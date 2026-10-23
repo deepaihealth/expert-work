@@ -42,6 +42,9 @@ class _FakeEmbeddingConfig:
     async def effective_embedding_config(self) -> tuple[str, str] | None:
         return ("qwen", "text-embedding-v4")
 
+    async def effective_rerank_config(self) -> tuple[str, str] | None:
+        return None
+
 
 class Harness:
     def __init__(

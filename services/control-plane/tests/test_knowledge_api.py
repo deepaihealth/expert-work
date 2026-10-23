@@ -79,6 +79,9 @@ class _FakeEmbeddingConfig:
     async def effective_embedding_config(self) -> tuple[str, str] | None:
         return self.pair
 
+    async def effective_rerank_config(self) -> tuple[str, str] | None:
+        return None
+
 
 ReindexSetup = tuple[AsyncClient, KnowledgeIngestionRunner, _FakeEmbeddingConfig]
 
@@ -298,6 +301,11 @@ async def test_create_base_with_config_and_get_single(setup: Setup) -> None:
         "method": "vector",
         "rerank_enabled": False,
         "rerank_score_threshold": None,
+        # B-206 K-7b — no threshold, nothing bound; this app configures no
+        # platform rerank model.
+        "rerank_threshold_model": None,
+        "rerank_threshold_paused": False,
+        "current_rerank_model": None,
     }
     assert body["stats"] == {"document_count": 0, "chunk_count": 0}
 

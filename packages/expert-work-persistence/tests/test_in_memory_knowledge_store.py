@@ -152,6 +152,33 @@ async def test_rerank_score_threshold_round_trip() -> None:
 
 
 @pytest.mark.asyncio
+async def test_rerank_threshold_model_round_trip() -> None:
+    """B-206 K-7b — the model a threshold was set under: stored at create, kept
+    by an update that omits it (a threshold change alone does not touch it),
+    cleared by an explicit None."""
+    store = InMemoryKnowledgeStore()
+    tenant = uuid4()
+    base = await store.create_base(
+        tenant_id=tenant,
+        name="kb",
+        rerank_score_threshold=0.7,
+        rerank_threshold_model="qwen/qwen3-vl-rerank",
+    )
+    assert base.rerank_threshold_model == "qwen/qwen3-vl-rerank"
+    kept = await store.update_base(tenant_id=tenant, kb_id=base.id, rerank_score_threshold=0.6)
+    assert kept is not None
+    assert kept.rerank_threshold_model == "qwen/qwen3-vl-rerank"
+    moved = await store.update_base(
+        tenant_id=tenant, kb_id=base.id, rerank_threshold_model="qwen/qwen3-rerank"
+    )
+    assert moved is not None
+    assert moved.rerank_threshold_model == "qwen/qwen3-rerank"
+    cleared = await store.update_base(tenant_id=tenant, kb_id=base.id, rerank_threshold_model=None)
+    assert cleared is not None
+    assert cleared.rerank_threshold_model is None
+
+
+@pytest.mark.asyncio
 async def test_update_missing_base_returns_none() -> None:
     store = InMemoryKnowledgeStore()
     assert await store.update_base(tenant_id=uuid4(), kb_id=uuid4(), description="x") is None

@@ -28,11 +28,13 @@ const BASE: knowledgeSdk.KnowledgeBase = {
 
 function response(
   rerank_outcome: knowledgeSdk.RerankOutcome | null,
+  extra: Partial<knowledgeSdk.RetrievalTestResponse> = {},
 ): knowledgeSdk.RetrievalTestResponse {
   return {
     query: "deductible",
     count: 1,
     rerank_outcome,
+    ...extra,
     results: [
       {
         content: "The deductible is 500.",
@@ -46,8 +48,11 @@ function response(
   };
 }
 
-async function run(rerank_outcome: knowledgeSdk.RerankOutcome | null): Promise<void> {
-  vi.spyOn(knowledgeSdk, "testRetrieval").mockResolvedValue(response(rerank_outcome));
+async function run(
+  rerank_outcome: knowledgeSdk.RerankOutcome | null,
+  extra: Partial<knowledgeSdk.RetrievalTestResponse> = {},
+): Promise<void> {
+  vi.spyOn(knowledgeSdk, "testRetrieval").mockResolvedValue(response(rerank_outcome, extra));
   render(
     <App>
       <RetrievalTestTab base={BASE} readScope={undefined} />
@@ -112,4 +117,38 @@ describe("RetrievalTestTab rerank outcome (B-206 K-7)", () => {
       expect(screen.getByTestId("kb-test-rerank-outcome")).toHaveClass(tone);
     },
   );
+});
+
+async function inChinese(body: () => Promise<void>): Promise<void> {
+  const prior = i18n.language;
+  await i18n.changeLanguage("zh-CN");
+  try {
+    await body();
+  } finally {
+    await i18n.changeLanguage(prior);
+  }
+}
+
+describe("RetrievalTestTab rerank-score threshold (B-206 K-7b)", () => {
+  it("says a threshold set under another rerank model was left out, naming this search's models", async () => {
+    // The page's base (loaded before a platform switch) knows neither model.
+    await inChinese(async () => {
+      await run("ok", {
+        rerank_threshold_paused: true,
+        rerank_threshold_model: "qwen/qwen3-vl-rerank",
+        rerank_model: "qwen/qwen3-rerank",
+      });
+      const notice = screen.getByTestId("kb-test-rerank-threshold-paused");
+      expect(notice).toHaveTextContent(
+        "重排分数下限是在 qwen/qwen3-vl-rerank 下标定的，当前重排模型是 qwen/qwen3-rerank",
+      );
+      expect(notice).toHaveTextContent("已暂停生效，请重新标定");
+      expect(notice).toHaveClass("ant-alert-warning");
+    });
+  });
+
+  it("says nothing about the threshold when it was in force", async () => {
+    await run("ok");
+    expect(screen.queryByTestId("kb-test-rerank-threshold-paused")).toBeNull();
+  });
 });

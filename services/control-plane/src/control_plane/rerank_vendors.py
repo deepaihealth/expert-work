@@ -129,4 +129,5 @@ def vendor_reranker(
         client=guards.wrap(cohere, provider=provider, model=model, secret_ref=secret_ref),
         model=model,
         caps=entry.rerank_caps if entry is not None else None,
+        provider=provider,
     )

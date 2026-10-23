@@ -43,6 +43,10 @@ B-206 K-14 重排对照组:``--rerank-view dual|single|single_clean`` / ``--rera
 ``--rerank-instruct`` 直接设到生产检索器上(不给 = 生产默认 dual + 100、不带任务说明;
 ``--rerank-instruct`` 只能配单视图;K-14 之前的生产 = ``--rerank-pool 50``,请求与那时逐字相同,
 重排缓存照样命中)。重排只判了候选池的一部分(池超过模型单次上限,或超长被拒后少送重试)时整轮退出。
+B-206 K-7b 换模型对照:``--rerank-model``(配 ``--rerank dashscope``,模型在缓存键里);
+``--rerank-threshold-on-base`` 把 ``--rerank-threshold`` 存到库上(绑这次的重排模型)而不是随检索传,
+走生产的库上门槛那条路(含绑定模型的检查);汇总 ``rerank_outcomes`` 记每种重排结局的检索次数
+(``partial`` 只计数,整轮只在 ``rerank_degraded`` 时退出)。
 
 凭据只从环境变量读(``EXPERT_WORK_EVAL_EMBED_API_KEY`` / ``_MODEL`` / ``_BASE_URL``;
 ``--rerank on`` 另要 ``EXPERT_WORK_EVAL_LLM_API_KEY`` / ``_MODEL`` / ``_BASE_URL``),没有命令行开关。
@@ -94,8 +98,11 @@ from kb_metrics import (  # type: ignore[import-not-found]
     score_case,
 )
 from kb_rerank import (  # type: ignore[import-not-found]
+    DEFAULT_RERANK_MODEL,
     CachedRerankClient,
     build_dashscope_reranker,
+    rerank_outcome_counts,
+    resolve_rerank_model,
 )
 from longmem.download import file_sha256  # type: ignore[import-not-found]
 from longmem.embedders import (  # type: ignore[import-not-found]
@@ -116,6 +123,7 @@ from expert_work.protocol import (
     RetrievalMethod,
     chunk_retrieval_text,
     knowledge_document_title,
+    rerank_model_key,
 )
 from expert_work.protocol.model_catalog import EmbeddingCaps
 from orchestrator.graph_builder.builder import _invoke_tool
@@ -215,6 +223,10 @@ class EvalConfig:
     rerank_view: RerankView = DEFAULT_RERANK_VIEW
     rerank_pool: int = DEFAULT_RERANK_POOL
     rerank_instruction: bool = False
+    #: B-206 K-7b(``--rerank-model``):dashscope 取法用的模型,其它取法 None。
+    rerank_model: str | None = None
+    #: B-206 K-7b(``--rerank-threshold-on-base``):门槛存在库上、不随检索传。
+    rerank_threshold_on_base: bool = False
 
 
 @dataclass(frozen=True)
@@ -338,6 +350,7 @@ class SearchLog:
     results: tuple[RetrievedChunk, ...]
     shown: int
     shown_chars: int  # 工具渲染给模型的文本长度
+    rerank_outcome: str | None = None  # B-206 K-7:这次重排怎么结束的(没要重排 = None)
 
 
 @dataclass(frozen=True)
@@ -929,7 +942,9 @@ async def run_eval(
                 method=cfg.method,
                 score_threshold=cfg.threshold,
                 rerank=cfg.rerank,
-                rerank_score_threshold=cfg.rerank_threshold,
+                rerank_score_threshold=None
+                if cfg.rerank_threshold_on_base
+                else cfg.rerank_threshold,
             )
         if cfg.rerank and outcome.rerank_degraded:
             msg = (
@@ -987,6 +1002,7 @@ async def run_eval(
                 results=outcome.results,
                 shown=min(replay.requested or 0, len(results)),
                 shown_chars=len(shown_text),
+                rerank_outcome=outcome.rerank_outcome,
             ),
         )
 
@@ -1163,6 +1179,7 @@ def search_log_json(row: CaseRow) -> dict[str, Any]:
         "status": log.status,
         "candidates": log.candidates,
         "rerank_degraded": log.rerank_degraded,
+        "rerank_outcome": log.rerank_outcome,
         "shown": log.shown,
         "shown_chars": log.shown_chars,
         "results": [
@@ -1296,6 +1313,8 @@ def fingerprint(
         "threshold": cfg.threshold,
         "rerank": cfg.rerank_mode,
         "rerank_threshold": cfg.rerank_threshold,
+        "rerank_threshold_on_base": cfg.rerank_threshold_on_base,
+        "rerank_model": cfg.rerank_model,
         **rerank_arm(cfg),
     }
 
@@ -1525,10 +1544,12 @@ def baseline_benchmark(dataset_name: str, rerank_mode: str) -> str:
     return dataset_name if rerank_mode == "off" else f"{dataset_name}@rerank-{rerank_mode}"
 
 
-def build_rerank_mode(mode: str) -> tuple[Reranker | None, CachedRerankClient | None]:
+def build_rerank_mode(
+    mode: str, *, model: str | None = None
+) -> tuple[Reranker | None, CachedRerankClient | None]:
     """``--rerank`` 的三种取法;``dashscope`` 另返回缓存客户端,汇总里记调用与费用。"""
     if mode == "dashscope":
-        reranker, client = build_dashscope_reranker(cache_path=RERANK_CACHE_DB)
+        reranker, client = build_dashscope_reranker(cache_path=RERANK_CACHE_DB, model=model)
         return reranker, client
     return build_reranker(mode == "llm"), None
 
@@ -1598,6 +1619,15 @@ def _build_parser() -> argparse.ArgumentParser:
             "单视图带英文任务说明(要配 --rerank-view single|single_clean;"
             "只发给支持的模型,生产默认关)"
         ),
+    )
+    parser.add_argument(
+        "--rerank-model",
+        help="B-206 K-7b 重排模型对照组(要配 --rerank dashscope;默认 = 生产同款)",
+    )
+    parser.add_argument(
+        "--rerank-threshold-on-base",
+        action="store_true",
+        help="B-206 K-7b:--rerank-threshold 存到库上(绑这次的重排模型),检索按生产的库上门槛走",
     )
     parser.add_argument(
         "--doc-match",
@@ -1699,6 +1729,13 @@ async def _run(
                     f"no document ingested ({report.docs_failed} failed) — check --corpus-root "
                     f"({corpus_root}) against the manifest's path column"
                 )
+            if cfg.rerank_threshold_on_base and cfg.rerank_model is not None:
+                await store.update_base(
+                    tenant_id=EVAL_TENANT_ID,
+                    kb_id=report.base_id,
+                    rerank_score_threshold=cfg.rerank_threshold,
+                    rerank_threshold_model=rerank_model_key("qwen", cfg.rerank_model),
+                )
             anchors = await check_anchors(
                 store=store, tenant_id=EVAL_TENANT_ID, kb_id=report.base_id, dataset=dataset
             )
@@ -1745,6 +1782,8 @@ async def _run(
         "threshold": cfg.threshold,
         "rerank": cfg.rerank_mode,
         "rerank_threshold": cfg.rerank_threshold,
+        "rerank_threshold_on_base": cfg.rerank_threshold_on_base,
+        "rerank_model": cfg.rerank_model,
         **rerank_arm(cfg),
         "label": args.label,
     }
@@ -1787,6 +1826,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             "refusing to update baseline with --rerank-threshold: the baseline section is "
             "keyed by rerank mode only, so a thresholded run would overwrite the plain one"
         )
+    if args.rerank_threshold_on_base and args.rerank_threshold is None:
+        raise SystemExit("--rerank-threshold-on-base needs --rerank-threshold")
     if args.rerank_pool < 1:
         raise SystemExit(f"--rerank-pool must be at least 1, got {args.rerank_pool}")
     if args.rerank_instruct and args.rerank_view == "dual":
@@ -1802,7 +1843,14 @@ def main(argv: Sequence[str] | None = None) -> int:
         rerank_view=args.rerank_view,
         rerank_pool=args.rerank_pool,
         rerank_instruction=args.rerank_instruct,
+        rerank_model=resolve_rerank_model(args.rerank_model, rerank_mode=rerank_mode),
+        rerank_threshold_on_base=args.rerank_threshold_on_base,
     )
+    if args.update_baseline and cfg.rerank_model not in (None, DEFAULT_RERANK_MODEL):
+        raise SystemExit(
+            "refusing to update baseline with --rerank-model off the production model: the "
+            "baseline section is keyed by rerank mode only"
+        )
     if args.update_baseline and rerank_arm(cfg) != rerank_arm(EvalConfig()):
         raise SystemExit(
             "refusing to update baseline with a K-14 arm (--rerank-view / --rerank-pool / "
@@ -1812,7 +1860,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     bundle = build_embedder(
         args.embedder, concurrency=args.concurrency, query_marker=args.query_marker == "on"
     )
-    reranker, rerank_client = build_rerank_mode(rerank_mode)
+    reranker, rerank_client = build_rerank_mode(rerank_mode, model=cfg.rerank_model)
 
     rows, summary, report = asyncio.run(
         _run(
@@ -1826,6 +1874,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             reranker=reranker,
         )
     )
+    if cfg.rerank:
+        summary["rerank_outcomes"] = rerank_outcome_counts(
+            row.search.rerank_outcome for row in rows if row.search is not None
+        )
     if rerank_client is not None:
         summary["rerank"] = {"model": cast(Any, reranker).model, **rerank_client.stats()}
         print(f"rerank: {summary['rerank']}", file=sys.stderr)

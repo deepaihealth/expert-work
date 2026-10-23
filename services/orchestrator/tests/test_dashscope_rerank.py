@@ -297,6 +297,28 @@ async def test_a_request_never_carries_more_documents_than_the_model_takes() -> 
 
 
 @pytest.mark.asyncio
+async def test_the_text_models_take_a_whole_pool_in_one_request() -> None:
+    """B-206 K-7b — 500 documents a request: the 100-candidate pool is never cut."""
+    for model in ("qwen3-rerank", "qwen3.7-text-rerank"):
+        client = _RecordingClient()
+        ranked = await DashScopeReranker(client=client, model=model).rerank_scored(
+            query="q", documents=[f"d{i}" for i in range(150)], top_k=150, tenant_id=uuid4()
+        )
+        assert len(client.requests[0]["documents"]) == 150, model
+        assert getattr(ranked, "dropped", 0) == 0, model
+
+
+@pytest.mark.asyncio
+async def test_a_ranking_names_the_model_that_scored_it() -> None:
+    """B-206 K-7b — what a base's threshold is checked against."""
+    ranked = await DashScopeReranker(client=_RecordingClient(), model="qwen3-rerank").rerank_scored(
+        query="q", documents=["a", "b"], top_k=2, tenant_id=uuid4()
+    )
+    assert isinstance(ranked, RerankRanking)
+    assert ranked.model == "qwen/qwen3-rerank"
+
+
+@pytest.mark.asyncio
 async def test_an_off_catalog_model_gets_every_document() -> None:
     client = _RecordingClient()
     ranked = await DashScopeReranker(client=client, model="gte-rerank-v2").rerank_scored(

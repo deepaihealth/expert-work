@@ -85,3 +85,23 @@ describe("RowDetailResult rerank outcome (B-206 K-7)", () => {
     },
   );
 });
+
+describe("RowDetailResult rerank-score threshold (B-206 K-7b)", () => {
+  it("says the base's threshold was left out for another rerank model", async () => {
+    const prior = i18n.language;
+    await i18n.changeLanguage("zh-CN");
+    try {
+      renderResult(knowledgeRow({ rerankThresholdPaused: true }));
+      const notice = screen.getByTestId("console-detail-rerank-threshold-paused");
+      expect(notice).toHaveTextContent("是在另一个重排模型下标定的");
+      expect(notice).toHaveClass("ant-typography-warning");
+    } finally {
+      await i18n.changeLanguage(prior);
+    }
+  });
+
+  it("says nothing about the threshold otherwise", () => {
+    renderResult(knowledgeRow({ rerankOutcome: "rate_limited" }));
+    expect(screen.queryByTestId("console-detail-rerank-threshold-paused")).toBeNull();
+  });
+});

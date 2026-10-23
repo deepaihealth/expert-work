@@ -46,6 +46,7 @@ from kb_agent_eval import (  # type: ignore[import-not-found]
 from kb_corpus_inventory import MANIFEST_FIELDS  # type: ignore[import-not-found]
 from kb_dataset import KbCase, KbDataset, KbExpected  # type: ignore[import-not-found]
 from kb_eval import (  # type: ignore[import-not-found]
+    EVAL_TENANT_ID,
     build_fake_embedder,
     build_retriever,
     rls_tenant,
@@ -62,6 +63,7 @@ from orchestrator.tools.knowledge import (
     KnowledgeSearchTool,
     RetrievedChunk,
 )
+from orchestrator.tools.knowledge_rerank import RerankRanking
 
 _ANCHOR = "常温密封保存即可"
 _DOC = (
@@ -257,6 +259,39 @@ async def test_run_agent_uses_the_tool_as_shipped_and_caps_searches() -> None:
     assert tool_messages[-1]["content"] == SEARCH_LIMIT_NOTE
     assert cost == pytest.approx(0.25 * (MAX_SEARCHES + 2))
     assert (spend.answer_cny, spend.answer_calls) == (pytest.approx(cost), MAX_SEARCHES + 2)
+
+
+class _ThresholdRetriever(_FixedRetriever):
+    """A search whose rerank ended ``partial`` and its base's threshold left out
+    for another model (B-206 K-7b)."""
+
+    async def search_detailed(self, **_kwargs: Any) -> KnowledgeSearchOutcome:
+        return KnowledgeSearchOutcome(
+            results=self.results,
+            status="ok",
+            candidates=len(self.results),
+            rerank_outcome="partial",
+            rerank_threshold_paused=True,
+        )
+
+
+@pytest.mark.asyncio
+async def test_each_search_records_how_its_rerank_and_threshold_ended() -> None:
+    chunk = RetrievedChunk(content="QK7 note", filename="manual.md", chunk_index=0)
+    retriever = cast(KnowledgeRetriever, _ThresholdRetriever((chunk,)))
+    tool = KnowledgeSearchTool(retriever=retriever, knowledge_base_refs=("kb",))
+    run, _cost = await run_agent(
+        _KeepSearching(), tool, question="q", tenant_id=uuid4(), spend=Spend()
+    )
+    first = run["searches"][0]
+    assert (first["rerank_outcome"], first["rerank_threshold_paused"]) == ("partial", True)
+    plain = (
+        await run_agent(_KeepSearching(), _tool(), question="q", tenant_id=uuid4(), spend=Spend())
+    )[0]
+    assert (
+        plain["searches"][0]["rerank_outcome"],
+        plain["searches"][0]["rerank_threshold_paused"],
+    ) == ("ok", False)
 
 
 @pytest.mark.asyncio
@@ -483,8 +518,17 @@ def _row(case_id: str, label: str, answerable: bool, cat: str, **searches: Any) 
 def test_tally_counts_each_category_with_totals_and_spend(tmp_path: Path) -> None:
     out = tmp_path / "agent.jsonl"
     rows = [
-        _row("n1", "main", False, "正确说没写", status="ok", embedding_degraded=True),
-        _row("n2", "chat", False, "编造", degraded=True),
+        _row(
+            "n1",
+            "main",
+            False,
+            "正确说没写",
+            status="ok",
+            embedding_degraded=True,
+            rerank_outcome="partial",
+            rerank_threshold_paused=True,
+        ),
+        _row("n2", "chat", False, "编造", status="ok", degraded=True, rerank_outcome="ok"),
         _row("a1", "main", True, "答对", error="[tool error] x"),
         _row("a2", "main", True, "误拒", skipped=True),
         _row("a3", "chat", True, "编造"),
@@ -504,7 +548,9 @@ def test_tally_counts_each_category_with_totals_and_spend(tmp_path: Path) -> Non
     assert text[9] == (
         "searches per question 0.80; degraded 1, embedding degraded 1, errors 1, skipped 1"
     )
-    assert text[10] == "spend ¥1.95 (answer ¥1.25, judge ¥0.50, rerank ¥0.20 over 1 run(s))"
+    # B-206 K-7b — how each search's rerank ended, and its threshold left out.
+    assert text[10] == "rerank outcomes ok 1, partial 1; threshold paused 1"
+    assert text[11] == "spend ¥1.95 (answer ¥1.25, judge ¥0.50, rerank ¥0.20 over 1 run(s))"
 
 
 # ---------------------------------------------------------------------------
@@ -673,7 +719,117 @@ def test_rerank_arm_flags_reach_the_tools_retriever_and_the_run_row(
     )
     lines = (tmp_path / "agent.jsonl").read_text(encoding="utf-8").splitlines()
     (run,) = [json.loads(line)["run"] for line in lines if "run" in json.loads(line)]
-    assert run["rerank_arm"] == {"view": "single_clean", "pool": 60, "instruct": False}
+    assert run["rerank_arm"] == {
+        "view": "single_clean",
+        "pool": 60,
+        "instruct": False,
+        "model": None,
+        "threshold": None,
+    }
+    assert network_attempts == []
+
+
+class _OtherModelReranker:
+    """Scores every passage 0.5, as another model than the base's threshold was set under."""
+
+    model = "qwen3-vl-rerank"
+
+    async def rerank(self, **kwargs: Any) -> list[int]:
+        return [i for i, _ in await self.rerank_scored(**kwargs)]
+
+    async def rerank_scored(
+        self, *, documents: Sequence[str], top_k: int, **_: Any
+    ) -> list[tuple[int, float | None]]:
+        ranked = [(i, 0.5) for i in range(min(len(documents), top_k))]
+        return RerankRanking(ranked, model="qwen/qwen3-vl-rerank")
+
+
+def test_a_base_threshold_is_set_bound_and_each_search_says_how_it_ended(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    network_attempts: list[str],
+) -> None:
+    """B-206 K-7b — ``--rerank-threshold`` sets the base's own threshold, bound to
+    the run's rerank model, so the agent layer meets it as production does; every
+    search records its rerank outcome and whether the threshold was left out."""
+    built: list[KnowledgeRetriever] = []
+
+    def _spy(**kwargs: Any) -> KnowledgeRetriever:
+        retriever = cast(KnowledgeRetriever, build_retriever(**kwargs))
+        built.append(retriever)
+        return retriever
+
+    monkeypatch.setattr("kb_agent_eval.build_retriever", _spy)
+    monkeypatch.setattr(
+        "kb_agent_eval.build_rerank_mode",
+        lambda mode, *, model=None: (_OtherModelReranker(), None),
+    )
+    monkeypatch.setenv("EXPERT_WORK_EVAL_EMBED_API_KEY", "offline-cache-only")
+    for name in (*ANSWER_ENV, *JUDGE_ENV):
+        monkeypatch.delenv(name, raising=False)
+    argv = _dry_argv(
+        tmp_path,
+        "--limit",
+        "1",
+        "--rerank",
+        "dashscope",
+        "--rerank-model",
+        "qwen3-rerank",
+        "--rerank-threshold",
+        "0.7",
+    )
+    assert main(argv) == 0
+    (retriever,) = built
+    (base,) = asyncio.run(
+        cast(InMemoryKnowledgeStore, retriever.store).list_bases(tenant_id=EVAL_TENANT_ID)
+    )
+    assert (base.rerank_score_threshold, base.rerank_threshold_model) == (0.7, "qwen/qwen3-rerank")
+    lines = [json.loads(line) for line in (tmp_path / "agent.jsonl").read_text().splitlines()]
+    searches = [s for line in lines if "case_id" in line for s in line["searches"]]
+    assert searches
+    assert all(s["rerank_outcome"] == "ok" for s in searches)
+    assert all(s["rerank_threshold_paused"] is True for s in searches)
+    (run,) = [line["run"] for line in lines if "run" in line]
+    assert run["rerank_arm"]["threshold"] == 0.7
+    assert network_attempts == []
+
+
+def test_a_base_threshold_needs_the_native_rerank(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    for name in (*ANSWER_ENV, *JUDGE_ENV):
+        monkeypatch.delenv(name, raising=False)
+    with pytest.raises(SystemExit):
+        main(_dry_argv(tmp_path, "--rerank-threshold", "0.7"))
+    assert "--rerank-threshold needs --rerank dashscope" in capsys.readouterr().err
+
+
+def test_rerank_model_reaches_the_reranker_and_the_run_row(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    network_attempts: list[str],
+) -> None:
+    """B-206 K-7b — ``--rerank-model`` (with ``--rerank dashscope``) picks the
+    native rerank model, and the run row says which."""
+    asked: list[tuple[str, str | None]] = []
+
+    def _build(mode: str, *, model: str | None = None) -> tuple[None, None]:
+        asked.append((mode, model))
+        return None, None
+
+    monkeypatch.setattr("kb_agent_eval.build_rerank_mode", _build)
+    monkeypatch.setenv("EXPERT_WORK_EVAL_EMBED_API_KEY", "offline-cache-only")
+    for name in (*ANSWER_ENV, *JUDGE_ENV):
+        monkeypatch.delenv(name, raising=False)
+    argv = _dry_argv(
+        tmp_path, "--limit", "1", "--rerank", "dashscope", "--rerank-model", "qwen3-rerank"
+    )
+    assert main(argv) == 0
+    assert asked == [("dashscope", "qwen3-rerank")]
+    lines = (tmp_path / "agent.jsonl").read_text(encoding="utf-8").splitlines()
+    (run,) = [json.loads(line)["run"] for line in lines if "run" in json.loads(line)]
+    assert run["rerank_arm"]["model"] == "qwen3-rerank"
+    assert network_attempts == []
     assert network_attempts == []
 
 

@@ -30,6 +30,13 @@ export interface RetrievalConfig {
   rerank_enabled: boolean;
   /** Minimum rerank score to keep a hit (B-175 wave 2 PR3); ``null`` = off. */
   rerank_score_threshold?: number | null;
+  /** B-206 K-7b — the rerank model (``provider/model``) the threshold was set
+   *  under; ``null`` when none is set, or it was set before models were recorded. */
+  rerank_threshold_model?: string | null;
+  /** The threshold is left out of searches: another rerank model scores now. */
+  rerank_threshold_paused?: boolean;
+  /** The platform's rerank model now (``provider/model``); ``null`` = none. */
+  current_rerank_model?: string | null;
 }
 
 export interface KnowledgeBaseStats {
@@ -176,6 +183,12 @@ export interface RetrievalTestResponse {
   count: number;
   /** B-206 K-7 — ``null`` when the search asked for no rerank. */
   rerank_outcome?: RerankOutcome | null;
+  /** B-206 K-7b — the base's threshold was left out: set under another model. */
+  rerank_threshold_paused?: boolean;
+  /** The model the base's threshold was set under (``provider/model``). */
+  rerank_threshold_model?: string | null;
+  /** The model that scored this search; ``null`` without scores. */
+  rerank_model?: string | null;
 }
 
 /** Update payload — only supplied keys are applied; ``null`` clears a
@@ -189,6 +202,8 @@ export interface UpdateBaseBody {
   retrieval_method?: RetrievalMethod;
   rerank_enabled?: boolean;
   rerank_score_threshold?: number | null;
+  /** B-206 K-7b — bind the stored threshold, unchanged, to the current rerank model. */
+  rerank_threshold_confirm?: boolean;
 }
 
 export interface RetrievalTestBody {

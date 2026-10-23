@@ -137,6 +137,8 @@ from expert_work.protocol.knowledge import (
     ScoredChunk,
     chunk_retrieval_text,
     knowledge_document_title,
+    rerank_model_key,
+    rerank_threshold_paused,
 )
 from expert_work.protocol.mcp_connector_catalog import (
     McpConnectorAuthField,
@@ -540,6 +542,8 @@ __all__ = [
     "parse_upload_id",
     "provider_for_model",
     "render_upload_id",
+    "rerank_model_key",
+    "rerank_threshold_paused",
     "resolve_extends",
     "tier_satisfies",
     "validate_secret_ref",

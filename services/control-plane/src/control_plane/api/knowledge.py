@@ -25,6 +25,11 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
 from control_plane.api._authz import console_only, require
+from control_plane.api.knowledge_rerank_threshold import (
+    current_rerank_model,
+    model_for_threshold,
+    threshold_binding,
+)
 from control_plane.audit import emit
 from control_plane.knowledge.ingestion import KnowledgeIngestionRunner
 from control_plane.knowledge.parsing import SUPPORTED_EXTENSIONS
@@ -110,6 +115,8 @@ class _UpdateBaseBody(BaseModel):
     retrieval_method: RetrievalMethod | None = None
     rerank_enabled: bool | None = None
     rerank_score_threshold: float | None = Field(default=None, ge=0.0, le=1.0)
+    #: B-206 K-7b — bind the stored threshold, unchanged, to the live rerank model.
+    rerank_threshold_confirm: bool = False
 
 
 class _TestBody(BaseModel):
@@ -209,7 +216,10 @@ def _base_dict(
     stats: tuple[int, int] = (0, 0),
     *,
     needs_reindex: bool = False,
+    rerank_model: str | None = None,
 ) -> dict[str, Any]:
+    """``rerank_model`` is the live platform rerank model (B-206 K-7b): whether
+    the base's rerank-score threshold is in force under it."""
     document_count, chunk_count = stats
     return {
         "id": str(base.id),
@@ -227,6 +237,7 @@ def _base_dict(
             "method": base.retrieval_method.value,
             "rerank_enabled": base.rerank_enabled,
             "rerank_score_threshold": base.rerank_score_threshold,
+            **threshold_binding(base, rerank_model),
         },
         "embedding_provider": base.embedding_provider,
         "embedding_model": base.embedding_model,
@@ -373,6 +384,7 @@ def build_knowledge_router() -> APIRouter:
         # detectable (``needs_reindex``). NULL when embedding is unconfigured.
         current = await _current_embedding_model(config_service)
         provider, model = current if current is not None else (None, None)
+        rerank_model = await current_rerank_model(config_service)
         try:
             base = await store.create_base(
                 tenant_id=tenant_id,
@@ -388,6 +400,9 @@ def build_knowledge_router() -> APIRouter:
                 rerank_score_threshold=body.rerank_score_threshold,
                 embedding_provider=provider,
                 embedding_model=model,
+                rerank_threshold_model=model_for_threshold(
+                    body.rerank_score_threshold, rerank_model
+                ),
             )
         except DuplicateKnowledgeBaseError as exc:
             raise HTTPException(status_code=409, detail="knowledge base already exists") from exc
@@ -400,7 +415,10 @@ def build_knowledge_router() -> APIRouter:
             details={"name": base.name},
         )
         return JSONResponse(
-            status_code=201, content=_base_dict(base, needs_reindex=_needs_reindex(base, current))
+            status_code=201,
+            content=_base_dict(
+                base, needs_reindex=_needs_reindex(base, current), rerank_model=rerank_model
+            ),
         )
 
     @router.get("/bases", response_model=None, dependencies=[Depends(require("manifest", "read"))])
@@ -448,6 +466,7 @@ def build_knowledge_router() -> APIRouter:
                     )
                 stats = await store.base_stats_many(tenant_id=scope.tenant_id)
         current = await _current_embedding_model(config_service)
+        rerank_model = await current_rerank_model(config_service)
         return JSONResponse(
             content={
                 "bases": [
@@ -455,6 +474,7 @@ def build_knowledge_router() -> APIRouter:
                         base,
                         stats.get(base.id, (0, 0)),
                         needs_reindex=_needs_reindex(base, current),
+                        rerank_model=rerank_model,
                     )
                     for base in bases
                 ],
@@ -498,7 +518,12 @@ def build_knowledge_router() -> APIRouter:
             stats = await store.base_stats(tenant_id=scope.tenant_id, kb_id=base.id)
         current = await _current_embedding_model(config_service)
         return JSONResponse(
-            content=_base_dict(base, stats, needs_reindex=_needs_reindex(base, current))
+            content=_base_dict(
+                base,
+                stats,
+                needs_reindex=_needs_reindex(base, current),
+                rerank_model=await current_rerank_model(config_service),
+            )
         )
 
     @router.patch(
@@ -533,6 +558,7 @@ def build_knowledge_router() -> APIRouter:
                 status_code=400,
                 detail="chunk_overlap_tokens must be less than chunk_max_tokens",
             )
+        rerank_model = await current_rerank_model(config_service)
         updated = await store.update_base(
             tenant_id=tenant_id,
             kb_id=base.id,
@@ -550,6 +576,13 @@ def build_knowledge_router() -> APIRouter:
             rerank_score_threshold=(
                 body.rerank_score_threshold if "rerank_score_threshold" in sent else UNSET
             ),
+            rerank_threshold_model=(
+                model_for_threshold(body.rerank_score_threshold, rerank_model)
+                if "rerank_score_threshold" in sent
+                else model_for_threshold(base.rerank_score_threshold, rerank_model)
+                if body.rerank_threshold_confirm
+                else UNSET
+            ),
         )
         if updated is None:  # pragma: no cover - guarded by _require_base above
             raise HTTPException(status_code=404, detail="knowledge base not found")
@@ -564,7 +597,12 @@ def build_knowledge_router() -> APIRouter:
         stats = await store.base_stats(tenant_id=tenant_id, kb_id=updated.id)
         current = await _current_embedding_model(config_service)
         return JSONResponse(
-            content=_base_dict(updated, stats, needs_reindex=_needs_reindex(updated, current))
+            content=_base_dict(
+                updated,
+                stats,
+                needs_reindex=_needs_reindex(updated, current),
+                rerank_model=rerank_model,
+            )
         )
 
     @router.post(
@@ -1052,6 +1090,12 @@ def build_knowledge_router() -> APIRouter:
                 # B-206 K-14 — candidates the reranker was handed but never
                 # judged (its model's per-request cap, or a length refusal).
                 "rerank_dropped": outcome.rerank_dropped,
+                # B-206 K-7b — the base's threshold was set under another rerank
+                # model than the one that scored, so this search left it out (both
+                # named here, so the notice never contradicts the search).
+                "rerank_threshold_paused": outcome.rerank_threshold_paused,
+                "rerank_threshold_model": base.rerank_threshold_model,
+                "rerank_model": outcome.rerank_model,
             }
         )
 

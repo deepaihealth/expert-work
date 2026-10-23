@@ -165,11 +165,13 @@ class KnowledgeStore(abc.ABC):
         rerank_score_threshold: float | None = None,
         embedding_provider: str | None = None,
         embedding_model: str | None = None,
+        rerank_threshold_model: str | None = None,
     ) -> KnowledgeBase:
         """Create a new knowledge base with its chunking + retrieval
         parameters and the embedding model that will produce its vectors;
         raise :class:`DuplicateKnowledgeBaseError` if ``(tenant_id, name)``
-        already exists."""
+        already exists. ``rerank_threshold_model`` (B-206 K-7b) is the rerank
+        model ``rerank_score_threshold`` was set under."""
 
     @abc.abstractmethod
     async def update_base(
@@ -185,10 +187,12 @@ class KnowledgeStore(abc.ABC):
         retrieval_method: RetrievalMethod | None = None,
         rerank_enabled: bool | None = None,
         rerank_score_threshold: float | _Unset | None = UNSET,
+        rerank_threshold_model: str | _Unset | None = UNSET,
     ) -> KnowledgeBase | None:
         """Patch an existing base. Each argument left at its default is not
         touched; ``None`` for a nullable field (``description``,
-        ``retrieval_score_threshold``, ``rerank_score_threshold``) clears it —
+        ``retrieval_score_threshold``, ``rerank_score_threshold``,
+        ``rerank_threshold_model``) clears it —
         the sentinel :data:`UNSET` is how "not supplied" is told apart from an
         explicit ``None``.
         Renaming is deliberately not offered (manifests reference bases by

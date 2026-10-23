@@ -35,7 +35,7 @@ from uuid import UUID
 #: ``model_unsupported`` (B-206 K-7c) a model is configured whose rerank API the
 #: platform has no client for; ``no_model`` rerank was asked for but no rerank
 #: model is configured. In every case but ``ok`` and ``partial`` the search used
-#: the fused order. The score-threshold ladder will add its own values.
+#: the fused order.
 RerankOutcome = Literal[
     "ok",
     "partial",
@@ -98,7 +98,11 @@ class RerankRanking(list[tuple[int, float | None]]):
     :func:`sigmoid`, in (0, 1), and ``logits`` keeps the raw logit behind each
     (index → logit) so rankings can be merged or combined in logit space, where
     a sigmoid's saturation near 1 does not hide differences. A score threshold
-    applies to the exposed (sigmoid) score. ``None`` for every other scale."""
+    applies to the exposed (sigmoid) score. ``None`` for every other scale.
+
+    ``model`` (B-206 K-7b) is the model whose scores these are, as
+    :func:`~expert_work.protocol.rerank_model_key` names it — a base's threshold
+    set under another model is left out; ``None`` when the reranker does not say."""
 
     def __init__(
         self,
@@ -107,11 +111,13 @@ class RerankRanking(list[tuple[int, float | None]]):
         dropped: int = 0,
         outcome: RerankOutcome = "ok",
         logits: Mapping[int, float] | None = None,
+        model: str | None = None,
     ) -> None:
         super().__init__(ranked)
         self.dropped = dropped
         self.outcome: RerankOutcome = outcome
         self.logits = logits
+        self.model = model
 
 
 def ranking_dropped(ranked: Sequence[tuple[int, float | None]]) -> int:
@@ -163,10 +169,20 @@ def weighted_views(
     combined = {i: weight * first[i] + (1 - weight) * second[i] for i in top}
     order = sorted(top, key=lambda i: (-combined[i], i))
     if titled_logits is None or body_logits is None:
-        return RerankRanking(((i, combined[i]) for i in order), dropped=dropped)
+        return RerankRanking(
+            ((i, combined[i]) for i in order), dropped=dropped, model=ranking_model(titled)
+        )
     return RerankRanking(
-        ((i, sigmoid(combined[i])) for i in order), dropped=dropped, logits=combined
+        ((i, sigmoid(combined[i])) for i in order),
+        dropped=dropped,
+        logits=combined,
+        model=ranking_model(titled),
     )
+
+
+def ranking_model(ranked: Sequence[tuple[int, float | None]]) -> str | None:
+    """The model that scored ``ranked`` (``None`` for a plain list)."""
+    return ranked.model if isinstance(ranked, RerankRanking) else None
 
 
 @runtime_checkable

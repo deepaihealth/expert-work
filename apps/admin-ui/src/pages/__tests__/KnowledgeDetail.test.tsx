@@ -337,7 +337,7 @@ describe("KnowledgeDetail", () => {
     await waitFor(() => expect(updateSpy).toHaveBeenCalledWith("support-docs", expect.any(Object)));
   });
 
-  it("settings save sends the rerank score floor (B-175 wave 2 PR3)", async () => {
+  it("settings save sends an edited rerank score floor (B-175 wave 2 PR3; B-206 K-7b)", async () => {
     vi.spyOn(knowledgeSdk, "getBase").mockResolvedValue({
       ...BASE,
       retrieval_config: { ...BASE.retrieval_config!, rerank_score_threshold: 0.7 },
@@ -348,16 +348,17 @@ describe("KnowledgeDetail", () => {
     renderDetail("/knowledge/support-docs/settings");
     await waitFor(() => expect(screen.getByTestId("knowledge-settings-tab")).toBeInTheDocument());
     const tab = screen.getByTestId("knowledge-settings-tab");
-    expect(within(tab).getByTestId("kb-settings-rerank-threshold")).toHaveAttribute(
-      "aria-valuenow",
-      "0.7",
-    );
+    const input = within(tab).getByTestId("kb-settings-rerank-threshold");
+    expect(input).toHaveAttribute("aria-valuenow", "0.7");
+    // B-206 K-7b — sent only when edited: sending binds it to the current rerank model.
+    await userEvent.clear(input);
+    await userEvent.type(input, "0.65");
     await userEvent.click(within(tab).getByTestId("kb-settings-save"));
 
     await waitFor(() =>
       expect(updateSpy).toHaveBeenCalledWith(
         "support-docs",
-        expect.objectContaining({ rerank_score_threshold: 0.7 }),
+        expect.objectContaining({ rerank_score_threshold: 0.65 }),
       ),
     );
   });
@@ -375,12 +376,9 @@ describe("KnowledgeDetail", () => {
     expect(input).toHaveAttribute("placeholder", "Empty = off (e.g. 0.70)");
     await userEvent.click(within(tab).getByTestId("kb-settings-save"));
 
-    await waitFor(() =>
-      expect(updateSpy).toHaveBeenCalledWith(
-        "support-docs",
-        expect.objectContaining({ rerank_score_threshold: null }),
-      ),
-    );
+    // Untouched, the floor is left out of the save (B-206 K-7b) — it stays off.
+    await waitFor(() => expect(updateSpy).toHaveBeenCalledTimes(1));
+    expect(updateSpy.mock.calls[0][1]).not.toHaveProperty("rerank_score_threshold");
   });
 
   it("切入态置灰重建索引/文档删除(两态:home 态由上方用例覆盖)", async () => {

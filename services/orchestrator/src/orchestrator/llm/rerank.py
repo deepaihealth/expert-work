@@ -29,6 +29,7 @@ from uuid import UUID
 
 import httpx
 
+from expert_work.protocol.knowledge import rerank_model_key
 from expert_work.protocol.model_catalog import catalog_entry
 from orchestrator.llm.providers._http import client_for
 from orchestrator.llm.rerank_guard import (
@@ -151,7 +152,8 @@ class DashScopeReranker:
     leading documents that surely fit (:func:`~orchestrator.llm.rerank_limits.fit_total`).
     Documents left out either way are reported, not silent: the ranking is a
     :class:`~orchestrator.tools.knowledge.RerankRanking` whose ``dropped`` counts
-    them. Off-catalog models get none of this."""
+    them. Off-catalog models get none of this. The ranking names ``model``
+    (B-206 K-7b), so a base's threshold set under another model is left out."""
 
     client: RerankClient
     model: str
@@ -212,11 +214,12 @@ class DashScopeReranker:
                 **extra,
             )
         dropped = len(documents) - len(items)
+        model = rerank_model_key(_CATALOG_PROVIDER, self.model)
         output = body.get("output")
         results = output.get("results") if isinstance(output, Mapping) else None
         if not isinstance(results, list):
             unscored = ((index, None) for index in range(min(len(items), top_k)))
-            return RerankRanking(unscored, dropped=dropped, outcome="model_error")
+            return RerankRanking(unscored, dropped=dropped, outcome="model_error", model=model)
         ranked = [
             (row["index"], relevance(row.get("relevance_score")))
             for row in results
@@ -225,7 +228,7 @@ class DashScopeReranker:
             and not isinstance(row.get("index"), bool)
             and 0 <= row["index"] < len(items)
         ]
-        return RerankRanking(ranked[:top_k], dropped=dropped)
+        return RerankRanking(ranked[:top_k], dropped=dropped, model=model)
 
 
 def _failure(response: httpx.Response) -> RerankFailure:

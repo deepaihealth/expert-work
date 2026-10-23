@@ -60,6 +60,9 @@ export interface ToolCallEntry {
   /** B-206 K-7 —— ``knowledge_search`` 的重排没定顺序、退回召回顺序时的原因,取自 wire
    *  ``artifact.rerank_outcome``(只在不是 ``ok`` 时才有);重排正常 → 缺省。 */
   rerankOutcome?: RerankFallback;
+  /** B-206 K-7b —— 这次没用库的重排分数下限:它是在另一个重排模型下标定的
+   *  (``artifact.rerank_threshold_paused``)。 */
+  rerankThresholdPaused?: true;
 }
 
 const MCP_PREFIX = "mcp__";
@@ -271,6 +274,7 @@ export function parseToolCalls(
           }
           const rerank = rerankFallbackOf(rec.rerank_outcome);
           if (rerank !== null) entry.rerankOutcome = rerank;
+          if (rec.rerank_threshold_paused === true) entry.rerankThresholdPaused = true;
           // PR-D — sandbox exec tools stash their raw (pre-datamark) streams
           // here; the rendered content's newlines don't survive spotlight.
           // Final-review fix wave — builder.py has piped meta → artifact

@@ -22,6 +22,7 @@ from kb_corpus_inventory import MANIFEST_FIELDS  # type: ignore[import-not-found
 from kb_dataset import KbCase, KbDataset, KbExpected, load_dataset  # type: ignore[import-not-found]
 from kb_eval import (  # type: ignore[import-not-found]
     EMBED_OVERLONG_CHARS,
+    EVAL_TENANT_ID,
     CaseRow,
     CountingEmbedder,
     EmbeddingDegradedError,
@@ -66,6 +67,7 @@ from orchestrator.tools.knowledge import (
     RerankRanking,
     RetrievedChunk,
 )
+from orchestrator.tools.knowledge_rerank import RerankError
 
 _ANCHOR_A = "常温密封保存即可"
 _ANCHOR_B = "专利号 ZL2019-1234567"
@@ -1316,6 +1318,118 @@ def test_main_refuses_baseline_for_a_non_default_rerank_arm(
     assert not (tmp_path / "b.yaml").exists()
 
 
+class _NamedReranker(_FlatScoreReranker):
+    """Scores the titled view; the body view (passages without the document
+    title) fails — every search ends ``partial``."""
+
+    model = "qwen3-rerank"
+
+    async def rerank_scored(
+        self, *, query: str, documents: Sequence[str], top_k: int, tenant_id: UUID
+    ) -> list[tuple[int, float | None]]:
+        if not any(document.startswith("[Document:") for document in documents):
+            raise RerankError("body view failed")
+        return await super().rerank_scored(
+            query=query, documents=documents, top_k=top_k, tenant_id=tenant_id
+        )
+
+
+def test_main_rerank_model_reaches_the_reranker_and_is_recorded(
+    tmp_path: Path,
+    dataset_path: Path,
+    corpus: tuple[Path, Path],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """B-206 K-7b — ``--rerank-model`` picks the native rerank model; the run
+    records it and how every search's rerank ended (``partial`` counted, not fatal)."""
+    asked: list[tuple[str, str | None]] = []
+
+    def _build(mode: str, *, model: str | None = None) -> tuple[Any, None]:
+        asked.append((mode, model))
+        return _NamedReranker(), None
+
+    monkeypatch.setattr("kb_eval.build_rerank_mode", _build)
+    _manifest, root = corpus
+    out = tmp_path / "unit.jsonl"
+    argv = _cli(dataset_path, root, out, tmp_path / "b.yaml", "--limit-docs", "1")
+    assert main([*argv, "--rerank", "dashscope", "--rerank-model", "qwen3-rerank"]) == 0
+    assert asked == [("dashscope", "qwen3-rerank")]
+    summary = json.loads(out.read_text(encoding="utf-8").splitlines()[-1])["summary"]
+    assert summary["config"]["rerank_model"] == "qwen3-rerank"
+    assert summary["rerank_outcomes"] == {"partial": len(_cases())}
+
+
+def test_main_can_put_the_threshold_on_the_base(
+    tmp_path: Path,
+    dataset_path: Path,
+    corpus: tuple[Path, Path],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """B-206 K-7b — ``--rerank-threshold-on-base`` stores the threshold on the base,
+    bound to the run's rerank model, instead of passing it with each search: the
+    searches meet it as production does (the model binding checked), and refuse as
+    with the passed threshold."""
+    built: list[KnowledgeRetriever] = []
+
+    def _spy(**kwargs: Any) -> KnowledgeRetriever:
+        retriever = cast(KnowledgeRetriever, build_retriever(**kwargs))
+        built.append(retriever)
+        return retriever
+
+    asked: list[float | None] = []
+    search = KnowledgeRetriever.search_detailed
+
+    async def _record(self: KnowledgeRetriever, **kwargs: Any) -> Any:
+        asked.append(kwargs.get("rerank_score_threshold"))
+        return await search(self, **kwargs)
+
+    monkeypatch.setattr("kb_eval.build_retriever", _spy)
+    monkeypatch.setattr(KnowledgeRetriever, "search_detailed", _record)
+    monkeypatch.setattr(
+        "kb_eval.build_rerank_mode", lambda mode, *, model=None: (_FlatScoreReranker(), None)
+    )
+    _manifest, root = corpus
+    out = tmp_path / "unit.jsonl"
+    argv = _cli(dataset_path, root, out, tmp_path / "b.yaml", "--limit-docs", "1")
+    flags = ["--rerank", "dashscope", "--rerank-threshold", "0.5", "--rerank-threshold-on-base"]
+    assert main([*argv, *flags]) == 0
+    (retriever,) = built
+    (base,) = asyncio.run(
+        cast(InMemoryKnowledgeStore, retriever.store).list_bases(tenant_id=EVAL_TENANT_ID)
+    )
+    assert (base.rerank_score_threshold, base.rerank_threshold_model) == (
+        0.5,
+        "qwen/qwen3-vl-rerank",
+    )
+    assert asked and set(asked) == {None}  # nothing passed with the search
+    lines = out.read_text(encoding="utf-8").splitlines()
+    summary = json.loads(lines[-1])["summary"]
+    assert summary["config"]["rerank_threshold_on_base"] is True
+    cases = [json.loads(line) for line in lines[:-1]]
+    assert all(case["refused"] is True for case in cases)  # every flat 0.3 is under 0.5
+
+
+def test_main_needs_a_threshold_to_put_on_the_base(
+    tmp_path: Path, dataset_path: Path, corpus: tuple[Path, Path]
+) -> None:
+    _manifest, root = corpus
+    argv = _cli(dataset_path, root, tmp_path / "unit.jsonl", tmp_path / "b.yaml")
+    with pytest.raises(SystemExit, match="--rerank-threshold-on-base needs --rerank-threshold"):
+        main([*argv, "--rerank", "dashscope", "--rerank-threshold-on-base"])
+
+
+def test_main_refuses_baseline_for_another_rerank_model(
+    tmp_path: Path, dataset_path: Path, corpus: tuple[Path, Path]
+) -> None:
+    _manifest, root = corpus
+    argv = _cli(
+        dataset_path, root, tmp_path / "unit.jsonl", tmp_path / "b.yaml", "--update-baseline"
+    )
+    with pytest.raises(SystemExit, match="refusing to update baseline with --rerank-model"):
+        main([*argv, "--rerank", "dashscope", "--rerank-model", "qwen3-rerank"])
+    assert not (tmp_path / "b.yaml").exists()
+
+
 def test_main_rerank_pool_must_be_positive(
     tmp_path: Path, dataset_path: Path, corpus: tuple[Path, Path]
 ) -> None:
@@ -1745,6 +1859,7 @@ async def test_search_log_records_every_returned_chunk_and_what_was_shown() -> N
     assert [r["fused_score"] for r in log["results"]] == [c.fused_score for c in ranked]
     assert all(isinstance(r["chunk_id"], str) for r in log["results"])
     assert all(r["rerank_score"] is None for r in log["results"])
+    assert log["rerank_outcome"] is None  # no rerank asked for
 
 
 @pytest.mark.asyncio

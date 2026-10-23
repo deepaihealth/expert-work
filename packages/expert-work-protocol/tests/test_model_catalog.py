@@ -497,6 +497,32 @@ def test_declared_caps_match_b206_tables() -> None:
         length_unit="char",
         score_scale="logit",
     )
+    # B-206 K-7b — the text-only rerank models (live probe 2026-10-22: the native
+    # endpoint takes both, answers in qwen3-vl-rerank's shape, ``instruct`` moves scores).
+    assert _e("qwen", "qwen3-rerank").rerank_caps == RerankCaps(
+        rerank_api="dashscope",
+        max_documents=500,
+        max_doc_tokens=4_000,
+        max_total_tokens=120_000,
+        supports_instruction=True,
+        score_scale="relative",
+        rpm=5_400,
+    )
+    assert _e("qwen", "qwen3.7-text-rerank").rerank_caps == RerankCaps(
+        rerank_api="dashscope",
+        max_documents=500,
+        max_doc_tokens=30_000,
+        supports_instruction=True,
+        score_scale="relative",
+        rpm=3_000,
+    )
+
+
+def test_text_rerank_models_are_selectable_for_the_platform_rerank() -> None:
+    """B-206 K-7b — the platform rerank setting offers every non-deprecated
+    ``rerank`` model, so the text models can become the default by setting alone."""
+    rerank = {e.name for e in models_for_provider("qwen") if e.rerank}
+    assert {"qwen3-vl-rerank", "qwen3-rerank", "qwen3.7-text-rerank"} <= rerank
 
 
 def test_caps_only_on_entries_with_the_matching_flag() -> None:

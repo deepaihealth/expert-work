@@ -305,9 +305,15 @@ class KnowledgeBase(BaseModel):
         description=(
             "minimum rerank score to keep a hit (B-175 wave 2 PR3); a search whose every "
             "hit falls below it returns nothing. Only applies when the reranker scores "
-            "(not a chat-model reranker, not when rerank failed). None disables it"
+            "(not a chat-model reranker, not when rerank failed) and only under the rerank "
+            "model it was set under (rerank_threshold_model); up to 3 hits below it are "
+            "kept when they contain a code the query names (B-206 K-7b). None disables it"
         ),
     )
+    #: B-206 K-7b — the rerank model (:func:`rerank_model_key`) the threshold was
+    #: set under. Scores are not comparable across models, so a search scored by
+    #: another one leaves the threshold out (:func:`rerank_threshold_paused`).
+    rerank_threshold_model: str | None = None
     #: Embedding model that produced this base's vectors. Captured at create
     #: time; compared against the live platform model to derive ``needs_reindex``.
     embedding_provider: str | None = None
@@ -334,6 +340,26 @@ class KnowledgeBase(BaseModel):
             msg = "chunk_overlap_tokens must be less than chunk_max_tokens"
             raise ValueError(msg)
         return self
+
+
+def rerank_model_key(provider: str, model: str) -> str:
+    """How a rerank model is named where a threshold is bound to it (B-206 K-7b):
+    what :attr:`KnowledgeBase.rerank_threshold_model` records and what a scoring
+    reranker reports."""
+    return f"{provider}/{model}"
+
+
+def rerank_threshold_paused(base: KnowledgeBase, scoring_model: str | None) -> bool:
+    """Whether ``base``'s stored rerank-score threshold is left out because
+    ``scoring_model`` (:func:`rerank_model_key`) is not the model it was set under
+    — or it was set before the model was recorded. ``scoring_model`` is ``None``
+    when the reranker does not say (no scores, or a reranker that predates it):
+    the threshold then applies as before."""
+    return (
+        base.rerank_score_threshold is not None
+        and scoring_model is not None
+        and base.rerank_threshold_model != scoring_model
+    )
 
 
 class KnowledgeDocument(BaseModel):

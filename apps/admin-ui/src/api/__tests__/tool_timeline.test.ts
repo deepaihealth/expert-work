@@ -212,6 +212,18 @@ describe("parseToolCalls artifact.rerank_outcome (B-206 K-7)", () => {
     expect(parseToolCalls(events)[0].rerankOutcome).toBe("partial");
   });
 
+  it("lifts a threshold left out for another rerank model (K-7b)", () => {
+    const events = [
+      updates("agent", [aiCall("k1", "knowledge_search", {}), aiCall2("k2", "knowledge_search", {})]),
+      updates("tools", [
+        toolResultWithArtifact("k1", "a", { hits: 2, rerank_threshold_paused: true }),
+        toolResultWithArtifact("k2", "b", { hits: 2, rerank_threshold_paused: "yes" }),
+      ]),
+    ];
+    const [a, b] = parseToolCalls(events);
+    expect([a.rerankThresholdPaused, b.rerankThresholdPaused]).toEqual([true, undefined]);
+  });
+
   it("leaves rerankOutcome unset for ok, missing or unknown values", () => {
     const events = [
       updates("agent", [aiCall("k1", "knowledge_search", {}), aiCall2("k2", "knowledge_search", {})]),

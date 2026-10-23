@@ -16,6 +16,8 @@ from kb_rerank import (  # type: ignore[import-not-found]
     CachedRerankClient,
     RerankCacheMissError,
     build_dashscope_reranker,
+    rerank_outcome_counts,
+    resolve_rerank_model,
 )
 
 from orchestrator.llm.rerank import DashScopeReranker, HTTPDashScopeRerankClient
@@ -162,3 +164,52 @@ def test_build_dashscope_reranker_needs_a_key(
     monkeypatch.delenv("EXPERT_WORK_EVAL_EMBED_API_KEY", raising=False)
     with pytest.raises(SystemExit, match="EXPERT_WORK_EVAL_EMBED_API_KEY"):
         build_dashscope_reranker(cache_path=tmp_path / "c.sqlite")
+
+
+# --- B-206 K-7b: comparing rerank models -------------------------------------
+
+
+def test_build_dashscope_reranker_takes_the_model_asked_for(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("EXPERT_WORK_EVAL_EMBED_API_KEY", OFFLINE_KEY)
+    monkeypatch.setenv("EXPERT_WORK_EVAL_RERANK_MODEL", "qwen3-rerank")
+    reranker, _client = build_dashscope_reranker(
+        cache_path=tmp_path / "c.sqlite", model="qwen3.7-text-rerank"
+    )
+    assert reranker.model == "qwen3.7-text-rerank"
+
+
+@pytest.mark.parametrize(
+    ("requested", "env", "expected"),
+    [
+        (None, None, "qwen3-vl-rerank"),
+        (None, "qwen3-rerank", "qwen3-rerank"),
+        ("qwen3.7-text-rerank", "qwen3-rerank", "qwen3.7-text-rerank"),
+    ],
+)
+def test_resolve_rerank_model_flag_then_env_then_production(
+    monkeypatch: pytest.MonkeyPatch, requested: str | None, env: str | None, expected: str
+) -> None:
+    if env is None:
+        monkeypatch.delenv("EXPERT_WORK_EVAL_RERANK_MODEL", raising=False)
+    else:
+        monkeypatch.setenv("EXPERT_WORK_EVAL_RERANK_MODEL", env)
+    assert resolve_rerank_model(requested, rerank_mode="dashscope") == expected
+
+
+def test_resolve_rerank_model_has_no_model_without_the_native_rerank() -> None:
+    assert resolve_rerank_model(None, rerank_mode="llm") is None
+    with pytest.raises(SystemExit, match="--rerank-model needs --rerank dashscope"):
+        resolve_rerank_model("qwen3-rerank", rerank_mode="off")
+
+
+def test_resolve_rerank_model_refuses_a_model_the_catalog_does_not_list() -> None:
+    """An unlisted model would run unpaced, with no per-request cap."""
+    with pytest.raises(SystemExit, match="not a rerank model in the model catalog"):
+        resolve_rerank_model("qwen3-rerak", rerank_mode="dashscope")
+
+
+def test_rerank_outcome_counts_counts_every_outcome_partial_included() -> None:
+    counts = rerank_outcome_counts(["ok", "partial", "ok", None, "rate_limited"])
+    assert counts == {"ok": 2, "partial": 1, "rate_limited": 1}
