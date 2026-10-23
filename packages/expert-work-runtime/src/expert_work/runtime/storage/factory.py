@@ -17,7 +17,10 @@ from typing import Literal
 
 from expert_work.runtime.storage.base import ObjectStore
 from expert_work.runtime.storage.memory import InMemoryObjectStore
-from expert_work.runtime.storage.s3_compatible import S3CompatibleObjectStore
+from expert_work.runtime.storage.s3_compatible import (
+    S3CompatibleObjectStore,
+    register_oss_compat,
+)
 
 ObjectStoreBackend = Literal["memory", "s3-compatible"]
 
@@ -104,4 +107,6 @@ async def _build_s3_store(
         aws_secret_access_key=config.secret_key,
         config=boto_config,
     ) as client:
+        # OSS batch deletes need a Content-MD5 botocore no longer sends.
+        register_oss_compat(client.meta.events)
         yield S3CompatibleObjectStore(client=client, bucket=config.bucket)

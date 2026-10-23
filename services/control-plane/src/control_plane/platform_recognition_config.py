@@ -1,6 +1,6 @@
 """``PlatformRecognitionConfigService`` —— B-209 §5.7「平台设置 → 模型服务 → 文档识别」。
 
-平台级、所有租户共用(设计 ⑦):扫描页识别模型、兜底识别模型、图片描述模型(PR-2 用)、单份
+平台级、所有租户共用(设计 ⑦):扫描页识别模型、兜底识别模型、图片描述模型(PR-2)、单份
 文档识别页数上限。数据库里有行就以行为准(某一对为空 = 关掉它);没有行用默认值:
 glm-ocr / qwen3.7-flash / qwen3.8-flash / 1,000 页(设计 ⑧ ⑪)。
 
@@ -66,6 +66,7 @@ class PlatformRecognitionConfigService:
             primary=_choice(record.ocr_provider, record.ocr_model),
             fallback=_choice(record.fallback_provider, record.fallback_model),
             max_pages=record.max_pages,
+            figure=_choice(record.figure_provider, record.figure_model),
         )
 
     async def put(self, record: PlatformRecognitionConfigRecord) -> None:

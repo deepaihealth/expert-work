@@ -37,6 +37,7 @@ from expert_work.protocol import (
     DocumentPage,
     DocumentSourceType,
     DocumentStatus,
+    FigureStats,
     IngestErrorCode,
     IngestStage,
     KnowledgeBase,
@@ -178,6 +179,8 @@ class InMemoryKnowledgeStore(KnowledgeStore):
         self._pages: dict[UUID, tuple[DocumentPage, ...]] = {}
         #: (tenant, document, kind, key) → entry.
         self._parse_cache: dict[tuple[UUID, UUID, str, str], ParseCacheEntry] = {}
+        #: B-209 PR-2 — pixel hashes of each document's figures (``figure_hashes``).
+        self._figure_hashes: dict[UUID, tuple[str, ...]] = {}
 
     # -- knowledge bases ----------------------------------------------------
 
@@ -680,6 +683,7 @@ class InMemoryKnowledgeStore(KnowledgeStore):
         store deletes them with the row / by FK cascade)."""
         for document_id in document_ids:
             self._pages.pop(document_id, None)
+            self._figure_hashes.pop(document_id, None)
         self._parse_cache = {
             key: entry for key, entry in self._parse_cache.items() if key[1] not in document_ids
         }
@@ -716,6 +720,42 @@ class InMemoryKnowledgeStore(KnowledgeStore):
             return None
         return list(self._pages.get(document_id, ()))
 
+    async def set_document_figures(
+        self,
+        *,
+        tenant_id: UUID,
+        document_id: UUID,
+        stats: FigureStats | _Unset | None,
+        pixel_hashes: Sequence[str],
+        generation: int | None = None,
+    ) -> bool:
+        document = await self.get_document(tenant_id=tenant_id, document_id=document_id)
+        if document is None:
+            return False
+        if generation is not None and not _fence_matches(document, generation):
+            return False
+        self._figure_hashes[document_id] = tuple(dict.fromkeys(pixel_hashes))
+        update: dict[str, object] = {"updated_at": datetime.now(UTC)}
+        if not isinstance(stats, _Unset):
+            update["figure_stats"] = stats
+        self._patch(tenant_id, document_id, update)
+        return True
+
+    async def existing_document_ids(self, *, document_ids: Sequence[UUID]) -> set[UUID]:
+        wanted = set(document_ids)
+        return {document.id for document in self._documents if document.id in wanted}
+
+    async def count_figure_documents(
+        self, *, tenant_id: UUID, pixel_hashes: Sequence[str], exclude_document_id: UUID
+    ) -> dict[str, int]:
+        wanted = set(pixel_hashes)
+        counts: Counter[str] = Counter()
+        for document in self._documents:
+            if document.tenant_id != tenant_id or document.id == exclude_document_id:
+                continue
+            counts.update(wanted.intersection(self._figure_hashes.get(document.id, ())))
+        return dict(counts)
+
     async def get_parse_cache(
         self,
         *,
@@ -741,9 +781,8 @@ class InMemoryKnowledgeStore(KnowledgeStore):
             # The SQL store's foreign key refuses a deleted document's reading.
             msg = f"no document {document_id}"
             raise KeyError(msg)
-        self._parse_cache.setdefault(
-            (tenant_id, document_id, kind, key),
-            ParseCacheEntry(model=model, result=dict(result)),
+        self._parse_cache[(tenant_id, document_id, kind, key)] = ParseCacheEntry(
+            model=model, result=dict(result)
         )
 
     # -- chunks -------------------------------------------------------------

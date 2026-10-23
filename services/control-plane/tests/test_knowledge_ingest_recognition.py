@@ -24,6 +24,7 @@ from control_plane.knowledge.ingestion import (
     shutdown_parse_pool,
 )
 from control_plane.knowledge.parsing import DocumentParseError, parse_document
+from control_plane.knowledge.recognition import ingest_parse
 from control_plane.knowledge.recognition import recognizer as recognizer_module
 from control_plane.knowledge.recognition.clients import Reading, RecognitionClient
 from control_plane.knowledge.recognition.pages import render_pages
@@ -512,10 +513,12 @@ async def test_the_pool_budget_is_spent_and_enforced(monkeypatch: pytest.MonkeyP
     import time
     from concurrent.futures import ThreadPoolExecutor
 
+    from control_plane.knowledge.parse_workers import PoolBudget
+
     executor = ThreadPoolExecutor(max_workers=1)
     monkeypatch.setattr(ingestion, "_parse_executor", executor)
     monkeypatch.setattr(ingestion, "_parse_slots", None)
-    budget = ingestion._PoolBudget(remaining=5.0)
+    budget = PoolBudget(remaining=5.0)
     assert await ingestion._in_parse_pool("a.pdf", time.sleep, 0.05, budget=budget) is None
     assert 4.8 < budget.remaining < 4.96
     budget.remaining = 0.0
@@ -562,7 +565,7 @@ async def test_a_worker_that_lost_the_document_stops_paying(
 async def test_recognized_text_past_the_document_limit_is_recorded_as_failed(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr(ingestion, "MAX_RECOGNIZED_CHARS_PER_DOCUMENT", len(_RECOGNIZED) + 5)
+    monkeypatch.setattr(ingest_parse, "MAX_RECOGNIZED_CHARS_PER_DOCUMENT", len(_RECOGNIZED) + 5)
     raw = _pdf("scan", "scan")
     doc = await _document("two.pdf", raw)
     await _ingest(doc, "two.pdf", raw, recognizer=_recognizer(doc.store, _Reader()))

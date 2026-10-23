@@ -68,6 +68,7 @@ from control_plane.api import (
     build_external_workspace_router,
     build_feedback_router,
     build_health_router,
+    build_knowledge_figures_router,
     build_knowledge_router,
     build_mcp_catalog_router,
     build_mcp_oauth_router,
@@ -163,7 +164,20 @@ from control_plane.keycloak import (
     ServiceAccountTokenProvider,
 )
 from control_plane.knowledge.ingestion import KnowledgeIngestionRunner, configure_parse_pool
-from control_plane.knowledge.recognition.recognizer import DocumentRecognizer, default_client
+from control_plane.knowledge.recognition.figure_pipeline import (
+    FigureDescriber,
+    default_figure_client,
+)
+from control_plane.knowledge.recognition.figure_reconcile import (
+    FigureReconciler,
+    build_figure_reconciler,
+)
+from control_plane.knowledge.recognition.figure_storage import FigureStorage
+from control_plane.knowledge.recognition.recognizer import (
+    DocumentRecognizer,
+    ModelLimits,
+    default_client,
+)
 from control_plane.knowledge.recovery import KnowledgeIngestRecoveryWorker
 from control_plane.knowledge.usage import IngestUsageRecorder
 from control_plane.manifest import ManifestLoader
@@ -2081,22 +2095,62 @@ def create_app(
                 configure_parse_pool(
                     workers=resolved_settings.knowledge_parse_workers,
                     timeout_s=resolved_settings.knowledge_parse_timeout_s,
+                    max_vm_mb=resolved_settings.knowledge_parse_worker_max_vm_mb,
+                    figure_max_vm_mb=resolved_settings.knowledge_figure_worker_max_vm_mb,
                 )
                 # B-209 — scanned PDF pages are read by the platform's
                 # recognition models; recognition and ingest embeddings are
                 # billed to the uploading tenant (``knowledge_ingest``).
                 ingest_usage = IngestUsageRecorder(resolved_token_usage)
+                document_recognizer_keys = ResolvingProviderKeys(
+                    resolver=credentials_resolver,
+                    secret_store=resolved_secret_store,
+                    secret_cache=credential_value_cache,
+                )
+                # One set of per-model concurrency slots for page recognition
+                # and figure description (review M4).
+                model_limits = ModelLimits()
                 document_recognizer = DocumentRecognizer(
                     store=resolved_knowledge_store,
                     settings=resolved_platform_recognition_config_service,
-                    api_keys=ResolvingProviderKeys(
-                        resolver=credentials_resolver,
-                        secret_store=resolved_secret_store,
-                        secret_cache=credential_value_cache,
-                    ),
+                    api_keys=document_recognizer_keys,
                     usage=ingest_usage,
                     client_factory=default_client(shared_http),
+                    limits=model_limits,
                 )
+                # Originals only on a durable store: the in-memory one forgets
+                # them on restart (thumbnails would 404) — like skill assets.
+                figure_storage = (
+                    FigureStorage(object_store)
+                    if resolved_settings.object_store_backend == "s3-compatible"
+                    else None
+                )
+                # B-209 PR-2 — images inside PDFs / Word / slides are described
+                # into the text (same platform settings, keys and billing); the
+                # originals go to the object store for the segment preview.
+                figure_describer = FigureDescriber(
+                    store=resolved_knowledge_store,
+                    settings=resolved_platform_recognition_config_service,
+                    api_keys=document_recognizer_keys,
+                    recognizer=document_recognizer,
+                    storage=figure_storage,
+                    usage=ingest_usage,
+                    client_factory=default_figure_client(shared_http),
+                    limits=model_limits,
+                )
+                figure_reconciler = build_figure_reconciler(
+                    store=resolved_knowledge_store,
+                    storage=figure_storage,
+                    interval_s=resolved_settings.knowledge_figure_reconcile_interval_s,
+                    delete=resolved_settings.knowledge_figure_reconcile_delete,
+                    ignore_orphan_share=(
+                        resolved_settings.knowledge_figure_reconcile_ignore_orphan_share
+                    ),
+                    session_factory=sql_stores.session_factory if sql_stores else None,
+                )
+                if figure_reconciler is not None:
+                    figure_reconciler.start()
+                    _app.state.knowledge_figure_reconciler = figure_reconciler
                 _app.state.knowledge_ingestion_runner = KnowledgeIngestionRunner(
                     store=resolved_knowledge_store,
                     embedder=embedder,
@@ -2105,6 +2159,7 @@ def create_app(
                     concurrency=resolved_settings.knowledge_ingest_concurrency,
                     recognizer=document_recognizer,
                     usage=ingest_usage,
+                    figures=figure_describer,
                 )
                 # Stream KB — durable crash recovery for ingestion: claims stuck
                 # documents (pending / lease-expired processing) and re-drives
@@ -2119,6 +2174,7 @@ def create_app(
                         max_attempts=resolved_settings.knowledge_ingest_max_attempts,
                         recognizer=document_recognizer,
                         usage=ingest_usage,
+                        figures=figure_describer,
                     )
                     knowledge_recovery_worker.start()
                     _app.state.knowledge_recovery_worker = knowledge_recovery_worker
@@ -2559,6 +2615,11 @@ def create_app(
                 )
                 if knowledge_recovery is not None:
                     await knowledge_recovery.stop()
+                figure_reconciler_running: FigureReconciler | None = getattr(
+                    _app.state, "knowledge_figure_reconciler", None
+                )
+                if figure_reconciler_running is not None:
+                    await figure_reconciler_running.stop()
                 ingestion_runner: KnowledgeIngestionRunner | None = getattr(
                     _app.state, "knowledge_ingestion_runner", None
                 )
@@ -2850,6 +2911,7 @@ def create_app(
     app.include_router(build_artifacts_router())
     app.include_router(build_workspace_router())
     app.include_router(build_knowledge_router())
+    app.include_router(build_knowledge_figures_router())
     app.include_router(build_me_router())
     app.include_router(build_memory_router())
     app.include_router(build_skills_router())

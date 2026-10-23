@@ -35,7 +35,7 @@ from sqlalchemy import (
     func,
     text,
 )
-from sqlalchemy.dialects.postgresql import JSONB, TSVECTOR
+from sqlalchemy.dialects.postgresql import ARRAY, JSONB, TSVECTOR
 from sqlalchemy.dialects.postgresql import UUID as PG_UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -176,6 +176,15 @@ class KnowledgeDocumentRow(Base):
     )
     page_stats: Mapped[dict[str, Any] | None] = mapped_column(
         JSONB(none_as_null=True), nullable=True
+    )
+    #: B-209 PR-2 (migration ``0172``) — figure counts of the latest ingest,
+    #: and the pixel hashes of its figures (the tenant-wide repeated-image
+    #: filter counts documents by them; deferred — only that query reads them).
+    figure_stats: Mapped[dict[str, Any] | None] = mapped_column(
+        JSONB(none_as_null=True), nullable=True
+    )
+    figure_hashes: Mapped[list[str] | None] = mapped_column(
+        ARRAY(Text), nullable=True, deferred=True
     )
     size_bytes: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
     mime: Mapped[str | None] = mapped_column(Text, nullable=True)

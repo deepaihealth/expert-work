@@ -785,6 +785,110 @@ PY
 - [x] **43.2 重排候选加到 100 后耗时正常**:「混合」+ 重排同一库查 3 次,中位数不超过 5 秒。说明:候选数本身没有真栈观测点,由单测(默认 dual/100 给带标题视图 min(融合数, 100) 条、`--rerank-pool 50` 逐字节复现改前请求)与开发集 A/B 覆盖。 **10-22 测试 `f4a075a54` 过**:897 / 966 / 1028 ms,中位 966 ms(库只有 16 段,候选不到 100;PR3 基线 1508 ms 是 69 段库)。
 - [x] **43.3 查询嵌入失败降级关键词**:不在测试环境真触发(要弄坏平台嵌入配置,影响共用测试环境);由单测覆盖(6 种厂商 / 网络故障降级、未配置 / 代码错 / 畸形返回体照旧报错,变异自证)。42.10 的一轮里 4 次检索都没有 `embedding_degraded`。
 
+## §44 B-209 PR-2 文档内图片:描述成文字插回原位 + 原图显示 + 计费(ROADMAP B-209)
+
+**背景**:PDF 文字页的插图、扫描页上识别模型报出的图片区域、Word / 幻灯片里的图片,先过滤(任一边 < 80 px、占 PDF 页面 < 1%、压缩后 < 10 KB、同一文档 ≥ 3 页 / ≥ 3 次出现、同租户 ≥ 3 份文档出现、每份最多 50 张按面积留),再由平台「文档识别」里的图片描述模型(默认 qwen3.8-flash;兜底 = 兜底识别模型,只在配了图片描述模型时才顶上)「先观察再描述」;没配图片描述模型(或它的 key 不可用)时整个图片步骤不跑,文档按改前的样子入库;文字大段的再走识别模型拿图中文字、图表再转成数据;短边 < 400 px 的只描述不抄字。描述以引用块 `> 〔图 <16 位 id>〕描述` 插回原位(不挪到页尾),进切块 / 检索;原图(规整后的 JPEG)存对象存储 `knowledge_figures/{租户}/{库}/{文档}/g{入库代}/{id}.jpg`(入库收尾删掉更早的代;文档行没了的原图由对账任务找出 —— 默认只记日志和指标,`EXPERT_WORK_KNOWLEDGE_FIGURE_RECONCILE_DELETE=true` 才删;只跟 SQL 库一起跑,先证明这次查询看得到所有租户(按 id 查的同一个事务里再核一遍)、查到一半出错或库里查不到任何文档或过半孤儿就放弃、只动一天前写的原图、每轮最多删 1000 个、多副本用 advisory 锁只让一个跑、启动后等一个周期才跑第一轮;列桶按页流式读、演练只报孤儿文档数、真删时按文档前缀重新列且攒够每轮配额就停),分段预览只给服务端确认属于该文档的图显示缩略图。超大图片(像素 > 6000 万、Word 图片在转换器读字节那一刻设上限:单张 > 20 MiB / 一份文档实际读到合计 > 40 MiB 的跳过,同一部件只读一次、正文里只放短标记(重复引用不再展开);幻灯片在交给 python-pptx 前按「大小 x 引用次数」改写,用真正的 XML 解析器读关系,任何 `r:embed` / `r:link` / `r:id` 指向的部件都算图,只有按 `[Content_Types].xml` 登记为 XML 的部件(幻灯片、版式、母版)按 XML 部件的上限算;Word 的预处理也不再把每个部件整个读进内存)不解码,计为「不支持」;Office 包里单个 XML 部件 > 64 MiB、条目 > 20000 个(在建条目列表之前从中央目录尾记录读)、解压后合计 > 256 MiB 的直接解析失败;解析进程有地址空间上限(`EXPERT_WORK_KNOWLEDGE_PARSE_WORKER_MAX_VM_MB`,代码默认 6144,base 配置表 2400),插图进程有自己的上限(`EXPERT_WORK_KNOWLEDGE_FIGURE_WORKER_MAX_VM_MB`,1536),与控制面 pod 内存上限成对 —— `tools/deploy/test_parse_worker_memory_budget.py` 渲染每个 overlay 检查三者(10-22 第五轮复核实测:4Gi + 2400 不够,见 PR 说明);Linux 才生效;控制面 pod 设了 `MALLOC_ARENA_MAX=2` 和 `OMP_NUM_THREADS` / `OPENBLAS_NUM_THREADS` / `MKL_NUM_THREADS` / `NUMEXPR_NUM_THREADS=1`),超了的图片跳过(计「不支持」),别的分配超了只让这份文档解析失败;插图收集 / 裁图在自己的单进程池里跑,它超时只杀它自己。缓存按文档(`knowledge_parse_cache` 的 `figure_desc` / `figure_ocr`),每次调用按租户记 `knowledge_ingest`。迁移 0170(`knowledge_document.figure_stats` / `figure_hashes`)。改前:PDF 插图整张消失;Word 图片变成 `![](data:image/png;base64...)` 占位符混进正文;纯图片的 Word / PPT「成功」入库成一段占位符垃圾段。
+
+**怎么进**:测试环境控制台用 **system_admin** 登录(平台租户);数据库只读查询走测试库;平台设置「文档识别」保持默认(glm-ocr / qwen3.7-flash / qwen3.8-flash)。**测试文件(零租户内容,本机生成)**:
+
+```bash
+uv run --no-sync python - <<'PY'
+import io, random, sys
+import pymupdf
+from PIL import Image, ImageDraw
+sys.path.insert(0, "services/control-plane")
+from tests.knowledge_form_fixtures import picture_docx, picture_pptx
+
+def photo(w=640, h=480, seed=1):  # 噪点图:够大、压缩后远超 10 KB
+    out = io.BytesIO(); Image.frombytes("RGB", (w, h), random.Random(seed).randbytes(w * h * 3)).save(out, "PNG"); return out.getvalue()
+
+def chart():  # 带数值标注的柱状图
+    img = Image.new("RGB", (900, 600), "white"); d = ImageDraw.Draw(img)
+    for i, v in enumerate((120, 180, 150, 240)):
+        d.rectangle((160 + i * 170, 520 - v * 1.6, 250 + i * 170, 520), fill=(70, 120, 200)); d.text((180 + i * 170, 500 - v * 1.6), str(v), fill="black")
+    d.text((350, 20), "FIGURE-CHART-MARKER quarterly units", fill="black"); out = io.BytesIO(); img.save(out, "PNG"); return out.getvalue()
+
+doc = pymupdf.open()
+p = doc.new_page(); p.insert_text((72, 80), "TEXT-ABOVE-MARKER device overview paragraph.", fontsize=12)
+p.insert_image(pymupdf.Rect(72, 110, 372, 335), stream=photo())
+p.insert_text((72, 380), "TEXT-BELOW-MARKER closing paragraph.", fontsize=12)
+paper = Image.new("RGB", (1240, 1754), "white"); paper.paste(Image.open(io.BytesIO(chart())), (170, 600))
+ImageDraw.Draw(paper).text((120, 200), "SCAN-WITH-CHART-MARKER 5521 page heading", fill="black")
+buf = io.BytesIO(); paper.save(buf, "PNG"); doc.new_page().insert_image(pymupdf.Rect(0, 0, 595, 842), stream=buf.getvalue())
+doc.save("/tmp/b209-figures.pdf")
+open("/tmp/b209-picture.docx", "wb").write(picture_docx(photo(seed=2), before="WORD-BEFORE-MARKER", after="WORD-AFTER-MARKER"))
+open("/tmp/b209-picture-only.docx", "wb").write(picture_docx(photo(seed=3)))
+open("/tmp/b209-picture-only.pptx", "wb").write(picture_pptx(photo(seed=4)))
+logo = photo(300, 120, seed=5); rep = pymupdf.open()
+for n in range(3):
+    pg = rep.new_page(); pg.insert_text((72, 200), f"LOGO-PAGE-{n} " + "words of the letter " * 6, fontsize=11); pg.insert_image(pymupdf.Rect(72, 30, 252, 102), stream=logo)
+rep.save("/tmp/b209-logo3.pdf")
+PY
+```
+
+- [ ] **44.1 迁移**:`SELECT version_num FROM alembic_version` 为 `0172_kb_document_figures`;`SELECT column_name, data_type FROM information_schema.columns WHERE table_name='knowledge_document' AND column_name IN ('figure_stats','figure_hashes')`。判据:两列都在(`jsonb` / `ARRAY`),旧文档两列为空。
+- [ ] **44.2 混合 PDF 的插图插在原位**:任一临时库上传 `b209-figures.pdf`。判据:① 文档 ready;列表显示「已识别 1 页」**和**「已描述 2 张图」;② 分段预览里第 1 页的 `> 〔图 …〕` 引用块排在 `TEXT-ABOVE-MARKER` 与 `TEXT-BELOW-MARKER` 之间(不在页尾);第 2 页(扫描页)的图表引用块排在 `SCAN-WITH-CHART-MARKER` 之后、带 `〔图表数据〕` 和 120 / 180 / 150 / 240;③ `GET …/documents/{id}/pages` 两页都是 `figures_kept=1`、`figures_described=1`;④ 文档 `figure_stats` 为 `extracted=2, described=2`,其余 0。**没修好时**:第 1 页的图整张消失,扫描页只有标题文字。
+- [ ] **44.3 带图 Word / 纯图片 Word / 纯图片 PPT**:上传 `b209-picture.docx`、`b209-picture-only.docx`、`b209-picture-only.pptx`。判据:① 三份都 ready;② 分段里没有 `data:image`、没有 `![`;③ `b209-picture.docx` 的引用块在 `WORD-BEFORE-MARKER` 与 `WORD-AFTER-MARKER` 之间;④ 两份纯图片文件各一段,内容就是图片描述引用块,`figure_stats.described=1`。**没修好时**:纯图片文件「成功」入库成一段 `![](data:image/png;base64...)` / `![Picture 2](Picture2.jpg)` 垃圾段。
+- [ ] **44.4 原图显示**:打开 44.2 文档的分段预览。判据:每个 `〔图 …〕` 引用块右侧有原图缩略图,点开可放大;浏览器开发者工具里请求 `GET /v1/knowledge/bases/{库}/documents/{文档}/figures/{id}` 回 200、`content-type: image/jpeg`、`x-content-type-options: nosniff`、`cache-control: private, no-cache`、带 `etag`;刷新页面同一请求回 304(浏览器带 `If-None-Match`)。检索测试 / 智能体看到的只有文字。
+- [ ] **44.5 跨租户的原图 URL 一律 404**:用**另一个租户**(非 system_admin)的账号或 API 凭据,请求 44.4 那个原图 URL(同样的库名、文档 id、图片 id)。判据:404。再用平台租户请求一个**不存在**的图片 id(16 位十六进制)、一个格式不对的 id(`abc`):都 404。**没修好时**:别的租户拿到 200 和图片字节。
+- [ ] **44.6 计费**:`SELECT model, input_tokens, output_tokens, usage_kind, agent_name FROM token_usage WHERE tenant_id='<平台租户>' AND usage_kind='knowledge_ingest' AND created_at > '<上传时刻>' ORDER BY created_at`。判据:44.2 的文档有 qwen3.8-flash 行(每张图一次描述 + 图表一次转数据)和 glm-ocr 一行(扫描页),token > 0、`agent_name` 空;用量页「按用途 → 知识库入库」成本不是 0(价目表 0169 已有 qwen3.8-flash)。**没有 qwen3.8-flash 行**:查日志 `knowledge.figure_call_failed` / `knowledge.ingest_usage_write_failed`。
+- [ ] **44.7 重新摄取不重复付费**:对 44.2 的文档点「重新摄取」。判据:没有新增 qwen3.8-flash / glm-ocr 的 `knowledge_ingest` 行;`SELECT kind, count(*) FROM knowledge_parse_cache WHERE document_id='<该文档 id>' GROUP BY kind` 前后一样(`page_ocr` 1、`figure_desc` 2、`figure_ocr` 1);分段内容不变。
+- [ ] **44.8 小图不抄字**:用短边 < 400 px 的带字图片(例如 `picture_docx` 里放一张 350×300、写着「规格 500g 批号 A2026」的图)上传。判据:引用块只有一句描述,没有 `〔图中文字〕`,描述里不出现具体规格 / 批号数字。
+- [ ] **44.9 重复的 logo 不描述**:上传 `b209-logo3.pdf`。判据:ready;`figure_stats` 为 `extracted=1, filtered=1`、`described=0`;没有新增 qwen3.8-flash 用量;分段与改前一样(只有文字)。
+- [ ] **44.10 没配图片描述模型 → 图片步骤整个不跑**:平台设置只把图片描述模型清空(兜底识别模型保持 qwen3.7-flash),上传 `b209-picture.docx`(换文件名)。判据:ready,文字与改前一样、没有引用块、没有「待描述」,`figure_stats` 为空;没有任何 qwen3.7-flash / qwen3.8-flash 的 `knowledge_ingest` 新行(兜底不会单独顶上)。恢复设置后点「重新摄取」。判据:变「已描述 1 张图」,只新增一行 qwen3.8-flash 用量。测完恢复默认。
+- [ ] **44.11 删文档 / 删库即删原图**:记下 44.4 的原图 URL,删掉 44.2 的文档。判据:同一 URL 回 404;对象存储里 `knowledge_figures/{平台租户}/{库 id}/{文档 id}/` 前缀为空(运维侧列桶)。删整个临时库后,`knowledge_figures/{平台租户}/{库 id}/` 前缀为空。
+- [ ] **44.12 WMF / EMF 图片计数不报错**(可选,有带 WMF 的 PPT 时):判据:文档 ready,`figure_stats.unsupported` 计数 ≥ 1,其余图片照常描述。镜像里没有 WMF / EMF 栅格化工具,这类图跳过不描述(已知限制)。
+- [ ] **44.13 换图重传只留新一代原图**:把 44.3 的 `b209-picture.docx` 换一张图(`picture_docx(photo(seed=9), before=..., after=...)`)同名重传。判据:ready 后 `knowledge_figures/{平台租户}/{库 id}/{文档 id}/` 下只有 `g{新代}/` 一个目录、一张图;分段预览缩略图是新图。**没修好时**:旧图留在桶里(文档删了也只删得掉当前代)。
+- [ ] **44.14 对账任务:默认只演练、查询可信才动**:① 发版后一个周期(`EXPERT_WORK_KNOWLEDGE_FIGURE_RECONCILE_INTERVAL_S`,默认 3600)内,日志里**没有** `knowledge.figure_reconcile_aborted`(有的话看 `reason`:`rls_not_bypassed` = 连接受行级安全约束、`lookup_failed` = 按 id 查到一半出错、`no_documents_found` / `orphan_share` = 库和桶对不上),指标 `expert_work_knowledge_figure_orphans` 出现(值 0 或 N —— N 是**文档数**:文档已不在、还有一天前写的原图的文档有几个,不是原图个数);两个副本里每轮只有一个真正跑(另一个拿不到 advisory 锁直接跳过,不打日志)。锁跟着一个一直开着的事务:持锁的节点整个死掉时,锁要等 TCP keepalive 断开或空闲事务超时(6 小时)才放,这期间对账不跑 —— 不出错,只是晚;要提前放,在库里 `SELECT pg_terminate_backend(pid) FROM pg_locks WHERE locktype = 'advisory' AND classid = 8623`。
+  - **库只是桶的一部分时**(例如测试库指向了生产桶、或从生产库裁出的子集库):桶里属于别的库的文档在这个库里都查不到,看起来全是孤儿 —— 过半就 `orphan_share` 放弃(这是保护在起作用,**不要**打开删除);没过半(这个库的文档占多数)就会把别的库的原图算成孤儿,所以**这种部署永远不要打开 `EXPERT_WORK_KNOWLEDGE_FIGURE_RECONCILE_DELETE`**。
+  - **真的大批删除之后**(例如一次删掉一半以上的库、当时对象存储又不可用),每一轮都会因 `orphan_share` 放弃、永远不清。确认是这种情况后,临时设 `EXPERT_WORK_KNOWLEDGE_FIGURE_RECONCILE_IGNORE_ORPHAN_SHARE=true`(连同 `…_DELETE=true`)重启 —— 打开期间每轮都有警告 `knowledge.figure_reconcile_orphan_share_override`、指标 `expert_work_knowledge_figure_reconcile_orphan_share_override` 为 1 —— 等日志里不再出现 `knowledge.figure_orphans_deleted`(打开删除后每轮记的是这一行,不是 `figure_orphans_found`;每轮最多删 1000 个)、指标 `expert_work_knowledge_figure_orphans` 回到 0 后,两个都改回 false 再重启。② 运维侧往桶里放一个 `knowledge_figures/{平台租户}/{随机 uuid}/{随机 uuid}/g0/0123456789abcdef.jpg`;**一天后**(只动 24 小时前写的)的下一轮:日志 `knowledge.figure_orphans_found documents=1 dry_run=true`,这个键**还在**。③ 只有决定打开删除时:设 `EXPERT_WORK_KNOWLEDGE_FIGURE_RECONCILE_DELETE=true` 重启,下一轮这个键被删,日志 `knowledge.figure_orphans_deleted count=1 documents=1`,指标 `expert_work_knowledge_figure_orphans_deleted_total` +1;桶里其他前缀不动。
+- [ ] **44.15 超大图片不解码、不拖垮 pod**:本机生成两份(都很小,压缩率高):
+
+```bash
+uv run --no-sync python - <<'PY'
+import io, random, sys, zipfile
+import pymupdf
+from PIL import Image, ImageDraw
+sys.path.insert(0, "services/control-plane")
+from tests.knowledge_form_fixtures import picture_docx
+big = pymupdf.open(); p = big.new_page()
+for n in range(12): p.insert_text((72, 430 + 24 * n), f"HUGE-PICTURE-MARKER line {n} of the text page.", fontsize=11)
+huge = Image.new("L", (10000, 7000), 255); rng = random.Random(7); d = ImageDraw.Draw(huge)
+d.point([(rng.randrange(10000), rng.randrange(7000)) for _ in range(60000)], fill=0)
+out = io.BytesIO(); huge.save(out, "PNG"); p.insert_image(pymupdf.Rect(72, 60, 500, 360), stream=out.getvalue())
+big.save("/tmp/b209-huge.pdf")
+small = io.BytesIO(); Image.new("RGB", (640, 480), "white").save(small, "PNG")
+src = zipfile.ZipFile(io.BytesIO(picture_docx(small.getvalue(), before="BOMB-BEFORE-MARKER"))); dst = io.BytesIO()
+with zipfile.ZipFile(dst, "w", zipfile.ZIP_DEFLATED) as z:
+    for item in src.infolist():
+        z.writestr(item.filename, b"\0" * (41 << 20) if item.filename.startswith("word/media/") else src.read(item))
+open("/tmp/b209-media-bomb.docx", "wb").write(dst.getvalue())
+PY
+```
+
+  上传两份。判据:都 ready、文字(`HUGE-PICTURE-MARKER` / `BOMB-BEFORE-MARKER`)在;`figure_stats.unsupported=1`、`described=0`;控制面 pod 没有重启(`kubectl get pod` 的 RESTARTS 不变,`kubectl describe pod` 的 Last State 没有 `OOMKilled`)。**顺带**:`kubectl exec` 进控制面 pod,`cat /proc/1/environ | tr '\0' '\n' | grep MALLOC_ARENA_MAX` 为 `2`;对解析子进程 `grep "Max address space" /proc/<pid>/limits` 为 configmap 所配上限(2400 MiB = `2516582400`);`kubectl -n expert-work get deploy control-plane -o jsonpath='{.spec.template.spec.containers[0].resources.limits.memory}'` 为 `4Gi`;`EXPERT_WORK_KNOWLEDGE_PARSE_WORKERS` 为 `1`(10-23 拍板:4 GiB + 1 个解析进程 × 2400 MiB + 插图进程 1536 MiB)。
+- [ ] **44.16 内存上限只让一份文档失败,不让 pod 重启**(临时把 `EXPERT_WORK_KNOWLEDGE_PARSE_WORKER_MAX_VM_MB` 设成 `1800` 重启;测完改回):本机生成一份解压后约 110 MB 文字的 Word(压缩后约 0.5 MB)和一份 4800 万像素照片的 Word:
+
+```bash
+uv run --no-sync python - <<'PY'
+import io, sys, zipfile
+from PIL import Image, ImageFilter
+sys.path.insert(0, "services/control-plane")
+from tests.knowledge_form_fixtures import _docx, _docx_paragraph, picture_docx
+line = "MEMORY-GUARD-MARKER ordinary words of a long manual paragraph " * 14
+src = zipfile.ZipFile(io.BytesIO(_docx("".join(_docx_paragraph(line, None) for _ in range(120_000))))); dst = io.BytesIO()
+with zipfile.ZipFile(dst, "w", zipfile.ZIP_DEFLATED) as z:
+    for item in src.infolist(): z.writestr(item.filename, src.read(item))
+open("/tmp/b209-bigtext.docx", "wb").write(dst.getvalue())
+small = Image.effect_noise((1000, 750), 60).convert("RGB").filter(ImageFilter.GaussianBlur(4))
+photo = Image.blend(small.resize((8000, 6000)), Image.effect_noise((8000, 6000), 12).convert("RGB"), 0.25)
+out = io.BytesIO(); photo.save(out, "JPEG", quality=90)
+open("/tmp/b209-photo48.docx", "wb").write(picture_docx(out.getvalue(), before="PHOTO-MARKER " * 20))
+PY
+```
+
+  先传 `b209-photo48.docx`。判据:ready、`PHOTO-MARKER` 在、`figure_stats.unsupported=1`(这张图超了上限被跳过),控制面日志有 `knowledge.figure_out_of_memory`。再传 `b209-bigtext.docx`。判据:配了图片描述模型时它在图片步骤之前就被拒,立刻 FAILED,`error` 含 `a part of the file unpacks to more than a document may`(单个 XML 部件 > 64 MiB,没占内存);图片描述模型没配(走普通解析)时同时另传一份普通文档,`b209-bigtext.docx` FAILED,`error` 是 `needs more memory than a parse may use` **或** `A process in the process pool was terminated abruptly`(本机实测:C 扩展里分配失败时子进程直接退出,表现为后者;解析池会重建、重试一次),那份普通文档 ready。两种情况都要 RESTARTS 不变、没有 `OOMKilled`。测完把上限改回原值。
+
 ## §45 B-206 第 1 步续:K-6 工具说明(#1901)+ K-7a 重排限速 / 重试 / 结果状态
 
 **背景**:#1901 —— `knowledge_search` 的工具说明末尾加了「小而准的多次检索、找全题搜到没有新文档为止、下结论前逐条核对」一段(只在绑了知识库的智能体上出现)。K-7a —— 每次重排 HTTP 请求先从全局桶取额度:按模型目录 `rpm` 均匀间隔、不攒突发(`qwen3-vl-rerank` 600 RPM = 每 100 ms 一次;目录没写 `rpm` 的模型不限速、只靠并发上限 + 429 重试);有 Redis 时多副本共用,键 `rl:llm:rerank:{provider}:{model}:{secret_ref}`,桶时间改读 Redis `TIME`(同一段 Lua 也给 B-44 的 LLM 限速用);同模型并发上限;429 / 5xx / 超时 / 阿里 400 `Throttling*` `InternalError*` 退避重试(限流后首次至少等 1 s,上限 8 s,最多 3 次);一次检索两个视图共用 10 秒等待上限,剩余不足 1 s 不再发请求;一个视图失败保留另一个视图的顺序(`partial`),都失败才退回融合顺序;记忆召回单独 2.5 秒上限;新增 `rerank_outcome`(`ok / partial / rate_limited / model_error / model_unavailable / no_model`),检索测试页与轨迹面板在非 `ok` 时显示提示(没配模型 / 密钥缺失是提示样式,真失败是警告样式)。厂商探针(10-22,¥0.125):超限回 HTTP 429 `Throttling.RateQuota`,不带 Retry-After,按 RPM/60 每秒限。

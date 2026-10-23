@@ -8,8 +8,10 @@ at construction time; no application code changes for migrations.
 
 from __future__ import annotations
 
+import base64
+import hashlib
 import logging
-from collections.abc import AsyncIterator, Mapping
+from collections.abc import AsyncIterator, Mapping, Sequence
 from datetime import datetime
 from typing import Any, Literal
 
@@ -26,6 +28,66 @@ logger = logging.getLogger(__name__)
 #: S3 multipart 分片大小(spec § 4.2:常驻内存 ≤ 单分片;S3 硬下限 5 MiB,
 #: 10k 片上限 → 64 MiB x 10k = 640 GiB 单对象天花板,远超工作区配额量级)。
 _MULTIPART_PART_SIZE = 64 * 1024 * 1024
+#: Keys per ``DeleteObjects`` request (the S3 limit).
+_DELETE_BATCH = 1000
+#: Error codes meaning the backend does not take ``DeleteObjects`` as botocore
+#: builds it (an S3-compatible service's own rules) — only these fall back to
+#: one request per key; anything else (AccessDenied, SlowDown, ...) is raised.
+_BATCH_SHAPE_ERRORS = frozenset(
+    {
+        "MissingArgument",
+        "InvalidDigest",
+        "BadDigest",
+        "MalformedXML",
+        "InvalidRequest",
+        "NotImplemented",
+    }
+)
+
+
+#: Error codes about the bucket / the service, not one key.
+_STORE_WIDE_ERRORS = frozenset(
+    {
+        "AccessDenied",
+        "AllAccessDisabled",
+        "InvalidAccessKeyId",
+        "SignatureDoesNotMatch",
+        "SlowDown",
+        "Throttling",
+        "RequestTimeout",
+        "ServiceUnavailable",
+        "InternalError",
+    }
+)
+
+
+def _store_wide(exc: Exception) -> bool:
+    """Whether a rejection is about the bucket / service, not one key."""
+    response = getattr(exc, "response", None) or {}
+    code = response.get("Error", {}).get("Code")
+    status = response.get("ResponseMetadata", {}).get("HTTPStatusCode") or 0
+    return code in _STORE_WIDE_ERRORS or status >= 500 or status in (401, 403, 429)
+
+
+def add_content_md5(request: Any, **_: Any) -> None:
+    """``before-sign`` handler for ``DeleteObjects``: Aliyun OSS requires a
+    ``Content-MD5`` on a batch delete, and botocore (1.36+) sends only a CRC32
+    checksum. Set before signing, so the header is signed as well."""
+    if "Content-MD5" in request.headers:
+        return
+    body = request.body
+    if isinstance(body, str):
+        body = body.encode()
+    if not isinstance(body, bytes | bytearray):
+        return  # a streamed body: not hashable without consuming it
+    digest = hashlib.md5(body, usedforsecurity=False).digest()
+    request.headers["Content-MD5"] = base64.b64encode(digest).decode()
+
+
+def register_oss_compat(events: Any) -> None:
+    """Hook the request adjustments S3-compatible backends need into a
+    botocore client's event system (``client.meta.events``)."""
+    events.register("before-sign.s3.DeleteObjects", add_content_md5)
 
 
 class S3CompatibleObjectStore:
@@ -209,7 +271,58 @@ class S3CompatibleObjectStore:
     async def delete(self, key: str) -> None:
         # S3 DeleteObject is idempotent — no error when key is absent —
         # matching the Protocol contract.
-        await self._client.delete_object(Bucket=self._bucket, Key=key)
+        try:
+            await self._client.delete_object(Bucket=self._bucket, Key=key)
+        except self._client.exceptions.ClientError as exc:
+            msg = f"delete failed for key={key!r}: {exc}"
+            raise ObjectStoreError(msg) from exc
+
+    async def delete_many(self, keys: Sequence[str]) -> None:
+        """Delete ``keys`` with ``DeleteObjects``, 1,000 per request (the S3
+        limit). Idempotent like :meth:`delete`. A batch the backend rejects
+        for its shape (:data:`_BATCH_SHAPE_ERRORS`) is deleted key by key
+        instead; any other rejection raises at once. Keys the backend could
+        not delete do not stop the other batches: one
+        :class:`ObjectStoreError` names them all at the end."""
+        failed: list[str] = []
+        for start in range(0, len(keys), _DELETE_BATCH):
+            chunk = list(keys[start : start + _DELETE_BATCH])
+            batch = [{"Key": key} for key in chunk]
+            try:
+                response = await self._client.delete_objects(
+                    Bucket=self._bucket, Delete={"Objects": batch, "Quiet": True}
+                )
+            except self._client.exceptions.ClientError as exc:
+                code = (getattr(exc, "response", None) or {}).get("Error", {}).get("Code")
+                if code not in _BATCH_SHAPE_ERRORS:
+                    msg = f"delete_objects failed ({code}): {exc}"
+                    raise ObjectStoreError(msg) from exc
+                logger.warning(
+                    "object_store.delete_objects_rejected keys=%d code=%s — one by one",
+                    len(chunk),
+                    code,
+                )
+                failed.extend(await self._delete_each(chunk))
+                continue
+            failed.extend(str(error.get("Key")) for error in response.get("Errors") or [])
+        if failed:
+            msg = f"delete failed for {len(failed)} keys (first: {failed[0]!r})"
+            raise ObjectStoreError(msg)
+
+    async def _delete_each(self, keys: Sequence[str]) -> list[str]:
+        """Delete ``keys`` one request each; the keys that failed. An error that
+        is not about the one key (refused, throttled, the service failing)
+        raises at once — the rest would only fail the same way."""
+        failed = []
+        for key in keys:
+            try:
+                await self._client.delete_object(Bucket=self._bucket, Key=key)
+            except self._client.exceptions.ClientError as exc:
+                if _store_wide(exc):
+                    msg = f"delete failed for key={key!r}: {exc}"
+                    raise ObjectStoreError(msg) from exc
+                failed.append(key)
+        return failed
 
     async def list_prefix(self, prefix: str) -> list[str]:
         keys: list[str] = []
@@ -221,6 +334,38 @@ class S3CompatibleObjectStore:
                     keys.append(k)
         keys.sort()
         return keys
+
+    async def iter_prefix_modified(self, prefix: str) -> AsyncIterator[list[tuple[str, datetime]]]:
+        """``(key, last modified)`` under ``prefix``, one listing page at a
+        time (memory stays at one page, whatever the bucket holds)."""
+        paginator = self._client.get_paginator("list_objects_v2")
+        try:
+            async for page in paginator.paginate(Bucket=self._bucket, Prefix=prefix):
+                found = []
+                for obj in page.get("Contents", []) or []:
+                    key, modified = obj.get("Key"), obj.get("LastModified")
+                    if key is not None and isinstance(modified, datetime):
+                        found.append((key, modified))
+                yield found
+        except self._client.exceptions.ClientError as exc:
+            msg = f"list failed for prefix={prefix!r}: {exc}"
+            raise ObjectStoreError(msg) from exc
+
+    async def list_prefix_modified(self, prefix: str) -> list[tuple[str, datetime]]:
+        """``(key, last modified)`` of every object under ``prefix``, by key."""
+        found: list[tuple[str, datetime]] = []
+        paginator = self._client.get_paginator("list_objects_v2")
+        try:
+            async for page in paginator.paginate(Bucket=self._bucket, Prefix=prefix):
+                for obj in page.get("Contents", []) or []:
+                    key, modified = obj.get("Key"), obj.get("LastModified")
+                    if key is not None and isinstance(modified, datetime):
+                        found.append((key, modified))
+        except self._client.exceptions.ClientError as exc:
+            msg = f"list failed for prefix={prefix!r}: {exc}"
+            raise ObjectStoreError(msg) from exc
+        found.sort()
+        return found
 
     async def presigned_url(
         self,

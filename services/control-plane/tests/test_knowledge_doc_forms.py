@@ -10,6 +10,8 @@
 * Ⓔ 对话不在一句话中间切开;
 * Ⓓ 带表格行的分段都带表头,表格行不被切开、且排在表头之下;
 * Ⓕ 没有文字层的文件:带错误码的解析失败,或零个分段 —— 不出别的异常、不出垃圾段。
+* Ⓕ 纯图片的 Word / 幻灯片(B-209 PR-2):图片带着字节抽出来,不再留下占位符垃圾段;图能描述时
+  文件按描述可检索,图被过滤时带原因失败、计数记在文档上。
 * Ⓕ 混合 PDF(B-209):每页都有记录,扫描页认不出也不静默为空;认得出时按页序插回。
 
 现在不成立、B-206 要修的标 ``xfail(strict=True)``:修好那天它变红,逼着把标记摘掉。
@@ -34,6 +36,8 @@ from control_plane.knowledge.ingestion import (
 )
 from control_plane.knowledge.parsing import DocumentParseError, parse_document
 from control_plane.knowledge.recognition.clients import Reading
+from control_plane.knowledge.recognition.figure_markup import FIGURE_LABEL
+from control_plane.knowledge.recognition.figure_pipeline import FigureDescriber
 from control_plane.knowledge.recognition.recognizer import (
     DocumentRecognizer,
     ModelChoice,
@@ -44,6 +48,7 @@ from expert_work.protocol import (
     DEFAULT_CHUNK_MAX_TOKENS,
     DEFAULT_CHUNK_OVERLAP_TOKENS,
     DocumentPage,
+    FigureStats,
     IngestErrorCode,
     KnowledgeChunk,
     PageDecision,
@@ -51,7 +56,13 @@ from expert_work.protocol import (
     PageStatus,
 )
 from orchestrator.llm import Embedder, FakeEmbedder
-from tests.knowledge_form_fixtures import MIXED_DOCS, SCANNED_DOCS, TEXT_FORM_DOCS, FormDoc
+from tests.knowledge_form_fixtures import (
+    MIXED_DOCS,
+    PICTURE_DOCS,
+    SCANNED_DOCS,
+    TEXT_FORM_DOCS,
+    FormDoc,
+)
 
 #: Tokens are counted on the joined text and a join can merge with its
 #: neighbour — the same slack ``test_knowledge_chunking`` allows the cap.
@@ -307,22 +318,8 @@ async def test_dialogue_lines_are_never_cut(doc: FormDoc) -> None:
 # Ⓕ 扫描件 / 图片
 # ---------------------------------------------------------------------------
 
-_IMAGE_PLACEHOLDER = (
-    "no owner in B-206 (B-175 P5 OCR): an image-only {} parses to its image "
-    "placeholder markup, not to empty text, and is stored as one junk chunk"
-)
 
-
-@pytest.mark.parametrize(
-    "doc",
-    _params(
-        SCANNED_DOCS,
-        xfail={
-            "scan-docx": _IMAGE_PLACEHOLDER.format("Word file"),
-            "scan-pptx": _IMAGE_PLACEHOLDER.format("slide deck"),
-        },
-    ),
-)
+@pytest.mark.parametrize("doc", _params(SCANNED_DOCS))
 async def test_scanned_document_yields_no_chunks(doc: FormDoc) -> None:
     try:
         ingested = await _ingest(doc)
@@ -330,6 +327,87 @@ async def test_scanned_document_yields_no_chunks(doc: FormDoc) -> None:
         assert failure_code(exc) in {IngestErrorCode.PARSE_FAILED, IngestErrorCode.UNSUPPORTED_FILE}
     else:
         assert ingested.chunks == []
+
+
+_OFFICE_SCANS = [doc for doc in SCANNED_DOCS if doc.slug in {"scan-docx", "scan-pptx"}]
+
+
+@pytest.mark.parametrize("doc", _params(_OFFICE_SCANS))
+def test_a_picture_only_office_file_leaves_no_placeholder_markup(doc: FormDoc) -> None:
+    # B-209 PR-2 (was xfail strict): the picture used to parse to its markup —
+    # ``![](data:image/png;base64...)`` / ``![scan](scan.jpg)`` — stored as one
+    # junk chunk. Now it is read with its bytes; with nothing to describe it
+    # leaves no text at all, so the file fails to parse instead.
+    with pytest.raises(DocumentParseError) as raised:
+        parse_document(doc.filename, doc.raw)
+    assert failure_code(raised.value) is IngestErrorCode.PARSE_FAILED
+
+
+class _Describe:
+    """Fake vision model: every picture is a device photo."""
+
+    async def read(self, image: bytes) -> Reading:
+        assert image.startswith(b"\xff\xd8")
+        return Reading(
+            text='{"text": "none", "chart": false, "description": "设备的外观照片。"}',
+            finish_reason="stop",
+        )
+
+
+def _describer(store: InMemoryKnowledgeStore) -> FigureDescriber:
+    return FigureDescriber(
+        store=store,
+        settings=_PlatformRecognition(),
+        api_keys=_key,
+        client_factory=lambda choice, key, prompt, user, cap: _Describe(),
+    )
+
+
+async def _ingest_with_figures(doc: FormDoc) -> tuple[list[KnowledgeChunk], FigureStats | None]:
+    store = InMemoryKnowledgeStore()
+    tenant = uuid4()
+    base = await store.create_base(tenant_id=tenant, name="kb")
+    document = await store.upsert_document(
+        tenant_id=tenant, kb_id=base.id, filename=doc.filename, content=doc.raw
+    )
+    try:
+        await ingest_document_bytes(
+            store=store,
+            embedder=FakeEmbedder(),
+            tenant_id=tenant,
+            document_id=document.id,
+            kb_id=base.id,
+            filename=doc.filename,
+            raw=doc.raw,
+            chunk_max_tokens=DEFAULT_CHUNK_MAX_TOKENS,
+            chunk_overlap_tokens=DEFAULT_CHUNK_OVERLAP_TOKENS,
+            figures=_describer(store),
+        )
+    finally:
+        fetched = await store.get_document(tenant_id=tenant, document_id=document.id)
+    chunks, _ = await store.list_chunks(tenant_id=tenant, document_id=document.id, limit=100)
+    return chunks, fetched.figure_stats if fetched is not None else None
+
+
+@pytest.mark.parametrize("doc", _params(_OFFICE_SCANS))
+async def test_a_filtered_picture_fails_the_file_with_its_count(
+    doc: FormDoc, _parse_pool: None
+) -> None:
+    # The scan here is a 64 px grey square: under the figure filters' 80 px floor.
+    with pytest.raises(DocumentParseError, match="1 pictures, 1 filtered"):
+        await _ingest_with_figures(doc)
+
+
+@pytest.mark.parametrize("doc", _params(PICTURE_DOCS))
+async def test_a_picture_only_office_file_is_searchable_by_its_description(
+    doc: FormDoc, _parse_pool: None
+) -> None:
+    chunks, stats = await _ingest_with_figures(doc)
+    # One chunk: the description (a slide deck keeps MarkItDown's slide marker).
+    assert [f"> {FIGURE_LABEL} " in chunk.content for chunk in chunks] == [True]
+    assert "设备的外观照片。" in chunks[0].content
+    assert "data:image" not in chunks[0].content
+    assert stats == FigureStats(extracted=1, described=1)
 
 
 # ---------------------------------------------------------------------------
@@ -370,6 +448,7 @@ class _PlatformRecognition:
             primary=ModelChoice("glm", "glm-ocr"),
             fallback=ModelChoice("qwen", "qwen3.7-flash"),
             max_pages=1000,
+            figure=ModelChoice("qwen", "qwen3.8-flash"),
         )
 
 

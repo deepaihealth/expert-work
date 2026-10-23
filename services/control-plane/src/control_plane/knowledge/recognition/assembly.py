@@ -34,19 +34,30 @@ def cap_recognized_text(outcomes: Mapping[int, PageOutcome], limit: int) -> dict
     return capped
 
 
-def page_records(analysis: PdfAnalysis, outcomes: Mapping[int, PageOutcome]) -> list[DocumentPage]:
+def page_records(
+    analysis: PdfAnalysis,
+    outcomes: Mapping[int, PageOutcome],
+    *,
+    figures_kept: Mapping[int, int] | None = None,
+    figures_described: Mapping[int, int] | None = None,
+) -> list[DocumentPage]:
     """Every page's record (B-209 §5.6): how its text was obtained and, for a
-    scanned page, what recognition made of it."""
+    scanned page, what recognition made of it; with the page's figures kept /
+    described (PR-2; 1-based page → count)."""
+    kept, described = figures_kept or {}, figures_described or {}
     records = []
     for page in analysis.pages:
+        number = page.index + 1
         if page.decision is not PageDecision.OCR:
             records.append(
                 DocumentPage(
-                    page=page.index + 1,
+                    page=number,
                     decision=page.decision,
                     reason=page.reason,
                     chars=page.chars,
                     images=page.images,
+                    figures_kept=kept.get(number, 0),
+                    figures_described=described.get(number, 0),
                 )
             )
             continue
@@ -55,7 +66,7 @@ def page_records(analysis: PdfAnalysis, outcomes: Mapping[int, PageOutcome]) -> 
         )
         records.append(
             DocumentPage(
-                page=page.index + 1,
+                page=number,
                 decision=page.decision,
                 reason=page.reason,
                 status=outcome.status,
@@ -65,6 +76,8 @@ def page_records(analysis: PdfAnalysis, outcomes: Mapping[int, PageOutcome]) -> 
                 images=page.images,
                 cached=outcome.cached,
                 error=outcome.error,
+                figures_kept=kept.get(number, 0),
+                figures_described=described.get(number, 0),
             )
         )
     return records

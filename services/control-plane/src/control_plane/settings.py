@@ -525,6 +525,32 @@ class Settings(BaseSettings):
     #: thread-safe): worker processes, and the per-document parse timeout.
     knowledge_parse_workers: int = Field(default=2, gt=0)
     knowledge_parse_timeout_s: int = Field(default=600, gt=0)
+    #: B-209 PR-2 (security review S-M1) —— address-space ceiling of one parse
+    #: worker (MiB, ``RLIMIT_AS``, Linux only; 0 = none): a document that needs
+    #: more fails its own parse instead of taking the pod down. Measured in the
+    #: control-plane image (2026-10-22): a worker's VmSize is ~0.3 GB idle and
+    #: ~4.5 GB after one parse (RSS ~0.55 GB; glibc per-thread arenas — 46
+    #: threads); with ``MALLOC_ARENA_MAX=2`` it is ~1.65 GB, which would allow a
+    #: much lower ceiling. The default leaves ~1.5 GB of headroom on the first.
+    knowledge_parse_worker_max_vm_mb: int = Field(default=6144, ge=0)
+    #: B-209 PR-2 (review round 5) —— the figure worker's own ceiling (MiB; 0 =
+    #: none). It renders clips and pages at most 2,000 px on the long edge, so it
+    #: needs far less than a parse worker (a 59 MP picture peaks at ~1.04 GB of
+    #: address space) — see ``tools/deploy/test_parse_worker_memory_budget.py``.
+    knowledge_figure_worker_max_vm_mb: int = Field(default=1536, ge=0)
+    #: B-209 PR-2 (review H5) —— how often original figures of deleted documents
+    #: are swept from the object store (s3-compatible backend + SQL store only;
+    #: the first pass waits one interval after start).
+    knowledge_figure_reconcile_interval_s: int = Field(default=3600, gt=0)
+    #: B-209 PR-2 (re-review H1) —— off: the sweep only counts and logs what it
+    #: would delete (``knowledge.figure_orphans_found``, gauge
+    #: ``expert_work_knowledge_figure_orphans``); on: it deletes them.
+    knowledge_figure_reconcile_delete: bool = False
+    #: B-209 PR-2 (re-review round 4) —— operator override: run a pass although
+    #: more than half the documents seen look orphaned (the guard that stops a
+    #: broken lookup from deleting everything). Only after confirming the
+    #: orphans really are from a mass deletion; switch it off again after.
+    knowledge_figure_reconcile_ignore_orphan_share: bool = False
 
     # ------------------------------------------------------------------ memory DLQ (K.K7)
     #: Stream K.K7 — how often the memory writeback DLQ worker scans

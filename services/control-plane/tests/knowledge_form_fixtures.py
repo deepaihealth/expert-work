@@ -19,7 +19,9 @@
 from __future__ import annotations
 
 import csv
+import hashlib
 import io
+import struct
 import zipfile
 from dataclasses import dataclass
 from xml.sax.saxutils import escape
@@ -720,6 +722,14 @@ def _gray_png(size: int = 64) -> bytes:
     return bytes(pixmap.tobytes("png"))
 
 
+def _photo_png(width: int = 640, height: int = 480, seed: int = 3) -> bytes:
+    """A picture big enough to describe: noisy pixels never compress below
+    the figure filters' 10 KB floor (a photo, as far as the filters can tell)."""
+    pixels = hashlib.shake_256(f"photo-{seed}".encode()).digest(width * height * 3)
+    pixmap = pymupdf.Pixmap(pymupdf.csRGB, width, height, pixels, False)
+    return bytes(pixmap.tobytes("png"))
+
+
 def _scanned_pdf(pages: int = 2) -> bytes:
     """A PDF whose pages are images only — no text layer, as a scanner produces."""
     document = pymupdf.open()
@@ -750,34 +760,70 @@ def _mixed_pdf() -> bytes:
     return bytes(document.tobytes())
 
 
+_DOCX_DRAWING = (
+    "<w:p><w:r><w:drawing>"
+    '<wp:inline xmlns:wp="http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing">'
+    '<wp:extent cx="5486400" cy="7315200"/><wp:docPr id="1" name="scan"/>'
+    '<a:graphic xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main">'
+    '<a:graphicData uri="http://schemas.openxmlformats.org/drawingml/2006/picture">'
+    '<pic:pic xmlns:pic="http://schemas.openxmlformats.org/drawingml/2006/picture">'
+    '<pic:nvPicPr><pic:cNvPr id="1" name="scan.png"/><pic:cNvPicPr/></pic:nvPicPr>'
+    f'<pic:blipFill><a:blip xmlns:r="{_R_NS}" r:embed="rId2"/></pic:blipFill>'
+    '<pic:spPr><a:xfrm><a:off x="0" y="0"/><a:ext cx="5486400" cy="7315200"/></a:xfrm>'
+    '<a:prstGeom prst="rect"/></pic:spPr></pic:pic></a:graphicData></a:graphic>'
+    "</wp:inline></w:drawing></w:r></w:p>"
+)
+
+
+def picture_docx(image: bytes, *, before: str = "", after: str = "", repeat: int = 1) -> bytes:
+    """B-209 PR-2 —— a Word file with ``image`` (PNG) placed ``repeat`` times
+    between the paragraphs ``before`` and ``after`` (each left out when empty)."""
+    body = "".join(
+        [
+            _docx_paragraph(before, None) if before else "",
+            _DOCX_DRAWING * repeat,
+            _docx_paragraph(after, None) if after else "",
+        ]
+    )
+    return _docx(body, image=image)
+
+
 def _scanned_docx() -> bytes:
     """A Word file holding one picture and no text (a scan pasted into Word)."""
-    drawing = (
-        "<w:p><w:r><w:drawing>"
-        '<wp:inline xmlns:wp="http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing">'
-        '<wp:extent cx="5486400" cy="7315200"/><wp:docPr id="1" name="scan"/>'
-        '<a:graphic xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main">'
-        '<a:graphicData uri="http://schemas.openxmlformats.org/drawingml/2006/picture">'
-        '<pic:pic xmlns:pic="http://schemas.openxmlformats.org/drawingml/2006/picture">'
-        '<pic:nvPicPr><pic:cNvPr id="1" name="scan.png"/><pic:cNvPicPr/></pic:nvPicPr>'
-        f'<pic:blipFill><a:blip xmlns:r="{_R_NS}" r:embed="rId2"/></pic:blipFill>'
-        '<pic:spPr><a:xfrm><a:off x="0" y="0"/><a:ext cx="5486400" cy="7315200"/></a:xfrm>'
-        '<a:prstGeom prst="rect"/></pic:spPr></pic:pic></a:graphicData></a:graphic>'
-        "</wp:inline></w:drawing></w:r></w:p>"
-    )
-    return _docx(drawing, image=_gray_png())
+    return picture_docx(_gray_png())
+
+
+def _placeable_wmf() -> bytes:
+    """A minimal placeable Windows Metafile (header + end record): a vector
+    picture format slides still carry, which nothing here can rasterise."""
+    head = b"\xd7\xcd\xc6\x9a" + struct.pack("<H4hHI", 0, 0, 0, 1000, 1000, 1440, 0)
+    checksum = 0
+    for (word,) in struct.iter_unpack("<H", head):
+        checksum ^= word
+    body = struct.pack("<HHHIHIH", 1, 9, 0x300, 12, 0, 3, 0) + struct.pack("<IH", 3, 0)
+    return head + struct.pack("<H", checksum) + body
+
+
+def picture_pptx(image: bytes, *, title: str = "", extra_wmf: bool = False) -> bytes:
+    """B-209 PR-2 —— a one-slide deck holding ``image`` (and, with
+    ``extra_wmf``, a WMF picture too); ``title`` adds a text box above it."""
+    presentation = Presentation()
+    slide = presentation.slides.add_slide(presentation.slide_layouts[6])
+    if title:
+        slide.shapes.add_textbox(Inches(0.5), Inches(0.2), Inches(9), Inches(0.6)).text = title
+    slide.shapes.add_picture(io.BytesIO(image), Inches(0.5), Inches(1), Inches(9), Inches(5.5))
+    if extra_wmf:
+        slide.shapes.add_picture(
+            io.BytesIO(_placeable_wmf()), Inches(7), Inches(6), Inches(2), Inches(1)
+        )
+    buffer = io.BytesIO()
+    presentation.save(buffer)
+    return buffer.getvalue()
 
 
 def _scanned_pptx() -> bytes:
     """A slide deck whose only slide is one picture."""
-    presentation = Presentation()
-    slide = presentation.slides.add_slide(presentation.slide_layouts[6])
-    slide.shapes.add_picture(
-        io.BytesIO(_gray_png()), Inches(0.5), Inches(0.5), Inches(9), Inches(6.5)
-    )
-    buffer = io.BytesIO()
-    presentation.save(buffer)
-    return buffer.getvalue()
+    return picture_pptx(_gray_png())
 
 
 # ---------------------------------------------------------------------------
@@ -827,6 +873,13 @@ SCANNED_DOCS: tuple[FormDoc, ...] = (
     FormDoc("F", "scan-docx", "合同扫描件.docx", _scanned_docx(), ()),
     FormDoc("F", "scan-pptx", "培训材料扫描件.pptx", _scanned_pptx(), ()),
     FormDoc("F", "photo-png", "发票照片.png", _gray_png(), ()),
+)
+
+#: Ⓕ (B-209 PR-2) — a Word file / slide deck that is one picture big enough to
+#: describe: with a figure describer it is searchable by the description.
+PICTURE_DOCS: tuple[FormDoc, ...] = (
+    FormDoc("F", "picture-docx", "设备外观图.docx", picture_docx(_photo_png()), ()),
+    FormDoc("F", "picture-pptx", "设备外观图.pptx", picture_pptx(_photo_png()), ()),
 )
 
 #: Ⓕ + text (B-209) — a PDF mixing text pages and a scanned page. ``units``

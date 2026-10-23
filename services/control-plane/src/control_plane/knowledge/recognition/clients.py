@@ -142,6 +142,10 @@ class Reading:
     #: Characters of text in the vendor layout model's text blocks (layout
     #: parsing only; :func:`~control_plane.knowledge.recognition.cleaning.layout_text_chars`).
     layout_chars: int | None = None
+    #: The page size the layout model reports its boxes against (layout
+    #: parsing only; ``data_info.pages[0]`` — B-209 PR-2: image regions are
+    #: read in this frame).
+    layout_size: tuple[int, int] | None = None
     input_tokens: int = 0
     output_tokens: int = 0
     #: The response carried a ``usage`` object (billing needs it).
@@ -257,10 +261,28 @@ class LayoutParsingClient:
         return Reading(
             text=markdown,
             layout_chars=_layout_chars(data.get("layout_details")),
+            layout_size=_layout_size(data),
             input_tokens=input_tokens,
             output_tokens=output_tokens,
             usage_reported=reported,
         )
+
+
+def _layout_size(data: Mapping[str, Any]) -> tuple[int, int] | None:
+    """The first page's ``(width, height)`` from ``data_info.pages`` (the
+    frame of the ``bbox`` values), else from the first layout block."""
+    info = data.get("data_info")
+    pages = info.get("pages") if isinstance(info, Mapping) else None
+    candidates: list[object] = [pages[0]] if isinstance(pages, list) and pages else []
+    details = data.get("layout_details")
+    if isinstance(details, list) and details and isinstance(details[0], list) and details[0]:
+        candidates.append(details[0][0])
+    for candidate in candidates:
+        if isinstance(candidate, Mapping):
+            width, height = candidate.get("width"), candidate.get("height")
+            if isinstance(width, int) and isinstance(height, int) and width > 0 and height > 0:
+                return width, height
+    return None
 
 
 def _layout_chars(details: object) -> int | None:
@@ -284,7 +306,9 @@ def _layout_chars(details: object) -> int | None:
 
 @dataclass(frozen=True)
 class ChatVlmClient:
-    """``chat_vlm`` adapter (OpenAI-compatible vision chat)."""
+    """``chat_vlm`` adapter (OpenAI-compatible vision chat). The prompt is the
+    scanned-page one unless a caller (B-209 PR-2 figure description) passes
+    its own fixed prompt."""
 
     url: str
     api_key: str = field(repr=False)
@@ -292,21 +316,24 @@ class ChatVlmClient:
     #: Vendor fields: thinking off + output cap (catalog-driven).
     request_fields: Mapping[str, Any] = field(default_factory=dict)
     http: httpx.AsyncClient | None = None
+    system_prompt: str = OCR_PROMPT
+    user_text: str = _OCR_USER_TEXT
+    temperature: float = OCR_TEMPERATURE
 
     async def read(self, image: bytes) -> Reading:
         body: dict[str, Any] = {
             "model": self.model,
             "messages": [
-                {"role": "system", "content": OCR_PROMPT},
+                {"role": "system", "content": self.system_prompt},
                 {
                     "role": "user",
                     "content": [
                         {"type": "image_url", "image_url": {"url": _data_uri(image)}},
-                        {"type": "text", "text": _OCR_USER_TEXT},
+                        {"type": "text", "text": self.user_text},
                     ],
                 },
             ],
-            "temperature": OCR_TEMPERATURE,
+            "temperature": self.temperature,
             **self.request_fields,
         }
         data = await _post(self.http, self.url, self.api_key, body)

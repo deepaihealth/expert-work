@@ -58,6 +58,7 @@ import {
 import { ApiError } from "../../api/client";
 import { formatBytes } from "../../components/console/workspace_format";
 import { DEFAULT_UPLOAD_STALL_TIMEOUT_MS, useUploadQueue } from "../../hooks/useUploadQueue";
+import { FigureStatsTags, figuresNeedDescription } from "./FigureStatsTags";
 import { needsRecognition, PageRecognitionTags } from "./PageRecognitionTags";
 import { SegmentPreviewDrawer } from "./SegmentPreviewDrawer";
 import { UploadQueuePanel } from "./UploadQueuePanel";
@@ -362,7 +363,10 @@ export function DocumentsTab({ baseName, readScope, readonly }: DocumentsTabProp
               tag
             );
           const pages = (
-            <PageRecognitionTags stats={record.page_stats} documentId={record.id} />
+            <>
+              <PageRecognitionTags stats={record.page_stats} documentId={record.id} />
+              <FigureStatsTags stats={record.figure_stats} documentId={record.id} />
+            </>
           );
           if (!record.has_pending) {
             return (
@@ -462,7 +466,8 @@ export function DocumentsTab({ baseName, readScope, readonly }: DocumentsTabProp
                 />
               </Tooltip>
             </ReadonlyTooltip>
-            {needsRecognition(record.page_stats) && (
+            {(needsRecognition(record.page_stats) ||
+              figuresNeedDescription(record.figure_stats)) && (
               <ReadonlyTooltip on={readonly}>
                 <Tooltip title={t("knowledge_page.recognize")}>
                   <Button

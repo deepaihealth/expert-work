@@ -38,6 +38,27 @@ spec:
                 name: control-plane-config
             - secretRef:
                 name: control-plane-secrets
+          env:
+            # B-209 PR-2 (re-review H2) —— two glibc malloc arenas per process
+            # instead of 8 x cores: a parse worker's address space after one
+            # parse drops from ~4.4 GB to ~1.6 GB, so the per-worker RLIMIT_AS
+            # (EXPERT_WORK_KNOWLEDGE_PARSE_WORKER_MAX_VM_MB) can sit below the
+            # pod limit and a heavy document fails alone (MemoryError) instead
+            # of the container being OOM-killed.
+            - name: MALLOC_ARENA_MAX
+              value: "2"
+            # B-209 PR-2 (review round 5) —— one thread per numeric library in
+            # every process (the pod has one CPU; the parse / figure workers
+            # would otherwise each start a pool per core): a parse worker's
+            # address space at its peak drops from ~2.4 GB to ~1.9 GB.
+            - name: OMP_NUM_THREADS
+              value: "1"
+            - name: OPENBLAS_NUM_THREADS
+              value: "1"
+            - name: MKL_NUM_THREADS
+              value: "1"
+            - name: NUMEXPR_NUM_THREADS
+              value: "1"
           # local_dev SecretStore dotenv vault (EXPERT_WORK_SECRET_STORE_ENV_FILE
           # in configmap.yaml) — resolves the object-store `secret://` refs.
           # Without this mount the file simply doesn't exist and every
@@ -55,7 +76,11 @@ spec:
               memory: 1Gi
             limits:
               cpu: "1"
-              memory: 2Gi
+              # B-209 PR-2 (2026-10-22 decision): 4Gi, paired
+              # with EXPERT_WORK_KNOWLEDGE_PARSE_WORKER_MAX_VM_MB in
+              # configmap.yaml — tools/deploy/test_parse_worker_memory_budget.py
+              # fails when the two stop fitting together.
+              memory: 4Gi
           # Three distinct probes per api/health.py — live never touches
           # deps (restart trigger), ready aggregates dep checks +
           # lifecycle state, startup is true only once Lifecycle.mark_ready

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import AsyncIterator, Mapping
+from collections.abc import AsyncIterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Literal
@@ -27,6 +27,7 @@ class _StoredObject:
     # not locked. The pair always moves together.
     retain_until: datetime | None = None
     lock_mode: LockMode | None = None
+    modified_at: datetime = field(default_factory=lambda: datetime.now(UTC))
 
 
 class InMemoryObjectStore:
@@ -88,8 +89,30 @@ class InMemoryObjectStore:
         async with self._lock:
             self._objects.pop(key, None)
 
+    async def delete_many(self, keys: Sequence[str]) -> None:
+        """Delete ``keys`` in one call (S3 ``DeleteObjects``); idempotent."""
+        async with self._lock:
+            for key in keys:
+                self._objects.pop(key, None)
+
     async def list_prefix(self, prefix: str) -> list[str]:
         return sorted(k for k in self._objects if k.startswith(prefix))
+
+    async def iter_prefix_modified(
+        self, prefix: str, page_size: int = 1000
+    ) -> AsyncIterator[list[tuple[str, datetime]]]:
+        """:meth:`list_prefix_modified` in pages of ``page_size``."""
+        listed = await self.list_prefix_modified(prefix)
+        for start in range(0, len(listed), page_size):
+            yield listed[start : start + page_size]
+
+    async def list_prefix_modified(self, prefix: str) -> list[tuple[str, datetime]]:
+        """``(key, last modified)`` of every object under ``prefix``, by key."""
+        return sorted(
+            (key, record.modified_at)
+            for key, record in self._objects.items()
+            if key.startswith(prefix)
+        )
 
     async def presigned_url(
         self,

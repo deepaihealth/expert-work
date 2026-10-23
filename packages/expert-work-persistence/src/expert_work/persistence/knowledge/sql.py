@@ -26,6 +26,7 @@ from sqlalchemy import (
     or_,
     select,
     text,
+    true,
     update,
 )
 from sqlalchemy.dialects.postgresql import ARRAY
@@ -44,6 +45,7 @@ from expert_work.persistence.knowledge.base import (
     KnowledgeStore,
     ParseCacheEntry,
     ParseCacheKind,
+    RowSecurityActiveError,
     _Unset,
 )
 from expert_work.persistence.knowledge.text_search import (
@@ -70,6 +72,7 @@ from expert_work.protocol import (
     DocumentPage,
     DocumentSourceType,
     DocumentStatus,
+    FigureStats,
     IngestErrorCode,
     IngestStage,
     KnowledgeBase,
@@ -216,6 +219,7 @@ def _to_document(row: KnowledgeDocumentRow) -> KnowledgeDocument:
         error_code=_enum_or(IngestErrorCode, row.error_code, IngestErrorCode.INTERNAL_ERROR),
         page_count=row.page_count,
         page_stats=PageStats.model_validate(row.page_stats) if row.page_stats else None,
+        figure_stats=FigureStats.model_validate(row.figure_stats) if row.figure_stats else None,
         size_bytes=row.size_bytes,
         mime=row.mime,
         created_at=row.created_at,
@@ -1295,6 +1299,94 @@ class SqlKnowledgeStore(KnowledgeStore):
             return None
         return [DocumentPage.model_validate(record) for record in row[0] or ()]
 
+    async def set_document_figures(
+        self,
+        *,
+        tenant_id: UUID,
+        document_id: UUID,
+        stats: FigureStats | _Unset | None,
+        pixel_hashes: Sequence[str],
+        generation: int | None = None,
+    ) -> bool:
+        values: dict[str, Any] = {
+            "figure_hashes": list(dict.fromkeys(pixel_hashes)),
+            "updated_at": datetime.now(UTC),
+        }
+        if not isinstance(stats, _Unset):
+            values["figure_stats"] = stats.model_dump(mode="json") if stats is not None else None
+        async with self._sf() as session:
+            result = await session.execute(
+                update(KnowledgeDocumentRow)
+                .where(
+                    KnowledgeDocumentRow.tenant_id == tenant_id,
+                    KnowledgeDocumentRow.id == document_id,
+                    *_fence(generation),
+                )
+                .values(**values)
+            )
+            await session.commit()
+        return int(getattr(result, "rowcount", 0) or 0) > 0
+
+    async def count_figure_documents(
+        self, *, tenant_id: UUID, pixel_hashes: Sequence[str], exclude_document_id: UUID
+    ) -> dict[str, int]:
+        if not pixel_hashes:
+            return {}
+        wanted = list(dict.fromkeys(pixel_hashes))
+        found = (
+            func.unnest(KnowledgeDocumentRow.figure_hashes)
+            .table_valued("digest")
+            .render_derived(name="h")
+        )
+        async with self._sf() as session:
+            rows = (
+                await session.execute(
+                    select(found.c.digest, func.count())
+                    .select_from(KnowledgeDocumentRow)
+                    .join(found, true())
+                    .where(
+                        KnowledgeDocumentRow.tenant_id == tenant_id,
+                        KnowledgeDocumentRow.id != exclude_document_id,
+                        KnowledgeDocumentRow.figure_hashes.overlap(wanted),
+                        found.c.digest.in_(wanted),
+                    )
+                    .group_by(found.c.digest)
+                )
+            ).all()
+        return {str(digest): int(count) for digest, count in rows}
+
+    async def sees_every_tenant(self) -> bool:
+        # Row security that applies to this connection's role filters the rows
+        # by tenant (bypassing it application-side only skips the tenant
+        # setting — the policy then shows nothing). Postgres says whether it
+        # applies: superuser, BYPASSRLS, an owner without FORCE, or RLS off.
+        async with self._sf() as session:
+            active = (
+                await session.execute(text("SELECT row_security_active('knowledge_document')"))
+            ).scalar_one()
+        return active is False
+
+    async def existing_document_ids(self, *, document_ids: Sequence[UUID]) -> set[UUID]:
+        if not document_ids:
+            return set()
+        async with self._sf() as session:
+            # Same transaction as the lookup: a "not found" here is only
+            # trusted when row security did not filter it.
+            active = (
+                await session.execute(text("SELECT row_security_active('knowledge_document')"))
+            ).scalar_one()
+            if active is not False:
+                msg = "row security applies to this connection: the lookup would miss rows"
+                raise RowSecurityActiveError(msg)
+            rows = (
+                await session.execute(
+                    select(KnowledgeDocumentRow.id).where(
+                        KnowledgeDocumentRow.id.in_(list(dict.fromkeys(document_ids)))
+                    )
+                )
+            ).all()
+        return {row[0] for row in rows}
+
     # -- recognition cache (B-209 §5.5) -------------------------------------
 
     async def get_parse_cache(
@@ -1347,7 +1439,10 @@ class SqlKnowledgeStore(KnowledgeStore):
                     model=model,
                     result=result,
                 )
-                .on_conflict_do_nothing(index_elements=["document_id", "kind", "cache_key"])
+                .on_conflict_do_update(
+                    index_elements=["document_id", "kind", "cache_key"],
+                    set_={"model": model, "result": result, "created_at": func.now()},
+                )
             )
             await session.commit()
 
@@ -1445,6 +1540,22 @@ class SqlKnowledgeStore(KnowledgeStore):
             rows = (await session.execute(page_stmt)).all()
             total = (await session.execute(count_stmt)).scalar_one()
         return [_to_chunk(row) for row in rows], int(total)
+
+    async def chunks_contain(self, *, tenant_id: UUID, document_id: UUID, text: str) -> bool:
+        # One query on the document's chunks (``knowledge_chunk_document_idx``
+        # on ``document_id`` narrows them), not a page-by-page read into the
+        # application.
+        stmt = select(
+            select(KnowledgeChunkRow.id)
+            .where(
+                KnowledgeChunkRow.tenant_id == tenant_id,
+                KnowledgeChunkRow.document_id == document_id,
+                func.strpos(KnowledgeChunkRow.content, text) > 0,
+            )
+            .exists()
+        )
+        async with self._sf() as session:
+            return bool((await session.execute(stmt)).scalar_one())
 
     async def chunk_embeddings_by_hash(
         self,

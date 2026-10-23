@@ -7,6 +7,7 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Sequence
 from dataclasses import dataclass, field
+from typing import Any
 from uuid import UUID, uuid4
 
 import pytest
@@ -19,6 +20,7 @@ from control_plane.knowledge.recognition.clients import (
     RecognitionCallError,
     RecognitionClient,
 )
+from control_plane.knowledge.recognition.figure_markup import resolve_figures
 from control_plane.knowledge.recognition.recognizer import (
     ERROR_CLASSES,
     DocumentRecognizer,
@@ -349,12 +351,53 @@ async def test_a_cached_reading_is_cleaned_under_the_current_rules() -> None:
     raw = Reading(text="## 第一章\n\n![](page=0,bbox=[1, 2, 3, 4])\n\n正文")
     clients = {GLM_OCR: _Fake(raw), QWEN_FLASH: _Fake(_GOOD)}
     recognizer = _recognizer(doc, clients=clients)
-    await _recognize(recognizer, doc)
+    page = _jpeg(10, 20)
+    await _recognize(recognizer, doc, images=(page,))
     stored = next(iter(doc.store._parse_cache.values()))
     assert stored.result["raw"] == raw.text
-    (outcome,) = await _recognize(recognizer, doc)
+    (outcome,) = await _recognize(recognizer, doc, images=(page,))
     assert outcome.cached is True
+    # B-209 PR-2: the image region stays in place as a placeholder (its box,
+    # relative to the page image, alongside) for the figure step; without
+    # figures it resolves to nothing.
+    assert resolve_figures(outcome.text, {}) == "## 第一章\n\n正文"
+    assert outcome.regions == ((0.1, 0.1, 0.3, 0.2),)
+
+
+def _jpeg(width: int, height: int) -> bytes:
+    import io
+
+    from PIL import Image
+
+    out = io.BytesIO()
+    Image.new("RGB", (width, height), (255, 255, 255)).save(out, format="JPEG")
+    return out.getvalue()
+
+
+async def test_regions_of_an_image_that_cannot_be_measured_are_dropped() -> None:
+    # B-209 PR-2: boxes are only meaningful against the image read; without
+    # its size they are left out (and leave no placeholder behind).
+    doc = await _doc()
+    raw = Reading(text="## 第一章\n\n![](page=0,bbox=[1, 2, 3, 4])\n\n正文")
+    recognizer = _recognizer(doc, clients={GLM_OCR: _Fake(raw), QWEN_FLASH: _Fake(_GOOD)})
+    (outcome,) = await _recognize(recognizer, doc, images=(b"not-an-image",))
+    assert outcome.regions == ()
     assert outcome.text == "## 第一章\n\n正文"
+
+
+async def test_regions_are_measured_in_the_frame_the_vendor_reports() -> None:
+    # Review H4: a box is relative to the page size the answer reports, also
+    # when it comes back from the cache.
+    doc = await _doc()
+    raw = Reading(
+        text="正文\n\n![](page=0,bbox=[100, 50, 300, 150])\n\n更多正文", layout_size=(400, 200)
+    )
+    recognizer = _recognizer(doc, clients={GLM_OCR: _Fake(raw), QWEN_FLASH: _Fake(_GOOD)})
+    page = _jpeg(800, 400)
+    (fresh,) = await _recognize(recognizer, doc, images=(page,))
+    (cached,) = await _recognize(recognizer, doc, images=(page,))
+    assert cached.cached is True
+    assert fresh.regions == cached.regions == ((0.25, 0.25, 0.75, 0.75),)
 
 
 async def test_a_cached_reading_the_rules_now_reject_is_read_again() -> None:
@@ -367,6 +410,11 @@ async def test_a_cached_reading_the_rules_now_reject_is_read_again() -> None:
     doc.store._parse_cache[key] = type(entry)(model=entry.model, result={"raw": ""})
     (outcome,) = await _recognize(recognizer, doc)
     assert outcome.cached is False
+    assert clients[GLM_OCR].calls == 2
+    # B-209 PR-2 (review M2): the fresh reading replaced the rejected one —
+    # a third run reads the cache.
+    (third,) = await _recognize(recognizer, doc)
+    assert third.cached is True
     assert clients[GLM_OCR].calls == 2
 
 
@@ -564,9 +612,9 @@ async def test_cleaning_runs_off_the_event_loop(monkeypatch: pytest.MonkeyPatch)
     threads: list[bool] = []
     real = recognizer_module._accept
 
-    def spy(reading: Reading) -> tuple[str, str | None]:
+    def spy(reading: Reading, image: bytes) -> tuple[str, str | None, Any]:
         threads.append(threading.current_thread() is threading.main_thread())
-        return real(reading)
+        return real(reading, image)
 
     monkeypatch.setattr(recognizer_module, "_accept", spy)
     doc = await _doc()

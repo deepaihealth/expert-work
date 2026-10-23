@@ -96,6 +96,9 @@ export interface KnowledgeDocument {
   page_count?: number | null;
   /** B-209 — page counts of the latest PDF ingest; ``null`` for other files. */
   page_stats?: PageStats | null;
+  /** B-209 PR-2 — what became of the document's pictures; ``null`` when it
+   *  was ingested before pictures were described. */
+  figure_stats?: FigureStats | null;
   enabled?: boolean;
   created_at: string | null;
   updated_at: string | null;
@@ -113,6 +116,26 @@ export interface PageStats {
   /** Past the per-document recognition page limit — 「补识别」 reads them
    *  once the platform limit is raised. */
   pages_over_limit: number;
+}
+
+/** B-209 PR-2 — 「已描述 N 张图」: the pictures inside a PDF / Word / slide
+ *  file, from extraction to description. */
+export interface FigureStats {
+  /** Pictures found in the document. */
+  extracted: number;
+  /** Dropped by the filters (too small, a tiny share of the page, a few KB,
+   *  repeated: logos, icons, backgrounds). */
+  filtered: number;
+  /** Past the per-document picture limit (smallest first). */
+  capped: number;
+  /** Formats that cannot be read (WMF / EMF / SVG …). */
+  unsupported: number;
+  /** Described into the document text. */
+  described: number;
+  /** The description models gave no usable answer — 「补识别」 retries. */
+  failed: number;
+  /** No usable description model when ingested — 「补识别」 once configured. */
+  pending: number;
 }
 
 /** Upload response — ``unchanged`` is true when the bytes matched the
@@ -157,6 +180,9 @@ export interface KnowledgeChunk {
 
 export interface ChunksPage {
   chunks: KnowledgeChunk[];
+  /** B-209 PR-2 — ids of the pictures these chunks describe whose originals
+   *  the server holds for this document; only these get a thumbnail. */
+  figure_ids?: string[];
   total: number;
   offset: number;
   limit: number;
@@ -407,6 +433,22 @@ export async function discardPendingDocument(
     `/v1/knowledge/bases/${encodeURIComponent(baseName)}/documents/${encodeURIComponent(documentId)}/discard-pending`,
   );
   return response.data;
+}
+
+/** B-209 PR-2 — one described picture of a document (the original, stored
+ *  when it was described) as an object URL for an ``<img>``; the caller
+ *  revokes it. Throws (HTTP 404) when there is no such picture. */
+export async function fetchFigureUrl(
+  baseName: string,
+  documentId: string,
+  figureId: string,
+  tenantScope?: TenantScope,
+): Promise<string> {
+  const response = await apiClient.get<Blob>(
+    `/v1/knowledge/bases/${encodeURIComponent(baseName)}/documents/${encodeURIComponent(documentId)}/figures/${encodeURIComponent(figureId)}`,
+    { params: withTenantScope({}, tenantScope), responseType: "blob" },
+  );
+  return URL.createObjectURL(response.data);
 }
 
 export async function listChunks(
