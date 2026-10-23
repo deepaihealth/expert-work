@@ -50,10 +50,16 @@ from control_plane.knowledge.parse_workers import (
     limit_worker_memory,
     terminate_workers,
 )
+from control_plane.knowledge.parsed_size import (
+    admitted,
+    check_parsed_size,
+    max_parsed_chars,
+    parse_within_cap,
+    raw_bytes_held,
+)
 from control_plane.knowledge.parsing import (
     DocumentParseError,
     is_plain_text_file,
-    parse_document,
     strip_lone_surrogates,
 )
 from control_plane.knowledge.recognition.figure_pipeline import FigureDescriber
@@ -220,7 +226,7 @@ async def parse_document_in_pool(filename: str, raw: bytes) -> str:
       necessarily this document's. Only the parse that finds the broken pool
       still current rebuilds it; the others retry on the replacement.
     """
-    return await _in_parse_pool(filename, parse_document, filename, raw)
+    return await _in_parse_pool(filename, parse_within_cap, filename, raw, max_parsed_chars())
 
 
 async def _in_parse_pool[T](
@@ -542,8 +548,12 @@ async def ingest_markdown(
     the text as plain text, not Markdown (a ``.txt`` file). ``usage`` bills
     the embedding calls to the tenant (B-209 §5.8, ``knowledge_ingest``).
     """
+    check_parsed_size(markdown)
     model_key, pinned = await pin_embedder(embedder, tenant_id=tenant_id)
-    async with billed_embeddings(usage, tenant_id=tenant_id, model_key=model_key):
+    async with (
+        admitted(len(markdown)),
+        billed_embeddings(usage, tenant_id=tenant_id, model_key=model_key),
+    ):
         return await _chunk_embed_store(
             store=store,
             pinned=pinned,
@@ -814,7 +824,7 @@ class KnowledgeIngestionRunner:
         lost = asyncio.Event()
         owner = asyncio.current_task()
         try:
-            async with self._semaphore:
+            async with self._semaphore, raw_bytes_held() as raw_bytes:
                 # CAS-claim before ingesting so a racing recovery sweep never
                 # double-processes this document. If the claim is lost (the
                 # reaper already took it), this fast path no-ops. The claim
@@ -828,6 +838,7 @@ class KnowledgeIngestionRunner:
                 )
                 if claim is None:
                     return
+                raw_bytes.shrink(len(claim.content or b""))
                 if claim.content is None:
                     await self._store.mark_document_failed_terminal(
                         tenant_id=tenant_id,

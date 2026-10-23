@@ -16,13 +16,19 @@ one CPU; sampled every 5 ms with VmSize and VmRSS read from the same
 ``/proc/<pid>/status`` read — review rounds 5 and 6):
 
 * :data:`MAIN_PROCESS_MIB` — the server process: 614 MiB RSS idle on the live
-  test pod, plus the 531 MiB it grew by running two ingests of an 11 MB-text
-  Word file at once through the real pipeline (uploads held in memory; two
-  48 MP Word files: +12 MiB). Not covered: a document whose text alone is
-  huge — two ingests of a 110 MB-text Word file (60,000 chunks) took the
-  server to 5.5 GB, which no worker ceiling can bound. That is the review
-  round 6 follow-up N3 (a cap on a document's parsed size and on concurrent
-  ingests, on its own branch); this constant does not cover it.
+  test pod, plus 752 MiB with both of the server's ingestion budgets full at
+  once (``control_plane/knowledge/parsed_size.py``): four Chinese text files
+  just under the per-document cap of 2,500,000 parsed characters
+  (``knowledge_document_max_chars``, which also caps the text the server
+  chunks / embeds / stores at once) through the upload path, and four 47 MiB
+  scanned PDFs through the recovery worker, holding the raw-bytes budget
+  (``knowledge_ingest_raw_bytes_budget``, 100 MiB); one parse worker, no-op
+  recognition, the fake embedder, real Postgres (2026-10-23, the parsed-size
+  cap branch). The two budgets replace review round 6's N3: a document whose
+  text is past the cap is refused in the parse worker, so the 110 MB-text Word
+  file that took the server to 5.5 GB no longer reaches it. Those measurements
+  apart: one document at the cap +463 MiB, four at once +503; eight 47 MiB
+  scanned PDFs (four uploads + four recovery claims) +241 MiB.
 * :data:`PARSE_WORKER_NEVER_RESIDENT_MIB` — the part of a parse worker's
   address space that is not resident when its RSS peaks: the smallest
   same-instant gap at the peak over the workloads measured — a 30-page text
@@ -33,6 +39,11 @@ one CPU; sampled every 5 ms with VmSize and VmRSS read from the same
   (654 MiB; 59 MP JPEG / flate images on a text page and a 59 MP scanned
   page). The figure worker is counted at its own ceiling, not at a measured
   peak.
+
+Shipped (2026-10-23: 4Gi, one parse worker at 2400 MiB, the figure worker at
+1536 MiB): 1,366 + (2,400 - 650) + (1,536 - 654) = 3,998 MiB of 4,096 — 98 MiB
+to spare. Raising either ingestion budget, the worker ceilings or the worker
+count eats into that first.
 """
 
 from __future__ import annotations
@@ -52,7 +63,7 @@ _REPO_ROOT = Path(__file__).resolve().parents[2]
 _K8S = _REPO_ROOT / "infra" / "k8s"
 _CONTAINER = "control-plane"
 
-MAIN_PROCESS_MIB = 1150
+MAIN_PROCESS_MIB = 614 + 752
 PARSE_WORKER_NEVER_RESIDENT_MIB = 650
 FIGURE_WORKER_NEVER_RESIDENT_MIB = 654
 
@@ -232,10 +243,10 @@ def test_the_config_map_and_a_container_env_override_are_both_read(tmp_path: Pat
 @pytest.mark.parametrize(
     ("limit_mib", "workers", "cap_mib", "figure_cap_mib", "fits"),
     [
-        (4096, 2, 2400, 1536, False),  # two workers at 2400: 1436 MiB over
-        (4096, 2, 1682, 1536, True),  # the largest ceiling two workers fit 4Gi at
-        (4096, 2, 1683, 1536, False),
-        (4096, 1, 2400, 1536, True),  # shipped (2026-10-23): one parse worker
+        (4096, 2, 2400, 1536, False),  # two workers at 2400: 1652 MiB over
+        (4096, 2, 1574, 1536, True),  # the largest ceiling two workers fit 4Gi at
+        (4096, 2, 1575, 1536, False),
+        (4096, 1, 2400, 1536, True),  # shipped (2026-10-23): one parse worker, 98 MiB spare
         (6144, 2, 2400, 1536, True),
         (2048, 2, 1800, 1536, False),
     ],

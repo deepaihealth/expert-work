@@ -58,6 +58,7 @@ import {
 import { ApiError } from "../../api/client";
 import { formatBytes } from "../../components/console/workspace_format";
 import { DEFAULT_UPLOAD_STALL_TIMEOUT_MS, useUploadQueue } from "../../hooks/useUploadQueue";
+import { documentErrorText } from "./documentError";
 import { FigureStatsTags, figuresNeedDescription } from "./FigureStatsTags";
 import { needsRecognition, PageRecognitionTags } from "./PageRecognitionTags";
 import { SegmentPreviewDrawer } from "./SegmentPreviewDrawer";
@@ -99,7 +100,7 @@ interface DocumentsTabProps {
 }
 
 export function DocumentsTab({ baseName, readScope, readonly }: DocumentsTabProps) {
-  const { t } = useTranslation();
+  const { t, i18n } = useTranslation();
   const { message } = App.useApp();
 
   const [documents, setDocuments] = useState<KnowledgeDocument[]>([]);
@@ -356,12 +357,8 @@ export function DocumentsTab({ baseName, readScope, readonly }: DocumentsTabProp
         width: 220,
         render: (status: DocumentStatus, record) => {
           const tag = <Tag color={STATUS_COLOR[status]}>{t(`knowledge_page.status_${status}`)}</Tag>;
-          const statusTag =
-            status === "failed" && record.error ? (
-              <Tooltip title={record.error}>{tag}</Tooltip>
-            ) : (
-              tag
-            );
+          const reason = status === "failed" ? documentErrorText(t, i18n.language, record) : null;
+          const statusTag = reason ? <Tooltip title={reason}>{tag}</Tooltip> : tag;
           const pages = (
             <>
               <PageRecognitionTags stats={record.page_stats} documentId={record.id} />
@@ -533,7 +530,7 @@ export function DocumentsTab({ baseName, readScope, readonly }: DocumentsTabProp
         ),
       },
     ],
-    [t, handleReingest, handleRecognize, handleDiscardPending, handleDelete, readonly],
+    [t, i18n.language, handleReingest, handleRecognize, handleDiscardPending, handleDelete, readonly],
   );
 
   const pagination = useMemo<TablePaginationConfig>(

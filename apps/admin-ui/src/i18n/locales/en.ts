@@ -580,6 +580,8 @@ export interface TranslationKeys {
     pending_nothing_serving: string;
     pending_ingesting_hint: string;
     pending_failed_hint: string;
+    error_text_too_large: string;
+    error_text_too_large_unknown: string;
     discard_pending: string;
     discard_pending_confirm_title: string;
     discard_pending_confirm_body: string;
@@ -3946,6 +3948,10 @@ const en: TranslationKeys = {
     pending_nothing_serving: "New version pending, nothing in use yet",
     pending_ingesting_hint: "The newly uploaded version is being ingested; retrieval keeps using the previous version until it finishes.",
     pending_failed_hint: "The newly uploaded version failed to ingest; retrieval still uses the previous version. Re-ingest it, or discard the new version.",
+    error_text_too_large:
+      "Too much text: {{size}} characters, over the per-document limit of {{limit}}. Split it into smaller files and upload them separately.",
+    error_text_too_large_unknown:
+      "Too much text: over the per-document limit. Split it into smaller files and upload them separately.",
     discard_pending: "Discard new version",
     discard_pending_confirm_title: "Discard the new version of \"{{name}}\"?",
     discard_pending_confirm_body: "The newly uploaded file is deleted and retrieval keeps using the previous version.",

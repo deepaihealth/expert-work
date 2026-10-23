@@ -287,6 +287,24 @@ async def test_failure_codes(store: KnowledgeStore) -> None:
     assert (await _doc(store, tenant, broken)).error_code is None
 
 
+async def test_every_failure_code_reads_back(store: KnowledgeStore) -> None:
+    # A code the store did not know would read back as ``internal_error``
+    # (e.g. ``text_too_large``, the parsed-size cap's refusal).
+    tenant = uuid4()
+    kb_id = await _base(store, tenant)
+    for code in IngestErrorCode:
+        document_id = await _upload(store, tenant, kb_id, f"{code.value}.md", b"x")
+        generation = await _claim(store, tenant, document_id)
+        assert await store.mark_document_failed_terminal(
+            tenant_id=tenant,
+            document_id=document_id,
+            error=code.value,
+            error_code=code,
+            generation=generation,
+        )
+        assert (await _doc(store, tenant, document_id)).error_code is code
+
+
 async def test_discard_restores_ready_stage(store: KnowledgeStore) -> None:
     tenant = uuid4()
     kb_id = await _base(store, tenant)

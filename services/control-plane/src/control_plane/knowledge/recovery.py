@@ -27,6 +27,7 @@ from control_plane.knowledge.ingestion import (
     ingest_document_bytes,
     renew_lease_periodically,
 )
+from control_plane.knowledge.parsed_size import DocumentTooLargeError, Hold, reserve_raw_bytes
 from control_plane.knowledge.recognition.figure_pipeline import FigureDescriber
 from control_plane.knowledge.recognition.recognizer import DocumentRecognizer
 from control_plane.knowledge.usage import IngestUsageRecorder
@@ -117,9 +118,14 @@ class KnowledgeIngestRecoveryWorker:
             self._task = None
 
     async def run_once(self) -> int:
-        """Sweep exhausted documents to ``failed``, then claim + re-drive one
-        batch of stuck documents concurrently; return how many of the driven
-        documents reached a terminal state (ready or failed) this pass."""
+        """Sweep exhausted documents to ``failed``, then claim + re-drive up to
+        ``concurrency`` stuck documents concurrently; return how many of the
+        driven documents reached a terminal state (ready or failed) this pass.
+
+        Each claim first reserves room for the document's bytes in the
+        server's raw-bytes budget (shared with the upload path), so documents
+        are claimed one at a time — and each starts being driven, its lease
+        renewed, before the next waits for room."""
         # The sweep and the claim scan are cross-tenant — bypass RLS to see
         # every tenant's stuck rows (mirrors quota/reaper.py).
         token_bypass = bypass_rls_var.set(True)
@@ -130,24 +136,30 @@ class KnowledgeIngestRecoveryWorker:
             if swept:
                 _failed_terminal.inc(swept)
                 logger.warning("knowledge.recovery.swept_exhausted count=%d", swept)
-            claims = await self._store.claim_documents_for_ingest(
-                now=now,
-                lease_seconds=self._lease_seconds,
-                limit=self._concurrency,
-                max_attempts=self._max_attempts,
-            )
         finally:
             current_tenant_id_var.reset(token_tenant)
             bypass_rls_var.reset(token_bypass)
 
-        if not claims:
+        drives: list[tuple[ClaimedIngestion, asyncio.Task[bool]]] = []
+        try:
+            for _ in range(self._concurrency):
+                claimed = await self._claim_holding()
+                if claimed is None:
+                    break
+                claim, hold = claimed
+                _claimed.inc()
+                drives.append((claim, asyncio.create_task(self._drive_holding(claim, hold))))
+        except BaseException as exc:
+            if isinstance(exc, asyncio.CancelledError):
+                for _, task in drives:
+                    task.cancel()
+            await asyncio.gather(*(task for _, task in drives), return_exceptions=True)
+            raise
+        if not drives:
             return 0
-        _claimed.inc(len(claims))
-        outcomes = await asyncio.gather(
-            *(self._drive_in_tenant_scope(claim) for claim in claims), return_exceptions=True
-        )
+        outcomes = await asyncio.gather(*(task for _, task in drives), return_exceptions=True)
         settled = 0
-        for claim, outcome in zip(claims, outcomes, strict=True):
+        for (claim, _), outcome in zip(drives, outcomes, strict=True):
             if isinstance(outcome, BaseException):
                 _cycle_errors.inc()
                 logger.error(
@@ -158,6 +170,38 @@ class KnowledgeIngestRecoveryWorker:
             elif outcome:
                 settled += 1
         return settled
+
+    async def _claim_holding(self) -> tuple[ClaimedIngestion, Hold] | None:
+        """Reserve room for one document's bytes, then claim one stuck
+        document; ``None`` (nothing held) when there is none left."""
+        hold = await reserve_raw_bytes()
+        try:
+            token_bypass = bypass_rls_var.set(True)
+            token_tenant = current_tenant_id_var.set(None)
+            try:
+                claims = await self._store.claim_documents_for_ingest(
+                    now=datetime.now(UTC),
+                    lease_seconds=self._lease_seconds,
+                    limit=1,
+                    max_attempts=self._max_attempts,
+                )
+            finally:
+                current_tenant_id_var.reset(token_tenant)
+                bypass_rls_var.reset(token_bypass)
+        except BaseException:
+            hold.release()
+            raise
+        if not claims:
+            hold.release()
+            return None
+        hold.shrink(len(claims[0].content or b""))
+        return claims[0], hold
+
+    async def _drive_holding(self, claim: ClaimedIngestion, hold: Hold) -> bool:
+        try:
+            return await self._drive_in_tenant_scope(claim)
+        finally:
+            hold.release()
 
     async def _drive_in_tenant_scope(self, claim: ClaimedIngestion) -> bool:
         # Each re-drive runs in its owning tenant's RLS context so the store
@@ -243,7 +287,9 @@ class KnowledgeIngestRecoveryWorker:
                 # 文档已被并发删除 — FK/守卫拒绝写回是正常终止,不算失败。
                 logger.debug("knowledge.recovery_document_gone document=%s", claim.document_id)
                 return False
-            if claim.attempts >= self._max_attempts:
+            # Over the size cap is decided by the text itself: every retry would
+            # re-parse the whole document only to be refused again.
+            if claim.attempts >= self._max_attempts or isinstance(exc, DocumentTooLargeError):
                 await self._store.mark_document_failed_terminal(
                     tenant_id=claim.tenant_id,
                     document_id=claim.document_id,

@@ -26,6 +26,13 @@ from pathlib import Path
 from typing import Protocol
 from uuid import UUID
 
+from control_plane.knowledge.parsed_size import (
+    analyse_pdf_within_cap,
+    max_parsed_chars,
+    parse_office_figures_within_cap,
+    parse_within_cap,
+    recognized_text_limit,
+)
 from control_plane.knowledge.parsing import (
     FIGURE_OFFICE_EXTENSIONS,
     DocumentParseError,
@@ -40,11 +47,7 @@ from control_plane.knowledge.recognition.assembly import (
     page_records,
 )
 from control_plane.knowledge.recognition.figure_describe import document_language
-from control_plane.knowledge.recognition.figure_extract import (
-    FigureExtraction,
-    OfficeParse,
-    parse_office_figures,
-)
+from control_plane.knowledge.recognition.figure_extract import FigureExtraction, OfficeParse
 from control_plane.knowledge.recognition.figure_markup import (
     regions_to_figures,
     resolve_figures,
@@ -58,12 +61,7 @@ from control_plane.knowledge.recognition.figure_pdf import (
 )
 from control_plane.knowledge.recognition.figure_pipeline import FigureDescriber, FigureOutcome
 from control_plane.knowledge.recognition.figure_scan import ScannedFigures, crop_scanned_figures
-from control_plane.knowledge.recognition.pages import (
-    PdfAnalysis,
-    analyse_pdf,
-    pdf_page_texts,
-    render_pages,
-)
+from control_plane.knowledge.recognition.pages import PdfAnalysis, pdf_page_texts, render_pages
 from control_plane.knowledge.recognition.recognizer import (
     ERROR_NOT_CONFIGURED,
     DocumentRecognizer,
@@ -119,7 +117,7 @@ async def parse_upload(
         return await _parse_pdf(job, recognizer, describer)
     if describer is not None and ext in FIGURE_OFFICE_EXTENSIONS:
         return await _parse_office(job, describer, ext)
-    return await job.run(parse_document, job.filename, job.raw)
+    return await job.run(parse_within_cap, job.filename, job.raw, max_parsed_chars())
 
 
 async def _enabled(figures: FigureDescriber, job: ParseJob) -> bool:
@@ -131,7 +129,9 @@ async def _enabled(figures: FigureDescriber, job: ParseJob) -> bool:
 
 
 async def _parse_office(job: ParseJob, figures: FigureDescriber, ext: str) -> str:
-    parsed: OfficeParse = await job.run(parse_office_figures, job.raw, ext)
+    parsed: OfficeParse = await job.run(
+        parse_office_figures_within_cap, job.raw, ext, max_parsed_chars()
+    )
     outcome = await _describe(job, figures, parsed.figures, parsed.markdown)
     markdown = resolve_figures(parsed.markdown, outcome.blocks if outcome else {})
     if office_text_is_empty(markdown):
@@ -143,7 +143,9 @@ async def _parse_office(job: ParseJob, figures: FigureDescriber, ext: str) -> st
 async def _parse_pdf(
     job: ParseJob, recognizer: DocumentRecognizer | None, figures: FigureDescriber | None
 ) -> str:
-    analysis: PdfAnalysis = await job.run(analyse_pdf, job.filename, job.raw)
+    analysis: PdfAnalysis = await job.run(
+        analyse_pdf_within_cap, job.filename, job.raw, max_parsed_chars()
+    )
     if not analysis.pages:  # PyMuPDF could not walk it: parsed as before, no records
         return analysis.markdown or ""
     outcomes = await _recognize(job, recognizer, analysis)
@@ -192,14 +194,18 @@ async def _recognize(
     async def render(indexes: list[int], max_pixels: int | None) -> list[bytes]:
         return await job.run(render_pages, job.raw, indexes, max_pixels)
 
+    # Recognition stops paying once what it read fills the room the
+    # per-document text cap leaves (parsed_size.recognized_text_limit).
+    limit = recognized_text_limit(analysis, MAX_RECOGNIZED_CHARS_PER_DOCUMENT)
     outcomes = await recognizer.recognize_document(
         tenant_id=job.tenant_id,
         document_id=job.document_id,
         pages=scanned,
         render=render,
         before_batch=job.recognizing,
+        max_chars=limit,
     )
-    return cap_recognized_text(outcomes, MAX_RECOGNIZED_CHARS_PER_DOCUMENT)
+    return cap_recognized_text(outcomes, limit)
 
 
 async def _figures_of(

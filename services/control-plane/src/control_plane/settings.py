@@ -521,6 +521,27 @@ class Settings(BaseSettings):
     #: upload endpoint answers 413 ``{"error": "file_too_large", "limit_bytes": N}``.
     knowledge_document_max_bytes: int = Field(default=50 * 1024 * 1024, gt=0)
 
+    #: Longest parsed text one knowledge document may have, in characters —
+    #: and the most the server chunks / embeds / stores at once over all the
+    #: documents it is ingesting (``knowledge/parsed_size.py``). A compressed
+    #: upload can unpack to far more text than its size suggests, and every
+    #: character costs server memory after parsing: about 190 MiB per million
+    #: Chinese characters (production image, 2026-10-23), so the default keeps
+    #: the server's extra memory under ~0.5 GiB per pod (measured 463 MiB for one
+    #: document at the cap, 503 MiB for four at once). Over the cap a document
+    #: fails with ``error_code=text_too_large``; raise it with the pod's memory.
+    knowledge_document_max_chars: int = Field(default=2_500_000, gt=0)
+
+    #: Original upload bytes the server holds at once, over every document it
+    #: is ingesting (upload path and recovery worker together). A claim holds
+    #: its document's bytes for the whole ingest — parsing and every batch of
+    #: scanned-page renders re-send them to the parse worker — and eight
+    #: claims of 47 MiB scanned PDFs took the server +533 MiB (+241 with this
+    #: budget, same throughput). A claim reserves
+    #: ``knowledge_document_max_bytes`` before it reads the bytes, keeps their
+    #: real size, and waits (in arrival order) when they would not fit.
+    knowledge_ingest_raw_bytes_budget: int = Field(default=100 * 1024 * 1024, gt=0)
+
     #: Document parsing runs in a spawned process pool (PyMuPDF is not
     #: thread-safe): worker processes, and the per-document parse timeout.
     knowledge_parse_workers: int = Field(default=2, gt=0)
