@@ -507,7 +507,11 @@ class InMemoryKnowledgeStore(KnowledgeStore):
         chunk_max = base.chunk_max_tokens if base else DEFAULT_CHUNK_MAX_TOKENS
         chunk_overlap = base.chunk_overlap_tokens if base else DEFAULT_CHUNK_OVERLAP_TOKENS
         pending = self._pending.get(doc.id)
-        content, sha = pending if pending is not None else (self._content.get(doc.id), None)
+        content, sha = (
+            pending
+            if pending is not None
+            else (self._content.get(doc.id), self._sha256.get(doc.id))
+        )
         return ClaimedIngestion(
             tenant_id=doc.tenant_id,
             document_id=doc.id,

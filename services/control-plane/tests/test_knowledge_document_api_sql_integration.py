@@ -1,0 +1,164 @@
+"""The console's document responses are the same on the SQL store as on the
+in-memory one (whose responses the unit tests pin) — real Postgres + Alembic.
+
+The SQL store reads documents without their byte slots and derives
+``has_pending`` in SQL; this walks one document through upload, a failed
+re-upload, retry, discard, re-ingest and a good re-upload, then searches, and
+compares every response with the in-memory run.
+
+Before running locally:
+export DOCKER_HOST=unix:///Users/mac/.docker/run/docker.sock
+"""
+
+from __future__ import annotations
+
+import re
+from collections.abc import AsyncIterator
+from pathlib import Path
+from typing import Any
+
+import psycopg
+import pytest
+from alembic import command
+from alembic.config import Config
+from httpx import ASGITransport, AsyncClient
+from testcontainers.postgres import PostgresContainer
+
+from control_plane.app import create_app
+from control_plane.audit import build_default_audit_logger
+from control_plane.knowledge.ingestion import KnowledgeIngestionRunner
+from control_plane.settings import DEFAULT_DEV_TENANT_ID, Settings
+from expert_work.persistence import (
+    DatabaseConfig,
+    InMemoryKnowledgeStore,
+    SqlKnowledgeStore,
+    create_async_engine_from_config,
+    create_async_session_factory,
+)
+from expert_work.persistence.audit_log import InMemoryAuditLogStore
+from expert_work.persistence.knowledge.base import KnowledgeStore
+from orchestrator.llm import FakeEmbedder
+from orchestrator.tools.knowledge import KnowledgeRetriever
+from tests.auth_fixtures import TEST_AUDIENCE, TEST_ISSUER, build_test_jwt_verifier, make_test_jwt
+
+pytestmark = pytest.mark.integration
+
+_ALEMBIC_INI = Path(__file__).resolve().parents[3] / "packages/expert-work-persistence/alembic.ini"
+_DB = "knowledge_document_api"
+_MD = b"# Handbook\n\nThe deductible is 500 dollars per year."
+_UUID = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
+#: Differ between runs (or, for ``score``, between float4 and float8 vectors).
+_VOLATILE = frozenset({"created_at", "updated_at", "score"})
+
+
+class _FakeEmbeddingConfig:
+    async def effective_embedding_config(self) -> tuple[str, str] | None:
+        return ("qwen", "text-embedding-v4")
+
+    async def effective_rerank_config(self) -> tuple[str, str] | None:
+        return None
+
+
+@pytest.fixture
+async def sql_store(postgres_container: PostgresContainer) -> AsyncIterator[SqlKnowledgeStore]:
+    admin = str(postgres_container.get_connection_url()).replace("+psycopg2", "")
+    with psycopg.connect(admin, autocommit=True) as conn:
+        conn.execute(f'DROP DATABASE IF EXISTS "{_DB}" WITH (FORCE)')
+        conn.execute(f'CREATE DATABASE "{_DB}"')
+    base, _, _ = admin.rpartition("/")
+    dsn = f"{base}/{_DB}"
+    cfg = Config(str(_ALEMBIC_INI))
+    cfg.set_main_option("sqlalchemy.url", dsn.replace("postgresql://", "postgresql+psycopg://", 1))
+    command.upgrade(cfg, "head")
+    engine = create_async_engine_from_config(
+        DatabaseConfig(dsn=dsn.replace("postgresql://", "postgresql+asyncpg://", 1))
+    )
+    try:
+        yield SqlKnowledgeStore(create_async_session_factory(engine))
+    finally:
+        await engine.dispose()
+        with psycopg.connect(admin, autocommit=True) as conn:
+            conn.execute(f'DROP DATABASE IF EXISTS "{_DB}" WITH (FORCE)')
+
+
+def _normalise(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {k: _normalise(v) for k, v in value.items() if k not in _VOLATILE}
+    if isinstance(value, list):
+        return [_normalise(v) for v in value]
+    if isinstance(value, str):
+        return _UUID.sub("<uuid>", value)
+    return value
+
+
+async def _walk(store: KnowledgeStore) -> list[tuple[str, int, Any]]:
+    """``(step, status, normalised body)`` for each request of the walk."""
+    runner = KnowledgeIngestionRunner(store=store, embedder=FakeEmbedder())
+    app = create_app(
+        settings=Settings(
+            env="dev",
+            auth_mode="dev",
+            rate_limit_burst=10_000,
+            rate_limit_per_second=10_000.0,
+            oidc_issuer=TEST_ISSUER,
+            oidc_audience=[TEST_AUDIENCE],
+        ),
+        knowledge_repo=store,
+        knowledge_ingestion_runner=runner,
+        audit_logger=build_default_audit_logger(InMemoryAuditLogStore()),
+        jwt_verifier=build_test_jwt_verifier(),
+    )
+    app.state.platform_embedding_config_service = _FakeEmbeddingConfig()
+    app.state.knowledge_retriever = KnowledgeRetriever(store=store, embedder=FakeEmbedder())
+    token = make_test_jwt(tenant_id=DEFAULT_DEV_TENANT_ID, subject="user-a")
+    steps: list[tuple[str, int, Any]] = []
+    async with AsyncClient(
+        transport=ASGITransport(app=app),
+        base_url="http://cp.test",
+        headers={"Authorization": f"Bearer {token}"},
+    ) as client:
+
+        async def call(step: str, method: str, url: str, **kwargs: Any) -> Any:
+            response = await client.request(method, url, **kwargs)
+            await runner.drain()
+            body = response.json() if response.content else None
+            steps.append((step, response.status_code, _normalise(body)))
+            return body
+
+        def upload(body: bytes) -> dict[str, Any]:
+            return {"files": {"file": ("h.md", body, "text/markdown")}}
+
+        docs = "/v1/knowledge/bases/kb/documents"
+        await call("create base", "POST", "/v1/knowledge/bases", json={"name": "kb"})
+        doc = (await call("upload v1", "POST", docs, **upload(_MD)))["id"]
+        await call("list", "GET", docs)
+        await call("upload same", "POST", docs, **upload(_MD))
+        await call("upload bad v2", "POST", docs, **upload(b"   "))
+        await call("list pending", "GET", f"{docs}?limit=50&offset=0")
+        await call("retry pending", "POST", f"{docs}/{doc}/reingest")
+        await call("list after retry", "GET", docs)
+        await call("chunks", "GET", f"{docs}/{doc}/chunks")
+        await call("pages", "GET", f"{docs}/{doc}/pages")
+        await call("discard", "POST", f"{docs}/{doc}/discard-pending")
+        await call("discard again", "POST", f"{docs}/{doc}/discard-pending")
+        await call("reingest serving", "POST", f"{docs}/{doc}/reingest")
+        await call("list after reingest", "GET", docs)
+        await call("upload good v2", "POST", docs, **upload(_MD + b"\n\nMore."))
+        await call("list after v2", "GET", docs)
+        search = {"query": "deductible", "rerank": False}
+        await call("search", "POST", "/v1/knowledge/bases/kb/test", json=search)
+    return steps
+
+
+async def test_document_responses_match_the_in_memory_store(
+    sql_store: SqlKnowledgeStore,
+) -> None:
+    on_sql = await _walk(sql_store)
+    assert on_sql == await _walk(InMemoryKnowledgeStore())
+    by_step = {step: (status, body) for step, status, body in on_sql}
+    pending = by_step["list pending"][1]["documents"][0]
+    assert (pending["status"], pending["has_pending"]) == ("failed", True)
+    assert by_step["discard"][1]["has_pending"] is False
+    assert by_step["discard again"][0] == 409
+    assert by_step["list after v2"][1]["documents"][0]["size_bytes"] == len(_MD + b"\n\nMore.")
+    assert [hit["filename"] for hit in by_step["search"][1]["results"]] == ["h.md"]
