@@ -225,10 +225,10 @@ def test_the_config_map_and_a_container_env_override_are_both_read(tmp_path: Pat
 @pytest.mark.parametrize(
     ("limit_mib", "workers", "cap_mib", "figure_cap_mib", "fits"),
     [
-        (4096, 2, 2400, 1536, False),  # the 2026-10-22 choice: 1338 MiB over
+        (4096, 2, 2400, 1536, False),  # two workers at 2400: 1338 MiB over
         (4096, 2, 1731, 1536, True),  # the largest ceiling that fits 4Gi
         (4096, 2, 1732, 1536, False),
-        (4096, 1, 2400, 1536, True),  # one parse worker
+        (4096, 1, 2400, 1536, True),  # shipped (2026-10-23): one parse worker
         (6144, 2, 2400, 1536, True),
         (2048, 2, 1800, 1536, False),
     ],

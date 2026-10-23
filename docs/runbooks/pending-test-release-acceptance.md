@@ -866,7 +866,7 @@ open("/tmp/b209-media-bomb.docx", "wb").write(dst.getvalue())
 PY
 ```
 
-  上传两份。判据:都 ready、文字(`HUGE-PICTURE-MARKER` / `BOMB-BEFORE-MARKER`)在;`figure_stats.unsupported=1`、`described=0`;控制面 pod 没有重启(`kubectl get pod` 的 RESTARTS 不变,`kubectl describe pod` 的 Last State 没有 `OOMKilled`)。**顺带**:`kubectl exec` 进控制面 pod,`cat /proc/1/environ | tr '\0' '\n' | grep MALLOC_ARENA_MAX` 为 `2`;对解析子进程 `grep "Max address space" /proc/<pid>/limits` 为 configmap 所配上限(2400 MiB = `2516582400`);`kubectl -n expert-work get deploy control-plane -o jsonpath='{.spec.template.spec.containers[0].resources.limits.memory}'` 为 `4Gi`(10-22 拍板方案 A:4 GiB + 每进程 2400 MiB)。
+  上传两份。判据:都 ready、文字(`HUGE-PICTURE-MARKER` / `BOMB-BEFORE-MARKER`)在;`figure_stats.unsupported=1`、`described=0`;控制面 pod 没有重启(`kubectl get pod` 的 RESTARTS 不变,`kubectl describe pod` 的 Last State 没有 `OOMKilled`)。**顺带**:`kubectl exec` 进控制面 pod,`cat /proc/1/environ | tr '\0' '\n' | grep MALLOC_ARENA_MAX` 为 `2`;对解析子进程 `grep "Max address space" /proc/<pid>/limits` 为 configmap 所配上限(2400 MiB = `2516582400`);`kubectl -n expert-work get deploy control-plane -o jsonpath='{.spec.template.spec.containers[0].resources.limits.memory}'` 为 `4Gi`;`EXPERT_WORK_KNOWLEDGE_PARSE_WORKERS` 为 `1`(10-23 拍板:4 GiB + 1 个解析进程 × 2400 MiB + 插图进程 1536 MiB)。
 - [ ] **44.16 内存上限只让一份文档失败,不让 pod 重启**(临时把 `EXPERT_WORK_KNOWLEDGE_PARSE_WORKER_MAX_VM_MB` 设成 `1800` 重启;测完改回):本机生成一份解压后约 110 MB 文字的 Word(压缩后约 0.5 MB)和一份 4800 万像素照片的 Word:
 
 ```bash
