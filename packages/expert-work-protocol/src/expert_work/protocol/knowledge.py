@@ -75,6 +75,9 @@ class IngestErrorCode(StrEnum):
     #: The parsed text is over the platform's per-document character limit
     #: (``knowledge_document_max_chars``); the user is asked to split it.
     TEXT_TOO_LARGE = "text_too_large"
+    #: The document splits into more chunks than the per-document limit
+    #: (``knowledge_document_max_chunks``, B-214); the user is asked to split it.
+    TOO_MANY_CHUNKS = "too_many_chunks"
     EMBEDDING_FAILED = "embedding_failed"
     #: Reserved — written once per-tenant knowledge quotas exist.
     QUOTA_EXCEEDED = "quota_exceeded"

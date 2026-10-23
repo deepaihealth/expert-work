@@ -91,6 +91,9 @@ logger = logging.getLogger(__name__)
 #: ``simple`` (no stemming / stopwords) is the correct universal config.
 _TS_CONFIG = "simple"
 
+#: Chunk rows inserted per flush in :meth:`SqlKnowledgeStore.replace_chunks`.
+_CHUNK_INSERT_BATCH = 500
+
 #: ``hnsw.ef_search`` for vector recall (raised to the request's ``limit`` when
 #: deeper). An HNSW scan returns at most ef_search rows *before* the tenant /
 #: base filter, and the server default (40) is below the retriever's default
@@ -463,6 +466,31 @@ async def _set_hnsw_scan(session: AsyncSession, limit: int, *, iterative: bool) 
         sql += f", set_config('{_HNSW_ITERATIVE_SCAN_GUC}', :iterative_scan, true)"
         params["iterative_scan"] = _HNSW_ITERATIVE_SCAN
     await session.execute(text(sql), params)
+
+
+def _chunk_row(chunk: KnowledgeChunk) -> KnowledgeChunkRow:
+    return KnowledgeChunkRow(
+        id=chunk.id,
+        tenant_id=chunk.tenant_id,
+        kb_id=chunk.kb_id,
+        document_id=chunk.document_id,
+        chunk_index=chunk.chunk_index,
+        content=chunk.content,
+        embedding=list(chunk.embedding),
+        # Keyword-search vector over title + breadcrumb + body — segmented
+        # app-side so it is correct for CJK (see text_search).
+        content_tsv=_kb_chunk_tsvector(chunk),
+        chunk_type=chunk.chunk_type.value,
+        heading_path=list(chunk.heading_path) or None,
+        doc_title=chunk.doc_title,
+        content_hash=chunk.content_hash,
+        embedding_model=chunk.embedding_model,
+        enabled=chunk.enabled,
+        edited=chunk.edited,
+        revision=chunk.revision,
+        parent_chunk_id=chunk.parent_chunk_id,
+        source_locator=chunk.source_locator,
+    )
 
 
 class SqlKnowledgeStore(KnowledgeStore):
@@ -1498,34 +1526,16 @@ class SqlKnowledgeStore(KnowledgeStore):
                     KnowledgeChunkRow.document_id == document_id,
                 )
             )
-            session.add_all(
-                [
-                    KnowledgeChunkRow(
-                        id=chunk.id,
-                        tenant_id=chunk.tenant_id,
-                        kb_id=chunk.kb_id,
-                        document_id=chunk.document_id,
-                        chunk_index=chunk.chunk_index,
-                        content=chunk.content,
-                        embedding=list(chunk.embedding),
-                        # Keyword-search vector over title + breadcrumb +
-                        # body — segmented app-side so it is correct for CJK
-                        # (see text_search).
-                        content_tsv=_kb_chunk_tsvector(chunk),
-                        chunk_type=chunk.chunk_type.value,
-                        heading_path=list(chunk.heading_path) or None,
-                        doc_title=chunk.doc_title,
-                        content_hash=chunk.content_hash,
-                        embedding_model=chunk.embedding_model,
-                        enabled=chunk.enabled,
-                        edited=chunk.edited,
-                        revision=chunk.revision,
-                        parent_chunk_id=chunk.parent_chunk_id,
-                        source_locator=chunk.source_locator,
-                    )
-                    for chunk in chunks
-                ]
-            )
+            # Rows are built, flushed and let go a batch at a time: an ORM row
+            # with its vector, keyword vector and bound parameters costs about
+            # as much again as the chunk itself, and a document can have
+            # thousands (B-214). Still one transaction.
+            for start in range(0, len(chunks), _CHUNK_INSERT_BATCH):
+                session.add_all(
+                    [_chunk_row(chunk) for chunk in chunks[start : start + _CHUNK_INSERT_BATCH]]
+                )
+                await session.flush()
+                session.expunge_all()
             await session.commit()
         return True
 

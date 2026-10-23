@@ -29,10 +29,11 @@ line, a page number, an image), which joins the chunk that follows. See
 
 from __future__ import annotations
 
+import hashlib
 import math
 import re
-from collections.abc import Sequence
-from dataclasses import dataclass
+from collections.abc import Mapping, Sequence
+from dataclasses import dataclass, field
 from typing import Literal
 from uuid import UUID
 
@@ -151,6 +152,30 @@ class TextChunk:
         return chunk_retrieval_text(self.heading_path, self.body)
 
 
+@dataclass
+class BreakMemo:
+    """Topic-shift decisions of adjacent block pairs, kept between ingests of
+    one document (B-215): a re-ingest whose text is unchanged — re-ingest,
+    「补识别」 with nothing newly read — embeds no block for topic detection,
+    and an edited document embeds only the blocks next to an edit. A decision
+    depends on the two blocks' texts, the embedding model (``namespace``) and
+    the threshold, so the key covers all of them.
+
+    ``known`` is what an earlier ingest decided; :func:`chunk_markdown_semantic`
+    fills ``decided`` with every pair of this text (reused or fresh), which is
+    what the caller stores back — pairs the text no longer has drop out."""
+
+    namespace: str
+    known: Mapping[str, bool] = field(default_factory=dict)
+    decided: dict[str, bool] = field(default_factory=dict)
+
+    def key(self, previous: str, current: str) -> str:
+        # Lengths first: no two different pairs (nor namespaces) join the same.
+        parts = (self.namespace, str(_SEMANTIC_BREAK_THRESHOLD), previous, current)
+        joined = "".join(f"{len(part)}:{part}" for part in parts)
+        return hashlib.sha256(joined.encode("utf-8", "surrogatepass")).hexdigest()[:16]
+
+
 def chunk_markdown(
     markdown: str,
     *,
@@ -187,13 +212,15 @@ async def chunk_markdown_semantic(
     tenant_id: UUID,
     plain_text: bool = False,
     doc_title: str | None = None,
+    memo: BreakMemo | None = None,
 ) -> list[TextChunk]:
     """Like :func:`chunk_markdown`, but additionally splits a section at
     *topic shifts* — adjacent blocks whose embeddings are far apart.
 
     This refines the weak spot of purely structural chunking: a long
     heading-less section otherwise sliced at arbitrary size points is
-    instead split where its content actually changes subject.
+    instead split where its content actually changes subject. ``memo``
+    reuses earlier decisions (see :class:`BreakMemo`).
     """
     # Oversized blocks (a whole spreadsheet sheet parses to one table block —
     # up to 85k characters in real material) are cut to the chunk cap *before*
@@ -203,13 +230,37 @@ async def chunk_markdown_semantic(
     blocks = _presplit_blocks(_blocks(markdown, plain_text=plain_text), max_tokens)
     semantic_breaks: frozenset[int] = frozenset()
     if len(blocks) >= 2:
-        semantic_breaks = await _semantic_breaks(blocks, embedder, tenant_id)
+        semantic_breaks = await _semantic_breaks(blocks, embedder, tenant_id, memo)
     return _pack_blocks(
         blocks,
         max_tokens=max_tokens,
         overlap_tokens=overlap_tokens,
         semantic_breaks=semantic_breaks,
         doc_title=doc_title,
+    )
+
+
+def structural_chunk_count(
+    markdown: str,
+    *,
+    max_tokens: int,
+    overlap_tokens: int,
+    plain_text: bool = False,
+    doc_title: str | None = None,
+) -> int:
+    """How many chunks :func:`chunk_markdown_semantic` makes with no topic
+    shift at all — the same blocks, no embedding call, nothing billed. Topic
+    shifts only split further, so this is what a document costs at least
+    (B-214 refuses a document over the chunk cap before it is embedded)."""
+    blocks = _presplit_blocks(_blocks(markdown, plain_text=plain_text), max_tokens)
+    return len(
+        _pack_blocks(
+            blocks,
+            max_tokens=max_tokens,
+            overlap_tokens=overlap_tokens,
+            semantic_breaks=frozenset(),
+            doc_title=doc_title,
+        )
     )
 
 
@@ -285,26 +336,48 @@ def _section_budget(
 
 
 async def _semantic_breaks(
-    blocks: list[_Block], embedder: Embedder, tenant_id: UUID
+    blocks: list[_Block], embedder: Embedder, tenant_id: UUID, memo: BreakMemo | None = None
 ) -> frozenset[int]:
     """Block indices that start a new semantic segment — adjacent
     same-section blocks whose embeddings exceed the distance threshold.
     A heading change is already a flush point, so it is skipped here.
     Blocks are embedded :data:`SEMANTIC_EMBED_WINDOW` at a time and only the
-    previous block's vector outlives its window."""
+    previous block's vector outlives its window. With a ``memo``, a pair it
+    already knows is not embedded again: only the blocks of the other pairs are."""
+    pairs = [
+        index
+        for index in range(1, len(blocks))
+        if blocks[index].heading_trail == blocks[index - 1].heading_trail
+    ]
     breaks: set[int] = set()
-    previous: Sequence[float] | None = None
-    for start in range(0, len(blocks), SEMANTIC_EMBED_WINDOW):
-        window = blocks[start : start + SEMANTIC_EMBED_WINDOW]
-        vectors = await embedder.embed([block.text for block in window], tenant_id=tenant_id)
-        for index, vector in zip(range(start, start + len(window)), vectors, strict=True):
-            if (
-                previous is not None
-                and blocks[index].heading_trail == blocks[index - 1].heading_trail
-                and _cosine_distance(previous, vector) >= _SEMANTIC_BREAK_THRESHOLD
-            ):
-                breaks.add(index)
-            previous = vector
+    keys: dict[int, str] = {}
+    if memo is not None:
+        keys = {index: memo.key(blocks[index - 1].text, blocks[index].text) for index in pairs}
+        for index in pairs:
+            known = memo.known.get(keys[index])
+            if known is not None:
+                memo.decided[keys[index]] = known
+                if known:
+                    breaks.add(index)
+        pairs = [index for index in pairs if keys[index] not in memo.decided]
+        needed = sorted({side for index in pairs for side in (index - 1, index)})
+    else:
+        needed = list(range(len(blocks)))
+    open_pairs = set(pairs)
+    previous: tuple[int, Sequence[float]] | None = None
+    for start in range(0, len(needed), SEMANTIC_EMBED_WINDOW):
+        window = needed[start : start + SEMANTIC_EMBED_WINDOW]
+        vectors = await embedder.embed(
+            [blocks[index].text for index in window], tenant_id=tenant_id
+        )
+        for index, vector in zip(window, vectors, strict=True):
+            if index in open_pairs and previous is not None and previous[0] == index - 1:
+                shift = _cosine_distance(previous[1], vector) >= _SEMANTIC_BREAK_THRESHOLD
+                if shift:
+                    breaks.add(index)
+                if memo is not None:
+                    memo.decided[keys[index]] = shift
+            previous = (index, vector)
     return frozenset(breaks)
 
 

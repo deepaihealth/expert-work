@@ -3,15 +3,16 @@ per-document cap on parsed text, the server's budget for it, and the budget
 for original upload bytes.
 
 Everything after parsing runs in the server process: the parsed text is
-chunked, every chunk gets a 1,024-float vector held as Python objects, and
-the rows are built and written in one transaction. The server's memory for a
-document therefore grows with its parsed text — about 190 MiB per million
-Chinese characters (~75 KiB per chunk), 35 MiB per million English ones,
-measured on the production image — and a compressed upload can unpack to far
-more text than its size suggests (a 0.5 MB Word file held 110 MB of text and
-took the server to 5.5 GB).
+chunked, every chunk gets a 1,024-float vector, and the rows are written in one
+transaction. A compressed upload can unpack to far more text than its size
+suggests (a 0.5 MB Word file held 110 MB of text and took the server to
+5.5 GB), and the server's memory for a document follows its **chunks**: about
+11 KiB a chunk plus 20 MiB (B-214, 10-23 — vectors kept compact, chunks
+embedded a window at a time and built as the store reads them; ~64 KiB a
+chunk before), whatever their length.
 
-Two bounds, one setting (``knowledge_document_max_chars``):
+Bounds on the characters (``knowledge_document_max_chars``) and the chunks
+(``knowledge_document_max_chunks``):
 
 * **the cap** — a document whose parsed text is longer is refused with
   ``error_code=text_too_large`` and a message that asks for it to be split.
@@ -26,11 +27,19 @@ Two bounds, one setting (``knowledge_document_max_chars``):
   retried. Scanned-page recognition stops once what it read fills the room
   the cap leaves (:func:`recognized_text_limit`): the remaining pages are
   recorded as ``document_text_limit`` and the document still ingests.
-* **the budget** — the server chunks / embeds / stores at most that many
-  characters at once, over every document in flight (the upload path and the
-  recovery worker alike). A document waits in arrival order until its text
-  fits (:func:`admitted`), so concurrent ingests cannot add up past what one
-  document at the cap may use.
+* **the chunk cap** (B-214) — a heading breaks a chunk however short it is,
+  so 2.5M characters of short headed entries are ~58,000 chunks. A document
+  over the cap is refused with ``error_code=too_many_chunks``: on its
+  structural chunks before anything is embedded, on its semantic chunks
+  before any chunk is (:func:`ensure_chunk_count`). Also deterministic.
+* **the budget** — the server embeds / stores at most a character cap's worth
+  at once, over every document in flight (the upload path and the recovery
+  worker alike), a document weighing its characters or its chunks at the two
+  caps' ratio, whichever is more (:func:`admission_weight`). A document waits
+  in arrival order until it fits (:func:`admitted`), so concurrent ingests
+  cannot add up past what one document at the caps may use. Chunking happens
+  before (it holds the text and one window of block vectors), so the weight
+  is the real chunk count.
 
 And **the raw-bytes budget** (``knowledge_ingest_raw_bytes_budget``): a claim
 holds its document's original bytes for the whole ingest — parsing and every
@@ -39,15 +48,16 @@ batch of scanned-page renders re-send them to the parse worker — so each claim
 them, keeps their real size, and waits in arrival order while they would not
 fit (:func:`reserve_raw_bytes`).
 
-Characters, not chunks: the length of the parsed text is known in the worker
-before anything is sent back, costs nothing to measure, means the same for
-every format, and is what a user can act on. Chunks are only known after the
-server has chunked the text — too late for the bound to protect anything.
+Characters first: the length of the parsed text is known in the worker before
+anything is sent back, costs nothing to measure, means the same for every
+format, and is what a user can act on. Chunks are counted in the server, but
+before anything is embedded — what memory actually follows (B-214).
 """
 
 from __future__ import annotations
 
 import asyncio
+import math
 import re
 from collections import deque
 from collections.abc import AsyncIterator
@@ -68,6 +78,16 @@ DEFAULT_MAX_PARSED_CHARS = 2_500_000
 
 _max_chars = DEFAULT_MAX_PARSED_CHARS
 
+#: Default of ``Settings.knowledge_document_max_chunks`` (B-214): the server's
+#: memory for an ingest follows its chunk count — about 11 KiB a chunk once
+#: vectors are compact (``chunk_rows``), 20 MiB fixed — so 40,000 chunks stay
+#: near 460 MiB. Characters alone cannot bound that: a document of short
+#: headed entries is ~43 characters a chunk, and a heading breaks a chunk
+#: however short it is.
+DEFAULT_MAX_CHUNKS = 40_000
+
+_max_chunks = DEFAULT_MAX_CHUNKS
+
 #: The numbers in a refusal's message, for readers that render it in their
 #: own words (the admin console does). Changing the message means changing
 #: this pattern — and the console's copy of it (``documentError.ts``).
@@ -87,6 +107,36 @@ class DocumentTooLargeError(DocumentParseError):
         return (type(self), (self.chars, self.limit))
 
 
+#: The numbers in a chunk-count refusal (``documentError.ts`` keeps a copy).
+TOO_MANY_CHUNKS_PATTERN = re.compile(r"([\d,]+) chunks, over the per-document limit of ([\d,]+)")
+
+
+class DocumentTooManyChunksError(DocumentParseError):
+    """The document splits into more chunks than one document may hold."""
+
+    def __init__(self, chunks: int, limit: int) -> None:
+        super().__init__(too_many_chunks_message(chunks, limit), IngestErrorCode.TOO_MANY_CHUNKS)
+        self.chunks = chunks
+        self.limit = limit
+
+    def __reduce__(self) -> tuple[type[DocumentTooManyChunksError], tuple[int, int]]:  # type: ignore[override]
+        return (type(self), (self.chunks, self.limit))
+
+
+def too_many_chunks_message(chunks: int, limit: int) -> str:
+    """The chunk-count refusal recorded as the document's ``error``."""
+    return (
+        f"too many chunks: {chunks:,} chunks, over the per-document limit of {limit:,}; "
+        "split the document into smaller files and upload them separately"
+    )
+
+
+def ensure_chunk_count(chunks: int) -> None:
+    """:raises DocumentTooManyChunksError: ``chunks`` is over the cap in effect."""
+    if chunks > _max_chunks:
+        raise DocumentTooManyChunksError(chunks, _max_chunks)
+
+
 def too_large_message(chars: int, limit: int) -> str:
     """The refusal recorded as the document's ``error`` (numbers first, so
     a truncated message still carries them)."""
@@ -96,10 +146,11 @@ def too_large_message(chars: int, limit: int) -> str:
     )
 
 
-def configure_parsed_size(*, max_chars: int) -> None:
-    """Set the cap / budget (lifespan wiring). Call before the first ingest."""
-    global _max_chars
+def configure_parsed_size(*, max_chars: int, max_chunks: int = DEFAULT_MAX_CHUNKS) -> None:
+    """Set the caps / budget (lifespan wiring). Call before the first ingest."""
+    global _max_chars, _max_chunks
     _max_chars = max(1, max_chars)
+    _max_chunks = max(1, max_chunks)
     _budgets.pop("text", None)
 
 
@@ -233,11 +284,19 @@ def _get_budget(name: str, capacity: int) -> _Budget:
     return held[1]
 
 
+def admission_weight(chars: int, chunks: int) -> int:
+    """What a document holds of the budget: its characters, or its chunks at
+    the cap's ratio (a document at the chunk cap weighs a whole budget) when
+    those cost more — memory follows chunks once a document is chunked."""
+    return max(chars, math.ceil(chunks * _max_chars / _max_chunks))
+
+
 @asynccontextmanager
-async def admitted(chars: int) -> AsyncIterator[None]:
-    """Hold ``chars`` of the server's text budget while a document is chunked,
-    embedded and stored; wait (in arrival order) until it fits."""
-    hold = await _acquire(_get_budget("text", _max_chars), chars)
+async def admitted(chars: int, chunks: int = 0) -> AsyncIterator[None]:
+    """Hold a document's share of the server's ingest budget
+    (:func:`admission_weight`) while it is embedded and stored; wait (in
+    arrival order) until it fits."""
+    hold = await _acquire(_get_budget("text", _max_chars), admission_weight(chars, chunks))
     try:
         yield
     finally:
