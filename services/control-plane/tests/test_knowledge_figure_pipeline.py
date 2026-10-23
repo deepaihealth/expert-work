@@ -224,8 +224,8 @@ class _Setup:
         ]
 
 
-async def _no_sleep(seconds: float) -> None:
-    del seconds
+async def _no_sleep(*_: object) -> None:
+    return None
 
 
 @pytest.fixture

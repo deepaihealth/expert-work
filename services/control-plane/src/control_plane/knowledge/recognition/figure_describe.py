@@ -75,10 +75,13 @@ CHART_USER_TEXT = "转写这张图表。"
 _FENCE_LINE = re.compile(r"^[ \t]*```[\w-]*[ \t]*$", re.MULTILINE)
 _JSON_OBJECT = re.compile(r"\{[^{}]{0,4000}\}")
 _LABELLED = re.compile(
-    r"^[ \t]*[\"']?(text|chart|description|文字|图表|描述)[\"']?[ \t]*[::=][ \t]*(.+?)[ \t,,]*$",
+    r"^[ \t]*[\"']?(text|chart|description|文字|图表|描述)[\"']?"
+    r"[ \t]*[:\uff1a=][ \t]*(.+?)[ \t,\uff0c]*$",
     re.IGNORECASE | re.MULTILINE,
 )
-_SENTENCE_END = re.compile(r"(?<=[。!?!?.])")
+#: Full-width punctuation as escapes, so no editor or normaliser can fold it
+#: into the ASCII forms the class already holds.
+_SENTENCE_END = re.compile(r"(?<=[\u3002\uff01\uff1f!?.])")
 _HAN = re.compile(r"[㐀-鿿]")
 _LATIN = re.compile(r"[A-Za-z]")
 

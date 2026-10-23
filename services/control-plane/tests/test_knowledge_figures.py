@@ -15,6 +15,7 @@ from PIL import Image
 from control_plane.knowledge.recognition import figure_filters, figure_images
 from control_plane.knowledge.recognition.cleaning import clean_reading
 from control_plane.knowledge.recognition.figure_describe import (
+    MAX_DESCRIPTION_CHARS,
     describe_prompt,
     description_failure,
     document_language,
@@ -183,6 +184,7 @@ def test_at_most_fifty_figures_largest_kept_in_document_order() -> None:
         '```json\n{"text": "lots", "chart": false, "description": "一张保养说明的文字截图。"}\n```',
         '好的。{"text":"lots","chart":"否","description":"一张保养说明的文字截图。"}',
         "文字: 大段\n图表: 否\n描述: 一张保养说明的文字截图。",
+        "文字\uff1a大段\uff0c\n图表\uff1a否\n描述\uff1a一张保养说明的文字截图。",
     ],
 )
 def test_description_answers_are_read_leniently(raw: str) -> None:
@@ -190,6 +192,13 @@ def test_description_answers_are_read_leniently(raw: str) -> None:
     assert parsed is not None
     assert (parsed.text_amount, parsed.chart) == ("lots", False)
     assert parsed.description == "一张保养说明的文字截图。"
+
+
+def test_a_long_description_is_cut_at_a_full_width_sentence_end() -> None:
+    sentence = "\u8fd9\u5f20\u56fe\u6709\u8868\u683c\uff01"  # seven characters ending in U+FF01
+    parsed = parse_description('{"text": "none", "description": "' + sentence * 60 + '"}')
+    assert parsed is not None
+    assert parsed.description == sentence * (MAX_DESCRIPTION_CHARS // len(sentence))
 
 
 def test_chart_flag_and_text_amounts() -> None:

@@ -79,7 +79,8 @@ logger = logging.getLogger(__name__)
 class PoolRunner(Protocol):
     """Runs ``fn(*args)`` in the parse process pool, on the document's budget."""
 
-    def __call__[T](self, fn: Callable[..., T], /, *args: object) -> Awaitable[T]: ...
+    def __call__[T](self, fn: Callable[..., T], /, *args: object) -> Awaitable[T]:
+        """``fn(*args)``'s result, computed in a pool worker."""
 
 
 @dataclass(frozen=True)
