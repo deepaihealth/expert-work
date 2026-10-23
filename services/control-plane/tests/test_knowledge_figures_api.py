@@ -252,6 +252,26 @@ async def test_a_revalidation_is_answered_without_reading_the_store(
     assert response.status_code == 304
 
 
+@pytest.mark.parametrize(
+    ("if_none_match", "status"),
+    [
+        # The test env's load balancer compresses the JPEG and weakens the
+        # ETag to W/"…"; the browser sends that back (10-23 acceptance 44.4).
+        (f'W/"{_ID}"', 304),
+        (f'"fedcba9876543210", W/"{_ID}"', 304),
+        ('"fedcba9876543210"', 200),
+        (_ID, 200),
+    ],
+)
+async def test_if_none_match_uses_the_weak_comparison(
+    setup: _Setup, if_none_match: str, status: int
+) -> None:
+    response = await setup.client.get(
+        setup.url(setup.document), headers={"If-None-Match": if_none_match}
+    )
+    assert response.status_code == status
+
+
 async def test_chunk_lists_confirm_only_figures_the_document_holds(setup: _Setup) -> None:
     # Security review S-L1: a paragraph an author typed to look like a figure
     # block, or one naming another document's figure, gets no thumbnail.

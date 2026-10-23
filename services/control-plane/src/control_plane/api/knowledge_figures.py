@@ -8,7 +8,8 @@ B-209 PR-2 §5.9:分段预览里图片描述旁的原图缩略图。
 缓存:``Cache-Control: private, no-cache`` + ``ETag``(图片 id 就是内容哈希):浏览器每次都
 回来问(权限每次都重新校验,删掉的文档的图不会从缓存里继续显示),内容没变时回 304、不再传图。
 不用 ``no-store``:分段预览翻页会反复取同一批缩略图。浏览器带来的 ``If-None-Match`` 对得上就直接
-回 304,不去对象存储取图。
+回 304,不去对象存储取图;按弱比较 —— 前面的负载均衡压缩图片时把 ETag 改成 ``W/"…"``,
+浏览器回传的就是它。
 
 本次入库那一代没有这张图时,只有文档当前的分段里提到这张图,才去别的代找(重传入库中、或待处理的
 重传被放弃后,分段还是旧版本的);被放弃的入库留下的、分段里已经不提的图不再能按 id 取到。
@@ -39,6 +40,13 @@ from expert_work.persistence import KnowledgeStore
 from expert_work.runtime.audit.logger import AuditLogger
 
 _NOT_FOUND = "figure not found"
+
+
+def _none_match(if_none_match: str | None, etag: str) -> bool:
+    """RFC 9110 §13.1.2: any listed tag equals ``etag`` once a ``W/`` is dropped."""
+    if not if_none_match:
+        return False
+    return any(tag.strip().removeprefix("W/") == etag for tag in if_none_match.split(","))
 
 
 def build_knowledge_figures_router() -> APIRouter:
@@ -84,7 +92,7 @@ def build_knowledge_figures_router() -> APIRouter:
             "X-Content-Type-Options": "nosniff",
             "Content-Disposition": "inline",
         }
-        if request.headers.get("if-none-match") == headers["ETag"]:
+        if _none_match(request.headers.get("if-none-match"), headers["ETag"]):
             return Response(status_code=304, headers=headers)
         storage = FigureStorage(object_store)
         image = await storage.get(
