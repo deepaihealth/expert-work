@@ -594,6 +594,8 @@ const zhCN: TranslationKeys = {
     pending_nothing_serving: "新版待入库，暂无生效版本",
     pending_ingesting_hint: "新上传的版本正在入库；入库完成前，检索仍使用上一版。",
     pending_failed_hint: "新上传的版本入库失败；检索仍使用上一版。可以重新入库，或丢弃新版。",
+    error_text_too_large: "文档文字过多：共 {{size}} 字，超过单个文档 {{limit}} 字的上限。请拆成几个较小的文件后分别上传。",
+    error_text_too_large_unknown: "文档文字过多，超过单个文档的字数上限。请拆成几个较小的文件后分别上传。",
     discard_pending: "丢弃新版",
     discard_pending_confirm_title: "丢弃「{{name}}」的新版？",
     discard_pending_confirm_body: "新上传的文件会被删除，检索继续使用上一版。",

@@ -75,6 +75,9 @@ ERROR_MODEL_UNSUPPORTED = "model_unsupported"
 ERROR_CREDENTIAL_MISSING = "credential_missing"
 ERROR_OVER_LIMIT = "over_limit"
 ERROR_INTERNAL = "internal_error"
+#: A page whose text did not fit under the document's text limit — read and
+#: dropped, or (once the limit is reached) not read at all.
+ERROR_DOCUMENT_TEXT_LIMIT = "document_text_limit"
 _CALL_ERROR_CLASSES: dict[CallErrorKind, str] = {
     "auth": "vendor_auth",
     "quota": "vendor_quota",
@@ -89,6 +92,7 @@ ERROR_CLASSES = frozenset(
         ERROR_CREDENTIAL_MISSING,
         ERROR_OVER_LIMIT,
         ERROR_INTERNAL,
+        ERROR_DOCUMENT_TEXT_LIMIT,
         "bad_output",
         *_CALL_ERROR_CLASSES.values(),
     }
@@ -170,6 +174,9 @@ class PageOutcome:
     cached: bool = False
     error: str | None = None
     regions: tuple[tuple[float, float, float, float], ...] = ()
+
+
+_TEXT_LIMIT = PageOutcome(status=PageStatus.FAILED, error=ERROR_DOCUMENT_TEXT_LIMIT)
 
 
 @dataclass(frozen=True)
@@ -398,12 +405,15 @@ class DocumentRecognizer:
         pages: Sequence[int],
         render: PageRenderer,
         before_batch: BatchGuard | None = None,
+        max_chars: int | None = None,
     ) -> dict[int, PageOutcome]:
         """Recognize one document's scanned pages (0-based indexes, in page
         order) up to the per-document cap — the rest are ``over_limit``.
         ``render`` draws pages as JPEG (in the parse pool) a batch at a time;
         the next batch renders while this one is read. ``before_batch`` runs
         before each batch and raises to stop a worker that lost the document.
+        Once the pages read hold ``max_chars`` characters, the remaining pages
+        are not read (nor paid for): they are ``document_text_limit``.
 
         No model configured at all: every page is ``pending``, nothing is
         rendered. Models configured but none usable (no key, account down):
@@ -426,21 +436,28 @@ class DocumentRecognizer:
             return asyncio.create_task(render(indexes, plan.max_pixels))
 
         upcoming = rendering(batches[0]) if batches else None
+        read = 0
         try:
             for position, indexes in enumerate(batches):
+                if max_chars is not None and read >= max_chars:
+                    unread = [index for rest in batches[position:] for index in rest]
+                    outcomes.update(dict.fromkeys(unread, _TEXT_LIMIT))
+                    break
                 if before_batch is not None:
                     await before_batch()
                 assert upcoming is not None  # noqa: S101 — one task per batch
                 images = await upcoming
                 upcoming = rendering(batches[position + 1]) if position + 1 < len(batches) else None
-                outcomes.update(
-                    await self.recognize(
-                        tenant_id=tenant_id,
-                        document_id=document_id,
-                        plan=plan,
-                        images=dict(zip(indexes, images, strict=True)),
-                        render=params,
-                    )
+                batch = await self.recognize(
+                    tenant_id=tenant_id,
+                    document_id=document_id,
+                    plan=plan,
+                    images=dict(zip(indexes, images, strict=True)),
+                    render=params,
+                )
+                outcomes.update(batch)
+                read += sum(
+                    len(o.text) for o in batch.values() if o.status is PageStatus.RECOGNIZED
                 )
         finally:
             if upcoming is not None:

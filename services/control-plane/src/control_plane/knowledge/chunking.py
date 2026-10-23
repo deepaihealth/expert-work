@@ -96,6 +96,14 @@ _SEMANTIC_BREAK_THRESHOLD = 0.4
 #: only a question outranks its answer on keyword match.
 MIN_SEMANTIC_CHUNK_TOKENS = 32
 
+#: Blocks embedded per topic-detection window. Only adjacent blocks are
+#: compared, so each window's vectors are dropped once compared; only the
+#: last one is carried into the next window. Holding every block's vector
+#: (1,024 floats, ~40 KiB as Python objects) at once took the server 600 MiB
+#: for a 5 MB text file. A multiple of the usual embedding batch sizes (10,
+#: 25, 50, 100), so the requests sent stay the same.
+SEMANTIC_EMBED_WINDOW = 200
+
 
 def count_tokens(text: str) -> int:
     """Token count of ``text`` under the chunking tokenizer."""
@@ -195,8 +203,7 @@ async def chunk_markdown_semantic(
     blocks = _presplit_blocks(_blocks(markdown, plain_text=plain_text), max_tokens)
     semantic_breaks: frozenset[int] = frozenset()
     if len(blocks) >= 2:
-        embeddings = await embedder.embed([block.text for block in blocks], tenant_id=tenant_id)
-        semantic_breaks = _semantic_breaks(blocks, embeddings)
+        semantic_breaks = await _semantic_breaks(blocks, embedder, tenant_id)
     return _pack_blocks(
         blocks,
         max_tokens=max_tokens,
@@ -277,16 +284,27 @@ def _section_budget(
     return trail, max(max_tokens - prefix_tokens(trail), max_tokens // 2)
 
 
-def _semantic_breaks(blocks: list[_Block], embeddings: Sequence[Sequence[float]]) -> frozenset[int]:
+async def _semantic_breaks(
+    blocks: list[_Block], embedder: Embedder, tenant_id: UUID
+) -> frozenset[int]:
     """Block indices that start a new semantic segment — adjacent
     same-section blocks whose embeddings exceed the distance threshold.
-    A heading change is already a flush point, so it is skipped here."""
+    A heading change is already a flush point, so it is skipped here.
+    Blocks are embedded :data:`SEMANTIC_EMBED_WINDOW` at a time and only the
+    previous block's vector outlives its window."""
     breaks: set[int] = set()
-    for i in range(1, len(blocks)):
-        if blocks[i].heading_trail != blocks[i - 1].heading_trail:
-            continue
-        if _cosine_distance(embeddings[i - 1], embeddings[i]) >= _SEMANTIC_BREAK_THRESHOLD:
-            breaks.add(i)
+    previous: Sequence[float] | None = None
+    for start in range(0, len(blocks), SEMANTIC_EMBED_WINDOW):
+        window = blocks[start : start + SEMANTIC_EMBED_WINDOW]
+        vectors = await embedder.embed([block.text for block in window], tenant_id=tenant_id)
+        for index, vector in zip(range(start, start + len(window)), vectors, strict=True):
+            if (
+                previous is not None
+                and blocks[index].heading_trail == blocks[index - 1].heading_trail
+                and _cosine_distance(previous, vector) >= _SEMANTIC_BREAK_THRESHOLD
+            ):
+                breaks.add(index)
+            previous = vector
     return frozenset(breaks)
 
 

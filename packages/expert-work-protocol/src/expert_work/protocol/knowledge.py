@@ -72,6 +72,9 @@ class IngestErrorCode(StrEnum):
     UNSUPPORTED_FILE = "unsupported_file"
     INVALID_FILE = "invalid_file"
     PARSE_FAILED = "parse_failed"
+    #: The parsed text is over the platform's per-document character limit
+    #: (``knowledge_document_max_chars``); the user is asked to split it.
+    TEXT_TOO_LARGE = "text_too_large"
     EMBEDDING_FAILED = "embedding_failed"
     #: Reserved — written once per-tenant knowledge quotas exist.
     QUOTA_EXCEEDED = "quota_exceeded"

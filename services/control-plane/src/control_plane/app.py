@@ -164,6 +164,7 @@ from control_plane.keycloak import (
     ServiceAccountTokenProvider,
 )
 from control_plane.knowledge.ingestion import KnowledgeIngestionRunner, configure_parse_pool
+from control_plane.knowledge.parsed_size import configure_parsed_size, configure_raw_bytes
 from control_plane.knowledge.recognition.figure_pipeline import (
     FigureDescriber,
     default_figure_client,
@@ -2097,6 +2098,11 @@ def create_app(
                     timeout_s=resolved_settings.knowledge_parse_timeout_s,
                     max_vm_mb=resolved_settings.knowledge_parse_worker_max_vm_mb,
                     figure_max_vm_mb=resolved_settings.knowledge_figure_worker_max_vm_mb,
+                )
+                configure_parsed_size(max_chars=resolved_settings.knowledge_document_max_chars)
+                configure_raw_bytes(
+                    budget=resolved_settings.knowledge_ingest_raw_bytes_budget,
+                    upload_max_bytes=resolved_settings.knowledge_document_max_bytes,
                 )
                 # B-209 — scanned PDF pages are read by the platform's
                 # recognition models; recognition and ingest embeddings are

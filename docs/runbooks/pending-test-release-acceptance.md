@@ -887,7 +887,7 @@ open("/tmp/b209-photo48.docx", "wb").write(picture_docx(out.getvalue(), before="
 PY
 ```
 
-  先传 `b209-photo48.docx`。判据:ready、`PHOTO-MARKER` 在、`figure_stats.unsupported=1`(这张图超了上限被跳过),控制面日志有 `knowledge.figure_out_of_memory`。再传 `b209-bigtext.docx`。判据:配了图片描述模型时它在图片步骤之前就被拒,立刻 FAILED,`error` 含 `a part of the file unpacks to more than a document may`(单个 XML 部件 > 64 MiB,没占内存);图片描述模型没配(走普通解析)时同时另传一份普通文档,`b209-bigtext.docx` FAILED,`error` 是 `needs more memory than a parse may use` **或** `A process in the process pool was terminated abruptly`(本机实测:C 扩展里分配失败时子进程直接退出,表现为后者;解析池会重建、重试一次),那份普通文档 ready。两种情况都要 RESTARTS 不变、没有 `OOMKilled`。测完把上限改回原值。
+  先传 `b209-photo48.docx`。判据:ready、`PHOTO-MARKER` 在、`figure_stats.unsupported=1`(这张图超了上限被跳过),控制面日志有 `knowledge.figure_out_of_memory`。再传 `b209-bigtext.docx`。判据:配了图片描述模型时它在图片步骤之前就被拒,立刻 FAILED,`error` 含 `a part of the file unpacks to more than a document may`(单个 XML 部件 > 64 MiB,没占内存);图片描述模型没配(走普通解析)时同时另传一份普通文档,`b209-bigtext.docx` FAILED,`error` 是 `needs more memory than a parse may use` **或** `A process in the process pool was terminated abruptly` **或** `text too large`(§48 的单份字数上限:解析进程解析完、在送回主进程前拒收,`error_code=text_too_large`)(本机实测:C 扩展里分配失败时子进程直接退出,表现为后者;解析池会重建、重试一次),那份普通文档 ready。两种情况都要 RESTARTS 不变、没有 `OOMKilled`。测完把上限改回原值。
 
 ## §45 B-206 第 1 步续:K-6 工具说明(#1901)+ K-7a 重排限速 / 重试 / 结果状态
 
@@ -930,9 +930,91 @@ PY
 - [ ] **47.4 智能体模型下拉不再出现重排 / 嵌入模型**:任一智能体配置页 → 模型 → 厂商选 glm / qwen。判据:模型下拉里没有 `rerank`、`embedding-3`、`qwen3-vl-rerank`、`text-embedding-v4`;`GET /v1/model-catalog` 里这些行仍在且 `chat_model: false`,对话模型 `chat_model: true`;价目表页仍列出它们。**没修好时**:下拉里能选到重排 / 嵌入模型(选了以后智能体每轮都失败)。
 - [ ] **47.5 拆批 / 装批 / 分数归一 / 超长重发 / 不支持的接口跳过**:不在测试环境真触发(要凑 12.8 万字以上的候选池或造一个平台调不了的目录模型);由单测覆盖(9 个厂商形状的请求 / 回包、每类拒绝的归类、logit→sigmoid 与 logit 上合并 / 双视图加权、按字符装批与拆批时同一查询、`relative` 只送第一批、按字节兜底、`model_unsupported` 跳过且不读凭据、目录里每个重排模型都调得了,变异自证见 PR 说明)。
 
-## §49 读知识库文档不再带上原件(列表 / 详情 / 检索署名 / 重建索引)
+## §48 知识库单文档字数上限 + 服务端同时处理的字数预算 + 原始文件字节预算(防大文档撑爆控制面内存)
 
-(§48 已被并行分支占用。)
+**背景**:解析出的文字回到控制面主进程后,切块 / 每段一个 1024 维向量 / 建行写库全在主进程内存里,内存跟文字量成正比;压缩包类格式能解出远超文件大小的文字(实测一个 0.5 MB 的 Word 解出 110 MB 文字,主进程涨到 5.5 GB;50 MiB 的纯中文 .txt 在 6 GiB 内存上限下 49 秒被 OOM 杀掉)。本条三处改动:① 新平台设置 `EXPERT_WORK_KNOWLEDGE_DOCUMENT_MAX_CHARS`(默认 2,500,000 字),**解析进程自己量出字数、超了就在解析进程里拒绝**,文字不回主进程(§44 的 Word / 幻灯片抽图解析同样);上限管的是**进切块的最终文字**:§44 插回原位的图片描述也算字数,所以拼完描述后主进程再查一次;扫描页识别拼出的文字在主进程切块前再查一次;拒绝 = 文档失败、`error_code=text_too_large`、控制台按界面语言显示「共 N 字,超过单个文档 M 字的上限,请拆分」,**不重试**(恢复任务第一次就判终态);② 同一个数字也是**主进程同时切块 / 嵌入 / 写库的字数预算**:并发入库的文档按到达顺序排队,文字加起来不超过它(上传入库与恢复任务共用一份预算);③ 语义切块找断点时按 200 段一窗嵌入,不再把每段的向量同时攥在内存里(原来 5 MB 文字就占 600 MiB)。实测(生产镜像 `f4a075a54` 挂本分支代码,linux/amd64,`MALLOC_ARENA_MAX=2`,真 Postgres,假嵌入器):上限附近的中文文档(245 万字、6,233 段)主进程峰值比空闲高 463 MiB,四份同时上传 503 MiB;改前同一份 811 MiB、四份同时 1,813 MiB(2Gi 的 pod 必被杀)。④ **扫描页识别跟着字数上限停**:识别出的文字封顶为「B-209 的 500 万字」与「上限减去文字页自身字数和页间空行」中较小的那个;读到顶后,后面的页不再渲染、不再调识别模型(不花钱),记为识别失败 `document_text_limit`,文档照常入库(改前:识别费付完,整份文档在切块前因超上限失败);到顶那一批(最多 16 页)里已经在识别的页照付。⑤ **原始文件字节预算** `EXPERT_WORK_KNOWLEDGE_INGEST_RAW_BYTES_BUDGET`(默认 100 MiB,两份最大上传):每份文档在认领(读出原文件字节)之前先按单文件上限 50 MiB 预留,读到真实大小后只留真实大小,一直占到这份文档入库结束(解析和每批扫描页渲染都要把原文件再发给解析进程);放不下就按到达顺序排队,此时还没读字节、文档保持 pending;上传入库与恢复任务共用一份,恢复任务改为一份一份认领。实测八份 47 MiB 扫描件 PDF(上传 4 + 恢复 4,1 个解析进程,识别用不联网的假模型):主进程峰值 +533 MiB → +241 MiB,总耗时不变(98 s);四份上限附近的中文文本 + 四份 47 MiB 扫描件同时:+752 MiB。没有新迁移,`error_code` 是文本列;回退旧镜像时这类文档的 `error_code` 读成 `internal_error`(`error` 原文不变)。
+
+**怎么进**:测试环境控制台(system_admin,平台租户)建临时知识库;控制面日志 `kubectl -n expert-work logs deploy/control-plane -c control-plane`;内存看 `kubectl -n expert-work top pod -l app.kubernetes.io/name=control-plane --containers`(或 pod 里 `cat /proc/1/status | grep VmRSS`)。**测试文件(零租户内容,本机生成,不需要第三方包)**:
+
+```bash
+python3 - <<'PY'
+import io, zipfile
+from xml.sax.saxutils import escape
+
+LINE = "超长文档验收段落：这一段文字只用于验证单个文档的字数上限。"
+
+
+def paragraphs(chars):
+    # Every paragraph carries its number, so no two chunks are the same text.
+    count = chars // (len(LINE) * 8 + 10) + 1
+    return [f"第{i}段。" + LINE * 8 for i in range(count)]
+
+
+def docx(path, chars):
+    body = "".join(f"<w:p><w:r><w:t>{escape(p)}</w:t></w:r></w:p>" for p in paragraphs(chars))
+    with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED, compresslevel=9) as zf:
+        zf.writestr("[Content_Types].xml",
+            '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+            '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">'
+            '<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>'
+            '<Default Extension="xml" ContentType="application/xml"/>'
+            '<Override PartName="/word/document.xml" ContentType="application/'
+            'vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/></Types>')
+        zf.writestr("_rels/.rels",
+            '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+            '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+            '<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/'
+            'relationships/officeDocument" Target="word/document.xml"/></Relationships>')
+        zf.writestr("word/document.xml",
+            '<?xml version="1.0" encoding="UTF-8" standalone="yes"?><w:document '
+            'xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">'
+            f"<w:body>{body}</w:body></w:document>")
+
+docx("/tmp/kb48-oversize.docx", 3_200_000)            # 约 320 万字,文件约 0.1 MB
+open("/tmp/kb48-oversize.txt", "w", encoding="utf-8").write("\n\n".join(paragraphs(2_800_000)))  # 约 280 万字,约 8 MB
+open("/tmp/kb48-normal.md", "w", encoding="utf-8").write(
+    "# 验收用普通文档\n\nKB48-NORMAL-MARKER 3517:差旅报销在出差结束后十个工作日内提交。\n")
+PY
+ls -l /tmp/kb48-*
+```
+
+- [ ] **48.1 设置生效**:`kubectl -n expert-work exec deploy/control-plane -c control-plane -- python -c "from control_plane.settings import Settings; print(Settings().knowledge_document_max_chars)"`。判据:`2500000`(没有在 ConfigMap / 环境变量里覆盖)。
+- [ ] **48.2 超上限的 Word 被拒、主进程不涨**:先记控制面 pod 的 VmRSS,再上传 `kb48-oversize.docx`(45 KB)。判据:① 几秒内文档变「失败」,`GET …/documents/{id}` 的 `error_code=text_too_large`、`error` 以 `text too large: 3,` 开头、含 `over the per-document limit of 2,500,000`;`attempts=1`;② 控制台状态标签的提示是「文档文字过多：共 3,…字，超过单个文档 2,500,000 字的上限。请拆成几个较小的文件后分别上传。」;③ 主进程 VmRSS 比上传前高不到 100 MiB;④ 这段时间 `token_usage` 没有该租户新的 `knowledge_ingest` 行(一次嵌入都没调)。**没修好时**:文档会被切块嵌入(32 万段级别的嵌入费用),主进程涨几个 GB、pod 可能被 OOM 杀掉(同 pod 上在跑的对话全断)。
+- [ ] **48.3 英文界面**:右上角切到 English 再看 48.2 的提示。判据:「Too much text: 3,… characters, over the per-document limit of 2,500,000. Split it into smaller files and upload them separately.」。
+- [ ] **48.4 不重试**:48.2 之后等 2 分钟(恢复任务每 30 秒扫一次)。判据:文档仍是失败、`attempts` 仍为 1;日志里这份文档只有一条 `knowledge.ingest_failed`,没有 `knowledge.recovery_retry` / `knowledge.recovery_failed_terminal`。再点一次「重新摄取」:判据:又是几秒内失败、同样的提示,`attempts` 只加 1。**没修好时**:恢复任务反复认领,每次重解析整份文档。
+- [ ] **48.5 同一批里的其他文档不受影响**:把 `kb48-oversize.txt` 和 `kb48-normal.md` 一起拖进上传框(同一批)。判据:`.txt` 失败、`text_too_large`;`.md` ready,检索测试搜「KB48-NORMAL-MARKER 3517」命中。**没修好时**:`.md` 跟着失败或长时间卡在排队。
+- [ ] **48.6 上限以内照常入库**:已有知识库里的文档点「重新摄取」(或 §42 的测试文件)。判据:照常 ready,分段数与之前相同;日志没有 `text_too_large`。
+- [ ] **48.7 预算排队 / 上限附近的真实内存(可选,两份约 ¥5 嵌入费、约 1 万次嵌入请求)**:不默认做。要做时在 48.2 那段脚本末尾加 `docx("/tmp/kb48-near-a.docx", 2_400_000); docx("/tmp/kb48-near-b.docx", 2_400_000)`(各约 240 万字,在上限内),两份同时上传。判据:两份都 ready;第一份在 chunking / embedding 时,第二份停在 parsing,第一份 ready 后第二份才进 chunking(预算按到达顺序);期间主进程 VmRSS 比空闲高不超过约 530 MiB。**没修好时**:两份同时切块嵌入,主进程峰值约翻倍。
+- [ ] **48.8 格式覆盖 / 解析进程里拒绝 / 预算排队与取消**:不在测试环境逐一触发;由单测覆盖(txt / md / markdown / html / htm / csv / docx / xlsx / pptx / pdf 每种格式「刚好超一字」在解析进程里被拒、「刚好等于上限」照常入库;开着图片描述时 Word / 幻灯片超限在解析进程里被拒、一次看图都不调;自身文字在上限内、拼上图片描述后超限的在切块前被拒;预解析文字超限在切块前被拒;预算先到先得、等待中取消让出、出错归还,变异自证见 PR 说明)。
+- [ ] **48.9 识别到字数上限就停**:不在测试环境触发(要 250 万字以上的识别文字,或临时调低共用环境的上限);由单测覆盖(5 页扫描件、上限只够 2 页:模型只被调 2 次,第 3–5 页 `document_text_limit`,文档入库;文字页的字数和页间空行计入上限;变异自证)。
+- [ ] **48.10 大扫描件按字节预算排队(识别费约 ¥0.1)**:本机生成 4 份约 45 MiB 的扫描件 PDF(每页一张整页大图,要 pymupdf + Pillow,仓库根目录跑):
+
+  ```bash
+  uv run --no-sync python - <<'PY'
+  import io, random
+  import pymupdf
+  from PIL import Image, ImageChops, ImageDraw
+  for n in range(4):
+      rng, doc, size, page_no = random.Random(n), pymupdf.open(), 0, 0
+      while size < 44 * 1024 * 1024:
+          page_no += 1
+          img = Image.new("L", (1654, 2339), 235)
+          draw = ImageDraw.Draw(img)
+          for y in range(80, 2259, 34):
+              draw.text((90, y), f"KB48-SCAN {n}-{page_no}-{y} {rng.random():.6f} " * 4, fill=30)
+          noise = Image.effect_noise((1654, 2339), 40).point(lambda v: 200 + v // 5)
+          buf = io.BytesIO()
+          ImageChops.multiply(img, noise).save(buf, "JPEG", quality=80)
+          doc.new_page().insert_image(pymupdf.Rect(0, 0, 595, 842), stream=buf.getvalue())
+          size += buf.tell()
+      doc.save(f"/tmp/kb48-scan-{n}.pdf")
+  PY
+  ls -l /tmp/kb48-scan-*.pdf
+  ```
+
+  记控制面 pod 的 VmRSS 后把 4 份一起传进同一个知识库。判据:① 每个 pod 同一时刻最多 2 份在 processing,其余是 pending、`attempts=0`(还没认领,字节没读);② 全部最终 ready、`page_stats.pages_ocr` 等于页数;③ 主进程 VmRSS 峰值比空闲高不超过约 300 MiB。**没修好时**:4 份同时 processing,主进程多涨约 200 MiB。
+
+## §49 读知识库文档不再带上原件(列表 / 详情 / 检索署名 / 重建索引)
 
 **背景**:`knowledge_document` 一行有两格原件:正在服务的版本 `content`、重传后等着入库的 `pending_content`,各最多 50 MiB。改前 `get_document` / `get_documents` / 文档列表每读一行都把两格原件整份读进内存再丢掉,而读它们的地方只要文件名、状态这些:`knowledge_search` 每次检索给结果署名(每个来源文档一次)、控制台文档列表(上传期间轮询)、文档详情、入库失败路径、重建索引(整库列一遍)。本机真 Postgres 16、8 份 47 MiB 文档实测 Python 分配峰值:`get_documents` 423 MiB、一页列表 423 MiB、一次 `get_document` 94 MiB、一次检索署名 8 份文档 423 MiB。现在两格原件在 ORM 上设为 `deferred` + `raiseload`:读文档行不读它们,代码误碰直接报错;`has_pending` 在 SQL 里算(`pending_content IS NOT NULL`)。只有两处读原件:入库认领(只读要入库的那一格:有待入库的读它,否则读正在服务的)和 `get_document_content`。改后同样的 8 份:上面四项都在 0.3–0.6 MiB;认领一份重传 188 → 94 MiB(原来两格都读、只用一格);重传上传 188 → 94 MiB(剩下的是新文件本身写进库);重建索引列全库 423 → 0.4 MiB。接口响应不变:同一套「上传 → 失败的重传 → 重试 → 丢弃 → 重新摄取 → 好的重传 → 检索」流程,改前改后 18 个响应逐字节相同。「重新摄取」「补识别」点击前的预检原来为了判断原件在不在,把正在服务的原件整份读出来(47 MiB 一份 94 MiB);现在看文档对象上新加的 `has_content`(SQL 里算 `content IS NOT NULL`,不读原件),预检 94.2 → 0.3 MiB,随后入库的认领照常读一格(94 MiB)。`has_content` 只加在内部文档对象上,没有进接口响应。没有迁移。说明:平台没有「下载原件」接口,原件只给入库用。
 

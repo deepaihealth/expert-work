@@ -8,15 +8,13 @@ from __future__ import annotations
 from collections.abc import Mapping, Sequence
 
 from control_plane.knowledge.recognition.pages import PdfAnalysis
-from control_plane.knowledge.recognition.recognizer import PageOutcome
+from control_plane.knowledge.recognition.recognizer import ERROR_DOCUMENT_TEXT_LIMIT, PageOutcome
 from expert_work.protocol import DocumentPage, PageDecision, PageStats, PageStatus
 
 #: Recognized text one document may add (review H1: 1,000 pages of 30,000
 #: characters is 30 M). A dense scanned page reads to ~3,000 characters, so
 #: the cap is far above a real 1,000-page document.
 MAX_RECOGNIZED_CHARS_PER_DOCUMENT = 5_000_000
-#: Error class of a page whose text did not fit under the document cap.
-ERROR_DOCUMENT_TEXT_LIMIT = "document_text_limit"
 
 
 def cap_recognized_text(outcomes: Mapping[int, PageOutcome], limit: int) -> dict[int, PageOutcome]:

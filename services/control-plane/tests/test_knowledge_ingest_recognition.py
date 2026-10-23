@@ -484,7 +484,7 @@ async def test_scanned_pages_that_gave_no_text_leave_the_document_as_it_parsed_b
     raw = _pdf("text", "scan", "text")
     doc = await _document("handbook.pdf", raw)
     await _ingest(doc, "handbook.pdf", raw, recognizer=None)
-    assert spy.names == ["analyse_pdf", "parse_document"]
+    assert spy.names == ["analyse_pdf_within_cap", "parse_document"]
     expected = parse_document("handbook.pdf", raw)
     assert "".join((await _bodies(doc)).split()) == "".join(expected.split())
 
@@ -494,7 +494,7 @@ async def test_a_recognized_page_skips_the_legacy_parse(monkeypatch: pytest.Monk
     raw = _pdf("text", "scan")
     doc = await _document("mixed.pdf", raw)
     await _ingest(doc, "mixed.pdf", raw, recognizer=_recognizer(doc.store, _Reader()))
-    assert spy.names == ["analyse_pdf", "render_pages"]
+    assert spy.names == ["analyse_pdf_within_cap", "render_pages"]
 
 
 async def test_analysis_and_every_render_share_one_budget(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -504,7 +504,7 @@ async def test_analysis_and_every_render_share_one_budget(monkeypatch: pytest.Mo
     raw = _pdf("scan", "scan", "scan")
     doc = await _document("book.pdf", raw)
     await _ingest(doc, "book.pdf", raw, recognizer=_recognizer(doc.store, _Reader()))
-    assert spy.names == ["analyse_pdf", "render_pages", "render_pages", "render_pages"]
+    assert spy.names == ["analyse_pdf_within_cap", "render_pages", "render_pages", "render_pages"]
     budgets = {id(budget) for _, budget in spy.calls}
     assert len(budgets) == 1 and spy.calls[0][1] is not None
 
