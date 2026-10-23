@@ -9,6 +9,7 @@ import base64
 import io
 import random
 import re
+import struct
 import tracemalloc
 import warnings
 import zipfile
@@ -429,9 +430,11 @@ def test_the_entry_count_is_read_from_the_end_record_first(
 
 
 def test_the_zip64_entry_count_is_read() -> None:
-    record = b"PK\x06\x06" + bytes(28) + (70_000).to_bytes(8, "little") + bytes(16)
-    locator = b"PK\x06\x07" + bytes(4) + (0).to_bytes(8, "little") + (1).to_bytes(4, "little")
-    end = b"PK\x05\x06" + bytes(6) + (0xFFFF).to_bytes(2, "little") + bytes(10)
+    # A well-formed ZIP64 end record: Python 3.12.12+ / 3.13.8+ (CVE-2025-8291)
+    # reject one whose size or version fields are inconsistent.
+    record = struct.pack("<4sQ2H2L4Q", b"PK\x06\x06", 44, 45, 45, 0, 0, 70_000, 70_000, 0, 0)
+    locator = struct.pack("<4sLQL", b"PK\x06\x07", 0, 0, 1)
+    end = struct.pack("<4s4H2LH", b"PK\x05\x06", 0, 0, 0xFFFF, 0xFFFF, 0xFFFFFFFF, 0xFFFFFFFF, 0)
     assert declared_entry_count(record + locator + end) == 70_000
     assert declared_entry_count(b"no end record") is None
 
