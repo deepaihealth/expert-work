@@ -710,11 +710,15 @@ async def test_a_cancelled_waiter_lets_the_next_one_in() -> None:
     assert blocked.cancelled()
 
 
+async def _fail_while_admitted(chars: int) -> None:
+    async with admitted(chars):
+        raise RuntimeError("embedding failed")
+
+
 async def test_the_budget_is_returned_when_an_ingest_fails() -> None:
     configure_parsed_size(max_chars=1000)
     with pytest.raises(RuntimeError):
-        async with admitted(1000):
-            raise RuntimeError("embedding failed")
+        await _fail_while_admitted(1000)
     async with asyncio.timeout(1):
         async with admitted(1000):
             pass
