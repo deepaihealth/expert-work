@@ -413,6 +413,7 @@ class InMemoryKnowledgeStore(KnowledgeStore):
                 else:
                     self._pending[existing.id] = (content, content_sha256)
             update["has_pending"] = existing.id in self._pending
+            update["has_content"] = self._content.get(existing.id) is not None
             if existing.doc_seq is None:  # a row from before doc_seq existed
                 update["doc_seq"] = self._bump_doc_seq(tenant_id)
             reset = existing.model_copy(update=update)
@@ -427,6 +428,7 @@ class InMemoryKnowledgeStore(KnowledgeStore):
             kb_id=kb_id,
             filename=filename,
             status=DocumentStatus.PENDING,
+            has_content=content is not None,
             doc_seq=doc_seq,
             title=facts.title,
             mime=facts.mime,
@@ -670,6 +672,7 @@ class InMemoryKnowledgeStore(KnowledgeStore):
             serving = self._content.get(document_id)
             update["size_bytes"] = len(serving) if serving is not None else None
             update["has_pending"] = False
+            update["has_content"] = serving is not None
         self._documents[self._documents.index(document)] = document.model_copy(update=update)
         return True
 

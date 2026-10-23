@@ -12,10 +12,15 @@ export DOCKER_HOST=unix:///Users/mac/.docker/run/docker.sock
 
 from __future__ import annotations
 
+import gc
 import re
-from collections.abc import AsyncIterator
+import tracemalloc
+from collections.abc import AsyncIterator, Awaitable, Callable
+from datetime import UTC, datetime
+from functools import partial
 from pathlib import Path
 from typing import Any
+from uuid import UUID
 
 import psycopg
 import pytest
@@ -37,6 +42,13 @@ from expert_work.persistence import (
 )
 from expert_work.persistence.audit_log import InMemoryAuditLogStore
 from expert_work.persistence.knowledge.base import KnowledgeStore
+from expert_work.protocol import (
+    DocumentPage,
+    DocumentStatus,
+    PageDecision,
+    PageReason,
+    PageStatus,
+)
 from orchestrator.llm import FakeEmbedder
 from orchestrator.tools.knowledge import KnowledgeRetriever
 from tests.auth_fixtures import TEST_AUDIENCE, TEST_ISSUER, build_test_jwt_verifier, make_test_jwt
@@ -45,6 +57,7 @@ pytestmark = pytest.mark.integration
 
 _ALEMBIC_INI = Path(__file__).resolve().parents[3] / "packages/expert-work-persistence/alembic.ini"
 _DB = "knowledge_document_api"
+_MIB = 1 << 20
 _MD = b"# Handbook\n\nThe deductible is 500 dollars per year."
 _UUID = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
 #: Differ between runs (or, for ``score``, between float4 and float8 vectors).
@@ -91,9 +104,7 @@ def _normalise(value: Any) -> Any:
     return value
 
 
-async def _walk(store: KnowledgeStore) -> list[tuple[str, int, Any]]:
-    """``(step, status, normalised body)`` for each request of the walk."""
-    runner = KnowledgeIngestionRunner(store=store, embedder=FakeEmbedder())
+def _client(store: KnowledgeStore, runner: Any) -> AsyncClient:
     app = create_app(
         settings=Settings(
             env="dev",
@@ -111,12 +122,18 @@ async def _walk(store: KnowledgeStore) -> list[tuple[str, int, Any]]:
     app.state.platform_embedding_config_service = _FakeEmbeddingConfig()
     app.state.knowledge_retriever = KnowledgeRetriever(store=store, embedder=FakeEmbedder())
     token = make_test_jwt(tenant_id=DEFAULT_DEV_TENANT_ID, subject="user-a")
-    steps: list[tuple[str, int, Any]] = []
-    async with AsyncClient(
+    return AsyncClient(
         transport=ASGITransport(app=app),
         base_url="http://cp.test",
         headers={"Authorization": f"Bearer {token}"},
-    ) as client:
+    )
+
+
+async def _walk(store: KnowledgeStore) -> list[tuple[str, int, Any]]:
+    """``(step, status, normalised body)`` for each request of the walk."""
+    runner = KnowledgeIngestionRunner(store=store, embedder=FakeEmbedder())
+    steps: list[tuple[str, int, Any]] = []
+    async with _client(store, runner) as client:
 
         async def call(step: str, method: str, url: str, **kwargs: Any) -> Any:
             response = await client.request(method, url, **kwargs)
@@ -162,3 +179,91 @@ async def test_document_responses_match_the_in_memory_store(
     assert by_step["discard again"][0] == 409
     assert by_step["list after v2"][1]["documents"][0]["size_bytes"] == len(_MD + b"\n\nMore.")
     assert [hit["filename"] for hit in by_step["search"][1]["results"]] == ["h.md"]
+
+
+# -- a reingest / recognize click leaves the bytes in Postgres ---------------
+
+#: The document's stored upload; reading it costs about twice this.
+_UPLOAD = 8 * _MIB
+
+
+class _RecordingRunner:
+    """Stands in for the ingestion runner: records what a click queues and
+    ingests nothing, so the click is measured on its own."""
+
+    def __init__(self) -> None:
+        self.queued: list[UUID] = []
+
+    def submit(self, *, tenant_id: UUID, document_id: UUID) -> None:
+        self.queued.append(document_id)
+
+
+async def _peak(operation: Callable[[], Awaitable[Any]]) -> tuple[int, Any]:
+    gc.collect()
+    tracemalloc.start()
+    try:
+        start, _ = tracemalloc.get_traced_memory()
+        result = await operation()
+        _, peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+    return peak - start, result
+
+
+async def test_reingest_and_recognize_clicks_do_not_read_the_upload(
+    sql_store: SqlKnowledgeStore,
+) -> None:
+    tenant = DEFAULT_DEV_TENANT_ID
+    kb_id = (await sql_store.create_base(tenant_id=tenant, name="kb")).id
+    upload = bytes([7]) * _UPLOAD
+    document = await sql_store.upsert_document(
+        tenant_id=tenant, kb_id=kb_id, filename="scan.pdf", content=upload, content_sha256="s"
+    )
+
+    async def ingest() -> int:
+        """What the queued ingest does first: claim, which carries the bytes."""
+        peak, claim = await _peak(
+            lambda: sql_store.claim_document(
+                tenant_id=tenant,
+                document_id=document.id,
+                now=datetime.now(UTC),
+                lease_seconds=600,
+                max_attempts=5,
+            )
+        )
+        assert claim is not None and claim.content == upload
+        failed_page = DocumentPage(
+            page=1,
+            decision=PageDecision.OCR,
+            reason=PageReason.FULL_PAGE_IMAGE,
+            status=PageStatus.FAILED,
+            images=1,
+            error="primary: empty output",
+        )
+        assert await sql_store.set_document_pages(
+            tenant_id=tenant,
+            document_id=document.id,
+            pages=[failed_page],
+            generation=claim.generation,
+        )
+        assert await sql_store.set_document_status(
+            tenant_id=tenant,
+            document_id=document.id,
+            status=DocumentStatus.READY,
+            chunk_count=0,
+            generation=claim.generation,
+        )
+        return peak
+
+    assert await ingest() >= _UPLOAD
+    runner = _RecordingRunner()
+    async with _client(sql_store, runner) as client:
+        url = f"/v1/knowledge/bases/kb/documents/{document.id}"
+        await client.get(f"{url}/pages")  # warm the app and the pool
+        for action in ("reingest", "recognize"):
+            peak, response = await _peak(partial(client.post, f"{url}/{action}"))
+            assert response.status_code == 202, (action, response.text)
+            assert peak < _UPLOAD // 4, (action, peak)
+            assert runner.queued[-1] == document.id
+            # The ingest the click queued still gets the bytes.
+            assert await ingest() >= _UPLOAD, action

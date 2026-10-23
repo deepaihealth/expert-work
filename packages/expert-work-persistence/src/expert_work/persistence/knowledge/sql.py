@@ -229,6 +229,7 @@ def _to_document(row: KnowledgeDocumentRow) -> KnowledgeDocument:
         attempts=row.attempts,
         ingest_generation=row.ingest_generation,
         has_pending=row.has_pending,
+        has_content=row.has_content,
         doc_seq=row.doc_seq,
         title=row.title,
         source_type=_enum_or(DocumentSourceType, row.source_type, DocumentSourceType.FILE)

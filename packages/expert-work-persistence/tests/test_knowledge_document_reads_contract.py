@@ -240,6 +240,78 @@ async def test_reupload_fills_the_empty_serving_slot_else_the_pending_one(
     )
 
 
+async def _flags(
+    store: KnowledgeStore, tenant: UUID, kb_id: UUID, document_id: UUID
+) -> tuple[bool, bool]:
+    """``(has_content, has_pending)`` — every light read must say the same."""
+    lib = _Library(tenant, kb_id, document_id, document_id)
+    seen = {
+        name: (documents[document_id].has_content, documents[document_id].has_pending)
+        for name, read in _light_reads(store, lib).items()
+        for documents in [await read()]
+    }
+    assert len(set(seen.values())) == 1, seen
+    return next(iter(seen.values()))
+
+
+async def _fail(store: KnowledgeStore, tenant: UUID, document_id: UUID) -> None:
+    claim = await store.claim_document(
+        tenant_id=tenant,
+        document_id=document_id,
+        now=datetime.now(UTC),
+        lease_seconds=600,
+        max_attempts=5,
+    )
+    assert claim is not None
+    assert await store.mark_document_failed_terminal(
+        tenant_id=tenant, document_id=document_id, error="parse failed", generation=claim.generation
+    )
+
+
+async def test_byte_slot_flags_through_every_state(store: KnowledgeStore) -> None:
+    tenant = uuid4()
+    kb_id = (await store.create_base(tenant_id=tenant, name="kb")).id
+
+    async def flags(document: KnowledgeDocument) -> tuple[bool, bool]:
+        stored = await _flags(store, tenant, kb_id, document.id)
+        assert (document.has_content, document.has_pending) == stored  # what the write returned
+        return stored
+
+    # Upload with bytes; first ingest fails; re-upload waits; discard; re-upload + ready.
+    kept = await _upload(store, tenant, kb_id, "kept.pdf", b"v1")
+    assert await flags(kept) == (True, False)
+    await _fail(store, tenant, kept.id)
+    assert await _flags(store, tenant, kb_id, kept.id) == (True, False)
+    assert await flags(await _upload(store, tenant, kb_id, "kept.pdf", b"v2")) == (True, True)
+    restored = await store.discard_pending(tenant_id=tenant, document_id=kept.id)
+    assert restored is not None and restored.status is DocumentStatus.FAILED
+    assert await flags(restored) == (True, False)
+    assert await flags(await _upload(store, tenant, kb_id, "kept.pdf", b"v3")) == (True, True)
+    await _make_ready(store, tenant, kept)
+    assert await _flags(store, tenant, kb_id, kept.id) == (True, False)
+    assert await store.get_document_content(tenant_id=tenant, document_id=kept.id) == b"v3"
+
+    # No bytes and nothing serving: the next upload fills the serving slot.
+    bare = await _upload(store, tenant, kb_id, "bare.pdf", None)
+    assert await flags(bare) == (False, False)
+    assert await flags(await _upload(store, tenant, kb_id, "bare.pdf", b"b1")) == (True, False)
+
+    # A document whose bytes were never kept, serving chunks (a legacy row).
+    legacy = await _upload(store, tenant, kb_id, "legacy.pdf", None)
+    assert await flags(legacy) == (False, False)
+    await _make_ready(store, tenant, legacy)
+    assert await _flags(store, tenant, kb_id, legacy.id) == (False, False)
+    # Its re-upload waits behind the serving chunks; discard; re-upload + ready.
+    assert await flags(await _upload(store, tenant, kb_id, "legacy.pdf", b"n1")) == (False, True)
+    dropped = await store.discard_pending(tenant_id=tenant, document_id=legacy.id)
+    assert dropped is not None and dropped.status is DocumentStatus.READY
+    assert await flags(dropped) == (False, False)
+    assert await flags(await _upload(store, tenant, kb_id, "legacy.pdf", b"n2")) == (False, True)
+    await _make_ready(store, tenant, legacy)
+    assert await _flags(store, tenant, kb_id, legacy.id) == (True, False)
+    assert await store.get_document_content(tenant_id=tenant, document_id=legacy.id) == b"n2"
+
+
 async def test_claim_carries_the_slot_it_ingests_with_that_slots_hash(
     store: KnowledgeStore,
 ) -> None:

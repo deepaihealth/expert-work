@@ -934,14 +934,14 @@ PY
 
 (§48 已被并行分支占用。)
 
-**背景**:`knowledge_document` 一行有两格原件:正在服务的版本 `content`、重传后等着入库的 `pending_content`,各最多 50 MiB。改前 `get_document` / `get_documents` / 文档列表每读一行都把两格原件整份读进内存再丢掉,而读它们的地方只要文件名、状态这些:`knowledge_search` 每次检索给结果署名(每个来源文档一次)、控制台文档列表(上传期间轮询)、文档详情、入库失败路径、重建索引(整库列一遍)。本机真 Postgres 16、8 份 47 MiB 文档实测 Python 分配峰值:`get_documents` 423 MiB、一页列表 423 MiB、一次 `get_document` 94 MiB、一次检索署名 8 份文档 423 MiB。现在两格原件在 ORM 上设为 `deferred` + `raiseload`:读文档行不读它们,代码误碰直接报错;`has_pending` 在 SQL 里算(`pending_content IS NOT NULL`)。只有两处读原件:入库认领(只读要入库的那一格:有待入库的读它,否则读正在服务的)和 `get_document_content`。改后同样的 8 份:上面四项都在 0.3–0.6 MiB;认领一份重传 188 → 94 MiB(原来两格都读、只用一格);重传上传 188 → 94 MiB(剩下的是新文件本身写进库);重建索引列全库 423 → 0.4 MiB。接口响应不变:同一套「上传 → 失败的重传 → 重试 → 丢弃 → 重新摄取 → 好的重传 → 检索」流程,改前改后 18 个响应逐字节相同。没有迁移。说明:平台没有「下载原件」接口,原件只给入库用。
+**背景**:`knowledge_document` 一行有两格原件:正在服务的版本 `content`、重传后等着入库的 `pending_content`,各最多 50 MiB。改前 `get_document` / `get_documents` / 文档列表每读一行都把两格原件整份读进内存再丢掉,而读它们的地方只要文件名、状态这些:`knowledge_search` 每次检索给结果署名(每个来源文档一次)、控制台文档列表(上传期间轮询)、文档详情、入库失败路径、重建索引(整库列一遍)。本机真 Postgres 16、8 份 47 MiB 文档实测 Python 分配峰值:`get_documents` 423 MiB、一页列表 423 MiB、一次 `get_document` 94 MiB、一次检索署名 8 份文档 423 MiB。现在两格原件在 ORM 上设为 `deferred` + `raiseload`:读文档行不读它们,代码误碰直接报错;`has_pending` 在 SQL 里算(`pending_content IS NOT NULL`)。只有两处读原件:入库认领(只读要入库的那一格:有待入库的读它,否则读正在服务的)和 `get_document_content`。改后同样的 8 份:上面四项都在 0.3–0.6 MiB;认领一份重传 188 → 94 MiB(原来两格都读、只用一格);重传上传 188 → 94 MiB(剩下的是新文件本身写进库);重建索引列全库 423 → 0.4 MiB。接口响应不变:同一套「上传 → 失败的重传 → 重试 → 丢弃 → 重新摄取 → 好的重传 → 检索」流程,改前改后 18 个响应逐字节相同。「重新摄取」「补识别」点击前的预检原来为了判断原件在不在,把正在服务的原件整份读出来(47 MiB 一份 94 MiB);现在看文档对象上新加的 `has_content`(SQL 里算 `content IS NOT NULL`,不读原件),预检 94.2 → 0.3 MiB,随后入库的认领照常读一格(94 MiB)。`has_content` 只加在内部文档对象上,没有进接口响应。没有迁移。说明:平台没有「下载原件」接口,原件只给入库用。
 
 **怎么进**:测试环境控制台(system_admin,平台租户)建临时库;测试文档(零租户内容):`h.md`,正文「# 手册\n\n免赔额是每年 500 元。」;同名、内容只有几个空格的 `h.md`(解析为空 → 新版本入库失败)。
 
 - [ ] **49.1 列表照常显示待入库的重传**:上传 `h.md` 到 `ready`;再传只有空格的 `h.md`。判据:列表里这一行 `status: failed`、`has_pending: true`、`chunk_count ≥ 1`,页面提示上一版仍在服务、有「丢弃新版本」;点丢弃后 `status: ready`、`has_pending: false`,再丢弃回 409。**没修好时**:`has_pending` 恒为 false(没有丢弃按钮、丢弃回 409)或恒为 true。
 - [ ] **49.2 检索照常署名文件名**:检索测试搜「免赔额」;绑了临时库的智能体跑一轮 `knowledge_search`。判据:命中的 `filename` 与轨迹里的来源都是 `h.md`,没有 `(unknown)`。
-- [ ] **49.3 原件照常交给入库**:对 49.1 的文档点「重新摄取」→ 回到 `ready`、`chunk_count` 不变;再传一份改了一句的 `h.md` → `ready`、`size_bytes` 等于新文件大小,检索命中新句子。**没修好时**:文档 `failed` 且错误是原件缺失,或入库的还是旧版本。
-- [ ] **49.4 读文档行不再读原件(pod 内只读探针)**:挑测试环境里一份 2 MiB 以上的文档(只读 `SELECT tenant_id, id, size_bytes FROM knowledge_document WHERE size_bytes >= 2097152 ORDER BY size_bytes DESC LIMIT 5`;没有就传一份 2 MiB 以上、不含扫描页的零租户内容 PDF),执行下面的命令(只读,连接串从 pod 配置取、不打印)。判据:`get_document` / `get_documents` / `list page` 三行都 < 1 MiB(本机 8 份文档的一页是 0.4 MiB);`content` 一行约为 `size` 的 2 倍(证明探针量得到原件)。**没修好时**:前三行每行都约为 `size` 的 2 倍(有待入库的重传时约 4 倍)。
+- [ ] **49.3 原件照常交给入库**:对 49.1 的文档点「重新摄取」→ 回到 `ready`、`chunk_count` 不变;再传一份改了一句的 `h.md` → `ready`、`size_bytes` 等于新文件大小,检索命中新句子;对有扫描失败页的文档点「补识别」同样 202、入库后回到 `ready`。原件没留下的文档仍拒绝:只读找一份 `SELECT tenant_id, kb_id, id FROM knowledge_document WHERE content IS NULL AND pending_content IS NULL LIMIT 1`,点「重新摄取」回 409「original file not retained」(没有这样的文档就标「不适用」,由单测覆盖)。**没修好时**:文档 `failed` 且错误是原件缺失,或入库的还是旧版本;或有原件的文档也回 409。
+- [ ] **49.4 读文档行不再读原件(pod 内只读探针)**:挑测试环境里一份 2 MiB 以上的文档(只读 `SELECT tenant_id, id, size_bytes FROM knowledge_document WHERE size_bytes >= 2097152 ORDER BY size_bytes DESC LIMIT 5`;没有就传一份 2 MiB 以上、不含扫描页的零租户内容 PDF),执行下面的命令(只读,连接串从 pod 配置取、不打印)。判据:`get_document` / `get_documents` / `list page` / `precheck`(「重新摄取」「补识别」点击前的检查)四行都 < 1 MiB(本机 8 份文档的一页是 0.4 MiB),`has_content` 为 True;`content` 一行约为 `size` 的 2 倍(证明探针量得到原件)。**没修好时**:前四行每行都约为 `size` 的 2 倍(有待入库的重传时列表类约 4 倍)。
 
 ```bash
 kubectl exec deploy/control-plane -- python -c '
@@ -950,6 +950,7 @@ from uuid import UUID
 from control_plane.settings import Settings
 from expert_work.persistence import DatabaseConfig, SqlKnowledgeStore, create_async_engine_from_config, create_async_session_factory
 from expert_work.persistence.rls import build_rls_sessionmaker, current_tenant_id_var
+from control_plane.api.knowledge import _require_redrivable
 T, D = UUID(sys.argv[1]), UUID(sys.argv[2])
 async def peak(op):
     gc.collect(); tracemalloc.start(); s, _ = tracemalloc.get_traced_memory(); await op(); _, p = tracemalloc.get_traced_memory(); tracemalloc.stop()
@@ -960,10 +961,12 @@ async def main():
     engine = create_async_engine_from_config(DatabaseConfig(dsn=s.db_dsn, pgbouncer_mode=s.db_pgbouncer_mode))
     store = SqlKnowledgeStore(build_rls_sessionmaker(create_async_session_factory(engine)))
     doc = await store.get_document(tenant_id=T, document_id=D)
-    print("size", round(doc.size_bytes / 2**20, 2), "has_pending", doc.has_pending)
+    print("size", round(doc.size_bytes / 2**20, 2), "has_pending", doc.has_pending, "has_content", doc.has_content)
+    base = next(b for b in await store.list_bases(tenant_id=T) if b.id == doc.kb_id)
     print("get_document", await peak(lambda: store.get_document(tenant_id=T, document_id=D)))
     print("get_documents", await peak(lambda: store.get_documents(tenant_id=T, document_ids=[D])))
     print("list page", await peak(lambda: store.list_documents_page(tenant_id=T, kb_id=doc.kb_id, limit=50, offset=0)))
+    print("precheck", await peak(lambda: _require_redrivable(store, object(), T, base, D)))
     print("content", await peak(lambda: store.get_document_content(tenant_id=T, document_id=D)))
     await engine.dispose()
 asyncio.run(main())

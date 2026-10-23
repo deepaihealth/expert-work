@@ -418,6 +418,10 @@ class KnowledgeDocument(BaseModel):
     #: ingest failed). ``status == failed`` with ``chunk_count > 0`` and
     #: ``has_pending`` means: the previous version is still serving.
     has_pending: bool = Field(default=False, description="a newer upload is pending / failed")
+    #: The serving version's original file is kept (``False`` for a document
+    #: whose bytes were never retained) — what re-ingest re-parses. Read from
+    #: the store without loading the file.
+    has_content: bool = Field(default=False, description="the serving version's file is kept")
     #: Tenant-wide monotonic number (short id ``D{doc_seq}``); kept across
     #: re-uploads, never reused. ``None`` only for rows from before it existed.
     doc_seq: int | None = Field(default=None, ge=1, description="tenant-wide document number")
