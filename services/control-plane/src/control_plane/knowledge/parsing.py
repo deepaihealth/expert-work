@@ -16,6 +16,7 @@ from __future__ import annotations
 import bisect
 import io
 import re
+import zipfile
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -297,9 +298,16 @@ def office_markdown(raw: bytes, ext: str, *, docx_pictures: ConvertImage | None 
     (:func:`find_data_uri_pictures` — the caller bounds them first).
 
     :raises DocumentParseError: MarkItDown cannot read the file."""
-    if ext == ".docx" and docx_pictures is not None:
+    if ext == ".docx" and docx_pictures is not None and _is_zip(raw):
         return _parse_docx(raw, docx_pictures)
     return _parse_with_markitdown(raw, ext, keep_data_uris=True)
+
+
+def _is_zip(raw: bytes) -> bool:
+    """Whether ``raw`` is a zip archive (what zipfile — and so the Word
+    converter — opens, a zip behind a prefix included). A file merely named
+    ``.docx`` (HTML, plain text) is left to MarkItDown's own guessing."""
+    return zipfile.is_zipfile(io.BytesIO(raw))
 
 
 def _parse_docx(raw: bytes, convert_image: ConvertImage | None = None) -> str:
@@ -311,7 +319,7 @@ def _parse_docx(raw: bytes, convert_image: ConvertImage | None = None) -> str:
 
 
 def _parse_with_markitdown(raw: bytes, ext: str, *, keep_data_uris: bool = False) -> str:
-    if ext == ".docx":  # pictures never read (no figure step here): office_docx
+    if ext == ".docx" and _is_zip(raw):  # pictures never read (no figure step): office_docx
         return _parse_docx(raw)
     # The bytes stay as they are; ``utf-8-sig`` also drops a leading BOM.
     utf8 = ext in _UTF8_HINTED_EXTENSIONS and _decode_utf8(raw) is not None

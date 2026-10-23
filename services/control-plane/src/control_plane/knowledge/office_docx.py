@@ -69,6 +69,9 @@ class _TokenDocxConverter(DocxConverter):  # type: ignore[misc]
             _pre_processed(file_stream),
             style_map=kwargs.get("style_map"),
             convert_image=mammoth.images.img_element(self._convert_image),
+            # Linked pictures (``TargetMode="External"``, ``file://…``) are never
+            # opened — mammoth's default today, pinned here.
+            external_file_access=False,
         ).value
         return self._html_converter.convert_string(html, **kwargs)
 

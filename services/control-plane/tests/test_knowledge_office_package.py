@@ -5,10 +5,12 @@ and both are checked for entry count, total size and XML part size first."""
 
 from __future__ import annotations
 
+import base64
 import io
 import random
 import re
 import tracemalloc
+import warnings
 import zipfile
 from collections.abc import Callable
 from typing import Any
@@ -27,6 +29,7 @@ from control_plane.knowledge.recognition.office_package import (
     STAND_IN,
     DocxPictureReader,
     bound_office_package,
+    declared_directory,
     declared_entry_count,
 )
 from tests.figure_test_images import noise_png
@@ -448,14 +451,6 @@ def test_a_failing_word_conversion_never_falls_back_to_reading_pictures(
         office_docx.docx_markdown(picture_docx(_BIG, before="Intro"))
 
 
-def test_an_unreadable_slide_counts_every_relationship_of_it(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setattr(office_package, "MAX_IMAGE_BYTES", len(_BIG) - 1)
-    raw = _rebuilt(picture_pptx(_BIG), rewrite={"ppt/slides/slide1.xml": lambda x: x[:-40]})
-    assert bound_office_package(raw, ".pptx")[1] >= 1
-
-
 def test_pre_processing_never_holds_a_picture_twice() -> None:
     # MarkItDown's own pre-processing read every part whole and wrote each out
     # again uncompressed: a picture's bytes held twice before any cap applies.
@@ -487,3 +482,195 @@ def test_word_math_is_still_turned_into_latex() -> None:
         },
     )
     assert "$x=1$" in docx_markdown(raw)
+
+
+# ---------------------------------------------------------------------------
+# Review round 6: the reviewer's probes (pptx_refs, pptx_types, eocd) and N6/N7
+# ---------------------------------------------------------------------------
+
+
+def _repeated_picture_deck(references: int, *, dtd: bool = False) -> bytes:
+    """The slide's picture shown ``references`` times, optionally behind a DTD
+    (which python-pptx reads past)."""
+
+    def slide(text: str) -> str:
+        picture = re.search(r"<p:pic>.*?</p:pic>", text, re.S)
+        assert picture is not None
+        text = text.replace(picture.group(0), picture.group(0) * references)
+        if dtd:
+            text = re.sub(r"^(<\?xml[^>]*\?>)", r'\1<!DOCTYPE p:sld [<!ENTITY x "y">]>', text)
+        return text
+
+    return _rebuilt(picture_pptx(_BIG), rewrite={"ppt/slides/slide1.xml": slide})
+
+
+@pytest.mark.parametrize("dtd", [False, True])
+def test_references_are_counted_past_a_dtd(monkeypatch: pytest.MonkeyPatch, dtd: bool) -> None:
+    # N1: defusedxml refused the DTD, the 50 references counted once, and 50
+    # inline copies of the picture got through.
+    monkeypatch.setattr(office_package, "MAX_OFFICE_MEDIA_BYTES", len(_BIG) * 10)
+    bounded, replaced = bound_office_package(_repeated_picture_deck(50, dtd=dtd), ".pptx")
+    assert replaced == 1
+    pictures = find_data_uri_pictures(office_markdown(bounded, ".pptx"))
+    assert len(pictures) == 50
+    assert all(base64.b64decode(picture.data) == STAND_IN for picture in pictures)
+
+
+def test_a_slide_python_pptx_cannot_read_fails_the_document() -> None:
+    raw = _rebuilt(picture_pptx(_BIG), rewrite={"ppt/slides/slide1.xml": lambda x: x[:-40]})
+    with pytest.raises(DocumentParseError, match="unreadable part"):
+        bound_office_package(raw, ".pptx")
+
+
+def _added(raw: bytes, parts: dict[str, str]) -> bytes:
+    out = io.BytesIO()
+    with zipfile.ZipFile(io.BytesIO(raw)) as source, zipfile.ZipFile(out, "w") as package:
+        for item in source.infolist():
+            package.writestr(item, source.read(item))
+        for name, text in parts.items():
+            package.writestr(name, text)
+    return out.getvalue()
+
+
+def test_an_unreadable_part_python_pptx_never_parses_counts_once(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A legacy VML drawing (often not well-formed XML) is not parsed by
+    # python-pptx, so nothing in it is shown: it must not fail the deck, and
+    # each of its relationships still counts once.
+    raw, _ = _deck()
+    with zipfile.ZipFile(io.BytesIO(raw)) as package:
+        (picture,) = [n for n in package.namelist() if n.startswith("ppt/media/")]
+    rels = (
+        '<?xml version="1.0"?><Relationships xmlns="'
+        'http://schemas.openxmlformats.org/package/2006/relationships">'
+        f'<Relationship Id="rId1" Type="{_R}/image" Target="../media/{picture.rsplit("/", 1)[1]}"/>'
+        "</Relationships>"
+    )
+    extended = _added(
+        raw,
+        {
+            "ppt/drawings/vmlDrawing1.vml": "<xml><v:shape><br></xml>",
+            "ppt/drawings/_rels/vmlDrawing1.vml.rels": rels,
+        },
+    )
+    assert bound_office_package(extended, ".pptx") == (extended, 0)
+    # Slide + drawing: two references; a budget for one and a half.
+    monkeypatch.setattr(office_package, "MAX_OFFICE_MEDIA_BYTES", len(_BIG) * 3 // 2)
+    assert bound_office_package(extended, ".pptx")[1] == 1
+
+
+def _decoy_types(raw: bytes) -> tuple[str, str]:
+    """The deck's picture and its content types with that picture typed XML."""
+    with zipfile.ZipFile(io.BytesIO(raw)) as package:
+        (picture,) = [n for n in package.namelist() if n.startswith("ppt/media/")]
+        types = package.read("[Content_Types].xml").decode()
+    override = f'<Override PartName="/{picture}" ContentType="application/xml"/></Types>'
+    return picture, types.replace("</Types>", override)
+
+
+@pytest.mark.parametrize("decoy", ["[CONTENT_TYPES].XML", "[Content_Types].xml"])
+def test_a_second_part_of_the_same_name_fails_the_document(decoy: str) -> None:
+    # N2 (probe pptx_types): the check read the first of two content types
+    # parts, python-pptx the last — typed XML there, the picture went uncapped.
+    raw, _ = _deck()
+    _, decoyed = _decoy_types(raw)
+    out = io.BytesIO()
+    with warnings.catch_warnings():  # zipfile warns about the duplicate name
+        warnings.simplefilter("ignore")
+        with zipfile.ZipFile(io.BytesIO(raw)) as source, zipfile.ZipFile(out, "w") as package:
+            package.writestr(decoy, decoyed)
+            for item in source.infolist():
+                package.writestr(item, source.read(item))
+    with pytest.raises(DocumentParseError, match="same name"):
+        bound_office_package(out.getvalue(), ".pptx")
+
+
+def test_content_types_are_read_by_their_exact_name(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Under another case python-pptx does not read it, so neither does the check.
+    monkeypatch.setattr(office_package, "MAX_IMAGE_BYTES", len(_BIG) - 1)
+    raw, _ = _deck()
+    _, decoyed = _decoy_types(raw)
+    renamed = _rebuilt(
+        raw,
+        renames={"[Content_Types].xml": "[CONTENT_TYPES].XML"},
+        rewrite={"[Content_Types].xml": lambda _: decoyed},
+    )
+    assert bound_office_package(renamed, ".pptx")[1] == 1
+
+
+def test_a_directory_larger_than_its_entries_need_is_refused_before_listing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # N5 (probe eocd): the end record's count said 1; zipfile lists whatever
+    # the declared directory size covers.
+    monkeypatch.setattr(office_package, "MAX_PACKAGE_ENTRIES", 100)
+    out = io.BytesIO()
+    with zipfile.ZipFile(out, "w") as package:
+        for number in range(2_000):
+            package.writestr(f"{number:x}", b"")
+    spoofed = bytearray(out.getvalue())
+    at = spoofed.rfind(b"PK\x05\x06")
+    spoofed[at + 8 : at + 12] = (1).to_bytes(2, "little") * 2
+    raw = bytes(spoofed)
+    assert declared_entry_count(raw) == 1
+
+    def no_listing(*args: object, **kwargs: object) -> object:
+        raise AssertionError("the entry list was built")
+
+    monkeypatch.setattr(office_package.zipfile, "ZipFile", no_listing)
+    with pytest.raises(DocumentParseError, match="parts"):
+        bound_office_package(raw, ".docx")
+
+
+def test_real_packages_stay_well_inside_the_directory_budget() -> None:
+    for raw in (picture_pptx(_BIG, title="Deck"), picture_docx(_BIG, before="Intro")):
+        declared = declared_directory(raw)
+        assert declared is not None
+        entries, size = declared
+        assert size / entries < office_package.DIRECTORY_BYTES_PER_ENTRY / 2
+
+
+@pytest.mark.parametrize(
+    ("raw", "words"),
+    [
+        (b"<html><body><h1>Title</h1><p>Hello HTML words</p></body></html>", "Hello HTML words"),
+        (b"Just plain words in a file named like Word.", "Just plain words"),
+    ],
+)
+def test_a_file_merely_named_docx_is_parsed_as_before(raw: bytes, words: str) -> None:
+    # N6: only a zip goes to the Word converter, the rest to MarkItDown.
+    assert words in parse_document("a.docx", raw)
+    assert words in parse_office_figures(raw, ".docx").markdown
+
+
+def test_a_zip_behind_a_prefix_still_goes_to_the_capped_converter() -> None:
+    # zipfile (and so any Word converter) opens it all the same.
+    raw = b"prefix " + picture_docx(_BIG, before="Intro")
+    assert find_data_uri_pictures(office_markdown(raw, ".docx")) == []
+    assert len(parse_office_figures(raw, ".docx").figures.candidates) == 1
+
+
+def test_a_linked_picture_is_never_opened(tmp_path: Any) -> None:
+    # N7: mammoth's external_file_access is pinned off.
+    linked = tmp_path / "linked.png"
+    linked.write_bytes(_BIG)
+    raw = _rebuilt(
+        _word(
+            "word/media/image1.png",
+            f'Id="rId2" Type="{_R}/image" Target="{linked.as_uri()}" TargetMode="External"',
+        ),
+        rewrite={"word/document.xml": lambda x: x.replace('r:embed="rId2"', 'r:link="rId2"')},
+    )
+    parsed = parse_office_figures(raw, ".docx")
+    assert (parsed.figures.candidates, parsed.figures.unsupported) == ((), 1)
+
+
+def test_the_markitdown_internals_reused_are_still_there() -> None:
+    # N7: office_docx reuses MarkItDown's private math pre-processing (its
+    # import fails at module load) and the Word converter's HTML converter.
+    from markitdown.converter_utils.docx import pre_process
+    from markitdown.converters import DocxConverter
+
+    assert callable(pre_process._pre_process_math)
+    assert callable(DocxConverter()._html_converter.convert_string)

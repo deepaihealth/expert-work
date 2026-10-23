@@ -13,19 +13,22 @@ and ConfigMap are checked together, container env overriding the ConfigMap.
 Constants and where they come from (control-plane image f4a075a54,
 ``MALLOC_ARENA_MAX=2`` and the thread pins of the Deployment, linux/amd64,
 one CPU; sampled every 5 ms with VmSize and VmRSS read from the same
-``/proc/<pid>/status`` read — review round 5):
+``/proc/<pid>/status`` read — review rounds 5 and 6):
 
 * :data:`MAIN_PROCESS_MIB` — the server process: 614 MiB RSS idle on the live
   test pod, plus the 531 MiB it grew by running two ingests of an 11 MB-text
   Word file at once through the real pipeline (uploads held in memory; two
   48 MP Word files: +12 MiB). Not covered: a document whose text alone is
   huge — two ingests of a 110 MB-text Word file (60,000 chunks) took the
-  server to 5.5 GB, which no worker ceiling can bound (that needs a cap on a
-  document's parsed size).
+  server to 5.5 GB, which no worker ceiling can bound. That is the review
+  round 6 follow-up N3 (a cap on a document's parsed size and on concurrent
+  ingests, on its own branch); this constant does not cover it.
 * :data:`PARSE_WORKER_NEVER_RESIDENT_MIB` — the part of a parse worker's
   address space that is not resident when its RSS peaks: the smallest
-  same-instant gap at the peak (two 48 MP Word parses at once: 699 and 705
-  MiB). A worker held to ``cap`` MiB peaks at most ``cap - gap`` resident.
+  same-instant gap at the peak over the workloads measured — a 30-page text
+  PDF (650 MiB), the 110 MB-text Word file parsed without figures (734 MiB),
+  two 48 MP Word parses at once (699 and 705 MiB). A worker held to ``cap``
+  MiB peaks at most ``cap - gap`` resident.
 * :data:`FIGURE_WORKER_NEVER_RESIDENT_MIB` — the same for the figure worker
   (654 MiB; 59 MP JPEG / flate images on a text page and a 59 MP scanned
   page). The figure worker is counted at its own ceiling, not at a measured
@@ -34,6 +37,7 @@ one CPU; sampled every 5 ms with VmSize and VmRSS read from the same
 
 from __future__ import annotations
 
+import os
 import shutil
 import subprocess
 from pathlib import Path
@@ -49,7 +53,7 @@ _K8S = _REPO_ROOT / "infra" / "k8s"
 _CONTAINER = "control-plane"
 
 MAIN_PROCESS_MIB = 1150
-PARSE_WORKER_NEVER_RESIDENT_MIB = 699
+PARSE_WORKER_NEVER_RESIDENT_MIB = 650
 FIGURE_WORKER_NEVER_RESIDENT_MIB = 654
 
 _WORKERS = "EXPERT_WORK_KNOWLEDGE_PARSE_WORKERS"
@@ -81,7 +85,10 @@ def _renderer() -> list[str] | None:
 def _render(overlay: Path) -> list[dict[str, Any]]:
     command = _renderer()
     if command is None:
-        pytest.skip("neither kustomize nor kubectl is installed — overlays cannot be rendered")
+        reason = "neither kustomize nor kubectl is installed — overlays cannot be rendered"
+        if os.environ.get("CI") or os.environ.get("GITHUB_ACTIONS"):
+            pytest.fail(f"{reason}; CI must render them, a skip there is a silent pass")
+        pytest.skip(reason)
     rendered = subprocess.run(  # noqa: S603 — fixed argv list, no shell
         [*command, str(overlay)], capture_output=True, text=True, check=True, timeout=120
     ).stdout
@@ -225,9 +232,9 @@ def test_the_config_map_and_a_container_env_override_are_both_read(tmp_path: Pat
 @pytest.mark.parametrize(
     ("limit_mib", "workers", "cap_mib", "figure_cap_mib", "fits"),
     [
-        (4096, 2, 2400, 1536, False),  # two workers at 2400: 1338 MiB over
-        (4096, 2, 1731, 1536, True),  # the largest ceiling that fits 4Gi
-        (4096, 2, 1732, 1536, False),
+        (4096, 2, 2400, 1536, False),  # two workers at 2400: 1436 MiB over
+        (4096, 2, 1682, 1536, True),  # the largest ceiling two workers fit 4Gi at
+        (4096, 2, 1683, 1536, False),
         (4096, 1, 2400, 1536, True),  # shipped (2026-10-23): one parse worker
         (6144, 2, 2400, 1536, True),
         (2048, 2, 1800, 1536, False),
@@ -238,3 +245,24 @@ def test_the_budget_arithmetic(
 ) -> None:
     needed = worst_case_mib(workers=workers, cap_mib=cap_mib, figure_cap_mib=figure_cap_mib)
     assert (needed <= limit_mib) is fits
+
+
+def test_ci_fails_rather_than_skips_without_a_renderer(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Review round 6 (N4): a skipped budget check in CI would pass silently.
+    monkeypatch.setattr(shutil, "which", lambda _: None)
+
+    def outcome() -> type[BaseException]:
+        # Caught here: an escaping skip would mark this very test skipped.
+        try:
+            _render(_OVERLAYS[0])
+        except (pytest.skip.Exception, pytest.fail.Exception) as exc:
+            return type(exc)
+        raise AssertionError("rendered without a renderer")
+
+    for name in ("CI", "GITHUB_ACTIONS"):
+        monkeypatch.delenv(name, raising=False)
+    assert outcome() is pytest.skip.Exception
+    for name in ("CI", "GITHUB_ACTIONS"):
+        monkeypatch.setenv(name, "true")
+        assert outcome() is pytest.fail.Exception
+        monkeypatch.delenv(name)

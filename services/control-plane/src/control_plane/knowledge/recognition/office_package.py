@@ -15,12 +15,15 @@ python-pptx 会当 XML 解析的部件(按 ``[Content_Types].xml`` 给它登记�
 解析:先按部件名的 Override、再按扩展名的 Default,都不分大小写 —— 幻灯片、版式、母版这些也是被
 ``r:id`` 引用的,它们按 XML 部件的上限算),都算图片,按「大小 x 引用次数」计:单个超过
 :data:`MAX_IMAGE_BYTES`、或合计超过 :data:`MAX_OFFICE_MEDIA_BYTES`(从最大的开始)的,换成一个
-1 像素的替身。
+1 像素的替身。引用次数按 python-pptx 的解析方式数(lxml,不展开实体、不联网、不加载 DTD);
+python-pptx 要解析的部件读不出来,这份文档直接解析失败。
 
-**两种都查**(读之前):中央目录尾记录里声明的条目数超过 :data:`MAX_PACKAGE_ENTRIES`(在
-``zipfile`` 建条目列表之前)、解压后合计超过 :data:`MAX_OFFICE_PACKAGE_BYTES`、按名字或登记类型是
-XML 的单个部件超过 :data:`MAX_XML_PART_BYTES` —— 这份文档直接解析失败。压缩包条目声明的大小就是
-读出来的上限(``zipfile`` 读到声明的长度为止并校验)。
+**两种都查**(读之前):中央目录尾记录里声明的条目数超过 :data:`MAX_PACKAGE_ENTRIES`、或声明的
+中央目录大小超过 :data:`MAX_PACKAGE_ENTRIES` x :data:`DIRECTORY_BYTES_PER_ENTRY`(都在 ``zipfile``
+建条目列表之前,按 ``zipfile`` 自己的读法)、两个条目同名(不分大小写)、解压后合计超过
+:data:`MAX_OFFICE_PACKAGE_BYTES`、按名字或登记类型是 XML 的单个部件超过 :data:`MAX_XML_PART_BYTES`
+—— 这份文档直接解析失败。压缩包条目声明的大小就是读出来的上限(``zipfile`` 读到声明的长度为止
+并校验)。
 """
 
 from __future__ import annotations
@@ -36,6 +39,7 @@ from typing import Any
 from urllib.parse import unquote
 
 import defusedxml.ElementTree as SafeElementTree  # type: ignore[import-untyped]
+from lxml import etree  # type: ignore[import-untyped]  # python-pptx's parser
 from PIL import Image
 
 from control_plane.knowledge.office_docx import FIGURE_TOKEN
@@ -56,14 +60,28 @@ MAX_XML_PART_BYTES = 64 * 1024 * 1024
 #: Entries one package may hold (a 1,000-slide deck has a few thousand).
 MAX_PACKAGE_ENTRIES = 20_000
 
-_CONTENT_TYPES = "[content_types].xml"
+#: Central-directory bytes one entry may take on average. A record is 46 bytes
+#: plus the part name, extra fields and comment; Office names its parts in
+#: under 100 bytes, writes under 40 bytes of extras and no comments — so a real
+#: package stays under ~190 bytes an entry, and 256 leaves headroom. zipfile
+#: lists one entry per 46+ bytes of the directory size the end record declares
+#: (the declared entry count is never used to stop it), so this — not the
+#: count — bounds the list it builds: at most 20,000 x 256 / 46 ≈ 111,000 entries.
+DIRECTORY_BYTES_PER_ENTRY = 256
+
+#: Read by its exact name, as python-pptx does.
+_CONTENT_TYPES = "[Content_Types].xml"
 _RELATIONSHIPS = "{http://schemas.openxmlformats.org/officeDocument/2006/relationships}"
 _REFERENCES = tuple(f"{_RELATIONSHIPS}{name}" for name in ("embed", "link", "id"))
 #: Bytes per read while copying a package part.
 _COPY_CHUNK = 1024 * 1024
-#: The end-of-central-directory record: signature, and how far back it may sit.
-_EOCD = b"PK\x05\x06"
-_EOCD_SEARCH = 22 + 0xFFFF
+#: zipfile's own reading of the end record (ZIP64 included), so the check sees
+#: what zipfile will; private — a Python without it fails here, at import.
+_END_RECORD = zipfile._EndRecData  # type: ignore[attr-defined]
+_END_ENTRIES = zipfile._ECD_ENTRIES_TOTAL  # type: ignore[attr-defined]
+_END_DIRECTORY_SIZE = zipfile._ECD_SIZE  # type: ignore[attr-defined]
+#: How python-pptx parses a part (no entities, no network, no DTD).
+_PPTX_PARSER = {"resolve_entities": False, "no_network": True, "load_dtd": False}
 
 
 def _stand_in() -> bytes:
@@ -76,25 +94,24 @@ def _stand_in() -> bytes:
 STAND_IN = _stand_in()
 
 
+def declared_directory(raw: bytes) -> tuple[int, int] | None:
+    """The entry count and central-directory size (bytes) the end record
+    declares, read as ``zipfile`` reads them (the ZIP64 record when there is
+    one); ``None`` when there is no readable record (``zipfile`` reports that
+    file)."""
+    try:
+        record = _END_RECORD(io.BytesIO(raw))
+    except (zipfile.BadZipFile, OSError, ValueError):
+        return None
+    if record is None:
+        return None
+    return int(record[_END_ENTRIES]), int(record[_END_DIRECTORY_SIZE])
+
+
 def declared_entry_count(raw: bytes) -> int | None:
-    """The entry count the end-of-central-directory record declares (the
-    ZIP64 record when the classic one says 0xFFFF); ``None`` when there is
-    no readable record (``zipfile`` reports that file)."""
-    tail = raw[-_EOCD_SEARCH:]
-    at = tail.rfind(_EOCD)
-    if at < 0 or len(tail) - at < 22:
-        return None
-    count = int.from_bytes(tail[at + 10 : at + 12], "little")
-    if count != 0xFFFF:
-        return count
-    locator = tail.rfind(b"PK\x06\x07", 0, at)
-    if locator < 0 or at - locator < 20:
-        return None
-    offset = int.from_bytes(tail[locator + 8 : locator + 16], "little")
-    record = raw[offset : offset + 56]
-    if len(record) < 56 or record[:4] != b"PK\x06\x06":
-        return None
-    return int.from_bytes(record[32:40], "little")
+    """The entry count the end record declares (see :func:`declared_directory`)."""
+    declared = declared_directory(raw)
+    return declared[0] if declared is not None else None
 
 
 def bound_office_package(raw: bytes, ext: str) -> tuple[bytes, int]:
@@ -106,8 +123,11 @@ def bound_office_package(raw: bytes, ext: str) -> tuple[bytes, int]:
     :raises DocumentParseError: too many entries, the package unpacks past
         :data:`MAX_OFFICE_PACKAGE_BYTES`, or an XML part past
         :data:`MAX_XML_PART_BYTES`."""
-    declared = declared_entry_count(raw)
-    if declared is not None and declared > MAX_PACKAGE_ENTRIES:
+    declared = declared_directory(raw)
+    if declared is not None and (
+        declared[0] > MAX_PACKAGE_ENTRIES
+        or declared[1] > MAX_PACKAGE_ENTRIES * DIRECTORY_BYTES_PER_ENTRY
+    ):
         msg = f"the file holds more than {MAX_PACKAGE_ENTRIES} parts"
         raise DocumentParseError(msg)
     try:
@@ -118,6 +138,11 @@ def bound_office_package(raw: bytes, ext: str) -> tuple[bytes, int]:
     if len(entries) > MAX_PACKAGE_ENTRIES:
         msg = f"the file holds more than {MAX_PACKAGE_ENTRIES} parts"
         raise DocumentParseError(msg)
+    if len({entry.filename.lower() for entry in entries}) != len(entries):
+        # Part names are case-insensitive; two of one name would let this
+        # check read a different part than the converter does.
+        msg = "the file holds two parts of the same name"
+        raise DocumentParseError(msg)
     if sum(entry.file_size for entry in entries) > MAX_OFFICE_PACKAGE_BYTES:
         msg = "the file unpacks to more than a document may (a zip bomb?)"
         raise DocumentParseError(msg)
@@ -125,7 +150,9 @@ def bound_office_package(raw: bytes, ext: str) -> tuple[bytes, int]:
     pictures = Counter(
         {
             name: count
-            for name, count in (_references(package, entries) if ext == ".pptx" else {}).items()
+            for name, count in (
+                _references(package, entries, xml) if ext == ".pptx" else {}
+            ).items()
             if name not in xml
         }
     )
@@ -160,7 +187,7 @@ def _parsed_as_xml(package: zipfile.ZipFile, entries: Sequence[zipfile.ZipInfo])
     """The parts whose registered content type is XML (not ``image/…``),
     resolved as python-pptx does: the part's Override, else its extension's
     Default, both case-insensitive."""
-    found = [entry for entry in entries if entry.filename.lower() == _CONTENT_TYPES]
+    found = [entry for entry in entries if entry.filename == _CONTENT_TYPES]
     if not found:
         return set()
     if found[0].file_size > MAX_XML_PART_BYTES:
@@ -203,10 +230,14 @@ def _over_the_caps(entries: Sequence[zipfile.ZipInfo], references: Counter[str])
     return over
 
 
-def _references(package: zipfile.ZipFile, entries: Sequence[zipfile.ZipInfo]) -> Counter[str]:
+def _references(
+    package: zipfile.ZipFile, entries: Sequence[zipfile.ZipInfo], xml: set[str]
+) -> Counter[str]:
     """How often each part is referenced by ``r:embed`` / ``r:link`` / ``r:id``
-    from the part its ``.rels`` describes (real XML parsing throughout; an
-    unreadable source part counts every relationship of it once)."""
+    from the part its ``.rels`` describes, that part parsed as python-pptx
+    parses it. One python-pptx parses (``xml``) that cannot be read fails the
+    document; any other unreadable one (python-pptx never parses it, so
+    nothing in it is shown) counts each of its relationships once."""
     by_lower = {entry.filename.lower(): entry for entry in entries}
     counted: Counter[str] = Counter()
     for entry in entries:
@@ -219,6 +250,9 @@ def _references(package: zipfile.ZipFile, entries: Sequence[zipfile.ZipInfo]) ->
             posixpath.join(folder, posixpath.basename(entry.filename)[:-5]).lower()
         )
         ids = _referenced_ids(package, source) if source is not None else None
+        if ids is None and source is not None and source.filename in xml:
+            msg = f"unreadable part {source.filename!r}"
+            raise DocumentParseError(msg)
         for relationship_id, target in targets.items():
             if ids is None:
                 counted[target] += 1
@@ -255,14 +289,15 @@ def _relationship_targets(
 
 
 def _referenced_ids(package: zipfile.ZipFile, source: zipfile.ZipInfo) -> Counter[str] | None:
-    """How often each relationship id is referenced from ``source``; ``None``
-    when the part cannot be parsed (the caller then counts every one)."""
+    """How often each relationship id is referenced from ``source`` (parsed
+    with lxml as python-pptx does: a DTD is no reason to give up — python-pptx
+    reads the part all the same); ``None`` when it cannot be parsed."""
     if source.file_size > MAX_XML_PART_BYTES:
         return None
     counted: Counter[str] = Counter()
     try:
         with package.open(source) as stream:
-            for _, element in SafeElementTree.iterparse(stream, events=("start",)):
+            for _, element in etree.iterparse(stream, events=("start",), **_PPTX_PARSER):
                 for attribute in _REFERENCES:
                     value = element.get(attribute)
                     if value:
