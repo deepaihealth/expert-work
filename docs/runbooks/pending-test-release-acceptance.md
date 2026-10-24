@@ -1097,3 +1097,12 @@ PY
 **怎么进**:同 §51(system_admin,平台租户,临时知识库,端口转发到一个 pod 直传);测试文件用 §51 的 `kb48-near-a.docx`。
 
 - [ ] **52.1 重新摄取的内存跟首次入库一个量级**(嵌入约 ¥2,只有首次入库那一次花钱):上传 `kb48-near-a.docx`,ready 后记该 pod 主进程 VmRSS,点「重新摄取」。判据:回到 ready、9,917 段;日志 `knowledge.ingest_vectors … reused=9917 embedded=0`;没有新的 `knowledge_ingest` 用量;重新摄取期间主进程峰值比点击前高不超过约 200 MiB(改前 +597 MiB)。**没修好时**:峰值 +600 MiB 左右,在日志打出 `reused=9917` 的那一刻。测完删临时库。
+
+## §53 沙箱 pip 下载走快的备源(B-212)
+
+**背景**:10-24 在测试沙箱里量出,pip 遇到同一个文件两个源都有时,下载用的是 **extra-index(备源)** 那份(pip 25 解析器按逆序取候选)。原配置的备源是阿里云公网镜像(沙箱里 382 KiB/s),于是沙箱里每次 pip 下载都走它:`pip download scikit-learn` 21.5s,只配内网 1.8s。改法:备源换成腾讯云公网镜像(沙箱直连 22.8 MB/s、经出网代理 75 MB/s),`PIP_TRUSTED_HOST` 只留内网主机。主源仍是阿里云内网。
+
+**怎么进**:调试台,选一个带沙箱(能调 exec_python)的智能体;两种各一个:出网关(53.1)、出网开且白名单为空(53.2)。让它原样执行 `python -m pip download --no-deps --no-cache-dir -v -d /tmp/b212 scikit-learn`,把含 `Downloading` 的那行和总耗时贴回来,再 `rm -rf /tmp/b212`。
+
+- [ ] **53.1 出网关的智能体**:判据:`Downloading https://mirrors.cloud.tencent.com/pypi/packages/…scikit_learn-…whl`,整条命令 10 秒内结束。**没修好时**:`Downloading https://mirrors.aliyun.com/…`,20 秒以上。
+- [ ] **53.2 出网开的智能体**(pip 经凭据代理出去):判据同 53.1;另查 `sandbox_egress_audit` 里这次运行有 `mirrors.cloud.tencent.com` 的放行记录(和 `mirrors.cloud.aliyuncs.com` 查目录的记录)。**没修好时**:同 53.1;若是 403 / 407,是代理那边的问题,不是源的问题。
