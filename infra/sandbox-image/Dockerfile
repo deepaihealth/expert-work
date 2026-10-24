@@ -175,6 +175,14 @@ RUN test -x /bin/bash \
 # batches: mainland Debian mirrors serve this at a usable rate. `Retries=5`
 # stays as cheap insurance on top.
 #
+# APT_MIRROR (B-211) swaps the host when mirrors.aliyun.com itself is slow —
+# on 2026-10-23 it ran at ~30 KB/s from the office network.
+# `make -C infra build-sandbox` picks it with tools/deploy/pick_mirror.py (the
+# default wins whenever it is fast enough). CI passes nothing: every workflow
+# that builds this image shares one layer cache and must build the same
+# image the push ships, and a per-job probe could pick a different host in
+# each.
+#
 # The sed handles both source formats: Debian 12+ base images ship deb822
 # (`/etc/apt/sources.list.d/debian.sources`), older ones a flat
 # `/etc/apt/sources.list`. Neither file existing would mean the base image
@@ -194,10 +202,11 @@ RUN test -x /bin/bash \
 # CVEs in base-shipped packages (perl-base, libglib2.0-0t64, libmbedcrypto16,
 # node-lodash), every one of them already patched in trixie-security, which
 # the sources rewrite above points at. Dropping this line re-opens that gap.
+ARG APT_MIRROR=mirrors.aliyun.com
 RUN if [ -f /etc/apt/sources.list.d/debian.sources ]; then \
-        sed -i 's|deb.debian.org|mirrors.aliyun.com|g' /etc/apt/sources.list.d/debian.sources; \
+        sed -i "s|deb.debian.org|${APT_MIRROR}|g" /etc/apt/sources.list.d/debian.sources; \
     elif [ -f /etc/apt/sources.list ]; then \
-        sed -i 's|deb.debian.org|mirrors.aliyun.com|g' /etc/apt/sources.list; \
+        sed -i "s|deb.debian.org|${APT_MIRROR}|g" /etc/apt/sources.list; \
     else \
         echo "no apt sources file found — base image layout changed" >&2; exit 1; \
     fi \

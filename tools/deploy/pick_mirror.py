@@ -15,8 +15,9 @@ link, and the fastest wins. A PyPI mirror must also already have the newest
 file in ``uv.lock``: a mirror that lags a fresh version bump would 404
 mid-build.
 
-Run inside the build's base image (build-push.sh does), so the probe takes the
-same network path and CA bundle as the build itself:
+Run inside the build's base image (build-push.sh does; so does
+``make -C infra build-sandbox`` for the sandbox image's apt layer), so the
+probe takes the same network path and CA bundle as the build itself:
 
     python3 pick_mirror.py apt                  # prints a Debian mirror host
     python3 pick_mirror.py pypi --lock uv.lock  # prints a PyPI prefix ("" = pypi.org)
