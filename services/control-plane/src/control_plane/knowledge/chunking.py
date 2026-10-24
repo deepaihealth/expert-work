@@ -32,8 +32,10 @@ from __future__ import annotations
 import hashlib
 import math
 import re
-from collections.abc import Mapping, Sequence
+import statistics
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
+from itertools import pairwise
 from typing import Literal
 from uuid import UUID
 
@@ -84,6 +86,42 @@ _SENTENCE_BOUNDARY = re.compile(r"(?<=[。！？])|(?<=[.!?\n])(?=\s)")  # noqa:
 #: window wins, so the carried context is clean *and* as long as possible.
 _OVERLAP_START = re.compile(r"\n\n|\n|(?<=[。！？.!?])")  # noqa: RUF001
 
+#: Lines that open a new part of a text (B-206 K-3): an oversized block is cut
+#: in front of them before anywhere else — a numbered line ("1." / "2.3" with
+#: a CJK enumeration comma / a CJK numeral with one / a parenthesised CJK
+#: numeral), a chapter or article line ("di san zhang", "di 2 tiao"), a rule
+#: line (``---``). A page break (form feed) is a cut point too. Only a block
+#: that has to be cut is: one within the cap keeps every character in place.
+#: Full-width marks are escapes: U+3001 enumeration comma, U+FF08 / U+FF09
+#: parentheses (a lint autofix folds the literal characters to ASCII).
+_CUT_LINE = re.compile(
+    r"^[ \t]*(?:"
+    r"\d+(?:\.\d+)*[.\u3001)\uff09](?!\d)"
+    r"|[\uff08(]?[一二三四五六七八九十百]+[\u3001.)\uff09]"
+    r"|第[ \t]*[0-9一二三四五六七八九十百千]+[ \t]*[章节条篇部卷]"
+    r"|(?:-{3,}|\*{3,}|_{3,}|={3,})[ \t]*$"
+    r")",
+    re.MULTILINE,
+)
+
+#: A speaker label opening a line ("Agent:", a name and a full-width colon
+#: U+FF1A). A block whose lines mostly open with one is a conversation, cut
+#: between lines (B-206 K-3).
+_SPEAKER = re.compile(r"^[ \t]*[^\s:\uff1a]{1,24}[:\uff1a]")
+
+#: A block of at least :data:`_LINE_BLOCK_MIN_LINES` lines whose median line is
+#: shorter than this is a list of lines (one utterance, item or entry each),
+#: cut between lines rather than at sentence marks inside them.
+_SHORT_LINE_CHARS = 40
+_LINE_BLOCK_MIN_LINES = 3
+
+#: One line with its line break (the breaks markdown-it counts, ``_LINE_BREAK``).
+_LINE_WITH_END = re.compile(r"[^\r\n]*(?:\r\n?|\n)|[^\r\n]+$")
+
+#: A Markdown table's header separator row (``| --- | :-: |``).
+_TABLE_SEPARATOR_ROW = re.compile(r"^[ \t]*\|?(?:[ \t]*:?-+:?[ \t]*\|)+[ \t]*(?::?-+:?[ \t]*)?$")
+_CELL_SPLIT = re.compile(r"(?<!\\)\|")
+
 #: Cosine distance above which two adjacent blocks in the same section
 #: are treated as a topic shift — a semantic chunk boundary. Conservative
 #: so coherent prose is not over-fragmented; only genuine shifts split.
@@ -96,6 +134,17 @@ _SEMANTIC_BREAK_THRESHOLD = 0.4
 #: chunks in a 42k-chunk real corpus were such fragments, and a chunk holding
 #: only a question outranks its answer on keyword match.
 MIN_SEMANTIC_CHUNK_TOKENS = 32
+
+#: A section whose only chunk holds fewer tokens than this — a heading with
+#: one line under it, a page number, a heading with nothing under it — joins
+#: a neighbouring chunk of its parent section instead of standing alone
+#: (B-206 K-3; Unstructured ``combine_text_under_n_chars``, Onyx
+#: ``CHUNK_MIN_CONTENT``).
+SHORT_SECTION_TOKENS = 100
+
+#: Joined short sections keep taking the next short one until they hold this
+#: many tokens, or half the cap if that is more (WeKnora ``coalesceTinyChunks``).
+_JOIN_TARGET_TOKENS = 200
 
 #: Blocks embedded per topic-detection window. Only adjacent blocks are
 #: compared, so each window's vectors are dropped once compared; only the
@@ -185,6 +234,26 @@ class TextChunk:
         """Breadcrumb + body — what is embedded and keyword-indexed
         (:func:`expert_work.protocol.chunk_retrieval_text`)."""
         return chunk_retrieval_text(self.heading_path, self.body)
+
+
+@dataclass
+class _Section:
+    """The chunks packed from one run of blocks under the same heading trail."""
+
+    trail: tuple[str, ...]
+    chunks: list[TextChunk] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
+class _Unit:
+    """A chunk on its way out of :func:`_join_short_sections`: the full
+    heading ``trail`` of its (first) section, whether it is that section's
+    ``whole`` text, and whether it already holds a ``joined`` short section."""
+
+    chunk: TextChunk
+    trail: tuple[str, ...]
+    whole: bool
+    joined: bool = False
 
 
 @dataclass
@@ -310,8 +379,13 @@ def _pack_blocks(
     """Pack blocks into chunks. Flush on a heading change, on a
     ``semantic_breaks`` index (a topic shift) once the chunk holds
     :data:`MIN_SEMANTIC_CHUNK_TOKENS`, and on the section's body budget
-    (the cap less the title and breadcrumb, see :func:`_section_budget`)."""
-    chunks: list[TextChunk] = []
+    (the cap less the title and breadcrumb, see :func:`_section_budget`).
+
+    A heading the breadcrumb has no room for opens the body of the first
+    chunk under it instead — the only place its text would otherwise have
+    been, so it was lost (B-200 regression). A section too short to stand on
+    its own then joins a neighbouring chunk (:func:`_join_short_sections`)."""
+    sections = [_Section(())]
     trail: tuple[str, ...] = ()
     shown, budget = _section_budget(trail, doc_title, max_tokens)
     # A piece cut from an oversized block leaves room for the overlap carried
@@ -319,26 +393,20 @@ def _pack_blocks(
     reserve = overlap_tokens + _JOIN_TOKENS if overlap_tokens > 0 else 0
     buffer: list[str] = []
     buffer_tokens = 0
+    written: set[tuple[str, ...]] = set()  # headings whose text went into a body
 
     def flush(*, carry_overlap: bool) -> None:
         nonlocal buffer, buffer_tokens
         if not buffer:
             return
         body = "\n\n".join(buffer)
-        chunks.append(TextChunk(body=body, heading_path=shown))
+        sections[-1].chunks.append(TextChunk(body=body, heading_path=shown))
         tail = _tail_text(body, overlap_tokens) if carry_overlap else ""
         buffer = [tail] if tail.strip() else []
         buffer_tokens = count_tokens(tail) if buffer else 0
 
-    for index, block in enumerate(blocks):
-        if block.heading_trail != trail:
-            flush(carry_overlap=False)
-            trail = block.heading_trail
-            shown, budget = _section_budget(trail, doc_title, max_tokens)
-        elif index in semantic_breaks and buffer_tokens >= MIN_SEMANTIC_CHUNK_TOKENS:
-            # Topic shift inside a section — a clean boundary, no overlap. A
-            # shorter fragment stays and opens the next chunk instead.
-            flush(carry_overlap=False)
+    def add(block: _Block) -> None:
+        nonlocal buffer, buffer_tokens
         for piece in _prepare_block(block, budget, reserve=reserve):
             piece_tokens = count_tokens(piece)
             if buffer and buffer_tokens + _JOIN_TOKENS + piece_tokens > budget:
@@ -349,8 +417,101 @@ def _pack_blocks(
                     buffer, buffer_tokens = [], 0
             buffer_tokens += piece_tokens + (_JOIN_TOKENS if buffer else 0)
             buffer.append(piece)
+
+    for index, block in enumerate(blocks):
+        if block.heading_trail != trail:
+            flush(carry_overlap=False)
+            trail = block.heading_trail
+            sections.append(_Section(trail))
+            shown, budget = _section_budget(trail, doc_title, max_tokens)
+            for depth in range(len(trail) - len(shown)):
+                if trail[: depth + 1] not in written:
+                    written.add(trail[: depth + 1])
+                    add(_Block("content", trail[depth], trail))
+        elif index in semantic_breaks and buffer_tokens >= MIN_SEMANTIC_CHUNK_TOKENS:
+            # Topic shift inside a section — a clean boundary, no overlap. A
+            # shorter fragment stays and opens the next chunk instead.
+            flush(carry_overlap=False)
+        add(block)
     flush(carry_overlap=False)
-    return chunks
+    return _join_short_sections(sections, max_tokens=max_tokens, doc_title=doc_title)
+
+
+def _join_short_sections(
+    sections: list[_Section], *, max_tokens: int, doc_title: str | None
+) -> list[TextChunk]:
+    """Chunks of every section in order, with each section shorter than
+    :data:`SHORT_SECTION_TOKENS` joined to a neighbour (B-206 K-3): to the
+    first chunk of the next section — taking further short sections until the
+    join holds :data:`_JOIN_TARGET_TOKENS` or half the cap — else to the chunk
+    before it. Only a sibling or a subsection joins (:func:`_may_join`), and a
+    join never passes the cap; otherwise the short section stays a chunk of
+    its own."""
+    target = max(_JOIN_TARGET_TOKENS, max_tokens // 2)
+
+    def fits(unit: _Unit) -> bool:
+        text = chunk_retrieval_text(unit.chunk.heading_path, unit.chunk.body, doc_title)
+        return count_tokens(text) <= max_tokens
+
+    def keep(short: _Unit) -> None:
+        if out and _may_join(out[-1].trail, short.trail):
+            joined = _join(out[-1], short)
+            if fits(joined):
+                out[-1] = joined
+                return
+        out.append(short)
+
+    out: list[_Unit] = []
+    pending: _Unit | None = None
+    for section in sections:
+        for chunk in section.chunks:
+            unit = _Unit(chunk, section.trail, whole=len(section.chunks) == 1)
+            if pending is not None:
+                joined = _join(pending, unit) if _may_join(pending.trail, unit.trail) else None
+                if joined is not None and fits(joined):
+                    unit = joined
+                else:
+                    keep(pending)
+                pending = None
+            size = count_tokens(unit.chunk.body)
+            if unit.whole and (size < SHORT_SECTION_TOKENS or (unit.joined and size < target)):
+                pending = unit
+            else:
+                out.append(unit)
+    if pending is not None:
+        keep(pending)
+    return [unit.chunk for unit in out]
+
+
+def _may_join(first: tuple[str, ...], second: tuple[str, ...]) -> bool:
+    """Whether the section at ``second`` may share a chunk under the
+    breadcrumb of the one at ``first`` before it: a sibling (same parent) or
+    a section inside it. Text after the preamble (no heading) always may."""
+    return second[:-1] == first[:-1] or second[: len(first)] == first
+
+
+def _join(first: _Unit, second: _Unit) -> _Unit:
+    """``second``'s body appended to ``first``'s chunk, under ``first``'s
+    breadcrumb (``second``'s when ``first`` has none). The headings of
+    ``second`` that breadcrumb does not carry open its part of the body, so
+    no heading's text is lost."""
+    if first.chunk.heading_path:
+        path, trail = first.chunk.heading_path, first.trail
+        shared = 0
+        while shared < min(len(first.trail), len(second.trail)) and (
+            first.trail[shared] == second.trail[shared]
+        ):
+            shared += 1
+        headings = second.trail[shared:]
+    else:
+        path, trail, headings = second.chunk.heading_path, second.trail, ()
+    body = "\n\n".join([first.chunk.body, *headings, second.chunk.body])
+    return _Unit(
+        TextChunk(body=body, heading_path=path),
+        trail,
+        whole=first.whole and second.whole,
+        joined=True,
+    )
 
 
 def _section_budget(
@@ -528,16 +689,110 @@ def _prepare_block(block: _Block, max_tokens: int, *, reserve: int = 0) -> list[
     size = max(max_tokens - reserve, max_tokens // 4)
     if block.kind == "table":
         return _split_table(block.text, size)
-    return _hard_split(block.text, size)
+    return _split_content(block.text, size)
+
+
+def _split_content(text: str, max_tokens: int) -> list[str]:
+    """Cut oversized prose where a cut does least harm (B-206 K-3): first in
+    front of a line that opens a new part and after a page break
+    (:data:`_CUT_LINE`), then — in a block of lines, a conversation or a list
+    of short lines — between lines, else on sentence boundaries."""
+    starts = {m.start() for m in _CUT_LINE.finditer(text)}
+    starts |= {m.end() for m in re.finditer("\f", text)}
+    bounds = [0, *sorted(starts - {0, len(text)}), len(text)]
+    parts: list[str] = []
+    for part in (text[a:b] for a, b in pairwise(bounds)):
+        if parts and _CUT_LINE.match(parts[-1]) and not _LINE_BREAK.search(parts[-1].rstrip()):
+            # A cut line alone (a chapter line over its first article) opens
+            # the part after it, not the end of the piece before.
+            parts[-1] += part
+        else:
+            parts.append(part)
+    return _pack_parts(parts, max_tokens, _split_part)
+
+
+def _split_part(text: str, max_tokens: int) -> list[str]:
+    """One oversized part with no cut line in it: between lines if it is a
+    block of lines (:func:`_is_line_block`), else on sentence boundaries."""
+    if _is_line_block(text):
+        return _pack_parts(_LINE_WITH_END.findall(text), max_tokens, _hard_split)
+    return _hard_split(text, max_tokens)
+
+
+def _is_line_block(text: str) -> bool:
+    """A conversation (most lines open with a speaker label) or a list of
+    short lines — one utterance or entry per line, not sentences of prose."""
+    lines = [line.strip() for line in _LINE_BREAK.split(text) if line.strip()]
+    if len(lines) < _LINE_BLOCK_MIN_LINES:
+        return False
+    if 2 * sum(bool(_SPEAKER.match(line)) for line in lines) > len(lines):
+        return True
+    return statistics.median(len(line) for line in lines) < _SHORT_LINE_CHARS
+
+
+def _pack_parts(
+    parts: list[str], max_tokens: int, cut: Callable[[str, int], list[str]]
+) -> list[str]:
+    """Consecutive ``parts`` (pieces of one text, in order) packed into pieces
+    of at most ``max_tokens``, each the parts' text exactly; a part over the
+    cap on its own goes to ``cut``."""
+    pieces: list[str] = []
+    current: list[str] = []
+    current_tokens = 0
+
+    def close() -> None:
+        nonlocal current_tokens
+        piece = "".join(current).strip()
+        if piece:
+            pieces.append(piece)
+        current.clear()
+        current_tokens = 0
+
+    for part in parts:
+        part_tokens = count_tokens(part)
+        if part_tokens > max_tokens:
+            close()
+            if part.strip():
+                pieces.extend(cut(part.strip(), max_tokens))
+            continue
+        if current and current_tokens + part_tokens > max_tokens:
+            close()
+        current.append(part)
+        current_tokens += part_tokens
+    close()
+    return pieces
 
 
 def _split_table(table: str, max_tokens: int) -> list[str]:
-    """Split an oversized Markdown table by rows, repeating the header +
-    separator rows in every part so each part is a valid table. A row that
-    alone outruns the cap (a cell holding a whole exported chat record) is cut
-    like prose, each piece under the header; a header that leaves under a
-    quarter of the cap is cut along with the rest of the table."""
+    """Split an oversized Markdown table into parts within the cap. A row
+    with another column count than the table's first row starts a new table
+    (B-206 K-3) — two tables run together keep their own headers."""
     lines = _LINE_BREAK.split(table)
+    tables: list[list[str]] = []
+    for line in lines:
+        if tables and _cell_count(line) == _cell_count(tables[-1][0]):
+            tables[-1].append(line)
+        else:
+            tables.append([line])
+    return [part for rows in tables for part in _split_one_table(rows, max_tokens)]
+
+
+def _cell_count(row: str) -> int:
+    return len(_CELL_SPLIT.split(row.strip().strip("|")))
+
+
+def _split_one_table(lines: list[str], max_tokens: int) -> list[str]:
+    """Split one table by rows, repeating the header + separator rows in every
+    part so each part is a valid table. A row that alone outruns the cap (a
+    cell holding a whole exported chat record) is cut like prose, each piece
+    under the header; a header that leaves under a quarter of the cap is cut
+    along with the rest of the table. Rows with no header row above them are
+    packed as they are."""
+    table = "\n".join(lines)
+    if count_tokens(table) <= max_tokens:
+        return [table]
+    if len(lines) < 2 or not _TABLE_SEPARATOR_ROW.match(lines[1]):
+        return _pack_parts([f"{line}\n" for line in lines], max_tokens, _hard_split)
     header = "\n".join(lines[:2])
     room = max_tokens - count_tokens(header) - _JOIN_TOKENS
     if room < max_tokens // 4:
