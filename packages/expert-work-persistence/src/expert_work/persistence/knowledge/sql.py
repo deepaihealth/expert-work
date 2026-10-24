@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 import operator
 import re
+from array import array
 from collections.abc import Callable, Sequence
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
@@ -93,6 +94,12 @@ _TS_CONFIG = "simple"
 
 #: Chunk rows inserted per flush in :meth:`SqlKnowledgeStore.replace_chunks`.
 _CHUNK_INSERT_BATCH = 500
+
+#: Content hashes looked up per query in
+#: :meth:`SqlKnowledgeStore.chunk_embeddings_by_hash`: each batch's vectors are
+#: made 8-byte floats as they arrive, so a re-ingest never holds every stored
+#: vector of a document as Python floats at once (B-216).
+_EMBEDDING_READ_BATCH = 500
 
 #: ``hnsw.ef_search`` for vector recall (raised to the request's ``limit`` when
 #: deeper). An HNSW scan returns at most ef_search rows *before* the tenant /
@@ -1590,25 +1597,26 @@ class SqlKnowledgeStore(KnowledgeStore):
         document_id: UUID,
         content_hashes: Sequence[str],
         embedding_model: str,
-    ) -> dict[str, tuple[float, ...]]:
+    ) -> dict[str, Sequence[float]]:
         if not content_hashes:
             return {}
-        # One ``text[]`` bind (``= ANY``), not one bind per hash: a large
-        # document can have more chunks than asyncpg's 32767-parameter cap.
-        hashes = literal(sorted(set(content_hashes)), ARRAY(Text))
-        stmt = select(KnowledgeChunkRow.content_hash, KnowledgeChunkRow.embedding).where(
-            KnowledgeChunkRow.tenant_id == tenant_id,
-            KnowledgeChunkRow.document_id == document_id,
-            KnowledgeChunkRow.embedding_model == embedding_model,
-            KnowledgeChunkRow.content_hash == any_(hashes),
-        )
+        wanted = sorted(set(content_hashes))
+        found: dict[str, Sequence[float]] = {}
         async with self._sf() as session:
-            rows = (await session.execute(stmt)).all()
-        return {
-            row.content_hash: tuple(float(value) for value in row.embedding)
-            for row in rows
-            if row.content_hash is not None
-        }
+            for start in range(0, len(wanted), _EMBEDDING_READ_BATCH):
+                # One ``text[]`` bind (``= ANY``), not one bind per hash: a
+                # batch could be raised past asyncpg's 32767-parameter cap.
+                hashes = literal(wanted[start : start + _EMBEDDING_READ_BATCH], ARRAY(Text))
+                stmt = select(KnowledgeChunkRow.content_hash, KnowledgeChunkRow.embedding).where(
+                    KnowledgeChunkRow.tenant_id == tenant_id,
+                    KnowledgeChunkRow.document_id == document_id,
+                    KnowledgeChunkRow.embedding_model == embedding_model,
+                    KnowledgeChunkRow.content_hash == any_(hashes),
+                )
+                for row in (await session.execute(stmt)).all():
+                    if row.content_hash is not None:
+                        found[row.content_hash] = array("d", row.embedding)
+        return found
 
     async def search(
         self,

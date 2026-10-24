@@ -21,7 +21,10 @@ from expert_work.protocol import KnowledgeChunk
 
 
 def compact(vector: Sequence[float]) -> array[float]:
-    """``vector`` as 8-byte floats in one buffer (no per-value objects)."""
+    """``vector`` as 8-byte floats in one buffer (no per-value objects); one
+    that already is one is returned as is, not copied."""
+    if isinstance(vector, array) and vector.typecode == "d":
+        return vector
     return array("d", vector)
 
 

@@ -644,13 +644,15 @@ class KnowledgeStore(abc.ABC):
         document_id: UUID,
         content_hashes: Sequence[str],
         embedding_model: str,
-    ) -> dict[str, tuple[float, ...]]:
+    ) -> dict[str, Sequence[float]]:
         """The stored vectors of this document's chunks whose ``content_hash``
         is in ``content_hashes`` **and** that ``embedding_model`` produced — a
         re-ingest reuses them instead of embedding unchanged chunks again,
         never across a model change. Only the given document's chunks
         (another document's identical text is not borrowed); hashes with no
-        matching chunk are absent."""
+        matching chunk are absent. A document can have tens of thousands of
+        chunks, so an implementation should hand back compact vectors
+        (``array("d")``), not tuples of Python floats (B-216)."""
 
     @abc.abstractmethod
     async def search(

@@ -19,6 +19,7 @@ is, and 2.5M characters of short headed entries are ~58,000 chunks. So:
 from __future__ import annotations
 
 import pickle
+from array import array
 from collections.abc import AsyncIterator, Iterator, Sequence
 from contextlib import asynccontextmanager
 from uuid import UUID, uuid4
@@ -308,3 +309,12 @@ def test_chunk_rows_read_like_the_list_they_replace() -> None:
 def test_a_compact_vector_holds_the_same_values() -> None:
     values = [0.1, -0.2, 1e-30, 3.141592653589793]
     assert tuple(compact(values)) == tuple(values)
+
+
+def test_a_vector_that_is_already_compact_is_not_copied() -> None:
+    # B-216: the store hands back compact vectors; copying each again would
+    # hold two of every stored vector while a re-ingest collects them.
+    vector = array("d", [0.25, -0.5])
+    assert compact(vector) is vector
+    single = array("f", [0.25, -0.5])
+    assert compact(single) is not single and compact(single).typecode == "d"

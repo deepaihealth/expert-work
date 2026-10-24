@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from array import array
 from collections.abc import Iterator
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -158,6 +159,41 @@ async def test_replace_chunks_writes_every_batch_in_order(
         )
         assert hits[0].content == "part 6"
         assert hits[0].embedding == pytest.approx(chunks[6].embedding)
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_chunk_embeddings_by_hash_reads_every_batch_as_compact_vectors(
+    sql_store: SqlStoreFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # B-216: a re-ingest reads the stored vectors a batch of hashes at a time,
+    # each made 8-byte floats as it arrives — never all of them as Python
+    # floats at once — and still gets every one of them back.
+    monkeypatch.setattr(sql_module, "_EMBEDDING_READ_BATCH", 3)
+    store, engine = sql_store
+    try:
+        tenant = uuid4()
+        base = await store.create_base(tenant_id=tenant, name="kb")
+        doc = await store.upsert_document(tenant_id=tenant, kb_id=base.id, filename="d.pdf")
+        chunks = [
+            _make_chunk(
+                tenant, base.id, doc.id, i, f"part {i}", _vec(0.1 * i, 1.0 / (i + 1))
+            ).model_copy(update={"content_hash": f"{i:064x}", "embedding_model": "m/v1"})
+            for i in range(7)
+        ]
+        await store.replace_chunks(tenant_id=tenant, document_id=doc.id, chunks=chunks)
+        found = await store.chunk_embeddings_by_hash(
+            tenant_id=tenant,
+            document_id=doc.id,
+            content_hashes=[f"{i:064x}" for i in range(7)],
+            embedding_model="m/v1",
+        )
+        assert set(found) == {f"{i:064x}" for i in range(7)}
+        for chunk in chunks:
+            vector = found[chunk.content_hash or ""]
+            assert isinstance(vector, array) and vector.typecode == "d"
+            assert list(vector) == pytest.approx(chunk.embedding)
     finally:
         await engine.dispose()
 
