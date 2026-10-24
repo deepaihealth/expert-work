@@ -843,7 +843,7 @@ class InMemoryKnowledgeStore(KnowledgeStore):
         document_id: UUID,
         content_hashes: Sequence[str],
         embedding_model: str,
-    ) -> dict[str, tuple[float, ...]]:
+    ) -> dict[str, Sequence[float]]:
         wanted = set(content_hashes)
         return {
             c.content_hash: c.embedding
