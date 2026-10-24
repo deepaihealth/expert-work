@@ -67,6 +67,7 @@ import argparse
 import asyncio
 import csv
 import json
+import math
 import os
 import random
 import shutil
@@ -291,6 +292,8 @@ class CorpusReport:
     docs_failed: int
     failed_by_stage: dict[str, int]
     chunk_total: int
+    #: 段长(检索文本 = 标题路径 + 正文,token)的 p10 / p50 / p90 / max;没有段时全 0。
+    chunk_tokens: dict[str, int]
     elapsed_s: float
     ingest_failures: tuple[IngestFailure, ...]
     name_collisions: tuple[NameCollision, ...]
@@ -751,6 +754,11 @@ async def build_corpus(
     by_stage: dict[str, int] = {}
     for failure in failures:
         by_stage[failure.stage] = by_stage.get(failure.stage, 0) + 1
+    sizes: list[int] = []
+    for doc in await store.list_documents(tenant_id=tenant_id, kb_id=base.id):
+        if doc.status is DocumentStatus.READY:
+            texts = await _all_chunk_texts(store, tenant_id=tenant_id, document_id=doc.id)
+            sizes.extend(count_tokens(text) for text in texts)
     return CorpusReport(
         base_id=base.id,
         docs_ingested=total - len(failures),
@@ -761,11 +769,23 @@ async def build_corpus(
         docs_failed=len(failures),
         failed_by_stage=by_stage,
         chunk_total=sum(counts),
+        chunk_tokens=_size_spread(sizes),
         elapsed_s=round(time.monotonic() - started, 3),
         ingest_failures=tuple(failures),
         name_collisions=tuple(collisions),
         embed=embedder.stats() if isinstance(embedder, CountingEmbedder) else None,
     )
+
+
+def _size_spread(sizes: Sequence[int]) -> dict[str, int]:
+    ordered = sorted(sizes)
+    if not ordered:
+        return {"p10": 0, "p50": 0, "p90": 0, "max": 0}
+
+    def at(q: float) -> int:  # nearest rank
+        return ordered[max(0, math.ceil(q * len(ordered)) - 1)]
+
+    return {"p10": at(0.1), "p50": at(0.5), "p90": at(0.9), "max": ordered[-1]}
 
 
 class _ParseStageError(Exception):
@@ -1257,6 +1277,12 @@ def format_summary_table(summary: Mapping[str, Any]) -> str:
             f"{corpus['failed_by_stage']} chunks={corpus['chunk_total']} "
             f"elapsed={corpus['elapsed_s']}s embedder={corpus['embedder']}"
         )
+        spread = corpus.get("chunk_tokens")
+        if spread:
+            lines.append(
+                "chunk tokens: "
+                + " ".join(f"{key}={spread[key]}" for key in ("p10", "p50", "p90", "max"))
+            )
         if corpus["docs_failed"]:
             names = ", ".join(f["filename"] for f in corpus.get("ingest_failures", []))
             lines.append(

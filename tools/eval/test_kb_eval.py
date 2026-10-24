@@ -31,6 +31,7 @@ from kb_eval import (  # type: ignore[import-not-found]
     RerankDegradedError,
     _build_parser,
     _ReplayRetriever,
+    _size_spread,
     baseline_benchmark,
     build_corpus,
     build_embedder,
@@ -298,6 +299,8 @@ async def test_build_corpus_ingests_once_per_dup_group_and_records_failures(
     assert report.docs_skipped_dup == 1
     assert report.docs_failed == 1
     assert report.chunk_total >= 2
+    spread = report.chunk_tokens
+    assert 0 < spread["p10"] <= spread["p50"] <= spread["p90"] <= spread["max"]
     assert report.elapsed_s >= 0.0
     # #7:失败按阶段分类,解析失败是 parse。
     assert [(f.filename, f.stage, f.error_type) for f in report.ingest_failures] == [
@@ -515,6 +518,14 @@ def test_summary_table_warns_when_the_corpus_is_incomplete() -> None:
     assert "WARNING" not in format_summary_table(_summary_with_corpus([]))
 
 
+def test_chunk_sizes_are_reported_as_nearest_rank_percentiles() -> None:
+    assert _size_spread(range(10, 0, -1)) == {"p10": 1, "p50": 5, "p90": 9, "max": 10}
+    assert _size_spread([]) == {"p10": 0, "p50": 0, "p90": 0, "max": 0}
+    summary = _summary_with_corpus([])
+    summary["corpus"]["chunk_tokens"] = {"p10": 120, "p50": 310, "p90": 398, "max": 400}
+    assert "chunk tokens: p10=120 p50=310 p90=398 max=400" in format_summary_table(summary)
+
+
 class _ExplodingEmbedder:
     DIM = EMBEDDING_DIM
 
@@ -530,6 +541,7 @@ async def test_build_corpus_embed_failure_is_embed_stage(corpus: tuple[Path, Pat
     report = await _build(corpus, store=store, tenant=tenant, embedder=embedder)
     assert report.docs_ingested == 0
     assert report.failed_by_stage == {"parse": 1, "embed": 3}  # incl. the renamed collision
+    assert report.chunk_tokens == {"p10": 0, "p50": 0, "p90": 0, "max": 0}  # failed docs: no chunks
     embed_failures = [f for f in report.ingest_failures if f.stage == "embed"]
     assert {f.error_type for f in embed_failures} == {"ConnectionError"}
     docs = await store.list_documents(tenant_id=tenant, kb_id=report.base_id)
