@@ -1096,7 +1096,7 @@ PY
 
 **怎么进**:同 §51(system_admin,平台租户,临时知识库,端口转发到一个 pod 直传);测试文件用 §51 的 `kb48-near-a.docx`。
 
-- [ ] **52.1 重新摄取的内存跟首次入库一个量级**(嵌入约 ¥2,只有首次入库那一次花钱):上传 `kb48-near-a.docx`,ready 后记该 pod 主进程 VmRSS,点「重新摄取」。判据:回到 ready、9,917 段;日志 `knowledge.ingest_vectors … reused=9917 embedded=0`;没有新的 `knowledge_ingest` 用量;重新摄取期间主进程峰值比点击前高不超过约 200 MiB(改前 +597 MiB)。**没修好时**:峰值 +600 MiB 左右,在日志打出 `reused=9917` 的那一刻。测完删临时库。
+- [x] **52.1 重新摄取的内存跟首次入库一个量级**(嵌入约 ¥2,只有首次入库那一次花钱):上传 `kb48-near-a.docx`,ready 后记该 pod 主进程 VmRSS,点「重新摄取」。判据:回到 ready、9,917 段;日志 `knowledge.ingest_vectors … reused=9917 embedded=0`;没有新的 `knowledge_ingest` 用量;重新摄取期间主进程峰值比点击前高不超过约 200 MiB(改前 +597 MiB)。**没修好时**:峰值 +600 MiB 左右,在日志打出 `reused=9917` 的那一刻。测完删临时库。 **10-24 测试 `4a58c44e3` 过**:直传 pod `s9mh8`,首次入库约 12.6 分钟 ready、9,917 段,主进程空闲 523 MiB → 峰值 731 MiB;点击重新摄取前 726 MiB,重新摄取 82 秒回到 ready、9,917 段,峰值 737 MiB,**比点击前高 11 MiB**(改前 +597 MiB);日志 `reused=9917 embedded=0`;这份文档只有首次入库那一条 `knowledge_ingest` 用量(4,004,557 token),重新摄取没有新行。临时库已删。
 
 ## §53 沙箱 pip 下载走快的备源(B-212)
 
@@ -1104,5 +1104,5 @@ PY
 
 **怎么进**:调试台,选一个带沙箱(能调 exec_python)的智能体;两种各一个:出网关(53.1)、出网开且白名单为空(53.2)。让它原样执行 `python -m pip download --no-deps --no-cache-dir -v -d /tmp/b212 scikit-learn`,把含 `Downloading` 的那行和总耗时贴回来,再 `rm -rf /tmp/b212`。
 
-- [ ] **53.1 出网关的智能体**:判据:`Downloading https://mirrors.cloud.tencent.com/pypi/packages/…scikit_learn-…whl`,整条命令 10 秒内结束。**没修好时**:`Downloading https://mirrors.aliyun.com/…`,20 秒以上。
-- [ ] **53.2 出网开的智能体**(pip 经凭据代理出去):判据同 53.1;另查 `sandbox_egress_audit` 里这次运行有 `mirrors.cloud.tencent.com` 的放行记录(和 `mirrors.cloud.aliyuncs.com` 查目录的记录)。**没修好时**:同 53.1;若是 403 / 407,是代理那边的问题,不是源的问题。
+- [x] **53.1 出网关的智能体**:判据:`Downloading https://mirrors.cloud.tencent.com/pypi/packages/…scikit_learn-…whl`,整条命令 10 秒内结束。**没修好时**:`Downloading https://mirrors.aliyun.com/…`,20 秒以上。 **10-24 测试 `4a58c44e3`(沙箱 `daf63cb1`)过**:`Downloading https://mirrors.cloud.tencent.com/pypi/packages/…/scikit_learn-1.9.1-cp312-…whl (9.2 MB)`,整条 3.2 秒;沙箱 `PIP_EXTRA_INDEX_URL` 为腾讯云、`PIP_TRUSTED_HOST` 只有内网主机。
+- [ ] **53.2 出网开的智能体**(pip 经凭据代理出去):判据同 53.1;另查 `sandbox_egress_audit` 里这次运行有 `mirrors.cloud.tencent.com` 的放行记录(和 `mirrors.cloud.aliyuncs.com` 查目录的记录)。**没修好时**:同 53.1;若是 403 / 407,是代理那边的问题,不是源的问题。 **10-24 测试 `4a58c44e3` 未过,不是 B-212 的问题**:pip 同样从腾讯云下载、4.5 秒,但沙箱里**没有任何代理环境变量**,`sandbox_egress_audit` 也没有这次运行的记录 —— pip 是直连出去的。两个原因:① 同一用户的热沙箱被多个智能体共用,代理环境变量只在建沙箱时注入一次,这次复用的是出网关智能体建的那个沙箱;② 沙箱网络本身没隔离,不走代理也能直连公网和全部内网服务。登记 **B-217**(高),修好后重验本条。
