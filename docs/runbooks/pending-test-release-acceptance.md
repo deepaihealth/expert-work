@@ -1063,8 +1063,8 @@ asyncio.run(main())
 
 **怎么进**:测试环境控制台(system_admin,平台租户)建临时知识库,上传一份带图片的 Word(§44 的 `b209-picture.docx` 即可),等 ready。
 
-- [ ] **50.1 刷新回 304**:打开该文档的分段预览,浏览器开发者工具看 `GET …/figures/{id}`。判据:首次 200、带 `etag`(经负载均衡可能是 `W/"…"`);刷新页面后同一请求带 `If-None-Match` 回 304、没有图片字节。**没修好时**:刷新后仍是 200、每次重传整张图。
-- [ ] **50.2 换了图不会 304**:同名换一张图重传(同 44.13),刷新分段预览。判据:新图 id 的请求 200 且显示新图;旧图 id 404。测完删临时库。
+- [x] **50.1 刷新回 304**:打开该文档的分段预览,浏览器开发者工具看 `GET …/figures/{id}`。判据:首次 200、带 `etag`(经负载均衡可能是 `W/"…"`);刷新页面后同一请求带 `If-None-Match` 回 304、没有图片字节。**没修好时**:刷新后仍是 200、每次重传整张图。 **10-24 测试 `f199d16c4` 过**:经负载均衡请求(带 `Accept-Encoding: gzip`,与浏览器一致)首次 200、`etag: W/"6bad9ccaff719375"`、232,857 字节;带回同一个 `If-None-Match` 再请求 → 304、0 字节。
+- [x] **50.2 换了图不会 304**:同名换一张图重传(同 44.13),刷新分段预览。判据:新图 id 的请求 200 且显示新图;旧图 id 404。测完删临时库。 **10-24 测试 `f199d16c4` 过**:同名换成另一张图的 Word 重传(文档 id 不变):新图 `86f0d35365113b19` 200 → 带 ETag 再请求 304;旧图 id 404。临时库已删,文档 / 识别缓存 / 孤儿缓存行均为 0。
 
 ## §51 入库内存跟着段数走 + 段数上限(B-214)+ 重新摄取不再重算切块断点(B-215)
 
@@ -1082,10 +1082,10 @@ PY
 
 另用 §48 脚本里的 `docx("/tmp/kb48-near-a.docx", 2_400_000)`(约 240 万字,9,917 段)。
 
-- [ ] **51.1 迁移**:`SELECT version_num FROM alembic_version` 为 `0173_kb_semantic_break_cache`;`SELECT pg_get_constraintdef(oid) FROM pg_constraint WHERE conname = 'knowledge_parse_cache_kind_enum'` 含 `semantic_break`。
-- [ ] **51.2 段数超限:秒级失败、一分钱不花**:上传 `kb51-over.md`。判据:几秒内「失败」,`error_code=too_many_chunks`,`error` 以 `too many chunks: 45,000 chunks, over the per-document limit of 40,000` 开头;控制台提示「文档切出的段落过多：共 45,000 段，超过单个文档 40,000 段的上限。请拆成几个较小的文件后分别上传。」(英文界面:「Too many segments: 45,000, over the per-document limit of 40,000. …」);`attempts=1`,2 分钟后仍是 1(不重试);这段时间该租户没有新的 `knowledge_ingest` 用量行。**没修好时**:文档被切块嵌入,4.5 万段一路写下去,主进程涨到 GB 级。
-- [ ] **51.3 上限附近照常入库、内存小**(可选,嵌入约 ¥1):记某个 pod 的 VmRSS,端口转发到它上传 `kb51-under.md`。判据:ready、3.8 万段;入库期间主进程比空闲高不超过约 500 MiB。
-- [ ] **51.4 48.7 的那份 Word 复测**(嵌入约 ¥2):同样端口转发直传 `kb48-near-a.docx`。判据:ready、9,917 段;主进程峰值比空闲高不超过约 200 MiB(改前 +616 MiB)。
-- [ ] **51.5 重新摄取不再重算断点**(B-215):对 51.4 的文档点「重新摄取」。判据:回到 ready、段数不变;日志 `knowledge.ingest_vectors … reused=9917 embedded=0`;这次重新摄取**没有** text-embedding-v4 的新 `knowledge_ingest` 用量(改前约是首次嵌入费的四成)。部署前就入库的文档第一次重新摄取还会付一次断点费(那时还没有缓存),第二次起才是 0。**没修好时**:又记几十万到上百万 token。
-- [ ] **51.6 改一段只付改动处**:把一份几十段的 Markdown 改一句话,同名重传。判据:ready;这次的 text-embedding-v4 用量只有几段的量(改动处相邻的块 + 改了的那一段),不是整份。
-- [ ] **51.7 排队停在切块**(由单测覆盖,不必真跑):两份同时上传时,后一份切完块后停在「切块」阶段等预算,前一份写完库才开始嵌入。
+- [x] **51.1 迁移**:`SELECT version_num FROM alembic_version` 为 `0173_kb_semantic_break_cache`;`SELECT pg_get_constraintdef(oid) FROM pg_constraint WHERE conname = 'knowledge_parse_cache_kind_enum'` 含 `semantic_break`。 **10-24 测试 `f199d16c4` 过**:`version_num = 0173_kb_semantic_break_cache`;约束为 `CHECK (kind = ANY (ARRAY['page_ocr', 'figure_desc', 'figure_ocr', 'semantic_break']))`。
+- [x] **51.2 段数超限:秒级失败、一分钱不花**:上传 `kb51-over.md`。判据:几秒内「失败」,`error_code=too_many_chunks`,`error` 以 `too many chunks: 45,000 chunks, over the per-document limit of 40,000` 开头;控制台提示「文档切出的段落过多：共 45,000 段，超过单个文档 40,000 段的上限。请拆成几个较小的文件后分别上传。」(英文界面:「Too many segments: 45,000, over the per-document limit of 40,000. …」);`attempts=1`,2 分钟后仍是 1(不重试);这段时间该租户没有新的 `knowledge_ingest` 用量行。**没修好时**:文档被切块嵌入,4.5 万段一路写下去,主进程涨到 GB 级。 **10-24 测试 `f199d16c4` 过**:约 11 秒 FAILED(停在切块),`too_many_chunks`,`too many chunks: 45,000 chunks, over the per-document limit of 40,000; split the document …`;`attempts=1`,2 分钟后仍是 1;中英文提示逐字一致;这段时间没有任何 `knowledge_ingest` 用量行。另:数结构段数时该 pod 主进程短时 +140 MiB(4.5 万个块),之后没回落到空闲值,51.3 的增量按两种起点都记。
+- [x] **51.3 上限附近照常入库、内存小**(可选,嵌入约 ¥1):记某个 pod 的 VmRSS,端口转发到它上传 `kb51-under.md`。判据:ready、3.8 万段;入库期间主进程比空闲高不超过约 500 MiB。 **10-24 测试 `f199d16c4` 过**:直传 pod B,约 21 分钟 ready、38,000 段;主进程峰值 961 MiB,比最初空闲(515 MiB)高 445 MiB,比上传前(542 MiB,含 51.2 残留)高 419 MiB;嵌入 1,307,780 token(约 ¥0.65);0 次重启。
+- [x] **51.4 48.7 的那份 Word 复测**(嵌入约 ¥2):同样端口转发直传 `kb48-near-a.docx`。判据:ready、9,917 段;主进程峰值比空闲高不超过约 200 MiB(改前 +616 MiB)。 **10-24 测试 `f199d16c4` 过**:直传 pod A,约 12.6 分钟 ready、9,917 段;主进程峰值 728 MiB,比空闲(531 MiB)高 196 MiB(改前 +616 MiB),峰值在写库结束时;嵌入 4,004,557 token(约 ¥2.00)。余量小,但在判据内。
+- [x] **51.5 重新摄取不再重算断点**(B-215):对 51.4 的文档点「重新摄取」。判据:回到 ready、段数不变;日志 `knowledge.ingest_vectors … reused=9917 embedded=0`;这次重新摄取**没有** text-embedding-v4 的新 `knowledge_ingest` 用量(改前约是首次嵌入费的四成)。部署前就入库的文档第一次重新摄取还会付一次断点费(那时还没有缓存),第二次起才是 0。**没修好时**:又记几十万到上百万 token。 **10-24 测试 `f199d16c4` 过**:重新摄取 81 秒回到 ready(首次 12.6 分钟)、9,917 段;日志 `knowledge.ingest_vectors … reused=9917 embedded=0`;期间没有任何 `knowledge_ingest` 用量行。**但这次重新摄取的内存峰值 +597 MiB(1,129 MiB),是首次入库的 3 倍** —— 读回已存向量时一次性全部转成 Python 浮点元组 → 登记 B-216,修复见 §52。
+- [x] **51.6 改一段只付改动处**:把一份几十段的 Markdown 改一句话,同名重传。判据:ready;这次的 text-embedding-v4 用量只有几段的量(改动处相邻的块 + 改了的那一段),不是整份。 **10-24 测试 `f199d16c4` 过**:两份夹具:① 每节一段(40 节):首次 2,556 token,改一句后同名重传 65 token,`reused=39 embedded=1` —— 这种形状同一节里没有相邻段,断点缓存用不上(也不嵌入任何断点块);② 每节三段(20 节):首次 2,746 token、缓存记 40 对判断,改一段后同名重传 142 token(改动那一节的 3 块 + 改了的 1 段,约首次的 5%),`reused=19 embedded=1`。
+- [ ] **51.7 排队停在切块**(由单测覆盖,不必真跑):两份同时上传时,后一份切完块后停在「切块」阶段等预算,前一份写完库才开始嵌入。 **10-24 未真跑**(按本条注明):单测 `test_knowledge_parsed_size.py` 的排队用例覆盖(后一份停在 CHUNKING、前一份写完库才开始嵌入);本次 51.3 / 51.4 分到两个 pod,没有排队。
