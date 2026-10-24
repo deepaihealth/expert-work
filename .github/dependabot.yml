@@ -34,6 +34,17 @@ updates:
       - dependency-name: "langfuse"
         update-types:
           - "version-update:semver-major"
+      # pymupdf 2.0 把 pymupdf4llm 的代码并进了自己,pymupdf4llm 2.0 只是个空包
+      # (零代码零依赖,只为绕开 pip 从 1.x 升 2.x 的一个 bug)。我们钉 pymupdf<2,
+      # 单把 pymupdf4llm 抬到 2.0 = 模块直接没了(#1926 conftest 导入失败,整轮
+      # pytest 起不来)。两个包要同一个 PR 一起迁,PDF 解析是知识库入库主路径,
+      # 迁完要比对解析结果。单独立项(ROADMAP X-17),做完连同这两条 ignore 一起删。
+      - dependency-name: "pymupdf"
+        update-types:
+          - "version-update:semver-major"
+      - dependency-name: "pymupdf4llm"
+        update-types:
+          - "version-update:semver-major"
 
   # apps/admin-ui(pnpm-lock.yaml 归 npm 生态)与 infra/sandbox-image 此前都
   # 不在本文件里,意味着只有 Dependabot **security updates** 会碰它们——那条
