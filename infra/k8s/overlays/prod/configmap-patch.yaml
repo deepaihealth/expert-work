@@ -49,15 +49,20 @@ data:
   # 且比公网镜像(143 KiB/s)再快 27 倍。代价是它**只有 http** —— https 证书验不过,
   # 所以必须给 PIP_TRUSTED_HOST。放弃的是传输层校验,**兜底的是 pip 自己的 wheel
   # 哈希校验**;链路在阿里云内网、不过公网,这个取舍是明写的、不是疏忽。
-  # 公网镜像做备源:内网地址只在 ECS/ACS 内可达,备源让同一份配置在别处也不至于全挂。
+  # 备源是腾讯云公网镜像(B-212)。**pip 下载用的其实是备源**:同一个文件两个源都有时,
+  # pip 25 的解析器按逆序取候选,落在 extra-index 那份上。10-24 在测试沙箱里量:此前备源
+  # 是阿里云公网镜像(382 KiB/s),沙箱里每次 pip 下载都走它 —— scikit-learn 21.5s,
+  # 只配内网 1.8s,换腾讯云 2.4s(沙箱直连 22.8 MB/s、经出网代理 75 MB/s)。不再用
+  # 阿里云公网:阿里云出问题时它和内网会一起挂。选商用云镜像不选高校镜像,因为它扛全部
+  # 下载流量(清华镜像在这里回 403)。任一个源挂了 pip 都从另一个下,只多等约 7s 重试。
   #
   # 注入路径不是这里直接给沙箱 —— 是控制面读这三个变量,再由
   # orchestrator.tools.sandbox.exec_envs 在每次 exec 注入(两个后端唯一来源)。
   # 不写进 SandboxSet 的 pod env:agent 的 exec 走 ACS/envd,它是否继承 pod env
   # 我们验不了(记忆里有「envd 不继承镜像 ENV」这条先例)。
   EXPERT_WORK_SANDBOX_PIP_INDEX_URL: "http://mirrors.cloud.aliyuncs.com/pypi/simple/"
-  EXPERT_WORK_SANDBOX_PIP_EXTRA_INDEX_URL: "https://mirrors.aliyun.com/pypi/simple/"
-  EXPERT_WORK_SANDBOX_PIP_TRUSTED_HOST: "mirrors.cloud.aliyuncs.com mirrors.aliyun.com"
+  EXPERT_WORK_SANDBOX_PIP_EXTRA_INDEX_URL: "https://mirrors.cloud.tencent.com/pypi/simple/"
+  EXPERT_WORK_SANDBOX_PIP_TRUSTED_HOST: "mirrors.cloud.aliyuncs.com"
   EXPERT_WORK_SANDBOX_E2B_DOMAIN: "expert-work-sbx.deepaihealth.com"
   EXPERT_WORK_SANDBOX_E2B_TEMPLATE: "expert-work-sandbox"
   EXPERT_WORK_WORKSPACE_NAS_ROOT: "/mnt/workspaces"
