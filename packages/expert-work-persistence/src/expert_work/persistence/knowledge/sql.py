@@ -254,6 +254,7 @@ def _to_document(row: KnowledgeDocumentRow) -> KnowledgeDocument:
         page_count=row.page_count,
         page_stats=PageStats.model_validate(row.page_stats) if row.page_stats else None,
         figure_stats=FigureStats.model_validate(row.figure_stats) if row.figure_stats else None,
+        chunk_params_hash=row.chunk_params_hash,
         size_bytes=row.size_bytes,
         mime=row.mime,
         created_at=row.created_at,
@@ -1507,6 +1508,7 @@ class SqlKnowledgeStore(KnowledgeStore):
         chunks: Sequence[KnowledgeChunk],
         generation: int | None = None,
         expect_status: DocumentStatus = DocumentStatus.PROCESSING,
+        chunk_params_hash: str | None = None,
     ) -> bool:
         async with self._sf() as session:
             if generation is not None:
@@ -1543,6 +1545,15 @@ class SqlKnowledgeStore(KnowledgeStore):
                 )
                 await session.flush()
                 session.expunge_all()
+            if chunk_params_hash is not None:
+                await session.execute(
+                    update(KnowledgeDocumentRow)
+                    .where(
+                        KnowledgeDocumentRow.tenant_id == tenant_id,
+                        KnowledgeDocumentRow.id == document_id,
+                    )
+                    .values(chunk_params_hash=chunk_params_hash)
+                )
             await session.commit()
         return True
 

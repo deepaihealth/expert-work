@@ -18,6 +18,7 @@ from uuid import UUID, uuid4
 import httpx
 
 from control_plane.knowledge import ingestion
+from control_plane.knowledge.chunking import chunk_params_hash
 from control_plane.knowledge.ingestion import KnowledgeIngestionRunner, content_hash
 from control_plane.knowledge.parsing import DocumentParseError
 from expert_work.persistence import InMemoryKnowledgeStore
@@ -30,8 +31,14 @@ from expert_work.protocol import (
 )
 from orchestrator.llm import FakeEmbedder
 
-_DOC = b"# Alpha\n\nalpha paragraph stays the same.\n\n# Beta\n\nbeta paragraph, first version."
-_DOC_EDITED = b"# Alpha\n\nalpha paragraph stays the same.\n\n# Beta\n\nbeta paragraph, edited."
+#: Each section long enough to stand as a chunk of its own (a shorter one
+#: joins its neighbour, B-206 K-3).
+_PAD = " The paragraph goes on" + " and on" * 50 + "."
+_ALPHA = "alpha paragraph stays the same." + _PAD
+_BETA = "beta paragraph, first version." + _PAD
+_BETA_EDITED = "beta paragraph, edited." + _PAD
+_DOC = f"# Alpha\n\n{_ALPHA}\n\n# Beta\n\n{_BETA}".encode()
+_DOC_EDITED = f"# Alpha\n\n{_ALPHA}\n\n# Beta\n\n{_BETA_EDITED}".encode()
 
 
 class _RecordingEmbedder(FakeEmbedder):
@@ -104,8 +111,8 @@ async def test_chunks_store_clean_body_and_heading_path() -> None:
     assert document.status is DocumentStatus.READY
     chunks, _ = await store.list_chunks(tenant_id=document.tenant_id, document_id=document.id)
     assert [(c.heading_path, c.content) for c in chunks] == [
-        (("Alpha",), "alpha paragraph stays the same."),
-        (("Beta",), "beta paragraph, first version."),
+        (("Alpha",), _ALPHA),
+        (("Beta",), _BETA),
     ]
     for chunk in chunks:
         assert not chunk.content.startswith("[Section:")
@@ -116,9 +123,7 @@ async def test_embeds_document_title_breadcrumb_plus_body() -> None:
     store = InMemoryKnowledgeStore()
     embedder = _RecordingEmbedder()
     await _upload_and_ingest(store, embedder, _DOC)
-    assert (
-        "[Document: guide]\n[Section: Alpha]\n\nalpha paragraph stays the same." in embedder.texts
-    )
+    assert f"[Document: guide]\n[Section: Alpha]\n\n{_ALPHA}" in embedder.texts
 
 
 async def test_chunks_carry_the_cleaned_document_title() -> None:
@@ -154,7 +159,7 @@ async def test_ingest_markdown_without_a_title_embeds_as_before() -> None:
     )
     chunks, _ = await store.list_chunks(tenant_id=tenant, document_id=document.id)
     assert {c.doc_title for c in chunks} == {None}
-    assert "[Section: Alpha]\n\nalpha paragraph stays the same." in embedder.texts
+    assert f"[Section: Alpha]\n\n{_ALPHA}" in embedder.texts
 
 
 async def test_stage_progression_ends_ready() -> None:
@@ -183,11 +188,8 @@ async def test_unchanged_chunks_reuse_their_vectors() -> None:
     # Only the edited chunk went to the embedding API as a chunk text; the
     # unchanged one kept its stored vector (FakeEmbedder is deterministic, so
     # comparing vectors could not tell reuse from re-embedding — the calls can).
-    assert "[Document: guide]\n[Section: Beta]\n\nbeta paragraph, edited." in embedder.texts
-    assert (
-        "[Document: guide]\n[Section: Alpha]\n\nalpha paragraph stays the same."
-        not in embedder.texts
-    )
+    assert f"[Document: guide]\n[Section: Beta]\n\n{_BETA_EDITED}" in embedder.texts
+    assert f"[Document: guide]\n[Section: Alpha]\n\n{_ALPHA}" not in embedder.texts
     after, _ = await store.list_chunks(tenant_id=tenant, document_id=again.id)
     assert after[0].content_hash == before[0].content_hash
 
@@ -200,9 +202,7 @@ async def test_no_reuse_across_an_embedding_model_switch() -> None:
     await _upload_and_ingest(store, _RecordingEmbedder("fake/a"), _DOC, tenant=tenant)
     switched = _RecordingEmbedder("fake/b")
     again = await _upload_and_ingest(store, switched, _DOC_EDITED, tenant=tenant)
-    assert (
-        "[Document: guide]\n[Section: Alpha]\n\nalpha paragraph stays the same." in switched.texts
-    )
+    assert f"[Document: guide]\n[Section: Alpha]\n\n{_ALPHA}" in switched.texts
     after, _ = await store.list_chunks(tenant_id=tenant, document_id=again.id)
     assert {c.embedding_model for c in after} == {"fake/b"}
 
@@ -215,9 +215,7 @@ async def test_no_reuse_without_a_known_model() -> None:
     await _upload_and_ingest(store, FakeEmbedder(), _DOC, tenant=tenant)
     anonymous = _RecordingEmbedder()
     await _upload_and_ingest(store, anonymous, _DOC_EDITED, tenant=tenant)
-    assert (
-        "[Document: guide]\n[Section: Alpha]\n\nalpha paragraph stays the same." in anonymous.texts
-    )
+    assert f"[Document: guide]\n[Section: Alpha]\n\n{_ALPHA}" in anonymous.texts
 
 
 async def test_reingest_of_a_legacy_document_writes_the_new_shape() -> None:
@@ -242,13 +240,11 @@ async def test_reingest_of_a_legacy_document_writes_the_new_shape() -> None:
 
     embedder = _RecordingEmbedder("fake/a")
     again = await _upload_and_ingest(store, embedder, _DOC_EDITED, tenant=tenant)
-    assert (
-        "[Document: guide]\n[Section: Alpha]\n\nalpha paragraph stays the same." in embedder.texts
-    )
+    assert f"[Document: guide]\n[Section: Alpha]\n\n{_ALPHA}" in embedder.texts
     after, _ = await store.list_chunks(tenant_id=tenant, document_id=again.id)
     assert [(c.heading_path, c.content) for c in after] == [
-        (("Alpha",), "alpha paragraph stays the same."),
-        (("Beta",), "beta paragraph, edited."),
+        (("Alpha",), _ALPHA),
+        (("Beta",), _BETA_EDITED),
     ]
 
 
@@ -307,6 +303,35 @@ async def test_reindex_keeps_heading_path_and_hash() -> None:
     # tagged with the model that did it.
     assert embedder.texts == [c.retrieval_text for c in before]
     assert {c.embedding_model for c in after} == {"fake/c"}
+
+
+async def test_an_ingest_records_the_chunking_it_used() -> None:
+    # B-206 K-3: the document carries the fingerprint of the parameters its
+    # chunks were cut with; new parameters, re-ingested, give a new one.
+    store = InMemoryKnowledgeStore()
+    document = await _upload_and_ingest(store, FakeEmbedder(), _DOC)
+    assert document.chunk_params_hash == chunk_params_hash(max_tokens=400, overlap_tokens=0)
+    await store.update_base(
+        tenant_id=document.tenant_id, kb_id=document.kb_id, chunk_max_tokens=256
+    )
+    again = await _upload_and_ingest(store, FakeEmbedder(), _DOC_EDITED, tenant=document.tenant_id)
+    assert again.chunk_params_hash == chunk_params_hash(max_tokens=256, overlap_tokens=0)
+
+
+async def test_a_reindex_leaves_the_chunking_fingerprint_alone() -> None:
+    # Re-embedding swaps vectors, not the chunking: the fingerprint stays.
+    store = InMemoryKnowledgeStore()
+    document = await _upload_and_ingest(store, FakeEmbedder(), _DOC)
+    runner = KnowledgeIngestionRunner(store=store, embedder=_RecordingEmbedder("fake/c"))
+    await runner.submit_reindex(
+        tenant_id=document.tenant_id,
+        kb_id=document.kb_id,
+        embedding_provider="fake",
+        embedding_model="fake-2",
+    )
+    after = await store.get_document(tenant_id=document.tenant_id, document_id=document.id)
+    assert after is not None
+    assert after.chunk_params_hash == document.chunk_params_hash is not None
 
 
 def test_parse_error_code_survives_pickling() -> None:

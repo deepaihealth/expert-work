@@ -593,6 +593,7 @@ class KnowledgeStore(abc.ABC):
         chunks: Sequence[KnowledgeChunk],
         generation: int | None = None,
         expect_status: DocumentStatus = DocumentStatus.PROCESSING,
+        chunk_params_hash: str | None = None,
     ) -> bool:
         """Replace all of a document's chunks with ``chunks`` — deletes
         the document's existing chunks, then inserts the new set, in one
@@ -612,7 +613,11 @@ class KnowledgeStore(abc.ABC):
         ``generation`` (``processing`` for an ingest write-back; ``ready``
         for a re-index, which swaps vectors under a settled document);
         otherwise — including a deleted document — nothing is written and
-        ``False`` is returned. ``True`` when the chunks landed."""
+        ``False`` is returned. ``True`` when the chunks landed.
+
+        ``chunk_params_hash`` (B-206 K-3) is recorded on the document with the
+        chunks: the chunking they were cut with. ``None`` leaves it as it is
+        (a re-index swaps vectors, not the chunking)."""
 
     @abc.abstractmethod
     async def list_chunks(

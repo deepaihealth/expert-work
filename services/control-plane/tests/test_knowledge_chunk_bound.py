@@ -82,8 +82,9 @@ class _RecordingEmbedder:
 
 
 def _entries(count: int) -> str:
-    """Short headed entries — every heading opens a chunk of its own."""
-    return "\n\n".join(f"## 条目 {i}\n\n第 {i} 条的说明文字。" for i in range(count))
+    """Headed entries, each just long enough to stand as a chunk of its own
+    (a shorter one joins its neighbour, B-206 K-3)."""
+    return "\n\n".join(f"## 条目 {i}\n\n" + f"第 {i} 条的说明文字。" * 12 for i in range(count))
 
 
 async def _document(store: InMemoryKnowledgeStore, markdown: str) -> tuple[UUID, UUID]:

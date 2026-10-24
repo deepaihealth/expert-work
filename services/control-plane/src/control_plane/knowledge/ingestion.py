@@ -49,6 +49,7 @@ from control_plane.knowledge.chunking import (
     TextChunk,
     chunk_markdown,
     chunk_markdown_semantic,
+    chunk_params_hash,
     semantic_breaks_enabled,
     structural_chunk_count,
 )
@@ -603,6 +604,7 @@ async def _chunk_embed_store(
     await _advance(store, stage=IngestStage.CHUNKING, **stage_args)
     text = strip_lone_surrogates(markdown)
     sizes = {"max_tokens": chunk_max_tokens, "overlap_tokens": chunk_overlap_tokens}
+    params_hash = chunk_params_hash(**sizes)
     if semantic_breaks_enabled():
         # B-214: memory follows the chunk count. Refused before anything is
         # embedded when even the structural chunks are too many; topic shifts
@@ -629,7 +631,11 @@ async def _chunk_embed_store(
     if not pieces:
         _ensure_written(
             await store.replace_chunks(
-                tenant_id=tenant_id, document_id=document_id, chunks=[], generation=generation
+                tenant_id=tenant_id,
+                document_id=document_id,
+                chunks=[],
+                generation=generation,
+                chunk_params_hash=params_hash,
             ),
             document_id,
         )
@@ -647,6 +653,7 @@ async def _chunk_embed_store(
             generation=generation,
             doc_title=doc_title,
             model_key=model_key,
+            params_hash=params_hash,
         )
 
 
@@ -661,6 +668,7 @@ async def _embed_store(
     generation: int | None,
     doc_title: str | None,
     model_key: str | None,
+    params_hash: str,
 ) -> int:
     stage_args = {"tenant_id": tenant_id, "document_id": document_id, "generation": generation}
     await _advance(store, stage=IngestStage.EMBEDDING, **stage_args)
@@ -688,7 +696,11 @@ async def _embed_store(
     await _advance(store, stage=IngestStage.INDEXING, **stage_args)
     _ensure_written(
         await store.replace_chunks(
-            tenant_id=tenant_id, document_id=document_id, chunks=chunks, generation=generation
+            tenant_id=tenant_id,
+            document_id=document_id,
+            chunks=chunks,
+            generation=generation,
+            chunk_params_hash=params_hash,
         ),
         document_id,
     )

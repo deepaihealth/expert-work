@@ -164,6 +164,34 @@ async def test_replace_chunks_writes_every_batch_in_order(
 
 
 @pytest.mark.asyncio
+async def test_replace_chunks_records_the_chunking_fingerprint(sql_store: SqlStoreFixture) -> None:
+    # B-206 K-3: the chunks' fingerprint lands on the document with them; a
+    # write without one (a re-index swapping vectors) leaves it as it is.
+    store, engine = sql_store
+    try:
+        tenant = uuid4()
+        base = await store.create_base(tenant_id=tenant, name="kb")
+        doc = await store.upsert_document(tenant_id=tenant, kb_id=base.id, filename="d.md")
+        assert doc.chunk_params_hash is None
+        chunks = [_make_chunk(tenant, base.id, doc.id, 0, "east", _vec(1.0, 0.0))]
+        await store.replace_chunks(
+            tenant_id=tenant, document_id=doc.id, chunks=chunks, chunk_params_hash="aaaa"
+        )
+        fetched = await store.get_document(tenant_id=tenant, document_id=doc.id)
+        assert fetched is not None and fetched.chunk_params_hash == "aaaa"
+        await store.replace_chunks(tenant_id=tenant, document_id=doc.id, chunks=chunks)
+        fetched = await store.get_document(tenant_id=tenant, document_id=doc.id)
+        assert fetched is not None and fetched.chunk_params_hash == "aaaa"
+        await store.replace_chunks(
+            tenant_id=tenant, document_id=doc.id, chunks=chunks, chunk_params_hash="bbbb"
+        )
+        listed = await store.list_documents(tenant_id=tenant, kb_id=base.id)
+        assert [d.chunk_params_hash for d in listed] == ["bbbb"]
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
 async def test_chunk_embeddings_by_hash_reads_every_batch_as_compact_vectors(
     sql_store: SqlStoreFixture, monkeypatch: pytest.MonkeyPatch
 ) -> None:

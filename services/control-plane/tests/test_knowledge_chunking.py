@@ -637,6 +637,15 @@ def test_a_heading_the_breadcrumb_has_no_room_for_keeps_its_text() -> None:
     assert all(count_tokens(c.text) <= 400 + 4 for c in chunks)
 
 
+def test_an_inner_heading_too_long_for_the_breadcrumb_leaves_the_outer_ones_on_it() -> None:
+    body = _long("渠道返点按季度结算。")
+    chunks = _chunk_markdown(
+        f"# 渠道大会\n\n## {_LONG_HEADING}\n\n{body}", max_tokens=400, overlap_tokens=0
+    )
+    assert [c.heading_path for c in chunks] == [("渠道大会",)]
+    assert chunks[0].body.startswith(_LONG_HEADING)
+
+
 def test_a_dropped_heading_is_written_into_one_body_only() -> None:
     body = _long("渠道返点按季度结算。")
     src = f"# {_LONG_HEADING}\n\n## 华东\n\n{body}\n\n## 华南\n\n{body}"
@@ -713,9 +722,9 @@ def test_short_entries_join_until_the_target() -> None:
 
 
 _CHAT = [
-    f"客户:我想问一下第 {i} 号订单。还没发货吗?能不能加急?"
+    f"客户:第 {i} 号订单还没发货。能不能加急。地址也要改一下。改成公司的地址。"
     if i % 2 == 0
-    else f"客服:您好,第 {i} 号订单明天发出。加急要另付十元。请问需要吗?"
+    else f"客服:您好。第 {i} 号订单明天发出。加急要另付十元。地址已经改好了。请问还有别的问题吗。"
     for i in range(60)
 ]
 
@@ -723,10 +732,25 @@ _CHAT = [
 @pytest.mark.parametrize("plain_text", [False, True])
 def test_a_conversation_is_cut_between_lines(plain_text: bool) -> None:
     src = "\n".join(_CHAT)  # one paragraph: no blank line between utterances
+    # Cut at sentence marks, some utterance would be cut in two.
+    by_sentence = _hard_split(src, 128)
+    assert any(line not in _CHAT for piece in by_sentence for line in piece.splitlines() if line)
     chunks = _chunk_markdown(src, max_tokens=128, overlap_tokens=0, plain_text=plain_text)
     assert len(chunks) > 1
     lines = [line for c in chunks for line in c.body.splitlines() if line.strip()]
     assert lines == _CHAT
+
+
+def test_a_timestamped_chat_export_is_cut_between_lines() -> None:
+    # "[time] name name<full-width colon> text": a speaker label after a time stamp.
+    lines = [
+        f"[2026-04-02 10:{i:02d}] {'销售 小林' if i % 2 else '客户'}\uff1a"
+        "第一句话说明情况。第二句话补充细节。第三句话提出问题。第四句话表示感谢。"
+        for i in range(40)
+    ]
+    chunks = _chunk_markdown("\n".join(lines), max_tokens=128, overlap_tokens=0, plain_text=True)
+    assert len(chunks) > 1
+    assert [line for c in chunks for line in c.body.splitlines()] == lines
 
 
 def test_a_list_of_short_lines_is_cut_between_lines() -> None:

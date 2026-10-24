@@ -802,6 +802,7 @@ class InMemoryKnowledgeStore(KnowledgeStore):
         chunks: Sequence[KnowledgeChunk],
         generation: int | None = None,
         expect_status: DocumentStatus = DocumentStatus.PROCESSING,
+        chunk_params_hash: str | None = None,
     ) -> bool:
         document = await self.get_document(tenant_id=tenant_id, document_id=document_id)
         if generation is not None:
@@ -823,6 +824,10 @@ class InMemoryKnowledgeStore(KnowledgeStore):
             if not (c.tenant_id == tenant_id and c.document_id == document_id)
         ]
         self._chunks.extend(chunks)
+        if chunk_params_hash is not None:
+            self._documents[self._documents.index(document)] = document.model_copy(
+                update={"chunk_params_hash": chunk_params_hash}
+            )
         return True
 
     async def list_chunks(

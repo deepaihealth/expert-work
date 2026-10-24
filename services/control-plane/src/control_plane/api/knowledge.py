@@ -31,6 +31,7 @@ from control_plane.api.knowledge_rerank_threshold import (
     threshold_binding,
 )
 from control_plane.audit import emit
+from control_plane.knowledge.chunking import chunk_params_hash
 from control_plane.knowledge.ingestion import KnowledgeIngestionRunner
 from control_plane.knowledge.parsing import SUPPORTED_EXTENSIONS
 from control_plane.knowledge.recognition.figure_storage import (
@@ -241,6 +242,11 @@ def _base_dict(
         "created_by": base.created_by,
         "chunk_max_tokens": base.chunk_max_tokens,
         "chunk_overlap_tokens": base.chunk_overlap_tokens,
+        # B-206 K-3 —— what a document's ``chunk_params_hash`` must equal to be
+        # chunked by the current parameters (else: re-ingest it).
+        "chunk_params_hash": chunk_params_hash(
+            max_tokens=base.chunk_max_tokens, overlap_tokens=base.chunk_overlap_tokens
+        ),
         "retrieval_config": {
             "top_k": base.retrieval_top_k,
             "score_threshold": base.retrieval_score_threshold,
@@ -289,6 +295,8 @@ def _document_dict(document: KnowledgeDocument) -> dict[str, Any]:
         "figure_stats": document.figure_stats.model_dump(mode="json")
         if document.figure_stats is not None
         else None,
+        # B-206 K-3 —— the chunking of the serving chunks (null: before it was recorded).
+        "chunk_params_hash": document.chunk_params_hash,
         "enabled": document.enabled,
         "created_at": _iso(document.created_at),
         "updated_at": _iso(document.updated_at),

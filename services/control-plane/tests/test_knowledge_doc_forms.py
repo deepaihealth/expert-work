@@ -15,12 +15,14 @@
 * Ⓕ 混合 PDF(B-209):每页都有记录,扫描页认不出也不静默为空;认得出时按页序插回。
 
 现在不成立、B-206 要修的标 ``xfail(strict=True)``:修好那天它变红,逼着把标记摘掉。
-B-206 有意要改的(段长分布、父段数)不在这里断言,见文末 TODO。
+B-206 K-3 之后另断言切块四条校验(WeKnora 同款)与长文档段长中位(不碎、不超上限);
+父段数等 K-1,见文末 TODO。
 """
 
 from __future__ import annotations
 
 import re
+import statistics
 from collections.abc import Iterator, Sequence
 from dataclasses import dataclass
 from itertools import pairwise
@@ -208,24 +210,43 @@ async def test_no_chunk_exceeds_the_cap(doc: FormDoc, embedder: Embedder) -> Non
     assert max(sizes) <= DEFAULT_CHUNK_MAX_TOKENS + _CAP_SLACK
 
 
-_HEADING_ONLY = (
-    "B-206 K-3: an empty section (a heading with no text under it) becomes a chunk "
-    "holding only the heading; short sections are to merge into the next one"
-)
-
-
-@pytest.mark.parametrize(
-    "doc",
-    _params(
-        TEXT_FORM_DOCS,
-        xfail={"handbook-zh-md": _HEADING_ONLY, "expense-policy-en-md": _HEADING_ONLY},
-    ),
-)
+@pytest.mark.parametrize("doc", _params(TEXT_FORM_DOCS))
 async def test_no_chunk_is_only_a_heading(doc: FormDoc) -> None:
+    # An empty section (a heading with no text under it) joins the next one
+    # instead of becoming a chunk of just its heading (B-206 K-3).
     ingested = await _ingest(doc)
     headings = set(_HEADING_LINE.findall(ingested.markdown))
     heading_only = [c.content for c in ingested.chunks if set(_lines(c.content)) <= headings]
     assert not heading_only
+
+
+@pytest.mark.parametrize("doc", _params(TEXT_FORM_DOCS))
+async def test_chunking_passes_the_four_checks(doc: FormDoc) -> None:
+    # B-206 K-3 (WeKnora's chunk validator): none of the four shapes of a
+    # chunking gone wrong.
+    ingested = await _ingest(doc)
+    cap = DEFAULT_CHUNK_MAX_TOKENS
+    sizes = [count_tokens(chunk.retrieval_text) for chunk in ingested.chunks]
+    length = count_tokens(ingested.markdown)
+    assert not (len(sizes) == 1 and length > 2 * cap)  # a long document left in one chunk
+    fragments = sum(len(chunk.content.strip()) < 50 for chunk in ingested.chunks)
+    assert fragments <= len(sizes) / 4  # fragments under 50 characters
+    assert not (length > cap and max(sizes) < cap // 4)  # every chunk tiny
+    assert max(sizes) <= 2 * cap  # a chunk far over the cap
+
+
+@pytest.mark.parametrize("doc", _params(TEXT_FORM_DOCS))
+async def test_a_long_document_is_neither_fragmented_nor_over_the_cap(doc: FormDoc) -> None:
+    # Median chunk of a document longer than the cap: at least the ~100 tokens
+    # under which a section joins its neighbour (B-206 K-3; a literal, so the
+    # check does not move with the constant it checks), at most the cap. The
+    # 200~400-token median of K-3 is judged on the dev set.
+    ingested = await _ingest(doc)
+    if count_tokens(ingested.markdown) <= DEFAULT_CHUNK_MAX_TOKENS:
+        assert len(ingested.chunks) == 1
+        return
+    median = statistics.median(count_tokens(c.retrieval_text) for c in ingested.chunks)
+    assert 100 <= median <= DEFAULT_CHUNK_MAX_TOKENS
 
 
 # ---------------------------------------------------------------------------
@@ -276,19 +297,10 @@ async def test_table_rows_are_whole_and_under_their_header(doc: FormDoc) -> None
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize(
-    "doc",
-    _params(
-        _form("E"),
-        xfail={
-            "sales-chat-zh-txt": (
-                "B-206 K-3 (dialogue chunked by line): a chat with no blank lines is one "
-                "paragraph, hard-split at sentence marks — inside a multi-sentence line"
-            )
-        },
-    ),
-)
+@pytest.mark.parametrize("doc", _params(_form("E")))
 async def test_dialogue_lines_are_never_cut(doc: FormDoc) -> None:
+    # A chat with no blank lines is one paragraph; it is cut between lines,
+    # not at the sentence marks inside one (B-206 K-3).
     ingested = await _ingest(doc)
     utterances = set(doc.units)
     cut = [line for c in ingested.chunks for line in _lines(c.content) if line not in utterances]
@@ -502,12 +514,6 @@ async def test_mixed_pdf_scanned_page_is_read_in_place(doc: FormDoc, _parse_pool
 
 
 # ---------------------------------------------------------------------------
-# TODO(B-206 K-3): 段长分布与切块结果校验 —— K-3 定下新默认(子段上限 400、语义断点关、
-# 重叠 0、短节合并、对话按行成块)后在这里断言:各形态子段长度中位落在 200~400 token;
-# 设计 §5.1 K-3 的四条校验(单块且文档长 > 2 倍上限 / 不足 50 字的碎块超过 25% /
-# 最大块不足上限 1/4 / 有块超过 2 倍上限)。中位数现在不断言 —— 它正是 K-3 要改的。
-# 若「重叠 = 0」改成独立开关而不是 DEFAULT_CHUNK_OVERLAP_TOKENS = 0,``_ingest`` 要跟着
-# 改成取平台新默认,否则上面 overlap-default 的 xfail 不会翻红。
 # TODO(B-206 K-1): 父段 —— Ⓐ 父段对齐章节、Ⓑ Ⓔ 按字数窗口、Ⓒ 整篇一个父段(只有一个
 # 子段时不建父行)、Ⓓ 整表(带表头)为父段、Ⓕ 不适用。父行进库后 ``_ingest`` 只把可检索的
 # 子段交给上面的断言,父段数与父段长在这里断言。现在没有父段(chunk_type 全是 text)。

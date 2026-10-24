@@ -104,10 +104,14 @@ _CUT_LINE = re.compile(
     re.MULTILINE,
 )
 
-#: A speaker label opening a line ("Agent:", a name and a full-width colon
-#: U+FF1A). A block whose lines mostly open with one is a conversation, cut
-#: between lines (B-206 K-3).
-_SPEAKER = re.compile(r"^[ \t]*[^\s:\uff1a]{1,24}[:\uff1a]")
+#: A speaker label opening a line: a name of up to three words and a colon
+#: (ASCII or full-width U+FF1A), after an optional bracketed time stamp as
+#: chat exports write it ("[2026-04-02 10:02] Sales Lin:"). A block whose
+#: lines mostly open with one is a conversation, cut between lines (B-206 K-3).
+_SPEAKER = re.compile(
+    r"^[ \t]*(?:[\[\u3010][^\]\u3011\n]{1,40}[\]\u3011][ \t]*)?"
+    r"[^\s:\uff1a\[\]]{1,24}(?:[ \t][^\s:\uff1a]{1,24}){0,2}[:\uff1a]"
+)
 
 #: A block of at least :data:`_LINE_BLOCK_MIN_LINES` lines whose median line is
 #: shorter than this is a list of lines (one utterance, item or entry each),
@@ -387,7 +391,8 @@ def _pack_blocks(
     its own then joins a neighbouring chunk (:func:`_join_short_sections`)."""
     sections = [_Section(())]
     trail: tuple[str, ...] = ()
-    shown, budget = _section_budget(trail, doc_title, max_tokens)
+    kept, budget = _section_budget(trail, doc_title, max_tokens)
+    shown = trail[kept.start : kept.stop]
     # A piece cut from an oversized block leaves room for the overlap carried
     # in front of it, so the cap holds overlap included.
     reserve = overlap_tokens + _JOIN_TOKENS if overlap_tokens > 0 else 0
@@ -423,9 +428,10 @@ def _pack_blocks(
             flush(carry_overlap=False)
             trail = block.heading_trail
             sections.append(_Section(trail))
-            shown, budget = _section_budget(trail, doc_title, max_tokens)
-            for depth in range(len(trail) - len(shown)):
-                if trail[: depth + 1] not in written:
+            kept, budget = _section_budget(trail, doc_title, max_tokens)
+            shown = trail[kept.start : kept.stop]
+            for depth in range(len(trail)):
+                if depth not in kept and trail[: depth + 1] not in written:
                     written.add(trail[: depth + 1])
                     add(_Block("content", trail[depth], trail))
         elif index in semantic_breaks and buffer_tokens >= MIN_SEMANTIC_CHUNK_TOKENS:
@@ -516,19 +522,28 @@ def _join(first: _Unit, second: _Unit) -> _Unit:
 
 def _section_budget(
     trail: tuple[str, ...], doc_title: str | None, max_tokens: int
-) -> tuple[tuple[str, ...], int]:
-    """The breadcrumb a section's chunks carry and the body budget left
-    beside it. The cap bounds the whole embedded text — title, breadcrumb and
-    body, as Onyx sizes its chunks (B-200) — so no embedding input outgrows
-    the chunk size. A breadcrumb over a quarter of the cap loses its outermost
-    headings first; the body keeps at least half the cap."""
+) -> tuple[range, int]:
+    """The headings of ``trail`` a section's chunks carry as their breadcrumb
+    (a range of its depths) and the body budget left beside it. The cap
+    bounds the whole embedded text — title, breadcrumb and body, as Onyx sizes
+    its chunks (B-200) — so no embedding input outgrows the chunk size. A
+    breadcrumb over a quarter of the cap loses its outermost headings first;
+    when even the innermost one alone is too long (a slide title read as a
+    heading), the outer headings that fit stay instead. The body keeps at
+    least half the cap."""
 
-    def prefix_tokens(path: tuple[str, ...]) -> int:
-        return count_tokens(chunk_retrieval_text(path, "", doc_title))
+    def prefix_tokens(start: int, stop: int) -> int:
+        return count_tokens(chunk_retrieval_text(trail[start:stop], "", doc_title))
 
-    while trail and prefix_tokens(trail) > max_tokens // 4:
-        trail = trail[1:]
-    return trail, max(max_tokens - prefix_tokens(trail), max_tokens // 2)
+    limit = max_tokens // 4
+    start, stop = 0, len(trail)
+    while start < stop and prefix_tokens(start, stop) > limit:
+        start += 1
+    if start == stop:
+        start = 0
+        while stop and prefix_tokens(0, stop) > limit:
+            stop -= 1
+    return range(start, stop), max(max_tokens - prefix_tokens(start, stop), max_tokens // 2)
 
 
 async def _semantic_breaks(

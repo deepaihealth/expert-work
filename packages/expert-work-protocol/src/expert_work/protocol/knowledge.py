@@ -458,6 +458,11 @@ class KnowledgeDocument(BaseModel):
     #: B-209 PR-2 —— figure counts of the latest ingest (``None``: ingested
     #: before figures were described, or without a figure describer).
     figure_stats: FigureStats | None = None
+    #: B-206 K-3 —— the chunking the serving chunks were cut with
+    #: (``control_plane.knowledge.chunking.chunk_params_hash``); one that
+    #: differs from the base's current hash, or ``None`` (chunked before it was
+    #: recorded), is an old version to re-ingest.
+    chunk_params_hash: str | None = None
     size_bytes: int | None = Field(
         default=None, ge=0, description="size of the serving version's original file"
     )

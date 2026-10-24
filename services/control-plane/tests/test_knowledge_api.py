@@ -14,6 +14,7 @@ from httpx import ASGITransport, AsyncClient
 
 from control_plane.app import create_app
 from control_plane.audit import build_default_audit_logger
+from control_plane.knowledge.chunking import chunk_params_hash
 from control_plane.knowledge.ingestion import KnowledgeIngestionRunner
 from control_plane.settings import DEFAULT_DEV_TENANT_ID, Settings
 from expert_work.persistence import InMemoryKnowledgeStore
@@ -190,6 +191,17 @@ async def test_create_base_defaults_to_400_tokens_without_overlap(setup: Setup) 
     resp = await client.post("/v1/knowledge/bases", json={"name": "plain"})
     assert resp.status_code == 201
     assert (resp.json()["chunk_max_tokens"], resp.json()["chunk_overlap_tokens"]) == (400, 0)
+
+
+@pytest.mark.asyncio
+async def test_a_base_reports_the_chunking_fingerprint_of_its_parameters(setup: Setup) -> None:
+    # B-206 K-3: a document whose chunk_params_hash differs is an old version.
+    client, _ = setup
+    created = (await client.post("/v1/knowledge/bases", json={"name": "kb"})).json()
+    assert created["chunk_params_hash"] == chunk_params_hash(max_tokens=400, overlap_tokens=0)
+    await client.patch("/v1/knowledge/bases/kb", json={"chunk_max_tokens": 256})
+    fetched = (await client.get("/v1/knowledge/bases/kb")).json()
+    assert fetched["chunk_params_hash"] == chunk_params_hash(max_tokens=256, overlap_tokens=0)
 
 
 @pytest.mark.asyncio
