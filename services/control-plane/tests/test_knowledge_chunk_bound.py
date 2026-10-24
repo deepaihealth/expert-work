@@ -186,6 +186,19 @@ def _alternating(count: int) -> str:
     )
 
 
+async def test_without_semantic_breaks_only_the_chunks_are_embedded() -> None:
+    # B-206 K-3 default: topic shifts do not split, so no block is embedded to
+    # find them — every text sent is a chunk's (they open with the title).
+    embedder = _TopicEmbedder()
+    _, chunks = await _ingest(
+        InMemoryKnowledgeStore(), embedder, _alternating(12), doc_title="report"
+    )
+    assert chunks < 12  # paragraphs pack by size, not one per topic
+    assert len(embedder.texts) == chunks
+    assert all(text.startswith("[Document: report]") for text in embedder.texts)
+
+
+@pytest.mark.usefixtures("semantic_breaks")
 async def test_topic_shifts_past_the_cap_are_refused_before_any_chunk_is_embedded() -> None:
     markdown = _alternating(12)
     store = InMemoryKnowledgeStore()

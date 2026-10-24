@@ -47,7 +47,9 @@ from control_plane.knowledge.break_cache import load_break_memo, store_break_mem
 from control_plane.knowledge.chunk_rows import ChunkRows, compact
 from control_plane.knowledge.chunking import (
     TextChunk,
+    chunk_markdown,
     chunk_markdown_semantic,
+    semantic_breaks_enabled,
     structural_chunk_count,
 )
 from control_plane.knowledge.parse_workers import (
@@ -601,24 +603,28 @@ async def _chunk_embed_store(
     await _advance(store, stage=IngestStage.CHUNKING, **stage_args)
     text = strip_lone_surrogates(markdown)
     sizes = {"max_tokens": chunk_max_tokens, "overlap_tokens": chunk_overlap_tokens}
-    # B-214: memory follows the chunk count. Refused before anything is
-    # embedded when even the structural chunks are too many; topic shifts
-    # only split further, so the semantic count is checked again below.
-    ensure_chunk_count(
-        structural_chunk_count(text, **sizes, plain_text=plain_text, doc_title=doc_title)
-    )
-    cache = {"tenant_id": tenant_id, "document_id": document_id, "model_key": model_key}
-    memo = await load_break_memo(store, **cache)
-    pieces = await chunk_markdown_semantic(
-        text,
-        **sizes,
-        embedder=retrying,
-        tenant_id=tenant_id,
-        plain_text=plain_text,
-        doc_title=doc_title,
-        memo=memo,
-    )
-    await store_break_memo(store, **cache, memo=memo)
+    if semantic_breaks_enabled():
+        # B-214: memory follows the chunk count. Refused before anything is
+        # embedded when even the structural chunks are too many; topic shifts
+        # only split further, so the semantic count is checked again below.
+        ensure_chunk_count(
+            structural_chunk_count(text, **sizes, plain_text=plain_text, doc_title=doc_title)
+        )
+        cache = {"tenant_id": tenant_id, "document_id": document_id, "model_key": model_key}
+        memo = await load_break_memo(store, **cache)
+        pieces = await chunk_markdown_semantic(
+            text,
+            **sizes,
+            embedder=retrying,
+            tenant_id=tenant_id,
+            plain_text=plain_text,
+            doc_title=doc_title,
+            memo=memo,
+        )
+        await store_break_memo(store, **cache, memo=memo)
+    else:
+        # B-206 K-3: structure and size only — nothing is embedded to chunk.
+        pieces = chunk_markdown(text, **sizes, plain_text=plain_text, doc_title=doc_title)
     ensure_chunk_count(len(pieces))
     if not pieces:
         _ensure_written(

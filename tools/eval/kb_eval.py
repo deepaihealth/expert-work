@@ -111,7 +111,12 @@ from longmem.embedders import (  # type: ignore[import-not-found]
 )
 from longmem.runner import update_baseline  # type: ignore[import-not-found]
 
-from control_plane.knowledge.chunking import count_tokens
+from control_plane.knowledge.chunking import (
+    CHUNKER_VERSION,
+    configure_semantic_breaks,
+    count_tokens,
+    semantic_breaks_enabled,
+)
 from control_plane.knowledge.ingestion import ingest_markdown
 from control_plane.knowledge.parsing import is_plain_text_file, parse_document
 from expert_work.persistence import InMemoryKnowledgeStore, KnowledgeStore
@@ -1291,6 +1296,9 @@ def fingerprint(
     ann: bool = False,
 ) -> dict[str, Any]:
     return {
+        # B-206 K-3: the chunker's rules and whether topic shifts split.
+        "chunker": CHUNKER_VERSION,
+        "semantic_breaks": semantic_breaks_enabled(),
         "dataset_sha256": file_sha256(dataset_path),
         "manifest_sha256": file_sha256(manifest_path),
         # Directory name only: the baseline is checked in, a machine-local
@@ -1646,6 +1654,12 @@ def _build_parser() -> argparse.ArgumentParser:
         help="结果文件里带上每段的检索文本(汇集标注用;含语料原文,结果文件只留在仓库外)",
     )
     parser.add_argument(
+        "--semantic-breaks",
+        default="off",
+        choices=("on", "off"),
+        help="切块时也按主题断开(B-206 K-3 起生产默认关):on = K-3 之前的生产行为,对照臂",
+    )
+    parser.add_argument(
         "--doc-titles",
         default="real",
         choices=DOC_TITLE_CHOICES,
@@ -1775,6 +1789,7 @@ async def _run(
         "query_marker": bundle.query_marker,
         "doc_match": args.doc_match,
         "doc_titles": args.doc_titles,
+        "semantic_breaks": args.semantic_breaks,
         "tiers": list(tiers),
         "limit_docs": args.limit_docs,
         "method": cfg.method.value,
@@ -1800,6 +1815,7 @@ async def _run(
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = _build_parser().parse_args(argv)
+    configure_semantic_breaks(enabled=args.semantic_breaks == "on")
     dataset = load_dataset(args.dataset)
     manifest = _resolve_manifest(args, dataset)
     if not manifest.is_file():

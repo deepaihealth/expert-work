@@ -105,6 +105,41 @@ MIN_SEMANTIC_CHUNK_TOKENS = 32
 #: 25, 50, 100), so the requests sent stay the same.
 SEMANTIC_EMBED_WINDOW = 200
 
+#: Version of the chunking rules, part of every :func:`chunk_params_hash`.
+#: Bump it with a change that cuts the same text differently under the same
+#: parameters, so documents chunked by the old rules show as an old version
+#: to re-ingest (B-206 K-3).
+CHUNKER_VERSION = "k3"
+
+#: Whether an ingest also splits sections at topic shifts
+#: (:func:`chunk_markdown_semantic`, ``Settings.knowledge_semantic_breaks``).
+#: Off by default since B-206 K-3: published comparisons found no stable gain
+#: from semantic chunking over structure plus size, and finding the topic
+#: shifts embeds every block once more on every ingest. Kept as a switch for
+#: A/B comparisons.
+_semantic_breaks_on = False
+
+
+def configure_semantic_breaks(*, enabled: bool) -> None:
+    """Turn topic-shift splitting on or off for the ingests that follow."""
+    global _semantic_breaks_on
+    _semantic_breaks_on = enabled
+
+
+def semantic_breaks_enabled() -> bool:
+    """Whether ingests split sections at topic shifts (off by default)."""
+    return _semantic_breaks_on
+
+
+def chunk_params_hash(*, max_tokens: int, overlap_tokens: int) -> str:
+    """Fingerprint of the chunking a document's chunks come from: the rules
+    (:data:`CHUNKER_VERSION`), the base's size and overlap, and whether topic
+    shifts split. A document whose stored fingerprint differs from its base's
+    current one was cut by other parameters and is due for a re-ingest."""
+    mode = "semantic" if _semantic_breaks_on else "structural"
+    key = f"{CHUNKER_VERSION}|{max_tokens}|{overlap_tokens}|{mode}"
+    return hashlib.sha256(key.encode("ascii")).hexdigest()[:16]
+
 
 def count_tokens(text: str) -> int:
     """Token count of ``text`` under the chunking tokenizer."""
