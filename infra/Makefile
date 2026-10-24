@@ -42,8 +42,23 @@ dev-build: ## 重建 control-plane + sandbox-supervisor 镜像(改了后端代�
 # 变体已合并(sandbox-image-consolidation)。host daemon build 一次即可
 # (supervisor 经挂载 socket 用同一 daemon)。context=sandbox-image/(本地 COPY)。
 # tag 对上 settings 默认值,或用 EXPERT_WORK_SANDBOX_SANDBOX_IMAGE 覆盖。
+#
+# Debian 源按测速选(B-211):约 280 个 apt 包,默认 mirrors.aliyun.com 够快就用它,
+# 慢了换最快的(10-23 办公网阿里云约 30 KB/s)。探针与 tools/deploy/build-push.sh
+# 同一个,在容器里跑 = 和 docker build 走同一条网络;探针跑不起来退回阿里云。
+# 手动指定:make build-sandbox APT_MIRROR=mirrors.ustc.edu.cn
+APT_MIRROR ?=
+MIRROR_PROBE_IMAGE := ghcr.io/astral-sh/uv:python3.12-bookworm-slim
 build-sandbox: ## build 沙箱镜像(full:office 库 + soffice/poppler/ffmpeg/node + egress shim ~1.3GB)
-	docker build -f sandbox-image/Dockerfile -t expert-work-sandbox:dev sandbox-image
+	@mirror="$(APT_MIRROR)"; \
+	if [ -z "$$mirror" ]; then \
+	  mirror="$$(docker run --rm --platform linux/amd64 --entrypoint python3 \
+	    -v "$(CURDIR)/../tools/deploy/pick_mirror.py:/pick_mirror.py:ro" \
+	    $(MIRROR_PROBE_IMAGE) /pick_mirror.py apt)" \
+	  || { echo "WARN Debian mirror probe failed; using mirrors.aliyun.com" >&2; mirror=mirrors.aliyun.com; }; \
+	fi; \
+	echo "==> APT_MIRROR=$$mirror"; \
+	docker build --build-arg "APT_MIRROR=$$mirror" -f sandbox-image/Dockerfile -t expert-work-sandbox:dev sandbox-image
 	@echo "✓ expert-work-sandbox:dev built"
 
 # 改了沙箱镜像内容(runner.py / sitecustomize.py / Dockerfile / requirements)后
