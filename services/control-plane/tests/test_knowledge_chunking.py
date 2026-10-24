@@ -5,6 +5,7 @@ from __future__ import annotations
 import random
 import re
 from collections.abc import Sequence
+from itertools import pairwise
 from typing import Any
 from uuid import UUID, uuid4
 
@@ -583,11 +584,22 @@ def test_long_breadcrumb_drops_outer_headings_first_but_keeps_their_text() -> No
     chunks = _chunk_markdown(headings + "Body text.\n", max_tokens=64, overlap_tokens=0)
     assert all(c.heading_path and c.heading_path[-1].startswith("level4") for c in chunks)
     assert not any(h.startswith("level0") for c in chunks for h in c.heading_path)
-    assert all(count_tokens(chunk_retrieval_text(c.heading_path, "")) <= 64 // 4 for c in chunks)
+    assert all(count_tokens(chunk_retrieval_text(c.heading_path, "")) <= 64 // 3 for c in chunks)
     # The headings cut from the breadcrumb open the body instead (B-200 regression).
     bodies = " ".join(c.body for c in chunks)
     assert all(f"level{i}" in bodies for i in range(4))
     assert all(count_tokens(c.text) <= 64 + 4 for c in chunks)
+
+
+def test_a_breadcrumb_within_a_third_of_the_cap_keeps_every_level() -> None:
+    # Continuation chunks of a deep section kept fewer levels than they did at
+    # a 512 cap once the budget was a quarter of 400 (B-206 K-3 dev set).
+    names = tuple(f"第{i}级标题关于渠道合作伙伴关于渠道合作伙伴" for i in range(4))
+    headings = "".join(f"{'#' * (i + 1)} {name}\n\n" for i, name in enumerate(names))
+    prefix = count_tokens(chunk_retrieval_text(names, ""))
+    assert 400 // 4 < prefix <= 400 // 3
+    chunks = _chunk_markdown(headings + _long("正文内容。"), max_tokens=400, overlap_tokens=0)
+    assert all(len(c.heading_path) == 4 for c in chunks)
 
 
 def test_overlap_is_dropped_when_it_would_push_a_chunk_past_the_cap() -> None:
@@ -696,9 +708,9 @@ def test_a_trailing_short_section_joins_the_chunk_before() -> None:
 
 
 def test_a_join_never_passes_the_cap() -> None:
-    intro = " ".join(f"intro{i}." for i in range(16))
+    intro = " ".join(f"intro{i}." for i in range(8))
     words = 0
-    while count_tokens(" ".join(f"word{i}." for i in range(words))) < 360:
+    while count_tokens(" ".join(f"word{i}." for i in range(words))) < 385:
         words += 1
     full = " ".join(f"word{i}." for i in range(words))
     assert count_tokens(intro) < SHORT_SECTION_TOKENS
@@ -709,16 +721,51 @@ def test_a_join_never_passes_the_cap() -> None:
     assert all(count_tokens(c.text) <= 400 + 4 for c in chunks)
 
 
-def test_short_entries_join_until_the_target() -> None:
-    entries = [f"问题 {i}:如何修改第 {i} 号订单的收货地址?" for i in range(24)]
+def test_short_entries_join_until_they_are_no_longer_short() -> None:
+    entries = [f"第 {i} 号订单怎样改地址?" for i in range(24)]
     src = "# 常见问题\n\n" + "\n\n".join(
         f"## 条目 {i}\n\n{entry}" for i, entry in enumerate(entries)
     )
     chunks = _chunk_markdown(src, max_tokens=400, overlap_tokens=0)
-    assert 1 < len(chunks) < len(entries)
-    assert all(count_tokens(c.body) >= 200 for c in chunks[:-1])
+    assert 1 < len(chunks) < len(entries) // 2
+    assert all(
+        SHORT_SECTION_TOKENS <= count_tokens(c.body) < 2 * SHORT_SECTION_TOKENS + 20
+        for c in chunks[:-1]
+    )
     joined = _all_text(chunks)
     assert all(_squashed(entry) in joined for entry in entries)
+
+
+def _sized(text: str, tokens: int) -> str:
+    """``text`` repeated to about ``tokens`` tokens."""
+    repeated = text
+    while count_tokens(repeated) < tokens:
+        repeated = f"{repeated}{text}"
+    return repeated
+
+
+def test_a_focused_section_over_the_join_threshold_keeps_its_own_chunk() -> None:
+    # An 80-token section joined into a bigger neighbour was outranked by
+    # chunks about only its subject (B-206 K-3 dev set: 3 questions lost).
+    warranty = _sized("整机保修一年,电池保修半年。", 80)
+    returns = _long("七天内无理由退货。")
+    assert SHORT_SECTION_TOKENS < count_tokens(warranty) < 100
+    src = f"# 售后\n\n## 保修\n\n{warranty}\n\n## 退货\n\n{returns}"
+    chunks = _chunk_markdown(src, max_tokens=400, overlap_tokens=0)
+    assert chunks == [
+        TextChunk(body=warranty, heading_path=("售后", "保修")),
+        TextChunk(body=returns, heading_path=("售后", "退货")),
+    ]
+
+
+def test_a_short_section_joins_one_neighbour_and_stops() -> None:
+    note = "以下为保修条款。"
+    warranty = _sized("整机保修一年,电池保修半年。", 80)
+    returns = _sized("七天内无理由退货。", 80)
+    assert count_tokens(note) < SHORT_SECTION_TOKENS
+    src = f"# 售后\n\n## 说明\n\n{note}\n\n## 保修\n\n{warranty}\n\n## 退货\n\n{returns}"
+    chunks = _chunk_markdown(src, max_tokens=400, overlap_tokens=0)
+    assert [c.body for c in chunks] == [f"{note}\n\n保修\n\n{warranty}", returns]
 
 
 _CHAT = [
@@ -800,6 +847,104 @@ def test_a_page_break_is_a_cut_point() -> None:
 )
 def test_cut_lines(line: str, cut: bool) -> None:
     assert bool(_CUT_LINE.match(line)) is cut
+
+
+def _faq(count: int, answer_tokens: int, question: str) -> list[tuple[str, str]]:
+    return [
+        (
+            question.format(i=i),
+            "**答:**" + _sized(f"第 {i} 条的处理办法写在这里。", answer_tokens),
+        )
+        for i in range(count)
+    ]
+
+
+@pytest.mark.parametrize(
+    "question",
+    [
+        "{i}. **第 {i} 种情况怎么处理\uff1f**",
+        "**问:第 {i} 种情况怎么处理?**",
+        "Q{i}: how is case {i} handled?",
+        "第 {i} 种情况的处理步骤如下\uff1a",
+        "**第 {i} 种情况的注意事项**",
+        "{i}. 第 {i} 种情况",
+    ],
+)
+def test_a_lead_in_line_never_ends_a_chunk(question: str) -> None:
+    # FAQ-style Word lists: a question paragraph, then its answer. A cut right
+    # after the question left the answer's chunk without it (B-206 K-3 dev
+    # set: 4 questions lost) — the question opens the next chunk instead.
+    entries = _faq(12, 110, question)
+    src = "\n\n".join(f"{q}\n\n{a}" for q, a in entries)
+    chunks = _chunk_markdown(src, max_tokens=400, overlap_tokens=0)
+    for q, a in entries:
+        holding = [c for c in chunks if a[:20] in c.body]
+        assert holding and all(q in c.body for c in holding)
+    assert all(count_tokens(c.text) <= 400 + 4 for c in chunks)
+
+
+def test_a_question_line_in_a_conversation_opens_the_next_piece() -> None:
+    lines: list[str] = []
+    for i in range(30):
+        lines.append(f"客户:第 {i} 号订单什么时候发货\uff1f")
+        lines.append(f"客服:第 {i} 号订单" + "明天上午从仓库发出,物流单号稍后短信通知。" * 2)
+    chunks = _chunk_markdown("\n".join(lines), max_tokens=128, overlap_tokens=0, plain_text=True)
+    assert len(chunks) > 2
+    for question, answer in zip(lines[::2], lines[1::2], strict=True):
+        holding = [c for c in chunks if answer in c.body.splitlines()]
+        assert holding and all(question in c.body.splitlines() for c in holding)
+
+
+def test_an_answer_cut_in_pieces_repeats_its_question_on_every_piece() -> None:
+    question = "7. **退货的运费由谁承担\uff1f**"
+    answer = "**答:**" + "".join(f"第 {i} 种情况下运费由卖家承担。" for i in range(80))
+    chunks = _chunk_markdown(f"{question}\n\n{answer}", max_tokens=128, overlap_tokens=0)
+    assert len(chunks) > 1
+    assert all(c.body.startswith(question) for c in chunks)
+    assert all(count_tokens(c.text) <= 128 + 4 for c in chunks)
+    for sentence in re.findall(r"第 \d+ 种[^。]*。", answer):
+        assert any(_squashed(sentence) in _squashed(c.body) for c in chunks)
+
+
+def test_a_sentence_ending_paragraph_is_not_held_back() -> None:
+    first = _sized("这是一段完整的说明。", 300)
+    second = _sized("这是另一段完整的说明。", 300)
+    chunks = _chunk_markdown(f"{first}\n\n{second}", max_tokens=400, overlap_tokens=0)
+    assert [c.body for c in chunks] == [first, second]
+
+
+def test_a_table_row_over_the_cap_repeats_its_leading_cells_on_every_piece() -> None:
+    # An FAQ sheet row whose answer cell outruns the cap: every piece is a
+    # whole row naming its category and question, under the header (B-206 K-3
+    # dev set: 5 questions lost when the pieces carried the header only).
+    answer = "".join(f"第 {i} 步按照说明书操作即可。" for i in range(90))
+    header = "| 分类 | 问题 | 回答 | 标签 |"
+    src = f"{header}\n| --- | --- | --- | --- |\n| 售后 | 退货运费谁承担? | {answer} | 运费 |\n"
+    chunks = _chunk_markdown(src, max_tokens=128, overlap_tokens=0)
+    assert len(chunks) > 1
+    for chunk in chunks:
+        rows = chunk.body.splitlines()
+        assert rows[0] == header
+        assert all(row.startswith("| 售后 | 退货运费谁承担? | ") for row in rows[2:])
+        assert all(row.count("|") == 5 for row in rows[2:])
+    assert all(count_tokens(c.text) <= 128 for c in chunks)
+    steps = re.findall(r"第 \d+ 步[^。]*。", answer)
+    assert len(steps) == 90
+    assert all(_squashed(step) in _all_text(chunks) for step in steps)
+    assert "运费" in chunks[0].body.splitlines()[2].rsplit("|", 2)[1]
+
+
+def test_prose_cut_inside_a_paragraph_carries_the_sentence_before_the_cut() -> None:
+    # Overlap only where a paragraph has to be cut (FastGPT / Unstructured):
+    # each piece after the first opens with the end of the piece before it.
+    prose = "".join(f"这是第 {i} 句完整的说明文字,内容比较长一些。" for i in range(160))
+    chunks = _chunk_markdown(prose, max_tokens=400, overlap_tokens=0, plain_text=True)
+    assert len(chunks) > 2
+    for before, after in pairwise(chunks):
+        last = re.findall(r"[^。]+。", before.body)[-1]
+        assert after.body.startswith("这是第")
+        assert last in after.body[: 3 * len(last)]
+    assert all(count_tokens(c.text) <= 400 for c in chunks)
 
 
 def test_tables_run_together_keep_their_own_headers() -> None:

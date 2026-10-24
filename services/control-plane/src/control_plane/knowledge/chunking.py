@@ -13,7 +13,8 @@ A parsed document (Markdown text) is sliced into retrieval chunks that:
   still findable ("免赔额是 500 元" is embedded / indexed as
   "[Section: 健康保险 > 免赔额]" + body) while the stored body stays clean;
 * **overlap** within a section so content near a chunk boundary is not
-  lost;
+  lost — the base's overlap, and regardless of it the last sentence of a
+  paragraph that had to be cut mid-text (B-206 K-3);
 * keep tables whole, splitting an oversized table by rows (header
   retained) and an oversized paragraph on sentence boundaries.
 
@@ -119,6 +120,16 @@ _SPEAKER = re.compile(
 _SHORT_LINE_CHARS = 40
 _LINE_BLOCK_MIN_LINES = 3
 
+#: A line that introduces what follows it ends in a question mark or a colon
+#: (ASCII or full-width U+FF1F / U+FF1A) once bold / italic marks are off.
+_LEAD_IN_END = re.compile(r"[?:\uff1f\uff1a]$")
+
+#: Share of the cap a paragraph cut mid-text repeats from the end of the piece
+#: before (FastGPT: overlap only at a cut inside a paragraph; Unstructured
+#: ``overlap``: only between pieces of a split element). Cuts at structure —
+#: a heading, a blank line, a numbered or chapter line — repeat nothing.
+_CUT_OVERLAP_PERCENT = 15
+
 #: One line with its line break (the breaks markdown-it counts, ``_LINE_BREAK``).
 _LINE_WITH_END = re.compile(r"[^\r\n]*(?:\r\n?|\n)|[^\r\n]+$")
 
@@ -142,13 +153,10 @@ MIN_SEMANTIC_CHUNK_TOKENS = 32
 #: A section whose only chunk holds fewer tokens than this — a heading with
 #: one line under it, a page number, a heading with nothing under it — joins
 #: a neighbouring chunk of its parent section instead of standing alone
-#: (B-206 K-3; Unstructured ``combine_text_under_n_chars``, Onyx
-#: ``CHUNK_MIN_CONTENT``).
-SHORT_SECTION_TOKENS = 100
-
-#: Joined short sections keep taking the next short one until they hold this
-#: many tokens, or half the cap if that is more (WeKnora ``coalesceTinyChunks``).
-_JOIN_TARGET_TOKENS = 200
+#: (B-206 K-3). Low on purpose: at 100 a focused 80-token section went into a
+#: bigger neighbour and lost its rank to chunks about only its subject (dev
+#: set); RAGFlow joins across sections only under 32 tokens, Docling never.
+SHORT_SECTION_TOKENS = 50
 
 #: Blocks embedded per topic-detection window. Only adjacent blocks are
 #: compared, so each window's vectors are dropped once compared; only the
@@ -251,13 +259,12 @@ class _Section:
 @dataclass(frozen=True)
 class _Unit:
     """A chunk on its way out of :func:`_join_short_sections`: the full
-    heading ``trail`` of its (first) section, whether it is that section's
-    ``whole`` text, and whether it already holds a ``joined`` short section."""
+    heading ``trail`` of its (first) section and whether it is that section's
+    ``whole`` text."""
 
     chunk: TextChunk
     trail: tuple[str, ...]
     whole: bool
-    joined: bool = False
 
 
 @dataclass
@@ -387,8 +394,11 @@ def _pack_blocks(
 
     A heading the breadcrumb has no room for opens the body of the first
     chunk under it instead — the only place its text would otherwise have
-    been, so it was lost (B-200 regression). A section too short to stand on
-    its own then joins a neighbouring chunk (:func:`_join_short_sections`)."""
+    been, so it was lost (B-200 regression). A line that introduces the next
+    block (:func:`_is_lead_in`, a question above its answer) never ends a
+    chunk: it opens the next one with that block, and every further piece of
+    a block cut after it repeats it. A section too short to stand on its own
+    then joins a neighbouring chunk (:func:`_join_short_sections`)."""
     sections = [_Section(())]
     trail: tuple[str, ...] = ()
     kept, budget = _section_budget(trail, doc_title, max_tokens)
@@ -412,6 +422,19 @@ def _pack_blocks(
 
     def add(block: _Block) -> None:
         nonlocal buffer, buffer_tokens
+        lead = buffer[-1] if buffer and _is_lead_in(buffer[-1], budget) else ""
+        if lead and buffer_tokens + _JOIN_TOKENS + count_tokens(block.text) > budget:
+            # The block does not fit beside what is packed: it opens the next
+            # chunk together with the line that introduces it.
+            buffer.pop()
+            buffer_tokens = count_tokens("\n\n".join(buffer)) if buffer else 0
+            flush(carry_overlap=False)
+            lead_tokens = count_tokens(lead) + _JOIN_TOKENS
+            for piece in _prepare_block(block, budget - lead_tokens, reserve=reserve):
+                flush(carry_overlap=False)
+                buffer = [lead, piece]
+                buffer_tokens = lead_tokens + count_tokens(piece)
+            return
         for piece in _prepare_block(block, budget, reserve=reserve):
             piece_tokens = count_tokens(piece)
             if buffer and buffer_tokens + _JOIN_TOKENS + piece_tokens > budget:
@@ -448,12 +471,10 @@ def _join_short_sections(
 ) -> list[TextChunk]:
     """Chunks of every section in order, with each section shorter than
     :data:`SHORT_SECTION_TOKENS` joined to a neighbour (B-206 K-3): to the
-    first chunk of the next section — taking further short sections until the
-    join holds :data:`_JOIN_TARGET_TOKENS` or half the cap — else to the chunk
-    before it. Only a sibling or a subsection joins (:func:`_may_join`), and a
-    join never passes the cap; otherwise the short section stays a chunk of
-    its own."""
-    target = max(_JOIN_TARGET_TOKENS, max_tokens // 2)
+    first chunk of the next section — a join still that short takes the next
+    one too — else to the chunk before it. Only a sibling or a subsection
+    joins (:func:`_may_join`), and a join never passes the cap; otherwise the
+    short section stays a chunk of its own."""
 
     def fits(unit: _Unit) -> bool:
         text = chunk_retrieval_text(unit.chunk.heading_path, unit.chunk.body, doc_title)
@@ -480,7 +501,7 @@ def _join_short_sections(
                     keep(pending)
                 pending = None
             size = count_tokens(unit.chunk.body)
-            if unit.whole and (size < SHORT_SECTION_TOKENS or (unit.joined and size < target)):
+            if unit.whole and size < SHORT_SECTION_TOKENS:
                 pending = unit
             else:
                 out.append(unit)
@@ -512,12 +533,7 @@ def _join(first: _Unit, second: _Unit) -> _Unit:
     else:
         path, trail, headings = second.chunk.heading_path, second.trail, ()
     body = "\n\n".join([first.chunk.body, *headings, second.chunk.body])
-    return _Unit(
-        TextChunk(body=body, heading_path=path),
-        trail,
-        whole=first.whole and second.whole,
-        joined=True,
-    )
+    return _Unit(TextChunk(body=body, heading_path=path), trail, whole=first.whole and second.whole)
 
 
 def _section_budget(
@@ -527,7 +543,9 @@ def _section_budget(
     (a range of its depths) and the body budget left beside it. The cap
     bounds the whole embedded text — title, breadcrumb and body, as Onyx sizes
     its chunks (B-200) — so no embedding input outgrows the chunk size. A
-    breadcrumb over a quarter of the cap loses its outermost headings first;
+    breadcrumb over a third of the cap loses its outermost headings first (a
+    quarter of 400 cost continuation chunks of deep sections levels they kept
+    at 512 — B-206 K-3 dev set);
     when even the innermost one alone is too long (a slide title read as a
     heading), the outer headings that fit stay instead. The body keeps at
     least half the cap."""
@@ -535,7 +553,7 @@ def _section_budget(
     def prefix_tokens(start: int, stop: int) -> int:
         return count_tokens(chunk_retrieval_text(trail[start:stop], "", doc_title))
 
-    limit = max_tokens // 4
+    limit = max_tokens // 3
     start, stop = 0, len(trail)
     while start < stop and prefix_tokens(start, stop) > limit:
         start += 1
@@ -728,10 +746,61 @@ def _split_content(text: str, max_tokens: int) -> list[str]:
 
 def _split_part(text: str, max_tokens: int) -> list[str]:
     """One oversized part with no cut line in it: between lines if it is a
-    block of lines (:func:`_is_line_block`), else on sentence boundaries."""
+    block of lines (:func:`_is_line_block`), else on sentence boundaries with
+    the sentence before each cut repeated (:func:`_cut_with_overlap`)."""
     if _is_line_block(text):
-        return _pack_parts(_LINE_WITH_END.findall(text), max_tokens, _hard_split)
-    return _hard_split(text, max_tokens)
+        return _pack_parts(_LINE_WITH_END.findall(text), max_tokens, _cut_with_overlap)
+    return _cut_with_overlap(text, max_tokens)
+
+
+def _cut_with_overlap(text: str, max_tokens: int) -> list[str]:
+    """``text`` cut on sentence boundaries (:func:`_hard_split`), each piece
+    after the first opening with the last whole sentences of the one before
+    it — at most :data:`_CUT_OVERLAP_PERCENT` of the cap; none when even the
+    last sentence is longer — so a passage the cut runs through is still
+    whole in one piece."""
+    overlap = max_tokens * _CUT_OVERLAP_PERCENT // 100
+    pieces = _hard_split(text, max_tokens - overlap - 2 * _JOIN_TOKENS)
+    out = pieces[:1]
+    for before, piece in pairwise(pieces):
+        tail = _sentence_tail(before, overlap)
+        if not tail:
+            out.append(piece)
+        else:
+            out.append(f"{tail}{piece}" if _cjk_end(tail) else f"{tail} {piece}")
+    return out
+
+
+def _sentence_tail(text: str, max_tokens: int) -> str:
+    """The last whole sentences of ``text`` that fit in ``max_tokens``."""
+    taken: list[str] = []
+    tokens = 0
+    for unit in reversed([u for u in _SENTENCE_BOUNDARY.split(text) if u.strip()]):
+        tokens += count_tokens(unit)
+        if tokens > max_tokens:
+            break
+        taken.append(unit)
+    return "".join(reversed(taken)).strip()
+
+
+def _cjk_end(text: str) -> bool:
+    """Whether ``text`` ends in a CJK character or mark (no space follows)."""
+    return bool(text) and ord(text[-1]) >= 0x2E80
+
+
+def _is_lead_in(piece: str, budget: int) -> bool:
+    """Whether ``piece`` is one line that introduces what follows it: a
+    question, a line ending in a colon, a bold line, a numbered or chapter
+    line — short (a quarter of the ``budget`` at most), not a table row. A
+    chunk ending on one leaves the text it introduces without it (B-206 K-3
+    dev set: an FAQ question at the end of a chunk, its answer in the next)."""
+    text = piece.strip()
+    if not text or text.startswith("|") or _LINE_BREAK.search(text):
+        return False
+    if count_tokens(text) > budget // 4:
+        return False
+    bold = len(text) > 4 and text.startswith("**") and text.endswith("**")
+    return bold or bool(_LEAD_IN_END.search(text.strip("*_ \t"))) or bool(_CUT_LINE.match(text))
 
 
 def _is_line_block(text: str) -> bool:
@@ -750,7 +819,8 @@ def _pack_parts(
 ) -> list[str]:
     """Consecutive ``parts`` (pieces of one text, in order) packed into pieces
     of at most ``max_tokens``, each the parts' text exactly; a part over the
-    cap on its own goes to ``cut``."""
+    cap on its own goes to ``cut``. A line that introduces the next part
+    (:func:`_is_lead_in`) opens the next piece rather than ending one."""
     pieces: list[str] = []
     current: list[str] = []
     current_tokens = 0
@@ -771,7 +841,15 @@ def _pack_parts(
                 pieces.extend(cut(part.strip(), max_tokens))
             continue
         if current and current_tokens + part_tokens > max_tokens:
+            lead = (
+                current.pop() if len(current) > 1 and _is_lead_in(current[-1], max_tokens) else ""
+            )
             close()
+            if lead and count_tokens(lead) + part_tokens <= max_tokens:
+                current.append(lead)
+                current_tokens = count_tokens(lead)
+            elif lead:
+                pieces.append(lead.strip())
         current.append(part)
         current_tokens += part_tokens
     close()
@@ -799,10 +877,10 @@ def _cell_count(row: str) -> int:
 def _split_one_table(lines: list[str], max_tokens: int) -> list[str]:
     """Split one table by rows, repeating the header + separator rows in every
     part so each part is a valid table. A row that alone outruns the cap (a
-    cell holding a whole exported chat record) is cut like prose, each piece
-    under the header; a header that leaves under a quarter of the cap is cut
-    along with the rest of the table. Rows with no header row above them are
-    packed as they are."""
+    cell holding a whole exported chat record, a long FAQ answer) is cut into
+    rows of its own (:func:`_split_long_row`), each under the header; a header
+    that leaves under a quarter of the cap is cut along with the rest of the
+    table. Rows with no header row above them are packed as they are."""
     table = "\n".join(lines)
     if count_tokens(table) <= max_tokens:
         return [table]
@@ -819,7 +897,7 @@ def _split_one_table(lines: list[str], max_tokens: int) -> list[str]:
             if current:
                 parts.append("\n".join([header, *current]))
                 current = []
-            parts.extend(f"{header}\n{piece}" for piece in _hard_split(row, room))
+            parts.extend(f"{header}\n{piece}" for piece in _split_long_row(row, room))
             continue
         candidate = "\n".join([header, *current, row])
         if current and count_tokens(candidate) > max_tokens:
@@ -830,6 +908,31 @@ def _split_one_table(lines: list[str], max_tokens: int) -> list[str]:
     if current:
         parts.append("\n".join([header, *current]))
     return parts
+
+
+def _split_long_row(row: str, max_tokens: int) -> list[str]:
+    """A table row over ``max_tokens`` as several rows: its longest cell cut
+    (:func:`_cut_with_overlap`), every piece in a row that repeats the cells
+    in front of it — the category / question an FAQ sheet keeps there — the
+    cells after it on the first piece only (B-206 K-3; Docling, Unstructured,
+    FastGPT and Onyx all carry the header alone, so a continuation never says
+    which question it answers). Cells too long to repeat: cut like prose."""
+    cells = [cell.strip() for cell in _CELL_SPLIT.split(row.strip().strip("|"))]
+    longest = max(range(len(cells)), key=lambda index: count_tokens(cells[index]))
+
+    def line(values: Sequence[str]) -> str:
+        return "| " + " | ".join(values) + " |"
+
+    lead, after = cells[:longest], cells[longest + 1 :]
+    frame = count_tokens(line([*lead, "", *after]))
+    if len(cells) < 2 or frame > max_tokens // 2:
+        return _hard_split(row, max_tokens)
+    pieces = _cut_with_overlap(cells[longest], max_tokens - frame - 2 * _JOIN_TOKENS)
+    blank = [""] * len(after)
+    return [
+        line([*lead, piece, *(after if index == 0 else blank)])
+        for index, piece in enumerate(pieces)
+    ]
 
 
 def _hard_split(text: str, max_tokens: int) -> list[str]:

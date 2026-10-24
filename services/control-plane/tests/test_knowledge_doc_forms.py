@@ -237,7 +237,7 @@ async def test_chunking_passes_the_four_checks(doc: FormDoc) -> None:
 
 @pytest.mark.parametrize("doc", _params(TEXT_FORM_DOCS))
 async def test_a_long_document_is_neither_fragmented_nor_over_the_cap(doc: FormDoc) -> None:
-    # Median chunk of a document longer than the cap: at least the ~100 tokens
+    # Median chunk of a document longer than the cap: at least the ~50 tokens
     # under which a section joins its neighbour (B-206 K-3; a literal, so the
     # check does not move with the constant it checks), at most the cap. The
     # 200~400-token median of K-3 is judged on the dev set.
@@ -246,7 +246,7 @@ async def test_a_long_document_is_neither_fragmented_nor_over_the_cap(doc: FormD
         assert len(ingested.chunks) == 1
         return
     median = statistics.median(count_tokens(c.retrieval_text) for c in ingested.chunks)
-    assert 100 <= median <= DEFAULT_CHUNK_MAX_TOKENS
+    assert 50 <= median <= DEFAULT_CHUNK_MAX_TOKENS
 
 
 # ---------------------------------------------------------------------------
