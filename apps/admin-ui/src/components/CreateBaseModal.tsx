@@ -82,12 +82,14 @@ export function CreateBaseModal({ open, onClose, onCreated }: CreateBaseModalPro
           form={form}
           layout="vertical"
           onFinish={handleFinish}
-          // Pre-filled with the tuned defaults (chunk 512/64, top-k 5, hybrid +
-          // rerank). Threshold stays empty on purpose — "no cutoff" is the safe
-          // default; a value risks dropping relevant hits.
+          // Pre-filled with the platform defaults (chunk 400 / no overlap — the
+          // backend's DEFAULT_CHUNK_MAX_TOKENS / _OVERLAP_TOKENS, B-206 K-3 —
+          // top-k 5, hybrid + rerank); the form posts them as they are, so they
+          // must match. Threshold stays empty on purpose — "no cutoff" is the
+          // safe default; a value risks dropping relevant hits.
           initialValues={{
-            chunkMaxTokens: 512,
-            chunkOverlapTokens: 64,
+            chunkMaxTokens: 400,
+            chunkOverlapTokens: 0,
             retrievalTopK: 5,
             retrievalMethod: "hybrid",
             rerankEnabled: true,
@@ -113,7 +115,8 @@ export function CreateBaseModal({ open, onClose, onCreated }: CreateBaseModalPro
             tooltip={t("knowledge_page.field_chunk_hint")}
           >
             <InputNumber
-              min={1}
+              min={128}
+              max={1024}
               style={{ width: "100%" }}
               aria-label={t("knowledge_page.field_chunk_max")}
             />

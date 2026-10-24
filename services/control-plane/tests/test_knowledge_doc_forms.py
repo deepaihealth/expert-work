@@ -99,7 +99,6 @@ async def _ingest(
     doc: FormDoc,
     *,
     embedder: Embedder | None = None,
-    overlap_tokens: int = DEFAULT_CHUNK_OVERLAP_TOKENS,
 ) -> _Ingested:
     """``doc`` through the upload path with the platform's default chunk size:
     parse, then the production chunk → embed → store; the stored chunks.
@@ -122,7 +121,7 @@ async def _ingest(
         filename=doc.filename,
         raw=doc.raw,
         chunk_max_tokens=DEFAULT_CHUNK_MAX_TOKENS,
-        chunk_overlap_tokens=overlap_tokens,
+        chunk_overlap_tokens=DEFAULT_CHUNK_OVERLAP_TOKENS,
         parsed_markdown=markdown,
     )
     chunks, _ = await store.list_chunks(tenant_id=tenant, document_id=document.id, limit=10_000)
@@ -256,30 +255,12 @@ async def test_table_chunks_carry_the_header(doc: FormDoc) -> None:
     assert all(headers & set(_lines(body)) for body in with_rows)
 
 
-_CARRIED_ROWS = (
-    "B-206 K-3 (overlap off by default): the overlap carried into the next chunk "
-    "puts table rows ahead of the repeated header, and can start inside a row "
-    "(after the '.' of a decimal cell)"
-)
-_TABLE_ROW_CASES = [
-    *(pytest.param(doc, 0, id=f"{doc.id}-overlap-off") for doc in _form("D")),
-    *(
-        pytest.param(
-            doc,
-            DEFAULT_CHUNK_OVERLAP_TOKENS,
-            id=f"{doc.id}-overlap-default",
-            marks=[pytest.mark.xfail(strict=True, reason=_CARRIED_ROWS)],
-        )
-        for doc in _form("D")
-    ),
-]
-
-
-@pytest.mark.parametrize(("doc", "overlap_tokens"), _TABLE_ROW_CASES)
-async def test_table_rows_are_whole_and_under_their_header(
-    doc: FormDoc, overlap_tokens: int
-) -> None:
-    ingested = await _ingest(doc, overlap_tokens=overlap_tokens)
+@pytest.mark.parametrize("doc", _params(_form("D")))
+async def test_table_rows_are_whole_and_under_their_header(doc: FormDoc) -> None:
+    # Holds with the default overlap of 0 (B-206 K-3). An overlap carried into
+    # the next chunk would put table rows ahead of the repeated header, and
+    # could start inside a row (after the '.' of a decimal cell).
+    ingested = await _ingest(doc)
     rows = {line for line in _lines(ingested.markdown) if line.startswith("|")}
     headers = _table_headers(ingested.markdown)
     runs = [run for chunk in ingested.chunks for run in _table_runs(chunk.content)]

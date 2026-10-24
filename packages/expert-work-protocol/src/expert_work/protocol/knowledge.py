@@ -23,8 +23,17 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 #: Default per-base chunking parameters (token-counted). A base may
 #: override them at creation to tune chunk granularity to its content.
-DEFAULT_CHUNK_MAX_TOKENS: Final = 512
-DEFAULT_CHUNK_OVERLAP_TOKENS: Final = 64
+#: B-206 K-3: 512 / 64 → 400 / 0 — chunks of 200~400 tokens are the measured
+#: middle ground (no chunk size wins everywhere; the context a long answer
+#: needs comes from the chunk's neighbours, not from a bigger chunk), and
+#: overlap only lowered precision in published measurements. 0 is a real
+#: value here, never a stand-in for "use the default".
+DEFAULT_CHUNK_MAX_TOKENS: Final = 400
+DEFAULT_CHUNK_OVERLAP_TOKENS: Final = 0
+
+#: The range a base's ``chunk_max_tokens`` may be set to (B-206 K-3).
+MIN_CHUNK_MAX_TOKENS: Final = 128
+MAX_CHUNK_MAX_TOKENS: Final = 1024
 
 #: A document title in a chunk's retrieval text is cut to this many
 #: characters: long, noisy titles hurt retrieval more than they help.

@@ -163,7 +163,8 @@ export function SettingsTab({ base, onSaved, readonly }: SettingsTabProps) {
             tooltip={t("knowledge_page.field_chunk_hint")}
           >
             <InputNumber
-              min={1}
+              min={128}
+              max={1024}
               style={{ width: "100%" }}
               aria-label={t("knowledge_page.field_chunk_max")}
             />

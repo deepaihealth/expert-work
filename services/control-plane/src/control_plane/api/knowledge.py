@@ -56,6 +56,8 @@ from expert_work.protocol import (
     DEFAULT_CHUNK_MAX_TOKENS,
     DEFAULT_CHUNK_OVERLAP_TOKENS,
     DEFAULT_RETRIEVAL_TOP_K,
+    MAX_CHUNK_MAX_TOKENS,
+    MIN_CHUNK_MAX_TOKENS,
     AuditAction,
     DocumentStatus,
     KnowledgeBase,
@@ -93,7 +95,9 @@ class _CreateBaseBody(BaseModel):
 
     name: str = Field(min_length=1, max_length=128)
     description: str | None = Field(default=None, max_length=2000)
-    chunk_max_tokens: int | None = Field(default=None, gt=0)
+    chunk_max_tokens: int | None = Field(
+        default=None, ge=MIN_CHUNK_MAX_TOKENS, le=MAX_CHUNK_MAX_TOKENS
+    )
     chunk_overlap_tokens: int | None = Field(default=None, ge=0)
     retrieval_top_k: int | None = Field(default=None, ge=1, le=50)
     retrieval_score_threshold: float | None = Field(default=None, ge=0.0, le=1.0)
@@ -112,7 +116,9 @@ class _UpdateBaseBody(BaseModel):
     """
 
     description: str | None = Field(default=None, max_length=2000)
-    chunk_max_tokens: int | None = Field(default=None, gt=0)
+    chunk_max_tokens: int | None = Field(
+        default=None, ge=MIN_CHUNK_MAX_TOKENS, le=MAX_CHUNK_MAX_TOKENS
+    )
     chunk_overlap_tokens: int | None = Field(default=None, ge=0)
     retrieval_top_k: int | None = Field(default=None, ge=1, le=50)
     retrieval_score_threshold: float | None = Field(default=None, ge=0.0, le=1.0)

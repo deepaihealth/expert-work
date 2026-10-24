@@ -197,6 +197,10 @@ class KnowledgeDocumentRow(Base):
     figure_hashes: Mapped[list[str] | None] = mapped_column(
         ARRAY(Text), nullable=True, deferred=True
     )
+    #: B-206 K-3 (migration ``0174``) — the chunking parameters the serving
+    #: chunks were cut with (``chunking.chunk_params_hash``); one that differs
+    #: from the base's current parameters is an old version to re-ingest.
+    chunk_params_hash: Mapped[str | None] = mapped_column(Text, nullable=True)
     size_bytes: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
     mime: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(

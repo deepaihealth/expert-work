@@ -178,9 +178,31 @@ async def test_create_base_rejects_overlap_not_below_max(setup: Setup) -> None:
     client, _ = setup
     resp = await client.post(
         "/v1/knowledge/bases",
-        json={"name": "bad", "chunk_max_tokens": 100, "chunk_overlap_tokens": 100},
+        json={"name": "bad", "chunk_max_tokens": 200, "chunk_overlap_tokens": 200},
     )
     assert resp.status_code == 400
+
+
+@pytest.mark.asyncio
+async def test_create_base_defaults_to_400_tokens_without_overlap(setup: Setup) -> None:
+    # B-206 K-3: the platform defaults; 0 overlap is stored as 0, not swapped for a default.
+    client, _ = setup
+    resp = await client.post("/v1/knowledge/bases", json={"name": "plain"})
+    assert resp.status_code == 201
+    assert (resp.json()["chunk_max_tokens"], resp.json()["chunk_overlap_tokens"]) == (400, 0)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("max_tokens", [127, 1025])
+async def test_chunk_size_outside_128_to_1024_is_rejected(setup: Setup, max_tokens: int) -> None:
+    client, _ = setup
+    created = await client.post(
+        "/v1/knowledge/bases", json={"name": "kb", "chunk_max_tokens": max_tokens}
+    )
+    assert created.status_code == 422
+    await client.post("/v1/knowledge/bases", json={"name": "ok"})
+    patched = await client.patch("/v1/knowledge/bases/ok", json={"chunk_max_tokens": max_tokens})
+    assert patched.status_code == 422
 
 
 @pytest.mark.asyncio
