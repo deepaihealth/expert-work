@@ -13,7 +13,9 @@ import pytest
 
 from control_plane.knowledge.chunking import (
     _CUT_LINE,
+    _CUT_OVERLAP_PERCENT,
     MIN_SEMANTIC_CHUNK_TOKENS,
+    PARENT_MAX_TOKENS,
     SHORT_SECTION_TOKENS,
     TextChunk,
     _cosine_distance,
@@ -21,6 +23,7 @@ from control_plane.knowledge.chunking import (
     _hard_split,
     _split_by_tokens,
     _tail_text,
+    chunk_markdown_parented,
     chunk_params_hash,
     configure_semantic_breaks,
     count_tokens,
@@ -936,15 +939,21 @@ def test_a_table_row_over_the_cap_repeats_its_leading_cells_on_every_piece() -> 
 
 def test_prose_cut_inside_a_paragraph_carries_the_sentence_before_the_cut() -> None:
     # Overlap only where a paragraph has to be cut (FastGPT / Unstructured):
-    # each piece after the first opens with the end of the piece before it.
+    # each piece after the first opens with the end of the piece before it —
+    # at most a share of the cap it was cut to: the chunk cap inside a parent,
+    # the parent cap where the paragraph was cut to parent size (B-206 K-1).
     prose = "".join(f"这是第 {i} 句完整的说明文字,内容比较长一些。" for i in range(160))
-    chunks = _chunk_markdown(prose, max_tokens=400, overlap_tokens=0, plain_text=True)
-    assert len(chunks) > 2
-    for before, after in pairwise(chunks):
+    parents = chunk_markdown_parented(prose, max_tokens=400, overlap_tokens=0, plain_text=True)
+    assert len(parents) > 1
+    pairs = [(pair, 400) for p in parents for pair in pairwise(p.children)]
+    pairs += [((a.children[-1], b.children[0]), PARENT_MAX_TOKENS) for a, b in pairwise(parents)]
+    assert len(pairs) > 2
+    for (before, after), cap in pairs:
         last = re.findall(r"[^。]+。", before.body)[-1]
         assert after.body.startswith("这是第")
-        assert last in after.body[: 3 * len(last)]
-    assert all(count_tokens(c.text) <= 400 for c in chunks)
+        carried = after.body[: after.body.index(last) + len(last)]
+        assert count_tokens(carried) <= cap * _CUT_OVERLAP_PERCENT // 100
+    assert all(count_tokens(c.text) <= 400 for p in parents for c in p.children)
 
 
 def test_tables_run_together_keep_their_own_headers() -> None:

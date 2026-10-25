@@ -16,7 +16,7 @@
 
 现在不成立、B-206 要修的标 ``xfail(strict=True)``:修好那天它变红,逼着把标记摘掉。
 B-206 K-3 之后另断言切块四条校验(WeKnora 同款)与长文档段长中位(不碎、不超上限);
-父段数等 K-1,见文末 TODO。
+B-206 K-1 的父段形状见文末。
 """
 
 from __future__ import annotations
@@ -30,13 +30,24 @@ from uuid import UUID, uuid4
 
 import pytest
 
-from control_plane.knowledge.chunking import count_tokens
+from control_plane.knowledge.chunking import (
+    PARENT_MAX_TOKENS,
+    SHORT_SECTION_TOKENS,
+    ParentChunk,
+    chunk_markdown_parented,
+    count_tokens,
+)
 from control_plane.knowledge.ingestion import (
     failure_code,
     ingest_document_bytes,
     shutdown_parse_pool,
 )
-from control_plane.knowledge.parsing import DocumentParseError, parse_document
+from control_plane.knowledge.parsing import (
+    DocumentParseError,
+    is_plain_text_file,
+    parse_document,
+    strip_lone_surrogates,
+)
 from control_plane.knowledge.recognition.clients import Reading
 from control_plane.knowledge.recognition.figure_markup import FIGURE_LABEL
 from control_plane.knowledge.recognition.figure_pipeline import FigureDescriber
@@ -56,6 +67,8 @@ from expert_work.protocol import (
     PageDecision,
     PageStats,
     PageStatus,
+    chunk_retrieval_text,
+    knowledge_document_title,
 )
 from orchestrator.llm import Embedder, FakeEmbedder
 from tests.knowledge_form_fixtures import (
@@ -514,7 +527,110 @@ async def test_mixed_pdf_scanned_page_is_read_in_place(doc: FormDoc, _parse_pool
 
 
 # ---------------------------------------------------------------------------
-# TODO(B-206 K-1): 父段 —— Ⓐ 父段对齐章节、Ⓑ Ⓔ 按字数窗口、Ⓒ 整篇一个父段(只有一个
-# 子段时不建父行)、Ⓓ 整表(带表头)为父段、Ⓕ 不适用。父行进库后 ``_ingest`` 只把可检索的
-# 子段交给上面的断言,父段数与父段长在这里断言。现在没有父段(chunk_type 全是 text)。
+# 父段(B-206 K-1):先切父段、再在父段里切子段 —— Ⓐ 父段对齐章节、Ⓑ Ⓔ 按字数窗口、
+# Ⓒ 整篇一个父段(只有一个子段时不建父行)、Ⓓ 整表(带表头)为父段;Ⓕ 没有文字,不适用。
+# 父行进库之前,父段由切块器按入库的参数直接切出,入库落的分段就是它们的子段。
 # ---------------------------------------------------------------------------
+
+_LEVELED_HEADING = re.compile(r"^(#{1,6})[ \t]+(.+?)[ \t]*$", re.MULTILINE)
+
+
+def _parented(doc: FormDoc) -> list[ParentChunk]:
+    """``doc``'s parents, cut with the arguments the upload path chunks it with."""
+    return chunk_markdown_parented(
+        strip_lone_surrogates(parse_document(doc.filename, doc.raw)),
+        max_tokens=DEFAULT_CHUNK_MAX_TOKENS,
+        overlap_tokens=DEFAULT_CHUNK_OVERLAP_TOKENS,
+        plain_text=is_plain_text_file(doc.filename),
+        doc_title=knowledge_document_title(doc.filename),
+    )
+
+
+def _parent_tokens(parent: ParentChunk, doc: FormDoc, body: str | None = None) -> int:
+    """A parent measured as a chunk is: title, heading path, body."""
+    text = parent.body if body is None else body
+    title = knowledge_document_title(doc.filename)
+    return count_tokens(chunk_retrieval_text(parent.heading_path, text, title))
+
+
+@pytest.mark.parametrize("doc", _params(TEXT_FORM_DOCS))
+async def test_the_stored_chunks_are_the_children_of_the_parents(doc: FormDoc) -> None:
+    ingested = await _ingest(doc)
+    children = [child for parent in _parented(doc) for child in parent.children]
+    assert [(c.content, tuple(c.heading_path)) for c in ingested.chunks] == [
+        (c.body, c.heading_path) for c in children
+    ]
+
+
+@pytest.mark.parametrize("doc", _params(TEXT_FORM_DOCS))
+def test_parents_hold_all_text_within_the_parent_cap(doc: FormDoc) -> None:
+    parents = _parented(doc)
+    assert all(_parent_tokens(parent, doc) <= PARENT_MAX_TOKENS for parent in parents)
+    texts = [_squash("".join(parent.heading_path) + parent.body) for parent in parents]
+    assert [u for u in doc.units if not any(_squash(u) in text for text in texts)] == []
+    for parent, text in zip(parents, texts, strict=True):
+        cells = [
+            cell for c in parent.children for line in _lines(c.body) for cell in line.split("|")
+        ]
+        assert [cell for cell in cells if _squash(cell) not in text] == []
+
+
+@pytest.mark.parametrize("doc", _params(_form("A")))
+def test_structured_parents_follow_chapters(doc: FormDoc) -> None:
+    # A level-1 / level-2 heading opens a new parent once the one before is at
+    # least half full: inside a parent one comes before its half — or opens a
+    # short end joined back (the empty headings closing a document).
+    markdown = parse_document(doc.filename, doc.raw)
+    chapters = {text for marks, text in _LEVELED_HEADING.findall(markdown) if len(marks) <= 2}
+    parents = _parented(doc)
+    assert all(parent.heading_path for parent in parents)
+    assert (len(parents) > 1) == (count_tokens(markdown) > PARENT_MAX_TOKENS)
+    for parent in parents:
+        paragraphs = parent.body.split("\n\n")
+        for index, paragraph in enumerate(paragraphs):
+            if paragraph in chapters:
+                before = _parent_tokens(parent, doc, "\n\n".join(paragraphs[:index]))
+                after = count_tokens("\n\n".join(paragraphs[index + 1 :]))
+                assert before < PARENT_MAX_TOKENS // 2 or after < SHORT_SECTION_TOKENS
+
+
+@pytest.mark.parametrize("doc", _params(_form("B") + _form("E")))
+def test_unstructured_parents_are_windows_by_size(doc: FormDoc) -> None:
+    parents = _parented(doc)
+    assert all(parent.heading_path == () for parent in parents)
+    markdown = parse_document(doc.filename, doc.raw)
+    assert (len(parents) > 1) == (count_tokens(markdown) > PARENT_MAX_TOKENS)
+    assert all(_parent_tokens(p, doc) >= PARENT_MAX_TOKENS // 2 for p in parents[:-1])
+
+
+@pytest.mark.parametrize("doc", _params(_form("E")))
+def test_dialogue_parents_hold_whole_utterances(doc: FormDoc) -> None:
+    utterances = set(doc.units)
+    cut = [line for p in _parented(doc) for line in _lines(p.body) if line not in utterances]
+    assert not cut
+
+
+@pytest.mark.parametrize("doc", _params(_form("C")))
+def test_a_short_document_is_one_parent_and_no_parent_row(doc: FormDoc) -> None:
+    [parent] = _parented(doc)
+    assert len(parent.children) == 1
+    assert parent.is_trivial
+
+
+@pytest.mark.parametrize("doc", _params(_form("D")))
+def test_a_table_parent_holds_rows_under_one_header(doc: FormDoc) -> None:
+    markdown = parse_document(doc.filename, doc.raw)
+    headers = _table_headers(markdown)
+    rows = [
+        line
+        for line in _lines(markdown)
+        if line.startswith("|") and line not in headers and not _TABLE_SEPARATOR.fullmatch(line)
+    ]
+    parents = _parented(doc)
+    runs = [run for parent in parents for run in _table_runs(parent.body)]
+    assert all(run[0] in headers and _TABLE_SEPARATOR.fullmatch(run[1]) for run in runs)
+    assert sorted(line for run in runs for line in run[2:]) == sorted(rows)  # each row once
+    # A table within the parent cap is one parent's, whole.
+    tables = ["\n".join(run) for run in _table_runs(markdown)]
+    small = [table for table in tables if count_tokens(table) < PARENT_MAX_TOKENS - 100]
+    assert all(any(table in parent.body for parent in parents) for table in small)

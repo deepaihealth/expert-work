@@ -26,6 +26,12 @@ changes rather than at an arbitrary size point — but never right after a
 fragment shorter than :data:`MIN_SEMANTIC_CHUNK_TOKENS` (a title or question
 line, a page number, an image), which joins the chunk that follows. See
 ``docs/streams/STREAM-J-DESIGN.md`` § 12.
+
+Chunks are the children of **parent chunks** (B-206 K-1,
+:func:`chunk_markdown_parented`): a search matches a chunk and returns its
+parent, a run of whole blocks within :data:`PARENT_MAX_TOKENS` that follows
+chapters where it can. Parents are cut first, chunks inside them — a chunk
+never crosses a parent.
 """
 
 from __future__ import annotations
@@ -35,7 +41,7 @@ import math
 import re
 import statistics
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from itertools import pairwise
 from typing import Literal
 from uuid import UUID
@@ -166,11 +172,25 @@ SHORT_SECTION_TOKENS = 50
 #: 25, 50, 100), so the requests sent stay the same.
 SEMANTIC_EMBED_WINDOW = 200
 
+#: Cap of a parent chunk (B-206 K-1), measured as a child is — document title,
+#: breadcrumb and body together. A constant for now, not a base setting: a
+#: parent is what a search returns, the size answers were found to need.
+PARENT_MAX_TOKENS = 1024
+
+#: Tokens under the parent cap within which a run's size is measured rather
+#: than estimated (:meth:`_ParentCut._grown`).
+_ESTIMATE_SLACK = 16
+
+#: Headings of this level or above (``#``, ``##``) are chapters: a new one
+#: closes a parent that is at least half full, so parents follow chapters
+#: where a document has them (B-206 K-1).
+_CHAPTER_LEVEL = 2
+
 #: Version of the chunking rules, part of every :func:`chunk_params_hash`.
 #: Bump it with a change that cuts the same text differently under the same
 #: parameters, so documents chunked by the old rules show as an old version
-#: to re-ingest (B-206 K-3).
-CHUNKER_VERSION = "k3"
+#: to re-ingest (B-206 K-3; "k3k1": children cut inside parents, K-1).
+CHUNKER_VERSION = "k3k1"
 
 #: Whether an ingest also splits sections at topic shifts
 #: (:func:`chunk_markdown_semantic`, ``Settings.knowledge_semantic_breaks``).
@@ -192,13 +212,16 @@ def semantic_breaks_enabled() -> bool:
     return _semantic_breaks_on
 
 
-def chunk_params_hash(*, max_tokens: int, overlap_tokens: int) -> str:
+def chunk_params_hash(
+    *, max_tokens: int, overlap_tokens: int, parent_max_tokens: int = PARENT_MAX_TOKENS
+) -> str:
     """Fingerprint of the chunking a document's chunks come from: the rules
-    (:data:`CHUNKER_VERSION`), the base's size and overlap, and whether topic
-    shifts split. A document whose stored fingerprint differs from its base's
-    current one was cut by other parameters and is due for a re-ingest."""
+    (:data:`CHUNKER_VERSION`), the base's size and overlap, the parent cap, and
+    whether topic shifts split. A document whose stored fingerprint differs
+    from its base's current one was cut by other parameters and is due for a
+    re-ingest."""
     mode = "semantic" if _semantic_breaks_on else "structural"
-    key = f"{CHUNKER_VERSION}|{max_tokens}|{overlap_tokens}|{mode}"
+    key = f"{CHUNKER_VERSION}|{max_tokens}|{overlap_tokens}|{parent_max_tokens}|{mode}"
     return hashlib.sha256(key.encode("ascii")).hexdigest()[:16]
 
 
@@ -226,11 +249,14 @@ class _Heading:
 
 @dataclass(frozen=True)
 class _Block:
-    """One top-level Markdown block, tagged with its section path."""
+    """One top-level Markdown block, tagged with its section path and the
+    ordinal of the level-1 / level-2 heading it sits under (``chapter``: a new
+    one may close a parent early, B-206 K-1)."""
 
     kind: Literal["content", "table"]
     text: str
     heading_trail: tuple[str, ...]
+    chapter: int = 0
 
 
 @dataclass(frozen=True)
@@ -246,6 +272,27 @@ class TextChunk:
         """Breadcrumb + body — what is embedded and keyword-indexed
         (:func:`expert_work.protocol.chunk_retrieval_text`)."""
         return chunk_retrieval_text(self.heading_path, self.body)
+
+
+@dataclass(frozen=True)
+class ParentChunk:
+    """One parent chunk (B-206 K-1): what a search returns when one of its
+    ``children`` — the chunks searched — matches. Its ``body`` is a run of
+    whole blocks of the document, each written once, with the headings the
+    run enters written in front of their text; its ``heading_path`` is its
+    first child's."""
+
+    body: str
+    heading_path: tuple[str, ...]
+    children: tuple[TextChunk, ...]
+
+    @property
+    def is_trivial(self) -> bool:
+        """Whether the parent is just its one child (same body, same heading
+        path): no parent row is stored then, the child stands for itself."""
+        return len(self.children) == 1 and self.children[0] == TextChunk(
+            body=self.body, heading_path=self.heading_path
+        )
 
 
 @dataclass
@@ -300,7 +347,8 @@ def chunk_markdown(
     doc_title: str | None = None,
 ) -> list[TextChunk]:
     """Slice ``markdown`` into retrieval chunks — the structural chunker (no
-    semantic refinement).
+    semantic refinement): the children of :func:`chunk_markdown_parented`, in
+    document order.
 
     ``max_tokens`` bounds a chunk's whole embedded text — ``doc_title`` (the
     title its retrieval text will carry), breadcrumb and body together;
@@ -309,13 +357,57 @@ def chunk_markdown(
     text, not Markdown (a ``.txt`` file). Returns chunk texts in document
     order; empty input yields an empty list.
     """
-    return _pack_blocks(
-        _blocks(markdown, plain_text=plain_text),
+    parents = chunk_markdown_parented(
+        markdown,
         max_tokens=max_tokens,
         overlap_tokens=overlap_tokens,
-        semantic_breaks=frozenset(),
+        plain_text=plain_text,
         doc_title=doc_title,
     )
+    return [child for parent in parents for child in parent.children]
+
+
+def chunk_markdown_parented(
+    markdown: str,
+    *,
+    max_tokens: int,
+    overlap_tokens: int,
+    plain_text: bool = False,
+    doc_title: str | None = None,
+    parent_max_tokens: int = PARENT_MAX_TOKENS,
+) -> list[ParentChunk]:
+    """``markdown`` as parent chunks, each holding its retrieval chunks (B-206
+    K-1). Parents are cut first and children inside them (Dify's order), so a
+    child never crosses a parent and a parent repeats nothing its children
+    repeat — a table header, a question line, an overlap.
+
+    A parent is a run of whole blocks within ``parent_max_tokens``, measured
+    as a child is (title, breadcrumb and body): the whole document when it
+    fits; else the run closes where the next block does not fit, or at a
+    level-1 / level-2 heading once at least half full, and never right after a
+    line introducing the next block of its section (that line opens the next
+    parent with it). A block over the parent cap on its own is cut to parent
+    size first — prose where a cut does least harm, a table by rows under its
+    header, a long row with its leading cells. The children are what
+    :func:`chunk_markdown`'s rules make of each parent's blocks."""
+    cut = _ParentCut(
+        max_tokens=max_tokens, parent_max_tokens=parent_max_tokens, doc_title=doc_title
+    )
+    written: set[tuple[str, ...]] = set()
+    return [
+        cut.parent(
+            group,
+            _pack_blocks(
+                group,
+                max_tokens=max_tokens,
+                overlap_tokens=overlap_tokens,
+                semantic_breaks=frozenset(),
+                doc_title=doc_title,
+                written=written,
+            ),
+        )
+        for group in cut.groups(_blocks(markdown, plain_text=plain_text))
+    ]
 
 
 async def chunk_markdown_semantic(
@@ -330,29 +422,74 @@ async def chunk_markdown_semantic(
     memo: BreakMemo | None = None,
 ) -> list[TextChunk]:
     """Like :func:`chunk_markdown`, but additionally splits a section at
-    *topic shifts* — adjacent blocks whose embeddings are far apart.
+    *topic shifts* — adjacent blocks whose embeddings are far apart: the
+    children of :func:`chunk_markdown_semantic_parented`, in document order.
 
     This refines the weak spot of purely structural chunking: a long
     heading-less section otherwise sliced at arbitrary size points is
     instead split where its content actually changes subject. ``memo``
     reuses earlier decisions (see :class:`BreakMemo`).
     """
+    parents = await chunk_markdown_semantic_parented(
+        markdown,
+        max_tokens=max_tokens,
+        overlap_tokens=overlap_tokens,
+        embedder=embedder,
+        tenant_id=tenant_id,
+        plain_text=plain_text,
+        doc_title=doc_title,
+        memo=memo,
+    )
+    return [child for parent in parents for child in parent.children]
+
+
+async def chunk_markdown_semantic_parented(
+    markdown: str,
+    *,
+    max_tokens: int,
+    overlap_tokens: int,
+    embedder: Embedder,
+    tenant_id: UUID,
+    plain_text: bool = False,
+    doc_title: str | None = None,
+    memo: BreakMemo | None = None,
+    parent_max_tokens: int = PARENT_MAX_TOKENS,
+) -> list[ParentChunk]:
+    """The parents of :func:`chunk_markdown_parented`, their children also
+    split at topic shifts (:func:`chunk_markdown_semantic`). A shift only
+    splits inside a parent: parents are cut by structure and size alone."""
+    cut = _ParentCut(
+        max_tokens=max_tokens, parent_max_tokens=parent_max_tokens, doc_title=doc_title
+    )
+    groups = cut.groups(_blocks(markdown, plain_text=plain_text))
     # Oversized blocks (a whole spreadsheet sheet parses to one table block —
     # up to 85k characters in real material) are cut to the chunk cap *before*
     # they are embedded for topic detection, so no single embedding input ever
     # exceeds the cap (the embedding API rejects inputs past its token limit
     # and the whole document would fail).
-    blocks = _presplit_blocks(_blocks(markdown, plain_text=plain_text), max_tokens)
+    split = [_presplit_blocks(group, max_tokens) for group in groups]
+    blocks = [block for group in split for block in group]
     semantic_breaks: frozenset[int] = frozenset()
     if len(blocks) >= 2:
         semantic_breaks = await _semantic_breaks(blocks, embedder, tenant_id, memo)
-    return _pack_blocks(
-        blocks,
-        max_tokens=max_tokens,
-        overlap_tokens=overlap_tokens,
-        semantic_breaks=semantic_breaks,
-        doc_title=doc_title,
-    )
+    parents: list[ParentChunk] = []
+    written: set[tuple[str, ...]] = set()
+    start = 0  # index in the document of the parent's first block
+    for group, pieces in zip(groups, split, strict=True):
+        breaks = frozenset(
+            index for index in range(1, len(pieces)) if start + index in semantic_breaks
+        )
+        start += len(pieces)
+        children = _pack_blocks(
+            pieces,
+            max_tokens=max_tokens,
+            overlap_tokens=overlap_tokens,
+            semantic_breaks=breaks,
+            doc_title=doc_title,
+            written=written,
+        )
+        parents.append(cut.parent(group, children))
+    return parents
 
 
 def structural_chunk_count(
@@ -362,21 +499,306 @@ def structural_chunk_count(
     overlap_tokens: int,
     plain_text: bool = False,
     doc_title: str | None = None,
+    parent_max_tokens: int = PARENT_MAX_TOKENS,
 ) -> int:
     """How many chunks :func:`chunk_markdown_semantic` makes with no topic
-    shift at all — the same blocks, no embedding call, nothing billed. Topic
-    shifts only split further, so this is what a document costs at least
-    (B-214 refuses a document over the chunk cap before it is embedded)."""
-    blocks = _presplit_blocks(_blocks(markdown, plain_text=plain_text), max_tokens)
-    return len(
-        _pack_blocks(
-            blocks,
-            max_tokens=max_tokens,
-            overlap_tokens=overlap_tokens,
-            semantic_breaks=frozenset(),
-            doc_title=doc_title,
-        )
+    shift at all — the same parents and blocks, no embedding call, nothing
+    billed. Topic shifts only split further, so this is what a document costs
+    at least (B-214 refuses a document over the chunk cap before it is
+    embedded). Children only: a parent is stored, never embedded."""
+    cut = _ParentCut(
+        max_tokens=max_tokens, parent_max_tokens=parent_max_tokens, doc_title=doc_title
     )
+    written: set[tuple[str, ...]] = set()
+    return sum(
+        len(
+            _pack_blocks(
+                _presplit_blocks(group, max_tokens),
+                max_tokens=max_tokens,
+                overlap_tokens=overlap_tokens,
+                semantic_breaks=frozenset(),
+                doc_title=doc_title,
+                written=written,
+            )
+        )
+        for group in cut.groups(_blocks(markdown, plain_text=plain_text))
+    )
+
+
+class _ParentCut:
+    """The parents of one document (B-206 K-1): which blocks each holds
+    (:meth:`groups`) and the parent a run of blocks and its children make
+    (:meth:`parent`).
+
+    A parent's breadcrumb is its first child's: its first section's, or — a
+    short first section without one joins the next (:func:`_join`) — the
+    first section's that has one. A run is measured with the larger of the
+    two, so the parent holds within the cap either way."""
+
+    def __init__(self, *, max_tokens: int, parent_max_tokens: int, doc_title: str | None) -> None:
+        self._max_tokens = max_tokens
+        self._cap = parent_max_tokens
+        self._doc_title = doc_title
+        self._budgets: dict[tuple[str, ...], tuple[range, int]] = {}
+        self._headings: dict[str, int] = {}
+        self._prefixes: dict[tuple[str, ...], int] = {}
+        self._texts: dict[str, int] = {}  # tokens of a block's text
+
+    def groups(self, blocks: list[_Block]) -> list[list[_Block]]:
+        """``blocks`` in runs, one run per parent, in document order."""
+        if not blocks:
+            return []
+        if self._fits_whole(blocks):
+            return [blocks]
+        groups: list[list[_Block]] = []
+        current: list[_Block] = []
+        tokens = 0  # the parent ``current`` makes, measured (:meth:`_size`)
+
+        def close() -> None:
+            nonlocal current, tokens
+            if current and groups and self._short(current):
+                # Too short to stand alone (the empty headings ending a
+                # document, after a new chapter closed the parent before):
+                # it joins that parent when it fits, as a short section joins
+                # the chunk before it (:func:`_join_short_sections`).
+                joined = [*groups[-1], *current]
+                if self._size(joined) <= self._cap:
+                    groups[-1] = joined
+                    current = []
+            if current:
+                groups.append(current)
+            current, tokens = [], 0
+
+        for block in blocks:
+            if current and block.chapter != current[-1].chapter and 2 * tokens >= self._cap:
+                close()  # a new chapter: parents follow chapters where they can
+            if current:
+                size = self._grown(current, tokens, block)
+                if size <= self._cap:
+                    current.append(block)
+                    tokens = size
+                    continue
+            lead = current.pop() if current and self._leads(current[-1], block) else None
+            if lead is not None:
+                # The block opens the next parent with the line introducing
+                # it — every parent its pieces fill, when it has to be cut.
+                for piece, size in self._pieces([lead], block):
+                    close()
+                    current, tokens = [lead, piece], size
+                continue
+            carried = self._carried(current, block)
+            if carried:
+                # A short end of a section opens the next parent with the
+                # block, as a short section joins the chunk after it.
+                del current[-len(carried) :]
+                close()
+                (first, size), *rest = self._pieces(carried, block)
+                current, tokens = [*carried, first], size
+                pieces = [pair for piece, _ in rest for pair in self._pieces([], piece)]
+            else:
+                pieces = self._pieces([], block)
+            for piece, size in pieces:
+                if current and piece is not block:  # a piece may fit where the block did not
+                    beside = self._grown(current, tokens, piece)
+                    if beside <= self._cap:
+                        current.append(piece)
+                        tokens = beside
+                        continue
+                close()
+                current, tokens = [piece], size
+        close()
+        return groups
+
+    def parent(self, blocks: list[_Block], children: list[TextChunk]) -> ParentChunk:
+        """The parent of the run ``blocks``, cut into ``children``."""
+        path = children[0].heading_path if children else ()
+        source = next(
+            (i for i, block in enumerate(blocks) if path and self._shown(block) == path), None
+        )
+        return ParentChunk(
+            body=self._render(blocks, source)[1], heading_path=path, children=tuple(children)
+        )
+
+    def _fits_whole(self, blocks: list[_Block]) -> bool:
+        total = 0
+        for block in blocks:
+            total += self._text_tokens(block)
+            if total > self._cap:
+                return False
+        return self._size(blocks) <= self._cap
+
+    def _short(self, blocks: list[_Block]) -> bool:
+        total = 0
+        for block in blocks:
+            total += self._text_tokens(block)
+            if total >= SHORT_SECTION_TOKENS:
+                return False
+        return True
+
+    def _carried(self, run: list[_Block], block: _Block) -> list[_Block]:
+        """The end of ``run`` that opens the next parent with ``block`` rather
+        than ending this one: the run's last blocks of one section, under
+        :data:`SHORT_SECTION_TOKENS` together — ``block``'s section, or one a
+        chunk may share with it (:func:`_may_join`) — as a short section joins
+        the chunk after it (:func:`_join_short_sections`). None when the run
+        is nothing else: a short run joins the parent before (``close``)."""
+        if not run:
+            return []
+        trail = run[-1].heading_trail
+        if trail != block.heading_trail and not _may_join(trail, block.heading_trail):
+            return []
+        start, total = len(run), 0
+        while start and run[start - 1].heading_trail == trail:
+            total += self._text_tokens(run[start - 1])
+            if total >= SHORT_SECTION_TOKENS:
+                return []
+            start -= 1
+        return run[start:] if start else []
+
+    def _leads(self, lead: _Block, block: _Block) -> bool:
+        """Whether ``lead`` is a line introducing ``block`` in its section
+        (:func:`_is_lead_in`, judged against the section's chunk budget as
+        :func:`_pack_blocks` judges it)."""
+        trail = lead.heading_trail
+        return trail == block.heading_trail and _is_lead_in(lead.text, self._budget(trail)[1])
+
+    def _pieces(self, frame: list[_Block], block: _Block) -> list[tuple[_Block, int]]:
+        """``block`` whole if it fits a parent after ``frame`` (nothing, or the
+        line introducing it), else cut by the chunk rules (:func:`_prepare_block`)
+        into pieces that each do — each with the size of the parent ``frame``
+        and it make. Cut to the room the measured overrun leaves, so the
+        title, breadcrumb, headings and joins the parent spends on top of the
+        text are counted as they are."""
+        size = self._grown(frame, self._size(frame) if frame else 0, block)
+        over = size - self._cap
+        if over <= 0:
+            return [(block, size)]
+        room = self._text_tokens(block) - over - _JOIN_TOKENS
+        if room < self._cap // 4:
+            # What surrounds the block fills the parent (a breadcrumb of
+            # headings the length of a page): it stays whole, over the cap,
+            # rather than cut into slivers.
+            return [(block, size)]
+        return [
+            pair
+            for text in _prepare_block(block, room)
+            for pair in self._pieces(frame, replace(block, text=text))
+        ]
+
+    def _grown(self, blocks: Sequence[_Block], tokens: int, block: _Block) -> int:
+        """The size of the parent ``blocks`` (of size ``tokens``) and ``block``
+        after them make. Estimated well under the cap where the breadcrumb is
+        known (:meth:`_estimate`); measured otherwise, so a run closes on
+        measured sizes."""
+        estimate = self._estimate(blocks, tokens, block)
+        if estimate is not None and estimate <= self._cap - _ESTIMATE_SLACK:
+            return estimate
+        return self._size([*blocks, block])
+
+    def _estimate(self, blocks: Sequence[_Block], tokens: int, block: _Block) -> int | None:
+        """``tokens`` plus what ``block`` adds — the headings it enters, its
+        text and the joins — which the joined text does not exceed; None when
+        ``block`` may change the breadcrumb (the first one in the run that has
+        one)."""
+        trail = block.heading_trail
+        if not blocks:
+            kept = self._budget(trail)[0]
+            entered = [heading for depth, heading in enumerate(trail) if depth not in kept]
+            tokens = self._prefix_tokens(trail)
+        elif (
+            trail == blocks[-1].heading_trail
+            or not self._shown(block)
+            or any(self._shown(earlier) for earlier in blocks)
+        ):
+            entered = list(trail[_shared_depth(blocks[-1].heading_trail, trail) :])
+        else:
+            return None
+        added = sum(self._heading_tokens(heading) + _JOIN_TOKENS for heading in entered)
+        return tokens + added + self._text_tokens(block) + _JOIN_TOKENS
+
+    def _prefix_tokens(self, trail: tuple[str, ...]) -> int:
+        """Tokens of the title and breadcrumb in front of a parent opening
+        with a block of ``trail``."""
+        tokens = self._prefixes.get(trail)
+        if tokens is None:
+            kept = self._budget(trail)[0]
+            prefix = chunk_retrieval_text(trail[kept.start : kept.stop], "", self._doc_title)
+            tokens = self._prefixes[trail] = count_tokens(prefix)
+        return tokens
+
+    def _heading_tokens(self, heading: str) -> int:
+        tokens = self._headings.get(heading)
+        if tokens is None:
+            tokens = self._headings[heading] = count_tokens(heading)
+        return tokens
+
+    def _text_tokens(self, block: _Block) -> int:
+        tokens = self._texts.get(block.text)
+        if tokens is None:
+            tokens = self._texts[block.text] = count_tokens(block.text)
+        return tokens
+
+    def _size(self, blocks: Sequence[_Block]) -> int:
+        """Tokens of the parent ``blocks`` make — title, breadcrumb, headings
+        and body — with the larger of the breadcrumbs it may carry."""
+        source = next((i for i, block in enumerate(blocks) if self._shown(block)), None)
+        size = self._tokens(blocks, source)
+        if source:  # a later section's breadcrumb: the parent may carry none
+            size = max(size, self._tokens(blocks, None))
+        return size
+
+    def _tokens(self, blocks: Sequence[_Block], source: int | None) -> int:
+        path, body = self._render(blocks, source)
+        return count_tokens(chunk_retrieval_text(path, body, self._doc_title))
+
+    def _render(self, blocks: Sequence[_Block], source: int | None) -> tuple[tuple[str, ...], str]:
+        """Breadcrumb and body of a parent of ``blocks`` that carries the
+        breadcrumb of ``blocks[source]`` (none when ``source`` is None). The
+        body is the blocks' text with every heading the run enters written in
+        front of the first text under it, save those the breadcrumb shows — the
+        headings a child writes into its body too (:func:`_pack_blocks`,
+        :func:`_join`)."""
+        path: tuple[str, ...] = ()
+        shown: set[tuple[str, ...]] = set()  # on the breadcrumb, not yet entered
+        if source is not None:
+            trail = blocks[source].heading_trail
+            kept = self._budget(trail)[0]
+            path = trail[kept.start : kept.stop]
+            shown = {trail[: depth + 1] for depth in kept}
+        parts: list[str] = []
+        previous: tuple[str, ...] | None = None
+        for block in blocks:
+            trail = block.heading_trail
+            if trail != previous:
+                start = 0 if previous is None else _shared_depth(previous, trail)
+                for depth in range(start, len(trail)):
+                    if trail[: depth + 1] in shown:
+                        shown.discard(trail[: depth + 1])
+                    else:
+                        parts.append(trail[depth])
+                previous = trail
+            parts.append(block.text)
+        return path, "\n\n".join(parts)
+
+    def _shown(self, block: _Block) -> tuple[str, ...]:
+        """The breadcrumb the chunks of ``block``'s section carry."""
+        kept = self._budget(block.heading_trail)[0]
+        return block.heading_trail[kept.start : kept.stop]
+
+    def _budget(self, trail: tuple[str, ...]) -> tuple[range, int]:
+        budget = self._budgets.get(trail)
+        if budget is None:
+            budget = _section_budget(trail, self._doc_title, self._max_tokens)
+            self._budgets[trail] = budget
+        return budget
+
+
+def _shared_depth(first: tuple[str, ...], second: tuple[str, ...]) -> int:
+    """How many outer headings two heading trails share."""
+    shared = 0
+    while shared < min(len(first), len(second)) and first[shared] == second[shared]:
+        shared += 1
+    return shared
 
 
 def _pack_blocks(
@@ -386,6 +808,7 @@ def _pack_blocks(
     overlap_tokens: int,
     semantic_breaks: frozenset[int],
     doc_title: str | None = None,
+    written: set[tuple[str, ...]] | None = None,
 ) -> list[TextChunk]:
     """Pack blocks into chunks. Flush on a heading change, on a
     ``semantic_breaks`` index (a topic shift) once the chunk holds
@@ -398,7 +821,11 @@ def _pack_blocks(
     block (:func:`_is_lead_in`, a question above its answer) never ends a
     chunk: it opens the next one with that block, and every further piece of
     a block cut after it repeats it. A section too short to stand on its own
-    then joins a neighbouring chunk (:func:`_join_short_sections`)."""
+    then joins a neighbouring chunk (:func:`_join_short_sections`).
+
+    ``written`` holds the headings whose text the chunks of earlier parents
+    of the document already hold (B-206 K-1) and takes those written here: a
+    heading opens one chunk's body in the document, not one per parent."""
     sections = [_Section(())]
     trail: tuple[str, ...] = ()
     kept, budget = _section_budget(trail, doc_title, max_tokens)
@@ -408,7 +835,8 @@ def _pack_blocks(
     reserve = overlap_tokens + _JOIN_TOKENS if overlap_tokens > 0 else 0
     buffer: list[str] = []
     buffer_tokens = 0
-    written: set[tuple[str, ...]] = set()  # headings whose text went into a body
+    if written is None:
+        written = set()  # headings whose text went into a body
 
     def flush(*, carry_overlap: bool) -> None:
         nonlocal buffer, buffer_tokens
@@ -634,11 +1062,12 @@ def _parse_blocks(markdown: str) -> list[_Block]:
     blocks: list[_Block] = []
     trail_stack: list[_Heading] = []
     covered = 0  # lines before this index are already in a block or a heading
+    chapter = 0  # level-1 / level-2 headings opened so far
 
     def emit(kind: Literal["content", "table"], text: str) -> None:
         for heading in trail_stack:
             heading.used = True
-        blocks.append(_Block(kind, text, tuple(h.text for h in trail_stack)))
+        blocks.append(_Block(kind, text, tuple(h.text for h in trail_stack), chapter))
 
     def keep(upto: int) -> None:
         text = "\n".join(lines[covered:upto]).strip()
@@ -663,6 +1092,8 @@ def _parse_blocks(markdown: str) -> list[_Block]:
             if len(text) <= _MAX_HEADING_CHARS:
                 level = int(token.tag[1:])
                 close_sections(level)
+                if level <= _CHAPTER_LEVEL:
+                    chapter += 1
                 trail_stack.append(_Heading(level, text))
                 continue
         block_text = "\n".join(lines[start:end]).strip()
@@ -706,7 +1137,7 @@ def _presplit_blocks(blocks: list[_Block], max_tokens: int) -> list[_Block]:
     """Cut every block over ``max_tokens`` into cap-sized pieces that keep its
     kind and heading trail; blocks within the cap pass through untouched."""
     return [
-        _Block(block.kind, piece, block.heading_trail)
+        replace(block, text=piece)
         for block in blocks
         for piece in _prepare_block(block, max_tokens)
     ]
