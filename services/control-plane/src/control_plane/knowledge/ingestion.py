@@ -35,7 +35,7 @@ import logging
 import multiprocessing
 import weakref
 from array import array
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Collection, Sequence
 from concurrent.futures import Executor, ProcessPoolExecutor
 from concurrent.futures.process import BrokenProcessPool
 from datetime import UTC, datetime
@@ -46,9 +46,10 @@ import httpx
 from control_plane.knowledge.break_cache import load_break_memo, store_break_memo
 from control_plane.knowledge.chunk_rows import ChunkRows, compact
 from control_plane.knowledge.chunking import (
-    TextChunk,
-    chunk_markdown,
-    chunk_markdown_semantic,
+    PARENT_MAX_TOKENS,
+    ParentChunk,
+    chunk_markdown_parented,
+    chunk_markdown_semantic_parented,
     chunk_params_hash,
     semantic_breaks_enabled,
     structural_chunk_count,
@@ -81,6 +82,7 @@ from expert_work.persistence import KnowledgeStore
 from expert_work.persistence.knowledge.base import ClaimedIngestion
 from expert_work.persistence.rls import current_tenant_id_var
 from expert_work.protocol import (
+    ChunkType,
     DocumentStatus,
     IngestErrorCode,
     IngestStage,
@@ -549,7 +551,8 @@ async def ingest_markdown(
     plain_text: bool = False,
     usage: IngestUsageRecorder | None = None,
 ) -> int:
-    """Chunk → embed → store already-parsed Markdown; return the chunk count.
+    """Chunk → embed → store already-parsed Markdown; return the chunk count
+    (the chunks searched — parent rows are not counted).
 
     The post-parse half of :func:`ingest_document_bytes`, exposed so a caller
     that parses elsewhere (the eval runner, an OCR path) still runs the exact
@@ -564,6 +567,10 @@ async def ingest_markdown(
     embedding model) instead of being embedded again. ``plain_text`` chunks
     the text as plain text, not Markdown (a ``.txt`` file). ``usage`` bills
     the embedding calls to the tenant (B-209 §5.8, ``knowledge_ingest``).
+
+    B-206 K-1: the chunks are cut inside parent chunks, and each parent that
+    is more than its one chunk is stored as a ``parent`` row next to them
+    (never embedded; see :class:`~control_plane.knowledge.chunk_rows.ChunkRows`).
     """
     check_parsed_size(markdown)
     model_key, pinned = await pin_embedder(embedder, tenant_id=tenant_id)
@@ -603,7 +610,11 @@ async def _chunk_embed_store(
     stage_args = {"tenant_id": tenant_id, "document_id": document_id, "generation": generation}
     await _advance(store, stage=IngestStage.CHUNKING, **stage_args)
     text = strip_lone_surrogates(markdown)
-    sizes = {"max_tokens": chunk_max_tokens, "overlap_tokens": chunk_overlap_tokens}
+    sizes = {
+        "max_tokens": chunk_max_tokens,
+        "overlap_tokens": chunk_overlap_tokens,
+        "parent_max_tokens": PARENT_MAX_TOKENS,
+    }
     params_hash = chunk_params_hash(**sizes)
     if semantic_breaks_enabled():
         # B-214: memory follows the chunk count. Refused before anything is
@@ -614,7 +625,7 @@ async def _chunk_embed_store(
         )
         cache = {"tenant_id": tenant_id, "document_id": document_id, "model_key": model_key}
         memo = await load_break_memo(store, **cache)
-        pieces = await chunk_markdown_semantic(
+        parents = await chunk_markdown_semantic_parented(
             text,
             **sizes,
             embedder=retrying,
@@ -626,9 +637,12 @@ async def _chunk_embed_store(
         await store_break_memo(store, **cache, memo=memo)
     else:
         # B-206 K-3: structure and size only — nothing is embedded to chunk.
-        pieces = chunk_markdown(text, **sizes, plain_text=plain_text, doc_title=doc_title)
-    ensure_chunk_count(len(pieces))
-    if not pieces:
+        parents = chunk_markdown_parented(text, **sizes, plain_text=plain_text, doc_title=doc_title)
+    # The chunks searched (and embedded) are what is capped and weighed; a
+    # parent row holds text the chunks already hold, no vector.
+    chunk_count = sum(len(parent.children) for parent in parents)
+    ensure_chunk_count(chunk_count)
+    if not chunk_count:
         _ensure_written(
             await store.replace_chunks(
                 tenant_id=tenant_id,
@@ -642,11 +656,11 @@ async def _chunk_embed_store(
         return 0
     # Chunked outside the budget (that holds the text and one window of block
     # vectors); embedded and stored inside it, weighed by its chunks.
-    async with admitted(len(markdown), len(pieces)):
+    async with admitted(len(markdown), chunk_count):
         return await _embed_store(
             store,
             retrying,
-            pieces=pieces,
+            parents=parents,
             tenant_id=tenant_id,
             document_id=document_id,
             kb_id=kb_id,
@@ -661,7 +675,7 @@ async def _embed_store(
     store: KnowledgeStore,
     retrying: Embedder,
     *,
-    pieces: Sequence[TextChunk],
+    parents: Sequence[ParentChunk],
     tenant_id: UUID,
     document_id: UUID,
     kb_id: UUID,
@@ -672,6 +686,8 @@ async def _embed_store(
 ) -> int:
     stage_args = {"tenant_id": tenant_id, "document_id": document_id, "generation": generation}
     await _advance(store, stage=IngestStage.EMBEDDING, **stage_args)
+    # Only the chunks are embedded; a parent is stored for reading.
+    pieces = [child for parent in parents for child in parent.children]
     texts = [chunk_retrieval_text(piece.heading_path, piece.body, doc_title) for piece in pieces]
     hashes = [content_hash(text) for text in texts]
     vectors = await _vectors_for(
@@ -684,7 +700,7 @@ async def _embed_store(
         model_key=model_key,
     )
     chunks = ChunkRows(
-        pieces=pieces,
+        parents=parents,
         hashes=hashes,
         vectors=vectors,
         tenant_id=tenant_id,
@@ -704,7 +720,7 @@ async def _embed_store(
         ),
         document_id,
     )
-    return len(chunks)
+    return len(pieces)
 
 
 async def _vectors_for(
@@ -1082,6 +1098,12 @@ class KnowledgeIngestionRunner:
         existing = await self._collect_chunks(tenant_id=tenant_id, document_id=document_id)
         if not existing:
             return
+        # B-206 K-1: the parent rows have no vector to rebuild, but the swap
+        # replaces every row of the document — they go back as they are, so
+        # each chunk's ``parent_chunk_id`` still finds its parent.
+        parents = await self._collect_chunks(
+            tenant_id=tenant_id, document_id=document_id, chunk_types={ChunkType.PARENT}
+        )
         # The retrieval text (title + breadcrumb + body) is what the vectors
         # encode.
         texts = [chunk.retrieval_text for chunk in existing]
@@ -1098,19 +1120,31 @@ class KnowledgeIngestionRunner:
         written = await self._store.replace_chunks(
             tenant_id=tenant_id,
             document_id=document_id,
-            chunks=rebuilt,
+            chunks=[*parents, *rebuilt],
             generation=document.ingest_generation,
             expect_status=DocumentStatus.READY,
         )
         if not written:
             logger.info("knowledge.reindex_document_superseded document=%s", document_id)
 
-    async def _collect_chunks(self, *, tenant_id: UUID, document_id: UUID) -> list[KnowledgeChunk]:
+    async def _collect_chunks(
+        self,
+        *,
+        tenant_id: UUID,
+        document_id: UUID,
+        chunk_types: Collection[ChunkType] | None = None,
+    ) -> list[KnowledgeChunk]:
+        """The document's rows of ``chunk_types`` (``None``: the chunks
+        searched, :meth:`KnowledgeStore.list_chunks`'s default)."""
         collected: list[KnowledgeChunk] = []
         offset = 0
         while True:
             page, total = await self._store.list_chunks(
-                tenant_id=tenant_id, document_id=document_id, offset=offset, limit=200
+                tenant_id=tenant_id,
+                document_id=document_id,
+                offset=offset,
+                limit=200,
+                chunk_types=chunk_types,
             )
             collected.extend(page)
             offset += len(page)

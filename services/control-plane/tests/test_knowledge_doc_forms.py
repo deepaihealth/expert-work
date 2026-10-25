@@ -60,6 +60,7 @@ from expert_work.persistence import InMemoryKnowledgeStore
 from expert_work.protocol import (
     DEFAULT_CHUNK_MAX_TOKENS,
     DEFAULT_CHUNK_OVERLAP_TOKENS,
+    ChunkType,
     DocumentPage,
     FigureStats,
     IngestErrorCode,
@@ -108,6 +109,7 @@ _EMBEDDERS = [
 class _Ingested:
     markdown: str  # what the parser handed the chunker
     chunks: list[KnowledgeChunk]
+    parents: list[KnowledgeChunk]  # the parent rows (B-206 K-1)
 
 
 async def _ingest(
@@ -140,7 +142,10 @@ async def _ingest(
         parsed_markdown=markdown,
     )
     chunks, _ = await store.list_chunks(tenant_id=tenant, document_id=document.id, limit=10_000)
-    return _Ingested(markdown, chunks)
+    parents, _ = await store.list_chunks(
+        tenant_id=tenant, document_id=document.id, limit=10_000, chunk_types={ChunkType.PARENT}
+    )
+    return _Ingested(markdown, chunks, parents)
 
 
 def _params(docs: Sequence[FormDoc], xfail: dict[str, str] | None = None) -> list[object]:
@@ -543,7 +548,7 @@ async def test_mixed_pdf_scanned_page_is_read_in_place(doc: FormDoc, _parse_pool
 # ---------------------------------------------------------------------------
 # 父段(B-206 K-1):先切父段、再在父段里切子段 —— Ⓐ 父段对齐章节、Ⓑ Ⓔ 按字数窗口、
 # Ⓒ 整篇一个父段(只有一个子段时不建父行)、Ⓓ 整表(带表头)为父段;Ⓕ 没有文字,不适用。
-# 父行进库之前,父段由切块器按入库的参数直接切出,入库落的分段就是它们的子段。
+# 父段由切块器按入库的参数直接切出;入库落的父行就是其中不止一个子段的那些,分段就是它们的子段。
 # ---------------------------------------------------------------------------
 
 _LEVELED_HEADING = re.compile(r"^(#{1,6})[ \t]+(.+?)[ \t]*$", re.MULTILINE)
@@ -575,6 +580,22 @@ async def test_the_stored_chunks_are_the_children_of_the_parents(doc: FormDoc) -
     assert [(c.content, tuple(c.heading_path)) for c in ingested.chunks] == [
         (c.body, c.heading_path) for c in children
     ]
+
+
+@pytest.mark.usefixtures("no_semantic_breaks")
+@pytest.mark.parametrize("doc", _params(TEXT_FORM_DOCS))
+async def test_the_stored_parent_rows_are_the_parents_cut(doc: FormDoc) -> None:
+    ingested = await _ingest(doc)
+    cut = _parented(doc)
+    stored = [parent for parent in cut if not parent.is_trivial]
+    assert [(p.chunk_index, p.content, tuple(p.heading_path)) for p in ingested.parents] == [
+        (index, p.body, p.heading_path) for index, p in enumerate(stored)
+    ]
+    # Each chunk points at the row of the parent it was cut in; the chunk of a
+    # one-chunk parent at none.
+    rows = [ingested.parents[stored.index(p)].id if p in stored else None for p in cut]
+    owners = [row for parent, row in zip(cut, rows, strict=True) for _ in parent.children]
+    assert [c.parent_chunk_id for c in ingested.chunks] == owners
 
 
 @pytest.mark.parametrize("doc", _params(TEXT_FORM_DOCS))
@@ -626,10 +647,13 @@ def test_dialogue_parents_hold_whole_utterances(doc: FormDoc) -> None:
 
 
 @pytest.mark.parametrize("doc", _params(_form("C")))
-def test_a_short_document_is_one_parent_and_no_parent_row(doc: FormDoc) -> None:
+async def test_a_short_document_is_one_parent_and_no_parent_row(doc: FormDoc) -> None:
     [parent] = _parented(doc)
     assert len(parent.children) == 1
     assert parent.is_trivial
+    ingested = await _ingest(doc)
+    assert ingested.parents == []
+    assert [c.parent_chunk_id for c in ingested.chunks] == [None]
 
 
 @pytest.mark.parametrize("doc", _params(_form("D")))
