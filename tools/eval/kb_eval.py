@@ -16,14 +16,19 @@
    **可复现**:SQL 库默认固定读行顺序(关掉索引扫描、并行扫描、同步顺序扫描与
    autovacuum,向量路走精确检索),加上串行落库,同一份代码两次跑出逐条相同的结果;
    ``--ann`` 改走生产同款 HNSW(量近似检索的召回损失时用,不可复现);
-3. 入库后核「锚文本存活」:每条 expected 的 anchor 至少出现在其文档的某一段里,不存活的 case
-   单列(是数据集 / 切块的问题,不是检索的问题);
+3. 入库后核「锚文本存活」:每条 expected 的 anchor 至少出现在其文档里**检索能返回的某一段**里
+   (B-206 K-1:父段行 + 自成父段的子段),不存活的 case 单列(是数据集 / 切块的问题,不是检索的
+   问题);只看子段的不存活数另报一份,两种口径对照;
 4. 每条 case 调 ``KnowledgeRetriever.search(limit=top_k)``,按 ``kb_metrics`` 打分(``match``
-   取 case 自己的 any|all);同一次检索的前几名再交给生产 ``knowledge_search`` 工具按默认条数渲染
-   (工具节点同一段代码),锚文本是否落在这段**给模型的文本**里记 ``context_hit``(B-206
-   「父段级段命中」,与 ``chk_hit@10`` 并列);总体 / 按 ``source`` / 按 ``tag`` 各出一份汇总;
-   结果 JSONL 每 case 一行(含 ``best_score`` 便于离线扫阈值)+ 末尾一行汇总;
-   ``--search-log`` 另写每次检索的逐段记录(段号、名次、各路分数、是否交给了模型,默认不写);
+   取 case 自己的 any|all;B-206 K-1 起一条结果是一个父段,判对看父段的检索文本,所以
+   ``mrr@10`` / ``chunk_hit@k`` 都是父段级);同一次检索的前几名再交给生产 ``knowledge_search``
+   工具按默认条数渲染(工具节点同一段代码),锚文本是否落在这段**给模型的文本**里记
+   ``context_hit``(与 ``chk_hit@10`` 并列),这段文本每次检索的字数 / token 数(均值、P90)与
+   被截成命中子段(``[已截断]``)的条数记进汇总 ``tool_output``;总体 / 按 ``source`` / 按 ``tag``
+   各出一份汇总;结果 JSONL 每 case 一行(含 ``best_score`` 便于离线扫阈值;每条结果带父段号、
+   命中子段号、它在工具输出里占的字数 / token 数)+ 末尾一行汇总;
+   ``--search-log`` 另写每次检索的逐段记录(段号、父段号、命中子段号、名次、各路分数、是否交给了
+   模型、在工具输出里占的字数,默认不写);
    ``--update-baseline`` 把汇总与指纹
    并进基线 YAML(复用 ``longmem.runner.update_baseline``);**有任何失败 / 同名冲突时拒绝
    更新基线**(退出码非 0)。
@@ -74,7 +79,7 @@ import shutil
 import subprocess
 import sys
 import time
-from collections.abc import AsyncIterator, Callable, Iterator, Mapping, Sequence
+from collections.abc import AsyncIterator, Callable, Collection, Iterator, Mapping, Sequence
 from concurrent.futures import Executor, ProcessPoolExecutor
 from contextlib import asynccontextmanager, contextmanager
 from dataclasses import asdict, dataclass, replace
@@ -125,7 +130,9 @@ from expert_work.persistence.embedding import EMBEDDING_DIM
 from expert_work.persistence.rls import current_tenant_id_var
 from expert_work.protocol import (
     MODEL_CATALOG,
+    ChunkType,
     DocumentStatus,
+    KnowledgeChunk,
     RetrievalMethod,
     chunk_retrieval_text,
     knowledge_document_title,
@@ -140,6 +147,7 @@ from orchestrator.llm.embedder import (
     EmbeddingMarker,
     embedding_marker,
 )
+from orchestrator.tools import knowledge as knowledge_tool
 from orchestrator.tools.knowledge import (
     DEFAULT_RERANK_POOL,
     DEFAULT_RERANK_VIEW,
@@ -152,6 +160,7 @@ from orchestrator.tools.knowledge import (
     RetrievedChunk,
     default_recall_depth,
 )
+from orchestrator.tools.knowledge_results import TRUNCATED_MARK
 from orchestrator.tools.registry import Tool, ToolContext
 
 _EVAL_DIR = Path(__file__).resolve().parent
@@ -291,9 +300,14 @@ class CorpusReport:
     docs_name_collision: int
     docs_failed: int
     failed_by_stage: dict[str, int]
-    chunk_total: int
-    #: 段长(检索文本 = 标题路径 + 正文,token)的 p10 / p50 / p90 / max;没有段时全 0。
+    chunk_total: int  # 子段数(B-206 K-1:召回、嵌入的单位)
+    #: 段长(检索文本 = 标题路径 + 正文,token)的 p10 / p50 / p90 / max;没有段时全 0。只数子段。
     chunk_tokens: dict[str, int]
+    #: B-206 K-1:父段行数,和没有父段行、自己就是父段的子段数(两者合起来是检索返回的单位)。
+    parent_total: int
+    standalone_total: int
+    #: 检索返回的单位(父段行 + 自成父段的子段)的段长,口径同 ``chunk_tokens``。
+    parent_tokens: dict[str, int]
     elapsed_s: float
     ingest_failures: tuple[IngestFailure, ...]
     name_collisions: tuple[NameCollision, ...]
@@ -311,11 +325,18 @@ class DeadAnchor:
 class AnchorReport:
     checked: int  # 核过的 expected 条数
     alive_cases: frozenset[str]  # 全部 expected 都存活的 case
+    #: 检索能返回的段(父段行 + 自成父段的子段,B-206 K-1)里都找不到的
     dead: tuple[DeadAnchor, ...]
+    #: 同样的检查只看子段(K-1 之前的口径):跨两个子段的锚文本在这里不存活、在 ``dead`` 里存活
+    child_dead: tuple[DeadAnchor, ...] = ()
 
     @property
     def dead_cases(self) -> frozenset[str]:
         return frozenset(d.case_id for d in self.dead)
+
+    @property
+    def child_dead_cases(self) -> frozenset[str]:
+        return frozenset(d.case_id for d in self.child_dead)
 
 
 @dataclass(frozen=True)
@@ -335,7 +356,21 @@ class AnchorDocsReport:
 
 
 @dataclass(frozen=True)
+class ShownPart:
+    """一条结果给 ``knowledge_search`` 的输出添了多少字(B-206 K-1,见 :func:`shown_parts`):
+    没交给工具、或被预算挤掉的结果全 0;``truncated`` = 父段放不下、只给了命中子段(``[已截断]``)。"""
+
+    chars: int = 0
+    tokens: int = 0
+    truncated: bool = False
+
+
+@dataclass(frozen=True)
 class ResultRow:
+    """一条结果 = 一个父段(B-206 K-1):``chunk_index`` 是排得最前的命中子段,``text`` 是父段的
+    检索文本(判对用的就是它);``parent_index`` 是父段号(没有父段行、子段自己就是父段时 None),
+    ``hit_chunk_indexes`` 是这个父段里排上名的全部子段号(最好的在前)。"""
+
     filename: str
     chunk_index: int
     score: float | None
@@ -343,6 +378,12 @@ class ResultRow:
     text: str | None = None
     #: 重排分数(B-175 波 2 PR3);没开重排 / 重排没给分时 None,结果文件里不出现这个键
     rerank_score: float | None = None
+    parent_index: int | None = None
+    hit_chunk_indexes: tuple[int, ...] = ()
+    #: 这条结果在工具输出里占的字数 / token 数,是否被截成命中子段(:class:`ShownPart`)
+    shown_chars: int = 0
+    shown_tokens: int = 0
+    truncated: bool = False
 
 
 @dataclass(frozen=True)
@@ -357,7 +398,13 @@ class SearchLog:
     rerank_degraded: bool
     results: tuple[RetrievedChunk, ...]
     shown: int
-    shown_chars: int  # 工具渲染给模型的文本长度
+    #: 工具节点交给模型的那段文本(:func:`tool_message_text`:围栏、提示都算)的字数 / token 数
+    shown_chars: int
+    shown_tokens: int
+    #: 每条结果在工具渲染里占的部分,与 ``results`` 一一对应
+    parts: tuple[ShownPart, ...]
+    #: 交给模型的文本就是工具自己搜会给的(工具要的条数 ≤ 这次检索的 ``top_k``);否则不进汇总
+    faithful: bool
     rerank_outcome: str | None = None  # B-206 K-7:这次重排怎么结束的(没要重排 = None)
 
 
@@ -755,10 +802,15 @@ async def build_corpus(
     for failure in failures:
         by_stage[failure.stage] = by_stage.get(failure.stage, 0) + 1
     sizes: list[int] = []
+    unit_sizes: list[int] = []
+    parent_total = standalone_total = 0
     for doc in await store.list_documents(tenant_id=tenant_id, kb_id=base.id):
         if doc.status is DocumentStatus.READY:
-            texts = await _all_chunk_texts(store, tenant_id=tenant_id, document_id=doc.id)
-            sizes.extend(count_tokens(text) for text in texts)
+            texts = await _document_texts(store, tenant_id=tenant_id, document_id=doc.id)
+            sizes.extend(count_tokens(text) for text in texts.chunks)
+            unit_sizes.extend(count_tokens(text) for text in texts.units)
+            parent_total += len(texts.parents)
+            standalone_total += len(texts.standalone)
     return CorpusReport(
         base_id=base.id,
         docs_ingested=total - len(failures),
@@ -770,6 +822,9 @@ async def build_corpus(
         failed_by_stage=by_stage,
         chunk_total=sum(counts),
         chunk_tokens=_size_spread(sizes),
+        parent_total=parent_total,
+        standalone_total=standalone_total,
+        parent_tokens=_size_spread(unit_sizes),
         elapsed_s=round(time.monotonic() - started, 3),
         ingest_failures=tuple(failures),
         name_collisions=tuple(collisions),
@@ -807,27 +862,31 @@ def _stage_of(exc: BaseException) -> tuple[str, str]:
 async def check_anchors(
     *, store: KnowledgeStore, tenant_id: UUID, kb_id: UUID, dataset: KbDataset
 ) -> AnchorReport:
-    """每条 expected 的 anchor 要能在其文档的**某一段**里 ``in`` 到;否则检索再好也命不中段级。
+    """每条 expected 的 anchor 要能在其文档里**检索能返回的某一段**里 ``in`` 到;否则检索再好
+    也命不中段级。B-206 K-1 起检索返回的是父段:父段行,和没有父段行、自己就是父段的子段
+    (:attr:`DocumentTexts.units`),锚文本跨了同一父段的两个子段也找得到。
 
     两种不存活分开报:``document_missing``(文档没入库 / 不在清单)与
-    ``anchor_not_in_any_chunk``(切块把锚文本切断了,或评测集抄错)。
+    ``anchor_not_in_any_chunk``(切块把锚文本切断了,或评测集抄错)。同样的检查只看子段
+    (K-1 之前的口径)另记在 ``child_dead``,两种口径对照。
     """
     docs = {
         d.filename: d
         for d in await store.list_documents(tenant_id=tenant_id, kb_id=kb_id)
         if d.status is DocumentStatus.READY
     }
-    chunk_cache: dict[str, list[str]] = {}
+    text_cache: dict[str, DocumentTexts] = {}
 
-    async def _chunks(filename: str) -> list[str]:
-        if filename not in chunk_cache:
-            chunk_cache[filename] = await _all_chunk_texts(
+    async def _texts(filename: str) -> DocumentTexts:
+        if filename not in text_cache:
+            text_cache[filename] = await _document_texts(
                 store, tenant_id=tenant_id, document_id=docs[filename].id
             )
-        return chunk_cache[filename]
+        return text_cache[filename]
 
     checked = 0
     dead: list[DeadAnchor] = []
+    child_dead: list[DeadAnchor] = []
     alive: set[str] = set()
     for case in dataset.cases:
         if not case.expected:
@@ -836,32 +895,93 @@ async def check_anchors(
         for exp in case.expected:
             checked += 1
             if exp.document not in docs:
-                dead.append(DeadAnchor(case.id, exp.document, "document_missing"))
+                missing = DeadAnchor(case.id, exp.document, "document_missing")
+                dead.append(missing)
+                child_dead.append(missing)
                 case_dead = True
-            elif not any(anchor_in(exp.anchor, text) for text in await _chunks(exp.document)):
-                dead.append(DeadAnchor(case.id, exp.document, "anchor_not_in_any_chunk"))
+                continue
+            texts = await _texts(exp.document)
+            cut = DeadAnchor(case.id, exp.document, "anchor_not_in_any_chunk")
+            if not any(anchor_in(exp.anchor, text) for text in texts.units):
+                dead.append(cut)
                 case_dead = True
+            if not any(anchor_in(exp.anchor, text) for text in texts.chunks):
+                child_dead.append(cut)
         if not case_dead:
             alive.add(case.id)
-    return AnchorReport(checked=checked, alive_cases=frozenset(alive), dead=tuple(dead))
+    return AnchorReport(
+        checked=checked,
+        alive_cases=frozenset(alive),
+        dead=tuple(dead),
+        child_dead=tuple(child_dead),
+    )
+
+
+@dataclass(frozen=True)
+class DocumentTexts:
+    """一份文档按判对口径的文本(B-206 K-1):每个子段的(``chunks``),以及检索能返回的单位 ——
+    父段行(``parents``)和没有父段行、自己就是父段的子段(``standalone``)。"""
+
+    chunks: tuple[str, ...]
+    parents: tuple[str, ...]
+    standalone: tuple[str, ...]
+
+    @property
+    def units(self) -> tuple[str, ...]:
+        return self.parents + self.standalone
+
+
+async def _document_texts(
+    store: KnowledgeStore, *, tenant_id: UUID, document_id: UUID
+) -> DocumentTexts:
+    chunks = await _all_chunks(store, tenant_id=tenant_id, document_id=document_id)
+    parents = await _all_chunks(
+        store, tenant_id=tenant_id, document_id=document_id, chunk_types={ChunkType.PARENT}
+    )
+    return DocumentTexts(
+        chunks=tuple(_judged_text(c) for c in chunks),
+        parents=tuple(_judged_text(c) for c in parents),
+        standalone=tuple(_judged_text(c) for c in chunks if c.parent_chunk_id is None),
+    )
 
 
 async def _all_chunk_texts(
     store: KnowledgeStore, *, tenant_id: UUID, document_id: UUID
 ) -> list[str]:
-    texts: list[str] = []
+    """Every chunk's (child's) text, as the hits are judged."""
+    chunks = await _all_chunks(store, tenant_id=tenant_id, document_id=document_id)
+    return [_judged_text(c) for c in chunks]
+
+
+def _judged_text(chunk: KnowledgeChunk) -> str:
+    # The text hits are judged on (``RetrievedChunk.retrieval_text``):
+    # breadcrumb + body, without the document title the index also
+    # carries — an anchor only in a title must not count as found.
+    return chunk_retrieval_text(chunk.heading_path, chunk.content)
+
+
+async def _all_chunks(
+    store: KnowledgeStore,
+    *,
+    tenant_id: UUID,
+    document_id: UUID,
+    chunk_types: Collection[ChunkType] | None = None,
+) -> list[KnowledgeChunk]:
+    """A document's rows of ``chunk_types`` (``None``: the chunks, not the parent rows)."""
+    rows: list[KnowledgeChunk] = []
     offset = 0
     while True:
         page, total = await store.list_chunks(
-            tenant_id=tenant_id, document_id=document_id, offset=offset, limit=_CHUNK_PAGE
+            tenant_id=tenant_id,
+            document_id=document_id,
+            offset=offset,
+            limit=_CHUNK_PAGE,
+            chunk_types=chunk_types,
         )
-        # The text hits are judged on (``RetrievedChunk.retrieval_text``):
-        # breadcrumb + body, without the document title the index also
-        # carries — an anchor only in a title must not count as found.
-        texts.extend(chunk_retrieval_text(c.heading_path, c.content) for c in page)
+        rows.extend(page)
         offset += len(page)
         if not page or offset >= total:
-            return texts
+            return rows
 
 
 #: 一段锚文本出现在超过这么多份已入库文档里,就太常见 —— 拿它判对会把不相干的文档也算对,
@@ -882,13 +1002,14 @@ async def resolve_anchor_documents(
     评测集只手列了答案所在的几份文档;内容重复的文档(同一份 FAQ 的两个版本)排在前面时,
     按文件名判就会算错 —— 10-14 实测产品 FAQ 题里 33 道排第一的是没列的 FAQ-2026。
     比对用 :func:`kb_metrics.anchor_key` 的归一形;一份文档的各段分别归一后用 ``\x00`` 连起来
-    再查(归一形只有字母与数字),锚文本不会跨段误配。
+    再查(归一形只有字母与数字),锚文本不会跨段误配。「段」与判对同一口径:检索能返回的单位
+    (B-206 K-1,:attr:`DocumentTexts.units`)。
     """
     texts: dict[str, str] = {}
     for doc in await store.list_documents(tenant_id=tenant_id, kb_id=kb_id):
         if doc.status is DocumentStatus.READY:
-            chunks = await _all_chunk_texts(store, tenant_id=tenant_id, document_id=doc.id)
-            texts[doc.filename] = "\x00".join(anchor_key(chunk) for chunk in chunks)
+            units = (await _document_texts(store, tenant_id=tenant_id, document_id=doc.id)).units
+            texts[doc.filename] = "\x00".join(anchor_key(unit) for unit in units)
     expanded = 0
     expanded_cases = 0
     too_common: list[TooCommonAnchor] = []
@@ -1000,6 +1121,8 @@ async def run_eval(
         )
         # 工具要的条数比这次检索的 top_k 还多时,截下来的前几名不是它自己搜会拿到的,不算。
         faithful = replay.requested is not None and replay.requested <= cfg.top_k
+        shown = min(replay.requested or 0, len(results))
+        parts = shown_parts(results[:shown]) + (ShownPart(),) * (len(results) - shown)
         alive: bool | None = None
         if anchors is not None and case.expected:
             alive = case.id in anchors.alive_cases
@@ -1007,7 +1130,10 @@ async def run_eval(
             case_id=case.id,
             source=case.source,
             tags=case.tags,
-            results=tuple(_result_row(r, with_text=cfg.with_text) for r in results),
+            results=tuple(
+                _result_row(r, with_text=cfg.with_text, part=part)
+                for r, part in zip(results, parts, strict=True)
+            ),
             score=score_case(
                 results,
                 case.expected,
@@ -1025,8 +1151,11 @@ async def run_eval(
                 candidates=outcome.candidates,
                 rerank_degraded=outcome.rerank_degraded,
                 results=outcome.results,
-                shown=min(replay.requested or 0, len(results)),
+                shown=shown,
                 shown_chars=len(shown_text),
+                shown_tokens=count_tokens(shown_text),
+                parts=parts,
+                faithful=faithful,
                 rerank_outcome=outcome.rerank_outcome,
             ),
         )
@@ -1070,7 +1199,42 @@ async def tool_message_text(
     return str(message.content)
 
 
-def _result_row(result: RetrievedChunk, *, with_text: bool = False) -> ResultRow:
+def shown_parts(results: Sequence[RetrievedChunk]) -> tuple[ShownPart, ...]:
+    """What each of ``results`` — the ones handed to ``knowledge_search`` — added
+    to the tool's rendering of them (B-206 K-1: the tool lays them out within its
+    text budget, a parent that does not fit shows its hit chunk marked
+    ``[已截断]``, and once one does not fit at all the rest are dropped).
+
+    Read off the tool's own renderer: the rendering of the first ``n`` results
+    minus that of the first ``n - 1``, so the parts add up to the rendering
+    exactly (separators included). Before :func:`tool_message_text`'s fence and
+    notice, which belong to no result."""
+    parts: list[ShownPart] = []
+    before = ""
+    for n in range(1, len(results) + 1):
+        rendered = knowledge_tool._format_results(results[:n])
+        if not rendered.startswith(before):
+            msg = (
+                "knowledge_search no longer renders its results in order (the first n-1 "
+                "are not a prefix of the first n), so what each one added cannot be read off"
+            )
+            raise ValueError(msg)
+        added = rendered[len(before) :]
+        parts.append(
+            ShownPart(
+                chars=len(added),
+                tokens=count_tokens(added),
+                truncated=added.endswith(TRUNCATED_MARK),
+            )
+        )
+        before = rendered
+    return tuple(parts)
+
+
+def _result_row(result: RetrievedChunk, *, with_text: bool, part: ShownPart) -> ResultRow:
+    """A result as scored: B-206 K-1, its ``retrieval_text`` is the parent passage
+    it returns (the hit chunk's own when it stands alone), so the hits judged on
+    it — and MRR / chunk hits — are parent level."""
     return ResultRow(
         filename=result.filename,
         chunk_index=result.chunk_index,
@@ -1078,6 +1242,11 @@ def _result_row(result: RetrievedChunk, *, with_text: bool = False) -> ResultRow
         recall_source=result.recall_source,
         text=result.retrieval_text if with_text else None,
         rerank_score=result.rerank_score,
+        parent_index=result.parent_index,
+        hit_chunk_indexes=result.hit_chunk_indexes,
+        shown_chars=part.chars,
+        shown_tokens=part.tokens,
+        truncated=part.truncated,
     )
 
 
@@ -1109,6 +1278,9 @@ def summarise(
             "checked": anchors.checked,
             "dead_cases": len(anchors.dead_cases),
             "dead": [asdict(d) for d in anchors.dead],
+            # B-206 K-1: the same check on the chunks alone, to compare with.
+            "child_level_dead_cases": len(anchors.child_dead_cases),
+            "child_level_dead": [asdict(d) for d in anchors.child_dead],
         }
     if anchor_docs is not None:
         anchors_block = dict(anchors_block or {})
@@ -1122,8 +1294,30 @@ def summarise(
         "by_tag": grouped((tag, r.score) for r in rows for tag in dict.fromkeys(r.tags)),
         "corpus": corpus_block,
         "anchors": anchors_block,
+        "tool_output": tool_output_summary(rows),
         "config": dict(config or {}),
     }
+
+
+def tool_output_summary(rows: Sequence[CaseRow]) -> dict[str, Any]:
+    """每次检索交给模型的文本(B-206 K-1 闸门要摆出来:父段更长,命中率上升有一部分是多给了字):
+    工具节点的真实输出(:func:`tool_message_text`,预算、围栏、提示都在内)的字数与 token 数的
+    均值 / P90,和被截成命中子段(``[已截断]``)交给模型的结果条数。只数「交给模型的就是工具自己
+    搜会给的」那些检索(``--top-k`` 小于工具要的条数时一条都不算)。"""
+    logs = [r.search for r in rows if r.search is not None and r.search.faithful]
+    return {
+        "searches": len(logs),
+        "chars": _mean_p90([log.shown_chars for log in logs]),
+        "tokens": _mean_p90([log.shown_tokens for log in logs]),
+        "truncated_results": sum(part.truncated for log in logs for part in log.parts),
+    }
+
+
+def _mean_p90(values: Sequence[int]) -> dict[str, float | int | None]:
+    """均值(一位小数)与 P90(最近秩,同 :func:`_size_spread`);没有值时都是 None。"""
+    if not values:
+        return {"mean": None, "p90": None}
+    return {"mean": round(sum(values) / len(values), 1), "p90": _size_spread(values)["p90"]}
 
 
 #: 写进基线时剔掉的、每次跑都会变的字段(``(块, 键)``)。
@@ -1149,6 +1343,7 @@ def baseline_section(summary: Mapping[str, Any]) -> dict[str, Any]:
 
 def _result_json(result: ResultRow) -> dict[str, Any]:
     out = asdict(result)
+    out["hit_chunk_indexes"] = list(result.hit_chunk_indexes)
     for key in ("text", "rerank_score"):
         if out[key] is None:
             del out[key]
@@ -1193,7 +1388,8 @@ def write_jsonl(path: Path, rows: Sequence[CaseRow], summary: Mapping[str, Any])
 
 
 def search_log_json(row: CaseRow) -> dict[str, Any]:
-    """``--search-log`` 的一行:这一题那次检索返回的每一段(不含正文)。"""
+    """``--search-log`` 的一行:这一题那次检索返回的每一段(不含正文;B-206 K-1 起每段是一个
+    父段,带父段号、命中子段号和它在工具输出里占的字数 / token 数)。"""
     log = row.search
     if log is None:
         raise ValueError(f"case {row.case_id} has no search log")
@@ -1207,20 +1403,28 @@ def search_log_json(row: CaseRow) -> dict[str, Any]:
         "rerank_outcome": log.rerank_outcome,
         "shown": log.shown,
         "shown_chars": log.shown_chars,
+        "shown_tokens": log.shown_tokens,
         "results": [
             {
                 "rank": rank,
                 "filename": r.filename,
                 "chunk_index": r.chunk_index,
                 "chunk_id": None if r.chunk_id is None else str(r.chunk_id),
+                # B-206 K-1: the result is this parent; these of its chunks ranked.
+                "parent_index": r.parent_index,
+                "hit_chunk_indexes": list(r.hit_chunk_indexes),
                 "recall_source": r.recall_source,
                 "vector_score": r.vector_score,
                 "keyword_score": r.keyword_score,
                 "fused_score": r.fused_score,
                 "rerank_score": r.rerank_score,
+                # Handed to the tool; whether the text budget then fit it is shown_chars > 0.
                 "shown": rank <= log.shown,
+                "shown_chars": part.chars,
+                "shown_tokens": part.tokens,
+                "truncated": part.truncated,
             }
-            for rank, r in enumerate(log.results, start=1)
+            for rank, (r, part) in enumerate(zip(log.results, log.parts, strict=True), start=1)
         ],
     }
 
@@ -1283,6 +1487,14 @@ def format_summary_table(summary: Mapping[str, Any]) -> str:
                 "chunk tokens: "
                 + " ".join(f"{key}={spread[key]}" for key in ("p10", "p50", "p90", "max"))
             )
+        parents = corpus.get("parent_tokens")
+        if parents:
+            lines.append(
+                "parent tokens: "
+                + " ".join(f"{key}={parents[key]}" for key in ("p10", "p50", "p90", "max"))
+                + f" (parents={corpus['parent_total']} "
+                f"+ standalone chunks={corpus['standalone_total']})"
+            )
         if corpus["docs_failed"]:
             names = ", ".join(f["filename"] for f in corpus.get("ingest_failures", []))
             lines.append(
@@ -1302,7 +1514,16 @@ def format_summary_table(summary: Mapping[str, Any]) -> str:
     if anchors:
         lines.append(
             f"anchors: checked={anchors['checked']} dead_cases={anchors['dead_cases']} "
+            f"child_level_dead_cases={anchors['child_level_dead_cases']} "
             f"(dead anchors are dataset / chunking problems, not retrieval misses)"
+        )
+    output = summary.get("tool_output")
+    if output and output["searches"]:
+        lines.append(
+            f"tool output per search: chars mean={output['chars']['mean']} "
+            f"p90={output['chars']['p90']} tokens mean={output['tokens']['mean']} "
+            f"p90={output['tokens']['p90']} truncated_results={output['truncated_results']} "
+            f"(searches={output['searches']})"
         )
     return "\n".join(lines)
 
