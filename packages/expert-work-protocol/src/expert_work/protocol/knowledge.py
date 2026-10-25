@@ -491,7 +491,9 @@ class KnowledgeChunk(BaseModel):
     document_id: UUID
     chunk_index: int = Field(ge=0, description="0-based position within the source document")
     content: str = Field(description="the chunk body, without its section breadcrumb")
-    embedding: tuple[float, ...] = Field(
+    #: ``None`` only for :attr:`ChunkType.PARENT` rows, which are never
+    #: embedded. Reads that skip the vector return ``()`` for a chunk that has one.
+    embedding: tuple[float, ...] | None = Field(
         repr=False, description="semantic embedding vector of ``retrieval_text``"
     )
     chunk_type: ChunkType = ChunkType.TEXT

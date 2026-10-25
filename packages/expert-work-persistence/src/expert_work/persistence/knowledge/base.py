@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import abc
 import mimetypes
-from collections.abc import Sequence
+from collections.abc import Collection, Sequence
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import PurePosixPath
@@ -25,6 +25,7 @@ from expert_work.protocol import (
     DEFAULT_CHUNK_MAX_TOKENS,
     DEFAULT_CHUNK_OVERLAP_TOKENS,
     DEFAULT_RETRIEVAL_TOP_K,
+    ChunkType,
     DocumentPage,
     DocumentStatus,
     FigureStats,
@@ -621,11 +622,30 @@ class KnowledgeStore(abc.ABC):
 
     @abc.abstractmethod
     async def list_chunks(
-        self, *, tenant_id: UUID, document_id: UUID, offset: int = 0, limit: int = 50
+        self,
+        *,
+        tenant_id: UUID,
+        document_id: UUID,
+        offset: int = 0,
+        limit: int = 50,
+        chunk_types: Collection[ChunkType] | None = None,
     ) -> tuple[list[KnowledgeChunk], int]:
-        """A page of a document's chunks ordered by ``chunk_index`` plus the
-        total count — for segment preview. The (large) embedding vector is
-        omitted from the returned chunks (``embedding == ()``)."""
+        """A page of a document's chunks of ``chunk_types`` ordered by
+        ``chunk_index`` (then type) plus their total count — for segment
+        preview. ``None`` = the searchable types
+        (:data:`~expert_work.protocol.SEARCHABLE_CHUNK_TYPES`): parent rows
+        (B-206 K-1) are only listed when asked for. The (large) embedding
+        vector is omitted from the returned chunks (``embedding == ()``;
+        ``None`` for a parent, which has none)."""
+
+    @abc.abstractmethod
+    async def get_chunks(
+        self, *, tenant_id: UUID, chunk_ids: Sequence[UUID]
+    ) -> list[KnowledgeChunk]:
+        """The tenant's chunks with these ids, of any type — each once, in
+        the order first asked for; ids with no such chunk (or another
+        tenant's) are skipped. What the retriever reads a hit's parent row
+        with (B-206 K-1). Vectors are omitted as in :meth:`list_chunks`."""
 
     async def chunks_contain(self, *, tenant_id: UUID, document_id: UUID, text: str) -> bool:
         """Whether any chunk of the document holds ``text`` (the figure
@@ -655,9 +675,10 @@ class KnowledgeStore(abc.ABC):
         re-ingest reuses them instead of embedding unchanged chunks again,
         never across a model change. Only the given document's chunks
         (another document's identical text is not borrowed); hashes with no
-        matching chunk are absent. A document can have tens of thousands of
-        chunks, so an implementation should hand back compact vectors
-        (``array("d")``), not tuples of Python floats (B-216)."""
+        matching chunk are absent; a parent row has no vector to give. A
+        document can have tens of thousands of chunks, so an implementation
+        should hand back compact vectors (``array("d")``), not tuples of
+        Python floats (B-216)."""
 
     @abc.abstractmethod
     async def search(
@@ -670,7 +691,10 @@ class KnowledgeStore(abc.ABC):
     ) -> list[KnowledgeChunk]:
         """Return the ``limit`` chunks across ``kb_ids`` nearest
         ``query_embedding`` by cosine distance, closest first. An empty
-        ``kb_ids`` yields an empty list."""
+        ``kb_ids`` yields an empty list. Recall — this and every search
+        method — only returns chunks of
+        :data:`~expert_work.protocol.SEARCHABLE_CHUNK_TYPES` (never a parent
+        row)."""
 
     @abc.abstractmethod
     async def search_scored(
@@ -724,8 +748,8 @@ class KnowledgeStore(abc.ABC):
         """Like :meth:`keyword_search` but each hit carries its keyword
         score and ``source == "keyword"`` — NOT a [0, 1] similarity:
         coverage (Σ idf·hit / Σ idf over the query's terms and identifier
-        phrases, idf = ln(1 + (N - df + 0.5) / (df + 0.5)) with N the chunks in
-        scope and df those holding the unit; ≤ 1) plus ``ts_rank`` (< 0.1, a
+        phrases, idf = ln(1 + (N - df + 0.5) / (df + 0.5)) with N the searchable
+        chunks in scope and df those holding the unit; ≤ 1) plus ``ts_rank`` (< 0.1, a
         tie-break), plus
         :data:`~expert_work.persistence.knowledge.text_search.KB_KEYWORD_PHRASE_BOOST`
         when an identifier phrase matched and

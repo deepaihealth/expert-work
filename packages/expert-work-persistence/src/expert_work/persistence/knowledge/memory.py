@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import math
 from collections import Counter
-from collections.abc import Sequence
+from collections.abc import Collection, Sequence
 from datetime import UTC, datetime, timedelta
 from typing import Any
 from uuid import UUID, uuid4
@@ -34,6 +34,8 @@ from expert_work.protocol import (
     DEFAULT_CHUNK_MAX_TOKENS,
     DEFAULT_CHUNK_OVERLAP_TOKENS,
     DEFAULT_RETRIEVAL_TOP_K,
+    SEARCHABLE_CHUNK_TYPES,
+    ChunkType,
     DocumentPage,
     DocumentSourceType,
     DocumentStatus,
@@ -146,6 +148,21 @@ def _keyword_scores(query: KbKeywordQuery, chunks: Sequence[KnowledgeChunk]) -> 
         )
         scores.append(identifier + verbatim + coverage + _ts_rank_or(body, lexemes))
     return scores
+
+
+def _vector(chunk: KnowledgeChunk) -> tuple[float, ...]:
+    """A recalled chunk's vector. Only a parent row has none, and recall never
+    reads one — so a missing vector here is a bug, not a miss."""
+    if chunk.embedding is None:
+        msg = f"chunk {chunk.id} ({chunk.chunk_type.value}) has no embedding"
+        raise ValueError(msg)
+    return chunk.embedding
+
+
+def _without_vector(chunk: KnowledgeChunk) -> KnowledgeChunk:
+    """``chunk`` as the SQL store's vector-less projection reads it: ``()``
+    for a chunk with a vector, ``None`` for a parent row."""
+    return chunk.model_copy(update={"embedding": None if chunk.embedding is None else ()})
 
 
 def _cosine_distance(a: Sequence[float], b: Sequence[float]) -> float:
@@ -813,17 +830,25 @@ class InMemoryKnowledgeStore(KnowledgeStore):
             # Mirror the SQL side's FK (0136): writing chunks back to a deleted
             # document must fail loudly instead of recreating orphan vectors.
             raise KeyError(document_id)
-        indices = [c.chunk_index for c in chunks]
-        if len(indices) != len(set(indices)):
-            # Mirror the SQL unique (document_id, chunk_index) (0165).
+        keys = [(c.chunk_type, c.chunk_index) for c in chunks]
+        if len(keys) != len(set(keys)):
+            # Mirror the SQL unique (document_id, chunk_type, chunk_index) (0175).
             msg = f"duplicate chunk_index in replace_chunks for document {document_id}"
+            raise ValueError(msg)
+        if any(c.embedding is None and c.chunk_type is not ChunkType.PARENT for c in chunks):
+            # Mirror the SQL CHECK: only a parent row goes without a vector (0175).
+            msg = f"a chunk that is not a parent has no embedding (document {document_id})"
             raise ValueError(msg)
         self._chunks = [
             c
             for c in self._chunks
             if not (c.tenant_id == tenant_id and c.document_id == document_id)
         ]
-        self._chunks.extend(chunks)
+        # A parent row is stored without a vector, as the SQL store writes it.
+        self._chunks.extend(
+            c.model_copy(update={"embedding": None}) if c.chunk_type is ChunkType.PARENT else c
+            for c in chunks
+        )
         if chunk_params_hash is not None:
             self._documents[self._documents.index(document)] = document.model_copy(
                 update={"chunk_params_hash": chunk_params_hash}
@@ -831,15 +856,30 @@ class InMemoryKnowledgeStore(KnowledgeStore):
         return True
 
     async def list_chunks(
-        self, *, tenant_id: UUID, document_id: UUID, offset: int = 0, limit: int = 50
+        self,
+        *,
+        tenant_id: UUID,
+        document_id: UUID,
+        offset: int = 0,
+        limit: int = 50,
+        chunk_types: Collection[ChunkType] | None = None,
     ) -> tuple[list[KnowledgeChunk], int]:
+        wanted = SEARCHABLE_CHUNK_TYPES if chunk_types is None else frozenset(chunk_types)
         matching = [
-            c for c in self._chunks if c.tenant_id == tenant_id and c.document_id == document_id
+            c
+            for c in self._chunks
+            if c.tenant_id == tenant_id and c.document_id == document_id and c.chunk_type in wanted
         ]
-        matching.sort(key=lambda c: c.chunk_index)
+        matching.sort(key=lambda c: (c.chunk_index, c.chunk_type.value))
         # Mirror the SQL projection: embedding omitted from preview rows.
-        page = [c.model_copy(update={"embedding": ()}) for c in matching[offset : offset + limit]]
+        page = [_without_vector(c) for c in matching[offset : offset + limit]]
         return page, len(matching)
+
+    async def get_chunks(
+        self, *, tenant_id: UUID, chunk_ids: Sequence[UUID]
+    ) -> list[KnowledgeChunk]:
+        found = {c.id: c for c in self._chunks if c.tenant_id == tenant_id}
+        return [_without_vector(found[i]) for i in dict.fromkeys(chunk_ids) if i in found]
 
     async def chunk_embeddings_by_hash(
         self,
@@ -851,10 +891,11 @@ class InMemoryKnowledgeStore(KnowledgeStore):
     ) -> dict[str, Sequence[float]]:
         wanted = set(content_hashes)
         return {
-            c.content_hash: c.embedding
+            c.content_hash: _vector(c)
             for c in self._chunks
             if c.tenant_id == tenant_id
             and c.document_id == document_id
+            and c.chunk_type in SEARCHABLE_CHUNK_TYPES
             and c.embedding_model == embedding_model
             and c.content_hash is not None
             and c.content_hash in wanted
@@ -883,16 +924,27 @@ class InMemoryKnowledgeStore(KnowledgeStore):
     ) -> list[ScoredChunk]:
         if not kb_ids:
             return []
-        kb_set = set(kb_ids)
-        candidates = [c for c in self._chunks if c.tenant_id == tenant_id and c.kb_id in kb_set]
-        candidates.sort(key=lambda c: _cosine_distance(query_embedding, c.embedding))
+        candidates = self._recallable(tenant_id, kb_ids)
+        candidates.sort(key=lambda c: _cosine_distance(query_embedding, _vector(c)))
         return [
             ScoredChunk(
                 chunk=chunk,
-                score=1.0 - _cosine_distance(query_embedding, chunk.embedding),
+                score=1.0 - _cosine_distance(query_embedding, _vector(chunk)),
                 source="vector",
             )
             for chunk in candidates[:limit]
+        ]
+
+    def _recallable(self, tenant_id: UUID, kb_ids: Sequence[UUID]) -> list[KnowledgeChunk]:
+        """The chunks recall may return: the tenant's, in ``kb_ids``, of the
+        searchable types — also BM25's N for keyword search."""
+        kb_set = set(kb_ids)
+        return [
+            c
+            for c in self._chunks
+            if c.tenant_id == tenant_id
+            and c.kb_id in kb_set
+            and c.chunk_type in SEARCHABLE_CHUNK_TYPES
         ]
 
     async def keyword_search(
@@ -921,8 +973,7 @@ class InMemoryKnowledgeStore(KnowledgeStore):
         kb_query = build_kb_keyword_query(query)
         if kb_query is None:
             return []
-        kb_set = set(kb_ids)
-        in_scope = [c for c in self._chunks if c.tenant_id == tenant_id and c.kb_id in kb_set]
+        in_scope = self._recallable(tenant_id, kb_ids)
         scores = _keyword_scores(kb_query, in_scope)
         scored = sorted(
             (

@@ -6,7 +6,7 @@ import logging
 import operator
 import re
 from array import array
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Collection, Sequence
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
 from typing import Any
@@ -69,6 +69,7 @@ from expert_work.protocol import (
     DEFAULT_CHUNK_MAX_TOKENS,
     DEFAULT_CHUNK_OVERLAP_TOKENS,
     DEFAULT_RETRIEVAL_TOP_K,
+    SEARCHABLE_CHUNK_TYPES,
     ChunkType,
     DocumentPage,
     DocumentSourceType,
@@ -285,9 +286,11 @@ _CHUNK_COLUMNS = (
 )
 
 
-def _to_chunk(row: Any, embedding: tuple[float, ...] = ()) -> KnowledgeChunk:
+def _to_chunk(row: Any, embedding: tuple[float, ...] | None = ()) -> KnowledgeChunk:
     """Build a chunk DTO from a ``KnowledgeChunkRow`` or a ``_CHUNK_COLUMNS``
-    projection row (same attribute names)."""
+    projection row (same attribute names). A parent row has no vector, so its
+    ``embedding`` is ``None`` whatever was passed (``()`` = not loaded)."""
+    chunk_type = _enum_or(ChunkType, row.chunk_type, ChunkType.TEXT) or ChunkType.TEXT
     return KnowledgeChunk(
         id=row.id,
         tenant_id=row.tenant_id,
@@ -295,8 +298,8 @@ def _to_chunk(row: Any, embedding: tuple[float, ...] = ()) -> KnowledgeChunk:
         document_id=row.document_id,
         chunk_index=row.chunk_index,
         content=row.content,
-        embedding=embedding,
-        chunk_type=_enum_or(ChunkType, row.chunk_type, ChunkType.TEXT) or ChunkType.TEXT,
+        embedding=None if chunk_type is ChunkType.PARENT else embedding,
+        chunk_type=chunk_type,
         heading_path=tuple(row.heading_path or ()),
         doc_title=row.doc_title,
         content_hash=row.content_hash,
@@ -311,7 +314,24 @@ def _to_chunk(row: Any, embedding: tuple[float, ...] = ()) -> KnowledgeChunk:
 
 
 def _to_chunk_with_embedding(row: KnowledgeChunkRow) -> KnowledgeChunk:
-    return _to_chunk(row, tuple(float(value) for value in row.embedding))
+    vector = row.embedding
+    return _to_chunk(row, None if vector is None else tuple(float(value) for value in vector))
+
+
+#: ``chunk_type`` values recall may return, sorted so the statement is the same
+#: from one process to the next.
+_SEARCHABLE_TYPE_VALUES = tuple(sorted(chunk_type.value for chunk_type in SEARCHABLE_CHUNK_TYPES))
+
+
+def _chunk_type_in(chunk_types: Collection[ChunkType] | None) -> ColumnElement[bool]:
+    """Rows of ``chunk_types``; ``None`` = the searchable types — an allow-list,
+    so a type added later (or one only a newer release knows) stays out."""
+    values = (
+        _SEARCHABLE_TYPE_VALUES
+        if chunk_types is None
+        else sorted(chunk_type.value for chunk_type in chunk_types)
+    )
+    return KnowledgeChunkRow.chunk_type.in_(values)
 
 
 def _balanced(
@@ -477,6 +497,10 @@ async def _set_hnsw_scan(session: AsyncSession, limit: int, *, iterative: bool) 
 
 
 def _chunk_row(chunk: KnowledgeChunk) -> KnowledgeChunkRow:
+    # A parent row (B-206 K-1) is stored for reading only: no vector, no
+    # keyword vector. Any other chunk without a vector is refused by the
+    # table's CHECK (``knowledge_chunk_embedding_iff_parent``).
+    parent = chunk.chunk_type is ChunkType.PARENT
     return KnowledgeChunkRow(
         id=chunk.id,
         tenant_id=chunk.tenant_id,
@@ -484,10 +508,10 @@ def _chunk_row(chunk: KnowledgeChunk) -> KnowledgeChunkRow:
         document_id=chunk.document_id,
         chunk_index=chunk.chunk_index,
         content=chunk.content,
-        embedding=list(chunk.embedding),
+        embedding=None if parent or chunk.embedding is None else list(chunk.embedding),
         # Keyword-search vector over title + breadcrumb + body — segmented
         # app-side so it is correct for CJK (see text_search).
-        content_tsv=_kb_chunk_tsvector(chunk),
+        content_tsv=None if parent else _kb_chunk_tsvector(chunk),
         chunk_type=chunk.chunk_type.value,
         heading_path=list(chunk.heading_path) or None,
         doc_title=chunk.doc_title,
@@ -1535,13 +1559,18 @@ class SqlKnowledgeStore(KnowledgeStore):
                     KnowledgeChunkRow.document_id == document_id,
                 )
             )
+            # Parent rows first, then the chunks that point at them.
+            ordered = [
+                *(chunk for chunk in chunks if chunk.chunk_type is ChunkType.PARENT),
+                *(chunk for chunk in chunks if chunk.chunk_type is not ChunkType.PARENT),
+            ]
             # Rows are built, flushed and let go a batch at a time: an ORM row
             # with its vector, keyword vector and bound parameters costs about
             # as much again as the chunk itself, and a document can have
             # thousands (B-214). Still one transaction.
-            for start in range(0, len(chunks), _CHUNK_INSERT_BATCH):
+            for start in range(0, len(ordered), _CHUNK_INSERT_BATCH):
                 session.add_all(
-                    [_chunk_row(chunk) for chunk in chunks[start : start + _CHUNK_INSERT_BATCH]]
+                    [_chunk_row(chunk) for chunk in ordered[start : start + _CHUNK_INSERT_BATCH]]
                 )
                 await session.flush()
                 session.expunge_all()
@@ -1558,32 +1587,49 @@ class SqlKnowledgeStore(KnowledgeStore):
         return True
 
     async def list_chunks(
-        self, *, tenant_id: UUID, document_id: UUID, offset: int = 0, limit: int = 50
+        self,
+        *,
+        tenant_id: UUID,
+        document_id: UUID,
+        offset: int = 0,
+        limit: int = 50,
+        chunk_types: Collection[ChunkType] | None = None,
     ) -> tuple[list[KnowledgeChunk], int]:
         # Explicit column projection — never SELECT the large embedding vector
-        # for a preview. The returned chunks carry ``embedding == ()``.
+        # for a preview. The returned chunks carry ``embedding == ()`` (``None``
+        # for a parent row).
+        in_scope = (
+            KnowledgeChunkRow.tenant_id == tenant_id,
+            KnowledgeChunkRow.document_id == document_id,
+            _chunk_type_in(chunk_types),
+        )
         page_stmt = (
             select(*_CHUNK_COLUMNS)
-            .where(
-                KnowledgeChunkRow.tenant_id == tenant_id,
-                KnowledgeChunkRow.document_id == document_id,
-            )
-            .order_by(KnowledgeChunkRow.chunk_index.asc())
+            .where(*in_scope)
+            .order_by(KnowledgeChunkRow.chunk_index.asc(), KnowledgeChunkRow.chunk_type.asc())
             .offset(offset)
             .limit(limit)
         )
-        count_stmt = (
-            select(func.count())
-            .select_from(KnowledgeChunkRow)
-            .where(
-                KnowledgeChunkRow.tenant_id == tenant_id,
-                KnowledgeChunkRow.document_id == document_id,
-            )
-        )
+        count_stmt = select(func.count()).select_from(KnowledgeChunkRow).where(*in_scope)
         async with self._sf() as session:
             rows = (await session.execute(page_stmt)).all()
             total = (await session.execute(count_stmt)).scalar_one()
         return [_to_chunk(row) for row in rows], int(total)
+
+    async def get_chunks(
+        self, *, tenant_id: UUID, chunk_ids: Sequence[UUID]
+    ) -> list[KnowledgeChunk]:
+        ids = list(dict.fromkeys(chunk_ids))
+        if not ids:
+            return []
+        stmt = select(*_CHUNK_COLUMNS).where(
+            KnowledgeChunkRow.tenant_id == tenant_id,
+            KnowledgeChunkRow.id.in_(ids),
+        )
+        async with self._sf() as session:
+            rows = (await session.execute(stmt)).all()
+        found = {row.id: _to_chunk(row) for row in rows}
+        return [found[chunk_id] for chunk_id in ids if chunk_id in found]
 
     async def chunks_contain(self, *, tenant_id: UUID, document_id: UUID, text: str) -> bool:
         # One query on the document's chunks (``knowledge_chunk_document_idx``
@@ -1594,6 +1640,8 @@ class SqlKnowledgeStore(KnowledgeStore):
             .where(
                 KnowledgeChunkRow.tenant_id == tenant_id,
                 KnowledgeChunkRow.document_id == document_id,
+                # The chunks ``list_chunks`` lists by default (no parent rows).
+                _chunk_type_in(None),
                 func.strpos(KnowledgeChunkRow.content, text) > 0,
             )
             .exists()
@@ -1621,6 +1669,7 @@ class SqlKnowledgeStore(KnowledgeStore):
                 stmt = select(KnowledgeChunkRow.content_hash, KnowledgeChunkRow.embedding).where(
                     KnowledgeChunkRow.tenant_id == tenant_id,
                     KnowledgeChunkRow.document_id == document_id,
+                    _chunk_type_in(None),
                     KnowledgeChunkRow.embedding_model == embedding_model,
                     KnowledgeChunkRow.content_hash == any_(hashes),
                 )
@@ -1661,6 +1710,9 @@ class SqlKnowledgeStore(KnowledgeStore):
             .where(
                 KnowledgeChunkRow.tenant_id == tenant_id,
                 KnowledgeChunkRow.kb_id.in_(list(kb_ids)),
+                # Parent rows have no vector; a sequential scan would still
+                # return them (NULL distance sorts last).
+                _chunk_type_in(None),
             )
             .order_by(distance)
             .limit(limit)
@@ -1734,9 +1786,12 @@ class SqlKnowledgeStore(KnowledgeStore):
         kb_query = build_kb_keyword_query(query)
         if kb_query is None:
             return []
+        # Searchable types only — this scope is also BM25's N (``scope``
+        # below): parent rows would dilute every idf.
         in_scope = (
             KnowledgeChunkRow.tenant_id == tenant_id,
             KnowledgeChunkRow.kb_id.in_(list(kb_ids)),
+            _chunk_type_in(None),
         )
         hits = _kb_hits(kb_query, in_scope, _kb_keyword_tsquery(kb_query))
         units = len(kb_query.terms) + len(kb_query.phrases)

@@ -27,7 +27,7 @@ from expert_work.persistence.knowledge import DuplicateKnowledgeBaseError, text_
 from expert_work.persistence.knowledge import sql as sql_module
 from expert_work.persistence.knowledge.sql import _kb_keyword_tsquery
 from expert_work.persistence.knowledge.text_search import KbKeywordQuery
-from expert_work.persistence.models import KnowledgeBaseRow
+from expert_work.persistence.models import KnowledgeBaseRow, KnowledgeChunkRow
 from expert_work.protocol import (
     ChunkType,
     DocumentStatus,
@@ -128,6 +128,7 @@ async def test_replace_chunks_and_search_orders_by_cosine(sql_store: SqlStoreFix
             tenant_id=tenant, kb_ids=[base.id], query_embedding=_vec(1.0, 0.0), limit=3
         )
         assert [h.content for h in hits] == ["east", "ne", "north"]
+        assert hits[0].embedding is not None
         assert len(hits[0].embedding) == EMBEDDING_DIM
     finally:
         await engine.dispose()
@@ -1148,21 +1149,16 @@ async def test_unknown_enum_values_read_without_failing_sql(sql_store: SqlStoreF
         doc = await store.upsert_document(
             tenant_id=tenant, kb_id=base.id, filename="d.md", content=b"d"
         )
-        await store.replace_chunks(
+        stored = KnowledgeChunk(
+            id=uuid4(),
             tenant_id=tenant,
+            kb_id=base.id,
             document_id=doc.id,
-            chunks=[
-                KnowledgeChunk(
-                    id=uuid4(),
-                    tenant_id=tenant,
-                    kb_id=base.id,
-                    document_id=doc.id,
-                    chunk_index=0,
-                    content="body",
-                    embedding=_vec(1.0),
-                )
-            ],
+            chunk_index=0,
+            content="body",
+            embedding=_vec(1.0),
         )
+        await store.replace_chunks(tenant_id=tenant, document_id=doc.id, chunks=[stored])
         async with engine.begin() as conn:
             await conn.execute(
                 text(
@@ -1182,8 +1178,11 @@ async def test_unknown_enum_values_read_without_failing_sql(sql_store: SqlStoreF
         assert read is not None
         assert read.stage is None
         assert read.error_code is IngestErrorCode.INTERNAL_ERROR
-        (chunk,), _ = await store.list_chunks(tenant_id=tenant, document_id=doc.id)
+        (chunk,) = await store.get_chunks(tenant_id=tenant, chunk_ids=[stored.id])
         assert chunk.chunk_type is ChunkType.TEXT
+        # B-206 K-1: listing and recall take an allow-list of chunk types, so a
+        # type only a newer release knows stays out of them.
+        assert await store.list_chunks(tenant_id=tenant, document_id=doc.id) == ([], 0)
         assert await store.get_base(tenant_id=tenant, name="kb") is not None
     finally:
         await engine.dispose()
@@ -1394,3 +1393,140 @@ async def test_pending_slot_failure_keeps_serving_and_ready_promotes_sql(
         assert [h.content for h in hits] == ["new"]
     finally:
         await engine.dispose()
+
+
+# ---------------------------------------------------------------------------
+# B-206 K-1 父段行(两个后端共有的契约见 test_knowledge_parent_chunks_contract.py)
+# ---------------------------------------------------------------------------
+
+
+def _parent_chunk(
+    tenant_id: object, kb_id: object, document_id: object, index: int, content: str
+) -> KnowledgeChunk:
+    return _make_chunk(tenant_id, kb_id, document_id, index, content, _vec(1.0)).model_copy(
+        update={"chunk_type": ChunkType.PARENT, "embedding": None}
+    )
+
+
+@pytest.mark.asyncio
+async def test_parent_rows_are_written_first_without_any_vector(
+    sql_store: SqlStoreFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Parent rows go in before the chunks pointing at them, and carry neither
+    a vector nor a keyword vector; the children keep both."""
+    built: list[ChunkType] = []
+    real_chunk_row = sql_module._chunk_row
+
+    def _recording(chunk: KnowledgeChunk) -> KnowledgeChunkRow:
+        built.append(chunk.chunk_type)
+        return real_chunk_row(chunk)
+
+    monkeypatch.setattr(sql_module, "_chunk_row", _recording)
+    monkeypatch.setattr(sql_module, "_CHUNK_INSERT_BATCH", 2)
+    store, engine = sql_store
+    try:
+        tenant = uuid4()
+        base = await store.create_base(tenant_id=tenant, name="kb")
+        doc = await store.upsert_document(tenant_id=tenant, kb_id=base.id, filename="d.md")
+        parents = [_parent_chunk(tenant, base.id, doc.id, i, f"parent {i}") for i in range(2)]
+        children = [
+            _make_chunk(tenant, base.id, doc.id, i, f"child {i}", _vec(1.0, 0.1 * i)).model_copy(
+                update={"parent_chunk_id": parents[i // 2].id}
+            )
+            for i in range(3)
+        ]
+        await store.replace_chunks(
+            tenant_id=tenant,
+            document_id=doc.id,
+            chunks=[children[0], parents[0], *children[1:], parents[1]],
+        )
+        assert built == [ChunkType.PARENT] * 2 + [ChunkType.TEXT] * 3
+        async with engine.begin() as conn:
+            rows = (
+                await conn.execute(
+                    text(
+                        "SELECT chunk_type, chunk_index, embedding IS NULL, content_tsv IS NULL "
+                        "FROM knowledge_chunk WHERE document_id = :id "
+                        "ORDER BY chunk_type, chunk_index"
+                    ),
+                    {"id": doc.id},
+                )
+            ).all()
+        assert [tuple(row) for row in rows] == [
+            ("parent", 0, True, True),
+            ("parent", 1, True, True),
+            ("text", 0, False, False),
+            ("text", 1, False, False),
+            ("text", 2, False, False),
+        ]
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_a_parent_row_with_a_keyword_vector_is_still_never_recalled(
+    sql_store: SqlStoreFixture,
+) -> None:
+    """Recall filters by chunk type, not by the absence of a keyword vector:
+    a parent row given one by hand (an older writer, a manual fix) neither
+    comes back nor counts toward BM25's N."""
+    store, engine = sql_store
+    try:
+        tenant = uuid4()
+        base = await store.create_base(tenant_id=tenant, name="kb")
+        doc = await store.upsert_document(tenant_id=tenant, kb_id=base.id, filename="d.md")
+        texts = ["苹果 沙拉", "苹果 派", "香蕉 甜点", "面包 牛奶"]
+        await store.replace_chunks(
+            tenant_id=tenant,
+            document_id=doc.id,
+            chunks=[
+                *(
+                    _make_chunk(tenant, base.id, doc.id, i, t, _vec(1.0))
+                    for i, t in enumerate(texts)
+                ),
+                _parent_chunk(tenant, base.id, doc.id, 0, "苹果 香蕉"),
+                _parent_chunk(tenant, base.id, doc.id, 1, "苹果 香蕉 苹果 香蕉"),
+            ],
+        )
+        before = await store.keyword_search_scored(
+            tenant_id=tenant, kb_ids=[base.id], query="苹果和香蕉", limit=10
+        )
+        async with engine.begin() as conn:
+            await conn.execute(
+                text(
+                    "UPDATE knowledge_chunk SET content_tsv = to_tsvector('simple', content) "
+                    "WHERE document_id = :id AND chunk_type = 'parent'"
+                ),
+                {"id": doc.id},
+            )
+        after = await store.keyword_search_scored(
+            tenant_id=tenant, kb_ids=[base.id], query="苹果和香蕉", limit=10
+        )
+        assert {hit.chunk.chunk_type for hit in after} == {ChunkType.TEXT}
+        assert {hit.chunk.content: hit.score for hit in after} == pytest.approx(
+            {hit.chunk.content: hit.score for hit in before}, abs=1e-9
+        )
+        assert len(after) == 3
+    finally:
+        await engine.dispose()
+
+
+def test_a_full_row_without_a_vector_reads_as_a_parent_with_none() -> None:
+    """Every full-row read builds its DTO the same way; a parent row's NULL
+    vector reads as ``None`` instead of failing."""
+    tenant, kb_id, document_id = uuid4(), uuid4(), uuid4()
+    row = KnowledgeChunkRow(
+        id=uuid4(),
+        tenant_id=tenant,
+        kb_id=kb_id,
+        document_id=document_id,
+        chunk_index=0,
+        content="parent",
+        embedding=None,
+        chunk_type="parent",
+        enabled=True,
+        edited=False,
+        revision=1,
+    )
+    chunk = sql_module._to_chunk_with_embedding(row)
+    assert (chunk.chunk_type, chunk.embedding) == (ChunkType.PARENT, None)

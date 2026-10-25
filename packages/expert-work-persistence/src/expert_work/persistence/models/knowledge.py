@@ -248,7 +248,9 @@ class KnowledgeChunkRow(Base):
     document_id: Mapped[UUID] = mapped_column(PG_UUID(as_uuid=True), nullable=False)
     chunk_index: Mapped[int] = mapped_column(Integer, nullable=False)
     content: Mapped[str] = mapped_column(Text, nullable=False)
-    embedding: Mapped[list[float]] = mapped_column(Vector(EMBEDDING_DIM), nullable=False)
+    #: ``NULL`` exactly for ``chunk_type = 'parent'`` rows (B-206 K-1,
+    #: migration ``0175``): stored for reading, never embedded.
+    embedding: Mapped[list[float] | None] = mapped_column(Vector(EMBEDDING_DIM), nullable=True)
     #: Full-text vector for the keyword side of hybrid search — populated
     #: by the store from jieba-segmented ``content`` (Stream J.5).
     content_tsv: Mapped[str | None] = mapped_column(TSVECTOR(), nullable=True)
@@ -282,7 +284,17 @@ class KnowledgeChunkRow(Base):
         Index("knowledge_chunk_kb_idx", "tenant_id", "kb_id"),
         Index("knowledge_chunk_document_idx", "document_id"),
         Index("knowledge_chunk_tsv_idx", "content_tsv", postgresql_using="gin"),
-        UniqueConstraint("document_id", "chunk_index", name="knowledge_chunk_document_index_uniq"),
+        # A parent and its children each number from 0 (B-206 K-1, 0175).
+        UniqueConstraint(
+            "document_id",
+            "chunk_type",
+            "chunk_index",
+            name="knowledge_chunk_document_type_index_uniq",
+        ),
+        CheckConstraint(
+            "(chunk_type = 'parent') = (embedding IS NULL)",
+            name="knowledge_chunk_embedding_iff_parent",
+        ),
     )
 
 
