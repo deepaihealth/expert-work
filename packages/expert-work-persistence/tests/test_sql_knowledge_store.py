@@ -4,9 +4,10 @@ from __future__ import annotations
 
 import asyncio
 from array import array
-from collections.abc import Iterator
+from collections.abc import Iterator, Sequence
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from typing import overload
 from uuid import uuid4
 
 import pytest
@@ -160,6 +161,68 @@ async def test_replace_chunks_writes_every_batch_in_order(
         )
         assert hits[0].content == "part 6"
         assert hits[0].embedding == pytest.approx(chunks[6].embedding)
+    finally:
+        await engine.dispose()
+
+
+class _TrackedChunks(Sequence[KnowledgeChunk]):
+    """A chunk sequence that records the furthest index anything has read."""
+
+    def __init__(self, chunks: list[KnowledgeChunk]) -> None:
+        self._chunks = chunks
+        self.furthest = -1
+
+    def __len__(self) -> int:
+        return len(self._chunks)
+
+    @overload
+    def __getitem__(self, index: int) -> KnowledgeChunk: ...
+    @overload
+    def __getitem__(self, index: slice) -> Sequence[KnowledgeChunk]: ...
+    def __getitem__(self, index: int | slice) -> KnowledgeChunk | Sequence[KnowledgeChunk]:
+        if isinstance(index, slice):
+            picked = range(len(self._chunks))[index]
+            if picked:
+                self.furthest = max(self.furthest, max(picked))
+            return self._chunks[index]
+        self.furthest = max(self.furthest, index % len(self._chunks))
+        return self._chunks[index]
+
+
+@pytest.mark.asyncio
+async def test_replace_chunks_reads_its_input_a_batch_at_a_time(
+    sql_store: SqlStoreFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # B-214: the ingest path hands a lazy sequence whose rows are built on
+    # read; reading it whole first (to reorder, say) would hold every vector at
+    # once. When a batch's rows are built, nothing past that batch was read.
+    monkeypatch.setattr(sql_module, "_CHUNK_INSERT_BATCH", 2)
+    seen_at_build: list[int] = []
+    real_chunk_row = sql_module._chunk_row
+    store, engine = sql_store
+    try:
+        tenant = uuid4()
+        base = await store.create_base(tenant_id=tenant, name="kb")
+        doc = await store.upsert_document(tenant_id=tenant, kb_id=base.id, filename="d.md")
+        parent = _parent_chunk(tenant, base.id, doc.id, 0, "parent 0")
+        children = [
+            _make_chunk(tenant, base.id, doc.id, i, f"child {i}", _vec(1.0, 0.1 * i)).model_copy(
+                update={"parent_chunk_id": parent.id}
+            )
+            for i in range(5)
+        ]
+        tracked = _TrackedChunks([parent, *children])
+
+        def _recording(chunk: KnowledgeChunk) -> KnowledgeChunkRow:
+            seen_at_build.append(tracked.furthest)
+            return real_chunk_row(chunk)
+
+        monkeypatch.setattr(sql_module, "_chunk_row", _recording)
+        await store.replace_chunks(tenant_id=tenant, document_id=doc.id, chunks=tracked)
+        assert seen_at_build == [1, 1, 3, 3, 5, 5]
+        stored, total = await store.list_chunks(tenant_id=tenant, document_id=doc.id, limit=50)
+        assert total == 5
+        assert {c.parent_chunk_id for c in stored} == {parent.id}
     finally:
         await engine.dispose()
 
@@ -1436,9 +1499,7 @@ async def test_parent_rows_are_written_first_without_any_vector(
             for i in range(3)
         ]
         await store.replace_chunks(
-            tenant_id=tenant,
-            document_id=doc.id,
-            chunks=[children[0], parents[0], *children[1:], parents[1]],
+            tenant_id=tenant, document_id=doc.id, chunks=[*parents, *children]
         )
         assert built == [ChunkType.PARENT] * 2 + [ChunkType.TEXT] * 3
         async with engine.begin() as conn:

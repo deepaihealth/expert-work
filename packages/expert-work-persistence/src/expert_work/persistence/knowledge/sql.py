@@ -1559,18 +1559,17 @@ class SqlKnowledgeStore(KnowledgeStore):
                     KnowledgeChunkRow.document_id == document_id,
                 )
             )
-            # Parent rows first, then the chunks that point at them.
-            ordered = [
-                *(chunk for chunk in chunks if chunk.chunk_type is ChunkType.PARENT),
-                *(chunk for chunk in chunks if chunk.chunk_type is not ChunkType.PARENT),
-            ]
-            # Rows are built, flushed and let go a batch at a time: an ORM row
-            # with its vector, keyword vector and bound parameters costs about
-            # as much again as the chunk itself, and a document can have
-            # thousands (B-214). Still one transaction.
-            for start in range(0, len(ordered), _CHUNK_INSERT_BATCH):
+            # Rows are built, flushed and let go a batch at a time, in the
+            # caller's order: an ORM row with its vector, keyword vector and
+            # bound parameters costs about as much again as the chunk itself,
+            # and a document can have thousands (B-214) — so ``chunks`` (a lazy
+            # sequence on the ingest path) is read one slice at a time, never
+            # whole. Still one transaction. ``parent_chunk_id`` has no foreign
+            # key, so parent rows (B-206 K-1) need not come first; the ingest
+            # path yields them first anyway.
+            for start in range(0, len(chunks), _CHUNK_INSERT_BATCH):
                 session.add_all(
-                    [_chunk_row(chunk) for chunk in ordered[start : start + _CHUNK_INSERT_BATCH]]
+                    [_chunk_row(chunk) for chunk in chunks[start : start + _CHUNK_INSERT_BATCH]]
                 )
                 await session.flush()
                 session.expunge_all()
