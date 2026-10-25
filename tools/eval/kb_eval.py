@@ -1681,9 +1681,12 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--semantic-breaks",
-        default="off",
+        default="on",
         choices=("on", "off"),
-        help="切块时也按主题断开(B-206 K-3 起生产默认关):on = K-3 之前的生产行为,对照臂",
+        help=(
+            "切块时也按主题断开(生产默认开;10-25 开发集:关掉后真实问法集变差):"
+            "off = 只按结构和长度切"
+        ),
     )
     parser.add_argument(
         "--doc-titles",

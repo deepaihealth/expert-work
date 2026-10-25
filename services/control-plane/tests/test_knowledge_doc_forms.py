@@ -168,6 +168,11 @@ def _squash(text: str) -> str:
     return re.sub(r"\s+", "", text)
 
 
+def _sentences(text: str) -> list[str]:
+    """``text`` cut after each sentence end (CJK or ASCII full stop, ! or ?)."""
+    return [piece for piece in re.split(r"(?<=[\u3002\uff01\uff1f.!?])", text) if piece]
+
+
 def _lines(text: str) -> list[str]:
     return [line.strip() for line in text.splitlines() if line.strip()]
 
@@ -206,10 +211,19 @@ def _table_runs(body: str) -> list[list[str]]:
 async def test_no_text_is_lost(doc: FormDoc, embedder: Embedder) -> None:
     # Every line / cell the user wrote reaches a chunk body (a heading may
     # instead sit on a chunk's heading path) — whatever semantic splitting does.
+    # Checked sentence by sentence: a paragraph cut mid-text repeats its last
+    # sentence(s) at the head of the next chunk (B-206 K-3), so the joined
+    # bodies hold it whole but not as one unbroken run.
     ingested = await _ingest(doc, embedder=embedder)
     bodies = _squash("".join(chunk.content for chunk in ingested.chunks))
     headings = {_squash(h) for chunk in ingested.chunks for h in chunk.heading_path}
-    lost = [u for u in doc.units if _squash(u) not in bodies and _squash(u) not in headings]
+    lost = [
+        sentence
+        for unit in doc.units
+        if _squash(unit) not in headings
+        for sentence in _sentences(_squash(unit))
+        if sentence not in bodies
+    ]
     assert not lost
 
 
@@ -553,6 +567,7 @@ def _parent_tokens(parent: ParentChunk, doc: FormDoc, body: str | None = None) -
     return count_tokens(chunk_retrieval_text(parent.heading_path, text, title))
 
 
+@pytest.mark.usefixtures("no_semantic_breaks")
 @pytest.mark.parametrize("doc", _params(TEXT_FORM_DOCS))
 async def test_the_stored_chunks_are_the_children_of_the_parents(doc: FormDoc) -> None:
     ingested = await _ingest(doc)

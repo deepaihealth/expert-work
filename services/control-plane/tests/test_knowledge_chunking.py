@@ -27,6 +27,7 @@ from control_plane.knowledge.chunking import (
     chunk_params_hash,
     configure_semantic_breaks,
     count_tokens,
+    semantic_breaks_enabled,
 )
 from control_plane.knowledge.chunking import chunk_markdown as _chunk_markdown
 from control_plane.knowledge.chunking import chunk_markdown_semantic as _chunk_markdown_semantic
@@ -977,8 +978,9 @@ def test_chunk_params_hash_follows_the_parameters_and_the_switch() -> None:
     assert base == chunk_params_hash(max_tokens=400, overlap_tokens=0)
     assert base != chunk_params_hash(max_tokens=512, overlap_tokens=0)
     assert base != chunk_params_hash(max_tokens=400, overlap_tokens=64)
-    configure_semantic_breaks(enabled=True)
+    previous = semantic_breaks_enabled()
+    configure_semantic_breaks(enabled=not previous)
     try:
         assert base != chunk_params_hash(max_tokens=400, overlap_tokens=0)
     finally:
-        configure_semantic_breaks(enabled=False)
+        configure_semantic_breaks(enabled=previous)

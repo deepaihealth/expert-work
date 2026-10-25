@@ -194,11 +194,12 @@ CHUNKER_VERSION = "k3k1"
 
 #: Whether an ingest also splits sections at topic shifts
 #: (:func:`chunk_markdown_semantic`, ``Settings.knowledge_semantic_breaks``).
-#: Off by default since B-206 K-3: published comparisons found no stable gain
-#: from semantic chunking over structure plus size, and finding the topic
-#: shifts embeds every block once more on every ingest. Kept as a switch for
-#: A/B comparisons.
-_semantic_breaks_on = False
+#: On by default. B-206 K-3 turned it off (published comparisons found no
+#: stable gain, and finding the shifts embeds every block once more on every
+#: ingest); the dev set then lost on real staff questions — rerank MRR@10
+#: 0.755 off vs 0.783 on, section hit 0.934 vs 0.961 — for about 1.8x the
+#: ingest embedding cost (2026-10-25). The switch turns it off to save that.
+_semantic_breaks_on = True
 
 
 def configure_semantic_breaks(*, enabled: bool) -> None:
@@ -208,7 +209,7 @@ def configure_semantic_breaks(*, enabled: bool) -> None:
 
 
 def semantic_breaks_enabled() -> bool:
-    """Whether ingests split sections at topic shifts (off by default)."""
+    """Whether ingests split sections at topic shifts (on by default)."""
     return _semantic_breaks_on
 
 

@@ -537,10 +537,11 @@ class Settings(BaseSettings):
     #: with ``error_code=too_many_chunks``, before any chunk is embedded.
     knowledge_document_max_chunks: int = Field(default=40_000, gt=0)
 
-    #: B-206 K-3 — also split document sections at topic shifts (each block is
-    #: embedded once more on every ingest to find them). Off: chunks follow
-    #: structure and size only; on is for A/B comparisons.
-    knowledge_semantic_breaks: bool = False
+    #: Also split document sections at topic shifts (each block is embedded once
+    #: more on every ingest to find them; B-206 K-3 dev set, 2026-10-25: real
+    #: staff questions rank better with it). Off: chunks follow structure and
+    #: size only, at about half the ingest embedding cost.
+    knowledge_semantic_breaks: bool = True
 
     #: Original upload bytes the server holds at once, over every document it
     #: is ingesting (upload path and recovery worker together). A claim holds
