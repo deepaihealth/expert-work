@@ -31,7 +31,7 @@ from orchestrator import (
 from orchestrator.context import WorkspaceFileWriter, plan_md_digest, render_plan_md
 from orchestrator.graph_builder import make_workspace_ingest_node
 from orchestrator.graph_builder.planner import complete_open_steps, make_planner_node
-from orchestrator.tools.sandbox import RecordingSandboxRuntime, SandboxOutcome
+from orchestrator.tools.sandbox import EgressContext, RecordingSandboxRuntime, SandboxOutcome
 from orchestrator.tools.spawn_worker import SPAWN_WORKER_TOOL_NAME
 
 
@@ -193,8 +193,9 @@ class _FsSandbox(RecordingSandboxRuntime):
         agent_key: str = "",
         run_id: UUID | None = None,
         has_skills: bool = False,
+        egress: EgressContext | None = None,
     ) -> SandboxOutcome:
-        del timeout_s, agent_key, run_id, has_skills
+        del timeout_s, agent_key, run_id, has_skills, egress
         self.execs.append((sandbox_id, code))
         for rel, content in self.files.items():
             if json.dumps(rel) in code:

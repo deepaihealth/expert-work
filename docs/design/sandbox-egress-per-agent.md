@@ -1,5 +1,11 @@
 # Per-agent sandbox egress — let skill code reach the internet, audited not walled
 
+> **B-217 (2026-10-24):** on ACS the "sandboxes stay on the `internal:true` net"
+> premise below no longer holds — nothing isolated the pod network until
+> [sandbox-network-isolation-acs.md](./sandbox-network-isolation-acs.md) (dedicated
+> security group, deny by default). The proxy env is also injected per exec now,
+> not at sandbox create (§ 4 there).
+
 > Status: **proposed** (design). Companion to
 > [skill-runtime-capability.md](./skill-runtime-capability.md): this closes that
 > doc's "F (external network) is a hard ceiling" claim, which was **overstated**

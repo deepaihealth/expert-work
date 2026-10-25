@@ -50,6 +50,7 @@ from orchestrator.tools.file_ops import (
     build_write_wrapper,
 )
 from orchestrator.tools.sandbox import (
+    EgressContext,
     RecordingSandboxRuntime,
     SandboxSupervisorError,
     WorkspaceFileNotFoundError,
@@ -1371,6 +1372,7 @@ class _SequenceRuntime(RecordingSandboxRuntime):
         agent_key: str = "",
         run_id: UUID | None = None,
         has_skills: bool = False,
+        egress: EgressContext | None = None,
     ) -> SandboxOutcome:
         self.execs.append((sandbox_id, code))
         self.exec_agent_keys.append(agent_key)

@@ -317,6 +317,99 @@ matched_lines="$(kubectl -n default get pods \
     2>/dev/null || true)"
 sandbox_cache_verdict "${cache_enabled}" "${cache_lines}" "${matched_lines}" "${pool_image}"
 
+# B-217 —— 沙箱网络隔离。ACS 上沙箱 Pod 默认进集群安全组,和平台服务同组:沙箱里的代码
+# 能直连公网和全部内网服务(数据库、Redis、k8s 接口、不设认证的监控),智能体的「出网关」
+# 只是没给代理变量。隔离靠池模板注解 network.alibabacloud.com/security-group-ids 指定的
+# 独立安全组(只放行域名解析、出网代理、NAS、内网 pip 镜像)。它丢了不会有任何报错:有人
+# apply 了不带注解的池定义、或注解写回集群安全组,沙箱照常开机,只是又和平台互通了。
+#
+# 判据看 ACS 实际分给沙箱的安全组(Pod 注解 security-group-id),不看模板写了什么:池里在跑的
+# 每一台 —— 待命的和用户正在用的都算,改模板不会把已在用的沙箱挪组 —— 都必须正好是模板
+# 那组,且模板那组和 control-plane 没有交集。只 WARN,同 B-57:SandboxSet 不在 release.sh
+# 的 apply 范围里,smoke 非零让人回滚 control-plane 修不好它;要做的是按
+# docs/runbooks/sandbox-image-release.md 重新 apply 池定义、回收旧沙箱。
+#
+# 纯函数,输入全是 kubectl 的输出,test_smoke_sandbox_network.py 直接驱动它:
+#   $1 池模板的 security-group-ids 注解值(逗号分隔)
+#   $2 池里在跑的沙箱 Pod 实际分到的安全组,每行一台(一台多个组时逗号分隔)
+#   $3 control-plane Pod 实际分到的安全组,每行一台
+sandbox_network_verdict() {
+    local template="$1" pool="$2" platform="$3" want line got off="" shared
+    if [[ -z "${template}" ]]; then
+        echo "WARN sandbox network (B-217): 沙箱池模板没有 network.alibabacloud.com/security-group-ids,"
+        echo "     沙箱进集群安全组、和平台服务互通;按 docs/runbooks/sandbox-image-release.md 重新 apply 池定义"
+        return 0
+    fi
+    if [[ -z "${pool//[[:space:]]/}" || -z "${platform//[[:space:]]/}" ]]; then
+        echo "WARN sandbox network (B-217): 看不到池里沙箱或 control-plane 实际分到的安全组,没法确认隔离"
+        return 0
+    fi
+    want="$(tr ',' '\n' <<<"${template}" | sed 's/[[:space:]]//g' | grep -v '^$' | sort -u | paste -sd, -)"
+    while IFS= read -r line; do
+        got="$(tr ',' '\n' <<<"${line}" | sed 's/[[:space:]]//g' | grep -v '^$' | sort -u | paste -sd, - || true)"
+        [[ "${got}" == "${want}" ]] || off="${off:+${off} }${got:-<none>}"
+    done <<<"${pool}"
+    shared="$(grep -Fxf <(tr ',' '\n' <<<"${platform}" | sed 's/[[:space:]]//g' | grep -v '^$') \
+        <(tr ',' '\n' <<<"${want}") | sort -u | paste -sd, - || true)"
+    if [[ -n "${shared}" ]]; then
+        echo "WARN sandbox network (B-217): 沙箱池的安全组 ${shared} 也挂在 control-plane 上 —— 沙箱能直连平台内网;"
+        echo "     核对 infra/k8s/sandbox-test 的注解后按 docs/runbooks/sandbox-image-release.md 重新 apply 池定义"
+    elif [[ -n "${off}" ]]; then
+        echo "WARN sandbox network (B-217): 有沙箱不在模板写的安全组 ${want} 里(实际:${off});"
+        echo "     改模板后已在用的沙箱不会换组,按 docs/runbooks/sandbox-image-release.md 回收旧沙箱"
+    else
+        echo "OK   sandbox pool is on its own security group (${want})"
+    fi
+}
+
+# 沙箱安全组只放行到托管组件的 /32:集群域名解析(CoreDNS,托管、集群里看不到它的 Pod)和
+# k8s 接口(沙箱开机时 ACS 的 Pod 内代理要连)。不写成整个 VPC 网段,是因为显式放行的网段
+# 会越过组内隔离 —— 10-25 实测两台沙箱经 6443 / 53 互通。代价是阿里云换了这些地址,沙箱就
+# 解析不了域名 / 开不了机。池定义上记着放行了哪些地址(infra/k8s/sandbox-test 的
+# sg-dns-peers / sg-apiserver-peers 注解),这里拿集群里的实际端点比,多出来的就提醒。
+#
+# 纯函数:$1 池模板的安全组注解(空 = 还没隔离,不比)  $2 记下的 DNS 地址(逗号分隔)
+#   $3 kube-dns 实际端点,每行一个  $4 记下的 k8s 接口地址  $5 kubernetes 实际端点,每行一个
+sandbox_peer_drift_verdict() {
+    local template="$1" dns_peers="$2" dns="$3" api_peers="$4" api="$5" extra
+    [[ -n "${template}" ]] || return 0
+    if [[ -z "${dns_peers}" || -z "${api_peers}" ]]; then
+        echo "WARN sandbox peers (B-217): 池定义上没记放行的 DNS / k8s 接口地址(sg-dns-peers / sg-apiserver-peers),没法比"
+        return 0
+    fi
+    extra="$( { grep -vFxf <(tr ',' '\n' <<<"${dns_peers}") <<<"${dns}" || true; \
+        grep -vFxf <(tr ',' '\n' <<<"${api_peers}") <<<"${api}" || true; } | grep -v '^[[:space:]]*$' | sort -u | paste -sd, - || true)"
+    if [[ -n "${extra}" ]]; then
+        echo "WARN sandbox peers (B-217): 集群域名解析 / k8s 接口出现了沙箱安全组没放行的地址 ${extra} ——"
+        echo "     新沙箱会解析不了域名或开不了机;在控制台给沙箱安全组补上,再更新池定义上的注解"
+    else
+        echo "OK   sandbox security group still covers cluster DNS and the k8s API"
+    fi
+}
+
+echo "== sandbox network isolation (B-217, warn-only) =="
+pool_sg_template="$(kubectl -n default get sandboxset expert-work-sandbox \
+    -o jsonpath='{.spec.template.metadata.annotations.network\.alibabacloud\.com/security-group-ids}' \
+    2>/dev/null || true)"
+pool_sg_lines="$(kubectl -n default get pods -l agents.kruise.io/sandbox-pool=expert-work-sandbox \
+    --field-selector=status.phase=Running \
+    -o jsonpath='{range .items[*]}{.metadata.annotations.network\.alibabacloud\.com/security-group-id}{"\n"}{end}' \
+    2>/dev/null || true)"
+platform_sg_lines="$(kubectl -n expert-work get pods -l app.kubernetes.io/name=control-plane \
+    -o jsonpath='{range .items[*]}{.metadata.annotations.network\.alibabacloud\.com/security-group-id}{"\n"}{end}' \
+    2>/dev/null || true)"
+sandbox_network_verdict "${pool_sg_template}" "${pool_sg_lines}" "${platform_sg_lines}"
+pool_dns_peers="$(kubectl -n default get sandboxset expert-work-sandbox \
+    -o jsonpath='{.metadata.annotations.expert-work\.io/sg-dns-peers}' 2>/dev/null || true)"
+pool_api_peers="$(kubectl -n default get sandboxset expert-work-sandbox \
+    -o jsonpath='{.metadata.annotations.expert-work\.io/sg-apiserver-peers}' 2>/dev/null || true)"
+dns_endpoints="$(kubectl -n kube-system get endpointslices -l kubernetes.io/service-name=kube-dns \
+    -o jsonpath='{range .items[*].endpoints[*]}{.addresses[0]}{"\n"}{end}' 2>/dev/null | sort -u || true)"
+api_endpoints="$(kubectl -n default get endpointslices -l kubernetes.io/service-name=kubernetes \
+    -o jsonpath='{range .items[*].endpoints[*]}{.addresses[0]}{"\n"}{end}' 2>/dev/null | sort -u || true)"
+sandbox_peer_drift_verdict "${pool_sg_template}" "${pool_dns_peers}" "${dns_endpoints}" \
+    "${pool_api_peers}" "${api_endpoints}"
+
 # B-154 —— Langfuse 的 ClickHouse 数据盘。它满了的失败形态是**无声的**:
 # Langfuse 的 web 照样 200(上面那两条 langfuse 检查照过),worker 每次写入
 # NOT_ENOUGH_SPACE 后重试三次就把记录丢掉,只在 worker 日志里留一行 error。

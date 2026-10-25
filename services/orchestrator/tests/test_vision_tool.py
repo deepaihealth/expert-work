@@ -26,6 +26,7 @@ from orchestrator.tools.nas_workspace_store import NasWorkspaceStore
 from orchestrator.tools.read_page import ReadPageTool, document_sha, workspace_figure_ref
 from orchestrator.tools.registry import ToolBlockedError, ToolContext
 from orchestrator.tools.sandbox import (
+    EgressContext,
     RecordingSandboxRuntime,
     SandboxOutcome,
     WorkspacePermissionError,
@@ -780,6 +781,7 @@ class _LocalRenderRuntime(RecordingSandboxRuntime):
         agent_key: str = "",
         run_id: UUID | None = None,
         has_skills: bool = False,
+        egress: EgressContext | None = None,
     ) -> SandboxOutcome:
         await super().exec(
             sandbox_id=sandbox_id,
@@ -788,6 +790,7 @@ class _LocalRenderRuntime(RecordingSandboxRuntime):
             agent_key=agent_key,
             run_id=run_id,
             has_skills=has_skills,
+            egress=egress,
         )
         params = _snippet_params(code)
         env = _run_render(self.ws, params["rel"], units=params["units"], out_rel=params["out_rel"])

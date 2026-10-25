@@ -1106,3 +1106,32 @@ PY
 
 - [x] **53.1 出网关的智能体**:判据:`Downloading https://mirrors.cloud.tencent.com/pypi/packages/…scikit_learn-…whl`,整条命令 10 秒内结束。**没修好时**:`Downloading https://mirrors.aliyun.com/…`,20 秒以上。 **10-24 测试 `4a58c44e3`(沙箱 `daf63cb1`)过**:`Downloading https://mirrors.cloud.tencent.com/pypi/packages/…/scikit_learn-1.9.1-cp312-…whl (9.2 MB)`,整条 3.2 秒;沙箱 `PIP_EXTRA_INDEX_URL` 为腾讯云、`PIP_TRUSTED_HOST` 只有内网主机。
 - [ ] **53.2 出网开的智能体**(pip 经凭据代理出去):判据同 53.1;另查 `sandbox_egress_audit` 里这次运行有 `mirrors.cloud.tencent.com` 的放行记录(和 `mirrors.cloud.aliyuncs.com` 查目录的记录)。**没修好时**:同 53.1;若是 403 / 407,是代理那边的问题,不是源的问题。 **10-24 测试 `4a58c44e3` 未过,不是 B-212 的问题**:pip 同样从腾讯云下载、4.5 秒,但沙箱里**没有任何代理环境变量**,`sandbox_egress_audit` 也没有这次运行的记录 —— pip 是直连出去的。两个原因:① 同一用户的热沙箱被多个智能体共用,代理环境变量只在建沙箱时注入一次,这次复用的是出网关智能体建的那个沙箱;② 沙箱网络本身没隔离,不走代理也能直连公网和全部内网服务。登记 **B-217**(高),修好后重验本条。
+
+## §54 沙箱网络隔离 + 出网设置每次执行注入(B-217)
+
+**背景**:10-24 验收 53.2 发现,ACS 上沙箱和平台服务同在集群安全组,沙箱能直连公网和全部内网服务(数据库、Redis、k8s 接口、不设认证的监控);「出网关」只是没给代理变量,白名单绕得过去,审计 10-22 后一条都没有。另一处:代理变量只在建沙箱时注入,同一用户的热沙箱被多个智能体共用,后来的智能体沿用第一个的出网设置。改动:① 沙箱单独一个安全组 `ew-test-sandbox`(组内隔离,只放行出网代理、域名解析、NAS、内网 pip 镜像、k8s 接口、镜像仓库;其余全拒),出网代理单独一个 `ew-test-credproxy`(10-24/25 用户在控制台建;审查后 10-25 收窄:到出网代理只开 8081、域名解析与 k8s 接口只放行到 /32 —— 放行整个 VPC 网段时两台沙箱经 6443 / 53 互通,实测);② 出网变量改为每次 exec 注入:出网开现铸 token,出网关把代理变量全部置空并去掉公网 pip 备源;③ smoke 新增 `sandbox network isolation`。设计与规则:`docs/design/sandbox-network-isolation-acs.md`。
+
+**怎么进**:发测试后 `kubectl apply -k infra/k8s/sandbox-test` 换正式沙箱池(apply 后按手册把 replicas 补回 2);**改模板不会把用户已在用的沙箱挪组**,apply 后把池里现有沙箱全部回收:`kubectl -n default delete sandbox -l agents.kruise.io/sandbox-pool=expert-work-sandbox`(工作区在 NAS,重建无损;那一刻正在跑的工具调用会失败一次),等池补满;调试台用两个带沙箱的智能体:A 出网关、B 出网开且白名单为空,**同一个账号**(共用一个热沙箱)。探测脚本 `exec_python` 原样执行(只打主机名与状态码):
+
+```python
+import os, socket, time, urllib.request, urllib.parse
+p = os.environ.get("HTTPS_PROXY", "")
+print("B217 proxy", urllib.parse.urlsplit(p).hostname or "none", "extra_index", repr(os.environ.get("PIP_EXTRA_INDEX_URL")))
+for name, host, port in (("baidu", "www.baidu.com", 443), ("prometheus", "prometheus.expert-work.svc.cluster.local", 9090), ("control-plane", "control-plane.expert-work.svc.cluster.local", 8000)):
+    try:
+        socket.create_connection((host, port), timeout=3).close(); print("B217 direct", name, "OPEN")
+    except Exception as e:
+        print("B217 direct", name, "closed", type(e).__name__)
+try:
+    print("B217 via-proxy baidu", urllib.request.urlopen("https://www.baidu.com/", timeout=10).status)
+except Exception as e:
+    print("B217 via-proxy baidu", type(e).__name__)
+```
+
+- [ ] **54.1 smoke**:`tools/deploy/smoke.sh test` 有 `OK   sandbox pool is on its own security group (sg-bp1cx4xj915hke4wgyf3)` 与 `OK   sandbox security group still covers cluster DNS and the k8s API`;出网代理 Pod 注解 `security-group-id` 为 `sg-bp1hjzkfjlao7lcv45py`。**没修好时**:`WARN sandbox network (B-217)`。
+- [ ] **54.2 出网关的智能体 A**:`B217 proxy none extra_index ''`;三条 direct 全部 `closed`;via-proxy 不是 200。再跑 `python -m pip download --no-deps --no-cache-dir -d /tmp/b217 six` 成功、10 秒内,`Downloading http://mirrors.cloud.aliyuncs.com/…`。**没修好时**:direct 有 OPEN,或 pip 先对腾讯云重试一轮再成功(十几秒以上)。
+- [ ] **54.3 出网开的智能体 B,紧接着在同一个热沙箱上跑**:`B217 proxy credential-proxy… extra_index 'https://mirrors.cloud.tencent.com/pypi/simple/'`;direct 全部 `closed`;via-proxy 200;`sandbox_egress_audit` 有这次运行的 `www.baidu.com` 放行记录(`agent_name` 为 B)。**没修好时**:`proxy none`(沿用了 A 建沙箱时的设置)—— 10-24 53.2 的原样。
+- [ ] **54.4 再回到 A**:同 54.2(B 的代理设置没有留给 A)。
+- [ ] **54.5 重验 53.2**:按 §53 跑 53.2,判据原样。
+- [ ] **54.6 平台照常**:B-140 评测里带 exec_python 的用例各跑一次通过;金丝雀 PASS;工作区读写、上传下载正常。
+- [ ] **54.7 沙箱之间不通**:在一台沙箱里 `kubectl -n default exec <沙箱A> -c main -- python3 -c '…监听 6443 与 53…'`(同 10-25 的做法),从另一台沙箱连 A 的 6443 / 53 / 49983。判据:全部超时。**没修好时**(规则写成 VPC 网段):6443 / 53 连得上。

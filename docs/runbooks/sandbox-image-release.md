@@ -39,10 +39,19 @@
 
    ```bash
    export KUBECONFIG=~/.kube/expert-work-test.yaml
-   kubectl apply -f infra/k8s/sandbox/sandboxset.yaml
+   kubectl apply -k infra/k8s/sandbox-test      # 测试:带沙箱专用安全组(B-217)
+   # 生产在它自己的沙箱安全组建好之前仍是:kubectl apply -f infra/k8s/sandbox/sandboxset.yaml
    kubectl get sandboxset expert-work-sandbox -n default -w
    # 到 UPDATEDAVAILABLEREPLICAS 等于池大小为止
    ```
+
+   **测试别再 `apply -f sandboxset.yaml`**(B-217):那份文件不带安全组注解,apply 后新开的
+   沙箱会回到集群安全组、和平台服务互通 —— 不报任何错。smoke 的
+   `sandbox network isolation` 一行会 WARN。安全组规则与理由见
+   `docs/design/sandbox-network-isolation-acs.md`。
+   **换安全组(第一次切、或改了注解)时**,用户已在用的沙箱不会跟着换组:apply 后
+   `kubectl -n default delete sandbox -l agents.kruise.io/sandbox-pool=expert-work-sandbox`
+   回收全部现有沙箱(工作区在 NAS,重建无损)。只换镜像 tag 不用这一步。
 
    **池大小按环境手设,文件里是 1**:测试集群 10-16 起是 2(评测并发,用户定),
    apply 会把它改回 1,apply 后补一句

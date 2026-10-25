@@ -1,0 +1,35 @@
+# B-217 — sandboxes on their own security group (test cluster: ew-test-sandbox).
+#
+# Without this annotation ACS puts every sandbox in the cluster security group,
+# next to the platform: sandbox code reaches the database, Redis, the k8s API,
+# the unauthenticated monitoring stack and the public internet directly, and an
+# agent's `egress: none` only means "no proxy env". ew-test-sandbox is
+# intra-group isolated and allows egress only to: the credential-proxy group on
+# 8081 (CONNECT; not 8080, the unauthenticated /forward API), cluster DNS and the
+# k8s API as /32s (listed below), Aliyun DNS 100.100.2.136/29:53, the NAS mount
+# target, the in-VPC pip mirror (100.100.2.148:80) and the image registry + its
+# OSS blobs (100.103.0.0/16, 100.118.0.0/16 on 443 — ACS pulls uncached images
+# through the pod's own ENI); everything else is denied.
+#
+# DNS and the k8s API are /32s, not the VPC range: an explicit CIDR rule
+# overrides intra-group isolation, and with 172.16.0.0/16 two sandboxes talked
+# to each other on 53 and 6443 (measured 2026-10-25). The two annotations on the
+# SandboxSet record which addresses the group allows; smoke.sh compares them
+# with the cluster's kube-dns / kubernetes endpoints and warns when Aliyun moves
+# them (new sandboxes would lose DNS or fail to boot). 172.16.41.70 is the API
+# address the ACS in-pod agent dials; it is not a `kubernetes` endpoint.
+# Rules, measurements, accepted residual channels:
+# docs/design/sandbox-network-isolation-acs.md.
+apiVersion: agents.kruise.io/v1alpha1
+kind: SandboxSet
+metadata:
+  name: expert-work-sandbox
+  namespace: default
+  annotations:
+    expert-work.io/sg-dns-peers: "172.16.41.73,172.16.41.74"
+    expert-work.io/sg-apiserver-peers: "172.16.41.70,172.16.41.72,172.16.88.94"
+spec:
+  template:
+    metadata:
+      annotations:
+        network.alibabacloud.com/security-group-ids: "sg-bp1cx4xj915hke4wgyf3"

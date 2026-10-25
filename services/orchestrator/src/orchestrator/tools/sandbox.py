@@ -352,6 +352,7 @@ class SandboxRuntime(Protocol):
         agent_key: str = "",
         run_id: UUID | None = None,
         has_skills: bool = False,
+        egress: EgressContext | None = None,
     ) -> SandboxOutcome:
         """Run ``code`` in the sandbox; return its captured outcome.
 
@@ -368,6 +369,11 @@ class SandboxRuntime(Protocol):
         wrapper 预绑定 —— ``run_in_sandbox`` 每次调用自己判定(那个 run 名下真有
         ``inputs.json`` 才给,否则 ``None``)。``has_skills`` 同理:每次调用的事实,
         ``True`` 时才注入 ``EXPERT_WORK_SKILLS_DIR``,wrapper 一律原样透传。
+
+        ``egress``(B-217)与 ``acquire`` 的同名参数同义,由 :class:`_EgressBindingClient`
+        每次补上:同一用户的热沙箱被他的多个智能体共用,出网变量只能按**本次调用方**
+        给,不能跟着沙箱走。云上后端据此每次注入 / 置空代理变量;本地 supervisor 后端
+        的出网变量在 ``docker run`` 时按容器烤定,忽略它。
         """
 
     async def release(self, *, sandbox_id: UUID) -> None:
@@ -449,7 +455,12 @@ class HTTPSupervisorRuntime:
         agent_key: str = "",
         run_id: UUID | None = None,
         has_skills: bool = False,
+        egress: EgressContext | None = None,
     ) -> SandboxOutcome:
+        # B-217 —— the docker supervisor bakes each container's egress env at
+        # `docker run` (acquire carries it) on an `internal: true` network; there
+        # is no per-exec egress channel to forward this to.
+        del egress
         payload: dict[str, Any] = {"code": code}
         if timeout_s is not None:
             payload["timeout_s"] = timeout_s
@@ -578,6 +589,8 @@ class RecordingSandboxRuntime:
     exec_run_ids: list[UUID | None] = field(default_factory=list)
     #: B-84 — the ``has_skills`` passed to each exec (same reasoning).
     exec_has_skills: list[bool] = field(default_factory=list)
+    #: B-217 — the ``egress`` passed to each exec (same reasoning).
+    exec_egress: list[EgressContext | None] = field(default_factory=list)
     released: list[UUID] = field(default_factory=list)
     destroyed: list[tuple[UUID, str]] = field(default_factory=list)
     reaped: list[bool] = field(default_factory=list)
@@ -607,12 +620,14 @@ class RecordingSandboxRuntime:
         agent_key: str = "",
         run_id: UUID | None = None,
         has_skills: bool = False,
+        egress: EgressContext | None = None,
     ) -> SandboxOutcome:
         del timeout_s
         self.execs.append((sandbox_id, code))
         self.exec_agent_keys.append(agent_key)
         self.exec_run_ids.append(run_id)
         self.exec_has_skills.append(has_skills)
+        self.exec_egress.append(egress)
         if self.exec_error is not None:
             raise self.exec_error
         return self.outcome
@@ -633,7 +648,9 @@ class RecordingSandboxRuntime:
 @dataclass
 class _EgressBindingClient:
     """Wraps a :class:`SandboxRuntime`, injecting a fixed :class:`EgressContext`
-    into every ``acquire`` (sandbox-egress §3.3).
+    into every ``acquire`` and every ``exec`` (sandbox-egress §3.3; exec since
+    B-217 — one user's warm sandbox is shared by their agents, so the egress env
+    must follow the caller of each exec, not whoever created the sandbox).
 
     Bound once per agent build (``agent_factory``) around the shared supervisor
     client, so all sandbox tools get the agent's egress policy + identity on the
@@ -671,10 +688,13 @@ class _EgressBindingClient:
         agent_key: str = "",
         run_id: UUID | None = None,
         has_skills: bool = False,
+        egress: EgressContext | None = None,
     ) -> SandboxOutcome:
         # This wrapper doesn't own agent_key, run_id or has_skills — it's a pure
         # passthrough here so a chain like _AgentKeyBindingClient(inner=_EgressBindingClient(...))
         # still reaches the real backend (spec 决策 10 + B-61 §4.4; see bind_agent_key).
+        # The bound egress wins, as in acquire (B-217).
+        del egress
         return await self.inner.exec(
             sandbox_id=sandbox_id,
             code=code,
@@ -682,6 +702,7 @@ class _EgressBindingClient:
             agent_key=agent_key,
             run_id=run_id,
             has_skills=has_skills,
+            egress=self.egress,
         )
 
     async def release(self, *, sandbox_id: UUID) -> None:
@@ -709,12 +730,11 @@ class _AgentKeyBindingClient:
 
     Bound once per agent build (``agent_factory``) around the shared sandbox
     client — mirrors :class:`_EgressBindingClient`, but binds into ``exec``
-    rather than ``acquire``: unlike the egress token (minted once at
-    container-create time, no re-mint on reconnect — see
-    ``AgentSandboxClient`` module docstring "Important-3"), ``PYTHONUSERBASE``
-    is a plain per-call env override both backends' exec channels support, so
-    it can — and must — be re-asserted on every call rather than baked in at
-    acquire time (two agents can share one *already-acquired* warm sandbox).
+    rather than ``acquire``: ``PYTHONUSERBASE`` is a plain per-call env override
+    both backends' exec channels support, so it can — and must — be re-asserted
+    on every call rather than baked in at acquire time (two agents can share one
+    *already-acquired* warm sandbox; the egress env follows the same rule since
+    B-217, injected by :class:`_EgressBindingClient`).
     Every other call delegates unchanged.
     """
 
@@ -747,6 +767,7 @@ class _AgentKeyBindingClient:
         agent_key: str = "",
         run_id: UUID | None = None,
         has_skills: bool = False,
+        egress: EgressContext | None = None,
     ) -> SandboxOutcome:
         # B-124 —— 调用方给了 key 就用调用方的:``run_in_sandbox`` 传 ``ctx.agent_key``,
         # 委派出去的子代那里是**父的** key(``_child_run._child_config``),与宿主侧
@@ -762,6 +783,7 @@ class _AgentKeyBindingClient:
             agent_key=agent_key or self.agent_key,
             run_id=run_id,
             has_skills=has_skills,
+            egress=egress,
         )
 
     async def release(self, *, sandbox_id: UUID) -> None:
