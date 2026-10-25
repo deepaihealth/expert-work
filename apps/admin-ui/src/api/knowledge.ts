@@ -176,7 +176,14 @@ export interface KnowledgeChunk {
   enabled?: boolean;
   edited?: boolean;
   revision?: number;
+  /** B-206 K-1 — the ``chunk_index`` of the parent row (「整块」) this chunk
+   *  belongs to; ``null`` without one, and for a parent row itself. */
+  parent_index?: number | null;
 }
+
+/** B-206 K-1 — which rows the segment preview lists: the searchable chunks
+ *  (「小段」, the default) or the parent rows grouping them (「整块」). */
+export type ChunkView = "children" | "parents";
 
 export interface ChunksPage {
   chunks: KnowledgeChunk[];
@@ -201,6 +208,17 @@ export interface RetrievalTestResult {
   recall_source: string | null;
   /** Section breadcrumb of the hit, outermost first. */
   heading_path?: string[];
+  /** B-206 K-1 — a result is the parent row (「整块」) of its hit chunks: then
+   *  ``content`` / ``heading_path`` are the parent's and this is its index;
+   *  ``null`` when the hit has no parent row (the result is the chunk itself).
+   *  ``chunk_index`` and the scores are the best hit chunk's. */
+  parent_index?: number | null;
+  /** Every hit chunk of the result, best first (``[0] === chunk_index``). */
+  hit_chunk_indexes?: number[];
+  /** The best hit chunk's own body; ``null`` when the result is that chunk. */
+  hit_content?: string | null;
+  /** The best hit chunk's own breadcrumb (empty when the result is that chunk). */
+  hit_heading_path?: string[];
 }
 
 export interface RetrievalTestResponse {
@@ -454,14 +472,14 @@ export async function fetchFigureUrl(
 export async function listChunks(
   baseName: string,
   documentId: string,
-  params?: { offset?: number; limit?: number },
+  params?: { offset?: number; limit?: number; view?: ChunkView },
   tenantScope?: TenantScope,
 ): Promise<ChunksPage> {
   const response = await apiClient.get<ChunksPage>(
     `/v1/knowledge/bases/${encodeURIComponent(baseName)}/documents/${encodeURIComponent(documentId)}/chunks`,
     {
       params: withTenantScope(
-        { offset: params?.offset, limit: params?.limit },
+        { offset: params?.offset, limit: params?.limit, view: params?.view },
         tenantScope,
       ),
     },

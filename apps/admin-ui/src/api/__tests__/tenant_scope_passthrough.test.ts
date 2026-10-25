@@ -227,6 +227,12 @@ describe("knowledge SDK — tenantScope passthrough", () => {
     expect(calls[0].params).toMatchObject({ offset: 5, limit: 20, tenant_id: TENANT });
   });
 
+  it("listChunks sends the view it is asked for (B-206 K-1)", async () => {
+    const calls = captureAdapter({ chunks: [], total: 0, offset: 0, limit: 20 });
+    await listChunks("kb", "d1", { offset: 0, limit: 20, view: "parents" }, TENANT);
+    expect(calls[0].params).toMatchObject({ view: "parents", tenant_id: TENANT });
+  });
+
   it("testRetrieval threads tenant_id as a query param on the POST", async () => {
     const calls = captureAdapter({ query: "q", results: [], count: 0 });
     await testRetrieval("kb", { query: "q" }, TENANT);
