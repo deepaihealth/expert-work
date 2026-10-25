@@ -62,7 +62,7 @@ from orchestrator.multimodal import parse_rendered_figure_ref
 from orchestrator.state import _merge_viewed_figures
 from orchestrator.tools.nas_workspace_store import NasWorkspaceStore
 from orchestrator.tools.read_page import ReadPageTool, document_sha, workspace_figure_ref
-from orchestrator.tools.sandbox import RecordingSandboxRuntime, SandboxOutcome
+from orchestrator.tools.sandbox import EgressContext, RecordingSandboxRuntime, SandboxOutcome
 from orchestrator.tools.sandbox_image_contract import EXEC_VIEW
 from orchestrator.tools.skill_seed import sanitize_agent_key
 from orchestrator.tools.workspace_scope import scoped_path, store_scope
@@ -762,6 +762,7 @@ class _EchoRenderRuntime(RecordingSandboxRuntime):
         agent_key: str = "",
         run_id: UUID | None = None,
         has_skills: bool = False,
+        egress: EgressContext | None = None,
     ) -> SandboxOutcome:
         await super().exec(
             sandbox_id=sandbox_id,
@@ -770,6 +771,7 @@ class _EchoRenderRuntime(RecordingSandboxRuntime):
             agent_key=agent_key,
             run_id=run_id,
             has_skills=has_skills,
+            egress=egress,
         )
         params = _snippet_params(code)
         rendered = [

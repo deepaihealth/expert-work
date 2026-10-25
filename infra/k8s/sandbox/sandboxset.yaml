@@ -17,6 +17,19 @@
 # Once the gate is green, moving this into base/ under `expert-work` is a
 # small follow-up with a known-good baseline to compare against.
 #
+# NETWORK ISOLATION (B-217)
+# -------------------------
+# This file carries no security group on purpose — the group id differs per
+# cluster. On test it is now applied through a kustomization after all (the
+# header above predates that), via the overlay that adds the group:
+#
+#     kubectl apply -k infra/k8s/sandbox-test
+#
+# Applying this file directly puts new sandboxes back into the cluster security
+# group, next to the platform's database, Redis and monitoring; nothing errors.
+# smoke.sh warns ("sandbox network isolation"). Rules and reasons:
+# docs/design/sandbox-network-isolation-acs.md.
+#
 # SHAPE
 # -----
 # Copied from the PoC's `SandboxSet/base` (the only shape verified to work

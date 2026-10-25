@@ -80,6 +80,13 @@ C-1 让"槽位当前的主人不是我"变成**可达**状态,按坐标定位的
 
 ## 再审 Important-3:出网 token 只能靠"活得比沙箱久",重发这条路走不通
 
+> **B-217(2026-10-24)起已改成每次 exec 注入**,本节只留作历史:那时的前提是
+> 「token 只在 ``create(envs=...)`` 送一次」,而同一用户的热沙箱被多个智能体共用,
+> 建沙箱时烤进去的出网设置属于第一个建它的智能体,后来者全部沿用(测试 §53.2 实测)。
+> 现在 ``SandboxRuntime.exec`` 带 ``egress``(由 ``_EgressBindingClient`` 每次补上),
+> token 每次 exec 现铸,见 :meth:`AgentSandboxClient._exec_egress_env`。热会话年龄
+> 上限仍保留(到点重建本身无害),不再是 token 的唯一自愈路径。
+
 取值与安全论证在 :attr:`AgentSandboxClient.egress_token_ttl_s`;**被否决的三
 条**记在这里免得下一个人重走(完整推理见本轮报告):``connect(envs=...)``
 ——e2b 2.24.0 没这个形参(核对过 ``ApiParams``);``commands.run(envs=...)``
@@ -246,6 +253,23 @@ _CLAIM_CONTENDED_POLL_S = 2.0
 #: 这侧测到的墙钟差,留一成余量。
 _TIMEOUT_ATTRIBUTION_RATIO = 0.9
 
+#: B-217 —— 出网关的那次 exec 注入的变量:代理相关的键全部置空(envd 只能覆盖不能删),
+#: 公网 pip 备源也置空(``PIP_EXTRA_INDEX_URL``,见 ``sandbox.platform_exec_envs``)。
+#: 键集合必须盖住 :meth:`AgentSandboxClient._egress_env` 给出网开时写的每一个键。
+_EGRESS_OFF_ENV: dict[str, str] = dict.fromkeys(
+    (
+        "HTTPS_PROXY",
+        "HTTP_PROXY",
+        "https_proxy",
+        "http_proxy",
+        "NO_PROXY",
+        "no_proxy",
+        "EXPERT_WORK_EGRESS_PROXY_AUTH",
+        "PIP_EXTRA_INDEX_URL",
+    ),
+    "",
+)
+
 #: ``Sandbox.create(metadata={...})`` 里挂载 NAS 工作区用的 key —— ACS 官方
 #: 文档化的动态挂载配方(spec § 一.1),"申请时"挂载,每挂载点一个 dict
 #: (``pvName``/``mountPath``/``subPath``)。
@@ -325,8 +349,10 @@ class AgentSandboxClient:
     #: ``e2b`` 没有 py.typed 标记(见 pyproject.toml 的 mypy override 说明),
     #: 手写测试假件也不共享一个正式 Protocol —— 两边都用 ``Any``,不是疏漏。
     sdk: Any | None = None
-    #: 出网 token 的存活期。**必须长于沙箱可能活着的时间**:token 只在
-    #: ``create(envs=...)`` 送一次,之后再没机会换(见 :meth:`_egress_env`)。
+    #: 出网 token 的存活期。B-217 之前 token 只在 ``create(envs=...)`` 送一次,
+    #: 所以**必须长于沙箱可能活着的时间**;现在每次 exec 现铸
+    #: (:meth:`_exec_egress_env`),这个值只需盖住一次 exec 里派生出去的进程,
+    #: 取值暂未收紧(下面是当时的论证)。
     #:
     #: 再审 Important-3:原值 1 小时,在 I-4 之前够用——不传 ``timeout`` 的沙箱
     #: 300 秒就被平台 kill,每次复用都是重建 + 新 token。I-4 给 ``connect`` 也
@@ -399,8 +425,9 @@ class AgentSandboxClient:
     #: 构造参数 —— tenant_quota store 的构建晚于本 client。
     quota_gate: WorkspaceQuotaGate | None = None
     #: acquire 时记下 sandbox_id → (tenant_id, user_id),release/destroy 时
-    #: 反查身份触发配额重算。进程内(acquire/release 同进程成对);重启丢失
-    #: 无害 —— janitor 全量扫兜底(spec § 3.2 第 3 层)。
+    #: 反查身份触发配额重算;B-217 起 exec 也用它取租户铸出网 token。进程内
+    #: (acquire/exec/release 在 ``run_in_sandbox`` 同一次调用里成对);重启丢失
+    #: 无害 —— 配额有 janitor 全量扫兜底(spec § 3.2 第 3 层),出网按「关」处理。
     _session_identity: dict[UUID, tuple[UUID, UUID | None]] = field(
         default_factory=dict, init=False, repr=False
     )
@@ -434,9 +461,9 @@ class AgentSandboxClient:
     def _max_warm_age_s(self) -> int:
         """热会话总年龄上限 —— 派生自 ``egress_token_ttl_s``,不设第二个常量。
 
-        取一半:token 只在 ``create(envs=...)`` 送一次、无法重发(模块
-        docstring 末节,三条重发路线全被否决),所以会话必须死在 token
-        之前;一半留足「cap + 单次工具调用最长(≤300s exec)≪ TTL」的
+        取一半:当时 token 只在 ``create(envs=...)`` 送一次、无法重发(模块
+        docstring 末节;B-217 起改为每次 exec 现铸,这个上限不再是唯一的
+        自愈路径),所以会话必须死在 token 之前;一半留足「cap + 单次工具调用最长(≤300s exec)≪ TTL」的
         余量,默认值下 = 12h。到点重建的代价实测(2026-08-05):池命中
         ~2-3s,池空最坏 ~33s,每持续使用的会话 12h 一次。顺带把「热会话
         沿用创建时烤死的旧 egress 政策」的 staleness 也封顶在同一值。
@@ -575,6 +602,33 @@ class AgentSandboxClient:
             "EXPERT_WORK_EGRESS_PROXY_AUTH": proxy_auth,
         }
 
+    def _exec_egress_env(self, *, sandbox_id: UUID, egress: EgressContext | None) -> dict[str, str]:
+        """一次 exec 的出网变量(B-217)—— 每次都按**本次调用方**的出网设置给。
+
+        同一用户的热沙箱被他的多个智能体共用,出网设置因此不能跟着沙箱走:
+
+        * ``egress is None`` —— 没经过 ``_EgressBindingClient`` 的调用方(老测试、
+          合成评测):什么都不给,与改前一致。
+        * 出网关 —— 把每个代理变量**显式置空**(envd 的 ``envs`` 只能覆盖、不能删除;
+          pip / urllib / requests 都把空值当没配,沙箱内实测),并去掉公网的 pip 备源:
+          沙箱网络隔离之后直连不到它,pip 每次都要先重试一轮才放弃。
+        * 出网开 —— 现铸 token(:meth:`_egress_env`)。租户来自本进程 ``acquire``
+          记下的身份;查不到就按出网关处理,不铸一个可能绑错租户的 token。
+        """
+        if egress is None:
+            return {}
+        if egress.policy not in (None, "none"):
+            identity = self._session_identity.get(sandbox_id)
+            if identity is not None:
+                return self._egress_env(tenant_id=identity[0], sandbox_id=sandbox_id, egress=egress)
+            logger.warning(
+                "exec on sandbox %s: no acquire identity in this process — "
+                "running with egress off for agent %s",
+                sandbox_id,
+                egress.agent_name,
+            )
+        return dict(_EGRESS_OFF_ENV)
+
     async def acquire(
         self,
         *,
@@ -585,6 +639,9 @@ class AgentSandboxClient:
         egress: EgressContext | None = None,
     ) -> UUID:
         del thread_id  # 波 1:热会话行不记 thread_id(见 SQL store 的说明)。
+        # B-217 —— 出网设置每次 exec 注入(:meth:`_exec_egress_env`),建沙箱不再用它:
+        # 这个沙箱之后可能被同一用户出网设置不同的智能体复用。
+        del egress
         sandbox_id = uuid4()
         # 沙箱迁移波 2 —— 软删闸 + mkdir/chmod,claim_warm 之前(spec § 二之
         # 二)。见 :meth:`_prepare_workspace_mount`(``workspace_root`` 未配
@@ -646,7 +703,7 @@ class AgentSandboxClient:
                     tenant_id=tenant_id, user_id=user_id, sandbox_id=sandbox_id
                 )
                 sbx = await self._create_and_track(
-                    tenant_id=tenant_id, sandbox_id=sandbox_id, user_id=user_id, egress=egress
+                    tenant_id=tenant_id, sandbox_id=sandbox_id, user_id=user_id
                 )
                 just_created = True
             else:
@@ -686,7 +743,6 @@ class AgentSandboxClient:
                         tenant_id=tenant_id,
                         sandbox_id=sandbox_id,
                         user_id=user_id,
-                        egress=egress,
                     )
                     just_created = True
                 else:
@@ -709,7 +765,7 @@ class AgentSandboxClient:
                 tenant_id=tenant_id, user_id=user_id, sandbox_id=sandbox_id
             )
             sbx = await self._create_and_track(
-                tenant_id=tenant_id, sandbox_id=sandbox_id, user_id=user_id, egress=egress
+                tenant_id=tenant_id, sandbox_id=sandbox_id, user_id=user_id
             )
             just_created = True
 
@@ -744,13 +800,11 @@ class AgentSandboxClient:
                 # 那一行也已经健康登记过,种子文件写失败不该把它连锅端了。
                 await self._discard_new_sandbox(sbx, sandbox_id=sandbox_id)
             raise SandboxSupervisorError(f"sandbox post-create setup failed: {exc}") from exc
-        if self.quota_gate is not None:
-            # 沙箱迁移波 3 —— 记身份供 release/destroy 反查触发配额重算。放
-            # 在最终返回值确定之后:热复用分支上面已经把 sandbox_id 改写成
-            # 赢家的真实 id(见该分支注释),这里记的必须是那个 id,不是本
-            # 次调用开头自铸、从未插入任何行的 uuid4()。评审 Minor:没配
-            # gate 的部署(本地 compose)完全不记账,少一份无谓状态。
-            self._session_identity[sandbox_id] = (tenant_id, user_id)
+        # 沙箱迁移波 3 —— 记身份供 release/destroy 反查触发配额重算;B-217 起 exec 也
+        # 靠它拿租户来铸出网 token,所以不再只在配了 quota_gate 时才记。放在最终返回值
+        # 确定之后:热复用分支上面已经把 sandbox_id 改写成赢家的真实 id(见该分支注释),
+        # 这里记的必须是那个 id,不是本次调用开头自铸、从未插入任何行的 uuid4()。
+        self._session_identity[sandbox_id] = (tenant_id, user_id)
         return sandbox_id
 
     async def _ensure_exec_view_dir(self, sbx: Any, *, sandbox_id: UUID) -> None:
@@ -1185,7 +1239,6 @@ class AgentSandboxClient:
         tenant_id: UUID,
         sandbox_id: UUID,
         user_id: UUID | None,
-        egress: EgressContext | None,
     ) -> Any:
         """``_create`` 加上失败时的 CAS 槽位清理(审查 Critical-2)。
 
@@ -1217,9 +1270,7 @@ class AgentSandboxClient:
         ``set_container_id`` 回填)也要走同一套清理,见 :meth:`acquire`。
         """
         try:
-            return await self._create(
-                tenant_id=tenant_id, sandbox_id=sandbox_id, user_id=user_id, egress=egress
-            )
+            return await self._create(tenant_id=tenant_id, sandbox_id=sandbox_id, user_id=user_id)
         except Exception:
             await self._unwind_slot(sandbox_id=sandbox_id, reason="create_failed")
             raise
@@ -1268,14 +1319,13 @@ class AgentSandboxClient:
         tenant_id: UUID,
         sandbox_id: UUID,
         user_id: UUID | None,
-        egress: EgressContext | None,
     ) -> Any:
         """建一个新沙箱。
 
-        ``envs`` 一次送两组:镜像自己声明、但 envd 派生进程拿不到的那套
-        (:data:`SANDBOX_IMAGE_ENV`,全分支终审 Important-2),加上本次
-        acquire 的 egress 变量。egress 放后面覆盖——今天两组键零重叠,
-        顺序只是把"哪一组是特化"这件事写死,免得以后加键时靠运气。
+        ``envs`` 只送镜像自己声明、但 envd 派生进程拿不到的那套
+        (:data:`SANDBOX_IMAGE_ENV`,全分支终审 Important-2)。出网变量 B-217 起
+        不在这里送:热沙箱会被同一用户的别的智能体复用,建沙箱时烤进去的出网设置
+        只属于第一个建它的智能体 —— 改为每次 exec 注入,见 :meth:`_exec_egress_env`。
 
         沙箱迁移波 2 —— :attr:`workspace_pv_name` 配了时,额外传
         ``metadata`` 挂载该用户(或临时沙箱的 scratch 子树,``user_id is
@@ -1288,10 +1338,7 @@ class AgentSandboxClient:
         """
         kwargs: dict[str, Any] = {
             "template": self.template,
-            "envs": {
-                **SANDBOX_IMAGE_ENV,
-                **self._egress_env(tenant_id=tenant_id, sandbox_id=sandbox_id, egress=egress),
-            },
+            "envs": dict(SANDBOX_IMAGE_ENV),
             "timeout": _SANDBOX_TIMEOUT_S,
             "domain": self.domain,
             "api_key": self.api_key,
@@ -1473,6 +1520,7 @@ class AgentSandboxClient:
         agent_key: str = "",
         run_id: UUID | None = None,
         has_skills: bool = False,
+        egress: EgressContext | None = None,
     ) -> SandboxOutcome:
         """波 1 Task 8(spec § 6.1 四契约点)。契约源头是
         ``infra/sandbox-image/runner.py:28-72``——本地 docker 沙箱里的
@@ -1561,15 +1609,14 @@ class AgentSandboxClient:
 
         sandbox migration wave 2(spec 决策 10):``agent_key`` 非空时随
         ``commands.run(envs=...)`` 注入 ``PYTHONUSERBASE``(:func:`agent_key_envs`
-        单源计算,与本地 supervisor 后端同一份值 —— 契约测试钉住)。egress
-        token 走 ``create(envs=...)``(§ 模块 docstring "Important-3")只送一
-        次;这里不同 —— SDK 的 ``commands.run`` 本就支持逐次传 envs,同用户
-        双 agent 共享一个已建好的热会话时,才需要"每次 exec 都能换一个不同
-        的 agent_key"。``run_id`` 非 ``None`` 时同一个 :func:`agent_key_envs`
-        再加一项 ``EXPERT_WORK_INPUTS``(B-61 §4.4);它不像 ``agent_key`` 那样
-        经 binding wrapper 预绑定,是调用方(``run_in_sandbox``)每次自己判定的
-        (那个 run 名下真有 ``inputs.json`` 才给)。``has_skills`` 同理,``True``
-        时才加 ``EXPERT_WORK_SKILLS_DIR``。
+        单源计算,与本地 supervisor 后端同一份值 —— 契约测试钉住)。SDK 的
+        ``commands.run`` 本就支持逐次传 envs,同用户双 agent 共享一个已建好的热
+        会话时,才需要"每次 exec 都能换一个不同的 agent_key"。B-217 起出网变量也走
+        这条通道(``egress``,见 :meth:`_exec_egress_env`)。``run_id`` 非 ``None``
+        时同一个 :func:`agent_key_envs` 再加一项 ``EXPERT_WORK_INPUTS``(B-61 §4.4);
+        它不像 ``agent_key`` 那样经 binding wrapper 预绑定,是调用方
+        (``run_in_sandbox``)每次自己判定的(那个 run 名下真有 ``inputs.json`` 才给)。
+        ``has_skills`` 同理,``True`` 时才加 ``EXPERT_WORK_SKILLS_DIR``。
 
         ``umask 077 && `` 前缀:``commands.run`` 走 ``/bin/bash -l -c cmd``
         (见上方 docstring),所以能在同一个 shell 里先设 umask 再 exec
@@ -1609,6 +1656,7 @@ class AgentSandboxClient:
         script = f"/tmp/ew-exec-{uuid4().hex}.py"  # noqa: S108 — sandbox container tmpfs, not host; name has 128 bits of random entropy
         started = _monotonic()
         envs = exec_envs(agent_key, run_id=run_id, has_skills=has_skills)
+        envs.update(self._exec_egress_env(sandbox_id=sandbox_id, egress=egress))
         try:
             await sbx.files.write(script, code, user=SANDBOX_EXEC_USER)
             # B-60 —— 命令串由 exec_view.build_exec_command 生成:umask 077,再在自己的

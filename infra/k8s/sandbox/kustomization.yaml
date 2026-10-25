@@ -1,0 +1,12 @@
+# The sandbox pool, per environment (B-217). sandboxset.yaml stays the one place
+# the image is pinned (smoke.sh and the sandbox-image workflow read it); each
+# overlay adds what differs per cluster — today only the security group:
+#
+#   kubectl apply -k infra/k8s/sandbox-test
+#
+# Production keeps `kubectl apply -f infra/k8s/sandbox/sandboxset.yaml` until its
+# own security groups exist (docs/design/sandbox-network-isolation-acs.md § 7).
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - sandboxset.yaml

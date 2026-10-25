@@ -50,21 +50,25 @@ Task 9 独立审查 Important-1/2 追加(task-9-report.md 有完整记录):
 
 from __future__ import annotations
 
+import base64
 import json
 import logging
 import os
 import re
 import shlex
+import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from urllib.parse import urlsplit
 from uuid import UUID, uuid4
 
 import httpcore
 import pytest
 from e2b import CommandExitException, TimeoutException
 
+from expert_work.common.egress_token import verify_egress_token
 from expert_work.persistence import SANDBOX_AGENTS_ROOT, SANDBOX_SKILLS_ROOT
 from expert_work.persistence.sandbox_instance_store import (
     _STUCK_CREATE_TTL_S,
@@ -773,17 +777,25 @@ async def test_egress_env_empty_when_no_policy() -> None:
     assert sdk.created[0]["envs"] == SANDBOX_IMAGE_ENV
 
 
-@pytest.mark.asyncio
-async def test_egress_env_mints_token_when_policy_set() -> None:
-    """egress 策略非 none 时铸 token 并塞 HTTP(S)_PROXY —— 与 supervisor 的
-    ``_egress_env`` 同语义(见 sandbox_supervisor/supervisor.py:790)。
+_PROXY_ENV_KEYS = (
+    "HTTPS_PROXY",
+    "HTTP_PROXY",
+    "https_proxy",
+    "http_proxy",
+    "NO_PROXY",
+    "no_proxy",
+    "EXPERT_WORK_EGRESS_PROXY_AUTH",
+)
 
-    这条测试独立发现的问题(不在派发方点名的三处修正里):brief 给的
-    ``_egress_env`` 草稿直接读 ``egress.tenant_id`` / ``egress.sandbox_id``,
-    但 ``EgressContext``(orchestrator/tools/sandbox.py)根本没有这两个字段
-    (它只有 policy/agent_name/agent_version/allowlist/denylist)—— 那份草稿
-    只要 egress 非 None 就必炸 AttributeError。真实实现改成从 ``acquire``
-    的入参里取 tenant_id / sandbox_id,而不是指望 EgressContext 携带它们。
+
+@pytest.mark.asyncio
+async def test_create_carries_no_egress_env_even_when_policy_set() -> None:
+    """B-217 —— 出网变量不再在 ``create()`` 时烤进沙箱。
+
+    一个用户的热沙箱被他的多个智能体共用;建沙箱时烤进去的代理变量 + token 属于
+    **第一个**建它的智能体,之后谁复用都沿用这一份(10-24 测试 §53.2:出网开的智能体
+    复用了出网关智能体建的沙箱,一个代理变量都没有,pip 直连出去)。改成每次 exec 注入
+    (见下面几条),create 只剩镜像那套 ENV。
     """
     sdk, store = FakeSdk(), FakeInstanceStore()
     client = make_client(sdk, store)
@@ -791,11 +803,155 @@ async def test_egress_env_mints_token_when_policy_set() -> None:
 
     await client.acquire(tenant_id=uuid4(), thread_id="t1", user_id=uuid4(), egress=egress)
 
-    envs = sdk.created[0]["envs"]
-    assert envs["HTTPS_PROXY"] == envs["HTTP_PROXY"]
-    assert envs["HTTPS_PROXY"].startswith("http://")
-    assert "@credential-proxy.expert-work.svc.cluster.local:8081" in envs["HTTPS_PROXY"]
-    assert envs["NO_PROXY"] == "credential-proxy.expert-work.svc.cluster.local,localhost,127.0.0.1"
+    assert sdk.created[0]["envs"] == SANDBOX_IMAGE_ENV
+
+
+@pytest.mark.asyncio
+async def test_exec_mints_the_proxy_env_per_call_for_an_egress_on_agent() -> None:
+    """出网开:每次 exec 都带代理变量,token 绑本次调用方的租户 / 沙箱 / 智能体 / 白名单。
+
+    与 supervisor 的 ``_egress_env`` 同语义(``sandbox_supervisor/supervisor.py``)。
+    stdlib ``urllib`` 的 CONNECT 不带 URL 里的 userinfo,所以另给一份现成的 Basic 头值
+    (``EXPERT_WORK_EGRESS_PROXY_AUTH``,镜像里的 sitecustomize 用它)。
+    """
+    sdk, store = FakeSdk(), FakeInstanceStore()
+    client = make_client(sdk, store)
+    tenant_id = uuid4()
+    egress = EgressContext(
+        policy="proxy", agent_name="demo", agent_version="1", allowlist=("api.example.com",)
+    )
+    sid = await client.acquire(tenant_id=tenant_id, thread_id="t", user_id=uuid4(), egress=egress)
+
+    await client.exec(
+        sandbox_id=sid, code="print(1)", timeout_s=5, agent_key="my-agent", egress=egress
+    )
+
+    envs = sdk.sandbox.commands.envs_calls[-1]
+    assert envs is not None
+    # 出网那组与每 agent 那组同走 commands.run(envs=),合并没有把隔离用的那个挤掉。
+    assert envs["PYTHONUSERBASE"] == f"{SANDBOX_AGENTS_ROOT}/my-agent"
+    proxy = urlsplit(envs["HTTPS_PROXY"])
+    assert (proxy.scheme, proxy.hostname, proxy.port) == (
+        "http",
+        "credential-proxy.expert-work.svc.cluster.local",
+        8081,
+    )
+    assert envs["HTTP_PROXY"] == envs["https_proxy"] == envs["http_proxy"] == envs["HTTPS_PROXY"]
+    assert (
+        envs["NO_PROXY"]
+        == envs["no_proxy"]
+        == ("credential-proxy.expert-work.svc.cluster.local,localhost,127.0.0.1")
+    )
+    assert proxy.username is not None
+    identity = verify_egress_token("s3cret", proxy.username, now=time.time())
+    assert identity is not None
+    assert (identity.tenant_id, identity.sandbox_id, identity.agent_name, identity.allowlist) == (
+        str(tenant_id),
+        str(sid),
+        "demo",
+        ("api.example.com",),
+    )
+    assert base64.b64decode(envs["EXPERT_WORK_EGRESS_PROXY_AUTH"]).decode() == (
+        f"{proxy.username}:"
+    )
+
+
+@pytest.mark.asyncio
+async def test_agents_sharing_one_warm_sandbox_each_get_their_own_egress(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """B-217 复现:同一用户的出网开 / 出网关两个智能体共用一个热沙箱,各拿各的。
+
+    出网关的那次 exec 必须把每个代理变量**显式置空**(envd 的 ``envs`` 只能覆盖、
+    不能删除;pip / urllib / requests 都把空值当没配),并且不带公网的 pip 备源 ——
+    网络隔离之后沙箱直连不到它,pip 每次都要先重试一轮才放弃。出网开的那个在同一个
+    沙箱上照旧拿到自己的代理。
+    """
+    monkeypatch.setenv("EXPERT_WORK_SANDBOX_PIP_EXTRA_INDEX_URL", "https://mirror.example/simple/")
+    sdk, store = FakeSdk(), FakeInstanceStore()
+    client = make_client(sdk, store)
+    tenant_id, user_id = uuid4(), uuid4()
+    egress_on = EgressContext(policy="proxy", agent_name="agent-on", agent_version="1")
+    egress_off = EgressContext(policy="none", agent_name="agent-off", agent_version="1")
+
+    sid = await client.acquire(
+        tenant_id=tenant_id, thread_id="t1", user_id=user_id, egress=egress_on
+    )
+    reused = await client.acquire(
+        tenant_id=tenant_id, thread_id="t2", user_id=user_id, egress=egress_off
+    )
+    assert reused == sid, "precondition: the second agent reuses the first one's warm sandbox"
+
+    await client.exec(sandbox_id=sid, code="print(1)", timeout_s=5, egress=egress_off)
+    off = sdk.sandbox.commands.envs_calls[-1]
+    assert off is not None
+    assert {key: off[key] for key in _PROXY_ENV_KEYS} == dict.fromkeys(_PROXY_ENV_KEYS, "")
+    assert off["PIP_EXTRA_INDEX_URL"] == ""
+
+    await client.exec(sandbox_id=sid, code="print(1)", timeout_s=5, egress=egress_on)
+    on = sdk.sandbox.commands.envs_calls[-1]
+    assert on is not None
+    assert on["HTTPS_PROXY"].startswith("http://")
+    assert on["PIP_EXTRA_INDEX_URL"] == "https://mirror.example/simple/"
+
+
+def test_egress_off_env_blanks_every_key_the_egress_on_env_sets() -> None:
+    """``_EGRESS_OFF_ENV`` 必须盖住出网开时写的**每一个**键:出网开往 ``_egress_env`` 里
+    加了新键(比如 ``ALL_PROXY``)而这里没跟上,出网关的 exec 就会沿用热沙箱里上一个出网开
+    exec 留下的那个值 —— 上面那条测试是写死的键表,咬不住这种漏。"""
+    client = make_client(FakeSdk(), FakeInstanceStore())
+    on = client._egress_env(
+        tenant_id=uuid4(),
+        sandbox_id=uuid4(),
+        egress=EgressContext(policy="proxy", agent_name="a", agent_version="1"),
+    )
+
+    assert set(on) <= set(agent_sandbox_module._EGRESS_OFF_ENV)
+    assert set(agent_sandbox_module._EGRESS_OFF_ENV.values()) == {""}
+
+
+@pytest.mark.asyncio
+async def test_a_reused_warm_sandbox_mints_its_token_for_the_reused_id() -> None:
+    """另一个进程建的热沙箱被本进程复用:身份要记在**复用到的那个** id 上(不是本次调用
+    开头自铸的 uuid4),出网开的 exec 才能铸出 sandbox_id 对得上的 token。"""
+    sdk, store = FakeSdk(), FakeInstanceStore()
+    tenant_id, user_id = uuid4(), uuid4()
+    egress = EgressContext(policy="proxy", agent_name="demo", agent_version="1")
+    winner = await make_client(sdk, store).acquire(
+        tenant_id=tenant_id, thread_id="t1", user_id=user_id, egress=egress
+    )
+    this_process = make_client(sdk, store)
+
+    reused = await this_process.acquire(
+        tenant_id=tenant_id, thread_id="t2", user_id=user_id, egress=egress
+    )
+    await this_process.exec(sandbox_id=reused, code="print(1)", timeout_s=5, egress=egress)
+
+    assert reused == winner
+    envs = sdk.sandbox.commands.envs_calls[-1]
+    assert envs is not None
+    token = urlsplit(envs["HTTPS_PROXY"]).username
+    assert token is not None
+    identity = verify_egress_token("s3cret", token, now=time.time())
+    assert identity is not None
+    assert (identity.tenant_id, identity.sandbox_id) == (str(tenant_id), str(winner))
+
+
+@pytest.mark.asyncio
+async def test_egress_on_exec_fails_closed_when_the_sandbox_owner_is_unknown() -> None:
+    """token 要绑租户,而 ``exec`` 只拿到 sandbox_id —— 租户来自本进程 ``acquire`` 时记下的
+    身份。查不到(没经过本进程的 acquire)就按出网关处理:不铸一个绑错租户的 token。"""
+    sdk, store = FakeSdk(), FakeInstanceStore()
+    client = make_client(sdk, store)
+    egress = EgressContext(policy="proxy", agent_name="demo", agent_version="1")
+    sid = await client.acquire(tenant_id=uuid4(), thread_id="t", user_id=uuid4(), egress=egress)
+    other_process = make_client(sdk, store)
+
+    await other_process.exec(sandbox_id=sid, code="print(1)", timeout_s=5, egress=egress)
+
+    envs = sdk.sandbox.commands.envs_calls[-1]
+    assert envs is not None
+    assert {key: envs[key] for key in _PROXY_ENV_KEYS} == dict.fromkeys(_PROXY_ENV_KEYS, "")
 
 
 @pytest.mark.asyncio
@@ -1151,8 +1307,8 @@ async def test_exec_passes_the_nas_mount_as_cwd() -> None:
 
 @pytest.mark.asyncio
 async def test_create_passes_the_image_environment() -> None:
-    """镜像声明的 ENV 必须显式随 ``create(envs=)`` 送进去,且不能踩掉
-    egress 那组(两组同走 ``envs`` 这一个通道)。"""
+    """镜像声明的 ENV 必须显式随 ``create(envs=)`` 送进去。(B-217 之前出网那组也走
+    这个通道;现在改为每次 exec 注入,见 ``test_exec_mints_the_proxy_env_per_call…``。)"""
     sdk, store = FakeSdk(), FakeInstanceStore()
     client = make_client(sdk, store)
 
@@ -1170,8 +1326,6 @@ async def test_create_passes_the_image_environment() -> None:
     # 让平台建 NAS 挂载 symlink,HOME 改落 useradd -m 建好的 /home/agent。
     assert envs["HOME"] == "/home/agent", "HOME 不是 /home/agent 则 PIP_USER 装到镜像预建目录之外"
     assert envs["PIP_USER"] == "1", "只读 rootfs 上没有 PIP_USER=1 则 pip install 必失败"
-    # egress 那组仍在 —— 合并没有把它挤掉。
-    assert "HTTPS_PROXY" in envs
 
 
 # ---------------------------------------------------------------- 沙箱迁移波 2 Task 4:

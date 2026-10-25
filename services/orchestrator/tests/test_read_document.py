@@ -25,7 +25,7 @@ from orchestrator.tools.read_document import (
     build_read_document_wrapper,
 )
 from orchestrator.tools.registry import ToolBlockedError, ToolContext
-from orchestrator.tools.sandbox import RecordingSandboxRuntime, SandboxOutcome
+from orchestrator.tools.sandbox import EgressContext, RecordingSandboxRuntime, SandboxOutcome
 
 # ---------------------------------------------------------------------------
 # Layer 1 — in-sandbox parse snippet (run locally with ws = tmp_path)
@@ -228,6 +228,7 @@ class _SequenceRuntime(RecordingSandboxRuntime):
         agent_key: str = "",
         run_id: UUID | None = None,
         has_skills: bool = False,
+        egress: EgressContext | None = None,
     ) -> SandboxOutcome:
         self.execs.append((sandbox_id, code))
         self.exec_agent_keys.append(agent_key)

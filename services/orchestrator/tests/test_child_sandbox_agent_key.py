@@ -27,6 +27,7 @@ from orchestrator.tools import ToolContext
 from orchestrator.tools._child_run import _child_config
 from orchestrator.tools.file_ops import ReadFileTool, WriteFileTool
 from orchestrator.tools.sandbox import (
+    EgressContext,
     RecordingSandboxRuntime,
     SandboxOutcome,
     agent_key_envs,
@@ -133,6 +134,7 @@ class _ViewRuntime(RecordingSandboxRuntime):
         agent_key: str = "",
         run_id: UUID | None = None,
         has_skills: bool = False,
+        egress: EgressContext | None = None,
     ) -> SandboxOutcome:
         self.exec_agent_keys.append(agent_key)
         view = self.user_root / "agents" / agent_key
