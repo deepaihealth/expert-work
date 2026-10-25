@@ -10,7 +10,7 @@ import { act, fireEvent, render, screen, waitFor, within } from "@testing-librar
 import userEvent from "@testing-library/user-event";
 import { App } from "antd";
 import { MemoryRouter, Route, Routes } from "react-router-dom";
-import "../../i18n";
+import i18n from "../../i18n";
 
 import * as knowledgeSdk from "../../api/knowledge";
 import { ApiError } from "../../api/client";
@@ -457,6 +457,169 @@ describe("KnowledgeDetail", () => {
     expect(await screen.findByTestId("kb-chunk-heading-c1")).toHaveTextContent("Benefits");
     expect(screen.getByText("500 per year.")).toBeInTheDocument();
     expect(screen.queryByTestId("kb-chunk-heading-c2")).not.toBeInTheDocument();
+  });
+
+  describe("segment preview views (B-206 K-1)", () => {
+    const CHILDREN: knowledgeSdk.ChunksPage = {
+      chunks: [
+        { id: "c1", chunk_index: 0, content: "alpha", chunk_type: "text", parent_index: 3 },
+        { id: "c2", chunk_index: 1, content: "beta", chunk_type: "text", parent_index: null },
+      ],
+      total: 2,
+      offset: 0,
+      limit: 20,
+    };
+    const PARENTS: knowledgeSdk.ChunksPage = {
+      chunks: [
+        {
+          id: "p1",
+          chunk_index: 3,
+          content: "alpha and more",
+          chunk_type: "parent",
+          heading_path: ["Benefits"],
+          parent_index: null,
+        },
+      ],
+      total: 1,
+      offset: 0,
+      limit: 20,
+    };
+
+    function byView(parents: knowledgeSdk.ChunksPage = PARENTS) {
+      return vi
+        .spyOn(knowledgeSdk, "listChunks")
+        .mockImplementation(async (_base, _doc, params) =>
+          params?.view === "parents" ? parents : CHILDREN,
+        );
+    }
+
+    async function inChinese(body: () => Promise<void>): Promise<void> {
+      const prior = i18n.language;
+      await i18n.changeLanguage("zh-CN");
+      try {
+        await body();
+      } finally {
+        await i18n.changeLanguage(prior);
+      }
+    }
+
+    async function openDrawer(): Promise<void> {
+      vi.spyOn(knowledgeSdk, "getBase").mockResolvedValue(BASE);
+      vi.spyOn(knowledgeSdk, "listDocuments").mockResolvedValue(docPage(DOCS));
+      renderDetail();
+      await userEvent.click(await screen.findByTestId(`doc-chunks-${DOCS[0].id}`));
+    }
+
+    it("lists chunks first, each naming the 整块 it belongs to", async () => {
+      await inChinese(async () => {
+        const spy = byView();
+        await openDrawer();
+        expect(await screen.findByText("alpha")).toBeInTheDocument();
+        expect(spy).toHaveBeenLastCalledWith(
+          "support-docs",
+          DOCS[0].id,
+          { offset: 0, limit: 20, view: "children" },
+          undefined,
+        );
+        expect(screen.getByRole("radio", { name: "按小段" })).toBeChecked();
+        expect(screen.getByText("小段 #0")).toBeInTheDocument();
+        expect(screen.getByTestId("kb-chunk-parent-c1")).toHaveTextContent("属于整块 #3");
+        // A chunk with no parent row says nothing about one.
+        expect(screen.getByText("小段 #1")).toBeInTheDocument();
+        expect(screen.queryByTestId("kb-chunk-parent-c2")).toBeNull();
+      });
+    });
+
+    it("switches to the 整块 and back", async () => {
+      await inChinese(async () => {
+        const spy = byView();
+        await openDrawer();
+        await screen.findByText("alpha");
+        await userEvent.click(screen.getByText("按整块"));
+        expect(await screen.findByText("alpha and more")).toBeInTheDocument();
+        expect(spy).toHaveBeenLastCalledWith(
+          "support-docs",
+          DOCS[0].id,
+          { offset: 0, limit: 20, view: "parents" },
+          undefined,
+        );
+        // A parent card reads like a chunk card: its label, breadcrumb and text.
+        expect(screen.getByText("整块 #3")).toBeInTheDocument();
+        expect(screen.getByTestId("kb-chunk-heading-p1")).toHaveTextContent("Benefits");
+        expect(screen.queryByText("alpha")).toBeNull();
+        expect(screen.queryByTestId("kb-chunk-parent-p1")).toBeNull();
+        await userEvent.click(screen.getByText("按小段"));
+        expect(await screen.findByText("alpha")).toBeInTheDocument();
+        expect(screen.queryByText("alpha and more")).toBeNull();
+      });
+    });
+
+    it("pages the 整块 view by its own total", async () => {
+      const spy = byView({ ...PARENTS, total: 45 });
+      await openDrawer();
+      await screen.findByText("alpha");
+      await userEvent.click(screen.getByText("By passage"));
+      await screen.findByText("alpha and more");
+      const drawer = screen.getByTestId("kb-chunks-drawer");
+      await userEvent.click(within(drawer).getByText("2"));
+      await waitFor(() =>
+        expect(spy).toHaveBeenLastCalledWith(
+          "support-docs",
+          DOCS[0].id,
+          { offset: 20, limit: 20, view: "parents" },
+          undefined,
+        ),
+      );
+    });
+
+    it("says a document with no 整块 has none", async () => {
+      await inChinese(async () => {
+        byView({ chunks: [], total: 0, offset: 0, limit: 20 });
+        await openDrawer();
+        await screen.findByText("alpha");
+        await userEvent.click(screen.getByText("按整块"));
+        expect(
+          await screen.findByText("这个文档没有整块，检索时每个小段单独作为一条结果。"),
+        ).toBeInTheDocument();
+      });
+    });
+
+    it("a slower answer for the view just left never replaces the one asked for", async () => {
+      let answerChildren: (page: knowledgeSdk.ChunksPage) => void = () => {};
+      vi.spyOn(knowledgeSdk, "listChunks").mockImplementation((_base, _doc, params) =>
+        params?.view === "parents"
+          ? Promise.resolve(PARENTS)
+          : new Promise((resolve) => {
+              answerChildren = resolve;
+            }),
+      );
+      await openDrawer();
+      await userEvent.click(await screen.findByText("By passage"));
+      expect(await screen.findByText("alpha and more")).toBeInTheDocument();
+      await act(async () => answerChildren(CHILDREN));
+      expect(screen.getByText("alpha and more")).toBeInTheDocument();
+      expect(screen.queryByText("alpha")).toBeNull();
+    });
+
+    it("opens the next document on the chunk view again", async () => {
+      const spy = byView();
+      await openDrawer();
+      await screen.findByText("alpha");
+      await userEvent.click(screen.getByText("By passage"));
+      await screen.findByText("alpha and more");
+      await userEvent.click(screen.getByRole("button", { name: "Close" }));
+      await userEvent.click(screen.getByTestId(`doc-chunks-${DOCS[0].id}`));
+      await waitFor(() =>
+        expect(spy).toHaveBeenLastCalledWith(
+          "support-docs",
+          DOCS[0].id,
+          { offset: 0, limit: 20, view: "children" },
+          undefined,
+        ),
+      );
+      expect(await screen.findByText("alpha")).toBeInTheDocument();
+      expect(screen.getByRole("radio", { name: "By chunk" })).toBeChecked();
+    });
   });
 
   it("settings save calls updateBase", async () => {

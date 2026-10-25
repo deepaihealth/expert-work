@@ -5,6 +5,10 @@
  * with their vector similarity score + which recall path surfaced each. The
  * controls (top-k / method / threshold / rerank) seed from the base's defaults
  * and let an operator probe how tuning changes recall.
+ *
+ * B-206 K-1: a result can be a parent row (「整块」) of its hit chunks (「小段」):
+ * the whole parent is shown, its best hit chunk highlighted where its text
+ * appears verbatim, or shown on its own above the parent where it does not.
  */
 import { useCallback, useState } from "react";
 import {
@@ -56,6 +60,77 @@ const RECALL_COLOR: Record<string, string> = {
   keyword: "gold",
   both: "green",
 };
+
+const BODY_STYLE = { whiteSpace: "pre-wrap", marginBottom: 0, fontSize: 13 } as const;
+
+/** A result's text. Without a parent row it is the hit chunk, shown as before;
+ *  with one it is the whole parent, under a line naming the parent and its hit
+ *  chunks. */
+function ResultBody({ result, idx }: { result: RetrievalTestResult; idx: number }) {
+  const { t } = useTranslation();
+  const parentIndex = result.parent_index ?? null;
+  if (parentIndex === null) {
+    return (
+      <>
+        <HeadingPath path={result.heading_path} testId={`kb-test-heading-${idx}`} />
+        <Paragraph style={BODY_STYLE} ellipsis={{ rows: 4, expandable: true }}>
+          {result.content}
+        </Paragraph>
+      </>
+    );
+  }
+  const hits = result.hit_chunk_indexes ?? [result.chunk_index];
+  const hit = result.hit_content ?? null;
+  const at = hit === null ? -1 : result.content.indexOf(hit);
+  return (
+    <>
+      <Text
+        type="secondary"
+        style={{ display: "block", fontSize: 12, marginBottom: 4 }}
+        data-testid={`kb-test-parent-${idx}`}
+      >
+        {t("knowledge_page.test_parent_hits", {
+          count: hits.length,
+          parent: parentIndex,
+          hits: hits.map((index) => `#${index}`).join(t("knowledge_page.test_hit_separator")),
+        })}
+      </Text>
+      <HeadingPath path={result.heading_path} testId={`kb-test-heading-${idx}`} />
+      {hit !== null && at < 0 && (
+        <div
+          style={{
+            border: "1px solid var(--ew-border-subtle)",
+            borderRadius: 6,
+            padding: "6px 10px",
+            marginBottom: 8,
+          }}
+          data-testid={`kb-test-hit-${idx}`}
+        >
+          <Text type="secondary" style={{ display: "block", fontSize: 12 }}>
+            {t("knowledge_page.test_hit_chunk")}
+          </Text>
+          <Paragraph style={BODY_STYLE}>{hit}</Paragraph>
+        </div>
+      )}
+      <Paragraph style={BODY_STYLE}>
+        {hit !== null && at >= 0 ? (
+          <>
+            {result.content.slice(0, at)}
+            <mark
+              style={{ background: "var(--ew-status-warning-bg)", color: "inherit", padding: 0 }}
+              data-testid={`kb-test-hit-mark-${idx}`}
+            >
+              {hit}
+            </mark>
+            {result.content.slice(at + hit.length)}
+          </>
+        ) : (
+          result.content
+        )}
+      </Paragraph>
+    </>
+  );
+}
 
 interface RetrievalTestTabProps {
   base: KnowledgeBase;
@@ -244,13 +319,7 @@ export function RetrievalTestTab({ base, readScope }: RetrievalTestTabProps) {
                   />
                 )}
               </Space>
-              <HeadingPath path={result.heading_path} testId={`kb-test-heading-${idx}`} />
-              <Paragraph
-                style={{ whiteSpace: "pre-wrap", marginBottom: 0, fontSize: 13 }}
-                ellipsis={{ rows: 4, expandable: true }}
-              >
-                {result.content}
-              </Paragraph>
+              <ResultBody result={result} idx={idx} />
             </Card>
           ))}
         </div>
