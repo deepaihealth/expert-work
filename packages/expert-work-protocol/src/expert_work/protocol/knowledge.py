@@ -245,7 +245,8 @@ class DocumentSourceType(StrEnum):
 
 class ChunkType(StrEnum):
     """``knowledge_chunk.chunk_type``. The ingestion pipeline writes
-    ``TEXT``; the others are reserved for FAQ / entries / materials."""
+    ``TEXT`` chunks and the ``PARENT`` rows that group them (B-206 K-1); the
+    others are reserved for FAQ / entries / materials."""
 
     TEXT = "text"
     QUESTION = "question"
@@ -255,6 +256,14 @@ class ChunkType(StrEnum):
     ENTRY = "entry"
     MATERIAL = "material"
     MATERIAL_PHRASE = "material_phrase"
+    #: A run of consecutive chunks returned as one result (B-206 K-1): stored
+    #: for reading, never embedded or keyword-indexed, never recalled.
+    PARENT = "parent"
+
+
+#: The chunk types recall may return — an allow-list, so a type added later
+#: stays out of search until it is listed here on purpose.
+SEARCHABLE_CHUNK_TYPES: frozenset[ChunkType] = frozenset(ChunkType) - {ChunkType.PARENT}
 
 
 #: A file extension: up to five letters / digits, at least one a letter — so a
