@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
+from collections.abc import Sequence
 from datetime import datetime
 from pathlib import Path
 from typing import Annotated, Any, Literal
@@ -60,6 +61,7 @@ from expert_work.protocol import (
     MAX_CHUNK_MAX_TOKENS,
     MIN_CHUNK_MAX_TOKENS,
     AuditAction,
+    ChunkType,
     DocumentStatus,
     KnowledgeBase,
     KnowledgeChunk,
@@ -303,10 +305,12 @@ def _document_dict(document: KnowledgeDocument) -> dict[str, Any]:
     }
 
 
-def _chunk_dict(chunk: KnowledgeChunk) -> dict[str, Any]:
+def _chunk_dict(chunk: KnowledgeChunk, parent_index: int | None) -> dict[str, Any]:
     """Segment-preview row. ``content`` is the clean body; ``heading_path``
     the section breadcrumb (empty for chunks ingested before it was stored
-    apart — their body still carries the ``[Section: …]`` prefix)."""
+    apart — their body still carries the ``[Section: …]`` prefix).
+    ``parent_index`` is the ``chunk_index`` of the parent row the chunk belongs
+    to (B-206 K-1; ``None`` without one, and for a parent row itself)."""
     return {
         "id": str(chunk.id),
         "chunk_index": chunk.chunk_index,
@@ -316,7 +320,21 @@ def _chunk_dict(chunk: KnowledgeChunk) -> dict[str, Any]:
         "enabled": chunk.enabled,
         "edited": chunk.edited,
         "revision": chunk.revision,
+        "parent_index": parent_index,
     }
+
+
+async def _parent_indexes(
+    store: KnowledgeStore, tenant_id: UUID, chunks: Sequence[KnowledgeChunk]
+) -> list[int | None]:
+    """Each chunk's parent row's ``chunk_index`` (``None`` without one) — one
+    read for the whole page, none when no chunk has a parent row."""
+    ids = list(dict.fromkeys(c.parent_chunk_id for c in chunks if c.parent_chunk_id is not None))
+    if not ids:
+        return [None] * len(chunks)
+    parents = await store.get_chunks(tenant_id=tenant_id, chunk_ids=ids)
+    index_of = {parent.id: parent.chunk_index for parent in parents}
+    return [None if c.parent_chunk_id is None else index_of.get(c.parent_chunk_id) for c in chunks]
 
 
 async def _require_base(store: KnowledgeStore, tenant_id: UUID, name: str) -> KnowledgeBase:
@@ -1019,6 +1037,9 @@ def build_knowledge_router() -> APIRouter:
         audit: Annotated[AuditLogger, Depends(_get_audit)],
         offset: int = 0,
         limit: int = 50,
+        # B-206 K-1 — ``children``: the searchable chunks, each naming its parent
+        # row (``parent_index``); ``parents``: the parent rows themselves.
+        view: Literal["children", "parents"] = "children",
         # W3 read scope — subordinate detail read: concrete tenant only.
         tenant_id: Annotated[UUID | Literal["*"] | None, Query()] = None,
     ) -> JSONResponse:
@@ -1042,7 +1063,9 @@ def build_knowledge_router() -> APIRouter:
                 document_id=document_id,
                 offset=safe_offset,
                 limit=safe_limit,
+                chunk_types=(ChunkType.PARENT,) if view == "parents" else None,
             )
+            parent_indexes = await _parent_indexes(store, scope.tenant_id, chunks)
         # B-209 PR-2 —— figures whose originals this document really has.
         figure_ids = await confirmed_figure_ids(
             request.app.state.object_store,
@@ -1053,7 +1076,10 @@ def build_knowledge_router() -> APIRouter:
         )
         return JSONResponse(
             content={
-                "chunks": [_chunk_dict(c) for c in chunks],
+                "chunks": [
+                    _chunk_dict(c, parent_index)
+                    for c, parent_index in zip(chunks, parent_indexes, strict=True)
+                ],
                 "figure_ids": figure_ids,
                 "total": total,
                 "offset": safe_offset,
@@ -1120,6 +1146,16 @@ def build_knowledge_router() -> APIRouter:
                         "score": r.score,
                         "rerank_score": r.rerank_score,
                         "recall_source": r.recall_source,
+                        # B-206 K-1 — ``content`` / ``heading_path`` are the parent
+                        # row's (``parent_index``, ``null`` when the hit has none);
+                        # the scores and ``chunk_index`` are its best hit child's,
+                        # ``hit_chunk_indexes`` every hit child (best first) and
+                        # ``hit_content`` the best one's own body (``null`` when
+                        # the result is that child itself).
+                        "parent_index": r.parent_index,
+                        "hit_chunk_indexes": list(r.hit_chunk_indexes),
+                        "hit_content": r.hit_content,
+                        "hit_heading_path": list(r.hit_heading_path),
                     }
                     for r in outcome.results
                 ],
