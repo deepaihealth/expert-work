@@ -54,7 +54,7 @@ async def test_create_base_persists_chunk_params() -> None:
     store = InMemoryKnowledgeStore()
     tenant = uuid4()
     default = await store.create_base(tenant_id=tenant, name="default")
-    assert (default.chunk_max_tokens, default.chunk_overlap_tokens) == (512, 64)
+    assert (default.chunk_max_tokens, default.chunk_overlap_tokens) == (400, 0)
     tuned = await store.create_base(
         tenant_id=tenant, name="tuned", chunk_max_tokens=256, chunk_overlap_tokens=16
     )
