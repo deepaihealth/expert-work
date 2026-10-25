@@ -230,6 +230,18 @@ Boot a temporary 1-replica pool on `ew-prod-sandbox`, as was done on test
 The platform never claims from that pool, so the old code is not involved and
 users are unaffected. The user runs it.
 
+**Done 2026-10-25** (two temporary sandboxes, pool `ew-sbx-sgcheck`, image
+from the live pool, deleted afterwards). Results:
+- booted on `sg-bp1a9oa7oi3v4s3ccquu` with no init or pull errors;
+- timed out as expected: DB, Redis, control plane, Prometheus, Alertmanager,
+  Grafana, Keycloak, public internet, proxy 8080, the user pool's sandbox and
+  the same-group twin;
+- open: NAS and the pip mirror;
+- proxy 8081 timed out, as expected until release day moves credential-proxy
+  onto `ew-prod-credproxy`.
+
+The console shows `ew-prod-sandbox` set to 组内隔离.
+
 ## 8. Follow-ups (not in this change)
 
 - **Token theft between one user's agents.** Execs of the same user's agents
