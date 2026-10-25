@@ -25,6 +25,10 @@
 #
 #     kubectl apply -k infra/k8s/sandbox-test
 #
+# Production has infra/k8s/sandbox-prod, but applies it only once the release
+# carrying B-217 (#1938) is live there; until then it stays on `apply -f` of
+# this file (see the warning in sandbox-prod/security-group-patch.yaml).
+#
 # Applying this file directly puts new sandboxes back into the cluster security
 # group, next to the platform's database, Redis and monitoring; nothing errors.
 # smoke.sh warns ("sandbox network isolation"). Rules and reasons:
