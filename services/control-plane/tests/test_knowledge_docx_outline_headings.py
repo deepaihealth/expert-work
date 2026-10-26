@@ -126,3 +126,20 @@ def test_the_chunks_carry_the_heading_path() -> None:
     parents = chunk_markdown_parented(markdown, max_tokens=400, overlap_tokens=0)
     paths = [chunk.heading_path for parent in parents for chunk in parent.children]
     assert ("Service guide", "Opening hours") in paths
+
+
+def test_level_nine_and_table_paragraphs_are_left_as_they_are() -> None:
+    # At the XML level: mammoth would render the result as body text either
+    # way, so the guard is pinned where it acts.
+    from control_plane.knowledge.office_docx import _outline_headings, _StyleOutlines
+
+    cell = f"<w:tbl><w:tr><w:tc>{_para('In a cell', level=0)}</w:tc></w:tr></w:tbl>"
+    document = (
+        f'<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        f'<w:document xmlns:w="{_W_NS}"><w:body>{_para("Body level", level=9)}{cell}'
+        "</w:body></w:document>"
+    ).encode()
+    none = _StyleOutlines(levels={}, headings=frozenset())
+    assert _outline_headings(document, none) == document
+    headed = _outline_headings(document.replace(b'w:val="9"', b'w:val="2"'), none)
+    assert headed.count(b"ExpertWorkOutline3") == 1  # the body paragraph, not the cell
