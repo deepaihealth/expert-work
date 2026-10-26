@@ -1135,3 +1135,24 @@ except Exception as e:
 - [x] **54.5 重验 53.2**:按 §53 跑 53.2,判据原样。 **10-25 过**,见 53.2。
 - [x] **54.6 平台照常**:B-140 评测里带 exec_python 的用例各跑一次通过;金丝雀 PASS;工作区读写、上传下载正常。 **10-25 过**:B-140 `g08-group-mean`、`c01-ten-ledgers-one-by-one` 各跑 1 次都过(c01 中途压缩 1 次);切池后重跑金丝雀 PASS(21.8 秒);往出网关智能体的会话上传一个文本文件,沙箱里从 `uploads/` 读回内容,工作区写入正常。
 - [x] **54.7 沙箱之间不通**:在一台沙箱里 `kubectl -n default exec <沙箱A> -c main -- python3 -c '…监听 6443 与 53…'`(同 10-25 的做法),从另一台沙箱连 A 的 6443 / 53 / 49983。判据:全部超时。**没修好时**(规则写成 VPC 网段):6443 / 53 连得上。 **10-25 过**:沙箱 X 监听 6443 / 53,另一台连 X 的 6443 / 53 / 49983 全部 4 秒超时;对照:X 连自己的 6443 / 53 是通的。
+
+## §55 B-206 K-3 重新切块 + K-1 父子块(小段检索、整块返回)
+
+**背景**:K-3 把切块改成「按结构切小段」:默认 400 token、不重叠,问答不拆开,长表格行续段重复前几列,只合并几乎为空的节;主题转换处断开(语义断点)默认开。K-1 在此之上先切「整块」(父段,≤ 1,024 token,一级 / 二级标题变化且已过半就收口),再在整块里切小段;小段不跨整块。召回、融合、重排都在小段上做,结果按整块折叠:同一整块只出一次,`limit` / `top_k` 数的是整块,交给模型的是整块正文(每次 `knowledge_search` 正文合计 ≤ 10,000 字,放不下的整块只给命中小段并标 `[已截断]`)。整块存为 `chunk_type='parent'` 的行,没有向量、不进关键词索引,召回永远查不到它;只有一个小段且与整块相同的,不建整块行(小段自己就是整块)。迁移 0174(切块默认值)+ 0175(`embedding` 可空,约束「只有整块没有向量」,唯一约束改成 `(document_id, chunk_type, chunk_index)`)。开发集(主集 303 / 真实问法 172 题,10-26):答案原文落在交给模型的文本里 主集 0.976 → 0.983、真实问法 0.921 → 0.928(两集都不比主干差);**每次检索交给模型的字数约翻倍**(主集 2,428 → 4,655 字);智能体层 60 题编造 3 比 3,有答案题 29 → 30 答对,答题模型花费 +56%。
+
+**怎么进**:测试环境控制台(system_admin,平台租户)建临时知识库 `kb55`,另找一个**发版前就入库**的知识库(下称「旧库」)。数据库查询走测试库只读连接。**测试文件(零租户内容,本机生成)**:
+
+```bash
+python3 - <<'PY'
+para = lambda c, p: f"第 {c} 章第 {p} 段:" + "这是用于验收切块的说明文字,只描述本段的编号与位置。" * 6
+doc = "\n\n".join(f"## 第 {c} 章\n\n" + "\n\n".join(para(c, p) for p in range(1, 9)) for c in range(1, 7))
+open("/tmp/kb55.md", "w", encoding="utf-8").write("# 验收文档\n\n" + doc)
+PY
+```
+
+- [ ] **55.1 迁移**:`SELECT version_num FROM alembic_version` 为 `0175_kb_k1_parent_chunks`;`SELECT conname FROM pg_constraint WHERE conname IN ('knowledge_chunk_embedding_iff_parent', 'knowledge_chunk_document_type_index_uniq')` 两行都在。
+- [ ] **55.2 旧库照常可用(没重新摄取前)**:调试台用绑了旧库的智能体问一个旧库里有答案的问题。判据:`knowledge_search` 正常返回、回答引用到资料;`SELECT count(*) FROM knowledge_chunk c JOIN knowledge_document d ON d.id = c.document_id WHERE d.kb_id = '<旧库 id>' AND c.chunk_type = 'parent'` 为 0(旧文档没有整块行,每个小段自己就是一条结果)。`GET /v1/knowledge/bases/<旧库>` 的 `chunk_params_hash` 与旧文档的 `chunk_params_hash` 不同(切块参数变了,要重新摄取才按新规则切)。**没修好时**:检索报错,或旧文档的结果是空。
+- [ ] **55.3 新入库建整块**(嵌入几分钱):`kb55` 上传 `/tmp/kb55.md`,等 ready。判据:`SELECT chunk_type, count(*), count(embedding), count(content_tsv) FROM knowledge_chunk WHERE document_id = '<id>' GROUP BY 1` —— `parent` 行数 > 0、向量与关键词都是 0;小段行数 > 整块行数、向量与关键词数都等于行数;每个小段的 `parent_chunk_id` 都指向本文档的一个 `parent` 行;文档 `chunk_count` = 小段行数(不含整块)。**没修好时**:没有 `parent` 行,或 `parent` 行带向量。
+- [ ] **55.4 智能体拿到的是整块**:调试台用绑了 `kb55` 的智能体问「第 3 章第 5 段讲了什么」。判据:工具结果每条以 `[kb55.md#<小段号>]` 开头,正文是**整块**(含第 3 章同一整块里的其它段,不只第 5 段);同一整块不出现两次;结果条数 ≤ 库的 top_k;正文合计 ≤ 10,000 字。**没修好时**:正文只有命中的那一小段,或同一整块重复出现。
+- [ ] **55.5 重新摄取后整块还在**:对 `kb55.md` 点「重新摄取」。判据:回到 ready;55.3 的查询结果不变(整块、小段行数相同,父子关系都在);日志 `knowledge.ingest_vectors … embedded=0`;没有新的 `knowledge_ingest` 用量。**没修好时**:`parent` 行数变 0(重建时把整块删了)。
+- [ ] **55.6 大文档入库内存没回退**(嵌入约 ¥4,语义断点默认开后约是 §51.4 的 1.8 倍):按 §51.4 端口转发直传 `kb48-near-a.docx`。判据:ready;主进程峰值比空闲高不超过约 200 MiB(§51.4 是 +196 MiB)。**没修好时**(写库前把整份段列表复制一遍重排):峰值 +600 MiB 以上。测完删 `kb55` 和这份文档。
