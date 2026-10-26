@@ -61,6 +61,12 @@ env:
   # 工单未批),env 先补上,Task 8 换镜像 tag / 工单批复之后这条测试原样
   # 就是验收开关,不需要再回来改这个 workflow。
   EXPERT_WORK_SANDBOX_WORKSPACE_PV_NAME: "workspace-nas"
+  # B-217 之后测试沙箱单独一个安全组,直连不到公网:pip 默认的 pypi.org 连不上,
+  # `test_exec_pip_user_install_then_import` 等满 240 秒超时(10-26 #1944 两次复现)。
+  # 与测试集群同值(infra/k8s/overlays/test/configmap-patch.yaml 的同名键),只给内网主源;
+  # 公网备源(PIP_EXTRA_INDEX_URL)不给 —— 这里的 exec 不带出网设置,等同出网关。
+  EXPERT_WORK_SANDBOX_PIP_INDEX_URL: "http://mirrors.cloud.aliyuncs.com/pypi/simple/"
+  EXPERT_WORK_SANDBOX_PIP_TRUSTED_HOST: "mirrors.cloud.aliyuncs.com"
 
 jobs:
   agent-sandbox-contract:
