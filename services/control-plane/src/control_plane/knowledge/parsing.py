@@ -2,8 +2,10 @@
 
 An uploaded file is converted to Markdown text — the form the chunker
 consumes. PDFs go through pymupdf4llm (high-quality, heading-aware);
-office formats (docx / pptx / xlsx) and a PDF fallback go through
-MarkItDown. A PDF whose pymupdf4llm parse is suspiciously sparse (a
+office formats (docx / pptx) and a PDF fallback go through
+MarkItDown; xlsx is read cell by cell as displayed (B-206 K-18,
+:mod:`~control_plane.knowledge.office_xlsx`), MarkItDown only when that
+cannot read the file. A PDF whose pymupdf4llm parse is suspiciously sparse (a
 scanned / image-only PDF) is retried with MarkItDown's extractor.
 Plain text (md / txt) that is valid UTF-8 is used as decoded; a UTF-8 CSV
 is handed to MarkItDown with its charset (B-181). Only other bytes get
@@ -25,6 +27,7 @@ import pymupdf4llm
 from markitdown import MarkItDown, StreamInfo
 
 from control_plane.knowledge.office_docx import FIGURE_TOKEN, ConvertImage, docx_markdown
+from control_plane.knowledge.office_xlsx import xlsx_markdown
 from expert_work.protocol import IngestErrorCode
 
 #: Document extensions the knowledge pipeline accepts.
@@ -321,6 +324,11 @@ def _parse_docx(raw: bytes, convert_image: ConvertImage | None = None) -> str:
 def _parse_with_markitdown(raw: bytes, ext: str, *, keep_data_uris: bool = False) -> str:
     if ext == ".docx" and _is_zip(raw):  # pictures never read (no figure step): office_docx
         return _parse_docx(raw)
+    if ext == ".xlsx" and _is_zip(raw):
+        try:
+            return xlsx_markdown(raw)
+        except Exception:  # noqa: S110 — MarkItDown reads it as before K-18, or fails
+            pass
     # The bytes stay as they are; ``utf-8-sig`` also drops a leading BOM.
     utf8 = ext in _UTF8_HINTED_EXTENSIONS and _decode_utf8(raw) is not None
     info = StreamInfo(extension=ext, charset="utf-8-sig" if utf8 else None)
