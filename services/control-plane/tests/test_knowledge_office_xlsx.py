@@ -79,7 +79,9 @@ def test_a_category_merged_down_the_rows_is_in_every_row() -> None:
         )
     )
     sheet.merge_cells("A2:A4")
-    assert xlsx_markdown(_bytes(book)).splitlines()[3:] == [
+    assert xlsx_markdown(_bytes(book)).splitlines()[1:] == [
+        "| Group | Plan | Fee |",
+        "| --- | --- | --- |",
         "| Basic | A | 10 |",
         "| Basic | B | 20 |",
         "| Basic | C | 30 |",
