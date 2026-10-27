@@ -40,7 +40,8 @@
    ```bash
    export KUBECONFIG=~/.kube/expert-work-test.yaml
    kubectl apply -k infra/k8s/sandbox-test      # 测试:带沙箱专用安全组(B-217)
-   # 生产在它自己的沙箱安全组建好之前仍是:kubectl apply -f infra/k8s/sandbox/sandboxset.yaml
+   # 生产:带 B-217(#1938)的版本上了生产之后才用 kubectl apply -k infra/k8s/sandbox-prod;
+   # 在那之前仍是 kubectl apply -f infra/k8s/sandbox/sandboxset.yaml(旧代码上切隔离会坏,见该目录补丁头注)
    kubectl get sandboxset expert-work-sandbox -n default -w
    # 到 UPDATEDAVAILABLEREPLICAS 等于池大小为止
    ```

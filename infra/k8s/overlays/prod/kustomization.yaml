@@ -75,6 +75,7 @@ configMapGenerator:
 
 patches:
 - path: configmap-patch.yaml
+- path: credential-proxy-sg-patch.yaml
 - path: ingress-patch.yaml
 - path: keycloak-patch.yaml
 - path: langfuse-configmap-patch.yaml

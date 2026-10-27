@@ -1,0 +1,33 @@
+# B-217 — sandboxes on their own security group (production: ew-prod-sandbox).
+#
+# Same rules as test (infra/k8s/sandbox-test), production addresses:
+# credential-proxy group on 8081 only, cluster DNS and the k8s API as /32s
+# (listed below), Aliyun DNS 100.100.2.136/29:53, the NAS mount target
+# 172.29.41.55, the in-VPC pip mirror 100.100.2.148:80, the image registry + its
+# OSS blobs (100.103.0.0/16, 100.118.0.0/16 on 443); everything else denied;
+# intra-group isolated.
+#
+# The ACS in-pod agent dials the cluster-info API host at boot. On production
+# that is a hostname that resolves inside the VPC to the two `kubernetes`
+# endpoints (probed 2026-10-25), so the API peers are just those two; on test it
+# is a separate address (172.16.41.70).
+#
+# ONLY APPLY AFTER the control-plane release carrying B-217 (#1938) is live in
+# production. Older code bakes egress env at sandbox creation: on this group an
+# egress-on agent reusing an egress-off agent's sandbox has no network at all,
+# and every pip install first times out on the public extra index.
+# Until then production keeps `kubectl apply -f infra/k8s/sandbox/sandboxset.yaml`.
+# docs/design/sandbox-network-isolation-acs.md § 7.
+apiVersion: agents.kruise.io/v1alpha1
+kind: SandboxSet
+metadata:
+  name: expert-work-sandbox
+  namespace: default
+  annotations:
+    expert-work.io/sg-dns-peers: "172.26.133.241,172.29.41.61"
+    expert-work.io/sg-apiserver-peers: "172.26.133.62,172.29.41.40"
+spec:
+  template:
+    metadata:
+      annotations:
+        network.alibabacloud.com/security-group-ids: "sg-bp1a9oa7oi3v4s3ccquu"

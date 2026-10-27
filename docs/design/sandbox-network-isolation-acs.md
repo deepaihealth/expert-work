@@ -1,6 +1,6 @@
 # Sandbox network isolation on ACS (B-217)
 
-> Status: **test cluster done (2026-10-25), production pending.** Supersedes the
+> Status: **test cluster done (2026-10-25); production groups created, switch pending the next production release.** Supersedes the
 > isolation assumption in [sandbox-egress-per-agent.md](./sandbox-egress-per-agent.md),
 > which relied on the docker supervisor's `internal: true` network.
 
@@ -164,16 +164,83 @@ platform's own `AgentSandboxClient` (egress on).
 
 ## 7. Production
 
-Production needs its own groups. The VPC, NAS mount target, API server and DNS
-addresses differ, so collect them first with a read-only probe (run by the
-user). Order:
+Status: **groups created 2026-10-25 (user, console); not attached to anything
+yet.** The sandbox pool switches only after the release carrying #1938 is live in
+production.
 
-1. Console: create the sandbox and credproxy groups with § 3's rules.
-2. Release with a prod overlay patch for credential-proxy.
-3. Add `infra/k8s/sandbox-prod` and apply it.
-4. `smoke.sh prod` → `sandbox network isolation` OK.
+### Addresses (read-only probes, run by the user 2026-10-25)
 
-Re-run the probe; the user runs it.
+| | production | test |
+|---|---|---|
+| VPC / range | `vpc-bp1b6yy71h4ww98cc05n1`, `172.16.0.0/12` | `172.16.0.0/16` |
+| cluster group | `sg-bp17uoxec8vtpgxr23ql` | `sg-bp160370jxjrwefwkdxo` |
+| cluster DNS (`kube-dns`) | `172.26.133.241`, `172.29.41.61` | `172.16.41.73`, `.74` |
+| k8s API (`kubernetes`) | `172.26.133.62`, `172.29.41.40` | `172.16.41.72`, `172.16.88.94` |
+| API host dialed at boot (cluster-info) | `apiserver.c153….cn-hangzhou.cs.aliyuncs.com`, which resolves in the VPC to the two `kubernetes` endpoints | `172.16.41.70` |
+| NAS mount target | `172.29.41.55` | `172.16.41.84` |
+| pip mirror, registry, OSS internal | same as test | |
+
+RDS and Redis allow `172.16.0.0/12` by IP, so moving credential-proxy to its own
+group keeps its database access. The user also listed `ew-prod-credproxy` on
+both; that is redundant but harmless.
+
+### Groups
+
+- **`ew-prod-sandbox` (`sg-bp1a9oa7oi3v4s3ccquu`).** Same rules as
+  `ew-test-sandbox` (§ 3), with production's DNS, API and NAS addresses above.
+  Ingress is from `172.16.0.0/12`.
+- **`ew-prod-credproxy` (`sg-bp14yleiog3dkd0io2ox`).** Same rules as
+  `ew-test-credproxy`, with `172.16.0.0/12`.
+
+Config:
+- `infra/k8s/sandbox-prod/`, the pool annotation;
+- `infra/k8s/overlays/prod/credential-proxy-sg-patch.yaml`.
+
+### Order on release day
+
+1. **`release.sh prod`** ships the B-217 code and moves credential-proxy to
+   `ew-prod-credproxy`. That is safe before the pool moves: sandboxes still on
+   the cluster group reach the proxy through its VPC rule.
+   - Check that the proxy pod is Ready on `sg-bp14yleiog3dkd0io2ox`.
+   - Check that the canary passes.
+2. **`kubectl apply -k infra/k8s/sandbox-prod`.** The pool stays at 1 replica.
+3. **Recycle the pool:** `kubectl -n default delete sandbox -l agents.kruise.io/sandbox-pool=expert-work-sandbox`.
+   - A tool call running at that moment fails once.
+   - Check the claimed count first and pick a quiet moment.
+4. **`smoke.sh prod`** should print both `sandbox network isolation` OK lines.
+5. **Probes from a warm sandbox:**
+   - direct DB, Redis, monitoring and public endpoints all time out;
+   - DNS, NAS, pip and the proxy work.
+
+   Then run the canary again.
+
+**Never apply `sandbox-prod` on the old code.** It bakes egress env at sandbox
+creation. On the isolated group that means two failures:
+- an egress-on agent that reuses an egress-off agent's sandbox has no network at all;
+- every pip install first times out on the public extra index.
+
+### Before release day (recommended)
+
+Boot a temporary 1-replica pool on `ew-prod-sandbox`, as was done on test
+(§ 5):
+- it should boot with no `FailedToInitKubeClient` and no `ImagePullBackOff`;
+- run the same reachability probe through `kubectl exec`;
+- then delete the pool.
+
+The platform never claims from that pool, so the old code is not involved and
+users are unaffected. The user runs it.
+
+**Done 2026-10-25** (two temporary sandboxes, pool `ew-sbx-sgcheck`, image
+from the live pool, deleted afterwards). Results:
+- booted on `sg-bp1a9oa7oi3v4s3ccquu` with no init or pull errors;
+- timed out as expected: DB, Redis, control plane, Prometheus, Alertmanager,
+  Grafana, Keycloak, public internet, proxy 8080, the user pool's sandbox and
+  the same-group twin;
+- open: NAS and the pip mirror;
+- proxy 8081 timed out, as expected until release day moves credential-proxy
+  onto `ew-prod-credproxy`.
+
+The console shows `ew-prod-sandbox` set to 组内隔离.
 
 ## 8. Follow-ups (not in this change)
 
