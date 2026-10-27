@@ -1156,3 +1156,40 @@ PY
 - [ ] **55.4 智能体拿到的是整块**:调试台用绑了 `kb55` 的智能体问「第 3 章第 5 段讲了什么」。判据:工具结果每条以 `[kb55.md#<小段号>]` 开头,正文是**整块**(含第 3 章同一整块里的其它段,不只第 5 段);同一整块不出现两次;结果条数 ≤ 库的 top_k;正文合计 ≤ 10,000 字。**没修好时**:正文只有命中的那一小段,或同一整块重复出现。
 - [ ] **55.5 重新摄取后整块还在**:对 `kb55.md` 点「重新摄取」。判据:回到 ready;55.3 的查询结果不变(整块、小段行数相同,父子关系都在);日志 `knowledge.ingest_vectors … embedded=0`;没有新的 `knowledge_ingest` 用量。**没修好时**:`parent` 行数变 0(重建时把整块删了)。
 - [ ] **55.6 大文档入库内存没回退**(嵌入约 ¥4,语义断点默认开后约是 §51.4 的 1.8 倍):按 §51.4 端口转发直传 `kb48-near-a.docx`。判据:ready;主进程峰值比空闲高不超过约 200 MiB(§51.4 是 +196 MiB)。**没修好时**(写库前把整份段列表复制一遍重排):峰值 +600 MiB 以上。测完删 `kb55` 和这份文档。
+
+## §56 B-206 K-18 表格按显示读 + K-19 Word 大纲级别当标题
+
+**背景**:K-18 改用 openpyxl 读 `.xlsx`,不再经 pandas:合并单元格的值往下补到它跨的每一行(只补第一列;横向合并只留第一格);空格子就是空,不再写 `NaN`;数字按单元格格式显示(百分比 `61.12%` 而不是 `0.6112`、整数不带 `.0`、零点的日期只显示日期);格子里的 `|` 转义、换行折成空格;第一行只有一个值、下面是至少两列的表 → 当成表标题(`### 标题`),进标题路径。openpyxl 读不了就退回 MarkItDown。K-19:Word 里用「大纲级别」(段落自己的,或段落样式的,含继承)标的标题,按级别转成 `#`~`######`;标题样式照旧;正文级别(9)、表格里的段落、超过 100 字的段落不动。开发集:表格 `NaN` 9,067 → 0;Word 标题行 224 → 1,313;主集答案原文落在交给模型的文本里 0.983 → 0.997(总计划 §3.5)。**已入库的文档要重新摄取才会按新解析重切。**
+
+**怎么进**:测试环境控制台(system_admin,平台租户)建临时知识库 `kb56`。数据库查询走测试库只读连接。**测试文件(零租户内容,本机生成,要 openpyxl)**:
+
+```bash
+python3 - <<'PY'
+import datetime, io, zipfile
+from openpyxl import Workbook
+book = Workbook(); s = book.active; s.title = "价目"
+for row in (["验收价目表 2026", None, None, None], ["分组", "项目", "折扣", "生效日"],
+            ["基础套餐", "甲", 0.6112, datetime.datetime(2026, 3, 1)], [None, "乙", 0.25, None],
+            [None, "丙", 0.125, datetime.datetime(2026, 4, 1)], ["增值套餐", "丁", 1.0, datetime.datetime(2026, 5, 1)]):
+    s.append(row)
+s.merge_cells("A1:D1"); s.merge_cells("A3:A5")
+for r in range(3, 7):
+    s[f"C{r}"].number_format = "0.00%"; s[f"D{r}"].number_format = "yyyy/mm/dd"
+book.save("/tmp/kb56.xlsx")
+W = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+def p(t, lv=None):
+    ppr = '<w:pPr><w:outlineLvl w:val="%d"/></w:pPr>' % lv if lv is not None else ""
+    return '<w:p>' + ppr + '<w:r><w:t xml:space="preserve">' + t + '</w:t></w:r></w:p>'
+body = p("验收服务指南", 0) + p("营业时间", 1) + p("工作日九点到五点,周六九点到十二点。") + p("退款规则", 1) + p("三十天内可以退款,需保留原包装。")
+out = io.BytesIO()
+with zipfile.ZipFile(out, "w") as z:
+    z.writestr("[Content_Types].xml", '<?xml version="1.0" encoding="UTF-8"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/></Types>')
+    z.writestr("_rels/.rels", '<?xml version="1.0" encoding="UTF-8"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="word/document.xml"/></Relationships>')
+    z.writestr("word/document.xml", f'<?xml version="1.0" encoding="UTF-8"?><w:document xmlns:w="{W}"><w:body>{body}</w:body></w:document>')
+open("/tmp/kb56.docx", "wb").write(out.getvalue())
+PY
+```
+
+- [ ] **56.1 表格按显示读**(嵌入不到 1 分钱):`kb56` 上传 `/tmp/kb56.xlsx`,等 ready。判据:`SELECT heading_path, content FROM knowledge_chunk WHERE document_id = '<id>' AND chunk_type <> 'parent' ORDER BY chunk_index` —— 正文里「基础套餐」出现 3 次(合并单元格每行都有);折扣是 `61.12%` / `25.00%` / `12.50%` / `100.00%`;日期是 `2026-03-01`(没有 `00:00:00`);没有 `NaN`、没有 `Unnamed`;`heading_path` 是 `["价目", "验收价目表 2026"]`。**没修好时**:乙、丙两行分组是 `NaN`,折扣 `0.6112`,表头是 `验收价目表 2026 | Unnamed: 1 …`,`heading_path` 只有 `["价目"]`。
+- [ ] **56.2 Word 大纲级别当标题**:`kb56` 上传 `/tmp/kb56.docx`(文件里没有任何「标题」样式,只有大纲级别),等 ready。判据:同上查询 —— `heading_path` 以 `"验收服务指南"` 开头;正文里有 `## 营业时间`、`## 退款规则` 两行。**没修好时**:`heading_path` 为空,正文里没有 `#`。
+- [ ] **56.3 智能体看到标题**:调试台用绑了 `kb56` 的智能体问「退款规则是什么」。判据:工具结果里这份 Word 的那条正文带「验收服务指南」「退款规则」,回答是「三十天内、需保留原包装」。测完删 `kb56`。
