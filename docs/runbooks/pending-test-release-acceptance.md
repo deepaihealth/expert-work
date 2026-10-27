@@ -1220,6 +1220,6 @@ with zipfile.ZipFile("/tmp/skill57.zip", "w") as z:
 PY
 ```
 
-- [ ] **57.1 租户导入**:控制台「技能」→ 导入 `/tmp/skill57.zip`。判据:导入成功,技能文件列表里有 `assets/reference.pdf`。**没修好时**:400「invalid skill package」。
-- [ ] **57.2 平台技能导入**:平台技能页导入同一个包。判据:导入成功。**没修好时**:400,提示「disallowed file type」。
-- [ ] **57.3 沙箱读得到**:调试台给一个智能体挂上 57.1 导入的技能,问「技能里那份 PDF 有几页」。判据:智能体在沙箱里读到 `assets/reference.pdf`,答 2 页。测完删掉两处导入的技能。
+- [x] **57.1 租户导入**:控制台「技能」→ 导入 `/tmp/skill57.zip`。判据:导入成功,技能文件列表里有 `assets/reference.pdf`。**没修好时**:400「invalid skill package」。 **10-27 测试 `e90903f7e` 过**:`POST /v1/skills/import` 201,版本 1 的文件列表是 `["assets/reference.pdf"]`(导入后是草稿,启用后才能挂到智能体)。
+- [x] **57.2 平台技能导入**:平台技能页导入同一个包。判据:导入成功。**没修好时**:400,提示「disallowed file type」。 **10-27 测试 `e90903f7e` 过**:`POST /v1/platform/skills/import` 201。
+- [x] **57.3 沙箱读得到**:调试台给一个智能体挂上 57.1 导入的技能,问「技能里那份 PDF 有几页」。判据:智能体在沙箱里读到 `assets/reference.pdf`,答 2 页。测完删掉两处导入的技能。 **10-27 测试 `e90903f7e` 过**(glm-5.3):智能体在 `$EXPERT_WORK_SKILLS_DIR/skill57-pdf-check/assets/` 下看到 `reference.pdf`,用 pypdf 读出 2 页,回答「共 2 页」。两处导入的技能已归档(没有硬删除接口),临时智能体已删。
