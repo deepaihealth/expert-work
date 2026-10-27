@@ -163,6 +163,7 @@ from control_plane.keycloak import (
     KeycloakAdminClient,
     ServiceAccountTokenProvider,
 )
+from control_plane.knowledge.chunking import configure_semantic_breaks
 from control_plane.knowledge.ingestion import KnowledgeIngestionRunner, configure_parse_pool
 from control_plane.knowledge.parsed_size import configure_parsed_size, configure_raw_bytes
 from control_plane.knowledge.recognition.figure_pipeline import (
@@ -2103,6 +2104,7 @@ def create_app(
                     max_chars=resolved_settings.knowledge_document_max_chars,
                     max_chunks=resolved_settings.knowledge_document_max_chunks,
                 )
+                configure_semantic_breaks(enabled=resolved_settings.knowledge_semantic_breaks)
                 configure_raw_bytes(
                     budget=resolved_settings.knowledge_ingest_raw_bytes_budget,
                     upload_max_bytes=resolved_settings.knowledge_document_max_bytes,

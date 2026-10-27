@@ -31,7 +31,7 @@ from expert_work.persistence import (
     create_async_session_factory,
 )
 from expert_work.persistence.embedding import EMBEDDING_DIM
-from expert_work.protocol import DocumentStatus, KnowledgeChunk
+from expert_work.protocol import ChunkType, DocumentStatus, KnowledgeChunk
 from orchestrator.tools.knowledge import KnowledgeRetriever
 
 pytestmark = pytest.mark.integration
@@ -142,3 +142,70 @@ async def test_search_attributes_file_names_without_reading_the_uploads(
     assert filenames == {f"doc-{index}.pdf" for index in range(_DOCUMENTS)}
     # Reading the uploads would allocate at least ``_DOCUMENTS * _UPLOAD``.
     assert peak - start < _UPLOAD // 4
+
+
+async def test_search_returns_the_parent_row_of_its_hit_children(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """B-206 K-1 on the SQL store: two hit children of one parent come back as
+    that parent row (stored without a vector), once, labelled by the better child."""
+    store = SqlKnowledgeStore(session_factory)
+    tenant = uuid4()
+    kb_id = (await store.create_base(tenant_id=tenant, name="kb")).id
+    document = await store.upsert_document(
+        tenant_id=tenant, kb_id=kb_id, filename="manual.md", content=b"x", content_sha256="sha"
+    )
+    claim = await store.claim_document(
+        tenant_id=tenant,
+        document_id=document.id,
+        now=datetime.now(UTC),
+        lease_seconds=600,
+        max_attempts=5,
+    )
+    assert claim is not None
+
+    def row(index: int, content: str, **extra: object) -> KnowledgeChunk:
+        return KnowledgeChunk.model_validate(
+            {
+                "id": uuid4(),
+                "tenant_id": tenant,
+                "kb_id": kb_id,
+                "document_id": document.id,
+                "chunk_index": index,
+                "content": content,
+                **extra,
+            }
+        )
+
+    parent = row(0, "alpha parent body", embedding=None, chunk_type=ChunkType.PARENT)
+    # Only child 0 matches "alpha" by keyword, and its vector is the closer one.
+    children = [
+        row(0, "alpha passage", embedding=_vec(0.01), parent_chunk_id=parent.id),
+        row(1, "beta passage", embedding=_vec(0.02), parent_chunk_id=parent.id),
+    ]
+    assert await store.replace_chunks(
+        tenant_id=tenant,
+        document_id=document.id,
+        chunks=[parent, *children],
+        generation=claim.generation,
+    )
+    assert await store.set_document_status(
+        tenant_id=tenant,
+        document_id=document.id,
+        status=DocumentStatus.READY,
+        chunk_count=len(children),
+        generation=claim.generation,
+    )
+    retriever = KnowledgeRetriever(store=store, embedder=_FixedEmbedder())
+
+    (hit,) = await retriever.search(
+        tenant_id=tenant, base_names=["kb"], query="alpha", limit=5, rerank=False
+    )
+
+    assert (hit.content, hit.parent_chunk_id, hit.parent_index) == (
+        "alpha parent body",
+        parent.id,
+        0,
+    )
+    assert (hit.chunk_index, hit.chunk_id, hit.hit_chunk_indexes) == (0, children[0].id, (0, 1))
+    assert (hit.filename, hit.hit_content) == ("manual.md", "alpha passage")

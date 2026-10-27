@@ -23,6 +23,9 @@ from control_plane.knowledge.ingestion import ingest_markdown
 from expert_work.persistence import InMemoryKnowledgeStore
 from expert_work.protocol import DEFAULT_CHUNK_MAX_TOKENS, DEFAULT_CHUNK_OVERLAP_TOKENS
 
+#: The memo is the semantic chunker's: topic shifts split sections here.
+pytestmark = pytest.mark.usefixtures("semantic_breaks")
+
 _TENANT = uuid4()
 
 

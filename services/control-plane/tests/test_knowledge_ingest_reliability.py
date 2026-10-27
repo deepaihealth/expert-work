@@ -347,6 +347,7 @@ class _FlakyFirstCallEmbedder(FakeEmbedder):
 
 
 @pytest.mark.asyncio
+@pytest.mark.usefixtures("semantic_breaks")
 async def test_semantic_chunking_embed_also_backs_off() -> None:
     """语义切块那一路(多块文档先嵌块)也走退避:第一次嵌入 429 仍然 READY."""
     store = InMemoryKnowledgeStore()

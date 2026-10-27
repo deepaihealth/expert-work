@@ -4,7 +4,9 @@
 文档);段级 = 文件在其中 **且**
 ``expected.anchor in retrieval_text``(检索文本 = 标题路径 + 正文,智能体看到的那段字;
 嵌入 / 关键词索引另在前面加了文档名,判对不算文档名;两侧先过 :func:`anchor_key` 归一,
-见 :func:`anchor_in`)。两级都先算成「逐名次覆盖集」——第 r 名结果**首次**覆盖到
+见 :func:`anchor_in`)。B-206 K-1 起一条结果是一个**父段**(召回命中的是子段,返回的是它所在的
+父段),``retrieval_text`` 是父段的文本,所以段级命中、``mrr@10``、``ndcg@10`` 都是父段级:锚文本
+跨了同一父段的两个子段也算命中。两级都先算成「逐名次覆盖集」——第 r 名结果**首次**覆盖到
 哪些期望条目(:func:`document_coverage` / :func:`chunk_coverage`):
 
 * 每条期望只在最早命中它的那一名记一次,后面再命中(相邻段重叠都含锚)记空,
@@ -94,8 +96,10 @@ class ResultLike(Protocol):
 
     @property
     def retrieval_text(self) -> str:
-        """Text the agent sees for the hit — section breadcrumb + chunk body
-        (the index also carries the document title; hits are not judged on it)."""
+        """Text the agent sees for the hit — section breadcrumb + body of the
+        passage the result returns: the parent of the matched chunk since
+        B-206 K-1 (the index also carries the document title; hits are not
+        judged on it)."""
 
     @property
     def score(self) -> float | None:

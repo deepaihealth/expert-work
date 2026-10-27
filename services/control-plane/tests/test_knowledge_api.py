@@ -14,11 +14,12 @@ from httpx import ASGITransport, AsyncClient
 
 from control_plane.app import create_app
 from control_plane.audit import build_default_audit_logger
+from control_plane.knowledge.chunking import chunk_params_hash
 from control_plane.knowledge.ingestion import KnowledgeIngestionRunner
 from control_plane.settings import DEFAULT_DEV_TENANT_ID, Settings
 from expert_work.persistence import InMemoryKnowledgeStore
 from expert_work.persistence.audit_log import InMemoryAuditLogStore
-from expert_work.protocol import DocumentStatus, KnowledgeChunk
+from expert_work.protocol import ChunkType, DocumentStatus, KnowledgeChunk
 from orchestrator.llm import FakeEmbedder
 from orchestrator.tools import KnowledgeRetriever
 from orchestrator.tools.knowledge import RerankRanking
@@ -178,9 +179,42 @@ async def test_create_base_rejects_overlap_not_below_max(setup: Setup) -> None:
     client, _ = setup
     resp = await client.post(
         "/v1/knowledge/bases",
-        json={"name": "bad", "chunk_max_tokens": 100, "chunk_overlap_tokens": 100},
+        json={"name": "bad", "chunk_max_tokens": 200, "chunk_overlap_tokens": 200},
     )
     assert resp.status_code == 400
+
+
+@pytest.mark.asyncio
+async def test_create_base_defaults_to_400_tokens_without_overlap(setup: Setup) -> None:
+    # B-206 K-3: the platform defaults; 0 overlap is stored as 0, not swapped for a default.
+    client, _ = setup
+    resp = await client.post("/v1/knowledge/bases", json={"name": "plain"})
+    assert resp.status_code == 201
+    assert (resp.json()["chunk_max_tokens"], resp.json()["chunk_overlap_tokens"]) == (400, 0)
+
+
+@pytest.mark.asyncio
+async def test_a_base_reports_the_chunking_fingerprint_of_its_parameters(setup: Setup) -> None:
+    # B-206 K-3: a document whose chunk_params_hash differs is an old version.
+    client, _ = setup
+    created = (await client.post("/v1/knowledge/bases", json={"name": "kb"})).json()
+    assert created["chunk_params_hash"] == chunk_params_hash(max_tokens=400, overlap_tokens=0)
+    await client.patch("/v1/knowledge/bases/kb", json={"chunk_max_tokens": 256})
+    fetched = (await client.get("/v1/knowledge/bases/kb")).json()
+    assert fetched["chunk_params_hash"] == chunk_params_hash(max_tokens=256, overlap_tokens=0)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("max_tokens", [127, 1025])
+async def test_chunk_size_outside_128_to_1024_is_rejected(setup: Setup, max_tokens: int) -> None:
+    client, _ = setup
+    created = await client.post(
+        "/v1/knowledge/bases", json={"name": "kb", "chunk_max_tokens": max_tokens}
+    )
+    assert created.status_code == 422
+    await client.post("/v1/knowledge/bases", json={"name": "ok"})
+    patched = await client.patch("/v1/knowledge/bases/ok", json={"chunk_max_tokens": max_tokens})
+    assert patched.status_code == 422
 
 
 @pytest.mark.asyncio
@@ -482,6 +516,233 @@ async def test_retrieval_test_returns_scored_results(full_setup: FullSetup) -> N
     first = body["results"][0]
     assert set(first) >= {"content", "source", "filename", "chunk_index", "score", "recall_source"}
     assert first["source"].startswith("h.md#")
+
+
+# ---------------------------------------------------------------------------
+# B-206 K-1 — parent rows in the segment preview and the hit-test
+# ---------------------------------------------------------------------------
+
+
+async def _seed_parented(
+    client: AsyncClient,
+    runner: KnowledgeIngestionRunner,
+    store: InMemoryKnowledgeStore,
+    children: Sequence[tuple[int | None, str]],
+) -> tuple[str, list[KnowledgeChunk]]:
+    """Base ``kb`` with one ready document ``h.md`` whose chunks are ``children``
+    — child ``i`` has chunk index ``i`` and heading ``("Part", "child i")``, and
+    belongs to the parent row its pair names (``None`` = no parent row). Parent
+    ``p`` (chunk index ``p``, heading ``("Part p",)``) holds its children's bodies
+    joined by a blank line. Returns the document id and the parent rows."""
+    doc_id = await _seed_kb_with_document(client, runner)
+    document = await store.get_document(tenant_id=_TENANT, document_id=UUID(doc_id))
+    assert document is not None
+
+    def row(index: int, content: str, **fields: Any) -> KnowledgeChunk:
+        return KnowledgeChunk(
+            id=uuid4(),
+            tenant_id=_TENANT,
+            kb_id=document.kb_id,
+            document_id=document.id,
+            chunk_index=index,
+            content=content,
+            **fields,
+        )
+
+    parents = [
+        row(
+            p,
+            "\n\n".join(body for ref, body in children if ref == p),
+            embedding=None,
+            chunk_type=ChunkType.PARENT,
+            heading_path=(f"Part {p}",),
+        )
+        for p in range(1 + max(ref for ref, _ in children if ref is not None))
+    ]
+    vectors = await FakeEmbedder().embed([body for _, body in children], tenant_id=_TENANT)
+    kids = [
+        row(
+            i,
+            body,
+            embedding=vector,
+            heading_path=("Part", f"child {i}"),
+            parent_chunk_id=None if ref is None else parents[ref].id,
+        )
+        for i, ((ref, body), vector) in enumerate(zip(children, vectors, strict=True))
+    ]
+    await store.replace_chunks(tenant_id=_TENANT, document_id=document.id, chunks=[*parents, *kids])
+    return doc_id, parents
+
+
+def _record_parent_reads(
+    store: InMemoryKnowledgeStore, monkeypatch: pytest.MonkeyPatch
+) -> list[list[UUID]]:
+    """Every ``get_chunks`` call's ids, from now on."""
+    reads: list[list[UUID]] = []
+    read = store.get_chunks
+
+    async def recording(*, tenant_id: UUID, chunk_ids: Sequence[UUID]) -> list[KnowledgeChunk]:
+        reads.append(list(chunk_ids))
+        return await read(tenant_id=tenant_id, chunk_ids=chunk_ids)
+
+    monkeypatch.setattr(store, "get_chunks", recording)
+    return reads
+
+
+@pytest.mark.asyncio
+async def test_list_chunks_names_each_chunks_parent_in_one_read(
+    full_setup: FullSetup, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The default view lists the searchable chunks (never the parent rows), each
+    with its parent row's own index — read once for the page's parents."""
+    client, runner, store = full_setup
+    doc_id, parents = await _seed_parented(
+        client, runner, store, [(0, "alpha"), (0, "beta"), (1, "gamma"), (None, "delta")]
+    )
+    reads = _record_parent_reads(store, monkeypatch)
+    url = f"/v1/knowledge/bases/kb/documents/{doc_id}/chunks"
+
+    body = (await client.get(url)).json()
+
+    assert body["total"] == 4
+    assert [(c["chunk_index"], c["content"], c["chunk_type"]) for c in body["chunks"]] == [
+        (0, "alpha", "text"),
+        (1, "beta", "text"),
+        (2, "gamma", "text"),
+        (3, "delta", "text"),
+    ]
+    assert [c["parent_index"] for c in body["chunks"]] == [0, 0, 1, None]
+    assert reads == [[parents[0].id, parents[1].id]]
+    # A later page names its parents by their own index, not by their place on the page.
+    page = (await client.get(url, params={"offset": 2, "limit": 2})).json()
+    assert [c["parent_index"] for c in page["chunks"]] == [1, None]
+
+
+@pytest.mark.asyncio
+async def test_list_chunks_parents_view_lists_the_parent_rows(full_setup: FullSetup) -> None:
+    client, runner, store = full_setup
+    doc_id, _ = await _seed_parented(
+        client, runner, store, [(0, "alpha"), (0, "beta"), (1, "gamma")]
+    )
+    url = f"/v1/knowledge/bases/kb/documents/{doc_id}/chunks"
+
+    body = (await client.get(url, params={"view": "parents"})).json()
+
+    assert body["total"] == 2
+    assert [
+        (c["chunk_index"], c["content"], c["heading_path"], c["chunk_type"], c["parent_index"])
+        for c in body["chunks"]
+    ] == [
+        (0, "alpha\n\nbeta", ["Part 0"], "parent", None),
+        (1, "gamma", ["Part 1"], "parent", None),
+    ]
+    page = (await client.get(url, params={"view": "parents", "offset": 1, "limit": 1})).json()
+    assert ([c["content"] for c in page["chunks"]], page["total"]) == (["gamma"], 2)
+    capped = (await client.get(url, params={"view": "parents", "limit": 500})).json()
+    assert capped["limit"] == 200
+    children = (await client.get(url, params={"view": "children"})).json()
+    assert ([c["content"] for c in children["chunks"]], children["total"]) == (
+        ["alpha", "beta", "gamma"],
+        3,
+    )
+
+
+@pytest.mark.asyncio
+async def test_list_chunks_of_a_document_without_parent_rows(
+    full_setup: FullSetup, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A document with no parent rows (ingested before them): the preview is as
+    before plus ``parent_index: null``, nothing is read for parents, and the
+    parents view is empty."""
+    client, runner, store = full_setup
+    doc_id = await _seed_kb_with_document(client, runner)
+    reads = _record_parent_reads(store, monkeypatch)
+    url = f"/v1/knowledge/bases/kb/documents/{doc_id}/chunks"
+
+    body = (await client.get(url)).json()
+
+    assert body["total"] >= 1
+    assert set(body["chunks"][0]) == {
+        "id",
+        "chunk_index",
+        "content",
+        "heading_path",
+        "chunk_type",
+        "enabled",
+        "edited",
+        "revision",
+        "parent_index",
+    }
+    assert [c["parent_index"] for c in body["chunks"]] == [None] * len(body["chunks"])
+    assert reads == []
+    parents = (await client.get(url, params={"view": "parents"})).json()
+    assert (parents["chunks"], parents["total"]) == ([], 0)
+
+
+@pytest.mark.asyncio
+async def test_list_chunks_rejects_an_unknown_view(full_setup: FullSetup) -> None:
+    client, runner, _ = full_setup
+    doc_id = await _seed_kb_with_document(client, runner)
+    resp = await client.get(
+        f"/v1/knowledge/bases/kb/documents/{doc_id}/chunks", params={"view": "all"}
+    )
+    assert resp.status_code == 422
+
+
+@pytest.mark.asyncio
+async def test_retrieval_test_returns_parents_with_their_hit_children(
+    full_setup: FullSetup,
+) -> None:
+    """A hit inside a parent comes back as the parent's text and index, naming its
+    hit children (best first) and carrying the best one's own text; a hit with no
+    parent row comes back as itself."""
+    client, runner, store = full_setup
+    await _seed_parented(
+        client,
+        runner,
+        store,
+        [
+            (0, "The deductible is 500."),
+            (0, "A second deductible applies abroad."),
+            (None, "The deductible resets in January."),
+            (1, "Claims close in 30 days."),
+        ],
+    )
+
+    body = (
+        await client.post(
+            "/v1/knowledge/bases/kb/test", json={"query": "deductible", "method": "keyword"}
+        )
+    ).json()
+
+    by_parent = {r["parent_index"]: r for r in body["results"]}
+    assert set(by_parent) == {0, None}
+    parent = by_parent[0]
+    assert parent["content"] == "The deductible is 500.\n\nA second deductible applies abroad."
+    assert parent["heading_path"] == ["Part 0"]
+    assert sorted(parent["hit_chunk_indexes"]) == [0, 1]
+    assert parent["hit_chunk_indexes"][0] == parent["chunk_index"]
+    assert parent["source"] == f"h.md#{parent['chunk_index']}"
+    best = parent["chunk_index"]
+    assert (
+        parent["hit_content"]
+        == [
+            "The deductible is 500.",
+            "A second deductible applies abroad.",
+        ][best]
+    )
+    assert parent["hit_heading_path"] == ["Part", f"child {best}"]
+    own = by_parent[None]
+    assert (own["content"], own["heading_path"], own["chunk_index"]) == (
+        "The deductible resets in January.",
+        ["Part", "child 2"],
+        2,
+    )
+    assert (own["hit_chunk_indexes"], own["hit_content"], own["hit_heading_path"]) == (
+        [2],
+        None,
+        [],
+    )
 
 
 @pytest.mark.asyncio

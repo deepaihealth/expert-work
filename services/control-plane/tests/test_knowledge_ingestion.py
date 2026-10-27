@@ -104,6 +104,7 @@ class _ConcurrentDeleteStore(_RecordingStore):
         chunks: Sequence[KnowledgeChunk],
         generation: int | None = None,
         expect_status: DocumentStatus = DocumentStatus.PROCESSING,
+        chunk_params_hash: str | None = None,
     ) -> bool:
         await self.delete_document(tenant_id=tenant_id, document_id=document_id)
         raise KeyError(document_id)
@@ -120,6 +121,7 @@ class _FailingReplaceStore(_RecordingStore):
         chunks: Sequence[KnowledgeChunk],
         generation: int | None = None,
         expect_status: DocumentStatus = DocumentStatus.PROCESSING,
+        chunk_params_hash: str | None = None,
     ) -> bool:
         raise RuntimeError("replace_chunks exploded")
 

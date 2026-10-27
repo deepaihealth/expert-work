@@ -222,9 +222,11 @@ EXPERT_WORK_EVAL_EMBED_API_KEY=... EXPERT_WORK_EVAL_EMBED_MODEL=text-embedding-v
   汇总 `corpus.embed` 报送入的文本数 / 字符数 / 超过 8000 字符的条数 / token 数与估算费用(单价 `EXPERT_WORK_EVAL_EMBED_PRICE_CNY_PER_1K`,
   默认 text-embedding-v4 的 0.0005 元/千 token;假嵌入 token 与费用报 0);token 按送入嵌入器的文本算,含缓存命中。
   SQL 库那条路像应用层一样设租户上下文(`build_rls_sessionmaker` + `current_tenant_id_var`),RLS 真开着时也查得到自己的行。
-- **锚文本存活检查**:入库后核每条 `expected` 的 `anchor` 是否出现在其文档的某一段里;不存活的 case 单列在汇总 `anchors.dead[]`
+- **锚文本存活检查**:入库后核每条 `expected` 的 `anchor` 是否出现在其文档里**检索能返回的某一段**里(B-206 K-1:父段行,
+  加上没有父段行、自己就是父段的子段);不存活的 case 单列在汇总 `anchors.dead[]`
   (`document_missing` = 文档没入库,`anchor_not_in_any_chunk` = 切块切断了锚 / 评测集抄错),每行 case 带 `anchors_alive`。
-  这些是数据集 / 切块的问题,不是检索的问题,看检索指标时要把它们剔开。
+  只看子段的旧口径另报 `anchors.child_level_dead_cases` / `child_level_dead[]`(跨同一父段两个子段的锚文本只在这里算不存活)。
+  这些是数据集 / 切块的问题,不是检索的问题,看检索指标时要把它们剔开。「含同一锚文本的其他文档也算对」用同一口径。
 - **指标**:文档级命中 = `filename` 相等,段级命中 = `anchor in content`;每条期望只在**最早**命中它的那一名记一次(重叠段重复命中不再加分,
   nDCG ≤ 1),一段含两条锚时两条一起记。按 case 的 `match`(`any` 默认 / `all`,见 `datasets/kb/README.md`)分:
   `doc_hit@10/@20`、`chunk_hit@10/@20`(`any` = 任一期望进前 k;`all` = 全部进前 k)、`doc_coverage@10/@20`、`chunk_coverage@10/@20`
@@ -237,8 +239,11 @@ EXPERT_WORK_EVAL_EMBED_API_KEY=... EXPERT_WORK_EVAL_EMBED_MODEL=text-embedding-v
   `knowledge_search` 工具,经工具节点同一段代码(`_invoke_tool`)渲染成模型拿到的文本(工具默认条数;默认智能体不开工作区,
   不外置截断),锚文本归一后落在里面记 1(`match=all` 要全部锚文本都在);汇总表 `ctx_hit` 列紧挨 `chk_hit@10`。工具改成
   返回父段 / 改条数 / 改格式,这个数自动跟着变。`--top-k` 小于工具要的条数时不算(报 `-`)。
-- **逐次检索记录(`--search-log <path>`,默认不写)**:每题一行 —— 查询、状态、候选数、是否降级、交给模型的条数与字数,
-  以及每个返回段的名次、文件名、段号、段 id、召回路、向量 / 关键词 / 融合 / 重排分数、是否交给了模型(不含正文)。
+  B-206 K-1 起一条结果是一个父段,段级命中 / `mrr@10` 都按父段文本判;汇总 `tool_output` 报这段给模型的文本每次检索的
+  字数 / token 数(均值、P90,围栏和提示都算)和被截成命中子段(`[已截断]`)的结果条数,口径同 `context_hit`。
+- **逐次检索记录(`--search-log <path>`,默认不写)**:每题一行 —— 查询、状态、候选数、是否降级、交给模型的条数与字数 / token 数,
+  以及每个返回段的名次、文件名、段号、父段号、命中子段号、段 id、召回路、向量 / 关键词 / 融合 / 重排分数、是否交给了模型、
+  在工具输出里占的字数 / token 数、是否 `[已截断]`(不含正文;交给了工具但被字数预算挤掉的 = `shown` 真、字数 0)。
 - **产出**:`eval-out/kb/<label>.jsonl`(每 case 一行:`match`、`best_score`、`anchors_alive`、返回的 (filename, chunk_index, score, recall_source)、
   命中名次、指标;末尾一行汇总;已存在就拒绝覆盖)、终端一张汇总表;`--update-baseline` 把汇总(去掉 `base_id` / `elapsed_s` / `label`
   这些每次都变的字段)与指纹(评测集 sha256、清单 sha256、`corpus_root`、嵌入模型 / base URL / 维度、store、git commit + dirty 标记、

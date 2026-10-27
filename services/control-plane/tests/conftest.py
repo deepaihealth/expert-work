@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import AsyncIterator, Callable
+from collections.abc import AsyncIterator, Callable, Iterator
 from uuid import UUID
 
 import pytest
@@ -10,6 +10,7 @@ from httpx import ASGITransport, AsyncClient
 
 from control_plane.app import create_app
 from control_plane.auth import JWTVerifier
+from control_plane.knowledge.chunking import configure_semantic_breaks, semantic_breaks_enabled
 from control_plane.settings import DEFAULT_DEV_TENANT_ID, Settings
 from expert_work.common.lifecycle import Lifecycle
 from tests.auth_fixtures import (
@@ -109,3 +110,23 @@ async def client(
 
 def known_dev_tenant() -> UUID:
     return DEFAULT_DEV_TENANT_ID
+
+
+@pytest.fixture
+def semantic_breaks() -> Iterator[None]:
+    """Ingests split sections at topic shifts (the default; pinned here so a
+    test does not depend on it)."""
+    previous = semantic_breaks_enabled()
+    configure_semantic_breaks(enabled=True)
+    yield
+    configure_semantic_breaks(enabled=previous)
+
+
+@pytest.fixture
+def no_semantic_breaks() -> Iterator[None]:
+    """Ingests chunk by structure and size only (``knowledge_semantic_breaks``
+    off)."""
+    previous = semantic_breaks_enabled()
+    configure_semantic_breaks(enabled=False)
+    yield
+    configure_semantic_breaks(enabled=previous)

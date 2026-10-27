@@ -28,7 +28,7 @@ import pytest
 
 from control_plane.knowledge import ingestion, parsed_size
 from control_plane.knowledge.chunk_rows import ChunkRows, compact
-from control_plane.knowledge.chunking import TextChunk
+from control_plane.knowledge.chunking import ParentChunk, TextChunk
 from control_plane.knowledge.ingestion import (
     CHUNK_EMBED_WINDOW,
     KnowledgeIngestionRunner,
@@ -50,6 +50,7 @@ from expert_work.persistence import InMemoryKnowledgeStore
 from expert_work.protocol import (
     DEFAULT_CHUNK_MAX_TOKENS,
     DEFAULT_CHUNK_OVERLAP_TOKENS,
+    ChunkType,
     DocumentStatus,
     IngestErrorCode,
     chunk_retrieval_text,
@@ -82,8 +83,9 @@ class _RecordingEmbedder:
 
 
 def _entries(count: int) -> str:
-    """Short headed entries — every heading opens a chunk of its own."""
-    return "\n\n".join(f"## 条目 {i}\n\n第 {i} 条的说明文字。" for i in range(count))
+    """Headed entries, each just long enough to stand as a chunk of its own
+    (a shorter one joins its neighbour, B-206 K-3)."""
+    return "\n\n".join(f"## 条目 {i}\n\n" + f"第 {i} 条的说明文字。" * 12 for i in range(count))
 
 
 async def _document(store: InMemoryKnowledgeStore, markdown: str) -> tuple[UUID, UUID]:
@@ -186,6 +188,20 @@ def _alternating(count: int) -> str:
     )
 
 
+@pytest.mark.usefixtures("no_semantic_breaks")
+async def test_without_semantic_breaks_only_the_chunks_are_embedded() -> None:
+    # Switched off, topic shifts do not split, so no block is embedded to find
+    # them — every text sent is a chunk's (they open with the title).
+    embedder = _TopicEmbedder()
+    _, chunks = await _ingest(
+        InMemoryKnowledgeStore(), embedder, _alternating(12), doc_title="report"
+    )
+    assert chunks < 12  # paragraphs pack by size, not one per topic
+    assert len(embedder.texts) == chunks
+    assert all(text.startswith("[Document: report]") for text in embedder.texts)
+
+
+@pytest.mark.usefixtures("semantic_breaks")
 async def test_topic_shifts_past_the_cap_are_refused_before_any_chunk_is_embedded() -> None:
     markdown = _alternating(12)
     store = InMemoryKnowledgeStore()
@@ -275,12 +291,19 @@ async def test_an_ingest_is_admitted_with_its_chunk_count(monkeypatch: pytest.Mo
 # ---------------------------------------------------------------------------
 
 
-def _rows(count: int) -> ChunkRows:
-    pieces = [TextChunk(body=f"body {i}", heading_path=("h",)) for i in range(count)]
+def _parent(*bodies: str) -> ParentChunk:
+    """A parent of these chunks; one of a single chunk is just that chunk
+    (:attr:`ParentChunk.is_trivial`)."""
+    children = tuple(TextChunk(body=body, heading_path=("h",)) for body in bodies)
+    return ParentChunk(body="\n\n".join(bodies), heading_path=("h",), children=children)
+
+
+def _rows(*parents: ParentChunk) -> ChunkRows:
+    count = sum(len(parent.children) for parent in parents)
     hashes = [f"h{i}" for i in range(count)]
     vectors = {f"h{i}": compact([float(i), 0.5, -1.25]) for i in range(count)}
     return ChunkRows(
-        pieces=pieces,
+        parents=parents,
         hashes=hashes,
         vectors=vectors,
         tenant_id=_TENANT,
@@ -292,7 +315,7 @@ def _rows(count: int) -> ChunkRows:
 
 
 def test_chunk_rows_read_like_the_list_they_replace() -> None:
-    rows = _rows(5)
+    rows = _rows(*(_parent(f"body {i}") for i in range(5)))
     assert len(rows) == 5
     assert rows[0].embedding == (0.0, 0.5, -1.25)
     assert rows[-1].chunk_index == 4 and rows[-1].content == "body 4"
@@ -304,6 +327,33 @@ def test_chunk_rows_read_like_the_list_they_replace() -> None:
         rows[5]
     with pytest.raises(IndexError):
         rows[-6]
+
+
+def test_chunk_rows_put_the_parent_rows_first_and_link_the_chunks() -> None:
+    # B-206 K-1: a row per parent of several chunks, numbered on its own,
+    # without a vector; the chunk of a one-chunk parent points at none.
+    rows = _rows(_parent("body 0", "body 1"), _parent("body 2"), _parent("body 3", "body 4"))
+    assert len(rows) == 7
+    parents, chunks = rows[:2], rows[2:]
+    assert [(p.chunk_type, p.chunk_index, p.content) for p in parents] == [
+        (ChunkType.PARENT, 0, "body 0\n\nbody 1"),
+        (ChunkType.PARENT, 1, "body 3\n\nbody 4"),
+    ]
+    assert {(p.embedding, p.embedding_model, p.content_hash) for p in parents} == {
+        (None, None, None)
+    }
+    assert {(p.heading_path, p.doc_title, p.document_id) for p in parents} == {
+        (("h",), "t", chunks[0].document_id)
+    }
+    assert [(c.chunk_type, c.chunk_index, c.content) for c in chunks] == [
+        (ChunkType.TEXT, i, f"body {i}") for i in range(5)
+    ]
+    assert [c.content_hash for c in chunks] == [f"h{i}" for i in range(5)]
+    assert chunks[4].embedding == (4.0, 0.5, -1.25)
+    first, second = parents[0].id, parents[1].id
+    assert [c.parent_chunk_id for c in chunks] == [first, first, None, second, second]
+    assert rows[0].id == first and rows[-1].parent_chunk_id == second  # same ids on every read
+    assert len({row.id for row in rows}) == 7
 
 
 def test_a_compact_vector_holds_the_same_values() -> None:

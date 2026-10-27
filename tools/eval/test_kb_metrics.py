@@ -86,6 +86,28 @@ def test_chunk_hit_needs_anchor_in_content_of_the_expected_document() -> None:
     assert chunk_hits(results, [_EXP_A]) == [True, False, False]
 
 
+@dataclass(frozen=True)
+class _ParentResult(_Result):
+    """B-206 K-1: a result is a parent passage (``retrieval_text``) found
+    through one of its chunks (``hit_retrieval_text``)."""
+
+    hit_retrieval_text: str = ""
+
+
+def test_a_chunk_hit_is_judged_on_the_passage_the_result_returns() -> None:
+    """The anchor runs across two chunks of one parent: the hit chunk alone
+    does not hold it, the parent the result returns does — a hit, at rank 1."""
+    parent = _ParentResult(
+        filename="a.md",
+        retrieval_text="开封后请在三天内用完。冷藏可以延长保质期。",
+        hit_retrieval_text="冷藏可以延长保质期。",
+    )
+    expected = [_Expected(document="a.md", anchor="三天内用完。冷藏可以")]
+    assert chunk_hits([parent], expected) == [True]
+    score = score_case([parent], expected, threshold=None)
+    assert (score.chunk_hit_10, score.mrr_10) == (1.0, 1.0)
+
+
 def test_chunk_hit_any_of_several_expected() -> None:
     results = [_r("b.txt", "本品专利号 ZL2019-1234567。")]
     assert chunk_hits(results, [_EXP_A, _EXP_B]) == [True]

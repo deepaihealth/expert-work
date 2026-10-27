@@ -27,10 +27,11 @@ import sqlalchemy as sa
 from alembic import op
 from sqlalchemy.dialects.postgresql import TSVECTOR
 
-from expert_work.protocol.knowledge import (
-    DEFAULT_CHUNK_MAX_TOKENS,
-    DEFAULT_CHUNK_OVERLAP_TOKENS,
-)
+#: The platform defaults when this revision was written. Literals, not the
+#: protocol constants: a migration must keep meaning what it meant — the
+#: defaults moved to 400 / 0 in 0174 (B-206 K-3).
+DEFAULT_CHUNK_MAX_TOKENS = 512
+DEFAULT_CHUNK_OVERLAP_TOKENS = 64
 
 revision: str = "0022_knowledge_chunking_hybrid"
 down_revision: str | Sequence[str] | None = "0021_knowledge_base"

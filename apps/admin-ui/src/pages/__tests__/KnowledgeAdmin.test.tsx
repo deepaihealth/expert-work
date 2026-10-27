@@ -131,7 +131,10 @@ describe("KnowledgeAdmin (list)", () => {
     await userEvent.click(screen.getByText("Save"));
 
     await waitFor(() =>
-      expect(createSpy).toHaveBeenCalledWith(expect.objectContaining({ name: "support-docs" })),
+      expect(createSpy).toHaveBeenCalledWith(
+        // B-206 K-3: the pre-filled chunk sizes are posted as-is — the platform defaults.
+        expect.objectContaining({ name: "support-docs", chunkMaxTokens: 400, chunkOverlapTokens: 0 }),
+      ),
     );
   });
 

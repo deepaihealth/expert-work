@@ -15,12 +15,14 @@
 * Ⓕ 混合 PDF(B-209):每页都有记录,扫描页认不出也不静默为空;认得出时按页序插回。
 
 现在不成立、B-206 要修的标 ``xfail(strict=True)``:修好那天它变红,逼着把标记摘掉。
-B-206 有意要改的(段长分布、父段数)不在这里断言,见文末 TODO。
+B-206 K-3 之后另断言切块四条校验(WeKnora 同款)与长文档段长中位(不碎、不超上限);
+B-206 K-1 的父段形状见文末。
 """
 
 from __future__ import annotations
 
 import re
+import statistics
 from collections.abc import Iterator, Sequence
 from dataclasses import dataclass
 from itertools import pairwise
@@ -28,13 +30,24 @@ from uuid import UUID, uuid4
 
 import pytest
 
-from control_plane.knowledge.chunking import count_tokens
+from control_plane.knowledge.chunking import (
+    PARENT_MAX_TOKENS,
+    SHORT_SECTION_TOKENS,
+    ParentChunk,
+    chunk_markdown_parented,
+    count_tokens,
+)
 from control_plane.knowledge.ingestion import (
     failure_code,
     ingest_document_bytes,
     shutdown_parse_pool,
 )
-from control_plane.knowledge.parsing import DocumentParseError, parse_document
+from control_plane.knowledge.parsing import (
+    DocumentParseError,
+    is_plain_text_file,
+    parse_document,
+    strip_lone_surrogates,
+)
 from control_plane.knowledge.recognition.clients import Reading
 from control_plane.knowledge.recognition.figure_markup import FIGURE_LABEL
 from control_plane.knowledge.recognition.figure_pipeline import FigureDescriber
@@ -47,6 +60,7 @@ from expert_work.persistence import InMemoryKnowledgeStore
 from expert_work.protocol import (
     DEFAULT_CHUNK_MAX_TOKENS,
     DEFAULT_CHUNK_OVERLAP_TOKENS,
+    ChunkType,
     DocumentPage,
     FigureStats,
     IngestErrorCode,
@@ -54,6 +68,8 @@ from expert_work.protocol import (
     PageDecision,
     PageStats,
     PageStatus,
+    chunk_retrieval_text,
+    knowledge_document_title,
 )
 from orchestrator.llm import Embedder, FakeEmbedder
 from tests.knowledge_form_fixtures import (
@@ -93,13 +109,13 @@ _EMBEDDERS = [
 class _Ingested:
     markdown: str  # what the parser handed the chunker
     chunks: list[KnowledgeChunk]
+    parents: list[KnowledgeChunk]  # the parent rows (B-206 K-1)
 
 
 async def _ingest(
     doc: FormDoc,
     *,
     embedder: Embedder | None = None,
-    overlap_tokens: int = DEFAULT_CHUNK_OVERLAP_TOKENS,
 ) -> _Ingested:
     """``doc`` through the upload path with the platform's default chunk size:
     parse, then the production chunk → embed → store; the stored chunks.
@@ -122,11 +138,14 @@ async def _ingest(
         filename=doc.filename,
         raw=doc.raw,
         chunk_max_tokens=DEFAULT_CHUNK_MAX_TOKENS,
-        chunk_overlap_tokens=overlap_tokens,
+        chunk_overlap_tokens=DEFAULT_CHUNK_OVERLAP_TOKENS,
         parsed_markdown=markdown,
     )
     chunks, _ = await store.list_chunks(tenant_id=tenant, document_id=document.id, limit=10_000)
-    return _Ingested(markdown, chunks)
+    parents, _ = await store.list_chunks(
+        tenant_id=tenant, document_id=document.id, limit=10_000, chunk_types={ChunkType.PARENT}
+    )
+    return _Ingested(markdown, chunks, parents)
 
 
 def _params(docs: Sequence[FormDoc], xfail: dict[str, str] | None = None) -> list[object]:
@@ -152,6 +171,11 @@ def _form(form: str) -> list[FormDoc]:
 def _squash(text: str) -> str:
     """``text`` without whitespace — chunk bodies are cut and re-joined there."""
     return re.sub(r"\s+", "", text)
+
+
+def _sentences(text: str) -> list[str]:
+    """``text`` cut after each sentence end (CJK or ASCII full stop, ! or ?)."""
+    return [piece for piece in re.split(r"(?<=[\u3002\uff01\uff1f.!?])", text) if piece]
 
 
 def _lines(text: str) -> list[str]:
@@ -192,10 +216,19 @@ def _table_runs(body: str) -> list[list[str]]:
 async def test_no_text_is_lost(doc: FormDoc, embedder: Embedder) -> None:
     # Every line / cell the user wrote reaches a chunk body (a heading may
     # instead sit on a chunk's heading path) — whatever semantic splitting does.
+    # Checked sentence by sentence: a paragraph cut mid-text repeats its last
+    # sentence(s) at the head of the next chunk (B-206 K-3), so the joined
+    # bodies hold it whole but not as one unbroken run.
     ingested = await _ingest(doc, embedder=embedder)
     bodies = _squash("".join(chunk.content for chunk in ingested.chunks))
     headings = {_squash(h) for chunk in ingested.chunks for h in chunk.heading_path}
-    lost = [u for u in doc.units if _squash(u) not in bodies and _squash(u) not in headings]
+    lost = [
+        sentence
+        for unit in doc.units
+        if _squash(unit) not in headings
+        for sentence in _sentences(_squash(unit))
+        if sentence not in bodies
+    ]
     assert not lost
 
 
@@ -209,24 +242,43 @@ async def test_no_chunk_exceeds_the_cap(doc: FormDoc, embedder: Embedder) -> Non
     assert max(sizes) <= DEFAULT_CHUNK_MAX_TOKENS + _CAP_SLACK
 
 
-_HEADING_ONLY = (
-    "B-206 K-3: an empty section (a heading with no text under it) becomes a chunk "
-    "holding only the heading; short sections are to merge into the next one"
-)
-
-
-@pytest.mark.parametrize(
-    "doc",
-    _params(
-        TEXT_FORM_DOCS,
-        xfail={"handbook-zh-md": _HEADING_ONLY, "expense-policy-en-md": _HEADING_ONLY},
-    ),
-)
+@pytest.mark.parametrize("doc", _params(TEXT_FORM_DOCS))
 async def test_no_chunk_is_only_a_heading(doc: FormDoc) -> None:
+    # An empty section (a heading with no text under it) joins the next one
+    # instead of becoming a chunk of just its heading (B-206 K-3).
     ingested = await _ingest(doc)
     headings = set(_HEADING_LINE.findall(ingested.markdown))
     heading_only = [c.content for c in ingested.chunks if set(_lines(c.content)) <= headings]
     assert not heading_only
+
+
+@pytest.mark.parametrize("doc", _params(TEXT_FORM_DOCS))
+async def test_chunking_passes_the_four_checks(doc: FormDoc) -> None:
+    # B-206 K-3 (WeKnora's chunk validator): none of the four shapes of a
+    # chunking gone wrong.
+    ingested = await _ingest(doc)
+    cap = DEFAULT_CHUNK_MAX_TOKENS
+    sizes = [count_tokens(chunk.retrieval_text) for chunk in ingested.chunks]
+    length = count_tokens(ingested.markdown)
+    assert not (len(sizes) == 1 and length > 2 * cap)  # a long document left in one chunk
+    fragments = sum(len(chunk.content.strip()) < 50 for chunk in ingested.chunks)
+    assert fragments <= len(sizes) / 4  # fragments under 50 characters
+    assert not (length > cap and max(sizes) < cap // 4)  # every chunk tiny
+    assert max(sizes) <= 2 * cap  # a chunk far over the cap
+
+
+@pytest.mark.parametrize("doc", _params(TEXT_FORM_DOCS))
+async def test_a_long_document_is_neither_fragmented_nor_over_the_cap(doc: FormDoc) -> None:
+    # Median chunk of a document longer than the cap: at least the ~50 tokens
+    # under which a section joins its neighbour (B-206 K-3; a literal, so the
+    # check does not move with the constant it checks), at most the cap. The
+    # 200~400-token median of K-3 is judged on the dev set.
+    ingested = await _ingest(doc)
+    if count_tokens(ingested.markdown) <= DEFAULT_CHUNK_MAX_TOKENS:
+        assert len(ingested.chunks) == 1
+        return
+    median = statistics.median(count_tokens(c.retrieval_text) for c in ingested.chunks)
+    assert 50 <= median <= DEFAULT_CHUNK_MAX_TOKENS
 
 
 # ---------------------------------------------------------------------------
@@ -256,30 +308,12 @@ async def test_table_chunks_carry_the_header(doc: FormDoc) -> None:
     assert all(headers & set(_lines(body)) for body in with_rows)
 
 
-_CARRIED_ROWS = (
-    "B-206 K-3 (overlap off by default): the overlap carried into the next chunk "
-    "puts table rows ahead of the repeated header, and can start inside a row "
-    "(after the '.' of a decimal cell)"
-)
-_TABLE_ROW_CASES = [
-    *(pytest.param(doc, 0, id=f"{doc.id}-overlap-off") for doc in _form("D")),
-    *(
-        pytest.param(
-            doc,
-            DEFAULT_CHUNK_OVERLAP_TOKENS,
-            id=f"{doc.id}-overlap-default",
-            marks=[pytest.mark.xfail(strict=True, reason=_CARRIED_ROWS)],
-        )
-        for doc in _form("D")
-    ),
-]
-
-
-@pytest.mark.parametrize(("doc", "overlap_tokens"), _TABLE_ROW_CASES)
-async def test_table_rows_are_whole_and_under_their_header(
-    doc: FormDoc, overlap_tokens: int
-) -> None:
-    ingested = await _ingest(doc, overlap_tokens=overlap_tokens)
+@pytest.mark.parametrize("doc", _params(_form("D")))
+async def test_table_rows_are_whole_and_under_their_header(doc: FormDoc) -> None:
+    # Holds with the default overlap of 0 (B-206 K-3). An overlap carried into
+    # the next chunk would put table rows ahead of the repeated header, and
+    # could start inside a row (after the '.' of a decimal cell).
+    ingested = await _ingest(doc)
     rows = {line for line in _lines(ingested.markdown) if line.startswith("|")}
     headers = _table_headers(ingested.markdown)
     runs = [run for chunk in ingested.chunks for run in _table_runs(chunk.content)]
@@ -295,19 +329,10 @@ async def test_table_rows_are_whole_and_under_their_header(
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize(
-    "doc",
-    _params(
-        _form("E"),
-        xfail={
-            "sales-chat-zh-txt": (
-                "B-206 K-3 (dialogue chunked by line): a chat with no blank lines is one "
-                "paragraph, hard-split at sentence marks — inside a multi-sentence line"
-            )
-        },
-    ),
-)
+@pytest.mark.parametrize("doc", _params(_form("E")))
 async def test_dialogue_lines_are_never_cut(doc: FormDoc) -> None:
+    # A chat with no blank lines is one paragraph; it is cut between lines,
+    # not at the sentence marks inside one (B-206 K-3).
     ingested = await _ingest(doc)
     utterances = set(doc.units)
     cut = [line for c in ingested.chunks for line in _lines(c.content) if line not in utterances]
@@ -521,13 +546,130 @@ async def test_mixed_pdf_scanned_page_is_read_in_place(doc: FormDoc, _parse_pool
 
 
 # ---------------------------------------------------------------------------
-# TODO(B-206 K-3): 段长分布与切块结果校验 —— K-3 定下新默认(子段上限 400、语义断点关、
-# 重叠 0、短节合并、对话按行成块)后在这里断言:各形态子段长度中位落在 200~400 token;
-# 设计 §5.1 K-3 的四条校验(单块且文档长 > 2 倍上限 / 不足 50 字的碎块超过 25% /
-# 最大块不足上限 1/4 / 有块超过 2 倍上限)。中位数现在不断言 —— 它正是 K-3 要改的。
-# 若「重叠 = 0」改成独立开关而不是 DEFAULT_CHUNK_OVERLAP_TOKENS = 0,``_ingest`` 要跟着
-# 改成取平台新默认,否则上面 overlap-default 的 xfail 不会翻红。
-# TODO(B-206 K-1): 父段 —— Ⓐ 父段对齐章节、Ⓑ Ⓔ 按字数窗口、Ⓒ 整篇一个父段(只有一个
-# 子段时不建父行)、Ⓓ 整表(带表头)为父段、Ⓕ 不适用。父行进库后 ``_ingest`` 只把可检索的
-# 子段交给上面的断言,父段数与父段长在这里断言。现在没有父段(chunk_type 全是 text)。
+# 父段(B-206 K-1):先切父段、再在父段里切子段 —— Ⓐ 父段对齐章节、Ⓑ Ⓔ 按字数窗口、
+# Ⓒ 整篇一个父段(只有一个子段时不建父行)、Ⓓ 整表(带表头)为父段;Ⓕ 没有文字,不适用。
+# 父段由切块器按入库的参数直接切出;入库落的父行就是其中不止一个子段的那些,分段就是它们的子段。
 # ---------------------------------------------------------------------------
+
+_LEVELED_HEADING = re.compile(r"^(#{1,6})[ \t]+(.+?)[ \t]*$", re.MULTILINE)
+
+
+def _parented(doc: FormDoc) -> list[ParentChunk]:
+    """``doc``'s parents, cut with the arguments the upload path chunks it with."""
+    return chunk_markdown_parented(
+        strip_lone_surrogates(parse_document(doc.filename, doc.raw)),
+        max_tokens=DEFAULT_CHUNK_MAX_TOKENS,
+        overlap_tokens=DEFAULT_CHUNK_OVERLAP_TOKENS,
+        plain_text=is_plain_text_file(doc.filename),
+        doc_title=knowledge_document_title(doc.filename),
+    )
+
+
+def _parent_tokens(parent: ParentChunk, doc: FormDoc, body: str | None = None) -> int:
+    """A parent measured as a chunk is: title, heading path, body."""
+    text = parent.body if body is None else body
+    title = knowledge_document_title(doc.filename)
+    return count_tokens(chunk_retrieval_text(parent.heading_path, text, title))
+
+
+@pytest.mark.usefixtures("no_semantic_breaks")
+@pytest.mark.parametrize("doc", _params(TEXT_FORM_DOCS))
+async def test_the_stored_chunks_are_the_children_of_the_parents(doc: FormDoc) -> None:
+    ingested = await _ingest(doc)
+    children = [child for parent in _parented(doc) for child in parent.children]
+    assert [(c.content, tuple(c.heading_path)) for c in ingested.chunks] == [
+        (c.body, c.heading_path) for c in children
+    ]
+
+
+@pytest.mark.usefixtures("no_semantic_breaks")
+@pytest.mark.parametrize("doc", _params(TEXT_FORM_DOCS))
+async def test_the_stored_parent_rows_are_the_parents_cut(doc: FormDoc) -> None:
+    ingested = await _ingest(doc)
+    cut = _parented(doc)
+    stored = [parent for parent in cut if not parent.is_trivial]
+    assert [(p.chunk_index, p.content, tuple(p.heading_path)) for p in ingested.parents] == [
+        (index, p.body, p.heading_path) for index, p in enumerate(stored)
+    ]
+    # Each chunk points at the row of the parent it was cut in; the chunk of a
+    # one-chunk parent at none.
+    rows = [ingested.parents[stored.index(p)].id if p in stored else None for p in cut]
+    owners = [row for parent, row in zip(cut, rows, strict=True) for _ in parent.children]
+    assert [c.parent_chunk_id for c in ingested.chunks] == owners
+
+
+@pytest.mark.parametrize("doc", _params(TEXT_FORM_DOCS))
+def test_parents_hold_all_text_within_the_parent_cap(doc: FormDoc) -> None:
+    parents = _parented(doc)
+    assert all(_parent_tokens(parent, doc) <= PARENT_MAX_TOKENS for parent in parents)
+    texts = [_squash("".join(parent.heading_path) + parent.body) for parent in parents]
+    assert [u for u in doc.units if not any(_squash(u) in text for text in texts)] == []
+    for parent, text in zip(parents, texts, strict=True):
+        cells = [
+            cell for c in parent.children for line in _lines(c.body) for cell in line.split("|")
+        ]
+        assert [cell for cell in cells if _squash(cell) not in text] == []
+
+
+@pytest.mark.parametrize("doc", _params(_form("A")))
+def test_structured_parents_follow_chapters(doc: FormDoc) -> None:
+    # A level-1 / level-2 heading opens a new parent once the one before is at
+    # least half full: inside a parent one comes before its half — or opens a
+    # short end joined back (the empty headings closing a document).
+    markdown = parse_document(doc.filename, doc.raw)
+    chapters = {text for marks, text in _LEVELED_HEADING.findall(markdown) if len(marks) <= 2}
+    parents = _parented(doc)
+    assert all(parent.heading_path for parent in parents)
+    assert (len(parents) > 1) == (count_tokens(markdown) > PARENT_MAX_TOKENS)
+    for parent in parents:
+        paragraphs = parent.body.split("\n\n")
+        for index, paragraph in enumerate(paragraphs):
+            if paragraph in chapters:
+                before = _parent_tokens(parent, doc, "\n\n".join(paragraphs[:index]))
+                after = count_tokens("\n\n".join(paragraphs[index + 1 :]))
+                assert before < PARENT_MAX_TOKENS // 2 or after < SHORT_SECTION_TOKENS
+
+
+@pytest.mark.parametrize("doc", _params(_form("B") + _form("E")))
+def test_unstructured_parents_are_windows_by_size(doc: FormDoc) -> None:
+    parents = _parented(doc)
+    assert all(parent.heading_path == () for parent in parents)
+    markdown = parse_document(doc.filename, doc.raw)
+    assert (len(parents) > 1) == (count_tokens(markdown) > PARENT_MAX_TOKENS)
+    assert all(_parent_tokens(p, doc) >= PARENT_MAX_TOKENS // 2 for p in parents[:-1])
+
+
+@pytest.mark.parametrize("doc", _params(_form("E")))
+def test_dialogue_parents_hold_whole_utterances(doc: FormDoc) -> None:
+    utterances = set(doc.units)
+    cut = [line for p in _parented(doc) for line in _lines(p.body) if line not in utterances]
+    assert not cut
+
+
+@pytest.mark.parametrize("doc", _params(_form("C")))
+async def test_a_short_document_is_one_parent_and_no_parent_row(doc: FormDoc) -> None:
+    [parent] = _parented(doc)
+    assert len(parent.children) == 1
+    assert parent.is_trivial
+    ingested = await _ingest(doc)
+    assert ingested.parents == []
+    assert [c.parent_chunk_id for c in ingested.chunks] == [None]
+
+
+@pytest.mark.parametrize("doc", _params(_form("D")))
+def test_a_table_parent_holds_rows_under_one_header(doc: FormDoc) -> None:
+    markdown = parse_document(doc.filename, doc.raw)
+    headers = _table_headers(markdown)
+    rows = [
+        line
+        for line in _lines(markdown)
+        if line.startswith("|") and line not in headers and not _TABLE_SEPARATOR.fullmatch(line)
+    ]
+    parents = _parented(doc)
+    runs = [run for parent in parents for run in _table_runs(parent.body)]
+    assert all(run[0] in headers and _TABLE_SEPARATOR.fullmatch(run[1]) for run in runs)
+    assert sorted(line for run in runs for line in run[2:]) == sorted(rows)  # each row once
+    # A table within the parent cap is one parent's, whole.
+    tables = ["\n".join(run) for run in _table_runs(markdown)]
+    small = [table for table in tables if count_tokens(table) < PARENT_MAX_TOKENS - 100]
+    assert all(any(table in parent.body for parent in parents) for table in small)

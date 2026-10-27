@@ -49,6 +49,12 @@ from orchestrator.tools.knowledge_rerank import (
 from orchestrator.tools.knowledge_rerank import Reranker as Reranker
 from orchestrator.tools.knowledge_rerank import RerankRanking as RerankRanking
 from orchestrator.tools.knowledge_rerank import ScoredReranker as ScoredReranker
+from orchestrator.tools.knowledge_results import (
+    ParentHit,
+    ResultText,
+    collapse_to_parents,
+    fit_to_budget,
+)
 from orchestrator.tools.knowledge_threshold import clears_floor, search_floors
 from orchestrator.tools.registry import ToolBlockedError, ToolContext, ToolResult, ToolSpec
 from orchestrator.tools.rerank_passage import rerank_passage
@@ -197,7 +203,17 @@ def rerank_documents(texts: Iterable[str]) -> list[str]:
 
 @dataclass(frozen=True)
 class RetrievedChunk:
-    """A retrieved chunk with its source document attribution.
+    """A search result with its source document attribution.
+
+    B-206 K-1: a result is the parent of a hit child chunk. ``content`` /
+    ``heading_path`` are the parent row's (``parent_chunk_id``; ``parent_index``
+    its ``chunk_index``, in the parents' own numbering), or the child's own when
+    there is no parent row or it could not be read (both ``None`` then).
+    ``chunk_index`` / ``chunk_id`` and every score are the best-ranked hit
+    child's; ``hit_chunk_indexes`` is every ranked child of the parent, best
+    first. ``hit_content`` / ``hit_heading_path`` are that best child's own body
+    and breadcrumb when ``content`` is its parent's (``None`` / ``()``
+    otherwise): the tool shows them in place of a parent its budget cannot fit.
 
     ``score`` is the vector cosine similarity in [0, 1] when the chunk was
     surfaced by vector recall (``None`` for keyword-only hits, whose
@@ -232,10 +248,23 @@ class RetrievedChunk:
     keyword_score: float | None = None
     fused_score: float | None = None
     rerank_score: float | None = None
+    parent_chunk_id: UUID | None = None
+    parent_index: int | None = None
+    hit_chunk_indexes: tuple[int, ...] = ()
+    hit_content: str | None = None
+    hit_heading_path: tuple[str, ...] = ()
 
     @property
     def retrieval_text(self) -> str:
         return chunk_retrieval_text(self.heading_path, self.content)
+
+    @property
+    def hit_retrieval_text(self) -> str:
+        """The best hit child's breadcrumb + body (:attr:`retrieval_text` when
+        the result is that child itself)."""
+        if self.hit_content is None:
+            return self.retrieval_text
+        return chunk_retrieval_text(self.hit_heading_path, self.hit_content)
 
 
 @dataclass(frozen=True)
@@ -243,7 +272,8 @@ class KnowledgeSearchOutcome:
     """One search's results and how it ended (B-175 wave 2 PR3).
 
     ``candidates`` is how many ranked passages the rerank-score threshold was
-    applied to — the reranker's output, not the recall depth (``0`` for
+    applied to — the reranker's output (every fused candidate when nothing
+    reranked), not the recall depth (``0`` for
     ``no_bases`` / ``no_hits``). ``rerank_degraded`` is set
     when the reranker failed or answered with nothing and the fused order was
     used instead — then no threshold applied either. ``rerank_outcome`` (B-206
@@ -284,9 +314,10 @@ class _SubScores:
 
 @dataclass(frozen=True)
 class _Reranked:
-    """The rerank stage's output: chunks best first — at least ``limit`` of them
-    when there are that many, more when the reranker scored more, so a
-    threshold that drops some can still fill ``limit`` — each one's rerank score
+    """The rerank stage's output: chunks best first — every one ranked, uncut
+    (the whole fused list when nothing reranked; the dual view ranks its titled
+    top ``max(limit, 20)``), so a threshold that drops some and the collapse to
+    parents (B-206 K-1) can still fill ``limit`` — each one's rerank score
     when the reranker gave one, how many candidates it never judged, how
     the rerank ended (``None`` when it was not asked for), and the model that
     scored (``None`` when it did not say)."""
@@ -369,7 +400,7 @@ class KnowledgeRetriever:
         rerank_score_threshold: float | None = None,
     ) -> list[RetrievedChunk]:
         """Hybrid-search ``base_names`` for ``query``, returning the
-        ``limit`` most relevant chunks with source attribution + scores —
+        ``limit`` most relevant parents with source attribution + scores —
         :meth:`search_detailed` without the outcome."""
         outcome = await self.search_detailed(
             tenant_id=tenant_id,
@@ -396,7 +427,9 @@ class KnowledgeRetriever:
         rerank_score_threshold: float | None = None,
     ) -> KnowledgeSearchOutcome:
         """Hybrid-search ``base_names`` for ``query``: the ``limit`` most
-        relevant chunks with source attribution + scores, and how it ended.
+        relevant parents with source attribution + scores, and how it ended.
+        Recall, fusion, rerank and thresholds run on child chunks; their
+        parents are the results (:class:`RetrievedChunk`, B-206 K-1).
 
         ``method`` / ``score_threshold`` / ``rerank`` / ``rerank_score_threshold``
         are *overrides*: when ``None`` each spanned base's own configured default
@@ -481,8 +514,9 @@ class KnowledgeRetriever:
             scoring_model=ranked.model,
         )
         # Filtered before the cut to ``limit``: with several bases, one base's
-        # floor dropping the top hits must leave room for another base's.
-        kept = [c for c in ranked.chunks if clears_floor(c, ranked.scores, floors.by_base)][:limit]
+        # floor dropping the top hits must leave room for another base's. The
+        # cut itself comes after the collapse to parents (``limit`` counts them).
+        kept = [c for c in ranked.chunks if clears_floor(c, ranked.scores, floors.by_base)]
         below = KnowledgeSearchOutcome(
             results=(),
             status="below_threshold",
@@ -502,7 +536,7 @@ class KnowledgeRetriever:
             fused=dict(fused_scored),
             rerank=ranked.scores,
         )
-        results = await self._attribute(tenant_id, kept, scores, sources)
+        results = await self._attribute(tenant_id, kept, limit, scores, sources)
         return replace(below, results=tuple(results), status="ok")
 
     async def _embed_query(self, query: str, tenant_id: UUID) -> tuple[float, ...] | None:
@@ -549,10 +583,10 @@ class KnowledgeRetriever:
         tenant_id: UUID,
         enabled: bool,
     ) -> _Reranked:
+        # Every path keeps its whole ranked list: the cut to ``limit`` parents
+        # comes after the collapse (B-206 K-1).
         if self.reranker is None or not enabled:
-            return _Reranked(
-                chunks=fused[:limit], scores={}, outcome="no_model" if enabled else None
-            )
+            return _Reranked(chunks=fused, scores={}, outcome="no_model" if enabled else None)
         # Cut after fusion: several bases (and an explicit recall_limit) can fuse
         # into more than the pool; a reranker whose model takes fewer per request
         # keeps the leading ones.
@@ -575,7 +609,7 @@ class KnowledgeRetriever:
                     budget.attempts,
                     exc_info=True,
                 )
-                return _Reranked(chunks=fused[:limit], scores={}, outcome=failed)
+                return _Reranked(chunks=fused, scores={}, outcome=failed)
         if not ranked:
             # An empty answer for a non-empty candidate list is a rerank fault,
             # not "nothing relevant" — that is the threshold's call.
@@ -583,7 +617,7 @@ class KnowledgeRetriever:
                 "knowledge.rerank_empty outcome=model_error attempts=%d — using the fused order",
                 budget.attempts,
             )
-            return _Reranked(chunks=fused[:limit], scores={}, outcome="model_error")
+            return _Reranked(chunks=fused, scores={}, outcome="model_error")
         outcome = ranking_outcome(ranked)
         if outcome not in ("ok", "partial"):  # ``partial`` was logged by the dual view
             # The reranker had nothing to call, or could not read its answer: the
@@ -612,7 +646,8 @@ class KnowledgeRetriever:
         tenant_id: UUID,
     ) -> list[tuple[int, float | None]]:
         """``candidates`` best first as ``(index, score)``, judged per
-        :attr:`rerank_view`; a reranker that cannot score ranks the best ``limit``."""
+        :attr:`rerank_view`; a reranker that cannot score ranks them all too
+        (``limit`` counts parents, which several ranked children can share)."""
         if self.rerank_view == "dual":
             if isinstance(reranker, ScoredReranker):
                 return await _two_view_order(
@@ -636,7 +671,7 @@ class KnowledgeRetriever:
                 **extra,
             )
         order = await reranker.rerank(
-            query=query, documents=documents, top_k=limit, tenant_id=tenant_id
+            query=query, documents=documents, top_k=len(documents), tenant_id=tenant_id
         )
         return [(index, None) for index in order]
 
@@ -644,32 +679,42 @@ class KnowledgeRetriever:
         self,
         tenant_id: UUID,
         chunks: Sequence[KnowledgeChunk],
+        limit: int,
         scores: _SubScores,
         sources: Mapping[UUID, set[str]],
     ) -> list[RetrievedChunk]:
+        """The ranked ``chunks`` (children) as the best ``limit`` parents, each
+        with its parent's text and its source file name (B-206 K-1)."""
+        hits = collapse_to_parents(chunks, limit)
+        parents = await self._read_parents(tenant_id, hits)
         # One batched lookup for every source document instead of a per-document
         # get_document (an N+1 over the result set — up to _MAX_LIMIT docs).
-        doc_ids = {chunk.document_id for chunk in chunks}
+        doc_ids = {hit.best.document_id for hit in hits}
         docs = await self.store.get_documents(tenant_id=tenant_id, document_ids=list(doc_ids))
         filenames: dict[UUID, str] = {
             doc_id: (docs[doc_id].filename if doc_id in docs else "(unknown)") for doc_id in doc_ids
         }
         return [
-            RetrievedChunk(
-                content=chunk.content,
-                filename=filenames[chunk.document_id],
-                chunk_index=chunk.chunk_index,
-                score=scores.vector.get(chunk.id),
-                recall_source=_recall_source(sources.get(chunk.id, set())),
-                heading_path=chunk.heading_path,
-                chunk_id=chunk.id,
-                vector_score=scores.vector.get(chunk.id),
-                keyword_score=scores.keyword.get(chunk.id),
-                fused_score=scores.fused.get(chunk.id),
-                rerank_score=scores.rerank.get(chunk.id),
+            _retrieved(
+                hit,
+                parents.get(hit.best.parent_chunk_id) if hit.best.parent_chunk_id else None,
+                filenames[hit.best.document_id],
+                scores,
+                sources,
             )
-            for chunk in chunks
+            for hit in hits
         ]
+
+    async def _read_parents(
+        self, tenant_id: UUID, hits: Sequence[ParentHit]
+    ) -> dict[UUID, KnowledgeChunk]:
+        """The parent rows of ``hits`` by id, in one read (none when no hit has
+        one). A parent that does not come back leaves its hit child as the result."""
+        ids = [pid for hit in hits if (pid := hit.best.parent_chunk_id) is not None]
+        if not ids:
+            return {}
+        rows = await self.store.get_chunks(tenant_id=tenant_id, chunk_ids=ids)
+        return {row.id: row for row in rows}
 
 
 async def _two_view_order(
@@ -746,7 +791,7 @@ class KnowledgeSearchTool:
     One instance per agent whose manifest declares a ``knowledge:``
     block; ``knowledge_base_refs`` are the base names it may query. The
     LLM calls it with a natural-language ``query``; the result is a
-    formatted block of relevant chunks, each tagged with its source.
+    formatted block of relevant passages, each tagged with its source.
     """
 
     retriever: KnowledgeRetriever
@@ -841,6 +886,43 @@ class KnowledgeSearchTool:
         return raw.strip()
 
 
+def _retrieved(
+    hit: ParentHit,
+    parent: KnowledgeChunk | None,
+    filename: str,
+    scores: _SubScores,
+    sources: Mapping[UUID, set[str]],
+) -> RetrievedChunk:
+    """``hit`` as a result: its best child's place, index and scores, and its
+    parent's text — the child's own when ``parent`` is ``None``."""
+    child = hit.best
+    own = RetrievedChunk(
+        content=child.content,
+        filename=filename,
+        chunk_index=child.chunk_index,
+        score=scores.vector.get(child.id),
+        recall_source=_recall_source(sources.get(child.id, set())),
+        heading_path=child.heading_path,
+        chunk_id=child.id,
+        vector_score=scores.vector.get(child.id),
+        keyword_score=scores.keyword.get(child.id),
+        fused_score=scores.fused.get(child.id),
+        rerank_score=scores.rerank.get(child.id),
+        hit_chunk_indexes=hit.hit_chunk_indexes,
+    )
+    if parent is None:
+        return own
+    return replace(
+        own,
+        content=parent.content,
+        heading_path=parent.heading_path,
+        parent_chunk_id=parent.id,
+        parent_index=parent.chunk_index,
+        hit_content=child.content,
+        hit_heading_path=child.heading_path,
+    )
+
+
 def _recall_source(found_by: set[str]) -> str | None:
     """Collapse the set of recall paths that surfaced a chunk into a label:
     ``"both"`` when vector and keyword agreed, else the single path."""
@@ -858,7 +940,17 @@ def _coerce_limit(raw: object) -> int:
 
 
 def _format_results(results: Sequence[RetrievedChunk]) -> str:
-    blocks = [
-        f"[{result.filename}#{result.chunk_index}]\n{result.retrieval_text}" for result in results
-    ]
-    return "\n\n---\n\n".join(blocks)
+    """Each result as ``[filename#chunk_index]`` + its parent's text, within
+    :data:`~orchestrator.tools.knowledge_results.RESULTS_TEXT_BUDGET` (B-206 K-1:
+    a parent that does not fit shows its hit child, see
+    :func:`~orchestrator.tools.knowledge_results.fit_to_budget`)."""
+    return fit_to_budget(
+        [
+            ResultText(
+                header=f"[{result.filename}#{result.chunk_index}]",
+                text=result.retrieval_text,
+                hit_text=None if result.hit_content is None else result.hit_retrieval_text,
+            )
+            for result in results
+        ]
+    )

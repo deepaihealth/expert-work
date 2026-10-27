@@ -7,6 +7,12 @@ Vectors are kept here as ``array("d")`` (8 KiB, the same values) and a
 :class:`~expert_work.protocol.KnowledgeChunk` is built when it is read —
 ``SqlKnowledgeStore.replace_chunks`` reads a batch at a time — so only one
 batch of chunk objects exists at once.
+
+The rows are the document's parent rows first (B-206 K-1: the passages a
+search returns — no vector, their own ``chunk_index`` 0..m-1), then its chunks,
+each pointing at its parent's row. A parent that is just its one chunk
+(:attr:`~control_plane.knowledge.chunking.ParentChunk.is_trivial`) gets no row:
+its chunk points at none and stands for itself.
 """
 
 from __future__ import annotations
@@ -16,8 +22,8 @@ from collections.abc import Mapping, Sequence
 from typing import overload
 from uuid import UUID, uuid4
 
-from control_plane.knowledge.chunking import TextChunk
-from expert_work.protocol import KnowledgeChunk
+from control_plane.knowledge.chunking import ParentChunk
+from expert_work.protocol import ChunkType, KnowledgeChunk
 
 
 def compact(vector: Sequence[float]) -> array[float]:
@@ -29,13 +35,14 @@ def compact(vector: Sequence[float]) -> array[float]:
 
 
 class ChunkRows(Sequence[KnowledgeChunk]):
-    """The chunks of one ingest in document order; each read builds it anew
-    (same id every time)."""
+    """The rows of one ingest — the parent rows, then the chunks in document
+    order; each read builds it anew (same id every time). ``hashes`` are the
+    chunks' (``parents``' children in order), ``vectors`` theirs by hash."""
 
     def __init__(
         self,
         *,
-        pieces: Sequence[TextChunk],
+        parents: Sequence[ParentChunk],
         hashes: Sequence[str],
         vectors: Mapping[str, array[float]],
         tenant_id: UUID,
@@ -44,10 +51,18 @@ class ChunkRows(Sequence[KnowledgeChunk]):
         doc_title: str | None,
         model_key: str | None,
     ) -> None:
-        self._pieces = pieces
+        self._parents: list[ParentChunk] = []  # the parents that get a row
+        self._pieces = [child for parent in parents for child in parent.children]
+        self._owners: list[int | None] = []  # each chunk's parent row, if any
+        for parent in parents:
+            owner = None if parent.is_trivial else len(self._parents)
+            if owner is not None:
+                self._parents.append(parent)
+            self._owners.extend([owner] * len(parent.children))
         self._hashes = hashes
         self._vectors = vectors
-        self._ids = [uuid4() for _ in pieces]
+        self._parent_ids = [uuid4() for _ in self._parents]
+        self._ids = [uuid4() for _ in self._pieces]
         self._tenant_id = tenant_id
         self._kb_id = kb_id
         self._document_id = document_id
@@ -55,7 +70,7 @@ class ChunkRows(Sequence[KnowledgeChunk]):
         self._model_key = model_key
 
     def __len__(self) -> int:
-        return len(self._pieces)
+        return len(self._parents) + len(self._pieces)
 
     @overload
     def __getitem__(self, index: int) -> KnowledgeChunk: ...
@@ -71,7 +86,10 @@ class ChunkRows(Sequence[KnowledgeChunk]):
         return self._chunk(index % len(self))
 
     def _chunk(self, index: int) -> KnowledgeChunk:
-        piece, digest = self._pieces[index], self._hashes[index]
+        if index < len(self._parents):
+            return self._parent_row(index)
+        index -= len(self._parents)
+        piece, digest, owner = self._pieces[index], self._hashes[index], self._owners[index]
         return KnowledgeChunk(
             id=self._ids[index],
             tenant_id=self._tenant_id,
@@ -84,4 +102,22 @@ class ChunkRows(Sequence[KnowledgeChunk]):
             content_hash=digest,
             embedding=tuple(self._vectors[digest]),
             embedding_model=self._model_key,
+            parent_chunk_id=None if owner is None else self._parent_ids[owner],
+        )
+
+    def _parent_row(self, index: int) -> KnowledgeChunk:
+        # Never embedded: no vector, no model and no hash, so a re-ingest's
+        # vector reuse can never match it.
+        parent = self._parents[index]
+        return KnowledgeChunk(
+            id=self._parent_ids[index],
+            tenant_id=self._tenant_id,
+            kb_id=self._kb_id,
+            document_id=self._document_id,
+            chunk_index=index,
+            content=parent.body,
+            heading_path=parent.heading_path,
+            doc_title=self._doc_title,
+            embedding=None,
+            chunk_type=ChunkType.PARENT,
         )

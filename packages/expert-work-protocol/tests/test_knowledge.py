@@ -48,8 +48,8 @@ def test_knowledge_base_constructs() -> None:
 
 def test_knowledge_base_chunk_params_default() -> None:
     kb = KnowledgeBase(id=uuid4(), tenant_id=uuid4(), name="kb")
-    assert kb.chunk_max_tokens == 512
-    assert kb.chunk_overlap_tokens == 64
+    assert kb.chunk_max_tokens == 400
+    assert kb.chunk_overlap_tokens == 0
 
 
 def test_knowledge_base_accepts_custom_chunk_params() -> None:

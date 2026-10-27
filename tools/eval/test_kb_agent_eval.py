@@ -66,9 +66,13 @@ from orchestrator.tools.knowledge import (
 from orchestrator.tools.knowledge_rerank import RerankRanking
 
 _ANCHOR = "常温密封保存即可"
+# 每节都比切块的短节合并线(约 100 token)长,两节各自成段,不会并成一段。
 _DOC = (
-    "# 产品说明书\n\n## 保存方式\n\n益生菌常温密封保存即可,不需要冷藏。\n\n"
-    "## 成分\n\n每袋含活菌 100 亿。\n"
+    "# 产品说明书\n\n## 保存方式\n\n益生菌常温密封保存即可,不需要冷藏。"
+    + "开封后请尽快用完,放在阴凉干燥处,避免阳光直射。" * 6
+    + "\n\n## 成分\n\n每袋含活菌 100 亿。"
+    + "配料为低聚果糖、菊粉和麦芽糊精,每袋净含量 2 克。" * 6
+    + "\n"
 )
 
 

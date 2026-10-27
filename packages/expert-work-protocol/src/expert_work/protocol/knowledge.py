@@ -23,8 +23,17 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 #: Default per-base chunking parameters (token-counted). A base may
 #: override them at creation to tune chunk granularity to its content.
-DEFAULT_CHUNK_MAX_TOKENS: Final = 512
-DEFAULT_CHUNK_OVERLAP_TOKENS: Final = 64
+#: B-206 K-3: 512 / 64 → 400 / 0 — chunks of 200~400 tokens are the measured
+#: middle ground (no chunk size wins everywhere; the context a long answer
+#: needs comes from the chunk's neighbours, not from a bigger chunk), and
+#: overlap only lowered precision in published measurements. 0 is a real
+#: value here, never a stand-in for "use the default".
+DEFAULT_CHUNK_MAX_TOKENS: Final = 400
+DEFAULT_CHUNK_OVERLAP_TOKENS: Final = 0
+
+#: The range a base's ``chunk_max_tokens`` may be set to (B-206 K-3).
+MIN_CHUNK_MAX_TOKENS: Final = 128
+MAX_CHUNK_MAX_TOKENS: Final = 1024
 
 #: A document title in a chunk's retrieval text is cut to this many
 #: characters: long, noisy titles hurt retrieval more than they help.
@@ -236,7 +245,8 @@ class DocumentSourceType(StrEnum):
 
 class ChunkType(StrEnum):
     """``knowledge_chunk.chunk_type``. The ingestion pipeline writes
-    ``TEXT``; the others are reserved for FAQ / entries / materials."""
+    ``TEXT`` chunks and the ``PARENT`` rows that group them (B-206 K-1); the
+    others are reserved for FAQ / entries / materials."""
 
     TEXT = "text"
     QUESTION = "question"
@@ -246,6 +256,14 @@ class ChunkType(StrEnum):
     ENTRY = "entry"
     MATERIAL = "material"
     MATERIAL_PHRASE = "material_phrase"
+    #: A run of consecutive chunks returned as one result (B-206 K-1): stored
+    #: for reading, never embedded or keyword-indexed, never recalled.
+    PARENT = "parent"
+
+
+#: The chunk types recall may return — an allow-list, so a type added later
+#: stays out of search until it is listed here on purpose.
+SEARCHABLE_CHUNK_TYPES: frozenset[ChunkType] = frozenset(ChunkType) - {ChunkType.PARENT}
 
 
 #: A file extension: up to five letters / digits, at least one a letter — so a
@@ -449,6 +467,11 @@ class KnowledgeDocument(BaseModel):
     #: B-209 PR-2 —— figure counts of the latest ingest (``None``: ingested
     #: before figures were described, or without a figure describer).
     figure_stats: FigureStats | None = None
+    #: B-206 K-3 —— the chunking the serving chunks were cut with
+    #: (``control_plane.knowledge.chunking.chunk_params_hash``); one that
+    #: differs from the base's current hash, or ``None`` (chunked before it was
+    #: recorded), is an old version to re-ingest.
+    chunk_params_hash: str | None = None
     size_bytes: int | None = Field(
         default=None, ge=0, description="size of the serving version's original file"
     )
@@ -468,7 +491,9 @@ class KnowledgeChunk(BaseModel):
     document_id: UUID
     chunk_index: int = Field(ge=0, description="0-based position within the source document")
     content: str = Field(description="the chunk body, without its section breadcrumb")
-    embedding: tuple[float, ...] = Field(
+    #: ``None`` only for :attr:`ChunkType.PARENT` rows, which are never
+    #: embedded. Reads that skip the vector return ``()`` for a chunk that has one.
+    embedding: tuple[float, ...] | None = Field(
         repr=False, description="semantic embedding vector of ``retrieval_text``"
     )
     chunk_type: ChunkType = ChunkType.TEXT

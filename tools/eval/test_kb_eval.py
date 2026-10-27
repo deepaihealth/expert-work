@@ -30,8 +30,11 @@ from kb_eval import (  # type: ignore[import-not-found]
     EvalConfig,
     RerankDegradedError,
     _build_parser,
+    _mean_p90,
     _ReplayRetriever,
+    _size_spread,
     baseline_benchmark,
+    baseline_section,
     build_corpus,
     build_embedder,
     build_fake_embedder,
@@ -47,18 +50,20 @@ from kb_eval import (  # type: ignore[import-not-found]
     run_eval,
     search_log_json,
     select_rows,
+    shown_parts,
     summarise,
     tool_message_text,
 )
-from kb_metrics import score_case  # type: ignore[import-not-found]
+from kb_metrics import anchor_in, score_case  # type: ignore[import-not-found]
 from kb_rerank import RerankCacheMissError  # type: ignore[import-not-found]
 from longmem.embedders import CachedEmbedder  # type: ignore[import-not-found]
 
-from control_plane.knowledge.chunking import count_tokens
+from control_plane.knowledge.chunking import CHUNKER_VERSION, count_tokens
+from expert_work.common.spotlight import unspotlight
 from expert_work.persistence import InMemoryKnowledgeStore
 from expert_work.persistence.embedding import EMBEDDING_DIM
 from expert_work.persistence.rls import current_tenant_id_var
-from expert_work.protocol import DocumentStatus, RetrievalMethod
+from expert_work.protocol import ChunkType, DocumentStatus, RetrievalMethod, chunk_retrieval_text
 from orchestrator.tools import knowledge
 from orchestrator.tools.knowledge import (
     KnowledgeRetriever,
@@ -298,6 +303,8 @@ async def test_build_corpus_ingests_once_per_dup_group_and_records_failures(
     assert report.docs_skipped_dup == 1
     assert report.docs_failed == 1
     assert report.chunk_total >= 2
+    spread = report.chunk_tokens
+    assert 0 < spread["p10"] <= spread["p50"] <= spread["p90"] <= spread["max"]
     assert report.elapsed_s >= 0.0
     # #7:失败按阶段分类,解析失败是 parse。
     assert [(f.filename, f.stage, f.error_type) for f in report.ingest_failures] == [
@@ -431,6 +438,7 @@ def test_fingerprint_records_vector_search_mode(tmp_path: Path) -> None:
     }
     assert fingerprint(**common)["vector_search"] == "exact"
     assert fingerprint(**common, ann=True)["vector_search"] == "ann"
+    assert fingerprint(**common)["chunker"] == CHUNKER_VERSION  # B-206 K-1: "k3k1"
 
 
 def _slow_parser(filename: str, raw: bytes) -> str:
@@ -515,6 +523,14 @@ def test_summary_table_warns_when_the_corpus_is_incomplete() -> None:
     assert "WARNING" not in format_summary_table(_summary_with_corpus([]))
 
 
+def test_chunk_sizes_are_reported_as_nearest_rank_percentiles() -> None:
+    assert _size_spread(range(10, 0, -1)) == {"p10": 1, "p50": 5, "p90": 9, "max": 10}
+    assert _size_spread([]) == {"p10": 0, "p50": 0, "p90": 0, "max": 0}
+    summary = _summary_with_corpus([])
+    summary["corpus"]["chunk_tokens"] = {"p10": 120, "p50": 310, "p90": 398, "max": 400}
+    assert "chunk tokens: p10=120 p50=310 p90=398 max=400" in format_summary_table(summary)
+
+
 class _ExplodingEmbedder:
     DIM = EMBEDDING_DIM
 
@@ -530,6 +546,7 @@ async def test_build_corpus_embed_failure_is_embed_stage(corpus: tuple[Path, Pat
     report = await _build(corpus, store=store, tenant=tenant, embedder=embedder)
     assert report.docs_ingested == 0
     assert report.failed_by_stage == {"parse": 1, "embed": 3}  # incl. the renamed collision
+    assert report.chunk_tokens == {"p10": 0, "p50": 0, "p90": 0, "max": 0}  # failed docs: no chunks
     embed_failures = [f for f in report.ingest_failures if f.stage == "embed"]
     assert {f.error_type for f in embed_failures} == {"ConnectionError"}
     docs = await store.list_documents(tenant_id=tenant, kb_id=report.base_id)
@@ -1853,6 +1870,8 @@ async def test_search_log_records_every_returned_chunk_and_what_was_shown() -> N
     ranked = _ranked(7)
     assert [r["rank"] for r in log["results"]] == list(range(1, 9))
     assert [r["shown"] for r in log["results"]] == [True] * 5 + [False] * 3
+    # B-206 K-1: only what was handed to the tool takes up any of its output.
+    assert [r["shown_chars"] > 0 for r in log["results"]] == [True] * 5 + [False] * 3
     assert [(r["filename"], r["chunk_index"]) for r in log["results"]] == [
         (c.filename, c.chunk_index) for c in ranked
     ]
@@ -1905,3 +1924,435 @@ def test_main_writes_the_search_log_only_when_asked(
     with pytest.raises(SystemExit, match="refusing to overwrite"):
         main([*argv, "--search-log", str(log)])
     assert not (tmp_path / "x.jsonl").exists()
+
+
+# ---------------------------------------------------------------------------
+# B-206 K-1:结果是父段 —— 判对、锚文本存活、段长、交给模型的字数、回放都按父段
+# ---------------------------------------------------------------------------
+
+_SPAN_P1 = "".join(f"第{i}条:每日一袋,温水冲服。" for i in range(1, 21)) + "开封后请在三天内用完。"
+_SPAN_P2 = "冷藏可以延长保质期。" + "".join(f"第{i}项:菌株编号BL-{i:02d}。" for i in range(1, 21))
+#: Too long for one 400-token chunk, short enough for one 1,024-token parent:
+#: two chunks of one parent, and this anchor runs across the two.
+_SPAN_DOC = f"# 用法\n\n{_SPAN_P1}\n\n{_SPAN_P2}\n"
+_SPAN_ANCHOR = "开封后请在三天内用完。冷藏可以延长保质期"
+#: One short chunk: no parent row, it stands for itself.
+_SOLO_DOC = "本品专利号 ZL2019-1234567,菌株编号 BL-99。规格 2g x 30 袋。\n"
+
+
+def _judged(chunk: Any) -> str:
+    return chunk_retrieval_text(chunk.heading_path, chunk.content)
+
+
+async def _rows_of(
+    store: InMemoryKnowledgeStore, tenant: UUID, kb_id: UUID, filename: str
+) -> tuple[list[Any], list[Any]]:
+    """``(chunks, parent rows)`` of one document."""
+    docs = await store.list_documents(tenant_id=tenant, kb_id=kb_id)
+    doc = next(d for d in docs if d.filename == filename)
+    chunks, _ = await store.list_chunks(tenant_id=tenant, document_id=doc.id, limit=200)
+    parents, _ = await store.list_chunks(
+        tenant_id=tenant, document_id=doc.id, limit=200, chunk_types={ChunkType.PARENT}
+    )
+    return chunks, parents
+
+
+async def _k1_seeded() -> tuple[InMemoryKnowledgeStore, UUID, UUID]:
+    store = InMemoryKnowledgeStore()
+    tenant = uuid4()
+    with rls_tenant(tenant):
+        kb_id = await _seed_docs(store, tenant, {"usage.md": _SPAN_DOC, "solo.md": _SOLO_DOC})
+    span_chunks, span_parents = await _rows_of(store, tenant, kb_id, "usage.md")
+    solo_chunks, solo_parents = await _rows_of(store, tenant, kb_id, "solo.md")
+    # The fixture's shape, which every test below relies on.
+    assert (len(span_chunks), len(span_parents)) == (2, 1)
+    assert not any(anchor_in(_SPAN_ANCHOR, _judged(c)) for c in span_chunks)
+    assert anchor_in(_SPAN_ANCHOR, _judged(span_parents[0]))
+    assert (len(solo_chunks), solo_parents, solo_chunks[0].parent_chunk_id) == (1, [], None)
+    return store, tenant, kb_id
+
+
+def _k1_case(case_id: str, query: str, document: str, anchor: str) -> KbCase:
+    return KbCase(
+        id=case_id,
+        query=query,
+        source="faq_xlsx",
+        tags=(),
+        expected=(KbExpected(document=document, anchor=anchor, page=None),),
+        answer=None,
+    )
+
+
+def _k1_dataset(*cases: KbCase) -> KbDataset:
+    return KbDataset(name="kb", corpus_manifest=None, corpus_tiers=("A",), cases=cases)
+
+
+_K1_SPAN = _k1_case("q-span", "开封后多久要用完,要冷藏吗", "usage.md", _SPAN_ANCHOR)
+_K1_SOLO = _k1_case("q-solo", "这个产品的专利号是多少", "solo.md", "专利号 ZL2019-1234567")
+_K1_GHOST = _k1_case("q-ghost", "维生素 D 推荐量", "ghost.md", "这个文档不在语料里")
+
+
+@pytest.mark.asyncio
+async def test_anchor_checks_judge_what_a_search_returns_and_report_the_chunk_level_too() -> None:
+    """A search returns parents (and chunks that stand alone): an anchor that
+    runs across two chunks of one parent can be found, so it is alive; the
+    chunk-level count is reported next to it so the two can be compared."""
+    store, tenant, kb_id = await _k1_seeded()
+    with rls_tenant(tenant):
+        anchors = await check_anchors(
+            store=store,
+            tenant_id=tenant,
+            kb_id=kb_id,
+            dataset=_k1_dataset(_K1_SPAN, _K1_SOLO, _K1_GHOST),
+        )
+    assert anchors.checked == 3
+    assert anchors.alive_cases == frozenset({"q-span", "q-solo"})
+    assert [(d.case_id, d.reason) for d in anchors.dead] == [("q-ghost", "document_missing")]
+    assert [(d.case_id, d.reason) for d in anchors.child_dead] == [
+        ("q-span", "anchor_not_in_any_chunk"),
+        ("q-ghost", "document_missing"),
+    ]
+    block = summarise([], corpus=None, anchors=anchors)["anchors"]
+    assert (block["checked"], block["dead_cases"], block["child_level_dead_cases"]) == (3, 1, 2)
+    assert [d["case_id"] for d in block["dead"]] == ["q-ghost"]
+    assert [(d["case_id"], d["reason"]) for d in block["child_level_dead"]] == [
+        ("q-span", "anchor_not_in_any_chunk"),
+        ("q-ghost", "document_missing"),
+    ]
+    table = format_summary_table(summarise([], corpus=None, anchors=anchors))
+    assert "anchors: checked=3 dead_cases=1 child_level_dead_cases=2" in table
+
+
+@pytest.mark.asyncio
+async def test_other_documents_holding_the_anchor_are_found_in_their_parents() -> None:
+    """Which documents count for an expectation is judged on the same text as
+    the hits: a copy whose parent holds the anchor across two chunks counts."""
+    store = InMemoryKnowledgeStore()
+    tenant = uuid4()
+    with rls_tenant(tenant):
+        kb_id = await _seed_docs(store, tenant, {"usage.md": _SPAN_DOC, "usage-2026.md": _SPAN_DOC})
+        resolved, report = await resolve_anchor_documents(
+            store=store,
+            tenant_id=tenant,
+            kb_id=kb_id,
+            dataset=_k1_dataset(_K1_SPAN),
+        )
+    assert resolved.cases[0].expected[0].documents == frozenset({"usage.md", "usage-2026.md"})
+    assert report.expanded == 1
+
+
+@pytest.mark.asyncio
+async def test_a_hit_is_judged_on_the_parent_passage_the_search_returns() -> None:
+    """No chunk holds the anchor, the parent the search returns does: a chunk
+    hit (MRR / chunk_hit are parent level), and the row records the parent and
+    the chunks of it that ranked."""
+    store, tenant, kb_id = await _k1_seeded()
+    retriever = build_retriever(store=store, embedder=build_fake_embedder(), reranker=None)
+    with rls_tenant(tenant):
+        (row,) = await run_eval(
+            dataset=_k1_dataset(_K1_SPAN),
+            retriever=retriever,
+            tenant_id=tenant,
+            cfg=EvalConfig(top_k=20, with_text=True),
+            concurrency=1,
+        )
+    (rank,) = row.score.chunk_hit_ranks
+    hit = row.results[rank - 1]
+    assert hit.filename == "usage.md"
+    assert hit.parent_index == 0
+    assert sorted(hit.hit_chunk_indexes) == [0, 1]  # both chunks ranked, one result
+    assert row.score.chunk_hit_10 == 1.0
+    assert row.score.mrr_10 == 1.0 / rank
+    assert row.score.context_hit == 1.0
+    _, (parent,) = await _rows_of(store, tenant, kb_id, "usage.md")
+    assert hit.text == _judged(parent)
+    line = case_to_json(row)["results"][rank - 1]
+    assert (line["parent_index"], sorted(line["hit_chunk_indexes"])) == (0, [0, 1])
+    assert line["shown_chars"] > 0
+    assert line["shown_tokens"] > 0
+    assert line["truncated"] is False
+
+
+@pytest.mark.asyncio
+async def test_corpus_reports_parent_sizes_next_to_chunk_sizes(tmp_path: Path) -> None:
+    """Chunk sizes stay the chunks'; parent sizes are what a search can return —
+    the parent rows plus the chunks that stand alone — with their counts."""
+    root = tmp_path / "k1"
+    root.mkdir()
+    (root / "usage.md").write_text(_SPAN_DOC, encoding="utf-8")
+    (root / "solo.md").write_text(_SOLO_DOC, encoding="utf-8")
+    manifest = tmp_path / "manifest.csv"
+    with manifest.open("w", encoding="utf-8", newline="") as fh:
+        writer = csv.DictWriter(fh, fieldnames=list(MANIFEST_FIELDS))
+        writer.writeheader()
+        writer.writerows([_row("usage.md"), _row("solo.md")])
+    store = InMemoryKnowledgeStore()
+    tenant = uuid4()
+    report = await _build((manifest, root), store=store, tenant=tenant, tiers=("A",))
+
+    rows = [await _rows_of(store, tenant, report.base_id, name) for name in ("usage.md", "solo.md")]
+    chunks = [c for doc_chunks, _ in rows for c in doc_chunks]
+    parents = [p for _, doc_parents in rows for p in doc_parents]
+    standalone = [c for c in chunks if c.parent_chunk_id is None]
+    assert (report.chunk_total, report.parent_total, report.standalone_total) == (3, 1, 1)
+    assert report.chunk_tokens == _size_spread([count_tokens(_judged(c)) for c in chunks])
+    assert report.parent_tokens == _size_spread(
+        [count_tokens(_judged(c)) for c in [*parents, *standalone]]
+    )
+    assert report.parent_tokens["max"] > report.chunk_tokens["max"]
+
+    summary = summarise([], corpus=report)
+    corpus_block = summary["corpus"]
+    assert (corpus_block["parent_total"], corpus_block["standalone_total"]) == (1, 1)
+    assert corpus_block["parent_tokens"] == report.parent_tokens
+    spread = " ".join(f"{k}={report.parent_tokens[k]}" for k in ("p10", "p50", "p90", "max"))
+    assert f"parent tokens: {spread} (parents=1 + standalone chunks=1)" in format_summary_table(
+        summary
+    )
+
+
+def _parent_result(rank: int, *, body: int, hit: int | None, anchor: str = "") -> RetrievedChunk:
+    """A result whose parent is ``body`` characters long and whose hit chunk
+    ``hit`` (``None``: a chunk that stands alone, no parent row)."""
+    return RetrievedChunk(
+        content=anchor + "甲" * body,
+        filename=f"doc{rank}.md",
+        chunk_index=rank * 2,
+        chunk_id=uuid4(),
+        fused_score=1.0 / (60 + rank),
+        parent_chunk_id=None if hit is None else uuid4(),
+        parent_index=None if hit is None else rank,
+        hit_chunk_indexes=(rank * 2, rank * 2 + 1),
+        hit_content=None if hit is None else anchor + "乙" * hit,
+    )
+
+
+#: Handed to the tool (default 5): the 1st fits whole, the 2nd only as its hit
+#: chunk (``[已截断]``), the 3rd whole, the 4th (no hit chunk to fall back to)
+#: not at all, so the 5th is dropped too; the 6th and 7th are past the limit.
+_BUDGET_RESULTS = (
+    _parent_result(1, body=6000, hit=100, anchor=_ANCHOR_A),
+    _parent_result(2, body=6000, hit=200),
+    _parent_result(3, body=100, hit=50),
+    _parent_result(4, body=6000, hit=None),
+    _parent_result(5, body=10, hit=5),
+    _parent_result(6, body=10, hit=5),
+    _parent_result(7, body=10, hit=5),
+)
+
+
+@dataclass(frozen=True)
+class _ByQueryRetriever:
+    """Returns the chunks listed for each query (cut to the asked-for limit)."""
+
+    results: dict[str, tuple[RetrievedChunk, ...]]
+
+    async def search_detailed(
+        self, *, query: str, limit: int, **_kwargs: Any
+    ) -> KnowledgeSearchOutcome:
+        found = self.results[query][:limit]
+        return KnowledgeSearchOutcome(
+            results=found, status="ok" if found else "no_hits", candidates=len(found)
+        )
+
+
+@pytest.mark.asyncio
+async def test_search_log_records_parents_and_what_each_result_added_to_the_output() -> None:
+    tenant = uuid4()
+    retriever = _ByQueryRetriever({"益生菌怎么补": _BUDGET_RESULTS})
+    (row,) = await run_eval(
+        dataset=_one_case_dataset(("doc1.md", _ANCHOR_A)),
+        retriever=cast(KnowledgeRetriever, retriever),
+        tenant_id=tenant,
+        cfg=EvalConfig(top_k=20),
+        concurrency=1,
+    )
+    text = await tool_message_text(
+        KnowledgeSearchTool(
+            retriever=cast(KnowledgeRetriever, retriever), knowledge_base_refs=("kb",)
+        ),
+        {"query": "益生菌怎么补"},
+        tenant_id=tenant,
+        call_id="q1",
+    )
+    body = knowledge._format_results(_BUDGET_RESULTS[:5])
+    assert unspotlight(text).startswith(body)  # the tool's rendering, inside the real output
+
+    log = search_log_json(row)
+    assert (log["shown_chars"], log["shown_tokens"]) == (len(text), count_tokens(text))
+    results = log["results"]
+    # Existing fields the offline replay tooling reads are still there.
+    assert [(r["rank"], r["filename"], r["chunk_index"]) for r in results] == [
+        (rank, c.filename, c.chunk_index) for rank, c in enumerate(_BUDGET_RESULTS, start=1)
+    ]
+    assert all("rerank_score" in r for r in results)
+    assert [r["parent_index"] for r in results] == [1, 2, 3, None, 5, 6, 7]
+    assert results[0]["hit_chunk_indexes"] == [2, 3]
+    assert [r["truncated"] for r in results] == [False, True, False, False, False, False, False]
+    chars = [r["shown_chars"] for r in results]
+    assert chars[0] > 6000
+    assert 200 < chars[1] < 6000
+    assert chars[2] > 100
+    assert chars[3:] == [0, 0, 0, 0]
+    assert sum(chars) == len(body)  # each result's share, separators included
+    assert results[0]["shown_tokens"] == count_tokens(body[: chars[0]])
+    assert [r["shown_tokens"] > 0 for r in results] == [True] * 3 + [False] * 4
+    assert [r["shown"] for r in results] == [True] * 5 + [False] * 2  # handed to the tool
+    # The results file carries the same per-result fields.
+    lines = case_to_json(row)["results"]
+    assert [(r["parent_index"], r["shown_chars"], r["truncated"]) for r in lines] == [
+        (r["parent_index"], r["shown_chars"], r["truncated"]) for r in results
+    ]
+    assert lines[0]["hit_chunk_indexes"] == [2, 3]
+
+
+@pytest.mark.asyncio
+async def test_summary_reports_the_text_handed_to_the_model_per_search() -> None:
+    """Measured on the tool's real output (fence, notice and budget included):
+    mean and p90 per search, in characters and tokens, and how many results
+    were shown cut to their hit chunk."""
+    tenant = uuid4()
+    retriever = _ByQueryRetriever(
+        {
+            "长": _BUDGET_RESULTS,
+            "短": (_parent_result(1, body=300, hit=20, anchor=_ANCHOR_A),),
+            "无": (),
+        }
+    )
+    cases = tuple(_k1_case(f"q-{q}", q, "doc1.md", _ANCHOR_A) for q in retriever.results)
+    rows = await run_eval(
+        dataset=_k1_dataset(*cases),
+        retriever=cast(KnowledgeRetriever, retriever),
+        tenant_id=tenant,
+        cfg=EvalConfig(top_k=20),
+        concurrency=1,
+    )
+    tool = KnowledgeSearchTool(
+        retriever=cast(KnowledgeRetriever, retriever), knowledge_base_refs=("kb",)
+    )
+    texts = [
+        await tool_message_text(tool, {"query": q}, tenant_id=tenant, call_id="c")
+        for q in retriever.results
+    ]
+    chars = [len(t) for t in texts]
+    tokens = [count_tokens(t) for t in texts]
+    summary = summarise(rows, corpus=None)
+    assert summary["tool_output"] == {
+        "searches": 3,
+        "chars": {"mean": round(sum(chars) / 3, 1), "p90": _size_spread(chars)["p90"]},
+        "tokens": {"mean": round(sum(tokens) / 3, 1), "p90": _size_spread(tokens)["p90"]},
+        "truncated_results": 1,
+    }
+    assert "tool output per search: chars mean=" in format_summary_table(summary)
+
+    # --top-k under the tool's own count: not what the tool would have shown, not counted.
+    short = await run_eval(
+        dataset=_k1_dataset(*cases),
+        retriever=cast(KnowledgeRetriever, retriever),
+        tenant_id=tenant,
+        cfg=EvalConfig(top_k=3),
+        concurrency=1,
+    )
+    assert summarise(short, corpus=None)["tool_output"] == {
+        "searches": 0,
+        "chars": {"mean": None, "p90": None},
+        "tokens": {"mean": None, "p90": None},
+        "truncated_results": 0,
+    }
+
+
+def test_shown_parts_refuses_a_rendering_it_cannot_split(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Each result's share is read off the tool's renderer by prefixes; a
+    renderer whose first n-1 results are not a prefix of its first n would
+    give made-up shares, so the eval stops instead."""
+    monkeypatch.setattr(
+        knowledge,
+        "_format_results",
+        lambda results: "\n".join(f"[{r.filename}#{r.chunk_index}]" for r in reversed(results)),
+    )
+    with pytest.raises(ValueError, match="in order"):
+        shown_parts(_ranked(2, n=3))
+
+
+def test_mean_and_p90_use_the_nearest_rank() -> None:
+    assert _mean_p90(range(10, 0, -1)) == {"mean": 5.5, "p90": 9}
+    assert _mean_p90([]) == {"mean": None, "p90": None}
+
+
+@pytest.mark.asyncio
+async def test_replay_reproduces_the_tools_own_search_over_parents() -> None:
+    """The eval hands the tool the first parents of its own top-20 search: with
+    parents collapsed from several ranked chunks that is still exactly what the
+    tool would have shown searching by itself."""
+    store = InMemoryKnowledgeStore()
+    tenant = uuid4()
+    with rls_tenant(tenant):
+        await _seed_docs(
+            store,
+            tenant,
+            {f"use{i}.md": f"# 用法 {i}\n\n{_SPAN_P1}{i}\n\n{_SPAN_P2}{i}\n" for i in range(8)},
+        )
+        retriever = KnowledgeRetriever(store=store, embedder=build_fake_embedder())
+        query = "开封后多久要用完,菌株编号"
+        outcome = await retriever.search_detailed(
+            tenant_id=tenant, base_names=["kb"], query=query, limit=20
+        )
+        assert len(outcome.results) > 5  # the tool's default count must actually cut
+        assert all(r.parent_index is not None for r in outcome.results)
+        assert any(len(r.hit_chunk_indexes) > 1 for r in outcome.results[:5])  # collapsed
+        replayed = KnowledgeSearchTool(
+            retriever=cast(KnowledgeRetriever, _ReplayRetriever(retriever, outcome)),
+            knowledge_base_refs=("kb",),
+        )
+        searching = KnowledgeSearchTool(retriever=retriever, knowledge_base_refs=("kb",))
+        texts = [
+            await tool_message_text(tool, {"query": query}, tenant_id=tenant, call_id="c")
+            for tool in (replayed, searching)
+        ]
+    assert texts[0] == texts[1]
+
+
+def test_two_runs_of_the_same_code_write_the_same_results(tmp_path: Path) -> None:
+    """Offline replay must line up: the same code run twice on the same corpus
+    gives the same case lines, summary and search log (ids aside)."""
+    root = tmp_path / "k1"
+    root.mkdir()
+    (root / "usage.md").write_text(_SPAN_DOC, encoding="utf-8")
+    (root / "solo.md").write_text(_SOLO_DOC, encoding="utf-8")
+    manifest = tmp_path / "manifest.csv"
+    with manifest.open("w", encoding="utf-8", newline="") as fh:
+        writer = csv.DictWriter(fh, fieldnames=list(MANIFEST_FIELDS))
+        writer.writeheader()
+        writer.writerows([_row("usage.md"), _row("solo.md")])
+    cases = [
+        {
+            "id": case.id,
+            "query": case.query,
+            "source": case.source,
+            "tags": [],
+            "expected": [
+                {"document": e.document, "anchor": e.anchor, "page": None} for e in case.expected
+            ],
+            "answer": None,
+        }
+        for case in (_K1_SPAN, _K1_SOLO, _K1_GHOST)
+    ]
+    dataset = _write_dataset(tmp_path / "k1.yaml", str(manifest), cases)
+
+    def run(label: str) -> tuple[list[str], dict[str, Any], list[dict[str, Any]]]:
+        out = tmp_path / f"{label}.jsonl"
+        log = tmp_path / f"{label}.log.jsonl"
+        argv = _cli(dataset, root, out, tmp_path / "b.yaml", "--tiers", "A")
+        assert main([*argv, "--search-log", str(log)]) == 0
+        *case_lines, summary_line = out.read_text(encoding="utf-8").splitlines()
+        searches = [json.loads(line) for line in log.read_text(encoding="utf-8").splitlines()]
+        for search in searches:
+            for result in search["results"]:
+                result.pop("chunk_id")  # a fresh id every ingest
+        return case_lines, baseline_section(json.loads(summary_line)["summary"]), searches
+
+    first, second = run("one"), run("two")
+    assert first == second
+    assert any(r["parent_index"] is not None for s in first[2] for r in s["results"])
