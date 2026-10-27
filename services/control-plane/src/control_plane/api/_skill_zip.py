@@ -119,7 +119,9 @@ MAX_PATH_DEPTH: Final[int] = 6
 #: ESM spellings of ``.js`` — same family, same text scan.
 #: ``.pptx`` / ``.docx`` / ``.xlsx`` are Office template assets (ppt-master
 #: bundles deck/brand templates) — binary like fonts: sandbox-consumed,
-#: skipped by the text scan, bounded by the size caps.
+#: skipped by the text scan, bounded by the size caps. ``.pdf`` is the same
+#: kind of document asset (a report skill appends fixed reference pages
+#: from a bundled PDF) and is handled the same way.
 ALLOWED_EXTENSIONS: Final[frozenset[str]] = frozenset(
     {
         ".md",
@@ -154,6 +156,7 @@ ALLOWED_EXTENSIONS: Final[frozenset[str]] = frozenset(
         ".pptx",
         ".docx",
         ".xlsx",
+        ".pdf",
     }
 )
 

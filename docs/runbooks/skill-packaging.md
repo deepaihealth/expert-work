@@ -117,11 +117,11 @@ internal limits beyond the enum.
 | `symlink` | ZIP entry is a symlink (no symlinks ever — even pointing inside the tree) |
 | `absolute_path` | Path starts with `/` or a Windows drive letter |
 | `invalid_chars` | Path contains NUL, control chars, or non-portable filename chars |
-| `depth_exceeded` | Directory depth > limit (currently 8) |
-| `extension_not_allowed` | Extension not in the allowlist (txt / md / py / json / yaml / yml / csv) |
-| `file_too_large` | Single file > per-file cap (256 KB at time of writing) |
-| `total_too_large` | Sum of all file bytes > total cap (4 MB) |
-| `too_many_entries` | Entry count > limit (currently 64) |
+| `depth_exceeded` | More than 6 directories above a file |
+| `extension_not_allowed` | Extension not in the allowlist (`ALLOWED_EXTENSIONS` in `control_plane/api/_skill_zip.py`): text — md txt yaml yml json py js cjs mjs ts sh ps1 toml html css xsd xml csv tsv ini cfg rst dot example; binary — png jpg svg ttf otf pptx docx xlsx pdf. Text files are threat-scanned, binary ones are not |
+| `file_too_large` | Single file > 1 MiB — 8 MiB for a **platform** skill import on a deployment with the skill object store; tenant imports always keep 1 MiB |
+| `total_too_large` | Sum of all file bytes > 8 MiB (64 MiB for a platform import with the object store) |
+| `too_many_entries` | More than 1,024 files (16,384 for a platform import with the object store) |
 | `legacy_format` | ZIP uses M0 `skill.yaml` + `prompt.md` + `tools.txt` layout (warning only — see § 4) |
 
 To inspect the actual internal detail (what path / what byte size hit

@@ -1159,3 +1159,30 @@ PY
 - [ ] **55.7 分段抽屉「按小段 / 按整块」**:`kb55` 文档列表里打开 `kb55.md` 的分段预览。判据:默认「按小段」,每段标「小段 #n」并注明「属于整块 #m」;切到「按整块」显示「整块 #m」列表,每块正文是它所含各小段的原文;旧库里的文档切到「按整块」显示「这个文档没有整块，检索时每个小段单独作为一条结果。」;英文界面为「By chunk / By passage」「Chunk #n」「Part of passage #m」。**没修好时**:没有切换,或「按整块」是空的。
 - [ ] **55.8 检索测试显示整块并标出命中小段**:`kb55` 检索测试输入「第 3 章第 5 段」。判据:每条结果头部「整块 #m · 命中小段 #n」(多个命中用「、」隔开),正文是整块,命中小段在正文里高亮;命中小段在整块正文里找不到原文时(带了续段表头 / 重复列),整块下面另列「命中小段」一栏。**没修好时**:只显示命中的那一小段,或没有整块编号。
 - [ ] **55.9 段数口径不变**:知识库列表与详情的「段数」= 55.3 的小段行数(不含整块)。测完删 `kb55`。
+
+## §57 技能包允许 PDF(B-223)
+
+**背景**:技能包文件类型白名单原来没有 `.pdf`,带 PDF 附件的技能(例如报告末尾原样追加固定几页)导入时被 400 拒收。现在 `.pdf` 和 pptx / docx / 字体一样按二进制处理:允许、原样保存、不做文本扫描、受大小上限约束(租户导入单文件 1 MiB;平台导入在有对象存储时 8 MiB)。
+
+**怎么进**:测试环境控制台(system_admin)。**测试包(零租户内容,本机生成,两页的 PDF)**:
+
+```bash
+python3 - <<'PY'
+import zipfile
+objs = [b"<</Type/Catalog/Pages 2 0 R>>", b"<</Type/Pages/Kids[3 0 R 4 0 R]/Count 2>>",
+        b"<</Type/Page/Parent 2 0 R/MediaBox[0 0 200 200]>>", b"<</Type/Page/Parent 2 0 R/MediaBox[0 0 200 200]>>"]
+pdf, offsets = bytearray(b"%PDF-1.4\n"), []
+for n, body in enumerate(objs, 1):
+    offsets.append(len(pdf)); pdf += b"%d 0 obj\n" % n + body + b"\nendobj\n"
+xref = len(pdf)
+pdf += b"xref\n0 %d\n0000000000 65535 f \n" % (len(objs) + 1) + b"".join(b"%010d 00000 n \n" % o for o in offsets)
+pdf += b"trailer\n<</Size %d/Root 1 0 R>>\nstartxref\n%d\n%%%%EOF\n" % (len(objs) + 1, xref)
+md = "---\nname: skill57-pdf-check\ndescription: 验收用技能,带一份两页的 PDF 附件。\n---\n\n# 验收\n\n用户问附件有几页时,读取 assets/reference.pdf 并回答页数。\n"
+with zipfile.ZipFile("/tmp/skill57.zip", "w") as z:
+    z.writestr("SKILL.md", md); z.writestr("assets/reference.pdf", bytes(pdf))
+PY
+```
+
+- [ ] **57.1 租户导入**:控制台「技能」→ 导入 `/tmp/skill57.zip`。判据:导入成功,技能文件列表里有 `assets/reference.pdf`。**没修好时**:400「invalid skill package」。
+- [ ] **57.2 平台技能导入**:平台技能页导入同一个包。判据:导入成功。**没修好时**:400,提示「disallowed file type」。
+- [ ] **57.3 沙箱读得到**:调试台给一个智能体挂上 57.1 导入的技能,问「技能里那份 PDF 有几页」。判据:智能体在沙箱里读到 `assets/reference.pdf`,答 2 页。测完删掉两处导入的技能。
