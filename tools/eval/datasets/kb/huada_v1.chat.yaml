@@ -454,7 +454,7 @@ cases:
     anchor: 正装 | 258元/盒
     page: null
   - document: 私域电商运营活动计划表-老版.xlsx
-    anchor: '| NaN | NaN | NaN | NaN | NaN | 益畅 | 258 | 1 | 258 | NaN |'
+    anchor: '益畅 | 258 | 1 | 258'
     page: null
     via: pool-judge
   - document: 6-50轮模拟对话测试.xlsx
@@ -2798,11 +2798,7 @@ cases:
     page: null
     via: pool-judge
   - document: 三诺&华大产品清单.xlsx
-    anchor: '| 益生菌伴侣 | 畅爽 |
-
-      | NaN | 晚安饮（新款） |
-
-      | NaN | 轻路 |'
+    anchor: '益生菌伴侣 | 晚安饮（新款'
     page: null
     via: pool-judge
   - document: 镜脂益生菌_减重客户沟通 SOP_长沙.docx
@@ -2922,7 +2918,7 @@ cases:
   - 成分性质
   expected:
   - document: 华大营养产品详情检索.xlsx
-    anchor: 优美达「玖伴」益生菌压片糖果 | 玖伴产品说明书 | 快速解酒 | 需要饮酒应酬人群、长期饮酒人群 | 100.0 | 24.0 | 0.8/片x3片/袋x3袋 | 169.0 | NaN | 压片糖果
+    anchor: '优美达「玖伴」益生菌压片糖果 | 玖伴产品说明书 | 快速解酒 | 需要饮酒应酬人群、长期饮酒人群 | 100 | 24 | 0.8/片x3片/袋x3袋 | 169.0 |  | 压片糖果'
     page: null
     via: pool-judge
   - document: 华大营养产品详情检索.xlsx
@@ -4968,7 +4964,7 @@ cases:
   - 价格
   expected:
   - document: 私域电商运营活动计划表-老版.xlsx
-    anchor: 520-618 大促活动 | 2025/5/18 | 2025/6/18 | NaN | 已完成 | 2、不同品折扣+1：1搭赠
+    anchor: '520-618 大促活动 | 2025/5/18 | 2025/6/18 | 已完成 | 2、不同品折扣+1：1搭赠'
     page: null
     via: pool-judge
   answer: null
