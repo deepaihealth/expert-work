@@ -699,7 +699,7 @@ cases:
     anchor: 鼠李糖乳酪杆菌OF44（专利号ZL202011248842.0）
     page: null
   - document: 华大营养益生菌FAQ-2026.xlsx
-    anchor: \n动物双歧杆菌乳亚种BGI-N3\n副干酪乳酪杆菌BGI-N2
+    anchor: '动物双歧杆菌乳亚种BGI-N3 副干酪乳酪杆菌BGI-N2'
     page: null
     via: pool-judge
   answer: '五株华大畅活益生菌（一畅到底）:
@@ -824,7 +824,7 @@ cases:
     anchor: 直接口服，一天1~2袋，餐后半小时内嚼服
     page: null
   - document: 华大产品汇总.xlsx
-    anchor: 益畅 | 便秘 | 婴幼儿 | 180.0 | 18 | 30 | 258 | 奶味 | 压片糖果 | 餐后30分钟左右咀嚼
+    anchor: '益畅 | 便秘 | 婴幼儿 | 180 | 18 | 30 | 258 | 奶味 | 压片糖果 | 餐后30分钟左右咀嚼'
     page: null
     via: pool-judge
   - document: 产品说明书：益畅.docx
@@ -5747,7 +5747,7 @@ cases:
     anchor: '| 正装 | 599元/盒 | 5g/袋×30袋/盒 | 500亿CFU/袋 | 24个月 |'
     page: null
   - document: 华大产品汇总.xlsx
-    anchor: 益畅珠峰版 | 严重便秘 | 婴幼儿 | 500.0 | 24 | 30 | 599
+    anchor: '益畅珠峰版 | 严重便秘 | 婴幼儿 | 500 | 24 | 30 | 599'
     page: null
     via: pool-judge
   answer: 599元/盒，24个月
