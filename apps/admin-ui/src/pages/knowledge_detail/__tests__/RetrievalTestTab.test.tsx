@@ -1,6 +1,7 @@
 /**
  * Retrieval test tab — B-206 K-7: when the rerank did not decide the order
  * (``rerank_outcome`` not ``ok``), the tab says why above the results.
+ * B-206 K-1: a parent result shows the whole parent with its hit chunk marked.
  */
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { render, screen, waitFor } from "@testing-library/react";
@@ -150,5 +151,111 @@ describe("RetrievalTestTab rerank-score threshold (B-206 K-7b)", () => {
   it("says nothing about the threshold when it was in force", async () => {
     await run("ok");
     expect(screen.queryByTestId("kb-test-rerank-threshold-paused")).toBeNull();
+  });
+});
+
+/** A parent result: the parent row #2 of hit chunks #5 (best) and #4. */
+const PARENT_TEXT = "Who is covered.\n\nThe deductible is 500.\n\nHow to claim.";
+
+function parentResult(
+  extra: Partial<knowledgeSdk.RetrievalTestResult> = {},
+): knowledgeSdk.RetrievalTestResult {
+  return {
+    content: PARENT_TEXT,
+    source: "faq.pdf#5",
+    filename: "faq.pdf",
+    chunk_index: 5,
+    score: 0.91,
+    recall_source: "both",
+    heading_path: ["Benefits"],
+    parent_index: 2,
+    hit_chunk_indexes: [5, 4],
+    hit_content: "The deductible is 500.",
+    hit_heading_path: ["Benefits", "Deductible"],
+    ...extra,
+  };
+}
+
+async function runWith(results: knowledgeSdk.RetrievalTestResult[]): Promise<void> {
+  vi.spyOn(knowledgeSdk, "testRetrieval").mockResolvedValue({
+    query: "deductible",
+    count: results.length,
+    rerank_outcome: "ok",
+    results,
+  });
+  render(
+    <App>
+      <RetrievalTestTab base={BASE} readScope={undefined} />
+    </App>,
+  );
+  await userEvent.type(screen.getByTestId("kb-test-query"), "deductible");
+  await userEvent.click(screen.getByTestId("kb-test-run"));
+  await waitFor(() => expect(screen.getByTestId("kb-test-results")).toBeInTheDocument());
+}
+
+describe("RetrievalTestTab parent results (B-206 K-1)", () => {
+  it("shows the whole parent with the hit chunk highlighted, naming the parent and its hits", async () => {
+    await inChinese(async () => {
+      await runWith([parentResult()]);
+      expect(screen.getByTestId("kb-test-parent-0")).toHaveTextContent(
+        "整块 #2 · 命中小段 #5、#4",
+      );
+      const mark = screen.getByTestId("kb-test-hit-mark-0");
+      expect(mark.tagName).toBe("MARK");
+      expect(mark.textContent).toBe("The deductible is 500.");
+      // The mark sits inside the parent's full text, in place — never clipped,
+      // so the highlight is always in view.
+      expect(mark.parentElement?.textContent).toBe(PARENT_TEXT);
+      expect(mark.parentElement).not.toHaveClass("ant-typography-ellipsis");
+      expect(screen.getByTestId("kb-test-heading-0")).toHaveTextContent("Benefits");
+      expect(screen.queryByTestId("kb-test-hit-0")).toBeNull();
+    });
+  });
+
+  it("names a single hit in English", async () => {
+    await runWith([parentResult({ hit_chunk_indexes: [5] })]);
+    expect(screen.getByTestId("kb-test-parent-0")).toHaveTextContent(
+      "Passage #2 · matched chunk #5",
+    );
+  });
+
+  it("shows the hit chunk on its own above the parent when its text is not in the parent", async () => {
+    await inChinese(async () => {
+      await runWith([parentResult({ hit_content: "Deductible: 500 per year." })]);
+      const block = screen.getByTestId("kb-test-hit-0");
+      expect(block).toHaveTextContent("命中小段");
+      expect(block).toHaveTextContent("Deductible: 500 per year.");
+      expect(screen.queryByTestId("kb-test-hit-mark-0")).toBeNull();
+      expect(screen.getByText(/Who is covered\./)).toHaveTextContent("How to claim.");
+      // The block comes before the parent's text.
+      const parentText = screen.getByText(/Who is covered\./);
+      expect(
+        block.compareDocumentPosition(parentText) & Node.DOCUMENT_POSITION_FOLLOWING,
+      ).toBeTruthy();
+    });
+  });
+
+  it("shows a result without a parent as before", async () => {
+    await runWith([
+      {
+        content: "The deductible is 500.",
+        source: "faq.pdf#0",
+        filename: "faq.pdf",
+        chunk_index: 0,
+        score: 0.91,
+        recall_source: "both",
+        heading_path: ["Benefits"],
+        parent_index: null,
+        hit_chunk_indexes: [0],
+        hit_content: null,
+        hit_heading_path: [],
+      },
+    ]);
+    // Clipped to four lines with an expander, as before.
+    expect(screen.getByText("The deductible is 500.")).toHaveClass("ant-typography-ellipsis");
+    expect(screen.getByTestId("kb-test-heading-0")).toHaveTextContent("Benefits");
+    expect(screen.queryByTestId("kb-test-parent-0")).toBeNull();
+    expect(screen.queryByTestId("kb-test-hit-mark-0")).toBeNull();
+    expect(screen.queryByTestId("kb-test-hit-0")).toBeNull();
   });
 });

@@ -595,11 +595,20 @@ export interface TranslationKeys {
     chunks_drawer_title: string;
     chunks_empty: string;
     chunk_label: string;
+    parent_label: string;
+    chunk_in_parent: string;
+    chunks_view_children: string;
+    chunks_view_parents: string;
+    parents_empty: string;
     test_title: string;
     test_query_placeholder: string;
     test_run: string;
     test_empty_hint: string;
     test_no_results: string;
+    test_parent_hits_one: string;
+    test_parent_hits_other: string;
+    test_hit_separator: string;
+    test_hit_chunk: string;
     test_control_top_k: string;
     test_control_method: string;
     test_control_threshold: string;
@@ -3851,7 +3860,7 @@ const en: TranslationKeys = {
     advanced: "Advanced",
     retrieval_defaults: "Retrieval defaults",
     field_top_k: "Results (top-k)",
-    field_top_k_hint: "How many chunks knowledge_search returns by default.",
+    field_top_k_hint: "How many results knowledge_search returns by default.",
     field_threshold: "Score threshold",
     field_threshold_hint:
       "Drop vector hits below this similarity (0–1). Off by default (empty). To enable, tune it from the retrieval test (try ~0.2 first) — too high drops relevant hits.",
@@ -3969,13 +3978,22 @@ const en: TranslationKeys = {
     chunks_drawer_title: "Chunks · {{name}}",
     chunks_empty: "No chunks (the document may still be processing).",
     chunk_label: "Chunk #{{index}}",
+    parent_label: "Passage #{{index}}",
+    chunk_in_parent: "Part of passage #{{index}}",
+    chunks_view_children: "By chunk",
+    chunks_view_parents: "By passage",
+    parents_empty: "This document has no passages: each chunk is returned as a result on its own.",
     test_title: "Retrieval test",
     test_query_placeholder:
-      "Enter a query to see which chunks would be retrieved…",
+      "Enter a query to see which results would be retrieved…",
     test_run: "Run",
     test_empty_hint:
-      "Run a query to preview retrieval — ranked chunks with scores and recall path.",
-    test_no_results: "No chunks matched this query.",
+      "Run a query to preview retrieval — ranked results with scores and recall path.",
+    test_no_results: "No results matched this query.",
+    test_parent_hits_one: "Passage #{{parent}} · matched chunk {{hits}}",
+    test_parent_hits_other: "Passage #{{parent}} · matched chunks {{hits}}",
+    test_hit_separator: ", ",
+    test_hit_chunk: "Matched chunk",
     test_control_top_k: "Top-k",
     test_control_method: "Method",
     test_control_threshold: "Threshold",
