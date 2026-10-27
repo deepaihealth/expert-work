@@ -388,6 +388,25 @@ def test_xsd_extension_allowed_and_scanned() -> None:
     assert ei.value.reason == "prompt_injection"
 
 
+def test_pdf_asset_allowed_as_binary() -> None:
+    """``.pdf`` is a document asset like ``.docx`` / ``.pptx`` (a report skill
+    appends fixed reference pages from a bundled PDF): allowed whatever the
+    case of its suffix, kept byte for byte, and — binary — not text-scanned."""
+    skill_md = _build_skill_md(name="report-skill")
+    pdf = b"%PDF-1.4\n%\xe2\xe3\xcf\xd3\n1 0 obj << /Type /Catalog >> endobj\n%%EOF\n"
+    parsed = parse_skill_zip(
+        _zip_with(
+            {
+                "SKILL.md": skill_md.encode("utf-8"),
+                "assets/reference.pdf": pdf,
+                "assets/appendix.PDF": pdf,
+            }
+        )
+    )
+    assert set(parsed.supporting_files) == {"assets/reference.pdf", "assets/appendix.PDF"}
+    assert base64.b64decode(parsed.supporting_files["assets/reference.pdf"].content) == pdf
+
+
 def test_leading_bom_in_text_file_not_flagged() -> None:
     """A leading UTF-8 BOM (U+FEFF) is an encoding marker, not obfuscation —
     standard for ECMA/MS OOXML ``.xsd`` files. It must NOT trip the

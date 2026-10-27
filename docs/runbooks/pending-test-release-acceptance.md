@@ -1196,3 +1196,30 @@ PY
 - [x] **56.1 表格按显示读**(嵌入不到 1 分钱):`kb56` 上传 `/tmp/kb56.xlsx`,等 ready。判据:`SELECT heading_path, content FROM knowledge_chunk WHERE document_id = '<id>' AND chunk_type <> 'parent' ORDER BY chunk_index` —— 正文里「基础套餐」出现 3 次(合并单元格每行都有);折扣是 `61.12%` / `25.00%` / `12.50%` / `100.00%`;日期是 `2026-03-01`(没有 `00:00:00`);没有 `NaN`、没有 `Unnamed`;`heading_path` 是 `["价目", "验收价目表 2026"]`。**没修好时**:乙、丙两行分组是 `NaN`,折扣 `0.6112`,表头是 `验收价目表 2026 | Unnamed: 1 …`,`heading_path` 只有 `["价目"]`。 **10-27 测试 `7a93398d1` 过**:`heading_path` = `["价目", "验收价目表 2026"]`;「基础套餐」3 行都在,折扣 `61.12%` / `25.00%` / `12.50%` / `100.00%`,日期 `2026-03-01`,没有 `NaN` / `Unnamed`。
 - [x] **56.2 Word 大纲级别当标题**:`kb56` 上传 `/tmp/kb56.docx`(文件里没有任何「标题」样式,只有大纲级别),等 ready。判据:同上查询 —— `heading_path` 是 `["验收服务指南", "营业时间"]`(标题进标题路径,入库的正文不带 `#`);「退款规则」在正文里单独成行。**没修好时**:`heading_path` 为空。 **10-27 测试 `7a93398d1` 过**:`heading_path` = `["验收服务指南", "营业时间"]`;「退款规则」在正文里单独成行。(原判据写「正文里有 `## 营业时间` / `## 退款规则`」是错的:标题进 `heading_path`,入库的正文不带 `#`,判据已改。)
 - [x] **56.3 智能体看到标题**:调试台用绑了 `kb56` 的智能体问「退款规则是什么」。判据:工具结果里这份 Word 的那条正文带「验收服务指南」「退款规则」,回答是「三十天内、需保留原包装」。测完删 `kb56`。 **10-27 测试 `7a93398d1` 过**:`[kb56.docx#0]` 那条正文带 `Section: 验收服务指南 > 营业时间` 和「退款规则」;回答「三十天内可以退款,需保留原包装」。已删 `kb56` 和临时智能体。
+
+## §57 技能包允许 PDF(B-223)
+
+**背景**:技能包文件类型白名单原来没有 `.pdf`,带 PDF 附件的技能(例如报告末尾原样追加固定几页)导入时被 400 拒收。现在 `.pdf` 和 pptx / docx / 字体一样按二进制处理:允许、原样保存、不做文本扫描、受大小上限约束(租户导入单文件 1 MiB;平台导入在有对象存储时 8 MiB)。
+
+**怎么进**:测试环境控制台(system_admin)。**测试包(零租户内容,本机生成,两页的 PDF)**:
+
+```bash
+python3 - <<'PY'
+import zipfile
+objs = [b"<</Type/Catalog/Pages 2 0 R>>", b"<</Type/Pages/Kids[3 0 R 4 0 R]/Count 2>>",
+        b"<</Type/Page/Parent 2 0 R/MediaBox[0 0 200 200]>>", b"<</Type/Page/Parent 2 0 R/MediaBox[0 0 200 200]>>"]
+pdf, offsets = bytearray(b"%PDF-1.4\n"), []
+for n, body in enumerate(objs, 1):
+    offsets.append(len(pdf)); pdf += b"%d 0 obj\n" % n + body + b"\nendobj\n"
+xref = len(pdf)
+pdf += b"xref\n0 %d\n0000000000 65535 f \n" % (len(objs) + 1) + b"".join(b"%010d 00000 n \n" % o for o in offsets)
+pdf += b"trailer\n<</Size %d/Root 1 0 R>>\nstartxref\n%d\n%%%%EOF\n" % (len(objs) + 1, xref)
+md = "---\nname: skill57-pdf-check\ndescription: 验收用技能,带一份两页的 PDF 附件。\n---\n\n# 验收\n\n用户问附件有几页时,读取 assets/reference.pdf 并回答页数。\n"
+with zipfile.ZipFile("/tmp/skill57.zip", "w") as z:
+    z.writestr("SKILL.md", md); z.writestr("assets/reference.pdf", bytes(pdf))
+PY
+```
+
+- [ ] **57.1 租户导入**:控制台「技能」→ 导入 `/tmp/skill57.zip`。判据:导入成功,技能文件列表里有 `assets/reference.pdf`。**没修好时**:400「invalid skill package」。
+- [ ] **57.2 平台技能导入**:平台技能页导入同一个包。判据:导入成功。**没修好时**:400,提示「disallowed file type」。
+- [ ] **57.3 沙箱读得到**:调试台给一个智能体挂上 57.1 导入的技能,问「技能里那份 PDF 有几页」。判据:智能体在沙箱里读到 `assets/reference.pdf`,答 2 页。测完删掉两处导入的技能。
