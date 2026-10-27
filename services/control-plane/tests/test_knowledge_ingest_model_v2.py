@@ -331,7 +331,8 @@ async def test_a_reindex_leaves_the_chunking_fingerprint_alone() -> None:
     )
     after = await store.get_document(tenant_id=document.tenant_id, document_id=document.id)
     assert after is not None
-    assert after.chunk_params_hash == document.chunk_params_hash is not None
+    assert document.chunk_params_hash is not None
+    assert after.chunk_params_hash == document.chunk_params_hash
 
 
 def test_parse_error_code_survives_pickling() -> None:

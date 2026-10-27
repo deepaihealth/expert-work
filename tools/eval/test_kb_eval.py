@@ -2064,7 +2064,7 @@ async def test_a_hit_is_judged_on_the_parent_passage_the_search_returns() -> Non
     assert row.score.chunk_hit_10 == 1.0
     assert row.score.mrr_10 == 1.0 / rank
     assert row.score.context_hit == 1.0
-    (_chunks, (parent,)) = await _rows_of(store, tenant, kb_id, "usage.md")
+    _, (parent,) = await _rows_of(store, tenant, kb_id, "usage.md")
     assert hit.text == _judged(parent)
     line = case_to_json(row)["results"][rank - 1]
     assert (line["parent_index"], sorted(line["hit_chunk_indexes"])) == (0, [0, 1])

@@ -176,9 +176,13 @@ class _TrackedChunks(Sequence[KnowledgeChunk]):
         return len(self._chunks)
 
     @overload
-    def __getitem__(self, index: int) -> KnowledgeChunk: ...
+    def __getitem__(self, index: int) -> KnowledgeChunk:
+        """One chunk."""
+
     @overload
-    def __getitem__(self, index: slice) -> Sequence[KnowledgeChunk]: ...
+    def __getitem__(self, index: slice) -> Sequence[KnowledgeChunk]:
+        """A run of chunks."""
+
     def __getitem__(self, index: int | slice) -> KnowledgeChunk | Sequence[KnowledgeChunk]:
         if isinstance(index, slice):
             picked = range(len(self._chunks))[index]
