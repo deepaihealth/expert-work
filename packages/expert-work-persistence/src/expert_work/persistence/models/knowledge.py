@@ -270,6 +270,10 @@ class KnowledgeChunkRow(Base):
         JSONB(none_as_null=True), nullable=True
     )
     enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default=text("true"))
+    #: Why a disabled row is off (migration ``0176``, B-175 P3-PR2): ``manual``
+    #: or ``inherited`` (a re-ingest switched it off because a switched-off
+    #: passage it could not find again holds its text — to be reviewed).
+    disabled_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
     edited: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default=text("false"))
     revision: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("1"))
     content_hash: Mapped[str | None] = mapped_column(Text, nullable=True)
@@ -294,6 +298,10 @@ class KnowledgeChunkRow(Base):
         CheckConstraint(
             "(chunk_type = 'parent') = (embedding IS NULL)",
             name="knowledge_chunk_embedding_iff_parent",
+        ),
+        CheckConstraint(
+            "disabled_reason IS NULL OR disabled_reason IN ('manual', 'inherited')",
+            name="knowledge_chunk_disabled_reason_enum",
         ),
     )
 
@@ -398,8 +406,10 @@ class KnowledgeTaskRow(Base):
 
 
 class KnowledgeChunkRevisionRow(Base):
-    """``knowledge_chunk_revision`` (migration ``0165``) — a chunk's edit
-    history for review / rollback. Nothing writes it yet (P3-PR2)."""
+    """``knowledge_chunk_revision`` (migration ``0165``) — a passage's edit
+    history for review / rollback (B-175 P3-PR2: ``chunk_id`` is the passage's
+    id — its parent row's, or its lone chunk's). Deleting the document deletes
+    it (FK cascade, migration ``0176``)."""
 
     __tablename__ = "knowledge_chunk_revision"
 
@@ -408,7 +418,15 @@ class KnowledgeChunkRevisionRow(Base):
     )
     tenant_id: Mapped[UUID] = mapped_column(PG_UUID(as_uuid=True), nullable=False)
     kb_id: Mapped[UUID] = mapped_column(PG_UUID(as_uuid=True), nullable=False)
-    document_id: Mapped[UUID] = mapped_column(PG_UUID(as_uuid=True), nullable=False)
+    document_id: Mapped[UUID] = mapped_column(
+        PG_UUID(as_uuid=True),
+        ForeignKey(
+            "knowledge_document.id",
+            ondelete="CASCADE",
+            name="fk_knowledge_chunk_revision_document",
+        ),
+        nullable=False,
+    )
     chunk_id: Mapped[UUID] = mapped_column(PG_UUID(as_uuid=True), nullable=False)
     revision: Mapped[int] = mapped_column(Integer, nullable=False)
     content: Mapped[str] = mapped_column(Text, nullable=False)
@@ -417,10 +435,27 @@ class KnowledgeChunkRevisionRow(Base):
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )
+    #: When a re-ingest last left this passage out (its manual change could
+    #: not be put back; migration ``0176``) — the retention job deletes such
+    #: a history 30 days on. ``None`` while the passage exists.
+    orphaned_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    #: Not a text revision but a switch-off record (``revision`` 0, migration
+    #: ``0176``): a person switched the passage off and a re-ingest left it
+    #: out; ``content`` / ``heading_path`` are the text every ingest derives
+    #: inherited switch-offs from, ``orphaned_at`` since when no passage holds
+    #: any of it (then listed for review with the unapplied edits).
+    switch_off_lost: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, server_default=text("false")
+    )
 
     __table_args__ = (
         UniqueConstraint("chunk_id", "revision", name="knowledge_chunk_revision_uniq"),
         Index("knowledge_chunk_revision_document_idx", "document_id"),
+        Index(
+            "knowledge_chunk_revision_orphaned_idx",
+            "orphaned_at",
+            postgresql_where=text("orphaned_at IS NOT NULL"),
+        ),
     )
 
 

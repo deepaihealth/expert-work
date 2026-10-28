@@ -260,6 +260,18 @@ class AuditAction(StrEnum):
     # waited for recognition (recognized pages come from the cache).
     KNOWLEDGE_DOCUMENT_RECOGNIZE = "knowledge:document_recognize"
     KNOWLEDGE_DOCUMENT_DISCARD_PENDING = "knowledge:document_discard_pending"
+    # B-175 P3-PR2 — knowledge maintenance: document switches and batches, a
+    # base's stale documents re-ingested, passage edits / additions / switches
+    # / restores (passage writes are recorded on their document).
+    KNOWLEDGE_DOCUMENT_TOGGLE = "knowledge:document_toggle"
+    KNOWLEDGE_DOCUMENT_BATCH = "knowledge:document_batch"
+    KNOWLEDGE_BASE_REINGEST = "knowledge:base_reingest"
+    KNOWLEDGE_PASSAGE_EDIT = "knowledge:passage_edit"
+    KNOWLEDGE_PASSAGE_ADD = "knowledge:passage_add"
+    KNOWLEDGE_PASSAGE_TOGGLE = "knowledge:passage_toggle"
+    KNOWLEDGE_PASSAGE_RESTORE = "knowledge:passage_restore"
+    # A document's unapplied edits (histories a re-ingest left behind) discarded.
+    KNOWLEDGE_PASSAGE_DISCARD_UNAPPLIED = "knowledge:passage_discard_unapplied"
     # triggers (Stream J.10 — Mini-ADR J-26 / J-42)
     TRIGGER_CREATE = "trigger:create"
     TRIGGER_UPDATE = "trigger:update"

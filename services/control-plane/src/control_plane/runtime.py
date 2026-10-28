@@ -141,6 +141,7 @@ from orchestrator.tools import (
     WorkspaceLock,
     WorkspaceStore,
 )
+from orchestrator.tools.knowledge_catalog import catalog_fingerprint
 from orchestrator.tools.knowledge_log import LoggedKnowledgeRetriever, RetrievalLogSink
 from orchestrator.tools.knowledge_rerank import RerankOutcome, RerankRanking
 from orchestrator.trajectory.recorder import TrajectoryRecorder
@@ -181,7 +182,8 @@ class AgentBuilder(Protocol):
 
 logger = logging.getLogger(__name__)
 
-# Built-agent cache key ``(tenant, name, version, spec_sha256, user_id)``.
+# Built-agent cache key ``(tenant, name, version, spec_sha256, user_id,
+# knowledge_catalog)``.
 # ``user_id`` is ``None`` for the shared build and carries the subject only
 # when the caller has connected OAuth connectors (Stream MCP-OAUTH, OA-3b), so
 # a no-OAuth agent stays shared across users. ``k[0]`` is always the tenant and
@@ -205,8 +207,16 @@ logger = logging.getLogger(__name__)
 # explicit invalidators and their bus broadcast stay load-bearing for those; what
 # the hash removes is the manifest edit's dependence on them.
 #
+# B-175 P4 — one piece of that outside state is keyed after all: an agent
+# binding 2+ knowledge bases freezes their catalog (names, descriptions,
+# document-count buckets) into its system prompt, and tenants edit it through the
+# knowledge pages, not the manifest. ``knowledge_catalog`` is that catalog's
+# fingerprint (:func:`knowledge_catalog_fingerprint`; ``None`` without one), so
+# such an edit reaches the next run without an invalidation hook. It is the LAST
+# element, so ``k[0]`` / ``k[4]`` keep their meaning.
+#
 # The cached value carries its ``expires_at`` (二期 PR2 T4).
-_CacheKey = tuple[UUID, str, str, str, str | None]
+_CacheKey = tuple[UUID, str, str, str, str | None, str | None]
 
 # Stream Agent-Templates (M1-3) — resolves a platform template ``(name, version)``
 # (``version`` may be ``"latest"``) to its base ``AgentSpec``, or ``None`` if the
@@ -214,6 +224,43 @@ _CacheKey = tuple[UUID, str, str, str, str | None]
 # under ``bypass_rls_session`` (NULL-tenant rows). Lets ``_build`` merge an
 # inheriting fork's manifest against its base + enforce the tier① security floor.
 PlatformTemplateResolver = Callable[[str, str], Awaitable[AgentSpec | None]]
+
+
+async def knowledge_catalog_fingerprint(
+    store: KnowledgeStore | None, spec: AgentSpec, *, tenant_id: UUID
+) -> str | None:
+    """B-175 P4 — the build cache key's knowledge-catalog slot for ``spec``:
+    ``None`` when no store is wired or the spec binds fewer than two bases (the
+    store is not read then), else :func:`catalog_fingerprint`.
+
+    It reads the spec as the caller holds it, before the builder merges a
+    template's ``extends``: a fork that inherits its ``knowledge`` block from
+    the template is not fingerprinted, and an edited catalog reaches its build
+    only when the cached entry expires (TTL)."""
+    knowledge = spec.spec.knowledge
+    if store is None or knowledge is None:
+        return None
+    return await catalog_fingerprint(store, tenant_id=tenant_id, refs=knowledge.knowledge_base_refs)
+
+
+def catalog_build_cacheable(keyed: str | None, built: BuiltAgent, *, checked: bool) -> bool:
+    """B-175 P4 — whether ``built`` may be cached under a key whose catalog slot
+    is ``keyed``. The key and the build each read the catalog; when the build
+    froze a different one (its own read failed, the catalog changed between the
+    two reads, bound bases appeared in between while the slot is ``None``) it is
+    served once but not cached — cached, it would answer the keyed catalog with
+    other content for the whole TTL. ``checked`` is false when the key could not
+    see the catalog at all: no store wired, or the spec it hashed declares no
+    ``knowledge`` (a fork inheriting it through ``extends``; stale up to the
+    TTL) — then any build is cached."""
+    if not checked or built.knowledge_catalog_fingerprint == keyed:
+        return True
+    logger.info(
+        "control_plane.build_not_cached reason=knowledge_catalog_mismatch keyed=%s built=%s",
+        keyed,
+        built.knowledge_catalog_fingerprint,
+    )
+    return False
 
 
 @dataclass
@@ -239,6 +286,10 @@ class AgentRuntime:
     #: Used only to decide whether a build must be per-user (the user has ≥1
     #: connected OAuth connector); the builder re-resolves it (cheap, cached).
     user_oauth_pool_provider: UserMcpOAuthPoolProvider | None = None
+    #: B-175 P4 — the store the builds' knowledge catalog is read from, for the
+    #: cache key's catalog fingerprint (see ``_CacheKey``). ``None`` leaves the
+    #: slot empty: a catalog edit then waits for the TTL.
+    knowledge_store: KnowledgeStore | None = None
     #: Stream SE (SE-7d-3b-ii) — emits ``skill_run_usage`` at each run's terminal
     #: hook (one row per distilled skill bound), feeding the rollback monitor.
     #: ``None`` disables emission (the monitor then stays a safe no-op).
@@ -410,7 +461,14 @@ class AgentRuntime:
             user_pool = await self.user_oauth_pool_provider(tenant_id, user_id)
             if user_pool.names():
                 oauth_subject = user_id
-        key: _CacheKey = (tenant_id, name, version, compute_spec_sha256(spec), oauth_subject)
+        key: _CacheKey = (
+            tenant_id,
+            name,
+            version,
+            compute_spec_sha256(spec),
+            oauth_subject,
+            await knowledge_catalog_fingerprint(self.knowledge_store, spec, tenant_id=tenant_id),
+        )
         cached = self._cache.get(key)
         if cached is not None:
             built, expires_at = cached
@@ -426,6 +484,9 @@ class AgentRuntime:
             del self._cache[key]
             self._publish_cache_size()
         built = await self.agent_builder(spec, tenant_id=tenant_id, user_id=user_id)
+        keyed_catalog = self.knowledge_store is not None and spec.spec.knowledge is not None
+        if not catalog_build_cacheable(key[-1], built, checked=keyed_catalog):
+            return built
         self._cache[key] = (built, self._clock() + self.cache_ttl_s)
         self._cache.move_to_end(key)
         while len(self._cache) > self.cache_max_size:

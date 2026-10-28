@@ -87,6 +87,12 @@ class RetentionCleanupSettings(BaseSettings):
     # 全局旋钮(与上面几个窗口一样),没有按租户覆盖。
     knowledge_task_retention_days: int = Field(default=90, ge=1, le=3650)
 
+    # --------------------------------------------------- 知识库分段修订(B-175 P3-PR2)
+    # 重新入库后整块找不到了、人工修改没能套回去的修订(``orphaned_at`` 有值),满这个
+    # 天数就删(修订正文可能含健康数据)。整块还在的修订不按时间删,随文档删除。用户
+    # 给检索记录定的期限是 30 天,这里同一期限。
+    knowledge_revision_orphan_days: int = Field(default=30, ge=1, le=3650)
+
     # --------------------------------------------------- knowledge retrieval log (B-175 P2-PR4)
     # ``knowledge_retrieval_log``: one row per knowledge search (agent + console
     # test), the question asked included. User ruling (2026-10-27): kept 30 days.

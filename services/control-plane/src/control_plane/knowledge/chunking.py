@@ -526,6 +526,55 @@ def structural_chunk_count(
     )
 
 
+def normalize_passage_body(body: str) -> str:
+    """A passage's text as it is stored when edited or added by hand (B-175
+    P3-PR2): its paragraphs, each trimmed, between single blank lines — the
+    text :func:`chunk_passage_body` makes one chunk of when it fits."""
+    return "\n\n".join(block.text for block in _parse_plain_blocks(body))
+
+
+def chunk_passage_body(
+    body: str,
+    heading_path: Sequence[str],
+    *,
+    max_tokens: int,
+    overlap_tokens: int,
+    doc_title: str | None,
+) -> list[TextChunk]:
+    """The chunks of one passage's text (B-175 P3-PR2): an edit, a passage
+    added by hand, a re-ingest putting an edit back. The text is cut by the
+    base's chunk rules inside the passage — paragraphs (blank-line separated;
+    one whose every line is a table row is a table) packed to ``max_tokens``
+    with ``overlap_tokens``, an oversized one cut like a document's — and every
+    chunk carries the passage's breadcrumb ``heading_path``. Deterministic; one
+    chunk when the text fits; none for blank text."""
+    trail = tuple(heading_path)
+    blocks = [
+        replace(block, kind=_passage_block_kind(block.text), heading_trail=trail)
+        for block in _parse_plain_blocks(body)
+    ]
+    if not blocks:
+        return []
+    # Every heading of the breadcrumb counts as written: none is put into a
+    # chunk's body (the passage's text already holds the ones it shows).
+    written = {trail[: depth + 1] for depth in range(len(trail))}
+    chunks = _pack_blocks(
+        blocks,
+        max_tokens=max_tokens,
+        overlap_tokens=overlap_tokens,
+        semantic_breaks=frozenset(),
+        doc_title=doc_title,
+        written=written,
+    )
+    return [TextChunk(body=chunk.body, heading_path=trail) for chunk in chunks]
+
+
+def _passage_block_kind(text: str) -> Literal["content", "table"]:
+    lines = _LINE_BREAK.split(text)
+    is_table = len(lines) > 1 and all(line.lstrip().startswith("|") for line in lines)
+    return "table" if is_table else "content"
+
+
 class _ParentCut:
     """The parents of one document (B-206 K-1): which blocks each holds
     (:meth:`groups`) and the parent a run of blocks and its children make

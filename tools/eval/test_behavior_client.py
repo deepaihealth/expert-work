@@ -40,7 +40,13 @@ _FRAMES = [
         {
             "tools": {
                 "messages": [
-                    {"type": "tool", "name": "edit_file", "status": "error", "content": "x"}
+                    {
+                        "type": "tool",
+                        "name": "edit_file",
+                        "status": "error",
+                        "content": "x",
+                        "tool_call_id": "c1",
+                    }
                 ]
             }
         },
@@ -123,6 +129,8 @@ async def test_run_turn_collects_tools_text_end_and_usage() -> None:
         "path": "report.md"
     }
     assert rec.tool_errors == 1
+    # B-175 P4 —— 这次调用被工具拒了(按 tool_call_id 对上),判据据此只看被接受的调用
+    assert rec.tool_calls[0].id == "c1" and rec.tool_calls[0].error is True
     assert rec.final_text == "已改好"
     assert rec.artifacts == [{"name": "report.md", "version": 2}]
     assert (rec.input_tokens, rec.output_tokens) == (1200, 50)

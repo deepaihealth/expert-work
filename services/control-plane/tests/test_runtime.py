@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Awaitable, Callable, Sequence
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -37,6 +38,7 @@ from expert_work.runtime.secret_store import LocalDevSecretStore, parse_secret_r
 from expert_work.runtime.storage import InMemoryObjectStore
 from expert_work.runtime.stream_bridge import InMemoryStreamBridge
 from expert_work.testing import InMemorySecretStore
+from orchestrator import BuiltAgent
 from orchestrator.llm import FakeEmbedder
 from orchestrator.multimodal import (
     CachingImageResolver,
@@ -45,6 +47,7 @@ from orchestrator.multimodal import (
     ObjectStoreImageResolver,
 )
 from orchestrator.tools.knowledge import DEFAULT_RERANK_POOL, DEFAULT_RERANK_VIEW
+from orchestrator.tools.knowledge_catalog import CATALOG_UNAVAILABLE, catalog_fingerprint
 from orchestrator.tools.knowledge_log import LoggedKnowledgeRetriever
 
 _MINIMAL_MANIFEST: dict[str, Any] = {
@@ -539,6 +542,245 @@ async def test_invalidate_user_drops_only_that_users_per_user_agents() -> None:
     await runtime.get_agent(tenant_id=t, name="x", version="1", spec=spec, user_id="u1")
     await runtime.get_agent(tenant_id=t, name="x", version="1", spec=spec, user_id="u2")
     assert len(builds) == 3
+
+
+# ---------------------------------------------------------------------------
+# B-175 P4 — the knowledge catalog is frozen into the build, so its fingerprint
+# joins the cache key: an edited description or a document-count bucket change
+# reaches the next run; an upload inside a bucket does not rebuild.
+# ---------------------------------------------------------------------------
+
+
+def _kb_spec(refs: list[str]) -> AgentSpec:
+    manifest = dict(_MINIMAL_MANIFEST)
+    manifest["spec"] = dict(manifest["spec"], knowledge={"knowledge_base_refs": refs})
+    return AgentSpec.model_validate(manifest)
+
+
+async def _seed_bases(store: InMemoryKnowledgeStore, tenant: UUID, *names: str) -> list[UUID]:
+    """Bases ``names``, one document each (bucket ``1-9``)."""
+    ids = []
+    for name in names:
+        base = await store.create_base(tenant_id=tenant, name=name, description=f"about {name}")
+        await store.upsert_document(tenant_id=tenant, kb_id=base.id, filename="d0.md")
+        ids.append(base.id)
+    return ids
+
+
+class _UnreadableKnowledgeStore(InMemoryKnowledgeStore):
+    """Records every catalog read. Not raising: the fingerprint swallows store
+    errors (``"unavailable"``), so a raise could not fail a test."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.reads: list[str] = []
+
+    async def list_bases(self, *, tenant_id: UUID) -> list[Any]:
+        self.reads.append("list_bases")
+        return await super().list_bases(tenant_id=tenant_id)
+
+    async def count_documents_capped(
+        self, *, tenant_id: UUID, kb_ids: Sequence[UUID], cap: int
+    ) -> dict[UUID, int]:
+        self.reads.append("count_documents_capped")
+        return await super().count_documents_capped(tenant_id=tenant_id, kb_ids=kb_ids, cap=cap)
+
+
+def _catalog_builder(
+    store: InMemoryKnowledgeStore,
+    builds: list[tuple[str, str | None]],
+    *,
+    before_read: Callable[[], Awaitable[None]] | None = None,
+    read_fails: bool = False,
+) -> Any:
+    """A builder that freezes the catalog the way ``build_agent`` does: it
+    reads the catalog itself and records that fingerprint on the build
+    (:data:`CATALOG_UNAVAILABLE` when ``read_fails``). ``before_read`` runs
+    between the key's read and the build's — a concurrent catalog edit."""
+
+    async def _builder(
+        spec: AgentSpec, *, tenant_id: UUID | None = None, user_id: str | None = None
+    ) -> BuiltAgent:
+        assert tenant_id is not None
+        builds.append((str(tenant_id), user_id))
+        if before_read is not None:
+            await before_read()
+        refs = spec.spec.knowledge.knowledge_base_refs if spec.spec.knowledge else []
+        fingerprint = (
+            CATALOG_UNAVAILABLE
+            if read_fails
+            else await catalog_fingerprint(store, tenant_id=tenant_id, refs=refs)
+        )
+        return BuiltAgent(
+            graph=object(),  # type: ignore[arg-type]
+            system_prompt="",
+            max_steps=1,
+            knowledge_catalog_fingerprint=fingerprint,
+        )
+
+    return _builder
+
+
+def _catalog_runtime(builder: Any, store: InMemoryKnowledgeStore) -> AgentRuntime:
+    return AgentRuntime(
+        run_manager=RunManager(store=None),  # type: ignore[arg-type]
+        stream_bridge=InMemoryStreamBridge(),
+        agent_builder=builder,
+        knowledge_store=store,
+    )
+
+
+@pytest.mark.asyncio
+async def test_get_agent_rebuilds_when_the_knowledge_catalog_changed() -> None:
+    builds: list[tuple[str, str | None]] = []
+    store = InMemoryKnowledgeStore()
+    runtime = _catalog_runtime(_catalog_builder(store, builds), store)
+    t = uuid4()
+    a_id, b_id = await _seed_bases(store, t, "a", "b")
+    spec = _kb_spec(["a", "b"])
+
+    await runtime.get_agent(tenant_id=t, name="x", version="1", spec=spec)
+    # Same bucket (1 -> 2 documents, both "1-9"): the prompt would not change.
+    await store.upsert_document(tenant_id=t, kb_id=a_id, filename="d1.md")
+    await runtime.get_agent(tenant_id=t, name="x", version="1", spec=spec)
+    assert len(builds) == 1
+
+    await store.update_base(tenant_id=t, kb_id=b_id, description="edited")
+    await runtime.get_agent(tenant_id=t, name="x", version="1", spec=spec)
+    await runtime.get_agent(tenant_id=t, name="x", version="1", spec=spec)
+    assert len(builds) == 2
+
+
+@pytest.mark.asyncio
+async def test_get_agent_does_not_cache_a_build_whose_catalog_read_failed() -> None:
+    """The key read the catalog, the build's own read failed: cached, the
+    catalog-less build would answer the real fingerprint for the whole TTL."""
+    builds: list[tuple[str, str | None]] = []
+    store = InMemoryKnowledgeStore()
+    runtime = _catalog_runtime(_catalog_builder(store, builds, read_fails=True), store)
+    t = uuid4()
+    await _seed_bases(store, t, "a", "b")
+    spec = _kb_spec(["a", "b"])
+    await runtime.get_agent(tenant_id=t, name="x", version="1", spec=spec)
+    await runtime.get_agent(tenant_id=t, name="x", version="1", spec=spec)
+    assert len(builds) == 2
+    assert not runtime._cache
+
+
+@pytest.mark.asyncio
+async def test_get_agent_does_not_cache_a_build_of_a_catalog_edited_meanwhile() -> None:
+    """The catalog changed between the key's read and the build's: that build is
+    served but not cached; the next run keys on the new catalog and caches."""
+    builds: list[tuple[str, str | None]] = []
+    store = InMemoryKnowledgeStore()
+    t = uuid4()
+    _a_id, b_id = await _seed_bases(store, t, "a", "b")
+    edits = iter(["edited once"])
+
+    async def _edit_once() -> None:
+        description = next(edits, None)
+        if description is not None:
+            await store.update_base(tenant_id=t, kb_id=b_id, description=description)
+
+    runtime = _catalog_runtime(_catalog_builder(store, builds, before_read=_edit_once), store)
+    spec = _kb_spec(["a", "b"])
+    for _ in range(3):
+        await runtime.get_agent(tenant_id=t, name="x", version="1", spec=spec)
+    assert len(builds) == 2
+    [key] = runtime._cache
+    assert key[-1] == await catalog_fingerprint(store, tenant_id=t, refs=("a", "b"))
+
+
+@pytest.mark.asyncio
+async def test_get_agent_does_not_cache_a_catalog_build_under_an_empty_slot() -> None:
+    """The bound bases appeared between the key's read (none existed: slot
+    ``None``) and the build's: cached, that catalog would be served after the
+    bases are gone again."""
+    builds: list[tuple[str, str | None]] = []
+    store = InMemoryKnowledgeStore()
+    t = uuid4()
+    created: list[UUID] = []
+
+    async def _create_once() -> None:
+        if not created:
+            created.extend(await _seed_bases(store, t, "a", "b"))
+
+    runtime = _catalog_runtime(_catalog_builder(store, builds, before_read=_create_once), store)
+    spec = _kb_spec(["a", "b"])
+    first = await runtime.get_agent(tenant_id=t, name="x", version="1", spec=spec)
+    assert first.knowledge_catalog_fingerprint is not None
+    assert not runtime._cache
+    for kb_id in created:
+        await store.delete_base(tenant_id=t, kb_id=kb_id)
+    again = await runtime.get_agent(tenant_id=t, name="x", version="1", spec=spec)
+    assert len(builds) == 2
+    assert again.knowledge_catalog_fingerprint is None
+
+
+@pytest.mark.asyncio
+async def test_get_agent_caches_a_catalog_its_key_could_not_see() -> None:
+    """A fork that inherits ``knowledge`` through ``extends`` has no catalog slot
+    (the key reads the unmerged spec); its build is cached as before (TTL)."""
+    builds: list[tuple[str, str | None]] = []
+    store = InMemoryKnowledgeStore()
+    t = uuid4()
+    await _seed_bases(store, t, "a", "b")
+    inner = _catalog_builder(store, builds)
+
+    async def _merging_builder(
+        spec: AgentSpec, *, tenant_id: UUID | None = None, user_id: str | None = None
+    ) -> BuiltAgent:
+        built: BuiltAgent = await inner(_kb_spec(["a", "b"]), tenant_id=tenant_id, user_id=user_id)
+        return built
+
+    runtime = _catalog_runtime(_merging_builder, store)
+    for _ in range(2):
+        await runtime.get_agent(tenant_id=t, name="x", version="1", spec=_make_spec())
+    assert len(builds) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("spec", [_make_spec(), _kb_spec(["a"])], ids=["no-knowledge", "one-base"])
+async def test_get_agent_does_not_read_the_knowledge_store_without_a_catalog(
+    spec: AgentSpec,
+) -> None:
+    builds: list[tuple[str, str | None]] = []
+    store = _UnreadableKnowledgeStore()
+    runtime = _catalog_runtime(_catalog_builder(store, builds), store)
+    t = uuid4()
+    await runtime.get_agent(tenant_id=t, name="x", version="1", spec=spec)
+    await runtime.get_agent(tenant_id=t, name="x", version="1", spec=spec)
+    assert len(builds) == 1
+    assert store.reads == []
+    [key] = runtime._cache
+    assert key[-1] is None
+
+
+@pytest.mark.asyncio
+async def test_invalidation_still_matches_keys_carrying_a_catalog() -> None:
+    """The fingerprint is appended last: ``k[0]`` stays the tenant and ``k[4]``
+    the OAuth subject, which the invalidators match positionally."""
+    builds: list[tuple[str, str | None]] = []
+    runtime = _runtime_with_oauth([], users_with_oauth={"u1", "u2"})
+    store = InMemoryKnowledgeStore()
+    runtime.knowledge_store = store
+    runtime.agent_builder = _catalog_builder(store, builds)
+    t = uuid4()
+    await _seed_bases(store, t, "a", "b")
+    spec = _kb_spec(["a", "b"])
+
+    async def _both() -> None:
+        for user in ("u1", "u2"):
+            await runtime.get_agent(tenant_id=t, name="x", version="1", spec=spec, user_id=user)
+
+    await _both()
+    assert len(builds) == 2
+    runtime.invalidate_user(t, "u1")
+    await _both()
+    assert builds[2:] == [(str(t), "u1")]
+    runtime.invalidate_tenant(t)
+    await _both()
+    assert len(builds) == 5
 
 
 # ---------------------------------------------------------------------------

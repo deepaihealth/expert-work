@@ -94,6 +94,7 @@ class TurnBuilder:
         self._final_text = ""
         self._calls: list[ToolCall] = []
         self._tool_errors = 0
+        self._failed_call_ids: set[str] = set()
         self._compactions = 0
 
     def on_frame(self, event: str, raw: str) -> None:
@@ -128,11 +129,13 @@ class TurnBuilder:
                     calls = [c for c in msg.get("tool_calls") or [] if isinstance(c, dict)]
                     for call in calls:
                         args = call.get("args")
+                        call_id = call.get("id")
                         self._calls.append(
                             ToolCall(
                                 turn=self.index,
                                 name=str(call.get("name", "")),
                                 args=args if isinstance(args, dict) else {},
+                                id=call_id if isinstance(call_id, str) else None,
                             )
                         )
                     text = message_text(msg.get("content"))
@@ -140,6 +143,9 @@ class TurnBuilder:
                         self._final_text = text
                 elif mtype in _TOOL_TYPES and msg.get("status") == "error":
                     self._tool_errors += 1
+                    failed_id = msg.get("tool_call_id")
+                    if isinstance(failed_id, str):
+                        self._failed_call_ids.add(failed_id)
 
     def result(self, wall_s: float) -> TurnRecord:
         if self._end is None:
@@ -161,7 +167,10 @@ class TurnBuilder:
             completed=end.get("completed"),
             exit_reason=end.get("exit_reason"),
             final_text=self._final_text,
-            tool_calls=self._calls,
+            tool_calls=[
+                c.model_copy(update={"error": True}) if c.id in self._failed_call_ids else c
+                for c in self._calls
+            ],
             tool_errors=self._tool_errors,
             artifacts=[a for a in artifacts if isinstance(a, dict)]
             if isinstance(artifacts, list)

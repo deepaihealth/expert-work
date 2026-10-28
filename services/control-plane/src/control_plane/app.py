@@ -70,6 +70,8 @@ from control_plane.api import (
     build_health_router,
     build_knowledge_figures_router,
     build_knowledge_logs_router,
+    build_knowledge_maintenance_router,
+    build_knowledge_passages_router,
     build_knowledge_router,
     build_mcp_catalog_router,
     build_mcp_oauth_router,
@@ -2088,6 +2090,9 @@ def create_app(
                 )
                 # Stream MCP-OAUTH (OA-3b) — let get_agent decide per-user builds.
                 resolved_agent_runtime.user_oauth_pool_provider = _user_mcp_oauth_pool_provider
+                # B-175 P4 — the knowledge catalog's fingerprint joins the build
+                # cache key; read from the store the builds read it from.
+                resolved_agent_runtime.knowledge_store = resolved_knowledge_store
                 # Stream T (PR B) — these background workers (ingestion runner,
                 # DLQ worker, consolidator) are ALWAYS started. ``embedder`` is a
                 # ``DynamicResolvingEmbedder`` that resolves the live platform
@@ -2937,6 +2942,8 @@ def create_app(
     app.include_router(build_knowledge_router())
     app.include_router(build_knowledge_figures_router())
     app.include_router(build_knowledge_logs_router())
+    app.include_router(build_knowledge_maintenance_router())
+    app.include_router(build_knowledge_passages_router())
     app.include_router(build_me_router())
     app.include_router(build_memory_router())
     app.include_router(build_skills_router())

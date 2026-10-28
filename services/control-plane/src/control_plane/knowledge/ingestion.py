@@ -51,6 +51,7 @@ from control_plane.knowledge.chunking import (
     chunk_markdown_parented,
     chunk_markdown_semantic_parented,
     chunk_params_hash,
+    chunk_passage_body,
     semantic_breaks_enabled,
     structural_chunk_count,
 )
@@ -74,12 +75,13 @@ from control_plane.knowledge.parsing import (
     is_plain_text_file,
     strip_lone_surrogates,
 )
+from control_plane.knowledge.passages import replay_manual_changes
 from control_plane.knowledge.recognition.figure_pipeline import FigureDescriber
 from control_plane.knowledge.recognition.ingest_parse import ParseJob, PoolRunner, parse_upload
 from control_plane.knowledge.recognition.recognizer import DocumentRecognizer
 from control_plane.knowledge.usage import IngestUsageRecorder, billed_embeddings
 from expert_work.persistence import KnowledgeStore
-from expert_work.persistence.knowledge.base import ClaimedIngestion
+from expert_work.persistence.knowledge.base import ChunkVector, ClaimedIngestion, PassageChild
 from expert_work.persistence.rls import current_tenant_id_var
 from expert_work.protocol import (
     ChunkType,
@@ -115,6 +117,12 @@ _RETRY_DELAYS: tuple[float, ...] = (1.0, 2.0, 4.0)
 #: OpenAI-compatible embedder splits on, so a retry re-sends one request,
 #: never the whole document's worth.
 _EMBED_BATCH_SIZE = 10
+
+#: B-175 P3-PR2 —— a re-index's passes over one document (the first re-embeds
+#: every chunk, the others the chunks still not on the new model) before it
+#: gives up and leaves the base unstamped; and its page size when reading.
+_REINDEX_PASSES = 3
+_PAGE = 200
 
 #: Process-pool parsing. The pool is process-global (one per control-plane
 #: process), created lazily on first use with the configured worker count.
@@ -642,20 +650,9 @@ async def _chunk_embed_store(
     # parent row holds text the chunks already hold, no vector.
     chunk_count = sum(len(parent.children) for parent in parents)
     ensure_chunk_count(chunk_count)
-    if not chunk_count:
-        _ensure_written(
-            await store.replace_chunks(
-                tenant_id=tenant_id,
-                document_id=document_id,
-                chunks=[],
-                generation=generation,
-                chunk_params_hash=params_hash,
-            ),
-            document_id,
-        )
-        return 0
     # Chunked outside the budget (that holds the text and one window of block
-    # vectors); embedded and stored inside it, weighed by its chunks.
+    # vectors); embedded and stored inside it, weighed by its chunks. A text
+    # with no chunk goes the same way: passages added by hand still go back.
     async with admitted(len(markdown), chunk_count):
         return await _embed_store(
             store,
@@ -668,6 +665,8 @@ async def _chunk_embed_store(
             doc_title=doc_title,
             model_key=model_key,
             params_hash=params_hash,
+            chunk_max_tokens=chunk_max_tokens,
+            chunk_overlap_tokens=chunk_overlap_tokens,
         )
 
 
@@ -683,9 +682,33 @@ async def _embed_store(
     doc_title: str | None,
     model_key: str | None,
     params_hash: str,
+    chunk_max_tokens: int,
+    chunk_overlap_tokens: int,
 ) -> int:
     stage_args = {"tenant_id": tenant_id, "document_id": document_id, "generation": generation}
     await _advance(store, stage=IngestStage.EMBEDDING, **stage_args)
+    # B-175 P3-PR2: the manual changes go back onto the new passages.
+    plan = replay_manual_changes(
+        parents,
+        await store.list_manual_passages(tenant_id=tenant_id, document_id=document_id),
+        switch_offs=await store.list_switch_offs(tenant_id=tenant_id, document_id=document_id),
+        max_tokens=chunk_max_tokens,
+        overlap_tokens=chunk_overlap_tokens,
+        doc_title=doc_title,
+    )
+    if any(plan.overrides) or plan.switch_offs:
+        logger.info(
+            "knowledge.manual_replay document=%s edits_applied=%d disabled_applied=%d "
+            "added=%d disabled_inherited=%d unapplied=%d switch_offs_lost=%d",
+            document_id,
+            plan.edits_applied,
+            plan.disabled_applied,
+            plan.added,
+            plan.disabled_inherited,
+            len(plan.unapplied),
+            plan.switch_offs_unplaced,
+        )
+    parents = plan.parents
     # Only the chunks are embedded; a parent is stored for reading.
     pieces = [child for parent in parents for child in parent.children]
     texts = [chunk_retrieval_text(piece.heading_path, piece.body, doc_title) for piece in pieces]
@@ -708,6 +731,7 @@ async def _embed_store(
         document_id=document_id,
         doc_title=doc_title,
         model_key=model_key,
+        overrides=plan.overrides,
     )
     await _advance(store, stage=IngestStage.INDEXING, **stage_args)
     _ensure_written(
@@ -717,6 +741,7 @@ async def _embed_store(
             chunks=chunks,
             generation=generation,
             chunk_params_hash=params_hash,
+            switch_offs=plan.switch_offs,
         ),
         document_id,
     )
@@ -775,6 +800,58 @@ def _ensure_written(written: bool, document_id: UUID) -> None:
     if not written:
         msg = f"document {document_id} was re-uploaded or settled by another claim"
         raise StaleIngestionError(msg)
+
+
+async def embed_passage(
+    *,
+    store: KnowledgeStore,
+    embedder: Embedder,
+    document: KnowledgeDocument,
+    content: str,
+    heading_path: Sequence[str],
+    chunk_max_tokens: int,
+    chunk_overlap_tokens: int,
+    usage: IngestUsageRecorder | None = None,
+) -> list[PassageChild]:
+    """The chunks of a passage's new text (B-175 P3-PR2: an edit, a restore, a
+    passage added by hand), cut by the base's parameters
+    (:func:`~control_plane.knowledge.chunking.chunk_passage_body`) and embedded
+    the way an ingest embeds: a chunk whose retrieval text the document already
+    has keeps its stored vector, so only what changed is embedded — and billed
+    to the tenant (``usage``)."""
+    tenant_id = document.tenant_id
+    doc_title = knowledge_document_title(document.filename)
+    model_key, pinned = await pin_embedder(embedder, tenant_id=tenant_id)
+    pieces = chunk_passage_body(
+        content,
+        heading_path,
+        max_tokens=chunk_max_tokens,
+        overlap_tokens=chunk_overlap_tokens,
+        doc_title=doc_title,
+    )
+    texts = [chunk_retrieval_text(piece.heading_path, piece.body, doc_title) for piece in pieces]
+    hashes = [content_hash(text) for text in texts]
+    async with billed_embeddings(usage, tenant_id=tenant_id, model_key=model_key):
+        vectors = await _vectors_for(
+            store,
+            _BackoffEmbedder(pinned),
+            tenant_id=tenant_id,
+            document_id=document.id,
+            texts=texts,
+            hashes=hashes,
+            model_key=model_key,
+        )
+    return [
+        PassageChild(
+            content=piece.body,
+            heading_path=piece.heading_path,
+            content_hash=digest,
+            embedding=vectors[digest],
+            embedding_model=model_key,
+            doc_title=doc_title,
+        )
+        for piece, digest in zip(pieces, hashes, strict=True)
+    ]
 
 
 async def renew_lease_periodically(
@@ -888,6 +965,28 @@ class KnowledgeIngestionRunner:
         self._tasks.add(task)
         task.add_done_callback(self._tasks.discard)
         return task
+
+    async def passage_children(
+        self,
+        *,
+        document: KnowledgeDocument,
+        content: str,
+        heading_path: Sequence[str],
+        chunk_max_tokens: int,
+        chunk_overlap_tokens: int,
+    ) -> list[PassageChild]:
+        """:func:`embed_passage` with this runner's embedder, billed like its
+        ingests (B-175 P3-PR2: the console's passage edits)."""
+        return await embed_passage(
+            store=self._store,
+            embedder=self._embedder,
+            document=document,
+            content=content,
+            heading_path=heading_path,
+            chunk_max_tokens=chunk_max_tokens,
+            chunk_overlap_tokens=chunk_overlap_tokens,
+            usage=self._usage,
+        )
 
     async def drain(self) -> None:
         """Await all outstanding ingestion tasks (used by tests / shutdown)."""
@@ -1094,38 +1193,96 @@ class KnowledgeIngestionRunner:
         embedder: Embedder,
         model_key: str | None,
     ) -> None:
+        """Re-embed the document's chunks with ``embedder``: every chunk once,
+        then — up to :data:`_REINDEX_PASSES` passes in all — the chunks still
+        not on ``model_key`` (written meanwhile with the model being replaced,
+        e.g. an edit that started before the switch). Raises when some are
+        still not, or a write-back is refused without a re-upload (the
+        document left the status it was read in), so the base is not stamped
+        with the new model."""
         document_id = document.id
-        existing = await self._collect_chunks(tenant_id=tenant_id, document_id=document_id)
-        if not existing:
-            return
-        # B-206 K-1: the parent rows have no vector to rebuild, but the swap
-        # replaces every row of the document — they go back as they are, so
-        # each chunk's ``parent_chunk_id`` still finds its parent.
-        parents = await self._collect_chunks(
-            tenant_id=tenant_id, document_id=document_id, chunk_types={ChunkType.PARENT}
-        )
+        pending = await self._collect_chunks(tenant_id=tenant_id, document_id=document_id)
+        for done in range(_REINDEX_PASSES):
+            if not pending:
+                return
+            if done:
+                logger.info(
+                    "knowledge.reindex_document_stragglers document=%s pass=%d chunks=%d",
+                    document_id,
+                    done + 1,
+                    len(pending),
+                )
+            if not await self._reembed(
+                tenant_id=tenant_id,
+                document=document,
+                chunks=pending,
+                embedder=embedder,
+                model_key=model_key,
+            ):
+                return  # superseded: a re-upload owns the document now
+            current = await self._collect_chunks(tenant_id=tenant_id, document_id=document_id)
+            pending = [chunk for chunk in current if chunk.embedding_model != model_key]
+        if pending:
+            msg = (
+                f"document {document_id}: {len(pending)} chunks still not on the new "
+                f"embedding model after {_REINDEX_PASSES} passes"
+            )
+            raise RuntimeError(msg)
+
+    async def _reembed(
+        self,
+        *,
+        tenant_id: UUID,
+        document: KnowledgeDocument,
+        chunks: Sequence[KnowledgeChunk],
+        embedder: Embedder,
+        model_key: str | None,
+    ) -> bool:
+        """One re-index pass over ``chunks``; ``False`` when superseded (a
+        re-upload owns the document now). A write refused for any other
+        reason raises: the base must not be stamped while these chunks keep
+        the old model."""
         # The retrieval text (title + breadcrumb + body) is what the vectors
         # encode.
-        texts = [chunk.retrieval_text for chunk in existing]
+        texts = [chunk.retrieval_text for chunk in chunks]
         embeddings = await embed_with_backoff(embedder, texts, tenant_id=tenant_id)
-        # Only the vector (and the model that made it) changes — title,
-        # heading path, hash, type and flags stay.
-        rebuilt = [
-            chunk.model_copy(update={"embedding": embedding, "embedding_model": model_key})
-            for chunk, embedding in zip(existing, embeddings, strict=True)
-        ]
-        # Fenced on the generation we read: a re-upload that landed while we
-        # were embedding owns the document now (and was embedded with the
-        # live model anyway) — do not put the old chunks back.
-        written = await self._store.replace_chunks(
+        # B-175 P3-PR2: only the vectors (and the model) are rewritten, in
+        # place, and only for chunks that still have the id and text read
+        # above. A passage write that landed while we were embedding (a
+        # switch-off, an edit, an added passage) is never undone: rows it
+        # replaced are skipped, and switches, text and parent rows are not
+        # touched; the rows it wrote are checked for their model after the
+        # pass. Fenced on the generation and status we read the document in.
+        updated = await self._store.update_chunk_embeddings(
             tenant_id=tenant_id,
-            document_id=document_id,
-            chunks=[*parents, *rebuilt],
+            document_id=document.id,
+            vectors=[
+                ChunkVector(chunk.id, chunk.content_hash, embedding)
+                for chunk, embedding in zip(chunks, embeddings, strict=True)
+            ],
+            embedding_model=model_key,
             generation=document.ingest_generation,
-            expect_status=DocumentStatus.READY,
+            expect_status=document.status,
         )
-        if not written:
-            logger.info("knowledge.reindex_document_superseded document=%s", document_id)
+        if updated is None:
+            now = await self._store.get_document(tenant_id=tenant_id, document_id=document.id)
+            if now is None or now.ingest_generation != document.ingest_generation:
+                # Re-uploaded (or deleted) meanwhile: the new version is
+                # embedded with the live model by its own ingest.
+                logger.info("knowledge.reindex_document_superseded document=%s", document.id)
+                return False
+            msg = (
+                f"document {document.id}: re-index write-back refused "
+                f"({document.status} -> {now.status}, same generation)"
+            )
+            raise RuntimeError(msg)
+        if updated < len(chunks):
+            logger.info(
+                "knowledge.reindex_document_changed_meanwhile document=%s skipped=%d",
+                document.id,
+                len(chunks) - updated,
+            )
+        return True
 
     async def _collect_chunks(
         self,
@@ -1135,19 +1292,20 @@ class KnowledgeIngestionRunner:
         chunk_types: Collection[ChunkType] | None = None,
     ) -> list[KnowledgeChunk]:
         """The document's rows of ``chunk_types`` (``None``: the chunks
-        searched, :meth:`KnowledgeStore.list_chunks`'s default)."""
+        searched, :meth:`KnowledgeStore.list_chunks`'s default), read a page
+        at a time by position — rows written or dropped meanwhile (a passage
+        edit) do not shift the pages."""
         collected: list[KnowledgeChunk] = []
-        offset = 0
+        after: tuple[int, ChunkType] | None = None
         while True:
-            page, total = await self._store.list_chunks(
+            page, _ = await self._store.list_chunks(
                 tenant_id=tenant_id,
                 document_id=document_id,
-                offset=offset,
-                limit=200,
+                limit=_PAGE,
                 chunk_types=chunk_types,
+                after=after,
             )
             collected.extend(page)
-            offset += len(page)
-            if not page or offset >= total:
-                break
-        return collected
+            if len(page) < _PAGE:
+                return collected
+            after = (page[-1].chunk_index, page[-1].chunk_type)

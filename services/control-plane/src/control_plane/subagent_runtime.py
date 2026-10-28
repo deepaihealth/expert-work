@@ -25,6 +25,8 @@ from control_plane.platform_judge_config import PlatformJudgeConfigService
 from control_plane.platform_mcp_pool import PlatformMcpPoolProvider
 from control_plane.platform_tool_budget_config import PlatformToolBudgetConfigService
 from control_plane.runtime import (
+    catalog_build_cacheable,
+    knowledge_catalog_fingerprint,
     make_mcp_allowlist_provider,
     make_provider_key_resolver,
     make_skill_resolver,
@@ -65,7 +67,11 @@ logger = logging.getLogger(__name__)
 # additionally never touched by the manifest write path — it is only reached
 # through the invalidation hooks — so before content-addressing, a stale child
 # survived the edit even on the replica that served it.
-_ChildKey = tuple[UUID, str, str, int, str, str, str | None]
+#
+# B-175 P4 — the last element is the child's knowledge catalog fingerprint
+# (``runtime.knowledge_catalog_fingerprint``; ``None`` without one), for the
+# same reason as the top-level key; appended so ``k[6]`` stays the subject.
+_ChildKey = tuple[UUID, str, str, int, str, str, str | None, str | None]
 
 
 #: B-122 —— worker 工具边界的提示词侧。结构上已经不给这些工具(assembly /
@@ -158,6 +164,13 @@ def _filter_worker_tools(tools: list[ToolSpecEntry], allowed: list[str]) -> list
     return keep
 
 
+def _knowledge_allowed(allowed: list[str]) -> bool:
+    """Whether a worker may keep the parent's ``knowledge`` block. It is not a
+    ``tools:`` entry, so :func:`_filter_worker_tools` cannot see it; the same
+    rule applies to the tool it brings: empty allowlist = everything."""
+    return not allowed or "knowledge_search" in allowed
+
+
 def synthesize_worker_spec(
     parent: AgentSpec,
     *,
@@ -178,7 +191,7 @@ def synthesize_worker_spec(
     verbatim (:func:`resolve_worker_max_iterations` owns the clamp policy —
     per-agent request vs platform default/cap), and strips
     stateful / delegation blocks (memory / triggers / static subagents /
-    reflection / routing / knowledge) — the worker is stateless and
+    reflection / routing) — the worker is stateless and
     ephemeral. ``dynamic_workers`` stays default-on so a worker may itself
     spawn while below the depth cap (a grand-worker inherits the same
     override).
@@ -197,8 +210,19 @@ def synthesize_worker_spec(
     progressive-disclosure: lazy skills contribute one ``<available-skills>``
     summary line each, bodies load only when the worker calls ``skill_view``.
     ``inherit_skills=False`` is the ops rollback valve (platform env, never a
-    tenant-facing setting) restoring the pre-B-37 stripped shape byte for byte.
+    tenant-facing setting) restoring the pre-B-37 empty ``skills`` list; it does
+    not touch the other blocks (``knowledge`` stays inherited, see below).
     See ``docs/superpowers/specs/2026-08-28-worker-context-inheritance-design.md``.
+
+    B-175 P4 (2026-10-27 decision) — ``knowledge`` is **inherited** too: a
+    worker handed a question about the parent's documents could not search them.
+    It is a read-only block, so it adds no state; the worker builds its own
+    ``knowledge_search`` over the parent's bases (and, with two or more, the
+    knowledge catalog) through the normal build path, from the same retriever
+    the parent uses, searching the run's tenant. Workers are not cached, so no
+    cache key needs the catalog fingerprint. A non-empty ``allowed_toolsets``
+    that does not list ``knowledge_search`` strips the block, as it strips any
+    tool it does not list.
 
     B-122 — ``worker_policy`` strips :data:`WORKER_DENIED_BUILTINS` (delivery
     + self-modification) and appends the boundary text; ``False`` is the ops
@@ -231,7 +255,9 @@ def synthesize_worker_spec(
             "skills": list(body.skills) if inherit_skills else [],
             "reflection": None,
             "routing": None,
-            "knowledge": None,
+            # B-175 P4 — ``knowledge`` is inherited (see the docstring), unless the
+            # platform allowlist is set and does not list ``knowledge_search``.
+            **({} if _knowledge_allowed(allowed_toolsets) else {"knowledge": None}),
             # B-35 — a worker is a focused executor: it never runs the
             # plan_first dispatch discipline itself, and a plan_first
             # parent's worker drops back to react (re-running the advisory
@@ -400,6 +426,13 @@ def make_child_agent_builder(
             token_usage_kind,
             compute_spec_sha256(record.spec),
             oauth_user_id if user_pool is not None else None,
+            await knowledge_catalog_fingerprint(
+                child_tool_env.knowledge_retriever.store
+                if child_tool_env.knowledge_retriever is not None
+                else None,
+                record.spec,
+                tenant_id=tenant_id,
+            ),
         )
         cached = cache.get(key)
         if cached is not None:
@@ -505,13 +538,20 @@ def make_child_agent_builder(
             http_client=http_client,
             rate_limiter_factory=rate_limiter_factory,
         )
-        cache[key] = (built, clock() + cache_ttl_s)
-        cache.move_to_end(key)
-        while len(cache) > cache_max_size:
-            # LRU eviction — pure abandonment, no close (same rationale as
-            # the expiry branch above).
-            cache.popitem(last=False)
-        _publish_cache_size()
+        # B-175 P4 — a build that froze another catalog than the key read is
+        # served but not cached (``catalog_build_cacheable``).
+        keyed_catalog = (
+            child_tool_env.knowledge_retriever is not None
+            and record.spec.spec.knowledge is not None
+        )
+        if catalog_build_cacheable(key[-1], built, checked=keyed_catalog):
+            cache[key] = (built, clock() + cache_ttl_s)
+            cache.move_to_end(key)
+            while len(cache) > cache_max_size:
+                # LRU eviction — pure abandonment, no close (same rationale as
+                # the expiry branch above).
+                cache.popitem(last=False)
+            _publish_cache_size()
         logger.info(
             "control_plane.subagent.built name=%s version=%s depth=%d",
             name,

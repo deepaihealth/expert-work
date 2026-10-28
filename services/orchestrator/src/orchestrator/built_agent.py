@@ -112,3 +112,8 @@ class BuiltAgent:
     #: control-plane 的「本轮输入」段据此报告哪些变量已绑定(模板里的值照常按形态渲染)。
     #: 带默认值,存量构造点一处都不用改。
     arg_bindings: tuple[ArgBindingSpec, ...] = ()
+    #: B-175 P4 — fingerprint of the knowledge catalog frozen into
+    #: ``system_prompt`` (``None`` without one, ``"unavailable"`` when its read
+    #: failed). The control-plane build caches compare it with their key's catalog
+    #: slot and do not cache a build whose catalog differs from what was keyed.
+    knowledge_catalog_fingerprint: str | None = None

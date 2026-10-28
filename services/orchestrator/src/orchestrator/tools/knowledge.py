@@ -18,8 +18,9 @@ rerank pass fixes ordering precision. See ``STREAM-J-DESIGN.md`` § 12.
 
 from __future__ import annotations
 
+import json
 import logging
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Hashable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Any, Literal
 from uuid import UUID
@@ -27,14 +28,22 @@ from uuid import UUID
 import httpx
 
 from expert_work.common.search.rrf import weighted_rrf_fuse_scored
-from expert_work.persistence import KnowledgeStore
+from expert_work.persistence import KnowledgeRecallError, KnowledgeStore
 from expert_work.protocol import (
     KnowledgeBase,
     KnowledgeChunk,
     RetrievalMethod,
+    ScoredChunk,
     chunk_retrieval_text,
 )
 from orchestrator.tools.error_classifier import GuidedToolError
+from orchestrator.tools.knowledge_catalog import select_bases, with_bases_parameter
+from orchestrator.tools.knowledge_dedup import (
+    drop_copied_children,
+    passage_key,
+    passage_of,
+    repeated_children,
+)
 from orchestrator.tools.knowledge_rerank import (
     RERANK_FAILED,
     RerankError,
@@ -165,10 +174,51 @@ _NO_HITS_NOTICE = (
     "search in their terms can find what this one missed; if that finds nothing either, "
     "the knowledge base does not cover this.]"
 )
+#: B-206 K-22 — results while a base could not be searched at all: the grounding
+#: rule of :data:`_RESULTS_NOTICE`, scoped to the bases that were searched, and no
+#: claim about the others. Constant text: it goes outside the spotlight fence, so
+#: the tenant-written names of those bases go with the fenced results
+#: (:data:`_UNSEARCHED_BASES_LINE`), never here.
+_PARTIAL_RESULTS_NOTICE = (
+    "[knowledge_search: some of the knowledge bases could not be searched (the search "
+    "failed; the result lists them), so these passages come only from the others. They are "
+    "the closest passages found, which is not the same as passages that answer the question. "
+    "What none of them explicitly states is not supported by the knowledge bases that were "
+    "searched, so an answer that infers or guesses it is not grounded in them; the related "
+    "information they do contain can still be mentioned. This says nothing about whether the "
+    "information exists in the knowledge bases that could not be searched. Documents may word "
+    "a fact differently from the query, so a search in their terms can find what this one "
+    "missed.]"
+)
+#: Ends the fenced results of such a search: the bases' names as a JSON list.
+_UNSEARCHED_BASES_LINE = "[knowledge bases that could not be searched: {names}]"
+#: B-206 K-22 / K-8 — nothing found by a search one of whose paths failed (the
+#: keyword path, or the query embedding): :data:`_NO_HITS_NOTICE`'s "does not
+#: cover this" would be a claim the search cannot make.
+_INCOMPLETE_NO_HITS_NOTICE = (
+    "[knowledge_search: this search was incomplete (one of its retrieval paths failed), so "
+    "finding nothing here says nothing about whether the information exists in the knowledge "
+    "base; documents may word a fact differently from the query, so a search in their terms "
+    "can find what this one missed.]"
+)
 _NO_BASES_ADVICE = (
     "None of the knowledge bases this agent is configured with exists, so nothing was "
     "searched: this says nothing about whether the information exists, and the same "
     "search fails the same way until the agent's knowledge base setting is fixed."
+)
+#: B-175 P4 — a search narrowed by ``bases`` found nothing (no hits, or all
+#: below the threshold): only part of the agent's knowledge was searched.
+_NARROWED_NO_HITS_NOTICE = (
+    "[knowledge_search: only the knowledge bases chosen in bases were searched, not every "
+    "knowledge base this agent can search, so this result does not show that the knowledge "
+    "bases lack the information. A search without bases covers all of them, and documents "
+    "may word a fact differently from the query.]"
+)
+#: B-175 P4 — the ``bases`` argument chose only bases that no longer exist.
+_NO_SELECTED_BASES_ADVICE = (
+    "None of the knowledge bases chosen in 'bases' exists, so nothing was searched: this "
+    "says nothing about whether the information exists. Search again without bases to "
+    "search every knowledge base this agent can use."
 )
 
 #: B-206 K-8 —— what a failed query embedding raises when the vendor, not the
@@ -291,6 +341,14 @@ class KnowledgeSearchOutcome:
     ``rerank_threshold_paused`` is set when a base's stored threshold was left
     out because another rerank model scored this search; ``rerank_model`` is the
     model that scored (``None`` without scores, or when the reranker did not say).
+    ``keyword_degraded`` (B-206 K-22) is set when a base's keyword recall failed
+    (:class:`~expert_work.persistence.KnowledgeRecallError`) and the search went
+    on with what the other paths found. ``duplicates_dropped`` (B-206 K-21②)
+    counts passages (a parent, or a child shown as itself) left out as a copy of
+    a better-ranked one (:mod:`orchestrator.tools.knowledge_dedup`) — however
+    many of their children ranked, before the rerank or after it.
+    ``unsearched_bases`` names the bases none of whose recall paths answered
+    (K-22); a search with them only ends ``ok`` — with nothing found it raises.
     """
 
     results: tuple[RetrievedChunk, ...]
@@ -302,6 +360,9 @@ class KnowledgeSearchOutcome:
     rerank_outcome: RerankOutcome | None = None
     rerank_threshold_paused: bool = False
     rerank_model: str | None = None
+    keyword_degraded: bool = False
+    duplicates_dropped: int = 0
+    unsearched_bases: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -341,6 +402,36 @@ _CONFIGURATION_STATES: frozenset[RerankOutcome | None] = frozenset(
 )
 
 
+def _fail_if_unsearched(
+    unsearched: Sequence[str], failures: Mapping[str, KnowledgeRecallError]
+) -> None:
+    """A search that found nothing while a base could not be searched at all
+    (B-206 K-22) raises that base's own failure: "nothing found" would claim the
+    knowledge base lacks what it was never searched for. The error's text reaches
+    the model unfenced, so it stays the driver's; the tenant-written base names
+    go to the log only."""
+    if unsearched:
+        logger.warning(
+            "knowledge.search_failed — no result, and bases %r could not be searched",
+            list(unsearched),
+        )
+        raise failures[unsearched[0]]
+
+
+def _floor_scopes(bases: Sequence[KnowledgeBase], override: float | None) -> dict[UUID, Hashable]:
+    """Each base's rerank floor as configured (B-206 K-21②). Copies are dropped
+    before the rerank only within bases whose floor after it will be the same
+    (:func:`~orchestrator.tools.knowledge_threshold.search_floors`): a copy in a
+    base without a floor must not be dropped for one that then fails another
+    base's. After the floor, the parent pass collapses copies across bases."""
+    return {
+        base.id: (override,)
+        if override is not None
+        else (base.rerank_score_threshold, base.rerank_threshold_model)
+        for base in bases
+    }
+
+
 def default_recall_depth(limit: int) -> int:
     """Production per-path recall depth for a ``limit``-result search:
     ``2 x limit`` clamped to [50, 100] (100 = the reranker's per-request cap)."""
@@ -368,6 +459,9 @@ class KnowledgeRetriever:
     many of the fused candidates it judges, ``rerank_instruction`` whether a
     single view sends :data:`RERANK_INSTRUCTION` — refused with ``dual``, which
     sends none, so no caller believes it instructed a rerank that was not.
+    B-206 K-21② — ``dedup`` drops copies of a better-ranked passage
+    (:mod:`~orchestrator.tools.knowledge_dedup`), children before the rerank and
+    parents after it; off only for the eval's A/B arm.
     """
 
     store: KnowledgeStore
@@ -379,6 +473,7 @@ class KnowledgeRetriever:
     rerank_view: RerankView = DEFAULT_RERANK_VIEW
     rerank_pool: int = DEFAULT_RERANK_POOL
     rerank_instruction: bool = False
+    dedup: bool = True
 
     def __post_init__(self) -> None:
         if self.rerank_instruction and self.rerank_view == "dual":
@@ -460,7 +555,11 @@ class KnowledgeRetriever:
         vector_score: dict[UUID, float] = {}
         keyword_score: dict[UUID, float] = {}
         sources: dict[UUID, set[str]] = {}
+        # K-22 —— the keyword failures, and the bases none of whose paths answered.
+        keyword_failures: dict[str, KnowledgeRecallError] = {}  # by base name
+        unsearched: list[str] = []
         for base in bases:
+            searched = False
             eff_method = method if method is not None else base.retrieval_method
             if query_embedding is None:
                 # K-8 —— no query vector: keywords for every base, a vector-only one
@@ -479,6 +578,7 @@ class KnowledgeRetriever:
                     query_embedding=query_embedding,
                     limit=depth,
                 )
+                searched = True
                 if eff_threshold is not None:
                     vector = [hit for hit in vector if hit.score >= eff_threshold]
                 rankings.append((self.vector_weight, [hit.chunk.id for hit in vector]))
@@ -487,24 +587,40 @@ class KnowledgeRetriever:
                     vector_score[hit.chunk.id] = max(vector_score.get(hit.chunk.id, 0.0), hit.score)
                     sources.setdefault(hit.chunk.id, set()).add("vector")
             if eff_method in (RetrievalMethod.HYBRID, RetrievalMethod.KEYWORD):
-                keyword = await self.store.keyword_search_scored(
-                    tenant_id=tenant_id,
-                    kb_ids=[base.id],
-                    query=query,
-                    limit=depth,
-                )
-                rankings.append((self.keyword_weight, [hit.chunk.id for hit in keyword]))
-                for hit in keyword:
-                    chunk_by_id.setdefault(hit.chunk.id, hit.chunk)
-                    keyword_score[hit.chunk.id] = max(
-                        keyword_score.get(hit.chunk.id, hit.score), hit.score
-                    )
-                    sources.setdefault(hit.chunk.id, set()).add("keyword")
+                keyword = await self._keyword_recall(tenant_id, base.id, query, depth)
+                if isinstance(keyword, KnowledgeRecallError):
+                    keyword_failures[base.name] = keyword
+                else:
+                    searched = True
+                    rankings.append((self.keyword_weight, [hit.chunk.id for hit in keyword]))
+                    for hit in keyword:
+                        chunk_by_id.setdefault(hit.chunk.id, hit.chunk)
+                        keyword_score[hit.chunk.id] = max(
+                            keyword_score.get(hit.chunk.id, hit.score), hit.score
+                        )
+                        sources.setdefault(hit.chunk.id, set()).add("keyword")
+            if not searched:
+                unsearched.append(base.name)
+        keyword_degraded = bool(keyword_failures)
 
         fused_scored = weighted_rrf_fuse_scored(rankings)
         if not fused_scored:
-            return KnowledgeSearchOutcome(results=(), status="no_hits", embedding_degraded=degraded)
+            _fail_if_unsearched(unsearched, keyword_failures)
+            return KnowledgeSearchOutcome(
+                results=(),
+                status="no_hits",
+                embedding_degraded=degraded,
+                keyword_degraded=keyword_degraded,
+            )
         fused = [chunk_by_id[chunk_id] for chunk_id, _score in fused_scored]
+        # K-21② —— before the rerank, so a copy takes none of its slots; the
+        # parent rows read to tell are reused for the results.
+        copied: frozenset[UUID] = frozenset()
+        known: Mapping[UUID, KnowledgeChunk] = {}
+        if self.dedup:
+            fused, copied, known = await self._drop_copied_children(
+                tenant_id, fused, _floor_scopes(bases, rerank_score_threshold)
+            )
         rerank_enabled = rerank if rerank is not None else any(b.rerank_enabled for b in bases)
         ranked = await self._rerank(
             query, fused, limit, tenant_id=tenant_id, enabled=rerank_enabled
@@ -529,8 +645,12 @@ class KnowledgeRetriever:
             rerank_outcome=ranked.outcome,
             rerank_threshold_paused=floors.paused,
             rerank_model=ranked.model if ranked.scores else None,
+            keyword_degraded=keyword_degraded,
+            duplicates_dropped=len(copied),
+            unsearched_bases=tuple(unsearched),
         )
         if not kept:
+            _fail_if_unsearched(unsearched, keyword_failures)
             return below
         scores = _SubScores(
             vector=vector_score,
@@ -538,8 +658,34 @@ class KnowledgeRetriever:
             fused=dict(fused_scored),
             rerank=ranked.scores,
         )
-        results = await self._attribute(tenant_id, kept, limit, scores, sources)
-        return replace(below, results=tuple(results), status="ok")
+        results, parent_copies = await self._attribute(
+            tenant_id, kept, limit, scores, sources, known
+        )
+        return replace(
+            below,
+            results=tuple(results),
+            status="ok",
+            duplicates_dropped=len(copied) + parent_copies,
+        )
+
+    async def _keyword_recall(
+        self, tenant_id: UUID, kb_id: UUID, query: str, depth: int
+    ) -> list[ScoredChunk] | KnowledgeRecallError:
+        """The base's keyword hits — or, when the database failed the query (its
+        statement timeout, a lost connection; B-206 K-22), the failure: the
+        search goes on with what the other paths find and says so, like K-8.
+        Anything else (a bug) propagates."""
+        try:
+            return await self.store.keyword_search_scored(
+                tenant_id=tenant_id, kb_ids=[kb_id], query=query, limit=depth
+            )
+        except KnowledgeRecallError as exc:
+            logger.warning(
+                "knowledge.keyword_degraded — keyword recall failed, "
+                "keeping the other paths' results",
+                exc_info=True,
+            )
+            return exc
 
     async def _embed_query(self, query: str, tenant_id: UUID) -> tuple[float, ...] | None:
         """The query's vector — ``None`` when the embedding vendor failed (B-206
@@ -684,38 +830,114 @@ class KnowledgeRetriever:
         limit: int,
         scores: _SubScores,
         sources: Mapping[UUID, set[str]],
-    ) -> list[RetrievedChunk]:
+        known: Mapping[UUID, KnowledgeChunk],
+    ) -> tuple[list[RetrievedChunk], int]:
         """The ranked ``chunks`` (children) as the best ``limit`` parents, each
-        with its parent's text and its source file name (B-206 K-1)."""
-        hits = collapse_to_parents(chunks, limit)
-        parents = await self._read_parents(tenant_id, hits)
+        with its parent's text and its source file name (B-206 K-1), and how many
+        parents were left out as a copy of a better-ranked one (K-21②).
+        ``known`` are parent rows already read."""
+        picked, duplicates = await self._pick_parents(
+            tenant_id, collapse_to_parents(chunks), limit, known
+        )
         # One batched lookup for every source document instead of a per-document
         # get_document (an N+1 over the result set — up to _MAX_LIMIT docs).
-        doc_ids = {hit.best.document_id for hit in hits}
+        doc_ids = {hit.best.document_id for hit, _parent in picked}
         docs = await self.store.get_documents(tenant_id=tenant_id, document_ids=list(doc_ids))
         filenames: dict[UUID, str] = {
             doc_id: (docs[doc_id].filename if doc_id in docs else "(unknown)") for doc_id in doc_ids
         }
-        return [
-            _retrieved(
-                hit,
-                parents.get(hit.best.parent_chunk_id) if hit.best.parent_chunk_id else None,
-                filenames[hit.best.document_id],
-                scores,
-                sources,
-            )
-            for hit in hits
+        results = [
+            _retrieved(hit, parent, filenames[hit.best.document_id], scores, sources)
+            for hit, parent in picked
         ]
+        return results, duplicates
+
+    async def _pick_parents(
+        self,
+        tenant_id: UUID,
+        hits: Sequence[ParentHit],
+        limit: int,
+        known: Mapping[UUID, KnowledgeChunk],
+    ) -> tuple[list[tuple[ParentHit, KnowledgeChunk | None]], int]:
+        """The first ``limit`` of ``hits`` with their parent rows (``None`` for
+        none) — with :attr:`dedup`, skipping a hit whose passage (its parent, or
+        the child itself without one) copies an earlier one's — and how many
+        were skipped. Rows not in ``known`` are read ``limit`` hits at a time,
+        so a search with no copies reads at most ``limit`` of them, once."""
+        picked: list[tuple[ParentHit, KnowledgeChunk | None]] = []
+        rows = dict(known)
+        seen: set[bytes] = set()
+        duplicates = 0
+        start = 0
+        while len(picked) < limit and start < len(hits):
+            window = hits[start : start + limit]
+            start += len(window)
+            missing = [
+                pid
+                for hit in window
+                if (pid := hit.best.parent_chunk_id) is not None and pid not in rows
+            ]
+            rows.update(await self._read_parents(tenant_id, missing))
+            for hit in window:
+                if len(picked) == limit:
+                    break
+                pid = hit.best.parent_chunk_id
+                parent = rows.get(pid) if pid is not None else None
+                if self.dedup:
+                    shown = parent if parent is not None else hit.best
+                    key = passage_key(shown.heading_path, shown.content)
+                    if key in seen:
+                        duplicates += 1
+                        continue
+                    seen.add(key)
+                picked.append((hit, parent))
+        return picked, duplicates
+
+    async def _drop_copied_children(
+        self,
+        tenant_id: UUID,
+        chunks: Sequence[KnowledgeChunk],
+        scopes: Mapping[UUID, Hashable],
+    ) -> tuple[list[KnowledgeChunk], frozenset[UUID], dict[UUID, KnowledgeChunk]]:
+        """K-21② before the rerank: drop the copied children
+        (:func:`~orchestrator.tools.knowledge_dedup.drop_copied_children`) from the
+        shortest prefix of ``chunks`` that still fills :attr:`rerank_pool` once
+        they are gone, grown a pool's length at a time; the rest is left as it is
+        (the reranker never sees it, and the parent pass collapses it). Parent
+        rows are read only for that prefix's children whose own text repeats —
+        none when nothing repeats — and returned for the results to reuse. The
+        passages counted are those with no child left anywhere in ``chunks``."""
+        step = max(1, self.rerank_pool)
+        parents: dict[UUID, KnowledgeChunk] = {}
+        asked: set[UUID] = set()
+        end = 0
+        while True:
+            end = min(len(chunks), end + step)
+            prefix = chunks[:end]
+            ids = [
+                pid
+                for chunk in repeated_children(prefix, scopes)
+                if (pid := chunk.parent_chunk_id) is not None and pid not in asked
+            ]
+            asked.update(ids)
+            parents.update(await self._read_parents(tenant_id, ids))
+            kept, copied = drop_copied_children(prefix, scopes, parents)
+            if len(kept) >= step or end == len(chunks):
+                rest = chunks[end:]
+                return (
+                    [*kept, *rest],
+                    copied - {passage_of(chunk) for chunk in rest},
+                    parents,
+                )
 
     async def _read_parents(
-        self, tenant_id: UUID, hits: Sequence[ParentHit]
+        self, tenant_id: UUID, ids: Sequence[UUID]
     ) -> dict[UUID, KnowledgeChunk]:
-        """The parent rows of ``hits`` by id, in one read (none when no hit has
-        one). A parent that does not come back leaves its hit child as the result."""
-        ids = [pid for hit in hits if (pid := hit.best.parent_chunk_id) is not None]
+        """The parent rows ``ids`` by id, in one read (none for no ids). A
+        parent that does not come back leaves its hit child as the result."""
         if not ids:
             return {}
-        rows = await self.store.get_chunks(tenant_id=tenant_id, chunk_ids=ids)
+        rows = await self.store.get_chunks(tenant_id=tenant_id, chunk_ids=list(dict.fromkeys(ids)))
         return {row.id: row for row in rows}
 
 
@@ -801,6 +1023,12 @@ class KnowledgeSearchTool:
 
     @property
     def spec(self) -> ToolSpec:
+        # B-175 P4 — 2+ bases add the optional ``bases`` argument (handles from
+        # the system prompt's knowledge catalog); 0 / 1 keep this schema as is.
+        return with_bases_parameter(self._base_spec, self.knowledge_base_refs)
+
+    @property
+    def _base_spec(self) -> ToolSpec:
         return ToolSpec(
             name="knowledge_search",
             description=(
@@ -835,31 +1063,47 @@ class KnowledgeSearchTool:
             raise ToolBlockedError(msg)
         query = self._require_query(args)
         limit = _coerce_limit(args.get("limit"))
+        # B-175 P4 — only this agent's refs can be chosen; anything else is
+        # refused before searching.
+        base_names = select_bases(self.knowledge_base_refs, args.get("bases"))
+        narrowed = base_names != self.knowledge_base_refs
         # A failed search propagates as-is: the classifier keeps a timeout or
         # outage ``transient``, and its advice already says a failure is no
         # evidence about the target.
         outcome = await self.retriever.search_detailed(
             tenant_id=ctx.tenant_id,
-            base_names=self.knowledge_base_refs,
+            base_names=base_names,
             query=query,
             limit=limit,
         )
         if outcome.status == "no_bases":
-            msg = "none of this agent's knowledge bases exists: " + ", ".join(
-                self.knowledge_base_refs
-            )
+            if narrowed:
+                msg = "none of the selected knowledge bases exists: " + ", ".join(base_names)
+                raise GuidedToolError(msg, advice=_NO_SELECTED_BASES_ADVICE)
+            msg = "none of this agent's knowledge bases exists: " + ", ".join(base_names)
             raise GuidedToolError(msg, advice=_NO_BASES_ADVICE)
         meta: dict[str, Any] = {"hits": len(outcome.results), "status": outcome.status}
+        if narrowed:
+            meta["bases"] = list(base_names)
         if outcome.rerank_degraded:
             meta["rerank_degraded"] = True
         if outcome.embedding_degraded:
             meta["embedding_degraded"] = True
+        if outcome.keyword_degraded:
+            meta["keyword_degraded"] = True
         if outcome.rerank_dropped:
             meta["rerank_dropped"] = outcome.rerank_dropped
         if outcome.rerank_outcome not in (None, "ok"):
             meta["rerank_outcome"] = outcome.rerank_outcome
         if outcome.rerank_threshold_paused:
             meta["rerank_threshold_paused"] = True
+        if narrowed and not outcome.results:
+            return _narrowed_miss(outcome, base_names, self.knowledge_base_refs, meta)
+        no_hits_notice = (
+            _INCOMPLETE_NO_HITS_NOTICE
+            if outcome.keyword_degraded or outcome.embedding_degraded
+            else _NO_HITS_NOTICE
+        )
         if outcome.status == "below_threshold":
             return ToolResult(
                 content=(
@@ -868,16 +1112,22 @@ class KnowledgeSearchTool:
                     "enough]"
                 ),
                 meta=meta,
-                notice=_NO_HITS_NOTICE,
+                notice=no_hits_notice,
             )
         if not outcome.results:
             return ToolResult(
                 content="[no relevant knowledge found for the query]",
                 meta=meta,
-                notice=_NO_HITS_NOTICE,
+                notice=no_hits_notice,
             )
+        content = _format_results(outcome.results)
+        if not outcome.unsearched_bases:
+            return ToolResult(content=content, meta=meta, notice=_RESULTS_NOTICE)
+        names = json.dumps(list(outcome.unsearched_bases), ensure_ascii=False)
         return ToolResult(
-            content=_format_results(outcome.results), meta=meta, notice=_RESULTS_NOTICE
+            content=f"{content}\n\n{_UNSEARCHED_BASES_LINE.format(names=names)}",
+            meta=meta,
+            notice=_PARTIAL_RESULTS_NOTICE,
         )
 
     def _require_query(self, args: Mapping[str, Any]) -> str:
@@ -886,6 +1136,32 @@ class KnowledgeSearchTool:
             msg = "knowledge_search requires a non-empty 'query' string"
             raise ValueError(msg)
         return raw.strip()
+
+
+def _narrowed_miss(
+    outcome: KnowledgeSearchOutcome,
+    searched: Sequence[str],
+    refs: Sequence[str],
+    meta: dict[str, Any],
+) -> ToolResult:
+    """B-175 P4 — a search narrowed by ``bases`` that returned nothing. The
+    other bases were not searched, so unlike :data:`_NO_HITS_NOTICE` nothing
+    here says the knowledge bases lack the fact. Base names (tenant text) stay
+    in the fenced content; the trusted notice names none."""
+    why = (
+        f"{outcome.candidates} passages were retrieved but none was relevant enough"
+        if outcome.status == "below_threshold"
+        else "nothing was found"
+    )
+    skipped = ", ".join(ref for ref in refs if ref not in searched)
+    return ToolResult(
+        content=(
+            f"[no relevant knowledge found for the query in the selected knowledge bases "
+            f"({', '.join(searched)}): {why}; not searched: {skipped}]"
+        ),
+        meta=meta,
+        notice=_NARROWED_NO_HITS_NOTICE,
+    )
 
 
 def _retrieved(

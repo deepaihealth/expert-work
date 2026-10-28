@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Collection, Sequence
 from datetime import UTC, datetime
 from uuid import UUID, uuid4
 
@@ -17,6 +17,7 @@ import pytest
 
 from control_plane.knowledge.recovery import KnowledgeIngestRecoveryWorker
 from expert_work.persistence import InMemoryKnowledgeStore
+from expert_work.persistence.knowledge.base import SwitchOffRecord
 from expert_work.persistence.rls import bypass_rls_var, current_tenant_id_var
 from expert_work.protocol import DocumentStatus, IngestErrorCode, KnowledgeChunk
 from orchestrator.llm import FakeEmbedder
@@ -149,6 +150,7 @@ class _ConcurrentDeleteStore(_RecordingStore):
         generation: int | None = None,
         expect_status: DocumentStatus = DocumentStatus.PROCESSING,
         chunk_params_hash: str | None = None,
+        switch_offs: Collection[SwitchOffRecord] = (),
     ) -> bool:
         await self.delete_document(tenant_id=tenant_id, document_id=document_id)
         raise KeyError(document_id)
@@ -166,6 +168,7 @@ class _FailingReplaceStore(_RecordingStore):
         generation: int | None = None,
         expect_status: DocumentStatus = DocumentStatus.PROCESSING,
         chunk_params_hash: str | None = None,
+        switch_offs: Collection[SwitchOffRecord] = (),
     ) -> bool:
         raise RuntimeError("replace_chunks exploded")
 
@@ -375,6 +378,7 @@ class _ContextRecordingStore(InMemoryKnowledgeStore):
         generation: int | None = None,
         expect_status: DocumentStatus = DocumentStatus.PROCESSING,
         chunk_params_hash: str | None = None,
+        switch_offs: Collection[SwitchOffRecord] = (),
     ) -> bool:
         self.seen.append((tenant_id, current_tenant_id_var.get(), bypass_rls_var.get()))
         return await super().replace_chunks(
@@ -384,6 +388,7 @@ class _ContextRecordingStore(InMemoryKnowledgeStore):
             generation=generation,
             expect_status=expect_status,
             chunk_params_hash=chunk_params_hash,
+            switch_offs=switch_offs,
         )
 
 

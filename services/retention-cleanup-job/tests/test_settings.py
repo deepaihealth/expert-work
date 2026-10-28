@@ -56,6 +56,12 @@ def test_upload_retention_days_rejects_zero(monkeypatch: pytest.MonkeyPatch) -> 
         RetentionCleanupSettings(_env_file=None)  # type: ignore[call-arg]
 
 
+def test_knowledge_revision_orphans_are_kept_30_days() -> None:
+    """B-175 P3-PR2 —— 重新入库没能套回去的人工修改,修订留 30 天(与检索记录同一期限)。"""
+    settings = RetentionCleanupSettings(_env_file=None)  # type: ignore[call-arg]
+    assert settings.knowledge_revision_orphan_days == 30
+
+
 def test_knowledge_task_retention_defaults_to_90_days() -> None:
     """B-175 L2-PR3 —— 知识库任务行收尾后留 90 天。"""
     settings = RetentionCleanupSettings(_env_file=None)  # type: ignore[call-arg]
