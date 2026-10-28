@@ -10,7 +10,7 @@
  * disabled — the review tag still opens the (read-only) review.
  */
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
-import { render, screen, waitFor, within } from "@testing-library/react";
+import { act, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { App } from "antd";
 import i18n from "../../../i18n";
@@ -103,6 +103,10 @@ describe("DocumentsTab — batch actions (B-175 P3-PR3)", () => {
     );
     expect(await screen.findByText("已停用 2 份。")).toBeInTheDocument();
     await waitFor(() => expect(list).toHaveBeenCalledTimes(2));
+    // The refresh after a batch reads each row's review again.
+    expect(list).toHaveBeenLastCalledWith(BASE_NAME, { limit: 50, offset: 0 }, undefined, {
+      withReview: true,
+    });
     expect(screen.queryByTestId("doc-batch-count")).toBeNull();
     expect(screen.getByRole("checkbox", { name: "选择 a.pdf" })).not.toBeChecked();
   });
@@ -167,6 +171,80 @@ describe("DocumentsTab — batch actions (B-175 P3-PR3)", () => {
     expect(screen.getByTestId("doc-batch-count")).toBeInTheDocument();
     await userEvent.click(screen.getByTitle("2"));
     await waitFor(() => expect(screen.queryByTestId("doc-batch-count")).toBeNull());
+  });
+});
+
+describe("DocumentsTab — review counts and the poll (B-175 P3-PR3 review)", () => {
+  const P = doc("11111111-0000-0000-0000-00000000000c", "p.pdf", {
+    status: "processing",
+    review: { inherited: 1, unapplied: 2 },
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  /** The 5-second poll runs while an ingest is in progress. */
+  async function tick() {
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(5_000);
+    });
+  }
+
+  it("explicit loads ask for review; the poll does not and keeps the row's tag", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    const bare = (d: knowledgeSdk.KnowledgeDocument) => ({ ...d, review: undefined });
+    const list = vi
+      .spyOn(knowledgeSdk, "listDocuments")
+      .mockResolvedValueOnce(docPage([P, B]))
+      .mockResolvedValue(docPage([bare(P), bare(B)]));
+    renderTab();
+
+    expect(await screen.findByTestId(`doc-review-${P.id}`)).toHaveTextContent("待复核 3");
+    expect(list).toHaveBeenLastCalledWith(BASE_NAME, { limit: 50, offset: 0 }, undefined, {
+      withReview: true,
+    });
+
+    await tick();
+    await waitFor(() => expect(list).toHaveBeenCalledTimes(2));
+    expect(list.mock.calls[1][3]).toEqual({ withReview: false });
+    expect(screen.getByTestId(`doc-review-${P.id}`)).toHaveTextContent("待复核 3");
+  });
+
+  it("a refresh keeps only the selected rows still shown", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    vi.spyOn(knowledgeSdk, "listDocuments")
+      .mockResolvedValueOnce(docPage([P, B]))
+      .mockResolvedValue(docPage([P]));
+    renderTab();
+
+    await selectRows("b.pdf");
+    expect(screen.getByTestId("doc-batch-count")).toHaveTextContent("已选 1 份");
+    await tick();
+    await waitFor(() => expect(screen.queryByTestId("doc-batch-count")).toBeNull());
+  });
+
+  it("closing the drawer reads the rows again with their review", async () => {
+    const list = vi.spyOn(knowledgeSdk, "listDocuments").mockResolvedValue(docPage([A]));
+    vi.spyOn(maintenanceSdk, "listPassages").mockResolvedValue({
+      passages: [],
+      figure_ids: [],
+      total: 0,
+      offset: 0,
+      limit: 20,
+    });
+    vi.spyOn(maintenanceSdk, "getUnappliedEdits").mockResolvedValue({
+      inherited: [],
+      unapplied: [],
+    });
+    renderTab();
+    await userEvent.click(await screen.findByTestId(`doc-chunks-${A.id}`));
+    await screen.findByTestId("kb-passage-list");
+    await userEvent.click(screen.getByRole("button", { name: "Close" }));
+    await waitFor(() => expect(list).toHaveBeenCalledTimes(2));
+    expect(list).toHaveBeenLastCalledWith(BASE_NAME, { limit: 50, offset: 0 }, undefined, {
+      withReview: true,
+    });
   });
 });
 

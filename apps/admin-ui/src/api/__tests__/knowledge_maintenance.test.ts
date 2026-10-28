@@ -9,6 +9,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import type { AxiosAdapter, InternalAxiosRequestConfig } from "axios";
 
 import { ApiError, apiClient } from "../client";
+import { listDocuments } from "../knowledge";
 import {
   addPassage,
   batchDeleteDocuments,
@@ -124,6 +125,18 @@ describe("knowledge maintenance SDK — requests", () => {
     const calls = captureAdapter({ discarded: 2 });
     expect(await discardUnappliedEdits("kb 1", "d1")).toBe(2);
     expect(calls[0]).toMatchObject({ method: "DELETE", url: `${DOC}/unapplied-edits` });
+  });
+
+  it("asks the document list for each row's review only when told to", async () => {
+    const calls = captureAdapter({ documents: [], total: 0, offset: 0, limit: 50 });
+    await listDocuments("kb 1", { limit: 50, offset: 0 }, TENANT, { withReview: true });
+    await listDocuments("kb 1", { limit: 50, offset: 0 }, TENANT);
+    await listDocuments("kb 1", { limit: 50, offset: 0 }, undefined, { withReview: false });
+    expect(calls.map((c) => c.params)).toEqual([
+      { limit: 50, offset: 0, with_review: true, tenant_id: TENANT },
+      { limit: 50, offset: 0, tenant_id: TENANT },
+      { limit: 50, offset: 0 },
+    ]);
   });
 
   it("posts batch actions, batch deletes and the stale re-ingest", async () => {

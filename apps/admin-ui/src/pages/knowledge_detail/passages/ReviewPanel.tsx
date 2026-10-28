@@ -21,13 +21,13 @@ import { useTranslation } from "react-i18next";
 import { errMessage } from "../../../api/client";
 import {
   discardUnappliedEdits,
+  getUnappliedEdits,
   type Passage,
   type PassageRevision,
   type UnappliedEdits,
 } from "../../../api/knowledge_maintenance";
-import { ReadonlyTooltip } from "../../../components/ReadonlyTooltip";
 import { HeadingPath } from "../HeadingPath";
-import { PassageCard } from "./PassageCard";
+import { PassageCard, WriteGate } from "./PassageCard";
 import { usePassageSwitch } from "./usePassageSwitch";
 
 const { Paragraph, Text } = Typography;
@@ -92,41 +92,63 @@ function UnappliedRow({ record }: { record: PassageRevision }): ReactElement {
   );
 }
 
+/** 「全部丢弃」: first reads what is there now, then asks with that count
+ *  (``confirming``: the count asked about, while the confirm is open). */
 function DiscardButton({
-  count,
+  confirming,
   readonly,
   canDelete,
   busy,
+  working,
+  onAsk,
   onConfirm,
+  onDismiss,
 }: {
-  count: number;
+  confirming: number | null;
   readonly: boolean;
   canDelete: boolean;
+  /** The document is being ingested: no writes. */
   busy: boolean;
+  working: boolean;
+  onAsk: () => void;
   onConfirm: () => void;
+  onDismiss: () => void;
 }): ReactElement {
   const { t } = useTranslation();
+  const blocked = readonly || busy || !canDelete;
   const button = (
     <Popconfirm
-      title={t("kb_maintenance.review_discard_confirm_title", { n: count })}
+      open={confirming !== null}
+      onOpenChange={(open) => {
+        if (!open) onDismiss();
+      }}
+      title={t("kb_maintenance.review_discard_confirm_title", { n: confirming ?? 0 })}
       description={t("kb_maintenance.review_discard_confirm_body")}
       okText={t("kb_maintenance.review_discard")}
       okButtonProps={{ danger: true }}
       onConfirm={onConfirm}
-      disabled={readonly || !canDelete}
+      onCancel={onDismiss}
+      disabled={blocked}
     >
       <Button
         size="small"
         danger
-        loading={busy}
-        disabled={readonly || !canDelete}
+        loading={working}
+        disabled={blocked}
+        onClick={onAsk}
         data-testid="kb-review-discard"
       >
         {t("kb_maintenance.review_discard")}
       </Button>
     </Popconfirm>
   );
-  if (readonly) return <ReadonlyTooltip on>{button}</ReadonlyTooltip>;
+  if (readonly || busy) {
+    return (
+      <WriteGate readonly={readonly} busy={busy}>
+        {button}
+      </WriteGate>
+    );
+  }
   if (!canDelete) {
     return (
       <Tooltip title={t("kb_maintenance.needs_admin")}>
@@ -159,12 +181,35 @@ export function ReviewPanel({
   const { message } = App.useApp();
   const { switching, switchPassage } = usePassageSwitch(baseName, documentId, onChanged);
   const [discarding, setDiscarding] = useState(false);
+  /** The count the open confirm asks about (read just before asking). */
+  const [confirming, setConfirming] = useState<number | null>(null);
 
   const settle = async (passage: Passage, enabled: boolean) => {
     if ((await switchPassage(passage, enabled)) !== null) onChanged();
   };
 
+  // The panel may be minutes old (a re-ingest adds to it, someone else may
+  // have discarded): ask about what is there now.
+  const askDiscard = async () => {
+    setDiscarding(true);
+    try {
+      const now = await getUnappliedEdits(baseName, documentId, readScope);
+      if (now.unapplied.length === 0) {
+        message.info(t("kb_maintenance.review_discard_nothing"));
+        onChanged();
+        return;
+      }
+      if (now.unapplied.length !== review.unapplied.length) onChanged();
+      setConfirming(now.unapplied.length);
+    } catch (err) {
+      message.error(errMessage(err));
+    } finally {
+      setDiscarding(false);
+    }
+  };
+
   const discard = async () => {
+    setConfirming(null);
     setDiscarding(true);
     try {
       await discardUnappliedEdits(baseName, documentId);
@@ -220,11 +265,14 @@ export function ReviewPanel({
               {t("kb_maintenance.review_unapplied_title", { n: review.unapplied.length })}
             </Text>
             <DiscardButton
-              count={review.unapplied.length}
+              confirming={confirming}
               readonly={readonly}
               canDelete={canDelete}
-              busy={discarding}
+              busy={busy}
+              working={discarding}
+              onAsk={() => void askDiscard()}
               onConfirm={() => void discard()}
+              onDismiss={() => setConfirming(null)}
             />
           </Space>
           <Text type="secondary" style={{ display: "block", fontSize: 12, margin: "4px 0 8px" }}>

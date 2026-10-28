@@ -25,6 +25,7 @@ import pytest
 from alembic import command
 from alembic.config import Config
 from sqlalchemy import event
+from sqlalchemy import text as sql_text
 from sqlalchemy.ext.asyncio import create_async_engine
 from testcontainers.postgres import PostgresContainer
 
@@ -1397,7 +1398,12 @@ async def test_list_chunks_pages_by_position(store: KnowledgeStore) -> None:
 
 
 async def _edit(
-    store: KnowledgeStore, doc: _Doc, passage_id: UUID, revision: int, text: str
+    store: KnowledgeStore,
+    doc: _Doc,
+    passage_id: UUID,
+    revision: int,
+    text: str,
+    heading: tuple[str, ...] = (),
 ) -> None:
     written = await store.replace_passage(
         tenant_id=doc.tenant,
@@ -1405,11 +1411,40 @@ async def _edit(
         passage_id=passage_id,
         expected_revision=revision,
         content=text,
-        heading_path=(),
-        children=_kids(text, heading=()),
+        heading_path=heading,
+        children=_kids(text, heading=heading),
         edited_by="user-a",
     )
     assert written is not None
+
+
+async def _add(store: KnowledgeStore, doc: _Doc, text: str) -> UUID:
+    added = await store.add_passage(
+        tenant_id=doc.tenant,
+        document_id=doc.id,
+        content=text,
+        heading_path=(),
+        children=_kids(text, heading=()),
+        edited_by="user-b",
+    )
+    assert added is not None
+    return added.id
+
+
+async def _keep_only(
+    store: KnowledgeStore,
+    p: _Passages,
+    *extra: KnowledgeChunk,
+    switch_offs: tuple[SwitchOffRecord, ...] = (),
+) -> None:
+    """Rewrite the document's chunks as a re-ingest leaving all but its second
+    passage (as it stands) behind, plus ``extra`` rows and switch-off records."""
+    scope: dict[str, Any] = {"tenant_id": p.doc.tenant, "document_id": p.doc.id}
+    kept = await store.get_passage(**scope, passage_id=p.second.id)
+    assert kept is not None
+    assert await store.replace_chunks(
+        **scope, chunks=[*_without_vectors(kept), *extra], switch_offs=switch_offs
+    )
 
 
 async def test_count_review_items(store: KnowledgeStore) -> None:
@@ -1417,34 +1452,34 @@ async def test_count_review_items(store: KnowledgeStore) -> None:
     by inheritance (a passage once, not each of its chunks; a person's own
     switch-off is not counted) and exactly what ``list_unapplied_revisions``
     lists — an edit whose passage is gone (one restored to its machine text
-    is not), an edit whose passage is back at an older revision, a switch-off
-    no passage holds (one placed is not). Documents with nothing to review,
-    another tenant's and unknown ids are absent."""
+    is not; one only of the breadcrumb is; one added by hand is), an edit
+    whose passage is back at an older revision (at its latest it is not), a
+    switch-off no passage holds (one placed is not; a gone passage's record
+    is not taken for its text history). Documents with nothing to review,
+    another tenant's (with an inherited passage, an unapplied edit and a lost
+    switch-off) and unknown ids are absent."""
     p = await _passages(store)
     doc, t = p.doc, p.doc.tenant
-    await _edit(store, doc, p.first.id, 1, "改")
+    await _edit(store, doc, p.first.id, 1, "改")  # gone, edited: counted
     await _edit(store, doc, p.lone.id, 1, "樱桃")
-    await _edit(store, doc, p.lone.id, 2, "樱桃 果酱")  # back to its machine text
+    await _edit(store, doc, p.lone.id, 2, "樱桃 果酱")  # gone, back to its machine text: not
+    await _edit(store, doc, p.second.id, 1, "香蕉")  # kept at its latest revision: not
+    added = await _add(store, doc, "葡萄 汁")  # gone, added by hand: counted
     off = {"enabled": False, "disabled_reason": "inherited"}
     held = doc.parent(5, "葡萄 干\n\n橙子 汁").model_copy(update=off)
-    mine = doc.child(9, "面包 干", enabled=False).model_copy(update={"disabled_reason": "manual"})
-    kept = await store.get_passage(tenant_id=t, document_id=doc.id, passage_id=p.second.id)
-    assert kept is not None
-    rows = [
-        *_without_vectors(kept),
+    await _keep_only(
+        store,
+        p,
         held,
         doc.child(7, "葡萄 干", parent=held).model_copy(update=off),
         doc.child(8, "橙子 汁", parent=held).model_copy(update=off),
-        mine,
-    ]
-    assert await store.replace_chunks(
-        tenant_id=t,
-        document_id=doc.id,
-        chunks=rows,
-        switch_offs=[
+        doc.child(9, "面包 干", enabled=False).model_copy(update={"disabled_reason": "manual"}),
+        switch_offs=(
             SwitchOffRecord(uuid4(), "葡萄 干", (), placed=True, new=True),
-            SwitchOffRecord(uuid4(), "西瓜 皮", (), placed=False, new=True),
-        ],
+            # Lost (counted) — and of the restored passage, whose text history
+            # it must not be read as: its text differs from that history's first.
+            SwitchOffRecord(p.lone.id, "西瓜 皮", (), placed=False, new=True),
+        ),
     )
 
     # Back at an older revision: the edit is listed, the passage is there.
@@ -1452,23 +1487,64 @@ async def test_count_review_items(store: KnowledgeStore) -> None:
     await _edit(store, back.doc, back.first.id, 1, "改")
     await _write(store, back.doc, [back.first, *back.children])
 
-    quiet = await _passages(store, t, name="quiet.md")
-    theirs = await _doc(store, name="theirs.md")
-    stray = theirs.parent(0, "苹果").model_copy(update=off)
-    await _write(store, theirs, [stray])
+    # Only the breadcrumb edited, then gone: counted.
+    crumb = await _passages(store, t, name="crumb.md")
+    await _edit(store, crumb.doc, crumb.lone.id, 1, "樱桃 果酱", heading=("新标题",))
+    await _keep_only(store, crumb)
 
-    counts = await store.count_review_items(
-        tenant_id=t, document_ids=[doc.id, back.doc.id, quiet.doc.id, theirs.id, uuid4()]
+    quiet = await _passages(store, t, name="quiet.md")
+
+    # Another tenant's document with everything that would count.
+    theirs = await _passages(store, name="theirs.md")
+    await _edit(store, theirs.doc, theirs.first.id, 1, "改")
+    stray = theirs.doc.parent(5, "苹果").model_copy(update=off)
+    await _keep_only(
+        store,
+        theirs,
+        stray,
+        switch_offs=(SwitchOffRecord(uuid4(), "西瓜 皮", (), placed=False, new=True),),
     )
 
+    asked = [doc.id, back.doc.id, crumb.doc.id, quiet.doc.id, theirs.doc.id, uuid4()]
+    counts = await store.count_review_items(tenant_id=t, document_ids=asked)
+
     assert {d: (c.inherited, c.unapplied) for d, c in counts.items()} == {
-        doc.id: (1, 2),
+        doc.id: (1, 3),
         back.doc.id: (0, 1),
+        crumb.doc.id: (0, 1),
     }
-    for listed in (doc, back.doc):
+    unapplied = await store.list_unapplied_revisions(tenant_id=t, document_id=doc.id)
+    assert sorted((r.passage_id, r.revision) for r in unapplied) == sorted(
+        [(p.first.id, 2), (added, 1), (p.lone.id, 0)]
+    )
+    for listed in (doc, back.doc, crumb.doc):
         unapplied = await store.list_unapplied_revisions(tenant_id=t, document_id=listed.id)
         assert counts[listed.id].unapplied == len(unapplied)
     assert await store.count_review_items(tenant_id=t, document_ids=[]) == {}
-    assert await store.count_review_items(tenant_id=theirs.tenant, document_ids=[theirs.id]) == {
-        theirs.id: ReviewCounts(inherited=1, unapplied=0)
-    }
+    mine = await store.count_review_items(tenant_id=theirs.doc.tenant, document_ids=asked)
+    assert mine == {theirs.doc.id: ReviewCounts(inherited=1, unapplied=2)}
+
+
+async def test_count_review_items_reads_the_tenants_passage_rows_only(
+    store: KnowledgeStore,
+) -> None:
+    """SQL only (a row the store API never writes): a chunk row of another
+    tenant that carries a gone passage's id and document is not that passage
+    coming back — the edit stays counted as left behind."""
+    if not isinstance(store, SqlKnowledgeStore):
+        pytest.skip("the row is written past the store API")
+    p = await _passages(store)
+    await _edit(store, p.doc, p.lone.id, 1, "樱桃")
+    await _keep_only(store, p)
+    async with store._sf() as session:
+        await session.execute(
+            sql_text(
+                "INSERT INTO knowledge_chunk (id, tenant_id, kb_id, document_id, chunk_index,"
+                " content, chunk_type, revision) VALUES (:id, :tenant, :kb, :doc, 99, 'x',"
+                " 'parent', 9)"
+            ),
+            {"id": p.lone.id, "tenant": uuid4(), "kb": p.doc.kb_id, "doc": p.doc.id},
+        )
+        await session.commit()
+    counts = await store.count_review_items(tenant_id=p.doc.tenant, document_ids=[p.doc.id])
+    assert counts == {p.doc.id: ReviewCounts(inherited=0, unapplied=1)}

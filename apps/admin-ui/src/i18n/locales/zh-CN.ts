@@ -531,6 +531,7 @@ const zhCN: TranslationKeys = {
     review_discard_confirm_title: "丢弃这 {{n}} 条没套回去的内容？",
     review_discard_confirm_body: "会删除它们的修订历史，不能恢复。",
     review_discarded: "已丢弃没套回去的内容。",
+    review_discard_nothing: "已经没有可丢弃的内容（可能已被处理），已刷新。",
     needs_admin: "需要租户管理员权限：这会删除数据。",
     doc_disabled: "已停用",
     doc_disabled_hint: "检索不到这份文档；分段仍保留，启用后恢复。",

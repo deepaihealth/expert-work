@@ -810,6 +810,7 @@ describe("KnowledgeDetail — cross-tenant W4 (review C-2)", () => {
         "support-docs",
         { limit: 50, offset: 0 },
         FOREIGN_TENANT,
+        { withReview: true },
       ),
     );
   });
@@ -1240,13 +1241,17 @@ describe("DocumentsTab — upload queue (B-175 L3)", () => {
     renderDetail();
     await waitFor(() => expect(screen.getByText("doc-0.pdf")).toBeInTheDocument());
 
-    expect(listSpy).toHaveBeenLastCalledWith("support-docs", { limit: 50, offset: 0 }, undefined);
+    expect(listSpy).toHaveBeenLastCalledWith("support-docs", { limit: 50, offset: 0 }, undefined, {
+      withReview: true,
+    });
     expect(screen.getAllByText(/^doc-\d+\.pdf$/)).toHaveLength(50);
     const pager = screen.getByTestId("doc-table-pagination");
     expect(pager).toHaveTextContent(/60/);
     await userEvent.click(within(pager).getByTitle("2"));
     await waitFor(() => expect(screen.getByText("doc-59.pdf")).toBeInTheDocument());
-    expect(listSpy).toHaveBeenLastCalledWith("support-docs", { limit: 50, offset: 50 }, undefined);
+    expect(listSpy).toHaveBeenLastCalledWith("support-docs", { limit: 50, offset: 50 }, undefined, {
+      withReview: true,
+    });
     expect(screen.getAllByText(/^doc-\d+\.pdf$/)).toHaveLength(10);
   }, FULL_PAGE_TIMEOUT_MS);
 
@@ -1276,7 +1281,9 @@ describe("DocumentsTab — upload queue (B-175 L3)", () => {
     await confirmPopover("Delete");
 
     await waitFor(() => expect(screen.getByText("doc-0.pdf")).toBeInTheDocument());
-    expect(listSpy).toHaveBeenLastCalledWith("support-docs", { limit: 50, offset: 0 }, undefined);
+    expect(listSpy).toHaveBeenLastCalledWith("support-docs", { limit: 50, offset: 0 }, undefined, {
+      withReview: true,
+    });
   }, FULL_PAGE_TIMEOUT_MS);
 });
 
@@ -1416,7 +1423,9 @@ describe("DocumentsTab — server paging edges (B-175 L3)", () => {
 
     rerender(tabTree("beta"));
     await waitFor(() => expect(screen.getByText("beta-0.pdf")).toBeInTheDocument());
-    expect(listSpy).not.toHaveBeenCalledWith("beta", { limit: 50, offset: 50 }, undefined);
+    expect(listSpy).not.toHaveBeenCalledWith("beta", { limit: 50, offset: 50 }, undefined, {
+      withReview: true,
+    });
   }, FULL_PAGE_TIMEOUT_MS);
 
   it("a slow response for the previous page never overwrites the current page", async () => {

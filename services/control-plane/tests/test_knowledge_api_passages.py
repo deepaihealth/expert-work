@@ -195,11 +195,12 @@ async def test_every_passage_carries_the_keys_the_frontend_reads(harness: Harnes
 
 
 async def _review_in_list(harness: Harness) -> dict[str, int]:
-    """The document's ``review`` in a paged and an unpaged document list
-    (the same in both)."""
+    """The document's ``review`` in a paged and an unpaged document list asked
+    ``with_review`` (the same in both)."""
+    asks: list[dict[str, str]] = [{"limit": "50", "with_review": "true"}, {"with_review": "true"}]
     lists = [
         await harness.client.get("/v1/knowledge/bases/kb/documents", params=params)
-        for params in ({"limit": 50}, {})
+        for params in asks
     ]
     found = [
         next(d["review"] for d in page.json()["documents"] if d["id"] == harness.document_id)
@@ -212,6 +213,30 @@ async def _review_in_list(harness: Harness) -> dict[str, int]:
 
 async def test_the_document_list_says_nothing_waits_for_review(harness: Harness) -> None:
     assert await _review_in_list(harness) == {"inherited": 0, "unapplied": 0}
+
+
+async def test_the_document_list_counts_review_only_when_asked(
+    harness: Harness, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``review`` costs a read of the page's chunks: a list read that does not
+    ask (the console's 5-second poll during an ingest) neither runs it nor
+    carries the key."""
+    asked: list[list[UUID]] = []
+    real = harness.store.count_review_items
+
+    async def counting(*, tenant_id: UUID, document_ids: Sequence[UUID]) -> dict[UUID, Any]:
+        asked.append(list(document_ids))
+        return await real(tenant_id=tenant_id, document_ids=document_ids)
+
+    monkeypatch.setattr(harness.store, "count_review_items", counting)
+    unasked: list[dict[str, str]] = [{"limit": "50"}, {}, {"limit": "50", "with_review": "false"}]
+    for params in unasked:
+        listed = await harness.client.get("/v1/knowledge/bases/kb/documents", params=params)
+        assert listed.status_code == 200, listed.text
+        assert all("review" not in d for d in listed.json()["documents"])
+    assert asked == []
+    await _review_in_list(harness)
+    assert asked == [[UUID(harness.document_id)]] * 2  # once per read, the whole page
 
 
 async def test_passages_are_read_with_the_tenant_scope(harness: Harness) -> None:

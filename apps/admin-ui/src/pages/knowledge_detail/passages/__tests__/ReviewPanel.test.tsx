@@ -54,7 +54,8 @@ function renderPanel({
   data = review(),
   readonly = false,
   canDelete = true,
-}: { data?: UnappliedEdits; readonly?: boolean; canDelete?: boolean } = {}) {
+  busy = false,
+}: { data?: UnappliedEdits; readonly?: boolean; canDelete?: boolean; busy?: boolean } = {}) {
   const handlers = {
     onChanged: vi.fn(),
     onEdit: vi.fn(),
@@ -69,7 +70,7 @@ function renderPanel({
         review={data}
         figureIds={new Set()}
         readonly={readonly}
-        busy={false}
+        busy={busy}
         canDelete={canDelete}
         {...handlers}
       />
@@ -120,17 +121,49 @@ describe("ReviewPanel", () => {
     expect(update).toHaveBeenCalledWith(BASE_NAME, "d1", inherited.id, { enabled: false });
   });
 
-  it("discard all asks first, then deletes the unapplied history", async () => {
+  it("discard all reads what is there now, asks with that count, then deletes", async () => {
     const discard = vi.spyOn(sdk, "discardUnappliedEdits").mockResolvedValue(3);
-    const { onChanged } = renderPanel();
+    // A re-ingest left one more since the panel was read.
+    const shown = review();
+    const now = {
+      ...shown,
+      unapplied: [...shown.unapplied, revision({ passage_id: "late", revision: 2, edited_by: "u" })],
+    };
+    const fresh = vi.spyOn(sdk, "getUnappliedEdits").mockResolvedValue(now);
+    const { onChanged } = renderPanel({ data: shown });
 
     await userEvent.click(screen.getByTestId("kb-review-discard"));
+    expect(await screen.findByText("丢弃这 3 条没套回去的内容？")).toBeInTheDocument();
+    expect(fresh).toHaveBeenCalledWith(BASE_NAME, "d1", undefined);
+    expect(discard).not.toHaveBeenCalled();
     const ok = await screen.findAllByRole("button", { name: /全部丢弃|丢 弃/ });
     await userEvent.click(ok[ok.length - 1]);
 
     await waitFor(() => expect(discard).toHaveBeenCalledWith(BASE_NAME, "d1"));
     expect(onChanged).toHaveBeenCalled();
     expect(await screen.findByText("已丢弃没套回去的内容。")).toBeInTheDocument();
+  });
+
+  it("nothing left to discard by then: no delete, the panel is read again", async () => {
+    const discard = vi.spyOn(sdk, "discardUnappliedEdits");
+    vi.spyOn(sdk, "getUnappliedEdits").mockResolvedValue({ inherited: [], unapplied: [] });
+    const { onChanged } = renderPanel();
+
+    await userEvent.click(screen.getByTestId("kb-review-discard"));
+
+    expect(
+      await screen.findByText("已经没有可丢弃的内容（可能已被处理），已刷新。"),
+    ).toBeInTheDocument();
+    expect(onChanged).toHaveBeenCalled();
+    expect(discard).not.toHaveBeenCalled();
+  });
+
+  it("while the document is being ingested the discard waits, with the reason", () => {
+    const discard = vi.spyOn(sdk, "discardUnappliedEdits");
+    renderPanel({ busy: true });
+    expect(screen.getByTestId("kb-review-discard")).toBeDisabled();
+    expect(screen.queryByTestId("readonly-tooltip")).toBeNull();
+    expect(discard).not.toHaveBeenCalled();
   });
 
   it("without manifest:delete the discard is disabled and says who may", async () => {

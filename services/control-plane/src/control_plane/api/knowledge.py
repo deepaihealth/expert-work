@@ -839,6 +839,9 @@ def build_knowledge_router() -> APIRouter:
         # B-175 P3-PR2 — only the documents switched that way / in these statuses.
         enabled: bool | None = None,
         status: Annotated[list[DocumentStatus] | None, Query()] = None,
+        # B-175 P3-PR3 — each row's ``review`` (it reads the page's chunks, so
+        # only when asked: the console's 5-second poll does not).
+        with_review: bool = False,
     ) -> JSONResponse:
         scope = await ensure_single_tenant_scope(
             request.state.principal,
@@ -867,13 +870,19 @@ def build_knowledge_router() -> APIRouter:
                     statuses=status,
                 )
             # B-175 P3-PR3 — the row's 「待复核」: one read for the whole page.
-            review = await store.count_review_items(
-                tenant_id=scope.tenant_id, document_ids=[doc.id for doc in documents]
+            review = (
+                await store.count_review_items(
+                    tenant_id=scope.tenant_id, document_ids=[doc.id for doc in documents]
+                )
+                if with_review
+                else None
             )
         return JSONResponse(
             content={
                 "documents": [
-                    {**_document_dict(doc), "review": _review_dict(review.get(doc.id))}
+                    _document_dict(doc)
+                    if review is None
+                    else {**_document_dict(doc), "review": _review_dict(review.get(doc.id))}
                     for doc in documents
                 ],
                 "total": total,

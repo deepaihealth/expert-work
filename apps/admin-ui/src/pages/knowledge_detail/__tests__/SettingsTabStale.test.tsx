@@ -8,7 +8,7 @@
  * the count, with the action disabled.
  */
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
-import { render, screen, waitFor } from "@testing-library/react";
+import { render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { App } from "antd";
 import i18n from "../../../i18n";
@@ -110,6 +110,28 @@ describe("SettingsTab — stale documents (B-175 P3-PR3)", () => {
     await waitFor(() => expect(onSaved).toHaveBeenCalled());
   });
 
+  it("Save stays busy through the whole sequence, question included", async () => {
+    staleCounts(0, 2);
+    const update = vi.spyOn(knowledgeSdk, "updateBase").mockResolvedValue(BASE);
+    const onSaved = renderTab();
+    await screen.findByTestId("kb-settings-stale");
+
+    await setChunkCap("300");
+    await userEvent.click(screen.getByTestId("kb-settings-save"));
+    await screen.findAllByText("2 份文档还是按旧的切块参数切的，现在全部重新摄取吗？");
+
+    const save = screen.getByTestId("kb-settings-save");
+    expect(save).toHaveClass("ant-btn-loading");
+    await userEvent.click(save);
+    expect(update).toHaveBeenCalledTimes(1);
+
+    await userEvent.click(await screen.findByRole("button", { name: "以后再说" }));
+    await waitFor(() => expect(onSaved).toHaveBeenCalled());
+    await waitFor(() =>
+      expect(screen.getByTestId("kb-settings-save")).not.toHaveClass("ant-btn-loading"),
+    );
+  });
+
   it("「以后再说」 re-ingests nothing; the save still lands", async () => {
     staleCounts(0, 2);
     vi.spyOn(knowledgeSdk, "updateBase").mockResolvedValue(BASE);
@@ -167,7 +189,9 @@ describe("SettingsTab — stale documents (B-175 P3-PR3)", () => {
     staleCounts(2);
     renderTab({ readonly: true });
     expect(await screen.findByTestId("kb-settings-reingest-stale")).toBeDisabled();
-    expect(screen.getAllByTestId("readonly-tooltip").length).toBeGreaterThan(0);
+    expect(
+      within(screen.getByTestId("kb-settings-stale")).getByTestId("readonly-tooltip"),
+    ).toBeInTheDocument();
   });
 });
 

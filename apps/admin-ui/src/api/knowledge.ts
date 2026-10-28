@@ -412,10 +412,15 @@ export async function listDocuments(
   baseName: string,
   page: PageParams,
   tenantScope?: TenantScope,
+  /** B-175 P3-PR3 — ``withReview``: each row's ``review`` (the server reads
+   *  the page's chunks for it; the 5-second poll leaves it out). */
+  options?: { withReview?: boolean },
 ): Promise<DocumentsPage> {
+  const params: Record<string, unknown> = { limit: page.limit, offset: page.offset };
+  if (options?.withReview) params.with_review = true;
   const response = await apiClient.get<DocumentsPage>(
     `/v1/knowledge/bases/${encodeURIComponent(baseName)}/documents`,
-    { params: withTenantScope({ limit: page.limit, offset: page.offset }, tenantScope) },
+    { params: withTenantScope(params, tenantScope) },
   );
   return response.data;
 }

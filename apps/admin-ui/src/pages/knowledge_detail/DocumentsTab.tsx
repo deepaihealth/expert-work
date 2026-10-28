@@ -97,6 +97,26 @@ function errMessage(err: unknown): string {
       : "unknown error";
 }
 
+/** B-175 P3-PR3 — rows read without ``review`` (the poll) keep the one the
+ *  last full read gave them. */
+function keepReview(
+  shown: readonly KnowledgeDocument[],
+  read: readonly KnowledgeDocument[],
+): KnowledgeDocument[] {
+  const known = new Map(shown.map((d) => [d.id, d.review]));
+  return read.map((d) => {
+    const review = d.review ?? known.get(d.id);
+    return review === d.review ? d : { ...d, review };
+  });
+}
+
+/** The selected ids still on the page just read (the same array when all are). */
+function stillShown(selected: string[], read: readonly KnowledgeDocument[]): string[] {
+  const ids = new Set(read.map((d) => d.id));
+  const kept = selected.filter((id) => ids.has(id));
+  return kept.length === selected.length ? selected : kept;
+}
+
 interface DocumentsTabProps {
   baseName: string;
   /** Cross-tenant W4(review C-2)— 权威读口径:URL ``?tenant_id=`` 原样透
@@ -151,7 +171,9 @@ export function DocumentsTab({
   const lastBatchRef = useRef<readonly File[] | null>(null);
 
   const refresh = useCallback(
-    async ({ quiet = false }: { quiet?: boolean } = {}) => {
+    // B-175 P3-PR3 — ``withReview``: each row's 「待复核」 count costs the
+    // server a read of the page's chunks; only the 5-second poll skips it.
+    async ({ quiet = false, withReview = true }: { quiet?: boolean; withReview?: boolean } = {}) => {
       if (!quiet) setLoading(true);
       const seq = ++requestSeqRef.current;
       try {
@@ -159,6 +181,7 @@ export function DocumentsTab({
           baseName,
           { limit: DOC_TABLE_PAGE_SIZE, offset: (page - 1) * DOC_TABLE_PAGE_SIZE },
           readScope,
+          { withReview },
         );
         if (seq !== requestSeqRef.current) return;
         // The page emptied under us (last rows deleted elsewhere) → step
@@ -168,7 +191,10 @@ export function DocumentsTab({
           setPage(lastPage);
           return;
         }
-        setDocuments(result.documents);
+        setDocuments((shown) =>
+          withReview ? result.documents : keepReview(shown, result.documents),
+        );
+        setSelected((current) => stillShown(current, result.documents));
         setTotal(result.total);
       } catch (err) {
         if (seq === requestSeqRef.current) message.error(errMessage(err));
@@ -197,7 +223,7 @@ export function DocumentsTab({
         // Same page-visibility gate as ``useStatusPolling``: a backgrounded
         // tab keeps the timer but skips the fetch until the user is back.
         if (typeof document !== "undefined" && document.visibilityState !== "visible") return;
-        void refresh({ quiet: true });
+        void refresh({ quiet: true, withReview: false });
       }, POLL_INTERVAL_MS);
       return () => {
         if (pollTimer.current !== null) clearInterval(pollTimer.current);

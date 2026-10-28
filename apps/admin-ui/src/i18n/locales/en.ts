@@ -518,6 +518,7 @@ export interface TranslationKeys {
     review_discard_confirm_title: string;
     review_discard_confirm_body: string;
     review_discarded: string;
+    review_discard_nothing: string;
     needs_admin: string;
     doc_disabled: string;
     doc_disabled_hint: string;
@@ -4017,6 +4018,8 @@ const en: TranslationKeys = {
     review_discard_confirm_title: "Discard these {{n}} items that were not put back?",
     review_discard_confirm_body: "Their revision history is deleted and cannot be restored.",
     review_discarded: "Discarded the items that were not put back.",
+    review_discard_nothing:
+      "Nothing is left to discard (it may have been handled meanwhile). The list was refreshed.",
     needs_admin: "Needs a tenant admin: this deletes data.",
     doc_disabled: "Off",
     doc_disabled_hint:

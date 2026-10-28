@@ -114,14 +114,18 @@ export function SettingsTab({ base, onSaved, readonly, readScope }: SettingsTabP
         setSaving(false);
         return;
       }
-      setSaving(false);
       // B-175 P3-PR3 「保存即问」: the chunking changed and documents are still
-      // cut the old way — ask now (before the page reloads the base).
-      if (chunkingChanged) {
-        const count = await refreshStale();
-        if (count !== null && count > 0) await confirmReingest(count);
+      // cut the old way — ask now (before the page reloads the base). Save
+      // stays busy until it is all done, so it cannot start over mid-way.
+      try {
+        if (chunkingChanged) {
+          const count = await refreshStale();
+          if (count !== null && count > 0) await confirmReingest(count);
+        }
+        await onSaved();
+      } finally {
+        setSaving(false);
       }
-      await onSaved();
     },
     [
       base.name,
