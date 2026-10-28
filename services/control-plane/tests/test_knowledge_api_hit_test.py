@@ -203,7 +203,7 @@ async def test_elapsed_ms_is_the_search_without_its_logging(setup: _Setup) -> No
     body = (
         await setup.client.post("/v1/knowledge/bases/kb/test", json={"query": "deductible"})
     ).json()
-    [row], _total = await log.list_for_base(tenant_id=_TENANT, kb_id=await _base_id(setup))
+    [row], _ = await log.list_for_base(tenant_id=_TENANT, kb_id=await _base_id(setup))
     assert body["elapsed_ms"] == row.latency_ms
     assert body["elapsed_ms"] < 250  # the 300 ms write is not counted
 

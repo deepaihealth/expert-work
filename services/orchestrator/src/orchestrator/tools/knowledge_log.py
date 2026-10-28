@@ -90,7 +90,8 @@ _NOT_FLAGS = frozenset({"results", "status"})
 class RetrievalLogSink(Protocol):
     """Where log rows go — ``KnowledgeRetrievalLogStore`` in production."""
 
-    async def add(self, entry: RetrievalLogEntry) -> None: ...
+    async def add(self, entry: RetrievalLogEntry) -> None:
+        """Write one log row."""
 
 
 @dataclass

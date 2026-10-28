@@ -455,7 +455,7 @@ async def test_a_pending_log_write_is_not_garbage_collected(
     assert len(pending) == 1
     pending[0].cancel()
     with contextlib.suppress(asyncio.CancelledError):
-        await pending[0]
+        _ = await pending[0]
 
 
 @pytest.mark.asyncio
