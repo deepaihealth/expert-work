@@ -724,6 +724,32 @@ class SqlKnowledgeStore(KnowledgeStore):
             rows = (await session.execute(stmt)).all()
         return {row[0]: (int(row[1]), int(row[2])) for row in rows}
 
+    async def count_documents_capped(
+        self, *, tenant_id: UUID, kb_ids: Sequence[UUID], cap: int
+    ) -> dict[UUID, int]:
+        ids = list(dict.fromkeys(kb_ids))
+        if not ids:
+            return {}
+
+        def _capped(kb_id: UUID) -> Any:
+            # LIMIT inside: the (tenant_id, kb_id, filename) unique index lets
+            # each count stop after ``cap`` rows instead of reading the base.
+            rows = (
+                select(KnowledgeDocumentRow.id)
+                .where(
+                    KnowledgeDocumentRow.tenant_id == tenant_id,
+                    KnowledgeDocumentRow.kb_id == kb_id,
+                )
+                .limit(cap)
+                .subquery()
+            )
+            return select(func.count()).select_from(rows).scalar_subquery()
+
+        stmt = select(*(_capped(kb_id) for kb_id in ids))
+        async with self._sf() as session:
+            row = (await session.execute(stmt)).one()
+        return {kb_id: int(count) for kb_id, count in zip(ids, row, strict=True)}
+
     async def base_stats_many_all_tenants(
         self, *, kb_ids: Sequence[UUID]
     ) -> dict[UUID, tuple[int, int]]:

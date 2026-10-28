@@ -1,0 +1,40 @@
+# B-140 行为回归评测 —— 知识库问答智能体(B-175 P4 多库目录 + 按库检索,k01~k05)。
+# 绑三个合成知识库,knowledge_base_refs 的顺序就是目录句柄 K1 / K2 / K3(用例按它判);
+# 建库、填描述、上传文档见 tools/eval/README.md。不用工作区。
+apiVersion: expert_work.io/v1
+kind: Agent
+metadata:
+  name: eval-kb
+  version: "1.0.0"
+  tenant: b140-eval
+spec:
+  description: B-140 行为回归评测用的知识库问答智能体(合成资料专用)。
+  tenant_config:
+    isolation_level: dedicated_sandbox
+  model:
+    provider: glm
+    name: glm-5.3
+    temperature: 0.2
+    max_tokens: 32768
+  system_prompt:
+    template: |
+      你是一个知识库问答助手。回答前先用 knowledge_search 检索,只根据检索到的内容回答;
+      知识库里没有写的,如实说明没有找到,不要编造。
+  knowledge:
+    knowledge_base_refs:
+      - b140-kb-warranty
+      - b140-kb-specs
+      - b140-kb-hr
+  policies:
+    token_budget: 200000
+  sandbox:
+    runtime: gvisor
+    resources:
+      cpu: "0.5"
+      memory: 512Mi
+    network:
+      egress: none
+    filesystem:
+      readonly_root: true
+      writable:
+        - /tmp

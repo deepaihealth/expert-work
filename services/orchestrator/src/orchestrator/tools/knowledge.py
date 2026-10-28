@@ -35,6 +35,7 @@ from expert_work.protocol import (
     chunk_retrieval_text,
 )
 from orchestrator.tools.error_classifier import GuidedToolError
+from orchestrator.tools.knowledge_catalog import select_bases, with_bases_parameter
 from orchestrator.tools.knowledge_rerank import (
     RERANK_FAILED,
     RerankError,
@@ -169,6 +170,20 @@ _NO_BASES_ADVICE = (
     "None of the knowledge bases this agent is configured with exists, so nothing was "
     "searched: this says nothing about whether the information exists, and the same "
     "search fails the same way until the agent's knowledge base setting is fixed."
+)
+#: B-175 P4 — a search narrowed by ``bases`` found nothing (no hits, or all
+#: below the threshold): only part of the agent's knowledge was searched.
+_NARROWED_NO_HITS_NOTICE = (
+    "[knowledge_search: only the knowledge bases chosen in bases were searched, not every "
+    "knowledge base this agent can search, so this result does not show that the knowledge "
+    "bases lack the information. A search without bases covers all of them, and documents "
+    "may word a fact differently from the query.]"
+)
+#: B-175 P4 — the ``bases`` argument chose only bases that no longer exist.
+_NO_SELECTED_BASES_ADVICE = (
+    "None of the knowledge bases chosen in 'bases' exists, so nothing was searched: this "
+    "says nothing about whether the information exists. Search again without bases to "
+    "search every knowledge base this agent can use."
 )
 
 #: B-206 K-8 —— what a failed query embedding raises when the vendor, not the
@@ -799,6 +814,12 @@ class KnowledgeSearchTool:
 
     @property
     def spec(self) -> ToolSpec:
+        # B-175 P4 — 2+ bases add the optional ``bases`` argument (handles from
+        # the system prompt's knowledge catalog); 0 / 1 keep this schema as is.
+        return with_bases_parameter(self._base_spec, self.knowledge_base_refs)
+
+    @property
+    def _base_spec(self) -> ToolSpec:
         return ToolSpec(
             name="knowledge_search",
             description=(
@@ -833,21 +854,28 @@ class KnowledgeSearchTool:
             raise ToolBlockedError(msg)
         query = self._require_query(args)
         limit = _coerce_limit(args.get("limit"))
+        # B-175 P4 — only this agent's refs can be chosen; anything else is
+        # refused before searching.
+        base_names = select_bases(self.knowledge_base_refs, args.get("bases"))
+        narrowed = base_names != self.knowledge_base_refs
         # A failed search propagates as-is: the classifier keeps a timeout or
         # outage ``transient``, and its advice already says a failure is no
         # evidence about the target.
         outcome = await self.retriever.search_detailed(
             tenant_id=ctx.tenant_id,
-            base_names=self.knowledge_base_refs,
+            base_names=base_names,
             query=query,
             limit=limit,
         )
         if outcome.status == "no_bases":
-            msg = "none of this agent's knowledge bases exists: " + ", ".join(
-                self.knowledge_base_refs
-            )
+            if narrowed:
+                msg = "none of the selected knowledge bases exists: " + ", ".join(base_names)
+                raise GuidedToolError(msg, advice=_NO_SELECTED_BASES_ADVICE)
+            msg = "none of this agent's knowledge bases exists: " + ", ".join(base_names)
             raise GuidedToolError(msg, advice=_NO_BASES_ADVICE)
         meta: dict[str, Any] = {"hits": len(outcome.results), "status": outcome.status}
+        if narrowed:
+            meta["bases"] = list(base_names)
         if outcome.rerank_degraded:
             meta["rerank_degraded"] = True
         if outcome.embedding_degraded:
@@ -858,6 +886,8 @@ class KnowledgeSearchTool:
             meta["rerank_outcome"] = outcome.rerank_outcome
         if outcome.rerank_threshold_paused:
             meta["rerank_threshold_paused"] = True
+        if narrowed and not outcome.results:
+            return _narrowed_miss(outcome, base_names, self.knowledge_base_refs, meta)
         if outcome.status == "below_threshold":
             return ToolResult(
                 content=(
@@ -884,6 +914,32 @@ class KnowledgeSearchTool:
             msg = "knowledge_search requires a non-empty 'query' string"
             raise ValueError(msg)
         return raw.strip()
+
+
+def _narrowed_miss(
+    outcome: KnowledgeSearchOutcome,
+    searched: Sequence[str],
+    refs: Sequence[str],
+    meta: dict[str, Any],
+) -> ToolResult:
+    """B-175 P4 — a search narrowed by ``bases`` that returned nothing. The
+    other bases were not searched, so unlike :data:`_NO_HITS_NOTICE` nothing
+    here says the knowledge bases lack the fact. Base names (tenant text) stay
+    in the fenced content; the trusted notice names none."""
+    why = (
+        f"{outcome.candidates} passages were retrieved but none was relevant enough"
+        if outcome.status == "below_threshold"
+        else "nothing was found"
+    )
+    skipped = ", ".join(ref for ref in refs if ref not in searched)
+    return ToolResult(
+        content=(
+            f"[no relevant knowledge found for the query in the selected knowledge bases "
+            f"({', '.join(searched)}): {why}; not searched: {skipped}]"
+        ),
+        meta=meta,
+        notice=_NARROWED_NO_HITS_NOTICE,
+    )
 
 
 def _retrieved(
