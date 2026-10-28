@@ -41,6 +41,7 @@ from expert_work.persistence.knowledge.base import (
     KnowledgeStore,
     Passage,
     PassageChild,
+    ReviewCounts,
     SwitchOffRecord,
 )
 from expert_work.persistence.knowledge.passages import PassageConflictError
@@ -1390,3 +1391,84 @@ async def test_list_chunks_pages_by_position(store: KnowledgeStore) -> None:
         **scope, limit=10, chunk_types=[ChunkType.PARENT], after=(0, ChunkType.PARENT)
     )
     assert [c.id for c in parents] == [p.second.id]
+
+
+# -- what a document list says is waiting for review (B-175 P3-PR3) ------------
+
+
+async def _edit(
+    store: KnowledgeStore, doc: _Doc, passage_id: UUID, revision: int, text: str
+) -> None:
+    written = await store.replace_passage(
+        tenant_id=doc.tenant,
+        document_id=doc.id,
+        passage_id=passage_id,
+        expected_revision=revision,
+        content=text,
+        heading_path=(),
+        children=_kids(text, heading=()),
+        edited_by="user-a",
+    )
+    assert written is not None
+
+
+async def test_count_review_items(store: KnowledgeStore) -> None:
+    """``count_review_items``: per document asked, the passages switched off
+    by inheritance (a passage once, not each of its chunks; a person's own
+    switch-off is not counted) and exactly what ``list_unapplied_revisions``
+    lists — an edit whose passage is gone (one restored to its machine text
+    is not), an edit whose passage is back at an older revision, a switch-off
+    no passage holds (one placed is not). Documents with nothing to review,
+    another tenant's and unknown ids are absent."""
+    p = await _passages(store)
+    doc, t = p.doc, p.doc.tenant
+    await _edit(store, doc, p.first.id, 1, "改")
+    await _edit(store, doc, p.lone.id, 1, "樱桃")
+    await _edit(store, doc, p.lone.id, 2, "樱桃 果酱")  # back to its machine text
+    off = {"enabled": False, "disabled_reason": "inherited"}
+    held = doc.parent(5, "葡萄 干\n\n橙子 汁").model_copy(update=off)
+    mine = doc.child(9, "面包 干", enabled=False).model_copy(update={"disabled_reason": "manual"})
+    kept = await store.get_passage(tenant_id=t, document_id=doc.id, passage_id=p.second.id)
+    assert kept is not None
+    rows = [
+        *_without_vectors(kept),
+        held,
+        doc.child(7, "葡萄 干", parent=held).model_copy(update=off),
+        doc.child(8, "橙子 汁", parent=held).model_copy(update=off),
+        mine,
+    ]
+    assert await store.replace_chunks(
+        tenant_id=t,
+        document_id=doc.id,
+        chunks=rows,
+        switch_offs=[
+            SwitchOffRecord(uuid4(), "葡萄 干", (), placed=True, new=True),
+            SwitchOffRecord(uuid4(), "西瓜 皮", (), placed=False, new=True),
+        ],
+    )
+
+    # Back at an older revision: the edit is listed, the passage is there.
+    back = await _passages(store, t, name="back.md")
+    await _edit(store, back.doc, back.first.id, 1, "改")
+    await _write(store, back.doc, [back.first, *back.children])
+
+    quiet = await _passages(store, t, name="quiet.md")
+    theirs = await _doc(store, name="theirs.md")
+    stray = theirs.parent(0, "苹果").model_copy(update=off)
+    await _write(store, theirs, [stray])
+
+    counts = await store.count_review_items(
+        tenant_id=t, document_ids=[doc.id, back.doc.id, quiet.doc.id, theirs.id, uuid4()]
+    )
+
+    assert {d: (c.inherited, c.unapplied) for d, c in counts.items()} == {
+        doc.id: (1, 2),
+        back.doc.id: (0, 1),
+    }
+    for listed in (doc, back.doc):
+        unapplied = await store.list_unapplied_revisions(tenant_id=t, document_id=listed.id)
+        assert counts[listed.id].unapplied == len(unapplied)
+    assert await store.count_review_items(tenant_id=t, document_ids=[]) == {}
+    assert await store.count_review_items(tenant_id=theirs.tenant, document_ids=[theirs.id]) == {
+        theirs.id: ReviewCounts(inherited=1, unapplied=0)
+    }

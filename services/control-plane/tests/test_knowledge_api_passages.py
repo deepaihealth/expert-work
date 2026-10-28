@@ -194,6 +194,26 @@ async def test_every_passage_carries_the_keys_the_frontend_reads(harness: Harnes
     assert set(page) >= set(fixture)
 
 
+async def _review_in_list(harness: Harness) -> dict[str, int]:
+    """The document's ``review`` in a paged and an unpaged document list
+    (the same in both)."""
+    lists = [
+        await harness.client.get("/v1/knowledge/bases/kb/documents", params=params)
+        for params in ({"limit": 50}, {})
+    ]
+    found = [
+        next(d["review"] for d in page.json()["documents"] if d["id"] == harness.document_id)
+        for page in lists
+    ]
+    assert found[0] == found[1]
+    review: dict[str, int] = found[0]
+    return review
+
+
+async def test_the_document_list_says_nothing_waits_for_review(harness: Harness) -> None:
+    assert await _review_in_list(harness) == {"inherited": 0, "unapplied": 0}
+
+
 async def test_passages_are_read_with_the_tenant_scope(harness: Harness) -> None:
     admin = await grant_system_admin(harness.client)
     own = await harness.client.get(
@@ -402,6 +422,8 @@ async def test_a_reupload_lists_what_needs_review_and_it_can_be_discarded(
     ((inherited,),) = [review["inherited"]]
     assert (inherited["enabled"], inherited["disabled_reason"]) == (False, "inherited")
     assert "Paragraph c was rewritten in the file." in inherited["content"]
+    # The document list says so (B-175 P3-PR3: the row's 「待复核」).
+    assert await _review_in_list(harness) == {"inherited": 1, "unapplied": 1}
 
     # Discarding deletes history: manifest:delete, which an operator lacks.
     operator = make_test_jwt(tenant_id=_TENANT, subject="user-b", roles=("operator",))
@@ -414,6 +436,7 @@ async def test_a_reupload_lists_what_needs_review_and_it_can_be_discarded(
     assert discarded.json() == {"discarded": 2}
     after = (await harness.client.get(f"{harness.base}/unapplied-edits")).json()
     assert after["unapplied"] == []
+    assert await _review_in_list(harness) == {"inherited": 1, "unapplied": 0}
     history = await harness.client.get(f"{harness.base}/passages/{notes['id']}/revisions")
     assert history.json() == {"revisions": []}
     rows = [r for r in await harness.audit_rows() if r[0] == "knowledge:passage_discard_unapplied"]

@@ -59,10 +59,12 @@ import {
 import { ApiError } from "../../api/client";
 import { formatBytes } from "../../components/console/workspace_format";
 import { DEFAULT_UPLOAD_STALL_TIMEOUT_MS, useUploadQueue } from "../../hooks/useUploadQueue";
+import { DocumentBatchBar } from "./DocumentBatchBar";
+import { DocumentFlags } from "./DocumentFlags";
 import { documentErrorText } from "./documentError";
 import { FigureStatsTags, figuresNeedDescription } from "./FigureStatsTags";
 import { needsRecognition, PageRecognitionTags } from "./PageRecognitionTags";
-import { SegmentPreviewDrawer } from "./SegmentPreviewDrawer";
+import { SegmentPreviewDrawer, type DrawerView } from "./SegmentPreviewDrawer";
 import { UploadQueuePanel } from "./UploadQueuePanel";
 import { ReadonlyTooltip } from "../../components/ReadonlyTooltip";
 
@@ -104,9 +106,17 @@ interface DocumentsTabProps {
   /** Cross-tenant W4(review C-2)— 只读态(切入态 ∪ "*" 聚合深链外租户
    *  读),由 KnowledgeDetail 统一判定下传;上传/重入库/删除一律置灰。 */
   readonly: boolean;
+  /** B-175 P3-PR3 — ``manifest:delete`` (tenant admin / system admin): batch
+   *  delete and discarding unapplied edits. */
+  canDelete?: boolean;
 }
 
-export function DocumentsTab({ baseName, readScope, readonly }: DocumentsTabProps) {
+export function DocumentsTab({
+  baseName,
+  readScope,
+  readonly,
+  canDelete = false,
+}: DocumentsTabProps) {
   const { t, i18n } = useTranslation();
   const { message } = App.useApp();
 
@@ -118,15 +128,19 @@ export function DocumentsTab({ baseName, readScope, readonly }: DocumentsTabProp
   // render so the fetch below never runs with the previous base's page.
   const pageOwner = `${readScope ?? ""}|${baseName}`;
   const [pageOwnerSeen, setPageOwnerSeen] = useState(pageOwner);
+  /** B-175 P3-PR3 — the rows selected on this page for a batch action. */
+  const [selected, setSelected] = useState<string[]>([]);
   if (pageOwnerSeen !== pageOwner) {
     setPageOwnerSeen(pageOwner);
     setPage(1);
+    setSelected([]);
   }
   /** Only the latest list request may write the table (page flips and the
    *  poll can overlap). */
   const requestSeqRef = useRef(0);
   const [loading, setLoading] = useState(false);
   const [previewDoc, setPreviewDoc] = useState<KnowledgeDocument | null>(null);
+  const [previewView, setPreviewView] = useState<DrawerView>("passages");
   const [folderMode, setFolderMode] = useState(false);
   const [dragging, setDragging] = useState(false);
   /** Nested dragenter/dragleave pairs over the dropzone's children. */
@@ -368,6 +382,24 @@ export function DocumentsTab({ baseName, readScope, readonly }: DocumentsTabProp
     [baseName, message, refresh],
   );
 
+  /** B-175 P3-PR3 — the drawer, on 整块 (the eye) or on 待复核 (the row's tag). */
+  const openPreview = useCallback((document: KnowledgeDocument, view: DrawerView) => {
+    setPreviewView(view);
+    setPreviewDoc(document);
+  }, []);
+  const openReview = useCallback(
+    (document: KnowledgeDocument) => openPreview(document, "review"),
+    [openPreview],
+  );
+  const changePage = useCallback((next: number) => {
+    setPage(next);
+    setSelected([]);
+  }, []);
+  const afterBatch = useCallback(() => {
+    setSelected([]);
+    void refresh({ quiet: true });
+  }, [refresh]);
+
   const columns: TableColumnsType<KnowledgeDocument> = useMemo(
     () => [
       {
@@ -375,7 +407,12 @@ export function DocumentsTab({ baseName, readScope, readonly }: DocumentsTabProp
         dataIndex: "filename",
         key: "filename",
         ellipsis: true,
-        render: (filename: string) => <Text strong>{filename}</Text>,
+        render: (filename: string, record) => (
+          <Space size={4} wrap>
+            <Text strong>{filename}</Text>
+            <DocumentFlags document={record} onReview={openReview} />
+          </Space>
+        ),
       },
       {
         title: t("knowledge_page.col_status"),
@@ -479,7 +516,7 @@ export function DocumentsTab({ baseName, readScope, readonly }: DocumentsTabProp
                 size="small"
                 type="text"
                 icon={<Eye size={14} strokeWidth={1.5} />}
-                onClick={() => setPreviewDoc(record)}
+                onClick={() => openPreview(record, "passages")}
                 aria-label={t("knowledge_page.view_chunks")}
                 data-testid={`doc-chunks-${record.id}`}
               />
@@ -588,7 +625,7 @@ export function DocumentsTab({ baseName, readScope, readonly }: DocumentsTabProp
         ),
       },
     ],
-    [t, i18n.language, handleReingest, handleRecognize, handleDiscardPending, handleCancel, handleDelete, readonly],
+    [t, i18n.language, handleReingest, handleRecognize, handleDiscardPending, handleCancel, handleDelete, readonly, openPreview, openReview],
   );
 
   const pagination = useMemo<TablePaginationConfig>(
@@ -598,10 +635,10 @@ export function DocumentsTab({ baseName, readScope, readonly }: DocumentsTabProp
       total,
       showSizeChanger: false,
       showTotal: (count: number) => t("knowledge_page.doc_table_total", { total: count }),
-      onChange: setPage,
+      onChange: changePage,
       ...DOC_TABLE_PAGINATION_TESTID,
     }),
-    [page, t, total],
+    [changePage, page, t, total],
   );
 
   return (
@@ -666,6 +703,15 @@ export function DocumentsTab({ baseName, readScope, readonly }: DocumentsTabProp
         onClearDone={queue.clearDone}
       />
 
+      <DocumentBatchBar
+        baseName={baseName}
+        selectedIds={selected}
+        readonly={readonly}
+        canDelete={canDelete}
+        onDone={afterBatch}
+        onClear={() => setSelected([])}
+      />
+
       <Table<KnowledgeDocument>
         size="small"
         columns={columns}
@@ -673,6 +719,18 @@ export function DocumentsTab({ baseName, readScope, readonly }: DocumentsTabProp
         rowKey="id"
         loading={loading}
         pagination={pagination}
+        rowSelection={{
+          selectedRowKeys: selected,
+          onChange: (keys) => setSelected(keys.map(String)),
+          // aria-labels keep the bare checkboxes axe-clean (label rule).
+          getCheckboxProps: (record) => ({
+            disabled: readonly,
+            "aria-label": t("kb_maintenance.batch_select_row", { name: record.filename }),
+          }),
+          columnTitle: (originNode) => (
+            <span aria-label={t("kb_maintenance.batch_select_all")}>{originNode}</span>
+          ),
+        }}
         locale={{ emptyText: <Empty description={t("knowledge_page.documents_empty")} /> }}
         data-testid="doc-table"
       />
@@ -681,7 +739,14 @@ export function DocumentsTab({ baseName, readScope, readonly }: DocumentsTabProp
         baseName={baseName}
         readScope={readScope}
         document={previewDoc}
-        onClose={() => setPreviewDoc(null)}
+        readonly={readonly}
+        canDelete={canDelete}
+        initialView={previewView}
+        onClose={() => {
+          setPreviewDoc(null);
+          // Passages switched or reviewed in the drawer change the row's flags.
+          void refresh({ quiet: true });
+        }}
       />
     </div>
   );

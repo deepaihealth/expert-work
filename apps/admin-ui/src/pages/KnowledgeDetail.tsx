@@ -56,6 +56,10 @@ export function KnowledgeDetail() {
   const isTenantSwitched = useIsTenantSwitched();
   const isForeignRead = readScope != null && readScope !== identity?.homeTenantId;
   const readonly = isTenantSwitched || isForeignRead;
+  // B-175 P3-PR3 — ``manifest:delete`` (tenant admin / system admin): batch
+  // delete and discarding unapplied edits, which delete history.
+  const canDelete =
+    (identity?.isSystemAdmin ?? false) || (identity?.roles.includes("admin") ?? false);
 
   const [base, setBase] = useState<KnowledgeBase | null>(null);
   const [loading, setLoading] = useState(true);
@@ -128,6 +132,17 @@ export function KnowledgeDetail() {
   }
 
   const embedding = base.embedding_model ?? t("knowledge_page.embedding_unset");
+  // B-206 §6 配置摘要行 —— 「切块：小段 400 / 整块 1024 token」.
+  const configSummary =
+    (base.parent_max_tokens != null
+      ? t("kb_maintenance.config_summary", {
+          chunk: base.chunk_max_tokens,
+          parent: base.parent_max_tokens,
+        })
+      : t("kb_maintenance.config_summary_chunk_only", { chunk: base.chunk_max_tokens })) +
+    (base.chunk_overlap_tokens > 0
+      ? t("kb_maintenance.config_summary_overlap", { overlap: base.chunk_overlap_tokens })
+      : "");
 
   return (
     <div data-testid="knowledge-detail-root">
@@ -145,6 +160,9 @@ export function KnowledgeDetail() {
             </Text>
             <Text type="secondary" style={{ fontSize: 12 }}>
               {t("knowledge_page.stat_embedding")}: <Text code>{embedding}</Text>
+            </Text>
+            <Text type="secondary" style={{ fontSize: 12 }} data-testid="knowledge-config-summary">
+              {configSummary}
             </Text>
             {base.reindexing && (
               <Tag color="processing" bordered={false}>
@@ -208,11 +226,16 @@ export function KnowledgeDetail() {
       />
 
       {activeTab === "documents" && (
-        <DocumentsTab baseName={name} readScope={readScope} readonly={readonly} />
+        <DocumentsTab
+          baseName={name}
+          readScope={readScope}
+          readonly={readonly}
+          canDelete={canDelete}
+        />
       )}
       {activeTab === "test" && <RetrievalTestTab base={base} readScope={readScope} />}
       {activeTab === "settings" && (
-        <SettingsTab base={base} onSaved={refresh} readonly={readonly} />
+        <SettingsTab base={base} onSaved={refresh} readonly={readonly} readScope={readScope} />
       )}
     </div>
   );

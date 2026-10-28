@@ -13,6 +13,7 @@ import { MemoryRouter, Route, Routes } from "react-router-dom";
 import i18n from "../../i18n";
 
 import * as knowledgeSdk from "../../api/knowledge";
+import * as maintenanceSdk from "../../api/knowledge_maintenance";
 import { ApiError } from "../../api/client";
 import { KnowledgeDetail } from "../KnowledgeDetail";
 import { DocumentsTab } from "../knowledge_detail/DocumentsTab";
@@ -35,6 +36,13 @@ const { HOME_TENANT, FOREIGN_TENANT } = vi.hoisted(() => ({
   FOREIGN_TENANT: "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb",
 }));
 
+// B-175 P3-PR3 — the roles are switchable (``manifest:delete`` gates batch
+// delete and discarding unapplied edits); reset in ``beforeEach``.
+const identityRoles = vi.hoisted(() => ({
+  roles: ["system_admin"] as string[],
+  isSystemAdmin: true,
+}));
+
 // Identity mock — homeTenantId=HOME_TENANT(W4 readonly 判定要比对
 // homeTenantId;真 AuthProvider 要拉 /v1/me,直接 mock useAuth 更确定)。
 vi.mock("../../auth/AuthContext", async (importOriginal) => {
@@ -48,8 +56,8 @@ vi.mock("../../auth/AuthContext", async (importOriginal) => {
         subject: "u1",
         subjectType: "user" as const,
         homeTenantId: HOME_TENANT,
-        roles: ["system_admin"],
-        isSystemAdmin: true,
+        roles: identityRoles.roles,
+        isSystemAdmin: identityRoles.isSystemAdmin,
         homeIsPlatform: false,
         displayName: "u1",
         serverResolved: true,
@@ -118,6 +126,33 @@ function docPage(
   return { documents, total, offset, limit: 50 };
 }
 
+/** B-175 P3-PR3 — a chunk standing for itself, as the passage list reads it. */
+function lonePassage(
+  id: string,
+  content: string,
+  heading_path: string[] = [],
+): maintenanceSdk.Passage {
+  return {
+    id,
+    kind: "chunk",
+    chunk_index: 0,
+    content,
+    heading_path,
+    enabled: true,
+    disabled_reason: null,
+    edited: false,
+    revision: 1,
+    children: [{ id, chunk_index: 0, content, heading_path, enabled: true, disabled_reason: null }],
+  };
+}
+
+function passagePage(
+  passages: maintenanceSdk.Passage[],
+  figureIds: string[] = [],
+): maintenanceSdk.PassagesPage {
+  return { passages, figure_ids: figureIds, total: passages.length, offset: 0, limit: 20 };
+}
+
 function detailTree(initial: string) {
   return (
     <MemoryRouter initialEntries={[initial]}>
@@ -141,6 +176,16 @@ afterEach(() => vi.restoreAllMocks());
 beforeEach(() => {
   isTenantSwitchedMock.mockReturnValue(false);
   scopeRef.current = undefined;
+  identityRoles.roles = ["system_admin"];
+  identityRoles.isSystemAdmin = true;
+  // B-175 P3-PR3 — the drawer reads what waits for review on opening; the
+  // settings tab reads how many documents use older chunking parameters.
+  vi.spyOn(maintenanceSdk, "getUnappliedEdits").mockResolvedValue({ inherited: [], unapplied: [] });
+  vi.spyOn(maintenanceSdk, "listPassages").mockResolvedValue(passagePage([]));
+  vi.spyOn(maintenanceSdk, "getStaleDocuments").mockResolvedValue({
+    stale: 0,
+    chunk_params_hash: "h",
+  });
 });
 
 describe("KnowledgeDetail", () => {
@@ -312,21 +357,19 @@ describe("KnowledgeDetail", () => {
     const figure = "0123456789abcdef";
     vi.spyOn(knowledgeSdk, "getBase").mockResolvedValue(BASE);
     vi.spyOn(knowledgeSdk, "listDocuments").mockResolvedValue(docPage(DOCS));
-    vi.spyOn(knowledgeSdk, "listChunks").mockResolvedValue({
-      chunks: [
-        {
-          id: "c1",
-          chunk_index: 0,
-          content: `Before the picture.\n\n> \u3014\u56fe ${figure}\u3015A device photo.\n\nAfter it.`,
-          heading_path: [],
-        },
-        { id: "c2", chunk_index: 1, content: "No picture here.", heading_path: [] },
-      ],
-      total: 2,
-      offset: 0,
-      limit: 20,
-      figure_ids: [figure],
-    });
+    // B-175 P3-PR3 \u2014 the drawer opens on its passages (the \u6574\u5757 view).
+    vi.spyOn(maintenanceSdk, "listPassages").mockResolvedValue(
+      passagePage(
+        [
+          lonePassage(
+            "c1",
+            `Before the picture.\n\n> \u3014\u56fe ${figure}\u3015A device photo.\n\nAfter it.`,
+          ),
+          lonePassage("c2", "No picture here."),
+        ],
+        [figure],
+      ),
+    );
     const fetchSpy = vi.spyOn(knowledgeSdk, "fetchFigureUrl").mockResolvedValue("blob:figure");
 
     renderDetail();
@@ -349,20 +392,9 @@ describe("KnowledgeDetail", () => {
     const figure = "fedcba9876543210";
     vi.spyOn(knowledgeSdk, "getBase").mockResolvedValue(BASE);
     vi.spyOn(knowledgeSdk, "listDocuments").mockResolvedValue(docPage(DOCS));
-    vi.spyOn(knowledgeSdk, "listChunks").mockResolvedValue({
-      chunks: [
-        {
-          id: "c1",
-          chunk_index: 0,
-          content: `> \u3014\u56fe ${figure}\u3015A chart.`,
-          heading_path: [],
-        },
-      ],
-      total: 1,
-      offset: 0,
-      limit: 20,
-      figure_ids: [figure],
-    });
+    vi.spyOn(maintenanceSdk, "listPassages").mockResolvedValue(
+      passagePage([lonePassage("c1", `> \u3014\u56fe ${figure}\u3015A chart.`)], [figure]),
+    );
     vi.spyOn(knowledgeSdk, "fetchFigureUrl").mockRejectedValue(new Error("404"));
 
     renderDetail();
@@ -377,20 +409,17 @@ describe("KnowledgeDetail", () => {
     const typed = "fedcba9876543210";
     vi.spyOn(knowledgeSdk, "getBase").mockResolvedValue(BASE);
     vi.spyOn(knowledgeSdk, "listDocuments").mockResolvedValue(docPage(DOCS));
-    vi.spyOn(knowledgeSdk, "listChunks").mockResolvedValue({
-      chunks: [
-        {
-          id: "c1",
-          chunk_index: 0,
-          content: `> \u3014\u56fe ${real}\u3015A photo.\n\n> \u3014\u56fe ${typed}\u3015Typed by an author.`,
-          heading_path: [],
-        },
-      ],
-      total: 1,
-      offset: 0,
-      limit: 20,
-      figure_ids: [real],
-    });
+    vi.spyOn(maintenanceSdk, "listPassages").mockResolvedValue(
+      passagePage(
+        [
+          lonePassage(
+            "c1",
+            `> \u3014\u56fe ${real}\u3015A photo.\n\n> \u3014\u56fe ${typed}\u3015Typed by an author.`,
+          ),
+        ],
+        [real],
+      ),
+    );
     const fetchSpy = vi.spyOn(knowledgeSdk, "fetchFigureUrl").mockResolvedValue("blob:figure");
 
     renderDetail();
@@ -454,12 +483,16 @@ describe("KnowledgeDetail", () => {
 
     renderDetail();
     await userEvent.click(await screen.findByTestId(`doc-chunks-${DOCS[0].id}`));
+    await userEvent.click(await screen.findByText("By chunk"));
     expect(await screen.findByTestId("kb-chunk-heading-c1")).toHaveTextContent("Benefits");
     expect(screen.getByText("500 per year.")).toBeInTheDocument();
     expect(screen.queryByTestId("kb-chunk-heading-c2")).not.toBeInTheDocument();
   });
 
-  describe("segment preview views (B-206 K-1)", () => {
+  // B-206 K-1, reworked by B-175 P3-PR3: the drawer opens on the passages
+  // (「按整块」, each with its chunks folded below); 「按小段」 lists the chunks,
+  // each naming the passage it belongs to.
+  describe("segment preview views (B-206 K-1 / B-175 P3-PR3)", () => {
     const CHILDREN: knowledgeSdk.ChunksPage = {
       chunks: [
         { id: "c1", chunk_index: 0, content: "alpha", chunk_type: "text", parent_index: 3 },
@@ -469,28 +502,28 @@ describe("KnowledgeDetail", () => {
       offset: 0,
       limit: 20,
     };
-    const PARENTS: knowledgeSdk.ChunksPage = {
-      chunks: [
+    const PASSAGE: maintenanceSdk.Passage = {
+      ...lonePassage("p1", "alpha and more", ["Benefits"]),
+      kind: "parent",
+      chunk_index: 3,
+      children: [
         {
-          id: "p1",
-          chunk_index: 3,
-          content: "alpha and more",
-          chunk_type: "parent",
+          id: "c1",
+          chunk_index: 0,
+          content: "alpha",
           heading_path: ["Benefits"],
-          parent_index: null,
+          enabled: true,
+          disabled_reason: null,
         },
       ],
-      total: 1,
-      offset: 0,
-      limit: 20,
     };
 
-    function byView(parents: knowledgeSdk.ChunksPage = PARENTS) {
-      return vi
-        .spyOn(knowledgeSdk, "listChunks")
-        .mockImplementation(async (_base, _doc, params) =>
-          params?.view === "parents" ? parents : CHILDREN,
-        );
+    function chunksSpy() {
+      return vi.spyOn(knowledgeSdk, "listChunks").mockResolvedValue(CHILDREN);
+    }
+
+    function passagesSpy(page: maintenanceSdk.PassagesPage = passagePage([PASSAGE])) {
+      return vi.spyOn(maintenanceSdk, "listPassages").mockResolvedValue(page);
     }
 
     async function inChinese(body: () => Promise<void>): Promise<void> {
@@ -510,115 +543,124 @@ describe("KnowledgeDetail", () => {
       await userEvent.click(await screen.findByTestId(`doc-chunks-${DOCS[0].id}`));
     }
 
-    it("lists chunks first, each naming the 整块 it belongs to", async () => {
+    it("lists the passages first, each naming its chunks", async () => {
       await inChinese(async () => {
-        const spy = byView();
+        const passages = passagesSpy();
+        const chunks = chunksSpy();
         await openDrawer();
+        expect(await screen.findByText("alpha and more")).toBeInTheDocument();
+        expect(passages).toHaveBeenLastCalledWith(
+          "support-docs",
+          DOCS[0].id,
+          { offset: 0, limit: 20 },
+          undefined,
+        );
+        expect(chunks).not.toHaveBeenCalled();
+        expect(screen.getByRole("radio", { name: "按整块" })).toBeChecked();
+        expect(screen.getByTestId("kb-passage-meta-p1")).toHaveTextContent("整块 #3");
+        expect(screen.getByTestId("kb-passage-meta-p1")).toHaveTextContent("1 个小段");
+        expect(screen.getByTestId("kb-passage-heading-p1")).toHaveTextContent("Benefits");
+      });
+    });
+
+    it("switches to the chunks, each naming the 整块 it belongs to, and back", async () => {
+      await inChinese(async () => {
+        passagesSpy();
+        const chunks = chunksSpy();
+        await openDrawer();
+        await screen.findByText("alpha and more");
+        await userEvent.click(screen.getByText("按小段"));
         expect(await screen.findByText("alpha")).toBeInTheDocument();
-        expect(spy).toHaveBeenLastCalledWith(
+        expect(chunks).toHaveBeenLastCalledWith(
           "support-docs",
           DOCS[0].id,
           { offset: 0, limit: 20, view: "children" },
           undefined,
         );
-        expect(screen.getByRole("radio", { name: "按小段" })).toBeChecked();
         expect(screen.getByText("小段 #0")).toBeInTheDocument();
         expect(screen.getByTestId("kb-chunk-parent-c1")).toHaveTextContent("属于整块 #3");
         // A chunk with no parent row says nothing about one.
         expect(screen.getByText("小段 #1")).toBeInTheDocument();
         expect(screen.queryByTestId("kb-chunk-parent-c2")).toBeNull();
-      });
-    });
-
-    it("switches to the 整块 and back", async () => {
-      await inChinese(async () => {
-        const spy = byView();
-        await openDrawer();
-        await screen.findByText("alpha");
+        expect(screen.queryByText("alpha and more")).toBeNull();
         await userEvent.click(screen.getByText("按整块"));
         expect(await screen.findByText("alpha and more")).toBeInTheDocument();
-        expect(spy).toHaveBeenLastCalledWith(
-          "support-docs",
-          DOCS[0].id,
-          { offset: 0, limit: 20, view: "parents" },
-          undefined,
-        );
-        // A parent card reads like a chunk card: its label, breadcrumb and text.
-        expect(screen.getByText("整块 #3")).toBeInTheDocument();
-        expect(screen.getByTestId("kb-chunk-heading-p1")).toHaveTextContent("Benefits");
-        expect(screen.queryByText("alpha")).toBeNull();
-        expect(screen.queryByTestId("kb-chunk-parent-p1")).toBeNull();
-        await userEvent.click(screen.getByText("按小段"));
-        expect(await screen.findByText("alpha")).toBeInTheDocument();
-        expect(screen.queryByText("alpha and more")).toBeNull();
+        expect(screen.queryByTestId("kb-chunk-parent-c1")).toBeNull();
       });
     });
 
-    it("pages the 整块 view by its own total", async () => {
-      const spy = byView({ ...PARENTS, total: 45 });
+    it("pages the chunk view by its own total", async () => {
+      passagesSpy();
+      const chunks = vi
+        .spyOn(knowledgeSdk, "listChunks")
+        .mockResolvedValue({ ...CHILDREN, total: 45 });
       await openDrawer();
-      await screen.findByText("alpha");
-      await userEvent.click(screen.getByText("By passage"));
       await screen.findByText("alpha and more");
+      await userEvent.click(screen.getByText("By chunk"));
+      await screen.findByText("alpha");
       const drawer = screen.getByTestId("kb-chunks-drawer");
       await userEvent.click(within(drawer).getByText("2"));
       await waitFor(() =>
-        expect(spy).toHaveBeenLastCalledWith(
+        expect(chunks).toHaveBeenLastCalledWith(
           "support-docs",
           DOCS[0].id,
-          { offset: 20, limit: 20, view: "parents" },
+          { offset: 20, limit: 20, view: "children" },
           undefined,
         ),
       );
     });
 
-    it("says a document with no 整块 has none", async () => {
+    it("says a document with no passages yet has none", async () => {
       await inChinese(async () => {
-        byView({ chunks: [], total: 0, offset: 0, limit: 20 });
+        passagesSpy(passagePage([]));
         await openDrawer();
-        await screen.findByText("alpha");
-        await userEvent.click(screen.getByText("按整块"));
         expect(
-          await screen.findByText("这个文档没有整块，检索时每个小段单独作为一条结果。"),
+          await screen.findByText("这份文档还没有整块（可能仍在入库）。"),
         ).toBeInTheDocument();
       });
     });
 
-    it("a slower answer for the view just left never replaces the one asked for", async () => {
-      let answerChildren: (page: knowledgeSdk.ChunksPage) => void = () => {};
-      vi.spyOn(knowledgeSdk, "listChunks").mockImplementation((_base, _doc, params) =>
-        params?.view === "parents"
-          ? Promise.resolve(PARENTS)
-          : new Promise((resolve) => {
-              answerChildren = resolve;
+    it("a slower answer for a chunk read the user left never replaces the later one", async () => {
+      passagesSpy();
+      let answerFirst: (page: knowledgeSdk.ChunksPage) => void = () => {};
+      vi.spyOn(knowledgeSdk, "listChunks")
+        .mockImplementationOnce(
+          () =>
+            new Promise((resolve) => {
+              answerFirst = resolve;
             }),
-      );
+        )
+        .mockResolvedValue(CHILDREN);
       await openDrawer();
-      await userEvent.click(await screen.findByText("By passage"));
-      expect(await screen.findByText("alpha and more")).toBeInTheDocument();
-      await act(async () => answerChildren(CHILDREN));
-      expect(screen.getByText("alpha and more")).toBeInTheDocument();
-      expect(screen.queryByText("alpha")).toBeNull();
+      await screen.findByText("alpha and more");
+      // The first read of the chunks is still on its way when the user
+      // leaves the view and comes back (a second read).
+      await userEvent.click(screen.getByText("By chunk"));
+      await userEvent.click(screen.getByText("By passage"));
+      await userEvent.click(screen.getByText("By chunk"));
+      expect(await screen.findByText("alpha")).toBeInTheDocument();
+      await act(async () =>
+        answerFirst({
+          ...CHILDREN,
+          chunks: [{ id: "c9", chunk_index: 20, content: "omega", chunk_type: "text" }],
+        }),
+      );
+      expect(screen.getByText("alpha")).toBeInTheDocument();
+      expect(screen.queryByText("omega")).toBeNull();
     });
 
-    it("opens the next document on the chunk view again", async () => {
-      const spy = byView();
+    it("opens the next document on the passage view again", async () => {
+      const passages = passagesSpy();
+      chunksSpy();
       await openDrawer();
-      await screen.findByText("alpha");
-      await userEvent.click(screen.getByText("By passage"));
       await screen.findByText("alpha and more");
+      await userEvent.click(screen.getByText("By chunk"));
+      await screen.findByText("alpha");
       await userEvent.click(screen.getByRole("button", { name: "Close" }));
       await userEvent.click(screen.getByTestId(`doc-chunks-${DOCS[0].id}`));
-      await waitFor(() =>
-        expect(spy).toHaveBeenLastCalledWith(
-          "support-docs",
-          DOCS[0].id,
-          { offset: 0, limit: 20, view: "children" },
-          undefined,
-        ),
-      );
-      expect(await screen.findByText("alpha")).toBeInTheDocument();
-      expect(screen.getByRole("radio", { name: "By chunk" })).toBeChecked();
+      await waitFor(() => expect(passages).toHaveBeenCalledTimes(2));
+      expect(await screen.findByText("alpha and more")).toBeInTheDocument();
+      expect(screen.getByRole("radio", { name: "By passage" })).toBeChecked();
     });
   });
 
@@ -1410,4 +1452,46 @@ describe("DocumentsTab — server paging edges (B-175 L3)", () => {
     expect(screen.queryByText("doc-0.pdf")).not.toBeInTheDocument();
     expect(screen.getByText("doc-59.pdf")).toBeInTheDocument();
   }, FULL_PAGE_TIMEOUT_MS);
+});
+
+describe("KnowledgeDetail — maintenance wiring (B-175 P3-PR3)", () => {
+  it("the header sums up the chunking", async () => {
+    vi.spyOn(knowledgeSdk, "getBase").mockResolvedValue({ ...BASE, parent_max_tokens: 1024 });
+    vi.spyOn(knowledgeSdk, "listDocuments").mockResolvedValue(docPage(DOCS));
+    renderDetail();
+    expect(await screen.findByTestId("knowledge-config-summary")).toHaveTextContent(
+      "Chunking: chunk 512 / passage 1024 tokens / overlap 64",
+    );
+  });
+
+  it.each([
+    { roles: ["operator"], isSystemAdmin: false, canDelete: false },
+    { roles: ["admin"], isSystemAdmin: false, canDelete: true },
+    { roles: ["system_admin"], isSystemAdmin: true, canDelete: true },
+  ])("batch delete follows manifest:delete ($roles)", async ({ roles, isSystemAdmin, canDelete }) => {
+    identityRoles.roles = roles;
+    identityRoles.isSystemAdmin = isSystemAdmin;
+    vi.spyOn(knowledgeSdk, "getBase").mockResolvedValue(BASE);
+    vi.spyOn(knowledgeSdk, "listDocuments").mockResolvedValue(docPage(DOCS));
+    renderDetail();
+    await userEvent.click(await screen.findByRole("checkbox", { name: "Select faq.pdf" }));
+    const remove = screen.getByTestId("doc-batch-delete");
+    if (canDelete) {
+      expect(remove).toBeEnabled();
+      expect(screen.queryByTestId("doc-batch-delete-needs-admin")).toBeNull();
+    } else {
+      expect(remove).toBeDisabled();
+      expect(screen.getByTestId("doc-batch-delete-needs-admin")).toBeInTheDocument();
+    }
+  });
+
+  it("settings reads the stale count with the deep-link scope (W4)", async () => {
+    vi.spyOn(knowledgeSdk, "getBase").mockResolvedValue(BASE);
+    const stale = vi
+      .spyOn(maintenanceSdk, "getStaleDocuments")
+      .mockResolvedValue({ stale: 2, chunk_params_hash: "h" });
+    renderDetail(`/knowledge/support-docs/settings?tenant_id=${FOREIGN_TENANT}`);
+    expect(await screen.findByTestId("kb-settings-reingest-stale")).toBeDisabled();
+    expect(stale).toHaveBeenCalledWith("support-docs", FOREIGN_TENANT);
+  });
 });

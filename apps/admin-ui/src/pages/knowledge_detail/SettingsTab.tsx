@@ -29,6 +29,7 @@ import {
 } from "../../api/knowledge";
 import { ApiError } from "../../api/client";
 import { ReadonlyTooltip } from "../../components/ReadonlyTooltip";
+import { StaleDocumentsLine, useStaleDocuments } from "./StaleDocuments";
 import { thresholdPausedNotice } from "./thresholdPausedNotice";
 
 const { Text } = Typography;
@@ -58,15 +59,19 @@ interface SettingsTabProps {
   /** Cross-tenant W4(review C-2)— 只读态(切入态 ∪ "*" 聚合深链外租户
    *  读),由 KnowledgeDetail 统一判定下传;保存/重建索引一律置灰。 */
   readonly: boolean;
+  /** B-175 P3-PR3 — the read scope for the stale-documents count. */
+  readScope?: string;
 }
 
-export function SettingsTab({ base, onSaved, readonly }: SettingsTabProps) {
+export function SettingsTab({ base, onSaved, readonly, readScope }: SettingsTabProps) {
   const { t } = useTranslation();
   const { message } = App.useApp();
   const [form] = Form.useForm<SettingsFormValues>();
   const [saving, setSaving] = useState(false);
   const [reindexing, setReindexing] = useState(false);
   const [confirming, setConfirming] = useState(false);
+  const stale = useStaleDocuments(base.name, readScope);
+  const { refresh: refreshStale, confirmReingest } = stale;
 
   const config = base.retrieval_config;
   const initialValues: SettingsFormValues = {
@@ -86,6 +91,9 @@ export function SettingsTab({ base, onSaved, readonly }: SettingsTabProps) {
       // B-206 K-7b —— 重排分数下限一送出就算「在当前重排模型下标定」:只在改过这一栏时送,
       // 存别的设置不会把别的模型下标定的旧下限算成新模型的。
       const thresholdEdited = form.isFieldTouched("rerank_score_threshold");
+      const chunkingChanged =
+        values.chunk_max_tokens !== base.chunk_max_tokens ||
+        values.chunk_overlap_tokens !== base.chunk_overlap_tokens;
       try {
         await updateBase(base.name, {
           description: values.description ?? null,
@@ -101,14 +109,31 @@ export function SettingsTab({ base, onSaved, readonly }: SettingsTabProps) {
         });
         form.setFields([{ name: "rerank_score_threshold", touched: false }]);
         message.success(t("knowledge_page.settings_saved"));
-        await onSaved();
       } catch (err) {
         message.error(errMessage(err));
-      } finally {
         setSaving(false);
+        return;
       }
+      setSaving(false);
+      // B-175 P3-PR3 「保存即问」: the chunking changed and documents are still
+      // cut the old way — ask now (before the page reloads the base).
+      if (chunkingChanged) {
+        const count = await refreshStale();
+        if (count !== null && count > 0) await confirmReingest(count);
+      }
+      await onSaved();
     },
-    [base.name, form, t, message, onSaved],
+    [
+      base.name,
+      base.chunk_max_tokens,
+      base.chunk_overlap_tokens,
+      form,
+      t,
+      message,
+      onSaved,
+      refreshStale,
+      confirmReingest,
+    ],
   );
 
   /** B-206 K-7b —— 确认库上存的下限在当前重排模型下也成立:不送值,只让服务端改绑模型,
@@ -150,7 +175,15 @@ export function SettingsTab({ base, onSaved, readonly }: SettingsTabProps) {
           initialValues={initialValues}
           onFinish={handleSave}
         >
-          <Form.Item name="description" label={t("knowledge_page.field_description")}>
+          <Form.Item
+            name="description"
+            label={t("knowledge_page.field_description")}
+            extra={
+              <span data-testid="kb-settings-description-hint">
+                {t("kb_maintenance.description_agent_hint")}
+              </span>
+            }
+          >
             <Input.TextArea
               rows={2}
               placeholder={t("knowledge_page.field_description_placeholder")}
@@ -159,14 +192,21 @@ export function SettingsTab({ base, onSaved, readonly }: SettingsTabProps) {
           </Form.Item>
           <Form.Item
             name="chunk_max_tokens"
-            label={t("knowledge_page.field_chunk_max")}
+            label={t("kb_maintenance.chunk_max_label")}
             tooltip={t("knowledge_page.field_chunk_hint")}
+            extra={
+              base.parent_max_tokens != null ? (
+                <span data-testid="kb-settings-parent-max">
+                  {t("kb_maintenance.parent_max", { max: base.parent_max_tokens })}
+                </span>
+              ) : undefined
+            }
           >
             <InputNumber
               min={128}
               max={1024}
               style={{ width: "100%" }}
-              aria-label={t("knowledge_page.field_chunk_max")}
+              aria-label={t("kb_maintenance.chunk_max_label")}
             />
           </Form.Item>
           <Form.Item
@@ -180,6 +220,7 @@ export function SettingsTab({ base, onSaved, readonly }: SettingsTabProps) {
               aria-label={t("knowledge_page.field_chunk_overlap")}
             />
           </Form.Item>
+          <StaleDocumentsLine state={stale} readonly={readonly} />
           <Form.Item
             name="retrieval_top_k"
             label={t("knowledge_page.field_top_k")}
