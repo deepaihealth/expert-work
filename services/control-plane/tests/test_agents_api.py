@@ -12,6 +12,7 @@ from httpx import ASGITransport, AsyncClient
 
 from control_plane.app import create_app
 from control_plane.audit import build_default_audit_logger
+from control_plane.runtime import _CacheKey
 from control_plane.settings import DEFAULT_DEV_TENANT_ID, Settings
 from expert_work.persistence import TriggerStore
 from expert_work.persistence.audit_log import InMemoryAuditLogStore
@@ -479,7 +480,7 @@ async def b5_app_client(
         yield app, client
 
 
-def _seed_build_cache(app: object) -> tuple[object, str, str, str, None]:
+def _seed_build_cache(app: object) -> _CacheKey:
     """Stand a sentinel build in the runtime cache for code-reviewer@1.0.0 so a
     following write can be shown to evict it. Returns the cache key.
 
@@ -488,7 +489,8 @@ def _seed_build_cache(app: object) -> tuple[object, str, str, str, None]:
     wrong arity would either be dropped for the wrong reason or, once the sha
     element moved, stop representing anything the runtime can actually hold."""
     runtime = app.state.agent_runtime  # type: ignore[attr-defined]
-    key = (_DEFAULT_TENANT, "code-reviewer", "1.0.0", "0" * 64, None)
+    # (tenant, name, version, spec_sha256, OAuth subject, knowledge catalog fingerprint)
+    key: _CacheKey = (_DEFAULT_TENANT, "code-reviewer", "1.0.0", "0" * 64, None, None)
     runtime._cache[key] = object()  # stand-in for a BuiltAgent
     return key
 

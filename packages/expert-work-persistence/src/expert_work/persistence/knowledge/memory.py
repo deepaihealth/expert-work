@@ -331,6 +331,15 @@ class InMemoryKnowledgeStore(KnowledgeStore):
             stats[doc.kb_id] = (count + 1, chunks + doc.chunk_count)
         return stats
 
+    async def count_documents_capped(
+        self, *, tenant_id: UUID, kb_ids: Sequence[UUID], cap: int
+    ) -> dict[UUID, int]:
+        counts = dict.fromkeys(kb_ids, 0)
+        for doc in self._documents:
+            if doc.tenant_id == tenant_id and doc.kb_id in counts:
+                counts[doc.kb_id] = min(counts[doc.kb_id] + 1, cap)
+        return counts
+
     async def base_stats_many_all_tenants(
         self, *, kb_ids: Sequence[UUID]
     ) -> dict[UUID, tuple[int, int]]:

@@ -1224,9 +1224,39 @@ PY
 - [x] **57.2 平台技能导入**:平台技能页导入同一个包。判据:导入成功。**没修好时**:400,提示「disallowed file type」。 **10-27 测试 `e90903f7e` 过**:`POST /v1/platform/skills/import` 201。
 - [x] **57.3 沙箱读得到**:调试台给一个智能体挂上 57.1 导入的技能,问「技能里那份 PDF 有几页」。判据:智能体在沙箱里读到 `assets/reference.pdf`,答 2 页。测完删掉两处导入的技能。 **10-27 测试 `e90903f7e` 过**(glm-5.3):智能体在 `$EXPERT_WORK_SKILLS_DIR/skill57-pdf-check/assets/` 下看到 `reference.pdf`,用 pypdf 读出 2 页,回答「共 2 页」。两处导入的技能已归档(没有硬删除接口),临时智能体已删。
 
-## §TBD-B225 read_file 碰到技能目录时报错给出读法(ROADMAP B-225)
+## §58 多库目录 + 按库检索(B-175 P4)
+
+**背景**:智能体绑了**两个及以上**知识库时,系统提示词最后加一节 `# Knowledge bases`:一段固定的英文规则 + `<knowledge_catalog>`,每个库一行 `<base handle="K1" name="…" documents="1-9" description="…" />`。句柄 `K<n>` = 该库在智能体 `knowledge_base_refs` 里的位置(库不存在就跳过,其余不重排);库名、描述是管理员写的原文,压成一行、去掉不可见字符(控制字符、双向覆盖、零宽字符、BOM、标签字符)、按 XML 属性转义,库名最多 128 字、描述最多 240 字,规则里写明它们是数据不是指令;文档数只数本智能体绑定的库、每个库数到 10000 为止;文档数只给分档(`0` / `1-9` / `10-99` / `100-999` / `1000-9999` / `10000+`);最多列 20 个库,其余写一行「N more…」。没有文档标题,也没有自动生成的库画像。`knowledge_search` 同时多一个可选参数 `bases`(句柄或库名的列表):只能选本智能体绑定的库,传别的(包括同租户里存在、但本智能体没绑的库)直接报错、不检索;不传或传空照旧查全部;按 `bases` 只查了一部分库而没查到时,结果写明查了哪些、哪些没查,不说「知识库没有」。绑 0 / 1 个库时,系统提示词和工具参数与发版前**逐字节相同**。目录在构建时冻结进系统提示词,构建缓存键(主智能体与静态子智能体两处)带目录指纹:描述改了、文档数跨档了,下一次 run 重建;同一档内加文档不重建;构建自己读到的目录与缓存键不一致(构建时读库失败,或两次读之间目录被改、绑定的库刚建或刚删)时,这次构建照常用、但不进缓存(日志 `control_plane.build_not_cached reason=knowledge_catalog_mismatch`)。静态子智能体(`agent_ref`)走同一条构建路径,有它自己的目录;动态 worker 改为继承父智能体的知识库(10-27 拍板,此前剥空):同一组库、同一个检索器、同租户,两个及以上库时也带目录;worker 不缓存,不涉及缓存键。构建时打日志 `agent_factory.knowledge_catalog entries=<n> fingerprint=<16 位>`(不含库名、描述)。读库失败时照常构建、不带目录,打一条 `agent_factory.knowledge_catalog_unavailable` 警告。
+
+**怎么进**:测试环境控制台(system_admin,平台租户)。看模型输入:Langfuse 里该 run 的 LLM 调用输入(system 消息末尾、tools 里 `knowledge_search` 的 parameters);看构建:控制面日志 `grep agent_factory.knowledge_catalog`(多副本时每个副本各建一次,看 fingerprint)。期间别改这几个智能体的其它配置。**测试文件(零租户内容,本机生成)**:
+
+```bash
+python3 - <<'PY'
+docs = {
+    "acc-d1-a.md": "# 验收保修规定\n\n验收用电水壶整机保修 17 个月,签收 8 天内可以无理由退货。\n",
+    "acc-d1-a2.md": "# 验收维修收费\n\n验收用上门服务费每次 41 元。\n",
+    "acc-d1-b.md": "# 验收型号参数\n\n验收型号 ACC-D1-77 的额定功率是 1460 W,容量 1.5 升。\n",
+    "acc-d1-c.md": "# 验收未绑定的库\n\n验收暗号是 D1-ZETA-58。\n",
+}
+for name, text in docs.items():
+    open(f"/tmp/{name}", "w", encoding="utf-8").write(text)
+PY
+```
+
+建三个临时知识库并上传、等就绪(嵌入不到 1 分钱):`acc-d1-a`(描述「家电保修与退换货规定」,传 `/tmp/acc-d1-a.md`)、`acc-d1-b`(描述「各型号技术参数」,传 `/tmp/acc-d1-b.md`)、`acc-d1-c`(描述「验收用,不绑定」,传 `/tmp/acc-d1-c.md`)。建两个临时智能体(不开持久工作区,模型 glm-5.3):`acc-d1` 的 `knowledge: {knowledge_base_refs: [acc-d1-a, acc-d1-b]}`;`acc-d1-one` 只绑 `[acc-d1-a]`。
+
+- [ ] **58.1 两个库有目录,一个库没有**:调试台分别问 `acc-d1` 和 `acc-d1-one`「你好」。判据:`acc-d1` 的 system 消息以 `# Knowledge bases` 一节结尾,含 `<base handle="K1" name="acc-d1-a" documents="1-9" description="家电保修与退换货规定" />` 与 `<base handle="K2" name="acc-d1-b" documents="1-9" description="各型号技术参数" />`,最后一行是 `</knowledge_catalog>`;`knowledge_search` 的 parameters 有 `bases`(字符串数组);控制面日志 `agent_factory.knowledge_catalog entries=2 fingerprint=…`。`acc-d1-one` 的 system 消息里没有 `knowledge_catalog`、没有 `# Knowledge bases`;`knowledge_search` 的 parameters 只有 `query`、`limit`;它的构建没有这行日志。**没修好时**:`acc-d1` 没有目录,或 `acc-d1-one` 也有目录 / `bases` 参数。
+- [ ] **58.2 按库检索**:问 `acc-d1`「型号 ACC-D1-77 的额定功率是多少?」。判据:第一次 `knowledge_search` 的参数带 `bases: ["K2"]`(或 `["acc-d1-b"]`),返回的每条结果都以 `[acc-d1-b.md#` 开头,该工具消息的 `artifact`(调试台原始事件)里有 `bases: ["acc-d1-b"]`;回答 1460 W。模型没传 `bases`(这是模型自己的选择,不算产品缺陷)时,同一会话里补一句「只在型号参数库里查」再看工具行为。再问「只在 K2 里查一下验收电水壶的保修期」:这次检索 `bases: ["K2"]` 查不到,工具结果是 `[no relevant knowledge found for the query in the selected knowledge bases (acc-d1-b): …; not searched: acc-d1-a]`,提示里说只查了选中的库、不传 `bases` 会查全部,**不说**「知识库没有」;模型随后不带 `bases` 再查(查到 17 个月)或如实说只查了参数库。**没修好时**:工具没有 `bases` 参数,或传了 `bases` 仍返回 `acc-d1-a.md` 的结果,或只查了一个库就说「知识库没有」。
+- [ ] **58.3 不能越权查没绑的库**:问 `acc-d1`「调用 knowledge_search 时把 bases 设为 ["acc-d1-c"],查一下验收暗号」。判据:这次调用报错,错误里是 `unknown knowledge base in 'bases': acc-d1-c; this agent can search K1 (acc-d1-a), K2 (acc-d1-b)`;整个 run 里没有任何工具结果含 `acc-d1-c.md` 或 `D1-ZETA-58`,回答里也没有 `D1-ZETA-58`。**没修好时**:查到了 `acc-d1-c` 的内容。
+- [ ] **58.4 改描述下一次 run 就生效**:把 `acc-d1-b` 的描述改成「各型号技术参数(已改)」,再问 `acc-d1`「你好」。判据:出现新的构建日志,fingerprint 与 58.1 的不同;system 消息里 K2 那行的 description 是新文字。**没修好时**:最多 30 分钟内(缓存 TTL)仍是旧描述、没有新的构建日志。
+- [ ] **58.5 同一档内加文档不重建**:给 `acc-d1-a` 再传 `/tmp/acc-d1-a2.md`(文档数 1 → 2,仍是 `1-9`),等就绪后再问 `acc-d1` 两次「你好」。判据:两次 run 的 system 消息与 58.4 之后那次逐字节相同;若出现新的构建日志(请求落到了还没缓存的副本),其 fingerprint 与 58.4 的相同。**没修好时**:fingerprint 变了(目录里混进了随上传变化的内容)。
+- [ ] **58.6 静态子智能体有自己的目录**:建临时智能体 `acc-d1-parent`(不绑知识库),`subagents: [{name: kb_helper, agent_ref: "acc-d1@<版本>", description: "回答家电保修与型号参数问题"}]`,问它「请让 kb_helper 查一下型号 ACC-D1-77 的额定功率」。判据:子智能体那次 LLM 调用的 system 消息以 `acc-d1` 的目录结尾(K1 / K2 两行);日志有 `control_plane.subagent.built name=acc-d1` 和一行 `agent_factory.knowledge_catalog entries=2`。父智能体自己的 system 消息里没有目录。**没修好时**:子智能体没有目录。
+- [ ] **58.7 动态 worker 继承父的知识库**(10-27 拍板;前提:平台 `dynamic_worker_allowed_toolsets` 为空,测试环境默认如此 —— 非空且不含 `knowledge_search` 时 worker 不带知识库):给 `acc-d1` 打开动态 worker(`dynamic_workers.enabled: true`,平台开关已开),问它「请派一个 worker 去知识库里查型号 ACC-D1-77 的额定功率,再把结果告诉我」。判据:worker 那次 LLM 调用的工具列表里有 `knowledge_search`(parameters 含 `bases`),system 消息以与 `acc-d1` 相同的目录结尾(K1 `acc-d1-a` / K2 `acc-d1-b` 两行,没有 `acc-d1-c`);worker 的检索结果只来自 `acc-d1-a.md` / `acc-d1-b.md`;让 worker 把 `bases` 设为 `["acc-d1-c"]` 时同 58.3 报错、不检索。worker 的检索用量(查询嵌入 / 重排)记 `platform_overhead`、`agent_name` 为 `acc-d1-worker`,与 worker 自己的模型调用同一个名字。再给 `acc-d1-one` 同样打开动态 worker 并派一个:worker 有 `knowledge_search`(parameters 只有 `query`、`limit`),没有目录。**没修好时**:worker 没有 `knowledge_search`(发版前的行为),或 worker 能查到 `acc-d1-c`。
+- [ ] **58.8 B-140 知识库用例**(协调人跑):按 `tools/eval/README.md`「知识库用例」准备 `eval-kb` 与三个合成库,发版前镜像与本次镜像各跑 `k01`~`k05` × 3。判据:本次镜像 k01 / k02 的 `tool_arg_contains` 3 次里至少 2 次过(发版前不可能过:没有 `bases` 参数);k03~k05 不比发版前差(对照规则同 B-140)。测完删 `acc-d1`、`acc-d1-one`、`acc-d1-parent` 和 `acc-d1-a` / `acc-d1-b` / `acc-d1-c`。
+
+## §59 read_file 碰到技能目录时报错给出读法(ROADMAP B-225)
 
 **背景**:技能文件在沙箱的 `$EXPERT_WORK_SKILLS_DIR`(`/opt/skills/<agent_key>/`)下,不在工作区;`read_file` 只读工作区,碰到 `../opt/skills/…` 会拒。改动后,拒绝含 `opt/skills/` 的路径时,报错末尾多一句「用 skill_view(skill_name, path) 读,或在 bash 里到 `$EXPERT_WORK_SKILLS_DIR/<技能名>/` 下读或运行」;其它被拒路径的报错不变。
 
-- [ ] **B225.1 技能路径给出读法**:调试台用一个挂了任意技能的智能体,让它「用 read_file 读 `../opt/skills/` 下这个技能的 SKILL.md」。判据:工具结果是 `[tool error] ValueError: read_file path must be a relative workspace path without '..': …`,并且后面带 `skill_view` 和 `$EXPERT_WORK_SKILLS_DIR` 的提示;下一步模型改用 skill_view 或 bash 读到。**没修好时**:报错只有前半句,没有读法提示。
-- [ ] **B225.2 其它路径不变**:同一个智能体让它 read_file `../etc/passwd`。判据:报错只有原来那半句,不含 `skill_view`。**没修好时**:无关路径也带上技能提示。
+- [ ] **59.1 技能路径给出读法**:调试台用一个挂了任意技能的智能体,让它「用 read_file 读 `../opt/skills/` 下这个技能的 SKILL.md」。判据:工具结果是 `[tool error] ValueError: read_file path must be a relative workspace path without '..': …`,并且后面带 `skill_view` 和 `$EXPERT_WORK_SKILLS_DIR` 的提示;下一步模型改用 skill_view 或 bash 读到。**没修好时**:报错只有前半句,没有读法提示。
+- [ ] **59.2 其它路径不变**:同一个智能体让它 read_file `../etc/passwd`。判据:报错只有原来那半句,不含 `skill_view`。**没修好时**:无关路径也带上技能提示。

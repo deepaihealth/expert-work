@@ -507,6 +507,31 @@ async def test_base_stats_aggregate(sql_store: SqlStoreFixture) -> None:
 
 
 @pytest.mark.asyncio
+async def test_count_documents_capped(sql_store: SqlStoreFixture) -> None:
+    """B-175 P4 — same contract as the in-memory store's test of this name."""
+    store, engine = sql_store
+    try:
+        tenant, other_tenant = uuid4(), uuid4()
+        a = await store.create_base(tenant_id=tenant, name="a")
+        b = await store.create_base(tenant_id=tenant, name="b")
+        empty = await store.create_base(tenant_id=tenant, name="empty")
+        foreign = await store.create_base(tenant_id=other_tenant, name="a")
+        for kb, owner, n in ((a, tenant, 3), (b, tenant, 1), (foreign, other_tenant, 2)):
+            for _ in range(n):
+                await store.upsert_document(tenant_id=owner, kb_id=kb.id, filename=f"{uuid4()}.md")
+        got = await store.count_documents_capped(
+            tenant_id=tenant, kb_ids=[a.id, b.id, empty.id, foreign.id, a.id], cap=2
+        )
+        assert got == {a.id: 2, b.id: 1, empty.id: 0, foreign.id: 0}
+        assert await store.count_documents_capped(tenant_id=tenant, kb_ids=[a.id], cap=10) == {
+            a.id: 3
+        }
+        assert await store.count_documents_capped(tenant_id=tenant, kb_ids=[], cap=10) == {}
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
 async def test_list_bases_all_tenants_aggregates(sql_store: SqlStoreFixture) -> None:
     """W4 — the all-tenants readers span tenants (newest first, per-base
     stats keyed by globally-unique kb_id). Session container is shared, so
