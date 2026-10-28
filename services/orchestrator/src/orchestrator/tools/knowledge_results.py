@@ -39,11 +39,13 @@ class ParentHit:
     hit_chunk_indexes: tuple[int, ...]
 
 
-def collapse_to_parents(children: Sequence[KnowledgeChunk], limit: int) -> list[ParentHit]:
-    """The best ``limit`` parents of ``children`` (ranked best first). A child's
-    parent is its ``parent_chunk_id``, or the child itself when it has none (no
-    parent row was stored for it). A later child of a parent already seen only
-    adds its index to that parent's hits."""
+def collapse_to_parents(
+    children: Sequence[KnowledgeChunk], limit: int | None = None
+) -> list[ParentHit]:
+    """The best ``limit`` parents of ``children`` (ranked best first; every one
+    when ``limit`` is ``None``). A child's parent is its ``parent_chunk_id``, or
+    the child itself when it has none (no parent row was stored for it). A later
+    child of a parent already seen only adds its index to that parent's hits."""
     best: dict[UUID, KnowledgeChunk] = {}
     hits: dict[UUID, list[int]] = {}
     for child in children:

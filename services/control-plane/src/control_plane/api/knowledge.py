@@ -1171,6 +1171,13 @@ def build_knowledge_router() -> APIRouter:
                 "rerank_outcome": outcome.rerank_outcome,
                 # B-206 K-8 — the query could not be embedded: keyword results only.
                 "embedding_degraded": outcome.embedding_degraded,
+                # B-206 K-22 — the keyword path could not finish (its statement
+                # timeout, a lost connection): the other path's results only.
+                "keyword_degraded": outcome.keyword_degraded,
+                # B-206 K-21② — passages (parents, or children shown as
+                # themselves; not child chunks) left out as a copy of a
+                # better-ranked one.
+                "duplicates_dropped": outcome.duplicates_dropped,
                 # B-206 K-14 — candidates the reranker was handed but never
                 # judged (its model's per-request cap, or a length refusal).
                 "rerank_dropped": outcome.rerank_dropped,

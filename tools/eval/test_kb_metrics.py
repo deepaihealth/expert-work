@@ -16,6 +16,7 @@ from kb_metrics import (  # type: ignore[import-not-found]
     coverage_at_k,
     document_coverage,
     document_hits,
+    dup_share_at_k,
     false_refusal_rate,
     grouped,
     hit_at_k,
@@ -35,6 +36,11 @@ class _Result:
     chunk_index: int = 0
     score: float | None = None
     recall_source: str | None = None
+    heading_path: tuple[str, ...] = ()
+
+    @property
+    def content(self) -> str:
+        return self.retrieval_text
 
 
 @dataclass(frozen=True)
@@ -533,3 +539,52 @@ def test_document_coverage_groups_alternates_under_the_listed_document() -> None
     exp_a2_also = _Expected(document="a.md", anchor="菌株编号 BL-99", also=frozenset({"a2.md"}))
     coverage = document_coverage([_r("a2.md", "x")], [_EXP_A_ALSO, exp_a2_also])
     assert coverage == [frozenset({0})]
+
+
+# ---------------------------------------------------------------------------
+# 副本占名额(B-206 K-21②)
+# ---------------------------------------------------------------------------
+
+
+def test_dup_share_counts_results_repeating_an_earlier_results_passage() -> None:
+    """The production copy key (``knowledge_dedup.passage_key``): the same
+    breadcrumb + body up to whitespace, under another file name."""
+    results = [
+        _r("a.md", f"{_ANCHOR} 不需要冷藏"),
+        _r("b.md", "别的段落"),
+        _r("a_copy.md", f"{_ANCHOR}  不需要冷藏"),
+        _r("c.md", "第三段"),
+    ]
+    assert dup_share_at_k(results) == 0.25
+    assert dup_share_at_k([]) is None
+
+
+def test_dup_share_does_not_count_markup_case_or_another_section_as_a_copy() -> None:
+    results = [
+        _r("a.md", _ANCHOR),
+        _r("b.md", f"**{_ANCHOR}**"),
+        replace(_r("c.md", _ANCHOR), heading_path=("另一节",)),
+        _r("d.md", "Code QX-7a"),
+        _r("e.md", "Code qx-7A"),
+    ]
+    assert dup_share_at_k(results) == 0.0
+
+
+def test_dup_share_looks_at_the_top_ten_only() -> None:
+    results = [*_miss(10), _r("x.md", "无关内容 0")]
+    assert dup_share_at_k(results) == 0.0
+    assert dup_share_at_k(results, k=11) == pytest.approx(1 / 11)
+
+
+def test_dup_share_is_scored_and_averaged_over_every_case_with_results() -> None:
+    copies = [_r("a.md", _ANCHOR), _r("a_copy.md", _ANCHOR)]
+    answerable = score_case(copies, [_EXP_A], threshold=None)
+    no_answer = score_case(copies[:1], [], threshold=None)
+    empty = score_case([], [], threshold=None)
+    assert (answerable.dup_share_10, no_answer.dup_share_10, empty.dup_share_10) == (
+        0.5,
+        0.0,
+        None,
+    )
+    assert answerable.metrics()["dup_share@10"] == 0.5
+    assert aggregate([answerable, no_answer, empty])["dup_share@10"] == 0.25

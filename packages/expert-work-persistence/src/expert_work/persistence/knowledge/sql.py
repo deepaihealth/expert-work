@@ -32,7 +32,7 @@ from sqlalchemy import (
 )
 from sqlalchemy.dialects.postgresql import ARRAY
 from sqlalchemy.dialects.postgresql import insert as pg_insert
-from sqlalchemy.exc import DBAPIError, IntegrityError
+from sqlalchemy.exc import DBAPIError, IntegrityError, InterfaceError, OperationalError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from sqlalchemy.sql.elements import ColumnElement
 from sqlalchemy.sql.selectable import CTE
@@ -43,6 +43,7 @@ from expert_work.persistence.knowledge.base import (
     ClaimedIngestion,
     DocumentFileFacts,
     DuplicateKnowledgeBaseError,
+    KnowledgeRecallError,
     KnowledgeStore,
     ParseCacheEntry,
     ParseCacheKind,
@@ -116,6 +117,21 @@ _HNSW_EF_SEARCH_MAX = 1000
 _HNSW_ITERATIVE_SCAN_GUC = "hnsw.iterative_scan"
 _HNSW_ITERATIVE_SCAN = "strict_order"
 _ITERATIVE_SCAN_MIN_VERSION = (0, 8)
+#: ``statement_timeout`` of the keyword recall statement, for its transaction
+#: only (B-206 K-22): a plan gone wrong has taken 10 to 44 s, and a hybrid search
+#: keeps its vector results when this path fails rather than waiting it out.
+_KEYWORD_STATEMENT_TIMEOUT_MS = 5_000
+#: SQLSTATEs that mean the keyword query could not finish, not that it is wrong —
+#: the only database errors it degrades on (:class:`KnowledgeRecallError`):
+#: 57014 statement timeout / cancelled, 55P03 lock not available, 40001
+#: serialization failure, 40P01 deadlock, 57P01-57P03 the server shutting down or
+#: starting; and the classes 08 (connection) and 53 (insufficient resources). A
+#: bug (42883 undefined function, 42703 undefined column) or a missing permission
+#: (42501) propagates: degrading it would hide it behind vector-only results.
+_RECALL_FAILED_SQLSTATES = frozenset(
+    {"57014", "55P03", "40001", "40P01", "57P01", "57P02", "57P03"}
+)
+_RECALL_FAILED_SQLSTATE_CLASSES = frozenset({"08", "53"})
 #: SQLSTATEs that mean the server refused the setting itself — the only
 #: failures that turn iterative scan off: 22023 invalid value, 42602 a name
 #: under an extension's reserved prefix that this build does not define (what
@@ -373,6 +389,18 @@ def _kb_unit_tsqueries(query: KbKeywordQuery) -> list[ColumnElement[Any]]:
     user types stay plain text."""
     terms = [_kb_unit_tsquery(query, term, phrase=False) for term in query.terms]
     return [*terms, *_kb_phrase_tsqueries(query)]
+
+
+def _recall_failed(exc: DBAPIError) -> bool:
+    """Whether ``exc`` says a recall query could not finish (B-206 K-22): a
+    SQLSTATE in :data:`_RECALL_FAILED_SQLSTATES` or its classes, a connection
+    SQLAlchemy invalidated, or a driver-level disconnect that carries no SQLSTATE."""
+    if exc.connection_invalidated:
+        return True
+    sqlstate = getattr(exc.orig, "sqlstate", None)
+    if not isinstance(sqlstate, str):
+        return isinstance(exc, (InterfaceError, OperationalError))
+    return sqlstate in _RECALL_FAILED_SQLSTATES or sqlstate[:2] in _RECALL_FAILED_SQLSTATE_CLASSES
 
 
 def _kb_keyword_tsquery(query: KbKeywordQuery) -> ColumnElement[Any]:
@@ -1879,15 +1907,26 @@ class SqlKnowledgeStore(KnowledgeStore):
             .join(top, KnowledgeChunkRow.id == top.c.id)
             .order_by(top.c.rank.desc())
         )
-        async with self._sf() as session:
-            # A custom plan every time, for this transaction only: asyncpg keeps
-            # the statement prepared, and a generic plan (Postgres' choice from
-            # the sixth run on a connection) re-evaluates every unit's tsquery
-            # per matching row — about 4x slower.
-            await session.execute(
-                text("SELECT set_config('plan_cache_mode', 'force_custom_plan', true)")
-            )
-            rows = (await session.execute(stmt)).all()
+        try:
+            async with self._sf() as session:
+                # A custom plan every time, for this transaction only: asyncpg keeps
+                # the statement prepared, and a generic plan (Postgres' choice from
+                # the sixth run on a connection) re-evaluates every unit's tsquery
+                # per matching row — about 4x slower. The timeout is this
+                # transaction's too (B-206 K-22).
+                await session.execute(
+                    text(
+                        "SELECT set_config('plan_cache_mode', 'force_custom_plan', true), "
+                        "set_config('statement_timeout', :timeout, true)"
+                    ),
+                    {"timeout": str(_KEYWORD_STATEMENT_TIMEOUT_MS)},
+                )
+                rows = (await session.execute(stmt)).all()
+        except DBAPIError as exc:
+            if not _recall_failed(exc):
+                raise
+            # The driver's text, so a statement timeout still reads as a timeout.
+            raise KnowledgeRecallError(str(exc.orig)) from exc
         return [
             ScoredChunk(
                 chunk=_to_chunk_with_embedding(row), score=float(rank_value), source="keyword"

@@ -1253,3 +1253,32 @@ PY
 - [ ] **D1.6 静态子智能体有自己的目录**:建临时智能体 `acc-d1-parent`(不绑知识库),`subagents: [{name: kb_helper, agent_ref: "acc-d1@<版本>", description: "回答家电保修与型号参数问题"}]`,问它「请让 kb_helper 查一下型号 ACC-D1-77 的额定功率」。判据:子智能体那次 LLM 调用的 system 消息以 `acc-d1` 的目录结尾(K1 / K2 两行);日志有 `control_plane.subagent.built name=acc-d1` 和一行 `agent_factory.knowledge_catalog entries=2`。父智能体自己的 system 消息里没有目录。**没修好时**:子智能体没有目录。
 - [ ] **D1.7 动态 worker 继承父的知识库**(10-27 拍板;前提:平台 `dynamic_worker_allowed_toolsets` 为空,测试环境默认如此 —— 非空且不含 `knowledge_search` 时 worker 不带知识库):给 `acc-d1` 打开动态 worker(`dynamic_workers.enabled: true`,平台开关已开),问它「请派一个 worker 去知识库里查型号 ACC-D1-77 的额定功率,再把结果告诉我」。判据:worker 那次 LLM 调用的工具列表里有 `knowledge_search`(parameters 含 `bases`),system 消息以与 `acc-d1` 相同的目录结尾(K1 `acc-d1-a` / K2 `acc-d1-b` 两行,没有 `acc-d1-c`);worker 的检索结果只来自 `acc-d1-a.md` / `acc-d1-b.md`;让 worker 把 `bases` 设为 `["acc-d1-c"]` 时同 D1.3 报错、不检索。worker 的检索用量(查询嵌入 / 重排)记 `platform_overhead`、`agent_name` 为 `acc-d1-worker`,与 worker 自己的模型调用同一个名字。再给 `acc-d1-one` 同样打开动态 worker 并派一个:worker 有 `knowledge_search`(parameters 只有 `query`、`limit`),没有目录。**没修好时**:worker 没有 `knowledge_search`(发版前的行为),或 worker 能查到 `acc-d1-c`。
 - [ ] **D1.8 B-140 知识库用例**(协调人跑):按 `tools/eval/README.md`「知识库用例」准备 `eval-kb` 与三个合成库,发版前镜像与本次镜像各跑 `k01`~`k05` × 3。判据:本次镜像 k01 / k02 的 `tool_arg_contains` 3 次里至少 2 次过(发版前不可能过:没有 `bases` 参数);k03~k05 不比发版前差(对照规则同 B-140)。测完删 `acc-d1`、`acc-d1-one`、`acc-d1-parent` 和 `acc-d1-a` / `acc-d1-b` / `acc-d1-c`。
+
+## §TBD-A1 检索结果去重 + 关键词路降级(B-206 K-21② / K-22)
+
+**背景**:K-21②:内容相同、文件名不同的两份文件是两份文档,同一段正文会在检索结果里出现两次,各占一个重排名额和一个结果名额。现在检索结果去副本,键是「标题路径 + 正文」的哈希,只做 NFC、合并空白(大小写、全角半角、上标都算不同 —— 只认逐字相同);文档名不算进去(副本之间不同的正是它),同一正文挂在不同标题下不算副本;留排得最前的那份。重排前在小段上去一次,但**只去「小段本身相同、它所在的整块也相同」的**:两个版本的文件共用一段原文(某一条款没改、别的条款改了)时,两边的整块不同,两个版本都留(设计 §7:冲突的版本要摆出来,不替用户选);也只在重排门槛相同的库之间去。重排后在整块上再去一次(读整块时一次读满 `limit` 条,不会每条跑一次库)。检索测试接口多返回 `duplicates_dropped`(去掉了几**段**,一个整块下命中几个小段都只算一段)。K-22:关键词路以前没有语句超时、一出错整次检索就失败;现在关键词语句在自己的事务里设 `statement_timeout`(5 秒),**查不完**(超时 / 被取消、锁或串行化冲突、断连、数据库资源不足)时保留向量路的结果、记 `knowledge.keyword_degraded` 警告,工具结果 meta 和检索测试接口带 `keyword_degraded: true`;SQL 写错、没权限这类错误照旧报错。只开关键词路的库、或查询嵌入也失败了(没有一路有结果)时照旧报错;同时搜几个库、其中一个库一路都没搜成时:别的库也什么都没找到 → 报那个库自己的错(错误文字里不带库名,库名只进日志 `knowledge.search_failed`),找到了 → 没搜成的库名列在结果末尾(防注入围栏里),围栏外的平台提示是固定文字:只对搜成的库说「没写的就是没依据」,对没搜成的「不说明那里有没有」。有一路失败(关键词路降级或查询嵌入失败)又什么都没找到时,提示改成「这次检索不完整,不说明资料里有没有」,不再说「资料里没有」。
+
+**怎么进**:测试环境控制台(system_admin,平台租户)建临时知识库 `kba1`(默认混合检索、开重排),上传下面三份文件,等都 ready(嵌入、重排各不到 1 分钱)。「检索测试」的返回看 DevTools Network 里 `POST …/bases/kba1/test` 的响应体。日志看两个控制面 pod。**测试文件(零租户内容,本机生成)**:`kbA1-b.md` 与 `kbA1-a.md` 逐字相同;`kbA1-c.md` 的第 2 章第 1~3 段与 a 逐字相同(按 400 token 切,这三段正好是同一个小段,两边一模一样),其余段落都不同(标记 `C1-…`,含第 2 章第 5 段 —— 所以两边第 2 章的整块不同);只有第 2 章第 2 段带一句「两份文件共用的条款原文」:
+
+```bash
+python3 - <<'PY'
+fill = "这是用于验收检索去重的说明文字,只描述本段的编号与位置。" * 4
+def para(tag, c, p):
+    extra = "两份文件共用的条款原文。" if (c, p) == (2, 2) else ""
+    return f"第 {c} 章第 {p} 段:验收标记 {tag}-{c}-{p}。{extra}{fill}"
+doc = lambda body: "# 验收文档\n\n" + "\n\n".join(
+    f"## 第 {c} 章\n\n" + "\n\n".join(body(c, p) for p in range(1, 7)) for c in range(1, 7)
+)
+a = doc(lambda c, p: para("A1", c, p))
+c = doc(lambda c, p: para("A1" if c == 2 and p <= 3 else "C1", c, p))
+for name, text in (("a", a), ("b", a), ("c", c)):
+    open(f"/tmp/kbA1-{name}.md", "w", encoding="utf-8").write(text)
+PY
+```
+
+- [ ] **A1.1 两份相同的文件只出一次**:「检索测试」查「验收标记 A1-4-2」。判据:含 `A1-4-2` 的那段在结果里只出现一次(文件名是 `kbA1-a.md` 或 `kbA1-b.md` 之一,不是两个都有);响应体 `duplicates_dropped` ≥ 1。再在调试台用绑了 `kba1` 的智能体问「验收标记 A1-4-2 那一段写了什么」:`knowledge_search` 的工具结果里这段也只出现一次。**没修好时**:同一段在 `kbA1-a.md` 和 `kbA1-b.md` 下各出现一次,响应体没有 `duplicates_dropped`。
+- [ ] **A1.2 内容不同的不被误去**:「检索测试」查「验收标记 C1-5-4」。判据:第一条结果是 `kbA1-c.md`、正文含 `C1-5-4`。**没修好时**(去重过头):结果里没有 `kbA1-c.md`。
+- [ ] **A1.3 共用一段原文的另一个版本不被当副本**:「检索测试」查「两份文件共用的条款原文」。判据:结果里有一条 `kbA1-c.md`、正文同时含 `A1-2-2` 和 `C1-2-5`(c 的第 2 章整块);含 `A1-2-2`、`A1-2-5` 的那段(a 或 b 的第 2 章整块)只出现一次。**没修好时**(按小段去副本、不看整块):c 的那个小段被当成 a 的副本去掉,结果里没有同时含 `A1-2-2` 和 `C1-2-5` 的一条 —— 用户只看到旧版本。(10-27 本机用真切块 + 内存库 + 假嵌入对照过:改后 c 的第 2 章整块排第 2;按改前的去法它不在前 5。)
+- [ ] **A1.4 关键词路正常时不降级、不变慢**:A1.1~A1.3 的响应体 `keyword_degraded` 都是 `false`;测试时间段内两个控制面 pod 的日志 `grep knowledge.keyword_degraded` 为 0 行;同一个问句(「验收标记 A1-4-2」)查 3 次,`POST …/test` 耗时的中位数 ≤ 5 秒。**没修好时**:响应体没有 `keyword_degraded`;或 5 秒的语句超时在正常查询上就触发(日志有 `knowledge.keyword_degraded`、`keyword_degraded: true`、结果只剩向量路)。
+- [ ] **A1.5 关键词路超时降级(不在测试环境做)**:由集成测试 `packages/expert-work-persistence/tests/test_sql_knowledge_keyword_timeout.py`(另一个会话锁住 `knowledge_chunk`,关键词检索在超时内报 `KnowledgeRecallError`;超时设置不留在连接池的连接上;SQL 写错照旧报错)和单测 `services/orchestrator/tests/test_knowledge_keyword_degraded.py`(保留向量结果、只开关键词路 / 两路都失败 / 多库里一个库没搜成时的处理)覆盖。判据:本 PR 的 CI「Test (integration)」里这条测试过(它不是合并必需检查,要单独看)。**不要在测试环境锁共享表来验这条。**
+- [ ] **A1.6 收尾**:删 `kba1` 和临时智能体。

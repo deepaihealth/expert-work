@@ -11,6 +11,9 @@ from expert_work.persistence.knowledge.base import UNSET as UNSET
 from expert_work.persistence.knowledge.base import (
     DuplicateKnowledgeBaseError as DuplicateKnowledgeBaseError,
 )
+from expert_work.persistence.knowledge.base import (
+    KnowledgeRecallError as KnowledgeRecallError,
+)
 from expert_work.persistence.knowledge.base import KnowledgeStore as KnowledgeStore
 from expert_work.persistence.knowledge.base import ParseCacheEntry as ParseCacheEntry
 from expert_work.persistence.knowledge.base import ParseCacheKind as ParseCacheKind
@@ -24,6 +27,7 @@ __all__ = [
     "UNSET",
     "DuplicateKnowledgeBaseError",
     "InMemoryKnowledgeStore",
+    "KnowledgeRecallError",
     "KnowledgeStore",
     "ParseCacheEntry",
     "ParseCacheKind",

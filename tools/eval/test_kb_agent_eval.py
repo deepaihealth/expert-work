@@ -298,6 +298,30 @@ async def test_each_search_records_how_its_rerank_and_threshold_ended() -> None:
     ) == ("ok", False)
 
 
+class _KeywordDegradedRetriever(_FixedRetriever):
+    """A search whose keyword path failed: vector results only (B-206 K-22)."""
+
+    async def search_detailed(self, **_kwargs: Any) -> KnowledgeSearchOutcome:
+        return KnowledgeSearchOutcome(
+            results=self.results, status="ok", candidates=len(self.results), keyword_degraded=True
+        )
+
+
+@pytest.mark.asyncio
+async def test_each_search_records_a_degraded_keyword_path() -> None:
+    chunk = RetrievedChunk(content="QK7 note", filename="manual.md", chunk_index=0)
+    retriever = cast(KnowledgeRetriever, _KeywordDegradedRetriever((chunk,)))
+    tool = KnowledgeSearchTool(retriever=retriever, knowledge_base_refs=("kb",))
+    run, _cost = await run_agent(
+        _KeepSearching(), tool, question="q", tenant_id=uuid4(), spend=Spend()
+    )
+    assert run["searches"][0]["keyword_degraded"] is True
+    plain = (
+        await run_agent(_KeepSearching(), _tool(), question="q", tenant_id=uuid4(), spend=Spend())
+    )[0]
+    assert plain["searches"][0]["keyword_degraded"] is False
+
+
 @pytest.mark.asyncio
 async def test_a_bad_tool_call_reaches_the_model_as_the_tools_node_error() -> None:
     class _NoQuery(_KeepSearching):
@@ -532,7 +556,16 @@ def test_tally_counts_each_category_with_totals_and_spend(tmp_path: Path) -> Non
             rerank_outcome="partial",
             rerank_threshold_paused=True,
         ),
-        _row("n2", "chat", False, "编造", status="ok", degraded=True, rerank_outcome="ok"),
+        _row(
+            "n2",
+            "chat",
+            False,
+            "编造",
+            status="ok",
+            degraded=True,
+            keyword_degraded=True,
+            rerank_outcome="ok",
+        ),
         _row("a1", "main", True, "答对", error="[tool error] x"),
         _row("a2", "main", True, "误拒", skipped=True),
         _row("a3", "chat", True, "编造"),
@@ -550,7 +583,8 @@ def test_tally_counts_each_category_with_totals_and_spend(tmp_path: Path) -> Non
     assert text[6] == "  main n=2 答对 1 误拒 1 编造 0 答偏 0 判分失败 0"
     assert text[8] == "total n=5 正确说没写 1 答对 1 编造 2 误拒 1"
     assert text[9] == (
-        "searches per question 0.80; degraded 1, embedding degraded 1, errors 1, skipped 1"
+        "searches per question 0.80; degraded 1, embedding degraded 1, keyword degraded 1, "
+        "errors 1, skipped 1"
     )
     # B-206 K-7b — how each search's rerank ended, and its threshold left out.
     assert text[10] == "rerank outcomes ok 1, partial 1; threshold paused 1"

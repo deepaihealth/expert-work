@@ -4,8 +4,8 @@
 一次跑 = 建库 + 打分:
 
 1. 读评测集(``kb_dataset.load_dataset``)与语料清单(``kb_corpus_inventory.py`` 产出的
-   ``manifest.csv``);按 ``--tiers`` 选行,同一 ``dup_group`` 只入第一份,``--limit-docs``
-   在去重之后截头;
+   ``manifest.csv``);按 ``--tiers`` 选行,同一 ``dup_group`` 只入第一份(``--keep-dups`` 例外),
+   ``--limit-docs`` 在去重之后截头;
 2. 单库,库名 = 评测集 ``name``;解析在**进程池**里并发跑(PyMuPDF 非线程安全;每份有
    ``--parse-timeout``),落库按清单顺序逐份串行:``upsert_document(content=None)`` →
    ``control_plane.knowledge.ingestion.ingest_markdown``(语义切块 → 嵌入 → 落段,与上传后的
@@ -52,6 +52,10 @@ B-206 K-7b 换模型对照:``--rerank-model``(配 ``--rerank dashscope``,模型�
 ``--rerank-threshold-on-base`` 把 ``--rerank-threshold`` 存到库上(绑这次的重排模型)而不是随检索传,
 走生产的库上门槛那条路(含绑定模型的检查);汇总 ``rerank_outcomes`` 记每种重排结局的检索次数
 (``partial`` 只计数,整轮只在 ``rerank_degraded`` 时退出)。
+B-206 K-21② 副本对照组:``--keep-dups real|same-title`` 让同 ``dup_group`` 的副本也入库
+(:data:`KEEP_DUPS_CHOICES`;``same-title`` 零嵌入花费),``--dedup off`` 关掉生产检索器的去副本;
+汇总里的 ``dup_share@10`` = 前 10 名里正文与更靠前一条相同的占比。B-206 K-22:有一题关键词路
+失败、只剩向量路的结果时整轮退出。这两个开关不是生产默认时拒绝更新基线。
 
 凭据只从环境变量读(``EXPERT_WORK_EVAL_EMBED_API_KEY`` / ``_MODEL`` / ``_BASE_URL``;
 ``--rerank on`` 另要 ``EXPERT_WORK_EVAL_LLM_API_KEY`` / ``_MODEL`` / ``_BASE_URL``),没有命令行开关。
@@ -82,7 +86,7 @@ import time
 from collections.abc import AsyncIterator, Callable, Collection, Iterator, Mapping, Sequence
 from concurrent.futures import Executor, ProcessPoolExecutor
 from contextlib import asynccontextmanager, contextmanager
-from dataclasses import asdict, dataclass, replace
+from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 from typing import Any, Literal, cast
 from uuid import NAMESPACE_URL, UUID, uuid5
@@ -182,6 +186,11 @@ DocTitles = Literal["real", "shuffled", "none"]
 DOC_TITLE_CHOICES: tuple[str, ...] = ("real", "shuffled", "none")
 #: ``shuffled`` 的固定种子:对照组每次跑同一种打乱,两次结果可比。
 DOC_TITLE_SHUFFLE_SEED = 20261016
+#: B-206 K-21② 副本对照组(``--keep-dups``):``drop`` = 同 ``dup_group`` 只入第一份(默认);
+#: ``real`` = 每份都以自己的文件名、文档名入库(真实重传的样子;副本的段要真嵌入,花钱);
+#: ``same-title`` = 后到的以 ``dup<n>/<原件文件名>`` 入库、带原件的文档名(:class:`DupCopy`,
+#: 嵌入全走缓存)。
+KEEP_DUPS_CHOICES: tuple[str, ...] = ("drop", "real", "same-title")
 #: 与根 ``conftest.py`` 的 ``postgres_container`` 同一镜像(GHCR 镜像站,CI 卫兵只放行这个源)。
 PGVECTOR_IMAGE = "ghcr.io/deepaihealth/mirror/pgvector:pg16"
 ALEMBIC_INI = _REPO_ROOT / "packages" / "expert-work-persistence" / "alembic.ini"
@@ -242,6 +251,18 @@ class EvalConfig:
     rerank_model: str | None = None
     #: B-206 K-7b(``--rerank-threshold-on-base``):门槛存在库上、不随检索传。
     rerank_threshold_on_base: bool = False
+    #: B-206 K-21②(``--dedup``):检索结果按正文去副本,生产默认开;关 = 对照臂。
+    dedup: bool = True
+
+
+@dataclass(frozen=True)
+class DupCopy:
+    """``--keep-dups same-title`` 下同 ``dup_group`` 的后到一份:以 ``filename``
+    (``dup<n>/<原件文件名>``)入库、段上带原件(``original`` = 原件的清单 path)的文档名 ——
+    检索文本与原件逐字相同,嵌入全走缓存。"""
+
+    original: str
+    filename: str
 
 
 @dataclass(frozen=True)
@@ -251,6 +272,8 @@ class CorpusSelection:
     skipped_tier: int
     skipped_limit: int
     skipped_empty: int = 0
+    #: 清单 path → :class:`DupCopy`(只有 ``--keep-dups same-title`` 时有)
+    copies: Mapping[str, DupCopy] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -445,6 +468,13 @@ class EmbeddingDegradedError(RuntimeError):
     """
 
 
+class KeywordDegradedError(RuntimeError):
+    """有一题的关键词路失败(语句超时等)、检索只剩向量路的结果(B-206 K-22)—— 整轮退出。
+
+    同 :class:`EmbeddingDegradedError`:生产要降级,评测不能把只走向量的结果当混合检索计分。
+    """
+
+
 class FakeKbEmbedder(KeywordEmbedder):  # type: ignore[misc]
     """关键词桶向量(CJK 二元组 + ASCII 词),维度对齐库的向量列。
 
@@ -556,12 +586,23 @@ def read_manifest(path: Path) -> list[dict[str, str]]:
 
 
 def select_rows(
-    rows: Sequence[Mapping[str, str]], *, tiers: Sequence[str], limit_docs: int
+    rows: Sequence[Mapping[str, str]],
+    *,
+    tiers: Sequence[str],
+    limit_docs: int,
+    keep_dups: str = "drop",
 ) -> CorpusSelection:
-    """按层过滤 → 同 ``dup_group`` 只留第一份 → ``limit_docs`` 截头(0 = 不限;在去重之后数)。"""
+    """按层过滤 → 同 ``dup_group`` 只留第一份 → ``limit_docs`` 截头(0 = 不限;在去重之后数)。
+    ``keep_dups``(:data:`KEEP_DUPS_CHOICES`)不是 ``drop`` 时副本全留,``same-title`` 另记
+    每份副本照哪份原件入库(``copies``);副本不占 ``limit_docs`` 的名额,随原件去留。"""
+    if keep_dups not in KEEP_DUPS_CHOICES:
+        raise ValueError(f"keep_dups must be one of {KEEP_DUPS_CHOICES}, got {keep_dups!r}")
     wanted = set(tiers)
     in_tier = [r for r in rows if r.get("tier") in wanted]
-    seen_groups: set[str] = set()
+    originals: dict[str, str] = {}  # dup_group → the first row's path
+    copy_of: dict[str, str] = {}  # a kept copy's path → its original's
+    copies: dict[str, DupCopy] = {}
+    copy_counts: dict[str, int] = {}  # dup_group → copies named so far
     kept: list[Mapping[str, str]] = []
     skipped_dup = 0
     skipped_empty = 0
@@ -570,22 +611,38 @@ def select_rows(
             skipped_empty += 1  # a 0-byte file cannot parse; not a retrieval problem
             continue
         group = row.get("dup_group") or ""
-        if group and group in seen_groups:
-            skipped_dup += 1
-            continue
-        if group:
-            seen_groups.add(group)
+        if group and group in originals:
+            if keep_dups == "drop":
+                skipped_dup += 1
+                continue
+            copy_of[row["path"]] = originals[group]
+            if keep_dups == "same-title":
+                copy_counts[group] = copy_counts.get(group, 0) + 1
+                original = originals[group]
+                copies[row["path"]] = DupCopy(
+                    original=original, filename=f"dup{copy_counts[group]}/{_basename(original)}"
+                )
+        elif group:
+            originals[group] = row["path"]
         kept.append(row)
     skipped_limit = 0
     if limit_docs > 0:
-        skipped_limit = max(0, len(kept) - limit_docs)
-        kept = kept[:limit_docs]
+        # A copy takes no slot: the limit counts the other rows, and each copy
+        # stays exactly when its original does — the arm with copies holds the
+        # same originals as the one without.
+        firsts = [row["path"] for row in kept if row["path"] not in copy_of]
+        allowed = set(firsts[:limit_docs])
+        limited = [row for row in kept if copy_of.get(row["path"], row["path"]) in allowed]
+        skipped_limit = len(kept) - len(limited)
+        kept = limited
+    paths = {row["path"] for row in kept}
     return CorpusSelection(
         rows=tuple(kept),
         skipped_dup=skipped_dup,
         skipped_tier=len(rows) - len(in_tier),
         skipped_limit=skipped_limit,
         skipped_empty=skipped_empty,
+        copies={path: copy for path, copy in copies.items() if path in paths},
     )
 
 
@@ -615,6 +672,14 @@ def doc_titles_for(rows: Sequence[Mapping[str, str]], mode: str) -> dict[str, st
     for position, index in enumerate(order):
         shuffled[index] = real[order[(position + 1) % len(order)]]
     return dict(zip(paths, shuffled, strict=True))
+
+
+def corpus_titles(selection: CorpusSelection, mode: str) -> dict[str, str | None]:
+    """Each selected row's title (:func:`doc_titles_for`), worked out over the rows
+    that are not ``same-title`` copies — so ``shuffled`` permutes the originals
+    exactly as the run without copies does — and each copy given its original's."""
+    titles = doc_titles_for([r for r in selection.rows if r["path"] not in selection.copies], mode)
+    return {**titles, **{path: titles[copy.original] for path, copy in selection.copies.items()}}
 
 
 def classify_failure(exc: BaseException) -> tuple[str, str]:
@@ -648,7 +713,8 @@ async def build_corpus(
     ``parse_timeout_s`` 秒超时;落库(建文档行 → ``ingest_markdown`` 切块 / 嵌入 / 落段 → 置状态)
     **按清单顺序逐份串行**:行的物理顺序每次都一样,检索并列分数时谁排前面才不随并发抖动
     (10-14 实测:并发落库时同一份代码连跑两次,303 题里 28 题排序不同)。
-    段上的文档名按 ``doc_titles``(:func:`doc_titles_for`)。
+    段上的文档名按 ``doc_titles``(:func:`doc_titles_for`);``selection.copies`` 里的副本
+    (``--keep-dups same-title``)以 :class:`DupCopy` 的文件名入库、带原件的文档名。
     同名文件(不同目录、同 basename、又不是同一 ``dup_group``)只入第一份:库内
     ``(kb_id, filename)`` 唯一,再 upsert 会把前一份重置并删段;后到的记进 ``name_collisions``。
     ``EmbeddingDimensionError`` 不按文档失败记,直接抛出 —— 那是配置错。
@@ -659,7 +725,7 @@ async def build_corpus(
     claimed: dict[str, str] = {}
     collisions: list[NameCollision] = []
     total = len(selection.rows)
-    titles = doc_titles_for(selection.rows, doc_titles)
+    titles = corpus_titles(selection, doc_titles)
     loop = asyncio.get_running_loop()
 
     async def _parse(pool: Executor, filename: str, raw: bytes) -> str:
@@ -704,7 +770,8 @@ async def build_corpus(
         index: int, row: Mapping[str, str], parsed: asyncio.Task[str]
     ) -> tuple[int, IngestFailure | None]:
         path = row["path"]
-        filename = _basename(path)
+        copy = selection.copies.get(path)
+        filename = copy.filename if copy is not None else _basename(path)
         if filename in claimed:
             # Same basename, different file: ingest under a directory-qualified
             # name (full relative path if even that collides).
@@ -1051,10 +1118,11 @@ def build_retriever(
     rerank_view: RerankView = DEFAULT_RERANK_VIEW,
     rerank_pool: int = DEFAULT_RERANK_POOL,
     rerank_instruction: bool = False,
+    dedup: bool = True,
 ) -> KnowledgeRetriever:
     """两路召回深度跟生产同一个默认(:func:`default_recall_depth`);只有 ``top_k`` 超过它时
-    才把深度抬到 ``top_k``,否则前 k 名凑不满。``rerank_*`` 是生产检索器自己的 K-14 旋钮
-    (默认 = 生产默认)。"""
+    才把深度抬到 ``top_k``,否则前 k 名凑不满。``rerank_*`` 是生产检索器自己的 K-14 旋钮、
+    ``dedup`` 是它的 K-21② 去副本开关(默认 = 生产默认)。"""
     recall_limit = top_k if top_k > default_recall_depth(top_k) else None
     return KnowledgeRetriever(
         store=store,
@@ -1064,6 +1132,7 @@ def build_retriever(
         rerank_view=rerank_view,
         rerank_pool=rerank_pool,
         rerank_instruction=rerank_instruction,
+        dedup=dedup,
     )
 
 
@@ -1104,6 +1173,12 @@ async def run_eval(
                 "warning): its numbers would be keyword search alone"
             )
             raise EmbeddingDegradedError(msg)
+        if outcome.keyword_degraded:
+            msg = (
+                f"keyword recall failed on case {case.id} (see the knowledge.keyword_degraded "
+                "warning): its numbers would be vector search alone"
+            )
+            raise KeywordDegradedError(msg)
         if cfg.rerank and outcome.rerank_dropped:
             msg = (
                 f"rerank on case {case.id} never judged {outcome.rerank_dropped} of its "
@@ -1448,6 +1523,7 @@ _TABLE_COLUMNS: tuple[tuple[str, str], ...] = (
     ("chk_cov@20", "chunk_coverage@20"),
     ("mrr@10", "mrr@10"),
     ("ndcg@10", "ndcg@10"),
+    ("dup@10", "dup_share@10"),
     ("zero_hit", "zero_hit_rate"),
     ("no_ans_ref", "no_answer_refusal_rate"),
     ("false_ref", "false_refusal_rate"),
@@ -1885,6 +1961,22 @@ def _build_parser() -> argparse.ArgumentParser:
         help="B-206 K-7b:--rerank-threshold 存到库上(绑这次的重排模型),检索按生产的库上门槛走",
     )
     parser.add_argument(
+        "--dedup",
+        default="on",
+        choices=("on", "off"),
+        help="B-206 K-21② 检索结果去副本(生产默认开):off = 对照臂,副本照样占名额",
+    )
+    parser.add_argument(
+        "--keep-dups",
+        default="drop",
+        choices=KEEP_DUPS_CHOICES,
+        help=(
+            "B-206 K-21② 同 dup_group 的副本:drop = 只入第一份(默认);real = 都以自己的名字入库"
+            "(副本的嵌入要花钱);same-title = 后到的以 dup<n>/<原件文件名> 入库、带原件的文档名"
+            "(嵌入全走缓存)"
+        ),
+    )
+    parser.add_argument(
         "--doc-match",
         default="anchor",
         choices=("anchor", "listed"),
@@ -1967,7 +2059,12 @@ async def _run(
     bundle: EmbedderBundle,
     reranker: Reranker | None,
 ) -> tuple[list[CaseRow], dict[str, Any], CorpusReport]:
-    selection = select_rows(read_manifest(manifest), tiers=tiers, limit_docs=args.limit_docs)
+    selection = select_rows(
+        read_manifest(manifest),
+        tiers=tiers,
+        limit_docs=args.limit_docs,
+        keep_dups=args.keep_dups,
+    )
     print(
         f"corpus: {len(selection.rows)} docs selected (tiers={','.join(tiers)}, "
         f"skipped_dup={selection.skipped_dup}, skipped_tier={selection.skipped_tier}, "
@@ -2022,6 +2119,7 @@ async def _run(
                 rerank_view=cfg.rerank_view,
                 rerank_pool=cfg.rerank_pool,
                 rerank_instruction=cfg.rerank_instruction,
+                dedup=cfg.dedup,
             )
             rows = await run_eval(
                 dataset=dataset,
@@ -2050,6 +2148,8 @@ async def _run(
         "rerank_threshold_on_base": cfg.rerank_threshold_on_base,
         "rerank_model": cfg.rerank_model,
         **rerank_arm(cfg),
+        "dedup": cfg.dedup,
+        "keep_dups": args.keep_dups,
         "label": args.label,
     }
     summary = summarise(
@@ -2098,6 +2198,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         raise SystemExit(f"--rerank-pool must be at least 1, got {args.rerank_pool}")
     if args.rerank_instruct and args.rerank_view == "dual":
         raise SystemExit(INSTRUCT_NEEDS_SINGLE_VIEW)
+    if args.keep_dups == "real" and args.doc_titles == "shuffled":
+        raise SystemExit(
+            "--keep-dups real cannot go with --doc-titles shuffled: real copies are documents "
+            "of their own, so the originals would get another permutation of titles than the "
+            "run they are compared with (--keep-dups same-title keeps it)"
+        )
     cfg = EvalConfig(
         method=RetrievalMethod(args.method),
         top_k=args.top_k,
@@ -2111,7 +2217,14 @@ def main(argv: Sequence[str] | None = None) -> int:
         rerank_instruction=args.rerank_instruct,
         rerank_model=resolve_rerank_model(args.rerank_model, rerank_mode=rerank_mode),
         rerank_threshold_on_base=args.rerank_threshold_on_base,
+        dedup=args.dedup == "on",
     )
+    if args.update_baseline and (not cfg.dedup or args.keep_dups != "drop"):
+        raise SystemExit(
+            "refusing to update baseline with a K-21 arm (--dedup off / --keep-dups): the "
+            "baseline section is keyed by rerank mode only, so an A/B arm would overwrite the "
+            "product's numbers"
+        )
     if args.update_baseline and cfg.rerank_model not in (None, DEFAULT_RERANK_MODEL):
         raise SystemExit(
             "refusing to update baseline with --rerank-model off the production model: the "

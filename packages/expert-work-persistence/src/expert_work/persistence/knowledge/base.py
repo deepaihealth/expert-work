@@ -151,6 +151,14 @@ class RowSecurityActiveError(RuntimeError):
     filters — its "not found" would be a lie (the figure reconciler gives up)."""
 
 
+class KnowledgeRecallError(RuntimeError):
+    """A recall query the database could not finish — a statement timeout, a
+    lock or serialization failure, a lost connection, exhausted resources
+    (B-206 K-22); never a bug in the query or a missing permission. The message
+    is the driver's, so a timeout still reads as one. A hybrid search keeps its
+    other path's results on it."""
+
+
 class KnowledgeStore(abc.ABC):
     """Tenant-scoped knowledge base / document / chunk repository."""
 
@@ -765,4 +773,9 @@ class KnowledgeStore(abc.ABC):
         :data:`~expert_work.persistence.knowledge.text_search.KB_KEYWORD_QUERY_PHRASE_BOOST`
         when the whole question appears verbatim. SQL and in-memory stores share the
         match predicate and the ordering intent; their exact scores (and so
-        the order of near-ties) can differ."""
+        the order of near-ties) can differ.
+
+        Raises :class:`KnowledgeRecallError` when the database could not finish
+        the query — the SQL store bounds it with a statement timeout (B-206
+        K-22); the in-memory store never raises it. Any other error, a database
+        error included, is not a recall failure and propagates as itself."""

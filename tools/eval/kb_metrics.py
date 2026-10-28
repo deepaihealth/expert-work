@@ -27,6 +27,11 @@
 运行器把工具真正的输出传进来,所以工具改成返回父段 / 改了条数或格式,它跟着变。没给渲染文本时
 为 ``None``。
 
+``dup_share@10``(B-206 K-21②)也不看期望:前 10 条结果里,与更靠前某条是同一段(生产去副本
+同一把键 ``orchestrator.tools.knowledge_dedup.passage_key``:标题路径 + 正文,只合并空白)的占比
+—— 被副本(同一内容换个文件名重传)占掉的名额。每条有结果的 case 都算(含无答案的),汇总取它们
+的均值;没有结果为 ``None``。
+
 「拒答」只在给了阈值时有定义:结果为空,或每条结果都带分数且都低于阈值;``score is None``
 (只被关键词路召回)的结果会被工具原样返回给模型,算作「给出了结果」。阈值未设时
 ``refused`` / 两个拒答率都是 ``None``;每条 case 的 ``best_score``(最佳向量分数)另存,
@@ -43,6 +48,8 @@ from collections import defaultdict
 from collections.abc import Callable, Iterable, Sequence
 from dataclasses import asdict, dataclass
 from typing import Protocol
+
+from orchestrator.tools.knowledge_dedup import passage_key
 
 #: 两个截断点;``mrr`` / ``ndcg`` 只算 @10。
 RECALL_KS: tuple[int, int] = (10, 20)
@@ -62,6 +69,8 @@ MEAN_FIELDS: tuple[tuple[str, str], ...] = (
     ("ndcg@10", "ndcg_10"),
     ("context_hit", "context_hit"),
 )
+#: 副本占名额的汇总键(不在 ``MEAN_FIELDS`` 里:它对无答案 case 也有值)。
+DUP_SHARE = "dup_share@10"
 
 #: 归一时去掉的 HTML 标签(``<br>``、``<u>`` 之类;PDF / 表格转出来的文字里常见)。
 _HTML_TAG = re.compile(r"</?[A-Za-z][^<>]{0,40}>")
@@ -105,6 +114,14 @@ class ResultLike(Protocol):
     def score(self) -> float | None:
         """Recall score (vector similarity when available)."""
 
+    @property
+    def heading_path(self) -> tuple[str, ...]:
+        """Section breadcrumb of the returned passage."""
+
+    @property
+    def content(self) -> str:
+        """Body of the returned passage."""
+
 
 class ExpectedLike(Protocol):
     """``kb_dataset.KbExpected`` 的结构镜像。"""
@@ -146,10 +163,14 @@ class CaseScore:
     doc_hit_ranks: tuple[int, ...]  # 1-based 结果名次,每个期望文档首次出现的那名
     chunk_hit_ranks: tuple[int, ...]  # 1-based 结果名次,首次覆盖到某条期望的那些名
     context_hit: float | None = None  # 没给渲染文本 / 无答案 case 为 None
+    dup_share_10: float | None = None  # 有答案、无答案都算;没有结果为 None
 
     def metrics(self) -> dict[str, float | None]:
         data = asdict(self)
-        return {label: data[field] for label, field in MEAN_FIELDS}
+        return {
+            **{label: data[field] for label, field in MEAN_FIELDS},
+            DUP_SHARE: self.dup_share_10,
+        }
 
 
 # ---------------------------------------------------------------------------
@@ -301,6 +322,22 @@ def best_score(results: Sequence[ResultLike]) -> float | None:
     return max(scores) if scores else None
 
 
+def dup_share_at_k(results: Sequence[ResultLike], *, k: int = RANK_K) -> float | None:
+    """前 ``k`` 条结果里,与更靠前某条是同一段(生产去副本的键 ``passage_key``:标题路径 + 正文,
+    只合并空白)的占比;没有结果时 ``None``。"""
+    top = results[:k]
+    if not top:
+        return None
+    seen: set[bytes] = set()
+    copies = 0
+    for result in top:
+        key = passage_key(result.heading_path, result.content)
+        if key in seen:
+            copies += 1
+        seen.add(key)
+    return copies / len(top)
+
+
 # ---------------------------------------------------------------------------
 # 单 case 打分
 # ---------------------------------------------------------------------------
@@ -325,6 +362,7 @@ def score_case(
         refused = bool(refused) or not results
     zero_hit = not results
     best = best_score(results)
+    dup_share = dup_share_at_k(results)
     if not expected:
         return CaseScore(
             answerable=False,
@@ -344,6 +382,7 @@ def score_case(
             ndcg_10=None,
             doc_hit_ranks=(),
             chunk_hit_ranks=(),
+            dup_share_10=dup_share,
         )
     doc_cov = document_coverage(results, expected)
     n_docs = len({e.document for e in expected})
@@ -371,6 +410,7 @@ def score_case(
         context_hit=(
             None if shown_text is None else context_hit(shown_text, expected, match=match)
         ),
+        dup_share_10=dup_share,
     )
 
 
@@ -413,6 +453,8 @@ def aggregate(scores: Sequence[CaseScore]) -> dict[str, float | int | None]:
     for label, field in MEAN_FIELDS:
         values = [v for s in answerable if (v := getattr(s, field)) is not None]
         out[label] = sum(values) / len(values) if values else None
+    shares = [s.dup_share_10 for s in scores if s.dup_share_10 is not None]
+    out[DUP_SHARE] = sum(shares) / len(shares) if shares else None
     out["zero_hit_rate"] = zero_hit_rate(scores)
     out["no_answer_refusal_rate"] = no_answer_refusal_rate(scores)
     out["false_refusal_rate"] = false_refusal_rate(scores)
@@ -428,6 +470,7 @@ def grouped(pairs: Iterable[tuple[str, CaseScore]]) -> dict[str, dict[str, float
 
 
 __all__ = [
+    "DUP_SHARE",
     "MATCH_MODES",
     "MEAN_FIELDS",
     "RANK_K",
@@ -444,6 +487,7 @@ __all__ = [
     "coverage_at_k",
     "document_coverage",
     "document_hits",
+    "dup_share_at_k",
     "false_refusal_rate",
     "grouped",
     "hit_at_k",
