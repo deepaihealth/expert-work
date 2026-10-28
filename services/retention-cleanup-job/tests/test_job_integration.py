@@ -34,9 +34,11 @@ from testcontainers.postgres import PostgresContainer
 from expert_work.persistence import (
     DatabaseConfig,
     SqlAuditLogStore,
+    SqlKnowledgeStore,
     create_async_engine_from_config,
     create_async_session_factory,
 )
+from expert_work.persistence.knowledge.base import SwitchOffRecord
 from expert_work.protocol import (
     AuditAction,
     AuditEntry,
@@ -887,5 +889,127 @@ async def test_knowledge_task_retention_deletes_old_finished_rows_only(
             )
         assert remaining == [("queued", 120), ("running", 120), ("succeeded", 10)]
         assert report.knowledge_tasks_deleted >= 4
+    finally:
+        await worker_engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_orphaned_knowledge_revisions_go_after_30_days(
+    db_fixture: tuple[AsyncEngine, AsyncEngine, str],
+) -> None:
+    """B-175 P3-PR2 —— 重新入库没能套回去的人工修改(``orphaned_at`` 有值)满 30 天删掉;
+    不满 30 天的、整块还在的(``orphaned_at`` 为空,不管多老)都留着。迁移 0176 的授权缺了
+    这里会 permission denied。只数本用例自造文档的行。"""
+    _app_engine, worker_engine, sync_admin = db_fixture
+    try:
+        tenant, kb, document = uuid4(), uuid4(), uuid4()
+        admin = create_engine(sync_admin, isolation_level="AUTOCOMMIT")
+        try:
+            with admin.connect() as conn:
+                conn.execute(
+                    text("INSERT INTO knowledge_base (id, tenant_id, name) VALUES (:k, :t, 'kb')"),
+                    {"k": str(kb), "t": str(tenant)},
+                )
+                conn.execute(
+                    text(
+                        "INSERT INTO knowledge_document (id, tenant_id, kb_id, filename, status) "
+                        "VALUES (:d, :t, :k, 'a.md', 'ready')"
+                    ),
+                    {"d": str(document), "t": str(tenant), "k": str(kb)},
+                )
+                insert = text(
+                    "INSERT INTO knowledge_chunk_revision (tenant_id, kb_id, document_id, "
+                    " chunk_id, revision, content, created_at, orphaned_at) "
+                    "VALUES (:t, :k, :d, gen_random_uuid(), 1, :label, "
+                    " now() - make_interval(days => 100), "
+                    " CASE WHEN :age >= 0 THEN now() - make_interval(days => :age) END)"
+                )
+                for label, age in (("old orphan", 40), ("recent orphan", 10), ("alive", -1)):
+                    conn.execute(
+                        insert,
+                        {
+                            "t": str(tenant),
+                            "k": str(kb),
+                            "d": str(document),
+                            "label": label,
+                            "age": age,
+                        },
+                    )
+        finally:
+            admin.dispose()
+
+        job = RetentionCleanupJob(
+            db_session_factory=create_async_session_factory(worker_engine),
+            batch_size=10000,
+            knowledge_revision_orphan_days=30,
+        )
+        report = await job.run_once()
+
+        async with worker_engine.begin() as conn:
+            remaining = sorted(
+                row[0]
+                for row in (
+                    await conn.execute(
+                        text("SELECT content FROM knowledge_chunk_revision WHERE document_id = :d"),
+                        {"d": str(document)},
+                    )
+                ).all()
+            )
+        assert remaining == ["alive", "recent orphan"]
+        assert report.knowledge_revisions_deleted >= 1
+    finally:
+        await worker_engine.dispose()
+
+
+async def test_an_expired_switch_off_record_is_not_written_back(
+    db_fixture: tuple[AsyncEngine, AsyncEngine, str],
+) -> None:
+    """B-175 P3-PR2 — a switch-off record (revision 0) no passage has held for
+    30 days is deleted by the job. An ingest that read it at its start and
+    writes its records back afterwards only updates the ones still there:
+    the record is not inserted again, so its 30 days do not start over."""
+    _app_engine, worker_engine, sync_admin = db_fixture
+    try:
+        tenant, kb, document, passage = uuid4(), uuid4(), uuid4(), uuid4()
+        admin = create_engine(sync_admin, isolation_level="AUTOCOMMIT")
+        try:
+            with admin.connect() as conn:
+                conn.execute(
+                    text("INSERT INTO knowledge_base (id, tenant_id, name) VALUES (:k, :t, 'kb')"),
+                    {"k": str(kb), "t": str(tenant)},
+                )
+                conn.execute(
+                    text(
+                        "INSERT INTO knowledge_document (id, tenant_id, kb_id, filename, status) "
+                        "VALUES (:d, :t, :k, 'a.md', 'ready')"
+                    ),
+                    {"d": str(document), "t": str(tenant), "k": str(kb)},
+                )
+                conn.execute(
+                    text(
+                        "INSERT INTO knowledge_chunk_revision (tenant_id, kb_id, document_id, "
+                        " chunk_id, revision, content, switch_off_lost, orphaned_at) "
+                        "VALUES (:t, :k, :d, :p, 0, 'hidden text', true, "
+                        " now() - make_interval(days => 40))"
+                    ),
+                    {"t": str(tenant), "k": str(kb), "d": str(document), "p": str(passage)},
+                )
+        finally:
+            admin.dispose()
+        factory = create_async_session_factory(worker_engine)
+        store = SqlKnowledgeStore(factory)
+        (read,) = await store.list_switch_offs(tenant_id=tenant, document_id=document)
+
+        job = RetentionCleanupJob(
+            db_session_factory=factory, batch_size=10000, knowledge_revision_orphan_days=30
+        )
+        await job.run_once()
+        assert await store.list_switch_offs(tenant_id=tenant, document_id=document) == []
+
+        written_back = SwitchOffRecord(read.passage_id, read.content, (), placed=False)
+        assert await store.replace_chunks(
+            tenant_id=tenant, document_id=document, chunks=[], switch_offs=[written_back]
+        )
+        assert await store.list_switch_offs(tenant_id=tenant, document_id=document) == []
     finally:
         await worker_engine.dispose()

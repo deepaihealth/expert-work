@@ -67,6 +67,7 @@ from expert_work.protocol import (
 from expert_work.runtime.audit import AuditLogger
 from expert_work.runtime.runs.store import RunStore
 from expert_work.runtime.storage import ObjectStore
+from retention_cleanup_job.knowledge_revisions import delete_orphaned_revisions
 from retention_cleanup_job.orphan_threads import (
     sweep_orphan_thread_dirs,
     sweep_orphan_tool_results,
@@ -138,6 +139,7 @@ class RetentionCleanupJob:
         sandbox_egress_audit_retention_days: int = 90,
         memory_writeback_job_retention_days: int = 30,
         knowledge_task_retention_days: int = 90,
+        knowledge_revision_orphan_days: int = 30,
         user_upload_store: UserUploadStore | None = None,
         upload_retention_days: int = 90,
         thread_store: ThreadMetaStore | None = None,
@@ -175,6 +177,9 @@ class RetentionCleanupJob:
         if knowledge_task_retention_days < 1:
             msg = "knowledge_task_retention_days must be >= 1"
             raise ValueError(msg)
+        if knowledge_revision_orphan_days < 1:
+            msg = "knowledge_revision_orphan_days must be >= 1"
+            raise ValueError(msg)
         if upload_retention_days < 1:
             msg = "upload_retention_days must be >= 1"
             raise ValueError(msg)
@@ -195,6 +200,7 @@ class RetentionCleanupJob:
         self._sandbox_egress_audit_retention_days = sandbox_egress_audit_retention_days
         self._memory_writeback_job_retention_days = memory_writeback_job_retention_days
         self._knowledge_task_retention_days = knowledge_task_retention_days
+        self._knowledge_revision_orphan_days = knowledge_revision_orphan_days
         self._user_upload_store = user_upload_store
         self._upload_retention_days = upload_retention_days
         self._thread_store = thread_store
@@ -226,6 +232,7 @@ class RetentionCleanupJob:
             sandbox_egress_audit_deleted = await self._delete_sandbox_egress_audit()
             memory_writeback_jobs_deleted = await self._delete_finished_memory_writeback_jobs()
             knowledge_tasks_deleted = await self._delete_finished_knowledge_tasks()
+            knowledge_revisions_deleted = await self._delete_orphaned_knowledge_revisions()
             jwt_deleted = await self._delete_expired_jwt_blacklist()
             image_rows, image_keys_ok, image_keys_failed = await self._delete_expired_images()
             # 版本 pass 先于逻辑产物 pass:文件先按版本清掉,后面的 hard-delete
@@ -268,6 +275,7 @@ class RetentionCleanupJob:
             sandbox_egress_audit_deleted=sandbox_egress_audit_deleted,
             memory_writeback_jobs_deleted=memory_writeback_jobs_deleted,
             knowledge_tasks_deleted=knowledge_tasks_deleted,
+            knowledge_revisions_deleted=knowledge_revisions_deleted,
             duration_seconds=time.monotonic() - started,
         )
 
@@ -847,6 +855,13 @@ class RetentionCleanupJob:
             )
             await session.commit()
         return result.rowcount or 0  # type: ignore[attr-defined]
+
+    async def _delete_orphaned_knowledge_revisions(self) -> int:
+        """B-175 P3-PR2 —— 规则本体在
+        :func:`retention_cleanup_job.knowledge_revisions.delete_orphaned_revisions`。"""
+        return await delete_orphaned_revisions(
+            self._sf, days=self._knowledge_revision_orphan_days, batch=self._batch_size
+        )
 
     async def _read_event_retentions(self) -> list[tuple[str, int]]:
         """Return ``(tenant_id, event_log_retention_days)`` for every tenant."""

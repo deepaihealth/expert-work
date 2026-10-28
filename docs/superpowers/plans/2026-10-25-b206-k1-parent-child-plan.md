@@ -44,6 +44,7 @@
 - `ChunkType.PARENT = "parent"`(`packages/expert-work-protocol/src/expert_work/protocol/knowledge.py:246`)。另加 `SEARCHABLE_CHUNK_TYPES`(除 `PARENT` 外的全部类型),所有召回 SQL 用白名单,不用排除法。
 - 父段行:`chunk_type='parent'`、`embedding` 为空、`content_tsv` 为空、`chunk_index` 在父段自己的编号空间(0..m-1)、`heading_path` = 父段首个子段的。
 - 子段行:与今天一样,`chunk_index` 0..n-1 连续;`parent_chunk_id` 指向父段行。
+  > **10-27 补注(B-175 P3-PR2)**:人工改过 / 新增整块后,编号不再保证连续 —— 改正文多出来的子段编在文档当前最大号之后,少了的子段号空出来,新增整块排在末尾;一个整块的子段号可以不相邻,直到下次重新入库才重新从 0 连续编号。读编号的地方(按 `parent_chunk_id` 分组、按 `chunk_index` 排序)不能假设连续或相邻。
 - **只有一个子段且与父段正文、标题路径都相同 → 不建父行**,子段 `parent_chunk_id` 为空,检索时自己就是父段(WeKnora 同款,短文档省一份正文)。
 - `chunk_count`(文档 / 库统计、「可服务」判断)仍只数子段。
 - `CHUNKER_VERSION` `"k3"` → `"k3k1"`,`chunk_params_hash` 把父段上限算进去 —— 测试环境重新入库时所有文档都会被标「参数已变」。
