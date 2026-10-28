@@ -26,6 +26,7 @@ from control_plane.api.feedback import build_feedback_router
 from control_plane.api.health import build_health_router
 from control_plane.api.knowledge import build_knowledge_router
 from control_plane.api.knowledge_figures import build_knowledge_figures_router
+from control_plane.api.knowledge_logs import build_knowledge_logs_router
 from control_plane.api.knowledge_maintenance import build_knowledge_maintenance_router
 from control_plane.api.knowledge_passages import build_knowledge_passages_router
 from control_plane.api.mcp_catalog import build_mcp_catalog_router
@@ -111,6 +112,7 @@ __all__ = [
     "build_feedback_router",
     "build_health_router",
     "build_knowledge_figures_router",
+    "build_knowledge_logs_router",
     "build_knowledge_maintenance_router",
     "build_knowledge_passages_router",
     "build_knowledge_router",

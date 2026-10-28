@@ -30,6 +30,7 @@ from expert_work.persistence.models.knowledge import (
     KnowledgeDocumentRow,
     KnowledgeDocumentTagRow,
     KnowledgeParseCacheRow,
+    KnowledgeRetrievalLogRow,
     KnowledgeTagRow,
     KnowledgeTaskRow,
 )
@@ -138,6 +139,7 @@ __all__ = [
     "KnowledgeDocumentRow",
     "KnowledgeDocumentTagRow",
     "KnowledgeParseCacheRow",
+    "KnowledgeRetrievalLogRow",
     "KnowledgeTagRow",
     "KnowledgeTaskRow",
     "McpConnectorCatalogRow",

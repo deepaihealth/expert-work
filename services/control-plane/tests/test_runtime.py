@@ -29,6 +29,7 @@ from control_plane.runtime import (
 )
 from expert_work.common.credentials import CredentialsResolver, CredentialsResolverError
 from expert_work.persistence import InMemoryKnowledgeStore
+from expert_work.persistence.knowledge import InMemoryKnowledgeRetrievalLogStore
 from expert_work.persistence.platform_agent_template import compute_spec_sha256
 from expert_work.persistence.skill import InMemorySkillStore
 from expert_work.protocol import AgentSpec, SkillStatus, TenantConfigRecord, TenantPlan
@@ -45,9 +46,9 @@ from orchestrator.multimodal import (
     NasWorkspaceImageResolver,
     ObjectStoreImageResolver,
 )
-from orchestrator.tools import KnowledgeRetriever
 from orchestrator.tools.knowledge import DEFAULT_RERANK_POOL, DEFAULT_RERANK_VIEW
 from orchestrator.tools.knowledge_catalog import CATALOG_UNAVAILABLE, catalog_fingerprint
+from orchestrator.tools.knowledge_log import LoggedKnowledgeRetriever
 
 _MINIMAL_MANIFEST: dict[str, Any] = {
     "apiVersion": "expert_work.io/v1",
@@ -146,16 +147,22 @@ async def test_resolve_reranker_builds_resolving_reranker() -> None:
 
 def test_make_knowledge_retriever_none_without_embedder() -> None:
     retriever = make_knowledge_retriever(
-        store=InMemoryKnowledgeStore(), embedder=None, reranker=None
+        store=InMemoryKnowledgeStore(),
+        embedder=None,
+        reranker=None,
+        retrieval_log=InMemoryKnowledgeRetrievalLogStore(),
     )
     assert retriever is None
 
 
 def test_make_knowledge_retriever_builds_with_embedder() -> None:
+    log = InMemoryKnowledgeRetrievalLogStore()
     retriever = make_knowledge_retriever(
-        store=InMemoryKnowledgeStore(), embedder=FakeEmbedder(), reranker=None
+        store=InMemoryKnowledgeStore(), embedder=FakeEmbedder(), reranker=None, retrieval_log=log
     )
-    assert isinstance(retriever, KnowledgeRetriever)
+    # B-175 P2-PR4 — the one retriever both entrances use logs every search.
+    assert isinstance(retriever, LoggedKnowledgeRetriever)
+    assert retriever.log_sink is log
     # B-206 K-14 — the one retriever both ``knowledge_search`` and the console's
     # retrieval test use carries the product rerank defaults.
     assert (retriever.rerank_view, retriever.rerank_pool, retriever.rerank_instruction) == (
