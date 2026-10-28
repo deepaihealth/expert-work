@@ -44,7 +44,11 @@ from expert_work.runtime.middleware import MeteredCall, usage_tap
 from orchestrator.errors import MaxStepsExceededError
 from orchestrator.multimodal import image_ref_block
 from orchestrator.tools._budget import DELEGATION_GATE_KEY
-from orchestrator.tools._guards import GUARD_SINK_KEY, TOKEN_BUDGET_KEY
+from orchestrator.tools._guards import (
+    DEFAULT_LOOP_TRIPS_PER_RUN,
+    GUARD_SINK_KEY,
+    TOKEN_BUDGET_KEY,
+)
 from orchestrator.tools._worker_events import (
     WORKER_EVENT_SINK_KEY,
     WorkerEventSink,
@@ -53,7 +57,7 @@ from orchestrator.tools._worker_events import (
     build_worker_start_frame,
     build_worker_update_frame,
 )
-from orchestrator.tools.artifact import ARTIFACT_RECORDER_KEY
+from orchestrator.tools.artifact import ARTIFACT_RECORDER_KEY, ArtifactRecorder
 from orchestrator.tools.registry import ToolContext, ToolResult
 from orchestrator.trajectory import (
     TrajectoryOutcome,
@@ -88,7 +92,11 @@ _worker_approval_blocked = expert_work_counter(
 #: 字面量)→ 给父的状态说明。
 _BUDGET_EXIT_NOTES: Mapping[str, str] = {
     "max_steps": "reached its step limit ({max_steps} steps)",
-    "no_progress": "stopped making progress ({max_no_progress} steps in a row without any)",
+    # B-226 ④ —— 按本 run 累计的打转次数停(不再是「连续 N 步」);没配时按平台规则的次数。
+    "no_progress": (
+        "stopped making progress (the same tool calls kept repeating, "
+        "{max_no_progress} loop trips in this run)"
+    ),
     "token_budget": "the run's token budget ran out",
 }
 
@@ -586,7 +594,10 @@ async def run_child_to_result(
         # 「不完整」由首行状态说明 + ``subagent_exit_reason`` 交代,不靠状态位。
         meta["subagent_exit_reason"] = budget_exit
         note = _BUDGET_EXIT_NOTES[budget_exit].format(
-            max_steps=child.max_steps, max_no_progress=child.max_no_progress
+            max_steps=child.max_steps,
+            max_no_progress=child.max_no_progress
+            if child.max_no_progress > 0
+            else DEFAULT_LOOP_TRIPS_PER_RUN,
         )
         content = (
             f"[worker stopped early: {note} — the reply below is a forced wrap-up "
@@ -976,7 +987,11 @@ def _child_config(ctx: ToolContext, *, sub_thread_id: UUID, sub_run_id: UUID) ->
     # 产物清单契约 —— 记录器下传:子代(worker/静态子 Agent)登记的产物
     # 同属本 run 的交付物,漏传会让「委派干活」的 run 清单缺项。真栈第三跑
     # (run 02ab4cfc)实证 worker 确实会 save_artifact。
-    if ctx.artifact_recorder is not None:
+    # B-226 ① —— 平台的记录器给子代一个分视图:同一份清单, 子代撞上限时的收尾只数它自己
+    # 登记的。
+    if isinstance(ctx.artifact_recorder, ArtifactRecorder):
+        configurable[ARTIFACT_RECORDER_KEY] = ctx.artifact_recorder.scoped()
+    elif ctx.artifact_recorder is not None:
         configurable[ARTIFACT_RECORDER_KEY] = ctx.artifact_recorder
     # 二期 PR3(spec P4)— the delegation gate is process-wide (one singleton
     # per process, not per-run like worker_spawn_budget): forward the SAME

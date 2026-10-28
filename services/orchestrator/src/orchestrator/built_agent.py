@@ -50,8 +50,8 @@ class BuiltAgent:
     #: deadline. ``sse.run_agent`` reads this to compute
     #: ``deadline_at = time.monotonic() + run_deadline_s`` once per run.
     run_deadline_s: int = 0
-    #: No-progress stop — consecutive loop-detection trips after which the
-    #: ReAct loop force-wraps up early (0 = off). Seeds ``max_no_progress``
+    #: No-progress stop — the run force-wraps up early at its Nth loop-detection
+    #: trip (0 = the platform rule, the 2nd trip). Seeds ``max_no_progress``
     #: in the initial ``AgentState``; mirrors ``max_steps``.
     max_no_progress: int = 0
     #: Stream SE (SE-7d-3b-ii) — distilled skill versions bound into this agent

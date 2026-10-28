@@ -245,15 +245,20 @@ class AgentState(TypedDict):
     #: (``ctx.payload["loop_detected"]``); the NEXT agent step consumes it
     #: (one turn on the escalated, higher-effort caller) and resets it.
     escalate_next: NotRequired[bool]
-    #: No-progress stop — consecutive loop-detection trips. agent_node
-    #: increments it on each turn the loop middleware flags a repeat and
-    #: resets it to 0 on a clean turn. Once it reaches ``max_no_progress``
-    #: (> 0) the node forces the same tool-less graceful wrap-up ``max_steps``
-    #: uses, stopping a stuck run early instead of grinding to ``max_steps``.
-    no_progress_streak: NotRequired[int]
-    #: Per-run consecutive-no-progress cap (0 = off). Configured once at graph
-    #: construction from ``policies.max_no_progress``; mirrors ``max_steps``.
+    #: No-progress stop (B-226 ④) — loop-detection trips in this run. agent_node
+    #: increments it on each turn the loop middleware flags a repeat; it is never
+    #: reset within the run (``api/runs.py`` resets it per turn). At the Nth trip
+    #: (``max_no_progress``) the node forces the same tool-less graceful wrap-up
+    #: ``max_steps`` uses, stopping a stuck run early instead of grinding on.
+    loop_trip_count: NotRequired[int]
+    #: No-progress cap from ``policies.max_no_progress``, set once at graph
+    #: construction; mirrors ``max_steps``. N = the run stops at its Nth loop
+    #: trip; 0 (default) is not "off" but the platform rule (the 2nd trip).
     max_no_progress: NotRequired[int]
+    #: B-226 ② —— 本 run 已发过步数预警的 ``warning`` 帧(进入最后一段步数时只发一次)。
+    #: 挂在本图的 state 上:每个子代有自己的步数上限;审批续跑带着它接着跑;
+    #: ``api/runs.py`` 的每轮图输入把它清回 ``False``。
+    step_budget_warned: NotRequired[bool]
     #: Stream CM-11 — the plan goal as of the previous agent turn. agent_node
     #: sets it each turn to the current ``plan.goal`` (``None`` for react
     #: graphs). A change versus the live plan goal — a re-plan, or a human

@@ -805,10 +805,10 @@ const zhCN: TranslationKeys = {
     plan_first_off_notice:
       "已关闭结构化执行。工作流类型和动态子智能体保持当前值，如需调整请手动修改。",
     max_no_progress_label: "无进展停机",
-    max_no_progress_brief: "连续无进展时提前结束运行",
+    max_no_progress_brief: "反复原地打转时提前结束运行",
     max_no_progress_impact:
-      "连续好几步都感觉不到任何实际进展，就提前把这次运行收尾，避免白白浪费步数；设成 0 = 关闭这项检查。\n调大 = 更能容忍正常的重试，不容易误伤；调小 = 更快掐断卡死的循环，但太小容易误伤正常重试，建议设 3-5。\n例：智能体反复调同一个工具却一直拿不到想要的结果，设了这个值就会提前结束运行，而不是持续空转浪费步数。",
-    max_no_progress_default: "0（关闭）",
+      "同一次运行里第 N 次原地打转（反复做同样的工具调用）就提前把这次运行收尾，避免白白浪费步数；次数按整次运行累计，中间正常走了几步也不清零。设成 0 = 用平台默认：同一次运行里第 2 次原地打转就收尾（0 不再是「关闭」，想基本不管就设一个很大的数）。\n调大 = 更能容忍正常的重试，不容易误伤；调小 = 更快掐断卡死的循环，但太小容易误伤正常重试，建议设 3-5。\n例：智能体反复调同一个工具却一直拿不到想要的结果，设了这个值就会提前结束运行，而不是持续空转浪费步数。",
+    max_no_progress_default: "0（平台默认：同一次运行第 2 次）",
     subhead_structured: "结构化执行",
     subhead_time: "时间与花费",
     run_deadline_label: "运行最长耗时（秒）",
@@ -1663,6 +1663,7 @@ const zhCN: TranslationKeys = {
     guard_token_budget_warn: "token 预算已用 {{pct}}%（{{spent}}/{{limit}}）",
     guard_token_budget_exhausted: "token 预算耗尽（{{spent}}/{{limit}}）→ 收尾轮",
     guard_max_steps: "步数耗尽（{{steps}}/{{max}}）→ 收尾轮",
+    guard_max_steps_warn: "步数已用 {{steps}}/{{max}}，接近上限",
     guard_no_progress: "无进展 {{streak}}/{{max}} → 收尾轮",
     gap_frames: "缺失第 {{from}}–{{to}} 帧（本次连接无法补齐，重新回放通常可恢复）",
     memory_recall: "记忆召回 · {{n}} 条",

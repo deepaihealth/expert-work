@@ -195,9 +195,18 @@ def _ledger(f: int) -> str:
 
 def c01_totals() -> dict[str, int]:
     """每份台账「金额」列的合计(用例 c01 的判据按它写)。"""
+    return ledger_totals(C01_FILES)
+
+
+# t04(B-226):21 份台账 —— 前 10 份就是 c01 那 10 份, 后 11 份同一个生成器接着编号。
+T04_FILES = [f"ledger-{f:02d}.csv" for f in range(1, 22)]
+
+
+def ledger_totals(names: list[str]) -> dict[str, int]:
+    """``ledger-NN.csv`` 各自「金额」列的合计(用例判据按它写)。"""
     return {
-        name: sum(int(line.rsplit(",", 1)[1]) for line in _ledger(f).splitlines()[1:])
-        for f, name in enumerate(C01_FILES, start=1)
+        name: sum(int(line.rsplit(",", 1)[1]) for line in _ledger(int(name[7:9])).splitlines()[1:])
+        for name in names
     }
 
 
@@ -361,7 +370,7 @@ def build() -> dict[str, str | bytes]:
         "calc-args.txt": _calc_args(),
         "previous-plan.docx": _previous_plan(),
         "checkup-report.docx": _checkup_report(),
-        **{name: _ledger(f) for f, name in enumerate(C01_FILES, start=1)},
+        **{name: _ledger(f) for f, name in enumerate(T04_FILES, start=1)},
         "dinner-brief.md": _dinner_brief(),
         **{name: _recipes(n) for n, name in enumerate(C02_RECIPES, start=1)},
         "family-picks.md": _family_picks(),
@@ -371,6 +380,8 @@ def build() -> dict[str, str | bytes]:
         "sleep-log.md": _sleep_log(),
         "diet-log.md": _diet_log(),
         "followup-notes.md": _followup_notes(),
+        # g16(B-226):一个永远不会变成 READY 的状态文件。
+        "status.txt": "STATUS=PENDING\n",
     }
 
 

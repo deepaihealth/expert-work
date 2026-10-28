@@ -10,6 +10,7 @@ from behavior_schema import (
     CheckVerdict,
     ResultHeader,
     ToolUsed,
+    TurnRecord,
     WorkspaceFileContains,
     WorkspaceFileLineCount,
     append_line,
@@ -222,3 +223,48 @@ def test_line_count_check_loads(tmp_path: Path) -> None:
     )
     check = load_case(_write(tmp_path, "g99-sample.yaml", ok)).checks[0]
     assert isinstance(check, WorkspaceFileLineCount) and check.count == 0
+
+
+def test_tight_budget_cases_take_a_t_id_and_can_require_an_exit_reason(tmp_path: Path) -> None:
+    """B-226 —— 撞步数上限的用例跑在 ``eval-tight``;这次没撞上(``exit_reason`` 不同)就不可判。"""
+    text = _CASE.replace("g99-sample", "t99-sample").replace("eval-general", "eval-tight")
+    case = load_case(
+        _write(tmp_path, "t99-sample.yaml", text + "requires_exit_reason: max_steps\n")
+    )
+    assert case.agent == "eval-tight" and case.requires_exit_reason == "max_steps"
+    assert load_case(_write(tmp_path, "g99-sample.yaml", _CASE)).requires_exit_reason is None
+
+
+def test_loop_cases_can_require_a_loop_trip(tmp_path: Path) -> None:
+    case = load_case(_write(tmp_path, "g99-sample.yaml", _CASE + "requires_loop_trip: true\n"))
+    assert case.requires_loop_trip is True
+    assert load_case(_write(tmp_path, "g99-sample.yaml", _CASE)).requires_loop_trip is False
+
+
+def test_unsaved_cases_can_require_that_no_artifact_matches(tmp_path: Path) -> None:
+    text = _CASE + "requires_no_artifact: 'totals*'\n"
+    assert load_case(_write(tmp_path, "g99-sample.yaml", text)).requires_no_artifact == "totals*"
+    assert load_case(_write(tmp_path, "g99-sample.yaml", _CASE)).requires_no_artifact is None
+
+
+def test_turn_record_loop_trips_default_to_zero() -> None:
+    assert TurnRecord(index=1).loop_trips == 0
+    assert TurnRecord(index=1).step_warning_maxes == []
+
+
+def test_step_notice_cases_can_require_a_step_warning(tmp_path: Path) -> None:
+    text = _CASE.replace("g99-sample", "t99-sample").replace("eval-general", "eval-tight-24")
+    case = load_case(_write(tmp_path, "t99-sample.yaml", text + "requires_step_warning: true\n"))
+    assert case.agent == "eval-tight-24" and case.requires_step_warning is True
+    assert load_case(_write(tmp_path, "g99-sample.yaml", _CASE)).requires_step_warning is False
+
+
+def test_checks_take_unless_exit_reason(tmp_path: Path) -> None:
+    ok = _CASE.replace("{type: completed}", "{type: completed, unless_exit_reason: max_steps}")
+    check = load_case(_write(tmp_path, "g99-sample.yaml", ok)).checks[0]
+    assert getattr(check, "unless_exit_reason", None) == ["max_steps"]  # 单个值收成列表
+    both = _CASE.replace(
+        "{type: completed}", "{type: completed, unless_exit_reason: [max_steps, token_budget]}"
+    )
+    check = load_case(_write(tmp_path, "g99-sample.yaml", both)).checks[0]
+    assert getattr(check, "unless_exit_reason", None) == ["max_steps", "token_budget"]

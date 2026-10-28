@@ -27,6 +27,7 @@ from behavior_schema import (
     ExitReason,
     FinalTextContains,
     FinalTextNotContains,
+    FinalTextNotRegex,
     FinalTextRegex,
     NotCompleted,
     RunRecord,
@@ -103,7 +104,17 @@ def evaluate(
     files: Mapping[FileKey, FetchedFile | None],
     fixtures_dir: Path,
 ) -> list[CheckVerdict]:
-    return [_one(check, record, files, fixtures_dir) for check in case.checks]
+    # B-226 t04 —— 带 ``unless_exit_reason`` 的判据, 按那个出口结束时记过并写明原因。
+    exit_reason = record.turns[-1].exit_reason if record.turns else None
+    verdicts: list[CheckVerdict] = []
+    for check in case.checks:
+        waived_for = getattr(check, "unless_exit_reason", None) or []
+        if exit_reason in waived_for:
+            detail = f"waived: exit_reason={exit_reason}"
+            verdicts.append(CheckVerdict(type=check.type, passed=True, detail=detail))
+        else:
+            verdicts.append(_one(check, record, files, fixtures_dir))
+    return verdicts
 
 
 def _verdict(check: Check, ok: bool, detail: str) -> CheckVerdict:
@@ -168,6 +179,9 @@ def _one(
         return _verdict(
             check, re.search(check.pattern, final) is not None, f"no match for {check.pattern!r}"
         )
+    if isinstance(check, FinalTextNotRegex):
+        hit = re.search(check.pattern, final)
+        return _verdict(check, hit is None, f"found {hit.group(0)!r}" if hit else "")
     if isinstance(check, ArtifactExists):
         names = [
             str(a["name"])

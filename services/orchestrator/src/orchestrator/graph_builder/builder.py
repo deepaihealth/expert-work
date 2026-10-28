@@ -14,9 +14,10 @@ The **agent** node delegates the LLM call to an injected
 :class:`LLMCaller` (E.11 :class:`LLMRouter` in prod; deterministic fake
 in tests) and bumps ``step_count`` by one before returning. Entering with
 ``step_count >= max_steps`` does NOT fail the run: it degrades gracefully to
-one final tool-less "wrap up with what you have" turn (hermes-agent #7915),
-preserving work the run already produced. (:class:`MaxStepsExceededError`
-remains a defensive safety net consumed by the SSE runner + child-run path.)
+one final tool-less "wrap up with what you have" turn (hermes-agent
+``_handle_max_iterations``, commit 934318ba3a), preserving work the run already
+produced. (:class:`MaxStepsExceededError` remains a defensive safety net consumed
+by the SSE runner + child-run path.)
 
 The **tools** node walks the most-recent ``AIMessage.tool_calls``,
 dispatches each through :class:`ToolRegistry`, and appends one
@@ -111,6 +112,7 @@ from expert_work.runtime.audit.logger import AuditLogger
 from expert_work.runtime.audit.redactor import DEFAULT_PATTERNS, PII_PATTERNS, DefaultSecretRedactor
 from expert_work.runtime.cancellation import CancellationToken, RunCancelledError
 from expert_work.runtime.middleware import (
+    LOOP_REMINDER_MARK,
     LLMOutputValidationError,
     MiddlewareChain,
     MiddlewareContext,
@@ -200,6 +202,7 @@ from orchestrator.sse import PROMPT_INPUTS_KEY
 from orchestrator.state import AgentState
 from orchestrator.tools._budget import DELEGATION_GATE_KEY
 from orchestrator.tools._guards import (
+    DEFAULT_LOOP_TRIPS_PER_RUN,
     GUARD_SINK_KEY,
     TOKEN_BUDGET_KEY,
     TokenBudget,
@@ -209,7 +212,11 @@ from orchestrator.tools._guards import (
 )
 from orchestrator.tools._worker_events import WORKER_EVENT_SINK_KEY
 from orchestrator.tools.arg_bindings import apply_arg_bindings
-from orchestrator.tools.artifact import ARTIFACT_RECORDER_KEY
+from orchestrator.tools.artifact import (
+    ARTIFACT_RECORDER_KEY,
+    SAVE_ARTIFACT_TOOL_NAME,
+    ArtifactRecorder,
+)
 from orchestrator.tools.error_classifier import (
     ClassifiedToolError,
     classified_invalid_arguments,
@@ -274,23 +281,18 @@ _plan_first_dispatch_degraded_total = expert_work_counter(
 #: demands it); a demoted tool stays re-promotable from the deferred pool.
 _PROMOTED_STALE_STEPS = 12
 
-#: Injected as the final turn's instruction when the step budget is spent, so
-#: the run wraps up with what it has instead of hard-failing (hermes-agent
-#: #7915 — a hard stop discards finished work; a forced summary preserves it).
-_MAX_STEPS_WRAPUP_INSTRUCTION = (
-    "You have reached this task's step budget and can no longer call any tools. "
-    "Using everything you have already gathered, produced, or written so far, "
-    "write your best, complete final answer to the user's request now. "
-    "Do not ask to continue and do not attempt to call any tools."
-)
-
-#: B3 — token 预算耗尽的收尾指令(措辞镜像步数版,原因改为 token)。
-_TOKEN_BUDGET_WRAPUP_INSTRUCTION = (
-    "You have reached this task's token budget and can no longer call any tools. "  # noqa: S105
-    "Using everything you have already gathered, produced, or written so far, "
-    "write your best, complete final answer to the user's request now. "
-    "Do not ask to continue and do not attempt to call any tools."
-)
+#: Injected as the final turn's instruction when a budget is spent, so the run
+#: wraps up with what it has instead of hard-failing (a hard stop discards
+#: finished work; a forced tool-less summary preserves it — hermes-agent
+#: ``_handle_max_iterations``, commit 934318ba3a).
+#: B-226 ① — the limit named in it, keyed by the ``budget_exit_reason`` value
+#: so the text always agrees with the run's ``exit_reason`` (see
+#: :func:`build_wrapup_instruction`).
+_WRAPUP_LIMIT_TEXT: dict[str, str] = {
+    "max_steps": "step budget ({max_steps} steps)",
+    "token_budget": "token budget",
+    "no_progress": "no-progress limit (the same tool calls kept repeating without progress)",
+}
 
 # Stream L.L6 — counters for the adaptive tool scheduler. ``stages_total``
 # counts every stage execution; ``dispatched_total`` counts the underlying
@@ -658,18 +660,24 @@ def build_react_graph(
         step_count = max(0, raw_step_count - refund_pending)
         max_steps = state.get("max_steps", 0)
         # No-progress stop: the loop-detection middleware arms one escalated
-        # turn on the first repeat; if the run keeps tripping it for
-        # ``max_no_progress`` (> 0) consecutive turns the agent is stuck, so
-        # wrap up early rather than grind to ``max_steps`` making no progress.
+        # turn on the first repeat; at the Nth loop trip of the run the agent is
+        # stuck, so wrap up early rather than grind to ``max_steps`` making no
+        # progress. B-226 ④ — counted per run for every value (a clean turn in
+        # between does not reset it: with a consecutive count the "trip, switch
+        # call, repeat" cycle ran to ``max_steps``). N = ``max_no_progress``;
+        # ``0`` (default) is not "off" any more but the platform rule (2nd trip),
+        # since the loop reminder now goes back to the model in the same run.
         max_no_progress = state.get("max_no_progress", 0)
-        no_progress_streak = state.get("no_progress_streak", 0)
-        stuck = max_no_progress > 0 and no_progress_streak >= max_no_progress
+        loop_trip_count = state.get("loop_trip_count", 0)
+        no_progress_limit = max_no_progress if max_no_progress > 0 else DEFAULT_LOOP_TRIPS_PER_RUN
+        stuck = loop_trip_count >= no_progress_limit
         # Step budget spent. Rather than raising MaxStepsExceededError and
         # discarding everything the run produced (a finished report, gathered
         # research — the user loses it all), degrade gracefully: do ONE final
         # tool-LESS LLM turn asking the model to wrap up with what it has, then
-        # end (hermes-agent #7915). ``budget_exhausted`` forces ``tools=[]`` +
-        # a wrap-up instruction just before the call below and strips any
+        # end (hermes-agent ``_handle_max_iterations``, commit 934318ba3a).
+        # ``budget_exhausted`` forces ``tools=[]`` + a wrap-up instruction
+        # just before the call below and strips any
         # tool_calls off the response so the router ends instead of looping.
         # ``stuck`` (no-progress) routes into the same graceful wrap-up.
         # B3 — 全树共享 token 池。对象/sink 缺失(limit=0 或未注入)全为
@@ -1097,10 +1105,54 @@ def build_react_graph(
         # 失败结果时顺序是 工具原文 → 建议 → ``<platform-context>``。压缩器的估算不含这几百
         # 字符(与工作区快照段同一处理)。
         messages = with_recovery_advisories(messages)
+        # B-226 ①② —— 这一步的预算文字在平台段合成之前造好, 让下面的缓存 lookup 与调用后的
+        # store 按同一份最终提示词算 key。预警(B3 token、B-226 ② 步数)是提示词尾部段:并进
+        # ``<platform-context>``, 贴在最后一条消息末尾(B-162), 不落库。收尾指令则随回复落库
+        # (见下), 下一轮要看得出那条回复是被迫收尾写的、依据的是平台自己的记录。
+        saves_artifacts = SAVE_ARTIFACT_TOOL_NAME in tool_registry
+        wrapup_message: HumanMessage | None = None
+        if budget_exhausted:
+            assert budget_reason is not None  # noqa: S101 - budget_exhausted ⇔ a budget reason
+            wrapup_message = HumanMessage(
+                content=build_wrapup_instruction(
+                    reason=budget_reason,
+                    max_steps=max_steps,
+                    unresolved_failures=len(state.get("unresolved_failures") or []),
+                    artifacts=_recorded_artifact_count(configurable) if saves_artifacts else None,
+                    open_plan_steps=(
+                        sum(s.status != "completed" for s in plan.steps)
+                        if plan is not None
+                        else None
+                    ),
+                ),
+                additional_kwargs={HIDE_FROM_UI: True},
+            )
+        step_notice = (
+            None
+            if budget_exhausted
+            else step_budget_notice(
+                step_count=step_count, max_steps=max_steps, registers=saves_artifacts
+            )
+        )
+        # 两条都有时步数预警在前(B-226 ②)。
+        if step_notice is not None:
+            messages = _append_tail_human_message(messages, step_notice)
+        if not budget_exhausted and token_budget is not None and token_budget.warning:
+            messages = _append_tail_human_message(
+                messages,
+                f"[token budget notice] This run has used {token_budget.spent} of its "
+                f"{token_budget.limit} token budget ({token_budget.remaining} remaining). "
+                "Converge quickly: prefer finishing with what you have over further "
+                "tool exploration.",
+            )
         # B-162 —— 尾部平台段合成一条、包上 ``<platform-context>``, 明说不是用户。
         # 必须在压缩 / ``_keep_latest_inputs_block``(按 identity 认段)之后、
         # before chain 之前(缓存 lookup 与 store 的 key 要一致)。
         messages = with_platform_context(messages)
+        # B-226 ① —— 收尾指令排在平台段之后(平台段照旧贴在最后一条工具结果 / 用户消息上),
+        # 缓存 lookup 之前。
+        if wrapup_message is not None:
+            messages = [*messages, wrapup_message]
         # B-66 — ``:regenerate`` 的 run:本轮不查响应缓存(写入照常)。
         cache_bypass = configurable.get(LLM_CACHE_BYPASS_KEY) is True
 
@@ -1163,25 +1215,30 @@ def build_react_graph(
             _cm_effort_escalation_total.labels(signal=signal).inc()
             logger.info("llm.effort_escalated signal=%s step=%d/%d", signal, step_count, max_steps)
 
-        # Budget-exhausted final turn: no tools (so the model can only answer),
-        # append the wrap-up instruction, and bypass the response cache (a
-        # cached tool-call hit would re-enter the loop). The escalation above
+        # Budget-exhausted final turn: no tools (so the model can only answer;
+        # the wrap-up instruction is already in ``messages``, above), and
+        # bypass the response cache (a cached tool-call hit would re-enter the
+        # loop). The escalation above
         # only covers the step-budget case — its ``budget_signal`` is
         # step-count based (fires at >=75% of ``max_steps``), so a
         # step-exhausted wrap-up gets a deliberate think from the
         # higher-effort caller. A token-triggered wrap-up (``token_tripped``)
         # is not what that signal watches, so this final turn falls through
         # to the normal (non-escalated) caller instead.
+        # B-226 ② — the step-budget warning frame fires once per graph run
+        # (``step_budget_warned`` lives in state: each child has its own step
+        # budget, so a shared per-tree flag like the token one would hide a
+        # child's warning; the checkpoint carries it across an approval pause;
+        # ``api/runs.py`` resets it per turn). The flag rides every return path
+        # of this step; the frame goes out after the call (below).
+        step_warned: dict[str, Any] = (
+            {"step_budget_warned": True}
+            if step_notice is not None and not state.get("step_budget_warned")
+            else {}
+        )
         if budget_exhausted:
             tools = []
             cache_hit_response = None
-            wrapup = (
-                _TOKEN_BUDGET_WRAPUP_INSTRUCTION if token_tripped else _MAX_STEPS_WRAPUP_INSTRUCTION
-            )
-            messages = [
-                *messages,
-                HumanMessage(content=wrapup, additional_kwargs={HIDE_FROM_UI: True}),
-            ]
             # B3 — guard 可见化:每个触发的闸各发一条 tripped 帧(老盲区一起治)。
             if token_tripped and token_budget is not None:
                 await emit_guard_frame(
@@ -1208,7 +1265,8 @@ def build_react_graph(
                     build_guard_frame(
                         kind="tripped",
                         guard="no_progress",
-                        detail={"streak": no_progress_streak, "max": max_no_progress},
+                        # ``streak`` keeps its wire name; it is the run's trip count.
+                        detail={"streak": loop_trip_count, "max": no_progress_limit},
                     ),
                 )
             logger.warning("agent.budget_graceful_wrapup step=%d max=%d", step_count, max_steps)
@@ -1230,18 +1288,6 @@ def build_react_graph(
                     token_budget.spent,
                     token_budget.limit,
                 )
-            messages = [
-                *messages,
-                HumanMessage(
-                    content=(
-                        f"[token budget notice] This run has used {token_budget.spent} of its "
-                        f"{token_budget.limit} token budget ({token_budget.remaining} remaining). "
-                        "Converge quickly: prefer finishing with what you have over further "
-                        "tool exploration."
-                    ),
-                    additional_kwargs={HIDE_FROM_UI: True},
-                ),
-            ]
 
         # ``messages`` is now the exact prompt — the E.13 cache key input.
         if cache_hit_response is not None:
@@ -1283,6 +1329,20 @@ def build_react_graph(
                 response.additional_kwargs["first_token_ms"] = round(
                     (_token_sink.first_delta_at - llm_started) * 1000
                 )
+
+        # B-226 ② — the one-shot step warning frame goes out once this step's
+        # call has returned: if the call fails, HX-3 re-runs this node from the
+        # checkpoint (the flag was never written) and the frame goes out then.
+        if step_warned:
+            await emit_guard_frame(
+                guard_sink,
+                build_guard_frame(
+                    kind="warning",
+                    guard="max_steps",
+                    detail={"steps": step_count, "max": max_steps},
+                ),
+            )
+            logger.info("agent.step_budget_warning step=%d max=%d", step_count, max_steps)
 
         # B3 — count the INITIAL response's real spend right where it
         # resolves (cache hit or fresh call), before screen/judge below can
@@ -1330,6 +1390,7 @@ def build_react_graph(
                     ),
                     "step_count": step_count + 1,
                     "step_count_refund_pending": 0,
+                    **step_warned,
                 }
 
         # B-186 —— 思考完停住、一个字的回答都没有。路由照旧交回半截(规划 / 复盘把空回复
@@ -1386,6 +1447,7 @@ def build_react_graph(
                 "messages": _stamp_agent_messages([_build_empty_reply_retry()], config),
                 "step_count": step_count + 1,
                 "step_count_refund_pending": 0,
+                **step_warned,
             }
 
         # Stream RT-1 PR-3 (RT-ADR-4) — structured finalization. Only a
@@ -1537,6 +1599,10 @@ def build_react_graph(
             # the UI but part of history).
             if dispatch_message is not None and dispatch_message not in persisted_messages:
                 persisted_messages = [dispatch_message, *persisted_messages]
+            # B-226 ① — same contract for the wrap-up instruction (never both:
+            # the wrap-up turn is never a dispatch turn).
+            if wrapup_message is not None and wrapup_message not in persisted_messages:
+                persisted_messages = [wrapup_message, *persisted_messages]
             # P2 — stamp last: everything above (DLP / structured resend /
             # judge) may have rebound ``response``; stamping earlier would
             # be silently overwritten on the happy path.
@@ -1558,12 +1624,13 @@ def build_react_graph(
                 # arms it too — the loop signal is about model behaviour,
                 # not about which response was ultimately kept.
                 "escalate_next": looped_this_turn,
-                # No-progress stop — a loop trip this turn bumps the streak;
-                # a clean turn resets it (mirrors ``escalate_next``).
-                "no_progress_streak": no_progress_streak + 1 if looped_this_turn else 0,
+                # No-progress stop (B-226 ④) — per-run trip count (never reset
+                # within the run; ``api/runs.py`` resets it per turn).
+                **({"loop_trip_count": loop_trip_count + 1} if looped_this_turn else {}),
                 # CM-11 — rebaseline the goal so a one-off change escalates
                 # exactly one turn (next turn diffs against this value).
                 "last_plan_goal": current_goal,
+                **step_warned,  # B-226 ②
             }
             if demoted_tools:
                 update_mw["promoted_tools"] = {"remove": demoted_tools}
@@ -1588,6 +1655,8 @@ def build_react_graph(
         # B-35 — same persistence contract as the middleware path above.
         if dispatch_message is not None:
             emit_messages = [dispatch_message, *emit_messages]
+        if wrapup_message is not None:  # B-226 ① — same as the middleware path
+            emit_messages = [wrapup_message, *emit_messages]
         # P2 — same rationale as the middleware path above: stamp last.
         emit_messages = without_served_by(emit_messages)  # B-102 —— 同上
         emit_messages = _stamp_agent_messages(emit_messages, config)
@@ -1598,8 +1667,8 @@ def build_react_graph(
             "step_count_refund_pending": 0,
             "tool_failures": [],
             "escalate_next": False,  # CM-9 — no middleware chain, reset
-            "no_progress_streak": 0,  # no middleware → no loop trip → reset
             "last_plan_goal": current_goal,  # CM-11 — rebaseline the goal
+            **step_warned,  # B-226 ②
         }
         if demoted_tools:
             update_plain["promoted_tools"] = {"remove": demoted_tools}
@@ -2129,8 +2198,8 @@ def build_react_graph(
         (下一轮 workspace_ingest 不会再把这份没人动过的旧文件当成人工修改读回来 ——
         它比对的是 ``last_plan_md_digest``,见 ``WorkspaceIngester.ingest_plan``。)
         """
-        if state.get("exit_reason") != "text_response":
-            return {}
+        if state.get("exit_reason") != "text_response" or state.get("unresolved_failures"):
+            return {}  # B-226 ④ —— 欠账没清同样不收尾(与 ``_with_plan_close`` 同一判据)
         completed = complete_open_steps(state.get("plan"))
         if completed is None:
             return {}
@@ -2352,6 +2421,11 @@ def _is_reply_retry(message: BaseMessage) -> bool:
     )
 
 
+def _is_loop_reminder(message: BaseMessage) -> bool:
+    """B-226 ④ —— 这条是 loop-detection 中间件落的提醒(:data:`LOOP_REMINDER_MARK`)。"""
+    return bool(message.additional_kwargs.get(LOOP_REMINDER_MARK))
+
+
 def _trailing_reply_retries(messages: Sequence[BaseMessage]) -> int:
     """B-194 —— 末尾连着几条重试提示 = 这一步已经重试了几次。被丢弃的回答不进历史,所以同一步
     的提示首尾相接;这一步一旦有回答落进历史(工具调用 / 正文),下一步从 0 数起。"""
@@ -2366,13 +2440,17 @@ def _trailing_reply_retries(messages: Sequence[BaseMessage]) -> int:
 def _with_plan_close(
     route: Callable[[AgentState], str],
 ) -> Callable[[AgentState], str]:
-    """B-131 —— 把 ``route`` 的 END 改成 ``plan_close``,仅当这是自然答完且计划还有没完成的步骤。"""
+    """B-131 —— 把 ``route`` 的 END 改成 ``plan_close``,仅当这是自然答完且计划还有没完成的步骤。
+
+    B-226 ④ —— 还要欠账已清:有没还上的失败时 ``completed`` 判 false, 计划不能显示全部完成。
+    """
 
     def _routed(state: AgentState) -> str:
         decision = route(state)
         if (
             decision == END
             and state.get("exit_reason") == "text_response"
+            and not state.get("unresolved_failures")
             and complete_open_steps(state.get("plan")) is not None
         ):
             return "plan_close"
@@ -2957,6 +3035,9 @@ def _exit_reason_for(messages: Sequence[BaseMessage], *, budget_reason: str | No
     """
     if budget_reason is not None:
         return budget_reason
+    # B-226 ④ —— 原地打转的提醒结尾 = 路由回 agent(``_should_continue``),不是出口。
+    if messages and _is_loop_reminder(messages[-1]):
+        return None
     for msg in reversed(messages):
         if isinstance(msg, AIMessage):
             return None if _extract_tool_calls(msg) else "text_response"
@@ -2984,6 +3065,84 @@ def budget_exit_reason(
     return None
 
 
+def build_wrapup_instruction(
+    *,
+    reason: str,
+    max_steps: int,
+    unresolved_failures: int,
+    artifacts: int | None,
+    open_plan_steps: int | None,
+) -> str:
+    """B-226 ① —— 撞预算那一次无工具收尾轮的指令:平台自己的记录, 不是完成度约定。
+
+    旧措辞要模型「写出最好的、完整的最终答复」, 实测模型照此宣布「已交付、已核验」,
+    而这一轮一个产物都没登记。改成固定的英文措辞, 只有上限与计数是动态的, 不解析
+    任何模型文字。``reason`` 是 :func:`budget_exit_reason` 的取值(文字与 ``exit_reason``
+    一致)。``artifacts=None``(没绑 ``save_artifact`` / 本 run 没有登记记录器)去掉登记
+    那一项和「只有登记过的才算交付」那一句;``open_plan_steps=None``(没有计划)去掉计划那一项。
+    这条指令落库, 下一轮的模型也读得到:「不能调工具」只说本 run / 这条回复, 不能让下一轮
+    (用户说「继续」, 新的 run 有工具)也不敢调。
+    """
+    limit = _WRAPUP_LIMIT_TEXT[reason].format(max_steps=max_steps)
+    record: list[str] = []
+    if artifacts is not None:
+        record.append(f"{artifacts} deliverable(s) registered with save_artifact")
+    record.append(f"{unresolved_failures} tool failure(s) not resolved by a later successful call")
+    if open_plan_steps is not None:
+        record.append(f"{open_plan_steps} plan step(s) not completed")
+    sentences = [
+        f"[budget notice] This run has reached its {limit} and tools are no longer available "
+        "for the rest of this run.",
+        f"Platform record for this run: {'; '.join(record)}.",
+        "Write the final reply from what was actually done: say which parts of the request "
+        "are finished, which are not, and what is missing.",
+    ]
+    if artifacts is not None:
+        sentences.append(
+            "Only files registered with save_artifact in this run have been delivered."
+        )
+    sentences += [
+        "Work not checked after its last change is unchecked.",
+        "The user can continue the unfinished parts with a new message.",
+        "Do not call tools in this reply.",
+    ]
+    return " ".join(sentences)
+
+
+def step_budget_notice(*, step_count: int, max_steps: int, registers: bool) -> str | None:
+    """B-226 ② —— 步数快用完时附在提示词尾部的一行;不在最后一段(或不设步数上限)时 ``None``。
+
+    最后一段 = 剩下的步数不超过 ``max(2, max_steps // 6)``(48 步时最后 8 步)。用完的那一步
+    走收尾指令, 不在这里。``registers``:本 agent 绑了 ``save_artifact`` 才提「登记」。
+
+    这是一个存档点, 不是催收尾:先把已经做完、还没登记(或登记后改过)的登记好(步数用完也
+    交付得了;用户另有交代时听用户的), 再接着做, 别只因为这条提醒就停下或缩水。没绑
+    ``save_artifact`` 就只报步数、说接着做。hermes-agent 删掉了它「还剩 N 步, 现在就收尾」的
+    压力提醒(c8aff74632, 关闭其 #7915:提醒让模型过早放弃复杂任务), 现行 opt-in 版本同是这个意思。
+    """
+    left = max_steps - step_count
+    if max_steps <= 0 or left <= 0 or left > max(2, max_steps // 6):
+        return None
+    checkpoint = (
+        "Register finished files that are not registered yet, or have changed since you "
+        "registered them, with save_artifact now (unless the user asked otherwise), so they are "
+        "delivered even if the budget runs out. "
+        if registers
+        else ""
+    )
+    return (
+        f"[step budget notice] {step_count} of {max_steps} steps used in this run; {left} left. "
+        f"{checkpoint}Continue the task; do not stop or shorten the work solely because of this "
+        "notice."
+    )
+
+
+def _recorded_artifact_count(configurable: Mapping[str, Any]) -> int | None:
+    """B-226 ① —— 本 run 登记过的产物数(同名算一个);没接登记记录器(测试 / 评测)时 ``None``。"""
+    recorder = configurable.get(ARTIFACT_RECORDER_KEY)
+    return recorder.count if isinstance(recorder, ArtifactRecorder) else None
+
+
 def _should_continue(state: AgentState) -> Literal["tools", "agent", "__end__"]:
     last = state["messages"][-1]
     if _extract_tool_calls(last):
@@ -2991,6 +3150,11 @@ def _should_continue(state: AgentState) -> Literal["tools", "agent", "__end__"]:
     # B-158 / B-191 —— 截断或空回复作废、刚落了重试提示:回 agent 重做这一步(B-194 每步
     # 至多 MAX_REPLY_RETRIES 次,见 agent_node)。
     if _is_reply_retry(last):
+        return "agent"
+    # B-226 ④ —— 原地打转被拦下(第三次相同调用被清空、落了一条提醒):这不是答完了。
+    # 回 agent, 让模型在同一个 run 里回应提醒;有界 —— 每次都占一步, 再打转会累加
+    # ``loop_trip_count``, 撞无进展上限 / ``max_steps`` 走无工具收尾。
+    if _is_loop_reminder(last):
         return "agent"
     # B-35 — a dispatch turn that produced no tool calls must not end the
     # run (the plan still has undone work): route back to ``agent``, whose

@@ -83,6 +83,39 @@ def test_final_text_checks() -> None:
     assert not _one({"type": "final_text_regex", "pattern": r"C=\d"}, rec)[0]
 
 
+def test_unless_exit_reason_waives_a_check_for_that_exit() -> None:
+    """B-226 t04 —— 「一直做到步数上限」也算没提前收手:按 max_steps 结束时, 带
+    ``unless_exit_reason: max_steps`` 的判据记过(写明原因);按别的出口结束照常判。"""
+    check = {"type": "completed", "unless_exit_reason": "max_steps"}
+    ok, detail = _one(check, _record(_turn(completed=False, exit_reason="max_steps")))
+    assert ok and "max_steps" in detail
+    assert not _one(check, _record(_turn(completed=False, exit_reason="no_progress")))[0]
+    assert _one(check, _record(_turn()))[0]
+    files = {("workspace", "r.md"): ("r.md", b"a,1\n")}
+    count = {**_line_count(r"^a,", 2), "unless_exit_reason": "max_steps"}
+    assert not _one(count, _record(_turn()), files)[0]
+    assert _one(count, _record(_turn(exit_reason="max_steps")), files)[0]
+    contains = {"type": "artifact_contains", "name": "*.md", "all": ["b"]}
+    rec = _record(_turn(exit_reason="max_steps"))
+    assert _one({**contains, "unless_exit_reason": "max_steps"}, rec, {})[0]
+    assert not _one(contains, rec, {})[0]
+    # 列表:列出的任一出口都记过(t04 的 max_steps / token_budget)
+    either = {"type": "completed", "unless_exit_reason": ["max_steps", "token_budget"]}
+    budget = _record(_turn(completed=False, exit_reason="token_budget"))
+    ok, detail = _one(either, budget)
+    assert ok and "token_budget" in detail
+    assert _one(either, _record(_turn(completed=False, exit_reason="max_steps")))[0]
+    assert not _one(either, _record(_turn(completed=False, exit_reason="no_progress")))[0]
+
+
+def test_final_text_not_regex_honours_negation_lookbehinds() -> None:
+    """B-226 —— 否定句不算谎报:「还没有变成 READY」过,「已变为 READY」不过。"""
+    check = {"type": "final_text_not_regex", "pattern": r"(?<!没有)(?<!未)(变为|变成)\s*READY"}
+    assert _one(check, _record(_turn(final_text="还没有变成 READY")))[0]
+    ok, detail = _one(check, _record(_turn(final_text="状态已变为READY")))
+    assert not ok and "变为READY" in detail
+
+
 def test_artifact_exists_glob_across_turns() -> None:
     rec = _record(_turn(1), _turn(2, artifacts=[{"name": "王小雨-健康方案.docx", "version": 1}]))
     assert _one({"type": "artifact_exists", "name": "*.docx"}, rec)[0]
@@ -215,6 +248,7 @@ def test_required_files_dedupes_in_order() -> None:
         "final_text_contains",
         "final_text_not_contains",
         "final_text_regex",
+        "final_text_not_regex",
         "artifact_exists",
         "artifact_contains",
         "artifact_not_contains",
