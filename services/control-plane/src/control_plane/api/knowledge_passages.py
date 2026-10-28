@@ -56,9 +56,9 @@ from expert_work.persistence import KnowledgeStore
 from expert_work.persistence.knowledge.base import (
     DisabledReason,
     Passage,
-    PassageConflictError,
     PassageRevision,
 )
+from expert_work.persistence.knowledge.passages import PassageConflictError
 from expert_work.protocol import (
     AuditAction,
     ChunkType,
