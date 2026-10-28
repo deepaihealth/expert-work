@@ -3,6 +3,8 @@
 ``GET /v1/knowledge/bases/{name}/retrieval-logs`` (newest first, filtered by
 source / status / zero hits / time, paged with a total) and ``…/{log_id}``
 (the row with each result's document resolved; ``null`` once deleted).
+``…/{log_id}/passages`` (B-175 P2-PR4 console) reads each result's passage and
+best hit chunk as they are now — the row itself keeps no text.
 
 Ruling (2026-10-27): logs are read under the conversation records' gate —
 ``session:read`` (every employee: viewer included), console only (an API key
@@ -12,6 +14,7 @@ deletes its logs.
 
 from __future__ import annotations
 
+import logging
 from collections.abc import AsyncIterator
 from datetime import UTC, datetime, timedelta
 from typing import Any
@@ -30,7 +33,7 @@ from expert_work.persistence.knowledge import (
     InMemoryKnowledgeRetrievalLogStore,
     RetrievalLogEntry,
 )
-from expert_work.protocol import AuditAction, AuditQuery
+from expert_work.protocol import AuditAction, AuditQuery, ChunkType, KnowledgeChunk
 from orchestrator.llm import FakeEmbedder
 from tests.auth_fixtures import (
     TEST_AUDIENCE,
@@ -68,9 +71,11 @@ class _Setup:
         kb_id: UUID,
         other_kb_id: UUID,
         document_id: UUID,
+        runner: KnowledgeIngestionRunner,
     ) -> None:
         self.client, self.store, self.log = client, store, log
         self.kb_id, self.other_kb_id, self.document_id = kb_id, other_kb_id, document_id
+        self.runner = runner
 
     async def add(self, kb_id: UUID | None = None, **fields: Any) -> RetrievalLogEntry:
         entry = RetrievalLogEntry(
@@ -120,7 +125,7 @@ async def setup() -> AsyncIterator[_Setup]:
         assert kb is not None
         assert other is not None
         [document] = await store.list_documents(tenant_id=_TENANT, kb_id=kb.id)
-        yield _Setup(client, store, log, kb.id, other.id, document.id)
+        yield _Setup(client, store, log, kb.id, other.id, document.id, runner)
 
 
 @pytest.mark.asyncio
@@ -234,7 +239,7 @@ async def test_the_detail_is_404_outside_the_base(setup: _Setup) -> None:
 @pytest.mark.asyncio
 async def test_a_roleless_employee_is_refused(setup: _Setup) -> None:
     entry = await setup.add()
-    for path in (_LOGS, f"{_LOGS}/{entry.id}"):
+    for path in (_LOGS, f"{_LOGS}/{entry.id}", f"{_LOGS}/{entry.id}/passages"):
         resp = await setup.client.get(path, headers=_headers())
         assert resp.status_code == 403, resp.text
         assert resp.json()["detail"]["message"] == "principal lacks required role"
@@ -244,7 +249,7 @@ async def test_a_roleless_employee_is_refused(setup: _Setup) -> None:
 async def test_an_api_key_is_refused(setup: _Setup) -> None:
     key = _headers(sub_type="service_account", scopes=("admin",))
     entry = await setup.add()
-    for path in (_LOGS, f"{_LOGS}/{entry.id}"):
+    for path in (_LOGS, f"{_LOGS}/{entry.id}", f"{_LOGS}/{entry.id}/passages"):
         resp = await setup.client.get(path, headers=key)
         assert resp.status_code == 403, resp.text
         assert "not available to API keys" in resp.json()["detail"]["message"]
@@ -252,9 +257,189 @@ async def test_an_api_key_is_refused(setup: _Setup) -> None:
 
 @pytest.mark.asyncio
 async def test_all_tenants_is_refused(setup: _Setup) -> None:
-    resp = await setup.client.get(_LOGS, params={"tenant_id": "*"}, headers=_ADMIN)
-    assert resp.status_code == 400, resp.text
-    assert resp.json()["detail"]["code"] == "SCOPE_ALL_NOT_SUPPORTED"
+    entry = await setup.add()
+    for path in (_LOGS, f"{_LOGS}/{entry.id}/passages"):
+        resp = await setup.client.get(path, params={"tenant_id": "*"}, headers=_ADMIN)
+        assert resp.status_code == 400, resp.text
+        assert resp.json()["detail"]["code"] == "SCOPE_ALL_NOT_SUPPORTED"
+
+
+# -- live passage text (B-175 P2-PR4 console) ------------------------------------------
+
+#: One chapter that fills a passage of several chunks (a parent row; one chunk
+#: per paragraph at a 128-token chunk size), then a short one that stands for
+#: itself (as in ``test_knowledge_api_passages``).
+_GUIDE = "\n\n".join(
+    [
+        "# Guide",
+        *(" ".join(f"p{tag}{i}" for i in range(50)) + "." for tag in "abcdefghij"),
+        "# Notes",
+        "The deductible is 500 dollars per year. " + " ".join(f"nt{i}" for i in range(20)),
+    ]
+)
+
+
+class _Guide:
+    """The uploaded guide: its id, the passage's parent row, one chunk under
+    it, and the chunk standing for itself."""
+
+    def __init__(
+        self, document_id: UUID, parent: KnowledgeChunk, child: KnowledgeChunk, lone: KnowledgeChunk
+    ) -> None:
+        self.document_id, self.parent, self.child, self.lone = document_id, parent, child, lone
+
+
+async def _upload(setup: _Setup, base: str, filename: str, text: str) -> UUID:
+    uploaded = await setup.client.post(
+        f"/v1/knowledge/bases/{base}/documents",
+        files={"file": (filename, text.encode(), "text/markdown")},
+        headers=_ADMIN,
+    )
+    assert uploaded.status_code == 202, uploaded.text
+    await setup.runner.drain()
+    return UUID(uploaded.json()["id"])
+
+
+async def _guide(setup: _Setup) -> _Guide:
+    patched = await setup.client.patch(
+        "/v1/knowledge/bases/kb", json={"chunk_max_tokens": 128}, headers=_ADMIN
+    )
+    assert patched.status_code == 200, patched.text
+    document_id = await _upload(setup, "kb", "guide.md", _GUIDE)
+    chunks, _ = await setup.store.list_chunks(tenant_id=_TENANT, document_id=document_id, limit=200)
+    [parent], _ = await setup.store.list_chunks(
+        tenant_id=_TENANT, document_id=document_id, chunk_types=(ChunkType.PARENT,)
+    )
+    under = [c for c in chunks if c.parent_chunk_id == parent.id]
+    [lone] = [c for c in chunks if c.parent_chunk_id is None]
+    assert len(under) > 1
+    return _Guide(document_id, parent, under[1], lone)
+
+
+def _hit(
+    chunk: KnowledgeChunk, *, parent: KnowledgeChunk | None = None, document_id: UUID | None = None
+) -> dict[str, Any]:
+    """A logged result for ``chunk`` (under ``parent``) — ids and a score, no text."""
+    return {
+        "chunk_id": str(chunk.id),
+        "document_id": str(document_id or chunk.document_id),
+        "parent_chunk_id": str(parent.id) if parent is not None else None,
+        "chunk_index": chunk.chunk_index,
+        "rerank_score": 0.5,
+    }
+
+
+def _live(chunk: KnowledgeChunk, **changes: Any) -> dict[str, Any]:
+    return {
+        "id": str(chunk.id),
+        "content": chunk.content,
+        "heading_path": list(chunk.heading_path),
+        "enabled": chunk.enabled,
+        **changes,
+    }
+
+
+@pytest.mark.asyncio
+async def test_live_passages_are_each_result_text_as_it_is_now(
+    setup: _Setup, caplog: pytest.LogCaptureFixture
+) -> None:
+    guide = await _guide(setup)
+    entry = await setup.add(
+        results=(
+            _hit(guide.child, parent=guide.parent),
+            _hit(guide.lone),
+            # A document deleted since, and a result written without ids.
+            {"chunk_id": str(uuid4()), "document_id": str(uuid4()), "parent_chunk_id": None},
+            {"chunk_id": None, "document_id": None},
+        )
+    )
+    caplog.set_level(logging.DEBUG)
+    resp = await setup.client.get(f"{_LOGS}/{entry.id}/passages", headers=_VIEWER)
+    assert resp.status_code == 200, resp.text
+    assert resp.json() == {
+        "passages": [
+            {"passage": _live(guide.parent), "hit": _live(guide.child)},
+            {"passage": _live(guide.lone), "hit": None},
+            {"passage": None, "hit": None},
+            {"passage": None, "hit": None},
+        ]
+    }
+    # The text is read for the console only — never written to the app log.
+    assert guide.child.content not in caplog.text
+    assert guide.parent.content[:40] not in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_live_passages_follow_a_switch_made_since(setup: _Setup) -> None:
+    guide = await _guide(setup)
+    entry = await setup.add(results=(_hit(guide.child, parent=guide.parent),))
+    switched = await setup.client.patch(
+        f"/v1/knowledge/bases/kb/documents/{guide.document_id}/passages/{guide.parent.id}",
+        json={"enabled": False},
+        headers=_ADMIN,
+    )
+    assert switched.status_code == 200, switched.text
+    [live] = (await setup.client.get(f"{_LOGS}/{entry.id}/passages", headers=_VIEWER)).json()[
+        "passages"
+    ]
+    assert live["passage"] == _live(guide.parent, enabled=False)
+    assert live["hit"]["enabled"] is False
+
+
+@pytest.mark.asyncio
+async def test_live_passages_leave_out_chunks_the_record_did_not_search(setup: _Setup) -> None:
+    guide = await _guide(setup)
+    other_document = await _upload(setup, "other", "o.md", "# O\n\nAnother base's passage.")
+    other_chunks, _ = await setup.store.list_chunks(tenant_id=_TENANT, document_id=other_document)
+    other_chunk = other_chunks[0]
+    entry = await setup.add(
+        results=(
+            # The chunk is real, but the result names another document.
+            _hit(guide.child, parent=guide.parent, document_id=uuid4()),
+            # A chunk of a base this search did not cover.
+            _hit(other_chunk),
+        )
+    )
+    body = (await setup.client.get(f"{_LOGS}/{entry.id}/passages", headers=_VIEWER)).json()
+    assert body == {"passages": [{"passage": None, "hit": None}] * 2}
+
+    # A search that covered both bases reads both.
+    both = RetrievalLogEntry(
+        tenant_id=_TENANT,
+        kb_ids=(setup.kb_id, setup.other_kb_id),
+        source="agent",
+        query="q",
+        status="ok",
+        latency_ms=1,
+        results=(_hit(other_chunk),),
+    )
+    await setup.log.add(both)
+    body = (await setup.client.get(f"{_LOGS}/{both.id}/passages", headers=_VIEWER)).json()
+    assert body == {"passages": [{"passage": _live(other_chunk), "hit": None}]}
+
+
+@pytest.mark.asyncio
+async def test_live_passages_are_404_where_the_detail_is(setup: _Setup) -> None:
+    guide = await _guide(setup)
+    hits = (_hit(guide.lone),)
+    elsewhere = await setup.add(kb_id=setup.other_kb_id, results=hits)
+    foreign = RetrievalLogEntry(
+        tenant_id=uuid4(),
+        kb_ids=(setup.kb_id,),
+        source="agent",
+        query="q",
+        status="ok",
+        latency_ms=1,
+        results=hits,
+    )
+    await setup.log.add(foreign)
+    for log_id in (elsewhere.id, foreign.id, uuid4()):
+        resp = await setup.client.get(f"{_LOGS}/{log_id}/passages", headers=_VIEWER)
+        assert resp.status_code == 404, resp.text
+        assert guide.lone.content not in resp.text
+    entry = await setup.add(results=hits)
+    ghost = f"/v1/knowledge/bases/ghost/retrieval-logs/{entry.id}/passages"
+    assert (await setup.client.get(ghost, headers=_VIEWER)).status_code == 404
 
 
 @pytest.mark.asyncio

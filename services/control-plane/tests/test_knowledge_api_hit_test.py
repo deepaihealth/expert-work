@@ -7,13 +7,16 @@ gains ``elapsed_ms`` (the search, not its logging) and ``log_id``, the
 retriever reports it back. Every key the response had before is still there.
 A retriever that logs nothing, or a write that failed, reports ``log_id: null``
 rather than an id that names no row. A result's document comes from its
-document id — no chunk re-read.
+document id — no chunk re-read. The responses (and the retrieval-log reads of
+the row) carry every key the admin UI's shared fixtures name.
 """
 
 from __future__ import annotations
 
 import asyncio
+import json
 from collections.abc import AsyncIterator
+from pathlib import Path
 from typing import Any
 from uuid import UUID
 
@@ -42,6 +45,7 @@ from tests.auth_fixtures import (
 
 _TENANT = DEFAULT_DEV_TENANT_ID
 _EMPLOYEE = "employee-hit-test"
+_FIXTURES = Path(__file__).resolve().parents[3] / "apps/admin-ui/src/api/__fixtures__"
 #: Keys the hit-test response carried before this change (result / top level).
 _RESULT_KEYS_BEFORE = {
     "content",
@@ -242,3 +246,45 @@ async def test_documents_come_from_the_results_document_ids(
     assert body["results"][0]["document"] is not None
     # The retriever's own attribution read + the response's document read.
     assert calls == ["get_documents", "get_documents"]
+
+
+def _fixture(name: str) -> Any:
+    return json.loads((_FIXTURES / name).read_text(encoding="utf-8"))
+
+
+def _has_keys(actual: Any, expected: Any, where: str) -> None:
+    """``actual`` carries every key ``expected`` (a fixture object) has, down
+    through nested objects and the first item of each list."""
+    if isinstance(expected, dict):
+        assert isinstance(actual, dict), where
+        missing = set(expected) - set(actual)
+        assert not missing, f"{where}: missing {sorted(missing)}"
+        for key, value in expected.items():
+            if actual[key] is not None:
+                _has_keys(actual[key], value, f"{where}.{key}")
+    elif isinstance(expected, list) and expected and actual:
+        _has_keys(actual[0], expected[0], f"{where}[0]")
+
+
+@pytest.mark.asyncio
+async def test_responses_carry_every_key_the_console_reads(setup: _Setup) -> None:
+    """The admin UI's fixtures (``apps/admin-ui/src/api/__fixtures__``) name the
+    keys its retrieval-test tab and record views read: a renamed or dropped
+    key fails here, not silently in the browser. Read from a real search."""
+    tested = (
+        await setup.client.post("/v1/knowledge/bases/kb/test", json={"query": "deductible"})
+    ).json()
+    _has_keys(tested, _fixture("knowledge_retrieval_test.json"), "test")
+    assert tested["results"] and tested["results"][0]["document"] is not None
+
+    logs = _fixture("knowledge_retrieval_logs.json")
+    base = "/v1/knowledge/bases/kb/retrieval-logs"
+    page = (await setup.client.get(base)).json()
+    _has_keys(page, logs["page"], "page")
+    assert page["logs"]
+    detail = (await setup.client.get(f"{base}/{tested['log_id']}")).json()
+    _has_keys(detail, logs["detail"], "detail")
+    assert detail["results"] and detail["results"][0]["document"] is not None
+    passages = (await setup.client.get(f"{base}/{tested['log_id']}/passages")).json()
+    _has_keys(passages, logs["passages"], "passages")
+    assert passages["passages"][0]["passage"] is not None
