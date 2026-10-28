@@ -160,6 +160,18 @@ describe("parseTimeline", () => {
     expect(items[1].kind === "guard" && items[1].text).toContain("步数耗尽");
   });
 
+  it("renders a step-budget warning as near the limit, not as exhausted", () => {
+    // B-226 ② —— 步数进入最后一段时的一次性预警;不能显示成「步数耗尽 → 收尾轮」。
+    const items = parseTimeline([
+      ev("guard", { kind: "warning", guard: "max_steps", detail: { steps: 40, max: 48 } }, "t1"),
+    ]);
+    expect(items).toHaveLength(1);
+    expect(items[0]).toMatchObject({ kind: "guard", tone: "warn" });
+    const text = items[0].kind === "guard" ? items[0].text : "";
+    expect(text).toContain("40/48");
+    expect(text).not.toContain("耗尽");
+  });
+
   // ——— P3 PR-1 契约变更 ———
 
   it("renders a gap frame as a warn marker naming the missing range", () => {

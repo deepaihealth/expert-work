@@ -106,7 +106,17 @@ def evaluate(
     files: Mapping[FileKey, FetchedFile | None],
     fixtures_dir: Path,
 ) -> list[CheckVerdict]:
-    return [_one(check, record, files, fixtures_dir) for check in case.checks]
+    # B-226 t04 —— 带 ``unless_exit_reason`` 的判据, 按那个出口结束时记过并写明原因。
+    exit_reason = record.turns[-1].exit_reason if record.turns else None
+    verdicts: list[CheckVerdict] = []
+    for check in case.checks:
+        waived_for = getattr(check, "unless_exit_reason", None) or []
+        if exit_reason in waived_for:
+            detail = f"waived: exit_reason={exit_reason}"
+            verdicts.append(CheckVerdict(type=check.type, passed=True, detail=detail))
+        else:
+            verdicts.append(_one(check, record, files, fixtures_dir))
+    return verdicts
 
 
 def _verdict(check: Check, ok: bool, detail: str) -> CheckVerdict:
@@ -185,8 +195,8 @@ def _one(
             check, re.search(check.pattern, final) is not None, f"no match for {check.pattern!r}"
         )
     if isinstance(check, FinalTextNotRegex):
-        found = re.search(check.pattern, final)
-        return _verdict(check, found is None, f"matched {found.group(0) if found else ''!r}")
+        hit = re.search(check.pattern, final)
+        return _verdict(check, hit is None, f"matched {hit.group(0) if hit else ''!r}")
     if isinstance(check, ArtifactExists):
         names = [
             str(a["name"])

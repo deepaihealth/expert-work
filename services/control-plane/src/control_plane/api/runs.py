@@ -566,6 +566,10 @@ def build_run_graph_input(
         # B-160 —— 「没做成」的欠账也只属于一轮:省略时上一轮没还上的失败一直
         # 留在检查点里,这个对话此后每一轮都判 completed=false。
         "unresolved_failures": [],
+        # B-226 —— 原地打转的计数(④)与步数预警帧(②)同样只属于一轮:省略时上一轮
+        # 停在打转上留下的计数会让这一轮第一步就被判「卡住」。
+        "loop_trip_count": 0,
+        "step_budget_warned": False,
     }
 
 
@@ -622,6 +626,8 @@ def replay_graph_input(
         # 与 ``build_run_graph_input`` 同一条:审批三件套与欠账(B-160)每一轮清零。
         **APPROVAL_TURN_RESET,
         "unresolved_failures": [],
+        "loop_trip_count": 0,  # B-226,同上
+        "step_budget_warned": False,
     }
 
 

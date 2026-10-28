@@ -18,6 +18,7 @@ from orchestrator.tools import (
     ToolEnv,
     build_tool_registry,
 )
+from orchestrator.tools.artifact import ArtifactRecorder
 from orchestrator.tools.file_ops import FileOpError
 from orchestrator.tools.sandbox import RecordingSandboxRuntime, SandboxOutcome
 
@@ -475,3 +476,33 @@ async def test_save_artifact_rejects_another_agents_tree() -> None:
             {"name": "x", "path": "agents/someone-else-bbbbbbbb/x.md"},
             ctx=_ctx(agent_key="me-aaaaaaaa"),
         )
+
+
+def test_artifact_recorder_counts_distinct_names_newest_wins() -> None:
+    """B-226 ① —— 收尾指令要的「本 run 登记了几个产物」:同名重登记只算一个、后登记覆盖。"""
+    recorder = ArtifactRecorder()
+    assert recorder.count == 0 and recorder.snapshot() == []
+    first = {"name": "a.md", "version": 1}
+    recorder(first)
+    recorder({"name": "b.md", "version": 1})
+    recorder({"name": "a.md", "version": 2})
+    assert recorder.count == 2
+    assert recorder.snapshot() == [{"name": "a.md", "version": 2}, {"name": "b.md", "version": 1}]
+    assert first == {"name": "a.md", "version": 1}
+
+
+def test_scoped_recorder_counts_its_own_subtree() -> None:
+    """B-226 ① —— 子代拿到的是同一份清单的分视图:登记照样进本 run 的清单(end 帧完整);
+    「登记了几个」数的是自己和自己委派出去的子代登记的, 不数父的、也不数兄弟的。"""
+    parent = ArtifactRecorder()
+    parent({"name": "a.md"})
+    parent({"name": "b.md"})
+    child = parent.scoped()
+    sibling = parent.scoped()
+    assert child.count == 0
+    child({"name": "c.md"})
+    grandchild = child.scoped()
+    grandchild({"name": "d.md"})
+    sibling({"name": "e.md"})
+    assert (parent.count, child.count, grandchild.count, sibling.count) == (5, 2, 1, 1)
+    assert [e["name"] for e in parent.snapshot()] == ["a.md", "b.md", "c.md", "d.md", "e.md"]

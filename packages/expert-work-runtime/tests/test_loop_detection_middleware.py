@@ -11,6 +11,7 @@ from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, ToolMe
 
 from expert_work.runtime.middleware import (
     DEFAULT_REMINDER_TEXT,
+    LOOP_REMINDER_MARK,
     LoopDetectionMiddleware,
     Middleware,
     MiddlewareContext,
@@ -71,16 +72,58 @@ async def test_three_identical_tool_calls_trip_detection() -> None:
 
     assert ctx.payload["terminal_called"] == 1
     new_messages = ctx.payload["messages"]
-    assert len(new_messages) == 2
-    cleaned, reminder = new_messages
-    assert isinstance(cleaned, AIMessage)
-    assert cleaned.id == "ai-3"  # most-recent AIMessage rewritten
-    assert cleaned.tool_calls == []
+    # B-226 ④ — the cleared reply had no text, so it is dropped: an empty
+    # non-final assistant message is rejected by Anthropic. Only the reminder
+    # goes out; the response was never in state, so nothing needs replacing.
+    assert len(new_messages) == 1
+    [reminder] = new_messages
     assert isinstance(reminder, HumanMessage)
     assert "Loop detected" in reminder.content
     # Spec 2026-07-30 Important#2 — not a real user turn: must not render as a
     # chat bubble, forward to third parties, or break history order-pairing.
     assert reminder.additional_kwargs.get("expert_work_hide_from_ui") is True
+    # B-226 ④ — the graph router keys on this mark to hand the reminder back
+    # to the model in the same run instead of ending on the cleared reply.
+    assert reminder.additional_kwargs.get(LOOP_REMINDER_MARK) is True
+
+
+@pytest.mark.asyncio
+async def test_trip_keeps_the_text_the_model_wrote_alongside_the_call() -> None:
+    mw = LoopDetectionMiddleware()
+    tc = _tool_call("read_file", {"path": "/etc/passwd"})
+    third = AIMessage(content="Still pending, checking again.", tool_calls=[tc], id="ai-3")
+    history: list[BaseMessage] = [
+        _ai(tool_calls=[tc], message_id="ai-1"),
+        ToolMessage(content="denied", tool_call_id="tc-1"),
+        _ai(tool_calls=[tc], message_id="ai-2"),
+        ToolMessage(content="denied", tool_call_id="tc-1"),
+        third,
+    ]
+    ctx = _ctx(history)
+    await mw(ctx, _terminal)
+    cleaned, reminder = ctx.payload["messages"]
+    assert isinstance(cleaned, AIMessage) and cleaned.id == "ai-3"
+    assert cleaned.tool_calls == [] and cleaned.content == "Still pending, checking again."
+    assert reminder.additional_kwargs.get(LOOP_REMINDER_MARK) is True
+
+
+@pytest.mark.asyncio
+async def test_no_trip_unless_the_current_response_repeats_the_call() -> None:
+    """B-226 —— 只判本次回复:历史里已有三次相同调用、这次回复是正文(例如无工具的收尾轮)
+    时不能拦 —— 以前会把历史里那条旧消息改掉, 还把这次的回复整个吞掉。"""
+    mw = LoopDetectionMiddleware()
+    tc = _tool_call("probe", {"x": 1})
+    history: list[BaseMessage] = [HumanMessage(content="go")]
+    for i in range(3):
+        history += [
+            _ai(tool_calls=[tc], message_id=f"ai-{i}"),
+            ToolMessage(content="ok", tool_call_id="tc-1"),
+        ]
+    history.append(AIMessage(content="wrap-up reply", id="ai-final"))
+    ctx = _ctx(history)
+    await mw(ctx, _terminal)
+    assert ctx.payload["messages"] == history
+    assert "loop_detected" not in ctx.payload
 
 
 @pytest.mark.asyncio
@@ -99,9 +142,8 @@ async def test_window_skips_non_ai_messages_between_calls() -> None:
     ]
     ctx = _ctx(history)
     await mw(ctx, _terminal)
-    assert isinstance(ctx.payload["messages"][0], AIMessage)
-    assert ctx.payload["messages"][0].id == "ai-3"
-    assert ctx.payload["messages"][0].tool_calls == []
+    assert ctx.payload.get("loop_detected") is True
+    assert [type(m) for m in ctx.payload["messages"]] == [HumanMessage]
 
 
 # ---------------------------------------------------------------------------
@@ -249,8 +291,8 @@ async def test_args_normalize_trip_via_middleware() -> None:
     ]
     ctx = _ctx(history)
     await mw(ctx, _terminal)
-    assert len(ctx.payload["messages"]) == 2
-    assert ctx.payload["messages"][0].tool_calls == []
+    assert ctx.payload.get("loop_detected") is True
+    assert [type(m) for m in ctx.payload["messages"]] == [HumanMessage]
 
 
 # ---------------------------------------------------------------------------
@@ -292,8 +334,8 @@ async def test_custom_window_size_two_trips_earlier() -> None:
     ]
     ctx = _ctx(history)
     await mw(ctx, _terminal)
-    assert len(ctx.payload["messages"]) == 2
-    assert ctx.payload["messages"][0].tool_calls == []
+    assert ctx.payload.get("loop_detected") is True
+    assert [type(m) for m in ctx.payload["messages"]] == [HumanMessage]
 
 
 @pytest.mark.asyncio
@@ -304,7 +346,7 @@ async def test_custom_reminder_text_used() -> None:
     history: list[BaseMessage] = [_ai(tool_calls=[tc], message_id=f"ai-{i}") for i in range(3)]
     ctx = _ctx(history)
     await mw(ctx, _terminal)
-    assert ctx.payload["messages"][1].content == custom
+    assert ctx.payload["messages"][-1].content == custom
 
 
 def test_default_reminder_mentions_loop() -> None:

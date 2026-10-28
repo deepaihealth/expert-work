@@ -183,7 +183,9 @@ export function parseTimeline(events: readonly SseEvent[]): TimelineItem[] {
                 spent: int(detail.spent), limit: int(detail.limit),
               })
           : g === "max_steps"
-            ? i18n.t("console_runtime.guard_max_steps", { steps: int(detail.steps), max: int(detail.max) })
+            ? i18n.t(warn ? "console_runtime.guard_max_steps_warn" : "console_runtime.guard_max_steps", {
+                steps: int(detail.steps), max: int(detail.max),
+              })
             : i18n.t("console_runtime.guard_no_progress", { streak: int(detail.streak), max: int(detail.max) });
       push({ kind: "guard", receivedAt: at, tone: warn ? "warn" : "bad", text });
       continue;
