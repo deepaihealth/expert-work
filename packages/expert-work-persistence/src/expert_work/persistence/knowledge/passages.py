@@ -97,13 +97,18 @@ SWITCH_OFF_REVISION = 0
 @dataclass(frozen=True)
 class SwitchOffRecord:
     """A switch-off record as an ingest writes it (``replace_chunks``):
-    whose switch-off (the gone passage's id), the text it hides, and whether
-    a passage of the new chunks holds any of it (``placed``)."""
+    whose switch-off (the gone passage's id), the text it hides, whether a
+    passage of the new chunks holds any of it (``placed``), and whether this
+    ingest made it (``new``: a switched-off passage it could not find). Only
+    a new one is inserted; an earlier one (read at the ingest's start) is only
+    updated if it still exists — one discarded, or deleted by the retention
+    job, while the ingest ran stays gone."""
 
     passage_id: UUID
     content: str
     heading_path: tuple[str, ...]
     placed: bool
+    new: bool = False
 
 
 @dataclass(frozen=True)

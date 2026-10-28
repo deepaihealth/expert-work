@@ -883,10 +883,12 @@ class KnowledgeStore(abc.ABC):
         back; see :meth:`list_unapplied_revisions`). ``switch_offs``: the
         switch-off records the ingest derived its inherited switch-offs from
         (new ones for switched-off passages it left out, and the document's
-        earlier ones), each written as a record (``switch_off_lost``) with
-        ``orphaned_at`` cleared when ``placed``, else set (kept if it already
-        was) — in the same transaction. Records it does not name are left as
-        they are; text histories never get records' flags or vice versa."""
+        earlier ones), with ``orphaned_at`` cleared when ``placed``, else set
+        (kept if it already was) — in the same transaction. Only a ``new``
+        record is inserted; an earlier one is only updated where it still
+        exists, so one discarded (or deleted by the retention job) while the
+        ingest ran stays gone. Records it does not name are left as they are;
+        text histories never get records' flags or vice versa."""
 
     @abc.abstractmethod
     async def list_chunks(

@@ -15,7 +15,7 @@ from __future__ import annotations
 
 from collections.abc import AsyncIterator, Iterator
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 from uuid import UUID, uuid4
@@ -1250,8 +1250,8 @@ async def test_switch_off_records_are_kept_apart_from_text_history(
     kept = await store.get_passage(**scope, passage_id=p.second.id)
     assert kept is not None
     chunks = _without_vectors(kept)
-    placed = SwitchOffRecord(p.first.id, "苹果 适合\n\n老年 人群", (), placed=True)
-    unplaced = SwitchOffRecord(p.lone.id, "樱桃 果酱", (), placed=False)
+    placed = SwitchOffRecord(p.first.id, "苹果 适合\n\n老年 人群", (), placed=True, new=True)
+    unplaced = SwitchOffRecord(p.lone.id, "樱桃 果酱", (), placed=False, new=True)
 
     assert await store.replace_chunks(**scope, chunks=chunks, switch_offs=[placed, unplaced])
 
@@ -1273,12 +1273,38 @@ async def test_switch_off_records_are_kept_apart_from_text_history(
     assert await store.list_passage_revisions(**scope, passage_id=p.lone.id) == []
 
     since = records[p.lone.id].orphaned_at
-    assert await store.replace_chunks(**scope, chunks=chunks, switch_offs=[placed, unplaced])
+    earlier = [replace(record, new=False) for record in (placed, unplaced)]
+    assert await store.replace_chunks(**scope, chunks=chunks, switch_offs=earlier)
     assert await store.replace_chunks(**scope, chunks=chunks)
     again = {r.passage_id: r for r in await store.list_switch_offs(**scope)}
     assert (again[p.lone.id].orphaned_at, again[p.first.id].orphaned_at) == (since, None)
 
     assert await store.discard_unapplied_revisions(**scope) == 3  # the edit's 2 + the record
+    assert [r.passage_id for r in await store.list_switch_offs(**scope)] == [p.first.id]
+
+
+async def test_a_record_discarded_during_an_ingest_stays_discarded(
+    store: KnowledgeStore,
+) -> None:
+    """An ingest writes back the switch-off records it read at its start. One
+    discarded meanwhile (or deleted by the retention job) does not come back:
+    earlier records are only updated where they still exist; only the ones
+    this ingest made (``new``) are inserted."""
+    p = await _passages(store)
+    scope: dict[str, Any] = {"tenant_id": p.doc.tenant, "document_id": p.doc.id}
+    kept = await store.get_passage(**scope, passage_id=p.second.id)
+    assert kept is not None
+    chunks = _without_vectors(kept)
+    first = SwitchOffRecord(p.lone.id, "樱桃 果酱", (), placed=False, new=True)
+    assert await store.replace_chunks(**scope, chunks=chunks, switch_offs=[first])
+
+    (read,) = await store.list_switch_offs(**scope)  # an ingest reads it ...
+    assert await store.discard_unapplied_revisions(**scope) == 1  # ... it is discarded ...
+    made = SwitchOffRecord(p.first.id, "苹果 适合", (), placed=False, new=True)
+    again = replace(first, new=False)  # ... and the ingest writes back what it read
+    assert await store.replace_chunks(**scope, chunks=chunks, switch_offs=[again, made])
+
+    assert read.passage_id == p.lone.id
     assert [r.passage_id for r in await store.list_switch_offs(**scope)] == [p.first.id]
 
 
@@ -1308,8 +1334,8 @@ async def test_reviewing_an_inherited_switch_off_settles_its_records(
         **scope,
         chunks=rows,
         switch_offs=[
-            SwitchOffRecord(wide, "苹果 适合\n\n老年 人群\n\n香蕉 甜点", (), placed=True),
-            SwitchOffRecord(narrow, "老年 人群", (), placed=True),
+            SwitchOffRecord(wide, "苹果 适合\n\n老年 人群\n\n香蕉 甜点", (), placed=True, new=True),
+            SwitchOffRecord(narrow, "老年 人群", (), placed=True, new=True),
         ],
     )
     await _ready(store, doc, chunks=4)

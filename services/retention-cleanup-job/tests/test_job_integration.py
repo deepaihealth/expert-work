@@ -34,9 +34,11 @@ from testcontainers.postgres import PostgresContainer
 from expert_work.persistence import (
     DatabaseConfig,
     SqlAuditLogStore,
+    SqlKnowledgeStore,
     create_async_engine_from_config,
     create_async_session_factory,
 )
+from expert_work.persistence.knowledge.base import SwitchOffRecord
 from expert_work.protocol import (
     AuditAction,
     AuditEntry,
@@ -955,5 +957,59 @@ async def test_orphaned_knowledge_revisions_go_after_30_days(
             )
         assert remaining == ["alive", "recent orphan"]
         assert report.knowledge_revisions_deleted >= 1
+    finally:
+        await worker_engine.dispose()
+
+
+async def test_an_expired_switch_off_record_is_not_written_back(
+    db_fixture: tuple[AsyncEngine, AsyncEngine, str],
+) -> None:
+    """B-175 P3-PR2 — a switch-off record (revision 0) no passage has held for
+    30 days is deleted by the job. An ingest that read it at its start and
+    writes its records back afterwards only updates the ones still there:
+    the record is not inserted again, so its 30 days do not start over."""
+    _app_engine, worker_engine, sync_admin = db_fixture
+    try:
+        tenant, kb, document, passage = uuid4(), uuid4(), uuid4(), uuid4()
+        admin = create_engine(sync_admin, isolation_level="AUTOCOMMIT")
+        try:
+            with admin.connect() as conn:
+                conn.execute(
+                    text("INSERT INTO knowledge_base (id, tenant_id, name) VALUES (:k, :t, 'kb')"),
+                    {"k": str(kb), "t": str(tenant)},
+                )
+                conn.execute(
+                    text(
+                        "INSERT INTO knowledge_document (id, tenant_id, kb_id, filename, status) "
+                        "VALUES (:d, :t, :k, 'a.md', 'ready')"
+                    ),
+                    {"d": str(document), "t": str(tenant), "k": str(kb)},
+                )
+                conn.execute(
+                    text(
+                        "INSERT INTO knowledge_chunk_revision (tenant_id, kb_id, document_id, "
+                        " chunk_id, revision, content, switch_off_lost, orphaned_at) "
+                        "VALUES (:t, :k, :d, :p, 0, 'hidden text', true, "
+                        " now() - make_interval(days => 40))"
+                    ),
+                    {"t": str(tenant), "k": str(kb), "d": str(document), "p": str(passage)},
+                )
+        finally:
+            admin.dispose()
+        factory = create_async_session_factory(worker_engine)
+        store = SqlKnowledgeStore(factory)
+        (read,) = await store.list_switch_offs(tenant_id=tenant, document_id=document)
+
+        job = RetentionCleanupJob(
+            db_session_factory=factory, batch_size=10000, knowledge_revision_orphan_days=30
+        )
+        await job.run_once()
+        assert await store.list_switch_offs(tenant_id=tenant, document_id=document) == []
+
+        written_back = SwitchOffRecord(read.passage_id, read.content, (), placed=False)
+        assert await store.replace_chunks(
+            tenant_id=tenant, document_id=document, chunks=[], switch_offs=[written_back]
+        )
+        assert await store.list_switch_offs(tenant_id=tenant, document_id=document) == []
     finally:
         await worker_engine.dispose()

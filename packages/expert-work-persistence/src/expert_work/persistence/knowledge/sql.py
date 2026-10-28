@@ -942,18 +942,33 @@ async def _read_history(
 async def _write_switch_offs(
     session: AsyncSession, tenant_id: UUID, document_id: UUID, records: Collection[SwitchOffRecord]
 ) -> None:
-    """``replace_chunks(switch_offs=…)``: each record upserted as revision
-    :data:`SWITCH_OFF_REVISION` of its passage, ``orphaned_at`` cleared when
-    placed, else set once."""
-    kb_id = (
-        await session.execute(
-            select(KnowledgeDocumentRow.kb_id).where(
-                KnowledgeDocumentRow.tenant_id == tenant_id, KnowledgeDocumentRow.id == document_id
-            )
-        )
-    ).scalar_one()
+    """``replace_chunks(switch_offs=…)``: a record this ingest made is inserted
+    as revision :data:`SWITCH_OFF_REVISION` of its passage; an earlier one is
+    only updated, if it still exists (one discarded or expired meanwhile stays
+    gone). ``orphaned_at`` cleared when placed, else set once."""
+    kb_id: UUID | None = None
     for record in records:
-        orphaned = None if record.placed else func.now()
+        orphaned = (
+            None
+            if record.placed
+            else func.coalesce(KnowledgeChunkRevisionRow.orphaned_at, func.now())
+        )
+        if not record.new:
+            await session.execute(
+                update(KnowledgeChunkRevisionRow)
+                .where(*_record_where(tenant_id, document_id, record.passage_id))
+                .values(orphaned_at=orphaned)
+            )
+            continue
+        if kb_id is None:
+            kb_id = (
+                await session.execute(
+                    select(KnowledgeDocumentRow.kb_id).where(
+                        KnowledgeDocumentRow.tenant_id == tenant_id,
+                        KnowledgeDocumentRow.id == document_id,
+                    )
+                )
+            ).scalar_one()
         insert = pg_insert(KnowledgeChunkRevisionRow).values(
             tenant_id=tenant_id,
             kb_id=kb_id,
@@ -964,20 +979,26 @@ async def _write_switch_offs(
             heading_path=list(record.heading_path) or None,
             edited_by=None,
             switch_off_lost=True,
-            orphaned_at=orphaned,
+            orphaned_at=None if record.placed else func.now(),
         )
         await session.execute(
             insert.on_conflict_do_update(
-                constraint="knowledge_chunk_revision_uniq",
-                set_={
-                    "content": insert.excluded.content,
-                    "heading_path": insert.excluded.heading_path,
-                    "orphaned_at": None
-                    if record.placed
-                    else func.coalesce(KnowledgeChunkRevisionRow.orphaned_at, func.now()),
-                },
+                constraint="knowledge_chunk_revision_uniq", set_={"orphaned_at": orphaned}
             )
         )
+
+
+def _record_where(
+    tenant_id: UUID, document_id: UUID, passage_id: UUID
+) -> tuple[ColumnElement[bool], ...]:
+    """One passage's switch-off record."""
+    return (
+        KnowledgeChunkRevisionRow.tenant_id == tenant_id,
+        KnowledgeChunkRevisionRow.document_id == document_id,
+        KnowledgeChunkRevisionRow.chunk_id == passage_id,
+        KnowledgeChunkRevisionRow.revision == SWITCH_OFF_REVISION,
+        KnowledgeChunkRevisionRow.switch_off_lost.is_(True),
+    )
 
 
 async def _settle_switch_offs(
@@ -989,12 +1010,7 @@ async def _settle_switch_offs(
         settled = settle_switch_off(record.content, passage.row.content)
         if settled == record.content:
             continue
-        mine = (
-            KnowledgeChunkRevisionRow.tenant_id == tenant_id,
-            KnowledgeChunkRevisionRow.document_id == document_id,
-            KnowledgeChunkRevisionRow.chunk_id == record.passage_id,
-            KnowledgeChunkRevisionRow.revision == SWITCH_OFF_REVISION,
-        )
+        mine = _record_where(tenant_id, document_id, record.passage_id)
         if settled:
             await session.execute(
                 update(KnowledgeChunkRevisionRow).where(*mine).values(content=settled)

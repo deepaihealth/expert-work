@@ -425,6 +425,37 @@ async def test_a_lost_switch_off_with_no_text_left_is_listed_for_review(
     assert await doc.store.list_switch_offs(**doc.scope) == []
 
 
+async def test_a_record_discarded_while_an_ingest_runs_stays_gone(
+    store: KnowledgeStore,
+) -> None:
+    """A lost switch-off is listed; right after the next ingest has read the
+    document's records, the reviewer discards it. The ingest writes back only
+    what still exists: the record stays gone and its 30 days do not start
+    over."""
+    doc = await _doc(store)
+    three = await doc.passage("Three")
+    await doc.switch(three, enabled=False)
+    reworded = _paragraph("three", 35).replace("three0 ", "THREE0 ")
+    await doc.ingest(_markdown(three=reworded))
+    assert [r.passage_id for r in await doc.store.list_switch_offs(**doc.scope)] == [three.id]
+    read = doc.store.list_switch_offs
+    seen: list[PassageRevision] = []
+
+    async def list_then_discard(**kwargs: Any) -> list[PassageRevision]:
+        records = await read(**kwargs)
+        if not seen:
+            seen.extend(records)
+            assert await doc.store.discard_unapplied_revisions(**doc.scope) == 1
+        return records
+
+    doc.store.list_switch_offs = list_then_discard  # type: ignore[method-assign]
+    await doc.ingest(_markdown(three=reworded))
+
+    assert [r.passage_id for r in seen] == [three.id]  # the ingest had read it
+    assert await read(**doc.scope) == []
+    assert await doc.store.list_unapplied_revisions(**doc.scope) == []
+
+
 def _long_section(paragraphs: list[str], extra: int) -> str:
     """One section of ``paragraphs`` with ``extra`` new ones at the top."""
     top = [_paragraph(f"ins{j}w", 45) for j in range(extra)]
@@ -913,7 +944,7 @@ def test_replay_counts_what_it_did() -> None:
     assert plan.unapplied == (lost_edit.row.id,)
     # Recorded, and its text went to ``c``.
     assert plan.switch_offs == (
-        SwitchOffRecord(lost_off.row.id, lost_off.row.content, ("H",), placed=True),
+        SwitchOffRecord(lost_off.row.id, lost_off.row.content, ("H",), placed=True, new=True),
     )
     assert plan.chunk_count == 1 + 2 + 1 + 1
 
@@ -1005,7 +1036,9 @@ def test_a_lost_switch_off_that_matches_nothing_is_recorded() -> None:
     plan = _replay([reworded, _parent(kept_off.row.content)], [lost, kept_off])
 
     assert plan.overrides[0] is None
-    assert plan.switch_offs == (SwitchOffRecord(lost.row.id, old, ("Dose",), placed=False),)
+    assert plan.switch_offs == (
+        SwitchOffRecord(lost.row.id, old, ("Dose",), placed=False, new=True),
+    )
     assert plan.switch_offs_unplaced == 1
 
 
@@ -1033,7 +1066,8 @@ def test_records_not_inherited_switch_offs_are_the_sources() -> None:
         None,
         inherited,
     ]
-    assert [(r.content, r.placed) for r in plan.switch_offs] == [(hidden, True)]
+    # The document's record: written back as an earlier one (only if it still exists).
+    assert [(r.content, r.placed, r.new) for r in plan.switch_offs] == [(hidden, True, False)]
     assert (plan.disabled_applied, plan.disabled_inherited) == (0, 1)
 
 

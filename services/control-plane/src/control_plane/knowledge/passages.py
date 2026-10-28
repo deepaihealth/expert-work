@@ -120,8 +120,9 @@ class _Replay:
         self.claimed: set[int] = set()
         self.edits = self.disabled = 0
         self.unapplied: list[UUID] = []
-        #: Switch-off records: (whose, text, breadcrumb) — the document's and new.
-        self.sources: list[tuple[UUID, str, tuple[str, ...]]] = []
+        #: Switch-off records — the document's, and ``new`` ones for misses
+        #: (``placed`` is worked out by :meth:`inherit`).
+        self.sources: list[SwitchOffRecord] = []
         self._max_tokens = max_tokens
         self._overlap_tokens = overlap_tokens
         self._doc_title = doc_title
@@ -188,27 +189,29 @@ class _Replay:
         if row.edited:
             self.unapplied.append(row.id)
         if _switched_off(passage) and passage.anchor is not None:
-            self.sources.append((row.id, passage.anchor, passage.anchor_heading))
+            self.sources.append(
+                SwitchOffRecord(
+                    row.id, passage.anchor, passage.anchor_heading, placed=False, new=True
+                )
+            )
 
     def inherit(self) -> tuple[int, list[SwitchOffRecord]]:
         """Switch off every new parent holding any distinctive paragraph of a
         switch-off record; returns how many were switched off, and each
         record with whether a new parent holds its text."""
-        counts = Counter(p for parent in self.parents for p in paragraphs(parent.body))
+        split = [paragraphs(parent.body) for parent in self.parents]  # once per replay
+        counts = Counter(p for ps in split for p in ps)
+        owned = [set(ps) for ps in split]
         inherited = 0
         records: list[SwitchOffRecord] = []
-        for passage_id, text, heading in self.sources:
+        for source in self.sources:
             distinctive = {
                 p
-                for p in paragraphs(text)
+                for p in paragraphs(source.content)
                 if len(p) >= _SHARED_PARAGRAPH_MIN_CHARS and counts[p] == 1
             }
-            holders = [
-                index
-                for index, parent in enumerate(self.parents)
-                if distinctive & set(paragraphs(parent.body))
-            ]
-            records.append(SwitchOffRecord(passage_id, text, heading, placed=bool(holders)))
+            holders = [index for index, own in enumerate(owned) if distinctive & own]
+            records.append(replace(source, placed=bool(holders)))
             for index in holders:
                 current = self.overrides[index]
                 if current is not None and not current.enabled:
@@ -233,7 +236,9 @@ def replay_manual_changes(
     replay = _Replay(
         parents, max_tokens=max_tokens, overlap_tokens=overlap_tokens, doc_title=doc_title
     )
-    replay.sources = [(r.passage_id, r.content, r.heading_path) for r in switch_offs]
+    replay.sources = [
+        SwitchOffRecord(r.passage_id, r.content, r.heading_path, placed=False) for r in switch_offs
+    ]
     from_file = [passage for passage in manual if not passage.added]
     by_text: list[ManualPassage] = []
     for passage in from_file:

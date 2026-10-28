@@ -1338,23 +1338,32 @@ class InMemoryKnowledgeStore(KnowledgeStore):
     def _write_switch_offs(
         self, tenant_id: UUID, document_id: UUID, records: Collection[SwitchOffRecord]
     ) -> None:
-        """``replace_chunks(switch_offs=…)``: each record upserted, its
-        ``orphaned_at`` cleared when placed, else set once."""
+        """``replace_chunks(switch_offs=…)``: a record this ingest made is
+        inserted; an earlier one only updated, if it still exists (one
+        discarded or expired meanwhile stays gone). ``orphaned_at`` cleared
+        when placed, else set once."""
         now = datetime.now(UTC)
         known = {r.passage_id: r for r in self._records(tenant_id, document_id)}
         written: dict[UUID, PassageRevision] = {}
         for record in records:
             previous = known.get(record.passage_id)
+            if previous is None and not record.new:
+                continue
             since = previous.orphaned_at if previous is not None else None
-            written[record.passage_id] = PassageRevision(
-                passage_id=record.passage_id,
-                revision=SWITCH_OFF_REVISION,
-                content=record.content,
-                heading_path=record.heading_path,
-                edited_by=None,
-                created_at=previous.created_at if previous is not None else now,
-                orphaned_at=None if record.placed else (since or now),
-                switch_off_lost=True,
+            orphaned_at = None if record.placed else (since or now)
+            written[record.passage_id] = (
+                replace(previous, orphaned_at=orphaned_at)
+                if previous is not None
+                else PassageRevision(
+                    passage_id=record.passage_id,
+                    revision=SWITCH_OFF_REVISION,
+                    content=record.content,
+                    heading_path=record.heading_path,
+                    edited_by=None,
+                    created_at=now,
+                    orphaned_at=orphaned_at,
+                    switch_off_lost=True,
+                )
             )
         self._switch_offs = [
             entry
