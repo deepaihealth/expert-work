@@ -92,6 +92,25 @@ describe("parseWorkerFrames", () => {
     expect(w.taskExcerpt).toBe("");
   });
 
+  it("B-226 ⑥ — an approval_blocked worker does not read as success", () => {
+    const map = parseWorkerFrames([
+      wf("end", { wseq: 0 }, { outcome: "approval_blocked", iteration_used: 1, llm_call_count: 1, wall_clock_ms: 1 }),
+    ]);
+    const [w] = map.get("call-1") ?? [];
+    expect(w.status).toBe("approval_blocked");
+  });
+
+  it("B-226 ⑥ — an outcome it does not know stays raw (never success); a missing one stays running", () => {
+    const unknown = parseWorkerFrames([
+      wf("end", { wseq: 0 }, { outcome: "a_future_outcome", iteration_used: 1, llm_call_count: 1, wall_clock_ms: 1 }),
+    ]);
+    expect((unknown.get("call-1") ?? [])[0].status).toBe("a_future_outcome");
+    const missing = parseWorkerFrames([
+      wf("end", { wseq: 0 }, { iteration_used: 1, llm_call_count: 1, wall_clock_ms: 1 }),
+    ]);
+    expect((missing.get("call-1") ?? [])[0].status).toBe("running");
+  });
+
   it("drops frames without parent_tool_call_id at depth-1 and malformed data without throwing", () => {
     const map = parseWorkerFrames([
       wf("start", { parent_tool_call_id: null, wseq: 0 }, { task_excerpt: "orphan", role: null, max_steps: 1 }),

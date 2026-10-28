@@ -919,6 +919,9 @@ def format_sandbox_outcome(outcome: SandboxOutcome, output_char_cap: int) -> Too
     When either stream was cut, ``full_content`` carries the complete
     rendering so the tools node can externalize it to the workspace
     (Stream CM-5 recoverable compression).
+
+    B-226 ③ — a non-zero exit or a timeout sets ``failed`` (ledger-only: the
+    rendering already ends with the exit code); exit 1 with an empty stderr is neutral.
     """
     stdout, cut_out = _truncate(outcome.stdout, output_char_cap)
     stderr, cut_err = _truncate(outcome.stderr, output_char_cap)
@@ -943,6 +946,7 @@ def format_sandbox_outcome(outcome: SandboxOutcome, output_char_cap: int) -> Too
         return "\n\n".join(parts)
 
     truncated = cut_out or cut_err
+    failed, neutral = _sandbox_verdict(outcome)
     return ToolResult(
         content=_render(stdout, stderr),
         meta={
@@ -957,7 +961,25 @@ def format_sandbox_outcome(outcome: SandboxOutcome, output_char_cap: int) -> Too
             "stderr": stderr,
         },
         full_content=_render(outcome.stdout, outcome.stderr) if truncated else None,
+        failed=failed,
+        failure_transient=neutral,
     )
+
+
+def _sandbox_verdict(outcome: SandboxOutcome) -> tuple[bool, bool]:
+    """B-226 ③ — ``(failed, neutral)`` for this execution, by exit code and timeout alone.
+
+    Exit 1 with nothing on stderr and no timeout is neutral — neither records nor
+    clears: usually a predicate that answered "no" (``grep -q`` / ``test`` print nothing,
+    ``grep -c`` prints ``0``, ``diff`` prints the difference), but ``python x.py 2>&1``
+    crashing looks the same, so it must not settle an earlier failure either. A
+    traceback or anything else on stderr counts. Errs toward under-reporting (B-84).
+    """
+    if outcome.timed_out:
+        return True, False
+    if outcome.exit_code == 0:
+        return False, False
+    return True, outcome.exit_code == 1 and not outcome.stderr
 
 
 async def _release_quietly(client: SandboxRuntime, sandbox_id: UUID, *, tool_label: str) -> None:

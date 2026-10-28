@@ -8,7 +8,7 @@ Related: [STREAM-E-DESIGN](../streams/STREAM-E-DESIGN.md) § 1.1 E.6 (ReAct loop
 Two of the findings below were built (the rest stays deferred):
 
 - **Long-task Gap #1 — platform-default wall-clock floor.** `settings.default_run_deadline_s` (default **3600s / 1h**, `le=86400`) is threaded through the lifespan → `make_agent_builder` → `build_agent`, where `_effective_run_deadline_s(manifest, default)` applies it **only when the manifest leaves `policies.run_deadline_s` at 0** (manifest always wins). The four deadline-setter sites are unchanged — `built.run_deadline_s` already carries the floor. So an unconfigured run now has a wall-clock ceiling; a genuinely long agent raises `run_deadline_s` explicitly.
-- **No-progress stop (方案 ②).** `policies.max_no_progress` (default **0 = off**) + a new `AgentState.no_progress_streak`: `agent_node` increments the streak on each loop-detection trip and resets it on a clean turn; once it reaches `max_no_progress` the run routes into the **existing** tool-less graceful wrap-up (same gate `max_steps` uses). The first trip still arms one higher-effort turn (`escalate_next`); this caps consecutive unproductive turns before stopping.
+- **No-progress stop (方案 ②).** `policies.max_no_progress` (default **0 = off**) + a new `AgentState.no_progress_streak`: `agent_node` increments the streak on each loop-detection trip and resets it on a clean turn; once it reaches `max_no_progress` the run routes into the **existing** tool-less graceful wrap-up (same gate `max_steps` uses). The first trip still arms one higher-effort turn (`escalate_next`); this caps consecutive unproductive turns before stopping. **B-226 (2026-10-28):** the streak is replaced by `AgentState.loop_trip_count`, counted per run (a clean turn no longer resets it — the loop reminder now goes back to the model in the same run, so a consecutive streak let "loop → other call → loop" grind to `max_steps`). N = the run stops at its Nth trip; 0 no longer means off but applies the platform rule (the 2nd trip); a large value effectively disables the check.
 
 **Still deferred:** token/$ per-run budget (方案 C, cost-motivated); Gap #2 (dedicated Reporter synthesis role); the deadline→graceful-wrap-up rewiring (deadline still enforced at delegation boundaries + cancellation, not the wrap-up gate).
 
@@ -42,7 +42,7 @@ Token/$ budget (方案 C) is the pickup point for the cost era; the wall-clock f
 
 Axis A (productivity):
 - **Step cap** — `DEFAULT_MAX_STEPS = 20` (`state.py:43`), overridable per manifest via `workflow.max_iterations` (`agent_factory.py:994`); clamped for sub-workers.
-- **Graceful wrap-up (not hard kill)** — `budget_exhausted` → force `tools=[]` + wrap-up instruction, preserving produced work (`builder.py:513, 770-774`). Cites Hermes #7915.
+- **Graceful wrap-up (not hard kill)** — `budget_exhausted` → force `tools=[]` + wrap-up instruction, preserving produced work (`builder.py:513, 770-774`). Same as Hermes `_handle_max_iterations` (commit 934318ba3a). (Earlier revisions cited Hermes #7915 here; that issue is about pressure warnings causing premature abandonment, not the wrap-up.)
 - **Effort escalation @ 75% budget** — `step_count*4 >= max_steps*3` → higher-effort model to converge (`builder.py:730, 763`).
 - **Iteration refund** — overhead/tool steps can refund their iteration so they don't eat the budget (`state.py:114-121`).
 - **Loop detection** — `LoopDetectionMiddleware` (window=3, SHA256 tool-call fingerprint): identical calls ×3 → `loop_detected` → `escalate_next` (`middleware/loop_detection.py`, `state.py:192-194`). Currently escalates effort; never stops.
@@ -67,7 +67,7 @@ Cost accounting (present, feeds the deferred budget):
 |---------|-----------|--------------|-------------|
 | Loop bound | `AGENT_RECURSION_LIMIT` 30 / `recursion_limit`, `max_plan_iterations`, `max_step_num` | double gate: `max_iterations` + shared `iteration_budget` (90) | `max_steps` (20) + spawn/worker caps |
 | Loop detection | warn @3 identical → hard-stop @5 (issue #1055) | warn on repeated/idempotent no-progress | `LoopDetectionMiddleware` window=3, warn→hard-stop — **same design as deer-flow #1055** |
-| Budget-exhausted | strip tool_calls, wrap up | `_handle_max_iterations`: 1 toolless grace call (#7915) | `tools=[]` + wrap-up — **= Hermes #7915, but hard (leads Hermes #36239 "should be hard stop")** |
+| Budget-exhausted | strip tool_calls, wrap up | `_handle_max_iterations`: 1 toolless grace call (commit 934318ba3a) | `tools=[]` + wrap-up — **= Hermes `_handle_max_iterations`, but hard (leads Hermes #36239 "should be hard stop")** |
 | Pressure warning | — | open feature #414 | ✅ effort escalation @75% — **leads Hermes #414** |
 | Exhaustion safety | — | once silently killed process (#8049) | ✅ graceful wrap-up preserves work |
 | Renewal authority | **human**: plan-approval + tool-approval interrupts (`auto_accepted_plan` bypass) | open "Loop Contract" #21172 (budget/stop/refresh/scope) | approval gates exist; no plan-as-renewal |

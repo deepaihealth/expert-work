@@ -90,14 +90,14 @@ async def test_budget_signal_switches_to_escalated_caller() -> None:
 
 
 @pytest.mark.asyncio
-async def test_loop_trip_arms_escalation_for_the_next_run() -> None:
+async def test_loop_trip_escalates_the_next_step_of_the_same_run() -> None:
     tool = _EchoTool()
     registry = ToolRegistry()
     registry.register(tool)
     # Three identical tool calls trip the loop middleware on the 3rd
-    # response — it clears the tool_calls, so the run ends with the
-    # reminder and ``escalate_next`` armed in the checkpoint. The NEXT
-    # run's first agent step serves from the escalated caller.
+    # response — it clears the tool_calls and appends the reminder with
+    # ``escalate_next`` armed. B-226 ④: the reminder goes back to the model
+    # in the SAME run, and that step serves from the escalated caller.
     base = _CountingLLM(
         responses=[
             AIMessage(content="", tool_calls=[_tc("a")]),
@@ -114,25 +114,17 @@ async def test_loop_trip_arms_escalation_for_the_next_run() -> None:
             "after_llm_call", [LoopDetectionMiddleware()]
         ),
     )
-    async with make_checkpointer("memory") as cp:
-        compiled = GraphRunner(checkpointer=cp).compile(graph)
-        cfg: RunnableConfig = {"configurable": {"thread_id": "esc-loop"}}
-        first = await compiled.ainvoke(
-            {"messages": [HumanMessage(content="go")], "step_count": 0, "max_steps": 20},
-            config=cfg,
-        )
-        # Loop tripped: run ended on the reminder with the signal armed.
-        assert first.get("escalate_next") is True
-        assert escalated.calls == 0
-
-        second = await compiled.ainvoke(
-            {"messages": [HumanMessage(content="try again")], "step_count": 0},
-            config=cfg,
-        )
+    state = await _invoke(
+        graph,
+        {"messages": [HumanMessage(content="go")], "step_count": 0, "max_steps": 20},
+        "esc-loop",
+    )
+    assert base.calls == 3
     assert escalated.calls == 1
-    assert str(second["messages"][-1].content) == "escalated final"
+    assert str(state["messages"][-1].content) == "escalated final"
+    assert state["exit_reason"] == "text_response"
     # Consumed signal resets (the escalated turn had no loop trip).
-    assert second.get("escalate_next") is False
+    assert state.get("escalate_next") is False
 
 
 @pytest.mark.asyncio

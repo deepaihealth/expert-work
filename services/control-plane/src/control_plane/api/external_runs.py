@@ -58,7 +58,14 @@ from expert_work.persistence.tenant_user import TenantUserStore
 from expert_work.persistence.thread_meta import ThreadMetaStore
 from expert_work.persistence.token_usage_store import TokenUsageStore
 from expert_work.protocol import AgentSpecStatus, Principal
-from expert_work.runtime.runs import DisconnectMode, InterruptReason, RunStatus, RunStore
+from expert_work.runtime.runs import (
+    DisconnectMode,
+    ExternalRunStatus,
+    InterruptReason,
+    RunStore,
+    external_run_status,
+    run_status_filter,
+)
 from expert_work.runtime.runs.schemas import TERMINAL_RUN_STATUSES
 from expert_work.runtime.runs.store import RunIdempotencyConflict
 from orchestrator import AgentFactoryError
@@ -390,7 +397,7 @@ def build_external_runs_router() -> APIRouter:
         users: Annotated[TenantUserStore, Depends(get_user_repo)],
         user_id: Annotated[str, Query(min_length=1, max_length=255)],
         session_id: Annotated[UUID | None, Query()] = None,
-        status: Annotated[RunStatus | None, Query()] = None,
+        status: Annotated[ExternalRunStatus | None, Query()] = None,
         limit: Annotated[int, Query(ge=1, le=200)] = 50,
         offset: Annotated[int, Query(ge=0)] = 0,
     ) -> JSONResponse:
@@ -447,12 +454,18 @@ def build_external_runs_router() -> APIRouter:
                     }
                 )
 
+        # B-226 ⑥ — the filter speaks the vocabulary the rows say: ``success``
+        # excludes limit-stopped runs, ``incomplete`` selects exactly them.
+        internal_status, incomplete = (
+            (None, None) if status is None else run_status_filter(status.value)
+        )
         rows = await runs.list_for_tenant(
             tenant_id=tenant_id,
             user_id=end_user_id,
             agent_name=agent_code,
             thread_ids=thread_ids,
-            status=status,
+            status=internal_status,
+            incomplete=incomplete,
             limit=limit,
             offset=offset,
         )
@@ -464,7 +477,8 @@ def build_external_runs_router() -> APIRouter:
                         {
                             "run_id": str(r.run_id),
                             "session_id": str(r.thread_id),
-                            "status": r.status.value,
+                            # B-226 ⑥ —— ``incomplete`` when a platform limit stopped it.
+                            "status": external_run_status(r.status, r.exit_reason),
                             "created_at": r.created_at.isoformat() if r.created_at else None,
                             "finished_at": r.finished_at.isoformat() if r.finished_at else None,
                             "error": r.error,
@@ -478,6 +492,15 @@ def build_external_runs_router() -> APIRouter:
                             "regenerated_from": str(r.regenerated_from_run_id)
                             if r.regenerated_from_run_id
                             else None,
+                            # B-226 ⑥ — same source as the end frame: ``status`` says the
+                            # run finished, ``completed`` says the request was done.
+                            # null = no record (usually error / interrupted / old run),
+                            # not false. A paused run voided by a new turn is
+                            # interrupted but keeps false / approval_pending.
+                            "completed": r.completed,
+                            "exit_reason": r.exit_reason,
+                            # B-226 ⑥ —— why not done: ``[{tool, kind}]``, null = no record.
+                            "unresolved_failures": r.unresolved_failures,
                         }
                         for r in rows
                     ],
@@ -554,7 +577,10 @@ def build_external_runs_router() -> APIRouter:
             # 未结束时被调用(``queued`` / ``running`` 在帧词表里根本没有),所以
             # 跟列表对齐 —— 否则同一个 run 在两个端点上会报出不同的状态串
             # (``timeout`` vs ``error``)。
-            "run_status": run.status.value,
+            # B-226 ⑥ —— both vocabularies now also carry ``incomplete`` (success +
+            # a budget exit), derived by the same ``external_run_status`` as the
+            # run list and the ``end`` frame, so the endpoints still agree.
+            "run_status": external_run_status(run.status, run.exit_reason),
         }
         if buckets is not None:
             body["usage_by_model"] = buckets

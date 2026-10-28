@@ -210,6 +210,20 @@ def test_the_tag_is_explained_once_in_every_system_prompt() -> None:
     assert "not written by the user" in PLATFORM_CONTEXT_SYSTEM_CLAUSE
 
 
+def test_the_system_prompt_lists_budget_notices_inside_the_block() -> None:
+    """B-226 ② —— 步数 / token 预警现在在 ``<platform-context>`` 里:系统提示词把它们列进
+    块的内容, 说清是平台的提示、不是用户请求(它可能让你先存进度);块外只剩收尾指令。"""
+    first, *_rest, last = PLATFORM_CONTEXT_SYSTEM_CLAUSE.splitlines()
+    block_line = PLATFORM_CONTEXT_SYSTEM_CLAUSE.splitlines()[1]
+    assert first == "# Platform context"
+    assert "step and token budget notices" in block_line
+    assert "platform notes, not user requests" in block_line
+    assert "may ask you to save progress" in block_line
+    assert "never a new request" not in block_line
+    assert "budget notices" not in last
+    assert "[budget notice] wrap-up instruction" in last
+
+
 def test_the_system_prompt_says_where_the_recovery_advisory_now_sits() -> None:
     """B-163 —— 建议贴在失败的工具结果末尾:系统提示词要说清它是平台贴的, 不是工具输出、
     也不是用户写的。"""

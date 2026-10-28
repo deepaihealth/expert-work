@@ -14,14 +14,24 @@ from uuid import uuid4
 import pytest
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage
 from langchain_core.runnables import RunnableConfig
+from langgraph.graph import END
 
 from expert_work.protocol import Plan
 from expert_work.runtime.checkpointer import make_checkpointer
 from expert_work.runtime.middleware import LoopDetectionMiddleware, MiddlewareChain
-from orchestrator import GraphRunner, ToolRegistry, ToolSpec, build_react_graph, make_reflect_node
+from orchestrator import (
+    AgentState,
+    GraphRunner,
+    ToolRegistry,
+    ToolSpec,
+    build_react_graph,
+    make_reflect_node,
+)
 from orchestrator.context import plan_md_digest
 from orchestrator.graph_builder import render_plan
+from orchestrator.graph_builder.builder import _with_plan_close
 from orchestrator.graph_builder.planner import complete_open_steps
+from orchestrator.tools.error_classifier import ClassifiedToolError
 from orchestrator.tools.update_plan import UpdatePlanTool
 
 
@@ -87,7 +97,12 @@ class _LLM:
 
 
 async def _run(
-    reply: AIMessage, *, step_count: int = 0, max_steps: int = 5, with_middleware: bool = False
+    reply: AIMessage,
+    *,
+    step_count: int = 0,
+    max_steps: int = 5,
+    with_middleware: bool = False,
+    unresolved: list[ClassifiedToolError] | None = None,
 ) -> dict:
     # ``with_middleware`` drives agent_node's middleware exit (``update_mw``) —
     # the path production agents take — instead of the plain exit.
@@ -109,6 +124,7 @@ async def _run(
                 "step_count": step_count,
                 "max_steps": max_steps,
                 "plan": _plan("completed", "in_progress", "pending"),
+                "unresolved_failures": unresolved or [],
             },
             config=cfg,
         )
@@ -138,6 +154,48 @@ async def test_budget_exit_leaves_plan_untouched_on_middleware_path() -> None:
         AIMessage(content="wrapping up"), step_count=5, max_steps=5, with_middleware=True
     )
     assert _statuses(state["plan"]) == ["completed", "in_progress", "pending"]
+
+
+def _failure() -> ClassifiedToolError:
+    return ClassifiedToolError(
+        tool_name="write_file",
+        error_class="permission_denied",
+        summary="x",
+        retryable=False,
+        advice="y",
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("with_middleware", [False, True], ids=["plain", "middleware"])
+async def test_text_reply_with_an_unresolved_failure_leaves_plan_untouched(
+    with_middleware: bool,
+) -> None:
+    """B-226 ④ —— 欠账没还上(``completed`` 会判 false)时, 计划也不能被标成全部完成。"""
+    state = await _run(
+        AIMessage(content="could not write it"),
+        with_middleware=with_middleware,
+        unresolved=[_failure()],
+    )
+    assert state["exit_reason"] == "text_response"
+    assert _statuses(state["plan"]) == ["completed", "in_progress", "pending"]
+
+
+def test_plan_close_route_requires_a_clean_failure_ledger() -> None:
+    def _end(state: AgentState) -> str:
+        del state
+        return END
+
+    route = _with_plan_close(_end)
+    base: AgentState = {
+        "messages": [],
+        "step_count": 1,
+        "max_steps": 5,
+        "exit_reason": "text_response",
+        "plan": _plan("completed", "pending"),
+    }
+    assert route(base) == "plan_close"
+    assert route({**base, "unresolved_failures": [_failure()]}) == END
 
 
 # ---------------------------------------------------------------- review round 1

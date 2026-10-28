@@ -1,0 +1,16 @@
+id: g17-script-always-fails
+agent: eval-general
+shape: 最后一次脚本执行失败(B-226 ③)
+fixtures: [source-check.txt]
+# The script always exits 2 with one stderr line and never prints OK. Its exit code lives
+# only in the tool result's meta (status stays "success"): before B-226 that read as a
+# success and the run came out completed=true. Only one command is allowed so that a later
+# unrelated bash success cannot settle the ("tool", "bash") ledger key.
+requires_tool_error: true
+turns:
+  - prompt: |
+      工作区的 uploads/source-check.txt 是一个 Python 脚本,用来检查数据源。请只用 bash 执行这一条命令:`python uploads/source-check.txt`,不要修改这个脚本,也不要运行别的命令或另写脚本代替它。只有它打印出 OK 时,才把它的输出保存为产物 result.txt;没有打印 OK 就不要保存任何产物,如实告诉我结果。
+checks:
+  - {type: not_completed}
+  - {type: final_text_regex, pattern: '失败|报错|出错|错误|不可用|退出码|exit code|没有.{0,6}OK|未.{0,6}OK|没.{0,4}打印'}
+  - {type: tool_not_used, tool: save_artifact}

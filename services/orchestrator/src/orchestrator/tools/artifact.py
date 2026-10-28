@@ -47,6 +47,48 @@ _SHARED_DIR_NAME = SHARED_PREFIX.rstrip(":")
 #: 登记喂一条清单项。键定义在 tools 层与 sink keys 同理由:builder 与
 #: sse 都要 import,而 tools 不 import 它们。
 ARTIFACT_RECORDER_KEY = "artifact_manifest_recorder"
+#: B-226 —— builder 据此判断本 agent 有没有登记交付物这项能力(收尾指令 / 步数预警
+#: 只在有时才提登记)。
+SAVE_ARTIFACT_TOOL_NAME = "save_artifact"
+
+
+class ArtifactRecorder:
+    """产物清单契约 —— 本 run 的产物登记累积器(``ARTIFACT_RECORDER_KEY`` 注入的那个对象)。
+
+    name 去重、后登记覆盖(与前端产物 chips 的 newest-wins 同义)。调用它 = 登记一条。
+    子代拿到的是 :meth:`scoped` 分出来的视图:写进同一份清单(整棵委派树的登记都在
+    end 帧里),``count`` 数的是**自己这棵子树**登记过的名字(自己的 + 自己委派出去的子代
+    的)—— B-226 ① 收尾指令里的「本 run 登记了几个产物」读它:父的收尾算上子代交付的,
+    子代撞上限时不会把父或兄弟登记的算成自己的。
+    """
+
+    def __init__(
+        self,
+        entries: dict[str, dict[str, Any]] | None = None,
+        parent: ArtifactRecorder | None = None,
+    ) -> None:
+        self._entries: dict[str, dict[str, Any]] = {} if entries is None else entries
+        self._parent = parent
+        self._subtree: set[str] = set()
+
+    def __call__(self, entry: dict[str, Any]) -> None:
+        name = str(entry.get("name"))
+        self._entries[name] = entry
+        node: ArtifactRecorder | None = self
+        while node is not None:
+            node._subtree.add(name)
+            node = node._parent
+
+    def scoped(self) -> ArtifactRecorder:
+        """给委派出去的子代:同一份清单, 计数只含它自己的子树(也计进本视图)。"""
+        return ArtifactRecorder(self._entries, parent=self)
+
+    @property
+    def count(self) -> int:
+        return len(self._subtree)
+
+    def snapshot(self) -> list[dict[str, Any]]:
+        return list(self._entries.values())
 
 
 def _require_user_scope(ctx: ToolContext, tool: str) -> tuple[UUID, UUID]:
@@ -136,7 +178,7 @@ class SaveArtifactTool:
     @property
     def spec(self) -> ToolSpec:
         return ToolSpec(
-            name="save_artifact",
+            name=SAVE_ARTIFACT_TOOL_NAME,
             description=(
                 "Register a file you produced in the workspace as a named "
                 "artifact so the user can retrieve it later. Re-saving an "

@@ -1,0 +1,27 @@
+id: t04-finish-after-step-notice
+agent: eval-tight-24
+shape: 步数预警出现之后照样往下做,不提前收手(B-226 ②;hermes-agent c8aff74632 / #7915:压力提醒让模型过早放弃)
+# eval-tight-24:24 步,预警窗口是最后 4 步(第 21~24 次调用)。21 份台账,最省 = 21 次 exec_python
+# + 1 次 save_artifact + 1 次回复 = 23 次:预警第一次出现(第 21 次调用)时第 21 份台账还没算,
+# 后面还有登记和回复;照预警先登记一次(多 1 次)也正好 24 次做完。
+# 判法:按 text_response 结束却缺了台账 = 提前收手, 不过;全做完, 过;一直做到步数上限
+# (max_steps)或 token 预算用完(token_budget)也算过 —— 要测的就是「没停下」。主 Agent 一条
+# 步数预警帧都没有(没进窗口)= 不可判。
+# 只测发版之后:旧版本没有步数预警帧, 基线那一遍按设计全是不可判, 只看新版本的过 / 不过。
+requires_step_warning: true
+fixtures: [ledger-01.csv, ledger-02.csv, ledger-03.csv, ledger-04.csv, ledger-05.csv, ledger-06.csv, ledger-07.csv, ledger-08.csv, ledger-09.csv, ledger-10.csv, ledger-11.csv, ledger-12.csv, ledger-13.csv, ledger-14.csv, ledger-15.csv, ledger-16.csv, ledger-17.csv, ledger-18.csv, ledger-19.csv, ledger-20.csv, ledger-21.csv]
+turns:
+  - prompt: |
+      工作区 uploads/ 下有 21 份门店台账 ledger-01.csv 到 ledger-21.csv(列:日期,门店,品类,单号,金额)。
+      请按编号从 01 到 21 逐份处理,每份只调用一次 exec_python:读这一份、算出「金额」列的合计,并把结果追加为工作区 totals.md 的一行。
+      totals.md 每行的格式严格为 `ledger-01.csv,合计=12345`(整数,不加千位分隔符),不要表头和其它行。
+      21 份都处理完后,用 save_artifact 把 totals.md 登记为产物,然后用一句话告诉我完成了。
+checks:
+  # 按步数上限 / token 预算结束 = 一直在做, 这三条都记过;别的出口按「做完了没有」判。
+  - {type: completed, unless_exit_reason: [max_steps, token_budget]}
+  # 每一份都做了:21 行都在、各一行、数值对(数值由 make_fixtures.ledger_totals 生成)
+  - type: artifact_contains
+    name: 'totals*'
+    unless_exit_reason: [max_steps, token_budget]
+    all: ['ledger-01.csv,合计=105075', 'ledger-02.csv,合计=102120', 'ledger-03.csv,合计=99165', 'ledger-04.csv,合计=98110', 'ledger-05.csv,合计=107505', 'ledger-06.csv,合计=104550', 'ledger-07.csv,合计=101595', 'ledger-08.csv,合计=98640', 'ledger-09.csv,合计=100435', 'ledger-10.csv,合计=106980', 'ledger-11.csv,合计=104025', 'ledger-12.csv,合计=101070', 'ledger-13.csv,合计=98115', 'ledger-14.csv,合计=101810', 'ledger-15.csv,合计=106455', 'ledger-16.csv,合计=103500', 'ledger-17.csv,合计=100545', 'ledger-18.csv,合计=97590', 'ledger-19.csv,合计=104135', 'ledger-20.csv,合计=105930', 'ledger-21.csv,合计=102975']
+  - {type: workspace_file_line_count, path: totals.md, pattern: '^\s*ledger-\d{2}\.csv,', count: 21, unless_exit_reason: [max_steps, token_budget]}

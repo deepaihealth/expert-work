@@ -10,12 +10,15 @@ import pytest
 
 from expert_work.runtime.runs import (
     DisconnectMode,
+    ExternalRunStatus,
     InMemoryRunEventStore,
     InMemoryRunStore,
     RunInfo,
     RunStatus,
     RunStore,
+    external_run_status,
     make_event_record,
+    run_status_filter,
 )
 
 _BASE = datetime(2026, 5, 22, 12, 0, 0, tzinfo=UTC)
@@ -1294,6 +1297,117 @@ async def test_set_status_writes_completion_signal_and_none_keeps_existing() -> 
     kept = await store.get(run_id=run_id, tenant_id=tenant_id)
     assert kept is not None
     assert kept.completed is False and kept.exit_reason == "text_response"
+
+
+@pytest.mark.asyncio
+async def test_set_status_writes_unresolved_failures_and_none_keeps_existing() -> None:
+    """B-226 ⑥ — same predicate as ``completed`` (the SQL store has the mirror
+    case): a list is written, ``[]`` is written (it means "none", not "no
+    record"), ``None`` leaves the stored value alone."""
+    store = InMemoryRunStore()
+    run_id, tenant_id = uuid4(), uuid4()
+    await store.create(_info(run_id=run_id, tenant_id=tenant_id))
+    fresh = await store.get(run_id=run_id, tenant_id=tenant_id)
+    assert fresh is not None and fresh.unresolved_failures is None
+
+    failures = [{"tool": "bash", "kind": "unknown"}]
+    await store.set_status(
+        run_id=run_id,
+        tenant_id=tenant_id,
+        status=RunStatus.SUCCESS,
+        updated_at=_BASE + timedelta(seconds=5),
+        unresolved_failures=failures,
+    )
+    fetched = await store.get(run_id=run_id, tenant_id=tenant_id)
+    assert fetched is not None and fetched.unresolved_failures == failures
+
+    await store.set_status(
+        run_id=run_id,
+        tenant_id=tenant_id,
+        status=RunStatus.SUCCESS,
+        updated_at=_BASE + timedelta(seconds=6),
+        unresolved_failures=[],
+    )
+    emptied = await store.get(run_id=run_id, tenant_id=tenant_id)
+    assert emptied is not None and emptied.unresolved_failures == []
+
+    await store.set_status(
+        run_id=run_id,
+        tenant_id=tenant_id,
+        status=RunStatus.SUCCESS,
+        updated_at=_BASE + timedelta(seconds=7),
+    )
+    kept = await store.get(run_id=run_id, tenant_id=tenant_id)
+    assert kept is not None and kept.unresolved_failures == []
+
+
+#: B-226 ⑥ — the rows the ``incomplete`` filter tests seed: label → (internal
+#: status, exit_reason). ``legacy`` is a success with no exit recorded.
+_FILTER_ROWS: dict[str, tuple[RunStatus, str | None]] = {
+    "clean": (RunStatus.SUCCESS, "text_response"),
+    "legacy": (RunStatus.SUCCESS, None),
+    "max_steps": (RunStatus.SUCCESS, "max_steps"),
+    "no_progress": (RunStatus.SUCCESS, "no_progress"),
+    "error": (RunStatus.ERROR, None),
+}
+
+
+async def _seed_filter_rows(store: RunStore, tenant_id: UUID) -> dict[str, UUID]:
+    ids: dict[str, UUID] = {}
+    for i, (label, (status, exit_reason)) in enumerate(_FILTER_ROWS.items()):
+        run_id = uuid4()
+        await store.create(
+            _info(run_id=run_id, tenant_id=tenant_id, created_at=_BASE + timedelta(seconds=i))
+        )
+        await store.set_status(
+            run_id=run_id,
+            tenant_id=tenant_id,
+            status=status,
+            updated_at=_BASE + timedelta(seconds=10 + i),
+            exit_reason=exit_reason,
+        )
+        ids[label] = run_id
+    return ids
+
+
+@pytest.mark.asyncio
+async def test_list_for_tenant_incomplete_predicate_partitions_successes() -> None:
+    """B-226 ⑥ — ``incomplete=True`` keeps the limit-stopped successes,
+    ``False`` keeps the rest (a NULL exit included), ``None`` adds nothing.
+    The SQL store has the mirror case."""
+    store = InMemoryRunStore()
+    tenant_id = uuid4()
+    ids = await _seed_filter_rows(store, tenant_id)
+
+    async def listed(status: RunStatus, incomplete: bool | None = None) -> set[UUID]:
+        rows = await store.list_for_tenant(
+            tenant_id=tenant_id, status=status, incomplete=incomplete
+        )
+        return {r.run_id for r in rows}
+
+    stopped = await listed(RunStatus.SUCCESS, incomplete=True)
+    natural = await listed(RunStatus.SUCCESS, incomplete=False)
+    assert stopped == {ids["max_steps"], ids["no_progress"]}
+    assert natural == {ids["clean"], ids["legacy"]}
+    assert stopped | natural == await listed(RunStatus.SUCCESS)
+    assert await listed(RunStatus.ERROR) == {ids["error"]}
+
+
+@pytest.mark.asyncio
+async def test_external_status_filter_returns_exactly_the_rows_that_say_it() -> None:
+    """B-226 ⑥ — both directions agree: filtering by an external status
+    (``run_status_filter``) returns exactly the rows whose
+    ``external_run_status`` is that value."""
+    store = InMemoryRunStore()
+    tenant_id = uuid4()
+    await _seed_filter_rows(store, tenant_id)
+    every = await store.list_for_tenant(tenant_id=tenant_id)
+
+    for external in ExternalRunStatus:
+        status, incomplete = run_status_filter(external.value)
+        got = await store.list_for_tenant(tenant_id=tenant_id, status=status, incomplete=incomplete)
+        want = {r.run_id for r in every if external_run_status(r.status, r.exit_reason) == external}
+        assert {r.run_id for r in got} == want, external
 
 
 # ---------------------------------------------------------------------------

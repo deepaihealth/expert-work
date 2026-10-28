@@ -108,8 +108,9 @@ def run_and_stream(user_id, input_text):
                 max_seq_seen = seq if max_seq_seen is None else max(max_seq_seen, seq)
 
             if event == "end":
-                # ④收到 end 才算结束;end 事件带这次 run 的最终 status
-                print("run 结束,status =", data["status"])
+                # ④收到 end 才算结束;status 说怎么结束的,completed 说事做成了没有
+                ok = data["status"] == "success" and data.get("completed") is not False
+                print("run 结束,status =", data["status"], "做成了" if ok else "没做成", data.get("exit_reason"))
                 break
             elif event == "truncated":
                 # ④收到 truncated 不算结束——这一页装不下,要带 next_seq 继续拉(见 10.5)
@@ -200,8 +201,9 @@ async function runAndStream(userId, inputText) {
     }
 
     if (event === "end") {
-      // ④收到 end 才算结束;end 事件带这次 run 的最终 status
-      console.log("run 结束,status =", data.status);
+      // ④收到 end 才算结束;status 说怎么结束的,completed 说事做成了没有
+      const ok = data.status === "success" && data.completed !== false;
+      console.log("run 结束,status =", data.status, ok ? "做成了" : "没做成", data.exit_reason);
       break;
     } else if (event === "truncated") {
       // ④收到 truncated 不算结束——这一页装不下,要带 next_seq 继续拉(见 10.5)
@@ -446,8 +448,10 @@ public class RunAndStream {
                             maxSeqSeen = (maxSeqSeen == null) ? frame.seq : Math.max(maxSeqSeen, frame.seq);
                         }
                         if ("end".equals(frame.event)) {
-                            // ④收到 end 才算结束;end 事件带这次 run 的最终 status
-                            System.out.println("run 结束,status = " + jsonValue(frame.rawData, "status"));
+                            // ④收到 end 才算结束;status 说怎么结束的,completed 说事做成了没有
+                            String endStatus = jsonValue(frame.rawData, "status");
+                            boolean ok = "success".equals(endStatus) && !"false".equals(jsonValue(frame.rawData, "completed"));
+                            System.out.println("run 结束,status = " + endStatus + (ok ? ",做成了" : ",没做成,exit_reason = " + jsonValue(frame.rawData, "exit_reason")));
                             break readLoop;
                         } else if ("truncated".equals(frame.event)) {
                             // ④收到 truncated 不算结束——这一页装不下,要带 next_seq 继续拉(见 10.5)
@@ -2046,7 +2050,8 @@ def consume_one_connection(response, cursor):
             cursor.value = seq if cursor.value is None else max(cursor.value, seq)
 
         if event == "end":
-            print("run 结束,status =", data["status"])
+            ok = data["status"] == "success" and data.get("completed") is not False
+            print("run 结束,status =", data["status"], "做成了" if ok else "没做成", data.get("exit_reason"))
             return True
         if event == "truncated":
             print("这一页到此为止(未结束),next_seq =", data["next_seq"])
@@ -2208,7 +2213,8 @@ async function consumeOneConnection(response, cursorRef) {
           cursorRef.value = cursorRef.value === null ? seq : Math.max(cursorRef.value, seq);
         }
         if (event === "end") {
-          console.log("run 结束,status =", data.status);
+          const ok = data.status === "success" && data.completed !== false;
+          console.log("run 结束,status =", data.status, ok ? "做成了" : "没做成", data.exit_reason);
           return true;
         }
         if (event === "truncated") {
@@ -2509,7 +2515,9 @@ public class ReconnectEvents {
                         cursor.value = (cursor.value == null) ? frame.seq : Math.max(cursor.value, frame.seq);
                     }
                     if ("end".equals(frame.event)) {
-                        System.out.println("run 结束,status = " + jsonValue(frame.rawData, "status"));
+                        String endStatus = jsonValue(frame.rawData, "status");
+                        boolean ok = "success".equals(endStatus) && !"false".equals(jsonValue(frame.rawData, "completed"));
+                        System.out.println("run 结束,status = " + endStatus + (ok ? ",做成了" : ",没做成,exit_reason = " + jsonValue(frame.rawData, "exit_reason")));
                         return true;
                     }
                     if ("truncated".equals(frame.event)) {
@@ -3202,7 +3210,8 @@ def run_items(user_id, input_text, conversation):
             elif event == "item.delta":
                 conversation.append_delta(data)
             elif event == "end":
-                print("\nrun 结束,status =", data["status"])
+                ok = data["status"] == "success" and data.get("completed") is not False
+                print("\nrun 结束,status =", data["status"], "做成了" if ok else "没做成", data.get("exit_reason"))
                 break
             elif event == "truncated":
                 # 这一页装不下,带 next_seq 继续拉(重连写法见 10.5)
@@ -3327,7 +3336,8 @@ async function runItems(userId, inputText, conversation) {
     } else if (event === "item.delta") {
       conversation.appendDelta(data);
     } else if (event === "end") {
-      console.log("\nrun 结束,status =", data.status);
+      const ok = data.status === "success" && data.completed !== false;
+      console.log("\nrun 结束,status =", data.status, ok ? "做成了" : "没做成", data.exit_reason);
       break;
     } else if (event === "truncated") {
       // 这一页装不下,带 next_seq 继续拉(重连写法见 10.5)
@@ -3567,8 +3577,9 @@ public class ItemsReceiver {
                         } else if ("item.delta".equals(frame.event)) {
                             conversation.appendDelta(frame.rawData);
                         } else if ("end".equals(frame.event)) {
-                            System.out.println("\nrun 结束,status = "
-                                    + jsonString(frame.rawData, "status"));
+                            String endStatus = jsonString(frame.rawData, "status");
+                            boolean ok = "success".equals(endStatus) && !frame.rawData.contains("\"completed\":false");
+                            System.out.println("\nrun 结束,status = " + endStatus + (ok ? ",做成了" : ",没做成"));
                             break readLoop;
                         } else if ("truncated".equals(frame.event)) {
                             // 这一页装不下,带 next_seq 继续拉(重连写法见 10.5)

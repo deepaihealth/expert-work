@@ -22,6 +22,25 @@ describe("buildConsoleTurns", () => {
     expect(out[1]).toMatchObject({ runId: "r2", loadState: "pending", turn: { status: "error", error: "timeout", events: [] }, fallbackLines: [{ text: "partial", channel: "final" }] });
     expect(out[2]).toMatchObject({ runId: "r3", loadState: "done", timing: { ttftMs: 500 }, tokens: null });
   });
+  it("B-226 ⑥ — a history turn carries its run row's completion (before any replay); a live turn has none", () => {
+    const out = buildConsoleTurns({
+      historyTurns: [
+        { key: "h1", input: "q1", fallbackLines: [], runId: "r1", status: "success", tokens: null, createdAt: null, finishedAt: null, runError: null, supersededBy: null, tombstone: false, platformLines: [], completed: false, exitReason: "max_steps", unresolvedFailures: [{ tool: "bash", kind: "unknown" }] },
+        { key: "h2", input: "q2", fallbackLines: [], runId: "r2", status: "success", tokens: null, createdAt: null, finishedAt: null, runError: null, supersededBy: null, tombstone: false, platformLines: [] },
+      ],
+      historyLoads: {},
+      liveTurns: [{ id: "L1", input: "q3", attachments: [], events: [], status: "running", error: null, approval: null }],
+      timings: {},
+    });
+    expect(out[0].runCompletion).toEqual({
+      status: "success", completed: false, exit_reason: "max_steps",
+      unresolved_failures: [{ tool: "bash", kind: "unknown" }],
+    });
+    expect(out[1].runCompletion).toEqual({
+      status: "success", completed: null, exit_reason: null, unresolved_failures: null,
+    });
+    expect(out[2].runCompletion).toBeNull();
+  });
   it("maps an interrupted history run to an interrupted turn (BUG-9 — not 'done')", () => {
     const out = buildConsoleTurns({
       historyTurns: [

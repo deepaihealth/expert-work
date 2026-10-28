@@ -19,7 +19,7 @@ from __future__ import annotations
 import asyncio
 import time
 from collections.abc import AsyncIterator
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any
 from uuid import uuid4
 
@@ -62,9 +62,10 @@ async def _run(
     *,
     recorder: _FakeRecorder | None = None,
     max_steps: int = 5,
+    max_no_progress: int = 0,
 ) -> ToolResult:
     return await run_child_to_result(
-        child=_built(graph, max_steps=max_steps),
+        child=replace(_built(graph, max_steps=max_steps), max_no_progress=max_no_progress),
         task="t",
         ctx=ctx,
         child_depth=1,
@@ -210,15 +211,28 @@ async def test_timeout_error_raised_by_the_child_itself_is_not_mistaken_for_the_
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("exit_reason", "phrase"),
+    ("exit_reason", "max_no_progress", "phrase"),
     [
-        ("max_steps", "reached its step limit (48 steps)"),
-        ("no_progress", "stopped making progress"),
-        ("token_budget", "token budget ran out"),
+        ("max_steps", 0, "reached its step limit (48 steps)"),
+        # B-226 ④ —— 按本 run 累计的打转次数停(不再是「连续 N 步」);子代没配
+        # max_no_progress(0)时按平台规则的 2 次, 不说「0 steps in a row」;配了就说配的次数。
+        (
+            "no_progress",
+            0,
+            "stopped making progress (the same tool calls kept repeating, "
+            "2 loop trips in this run)",
+        ),
+        (
+            "no_progress",
+            4,
+            "stopped making progress (the same tool calls kept repeating, "
+            "4 loop trips in this run)",
+        ),
+        ("token_budget", 0, "token budget ran out"),
     ],
 )
 async def test_budget_wrap_up_is_flagged_not_reported_as_plain_success(
-    exit_reason: str, phrase: str
+    exit_reason: str, max_no_progress: int, phrase: str
 ) -> None:
     graph = _StreamingGraph(
         [],
@@ -231,7 +245,13 @@ async def test_budget_wrap_up_is_flagged_not_reported_as_plain_success(
     frames: list[dict[str, Any]] = []
     recorder = _FakeRecorder()
 
-    result = await _run(graph, _collecting_ctx(frames), recorder=recorder, max_steps=48)
+    result = await _run(
+        graph,
+        _collecting_ctx(frames),
+        recorder=recorder,
+        max_steps=48,
+        max_no_progress=max_no_progress,
+    )
 
     content = str(result.content)
     first_line, _, rest = content.partition("\n\n")
@@ -283,6 +303,21 @@ async def test_child_with_no_answer_is_failed_not_completed() -> None:
     assert inv.error
     await _drain_trajectories()
     assert [r.outcome for r in recorder.records] == ["failed"]
+
+
+@pytest.mark.asyncio
+async def test_child_with_no_answer_end_frame_is_not_success() -> None:
+    """B-226 ⑥ — the parent gets a "produced no answer" failure, yet the end
+    frame said success. The contract has no ``failed``; a worker that ended
+    without handing back a result uses the existing ``cancelled`` (the same
+    value as an unexpected error)."""
+    graph = _StreamingGraph([], {"messages": [HumanMessage(content="t")], "step_count": 1})
+    frames: list[dict[str, Any]] = []
+
+    await _run(graph, _collecting_ctx(frames))
+
+    (end,) = _ends(frames)
+    assert end["data"]["outcome"] == "cancelled"
 
 
 @pytest.mark.asyncio

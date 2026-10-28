@@ -428,6 +428,20 @@ class ToolResult:
     facts the tool computed (counts, the next argument to pass) or fixed
     platform text about how to read this kind of result (``knowledge_search``,
     B-175 wave 2 PR3), stated as facts rather than commands (B-163).
+
+    ``failed`` (B-226 ③) says the call failed although the tool returned
+    normally: a non-zero exit, an MCP ``isError``, an HTTP status >= 400 on a
+    method that changes something, a delegated run that did not finish, a
+    refused delegation. It is set from the
+    tool's own structured result, never from reading its text. The tools node
+    records it in the run's failure ledger like a raised error, instead of
+    reading it as a success that clears an earlier failure of the same tool.
+    Ledger only: no advisory (the result itself says what failed), no escalation.
+
+    ``failure_transient`` (only on a failed result) makes it neutral — classed
+    ``transient``, which neither records nor clears a ledger entry: retry-later
+    jitter (HTTP 5xx, a saturated delegation gate), or an outcome that is evidence
+    neither way (a refusal the run cannot settle, a predicate that answered "no").
     """
 
     content: str
@@ -436,6 +450,8 @@ class ToolResult:
     refund_iterations: int = 0
     full_content: str | None = None
     notice: str | None = None
+    failed: bool = False
+    failure_transient: bool = False
 
     def __post_init__(self) -> None:
         # Frozen dataclass — direct setattr is disabled. The check runs
@@ -447,6 +463,9 @@ class ToolResult:
                 f"{self.refund_iterations}); a tool cannot consume the "
                 f"agent's iteration budget through this channel."
             )
+            raise ValueError(msg)
+        if self.failure_transient and not self.failed:
+            msg = "ToolResult.failure_transient requires failed=True"
             raise ValueError(msg)
 
 

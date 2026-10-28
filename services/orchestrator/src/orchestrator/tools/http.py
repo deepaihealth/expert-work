@@ -60,6 +60,7 @@ from orchestrator.tools.registry import (
     ToolResult,
     ToolSpec,
 )
+from orchestrator.tools.worker_policy import READ_ONLY_HTTP_METHODS
 
 logger = logging.getLogger(__name__)
 
@@ -158,7 +159,7 @@ class HTTPTool:
                 **body_kwargs,
             )
 
-        return self._format(response)
+        return self._format(response, method=method)
 
     # ------------------------------------------------------------------
     # Input parsing / validation
@@ -274,7 +275,7 @@ class HTTPTool:
     # Response formatting + truncation
     # ------------------------------------------------------------------
 
-    def _format(self, response: httpx.Response) -> ToolResult:
+    def _format(self, response: httpx.Response, *, method: str) -> ToolResult:
         body_text = response.text
         body_truncated = len(body_text) > self.body_char_cap
         if body_truncated:
@@ -297,6 +298,12 @@ class HTTPTool:
             full_headers = "\n".join(f"{key}: {value}" for key, value in response.headers.items())
             full_content = _render(full_headers, response.text)
 
+        # B-226 ③ — a 4xx / 5xx counts only for a method that changes something: a
+        # failed GET / HEAD / OPTIONS is a lookup, not undone work (cf. the B-164
+        # read-only exemption; the http spec has no read-only flag, so it is per method).
+        # Ledger-only (the status line leads the result); a 5xx is the server's trouble,
+        # retry-later jitter rather than evidence either way.
+        failed = response.status_code >= 400 and method not in READ_ONLY_HTTP_METHODS
         return ToolResult(
             content=_render(headers_text, body_text),
             meta={
@@ -305,6 +312,8 @@ class HTTPTool:
                 "headers_truncated": headers_truncated,
             },
             full_content=full_content,
+            failed=failed,
+            failure_transient=failed and response.status_code >= 500,
         )
 
     def _format_headers(self, headers: httpx.Headers) -> tuple[str, bool]:
