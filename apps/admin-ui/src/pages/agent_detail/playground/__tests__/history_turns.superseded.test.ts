@@ -20,6 +20,8 @@ function run(over: Partial<ThreadRunSummary> & { runId: string }): ThreadRunSumm
     tokens: null,
     supersededBy: null,
     regeneratedFrom: null,
+    completed: null,
+    exitReason: null,
     ...over,
   };
 }

@@ -339,6 +339,41 @@ async def test_detail_runs_carry_the_config_version(
 
 
 @pytest.mark.asyncio
+async def test_detail_runs_carry_completed_and_exit_reason(
+    client_and_threads: tuple[AsyncClient, dict[str, UUID]],
+) -> None:
+    """B-226 ⑥ — the conversation page patches a turn that was in flight at
+    load from this list, so the list must say "finished but not done" too.
+    A row with no record gives ``null`` for both (keys always present)."""
+    from datetime import UTC, datetime
+
+    client, ids = client_and_threads
+    app = client._transport.app  # type: ignore[attr-defined,union-attr]
+    runs = (await client.get(f"/v1/conversations/{ids['convo']}")).json()["data"]["runs"]
+    assert all({"completed", "exit_reason", "unresolved_failures"} <= set(r) for r in runs)
+    assert all(r["completed"] is None and r["exit_reason"] is None for r in runs)
+    assert all(r["unresolved_failures"] is None for r in runs)
+
+    now = datetime.now(UTC)
+    await app.state.run_store.set_status(
+        run_id=UUID(runs[0]["run_id"]),
+        tenant_id=_TENANT,
+        status=RunStatus.SUCCESS,
+        updated_at=now,
+        finished_at=now,
+        completed=False,
+        exit_reason="max_steps",
+        unresolved_failures=[{"tool": "bash", "kind": "unknown"}],
+    )
+    refreshed = (await client.get(f"/v1/conversations/{ids['convo']}")).json()["data"]["runs"]
+    by_id = {
+        r["run_id"]: (r["completed"], r["exit_reason"], r["unresolved_failures"]) for r in refreshed
+    }
+    assert by_id[runs[0]["run_id"]] == (False, "max_steps", [{"tool": "bash", "kind": "unknown"}])
+    assert by_id[runs[1]["run_id"]] == (None, None, None)
+
+
+@pytest.mark.asyncio
 async def test_detail_unknown_thread_is_404(
     client_and_threads: tuple[AsyncClient, dict[str, UUID]],
 ) -> None:

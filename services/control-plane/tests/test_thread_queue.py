@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from collections.abc import AsyncIterator
 from datetime import UTC, datetime, timedelta
 from typing import Any
@@ -196,6 +197,39 @@ async def test_cancelled_while_waiting_ends_without_running() -> None:
     assert h.launched == []
     assert frames[-1].startswith(b"event: end\n")
     assert b'"status":"interrupted"' in frames[-1]
+
+
+@pytest.mark.asyncio
+async def test_a_turn_finished_elsewhere_ends_with_its_completion_record() -> None:
+    """B-226 ⑥ — the queued row finished while this replica waited (another
+    replica's queue worker ran it): the end carries the row's record, so a
+    limit-stopped run reads ``incomplete`` here as on every other path."""
+    h = _Harness()
+    await h.setup()
+    artifacts = [{"name": "a.md", "kind": "document", "version": 1, "created_at": "t"}]
+    failures = [{"tool": "bash", "kind": "unknown"}]
+
+    async def sleep(_: float) -> None:
+        await h.store.set_status(
+            run_id=h.follower.run_id,
+            tenant_id=h.tenant,
+            status=RunStatus.SUCCESS,
+            updated_at=datetime.now(UTC),
+            artifacts=artifacts,
+            completed=False,
+            exit_reason="max_steps",
+            unresolved_failures=failures,
+        )
+
+    frames = [f async for f in h.stream(sleep=sleep)]  # type: ignore[arg-type]
+
+    assert h.launched == []
+    assert frames[-1].startswith(b"event: end\n")
+    data = json.loads(frames[-1].split(b"data: ", 1)[1])
+    assert data["status"] == "incomplete"
+    assert (data["completed"], data["exit_reason"]) == (False, "max_steps")
+    assert data["unresolved_failures"] == failures
+    assert data["artifacts"] == artifacts
 
 
 @pytest.mark.asyncio

@@ -230,6 +230,20 @@ describe("compactRowsOf", () => {
     }
   });
 
+  it.each(["approval_blocked", "a_future_outcome"])(
+    "B-226 ⑥ — a worker ending with outcome %s is a warn row carrying the raw value, not ok",
+    (outcome) => {
+      const events = workerFixtureEvents();
+      const end = events[2];
+      const frame = end.data as { data: Record<string, unknown> };
+      const swapped = { ...end, data: { ...frame, data: { ...frame.data, outcome } } };
+      const rows = compactRowsOf([events[0], events[1], swapped]);
+      const sub = rows.find((r) => r.kind === "subagent");
+      expect(sub?.status).toBe("warn");
+      expect(sub?.kind === "subagent" && sub.worker.status).toBe(outcome);
+    },
+  );
+
   it("row ids are unique within a turn", () => {
     const rows = compactRowsOf([
       upd("agent", { step_count: 1, messages: [{ type: "ai", content: "", additional_kwargs: { reasoning_content: "r" }, tool_calls: [{ id: "a", name: "t", args: {} }, { id: "b", name: "t", args: {} }] }] }),

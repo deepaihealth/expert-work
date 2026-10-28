@@ -55,7 +55,7 @@ from expert_work.protocol import (
     WebhookEndpointRecord,
     WebhookEventType,
 )
-from expert_work.runtime.runs import RunStatus, RunStore
+from expert_work.runtime.runs import RunStatus, RunStore, external_run_status
 from expert_work.runtime.runs.schemas import TERMINAL_RUN_STATUSES
 from expert_work.runtime.secret_store import SecretNotFoundError, SecretStore
 
@@ -125,6 +125,24 @@ _EVENT_TITLES: dict[str, str] = {
     "quality.drift": "质量漂移告警",
 }
 
+#: B-226 ⑥ — the ``run.completed`` title when the run finished without getting
+#: the work done: the console's orange-tag wording ("finished, not completed").
+_RUN_NOT_DONE_TITLE = "已结束\N{FULLWIDTH COMMA}未完成"
+
+
+def _im_title(row: WebhookDeliveryRecord) -> str:
+    """The title line: the event's title, except that a ``run.completed`` the
+    console would tag "finished, not completed" (``status=incomplete``, or
+    ``success`` with ``completed=false``) gets :data:`_RUN_NOT_DONE_TITLE`
+    instead of the plain "run completed" title."""
+    payload = row.payload or {}
+    status = payload.get("status")
+    if row.event_type == "run.completed" and (
+        status == "incomplete" or (status == "success" and payload.get("completed") is False)
+    ):
+        return _RUN_NOT_DONE_TITLE
+    return _EVENT_TITLES.get(row.event_type, row.event_type)
+
 
 def _im_text(row: WebhookDeliveryRecord) -> str:
     """Render one delivery as a plain-text IM bot message.
@@ -133,14 +151,17 @@ def _im_text(row: WebhookDeliveryRecord) -> str:
     raw event type) followed by the payload's scalar fields one per line —
     good enough for a human to act on, with the delivery id for tracing.
     """
-    title = _EVENT_TITLES.get(row.event_type, row.event_type)
+    title = _im_title(row)
     lines = [f"【Expert Work】{title}"]
     for key, value in sorted((row.payload or {}).items()):
         if value is None or isinstance(value, dict | list):
             continue
+        # B-226 ⑥ — a bool reads as in the JSON payload (``completed: false``),
+        # not Python's ``False``.
+        shown = json.dumps(value) if isinstance(value, bool) else str(value)
         # Collapse line breaks so a multi-line value (e.g. an agent-authored
         # action_summary) can't inject fake "key: value" lines into the card.
-        flat = " ".join(str(value).splitlines())
+        flat = " ".join(shown.splitlines())
         lines.append(f"{key}: {flat}")
     lines.append(f"event: {row.event_type}")
     lines.append(f"delivery: {row.id}")
@@ -364,7 +385,17 @@ class WebhookDeliveryWorker:
                     payload={
                         "run_id": str(run.run_id),
                         "thread_id": str(run.thread_id),
-                        "status": run.status.value,
+                        # B-226 ⑥ — a run a platform limit stopped still fires
+                        # run.completed (a new event type would be missed by
+                        # every existing subscriber), with ``status: incomplete``.
+                        "status": external_run_status(run.status, run.exit_reason),
+                        # None = no record (usually error / interrupted); a
+                        # paused run voided by a new turn is run.failed /
+                        # interrupted but keeps false / approval_pending.
+                        "completed": run.completed,
+                        "exit_reason": run.exit_reason,
+                        # Why not done: ``[{tool, kind}]``; None = no record.
+                        "unresolved_failures": run.unresolved_failures,
                     },
                     now=now,
                 )

@@ -159,8 +159,12 @@ class StreamBridge(abc.ABC):
         artifacts: list[dict[str, Any]] | None = None,
         completed: bool | None = None,
         exit_reason: str | None = None,
+        unresolved_failures: list[dict[str, Any]] | None = None,
     ) -> None:
         """Signal that no more events will be produced for ``run_id``.
+
+        ``unresolved_failures`` (B-226 ⑥) rides like ``completed``: the run's
+        final failure ledger as ``[{tool, kind}]``; ``None`` = key absent.
 
         ``status`` is this run's terminal status as the client should see it;
         it rides on the ``data`` of the end frame :meth:`subscribe` yields, so

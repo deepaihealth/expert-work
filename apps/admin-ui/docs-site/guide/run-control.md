@@ -34,7 +34,7 @@ Content-Type: application/json
 | `true` | 这次调用真的触发了取消：run 当时确实在执行中，中断请求已经送达 |
 | `false` | 这个 run 已经处于最终状态，端点不做任何操作，也不报错 |
 
-`stopped` 为 `false` 覆盖的最终状态包括正常结束（`success`）、失败（`error`）、已被取消（`interrupted`），**也包括暂停等待人工审批（`paused`）**。对一个等待审批的 run 调用取消，它的状态不会改变，仍然停在原地等待决策。
+`stopped` 为 `false` 覆盖的最终状态包括正常结束（`success`）、被平台的限制叫停（`incomplete`）、失败（`error`）、已被取消（`interrupted`），**也包括暂停等待人工审批（`paused`）**。对一个等待审批的 run 调用取消，它的状态不会改变，仍然停在原地等待决策。
 
 中断请求生效之后，这次 run 最终会落到 `interrupted` 状态，可以在 [5.4 run 列表](./query#_5-4-run-列表) 的 `status`，或者事件流末尾 `end` 事件的 `status` 里看到。
 
@@ -148,12 +148,25 @@ Content-Type: application/json
 
 `reason_kind` 不是 `policy_gate` 时，`approval` 事件展示的是 Agent 自己的提问。批准后 Agent 收到一条以 `[approved]` 开头的结果（决策为 `modify` 时附带 `modified_args`），同一步里提出的其它操作同样不执行，Agent 可据此在仍然需要时重新提出。
 
-`reject` 之后 run 是否终止，取决于这次审批是怎么触发的。`approval` 事件里的 `reason_kind` 字段说明这次审批的来源，客户端在下达决策之前就能据此区分两条路径（五个取值见 [3.4 的 `approval`](./sse-events#approval)；条目模式下这个字段在 `approval` 条目上，取值相同）：
+`reject` 之后 run 是否终止，取决于这次审批是怎么触发的。`approval` 事件里的 `reason_kind` 字段说明这次审批的来源（五个取值见 [3.4 的 `approval`](./sse-events#approval)；条目模式下这个字段在 `approval` 条目上，取值相同）：
 
-- `reason_kind` 为 `policy_gate`：这是 Agent 配置里声明的强制审批点，常见于高风险工具，拒绝会终止整个 run。
+- `reason_kind` 为 `policy_gate`：审批由平台提出，来源有两种，拒绝的后果不同，见下表。
 - `reason_kind` 为其余四个取值：这是 Agent 在执行过程中自己发起的确认请求，拒绝只是把一条「审批被拒绝」的结果交回给 Agent，run 会继续往下跑，Agent 可能换一种方式重试或者调整计划。
 
-强制审批点被拒绝、run 就此终止时，`end` 事件的 `status` 仍然是 `success`，平台没有单独的「已拒绝」最终状态。**要确认这次工具调用是否被拒绝，看事件流里这次调用对应的结果消息。** 条目模式下看的是同一次调用的 `tool_result` 条目，靠 `call_id` 找到它。
+`policy_gate` 的两种来源：
+
+| 来源 | 拒绝之后 |
+|---|---|
+| 强制审批：这个工具被 Agent 配置列为必须人工批准，常见于高风险工具 | run 终止，续跑流 `end` 的 `exit_reason` 是 `approval_rejected` |
+| 工具调用审查：租户管理员为这个 Agent 开启了「工具调用审查」并选择转人工审批，平台在调用工具前发现这次调用与用户的请求不符，转给人确认 | 这次调用不执行，run 继续，Agent 收到被拒绝的结果后自行调整。同一步里还有强制审批的工具时，run 可能照样终止 |
+
+`approval` 事件和 `approval` 条目里没有字段能在决策之前区分这两种来源：两者的 `reason_kind` 都是 `policy_gate`，`action_summary` 的写法也一样。拒绝之后以续跑流的 `end` 为准：`exit_reason` 为 `approval_rejected` 表示 run 因这次拒绝终止；run 继续下去时，被拒绝的那次调用会作为一条 `kind` 为 `blocked_by_policy` 的记录出现在 `unresolved_failures` 里，之后对同一个对象的调用成功就算解决（「同一个对象」的含义见 [3.4 的 `end`](./sse-events#end)），一直没有解决时 `completed` 是 `false`。被拒绝的是只读的查询类工具时，不会留下这条记录。
+
+强制审批点被拒绝、run 就此终止时，`end` 事件的 `status` 仍然是 `success`，平台没有单独的「已拒绝」最终状态；同一个 `end` 里 `completed` 是 `false`、`exit_reason` 是 `approval_rejected`，据此就能知道这一轮因审批被拒绝而结束。**要确认被拒绝的是哪一次工具调用，看事件流里这次调用对应的结果消息。** 条目模式下看的是同一次调用的 `tool_result` 条目，靠 `call_id` 找到它。
+
+Agent 自己发起的确认被拒绝时，run 不会终止，结果按 `reason_kind` 分两种。`risk_confirmation`（风险确认）被拒绝，表示 Agent 请求要做的动作没有执行，平台会把这次审批对应的那次调用记为一条未解决的失败：`{"tool": "ask_for_approval", "kind": "blocked_by_policy"}`，`tool` 是 Agent 发起确认时调用的 `ask_for_approval`，不是它想做的那个动作。之后这次 run 里又有一次 `risk_confirmation` 被批准，这一条就算解决；否则这一轮结束时 `completed` 是 `false`，`unresolved_failures` 里有这一条。
+
+`missing_info`、`ambiguous_requirement`、`approach_choice` 这三类提问被拒绝，只是把答复交回给 Agent，不影响 `completed`，也不会出现在 `unresolved_failures` 里；它们被批准，也不会让上面那条记录算作解决。
 
 #### modified_args 的形状
 
