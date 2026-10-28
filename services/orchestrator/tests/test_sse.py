@@ -1304,6 +1304,43 @@ async def test_run_agent_binds_run_id_contextvar(fast_backoff: None) -> None:
 
 
 @pytest.mark.asyncio
+async def test_run_agent_binds_thread_id_contextvar(fast_backoff: None) -> None:
+    """B-175 P2-PR4 — the worker binds the run's conversation too (a knowledge
+    search stamps it on its log row, which a conversation purge deletes by)."""
+    from expert_work.common.context import get_current_thread_id
+
+    seen: list[Any] = []
+
+    @dataclass
+    class _ProbeGraph:
+        async def astream(
+            self, input: Any, config: Any = None, *, stream_mode: Any = None
+        ) -> AsyncIterator[Any]:
+            del input, config, stream_mode
+            seen.append(get_current_thread_id())
+            yield {"agent": {"step_count": 1}}
+
+        async def aget_state(self, config: Any) -> Any:
+            del config
+            return SimpleNamespace(values={})
+
+    bridge = InMemoryStreamBridge()
+    rm = RunManager()
+    record = await _new_record(rm)
+    await run_agent(
+        bridge=bridge,
+        run_manager=rm,
+        record=record,
+        graph=_ProbeGraph(),
+        graph_input={"messages": []},
+        config={},
+    )
+
+    assert seen == [record.thread_id]
+    assert get_current_thread_id() is None  # reset after the worker exits
+
+
+@pytest.mark.asyncio
 async def test_run_agent_emits_session_root_span() -> None:
     """10.1 — one ``expert_work.session.run`` root span wraps the whole run,
     carrying ``run_id`` / ``thread_id`` so a run becomes one connected trace."""

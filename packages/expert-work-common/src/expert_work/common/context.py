@@ -35,6 +35,10 @@ _current_run_id: Final[ContextVar[UUID | None]] = ContextVar(
     "expert_work_current_run_id",
     default=None,
 )
+_current_thread_id: Final[ContextVar[UUID | None]] = ContextVar(
+    "expert_work_current_thread_id",
+    default=None,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -117,3 +121,24 @@ def reset_current_run_id(token: Token[UUID | None]) -> None:
 def get_current_run_id() -> UUID | None:
     """Return the bound run id, or ``None`` outside a run worker."""
     return _current_run_id.get()
+
+
+# ---------------------------------------------------------------------------
+# thread_id — B-175 P2-PR4 (the run's conversation, bound with run_id)
+# ---------------------------------------------------------------------------
+
+
+def set_current_thread_id(thread_id: UUID) -> Token[UUID | None]:
+    """Bind the run's ``thread_id`` (the run worker binds it with the run id).
+    Return a reset token."""
+    return _current_thread_id.set(thread_id)
+
+
+def reset_current_thread_id(token: Token[UUID | None]) -> None:
+    """Restore the previous thread_id captured by ``token``."""
+    _current_thread_id.reset(token)
+
+
+def get_current_thread_id() -> UUID | None:
+    """Return the bound thread id, or ``None`` outside a run worker."""
+    return _current_thread_id.get()

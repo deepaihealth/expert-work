@@ -49,6 +49,8 @@ class CleanupReport:
     knowledge_tasks_deleted: int = 0
     # B-175 P3-PR2 —— 重新入库没能套回去满 30 天的分段修订行。
     knowledge_revisions_deleted: int = 0
+    # B-175 P2-PR4 — knowledge retrieval log rows past their window (30 days).
+    knowledge_retrieval_logs_deleted: int = 0
     duration_seconds: float = 0.0
     # Per-tenant breakdown of audit deletes (for observability).
     audit_deleted_by_tenant: dict[str, int] = field(default_factory=dict)

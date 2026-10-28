@@ -318,6 +318,7 @@ async def _describe(
         document_id=job.document_id,
         extraction=extraction,
         language=document_language(resolve_figures(text, {})),
+        before_call=job.recognizing,  # B-222: a cancelled document pays for no further figure
     )
     if outcome.originals:
         await job.recognizing()  # still ours before anything goes to storage (S-M2)

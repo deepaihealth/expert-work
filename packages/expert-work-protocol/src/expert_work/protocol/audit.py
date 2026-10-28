@@ -260,6 +260,8 @@ class AuditAction(StrEnum):
     # waited for recognition (recognized pages come from the cache).
     KNOWLEDGE_DOCUMENT_RECOGNIZE = "knowledge:document_recognize"
     KNOWLEDGE_DOCUMENT_DISCARD_PENDING = "knowledge:document_discard_pending"
+    # B-222 — stop an ingest in progress (one row per document cancelled).
+    KNOWLEDGE_DOCUMENT_CANCEL = "knowledge:document_cancel"
     # B-175 P3-PR2 — knowledge maintenance: document switches and batches, a
     # base's stale documents re-ingested, passage edits / additions / switches
     # / restores (passage writes are recorded on their document).

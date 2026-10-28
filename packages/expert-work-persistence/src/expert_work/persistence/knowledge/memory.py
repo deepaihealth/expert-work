@@ -13,6 +13,7 @@ from uuid import UUID, uuid4
 from expert_work.persistence.knowledge.base import (
     ALL_TENANTS_BASES_LIMIT,
     UNSET,
+    CancelOutcome,
     ClaimedIngestion,
     DocumentFileFacts,
     DuplicateKnowledgeBaseError,
@@ -631,7 +632,7 @@ class InMemoryKnowledgeStore(KnowledgeStore):
         document = await self.get_document(tenant_id=tenant_id, document_id=document_id)
         if document is None:
             return None
-        if document_id not in self._pending:
+        if document_id not in self._pending or _writing_chunks(document):
             return document
         del self._pending[document_id]
         serving = document.chunk_count > 0
@@ -650,6 +651,32 @@ class InMemoryKnowledgeStore(KnowledgeStore):
         self._documents[self._documents.index(document)] = restored
         self._lease[document_id] = None
         return restored
+
+    async def cancel_documents(
+        self, *, tenant_id: UUID, kb_id: UUID, document_ids: Sequence[UUID]
+    ) -> dict[UUID, CancelOutcome]:
+        outcomes: dict[UUID, CancelOutcome] = {}
+        now = datetime.now(UTC)
+        for document_id in dict.fromkeys(document_ids):
+            document = await self.get_document(tenant_id=tenant_id, document_id=document_id)
+            if document is None or document.kb_id != kb_id:
+                outcomes[document_id] = "not_found"
+            elif document.status not in _CANCELLABLE_STATUSES or _writing_chunks(document):
+                outcomes[document_id] = "not_cancellable"
+            else:
+                self._patch(
+                    tenant_id,
+                    document_id,
+                    {
+                        "status": DocumentStatus.CANCELLED,
+                        "error": _CANCELLED_ERROR,
+                        "ingest_generation": document.ingest_generation + 1,
+                        "updated_at": now,
+                    },
+                )
+                self._lease[document_id] = None
+                outcomes[document_id] = "cancelled"
+        return outcomes
 
     async def sweep_terminal(self, *, now: datetime, max_attempts: int) -> int:
         swept = 0
@@ -1437,6 +1464,17 @@ class InMemoryKnowledgeStore(KnowledgeStore):
             and c.content_hash in wanted
         }
 
+    async def has_chunks_off_model(
+        self, *, tenant_id: UUID, kb_id: UUID, embedding_model: str | None
+    ) -> bool:
+        return any(
+            c.tenant_id == tenant_id
+            and c.kb_id == kb_id
+            and c.chunk_type in SEARCHABLE_CHUNK_TYPES
+            and c.embedding_model != embedding_model
+            for c in self._chunks
+        )
+
     async def search(
         self,
         *,
@@ -1543,6 +1581,17 @@ def _created_key(record: KnowledgeBase | KnowledgeDocument) -> datetime:
 _EXHAUSTED_ERROR = "ingest attempts exhausted"
 #: ``error`` after discarding a pending upload when nothing was serving.
 _DISCARDED_ERROR = "pending upload discarded; nothing is serving"
+#: B-222 —— the statuses :meth:`InMemoryKnowledgeStore.cancel_documents` may
+#: stop (short of the point of no return, :func:`_writing_chunks`), and the
+#: ``error`` it writes (same text as the SQL store).
+_CANCELLABLE_STATUSES = (DocumentStatus.PENDING, DocumentStatus.PROCESSING)
+_CANCELLED_ERROR = "cancelled by user"
+
+
+def _writing_chunks(document: KnowledgeDocument) -> bool:
+    """B-222 —— past the point of no return: ``processing`` at ``indexing``,
+    whatever the lease (the SQL store's ``_writing_chunks``)."""
+    return document.status is DocumentStatus.PROCESSING and document.stage is IngestStage.INDEXING
 
 
 def _fence_matches(
