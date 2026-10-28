@@ -7,7 +7,7 @@ from collections.abc import Callable
 
 import httpx
 import pytest
-from behavior_client import ExternalClient, SseParser, StreamIncompleteError
+from behavior_client import ExternalClient, SseParser, StreamIncompleteError, TurnBuilder
 
 
 def _sse(*frames: tuple[str, object]) -> str:
@@ -136,6 +136,68 @@ async def test_run_turn_collects_tools_text_end_and_usage() -> None:
     assert (rec.input_tokens, rec.output_tokens) == (1200, 50)
 
 
+@pytest.mark.parametrize(
+    ("status", "artifact", "counted"),
+    [
+        pytest.param("success", {"exit_code": 2, "stdout": "", "stderr": "boom"}, 1, id="exit-2"),
+        pytest.param(
+            "success", {"exit_code": 1, "stdout": "", "stderr": "x"}, 1, id="exit-1-stderr"
+        ),
+        pytest.param(
+            "success", {"exit_code": 2, "stdout": "0\n", "stderr": ""}, 1, id="exit-2-stdout-only"
+        ),
+        pytest.param(
+            "success",
+            {"exit_code": -1, "timed_out": True, "stdout": "", "stderr": ""},
+            1,
+            id="timeout",
+        ),
+        pytest.param(
+            "success",
+            {"exit_code": 1, "timed_out": True, "stdout": "", "stderr": ""},
+            1,
+            id="silent-but-timed-out",
+        ),
+        # grep -c prints "0", diff prints the difference: exit 1 without stderr is a
+        # predicate that answered "no" — the platform does not count it either (B-226).
+        pytest.param(
+            "success",
+            {"exit_code": 1, "timed_out": False, "stdout": "0\n", "stderr": ""},
+            0,
+            id="predicate-with-stdout",
+        ),
+        # grep -q / a grep with no match.
+        pytest.param(
+            "success",
+            {"exit_code": 1, "timed_out": False, "stdout": "", "stderr": ""},
+            0,
+            id="silent-predicate",
+        ),
+        pytest.param("success", {"exit_code": 0, "stdout": "ok", "stderr": ""}, 0, id="exit-0"),
+        pytest.param("success", {"status_code": 404}, 0, id="no-exit-code"),
+        pytest.param("success", None, 0, id="no-artifact"),
+        pytest.param(
+            "error", {"exit_code": 2, "stdout": "", "stderr": "x"}, 1, id="error-counted-once"
+        ),
+    ],
+)
+def test_tool_errors_count_non_zero_exit_codes(status: str, artifact: object, counted: int) -> None:
+    """B-226 — a script's non-zero exit is a ``status="success"`` tool result whose meta
+    (``artifact``) carries the exit code; ``requires_tool_error`` must still see it."""
+    turn = TurnBuilder(1)
+    message = {
+        "type": "tool",
+        "name": "bash",
+        "status": status,
+        "content": "x",
+        "artifact": artifact,
+    }
+    turn.on_frame("updates", json.dumps({"tools": {"messages": [message]}}))
+    turn.on_frame("end", json.dumps({"status": "success", "run_id": "r1"}))
+
+    assert turn.result(0.0).tool_errors == counted
+
+
 @pytest.mark.asyncio
 async def test_run_turn_continues_session_and_keeps_usage_absent() -> None:
     frames = [f for f in _FRAMES if f[0] != "end"] + [
@@ -220,3 +282,69 @@ async def test_run_turn_counts_compaction_frames() -> None:
     assert rec.compactions == 2
     plain = _client(lambda request: httpx.Response(200, text=_sse(*_FRAMES)))
     assert (await plain.run_turn("eval-general", "u1", None, "p", [], 1))[0].compactions == 0
+
+
+def _hidden_human(content: str, **marks: bool) -> tuple[str, object]:
+    kwargs = {"expert_work_hide_from_ui": True, **marks}
+    message = {"type": "human", "content": content, "additional_kwargs": kwargs}
+    return ("updates", {"agent": {"messages": [{"type": "ai", "content": ""}, message]}})
+
+
+@pytest.mark.asyncio
+async def test_run_turn_counts_loop_detection_reminders() -> None:
+    """B-226 —— 原地打转被拦下 = agent 帧里那条隐藏提醒。新版本带标记;旧版本没有标记,
+    按提醒正文认(对照基线跑在旧版本上, 认不出来就整条用例都不可判)。"""
+    marked = _hidden_human("x", expert_work_loop_reminder=True)
+    legacy = _hidden_human(
+        "<system-reminder>Loop detected: the same tool call has been emitted 3 times in a row."
+    )
+    dispatch = _hidden_human("[structured dispatch] The plan marks these steps")
+    frames = [*_FRAMES[:2], marked, legacy, dispatch, *_FRAMES[2:]]
+
+    def loops(request: httpx.Request) -> httpx.Response:
+        del request
+        return httpx.Response(200, text=_sse(*frames))
+
+    def plain(request: httpx.Request) -> httpx.Response:
+        del request
+        return httpx.Response(200, text=_sse(*_FRAMES))
+
+    rec, _ = await _client(loops).run_turn("eval-general", "u1", None, "p", [], 1)
+    assert rec.loop_trips == 2
+    assert rec.final_text == "已改好"
+    assert (await _client(plain).run_turn("eval-general", "u1", None, "p", [], 1))[
+        0
+    ].loop_trips == 0
+
+
+@pytest.mark.asyncio
+async def test_run_turn_counts_step_budget_warning_frames() -> None:
+    """B-226 —— t04 的前提:进了步数预警窗口(``guard`` warning / max_steps 帧)。记下每条的
+    ``detail.max``:子代的预警带它自己的步数上限, 由 runner 只认主 Agent 的那条。"""
+    warnings = [
+        ("guard", {"kind": "warning", "guard": "max_steps", "detail": {"steps": 20, "max": 24}}),
+        ("guard", {"kind": "warning", "guard": "max_steps", "detail": {"steps": 5, "max": 6}}),
+    ]
+    others = [
+        (
+            "guard",
+            {"kind": "warning", "guard": "token_budget", "detail": {"spent": 8, "limit": 10}},
+        ),
+        ("guard", {"kind": "tripped", "guard": "max_steps", "detail": {"steps": 6, "max": 6}}),
+        ("guard", {"kind": "tripped", "guard": "max_steps", "detail": {"steps": 24, "max": 24}}),
+    ]
+    frames = [*_FRAMES[:2], *warnings, *others, *_FRAMES[2:]]
+
+    def guarded(request: httpx.Request) -> httpx.Response:
+        del request
+        return httpx.Response(200, text=_sse(*frames))
+
+    def plain(request: httpx.Request) -> httpx.Response:
+        del request
+        return httpx.Response(200, text=_sse(*_FRAMES))
+
+    rec, _ = await _client(guarded).run_turn("eval-tight-24", "u1", None, "p", [], 1)
+    assert rec.step_warning_maxes == [24, 6]
+    assert (await _client(plain).run_turn("eval-general", "u1", None, "p", [], 1))[
+        0
+    ].step_warning_maxes == []

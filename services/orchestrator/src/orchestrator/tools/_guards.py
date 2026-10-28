@@ -21,6 +21,12 @@ GUARD_SINK_KEY = "guard_event_sink"
 
 GuardSink = Callable[[dict[str, Any]], Awaitable[None]]
 
+#: B-226 ④ —— ``policies.max_no_progress`` 为 0(默认)时的平台规则:同一次运行里第二次
+#: 被 loop-detection 拦下就走无进展收尾。配了 N 就是第 N 次;都按本 run 累计, 中间干净的
+#: 轮次不清零。拦下之后提醒在同一个 run 里交回模型, 按「连续」算的话「打转 → 换个调用 →
+#: 再打转」会一路跑到步数上限。住在 tools 层:子代收尾说明(``_child_run``)也要用。
+DEFAULT_LOOP_TRIPS_PER_RUN = 2
+
 
 @dataclass
 class TokenBudget:

@@ -154,8 +154,8 @@ async def test_three_step_loop_tool_tool_final() -> None:
 async def test_max_steps_graceful_wrapup_when_llm_keeps_calling_tools() -> None:
     """LLM never finalises → at the budget the loop does ONE final tool-less
     wrap-up turn instead of raising, so the run ends cleanly without discarding
-    work (hermes-agent #7915). The wrap-up response has its tool_calls stripped
-    so the router goes to END."""
+    work (hermes-agent ``_handle_max_iterations``, commit 934318ba3a). The wrap-up
+    response has its tool_calls stripped so the router goes to END."""
     llm = _ScriptedLLM(
         responses=[
             AIMessage(

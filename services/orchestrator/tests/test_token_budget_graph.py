@@ -314,7 +314,12 @@ async def test_max_steps_trip_emits_guard_frame() -> None:
         guard_sink=publish,
     )
 
-    assert events == [{"kind": "tripped", "guard": "max_steps", "detail": {"steps": 2, "max": 2}}]
+    # B-226 ② — with 2 steps the whole run sits in the step-notice window, so
+    # the one-shot warning lands on the first step, before the trip.
+    assert events == [
+        {"kind": "warning", "guard": "max_steps", "detail": {"steps": 0, "max": 2}},
+        {"kind": "tripped", "guard": "max_steps", "detail": {"steps": 2, "max": 2}},
+    ]
 
 
 @pytest.mark.asyncio
@@ -334,7 +339,7 @@ async def test_no_progress_trip_emits_guard_frame() -> None:
             "messages": [HumanMessage(content="go")],
             "step_count": 0,
             "max_steps": 20,
-            "no_progress_streak": 2,
+            "loop_trip_count": 2,
             "max_no_progress": 2,
         },
         thread_id="tb-noprogress",

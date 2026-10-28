@@ -20,7 +20,9 @@ CASES_DIR = DATASET_DIR / "cases"
 FIXTURES_DIR = DATASET_DIR / "fixtures"
 AGENTS_DIR = DATASET_DIR / "agents"
 
-AgentCode = Literal["eval-general", "eval-ahp", "eval-compress", "eval-kb"]
+AgentCode = Literal[
+    "eval-general", "eval-ahp", "eval-compress", "eval-kb", "eval-tight", "eval-tight-24"
+]
 
 
 class _Strict(BaseModel):
@@ -30,7 +32,18 @@ class _Strict(BaseModel):
 # --- 判据(规格 §6)-------------------------------------------------------
 
 
-class Completed(_Strict):
+class _Waivable(_Strict):
+    #: B-226 t04 —— 最后一轮按列出的任一出口结束时这条记过(「一直做到步数上限 / token 预算
+    #: 用完」也算没提前收手)。YAML 里可以只写一个值。
+    unless_exit_reason: list[str] | None = None
+
+    @field_validator("unless_exit_reason", mode="before")
+    @classmethod
+    def _one_or_many(cls, value: Any) -> Any:
+        return [value] if isinstance(value, str) else value
+
+
+class Completed(_Waivable):
     type: Literal["completed"]
 
 
@@ -73,7 +86,8 @@ class FinalTextRegex(_Strict):
 
 
 class FinalTextNotRegex(_Strict):
-    """最后一轮回复里**没有**匹配 ``pattern`` 的地方(B-175 P4 k05:编出来的月份)。"""
+    """最后一轮回复里**没有**匹配 ``pattern`` 的地方(B-175 P4 k05:编出来的月份;B-226:谎报
+    「已登记」「已变为 READY」,用后顾断言 ``(?<!没有)`` 等放过如实的否定句)。"""
 
     type: Literal["final_text_not_regex"]
     pattern: str = Field(min_length=1)
@@ -101,7 +115,7 @@ def _text_readable(name: str) -> str:
     return name
 
 
-class ArtifactContains(_Strict):
+class ArtifactContains(_Waivable):
     type: Literal["artifact_contains"]
     name: str = Field(min_length=1)
     all: list[str] = Field(min_length=1)
@@ -149,7 +163,7 @@ class WorkspaceFileUnchangedLines(_Strict):
     except_lines: list[int] = Field(default_factory=list)
 
 
-class WorkspaceFileLineCount(_Strict):
+class WorkspaceFileLineCount(_Waivable):
     """工作区文件里匹配 ``pattern``(逐行 ``re.search``)的行数恰好是 ``count``。
 
     B-141:抓「重做一步」(同一行出现两次)和「漏一步」(该有的行没有)。
@@ -271,7 +285,9 @@ class Turn(_Strict):
 
 
 class Case(_Strict):
-    id: str = Field(pattern=r"^[ghck][0-9]{2}-[a-z0-9-]+$")
+    #: 首字母 = 智能体:g 通用、h ahp、c 压缩、k 知识库 ``eval-kb``、
+    #: t 步数上限很紧的 ``eval-tight``(B-226)。
+    id: str = Field(pattern=r"^[ghckt][0-9]{2}-[a-z0-9-]+$")
     agent: AgentCode
     shape: str = Field(min_length=1)  # 出处:ROADMAP 编号
     fixtures: list[str] = Field(default_factory=list)
@@ -283,6 +299,29 @@ class Case(_Strict):
     #: B-163 —— 用例测的是工具中途失败之后怎么接着做:整次运行一次失败的工具调用都没有
     #: (模型先列目录绕开了那次失败)就判「不可判」, 理由同上。
     requires_tool_error: bool = False
+    #: B-226 —— 用例测的是某个出口之后的行为(撞步数上限之后的收尾):最后一轮结束帧的
+    #: ``exit_reason`` 不是这个值(模型提前做完 / 换了出口)就判「不可判」, 理由同上。
+    requires_exit_reason: str | None = None
+    #: B-226 —— 用例测的是原地打转被拦下之后的行为:整次运行一次都没被拦下就判「不可判」。
+    requires_loop_trip: bool = False
+    #: B-226 —— 用例测的是「什么都没登记」时的收尾:登记了名字匹配这个通配的产物(模型照步数
+    #: 预警提前登记了)就判「不可判」—— 那是另一种结局, 不算这条用例不过。
+    requires_no_artifact: str | None = None
+    #: B-226 —— 用例测的是步数预警之后的行为:整次运行主 Agent 一条步数预警(``guard``
+    #: warning / max_steps 帧, ``detail.max`` 是它的步数上限)都没有就判「不可判」(提前做完了,
+    #: 没进预警窗口);子代的预警带子代自己的上限, 不算。
+    requires_step_warning: bool = False
+
+
+#: 协议 ``spec.workflow.max_iterations`` 的默认值(test_behavior_dataset 钉住两边一致)。
+DEFAULT_MAX_STEPS = 30
+
+
+def agent_max_steps(agent: str, agents_dir: Path = AGENTS_DIR) -> int:
+    """B-226 —— 评测智能体主 Agent 的步数上限:它 manifest 里的 ``spec.workflow.max_iterations``。"""
+    raw = yaml.safe_load((agents_dir / f"{agent}.yaml").read_text(encoding="utf-8"))
+    workflow = (raw.get("spec") or {}).get("workflow") or {}
+    return int(workflow.get("max_iterations", DEFAULT_MAX_STEPS))
 
 
 def load_case(path: Path) -> Case:
@@ -354,6 +393,10 @@ class TurnRecord(_Strict):
     output_tokens: int | None = None
     wall_s: float = 0.0
     compactions: int = 0  # 本轮 ``compaction`` 帧个数(帧对外可见,没有帧 = 没压缩)
+    loop_trips: int = 0  # B-226 —— 本轮原地打转被拦下几次(agent 帧里那条隐藏提醒)
+    #: B-226 —— 本轮每条 ``guard`` warning / max_steps 帧的 ``detail.max``:子代的预警带它
+    #: 自己的步数上限, 主 Agent 那条的上限 = ``agent_max_steps(case.agent)``。
+    step_warning_maxes: list[int] = Field(default_factory=list)
 
 
 class RunRecord(_Strict):

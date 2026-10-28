@@ -173,6 +173,9 @@ class SubAgentTool:
                         "saturated; retry later or complete the work without delegating]"
                     ),
                     meta={"delegation_gated": True, "reason": "global_gate_timeout"},
+                    # B-226 ③ — same gate as spawn_worker: retry-later jitter.
+                    failed=True,
+                    failure_transient=True,
                 )
         try:
             child = await self.builder(

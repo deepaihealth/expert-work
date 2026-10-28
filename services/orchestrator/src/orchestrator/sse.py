@@ -109,7 +109,7 @@ from orchestrator.stream_items import (
 from orchestrator.tools._budget import DELEGATION_GATE_KEY, DelegationGate
 from orchestrator.tools._guards import GUARD_SINK_KEY, TOKEN_BUDGET_KEY, TokenBudget
 from orchestrator.tools._worker_events import WORKER_EVENT_SINK_KEY
-from orchestrator.tools.artifact import ARTIFACT_RECORDER_KEY
+from orchestrator.tools.artifact import ARTIFACT_RECORDER_KEY, ArtifactRecorder
 from orchestrator.tools.spawn_worker import WorkerSpawnBudget
 from orchestrator.trajectory import (
     TrajectoryOutcome,
@@ -490,7 +490,7 @@ async def run_agent(
     # 产物清单契约 —— 本 run 的产物登记累积器(name 去重、后登记覆盖,与
     # 前端产物 chips 的 newest-wins 同义)。resume(审批续跑)先把 PAUSED 时
     # 固化的清单读回来接着记,否则续跑段会把暂停前的登记整表覆盖掉。
-    artifact_manifest: dict[str, dict[str, Any]] = {}
+    artifact_manifest = ArtifactRecorder()
     if getattr(record, "is_resume", False):
         # 续跑清单来源两级:审批 continuation 是**新** run_id,父 run 的清单
         # 由 decide 端点挂在 ``record.seed_artifacts``;fallback 读自己的行,
@@ -500,13 +500,9 @@ async def run_agent(
             seeded = await run_manager.persisted_artifacts(run_id, tenant_id=record.tenant_id)
         for e in seeded or []:
             if isinstance(e, dict) and e.get("name"):
-                artifact_manifest[str(e["name"])] = dict(e)
+                artifact_manifest(dict(e))
 
-    def _record_artifact(entry: dict[str, Any]) -> None:
-        artifact_manifest[str(entry.get("name"))] = entry
-
-    def _manifest_snapshot() -> list[dict[str, Any]]:
-        return list(artifact_manifest.values())
+    _manifest_snapshot = artifact_manifest.snapshot
 
     session_started = time.monotonic()
     session_outcome = "error"
@@ -645,7 +641,7 @@ async def run_agent(
     effective_config["configurable"][TOKEN_SINK_KEY] = _publish_token
     effective_config["configurable"][WORKER_EVENT_SINK_KEY] = _publish_worker
     effective_config["configurable"][GUARD_SINK_KEY] = _publish_guard
-    effective_config["configurable"][ARTIFACT_RECORDER_KEY] = _record_artifact
+    effective_config["configurable"][ARTIFACT_RECORDER_KEY] = artifact_manifest
     if token_budget > 0:
         effective_config["configurable"][TOKEN_BUDGET_KEY] = TokenBudget(limit=token_budget)
     # Stream 9.4 (HA failover) — renew the ownership lease while executing so a

@@ -109,7 +109,7 @@ metrics: [tokens_in, tokens_out, tool_calls, wall_s]
 | `not_completed` | 最后一轮结束帧**明确**记了 `completed == false`(缺记录不算)。反向守卫:写类失败的账必须还在(g13) |
 | `exit_reason` | 指定结束方式(诚实报不能完成的任务要 `text_response` + 文本判据) |
 | `final_text_contains` / `final_text_regex` / `final_text_not_contains` | 最后一轮回复 |
-| `final_text_not_regex` | 最后一轮回复里**没有**匹配某正则的地方(B-175 P4 k05:说了「没有」却仍编出月份) |
+| `final_text_not_regex` | 最后一轮回复里**没有**匹配某正则的地方(B-175 P4 k05:说了「没有」却仍编出月份;B-226:谎报「已登记」「已变为 READY」,用后顾断言 `(?<!没有)` 等放过如实的否定句) |
 | `artifact_exists` | 产物按名字(或 glob)存在 |
 | `artifact_contains` / `artifact_not_contains` | 产物文本(`.docx` / `.pptx` / `.pdf` 本机抽文本后判) |
 | `artifact_unchanged_lines` | 与开局文件逐行比,除指定行外不变(抓「整篇重写顺手改坏别处」) |
@@ -129,7 +129,7 @@ metrics: [tokens_in, tokens_out, tool_calls, wall_s]
 - 指标(输入 / 输出 token、工具调用数、墙钟)比**中位数**,涨跌超过 20% 标出;
 - `compare.py` 有稳定退步时退出码 1,方便放进发版前的检查步骤;
 - 对照表另附一段「每个任务每次的判定明细」,定位到哪条判据翻了。
-- **不可判**(B-141):用例写 `requires_compaction: true`,而这次运行整次一次 `compaction` 帧都没有 —— 判据测不到它要测的东西,这次记「不可判」(判据照常算出来留作排查),与 `infra_error` 一样**不计入**过 / 不过,对照表里写成「2/2(另 1 次不可判)」。客户端逐轮数 `compaction` 帧,写进轮指标与整次指标(`compactions`)。
+- **不可判**(B-141):用例写 `requires_compaction: true`,而这次运行整次一次 `compaction` 帧都没有 —— 判据测不到它要测的东西,这次记「不可判」(判据照常算出来留作排查),与 `infra_error` 一样**不计入**过 / 不过,对照表里写成「2/2(另 1 次不可判)」。客户端逐轮数 `compaction` 帧,写进轮指标与整次指标(`compactions`)。同一口径(B-226):`requires_exit_reason: <值>` —— 最后一轮结束帧的 `exit_reason` 不是这个值就不可判;`requires_loop_trip: true` —— 整次一次原地打转都没被拦下(客户端逐轮数 agent 帧里那条隐藏的 loop-detection 提醒,`loop_trips`)就不可判;`requires_no_artifact: <glob>` —— 登记了名字匹配的产物(测「什么都没登记时的收尾」,模型却提前登记了)就不可判;`requires_step_warning: true` —— 整次主 Agent 一条步数预警帧都没有就不可判(客户端逐轮记下每条 `guard` warning / max_steps 帧的 `detail.max`,即 `step_warning_maxes`;只认等于该评测智能体 manifest 步数上限的那条,子代的预警带它自己的上限、不算)。判据可带 `unless_exit_reason: <值或列表>`(`completed` / `artifact_contains` / `workspace_file_line_count`):最后一轮按列出的任一出口结束时这条记过并写明原因(t04:一直做到步数上限或 token 预算用完也算没提前收手)。
 
 ### 三种对照方式
 

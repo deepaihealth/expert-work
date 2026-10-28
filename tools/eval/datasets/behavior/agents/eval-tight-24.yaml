@@ -1,0 +1,47 @@
+# B-226 步数预警评测智能体 —— eval-general 的副本,只把步数上限设成 24 步:预警窗口是最后
+# max(2, 24 // 6) = 4 步(第 21~24 次调用),比 eval-tight 宽,t04 才有「预警之后还剩台账要做」。
+# 用控制台登录态导入测试环境的对接方租户(规格 §8;新建智能体只能走控制台平面)。
+apiVersion: expert_work.io/v1
+kind: Agent
+metadata:
+  name: eval-tight-24
+  version: "1.0.0"
+  tenant: b140-eval
+spec:
+  description: B-226 步数预警评测用的通用智能体(合成任务专用,步数上限 24)。
+  tenant_config:
+    isolation_level: dedicated_sandbox
+  model:
+    provider: glm
+    name: glm-5.3
+    temperature: 0.2
+    max_tokens: 32768  # 同 eval-general
+  system_prompt:
+    template: |
+      你是一个通用的办公助手,在工作区里读写文件、运行脚本,完成用户交代的任务。
+      做完后用一两句话说明结果;做不到的事情如实说明原因,不要编造。
+  tools:
+    - { type: builtin, name: read_file }
+    - { type: builtin, name: write_file }
+    - { type: builtin, name: edit_file }
+    - { type: builtin, name: search_files }
+    - { type: builtin, name: exec_python }
+    - { type: builtin, name: bash }
+    - { type: builtin, name: save_artifact }
+  # 与 eval-general 唯一的不同:步数上限 24(见文件头)。
+  workflow:
+    max_iterations: 24
+  policies:
+    token_budget: 400000
+  sandbox:
+    runtime: gvisor
+    resources:
+      cpu: "0.5"
+      memory: 512Mi
+    network:
+      egress: none
+    filesystem:
+      readonly_root: true
+      writable:
+        - /tmp
+      persistent_workspace: true
