@@ -467,6 +467,7 @@ async def _collect_replay(
     run_artifacts: list[dict[str, Any]] | None = None,
     run_completed: bool | None = None,
     run_exit_reason: str | None = None,
+    run_unresolved_failures: list[dict[str, Any]] | None = None,
     load_usage: Callable[[], Awaitable[list[dict[str, Any]] | None]] | None = None,
 ) -> tuple[list[tuple[str | None, str, Any]], int | None]:
     plan = await build_event_producer(
@@ -475,6 +476,7 @@ async def _collect_replay(
         run_artifacts=run_artifacts,
         run_completed=run_completed,
         run_exit_reason=run_exit_reason,
+        run_unresolved_failures=run_unresolved_failures,
         event_store=store,
         stream_bridge=InMemoryStreamBridge(),
         since_seq=since_seq,
@@ -768,22 +770,54 @@ async def test_both_sse_paths_emit_the_same_end_shape() -> None:
     )
 
 
-@pytest.mark.asyncio
-async def test_both_sse_paths_carry_the_completion_signal() -> None:
-    """防分叉哨兵的**正向**对照 —— B-85 ③ 的两个字段真的存在时也必须两边都带。
+class _LedgerEntry:
+    """Shaped like ``ClassifiedToolError``, tenant content included on purpose."""
 
-    上面那条哨兵跑的是一个 ``INTERRUPTED`` 的 run,图状态是空的,于是两个新字段
+    tool_name = "bash"
+    error_class = "unknown"
+    summary = "stderr: secret customer row"
+    path = "/workspace/客户资料.xlsx"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("graph_values", "status", "completed", "failures"),
+    [
+        # 本条最要命的那个组合:``status="success"`` 而 ``completed=false`` ——
+        # 图跑完了没抛异常,但 run 里还有没被抵消掉的工具失败,事没做成。
+        # B-226 ⑥:这一格**不是** incomplete(自然结束),失败清单说出是哪个工具。
+        (
+            {"exit_reason": "text_response", "unresolved_failures": [_LedgerEntry()]},
+            "success",
+            False,
+            [{"tool": "bash", "kind": "unknown"}],
+        ),
+        # B-226 ⑥:平台的限制叫停 → 对外 ``incomplete``,两条路径一致。
+        ({"exit_reason": "max_steps", "unresolved_failures": []}, "incomplete", False, []),
+        ({"exit_reason": "text_response", "unresolved_failures": []}, "success", True, []),
+    ],
+)
+async def test_both_sse_paths_carry_the_completion_signal(
+    graph_values: dict[str, Any],
+    status: str,
+    completed: bool,
+    failures: list[dict[str, str]],
+) -> None:
+    """防分叉哨兵的**正向**对照 —— B-85 ③ 的字段真的存在时也必须两边都带。
+
+    上面那条哨兵跑的是一个 ``INTERRUPTED`` 的 run,图状态是空的,于是新字段
     在**两条路径上都缺席** —— 缺席 == 缺席,那一格**在不可能失败的条件下成立**:
     哪怕我只给其中一条路径接线,它照样绿。这一条把字段真的放进去再比一次。
 
-    同时钉住本条最要命的那个组合:``status="success"`` 而 ``completed=false`` ——
-    图跑完了没抛异常,但 run 里还有没被抵消掉的工具失败,事没做成。
+    重放路径读的是 ``run_agent`` 真写下的 run 行(带 store 的 RunManager),所以
+    这一条同时证明 sse.py 把 ``unresolved_failures`` 落了库。
     """
-    from expert_work.runtime.runs import RunManager
+    from expert_work.runtime.runs import InMemoryRunStore, RunManager
     from orchestrator.sse import run_agent, sse_consumer
 
     bridge = InMemoryStreamBridge()
-    rm = RunManager()
+    run_store = InMemoryRunStore()
+    rm = RunManager(store=run_store)
     record = await rm.create(
         run_id=uuid4(),
         thread_id=uuid4(),
@@ -792,12 +826,7 @@ async def test_both_sse_paths_carry_the_completion_signal() -> None:
     )
     store = InMemoryRunEventStore()
 
-    class _FailedBatch:
-        """``unresolved_failures`` 只看有没有,不看内容(见 compute_completed)。"""
-
-        error_class = "tool_error"
-
-    class _StoppedAfterAFailureGraph:
+    class _FinishedGraph:
         async def astream(
             self, _input: Any, _config: Any = None, *, stream_mode: str = "updates"
         ) -> AsyncIterator[Any]:
@@ -806,20 +835,22 @@ async def test_both_sse_paths_carry_the_completion_signal() -> None:
         async def aget_state(self, _config: Any) -> Any:
             from types import SimpleNamespace
 
-            return SimpleNamespace(
-                values={"exit_reason": "text_response", "unresolved_failures": [_FailedBatch()]}
-            )
+            return SimpleNamespace(values=graph_values)
 
     await run_agent(
         bridge=bridge,
         run_manager=rm,
         record=record,
-        graph=_StoppedAfterAFailureGraph(),
+        graph=_FinishedGraph(),
         graph_input={"messages": []},
         config={},
         event_store=store,
     )
-    assert rm.get(record.run_id).status is RunStatus.SUCCESS  # 前置条件:status 没被动过
+    assert rm.get(record.run_id).status is RunStatus.SUCCESS  # 前置条件:内部 status 没被动过
+    row = await run_store.get(run_id=record.run_id, tenant_id=record.tenant_id)
+    assert row is not None
+    assert row.status is RunStatus.SUCCESS, "agent_run.status stays success (D1: storage unchanged)"
+    assert row.unresolved_failures == failures
 
     async def _never_disconnected() -> bool:
         return False
@@ -837,14 +868,15 @@ async def test_both_sse_paths_carry_the_completion_signal() -> None:
         ]
     )
     # 重放路径从 run 行取值 —— 生产调用方(runs.py / external_events.py)传的就是
-    # 同一行上的三列,测试帮手镜像同一契约。
+    # 同一行上的这几列,测试帮手镜像同一契约。
     events_frames, _ = await _collect_replay(
         run_id=record.run_id,
         store=store,
-        run_status=RunStatus.SUCCESS,
-        run_artifacts=[],
-        run_completed=False,
-        run_exit_reason="text_response",
+        run_status=row.status,
+        run_artifacts=row.artifacts,
+        run_completed=row.completed,
+        run_exit_reason=row.exit_reason,
+        run_unresolved_failures=row.unresolved_failures,
     )
 
     consumer_end = consumer_frames[-1][2]
@@ -853,9 +885,11 @@ async def test_both_sse_paths_carry_the_completion_signal() -> None:
         f"两条流的 end 帧字段集合分叉了:sse_consumer={consumer_end!r} vs GET events={events_end!r}"
     )
     assert consumer_end == events_end
-    assert consumer_end["status"] == "success", "status 一个字都不许动"
-    assert consumer_end["completed"] is False
-    assert consumer_end["exit_reason"] == "text_response"
+    assert consumer_end["status"] == status
+    assert consumer_end["completed"] is completed
+    assert consumer_end["exit_reason"] == graph_values["exit_reason"]
+    assert consumer_end["unresolved_failures"] == failures
+    assert "secret" not in repr(consumer_end) and "客户资料" not in repr(consumer_end)
 
 
 # ---------------------------------------------------------------------------
@@ -1012,9 +1046,18 @@ def test_end_status_vocabulary_round_trip() -> None:
         f"RunStatus 终态与映射表不闭合:缺 {TERMINAL_RUN_STATUSES - set(_RUN_STATUS_END_STATUS)},"
         f"多 {set(_RUN_STATUS_END_STATUS) - TERMINAL_RUN_STATUSES}"
     )
-    # ②③ 两张表的值都必须落在对外四值词表里。
+    # ②③ 两张表的值都必须落在对外词表里。
     assert set(_RUN_STATUS_END_STATUS.values()) <= EXTERNAL_END_STATUSES
     assert set(_EXTERNAL_END_STATUS.values()) <= EXTERNAL_END_STATUSES
+    # B-226 ⑥ —— ``incomplete`` is derived (success + a budget exit), never a
+    # map value; every derivation over every exit stays inside the closed set.
+    from expert_work.runtime.runs import RUN_EXIT_REASONS, external_run_status
+
+    assert "incomplete" in EXTERNAL_END_STATUSES
+    assert "incomplete" not in set(_RUN_STATUS_END_STATUS.values())
+    for base in set(_RUN_STATUS_END_STATUS.values()) | set(_EXTERNAL_END_STATUS.values()):
+        for reason in (*RUN_EXIT_REASONS, None):
+            assert external_run_status(base, reason) in EXTERNAL_END_STATUSES, (base, reason)
 
     # ④ sse.py 里赋值过的每个 session_outcome 字面量都必须是 _EXTERNAL_END_STATUS 的键。
     literals = _session_outcome_literals()
@@ -1285,6 +1328,7 @@ async def test_make_run_probe_reads_row_and_survives_vanish() -> None:
             artifacts=manifest,
             completed=False,
             exit_reason="text_response",
+            unresolved_failures=[{"tool": "bash", "kind": "unknown"}],
         )
     )
     probe = make_run_probe(runs=store, run_id=run_id, tenant_id=tenant_id)  # type: ignore[arg-type]
@@ -1295,6 +1339,8 @@ async def test_make_run_probe_reads_row_and_survives_vanish() -> None:
     # 的 end 帧会比 live 分支少两个字段,正是这条流反复出过的分叉形态。
     assert probed.completed is False
     assert probed.exit_reason == "text_response"
+    # B-226 ⑥ —— the same rule for the failure ledger view.
+    assert probed.unresolved_failures == [{"tool": "bash", "kind": "unknown"}]
     assert store.calls == [(run_id, tenant_id)]
 
     # run 行中途消失(purge 极端路径)—— 按 interrupted 收流,轮询不挂死。
@@ -1305,6 +1351,7 @@ async def test_make_run_probe_reads_row_and_survives_vanish() -> None:
     assert gone.status is RunStatus.INTERRUPTED
     assert gone.artifacts is None
     assert gone.completed is None and gone.exit_reason is None
+    assert gone.unresolved_failures is None
 
 
 def test_event_page_limit_stays_within_the_store_clamp() -> None:

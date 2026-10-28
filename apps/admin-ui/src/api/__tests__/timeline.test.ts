@@ -185,6 +185,37 @@ describe("parseTimeline", () => {
     }
   });
 
+  it("B-226 ⑥ — success + completed=false is a warn marker, not 运行完成", () => {
+    const stopped = parseTimeline([
+      ev("end", { status: "success", run_id: "r1", completed: false, exit_reason: "max_steps" }, "t1"),
+    ]);
+    expect(stopped[0]).toMatchObject({
+      kind: "end",
+      text: "已结束，未完成（步数用完）",
+      tone: "warn",
+    });
+    // The end frame now says ``incomplete`` for such a run: same marker.
+    const incomplete = parseTimeline([
+      ev("end", { status: "incomplete", run_id: "r1", completed: false, exit_reason: "max_steps" }, "t1"),
+    ]);
+    expect(incomplete[0]).toMatchObject({
+      kind: "end",
+      text: "已结束，未完成（步数用完）",
+      tone: "warn",
+    });
+    // completed=true and an absent field (an older run) keep the green marker.
+    for (const data of [
+      { status: "success", run_id: "r1", completed: true, exit_reason: "text_response" },
+      { status: "success", run_id: "r1" },
+    ]) {
+      expect(parseTimeline([ev("end", data, "t1")])[0]).toMatchObject({
+        kind: "end",
+        text: "运行完成",
+        tone: "good",
+      });
+    }
+  });
+
   it("falls back to 运行完成 for a legacy end frame with null data", () => {
     const items = parseTimeline([ev("end", null, "t1")]);
     expect(items[0]).toMatchObject({ kind: "end", text: "运行完成", tone: "good" });

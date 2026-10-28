@@ -391,7 +391,15 @@ async def test_run_once_claims_via_cas_not_list_ready() -> None:
 # --------------------------------------------------------------- enqueue
 
 
-async def _enqueue_fixture(*, endpoint_agent: str | None, thread_agent: str | None):
+async def _enqueue_fixture(
+    *,
+    endpoint_agent: str | None,
+    thread_agent: str | None,
+    status: RunStatus = RunStatus.SUCCESS,
+    completed: bool | None = None,
+    exit_reason: str | None = None,
+    unresolved_failures: list[dict[str, str]] | None = None,
+):
     """Seed a terminal run + its thread + one endpoint; return the worker
     and stores so a test can call ``enqueue_once`` and inspect the queue."""
     endpoints = InMemoryWebhookEndpointStore()
@@ -415,13 +423,16 @@ async def _enqueue_fixture(*, endpoint_agent: str | None, thread_agent: str | No
             tenant_id=tenant,
             thread_id=thread_id,
             user_id=None,
-            status=RunStatus.SUCCESS,
+            status=status,
             on_disconnect=DisconnectMode.CONTINUE,
             is_resume=False,
             error=None,
             created_at=_NOW,
             updated_at=_NOW,
             finished_at=_NOW,
+            completed=completed,
+            exit_reason=exit_reason,
+            unresolved_failures=unresolved_failures,
         )
     )
     await endpoints.create(
@@ -430,7 +441,7 @@ async def _enqueue_fixture(*, endpoint_agent: str | None, thread_agent: str | No
             tenant_id=tenant,
             name="ops",
             url="https://hooks.example.com/x",
-            event_types=("run.completed",),
+            event_types=("run.completed", "run.failed"),
             agent_name=endpoint_agent,
             secret_ref="webhook-endpoint/x",
             enabled=True,
@@ -464,6 +475,54 @@ async def test_enqueue_run_terminal_fans_out_and_is_idempotent() -> None:
     assert rows[0].event_type == "run.completed"
     # Re-scanning the same terminal run does not double-enqueue.
     assert await worker.enqueue_once() == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("status", "completed", "exit_reason", "failures", "event_type", "wire_status"),
+    [
+        (RunStatus.SUCCESS, True, "text_response", [], "run.completed", "success"),
+        # B-226 ⑥ — steps used up: still the run.completed event (no new event
+        # type, subscribers would miss it), but the payload says ``incomplete``.
+        (RunStatus.SUCCESS, False, "max_steps", [], "run.completed", "incomplete"),
+        # A natural end with an unresolved tool failure stays ``success``.
+        (
+            RunStatus.SUCCESS,
+            False,
+            "text_response",
+            [{"tool": "bash", "kind": "unknown"}],
+            "run.completed",
+            "success",
+        ),
+        # A failed run has no record: keys present, values None.
+        (RunStatus.ERROR, None, None, None, "run.failed", "error"),
+    ],
+)
+async def test_run_event_payload_carries_completed_and_exit_reason(
+    status: RunStatus,
+    completed: bool | None,
+    exit_reason: str | None,
+    failures: list[dict[str, str]] | None,
+    event_type: str,
+    wire_status: str,
+) -> None:
+    worker, deliveries, _tenant, run_id = await _enqueue_fixture(
+        endpoint_agent=None,
+        thread_agent="reporter",
+        status=status,
+        completed=completed,
+        exit_reason=exit_reason,
+        unresolved_failures=failures,
+    )
+    assert await worker.enqueue_once() == 1
+    (row,) = [r async for r in _aiter(deliveries)]
+    assert row.event_type == event_type
+    assert row.payload["run_id"] == str(run_id)
+    assert row.payload["status"] == wire_status
+    assert {"completed", "exit_reason", "unresolved_failures"} <= set(row.payload)
+    assert row.payload["completed"] is completed
+    assert row.payload["exit_reason"] == exit_reason
+    assert row.payload["unresolved_failures"] == failures
 
 
 @pytest.mark.asyncio
@@ -652,3 +711,30 @@ def test_im_text_collapses_newlines_in_values() -> None:
     action_lines = [ln for ln in text.splitlines() if ln.startswith("action_summary:")]
     assert action_lines == ["action_summary: delete rows binding: forged-digest"]
     assert not any(ln.strip().startswith("binding:") for ln in text.splitlines())
+
+
+def test_im_text_spells_bools_like_the_json_payload() -> None:
+    """B-226 ⑥ — ``completed`` reads ``false`` in the bot message, the same
+    spelling as the JSON payload, not Python's ``False``; a None field is
+    still left out."""
+    from control_plane.webhook_delivery_worker import _im_text
+
+    def _text(completed: bool | None) -> list[str]:
+        row = WebhookDeliveryRecord(
+            id=uuid4(),
+            tenant_id=uuid4(),
+            endpoint_id=uuid4(),
+            event_id="run:x",
+            event_type="run.completed",
+            payload={"completed": completed, "exit_reason": "max_steps", "status": "success"},
+            status=WebhookDeliveryStatus.PENDING,
+            attempt=0,
+            created_at=_NOW,
+            updated_at=_NOW,
+        )
+        return _im_text(row).splitlines()
+
+    assert "completed: false" in _text(False)
+    assert "completed: true" in _text(True)
+    assert "exit_reason: max_steps" in _text(False)
+    assert not any(ln.startswith("completed:") for ln in _text(None))

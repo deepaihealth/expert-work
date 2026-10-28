@@ -7,6 +7,7 @@
  * endpoints that returns the raw payload (no envelope) — see :func:`getRun`.
  */
 import { apiClient, unwrap, withTenantScope, type ApiEnvelope, type TenantScope } from "./client";
+import type { UnresolvedFailure } from "./run_completion";
 import { seqOf } from "./sse_id";
 
 export type RunStatus =
@@ -122,6 +123,15 @@ export interface RunDetail {
    *  only in the in-memory RunManager); the summary derives duration. */
   created_at?: string | null;
   finished_at?: string | null;
+  /** B-226 ⑥ — ``status`` says the run finished, ``completed`` says the request
+   *  was done (a run that used up its steps is ``success`` + ``false``).
+   *  ``null`` / absent = no record (usually error / interrupted / old run; a
+   *  paused run voided by a new turn is ``interrupted`` but keeps ``false`` /
+   *  ``approval_pending``). */
+  completed?: boolean | null;
+  exit_reason?: string | null;
+  /** B-226 ⑥ — why not done: ``[{tool, kind}]``; ``null`` / absent = no record. */
+  unresolved_failures?: UnresolvedFailure[] | null;
 }
 
 /** Raw (no envelope) fetch — runs.py historically returns the run
@@ -310,6 +320,12 @@ export interface ThreadRunSummary {
   supersededBy: string | null;
   /** P-1 —— 这一轮是对哪个旧 run 的重新生成 / 编辑重发;``null`` = 普通一轮。 */
   regeneratedFrom: string | null;
+  /** B-226 ⑥ — the row's ``completed`` / ``exit_reason``, so a history turn shows
+   *  "finished, not completed" before its events are replayed. ``null`` /
+   *  absent = no record. */
+  completed?: boolean | null;
+  exitReason?: string | null;
+  unresolvedFailures?: UnresolvedFailure[] | null;
 }
 
 interface ThreadRunRow {
@@ -322,6 +338,9 @@ interface ThreadRunRow {
   tokens?: RunTokens | null;
   superseded_by?: string | null;
   regenerated_from?: string | null;
+  completed?: boolean | null;
+  exit_reason?: string | null;
+  unresolved_failures?: UnresolvedFailure[] | null;
 }
 
 /** List a thread's runs oldest-first. ``tenantId`` (a system_admin drilling
@@ -344,6 +363,9 @@ export async function listThreadRuns(
     tokens: r.tokens ?? null,
     supersededBy: r.superseded_by ?? null,
     regeneratedFrom: r.regenerated_from ?? null,
+    completed: r.completed ?? null,
+    exitReason: r.exit_reason ?? null,
+    unresolvedFailures: r.unresolved_failures ?? null,
   }));
 }
 

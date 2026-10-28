@@ -307,6 +307,38 @@ async def test_run_status_uses_the_same_vocabulary_as_the_runs_list(ctx: _Ctx) -
 
 
 @pytest.mark.asyncio
+async def test_run_status_is_incomplete_on_both_endpoints_for_a_max_steps_run(ctx: _Ctx) -> None:
+    """B-226 ⑥ — the same vocabulary rule for the derived ``incomplete``: a run a
+    platform limit stopped reads ``incomplete`` in the run list and here."""
+    await ctx.seed_agent()
+    run_id = await ctx.start_run(user_id="cust-77")
+    await ctx.run_store.set_status(
+        run_id=run_id,
+        tenant_id=ctx.tenant_id,
+        status=RunStatus.SUCCESS,
+        updated_at=datetime.now(UTC),
+        finished_at=datetime.now(UTC),
+        completed=False,
+        exit_reason="max_steps",
+    )
+    listed = (
+        await ctx.client.get(
+            "/v1/agents/support-bot/runs",
+            params={"user_id": "cust-77"},
+            headers=ctx.headers,
+        )
+    ).json()["data"]["runs"][0]["status"]
+    usage = (
+        await ctx.client.get(
+            f"/v1/agents/support-bot/runs/{run_id}/usage",
+            params={"user_id": "cust-77"},
+            headers=ctx.headers,
+        )
+    ).json()["run_status"]
+    assert usage == listed == "incomplete"
+
+
+@pytest.mark.asyncio
 async def test_run_without_usage_omits_the_field_rather_than_returning_zero(
     ctx: _Ctx,
 ) -> None:

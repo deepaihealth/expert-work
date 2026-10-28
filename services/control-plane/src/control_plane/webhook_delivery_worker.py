@@ -55,7 +55,7 @@ from expert_work.protocol import (
     WebhookEndpointRecord,
     WebhookEventType,
 )
-from expert_work.runtime.runs import RunStatus, RunStore
+from expert_work.runtime.runs import RunStatus, RunStore, external_run_status
 from expert_work.runtime.runs.schemas import TERMINAL_RUN_STATUSES
 from expert_work.runtime.secret_store import SecretNotFoundError, SecretStore
 
@@ -138,9 +138,12 @@ def _im_text(row: WebhookDeliveryRecord) -> str:
     for key, value in sorted((row.payload or {}).items()):
         if value is None or isinstance(value, dict | list):
             continue
+        # B-226 ⑥ — a bool reads as in the JSON payload (``completed: false``),
+        # not Python's ``False``.
+        shown = json.dumps(value) if isinstance(value, bool) else str(value)
         # Collapse line breaks so a multi-line value (e.g. an agent-authored
         # action_summary) can't inject fake "key: value" lines into the card.
-        flat = " ".join(str(value).splitlines())
+        flat = " ".join(shown.splitlines())
         lines.append(f"{key}: {flat}")
     lines.append(f"event: {row.event_type}")
     lines.append(f"delivery: {row.id}")
@@ -364,7 +367,17 @@ class WebhookDeliveryWorker:
                     payload={
                         "run_id": str(run.run_id),
                         "thread_id": str(run.thread_id),
-                        "status": run.status.value,
+                        # B-226 ⑥ — a run a platform limit stopped still fires
+                        # run.completed (a new event type would be missed by
+                        # every existing subscriber), with ``status: incomplete``.
+                        "status": external_run_status(run.status, run.exit_reason),
+                        # None = no record (usually error / interrupted); a
+                        # paused run voided by a new turn is run.failed /
+                        # interrupted but keeps false / approval_pending.
+                        "completed": run.completed,
+                        "exit_reason": run.exit_reason,
+                        # Why not done: ``[{tool, kind}]``; None = no record.
+                        "unresolved_failures": run.unresolved_failures,
                     },
                     now=now,
                 )

@@ -280,7 +280,7 @@ GET /v1/agents/{agent_code}/runs
 | `agent_code` | 是 | 要查询的 Agent 标识 |
 | `user_id` | 是 | 只列出这个终端用户的 run，长度 1–255 字符。缺失时返回 422 `INVALID_REQUEST`，不会退化成列出整个租户的 run |
 | `session_id` | 否 | 只列出这一段会话里的 run，UUID。这段会话不属于该 `user_id` 与 `agent_code` 时返回 404 `SESSION_NOT_FOUND`，不是空列表 |
-| `status` | 否 | 只列出这个状态的 run，取值见下文。传入八个取值之外的内容返回 422 `INVALID_REQUEST` |
+| `status` | 否 | 只列出返回的 `status` 正是这个值的 run，九个取值见下文，包括 `incomplete`。按 `success` 筛选不会返回 `incomplete` 的 run；传入九个取值之外的内容返回 422 `INVALID_REQUEST` |
 | `limit` | 否 | 分页大小。取 1–200，默认 50 |
 | `offset` | 否 | 分页偏移。取 0 及以上的整数，默认 0 |
 
@@ -292,13 +292,20 @@ GET /v1/agents/{agent_code}/runs
 |---|---|---|
 | `run_id` | string（UUID） | 这次 run 的标识 |
 | `session_id` | string（UUID） | 这次 run 所属的会话 |
-| `status` | string | run 当前的状态，八个取值见下文 |
+| `status` | string | run 当前的状态，九个取值见下文 |
 | `created_at` | string（ISO 8601） | 创建时间 |
 | `finished_at` | string（ISO 8601） \| null | 进入最终状态的时间；还没有进入最终状态时为 `null` |
 | `error` | string \| null | 失败诊断文本，只在失败时非空，读法见下文 |
 | `artifacts` | array \| null | 这次 run 登记过的产物清单，元素结构与 [3.4 的 `end`](./sse-events#end) 完全相同：`{name, kind, version, created_at}`。`[]` 表示这轮没有登记产物，**不等于这轮没有产出文件**（见 [5.7 产物](#_5-7-产物) 开头）；`null` 表示没有记录——平台升级前的历史 run，以及还没跑到终局的 run，都没有清单。**没消费到 `end` 事件就发现 run 已终局的重连场景，从这里拿清单重建，不要用工作区文件状态倒推** |
 | `superseded_by` | string（UUID） \| null | 取代这一轮的新 `run_id`；没有被取代时是 `null`。含义见 [2.10 重新生成与编辑重发](./chat#_2-10-重新生成与编辑重发) |
 | `regenerated_from` | string（UUID） \| null | 这一轮是对哪一轮的重新生成或者编辑重发；不是重来的一轮时是 `null` |
+| `completed` | boolean \| null | 这次 run 有没有把要做的事做成，与 [3.4 的 `end`](./sse-events#end) 里的同名字段相同。`null` 表示没有记录，多见于失败、被取消、还没结束的 run 与平台升级前的历史 run，不要当成 `false` |
+| `exit_reason` | string \| null | 这次 run 从哪个出口结束，`null` 的含义与 `completed` 相同。取值：`text_response`（助手自然说完）/ `max_steps`（步数用完）/ `no_progress`（连续多步没有进展）/ `token_budget`（token 预算用完）/ `approval_pending`（停在人工审批处）/ `approval_rejected`（审批被拒绝）；遇到不认识的取值时按「没有正常完成」处理 |
+| `unresolved_failures` | array \| null | 因为工具失败没做成时，是哪些工具。元素结构与 [3.4 的 `end`](./sse-events#end) 里的同名字段相同（`{tool, kind}`，最多 20 个）；`[]` 表示没有，`null` 的含义与 `completed` 相同 |
+
+`status` 说的是这次 run 怎么结束的，`completed` 说的是要做的事做成了没有，`unresolved_failures` 说的是因为工具失败没做成时，是哪些工具。步数用完的 run 是 `status` 为 `incomplete`、`completed` 为 `false`，读法见 [3.4 的 `end`](./sse-events#end)。没有记录时，这三个字段在 `end` 事件里不出现，在这里是 `null`。
+
+停在人工审批处的 run 因同一会话发起新一轮而变为 `interrupted` 时，不是 `null`，而是保留 `completed` 为 `false`、`exit_reason` 为 `approval_pending`，见 [4.2 决策之前发起新一轮](./run-control#决策之前发起新一轮)。
 
 ### 示例
 
@@ -326,7 +333,10 @@ curl "https://<your-domain>/v1/agents/{agent_code}/runs?user_id=u-123&limit=20" 
             "version": 1,
             "created_at": "2026-08-12T10:00:07+00:00"
           }
-        ]
+        ],
+        "completed": true,
+        "exit_reason": "text_response",
+        "unresolved_failures": []
       }
     ],
     "limit": 20,
@@ -345,8 +355,9 @@ curl "https://<your-domain>/v1/agents/{agent_code}/runs?user_id=u-123&limit=20" 
 | `pending` | 刚创建，正在转入 `running` 的瞬时状态 | 否 | 继续等待，或者接上这次 run 的事件流 |
 | `queued` | 已进入队列，还没有实例开始执行 | 否 | 继续等待，或者接上这次 run 的事件流 |
 | `running` | 正在执行 | 否 | 继续等待，或者接上这次 run 的事件流 |
-| `success` | 正常执行完毕 | 是 | 按正常结果处理 |
-| `error` | 执行失败，包含步数预算耗尽的情况 | 是 | 读 `error` 字段，见下文 |
+| `success` | 执行完毕，没有出错，也没有被平台的限制叫停。要做的事有没有做成看 `completed` | 是 | 按正常结果处理；`completed` 为 `false` 时提示这一轮没有做完 |
+| `incomplete` | 被平台的一道限制叫停：步数或 token 预算用完，或者连续多步没有进展。`exit_reason` 指出是哪一道 | 是 | 按没有做完处理，回答照常显示 |
+| `error` | 执行失败 | 是 | 读 `error` 字段，见下文 |
 | `timeout` | 保留取值，当前不会出现 | 是 | 不需要为它单独写处理分支 |
 | `interrupted` | 被调用方取消，或者等待审批期间同一会话里发起了新一轮（见 [4.2 决策之前发起新一轮](./run-control#决策之前发起新一轮)） | 是 | 视为调用方自己中止的结果 |
 | `paused` | 暂停等待人工审批，可以续跑 | 是 | 去 [4.2 审批决策](./run-control#_4-2-审批决策) 下达决策，这个 run 才会继续 |
@@ -355,7 +366,7 @@ curl "https://<your-domain>/v1/agents/{agent_code}/runs?user_id=u-123&limit=20" 
 
 `finished_at` 只在 run 进入最终状态之后才有值。
 
-事件流末尾的 `end` 事件也有一个 `status` 字段，但它只有四个取值，而且只在事件流收尾时出现一次，见 [3.4 的 `end`](./sse-events#end)。两个字段名字相同，取值集合不同，不要假设它们一一对应。
+事件流末尾的 `end` 事件也有一个 `status` 字段，但它只有五个取值，而且只在事件流收尾时出现一次，见 [3.4 的 `end`](./sse-events#end)。两个字段名字相同，取值集合不同，不要假设它们一一对应。
 
 #### error 字段的读法
 
@@ -882,7 +893,7 @@ GET /v1/agents/{agent_code}/sessions/{session_id}/items
 | `tool_result` | `call_id`、`name`、`status`、`content`、`artifact`、`duration_ms` | 一次工具调用的结果，用 `call_id` 与 `tool_call` 配对。`status` 取值：`success` / `error` |
 | `plan` | `goal`、`steps` | 这一轮的计划快照。一轮里计划改过几次时只保留最后一份 |
 | `approval` | 见下文 [审批条目](#审批条目) | 这一轮等过一次人工审批 |
-| `error` | `message`、`name` | 这一轮失败的原因。`name` 是失败分类，例如 `MaxStepsExceededError`（撞了步数上限，不是平台故障） |
+| `error` | `message`、`name` | 这一轮失败的原因。`name` 是服务端给这次失败的错误类型名，开放取值，只用于日志和上报，与 [3.4 的 `error`](./sse-events#error) 相同 |
 
 `tool_result` 的两个可选字段：`artifact` 是工具产出的结构化数据，结构随工具而定；`duration_ms` 是这次调用耗时，服务端没有量到时不出现。
 
@@ -925,7 +936,7 @@ GET /v1/agents/{agent_code}/sessions/{session_id}/items
 | `label` | string | 可读标签 |
 | `agent_ref` | string | 这个子任务使用的是哪个 Agent |
 | `depth` | integer | 委托层级。直接由这次工具调用派生的是 `1`，平台硬上限是 `3` |
-| `status` | string | 取值：`success`（正常结束）/ `max_steps`（撞了步数上限）/ `cancelled`（被取消）/ `running`（没有结束记录，见下文） |
+| `status` | string | 取值：`success`（正常结束，带回了回答）/ `max_steps`（被平台的一道限制叫停，带回的是部分结果）/ `cancelled`（没有带回结果就结束了）/ `approval_blocked`（遇到需要人工审批的工具而停下）/ `running`（没有结束记录，见下文）。前四个的含义与 [3.4 的 `worker`](./sse-events#kind-为-end-时的-data) 里的 `outcome` 相同；遇到不认识的取值时按「没有正常完成」处理 |
 | `task_excerpt` | string | 交给这个子任务的任务描述摘要，上限 500 字符 |
 | `role` | string \| null | 这个子任务的角色，开放取值；没有角色时是 `null` |
 | `max_steps` | integer \| null | 允许执行的最大步数 |
@@ -1018,7 +1029,10 @@ curl "https://<your-domain>/v1/agents/{agent_code}/sessions/{session_id}/items?u
         "created_at": "2026-08-25T09:00:00+00:00",
         "duration_ms": 3200,
         "error": null,
-        "artifacts": []
+        "artifacts": [],
+        "completed": true,
+        "exit_reason": "text_response",
+        "unresolved_failures": []
       }
     ],
     "has_more": true,
@@ -1036,7 +1050,7 @@ curl "https://<your-domain>/v1/agents/{agent_code}/sessions/{session_id}/items?u
 | 字段 | 类型 | 说明 |
 |---|---|---|
 | `run_id` | string（UUID） | 这一轮的标识 |
-| `status` | string | 这一轮的状态，八个取值见 [5.4 的 status 的取值](#status-的取值) |
+| `status` | string | 这一轮的状态，九个取值见 [5.4 的 status 的取值](#status-的取值) |
 | `created_at` | string（ISO 8601） \| null | 这一轮开始的时间 |
 | `duration_ms` | number \| null | 这一轮从开始到结束用了多少毫秒；还没有结束时是 `null` |
 | `error` | string \| null | 失败诊断文本，只在失败时非空，读法见 [5.4 的 error 字段的读法](#error-字段的读法) |
@@ -1044,6 +1058,11 @@ curl "https://<your-domain>/v1/agents/{agent_code}/sessions/{session_id}/items?u
 | `feedback` | object \| null | 当前 `user_id` 对这一轮打过的分；没打过是 `null`。字段与 [5.3 的 `feedback`](#_5-3-历史消息) 相同 |
 | `superseded_by` | string（UUID） \| null | 取代这一轮的新 `run_id`；没有被取代时是 `null`。含义见 [2.10 重新生成与编辑重发](./chat#_2-10-重新生成与编辑重发) |
 | `regenerated_from` | string（UUID） \| null | 这一轮是对哪一轮的重新生成或者编辑重发；不是重来的一轮时是 `null` |
+| `completed` | boolean \| null | 这一轮有没有把要做的事做成，取值与 [5.4 run 列表](#_5-4-run-列表) 的同名字段相同。`null` 表示没有记录，不要当成 `false` |
+| `exit_reason` | string \| null | 这一轮从哪个出口结束，取值与 [5.4 run 列表](#_5-4-run-列表) 的同名字段相同 |
+| `unresolved_failures` | array \| null | 因为工具失败没做成时，是哪些工具，与 [5.4 run 列表](#_5-4-run-列表) 的同名字段相同。`[]` 表示没有，`null` 表示没有记录 |
+
+`status` 为 `success` 只说明这一轮跑完了；`completed` 为 `false` 时这一轮没有把事做成，`unresolved_failures` 列出没有解决的工具失败。被平台的限制叫停的一轮是 `incomplete`。界面上应当把这样的一轮与真正做完的一轮区分开。
 
 一轮的内容可能是空的（`runs` 里有这一轮，`items` 里没有它的条目），失败在第一步之前的轮次就是这样。`runs` 仍然给出它的状态与失败原因。
 
@@ -1104,7 +1123,7 @@ GET /v1/agents/{agent_code}/runs/{run_id}/usage
 | 字段 | 类型 | 说明 |
 |---|---|---|
 | `run_id` | string（UUID） | 这次 run 的标识 |
-| `run_status` | string | run 当前的状态，取值与 [5.4 run 列表](#_5-4-run-列表) 的 `status` 完全一致（八个取值）。注意它比 `end` 事件的 `status` 分得细，两处对同一次 run 给出不同字样是正常的 |
+| `run_status` | string | run 当前的状态，取值与 [5.4 run 列表](#_5-4-run-列表) 的 `status` 完全一致（九个取值）。注意它比 `end` 事件的 `status` 分得细，两处对同一次 run 给出不同字样是正常的 |
 | `usage_by_model` | array | 按 `{provider, model}` 分项的 token 消耗，元素结构与 [3.4 的 `end`](./sse-events#end) 完全相同。`[]` 表示这次 run 确实没有消耗；字段**缺席**表示没有记录，两者含义不同 |
 
 ### 示例

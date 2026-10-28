@@ -18,6 +18,12 @@ import { Download, Route, RotateCcw } from "lucide-react";
 import { useTranslation } from "react-i18next";
 import { Link } from "react-router-dom";
 
+import {
+  lastEndData,
+  notCompletedLabel,
+  unresolvedFailuresOf,
+  unresolvedFailuresText,
+} from "../../api/run_completion";
 import type { SessionFeedbackItem } from "../../api/sessions";
 import type { TurnSummary } from "../../api/turn_summary";
 import { fmtDuration } from "../../pages/agent_detail/playground/duration_format";
@@ -136,16 +142,42 @@ export function TurnFooter({
     status === "interrupted" && turn.runError !== null && INTERRUPT_REASONS.has(turn.runError)
       ? turn.runError
       : null;
+  // B-226 ⑥ — a done turn whose end frame or run row says completed=false
+  // (steps / budget used up, an unresolved failure) is not a green success.
+  // Either source counts: a history turn shows it from its run row before
+  // replay, and the replayed end frame cannot flip it back.
+  const endData = lastEndData(turn.turn.events);
+  const notCompleted =
+    status === "done"
+      ? (notCompletedLabel(endData) ?? notCompletedLabel(turn.runCompletion ?? null))
+      : null;
+  // B-226 ⑥ — why not done, in the tag's tooltip: from the end frame, else
+  // the run row (an un-replayed history turn).
+  const failures = unresolvedFailuresOf(endData);
+  const failuresText =
+    notCompleted !== null
+      ? unresolvedFailuresText(
+          failures.length > 0 ? failures : unresolvedFailuresOf(turn.runCompletion ?? null),
+        )
+      : null;
   const statusLabel =
-    interruptReason !== null
-      ? t(`console.interrupt_reason_${interruptReason}`)
-      : t(`console.footer_status_${status}`);
+    notCompleted !== null
+      ? notCompleted
+      : interruptReason !== null
+        ? t(`console.interrupt_reason_${interruptReason}`)
+        : t(`console.footer_status_${status}`);
 
   return (
     <div className="ew-turn-footer">
-      <Tag color={STATUS_TAG_COLOR[status]} bordered={false} data-testid="console-turn-status">
-        {statusLabel}
-      </Tag>
+      <Tooltip title={failuresText ?? undefined}>
+        <Tag
+          color={notCompleted !== null ? "warning" : STATUS_TAG_COLOR[status]}
+          bordered={false}
+          data-testid="console-turn-status"
+        >
+          {statusLabel}
+        </Tag>
+      </Tooltip>
       {meta.length > 0 && (
         <Tooltip
           title={

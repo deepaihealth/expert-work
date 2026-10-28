@@ -1562,6 +1562,16 @@ export interface TranslationKeys {
     status_paused: string;
     status_interrupted: string;
     status_error: string;
+    status_not_completed: string;
+    status_not_completed_plain: string;
+    exit_reason_max_steps: string;
+    exit_reason_token_budget: string;
+    exit_reason_no_progress: string;
+    exit_reason_approval_rejected: string;
+    exit_reason_text_response: string;
+    unresolved_failures: string;
+    unresolved_failure_item: string;
+    unresolved_failure_sep: string;
     error_generic: string;
     compaction: string;
     retry: string;
@@ -5061,6 +5071,16 @@ const en: TranslationKeys = {
     status_paused: "Awaiting human approval",
     status_interrupted: "Run cancelled",
     status_error: "Run failed",
+    status_not_completed: "Finished, not completed ({{reason}})",
+    status_not_completed_plain: "Finished, not completed",
+    exit_reason_max_steps: "step limit reached",
+    exit_reason_token_budget: "token budget used up",
+    exit_reason_no_progress: "no progress",
+    exit_reason_approval_rejected: "approval rejected",
+    exit_reason_text_response: "unresolved failures",
+    unresolved_failures: "Unresolved failures: {{list}}",
+    unresolved_failure_item: "{{tool}} ({{kind}})",
+    unresolved_failure_sep: ", ",
     error_generic: "Run error",
     compaction: "Compaction ×{{n}} · {{before}} → {{after}} tok",
     retry: "Retry #{{n}} · {{error}} · backing off {{backoff}}s",

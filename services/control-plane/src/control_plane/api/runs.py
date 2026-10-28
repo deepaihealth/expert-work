@@ -2038,6 +2038,18 @@ def build_runs_router() -> APIRouter:
                     persisted.agent_spec_sha256 if persisted is not None else None
                 ),
                 "tokens": tokens,
+                # B-226 ⑥ — ``status`` says the run finished, ``completed`` says
+                # the request was done (a run that used up its steps is
+                # success + false). None = no record: usually error / interrupted
+                # / old run, or only the in-memory record exists. A paused run
+                # voided by a new turn is interrupted but keeps false /
+                # approval_pending.
+                "completed": persisted.completed if persisted is not None else None,
+                "exit_reason": persisted.exit_reason if persisted is not None else None,
+                # Why not done: ``[{tool, kind}]``; None = no record.
+                "unresolved_failures": (
+                    persisted.unresolved_failures if persisted is not None else None
+                ),
                 "memory_writeback": _memory_writeback_to_dict(memory_job),
                 # Timestamps from the durable row (None when the run is only in
                 # the in-memory RunManager) — the detail summary derives duration.
@@ -2372,6 +2384,11 @@ def build_runs_router() -> APIRouter:
                     "regenerated_from": str(r.regenerated_from_run_id)
                     if r.regenerated_from_run_id
                     else None,
+                    # B-226 ⑥ — lets a history turn show "finished, not
+                    # completed" before its events are replayed. None = no record.
+                    "completed": r.completed,
+                    "exit_reason": r.exit_reason,
+                    "unresolved_failures": r.unresolved_failures,
                     "tokens": _tokens_to_dict(
                         by_trace.get(r.trace_id) if r.trace_id is not None else None
                     ),
@@ -2455,6 +2472,7 @@ def build_runs_router() -> APIRouter:
             run_artifacts=persisted.artifacts,
             run_completed=persisted.completed,
             run_exit_reason=persisted.exit_reason,
+            run_unresolved_failures=persisted.unresolved_failures,
             event_store=event_store,
             stream_bridge=runtime.stream_bridge,
             # PROD-1 —— 对话页/调试台 live attach 落到非属主副本时轮询兜底;
@@ -2810,6 +2828,13 @@ def _run_to_dict(
         # 反查版本号。``null`` = 这一列上线前的历史 run,或 run 在构建成功前
         # 就结束了(配额拒绝 / Agent 被停用 / 构建失败)。
         "agent_spec_sha256": info.agent_spec_sha256,
+        # B-226 ⑥ — success + completed=false = finished but not done.
+        # None = no record (usually error / interrupted / old run); a paused
+        # run voided by a new turn is interrupted but keeps false /
+        # approval_pending.
+        "completed": info.completed,
+        "exit_reason": info.exit_reason,
+        "unresolved_failures": info.unresolved_failures,
         "tokens": _tokens_to_dict(tokens),
     }
 

@@ -34,7 +34,7 @@ Content-Type: application/json
 | `true` | 这次调用真的触发了取消：run 当时确实在执行中，中断请求已经送达 |
 | `false` | 这个 run 已经处于最终状态，端点不做任何操作，也不报错 |
 
-`stopped` 为 `false` 覆盖的最终状态包括正常结束（`success`）、失败（`error`）、已被取消（`interrupted`），**也包括暂停等待人工审批（`paused`）**。对一个等待审批的 run 调用取消，它的状态不会改变，仍然停在原地等待决策。
+`stopped` 为 `false` 覆盖的最终状态包括正常结束（`success`）、被平台的限制叫停（`incomplete`）、失败（`error`）、已被取消（`interrupted`），**也包括暂停等待人工审批（`paused`）**。对一个等待审批的 run 调用取消，它的状态不会改变，仍然停在原地等待决策。
 
 中断请求生效之后，这次 run 最终会落到 `interrupted` 状态，可以在 [5.4 run 列表](./query#_5-4-run-列表) 的 `status`，或者事件流末尾 `end` 事件的 `status` 里看到。
 
@@ -153,7 +153,9 @@ Content-Type: application/json
 - `reason_kind` 为 `policy_gate`：这是 Agent 配置里声明的强制审批点，常见于高风险工具，拒绝会终止整个 run。
 - `reason_kind` 为其余四个取值：这是 Agent 在执行过程中自己发起的确认请求，拒绝只是把一条「审批被拒绝」的结果交回给 Agent，run 会继续往下跑，Agent 可能换一种方式重试或者调整计划。
 
-强制审批点被拒绝、run 就此终止时，`end` 事件的 `status` 仍然是 `success`，平台没有单独的「已拒绝」最终状态。**要确认这次工具调用是否被拒绝，看事件流里这次调用对应的结果消息。** 条目模式下看的是同一次调用的 `tool_result` 条目，靠 `call_id` 找到它。
+强制审批点被拒绝、run 就此终止时，`end` 事件的 `status` 仍然是 `success`，平台没有单独的「已拒绝」最终状态；同一个 `end` 里 `completed` 是 `false`、`exit_reason` 是 `approval_rejected`，据此就能知道这一轮因审批被拒绝而结束。**要确认被拒绝的是哪一次工具调用，看事件流里这次调用对应的结果消息。** 条目模式下看的是同一次调用的 `tool_result` 条目，靠 `call_id` 找到它。
+
+Agent 自己发起的确认被拒绝时，run 不会终止，结果按 `reason_kind` 分两种。`risk_confirmation`（风险确认）被拒绝，表示要做的动作没有执行：除非之后同一个工具又调用成功，这一轮结束时 `completed` 是 `false`，`unresolved_failures` 里有一条 `kind` 为 `blocked_by_policy` 的记录。`missing_info`、`ambiguous_requirement`、`approach_choice` 这三类提问被拒绝，只是把答复交回给 Agent，不影响 `completed`，也不会出现在 `unresolved_failures` 里。
 
 #### modified_args 的形状
 

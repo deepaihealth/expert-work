@@ -77,7 +77,9 @@ from expert_work.runtime.runs import (
     RunRecord,
     RunStatus,
     compute_completed,
+    external_run_status,
     make_event_record,
+    unresolved_failures_view,
 )
 from expert_work.runtime.stream_bridge import (
     HEARTBEAT_FRAME,
@@ -655,6 +657,9 @@ async def run_agent(
     # ``None`` 在这两个字段上恒等于「无记录」,而异常路径确实没有记录。
     completed: bool | None = None
     exit_reason: str | None = None
+    # B-226 ⑥ —— same function-scope rule: the ``[{tool, kind}]`` view of the
+    # final failure ledger; ``None`` = no record on every exception path.
+    failures_view: list[dict[str, str]] | None = None
 
     async def _handoff_watch() -> None:
         """B-80 —— 关机期间,一旦这一轮可以安全交接就把它停下来。
@@ -931,12 +936,16 @@ async def run_agent(
             completed = compute_completed(
                 exit_reason=exit_reason, unresolved_failures=unresolved_failures
             )
+            # B-226 ⑥ —— why not done: tool name + error class only (the
+            # ledger's summary / path can carry tenant content), capped.
+            failures_view = unresolved_failures_view(unresolved_failures)
         await run_manager.set_status(
             run_id,
             final,
             artifacts=_manifest_snapshot(),
             completed=completed,
             exit_reason=exit_reason,
+            unresolved_failures=failures_view,
         )
         if final is RunStatus.PAUSED and pending_request is not None:
             # Register the paused run in the durable ``agent_approval``
@@ -1148,6 +1157,7 @@ async def run_agent(
                 artifacts=_manifest_snapshot(),
                 completed=completed,
                 exit_reason=exit_reason,
+                unresolved_failures=failures_view,
             )
         # P2 块 2 —— 会话对外可见消息条数在这里重算。挂 ``finally`` 而不是挂
         # 控制面的 6 个 ``run_agent`` 启动点:一处覆盖全部调用方 + 全部终局
@@ -1865,6 +1875,7 @@ async def sse_consumer(
                         # end 帧 data 透传,``publish_end`` 存的。
                         completed=_end_data.get("completed"),
                         exit_reason=_end_data.get("exit_reason"),
+                        unresolved_failures=_end_data.get("unresolved_failures"),
                     ),
                 )
                 return
@@ -1903,10 +1914,14 @@ async def sse_consumer(
             await run_manager.cancel(record.run_id, reason=InterruptReason.CLIENT_DISCONNECT)
 
 
-#: 对外 ``end`` 帧允许出现的 status 四值。``_EXTERNAL_END_STATUS``(内部
+#: 对外 ``end`` 帧允许出现的 status 值。``_EXTERNAL_END_STATUS``(内部
 #: outcome → 对外 status)和 ``_run_event_stream._RUN_STATUS_END_STATUS``
 #: (``RunStatus`` → 对外 status)是同一套词表的两个入口,值域必须一致。
-EXTERNAL_END_STATUSES: frozenset[str] = frozenset({"success", "paused", "interrupted", "error"})
+#: B-226 ⑥ —— ``incomplete`` is not produced by either map: ``end_frame_data``
+#: derives it from ``success`` + a budget exit via ``external_run_status``.
+EXTERNAL_END_STATUSES: frozenset[str] = frozenset(
+    {"success", "incomplete", "paused", "interrupted", "error"}
+)
 
 
 def end_frame_data(
@@ -1917,6 +1932,7 @@ def end_frame_data(
     usage_by_model: list[dict[str, Any]] | None = None,
     completed: bool | None = None,
     exit_reason: str | None = None,
+    unresolved_failures: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """``end`` 帧的 ``data`` —— **两条 SSE 路径共用的唯一构造口**。
 
@@ -1947,8 +1963,11 @@ def end_frame_data(
     **别当成「没做成」**。``exit_reason`` 的取值见
     :data:`expert_work.runtime.runs.RUN_EXIT_REASONS`,将来新增是向后兼容的新值。
     """
+    known = status if status in EXTERNAL_END_STATUSES else "error"
     data: dict[str, Any] = {
-        "status": status if status in EXTERNAL_END_STATUSES else "error",
+        # B-226 ⑥ —— a run a platform limit stopped reads ``incomplete``; the
+        # one shared derivation, so live and replay can never disagree.
+        "status": external_run_status(known, exit_reason),
         "run_id": str(run_id),
     }
     if artifacts is not None:
@@ -1959,6 +1978,9 @@ def end_frame_data(
         data["completed"] = completed
     if exit_reason is not None:
         data["exit_reason"] = exit_reason
+    # B-226 ⑥ —— why not done: ``[{tool, kind}]``; absent = no record.
+    if unresolved_failures is not None:
+        data["unresolved_failures"] = unresolved_failures
     return data
 
 

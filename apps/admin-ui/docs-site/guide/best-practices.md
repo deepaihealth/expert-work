@@ -76,6 +76,18 @@ flowchart LR
 | [预先创建会话](./chat#预先创建会话) `POST /v1/agents/{agent_code}/sessions` | 响应体 `data.session_id` |
 | 上传附件 `POST /v1/agents/{agent_code}/uploads` | 响应体 `data.session_id` |
 
+### 判断一次 run 是否做成
+
+`end` 事件用三个字段回答三个不同的问题，run 列表和对话条目里的同名字段含义相同，判断时要一起看：
+
+| 字段 | 回答的问题 | 读法 |
+|---|---|---|
+| `status` | 这一轮怎么结束的 | 只有 `success` 才可能是做成了；`incomplete`、`error`、`interrupted` 与不认识的取值都表示没做成，`paused` 表示还在等审批 |
+| `completed` | 要做的事做成了没有 | `false` 表示没做成；缺席或 `null` 表示没有记录，沿用 `status` 的判定 |
+| `unresolved_failures` | 因为工具失败没做成时，是哪些工具 | 用于提示用户或排查问题，不改变判定 |
+
+`guard` 事件只是提示某一道限制到了，不是这一轮的结果：限制可能来自子任务，主 Agent 仍可能把事做完。结论只看 `end`，见 [3.4 的 `end`](./sse-events#end)。
+
 ### run 列表里的 error 字段不能用于错误分类
 
 这个字段是一段诊断文本，不是结构化错误码，不要按它的文案做模式匹配。字段的完整说明见 [5.4 run 列表](./query#_5-4-run-列表)。

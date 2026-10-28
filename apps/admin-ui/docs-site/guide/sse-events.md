@@ -154,7 +154,7 @@ function seqOf(id) {
 | [`approval`](#approval) | run 停下等待人工审批时 | 立刻保存这条事件，并显示审批界面 |
 | [`retry`](#retry) | 遇到平台可以自动重试的失败时 | 显示「正在重试」，不要中断处理、不要自行重连 |
 | [`error`](#error) | run 失败时 | 按失败显示 |
-| [`end`](#end) | 流正常收尾时，最后一个 | 按 `status` 的四个取值分别处理 |
+| [`end`](#end) | 流正常收尾时，最后一个 | 按 `status` 的五个取值分别处理，再看 `completed` |
 | [`gap`](#gap) | 有一段事件在这条连接上取不到时 | 标记这段缺失，继续处理后面的事件 |
 | [`truncated`](#truncated) | 续传的一页装不下时 | 用它给出的 `next_seq` 拉下一页，流尚未结束 |
 
@@ -642,7 +642,7 @@ function onPlan(data) {
 客户端要做的是显示，另加两条容错规则：
 
 - 没有收到 `kind` 为 `start` 的事件时，忽略这个子任务后续的 `update` 与 `end`。3.5 的示例代码在这里直接返回，是有意的。
-- `kind` 为 `end` 的事件不保证一定到达：子任务异常终止时不发，那张卡会一直停在「运行中」。父 run 的 `end` 到达时，把所有还没收尾的子任务卡标为「结果未知」。
+- `kind` 为 `end` 的事件不保证一定到达：少数情况下不发，例如执行子任务的服务进程意外退出，那张卡会一直停在「运行中」。父 run 的 `end` 到达时，把所有还没收尾的子任务卡标为「结果未知」。
 
 #### data 字段
 
@@ -706,7 +706,7 @@ function onPlan(data) {
 
 | 字段 | 类型 | 说明 |
 |---|---|---|
-| `outcome` | string | 这个子任务结束时的结果。取值：`success`（正常执行完成）/ `max_steps`（把自己的步数预算用完，这是部分结果而不是失败，父 Agent 会带着这份部分进展继续推理）/ `cancelled`（执行中被取消）。只有这三个取值 |
+| `outcome` | string | 这个子任务结束时的结果，各取值的含义见下文。开放取值，当前常见：`success`（正常执行完成，带回了回答）/ `max_steps`（被平台的一道限制叫停，带回部分结果）/ `cancelled`（没有带回结果就结束了）/ `approval_blocked`（遇到需要人工审批的工具而停下）；遇到未知值时按「没有正常完成」处理 |
 | `iteration_used` | integer | 实际用掉的步数，非负整数 |
 | `llm_call_count` | integer | `usage` 所计入的模型调用次数，非负整数。平台没有记录到这个子任务的用量时，是模型回复的条数 |
 | `wall_clock_ms` | integer | 这个子任务从开始到结束的墙钟耗时，单位毫秒，非负整数 |
@@ -733,7 +733,13 @@ function onPlan(data) {
 
 `model` 是平台上配置的模型名，不是厂商返回的名称。
 
-这三个 `outcome` 覆盖的是正常收尾的三种情况。子任务因为未捕获的异常终止时，平台不发这条事件，这个子任务就此没有后续事件；客户端的处置方式见本节「什么时候发」的第二条容错规则。
+只有 `success` 表示子任务完成了交给它的工作，其余取值都不要显示成成功。
+
+- `max_steps`：叫停它的限制可能是子任务自己的步数上限、这次 run 的 token 预算、连续多步没有进展，或这次 run 的时间上限。带回的是部分结果，父 Agent 会带着它继续推理。
+- `cancelled`：执行中被取消、出现意外错误，或者结束时没有给出回答。出现意外错误时这条事件照常发出。
+- `approval_blocked`：子任务里无法发起人工审批，主 Agent 会收回这部分工作。
+
+这条事件没有到达时的处置方式，见本节「什么时候发」的第二条容错规则。
 
 #### 统计一次 run 的 token 消耗
 
@@ -807,11 +813,11 @@ function onWorker(w) {
 
 #### 什么时候发
 
-平台的三道限制预警或者真正触发时，服务端发一次到当前这条连接。三道限制是：步数上限、token 预算（这里的 token 指模型用量单位，不是 `token` 事件）、连续多步没有实质进展。
+平台的三道限制预警或者真正触发时，服务端发一次到当前这条连接。三道限制是：步数上限、token 预算（这里的 token 指模型用量单位，不是 `token` 事件）、连续多步没有实质进展。触发限制的可能是主 Agent，也可能是它派出的[子任务](#worker)；事件本身不标明是哪一方。
 
-- 上限由谁设定：步数上限和无进展上限来自这个 Agent 的配置，token 预算由平台为这次 run 设定。调用方都不能修改，需要调整要联系租户管理员。
-- 触发之后发生了什么：平台给模型追加一条收尾指令，并且这一步不再提供任何工具，模型只能直接作答。用户仍然会拿到一段完整回答，只是后续推理被截断。
-- 客户端要做什么：按「已到上限」的提示显示，不要按错误显示；也不要据此判定这次 run 成功，最终状态以 `end` 的 `status` 为准。
+- 上限由谁设定：步数上限和无进展上限来自主 Agent 或子任务各自的配置，token 预算由平台为这次 run 设定、主 Agent 与子任务共用。调用方都不能修改，需要调整要联系租户管理员。
+- 触发之后发生了什么：平台给触发限制的那一方追加一条收尾指令，并且这一步不再提供任何工具，只能直接作答。主 Agent 触发时，用户仍然会拿到一段完整回答，只是后续推理被截断；子任务触发时，子任务把部分结果交回主 Agent，主 Agent 可以继续工作。
+- 客户端要做什么：按「已到上限」的提示显示，不要按错误显示，也不要据此判断这一轮的结果，见下文。
 
 #### data 字段
 
@@ -826,7 +832,7 @@ function onWorker(w) {
 | `guard` 取值 | `detail` 字段 | 类型 | 说明 |
 |---|---|---|---|
 | `max_steps` | `steps` | integer | 已经执行的步数 |
-| `max_steps` | `max` | integer | 这个 Agent 配置的步数上限 |
+| `max_steps` | `max` | integer | 触发限制的那一方的步数上限：主 Agent 或子任务各自配置的值 |
 | `token_budget` | `spent` | integer | 这棵委托树累计消耗的 token |
 | `token_budget` | `limit` | integer | 平台为这次 run 设定的 token 预算 |
 | `no_progress` | `streak` | integer | 连续多少步没有实质进展 |
@@ -836,7 +842,7 @@ function onWorker(w) {
 
 三道限制里只有 `token_budget` 会发 `warning`：用量达到预算 80% 时发一次，整棵委托树只发一次。`max_steps` 与 `no_progress` 当前只有 `tripped`，没有预警，不要写一个等待它们预警的分支，那个分支不会被触发。`warning` 比 `tripped` 轻，只表示接近上限，不代表任何收尾动作已经发生。
 
-「不按错误显示」只适用于 `guard` 事件本身。`guard` 为 `max_steps` 的那一路收尾之后，这次 run 在 `end` 事件里的 `status` 仍然是 `error`。**run 成功还是失败，以 `end` 的 `status` 为准。**
+**这一轮有没有把事做成，只看 `end` 的 `completed`**，不要从 `guard` 事件推断。主 Agent 触发限制时，这一轮的 `end` 是 `status` 为 `incomplete`、`completed` 为 `false`，`exit_reason` 指出是哪一道限制；子任务触发步数上限或无进展限制时只有这个子任务收尾，主 Agent 可能照常把事做完，`end` 的 `completed` 仍是 `true`。`completed` 与 `exit_reason` 的读法见 [end](#end)。
 
 #### 示例
 
@@ -866,7 +872,7 @@ function onGuard(data) {
   const tripped = data.kind === "tripped";
   $("#timeline").insertAdjacentHTML("beforeend",
     `<div class="notice ${tripped ? "warn" : "hint"}">
-       ${tripped ? "本轮已由平台收尾" : "接近上限"}:${esc(detail)}
+       ${tripped ? "已到上限" : "接近上限"}:${esc(detail)}
      </div>`);
   // 样式用「提示」而不是「错误」:这不是失败
 }
@@ -1067,14 +1073,16 @@ run 执行失败时，服务端发一次到当前这条连接，紧接着是 `st
 | 字段 | 类型 | 说明 |
 |---|---|---|
 | `message` | string | 失败原因的文本描述，供排查使用，不适合直接显示给终端用户 |
-| `name` | string | 服务端给这次失败的错误类型名。开放取值，会随平台演进变化；当前唯一保证语义的取值是 `MaxStepsExceededError`，表示步数预算耗尽，同时一定会有一条 `guard` 为 `max_steps`、`kind` 为 `tripped` 的事件。不要按它写分支，只用它做日志和上报 |
+| `name` | string | 服务端给这次失败的错误类型名。开放取值，会随平台演进变化，不保证任何取值的语义。不要按它写分支，只用它做日志和上报 |
+
+[guard](#guard) 的三道限制触发时不会产生这个事件：平台让助手收尾，这一轮照常以 `end` 结束。主 Agent 触发限制时，`end` 的 `status` 是 `incomplete`，不是 `success`，见 [end](#end)。
 
 #### 示例
 
 ``` [事件流片段]
 id: 1755229402778-27
 event: error
-data: {"message":"step budget exhausted: 32 of 32 steps used","name":"MaxStepsExceededError"}
+data: {"message":"all LLM providers exhausted; last error: TimeoutError: request timed out","name":"AllProvidersExhaustedError"}
 ```
 
 #### 客户端怎么处理
@@ -1109,11 +1117,12 @@ HTTP 层的错误码（4xx / 5xx、限流、配额）是另一回事，见 [8 �
 
 | 字段 | 类型 | 说明 |
 |---|---|---|
-| `status` | string | 这次 run 的最终状态。四个取值见下表，这是全集：平台在发这个事件之前，会把任何不在这四个取值里的内部状态强制归为 `error` |
+| `status` | string | 这次 run 是怎么结束的。五个取值见下表，这是全集：平台在发这个事件之前，会把任何不在这五个取值里的内部状态强制归为 `error` |
 | `run_id` | string | 这次 run 的 id，格式是 UUID |
 | `artifacts` | array | **这次 run 登记过的产物清单**。每个元素是 `{name, kind, version, created_at}`；`[]` 表示这轮没有登记产物——**注意这不等于「这轮没有产出文件」**，详见下方说明。字段**缺席**只发生在读平台升级前的历史 run——缺席表示「当时没有记录」，不要当成零交付。清单是登记时刻的快照：产物之后被删除或同名覆盖，不会回头改这份清单 |
-| `completed` | boolean | **这次 run 有没有把事做成**。与 `status` 是两件事，判成功要同时看，原因见下方说明。字段**缺席**表示没有记录（平台升级前的历史 run，或平台读不到执行状态），**不要当成 `false`** |
+| `completed` | boolean | **这次 run 有没有把事做成**。与 `status` 是两件事，判成功要同时看，原因见下方说明。字段**缺席**表示没有记录（多见于 `status` 为 `error` 或 `interrupted` 的 run、平台升级前的历史 run，或平台读不到执行状态；例外见下文 `exit_reason` 取值表后的说明），**不要当成 `false`** |
 | `exit_reason` | string | 这次 run 是从哪个出口结束的。取值见下表，这是全集；将来新增取值是向后兼容的追加，客户端把未知取值当作「非正常结束」处理即可。字段**缺席**与 `completed` 同义：没有记录 |
+| `unresolved_failures` | array | 这一轮结束时仍然没有解决的工具失败，说明没做成的原因；每个元素是 `{tool, kind}`，最多 20 个，见下方说明。`[]` 表示没有；字段缺席表示没有记录，与 `completed` 同时出现、同时缺席 |
 | `usage_by_model` | array | **这次 run 消耗的 token**，按 `{provider, model}` 分项，字段说明见下表。**已经包含子任务**：子任务与主 Agent 共用同一次 run 的计量，各项相加就是整次 run 的总量，不要再去累加 `worker` 事件里的 `usage`，那会重复计算。`[]` 表示这次 run 确实没有消耗；字段**缺席**表示没有记录（平台升级前的历史 run、run 尚未开始执行、或平台取数失败），不要当成零消耗。某一项各数值全为 `0`，表示那次调用由平台的回答缓存直接给出、没有调用模型。同一份数据也可以用 [5.9 run 用量](./query#_5-9-run-用量) 取回 |
 
 `artifacts` 每个元素的字段：
@@ -1137,7 +1146,16 @@ Agent 产生的文件分两种去向：一种直接写进这个终端用户的**
 决定展示什么、或者是否计费，同时检查工作区文件更准确。
 :::
 
-判断这轮做到哪一步，**首选 `end` 事件的 `completed`**（见 3.4 的说明），它对每次 run 都有。
+判断这轮做到哪一步，**首选 `end` 事件的 `completed`**（见 3.4 的说明）。失败、被取消的 run 以及平台升级前的历史 run 通常没有这个字段。
+
+`unresolved_failures` 每个元素的字段：
+
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| `tool` | string | 失败的工具名，与 `updates` 事件里工具调用的 `name` 相同 |
+| `kind` | string | 失败类别。开放取值，当前常见：`unknown_tool`（调用了不存在的工具）/ `invalid_arguments`（参数不合法）/ `blocked_by_policy`（被平台的策略或者人工审批拦下，没有执行）/ `resource_not_found`（要操作的对象不存在）/ `permission_denied`（没有权限）/ `mutation_not_landed`（改动类操作报告成功，但改动没有生效）/ `unknown`（其他失败）；遇到未知值时按 `unknown` 处理 |
+
+这份列表只给出工具名与失败类别，不包含错误详情、调用参数或工具的输出。同一个工具后来又调用成功，或者同一个文件后来被改成功，对应的失败就算已经解决、不再列出；超过 20 条时只给出最早的 20 条。
 
 `plan` 事件是另一个补充依据：最后一个 `plan` 事件里若仍有
 `pending` 或 `in_progress` 的步骤，说明 Agent 自己认为这一轮的计划没有走完。
@@ -1158,18 +1176,19 @@ Agent 产生的文件分两种去向：一种直接写进这个终端用户的**
 
 一次 run 跨多个模型是常见情况：主 Agent 与它派出的子任务可以用不同模型，所以要逐项按各自的 `provider` 与 `model` 查单价再相加，不能整次 run 按主 Agent 的单价折算。
 
-`status` 的四个取值：
+`status` 的五个取值：
 
 | 取值 | 含义 | 客户端处理 |
 |---|---|---|
-| `success` | 正常执行完成 | 显示最终回答 |
+| `success` | 这一轮跑完了，没有出错，也没有被平台的限制叫停。要做的事有没有做成，看 `completed` | 显示最终回答；`completed` 为 `false` 时同时提示这一轮没有做完 |
+| `incomplete` | 被平台的一道限制叫停：步数或 token 预算用完，或者连续多步没有进展。`exit_reason` 是 `max_steps`、`token_budget`、`no_progress` 之一，`completed` 恒为 `false` | 显示助手收尾时给出的回答，同时提示这一轮没有做完 |
 | `paused` | 停在人工审批点等待决策。这不是失败，批准或拒绝之后这一轮对话还会继续 | 显示审批界面，前面的 `approval` 事件已经给了全部信息；不要按错误显示 |
 | `interrupted` | run 被中断，例如调用方主动取消。取消不会另外发 `error` 事件 | 按「已取消」处理，不必重试 |
-| `error` | 执行失败。三种情况都归在这里：执行出错、超时，以及步数用尽 | 按失败处理，细节见 [8 错误码总表](./errors) |
+| `error` | 执行失败，包括执行出错和超时 | 按失败处理，细节见 [8 错误码总表](./errors) |
 
-步数用尽这一路最容易误判：`guard` 那一节说 `tripped` 不是错误，指的是不要把那条 `guard` 当成崩溃报出来，用户仍会拿到一段完整回答；但这次 run 是被平台停下的、没有正常执行到底，所以在 `end` 里算 `error`。两句话不矛盾——**这一轮跑没跑完、是不是失败了，以这里的 `status` 为准**；至于「要做的事做成了没有」，那是另一个字段的事，见下一小节。
+平台在步数或 token 预算用完、连续多步没有进展时让助手收尾，用户仍会拿到一段完整回答，这一轮的 `status` 是 `incomplete`，`completed` 是 `false`，`exit_reason` 指出是哪一道限制。**`status` 说的是这一轮怎么结束的，`completed` 说的是要做的事做成了没有，`unresolved_failures` 说的是因为工具失败没做成时，是哪些工具**，判断方式见下一小节。`incomplete` 的 run 在 webhook 里照常发 `run.completed` 事件，不新增事件类型，推送内容里的 `status` 同样是 `incomplete`。
 
-`end` 的四个取值是由平台内部的结束原因收敛而来的：内部的「被取消」和「中断」都归为 `interrupted`，内部的「超时」和「步数用尽」都归为 `error`。run 记录里的状态（见 [5.4 run 列表](./query#_5-4-run-列表)）分得比这四个细，所以同一次 run 在两个地方看到不同的字样是正常的。
+`end` 的取值是由平台内部的结束原因收敛而来的：内部的「被取消」和「中断」都归为 `interrupted`，内部的「超时」归为 `error`，正常结束但出口是平台限制的归为 `incomplete`。run 记录里的状态（见 [5.4 run 列表](./query#_5-4-run-列表)）分得比这五个细，所以同一次 run 在两个地方看到不同的字样是正常的。
 
 #### `status` 说的是「跑完了」，`completed` 说的是「做成了」
 
@@ -1194,30 +1213,37 @@ const ok = data.status === "success" && data.completed !== false;
 | 取值 | 含义 | 是否算做成 |
 |---|---|---|
 | `text_response` | 助手不再调用工具，自然说完了 | 要看 `completed`：同时为 `true` 才是真的做完 |
-| `max_steps` | 这一轮的步数预算用尽，平台让助手用现有结果收尾 | 否 |
-| `no_progress` | 助手连续多轮没有进展，平台判定卡住并收尾 | 否 |
-| `token_budget` | 这一轮的 token 预算用尽 | 否 |
+| `max_steps` | 这一轮的步数预算用尽，平台让助手用现有结果收尾（`status` 为 `incomplete`） | 否 |
+| `no_progress` | 助手连续多轮没有进展，平台判定卡住并收尾（`status` 为 `incomplete`） | 否 |
+| `token_budget` | 这一轮的 token 预算用尽（`status` 为 `incomplete`） | 否 |
 | `approval_pending` | 停在人工审批点（对应 `status` 的 `paused`） | 否 —— 批准之后这一轮会接着跑 |
 | `approval_rejected` | 审批被拒绝，这一轮就此终止 | 否 |
 
-除 `text_response` 之外的取值都表示这一轮是**被平台停下来的**，`completed` 恒为 `false`。
+除 `text_response` 之外的取值都表示这一轮是**被平台停下来的**，`completed` 恒为 `false`。`approval_rejected` 的 `status` 是 `success`；`approval_pending` 对应 `paused`，审批还没处理、同一会话就发起了新一轮时，这个 run 变为 `interrupted`（见 [4.2 决策之前发起新一轮](./run-control#决策之前发起新一轮)），但仍保留 `completed` 为 `false`、`exit_reason` 为 `approval_pending`。
 
 `exit_reason` 是 `text_response` 而 `completed` 是 `false`，是最需要留意的那一格：
-助手自己停下了，但它停下之前有工具调用失败且没有恢复。这种情况值得给用户一个提示，
-或者进重试队列，不要当成正常完成。
+助手自己停下了，但它停下之前有工具调用失败且没有恢复，`unresolved_failures` 列出是哪些工具。
+这种情况值得给用户一个提示，或者进重试队列，不要当成正常完成。
 
 #### 示例
 
 ``` [事件流片段]
 event: end
-data: {"status":"success","run_id":"67262572-5470-41a4-800d-592762ec679d","artifacts":[{"name":"张女士_20260826142539.pptx","kind":"document","version":1,"created_at":"2026-08-26T06:31:37+00:00"}],"completed":true,"exit_reason":"text_response"}
+data: {"status":"success","run_id":"67262572-5470-41a4-800d-592762ec679d","artifacts":[{"name":"张女士_20260826142539.pptx","kind":"document","version":1,"created_at":"2026-08-26T06:31:37+00:00"}],"completed":true,"exit_reason":"text_response","unresolved_failures":[]}
 ```
 
-某个工具失败之后助手停下不再动作 —— `status` 仍是 `success`，但事没做成：
+某个工具失败之后助手停下不再动作 —— `status` 仍是 `success`，但事没做成，`unresolved_failures` 指出是哪个工具：
 
 ``` [事件流片段]
 event: end
-data: {"status":"success","run_id":"c0f6e1a2-8b33-4d70-9a11-6f2b7c94de05","artifacts":[],"completed":false,"exit_reason":"text_response"}
+data: {"status":"success","run_id":"c0f6e1a2-8b33-4d70-9a11-6f2b7c94de05","artifacts":[],"completed":false,"exit_reason":"text_response","unresolved_failures":[{"tool":"bash","kind":"unknown"}]}
+```
+
+步数用完、平台让助手收尾 —— `status` 是 `incomplete`，`exit_reason` 指出是哪一道限制：
+
+``` [事件流片段]
+event: end
+data: {"status":"incomplete","run_id":"3d8b5f20-6a1e-4c9b-8f02-7e4d1c6a9b53","artifacts":[],"completed":false,"exit_reason":"max_steps","unresolved_failures":[]}
 ```
 
 追问轮（这轮没有产出、助手在等用户补信息）的 `artifacts` 是显式空数组：
@@ -1231,7 +1257,7 @@ data: {"status":"success","run_id":"5a1315a9-6055-454d-90ac-95e1fa6cb782","artif
 
 #### 客户端怎么处理
 
-四个状态各走各的分支，**不要合并成「成功 / 失败」两个分支**，那样 `paused` 会被误报成失败。
+每个状态各走各的分支，**不要合并成「成功 / 失败」两个分支**，那样 `paused` 会被误报成失败。
 
 ```js [示例代码]
 function onEnd(data) {
@@ -1242,6 +1268,9 @@ function onEnd(data) {
       // 字段,缺席要保持原来的判定,不能被误判成失败。
       $("#status").textContent = data.completed !== false ? "已完成" : "未完成";
       break;
+    case "incomplete":                   // 被平台的限制叫停:回答照常显示,但事没做完
+      $("#status").textContent = "未完成";
+      break;
     case "paused":                       // 不是失败:等待审批,对话还会继续
       $("#status").textContent = "等待审批";
       $(".approval")?.scrollIntoView();
@@ -1249,7 +1278,7 @@ function onEnd(data) {
     case "interrupted":
       $("#status").textContent = "已取消";
       break;
-    default:                             // "error",以及将来未列出的取值
+    default:                             // "error",以及将来未列出的取值:按没做成处理
       $("#status").textContent = "已失败";
   }
   return true;                           // 通知外层循环:流结束了,不要再重连

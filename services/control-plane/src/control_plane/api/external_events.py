@@ -126,6 +126,7 @@ async def build_events_response(
         run_artifacts=run.artifacts,
         run_completed=run.completed,
         run_exit_reason=run.exit_reason,
+        run_unresolved_failures=run.unresolved_failures,
         event_store=event_store,
         stream_bridge=stream_bridge,
         run_probe=run_probe,

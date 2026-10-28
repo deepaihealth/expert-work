@@ -468,11 +468,17 @@ async def run_child_to_result(
             build_worker_end_frame(
                 ident,
                 wseq=wseq,
+                # B-226 ⑥ — no answer = ended without handing back a result: the
+                # existing ``cancelled``, as for an unexpected error (the contract
+                # has no ``failed``). This used to say success while the parent
+                # got a failure.
                 outcome=(
                     "max_steps"
                     if raised_max_steps or budget_exit is not None
                     else "approval_blocked"
                     if approval_blocked
+                    else "cancelled"
+                    if answer is None
                     else "success"
                 ),
                 iteration_used=step_count,
