@@ -136,6 +136,7 @@ from orchestrator.context.system_prompt_view import keep_latest_system_prompt
 from orchestrator.graph_builder._approval import (
     ApprovalTarget,
     apply_resume_decision,
+    asks_to_act,
     build_approval_request,
     find_approval_target,
 )
@@ -219,8 +220,10 @@ from orchestrator.tools.artifact import (
 )
 from orchestrator.tools.error_classifier import (
     ClassifiedToolError,
+    classified_blocked,
     classified_invalid_arguments,
     classified_mutation_not_landed,
+    classified_soft_failure,
     classify_tool_error,
     render_recovery_advisory,
 )
@@ -1778,6 +1781,9 @@ def build_react_graph(
         # B-76 / B-79 —— 续跑时由平台直接作答、不派发的调用:下标 → 那条工具结果。
         # 审批单上那一条之外的调用(没有执行),以及被批准的 ``ask_for_approval``。
         answered: Mapping[int, ToolMessage] = {}
+        # B-226 ⑤ — the approved ``risk_confirmation`` ``ask_for_approval`` among
+        # ``answered`` (B-79): the only answer that settles a refused one.
+        approved_questions: frozenset[int] = frozenset()
         if approval_resume is not None:
             # Stream CM-8 (Mini-ADR CM-I4) — the resume re-entry skips the
             # entry chain (``aupdate_state(as_node="agent")`` lands the
@@ -1817,6 +1823,15 @@ def build_react_graph(
                     # B-85 ③ —— 出口就在这一行,盖在这里。``_after_tools``
                     # 是路由函数,只返回路由、不写 state。
                     rejected["exit_reason"] = "approval_rejected"
+                elif resume_outcome.rejected is not None:
+                    # B-226 ⑤ — the run goes on, but the call the reviewer turned
+                    # down never ran: that is debt until something settles it.
+                    rejected["unresolved_failures"] = _record_refused_call(
+                        state.get("unresolved_failures") or [],
+                        tool_calls[resume_outcome.rejected],
+                        resume_outcome.reject_messages[resume_outcome.rejected],
+                        tool_registry,
+                    )
                 return rejected
             # approve / modify — fall through to dispatch the approved (possibly
             # arg-rewritten) call; clear the resume channel on return.
@@ -1828,6 +1843,10 @@ def build_react_graph(
             # withheld call the model issues again lands on a fresh step, where
             # screening and the gate judge it like any other call.
             answered = {**resume_outcome.withheld, **resume_outcome.answered}
+            # Read from this turn's checkpointed calls (a ``modify`` replaces the args).
+            approved_questions = frozenset(
+                index for index in resume_outcome.answered if asks_to_act(tool_calls[index])
+            )
             #
             # B-61 §5.3 —— 再套一遍绑定。``modify`` 拿人工给的 ``modified_args``
             # **整份替换**那条 call 的 args,于是(a)被绑参数会被人在审批面上静默
@@ -1876,19 +1895,28 @@ def build_react_graph(
                         }
                     # block — deny the whole turn (one error ToolMessage per
                     # call so no tool_call is left orphaned); the agent re-plans.
+                    blocked_messages = [
+                        ToolMessage(
+                            content=(
+                                "[blocked] action screening: a tool call did not match "
+                                "your request and was not run"
+                            ),
+                            tool_call_id=str(call.get("id") or ""),
+                            status="error",
+                        )
+                        for call in tool_calls
+                    ]
                     return {
                         **stale_approval,
-                        "messages": [
-                            ToolMessage(
-                                content=(
-                                    "[blocked] action screening: a tool call did not match "
-                                    "your request and was not run"
-                                ),
-                                tool_call_id=str(call.get("id") or ""),
-                                status="error",
-                            )
-                            for call in tool_calls
-                        ],
+                        "messages": blocked_messages,
+                        # B-226 ⑤ — the misaligned call is refused debt; the rest of
+                        # the turn was not run because of it (not run is not failed).
+                        "unresolved_failures": _record_refused_call(
+                            state.get("unresolved_failures") or [],
+                            tool_calls[bad_idx],
+                            blocked_messages[bad_idx],
+                            tool_registry,
+                        ),
                     }
             target = find_approval_target(tool_calls, _gated_tools)
             if target is not None:
@@ -2066,6 +2094,10 @@ def build_react_graph(
                 # B-76 — not run is not failed. A withheld call's ``status="error"``
                 # must not reach the classifier (a withheld ``save_artifact`` would
                 # read as "the write did not land") → no advisory, no error count.
+                # B-226 ⑤ — an approved ``risk_confirmation`` did not run either, but it
+                # grants what an earlier rejection refused: it clears that entry.
+                if idx in approved_questions:
+                    batch_outcomes.append((_ledger_key(tool_calls[idx], tool_message, None), None))
                 continue
             failure = _classify_tool_failure(tool_calls[idx], tool_message, classified)
             ledger_failure = _ledger_failure(failure, classified)
@@ -2075,7 +2107,9 @@ def build_react_graph(
                 batch_outcomes.append(
                     (_ledger_key(tool_calls[idx], tool_message, failure), ledger_failure)
                 )
-            if failure is not None:
+            # B-226 ③ — a soft failure (no advice) stops here, ledger-only: its own
+            # result already says what failed.
+            if failure is not None and failure.advice:
                 tool_failures.append(failure)
                 _cm_tool_error_total.labels(
                     error_class=failure.error_class, tool=failure.tool_name
@@ -2922,6 +2956,36 @@ def _apply_failure_ledger(
     return list(ledger.values())
 
 
+def _record_refused_call(
+    carried: Sequence[ClassifiedToolError],
+    tool_call: dict[str, Any],
+    tool_message: ToolMessage,
+    registry: ToolRegistry,
+) -> list[ClassifiedToolError]:
+    """B-226 ⑤ — record a call a policy stopped before it ran as ``blocked_by_policy``.
+
+    The two paths that answer a call without running it and let the run go on
+    (action screening ``block``, a rejected approval request that is not a
+    declarative-gate veto) return before the batch bookkeeping, so without this
+    the action never happened and the ledger never heard of it. Same key and the
+    same B-164 read-only exemption as a failure that ran: a write is keyed by the
+    resource it targets, so a later successful write of it settles the entry.
+    """
+    name = str(tool_call.get("name", ""))
+    outcome = classify_mutation(name, tool_call.get("args") or {}, tool_message)
+    failure = classified_blocked(
+        tool_name=name,
+        summary=str(tool_message.content),
+        path=outcome.path if outcome is not None else None,
+    )
+    tool = registry.get(name)
+    if _is_read_only_failure(tool.spec if tool is not None else None, failure):
+        return list(carried)
+    return _apply_failure_ledger(
+        carried, [(_ledger_key(tool_call, tool_message, failure), failure)]
+    )
+
+
 def _plan_identity_hash(plan: Plan) -> str:
     """动态子智能体委派增强(层 1)— plan identity for the nudge dedupe.
 
@@ -3636,7 +3700,8 @@ async def _dispatch_tool(
     refund is ``0`` for every code path that does not produce a
     successful :class:`~orchestrator.tools.registry.ToolResult` (errors,
     blocks, unknown tools); ``classified_error`` is ``None`` on the
-    success path and set on every failure path.
+    success path and set on every failure path — including a result the
+    tool itself reports as failed (B-226 ③, ``ToolResult.failed``).
 
     Stream TE-2 — each dispatch emits one ``TOOL_CALL`` audit row
     (``result=ERROR`` when the tool returns an error) or, when a
@@ -4480,6 +4545,16 @@ async def _invoke_tool(
     if persist_path is not None:
         meta_artifact[TOOL_RESULT_PATH_ARTIFACT_KEY] = persist_path
     artifact: dict[str, Any] | None = meta_artifact or None
+    # B-226 ③ — a result the tool itself reports as failed is a failure for the
+    # run's ledger, not a success that clears one. The wire status stays
+    # ``success``: the tool did return a result, and API clients read it as such.
+    soft_failure = (
+        classified_soft_failure(
+            tool_name=tool.spec.name, spec=tool.spec, transient=result.failure_transient
+        )
+        if result.failed
+        else None
+    )
     return (
         # ``name`` records which tool produced this result (for MCP tools,
         # ``mcp:server.tool``). LangChain leaves it null unless set, so the raw
@@ -4487,7 +4562,7 @@ async def _invoke_tool(
         ToolMessage(content=content, tool_call_id=call_id, name=tool.spec.name, artifact=artifact),
         result.state_updates,
         result.refund_iterations,
-        None,
+        soft_failure,
     )
 
 

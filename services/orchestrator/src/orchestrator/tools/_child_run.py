@@ -41,6 +41,7 @@ from expert_work.runtime.cancellation import (
     RunCancelledError,
 )
 from expert_work.runtime.middleware import MeteredCall, usage_tap
+from expert_work.runtime.runs.schemas import compute_completed
 from orchestrator.errors import MaxStepsExceededError
 from orchestrator.multimodal import image_ref_block
 from orchestrator.tools._budget import DELEGATION_GATE_KEY
@@ -619,6 +620,24 @@ async def run_child_to_result(
         iteration_used=step_count,
         llm_call_count=llm_call_count,
         wall_clock_ms=wall_clock_ms,
+        unfinished=not _child_completed(result),
+    )
+
+
+def _child_completed(result: Any) -> bool:
+    """B-226 ③ — the child's own ``compute_completed`` verdict on its final state.
+
+    ``False`` for a budget wrap-up and for a child that answered with a failure of
+    its own still unresolved (its last script failed). No exit record (no B-85
+    stamp) is no verdict, not a failure.
+    """
+    if not isinstance(result, Mapping):
+        return True
+    raw_exit = result.get("exit_reason")
+    if not isinstance(raw_exit, str):
+        return True
+    return compute_completed(
+        exit_reason=raw_exit, unresolved_failures=result.get("unresolved_failures") or []
     )
 
 
@@ -639,7 +658,14 @@ def _build_tool_result(
     iteration_used: int,
     llm_call_count: int,
     wall_clock_ms: int,
+    unfinished: bool = False,
 ) -> ToolResult:
+    """``unfinished`` — a COMPLETED delegation that still did not finish the job
+    (budget wrap-up, the child's own ledger not empty). It and every FAILED exit set
+    ``failed`` (B-226 ③). FAILED exits and a budget wrap-up lead the reply with a
+    status line; a child whose own ledger is not empty does not — its answer comes
+    back as-is, only the parent's ledger records it.
+    """
     invocation = SubAgentInvocation(
         task_id=sub_run_id,
         sub_thread_id=sub_thread_id,
@@ -659,6 +685,7 @@ def _build_tool_result(
         content=content,
         meta=meta,
         state_updates={"subagent_invocations": [invocation]},
+        failed=status is not SubagentStatus.COMPLETED or unfinished,
     )
 
 

@@ -270,6 +270,16 @@ def test_g14_g15_fixture_facts() -> None:
     assert wrong in g15.turns[0].prompt and wrong not in line3, "抄错的片段必须真的对不上"
 
 
+def test_g17_fixture_always_fails_and_never_prints_ok() -> None:
+    """B-226 g17's premise: exit 2 with a stderr line is a failure the platform records
+    (not an exit 1 with an empty stderr), and nothing it prints contains OK."""
+    [g17] = load_cases(CASES_DIR, only=["g17-script-always-fails"])
+    assert g17.requires_tool_error and g17.fixtures == ["source-check.txt"]
+    script = (FIXTURES_DIR / "source-check.txt").read_text(encoding="utf-8")
+    assert "sys.exit(2)" in script and "file=sys.stderr" in script
+    assert "OK" not in script
+
+
 def test_g02_fixture_has_the_three_outdated_lines_where_the_case_says() -> None:
     lines = (FIXTURES_DIR / "report-300-lines.md").read_text(encoding="utf-8").splitlines()
     assert len(lines) == 300
