@@ -146,6 +146,7 @@ from orchestrator.tools import ToolEnv, build_tool_registry
 from orchestrator.tools.arg_bindings import manifest_bindings
 from orchestrator.tools.file_ops import SandboxWorkspaceWriter
 from orchestrator.tools.knowledge import Reranker
+from orchestrator.tools.knowledge_catalog import CATALOG_UNAVAILABLE, load_knowledge_catalog
 from orchestrator.tools.manage_task import ManageTaskTool
 from orchestrator.tools.overflow import tool_output_budget_enabled
 from orchestrator.tools.registry import ToolContext, ToolRegistry
@@ -1175,6 +1176,8 @@ async def build_agent(
         and len(registry) > 0
         else None
     )
+    # B-175 P4 — only an agent binding two or more knowledge bases.
+    knowledge_catalog, knowledge_fingerprint = await _knowledge_catalog(spec, env, tenant_id)
     final_system_prompt = _assemble_system_prompt(
         base=spec.spec.system_prompt.template,
         skill_fragments=loaded_skills.prompt_fragments,
@@ -1190,6 +1193,7 @@ async def build_agent(
         # opt-out, the platform wiring switch, and the depth cap all fold into
         # that one fact, so an agent without the tool never reads its rubric.
         worker_delegation=SPAWN_WORKER_TOOL_NAME in registry,
+        knowledge_catalog=knowledge_catalog,
     )
 
     # Capability Uplift Sprint #8 (Mini-ADR U-8) — render mode for the
@@ -1359,6 +1363,7 @@ async def build_agent(
         # platform hard cap by ``AgentRuntime.new_worker_spawn_budget``.
         worker_max_concurrent=spec.spec.dynamic_workers.max_concurrent,
         worker_max_per_run=spec.spec.dynamic_workers.max_per_run,
+        knowledge_catalog_fingerprint=knowledge_fingerprint,
     )
 
 
@@ -1820,10 +1825,11 @@ def _current_date_block(now: datetime) -> str:
 #: to never fabricate tool output. Aligns with hermes-agent's
 #: ``TOOL_USE_ENFORCEMENT`` + ``TASK_COMPLETION`` guidance.
 # 动态子智能体委派率增强(层 2)— appended (with its ``# Subtask delegation``
-# heading) as the system prompt's FINAL section whenever this build registered
-# the ``spawn_worker`` tool. Domain-free by design: a scale rubric over work
-# *shapes* only, so it composes with any agent prompt — one that carries its
-# own delegation policy keeps it; this section is the generic floor.
+# heading) after the advisory blocks — only the B-175 P4 knowledge catalog
+# follows it — whenever this build registered the ``spawn_worker`` tool.
+# Domain-free by design: a scale rubric over work *shapes* only, so it composes
+# with any agent prompt — one that carries its own delegation policy keeps it;
+# this section is the generic floor.
 _WORKER_DELEGATION_BLOCK = (
     "Before starting a task, judge its scale. Single-point work (one "
     "question, one document, one step): do it yourself — do not delegate. "
@@ -1925,6 +1931,45 @@ COMPLETION_CONTRACT_CLAUSE = """<completion-contract>
 </completion-contract>"""
 
 
+async def _knowledge_catalog(
+    spec: AgentSpec, env: ToolEnv, tenant_id: Any
+) -> tuple[str | None, str | None]:
+    """B-175 P4 — ``(section body, fingerprint)`` of the ``# Knowledge bases``
+    section of an agent binding two or more knowledge bases (``(None, None)``
+    otherwise, or without a tenant).
+
+    A store failure builds without it, warned, fingerprint
+    :data:`CATALOG_UNAVAILABLE`: the catalog only steers where to search, and
+    ``knowledge_search`` with ``bases`` omitted still searches every base. The
+    build cache keys carry the same catalog's fingerprint (control plane), so an
+    edited description or bucket reaches the next run; a build whose fingerprint
+    differs from its key's is not cached.
+    """
+    knowledge = spec.spec.knowledge
+    if knowledge is None or env.knowledge_retriever is None or not isinstance(tenant_id, UUID):
+        return None, None
+    try:
+        catalog = await load_knowledge_catalog(
+            env.knowledge_retriever.store,
+            tenant_id=tenant_id,
+            refs=knowledge.knowledge_base_refs,
+        )
+    except Exception:
+        logger.warning(
+            "agent_factory.knowledge_catalog_unavailable — building without the catalog",
+            exc_info=True,
+        )
+        return None, CATALOG_UNAVAILABLE
+    if catalog is None:
+        return None, None
+    logger.info(
+        "agent_factory.knowledge_catalog entries=%d fingerprint=%s",
+        len(catalog.entries),
+        catalog.fingerprint,
+    )
+    return catalog.render(), catalog.fingerprint
+
+
 def _assemble_system_prompt(
     *,
     base: str,
@@ -1937,6 +1982,7 @@ def _assemble_system_prompt(
     tool_use_enforcement: str | None = None,
     spotlight: bool = False,
     worker_delegation: bool = False,
+    knowledge_catalog: str | None = None,
 ) -> str:
     """Splice base system prompt + skill summary list + ordered body
     fragments (eager skills only) + SE-10 text-class component blocks.
@@ -2041,6 +2087,12 @@ def _assemble_system_prompt(
     # append-a-section convention above.
     if worker_delegation:
         pieces.append("\n\n# Subtask delegation\n" + _worker_delegation_block())
+
+    # B-175 P4 — the knowledge catalog (``knowledge_catalog`` module; 2+ bound
+    # bases). Last, so a description edit or a document-count bucket change
+    # keeps every section above it in the provider's prompt cache.
+    if knowledge_catalog:
+        pieces.append("\n\n# Knowledge bases\n" + knowledge_catalog)
 
     return "".join(pieces)
 

@@ -2076,6 +2076,9 @@ def create_app(
                 )
                 # Stream MCP-OAUTH (OA-3b) — let get_agent decide per-user builds.
                 resolved_agent_runtime.user_oauth_pool_provider = _user_mcp_oauth_pool_provider
+                # B-175 P4 — the knowledge catalog's fingerprint joins the build
+                # cache key; read from the store the builds read it from.
+                resolved_agent_runtime.knowledge_store = resolved_knowledge_store
                 # Stream T (PR B) — these background workers (ingestion runner,
                 # DLQ worker, consolidator) are ALWAYS started. ``embedder`` is a
                 # ``DynamicResolvingEmbedder`` that resolves the live platform

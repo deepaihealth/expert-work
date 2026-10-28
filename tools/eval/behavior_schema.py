@@ -13,14 +13,14 @@ from pathlib import Path
 from typing import Annotated, Any, Literal
 
 import yaml
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 DATASET_DIR = Path(__file__).parent / "datasets" / "behavior"
 CASES_DIR = DATASET_DIR / "cases"
 FIXTURES_DIR = DATASET_DIR / "fixtures"
 AGENTS_DIR = DATASET_DIR / "agents"
 
-AgentCode = Literal["eval-general", "eval-ahp", "eval-compress"]
+AgentCode = Literal["eval-general", "eval-ahp", "eval-compress", "eval-kb"]
 
 
 class _Strict(BaseModel):
@@ -64,6 +64,18 @@ def _regex(value: str) -> str:
 
 class FinalTextRegex(_Strict):
     type: Literal["final_text_regex"]
+    pattern: str = Field(min_length=1)
+
+    @field_validator("pattern")
+    @classmethod
+    def _compiles(cls, value: str) -> str:
+        return _regex(value)
+
+
+class FinalTextNotRegex(_Strict):
+    """最后一轮回复里**没有**匹配 ``pattern`` 的地方(B-175 P4 k05:编出来的月份)。"""
+
+    type: Literal["final_text_not_regex"]
     pattern: str = Field(min_length=1)
 
     @field_validator("pattern")
@@ -180,6 +192,42 @@ class ToolNotUsedOn(_Strict):
     turn: int | None = Field(default=None, ge=1)  # None = 全部轮次
 
 
+_HANDLE = re.compile(r"[Kk][1-9][0-9]*")
+
+
+def arg_key(value: object) -> str:
+    """一个工具参数值的比较口径(:class:`ToolArgContains`):去空白;``K2`` 这类句柄
+    不分大小写,其它值原样 —— 与 ``knowledge_search`` 认库的口径一致。"""
+    text = str(value).strip()
+    return text.upper() if _HANDLE.fullmatch(text) else text
+
+
+class ToolArgContains(_Strict):
+    """某工具调用的参数 ``arg`` 含 ``any_of`` 之一、且不含 ``none_of`` 里的任何一个(B-175 P4:
+    ``knowledge_search`` 有没有只按该查的库检索 —— 选了所有库也「含」对的那个)。
+
+    只看工具接受了的调用(被拒的不算,例如传了没绑定的库)。参数是列表时逐项比、是字符串时
+    整串比、去空白;``K2`` 这类句柄不分大小写,其它值区分大小写 —— 与工具的认法一致。
+    ``call: first`` 只看第一次被接受的调用(范围内),``any`` 任一次满足即可。
+    """
+
+    type: Literal["tool_arg_contains"]
+    tool: str = Field(min_length=1)
+    arg: str = Field(min_length=1)
+    any_of: list[str] = Field(min_length=1)
+    none_of: list[str] = Field(default_factory=list)
+    turn: int | None = Field(default=None, ge=1)  # None = 全部轮次
+    call: Literal["first", "any"] = "first"
+
+    @model_validator(mode="after")
+    def _disjoint(self) -> ToolArgContains:
+        # 同一个值两边都有,判据永远不过:加载时就报错。
+        both = {arg_key(v) for v in self.any_of} & {arg_key(v) for v in self.none_of}
+        if both:
+            raise ValueError(f"{sorted(both)} in both any_of and none_of")
+        return self
+
+
 class TurnTokensMax(_Strict):
     type: Literal["turn_tokens_max"]
     turn: int = Field(ge=1)
@@ -193,6 +241,7 @@ Check = Annotated[
     | FinalTextContains
     | FinalTextNotContains
     | FinalTextRegex
+    | FinalTextNotRegex
     | ArtifactExists
     | ArtifactContains
     | ArtifactNotContains
@@ -205,6 +254,7 @@ Check = Annotated[
     | ToolNotUsed
     | ToolCountMax
     | ToolNotUsedOn
+    | ToolArgContains
     | TurnTokensMax,
     Field(discriminator="type"),
 ]
@@ -221,7 +271,7 @@ class Turn(_Strict):
 
 
 class Case(_Strict):
-    id: str = Field(pattern=r"^[ghc][0-9]{2}-[a-z0-9-]+$")
+    id: str = Field(pattern=r"^[ghck][0-9]{2}-[a-z0-9-]+$")
     agent: AgentCode
     shape: str = Field(min_length=1)  # 出处:ROADMAP 编号
     fixtures: list[str] = Field(default_factory=list)
@@ -285,6 +335,9 @@ class ToolCall(_Strict):
     turn: int
     name: str
     args: dict[str, Any] = Field(default_factory=dict)
+    id: str | None = None
+    #: 这次调用的工具结果是失败(按 ``tool_call_id`` 对上;流里没有 id 时记不上,恒为 False)
+    error: bool = False
 
 
 class TurnRecord(_Strict):

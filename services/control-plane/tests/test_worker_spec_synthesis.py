@@ -325,3 +325,35 @@ def test_worker_inherits_fixed_tool_args(worker_policy: bool) -> None:
     assert [(b.tool, b.fixed) for b in entry.arg_bindings] == [  # type: ignore[union-attr]
         ("fetch_record", {"detail_level": "brief"})
     ]
+
+
+@pytest.mark.parametrize("worker_policy", [True, False])
+def test_worker_inherits_the_parents_knowledge(worker_policy: bool) -> None:
+    """B-175 P4(10-27 拍板)—— worker 继承父的知识库:同一组库、同一顺序(目录句柄按顺序)。"""
+    parent = _parent(knowledge={"knowledge_base_refs": ["specs", "warranty"]})
+    w = synthesize_worker_spec(
+        parent,
+        role=None,
+        max_iterations=8,
+        allowed_toolsets=[],
+        worker_policy=worker_policy,
+    )
+    assert w.spec.knowledge is not None
+    assert w.spec.knowledge.knowledge_base_refs == ["specs", "warranty"]
+
+
+@pytest.mark.parametrize(
+    ("allowed", "kept"),
+    [([], True), (["web_search"], False), (["web_search", "knowledge_search"], True)],
+)
+def test_worker_knowledge_follows_the_platform_allowlist(allowed: list[str], kept: bool) -> None:
+    """A non-empty ``dynamic_worker_allowed_toolsets`` keeps only the listed tools;
+    ``knowledge_search`` comes from the ``knowledge`` block, so the block goes too."""
+    parent = _parent(knowledge={"knowledge_base_refs": ["specs", "warranty"]})
+    w = synthesize_worker_spec(parent, role=None, max_iterations=8, allowed_toolsets=allowed)
+    assert (w.spec.knowledge is not None) is kept
+
+
+def test_worker_of_a_parent_without_knowledge_has_none() -> None:
+    w = synthesize_worker_spec(_parent(), role=None, max_iterations=8, allowed_toolsets=[])
+    assert w.spec.knowledge is None

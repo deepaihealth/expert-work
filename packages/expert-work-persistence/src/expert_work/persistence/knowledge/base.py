@@ -263,6 +263,15 @@ class KnowledgeStore(abc.ABC):
         tenant's bases in one query — used by ``list_bases`` to avoid N+1."""
 
     @abc.abstractmethod
+    async def count_documents_capped(
+        self, *, tenant_id: UUID, kb_ids: Sequence[UUID], cap: int
+    ) -> dict[UUID, int]:
+        """``{kb_id: min(document_count, cap)}`` for every id in ``kb_ids``
+        (``0`` for a base without documents, or not the tenant's). Each count
+        stops after ``cap`` rows — B-175 P4: the knowledge catalog reads this on
+        every run of an agent binding several bases and only needs a bucket."""
+
+    @abc.abstractmethod
     async def base_stats_many_all_tenants(
         self, *, kb_ids: Sequence[UUID]
     ) -> dict[UUID, tuple[int, int]]:

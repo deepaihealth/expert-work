@@ -351,6 +351,101 @@ def _followup_notes() -> str:
     )
 
 
+# B-175 P4(k01~k05):eval-kb 绑的三个知识库,顺序就是目录句柄 K1 / K2 / K3。描述原样填进控制台:
+# k05 问的「年度体检」只在 hr 库的描述里提到,文档里没有(目录不是证据)。
+KB_BASES = {
+    "b140-kb-warranty": "家电各品类的保修期限、退换货与维修收费规定(合成数据)",
+    "b140-kb-specs": "各型号家电的技术参数与待机能效分级(合成数据)",
+    "b140-kb-hr": "员工差旅住宿、伙食补助、请假、报销流程与年度体检安排(合成数据)",
+}
+
+# 每个数只在一个库里出现(test_behavior_dataset 复核)。k03:型号 → 品类只在参数库,
+# 品类 → 保修期只在保修库;k04:「A 级」在参数库是待机能效等级,在 hr 库是城市等级。
+_KB_TEXTS: dict[str, dict[str, str]] = {
+    "b140-kb-warranty": {
+        "warranty-periods.md": (
+            "# 家电保修期限(合成数据)\n\n"
+            "整机保修期按品类计算,自购买发票日期起算。\n\n"
+            "- 空气净化器:整机保修 18 个月,滤网属于耗材,不在保修范围内。\n"
+            "- 除湿机:整机保修 26 个月,压缩机单独保修 74 个月。\n"
+            "- 电水壶:整机保修 15 个月。\n"
+            "- 落地扇:整机保修 13 个月。\n"
+        ),
+        "warranty-returns.md": (
+            "# 退换货规定(合成数据)\n\n"
+            "签收之日起 9 天内,商品无人为损坏且包装配件齐全的,可以无理由退货。\n"
+            "签收后第 10 天至第 31 天内出现性能故障的,经检测确认后可以换同型号新机。\n"
+            "超过 31 天的故障按保修处理,不再退换。\n"
+        ),
+        "warranty-repair-fees.md": (
+            "# 保修期外维修收费(合成数据)\n\n"
+            "保修期外的维修收取上门服务费 47 元每次,维修工时费每小时 63 元,更换的配件另行计价。\n"
+            "保修期内的维修不收上门服务费和工时费。\n"
+        ),
+        "warranty-claims.md": (
+            "# 保修申请(合成数据)\n\n"
+            "申请保修需要提供购买发票或电子订单截图,以及产品机身上的序列号。\n"
+            "序列号被涂改或撕毁的产品不予保修。受理后 3 个工作日内安排检测。\n"
+        ),
+        "warranty-exclusions.md": (
+            "# 不在保修范围内的情形(合成数据)\n\n"
+            "人为损坏、进水、跌落、使用非原装配件、自行拆修造成的故障,以及耗材的正常损耗,"
+            "均不在保修范围内,按保修期外维修收费。\n"
+        ),
+    },
+    "b140-kb-specs": {
+        "specs-kx217.md": (
+            "# KX-217 技术参数(合成数据)\n\n"
+            "品类:空气净化器\n额定功率:46 W\n洁净空气量:383 立方米每小时\n"
+            "建议使用面积:29 至 52 平方米\n"
+        ),
+        "specs-kx305.md": (
+            "# KX-305 技术参数(合成数据)\n\n"
+            "品类:除湿机\n额定功率:237 W\n日除湿量:21 升\n水箱容量:4.6 升\n"
+        ),
+        "specs-kx512.md": (
+            "# KX-512 技术参数(合成数据)\n\n品类:电水壶\n额定功率:1730 W\n容量:1.7 升\n"
+        ),
+        "specs-kx640.md": (
+            "# KX-640 技术参数(合成数据)\n\n品类:落地扇\n额定功率:38 W\n风速档位:5 档\n"
+        ),
+        "specs-standby-grades.md": (
+            "# 待机能效分级(合成数据)\n\n"
+            "按待机功率把整机分为三级:A 级待机功率不超过 0.37 W,B 级不超过 0.82 W,"
+            "C 级不超过 1.45 W。目前在售的各型号均为 A 级。\n"
+        ),
+    },
+    "b140-kb-hr": {
+        "hr-travel-lodging.md": (
+            "# 差旅住宿标准(合成数据)\n\n"
+            "出差城市分为三级,住宿费按晚报销,超出部分由个人承担:\n\n"
+            "- A 级城市:每晚不超过 735 元。\n"
+            "- B 级城市:每晚不超过 468 元。\n"
+            "- C 级城市:每晚不超过 356 元。\n"
+        ),
+        "hr-travel-meals.md": (
+            "# 出差伙食补助(合成数据)\n\n"
+            "出差期间按自然天数发放伙食补助,每天 97 元,不需要提供餐饮发票。\n"
+        ),
+        "hr-leave.md": (
+            "# 请假制度(合成数据)\n\n"
+            "入职满一年后每年享有带薪年假 6 天,满五年后每年 11 天。"
+            "病假需要提供医院证明,事假需提前两个工作日申请。\n"
+        ),
+        "hr-reimbursement.md": (
+            "# 报销流程(合成数据)\n\n"
+            "出差结束后 14 天内提交报销单并附发票原件。"
+            "单笔金额超过 2400 元的报销需要部门负责人签字。\n"
+        ),
+        "hr-overtime.md": (
+            "# 加班与调休(合成数据)\n\n"
+            "工作日加班可以按 1 比 1 调休,调休需在加班后 60 天内使用,过期作废。\n"
+        ),
+    },
+}
+KB_DOCS = {base: list(docs) for base, docs in _KB_TEXTS.items()}
+
+
 def build() -> dict[str, str | bytes]:
     return {
         "report-300-lines.md": _report(),
@@ -371,12 +466,18 @@ def build() -> dict[str, str | bytes]:
         "sleep-log.md": _sleep_log(),
         "diet-log.md": _diet_log(),
         "followup-notes.md": _followup_notes(),
+        **{
+            f"kb/{base}/{doc}": text
+            for base, docs in _KB_TEXTS.items()
+            for doc, text in docs.items()
+        },
     }
 
 
 if __name__ == "__main__":
     for name, content in build().items():
         path = HERE / name
+        path.parent.mkdir(parents=True, exist_ok=True)
         if isinstance(content, bytes):
             path.write_bytes(content)
         else:

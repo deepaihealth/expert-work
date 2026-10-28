@@ -101,7 +101,7 @@ The JSON artifact lands in `eval-out/prompt_ab_<eval-set>.json`.
 ## B-140 行为回归评测(在测试环境真跑)
 
 设计:`docs/superpowers/specs/2026-10-05-b140-behavior-regression-eval-design.md`。用例在
-`datasets/behavior/cases/`(全部合成),两个评测智能体在 `datasets/behavior/agents/`。
+`datasets/behavior/cases/`(全部合成),评测智能体在 `datasets/behavior/agents/`。
 
 跑在测试环境的对接方租户里(用户 10-05 拍板),用现成的 canary key(Secret `canary-credentials`)。一次性准备:
 用控制台登录态把两个评测智能体 manifest 导入该租户(新建智能体只能走控制台平面)。
@@ -136,6 +136,26 @@ uv run --no-sync python tools/eval/behavior_compare.py eval-out/b140/<改动前>
 恢复用例(B-163,`g14` / `g15`):任务中途确定会有一次工具失败(读一个不存在的文件 / 照抄一段对不上的原文去 `edit_file`),
 看模型能不能接着把事做完。用例写了 `requires_tool_error: true`:整次一次失败的工具调用都没有(模型绕开了那次失败)
 就判「不可判」,与 `requires_compaction` 同一口径。
+
+知识库用例(B-175 P4 多库目录 + 按库检索,`k01`~`k05`,`--only` 选它们):跑在 `eval-kb`,绑三个合成知识库。
+**一次性准备**(在跑评测的同一个租户里,控制台知识库页;嵌入费用几分钱):
+
+1. 建三个知识库,名字与描述**逐字**照 `datasets/behavior/fixtures/make_fixtures.py` 的 `KB_BASES`
+   (k05 依赖 `b140-kb-hr` 的描述里提到、文档里却没有的「年度体检」):
+   `b140-kb-warranty`「家电各品类的保修期限、退换货与维修收费规定(合成数据)」、
+   `b140-kb-specs`「各型号家电的技术参数与待机能效分级(合成数据)」、
+   `b140-kb-hr`「员工差旅住宿、伙食补助、请假、报销流程与年度体检安排(合成数据)」;其余设置用默认值。
+2. 把 `datasets/behavior/fixtures/kb/<库名>/` 下的全部文件上传到同名的库,等文档都变成就绪。
+3. 导入 `datasets/behavior/agents/eval-kb.yaml`。`knowledge_base_refs` 的顺序就是系统提示词目录里的句柄
+   (K1 = warranty、K2 = specs、K3 = hr),k01 / k02 的 `tool_arg_contains` 按它判,**不要调顺序**。
+
+```sh
+EXPERT_WORK_API_TOKEN=… uv run --no-sync python tools/eval/behavior_runner.py --label kb-cand-$(date +%m%d) \
+  --only k01-route-specs,k02-route-warranty,k03-cross-base,k04-same-term-two-bases,k05-catalog-not-evidence
+```
+
+改动前的版本 `knowledge_search` 没有 `bases` 参数,k01 / k02 的 `tool_arg_contains` 在基线上必然不过;对照时看其余判据
+(答对没有、检索次数)与 k03~k05 有没有退步。改 fixtures 要改 `make_fixtures.py` 重新生成,并把库里的文档换成新版。
 
 ## ClinConsensus 健康问答小测(`clinconsensus.py`,2026-10-09)
 

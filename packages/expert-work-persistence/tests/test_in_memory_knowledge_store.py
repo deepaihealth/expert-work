@@ -249,6 +249,28 @@ async def test_base_stats_counts_documents_and_chunks() -> None:
 
 
 @pytest.mark.asyncio
+async def test_count_documents_capped() -> None:
+    """B-175 P4 — the knowledge catalog's per-base document count: only the
+    asked bases, each stopped at ``cap``; another tenant's documents never count,
+    even when its base id is passed. Every asked id is in the answer."""
+    store = InMemoryKnowledgeStore()
+    tenant, other_tenant = uuid4(), uuid4()
+    a = await store.create_base(tenant_id=tenant, name="a")
+    b = await store.create_base(tenant_id=tenant, name="b")
+    empty = await store.create_base(tenant_id=tenant, name="empty")
+    foreign = await store.create_base(tenant_id=other_tenant, name="a")
+    for kb, owner, n in ((a, tenant, 3), (b, tenant, 1), (foreign, other_tenant, 2)):
+        for _ in range(n):
+            await store.upsert_document(tenant_id=owner, kb_id=kb.id, filename=f"{uuid4()}.md")
+    got = await store.count_documents_capped(
+        tenant_id=tenant, kb_ids=[a.id, b.id, empty.id, foreign.id, a.id], cap=2
+    )
+    assert got == {a.id: 2, b.id: 1, empty.id: 0, foreign.id: 0}
+    assert await store.count_documents_capped(tenant_id=tenant, kb_ids=[a.id], cap=10) == {a.id: 3}
+    assert await store.count_documents_capped(tenant_id=tenant, kb_ids=[], cap=10) == {}
+
+
+@pytest.mark.asyncio
 async def test_stamp_embedding_and_reindex_flag() -> None:
     store = InMemoryKnowledgeStore()
     tenant = uuid4()
