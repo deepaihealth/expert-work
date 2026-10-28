@@ -340,7 +340,7 @@ class _BusyOnce:
 
 
 async def _no_sleep(seconds: float) -> None:
-    del seconds
+    """Stands in for asyncio.sleep; never waits."""
 
 
 def _candidate(number: int) -> FigureCandidate:
