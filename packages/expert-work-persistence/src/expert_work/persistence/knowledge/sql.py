@@ -40,6 +40,7 @@ from sqlalchemy.sql.selectable import CTE
 from expert_work.persistence.knowledge.base import (
     ALL_TENANTS_BASES_LIMIT,
     UNSET,
+    CancelOutcome,
     ClaimedIngestion,
     DocumentFileFacts,
     DuplicateKnowledgeBaseError,
@@ -132,6 +133,9 @@ _TERMINAL_STATUSES = (DocumentStatus.READY.value, DocumentStatus.FAILED.value)
 _EXHAUSTED_ERROR = "ingest attempts exhausted"
 #: ``error`` after discarding a pending upload when nothing was serving.
 _DISCARDED_ERROR = "pending upload discarded; nothing is serving"
+#: B-222 —— the ``error`` :meth:`SqlKnowledgeStore.cancel_documents` writes
+#: (same text as the in-memory store).
+_CANCELLED_ERROR = "cancelled by user"
 
 
 def _fence(
@@ -164,6 +168,33 @@ def _claimable(now: datetime, max_attempts: int) -> ColumnElement[bool]:
             ),
         ),
     )
+
+
+def _cancellable() -> ColumnElement[bool]:
+    """B-222 —— a document :meth:`SqlKnowledgeStore.cancel_documents` may still
+    stop: ``pending``, or ``processing`` short of the point of no return
+    (:func:`_writing_chunks`)."""
+    return or_(
+        KnowledgeDocumentRow.status == DocumentStatus.PENDING.value,
+        and_(
+            KnowledgeDocumentRow.status == DocumentStatus.PROCESSING.value,
+            # NOT at indexing, NULL-safe (a NULL stage must not make the whole
+            # condition NULL).
+            or_(
+                KnowledgeDocumentRow.stage.is_(None),
+                KnowledgeDocumentRow.stage != IngestStage.INDEXING.value,
+            ),
+        ),
+    )
+
+
+def _writing_chunks(row: KnowledgeDocumentRow) -> bool:
+    """B-222 —— past the point of no return: ``processing`` at ``indexing``
+    (the new chunks are being swapped in, READY follows), whatever the lease —
+    a worker whose lease ran out may have died after its swap, with the new
+    chunks serving; the recovery worker re-claims it. The fenced stage write
+    to indexing and a cancel / discard serialise on the row."""
+    return row.status == DocumentStatus.PROCESSING.value and row.stage == IngestStage.INDEXING.value
 
 
 #: What a claim's ``RETURNING`` reads: the document's identity and counters,
@@ -229,13 +260,16 @@ def _to_base(row: KnowledgeBaseRow) -> KnowledgeBase:
 
 
 def _to_document(row: KnowledgeDocumentRow) -> KnowledgeDocument:
+    # A status this version does not know (written by a newer release before a
+    # rollback) reads as failed, saying so — never a 500 on every list call.
+    status = _enum_or(DocumentStatus, row.status, None)
     return KnowledgeDocument(
         id=row.id,
         tenant_id=row.tenant_id,
         kb_id=row.kb_id,
         filename=row.filename,
-        status=DocumentStatus(row.status),
-        error=row.error,
+        status=status or DocumentStatus.FAILED,
+        error=row.error if status is not None else f"status {row.status!r} unknown to this version",
         chunk_count=row.chunk_count,
         attempts=row.attempts,
         ingest_generation=row.ingest_generation,
@@ -1134,7 +1168,7 @@ class SqlKnowledgeStore(KnowledgeStore):
             ).scalar_one_or_none()
             if row is None:
                 return None
-            if not row.has_pending:
+            if not row.has_pending or _writing_chunks(row):
                 await session.commit()
                 return _to_document(row)
             serving = row.chunk_count > 0
@@ -1153,6 +1187,53 @@ class SqlKnowledgeStore(KnowledgeStore):
             await session.commit()
             await session.refresh(row)
             return _to_document(row)
+
+    async def cancel_documents(
+        self, *, tenant_id: UUID, kb_id: UUID, document_ids: Sequence[UUID]
+    ) -> dict[UUID, CancelOutcome]:
+        ids = list(dict.fromkeys(document_ids))
+        if not ids:
+            return {}
+        in_base = (
+            KnowledgeDocumentRow.tenant_id == tenant_id,
+            KnowledgeDocumentRow.kb_id == kb_id,
+            KnowledgeDocumentRow.id.in_(ids),
+        )
+        async with self._sf() as session:
+            cancelled = set(
+                (
+                    await session.execute(
+                        update(KnowledgeDocumentRow)
+                        .where(*in_base, _cancellable())
+                        .values(
+                            status=DocumentStatus.CANCELLED.value,
+                            error=_CANCELLED_ERROR,
+                            ingest_generation=KnowledgeDocumentRow.ingest_generation + 1,
+                            claimed_at=None,
+                            lease_until=None,
+                            updated_at=datetime.now(UTC),
+                        )
+                        .returning(KnowledgeDocumentRow.id)
+                    )
+                )
+                .scalars()
+                .all()
+            )
+            found = set(
+                (await session.execute(select(KnowledgeDocumentRow.id).where(*in_base)))
+                .scalars()
+                .all()
+            )
+            await session.commit()
+        outcomes: dict[UUID, CancelOutcome] = {}
+        for document_id in ids:
+            if document_id in cancelled:
+                outcomes[document_id] = "cancelled"
+            elif document_id in found:
+                outcomes[document_id] = "not_cancellable"
+            else:
+                outcomes[document_id] = "not_found"
+        return outcomes
 
     async def sweep_terminal(self, *, now: datetime, max_attempts: int) -> int:
         async with self._sf() as session:

@@ -1223,3 +1223,31 @@ PY
 - [x] **57.1 租户导入**:控制台「技能」→ 导入 `/tmp/skill57.zip`。判据:导入成功,技能文件列表里有 `assets/reference.pdf`。**没修好时**:400「invalid skill package」。 **10-27 测试 `e90903f7e` 过**:`POST /v1/skills/import` 201,版本 1 的文件列表是 `["assets/reference.pdf"]`(导入后是草稿,启用后才能挂到智能体)。
 - [x] **57.2 平台技能导入**:平台技能页导入同一个包。判据:导入成功。**没修好时**:400,提示「disallowed file type」。 **10-27 测试 `e90903f7e` 过**:`POST /v1/platform/skills/import` 201。
 - [x] **57.3 沙箱读得到**:调试台给一个智能体挂上 57.1 导入的技能,问「技能里那份 PDF 有几页」。判据:智能体在沙箱里读到 `assets/reference.pdf`,答 2 页。测完删掉两处导入的技能。 **10-27 测试 `e90903f7e` 过**(glm-5.3):智能体在 `$EXPERT_WORK_SKILLS_DIR/skill57-pdf-check/assets/` 下看到 `reference.pdf`,用 pypdf 读出 2 页,回答「共 2 页」。两处导入的技能已归档(没有硬删除接口),临时智能体已删。
+
+## §TBD-B1 入库中可取消(B-222 PR-1)
+
+**背景**:入库一旦开始只能等它跑完(或删掉文档),大文档的识别 / 嵌入费照付。现在 `pending` / `processing` 的文档可以取消:新接口 `POST /v1/knowledge/bases/{name}/documents/cancel`(body `{"document_ids": [...]}`,要 `manifest:write`,仅控制台),逐个返回 `cancelled` / `not_cancellable`(已 ready / failed / cancelled,或已到 `stage=indexing` 正在写分段、马上就绪——写分段是不可撤回点,取消在那之后一律拒绝,租约过期也一样(由恢复任务重新认领);「丢弃新版」同理回 409)/ `not_found`(不在这个库);取消 = 状态 `cancelled`、`error=cancelled by user`、代际 +1(在跑的 worker 之后每次带围栏的写都被拒)、释放租约;每个取消的文档审计一条 `knowledge:document_cancel`。花钱的步骤都在下一批之前检查:分段嵌入与语义断点嵌入每 200 条一窗、扫描页识别每 16 页一批、图片描述与图中文字每次调模型之前(重试也算);检查本身出错(数据库抖一下)不算取消,入库照常。接到取消请求的 pod 如果正在跑这份文档(上传入库或恢复任务都算),立刻中止(在途请求一并断开;正在进程池里跑的解析 / 收集图片,名额等那个进程跑完才让出,过了这次调用的截止时间就杀掉进程池让出名额);别的 pod 在跑的,最迟下一次续约(100 秒)被拒即停,恢复任务也一样。已写的识别缓存保留,重新入库不再付费;取消的文档不会被恢复任务认领;重新上传 / 重新入库照常重置。原来就在生效的上一版(同名重传被取消时)继续生效,换嵌入模型重建索引时也会重新嵌入(失败的同名重传同理;重建索引时有文档正在重新入库,库的模型不盖章,仍显示需要重建索引)。控制台:入库中的行多一个「取消入库」按钮(确认框),状态标签「已取消」;只读态置灰。**没有迁移。**
+
+**怎么进**:测试环境控制台(system_admin,平台租户)建临时知识库 `kbb1`。数据库查询走测试库只读连接;日志 `kubectl -n expert-work logs <pod> -c control-plane`。直传 / 指定 pod 发请求用端口转发(同 §55.6),带控制台的登录令牌。**全节费用 < ¥1**(B1.1 嵌入在 `embedding` 刚出现时取消约 ¥0.9 以内、越早越便宜;识别几分钱)。**测试文件(零租户内容,本机生成)**:`kb48-near-a.docx` 用 §48 那段脚本末尾加 `docx("/tmp/kb48-near-a.docx", 2_400_000)`(约 240 万字);扫描件(每页不同,否则相同的页走识别缓存):
+
+```bash
+uv run --no-sync python - <<'PY'
+import pymupdf
+def scan(path, pages):
+    doc = pymupdf.open()
+    for n in range(1, pages + 1):
+        src = pymupdf.open(); p = src.new_page()
+        p.insert_text((72, 120), f"B1-SCAN-PAGE {n}: cold chain boxes ship with two ice packs.", fontsize=14)
+        doc.new_page().insert_image(pymupdf.Rect(0, 0, 595, 842), stream=p.get_pixmap(dpi=200).tobytes("png"))
+    doc.save(path)
+scan("/tmp/b1-scan40.pdf", 40)
+scan("/tmp/b1-scan160.pdf", 160)
+PY
+```
+
+- [ ] **B1.1 嵌入中取消,同一 pod 立即停**:经端口转发把 `kb48-near-a.docx` 直传 pod A 的 `kbb1`;轮询 `GET …/documents`,`stage` 刚变 `embedding` 时经**同一个端口转发**发 `POST …/documents/cancel`。判据:① 返回 `cancelled`;60 秒内(实际应是几秒)`status=cancelled`、`error=cancelled by user`;② `SELECT count(*) FROM knowledge_chunk WHERE document_id = '<id>'` 为 0;③ 这份文档的 `knowledge_ingest` 嵌入用量(上传到取消后 2 分钟这段时间,该租户 text-embedding-v4 的行)远低于 §55.6 的 3,588,096 token,记下数字;④ 取消后 2 分钟内没有新的 `knowledge_ingest` 行;pod A 日志有 `knowledge.ingest_cancelled_local` 和 `knowledge.ingest_lost_lease`,没有 `knowledge.ingest_failed`;⑤ 审计一条 `knowledge:document_cancel`;⑥ 2 分钟后状态仍是 `cancelled`、`attempts` 不变(恢复任务没认领)。**没修好时**:没有取消接口(404 / 405);或状态改了但嵌入一直跑到写分段时才停,用量 ≈ 3.6M token。这份文档测完就删。
+- [ ] **B1.2 识别中取消**:控制台 `kbb1` 上传 `/tmp/b1-scan40.pdf`,状态显示「处理中」且 `stage=recognizing` 时点该行「取消入库」→ 确认。判据:① 60 秒内「已取消」;② 这段时间 glm-ocr 的 `knowledge_ingest` 用量行 ≤ 32(在读的那批读完就停,不再开新批);③ `SELECT count(*) FROM knowledge_parse_cache WHERE document_id = '<id>' AND kind = 'page_ocr'` = 已识别的页数(保留,B1.4 用);④ 没有分段。**没修好时**:40 页全部识别完才停(用量 40 行)。
+- [ ] **B1.3 从另一个 pod 取消**:经端口转发把 `/tmp/b1-scan160.pdf` 直传 pod A,`stage=recognizing` 后经端口转发到 **pod B** 发 `POST …/documents/cancel`。判据:① pod B 返回 `cancelled`;② 100 秒内 pod A 停止识别(glm-ocr 用量行不再增加;通常在读的那批读完就停),pod A 日志 `knowledge.ingest_stale`(租约续期先发现时是 `knowledge.ingest_lost_lease`;不会有 `ingest_cancelled_local`,也没有 `ingest_failed`);③ 状态 `cancelled`、没有分段;④ glm-ocr 用量行 ≤ 取消时已读页数 + 16。**没修好时**:pod A 读完 160 页才发现文档已不归自己。这份文档测完就删。
+- [ ] **B1.4 重新入库,已识别的页不再付费**:对 B1.2 的文档点「重新摄取」。判据:ready、`page_stats.pages_ocr=40`;`GET …/documents/{id}/pages` 里 B1.2 已识别的页 `cached=true`;新增 glm-ocr 用量行数 = 40 − B1.2 ③ 的缓存页数。**没修好时**:取消时把识别缓存删了,40 页重新付费。
+- [ ] **B1.5 已结束的不能取消 + 只读置灰**:对 B1.4 那份 ready 文档发 `POST …/documents/cancel`。判据:返回 `not_cancellable`,状态、`ingest_generation` 不变,没有新的 `knowledge:document_cancel` 审计;控制台 ready / 失败 / 已取消的行都没有「取消入库」按钮;别的库的文档 id 返回 `not_found`。正在写分段(`stage=indexing`)的文档取消回 `not_cancellable`、随后照常 ready(窗口只有几秒,真栈不强求撞上,单测与 SQL 并发测试覆盖)。平台管理账号切入其它租户时,入库中的行「取消入库」置灰、悬停提示只读(该租户此刻没有入库中的文档则不可判,单测覆盖)。
+- [ ] **B1.6 英文界面**:右上角切 English。判据:按钮提示「Cancel ingest」;确认框「Cancel the ingest of "…"?」;状态标签「Cancelled」,悬停「The ingest was cancelled. Re-ingest to run it again; pages and pictures already recognized are not billed again.」。测完删 `kbb1`。

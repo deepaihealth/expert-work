@@ -36,7 +36,7 @@ import multiprocessing
 import weakref
 from array import array
 from collections.abc import Callable, Collection, Sequence
-from concurrent.futures import Executor, ProcessPoolExecutor
+from concurrent.futures import Executor, Future, ProcessPoolExecutor
 from concurrent.futures.process import BrokenProcessPool
 from datetime import UTC, datetime
 from uuid import UUID
@@ -58,6 +58,7 @@ from control_plane.knowledge.parse_workers import (
     FIGURE_POOL,
     FIGURE_POOL_WORKERS,
     PoolBudget,
+    PoolSlot,
     limit_worker_memory,
     terminate_workers,
 )
@@ -76,7 +77,8 @@ from control_plane.knowledge.parsing import (
 )
 from control_plane.knowledge.recognition.figure_pipeline import FigureDescriber
 from control_plane.knowledge.recognition.ingest_parse import ParseJob, PoolRunner, parse_upload
-from control_plane.knowledge.recognition.recognizer import DocumentRecognizer
+from control_plane.knowledge.recognition.recognizer import BatchGuard, DocumentRecognizer
+from control_plane.knowledge.stale import StaleIngestionError as StaleIngestionError
 from control_plane.knowledge.usage import IngestUsageRecorder, billed_embeddings
 from expert_work.persistence import KnowledgeStore
 from expert_work.persistence.knowledge.base import ClaimedIngestion
@@ -139,13 +141,6 @@ _MAX_SPARED = 3
 _sleep = asyncio.sleep
 
 
-class StaleIngestionError(Exception):
-    """A fenced write-back was rejected: the document was re-uploaded (new
-    ``ingest_generation``) or already settled while this worker was busy.
-    Nothing was written; the worker must stop quietly — the document now
-    belongs to another claim."""
-
-
 #: ``error`` for a legacy document whose original bytes were not retained.
 CONTENT_MISSING_ERROR = "original file not retained; re-upload required"
 
@@ -159,6 +154,15 @@ _ERROR_CODE_ATTR = "knowledge_error_code"
 #: comes back, so a document never holds all of them in that form at once.
 #: A multiple of the usual embedding batch sizes: the requests sent are the same.
 CHUNK_EMBED_WINDOW = 200
+
+#: Settled statuses whose chunks may be serving: READY, and a re-upload that
+#: failed or was cancelled (B-222) while the previous version serves on. A
+#: re-index re-embeds them all (and fences on the status it read).
+_SERVING_STATUSES = frozenset(
+    {DocumentStatus.READY, DocumentStatus.FAILED, DocumentStatus.CANCELLED}
+)
+#: Statuses of a document being (re-)ingested: its chunks belong to that ingest.
+_IN_FLIGHT_STATUSES = frozenset({DocumentStatus.PENDING, DocumentStatus.PROCESSING})
 
 
 def failure_code(exc: BaseException) -> IngestErrorCode:
@@ -248,6 +252,15 @@ async def parse_document_in_pool(filename: str, raw: bytes) -> str:
     return await _in_parse_pool(filename, parse_within_cap, filename, raw, max_parsed_chars())
 
 
+def _kill_overdue(executor: Executor, filename: str) -> None:
+    """A cancelled parse past its time (B-222, :class:`PoolSlot`): kill its
+    pool like a timeout does — the parses broken with it are spared. (A pool
+    already replaced was killed by whoever replaced it.)"""
+    logger.warning("knowledge.parse_overdue document=%r — killing the parse pool", filename)
+    _killed_pools.add(executor)
+    _discard_parse_pool(executor)
+
+
 async def _in_parse_pool[T](
     filename: str, fn: Callable[..., T], *args: object, budget: PoolBudget | None = None
 ) -> T:
@@ -256,7 +269,7 @@ async def _in_parse_pool[T](
     rendering use PyMuPDF too, so they run there as well). With ``budget`` the
     call may only use what is left of the document's budget."""
     attempt = spared = 0
-    async with _get_parse_slots():
+    async with PoolSlot(_get_parse_slots()) as slot:
         while True:
             attempt += 1
             loop = asyncio.get_running_loop()
@@ -271,8 +284,13 @@ async def _in_parse_pool[T](
             charged = True
             try:
                 # ``submit`` itself raises on a broken pool — keep it in the try.
-                future = loop.run_in_executor(executor, fn, *args)
-                return await asyncio.wait_for(future, timeout=timeout)
+                call: Future[T] = executor.submit(fn, *args)
+                slot.holds(
+                    call,
+                    deadline=started + timeout,
+                    kill=functools.partial(_kill_overdue, executor, filename),
+                )
+                return await asyncio.wait_for(asyncio.wrap_future(call), timeout=timeout)
             except TimeoutError as exc:
                 logger.warning(
                     "knowledge.parse_timeout document=%r timeout=%gs — killing the parse pool",
@@ -395,6 +413,54 @@ class _BackoffEmbedder:
             raise
 
 
+class _GuardedEmbedder:
+    """B-222 —— runs ``guard`` before each ``embed`` call. Chunks and the
+    semantic chunker's blocks are embedded a window (≤ 200 texts) at a time,
+    so a document cancelled mid-ingest stops paying at the next window."""
+
+    def __init__(self, inner: Embedder, guard: BatchGuard) -> None:
+        self._inner = inner
+        self._guard = guard
+
+    async def embed(self, texts: Sequence[str], *, tenant_id: UUID) -> list[tuple[float, ...]]:
+        await self._guard()
+        return await self._inner.embed(texts, tenant_id=tenant_id)
+
+
+def lease_guard(
+    store: KnowledgeStore,
+    *,
+    tenant_id: UUID,
+    document_id: UUID,
+    generation: int,
+    lease_seconds: int,
+) -> BatchGuard:
+    """B-222 —— the checkpoint an ingest passes before each batch it pays
+    for: a fenced lease renewal. Still this claim's document → the lease is
+    extended; cancelled, re-uploaded, settled or deleted →
+    :class:`StaleIngestionError` (the worker stops and writes nothing). A
+    renewal that errors (a database blip) is not a refusal: the ingest goes
+    on, as with the periodic renewal — its fenced writes still guard it."""
+
+    async def guard() -> None:
+        try:
+            renewed = await store.renew_lease(
+                tenant_id=tenant_id,
+                document_id=document_id,
+                generation=generation,
+                now=datetime.now(UTC),
+                lease_seconds=lease_seconds,
+            )
+        except Exception:
+            logger.warning("knowledge.ingest_guard_failed document=%s", document_id, exc_info=True)
+            return
+        if not renewed:
+            msg = f"document {document_id} was cancelled, re-uploaded or settled elsewhere"
+            raise StaleIngestionError(msg)
+
+    return guard
+
+
 async def _advance(
     store: KnowledgeStore,
     *,
@@ -451,6 +517,7 @@ async def ingest_document_bytes(
     recognizer: DocumentRecognizer | None = None,
     usage: IngestUsageRecorder | None = None,
     figures: FigureDescriber | None = None,
+    guard: BatchGuard | None = None,
 ) -> int:
     """Parse → chunk → embed → store one document; return the chunk count.
 
@@ -468,6 +535,8 @@ async def ingest_document_bytes(
     recognition and embedding calls to the tenant (``knowledge_ingest``).
     B-209 PR-2: ``figures`` describes the images inside PDFs / Word / slide
     files into the text, at their place (without it they are left out).
+    B-222: ``guard`` (:func:`lease_guard`) runs before each embedding window;
+    recognition batches and figure model calls check the fenced stage write.
 
     :raises StaleIngestionError: the fenced write-back was rejected.
     """
@@ -516,6 +585,7 @@ async def ingest_document_bytes(
         doc_title=knowledge_document_title(filename),
         plain_text=is_plain_text_file(filename),
         usage=usage,
+        guard=guard,
     )
 
 
@@ -550,6 +620,7 @@ async def ingest_markdown(
     doc_title: str | None = None,
     plain_text: bool = False,
     usage: IngestUsageRecorder | None = None,
+    guard: BatchGuard | None = None,
 ) -> int:
     """Chunk → embed → store already-parsed Markdown; return the chunk count
     (the chunks searched — parent rows are not counted).
@@ -567,6 +638,8 @@ async def ingest_markdown(
     embedding model) instead of being embedded again. ``plain_text`` chunks
     the text as plain text, not Markdown (a ``.txt`` file). ``usage`` bills
     the embedding calls to the tenant (B-209 §5.8, ``knowledge_ingest``).
+    ``guard`` runs before each embedding window, topic-break ones included
+    (B-222).
 
     B-206 K-1: the chunks are cut inside parent chunks, and each parent that
     is more than its one chunk is stored as a ``parent`` row next to them
@@ -588,6 +661,7 @@ async def ingest_markdown(
             generation=generation,
             doc_title=doc_title,
             plain_text=plain_text,
+            guard=guard,
         )
 
 
@@ -605,8 +679,11 @@ async def _chunk_embed_store(
     generation: int | None,
     doc_title: str | None,
     plain_text: bool,
+    guard: BatchGuard | None,
 ) -> int:
-    retrying = _BackoffEmbedder(pinned)
+    retrying: Embedder = _BackoffEmbedder(pinned)
+    if guard is not None:
+        retrying = _GuardedEmbedder(retrying, guard)
     stage_args = {"tenant_id": tenant_id, "document_id": document_id, "generation": generation}
     await _advance(store, stage=IngestStage.CHUNKING, **stage_args)
     text = strip_lone_surrogates(markdown)
@@ -643,6 +720,9 @@ async def _chunk_embed_store(
     chunk_count = sum(len(parent.children) for parent in parents)
     ensure_chunk_count(chunk_count)
     if not chunk_count:
+        # Clearing the serving chunks is a swap too: past the point of no
+        # return for a cancel (B-222), like ``_embed_store``'s indexing.
+        await _advance(store, stage=IngestStage.INDEXING, **stage_args)
         _ensure_written(
             await store.replace_chunks(
                 tenant_id=tenant_id,
@@ -818,6 +898,36 @@ async def _stop_renewer(renewer: asyncio.Task[None] | None) -> None:
     await asyncio.gather(renewer, return_exceptions=True)
 
 
+class LocalIngests:
+    """B-222 —— the ingests this process is driving now (claimed), each with
+    the call that stops it as a lost claim: its task is cancelled, in-flight
+    model calls are aborted, nothing is written. One per process, shared by
+    the ingestion runner and the recovery worker."""
+
+    def __init__(self) -> None:
+        self._stops: dict[UUID, Callable[[], None]] = {}
+
+    def add(self, document_id: UUID, stop: Callable[[], None]) -> None:
+        self._stops[document_id] = stop
+
+    def discard(self, document_id: UUID, stop: Callable[[], None]) -> None:
+        """Forget ``stop`` — only while it is still the one registered: a newer
+        claim of the same document may have taken its place."""
+        if self._stops.get(document_id) is stop:
+            del self._stops[document_id]
+
+    def cancel(self, document_ids: Collection[UUID]) -> int:
+        """Stop the ingests of ``document_ids`` driven here; how many were."""
+        stopped = 0
+        for document_id in dict.fromkeys(document_ids):
+            stop = self._stops.get(document_id)
+            if stop is not None:
+                logger.info("knowledge.ingest_cancelled_local document=%s", document_id)
+                stop()
+                stopped += 1
+        return stopped
+
+
 class KnowledgeIngestionRunner:
     """Runs the parse → chunk → embed → store pipeline off the request path.
 
@@ -838,6 +948,7 @@ class KnowledgeIngestionRunner:
         recognizer: DocumentRecognizer | None = None,
         usage: IngestUsageRecorder | None = None,
         figures: FigureDescriber | None = None,
+        local: LocalIngests | None = None,
     ) -> None:
         self._store = store
         self._embedder = embedder
@@ -848,6 +959,18 @@ class KnowledgeIngestionRunner:
         self._max_attempts = max_attempts
         self._semaphore = asyncio.Semaphore(max(1, concurrency))
         self._tasks: set[asyncio.Task[None]] = set()
+        #: B-222 —— this process's running ingests; hand it to the recovery
+        #: worker so :meth:`cancel_local` stops its drives too.
+        self.local = local if local is not None else LocalIngests()
+
+    def cancel_local(self, document_ids: Collection[UUID]) -> int:
+        """B-222 —— stop at once the ingests of ``document_ids`` running in
+        this process, by this runner or the recovery worker sharing
+        :attr:`local` (their in-flight model calls are aborted); return how
+        many were running. Call it only after the store cancelled them: the
+        task ends as a lost claim and writes nothing. Ingests on other pods
+        stop at their next checkpoint (:func:`lease_guard`) or lease renewal."""
+        return self.local.cancel(document_ids)
 
     def submit(self, *, tenant_id: UUID, document_id: UUID) -> asyncio.Task[None]:
         """Schedule ingestion of one document; return its background task.
@@ -910,7 +1033,10 @@ class KnowledgeIngestionRunner:
         claim: ClaimedIngestion | None = None
         ready = written = False
         lost = asyncio.Event()
+        #: B-222 —— set once the paid work is over (whatever its outcome).
+        finishing = asyncio.Event()
         owner = asyncio.current_task()
+        stop: Callable[[], None] | None = None
         try:
             async with self._semaphore, raw_bytes_held() as raw_bytes:
                 # CAS-claim before ingesting so a racing recovery sweep never
@@ -938,10 +1064,16 @@ class KnowledgeIngestionRunner:
                     return
 
                 def _on_lost() -> None:
+                    if finishing.is_set():
+                        # Only fenced writes follow; a refusal now is READY
+                        # landing (or the claim lost — those writes then fail).
+                        return
                     lost.set()
                     if owner is not None:
                         owner.cancel()
 
+                stop = _on_lost
+                self.local.add(document_id, stop)
                 renewer = asyncio.create_task(
                     renew_lease_periodically(
                         self._store,
@@ -952,21 +1084,31 @@ class KnowledgeIngestionRunner:
                         on_lost=_on_lost,
                     )
                 )
-                chunk_count = await ingest_document_bytes(
-                    store=self._store,
-                    embedder=self._embedder,
-                    tenant_id=tenant_id,
-                    document_id=document_id,
-                    kb_id=claim.kb_id,
-                    filename=claim.filename,
-                    raw=claim.content,
-                    chunk_max_tokens=claim.chunk_max_tokens,
-                    chunk_overlap_tokens=claim.chunk_overlap_tokens,
-                    generation=claim.generation,
-                    recognizer=self._recognizer,
-                    usage=self._usage,
-                    figures=self._figures,
-                )
+                try:
+                    chunk_count = await ingest_document_bytes(
+                        store=self._store,
+                        embedder=self._embedder,
+                        tenant_id=tenant_id,
+                        document_id=document_id,
+                        kb_id=claim.kb_id,
+                        filename=claim.filename,
+                        raw=claim.content,
+                        chunk_max_tokens=claim.chunk_max_tokens,
+                        chunk_overlap_tokens=claim.chunk_overlap_tokens,
+                        generation=claim.generation,
+                        recognizer=self._recognizer,
+                        usage=self._usage,
+                        figures=self._figures,
+                        guard=lease_guard(
+                            self._store,
+                            tenant_id=tenant_id,
+                            document_id=document_id,
+                            generation=claim.generation,
+                            lease_seconds=self._lease_seconds,
+                        ),
+                    )
+                finally:
+                    finishing.set()
                 written = True  # this claim's chunks are in place
                 settled = await self._store.set_document_status(
                     tenant_id=tenant_id,
@@ -984,9 +1126,9 @@ class KnowledgeIngestionRunner:
         except asyncio.CancelledError:
             if not lost.is_set():
                 raise
-            # The lease renewal was refused: the document was re-uploaded or
-            # settled by another claim — stop working on a result that can no
-            # longer be written.
+            # The lease renewal was refused (the document was re-uploaded or
+            # settled by another claim) or the ingest was cancelled here
+            # (B-222) — stop working on a result that can no longer be written.
             logger.info("knowledge.ingest_lost_lease document=%s", document_id)
         except StaleIngestionError:
             # 重传 / 已被别的认领收尾 —— 本 worker 的结果作废,什么都不写。
@@ -1028,6 +1170,8 @@ class KnowledgeIngestionRunner:
                 generation=claim.generation,
             )
         finally:
+            if stop is not None:
+                self.local.discard(document_id, stop)
             await _stop_renewer(renewer)
             if claim is not None and self._figures is not None:
                 await self._figures.tidy(claim, settled=ready, serving=written)
@@ -1052,8 +1196,19 @@ class KnowledgeIngestionRunner:
                 return  # nothing re-embedded; the model stays unstamped
             documents = await self._store.list_documents(tenant_id=tenant_id, kb_id=kb_id)
             for document in documents:
-                if document.status is not DocumentStatus.READY:
-                    continue  # only documents with chunks can be re-embedded
+                if document.status in _IN_FLIGHT_STATUSES and document.chunk_count > 0:
+                    # B-222: its previous version serves on (and keeps doing so
+                    # if the re-upload is cancelled), but the chunks are not
+                    # ours to swap now — leave the base flagged for a re-index.
+                    failed = True
+                    logger.info(
+                        "knowledge.reindex_document_in_flight kb=%s document=%s",
+                        kb_id,
+                        document.id,
+                    )
+                    continue
+                if document.status not in _SERVING_STATUSES:
+                    continue  # only settled documents' chunks are re-embedded
                 try:
                     await self._reindex_document(
                         tenant_id=tenant_id,
@@ -1114,7 +1269,7 @@ class KnowledgeIngestionRunner:
             chunk.model_copy(update={"embedding": embedding, "embedding_model": model_key})
             for chunk, embedding in zip(existing, embeddings, strict=True)
         ]
-        # Fenced on the generation we read: a re-upload that landed while we
+        # Fenced on the generation and status we read: a re-upload that landed while we
         # were embedding owns the document now (and was embedded with the
         # live model anyway) — do not put the old chunks back.
         written = await self._store.replace_chunks(
@@ -1122,7 +1277,7 @@ class KnowledgeIngestionRunner:
             document_id=document_id,
             chunks=[*parents, *rebuilt],
             generation=document.ingest_generation,
-            expect_status=DocumentStatus.READY,
+            expect_status=document.status,
         )
         if not written:
             logger.info("knowledge.reindex_document_superseded document=%s", document_id)

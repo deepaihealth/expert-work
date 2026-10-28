@@ -51,6 +51,10 @@ class DocumentStatus(StrEnum):
     PROCESSING = "processing"
     READY = "ready"
     FAILED = "failed"
+    #: B-222 —— the user stopped the ingest (from ``pending`` / ``processing``).
+    #: Never claimed again; whatever version was serving before keeps serving.
+    #: A re-upload or re-ingest queues the document as usual.
+    CANCELLED = "cancelled"
     #: Reserved for B-179 content safety (L2-PR2 only declares them; nothing
     #: writes these yet): ``blocked`` = rejected by a safety check, ``disabled``
     #: = kept but excluded from retrieval by an operator.

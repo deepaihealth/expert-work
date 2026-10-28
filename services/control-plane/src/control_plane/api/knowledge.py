@@ -143,6 +143,12 @@ class _TestBody(BaseModel):
     rerank_score_threshold: float | None = Field(default=None, ge=0.0, le=1.0)
 
 
+class _CancelBody(BaseModel):
+    """Body of ``POST /v1/knowledge/bases/{name}/documents/cancel`` (B-222)."""
+
+    document_ids: list[UUID] = Field(min_length=1, max_length=DOCUMENTS_PAGE_MAX)
+
+
 def _get_knowledge_store(request: Request) -> KnowledgeStore:
     return request.app.state.knowledge_store  # type: ignore[no-any-return]
 
@@ -1014,6 +1020,13 @@ def build_knowledge_router() -> APIRouter:
         restored = await store.discard_pending(tenant_id=tenant_id, document_id=document_id)
         if restored is None:  # pragma: no cover - checked just above
             raise HTTPException(status_code=404, detail="document not found")
+        if restored.has_pending:
+            # B-222: its chunks are being swapped in (processing at indexing) —
+            # the new version is about to serve; the store left it alone.
+            raise HTTPException(
+                status_code=409,
+                detail="the new version is being written and about to finish; it can't be dropped",
+            )
         await _audit_write(
             audit,
             request,
@@ -1023,6 +1036,52 @@ def build_knowledge_router() -> APIRouter:
             details={"kb": base.name, "filename": document.filename},
         )
         return JSONResponse(content=_document_dict(restored))
+
+    @router.post(
+        "/bases/{name}/documents/cancel",
+        response_model=None,
+        dependencies=[Depends(require("manifest", "write"))],
+    )
+    async def cancel_documents(
+        name: str,
+        body: _CancelBody,
+        request: Request,
+        store: Annotated[KnowledgeStore, Depends(_get_knowledge_store)],
+        runner: Annotated[KnowledgeIngestionRunner | None, Depends(_get_ingestion_runner)],
+        audit: Annotated[AuditLogger, Depends(_get_audit)],
+    ) -> JSONResponse:
+        """B-222 —— stop the ingest of the base's ``pending`` / ``processing``
+        documents. Per document: ``cancelled``, ``not_cancellable`` (already
+        settled, or already writing its chunks — about to finish) or
+        ``not_found``. What was written stays (recognition and topic-break
+        caches: a re-ingest does not pay for them again); the version serving
+        before, if any, keeps serving. An ingest this pod drives (upload or
+        recovery) stops at once; elsewhere at its next batch."""
+        tenant_id: UUID = request.state.tenant_id
+        base = await _require_base(store, tenant_id, name)
+        outcomes = await store.cancel_documents(
+            tenant_id=tenant_id, kb_id=base.id, document_ids=body.document_ids
+        )
+        cancelled = [doc_id for doc_id, outcome in outcomes.items() if outcome == "cancelled"]
+        if runner is not None and cancelled:
+            runner.cancel_local(cancelled)
+        for document_id in cancelled:
+            await _audit_write(
+                audit,
+                request,
+                action=AuditAction.KNOWLEDGE_DOCUMENT_CANCEL,
+                resource_type="knowledge_document",
+                resource_id=str(document_id),
+                details={"kb": base.name},
+            )
+        return JSONResponse(
+            content={
+                "results": [
+                    {"document_id": str(doc_id), "outcome": outcome}
+                    for doc_id, outcome in outcomes.items()
+                ]
+            }
+        )
 
     @router.get(
         "/bases/{name}/documents/{document_id}/chunks",

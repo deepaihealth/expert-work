@@ -260,6 +260,8 @@ class AuditAction(StrEnum):
     # waited for recognition (recognized pages come from the cache).
     KNOWLEDGE_DOCUMENT_RECOGNIZE = "knowledge:document_recognize"
     KNOWLEDGE_DOCUMENT_DISCARD_PENDING = "knowledge:document_discard_pending"
+    # B-222 — stop an ingest in progress (one row per document cancelled).
+    KNOWLEDGE_DOCUMENT_CANCEL = "knowledge:document_cancel"
     # triggers (Stream J.10 — Mini-ADR J-26 / J-42)
     TRIGGER_CREATE = "trigger:create"
     TRIGGER_UPDATE = "trigger:update"
