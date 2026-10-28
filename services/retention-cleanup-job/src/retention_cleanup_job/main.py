@@ -30,6 +30,7 @@ from expert_work.persistence import (
     create_async_engine_from_config,
     create_async_session_factory,
 )
+from expert_work.persistence.knowledge import SqlKnowledgeRetrievalLogStore
 from expert_work.persistence.rls import build_rls_sessionmaker
 from expert_work.runtime.audit import (
     AuditLogger,
@@ -198,6 +199,10 @@ async def _amain() -> None:
             sandbox_egress_audit_retention_days=settings.sandbox_egress_audit_retention_days,
             memory_writeback_job_retention_days=settings.memory_writeback_job_retention_days,
             knowledge_task_retention_days=settings.knowledge_task_retention_days,
+            knowledge_revision_orphan_days=settings.knowledge_revision_orphan_days,
+            # B-175 P2-PR4 — metadata-only like memory_store: always wired.
+            knowledge_retrieval_log_store=SqlKnowledgeRetrievalLogStore(session_factory),
+            knowledge_retrieval_log_retention_days=settings.knowledge_retrieval_log_retention_days,
             user_upload_store=user_upload_store,
             upload_retention_days=settings.upload_retention_days,
             thread_store=thread_store,
@@ -216,7 +221,7 @@ async def _amain() -> None:
             "memory_hard_deleted=%d workspaces_hard_deleted=%d "
             "workspaces_pending_archive=%d tenant_users_hard_deleted=%d "
             "sandbox_egress_audit=%d memory_writeback_jobs=%d knowledge_tasks=%d "
-            "duration=%.2fs",
+            "knowledge_revisions=%d knowledge_retrieval_logs=%d duration=%.2fs",
             report.audit_deleted,
             report.audit_skipped_unacked,
             report.event_deleted,
@@ -239,6 +244,8 @@ async def _amain() -> None:
             report.sandbox_egress_audit_deleted,
             report.memory_writeback_jobs_deleted,
             report.knowledge_tasks_deleted,
+            report.knowledge_revisions_deleted,
+            report.knowledge_retrieval_logs_deleted,
             report.duration_seconds,
         )
         if report.audit_skipped_unacked > 0:

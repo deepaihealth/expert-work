@@ -481,7 +481,17 @@ async def test_runner_renews_lease_while_processing() -> None:
 
 
 class _RefuseRenewalStore(_RenewRecordingStore):
+    """Refuses every renewal made once the ingest is inside its embedding
+    call (B-222: the checkpoint before each embedding window renews too, and
+    refusing that one would stop the ingest before the call)."""
+
+    def __init__(self, embedding: asyncio.Event) -> None:
+        super().__init__()
+        self._embedding = embedding
+
     async def renew_lease(self, **kwargs: object) -> bool:
+        if not self._embedding.is_set():
+            return await super().renew_lease(**kwargs)  # type: ignore[arg-type]
         self.renewals.append(-1)
         return False
 
@@ -489,8 +499,10 @@ class _RefuseRenewalStore(_RenewRecordingStore):
 class _NeverFinishEmbedder(FakeEmbedder):
     def __init__(self) -> None:
         self.cancelled = False
+        self.entered = asyncio.Event()
 
     async def embed(self, texts: Sequence[str], *, tenant_id: UUID) -> list[tuple[float, ...]]:
+        self.entered.set()
         try:
             await asyncio.sleep(3600)
         except asyncio.CancelledError:
@@ -502,9 +514,9 @@ class _NeverFinishEmbedder(FakeEmbedder):
 @pytest.mark.asyncio
 async def test_refused_renewal_cancels_the_ingest() -> None:
     """续约被拒 = 文档已不归自己 → 取消本次入库,不再占着并发闸."""
-    store = _RefuseRenewalStore()
-    kb_id, doc_id = await _seed(store)
     embedder = _NeverFinishEmbedder()
+    store = _RefuseRenewalStore(embedder.entered)
+    kb_id, doc_id = await _seed(store)
     runner = KnowledgeIngestionRunner(store=store, embedder=embedder, lease_seconds=1)
     task = _submit(runner, kb_id, doc_id)
     await asyncio.wait_for(task, timeout=5)  # would hang for an hour without the cancel

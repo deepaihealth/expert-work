@@ -2,13 +2,14 @@
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Collection, Sequence
 from uuid import UUID, uuid4
 
 import pytest
 
 from control_plane.knowledge.ingestion import KnowledgeIngestionRunner
 from expert_work.persistence import InMemoryKnowledgeStore
+from expert_work.persistence.knowledge.base import SwitchOffRecord
 from expert_work.protocol import (
     DocumentStatus,
     IngestErrorCode,
@@ -105,6 +106,7 @@ class _ConcurrentDeleteStore(_RecordingStore):
         generation: int | None = None,
         expect_status: DocumentStatus = DocumentStatus.PROCESSING,
         chunk_params_hash: str | None = None,
+        switch_offs: Collection[SwitchOffRecord] = (),
     ) -> bool:
         await self.delete_document(tenant_id=tenant_id, document_id=document_id)
         raise KeyError(document_id)
@@ -122,6 +124,7 @@ class _FailingReplaceStore(_RecordingStore):
         generation: int | None = None,
         expect_status: DocumentStatus = DocumentStatus.PROCESSING,
         chunk_params_hash: str | None = None,
+        switch_offs: Collection[SwitchOffRecord] = (),
     ) -> bool:
         raise RuntimeError("replace_chunks exploded")
 

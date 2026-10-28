@@ -614,7 +614,9 @@ async def test_a_worker_that_lost_the_document_describes_no_figure() -> None:
 
 
 class _LostLateStore(InMemoryKnowledgeStore):
-    """The document is re-uploaded while its figures are being described."""
+    """The document is re-uploaded while its figures are being described:
+    the stage writes before the description and before its model call (B-222)
+    pass, the next one is refused."""
 
     def __init__(self) -> None:
         super().__init__()
@@ -623,7 +625,7 @@ class _LostLateStore(InMemoryKnowledgeStore):
     async def set_document_stage(self, **kwargs: object) -> bool:
         if kwargs["stage"] is IngestStage.RECOGNIZING:
             self.recognizing += 1
-            if self.recognizing > 1:
+            if self.recognizing > 2:
                 return False
         return await super().set_document_stage(**kwargs)  # type: ignore[arg-type]
 

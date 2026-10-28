@@ -11,7 +11,8 @@ The endpoint test asserts the admin/viewer authz split.
 
 from __future__ import annotations
 
-from collections.abc import AsyncIterator, Sequence
+from collections.abc import AsyncIterator, Collection, Sequence
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 from uuid import UUID, uuid4
@@ -21,7 +22,7 @@ from httpx import ASGITransport, AsyncClient
 
 from control_plane.app import create_app
 from control_plane.audit import build_default_audit_logger
-from control_plane.purge import PurgeUserDeps, purge_user
+from control_plane.purge import PurgeUserDeps, purge_user, user_purge
 from control_plane.settings import Settings
 from expert_work.persistence import (
     InMemoryApprovalStore,
@@ -41,6 +42,10 @@ from expert_work.persistence.agent_instance.memory import InMemoryAgentInstanceS
 from expert_work.persistence.audit_log import InMemoryAuditLogStore
 from expert_work.persistence.feedback_store import FeedbackRecord, InMemoryFeedbackStore
 from expert_work.persistence.image_upload import InMemoryImageUploadStore
+from expert_work.persistence.knowledge import (
+    InMemoryKnowledgeRetrievalLogStore,
+    RetrievalLogEntry,
+)
 from expert_work.persistence.memory import InMemoryMemoryWritebackJobStore
 from expert_work.persistence.memory.dlq import InMemoryMemoryWritebackDLQ
 from expert_work.persistence.skill import InMemorySkillStore
@@ -306,6 +311,7 @@ async def test_purge_user_cascade_isolates_other_user_and_tenant_and_is_idempote
         skills=skills,
         eval_datasets=eval_datasets,
         curation_candidates=curation,
+        retrieval_logs=InMemoryKnowledgeRetrievalLogStore(),
         tenant_users=users,
         audit=build_default_audit_logger(audit_store),
         workspace_store=workspace_store,
@@ -457,6 +463,7 @@ async def test_purge_user_image_blobs_skipped_without_object_store() -> None:
         skills=skills,
         eval_datasets=eval_datasets,
         curation_candidates=curation,
+        retrieval_logs=InMemoryKnowledgeRetrievalLogStore(),
         tenant_users=users,
         audit=build_default_audit_logger(audit_store),
         workspace_store=workspace_store,
@@ -568,6 +575,7 @@ async def test_purge_user_deletes_user_upload_rows() -> None:
         skills=skills,
         eval_datasets=eval_datasets,
         curation_candidates=curation,
+        retrieval_logs=InMemoryKnowledgeRetrievalLogStore(),
         tenant_users=users,
         audit=build_default_audit_logger(audit_store),
         workspace_store=workspace_store,
@@ -675,6 +683,7 @@ async def test_purge_user_image_blob_delete_failure_still_deletes_rows() -> None
         skills=skills,
         eval_datasets=eval_datasets,
         curation_candidates=curation,
+        retrieval_logs=InMemoryKnowledgeRetrievalLogStore(),
         tenant_users=users,
         audit=build_default_audit_logger(audit_store),
         workspace_store=workspace_store,
@@ -776,6 +785,7 @@ async def test_purge_user_deletes_null_user_approvals_on_user_threads() -> None:
         skills=skills,
         eval_datasets=eval_datasets,
         curation_candidates=curation,
+        retrieval_logs=InMemoryKnowledgeRetrievalLogStore(),
         tenant_users=users,
         audit=build_default_audit_logger(audit_store),
         workspace_store=workspace_store,
@@ -919,6 +929,7 @@ async def test_purge_user_approval_cleanup_failure_recorded_and_does_not_abort()
         skills=skills,
         eval_datasets=eval_datasets,
         curation_candidates=curation,
+        retrieval_logs=InMemoryKnowledgeRetrievalLogStore(),
         tenant_users=users,
         audit=build_default_audit_logger(audit_store),
         workspace_store=workspace_store,
@@ -1120,3 +1131,260 @@ async def test_purge_endpoint_allows_self() -> None:
         )
     assert resp.status_code == 200, resp.text
     assert resp.json()["data"]["deactivated"] is True
+
+
+def _deps_with(
+    *,
+    threads: InMemoryThreadMetaStore,
+    runs: InMemoryRunStore,
+    retrieval_logs: InMemoryKnowledgeRetrievalLogStore,
+    users: InMemoryTenantUserStore,
+) -> PurgeUserDeps:
+    """Purge deps around the given stores; every other store fresh and empty."""
+    writeback_jobs = InMemoryMemoryWritebackJobStore()
+    return PurgeUserDeps(
+        threads=threads,
+        runtime=SimpleNamespace(durable_checkpointer=None, run_manager=RunManager(store=runs)),  # type: ignore[arg-type]
+        memory=InMemoryMemoryStore(),
+        memory_dlq=InMemoryMemoryWritebackDLQ(),
+        memory_writeback_jobs=writeback_jobs,
+        artifacts=InMemoryArtifactStore(),
+        mcp_oauth=InMemoryMcpOAuthConnectionStore(),
+        agent_instances=InMemoryAgentInstanceStore(),
+        approvals=InMemoryApprovalStore(),
+        triggers=InMemoryTriggerStore(),
+        trigger_runs=InMemoryTriggerRunStore(),
+        webhook_endpoints=InMemoryWebhookEndpointStore(),
+        webhook_deliveries=InMemoryWebhookDeliveryStore(),
+        image_uploads=InMemoryImageUploadStore(),
+        user_uploads=InMemoryUserUploadStore(),
+        feedback=InMemoryFeedbackStore(),
+        object_store=None,
+        volume_backup_dlq=None,
+        token_usage=InMemoryTokenUsageStore(),
+        runs=runs,
+        skills=InMemorySkillStore(),
+        eval_datasets=InMemoryEvalDatasetStore(),
+        curation_candidates=InMemoryCurationCandidateStore(),
+        retrieval_logs=retrieval_logs,
+        tenant_users=users,
+        audit=build_default_audit_logger(InMemoryAuditLogStore()),
+        workspace_store=RecordingWorkspaceStore(),
+    )
+
+
+_LOG_KB = uuid4()
+
+
+class _LogWorld:
+    """User A with a conversation that runs by A, an admin (an approval
+    continuation) and no user (a machine principal's) made knowledge searches
+    in; A's run on a thread with no ``thread_meta`` row; A's own console test
+    as an employee; and rows that must stay: B's run, another employee's test."""
+
+    def __init__(self) -> None:
+        self.t1 = uuid4()
+        self.threads, self.runs = InMemoryThreadMetaStore(), InMemoryRunStore()
+        self.users, self.logs = InMemoryTenantUserStore(), InMemoryKnowledgeRetrievalLogStore()
+        self.kept: set[UUID] = set()
+
+    async def seed(self) -> UUID:
+        t1 = self.t1
+        a = await self.users.resolve(tenant_id=t1, subject_type="user", subject_id="subj-a")
+        admin = await self.users.resolve(tenant_id=t1, subject_type="user", subject_id="emp-admin")
+        b = await self.users.resolve(tenant_id=t1, subject_type="user", subject_id="subj-b")
+        self.a_thread = uuid4()
+        await self.threads.create(
+            thread_id=self.a_thread,
+            tenant_id=t1,
+            created_by="seed",
+            user_id=a.id,
+            agent_name="alpha",
+            agent_version="1.0.0",
+        )
+        by_a = _run(tenant=t1, user=a.id, thread=self.a_thread)
+        by_admin = _run(tenant=t1, user=admin.id, thread=self.a_thread)
+        by_machine = replace(_run(tenant=t1, user=a.id, thread=self.a_thread), user_id=None)
+        self.threadless = _run(tenant=t1, user=a.id, thread=uuid4())
+        of_b = _run(tenant=t1, user=b.id, thread=uuid4())
+        for run in (by_a, by_admin, by_machine, self.threadless, of_b):
+            await self.runs.create(run)
+            await self.log(run_id=run.run_id, thread_id=run.thread_id, keep=run is of_b)
+        await self.log(source="console_test", actor_id="subj-a")
+        await self.log(source="console_test", actor_id="emp-other", keep=True)
+        return a.id
+
+    async def log(
+        self,
+        *,
+        run_id: UUID | None = None,
+        thread_id: UUID | None = None,
+        source: str = "agent",
+        actor_id: str | None = None,
+        keep: bool = False,
+    ) -> None:
+        entry = RetrievalLogEntry(
+            tenant_id=self.t1,
+            kb_ids=(_LOG_KB,),
+            source=source,  # type: ignore[arg-type]
+            query="q",
+            status="ok",
+            latency_ms=1,
+            run_id=run_id,
+            thread_id=thread_id,
+            actor_id=actor_id,
+        )
+        await self.logs.add(entry)
+        if keep:
+            self.kept.add(entry.id)
+
+    async def left(self) -> set[UUID]:
+        rows, _total = await self.logs.list_for_base(tenant_id=self.t1, kb_id=_LOG_KB)
+        return {row.id for row in rows}
+
+    def deps(self, logs: InMemoryKnowledgeRetrievalLogStore | None = None) -> PurgeUserDeps:
+        return _deps_with(
+            threads=self.threads, runs=self.runs, retrieval_logs=logs or self.logs, users=self.users
+        )
+
+
+@pytest.mark.asyncio
+async def test_purge_deletes_every_retrieval_log_of_the_user(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """B-175 P2-PR4 — everything searched in the user's conversations, whoever's
+    run it was; their runs elsewhere; their own console tests. One run per page,
+    so the user's runs take several pages."""
+    monkeypatch.setattr(user_purge, "MAX_LIST_LIMIT", 1)
+    world = _LogWorld()
+    a = await world.seed()
+
+    summary = await purge_user(
+        tenant_id=world.t1, user_id=a, subject_id="subj-a", deps=world.deps(), actor_id="admin"
+    )
+
+    assert await world.left() == world.kept
+    assert summary.deleted["knowledge_retrieval_log"] == 5
+    assert (summary.failures, summary.skipped) == ({}, [])
+    again = await purge_user(
+        tenant_id=world.t1, user_id=a, subject_id="subj-a", deps=world.deps(), actor_id="admin"
+    )
+    assert again.deleted["knowledge_retrieval_log"] == 0
+
+
+class _FlakyLogs(InMemoryKnowledgeRetrievalLogStore):
+    """Fails ``method`` once, then works — on the shared rows of ``inner``."""
+
+    def __init__(self, inner: InMemoryKnowledgeRetrievalLogStore, method: str) -> None:
+        super().__init__()
+        self._rows = inner._rows
+        self.failing = method
+
+    async def delete_for_runs(self, *, tenant_id: UUID, run_ids: Collection[UUID]) -> int:
+        self._maybe_fail("delete_for_runs")
+        return await super().delete_for_runs(tenant_id=tenant_id, run_ids=run_ids)
+
+    async def delete_for_threads(self, *, tenant_id: UUID, thread_ids: Collection[UUID]) -> int:
+        self._maybe_fail("delete_for_threads")
+        return await super().delete_for_threads(tenant_id=tenant_id, thread_ids=thread_ids)
+
+    def _maybe_fail(self, method: str) -> None:
+        if self.failing == method:
+            self.failing = ""
+            msg = "transient"
+            raise ConnectionError(msg)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("method", ["delete_for_runs", "delete_for_threads"])
+async def test_a_retrieval_log_failure_keeps_the_runs_for_a_rerun(method: str) -> None:
+    """Deleting or anonymising the runs after a failed log purge would leave
+    their rows with nothing to find them by: those steps are skipped (and say
+    so), and a re-run finishes the job."""
+    world = _LogWorld()
+    a = await world.seed()
+    flaky = _FlakyLogs(world.logs, method)
+
+    first = await purge_user(
+        tenant_id=world.t1, user_id=a, subject_id="subj-a", deps=world.deps(flaky), actor_id="x"
+    )
+    assert first.failures["knowledge_retrieval_log"] == "ConnectionError"
+    assert "agent_run" in first.skipped
+    # Every run of A's is still there, still A's.
+    assert {r.thread_id for r in await world.runs.list_for_tenant(tenant_id=world.t1)} >= {
+        world.a_thread,
+        world.threadless.thread_id,
+    }
+    assert (await world.runs.get(run_id=world.threadless.run_id, tenant_id=world.t1)) is not None
+    assert (await world.threads.get(world.a_thread, tenant_id=world.t1)) is not None
+
+    second = await purge_user(
+        tenant_id=world.t1, user_id=a, subject_id="subj-a", deps=world.deps(flaky), actor_id="x"
+    )
+    assert (second.failures, second.skipped) == ({}, [])
+    assert await world.left() == world.kept
+    assert await world.threads.get(world.a_thread, tenant_id=world.t1) is None
+
+
+class _LateWriteRuns(InMemoryRunStore):
+    """A run still executing on the conversation logs a search while the purge
+    deletes the conversation's runs (the purge does not stop runs)."""
+
+    def __init__(self, logs: InMemoryKnowledgeRetrievalLogStore) -> None:
+        super().__init__()
+        self.logs = logs
+
+    async def delete_by_thread(self, *, thread_id: UUID, tenant_id: UUID) -> int:
+        await self.logs.add(
+            RetrievalLogEntry(
+                tenant_id=tenant_id,
+                kb_ids=(_LOG_KB,),
+                source="agent",
+                query="late",
+                status="ok",
+                latency_ms=1,
+                run_id=uuid4(),
+                thread_id=thread_id,
+            )
+        )
+        return await super().delete_by_thread(thread_id=thread_id, tenant_id=tenant_id)
+
+
+class _SecondPassFails(InMemoryKnowledgeRetrievalLogStore):
+    def __init__(self, inner: InMemoryKnowledgeRetrievalLogStore) -> None:
+        super().__init__()
+        self._rows = inner._rows
+        self.thread_calls = 0
+
+    async def delete_for_threads(self, *, tenant_id: UUID, thread_ids: Collection[UUID]) -> int:
+        self.thread_calls += 1
+        if self.thread_calls == 2:
+            msg = "transient"
+            raise ConnectionError(msg)
+        return await super().delete_for_threads(tenant_id=tenant_id, thread_ids=thread_ids)
+
+
+@pytest.mark.asyncio
+async def test_a_row_written_while_the_conversation_goes_is_deleted_too() -> None:
+    world = _LogWorld()
+    world.runs = _LateWriteRuns(world.logs)
+    a = await world.seed()
+    summary = await purge_user(
+        tenant_id=world.t1, user_id=a, subject_id="subj-a", deps=world.deps(), actor_id="x"
+    )
+    assert summary.failures == {}
+    assert await world.left() == world.kept
+
+
+@pytest.mark.asyncio
+async def test_the_second_conversation_pass_is_best_effort() -> None:
+    world = _LogWorld()
+    a = await world.seed()
+    logs = _SecondPassFails(world.logs)
+    summary = await purge_user(
+        tenant_id=world.t1, user_id=a, subject_id="subj-a", deps=world.deps(logs), actor_id="x"
+    )
+    assert logs.thread_calls == 2
+    assert (summary.failures, summary.skipped) == ({}, [])
+    assert summary.threads_purged == 1
+    assert await world.left() == world.kept

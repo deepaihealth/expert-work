@@ -15,8 +15,9 @@ import type { RerankOutcome } from "./rerank_outcome";
 
 export type { RerankOutcome } from "./rerank_outcome";
 
-/** Document ingestion lifecycle — mirrors the backend ``DocumentStatus``. */
-export type DocumentStatus = "pending" | "processing" | "ready" | "failed";
+/** Document ingestion lifecycle — mirrors the backend ``DocumentStatus``
+ *  (``cancelled``: the user stopped the ingest, B-222). */
+export type DocumentStatus = "pending" | "processing" | "ready" | "failed" | "cancelled";
 
 /** Per-base recall strategy — mirrors the backend ``RetrievalMethod``. */
 export type RetrievalMethod = "vector" | "keyword" | "hybrid";
@@ -451,6 +452,28 @@ export async function discardPendingDocument(
     `/v1/knowledge/bases/${encodeURIComponent(baseName)}/documents/${encodeURIComponent(documentId)}/discard-pending`,
   );
   return response.data;
+}
+
+/** B-222 — what cancelling did with one document: ``not_cancellable`` = it
+ *  had already settled (ready / failed / cancelled). */
+export type CancelOutcome = "cancelled" | "not_cancellable" | "not_found";
+
+export interface CancelResult {
+  document_id: string;
+  outcome: CancelOutcome;
+}
+
+/** B-222 — stop the ingest of pending / processing documents; one result per
+ *  distinct id, in request order. */
+export async function cancelDocuments(
+  baseName: string,
+  documentIds: string[],
+): Promise<CancelResult[]> {
+  const response = await apiClient.post<{ results: CancelResult[] }>(
+    `/v1/knowledge/bases/${encodeURIComponent(baseName)}/documents/cancel`,
+    { document_ids: documentIds },
+  );
+  return response.data.results;
 }
 
 /** B-209 PR-2 — one described picture of a document (the original, stored

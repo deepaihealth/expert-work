@@ -21,6 +21,28 @@ from pathlib import PurePosixPath
 from typing import Any, Final, Literal
 from uuid import UUID
 
+# B-175 P3-PR2 — passage types and the rules both stores share, re-exported.
+from expert_work.persistence.knowledge.passages import (
+    ChunkVector as ChunkVector,
+)
+from expert_work.persistence.knowledge.passages import (
+    DisabledReason as DisabledReason,
+)
+from expert_work.persistence.knowledge.passages import (
+    ManualPassage as ManualPassage,
+)
+from expert_work.persistence.knowledge.passages import (
+    Passage as Passage,
+)
+from expert_work.persistence.knowledge.passages import (
+    PassageChild as PassageChild,
+)
+from expert_work.persistence.knowledge.passages import (
+    PassageRevision as PassageRevision,
+)
+from expert_work.persistence.knowledge.passages import (
+    SwitchOffRecord as SwitchOffRecord,
+)
 from expert_work.protocol import (
     DEFAULT_CHUNK_MAX_TOKENS,
     DEFAULT_CHUNK_OVERLAP_TOKENS,
@@ -119,6 +141,10 @@ class ClaimedIngestion:
     #: worker makes (``replace_chunks`` / ``set_document_status`` /
     #: ``mark_document_failed_terminal``) passes it as the fence.
     generation: int
+
+
+#: B-222 —— what :meth:`KnowledgeStore.cancel_documents` did with one document.
+CancelOutcome = Literal["cancelled", "not_cancellable", "not_found"]
 
 
 #: B-209 §5.5 —— what a ``knowledge_parse_cache`` row holds: a scanned page's
@@ -310,8 +336,8 @@ class KnowledgeStore(abc.ABC):
 
     @abc.abstractmethod
     async def delete_base(self, *, tenant_id: UUID, kb_id: UUID) -> bool:
-        """Delete a base and cascade its documents + chunks. ``False`` if
-        no base matched."""
+        """Delete a base and cascade its documents + chunks (and what
+        :meth:`delete_document` cascades). ``False`` if no base matched."""
 
     # -- documents ----------------------------------------------------------
 
@@ -437,7 +463,29 @@ class KnowledgeStore(abc.ABC):
         status to ``READY`` (and ``stage=ready``) when serving chunks exist,
         else ``FAILED`` with a note; ``error_code`` is cleared either way.
         ``None`` when the document does not exist; the document unchanged
-        when nothing was pending."""
+        when nothing was pending, or when the pending version's ingest is past
+        the point of no return (B-222: ``processing`` at ``indexing``, see
+        :meth:`cancel_documents`) — it still ``has_pending``."""
+
+    @abc.abstractmethod
+    async def cancel_documents(
+        self, *, tenant_id: UUID, kb_id: UUID, document_ids: Sequence[UUID]
+    ) -> dict[UUID, CancelOutcome]:
+        """B-222 —— stop the ingest of each of the base's ``pending`` /
+        ``processing`` documents: status ``CANCELLED``, ``error='cancelled by
+        user'``, ``ingest_generation`` bumped (the worker still busy with it
+        is fenced out of every write, its lease renewal included) and the
+        lease released; ``stage``, the byte slots and serving chunks are kept.
+        ``processing`` at ``stage=indexing`` is past the point of no return
+        (its new chunks are being swapped in, READY follows): the fenced stage
+        write to it and the cancel serialise on the row, so a cancel never
+        lands between the swap and READY. That holds whatever the lease: a
+        worker whose lease ran out there may have died after its swap, with
+        the new chunks serving — the recovery worker re-claims such a
+        document. One outcome per distinct id:
+        ``cancelled``; ``not_cancellable`` (any other status, ``cancelled``
+        included, or at indexing — nothing is written); ``not_found`` (no such
+        document in this base of this tenant)."""
 
     @abc.abstractmethod
     async def sweep_terminal(self, *, now: datetime, max_attempts: int) -> int:
@@ -465,14 +513,32 @@ class KnowledgeStore(abc.ABC):
         ours (settled, re-uploaded, deleted)."""
 
     @abc.abstractmethod
-    async def list_documents(self, *, tenant_id: UUID, kb_id: UUID) -> list[KnowledgeDocument]:
-        """The base's documents, newest first."""
+    async def list_documents(
+        self,
+        *,
+        tenant_id: UUID,
+        kb_id: UUID,
+        enabled: bool | None = None,
+        statuses: Collection[DocumentStatus] | None = None,
+    ) -> list[KnowledgeDocument]:
+        """The base's documents, newest first. ``enabled`` / ``statuses``
+        (B-175 P3-PR2) keep only the documents switched that way / in one of
+        those statuses; ``None`` does not filter (an empty ``statuses``
+        matches nothing)."""
 
     @abc.abstractmethod
     async def list_documents_page(
-        self, *, tenant_id: UUID, kb_id: UUID, limit: int, offset: int
+        self,
+        *,
+        tenant_id: UUID,
+        kb_id: UUID,
+        limit: int,
+        offset: int,
+        enabled: bool | None = None,
+        statuses: Collection[DocumentStatus] | None = None,
     ) -> tuple[list[KnowledgeDocument], int]:
-        """A page of :meth:`list_documents` (same order) plus the total count."""
+        """A page of :meth:`list_documents` (same order and filters) plus the
+        total count of the filtered list."""
 
     @abc.abstractmethod
     async def set_document_status(
@@ -503,8 +569,9 @@ class KnowledgeStore(abc.ABC):
 
     @abc.abstractmethod
     async def delete_document(self, *, tenant_id: UUID, document_id: UUID) -> bool:
-        """Delete a document and cascade its chunks, page records and
-        recognition cache. ``False`` if no document matched."""
+        """Delete a document and cascade its chunks, page records,
+        recognition cache and passage revisions. ``False`` if no document
+        matched."""
 
     @abc.abstractmethod
     async def set_document_pages(
@@ -600,6 +667,199 @@ class KnowledgeStore(abc.ABC):
         when the current rules reject it, and the fresh one must then stand,
         or every later ingest would pay for it again."""
 
+    # -- maintenance (B-175 P3-PR2) -------------------------------------------
+
+    @abc.abstractmethod
+    async def set_documents_enabled(
+        self, *, tenant_id: UUID, kb_id: UUID, document_ids: Sequence[UUID], enabled: bool
+    ) -> list[UUID]:
+        """Switch the base's documents on or off. A disabled document keeps
+        its chunks (and their own switches) and its place in every listing;
+        recall leaves it out (:meth:`search`). Returns the ids that are this
+        base's documents, in the order asked, each once — another base's,
+        another tenant's and unknown ids are skipped."""
+
+    @abc.abstractmethod
+    async def count_stale_documents(self, *, tenant_id: UUID, kb_id: UUID, params_hash: str) -> int:
+        """How many of the base's ``ready`` documents serve chunks cut by
+        other chunking parameters: their ``chunk_params_hash`` differs from
+        ``params_hash`` (the base's current one) or was never recorded."""
+
+    @abc.abstractmethod
+    async def list_stale_documents(
+        self, *, tenant_id: UUID, kb_id: UUID, params_hash: str
+    ) -> list[KnowledgeDocument]:
+        """The documents :meth:`count_stale_documents` counts, in
+        :meth:`list_documents` order."""
+
+    @abc.abstractmethod
+    async def list_passages(
+        self,
+        *,
+        tenant_id: UUID,
+        document_id: UUID,
+        enabled_only: bool = False,
+        offset: int = 0,
+        limit: int | None = None,
+        disabled_reason: DisabledReason | None = None,
+    ) -> list[Passage]:
+        """The document's passages in document order: a passage sits where
+        its first chunk does (the lowest ``chunk_index`` of its children — a
+        parent row's own number is in another numbering), a chunk standing
+        for itself where it is. Each passage's children in ``chunk_index``
+        order, grouped by ``parent_chunk_id``; their numbers need not be
+        consecutive (an edit numbers a passage's extra chunks after the
+        document's last). ``enabled_only`` leaves out what recall leaves out:
+        switched-off passages, and everything when the document is switched
+        off. ``disabled_reason`` keeps only the passages switched off for
+        that reason (``inherited``: the ones to review). ``offset`` /
+        ``limit`` page through the passages; another tenant's document has
+        none. Vectors are not loaded."""
+
+    @abc.abstractmethod
+    async def count_passages(self, *, tenant_id: UUID, document_id: UUID) -> int:
+        """How many passages :meth:`list_passages` lists (unfiltered)."""
+
+    @abc.abstractmethod
+    async def get_passage(
+        self, *, tenant_id: UUID, document_id: UUID, passage_id: UUID
+    ) -> Passage | None:
+        """One passage of the document by its id (its parent row's, or its
+        lone chunk's); ``None`` when the document has no such passage."""
+
+    @abc.abstractmethod
+    async def replace_passage(
+        self,
+        *,
+        tenant_id: UUID,
+        document_id: UUID,
+        passage_id: UUID,
+        expected_revision: int,
+        content: str,
+        heading_path: Sequence[str],
+        children: Sequence[PassageChild],
+        edited_by: str | None,
+    ) -> Passage | None:
+        """Write a passage's new text and its chunks in one transaction; the
+        passage keeps its id. The chunks are numbered like the ones they
+        replace (in order) and any extra one after the document's last
+        number; the document's ``chunk_count`` follows. A lone chunk whose new
+        text needs several becomes a parent row with the same id.
+
+        History: the first change of a passage ingested from the file first
+        records its text as revision 1 (``edited_by`` ``None``); every change
+        adds the next revision (restoring an old text is a change too). The
+        passage is ``edited`` while its text differs from that first,
+        machine-made revision — always for one added by hand.
+
+        Refused with :class:`PassageConflictError`: ``revision_conflict`` when
+        the passage is no longer at ``expected_revision``;
+        ``document_busy`` unless the document is ``ready`` with no new
+        version pending. ``None`` when there is no such passage."""
+
+    @abc.abstractmethod
+    async def add_passage(
+        self,
+        *,
+        tenant_id: UUID,
+        document_id: UUID,
+        content: str,
+        heading_path: Sequence[str],
+        children: Sequence[PassageChild],
+        edited_by: str | None,
+    ) -> Passage | None:
+        """Add a passage at the end of the document: its chunks numbered
+        after the last, a parent row unless it is just its one chunk;
+        revision 1 records the text and its author, and it is ``edited``.
+        ``document_busy`` as :meth:`replace_passage`; ``None`` when there is
+        no such document."""
+
+    @abc.abstractmethod
+    async def set_passage_enabled(
+        self, *, tenant_id: UUID, document_id: UUID, passage_id: UUID, enabled: bool
+    ) -> Passage | None:
+        """Switch a passage on or off — its parent row and every chunk under
+        it; switched off by hand, ``disabled_reason`` is ``manual`` (cleared
+        when switched on). An edit keeps the switch and its reason.
+        ``document_busy`` as :meth:`replace_passage`; ``None`` when there is
+        no such passage.
+
+        Switching a passage that was off by inheritance (either way) settles
+        it: its paragraphs leave the document's switch-off records
+        (:func:`~expert_work.persistence.knowledge.passages.settle_switch_off`;
+        a record left empty is deleted), so a later ingest does not hide them
+        again for those records — switched on it stays on, switched off it is
+        the person's own (``manual``) from then on."""
+
+    @abc.abstractmethod
+    async def list_passage_revisions(
+        self, *, tenant_id: UUID, document_id: UUID, passage_id: UUID
+    ) -> list[PassageRevision]:
+        """The passage's recorded text revisions, oldest first (switch-off
+        records are not text revisions: :meth:`list_switch_offs`)."""
+
+    @abc.abstractmethod
+    async def list_switch_offs(
+        self, *, tenant_id: UUID, document_id: UUID
+    ) -> list[PassageRevision]:
+        """The document's switch-off records (``switch_off_lost``, written by
+        :meth:`replace_chunks`): what every ingest derives inherited
+        switch-offs from."""
+
+    @abc.abstractmethod
+    async def list_unapplied_revisions(
+        self, *, tenant_id: UUID, document_id: UUID
+    ) -> list[PassageRevision]:
+        """Manual changes the document's chunks no longer carry: per passage
+        with a history, its latest revision when that passage is gone (a
+        re-ingest could not find it again) and the revision holds more than
+        the machine text, or when the passage is still there at an older
+        revision; and each switch-off record no passage holds the text of
+        (``orphaned_at`` set). Oldest first. A history whose passage a
+        re-ingest left out carries ``orphaned_at`` (stamped by
+        :meth:`replace_chunks`); it is kept until
+        :meth:`discard_unapplied_revisions`, the document's deletion, or the
+        retention job (30 days after ``orphaned_at``)."""
+
+    @abc.abstractmethod
+    async def discard_unapplied_revisions(self, *, tenant_id: UUID, document_id: UUID) -> int:
+        """Delete what :meth:`list_unapplied_revisions` lists: the whole
+        history of every passage that is gone, the revisions above the
+        current one of a passage still there, and the switch-off records no
+        passage holds the text of. Returns the rows deleted."""
+
+    @abc.abstractmethod
+    async def list_manual_passages(
+        self, *, tenant_id: UUID, document_id: UUID
+    ) -> list[ManualPassage]:
+        """The document's passages a re-ingest must carry over (edited,
+        switched off, added by hand, or with a history), in document order,
+        each with its first revision and its ``occurrence`` among the
+        document's passages of the same machine text and breadcrumb
+        (:func:`~expert_work.persistence.knowledge.passages.manual_passages`)."""
+
+    @abc.abstractmethod
+    async def update_chunk_embeddings(
+        self,
+        *,
+        tenant_id: UUID,
+        document_id: UUID,
+        vectors: Sequence[ChunkVector],
+        embedding_model: str | None,
+        generation: int,
+        expect_status: DocumentStatus = DocumentStatus.READY,
+    ) -> int | None:
+        """A re-index's write-back: set each chunk's vector and
+        ``embedding_model`` in place, only where the chunk still has that id
+        and ``content_hash`` — a chunk a passage write replaced meanwhile
+        (that write embedded it with the live model) is left as it is, and
+        nothing else of any row (text, switches, parent rows) is touched, so
+        a re-index can never undo a passage write. Fenced: ``None`` (nothing
+        written) unless the document is in ``expect_status`` at
+        ``generation`` (as :meth:`replace_chunks`: a document serving its
+        chunks in another status, e.g. a failed re-upload's, is re-embedded
+        with that status); otherwise the number of chunks updated."""
+
     # -- chunks -------------------------------------------------------------
 
     @abc.abstractmethod
@@ -612,6 +872,7 @@ class KnowledgeStore(abc.ABC):
         generation: int | None = None,
         expect_status: DocumentStatus = DocumentStatus.PROCESSING,
         chunk_params_hash: str | None = None,
+        switch_offs: Collection[SwitchOffRecord] = (),
     ) -> bool:
         """Replace all of a document's chunks with ``chunks`` — deletes
         the document's existing chunks, then inserts the new set, in one
@@ -635,7 +896,19 @@ class KnowledgeStore(abc.ABC):
 
         ``chunk_params_hash`` (B-206 K-3) is recorded on the document with the
         chunks: the chunking they were cut with. ``None`` leaves it as it is
-        (a re-index swaps vectors, not the chunking)."""
+        (a re-index swaps vectors, not the chunking).
+
+        B-175 P3-PR2: the revision histories of passages the new chunks no
+        longer have get ``orphaned_at`` (their manual change was not put
+        back; see :meth:`list_unapplied_revisions`). ``switch_offs``: the
+        switch-off records the ingest derived its inherited switch-offs from
+        (new ones for switched-off passages it left out, and the document's
+        earlier ones), with ``orphaned_at`` cleared when ``placed``, else set
+        (kept if it already was) — in the same transaction. Only a ``new``
+        record is inserted; an earlier one is only updated where it still
+        exists, so one discarded (or deleted by the retention job) while the
+        ingest ran stays gone. Records it does not name are left as they are;
+        text histories never get records' flags or vice versa."""
 
     @abc.abstractmethod
     async def list_chunks(
@@ -646,14 +919,18 @@ class KnowledgeStore(abc.ABC):
         offset: int = 0,
         limit: int = 50,
         chunk_types: Collection[ChunkType] | None = None,
+        after: tuple[int, ChunkType] | None = None,
     ) -> tuple[list[KnowledgeChunk], int]:
         """A page of a document's chunks of ``chunk_types`` ordered by
         ``chunk_index`` (then type) plus their total count — for segment
-        preview. ``None`` = the searchable types
+        preview. ``chunk_types`` ``None`` = the searchable types
         (:data:`~expert_work.protocol.SEARCHABLE_CHUNK_TYPES`): parent rows
-        (B-206 K-1) are only listed when asked for. The (large) embedding
-        vector is omitted from the returned chunks (``embedding == ()``;
-        ``None`` for a parent, which has none)."""
+        (B-206 K-1) are only listed when asked for. ``after``: only the
+        chunks ordered after that ``(chunk_index, chunk_type)`` — a keyset
+        page, which rows going or coming before it do not shift (B-175
+        P3-PR2: a re-index reads a document while its passages are edited).
+        The (large) embedding vector is omitted from the returned chunks
+        (``embedding == ()``; ``None`` for a parent, which has none)."""
 
     @abc.abstractmethod
     async def get_chunks(
@@ -698,6 +975,16 @@ class KnowledgeStore(abc.ABC):
         Python floats (B-216)."""
 
     @abc.abstractmethod
+    async def has_chunks_off_model(
+        self, *, tenant_id: UUID, kb_id: UUID, embedding_model: str | None
+    ) -> bool:
+        """Whether any searchable chunk of the base was embedded by another
+        model than ``embedding_model`` (a ``NULL`` model counts as another) —
+        what a re-index checks before it stamps the base with the new model
+        (B-222: a re-upload that landed meanwhile and was then cancelled or
+        failed leaves its previous chunks serving on the old model)."""
+
+    @abc.abstractmethod
     async def search(
         self,
         *,
@@ -711,7 +998,8 @@ class KnowledgeStore(abc.ABC):
         ``kb_ids`` yields an empty list. Recall — this and every search
         method — only returns chunks of
         :data:`~expert_work.protocol.SEARCHABLE_CHUNK_TYPES` (never a parent
-        row)."""
+        row) that are enabled, of a document that is enabled (B-175
+        P3-PR2); the others are filtered out before ``limit`` is applied."""
 
     @abc.abstractmethod
     async def search_scored(

@@ -22,6 +22,7 @@ import hashlib
 import json
 import logging
 from collections.abc import Awaitable, Callable, Coroutine, Mapping, Sequence
+from contextlib import AbstractAsyncContextManager
 from dataclasses import dataclass, replace
 from typing import Any, Protocol
 from uuid import UUID
@@ -55,6 +56,7 @@ from control_plane.knowledge.recognition.figure_markup import (
     resolve_figures,
 )
 from control_plane.knowledge.recognition.pages import render_params
+from control_plane.knowledge.stale import StaleIngestionError
 from expert_work.persistence.knowledge.base import KnowledgeStore, ParseCacheEntry, ParseCacheKind
 from expert_work.protocol import OcrCaps, PageStatus, catalog_entry
 from orchestrator.agent_factory import thinking_off_request_fields
@@ -155,6 +157,58 @@ BatchGuard = Callable[[], Awaitable[None]]
 
 #: Builds a client for a model from its API key (tests inject fakes).
 ClientFactory = Callable[[ModelChoice, str], RecognitionClient]
+
+
+class CallCheckpoint:
+    """B-222 —— a document's check before each model call (figure
+    description, a figure's text). A refusal (:class:`StaleIngestionError`:
+    the document is no longer this worker's) is kept: later calls are refused
+    without asking again, and :meth:`stop_if_refused` raises it once the calls
+    already under way are done. Any other error of the check (a database
+    blip) is logged and the call goes ahead — the ingest's fenced writes still
+    guard it."""
+
+    def __init__(self, before_call: BatchGuard | None) -> None:
+        self._before_call = before_call
+        self.refusal: StaleIngestionError | None = None
+
+    async def check(self) -> None:
+        if self.refusal is not None:
+            raise self.refusal
+        if self._before_call is None:
+            return
+        try:
+            await self._before_call()
+        except StaleIngestionError as exc:
+            self.refusal = exc
+            raise
+        except Exception:
+            logger.warning("knowledge.call_check_failed", exc_info=True)
+
+    def stop_if_refused(self) -> None:
+        if self.refusal is not None:
+            raise self.refusal
+
+
+class CheckedSlot(AbstractAsyncContextManager[None]):
+    """A model's concurrency slot that passes the checkpoint once it is held:
+    a call queued behind the slot checks when its turn comes, and every retry
+    attempt (a paid call too) checks again."""
+
+    def __init__(self, slot: asyncio.Semaphore, checkpoint: CallCheckpoint) -> None:
+        self._slot = slot
+        self._checkpoint = checkpoint
+
+    async def __aenter__(self) -> None:
+        await self._slot.acquire()
+        try:
+            await self._checkpoint.check()
+        except BaseException:
+            self._slot.release()
+            raise
+
+    async def __aexit__(self, *exc_info: object) -> None:
+        self._slot.release()
 
 
 @dataclass(frozen=True)
@@ -374,11 +428,14 @@ class DocumentRecognizer:
         images: Mapping[int, bytes],
         render: str,
         kind: ParseCacheKind = _CACHE_KIND,
+        checkpoint: CallCheckpoint | None = None,
     ) -> dict[int, PageOutcome]:
         """Recognize the given pages (index → JPEG bytes). One page going
         wrong never leaves the others' paid calls running unattended: an
         unexpected error is that page's ``internal_error``. ``kind`` is the
-        cache row kind (``figure_ocr``: the text inside a document's figure)."""
+        cache row kind (``figure_ocr``: the text inside a document's figure).
+        ``checkpoint`` is passed before each model call (B-222); its refusal
+        is raised once the calls under way are done."""
         keys = {
             index: [
                 cache_key(image, engine.choice.key, engine.cache_tag, render)
@@ -391,10 +448,14 @@ class DocumentRecognizer:
         )
         results = await asyncio.gather(
             *(
-                self._guarded_page(tenant_id, document_id, plan, image, keys[index], cached, kind)
+                self._guarded_page(
+                    tenant_id, document_id, plan, image, keys[index], cached, kind, checkpoint
+                )
                 for index, image in images.items()
             )
         )
+        if checkpoint is not None:
+            checkpoint.stop_if_refused()
         return dict(zip(images, results, strict=True))
 
     async def recognize_document(
@@ -486,10 +547,16 @@ class DocumentRecognizer:
         keys: Sequence[str],
         cached: Mapping[str, ParseCacheEntry],
         kind: ParseCacheKind,
+        checkpoint: CallCheckpoint | None,
     ) -> PageOutcome:
         try:
-            return await self._page(tenant_id, document_id, plan, image, keys, cached, kind)
-        except Exception:
+            return await self._page(
+                tenant_id, document_id, plan, image, keys, cached, kind, checkpoint
+            )
+        except Exception as exc:
+            if checkpoint is not None and exc is checkpoint.refusal:
+                # Stopped (B-222): ``recognize`` raises the refusal.
+                return PageOutcome(status=PageStatus.PENDING, error=ERROR_INTERNAL)
             logger.exception("knowledge.recognition_page_failed document=%s", document_id)
             return PageOutcome(status=PageStatus.FAILED, error=ERROR_INTERNAL)
 
@@ -502,6 +569,7 @@ class DocumentRecognizer:
         keys: Sequence[str],
         cached: Mapping[str, ParseCacheEntry],
         kind: ParseCacheKind,
+        checkpoint: CallCheckpoint | None,
     ) -> PageOutcome:
         for engine, key in zip(plan.engines, keys, strict=True):
             hit = cached.get(key)
@@ -527,9 +595,13 @@ class DocumentRecognizer:
             if engine.client is None:
                 errors.append(f"{engine.choice.key}: {engine.unavailable}")
                 continue
+            slot = self._limit(engine)
             try:
                 reading = await read_with_retry(
-                    engine.client, image, sleep=self._sleep, limit=self._limit(engine)
+                    engine.client,
+                    image,
+                    sleep=self._sleep,
+                    limit=slot if checkpoint is None else CheckedSlot(slot, checkpoint),
                 )
             except RecognitionCallError as exc:
                 logger.warning(

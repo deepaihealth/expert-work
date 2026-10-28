@@ -142,6 +142,7 @@ from orchestrator.tools import (
     WorkspaceStore,
 )
 from orchestrator.tools.knowledge_catalog import catalog_fingerprint
+from orchestrator.tools.knowledge_log import LoggedKnowledgeRetriever, RetrievalLogSink
 from orchestrator.tools.knowledge_rerank import RerankOutcome, RerankRanking
 from orchestrator.trajectory.recorder import TrajectoryRecorder
 from orchestrator.usage_metering import (
@@ -2056,15 +2057,22 @@ def make_knowledge_retriever(
     store: KnowledgeStore,
     embedder: Embedder | None,
     reranker: Reranker | None,
+    retrieval_log: RetrievalLogSink,
 ) -> KnowledgeRetriever | None:
     """Build the :class:`KnowledgeRetriever` backing ``knowledge_search``.
 
     ``None`` when no embedder is configured — ``knowledge_search`` is
     then unavailable, like long-term memory without an embedder.
+
+    B-175 P2-PR4 —— a :class:`LoggedKnowledgeRetriever`: every search, the
+    agent's and the console retrieval test's alike, writes a row to
+    ``retrieval_log``.
     """
     if embedder is None:
         return None
-    return KnowledgeRetriever(store=store, embedder=embedder, reranker=reranker)
+    return LoggedKnowledgeRetriever(
+        store=store, embedder=embedder, reranker=reranker, log_sink=retrieval_log
+    )
 
 
 async def resolve_object_store_config(

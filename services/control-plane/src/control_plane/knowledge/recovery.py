@@ -22,9 +22,11 @@ from datetime import UTC, datetime
 
 from control_plane.knowledge.ingestion import (
     CONTENT_MISSING_ERROR,
+    LocalIngests,
     StaleIngestionError,
     failure_code,
     ingest_document_bytes,
+    lease_guard,
     renew_lease_periodically,
 )
 from control_plane.knowledge.parsed_size import DocumentTooLargeError, Hold, reserve_raw_bytes
@@ -75,6 +77,7 @@ class KnowledgeIngestRecoveryWorker:
         recognizer: DocumentRecognizer | None = None,
         usage: IngestUsageRecorder | None = None,
         figures: FigureDescriber | None = None,
+        local: LocalIngests | None = None,
     ) -> None:
         if interval_s <= 0:
             msg = "interval_s must be positive"
@@ -91,6 +94,9 @@ class KnowledgeIngestRecoveryWorker:
         self._concurrency = max(1, concurrency)
         self._lease_seconds = lease_seconds
         self._max_attempts = max_attempts
+        #: B-222 —— the process's running ingests (the runner's ``local``), so
+        #: a cancel on this pod stops a drive at once.
+        self.local = local if local is not None else LocalIngests()
         self._task: asyncio.Task[None] | None = None
         self._stop = asyncio.Event()
 
@@ -209,6 +215,22 @@ class KnowledgeIngestRecoveryWorker:
         # coroutine: ``gather`` copies the context at task creation.
         token_tenant = current_tenant_id_var.set(claim.tenant_id)
         token_bypass = bypass_rls_var.set(False)
+        lost = asyncio.Event()
+        finishing = asyncio.Event()
+        owner = asyncio.current_task()
+
+        def stop() -> None:
+            # B-222: the document was cancelled on this pod, or a lease renewal
+            # was refused (cancelled / re-uploaded elsewhere) — stop as a lost
+            # claim (nothing written). Once the paid work is over a refusal is
+            # expected (READY refuses it): the drive finishes, tidy-up included.
+            if finishing.is_set():
+                return
+            lost.set()
+            if owner is not None:
+                owner.cancel()
+
+        self.local.add(claim.document_id, stop)
         renewer = asyncio.create_task(
             renew_lease_periodically(
                 self._store,
@@ -216,16 +238,25 @@ class KnowledgeIngestRecoveryWorker:
                 document_id=claim.document_id,
                 generation=claim.generation,
                 lease_seconds=self._lease_seconds,
+                on_lost=stop,
             )
         )
         try:
-            return await self._drive(claim)
+            return await self._drive(claim, finishing=finishing)
+        except asyncio.CancelledError:
+            if not lost.is_set():
+                raise
+            logger.info("knowledge.recovery_lost_claim document=%s", claim.document_id)
+            return False
         finally:
+            self.local.discard(claim.document_id, stop)
             renewer.cancel()
             current_tenant_id_var.reset(token_tenant)
             bypass_rls_var.reset(token_bypass)
 
-    async def _drive(self, claim: ClaimedIngestion) -> bool:
+    async def _drive(self, claim: ClaimedIngestion, *, finishing: asyncio.Event) -> bool:
+        """``finishing`` is set once the paid work is over (whatever its
+        outcome): from then on only fenced writes and the tidy-up follow."""
         if claim.content is None:
             # No retained bytes (legacy row) — cannot recover; fail it.
             await self._store.mark_document_failed_terminal(
@@ -239,21 +270,31 @@ class KnowledgeIngestRecoveryWorker:
             return True
         ready = written = False
         try:
-            chunk_count = await ingest_document_bytes(
-                store=self._store,
-                embedder=self._embedder,
-                tenant_id=claim.tenant_id,
-                document_id=claim.document_id,
-                kb_id=claim.kb_id,
-                filename=claim.filename,
-                raw=claim.content,
-                chunk_max_tokens=claim.chunk_max_tokens,
-                chunk_overlap_tokens=claim.chunk_overlap_tokens,
-                generation=claim.generation,
-                recognizer=self._recognizer,
-                usage=self._usage,
-                figures=self._figures,
-            )
+            try:
+                chunk_count = await ingest_document_bytes(
+                    store=self._store,
+                    embedder=self._embedder,
+                    tenant_id=claim.tenant_id,
+                    document_id=claim.document_id,
+                    kb_id=claim.kb_id,
+                    filename=claim.filename,
+                    raw=claim.content,
+                    chunk_max_tokens=claim.chunk_max_tokens,
+                    chunk_overlap_tokens=claim.chunk_overlap_tokens,
+                    generation=claim.generation,
+                    recognizer=self._recognizer,
+                    usage=self._usage,
+                    figures=self._figures,
+                    guard=lease_guard(
+                        self._store,
+                        tenant_id=claim.tenant_id,
+                        document_id=claim.document_id,
+                        generation=claim.generation,
+                        lease_seconds=self._lease_seconds,
+                    ),
+                )
+            finally:
+                finishing.set()
             written = True  # this claim's chunks are in place
             settled = await self._store.set_document_status(
                 tenant_id=claim.tenant_id,
