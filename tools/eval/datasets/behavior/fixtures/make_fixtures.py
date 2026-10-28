@@ -101,6 +101,22 @@ def _calc_args() -> str:
     )
 
 
+def _source_check() -> str:
+    # g17 (B-226): always writes one stderr line and exits 2; never prints OK.
+    return (
+        "import sys\n"
+        "\n"
+        "\n"
+        "def main():\n"
+        '    print("ERROR: data source unavailable (synthetic)", file=sys.stderr)\n'
+        "    sys.exit(2)\n"
+        "\n"
+        "\n"
+        'if __name__ == "__main__":\n'
+        "    main()\n"
+    )
+
+
 _CONTENT_TYPES = (
     '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
     '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">'
@@ -454,6 +470,7 @@ def build() -> dict[str, str | bytes]:
         "product-notes.md": _product_notes(),
         "buggy-script.txt": _buggy_script(),
         "calc-args.txt": _calc_args(),
+        "source-check.txt": _source_check(),
         "previous-plan.docx": _previous_plan(),
         "checkup-report.docx": _checkup_report(),
         **{name: _ledger(f) for f, name in enumerate(C01_FILES, start=1)},

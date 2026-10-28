@@ -243,7 +243,11 @@ class ResumeOutcome:
       ``terminal`` is ``True`` for a declarative-gate reject (the platform
       vetoed the run → route to END) and ``False`` for an
       ``ask_for_approval`` reject (the agent just loops back, sees the
-      rejection, re-plans).
+      rejection, re-plans). ``rejected`` is the index of the call the
+      rejected request showed when the reject refused an action — B-226 ⑤
+      records it when the reject does not end the run. ``None`` when it cannot
+      be told, or when the request was an ``ask_for_approval`` question
+      (anything but ``risk_confirmation``): a reject answers a question.
 
     ``binding_drift`` (RT-6 Tier A, RT-ADR-19) marks the reject as an
     *integrity veto*: the dispatched args no longer match what was
@@ -255,6 +259,7 @@ class ResumeOutcome:
         "answered",
         "binding_drift",
         "reject_messages",
+        "rejected",
         "terminal",
         "tool_calls",
         "withheld",
@@ -269,6 +274,7 @@ class ResumeOutcome:
         binding_drift: bool = False,
         withheld: dict[int, ToolMessage] | None = None,
         answered: dict[int, ToolMessage] | None = None,
+        rejected: int | None = None,
     ) -> None:
         self.tool_calls = tool_calls
         self.reject_messages = reject_messages
@@ -276,6 +282,7 @@ class ResumeOutcome:
         self.binding_drift = binding_drift
         self.withheld: dict[int, ToolMessage] = withheld or {}
         self.answered: dict[int, ToolMessage] = answered or {}
+        self.rejected = rejected
 
 
 def _binding_drift_reject(tool_calls: list[dict[str, Any]]) -> ResumeOutcome:
@@ -492,7 +499,15 @@ def apply_resume_decision(
         # A declarative-gate reject vetoes the whole run; an
         # agent-initiated ask_for_approval reject just informs the agent.
         terminal = target is not None and not target.is_agent_initiated
-        return ResumeOutcome(tool_calls=[], reject_messages=messages, terminal=terminal)
+        # B-226 ⑤ — the call the request showed: an action-screen request shows the
+        # judge's pick, which the declarative scan above does not re-find.
+        shown = _approved_target(tool_calls, approval_required_tools, resume)
+        return ResumeOutcome(
+            tool_calls=[],
+            reject_messages=messages,
+            terminal=terminal,
+            rejected=shown.index if shown is not None and _refuses_an_action(shown) else None,
+        )
     # approve / modify (any other decision value reads as approve, as before).
     target = _approved_target(tool_calls, approval_required_tools, resume)
     dispatched = [dict(call) for call in tool_calls]
@@ -522,6 +537,25 @@ def apply_resume_decision(
         withheld=_withhold_all_but(tool_calls, target.index),
         answered=answered,
     )
+
+
+def asks_to_act(call: Mapping[str, Any]) -> bool:
+    """B-226 ⑤ — is this ``ask_for_approval`` call a ``risk_confirmation``?
+
+    One asking about a fork, a missing value or an ambiguity (``approach_choice`` /
+    ``missing_info`` / ``ambiguous_requirement``) asks a question: a reject answers it
+    ("not A — use B"), an approval says nothing about any refused action. Only
+    ``risk_confirmation`` asks to do something. Read through the same coercion the
+    request was built with, so the ledger sees the kind the reviewer was shown.
+    """
+    args = call.get("args") or {}
+    return _coerce_reason_kind(args.get("reason_kind")) == "risk_confirmation"
+
+
+def _refuses_an_action(target: ApprovalTarget) -> bool:
+    """B-226 ⑤ — does rejecting ``target`` refuse an action (rather than answer a question)?
+    Any gated call other than ``ask_for_approval`` is an action."""
+    return not target.is_agent_initiated or asks_to_act(target.tool_call)
 
 
 def _approved_question(

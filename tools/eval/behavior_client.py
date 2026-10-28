@@ -53,6 +53,22 @@ def message_text(content: Any) -> str:
     return ""
 
 
+def _failed_exec(msg: dict[str, Any]) -> bool:
+    """B-226: an exec_python / bash non-zero exit stays a ``status="success"`` tool
+    result; the exit code is only in its meta (``artifact``). Same rule as the
+    platform's ledger: exit 1 with nothing on stderr and no timeout is neutral (not
+    counted) — usually a predicate that answered "no" (``grep -q``, ``grep -c``
+    printing 0, ``diff``)."""
+    meta = msg.get("artifact")
+    if not isinstance(meta, dict):
+        return False
+    code = meta.get("exit_code")
+    if not isinstance(code, int) or isinstance(code, bool) or code == 0:
+        return False
+    predicate_no = code == 1 and not meta.get("stderr") and not meta.get("timed_out")
+    return not predicate_no
+
+
 class SseParser:
     """逐行喂 SSE;空行结束一个事件。忽略 ``:`` 注释,多行 ``data:`` 用换行拼接。"""
 
@@ -141,7 +157,7 @@ class TurnBuilder:
                     text = message_text(msg.get("content"))
                     if text.strip() and not calls:
                         self._final_text = text
-                elif mtype in _TOOL_TYPES and msg.get("status") == "error":
+                elif mtype in _TOOL_TYPES and (msg.get("status") == "error" or _failed_exec(msg)):
                     self._tool_errors += 1
                     failed_id = msg.get("tool_call_id")
                     if isinstance(failed_id, str):
