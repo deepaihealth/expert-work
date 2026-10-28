@@ -38,12 +38,6 @@ from expert_work.persistence.knowledge.passages import (
     PassageChild as PassageChild,
 )
 from expert_work.persistence.knowledge.passages import (
-    PassageConflictError as PassageConflictError,
-)
-from expert_work.persistence.knowledge.passages import (
-    PassageLayout as PassageLayout,
-)
-from expert_work.persistence.knowledge.passages import (
     PassageRevision as PassageRevision,
 )
 from expert_work.persistence.knowledge.passages import (

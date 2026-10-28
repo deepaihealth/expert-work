@@ -41,9 +41,9 @@ from expert_work.persistence.knowledge.base import (
     KnowledgeStore,
     Passage,
     PassageChild,
-    PassageConflictError,
     SwitchOffRecord,
 )
+from expert_work.persistence.knowledge.passages import PassageConflictError
 from expert_work.protocol import ChunkType, DocumentStatus, KnowledgeChunk
 
 ALEMBIC_INI = Path(__file__).resolve().parent.parent / "alembic.ini"
@@ -702,7 +702,7 @@ async def test_passage_writes_wait_for_a_settled_document(store: KnowledgeStore)
     ]
     for attempt in attempts:
         with pytest.raises(PassageConflictError) as refused:
-            await attempt
+            _ = await attempt
         assert refused.value.reason == "document_busy"
     assert [x.row.revision for x in await _listed(store, p.doc)] == [1, 1, 1]
 
