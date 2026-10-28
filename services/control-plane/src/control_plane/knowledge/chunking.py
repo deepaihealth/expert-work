@@ -459,20 +459,62 @@ async def chunk_markdown_semantic_parented(
     """The parents of :func:`chunk_markdown_parented`, their children also
     split at topic shifts (:func:`chunk_markdown_semantic`). A shift only
     splits inside a parent: parents are cut by structure and size alone."""
+    cut, groups, split, blocks = _semantic_layout(
+        markdown,
+        max_tokens=max_tokens,
+        plain_text=plain_text,
+        doc_title=doc_title,
+        parent_max_tokens=parent_max_tokens,
+    )
+    semantic_breaks: frozenset[int] = frozenset()
+    if len(blocks) >= 2:
+        semantic_breaks = await _semantic_breaks(blocks, embedder, tenant_id, memo)
+    return _pack_parents(
+        cut,
+        groups,
+        split,
+        semantic_breaks,
+        max_tokens=max_tokens,
+        overlap_tokens=overlap_tokens,
+        doc_title=doc_title,
+    )
+
+
+def _semantic_layout(
+    markdown: str,
+    *,
+    max_tokens: int,
+    plain_text: bool,
+    doc_title: str | None,
+    parent_max_tokens: int,
+) -> tuple[_ParentCut, list[list[_Block]], list[list[_Block]], list[_Block]]:
+    """The parent groups of the semantic chunker and their blocks as topic
+    detection sees them. Oversized blocks (a whole spreadsheet sheet parses to
+    one table block — up to 85k characters in real material) are cut to the
+    chunk cap *before* they are embedded for topic detection, so no single
+    embedding input ever exceeds the cap (the embedding API rejects inputs past
+    its token limit and the whole document would fail)."""
     cut = _ParentCut(
         max_tokens=max_tokens, parent_max_tokens=parent_max_tokens, doc_title=doc_title
     )
     groups = cut.groups(_blocks(markdown, plain_text=plain_text))
-    # Oversized blocks (a whole spreadsheet sheet parses to one table block —
-    # up to 85k characters in real material) are cut to the chunk cap *before*
-    # they are embedded for topic detection, so no single embedding input ever
-    # exceeds the cap (the embedding API rejects inputs past its token limit
-    # and the whole document would fail).
     split = [_presplit_blocks(group, max_tokens) for group in groups]
     blocks = [block for group in split for block in group]
-    semantic_breaks: frozenset[int] = frozenset()
-    if len(blocks) >= 2:
-        semantic_breaks = await _semantic_breaks(blocks, embedder, tenant_id, memo)
+    return cut, groups, split, blocks
+
+
+def _pack_parents(
+    cut: _ParentCut,
+    groups: Sequence[list[_Block]],
+    split: Sequence[list[_Block]],
+    semantic_breaks: frozenset[int],
+    *,
+    max_tokens: int,
+    overlap_tokens: int,
+    doc_title: str | None,
+) -> list[ParentChunk]:
+    """Each group's children, split also at ``semantic_breaks`` (indices of
+    the document's blocks), under their parent."""
     parents: list[ParentChunk] = []
     written: set[tuple[str, ...]] = set()
     start = 0  # index in the document of the parent's first block
@@ -491,6 +533,68 @@ async def chunk_markdown_semantic_parented(
         )
         parents.append(cut.parent(group, children))
     return parents
+
+
+@dataclass(frozen=True)
+class ChunkEstimate:
+    """B-222 —— what an ingest of a text will chunk and embed, found without
+    embedding anything: its ``parents`` cut as the ingest cuts them, split at
+    the topic shifts already known (:class:`BreakMemo`; unknown ones are not
+    split — topic shifts only add chunks), and the block texts topic
+    detection would embed (``break_texts``; none when it is off)."""
+
+    parents: list[ParentChunk]
+    break_texts: list[str]
+
+
+def estimate_chunks(
+    markdown: str,
+    *,
+    max_tokens: int,
+    overlap_tokens: int,
+    semantic: bool,
+    plain_text: bool = False,
+    doc_title: str | None = None,
+    memo: BreakMemo | None = None,
+    parent_max_tokens: int = PARENT_MAX_TOKENS,
+) -> ChunkEstimate:
+    """:class:`ChunkEstimate` of ``markdown`` — the same layout and packing
+    as :func:`chunk_markdown_parented` / :func:`chunk_markdown_semantic_parented`
+    (``semantic``), and the same choice of blocks to embed as
+    :func:`_semantic_breaks`."""
+    if not semantic:
+        parents = chunk_markdown_parented(
+            markdown,
+            max_tokens=max_tokens,
+            overlap_tokens=overlap_tokens,
+            plain_text=plain_text,
+            doc_title=doc_title,
+            parent_max_tokens=parent_max_tokens,
+        )
+        return ChunkEstimate(parents=parents, break_texts=[])
+    cut, groups, split, blocks = _semantic_layout(
+        markdown,
+        max_tokens=max_tokens,
+        plain_text=plain_text,
+        doc_title=doc_title,
+        parent_max_tokens=parent_max_tokens,
+    )
+    known: frozenset[int] = frozenset()
+    break_texts: list[str] = []
+    if len(blocks) >= 2:
+        plan = _break_plan(blocks, memo)
+        known = plan.known_breaks
+        break_texts = [blocks[index].text for index in plan.needed]
+    parents = _pack_parents(
+        cut,
+        groups,
+        split,
+        known,
+        max_tokens=max_tokens,
+        overlap_tokens=overlap_tokens,
+        doc_title=doc_title,
+    )
+    return ChunkEstimate(parents=parents, break_texts=break_texts)
 
 
 def structural_chunk_count(
@@ -1042,6 +1146,58 @@ def _section_budget(
     return range(start, stop), max(max_tokens - prefix_tokens(start, stop), max_tokens // 2)
 
 
+@dataclass(frozen=True)
+class _BreakPlan:
+    """What topic detection over ``blocks`` needs: the same-section pairs
+    (index of the second block) whose decision ``known`` from the memo (and
+    which of them are breaks), the ones still ``open_pairs``, and the blocks
+    to embed (``needed``) — all of them without a memo."""
+
+    keys: dict[int, str]
+    known: dict[str, bool]
+    known_breaks: frozenset[int]
+    open_pairs: list[int]
+    needed: list[int]
+
+
+def _break_plan(blocks: Sequence[_Block], memo: BreakMemo | None) -> _BreakPlan:
+    """The plan of :func:`_semantic_breaks` (and of a B-222 estimate, which
+    embeds nothing): pure, the memo is only read."""
+    pairs = [
+        index
+        for index in range(1, len(blocks))
+        if blocks[index].heading_trail == blocks[index - 1].heading_trail
+    ]
+    if memo is None:
+        return _BreakPlan(
+            keys={},
+            known={},
+            known_breaks=frozenset(),
+            open_pairs=pairs,
+            needed=list(range(len(blocks))),
+        )
+    keys = {index: memo.key(blocks[index - 1].text, blocks[index].text) for index in pairs}
+    known: dict[str, bool] = {}
+    breaks: set[int] = set()
+    for index in pairs:
+        decision = memo.known.get(keys[index])
+        if decision is not None:
+            known[keys[index]] = decision
+            if decision:
+                breaks.add(index)
+    open_pairs = [
+        index for index in pairs if keys[index] not in known and keys[index] not in memo.decided
+    ]
+    needed = sorted({side for index in open_pairs for side in (index - 1, index)})
+    return _BreakPlan(
+        keys=keys,
+        known=known,
+        known_breaks=frozenset(breaks),
+        open_pairs=open_pairs,
+        needed=needed,
+    )
+
+
 async def _semantic_breaks(
     blocks: list[_Block], embedder: Embedder, tenant_id: UUID, memo: BreakMemo | None = None
 ) -> frozenset[int]:
@@ -1051,26 +1207,13 @@ async def _semantic_breaks(
     Blocks are embedded :data:`SEMANTIC_EMBED_WINDOW` at a time and only the
     previous block's vector outlives its window. With a ``memo``, a pair it
     already knows is not embedded again: only the blocks of the other pairs are."""
-    pairs = [
-        index
-        for index in range(1, len(blocks))
-        if blocks[index].heading_trail == blocks[index - 1].heading_trail
-    ]
-    breaks: set[int] = set()
-    keys: dict[int, str] = {}
+    plan = _break_plan(blocks, memo)
+    breaks: set[int] = set(plan.known_breaks)
+    keys = plan.keys
     if memo is not None:
-        keys = {index: memo.key(blocks[index - 1].text, blocks[index].text) for index in pairs}
-        for index in pairs:
-            known = memo.known.get(keys[index])
-            if known is not None:
-                memo.decided[keys[index]] = known
-                if known:
-                    breaks.add(index)
-        pairs = [index for index in pairs if keys[index] not in memo.decided]
-        needed = sorted({side for index in pairs for side in (index - 1, index)})
-    else:
-        needed = list(range(len(blocks)))
-    open_pairs = set(pairs)
+        memo.decided.update(plan.known)
+    open_pairs = set(plan.open_pairs)
+    needed = plan.needed
     previous: tuple[int, Sequence[float]] | None = None
     for start in range(0, len(needed), SEMANTIC_EMBED_WINDOW):
         window = needed[start : start + SEMANTIC_EMBED_WINDOW]

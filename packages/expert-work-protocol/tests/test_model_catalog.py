@@ -11,7 +11,7 @@ from expert_work.protocol import (
     catalog_entry,
     models_for_provider,
 )
-from expert_work.protocol.model_catalog import EmbeddingCaps, OcrCaps, RerankCaps
+from expert_work.protocol.model_catalog import EmbeddingCaps, EstimateCaps, OcrCaps, RerankCaps
 from expert_work.protocol.provider_catalog import PROVIDER_CATALOG
 
 
@@ -704,6 +704,25 @@ def test_chat_vlm_ocr_caps_need_vision() -> None:
     # A layout-parsing model reads images without being a vision chat model.
     ModelEntry(name="ocr", ocr_caps=OcrCaps(api="layout_parsing"))
     ModelEntry(name="vlm", vision=True, ocr_caps=OcrCaps(api="chat_vlm"))
+
+
+def test_estimate_caps_are_the_calibrated_ones() -> None:
+    """B-222 PR-2 —— per-call averages for the ingest estimate (sources at
+    the entries: a usage measurement, or the output cap the platform sends —
+    an estimate errs high). Whole-object equality pins the undeclared fields:
+    they fall back to the platform's generic averages."""
+    assert _e("glm", "glm-ocr").estimate_caps == EstimateCaps(
+        page_input_tokens=2_035, page_output_tokens=8_192
+    )
+    vlm = _e("qwen", "qwen3.7-flash")
+    assert vlm.estimate_caps == EstimateCaps(page_input_tokens=2_733, page_output_tokens=8_192)
+    assert vlm.ocr_caps is not None
+    assert vlm.estimate_caps.page_output_tokens == vlm.ocr_caps.max_output_tokens
+    assert _e("qwen", "qwen3.8-flash").estimate_caps == EstimateCaps(
+        figure_input_tokens=2_711, figure_output_tokens=1_024
+    )
+    # Embedding models: measured only on Chinese text so far — none declared.
+    assert all(entry.estimate_caps is None for _, entry in _flagged("embeddings"))
 
 
 def test_retired_qwen3_vl_flash_is_deprecated_but_resolvable() -> None:

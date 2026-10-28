@@ -36,6 +36,9 @@ def test_document_status_values() -> None:
         "failed",
         # B-222 — the user stopped the ingest.
         "cancelled",
+        # B-222 PR-2 — estimated before anything is spent, then confirmed.
+        "estimating",
+        "awaiting_confirmation",
         # Reserved for B-179 content safety; nothing writes them yet.
         "blocked",
         "disabled",

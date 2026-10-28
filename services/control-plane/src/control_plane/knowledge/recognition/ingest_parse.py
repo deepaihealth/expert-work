@@ -23,7 +23,7 @@ from collections.abc import Awaitable, Callable, Mapping
 from concurrent.futures.process import BrokenProcessPool
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Protocol
+from typing import Literal, Protocol
 from uuid import UUID
 
 from control_plane.knowledge.parsed_size import (
@@ -101,57 +101,141 @@ class ParseJob:
     run_figures: PoolRunner | None = None
 
 
+@dataclass(frozen=True)
+class LocalParse:
+    """B-222 PR-2 —— the free half of parsing an upload: everything done in
+    the parse pools, no model called, nothing written. What an estimate counts
+    and keeps (the parse snapshot); :func:`finish_parse` does the rest.
+
+    * ``text`` —— ``markdown`` is the final text;
+    * ``office`` —— a Word / slide file with figures on: ``markdown`` with
+      figure placeholders and the figures (``office_figures``);
+    * ``pdf`` —— the page decisions with the text pages' text (``analysis``;
+      the text-page figures already placed, ``pdf_figures``, when figures are
+      on), and how much recognized text the document may still take
+      (``text_limit``)."""
+
+    kind: Literal["text", "office", "pdf"]
+    figures_on: bool
+    markdown: str | None = None
+    office_figures: FigureExtraction | None = None
+    analysis: PdfAnalysis | None = None
+    pdf_figures: FigureExtraction | None = None
+    text_limit: int = 0
+
+
 async def parse_upload(
     job: ParseJob,
     *,
     recognizer: DocumentRecognizer | None = None,
     figures: FigureDescriber | None = None,
 ) -> str:
-    """The upload's Markdown (see module doc).
+    """The upload's Markdown (see module doc): :func:`local_parse`, then
+    :func:`finish_parse`.
 
     :raises DocumentParseError: the file cannot be parsed or holds no text.
     :raises Exception: ``job.lost()`` when a fenced write was refused."""
-    ext = Path(job.filename).suffix.lower()
-    describer = figures if figures is not None and await _enabled(figures, job) else None
-    if ext == ".pdf":
-        return await _parse_pdf(job, recognizer, describer)
-    if describer is not None and ext in FIGURE_OFFICE_EXTENSIONS:
-        return await _parse_office(job, describer, ext)
-    return await job.run(parse_within_cap, job.filename, job.raw, max_parsed_chars())
+    on = figures is not None and await figures_enabled(figures, tenant_id=job.tenant_id)
+    describer = figures if on else None
+    local = await local_parse(job, figures_on=describer is not None)
+    return await finish_parse(job, local, recognizer=recognizer, figures=describer)
 
 
-async def _enabled(figures: FigureDescriber, job: ParseJob) -> bool:
+async def figures_enabled(figures: FigureDescriber, *, tenant_id: UUID) -> bool:
+    """Whether the document's figures are taken out and described (a usable
+    figure model is configured; never an error — off then)."""
     try:
-        return await figures.enabled(tenant_id=job.tenant_id)
+        return await figures.enabled(tenant_id=tenant_id)
     except Exception:
         logger.warning("knowledge.figure_settings_failed", exc_info=True)
         return False
 
 
-async def _parse_office(job: ParseJob, figures: FigureDescriber, ext: str) -> str:
-    parsed: OfficeParse = await job.run(
-        parse_office_figures_within_cap, job.raw, ext, max_parsed_chars()
-    )
-    outcome = await _describe(job, figures, parsed.figures, parsed.markdown)
-    markdown = resolve_figures(parsed.markdown, outcome.blocks if outcome else {})
+async def local_parse(job: ParseJob, *, figures_on: bool) -> LocalParse:
+    """The parse-pool half of :func:`parse_upload` (``figures_on``: a usable
+    figure describer will describe the figures)."""
+    ext = Path(job.filename).suffix.lower()
+    if ext == ".pdf":
+        return await _local_pdf(job, figures_on)
+    if figures_on and ext in FIGURE_OFFICE_EXTENSIONS:
+        parsed: OfficeParse = await job.run(
+            parse_office_figures_within_cap, job.raw, ext, max_parsed_chars()
+        )
+        return LocalParse(
+            kind="office",
+            figures_on=True,
+            markdown=parsed.markdown,
+            office_figures=parsed.figures,
+        )
+    markdown = await job.run(parse_within_cap, job.filename, job.raw, max_parsed_chars())
+    return LocalParse(kind="text", figures_on=figures_on, markdown=markdown)
+
+
+async def finish_parse(
+    job: ParseJob,
+    local: LocalParse,
+    *,
+    recognizer: DocumentRecognizer | None = None,
+    figures: FigureDescriber | None = None,
+) -> str:
+    """The paid half: recognition, figure descriptions, the page and figure
+    records — from ``local`` (just parsed, or the estimate's snapshot).
+    ``figures`` is only used when ``local`` was parsed with figures on."""
+    describer = figures if local.figures_on else None
+    if local.kind == "office" and describer is not None:
+        return await _finish_office(job, local, describer)
+    if local.kind == "pdf" and local.analysis is not None:
+        return await _finish_pdf(job, local, recognizer, describer)
+    return local.markdown or ""
+
+
+async def _finish_office(job: ParseJob, local: LocalParse, figures: FigureDescriber) -> str:
+    markdown_in = local.markdown or ""
+    extraction = local.office_figures or FigureExtraction()
+    outcome = await _describe(job, figures, extraction, markdown_in)
+    markdown = resolve_figures(markdown_in, outcome.blocks if outcome else {})
     if office_text_is_empty(markdown):
         stats = outcome.stats if outcome is not None else FigureStats()
         raise DocumentParseError(_no_text_message(job.filename, stats))
     return markdown
 
 
-async def _parse_pdf(
-    job: ParseJob, recognizer: DocumentRecognizer | None, figures: FigureDescriber | None
-) -> str:
+async def _local_pdf(job: ParseJob, figures_on: bool) -> LocalParse:
     analysis: PdfAnalysis = await job.run(
         analyse_pdf_within_cap, job.filename, job.raw, max_parsed_chars()
     )
     if not analysis.pages:  # PyMuPDF could not walk it: parsed as before, no records
-        return analysis.markdown or ""
-    outcomes = await _recognize(job, recognizer, analysis)
+        return LocalParse(kind="text", figures_on=figures_on, markdown=analysis.markdown or "")
+    # Recognition stops paying once what it read fills the room the
+    # per-document text cap leaves (parsed_size.recognized_text_limit) —
+    # measured before the text pages' figures are placed in their text.
+    limit = recognized_text_limit(analysis, MAX_RECOGNIZED_CHARS_PER_DOCUMENT)
+    figures: FigureExtraction | None = None
+    if figures_on:
+        analysis, figures = await _text_page_figures(job, analysis)
+    return LocalParse(
+        kind="pdf",
+        figures_on=figures_on,
+        analysis=analysis,
+        pdf_figures=figures,
+        text_limit=limit,
+    )
+
+
+async def _finish_pdf(
+    job: ParseJob,
+    local: LocalParse,
+    recognizer: DocumentRecognizer | None,
+    figures: FigureDescriber | None,
+) -> str:
+    analysis = local.analysis
+    assert analysis is not None  # noqa: S101 — the caller checked
+    outcomes = await _recognize(job, recognizer, analysis, local.text_limit)
     outcome: FigureOutcome | None = None
     if figures is not None:
-        analysis, outcomes, extraction = await _figures_of(job, analysis, outcomes)
+        outcomes, extraction = await _scanned_figures(
+            job, outcomes, local.pdf_figures or FigureExtraction()
+        )
         text = "\n".join([*(p.text for p in analysis.pages), *(o.text for o in outcomes.values())])
         outcome = await _describe(job, figures, extraction, text)
     blocks = outcome.blocks if outcome is not None else {}
@@ -180,9 +264,10 @@ async def _parse_pdf(
 
 
 async def _recognize(
-    job: ParseJob, recognizer: DocumentRecognizer | None, analysis: PdfAnalysis
+    job: ParseJob, recognizer: DocumentRecognizer | None, analysis: PdfAnalysis, limit: int
 ) -> dict[int, PageOutcome]:
-    """The scanned pages' outcomes (none: no page needs recognition)."""
+    """The scanned pages' outcomes (none: no page needs recognition); what
+    they read stops at ``limit`` characters."""
     scanned = [page.index for page in analysis.ocr_pages]
     if not scanned:
         return {}
@@ -194,9 +279,6 @@ async def _recognize(
     async def render(indexes: list[int], max_pixels: int | None) -> list[bytes]:
         return await job.run(render_pages, job.raw, indexes, max_pixels)
 
-    # Recognition stops paying once what it read fills the room the
-    # per-document text cap leaves (parsed_size.recognized_text_limit).
-    limit = recognized_text_limit(analysis, MAX_RECOGNIZED_CHARS_PER_DOCUMENT)
     outcomes = await recognizer.recognize_document(
         tenant_id=job.tenant_id,
         document_id=job.document_id,
@@ -208,12 +290,13 @@ async def _recognize(
     return cap_recognized_text(outcomes, limit)
 
 
-async def _figures_of(
-    job: ParseJob, analysis: PdfAnalysis, outcomes: Mapping[int, PageOutcome]
-) -> tuple[PdfAnalysis, dict[int, PageOutcome], FigureExtraction]:
-    """The PDF's figures with their placeholders in place: the text pages'
-    (own pool call, own time share) and the scanned pages' image regions.
-    Either going wrong costs only those figures (counted unreadable)."""
+async def _text_page_figures(
+    job: ParseJob, analysis: PdfAnalysis
+) -> tuple[PdfAnalysis, FigureExtraction]:
+    """The figures of the PDF's text pages, with their placeholders in place
+    (own pool call, own time share; going wrong costs only those figures,
+    counted unreadable). The scanned pages' come with their recognition
+    (:func:`_scanned_figures`)."""
     text_pages = [
         page
         for page in analysis.pages
@@ -246,13 +329,22 @@ async def _figures_of(
                 replace(page, text=texts.get(page.index, page.text)) for page in analysis.pages
             ),
         )
+    return analysis, extraction
+
+
+async def _scanned_figures(
+    job: ParseJob, outcomes: Mapping[int, PageOutcome], extraction: FigureExtraction
+) -> tuple[dict[int, PageOutcome], FigureExtraction]:
+    """The scanned pages' image regions cropped and their placeholders in
+    place, numbered after the text pages' ``extraction`` and added to it
+    (going wrong costs only those figures, counted unreadable)."""
     regions = {
         index: outcome.regions
         for index, outcome in outcomes.items()
         if outcome.status is PageStatus.RECOGNIZED and outcome.regions
     }
     if not regions:
-        return analysis, dict(outcomes), extraction
+        return dict(outcomes), extraction
     unreadable = sum(len(boxes) for boxes in regions.values())
     scanned: ScannedFigures = await _figure_call(
         job,
@@ -265,7 +357,6 @@ async def _figures_of(
         ),
     )
     return (
-        analysis,
         {
             index: replace(
                 outcome, text=regions_to_figures(outcome.text, scanned.numbers.get(index, {}))

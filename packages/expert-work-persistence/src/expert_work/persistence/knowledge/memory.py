@@ -22,6 +22,8 @@ from expert_work.persistence.knowledge.base import (
     ParseCacheKind,
     _Unset,
 )
+from expert_work.persistence.knowledge.estimates import WAITING_STATUSES, reindex_fence_statuses
+from expert_work.persistence.knowledge.memory_estimates import HeldSnapshot, InMemoryEstimates
 from expert_work.persistence.knowledge.passages import (
     SWITCH_OFF_REVISION,
     ChunkVector,
@@ -202,7 +204,7 @@ def _cosine_distance(a: Sequence[float], b: Sequence[float]) -> float:
     return 1.0 - dot / (norm_a * norm_b)
 
 
-class InMemoryKnowledgeStore(KnowledgeStore):
+class InMemoryKnowledgeStore(InMemoryEstimates, KnowledgeStore):
     """In-memory knowledge repository — semantics mirror :class:`SqlKnowledgeStore`."""
 
     def __init__(self) -> None:
@@ -229,6 +231,9 @@ class InMemoryKnowledgeStore(KnowledgeStore):
         #: the text revisions, and apart from them the switch-off records.
         self._revisions: list[tuple[UUID, UUID, PassageRevision]] = []
         self._switch_offs: list[tuple[UUID, UUID, PassageRevision]] = []
+        #: B-222 PR-2 — ``ingest_estimate`` as stored and ``knowledge_parse_snapshot``.
+        self._estimates: dict[UUID, dict[str, Any]] = {}
+        self._snapshots: dict[UUID, HeldSnapshot] = {}
 
     # -- knowledge bases ----------------------------------------------------
 
@@ -461,7 +466,12 @@ class InMemoryKnowledgeStore(KnowledgeStore):
                 "attempts": 0,
                 "ingest_generation": existing.ingest_generation + 1,
                 "updated_at": now,
+                # B-222 PR-2: queued without an estimate.
+                "ingest_estimate": None,
+                "confirm_by": None,
             }
+            self._estimates.pop(existing.id, None)
+            self._snapshots.pop(existing.id, None)
             if content is not None:
                 if self._content.get(existing.id) is None and existing.chunk_count == 0:
                     self._content[existing.id] = content  # nothing serving yet
@@ -547,15 +557,17 @@ class InMemoryKnowledgeStore(KnowledgeStore):
             return False
         if doc.status is DocumentStatus.PENDING:
             return True
-        if doc.status is DocumentStatus.PROCESSING:
+        # B-222 PR-2: an estimate is claimed like an ingest, and stays estimating.
+        if doc.status in (DocumentStatus.PROCESSING, DocumentStatus.ESTIMATING):
             lease = self._lease.get(doc.id)
             return lease is None or lease < now
         return False
 
     def _claim(self, doc: KnowledgeDocument, now: datetime, lease_seconds: int) -> ClaimedIngestion:
+        estimating = doc.status is DocumentStatus.ESTIMATING
         claimed = doc.model_copy(
             update={
-                "status": DocumentStatus.PROCESSING,
+                "status": DocumentStatus.ESTIMATING if estimating else DocumentStatus.PROCESSING,
                 "attempts": doc.attempts + 1,
                 "updated_at": now,
             }
@@ -582,6 +594,11 @@ class InMemoryKnowledgeStore(KnowledgeStore):
             chunk_overlap_tokens=chunk_overlap,
             attempts=claimed.attempts,
             generation=claimed.ingest_generation,
+            phase="estimate" if estimating else "ingest",
+            estimate=claimed.ingest_estimate,
+            origin=self._estimates.get(doc.id, {}).get("origin"),
+            allow_duplicate=bool(self._estimates.get(doc.id, {}).get("allow_duplicate")),
+            serving_sha256=self._sha256.get(doc.id),
         )
 
     async def mark_document_failed_terminal(
@@ -593,12 +610,16 @@ class InMemoryKnowledgeStore(KnowledgeStore):
         error_code: IngestErrorCode | None = None,
         generation: int | None = None,
     ) -> bool:
+        document = await self.get_document(tenant_id=tenant_id, document_id=document_id)
+        if document is None:
+            return False
+        if generation is not None and not _fence_in(document, generation, _WORKING):
+            return False
         failed = await self.set_document_status(
             tenant_id=tenant_id,
             document_id=document_id,
             status=DocumentStatus.FAILED,
             error=error,
-            generation=generation,
         )
         if failed:
             self._patch(tenant_id, document_id, {"error_code": error_code})
@@ -661,9 +682,13 @@ class InMemoryKnowledgeStore(KnowledgeStore):
             document = await self.get_document(tenant_id=tenant_id, document_id=document_id)
             if document is None or document.kb_id != kb_id:
                 outcomes[document_id] = "not_found"
+            elif document.status in WAITING_STATUSES:
+                # B-222 PR-2: nothing was spent yet — the estimate is withdrawn.
+                outcomes[document_id] = self._withdraw(document, now)
             elif document.status not in _CANCELLABLE_STATUSES or _writing_chunks(document):
                 outcomes[document_id] = "not_cancellable"
             else:
+                self._snapshots.pop(document_id, None)
                 self._patch(
                     tenant_id,
                     document_id,
@@ -681,7 +706,7 @@ class InMemoryKnowledgeStore(KnowledgeStore):
     async def sweep_terminal(self, *, now: datetime, max_attempts: int) -> int:
         swept = 0
         for doc in list(self._documents):
-            if doc.status is not DocumentStatus.PROCESSING or doc.attempts < max_attempts:
+            if doc.status not in _WORKING or doc.attempts < max_attempts:
                 continue
             lease = self._lease.get(doc.id)
             if lease is not None and lease >= now:
@@ -705,7 +730,7 @@ class InMemoryKnowledgeStore(KnowledgeStore):
         lease_seconds: int,
     ) -> bool:
         document = await self.get_document(tenant_id=tenant_id, document_id=document_id)
-        if document is None or not _fence_matches(document, generation):
+        if document is None or not _fence_in(document, generation, _WORKING):
             return False
         self._lease[document_id] = now + timedelta(seconds=lease_seconds)
         return True
@@ -797,6 +822,9 @@ class InMemoryKnowledgeStore(KnowledgeStore):
         for document_id in document_ids:
             self._pages.pop(document_id, None)
             self._figure_hashes.pop(document_id, None)
+            # B-222 PR-2 — the SQL FK cascades the snapshot (0179).
+            self._estimates.pop(document_id, None)
+            self._snapshots.pop(document_id, None)
         self._parse_cache = {
             key: entry for key, entry in self._parse_cache.items() if key[1] not in document_ids
         }
@@ -1157,7 +1185,9 @@ class InMemoryKnowledgeStore(KnowledgeStore):
         expect_status: DocumentStatus = DocumentStatus.READY,
     ) -> int | None:
         document = await self.get_document(tenant_id=tenant_id, document_id=document_id)
-        if document is None or not _fence_matches(document, generation, expect_status):
+        if document is None or not _fence_in(
+            document, generation, reindex_fence_statuses(expect_status)
+        ):
             return None
         wanted = {v.chunk_id: v for v in vectors}
         updated = 0
@@ -1602,3 +1632,14 @@ def _fence_matches(
     """The generation fence: the write-back belongs to the claim that still
     owns this exact generation of the document in the expected status."""
     return document.status is status and document.ingest_generation == generation
+
+
+#: B-222 PR-2 —— what a worker's lease renewal and terminal failure are fenced
+#: on: the paid ingest, or the free estimate.
+_WORKING = frozenset({DocumentStatus.PROCESSING, DocumentStatus.ESTIMATING})
+
+
+def _fence_in(
+    document: KnowledgeDocument, generation: int, statuses: Collection[DocumentStatus]
+) -> bool:
+    return document.status in statuses and document.ingest_generation == generation

@@ -38,6 +38,7 @@ from array import array
 from collections.abc import Callable, Collection, Sequence
 from concurrent.futures import Executor, Future, ProcessPoolExecutor
 from concurrent.futures.process import BrokenProcessPool
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from uuid import UUID
 
@@ -55,6 +56,8 @@ from control_plane.knowledge.chunking import (
     semantic_breaks_enabled,
     structural_chunk_count,
 )
+from control_plane.knowledge.estimate import IngestEstimator
+from control_plane.knowledge.parse_snapshot import decode_snapshot, encode_snapshot
 from control_plane.knowledge.parse_workers import (
     FIGURE_POOL,
     FIGURE_POOL_WORKERS,
@@ -77,11 +80,25 @@ from control_plane.knowledge.parsing import (
     strip_lone_surrogates,
 )
 from control_plane.knowledge.passages import replay_manual_changes
+from control_plane.knowledge.pricing import price_spend
 from control_plane.knowledge.recognition.figure_pipeline import FigureDescriber
-from control_plane.knowledge.recognition.ingest_parse import ParseJob, PoolRunner, parse_upload
+from control_plane.knowledge.recognition.ingest_parse import (
+    LocalParse,
+    ParseJob,
+    PoolRunner,
+    figures_enabled,
+    finish_parse,
+    local_parse,
+    parse_upload,
+)
 from control_plane.knowledge.recognition.recognizer import BatchGuard, DocumentRecognizer
 from control_plane.knowledge.stale import StaleIngestionError as StaleIngestionError
-from control_plane.knowledge.usage import IngestUsageRecorder, billed_embeddings
+from control_plane.knowledge.usage import (
+    IngestSpend,
+    IngestUsageRecorder,
+    billed_embeddings,
+    spend_scope,
+)
 from expert_work.persistence import KnowledgeStore
 from expert_work.persistence.knowledge.base import ChunkVector, ClaimedIngestion, PassageChild
 from expert_work.persistence.rls import current_tenant_id_var
@@ -94,6 +111,11 @@ from expert_work.protocol import (
     KnowledgeDocument,
     chunk_retrieval_text,
     knowledge_document_title,
+)
+from expert_work.protocol.knowledge_estimate import (
+    CONFIRM_WINDOW,
+    IngestOutcome,
+    needs_reconfirmation,
 )
 from orchestrator.llm import Embedder
 
@@ -165,9 +187,17 @@ CHUNK_EMBED_WINDOW = 200
 
 #: Settled statuses whose chunks may be serving: READY, and a re-upload that
 #: failed or was cancelled (B-222) while the previous version serves on. A
-#: re-index re-embeds them all (and fences on the status it read).
+#: re-index re-embeds them all (and fences on the status it read). B-222 PR-2:
+#: and a document being estimated or waiting (up to 7 days) for a confirmation
+#: — its previous version serves meanwhile, and must not hold the base back.
 _SERVING_STATUSES = frozenset(
-    {DocumentStatus.READY, DocumentStatus.FAILED, DocumentStatus.CANCELLED}
+    {
+        DocumentStatus.READY,
+        DocumentStatus.FAILED,
+        DocumentStatus.CANCELLED,
+        DocumentStatus.ESTIMATING,
+        DocumentStatus.AWAITING_CONFIRMATION,
+    }
 )
 
 
@@ -524,6 +554,7 @@ async def ingest_document_bytes(
     usage: IngestUsageRecorder | None = None,
     figures: FigureDescriber | None = None,
     guard: BatchGuard | None = None,
+    local: LocalParse | None = None,
 ) -> int:
     """Parse → chunk → embed → store one document; return the chunk count.
 
@@ -543,6 +574,8 @@ async def ingest_document_bytes(
     files into the text, at their place (without it they are left out).
     B-222: ``guard`` (:func:`lease_guard`) runs before each embedding window;
     recognition batches and figure model calls check the fenced stage write.
+    B-222 PR-2: ``local`` is the estimate's parse (:func:`parse_locally`, kept
+    as its snapshot) — the parse pools are not run again.
 
     :raises StaleIngestionError: the fenced write-back was rejected.
     """
@@ -556,28 +589,20 @@ async def ingest_document_bytes(
             stage=IngestStage.PARSING,
             generation=generation,
         )
-        run, run_figures = _pool_runners(filename)
-        job = ParseJob(
-            store=store,
+        job = _parse_job(
+            store,
             tenant_id=tenant_id,
             kb_id=kb_id,
             document_id=document_id,
             filename=filename,
             raw=raw,
             generation=generation,
-            run=run,
-            run_figures=run_figures,
-            recognizing=functools.partial(
-                _advance,
-                store,
-                tenant_id=tenant_id,
-                document_id=document_id,
-                stage=IngestStage.RECOGNIZING,
-                generation=generation,
-            ),
-            lost=lambda: StaleIngestionError(f"document {document_id} was taken by another claim"),
         )
-        markdown = await parse_upload(job, recognizer=recognizer, figures=figures)
+        if local is None:
+            markdown = await parse_upload(job, recognizer=recognizer, figures=figures)
+        else:
+            # B-222 PR-2: the estimate's parse — only the paid half is left.
+            markdown = await finish_parse(job, local, recognizer=recognizer, figures=figures)
     return await ingest_markdown(
         store=store,
         embedder=embedder,
@@ -593,6 +618,66 @@ async def ingest_document_bytes(
         usage=usage,
         guard=guard,
     )
+
+
+def _parse_job(
+    store: KnowledgeStore,
+    *,
+    tenant_id: UUID,
+    kb_id: UUID,
+    document_id: UUID,
+    filename: str,
+    raw: bytes,
+    generation: int | None,
+) -> ParseJob:
+    run, run_figures = _pool_runners(filename)
+    return ParseJob(
+        store=store,
+        tenant_id=tenant_id,
+        kb_id=kb_id,
+        document_id=document_id,
+        filename=filename,
+        raw=raw,
+        generation=generation,
+        run=run,
+        run_figures=run_figures,
+        recognizing=functools.partial(
+            _advance,
+            store,
+            tenant_id=tenant_id,
+            document_id=document_id,
+            stage=IngestStage.RECOGNIZING,
+            generation=generation,
+        ),
+        lost=lambda: StaleIngestionError(f"document {document_id} was taken by another claim"),
+    )
+
+
+async def parse_locally(
+    store: KnowledgeStore,
+    *,
+    tenant_id: UUID,
+    kb_id: UUID,
+    document_id: UUID,
+    filename: str,
+    raw: bytes,
+    figures: FigureDescriber | None,
+) -> LocalParse:
+    """B-222 PR-2 —— the free half of :func:`ingest_document_bytes`'s parse:
+    the parse pools only (same budgets), no model, nothing written. What an
+    estimate counts; its snapshot spares the confirmed ingest from parsing
+    again (``local``)."""
+    job = _parse_job(
+        store,
+        tenant_id=tenant_id,
+        kb_id=kb_id,
+        document_id=document_id,
+        filename=filename,
+        raw=raw,
+        generation=None,
+    )
+    on = figures is not None and await figures_enabled(figures, tenant_id=tenant_id)
+    return await local_parse(job, figures_on=on)
 
 
 def _pool_runners(filename: str) -> tuple[PoolRunner, PoolRunner]:
@@ -970,6 +1055,170 @@ async def _stop_renewer(renewer: asyncio.Task[None] | None) -> None:
     await asyncio.gather(renewer, return_exceptions=True)
 
 
+# -- B-222 PR-2: estimate first, confirm, then pay ------------------------------------
+
+
+async def estimate_document(
+    store: KnowledgeStore,
+    estimator: IngestEstimator,
+    embedder: Embedder,
+    claim: ClaimedIngestion,
+    *,
+    figures: FigureDescriber | None,
+) -> KnowledgeDocument:
+    """The estimate phase of a claim (``phase == "estimate"``): the local
+    parse, counts and prices — no model called — recorded with the parse
+    snapshot; the document then waits for its confirmation. What the ingest
+    would refuse (unparseable, over the caps) is raised here, before anything
+    is spent.
+
+    :raises StaleIngestionError: the estimate was withdrawn, or the document
+        re-uploaded, meanwhile (nothing written)."""
+    assert claim.content is not None  # noqa: S101 — the caller checked
+    local = await parse_locally(
+        store,
+        tenant_id=claim.tenant_id,
+        kb_id=claim.kb_id,
+        document_id=claim.document_id,
+        filename=claim.filename,
+        raw=claim.content,
+        figures=figures,
+    )
+    model_key, _ = await pin_embedder(embedder, tenant_id=claim.tenant_id)
+    now = datetime.now(UTC)
+    estimate = await estimator.estimate(claim, local, embedding_model=model_key, now=now)
+    finished = await store.finish_estimate(
+        tenant_id=claim.tenant_id,
+        document_id=claim.document_id,
+        generation=claim.generation,
+        estimate=estimate.model_dump(mode="json"),
+        snapshot=encode_snapshot(local),
+        confirm_by=now + CONFIRM_WINDOW,
+    )
+    if finished is None:
+        msg = f"document {claim.document_id} was withdrawn or re-uploaded while it was estimated"
+        raise StaleIngestionError(msg)
+    logger.info(
+        "knowledge.estimated document=%s total_micros=%d items=%d",
+        claim.document_id,
+        estimate.total_micros,
+        len(estimate.items),
+    )
+    return finished
+
+
+@dataclass(frozen=True)
+class PaidStart:
+    """How a confirmed ingest starts: from ``local`` (the estimate's parse —
+    ``None``: parse as ever), or not at all: ``returned`` — its estimate no
+    longer holds and the document waits for the new one."""
+
+    local: LocalParse | None
+    returned: bool = False
+
+
+async def start_paid_ingest(
+    store: KnowledgeStore,
+    estimator: IngestEstimator,
+    embedder: Embedder,
+    claim: ClaimedIngestion,
+    *,
+    figures: FigureDescriber | None,
+) -> PaidStart:
+    """§6.3 —— before a confirmed ingest spends anything: its parse comes
+    from the estimate's snapshot (parsed again, free, when there is none, it
+    cannot be read, or figure description was switched since), and it is
+    estimated again with the models and prices of now. A model changed, or
+    the total rose past the threshold (``needs_reconfirmation``): the
+    document goes back to waiting for a confirmation of the new estimate.
+    A document queued without an estimate starts as it always did.
+
+    :raises StaleIngestionError: the claim was lost meanwhile."""
+    confirmed = claim.estimate
+    if confirmed is None or confirmed.confirmed_at is None or claim.content is None:
+        return PaidStart(local=None)
+    local: LocalParse | None = None
+    snapshot = await store.get_parse_snapshot(
+        tenant_id=claim.tenant_id, document_id=claim.document_id, estimate_id=confirmed.id
+    )
+    if snapshot is not None:
+        local = decode_snapshot(snapshot)
+    figures_on = figures is not None and await figures_enabled(figures, tenant_id=claim.tenant_id)
+    if local is None or local.figures_on != figures_on:
+        local = await parse_locally(
+            store,
+            tenant_id=claim.tenant_id,
+            kb_id=claim.kb_id,
+            document_id=claim.document_id,
+            filename=claim.filename,
+            raw=claim.content,
+            figures=figures,
+        )
+    else:
+        logger.info("knowledge.snapshot_used document=%s", claim.document_id)
+    model_key, _ = await pin_embedder(embedder, tenant_id=claim.tenant_id)
+    now = datetime.now(UTC)
+    fresh = await estimator.estimate(claim, local, embedding_model=model_key, now=now)
+    if not needs_reconfirmation(confirmed, fresh):
+        return PaidStart(local=local)
+    returned = await store.return_to_confirmation(
+        tenant_id=claim.tenant_id,
+        document_id=claim.document_id,
+        generation=claim.generation,
+        estimate=fresh.model_dump(mode="json"),
+        snapshot=encode_snapshot(local),
+        confirm_by=now + CONFIRM_WINDOW,
+    )
+    if not returned:
+        msg = f"document {claim.document_id} was taken by another claim"
+        raise StaleIngestionError(msg)
+    logger.info(
+        "knowledge.estimate_reconfirm document=%s confirmed_micros=%d fresh_micros=%d "
+        "models_changed=%s",
+        claim.document_id,
+        confirmed.total_micros,
+        fresh.total_micros,
+        confirmed.models_fingerprint != fresh.models_fingerprint,
+    )
+    return PaidStart(local=None, returned=True)
+
+
+async def record_actual(
+    store: KnowledgeStore,
+    estimator: IngestEstimator,
+    claim: ClaimedIngestion,
+    spend: IngestSpend,
+    *,
+    outcome: IngestOutcome,
+    settled: bool,
+) -> None:
+    """Keep what the paid ingest of ``claim`` was billed on the document,
+    priced like the bill (§14 ⑥ 「预估 ¥x · 实际 ¥y」). Best effort: the usage
+    rows themselves are the bill."""
+    estimate_id = claim.estimate.id if claim.estimate is not None else None
+    try:
+        actual = await price_spend(
+            estimator.prices,
+            spend.rows,
+            estimate_id=estimate_id,
+            generation=claim.generation,
+            outcome=outcome,
+            now=datetime.now(UTC),
+        )
+        await store.record_ingest_actual(
+            tenant_id=claim.tenant_id,
+            document_id=claim.document_id,
+            generation=claim.generation,
+            estimate_id=estimate_id,
+            actual=actual.model_dump(mode="json"),
+            settled=settled,
+        )
+    except Exception:
+        logger.warning(
+            "knowledge.ingest_actual_failed document=%s", claim.document_id, exc_info=True
+        )
+
+
 class LocalIngests:
     """B-222 —— the ingests this process is driving now (claimed), each with
     the call that stops it as a lost claim: its task is cancelled, in-flight
@@ -1021,6 +1270,7 @@ class KnowledgeIngestionRunner:
         usage: IngestUsageRecorder | None = None,
         figures: FigureDescriber | None = None,
         local: LocalIngests | None = None,
+        estimator: IngestEstimator | None = None,
     ) -> None:
         self._store = store
         self._embedder = embedder
@@ -1034,6 +1284,9 @@ class KnowledgeIngestionRunner:
         #: B-222 —— this process's running ingests; hand it to the recovery
         #: worker so :meth:`cancel_local` stops its drives too.
         self.local = local if local is not None else LocalIngests()
+        #: B-222 PR-2 —— estimates claimed documents and prices what ingests
+        #: cost (none given: no prices, no figure settings — test wiring).
+        self.estimator = estimator or IngestEstimator(store=store, recognizer=recognizer)
 
     def cancel_local(self, document_ids: Collection[UUID]) -> int:
         """B-222 —— stop at once the ingests of ``document_ids`` running in
@@ -1125,7 +1378,9 @@ class KnowledgeIngestionRunner:
         token = current_tenant_id_var.set(tenant_id)
         renewer: asyncio.Task[None] | None = None
         claim: ClaimedIngestion | None = None
-        ready = written = False
+        ready = written = failed = False
+        #: B-222 PR-2 —— what the paid ingest was billed (none for an estimate).
+        spend: IngestSpend | None = None
         lost = asyncio.Event()
         #: B-222 —— set once the paid work is over (whatever its outcome).
         finishing = asyncio.Event()
@@ -1179,28 +1434,47 @@ class KnowledgeIngestionRunner:
                     )
                 )
                 try:
-                    chunk_count = await ingest_document_bytes(
-                        store=self._store,
-                        embedder=self._embedder,
-                        tenant_id=tenant_id,
-                        document_id=document_id,
-                        kb_id=claim.kb_id,
-                        filename=claim.filename,
-                        raw=claim.content,
-                        chunk_max_tokens=claim.chunk_max_tokens,
-                        chunk_overlap_tokens=claim.chunk_overlap_tokens,
-                        generation=claim.generation,
-                        recognizer=self._recognizer,
-                        usage=self._usage,
-                        figures=self._figures,
-                        guard=lease_guard(
+                    if claim.phase == "estimate":
+                        # B-222 PR-2: the free estimate; the document then
+                        # waits for its confirmation.
+                        await estimate_document(
                             self._store,
+                            self.estimator,
+                            self._embedder,
+                            claim,
+                            figures=self._figures,
+                        )
+                        return
+                    start = await start_paid_ingest(
+                        self._store, self.estimator, self._embedder, claim, figures=self._figures
+                    )
+                    if start.returned:
+                        return  # asked again: nothing spent
+                    spend = IngestSpend()
+                    with spend_scope(spend):
+                        chunk_count = await ingest_document_bytes(
+                            store=self._store,
+                            embedder=self._embedder,
                             tenant_id=tenant_id,
                             document_id=document_id,
+                            kb_id=claim.kb_id,
+                            filename=claim.filename,
+                            raw=claim.content,
+                            chunk_max_tokens=claim.chunk_max_tokens,
+                            chunk_overlap_tokens=claim.chunk_overlap_tokens,
                             generation=claim.generation,
-                            lease_seconds=self._lease_seconds,
-                        ),
-                    )
+                            recognizer=self._recognizer,
+                            usage=self._usage,
+                            figures=self._figures,
+                            guard=lease_guard(
+                                self._store,
+                                tenant_id=tenant_id,
+                                document_id=document_id,
+                                generation=claim.generation,
+                                lease_seconds=self._lease_seconds,
+                            ),
+                            local=start.local,
+                        )
                 finally:
                     finishing.set()
                 written = True  # this claim's chunks are in place
@@ -1256,7 +1530,7 @@ class KnowledgeIngestionRunner:
             # is handled separately by the recovery worker. Fenced: a stale
             # worker's failure must not mark the newer generation failed.
             logger.warning("knowledge.ingest_failed document=%s", document_id, exc_info=True)
-            await self._store.mark_document_failed_terminal(
+            failed = await self._store.mark_document_failed_terminal(
                 tenant_id=tenant_id,
                 document_id=document_id,
                 error=str(exc)[:_ERROR_CAP],
@@ -1267,7 +1541,12 @@ class KnowledgeIngestionRunner:
             if stop is not None:
                 self.local.discard(document_id, stop)
             await _stop_renewer(renewer)
-            if claim is not None and self._figures is not None:
+            if claim is not None and spend is not None:
+                outcome: IngestOutcome = "ready" if ready else "failed" if failed else "stopped"
+                await record_actual(
+                    self._store, self.estimator, claim, spend, outcome=outcome, settled=True
+                )
+            if claim is not None and claim.phase == "ingest" and self._figures is not None:
                 await self._figures.tidy(claim, settled=ready, serving=written)
             current_tenant_id_var.reset(token)
 
@@ -1288,7 +1567,16 @@ class KnowledgeIngestionRunner:
             except Exception:
                 logger.warning("knowledge.reindex_pin_failed kb=%s", kb_id, exc_info=True)
                 return  # nothing re-embedded; the model stays unstamped
-            documents = await self._store.list_documents(tenant_id=tenant_id, kb_id=kb_id)
+            if model_key is not None and not await self._store.has_chunks_off_model(
+                tenant_id=tenant_id, kb_id=kb_id, embedding_model=model_key
+            ):
+                # B-222 PR-2: every chunk is on the model already (an earlier
+                # re-index got them all but a document then re-uploading, whose
+                # new version came in on the new model): stamp, embed nothing.
+                documents = []
+                logger.info("knowledge.reindex_stamp_only kb=%s", kb_id)
+            else:
+                documents = await self._store.list_documents(tenant_id=tenant_id, kb_id=kb_id)
             for document in documents:
                 if document.status not in _SERVING_STATUSES:
                     continue  # only settled documents' chunks are re-embedded
@@ -1341,15 +1629,19 @@ class KnowledgeIngestionRunner:
         embedder: Embedder,
         model_key: str | None,
     ) -> None:
-        """Re-embed the document's chunks with ``embedder``: every chunk once,
-        then — up to :data:`_REINDEX_PASSES` passes in all — the chunks still
-        not on ``model_key`` (written meanwhile with the model being replaced,
-        e.g. an edit that started before the switch). Raises when some are
-        still not, or a write-back is refused without a re-upload (the
-        document left the status it was read in), so the base is not stamped
-        with the new model."""
+        """Re-embed the document's chunks with ``embedder`` — those not on
+        ``model_key`` (B-222 PR-2: a chunk an earlier re-index, or the ingest
+        of a new version, already embedded with it is not paid for again;
+        with no known model, every chunk) — then, up to
+        :data:`_REINDEX_PASSES` passes in all, the chunks still not on it
+        (written meanwhile with the model being replaced, e.g. an edit that
+        started before the switch). Raises when some are still not, or a
+        write-back is refused without a re-upload (the document left the
+        status it was read in), so the base is not stamped with the new model."""
         document_id = document.id
         pending = await self._collect_chunks(tenant_id=tenant_id, document_id=document_id)
+        if model_key is not None:
+            pending = [chunk for chunk in pending if chunk.embedding_model != model_key]
         for done in range(_REINDEX_PASSES):
             if not pending:
                 return
