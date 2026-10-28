@@ -807,9 +807,9 @@ function onWorker(w) {
 
 #### 什么时候发
 
-平台的三道限制预警或者真正触发时，服务端发一次到当前这条连接。三道限制是：步数上限、token 预算（这里的 token 指模型用量单位，不是 `token` 事件）、连续多步没有实质进展。
+平台的三道限制预警或者真正触发时，服务端发一次到当前这条连接。三道限制是：步数上限、token 预算（这里的 token 指模型用量单位，不是 `token` 事件）、反复原地打转没有实质进展。
 
-- 上限由谁设定：步数上限和无进展上限来自这个 Agent 的配置，token 预算由平台为这次 run 设定。调用方都不能修改，需要调整要联系租户管理员。
+- 上限由谁设定：步数上限和无进展上限来自这个 Agent 的配置（无进展上限没有配置时，平台规则是同一次运行里第 2 次原地打转就收尾），token 预算由平台为这次 run 设定。调用方都不能修改，需要调整要联系租户管理员。
 - 触发之后发生了什么：平台给模型追加一条收尾指令，并且这一步不再提供任何工具，模型只能直接作答。用户仍然会拿到一段完整回答，只是后续推理被截断。
 - 客户端要做什么：按「已到上限」的提示显示，不要按错误显示；也不要据此判定这次 run 成功，最终状态以 `end` 的 `status` 为准。
 
@@ -818,7 +818,7 @@ function onWorker(w) {
 | 字段 | 类型 | 说明 |
 |---|---|---|
 | `kind` | string | 这条事件是预警还是已经触发。取值：`tripped`（限制触发，平台已经收尾）/ `warning`（预警，尚未触发）。只有这两个取值 |
-| `guard` | string | 是哪一道限制。取值：`max_steps`（步数上限）/ `token_budget`（token 预算）/ `no_progress`（连续多步没有实质进展）。只有这三个取值 |
+| `guard` | string | 是哪一道限制。取值：`max_steps`（步数上限）/ `token_budget`（token 预算）/ `no_progress`（反复原地打转没有实质进展）。只有这三个取值 |
 | `detail` | object | 这道限制当前的两个数值，字段名随 `guard` 变化，见下表 |
 
 `detail` 里的字段：
@@ -829,12 +829,12 @@ function onWorker(w) {
 | `max_steps` | `max` | integer | 这个 Agent 配置的步数上限 |
 | `token_budget` | `spent` | integer | 这棵委托树累计消耗的 token |
 | `token_budget` | `limit` | integer | 平台为这次 run 设定的 token 预算 |
-| `no_progress` | `streak` | integer | 连续多少步没有实质进展 |
-| `no_progress` | `max` | integer | 允许的连续无进展步数上限 |
+| `no_progress` | `streak` | integer | 这次运行里原地打转被拦下的累计次数（中间正常走了几步也不清零） |
+| `no_progress` | `max` | integer | 第几次被拦下就收尾：配了就是配置值，没配是平台规则的 2 |
 
 三道限制的 `tripped` 出自同一个判断，因此同一步可能一次到达两条或三条 `tripped`，客户端不要假设一轮只有一条。
 
-三道限制里只有 `token_budget` 会发 `warning`：用量达到预算 80% 时发一次，整棵委托树只发一次。`max_steps` 与 `no_progress` 当前只有 `tripped`，没有预警，不要写一个等待它们预警的分支，那个分支不会被触发。`warning` 比 `tripped` 轻，只表示接近上限，不代表任何收尾动作已经发生。
+会发 `warning` 的是 `token_budget` 与 `max_steps`：`token_budget` 在用量达到预算 80% 时发一次，整棵委托树只发一次；`max_steps` 在剩下的步数不超过 `max(2, 上限 ÷ 6 向下取整)` 时发一次（上限 48 步的 Agent 在已执行 40 步时发），主 Agent 和每个子任务各按自己的步数上限最多发一次。`no_progress` 当前只有 `tripped`，没有预警，不要写一个等待它预警的分支，那个分支不会被触发。`warning` 比 `tripped` 轻，只表示接近上限，不代表任何收尾动作已经发生。
 
 「不按错误显示」只适用于 `guard` 事件本身。`guard` 为 `max_steps` 的那一路收尾之后，这次 run 在 `end` 事件里的 `status` 仍然是 `error`。**run 成功还是失败，以 `end` 的 `status` 为准。**
 
@@ -856,9 +856,9 @@ data: {"kind":"tripped","guard":"max_steps","detail":{"steps":32,"max":32}}
 
 ```js [示例代码]
 const GUARD_TEXT = {
-  max_steps:    (d) => `已执行 ${d.steps} 步,达到上限 ${d.max} 步`,
+  max_steps:    (d) => `已执行 ${d.steps} 步,上限 ${d.max} 步`,
   token_budget: (d) => `已用 ${d.spent} token,预算 ${d.limit}`,
-  no_progress:  (d) => `连续 ${d.streak} 步没有实质进展(上限 ${d.max})`,
+  no_progress:  (d) => `第 ${d.streak} 次原地打转(上限 ${d.max} 次)`,
 };
 
 function onGuard(data) {
@@ -1195,7 +1195,7 @@ const ok = data.status === "success" && data.completed !== false;
 |---|---|---|
 | `text_response` | 助手不再调用工具，自然说完了 | 要看 `completed`：同时为 `true` 才是真的做完 |
 | `max_steps` | 这一轮的步数预算用尽，平台让助手用现有结果收尾 | 否 |
-| `no_progress` | 助手连续多轮没有进展，平台判定卡住并收尾 | 否 |
+| `no_progress` | 助手反复原地打转（重复同样的工具调用），平台判定卡住并收尾 | 否 |
 | `token_budget` | 这一轮的 token 预算用尽 | 否 |
 | `approval_pending` | 停在人工审批点（对应 `status` 的 `paused`） | 否 —— 批准之后这一轮会接着跑 |
 | `approval_rejected` | 审批被拒绝，这一轮就此终止 | 否 |

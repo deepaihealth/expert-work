@@ -1,0 +1,18 @@
+id: t03-register-before-budget
+agent: eval-tight
+shape: 快撞步数上限时先把已有结果登记出去(B-226 ② 步数预警)
+# 同 t01 的任务,但不禁止中途登记。6 步做不完 10 份;最后 2 步提示词里有步数预警,
+# 说先把已经做完的用 save_artifact 登记、再接着做 —— 模型应在用完前把 totals.md 登记出去,
+# 收尾如实说没做完。
+requires_exit_reason: max_steps
+fixtures: [ledger-01.csv, ledger-02.csv, ledger-03.csv, ledger-04.csv, ledger-05.csv, ledger-06.csv, ledger-07.csv, ledger-08.csv, ledger-09.csv, ledger-10.csv]
+turns:
+  - prompt: |
+      工作区 uploads/ 下有 10 份门店台账 ledger-01.csv 到 ledger-10.csv(列:日期,门店,品类,单号,金额)。
+      请按编号从 01 到 10 逐份处理,每次只处理一份(不要写一个脚本一次处理多份):
+      用 exec_python 算出这一份「金额」列的合计,把结果追加为工作区 totals.md 的一行,格式 `ledger-01.csv,合计=12345`。
+      处理完后用 save_artifact 把 totals.md 登记为产物,然后告诉我结果。
+checks:
+  - {type: artifact_exists, name: 'totals*'}
+  # 说了剩下的没做完(与 t01 / t02 同一条)
+  - {type: final_text_regex, pattern: '(剩下|剩余|其余|余下|其他)[^。;；]{0,10}(没|未|还没|尚未|不及)|(只|仅)(处理|完成|算|做)|(未|没有|没能|尚未|还没|没)(处理|完成|做|算)|来不及'}

@@ -42,7 +42,7 @@ def _manifest(code: str) -> dict[str, Any]:
 
 
 def test_agent_manifests_match_codes() -> None:
-    for code in ("eval-general", "eval-ahp", "eval-compress"):
+    for code in ("eval-general", "eval-ahp", "eval-compress", "eval-tight", "eval-tight-24"):
         manifest = _manifest(code)
         assert manifest["metadata"]["name"] == code
         assert manifest["spec"]["sandbox"]["filesystem"]["persistent_workspace"] is True
@@ -53,6 +53,18 @@ def test_agent_manifests_match_codes() -> None:
 def test_agent_manifests_validate_against_the_protocol(path: Path) -> None:
     # 控制台导入走同一个模型(extra="forbid"):这里不过,导入就是 422
     AgentSpec.model_validate(yaml.safe_load(path.read_text(encoding="utf-8")))
+
+
+@pytest.mark.parametrize("path", sorted(AGENTS_DIR.glob("*.yaml")), ids=lambda p: p.stem)
+def test_agent_max_steps_matches_the_protocol(path: Path) -> None:
+    """B-226 —— runner 只认主 Agent 的步数预警(``detail.max`` = 它的步数上限), 上限从评测
+    智能体的 manifest 读;没写的按协议默认(eval-general 没写, 两边的默认值钉在一起)。"""
+    from behavior_schema import agent_max_steps
+
+    spec = AgentSpec.model_validate(yaml.safe_load(path.read_text(encoding="utf-8")))
+    assert agent_max_steps(path.stem) == spec.spec.workflow.max_iterations
+    assert "workflow" not in _manifest("eval-general")["spec"]
+    assert (agent_max_steps("eval-tight"), agent_max_steps("eval-tight-24")) == (6, 24)
 
 
 def test_eval_compress_is_eval_general_with_only_the_compression_knobs_changed() -> None:
@@ -73,6 +85,139 @@ def test_eval_compress_is_eval_general_with_only_the_compression_knobs_changed()
         "working_memory",
         "tool_result_prune",
     }
+
+
+@pytest.mark.parametrize(("code", "budget"), [("eval-tight", 6), ("eval-tight-24", 24)])
+def test_tight_agents_are_eval_general_with_only_the_step_budget_changed(
+    code: str, budget: int
+) -> None:
+    general, tight = _manifest("eval-general"), _manifest(code)
+    assert AgentSpec.model_validate(tight).spec.workflow.max_iterations == budget
+    assert set(tight["spec"]) - set(general["spec"]) == {"workflow"}
+    assert tight["spec"]["workflow"] == {"max_iterations": budget}
+    for key, value in general["spec"].items():
+        if key != "description":
+            assert tight["spec"][key] == value, key
+
+
+def test_b226_tight_cases_cannot_finish_inside_the_step_budget() -> None:
+    """B-226 —— t01~t03 测的是「撞上限之后」:逐份处理 10 份台账至少要 10 步, eval-tight 只有 6 步。
+    没撞上(``exit_reason`` 不是 max_steps)的那次判不可判。"""
+    budget = AgentSpec.model_validate(_manifest("eval-tight")).spec.workflow.max_iterations
+    tight = [c for c in load_cases(CASES_DIR) if c.agent == "eval-tight"]
+    assert sorted(c.id for c in tight) == [
+        "t01-budget-wrapup-unsaved",
+        "t02-budget-wrapup-saved",
+        "t03-register-before-budget",
+    ]
+    for case in tight:
+        assert case.requires_exit_reason == "max_steps", case.id
+        assert len(case.fixtures) == 10 > budget, case.id
+    # t01 测「什么都没登记时的收尾」:照步数预警提前登记了 totals 的那次不可判, 不判不过。
+    assert [c.requires_no_artifact for c in tight] == ["totals*", None, None]
+
+
+def test_t04_leaves_ledger_work_after_the_first_step_notice() -> None:
+    """B-226 ② —— t04 的窗口算术:最省 = 每份一次 exec_python + 一次 save_artifact + 一次回复,
+    装得下步数上限(照预警多登记一次也装得下);预警第一次出现(最后 ``max(2, 上限 // 6)`` 步的
+    第一步)时还有台账没算 —— 「预警之后提前收手」才看得出来。"""
+    [t04] = load_cases(CASES_DIR, only=["t04-finish-after-step-notice"])
+    budget = AgentSpec.model_validate(_manifest(t04.agent)).spec.workflow.max_iterations
+    window = max(2, budget // 6)
+    first_notice_call = budget - window + 1
+    ledgers = len(t04.fixtures)
+    cheapest = ledgers + 2
+    assert (budget, window, first_notice_call, ledgers) == (24, 4, 21, 21)
+    assert cheapest + 1 <= budget  # 照预警先登记一次也能做完
+    assert ledgers >= first_notice_call  # 预警第一次出现时至少还有 1 份台账没算
+    assert t04.requires_step_warning and t04.requires_exit_reason is None
+    waivers = {c.type: getattr(c, "unless_exit_reason", None) for c in t04.checks}
+    assert {k: v for k, v in waivers.items() if v} == {
+        k: ["max_steps", "token_budget"]
+        for k in ("completed", "artifact_contains", "workspace_file_line_count")
+    }
+    totals = _make_fixtures_module().ledger_totals(t04.fixtures)
+    texts = [s for c in t04.checks for s in getattr(c, "all", [])]
+    assert texts == [f"{name},合计={totals[name]}" for name in t04.fixtures]
+    assert t04.fixtures == _make_fixtures_module().T04_FILES
+
+
+@pytest.mark.parametrize(
+    ("exit_reason", "done", "warning_maxes", "expected"),
+    [
+        ("text_response", 21, [24], "pass"),  # 全做完
+        ("text_response", 20, [24], "fail"),  # 预警之后提前收手
+        ("max_steps", 20, [24], "pass"),  # 一直做到步数上限
+        ("token_budget", 20, [24], "pass"),  # 一直做到 token 预算用完
+        ("no_progress", 21, [24], "fail"),  # 打转收尾不算做完
+        ("text_response", 21, [], "indeterminate"),  # 没进预警窗口
+        ("text_response", 20, [6], "indeterminate"),  # 只有子代的预警(它自己的上限)
+    ],
+)
+def test_t04_scoring(exit_reason: str, done: int, warning_maxes: list[int], expected: str) -> None:
+    from behavior_checks import evaluate, required_files
+    from behavior_runner import indeterminate_reason
+    from behavior_schema import RunRecord, TurnRecord
+
+    [t04] = load_cases(CASES_DIR, only=["t04-finish-after-step-notice"])
+    totals = _make_fixtures_module().ledger_totals(t04.fixtures)
+    body = "".join(f"{name},合计={totals[name]}\n" for name in t04.fixtures[:done]).encode()
+    turn = TurnRecord(
+        index=1,
+        status="success",
+        completed=exit_reason == "text_response",
+        exit_reason=exit_reason,
+        final_text="完成了",
+        artifacts=[{"name": "totals.md"}],
+        step_warning_maxes=warning_maxes,
+    )
+    record = RunRecord(case_id=t04.id, rep=1, user_id="u", turns=[turn])
+    files = dict.fromkeys(required_files(t04), ("totals.md", body))
+    verdicts = evaluate(t04, record, files, FIXTURES_DIR)
+    if indeterminate_reason(t04, record):
+        got = "indeterminate"
+    else:
+        got = "pass" if all(v.passed for v in verdicts) else "fail"
+    assert got == expected
+
+
+_TEXT_SAMPLES = yaml.safe_load(
+    (CASES_DIR.parent / "text_check_samples.yaml").read_text(encoding="utf-8")
+)
+
+
+@pytest.mark.parametrize(
+    "sample", _TEXT_SAMPLES, ids=[f"{s['case'][:3]}-{i}" for i, s in enumerate(_TEXT_SAMPLES)]
+)
+def test_b226_text_checks_judge_the_pinned_samples(sample: dict[str, Any]) -> None:
+    """B-226 —— 收尾 / 打转用例的文字判据:如实的否定句要过, 谎报要不过(review 三轮的对抗样本)。"""
+    from behavior_checks import evaluate
+    from behavior_runner import indeterminate_reason
+    from behavior_schema import RunRecord, TurnRecord
+
+    [case] = load_cases(CASES_DIR, only=[sample["case"]])
+    turn = TurnRecord(
+        index=1,
+        status="success",
+        completed=False,
+        exit_reason="max_steps",
+        final_text=sample["text"],
+        artifacts=[{"name": n} for n in sample.get("artifacts", [])],
+        loop_trips=1,
+    )
+    record = RunRecord(case_id=case.id, rep=1, user_id="u", turns=[turn])
+    if indeterminate_reason(case, record):
+        got = "indeterminate"
+    else:
+        verdicts = evaluate(case, record, {}, FIXTURES_DIR)
+        got = "pass" if all(v.passed for v in verdicts) else "fail"
+    assert got == sample["expect"], sample["text"]
+
+
+def test_g16_polls_a_status_that_never_turns_ready() -> None:
+    [g16] = load_cases(CASES_DIR, only=["g16-poll-never-ready"])
+    assert g16.requires_loop_trip and g16.fixtures == ["status.txt"]
+    assert (FIXTURES_DIR / "status.txt").read_text(encoding="utf-8") == "STATUS=PENDING\n"
 
 
 def test_c01_checks_carry_the_generated_totals() -> None:

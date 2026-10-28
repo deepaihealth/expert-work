@@ -1228,3 +1228,19 @@ def test_every_turn_input_clears_the_failure_ledger() -> None:
     )
     for graph_input in (fresh, replay):
         assert graph_input["unresolved_failures"] == []
+
+
+def test_every_turn_input_resets_the_loop_trip_count_and_step_warning() -> None:
+    """B-226 ④② —— 原地打转的计数与步数预警帧也只属于一轮:省略时上一轮停在打转上
+    留下的次数会让这一轮第一步就判「卡住」去收尾, 上一轮发过的预警让这一轮不再发。"""
+    built = BuiltAgent(graph=None, system_prompt="sys", max_steps=3)  # type: ignore[arg-type]
+    fresh = build_run_graph_input(
+        built, input_text="hi", image_refs=[], untrusted_content=None, run_id=uuid4()
+    )
+    replay = replay_graph_input(
+        built, [SystemMessage(content="sys"), HumanMessage(content="hi")], run_id=uuid4()
+    )
+    for graph_input in (fresh, replay):
+        assert "no_progress_streak" not in graph_input  # B-226:不再按连续次数判, 通道已删
+        assert graph_input["loop_trip_count"] == 0  # 「这次运行第 N 次打转」按本轮算
+        assert graph_input["step_budget_warned"] is False

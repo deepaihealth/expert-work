@@ -1778,6 +1778,59 @@ async def test_resume_seeds_manifest_from_seed_artifacts() -> None:
     assert pre_pause in row.artifacts and post in row.artifacts
 
 
+@dataclass
+class _CountingGraph(_RecordingGraph):
+    """登记完之后读一次记录器的 ``count`` —— 收尾指令(B-226 ①)读的就是它。"""
+
+    counts: list[int] = field(default_factory=list)
+
+    async def astream(
+        self,
+        input: Any,
+        config: Any = None,
+        *,
+        stream_mode: Any = None,
+    ) -> AsyncIterator[Any]:
+        from orchestrator.tools.artifact import ARTIFACT_RECORDER_KEY, ArtifactRecorder
+
+        recorder = (config or {}).get("configurable", {}).get(ARTIFACT_RECORDER_KEY)
+        assert isinstance(recorder, ArtifactRecorder)
+        async for chunk in super().astream(input, config, stream_mode=stream_mode):
+            yield chunk
+        self.counts.append(recorder.count)
+
+
+@pytest.mark.asyncio
+async def test_recorder_count_includes_seeded_entries_and_dedupes_by_name() -> None:
+    """B-226 ① —— 续跑段的计数接着暂停前的登记数;同名重登记不重复计。"""
+    from expert_work.runtime.runs.store import InMemoryRunStore
+
+    rm = RunManager(InMemoryRunStore())
+    record = await rm.create(
+        run_id=uuid4(),
+        thread_id=uuid4(),
+        tenant_id=uuid4(),
+        on_disconnect=DisconnectMode.CANCEL,
+        is_resume=True,
+    )
+    record.seed_artifacts = [{"name": "draft.md", "version": 1}]
+    graph = _CountingGraph(
+        chunks=[{"agent": {"step_count": 1}}],
+        manifest_entries=[{"name": "final.md", "version": 1}, {"name": "final.md", "version": 2}],
+    )
+
+    await run_agent(
+        bridge=InMemoryStreamBridge(),
+        run_manager=rm,
+        record=record,
+        graph=graph,
+        graph_input={"messages": []},
+        config={},
+    )
+
+    assert graph.counts == [2]
+
+
 @pytest.mark.asyncio
 async def test_resume_falls_back_to_own_row_manifest() -> None:
     """fallback:``seed_artifacts`` 缺席时读自己的行 —— 兜同 run_id 重入

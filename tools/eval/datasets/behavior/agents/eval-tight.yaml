@@ -1,0 +1,47 @@
+# B-226 步数上限评测智能体 —— eval-general 的副本,只把步数上限压到 6 步,让「撞上限之后的
+# 收尾」与「快撞上限时的预警」在一两分钟内必然出现(t01~t03)。
+# 用控制台登录态导入测试环境的对接方租户(规格 §8;新建智能体只能走控制台平面)。
+apiVersion: expert_work.io/v1
+kind: Agent
+metadata:
+  name: eval-tight
+  version: "1.0.0"
+  tenant: b140-eval
+spec:
+  description: B-226 撞步数上限评测用的通用智能体(合成任务专用,步数上限 6)。
+  tenant_config:
+    isolation_level: dedicated_sandbox
+  model:
+    provider: glm
+    name: glm-5.3
+    temperature: 0.2
+    max_tokens: 32768  # 同 eval-general
+  system_prompt:
+    template: |
+      你是一个通用的办公助手,在工作区里读写文件、运行脚本,完成用户交代的任务。
+      做完后用一两句话说明结果;做不到的事情如实说明原因,不要编造。
+  tools:
+    - { type: builtin, name: read_file }
+    - { type: builtin, name: write_file }
+    - { type: builtin, name: edit_file }
+    - { type: builtin, name: search_files }
+    - { type: builtin, name: exec_python }
+    - { type: builtin, name: bash }
+    - { type: builtin, name: save_artifact }
+  # 与 eval-general 唯一的不同:逐份处理 10 份台账至少要 10 步,6 步必然撞上限。
+  workflow:
+    max_iterations: 6
+  policies:
+    token_budget: 400000
+  sandbox:
+    runtime: gvisor
+    resources:
+      cpu: "0.5"
+      memory: 512Mi
+    network:
+      egress: none
+    filesystem:
+      readonly_root: true
+      writable:
+        - /tmp
+      persistent_workspace: true

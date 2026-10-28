@@ -11,15 +11,17 @@ abort** that prevents 20 wasted iterations of the same buggy call
 burning tokens. Modelled after deer-flow's
 ``loop_detection_middleware.py``.
 
-On detection:
+On detection (only the response being checked — the last message — can
+trip; B-226):
 
-1. The most recent ``AIMessage`` is **rewritten with empty
-   ``tool_calls``** (preserving its id so LangGraph's ``add_messages``
-   reducer replaces in-place — no duplicate ladder accumulating in
-   the checkpoint).
+1. The response is **rewritten with empty ``tool_calls``** (preserving its
+   id so LangGraph's ``add_messages`` reducer replaces in-place — no
+   duplicate ladder accumulating in the checkpoint). B-226: it is kept
+   only when it carries text; an empty one is dropped (Anthropic rejects
+   an empty non-final assistant message).
 2. A ``<system-reminder>`` :class:`HumanMessage` is appended telling
    the LLM the loop was detected so it switches to a final answer or
-   different parameters.
+   different parameters. It carries :data:`LOOP_REMINDER_MARK`.
 
 Both rewrites go into ``ctx.payload["messages"]``; the orchestrator's
 post-chain integration (E.11 LLMRouter) merges them back into the
@@ -53,6 +55,10 @@ DEFAULT_REMINDER_TEXT = (
     "different tool / arguments instead.</system-reminder>"
 )
 _FINGERPRINT_BYTES = 16
+#: B-226 ④ — ``additional_kwargs`` mark on the appended reminder. The graph
+#: router routes a trailing marked reminder back to the agent, so the model
+#: answers it in the same run instead of the run ending on the cleared reply.
+LOOP_REMINDER_MARK = "expert_work_loop_reminder"
 
 
 def normalize_args(value: object) -> object:
@@ -131,6 +137,22 @@ def clone_ai_message_with_tool_calls(
     )
 
 
+def _has_text(message: AIMessage) -> bool:
+    """Whether the message carries any non-blank text (str content or text blocks)."""
+    content = message.content
+    if isinstance(content, str):
+        return bool(content.strip())
+    return any(
+        (isinstance(part, str) and part.strip())
+        or (
+            isinstance(part, dict)
+            and part.get("type") == "text"
+            and str(part.get("text", "")).strip()
+        )
+        for part in content
+    )
+
+
 @dataclass
 class LoopDetectionMiddleware:
     """Detect identical tool-call loops and abort with a system reminder."""
@@ -150,6 +172,13 @@ class LoopDetectionMiddleware:
 
         raw_messages = ctx.payload.get("messages")
         if not isinstance(raw_messages, list):
+            return
+        # B-226 — only the response being checked can trip: when it carries no
+        # tool call (a final answer, the tool-less wrap-up turn) an older run of
+        # identical calls in history is not a loop happening now — rewriting it
+        # would edit an old message and swallow this reply.
+        current = raw_messages[-1] if raw_messages else None
+        if not (isinstance(current, AIMessage) and current.tool_calls):
             return
 
         recent = self._recent_ai_with_tool_calls(raw_messages)
@@ -175,11 +204,14 @@ class LoopDetectionMiddleware:
         # order-pairing (spec 2026-07-30, Important#2).
         reminder = HumanMessage(
             content=self.reminder_text,
-            additional_kwargs={"expert_work_hide_from_ui": True},
+            additional_kwargs={"expert_work_hide_from_ui": True, LOOP_REMINDER_MARK: True},
         )
-        # Same-id ``cleaned`` → replace in-place via add_messages; the
-        # reminder has a fresh auto-id → append.
-        ctx.payload["messages"] = [cleaned, reminder]
+        # The reminder has a fresh auto-id → append. B-226 — ``cleaned`` (same
+        # id as the response, which is not in state yet) is kept only when the
+        # model wrote text alongside the call: an empty assistant message that
+        # is not the last one is rejected by Anthropic, and the reminder now
+        # goes back to the model in the same run.
+        ctx.payload["messages"] = [cleaned, reminder] if _has_text(cleaned) else [reminder]
         # Stream CM-9 (Mini-ADR CM-J5) — flag the trip for the caller so
         # the next agent step can escalate to the higher-effort caller.
         ctx.payload["loop_detected"] = True
