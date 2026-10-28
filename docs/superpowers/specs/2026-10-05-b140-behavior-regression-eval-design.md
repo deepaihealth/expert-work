@@ -109,7 +109,7 @@ metrics: [tokens_in, tokens_out, tool_calls, wall_s]
 | `not_completed` | 最后一轮结束帧**明确**记了 `completed == false`(缺记录不算)。反向守卫:写类失败的账必须还在(g13) |
 | `exit_reason` | 指定结束方式(诚实报不能完成的任务要 `text_response` + 文本判据) |
 | `final_text_contains` / `final_text_regex` / `final_text_not_contains` | 最后一轮回复 |
-| `final_text_not_regex` | 最后一轮回复里不能有匹配的话(B-226:谎报「已登记」「已变为 READY」;用后顾断言 `(?<!没有)` 等放过如实的否定句) |
+| `final_text_not_regex` | 最后一轮回复里**没有**匹配某正则的地方(B-175 P4 k05:说了「没有」却仍编出月份;B-226:谎报「已登记」「已变为 READY」,用后顾断言 `(?<!没有)` 等放过如实的否定句) |
 | `artifact_exists` | 产物按名字(或 glob)存在 |
 | `artifact_contains` / `artifact_not_contains` | 产物文本(`.docx` / `.pptx` / `.pdf` 本机抽文本后判) |
 | `artifact_unchanged_lines` | 与开局文件逐行比,除指定行外不变(抓「整篇重写顺手改坏别处」) |
@@ -118,6 +118,7 @@ metrics: [tokens_in, tokens_out, tool_calls, wall_s]
 | `tool_not_used_on` | 某工具没有用在某路径上(抓「改已有文件却整篇 write_file」) |
 | `turn_tokens_max` | 某一轮输入 token 上限(B-126 / B-128 那类「越聊越贵」) |
 | `workspace_file_line_count` | 工作区文件里匹配某正则(逐行 `re.search`)的行数恰好等于 N(B-141:抓压缩后「重做一步」= 行重复、「漏一步」= 行缺失) |
+| `tool_arg_contains` | 某工具调用的某个参数含 `any_of` 之一、且不含 `none_of` 里的任何一个(列表逐项比、字符串整串比;`K2` 这类句柄不分大小写,其它值区分,与工具一致);只看工具接受了的调用(被拒的不算);`call: first` 只看第一次被接受的调用、`any` 任一次即可,可加 `turn: N`(B-175 P4:`knowledge_search` 第一次检索就只按 `bases` 选对库,全选不算) |
 
 判据只认**行为的结果**,不认措辞。每条新判据在单元测试里必须能红(先构造一份「坏记录」证明它会判不过)。
 

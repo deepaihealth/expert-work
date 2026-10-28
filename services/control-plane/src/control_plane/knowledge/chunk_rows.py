@@ -13,6 +13,10 @@ search returns — no vector, their own ``chunk_index`` 0..m-1), then its chunks
 each pointing at its parent's row. A parent that is just its one chunk
 (:attr:`~control_plane.knowledge.chunking.ParentChunk.is_trivial`) gets no row:
 its chunk points at none and stands for itself.
+
+A passage with an override (B-175 P3-PR2, a manual change put back) keeps its
+id — on its parent row, or on its lone chunk — and its switch (and why it is
+off), edit flag and revision; its chunks are switched with it.
 """
 
 from __future__ import annotations
@@ -23,6 +27,8 @@ from typing import overload
 from uuid import UUID, uuid4
 
 from control_plane.knowledge.chunking import ParentChunk
+from control_plane.knowledge.passages import PassageOverride
+from expert_work.persistence.knowledge.passages import DisabledReason
 from expert_work.protocol import ChunkType, KnowledgeChunk
 
 
@@ -37,7 +43,8 @@ def compact(vector: Sequence[float]) -> array[float]:
 class ChunkRows(Sequence[KnowledgeChunk]):
     """The rows of one ingest — the parent rows, then the chunks in document
     order; each read builds it anew (same id every time). ``hashes`` are the
-    chunks' (``parents``' children in order), ``vectors`` theirs by hash."""
+    chunks' (``parents``' children in order), ``vectors`` theirs by hash;
+    ``overrides`` (when given, one per parent) what a passage keeps."""
 
     def __init__(
         self,
@@ -50,19 +57,28 @@ class ChunkRows(Sequence[KnowledgeChunk]):
         document_id: UUID,
         doc_title: str | None,
         model_key: str | None,
+        overrides: Sequence[PassageOverride | None] = (),
     ) -> None:
         self._parents: list[ParentChunk] = []  # the parents that get a row
         self._pieces = [child for parent in parents for child in parent.children]
         self._owners: list[int | None] = []  # each chunk's parent row, if any
-        for parent in parents:
+        self._parent_marks: list[PassageOverride | None] = []
+        self._marks: list[PassageOverride | None] = []  # each chunk's passage's override
+        for parent, mark in zip(parents, overrides or [None] * len(parents), strict=True):
             owner = None if parent.is_trivial else len(self._parents)
             if owner is not None:
                 self._parents.append(parent)
+                self._parent_marks.append(mark)
             self._owners.extend([owner] * len(parent.children))
+            self._marks.extend([mark] * len(parent.children))
         self._hashes = hashes
         self._vectors = vectors
-        self._parent_ids = [uuid4() for _ in self._parents]
-        self._ids = [uuid4() for _ in self._pieces]
+        self._parent_ids = [_kept_id(mark) for mark in self._parent_marks]
+        # A lone chunk is its passage: it takes the passage's id.
+        self._ids = [
+            _kept_id(mark) if owner is None else uuid4()
+            for owner, mark in zip(self._owners, self._marks, strict=True)
+        ]
         self._tenant_id = tenant_id
         self._kb_id = kb_id
         self._document_id = document_id
@@ -90,6 +106,7 @@ class ChunkRows(Sequence[KnowledgeChunk]):
             return self._parent_row(index)
         index -= len(self._parents)
         piece, digest, owner = self._pieces[index], self._hashes[index], self._owners[index]
+        mark = self._marks[index]
         return KnowledgeChunk(
             id=self._ids[index],
             tenant_id=self._tenant_id,
@@ -103,12 +120,17 @@ class ChunkRows(Sequence[KnowledgeChunk]):
             embedding=tuple(self._vectors[digest]),
             embedding_model=self._model_key,
             parent_chunk_id=None if owner is None else self._parent_ids[owner],
+            enabled=mark is None or mark.enabled,
+            disabled_reason=_reason(mark),
+            edited=mark is not None and mark.edited,
+            # The revision is the passage's: on its parent row when it has one.
+            revision=mark.revision if mark is not None and owner is None else 1,
         )
 
     def _parent_row(self, index: int) -> KnowledgeChunk:
         # Never embedded: no vector, no model and no hash, so a re-ingest's
         # vector reuse can never match it.
-        parent = self._parents[index]
+        parent, mark = self._parents[index], self._parent_marks[index]
         return KnowledgeChunk(
             id=self._parent_ids[index],
             tenant_id=self._tenant_id,
@@ -120,4 +142,18 @@ class ChunkRows(Sequence[KnowledgeChunk]):
             doc_title=self._doc_title,
             embedding=None,
             chunk_type=ChunkType.PARENT,
+            enabled=mark is None or mark.enabled,
+            disabled_reason=_reason(mark),
+            edited=mark is not None and mark.edited,
+            revision=1 if mark is None else mark.revision,
         )
+
+
+def _kept_id(mark: PassageOverride | None) -> UUID:
+    return mark.id if mark is not None and mark.id is not None else uuid4()
+
+
+def _reason(mark: PassageOverride | None) -> DisabledReason | None:
+    if mark is None or mark.enabled:
+        return None
+    return mark.disabled_reason or "manual"

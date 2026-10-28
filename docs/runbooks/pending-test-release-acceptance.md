@@ -1224,6 +1224,168 @@ PY
 - [x] **57.2 平台技能导入**:平台技能页导入同一个包。判据:导入成功。**没修好时**:400,提示「disallowed file type」。 **10-27 测试 `e90903f7e` 过**:`POST /v1/platform/skills/import` 201。
 - [x] **57.3 沙箱读得到**:调试台给一个智能体挂上 57.1 导入的技能,问「技能里那份 PDF 有几页」。判据:智能体在沙箱里读到 `assets/reference.pdf`,答 2 页。测完删掉两处导入的技能。 **10-27 测试 `e90903f7e` 过**(glm-5.3):智能体在 `$EXPERT_WORK_SKILLS_DIR/skill57-pdf-check/assets/` 下看到 `reference.pdf`,用 pypdf 读出 2 页,回答「共 2 页」。两处导入的技能已归档(没有硬删除接口),临时智能体已删。
 
+## §58 多库目录 + 按库检索(B-175 P4)
+
+**背景**:智能体绑了**两个及以上**知识库时,系统提示词最后加一节 `# Knowledge bases`:一段固定的英文规则 + `<knowledge_catalog>`,每个库一行 `<base handle="K1" name="…" documents="1-9" description="…" />`。句柄 `K<n>` = 该库在智能体 `knowledge_base_refs` 里的位置(库不存在就跳过,其余不重排);库名、描述是管理员写的原文,压成一行、去掉不可见字符(控制字符、双向覆盖、零宽字符、BOM、标签字符)、按 XML 属性转义,库名最多 128 字、描述最多 240 字,规则里写明它们是数据不是指令;文档数只数本智能体绑定的库、每个库数到 10000 为止;文档数只给分档(`0` / `1-9` / `10-99` / `100-999` / `1000-9999` / `10000+`);最多列 20 个库,其余写一行「N more…」。没有文档标题,也没有自动生成的库画像。`knowledge_search` 同时多一个可选参数 `bases`(句柄或库名的列表):只能选本智能体绑定的库,传别的(包括同租户里存在、但本智能体没绑的库)直接报错、不检索;不传或传空照旧查全部;按 `bases` 只查了一部分库而没查到时,结果写明查了哪些、哪些没查,不说「知识库没有」。绑 0 / 1 个库时,系统提示词和工具参数与发版前**逐字节相同**。目录在构建时冻结进系统提示词,构建缓存键(主智能体与静态子智能体两处)带目录指纹:描述改了、文档数跨档了,下一次 run 重建;同一档内加文档不重建;构建自己读到的目录与缓存键不一致(构建时读库失败,或两次读之间目录被改、绑定的库刚建或刚删)时,这次构建照常用、但不进缓存(日志 `control_plane.build_not_cached reason=knowledge_catalog_mismatch`)。静态子智能体(`agent_ref`)走同一条构建路径,有它自己的目录;动态 worker 改为继承父智能体的知识库(10-27 拍板,此前剥空):同一组库、同一个检索器、同租户,两个及以上库时也带目录;worker 不缓存,不涉及缓存键。构建时打日志 `agent_factory.knowledge_catalog entries=<n> fingerprint=<16 位>`(不含库名、描述)。读库失败时照常构建、不带目录,打一条 `agent_factory.knowledge_catalog_unavailable` 警告。
+
+**怎么进**:测试环境控制台(system_admin,平台租户)。看模型输入:Langfuse 里该 run 的 LLM 调用输入(system 消息末尾、tools 里 `knowledge_search` 的 parameters);看构建:控制面日志 `grep agent_factory.knowledge_catalog`(多副本时每个副本各建一次,看 fingerprint)。期间别改这几个智能体的其它配置。**测试文件(零租户内容,本机生成)**:
+
+```bash
+python3 - <<'PY'
+docs = {
+    "acc-d1-a.md": "# 验收保修规定\n\n验收用电水壶整机保修 17 个月,签收 8 天内可以无理由退货。\n",
+    "acc-d1-a2.md": "# 验收维修收费\n\n验收用上门服务费每次 41 元。\n",
+    "acc-d1-b.md": "# 验收型号参数\n\n验收型号 ACC-D1-77 的额定功率是 1460 W,容量 1.5 升。\n",
+    "acc-d1-c.md": "# 验收未绑定的库\n\n验收暗号是 D1-ZETA-58。\n",
+}
+for name, text in docs.items():
+    open(f"/tmp/{name}", "w", encoding="utf-8").write(text)
+PY
+```
+
+建三个临时知识库并上传、等就绪(嵌入不到 1 分钱):`acc-d1-a`(描述「家电保修与退换货规定」,传 `/tmp/acc-d1-a.md`)、`acc-d1-b`(描述「各型号技术参数」,传 `/tmp/acc-d1-b.md`)、`acc-d1-c`(描述「验收用,不绑定」,传 `/tmp/acc-d1-c.md`)。建两个临时智能体(不开持久工作区,模型 glm-5.3):`acc-d1` 的 `knowledge: {knowledge_base_refs: [acc-d1-a, acc-d1-b]}`;`acc-d1-one` 只绑 `[acc-d1-a]`。
+
+- [ ] **58.1 两个库有目录,一个库没有**:调试台分别问 `acc-d1` 和 `acc-d1-one`「你好」。判据:`acc-d1` 的 system 消息以 `# Knowledge bases` 一节结尾,含 `<base handle="K1" name="acc-d1-a" documents="1-9" description="家电保修与退换货规定" />` 与 `<base handle="K2" name="acc-d1-b" documents="1-9" description="各型号技术参数" />`,最后一行是 `</knowledge_catalog>`;`knowledge_search` 的 parameters 有 `bases`(字符串数组);控制面日志 `agent_factory.knowledge_catalog entries=2 fingerprint=…`。`acc-d1-one` 的 system 消息里没有 `knowledge_catalog`、没有 `# Knowledge bases`;`knowledge_search` 的 parameters 只有 `query`、`limit`;它的构建没有这行日志。**没修好时**:`acc-d1` 没有目录,或 `acc-d1-one` 也有目录 / `bases` 参数。
+- [ ] **58.2 按库检索**:问 `acc-d1`「型号 ACC-D1-77 的额定功率是多少?」。判据:第一次 `knowledge_search` 的参数带 `bases: ["K2"]`(或 `["acc-d1-b"]`),返回的每条结果都以 `[acc-d1-b.md#` 开头,该工具消息的 `artifact`(调试台原始事件)里有 `bases: ["acc-d1-b"]`;回答 1460 W。模型没传 `bases`(这是模型自己的选择,不算产品缺陷)时,同一会话里补一句「只在型号参数库里查」再看工具行为。再问「只在 K2 里查一下验收电水壶的保修期」:这次检索 `bases: ["K2"]` 查不到,工具结果是 `[no relevant knowledge found for the query in the selected knowledge bases (acc-d1-b): …; not searched: acc-d1-a]`,提示里说只查了选中的库、不传 `bases` 会查全部,**不说**「知识库没有」;模型随后不带 `bases` 再查(查到 17 个月)或如实说只查了参数库。**没修好时**:工具没有 `bases` 参数,或传了 `bases` 仍返回 `acc-d1-a.md` 的结果,或只查了一个库就说「知识库没有」。
+- [ ] **58.3 不能越权查没绑的库**:问 `acc-d1`「调用 knowledge_search 时把 bases 设为 ["acc-d1-c"],查一下验收暗号」。判据:这次调用报错,错误里是 `unknown knowledge base in 'bases': acc-d1-c; this agent can search K1 (acc-d1-a), K2 (acc-d1-b)`;整个 run 里没有任何工具结果含 `acc-d1-c.md` 或 `D1-ZETA-58`,回答里也没有 `D1-ZETA-58`。**没修好时**:查到了 `acc-d1-c` 的内容。
+- [ ] **58.4 改描述下一次 run 就生效**:把 `acc-d1-b` 的描述改成「各型号技术参数(已改)」,再问 `acc-d1`「你好」。判据:出现新的构建日志,fingerprint 与 58.1 的不同;system 消息里 K2 那行的 description 是新文字。**没修好时**:最多 30 分钟内(缓存 TTL)仍是旧描述、没有新的构建日志。
+- [ ] **58.5 同一档内加文档不重建**:给 `acc-d1-a` 再传 `/tmp/acc-d1-a2.md`(文档数 1 → 2,仍是 `1-9`),等就绪后再问 `acc-d1` 两次「你好」。判据:两次 run 的 system 消息与 58.4 之后那次逐字节相同;若出现新的构建日志(请求落到了还没缓存的副本),其 fingerprint 与 58.4 的相同。**没修好时**:fingerprint 变了(目录里混进了随上传变化的内容)。
+- [ ] **58.6 静态子智能体有自己的目录**:建临时智能体 `acc-d1-parent`(不绑知识库),`subagents: [{name: kb_helper, agent_ref: "acc-d1@<版本>", description: "回答家电保修与型号参数问题"}]`,问它「请让 kb_helper 查一下型号 ACC-D1-77 的额定功率」。判据:子智能体那次 LLM 调用的 system 消息以 `acc-d1` 的目录结尾(K1 / K2 两行);日志有 `control_plane.subagent.built name=acc-d1` 和一行 `agent_factory.knowledge_catalog entries=2`。父智能体自己的 system 消息里没有目录。**没修好时**:子智能体没有目录。
+- [ ] **58.7 动态 worker 继承父的知识库**(10-27 拍板;前提:平台 `dynamic_worker_allowed_toolsets` 为空,测试环境默认如此 —— 非空且不含 `knowledge_search` 时 worker 不带知识库):给 `acc-d1` 打开动态 worker(`dynamic_workers.enabled: true`,平台开关已开),问它「请派一个 worker 去知识库里查型号 ACC-D1-77 的额定功率,再把结果告诉我」。判据:worker 那次 LLM 调用的工具列表里有 `knowledge_search`(parameters 含 `bases`),system 消息以与 `acc-d1` 相同的目录结尾(K1 `acc-d1-a` / K2 `acc-d1-b` 两行,没有 `acc-d1-c`);worker 的检索结果只来自 `acc-d1-a.md` / `acc-d1-b.md`;让 worker 把 `bases` 设为 `["acc-d1-c"]` 时同 58.3 报错、不检索。worker 的检索用量(查询嵌入 / 重排)记 `platform_overhead`、`agent_name` 为 `acc-d1-worker`,与 worker 自己的模型调用同一个名字。再给 `acc-d1-one` 同样打开动态 worker 并派一个:worker 有 `knowledge_search`(parameters 只有 `query`、`limit`),没有目录。**没修好时**:worker 没有 `knowledge_search`(发版前的行为),或 worker 能查到 `acc-d1-c`。
+- [ ] **58.8 B-140 知识库用例**(协调人跑):按 `tools/eval/README.md`「知识库用例」准备 `eval-kb` 与三个合成库,发版前镜像与本次镜像各跑 `k01`~`k05` × 3。判据:本次镜像 k01 / k02 的 `tool_arg_contains` 3 次里至少 2 次过(发版前不可能过:没有 `bases` 参数);k03~k05 不比发版前差(对照规则同 B-140)。测完删 `acc-d1`、`acc-d1-one`、`acc-d1-parent` 和 `acc-d1-a` / `acc-d1-b` / `acc-d1-c`。
+
+## §59 read_file 碰到技能目录时报错给出读法(ROADMAP B-225)
+
+**背景**:技能文件在沙箱的 `$EXPERT_WORK_SKILLS_DIR`(`/opt/skills/<agent_key>/`)下,不在工作区;`read_file` 只读工作区,碰到 `../opt/skills/…` 会拒。改动后,拒绝含 `opt/skills/` 的路径时,报错末尾多一句「用 skill_view(skill_name, path) 读,或在 bash 里到 `$EXPERT_WORK_SKILLS_DIR/<技能名>/` 下读或运行」;其它被拒路径的报错不变。
+
+- [ ] **59.1 技能路径给出读法**:调试台用一个挂了任意技能的智能体,让它「用 read_file 读 `../opt/skills/` 下这个技能的 SKILL.md」。判据:工具结果是 `[tool error] ValueError: read_file path must be a relative workspace path without '..': …`,并且后面带 `skill_view` 和 `$EXPERT_WORK_SKILLS_DIR` 的提示;下一步模型改用 skill_view 或 bash 读到。**没修好时**:报错只有前半句,没有读法提示。
+- [ ] **59.2 其它路径不变**:同一个智能体让它 read_file `../etc/passwd`。判据:报错只有原来那半句,不含 `skill_view`。**没修好时**:无关路径也带上技能提示。
+
+## §60 检索结果去重 + 关键词路降级(B-206 K-21② / K-22)
+
+**背景**:K-21②:内容相同、文件名不同的两份文件是两份文档,同一段正文会在检索结果里出现两次,各占一个重排名额和一个结果名额。现在检索结果去副本,键是「标题路径 + 正文」的哈希,只做 NFC、合并空白(大小写、全角半角、上标都算不同 —— 只认逐字相同);文档名不算进去(副本之间不同的正是它),同一正文挂在不同标题下不算副本;留排得最前的那份。重排前在小段上去一次,但**只去「小段本身相同、它所在的整块也相同」的**:两个版本的文件共用一段原文(某一条款没改、别的条款改了)时,两边的整块不同,两个版本都留(设计 §7:冲突的版本要摆出来,不替用户选);也只在重排门槛相同的库之间去。重排后在整块上再去一次(读整块时一次读满 `limit` 条,不会每条跑一次库)。检索测试接口多返回 `duplicates_dropped`(去掉了几**段**,一个整块下命中几个小段都只算一段)。K-22:关键词路以前没有语句超时、一出错整次检索就失败;现在关键词语句在自己的事务里设 `statement_timeout`(5 秒),**查不完**(超时 / 被取消、锁或串行化冲突、断连、数据库资源不足)时保留向量路的结果、记 `knowledge.keyword_degraded` 警告,工具结果 meta 和检索测试接口带 `keyword_degraded: true`;SQL 写错、没权限这类错误照旧报错。只开关键词路的库、或查询嵌入也失败了(没有一路有结果)时照旧报错;同时搜几个库、其中一个库一路都没搜成时:别的库也什么都没找到 → 报那个库自己的错(错误文字里不带库名,库名只进日志 `knowledge.search_failed`),找到了 → 没搜成的库名列在结果末尾(防注入围栏里),围栏外的平台提示是固定文字:只对搜成的库说「没写的就是没依据」,对没搜成的「不说明那里有没有」。有一路失败(关键词路降级或查询嵌入失败)又什么都没找到时,提示改成「这次检索不完整,不说明资料里有没有」,不再说「资料里没有」。
+
+**怎么进**:测试环境控制台(system_admin,平台租户)建临时知识库 `kba1`(默认混合检索、开重排),上传下面三份文件,等都 ready(嵌入、重排各不到 1 分钱)。「检索测试」的返回看 DevTools Network 里 `POST …/bases/kba1/test` 的响应体。日志看两个控制面 pod。**测试文件(零租户内容,本机生成)**:`kbA1-b.md` 与 `kbA1-a.md` 逐字相同;`kbA1-c.md` 的第 2 章第 1~3 段与 a 逐字相同(按 400 token 切,这三段正好是同一个小段,两边一模一样),其余段落都不同(标记 `C1-…`,含第 2 章第 5 段 —— 所以两边第 2 章的整块不同);只有第 2 章第 2 段带一句「两份文件共用的条款原文」:
+
+```bash
+python3 - <<'PY'
+fill = "这是用于验收检索去重的说明文字,只描述本段的编号与位置。" * 4
+def para(tag, c, p):
+    extra = "两份文件共用的条款原文。" if (c, p) == (2, 2) else ""
+    return f"第 {c} 章第 {p} 段:验收标记 {tag}-{c}-{p}。{extra}{fill}"
+doc = lambda body: "# 验收文档\n\n" + "\n\n".join(
+    f"## 第 {c} 章\n\n" + "\n\n".join(body(c, p) for p in range(1, 7)) for c in range(1, 7)
+)
+a = doc(lambda c, p: para("A1", c, p))
+c = doc(lambda c, p: para("A1" if c == 2 and p <= 3 else "C1", c, p))
+for name, text in (("a", a), ("b", a), ("c", c)):
+    open(f"/tmp/kbA1-{name}.md", "w", encoding="utf-8").write(text)
+PY
+```
+
+- [ ] **60.1 两份相同的文件只出一次**:「检索测试」查「验收标记 A1-4-2」。判据:含 `A1-4-2` 的那段在结果里只出现一次(文件名是 `kbA1-a.md` 或 `kbA1-b.md` 之一,不是两个都有);响应体 `duplicates_dropped` ≥ 1。再在调试台用绑了 `kba1` 的智能体问「验收标记 A1-4-2 那一段写了什么」:`knowledge_search` 的工具结果里这段也只出现一次。**没修好时**:同一段在 `kbA1-a.md` 和 `kbA1-b.md` 下各出现一次,响应体没有 `duplicates_dropped`。
+- [ ] **60.2 内容不同的不被误去**:「检索测试」查「验收标记 C1-5-4」。判据:第一条结果是 `kbA1-c.md`、正文含 `C1-5-4`。**没修好时**(去重过头):结果里没有 `kbA1-c.md`。
+- [ ] **60.3 共用一段原文的另一个版本不被当副本**:「检索测试」查「两份文件共用的条款原文」。判据:结果里有一条 `kbA1-c.md`、正文同时含 `A1-2-2` 和 `C1-2-5`(c 的第 2 章整块);含 `A1-2-2`、`A1-2-5` 的那段(a 或 b 的第 2 章整块)只出现一次。**没修好时**(按小段去副本、不看整块):c 的那个小段被当成 a 的副本去掉,结果里没有同时含 `A1-2-2` 和 `C1-2-5` 的一条 —— 用户只看到旧版本。(10-27 本机用真切块 + 内存库 + 假嵌入对照过:改后 c 的第 2 章整块排第 2;按改前的去法它不在前 5。)
+- [ ] **60.4 关键词路正常时不降级、不变慢**:60.1~60.3 的响应体 `keyword_degraded` 都是 `false`;测试时间段内两个控制面 pod 的日志 `grep knowledge.keyword_degraded` 为 0 行;同一个问句(「验收标记 A1-4-2」)查 3 次,`POST …/test` 耗时的中位数 ≤ 5 秒。**没修好时**:响应体没有 `keyword_degraded`;或 5 秒的语句超时在正常查询上就触发(日志有 `knowledge.keyword_degraded`、`keyword_degraded: true`、结果只剩向量路)。
+- [ ] **60.5 关键词路超时降级(不在测试环境做)**:由集成测试 `packages/expert-work-persistence/tests/test_sql_knowledge_keyword_timeout.py`(另一个会话锁住 `knowledge_chunk`,关键词检索在超时内报 `KnowledgeRecallError`;超时设置不留在连接池的连接上;SQL 写错照旧报错)和单测 `services/orchestrator/tests/test_knowledge_keyword_degraded.py`(保留向量结果、只开关键词路 / 两路都失败 / 多库里一个库没搜成时的处理)覆盖。判据:本 PR 的 CI「Test (integration)」里这条测试过(它不是合并必需检查,要单独看)。**不要在测试环境锁共享表来验这条。**
+- [ ] **60.6 收尾**:删 `kba1` 和临时智能体。
+
+## §61 文档与整块维护·后端(B-175 P3-PR2)
+
+**背景**:停用以前只是存了个字段,检索照样返回 —— 现在文档级、整块级(整块行 + 它的小段;单独成块的小段也算一个整块)停用后,向量与关键词召回都不再返回,关键词打分的段总数也不再数它们。新接口(都在 `/v1/knowledge` 下,只对控制台开放,权限沿用 `manifest`):`PATCH /bases/{库}/documents/{id}`(启停)、`POST …/documents/batch`(批量启用 / 停用 / 重新摄取)、`POST …/documents/batch-delete`(批量删除,要 `manifest:delete`)、`GET …/documents?enabled=&status=`(筛选)、`GET /bases/{库}/stale-documents` 与 `POST /bases/{库}/reingest-stale`(切块参数变了的文档)、`GET|POST …/documents/{id}/passages`(整块列表 / 新增)、`PATCH …/passages/{pid}`(改正文要带 `revision`,或启停)、`GET …/passages/{pid}/revisions`、`POST …/passages/{pid}/restore`、`GET|DELETE …/documents/{id}/unapplied-edits`。改正文只重算变了的小段的向量;每次修改写一条修订(第一次改先把入库时的原文与标题路径记成修订 1,`edited_by` 为空)。**重新摄取会把人工修改套回去**:按入库原文 + 标题路径找回整块(模板重复的章节正文相同,靠标题区分;正文和标题都相同的几份按先后一一对应)—— 找到就保留编号、修订号、启停和改后的正文;同参数同文件一个都不丢、不重新嵌入;文件只改了章节标题时,修改跟着套到新标题下;找不到的修改不丢,列在 `unapplied-edits`(带 `orphaned_at`,可手动丢弃,满 30 天 retention-cleanup-job 删);有人停用的整块找不到时,记一条**停用记录**(它的原文与标题路径,修订表里 `revision = 0`、`switch_off_lost = true` 的行);之后每次入库,新文件里含任何一条停用记录**任何一段**独有段落的整块都跟着停用(段落边界挪了、原文分到两个整块里也一样),`disabled_reason = inherited`,列在 `unapplied-edits.inherited` 等人复核(只数在新文件里恰好出现一次、至少 20 字的段落,重复的页脚之类不算;规则 10-27 定:宁可多停,标出来)。**跟着停用的不是来源**:每次入库都只按停用记录重新算,不会一次次越停越多。复核时把跟着停用的整块启用(可以露出来)或再停用一次(变成自己的 `manual` 停用),它的段落就从停用记录里划掉,以后不会再因为那条记录被停;记录划空就删掉。一段都找不到(比如一句话的整块被文件改了一个词)就什么都不停,但这次停用不会悄悄丢 —— 这条记录进 `unapplied-edits.unapplied`(`switch_off_lost: true`、`revision: 0`,原文、`orphaned_at` = 从何时起没有整块含它),同样可丢弃、满 30 天删。丢弃(`DELETE …/unapplied-edits`)删的是修订历史,要 `manifest:delete`。重建索引(换嵌入模型)只原地换向量,不再整份删了重插,期间的停用 / 修改 / 新增不会被撤回;按位置分页读(期间有人改整块也不会漏读),读完再补嵌还不是新模型的小段,最多 3 轮,补不齐就算这次重建失败、不给库记新模型;写回按读到时的文档状态与代数加锁,被拒时只有文档被重新上传(代数变了)才算「被新版本取代」,其它情况(状态变了)也算失败、不记新模型。批量操作每份文档各记一条审计。`reingest-stale` 一次最多 200 份(`remaining` 是剩下的,再调一次)。迁移 0176:修订表挂外键到文档(删文档连带删修订)、`knowledge_chunk.disabled_reason`(CHECK 以 NOT VALID 加上、不做校验:整个 `upgrade head` 在一个事务里,校验扫全表会落在挡检索的锁里;新列存量全是 NULL,新写入照样检查)、`knowledge_chunk_revision.orphaned_at` / `switch_off_lost`、给 `retention_cleanup_worker` 的授权。管理端页面是下一个 PR(C2),本节只验接口。
+
+**怎么进**:测试环境控制台(system_admin,平台租户),接口用浏览器 DevTools 或带登录态的脚本调;数据库查询走测试库只读连接。建临时知识库 `kbc1`(默认参数)。**测试文件(零租户内容,本机生成;`kbc1.md` 三章各一个整块,`kbc1b.md` 一句话,两份都含「验收标记甲」;`/tmp/v2/kbc1.md` 只改了第 2 章第 3 段;`/tmp/v3/kbc1.md` 再改第 1 章第 5 段;`/tmp/v2/kbc1b.md` 那句话改了一个词;`kbc1t.md` 三周正文一模一样)**:
+
+```bash
+python3 - <<'PY'
+import os
+para = lambda c, p, extra="": f"第 {c} 章第 {p} 段:{extra}" + "这是用于验收知识维护的说明文字,只描述本段的编号与位置。" * 4
+def doc(changed=(), changed1=False):
+    chapters = []
+    for c in range(1, 4):
+        ps = [para(c, p, "验收标记甲。" if (c, p) == (1, 2) else "") for p in range(1, 7)]
+        if 2 in changed and c == 2:
+            ps[2] = para(2, 3, "文件里这一段改过了。")
+        if 1 in changed and c == 1:
+            ps[4] = para(1, 5, "第一章这一段也改过了。")
+        chapters.append(f"## 第 {c} 章\n\n" + "\n\n".join(ps))
+    return "# 维护验收文档\n\n" + "\n\n".join(chapters)
+os.makedirs("/tmp/v2", exist_ok=True)
+os.makedirs("/tmp/v3", exist_ok=True)
+open("/tmp/kbc1.md", "w", encoding="utf-8").write(doc())
+open("/tmp/v2/kbc1.md", "w", encoding="utf-8").write(doc(changed=(2,)))
+open("/tmp/v3/kbc1.md", "w", encoding="utf-8").write(doc(changed=(1, 2)))
+open("/tmp/kbc1b.md", "w", encoding="utf-8").write("# 另一份\n\n验收标记甲:第二份文档也提到它。")
+open("/tmp/v2/kbc1b.md", "w", encoding="utf-8").write("# 另一份\n\n验收标记甲:第二份文档也写到它。")
+week = "\n\n".join("本周安排:" + f"{t}。" * 30 for t in ("饮食少盐少油", "睡眠不晚于十一点", "步行三十分钟"))
+open("/tmp/kbc1t.md", "w", encoding="utf-8").write("\n\n".join(f"## 第 {i} 周\n\n{week}" for i in range(1, 4)))
+PY
+```
+
+`kbc1` 上传 `/tmp/kbc1.md`、`/tmp/kbc1b.md`,等 ready。`GET /v1/knowledge/bases/kbc1/documents/<kbc1.md 的 id>/passages` 应有 3 条(`kind: parent`,`heading_path` 末级分别是「第 1 章」「第 2 章」「第 3 章」),下称 A、B、C。
+
+- [ ] **61.1 迁移**:`SELECT version_num FROM alembic_version` 为 `0176_kb_revision_doc_fk`(或之后的版本);`SELECT confdeltype FROM pg_constraint WHERE conname = 'fk_knowledge_chunk_revision_document'` 一行、值为 `c`(删文档连带删);`SELECT table_name, column_name FROM information_schema.columns WHERE (table_name, column_name) IN (('knowledge_chunk', 'disabled_reason'), ('knowledge_chunk_revision', 'orphaned_at'), ('knowledge_chunk_revision', 'switch_off_lost'))` 三行;`SELECT convalidated FROM pg_constraint WHERE conname = 'knowledge_chunk_disabled_reason_enum'` 一行、值为 `f`(NOT VALID,**预期如此**,不要手动 VALIDATE);新写入照样被检查:测试库里 `BEGIN; UPDATE knowledge_chunk SET disabled_reason = 'x' WHERE id = '<A>'; ROLLBACK;` 报 `violates check constraint`;`SELECT has_table_privilege('retention_cleanup_worker', 'knowledge_chunk_revision', 'DELETE')` 为 `t`;迁移 Job 一次跑完、没有中途提交(`alembic_version` 直接到 0176 或之后)。**没修好时**:查不到这条外键、这三列或这条 CHECK,或授权为 `f`(清理 job 删不了过期修订)。
+- [ ] **61.2 停用文档不再被检索到**:检索测试查「验收标记甲」→ 两份都命中。`PATCH /v1/knowledge/bases/kbc1/documents/<kbc1.md id>` `{"enabled": false}` → 200、`enabled: false`;再查「验收标记甲」→ 只剩 `kbc1b.md`;调试台用绑了 `kbc1` 的智能体问「验收标记甲出现在哪些文档里」→ 工具结果只引用 `kbc1b.md`;`GET …/documents?enabled=false` 只列 `kbc1.md`,它的 `GET …/chunks` 仍有分段;审计多一条 `knowledge:document_toggle`。测完 `{"enabled": true}` 恢复,两份又都命中。**没修好时**:停用后检索和智能体照样返回 `kbc1.md`。
+- [ ] **61.3 停用整块**:`PATCH …/documents/<kbc1.md id>/passages/<A>` `{"enabled": false}` → 200,返回的 `enabled` 与每个 `children[].enabled` 都是 `false`、`disabled_reason: "manual"`;检索测试查「第 1 章第 4 段」→ 没有 `kbc1.md` 第 1 章的结果(查「第 3 章第 4 段」照常命中 C);`SELECT chunk_type, enabled FROM knowledge_chunk WHERE id = '<A>' OR parent_chunk_id = '<A>'` 全是 `false`。**没修好时**:整块停用了小段仍被检索到,或只有整块行是 `false`。
+- [ ] **61.4 改一句话**:取 B 的 `content`,把「第 2 章第 2 段:」开头那一句整句换成「验收修改乙:等待期为三十天。」,`PATCH …/passages/<B>` `{"content": <新正文>, "revision": 1}` → 200、`revision: 2`、`edited: true`、`id` 不变;检索测试查「验收修改乙」命中 B;`SELECT revision, edited_by IS NULL FROM knowledge_chunk_revision WHERE chunk_id = '<B>' ORDER BY revision` → `(1, true)`、`(2, false)`;日志 `knowledge.ingest_vectors document=<kbc1.md id> reused=… embedded=1`(只重算改了的那一个小段);审计 `knowledge:passage_edit`。**没修好时**:没有修订行,或日志 `embedded` 等于 B 的全部小段数。
+- [ ] **61.5 乐观锁**:用 `"revision": 1` 再提交一次别的正文 → 409,`detail.error = "revision_conflict"`,`detail.passage.revision = 2`、正文仍是 61.4 的;日志里这次没有 `knowledge.ingest_vectors`(拒绝在嵌入之前)。**没修好时**:后写的覆盖先写的。
+- [ ] **61.6 同参数重新摄取保住修改**(嵌入 0 元):对 `kbc1.md` 点「重新摄取」,等 ready。判据:`GET …/passages` 里 A 仍停用、B 的 `id` / `revision: 2` / 「验收修改乙」都在、C 不变;日志 `knowledge.manual_replay document=<id> edits_applied=1 disabled_applied=1 added=0 disabled_inherited=0 unapplied=0 switch_offs_lost=0` 与 `knowledge.ingest_vectors … embedded=0`;没有新的 `knowledge_ingest` 用量。**没修好时**:B 变回原文、`edited: false`,A 重新启用、又能被检索到。
+- [ ] **61.7 改切块参数后重新摄取**(嵌入几分钱):`PATCH /v1/knowledge/bases/kbc1` `{"chunk_max_tokens": 300}`;`GET /v1/knowledge/bases/kbc1/stale-documents` → `stale: 2`;`POST /v1/knowledge/bases/kbc1/reingest-stale` → 202、`queued` 两个 id、`skipped` 为空、`remaining: 0`;审计每份文档一条 `knowledge:document_reingest`(`stale: true`)外加一条 `knowledge:base_reingest`。等 ready 后:B 的「验收修改乙」仍在、`revision: 2`(整块原文没变,修改套回去了,小段按 300 重切),A 仍停用;日志 `knowledge.manual_replay … edits_applied=1 disabled_applied=1`;`stale-documents` 回到 0。若 B 没套回去,它必须出现在 `GET …/unapplied-edits` 里(正文含「验收修改乙」)。**没修好时**:修改消失且 `unapplied-edits` 为空。测完把 `chunk_max_tokens` 改回 400 并再 `reingest-stale` 一次。
+- [ ] **61.8 重传改了那一段的文件**:上传 `/tmp/v2/kbc1.md`(同名,第 2 章第 3 段改过),等 ready。判据:`GET …/unapplied-edits` 的 `unapplied` 列出 B 的修订 2(`passage_id` = B、正文含「验收修改乙」、`orphaned_at` 有值),`inherited` 为空;`SELECT count(*) FROM knowledge_chunk_revision WHERE chunk_id = '<B>'` 仍为 2;新的第 2 章整块正文含「文件里这一段改过了」、不含「验收修改乙」;A(原文没变)仍停用;日志 `knowledge.manual_replay … edits_applied=0 disabled_applied=1 … unapplied=1`。**没修好时**:修改悄悄没了,`unapplied-edits` 为空或修订行被删。
+- [ ] **61.9 恢复原文**:对 C 改一句(同 61.4 的做法,`revision: 1` → 2),再 `POST …/passages/<C>/restore` `{"revision": 1, "expected_revision": 2}` → 200,正文回到入库原文、`edited: false`、`revision: 3`;`GET …/passages/<C>/revisions` 有 1、2、3 三条;审计 `knowledge:passage_restore`。**没修好时**:恢复改写了旧修订,或 `edited` 仍是 `true`。
+- [ ] **61.10 批量操作与权限**:`POST /v1/knowledge/bases/kbc1/documents/batch` `{"action": "disable", "document_ids": [<kbc1.md>, <kbc1b.md>]}` → `done` 两个、`skipped` 为空;检索测试查「验收标记甲」→ 0 条;再 `"action": "enable"` 恢复。用 operator 账号 `POST …/documents/batch-delete` `{"document_ids": [<kbc1b.md>]}` → 403(文档还在)。审计:每次批量一条 `knowledge:document_batch`,外加每份文档各一条 `knowledge:document_toggle`(`batch: true`,`resource_id` 是那份文档)。**没修好时**:批量停用后仍能检索到,或 operator 能批量删除,或审计里查不到某份文档被批量停用过。
+- [ ] **61.11 找不回的停用整块:跟着停用、标出来等复核**:上传 `/tmp/v3/kbc1.md`(第 1 章第 5 段也改了 → A 的原文对不上了),等 ready。判据:新的第 1 章整块(下称 A′)`enabled: false`、`disabled_reason: "inherited"`、`children[].enabled` 全 `false`;第 2、3 章整块照常启用;`GET …/passages?disabled_reason=inherited` 只列 A′;`GET …/unapplied-edits` 的 `inherited` 只列 A′;日志 `knowledge.manual_replay … disabled_inherited=1`;检索测试查「第一章这一段也改过了」→ 结果里没有 A′ 的分段(`kbc1.md` 第 1 章)。`SELECT revision, switch_off_lost, orphaned_at IS NULL FROM knowledge_chunk_revision WHERE chunk_id = '<A>'` → `(0, true, true)`(A 的停用记录,有整块含它的原文)。复核:`PATCH …/passages/<A′>` `{"enabled": true}` → `disabled_reason: null`,`inherited` 变空,再查能命中 A′。然后对 `kbc1.md` 点「重新摄取」,等 ready:第 1 章整块**仍启用**(复核过的段落已从记录里划掉,不会又被停);A 的记录只剩改之前的第 1 章第 5 段,新文件里没有了 → 出现在 `unapplied` 里(`passage_id` = A、`revision: 0`、`switch_off_lost: true`);日志 `knowledge.manual_replay … disabled_inherited=0 … switch_offs_lost=1`。**没修好时**:A′ 照常启用(停用悄悄丢了),或停了却 `disabled_reason` 为空、`inherited` 里看不到,或复核启用后重新摄取又被停回去。
+- [ ] **61.12 模板重复的章节各管各的**:`kbc1` 上传 `/tmp/kbc1t.md`(三周正文一模一样,标题「第 1 周」「第 2 周」「第 3 周」),等 ready,`GET …/passages` 3 条,下称 W1、W2、W3。停用 W2;按 61.4 的做法把 W3 第一句换成「验收修改丙。」;然后对 `kbc1t.md` 点「重新摄取」,等 ready。判据:W2 仍停用(`disabled_reason: "manual"`)、W1 与 W3 启用;「验收修改丙」只在 W3、`revision: 2`;W1 是原文、`edited: false`;日志 `knowledge.manual_replay … edits_applied=1 disabled_applied=1 … unapplied=0`。测完删 `kbc1t.md`。**没修好时**:停用或修改跑到 W1 上(三份正文相同,只按正文找会都对到第一份)。
+- [ ] **61.13 停用找不回、也没有可跟着停的:记下来等复核**:停用 `kbc1b.md` 唯一的整块(下称 D,`PATCH …/documents/<kbc1b.md id>/passages/<D>` `{"enabled": false}`),再上传 `/tmp/v2/kbc1b.md`(同名,那句话改了一个词),等 ready。判据:新整块照常启用(它不含 D 的任何一段独有原文,没东西可停);`GET …/documents/<kbc1b.md id>/unapplied-edits` 的 `unapplied` 一条:`passage_id` = D、`revision: 0`、正文是改之前那句、`switch_off_lost: true`、`edited_by: null`、`orphaned_at` 有值;日志 `knowledge.manual_replay … disabled_inherited=0 unapplied=0 switch_offs_lost=1`。operator 账号 `DELETE …/documents/<kbc1b.md id>/unapplied-edits` → 403;system_admin → 200、`{"discarded": 1}`,`unapplied` 变空。**没修好时**:D 的停用悄悄没了,`unapplied-edits` 什么都没有;或 operator 能删修订历史。
+- [ ] **61.14 过期修订由清理 job 删**:B 的修订自 61.8 起没套回去。`UPDATE knowledge_chunk_revision SET orphaned_at = now() - interval '31 days' WHERE chunk_id = '<B>' AND revision = 1`(只测试环境),手动起一次 retention-cleanup-job。判据:日志 `retention_cleanup_job.done … knowledge_revisions=1`,没有 `permission denied`;`SELECT revision FROM knowledge_chunk_revision WHERE chunk_id = '<B>'` 只剩 `2`;其它文档的修订行数不变。**没修好时**:`knowledge_revisions=0` 或报权限错,修订 1 还在。
+- [ ] **61.15 手动丢弃找不回的修改**:`DELETE …/documents/<kbc1.md id>/unapplied-edits` → 200、`{"discarded": 2}`(B 剩下的修订 2 + 61.11 里 A 的停用记录);`GET …/unapplied-edits` 的 `unapplied` 为空;`SELECT count(*) FROM knowledge_chunk_revision WHERE chunk_id IN ('<A>', '<B>')` 为 0;现有整块的修订(如 61.9 的 C)不受影响;审计 `knowledge:passage_discard_unapplied`(`discarded: 2`)。**没修好时**:丢弃后仍列着,或连现有整块的修订一起删了。
+- [ ] **61.16 删文档连带删修订**:`DELETE …/documents/<kbc1.md id>` → 204;`SELECT count(*) FROM knowledge_chunk_revision WHERE document_id = '<kbc1.md id>'` 为 0。测完删 `kbc1`。**没修好时**:修订行留在库里。
+
+## §62 检索记录 + 命中测试接口(B-175 P2-PR4)
+
+**背景**:知识库检索写一行 `knowledge_retrieval_log`(迁移 0177):智能体的 `knowledge_search`(来源 `agent`,带本轮 run id 和**会话 thread id**)和控制台检索测试(来源 `console_test`,带操作员工)都记;不在 run 里、也没有控制台范围的检索(例如技能进化回放)**不记**(没有清除能找到它)。存检索了哪些库、问题(超过 2,000 字截断)、参数、怎么结束的(检索自己报错时为 `error`,`flags.error` 是异常类型)、每条结果的段 / 文档 id 与四个分数、降级标记、耗时 —— **不存文档正文**。智能体那一路检索最多等写记录 1 秒,写本身作为单独的任务在后台继续(不取消:取消数据库写要等它收尾,正是要避免的卡顿),写失败不影响检索;应用日志里只记来源和异常类型,**不出现问题原文**。读记录:`GET /v1/knowledge/bases/{库}/retrieval-logs`(列表,按来源 / 状态 / 零命中 / 时间筛,分页带总数;同时检索了几个库的记录在每个库下都列,条数与结果算的是全部库)与 `…/{id}`(详情,结果按文档 id 现查文档,已删的为 null);权限同会话记录 —— `session:read`(viewer 也能看)、只给控制台(API key 403)、不支持 `tenant_id=*`。删除:删库先删记录(删不掉就 503、库不动,可重试),删库后再补删一次;删会话先按 thread 删记录(谁的 run 写的都删;删不掉就 503、什么都不删),删完会话行再补删一次(清除不停正在跑的 run,它补删之后才写的那条留到保留期清理;清除用户时每个会话同样两遍);零命中筛选不含 `error` 行;清除用户删他会话里的全部记录(含审批续跑等别人 / 无用户的 run)、他在别处的 run 的记录、他作为员工做的检索测试 —— 记录删失败时跳过删 run / 匿名化 run 两步(`skipped`),重跑能删干净;retention-cleanup-job 删满 30 天的(`EXPERT_WORK_RETENTION_KNOWLEDGE_RETRIEVAL_LOG_RETENTION_DAYS`,默认 30,分批删到删完)。检索测试接口每条结果新增 `vector_score` / `keyword_score` / `fused_score` 与 `document{id, doc_seq, title, filename, created_at}`,顶层新增 `elapsed_ms`(检索本身,不含写记录)、`log_id`(这次检索写下的记录 id;没写成时为 null);原有字段都在。管理端页面在 PR C4。
+
+**怎么进**:测试环境控制台(system_admin,平台租户)建临时知识库 `kbc3`,上传一份小 Markdown(内容随意、零租户内容),等 ready;建一个绑 `kbc3` 的临时智能体。数据库查询走测试库只读连接(62.6 的造数是写,测试环境我自己跑)。本节所有问题都带同一个**标记** `C3-<当天日期>-<4 位随机数>`(下称 `<标记>`),62.5 用它查日志。
+
+- [ ] **62.1 迁移与隔离**:`SELECT version_num FROM alembic_version` 为 `0177_kb_retrieval_log`(或其后);`SELECT relrowsecurity, relforcerowsecurity FROM pg_class WHERE relname = 'knowledge_retrieval_log'` 为 `t, t`;`SELECT polname FROM pg_policy WHERE polrelid = 'knowledge_retrieval_log'::regclass` 只有 `knowledge_retrieval_log_tenant_isolation`;`SELECT has_table_privilege('retention_cleanup_worker', 'knowledge_retrieval_log', 'SELECT'), has_table_privilege('retention_cleanup_worker', 'knowledge_retrieval_log', 'DELETE')` 为 `t, t`。**没修好时**:表不存在,或 `relforcerowsecurity = f`,或清扫角色没有 DELETE(62.6 会 permission denied)。
+- [ ] **62.2 检索测试返回四个分数与文档**(嵌入不到 1 分钱):`kbc3` 检索测试问「`<标记>` 第一段讲了什么」。判据:每条结果有 `vector_score` / `keyword_score` / `fused_score` / `rerank_score`(没走某一路的为 null,`vector_score` 等于原来的 `score`)和 `document`,其中 `id` 是这份文档、`doc_seq` 与文档列表的 D 号一致、`created_at` 是上传时间;`source` 仍是 `文件名#段号`;顶层 `elapsed_ms` 是整数、`log_id` 不为 null;原有字段(`content`、`hit_chunk_indexes`、`rerank_outcome`、`embedding_degraded` 等)都在。**没修好时**:结果里没有 `document` / 子分数,或没有 `elapsed_ms` / `log_id`。
+- [ ] **62.3 控制台检索写 `console_test` 记录**:`SELECT source, actor_id, run_id, kb_ids, result_count, latency_ms FROM knowledge_retrieval_log WHERE id = '<62.2 的 log_id>'` —— `console_test`、`actor_id` 是做检索的员工、`run_id` 为空、`kb_ids` 只有 `kbc3` 的 id、`result_count` 等于 62.2 的 `count`;`SELECT count(*) FROM knowledge_retrieval_log, jsonb_array_elements(results) AS r WHERE id = '<log_id>' AND (r ? 'content' OR r ? 'hit_content')` 为 0(不存正文);`GET /v1/knowledge/bases/kbc3/retrieval-logs` 第一条就是它,`GET …/retrieval-logs/<log_id>` 的每条结果带 `document`。**没修好时**:没有这一行,或来源是 `agent`、`actor_id` 为空,或结果里有正文。
+- [ ] **62.4 智能体检索写 `agent` 记录**:调试台用绑 `kbc3` 的智能体问「`<标记>` 文档里写了什么」,等回答(要真的调了 `knowledge_search`)。判据:`SELECT source, run_id, thread_id, actor_id FROM knowledge_retrieval_log WHERE kb_ids @> ARRAY['<kbc3 id>']::uuid[] AND source = 'agent' ORDER BY created_at DESC LIMIT 3` —— 条数等于这一轮 `knowledge_search` 的调用次数,`run_id` 等于这一轮的 run id、`thread_id` 等于这个会话的 id(会话记录 / Run 详情里看),`actor_id` 为空;`GET …/retrieval-logs?source=agent` 列得出来。**没修好时**:没有 `agent` 行,或 `run_id` / `thread_id` 为空(会话清除就找不到这些行)。
+- [ ] **62.5 日志里没有问题原文**:62.2~62.4 跑完后,`kubectl -n expert-work logs -l app.kubernetes.io/name=control-plane -c control-plane --since=30m --tail=-1 --prefix | grep -c '<标记>'` 为 0(所有控制面 pod;智能体的检索跑在控制面进程里,也在这份日志;带 `-l` 时 kubectl 默认只取每个 pod 最后 10 行,`--tail=-1` 不能省)。**没修好时**:写记录失败时整条异常带参数打进日志,`grep` 出含标记的行。若有命中行,先看是不是本 PR 的 logger(`knowledge.retrieval_log_failed` / `knowledge.base_delete_logs_failed` / `session_purge.retrieval_logs_failed` / `purge_user.retrieval_logs_failed`),不是的话记下来源另立项。
+- [ ] **62.6 保留期清理**:先把 62.3 那一行改老:`UPDATE knowledge_retrieval_log SET created_at = now() - interval '31 days' WHERE id = '<62.2 的 log_id>'`;手动起一次清理 job:`kubectl -n expert-work create job --from=cronjob/retention-cleanup c3-retention-$(date +%s)`,等完成。判据:job 日志 `retention_cleanup_job.done … knowledge_retrieval_logs=<n> …`,`n ≥ 1`、没有 `permission denied` / 报错;那一行已不在(`SELECT count(*) … WHERE id = '<log_id>'` 为 0),62.4 的 `agent` 行还在。测完删掉临时 job。**没修好时**:日志里没有 `knowledge_retrieval_logs=`,或 permission denied,或改老的那行还在。
+- [ ] **62.7 谁能看**:只有 viewer 角色的员工账号 `GET /v1/knowledge/bases/kbc3/retrieval-logs` 200;一个 `admin` scope 的 API key 调同一地址 403,`detail.message` 为「console API is not available to API keys; use /v1/agents/{agent_code}/…」;`?tenant_id=*` 400 `SCOPE_ALL_NOT_SUPPORTED`。**没修好时**:API key 拿到 200。
+- [ ] **62.8 清除会话连记录一起删**:调试台用绑 `kbc3` 的智能体另开一个会话问「`<标记>` 第二段讲了什么」(调了 `knowledge_search`),记下会话 id `<会话 id>`;`SELECT count(*) FROM knowledge_retrieval_log WHERE thread_id = '<会话 id>'` ≥ 1。对话记录页「彻底删除」这个会话(`POST /v1/sessions/<会话 id>:purge`)。判据:响应 `retrieval_logs` 等于上面的条数;同一查询为 0;62.4 那个会话的行还在。**没修好时**:响应里没有 `retrieval_logs`,查询仍 ≥ 1(会话没了,问题原文还在)。
+- [ ] **62.9 清除用户连记录一起删**(真栈,临时终端用户):用临时 `admin` scope API key 以临时终端用户 `c3-purge-<4 位随机数>` 的身份调 `POST /v1/agents/{绑 kbc3 的智能体 code}/runs`(`user_id=c3-purge-…`),问「`<标记>` 第三段讲了什么」,等 run 结束;`SELECT id FROM tenant_user WHERE subject_id LIKE '%c3-purge-%'` 得 `<用户 id>`;`SELECT count(*) FROM knowledge_retrieval_log l JOIN agent_run r ON r.id = l.run_id WHERE r.user_id = '<用户 id>'` ≥ 1,并记下这些行的 `thread_id`。控制台「用户」页清除这个用户(`POST /v1/users/<用户 id>:purge`)。判据:响应 `deleted.knowledge_retrieval_log` ≥ 1、`skipped` 为空、`failures` 里没有 `knowledge_retrieval_log`;`SELECT count(*) FROM knowledge_retrieval_log WHERE thread_id IN (<上面的 thread_id>)` 为 0。测完删临时 API key。**没修好时**:仍 ≥ 1(用户的问题原文在清除后留下),或会话被删了而记录还在。
+- [ ] **62.10 删库连记录一起删**:删 `kbc3`。判据:`SELECT count(*) FROM knowledge_retrieval_log WHERE kb_ids @> ARRAY['<kbc3 id>']::uuid[]` 为 0;审计里有这次 `knowledge:base_delete`。测完删临时智能体。**没修好时**:62.4 的行还在(问题原文留在已删的库名下)。
+
+## §63 入库中可取消(B-222 PR-1)
+
+**背景**:入库一旦开始只能等它跑完(或删掉文档),大文档的识别 / 嵌入费照付。现在 `pending` / `processing` 的文档可以取消:新接口 `POST /v1/knowledge/bases/{name}/documents/cancel`(body `{"document_ids": [...]}`,要 `manifest:write`,仅控制台),逐个返回 `cancelled` / `not_cancellable`(已 ready / failed / cancelled,或已到 `stage=indexing` 正在写分段、马上就绪——写分段是不可撤回点,取消在那之后一律拒绝,租约过期也一样(由恢复任务重新认领);「丢弃新版」同理回 409)/ `not_found`(不在这个库);取消 = 状态 `cancelled`、`error=cancelled by user`、代际 +1(在跑的 worker 之后每次带围栏的写都被拒)、释放租约;每个取消的文档审计一条 `knowledge:document_cancel`。花钱的步骤都在下一批之前检查:分段嵌入与语义断点嵌入每 200 条一窗、扫描页识别每 16 页一批、图片描述与图中文字每次调模型之前(重试也算);检查本身出错(数据库抖一下)不算取消,入库照常。接到取消请求的 pod 如果正在跑这份文档(上传入库或恢复任务都算),立刻中止(在途请求一并断开;正在进程池里跑的解析 / 收集图片,名额等那个进程跑完才让出,过了这次调用的截止时间就杀掉进程池让出名额);别的 pod 在跑的,最迟下一次续约(100 秒)被拒即停,恢复任务也一样。已写的识别缓存保留,重新入库不再付费;取消的文档不会被恢复任务认领;重新上传 / 重新入库照常重置。原来就在生效的上一版(同名重传被取消时)继续生效,换嵌入模型重建索引时也会重新嵌入(失败的同名重传同理;重建索引结束时库里还有分段不是新模型的(例如有文档正在重新入库),库的模型不盖章,仍显示需要重建索引)。控制台:入库中的行多一个「取消入库」按钮(确认框),状态标签「已取消」;只读态置灰。**没有迁移。**
+
+**怎么进**:测试环境控制台(system_admin,平台租户)建临时知识库 `kbb1`。数据库查询走测试库只读连接;日志 `kubectl -n expert-work logs <pod> -c control-plane`。直传 / 指定 pod 发请求用端口转发(同 §55.6),带控制台的登录令牌。**全节费用 < ¥1**(63.1 嵌入在 `embedding` 刚出现时取消约 ¥0.9 以内、越早越便宜;识别几分钱)。**测试文件(零租户内容,本机生成)**:`kb48-near-a.docx` 用 §48 那段脚本末尾加 `docx("/tmp/kb48-near-a.docx", 2_400_000)`(约 240 万字);扫描件(每页不同,否则相同的页走识别缓存):
+
+```bash
+uv run --no-sync python - <<'PY'
+import pymupdf
+def scan(path, pages):
+    doc = pymupdf.open()
+    for n in range(1, pages + 1):
+        src = pymupdf.open(); p = src.new_page()
+        p.insert_text((72, 120), f"B1-SCAN-PAGE {n}: cold chain boxes ship with two ice packs.", fontsize=14)
+        doc.new_page().insert_image(pymupdf.Rect(0, 0, 595, 842), stream=p.get_pixmap(dpi=200).tobytes("png"))
+    doc.save(path)
+scan("/tmp/b1-scan40.pdf", 40)
+scan("/tmp/b1-scan160.pdf", 160)
+PY
+```
+
+- [ ] **63.1 嵌入中取消,同一 pod 立即停**:经端口转发把 `kb48-near-a.docx` 直传 pod A 的 `kbb1`;轮询 `GET …/documents`,`stage` 刚变 `embedding` 时经**同一个端口转发**发 `POST …/documents/cancel`。判据:① 返回 `cancelled`;60 秒内(实际应是几秒)`status=cancelled`、`error=cancelled by user`;② `SELECT count(*) FROM knowledge_chunk WHERE document_id = '<id>'` 为 0;③ 这份文档的 `knowledge_ingest` 嵌入用量(上传到取消后 2 分钟这段时间,该租户 text-embedding-v4 的行)远低于 §55.6 的 3,588,096 token,记下数字;④ 取消后 2 分钟内没有新的 `knowledge_ingest` 行;pod A 日志有 `knowledge.ingest_cancelled_local` 和 `knowledge.ingest_lost_lease`,没有 `knowledge.ingest_failed`;⑤ 审计一条 `knowledge:document_cancel`;⑥ 2 分钟后状态仍是 `cancelled`、`attempts` 不变(恢复任务没认领)。**没修好时**:没有取消接口(404 / 405);或状态改了但嵌入一直跑到写分段时才停,用量 ≈ 3.6M token。这份文档测完就删。
+- [ ] **63.2 识别中取消**:控制台 `kbb1` 上传 `/tmp/b1-scan40.pdf`,状态显示「处理中」且 `stage=recognizing` 时点该行「取消入库」→ 确认。判据:① 60 秒内「已取消」;② 这段时间 glm-ocr 的 `knowledge_ingest` 用量行 ≤ 32(在读的那批读完就停,不再开新批);③ `SELECT count(*) FROM knowledge_parse_cache WHERE document_id = '<id>' AND kind = 'page_ocr'` = 已识别的页数(保留,63.4 用);④ 没有分段。**没修好时**:40 页全部识别完才停(用量 40 行)。
+- [ ] **63.3 从另一个 pod 取消**:经端口转发把 `/tmp/b1-scan160.pdf` 直传 pod A,`stage=recognizing` 后经端口转发到 **pod B** 发 `POST …/documents/cancel`。判据:① pod B 返回 `cancelled`;② 100 秒内 pod A 停止识别(glm-ocr 用量行不再增加;通常在读的那批读完就停),pod A 日志 `knowledge.ingest_stale`(租约续期先发现时是 `knowledge.ingest_lost_lease`;不会有 `ingest_cancelled_local`,也没有 `ingest_failed`);③ 状态 `cancelled`、没有分段;④ glm-ocr 用量行 ≤ 取消时已读页数 + 16。**没修好时**:pod A 读完 160 页才发现文档已不归自己。这份文档测完就删。
+- [ ] **63.4 重新入库,已识别的页不再付费**:对 63.2 的文档点「重新摄取」。判据:ready、`page_stats.pages_ocr=40`;`GET …/documents/{id}/pages` 里 63.2 已识别的页 `cached=true`;新增 glm-ocr 用量行数 = 40 − 63.2 ③ 的缓存页数。**没修好时**:取消时把识别缓存删了,40 页重新付费。
+- [ ] **63.5 已结束的不能取消 + 只读置灰**:对 63.4 那份 ready 文档发 `POST …/documents/cancel`。判据:返回 `not_cancellable`,状态、`ingest_generation` 不变,没有新的 `knowledge:document_cancel` 审计;控制台 ready / 失败 / 已取消的行都没有「取消入库」按钮;别的库的文档 id 返回 `not_found`。正在写分段(`stage=indexing`)的文档取消回 `not_cancellable`、随后照常 ready(窗口只有几秒,真栈不强求撞上,单测与 SQL 并发测试覆盖)。平台管理账号切入其它租户时,入库中的行「取消入库」置灰、悬停提示只读(该租户此刻没有入库中的文档则不可判,单测覆盖)。
+- [ ] **63.6 英文界面**:右上角切 English。判据:按钮提示「Cancel ingest」;确认框「Cancel the ingest of "…"?」;状态标签「Cancelled」,悬停「The ingest was cancelled. Re-ingest to run it again; pages and pictures already recognized are not billed again.」。测完删 `kbb1`。
+
 ## §TBD-B226a 收尾如实 + 步数预警 + 原地打转(B-226 ①②④)
 
 **背景**:10-28 测试环境 `ai-strategy-report` 一轮跑满 48 步,收尾指令是「写出你最好的、完整的最终答复」,模型答「交付文件已通过逐页渲染核验」,而这一轮一次 `save_artifact` 都没调(产物 0 个)。三处改动:① 收尾指令改成平台记录(本 run 自己登记了几个产物、几次失败没补上、计划还有几步没完成;文字固定、只有数字和上限是动态的),按 `exit_reason` 说撞的是哪个上限,「不能调工具」只说本 run,并作为隐藏消息落进检查点;② 剩下的步数不超过 `max(2, 上限 // 6)` 时,每一步的预警进 `<platform-context>`、贴在最后一条消息末尾(不落库,token 预警同样挪进来),本 run 发一次 `guard` `warning` `max_steps` 帧;预警是存档点不是催收尾:先把还没登记(或登记后改过)的成品登记好(用户另有交代时听用户的;没绑 `save_artifact` 就只报步数),再接着做,别只因为它停下(hermes-agent 删掉「现在就收尾」式提醒的理由:c8aff74632,#7915 让模型过早放弃);两条预警都有时步数预警在前;④ loop-detection 只看本次回复,清掉第三次相同调用后提醒在**同一个 run** 里交回模型(以前 run 直接以被清空的那条回复「正常结束」;被清空的回复没有正文就不落库),`max_no_progress` 配了 N 就是同一次运行里第 N 次被拦下走无进展收尾,没配(0)按平台规则是第 2 次(都按本 run 累计,中间干净的一步不清零;以前按「连续次数」算,提醒交回模型后「打转 → 换个调用 → 再打转」会一路跑到步数上限;0 不再是「关闭」),收尾时登记数按本 run 自己和它委派出去的子代算,欠账没清时计划不再被自动标成全部完成。

@@ -95,6 +95,7 @@ from expert_work.persistence.knowledge import (
     DuplicateKnowledgeBaseError as DuplicateKnowledgeBaseError,
 )
 from expert_work.persistence.knowledge import InMemoryKnowledgeStore as InMemoryKnowledgeStore
+from expert_work.persistence.knowledge import KnowledgeRecallError as KnowledgeRecallError
 from expert_work.persistence.knowledge import KnowledgeStore as KnowledgeStore
 from expert_work.persistence.knowledge import SqlKnowledgeStore as SqlKnowledgeStore
 from expert_work.persistence.mcp_connector_catalog import (
@@ -502,6 +503,7 @@ __all__ = [
     "KnowledgeBaseRow",
     "KnowledgeChunkRow",
     "KnowledgeDocumentRow",
+    "KnowledgeRecallError",
     "KnowledgeStore",
     "McpConnectorCatalogAlreadyExistsError",
     "McpConnectorCatalogInUseError",

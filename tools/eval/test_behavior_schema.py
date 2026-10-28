@@ -9,6 +9,7 @@ from behavior_schema import (
     CaseResult,
     CheckVerdict,
     ResultHeader,
+    ToolArgContains,
     ToolUsed,
     TurnRecord,
     WorkspaceFileContains,
@@ -128,9 +129,10 @@ def test_case_set_hash_ignores_caches_and_dotfiles(tmp_path: Path) -> None:
     assert case_set_hash(cases, fixtures) == before
 
 
-def test_final_text_regex_must_compile(tmp_path: Path) -> None:
-    bad = _CASE.replace("{type: completed}", "{type: final_text_regex, pattern: '(unclosed'}")
-    with pytest.raises(ValidationError, match="regex"):
+@pytest.mark.parametrize("check_type", ["final_text_regex", "final_text_not_regex"])
+def test_final_text_regex_must_compile(tmp_path: Path, check_type: str) -> None:
+    bad = _CASE.replace("{type: completed}", f"{{type: {check_type}, pattern: '(unclosed'}}")
+    with pytest.raises(ValidationError, match="invalid regex"):
         load_case(_write(tmp_path, "g99-sample.yaml", bad))
 
 
@@ -214,6 +216,62 @@ def test_turns_may_bring_their_own_fixtures(tmp_path: Path) -> None:
     )
     case = load_case(_write(tmp_path, "g99-sample.yaml", text))
     assert case.turns[0].fixtures == [] and case.turns[1].fixtures == ["b.md"]
+
+
+def test_knowledge_cases_take_a_k_id_and_the_kb_agent(tmp_path: Path) -> None:
+    text = (
+        _CASE.replace("g99-sample", "k99-sample")
+        .replace("eval-general", "eval-kb")
+        .replace(
+            "{type: completed}",
+            "{type: tool_arg_contains, tool: knowledge_search, arg: bases, any_of: [K2, specs]}",
+        )
+    )
+    case = load_case(_write(tmp_path, "k99-sample.yaml", text))
+    assert case.agent == "eval-kb"
+    check = case.checks[0]
+    assert isinstance(check, ToolArgContains)
+    assert check.any_of == ["K2", "specs"] and check.call == "first" and check.turn is None
+
+
+@pytest.mark.parametrize(
+    "check",
+    [
+        "{type: tool_arg_contains, tool: knowledge_search, arg: bases, any_of: []}",
+        "{type: tool_arg_contains, tool: knowledge_search, arg: bases, any_of: [K2], call: last}",
+        "{type: tool_arg_contains, tool: knowledge_search, any_of: [K2]}",
+        "{type: tool_arg_contains, tool: knowledge_search, arg: bases, any_of: [K2], turn: 0}",
+    ],
+)
+def test_tool_arg_check_is_strict(tmp_path: Path, check: str) -> None:
+    bad = _CASE.replace("{type: completed}", check)
+    with pytest.raises(ValidationError):
+        load_case(_write(tmp_path, "g99-sample.yaml", bad))
+
+
+@pytest.mark.parametrize(
+    ("any_of", "none_of", "ok"),
+    [
+        ("[K2]", "[k2]", False),  # 句柄不分大小写:同一个库
+        ("[specs, K2]", "[specs]", False),
+        ("[specs]", "[SPECS]", True),  # 库名区分大小写:不是同一个库
+        ("[K2]", "[K1, K3]", True),
+    ],
+)
+def test_tool_arg_check_rejects_overlapping_lists(
+    tmp_path: Path, any_of: str, none_of: str, ok: bool
+) -> None:
+    """同一个值既在 any_of 又在 none_of:判据永远不过,加载时就报错。"""
+    check = (
+        "{type: tool_arg_contains, tool: knowledge_search, arg: bases, "
+        f"any_of: {any_of}, none_of: {none_of}}}"
+    )
+    text = _CASE.replace("{type: completed}", check)
+    if ok:
+        load_case(_write(tmp_path, "g99-sample.yaml", text))
+        return
+    with pytest.raises(ValidationError, match="both any_of and none_of"):
+        load_case(_write(tmp_path, "g99-sample.yaml", text))
 
 
 def test_line_count_check_loads(tmp_path: Path) -> None:

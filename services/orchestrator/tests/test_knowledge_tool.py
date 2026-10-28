@@ -457,7 +457,7 @@ class _CountingReranker:
 
 async def _seed_bases(store: InMemoryKnowledgeStore, *, bases: int, per_base: int) -> UUID:
     """``bases`` bases ``kb0``.. with ``per_base`` chunks each; every chunk
-    mentions "policy" (keyword hit) and has a distinct vector."""
+    mentions "policy" (keyword hit) and has a distinct vector and body."""
     tenant = uuid4()
     for b in range(bases):
         base = await store.create_base(tenant_id=tenant, name=f"kb{b}")
@@ -473,7 +473,7 @@ async def _seed_bases(store: InMemoryKnowledgeStore, *, bases: int, per_base: in
                     kb=base.id,
                     doc=document.id,
                     index=i,
-                    content=f"policy clause {i}",
+                    content=f"policy clause {b}-{i}",
                     embedding=(1.0, i / per_base),
                 )
                 for i in range(per_base)
@@ -550,7 +550,8 @@ async def test_default_weights_reproduce_plain_rrf_order_and_scores() -> None:
                     kb=base.id,
                     doc=document.id,
                     index=i,
-                    content=" ".join(rng.sample(words, 3)),
+                    # Distinct bodies: a copy would be dropped (B-206 K-21②).
+                    content=" ".join([*rng.sample(words, 3), f"{b}-{i}"]),
                     embedding=(rng.random(), rng.random(), rng.random()),
                 )
                 for i in range(30)

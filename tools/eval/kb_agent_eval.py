@@ -392,6 +392,8 @@ async def _search(
         "degraded": bool(result.meta.get("rerank_degraded")),
         # B-206 K-8: the query was not embedded, this search ran on keywords alone.
         "embedding_degraded": bool(result.meta.get("embedding_degraded")),
+        # B-206 K-22: the keyword path failed, this search ran on vectors alone.
+        "keyword_degraded": bool(result.meta.get("keyword_degraded")),
         # B-206 K-7: how the rerank ended. The eval's base always asks for rerank, so a
         # result without the key ended ``ok``; K-7b: the base's threshold left out
         # (set under another model).
@@ -729,6 +731,7 @@ def tally(path: Path) -> str:
         f"searches per question {len(searches) / max(1, len(rows)):.2f}; "
         f"degraded {sum(1 for s in searches if s.get('degraded'))}, "
         f"embedding degraded {sum(1 for s in searches if s.get('embedding_degraded'))}, "
+        f"keyword degraded {sum(1 for s in searches if s.get('keyword_degraded'))}, "
         f"errors {sum(1 for s in searches if s.get('error'))}, "
         f"skipped {sum(1 for s in searches if s.get('skipped'))}"
     )

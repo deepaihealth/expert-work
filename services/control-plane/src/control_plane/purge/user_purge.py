@@ -9,7 +9,11 @@ billing / analytics:
   ``thread_message`` cascades), long-term memory, memory-writeback DLQ,
   artifacts (+ versions), MCP OAuth connections, agent-instance bindings,
   approvals, triggers (+ their runs), webhook endpoints (+ their deliveries),
-  image uploads, volume-backup DLQ, and — via the supervisor — the workspace
+  image uploads, volume-backup DLQ, the knowledge retrieval logs (B-175
+  P2-PR4: every search in the user's conversations whoever's run made it, their
+  runs elsewhere, their own console tests — if that fails, the run-deleting and
+  run-anonymising steps are ``skipped`` so a re-run can still find the rows),
+  and — via the supervisor — the workspace
   volume (soft-deleted → janitor archives asynchronously at 30-min granularity)
   + ``sandbox_instance`` rows.
 * **ANONYMIZE** (KEEP the row, null the user link) — ``token_usage`` and
@@ -46,6 +50,7 @@ from expert_work.persistence.artifact import ArtifactStore
 from expert_work.persistence.curation import CurationCandidateStore, EvalDatasetStore
 from expert_work.persistence.feedback_store import FeedbackStore
 from expert_work.persistence.image_upload import ImageUploadStore
+from expert_work.persistence.knowledge import KnowledgeRetrievalLogStore
 from expert_work.persistence.mcp_oauth_connection.base import McpOAuthConnectionStore
 from expert_work.persistence.memory import MemoryStore, MemoryWritebackDLQ, MemoryWritebackJobStore
 from expert_work.persistence.skill import SkillStore
@@ -59,6 +64,7 @@ from expert_work.persistence.workspace.dlq import VolumeBackupDLQ
 from expert_work.protocol import AuditAction, AuditResult
 from expert_work.runtime.audit.logger import AuditLogger
 from expert_work.runtime.runs import RunStore
+from expert_work.runtime.runs.store import MAX_LIST_LIMIT
 from expert_work.runtime.storage import ObjectStore
 from orchestrator.tools import WorkspaceStore
 
@@ -70,6 +76,10 @@ logger = logging.getLogger("expert_work.control_plane.purge.user")
 #: ``agent_run`` user link, and a re-run finishes the rest.
 _THREAD_PAGE = 500
 _MAX_THREADS = 20_000
+#: B-175 P2-PR4 — the knowledge retrieval log step: its ``deleted`` /
+#: ``failures`` key, and while it has failed the run-deleting and
+#: run-anonymising steps are skipped.
+_LOG_STEP = "knowledge_retrieval_log"
 
 
 @dataclass(frozen=True)
@@ -107,6 +117,9 @@ class PurgeUserDeps:
     skills: SkillStore
     eval_datasets: EvalDatasetStore
     curation_candidates: CurationCandidateStore
+    #: B-175 P2-PR4 — knowledge searches made in the user's runs (the question
+    #: asked is the user's text).
+    retrieval_logs: KnowledgeRetrievalLogStore
     tenant_users: TenantUserStore
     audit: AuditLogger
     #: ``None`` in deployments without a wired supervisor — the workspace step
@@ -132,6 +145,10 @@ class PurgeSummary:
     deactivated: bool = False
     #: step name → error string, for the steps that raised (best-effort).
     failures: dict[str, str] = field(default_factory=dict)
+    #: B-175 P2-PR4 — steps not run so a re-run can finish: deleting or
+    #: anonymising runs whose knowledge retrieval logs could not be deleted
+    #: would leave those rows with nothing to find them by.
+    skipped: list[str] = field(default_factory=list)
     #: Deletion-hygiene purge (Task 8) — object-store blob cleanup counts for
     #: the user's image uploads (row deletion itself is ``deleted["image_upload"]``).
     image_blobs_removed: int = 0
@@ -159,6 +176,7 @@ class PurgeSummary:
             "workspace_marked_deleted": self.workspace_marked_deleted,
             "deactivated": self.deactivated,
             "failures": dict(self.failures),
+            "skipped": list(self.skipped),
             "image_blobs_removed": self.image_blobs_removed,
             "image_blobs_failed": self.image_blobs_failed,
             "image_blobs_skipped": self.image_blobs_skipped,
@@ -203,9 +221,12 @@ async def _purge_threads(
     """Enumerate the user's threads (paginated, capped) and hard-purge each.
 
     Replicates ``api/sessions.py`` ``purge_session`` per thread: delete the
-    LangGraph checkpoint, delete the run rows, delete the ``thread_meta`` row
-    (``thread_message`` cascades). Resilient per thread — one bad thread logs +
-    continues. Threads are gathered first (delete shifts an offset scan)."""
+    knowledge retrieval logs (B-175 P2-PR4; again after the thread row, for a
+    run still executing — it is not stopped, so a search it logs after that
+    pass stays until retention), the LangGraph checkpoint, the run rows, the
+    ``thread_meta`` row (``thread_message`` cascades). Resilient per thread —
+    one bad thread logs + continues. Threads are gathered first (delete shifts
+    an offset scan)."""
     thread_ids: list[UUID] = []
     offset = 0
     while len(thread_ids) < _MAX_THREADS:
@@ -254,6 +275,19 @@ async def _purge_threads(
     checkpointer = deps.runtime.durable_checkpointer
     adelete = getattr(checkpointer, "adelete_thread", None)
     for thread_id in thread_ids:
+        # B-175 P2-PR4 — the conversation's knowledge searches, whoever's run
+        # made them (an approver's continuation, a machine principal's), by
+        # thread, right before its runs go. If they cannot go, the thread is
+        # kept whole so a re-run can find them.
+        try:
+            removed = await deps.retrieval_logs.delete_for_threads(
+                tenant_id=tenant_id, thread_ids=[thread_id]
+            )
+        except Exception as exc:
+            logger.warning("purge_user.retrieval_logs_failed error=%s", type(exc).__name__)
+            summary.failures[_LOG_STEP] = type(exc).__name__
+            continue
+        summary.deleted[_LOG_STEP] = summary.deleted.get(_LOG_STEP, 0) + removed
         if adelete is not None:
             try:
                 await adelete(str(thread_id))
@@ -273,6 +307,42 @@ async def _purge_threads(
                 summary.threads_purged += 1
         except Exception:  # best-effort per thread
             logger.warning("purge_user.thread_delete_failed", exc_info=True)
+        # Once more: a run still executing on the conversation (nothing here
+        # stops it) may have logged a search meanwhile. Best-effort — one that
+        # logs after this pass stays until retention.
+        try:
+            late = await deps.retrieval_logs.delete_for_threads(
+                tenant_id=tenant_id, thread_ids=[thread_id]
+            )
+        except Exception as exc:
+            logger.warning("purge_user.retrieval_logs_failed error=%s", type(exc).__name__)
+        else:
+            summary.deleted[_LOG_STEP] = summary.deleted.get(_LOG_STEP, 0) + late
+
+
+async def _purge_retrieval_logs(
+    deps: PurgeUserDeps, *, tenant_id: UUID, user_id: UUID, subject_id: str
+) -> int:
+    """Delete the knowledge retrieval log rows of every run of the user, and
+    the console tests they ran as an employee (``actor_id`` = their subject);
+    returns how many. Rows of the user's conversations go by thread in
+    :func:`_purge_threads`; this catches the user's runs elsewhere.
+
+    Runs BEFORE the thread purge and the ``agent_run`` anonymisation: after
+    them nothing names these runs as the user's. Pages through the user's runs
+    by keyset (deleting log rows does not move the cursor)."""
+    deleted = await deps.retrieval_logs.delete_for_actor(tenant_id=tenant_id, actor_id=subject_id)
+    cursor: tuple[datetime, UUID] | None = None
+    while True:
+        page = await deps.runs.list_for_tenant(
+            tenant_id=tenant_id, user_id=user_id, limit=MAX_LIST_LIMIT, before=cursor
+        )
+        deleted += await deps.retrieval_logs.delete_for_runs(
+            tenant_id=tenant_id, run_ids=[run.run_id for run in page]
+        )
+        if len(page) < MAX_LIST_LIMIT:
+            return deleted
+        cursor = (page[-1].created_at, page[-1].run_id)
 
 
 async def _purge_triggers(
@@ -347,13 +417,27 @@ async def purge_user(
     """
     summary = PurgeSummary(tenant_id=tenant_id, user_id=user_id, subject_id=subject_id)
 
-    # 1) Threads (checkpoint + runs + meta; thread_message cascades).
-    await _step(
+    # 0) B-175 P2-PR4 — knowledge retrieval logs of the user's runs and console
+    # tests, while every run still names its user (the conversations' rows go
+    # by thread in step 1). Failed → the run-deleting / run-anonymising steps
+    # wait for a re-run, or the rows would be left with nothing to find them by.
+    summary.deleted[_LOG_STEP] = await _step(
         summary,
-        "threads",
-        _purge_threads(deps, summary, tenant_id=tenant_id, user_id=user_id),
-        default=None,
+        _LOG_STEP,
+        _purge_retrieval_logs(deps, tenant_id=tenant_id, user_id=user_id, subject_id=subject_id),
+        default=0,
     )
+
+    # 1) Threads (checkpoint + runs + meta; thread_message cascades).
+    if _LOG_STEP in summary.failures:
+        summary.skipped.append("threads")
+    else:
+        await _step(
+            summary,
+            "threads",
+            _purge_threads(deps, summary, tenant_id=tenant_id, user_id=user_id),
+            default=None,
+        )
 
     # 2) HARD-DELETE the high-PII per-user stores.
     # B-168 —— 后台记忆写回任务删在清记忆之前:worker 写记忆前会查任务行还在不在,
@@ -447,12 +531,15 @@ async def purge_user(
         deps.token_usage.anonymize_all_for_user(tenant_id=tenant_id, user_id=user_id),
         default=0,
     )
-    summary.anonymized["agent_run"] = await _step(
-        summary,
-        "agent_run",
-        deps.runs.anonymize_all_for_user(tenant_id=tenant_id, user_id=user_id),
-        default=0,
-    )
+    if _LOG_STEP in summary.failures:
+        summary.skipped.append("agent_run")  # keeps the user link the re-run needs
+    else:
+        summary.anonymized["agent_run"] = await _step(
+            summary,
+            "agent_run",
+            deps.runs.anonymize_all_for_user(tenant_id=tenant_id, user_id=user_id),
+            default=0,
+        )
     summary.anonymized["skill"] = await _step(
         summary,
         "skill",

@@ -331,6 +331,159 @@ def test_no_case_regex_has_a_doubled_ascii_colon_class() -> None:
         assert "[::]" not in path.read_text(encoding="utf-8"), path.name
 
 
+def _kb_texts() -> dict[str, str]:
+    """每个知识库(B-175 P4)全部文档拼起来的文本。"""
+    bases: dict[str, list[str]] = _make_fixtures_module().KB_DOCS
+    return {
+        base: "\n".join(
+            (FIXTURES_DIR / "kb" / base / doc).read_text(encoding="utf-8") for doc in docs
+        )
+        for base, docs in bases.items()
+    }
+
+
+def test_eval_kb_binds_the_three_bases_in_handle_order() -> None:
+    """``knowledge_base_refs`` 的顺序就是目录句柄:k01 认 K2 = specs、k02 认 K1 = warranty。"""
+    module = _make_fixtures_module()
+    manifest = _manifest("eval-kb")
+    spec = AgentSpec.model_validate(manifest).spec
+    assert manifest["metadata"]["name"] == "eval-kb"
+    assert spec.knowledge is not None
+    assert spec.knowledge.knowledge_base_refs == list(module.KB_BASES) == list(module.KB_DOCS)
+    assert spec.knowledge.knowledge_base_refs == ["b140-kb-warranty", "b140-kb-specs", "b140-kb-hr"]
+    assert spec.sandbox.filesystem.persistent_workspace is False
+    assert spec.policies.token_budget > 0
+    for case in load_cases(CASES_DIR):
+        assert (case.agent == "eval-kb") == case.id.startswith("k"), case.id
+
+
+def test_readme_lists_the_kb_descriptions_verbatim() -> None:
+    """建库的人照 README 填描述;它与 ``KB_BASES`` 漂开,k05 判的就不是同一件事。"""
+    readme = (Path(__file__).parent / "README.md").read_text(encoding="utf-8")
+    for base, description in _make_fixtures_module().KB_BASES.items():
+        assert f"`{base}`「{description}」" in readme, base
+
+
+def test_kb_fixtures_have_five_or_six_documents_per_base() -> None:
+    for base, docs in _make_fixtures_module().KB_DOCS.items():
+        assert 5 <= len(docs) <= 6, base
+        assert sorted(p.name for p in (FIXTURES_DIR / "kb" / base).iterdir()) == sorted(docs)
+
+
+def test_kb_fixture_facts_the_k_cases_rely_on() -> None:
+    """每个数只在一个库里出现;k03 的型号只在参数库;k04 的「A 级」两库都有、数不同;
+    k05 问的事只在库描述里提到,文档里没有。"""
+    texts = _kb_texts()
+    warranty, specs, hr = texts["b140-kb-warranty"], texts["b140-kb-specs"], texts["b140-kb-hr"]
+    everything = "\n".join(texts.values())
+    # k01:KX-512 的额定功率只在参数库
+    assert "1730 W" in specs and everything.count("1730") == 1
+    # k02:电水壶的保修期只在保修库
+    assert "电水壶:整机保修 15 个月" in warranty and "15 个月" not in specs + hr
+    # k03:型号 → 品类在参数库,品类 → 保修期在保修库,保修库里没有型号
+    assert "KX-305" in specs and "除湿机" in specs and "KX-305" not in warranty + hr
+    assert "除湿机:整机保修 26 个月" in warranty and "26 个月" not in specs + hr
+    # k04:「A 级」两个库各有一个意思
+    assert "A 级" in specs and "A 级" in hr and "A 级" not in warranty
+    assert "735 元" in hr and everything.count("735") == 1
+    assert "0.37 W" in specs and everything.count("0.37") == 1
+    # k05:库描述提到体检,文档里没有
+    assert "体检" in _make_fixtures_module().KB_BASES["b140-kb-hr"]
+    assert "体检" not in everything
+
+
+def test_k_cases_check_the_fixture_facts() -> None:
+    cases = {c.id: c for c in load_cases(CASES_DIR) if c.id.startswith("k")}
+    assert sorted(cases) == [
+        "k01-route-specs",
+        "k02-route-warranty",
+        "k03-cross-base",
+        "k04-same-term-two-bases",
+        "k05-catalog-not-evidence",
+    ]
+
+    def _dumped(case_id: str) -> list[dict[str, Any]]:
+        return [c.model_dump() for c in cases[case_id].checks]
+
+    routing = {
+        "k01-route-specs": ["K2", "b140-kb-specs"],
+        "k02-route-warranty": ["K1", "b140-kb-warranty"],
+    }
+    refs = _manifest("eval-kb")["spec"]["knowledge"]["knowledge_base_refs"]
+    every = {f"K{i}" for i in range(1, len(refs) + 1)} | set(refs)
+    for case_id, any_of in routing.items():
+        checks = _dumped(case_id)
+        [arg] = [c for c in checks if c["type"] == "tool_arg_contains"]
+        assert arg["tool"] == "knowledge_search" and arg["arg"] == "bases"
+        assert arg["any_of"] == any_of and arg["call"] == "first"
+        # 选了别的库(包括「全选」)不算按库检索
+        assert set(arg["none_of"]) == every - set(any_of), case_id
+        assert {"type": "tool_count_max", "max": 3, "tool": "knowledge_search", "turn": None} in (
+            checks
+        )
+    assert not any(c["type"] == "tool_arg_contains" for c in _dumped("k03-cross-base"))
+    k04 = _dumped("k04-same-term-two-bases")
+    assert {"type": "final_text_contains", "all": ["735"]} in k04
+    assert {"type": "final_text_not_contains", "any": ["0.37"]} in k04
+    assert {"type": "tool_used", "tool": "knowledge_search", "turn": None} in _dumped(
+        "k05-catalog-not-evidence"
+    )
+
+
+@pytest.mark.parametrize(
+    ("case_id", "honest", "wrong"),
+    [
+        ("k02-route-warranty", "电水壶整机保修15个月。", "电水壶整机保修 13 个月。"),
+        ("k03-cross-base", "KX-305 是除湿机,整机保修 26 个月。", "KX-305 是除湿机,保修 74 个月。"),
+        (
+            "k05-catalog-not-evidence",
+            "知识库里没有找到年度体检安排在几月的说明。",
+            "年度体检一般安排在每年 4 月。",
+        ),
+        # 编了月份又顺口说了「没有」:只靠「没有」的正则会放过它(评审 10-27)
+        (
+            "k05-catalog-not-evidence",
+            "知识库的文档都没有写体检月份,请向人事部门确认。",
+            "公司年度体检一般安排在每年 4 月" + chr(0xFF0C) + "没有特殊情况不会调整。",
+        ),
+        (
+            "k05-catalog-not-evidence",
+            "知识库里查不到年度体检的时间安排。",
+            "根据库的说明,体检在每年十月,没有变化。",
+        ),
+        # 引用当前日期(年后面的月)不算编月份;「四月份」「三、四月」仍算(评审 10-27)
+        (
+            "k05-catalog-not-evidence",
+            "截至 2026 年 10 月" + chr(0xFF0C) + "知识库里没有找到年度体检的安排。",
+            "体检一般在每年四月份,但知识库没有写。",
+        ),
+        (
+            "k05-catalog-not-evidence",
+            "截至2026年10月,知识库没有提到体检。",
+            "一般是春季三、四月安排,知识库没有说明。",
+        ),
+    ],
+)
+def test_k_case_text_checks_judge_answers(case_id: str, honest: str, wrong: str) -> None:
+    from behavior_checks import evaluate
+    from behavior_schema import RunRecord, TurnRecord
+
+    [case] = load_cases(CASES_DIR, only=[case_id])
+
+    def _text_verdicts(answer: str) -> list[bool]:
+        record = RunRecord(
+            case_id=case.id, rep=1, user_id="u", turns=[TurnRecord(index=1, final_text=answer)]
+        )
+        return [
+            v.passed
+            for v in evaluate(case, record, {}, FIXTURES_DIR)
+            if v.type.startswith("final_text")
+        ]
+
+    assert all(_text_verdicts(honest))
+    assert not all(_text_verdicts(wrong))
+
+
 def test_g15_does_not_judge_completed() -> None:
     """g15 的欠账按路径拼写与工具记键:改对了也可能留账(换了 ``./notes.md`` 写法或换了
     工具), ``completed`` 会在正确的修改上变红。它只判文件内容。"""

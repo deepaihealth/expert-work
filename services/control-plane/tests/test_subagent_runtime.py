@@ -16,11 +16,15 @@ from control_plane.subagent_runtime import (
     make_worker_build_fn,
 )
 from expert_work.common.credentials import CredentialsResolver
+from expert_work.persistence import InMemoryKnowledgeStore
 from expert_work.persistence.agent_spec import InMemoryAgentSpecStore
 from expert_work.protocol import AgentSpec, AgentSpecStatus, TenantConfigRecord, TenantPlan
 from expert_work.runtime.secret_store import LocalDevSecretStore
 from expert_work.testing import InMemorySecretStore
 from orchestrator import BuiltAgent, LLMActionJudge, LLMOutputJudge, ToolEnv
+from orchestrator.llm import FakeEmbedder
+from orchestrator.tools import KnowledgeRetriever
+from orchestrator.tools.knowledge_catalog import catalog_fingerprint
 
 _SHA = "a" * 64
 
@@ -253,6 +257,216 @@ async def test_child_rebuilds_when_the_stored_spec_changed(
 
     assert len(build_calls) == 2
     assert build_calls[1]["spec"].spec.system_prompt.template == "edited"
+
+
+# ---------------------------------------------------------------------------
+# B-175 P4 — a static sub-agent's knowledge catalog fingerprint in its key
+# ---------------------------------------------------------------------------
+
+
+def _kb_spec(name: str, refs: list[str]) -> AgentSpec:
+    doc = _spec(name).model_dump(by_alias=True, mode="json")
+    doc["spec"]["knowledge"] = {"knowledge_base_refs": refs}
+    return AgentSpec.model_validate(doc)
+
+
+async def _kb_child_builder(
+    kb_store: InMemoryKnowledgeStore, refs: list[str], **kwargs: Any
+) -> tuple[Any, UUID]:
+    """A child builder whose env carries a retriever over ``kb_store``, and a
+    tenant holding a ``researcher`` sub-agent bound to ``refs``."""
+    tenant = uuid4()
+    store = InMemoryAgentSpecStore()
+    await store.create(
+        tenant_id=tenant,
+        spec=_kb_spec("researcher", refs),
+        spec_sha256=_SHA,
+        created_by="test",
+    )
+    builder = make_child_agent_builder(
+        spec_store=store,
+        secret_store=InMemorySecretStore(),
+        checkpointer=InMemorySaver(),
+        base_tool_env=ToolEnv(
+            knowledge_retriever=KnowledgeRetriever(store=kb_store, embedder=FakeEmbedder())
+        ),
+        **kwargs,
+    )
+    return builder, tenant
+
+
+@pytest.fixture
+def catalog_build_calls(monkeypatch: pytest.MonkeyPatch) -> list[dict[str, Any]]:
+    """``build_calls``, but the fake build freezes the catalog the way
+    ``build_agent`` does: it reads the catalog from its env's retriever store and
+    records that fingerprint on the build."""
+    calls: list[dict[str, Any]] = []
+
+    async def _fake_build_agent(spec: AgentSpec, **kwargs: Any) -> BuiltAgent:
+        calls.append({"spec": spec, **kwargs})
+        retriever = kwargs["tool_env"].knowledge_retriever
+        refs = spec.spec.knowledge.knowledge_base_refs if spec.spec.knowledge else []
+        fingerprint = (
+            await catalog_fingerprint(retriever.store, tenant_id=kwargs["tenant_id"], refs=refs)
+            if retriever is not None
+            else None
+        )
+        return BuiltAgent(
+            graph=object(),  # type: ignore[arg-type]
+            system_prompt="",
+            max_steps=1,
+            knowledge_catalog_fingerprint=fingerprint,
+        )
+
+    monkeypatch.setattr("control_plane.subagent_runtime.build_agent", _fake_build_agent)
+    return calls
+
+
+class _SecondReadFailsStore(InMemoryKnowledgeStore):
+    """``list_bases`` fails on its second call only: the key's read succeeds,
+    the build's read right after it fails, later reads succeed."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.list_calls = 0
+
+    async def list_bases(self, *, tenant_id: UUID) -> list[Any]:
+        self.list_calls += 1
+        if self.list_calls == 2:
+            raise RuntimeError("database blip")
+        return await super().list_bases(tenant_id=tenant_id)
+
+
+class _FirstReadBlindStore(InMemoryKnowledgeStore):
+    """The first ``list_bases`` sees no base (the key's read), later ones do:
+    the bases appeared between the key's read and the build's."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.list_calls = 0
+
+    async def list_bases(self, *, tenant_id: UUID) -> list[Any]:
+        self.list_calls += 1
+        if self.list_calls == 1:
+            return []
+        return await super().list_bases(tenant_id=tenant_id)
+
+
+class _UnreadableKnowledgeStore(InMemoryKnowledgeStore):
+    """Records every catalog read. Not raising: the fingerprint swallows store
+    errors (``"unavailable"``), so a raise could not fail a test."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.reads: list[str] = []
+
+    async def list_bases(self, *, tenant_id: UUID) -> list[Any]:
+        self.reads.append("list_bases")
+        return await super().list_bases(tenant_id=tenant_id)
+
+
+@pytest.mark.asyncio
+async def test_child_rebuilds_when_its_knowledge_catalog_changed(
+    catalog_build_calls: list[dict[str, Any]],
+) -> None:
+    kb = InMemoryKnowledgeStore()
+    builder, tenant = await _kb_child_builder(kb, ["a", "b"])
+    base_a = await kb.create_base(tenant_id=tenant, name="a", description="first")
+    await kb.create_base(tenant_id=tenant, name="b", description="second")
+    await kb.upsert_document(tenant_id=tenant, kb_id=base_a.id, filename="d0.md")
+
+    async def _delegate() -> None:
+        await builder(tenant_id=tenant, name="researcher", version="1.0.0", depth=1)
+
+    await _delegate()
+    await kb.upsert_document(tenant_id=tenant, kb_id=base_a.id, filename="d1.md")  # 1 -> 2
+    await _delegate()
+    assert len(catalog_build_calls) == 1
+    await kb.update_base(tenant_id=tenant, kb_id=base_a.id, description="edited")
+    await _delegate()
+    await _delegate()
+    assert len(catalog_build_calls) == 2
+
+
+@pytest.mark.asyncio
+async def test_child_build_whose_catalog_read_failed_is_not_cached(
+    catalog_build_calls: list[dict[str, Any]],
+) -> None:
+    """The key read the catalog, the child build's own read failed: that build
+    is served but not cached, so the next delegation builds with the catalog."""
+    kb = _SecondReadFailsStore()
+    builder, tenant = await _kb_child_builder(kb, ["a", "b"])
+    await kb.create_base(tenant_id=tenant, name="a")
+    await kb.create_base(tenant_id=tenant, name="b")
+    for _ in range(3):
+        await builder(tenant_id=tenant, name="researcher", version="1.0.0", depth=1)
+    assert len(catalog_build_calls) == 2
+
+
+@pytest.mark.asyncio
+async def test_child_catalog_build_under_an_empty_slot_is_not_cached(
+    catalog_build_calls: list[dict[str, Any]],
+) -> None:
+    """Key slot ``None`` (no bound base yet), build froze a catalog: not
+    cached, so once the bases are gone the next delegation builds without it."""
+    kb = _FirstReadBlindStore()
+    builder, tenant = await _kb_child_builder(kb, ["a", "b"])
+    bases = [await kb.create_base(tenant_id=tenant, name=n) for n in ("a", "b")]
+    await builder(tenant_id=tenant, name="researcher", version="1.0.0", depth=1)
+    for base in bases:
+        await kb.delete_base(tenant_id=tenant, kb_id=base.id)
+    await builder(tenant_id=tenant, name="researcher", version="1.0.0", depth=1)
+    assert len(catalog_build_calls) == 2
+
+
+@pytest.mark.asyncio
+async def test_single_base_child_does_not_read_the_knowledge_store(
+    build_calls: list[dict[str, Any]],
+) -> None:
+    kb = _UnreadableKnowledgeStore()
+    builder, tenant = await _kb_child_builder(kb, ["a"])
+    await builder(tenant_id=tenant, name="researcher", version="1.0.0", depth=1)
+    await builder(tenant_id=tenant, name="researcher", version="1.0.0", depth=1)
+    assert len(build_calls) == 1
+    assert kb.reads == []
+
+
+@pytest.mark.asyncio
+async def test_user_invalidation_still_matches_child_keys_carrying_a_catalog(
+    catalog_build_calls: list[dict[str, Any]],
+) -> None:
+    """The fingerprint is appended last: ``k[6]`` stays the OAuth subject."""
+    from orchestrator.tools import MCPServerPool, RecordingMCPClient
+
+    async def _user_provider(tid: object, uid: str) -> MCPServerPool:
+        pool = MCPServerPool()
+        await pool.add(f"srv-{uid}", RecordingMCPClient())
+        return pool
+
+    kb = InMemoryKnowledgeStore()
+    user_hooks: list[Any] = []
+    builder, tenant = await _kb_child_builder(
+        kb,
+        ["a", "b"],
+        user_mcp_oauth_pool_provider=_user_provider,
+        register_user_invalidation=user_hooks.append,
+    )
+    await kb.create_base(tenant_id=tenant, name="a")
+    await kb.create_base(tenant_id=tenant, name="b")
+
+    async def _delegate(user: str) -> None:
+        await builder(
+            tenant_id=tenant, name="researcher", version="1.0.0", depth=1, oauth_user_id=user
+        )
+
+    await _delegate("A")
+    await _delegate("B")
+    assert len(catalog_build_calls) == 2
+    [invalidate_user] = user_hooks
+    invalidate_user(tenant, "A")
+    await _delegate("A")
+    await _delegate("B")
+    assert len(catalog_build_calls) == 3
 
 
 # ---------------------------------------------------------------------------
