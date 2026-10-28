@@ -44,7 +44,7 @@ every error class speaks through this one module's vocabulary.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Literal
 
 from orchestrator.tools.registry import ToolNotFoundError, ToolSpec
@@ -77,6 +77,10 @@ class ClassifiedToolError:
     grounded "is a blind retry safe?" hint (CM-B5). ``path`` is carried
     for the ``mutation_not_landed`` class (PR2), unused on the error
     path.
+
+    An empty ``advice`` (B-226 ③, :func:`classified_soft_failure`) means the
+    platform has nothing to add to the tool's own result: the failure enters the
+    run's ledger and nothing else (no advisory block, no escalation).
     """
 
     tool_name: str
@@ -196,6 +200,46 @@ def classified_mutation_not_landed(
         summary=summary,
         retryable=True,
         advice=_ADVICE["mutation_not_landed"],
+        path=path,
+    )
+
+
+#: B-226 ③ — the ledger summary of a soft failure. Fixed text: the tool's result
+#: (exit code, status, its own message) sits right there in the conversation.
+SOFT_FAILURE_SUMMARY = "the tool's own result reports a failure"
+
+
+def classified_soft_failure(
+    *, tool_name: str, spec: ToolSpec | None, transient: bool
+) -> ClassifiedToolError:
+    """Build the classification of a call the tool itself reports as failed (B-226 ③).
+
+    Like :func:`classified_mutation_not_landed` there is no exception: the tool
+    returned a :class:`~orchestrator.tools.registry.ToolResult` with ``failed``
+    set from its own structured result. ``transient`` (neutral) → ``transient``,
+    otherwise ``unknown`` — the platform does not read the result's text to guess a
+    finer class. ``advice`` is always empty (ledger-only): the ``unknown`` advice
+    says the call "never got far enough to look", which is false for a call that ran.
+    """
+    error_class: ToolErrorClass = "transient" if transient else "unknown"
+    return replace(_make(error_class, tool_name, SOFT_FAILURE_SUMMARY, spec), advice="")
+
+
+def classified_blocked(*, tool_name: str, summary: str, path: str | None) -> ClassifiedToolError:
+    """Build the ``blocked_by_policy`` entry for a call a policy stopped before it ran
+    (B-226 ⑤: an action-screen block, a rejected approval that does not end the run).
+
+    ``path`` is the written resource for a write tool (the same extractor the success
+    side keys by), so a later successful write of it clears the entry.
+    """
+    if len(summary) > _SUMMARY_MAX_CHARS:
+        summary = summary[:_SUMMARY_MAX_CHARS] + "...[truncated]"
+    return ClassifiedToolError(
+        tool_name=tool_name,
+        error_class="blocked_by_policy",
+        summary=summary,
+        retryable=False,
+        advice=_ADVICE["blocked_by_policy"],
         path=path,
     )
 

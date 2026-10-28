@@ -7,7 +7,7 @@ from collections.abc import Callable
 
 import httpx
 import pytest
-from behavior_client import ExternalClient, SseParser, StreamIncompleteError
+from behavior_client import ExternalClient, SseParser, StreamIncompleteError, TurnBuilder
 
 
 def _sse(*frames: tuple[str, object]) -> str:
@@ -134,6 +134,68 @@ async def test_run_turn_collects_tools_text_end_and_usage() -> None:
     assert rec.final_text == "已改好"
     assert rec.artifacts == [{"name": "report.md", "version": 2}]
     assert (rec.input_tokens, rec.output_tokens) == (1200, 50)
+
+
+@pytest.mark.parametrize(
+    ("status", "artifact", "counted"),
+    [
+        pytest.param("success", {"exit_code": 2, "stdout": "", "stderr": "boom"}, 1, id="exit-2"),
+        pytest.param(
+            "success", {"exit_code": 1, "stdout": "", "stderr": "x"}, 1, id="exit-1-stderr"
+        ),
+        pytest.param(
+            "success", {"exit_code": 2, "stdout": "0\n", "stderr": ""}, 1, id="exit-2-stdout-only"
+        ),
+        pytest.param(
+            "success",
+            {"exit_code": -1, "timed_out": True, "stdout": "", "stderr": ""},
+            1,
+            id="timeout",
+        ),
+        pytest.param(
+            "success",
+            {"exit_code": 1, "timed_out": True, "stdout": "", "stderr": ""},
+            1,
+            id="silent-but-timed-out",
+        ),
+        # grep -c prints "0", diff prints the difference: exit 1 without stderr is a
+        # predicate that answered "no" — the platform does not count it either (B-226).
+        pytest.param(
+            "success",
+            {"exit_code": 1, "timed_out": False, "stdout": "0\n", "stderr": ""},
+            0,
+            id="predicate-with-stdout",
+        ),
+        # grep -q / a grep with no match.
+        pytest.param(
+            "success",
+            {"exit_code": 1, "timed_out": False, "stdout": "", "stderr": ""},
+            0,
+            id="silent-predicate",
+        ),
+        pytest.param("success", {"exit_code": 0, "stdout": "ok", "stderr": ""}, 0, id="exit-0"),
+        pytest.param("success", {"status_code": 404}, 0, id="no-exit-code"),
+        pytest.param("success", None, 0, id="no-artifact"),
+        pytest.param(
+            "error", {"exit_code": 2, "stdout": "", "stderr": "x"}, 1, id="error-counted-once"
+        ),
+    ],
+)
+def test_tool_errors_count_non_zero_exit_codes(status: str, artifact: object, counted: int) -> None:
+    """B-226 — a script's non-zero exit is a ``status="success"`` tool result whose meta
+    (``artifact``) carries the exit code; ``requires_tool_error`` must still see it."""
+    turn = TurnBuilder(1)
+    message = {
+        "type": "tool",
+        "name": "bash",
+        "status": status,
+        "content": "x",
+        "artifact": artifact,
+    }
+    turn.on_frame("updates", json.dumps({"tools": {"messages": [message]}}))
+    turn.on_frame("end", json.dumps({"status": "success", "run_id": "r1"}))
+
+    assert turn.result(0.0).tool_errors == counted
 
 
 @pytest.mark.asyncio

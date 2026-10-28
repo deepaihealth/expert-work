@@ -267,6 +267,10 @@ class SpawnWorkerTool:
                     f"({budget.max_per_run}); complete the work with the results you have]"
                 ),
                 meta={"spawn_worker_blocked": True, "reason": "per_run_budget"},
+                # B-226 ③ — neutral: the budget only grows, so nothing in this run could
+                # settle the refusal, and its text tells the model to finish without one.
+                failed=True,
+                failure_transient=True,
             )
 
         # Minor — if the gate below refuses this delegation, the per-run
@@ -307,6 +311,9 @@ class SpawnWorkerTool:
                             "saturated; retry later or complete the work without delegating]"
                         ),
                         meta={"delegation_gated": True, "reason": "global_gate_timeout"},
+                        # B-226 ③ — a saturated gate is retry-later jitter.
+                        failed=True,
+                        failure_transient=True,
                     )
             try:
                 child = await self.builder(

@@ -950,6 +950,12 @@ class MCPTool:
             # Stream CM-5: middle-trimmed MCP output is otherwise
             # unrecoverable — carry the full text for externalization.
             full_content=result.content if truncated else None,
+            # B-226 ③ — the server's own ``isError`` is a failure. On a tool the server
+            # marks read-only (``readOnlyHint``) it is neutral, like a native read-only
+            # failure (B-164): a failed lookup is not undone work, nor a success that
+            # settles an earlier failure. The spec / scheduler do not read the hint.
+            failed=result.is_error,
+            failure_transient=result.is_error and self.tool_def.read_only is True,
         )
 
 
