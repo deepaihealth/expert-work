@@ -72,6 +72,9 @@ from control_plane.knowledge.recognition.recognizer import (
     ERROR_CREDENTIAL_MISSING,
     ERROR_NOT_CONFIGURED,
     ApiKeySource,
+    BatchGuard,
+    CallCheckpoint,
+    CheckedSlot,
     DocumentRecognizer,
     ModelChoice,
     ModelLimits,
@@ -81,6 +84,7 @@ from control_plane.knowledge.recognition.recognizer import (
     cache_key,
     model_concurrency,
 )
+from control_plane.knowledge.stale import StaleIngestionError
 from expert_work.persistence.knowledge.base import (
     ClaimedIngestion,
     KnowledgeStore,
@@ -159,6 +163,7 @@ class _Document:
     kb_id: UUID
     document_id: UUID
     language: Language
+    checkpoint: CallCheckpoint = field(default_factory=lambda: CallCheckpoint(None))
 
 
 @dataclass(frozen=True)
@@ -291,15 +296,19 @@ class FigureDescriber:
         document_id: UUID,
         extraction: FigureExtraction,
         language: Language,
+        before_call: BatchGuard | None = None,
     ) -> FigureOutcome:
         """Describe the document's figures (see module doc); never raises for
-        one figure going wrong."""
+        one figure going wrong. ``before_call`` runs before each model call
+        and raises to stop (B-222: the document was cancelled or is no longer
+        this worker's) — the calls under way finish, no other one starts, and
+        its error is raised."""
         candidates = extraction.candidates
         hashes = tuple(c.pixel_hash for c in candidates)
         others = await self._other_documents(tenant_id, document_id, hashes)
         selection = select_figures(candidates, others)
         engines = await self._engines(tenant_id) if selection.kept else ()
-        document = _Document(tenant_id, kb_id, document_id, language)
+        document = _Document(tenant_id, kb_id, document_id, language, CallCheckpoint(before_call))
         described, statuses = await self._describe_all(document, selection.kept, engines)
         texts = await self._figure_texts(document, selection.kept, described, engines)
         blocks: dict[int, str] = {}
@@ -416,6 +425,8 @@ class FigureDescriber:
     async def _read_texts(
         self, document: _Document, figures: Sequence[FigureCandidate]
     ) -> dict[int, str]:
+        """The text of text-heavy figures; the checkpoint is passed before each
+        recognition model call (B-222) and a refusal is raised."""
         if self._recognizer is None:
             return {}
         try:
@@ -429,7 +440,10 @@ class FigureDescriber:
                 images={f.number: f.image for f in figures},
                 render=figure_images.render_params(),
                 kind="figure_ocr",
+                checkpoint=document.checkpoint,
             )
+        except StaleIngestionError:
+            raise
         except Exception:
             logger.warning("knowledge.figure_text_failed", exc_info=True)
             return {}
@@ -510,11 +524,14 @@ class FigureDescriber:
                     keys[figure.number],
                     cached,
                 )
-            except Exception:
+            except Exception as exc:
+                if exc is document.checkpoint.refusal:
+                    return _Answer(None, "pending")  # stopped: raised below
                 logger.exception("knowledge.figure_failed document=%s", document.document_id)
                 return _Answer(None, "failed")
 
         answers = await asyncio.gather(*(answer(figure) for figure in figures))
+        document.checkpoint.stop_if_refused()
         return dict(zip((f.number for f in figures), answers, strict=True))
 
     async def _ask(
@@ -549,8 +566,9 @@ class FigureDescriber:
                 engine.choice, engine.api_key, ask.prompt, ask.user_text, ask.max_tokens
             )
             slot = self._limits.slot(engine.choice, model_concurrency(engine.choice))
+            checked = CheckedSlot(slot, document.checkpoint)
             try:
-                reading = await read_with_retry(client, image, sleep=self._sleep, limit=slot)
+                reading = await read_with_retry(client, image, sleep=self._sleep, limit=checked)
             except RecognitionCallError as exc:
                 logger.warning(
                     "knowledge.figure_call_failed model=%s kind=%s detail=%s",

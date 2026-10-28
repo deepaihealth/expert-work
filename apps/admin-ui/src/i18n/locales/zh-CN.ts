@@ -649,6 +649,16 @@ const zhCN: TranslationKeys = {
     settings_saved: "设置已保存。",
     settings_rename_note: "不支持重命名——智能体按名称引用知识库。",
     settings_embedding_title: "Embedding",
+    // ── B-222：入库中可取消 ──
+    status_cancelled: "已取消",
+    status_cancelled_hint: "入库已取消。可以重新入库；已识别的页和图片不会再次计费。",
+    pending_cancelled_hint: "新上传的版本已取消入库；检索仍使用上一版。可以重新入库，或丢弃新版。",
+    cancel_ingest: "取消入库",
+    cancel_ingest_confirm_title: "取消「{{name}}」的入库？",
+    cancel_ingest_confirm_body: "最迟在当前这一批处理完后停止。已识别的页和图片会保留，之后重新入库不会再次计费；如有上一版，继续生效。",
+    cancel_ingest_done: "已取消入库",
+    cancel_ingest_not_cancellable: "该文档已在写入结果（即将完成）或已结束，无法再取消，已刷新列表。",
+    cancel_ingest_not_found: "该文档已不存在（可能已被删除），已刷新列表。",
   },
   rate_card_page: {
     page_title: "模型定价",

@@ -23,8 +23,8 @@ pytestmark = pytest.mark.integration
 ALEMBIC_INI = Path(__file__).resolve().parent.parent / "alembic.ini"
 _DB = "migration_0178_test"
 _REVISION = "0178_run_unresolved_failures"
-# Mirrors the migration's ``down_revision`` (see the chain note there).
-_BEFORE = "0175_kb_k1_parent_chunks"
+# Mirrors the migration's ``down_revision``.
+_BEFORE = "0177_kb_retrieval_log"
 
 
 def _sync_dsn(container: PostgresContainer, database: str | None = None) -> str:

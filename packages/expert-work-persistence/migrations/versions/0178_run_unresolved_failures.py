@@ -14,7 +14,7 @@ every run before this column); ``[]`` = no unresolved failure. Backfilling ``[]`
 would claim "nothing failed" for runs nobody looked at.
 
 Revision ID: 0178_run_unresolved_failures
-Revises: 0175_kb_k1_parent_chunks (see the note on ``down_revision``)
+Revises: 0177_kb_retrieval_log
 """
 
 from __future__ import annotations
@@ -26,10 +26,7 @@ from alembic import op
 from sqlalchemy.dialects import postgresql
 
 revision: str = "0178_run_unresolved_failures"
-# Chain note: the merge target is ``0177_kb_retrieval_log`` (PR #1955, not yet on
-# main). This branch is based on a main that ends at ``0175_kb_k1_parent_chunks``,
-# so it points there for the local migration tests; repoint before merging.
-down_revision: str | Sequence[str] | None = "0175_kb_k1_parent_chunks"
+down_revision: str | Sequence[str] | None = "0177_kb_retrieval_log"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 

@@ -26,6 +26,10 @@ from expert_work.persistence.auth import (
     SqlServiceAccountStore,
 )
 from expert_work.persistence.feedback_store import DbFeedbackStore, InMemoryFeedbackStore
+from expert_work.persistence.knowledge import (
+    InMemoryKnowledgeRetrievalLogStore,
+    SqlKnowledgeRetrievalLogStore,
+)
 from expert_work.persistence.quota import (
     InMemoryTenantQuotaStore,
     InMemoryTokenReservationStore,
@@ -70,6 +74,7 @@ def test_memory_backend_uses_in_memory_stores() -> None:
     assert isinstance(app.state.token_reservation_repo, InMemoryTokenReservationStore)
     assert isinstance(app.state.tenant_config_repo, InMemoryTenantConfigStore)
     assert isinstance(app.state.audit_logger._store, InMemoryAuditLogStore)
+    assert isinstance(app.state.knowledge_retrieval_log_store, InMemoryKnowledgeRetrievalLogStore)
 
 
 @pytest.mark.asyncio
@@ -92,6 +97,8 @@ async def test_sql_backend_wires_every_store() -> None:
         assert isinstance(app.state.token_reservation_repo, SqlTokenReservationStore)
         assert isinstance(app.state.tenant_config_repo, SqlTenantConfigStore)
         assert isinstance(app.state.audit_logger._store, SqlAuditLogStore)
+        # B-175 P2-PR4.
+        assert isinstance(app.state.knowledge_retrieval_log_store, SqlKnowledgeRetrievalLogStore)
     finally:
         await app.state.db_engine.dispose()
 

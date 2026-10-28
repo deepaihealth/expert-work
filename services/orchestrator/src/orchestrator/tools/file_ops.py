@@ -48,6 +48,7 @@ from pathlib import PurePosixPath
 from typing import Any, NoReturn
 from uuid import UUID
 
+from expert_work.persistence import SANDBOX_SKILLS_ROOT
 from orchestrator.tools.locks import NullWorkspaceLock, WorkspaceLock
 from orchestrator.tools.registry import (
     ToolBlockedError,
@@ -101,6 +102,17 @@ _MAX_WRITE_CHARS = 10 * 1024 * 1024
 #: Largest number of directory entries ``list_dir`` returns (sorted prefix;
 #: sets ``truncated`` when exceeded).
 _MAX_LIST_ENTRIES = 1000
+
+
+#: B-225 —— skill files are seeded outside the workspace, under
+#: ``SANDBOX_SKILLS_ROOT``; models reach for them with ``../opt/skills/…``. The
+#: rejection names the two ways that work, so the next call does not guess.
+_SKILLS_SEGMENT = SANDBOX_SKILLS_ROOT.lstrip("/") + "/"
+_SKILLS_PATH_HINT = (
+    ". Skill files are outside the workspace: load one with "
+    "skill_view(skill_name, path), or read or run it with bash under "
+    "$EXPERT_WORK_SKILLS_DIR/<skill name>/."
+)
 
 
 class FileOpError(RuntimeError):
@@ -158,6 +170,8 @@ def _require_path(
         cleaned = cleaned[len(EXEC_VIEW) + 1 :]
     if cleaned.startswith("/") or ".." in PurePosixPath(cleaned).parts:
         msg = f"{tool} path must be a relative workspace path without '..': {raw!r}"
+        if _SKILLS_SEGMENT in raw:
+            msg += _SKILLS_PATH_HINT
         raise ValueError(msg)
     # B-50 —— ``agents/`` 是布局的保留段,绑了 agent 的调用一律不许拿它寻址。
     # 不拒的话迁移期读回落正好把 ``agents/<别人的 key>/x`` 办成一次合法的跨 agent

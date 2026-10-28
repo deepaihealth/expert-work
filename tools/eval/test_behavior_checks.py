@@ -81,6 +81,9 @@ def test_final_text_checks() -> None:
     assert not _one({"type": "final_text_not_contains", "any": ["A="]}, rec)[0]
     assert _one({"type": "final_text_regex", "pattern": r"A=\d+\.\d"}, rec)[0]
     assert not _one({"type": "final_text_regex", "pattern": r"C=\d"}, rec)[0]
+    assert _one({"type": "final_text_not_regex", "pattern": r"C=\d"}, rec)[0]
+    ok, detail = _one({"type": "final_text_not_regex", "pattern": r"A=\d+"}, rec)
+    assert not ok and "A=104" in detail
 
 
 def test_artifact_exists_glob_across_turns() -> None:
@@ -215,6 +218,7 @@ def test_required_files_dedupes_in_order() -> None:
         "final_text_contains",
         "final_text_not_contains",
         "final_text_regex",
+        "final_text_not_regex",
         "artifact_exists",
         "artifact_contains",
         "artifact_not_contains",
@@ -227,6 +231,7 @@ def test_required_files_dedupes_in_order() -> None:
         "tool_not_used",
         "tool_count_max",
         "tool_not_used_on",
+        "tool_arg_contains",
         "turn_tokens_max",
     ],
 )
@@ -285,3 +290,68 @@ def test_workspace_file_line_count() -> None:
     ok, detail = _one(_line_count(r"^a,", 2), rec, {("workspace", "r.md"): None})
     assert not ok and "not found" in detail
     assert required_files(_case([_line_count("x", 1)])) == [("workspace", "r.md")]
+
+
+def _bases_check(**kw: Any) -> dict[str, Any]:
+    return {
+        "type": "tool_arg_contains",
+        "tool": "knowledge_search",
+        "arg": "bases",
+        "any_of": ["K2", "specs"],
+        **kw,
+    }
+
+
+def _searches(*args: dict[str, Any], turn: int = 1) -> TurnRecord:
+    calls = [ToolCall(turn=turn, name="knowledge_search", args=a) for a in args]
+    return _turn(turn, tool_calls=[ToolCall(turn=turn, name="update_plan"), *calls])
+
+
+def test_tool_arg_contains_first_call() -> None:
+    """B-175 P4 —— 第一次检索就把 bases 传对(按句柄或库名,列表或单个字符串都算)。"""
+    for bases in (["K2"], ["k2"], ["K1", "K2"], ["specs"], "K2"):
+        rec = _record(_searches({"query": "q", "bases": bases}))
+        assert _one(_bases_check(), rec)[0], bases
+    # 第一次没传 bases、第二次才传:call=first 不过, call=any 过
+    rec = _record(_searches({"query": "q"}, {"query": "q", "bases": ["K2"]}))
+    ok, detail = _one(_bases_check(), rec)
+    assert not ok and "None" in detail
+    assert _one(_bases_check(call="any"), rec)[0]
+    # 传错了库
+    ok, detail = _one(_bases_check(), _record(_searches({"query": "q", "bases": ["K1"]})))
+    assert not ok and "K1" in detail
+    # 根本没检索
+    ok, detail = _one(_bases_check(), _record(_turn()))
+    assert not ok and "knowledge_search not called" in detail
+
+
+def test_tool_arg_contains_none_of_rejects_searching_everything() -> None:
+    """选了所有库也「含」K2:none_of 把它判不过。"""
+    check = _bases_check(none_of=["K1", "K3", "warranty", "hr"])
+    assert _one(check, _record(_searches({"query": "q", "bases": ["K2"]})))[0]
+    ok, detail = _one(check, _record(_searches({"query": "q", "bases": ["K1", "K2", "K3"]})))
+    assert not ok and "K3" in detail
+    assert not _one(check, _record(_searches({"query": "q", "bases": ["specs", "hr"]})))[0]
+
+
+def test_tool_arg_contains_judges_accepted_calls_only() -> None:
+    """工具拒了的调用(没绑定的库、大小写不对的库名)不算选对;句柄不分大小写、库名区分,与工具一致。"""
+    refused = ToolCall(
+        turn=1, name="knowledge_search", args={"bases": ["SPECS"]}, id="c1", error=True
+    )
+    accepted = ToolCall(turn=1, name="knowledge_search", args={"bases": ["K2"]}, id="c2")
+    rec = _record(_turn(1, tool_calls=[refused, accepted]))
+    assert _one(_bases_check(), rec)[0]  # 第一次被接受的调用是 c2
+    ok, detail = _one(_bases_check(), _record(_turn(1, tool_calls=[refused])))
+    assert not ok and "not called" in detail
+    wrong_case = ToolCall(turn=1, name="knowledge_search", args={"bases": ["SPECS"]})
+    assert not _one(_bases_check(), _record(_turn(1, tool_calls=[wrong_case])))[0]
+
+
+def test_tool_arg_contains_scoped_to_a_turn() -> None:
+    rec = _record(
+        _searches({"query": "q", "bases": ["K1"]}, turn=1),
+        _searches({"query": "q", "bases": ["K2"]}, turn=2),
+    )
+    assert not _one(_bases_check(), rec)[0]
+    assert _one(_bases_check(turn=2), rec)[0]

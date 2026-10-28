@@ -131,6 +131,21 @@ async def test_lifespan_memory_checkpointer_uses_allowlisted_serde() -> None:
     assert unregistered == []
 
 
+@pytest.mark.asyncio
+async def test_lifespan_wires_the_knowledge_store_into_the_runtime() -> None:
+    """B-175 P4 — the build cache key's catalog fingerprint must read the store
+    the builds read the catalog from (the knowledge retriever's)."""
+    app = create_app(
+        settings=Settings(checkpointer_backend="memory"),
+        jwt_verifier=build_test_jwt_verifier(),
+        enable_reaper=False,
+    )
+    async with app.router.lifespan_context(app):
+        runtime = app.state.agent_runtime
+        assert runtime.knowledge_store is not None
+        assert runtime.knowledge_store is app.state.knowledge_retriever.store
+
+
 # ---------------------------------------------------------------------------
 # ToolEnv / MiddlewareEnv backends (PR1.5)
 # ---------------------------------------------------------------------------

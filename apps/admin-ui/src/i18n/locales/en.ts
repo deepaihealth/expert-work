@@ -632,6 +632,16 @@ export interface TranslationKeys {
     settings_saved: string;
     settings_rename_note: string;
     settings_embedding_title: string;
+    // ── B-222: cancel an ingest in progress ──
+    status_cancelled: string;
+    status_cancelled_hint: string;
+    pending_cancelled_hint: string;
+    cancel_ingest: string;
+    cancel_ingest_confirm_title: string;
+    cancel_ingest_confirm_body: string;
+    cancel_ingest_done: string;
+    cancel_ingest_not_cancellable: string;
+    cancel_ingest_not_found: string;
   };
   rate_card_page: {
     page_title: string;
@@ -4034,6 +4044,16 @@ const en: TranslationKeys = {
     settings_rename_note:
       "Renaming is not supported — agents reference a base by name.",
     settings_embedding_title: "Embedding",
+    // ── B-222: cancel an ingest in progress ──
+    status_cancelled: "Cancelled",
+    status_cancelled_hint: "The ingest was cancelled. Re-ingest to run it again; pages and pictures already recognized are not billed again.",
+    pending_cancelled_hint: "The ingest of the newly uploaded version was cancelled; retrieval still uses the previous version. Re-ingest it, or discard the new version.",
+    cancel_ingest: "Cancel ingest",
+    cancel_ingest_confirm_title: "Cancel the ingest of \"{{name}}\"?",
+    cancel_ingest_confirm_body: "It stops after the batch in progress at the latest. Pages and pictures already recognized are kept, so re-ingesting later does not bill them again; a previous version, if any, stays in use.",
+    cancel_ingest_done: "Ingest cancelled",
+    cancel_ingest_not_cancellable: "This document is already writing its results (about to finish) or has finished, so it can no longer be cancelled. The list was refreshed.",
+    cancel_ingest_not_found: "This document no longer exists (it may have been deleted). The list was refreshed.",
   },
   rate_card_page: {
     page_title: "Model Pricing",
