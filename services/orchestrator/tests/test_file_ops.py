@@ -1251,6 +1251,32 @@ async def test_require_path_rejects_bad_paths(bad: str) -> None:
 
 
 @pytest.mark.parametrize(
+    "raw",
+    [
+        "../opt/skills/agent-75d8d8ad/report/scripts/export_pdf.py",
+        "/opt/skills/agent-75d8d8ad/report/SKILL.md",
+        "/workspace/../opt/skills/agent-75d8d8ad/report/assets/t.html",
+    ],
+)
+async def test_a_rejected_skills_path_points_to_skill_view_and_bash(raw: str) -> None:
+    # B-225 —— skill files sit outside the workspace; a model that reaches for
+    # them through read_file learns the two ways that work in the same reply.
+    with pytest.raises(ValueError) as rejected:
+        await ReadFileTool(store=_store()).call({"path": raw}, ctx=_ctx())
+    message = str(rejected.value)
+    assert message.startswith("read_file path must be a relative workspace path without '..'")
+    assert "skill_view" in message
+    assert "$EXPERT_WORK_SKILLS_DIR" in message
+
+
+@pytest.mark.parametrize("raw", ["../escape", "/etc/passwd", "/workspace/../etc/passwd"])
+async def test_other_rejected_paths_carry_no_skills_hint(raw: str) -> None:
+    with pytest.raises(ValueError) as rejected:
+        await ReadFileTool(store=_store()).call({"path": raw}, ctx=_ctx())
+    assert "skill_view" not in str(rejected.value)
+
+
+@pytest.mark.parametrize(
     ("raw", "expected_rel"),
     [
         # Models routinely anchor at the documented sandbox root — folded to

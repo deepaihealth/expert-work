@@ -1223,3 +1223,10 @@ PY
 - [x] **57.1 租户导入**:控制台「技能」→ 导入 `/tmp/skill57.zip`。判据:导入成功,技能文件列表里有 `assets/reference.pdf`。**没修好时**:400「invalid skill package」。 **10-27 测试 `e90903f7e` 过**:`POST /v1/skills/import` 201,版本 1 的文件列表是 `["assets/reference.pdf"]`(导入后是草稿,启用后才能挂到智能体)。
 - [x] **57.2 平台技能导入**:平台技能页导入同一个包。判据:导入成功。**没修好时**:400,提示「disallowed file type」。 **10-27 测试 `e90903f7e` 过**:`POST /v1/platform/skills/import` 201。
 - [x] **57.3 沙箱读得到**:调试台给一个智能体挂上 57.1 导入的技能,问「技能里那份 PDF 有几页」。判据:智能体在沙箱里读到 `assets/reference.pdf`,答 2 页。测完删掉两处导入的技能。 **10-27 测试 `e90903f7e` 过**(glm-5.3):智能体在 `$EXPERT_WORK_SKILLS_DIR/skill57-pdf-check/assets/` 下看到 `reference.pdf`,用 pypdf 读出 2 页,回答「共 2 页」。两处导入的技能已归档(没有硬删除接口),临时智能体已删。
+
+## §TBD-B225 read_file 碰到技能目录时报错给出读法(ROADMAP B-225)
+
+**背景**:技能文件在沙箱的 `$EXPERT_WORK_SKILLS_DIR`(`/opt/skills/<agent_key>/`)下,不在工作区;`read_file` 只读工作区,碰到 `../opt/skills/…` 会拒。改动后,拒绝含 `opt/skills/` 的路径时,报错末尾多一句「用 skill_view(skill_name, path) 读,或在 bash 里到 `$EXPERT_WORK_SKILLS_DIR/<技能名>/` 下读或运行」;其它被拒路径的报错不变。
+
+- [ ] **B225.1 技能路径给出读法**:调试台用一个挂了任意技能的智能体,让它「用 read_file 读 `../opt/skills/` 下这个技能的 SKILL.md」。判据:工具结果是 `[tool error] ValueError: read_file path must be a relative workspace path without '..': …`,并且后面带 `skill_view` 和 `$EXPERT_WORK_SKILLS_DIR` 的提示;下一步模型改用 skill_view 或 bash 读到。**没修好时**:报错只有前半句,没有读法提示。
+- [ ] **B225.2 其它路径不变**:同一个智能体让它 read_file `../etc/passwd`。判据:报错只有原来那半句,不含 `skill_view`。**没修好时**:无关路径也带上技能提示。
