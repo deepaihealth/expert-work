@@ -300,7 +300,7 @@ GET /v1/agents/{agent_code}/runs
 | `superseded_by` | string（UUID） \| null | 取代这一轮的新 `run_id`；没有被取代时是 `null`。含义见 [2.10 重新生成与编辑重发](./chat#_2-10-重新生成与编辑重发) |
 | `regenerated_from` | string（UUID） \| null | 这一轮是对哪一轮的重新生成或者编辑重发；不是重来的一轮时是 `null` |
 | `completed` | boolean \| null | 这次 run 有没有把要做的事做成，与 [3.4 的 `end`](./sse-events#end) 里的同名字段相同。`null` 表示没有记录，多见于失败、被取消、还没结束的 run 与平台升级前的历史 run，不要当成 `false` |
-| `exit_reason` | string \| null | 这次 run 从哪个出口结束，`null` 的含义与 `completed` 相同。取值：`text_response`（助手自然说完）/ `max_steps`（步数用完）/ `no_progress`（连续多步没有进展）/ `token_budget`（token 预算用完）/ `approval_pending`（停在人工审批处）/ `approval_rejected`（审批被拒绝）；遇到不认识的取值时按「没有正常完成」处理 |
+| `exit_reason` | string \| null | 这次 run 从哪个出口结束，`null` 的含义与 `completed` 相同。取值：`text_response`（助手自然说完）/ `max_steps`（步数用完）/ `no_progress`（反复原地打转）/ `token_budget`（token 预算用完）/ `approval_pending`（停在人工审批处）/ `approval_rejected`（审批被拒绝）；遇到不认识的取值时按「没有正常完成」处理 |
 | `unresolved_failures` | array \| null | 因为工具失败没做成时，是哪些工具。元素结构与 [3.4 的 `end`](./sse-events#end) 里的同名字段相同（`{tool, kind}`，最多 20 个）；`[]` 表示没有。`null` 表示没有记录，按「不清楚」处理，平台升级前的历史 run 可能 `completed` 有值而这里是 `null` |
 
 `status` 说的是这次 run 怎么结束的，`completed` 说的是要做的事做成了没有，`unresolved_failures` 说的是因为工具失败没做成时，是哪些工具。步数用完的 run 是 `status` 为 `incomplete`、`completed` 为 `false`，读法见 [3.4 的 `end`](./sse-events#end)。没有记录时，这三个字段在 `end` 事件里不出现，在这里是 `null`。
@@ -358,7 +358,7 @@ curl "https://<your-domain>/v1/agents/{agent_code}/runs?user_id=u-123&limit=20" 
 | `queued` | 已进入队列，还没有实例开始执行 | 否 | 继续等待，或者接上这次 run 的事件流 |
 | `running` | 正在执行 | 否 | 继续等待，或者接上这次 run 的事件流 |
 | `success` | 执行完毕，没有出错，也没有被平台的限制叫停。要做的事有没有做成看 `completed` | 是 | 按正常结果处理；`completed` 为 `false` 时提示这一轮没有做完 |
-| `incomplete` | 被平台的一道限制叫停：步数或 token 预算用完，或者连续多步没有进展。`exit_reason` 指出是哪一道 | 是 | 按没有做完处理，回答照常显示 |
+| `incomplete` | 被平台的一道限制叫停：步数或 token 预算用完，或者反复原地打转。`exit_reason` 指出是哪一道 | 是 | 按没有做完处理，回答照常显示 |
 | `error` | 执行失败 | 是 | 读 `error` 字段，见下文 |
 | `timeout` | 保留取值，当前不会出现 | 是 | 不需要为它单独写处理分支 |
 | `interrupted` | 被调用方取消，或者等待审批期间同一会话里发起了新一轮（见 [4.2 决策之前发起新一轮](./run-control#决策之前发起新一轮)） | 是 | 视为调用方自己中止的结果 |

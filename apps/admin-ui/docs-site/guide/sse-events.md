@@ -735,7 +735,7 @@ function onPlan(data) {
 
 只有 `success` 表示子任务完成了交给它的工作，其余取值都不要显示成成功。
 
-- `max_steps`：叫停它的限制可能是子任务自己的步数上限、这次 run 的 token 预算、连续多步没有进展，或这次 run 的时间上限。带回的是部分结果，父 Agent 会带着它继续推理。
+- `max_steps`：叫停它的限制可能是子任务自己的步数上限、这次 run 的 token 预算、反复原地打转，或这次 run 的时间上限。带回的是部分结果，父 Agent 会带着它继续推理。
 - `cancelled`：执行中被取消、出现意外错误，或者结束时没有给出回答。出现意外错误时这条事件照常发出。
 - `approval_blocked`：子任务里无法发起人工审批，主 Agent 会收回这部分工作。
 
@@ -1193,12 +1193,12 @@ Agent 产生的文件分两种去向：一种直接写进这个终端用户的**
 | 取值 | 含义 | 客户端处理 |
 |---|---|---|
 | `success` | 这一轮跑完了，没有出错，也没有被平台的限制叫停。要做的事有没有做成，看 `completed` | 显示最终回答；`completed` 为 `false` 时同时提示这一轮没有做完 |
-| `incomplete` | 被平台的一道限制叫停：步数或 token 预算用完，或者连续多步没有进展。`exit_reason` 是 `max_steps`、`token_budget`、`no_progress` 之一，`completed` 恒为 `false` | 显示助手收尾时给出的回答，同时提示这一轮没有做完 |
+| `incomplete` | 被平台的一道限制叫停：步数或 token 预算用完，或者反复原地打转。`exit_reason` 是 `max_steps`、`token_budget`、`no_progress` 之一，`completed` 恒为 `false` | 显示助手收尾时给出的回答，同时提示这一轮没有做完 |
 | `paused` | 停在人工审批点等待决策。这不是失败，批准或拒绝之后这一轮对话还会继续 | 显示审批界面，前面的 `approval` 事件已经给了全部信息；不要按错误显示 |
 | `interrupted` | run 被中断，例如调用方主动取消。取消不会另外发 `error` 事件 | 按「已取消」处理，不必重试 |
 | `error` | 执行失败，包括执行出错和超时 | 按失败处理，细节见 [8 错误码总表](./errors) |
 
-平台在步数或 token 预算用完、连续多步没有进展时让助手收尾，用户仍会拿到一段完整回答，这一轮的 `status` 是 `incomplete`，`completed` 是 `false`，`exit_reason` 指出是哪一道限制。**`status` 说的是这一轮怎么结束的，`completed` 说的是要做的事做成了没有，`unresolved_failures` 说的是因为工具失败没做成时，是哪些工具**，判断方式见下一小节。`incomplete` 的 run 在 webhook 里照常发 `run.completed` 事件，不新增事件类型，推送内容里的 `status` 同样是 `incomplete`。
+平台在步数或 token 预算用完、反复原地打转时让助手收尾，用户仍会拿到一段完整回答，这一轮的 `status` 是 `incomplete`，`completed` 是 `false`，`exit_reason` 指出是哪一道限制。**`status` 说的是这一轮怎么结束的，`completed` 说的是要做的事做成了没有，`unresolved_failures` 说的是因为工具失败没做成时，是哪些工具**，判断方式见下一小节。`incomplete` 的 run 在 webhook 里照常发 `run.completed` 事件，不新增事件类型，推送内容里的 `status` 同样是 `incomplete`。
 
 `end` 的取值是由平台内部的结束原因收敛而来的：内部的「被取消」和「中断」都归为 `interrupted`，内部的「超时」归为 `error`，正常结束但出口是平台限制的归为 `incomplete`。run 记录里的状态（见 [5.4 run 列表](./query#_5-4-run-列表)）分得比这五个细，所以同一次 run 在两个地方看到不同的字样是正常的。
 
