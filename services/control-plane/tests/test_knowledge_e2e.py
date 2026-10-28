@@ -9,6 +9,7 @@ regardless of the (hash-based) test embedder.
 
 from __future__ import annotations
 
+import re
 from uuid import uuid4
 
 import pytest
@@ -54,7 +55,8 @@ async def test_ingest_then_knowledge_search_round_trip() -> None:
     result = await tool.call({"query": "deductible"}, ctx=ToolContext(tenant_id=tenant))
 
     assert "deductible" in result.content
-    # Source attribution + the chunker's heading-path prefix survive.
-    assert "[handbook.md#" in result.content
+    # Source attribution (B-206 K-2: the document's number + chunk, then its
+    # file name) + the chunker's heading-path prefix survive.
+    assert re.search(r"\[D1#\d+\] handbook\.md\n", result.content)
     assert "[Section: Benefits" in result.content
     assert result.meta["hits"] >= 1

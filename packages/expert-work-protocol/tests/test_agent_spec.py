@@ -551,7 +551,15 @@ def test_subagent_name_colliding_with_builtin_tool_rejected() -> None:
 
 @pytest.mark.parametrize(
     "reserved",
-    ["spawn_worker", "update_plan", "skill_view", "find_tools", "knowledge_search", "ask_image"],
+    [
+        "spawn_worker",
+        "update_plan",
+        "skill_view",
+        "find_tools",
+        "knowledge_search",
+        "knowledge_read",
+        "ask_image",
+    ],
 )
 def test_subagent_name_colliding_with_implicit_tool_rejected(reserved: str) -> None:
     """隐式注册的平台工具名(manifest 里从不声明)是保留字。

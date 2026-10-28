@@ -113,7 +113,7 @@ async def test_a_chosen_base_returns_only_its_passages() -> None:
     store, tenant = await _seed(["a", "b"])
     tool, _ = _tool(store, ("a", "b"))
     content, meta = await _call(tool, tenant, bases=["K2"])
-    assert "[b.md#0]" in content and "[a.md#0]" not in content
+    assert "[D2#0] b.md" in content and "a.md" not in content
     assert meta["bases"] == ["b"]
 
 
@@ -124,7 +124,7 @@ async def test_no_bases_searches_every_base(args: dict[str, Any]) -> None:
     tool, retriever = _tool(store, ("a", "b"))
     content, meta = await _call(tool, tenant, **args)
     assert retriever.searched == [("a", "b")]
-    assert "[a.md#0]" in content and "[b.md#0]" in content
+    assert "[D1#0] a.md" in content and "[D2#0] b.md" in content
     assert "bases" not in meta
 
 

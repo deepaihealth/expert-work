@@ -393,6 +393,24 @@ class KnowledgeStore(abc.ABC):
         loop (e.g. retrieval attribution — an N+1 over the result's documents)."""
 
     @abc.abstractmethod
+    async def get_document_by_seq(
+        self, *, tenant_id: UUID, doc_seq: int
+    ) -> KnowledgeDocument | None:
+        """The tenant's document ``D{doc_seq}`` (B-206 K-2), or ``None``. The
+        number is tenant-wide: the caller checks the base."""
+
+    @abc.abstractmethod
+    async def find_documents_by_name(
+        self, *, tenant_id: UUID, kb_ids: Sequence[UUID], name: str, limit: int
+    ) -> list[KnowledgeDocument]:
+        """The documents of ``kb_ids`` whose file name or title contains
+        ``name``, case-insensitively and literally (no wildcards) — those whose
+        file name or title *is* ``name`` first, then by ``doc_seq``; at most
+        ``limit`` (B-206 K-2: ``knowledge_read`` finding a document by name).
+        Case folding is the database's ``lower()`` / Python's ``str.lower()``,
+        which agree outside a few non-Latin special cases."""
+
+    @abc.abstractmethod
     async def get_document_content(self, *, tenant_id: UUID, document_id: UUID) -> bytes | None:
         """The document's retained original bytes, or ``None`` (legacy rows /
         unknown id)."""

@@ -1385,3 +1385,51 @@ PY
 - [ ] **63.4 重新入库,已识别的页不再付费**:对 63.2 的文档点「重新摄取」。判据:ready、`page_stats.pages_ocr=40`;`GET …/documents/{id}/pages` 里 63.2 已识别的页 `cached=true`;新增 glm-ocr 用量行数 = 40 − 63.2 ③ 的缓存页数。**没修好时**:取消时把识别缓存删了,40 页重新付费。
 - [ ] **63.5 已结束的不能取消 + 只读置灰**:对 63.4 那份 ready 文档发 `POST …/documents/cancel`。判据:返回 `not_cancellable`,状态、`ingest_generation` 不变,没有新的 `knowledge:document_cancel` 审计;控制台 ready / 失败 / 已取消的行都没有「取消入库」按钮;别的库的文档 id 返回 `not_found`。正在写分段(`stage=indexing`)的文档取消回 `not_cancellable`、随后照常 ready(窗口只有几秒,真栈不强求撞上,单测与 SQL 并发测试覆盖)。平台管理账号切入其它租户时,入库中的行「取消入库」置灰、悬停提示只读(该租户此刻没有入库中的文档则不可判,单测覆盖)。
 - [ ] **63.6 英文界面**:右上角切 English。判据:按钮提示「Cancel ingest」;确认框「Cancel the ingest of "…"?」;状态标签「Cancelled」,悬停「The ingest was cancelled. Re-ingest to run it again; pages and pictures already recognized are not billed again.」。测完删 `kbb1`。
+
+## §TBD-A2 读文档工具 knowledge_read(B-206 K-2)
+
+**背景**:`knowledge_search` 只给最相关的几段,答案常在相邻那段里,「找全」题还要逐篇核对。新工具 `knowledge_read` 让模型自己决定读多少,与 `knowledge_search` 一起注册:绑了知识库(manifest 有 `knowledge:` 块)才有,没绑的智能体两个都没有、任何工具说明里也不出现;动态 worker 跟着继承的知识库一起拿到(平台 `dynamic_worker_allowed_toolsets` 非空时仍按 `knowledge_search` 一个名字放行或剥掉两个)。`knowledge_search` 每条结果的标头改成 `[D<文档编号>#<段号>] <文件名>`(`#` 后仍是排得最前的小段号;没有编号的老文档仍是 `[<文件名>#<段号>]`);结果被截成命中小段(`[已截断]`)时,围栏外的提示多一句「用 knowledge_read 读这条的编号能拿到整段」;工具说明「找全」那句改成「逐篇用 knowledge_read 读、核对每个条件」。`knowledge_read` 的参数:`document`(`D12` / `D12#7` / 文档编号 / 文件名或标题;文件名后带 `#7` 也认)、`page`(从 1 起)、`section`(标题,或 `A > B` 标题路径)、`find`(几个词,同一段里都要出现、顺序不限、不分大小写全半角和空格)、`context`(`D12#7` 两侧各几段,默认 1、最多 5)、`max_tokens`(每页大小,默认 4,000、范围 4,000~16,000,按平台 o200k 分词器数)。四种读法:按页(一页装到 `max_tokens` 的 80%,至少一整段;超过 16,000 token 的段截断并标 `[已截断]`)、读某段前后(放不下时先丢最外侧)、按章节、文档内查找(每处带前后各一段、每页最多 20 处,零命中给每个词各出现在几段)。每次结果开头是文档信息(`[D12] 文件名`、标题(与文件名不同时)、库名(绑两个以上库时)、上传日期、`metadata` 里的 `version` / `effective_date` / `source`、段数、这次读的位置),每段标 `[D12#7-9]`(该段下的小段号区间,区间里任一号都指这一段)。只能读本智能体绑定的库里的文档:别的库、别的租户、不存在的编号报同一句 `no document D12 in this agent's knowledge bases`;停用的文档与段落读不到(与检索一致);文件名对上几份时列出候选编号、不替模型选。文档重新入库期间读的是正在生效的版本,提示「a newer version of this document is being ingested」。错误与围栏外提示里只有平台文字、数字和 `D` 编号,文件名 / 标题 / 正文 / 库名只在围栏里。工具结果的 `artifact`(调试台原始事件)带 `status / mode / document / args / page / pages / passages[{ref, role, chunk_indexes, tokens, truncated}]`。`knowledge_read` 的结果不外置到工作区(和 `read_file` 一样可重读);跨轮清理(B-126)与轮内清理把旧的读取结果收成一行「`[knowledge_read of D12, page 2 of 9, max_tokens 4000 — content compressed; re-readable via the knowledge_read tool with the same arguments]`」。轨迹面板侧栏(读了哪几页)不在本 PR(随 K-4 另做)。**没有迁移。**
+
+**怎么进**:测试环境控制台(system_admin,平台租户)。看模型输入:Langfuse 里该 run 的 LLM 调用输入(tools 列表、system 消息、工具消息);看工具结果的 `artifact`:调试台原始事件。数据库查询走测试库只读连接。**全节费用约 ¥2~4,不含 A2.12**(嵌入几分钱;glm-5.3 每轮几分钱,A2.11 约 ¥1~3)。**测试文件(零租户内容,本机生成)**:
+
+```bash
+python3 - <<'PY'
+import os
+fill = "这是用于验收读文档工具的说明文字,只描述本段的编号与位置。" * 8
+def long_doc(tag, chapters=6):
+    parts = ["# 验收读文档"]
+    for c in range(1, chapters + 1):
+        parts.append(f"## 第 {c} 章")
+        if c in (2, 5):
+            parts.append("### 注意事项")
+        parts += [f"第 {c} 章第 {p} 段:验收标记 {tag}-{c}-{p}。{fill}" for p in range(1, 9)]
+    return "\n\n".join(parts) + "\n"
+os.makedirs("/tmp/v2", exist_ok=True)
+docs = {
+    "/tmp/kbA2-long.md": long_doc("A2"),
+    "/tmp/v2/kbA2-long.md": long_doc("V2", chapters=60),
+    "/tmp/kba2/kbA2-dup.md": "# 重名文件\n\n重名文件甲库的标记 DUP-A-11。\n",
+    "/tmp/kba2b/kbA2-dup.md": "# 重名文件\n\n重名文件乙库的标记 DUP-B-22。\n",
+    "/tmp/kbA2-secret.md": "# 未绑定的库\n\n验收暗号是 A2-SECRET-77。\n",
+}
+for path, text in docs.items():
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    open(path, "w", encoding="utf-8").write(text)
+PY
+```
+
+建三个临时知识库(默认参数)并上传、等就绪:`kba2`(`/tmp/kbA2-long.md`、`/tmp/kba2/kbA2-dup.md`)、`kba2b`(`/tmp/kba2b/kbA2-dup.md`)、`kba2c`(`/tmp/kbA2-secret.md`,不绑定)。在文档列表记下 `kbA2-long.md` 的编号 `D<n>`、`kbA2-secret.md` 的编号 `D<s>`。建两个临时智能体(不开持久工作区,模型 glm-5.3):`acc-a2` 的 `knowledge: {knowledge_base_refs: [kba2, kba2b]}`;`acc-a2-none` 不绑知识库。
+
+- [ ] **A2.1 绑了知识库才有这个工具**:调试台分别问 `acc-a2`、`acc-a2-none`「你好」。判据:`acc-a2` 的 tools 里有 `knowledge_search` 和 `knowledge_read`(parameters 有 `document / page / section / find / context / max_tokens`,`max_tokens` 的 minimum 4000、maximum 16000);`acc-a2-none` 两个都没有,它的所有工具说明与 system 消息里都没有 `knowledge_read`。**没修好时**:`acc-a2-none` 有 `knowledge_read`,或 `acc-a2` 没有。费用约 ¥0.02。
+- [ ] **A2.2 检索结果带文档编号**:问 `acc-a2`「验收标记 A2-3-4 那一段写了什么」。判据:`knowledge_search` 的结果每条以 `[D<n>#<数字>] kbA2-long.md` 开头;工具说明里有 `read each candidate (knowledge_read)`。**没修好时**:结果仍是 `[kbA2-long.md#数字]`,模型无从得到编号。费用约 ¥0.02。
+- [ ] **A2.3 读一段的前后**:同一会话里说「用 knowledge_read 读 A2.2 结果里那条编号,前后各 2 段」。判据:`knowledge_read` 参数 `document` 是那条编号、`context: 2`;结果第一行 `[D<n>] kbA2-long.md`,第二行含 `uploaded:` 与 `passages:`,第三行 `around D<n>#<k>: 2 passages before, 2 after`;5 段按顺序、中间那段标 `· match`;`artifact.passages` 的 `role` 依次 `context_before, context_before, match, context_after, context_after`。**没修好时**:只返回一段,或没有角色标记,或报错。费用约 ¥0.02。
+- [ ] **A2.4 翻页与超界**:说「用 knowledge_read 从头读 kbA2-long.md 的第 2 页」。判据:结果第三行 `page 2 of N at max_tokens 4000`(记下 N),围栏外提示 `page 2 of N of D<n>; the next page is page=3.`;再说「读第 N+3 页」:报错 `page N+3 is out of range: D<n> has N pages at max_tokens 4000 (valid pages 1..N)`。**没修好时**:超界返回空结果、或报错里没有有效范围。费用约 ¥0.03。
+- [ ] **A2.5 按章节读、同名标题问哪个**:说「用 knowledge_read 读 kbA2-long.md 的第 4 章」。判据:返回的每段都只含 `A2-4-*` 标记,第三行 `section "验收读文档 > 第 4 章": …`;再说「读『注意事项』那一节」:结果 `status=ambiguous`,列出 `验收读文档 > 第 2 章 > 注意事项` 与 `验收读文档 > 第 5 章 > 注意事项`,没有正文,提示说把完整标题路径传给 section。**没修好时**:读出别的章,或同名标题随便读了一个。费用约 ¥0.02。
+- [ ] **A2.6 文档内查找**:说「用 knowledge_read 在 D<n> 里找『A2-5-3 验收』」(两个词、顺序与原文相反)。判据:命中的那段含 `A2-5-3`、标 `· match`,前后各一段(`artifact.passages` 角色 `context_before / match / context_after`);再说「在 D<n> 里找『A2-5-3 不存在的词』」:结果 `status=no_match`,围栏里列出 `a2-5-3: 1 passage`、`不存在的词: 0 passages`,围栏外提示说要每个词都在同一段。**没修好时**:换了词序就找不到,或零命中只回空。费用约 ¥0.03。
+- [ ] **A2.7 按名字读、重名、越权**:说「用 knowledge_read 读 kbA2-dup.md」。判据:`status=ambiguous`,围栏里列出两行 `D<x> · kbA2-dup.md · kba2 · uploaded …` 与 `D<y> · kbA2-dup.md · kba2b · uploaded …`,没有 `DUP-A-11` / `DUP-B-22` 正文;再说「用 knowledge_read 读 D<s>」:报错 `no document D<s> in this agent's knowledge bases`;整个 run 里任何工具结果与回答都没有 `A2-SECRET-77`。**没修好时**:同名时悄悄读了其中一份,或读到了未绑定库的暗号。费用约 ¥0.03。
+- [ ] **A2.8 停用的读不到**:控制台分段抽屉(或 `PATCH …/documents/{id}/passages/{pid}`)停用含 `A2-2-3` 的那段,问 `acc-a2`「用 knowledge_read 读 D<n> 第 1 页到最后一页,找 A2-2-3」。判据:各页都没有 `A2-2-3`,也没有与它同在那一整段(父段,抽屉里看得到)里的其余标记,别的段的标记都在;`passages:` 比停用前少 1;直接读那段的编号(停用前从 A2.2 一类检索里拿到的 `D<n>#<k>`)报错 `D<n> has no readable passage containing #<k> …`。再停用文档 `kba2` 的 `kbA2-dup.md`(`PATCH …/documents/{id}`),读它的编号:报错 `D<x> is switched off in its knowledge base and cannot be read`。测完都启用回来。**没修好时**:停用的段或文档仍读得到。费用约 ¥0.03。
+- [ ] **A2.9 worker 继承**(前提同 §58.7:平台 `dynamic_worker_allowed_toolsets` 为空):给 `acc-a2` 打开动态 worker,问「派一个 worker 用 knowledge_read 读 D<n> 第 1 页,告诉我第一段的标记」,再让它「派 worker 读 D<s>」。判据:worker 的 tools 里有 `knowledge_read`,第一次答出 `A2-1-1`;第二次 worker 的工具结果是 `no document D<s> in this agent's knowledge bases`,没有 `A2-SECRET-77`。**没修好时**:worker 没有这个工具,或读到了未绑定的库。费用约 ¥0.05。
+- [ ] **A2.10 重新入库期间读正在生效的版本**:把 `/tmp/v2/kbA2-long.md` 重新上传到 `kba2`(同名,60 章、标记 `V2-*`,入库要一阵),状态为「处理中」时问 `acc-a2`「用 knowledge_read 读 D<n> 第 1 页」。判据:返回的仍是 `A2-*` 标记,围栏外提示有 `a newer version of this document is being ingested; this is the version in use.`;就绪后再读第 1 页是 `V2-*`、提示里没有那句。入库太快撞不上「处理中」时记「不可判」(单测 `test_a_document_being_ingested_again_reads_the_version_in_use` 覆盖)。**没修好时**:处理中报错或返回空,或新旧标记混在一起。费用约 ¥0.05。
+- [ ] **A2.11 跨轮清理收成重读引用**(在 A2.10 之后做:此时 D<n> 是 60 章的 v2,约 9 万 token):新开一个 `acc-a2` 会话,第 1 轮说「用 knowledge_read 读 D<n> 的第 1 到第 6 页,max_tokens 16000,每页一次调用」(6 个结果、上下文过 3 万 token;跨轮清理保护最近 4 个工具结果),第 2 轮说「你好」。判据:第 2 轮那次 LLM 调用的输入里,第 1 轮最早的两个 `knowledge_read` 工具消息变成 `<tool-result-pruned>` 包着的一行 `[knowledge_read of D<n>, page 1 of …, max_tokens 16000 — content compressed; re-readable via the knowledge_read tool with the same arguments]`(第二个是 `page 2 of …`),后四个原样;控制面日志有 `tool_result_prune.cross_turn count=2`。**没修好时**:旧读取结果原样留在上下文里,或只剩「older context, not preserved」没有重读办法。模型没按每页一次调用读(工具结果不足 5 个)时记「不可判」(单测 `test_knowledge_reference.py` 覆盖)。费用约 ¥1~3。
+- [ ] **A2.12 评测闸门**(协调人跑):智能体层 60 题,改动前臂 = main 检出 + main 的脚本,改动后臂 = 本 PR(默认给 `knowledge_read`);再跑一次两集召回层(`kb_eval.py`)。判据:答对不降、编造不升、每题工具调用(检索 + 读)增幅 ≤ 1 次;召回层两集不比改动前差。费用:改动前约 ¥8~15、改动后约 ¥15~25、召回层约 ¥1。
+- [ ] **A2.13 收尾**:删 `acc-a2`、`acc-a2-none` 和 `kba2` / `kba2b` / `kba2c`。

@@ -22,6 +22,7 @@ import yaml
 from kb_agent_eval import (  # type: ignore[import-not-found]
     ANSWER_ENV,
     JUDGE_ENV,
+    MAX_READS,
     MAX_SEARCHES,
     PRICES,
     SEARCH_LIMIT_NOTE,
@@ -35,6 +36,7 @@ from kb_agent_eval import (  # type: ignore[import-not-found]
     done_case_ids,
     gold_passages,
     is_deepseek_offpeak,
+    judge_prompt,
     main,
     parse_verdict,
     resolve_price,
@@ -64,6 +66,7 @@ from orchestrator.tools.knowledge import (
     RetrievedChunk,
 )
 from orchestrator.tools.knowledge_rerank import RerankRanking
+from orchestrator.tools.registry import ToolContext, ToolResult, ToolSpec
 
 _ANCHOR = "常温密封保存即可"
 # 每节都比切块的短节合并线(约 100 token)长,两节各自成段,不会并成一段。
@@ -912,3 +915,158 @@ def test_tally_mode_reads_the_file_only(tmp_path: Path, capsys: pytest.CaptureFi
     out.write_text(json.dumps(_row("n1", "main", False, "正确说没写"), ensure_ascii=False) + "\n")
     assert main(["--tally", str(out)]) == 0
     assert "  all  n=1 正确说没写 1" in capsys.readouterr().out
+
+
+# ---------------------------------------------------------------------------
+# B-206 K-2: knowledge_read 与 knowledge_search 一起给模型
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class _FixedReader:
+    """A ``knowledge_read`` stand-in: every read returns the same page."""
+
+    calls: list[dict[str, Any]]
+
+    @property
+    def spec(self) -> ToolSpec:
+        return ToolSpec(name="knowledge_read", description="read", parameters={})
+
+    async def call(self, args: Any, *, ctx: ToolContext) -> ToolResult:
+        self.calls.append(dict(args))
+        meta = {"status": "ok", "mode": "page", "page": 1, "pages": 2, "passages": [{}, {}]}
+        return ToolResult(content=f"READ TEXT {len(self.calls)}", meta=meta)
+
+
+class _SearchThenRead:
+    """One search, then a read on every turn (one more than the eval allows)."""
+
+    answer_model = "scripted"
+    judge_model = "scripted"
+
+    def __init__(self) -> None:
+        self.tools: list[dict[str, Any]] = []
+
+    async def agent(
+        self, messages: list[dict[str, Any]], tools: list[dict[str, Any]]
+    ) -> tuple[dict[str, Any], float]:
+        self.tools = tools
+        n = sum(1 for m in messages if m["role"] == "tool")
+        if n > 1 + MAX_READS:
+            return {"role": "assistant", "content": "答完了"}, 0.0
+        name, args = (
+            ("knowledge_search", {"query": "q"})
+            if n == 0
+            else (
+                "knowledge_read",
+                {"document": f"D1#{n}"},
+            )
+        )
+        fn = {"name": name, "arguments": json.dumps(args)}
+        call = {"id": f"c{n}", "type": "function", "function": fn}
+        return {"role": "assistant", "content": "", "tool_calls": [call]}, 0.0
+
+    async def judge(self, prompt: str) -> tuple[str, float]:
+        return "{}", 0.0
+
+
+@pytest.mark.asyncio
+async def test_run_agent_offers_both_tools_records_reads_and_caps_them_apart() -> None:
+    models = _SearchThenRead()
+    reader = _FixedReader([])
+    search = _tool()
+
+    run, _cost = await run_agent(
+        models, search, question="q", tenant_id=uuid4(), spend=Spend(), reader=reader
+    )
+
+    assert models.tools == [_to_openai_tool(search.spec), _to_openai_tool(reader.spec)]
+    assert len(run["searches"]) == 1 and run["searches"][0]["status"] == "ok"
+    reads = run["reads"]
+    assert [r.get("skipped", False) for r in reads] == [False] * MAX_READS + [True]
+    assert reads[0]["args"] == {"document": "D1#1"}
+    assert (reads[0]["status"], reads[0]["mode"], reads[0]["page"], reads[0]["passages"]) == (
+        "ok",
+        "page",
+        1,
+        2,
+    )
+    assert reads[0]["content"] == "READ TEXT 1"
+    assert len(reader.calls) == MAX_READS
+    assert run["answer"] == "答完了"
+
+
+@pytest.mark.asyncio
+async def test_without_a_reader_only_the_search_tool_is_offered() -> None:
+    models = _SearchThenRead()
+    search = _tool()
+
+    run, _cost = await run_agent(models, search, question="q", tenant_id=uuid4(), spend=Spend())
+
+    # A knowledge_read call with no reader goes to the search tool, as every call did before.
+    assert models.tools == [_to_openai_tool(search.spec)]
+    assert run["reads"] == []
+    skipped = [s.get("skipped", False) for s in run["searches"]]
+    assert len(skipped) == MAX_READS + 2  # every call the script made
+    assert skipped == [False] * MAX_SEARCHES + [True] * (len(skipped) - MAX_SEARCHES)
+
+
+def test_the_judge_sees_what_was_read() -> None:
+    case = _case("q1", answerable=True)
+    run = {
+        "answer": "a",
+        "searches": [{"content": "SEARCH TEXT"}],
+        "reads": [{"content": "READ TEXT"}],
+    }
+    prompt = judge_prompt(case, run, {})
+    assert "SEARCH TEXT" in prompt and "READ TEXT" in prompt
+    # Without reads (rows from before K-2 too) the prompt is what it was: cached verdicts hold.
+    plain = {"answer": "a", "searches": [{"content": "SEARCH TEXT"}]}
+    assert judge_prompt(case, {**plain, "reads": []}, {}) == judge_prompt(case, plain, {})
+
+
+def test_tally_counts_searches_and_reads_apart(tmp_path: Path) -> None:
+    out = tmp_path / "agent.jsonl"
+    rows = [
+        _row("a1", "main", True, "答对", status="ok"),
+        {
+            **_row("a2", "main", True, "答对", status="ok"),
+            "reads": [
+                {"status": "ok", "mode": "around"},
+                {"status": "ok", "mode": "page"},
+                {"skipped": True},
+            ],
+        },
+    ]
+    out.write_text("".join(json.dumps(r, ensure_ascii=False) + "\n" for r in rows))
+    text = tally(out)
+    assert "searches per question 1.00;" in text
+    assert "reads per question 1.50 (questions with a read 1); modes around 1, page 1" in text
+
+
+def test_dry_run_reads_a_search_result_and_no_read_leaves_it_out(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, network_attempts: list[str]
+) -> None:
+    for name in (*ANSWER_ENV, *JUDGE_ENV):
+        monkeypatch.delenv(name, raising=False)
+    with_read, without = tmp_path / "with", tmp_path / "without"
+    with_read.mkdir()
+    without.mkdir()
+
+    assert main(_dry_argv(with_read, "--limit", "2")) == 0
+    assert main(_dry_argv(without, "--limit", "2", "--no-read")) == 0
+
+    def rows_and_run(base: Path) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+        lines = [json.loads(x) for x in (base / "agent.jsonl").read_text().splitlines()]
+        return [x for x in lines if "case_id" in x], next(x["run"] for x in lines if "run" in x)
+
+    read_rows, read_run = rows_and_run(with_read)
+    plain_rows, plain_run = rows_and_run(without)
+    assert read_run["read_tool"] is True and plain_run["read_tool"] is False
+    assert read_rows and plain_rows
+    for row in read_rows:
+        assert [s["status"] for s in row["searches"]] == ["ok"]
+        (read,) = row["reads"]
+        assert read["status"] == "ok" and read["args"]["document"].startswith("D1#")
+    assert all(row["reads"] == [] and len(row["searches"]) == 1 for row in plain_rows)
+    assert network_attempts == []

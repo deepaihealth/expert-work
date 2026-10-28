@@ -75,6 +75,9 @@ from orchestrator.tools.knowledge import (
 from orchestrator.tools.knowledge import (
     RetrievedChunk as RetrievedChunk,
 )
+from orchestrator.tools.knowledge_read import (
+    KnowledgeReadTool as KnowledgeReadTool,
+)
 from orchestrator.tools.llm_reranker import (
     LLMReranker as LLMReranker,
 )
@@ -268,6 +271,7 @@ __all__ = [
     "FindToolsTool",
     "HTTPSupervisorRuntime",
     "HTTPTool",
+    "KnowledgeReadTool",
     "KnowledgeRetriever",
     "KnowledgeSearchTool",
     "LLMReranker",

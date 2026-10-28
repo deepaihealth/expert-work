@@ -76,6 +76,7 @@ from orchestrator.tools.knowledge import (
     RetrievedChunk,
 )
 from orchestrator.tools.knowledge_rerank import RerankError
+from orchestrator.tools.knowledge_results import LaidOut
 
 _ANCHOR_A = "常温密封保存即可"
 _ANCHOR_B = "专利号 ZL2019-1234567"
@@ -1770,10 +1771,14 @@ async def test_context_hit_follows_the_tools_own_limit_and_rendering(
     default count or its rendering changes (parent chunks later), so does it."""
     monkeypatch.setattr(knowledge, "_DEFAULT_LIMIT", 8)
     assert (await _context_rows(7))[0].score.context_hit == 1.0
+    # The tool lays its results out with ``_lay_out_results`` (B-206 K-2: text +
+    # whether any was cut); ``_format_results`` is its text.
     monkeypatch.setattr(
         knowledge,
-        "_format_results",
-        lambda results: "\n".join(f"[{r.filename}#{r.chunk_index}]" for r in results),
+        "_lay_out_results",
+        lambda results: LaidOut(
+            "\n".join(f"[{r.filename}#{r.chunk_index}]" for r in results), truncated=False
+        ),
     )
     assert (await _context_rows(3))[0].score.context_hit == 0.0
 

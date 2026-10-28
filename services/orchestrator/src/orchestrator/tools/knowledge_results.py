@@ -5,7 +5,7 @@ small units that are embedded and keyword-indexed. A result is a child's parent,
 the larger passage the child was cut from: :func:`collapse_to_parents` walks the
 ranked children best first and keeps each parent once, at its best child's place,
 with the index of every child of it that ranked; ``limit`` counts parents.
-:func:`fit_to_budget` then lays the results out within one call's text budget.
+:func:`lay_out` then lays the results out within one call's text budget.
 """
 
 from __future__ import annotations
@@ -66,13 +66,23 @@ class ResultText:
     hit_text: str | None = None
 
 
-def fit_to_budget(results: Sequence[ResultText], budget: int = RESULTS_TEXT_BUDGET) -> str:
+@dataclass(frozen=True)
+class LaidOut:
+    """:func:`lay_out`'s text, and whether any result in it shows less than its
+    full text (B-206 K-2: the tool then points at ``knowledge_read``)."""
+
+    text: str
+    truncated: bool
+
+
+def lay_out(results: Sequence[ResultText], budget: int = RESULTS_TEXT_BUDGET) -> LaidOut:
     """``results`` in order, within ``budget`` characters. A result whose full text
     does not fit what is left shows its hit child instead, marked
     :data:`TRUNCATED_MARK`; when that does not fit either, the listing stops there:
     lower-ranked results are dropped, never skipped over. The first result always
     appears, its hit child cut to the budget when even that is longer."""
     blocks: list[str] = []
+    truncated = False
     room = budget
     for result in results:
         if blocks:
@@ -82,15 +92,20 @@ def fit_to_budget(results: Sequence[ResultText], budget: int = RESULTS_TEXT_BUDG
             if blocks:
                 break
             block = _cut_block(result, room)
+        truncated = truncated or block != _full_block(result)
         blocks.append(block)
         room -= len(block)
-    return RESULT_SEPARATOR.join(blocks)
+    return LaidOut(RESULT_SEPARATOR.join(blocks), truncated)
+
+
+def _full_block(result: ResultText) -> str:
+    return f"{result.header}\n{result.text}"
 
 
 def _fitting_block(result: ResultText, room: int) -> str | None:
     """``result`` in full if that fits ``room``, else its hit child marked
     truncated if that fits, else ``None``."""
-    full = f"{result.header}\n{result.text}"
+    full = _full_block(result)
     if len(full) <= room:
         return full
     if result.hit_text is None:

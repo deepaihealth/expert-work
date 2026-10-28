@@ -9,6 +9,9 @@
   同一段代码交给模型(``kb_eval.tool_message_text``:防注入围栏 + 围栏外的提示);
 * 答题模型每题最多搜 3 次;判分模型给每个回答出 ``refused`` / ``fabricated`` /
   ``matches_reference``,归成 答对 / 编造 / 正确说没写 / 误拒(另有 答偏 / 其它 / 判分失败)。
+* B-206 K-2 起, 生产里有知识库的智能体还有 ``knowledge_read``:默认一起给模型(每题最多读 3 次,
+  不占检索次数;模型最多回 8 轮), 读到的内容记进结果行的 ``reads``、也给判分看;
+  ``--no-read`` = 只给 ``knowledge_search``(K-2 之前的工具组合)。
 
 选题:主集与真实问法集各取全部「资料没写」题 + 固定种子各抽 15 道有答案的题(与 B-175 PR3
 同一批 60 题:30 + 30)。判分时给的「含答案的完整段落」= 期望文档里含锚文本的段,建库后从库里取。
@@ -43,8 +46,10 @@ B-206 K-14 对照组:``--rerank-view dual|single|single_clean`` / ``--rerank-poo
 (元 / 百万 token:输入,缓存命中,输出)。
 
 花费:一轮 60 题约 ¥15(glm-5.3 答题 + deepseek-v4-pro 判分 + 重排;判分按提示词缓存在 sqlite,
-同样的回答复跑不再花钱)。DeepSeek 闲时(北京时间工作日 9-12 点、14-18 点以外,周末全天)半价,
-按每次调用的时刻折算。``--budget`` 到了**不退出**:不再开新题,在跑的题跑完照常落盘,然后暂停、库留着,
+同样的回答复跑不再花钱)。带 ``knowledge_read`` 的一轮更贵:每次读最多 ``max_tokens``(默认 4,000)
+token 进上下文、之后每轮都重发, 判分也要看, 约 ¥15~25。
+DeepSeek 闲时(北京时间工作日 9-12 点、14-18 点以外,周末全天)半价,按每次调用的时刻折算。
+``--budget`` 到了**不退出**:不再开新题,在跑的题跑完照常落盘,然后暂停、库留着,
 等操作者往 ``<out>.budget`` 写新上限(元)继续,或写 ``stop`` 收尾。结果 JSONL 每题一行、追加写,
 同一个 ``--out`` 重跑只补没做完的题。
 """
@@ -107,18 +112,24 @@ from orchestrator.tools.knowledge import (
     RERANK_VIEWS,
     KnowledgeSearchTool,
 )
+from orchestrator.tools.knowledge_read import KnowledgeReadTool
 from orchestrator.tools.registry import ToolContext, ToolResult, ToolSpec
 
 AGENT_SYSTEM = (
     "你是一家公司的客服助手。回答客户的问题时,先用 knowledge_search 查公司知识库,再回答。"
 )
 MAX_SEARCHES = 3
-MAX_CALLS = 6
+#: B-206 K-2: knowledge_read 单独计数, 不占检索次数。
+MAX_READS = 3
+#: 模型最多回几轮(一轮可并发多个工具调用);B-206 K-2 起 6 -> 8, 容得下 3 次检索 + 3 次读文档。
+MAX_CALLS = 8
 SEED = 20261018
 N_ANSWERABLE_PER_SET = 15
 #: 判分时每题最多给几段「含答案的完整段落」。
 GOLD_PASSAGES = 2
 SEARCH_LIMIT_NOTE = "[search limit reached in this evaluation; answer with what you have]"
+READ_LIMIT_NOTE = "[read limit reached in this evaluation; answer with what you have]"
+READ_TOOL = "knowledge_read"
 
 DEFAULT_ANSWER_MODEL = "glm-5.3"
 DEFAULT_JUDGE_MODEL = "deepseek-v4-pro"
@@ -318,7 +329,8 @@ class RealModels:
 
 
 class FakeModels:
-    """``--dry``:用题目原文搜一次、回一句占位;判分固定。不花钱、不连网。"""
+    """``--dry``:用题目原文搜一次;给了 knowledge_read 就再读一次检索结果里第一个
+    ``[D<n>#<k>]``(B-206 K-2);然后回一句占位。判分固定。不花钱、不连网。"""
 
     answer_model = DRY_MODEL
     judge_model = DRY_MODEL
@@ -326,22 +338,31 @@ class FakeModels:
     async def agent(
         self, messages: list[dict[str, Any]], tools: list[dict[str, Any]]
     ) -> tuple[dict[str, Any], float]:
-        if any(m["role"] == "tool" for m in messages):
-            return {"role": "assistant", "content": "(空跑)"}, 0.0
-        question = messages[-1]["content"]
-        call = {
-            "id": "call_dry",
-            "type": "function",
-            "function": {
-                "name": tools[0]["function"]["name"],
-                "arguments": json.dumps({"query": question}, ensure_ascii=False),
-            },
-        }
-        return {"role": "assistant", "content": "", "tool_calls": [call]}, 0.0
+        results = [str(m["content"]) for m in messages if m["role"] == "tool"]
+        if not results:
+            question = messages[-1]["content"]
+            return _dry_call(tools[0]["function"]["name"], {"query": question}), 0.0
+        offered = {t["function"]["name"] for t in tools}
+        reference = _DRY_REFERENCE.search(results[0])
+        if READ_TOOL in offered and len(results) == 1 and reference is not None:
+            return _dry_call(READ_TOOL, {"document": reference.group(1)}), 0.0
+        return {"role": "assistant", "content": "(空跑)"}, 0.0
 
     async def judge(self, prompt: str) -> tuple[str, float]:
         verdict = {"refused": False, "fabricated": False, "matches_reference": "n/a"}
         return json.dumps({**verdict, "reason": "dry"}), 0.0
+
+
+_DRY_REFERENCE = re.compile(r"\[(D[0-9]+#[0-9]+)\]")
+
+
+def _dry_call(name: str, args: Mapping[str, Any]) -> dict[str, Any]:
+    call = {
+        "id": f"call_dry_{name}",
+        "type": "function",
+        "function": {"name": name, "arguments": json.dumps(args, ensure_ascii=False)},
+    }
+    return {"role": "assistant", "content": "", "tool_calls": [call]}
 
 
 # ---------------------------------------------------------------------------
@@ -349,11 +370,20 @@ class FakeModels:
 # ---------------------------------------------------------------------------
 
 
+class Tool(Protocol):
+    """``knowledge_search`` / ``knowledge_read``(或测试替身)。"""
+
+    @property
+    def spec(self) -> ToolSpec: ...
+
+    async def call(self, args: Mapping[str, Any], *, ctx: ToolContext) -> ToolResult: ...
+
+
 @dataclass
 class _RecordingTool:
     """把工具的 ``ToolResult`` 留一份(判分与结果文件用);模型看到的仍是工具节点渲染的那段。"""
 
-    tool: KnowledgeSearchTool
+    tool: Tool
     results: list[ToolResult] = field(default_factory=list)
 
     @property
@@ -366,16 +396,19 @@ class _RecordingTool:
         return result
 
 
-async def _search(
-    recorder: _RecordingTool, call: Mapping[str, Any], *, done: int, tenant_id: UUID
-) -> tuple[str, dict[str, Any]]:
-    """一次工具调用:``(给模型的文本, 记进结果文件的这次检索)``。"""
+def _call_args(call: Mapping[str, Any]) -> dict[str, Any]:
     try:
         args = json.loads(call["function"]["arguments"] or "{}")
     except json.JSONDecodeError:
         args = {}
-    if not isinstance(args, dict):
-        args = {}
+    return args if isinstance(args, dict) else {}
+
+
+async def _search(
+    recorder: _RecordingTool, call: Mapping[str, Any], *, done: int, tenant_id: UUID
+) -> tuple[str, dict[str, Any]]:
+    """一次工具调用:``(给模型的文本, 记进结果文件的这次检索)``。"""
+    args = _call_args(call)
     if done >= MAX_SEARCHES:
         return SEARCH_LIMIT_NOTE, {"query": args.get("query"), "skipped": True}
     before = len(recorder.results)
@@ -403,22 +436,54 @@ async def _search(
     }
 
 
+async def _read(
+    recorder: _RecordingTool, call: Mapping[str, Any], *, done: int, tenant_id: UUID
+) -> tuple[str, dict[str, Any]]:
+    """一次 knowledge_read(B-206 K-2):``(给模型的文本, 记进结果文件的这次读取)``。"""
+    args = _call_args(call)
+    if done >= MAX_READS:
+        return READ_LIMIT_NOTE, {"args": args, "skipped": True}
+    before = len(recorder.results)
+    rendered = await tool_message_text(
+        recorder, args, tenant_id=tenant_id, call_id=str(call.get("id") or "call")
+    )
+    if len(recorder.results) == before:
+        return rendered, {"args": args, "error": rendered}
+    meta = recorder.results[-1].meta
+    return rendered, {
+        "args": args,
+        "status": meta.get("status"),
+        "mode": meta.get("mode"),
+        "page": meta.get("page"),
+        "pages": meta.get("pages"),
+        "passages": len(meta.get("passages") or ()),
+        "content": recorder.results[-1].content,
+    }
+
+
 async def run_agent(
     models: Models,
-    tool: KnowledgeSearchTool,
+    tool: Tool,
     *,
     question: str,
     tenant_id: UUID,
     spend: Spend,
+    reader: Tool | None = None,
 ) -> tuple[dict[str, Any], float]:
-    """答一道题:``({answer, searches}, 答题花费)``。"""
+    """答一道题:``({answer, searches, reads}, 答题花费)``。``reader``(B-206 K-2)给了就把
+    knowledge_read 一起给模型:调用名是它的走它、记进 ``reads``, 其余都当检索(与之前一样)。
+    两种各有各的次数上限。"""
     recorder = _RecordingTool(tool)
+    reading = _RecordingTool(reader) if reader is not None else None
     tools = [_to_openai_tool(tool.spec)]
+    if reader is not None:
+        tools.append(_to_openai_tool(reader.spec))
     messages: list[dict[str, Any]] = [
         {"role": "system", "content": AGENT_SYSTEM + "\n\n" + SPOTLIGHT_SYSTEM_CLAUSE},
         {"role": "user", "content": question},
     ]
     searches: list[dict[str, Any]] = []
+    reads: list[dict[str, Any]] = []
     answer = ""
     cost = 0.0
     for _ in range(MAX_CALLS):
@@ -434,12 +499,16 @@ async def run_agent(
             {"role": "assistant", "content": message.get("content") or "", "tool_calls": calls}
         )
         for call in calls:
-            rendered, search = await _search(
-                recorder, call, done=len(searches), tenant_id=tenant_id
-            )
-            searches.append(search)
+            if reading is not None and call["function"]["name"] == READ_TOOL:
+                rendered, record = await _read(reading, call, done=len(reads), tenant_id=tenant_id)
+                reads.append(record)
+            else:
+                rendered, record = await _search(
+                    recorder, call, done=len(searches), tenant_id=tenant_id
+                )
+                searches.append(record)
             messages.append({"role": "tool", "tool_call_id": call["id"], "content": rendered})
-    return {"answer": answer, "searches": searches}, cost
+    return {"answer": answer, "searches": searches, "reads": reads}, cost
 
 
 # ---------------------------------------------------------------------------
@@ -488,9 +557,10 @@ async def gold_passages(
 
 
 def judge_prompt(case: KbCase, run: Mapping[str, Any], gold: Mapping[str, list[str]]) -> str:
+    # B-206 K-2: 读文档拿到的也是智能体看过的资料;没有读文档时提示词与之前逐字相同(判分缓存照用)。
+    seen = [*run["searches"], *run.get("reads", ())]
     passages = (
-        "\n\n=====\n\n".join(s["content"] for s in run["searches"] if s.get("content"))
-        or "(没有检索到段落)"
+        "\n\n=====\n\n".join(s["content"] for s in seen if s.get("content")) or "(没有检索到段落)"
     )
     if case.expected:
         anchors = "\n".join(f"- 《{e.document}》中的原文片段:{e.anchor}" for e in case.expected[:3])
@@ -608,7 +678,7 @@ async def run_questions(
     *,
     todo: Sequence[tuple[str, KbCase]],
     models: Models,
-    tool: KnowledgeSearchTool,
+    tool: Tool,
     tenant_id: UUID,
     gold: Mapping[str, list[str]],
     cache: JudgeCache,
@@ -618,6 +688,7 @@ async def run_questions(
     other_cost: Callable[[], float] = lambda: 0.0,
     concurrency: int = 4,
     cache_verdicts: bool = True,
+    reader: Tool | None = None,
 ) -> int:
     """答题 + 判分,每题一行追加进 ``out``;返回写了几行。``other_cost`` 是计入预算的其它花费
     (重排)。"""
@@ -643,7 +714,7 @@ async def run_questions(
             if not await admit():
                 return
             run, answer_cny = await run_agent(
-                models, tool, question=case.query, tenant_id=tenant_id, spend=spend
+                models, tool, question=case.query, tenant_id=tenant_id, spend=spend, reader=reader
             )
             prompt = judge_prompt(case, run, gold)
             raw = cache.get(models.judge_model, prompt)
@@ -662,6 +733,7 @@ async def run_questions(
                 "question": case.query,
                 "answer": run["answer"],
                 "searches": run["searches"],
+                "reads": run["reads"],
                 "verdict": verdict,
                 "category": category(bool(case.expected), verdict),
                 "answer_model": models.answer_model,
@@ -727,6 +799,8 @@ def tally(path: Path) -> str:
     total = Counter(r["category"] for r in rows)
     lines.append(f"total n={len(rows)} " + " ".join(f"{k} {v}" for k, v in sorted(total.items())))
     searches = [s for r in rows for s in r["searches"]]
+    # B-206 K-2: 读文档单独统计(之前的结果行没有 reads)。
+    reads = [s for r in rows for s in r.get("reads", ())]
     lines.append(
         f"searches per question {len(searches) / max(1, len(rows)):.2f}; "
         f"degraded {sum(1 for s in searches if s.get('degraded'))}, "
@@ -742,6 +816,16 @@ def tally(path: Path) -> str:
         + ", ".join(f"{k} {v}" for k, v in sorted(outcomes.items()))
         + f"; threshold paused {sum(1 for s in ran if s.get('rerank_threshold_paused'))}"
     )
+    if reads:
+        with_read = sum(1 for r in rows if r.get("reads"))
+        modes = Counter(s["mode"] for s in reads if s.get("mode"))
+        lines.append(
+            f"reads per question {len(reads) / max(1, len(rows)):.2f} "
+            f"(questions with a read {with_read}); modes "
+            + ", ".join(f"{k} {v}" for k, v in sorted(modes.items()))
+            + f"; errors {sum(1 for s in reads if s.get('error'))}, "
+            f"skipped {sum(1 for s in reads if s.get('skipped'))}"
+        )
     answer = sum(r["cost_cny"]["answer"] for r in rows)
     judge = sum(r["cost_cny"]["judge"] for r in rows)
     rerank = sum(run["spend_cny"]["rerank"] for run in runs)
@@ -784,6 +868,11 @@ def _build_parser() -> argparse.ArgumentParser:
         default="on",
         choices=("on", "off"),
         help="查询侧标记(B-206 K-5,同 kb_eval):off = 对照臂,查询不带标记",
+    )
+    parser.add_argument(
+        "--no-read",
+        action="store_true",
+        help="不给模型 knowledge_read(B-206 K-2 之前的工具组合)",
     )
     parser.add_argument("--rerank", default="dashscope", choices=("dashscope", "off"))
     # B-206 K-14 对照组,与 kb_eval.py 同名同义;默认 = 生产默认。
@@ -925,10 +1014,15 @@ async def _run(
                 rerank_pool=args.rerank_pool,
                 rerank_instruction=args.rerank_instruct,
             )
+            refs = (main_set.name,)
             written = await run_questions(
                 todo=todo,
                 models=models,
-                tool=KnowledgeSearchTool(retriever=retriever, knowledge_base_refs=(main_set.name,)),
+                tool=KnowledgeSearchTool(retriever=retriever, knowledge_base_refs=refs),
+                # B-206 K-2:生产里有知识库的智能体两个工具都有;--no-read 是改动前那一臂。
+                reader=None
+                if args.no_read
+                else KnowledgeReadTool(store=store, knowledge_base_refs=refs),
                 tenant_id=EVAL_TENANT_ID,
                 gold=gold,
                 cache=JudgeCache(args.judge_cache),
@@ -946,6 +1040,8 @@ async def _run(
         "answer_model": models.answer_model,
         "judge_model": models.judge_model,
         "query_marker": bundle.query_marker,
+        # B-206 K-2:这次有没有给模型 knowledge_read。
+        "read_tool": not args.no_read,
         # B-206 K-14:这次跑的是哪个重排对照组(不同组请写不同的 --out)。
         "rerank_arm": {
             "view": args.rerank_view,

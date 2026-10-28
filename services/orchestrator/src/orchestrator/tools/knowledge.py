@@ -59,10 +59,12 @@ from orchestrator.tools.knowledge_rerank import Reranker as Reranker
 from orchestrator.tools.knowledge_rerank import RerankRanking as RerankRanking
 from orchestrator.tools.knowledge_rerank import ScoredReranker as ScoredReranker
 from orchestrator.tools.knowledge_results import (
+    TRUNCATED_MARK,
+    LaidOut,
     ParentHit,
     ResultText,
     collapse_to_parents,
-    fit_to_budget,
+    lay_out,
 )
 from orchestrator.tools.knowledge_threshold import clears_floor, search_floors
 from orchestrator.tools.registry import ToolBlockedError, ToolContext, ToolResult, ToolSpec
@@ -150,13 +152,15 @@ KNOWLEDGE_ANSWERABILITY_RULE = (
 #: correctly (Onyx EnterpriseRAG-Bench). Dev-set agent layer (60 questions, the
 #: platform answer model) 2026-10-22: fabrications 2 → 1, wrong refusals 1 → 0
 #: with only this wording changed; the K-4 grouped result format measured on its
-#: own raised fabrications (2 → 7) and is held back.
+#: own raised fabrications (2 → 7) and is held back. B-206 K-2 names the tool
+#: that checks a candidate (the design's wording, held back until it existed).
 KNOWLEDGE_SEARCH_GUIDANCE = (
     "Use several small, targeted searches rather than one broad one; if a result does not "
     "state the fact asked, search again in the documents' own terms, and do not repeat the "
     "same or a very similar query. For questions that ask for all / every / how many, keep "
     "searching with different terms until a search returns no document you have not seen, "
-    "then check each candidate against every condition in the question before counting it. "
+    "then read each candidate (knowledge_read) and check it against every condition in the "
+    "question before counting it. "
     "Before concluding, verify each condition in the question against text you have actually "
     "read; conflicting documents are reported as conflicting, not resolved by guessing. Say "
     "you searched and found nothing only when a search actually ran."
@@ -192,6 +196,11 @@ _PARTIAL_RESULTS_NOTICE = (
 )
 #: Ends the fenced results of such a search: the bases' names as a JSON list.
 _UNSEARCHED_BASES_LINE = "[knowledge bases that could not be searched: {names}]"
+#: B-206 K-2 — added to the notice when a result shows only its matched chunk.
+_TRUNCATED_RESULTS_NOTICE = (
+    f"[knowledge_search: a result marked {TRUNCATED_MARK} shows only the part of its passage "
+    "that matched; knowledge_read with that result's reference returns the whole passage.]"
+)
 #: B-206 K-22 / K-8 — nothing found by a search one of whose paths failed (the
 #: keyword path, or the query embedding): :data:`_NO_HITS_NOTICE`'s "does not
 #: cover this" would be a claim the search cannot make.
@@ -305,6 +314,9 @@ class RetrievedChunk:
     hit_heading_path: tuple[str, ...] = ()
     #: The source document (B-175 P2-PR4: the retrieval log and test name it).
     document_id: UUID | None = None
+    #: Its tenant-wide number — the ``D12`` of the ``[D12#7]`` header that
+    #: ``knowledge_read`` takes (B-206 K-2); ``None`` for a row from before numbers.
+    doc_seq: int | None = None
 
     @property
     def retrieval_text(self) -> str:
@@ -847,7 +859,12 @@ class KnowledgeRetriever:
             doc_id: (docs[doc_id].filename if doc_id in docs else "(unknown)") for doc_id in doc_ids
         }
         results = [
-            _retrieved(hit, parent, filenames[hit.best.document_id], scores, sources)
+            replace(
+                _retrieved(hit, parent, filenames[hit.best.document_id], scores, sources),
+                doc_seq=docs[hit.best.document_id].doc_seq
+                if hit.best.document_id in docs
+                else None,
+            )
             for hit, parent in picked
         ]
         return results, duplicates
@@ -1120,14 +1137,19 @@ class KnowledgeSearchTool:
                 meta=meta,
                 notice=no_hits_notice,
             )
-        content = _format_results(outcome.results)
+        laid_out = _lay_out_results(outcome.results)
+        content = laid_out.text
+        cut = ""
+        if laid_out.truncated:
+            meta["truncated"] = True
+            cut = f"\n{_TRUNCATED_RESULTS_NOTICE}"
         if not outcome.unsearched_bases:
-            return ToolResult(content=content, meta=meta, notice=_RESULTS_NOTICE)
+            return ToolResult(content=content, meta=meta, notice=_RESULTS_NOTICE + cut)
         names = json.dumps(list(outcome.unsearched_bases), ensure_ascii=False)
         return ToolResult(
             content=f"{content}\n\n{_UNSEARCHED_BASES_LINE.format(names=names)}",
             meta=meta,
-            notice=_PARTIAL_RESULTS_NOTICE,
+            notice=_PARTIAL_RESULTS_NOTICE + cut,
         )
 
     def _require_query(self, args: Mapping[str, Any]) -> str:
@@ -1219,14 +1241,24 @@ def _coerce_limit(raw: object) -> int:
 
 
 def _format_results(results: Sequence[RetrievedChunk]) -> str:
-    """Each result as ``[filename#chunk_index]`` + its parent's text, within
+    """:func:`_lay_out_results`'s text."""
+    return _lay_out_results(results).text
+
+
+def _lay_out_results(results: Sequence[RetrievedChunk]) -> LaidOut:
+    """Each result as ``[D<doc_seq>#<chunk_index>] <filename>`` (B-206 K-2;
+    ``[<filename>#<chunk_index>]`` without a number) + its parent's text, within
     :data:`~orchestrator.tools.knowledge_results.RESULTS_TEXT_BUDGET` (B-206 K-1:
     a parent that does not fit shows its hit child, see
-    :func:`~orchestrator.tools.knowledge_results.fit_to_budget`)."""
-    return fit_to_budget(
+    :func:`~orchestrator.tools.knowledge_results.lay_out`)."""
+    return lay_out(
         [
             ResultText(
-                header=f"[{result.filename}#{result.chunk_index}]",
+                header=(
+                    f"[D{result.doc_seq}#{result.chunk_index}] {result.filename}"
+                    if result.doc_seq is not None
+                    else f"[{result.filename}#{result.chunk_index}]"
+                ),
                 text=result.retrieval_text,
                 hit_text=None if result.hit_content is None else result.hit_retrieval_text,
             )

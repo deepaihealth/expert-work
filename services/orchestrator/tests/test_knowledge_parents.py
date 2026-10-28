@@ -311,7 +311,7 @@ async def test_the_tool_shows_each_parent_once_under_its_best_childs_label() -> 
 
     result = await tool.call({"query": "deductible"}, ctx=ToolContext(tenant_id=tenant))
 
-    assert result.content == "[manual.md#0]\n[Section: Part 0]\n\nPARENT A BODY"
+    assert result.content == "[D1#0] manual.md\n[Section: Part 0]\n\nPARENT A BODY"
     assert result.meta["hits"] == 1
 
 
@@ -424,9 +424,9 @@ async def test_twenty_full_size_parents_stay_under_the_externalization_gate() ->
     assert result.meta["hits"] == 20
     assert len(result.content) < EXTERNALIZE_MIN_CHARS
     assert len(result.content) <= RESULTS_TEXT_BUDGET
-    assert result.content.startswith(f"[manual.md#0]\n[Section: Part 0]\n\n{bodies[0]}")
+    assert result.content.startswith(f"[D1#0] manual.md\n[Section: Part 0]\n\n{bodies[0]}")
     # The second parent does not fit what is left: its hit child, breadcrumb and all.
-    assert "\n\n---\n\n[manual.md#1]\n[Section: Part 1 > child 1]\n\n01 child text" in (
+    assert "\n\n---\n\n[D1#1] manual.md\n[Section: Part 1 > child 1]\n\n01 child text" in (
         result.content
     )
     assert TRUNCATED_MARK in result.content

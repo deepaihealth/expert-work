@@ -373,7 +373,7 @@ def test_knowledge_search_spec() -> None:
 async def test_knowledge_search_tool_returns_attributed_block() -> None:
     store, tenant = await _seed_store()
     result = await _tool(store).call({"query": "deductible"}, ctx=ToolContext(tenant_id=tenant))
-    assert "[doc.pdf#0]" in result.content
+    assert "[D1#0] doc.pdf" in result.content
     assert "deductible" in result.content
     assert result.meta["hits"] >= 1
 
@@ -1850,7 +1850,8 @@ def test_the_tool_description_states_how_to_search_and_conclude() -> None:
 
 
 def test_the_tool_description_names_no_tool_that_does_not_exist() -> None:
-    # Reading a candidate in full / listing documents come with K-2 / K-13.
+    # Listing documents comes with K-13; knowledge_read (K-2) is registered with
+    # knowledge_search (test_knowledge_read_registration.py).
     description = _tool(InMemoryKnowledgeStore()).spec.description
-    for absent in ("knowledge_read", "knowledge_list_documents", "list_documents"):
+    for absent in ("knowledge_list_documents", "list_documents"):
         assert absent not in description, absent

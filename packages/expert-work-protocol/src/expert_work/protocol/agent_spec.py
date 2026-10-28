@@ -1385,6 +1385,7 @@ _IMPLICIT_TOOL_NAMES = frozenset(
         "skill_view",  # lazy skill loader (any skill bound)
         "find_tools",  # TE-6 deferred-pool promoter
         "knowledge_search",  # activated by a ``knowledge:`` block
+        "knowledge_read",  # registered beside knowledge_search (B-206 K-2)
         "ask_image",  # activated by a ``vision:`` block
     }
 )

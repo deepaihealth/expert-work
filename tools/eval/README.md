@@ -297,3 +297,6 @@ EXPERT_WORK_EVAL_EMBED_API_KEY=... EXPERT_WORK_EVAL_EMBED_MODEL=text-embedding-v
 工具就是主干的 `knowledge_search`(结果经工具节点渲染);答题模型(默认 glm-5.3)最多搜 3 次,判分模型(默认
 deepseek-v4-pro)归成 答对 / 编造 / 正确说没写 / 误拒。一轮约 ¥15;`--dry` 换假模型零花费;`--budget` 到了暂停
 (往 `<out>.budget` 写新上限继续、写 `stop` 收尾),结果可续跑;`--tally <out>` 只出统计。用法、环境变量、计费规则见脚本开头说明。
+B-206 K-2 起默认同时给模型 `knowledge_read`(与生产一致:绑了知识库的智能体两个工具都有),每题最多读 3 次、不占检索次数,
+模型最多回 8 轮;读到的内容记进结果行的 `reads` 并给判分看,`--tally` 另报每题读几次、按读法分布。`--no-read` 只给
+`knowledge_search`。带读文档的一轮约 ¥15~25。
