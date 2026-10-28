@@ -160,6 +160,18 @@ describe("parseTimeline", () => {
     expect(items[1].kind === "guard" && items[1].text).toContain("步数耗尽");
   });
 
+  it("renders a step-budget warning as near the limit, not as exhausted", () => {
+    // B-226 ② —— 步数进入最后一段时的一次性预警;不能显示成「步数耗尽 → 收尾轮」。
+    const items = parseTimeline([
+      ev("guard", { kind: "warning", guard: "max_steps", detail: { steps: 40, max: 48 } }, "t1"),
+    ]);
+    expect(items).toHaveLength(1);
+    expect(items[0]).toMatchObject({ kind: "guard", tone: "warn" });
+    const text = items[0].kind === "guard" ? items[0].text : "";
+    expect(text).toContain("40/48");
+    expect(text).not.toContain("耗尽");
+  });
+
   // ——— P3 PR-1 契约变更 ———
 
   it("renders a gap frame as a warn marker naming the missing range", () => {
@@ -182,6 +194,37 @@ describe("parseTimeline", () => {
     for (const [status, text, tone] of cases) {
       const items = parseTimeline([ev("end", { status, run_id: "r1" }, "t1")]);
       expect(items[0]).toMatchObject({ kind: "end", text, tone });
+    }
+  });
+
+  it("B-226 ⑥ — success + completed=false is a warn marker, not 运行完成", () => {
+    const stopped = parseTimeline([
+      ev("end", { status: "success", run_id: "r1", completed: false, exit_reason: "max_steps" }, "t1"),
+    ]);
+    expect(stopped[0]).toMatchObject({
+      kind: "end",
+      text: "已结束，未完成（步数用完）",
+      tone: "warn",
+    });
+    // The end frame now says ``incomplete`` for such a run: same marker.
+    const incomplete = parseTimeline([
+      ev("end", { status: "incomplete", run_id: "r1", completed: false, exit_reason: "max_steps" }, "t1"),
+    ]);
+    expect(incomplete[0]).toMatchObject({
+      kind: "end",
+      text: "已结束，未完成（步数用完）",
+      tone: "warn",
+    });
+    // completed=true and an absent field (an older run) keep the green marker.
+    for (const data of [
+      { status: "success", run_id: "r1", completed: true, exit_reason: "text_response" },
+      { status: "success", run_id: "r1" },
+    ]) {
+      expect(parseTimeline([ev("end", data, "t1")])[0]).toMatchObject({
+        kind: "end",
+        text: "运行完成",
+        tone: "good",
+      });
     }
   });
 

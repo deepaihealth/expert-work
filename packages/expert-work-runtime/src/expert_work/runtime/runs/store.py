@@ -34,6 +34,7 @@ from expert_work.persistence.models import AgentRunRow, RunEventRow, ThreadMetaR
 from expert_work.persistence.thread_meta.base import ThreadMetaStore
 from expert_work.runtime.runs.event_store import RunEventStore
 from expert_work.runtime.runs.schemas import (
+    INCOMPLETE_EXIT_REASONS,
     THREAD_BUSY_STATUSES,
     DisconnectMode,
     RunInfo,
@@ -170,11 +171,15 @@ class RunStore(abc.ABC):
         artifacts: list[dict[str, Any]] | None = None,
         completed: bool | None = None,
         exit_reason: str | None = None,
+        unresolved_failures: list[dict[str, Any]] | None = None,
         expected_statuses: Sequence[RunStatus] | None = None,
         guard_claimed_by: str | None = None,
     ) -> bool:
         """Update a run's status; return ``True`` iff the row exists
         (and, when a guard is given, the guard held).
+
+        ``unresolved_failures`` (B-226 ⑥) follows the same "``None`` leaves it
+        alone" predicate; ``[]`` is written (it means "none", not "no record").
 
         ``error`` / ``finished_at`` / ``artifacts`` / ``completed`` /
         ``exit_reason`` are written only when not ``None`` so a non-terminal
@@ -328,8 +333,15 @@ class RunStore(abc.ABC):
         limit: int = 100,
         offset: int = 0,
         before: tuple[datetime, UUID] | None = None,
+        incomplete: bool | None = None,
     ) -> list[RunInfo]:
         """Return runs for ``tenant_id``, newest first; paginated.
+
+        ``incomplete`` (B-226 ⑥) is the ``exit_reason`` half of the partner
+        status filter (:func:`~expert_work.runtime.runs.schemas.run_status_filter`):
+        ``True`` keeps only runs whose ``exit_reason`` is in
+        ``INCOMPLETE_EXIT_REASONS``, ``False`` keeps only runs whose
+        ``exit_reason`` is NULL or outside it, ``None`` adds no predicate.
 
         ``before`` is a **keyset cursor**: ``(created_at, run_id)`` of the
         oldest row the caller already has; only strictly-older rows come
@@ -732,6 +744,7 @@ class InMemoryRunStore(RunStore):
         artifacts: list[dict[str, Any]] | None = None,
         completed: bool | None = None,
         exit_reason: str | None = None,
+        unresolved_failures: list[dict[str, Any]] | None = None,
         expected_statuses: Sequence[RunStatus] | None = None,
         guard_claimed_by: str | None = None,
     ) -> bool:
@@ -754,6 +767,10 @@ class InMemoryRunStore(RunStore):
             # B-85 ③ —— 同一条谓词:None 不碰既有值。
             completed=completed if completed is not None else row.completed,
             exit_reason=exit_reason if exit_reason is not None else row.exit_reason,
+            # B-226 ⑥ —— same predicate; ``[]`` is written.
+            unresolved_failures=(
+                unresolved_failures if unresolved_failures is not None else row.unresolved_failures
+            ),
         )
         return True
 
@@ -855,6 +872,7 @@ class InMemoryRunStore(RunStore):
         limit: int = 100,
         offset: int = 0,
         before: tuple[datetime, UUID] | None = None,
+        incomplete: bool | None = None,
     ) -> list[RunInfo]:
         rows = [r for r in self._rows.values() if r.tenant_id == tenant_id]
         if before is not None:
@@ -862,6 +880,9 @@ class InMemoryRunStore(RunStore):
             rows = [r for r in rows if (r.created_at, r.run_id) < before]
         if status is not None:
             rows = [r for r in rows if r.status is status]
+        if incomplete is not None:
+            # Same predicate as the SQL side: NULL ``exit_reason`` is "not in".
+            rows = [r for r in rows if (r.exit_reason in INCOMPLETE_EXIT_REASONS) is incomplete]
         if user_id is not None:
             rows = [r for r in rows if r.user_id == user_id]
         if thread_ids is not None:
@@ -1251,6 +1272,8 @@ def _row_to_dto(row: AgentRunRow) -> RunInfo:
         # B-85 ③ —— 两列都是 NULL-able 且不回填,老 run 读出来就是 None。
         completed=row.completed,
         exit_reason=row.exit_reason,
+        # B-226 ⑥ —— NULL-able, not backfilled: older runs read back as None.
+        unresolved_failures=row.unresolved_failures,
         agent_spec_sha256=row.agent_spec_sha256,
         superseded_by_run_id=row.superseded_by_run_id,
         regenerated_from_run_id=row.regenerated_from_run_id,
@@ -1351,6 +1374,7 @@ class SqlRunStore(RunStore):
         artifacts: list[dict[str, Any]] | None = None,
         completed: bool | None = None,
         exit_reason: str | None = None,
+        unresolved_failures: list[dict[str, Any]] | None = None,
         expected_statuses: Sequence[RunStatus] | None = None,
         guard_claimed_by: str | None = None,
     ) -> bool:
@@ -1367,6 +1391,9 @@ class SqlRunStore(RunStore):
             values["completed"] = completed
         if exit_reason is not None:
             values["exit_reason"] = exit_reason
+        # B-226 ⑥ —— same predicate; ``[]`` is written.
+        if unresolved_failures is not None:
+            values["unresolved_failures"] = unresolved_failures
         conditions = [AgentRunRow.id == run_id, AgentRunRow.tenant_id == tenant_id]
         # 守卫谓词与 in-memory 店 byte-同义(见 Protocol docstring)。
         if expected_statuses is not None:
@@ -1550,6 +1577,7 @@ class SqlRunStore(RunStore):
         limit: int = 100,
         offset: int = 0,
         before: tuple[datetime, UUID] | None = None,
+        incomplete: bool | None = None,
     ) -> list[RunInfo]:
         if thread_ids is not None and not thread_ids:
             return []
@@ -1575,6 +1603,17 @@ class SqlRunStore(RunStore):
             )
         if status is not None:
             stmt = stmt.where(AgentRunRow.status == status.value)
+        if incomplete is not None:
+            limit_exits = sorted(INCOMPLETE_EXIT_REASONS)
+            stmt = stmt.where(
+                AgentRunRow.exit_reason.in_(limit_exits)
+                if incomplete
+                # ``NOT IN`` is NULL (not true) for a NULL ``exit_reason``.
+                else or_(
+                    AgentRunRow.exit_reason.is_(None),
+                    AgentRunRow.exit_reason.not_in(limit_exits),
+                )
+            )
         if user_id is not None:
             stmt = stmt.where(AgentRunRow.user_id == user_id)
         if thread_ids is not None:

@@ -112,7 +112,7 @@ async def test_current_turn_tool_result_survives_the_max_steps_wrapup_tail_injec
 
     构造:``step_count == max_steps`` 让 ``budget_exhausted`` 在这唯一一次
     ``agent_node`` 调用里立刻为真 —— 收尾分支会往 ``messages`` 尾部追加一条
-    **非隐藏** ``HumanMessage``(``_MAX_STEPS_WRAPUP_INSTRUCTION``)。本轮自己在
+    **非隐藏** ``HumanMessage``(``build_wrapup_instruction``)。本轮自己在
     这条收尾消息之前已经有一条大工具结果(``now-0``,带持久化路径,构造上与
     旧轮次的三条同样「可无损找回」)。``recent_tool_results_kept=0`` 关掉最近
     窗保护,让这条断言只能靠「它在 current_turn_start 的边界之后」这一条结构

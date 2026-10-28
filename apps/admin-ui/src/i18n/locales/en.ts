@@ -1683,12 +1683,23 @@ export interface TranslationKeys {
     status_paused: string;
     status_interrupted: string;
     status_error: string;
+    status_not_completed: string;
+    status_not_completed_plain: string;
+    exit_reason_max_steps: string;
+    exit_reason_token_budget: string;
+    exit_reason_no_progress: string;
+    exit_reason_approval_rejected: string;
+    exit_reason_text_response: string;
+    unresolved_failures: string;
+    unresolved_failure_item: string;
+    unresolved_failure_sep: string;
     error_generic: string;
     compaction: string;
     retry: string;
     guard_token_budget_warn: string;
     guard_token_budget_exhausted: string;
     guard_max_steps: string;
+    guard_max_steps_warn: string;
     guard_no_progress: string;
     gap_frames: string;
     memory_recall: string;
@@ -4450,8 +4461,8 @@ const en: TranslationKeys = {
     max_no_progress_label: "No-progress stop",
     max_no_progress_brief: "Stop early once it's stuck making no progress",
     max_no_progress_impact:
-      "Stop early after N consecutive steps with no real progress at all, so the agent doesn't burn through steps for nothing; 0 = turns this check off.\nRaise it to tolerate legitimate retries without cutting them off; lower it to kill a stuck loop faster — but too low may cut off a normal retry, so 3-5 is a reasonable starting point.\nExample: the agent keeps calling the same tool over and over without getting anywhere useful — this setting stops it early instead of letting it spin in place.",
-    max_no_progress_default: "0 (off)",
+      "Stop the run early the Nth time it gets caught looping (repeating the same tool calls), so the agent doesn't burn through steps for nothing. Loops are counted across the whole run — a normal step in between doesn't reset the count. 0 = the platform default: stop on the 2nd loop within a run (0 no longer turns the check off; set a large number to effectively disable it).\nRaise it to tolerate legitimate retries without cutting them off; lower it to kill a stuck loop faster — but too low may cut off a normal retry, so 3-5 is a reasonable starting point.\nExample: the agent keeps calling the same tool over and over without getting anywhere useful — this setting stops it early instead of letting it spin in place.",
+    max_no_progress_default: "0 (platform default: 2nd loop in a run)",
     subhead_structured: "Structured execution",
     subhead_time: "Time & spend",
     run_deadline_label: "Max run time (seconds)",
@@ -5321,12 +5332,23 @@ const en: TranslationKeys = {
     status_paused: "Awaiting human approval",
     status_interrupted: "Run cancelled",
     status_error: "Run failed",
+    status_not_completed: "Finished, not completed ({{reason}})",
+    status_not_completed_plain: "Finished, not completed",
+    exit_reason_max_steps: "step limit reached",
+    exit_reason_token_budget: "token budget used up",
+    exit_reason_no_progress: "no progress",
+    exit_reason_approval_rejected: "approval rejected",
+    exit_reason_text_response: "unresolved failures",
+    unresolved_failures: "Unresolved failures: {{list}}",
+    unresolved_failure_item: "{{tool}} ({{kind}})",
+    unresolved_failure_sep: ", ",
     error_generic: "Run error",
     compaction: "Compaction ×{{n}} · {{before}} → {{after}} tok",
     retry: "Retry #{{n}} · {{error}} · backing off {{backoff}}s",
     guard_token_budget_warn: "Token budget {{pct}}% used ({{spent}}/{{limit}})",
     guard_token_budget_exhausted: "Token budget exhausted ({{spent}}/{{limit}}) → wrap-up turn",
     guard_max_steps: "Step limit reached ({{steps}}/{{max}}) → wrap-up turn",
+    guard_max_steps_warn: "Steps {{steps}}/{{max}} used — near the step limit",
     guard_no_progress: "No progress {{streak}}/{{max}} → wrap-up turn",
     gap_frames: "Frames {{from}}–{{to}} missing (unrecoverable on this connection; replaying usually restores them)",
     memory_recall: "Memory recall · {{n}}",

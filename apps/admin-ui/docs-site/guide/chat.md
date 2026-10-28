@@ -33,7 +33,7 @@ sequenceDiagram
     end
 ```
 
-run 结束时会处于一个最终状态：`success`、`error`、`interrupted` 或 `paused`（枚举中另有一个保留值 `timeout`，当前不会出现）。其中 `paused` 表示 run 停在人工审批处等待决策，需要调用方调用审批接口推进，见 [4 对话过程中的控制](./run-control)。run 全部八个状态值的含义见 [5.4 run 列表](./query#_5-4-run-列表)。
+run 结束时会处于一个最终状态：`success`、`incomplete`、`error`、`interrupted` 或 `paused`（枚举中另有一个保留值 `timeout`，当前不会出现）。其中 `incomplete` 表示 run 被平台的一道限制叫停、要做的事没有做完，读法见 [3.4 的 `end`](./sse-events#end)；`paused` 表示 run 停在人工审批处等待决策，需要调用方调用审批接口推进，见 [4 对话过程中的控制](./run-control)。run 全部九个状态值的含义见 [5.4 run 列表](./query#_5-4-run-列表)。
 
 ## 2.2 发起对话
 
@@ -686,7 +686,7 @@ key 与 run 的绑定关系永久保留，没有过期时间，不会因为时�
 
 #### queue 模式
 
-返回与首次请求同形状的 202 响应，`data.run_id` 与首次一致。`data.status` 与首次不同：首次请求恒为 `queued`，重复请求返回的是原 run 当时的真实状态，可能是 [5.4 run 列表](./query#_5-4-run-列表) 那八个值里的任意一个（例如已经执行完成的 `success`）。
+返回与首次请求同形状的 202 响应，`data.run_id` 与首次一致。`data.status` 与首次不同：首次请求恒为 `queued`，重复请求返回的是原 run 当时的真实状态，可能是 [5.4 run 列表](./query#_5-4-run-列表) 那九个值里的任意一个（例如已经执行完成的 `success`）。
 
 **因此轮询的判断条件应当是「状态不是最终状态」，不是「状态等于 `queued`」。**
 

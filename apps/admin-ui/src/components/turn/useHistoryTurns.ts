@@ -16,6 +16,7 @@
  */
 import { useCallback, useEffect, useRef, useState } from "react";
 
+import type { UnresolvedFailure } from "../../api/run_completion";
 import {
   listThreadRuns,
   NON_TERMINAL_RUN_STATUSES,
@@ -57,9 +58,18 @@ export interface UseHistoryTurns {
    *  read WITHOUT re-pairing (re-pairing a thread whose paused run's
    *  continuation has finished would flatten the whole page — ROADMAP D-7).
    *  Identity-stable: returns the same ``turns`` array when nothing changed. */
-  patchRuns: (
-    runs: readonly { runId: string; status: string; tokens: RunTokens | null }[],
-  ) => void;
+  patchRuns: (runs: readonly PatchRun[]) => void;
+}
+
+/** One row of a fresh run-list read, as ``patchRuns`` takes it. ``completed`` /
+ *  ``exitReason`` (B-226 ⑥) absent = no record. */
+export interface PatchRun {
+  runId: string;
+  status: string;
+  tokens: RunTokens | null;
+  completed?: boolean | null;
+  exitReason?: string | null;
+  unresolvedFailures?: UnresolvedFailure[] | null;
 }
 
 export interface UseHistoryTurnsOptions {
@@ -369,7 +379,7 @@ export function useHistoryTurns(options: UseHistoryTurnsOptions = {}): UseHistor
   }, []);
 
   const patchRuns = useCallback(
-    (runs: readonly { runId: string; status: string; tokens: RunTokens | null }[]) => {
+    (runs: readonly PatchRun[]) => {
       const byId = new Map(runs.map((r) => [r.runId, r]));
       for (const r of runs) {
         if (runStatusRef.current.has(r.runId)) runStatusRef.current.set(r.runId, r.status);
@@ -384,9 +394,29 @@ export function useHistoryTurns(options: UseHistoryTurnsOptions = {}): UseHistor
           // changes again, and the pairing source (``listThreadRuns``) stays
           // authoritative for turns it already settled.
           if (!NON_TERMINAL_RUN_STATUSES.has(h.status)) return h;
-          if (r.status === h.status && r.tokens === h.tokens) return h;
+          // B-226 ⑥ — carry the row's completion too, so a turn patched to
+          // success gets the "finished, not completed" fallback before replay.
+          const completed = r.completed ?? null;
+          const exitReason = r.exitReason ?? null;
+          const unresolvedFailures = r.unresolvedFailures ?? null;
+          if (
+            r.status === h.status &&
+            r.tokens === h.tokens &&
+            completed === (h.completed ?? null) &&
+            exitReason === (h.exitReason ?? null) &&
+            unresolvedFailures === (h.unresolvedFailures ?? null)
+          ) {
+            return h;
+          }
           changed = true;
-          return { ...h, status: r.status, tokens: r.tokens };
+          return {
+            ...h,
+            status: r.status,
+            tokens: r.tokens,
+            completed,
+            exitReason,
+            unresolvedFailures,
+          };
         });
         return changed ? next : prev;
       });

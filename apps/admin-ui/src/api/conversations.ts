@@ -12,6 +12,7 @@
  *   - ``GET /v1/conversations/{thread_id}`` — one conversation's run list.
  */
 import { getJson, withTenantScope, type TenantScope } from "./client";
+import type { UnresolvedFailure } from "./run_completion";
 import type { RunStatus, RunTokens } from "./runs";
 
 /** Thread lifecycle — server ``ThreadStatus`` (expert_work.protocol). */
@@ -75,6 +76,11 @@ export interface ConversationRun {
   superseded_by: string | null;
   /** P-1 —— 这一轮是对哪个旧 run 的重新生成 / 编辑重发;``null`` = 普通一轮。 */
   regenerated_from: string | null;
+  /** B-226 ⑥ — ``completed`` / ``exit_reason`` of the row; the page patches a
+   *  turn that was in flight at load with them. ``null`` / absent = no record. */
+  completed?: boolean | null;
+  exit_reason?: string | null;
+  unresolved_failures?: UnresolvedFailure[] | null;
 }
 
 /** ``GET /v1/conversations/{thread_id}`` — the list item + its runs. */
