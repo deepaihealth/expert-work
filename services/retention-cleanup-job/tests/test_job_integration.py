@@ -38,6 +38,7 @@ from expert_work.persistence import (
     create_async_engine_from_config,
     create_async_session_factory,
 )
+from expert_work.persistence.knowledge import SqlKnowledgeRetrievalLogStore
 from expert_work.persistence.knowledge.base import SwitchOffRecord
 from expert_work.protocol import (
     AuditAction,
@@ -1011,5 +1012,67 @@ async def test_an_expired_switch_off_record_is_not_written_back(
             tenant_id=tenant, document_id=document, chunks=[], switch_offs=[written_back]
         )
         assert await store.list_switch_offs(tenant_id=tenant, document_id=document) == []
+    finally:
+        await worker_engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_knowledge_retrieval_log_retention_deletes_rows_past_30_days(
+    db_fixture: tuple[AsyncEngine, AsyncEngine, str],
+) -> None:
+    """B-175 P2-PR4 — rows older than 30 days go, in batches (``batch_size`` 2
+    here, so several rounds), across tenants; younger rows stay. Counts only
+    this case's own tenants."""
+    _app_engine, worker_engine, sync_admin = db_fixture
+    try:
+        tenants = (uuid4(), uuid4())
+        admin = create_engine(sync_admin, isolation_level="AUTOCOMMIT")
+        try:
+            with admin.connect() as conn:
+                for tenant, age in (
+                    (tenants[0], 31),
+                    (tenants[0], 45),
+                    (tenants[0], 60),
+                    (tenants[1], 33),
+                    (tenants[1], 50),
+                    (tenants[0], 29),  # kept
+                    (tenants[1], 1),  # kept
+                ):
+                    conn.execute(
+                        text(
+                            "INSERT INTO knowledge_retrieval_log (tenant_id, kb_ids, source, "
+                            " query, status, result_count, latency_ms, created_at) "
+                            "VALUES (:t, ARRAY[gen_random_uuid()], 'agent', 'q', 'ok', 0, 1, "
+                            " now() - make_interval(days => :age))"
+                        ),
+                        {"t": str(tenant), "age": age},
+                    )
+        finally:
+            admin.dispose()
+
+        session_factory = create_async_session_factory(worker_engine)
+        job = RetentionCleanupJob(
+            db_session_factory=session_factory,
+            batch_size=2,
+            knowledge_retrieval_log_store=SqlKnowledgeRetrievalLogStore(session_factory),
+            knowledge_retrieval_log_retention_days=30,
+        )
+        report = await job.run_once()
+
+        async with worker_engine.begin() as conn:
+            remaining = sorted(
+                int(row[0])
+                for row in (
+                    await conn.execute(
+                        text(
+                            "SELECT extract(day FROM now() - created_at) "
+                            "FROM knowledge_retrieval_log WHERE tenant_id = ANY(:t)"
+                        ),
+                        {"t": [str(tenant) for tenant in tenants]},
+                    )
+                ).all()
+            )
+        assert remaining == [1, 29]
+        assert report.knowledge_retrieval_logs_deleted >= 5
     finally:
         await worker_engine.dispose()

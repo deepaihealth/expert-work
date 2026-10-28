@@ -14,6 +14,10 @@ from expert_work.persistence import (
     InMemoryTenantUserStore,
     InMemoryUserWorkspaceStore,
 )
+from expert_work.persistence.knowledge import (
+    InMemoryKnowledgeRetrievalLogStore,
+    RetrievalLogEntry,
+)
 from expert_work.protocol import MemoryItem
 from expert_work.runtime.storage import InMemoryObjectStore
 from retention_cleanup_job.job import CleanupReport, RetentionCleanupJob
@@ -47,6 +51,7 @@ def test_cleanup_report_default_is_all_zero() -> None:
     assert report.memory_writeback_jobs_deleted == 0
     assert report.knowledge_tasks_deleted == 0
     assert report.knowledge_revisions_deleted == 0
+    assert report.knowledge_retrieval_logs_deleted == 0
     assert report.duration_seconds == 0.0
     assert report.audit_deleted_by_tenant == {}
 
@@ -86,6 +91,48 @@ def test_job_rejects_non_positive_knowledge_revision_orphan_days() -> None:
             db_session_factory=_no_session,  # type: ignore[arg-type]
             knowledge_revision_orphan_days=0,
         )
+
+
+def test_job_rejects_non_positive_knowledge_retrieval_log_retention_days() -> None:
+    with pytest.raises(ValueError, match="knowledge_retrieval_log_retention_days"):
+        RetentionCleanupJob(
+            db_session_factory=_no_session,  # type: ignore[arg-type]
+            knowledge_retrieval_log_retention_days=0,
+        )
+
+
+async def test_retrieval_logs_past_retention_go_in_bounded_batches() -> None:
+    """B-175 P2-PR4 — rows older than the window are deleted ``batch_size`` at
+    a time until none is left; newer rows stay. Without a store, nothing runs."""
+    logs = InMemoryKnowledgeRetrievalLogStore()
+    tenant, kb = uuid4(), uuid4()
+
+    def entry(age_days: float) -> RetrievalLogEntry:
+        return RetrievalLogEntry(
+            tenant_id=tenant,
+            kb_ids=(kb,),
+            source="agent",
+            query="q",
+            status="ok",
+            latency_ms=1,
+            created_at=datetime.now(UTC) - timedelta(days=age_days),
+        )
+
+    kept = entry(29.5)
+    for row in (*(entry(30.5 + day) for day in range(5)), kept):
+        await logs.add(row)
+    job = RetentionCleanupJob(
+        db_session_factory=_no_session,  # type: ignore[arg-type]
+        batch_size=2,
+        knowledge_retrieval_log_store=logs,
+        knowledge_retrieval_log_retention_days=30,
+    )
+
+    assert await job._delete_expired_knowledge_retrieval_logs() == 5
+    rows, total = await logs.list_for_base(tenant_id=tenant, kb_id=kb)
+    assert (total, rows) == (1, [kept])
+    unwired = RetentionCleanupJob(db_session_factory=_no_session)  # type: ignore[arg-type]
+    assert await unwired._delete_expired_knowledge_retrieval_logs() == 0
 
 
 def test_job_rejects_non_positive_image_retention_days() -> None:

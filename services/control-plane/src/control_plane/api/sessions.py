@@ -60,6 +60,7 @@ from expert_work.persistence import WORKSPACE_AGENTS_DIR
 from expert_work.persistence.agent_spec import AgentSpecStore
 from expert_work.persistence.approval import ApprovalStore
 from expert_work.persistence.artifact import ArtifactStore
+from expert_work.persistence.knowledge import KnowledgeRetrievalLogStore
 from expert_work.persistence.memory import MemoryWritebackJobStore
 from expert_work.persistence.tenant_config import TenantConfigStore
 from expert_work.persistence.tenant_user import TenantUserStore
@@ -158,6 +159,10 @@ def _get_approval_store(request: Request) -> ApprovalStore:
 def _get_memory_writeback_jobs(request: Request) -> MemoryWritebackJobStore | None:
     # B-168 —— 记忆后台写回任务表;create_app 总会挂上,测试里自建的 app 可能没有。
     return getattr(request.app.state, "memory_writeback_job_store", None)
+
+
+def _get_retrieval_logs(request: Request) -> KnowledgeRetrievalLogStore:
+    return request.app.state.knowledge_retrieval_log_store  # type: ignore[no-any-return]
 
 
 def _get_audit(request: Request) -> AuditLogger:
@@ -1019,10 +1024,15 @@ def build_sessions_router() -> APIRouter:
         writeback_jobs: Annotated[
             MemoryWritebackJobStore | None, Depends(_get_memory_writeback_jobs)
         ],
+        retrieval_logs: Annotated[KnowledgeRetrievalLogStore, Depends(_get_retrieval_logs)],
     ) -> JSONResponse:
         """Hard-delete — irreversibly purge the whole conversation.
 
-        Removes ONLY thread-scoped data (checkpoint messages, run rows +
+        Removes ONLY thread-scoped data (the knowledge retrieval log rows —
+        first, all-or-nothing, and again best-effort after the thread row; a
+        run still executing on the conversation is not stopped, so a search it
+        logs after that second pass stays until retention — checkpoint
+        messages, run rows +
         their run_event children, agent_approval rows, the thread_meta row,
         and — 留存链 B-27 — the thread's own ``threads/<thread_id>/``
         projection directory in the user's workspace). The user's persistent
@@ -1041,7 +1051,24 @@ def build_sessions_router() -> APIRouter:
             "approvals": 0,
             "threads_dir": False,
             "memory_writeback_jobs": 0,
+            "retrieval_logs": 0,
         }
+
+        # B-175 P2-PR4 — first the conversation's knowledge retrieval logs (the
+        # questions asked), by thread, whoever's run wrote them. If they cannot
+        # go, nothing goes: once the runs and the thread row are gone nothing
+        # finds those rows again — kept as is, a retry purges them all.
+        try:
+            logs_deleted = await retrieval_logs.delete_for_threads(
+                tenant_id=tenant_id, thread_ids=[thread_id]
+            )
+        except Exception as exc:
+            logger.warning("session_purge.retrieval_logs_failed error=%s", type(exc).__name__)
+            raise HTTPException(
+                status_code=503,
+                detail="retrieval logs could not be deleted; nothing was purged, retry",
+            ) from exc
+        deleted["retrieval_logs"] = logs_deleted
 
         # B-168 —— 先删这个会话没写完的记忆后台写回任务:worker 写记忆前会查任务行,
         # 行没了就放弃,不会在删会话之后再从它的对话里抽记忆。
@@ -1088,6 +1115,15 @@ def build_sessions_router() -> APIRouter:
             deleted["approvals_delete_failed"] = True
 
         removed = await threads.delete(thread_id, tenant_id=tenant_id)
+        # B-175 P2-PR4 — once more: a run still executing on the conversation
+        # (the purge does not stop runs) may have logged a search meanwhile.
+        try:
+            logs_deleted += await retrieval_logs.delete_for_threads(
+                tenant_id=tenant_id, thread_ids=[thread_id]
+            )
+            deleted["retrieval_logs"] = logs_deleted
+        except Exception as exc:  # best-effort: retention removes a straggler
+            logger.warning("session_purge.retrieval_logs_failed error=%s", type(exc).__name__)
         # 留存链 B-27 —— the thread's projected-state directory
         # (``threads/<thread_id>/``: MEMORY.md / PLAN.md / TODO.md) goes with the
         # thread. After the row delete on purpose: once the row is gone the

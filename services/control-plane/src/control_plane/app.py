@@ -69,6 +69,7 @@ from control_plane.api import (
     build_feedback_router,
     build_health_router,
     build_knowledge_figures_router,
+    build_knowledge_logs_router,
     build_knowledge_maintenance_router,
     build_knowledge_passages_router,
     build_knowledge_router,
@@ -370,8 +371,11 @@ from expert_work.persistence.image_upload import (
     SqlImageUploadStore,
 )
 from expert_work.persistence.knowledge import (
+    InMemoryKnowledgeRetrievalLogStore,
     InMemoryKnowledgeStore,
+    KnowledgeRetrievalLogStore,
     KnowledgeStore,
+    SqlKnowledgeRetrievalLogStore,
     SqlKnowledgeStore,
 )
 from expert_work.persistence.mcp_connector_catalog import (
@@ -606,6 +610,7 @@ def create_app(
     eval_run_repo: EvalRunStore | None = None,
     artifact_repo: ArtifactStore | None = None,
     knowledge_repo: KnowledgeStore | None = None,
+    knowledge_retrieval_log_repo: KnowledgeRetrievalLogStore | None = None,
     image_upload_repo: ImageUploadStore | None = None,
     user_upload_repo: UserUploadStore | None = None,
     approval_repo: ApprovalStore | None = None,
@@ -722,6 +727,10 @@ def create_app(
     # knowledge_search tool.
     resolved_knowledge_store: KnowledgeStore = knowledge_repo or (
         sql_stores.knowledge if sql_stores else InMemoryKnowledgeStore()
+    )
+    # B-175 P2-PR4 — every knowledge search's log row (agent + console test).
+    resolved_retrieval_log_store: KnowledgeRetrievalLogStore = knowledge_retrieval_log_repo or (
+        sql_stores.knowledge_retrieval_log if sql_stores else InMemoryKnowledgeRetrievalLogStore()
     )
     # Stream J.6.补强-3 (Mini-ADR J-32) — image upload registry.
     resolved_image_upload_store: ImageUploadStore = image_upload_repo or (
@@ -1802,7 +1811,10 @@ def create_app(
                     rerank_guards=rerank_guards,
                 )
                 knowledge_retriever = make_knowledge_retriever(
-                    store=resolved_knowledge_store, embedder=embedder, reranker=reranker
+                    store=resolved_knowledge_store,
+                    embedder=embedder,
+                    reranker=reranker,
+                    retrieval_log=resolved_retrieval_log_store,
                 )
                 # Reused by the ``/v1/knowledge/bases/{name}/test`` endpoint so
                 # the retrieval-test mirrors production retrieval exactly.
@@ -2704,6 +2716,7 @@ def create_app(
     app.state.quality_config_service = quality_config_service
     app.state.sandbox_egress_audit_store = resolved_egress_audit_store
     app.state.knowledge_store = resolved_knowledge_store
+    app.state.knowledge_retrieval_log_store = resolved_retrieval_log_store
     app.state.image_upload_store = resolved_image_upload_store
     app.state.user_upload_store = resolved_user_upload_store
     app.state.skill_store = resolved_skill_store
@@ -2928,6 +2941,7 @@ def create_app(
     app.include_router(build_workspace_router())
     app.include_router(build_knowledge_router())
     app.include_router(build_knowledge_figures_router())
+    app.include_router(build_knowledge_logs_router())
     app.include_router(build_knowledge_maintenance_router())
     app.include_router(build_knowledge_passages_router())
     app.include_router(build_me_router())
@@ -3038,6 +3052,7 @@ class _SqlStores:
     memory_dlq: MemoryWritebackDLQ  # Stream K.K7
     memory_writeback_job: MemoryWritebackJobStore  # B-168
     knowledge: KnowledgeStore
+    knowledge_retrieval_log: KnowledgeRetrievalLogStore  # B-175 P2-PR4
     skill: SkillStore
     image_upload: ImageUploadStore  # Stream J.6.补强-3 (Mini-ADR J-32)
     user_upload: UserUploadStore  # 对外附件模型统一(spec 2026-08-17)
@@ -3266,6 +3281,7 @@ def _build_sql_stores(settings: Settings) -> _SqlStores:
             session_factory, claim_lock_classid=MEMORY_WRITEBACK_CLAIM_LOCK_CLASSID
         ),
         knowledge=SqlKnowledgeStore(session_factory),
+        knowledge_retrieval_log=SqlKnowledgeRetrievalLogStore(session_factory),
         skill=SqlSkillStore(session_factory),
         image_upload=SqlImageUploadStore(session_factory),
         user_upload=SqlUserUploadStore(session_factory),

@@ -60,8 +60,11 @@ _DB = "knowledge_document_api"
 _MIB = 1 << 20
 _MD = b"# Handbook\n\nThe deductible is 500 dollars per year."
 _UUID = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
-#: Differ between runs (or, for ``score``, between float4 and float8 vectors).
-_VOLATILE = frozenset({"created_at", "updated_at", "score"})
+#: Differ between runs (or, for the vector / keyword scores, between Postgres's
+#: float4 and Python's float8 arithmetic; ``elapsed_ms`` is wall-clock).
+_VOLATILE = frozenset(
+    {"created_at", "updated_at", "score", "vector_score", "keyword_score", "elapsed_ms"}
+)
 
 
 class _FakeEmbeddingConfig:

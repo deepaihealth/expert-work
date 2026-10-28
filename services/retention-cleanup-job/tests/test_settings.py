@@ -66,3 +66,15 @@ def test_knowledge_task_retention_defaults_to_90_days() -> None:
     """B-175 L2-PR3 —— 知识库任务行收尾后留 90 天。"""
     settings = RetentionCleanupSettings(_env_file=None)  # type: ignore[call-arg]
     assert settings.knowledge_task_retention_days == 90
+
+
+def test_knowledge_retrieval_log_retention_defaults_to_30_days() -> None:
+    """B-175 P2-PR4 — user ruling 2026-10-27: retrieval logs are kept 30 days."""
+    settings = RetentionCleanupSettings(_env_file=None)  # type: ignore[call-arg]
+    assert settings.knowledge_retrieval_log_retention_days == 30
+
+
+def test_knowledge_retrieval_log_retention_rejects_zero(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("EXPERT_WORK_RETENTION_KNOWLEDGE_RETRIEVAL_LOG_RETENTION_DAYS", "0")
+    with pytest.raises(ValueError, match="knowledge_retrieval_log_retention_days"):
+        RetentionCleanupSettings(_env_file=None)  # type: ignore[call-arg]
