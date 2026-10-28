@@ -39,10 +39,11 @@ import {
   Upload,
 } from "antd";
 import type { TableColumnsType, TablePaginationConfig } from "antd";
-import { Eye, RefreshCw, ScanText, Trash2, Undo2 } from "lucide-react";
+import { CircleStop, Eye, RefreshCw, ScanText, Trash2, Undo2 } from "lucide-react";
 import { useTranslation } from "react-i18next";
 
 import {
+  cancelDocuments,
   deleteDocument,
   discardPendingDocument,
   KNOWLEDGE_DOCUMENT_MAX_BYTES,
@@ -72,7 +73,13 @@ const STATUS_COLOR: Record<DocumentStatus, string> = {
   processing: "processing",
   ready: "success",
   failed: "error",
+  cancelled: "warning",
 };
+
+/** B-222 — the statuses an ingest can still be cancelled from. */
+function isCancellable(status: DocumentStatus): boolean {
+  return status === "pending" || status === "processing";
+}
 
 const POLL_INTERVAL_MS = 5_000;
 const DOC_TABLE_PAGE_SIZE = 50;
@@ -329,6 +336,26 @@ export function DocumentsTab({ baseName, readScope, readonly }: DocumentsTabProp
     [t, baseName, message, refresh],
   );
 
+  const handleCancel = useCallback(
+    async (documentId: string) => {
+      try {
+        const [result] = await cancelDocuments(baseName, [documentId]);
+        if (result?.outcome === "cancelled") {
+          message.success(t("knowledge_page.cancel_ingest_done"));
+        } else if (result?.outcome === "not_cancellable") {
+          // Settled, or past the point of no return (writing its chunks).
+          message.info(t("knowledge_page.cancel_ingest_not_cancellable"));
+        } else {
+          message.warning(t("knowledge_page.cancel_ingest_not_found"));
+        }
+      } catch (err) {
+        message.error(errMessage(err));
+      }
+      await refresh();
+    },
+    [t, baseName, message, refresh],
+  );
+
   const handleDelete = useCallback(
     async (documentId: string) => {
       try {
@@ -357,7 +384,12 @@ export function DocumentsTab({ baseName, readScope, readonly }: DocumentsTabProp
         width: 220,
         render: (status: DocumentStatus, record) => {
           const tag = <Tag color={STATUS_COLOR[status]}>{t(`knowledge_page.status_${status}`)}</Tag>;
-          const reason = status === "failed" ? documentErrorText(t, i18n.language, record) : null;
+          const reason =
+            status === "failed"
+              ? documentErrorText(t, i18n.language, record)
+              : status === "cancelled"
+                ? t("knowledge_page.status_cancelled_hint")
+                : null;
           const statusTag = reason ? <Tooltip title={reason}>{tag}</Tooltip> : tag;
           const pages = (
             <>
@@ -382,7 +414,9 @@ export function DocumentsTab({ baseName, readScope, readonly }: DocumentsTabProp
                 title={t(
                   status === "failed"
                     ? "knowledge_page.pending_failed_hint"
-                    : "knowledge_page.pending_ingesting_hint",
+                    : status === "cancelled"
+                      ? "knowledge_page.pending_cancelled_hint"
+                      : "knowledge_page.pending_ingesting_hint",
                 )}
               >
                 <Tag
@@ -450,6 +484,30 @@ export function DocumentsTab({ baseName, readScope, readonly }: DocumentsTabProp
                 data-testid={`doc-chunks-${record.id}`}
               />
             </Tooltip>
+            {isCancellable(record.status) && (
+              <ReadonlyTooltip on={readonly}>
+                <Popconfirm
+                  title={t("knowledge_page.cancel_ingest_confirm_title", {
+                    name: record.filename,
+                  })}
+                  description={t("knowledge_page.cancel_ingest_confirm_body")}
+                  onConfirm={() => void handleCancel(record.id)}
+                  okText={t("knowledge_page.cancel_ingest")}
+                  disabled={readonly}
+                >
+                  <Tooltip title={t("knowledge_page.cancel_ingest")}>
+                    <Button
+                      size="small"
+                      type="text"
+                      disabled={readonly}
+                      icon={<CircleStop size={14} strokeWidth={1.5} />}
+                      aria-label={t("knowledge_page.cancel_ingest")}
+                      data-testid={`doc-cancel-${record.id}`}
+                    />
+                  </Tooltip>
+                </Popconfirm>
+              </ReadonlyTooltip>
+            )}
             <ReadonlyTooltip on={readonly}>
               <Tooltip title={t("knowledge_page.reingest")}>
                 <Button
@@ -530,7 +588,7 @@ export function DocumentsTab({ baseName, readScope, readonly }: DocumentsTabProp
         ),
       },
     ],
-    [t, i18n.language, handleReingest, handleRecognize, handleDiscardPending, handleDelete, readonly],
+    [t, i18n.language, handleReingest, handleRecognize, handleDiscardPending, handleCancel, handleDelete, readonly],
   );
 
   const pagination = useMemo<TablePaginationConfig>(

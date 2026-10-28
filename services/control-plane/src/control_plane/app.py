@@ -2179,7 +2179,7 @@ def create_app(
                 if figure_reconciler is not None:
                     figure_reconciler.start()
                     _app.state.knowledge_figure_reconciler = figure_reconciler
-                _app.state.knowledge_ingestion_runner = KnowledgeIngestionRunner(
+                knowledge_runner = KnowledgeIngestionRunner(
                     store=resolved_knowledge_store,
                     embedder=embedder,
                     lease_seconds=resolved_settings.knowledge_ingest_lease_s,
@@ -2189,6 +2189,7 @@ def create_app(
                     usage=ingest_usage,
                     figures=figure_describer,
                 )
+                _app.state.knowledge_ingestion_runner = knowledge_runner
                 # Stream KB — durable crash recovery for ingestion: claims stuck
                 # documents (pending / lease-expired processing) and re-drives
                 # them from retained bytes.
@@ -2203,6 +2204,8 @@ def create_app(
                         recognizer=document_recognizer,
                         usage=ingest_usage,
                         figures=figure_describer,
+                        # B-222: a cancel on this pod stops its drives at once.
+                        local=knowledge_runner.local,
                     )
                     knowledge_recovery_worker.start()
                     _app.state.knowledge_recovery_worker = knowledge_recovery_worker

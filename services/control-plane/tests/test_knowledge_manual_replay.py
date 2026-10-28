@@ -789,12 +789,14 @@ async def test_a_reindex_refused_without_a_reupload_is_not_stamped(
     assert "knowledge.reindex_document_superseded" not in caplog.text
 
 
-async def test_a_reindex_superseded_by_a_reupload_still_stamps(
+async def test_a_reindex_superseded_by_a_reupload_is_not_stamped_yet(
     store: KnowledgeStore, caplog: pytest.LogCaptureFixture
 ) -> None:
     """A re-upload lands while the re-index embeds (a new generation): its own
     ingest embeds the new version with the live model, so this document is
-    skipped and the base is still stamped."""
+    skipped — but until that version is in, the previous chunks serve on the
+    old model (for good if the re-upload is cancelled or fails, B-222), so the
+    base is not stamped yet."""
     doc = await _doc(store)
 
     async def meanwhile() -> None:
@@ -808,8 +810,9 @@ async def test_a_reindex_superseded_by_a_reupload_still_stamps(
     with caplog.at_level("INFO", logger="control_plane.knowledge.ingestion"):
         await _reindex(doc, _Hooked(meanwhile))
 
-    assert (await _models(doc))[1] == "new"
+    assert (await _models(doc))[1] != "new"
     assert "knowledge.reindex_document_superseded" in caplog.text
+    assert "knowledge.reindex_chunks_left_on_old_model" in caplog.text
 
 
 async def test_a_reindex_writes_with_the_status_it_read(store: KnowledgeStore) -> None:

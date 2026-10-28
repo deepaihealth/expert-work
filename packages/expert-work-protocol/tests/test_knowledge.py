@@ -34,6 +34,8 @@ def test_document_status_values() -> None:
         "processing",
         "ready",
         "failed",
+        # B-222 — the user stopped the ingest.
+        "cancelled",
         # Reserved for B-179 content safety; nothing writes them yet.
         "blocked",
         "disabled",

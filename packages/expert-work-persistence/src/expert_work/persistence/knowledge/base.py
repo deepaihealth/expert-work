@@ -143,6 +143,10 @@ class ClaimedIngestion:
     generation: int
 
 
+#: B-222 —— what :meth:`KnowledgeStore.cancel_documents` did with one document.
+CancelOutcome = Literal["cancelled", "not_cancellable", "not_found"]
+
+
 #: B-209 §5.5 —— what a ``knowledge_parse_cache`` row holds: a scanned page's
 #: raw reading (PR-1); a figure's description / text (PR-2); the semantic
 #: chunker's topic-shift decisions for one embedding model (B-215).
@@ -459,7 +463,29 @@ class KnowledgeStore(abc.ABC):
         status to ``READY`` (and ``stage=ready``) when serving chunks exist,
         else ``FAILED`` with a note; ``error_code`` is cleared either way.
         ``None`` when the document does not exist; the document unchanged
-        when nothing was pending."""
+        when nothing was pending, or when the pending version's ingest is past
+        the point of no return (B-222: ``processing`` at ``indexing``, see
+        :meth:`cancel_documents`) — it still ``has_pending``."""
+
+    @abc.abstractmethod
+    async def cancel_documents(
+        self, *, tenant_id: UUID, kb_id: UUID, document_ids: Sequence[UUID]
+    ) -> dict[UUID, CancelOutcome]:
+        """B-222 —— stop the ingest of each of the base's ``pending`` /
+        ``processing`` documents: status ``CANCELLED``, ``error='cancelled by
+        user'``, ``ingest_generation`` bumped (the worker still busy with it
+        is fenced out of every write, its lease renewal included) and the
+        lease released; ``stage``, the byte slots and serving chunks are kept.
+        ``processing`` at ``stage=indexing`` is past the point of no return
+        (its new chunks are being swapped in, READY follows): the fenced stage
+        write to it and the cancel serialise on the row, so a cancel never
+        lands between the swap and READY. That holds whatever the lease: a
+        worker whose lease ran out there may have died after its swap, with
+        the new chunks serving — the recovery worker re-claims such a
+        document. One outcome per distinct id:
+        ``cancelled``; ``not_cancellable`` (any other status, ``cancelled``
+        included, or at indexing — nothing is written); ``not_found`` (no such
+        document in this base of this tenant)."""
 
     @abc.abstractmethod
     async def sweep_terminal(self, *, now: datetime, max_attempts: int) -> int:
@@ -947,6 +973,16 @@ class KnowledgeStore(abc.ABC):
         document can have tens of thousands of chunks, so an implementation
         should hand back compact vectors (``array("d")``), not tuples of
         Python floats (B-216)."""
+
+    @abc.abstractmethod
+    async def has_chunks_off_model(
+        self, *, tenant_id: UUID, kb_id: UUID, embedding_model: str | None
+    ) -> bool:
+        """Whether any searchable chunk of the base was embedded by another
+        model than ``embedding_model`` (a ``NULL`` model counts as another) —
+        what a re-index checks before it stamps the base with the new model
+        (B-222: a re-upload that landed meanwhile and was then cancelled or
+        failed leaves its previous chunks serving on the old model)."""
 
     @abc.abstractmethod
     async def search(

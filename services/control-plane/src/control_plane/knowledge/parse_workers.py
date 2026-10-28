@@ -12,11 +12,12 @@
 from __future__ import annotations
 
 import asyncio
+import functools
 import logging
 import multiprocessing
 import sys
 from collections.abc import Callable
-from concurrent.futures import Executor, ProcessPoolExecutor
+from concurrent.futures import Executor, Future, ProcessPoolExecutor
 from concurrent.futures.process import BrokenProcessPool
 from dataclasses import dataclass
 from typing import Any
@@ -69,6 +70,68 @@ def terminate_workers(executor: Executor) -> None:
             logger.warning("knowledge.parse_pool_terminate_failed", exc_info=True)
 
 
+class PoolSlot:
+    """One call's hold on a pool's concurrency slot (B-222). Cancelled while
+    its call still runs in a worker — the asyncio side cannot stop it (an
+    ingest cancelled on this pod) — the slot is handed on only once that
+    worker is done, or the next call would wait in the pool's queue on its
+    own clock. The call keeps its deadline: past it ``kill`` frees the worker
+    (the pool is killed) and the slot is handed on."""
+
+    def __init__(self, slots: asyncio.Semaphore) -> None:
+        self._slots = slots
+        self._call: Future[Any] | None = None
+        self._deadline = 0.0
+        self._kill: Callable[[], None] = _no_kill
+        self._held = False
+        self._timer: asyncio.TimerHandle | None = None
+
+    def holds(self, call: Future[Any], *, deadline: float, kill: Callable[[], None]) -> None:
+        """The call now running on the slot, its deadline (loop time) and how
+        to free its worker once it is overdue."""
+        self._call, self._deadline, self._kill = call, deadline, kill
+
+    async def __aenter__(self) -> PoolSlot:
+        await self._slots.acquire()
+        self._held = True
+        return self
+
+    async def __aexit__(self, exc_type: type[BaseException] | None, *_: object) -> None:
+        call = self._call
+        cancelled = exc_type is not None and issubclass(exc_type, asyncio.CancelledError)
+        if not cancelled or call is None or call.done():
+            self._release()
+            return
+        loop = asyncio.get_running_loop()
+        self._timer = loop.call_later(max(0.0, self._deadline - loop.time()), self._overdue)
+        call.add_done_callback(lambda _: _soon(loop, self._release))
+
+    def _overdue(self) -> None:
+        if self._call is not None and not self._call.done():
+            self._kill()
+        self._release()
+
+    def _release(self) -> None:
+        """Hand the slot on — once (the call ending and its deadline both lead here)."""
+        if self._timer is not None:
+            self._timer.cancel()
+        if self._held:
+            self._held = False
+            self._slots.release()
+
+
+def _no_kill() -> None:
+    return None
+
+
+def _soon(loop: asyncio.AbstractEventLoop, callback: Callable[[], None]) -> None:
+    """Run ``callback`` on ``loop`` from a pool's callback thread."""
+    try:
+        loop.call_soon_threadsafe(callback)
+    except RuntimeError:  # pragma: no cover - the loop is gone (shutdown)
+        pass
+
+
 @dataclass
 class PoolBudget:
     """B-209 (review M2) —— one parse-pool time budget per document: page
@@ -108,15 +171,20 @@ class FigurePool:
         worker died earlier) is rebuilt and the call handed to the new one
         once. Raises :class:`DocumentParseError` (out of time / memory) or
         ``BrokenProcessPool`` — the caller falls back to "no figures"."""
-        async with self._get_slots():
+        async with PoolSlot(self._get_slots()) as slot:
             if budget.remaining <= 0:
                 msg = f"figures of {filename!r} out of time"
                 raise DocumentParseError(msg)
             loop = asyncio.get_running_loop()
-            executor, future = self._submit(fn, args)
+            executor, call = self._submit(fn, args)
             started = loop.time()
+            slot.holds(
+                call,
+                deadline=started + budget.remaining,
+                kill=functools.partial(self._kill_overdue, executor, filename),
+            )
             try:
-                return await asyncio.wait_for(future, timeout=budget.remaining)
+                return await asyncio.wait_for(asyncio.wrap_future(call), timeout=budget.remaining)
             except TimeoutError as exc:
                 logger.warning("knowledge.figure_pool_timeout document=%r — killing it", filename)
                 self._discard(executor)
@@ -131,14 +199,18 @@ class FigurePool:
             finally:
                 budget.charge(loop.time() - started)
 
+    def _kill_overdue(self, executor: Executor, filename: str) -> None:
+        """A cancelled figure call past its time (B-222): free its worker."""
+        logger.warning("knowledge.figure_pool_overdue document=%r — killing it", filename)
+        self._discard(executor)
+
     def _submit(
         self, fn: Callable[..., object], args: tuple[object, ...]
-    ) -> tuple[Executor, asyncio.Future[Any]]:
-        loop = asyncio.get_running_loop()
+    ) -> tuple[Executor, Future[Any]]:
         for attempt in (1, 2):
             executor = self._get_executor()
             try:
-                return executor, loop.run_in_executor(executor, fn, *args)
+                return executor, executor.submit(fn, *args)
             except BrokenProcessPool:
                 self._discard(executor)
                 if attempt == 2:
