@@ -889,3 +889,71 @@ async def test_knowledge_task_retention_deletes_old_finished_rows_only(
         assert report.knowledge_tasks_deleted >= 4
     finally:
         await worker_engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_orphaned_knowledge_revisions_go_after_30_days(
+    db_fixture: tuple[AsyncEngine, AsyncEngine, str],
+) -> None:
+    """B-175 P3-PR2 —— 重新入库没能套回去的人工修改(``orphaned_at`` 有值)满 30 天删掉;
+    不满 30 天的、整块还在的(``orphaned_at`` 为空,不管多老)都留着。迁移 0176 的授权缺了
+    这里会 permission denied。只数本用例自造文档的行。"""
+    _app_engine, worker_engine, sync_admin = db_fixture
+    try:
+        tenant, kb, document = uuid4(), uuid4(), uuid4()
+        admin = create_engine(sync_admin, isolation_level="AUTOCOMMIT")
+        try:
+            with admin.connect() as conn:
+                conn.execute(
+                    text("INSERT INTO knowledge_base (id, tenant_id, name) VALUES (:k, :t, 'kb')"),
+                    {"k": str(kb), "t": str(tenant)},
+                )
+                conn.execute(
+                    text(
+                        "INSERT INTO knowledge_document (id, tenant_id, kb_id, filename, status) "
+                        "VALUES (:d, :t, :k, 'a.md', 'ready')"
+                    ),
+                    {"d": str(document), "t": str(tenant), "k": str(kb)},
+                )
+                insert = text(
+                    "INSERT INTO knowledge_chunk_revision (tenant_id, kb_id, document_id, "
+                    " chunk_id, revision, content, created_at, orphaned_at) "
+                    "VALUES (:t, :k, :d, gen_random_uuid(), 1, :label, "
+                    " now() - make_interval(days => 100), "
+                    " CASE WHEN :age >= 0 THEN now() - make_interval(days => :age) END)"
+                )
+                for label, age in (("old orphan", 40), ("recent orphan", 10), ("alive", -1)):
+                    conn.execute(
+                        insert,
+                        {
+                            "t": str(tenant),
+                            "k": str(kb),
+                            "d": str(document),
+                            "label": label,
+                            "age": age,
+                        },
+                    )
+        finally:
+            admin.dispose()
+
+        job = RetentionCleanupJob(
+            db_session_factory=create_async_session_factory(worker_engine),
+            batch_size=10000,
+            knowledge_revision_orphan_days=30,
+        )
+        report = await job.run_once()
+
+        async with worker_engine.begin() as conn:
+            remaining = sorted(
+                row[0]
+                for row in (
+                    await conn.execute(
+                        text("SELECT content FROM knowledge_chunk_revision WHERE document_id = :d"),
+                        {"d": str(document)},
+                    )
+                ).all()
+            )
+        assert remaining == ["alive", "recent orphan"]
+        assert report.knowledge_revisions_deleted >= 1
+    finally:
+        await worker_engine.dispose()

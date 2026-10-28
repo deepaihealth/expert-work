@@ -47,6 +47,8 @@ class CleanupReport:
     memory_writeback_jobs_deleted: int = 0
     # B-175 L2-PR3 —— 收尾满保留期的知识库任务行。
     knowledge_tasks_deleted: int = 0
+    # B-175 P3-PR2 —— 重新入库没能套回去满 30 天的分段修订行。
+    knowledge_revisions_deleted: int = 0
     duration_seconds: float = 0.0
     # Per-tenant breakdown of audit deletes (for observability).
     audit_deleted_by_tenant: dict[str, int] = field(default_factory=dict)

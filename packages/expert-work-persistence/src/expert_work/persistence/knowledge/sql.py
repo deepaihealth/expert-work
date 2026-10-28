@@ -6,12 +6,13 @@ import logging
 import operator
 import re
 from array import array
-from collections.abc import Callable, Collection, Sequence
+from collections.abc import Callable, Collection, Mapping, Sequence
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
 from typing import Any
-from uuid import UUID
+from uuid import UUID, uuid4
 
+from pgvector.sqlalchemy import Vector
 from sqlalchemy import (
     Float,
     Row,
@@ -20,6 +21,8 @@ from sqlalchemy import (
     and_,
     any_,
     case,
+    cast,
+    column,
     delete,
     func,
     literal,
@@ -28,15 +31,20 @@ from sqlalchemy import (
     select,
     text,
     true,
+    tuple_,
     update,
 )
+from sqlalchemy import values as sa_values
 from sqlalchemy.dialects.postgresql import ARRAY
+from sqlalchemy.dialects.postgresql import UUID as PG_UUID
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.exc import DBAPIError, IntegrityError, InterfaceError, OperationalError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+from sqlalchemy.orm import aliased
 from sqlalchemy.sql.elements import ColumnElement
 from sqlalchemy.sql.selectable import CTE
 
+from expert_work.persistence.embedding import EMBEDDING_DIM
 from expert_work.persistence.knowledge.base import (
     ALL_TENANTS_BASES_LIMIT,
     UNSET,
@@ -50,6 +58,23 @@ from expert_work.persistence.knowledge.base import (
     RowSecurityActiveError,
     _Unset,
 )
+from expert_work.persistence.knowledge.passages import (
+    SWITCH_OFF_REVISION,
+    ChunkVector,
+    DisabledReason,
+    ManualPassage,
+    Passage,
+    PassageChild,
+    PassageConflictError,
+    PassageLayout,
+    PassageRevision,
+    SwitchOffRecord,
+    edited_since,
+    manual_passages,
+    passage_rows,
+    settle_switch_off,
+    unapplied_revisions,
+)
 from expert_work.persistence.knowledge.text_search import (
     KB_DOC_TITLE_HIT_WEIGHT,
     KB_KEYWORD_PHRASE_BOOST,
@@ -61,6 +86,7 @@ from expert_work.persistence.knowledge.text_search import (
 )
 from expert_work.persistence.models import (
     KnowledgeBaseRow,
+    KnowledgeChunkRevisionRow,
     KnowledgeChunkRow,
     KnowledgeDocSeqRow,
     KnowledgeDocumentRow,
@@ -161,6 +187,34 @@ def _fence(
     return [
         KnowledgeDocumentRow.status == status.value,
         KnowledgeDocumentRow.ingest_generation == generation,
+    ]
+
+
+def _documents_where(
+    tenant_id: UUID,
+    kb_id: UUID,
+    enabled: bool | None = None,
+    statuses: Collection[DocumentStatus] | None = None,
+) -> list[ColumnElement[bool]]:
+    """The base's documents, optionally only those switched ``enabled`` and
+    in one of ``statuses`` (an empty collection matches none)."""
+    where = [KnowledgeDocumentRow.tenant_id == tenant_id, KnowledgeDocumentRow.kb_id == kb_id]
+    if enabled is not None:
+        where.append(KnowledgeDocumentRow.enabled.is_(enabled))
+    if statuses is not None:
+        where.append(KnowledgeDocumentRow.status.in_(sorted(s.value for s in statuses)))
+    return where
+
+
+def _stale_where(tenant_id: UUID, kb_id: UUID, params_hash: str) -> list[ColumnElement[bool]]:
+    """Ready documents whose chunks were cut by other parameters (or by
+    parameters never recorded)."""
+    return [
+        *_documents_where(tenant_id, kb_id, statuses=(DocumentStatus.READY,)),
+        or_(
+            KnowledgeDocumentRow.chunk_params_hash.is_(None),
+            KnowledgeDocumentRow.chunk_params_hash != params_hash,
+        ),
     ]
 
 
@@ -293,6 +347,7 @@ _CHUNK_COLUMNS = (
     KnowledgeChunkRow.content_hash,
     KnowledgeChunkRow.embedding_model,
     KnowledgeChunkRow.enabled,
+    KnowledgeChunkRow.disabled_reason,
     KnowledgeChunkRow.edited,
     KnowledgeChunkRow.revision,
     KnowledgeChunkRow.parent_chunk_id,
@@ -321,12 +376,21 @@ def _to_chunk(row: Any, embedding: tuple[float, ...] | None = ()) -> KnowledgeCh
         content_hash=row.content_hash,
         embedding_model=row.embedding_model,
         enabled=row.enabled,
+        disabled_reason=_disabled_reason(row.disabled_reason),
         edited=row.edited,
         revision=row.revision,
         parent_chunk_id=row.parent_chunk_id,
         source_locator=row.source_locator,
         created_at=row.created_at,
     )
+
+
+def _disabled_reason(value: str | None) -> DisabledReason | None:
+    """``knowledge_chunk.disabled_reason`` as the DTO takes it (the column's
+    CHECK allows only these two)."""
+    if value == "inherited":
+        return "inherited"
+    return "manual" if value is not None else None
 
 
 def _to_chunk_with_embedding(row: KnowledgeChunkRow) -> KnowledgeChunk:
@@ -348,6 +412,27 @@ def _chunk_type_in(chunk_types: Collection[ChunkType] | None) -> ColumnElement[b
         else sorted(chunk_type.value for chunk_type in chunk_types)
     )
     return KnowledgeChunkRow.chunk_type.in_(values)
+
+
+def _recall_scope(tenant_id: UUID, kb_ids: Sequence[UUID]) -> tuple[ColumnElement[bool], ...]:
+    """What recall may return — and so BM25's N: the tenant's chunks in
+    ``kb_ids`` of the searchable types, enabled, of a document that is not
+    disabled (B-175 P3-PR2). The disabled documents are one uncorrelated
+    ``NOT IN`` (a hashed filter on the scan), so a vector search still walks
+    its index in distance order and filters before ``LIMIT``."""
+    kbs = list(kb_ids)
+    disabled_documents = select(KnowledgeDocumentRow.id).where(
+        KnowledgeDocumentRow.tenant_id == tenant_id,
+        KnowledgeDocumentRow.kb_id.in_(kbs),
+        KnowledgeDocumentRow.enabled.is_(False),
+    )
+    return (
+        KnowledgeChunkRow.tenant_id == tenant_id,
+        KnowledgeChunkRow.kb_id.in_(kbs),
+        _chunk_type_in(None),
+        KnowledgeChunkRow.enabled.is_(True),
+        KnowledgeChunkRow.document_id.not_in(disabled_documents),
+    )
 
 
 def _balanced(
@@ -546,11 +631,376 @@ def _chunk_row(chunk: KnowledgeChunk) -> KnowledgeChunkRow:
         content_hash=chunk.content_hash,
         embedding_model=chunk.embedding_model,
         enabled=chunk.enabled,
+        disabled_reason=None if chunk.enabled else chunk.disabled_reason,
         edited=chunk.edited,
         revision=chunk.revision,
         parent_chunk_id=chunk.parent_chunk_id,
         source_locator=chunk.source_locator,
     )
+
+
+# -- passages (B-175 P3-PR2) --------------------------------------------------
+
+
+def _passage_rows_where(tenant_id: UUID, document_id: UUID) -> tuple[ColumnElement[bool], ...]:
+    """The document's passage rows: parent rows, and chunks with none."""
+    return (
+        KnowledgeChunkRow.tenant_id == tenant_id,
+        KnowledgeChunkRow.document_id == document_id,
+        or_(
+            KnowledgeChunkRow.chunk_type == ChunkType.PARENT.value,
+            and_(_chunk_type_in(None), KnowledgeChunkRow.parent_chunk_id.is_(None)),
+        ),
+    )
+
+
+def _passages_stmt(tenant_id: UUID, document_id: UUID, *extra: ColumnElement[bool]) -> Select[Any]:
+    """The document's passage rows in document order: a parent row where its
+    first chunk is (one with no chunk last), a lone chunk where it is."""
+    child = aliased(KnowledgeChunkRow)
+    first = (
+        select(
+            child.parent_chunk_id.label("passage_id"),
+            func.min(child.chunk_index).label("position"),
+        )
+        .where(
+            child.tenant_id == tenant_id,
+            child.document_id == document_id,
+            child.parent_chunk_id.is_not(None),
+            child.chunk_type.in_(_SEARCHABLE_TYPE_VALUES),
+        )
+        .group_by(child.parent_chunk_id)
+        .subquery("first_chunk")
+    )
+    position = case(
+        (KnowledgeChunkRow.chunk_type == ChunkType.PARENT.value, first.c.position),
+        else_=KnowledgeChunkRow.chunk_index,
+    )
+    return (
+        select(*_CHUNK_COLUMNS)
+        .outerjoin(first, first.c.passage_id == KnowledgeChunkRow.id)
+        .where(*_passage_rows_where(tenant_id, document_id), *extra)
+        .order_by(
+            position.asc().nulls_last(),
+            KnowledgeChunkRow.chunk_type.asc(),
+            KnowledgeChunkRow.chunk_index.asc(),
+        )
+    )
+
+
+async def _read_passages(
+    session: AsyncSession,
+    tenant_id: UUID,
+    document_id: UUID,
+    stmt: Select[Any],
+    *,
+    enabled_only: bool = False,
+) -> list[Passage]:
+    """The passages ``stmt`` (a :func:`_passages_stmt`) selects, each with
+    its chunks — one more query for the parent rows' chunks."""
+    rows = [_to_chunk(row) for row in (await session.execute(stmt)).all()]
+    parents = [row.id for row in rows if row.chunk_type is ChunkType.PARENT]
+    under: dict[UUID | None, list[KnowledgeChunk]] = {}
+    if parents:
+        where = [
+            KnowledgeChunkRow.tenant_id == tenant_id,
+            KnowledgeChunkRow.document_id == document_id,
+            KnowledgeChunkRow.parent_chunk_id.in_(parents),
+            _chunk_type_in(None),
+        ]
+        if enabled_only:
+            where.append(KnowledgeChunkRow.enabled.is_(True))
+        children = select(*_CHUNK_COLUMNS).where(*where).order_by(KnowledgeChunkRow.chunk_index)
+        for row in (await session.execute(children)).all():
+            chunk = _to_chunk(row)
+            under.setdefault(chunk.parent_chunk_id, []).append(chunk)
+    return [
+        Passage(row, tuple(under.get(row.id, ())) if row.chunk_type is ChunkType.PARENT else (row,))
+        for row in rows
+    ]
+
+
+async def _read_passage(
+    session: AsyncSession, tenant_id: UUID, document_id: UUID, passage_id: UUID
+) -> Passage | None:
+    stmt = _passages_stmt(tenant_id, document_id, KnowledgeChunkRow.id == passage_id)
+    found = await _read_passages(session, tenant_id, document_id, stmt)
+    return found[0] if found else None
+
+
+async def _lock_settled_document(
+    session: AsyncSession, tenant_id: UUID, document_id: UUID
+) -> UUID | None:
+    """Lock the document row a passage write changes (the order a fenced
+    ``replace_chunks`` takes: the row, then its chunks) and return its base;
+    ``None`` when there is no such document. :class:`PassageConflictError`
+    while its chunks are about to be replaced (being ingested, or a new
+    version waits)."""
+    row = (
+        await session.execute(
+            select(
+                KnowledgeDocumentRow.kb_id,
+                KnowledgeDocumentRow.status,
+                KnowledgeDocumentRow.has_pending,
+            )
+            .where(
+                KnowledgeDocumentRow.tenant_id == tenant_id,
+                KnowledgeDocumentRow.id == document_id,
+            )
+            .with_for_update()
+        )
+    ).one_or_none()
+    if row is None:
+        await session.rollback()
+        return None
+    if row.status != DocumentStatus.READY.value or row.has_pending:
+        await session.rollback()
+        raise PassageConflictError("document_busy")
+    return UUID(str(row.kb_id))
+
+
+async def _next_numbers(
+    session: AsyncSession, tenant_id: UUID, document_id: UUID
+) -> dict[str, int]:
+    """The document's first free chunk number and first free parent number."""
+    is_parent = KnowledgeChunkRow.chunk_type == ChunkType.PARENT.value
+    last_chunk, last_parent = (
+        await session.execute(
+            select(
+                func.max(case((_chunk_type_in(None), KnowledgeChunkRow.chunk_index))),
+                func.max(case((is_parent, KnowledgeChunkRow.chunk_index))),
+            ).where(
+                KnowledgeChunkRow.tenant_id == tenant_id,
+                KnowledgeChunkRow.document_id == document_id,
+            )
+        )
+    ).one()
+    return {
+        "next_index": 0 if last_chunk is None else int(last_chunk) + 1,
+        "next_parent_index": 0 if last_parent is None else int(last_parent) + 1,
+    }
+
+
+async def _write_passage(
+    session: AsyncSession,
+    layout: PassageLayout,
+    *,
+    content: str,
+    heading_path: Sequence[str],
+    children: Sequence[PassageChild],
+    revision: int,
+    edited: bool,
+    enabled: bool,
+    disabled_reason: DisabledReason | None = None,
+) -> None:
+    """Swap the passage's rows (:func:`passage_rows`) and recount the
+    document's chunks, inside the caller's transaction."""
+    rows = passage_rows(
+        layout,
+        content=content,
+        heading_path=heading_path,
+        children=children,
+        revision=revision,
+        edited=edited,
+        enabled=enabled,
+        disabled_reason=disabled_reason,
+    )
+    scope = (
+        KnowledgeChunkRow.tenant_id == layout.tenant_id,
+        KnowledgeChunkRow.document_id == layout.document_id,
+    )
+    if layout.old is not None:
+        replaced = {layout.old.id, *(child.id for child in layout.old.children)}
+        await session.execute(
+            delete(KnowledgeChunkRow).where(*scope, KnowledgeChunkRow.id.in_(replaced))
+        )
+    session.add_all([_chunk_row(row) for row in rows])
+    await session.flush()
+    chunks = (
+        select(func.count())
+        .select_from(KnowledgeChunkRow)
+        .where(*scope, _chunk_type_in(None))
+        .scalar_subquery()
+    )
+    await session.execute(
+        update(KnowledgeDocumentRow)
+        .where(
+            KnowledgeDocumentRow.tenant_id == layout.tenant_id,
+            KnowledgeDocumentRow.id == layout.document_id,
+        )
+        .values(chunk_count=chunks, updated_at=datetime.now(UTC))
+    )
+
+
+def _revision_row(
+    tenant_id: UUID, kb_id: UUID, document_id: UUID, record: PassageRevision
+) -> KnowledgeChunkRevisionRow:
+    return KnowledgeChunkRevisionRow(
+        tenant_id=tenant_id,
+        kb_id=kb_id,
+        document_id=document_id,
+        chunk_id=record.passage_id,
+        revision=record.revision,
+        content=record.content,
+        heading_path=list(record.heading_path) or None,
+        edited_by=record.edited_by,
+    )
+
+
+async def _current_revisions(
+    session: AsyncSession,
+    tenant_id: UUID,
+    document_id: UUID,
+    histories: Mapping[UUID, Sequence[PassageRevision]],
+) -> dict[UUID, int]:
+    """The current revision of each passage with a history that still exists."""
+    if not histories:
+        return {}
+    rows = await session.execute(
+        select(KnowledgeChunkRow.id, KnowledgeChunkRow.revision).where(
+            *_passage_rows_where(tenant_id, document_id),
+            KnowledgeChunkRow.id.in_(list(histories)),
+        )
+    )
+    return {row.id: row.revision for row in rows.all()}
+
+
+async def _stamp_orphans(session: AsyncSession, tenant_id: UUID, document_id: UUID) -> None:
+    """Histories of passages the document no longer has get ``orphaned_at``
+    (once); a passage that is there again clears it. Switch-off records keep
+    their own (:func:`_write_switch_offs`)."""
+    present = select(KnowledgeChunkRow.id).where(*_passage_rows_where(tenant_id, document_id))
+    revisions = (
+        KnowledgeChunkRevisionRow.tenant_id == tenant_id,
+        KnowledgeChunkRevisionRow.document_id == document_id,
+        KnowledgeChunkRevisionRow.switch_off_lost.is_(False),
+    )
+    await session.execute(
+        update(KnowledgeChunkRevisionRow)
+        .where(
+            *revisions,
+            KnowledgeChunkRevisionRow.orphaned_at.is_(None),
+            KnowledgeChunkRevisionRow.chunk_id.not_in(present),
+        )
+        .values(orphaned_at=func.now())
+    )
+    await session.execute(
+        update(KnowledgeChunkRevisionRow)
+        .where(
+            *revisions,
+            KnowledgeChunkRevisionRow.orphaned_at.is_not(None),
+            KnowledgeChunkRevisionRow.chunk_id.in_(present),
+        )
+        .values(orphaned_at=None)
+    )
+
+
+async def _read_history(
+    session: AsyncSession,
+    tenant_id: UUID,
+    document_id: UUID,
+    passage_id: UUID | None = None,
+    *,
+    switch_offs: bool = False,
+) -> list[PassageRevision]:
+    """The document's text revision rows (one passage's, given
+    ``passage_id``), each passage's oldest first — or, ``switch_offs``, its
+    switch-off records."""
+    where = [
+        KnowledgeChunkRevisionRow.tenant_id == tenant_id,
+        KnowledgeChunkRevisionRow.document_id == document_id,
+        KnowledgeChunkRevisionRow.switch_off_lost.is_(switch_offs),
+    ]
+    if passage_id is not None:
+        where.append(KnowledgeChunkRevisionRow.chunk_id == passage_id)
+    rows = (
+        (
+            await session.execute(
+                select(KnowledgeChunkRevisionRow)
+                .where(*where)
+                .order_by(KnowledgeChunkRevisionRow.chunk_id, KnowledgeChunkRevisionRow.revision)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    return [
+        PassageRevision(
+            passage_id=row.chunk_id,
+            revision=row.revision,
+            content=row.content,
+            heading_path=tuple(row.heading_path or ()),
+            edited_by=row.edited_by,
+            created_at=row.created_at,
+            orphaned_at=row.orphaned_at,
+            switch_off_lost=row.switch_off_lost,
+        )
+        for row in rows
+    ]
+
+
+async def _write_switch_offs(
+    session: AsyncSession, tenant_id: UUID, document_id: UUID, records: Collection[SwitchOffRecord]
+) -> None:
+    """``replace_chunks(switch_offs=…)``: each record upserted as revision
+    :data:`SWITCH_OFF_REVISION` of its passage, ``orphaned_at`` cleared when
+    placed, else set once."""
+    kb_id = (
+        await session.execute(
+            select(KnowledgeDocumentRow.kb_id).where(
+                KnowledgeDocumentRow.tenant_id == tenant_id, KnowledgeDocumentRow.id == document_id
+            )
+        )
+    ).scalar_one()
+    for record in records:
+        orphaned = None if record.placed else func.now()
+        insert = pg_insert(KnowledgeChunkRevisionRow).values(
+            tenant_id=tenant_id,
+            kb_id=kb_id,
+            document_id=document_id,
+            chunk_id=record.passage_id,
+            revision=SWITCH_OFF_REVISION,
+            content=record.content,
+            heading_path=list(record.heading_path) or None,
+            edited_by=None,
+            switch_off_lost=True,
+            orphaned_at=orphaned,
+        )
+        await session.execute(
+            insert.on_conflict_do_update(
+                constraint="knowledge_chunk_revision_uniq",
+                set_={
+                    "content": insert.excluded.content,
+                    "heading_path": insert.excluded.heading_path,
+                    "orphaned_at": None
+                    if record.placed
+                    else func.coalesce(KnowledgeChunkRevisionRow.orphaned_at, func.now()),
+                },
+            )
+        )
+
+
+async def _settle_switch_offs(
+    session: AsyncSession, tenant_id: UUID, document_id: UUID, passage: Passage
+) -> None:
+    """A person decided about ``passage``, off by inheritance: its paragraphs
+    leave the document's switch-off records (an emptied one is deleted)."""
+    for record in await _read_history(session, tenant_id, document_id, switch_offs=True):
+        settled = settle_switch_off(record.content, passage.row.content)
+        if settled == record.content:
+            continue
+        mine = (
+            KnowledgeChunkRevisionRow.tenant_id == tenant_id,
+            KnowledgeChunkRevisionRow.document_id == document_id,
+            KnowledgeChunkRevisionRow.chunk_id == record.passage_id,
+            KnowledgeChunkRevisionRow.revision == SWITCH_OFF_REVISION,
+        )
+        if settled:
+            await session.execute(
+                update(KnowledgeChunkRevisionRow).where(*mine).values(content=settled)
+            )
+        else:
+            await session.execute(delete(KnowledgeChunkRevisionRow).where(*mine))
 
 
 class SqlKnowledgeStore(KnowledgeStore):
@@ -870,6 +1320,13 @@ class SqlKnowledgeStore(KnowledgeStore):
                             KnowledgeDocumentRow.kb_id == kb_id,
                         )
                     ),
+                )
+            )
+            # B-175 P3-PR2 — the passages' history (the FK cascades too, 0176).
+            await session.execute(
+                delete(KnowledgeChunkRevisionRow).where(
+                    KnowledgeChunkRevisionRow.tenant_id == tenant_id,
+                    KnowledgeChunkRevisionRow.kb_id == kb_id,
                 )
             )
             await session.execute(
@@ -1261,38 +1718,46 @@ class SqlKnowledgeStore(KnowledgeStore):
             await session.commit()
         return int(getattr(result, "rowcount", 0) or 0) > 0
 
-    async def list_documents(self, *, tenant_id: UUID, kb_id: UUID) -> list[KnowledgeDocument]:
+    async def list_documents(
+        self,
+        *,
+        tenant_id: UUID,
+        kb_id: UUID,
+        enabled: bool | None = None,
+        statuses: Collection[DocumentStatus] | None = None,
+    ) -> list[KnowledgeDocument]:
+        stmt = self._documents_stmt(_documents_where(tenant_id, kb_id, enabled, statuses))
         async with self._sf() as session:
-            rows = (await session.execute(self._documents_stmt(tenant_id, kb_id))).scalars().all()
+            rows = (await session.execute(stmt)).scalars().all()
         return [_to_document(row) for row in rows]
 
     async def list_documents_page(
-        self, *, tenant_id: UUID, kb_id: UUID, limit: int, offset: int
+        self,
+        *,
+        tenant_id: UUID,
+        kb_id: UUID,
+        limit: int,
+        offset: int,
+        enabled: bool | None = None,
+        statuses: Collection[DocumentStatus] | None = None,
     ) -> tuple[list[KnowledgeDocument], int]:
-        page_stmt = self._documents_stmt(tenant_id, kb_id).offset(offset).limit(limit)
-        count_stmt = (
-            select(func.count())
-            .select_from(KnowledgeDocumentRow)
-            .where(
-                KnowledgeDocumentRow.tenant_id == tenant_id,
-                KnowledgeDocumentRow.kb_id == kb_id,
-            )
-        )
+        where = _documents_where(tenant_id, kb_id, enabled, statuses)
+        page_stmt = self._documents_stmt(where).offset(offset).limit(limit)
+        count_stmt = select(func.count()).select_from(KnowledgeDocumentRow).where(*where)
         async with self._sf() as session:
             rows = (await session.execute(page_stmt)).scalars().all()
             total = (await session.execute(count_stmt)).scalar_one()
         return [_to_document(row) for row in rows], int(total)
 
     @staticmethod
-    def _documents_stmt(tenant_id: UUID, kb_id: UUID) -> Select[tuple[KnowledgeDocumentRow]]:
+    def _documents_stmt(
+        where: Sequence[ColumnElement[bool]],
+    ) -> Select[tuple[KnowledgeDocumentRow]]:
         # ``id`` tiebreak keeps pages stable when several documents share a
         # ``created_at`` (batch upload).
         return (
             select(KnowledgeDocumentRow)
-            .where(
-                KnowledgeDocumentRow.tenant_id == tenant_id,
-                KnowledgeDocumentRow.kb_id == kb_id,
-            )
+            .where(*where)
             .order_by(KnowledgeDocumentRow.created_at.desc(), KnowledgeDocumentRow.id.desc())
         )
 
@@ -1376,6 +1841,13 @@ class SqlKnowledgeStore(KnowledgeStore):
                 delete(KnowledgeParseCacheRow).where(
                     KnowledgeParseCacheRow.tenant_id == tenant_id,
                     KnowledgeParseCacheRow.document_id == document_id,
+                )
+            )
+            # B-175 P3-PR2 — the passages' history (the FK cascades too, 0176).
+            await session.execute(
+                delete(KnowledgeChunkRevisionRow).where(
+                    KnowledgeChunkRevisionRow.tenant_id == tenant_id,
+                    KnowledgeChunkRevisionRow.document_id == document_id,
                 )
             )
             await session.execute(
@@ -1576,6 +2048,373 @@ class SqlKnowledgeStore(KnowledgeStore):
             )
             await session.commit()
 
+    # -- maintenance (B-175 P3-PR2) -------------------------------------------
+
+    async def set_documents_enabled(
+        self, *, tenant_id: UUID, kb_id: UUID, document_ids: Sequence[UUID], enabled: bool
+    ) -> list[UUID]:
+        if not document_ids:
+            return []
+        async with self._sf() as session:
+            done = set(
+                (
+                    await session.execute(
+                        update(KnowledgeDocumentRow)
+                        .where(
+                            *_documents_where(tenant_id, kb_id),
+                            KnowledgeDocumentRow.id.in_(list(dict.fromkeys(document_ids))),
+                        )
+                        .values(enabled=enabled, updated_at=datetime.now(UTC))
+                        .returning(KnowledgeDocumentRow.id)
+                    )
+                )
+                .scalars()
+                .all()
+            )
+            await session.commit()
+        return [document_id for document_id in dict.fromkeys(document_ids) if document_id in done]
+
+    async def count_stale_documents(self, *, tenant_id: UUID, kb_id: UUID, params_hash: str) -> int:
+        stmt = (
+            select(func.count())
+            .select_from(KnowledgeDocumentRow)
+            .where(*_stale_where(tenant_id, kb_id, params_hash))
+        )
+        async with self._sf() as session:
+            return int((await session.execute(stmt)).scalar_one())
+
+    async def list_stale_documents(
+        self, *, tenant_id: UUID, kb_id: UUID, params_hash: str
+    ) -> list[KnowledgeDocument]:
+        stmt = self._documents_stmt(_stale_where(tenant_id, kb_id, params_hash))
+        async with self._sf() as session:
+            rows = (await session.execute(stmt)).scalars().all()
+        return [_to_document(row) for row in rows]
+
+    async def list_passages(
+        self,
+        *,
+        tenant_id: UUID,
+        document_id: UUID,
+        enabled_only: bool = False,
+        offset: int = 0,
+        limit: int | None = None,
+        disabled_reason: DisabledReason | None = None,
+    ) -> list[Passage]:
+        extra: list[ColumnElement[bool]] = []
+        if disabled_reason is not None:
+            extra.append(KnowledgeChunkRow.disabled_reason == disabled_reason)
+        if enabled_only:
+            extra.append(KnowledgeChunkRow.enabled.is_(True))
+            extra.append(
+                select(KnowledgeDocumentRow.id)
+                .where(
+                    KnowledgeDocumentRow.tenant_id == tenant_id,
+                    KnowledgeDocumentRow.id == document_id,
+                    KnowledgeDocumentRow.enabled.is_(True),
+                )
+                .exists()
+            )
+        stmt = _passages_stmt(tenant_id, document_id, *extra).offset(offset)
+        if limit is not None:
+            stmt = stmt.limit(limit)
+        async with self._sf() as session:
+            return await _read_passages(
+                session, tenant_id, document_id, stmt, enabled_only=enabled_only
+            )
+
+    async def count_passages(self, *, tenant_id: UUID, document_id: UUID) -> int:
+        stmt = (
+            select(func.count())
+            .select_from(KnowledgeChunkRow)
+            .where(*_passage_rows_where(tenant_id, document_id))
+        )
+        async with self._sf() as session:
+            return int((await session.execute(stmt)).scalar_one())
+
+    async def get_passage(
+        self, *, tenant_id: UUID, document_id: UUID, passage_id: UUID
+    ) -> Passage | None:
+        async with self._sf() as session:
+            return await _read_passage(session, tenant_id, document_id, passage_id)
+
+    async def replace_passage(
+        self,
+        *,
+        tenant_id: UUID,
+        document_id: UUID,
+        passage_id: UUID,
+        expected_revision: int,
+        content: str,
+        heading_path: Sequence[str],
+        children: Sequence[PassageChild],
+        edited_by: str | None,
+    ) -> Passage | None:
+        async with self._sf() as session:
+            kb_id = await _lock_settled_document(session, tenant_id, document_id)
+            if kb_id is None:
+                return None
+            old = await _read_passage(session, tenant_id, document_id, passage_id)
+            if old is None:
+                await session.rollback()
+                return None
+            if old.row.revision != expected_revision:
+                await session.rollback()
+                raise PassageConflictError("revision_conflict", current=old)
+            history = await _read_history(session, tenant_id, document_id, passage_id)
+            if not history:
+                # The text ingested from the file, kept before its first change.
+                history = [
+                    PassageRevision(
+                        passage_id=passage_id,
+                        revision=old.row.revision,
+                        content=old.row.content,
+                        heading_path=old.row.heading_path,
+                        edited_by=None,
+                    )
+                ]
+                session.add(_revision_row(tenant_id, kb_id, document_id, history[0]))
+            revision = max(old.row.revision, history[-1].revision) + 1
+            session.add(
+                _revision_row(
+                    tenant_id,
+                    kb_id,
+                    document_id,
+                    PassageRevision(
+                        passage_id=passage_id,
+                        revision=revision,
+                        content=content,
+                        heading_path=tuple(heading_path),
+                        edited_by=edited_by,
+                    ),
+                )
+            )
+            await _write_passage(
+                session,
+                PassageLayout(
+                    passage_id=passage_id,
+                    tenant_id=tenant_id,
+                    kb_id=kb_id,
+                    document_id=document_id,
+                    old=old,
+                    **await _next_numbers(session, tenant_id, document_id),
+                ),
+                content=content,
+                heading_path=heading_path,
+                children=children,
+                revision=revision,
+                edited=edited_since(history[0], content, heading_path),
+                enabled=old.row.enabled,
+                disabled_reason=old.row.disabled_reason,
+            )
+            written = await _read_passage(session, tenant_id, document_id, passage_id)
+            await session.commit()
+        return written
+
+    async def add_passage(
+        self,
+        *,
+        tenant_id: UUID,
+        document_id: UUID,
+        content: str,
+        heading_path: Sequence[str],
+        children: Sequence[PassageChild],
+        edited_by: str | None,
+    ) -> Passage | None:
+        passage_id = uuid4()
+        async with self._sf() as session:
+            kb_id = await _lock_settled_document(session, tenant_id, document_id)
+            if kb_id is None:
+                return None
+            first = PassageRevision(
+                passage_id=passage_id,
+                revision=1,
+                content=content,
+                heading_path=tuple(heading_path),
+                edited_by=edited_by,
+            )
+            session.add(_revision_row(tenant_id, kb_id, document_id, first))
+            await _write_passage(
+                session,
+                PassageLayout(
+                    passage_id=passage_id,
+                    tenant_id=tenant_id,
+                    kb_id=kb_id,
+                    document_id=document_id,
+                    old=None,
+                    **await _next_numbers(session, tenant_id, document_id),
+                ),
+                content=content,
+                heading_path=heading_path,
+                children=children,
+                revision=1,
+                edited=True,
+                enabled=True,
+            )
+            written = await _read_passage(session, tenant_id, document_id, passage_id)
+            await session.commit()
+        return written
+
+    async def set_passage_enabled(
+        self, *, tenant_id: UUID, document_id: UUID, passage_id: UUID, enabled: bool
+    ) -> Passage | None:
+        async with self._sf() as session:
+            if await _lock_settled_document(session, tenant_id, document_id) is None:
+                return None
+            passage = await _read_passage(session, tenant_id, document_id, passage_id)
+            if passage is None:
+                await session.rollback()
+                return None
+            await session.execute(
+                update(KnowledgeChunkRow)
+                .where(
+                    KnowledgeChunkRow.tenant_id == tenant_id,
+                    KnowledgeChunkRow.document_id == document_id,
+                    KnowledgeChunkRow.id.in_({passage.id, *(c.id for c in passage.children)}),
+                )
+                .values(enabled=enabled, disabled_reason=None if enabled else "manual")
+            )
+            if passage.row.disabled_reason == "inherited":
+                await _settle_switch_offs(session, tenant_id, document_id, passage)
+            written = await _read_passage(session, tenant_id, document_id, passage_id)
+            await session.commit()
+        return written
+
+    async def list_passage_revisions(
+        self, *, tenant_id: UUID, document_id: UUID, passage_id: UUID
+    ) -> list[PassageRevision]:
+        async with self._sf() as session:
+            return await _read_history(session, tenant_id, document_id, passage_id)
+
+    async def list_unapplied_revisions(
+        self, *, tenant_id: UUID, document_id: UUID
+    ) -> list[PassageRevision]:
+        async with self._sf() as session:
+            histories: dict[UUID, list[PassageRevision]] = {}
+            for record in await _read_history(session, tenant_id, document_id):
+                histories.setdefault(record.passage_id, []).append(record)
+            current = await _current_revisions(session, tenant_id, document_id, histories)
+            records = await _read_history(session, tenant_id, document_id, switch_offs=True)
+        return unapplied_revisions(histories, current, records)
+
+    async def discard_unapplied_revisions(self, *, tenant_id: UUID, document_id: UUID) -> int:
+        async with self._sf() as session:
+            histories: dict[UUID, list[PassageRevision]] = {}
+            for record in await _read_history(session, tenant_id, document_id):
+                histories.setdefault(record.passage_id, []).append(record)
+            current = await _current_revisions(session, tenant_id, document_id, histories)
+            records = await _read_history(session, tenant_id, document_id, switch_offs=True)
+            unapplied = unapplied_revisions(histories, current, records)
+            if not unapplied:
+                return 0
+            # Gone: the whole history; still there: the revisions above its
+            # own; a switch-off record: itself.
+            doomed = [
+                and_(
+                    KnowledgeChunkRevisionRow.chunk_id == r.passage_id,
+                    KnowledgeChunkRevisionRow.switch_off_lost.is_(r.switch_off_lost),
+                    true()
+                    if r.switch_off_lost
+                    else KnowledgeChunkRevisionRow.revision > current.get(r.passage_id, 0),
+                )
+                for r in unapplied
+            ]
+            deleted = (
+                (
+                    await session.execute(
+                        delete(KnowledgeChunkRevisionRow)
+                        .where(
+                            KnowledgeChunkRevisionRow.tenant_id == tenant_id,
+                            KnowledgeChunkRevisionRow.document_id == document_id,
+                            or_(*doomed),
+                        )
+                        .returning(KnowledgeChunkRevisionRow.id)
+                    )
+                )
+                .scalars()
+                .all()
+            )
+            await session.commit()
+        return len(deleted)
+
+    async def list_manual_passages(
+        self, *, tenant_id: UUID, document_id: UUID
+    ) -> list[ManualPassage]:
+        # Every passage row is read: a manual passage's ``occurrence`` counts
+        # the identical passages before it, manual or not.
+        stmt = _passages_stmt(tenant_id, document_id)
+        async with self._sf() as session:
+            rows = [_to_chunk(row) for row in (await session.execute(stmt)).all()]
+            histories: dict[UUID, list[PassageRevision]] = {}
+            for record in await _read_history(session, tenant_id, document_id):
+                histories.setdefault(record.passage_id, []).append(record)
+        return manual_passages(rows, histories)
+
+    async def list_switch_offs(
+        self, *, tenant_id: UUID, document_id: UUID
+    ) -> list[PassageRevision]:
+        async with self._sf() as session:
+            return await _read_history(session, tenant_id, document_id, switch_offs=True)
+
+    async def update_chunk_embeddings(
+        self,
+        *,
+        tenant_id: UUID,
+        document_id: UUID,
+        vectors: Sequence[ChunkVector],
+        embedding_model: str | None,
+        generation: int,
+        expect_status: DocumentStatus = DocumentStatus.READY,
+    ) -> int | None:
+        updated = 0
+        async with self._sf() as session:
+            # The document row first (the order a fenced replace_chunks and a
+            # passage write take): a passage write waits for this swap, or
+            # this swap sees its rows.
+            owner = (
+                await session.execute(
+                    select(KnowledgeDocumentRow.id)
+                    .where(
+                        KnowledgeDocumentRow.tenant_id == tenant_id,
+                        KnowledgeDocumentRow.id == document_id,
+                        *_fence(generation, expect_status),
+                    )
+                    .with_for_update()
+                )
+            ).scalar_one_or_none()
+            if owner is None:
+                await session.rollback()
+                return None
+            for start in range(0, len(vectors), _CHUNK_INSERT_BATCH):
+                batch = vectors[start : start + _CHUNK_INSERT_BATCH]
+                incoming = sa_values(
+                    column("chunk_id", PG_UUID(as_uuid=True)),
+                    column("content_hash", Text),
+                    column("embedding", Vector(EMBEDDING_DIM)),
+                    name="incoming",
+                ).data([(v.chunk_id, v.content_hash, list(v.embedding)) for v in batch])
+                result = await session.execute(
+                    update(KnowledgeChunkRow)
+                    .where(
+                        KnowledgeChunkRow.tenant_id == tenant_id,
+                        KnowledgeChunkRow.document_id == document_id,
+                        _chunk_type_in(None),
+                        KnowledgeChunkRow.id == incoming.c.chunk_id,
+                        KnowledgeChunkRow.content_hash.is_not_distinct_from(
+                            incoming.c.content_hash
+                        ),
+                    )
+                    # VALUES columns arrive as text: the vector is cast back.
+                    .values(
+                        embedding=cast(incoming.c.embedding, Vector(EMBEDDING_DIM)),
+                        embedding_model=embedding_model,
+                    )
+                    .returning(KnowledgeChunkRow.id)
+                )
+                updated += len(result.scalars().all())
+            await session.commit()
+        return updated
+
     # -- chunks -------------------------------------------------------------
 
     async def replace_chunks(
@@ -1587,6 +2426,7 @@ class SqlKnowledgeStore(KnowledgeStore):
         generation: int | None = None,
         expect_status: DocumentStatus = DocumentStatus.PROCESSING,
         chunk_params_hash: str | None = None,
+        switch_offs: Collection[SwitchOffRecord] = (),
     ) -> bool:
         async with self._sf() as session:
             if generation is not None:
@@ -1607,6 +2447,8 @@ class SqlKnowledgeStore(KnowledgeStore):
                 if owner is None:
                     await session.rollback()
                     return False
+            if switch_offs:
+                await _write_switch_offs(session, tenant_id, document_id, switch_offs)
             await session.execute(
                 delete(KnowledgeChunkRow).where(
                     KnowledgeChunkRow.tenant_id == tenant_id,
@@ -1636,6 +2478,7 @@ class SqlKnowledgeStore(KnowledgeStore):
                     )
                     .values(chunk_params_hash=chunk_params_hash)
                 )
+            await _stamp_orphans(session, tenant_id, document_id)
             await session.commit()
         return True
 
@@ -1647,6 +2490,7 @@ class SqlKnowledgeStore(KnowledgeStore):
         offset: int = 0,
         limit: int = 50,
         chunk_types: Collection[ChunkType] | None = None,
+        after: tuple[int, ChunkType] | None = None,
     ) -> tuple[list[KnowledgeChunk], int]:
         # Explicit column projection — never SELECT the large embedding vector
         # for a preview. The returned chunks carry ``embedding == ()`` (``None``
@@ -1656,9 +2500,15 @@ class SqlKnowledgeStore(KnowledgeStore):
             KnowledgeChunkRow.document_id == document_id,
             _chunk_type_in(chunk_types),
         )
+        position = (
+            tuple_(KnowledgeChunkRow.chunk_index, KnowledgeChunkRow.chunk_type)
+            > tuple_(literal(after[0]), literal(after[1].value))
+            if after is not None
+            else true()
+        )
         page_stmt = (
             select(*_CHUNK_COLUMNS)
-            .where(*in_scope)
+            .where(*in_scope, position)
             .order_by(KnowledgeChunkRow.chunk_index.asc(), KnowledgeChunkRow.chunk_type.asc())
             .offset(offset)
             .limit(limit)
@@ -1760,13 +2610,9 @@ class SqlKnowledgeStore(KnowledgeStore):
         distance = KnowledgeChunkRow.embedding.cosine_distance(vec)
         stmt = (
             select(KnowledgeChunkRow, distance.label("distance"))
-            .where(
-                KnowledgeChunkRow.tenant_id == tenant_id,
-                KnowledgeChunkRow.kb_id.in_(list(kb_ids)),
-                # Parent rows have no vector; a sequential scan would still
-                # return them (NULL distance sorts last).
-                _chunk_type_in(None),
-            )
+            # Searchable types only: parent rows have no vector, and a
+            # sequential scan would still return them (NULL distance sorts last).
+            .where(*_recall_scope(tenant_id, kb_ids))
             .order_by(distance)
             .limit(limit)
         )
@@ -1839,13 +2685,9 @@ class SqlKnowledgeStore(KnowledgeStore):
         kb_query = build_kb_keyword_query(query)
         if kb_query is None:
             return []
-        # Searchable types only — this scope is also BM25's N (``scope``
-        # below): parent rows would dilute every idf.
-        in_scope = (
-            KnowledgeChunkRow.tenant_id == tenant_id,
-            KnowledgeChunkRow.kb_id.in_(list(kb_ids)),
-            _chunk_type_in(None),
-        )
+        # Recallable chunks only — this scope is also BM25's N (``scope``
+        # below): parent rows and disabled chunks would dilute every idf.
+        in_scope = _recall_scope(tenant_id, kb_ids)
         hits = _kb_hits(kb_query, in_scope, _kb_keyword_tsquery(kb_query))
         units = len(kb_query.terms) + len(kb_query.phrases)
         # One row: each unit's BM25 idf. N = chunks in scope; df = matched

@@ -32,7 +32,7 @@ from control_plane.api.knowledge_rerank_threshold import (
     threshold_binding,
 )
 from control_plane.audit import emit
-from control_plane.knowledge.chunking import chunk_params_hash
+from control_plane.knowledge.chunking import PARENT_MAX_TOKENS, chunk_params_hash
 from control_plane.knowledge.ingestion import KnowledgeIngestionRunner
 from control_plane.knowledge.parsing import SUPPORTED_EXTENSIONS
 from control_plane.knowledge.recognition.figure_storage import (
@@ -249,6 +249,8 @@ def _base_dict(
         "chunk_params_hash": chunk_params_hash(
             max_tokens=base.chunk_max_tokens, overlap_tokens=base.chunk_overlap_tokens
         ),
+        # B-175 P3-PR2 —— read-only: a passage's cap (an edit may be up to twice it).
+        "parent_max_tokens": PARENT_MAX_TOKENS,
         "retrieval_config": {
             "top_k": base.retrieval_top_k,
             "score_threshold": base.retrieval_score_threshold,
@@ -796,6 +798,9 @@ def build_knowledge_router() -> APIRouter:
         offset: int = 0,
         # W3 read scope — subordinate detail read: concrete tenant only.
         tenant_id: Annotated[UUID | Literal["*"] | None, Query()] = None,
+        # B-175 P3-PR2 — only the documents switched that way / in these statuses.
+        enabled: bool | None = None,
+        status: Annotated[list[DocumentStatus] | None, Query()] = None,
     ) -> JSONResponse:
         scope = await ensure_single_tenant_scope(
             request.state.principal,
@@ -810,11 +815,18 @@ def build_knowledge_router() -> APIRouter:
         async with applied_scope(scope):
             base = await _require_base(store, scope.tenant_id, name)
             if safe_limit is None:
-                everything = await store.list_documents(tenant_id=scope.tenant_id, kb_id=base.id)
+                everything = await store.list_documents(
+                    tenant_id=scope.tenant_id, kb_id=base.id, enabled=enabled, statuses=status
+                )
                 documents, total = everything[safe_offset:], len(everything)
             else:
                 documents, total = await store.list_documents_page(
-                    tenant_id=scope.tenant_id, kb_id=base.id, limit=safe_limit, offset=safe_offset
+                    tenant_id=scope.tenant_id,
+                    kb_id=base.id,
+                    limit=safe_limit,
+                    offset=safe_offset,
+                    enabled=enabled,
+                    statuses=status,
                 )
         return JSONResponse(
             content={
