@@ -1442,6 +1442,66 @@ async def test_poll_end_frame_carries_usage(_fast_poll: None) -> None:
     assert _end_data(frames)["usage_by_model"] == [_USAGE_BUCKET]
 
 
+_FAILURES = [{"tool": "bash", "kind": "unknown"}]
+
+
+@pytest.mark.asyncio
+async def test_poll_end_frame_carries_the_completion_record(_fast_poll: None) -> None:
+    """B-226 ⑥ — cross-replica polling: the run row's ``completed`` /
+    ``exit_reason`` / ``unresolved_failures`` reach the end, and a limit stop
+    reads ``incomplete``."""
+    run_id = uuid4()
+
+    async def probe() -> RunTerminalProbe:
+        return RunTerminalProbe(
+            RunStatus.SUCCESS,
+            [],
+            completed=False,
+            exit_reason="max_steps",
+            unresolved_failures=_FAILURES,
+        )
+
+    plan = await build_event_producer(
+        run_id=run_id,
+        run_status=RunStatus.RUNNING,
+        event_store=InMemoryRunEventStore(),
+        stream_bridge=InMemoryStreamBridge(),  # unfed → the polling branch
+        run_probe=probe,
+        since_seq=None,
+        scope=None,
+    )
+    frames = _parse_sse(await asyncio.wait_for(_aiter_to_list(plan.producer), 10))
+
+    end = _end_data(frames)
+    assert end["status"] == "incomplete"
+    assert (end["completed"], end["exit_reason"]) == (False, "max_steps")
+    assert end["unresolved_failures"] == _FAILURES
+
+
+@pytest.mark.asyncio
+async def test_live_join_end_frame_carries_the_completion_record() -> None:
+    """B-226 ⑥ — live join: the bridge's end data carries the ledger through to
+    the end the client sees."""
+    run_id = uuid4()
+    bridge = InMemoryStreamBridge()
+    await bridge.publish_end(
+        run_id,
+        status="success",
+        completed=False,
+        exit_reason="text_response",
+        unresolved_failures=_FAILURES,
+    )
+
+    frames = await _collect_live(
+        run_id=run_id, event_store=InMemoryRunEventStore(), bridge=bridge, since_seq=None
+    )
+
+    end = _end_data(frames)
+    assert end["status"] == "success"
+    assert (end["completed"], end["exit_reason"]) == (False, "text_response")
+    assert end["unresolved_failures"] == _FAILURES
+
+
 @pytest.mark.asyncio
 async def test_sse_consumer_end_frame_carries_usage() -> None:
     """分支 4/4 —— ``sse_consumer``,**第三方的主路径**(``POST .../runs`` 的

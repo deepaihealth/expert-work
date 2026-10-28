@@ -301,9 +301,11 @@ GET /v1/agents/{agent_code}/runs
 | `regenerated_from` | string（UUID） \| null | 这一轮是对哪一轮的重新生成或者编辑重发；不是重来的一轮时是 `null` |
 | `completed` | boolean \| null | 这次 run 有没有把要做的事做成，与 [3.4 的 `end`](./sse-events#end) 里的同名字段相同。`null` 表示没有记录，多见于失败、被取消、还没结束的 run 与平台升级前的历史 run，不要当成 `false` |
 | `exit_reason` | string \| null | 这次 run 从哪个出口结束，`null` 的含义与 `completed` 相同。取值：`text_response`（助手自然说完）/ `max_steps`（步数用完）/ `no_progress`（连续多步没有进展）/ `token_budget`（token 预算用完）/ `approval_pending`（停在人工审批处）/ `approval_rejected`（审批被拒绝）；遇到不认识的取值时按「没有正常完成」处理 |
-| `unresolved_failures` | array \| null | 因为工具失败没做成时，是哪些工具。元素结构与 [3.4 的 `end`](./sse-events#end) 里的同名字段相同（`{tool, kind}`，最多 20 个）；`[]` 表示没有，`null` 的含义与 `completed` 相同 |
+| `unresolved_failures` | array \| null | 因为工具失败没做成时，是哪些工具。元素结构与 [3.4 的 `end`](./sse-events#end) 里的同名字段相同（`{tool, kind}`，最多 20 个）；`[]` 表示没有。`null` 表示没有记录，按「不清楚」处理，平台升级前的历史 run 可能 `completed` 有值而这里是 `null` |
 
 `status` 说的是这次 run 怎么结束的，`completed` 说的是要做的事做成了没有，`unresolved_failures` 说的是因为工具失败没做成时，是哪些工具。步数用完的 run 是 `status` 为 `incomplete`、`completed` 为 `false`，读法见 [3.4 的 `end`](./sse-events#end)。没有记录时，这三个字段在 `end` 事件里不出现，在这里是 `null`。
+
+这三个字段不一定同时有记录：平台升级前结束的历史 run 可能 `completed` 与 `exit_reason` 有值，`unresolved_failures` 却是 `null`。这时不清楚是哪些工具失败，不要当成 `[]`，也不要据此认为没有工具失败。
 
 停在人工审批处的 run 因同一会话发起新一轮而变为 `interrupted` 时，不是 `null`，而是保留 `completed` 为 `false`、`exit_reason` 为 `approval_pending`，见 [4.2 决策之前发起新一轮](./run-control#决策之前发起新一轮)。
 
@@ -1060,7 +1062,7 @@ curl "https://<your-domain>/v1/agents/{agent_code}/sessions/{session_id}/items?u
 | `regenerated_from` | string（UUID） \| null | 这一轮是对哪一轮的重新生成或者编辑重发；不是重来的一轮时是 `null` |
 | `completed` | boolean \| null | 这一轮有没有把要做的事做成，取值与 [5.4 run 列表](#_5-4-run-列表) 的同名字段相同。`null` 表示没有记录，不要当成 `false` |
 | `exit_reason` | string \| null | 这一轮从哪个出口结束，取值与 [5.4 run 列表](#_5-4-run-列表) 的同名字段相同 |
-| `unresolved_failures` | array \| null | 因为工具失败没做成时，是哪些工具，与 [5.4 run 列表](#_5-4-run-列表) 的同名字段相同。`[]` 表示没有，`null` 表示没有记录 |
+| `unresolved_failures` | array \| null | 因为工具失败没做成时，是哪些工具，与 [5.4 run 列表](#_5-4-run-列表) 的同名字段相同。`[]` 表示没有，`null` 表示没有记录、按「不清楚」处理，`completed` 有值时也可能是 `null` |
 
 `status` 为 `success` 只说明这一轮跑完了；`completed` 为 `false` 时这一轮没有把事做成，`unresolved_failures` 列出没有解决的工具失败。被平台的限制叫停的一轮是 `incomplete`。界面上应当把这样的一轮与真正做完的一轮区分开。
 

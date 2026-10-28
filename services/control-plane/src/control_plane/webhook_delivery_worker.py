@@ -125,6 +125,24 @@ _EVENT_TITLES: dict[str, str] = {
     "quality.drift": "质量漂移告警",
 }
 
+#: B-226 ⑥ — the ``run.completed`` title when the run finished without getting
+#: the work done: the console's orange-tag wording ("finished, not completed").
+_RUN_NOT_DONE_TITLE = "已结束\N{FULLWIDTH COMMA}未完成"
+
+
+def _im_title(row: WebhookDeliveryRecord) -> str:
+    """The title line: the event's title, except that a ``run.completed`` the
+    console would tag "finished, not completed" (``status=incomplete``, or
+    ``success`` with ``completed=false``) gets :data:`_RUN_NOT_DONE_TITLE`
+    instead of the plain "run completed" title."""
+    payload = row.payload or {}
+    status = payload.get("status")
+    if row.event_type == "run.completed" and (
+        status == "incomplete" or (status == "success" and payload.get("completed") is False)
+    ):
+        return _RUN_NOT_DONE_TITLE
+    return _EVENT_TITLES.get(row.event_type, row.event_type)
+
 
 def _im_text(row: WebhookDeliveryRecord) -> str:
     """Render one delivery as a plain-text IM bot message.
@@ -133,7 +151,7 @@ def _im_text(row: WebhookDeliveryRecord) -> str:
     raw event type) followed by the payload's scalar fields one per line —
     good enough for a human to act on, with the delivery id for tracing.
     """
-    title = _EVENT_TITLES.get(row.event_type, row.event_type)
+    title = _im_title(row)
     lines = [f"【Expert Work】{title}"]
     for key, value in sorted((row.payload or {}).items()):
         if value is None or isinstance(value, dict | list):

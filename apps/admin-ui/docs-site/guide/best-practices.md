@@ -84,7 +84,7 @@ flowchart LR
 |---|---|---|
 | `status` | 这一轮怎么结束的 | 只有 `success` 才可能是做成了；`incomplete`、`error`、`interrupted` 与不认识的取值都表示没做成，`paused` 表示还在等审批 |
 | `completed` | 要做的事做成了没有 | `false` 表示没做成；缺席或 `null` 表示没有记录，沿用 `status` 的判定 |
-| `unresolved_failures` | 因为工具失败没做成时，是哪些工具 | 用于提示用户或排查问题，不改变判定 |
+| `unresolved_failures` | 因为工具失败没做成时，是哪些工具 | 用于提示用户或排查问题，不改变判定；缺席或 `null` 表示不清楚，不是「没有失败」 |
 
 `guard` 事件只是提示某一道限制到了，不是这一轮的结果：限制可能来自子任务，主 Agent 仍可能把事做完。结论只看 `end`，见 [3.4 的 `end`](./sse-events#end)。
 

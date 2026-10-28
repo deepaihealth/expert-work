@@ -6,6 +6,7 @@ import hmac
 import json
 from datetime import UTC, datetime
 from hashlib import sha256
+from typing import Any
 from uuid import UUID, uuid4
 
 import pytest
@@ -738,3 +739,46 @@ def test_im_text_spells_bools_like_the_json_payload() -> None:
     assert "completed: true" in _text(True)
     assert "exit_reason: max_steps" in _text(False)
     assert not any(ln.startswith("completed:") for ln in _text(None))
+
+
+@pytest.mark.parametrize(
+    ("event_type", "payload", "title"),
+    [
+        # A platform limit stopped it: not "run completed".
+        (
+            "run.completed",
+            {"status": "incomplete", "completed": False},
+            "已结束\N{FULLWIDTH COMMA}未完成",
+        ),
+        # Finished on its own with an unresolved failure: same orange-tag wording.
+        (
+            "run.completed",
+            {"status": "success", "completed": False},
+            "已结束\N{FULLWIDTH COMMA}未完成",
+        ),
+        # Done, or no record: the plain title.
+        ("run.completed", {"status": "success", "completed": True}, "运行完成"),
+        ("run.completed", {"status": "success", "completed": None}, "运行完成"),
+        ("run.failed", {"status": "error", "completed": None}, "运行失败"),
+    ],
+)
+def test_im_title_reads_finished_not_completed_when_the_work_was_not_done(
+    event_type: str, payload: dict[str, Any], title: str
+) -> None:
+    """B-226 ⑥ — the bot title matches the console's orange tag: a run that
+    finished without getting the work done does not read 运行完成."""
+    from control_plane.webhook_delivery_worker import _im_text
+
+    row = WebhookDeliveryRecord(
+        id=uuid4(),
+        tenant_id=uuid4(),
+        endpoint_id=uuid4(),
+        event_id="run:x",
+        event_type=event_type,
+        payload=payload,
+        status=WebhookDeliveryStatus.PENDING,
+        attempt=0,
+        created_at=_NOW,
+        updated_at=_NOW,
+    )
+    assert _im_text(row).splitlines()[0] == f"【Expert Work】{title}"
