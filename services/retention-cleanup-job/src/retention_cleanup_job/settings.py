@@ -87,6 +87,12 @@ class RetentionCleanupSettings(BaseSettings):
     # 全局旋钮(与上面几个窗口一样),没有按租户覆盖。
     knowledge_task_retention_days: int = Field(default=90, ge=1, le=3650)
 
+    # --------------------------------------------------- knowledge retrieval log (B-175 P2-PR4)
+    # ``knowledge_retrieval_log``: one row per knowledge search (agent + console
+    # test), the question asked included. User ruling (2026-10-27): kept 30 days.
+    # Global knob like the windows above, no per-tenant override.
+    knowledge_retrieval_log_retention_days: int = Field(default=30, ge=1, le=3650)
+
     # --------------------------------------------------- 留存链 PR2(波 3 线 R)
     # 用户拍板(2026-09-09):产物 90 天、上传 90 天、已删工作区库行 90 天销账。
     # 产物版本复用上面的 ``artifact_retention_days``,已删工作区复用

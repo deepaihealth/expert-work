@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import time
 from collections.abc import Sequence
 from datetime import datetime
 from pathlib import Path
@@ -26,6 +27,7 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
 from control_plane.api._authz import console_only, require
+from control_plane.api.knowledge_hits import documents_by_id
 from control_plane.api.knowledge_rerank_threshold import (
     current_rerank_model,
     model_for_threshold,
@@ -53,6 +55,7 @@ from expert_work.persistence.knowledge import (
     ALL_TENANTS_BASES_LIMIT,
     UNSET,
     DuplicateKnowledgeBaseError,
+    KnowledgeRetrievalLogStore,
 )
 from expert_work.protocol import (
     DEFAULT_CHUNK_MAX_TOKENS,
@@ -69,6 +72,7 @@ from expert_work.protocol import (
     RetrievalMethod,
 )
 from expert_work.runtime.audit.logger import AuditLogger
+from orchestrator.tools.knowledge_log import RetrievalLogContext, retrieval_log_scope
 
 # NOTE: ``KnowledgeRetriever`` lives in ``orchestrator`` — importing it at
 # module top level would cycle (control-plane → orchestrator). The
@@ -153,6 +157,10 @@ def _get_ingestion_runner(request: Request) -> KnowledgeIngestionRunner | None:
 
 def _get_knowledge_retriever(request: Request) -> Any | None:
     return getattr(request.app.state, "knowledge_retriever", None)
+
+
+def _get_retrieval_log_store(request: Request) -> KnowledgeRetrievalLogStore:
+    return request.app.state.knowledge_retrieval_log_store  # type: ignore[no-any-return]
 
 
 def _get_embedding_config_service(request: Request) -> Any | None:
@@ -701,10 +709,26 @@ def build_knowledge_router() -> APIRouter:
         request: Request,
         store: Annotated[KnowledgeStore, Depends(_get_knowledge_store)],
         audit: Annotated[AuditLogger, Depends(_get_audit)],
+        log_store: Annotated[KnowledgeRetrievalLogStore, Depends(_get_retrieval_log_store)],
     ) -> Response:
         tenant_id: UUID = request.state.tenant_id
         base = await _require_base(store, tenant_id, name)
+        # B-175 P2-PR4 — the base's retrieval logs (questions asked of it) go
+        # with it: first, so a failure leaves the base to retry the delete on …
+        try:
+            await log_store.delete_for_base(tenant_id=tenant_id, kb_id=base.id)
+        except Exception as exc:
+            logger.warning("knowledge.base_delete_logs_failed error=%s", type(exc).__name__)
+            raise HTTPException(
+                status_code=503,
+                detail="retrieval logs could not be deleted; the base was kept, retry",
+            ) from exc
         await store.delete_base(tenant_id=tenant_id, kb_id=base.id)
+        # … and again after it, for a search that logged while it was going.
+        try:
+            await log_store.delete_for_base(tenant_id=tenant_id, kb_id=base.id)
+        except Exception as exc:  # best-effort: retention removes a straggler
+            logger.warning("knowledge.base_delete_logs_failed error=%s", type(exc).__name__)
         # B-209 PR-2 — the base's original figures go with it.
         await delete_figures_quietly(
             request.app.state.object_store, tenant_id=tenant_id, kb_id=base.id
@@ -1123,15 +1147,31 @@ def build_knowledge_router() -> APIRouter:
                     status_code=503,
                     detail="knowledge retrieval unavailable: no embedding model configured",
                 )
-            outcome = await retriever.search_detailed(
-                tenant_id=scope.tenant_id,
-                base_names=[base.name],
-                query=body.query,
-                limit=body.top_k or base.retrieval_top_k,
-                method=body.method,
-                score_threshold=body.score_threshold,
-                rerank=body.rerank,
-                rerank_score_threshold=body.rerank_score_threshold,
+            # B-175 P2-PR4 — logged as this employee's console test; the receipt
+            # brings back the search's latency and the row id once it is written.
+            caller = RetrievalLogContext(
+                source="console_test", actor_id=request.state.principal.subject_id
+            )
+            started = time.monotonic()
+            with retrieval_log_scope(caller) as receipt:
+                outcome = await retriever.search_detailed(
+                    tenant_id=scope.tenant_id,
+                    base_names=[base.name],
+                    query=body.query,
+                    limit=body.top_k or base.retrieval_top_k,
+                    method=body.method,
+                    score_threshold=body.score_threshold,
+                    rerank=body.rerank,
+                    rerank_score_threshold=body.rerank_score_threshold,
+                )
+            # A retriever that logs nothing reports no latency: time it here.
+            elapsed_ms = (
+                receipt.latency_ms
+                if receipt.latency_ms is not None
+                else int((time.monotonic() - started) * 1000)
+            )
+            documents = await documents_by_id(
+                store, scope.tenant_id, (r.document_id for r in outcome.results if r.document_id)
             )
         return JSONResponse(
             content={
@@ -1156,6 +1196,13 @@ def build_knowledge_router() -> APIRouter:
                         "hit_chunk_indexes": list(r.hit_chunk_indexes),
                         "hit_content": r.hit_content,
                         "hit_heading_path": list(r.hit_heading_path),
+                        # B-175 P2-PR4 (B-206 §6) — the best hit child's four
+                        # scores (``score`` is ``vector_score``), and its document
+                        # (``null`` once deleted).
+                        "vector_score": r.vector_score,
+                        "keyword_score": r.keyword_score,
+                        "fused_score": r.fused_score,
+                        "document": documents.get(r.document_id) if r.document_id else None,
                     }
                     for r in outcome.results
                 ],
@@ -1180,6 +1227,10 @@ def build_knowledge_router() -> APIRouter:
                 "rerank_threshold_paused": outcome.rerank_threshold_paused,
                 "rerank_threshold_model": base.rerank_threshold_model,
                 "rerank_model": outcome.rerank_model,
+                # B-175 P2-PR4 — how long the search took (not its logging), and
+                # its log row (``null`` when none was written).
+                "elapsed_ms": elapsed_ms,
+                "log_id": str(receipt.log_id) if receipt.log_id is not None else None,
             }
         )
 

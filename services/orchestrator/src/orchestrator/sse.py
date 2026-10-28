@@ -47,7 +47,12 @@ from langchain_core.messages import BaseMessage
 from langchain_core.runnables import RunnableConfig
 from pydantic import BaseModel
 
-from expert_work.common.context import reset_current_run_id, set_current_run_id
+from expert_work.common.context import (
+    reset_current_run_id,
+    reset_current_thread_id,
+    set_current_run_id,
+    set_current_thread_id,
+)
 from expert_work.common.observability import (
     ExpertWorkComponent,
     expert_work_counter,
@@ -438,6 +443,9 @@ async def run_agent(
     # spawns) carries ``run_id`` without manual threading. Reset in the
     # ``finally`` below.
     run_id_token = set_current_run_id(run_id)
+    # B-175 P2-PR4 — and its conversation: a knowledge search's log row carries
+    # it, so purging the conversation finds rows of any run on it.
+    thread_id_token = set_current_thread_id(record.thread_id)
     # Bind a cancellation token to the run's abort_event and thread it
     # to graph nodes via config["configurable"] (E.15). RunManager.cancel
     # sets abort_event → the token reports cancelled → nodes surface
@@ -1160,6 +1168,7 @@ async def run_agent(
         cleanup_task = asyncio.create_task(bridge.cleanup(run_id, delay=_CLEANUP_DELAY_S))
         _BACKGROUND_CLEANUP_TASKS.add(cleanup_task)
         cleanup_task.add_done_callback(_BACKGROUND_CLEANUP_TASKS.discard)
+        reset_current_thread_id(thread_id_token)
         reset_current_run_id(run_id_token)
 
 

@@ -253,6 +253,8 @@ class RetrievedChunk:
     hit_chunk_indexes: tuple[int, ...] = ()
     hit_content: str | None = None
     hit_heading_path: tuple[str, ...] = ()
+    #: The source document (B-175 P2-PR4: the retrieval log and test name it).
+    document_id: UUID | None = None
 
     @property
     def retrieval_text(self) -> str:
@@ -909,6 +911,7 @@ def _retrieved(
         fused_score=scores.fused.get(child.id),
         rerank_score=scores.rerank.get(child.id),
         hit_chunk_indexes=hit.hit_chunk_indexes,
+        document_id=child.document_id,
     )
     if parent is None:
         return own

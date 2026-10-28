@@ -18,6 +18,7 @@ from control_plane.app import create_app
 from control_plane.audit import build_default_audit_logger
 from control_plane.settings import DEFAULT_DEV_TENANT_ID, Settings
 from expert_work.persistence.audit_log import InMemoryAuditLogStore
+from expert_work.persistence.knowledge import RetrievalLogEntry
 from expert_work.protocol import ApprovalRecord, AuditPage, AuditQuery
 from expert_work.protocol.agent_key import sanitize_agent_key
 from expert_work.runtime.runs import (
@@ -1214,6 +1215,116 @@ async def test_purge_approval_delete_failure_is_audit_visible(
     details = _purge_audit_details(page, tid)
     assert details["approvals_delete_failed"] is True
     assert details["meta_removed"] is True
+
+
+def _log_row(thread_id: UUID, run_id: UUID | None) -> RetrievalLogEntry:
+    return RetrievalLogEntry(
+        tenant_id=_DEFAULT_TENANT,
+        kb_ids=(_LOG_KB,),
+        source="agent",
+        query="q",
+        status="ok",
+        latency_ms=1,
+        run_id=run_id,
+        thread_id=thread_id,
+    )
+
+
+_LOG_KB = UUID("00000000-0000-4000-8000-0000000000b1")
+
+
+@pytest.mark.asyncio
+async def test_purge_deletes_the_conversations_retrieval_logs(
+    session_client: AsyncClient, audit_store: InMemoryAuditLogStore
+) -> None:
+    """B-175 P2-PR4 — every knowledge search made in the conversation goes,
+    whoever's run made it (an approver's continuation, a machine's)."""
+    tid = await _create(session_client)
+    app = session_client._transport.app  # type: ignore[attr-defined,union-attr]
+    logs = app.state.knowledge_retrieval_log_store
+    for run_id in (uuid4(), uuid4(), None):
+        await logs.add(_log_row(UUID(tid), run_id))
+    elsewhere = _log_row(uuid4(), uuid4())
+    await logs.add(elsewhere)
+
+    resp = await session_client.post(f"/v1/sessions/{tid}:purge")
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["data"]["retrieval_logs"] == 3
+    rows, _total = await logs.list_for_base(tenant_id=_DEFAULT_TENANT, kb_id=_LOG_KB)
+    assert [row.id for row in rows] == [elsewhere.id]
+    page = await audit_store.query(AuditQuery(tenant_id=_DEFAULT_TENANT))
+    assert _purge_audit_details(page, tid)["retrieval_logs"] == 3
+
+
+@pytest.mark.asyncio
+async def test_a_retrieval_log_failure_purges_nothing_so_a_retry_can(
+    session_client: AsyncClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Deleting the runs and the thread first would leave their log rows with
+    nothing to find them by — so a failure stops the purge before any delete."""
+    tid = await _create(session_client)
+    app = session_client._transport.app  # type: ignore[attr-defined,union-attr]
+    logs = app.state.knowledge_retrieval_log_store
+    info = _run_info(tid)
+    await app.state.run_store.create(info)
+    await logs.add(_log_row(UUID(tid), info.run_id))
+    real = logs.delete_for_threads
+
+    async def _boom(*, tenant_id: UUID, thread_ids: object) -> int:
+        raise ConnectionError("db blip")
+
+    monkeypatch.setattr(logs, "delete_for_threads", _boom)
+    failed = await session_client.post(f"/v1/sessions/{tid}:purge")
+    assert failed.status_code == 503, failed.text
+    assert await app.state.run_store.get(run_id=info.run_id, tenant_id=_DEFAULT_TENANT) is not None
+    assert (await session_client.get(f"/v1/sessions/{tid}")).status_code == 200
+
+    monkeypatch.setattr(logs, "delete_for_threads", real)
+    retried = await session_client.post(f"/v1/sessions/{tid}:purge")
+    assert retried.status_code == 200, retried.text
+    assert retried.json()["data"]["retrieval_logs"] == 1
+    assert await app.state.run_store.get(run_id=info.run_id, tenant_id=_DEFAULT_TENANT) is None
+
+
+@pytest.mark.asyncio
+async def test_a_row_written_while_purging_goes_too(
+    session_client: AsyncClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A run still executing on the conversation can log a search after the
+    first delete (the purge does not stop runs): a second pass after the thread
+    row is gone takes it too — and a failure of that pass is not the purge's."""
+    tid = await _create(session_client)
+    app = session_client._transport.app  # type: ignore[attr-defined,union-attr]
+    logs = app.state.knowledge_retrieval_log_store
+    run_manager = app.state.agent_runtime.run_manager
+    real_delete_runs = run_manager.delete_by_thread
+
+    async def _runs_gone_after_a_late_write(thread_id: UUID, *, tenant_id: UUID) -> int:
+        await logs.add(_log_row(thread_id, uuid4()))  # the still-running run's search
+        removed: int = await real_delete_runs(thread_id, tenant_id=tenant_id)
+        return removed
+
+    monkeypatch.setattr(run_manager, "delete_by_thread", _runs_gone_after_a_late_write)
+    resp = await session_client.post(f"/v1/sessions/{tid}:purge")
+    assert resp.status_code == 200, resp.text
+    rows, _total = await logs.list_for_base(tenant_id=_DEFAULT_TENANT, kb_id=_LOG_KB)
+    assert rows == []
+
+    calls: list[int] = []
+    real_delete_logs = logs.delete_for_threads
+
+    async def _second_pass_fails(*, tenant_id: UUID, thread_ids: object) -> int:
+        calls.append(1)
+        if len(calls) == 2:
+            raise ConnectionError("db blip")
+        removed: int = await real_delete_logs(tenant_id=tenant_id, thread_ids=thread_ids)
+        return removed
+
+    monkeypatch.setattr(logs, "delete_for_threads", _second_pass_fails)
+    other = await _create(session_client)
+    resp = await session_client.post(f"/v1/sessions/{other}:purge")
+    assert resp.status_code == 200, resp.text
+    assert len(calls) == 2
 
 
 @pytest.mark.asyncio

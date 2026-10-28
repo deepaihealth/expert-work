@@ -475,3 +475,60 @@ class KnowledgeDocumentTagRow(Base):
         PrimaryKeyConstraint("document_id", "tag_id", name="knowledge_document_tag_pkey"),
         Index("knowledge_document_tag_tag_idx", "tag_id"),
     )
+
+
+class KnowledgeRetrievalLogRow(Base):
+    """``knowledge_retrieval_log`` (migration ``0177``, B-175 P2-PR4) — one
+    retrieval by an agent, a console test or the open API. ``results`` holds
+    chunk / document ids and scores only, never document text. Deleted with
+    the base, with a purged conversation (``thread_id``) or user (their runs,
+    threads and console tests), and past the retention window."""
+
+    __tablename__ = "knowledge_retrieval_log"
+
+    id: Mapped[UUID] = mapped_column(
+        PG_UUID(as_uuid=True), primary_key=True, server_default=text("gen_random_uuid()")
+    )
+    tenant_id: Mapped[UUID] = mapped_column(PG_UUID(as_uuid=True), nullable=False)
+    kb_ids: Mapped[list[UUID]] = mapped_column(ARRAY(PG_UUID(as_uuid=True)), nullable=False)
+    source: Mapped[str] = mapped_column(Text, nullable=False)
+    query: Mapped[str] = mapped_column(Text, nullable=False)
+    params: Mapped[dict[str, Any]] = mapped_column(
+        JSONB, nullable=False, server_default=text("'{}'::jsonb")
+    )
+    status: Mapped[str] = mapped_column(Text, nullable=False)
+    result_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    results: Mapped[list[dict[str, Any]]] = mapped_column(
+        JSONB, nullable=False, server_default=text("'[]'::jsonb")
+    )
+    flags: Mapped[dict[str, Any]] = mapped_column(
+        JSONB, nullable=False, server_default=text("'{}'::jsonb")
+    )
+    latency_ms: Mapped[int] = mapped_column(Integer, nullable=False)
+    run_id: Mapped[UUID | None] = mapped_column(PG_UUID(as_uuid=True), nullable=True)
+    thread_id: Mapped[UUID | None] = mapped_column(PG_UUID(as_uuid=True), nullable=True)
+    actor_id: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+    __table_args__ = (
+        CheckConstraint(
+            "source IN ('agent', 'console_test', 'open_api')",
+            name="knowledge_retrieval_log_source_enum",
+        ),
+        CheckConstraint("char_length(query) <= 2000", name="knowledge_retrieval_log_query_len"),
+        Index("knowledge_retrieval_log_tenant_time_idx", "tenant_id", text("created_at DESC")),
+        Index("knowledge_retrieval_log_created_idx", "created_at"),
+        Index("knowledge_retrieval_log_kb_ids_idx", "kb_ids", postgresql_using="gin"),
+        Index(
+            "knowledge_retrieval_log_run_idx",
+            "run_id",
+            postgresql_where=text("run_id IS NOT NULL"),
+        ),
+        Index(
+            "knowledge_retrieval_log_thread_idx",
+            "thread_id",
+            postgresql_where=text("thread_id IS NOT NULL"),
+        ),
+    )
