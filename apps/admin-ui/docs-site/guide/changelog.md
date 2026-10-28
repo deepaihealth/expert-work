@@ -38,13 +38,14 @@
 | SSE `end` 事件，包括续传时重新发送的 `end` | `status` 新增取值 `incomplete`，表示 run 被平台限制截停，此时 `exit_reason` 为 `max_steps`、`token_budget` 或 `no_progress`。这类 run 以前是 `success` | 对 `status` 做分支或枚举校验的代码要认这个新值 |
 | SSE `end` 事件 | 新增 `unresolved_failures`。`completed` 与 `exit_reason` 原已存在 | 按需读取 |
 | 5.4 run 列表的每条 run，5.8 对话条目的 `runs[]` | `status` 同样会出现 `incomplete`。新增 `completed`、`exit_reason`、`unresolved_failures` | 用这两个接口判断结果的，读新字段 |
+| 5.4 run 列表的 `status` 筛选参数 | 新增可选值 `incomplete`，只返回被限制截停的 run；按 `success` 筛选时不再包含它们 | 按 `success` 筛选、再自己判断是否截停的，可改为直接筛 `incomplete` |
 | Webhook `run.completed` 与 `run.failed` 的 `payload` | 新增 `completed`、`exit_reason`、`unresolved_failures`。被限制截停的 run 照样发 `run.completed`，`status` 为 `incomplete`，不新增事件类型 | 不要只凭事件名判断成功，再看 `status` 与 `completed` |
 | SSE `worker` 事件 `kind` 为 `end` 时的 `outcome` | 改为开放取值，写明 `approval_blocked`（遇到需要人工审批的工具而停下）。子任务没有给出回答时，由 `success` 改报已有的取值 `cancelled` | 只有 `success` 表示子任务完成，未知取值按「没有正常完成」处理 |
 | 5.8 对话条目里 `tool_call` 的 `worker.status` | 如实给出子任务的结果，会出现 `approval_blocked`，今后还可能新增取值。没有结束结果的子任务保持 `running` | 用严格枚举渲染子任务状态的界面要处理新值，未知值按「没有正常完成」处理 |
 | SSE `guard` 事件 | 接近步数上限时，每个 run 额外发一条 `kind` 为 `warning`、`guard` 为 `max_steps` 的事件。`guard` 事件也可能来自子任务，事件里不标明来源 | 不要据此判断这一轮已经结束或失败，最终结果以 `end` 为准 |
 | 停在审批处、又因同一会话发起新一轮而作废的 run | `status` 变为 `interrupted`，同时保留 `completed` 为 `false`、`exit_reason` 为 `approval_pending`，不是 `null` | 读 `completed` 时，不要假设 `interrupted` 的 run 一定是 `null` |
 
-`unresolved_failures` 是到 run 结束时仍未解决的工具失败，形如 `[{"tool": "bash", "kind": "unknown"}]`，最多 20 条，只有工具名和失败类型，不含参数、路径或工具输出。没有记录时，run 列表、对话条目与 Webhook 里是 `null`，`end` 事件里不出现这个字段；出错或被取消的 run 以及这次变更之前的 run 都没有记录。`[]` 表示没有未解决的失败，`kind` 的取值见 [11.5](./webhooks#run-completed-与-run-failed)。
+`unresolved_failures` 是到 run 结束时仍未解决的工具失败，形如 `[{"tool": "bash", "kind": "unknown"}]`，最多 20 条，只有工具名和失败类型，不含参数、路径或工具输出。没有记录时，run 列表、对话条目与 Webhook 里是 `null`，`end` 事件里不出现这个字段；出错或被取消的 run 以及这次变更之前的 run 都没有记录。这次变更之前结束的 run 可能有 `completed` 却没有这个字段，按「不清楚」处理，不要当成 `[]`。`[]` 表示没有未解决的失败，`kind` 的取值见 [11.5](./webhooks#run-completed-与-run-failed)。
 
 三个字段各回答一个问题：`status` 说的是这次 run 怎么结束的，`completed` 说的是要做的事做成了没有，`unresolved_failures` 说的是没做成时哪些工具失败了。
 
@@ -59,19 +60,20 @@
 - 「执行有风险的操作」这类审批被用户拒绝。
 - 动作被平台的安全审查拦下。
 
-同一个工具之后调用成功，之前的失败就算已解决。
+之后对同一个对象的调用成功，之前的失败就算已解决：写文件、改文件看工作区里的文件路径，登记产物看产物名，其它工具看工具本身。只读的查询类工具失败和可以重试的临时失败不会列出。完整规则见 [3.4 的 `end`](./sse-events#end)。
 
 其它行为变化：
 
-- Agent 连续多次重复同一个调用时，平台先提醒它换一种做法；再次出现时这一轮收尾，`status` 为 `incomplete`，`exit_reason` 为 `no_progress`。以前第一次出现就以 `success` 结束。
+- Agent 连续多次重复同一个调用时，平台先提醒它换一种做法，这算一次原地打转。同一次 run 里原地打转的次数达到上限时这一轮收尾，`status` 为 `incomplete`，`exit_reason` 为 `no_progress`。上限取 Agent 配置的无进展上限，没有配置时是 2 次；次数按整次 run 累计，中间有正常的调用也不清零。以前第一次出现就以 `success` 结束。
 - 被限制截停时，最后的回复会分开说明做完了什么、没做完什么，不再把没有登记的文件说成已经交付。终端用户发一条新消息（例如「继续」）可以接着做。
 - `status` 为 `incomplete` 的 run 照样有最终回复文本。它的产物清单 `artifacts` 可能为空，也可能只有一部分。
+- 文档更正：`reason_kind` 为 `policy_gate` 的审批被拒绝，不一定终止 run。Agent 配置里列为强制审批的工具被拒绝时 run 终止；工具调用审查转来的审批被拒绝时 run 继续。审批事件里没有字段能在决策之前区分这两种来源，拒绝之后以 `end` 的 `exit_reason` 为准，详见 [4.2 审批决策](./run-control#_4-2-审批决策)。
 
 #### 调用方的改动
 
 服务端：
 
-1. 读取 `status` 的地方都要认 `incomplete`，包括 SSE 解析、run 列表轮询和 Webhook 处理。它的含义是「已结束，但没有做完」，既不是失败也不是成功。
+1. 读取 `status` 的地方都要认 `incomplete`，包括 SSE 解析、run 列表轮询和 Webhook 处理。它的含义是「已结束，但没有做完」，既不是失败也不是成功。轮询 run 列表或用量接口、等 run 结束才停的，要把 `incomplete` 算作结束状态，否则被截停的 run 会让轮询一直停不下来。
 2. 不认识的状态值按「没有正常结束」处理，不要报错，也不要丢弃这条结果。
 3. 判断这一轮是否交付的逻辑改为看 `completed`，例如是否回写业务结果、是否把产物同步给终端用户。
 4. 订阅了 Webhook 的，收到 `run.completed` 之后再看 `status` 与 `completed`。

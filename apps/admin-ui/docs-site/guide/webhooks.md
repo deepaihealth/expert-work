@@ -151,7 +151,7 @@ Webhook 端点（一个接收地址加上它订阅的事件类型）只能由租
 | `status` | string | run 的最终状态，取值与 [5.4 run 列表](./query#status-的取值) 的 `status` 相同。`run.completed` 只带 `success` 或 `incomplete`，`run.failed` 带其余最终状态 |
 | `completed` | boolean \| null | 要做的事有没有做成，与 5.4 run 列表的同名字段相同。`null` 表示没有记录，多见于失败、被取消的 run，不要当成 `false` |
 | `exit_reason` | string \| null | run 从哪个出口结束，取值与 5.4 run 列表的同名字段相同。`null` 的含义与 `completed` 相同 |
-| `unresolved_failures` | array \| null | 到 run 结束时仍未解决的工具失败，最多 20 条，元素结构见下表。`[]` 表示没有；`null` 表示没有记录，多见于失败、被取消的 run |
+| `unresolved_failures` | array \| null | 到 run 结束时仍未解决的工具失败，最多 20 条，元素结构见下表。`[]` 表示没有；`null` 表示没有记录，多见于失败、被取消的 run，以及这次变更之前结束的 run（这时 `completed` 可能有值），按「不清楚」处理，不要当成 `[]` |
 
 `status`、`completed`、`exit_reason` 三个字段的完整读法见 [3.4 的 `end`](./sse-events#end)。`status` 说的是这次 run 怎么结束的，`completed` 说的是要做的事做成了没有，`unresolved_failures` 说的是没做成时哪些工具失败了。
 
