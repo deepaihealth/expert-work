@@ -226,7 +226,7 @@ def _store_failing_with(error: BaseException) -> SqlKnowledgeStore:
     def factory() -> _FailingSession:
         return _FailingSession(error)
 
-    return SqlKnowledgeStore(cast("async_sessionmaker[AsyncSession]", factory))
+    return SqlKnowledgeStore(cast(async_sessionmaker[AsyncSession], factory))
 
 
 async def _search(store: SqlKnowledgeStore) -> None:
