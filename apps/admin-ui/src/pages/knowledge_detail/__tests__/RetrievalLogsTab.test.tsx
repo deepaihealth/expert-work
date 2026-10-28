@@ -18,6 +18,7 @@ import "../../../i18n";
 import LOGS_FIXTURE from "../../../api/__fixtures__/knowledge_retrieval_logs.json";
 import { ApiError } from "../../../api/client";
 import * as logsSdk from "../../../api/knowledge_logs";
+import { typedFixture } from "../../../test-utils/typedFixture";
 import { RetrievalLogsTab, timeRangeFilter } from "../RetrievalLogsTab";
 
 const scopeRef = vi.hoisted(() => ({ current: undefined as string | undefined }));
@@ -54,7 +55,8 @@ vi.mock("../../../auth/AuthContext", async (importOriginal) => {
   };
 });
 
-const PAGE = LOGS_FIXTURE.page as unknown as logsSdk.RetrievalLogsPage;
+const PAGE = typedFixture<logsSdk.RetrievalLogsPage>(LOGS_FIXTURE.page);
+const DETAIL = typedFixture<logsSdk.RetrievalLogDetail>(LOGS_FIXTURE.detail);
 const [ROW] = PAGE.logs;
 
 function page(logs: logsSdk.RetrievalLogSummary[], total = logs.length): logsSdk.RetrievalLogsPage {
@@ -98,6 +100,17 @@ describe("RetrievalLogsTab", () => {
     expect(row).toHaveTextContent("Found");
     expect(row).toHaveTextContent("412 ms");
     expect(screen.getByTestId("kb-logs-retention")).toHaveTextContent("kept for 30 days");
+  });
+
+  it("tags the rows a platform admin searched, and only those", async () => {
+    const staff = { ...ROW, id: "by-staff", flags: { ...ROW.flags, platform_admin: true } };
+    vi.spyOn(logsSdk, "listRetrievalLogs").mockResolvedValue(page([ROW, staff]));
+    mount();
+    const tag = await screen.findByTestId("kb-logs-platform-admin-by-staff");
+    expect(tag).toHaveTextContent("Platform admin");
+    // In the source column, next to the source.
+    expect(tag.closest("td")).toHaveTextContent("Agent");
+    expect(screen.queryByTestId(`kb-logs-platform-admin-${ROW.id}`)).toBeNull();
   });
 
   it("reads another tenant's base under that tenant, never all tenants", async () => {
@@ -230,7 +243,7 @@ describe("RetrievalLogsTab", () => {
     vi.spyOn(logsSdk, "listRetrievalLogs").mockResolvedValue(PAGE);
     const detail = vi
       .spyOn(logsSdk, "getRetrievalLog")
-      .mockResolvedValue(LOGS_FIXTURE.detail as unknown as logsSdk.RetrievalLogDetail);
+      .mockResolvedValue(DETAIL);
     vi.spyOn(logsSdk, "getRetrievalLogPassages").mockResolvedValue([]);
     mount("tenant-b");
     await userEvent.click(await screen.findByTestId(`kb-logs-view-${ROW.id}`));

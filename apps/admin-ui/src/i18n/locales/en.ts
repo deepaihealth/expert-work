@@ -507,6 +507,9 @@ export interface TranslationKeys {
     results_title: string;
     results_empty: string;
     doc_deleted: string;
+    doc_disabled: string;
+    platform_admin: string;
+    platform_admin_hint: string;
     uploaded_at: string;
     passage_parent: string;
     passage_chunk: string;
@@ -3989,6 +3992,9 @@ const en: TranslationKeys = {
     results_title: "Results",
     results_empty: "No results.",
     doc_deleted: "Document deleted",
+    doc_disabled: "Document switched off",
+    platform_admin: "Platform admin",
+    platform_admin_hint: "Searched by platform staff from outside this tenant.",
     uploaded_at: "uploaded {{time}}",
     passage_parent: "Passage #{{parent}} · chunk #{{chunk}}",
     passage_chunk: "Chunk #{{chunk}}",

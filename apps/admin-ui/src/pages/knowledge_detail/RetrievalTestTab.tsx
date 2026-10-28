@@ -163,8 +163,9 @@ interface RetrievalTestTabProps {
    *  按 ``readonly`` 置灰。 */
   readScope: string | undefined;
   /** B-175 P2-PR4 — switched-in or foreign deep-link read: 「存为库默认参数」
-   *  would write the same-named base of the caller's own tenant, so it is off. */
-  readonly?: boolean;
+   *  would write the same-named base of the caller's own tenant, so it is off.
+   *  Required (no default): a mount that forgets it must not fail open. */
+  readonly: boolean;
   /** The base as 「存为库默认参数」 saved it (the page shows it without a reload). */
   onBaseUpdated?: (next: KnowledgeBase) => void;
   /** Open the retrieval records tab (the link renders only when given). */
@@ -174,7 +175,7 @@ interface RetrievalTestTabProps {
 export function RetrievalTestTab({
   base,
   readScope,
-  readonly = false,
+  readonly,
   onBaseUpdated,
   onOpenLogs,
 }: RetrievalTestTabProps) {

@@ -238,6 +238,9 @@ export interface KnowledgeHitDocument {
   title: string | null;
   filename: string;
   created_at: string | null;
+  /** The document's own switch — switching it off leaves its chunks' switches
+   *  on, so a record read later says so here; absent on older backends. */
+  enabled?: boolean;
 }
 
 /** How a knowledge search ended — ``no_hits`` / ``below_threshold`` came back

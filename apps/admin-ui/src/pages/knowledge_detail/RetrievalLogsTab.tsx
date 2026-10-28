@@ -28,7 +28,7 @@ import {
   type RetrievalLogSummary,
 } from "../../api/knowledge_logs";
 import { TABLE_PAGINATION, TABLE_PAGE_SIZE } from "../../utils/pagination";
-import { LogSourceTag, LogStatusTag } from "./logTags";
+import { LogSourceTag, LogStatusTag, PlatformAdminTag } from "./logTags";
 import { RetrievalLogDrawer } from "./RetrievalLogDrawer";
 
 const { Text } = Typography;
@@ -136,8 +136,13 @@ export function RetrievalLogsTab({ baseName, readScope }: RetrievalLogsTabProps)
     {
       title: t("knowledge_retrieval.col_source"),
       dataIndex: "source",
-      width: 110,
-      render: (value: string) => <LogSourceTag source={value} />,
+      width: 200,
+      render: (value: string, record) => (
+        <Space size={4} wrap>
+          <LogSourceTag source={value} />
+          <PlatformAdminTag flags={record.flags} testId={`kb-logs-platform-admin-${record.id}`} />
+        </Space>
+      ),
     },
     {
       title: t("knowledge_retrieval.col_query"),

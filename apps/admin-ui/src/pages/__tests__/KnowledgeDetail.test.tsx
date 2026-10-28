@@ -1441,6 +1441,36 @@ describe("KnowledgeDetail — retrieval records (B-175 P2-PR4)", () => {
     );
   });
 
+  // 「存为库默认参数」 PATCHes the caller's own tenant's base by name: on another
+  // tenant's base it must stay off however the parameters change.
+  it.each([
+    [
+      "an aggregate deep link to another tenant's base",
+      "*",
+      false,
+      `/knowledge/support-docs/test?tenant_id=${FOREIGN_TENANT}`,
+    ],
+    ["switched into another tenant", FOREIGN_TENANT, true, "/knowledge/support-docs/test"],
+  ] as const)(
+    "keeps 存为库默认参数 off on %s",
+    async (_case, scope, switched, path) => {
+      scopeRef.current = scope;
+      isTenantSwitchedMock.mockReturnValue(switched);
+      vi.spyOn(knowledgeSdk, "getBase").mockResolvedValue(BASE);
+      const update = vi.spyOn(knowledgeSdk, "updateBase");
+
+      renderDetail(path);
+      const topK = await screen.findByRole("spinbutton", { name: "Top-k" });
+      await userEvent.clear(topK);
+      await userEvent.type(topK, "8");
+      expect(topK).toHaveValue("8");
+      const save = screen.getByTestId("kb-test-save-defaults");
+      expect(save).toBeDisabled();
+      expect(within(screen.getByTestId("knowledge-test-tab")).getByTestId("readonly-tooltip")).toContainElement(save);
+      expect(update).not.toHaveBeenCalled();
+    },
+  );
+
   it("opens the records tab from the retrieval test", async () => {
     vi.spyOn(knowledgeSdk, "getBase").mockResolvedValue(BASE);
     vi.spyOn(knowledgeSdk, "testRetrieval").mockResolvedValue({

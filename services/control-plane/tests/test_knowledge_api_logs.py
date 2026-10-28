@@ -25,6 +25,7 @@ from httpx import ASGITransport, AsyncClient
 
 from control_plane.app import create_app
 from control_plane.audit import build_default_audit_logger
+from control_plane.auth import rbac
 from control_plane.knowledge.ingestion import KnowledgeIngestionRunner
 from control_plane.settings import DEFAULT_DEV_TENANT_ID, Settings
 from expert_work.persistence import InMemoryKnowledgeStore
@@ -33,7 +34,7 @@ from expert_work.persistence.knowledge import (
     InMemoryKnowledgeRetrievalLogStore,
     RetrievalLogEntry,
 )
-from expert_work.protocol import AuditAction, AuditQuery, ChunkType, KnowledgeChunk
+from expert_work.protocol import AuditAction, AuditQuery, ChunkType, KnowledgeChunk, Role
 from orchestrator.llm import FakeEmbedder
 from tests.auth_fixtures import (
     TEST_AUDIENCE,
@@ -223,8 +224,30 @@ async def test_the_detail_resolves_each_result_document(setup: _Setup) -> None:
         "title": document.title,
         "filename": "h.md",
         "created_at": document.created_at.isoformat() if document.created_at else None,
+        "enabled": True,
     }
     assert second["document"] is None
+
+
+@pytest.mark.asyncio
+async def test_the_detail_says_a_document_switched_off_since(setup: _Setup) -> None:
+    """Switching a document off flips its row only (its chunks keep
+    ``enabled``): the record's document says so, and the live passages
+    endpoint still reads the text for the console to mark."""
+    [chunk], _ = await setup.store.list_chunks(tenant_id=_TENANT, document_id=setup.document_id)
+    entry = await setup.add(results=(_hit(chunk),))
+    switched = await setup.client.patch(
+        f"/v1/knowledge/bases/kb/documents/{setup.document_id}",
+        json={"enabled": False},
+        headers=_ADMIN,
+    )
+    assert switched.status_code == 200, switched.text
+    [result] = (await setup.client.get(f"{_LOGS}/{entry.id}", headers=_VIEWER)).json()["results"]
+    assert result["document"]["enabled"] is False
+    [live] = (await setup.client.get(f"{_LOGS}/{entry.id}/passages", headers=_VIEWER)).json()[
+        "passages"
+    ]
+    assert live["passage"]["enabled"] is True  # the chunk's own switch is untouched
 
 
 @pytest.mark.asyncio
@@ -243,6 +266,30 @@ async def test_a_roleless_employee_is_refused(setup: _Setup) -> None:
         resp = await setup.client.get(path, headers=_headers())
         assert resp.status_code == 403, resp.text
         assert resp.json()["detail"]["message"] == "principal lacks required role"
+
+
+@pytest.mark.asyncio
+async def test_the_live_text_also_needs_manifest_read(
+    setup: _Setup, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The text is the base's: reading it takes ``manifest:read`` on top of the
+    records' ``session:read``. No built-in role has one without the other, so
+    the viewer role is narrowed here to ``session:read`` alone."""
+    grants = rbac._grants
+
+    def viewer_without_manifest(role: Role) -> dict[rbac.Resource, set[rbac.Action]]:
+        granted = grants(role)
+        if role is Role.VIEWER:
+            return {resource: acts for resource, acts in granted.items() if resource != "manifest"}
+        return granted
+
+    monkeypatch.setattr(rbac, "_grants", viewer_without_manifest)
+    entry = await setup.add()
+    # The record itself is still readable — only the text is refused.
+    assert (await setup.client.get(f"{_LOGS}/{entry.id}", headers=_VIEWER)).status_code == 200
+    refused = await setup.client.get(f"{_LOGS}/{entry.id}/passages", headers=_VIEWER)
+    assert refused.status_code == 403, refused.text
+    assert refused.json()["detail"]["message"] == "principal lacks required role"
 
 
 @pytest.mark.asyncio

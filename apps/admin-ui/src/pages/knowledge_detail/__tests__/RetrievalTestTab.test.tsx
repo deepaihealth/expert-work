@@ -14,6 +14,7 @@ import i18n from "../../../i18n";
 import TEST_FIXTURE from "../../../api/__fixtures__/knowledge_retrieval_test.json";
 import { ApiError } from "../../../api/client";
 import * as knowledgeSdk from "../../../api/knowledge";
+import { typedFixture } from "../../../test-utils/typedFixture";
 import { RetrievalTestTab } from "../RetrievalTestTab";
 
 const BASE: knowledgeSdk.KnowledgeBase = {
@@ -60,7 +61,7 @@ async function run(
   vi.spyOn(knowledgeSdk, "testRetrieval").mockResolvedValue(response(rerank_outcome, extra));
   render(
     <App>
-      <RetrievalTestTab base={BASE} readScope={undefined} />
+      <RetrievalTestTab base={BASE} readScope={undefined} readonly={false} />
     </App>,
   );
   await userEvent.type(screen.getByTestId("kb-test-query"), "deductible");
@@ -189,7 +190,7 @@ async function runWith(results: knowledgeSdk.RetrievalTestResult[]): Promise<voi
   });
   render(
     <App>
-      <RetrievalTestTab base={BASE} readScope={undefined} />
+      <RetrievalTestTab base={BASE} readScope={undefined} readonly={false} />
     </App>,
   );
   await userEvent.type(screen.getByTestId("kb-test-query"), "deductible");
@@ -270,7 +271,7 @@ describe("RetrievalTestTab parent results (B-206 K-1)", () => {
 // 「存为库默认参数」. The response is the shared contract fixture.
 // ---------------------------------------------------------------------------
 
-const UPGRADED = TEST_FIXTURE as unknown as knowledgeSdk.RetrievalTestResponse;
+const UPGRADED = typedFixture<knowledgeSdk.RetrievalTestResponse>(TEST_FIXTURE);
 const [FIXTURE_RESULT] = UPGRADED.results;
 
 interface MountOptions {

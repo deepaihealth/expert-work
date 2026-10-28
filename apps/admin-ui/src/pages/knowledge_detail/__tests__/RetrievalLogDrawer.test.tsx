@@ -14,11 +14,12 @@ import { render, screen, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { App } from "antd";
 import { MemoryRouter, Route, Routes, useLocation } from "react-router-dom";
-import "../../../i18n";
+import i18n from "../../../i18n";
 
 import LOGS_FIXTURE from "../../../api/__fixtures__/knowledge_retrieval_logs.json";
 import { ApiError } from "../../../api/client";
 import * as logsSdk from "../../../api/knowledge_logs";
+import { typedFixture } from "../../../test-utils/typedFixture";
 import { RetrievalLogDrawer } from "../RetrievalLogDrawer";
 
 const scopeRef = vi.hoisted(() => ({ current: undefined as string | undefined }));
@@ -61,8 +62,8 @@ vi.mock("../../../auth/AuthContext", async (importOriginal) => {
   };
 });
 
-const DETAIL = LOGS_FIXTURE.detail as unknown as logsSdk.RetrievalLogDetail;
-const PASSAGES = LOGS_FIXTURE.passages.passages as unknown as logsSdk.LivePassage[];
+const DETAIL = typedFixture<logsSdk.RetrievalLogDetail>(LOGS_FIXTURE.detail);
+const PASSAGES = typedFixture<logsSdk.LivePassage[]>(LOGS_FIXTURE.passages.passages);
 const THREAD = DETAIL.thread_id!;
 const RUN = DETAIL.run_id!;
 
@@ -200,6 +201,26 @@ describe("RetrievalLogDrawer — results", () => {
     expect(screen.getByTestId("kb-log-text-live-note")).toBeInTheDocument();
   });
 
+  it("says a document switched off since is off, and nothing when it is on", async () => {
+    const [first, second] = DETAIL.results;
+    mount({ results: [{ ...first, document: { ...first.document!, enabled: false } }, second] });
+    expect(await screen.findByTestId("kb-log-result-doc-0-disabled")).toHaveTextContent(
+      "Document switched off",
+    );
+    // Its chunks' own switches stay on: the text is still read and shown.
+    expect(await screen.findByTestId("kb-log-result-text-0")).toBeInTheDocument();
+  });
+
+  it.each([
+    ["on", true],
+    ["from an older backend that does not say", undefined],
+  ] as const)("does not mark a document that is %s", async (_case, enabled) => {
+    const [first, second] = DETAIL.results;
+    mount({ results: [{ ...first, document: { ...first.document!, enabled } }, second] });
+    await screen.findByTestId("kb-log-result-text-0");
+    expect(screen.queryByTestId("kb-log-result-doc-0-disabled")).toBeNull();
+  });
+
   it("says a deleted document is deleted and shows no text for it", async () => {
     mount();
     const second = await screen.findByTestId("kb-log-result-1");
@@ -311,5 +332,26 @@ describe("RetrievalLogDrawer — conversation and run", () => {
     expect(await screen.findByTestId("kb-log-actor")).toHaveTextContent("emp-7");
     expect(screen.queryByTestId("kb-log-conversation-link")).toBeNull();
     expect(screen.queryByTestId("kb-log-links-other-tenant")).toBeNull();
+    expect(screen.queryByTestId("kb-log-platform-admin")).toBeNull();
+  });
+
+  it("tags a platform admin's search next to the operator (user ruling 10-28)", async () => {
+    const prior = i18n.language;
+    await i18n.changeLanguage("zh-CN");
+    try {
+      mount({
+        source: "console_test",
+        run_id: null,
+        thread_id: null,
+        actor_id: "platform-staff-1",
+        flags: { ...DETAIL.flags, platform_admin: true },
+      });
+      const actor = await screen.findByTestId("kb-log-actor");
+      const tag = screen.getByTestId("kb-log-platform-admin");
+      expect(tag).toHaveTextContent("平台管理员");
+      expect(actor.parentElement?.parentElement).toContainElement(tag);
+    } finally {
+      await i18n.changeLanguage(prior);
+    }
   });
 });

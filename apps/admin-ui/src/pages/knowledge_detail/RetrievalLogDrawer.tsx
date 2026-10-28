@@ -39,7 +39,7 @@ import { useAuth } from "../../auth/AuthContext";
 import { concreteTenantScope, useTenantScope } from "../../tenant/TenantScopeContext";
 import { HeadingPath } from "./HeadingPath";
 import { HitDocument } from "./HitDocument";
-import { LogSourceTag, LogStatusTag } from "./logTags";
+import { LogSourceTag, LogStatusTag, PlatformAdminTag } from "./logTags";
 import { ScoreBreakdown } from "./ScoreBreakdown";
 import { SearchNotices } from "./SearchNotices";
 
@@ -183,9 +183,12 @@ function RecordBody({
         </Descriptions.Item>
         {detail.actor_id && (
           <Descriptions.Item label={t("knowledge_retrieval.field_actor")}>
-            <Text code data-testid="kb-log-actor">
-              {detail.actor_id}
-            </Text>
+            <Space size={8} wrap>
+              <Text code data-testid="kb-log-actor">
+                {detail.actor_id}
+              </Text>
+              <PlatformAdminTag flags={detail.flags} testId="kb-log-platform-admin" />
+            </Space>
           </Descriptions.Item>
         )}
         {detail.thread_id && (
