@@ -195,8 +195,8 @@ def _one(
             check, re.search(check.pattern, final) is not None, f"no match for {check.pattern!r}"
         )
     if isinstance(check, FinalTextNotRegex):
-        found = re.search(check.pattern, final)
-        return _verdict(check, found is None, f"matched {found.group(0) if found else ''!r}")
+        hit = re.search(check.pattern, final)
+        return _verdict(check, hit is None, f"matched {hit.group(0) if hit else ''!r}")
     if isinstance(check, ArtifactExists):
         names = [
             str(a["name"])
