@@ -1,0 +1,11 @@
+id: k03-cross-base
+agent: eval-kb
+shape: 多库按库检索(B-175 P4):答案跨两个库(型号 → 品类在参数库,品类 → 保修期在保修库)
+turns:
+  - prompt: |
+      KX-305 是哪一类产品?这一类产品的整机保修期是多久?
+checks:
+  # 不判 bases:跨库问题传两个库、分两次查、不传都对
+  - {type: completed}
+  - {type: final_text_contains, all: ["除湿机"]}
+  - {type: final_text_regex, pattern: '26\s*个月'}

@@ -1,0 +1,57 @@
+{
+  "passages": [
+    {
+      "id": "8f0f3c2e-5b0a-4c39-9a35-0d3c7b6f1a01",
+      "kind": "parent",
+      "chunk_index": 0,
+      "content": "Sample paragraph one.\n\nSample paragraph two, edited.",
+      "heading_path": ["Chapter 1", "Section 1.1"],
+      "enabled": true,
+      "disabled_reason": null,
+      "edited": true,
+      "revision": 2,
+      "children": [
+        {
+          "id": "8f0f3c2e-5b0a-4c39-9a35-0d3c7b6f1a02",
+          "chunk_index": 0,
+          "content": "Sample paragraph one.",
+          "heading_path": ["Chapter 1", "Section 1.1"],
+          "enabled": true,
+          "disabled_reason": null
+        },
+        {
+          "id": "8f0f3c2e-5b0a-4c39-9a35-0d3c7b6f1a03",
+          "chunk_index": 7,
+          "content": "Sample paragraph two, edited.",
+          "heading_path": ["Chapter 1", "Section 1.1"],
+          "enabled": true,
+          "disabled_reason": null
+        }
+      ]
+    },
+    {
+      "id": "8f0f3c2e-5b0a-4c39-9a35-0d3c7b6f1a04",
+      "kind": "chunk",
+      "chunk_index": 1,
+      "content": "A short passage that is its own chunk.",
+      "heading_path": ["Chapter 2"],
+      "enabled": false,
+      "disabled_reason": "inherited",
+      "edited": false,
+      "revision": 1,
+      "children": [
+        {
+          "id": "8f0f3c2e-5b0a-4c39-9a35-0d3c7b6f1a04",
+          "chunk_index": 1,
+          "content": "A short passage that is its own chunk.",
+          "heading_path": ["Chapter 2"],
+          "enabled": false,
+          "disabled_reason": "inherited"
+        }
+      ]
+    }
+  ],
+  "total": 2,
+  "offset": 0,
+  "limit": 50
+}

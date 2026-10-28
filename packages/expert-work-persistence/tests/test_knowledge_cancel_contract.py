@@ -37,7 +37,13 @@ from expert_work.persistence import (
 from expert_work.persistence.embedding import EMBEDDING_DIM
 from expert_work.persistence.knowledge.base import KnowledgeStore
 from expert_work.persistence.models import KnowledgeDocumentRow
-from expert_work.protocol import DocumentStatus, IngestStage, KnowledgeChunk, KnowledgeDocument
+from expert_work.protocol import (
+    ChunkType,
+    DocumentStatus,
+    IngestStage,
+    KnowledgeChunk,
+    KnowledgeDocument,
+)
 
 ALEMBIC_INI = Path(__file__).resolve().parent.parent / "alembic.ini"
 _DB = "knowledge_cancel_contract"
@@ -378,6 +384,78 @@ async def test_discard_pending_from_a_dead_worker_at_indexing_is_still_refused(
 
     assert kept is not None
     assert (kept.status, kept.has_pending) == (DocumentStatus.PROCESSING, True)
+
+
+def _row(
+    tenant: UUID,
+    kb_id: UUID,
+    document_id: UUID,
+    index: int,
+    model: str | None,
+    chunk_type: ChunkType = ChunkType.TEXT,
+) -> KnowledgeChunk:
+    parent = chunk_type is ChunkType.PARENT
+    return KnowledgeChunk(
+        id=uuid4(),
+        tenant_id=tenant,
+        kb_id=kb_id,
+        document_id=document_id,
+        chunk_index=index,
+        content=f"passage {index}",
+        chunk_type=chunk_type,
+        embedding=None if parent else (1.0,) + (0.0,) * (EMBEDDING_DIM - 1),
+        embedding_model=None if parent else model,
+    )
+
+
+async def test_has_chunks_off_model(store: KnowledgeStore) -> None:
+    """Whether a base still serves a searchable chunk another model embedded —
+    what a re-index checks before it stamps the base with the new model."""
+    tenant = uuid4()
+    base = await store.create_base(tenant_id=tenant, name="kb")
+    other = await store.create_base(tenant_id=tenant, name="other")
+    document = await _upload(store, tenant, base.id, "a.md")
+    elsewhere = await _upload(store, tenant, other.id, "b.md")
+    assert await store.replace_chunks(
+        tenant_id=tenant,
+        document_id=document.id,
+        chunks=[
+            _row(tenant, base.id, document.id, 0, None, ChunkType.PARENT),  # no vector
+            _row(tenant, base.id, document.id, 1, "prov/new"),
+        ],
+    )
+    assert await store.replace_chunks(
+        tenant_id=tenant,
+        document_id=elsewhere.id,
+        chunks=[_row(tenant, other.id, elsewhere.id, 0, "prov/old")],
+    )
+    scope = {"tenant_id": tenant, "kb_id": base.id}
+
+    assert not await store.has_chunks_off_model(**scope, embedding_model="prov/new")
+    assert await store.has_chunks_off_model(**scope, embedding_model="prov/newer")
+    assert await store.has_chunks_off_model(**scope, embedding_model=None)
+    assert not await store.has_chunks_off_model(
+        tenant_id=uuid4(), kb_id=base.id, embedding_model="prov/other"
+    )
+    assert await store.replace_chunks(
+        tenant_id=tenant,
+        document_id=document.id,
+        chunks=[
+            _row(tenant, base.id, document.id, 1, "prov/new"),
+            _row(tenant, base.id, document.id, 2, "prov/old"),
+        ],
+    )
+    assert await store.has_chunks_off_model(**scope, embedding_model="prov/new")
+    # A searchable chunk with no model recorded counts as another model.
+    assert await store.replace_chunks(
+        tenant_id=tenant,
+        document_id=document.id,
+        chunks=[
+            _row(tenant, base.id, document.id, 1, "prov/new"),
+            _row(tenant, base.id, document.id, 2, None),
+        ],
+    )
+    assert await store.has_chunks_off_model(**scope, embedding_model="prov/new")
 
 
 async def test_cancelled_never_claimed(store: KnowledgeStore) -> None:

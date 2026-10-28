@@ -27,9 +27,11 @@ from behavior_schema import (
     ExitReason,
     FinalTextContains,
     FinalTextNotContains,
+    FinalTextNotRegex,
     FinalTextRegex,
     NotCompleted,
     RunRecord,
+    ToolArgContains,
     ToolCall,
     ToolCountMax,
     ToolNotUsed,
@@ -40,6 +42,7 @@ from behavior_schema import (
     WorkspaceFileLineCount,
     WorkspaceFileNotContains,
     WorkspaceFileUnchangedLines,
+    arg_key,
 )
 
 FileKey = tuple[Literal["artifact", "workspace"], str]
@@ -125,6 +128,19 @@ def _calls(record: RunRecord) -> list[ToolCall]:
     return [call for turn in record.turns for call in turn.tool_calls]
 
 
+def _arg_values(value: object) -> set[str]:
+    """参数值拆成可比的集合(列表逐项、字符串整串;口径见 :func:`arg_key`)。"""
+    items = value if isinstance(value, list) else [] if value is None else [value]
+    return {arg_key(item) for item in items}
+
+
+def _arg_ok(call: ToolCall, check: ToolArgContains) -> bool:
+    values = _arg_values(call.args.get(check.arg))
+    wanted = {arg_key(v) for v in check.any_of}
+    unwanted = {arg_key(v) for v in check.none_of}
+    return bool(values & wanted) and not values & unwanted
+
+
 # 一个判据一个分支,与规格 §6 的表逐行对照。
 def _one(
     check: Check,
@@ -168,6 +184,9 @@ def _one(
         return _verdict(
             check, re.search(check.pattern, final) is not None, f"no match for {check.pattern!r}"
         )
+    if isinstance(check, FinalTextNotRegex):
+        found = re.search(check.pattern, final)
+        return _verdict(check, found is None, f"matched {found.group(0) if found else ''!r}")
     if isinstance(check, ArtifactExists):
         names = [
             str(a["name"])
@@ -221,7 +240,7 @@ def _one(
         return _verdict(
             check, n == check.count, f"{n} lines match {check.pattern!r}, want {check.count}"
         )
-    if isinstance(check, ToolUsed | ToolNotUsed | ToolCountMax | ToolNotUsedOn):
+    if isinstance(check, ToolUsed | ToolNotUsed | ToolCountMax | ToolNotUsedOn | ToolArgContains):
         calls = [c for c in calls if check.turn is None or c.turn == check.turn]
     if isinstance(check, ToolUsed):
         return _verdict(
@@ -242,6 +261,17 @@ def _one(
             if c.name == check.tool and path_matches(str(c.args.get("path", "")), check.path)
         ]
         return _verdict(check, not hits, f"{check.tool} on {check.path!r} in turns {hits}")
+    if isinstance(check, ToolArgContains):
+        # 只看工具接受了的调用:被拒的(没绑定的库、大小写不对的库名)不算选对。
+        mine = [c for c in calls if c.name == check.tool and not c.error]
+        if not mine:
+            return _verdict(check, False, f"{check.tool} not called (or every call refused)")
+        judged = mine[:1] if check.call == "first" else mine
+        return _verdict(
+            check,
+            any(_arg_ok(c, check) for c in judged),
+            f"{check.arg}={[c.args.get(check.arg) for c in judged]}",
+        )
     if isinstance(check, TurnTokensMax):
         if check.turn > len(turns):
             return _verdict(check, False, f"only {len(turns)} turns")

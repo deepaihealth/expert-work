@@ -1,0 +1,11 @@
+id: k04-same-term-two-bases
+agent: eval-kb
+shape: 多库按库检索(B-175 P4):同一个词(A 级)在两个库里意思不同,不能张冠李戴
+turns:
+  - prompt: |
+      我下个月要去一个 A 级城市出差,住宿每晚最多能报销多少钱?
+checks:
+  - {type: completed}
+  # hr 库:A 级城市每晚 735 元;参数库:A 级 = 待机功率不超过 0.37 W
+  - {type: final_text_contains, all: ["735"]}
+  - {type: final_text_not_contains, any: ["0.37"]}

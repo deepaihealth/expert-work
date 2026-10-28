@@ -5,6 +5,7 @@ from __future__ import annotations
 import math
 from collections import Counter
 from collections.abc import Collection, Sequence
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from typing import Any
 from uuid import UUID, uuid4
@@ -20,6 +21,23 @@ from expert_work.persistence.knowledge.base import (
     ParseCacheEntry,
     ParseCacheKind,
     _Unset,
+)
+from expert_work.persistence.knowledge.passages import (
+    SWITCH_OFF_REVISION,
+    ChunkVector,
+    DisabledReason,
+    ManualPassage,
+    Passage,
+    PassageChild,
+    PassageConflictError,
+    PassageLayout,
+    PassageRevision,
+    SwitchOffRecord,
+    edited_since,
+    manual_passages,
+    passage_rows,
+    settle_switch_off,
+    unapplied_revisions,
 )
 from expert_work.persistence.knowledge.text_search import (
     KB_DOC_TITLE_HIT_WEIGHT,
@@ -166,6 +184,14 @@ def _without_vector(chunk: KnowledgeChunk) -> KnowledgeChunk:
     return chunk.model_copy(update={"embedding": None if chunk.embedding is None else ()})
 
 
+def _public(passage: Passage) -> Passage:
+    """``passage`` as the SQL store reads it: vectors not loaded."""
+    row = _without_vector(passage.row)
+    if len(passage.children) == 1 and passage.children[0] is passage.row:
+        return Passage(row, (row,))
+    return Passage(row, tuple(_without_vector(child) for child in passage.children))
+
+
 def _cosine_distance(a: Sequence[float], b: Sequence[float]) -> float:
     """Cosine distance (0 = identical) — mirrors pgvector's ``<=>``."""
     dot = sum(x * y for x, y in zip(a, b, strict=False))
@@ -199,6 +225,10 @@ class InMemoryKnowledgeStore(KnowledgeStore):
         self._parse_cache: dict[tuple[UUID, UUID, str, str], ParseCacheEntry] = {}
         #: B-209 PR-2 — pixel hashes of each document's figures (``figure_hashes``).
         self._figure_hashes: dict[UUID, tuple[str, ...]] = {}
+        #: B-175 P3-PR2 — ``knowledge_chunk_revision``: (tenant, document, row);
+        #: the text revisions, and apart from them the switch-off records.
+        self._revisions: list[tuple[UUID, UUID, PassageRevision]] = []
+        self._switch_offs: list[tuple[UUID, UUID, PassageRevision]] = []
 
     # -- knowledge bases ----------------------------------------------------
 
@@ -331,6 +361,15 @@ class InMemoryKnowledgeStore(KnowledgeStore):
             count, chunks = stats.get(doc.kb_id, (0, 0))
             stats[doc.kb_id] = (count + 1, chunks + doc.chunk_count)
         return stats
+
+    async def count_documents_capped(
+        self, *, tenant_id: UUID, kb_ids: Sequence[UUID], cap: int
+    ) -> dict[UUID, int]:
+        counts = dict.fromkeys(kb_ids, 0)
+        for doc in self._documents:
+            if doc.tenant_id == tenant_id and doc.kb_id in counts:
+                counts[doc.kb_id] = min(counts[doc.kb_id] + 1, cap)
+        return counts
 
     async def base_stats_many_all_tenants(
         self, *, kb_ids: Sequence[UUID]
@@ -671,14 +710,37 @@ class InMemoryKnowledgeStore(KnowledgeStore):
         self._lease[document_id] = now + timedelta(seconds=lease_seconds)
         return True
 
-    async def list_documents(self, *, tenant_id: UUID, kb_id: UUID) -> list[KnowledgeDocument]:
-        docs = [d for d in self._documents if d.tenant_id == tenant_id and d.kb_id == kb_id]
+    async def list_documents(
+        self,
+        *,
+        tenant_id: UUID,
+        kb_id: UUID,
+        enabled: bool | None = None,
+        statuses: Collection[DocumentStatus] | None = None,
+    ) -> list[KnowledgeDocument]:
+        docs = [
+            d
+            for d in self._documents
+            if d.tenant_id == tenant_id
+            and d.kb_id == kb_id
+            and (enabled is None or d.enabled is enabled)
+            and (statuses is None or d.status in statuses)
+        ]
         return sorted(docs, key=_created_key, reverse=True)
 
     async def list_documents_page(
-        self, *, tenant_id: UUID, kb_id: UUID, limit: int, offset: int
+        self,
+        *,
+        tenant_id: UUID,
+        kb_id: UUID,
+        limit: int,
+        offset: int,
+        enabled: bool | None = None,
+        statuses: Collection[DocumentStatus] | None = None,
     ) -> tuple[list[KnowledgeDocument], int]:
-        docs = await self.list_documents(tenant_id=tenant_id, kb_id=kb_id)
+        docs = await self.list_documents(
+            tenant_id=tenant_id, kb_id=kb_id, enabled=enabled, statuses=statuses
+        )
         return docs[offset : offset + limit], len(docs)
 
     async def set_document_status(
@@ -738,6 +800,9 @@ class InMemoryKnowledgeStore(KnowledgeStore):
         self._parse_cache = {
             key: entry for key, entry in self._parse_cache.items() if key[1] not in document_ids
         }
+        # B-175 P3-PR2 — the passages' history (the SQL FK cascades, 0176).
+        self._revisions = [r for r in self._revisions if r[1] not in document_ids]
+        self._switch_offs = [r for r in self._switch_offs if r[1] not in document_ids]
 
     async def set_document_pages(
         self,
@@ -836,6 +901,411 @@ class InMemoryKnowledgeStore(KnowledgeStore):
             model=model, result=dict(result)
         )
 
+    # -- maintenance (B-175 P3-PR2) -------------------------------------------
+
+    async def set_documents_enabled(
+        self, *, tenant_id: UUID, kb_id: UUID, document_ids: Sequence[UUID], enabled: bool
+    ) -> list[UUID]:
+        wanted = set(document_ids)
+        done: set[UUID] = set()
+        now = datetime.now(UTC)
+        for index, document in enumerate(self._documents):
+            if (
+                document.tenant_id == tenant_id
+                and document.kb_id == kb_id
+                and document.id in wanted
+            ):
+                self._documents[index] = document.model_copy(
+                    update={"enabled": enabled, "updated_at": now}
+                )
+                done.add(document.id)
+        return [document_id for document_id in dict.fromkeys(document_ids) if document_id in done]
+
+    async def count_stale_documents(self, *, tenant_id: UUID, kb_id: UUID, params_hash: str) -> int:
+        stale = await self.list_stale_documents(
+            tenant_id=tenant_id, kb_id=kb_id, params_hash=params_hash
+        )
+        return len(stale)
+
+    async def list_stale_documents(
+        self, *, tenant_id: UUID, kb_id: UUID, params_hash: str
+    ) -> list[KnowledgeDocument]:
+        ready = await self.list_documents(
+            tenant_id=tenant_id, kb_id=kb_id, statuses=(DocumentStatus.READY,)
+        )
+        return [d for d in ready if d.chunk_params_hash != params_hash]
+
+    async def list_passages(
+        self,
+        *,
+        tenant_id: UUID,
+        document_id: UUID,
+        enabled_only: bool = False,
+        offset: int = 0,
+        limit: int | None = None,
+        disabled_reason: DisabledReason | None = None,
+    ) -> list[Passage]:
+        passages = [_public(p) for p in self._passages(tenant_id, document_id)]
+        if disabled_reason is not None:
+            passages = [p for p in passages if p.row.disabled_reason == disabled_reason]
+        if enabled_only:
+            document = await self.get_document(tenant_id=tenant_id, document_id=document_id)
+            if document is None or not document.enabled:
+                return []
+            passages = [
+                Passage(p.row, tuple(c for c in p.children if c.enabled))
+                for p in passages
+                if p.row.enabled
+            ]
+        end = None if limit is None else offset + limit
+        return passages[offset:end]
+
+    async def count_passages(self, *, tenant_id: UUID, document_id: UUID) -> int:
+        return len(self._passages(tenant_id, document_id))
+
+    async def get_passage(
+        self, *, tenant_id: UUID, document_id: UUID, passage_id: UUID
+    ) -> Passage | None:
+        found = self._passage(tenant_id, document_id, passage_id)
+        return _public(found) if found is not None else None
+
+    async def replace_passage(
+        self,
+        *,
+        tenant_id: UUID,
+        document_id: UUID,
+        passage_id: UUID,
+        expected_revision: int,
+        content: str,
+        heading_path: Sequence[str],
+        children: Sequence[PassageChild],
+        edited_by: str | None,
+    ) -> Passage | None:
+        document = await self._settled_document(tenant_id, document_id)
+        if document is None:
+            return None
+        old = self._passage(tenant_id, document_id, passage_id)
+        if old is None:
+            return None
+        if old.row.revision != expected_revision:
+            raise PassageConflictError("revision_conflict", current=_public(old))
+        history = self._history(tenant_id, document_id, passage_id)
+        if not history:
+            # The text ingested from the file, kept before its first change.
+            history = [
+                self._record(
+                    document,
+                    passage_id,
+                    old.row.revision,
+                    old.row.content,
+                    old.row.heading_path,
+                    None,
+                )
+            ]
+        revision = max(old.row.revision, history[-1].revision) + 1
+        self._record(document, passage_id, revision, content, heading_path, edited_by)
+        self._write_passage(
+            document,
+            old,
+            content=content,
+            heading_path=heading_path,
+            children=children,
+            revision=revision,
+            edited=edited_since(history[0], content, heading_path),
+            enabled=old.row.enabled,
+            disabled_reason=old.row.disabled_reason,
+        )
+        return await self.get_passage(
+            tenant_id=tenant_id, document_id=document_id, passage_id=passage_id
+        )
+
+    async def add_passage(
+        self,
+        *,
+        tenant_id: UUID,
+        document_id: UUID,
+        content: str,
+        heading_path: Sequence[str],
+        children: Sequence[PassageChild],
+        edited_by: str | None,
+    ) -> Passage | None:
+        document = await self._settled_document(tenant_id, document_id)
+        if document is None:
+            return None
+        passage_id = uuid4()
+        self._record(document, passage_id, 1, content, heading_path, edited_by)
+        self._write_passage(
+            document,
+            None,
+            content=content,
+            heading_path=heading_path,
+            children=children,
+            revision=1,
+            edited=True,
+            enabled=True,
+            passage_id=passage_id,
+        )
+        return await self.get_passage(
+            tenant_id=tenant_id, document_id=document_id, passage_id=passage_id
+        )
+
+    async def set_passage_enabled(
+        self, *, tenant_id: UUID, document_id: UUID, passage_id: UUID, enabled: bool
+    ) -> Passage | None:
+        if await self._settled_document(tenant_id, document_id) is None:
+            return None
+        passage = self._passage(tenant_id, document_id, passage_id)
+        if passage is None:
+            return None
+        ids = {passage.row.id, *(c.id for c in passage.children)}
+        update = {"enabled": enabled, "disabled_reason": None if enabled else "manual"}
+        self._chunks = [c.model_copy(update=update) if c.id in ids else c for c in self._chunks]
+        if passage.row.disabled_reason == "inherited":
+            self._settle_switch_offs(tenant_id, document_id, passage.row.content)
+        return await self.get_passage(
+            tenant_id=tenant_id, document_id=document_id, passage_id=passage_id
+        )
+
+    def _settle_switch_offs(self, tenant_id: UUID, document_id: UUID, passage: str) -> None:
+        """A person decided about a passage off by inheritance: its paragraphs
+        leave the document's switch-off records (an emptied one goes)."""
+        settled: list[tuple[UUID, UUID, PassageRevision]] = []
+        for tenant, document, record in self._switch_offs:
+            if (tenant, document) == (tenant_id, document_id):
+                content = settle_switch_off(record.content, passage)
+                if not content:
+                    continue
+                record = replace(record, content=content)
+            settled.append((tenant, document, record))
+        self._switch_offs = settled
+
+    def _records(self, tenant_id: UUID, document_id: UUID) -> list[PassageRevision]:
+        return [
+            record
+            for tenant, document, record in self._switch_offs
+            if (tenant, document) == (tenant_id, document_id)
+        ]
+
+    async def list_passage_revisions(
+        self, *, tenant_id: UUID, document_id: UUID, passage_id: UUID
+    ) -> list[PassageRevision]:
+        return self._history(tenant_id, document_id, passage_id)
+
+    async def list_switch_offs(
+        self, *, tenant_id: UUID, document_id: UUID
+    ) -> list[PassageRevision]:
+        return self._records(tenant_id, document_id)
+
+    async def list_unapplied_revisions(
+        self, *, tenant_id: UUID, document_id: UUID
+    ) -> list[PassageRevision]:
+        histories: dict[UUID, list[PassageRevision]] = {}
+        for tenant, document, record in self._revisions:
+            if tenant == tenant_id and document == document_id:
+                histories.setdefault(record.passage_id, []).append(record)
+        current = {p.row.id: p.row.revision for p in self._passages(tenant_id, document_id)}
+        return unapplied_revisions(histories, current, self._records(tenant_id, document_id))
+
+    async def discard_unapplied_revisions(self, *, tenant_id: UUID, document_id: UUID) -> int:
+        unapplied = await self.list_unapplied_revisions(
+            tenant_id=tenant_id, document_id=document_id
+        )
+        current = {p.row.id: p.row.revision for p in self._passages(tenant_id, document_id)}
+        # Gone: the whole history; still there: the revisions above its own;
+        # a switch-off record: itself.
+        records = {r.passage_id for r in unapplied if r.switch_off_lost}
+        floor = {
+            r.passage_id: current.get(r.passage_id, 0) for r in unapplied if not r.switch_off_lost
+        }
+        mine = (tenant_id, document_id)
+        kept = [
+            entry
+            for entry in self._revisions
+            if not (
+                entry[:2] == mine
+                and entry[2].passage_id in floor
+                and entry[2].revision > floor[entry[2].passage_id]
+            )
+        ]
+        kept_records = [
+            entry
+            for entry in self._switch_offs
+            if not (entry[:2] == mine and entry[2].passage_id in records)
+        ]
+        discarded = len(self._revisions) - len(kept) + len(self._switch_offs) - len(kept_records)
+        self._revisions, self._switch_offs = kept, kept_records
+        return discarded
+
+    async def list_manual_passages(
+        self, *, tenant_id: UUID, document_id: UUID
+    ) -> list[ManualPassage]:
+        histories: dict[UUID, list[PassageRevision]] = {}
+        for tenant, document, record in sorted(self._revisions, key=lambda e: e[2].revision):
+            if tenant == tenant_id and document == document_id:
+                histories.setdefault(record.passage_id, []).append(record)
+        rows = [_without_vector(p.row) for p in self._passages(tenant_id, document_id)]
+        return manual_passages(rows, histories)
+
+    async def update_chunk_embeddings(
+        self,
+        *,
+        tenant_id: UUID,
+        document_id: UUID,
+        vectors: Sequence[ChunkVector],
+        embedding_model: str | None,
+        generation: int,
+        expect_status: DocumentStatus = DocumentStatus.READY,
+    ) -> int | None:
+        document = await self.get_document(tenant_id=tenant_id, document_id=document_id)
+        if document is None or not _fence_matches(document, generation, expect_status):
+            return None
+        wanted = {v.chunk_id: v for v in vectors}
+        updated = 0
+        for index, chunk in enumerate(self._chunks):
+            vector = wanted.get(chunk.id)
+            if (
+                vector is None
+                or chunk.tenant_id != tenant_id
+                or chunk.document_id != document_id
+                or chunk.chunk_type not in SEARCHABLE_CHUNK_TYPES
+                or chunk.content_hash != vector.content_hash
+            ):
+                continue
+            self._chunks[index] = chunk.model_copy(
+                update={"embedding": tuple(vector.embedding), "embedding_model": embedding_model}
+            )
+            updated += 1
+        return updated
+
+    def _passages(self, tenant_id: UUID, document_id: UUID) -> list[Passage]:
+        """The document's passages in document order, vectors kept (the
+        SQL store's ``_passages_stmt`` order)."""
+        rows = [
+            c for c in self._chunks if c.tenant_id == tenant_id and c.document_id == document_id
+        ]
+        under: dict[UUID, list[KnowledgeChunk]] = {}
+        for chunk in rows:
+            if chunk.chunk_type in SEARCHABLE_CHUNK_TYPES and chunk.parent_chunk_id is not None:
+                under.setdefault(chunk.parent_chunk_id, []).append(chunk)
+        passages: list[Passage] = []
+        for chunk in rows:
+            if chunk.chunk_type is ChunkType.PARENT:
+                kids = sorted(under.get(chunk.id, []), key=lambda c: c.chunk_index)
+                passages.append(Passage(chunk, tuple(kids)))
+            elif chunk.chunk_type in SEARCHABLE_CHUNK_TYPES and chunk.parent_chunk_id is None:
+                passages.append(Passage(chunk, (chunk,)))
+
+        def place(passage: Passage) -> tuple[bool, int, str, int]:
+            first = passage.children[0].chunk_index if passage.children else None
+            row = passage.row
+            return (first is None, first or 0, row.chunk_type.value, row.chunk_index)
+
+        return sorted(passages, key=place)
+
+    def _passage(self, tenant_id: UUID, document_id: UUID, passage_id: UUID) -> Passage | None:
+        return next(
+            (p for p in self._passages(tenant_id, document_id) if p.row.id == passage_id), None
+        )
+
+    async def _settled_document(
+        self, tenant_id: UUID, document_id: UUID
+    ) -> KnowledgeDocument | None:
+        """The document a passage write may change, or ``None`` when there is
+        none; :class:`PassageConflictError` while its chunks are about to be
+        replaced (being ingested, or a new version waits)."""
+        document = await self.get_document(tenant_id=tenant_id, document_id=document_id)
+        if document is None:
+            return None
+        if document.status is not DocumentStatus.READY or document.has_pending:
+            raise PassageConflictError("document_busy")
+        return document
+
+    def _history(
+        self, tenant_id: UUID, document_id: UUID, passage_id: UUID
+    ) -> list[PassageRevision]:
+        found = [
+            record
+            for tenant, document, record in self._revisions
+            if tenant == tenant_id and document == document_id and record.passage_id == passage_id
+        ]
+        return sorted(found, key=lambda record: record.revision)
+
+    def _record(
+        self,
+        document: KnowledgeDocument,
+        passage_id: UUID,
+        revision: int,
+        content: str,
+        heading_path: Sequence[str],
+        edited_by: str | None,
+    ) -> PassageRevision:
+        if any(
+            r.passage_id == passage_id and r.revision == revision for _, _, r in self._revisions
+        ):
+            # Mirror the SQL unique (chunk_id, revision).
+            msg = f"revision {revision} of passage {passage_id} already exists"
+            raise ValueError(msg)
+        record = PassageRevision(
+            passage_id=passage_id,
+            revision=revision,
+            content=content,
+            heading_path=tuple(heading_path),
+            edited_by=edited_by,
+            created_at=datetime.now(UTC),
+        )
+        self._revisions.append((document.tenant_id, document.id, record))
+        return record
+
+    def _write_passage(
+        self,
+        document: KnowledgeDocument,
+        old: Passage | None,
+        *,
+        content: str,
+        heading_path: Sequence[str],
+        children: Sequence[PassageChild],
+        revision: int,
+        edited: bool,
+        enabled: bool,
+        passage_id: UUID | None = None,
+        disabled_reason: DisabledReason | None = None,
+    ) -> None:
+        mine = [c for c in self._chunks if c.document_id == document.id]
+        searchable = [c.chunk_index for c in mine if c.chunk_type in SEARCHABLE_CHUNK_TYPES]
+        parents = [c.chunk_index for c in mine if c.chunk_type is ChunkType.PARENT]
+        layout = PassageLayout(
+            passage_id=old.row.id if old is not None else (passage_id or uuid4()),
+            tenant_id=document.tenant_id,
+            kb_id=document.kb_id,
+            document_id=document.id,
+            old=old,
+            next_index=max(searchable, default=-1) + 1,
+            next_parent_index=max(parents, default=-1) + 1,
+        )
+        rows = passage_rows(
+            layout,
+            content=content,
+            heading_path=heading_path,
+            children=children,
+            revision=revision,
+            edited=edited,
+            enabled=enabled,
+            disabled_reason=disabled_reason,
+        )
+        replaced = {old.row.id, *(c.id for c in old.children)} if old is not None else set()
+        self._chunks = [c for c in self._chunks if c.id not in replaced]
+        self._chunks.extend(rows)
+        count = sum(
+            1
+            for c in self._chunks
+            if c.document_id == document.id and c.chunk_type in SEARCHABLE_CHUNK_TYPES
+        )
+        self._patch(
+            document.tenant_id,
+            document.id,
+            {"chunk_count": count, "updated_at": datetime.now(UTC)},
+        )
+
     # -- chunks -------------------------------------------------------------
 
     async def replace_chunks(
@@ -847,6 +1317,7 @@ class InMemoryKnowledgeStore(KnowledgeStore):
         generation: int | None = None,
         expect_status: DocumentStatus = DocumentStatus.PROCESSING,
         chunk_params_hash: str | None = None,
+        switch_offs: Collection[SwitchOffRecord] = (),
     ) -> bool:
         document = await self.get_document(tenant_id=tenant_id, document_id=document_id)
         if generation is not None:
@@ -866,21 +1337,81 @@ class InMemoryKnowledgeStore(KnowledgeStore):
             # Mirror the SQL CHECK: only a parent row goes without a vector (0175).
             msg = f"a chunk that is not a parent has no embedding (document {document_id})"
             raise ValueError(msg)
+        if switch_offs:
+            self._write_switch_offs(tenant_id, document_id, switch_offs)
         self._chunks = [
             c
             for c in self._chunks
             if not (c.tenant_id == tenant_id and c.document_id == document_id)
         ]
-        # A parent row is stored without a vector, as the SQL store writes it.
+        # A parent row is stored without a vector, and an enabled row without a
+        # disabled reason, as the SQL store writes them.
         self._chunks.extend(
-            c.model_copy(update={"embedding": None}) if c.chunk_type is ChunkType.PARENT else c
+            c.model_copy(
+                update={
+                    "embedding": None if c.chunk_type is ChunkType.PARENT else c.embedding,
+                    "disabled_reason": None if c.enabled else c.disabled_reason,
+                }
+            )
             for c in chunks
         )
         if chunk_params_hash is not None:
             self._documents[self._documents.index(document)] = document.model_copy(
                 update={"chunk_params_hash": chunk_params_hash}
             )
+        self._stamp_orphans(tenant_id, document_id)
         return True
+
+    def _write_switch_offs(
+        self, tenant_id: UUID, document_id: UUID, records: Collection[SwitchOffRecord]
+    ) -> None:
+        """``replace_chunks(switch_offs=…)``: a record this ingest made is
+        inserted; an earlier one only updated, if it still exists (one
+        discarded or expired meanwhile stays gone). ``orphaned_at`` cleared
+        when placed, else set once."""
+        now = datetime.now(UTC)
+        known = {r.passage_id: r for r in self._records(tenant_id, document_id)}
+        written: dict[UUID, PassageRevision] = {}
+        for record in records:
+            previous = known.get(record.passage_id)
+            if previous is None and not record.new:
+                continue
+            since = previous.orphaned_at if previous is not None else None
+            orphaned_at = None if record.placed else (since or now)
+            written[record.passage_id] = (
+                replace(previous, orphaned_at=orphaned_at)
+                if previous is not None
+                else PassageRevision(
+                    passage_id=record.passage_id,
+                    revision=SWITCH_OFF_REVISION,
+                    content=record.content,
+                    heading_path=record.heading_path,
+                    edited_by=None,
+                    created_at=now,
+                    orphaned_at=orphaned_at,
+                    switch_off_lost=True,
+                )
+            )
+        self._switch_offs = [
+            entry
+            for entry in self._switch_offs
+            if not (entry[:2] == (tenant_id, document_id) and entry[2].passage_id in written)
+        ] + [(tenant_id, document_id, record) for record in written.values()]
+
+    def _stamp_orphans(self, tenant_id: UUID, document_id: UUID) -> None:
+        """B-175 P3-PR2 — histories of passages the document no longer has
+        get ``orphaned_at`` (once); a passage that is there again clears it."""
+        present = {p.row.id for p in self._passages(tenant_id, document_id)}
+        now = datetime.now(UTC)
+        stamped: list[tuple[UUID, UUID, PassageRevision]] = []
+        for tenant, document, record in self._revisions:
+            if tenant == tenant_id and document == document_id:
+                if record.passage_id in present:
+                    record = replace(record, orphaned_at=None)
+                elif record.orphaned_at is None:
+                    record = replace(record, orphaned_at=now)
+            stamped.append((tenant, document, record))
+        self._revisions = stamped
 
     async def list_chunks(
         self,
@@ -890,6 +1421,7 @@ class InMemoryKnowledgeStore(KnowledgeStore):
         offset: int = 0,
         limit: int = 50,
         chunk_types: Collection[ChunkType] | None = None,
+        after: tuple[int, ChunkType] | None = None,
     ) -> tuple[list[KnowledgeChunk], int]:
         wanted = SEARCHABLE_CHUNK_TYPES if chunk_types is None else frozenset(chunk_types)
         matching = [
@@ -898,8 +1430,12 @@ class InMemoryKnowledgeStore(KnowledgeStore):
             if c.tenant_id == tenant_id and c.document_id == document_id and c.chunk_type in wanted
         ]
         matching.sort(key=lambda c: (c.chunk_index, c.chunk_type.value))
+        start = (after[0], after[1].value) if after is not None else None
+        listed = [
+            c for c in matching if start is None or (c.chunk_index, c.chunk_type.value) > start
+        ]
         # Mirror the SQL projection: embedding omitted from preview rows.
-        page = [_without_vector(c) for c in matching[offset : offset + limit]]
+        page = [_without_vector(c) for c in listed[offset : offset + limit]]
         return page, len(matching)
 
     async def get_chunks(
@@ -927,6 +1463,17 @@ class InMemoryKnowledgeStore(KnowledgeStore):
             and c.content_hash is not None
             and c.content_hash in wanted
         }
+
+    async def has_chunks_off_model(
+        self, *, tenant_id: UUID, kb_id: UUID, embedding_model: str | None
+    ) -> bool:
+        return any(
+            c.tenant_id == tenant_id
+            and c.kb_id == kb_id
+            and c.chunk_type in SEARCHABLE_CHUNK_TYPES
+            and c.embedding_model != embedding_model
+            for c in self._chunks
+        )
 
     async def search(
         self,
@@ -964,14 +1511,22 @@ class InMemoryKnowledgeStore(KnowledgeStore):
 
     def _recallable(self, tenant_id: UUID, kb_ids: Sequence[UUID]) -> list[KnowledgeChunk]:
         """The chunks recall may return: the tenant's, in ``kb_ids``, of the
-        searchable types — also BM25's N for keyword search."""
+        searchable types, enabled, of a document that is not disabled — also
+        BM25's N for keyword search (the SQL store's ``_recall_scope``)."""
         kb_set = set(kb_ids)
+        disabled = {
+            d.id
+            for d in self._documents
+            if d.tenant_id == tenant_id and d.kb_id in kb_set and not d.enabled
+        }
         return [
             c
             for c in self._chunks
             if c.tenant_id == tenant_id
             and c.kb_id in kb_set
             and c.chunk_type in SEARCHABLE_CHUNK_TYPES
+            and c.enabled
+            and c.document_id not in disabled
         ]
 
     async def keyword_search(

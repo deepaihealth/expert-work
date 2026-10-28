@@ -251,6 +251,58 @@ async def test_reindex_stays_unstamped_while_a_serving_document_is_re_uploading(
     assert await _base_model(store) == ("prov", "new")
 
 
+class _ReuploadMeanwhile(_Pinned):
+    """The new model, during whose first call the document is re-uploaded."""
+
+    def __init__(self, store: InMemoryKnowledgeStore, kb_id: UUID) -> None:
+        super().__init__("prov/new")
+        self._store = store
+        self._kb_id = kb_id
+        self._fired = False
+
+    async def embed(self, texts: Sequence[str], *, tenant_id: UUID) -> list[tuple[float, ...]]:
+        if not self._fired:
+            self._fired = True
+            await self._store.upsert_document(
+                tenant_id=_TENANT,
+                kb_id=self._kb_id,
+                filename="y.md",
+                content=_V2,
+                content_sha256="v2",
+            )
+        return await super().embed(texts, tenant_id=tenant_id)
+
+
+@pytest.mark.usefixtures("no_semantic_breaks")
+async def test_reindex_superseded_by_a_reupload_that_is_then_cancelled_stays_unstamped() -> None:
+    """A re-upload lands while the re-index embeds the document (its write-back
+    is superseded). Until the new version is in, the previous chunks serve on
+    the old model — and keep doing so when the re-upload is cancelled — so the
+    base is not stamped; the next re-index re-embeds them and stamps it."""
+    store = InMemoryKnowledgeStore()
+    base = await store.create_base(tenant_id=_TENANT, name="kb")
+    old = KnowledgeIngestionRunner(store=store, embedder=_Pinned("prov/old"))
+    document = await store.upsert_document(
+        tenant_id=_TENANT, kb_id=base.id, filename="y.md", content=_V1, content_sha256="v1"
+    )
+    await old.submit(tenant_id=_TENANT, document_id=document.id)
+    racing = KnowledgeIngestionRunner(store=store, embedder=_ReuploadMeanwhile(store, base.id))
+
+    await racing.submit_reindex(
+        tenant_id=_TENANT, kb_id=base.id, embedding_provider="prov", embedding_model="new"
+    )
+
+    assert await _base_model(store) == (None, None)
+    await _cancel(store, base.id, document.id)
+    assert await _models(store, document.id) == {"prov/old"}  # still serving
+    new = KnowledgeIngestionRunner(store=store, embedder=_Pinned("prov/new"))
+    await new.submit_reindex(
+        tenant_id=_TENANT, kb_id=base.id, embedding_provider="prov", embedding_model="new"
+    )
+    assert await _models(store, document.id) == {"prov/new"}
+    assert await _base_model(store) == ("prov", "new")
+
+
 @pytest.mark.usefixtures("no_semantic_breaks")
 async def test_reindex_re_embeds_chunks_of_a_first_upload_that_failed_after_its_swap() -> None:
     """Chunks written, then READY refused (failed): ``chunk_count`` was never

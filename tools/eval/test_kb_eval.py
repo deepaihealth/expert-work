@@ -25,9 +25,11 @@ from kb_eval import (  # type: ignore[import-not-found]
     EVAL_TENANT_ID,
     CaseRow,
     CountingEmbedder,
+    DupCopy,
     EmbeddingDegradedError,
     EmbeddingDimensionError,
     EvalConfig,
+    KeywordDegradedError,
     RerankDegradedError,
     _build_parser,
     _mean_p90,
@@ -41,6 +43,7 @@ from kb_eval import (  # type: ignore[import-not-found]
     build_retriever,
     case_to_json,
     check_anchors,
+    corpus_titles,
     doc_titles_for,
     fingerprint,
     format_summary_table,
@@ -60,7 +63,7 @@ from longmem.embedders import CachedEmbedder  # type: ignore[import-not-found]
 
 from control_plane.knowledge.chunking import CHUNKER_VERSION, count_tokens
 from expert_work.common.spotlight import unspotlight
-from expert_work.persistence import InMemoryKnowledgeStore
+from expert_work.persistence import InMemoryKnowledgeStore, KnowledgeRecallError
 from expert_work.persistence.embedding import EMBEDDING_DIM
 from expert_work.persistence.rls import current_tenant_id_var
 from expert_work.protocol import ChunkType, DocumentStatus, RetrievalMethod, chunk_retrieval_text
@@ -2356,3 +2359,230 @@ def test_two_runs_of_the_same_code_write_the_same_results(tmp_path: Path) -> Non
     first, second = run("one"), run("two")
     assert first == second
     assert any(r["parent_index"] is not None for s in first[2] for r in s["results"])
+
+
+# ---------------------------------------------------------------------------
+# B-206 K-21② 保留副本的对照组 / K-22 关键词路降级
+# ---------------------------------------------------------------------------
+
+
+def test_select_rows_keep_dups_real_keeps_every_copy_as_itself(corpus: tuple[Path, Path]) -> None:
+    manifest, _root = corpus
+    selection = select_rows(
+        _manifest_rows(manifest), tiers=("A", "D-A"), limit_docs=0, keep_dups="real"
+    )
+    assert "docs/manual_a_copy.md" in [r["path"] for r in selection.rows]
+    assert selection.skipped_dup == 0
+    assert selection.copies == {}
+
+
+def test_select_rows_keep_dups_same_title_names_each_copy_after_its_original() -> None:
+    rows = [
+        _row("x/a.md", dup_group="g1"),
+        _row("y/b.md"),
+        _row("y/a2.md", dup_group="g1"),
+        _row("z/a3.md", dup_group="g1"),
+    ]
+    selection = select_rows(rows, tiers=("A",), limit_docs=0, keep_dups="same-title")
+    assert [r["path"] for r in selection.rows] == ["x/a.md", "y/b.md", "y/a2.md", "z/a3.md"]
+    assert selection.skipped_dup == 0
+    assert selection.copies == {
+        "y/a2.md": DupCopy(original="x/a.md", filename="dup1/a.md"),
+        "z/a3.md": DupCopy(original="x/a.md", filename="dup2/a.md"),
+    }
+    with pytest.raises(ValueError, match="keep_dups"):
+        select_rows(rows, tiers=("A",), limit_docs=0, keep_dups="all")
+
+
+@pytest.mark.parametrize("mode", ["real", "same-title"])
+def test_limit_docs_counts_no_copy_and_keeps_the_copies_of_what_it_kept(mode: str) -> None:
+    """The arm with copies holds the same originals as the arm without, plus the
+    copies of those: a copy takes no slot of ``--limit-docs``."""
+    rows = [
+        _row("x/a.md", dup_group="g1"),
+        _row("x/a_copy.md", dup_group="g1"),
+        _row("x/b.md"),
+        _row("x/c.md", dup_group="g2"),
+        _row("x/c_copy.md", dup_group="g2"),
+    ]
+    without = select_rows(rows, tiers=("A",), limit_docs=2)
+    with_copies = select_rows(rows, tiers=("A",), limit_docs=2, keep_dups=mode)
+    assert [r["path"] for r in without.rows] == ["x/a.md", "x/b.md"]
+    assert [r["path"] for r in with_copies.rows] == ["x/a.md", "x/a_copy.md", "x/b.md"]
+    assert with_copies.skipped_limit == 2  # c and its copy
+    assert set(with_copies.copies) == ({"x/a_copy.md"} if mode == "same-title" else set())
+
+
+def test_same_title_copies_leave_the_originals_shuffled_titles_as_they_were() -> None:
+    """The shuffled control arm permutes the originals' titles exactly as the
+    run without copies does; each copy then takes its original's."""
+    rows = [_row(f"docs/doc_{i}.md", dup_group="g1" if i in (0, 3) else "") for i in range(6)]
+    without = corpus_titles(select_rows(rows, tiers=("A",), limit_docs=0), "shuffled")
+    with_copies = corpus_titles(
+        select_rows(rows, tiers=("A",), limit_docs=0, keep_dups="same-title"), "shuffled"
+    )
+    assert {p: t for p, t in with_copies.items() if p != "docs/doc_3.md"} == without
+    assert with_copies["docs/doc_3.md"] == with_copies["docs/doc_0.md"]
+
+
+def test_main_refuses_shuffled_titles_with_real_copies(
+    tmp_path: Path, dataset_path: Path, corpus: tuple[Path, Path]
+) -> None:
+    """Real copies are documents of their own: shuffling would give the originals
+    another permutation than the run they are compared with."""
+    _manifest, root = corpus
+    argv = _cli(dataset_path, root, tmp_path / "unit.jsonl", tmp_path / "b.yaml")
+    with pytest.raises(SystemExit, match="--doc-titles shuffled"):
+        main([*argv, "--keep-dups", "real", "--doc-titles", "shuffled"])
+    assert not (tmp_path / "unit.jsonl").exists()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("mode", "copy_name", "copy_title"),
+    [("real", "manual_a_copy.md", "manual a copy"), ("same-title", "dup1/manual_a.md", "manual a")],
+)
+async def test_build_corpus_ingests_a_kept_copy(
+    corpus: tuple[Path, Path], mode: str, copy_name: str, copy_title: str
+) -> None:
+    """``same-title`` copies carry the original's title, so every chunk's embedded
+    text is the original's (an embedding cache hit, no spend); ``real`` copies
+    keep their own name and title."""
+    manifest, root = corpus
+    store = InMemoryKnowledgeStore()
+    tenant = uuid4()
+    report = await build_corpus(
+        store=store,
+        embedder=build_fake_embedder(),
+        tenant_id=tenant,
+        base_name="unit_kb",
+        corpus_root=root,
+        selection=select_rows(
+            _manifest_rows(manifest), tiers=("A", "D-A"), limit_docs=0, keep_dups=mode
+        ),
+        concurrency=2,
+    )
+    assert report.docs_skipped_dup == 0
+    docs = {
+        d.filename: d for d in await store.list_documents(tenant_id=tenant, kb_id=report.base_id)
+    }
+    assert docs[copy_name].status is DocumentStatus.READY
+
+    def embedded(filename: str) -> list[str]:
+        return [c.retrieval_text for c in store._chunks if c.document_id == docs[filename].id]
+
+    copy = [c for c in store._chunks if c.document_id == docs[copy_name].id]
+    assert {c.doc_title for c in copy} == {copy_title}
+    assert (embedded(copy_name) == embedded("manual_a.md")) is (mode == "same-title")
+
+
+async def _built_with_copies(
+    corpus: tuple[Path, Path], dataset_path: Path, *, dedup: bool
+) -> list[CaseRow]:
+    manifest, root = corpus
+    dataset = load_dataset(dataset_path)
+    store = InMemoryKnowledgeStore()
+    embedder = build_fake_embedder()
+    tenant = uuid4()
+    await build_corpus(
+        store=store,
+        embedder=embedder,
+        tenant_id=tenant,
+        base_name=dataset.name,
+        corpus_root=root,
+        selection=select_rows(
+            _manifest_rows(manifest), tiers=("A", "D-A"), limit_docs=0, keep_dups="real"
+        ),
+        concurrency=1,
+    )
+    retriever = build_retriever(store=store, embedder=embedder, reranker=None, dedup=dedup)
+    return await run_eval(
+        dataset=dataset, retriever=retriever, tenant_id=tenant, cfg=EvalConfig(), concurrency=1
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_kept_copy_takes_top_ten_places_only_with_dedup_off(
+    corpus: tuple[Path, Path], dataset_path: Path
+) -> None:
+    off = summarise(await _built_with_copies(corpus, dataset_path, dedup=False), corpus=None)
+    on = summarise(await _built_with_copies(corpus, dataset_path, dedup=True), corpus=None)
+    assert off["overall"]["dup_share@10"] > 0
+    assert on["overall"]["dup_share@10"] == 0.0
+
+
+async def _keyword_timeout(**_kwargs: Any) -> list[Any]:
+    raise KnowledgeRecallError("canceling statement due to statement timeout")
+
+
+@pytest.mark.asyncio
+async def test_run_eval_aborts_when_the_keyword_path_degrades(
+    corpus: tuple[Path, Path], dataset_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The retriever keeps the vector results when the keyword path fails
+    (B-206 K-22); the eval must not score them as the hybrid result."""
+    dataset, retriever, store, (tenant, _report) = await _built(corpus, dataset_path)
+    monkeypatch.setattr(store, "keyword_search_scored", _keyword_timeout)
+    with pytest.raises(KeywordDegradedError, match="vector search alone"):
+        await run_eval(
+            dataset=dataset,
+            retriever=retriever,
+            tenant_id=tenant,
+            cfg=EvalConfig(top_k=20),
+            concurrency=1,
+        )
+
+
+@pytest.mark.parametrize(
+    ("flags", "expected"),
+    [
+        ((), (True, "drop", 3)),
+        (("--dedup", "off"), (False, "drop", 3)),
+        (("--keep-dups", "real"), (True, "real", 4)),
+        (("--keep-dups", "same-title", "--dedup", "off"), (False, "same-title", 4)),
+    ],
+)
+def test_main_duplicate_arm_flags_reach_the_run_and_are_recorded(
+    tmp_path: Path,
+    dataset_path: Path,
+    corpus: tuple[Path, Path],
+    monkeypatch: pytest.MonkeyPatch,
+    flags: tuple[str, ...],
+    expected: tuple[bool, str, int],
+) -> None:
+    built: list[KnowledgeRetriever] = []
+
+    def _spy(**kwargs: Any) -> KnowledgeRetriever:
+        retriever = cast(KnowledgeRetriever, build_retriever(**kwargs))
+        built.append(retriever)
+        return retriever
+
+    monkeypatch.setattr("kb_eval.build_retriever", _spy)
+    _manifest, root = corpus
+    out = tmp_path / "unit.jsonl"
+    assert main(_cli(dataset_path, root, out, tmp_path / "b.yaml", *flags)) == 0
+    (retriever,) = built
+    summary = json.loads(out.read_text(encoding="utf-8").splitlines()[-1])["summary"]
+    recorded = (
+        retriever.dedup,
+        summary["config"]["keep_dups"],
+        summary["corpus"]["docs_ingested"],
+    )
+    assert recorded == expected
+    assert summary["config"]["dedup"] is expected[0]
+    assert "dup_share@10" in summary["overall"]
+
+
+@pytest.mark.parametrize(
+    "flags", [("--dedup", "off"), ("--keep-dups", "real"), ("--keep-dups", "same-title")]
+)
+def test_main_refuses_baseline_for_a_duplicate_arm(
+    tmp_path: Path, dataset_path: Path, corpus: tuple[Path, Path], flags: tuple[str, ...]
+) -> None:
+    _manifest, root = corpus
+    argv = _cli(
+        dataset_path, root, tmp_path / "unit.jsonl", tmp_path / "b.yaml", "--update-baseline"
+    )
+    with pytest.raises(SystemExit, match="refusing to update baseline with a K-21 arm"):
+        main([*argv, *flags])
+    assert not (tmp_path / "b.yaml").exists()

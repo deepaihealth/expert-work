@@ -1,0 +1,17 @@
+id: k02-route-warranty
+agent: eval-kb
+shape: 多库按库检索(B-175 P4):保修问题第一次检索就该查保修库
+turns:
+  - prompt: |
+      电水壶的整机保修期是多久?
+checks:
+  - {type: completed}
+  - {type: final_text_regex, pattern: '15\s*个月'}
+  # K1 = b140-kb-warranty(eval-kb 的第一个 knowledge_base_refs);同时选了别的库(含全选)不算
+  - type: tool_arg_contains
+    tool: knowledge_search
+    arg: bases
+    any_of: [K1, b140-kb-warranty]
+    none_of: [K2, K3, b140-kb-specs, b140-kb-hr]
+    call: first
+  - {type: tool_count_max, tool: knowledge_search, max: 3}

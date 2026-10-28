@@ -52,6 +52,8 @@ Agent 抄来的规则文本工作。
 | 系统提示词 | ❌ 不继承 | 平台生成 worker 模板(**符合业界共识,不改**) |
 | 记忆 / 触发器 / 静态子 Agent / reflection / routing / knowledge | ❌ 剥空 | 状态或递归语义,本设计不动 |
 
+> **2026-10-27 更新(B-175 P4,用户拍板)**:knowledge 改为**继承** —— worker 带父智能体的 `knowledge_search`(只能查父绑定的库),父绑两个及以上库时也带库目录;上表 knowledge 一格已过时。
+
 ## 二、业界调研结论(2026-08-28)
 
 覆盖 Claude Code / CrewAI / LangGraph+Deep Agents / OpenAI Agents SDK /

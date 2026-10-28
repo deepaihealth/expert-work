@@ -517,6 +517,11 @@ class KnowledgeChunk(BaseModel):
     #: ``None`` for chunks written before it was recorded (never reused).
     embedding_model: str | None = None
     enabled: bool = True
+    #: B-175 P3-PR2 — why a disabled row is off: ``manual`` (someone switched
+    #: it off) or ``inherited`` (a re-ingest switched it off because a
+    #: switched-off passage it could not find again holds its text — to be
+    #: reviewed). ``None`` while enabled.
+    disabled_reason: Literal["manual", "inherited"] | None = None
     edited: bool = False
     revision: int = Field(default=1, ge=1)
     parent_chunk_id: UUID | None = None

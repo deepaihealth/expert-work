@@ -101,7 +101,7 @@ The JSON artifact lands in `eval-out/prompt_ab_<eval-set>.json`.
 ## B-140 行为回归评测(在测试环境真跑)
 
 设计:`docs/superpowers/specs/2026-10-05-b140-behavior-regression-eval-design.md`。用例在
-`datasets/behavior/cases/`(全部合成),两个评测智能体在 `datasets/behavior/agents/`。
+`datasets/behavior/cases/`(全部合成),评测智能体在 `datasets/behavior/agents/`。
 
 跑在测试环境的对接方租户里(用户 10-05 拍板),用现成的 canary key(Secret `canary-credentials`)。一次性准备:
 用控制台登录态把两个评测智能体 manifest 导入该租户(新建智能体只能走控制台平面)。
@@ -136,6 +136,26 @@ uv run --no-sync python tools/eval/behavior_compare.py eval-out/b140/<改动前>
 恢复用例(B-163,`g14` / `g15`):任务中途确定会有一次工具失败(读一个不存在的文件 / 照抄一段对不上的原文去 `edit_file`),
 看模型能不能接着把事做完。用例写了 `requires_tool_error: true`:整次一次失败的工具调用都没有(模型绕开了那次失败)
 就判「不可判」,与 `requires_compaction` 同一口径。
+
+知识库用例(B-175 P4 多库目录 + 按库检索,`k01`~`k05`,`--only` 选它们):跑在 `eval-kb`,绑三个合成知识库。
+**一次性准备**(在跑评测的同一个租户里,控制台知识库页;嵌入费用几分钱):
+
+1. 建三个知识库,名字与描述**逐字**照 `datasets/behavior/fixtures/make_fixtures.py` 的 `KB_BASES`
+   (k05 依赖 `b140-kb-hr` 的描述里提到、文档里却没有的「年度体检」):
+   `b140-kb-warranty`「家电各品类的保修期限、退换货与维修收费规定(合成数据)」、
+   `b140-kb-specs`「各型号家电的技术参数与待机能效分级(合成数据)」、
+   `b140-kb-hr`「员工差旅住宿、伙食补助、请假、报销流程与年度体检安排(合成数据)」;其余设置用默认值。
+2. 把 `datasets/behavior/fixtures/kb/<库名>/` 下的全部文件上传到同名的库,等文档都变成就绪。
+3. 导入 `datasets/behavior/agents/eval-kb.yaml`。`knowledge_base_refs` 的顺序就是系统提示词目录里的句柄
+   (K1 = warranty、K2 = specs、K3 = hr),k01 / k02 的 `tool_arg_contains` 按它判,**不要调顺序**。
+
+```sh
+EXPERT_WORK_API_TOKEN=… uv run --no-sync python tools/eval/behavior_runner.py --label kb-cand-$(date +%m%d) \
+  --only k01-route-specs,k02-route-warranty,k03-cross-base,k04-same-term-two-bases,k05-catalog-not-evidence
+```
+
+改动前的版本 `knowledge_search` 没有 `bases` 参数,k01 / k02 的 `tool_arg_contains` 在基线上必然不过;对照时看其余判据
+(答对没有、检索次数)与 k03~k05 有没有退步。改 fixtures 要改 `make_fixtures.py` 重新生成,并把库里的文档换成新版。
 
 ## ClinConsensus 健康问答小测(`clinconsensus.py`,2026-10-09)
 
@@ -207,12 +227,26 @@ EXPERT_WORK_EVAL_EMBED_API_KEY=... EXPERT_WORK_EVAL_EMBED_MODEL=text-embedding-v
   K-14 之前的生产,请求逐字相同、重排缓存照样命中。`--rerank-instruct` 只能配单视图(双视图不发任务说明,会被拒)。
   组别记进汇总 `config` 和指纹;非默认组拒绝写基线;某题的重排只判了候选池的一部分(池超过模型单次上限,或超长被拒后
   少送重试)时整轮退出。开发集(主集 303 / 真实问法集 172)上单视图把精确编号组 MRR@10 从 0.917 拉到 0.699,所以默认仍是 dual。
+- **副本对照组(B-206 K-21②)**:开发集选样时同一 `dup_group` 只入第一份,所以默认跑不出「同一内容换个文件名重传」的样子。
+  `--keep-dups real` = 副本都以自己的文件名 / 文档名入库(真实重传的样子;副本的段要真嵌入,花钱);
+  `--keep-dups same-title` = 后到的以 `dup<n>/<原件文件名>` 入库、段上带原件的文档名,检索文本与原件逐字相同,嵌入全走缓存(零花费)。
+  `--dedup off` 关掉生产检索器的去副本(默认开;键 = 标题路径 + 正文的哈希,只做 NFC、合并空白,不含文档名、不折大小写;
+  重排前只去「子段本身相同、且它给出的整块也相同」的子段 —— 共用一条原文的两个版本都留 —— 且只在重排门槛相同的库之间去;
+  重排后按整块再去一次)。汇总多一列 `dup@10`(`dup_share@10`:前 10 名里与更靠前一条是同一段 —— 同一把键 —— 的占比,
+  有答案 / 无答案的题都算)。看「副本挤占名额」用 `--keep-dups same-title --dedup off` 对 `--keep-dups same-title`。
+  `same-title` 配 `--doc-titles shuffled` 时原件的打乱方式与不带副本的那次相同;`real` 配 `shuffled` 会被拒绝。
+  副本不占 `--limit-docs` 的名额、随原件去留,所以两臂的原件完全相同。
+  两个开关都记进汇总 `config`;非默认组拒绝写基线。
+- **关键词路降级(B-206 K-22)**:生产检索在关键词路查不完(语句超时、锁 / 串行化冲突、断连、资源不足;SQL 写错、没权限
+  不算,照常报错)时保留向量路的结果并标 `keyword_degraded`;
+  评测有一题这样就整轮退出(只剩向量路的数不能当混合检索计分),与查询嵌入失败(K-8)同一处理。
+  `kb_agent_eval.py --tally` 的检索次数那行另报 `keyword degraded N`。
 - **留出集** `datasets/kb/huada_v1.holdout.yaml`(精确编号 16 + 无答案 6,只用主评测集没出过题的条目):波 2 期间
   不看结果、不针对它调参,收官时跑一次。
 - **为什么基线必须 `--store sql`**:关键词路 SQL 是 `plainto_tsquery` 全 AND,内存库是任一词重叠打分,两套语义不同;
   中文长问句关键词路命中率(设计 §1.3 的固定回归用例)只有 SQL 库量得到。再跑一次 `--method keyword` 单独记这个数。
 - **建库规则**:单库,库名 = 评测集 `name`;只入 `--tiers` 里的层(默认评测集 `corpus.tiers`,再默认 `A,D-A`);
-  同一 `dup_group` 只入第一份,`--limit-docs` 在去重**之后**截头(汇总里 `skipped_dup` / `skipped_limit` 分开记);
+  同一 `dup_group` 只入第一份(`--keep-dups` 例外,见上),`--limit-docs` 在去重**之后**截头(汇总里 `skipped_dup` / `skipped_limit` 分开记);
   解析在进程池里跑(PyMuPDF 非线程安全),每份 `--parse-timeout`(默认 120 s),解析完的 Markdown 走
   `ingest_markdown`(与上传入库同一段切块 → 嵌入 → 落段代码);失败按阶段 `parse|embed|store|other` 记进
   `corpus.ingest_failures[]`(文件名、路径、异常类型),文档标 FAILED,整轮继续;同名不同内容的文件(不同目录、不是同一
