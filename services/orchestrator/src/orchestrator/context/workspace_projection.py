@@ -86,19 +86,17 @@ _READONLY_NOTE = (
 #: editor nor the agent's own ``read_file`` takes the stale cross-thread state
 #: for live state.
 #:
-#: B-236 review 3 L2 —— 这一份根文件同时被两种视图读到(老对话的 ``/workspace`` 与新对话的
-#: ``/agent`` 都是 agent 根),所以文案不能只对一种视图成立:对话视图里相对路径
-#: ``threads/<id>/PLAN.md`` 落进本对话的 ``work/``、从不被读回。改计划的通路两种视图都是
-#: ``update_plan`` 工具;手改文件时写出两种视图各自的路径。已经写成旧文案的文件不重写
-#: (``_legacy_root_repairs`` 只认旧投影的头注释)。
+#: B-236 review 3 L2 / review 4 —— 这一份根文件同时被两种视图读到(老对话的 ``/workspace`` 与
+#: 新对话的 ``/agent`` 都是 agent 根),所以文案只说两种视图里都成立的那条路:``update_plan``。
+#: 不写手改路径 —— 对话视图里文件工具拒绝 ``/agent/threads/…``,相对路径 ``threads/<id>/``
+#: 又落进本对话的 ``work/``、从不被读回。已经写成旧文案的文件不重写(``_legacy_root_repairs``
+#: 只认旧投影的头注释)。
 LEGACY_REDIRECT_NOTE = (
-    "<!-- Moved: plan/state files now live per conversation under "
-    "threads/<thread_id>/ in the agent's directory. This root file is no "
-    "longer read or updated. To change a conversation's plan, call the "
-    "update_plan tool in that conversation. To edit its PLAN.md by hand: "
-    "/agent/threads/<thread_id>/PLAN.md (in conversations opened before "
-    "per-conversation workspaces: threads/<thread_id>/PLAN.md). -->\n"
+    "<!-- Moved: plan/state files now live per conversation and this root file is "
+    "no longer read or updated. To change a conversation's plan, call the "
+    "update_plan tool in that conversation. -->\n"
 )
+
 
 #: B-188 — how to recognise a legacy root projection: line 1 is the header its
 #: renderer wrote. These are the literal texts root projection wrote from CM-0

@@ -65,7 +65,9 @@ MAX_OUTPUT_CHARS = 1_000_000
 #: ``$2`` = 对话 id(B-236,空串 = 老视图),``$3`` = 本对话线程 id(老视图里留出自己那一格
 #: ``threads/<id>/``),``$4`` = 过渡期目录个数,其后是目录名。挂载阶段由脚本内嵌的一段
 #: ``/usr/local/bin/python3 -I -S`` 按 fd 完成(``open_tree`` / ``move_mount``,理由见
-#: ``exec_view`` 的模块文档),所以镜像必须在这个绝对路径上有 python。
+#: ``exec_view`` 的模块文档),所以镜像必须在这个绝对路径上有 python。它只分隔 NAS 视图:
+#: ``/tmp`` / ``$HOME`` / ``/opt/agents`` / ``/opt/skills`` 是这个沙箱里所有 exec(同一用户的
+#: 所有 agent 与对话)共用的本地状态,不在它管辖之内(单独跟踪)。
 _EXEC_VIEW_SCRIPT = """\
 set -eu
 ew_path="${PATH-}"
@@ -356,8 +358,11 @@ def run_once(
     runs inside its own user + mount namespace (``unshare -Urm``) where that
     directory is bind-mounted as ``/workspace``, ``shared/`` is bound read-only
     and the NAS mount itself is covered by an empty tmpfs — so absolute
-    ``/workspace/x`` lands in the agent's directory and other agents' directories
-    are simply not there. ``None`` → the whole user root is ``/workspace``.
+    ``/workspace/x`` lands in the agent's directory and other agents' NAS
+    directories are not in the view. That partitions the NAS only: sandbox-local
+    state (``/tmp``, ``$HOME``, ``/opt/agents``, ``/opt/skills``) is shared by every
+    exec in this sandbox, i.e. by all agents and conversations of the same user.
+    ``None`` → the whole user root is ``/workspace``.
     The directory is created inside the namespace (``mkdir -p``, umask 0o077
     inherited from this process). Any mount failure exits non-zero before the
     code runs: fail closed, never fall back to the shared root.

@@ -56,7 +56,7 @@ JSON 会把 ``style/`` 冲出预算。按目录聚合则上限由**目录数**�
 from __future__ import annotations
 
 import logging
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Iterable, Sequence
 from datetime import datetime
 from uuid import UUID
 
@@ -248,16 +248,8 @@ def render_workspace_tree(
     return _render_tree(entries, max_expanded=max_expanded)[0]
 
 
-def _render_tree(
-    entries: Sequence[WorkspaceFileEntry],
-    *,
-    max_expanded: int,
-    notes: Mapping[str, str] | None = None,
-) -> tuple[str, int]:
-    """树形摘要 + 展开用掉的文件行数(B-236 两节共用一个展开预算,先到先得)。
-
-    ``notes``:目录组名(``style/``)→ 附在那一行末尾的说明。
-    """
+def _render_tree(entries: Sequence[WorkspaceFileEntry], *, max_expanded: int) -> tuple[str, int]:
+    """树形摘要 + 展开用掉的文件行数(B-236 两节共用一个展开预算,先到先得)。"""
     groups: dict[str, list[WorkspaceFileEntry]] = {}
     for entry in entries:
         groups.setdefault(_group_key(entry.path), []).append(entry)
@@ -267,7 +259,7 @@ def _render_tree(
     lines: list[str] = []
     for name in _output_order(groups):
         members = groups[name]
-        lines.append(_dir_line(name, members, (notes or {}).get(name, "")))
+        lines.append(_dir_line(name, members))
         if name in expanded:
             lines.extend(_file_line(e) for e in sorted(members, key=lambda e: e.path))
     return "\n".join(lines), sum(len(groups[n]) for n in expanded)
@@ -295,19 +287,26 @@ def render_conversation_block(
 
     展开预算先给本对话那一节,剩下的给 ``/agent``。两节都空才整块不出现;只有一节空时
     那一节写 ``(empty)`` —— 新对话的 ``/workspace`` 本来就是空的,不写就读不出这件事。
-    过渡期映射的目录在 ``/agent`` 一节那一行末尾注明还能按原相对路径**只读**用到哪天
-    (B-236 M4:exec 里只读 bind,文件工具拒写)。
+    过渡期映射的目录在 ``/agent`` 一节末尾单独一行列全:还能按原相对路径**只读**用到哪天
+    (B-236 M4:exec 里只读 bind,文件工具拒写)。不挂在目录行上 —— 目录行按文件的父路径
+    分组,空目录或只有更深层文件的目录(``output/2026-10/r.docx``)根本没有 ``output/``
+    那一行(review 4)。
     """
     if not conversation and not agent:
         return ""
     conv_tree, used = _render_tree(conversation, max_expanded=max_expanded)
     until = f" until {compat_until_text}" if compat_until_text else ""
-    notes = {f"{d}/": f"   (also readable as {d}/{until}, read-only)" for d in compat_dirs}
-    agent_tree, _ = _render_tree(agent, max_expanded=max(max_expanded - used, 0), notes=notes)
+    agent_tree, _ = _render_tree(agent, max_expanded=max(max_expanded - used, 0))
+    compat = (
+        f"\n  Also readable, read-only, by their old relative path{until}: "
+        + ", ".join(f"{d}/" for d in compat_dirs)
+        if compat_dirs
+        else ""
+    )
     return (
         f"{WORKSPACE_BLOCK_HEADING}\n{_CONVERSATION_BLOCK_PREAMBLE}\n\n"
         f"{CONVERSATION_SECTION}\n{conv_tree or _EMPTY_SECTION}\n\n"
-        f"{AGENT_SECTION}\n{agent_tree or _EMPTY_SECTION}"
+        f"{AGENT_SECTION}\n{agent_tree or _EMPTY_SECTION}{compat}"
     )
 
 

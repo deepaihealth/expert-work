@@ -1402,6 +1402,8 @@ _CONV = "11111111-2222-3333-4444-555555555555"
         {"agent_root": _ROOT, "conv_id": _CONV, "compat_dirs": [".tool_results"]},
         {"agent_root": _ROOT, "conv_id": _CONV, "compat_dirs": [".."]},
         {"agent_root": _ROOT, "conv_id": _CONV, "compat_dirs": [""]},
+        # review 4 —— GBK 目录名经 os.listdir 成了孤立代理字符,编码不成 UTF-8
+        {"agent_root": _ROOT, "conv_id": _CONV, "compat_dirs": ["\udcd7\udcca"]},
         {"agent_root": _ROOT, "conv_id": _CONV, "compat_dirs": [f"d{i}" for i in range(65)]},
         {"conv_id": _CONV},
         {"thread_id": _CONV},

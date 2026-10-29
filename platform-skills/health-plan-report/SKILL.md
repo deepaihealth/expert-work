@@ -40,9 +40,9 @@ expert_work:
    `python $EXPERT_WORK_SKILLS_DIR/health-plan-report/scripts/validate.py {FN}.json`
    报错会给出位置（如 `sections[3].blocks[1].rows[4]`），改内容后重跑。
 2. 准备样式层（可以没有）：把每一类参数各写成一个 JSON 小文件，**按优先级从高到低**传给渲染命令。
-   常见顺序：本次对话要求 > 系统注入的样式配置 > 个人默认 `report-style/personal.json`（存在才传）。
+   常见顺序：本次对话要求 > 系统注入的样式配置 > 个人默认 `/agent/report-style/personal.json`（存在才传；放在 `/agent` 下，这个 Agent 以后的每个对话都读得到）。
 3. 渲染：
-   `python $EXPERT_WORK_SKILLS_DIR/health-plan-report/scripts/render.py --content {FN}.json --style 本次.json --style 配置.json --style report-style/personal.json --format pptx --out-dir . --basename {FN}`
+   `python $EXPERT_WORK_SKILLS_DIR/health-plan-report/scripts/render.py --content {FN}.json --style 本次.json --style 配置.json --style /agent/report-style/personal.json --format pptx --out-dir . --basename {FN}`
    `--format` 取 `pptx` / `pdf` / `both`。`{FN}.pptx`/`.pdf`、`.qa.json`、`.params-report.json` 里只要有一个已存在就会拒绝渲染——换新的 basename 再试。
 4. 读输出 JSON：
    - `ok` 为 true：`files` 是产物路径，看第 5 步。
@@ -70,7 +70,7 @@ expert_work:
 - 值可以写大白话（「深蓝」「右上角」「大一点」「表格」），脚本负责换算；换算不了会出现在 `not_applied`。
 - 你拿到的任何参数（注入变量、员工设置文本、对话要求）都由你翻译成这些键；影响内容的（增删板块、改周期）改内容 JSON。
 - 用户说「以后都这样」才写个人默认：
-  `python $EXPERT_WORK_SKILLS_DIR/health-plan-report/scripts/resolve_style.py --merge-into report-style/personal.json --set 键=值`
+  `python $EXPERT_WORK_SKILLS_DIR/health-plan-report/scripts/resolve_style.py --merge-into /agent/report-style/personal.json --set 键=值`
   一次性要求只放进本次样式层，不写文件。
 - 想先看某组参数的生效结果：`python $EXPERT_WORK_SKILLS_DIR/health-plan-report/scripts/resolve_style.py --style a.json --content {FN}.json`
 

@@ -129,7 +129,9 @@ EXEC_WORKSPACE_NOTE = (
     "agent's directory. /agent/ is always this agent's directory, shared by all of "
     "its conversations — put files meant to be reused by later conversations "
     "(templates, style guides, helper scripts) there. Other agents' files are not "
-    "part of the default view. Uploaded files are in uploads/."
+    "part of the default view. Uploaded files are in uploads/. During the transition "
+    "some old agent-directory folders also show up read-only in /workspace; write "
+    "under /workspace or /agent/<dir>/ instead."
 )
 #: B-236 —— 文件类工具 ``path`` 参数的说明。
 PATH_ARG_DESCRIPTION = "File path relative to /workspace, or under /agent/ (no '..')."
@@ -160,10 +162,21 @@ ResolvedKind = Literal["conversation", "agent", "platform", "compat", "shared", 
 
 
 def require_compat_dir_name(name: str) -> str:
-    """过渡期目录名必须是 agent 根下的一级目录名,且不是布局保留名。不合法就 ``ValueError``。"""
+    """过渡期目录名必须是 agent 根下的一级目录名,且不是布局保留名。不合法就 ``ValueError``。
+
+    review 4 —— 还必须能编码成 UTF-8。老对话在 agent 根解压过 Windows zip 时,GBK 文件名在
+    ``os.listdir`` 里是孤立的代理字符(surrogateescape);它一旦进了名单,ACS 的命令串在
+    e2b 的 protobuf 编码那一步 ``UnicodeEncodeError``,这个 agent 每个新对话的每次 exec
+    都失败,直到窗口关上。这样的目录不映射(:func:`workspace_compat._mappable` 跳过它)。
+    """
     if not name or name in (".", "..") or "/" in name or "\0" in name or name in _COMPAT_RESERVED:
         msg = f"not a mappable workspace directory name: {name!r}"
         raise ValueError(msg)
+    try:
+        name.encode("utf-8")
+    except UnicodeEncodeError:
+        msg = f"workspace directory name is not valid UTF-8: {name!r}"
+        raise ValueError(msg) from None
     return name
 
 

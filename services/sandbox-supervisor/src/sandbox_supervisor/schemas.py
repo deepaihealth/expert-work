@@ -126,11 +126,18 @@ class ExecRequest(BaseModel):
     @field_validator("compat_dirs")
     @classmethod
     def _compat_dirs_are_plain_top_level_names(cls, value: list[str]) -> list[str]:
-        """422 任何不是「agent 根下一级、非保留」的名字 —— 它们会被拼成 bind 源与目标。"""
+        """422 任何不是「agent 根下一级、非保留」的名字 —— 它们会被拼成 bind 源与目标。
+        编码不成 UTF-8 的(孤立代理字符,即 GBK 之类的文件名)同样 422:它们过不了下游的
+        编码(review 4)。"""
         for name in value:
             if "/" in name or "\0" in name or name in _RESERVED_COMPAT_NAMES:
                 msg = f"compat_dirs entry is not a plain directory name: {name!r}"
                 raise ValueError(msg)
+            try:
+                name.encode("utf-8")
+            except UnicodeEncodeError:
+                msg = f"compat_dirs entry is not valid UTF-8: {name!r}"
+                raise ValueError(msg) from None
         return value
 
     @model_validator(mode="after")

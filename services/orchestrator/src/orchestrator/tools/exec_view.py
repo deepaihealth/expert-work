@@ -5,8 +5,15 @@
 无特权 mount 的前提是当前 uid 在新 user ns 里映射成 root),在里面把 agent 目录 bind
 成 ``/workspace``、``shared/`` 只读 bind 进来、再用 tmpfs 把 ``/mnt/workspace`` 整个
 盖掉 —— 于是 exec 里的任何代码(含子进程)写 ``/workspace/x`` 落的就是
-``agents/<key>/x``,而且看不见别的 agent。命名空间按进程树,同一沙箱里两个 agent 的
-exec 并发互不影响。
+``agents/<key>/x``,NAS 上别的 agent(B-236 起还有别的对话)的目录不在这个视图里。命名
+空间按进程树,同一沙箱里两个 agent 的 exec 并发互不影响。
+
+**它只分隔 NAS 视图,不分隔沙箱本地状态。** 热沙箱按 ``(tenant, user)`` 复用,同一个
+用户所有 agent、所有对话的 exec 共用同一个容器 / microVM 的本地文件系统:``/tmp``(exec
+的代码文件就写在那里)、``$HOME``(``bash -l`` 会读 ``~/.bash_profile``)、``/opt/agents``
+与 ``/opt/skills`` 都不在这个脚本管辖之内。一段恶意载荷可以借这些地方影响同一用户之后
+别的对话 / 别的 agent 的 exec。这是 B-236 之前就有的边界,单独跟踪;这里不要读成「exec
+之间互相隔离」。
 
 脚本体是**字面量**,参数走位置参数(``$1`` = bind 源,余下 = python argv),不做字符串
 拼接。``infra/sandbox-image/runner.py`` 是镜像代码、不能 import 仓库,自带一份逐字相同
@@ -62,7 +69,8 @@ mount ns 的全部能力,``/mnt/workspace`` 也还没盖住)。所以整个挂�
 
 **载荷跑在嵌套的 user namespace 里。** 脚本最后 ``exec /usr/bin/unshare -Ur -- "$@"``:载荷所在的
 user namespace 不拥有这个 mount namespace,于是它 ``umount`` 不掉盖住 ``/mnt/workspace`` /
-``threads/`` 的那几层(B-60 spec §五 记过的「能挪开 tmpfs」那条残留就此关上);它即便自己再
+``threads/`` 的那几层(B-60 spec §五 记过的「能挪开 tmpfs」那一条由此关上 —— 只是这一条,
+上面说的沙箱本地状态不在其内);它即便自己再
 ``unshare -m``,复制过去的挂载也是锁住的(``MNT_LOCKED``),同样卸不掉。载荷里的 uid 仍是
 0(映射回外层的 0,即沙箱用户),文件属主不变。云上 ACS 沙箱不挂 seccomp,本地后端的
 seccomp profile 已为外层 ``unshare`` 放行同一组系统调用(``open_tree`` / ``move_mount`` /

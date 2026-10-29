@@ -15,6 +15,7 @@ from __future__ import annotations
 import contextlib
 import io
 import json
+import os
 from dataclasses import replace
 from pathlib import Path
 from typing import Any
@@ -355,6 +356,40 @@ async def test_compat_dirs_are_existing_root_dirs_the_conversation_lacks(
     assert dirs == ("stub", "style")
 
 
+async def test_a_root_dir_whose_name_is_not_utf8_is_never_mapped(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """review 4 —— 老对话在 agent 根解压过 Windows zip,留下 GBK 名字的目录(``资`` 的 GBK
+    字节 ``\\xd7\\xca``)。``os.listdir`` 给的是孤立代理字符;映射它会让 ACS 命令串在 e2b
+    的 protobuf 编码上 ``UnicodeEncodeError``,这个 agent 的每次 exec 都失败。跳过它,其余照映射。"""
+    _compat_tree(tmp_path)
+    bad = os.fsencode(_agent_root(tmp_path)) + b"/\xd7\xca"
+    try:
+        os.mkdir(bad)
+    except OSError as exc:  # macOS APFS 拒绝非 UTF-8 文件名
+        pytest.skip(f"filesystem refuses a non-UTF-8 name: {exc}")
+    monkeypatch.setenv(COMPAT_UNTIL_ENV, "2099-12-31")
+    dirs = await discover_compat_dirs(
+        NasWorkspaceStore(root=str(tmp_path)), tenant_id=_TENANT, user_id=_USER, view=_CONV1
+    )
+    assert dirs == ("stub", "style")
+    assert all(d.encode("utf-8") for d in dirs)
+
+
+@pytest.mark.parametrize("name", ["\udcd7\udcca", "a\udcff"])
+def test_a_name_that_is_not_utf8_is_not_a_compat_dir_name(name: str) -> None:
+    """平台无关的那一半:名单校验(宿主侧发现与 ``exec_view_argv`` 共用)拒绝它。"""
+    from orchestrator.tools.exec_view import exec_view_argv
+    from orchestrator.tools.workspace_compat import _mappable
+    from orchestrator.tools.workspace_paths import require_compat_dir_name
+
+    with pytest.raises(ValueError, match="UTF-8"):
+        require_compat_dir_name(name)
+    assert _mappable(name) is False
+    with pytest.raises(ValueError, match="UTF-8"):
+        exec_view_argv(_KEY, ["python"], conv_id=_C1, compat_dirs=(name,))
+
+
 @pytest.mark.parametrize("until", ["2000-01-01", "", "not-a-date"])
 async def test_closed_or_unset_window_maps_nothing(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, until: str
@@ -600,10 +635,32 @@ async def test_the_block_lists_this_conversation_and_the_agent_root_only(tmp_pat
     assert block.index(CONVERSATION_SECTION) < block.index(AGENT_SECTION)
     assert "mine.md" in block
     assert "anchor.md" in block
-    assert "also readable as style/" in block and "read-only" in block
+    assert "Also readable, read-only, by their old relative path" in block
+    assert block.rstrip().endswith(": style/")
     assert "theirs.md" not in block
     assert "PLAN.md" not in block
     assert "threads" not in block
+
+
+def test_every_compat_dir_gets_the_read_only_note_whatever_its_shape() -> None:
+    """review 4 LOW-1 —— 目录行按文件的父路径分组:空的过渡期目录、只有更深层文件的过渡期
+    目录(``output/2026-10/r.docx``)都没有自己那一行,说明不能挂在目录行上。"""
+    from orchestrator.tools.workspace_store import WorkspaceFileEntry
+    from orchestrator.tools.workspace_tree import render_conversation_block
+
+    agent = [
+        WorkspaceFileEntry(path="style/anchor.md", size=1, mtime=None),
+        WorkspaceFileEntry(path="output/2026-10/r.docx", size=1, mtime=None),
+    ]
+    block = render_conversation_block(
+        [], agent, compat_dirs=("empty", "output", "style"), compat_until_text="2026-12-10"
+    )
+    note = block.rsplit("\n", 1)[1]
+    assert note == (
+        "  Also readable, read-only, by their old relative path until 2026-12-10: "
+        "empty/, output/, style/"
+    )
+    assert "read-only" not in render_conversation_block([], agent)
 
 
 async def test_the_legacy_block_no_longer_lists_other_conversations_projections(
