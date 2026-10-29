@@ -209,6 +209,22 @@ class IngestEstimator:
             items=items,
         )
 
+    async def models_changed(self, claim: ClaimedIngestion, confirmed: EstimateModels) -> bool:
+        """§14 ④ during a confirmed ingest: the recognition or figure model it
+        would call now is not the one in the estimate the user confirmed.
+        Only the models the estimate counted on are compared."""
+        if confirmed.recognition is not None:
+            recognition = await self._recognition(claim)
+            now = (recognition.primary, recognition.fallback)
+            if now != (confirmed.recognition, confirmed.fallback):
+                return True
+        if confirmed.figure is not None and self._settings is not None:
+            settings = await self._settings.recognition_settings()
+            figure = settings.figure.key if settings.figure is not None else None
+            if figure != confirmed.figure:
+                return True
+        return False
+
     # -- counts ----------------------------------------------------------------
 
     async def _pages(

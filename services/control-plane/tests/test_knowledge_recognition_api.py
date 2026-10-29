@@ -34,6 +34,7 @@ from tests.auth_fixtures import (
     build_test_jwt_verifier,
     make_test_jwt,
 )
+from tests.knowledge_confirm import settle
 
 _TENANT = DEFAULT_DEV_TENANT_ID
 _RECOGNIZED = "第三章 考勤\n\n迟到超过三十分钟按事假半天计。"
@@ -128,7 +129,7 @@ async def _upload(
         "/v1/knowledge/bases/kb/documents", files={"file": (name, raw, "application/pdf")}
     )
     assert resp.status_code in (200, 202), resp.text
-    await runner.drain()
+    await settle(client, runner)
     document_id: str = (await client.get("/v1/knowledge/bases/kb/documents")).json()["documents"][
         0
     ]["id"]
@@ -160,7 +161,7 @@ async def test_pending_pages_are_listed_and_recognized_on_request(setup: Setup) 
     settings.on = True  # the admin configures 「文档识别」
     resp = await client.post(f"/v1/knowledge/bases/kb/documents/{document_id}/recognize")
     assert resp.status_code == 202, resp.text
-    await runner.drain()
+    await settle(client, runner)
 
     listed = (await client.get("/v1/knowledge/bases/kb/documents")).json()["documents"][0]
     assert listed["status"] == "ready"
@@ -181,7 +182,7 @@ async def test_recognize_a_document_without_page_records_is_409(setup: Setup) ->
         "/v1/knowledge/bases/kb/documents",
         files={"file": ("notes.md", b"# Notes\n\nPlain text only.", "text/markdown")},
     )
-    await runner.drain()
+    await settle(client, runner)
     document = (await client.get("/v1/knowledge/bases/kb/documents")).json()["documents"][0]
     assert document["page_stats"] is None
     resp = await client.post(f"/v1/knowledge/bases/kb/documents/{document['id']}/recognize")
@@ -212,6 +213,15 @@ async def test_pages_over_the_limit_are_recognized_once_the_limit_is_raised(setu
     resp = await client.post(f"/v1/knowledge/bases/kb/documents/{document_id}/recognize")
     assert resp.status_code == 202, resp.text
     await runner.drain()
+    # B-222 PR-2: the estimate bills only the page not read yet.
+    waiting = (await client.get("/v1/knowledge/bases/kb/documents")).json()["documents"][0]
+    assert (waiting["status"], waiting["ingest_estimate"]["origin"]) == (
+        "awaiting_confirmation",
+        "recognize",
+    )
+    (recognition,) = [i for i in waiting["ingest_estimate"]["items"] if i["kind"] == "recognition"]
+    assert (recognition["units"], recognition["reused_units"]) == (2, 1)
+    await settle(client, runner)
     listed = (await client.get("/v1/knowledge/bases/kb/documents")).json()["documents"][0]
     assert (listed["page_stats"]["pages_ocr"], listed["page_stats"]["pages_over_limit"]) == (2, 0)
 

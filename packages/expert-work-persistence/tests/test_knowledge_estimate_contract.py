@@ -643,12 +643,14 @@ async def test_confirm_all_only_when_the_base_still_adds_up(store: KnowledgeStor
         expected_total_micros=299,
         confirmed_by="user-1",
         now=_NOW,
-        withdraw_duplicates=True,
+        withdraw_duplicates=[duplicate.id],
     )
     assert not stale.matched
     assert stale.summary == summary
     assert (await _get(store, tenant, a.id)).status is DocumentStatus.AWAITING_CONFIRMATION
     assert (await _get(store, tenant, duplicate.id)).status is DocumentStatus.AWAITING_CONFIRMATION
+    # A duplicate that arrives after the user was shown the others.
+    late = await _upload(store, tenant, base.id, "late.md", sha="dup")
 
     done = await store.confirm_all(
         tenant_id=tenant,
@@ -657,14 +659,44 @@ async def test_confirm_all_only_when_the_base_still_adds_up(store: KnowledgeStor
         expected_total_micros=300,
         confirmed_by="user-1",
         now=_NOW,
-        withdraw_duplicates=True,
+        withdraw_duplicates=[duplicate.id, a.id],
     )
     assert done.matched
     assert set(done.confirmed) == {a.id, b.id}
+    # Only the duplicate the user saw is withdrawn (``a`` is not a duplicate).
     assert dict(done.withdrawn) == {duplicate.id: "withdrawn_deleted"}
     assert (await _get(store, tenant, a.id)).status is DocumentStatus.PENDING
     assert (await _get(store, tenant, b.id)).status is DocumentStatus.PENDING
     assert await store.get_document(tenant_id=tenant, document_id=duplicate.id) is None
+    assert (await _get(store, tenant, late.id)).status is DocumentStatus.AWAITING_CONFIRMATION
+
+
+async def test_an_estimate_past_its_deadline_is_never_confirmed(store: KnowledgeStore) -> None:
+    tenant = uuid4()
+    base = await store.create_base(tenant_id=tenant, name="kb")
+    due = _NOW - timedelta(seconds=1)
+    late = await _estimated(
+        store, tenant, (await _upload(store, tenant, base.id, "a.md")).id, total=100, confirm_by=due
+    )
+    assert late.ingest_estimate is not None
+    by_list = await store.confirm_documents(
+        tenant_id=tenant,
+        kb_id=base.id,
+        estimates=[(late.id, late.ingest_estimate.id)],
+        confirmed_by="user-1",
+        now=_NOW,
+    )
+    assert by_list == {late.id: "expired"}
+    at_once = await store.confirm_all(
+        tenant_id=tenant,
+        kb_id=base.id,
+        expected_count=1,
+        expected_total_micros=100,
+        confirmed_by="user-1",
+        now=_NOW,
+    )
+    assert at_once.matched and at_once.confirmed == ()
+    assert (await _get(store, tenant, late.id)).status is DocumentStatus.AWAITING_CONFIRMATION
 
 
 # -- withdrawing -------------------------------------------------------------------
@@ -742,6 +774,85 @@ async def test_withdrawing_a_reupload_keeps_the_serving_version(store: Knowledge
     assert back.status is DocumentStatus.FAILED
     assert back.error == "pending upload discarded; nothing is serving"
     assert not back.has_pending
+
+
+async def test_a_withdrawn_reupload_leaves_no_bytes_behind(store: KnowledgeStore) -> None:
+    """Nothing serving and no bytes kept (a legacy row): the re-upload's bytes
+    still wait in the pending slot, so withdrawing it leaves none of them."""
+    tenant = uuid4()
+    base = await store.create_base(tenant_id=tenant, name="kb")
+    legacy = await store.upsert_document(tenant_id=tenant, kb_id=base.id, filename="l.md")
+    generation = await _claim(store, tenant, legacy.id)
+    assert await store.mark_document_failed_terminal(
+        tenant_id=tenant, document_id=legacy.id, error="no bytes", generation=generation
+    )
+    started = await store.begin_upload(
+        tenant_id=tenant,
+        kb_id=base.id,
+        filename="l.md",
+        content=b"new",
+        content_sha256="new",
+        now=_NOW,
+    )
+    assert (started.document.has_pending, started.document.has_content) == (True, False)
+    assert await store.cancel_documents(
+        tenant_id=tenant, kb_id=base.id, document_ids=[legacy.id]
+    ) == {legacy.id: "withdrawn"}
+    back = await _get(store, tenant, legacy.id)
+    assert (back.has_pending, back.has_content) == (False, False)
+    assert await store.get_document_content(tenant_id=tenant, document_id=legacy.id) is None
+
+
+@pytest.mark.parametrize("held", [DocumentStatus.BLOCKED, DocumentStatus.DISABLED])
+async def test_a_withdrawn_reupload_of_a_held_back_document_stays_held_back(
+    store: KnowledgeStore, held: DocumentStatus
+) -> None:
+    tenant = uuid4()
+    base = await store.create_base(tenant_id=tenant, name="kb")
+    ready = await _ready(store, tenant, base.id, "doc.md")
+    assert await store.set_document_status(tenant_id=tenant, document_id=ready.id, status=held)
+    await store.begin_upload(
+        tenant_id=tenant,
+        kb_id=base.id,
+        filename="doc.md",
+        content=b"v2",
+        content_sha256="v2",
+        now=_NOW,
+    )
+    assert await store.cancel_documents(
+        tenant_id=tenant, kb_id=base.id, document_ids=[ready.id]
+    ) == {ready.id: "withdrawn"}
+    back = await _get(store, tenant, ready.id)
+    assert (back.status, back.has_pending, back.chunk_count) == (held, False, 1)
+
+
+async def test_discarding_a_waiting_reupload_drops_its_estimate(store: KnowledgeStore) -> None:
+    tenant = uuid4()
+    base = await store.create_base(tenant_id=tenant, name="kb")
+    ready = await _ready(store, tenant, base.id, "doc.md")
+    await store.begin_upload(
+        tenant_id=tenant,
+        kb_id=base.id,
+        filename="doc.md",
+        content=b"v2",
+        content_sha256="v2",
+        now=_NOW,
+    )
+    waiting = await _estimated(store, tenant, ready.id)
+    assert waiting.ingest_estimate is not None and waiting.confirm_by is not None
+
+    discarded = await store.discard_pending(tenant_id=tenant, document_id=ready.id)
+
+    assert discarded is not None
+    assert (discarded.status, discarded.has_pending) == (DocumentStatus.READY, False)
+    after = await _get(store, tenant, ready.id)
+    assert (after.ingest_estimate, after.confirm_by) == (None, None)
+    assert (
+        await store.get_parse_snapshot(
+            tenant_id=tenant, document_id=ready.id, estimate_id=waiting.ingest_estimate.id
+        )
+        is None
+    )
 
 
 async def test_withdrawing_a_reingest_puts_the_document_back_exactly(

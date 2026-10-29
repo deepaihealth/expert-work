@@ -17,7 +17,7 @@ the two cannot drift.
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Mapping
+from collections.abc import Collection, Iterable, Mapping
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, Final, Literal
@@ -56,6 +56,10 @@ _RESTORABLE: Final = frozenset(
     }
 )
 
+#: Statuses that keep a document out of retrieval whatever serves: a withdrawn
+#: re-upload goes back to them, not to ``ready``.
+_HELD_BACK: Final = frozenset({DocumentStatus.BLOCKED, DocumentStatus.DISABLED})
+
 #: ``error`` texts — the same as the stores' own for the same states.
 DISCARDED_ERROR: Final = "pending upload discarded; nothing is serving"
 CANCELLED_ERROR: Final = "cancelled by user"
@@ -63,7 +67,9 @@ CANCELLED_ERROR: Final = "cancelled by user"
 #: What an upload became.
 UploadOutcome = Literal["unchanged", "estimating", "duplicate"]
 #: What confirming one document did.
-ConfirmOutcome = Literal["confirmed", "estimate_changed", "not_awaiting", "duplicate", "not_found"]
+ConfirmOutcome = Literal[
+    "confirmed", "estimate_changed", "not_awaiting", "duplicate", "expired", "not_found"
+]
 #: What withdrawing an estimate did with the document.
 WithdrawOutcome = Literal["withdrawn", "withdrawn_deleted"]
 
@@ -320,6 +326,18 @@ def withdraw_plan(raw: Mapping[str, Any] | None, *, chunk_count: int) -> Withdra
     if origin == EstimateOrigin.UPLOAD.value:
         return WithdrawPlan(delete=True)
     if origin == EstimateOrigin.REUPLOAD.value:
+        kept = _status(restore.get("status"))
+        if kept in _HELD_BACK:
+            # Held out of retrieval before the re-upload: it stays so.
+            return WithdrawPlan(
+                delete=False,
+                clear_pending=True,
+                status=kept,
+                error=restore.get("error"),
+                error_code=restore.get("error_code"),
+                stage=restore.get("stage"),
+                estimate=previous,
+            )
         serving = chunk_count > 0
         return WithdrawPlan(
             delete=False,
@@ -391,7 +409,12 @@ def summarize(
 
 
 def confirm_outcome(
-    *, status: str, raw: Mapping[str, Any] | None, estimate_id: UUID
+    *,
+    status: str,
+    raw: Mapping[str, Any] | None,
+    estimate_id: UUID,
+    confirm_by: datetime | None,
+    now: datetime,
 ) -> ConfirmOutcome | None:
     """Why one document cannot be confirmed (``None``: it can)."""
     if status != DocumentStatus.AWAITING_CONFIRMATION.value:
@@ -400,7 +423,30 @@ def confirm_outcome(
         return "duplicate"  # caught on upload: estimate it first (「仍入库」)
     if estimate_id_of(raw) != estimate_id:
         return "estimate_changed"
+    if is_expired(confirm_by, now):
+        return "expired"
     return None
+
+
+def is_expired(confirm_by: datetime | None, now: datetime) -> bool:
+    """Past its deadline: the estimate is withdrawn, never confirmed (§14 ①)."""
+    return confirm_by is not None and confirm_by <= now
+
+
+def withdraws_with_confirm_all(
+    document_id: UUID, raw: Mapping[str, Any] | None, seen: Collection[UUID]
+) -> bool:
+    """A duplicate 「全部确认」 withdraws: one the user was shown (``seen``) —
+    never one that arrived after."""
+    return document_id in seen and (is_duplicate(raw) or not is_estimated(raw))
+
+
+def discarded_estimate(raw: Mapping[str, Any] | None) -> dict[str, Any] | None:
+    """What ``ingest_estimate`` becomes when the new bytes a waiting estimate
+    was made for are discarded: the estimate the document had before."""
+    restore = (raw or {}).get("restore") or {}
+    previous = restore.get("estimate")
+    return dict(previous) if previous else None
 
 
 # -- what an ingest cost -----------------------------------------------------------

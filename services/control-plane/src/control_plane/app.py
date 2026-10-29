@@ -68,6 +68,7 @@ from control_plane.api import (
     build_external_workspace_router,
     build_feedback_router,
     build_health_router,
+    build_knowledge_estimates_router,
     build_knowledge_figures_router,
     build_knowledge_logs_router,
     build_knowledge_maintenance_router,
@@ -2218,6 +2219,9 @@ def create_app(
                         # B-222: a cancel on this pod stops its drives at once.
                         local=knowledge_runner.local,
                         estimator=knowledge_estimator,
+                        # B-222 PR-2: an estimate withdrawn on its deadline
+                        # is audited (actor ``system``).
+                        audit=resolved_audit,
                     )
                     knowledge_recovery_worker.start()
                     _app.state.knowledge_recovery_worker = knowledge_recovery_worker
@@ -2959,6 +2963,8 @@ def create_app(
     app.include_router(build_knowledge_logs_router())
     app.include_router(build_knowledge_maintenance_router())
     app.include_router(build_knowledge_passages_router())
+    # B-222 PR-2 — confirm ingest estimates / ingest a duplicate anyway.
+    app.include_router(build_knowledge_estimates_router())
     app.include_router(build_me_router())
     app.include_router(build_memory_router())
     app.include_router(build_skills_router())

@@ -1048,7 +1048,8 @@ class KnowledgeStore(abc.ABC):
         more day. One outcome per distinct document: ``confirmed``,
         ``estimate_changed`` (estimated again since), ``not_awaiting``,
         ``duplicate`` (caught on upload, never estimated — estimate it first),
-        ``not_found`` (not in this base)."""
+        ``expired`` (its ``confirm_by`` has passed: it is withdrawn, never
+        confirmed), ``not_found`` (not in this base)."""
 
     @abc.abstractmethod
     async def confirm_all(
@@ -1060,13 +1061,16 @@ class KnowledgeStore(abc.ABC):
         expected_total_micros: int,
         confirmed_by: str | None,
         now: datetime,
-        withdraw_duplicates: bool,
+        withdraw_duplicates: Sequence[UUID] = (),
     ) -> ConfirmAllResult:
         """Confirm every confirmable document waiting in the base — only when
         they still number ``expected_count`` and add up to
         ``expected_total_micros`` (what the user was shown; checked with the
-        rows locked), else nothing changes. Duplicates are never confirmed by
-        it; ``withdraw_duplicates`` withdraws them in the same transaction."""
+        rows locked), else nothing changes. One past its ``confirm_by`` is
+        left for the expiry sweep. Duplicates are never confirmed by it; those
+        of ``withdraw_duplicates`` (the ones the user was shown) still waiting
+        as duplicates are withdrawn in the same transaction — never one that
+        arrived since."""
 
     @abc.abstractmethod
     async def return_to_confirmation(

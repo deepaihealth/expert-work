@@ -855,6 +855,74 @@ export interface TranslationKeys {
     cancel_ingest_done: string;
     cancel_ingest_not_cancellable: string;
     cancel_ingest_not_found: string;
+    // ── B-222 PR-2: estimate the cost before ingest, confirm before it starts ──
+    status_estimating: string;
+    status_awaiting_confirmation: string;
+    col_cost: string;
+    estimate_amount: string;
+    estimate_unpriced: string;
+    estimate_days_left_one: string;
+    estimate_days_left_other: string;
+    estimate_and_actual: string;
+    estimate_actual_only: string;
+    estimate_item_embedding: string;
+    estimate_item_recognition: string;
+    estimate_item_figure: string;
+    estimate_reused_chunks_one: string;
+    estimate_reused_chunks_other: string;
+    estimate_reused_pages_one: string;
+    estimate_reused_pages_other: string;
+    estimate_reused_figures_one: string;
+    estimate_reused_figures_other: string;
+    estimate_note_scanned_figures_not_counted: string;
+    estimate_note_recognition_unavailable: string;
+    estimate_note_figures_off: string;
+    estimate_note_default_average: string;
+    estimate_note_over_page_limit: string;
+    estimate_note_unpriced: string;
+    estimate_note_text_limit_may_stop_early: string;
+    estimate_note_batch_repeats_counted: string;
+    estimate_note_figure_extra_calls_not_counted: string;
+    estimate_footnote: string;
+    estimate_duplicate_tag: string;
+    estimate_duplicate_of: string;
+    estimate_duplicate_unknown: string;
+    estimate_sep: string;
+    estimate_banner_awaiting_one: string;
+    estimate_banner_awaiting_other: string;
+    estimate_banner_duplicates_one: string;
+    estimate_banner_duplicates_other: string;
+    estimate_banner_estimating_one: string;
+    estimate_banner_estimating_other: string;
+    estimate_banner_deadline_one: string;
+    estimate_banner_deadline_other: string;
+    estimate_confirm_all_one: string;
+    estimate_confirm_all_other: string;
+    estimate_withdraw_all: string;
+    estimate_withdraw_all_confirm_title: string;
+    estimate_withdraw_batch_confirm_title: string;
+    estimate_withdraw_confirm_title: string;
+    estimate_withdraw_confirm_body: string;
+    estimate_only_waiting: string;
+    estimate_batch_title_one: string;
+    estimate_batch_title_other: string;
+    estimate_batch_awaiting_one: string;
+    estimate_batch_awaiting_other: string;
+    estimate_batch_duplicates_one: string;
+    estimate_batch_duplicates_other: string;
+    estimate_batch_confirm_skip_one: string;
+    estimate_batch_confirm_skip_other: string;
+    estimate_confirm: string;
+    estimate_withdraw: string;
+    estimate_ingest_anyway: string;
+    estimate_ingest_anyway_started: string;
+    estimate_confirmed_one: string;
+    estimate_confirmed_other: string;
+    estimate_withdrawn_one: string;
+    estimate_withdrawn_other: string;
+    estimate_changed: string;
+    estimate_all_changed: string;
+    estimate_expired: string;
   };
   rate_card_page: {
     page_title: string;
@@ -4412,7 +4480,7 @@ const en: TranslationKeys = {
     doc_table_total: "{{total}} documents",
     col_attempts: "Attempts",
     reingest: "Re-ingest",
-    reingest_started: "Re-ingestion started.",
+    reingest_started: "Estimating the cost of the re-ingest — confirm it in the document list to start.",
     reingest_no_bytes:
       "The original file was not retained for this document — please re-upload it.",
     pages_recognized: "{{count}} pages recognized",
@@ -4427,7 +4495,7 @@ const en: TranslationKeys = {
     figure_thumb_alt: "Original picture",
     figure_unavailable: "Original not available",
     recognize: "Recognize",
-    recognize_started: "Recognition started: only the failed and waiting pages and pictures are sent to a model.",
+    recognize_started: "Estimating the cost of recognition (only the failed and waiting pages and pictures) — confirm it in the document list to start.",
     recognize_nothing: "No page or picture failed or waits for recognition.",
     upload_queue_unchanged: "Unchanged — not re-ingested",
     pending_previous_serving: "Previous version still in use",
@@ -4508,6 +4576,74 @@ const en: TranslationKeys = {
     cancel_ingest_done: "Ingest cancelled",
     cancel_ingest_not_cancellable: "This document is already writing its results (about to finish) or has finished, so it can no longer be cancelled. The list was refreshed.",
     cancel_ingest_not_found: "This document no longer exists (it may have been deleted). The list was refreshed.",
+    // ── B-222 PR-2: estimate the cost before ingest, confirm before it starts ──
+    status_estimating: "Estimating",
+    status_awaiting_confirmation: "Awaiting confirmation",
+    col_cost: "Cost",
+    estimate_amount: "Estimate {{amount}}",
+    estimate_unpriced: "not priced",
+    estimate_days_left_one: "confirm within {{count}} day",
+    estimate_days_left_other: "confirm within {{count}} days",
+    estimate_and_actual: "Estimate {{estimate}} · Actual {{actual}}",
+    estimate_actual_only: "Actual {{actual}}",
+    estimate_item_embedding: "Embedding: {{units}} chunks · {{tokens}} tokens{{reused}} — {{amount}}",
+    estimate_item_recognition: "Scanned-page recognition ({{model}}): {{units}} pages{{reused}} — {{amount}}",
+    estimate_item_figure: "Picture descriptions ({{model}}): {{units}} pictures{{reused}} — {{amount}}",
+    estimate_reused_chunks_one: " ({{count}} already embedded, not billed again)",
+    estimate_reused_chunks_other: " ({{count}} already embedded, not billed again)",
+    estimate_reused_pages_one: " ({{count}} recognized last time, not billed again)",
+    estimate_reused_pages_other: " ({{count}} recognized last time, not billed again)",
+    estimate_reused_figures_one: " ({{count}} described last time, not billed again)",
+    estimate_reused_figures_other: " ({{count}} described last time, not billed again)",
+    estimate_note_scanned_figures_not_counted: "Pictures on scanned pages are found only by recognition and are not counted.",
+    estimate_note_recognition_unavailable: "No usable recognition model: scanned pages will wait for recognition, not billed.",
+    estimate_note_figures_off: "Picture description is off: the document's pictures are left out.",
+    estimate_note_default_average: "Some lines use the platform's generic averages.",
+    estimate_note_over_page_limit: "Pages past the recognition page limit are not read.",
+    estimate_note_unpriced: "A model has no price yet: that line is not billed.",
+    estimate_note_text_limit_may_stop_early: "Recognition stops at the document's text limit; the estimate counts every page.",
+    estimate_note_batch_repeats_counted: "A logo repeated across this batch is counted in each document.",
+    estimate_note_figure_extra_calls_not_counted: "Each picture is counted as one description; charts and text-heavy pictures may cost more.",
+    estimate_footnote: "Chunks, pages and pictures are counted from the local parse; tokens are converted from a local tokenizer and recognition / descriptions use average usage. Billing follows the vendor's reported usage; the actual cost shows here once the ingest is over.",
+    estimate_duplicate_tag: "Duplicate",
+    estimate_duplicate_of: "Same content as D{{seq}} \"{{name}}\" — not ingested unless you choose to",
+    estimate_duplicate_unknown: "Same content as another document of this base — not ingested unless you choose to",
+    estimate_sep: "; ",
+    estimate_banner_awaiting_one: "{{count}} document awaits confirmation, estimated {{amount}} in total",
+    estimate_banner_awaiting_other: "{{count}} documents await confirmation, estimated {{amount}} in total",
+    estimate_banner_duplicates_one: "{{count}} duplicate (not ingested, not billed)",
+    estimate_banner_duplicates_other: "{{count}} duplicates (not ingested, not billed)",
+    estimate_banner_estimating_one: "{{count}} being estimated",
+    estimate_banner_estimating_other: "{{count}} being estimated",
+    estimate_banner_deadline_one: "withdrawn automatically unless confirmed within {{count}} day",
+    estimate_banner_deadline_other: "withdrawn automatically unless confirmed within {{count}} days",
+    estimate_confirm_all_one: "Confirm {{count}}",
+    estimate_confirm_all_other: "Confirm all {{count}}",
+    estimate_withdraw_all: "Cancel all",
+    estimate_withdraw_all_confirm_title: "Withdraw every estimate waiting in this base?",
+    estimate_withdraw_batch_confirm_title: "Withdraw this batch's estimates?",
+    estimate_withdraw_confirm_title: "Withdraw the estimate of \"{{name}}\"?",
+    estimate_withdraw_confirm_body: "Nothing has been billed. A new upload is removed with its file; a re-upload goes back to the previous version; a re-ingest goes back to how it was.",
+    estimate_only_waiting: "Only awaiting confirmation",
+    estimate_batch_title_one: "This batch ({{count}} file): ",
+    estimate_batch_title_other: "This batch ({{count}} files): ",
+    estimate_batch_awaiting_one: "{{count}} awaits confirmation, estimated {{amount}}",
+    estimate_batch_awaiting_other: "{{count}} await confirmation, estimated {{amount}} in total",
+    estimate_batch_duplicates_one: "{{count}} duplicate (not ingested, not billed)",
+    estimate_batch_duplicates_other: "{{count}} duplicates (not ingested, not billed)",
+    estimate_batch_confirm_skip_one: "Confirm {{count}} · skip {{skip}} duplicate(s)",
+    estimate_batch_confirm_skip_other: "Confirm {{count}} · skip {{skip}} duplicate(s)",
+    estimate_confirm: "Confirm",
+    estimate_withdraw: "Withdraw",
+    estimate_ingest_anyway: "Ingest anyway",
+    estimate_ingest_anyway_started: "Being estimated — confirm the estimate to ingest it.",
+    estimate_confirmed_one: "Confirmed {{count}} document; ingesting.",
+    estimate_confirmed_other: "Confirmed {{count}} documents; ingesting.",
+    estimate_withdrawn_one: "Withdrew {{count}} estimate.",
+    estimate_withdrawn_other: "Withdrew {{count}} estimates.",
+    estimate_changed: "An estimate was made again since — confirm the new amount.",
+    estimate_all_changed: "The documents awaiting confirmation changed — check the new total and confirm again.",
+    estimate_expired: "An estimate is past its confirmation deadline and is being withdrawn.",
   },
   rate_card_page: {
     page_title: "Model Pricing",

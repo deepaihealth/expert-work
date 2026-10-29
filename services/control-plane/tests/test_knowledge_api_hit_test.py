@@ -44,6 +44,7 @@ from tests.auth_fixtures import (
     make_test_jwt,
 )
 from tests.test_knowledge_api_logs import _GUIDE
+from tests.knowledge_confirm import settle
 
 _TENANT = DEFAULT_DEV_TENANT_ID
 _EMPLOYEE = "employee-hit-test"
@@ -125,7 +126,7 @@ async def setup() -> AsyncIterator[_Setup]:
             "/v1/knowledge/bases/kb/documents",
             files={"file": ("h.md", b"# H\n\nThe deductible is 500 dollars.", "text/markdown")},
         )
-        await runner.drain()
+        await settle(client, runner)
         yield _Setup(client, store, log, app)
 
 

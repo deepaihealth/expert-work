@@ -9,8 +9,9 @@
   cut by other chunking parameters than the base's current ones;
   ``POST /bases/{name}/reingest-stale`` re-ingests those that still have their
   file (the rest are listed: re-upload them), at most :data:`REINGEST_STALE_MAX`
-  per call (``remaining``: call again). It starts paid embedding at once; B-222
-  PR-2 puts it behind an estimate the user confirms (same endpoint name).
+  per call (``remaining``: call again). B-222 PR-2: like a batch re-ingest, it
+  spends nothing yet — each document is estimated and waits for the user to
+  confirm it (``POST …/documents/confirm``).
 
 Console plane, ``manifest`` permissions, like the rest of ``/v1/knowledge``;
 every write is audited — a batch with one row per document it changed (which
@@ -47,6 +48,7 @@ from control_plane.tenant_scope import (
 from expert_work.common.observability import current_trace_id_hex
 from expert_work.persistence import KnowledgeStore
 from expert_work.protocol import AuditAction, KnowledgeBase, KnowledgeDocument
+from expert_work.protocol.knowledge_estimate import EstimateOrigin
 from expert_work.runtime.audit.logger import AuditLogger
 
 #: Documents one batch request may name.
@@ -182,8 +184,18 @@ def build_knowledge_maintenance_router() -> APIRouter:
                     skipped.append(_skipped(document_id, "not_found"))
                 elif not document.has_content and not document.has_pending:
                     skipped.append(_skipped(document_id, "content_missing"))
+                elif (
+                    await _redrive(
+                        store,
+                        ready_runner,
+                        tenant_id,
+                        document,
+                        origin=EstimateOrigin.BATCH_REINGEST,
+                    )
+                    is None
+                ):
+                    skipped.append(_skipped(document_id, "not_found"))  # deleted meanwhile
                 else:
-                    await _redrive(store, ready_runner, tenant_id, base, document)
                     done.append(document_id)
                     await _audit_document(
                         audit,
@@ -338,8 +350,12 @@ def build_knowledge_maintenance_router() -> APIRouter:
                 skipped.append(_skipped(document.id, "content_missing"))
             elif len(queued) >= REINGEST_STALE_MAX:
                 remaining += 1  # the next call takes them
-            else:
-                await _redrive(store, ready_runner, tenant_id, base, document)
+            elif (
+                await _redrive(
+                    store, ready_runner, tenant_id, document, origin=EstimateOrigin.REINGEST_STALE
+                )
+                is not None
+            ):
                 queued.append(str(document.id))
                 await _audit_document(
                     audit,

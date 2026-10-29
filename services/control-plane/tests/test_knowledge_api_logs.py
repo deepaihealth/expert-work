@@ -42,6 +42,7 @@ from tests.auth_fixtures import (
     build_test_jwt_verifier,
     make_test_jwt,
 )
+from tests.knowledge_confirm import settle
 
 _TENANT = DEFAULT_DEV_TENANT_ID
 _NOW = datetime.now(UTC).replace(microsecond=0)
@@ -120,7 +121,7 @@ async def setup() -> AsyncIterator[_Setup]:
             files={"file": ("h.md", b"# H\n\nThe deductible is 500 dollars.", "text/markdown")},
             headers=_ADMIN,
         )
-        await runner.drain()
+        await settle(client, runner, headers=_ADMIN)
         kb = await store.get_base(tenant_id=_TENANT, name="kb")
         other = await store.get_base(tenant_id=_TENANT, name="other")
         assert kb is not None

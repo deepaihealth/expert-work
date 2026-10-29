@@ -31,6 +31,7 @@ from tests.auth_fixtures import (
     grant_system_admin,
     make_test_jwt,
 )
+from tests.knowledge_confirm import settle
 
 _TENANT = DEFAULT_DEV_TENANT_ID
 
@@ -249,10 +250,15 @@ async def test_upload_document_ingests_to_ready(setup: Setup) -> None:
         files={"file": ("handbook.md", b"# Handbook\n\nThe deductible is 500.", "text/markdown")},
     )
     assert uploaded.status_code == 202
-    assert uploaded.json()["status"] == "pending"
+    assert uploaded.json()["status"] == "estimating"
 
-    # Ingestion runs in the background — wait for it, then poll the list.
+    # B-222 PR-2: the free estimate runs in the background, then the document
+    # waits for the user's confirmation — nothing ingested yet.
     await runner.drain()
+    waiting = (await client.get("/v1/knowledge/bases/kb/documents")).json()["documents"]
+    assert [(d["status"], d["chunk_count"]) for d in waiting] == [("awaiting_confirmation", 0)]
+    # Confirmed, it is ingested in the background — wait, then poll the list.
+    await settle(client, runner)
     documents = (await client.get("/v1/knowledge/bases/kb/documents")).json()["documents"]
     assert len(documents) == 1
     assert documents[0]["filename"] == "handbook.md"
@@ -289,7 +295,7 @@ async def test_delete_document(setup: Setup) -> None:
         "/v1/knowledge/bases/kb/documents",
         files={"file": ("doc.md", b"# Doc\n\nbody.", "text/markdown")},
     )
-    await runner.drain()
+    await settle(client, runner)
     documents = (await client.get("/v1/knowledge/bases/kb/documents")).json()["documents"]
     document_id = documents[0]["id"]
 
@@ -350,7 +356,7 @@ async def test_create_base_with_config_and_get_single(setup: Setup) -> None:
         "/v1/knowledge/bases/kb/documents",
         files={"file": ("h.md", b"# H\n\nThe deductible is 500.", "text/markdown")},
     )
-    await runner.drain()
+    await settle(client, runner)
     single = await client.get("/v1/knowledge/bases/kb")
     assert single.status_code == 200
     sbody = single.json()
@@ -372,7 +378,7 @@ async def test_list_bases_includes_stats(setup: Setup) -> None:
         "/v1/knowledge/bases/kb/documents",
         files={"file": ("d.md", b"# D\n\nbody text here.", "text/markdown")},
     )
-    await runner.drain()
+    await settle(client, runner)
     listed = (await client.get("/v1/knowledge/bases")).json()["bases"]
     assert listed[0]["stats"]["document_count"] == 1
 
@@ -386,7 +392,7 @@ async def test_list_bases_paginates(setup: Setup) -> None:
         "/v1/knowledge/bases/kb-0/documents",
         files={"file": ("d.md", b"# D\n\nbody text here.", "text/markdown")},
     )
-    await runner.drain()
+    await settle(client, runner, "kb-0")
     # No ``limit`` → the whole list (the knowledge picker still reads all).
     everything = (await client.get("/v1/knowledge/bases")).json()
     assert everything["total"] == 4
@@ -477,7 +483,7 @@ async def test_list_chunks_preview(full_setup: FullSetup) -> None:
         "/v1/knowledge/bases/kb/documents",
         files={"file": ("h.md", b"# Handbook\n\nThe deductible is 500 dollars.", "text/markdown")},
     )
-    await runner.drain()
+    await settle(client, runner)
     doc_id = (await client.get("/v1/knowledge/bases/kb/documents")).json()["documents"][0]["id"]
     resp = await client.get(f"/v1/knowledge/bases/kb/documents/{doc_id}/chunks")
     assert resp.status_code == 200
@@ -507,7 +513,7 @@ async def test_retrieval_test_returns_scored_results(full_setup: FullSetup) -> N
         "/v1/knowledge/bases/kb/documents",
         files={"file": ("h.md", b"# H\n\nThe deductible is 500 dollars.", "text/markdown")},
     )
-    await runner.drain()
+    await settle(client, runner)
     resp = await client.post("/v1/knowledge/bases/kb/test", json={"query": "deductible"})
     assert resp.status_code == 200
     body = resp.json()
@@ -774,7 +780,7 @@ async def test_retrieval_test_reports_how_the_search_ended(full_setup: FullSetup
         "/v1/knowledge/bases/kb/documents",
         files={"file": ("h.md", b"# H\n\nThe deductible is 500 dollars.", "text/markdown")},
     )
-    await runner.drain()
+    await settle(client, runner)
     body = (await client.post("/v1/knowledge/bases/kb/test", json={"query": "deductible"})).json()
     assert body["status"] == "ok"
     assert body["candidates"] >= 1
@@ -840,7 +846,7 @@ async def _client_with_reranker(reranker: Any) -> AsyncIterator[AsyncClient]:
             "/v1/knowledge/bases/kb/documents",
             files={"file": ("h.md", b"# H\n\nThe deductible is 500 dollars.", "text/markdown")},
         )
-        await runner.drain()
+        await settle(client, runner)
         yield client
 
 
@@ -874,7 +880,7 @@ async def test_retrieval_test_reports_a_failed_query_embedding() -> None:
             "/v1/knowledge/bases/kb/documents",
             files={"file": ("h.md", b"# H\n\nThe deductible is 500 dollars.", "text/markdown")},
         )
-        await runner.drain()
+        await settle(client, runner)
         resp = await client.post("/v1/knowledge/bases/kb/test", json={"query": "deductible"})
     assert resp.status_code == 200
     body = resp.json()
@@ -991,7 +997,7 @@ async def test_reindex_reembeds_and_restamps(reindex_setup: ReindexSetup) -> Non
         "/v1/knowledge/bases/kb/documents",
         files={"file": ("h.md", b"# H\n\nThe deductible is 500 dollars.", "text/markdown")},
     )
-    await runner.drain()
+    await settle(client, runner)
     # Swap the model → base is now stale.
     config.pair = ("qwen", "text-embedding-v5")
     assert (await client.get("/v1/knowledge/bases/kb")).json()["needs_reindex"] is True
@@ -1034,13 +1040,17 @@ async def test_reingest_redrives_document(full_setup: FullSetup) -> None:
         "/v1/knowledge/bases/kb/documents",
         files={"file": ("h.md", b"# H\n\nThe deductible is 500 dollars.", "text/markdown")},
     )
-    await runner.drain()
+    await settle(client, runner)
     doc_id = (await client.get("/v1/knowledge/bases/kb/documents")).json()["documents"][0]["id"]
 
     resp = await client.post(f"/v1/knowledge/bases/kb/documents/{doc_id}/reingest")
     assert resp.status_code == 202
-    assert resp.json()["status"] == "pending"
+    assert resp.json()["status"] == "estimating"
     await runner.drain()
+    # B-222 PR-2: estimated, it waits — the serving version stays ready.
+    waiting = (await client.get("/v1/knowledge/bases/kb/documents")).json()["documents"][0]
+    assert (waiting["status"], waiting["chunk_count"] > 0) == ("awaiting_confirmation", True)
+    await settle(client, runner)
     refreshed = (await client.get("/v1/knowledge/bases/kb/documents")).json()["documents"][0]
     assert refreshed["status"] == "ready"
 
@@ -1104,7 +1114,7 @@ async def test_reingest_without_serving_bytes_redrives_the_pending_upload(
     )
     resp = await client.post(f"/v1/knowledge/bases/kb/documents/{doc.id}/reingest")
     assert resp.status_code == 202
-    await runner.drain()
+    await settle(client, runner)
     row = (await client.get("/v1/knowledge/bases/kb/documents")).json()["documents"][0]
     assert (row["status"], row["has_pending"]) == ("ready", False)
 
@@ -1136,7 +1146,7 @@ async def _seed_kb_with_document(client: AsyncClient, runner: KnowledgeIngestion
         "/v1/knowledge/bases/kb/documents",
         files={"file": ("h.md", b"# H\n\nThe deductible is 500.", "text/markdown")},
     )
-    await runner.drain()
+    await settle(client, runner)
     documents = (await client.get("/v1/knowledge/bases/kb/documents")).json()["documents"]
     return str(documents[0]["id"])
 

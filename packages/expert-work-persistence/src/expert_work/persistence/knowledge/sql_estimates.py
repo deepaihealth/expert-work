@@ -41,11 +41,13 @@ from expert_work.persistence.knowledge.estimates import (
     estimate_id_of,
     is_duplicate,
     is_estimated,
+    is_expired,
     merge_actual,
     meta_of,
     summarize,
     with_estimate,
     withdraw_plan,
+    withdraws_with_confirm_all,
 )
 from expert_work.persistence.models import (
     KnowledgeChunkRow,
@@ -295,13 +297,10 @@ class SqlEstimates:
                     allow_duplicate=False,
                     restore=_restore_of(row),
                 )
-                if not row.has_content and row.chunk_count == 0:
-                    row.content = content  # nothing serving yet
-                    row.content_sha256 = content_sha256
-                    row.size_bytes = len(content)
-                else:
-                    row.pending_content = content
-                    row.pending_content_sha256 = content_sha256
+                # Into the pending slot even when nothing serves: withdrawn, it
+                # goes with the slot; ingested, it is promoted (READY).
+                row.pending_content = content
+                row.pending_content_sha256 = content_sha256
                 if row.doc_seq is None:
                     row.doc_seq = await self._next_doc_seq(session, tenant_id)
                 row.error = None
@@ -482,7 +481,11 @@ class SqlEstimates:
                     outcomes[document_id] = "not_found"
                     continue
                 refused = confirm_outcome(
-                    status=row.status, raw=row.ingest_estimate, estimate_id=estimate_id
+                    status=row.status,
+                    raw=row.ingest_estimate,
+                    estimate_id=estimate_id,
+                    confirm_by=row.confirm_by,
+                    now=now,
                 )
                 if refused is not None:
                     outcomes[document_id] = refused
@@ -502,8 +505,9 @@ class SqlEstimates:
         expected_total_micros: int,
         confirmed_by: str | None,
         now: datetime,
-        withdraw_duplicates: bool,
+        withdraw_duplicates: Sequence[UUID] = (),
     ) -> ConfirmAllResult:
+        seen = frozenset(withdraw_duplicates)
         async with self._sf() as session:
             rows = list(
                 (
@@ -529,9 +533,11 @@ class SqlEstimates:
                 if row.status != DocumentStatus.AWAITING_CONFIRMATION.value:
                     continue
                 if is_duplicate(row.ingest_estimate) or not is_estimated(row.ingest_estimate):
-                    if withdraw_duplicates:
+                    if withdraws_with_confirm_all(row.id, row.ingest_estimate, seen):
                         withdrawn[row.id] = await self._withdraw_row(session, row, now)
                     continue
+                if is_expired(row.confirm_by, now):
+                    continue  # the expiry sweep withdraws it
                 self._confirm_row(row, confirmed_by, now)
                 await self._extend_snapshot(session, row, now)
                 confirmed_ids.append(row.id)

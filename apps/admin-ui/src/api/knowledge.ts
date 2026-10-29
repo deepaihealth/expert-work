@@ -16,8 +16,17 @@ import type { RerankOutcome } from "./rerank_outcome";
 export type { RerankOutcome } from "./rerank_outcome";
 
 /** Document ingestion lifecycle — mirrors the backend ``DocumentStatus``
- *  (``cancelled``: the user stopped the ingest, B-222). */
-export type DocumentStatus = "pending" | "processing" | "ready" | "failed" | "cancelled";
+ *  (``cancelled``: the user stopped the ingest, B-222; ``estimating`` /
+ *  ``awaiting_confirmation``: estimated for free, waiting for the user to
+ *  confirm before anything is spent, B-222 PR-2). */
+export type DocumentStatus =
+  | "pending"
+  | "processing"
+  | "ready"
+  | "failed"
+  | "cancelled"
+  | "estimating"
+  | "awaiting_confirmation";
 
 /** Per-base recall strategy — mirrors the backend ``RetrievalMethod``. */
 export type RetrievalMethod = "vector" | "keyword" | "hybrid";
@@ -113,6 +122,13 @@ export interface KnowledgeDocument {
   review?: { inherited: number; unapplied: number };
   created_at: string | null;
   updated_at: string | null;
+  /** B-222 PR-2 — what the ingest is estimated to cost (``null`` while being
+   *  estimated, or never estimated). */
+  ingest_estimate?: IngestEstimate | null;
+  /** Until when the estimate can be confirmed (``awaiting_confirmation``). */
+  confirm_by?: string | null;
+  /** What the latest paid ingest was billed. */
+  ingest_actual?: IngestActual | null;
 }
 
 /** B-209 — 「已识别 N 页 · 失败 M 页 · 待识别 K 页」 for a PDF with scanned pages. */
@@ -166,6 +182,8 @@ export interface DocumentsPage {
   total: number;
   offset: number;
   limit: number | null;
+  /** B-222 PR-2 — the whole base's estimates, whatever the filters. */
+  estimate_summary?: EstimateSummary;
 }
 
 export interface BasesPage {
@@ -452,19 +470,34 @@ export async function uploadDocument(
   return response.data;
 }
 
+/** Narrows ``listDocuments`` (B-222 PR-2): these statuses, these documents. */
+export interface ListDocumentsOptions {
+  status?: DocumentStatus[];
+  documentIds?: string[];
+  /** B-175 P3-PR3 — each row's ``review`` (the server reads the page's
+   *  chunks for it; the 5-second poll leaves it out). */
+  withReview?: boolean;
+}
+
 export async function listDocuments(
   baseName: string,
   page: PageParams,
   tenantScope?: TenantScope,
-  /** B-175 P3-PR3 — ``withReview``: each row's ``review`` (the server reads
-   *  the page's chunks for it; the 5-second poll leaves it out). */
-  options?: { withReview?: boolean },
+  options: ListDocumentsOptions = {},
 ): Promise<DocumentsPage> {
-  const params: Record<string, unknown> = { limit: page.limit, offset: page.offset };
-  if (options?.withReview) params.with_review = true;
+  const filters: Record<string, unknown> = {};
+  if (options.status && options.status.length > 0) filters.status = options.status;
+  if (options.documentIds && options.documentIds.length > 0) {
+    filters.document_id = options.documentIds;
+  }
+  if (options.withReview) filters.with_review = true;
   const response = await apiClient.get<DocumentsPage>(
     `/v1/knowledge/bases/${encodeURIComponent(baseName)}/documents`,
-    { params: withTenantScope(params, tenantScope) },
+    {
+      params: withTenantScope({ limit: page.limit, offset: page.offset, ...filters }, tenantScope),
+      // Repeated keys (``status=a&status=b``), as FastAPI reads list queries.
+      paramsSerializer: { indexes: null },
+    },
   );
   return response.data;
 }
@@ -514,8 +547,15 @@ export async function discardPendingDocument(
 }
 
 /** B-222 — what cancelling did with one document: ``not_cancellable`` = it
- *  had already settled (ready / failed / cancelled). */
-export type CancelOutcome = "cancelled" | "not_cancellable" | "not_found";
+ *  had already settled (ready / failed / cancelled). PR-2: an estimate
+ *  withdrawn — ``withdrawn_deleted`` a new upload, deleted with its file;
+ *  ``withdrawn`` put back as it was (new bytes dropped). */
+export type CancelOutcome =
+  | "cancelled"
+  | "not_cancellable"
+  | "not_found"
+  | "withdrawn"
+  | "withdrawn_deleted";
 
 export interface CancelResult {
   document_id: string;
@@ -565,6 +605,128 @@ export async function listChunks(
         tenantScope,
       ),
     },
+  );
+  return response.data;
+}
+
+// ── B-222 PR-2: estimate the cost before ingest, confirm before it starts ──
+
+/** One billed line of an estimate (amounts in micro-yuan). */
+export interface EstimateItem {
+  kind: "embedding" | "recognition" | "figure";
+  units: number;
+  unit: "chunks" | "pages" | "figures";
+  /** Of ``units``, those read / embedded before and not billed again. */
+  reused_units: number;
+  model: string | null;
+  input_tokens: number;
+  output_tokens: number;
+  micros: number;
+  basis: "local_count" | "catalog_average" | "default_average";
+  /** ``false``: the model has no price — not billed (``micros`` 0). */
+  priced: boolean;
+}
+
+export interface IngestEstimate {
+  id: string;
+  origin: string;
+  /** ``false``: a duplicate caught on upload, never parsed. */
+  estimated: boolean;
+  created_at: string;
+  duplicate_of: { id: string; doc_seq: number | null; filename: string } | null;
+  allow_duplicate: boolean;
+  currency: string;
+  total_micros: number;
+  unpriced: boolean;
+  /** Hint codes (``scanned_figures_not_counted`` …), worded by the console. */
+  notes: string[];
+  counts: { chunks: number; scanned_pages: number; figures: number; pages_over_limit: number };
+  items: EstimateItem[];
+  confirmed_at: string | null;
+  confirmed_by: string | null;
+}
+
+export interface IngestActual {
+  estimate_id: string | null;
+  generation: number;
+  currency: string;
+  total_micros: number;
+  unpriced: boolean;
+  outcome: "ready" | "failed" | "stopped";
+  finished_at: string;
+}
+
+/** A base's estimates: ``awaiting`` / ``total_micros`` are what 「全部确认」
+ *  confirms; duplicates are counted apart. */
+export interface EstimateSummary {
+  estimating: number;
+  awaiting: number;
+  duplicates: number;
+  total_micros: number;
+  unpriced: boolean;
+  earliest_confirm_by: string | null;
+}
+
+export type ConfirmOutcome =
+  | "confirmed"
+  | "estimate_changed"
+  | "not_awaiting"
+  | "duplicate"
+  | "expired"
+  | "not_found";
+
+export interface ConfirmResult {
+  document_id: string;
+  outcome: ConfirmOutcome;
+}
+
+/** Confirm documents by the estimate the user saw (a compare-and-set). */
+export async function confirmDocuments(
+  baseName: string,
+  documents: { documentId: string; estimateId: string }[],
+): Promise<ConfirmResult[]> {
+  const response = await apiClient.post<{ results: ConfirmResult[] }>(
+    `/v1/knowledge/bases/${encodeURIComponent(baseName)}/documents/confirm`,
+    {
+      documents: documents.map((d) => ({ document_id: d.documentId, estimate_id: d.estimateId })),
+    },
+  );
+  return response.data.results;
+}
+
+export interface ConfirmAllResult {
+  confirmed: string[];
+  withdrawn: { document_id: string; outcome: "withdrawn" | "withdrawn_deleted" }[];
+  estimate_summary: EstimateSummary;
+}
+
+/** 「全部确认」: every confirmable estimate of the base, provided they still
+ *  number and add up to what the user saw (else ``ApiError`` 409 with
+ *  ``details.error === "estimate_changed"`` and the summary now). The
+ *  duplicates named are withdrawn with it. */
+export async function confirmAllDocuments(
+  baseName: string,
+  expected: { count: number; totalMicros: number; withdrawDuplicateIds?: string[] },
+): Promise<ConfirmAllResult> {
+  const response = await apiClient.post<ConfirmAllResult>(
+    `/v1/knowledge/bases/${encodeURIComponent(baseName)}/documents/confirm`,
+    {
+      all: true,
+      expected_count: expected.count,
+      expected_total_micros: expected.totalMicros,
+      withdraw_duplicate_ids: expected.withdrawDuplicateIds ?? [],
+    },
+  );
+  return response.data;
+}
+
+/** 「仍入库」: a duplicate is estimated like any upload (202), then waits. */
+export async function estimateDuplicate(
+  baseName: string,
+  documentId: string,
+): Promise<KnowledgeDocument> {
+  const response = await apiClient.post<KnowledgeDocument>(
+    `/v1/knowledge/bases/${encodeURIComponent(baseName)}/documents/${encodeURIComponent(documentId)}/estimate`,
   );
   return response.data;
 }

@@ -67,6 +67,12 @@ import { needsRecognition, PageRecognitionTags } from "./PageRecognitionTags";
 import { SegmentPreviewDrawer, type DrawerView } from "./SegmentPreviewDrawer";
 import { UploadQueuePanel } from "./UploadQueuePanel";
 import { ReadonlyTooltip } from "../../components/ReadonlyTooltip";
+import { IngestCostTag } from "./IngestCostTag";
+import { PendingConfirmationBanner } from "./PendingConfirmationBanner";
+import { EstimateActions, UploadBatchBar, UploadRowEstimate } from "./UploadBatchBar";
+import { useEstimateActions } from "./useEstimateActions";
+import { useIngestBatch } from "./useIngestBatch";
+import type { EstimateSummary } from "../../api/knowledge";
 
 const { Text } = Typography;
 
@@ -76,7 +82,12 @@ const STATUS_COLOR: Record<DocumentStatus, string> = {
   ready: "success",
   failed: "error",
   cancelled: "warning",
+  estimating: "processing",
+  awaiting_confirmation: "blue",
 };
+
+/** B-222 PR-2 — what 「只看待确认」 lists. */
+const WAITING_FILTER: DocumentStatus[] = ["estimating", "awaiting_confirmation"];
 
 /** B-222 — the statuses an ingest can still be cancelled from. */
 function isCancellable(status: DocumentStatus): boolean {
@@ -142,6 +153,9 @@ export function DocumentsTab({
 
   const [documents, setDocuments] = useState<KnowledgeDocument[]>([]);
   const [total, setTotal] = useState(0);
+  /** B-222 PR-2 — the base's estimates (the banner) and 「只看待确认」. */
+  const [estimateSummary, setEstimateSummary] = useState<EstimateSummary | undefined>();
+  const [onlyWaiting, setOnlyWaiting] = useState(false);
   /** 1-based page of the server-side paged table. */
   const [page, setPage] = useState(1);
   // Another base (or tenant scope) starts again on page 1 — reset during
@@ -177,11 +191,12 @@ export function DocumentsTab({
       if (!quiet) setLoading(true);
       const seq = ++requestSeqRef.current;
       try {
+        const pageParams = { limit: DOC_TABLE_PAGE_SIZE, offset: (page - 1) * DOC_TABLE_PAGE_SIZE };
         const result = await listDocuments(
           baseName,
-          { limit: DOC_TABLE_PAGE_SIZE, offset: (page - 1) * DOC_TABLE_PAGE_SIZE },
+          pageParams,
           readScope,
-          { withReview },
+          onlyWaiting ? { status: WAITING_FILTER, withReview } : { withReview },
         );
         if (seq !== requestSeqRef.current) return;
         // The page emptied under us (last rows deleted elsewhere) → step
@@ -196,6 +211,7 @@ export function DocumentsTab({
         );
         setSelected((current) => stillShown(current, result.documents));
         setTotal(result.total);
+        setEstimateSummary(result.estimate_summary);
       } catch (err) {
         if (seq === requestSeqRef.current) message.error(errMessage(err));
       } finally {
@@ -204,7 +220,7 @@ export function DocumentsTab({
         if (seq === requestSeqRef.current) setLoading(false);
       }
     },
-    [baseName, message, page, readScope],
+    [baseName, message, onlyWaiting, page, readScope],
   );
 
   useEffect(() => {
@@ -213,8 +229,11 @@ export function DocumentsTab({
 
 
   const hasActiveIngest = useMemo(
-    () => documents.some((d) => d.status === "pending" || d.status === "processing"),
-    [documents],
+    () =>
+      documents.some(
+        (d) => d.status === "pending" || d.status === "processing" || d.status === "estimating",
+      ) || (estimateSummary?.estimating ?? 0) > 0,
+    [documents, estimateSummary],
   );
 
   useEffect(() => {
@@ -276,6 +295,33 @@ export function DocumentsTab({
     }),
   });
   const { enqueue, retry } = queue;
+
+  // B-222 PR-2 — every upload is estimated, then waits for a confirmation:
+  // the queue follows its documents, the banner the base's.
+  const { documents: batchById, refresh: refreshBatch } = useIngestBatch(
+    baseName,
+    readScope,
+    queue.items,
+  );
+  const refreshAll = useCallback(async () => {
+    await Promise.all([refresh({ quiet: true }), refreshBatch().catch(() => undefined)]);
+  }, [refresh, refreshBatch]);
+  const estimates = useEstimateActions(baseName, refreshAll);
+  const batchDocuments = useMemo(() => Object.values(batchById), [batchById]);
+  const handleOnlyWaiting = useCallback((on: boolean) => {
+    setOnlyWaiting(on);
+    setPage(1);
+  }, []);
+  const estimateActionProps = useMemo(
+    () => ({
+      readonly,
+      busy: estimates.busy,
+      onConfirm: (doc: KnowledgeDocument) => void estimates.confirm([doc]),
+      onWithdraw: (doc: KnowledgeDocument) => void estimates.withdraw([doc]),
+      onIngestAnyway: (doc: KnowledgeDocument) => void estimates.ingestAnyway(doc),
+    }),
+    [estimates, readonly],
+  );
 
   const handleBeforeUpload = useCallback(
     (_file: File, batch: File[]) => {
@@ -502,6 +548,13 @@ export function DocumentsTab({
         },
       },
       {
+        // B-222 PR-2 — 「预估 ¥x」 waiting, 「预估 ¥x · 实际 ¥y」 once ingested.
+        title: t("knowledge_page.col_cost"),
+        key: "cost",
+        width: 200,
+        render: (_: unknown, record) => <IngestCostTag document={record} />,
+      },
+      {
         title: t("knowledge_page.col_chunks"),
         dataIndex: "chunk_count",
         key: "chunk_count",
@@ -547,6 +600,7 @@ export function DocumentsTab({
                 data-testid={`doc-chunks-${record.id}`}
               />
             </Tooltip>
+            <EstimateActions document={record} {...estimateActionProps} />
             {isCancellable(record.status) && (
               <ReadonlyTooltip on={readonly}>
                 <Popconfirm
@@ -651,7 +705,7 @@ export function DocumentsTab({
         ),
       },
     ],
-    [t, i18n.language, handleReingest, handleRecognize, handleDiscardPending, handleCancel, handleDelete, readonly, openPreview, openReview],
+    [t, i18n.language, handleReingest, handleRecognize, handleDiscardPending, handleCancel, handleDelete, readonly, openPreview, openReview, estimateActionProps],
   );
 
   const pagination = useMemo<TablePaginationConfig>(
@@ -727,6 +781,30 @@ export function DocumentsTab({
         onRetry={handleRetry}
         onCancelAll={queue.cancelAll}
         onClearDone={queue.clearDone}
+        batchBar={
+          <UploadBatchBar
+            documents={batchDocuments}
+            readonly={readonly}
+            busy={estimates.busy}
+            onConfirm={(confirm, skip) => void estimates.confirm(confirm, skip)}
+            onWithdraw={(waiting) => void estimates.withdraw(waiting)}
+          />
+        }
+        rowExtra={(item) =>
+          item.result && !item.result.unchanged ? (
+            <UploadRowEstimate document={batchById[item.result.id]} {...estimateActionProps} />
+          ) : null
+        }
+      />
+
+      <PendingConfirmationBanner
+        summary={estimateSummary}
+        readonly={readonly}
+        busy={estimates.busy}
+        onlyWaiting={onlyWaiting}
+        onConfirmAll={() => estimateSummary && void estimates.confirmAll(estimateSummary)}
+        onWithdrawAll={() => void estimates.withdrawAll()}
+        onOnlyWaitingChange={handleOnlyWaiting}
       />
 
       <DocumentBatchBar

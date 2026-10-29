@@ -25,6 +25,7 @@ from control_plane.api.external_workspace import build_external_workspace_router
 from control_plane.api.feedback import build_feedback_router
 from control_plane.api.health import build_health_router
 from control_plane.api.knowledge import build_knowledge_router
+from control_plane.api.knowledge_estimates import build_knowledge_estimates_router
 from control_plane.api.knowledge_figures import build_knowledge_figures_router
 from control_plane.api.knowledge_logs import build_knowledge_logs_router
 from control_plane.api.knowledge_maintenance import build_knowledge_maintenance_router
@@ -111,6 +112,7 @@ __all__ = [
     "build_external_workspace_router",
     "build_feedback_router",
     "build_health_router",
+    "build_knowledge_estimates_router",
     "build_knowledge_figures_router",
     "build_knowledge_logs_router",
     "build_knowledge_maintenance_router",

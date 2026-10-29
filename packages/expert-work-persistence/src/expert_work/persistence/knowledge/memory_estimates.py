@@ -34,6 +34,7 @@ from expert_work.persistence.knowledge.estimates import (
     estimate_id_of,
     is_duplicate,
     is_estimated,
+    is_expired,
     merge_actual,
     meta_of,
     public_estimate,
@@ -41,6 +42,7 @@ from expert_work.persistence.knowledge.estimates import (
     summarize,
     with_estimate,
     withdraw_plan,
+    withdraws_with_confirm_all,
 )
 from expert_work.protocol import (
     SEARCHABLE_CHUNK_TYPES,
@@ -271,12 +273,9 @@ class InMemoryEstimates:
             ),
         )
         update: dict[str, Any] = {}
-        if self._content.get(existing.id) is None and existing.chunk_count == 0:
-            self._content[existing.id] = content  # nothing serving yet
-            self._sha256[existing.id] = content_sha256
-            update["size_bytes"] = len(content)
-        else:
-            self._pending[existing.id] = (content, content_sha256)
+        # Into the pending slot even when nothing serves: withdrawn, it goes
+        # with the slot; ingested, it is promoted (``set_document_status``).
+        self._pending[existing.id] = (content, content_sha256)
         if existing.doc_seq is None:
             update["doc_seq"] = self._bump_doc_seq(existing.tenant_id)
         document = existing.model_copy(
@@ -444,7 +443,11 @@ class InMemoryEstimates:
                 continue
             raw = self._estimates.get(document_id)
             refused = confirm_outcome(
-                status=document.status.value, raw=raw, estimate_id=estimate_id
+                status=document.status.value,
+                raw=raw,
+                estimate_id=estimate_id,
+                confirm_by=document.confirm_by,
+                now=now,
             )
             if refused is not None:
                 outcomes[document_id] = refused
@@ -490,12 +493,13 @@ class InMemoryEstimates:
         expected_total_micros: int,
         confirmed_by: str | None,
         now: datetime,
-        withdraw_duplicates: bool,
+        withdraw_duplicates: Sequence[UUID] = (),
     ) -> ConfirmAllResult:
         mine = [d for d in self._documents if d.tenant_id == tenant_id and d.kb_id == kb_id]
         summary = summarize((d.status.value, self._estimates.get(d.id), d.confirm_by) for d in mine)
         if summary.awaiting != expected_count or summary.total_micros != expected_total_micros:
             return ConfirmAllResult(matched=False, summary=summary)
+        seen = frozenset(withdraw_duplicates)
         confirmed_ids: list[UUID] = []
         withdrawn: dict[UUID, WithdrawOutcome] = {}
         for document in mine:
@@ -503,9 +507,11 @@ class InMemoryEstimates:
                 continue
             raw = self._estimates.get(document.id)
             if is_duplicate(raw) or not is_estimated(raw):
-                if withdraw_duplicates:
+                if withdraws_with_confirm_all(document.id, raw, seen):
                     withdrawn[document.id] = self._withdraw(document, now)
                 continue
+            if is_expired(document.confirm_by, now):
+                continue  # the expiry sweep withdraws it
             self._confirm(document, raw or {}, confirmed_by, now)
             confirmed_ids.append(document.id)
         return ConfirmAllResult(

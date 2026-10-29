@@ -57,7 +57,7 @@ from control_plane.knowledge.chunking import (
     structural_chunk_count,
 )
 from control_plane.knowledge.estimate import IngestEstimator
-from control_plane.knowledge.parse_snapshot import decode_snapshot, encode_snapshot
+from control_plane.knowledge.parse_snapshot import decode_in_thread, encode_in_thread
 from control_plane.knowledge.parse_workers import (
     FIGURE_POOL,
     FIGURE_POOL_WORKERS,
@@ -114,6 +114,7 @@ from expert_work.protocol import (
 )
 from expert_work.protocol.knowledge_estimate import (
     CONFIRM_WINDOW,
+    IngestEstimate,
     IngestOutcome,
     needs_reconfirmation,
 )
@@ -555,6 +556,7 @@ async def ingest_document_bytes(
     figures: FigureDescriber | None = None,
     guard: BatchGuard | None = None,
     local: LocalParse | None = None,
+    before_paid: BatchGuard | None = None,
 ) -> int:
     """Parse → chunk → embed → store one document; return the chunk count.
 
@@ -575,7 +577,9 @@ async def ingest_document_bytes(
     B-222: ``guard`` (:func:`lease_guard`) runs before each embedding window;
     recognition batches and figure model calls check the fenced stage write.
     B-222 PR-2: ``local`` is the estimate's parse (:func:`parse_locally`, kept
-    as its snapshot) — the parse pools are not run again.
+    as its snapshot) — the parse pools are not run again; ``before_paid``
+    (:attr:`PaidStart.before_paid`) runs before each recognition batch and
+    figure call, after the fenced stage write.
 
     :raises StaleIngestionError: the fenced write-back was rejected.
     """
@@ -597,6 +601,7 @@ async def ingest_document_bytes(
             filename=filename,
             raw=raw,
             generation=generation,
+            before_paid=before_paid,
         )
         if local is None:
             markdown = await parse_upload(job, recognizer=recognizer, figures=figures)
@@ -629,8 +634,23 @@ def _parse_job(
     filename: str,
     raw: bytes,
     generation: int | None,
+    before_paid: BatchGuard | None = None,
 ) -> ParseJob:
     run, run_figures = _pool_runners(filename)
+    advance = functools.partial(
+        _advance,
+        store,
+        tenant_id=tenant_id,
+        document_id=document_id,
+        stage=IngestStage.RECOGNIZING,
+        generation=generation,
+    )
+
+    async def recognizing() -> None:
+        await advance()
+        if before_paid is not None:
+            await before_paid()
+
     return ParseJob(
         store=store,
         tenant_id=tenant_id,
@@ -641,14 +661,7 @@ def _parse_job(
         generation=generation,
         run=run,
         run_figures=run_figures,
-        recognizing=functools.partial(
-            _advance,
-            store,
-            tenant_id=tenant_id,
-            document_id=document_id,
-            stage=IngestStage.RECOGNIZING,
-            generation=generation,
-        ),
+        recognizing=recognizing,
         lost=lambda: StaleIngestionError(f"document {document_id} was taken by another claim"),
     )
 
@@ -1092,7 +1105,7 @@ async def estimate_document(
         document_id=claim.document_id,
         generation=claim.generation,
         estimate=estimate.model_dump(mode="json"),
-        snapshot=encode_snapshot(local),
+        snapshot=await encode_in_thread(local),
         confirm_by=now + CONFIRM_WINDOW,
     )
     if finished is None:
@@ -1111,10 +1124,64 @@ async def estimate_document(
 class PaidStart:
     """How a confirmed ingest starts: from ``local`` (the estimate's parse —
     ``None``: parse as ever), or not at all: ``returned`` — its estimate no
-    longer holds and the document waits for the new one."""
+    longer holds and the document waits for the new one. ``embedder`` (the
+    model checked against the confirmed estimate, pinned — ``None``: the
+    worker's own) and ``before_paid`` (run before each recognition batch and
+    figure call: a model switched since the check sends the document back for
+    a new confirmation) keep the ingest on the models the user confirmed."""
 
     local: LocalParse | None
     returned: bool = False
+    embedder: Embedder | None = None
+    before_paid: BatchGuard | None = None
+
+
+@dataclass(frozen=True)
+class _KeyedEmbedder:
+    """An embedder fixed to the model pinned at the §6.3 check (``model_key``
+    is what :func:`pin_embedder` reads): the ingest embeds with the model the
+    user confirmed, whatever the platform switched to since."""
+
+    inner: Embedder
+    model_key: str | None
+
+    async def embed(self, texts: Sequence[str], *, tenant_id: UUID) -> list[tuple[float, ...]]:
+        return await self.inner.embed(texts, tenant_id=tenant_id)
+
+
+def _models_guard(
+    store: KnowledgeStore,
+    estimator: IngestEstimator,
+    claim: ClaimedIngestion,
+    local: LocalParse,
+    confirmed: IngestEstimate,
+) -> BatchGuard:
+    """§14 ④ —— before a recognition batch or figure call of a confirmed
+    ingest: the recognition / figure model it would use now is still the one
+    the user confirmed, else the document goes back for a confirmation of a
+    fresh estimate (what is cached by now is not counted again) and the
+    ingest stops, writing nothing more."""
+
+    async def guard() -> None:
+        if not await estimator.models_changed(claim, confirmed.models):
+            return
+        now = datetime.now(UTC)
+        fresh = await estimator.estimate(
+            claim, local, embedding_model=confirmed.models.embedding, now=now
+        )
+        await store.return_to_confirmation(
+            tenant_id=claim.tenant_id,
+            document_id=claim.document_id,
+            generation=claim.generation,
+            estimate=fresh.model_dump(mode="json"),
+            snapshot=await encode_in_thread(local),
+            confirm_by=now + CONFIRM_WINDOW,
+        )
+        logger.info("knowledge.estimate_reconfirm_mid_ingest document=%s", claim.document_id)
+        msg = f"document {claim.document_id}: a model changed since its estimate was confirmed"
+        raise StaleIngestionError(msg)
+
+    return guard
 
 
 async def start_paid_ingest(
@@ -1142,7 +1209,7 @@ async def start_paid_ingest(
         tenant_id=claim.tenant_id, document_id=claim.document_id, estimate_id=confirmed.id
     )
     if snapshot is not None:
-        local = decode_snapshot(snapshot)
+        local = await decode_in_thread(snapshot)
     figures_on = figures is not None and await figures_enabled(figures, tenant_id=claim.tenant_id)
     if local is None or local.figures_on != figures_on:
         local = await parse_locally(
@@ -1156,17 +1223,21 @@ async def start_paid_ingest(
         )
     else:
         logger.info("knowledge.snapshot_used document=%s", claim.document_id)
-    model_key, _ = await pin_embedder(embedder, tenant_id=claim.tenant_id)
+    model_key, pinned = await pin_embedder(embedder, tenant_id=claim.tenant_id)
     now = datetime.now(UTC)
     fresh = await estimator.estimate(claim, local, embedding_model=model_key, now=now)
     if not needs_reconfirmation(confirmed, fresh):
-        return PaidStart(local=local)
+        return PaidStart(
+            local=local,
+            embedder=_KeyedEmbedder(pinned, model_key),
+            before_paid=_models_guard(store, estimator, claim, local, confirmed),
+        )
     returned = await store.return_to_confirmation(
         tenant_id=claim.tenant_id,
         document_id=claim.document_id,
         generation=claim.generation,
         estimate=fresh.model_dump(mode="json"),
-        snapshot=encode_snapshot(local),
+        snapshot=await encode_in_thread(local),
         confirm_by=now + CONFIRM_WINDOW,
     )
     if not returned:
@@ -1378,7 +1449,7 @@ class KnowledgeIngestionRunner:
         token = current_tenant_id_var.set(tenant_id)
         renewer: asyncio.Task[None] | None = None
         claim: ClaimedIngestion | None = None
-        ready = written = failed = False
+        ready = written = failed = stale = False
         #: B-222 PR-2 —— what the paid ingest was billed (none for an estimate).
         spend: IngestSpend | None = None
         lost = asyncio.Event()
@@ -1454,7 +1525,7 @@ class KnowledgeIngestionRunner:
                     with spend_scope(spend):
                         chunk_count = await ingest_document_bytes(
                             store=self._store,
-                            embedder=self._embedder,
+                            embedder=start.embedder or self._embedder,
                             tenant_id=tenant_id,
                             document_id=document_id,
                             kb_id=claim.kb_id,
@@ -1474,6 +1545,7 @@ class KnowledgeIngestionRunner:
                                 lease_seconds=self._lease_seconds,
                             ),
                             local=start.local,
+                            before_paid=start.before_paid,
                         )
                 finally:
                     finishing.set()
@@ -1500,6 +1572,7 @@ class KnowledgeIngestionRunner:
             logger.info("knowledge.ingest_lost_lease document=%s", document_id)
         except StaleIngestionError:
             # 重传 / 已被别的认领收尾 —— 本 worker 的结果作废,什么都不写。
+            stale = True
             logger.info(
                 "knowledge.ingest_stale document=%s generation=%s",
                 document_id,
@@ -1543,8 +1616,10 @@ class KnowledgeIngestionRunner:
             await _stop_renewer(renewer)
             if claim is not None and spend is not None:
                 outcome: IngestOutcome = "ready" if ready else "failed" if failed else "stopped"
+                # A shutdown leaves the claim for a retry: its snapshot stays.
+                settled = ready or failed or stale or lost.is_set()
                 await record_actual(
-                    self._store, self.estimator, claim, spend, outcome=outcome, settled=True
+                    self._store, self.estimator, claim, spend, outcome=outcome, settled=settled
                 )
             if claim is not None and claim.phase == "ingest" and self._figures is not None:
                 await self._figures.tidy(claim, settled=ready, serving=written)

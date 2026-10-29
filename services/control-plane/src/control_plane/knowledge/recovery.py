@@ -12,6 +12,10 @@ Mirrors :class:`control_plane.quota.reaper.ReservationReaper`: a never-raising
 periodic loop with an ``asyncio.Event`` stop, started/stopped from the FastAPI
 lifespan. Bounded by ``max_attempts`` so a document that repeatedly kills the
 process eventually goes terminally ``failed`` instead of looping forever.
+
+B-222 PR-2: it also claims ``estimating`` documents (the free estimate only;
+``awaiting_confirmation`` is never claimed), withdraws estimates nobody
+confirmed within 7 days and drops expired parse snapshots, every cycle.
 """
 
 from __future__ import annotations
@@ -20,6 +24,7 @@ import asyncio
 import logging
 from datetime import UTC, datetime
 
+from control_plane.audit import emit
 from control_plane.knowledge.estimate import IngestEstimator
 from control_plane.knowledge.ingestion import (
     CONTENT_MISSING_ERROR,
@@ -37,12 +42,14 @@ from control_plane.knowledge.parsed_size import DocumentTooLargeError, Hold, res
 from control_plane.knowledge.recognition.figure_pipeline import FigureDescriber
 from control_plane.knowledge.recognition.recognizer import DocumentRecognizer
 from control_plane.knowledge.usage import IngestSpend, IngestUsageRecorder, spend_scope
-from expert_work.common.observability import expert_work_counter
+from expert_work.common.observability import current_trace_id_hex, expert_work_counter
 from expert_work.persistence import KnowledgeStore
 from expert_work.persistence.knowledge.base import ClaimedIngestion
+from expert_work.persistence.knowledge.estimates import ExpiredEstimate
 from expert_work.persistence.rls import bypass_rls_var, current_tenant_id_var
-from expert_work.protocol import DocumentStatus, IngestErrorCode
+from expert_work.protocol import AuditAction, DocumentStatus, IngestErrorCode
 from expert_work.protocol.knowledge_estimate import IngestOutcome
+from expert_work.runtime.audit.logger import AuditLogger
 from orchestrator.llm import Embedder
 
 logger = logging.getLogger("expert_work.control_plane.knowledge.recovery")
@@ -65,6 +72,14 @@ _cycle_errors = expert_work_counter(
     "expert_work_knowledge_ingest_cycle_errors_total",
     "Recovery worker cycles that ended in a caught exception.",
 )
+_expired = expert_work_counter(
+    "expert_work_knowledge_estimate_expired_total",
+    "Ingest estimates withdrawn because nobody confirmed them in time (B-222).",
+)
+
+#: B-222 PR-2 —— estimates past their deadline one cycle withdraws (the rest
+#: wait for the next cycle).
+_EXPIRE_BATCH = 200
 
 
 class KnowledgeIngestRecoveryWorker:
@@ -84,6 +99,7 @@ class KnowledgeIngestRecoveryWorker:
         figures: FigureDescriber | None = None,
         local: LocalIngests | None = None,
         estimator: IngestEstimator | None = None,
+        audit: AuditLogger | None = None,
     ) -> None:
         if interval_s <= 0:
             msg = "interval_s must be positive"
@@ -106,6 +122,8 @@ class KnowledgeIngestRecoveryWorker:
         #: B-222 —— the process's running ingests (the runner's ``local``), so
         #: a cancel on this pod stops a drive at once.
         self.local = local if local is not None else LocalIngests()
+        #: B-222 PR-2 —— audits each estimate withdrawn on its deadline.
+        self._audit = audit
         self._task: asyncio.Task[None] | None = None
         self._stop = asyncio.Event()
 
@@ -154,6 +172,7 @@ class KnowledgeIngestRecoveryWorker:
         finally:
             current_tenant_id_var.reset(token_tenant)
             bypass_rls_var.reset(token_bypass)
+        await self._expire_estimates()
 
         drives: list[tuple[ClaimedIngestion, asyncio.Task[bool]]] = []
         try:
@@ -185,6 +204,57 @@ class KnowledgeIngestRecoveryWorker:
             elif outcome:
                 settled += 1
         return settled
+
+    async def _expire_estimates(self) -> None:
+        """B-222 PR-2 (§6.5) —— withdraw the estimates nobody confirmed by their
+        deadline (a new upload deleted, anything else put back as it was), one
+        ``knowledge:document_estimate_expired`` audit row each (actor
+        ``system``), and drop parse snapshots past their lifetime. Several pods
+        sweeping at once withdraw each estimate once. A failure here is logged
+        and leaves the claims of this cycle alone."""
+        token_bypass = bypass_rls_var.set(True)
+        token_tenant = current_tenant_id_var.set(None)
+        try:
+            now = datetime.now(UTC)
+            expired = await self._store.expire_awaiting(now=now, limit=_EXPIRE_BATCH)
+            purged = await self._store.purge_expired_snapshots(now=now)
+        except Exception:
+            _cycle_errors.inc()
+            logger.exception("knowledge.recovery.expire_failed")
+            return
+        finally:
+            current_tenant_id_var.reset(token_tenant)
+            bypass_rls_var.reset(token_bypass)
+        if expired:
+            _expired.inc(len(expired))
+            logger.info("knowledge.recovery.estimates_expired count=%d", len(expired))
+        if purged:
+            logger.info("knowledge.recovery.snapshots_purged count=%d", purged)
+        for withdrawn in expired:
+            await self._audit_expired(withdrawn)
+
+    async def _audit_expired(self, withdrawn: ExpiredEstimate) -> None:
+        if self._audit is None:
+            return
+        try:
+            await emit(
+                self._audit,
+                tenant_id=withdrawn.tenant_id,
+                actor_id="system",
+                action=AuditAction.KNOWLEDGE_DOCUMENT_ESTIMATE_EXPIRED,
+                resource_type="knowledge_document",
+                resource_id=str(withdrawn.document_id),
+                trace_id=current_trace_id_hex(),
+                details={
+                    "kb_id": str(withdrawn.kb_id),
+                    "filename": withdrawn.filename,
+                    "outcome": withdrawn.outcome,
+                },
+            )
+        except Exception:
+            logger.exception(
+                "knowledge.recovery.expire_audit_failed document=%s", withdrawn.document_id
+            )
 
     async def _claim_holding(self) -> tuple[ClaimedIngestion, Hold] | None:
         """Reserve room for one document's bytes, then claim one stuck
@@ -251,7 +321,7 @@ class KnowledgeIngestRecoveryWorker:
             )
         )
         try:
-            return await self._drive(claim, finishing=finishing)
+            return await self._drive(claim, finishing=finishing, lost=lost)
         except asyncio.CancelledError:
             if not lost.is_set():
                 raise
@@ -263,9 +333,13 @@ class KnowledgeIngestRecoveryWorker:
             current_tenant_id_var.reset(token_tenant)
             bypass_rls_var.reset(token_bypass)
 
-    async def _drive(self, claim: ClaimedIngestion, *, finishing: asyncio.Event) -> bool:
+    async def _drive(
+        self, claim: ClaimedIngestion, *, finishing: asyncio.Event, lost: asyncio.Event
+    ) -> bool:
         """``finishing`` is set once the paid work is over (whatever its
-        outcome): from then on only fenced writes and the tidy-up follow."""
+        outcome): from then on only fenced writes and the tidy-up follow.
+        ``lost`` is set when the drive is stopped because the claim is no
+        longer its own (any other cancellation is the pod shutting down)."""
         if claim.content is None:
             # No retained bytes (legacy row) — cannot recover; fail it.
             await self._store.mark_document_failed_terminal(
@@ -277,7 +351,7 @@ class KnowledgeIngestRecoveryWorker:
             )
             _failed_terminal.inc()
             return True
-        ready = written = settled_failure = retrying = False
+        ready = written = settled_failure = retrying = interrupted = False
         #: B-222 PR-2 —— what the paid ingest was billed (none for an estimate).
         spend: IngestSpend | None = None
         try:
@@ -297,7 +371,7 @@ class KnowledgeIngestRecoveryWorker:
                 with spend_scope(spend):
                     chunk_count = await ingest_document_bytes(
                         store=self._store,
-                        embedder=self._embedder,
+                        embedder=start.embedder or self._embedder,
                         tenant_id=claim.tenant_id,
                         document_id=claim.document_id,
                         kb_id=claim.kb_id,
@@ -317,7 +391,13 @@ class KnowledgeIngestRecoveryWorker:
                             lease_seconds=self._lease_seconds,
                         ),
                         local=start.local,
+                        before_paid=start.before_paid,
                     )
+            except asyncio.CancelledError:
+                # Lost / cancelled here (``lost``), or the pod shutting down —
+                # then the claim is retried later and keeps its snapshot.
+                interrupted = not lost.is_set()
+                raise
             finally:
                 finishing.set()
             written = True  # this claim's chunks are in place
@@ -394,7 +474,7 @@ class KnowledgeIngestRecoveryWorker:
                     claim,
                     spend,
                     outcome=outcome,
-                    settled=not retrying,
+                    settled=not (retrying or interrupted),
                 )
             if self._figures is not None and claim.phase == "ingest":
                 # B-209 PR-2 (review H5): same tidy-up as the fast path.

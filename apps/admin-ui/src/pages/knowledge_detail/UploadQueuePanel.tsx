@@ -10,7 +10,7 @@
  * Rows are memoised so a progress tick on one upload does not re-render the
  * other few hundred.
  */
-import { memo, useMemo, useState } from "react";
+import { memo, useMemo, useState, type ReactNode } from "react";
 import { Button, Progress, Space, Tag, Typography } from "antd";
 import { useTranslation } from "react-i18next";
 
@@ -46,6 +46,10 @@ interface UploadQueuePanelProps {
   onRetry: (id: string) => void;
   onCancelAll: () => void;
   onClearDone: () => void;
+  /** B-222 PR-2 — under the header: the batch's estimates and actions. */
+  batchBar?: ReactNode;
+  /** B-222 PR-2 — under a row: its document on the server (status, cost). */
+  rowExtra?: (item: UploadQueueItem<UploadedDocument>) => ReactNode;
 }
 
 interface UploadQueueRowProps {
@@ -174,6 +178,8 @@ export function UploadQueuePanel({
   onRetry,
   onCancelAll,
   onClearDone,
+  batchBar,
+  rowExtra,
 }: UploadQueuePanelProps) {
   const { t } = useTranslation();
   const [showSkipped, setShowSkipped] = useState(false);
@@ -209,14 +215,16 @@ export function UploadQueuePanel({
   ].filter((part): part is string => part !== null);
 
   const renderRow = (item: UploadQueueItem<UploadedDocument>) => (
-    <UploadQueueRow
-      key={item.id}
-      item={item}
-      limitLabel={limitLabel}
-      readonly={readonly}
-      onCancel={onCancel}
-      onRetry={onRetry}
-    />
+    <div key={item.id}>
+      <UploadQueueRow
+        item={item}
+        limitLabel={limitLabel}
+        readonly={readonly}
+        onCancel={onCancel}
+        onRetry={onRetry}
+      />
+      {rowExtra ? rowExtra(item) : null}
+    </div>
   );
 
   return (
@@ -267,6 +275,7 @@ export function UploadQueuePanel({
           </Button>
         </Space>
       </div>
+      {batchBar}
 
       {uploads.length > 0 ? (
         <div style={{ marginTop: 8, maxHeight: ROW_LIST_MAX_HEIGHT, overflowY: "auto" }}>
