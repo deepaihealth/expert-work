@@ -82,9 +82,6 @@ UNION ALL SELECT 'running_queued_paused', count(*)::text FROM agent_run WHERE st
 
 ---
 
-
----
-
 ## 段 1：数据库 16 → 17（照测试 10-21 实际走过的步骤重放，`rds-pg-major-upgrade.md` §4–§7）
 
 ### U1 停写 + 升级前快照（约 10 分钟，从这里开始停服）
@@ -271,13 +268,10 @@ SELECT status, completed, exit_reason, unresolved_failures FROM agent_run WHERE 
 
 ### Step F：收尾记录（10 分钟）
 
-- [ ] 记录 PR `chore(deploy): prod newTag 7e6b7679e`，写上：上一版 `94dc73ba`；沙箱 `d8a32812→daf63cb1`；B-217 切换；回滚命令。
-- [ ] 同一 PR 里改 `production-release.md` 的现状表。
-- [ ] 更新记录 `changelog.md` 两条的「待发布」改成 2026-10-29。
-- [ ] ROADMAP 里 B-209 / B-212 / B-217 / B-222 / B-226 / B-235，以及 B-198~B-203 等「生产待令」的行，改成已上线。
-
----
-
+- [x] 记录 PR `chore(deploy): prod newTag 7e6b7679e`（#1974），写上：上一版 `94dc73ba`；沙箱 `d8a32812→daf63cb1`；B-217 切换；回滚命令。
+- [x] 同一 PR 里改 `production-release.md` 的现状表。
+- [x] 更新记录 `changelog.md` 两条的「待发布」改成 2026-10-29。
+- [x] ROADMAP 里本版上线的条目（B-207 / B-208 / B-217 / B-222 / B-226 / B-235）标注已上线。
 
 ---
 
@@ -314,9 +308,6 @@ SELECT status, completed, exit_reason, unresolved_failures FROM agent_run WHERE 
 
 ---
 
-
----
-
 ## 附 A：发前通知深护智康的接口变化（`changelog.md` 里两条标着「待发布」）
 
 
@@ -342,16 +333,10 @@ B-236（路径形状、`session_id`）不在本版，今晚不用通知。
 ---
 
 
-## 附 B：没能核实的地方
+## 附 B：发前没能核实的地方（执行后的结论）
 
-
-- 生产当前的沙箱钉子、`acr-pull`、表大小、价目表、`pgvector` 版本：由 Step P 和 §1 的 SQL 来确认。
-- 盘点 SQL 和 pod 内的代码在位检查命令：没在测试库或测试 pod 上跑过。`kubectl get` 类命令和标签、注解的写法在测试集群上跑通了。
-- 4Gi 对 ACS 计费的影响。
-- 生产能否直接命中测试已建好的 `daf63cb1` 缓存（只有同一账号才行）。
-- `apply -f` 能否去掉 `apply -k` 写上的安全组注解（回滚第一行）。
-
-本次的临时文件都在 `/private/tmp/claude-501/-Users-mac-src-github-jone-qian-expert-work/0498b6da-b5f7-4fd4-bc85-1712b1347707/scratchpad/prod/`（迁移源码、渲染出的 overlay、configmap 对比结果）。仓库里没有任何改动。
-</agent-message>
-
-
+- 生产当前的沙箱钉子、`acr-pull`、表大小、价目表、`pgvector` 版本：Step P 和 0.5 的 SQL 已确认。
+- 盘点 SQL 和 pod 内的代码在位检查命令：发前先在测试库、测试 pod 上跑通，生产照常输出。
+- 生产能否直接命中测试已建好的 `daf63cb1` 缓存：Step A 已命中。
+- 4Gi 对 ACS 计费的影响：仍未核。
+- `apply -f` 能否去掉 `apply -k` 写上的安全组注解（回滚第一行）：本次没有回滚，仍未核。
