@@ -36,13 +36,13 @@ images:
   newTag: 24.12-alpine-r1
 - name: crpi-sgadimluo7wm655m.cn-hangzhou.personal.cr.aliyuncs.com/expert-work/admin-ui
   newName: crpi-sgadimluo7wm655m.cn-hangzhou.personal.cr.aliyuncs.com/expert-work/admin-ui
-  newTag: 94dc73ba-prod
+  newTag: 7e6b7679e-prod
 - name: crpi-sgadimluo7wm655m.cn-hangzhou.personal.cr.aliyuncs.com/expert-work/control-plane
   newName: crpi-sgadimluo7wm655m.cn-hangzhou.personal.cr.aliyuncs.com/expert-work/control-plane
-  newTag: 94dc73ba
+  newTag: 7e6b7679e
 - name: crpi-sgadimluo7wm655m.cn-hangzhou.personal.cr.aliyuncs.com/expert-work/credential-proxy
   newName: crpi-sgadimluo7wm655m.cn-hangzhou.personal.cr.aliyuncs.com/expert-work/credential-proxy
-  newTag: 94dc73ba
+  newTag: 7e6b7679e
 - name: grafana/grafana
   newName: crpi-sgadimluo7wm655m.cn-hangzhou.personal.cr.aliyuncs.com/expert-work/grafana
 - name: grafana/tempo
