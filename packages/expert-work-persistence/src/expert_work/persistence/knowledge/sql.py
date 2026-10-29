@@ -60,6 +60,12 @@ from expert_work.persistence.knowledge.base import (
     RowSecurityActiveError,
     _Unset,
 )
+from expert_work.persistence.knowledge.estimates import (
+    WAITING_STATUSES,
+    public_estimate,
+    read_actual,
+    reindex_fence_statuses,
+)
 from expert_work.persistence.knowledge.passages import (
     SWITCH_OFF_REVISION,
     ChunkVector,
@@ -78,6 +84,7 @@ from expert_work.persistence.knowledge.passages import (
     settle_switch_off,
     unapplied_revisions,
 )
+from expert_work.persistence.knowledge.sql_estimates import SqlEstimates
 from expert_work.persistence.knowledge.text_search import (
     KB_DOC_TITLE_HIT_WEIGHT,
     KB_KEYWORD_PHRASE_BOOST,
@@ -94,6 +101,7 @@ from expert_work.persistence.models import (
     KnowledgeDocSeqRow,
     KnowledgeDocumentRow,
     KnowledgeParseCacheRow,
+    KnowledgeParseSnapshotRow,
 )
 from expert_work.protocol import (
     DEFAULT_CHUNK_MAX_TOKENS,
@@ -196,6 +204,22 @@ def _fence(
     ]
 
 
+#: B-222 PR-2 —— what a worker's lease renewal and terminal failure are fenced
+#: on: the paid ingest, or the free estimate.
+_WORKING_VALUES = (DocumentStatus.ESTIMATING.value, DocumentStatus.PROCESSING.value)
+_WAITING_VALUES = tuple(sorted(status.value for status in WAITING_STATUSES))
+
+
+def _fence_in(generation: int | None, statuses: Collection[str]) -> list[ColumnElement[bool]]:
+    """:func:`_fence` for any of ``statuses`` (values)."""
+    if generation is None:
+        return []
+    return [
+        KnowledgeDocumentRow.status.in_(sorted(statuses)),
+        KnowledgeDocumentRow.ingest_generation == generation,
+    ]
+
+
 def _documents_where(
     tenant_id: UUID,
     kb_id: UUID,
@@ -226,13 +250,14 @@ def _stale_where(tenant_id: UUID, kb_id: UUID, params_hash: str) -> list[ColumnE
 
 def _claimable(now: datetime, max_attempts: int) -> ColumnElement[bool]:
     """A document is claimable when it is ``pending``, or ``processing`` with
-    an expired (or absent) lease, and still under its retry budget."""
+    an expired (or absent) lease, and still under its retry budget. B-222
+    PR-2: ``estimating`` likewise (for its estimate; it stays ``estimating``)."""
     return and_(
         KnowledgeDocumentRow.attempts < max_attempts,
         or_(
             KnowledgeDocumentRow.status == DocumentStatus.PENDING.value,
             and_(
-                KnowledgeDocumentRow.status == DocumentStatus.PROCESSING.value,
+                KnowledgeDocumentRow.status.in_(_WORKING_VALUES),
                 or_(
                     KnowledgeDocumentRow.lease_until.is_(None),
                     KnowledgeDocumentRow.lease_until < now,
@@ -289,6 +314,20 @@ _CLAIM_COLUMNS = (
         ),
         else_=KnowledgeDocumentRow.content_sha256,
     ).label("content_sha256"),
+    # B-222 PR-2 — the phase (the status after the claim), the estimate, and
+    # the serving version's hash (the bytes claimed are unchanged when equal).
+    KnowledgeDocumentRow.status,
+    KnowledgeDocumentRow.ingest_estimate,
+    KnowledgeDocumentRow.content_sha256.label("serving_sha256"),
+)
+
+#: B-222 PR-2 — a claim keeps an ``estimating`` document estimating.
+_CLAIMED_STATUS = case(
+    (
+        KnowledgeDocumentRow.status == DocumentStatus.ESTIMATING.value,
+        DocumentStatus.ESTIMATING.value,
+    ),
+    else_=DocumentStatus.PROCESSING.value,
 )
 
 
@@ -362,6 +401,9 @@ def _to_document(row: KnowledgeDocumentRow) -> KnowledgeDocument:
         page_stats=PageStats.model_validate(row.page_stats) if row.page_stats else None,
         figure_stats=FigureStats.model_validate(row.figure_stats) if row.figure_stats else None,
         chunk_params_hash=row.chunk_params_hash,
+        ingest_estimate=public_estimate(row.ingest_estimate),
+        ingest_actual=read_actual(row.ingest_actual),
+        confirm_by=row.confirm_by,
         size_bytes=row.size_bytes,
         mime=row.mime,
         created_at=row.created_at,
@@ -1158,7 +1200,7 @@ async def _settle_switch_offs(
             await session.execute(delete(KnowledgeChunkRevisionRow).where(*mine))
 
 
-class SqlKnowledgeStore(KnowledgeStore):
+class SqlKnowledgeStore(SqlEstimates, KnowledgeStore):
     """Postgres-backed knowledge repository (pgvector)."""
 
     def __init__(self, session_factory: async_sessionmaker[AsyncSession]) -> None:
@@ -1167,6 +1209,10 @@ class SqlKnowledgeStore(KnowledgeStore):
         self._vector_version: tuple[int, ...] | None = None
         #: Set when the server refused ``hnsw.iterative_scan``; never sent again.
         self._iterative_scan_rejected = False
+
+    @staticmethod
+    def _document_of(row: KnowledgeDocumentRow) -> KnowledgeDocument:
+        return _to_document(row)
 
     # -- knowledge bases ----------------------------------------------------
 
@@ -1484,6 +1530,18 @@ class SqlKnowledgeStore(KnowledgeStore):
                     KnowledgeChunkRevisionRow.kb_id == kb_id,
                 )
             )
+            # B-222 PR-2 — the documents' parse snapshots (the FK cascades too, 0179).
+            await session.execute(
+                delete(KnowledgeParseSnapshotRow).where(
+                    KnowledgeParseSnapshotRow.tenant_id == tenant_id,
+                    KnowledgeParseSnapshotRow.document_id.in_(
+                        select(KnowledgeDocumentRow.id).where(
+                            KnowledgeDocumentRow.tenant_id == tenant_id,
+                            KnowledgeDocumentRow.kb_id == kb_id,
+                        )
+                    ),
+                )
+            )
             await session.execute(
                 delete(KnowledgeDocumentRow).where(
                     KnowledgeDocumentRow.tenant_id == tenant_id,
@@ -1542,6 +1600,15 @@ class SqlKnowledgeStore(KnowledgeStore):
                     existing.doc_seq = await self._next_doc_seq(session, tenant_id)
                 existing.claimed_at = None
                 existing.lease_until = None
+                # B-222 PR-2: queued without an estimate.
+                existing.ingest_estimate = None
+                existing.confirm_by = None
+                await session.execute(
+                    delete(KnowledgeParseSnapshotRow).where(
+                        KnowledgeParseSnapshotRow.tenant_id == tenant_id,
+                        KnowledgeParseSnapshotRow.document_id == existing.id,
+                    )
+                )
                 if content is not None:
                     if not existing.has_content and existing.chunk_count == 0:
                         existing.content = content  # nothing serving yet
@@ -1644,7 +1711,7 @@ class SqlKnowledgeStore(KnowledgeStore):
                         _claimable(now, max_attempts),
                     )
                     .values(
-                        status=DocumentStatus.PROCESSING.value,
+                        status=_CLAIMED_STATUS,
                         claimed_at=now,
                         lease_until=lease_until,
                         attempts=KnowledgeDocumentRow.attempts + 1,
@@ -1685,7 +1752,7 @@ class SqlKnowledgeStore(KnowledgeStore):
                     update(KnowledgeDocumentRow)
                     .where(KnowledgeDocumentRow.id.in_(candidate_ids))
                     .values(
-                        status=DocumentStatus.PROCESSING.value,
+                        status=_CLAIMED_STATUS,
                         claimed_at=now,
                         lease_until=lease_until,
                         attempts=KnowledgeDocumentRow.attempts + 1,
@@ -1725,6 +1792,11 @@ class SqlKnowledgeStore(KnowledgeStore):
             chunk_overlap_tokens=chunk_overlap,
             attempts=row.attempts,
             generation=row.ingest_generation,
+            phase="estimate" if row.status == DocumentStatus.ESTIMATING.value else "ingest",
+            estimate=public_estimate(row.ingest_estimate),
+            origin=(row.ingest_estimate or {}).get("origin"),
+            allow_duplicate=bool((row.ingest_estimate or {}).get("allow_duplicate")),
+            serving_sha256=row.serving_sha256,
         )
 
     async def mark_document_failed_terminal(
@@ -1744,7 +1816,7 @@ class SqlKnowledgeStore(KnowledgeStore):
                         .where(
                             KnowledgeDocumentRow.tenant_id == tenant_id,
                             KnowledgeDocumentRow.id == document_id,
-                            *_fence(generation),
+                            *_fence_in(generation, _WORKING_VALUES),
                         )
                         .values(
                             status=DocumentStatus.FAILED.value,
@@ -1831,7 +1903,20 @@ class SqlKnowledgeStore(KnowledgeStore):
             KnowledgeDocumentRow.kb_id == kb_id,
             KnowledgeDocumentRow.id.in_(ids),
         )
+        now = datetime.now(UTC)
         async with self._sf() as session:
+            # B-222 PR-2: nothing was spent yet — the estimate is withdrawn.
+            waiting = (
+                await session.execute(
+                    select(KnowledgeDocumentRow)
+                    .where(*in_base, KnowledgeDocumentRow.status.in_(_WAITING_VALUES))
+                    .order_by(KnowledgeDocumentRow.id)
+                    .with_for_update()
+                )
+            ).scalars()
+            withdrawn: dict[UUID, CancelOutcome] = {}
+            for row in list(waiting):
+                withdrawn[row.id] = await self._withdraw_row(session, row, now)
             cancelled = set(
                 (
                     await session.execute(
@@ -1851,6 +1936,13 @@ class SqlKnowledgeStore(KnowledgeStore):
                 .scalars()
                 .all()
             )
+            if cancelled:
+                await session.execute(
+                    delete(KnowledgeParseSnapshotRow).where(
+                        KnowledgeParseSnapshotRow.tenant_id == tenant_id,
+                        KnowledgeParseSnapshotRow.document_id.in_(sorted(cancelled)),
+                    )
+                )
             found = set(
                 (await session.execute(select(KnowledgeDocumentRow.id).where(*in_base)))
                 .scalars()
@@ -1859,7 +1951,9 @@ class SqlKnowledgeStore(KnowledgeStore):
             await session.commit()
         outcomes: dict[UUID, CancelOutcome] = {}
         for document_id in ids:
-            if document_id in cancelled:
+            if document_id in withdrawn:
+                outcomes[document_id] = withdrawn[document_id]
+            elif document_id in cancelled:
                 outcomes[document_id] = "cancelled"
             elif document_id in found:
                 outcomes[document_id] = "not_cancellable"
@@ -1874,7 +1968,7 @@ class SqlKnowledgeStore(KnowledgeStore):
                     await session.execute(
                         update(KnowledgeDocumentRow)
                         .where(
-                            KnowledgeDocumentRow.status == DocumentStatus.PROCESSING.value,
+                            KnowledgeDocumentRow.status.in_(_WORKING_VALUES),
                             KnowledgeDocumentRow.attempts >= max_attempts,
                             or_(
                                 KnowledgeDocumentRow.lease_until.is_(None),
@@ -1913,7 +2007,7 @@ class SqlKnowledgeStore(KnowledgeStore):
                 .where(
                     KnowledgeDocumentRow.tenant_id == tenant_id,
                     KnowledgeDocumentRow.id == document_id,
-                    *_fence(generation),
+                    *_fence_in(generation, _WORKING_VALUES),
                 )
                 .values(lease_until=now + timedelta(seconds=lease_seconds))
             )
@@ -2050,6 +2144,13 @@ class SqlKnowledgeStore(KnowledgeStore):
                 delete(KnowledgeChunkRevisionRow).where(
                     KnowledgeChunkRevisionRow.tenant_id == tenant_id,
                     KnowledgeChunkRevisionRow.document_id == document_id,
+                )
+            )
+            # B-222 PR-2 — the estimate's parse snapshot (the FK cascades too, 0179).
+            await session.execute(
+                delete(KnowledgeParseSnapshotRow).where(
+                    KnowledgeParseSnapshotRow.tenant_id == tenant_id,
+                    KnowledgeParseSnapshotRow.document_id == document_id,
                 )
             )
             await session.execute(
@@ -2598,7 +2699,9 @@ class SqlKnowledgeStore(KnowledgeStore):
                     .where(
                         KnowledgeDocumentRow.tenant_id == tenant_id,
                         KnowledgeDocumentRow.id == document_id,
-                        *_fence(generation, expect_status),
+                        *_fence_in(
+                            generation, {s.value for s in reindex_fence_statuses(expect_status)}
+                        ),
                     )
                     .with_for_update()
                 )

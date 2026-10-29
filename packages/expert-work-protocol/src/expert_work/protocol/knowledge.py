@@ -21,6 +21,8 @@ from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+from expert_work.protocol.knowledge_estimate import IngestActual, IngestEstimate
+
 #: Default per-base chunking parameters (token-counted). A base may
 #: override them at creation to tune chunk granularity to its content.
 #: B-206 K-3: 512 / 64 → 400 / 0 — chunks of 200~400 tokens are the measured
@@ -55,6 +57,13 @@ class DocumentStatus(StrEnum):
     #: Never claimed again; whatever version was serving before keeps serving.
     #: A re-upload or re-ingest queues the document as usual.
     CANCELLED = "cancelled"
+    #: B-222 PR-2 —— being estimated: parsed and counted locally, no model called
+    #: (claimed like ``pending``, but only ever for the free estimate).
+    ESTIMATING = "estimating"
+    #: B-222 PR-2 —— estimated; waits (at most 7 days) for the user to confirm
+    #: before anything is spent. Never claimed. The version serving before, if
+    #: any, keeps serving.
+    AWAITING_CONFIRMATION = "awaiting_confirmation"
     #: Reserved for B-179 content safety (L2-PR2 only declares them; nothing
     #: writes these yet): ``blocked`` = rejected by a safety check, ``disabled``
     #: = kept but excluded from retrieval by an operator.
@@ -476,6 +485,12 @@ class KnowledgeDocument(BaseModel):
     #: differs from the base's current hash, or ``None`` (chunked before it was
     #: recorded), is an old version to re-ingest.
     chunk_params_hash: str | None = None
+    #: B-222 PR-2 —— the latest estimate (``None``: never estimated, or still
+    #: being estimated), the spend of the latest paid ingest, and until when an
+    #: estimate waiting for confirmation is kept (then withdrawn).
+    ingest_estimate: IngestEstimate | None = None
+    ingest_actual: IngestActual | None = None
+    confirm_by: datetime | None = None
     size_bytes: int | None = Field(
         default=None, ge=0, description="size of the serving version's original file"
     )
