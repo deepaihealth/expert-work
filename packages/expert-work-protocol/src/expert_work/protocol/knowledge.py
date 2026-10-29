@@ -107,6 +107,9 @@ class IngestErrorCode(StrEnum):
     CONTENT_MISSING = "content_missing"
     #: Crash recovery used up its retry budget.
     ATTEMPTS_EXHAUSTED = "attempts_exhausted"
+    #: B-222 —— the check that a confirmed ingest still runs on the models the
+    #: user confirmed could not run, on every attempt.
+    MODELS_CHECK_FAILED = "models_check_failed"
     INTERNAL_ERROR = "internal_error"
 
 

@@ -87,9 +87,10 @@ export interface PassagePatch {
 
 export type DocumentBatchAction = "enable" | "disable" | "reingest";
 
-/** Why a batch left a document out: not this base's (or gone), or its file
- *  was not kept (re-upload it). */
-export type BatchSkipReason = "not_found" | "content_missing";
+/** Why a batch left a document out: not this base's (or gone), its file
+ *  was not kept (re-upload it), or (B-222) its new version is being written
+ *  (try again once it is ready). */
+export type BatchSkipReason = "not_found" | "content_missing" | "busy";
 
 export interface BatchSkip {
   id: string;

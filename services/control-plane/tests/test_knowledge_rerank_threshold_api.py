@@ -25,6 +25,7 @@ from tests.auth_fixtures import (
     build_test_jwt_verifier,
     make_test_jwt,
 )
+from tests.knowledge_confirm import settle
 
 _VL = ("qwen", "qwen3-vl-rerank")
 _TEXT = ("qwen", "qwen3-rerank")
@@ -211,7 +212,7 @@ async def test_an_off_catalog_dashscope_rerank_model_is_the_current_model(setup:
         "/v1/knowledge/bases/kb/documents",
         files={"file": ("h.md", b"# H\n\nThe deductible is 500 dollars.", "text/markdown")},
     )
-    await runner.drain()
+    await settle(client, runner)
     config.rerank = ("qwen", "gte-rerank")
     retrieval = await _config(client)
     assert (retrieval["rerank_threshold_paused"], retrieval["current_rerank_model"]) == (
@@ -316,7 +317,7 @@ async def test_the_retrieval_test_reports_a_threshold_left_out(setup: Setup) -> 
         "/v1/knowledge/bases/kb/documents",
         files={"file": ("h.md", b"# H\n\nThe deductible is 500 dollars.", "text/markdown")},
     )
-    await runner.drain()
+    await settle(client, runner)
     in_force = (await client.post("/v1/knowledge/bases/kb/test", json={"query": "x"})).json()
     config.rerank = _TEXT
     left_out = (await client.post("/v1/knowledge/bases/kb/test", json={"query": "x"})).json()

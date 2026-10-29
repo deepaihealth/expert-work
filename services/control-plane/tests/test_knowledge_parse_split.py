@@ -28,6 +28,8 @@ from control_plane.knowledge.ingestion import (
 from control_plane.knowledge.parse_snapshot import decode_snapshot, encode_snapshot
 from control_plane.knowledge.recognition import ingest_parse
 from control_plane.knowledge.recognition.clients import Reading
+from control_plane.knowledge.recognition.figure_extract import FigureExtraction
+from control_plane.knowledge.recognition.figure_filters import FigureCandidate
 from control_plane.knowledge.recognition.figure_pipeline import FigureDescriber
 from control_plane.knowledge.recognition.ingest_parse import LocalParse
 from control_plane.knowledge.recognition.recognizer import (
@@ -278,6 +280,44 @@ def test_a_snapshot_too_large_or_unreadable_is_no_snapshot(monkeypatch: pytest.M
     assert decode_snapshot(ParseSnapshot(format=snapshot.format, payload=b"not gzip")) is None
     monkeypatch.setattr(parse_snapshot, "SNAPSHOT_MAX_BYTES", len(snapshot.payload) - 1)
     assert encode_snapshot(local) is None
+
+
+def test_images_past_the_cap_are_refused_before_anything_is_compressed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """B2a review: 75 figures of ~800 KB took 3.4 s to compress only to be
+    thrown away — the images alone already decide it."""
+    image = b"\x89PNG" + bytes(2_000)
+    extraction = FigureExtraction(
+        candidates=(
+            FigureCandidate(number=1, image=image, width=10, height=10, pixel_hash="p", pages=(1,)),
+        ),
+        extracted=1,
+        filtered=0,
+        unsupported=0,
+        capped=0,
+    )
+    local = LocalParse(kind="office", figures_on=True, markdown="x", office_figures=extraction)
+    monkeypatch.setattr(parse_snapshot, "SNAPSHOT_MAX_BYTES", len(image) - 1)
+
+    def no_compress(*args: object, **kwargs: object) -> bytes:
+        raise AssertionError("compressed")
+
+    monkeypatch.setattr(parse_snapshot.gzip, "compress", no_compress)
+    assert encode_snapshot(local) is None
+
+
+def test_a_snapshot_is_not_read_past_its_decoded_cap(monkeypatch: pytest.MonkeyPatch) -> None:
+    local = LocalParse(kind="text", figures_on=False, markdown="y" * 100_000)
+    snapshot = encode_snapshot(local)
+    assert snapshot is not None and len(snapshot.payload) < 10_000  # compresses well
+    assert decode_snapshot(snapshot) == local
+    monkeypatch.setattr(parse_snapshot, "SNAPSHOT_MAX_DECODED_BYTES", 50_000)
+    assert decode_snapshot(snapshot) is None
+    monkeypatch.undo()
+    # Its checksum trailer cut off: the text is all there, but unverified.
+    truncated = ParseSnapshot(format=snapshot.format, payload=snapshot.payload[:-4])
+    assert decode_snapshot(truncated) is None
 
 
 def test_a_lone_surrogate_survives_the_snapshot() -> None:

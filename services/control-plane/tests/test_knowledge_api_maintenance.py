@@ -35,6 +35,7 @@ from expert_work.protocol import AuditQuery, DocumentStatus
 from orchestrator.llm import FakeEmbedder
 from orchestrator.tools import KnowledgeRetriever
 from tests.auth_fixtures import TEST_AUDIENCE, TEST_ISSUER, build_test_jwt_verifier, make_test_jwt
+from tests.knowledge_confirm import settle
 
 _TENANT = DEFAULT_DEV_TENANT_ID
 
@@ -57,7 +58,7 @@ class Harness:
             files={"file": (name, text.encode(), "text/markdown")},
         )
         assert response.status_code == 202, response.text
-        await self.runner.drain()
+        await settle(self.client, self.runner, base)
         return str(response.json()["id"])
 
     async def documents(self, **params: Any) -> list[dict[str, Any]]:
@@ -226,8 +227,14 @@ async def test_batch_reingest_skips_documents_without_their_file(harness: Harnes
     assert response.json()["done"] == [a]
     assert response.json()["skipped"] == [{"id": str(legacy.id), "reason": "content_missing"}]
     await harness.runner.drain()
+    # B-222 PR-2: estimated, it waits for a confirmation (still serving).
     document = await harness.store.get_document(tenant_id=_TENANT, document_id=UUID(a))
-    assert document is not None and document.ingest_generation == 1
+    assert document is not None and document.ingest_estimate is not None
+    assert (document.status, document.ingest_estimate.origin, document.chunk_count) == (
+        DocumentStatus.AWAITING_CONFIRMATION,
+        "batch_reingest",
+        1,
+    )
     rows = [r for r in await harness.audit_rows() if r[0] == "knowledge:document_reingest"]
     assert [(r[2], r[3]["filename"], r[3]["batch"]) for r in rows] == [(a, "a.md", True)]
 
@@ -307,6 +314,13 @@ async def test_stale_documents_are_counted_and_reingested(harness: Harness) -> N
         "remaining": 0,
     }
     await harness.runner.drain()
+    # B-222 PR-2: each waits for the user to confirm its estimate first.
+    waiting = {d["id"]: d for d in await harness.documents(status="awaiting_confirmation")}
+    assert {i: waiting[i]["ingest_estimate"]["origin"] for i in waiting} == {
+        a: "reingest_stale",
+        b: "reingest_stale",
+    }
+    await settle(harness.client, harness.runner)
     stale = await harness.client.get("/v1/knowledge/bases/kb/stale-documents")
     assert stale.json()["stale"] == 1
     rows = [r for r in await harness.audit_rows() if r[0] == "knowledge:base_reingest"]
@@ -327,7 +341,7 @@ async def test_reingest_stale_works_through_at_most_a_cap_per_call(
 
     first = await harness.client.post("/v1/knowledge/bases/kb/reingest-stale")
     assert first.json() == {"queued": [b], "skipped": [], "remaining": 1}
-    await harness.runner.drain()
+    await settle(harness.client, harness.runner)
     second = await harness.client.post("/v1/knowledge/bases/kb/reingest-stale")
     assert second.json() == {"queued": [a], "skipped": [], "remaining": 0}
 

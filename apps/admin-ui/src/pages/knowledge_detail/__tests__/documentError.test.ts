@@ -40,6 +40,20 @@ describe("documentErrorText", () => {
     );
   });
 
+  it("explains a models check that kept failing, in the console's language (B-222)", async () => {
+    const recorded = "document 0b7f…: its models could not be checked";
+    await i18n.changeLanguage("zh-CN");
+    const zh = documentErrorText(i18n.t, "zh-CN", {
+      error: recorded,
+      error_code: "models_check_failed",
+    });
+    expect(zh).toMatch(/^无法确认本次入库仍使用已确认的模型/);
+    await i18n.changeLanguage("en");
+    const en = documentErrorText(i18n.t, "en", { error: recorded, error_code: "models_check_failed" });
+    expect(en).toMatch(/^Could not check that the models confirmed/);
+    expect(en).not.toContain("0b7f");
+  });
+
   it("still asks to split when the numbers cannot be read", async () => {
     await i18n.changeLanguage("en");
     expect(

@@ -15,7 +15,7 @@ from __future__ import annotations
 import gc
 import re
 import tracemalloc
-from collections.abc import AsyncIterator, Awaitable, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
 from datetime import UTC, datetime
 from functools import partial
 from pathlib import Path
@@ -63,7 +63,21 @@ _UUID = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12
 #: Differ between runs (or, for the vector / keyword scores, between Postgres's
 #: float4 and Python's float8 arithmetic; ``elapsed_ms`` is wall-clock).
 _VOLATILE = frozenset(
-    {"created_at", "updated_at", "score", "vector_score", "keyword_score", "elapsed_ms"}
+    {
+        "created_at",
+        "updated_at",
+        "score",
+        "vector_score",
+        "keyword_score",
+        "elapsed_ms",
+        # B-222 PR-2 —— estimate / confirmation / actual-cost times.
+        "confirm_by",
+        "earliest_confirm_by",
+        "confirmed_at",
+        "finished_at",
+        # A hash of the waiting documents' (run-specific) ids.
+        "fingerprint",
+    }
 )
 
 
@@ -149,8 +163,22 @@ async def _walk(store: KnowledgeStore) -> list[tuple[str, int, Any]]:
             return {"files": {"file": ("h.md", body, "text/markdown")}}
 
         docs = "/v1/knowledge/bases/kb/documents"
+
+        async def confirm(step: str) -> Any:
+            """B-222 PR-2: 「全部确认」 with what the list reports."""
+            summary = (await call(f"{step} (summary)", "GET", docs))["estimate_summary"]
+            expected = {
+                "all": True,
+                "expected_count": summary["awaiting"],
+                "expected_total_micros": summary["total_micros"],
+                "expected_fingerprint": summary["fingerprint"],
+            }
+            return await call(step, "POST", f"{docs}/confirm", json=expected)
+
         await call("create base", "POST", "/v1/knowledge/bases", json={"name": "kb"})
         doc = (await call("upload v1", "POST", docs, **upload(_MD)))["id"]
+        await call("list awaiting", "GET", docs)
+        await confirm("confirm v1")
         await call("list", "GET", docs)
         await call("upload same", "POST", docs, **upload(_MD))
         await call("upload bad v2", "POST", docs, **upload(b"   "))
@@ -162,9 +190,16 @@ async def _walk(store: KnowledgeStore) -> list[tuple[str, int, Any]]:
         await call("discard", "POST", f"{docs}/{doc}/discard-pending")
         await call("discard again", "POST", f"{docs}/{doc}/discard-pending")
         await call("reingest serving", "POST", f"{docs}/{doc}/reingest")
+        await confirm("confirm reingest")
         await call("list after reingest", "GET", docs)
         await call("upload good v2", "POST", docs, **upload(_MD + b"\n\nMore."))
+        await confirm("confirm v2")
         await call("list after v2", "GET", docs)
+        copy = await call(
+            "upload a copy", "POST", docs, files={"file": ("copy.md", _MD + b"\n\nMore.")}
+        )
+        withdraw = {"document_ids": [copy["id"]]}
+        await call("withdraw the copy", "POST", f"{docs}/cancel", json=withdraw)
         search = {"query": "deductible", "rerank": False}
         await call("search", "POST", "/v1/knowledge/bases/kb/test", json=search)
     return steps
@@ -176,12 +211,25 @@ async def test_document_responses_match_the_in_memory_store(
     on_sql = await _walk(sql_store)
     assert on_sql == await _walk(InMemoryKnowledgeStore())
     by_step = {step: (status, body) for step, status, body in on_sql}
+    (awaiting,) = by_step["list awaiting"][1]["documents"]
+    assert (awaiting["status"], awaiting["ingest_estimate"]["origin"]) == (
+        "awaiting_confirmation",
+        "upload",
+    )
+    assert by_step["confirm v1"][1]["confirmed"] == ["<uuid>"]
     pending = by_step["list pending"][1]["documents"][0]
     assert (pending["status"], pending["has_pending"]) == ("failed", True)
     assert by_step["discard"][1]["has_pending"] is False
     assert by_step["discard again"][0] == 409
     assert by_step["list after v2"][1]["documents"][0]["size_bytes"] == len(_MD + b"\n\nMore.")
     assert [hit["filename"] for hit in by_step["search"][1]["results"]] == ["h.md"]
+    # K-21 ①: the same bytes under another name wait as a duplicate, unparsed.
+    copy = by_step["upload a copy"][1]
+    assert (copy["status"], copy["ingest_estimate"]["estimated"]) == (
+        "awaiting_confirmation",
+        False,
+    )
+    assert by_step["withdraw the copy"][1]["results"][0]["outcome"] == "withdrawn_deleted"
 
 
 # -- a reingest / recognize click leaves the bytes in Postgres ---------------
@@ -199,6 +247,9 @@ class _RecordingRunner:
 
     def submit(self, *, tenant_id: UUID, document_id: UUID) -> None:
         self.queued.append(document_id)
+
+    def cancel_local(self, document_ids: Sequence[UUID]) -> int:
+        return 0
 
 
 async def _peak(operation: Callable[[], Awaitable[Any]]) -> tuple[int, Any]:
@@ -223,8 +274,8 @@ async def test_reingest_and_recognize_clicks_do_not_read_the_upload(
         tenant_id=tenant, kb_id=kb_id, filename="scan.pdf", content=upload, content_sha256="s"
     )
 
-    async def ingest() -> int:
-        """What the queued ingest does first: claim, which carries the bytes."""
+    async def claimed(phase: str) -> int:
+        """What the queued work does first: claim, which carries the bytes."""
         peak, claim = await _peak(
             lambda: sql_store.claim_document(
                 tenant_id=tenant,
@@ -234,7 +285,14 @@ async def test_reingest_and_recognize_clicks_do_not_read_the_upload(
                 max_attempts=5,
             )
         )
-        assert claim is not None and claim.content == upload
+        assert claim is not None and (claim.phase, claim.content) == (phase, upload)
+        return peak
+
+    async def ingest() -> int:
+        peak = await claimed("ingest")
+        current = await sql_store.get_document(tenant_id=tenant, document_id=document.id)
+        assert current is not None
+        generation = current.ingest_generation
         failed_page = DocumentPage(
             page=1,
             decision=PageDecision.OCR,
@@ -247,14 +305,14 @@ async def test_reingest_and_recognize_clicks_do_not_read_the_upload(
             tenant_id=tenant,
             document_id=document.id,
             pages=[failed_page],
-            generation=claim.generation,
+            generation=generation,
         )
         assert await sql_store.set_document_status(
             tenant_id=tenant,
             document_id=document.id,
             status=DocumentStatus.READY,
             chunk_count=0,
-            generation=claim.generation,
+            generation=generation,
         )
         return peak
 
@@ -268,5 +326,13 @@ async def test_reingest_and_recognize_clicks_do_not_read_the_upload(
             assert response.status_code == 202, (action, response.text)
             assert peak < _UPLOAD // 4, (action, peak)
             assert runner.queued[-1] == document.id
-            # The ingest the click queued still gets the bytes.
-            assert await ingest() >= _UPLOAD, action
+            # The estimate the click queued (B-222 PR-2) still gets the bytes.
+            assert await claimed("estimate") >= _UPLOAD, action
+            # Withdrawn, the document is back as it was: ready, its page failed.
+            withdrawn = await client.post(
+                "/v1/knowledge/bases/kb/documents/cancel",
+                json={"document_ids": [str(document.id)]},
+            )
+            assert withdrawn.json()["results"] == [
+                {"document_id": str(document.id), "outcome": "withdrawn"}
+            ], action

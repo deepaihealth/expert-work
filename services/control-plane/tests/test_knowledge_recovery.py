@@ -151,6 +151,7 @@ class _ConcurrentDeleteStore(_RecordingStore):
         expect_status: DocumentStatus = DocumentStatus.PROCESSING,
         chunk_params_hash: str | None = None,
         switch_offs: Collection[SwitchOffRecord] = (),
+        ready_chunk_count: int | None = None,
     ) -> bool:
         await self.delete_document(tenant_id=tenant_id, document_id=document_id)
         raise KeyError(document_id)
@@ -169,6 +170,7 @@ class _FailingReplaceStore(_RecordingStore):
         expect_status: DocumentStatus = DocumentStatus.PROCESSING,
         chunk_params_hash: str | None = None,
         switch_offs: Collection[SwitchOffRecord] = (),
+        ready_chunk_count: int | None = None,
     ) -> bool:
         raise RuntimeError("replace_chunks exploded")
 
@@ -379,6 +381,7 @@ class _ContextRecordingStore(InMemoryKnowledgeStore):
         expect_status: DocumentStatus = DocumentStatus.PROCESSING,
         chunk_params_hash: str | None = None,
         switch_offs: Collection[SwitchOffRecord] = (),
+        ready_chunk_count: int | None = None,
     ) -> bool:
         self.seen.append((tenant_id, current_tenant_id_var.get(), bypass_rls_var.get()))
         return await super().replace_chunks(
@@ -389,6 +392,7 @@ class _ContextRecordingStore(InMemoryKnowledgeStore):
             expect_status=expect_status,
             chunk_params_hash=chunk_params_hash,
             switch_offs=switch_offs,
+            ready_chunk_count=ready_chunk_count,
         )
 
 

@@ -549,7 +549,7 @@ async def test_a_failed_ingest_drops_only_what_it_stored(path: str) -> None:
 
 
 class _ReadyWriteFails(InMemoryKnowledgeStore):
-    """The READY write fails (a database blip) after the chunks are written."""
+    """A separate READY write would fail (a database blip)."""
 
     async def set_document_status(self, **kwargs: Any) -> bool:
         if kwargs.get("status") is DocumentStatus.READY:
@@ -558,9 +558,10 @@ class _ReadyWriteFails(InMemoryKnowledgeStore):
 
 
 @pytest.mark.parametrize("path", ["runner", "recovery"])
-async def test_originals_of_written_chunks_stay_when_the_ready_write_fails(path: str) -> None:
-    # Re-review L1: the document ends FAILED, but this claim's chunks are the
-    # ones served — and they name this generation's originals.
+async def test_the_chunk_swap_lands_ready_with_its_originals(path: str) -> None:
+    # B2b review: the swap and READY are one write — there is no READY write
+    # left to fail after the chunks are in place (re-review L1's case cannot
+    # happen). The served chunks name this generation's originals.
     store = _ReadyWriteFails()
     tenant = uuid4()
     base = await store.create_base(tenant_id=tenant, name="kb")
@@ -572,7 +573,8 @@ async def test_originals_of_written_chunks_stay_when_the_ready_write_fails(path:
     pipeline = _pipeline(store)
     await _drive(doc, pipeline, path, FakeEmbedder())
     fetched = await store.get_document(tenant_id=tenant, document_id=document.id)
-    assert fetched is not None and fetched.status is DocumentStatus.FAILED
+    assert fetched is not None and fetched.status is DocumentStatus.READY
+    assert fetched.chunk_count > 0
     assert await _generations(pipeline) == {"g0"}
 
 

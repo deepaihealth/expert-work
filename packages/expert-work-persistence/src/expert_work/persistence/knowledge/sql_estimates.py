@@ -19,33 +19,45 @@ from sqlalchemy.dialects.postgresql import ARRAY
 from sqlalchemy.dialects.postgresql import UUID as PG_UUID
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+from sqlalchemy.sql.elements import ColumnElement
 
 from expert_work.persistence.knowledge.base import DocumentFileFacts
 from expert_work.persistence.knowledge.estimates import (
     WAITING_STATUSES,
     ConfirmAllResult,
     ConfirmOutcome,
+    EstimateRefused,
     EstimateSummary,
     ExpiredEstimate,
     ParseSnapshot,
     UploadStart,
     WithdrawOutcome,
+    WithdrawPlan,
     actual_lands,
     begin_meta,
     capture_restore,
     checks_duplicates,
     confirm_outcome,
     confirmed,
+    discard_plan,
     duplicate_estimate,
     duplicate_ref,
+    duplicate_ref_id,
     estimate_id_of,
+    estimate_refusal,
     is_duplicate,
     is_estimated,
+    is_expired,
+    kept_deadline,
     merge_actual,
     meta_of,
+    released_duplicate,
     summarize,
+    summary_matches,
     with_estimate,
     withdraw_plan,
+    withdraws_with_confirm_all,
+    writing_chunks,
 )
 from expert_work.persistence.models import (
     KnowledgeChunkRow,
@@ -66,9 +78,17 @@ from expert_work.protocol.knowledge_estimate import (
 )
 
 _WAITING_VALUES = tuple(sorted(status.value for status in WAITING_STATUSES))
+#: Re-sending these bytes changes nothing (a confirmed ingest is not restarted).
+_UNDER_WAY_VALUES = (
+    *_WAITING_VALUES,
+    DocumentStatus.PENDING.value,
+    DocumentStatus.PROCESSING.value,
+)
 _SEARCHABLE_VALUES = tuple(sorted(chunk_type.value for chunk_type in SEARCHABLE_CHUNK_TYPES))
 #: Hashes per ``chunk_hashes_on_model`` query.
 _HASH_READ_BATCH: Final = 5_000
+#: Duplicates locked (and originals read) per ``release_stale_duplicates`` batch.
+_RELEASE_BATCH: Final = 500
 
 
 def _estimated_sha(row: KnowledgeDocumentRow) -> str | None:
@@ -193,11 +213,25 @@ class SqlEstimates:
             )
         )
 
-    @staticmethod
+    @classmethod
     async def _withdraw_row(
-        session: AsyncSession, row: KnowledgeDocumentRow, now: datetime
+        cls, session: AsyncSession, row: KnowledgeDocumentRow, now: datetime
     ) -> WithdrawOutcome:
         plan = withdraw_plan(row.ingest_estimate, chunk_count=row.chunk_count)
+        return await cls._apply_row(session, row, plan, now)
+
+    @classmethod
+    async def discard_waiting_row(
+        cls, session: AsyncSession, row: KnowledgeDocumentRow, now: datetime
+    ) -> None:
+        """``discard_pending`` of a waiting document (:func:`discard_plan`)."""
+        plan = discard_plan(row.ingest_estimate, chunk_count=row.chunk_count)
+        await cls._apply_row(session, row, plan, now)
+
+    @staticmethod
+    async def _apply_row(
+        session: AsyncSession, row: KnowledgeDocumentRow, plan: WithdrawPlan, now: datetime
+    ) -> WithdrawOutcome:
         await _drop_snapshot(session, row.tenant_id, row.id)
         if plan.delete:
             # Nothing of it was ever ingested; the FKs take whatever hangs off it.
@@ -280,13 +314,18 @@ class SqlEstimates:
                     existing.status == DocumentStatus.READY.value
                     and existing.content_sha256 == content_sha256
                 )
-                waiting_same = (
-                    existing.status in _WAITING_VALUES
+                under_way_same = (
+                    existing.status in _UNDER_WAY_VALUES
                     and _estimated_sha(existing) == content_sha256
+                    # Past its deadline it is about to be withdrawn: estimate again.
+                    and not is_expired(existing.confirm_by, now)
                 )
-                if ready_same or waiting_same:
+                if ready_same or under_way_same:
                     await session.commit()
                     return UploadStart(self._document_of(existing), "unchanged")
+                if writing_chunks(existing.status, existing.stage):
+                    await session.commit()
+                    return UploadStart(self._document_of(existing), "busy")
                 row = existing
                 meta = begin_meta(
                     status=row.status,
@@ -295,13 +334,10 @@ class SqlEstimates:
                     allow_duplicate=False,
                     restore=_restore_of(row),
                 )
-                if not row.has_content and row.chunk_count == 0:
-                    row.content = content  # nothing serving yet
-                    row.content_sha256 = content_sha256
-                    row.size_bytes = len(content)
-                else:
-                    row.pending_content = content
-                    row.pending_content_sha256 = content_sha256
+                # Into the pending slot even when nothing serves: withdrawn, it
+                # goes with the slot; ingested, it is promoted (READY).
+                row.pending_content = content
+                row.pending_content_sha256 = content_sha256
                 if row.doc_seq is None:
                     row.doc_seq = await self._next_doc_seq(session, tenant_id)
                 row.error = None
@@ -373,12 +409,24 @@ class SqlEstimates:
         document_id: UUID,
         origin: EstimateOrigin,
         allow_duplicate: bool = False,
+        expect_status: DocumentStatus | None = None,
+        expect_estimate_id: UUID | None = None,
     ) -> KnowledgeDocument | None:
         async with self._sf() as session:
             row = await self._lock(session, tenant_id, document_id)
             if row is None:
                 await session.commit()
                 return None
+            refused = estimate_refusal(
+                status=row.status,
+                stage=row.stage,
+                raw=row.ingest_estimate,
+                expect_status=expect_status,
+                expect_estimate_id=expect_estimate_id,
+            )
+            if refused is not None:
+                await session.commit()
+                raise EstimateRefused(refused)
             meta = begin_meta(
                 status=row.status,
                 raw=row.ingest_estimate,
@@ -411,6 +459,7 @@ class SqlEstimates:
         estimate: Mapping[str, Any],
         snapshot: ParseSnapshot | None,
         confirm_by: datetime,
+        now: datetime | None = None,
     ) -> KnowledgeDocument | None:
         async with self._sf() as session:
             row = await self._lock(session, tenant_id, document_id)
@@ -421,6 +470,9 @@ class SqlEstimates:
             ):
                 await session.commit()
                 return None
+            confirm_by = kept_deadline(
+                row.ingest_estimate, confirm_by, now=now or datetime.now(UTC)
+            )
             meta = meta_of(row.ingest_estimate)
             raw = with_estimate(meta, estimate)
             if checks_duplicates(meta):
@@ -482,7 +534,11 @@ class SqlEstimates:
                     outcomes[document_id] = "not_found"
                     continue
                 refused = confirm_outcome(
-                    status=row.status, raw=row.ingest_estimate, estimate_id=estimate_id
+                    status=row.status,
+                    raw=row.ingest_estimate,
+                    estimate_id=estimate_id,
+                    confirm_by=row.confirm_by,
+                    now=now,
                 )
                 if refused is not None:
                     outcomes[document_id] = refused
@@ -500,10 +556,12 @@ class SqlEstimates:
         kb_id: UUID,
         expected_count: int,
         expected_total_micros: int,
+        expected_fingerprint: str,
         confirmed_by: str | None,
         now: datetime,
-        withdraw_duplicates: bool,
+        withdraw_duplicates: Sequence[UUID] = (),
     ) -> ConfirmAllResult:
+        seen = frozenset(withdraw_duplicates)
         async with self._sf() as session:
             rows = list(
                 (
@@ -519,17 +577,29 @@ class SqlEstimates:
                     )
                 ).scalars()
             )
-            summary = summarize((row.status, row.ingest_estimate, row.confirm_by) for row in rows)
-            if summary.awaiting != expected_count or summary.total_micros != expected_total_micros:
+            summary = summarize(
+                ((row.id, row.status, row.ingest_estimate, row.confirm_by) for row in rows),
+                now=now,
+            )
+            if not summary_matches(
+                summary,
+                count=expected_count,
+                total_micros=expected_total_micros,
+                fingerprint=expected_fingerprint,
+            ):
                 await session.commit()
                 return ConfirmAllResult(matched=False, summary=summary)
             confirmed_ids: list[UUID] = []
+            skipped: list[UUID] = []
             withdrawn: dict[UUID, WithdrawOutcome] = {}
             for row in rows:
                 if row.status != DocumentStatus.AWAITING_CONFIRMATION.value:
                     continue
+                if is_expired(row.confirm_by, now):
+                    skipped.append(row.id)  # the expiry sweep withdraws it
+                    continue
                 if is_duplicate(row.ingest_estimate) or not is_estimated(row.ingest_estimate):
-                    if withdraw_duplicates:
+                    if withdraws_with_confirm_all(row.id, row.ingest_estimate, seen):
                         withdrawn[row.id] = await self._withdraw_row(session, row, now)
                     continue
                 self._confirm_row(row, confirmed_by, now)
@@ -537,7 +607,11 @@ class SqlEstimates:
                 confirmed_ids.append(row.id)
             await session.commit()
         return ConfirmAllResult(
-            matched=True, summary=summary, confirmed=tuple(confirmed_ids), withdrawn=withdrawn
+            matched=True,
+            summary=summary,
+            confirmed=tuple(confirmed_ids),
+            withdrawn=withdrawn,
+            skipped=tuple(skipped),
         )
 
     async def return_to_confirmation(
@@ -556,6 +630,7 @@ class SqlEstimates:
                 row is None
                 or row.status != DocumentStatus.PROCESSING.value
                 or row.ingest_generation != generation
+                or writing_chunks(row.status, row.stage)
             ):
                 await session.commit()
                 return False
@@ -664,11 +739,14 @@ class SqlEstimates:
             await session.commit()
         return True
 
-    async def estimate_summary(self, *, tenant_id: UUID, kb_id: UUID) -> EstimateSummary:
+    async def estimate_summary(
+        self, *, tenant_id: UUID, kb_id: UUID, now: datetime | None = None
+    ) -> EstimateSummary:
         async with self._sf() as session:
             rows = (
                 await session.execute(
                     select(
+                        KnowledgeDocumentRow.id,
                         KnowledgeDocumentRow.status,
                         KnowledgeDocumentRow.ingest_estimate,
                         KnowledgeDocumentRow.confirm_by,
@@ -679,7 +757,108 @@ class SqlEstimates:
                     )
                 )
             ).all()
-        return summarize((row.status, row.ingest_estimate, row.confirm_by) for row in rows)
+        return summarize(
+            ((row.id, row.status, row.ingest_estimate, row.confirm_by) for row in rows),
+            now=now or datetime.now(UTC),
+        )
+
+    async def release_stale_duplicates(
+        self,
+        *,
+        tenant_id: UUID | None = None,
+        kb_id: UUID | None = None,
+        now: datetime | None = None,
+    ) -> list[KnowledgeDocument]:
+        now = now or datetime.now(UTC)
+        where = [
+            KnowledgeDocumentRow.status == DocumentStatus.AWAITING_CONFIRMATION.value,
+            KnowledgeDocumentRow.ingest_estimate["duplicate_of"].is_not(None),
+            func.jsonb_typeof(KnowledgeDocumentRow.ingest_estimate["duplicate_of"]) == "object",
+            # Past its deadline: the expiry sweep withdraws it.
+            or_(
+                KnowledgeDocumentRow.confirm_by.is_(None),
+                KnowledgeDocumentRow.confirm_by > now,
+            ),
+        ]
+        if tenant_id is not None:
+            where.append(KnowledgeDocumentRow.tenant_id == tenant_id)
+        if kb_id is not None:
+            where.append(KnowledgeDocumentRow.kb_id == kb_id)
+        released: list[KnowledgeDocument] = []
+        after: UUID | None = None
+        while True:  # one transaction per batch: bounded locks and binds
+            batch = [*where, KnowledgeDocumentRow.id > after] if after is not None else where
+            scanned, changed = await self._release_batch(batch)
+            released.extend(changed)
+            if len(scanned) < _RELEASE_BATCH:
+                return released
+            after = scanned[-1]
+
+    async def _release_batch(
+        self, where: Sequence[ColumnElement[bool]]
+    ) -> tuple[list[UUID], list[KnowledgeDocument]]:
+        """One batch of :meth:`release_stale_duplicates`: the ids scanned (in
+        order) and the documents released."""
+        released: list[KnowledgeDocumentRow] = []
+        async with self._sf() as session:
+            rows = list(
+                (
+                    await session.execute(
+                        select(KnowledgeDocumentRow)
+                        .where(*where)
+                        .order_by(KnowledgeDocumentRow.id)
+                        .limit(_RELEASE_BATCH)
+                        .with_for_update(skip_locked=True)
+                    )
+                ).scalars()
+            )
+            scanned = [row.id for row in rows]
+            wanted = {
+                original_id
+                for row in rows
+                if (original_id := duplicate_ref_id(row.ingest_estimate)) is not None
+            }
+            holders = {}
+            if wanted:
+                found_rows = await session.execute(
+                    select(
+                        KnowledgeDocumentRow.id,
+                        KnowledgeDocumentRow.tenant_id,
+                        KnowledgeDocumentRow.kb_id,
+                        KnowledgeDocumentRow.content_sha256,
+                        KnowledgeDocumentRow.pending_content_sha256,
+                    ).where(KnowledgeDocumentRow.id.in_(sorted(wanted)))
+                )
+                holders = {found.id: found for found in found_rows.all()}
+            for row in rows:
+                original_id = duplicate_ref_id(row.ingest_estimate)
+                original = holders.get(original_id) if original_id is not None else None
+                sha = _estimated_sha(row)
+                if (
+                    original is not None
+                    and original.tenant_id == row.tenant_id
+                    and original.kb_id == row.kb_id
+                    and sha is not None
+                    and sha in (original.content_sha256, original.pending_content_sha256)
+                ):
+                    continue
+                status, kept = released_duplicate(
+                    row.ingest_estimate or {}, confirm_by=row.confirm_by
+                )
+                row.status = status.value
+                row.ingest_estimate = kept
+                row.updated_at = datetime.now(UTC)
+                if status is DocumentStatus.ESTIMATING:
+                    row.ingest_generation = row.ingest_generation + 1
+                    row.attempts = 0
+                    row.confirm_by = None
+                    row.claimed_at = None
+                    row.lease_until = None
+                released.append(row)
+            await session.commit()
+            for row in released:
+                await session.refresh(row)
+            return scanned, [self._document_of(row) for row in released]
 
     async def chunk_hashes_on_model(
         self,

@@ -17,6 +17,7 @@ from expert_work.persistence.audit_log import InMemoryAuditLogStore
 from expert_work.protocol import AuditQuery
 from orchestrator.llm import FakeEmbedder
 from tests.auth_fixtures import TEST_AUDIENCE, TEST_ISSUER, build_test_jwt_verifier, make_test_jwt
+from tests.knowledge_confirm import settle
 
 _TENANT = DEFAULT_DEV_TENANT_ID
 _MD = b"# Handbook\n\nThe deductible is 500 dollars per year."
@@ -64,7 +65,7 @@ class Harness:
             f"/v1/knowledge/bases/{base}/documents", files={"file": (name, body, "text/markdown")}
         )
         assert response.status_code in (200, 202), response.text
-        await self.runner.drain()
+        await settle(self.client, self.runner, base)
         data: dict[str, object] = response.json()
         data["_status"] = response.status_code
         return data
@@ -150,6 +151,8 @@ async def test_reupload_same_content_is_200_unchanged(harness: Harness) -> None:
     ready = await harness.client.get("/v1/knowledge/bases/kb/documents")
     before = ready.json()["documents"][0]
     assert before["status"] == "ready"
+    first_doc = await harness.store.get_document(tenant_id=_TENANT, document_id=UUID(before["id"]))
+    assert first_doc is not None
 
     again = await harness.upload("kb", "h.md", _MD)
     assert again["_status"] == 200
@@ -166,21 +169,26 @@ async def test_reupload_same_content_is_200_unchanged(harness: Harness) -> None:
     final = (await harness.client.get("/v1/knowledge/bases/kb/documents")).json()["documents"][0]
     assert final["status"] == "ready"
     doc = await harness.store.get_document(tenant_id=_TENANT, document_id=UUID(final["id"]))
-    assert doc is not None and doc.ingest_generation == 1  # a real re-ingest happened
+    # A real re-ingest happened: estimated (one generation), confirmed (another).
+    assert doc is not None and doc.ingest_generation == first_doc.ingest_generation + 2
 
 
 @pytest.mark.asyncio
 async def test_reingest_forces_a_new_generation(harness: Harness) -> None:
     await harness.client.post("/v1/knowledge/bases", json={"name": "kb"})
     uploaded = await harness.upload("kb", "h.md", _MD)
+    document_id = UUID(str(uploaded["id"]))
+    settled = await harness.store.get_document(tenant_id=_TENANT, document_id=document_id)
+    assert settled is not None
     response = await harness.client.post(
         f"/v1/knowledge/bases/kb/documents/{uploaded['id']}/reingest"
     )
     assert response.status_code == 202
-    await harness.runner.drain()
-    doc = await harness.store.get_document(tenant_id=_TENANT, document_id=UUID(str(uploaded["id"])))
+    await settle(harness.client, harness.runner)
+    doc = await harness.store.get_document(tenant_id=_TENANT, document_id=document_id)
     assert doc is not None
-    assert doc.ingest_generation == 1
+    # The same bytes again: estimated (a generation) and confirmed (another).
+    assert doc.ingest_generation == settled.ingest_generation + 2
     assert doc.status.value == "ready"
 
 
@@ -226,7 +234,7 @@ async def test_every_write_endpoint_emits_an_audit_row(harness: Harness) -> None
     doc_id = str(uploaded["id"])
     reingested = await harness.client.post(f"/v1/knowledge/bases/kb/documents/{doc_id}/reingest")
     assert reingested.status_code == 202
-    await harness.runner.drain()
+    await settle(harness.client, harness.runner)
     reindexed = await harness.client.post("/v1/knowledge/bases/kb/reindex")
     assert reindexed.status_code == 202
     await harness.runner.drain()
@@ -240,7 +248,10 @@ async def test_every_write_endpoint_emits_an_audit_row(harness: Harness) -> None
         ("knowledge:base_create", "knowledge_base", base_id, "user-a"),
         ("knowledge:base_update", "knowledge_base", base_id, "user-a"),
         ("knowledge:document_upload", "knowledge_document", doc_id, "user-a"),
+        # B-222 PR-2: every paid ingest is confirmed first, and that is audited.
+        ("knowledge:document_confirm", "knowledge_document", doc_id, "user-a"),
         ("knowledge:document_reingest", "knowledge_document", doc_id, "user-a"),
+        ("knowledge:document_confirm", "knowledge_document", doc_id, "user-a"),
         ("knowledge:base_reindex", "knowledge_base", base_id, "user-a"),
         ("knowledge:document_delete", "knowledge_document", doc_id, "user-a"),
         ("knowledge:base_delete", "knowledge_base", base_id, "user-a"),
@@ -280,7 +291,7 @@ async def test_failed_reupload_keeps_previous_version_serving(harness: Harness) 
     # Retry the pending v2 → still bad → still failed, still serving v1.
     retried = await harness.client.post(f"/v1/knowledge/bases/kb/documents/{doc_id}/reingest")
     assert retried.status_code == 202
-    await harness.runner.drain()
+    await settle(harness.client, harness.runner)
     row = (await harness.client.get("/v1/knowledge/bases/kb/documents")).json()["documents"][0]
     assert row["status"] == "failed" and row["has_pending"] is True
 

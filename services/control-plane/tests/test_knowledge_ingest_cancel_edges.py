@@ -51,9 +51,11 @@ def _parse_pool_teardown() -> Iterator[None]:
 
 
 class _CancelAfterSwap(InMemoryKnowledgeStore):
-    """A cancel request that lands right after the chunks were swapped in,
-    before the READY write (what an SQL cancel blocked on the swap's row lock
-    does). Armed by setting ``kb_id``; records each outcome."""
+    """A cancel request that lands right after the chunks were swapped in
+    (what an SQL cancel blocked on the swap's row lock does; since the B2b
+    review the swap lands READY with it, or — ``ingest_markdown`` without
+    ``settle`` — before its caller's READY write). Armed by setting
+    ``kb_id``; records each outcome."""
 
     def __init__(self) -> None:
         super().__init__()

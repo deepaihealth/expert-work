@@ -262,6 +262,12 @@ class AuditAction(StrEnum):
     KNOWLEDGE_DOCUMENT_DISCARD_PENDING = "knowledge:document_discard_pending"
     # B-222 — stop an ingest in progress (one row per document cancelled).
     KNOWLEDGE_DOCUMENT_CANCEL = "knowledge:document_cancel"
+    # B-222 PR-2 — an ingest estimate confirmed (the paid ingest starts),
+    # withdrawn by the user, or withdrawn because its 7 days ran out (actor
+    # ``system``); one row per document.
+    KNOWLEDGE_DOCUMENT_CONFIRM = "knowledge:document_confirm"
+    KNOWLEDGE_DOCUMENT_WITHDRAW = "knowledge:document_withdraw"
+    KNOWLEDGE_DOCUMENT_ESTIMATE_EXPIRED = "knowledge:document_estimate_expired"
     # B-175 P3-PR2 — knowledge maintenance: document switches and batches, a
     # base's stale documents re-ingested, passage edits / additions / switches
     # / restores (passage writes are recorded on their document).

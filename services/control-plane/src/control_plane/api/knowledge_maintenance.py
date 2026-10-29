@@ -9,8 +9,9 @@
   cut by other chunking parameters than the base's current ones;
   ``POST /bases/{name}/reingest-stale`` re-ingests those that still have their
   file (the rest are listed: re-upload them), at most :data:`REINGEST_STALE_MAX`
-  per call (``remaining``: call again). It starts paid embedding at once; B-222
-  PR-2 puts it behind an estimate the user confirms (same endpoint name).
+  per call (``remaining``: call again). B-222 PR-2: like a batch re-ingest, it
+  spends nothing yet — each document is estimated and waits for the user to
+  confirm it (``POST …/documents/confirm``).
 
 Console plane, ``manifest`` permissions, like the rest of ``/v1/knowledge``;
 every write is audited — a batch with one row per document it changed (which
@@ -34,6 +35,7 @@ from control_plane.api.knowledge import (
     _get_ingestion_runner,
     _get_knowledge_store,
     _redrive,
+    _release_duplicates,
     _require_base,
 )
 from control_plane.knowledge.chunking import chunk_params_hash
@@ -46,7 +48,9 @@ from control_plane.tenant_scope import (
 )
 from expert_work.common.observability import current_trace_id_hex
 from expert_work.persistence import KnowledgeStore
+from expert_work.persistence.knowledge.estimates import EstimateRefused
 from expert_work.protocol import AuditAction, KnowledgeBase, KnowledgeDocument
+from expert_work.protocol.knowledge_estimate import EstimateOrigin
 from expert_work.runtime.audit.logger import AuditLogger
 
 #: Documents one batch request may name.
@@ -92,6 +96,23 @@ async def _base_documents(
     """The named documents that belong to ``base`` (others are absent)."""
     found = await store.get_documents(tenant_id=tenant_id, document_ids=document_ids)
     return {i: d for i, d in found.items() if d.kb_id == base.id}
+
+
+async def _redrive_or_reason(
+    store: KnowledgeStore,
+    runner: KnowledgeIngestionRunner,
+    tenant_id: UUID,
+    document: KnowledgeDocument,
+    origin: EstimateOrigin,
+) -> str | None:
+    """Re-drive one document of a batch; why it was skipped, if it was
+    (``not_found``: deleted meanwhile; ``busy``: its new chunks are being
+    swapped in)."""
+    try:
+        reset = await _redrive(store, runner, tenant_id, document, origin=origin)
+    except EstimateRefused as exc:
+        return exc.reason
+    return None if reset is not None else "not_found"
 
 
 def _runner_or_503(runner: KnowledgeIngestionRunner | None) -> KnowledgeIngestionRunner:
@@ -182,8 +203,13 @@ def build_knowledge_maintenance_router() -> APIRouter:
                     skipped.append(_skipped(document_id, "not_found"))
                 elif not document.has_content and not document.has_pending:
                     skipped.append(_skipped(document_id, "content_missing"))
+                elif (
+                    outcome := await _redrive_or_reason(
+                        store, ready_runner, tenant_id, document, EstimateOrigin.BATCH_REINGEST
+                    )
+                ) is not None:
+                    skipped.append(_skipped(document_id, outcome))
                 else:
-                    await _redrive(store, ready_runner, tenant_id, base, document)
                     done.append(document_id)
                     await _audit_document(
                         audit,
@@ -236,6 +262,7 @@ def build_knowledge_maintenance_router() -> APIRouter:
         body: _BatchDeleteBody,
         request: Request,
         store: Annotated[KnowledgeStore, Depends(_get_knowledge_store)],
+        runner: Annotated[KnowledgeIngestionRunner | None, Depends(_get_ingestion_runner)],
         audit: Annotated[AuditLogger, Depends(_get_audit)],
     ) -> JSONResponse:
         tenant_id: UUID = request.state.tenant_id
@@ -279,6 +306,8 @@ def build_knowledge_maintenance_router() -> APIRouter:
                 "skipped": len(skipped),
             },
         )
+        if done:
+            await _release_duplicates(store, runner, base)  # B-222 PR-2: their copies
         return JSONResponse(
             content={"action": "delete", "done": [str(i) for i in done], "skipped": skipped}
         )
@@ -338,8 +367,13 @@ def build_knowledge_maintenance_router() -> APIRouter:
                 skipped.append(_skipped(document.id, "content_missing"))
             elif len(queued) >= REINGEST_STALE_MAX:
                 remaining += 1  # the next call takes them
+            elif (
+                outcome := await _redrive_or_reason(
+                    store, ready_runner, tenant_id, document, EstimateOrigin.REINGEST_STALE
+                )
+            ) is not None:
+                skipped.append(_skipped(document.id, outcome))
             else:
-                await _redrive(store, ready_runner, tenant_id, base, document)
                 queued.append(str(document.id))
                 await _audit_document(
                     audit,
