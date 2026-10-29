@@ -684,6 +684,28 @@ async def test_list_files_reports_a_directory_vanishing_mid_walk_as_a_listing_fa
     assert str(tmp_path) not in str(excinfo.value)
 
 
+async def test_search_files_reports_a_directory_vanishing_mid_walk_as_a_search_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Same ESTALE shape as the list_files test above, through ``search_files``."""
+    tenant_id, user_id = uuid4(), uuid4()
+    store = _store(tmp_path)
+    await store.write_file(tenant_id=tenant_id, user_id=user_id, path="sub/a.txt", data=b"x")
+    sub_ino = (tmp_path / str(tenant_id) / str(user_id) / "sub").stat().st_ino
+    real_scandir = os.scandir
+
+    def _stale_scandir(arg: Any = ".") -> Any:
+        if isinstance(arg, int) and os.fstat(arg).st_ino == sub_ino:
+            raise OSError(errno.ESTALE, os.strerror(errno.ESTALE))
+        return real_scandir(arg)
+
+    monkeypatch.setattr(os, "scandir", _stale_scandir)
+
+    with pytest.raises(SandboxSupervisorError) as excinfo:
+        await store.search_files(tenant_id=tenant_id, user_id=user_id, name_glob="*")
+    assert str(tmp_path) not in str(excinfo.value)
+
+
 async def test_list_files_does_not_hide_a_file_named_like_the_legacy_marker(
     tmp_path: Path,
 ) -> None:
