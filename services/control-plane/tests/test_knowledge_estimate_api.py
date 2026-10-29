@@ -187,7 +187,8 @@ async def test_an_upload_is_estimated_without_a_model_and_waits_even_at_zero(
     assert row["confirm_by"] is not None and row["ingest_actual"] is None
     assert "restore" not in estimate  # the store-only part is never shown
     summary = await harness.summary()
-    assert len(summary.pop("fingerprint")) == 64
+    fingerprint = summary.pop("fingerprint")
+    assert len(fingerprint) == 64
     assert summary == {
         "estimating": 0,
         "awaiting": 1,
