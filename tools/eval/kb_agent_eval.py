@@ -375,9 +375,11 @@ class Tool(Protocol):
     """``knowledge_search`` / ``knowledge_read``(或测试替身)。"""
 
     @property
-    def spec(self) -> ToolSpec: ...
+    def spec(self) -> ToolSpec:
+        """工具声明(名字、说明、参数)。"""
 
-    async def call(self, args: Mapping[str, Any], *, ctx: ToolContext) -> ToolResult: ...
+    async def call(self, args: Mapping[str, Any], *, ctx: ToolContext) -> ToolResult:
+        """执行一次调用。"""
 
 
 @dataclass
