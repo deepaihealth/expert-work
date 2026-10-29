@@ -172,6 +172,25 @@ describe("SettingsTab — stale documents (B-175 P3-PR3)", () => {
     expect(screen.queryByText(/现在全部重新摄取吗/)).toBeNull();
   });
 
+  it("asks to re-upload only what has no file, and says a busy one is skipped for now (B-222)", async () => {
+    staleCounts(3, 2);
+    vi.spyOn(sdk, "reingestStale").mockResolvedValue({
+      queued: ["d1"],
+      skipped: [
+        { id: "d2", reason: "content_missing" },
+        { id: "d3", reason: "busy" },
+      ],
+      remaining: 0,
+    });
+    renderTab();
+    await userEvent.click(await screen.findByTestId("kb-settings-reingest-stale"));
+    await userEvent.click(await screen.findByTestId("kb-stale-confirm-ok"));
+
+    expect(await screen.findByText("1 份没保留原文件，已跳过，需要重新上传。")).toBeInTheDocument();
+    expect(await screen.findByText("1 份正在写入新版本，已跳过，稍后再试。")).toBeInTheDocument();
+    expect(screen.queryByText("2 份没保留原文件，已跳过，需要重新上传。")).toBeNull();
+  });
+
   it("the line's button asks too, then re-ingests", async () => {
     staleCounts(2, 0);
     const reingest = vi

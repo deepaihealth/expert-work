@@ -1126,6 +1126,7 @@ async def estimate_document(
         estimate=estimate.model_dump(mode="json"),
         snapshot=await encode_in_thread(local),
         confirm_by=now + CONFIRM_WINDOW,
+        now=now,
     )
     if finished is None:
         msg = f"document {claim.document_id} was withdrawn or re-uploaded while it was estimated"
@@ -1248,6 +1249,27 @@ class _ModelsGuard:
         logger.info("knowledge.estimate_reconfirm_mid_ingest document=%s", claim.document_id)
 
 
+async def _estimate_again(
+    estimator: IngestEstimator,
+    claim: ClaimedIngestion,
+    local: LocalParse,
+    model_key: str | None,
+    now: datetime,
+) -> IngestEstimate:
+    """The confirmed ingest's estimate made again (models, settings, keys and
+    prices of now). A document's own refusal (too large, too many chunks,
+    unreadable) stays terminal; anything else — a settings, key or price
+    lookup that failed — is the same failure as a model check mid-ingest
+    (B2b review): :class:`ModelsCheckFailedError`, retried."""
+    try:
+        return await estimator.estimate(claim, local, embedding_model=model_key, now=now)
+    except (DocumentParseError, StaleIngestionError):
+        raise
+    except Exception as exc:
+        msg = f"document {claim.document_id}: its estimate could not be made again"
+        raise ModelsCheckFailedError(msg) from exc
+
+
 async def start_paid_ingest(
     store: KnowledgeStore,
     estimator: IngestEstimator,
@@ -1264,7 +1286,9 @@ async def start_paid_ingest(
     document goes back to waiting for a confirmation of the new estimate.
     A document queued without an estimate starts as it always did.
 
-    :raises StaleIngestionError: the claim was lost meanwhile."""
+    :raises StaleIngestionError: the claim was lost meanwhile.
+    :raises ModelsCheckFailedError: the estimate could not be made again
+        (a settings, key or price lookup failed) — retried."""
     confirmed = claim.estimate
     if confirmed is None or confirmed.confirmed_at is None or claim.content is None:
         return PaidStart(local=None)
@@ -1289,7 +1313,7 @@ async def start_paid_ingest(
         logger.info("knowledge.snapshot_used document=%s", claim.document_id)
     model_key, pinned = await pin_embedder(embedder, tenant_id=claim.tenant_id)
     now = datetime.now(UTC)
-    fresh = await estimator.estimate(claim, local, embedding_model=model_key, now=now)
+    fresh = await _estimate_again(estimator, claim, local, model_key, now)
     if not needs_reconfirmation(confirmed, fresh):
         return PaidStart(
             local=local,
@@ -1513,7 +1537,7 @@ class KnowledgeIngestionRunner:
         token = current_tenant_id_var.set(tenant_id)
         renewer: asyncio.Task[None] | None = None
         claim: ClaimedIngestion | None = None
-        ready = written = failed = stale = False
+        ready = written = failed = stale = retrying = False
         #: B-222 PR-2 —— what the paid ingest was billed (none for an estimate).
         spend: IngestSpend | None = None
         lost = asyncio.Event()
@@ -1632,6 +1656,7 @@ class KnowledgeIngestionRunner:
             # the lease runs out (its snapshot kept); the last attempt fails
             # with its own code instead of ``attempts_exhausted``.
             logger.warning("knowledge.ingest_models_unchecked document=%s", document_id)
+            retrying = True  # a failed attempt, as the recovery worker records one
             if claim is not None and claim.attempts >= self._max_attempts:
                 failed = await self._store.mark_document_failed_terminal(
                     tenant_id=tenant_id,
@@ -1685,7 +1710,9 @@ class KnowledgeIngestionRunner:
                 self.local.discard(document_id, stop)
             await _stop_renewer(renewer)
             if claim is not None and spend is not None:
-                outcome: IngestOutcome = "ready" if ready else "failed" if failed else "stopped"
+                outcome: IngestOutcome = (
+                    "ready" if ready else "failed" if failed or retrying else "stopped"
+                )
                 # A shutdown leaves the claim for a retry: its snapshot stays.
                 settled = ready or failed or stale or lost.is_set()
                 await record_actual(

@@ -131,7 +131,12 @@ export function useEstimateActions(
       if (withdrawn > 0) message.success(t("knowledge_page.estimate_withdrawn", { count: withdrawn }));
       const changed = results.filter((r) => r.outcome === "status_changed").length;
       if (changed > 0) {
-        message.warning(t("knowledge_page.estimate_withdraw_changed", { count: changed }));
+        // Withdrawing (the waiting set): only a confirmed one is left. Skipping
+        // duplicates (strict): one sent for 「仍入库」 since is kept.
+        const key = strict
+          ? "knowledge_page.estimate_skip_changed"
+          : "knowledge_page.estimate_withdraw_changed";
+        message.warning(t(key, { count: changed }));
       }
     },
     [baseName, message, t],

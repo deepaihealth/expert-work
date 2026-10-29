@@ -1114,6 +1114,8 @@ async def test_stale_copies_are_released_batch_by_batch(
 
     assert sorted(d.id for d in released) == sorted(d.id for d in copies)
     assert all(size <= 2 for size in scanned)  # each transaction locks at most a batch
+    if isinstance(store, SqlKnowledgeStore):
+        assert len(scanned) >= 3  # 8 waiting copies, 2 a batch: the loop went on
 
 
 async def test_release_skips_a_copy_another_transaction_holds(store: KnowledgeStore) -> None:
@@ -1252,6 +1254,39 @@ async def test_a_landed_chunk_swap_is_ready_so_no_reclaim_can_undo_it(
     ) == {ready.id: "not_cancellable"}
     chunks, _ = await store.list_chunks(tenant_id=tenant, document_id=ready.id)
     assert [c.content for c in chunks] == ["v2 passage"]
+
+
+async def test_only_a_fenced_ingest_write_back_settles_ready(store: KnowledgeStore) -> None:
+    """B2b review: a re-index (``expect_status=ready``) or an unfenced write
+    never settles a document; the chunks stay as they were."""
+    tenant = uuid4()
+    base = await store.create_base(tenant_id=tenant, name="kb")
+    ready = await _ready(store, tenant, base.id, "a.md")
+    chunk = KnowledgeChunk(
+        id=uuid4(),
+        tenant_id=tenant,
+        kb_id=base.id,
+        document_id=ready.id,
+        chunk_index=0,
+        content="re-indexed",
+        embedding=(1.0,) + (0.0,) * (EMBEDDING_DIM - 1),
+        content_hash="h0",
+        embedding_model="p/new",
+    )
+    for fence in (
+        {"generation": ready.ingest_generation, "expect_status": DocumentStatus.READY},
+        {"generation": None},
+    ):
+        with pytest.raises(ValueError, match="fenced ingest write-back"):
+            await store.replace_chunks(
+                tenant_id=tenant,
+                document_id=ready.id,
+                chunks=[chunk],
+                ready_chunk_count=1,
+                **fence,
+            )
+    chunks, _ = await store.list_chunks(tenant_id=tenant, document_id=ready.id)
+    assert [c.content for c in chunks] == ["v1 passage 0"]
 
 
 async def test_the_same_bytes_past_the_deadline_start_a_new_estimate(

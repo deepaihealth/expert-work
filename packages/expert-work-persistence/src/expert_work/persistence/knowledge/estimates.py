@@ -46,7 +46,8 @@ META_KEYS: Final = ("origin", "allow_duplicate", "restore")
 _STORE_ONLY: Final = ("restore", "first_confirm_by")
 #: B2b review —— the deadline a released duplicate had before it went back
 #: to ``estimating`` (ISO). Its estimate, when it lands, keeps that deadline
-#: (:func:`kept_deadline`): a released copy never outlives its first one.
+#: (:func:`kept_deadline`) — a released copy outlives its first one by at most
+#: :data:`RELEASED_COPY_GRACE`, and only when it was released that close to it.
 FIRST_CONFIRM_BY: Final = "first_confirm_by"
 #: The least time a released copy's estimate is left to be confirmed in.
 RELEASED_COPY_GRACE: Final = timedelta(hours=1)

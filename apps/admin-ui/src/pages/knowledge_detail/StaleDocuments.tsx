@@ -15,6 +15,7 @@ import { useTranslation } from "react-i18next";
 import { ApiError, errMessage } from "../../api/client";
 import { getStaleDocuments, reingestStale } from "../../api/knowledge_maintenance";
 import { ReadonlyTooltip } from "../../components/ReadonlyTooltip";
+import { skippedSummary } from "./DocumentBatchBar";
 
 const { Text } = Typography;
 
@@ -63,9 +64,15 @@ export function useStaleDocuments(baseName: string, readScope: string | undefine
     try {
       const result = await reingestStale(baseName);
       message.success(t("kb_maintenance.stale_submitted", { n: result.queued.length }));
-      if (result.skipped.length > 0) {
-        message.warning(t("kb_maintenance.stale_skipped", { n: result.skipped.length }));
-      }
+      const missing = result.skipped.filter((s) => s.reason === "content_missing").length;
+      const busy = result.skipped.filter((s) => s.reason === "busy").length;
+      const others = result.skipped.filter(
+        (s) => s.reason !== "content_missing" && s.reason !== "busy",
+      );
+      if (missing > 0) message.warning(t("kb_maintenance.stale_skipped", { n: missing }));
+      if (busy > 0) message.warning(t("kb_maintenance.stale_busy", { n: busy }));
+      const rest = skippedSummary(t, others);
+      if (rest !== null) message.warning(rest);
       if (result.remaining > 0) {
         message.info(t("kb_maintenance.stale_remaining", { n: result.remaining }));
       }

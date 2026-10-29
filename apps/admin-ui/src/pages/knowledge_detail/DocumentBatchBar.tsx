@@ -39,9 +39,14 @@ export function skippedSummary(t: TFunction, skipped: readonly BatchSkip[]): str
   if (skipped.length === 0) return null;
   const notFound = skipped.filter((s) => s.reason === "not_found").length;
   const missing = skipped.filter((s) => s.reason === "content_missing").length;
+  const busy = skipped.filter((s) => s.reason === "busy").length;
+  // A reason this version does not know still counts, so the parts add up.
+  const other = skipped.length - notFound - missing - busy;
   const reasons = [
     notFound > 0 ? t("kb_maintenance.skip_not_found", { n: notFound }) : null,
     missing > 0 ? t("kb_maintenance.skip_content_missing", { n: missing }) : null,
+    busy > 0 ? t("kb_maintenance.skip_busy", { n: busy }) : null,
+    other > 0 ? t("kb_maintenance.skip_other", { n: other }) : null,
   ].filter((part): part is string => part !== null);
   return t("kb_maintenance.batch_skipped", {
     n: skipped.length,

@@ -351,7 +351,7 @@ describe("DocumentsTab — estimates (B-222 PR-2)", () => {
       "awaiting_confirmation",
     ]);
     expect(await screen.findByText("Withdrew 2 estimates.")).toBeInTheDocument();
-    expect(screen.queryByText(/changed meanwhile/)).not.toBeInTheDocument();
+    expect(screen.queryByText(/meanwhile/)).not.toBeInTheDocument();
   });
 
   it("「全部取消」 leaves one confirmed since it was read, and says so (B2b second review)", async () => {
@@ -366,13 +366,15 @@ describe("DocumentsTab — estimates (B-222 PR-2)", () => {
     await confirmPopover("OK");
 
     expect(
-      await screen.findByText(/1 document changed meanwhile .* and was not withdrawn/),
+      await screen.findByText("1 document was confirmed meanwhile and was not withdrawn."),
     ).toBeInTheDocument();
   });
 
   it("skipping a duplicate on confirm leaves one sent for 「仍入库」 since", async () => {
     const confirmSpy = vi.spyOn(knowledgeSdk, "confirmDocuments").mockResolvedValue([]);
-    const cancel = vi.spyOn(knowledgeSdk, "cancelDocuments").mockResolvedValue([]);
+    const cancel = vi
+      .spyOn(knowledgeSdk, "cancelDocuments")
+      .mockResolvedValue([{ document_id: COPY.id, outcome: "status_changed" }]);
     const { result } = renderHook(() => useEstimateActions(BASE_NAME, () => undefined), {
       wrapper: ({ children }) => <App>{children}</App>,
     });
@@ -381,6 +383,11 @@ describe("DocumentsTab — estimates (B-222 PR-2)", () => {
 
     expect(confirmSpy).toHaveBeenCalledTimes(1);
     expect(cancel).toHaveBeenCalledWith(BASE_NAME, [COPY.id], ["awaiting_confirmation"]);
+    expect(
+      await screen.findByText(
+        "1 duplicate was sent to be ingested anyway meanwhile and was kept.",
+      ),
+    ).toBeInTheDocument();
   });
 
   it.each([

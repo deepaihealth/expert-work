@@ -1257,7 +1257,9 @@ class KnowledgeStore(abc.ABC):
         ingest ran stays gone. Records it does not name are left as they are;
         text histories never get records' flags or vice versa.
 
-        ``ready_chunk_count`` (B2b review; fenced writes only): the swap
+        ``ready_chunk_count`` (B2b review; a fenced ingest write-back only —
+        ``generation`` given and ``expect_status`` ``processing``, else
+        :class:`ValueError`, so a re-index never settles anything): the swap
         also settles the document READY with that ``chunk_count``, in the
         same transaction — everything :meth:`set_document_status` writes
         for a fenced READY. A swap in place then always means READY: a

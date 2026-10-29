@@ -558,6 +558,8 @@ const zhCN: TranslationKeys = {
     batch_skipped: "跳过 {{n}} 份：{{reasons}}",
     skip_not_found: "{{n}} 份已不在这个库",
     skip_content_missing: "{{n}} 份没保留原文件，需要重新上传",
+    skip_busy: "{{n}} 份正在写入新版本，稍后再试",
+    skip_other: "{{n}} 份因其他原因",
     skip_sep: "；",
     description_agent_hint:
       "绑定多个知识库时，智能体按这段描述决定查哪个库：写清楚库里有哪类资料、适合回答什么问题。",
@@ -575,6 +577,7 @@ const zhCN: TranslationKeys = {
     stale_confirm_later: "以后再说",
     stale_submitted: "已提交 {{n}} 份重新摄取，正在估算费用；估算完成后在「文档」页确认才会开始。",
     stale_skipped: "{{n}} 份没保留原文件，已跳过，需要重新上传。",
+    stale_busy: "{{n}} 份正在写入新版本，已跳过，稍后再试。",
     stale_remaining: "还有 {{n}} 份没提交，再点一次「全部重新摄取」。",
     config_summary: "切块：小段 {{chunk}} / 整块 {{parent}} token",
     config_summary_chunk_only: "切块：小段 {{chunk}} token",
@@ -948,10 +951,14 @@ const zhCN: TranslationKeys = {
     estimate_changed: "预估已重新计算，请按新的金额再确认。",
     estimate_all_changed: "待确认的文档有变化，请按最新合计再确认。",
     estimate_expired: "有预估已过确认期限，正在撤回。",
-    estimate_withdraw_changed_one: "{{count}} 份在此期间已有变化（已确认或正在重新估算），未撤回。",
-    estimate_withdraw_changed_other: "{{count}} 份在此期间已有变化（已确认或正在重新估算），未撤回。",
+    estimate_withdraw_changed_one: "{{count}} 份在此期间已被确认入库，未撤回。",
+    estimate_withdraw_changed_other: "{{count}} 份在此期间已被确认入库，未撤回。",
+    estimate_skip_changed_one: "{{count}} 份副本在此期间已被选择「仍入库」，已保留。",
+    estimate_skip_changed_other: "{{count}} 份副本在此期间已被选择「仍入库」，已保留。",
     estimate_ingest_anyway_changed: "该文档在此期间已有变化（已撤回、已确认或正在重新估算），请查看最新列表。",
     document_busy: "该文档的新版本正在写入分段，写完后再试。",
+    error_models_check_failed:
+      "无法确认本次入库仍使用已确认的模型（多次尝试读取识别设置或密钥均失败）。请检查识别设置与密钥后重新摄取。",
   },
   rate_card_page: {
     page_title: "模型定价",

@@ -2861,7 +2861,9 @@ class SqlKnowledgeStore(SqlEstimates, KnowledgeStore):
         switch_offs: Collection[SwitchOffRecord] = (),
         ready_chunk_count: int | None = None,
     ) -> bool:
-        if ready_chunk_count is not None and generation is None:
+        if ready_chunk_count is not None and (
+            generation is None or expect_status is not DocumentStatus.PROCESSING
+        ):
             msg = "replace_chunks settles READY only as a fenced ingest write-back"
             raise ValueError(msg)
         async with self._sf() as session:

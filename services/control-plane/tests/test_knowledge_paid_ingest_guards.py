@@ -31,6 +31,7 @@ from control_plane.knowledge.ingestion import (
     _ModelsGuard,
     shutdown_parse_pool,
 )
+from control_plane.knowledge.parsed_size import DocumentTooLargeError
 from control_plane.knowledge.recognition.clients import Reading
 from control_plane.knowledge.recognition.figure_pipeline import FigureDescriber
 from control_plane.knowledge.recognition.ingest_parse import LocalParse
@@ -520,14 +521,30 @@ async def test_a_models_check_that_fails_pays_for_nothing(doc: FormDoc) -> None:
     assert after is not None and after.status is DocumentStatus.PROCESSING  # left for a retry
 
 
+class _EstimateAgainFails(IngestEstimator):
+    """The paid ingest's estimate made again fails — with ``error`` (a lookup
+    failure) or the document's own refusal."""
+
+    error: Exception = RuntimeError("price lookup failed")
+
+    async def estimate(self, claim: ClaimedIngestion, local: LocalParse, **kwargs: Any) -> Any:
+        if claim.phase == "ingest":
+            raise type(self).error
+        return await super().estimate(claim, local, **kwargs)
+
+
+@pytest.mark.parametrize("estimator_type", [_CheckFails, _EstimateAgainFails])
 @pytest.mark.parametrize("path", ["runner", "recovery"])
 @pytest.mark.usefixtures("no_semantic_breaks")
 async def test_a_models_check_that_keeps_failing_is_retried_then_fails_as_itself(
-    path: str,
+    path: str, estimator_type: type[IngestEstimator]
 ) -> None:
-    """B2b third review: each attempt keeps the parse snapshot; the last one
-    fails ``models_check_failed``, not ``attempts_exhausted``."""
+    """B2b third / fourth review: the check mid-ingest (``_CheckFails``) and
+    the estimate made again at the start (``_EstimateAgainFails``) fail the
+    same way — each attempt keeps the parse snapshot; the last one fails
+    ``models_check_failed``, not ``attempts_exhausted`` / ``internal_error``."""
     _CheckFails.checks, _CheckFails.passes = 0, 0
+    _EstimateAgainFails.error = RuntimeError("price lookup failed")
     store = InMemoryKnowledgeStore()
     settings = _Recognition()
     paid = _Paid()
@@ -542,7 +559,7 @@ async def test_a_models_check_that_keeps_failing_is_retried_then_fails_as_itself
         client_factory=paid.describer,
     )
     embedder = _Keyed("acme/embed-1")
-    estimator = _CheckFails(store=store, settings=settings, recognizer=recognizer)
+    estimator = estimator_type(store=store, settings=settings, recognizer=recognizer)
     runner = KnowledgeIngestionRunner(
         store=store,
         embedder=embedder,
@@ -578,12 +595,39 @@ async def test_a_models_check_that_keeps_failing_is_retried_then_fails_as_itself
     first = await attempt()
     assert first.status is DocumentStatus.PROCESSING
     assert await _snapshot_of(store, waiting) is not None
+    if estimator_type is _CheckFails:  # the paid half started: its spend is recorded
+        # The same outcome on both paths: a failed attempt (B2b fourth review L2).
+        assert first.ingest_actual is not None and first.ingest_actual.outcome == "failed"
     last = await attempt()
     assert (last.status, last.error_code) == (
         DocumentStatus.FAILED,
         IngestErrorCode.MODELS_CHECK_FAILED,
     )
     assert (paid.reads, paid.descriptions, embedder.calls) == (0, 0, 0)
+
+
+@pytest.mark.usefixtures("no_semantic_breaks")
+async def test_a_documents_own_refusal_at_the_start_stays_terminal() -> None:
+    """B2b fourth review: only lookups are retried; the text over the cap
+    fails at once, with its own code."""
+    _EstimateAgainFails.error = DocumentTooLargeError(3_000_000, 2_500_000)
+    store = InMemoryKnowledgeStore()
+    runner = KnowledgeIngestionRunner(
+        store=store,
+        embedder=_Keyed("acme/embed-1"),
+        estimator=_EstimateAgainFails(store=store),
+        max_attempts=5,
+    )
+    waiting = await _waiting(store, runner, "a.md", _TEXT.encode())
+
+    await runner.submit(tenant_id=_TENANT, document_id=waiting.id)
+
+    after = await store.get_document(tenant_id=_TENANT, document_id=waiting.id)
+    assert after is not None
+    assert (after.status, after.error_code) == (
+        DocumentStatus.FAILED,
+        IngestErrorCode.TEXT_TOO_LARGE,
+    )
 
 
 async def test_the_models_guard_refuses_when_its_check_fails() -> None:

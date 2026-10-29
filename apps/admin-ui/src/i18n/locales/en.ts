@@ -544,6 +544,8 @@ export interface TranslationKeys {
     batch_skipped: string;
     skip_not_found: string;
     skip_content_missing: string;
+    skip_busy: string;
+    skip_other: string;
     skip_sep: string;
     description_agent_hint: string;
     chunk_max_label: string;
@@ -559,6 +561,7 @@ export interface TranslationKeys {
     stale_confirm_later: string;
     stale_submitted: string;
     stale_skipped: string;
+    stale_busy: string;
     stale_remaining: string;
     config_summary: string;
     config_summary_chunk_only: string;
@@ -926,8 +929,11 @@ export interface TranslationKeys {
     estimate_expired: string;
     estimate_withdraw_changed_one: string;
     estimate_withdraw_changed_other: string;
+    estimate_skip_changed_one: string;
+    estimate_skip_changed_other: string;
     estimate_ingest_anyway_changed: string;
     document_busy: string;
+    error_models_check_failed: string;
   };
   rate_card_page: {
     page_title: string;
@@ -4235,6 +4241,8 @@ const en: TranslationKeys = {
     batch_skipped: "Skipped {{n}}: {{reasons}}",
     skip_not_found: "{{n}} no longer in this base",
     skip_content_missing: "{{n}} without their original file (re-upload them)",
+    skip_busy: "{{n}} writing a new version (try again shortly)",
+    skip_other: "{{n}} for another reason",
     skip_sep: "; ",
     description_agent_hint:
       "When an agent binds several bases, it reads this description to decide which one to search: say what the documents are and which questions they answer.",
@@ -4255,6 +4263,7 @@ const en: TranslationKeys = {
     stale_submitted:
       "Submitted {{n}} document(s) for re-ingest. Their cost is being estimated — confirm it on the Documents tab to start.",
     stale_skipped: "{{n}} documents have no original file and were skipped; re-upload them.",
+    stale_busy: "{{n}} documents are writing a new version and were skipped; try again shortly.",
     stale_remaining: "{{n}} more were not submitted; click “Re-ingest them” again.",
     config_summary: "Chunking: chunk {{chunk}} / passage {{parent}} tokens",
     config_summary_chunk_only: "Chunking: chunk {{chunk}} tokens",
@@ -4653,12 +4662,18 @@ const en: TranslationKeys = {
     estimate_all_changed: "The documents awaiting confirmation changed — check the new total and confirm again.",
     estimate_expired: "An estimate is past its confirmation deadline and is being withdrawn.",
     estimate_withdraw_changed_one:
-      "{{count}} document changed meanwhile (confirmed, or being estimated again) and was not withdrawn.",
+      "{{count}} document was confirmed meanwhile and was not withdrawn.",
     estimate_withdraw_changed_other:
-      "{{count}} documents changed meanwhile (confirmed, or being estimated again) and were not withdrawn.",
+      "{{count}} documents were confirmed meanwhile and were not withdrawn.",
+    estimate_skip_changed_one:
+      "{{count}} duplicate was sent to be ingested anyway meanwhile and was kept.",
+    estimate_skip_changed_other:
+      "{{count}} duplicates were sent to be ingested anyway meanwhile and were kept.",
     estimate_ingest_anyway_changed:
       "This document changed meanwhile (withdrawn, confirmed or being estimated again) — check the list again.",
     document_busy: "This document's new version is being written — try again once it is ready.",
+    error_models_check_failed:
+      "Could not check that the models confirmed for this ingest are still the ones configured (settings or key lookup failed on every attempt). Check the recognition settings and keys, then re-ingest.",
   },
   rate_card_page: {
     page_title: "Model Pricing",

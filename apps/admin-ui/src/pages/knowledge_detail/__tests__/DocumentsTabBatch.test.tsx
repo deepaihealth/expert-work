@@ -17,6 +17,7 @@ import i18n from "../../../i18n";
 
 import * as knowledgeSdk from "../../../api/knowledge";
 import * as maintenanceSdk from "../../../api/knowledge_maintenance";
+import { skippedSummary } from "../DocumentBatchBar";
 import { DocumentsTab } from "../DocumentsTab";
 
 const BASE_NAME = "support-docs";
@@ -272,5 +273,20 @@ describe("DocumentsTab — row flags (B-175 P3-PR3)", () => {
 
     expect(await screen.findByTestId("kb-review-panel")).toBeInTheDocument();
     expect(unapplied).toHaveBeenCalledWith(BASE_NAME, A.id, undefined);
+  });
+});
+
+describe("skippedSummary (B-222)", () => {
+  it("names a busy one and counts a reason it does not know, so the parts add up", () => {
+    const skipped = [
+      { id: "1", reason: "not_found" },
+      { id: "2", reason: "content_missing" },
+      { id: "3", reason: "busy" },
+      { id: "4", reason: "from_a_newer_server" as maintenanceSdk.BatchSkipReason },
+    ] as const;
+    expect(skippedSummary(i18n.t, skipped)).toBe(
+      "跳过 4 份：1 份已不在这个库；1 份没保留原文件，需要重新上传；" +
+        "1 份正在写入新版本，稍后再试；1 份因其他原因",
+    );
   });
 });
