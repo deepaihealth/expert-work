@@ -191,14 +191,14 @@ def _basename(path: str) -> str:
     return path.rpartition("/")[2]
 
 
-def _dir_line(name: str, entries: Sequence[WorkspaceFileEntry], note: str = "") -> str:
+def _dir_line(name: str, entries: Sequence[WorkspaceFileEntry]) -> str:
     total = sum(e.size for e in entries)
     day = _day_text(_latest(entries))
     tail = f"   最近改 {day}" if day else ""
     return (
         f"{_INDENT_DIR}{name:<{_NAME_WIDTH}}"
         f"{_count_text(len(entries)):>{_COUNT_WIDTH}}"
-        f"{_size_text(total):>{_SIZE_WIDTH}}{tail}{note}"
+        f"{_size_text(total):>{_SIZE_WIDTH}}{tail}"
     ).rstrip()
 
 
@@ -290,7 +290,9 @@ def render_conversation_block(
     过渡期映射的目录在 ``/agent`` 一节末尾单独一行列全:还能按原相对路径**只读**用到哪天
     (B-236 M4:exec 里只读 bind,文件工具拒写)。不挂在目录行上 —— 目录行按文件的父路径
     分组,空目录或只有更深层文件的目录(``output/2026-10/r.docx``)根本没有 ``output/``
-    那一行(review 4)。
+    那一行(review 4)。写的去处也只写在这一行:它只在对话视图、窗口开着、确有映射目录时
+    出现,工具描述是按 agent 构建、所有视图共用的,不放这种话(review 5)。``/agent`` 没有
+    文件但有映射目录时不写 ``(empty)``,直接是这一行。
     """
     if not conversation and not agent:
         return ""
@@ -298,15 +300,18 @@ def render_conversation_block(
     until = f" until {compat_until_text}" if compat_until_text else ""
     agent_tree, _ = _render_tree(agent, max_expanded=max(max_expanded - used, 0))
     compat = (
-        f"\n  Also readable, read-only, by their old relative path{until}: "
+        f"  Also readable, read-only, by their old relative path{until}: "
         + ", ".join(f"{d}/" for d in compat_dirs)
+        + ". To change a file in one, write it to /agent/<dir>/… (shared) or under a new "
+        "name in this conversation."
         if compat_dirs
         else ""
     )
+    agent_body = "\n".join(part for part in (agent_tree, compat) if part) or _EMPTY_SECTION
     return (
         f"{WORKSPACE_BLOCK_HEADING}\n{_CONVERSATION_BLOCK_PREAMBLE}\n\n"
         f"{CONVERSATION_SECTION}\n{conv_tree or _EMPTY_SECTION}\n\n"
-        f"{AGENT_SECTION}\n{agent_tree or _EMPTY_SECTION}{compat}"
+        f"{AGENT_SECTION}\n{agent_body}"
     )
 
 

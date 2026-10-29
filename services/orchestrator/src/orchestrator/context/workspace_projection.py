@@ -97,7 +97,6 @@ LEGACY_REDIRECT_NOTE = (
     "update_plan tool in that conversation. -->\n"
 )
 
-
 #: B-188 — how to recognise a legacy root projection: line 1 is the header its
 #: renderer wrote. These are the literal texts root projection wrote from CM-0
 #: PR2b-i (#492) until 方案 a (#1268) moved projection under ``threads/`` —

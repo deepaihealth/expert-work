@@ -636,7 +636,7 @@ async def test_the_block_lists_this_conversation_and_the_agent_root_only(tmp_pat
     assert "mine.md" in block
     assert "anchor.md" in block
     assert "Also readable, read-only, by their old relative path" in block
-    assert block.rstrip().endswith(": style/")
+    assert ": style/. To change a file in one, write it to /agent/<dir>/" in block
     assert "theirs.md" not in block
     assert "PLAN.md" not in block
     assert "threads" not in block
@@ -658,9 +658,29 @@ def test_every_compat_dir_gets_the_read_only_note_whatever_its_shape() -> None:
     note = block.rsplit("\n", 1)[1]
     assert note == (
         "  Also readable, read-only, by their old relative path until 2026-12-10: "
-        "empty/, output/, style/"
+        "empty/, output/, style/. To change a file in one, write it to /agent/<dir>/… "
+        "(shared) or under a new name in this conversation."
     )
-    assert "read-only" not in render_conversation_block([], agent)
+
+
+def test_the_transition_hint_appears_only_with_mapped_dirs() -> None:
+    """review 5 —— 「只读 + 写到哪」只出现在对话块里、且确有映射目录时;工具描述按 agent
+    构建、所有视图共用(未绑 agent、老视图、窗口关了以后都读得到),不带过渡期的话。
+    ``/agent`` 没有文件、只有映射目录时不写 ``(empty)``。"""
+    from orchestrator.tools.workspace_paths import EXEC_WORKSPACE_NOTE
+    from orchestrator.tools.workspace_store import WorkspaceFileEntry
+    from orchestrator.tools.workspace_tree import render_conversation_block
+
+    conv = [WorkspaceFileEntry(path="mine.md", size=1, mtime=None)]
+    agent = [WorkspaceFileEntry(path="style/anchor.md", size=1, mtime=None)]
+    for plain in (render_conversation_block(conv, agent), render_conversation_block(conv, [])):
+        assert "read-only" not in plain and "/agent/<dir>/" not in plain
+    only_compat = render_conversation_block(conv, [], compat_dirs=("style",))
+    section = only_compat.split(AGENT_SECTION + "\n", 1)[1]
+    assert section.startswith("  Also readable, read-only")
+    assert "(empty)" not in section
+    for word in ("transition", "read-only", "<dir>"):
+        assert word not in EXEC_WORKSPACE_NOTE
 
 
 async def test_the_legacy_block_no_longer_lists_other_conversations_projections(

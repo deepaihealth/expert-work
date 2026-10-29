@@ -129,9 +129,7 @@ EXEC_WORKSPACE_NOTE = (
     "agent's directory. /agent/ is always this agent's directory, shared by all of "
     "its conversations — put files meant to be reused by later conversations "
     "(templates, style guides, helper scripts) there. Other agents' files are not "
-    "part of the default view. Uploaded files are in uploads/. During the transition "
-    "some old agent-directory folders also show up read-only in /workspace; write "
-    "under /workspace or /agent/<dir>/ instead."
+    "part of the default view. Uploaded files are in uploads/."
 )
 #: B-236 —— 文件类工具 ``path`` 参数的说明。
 PATH_ARG_DESCRIPTION = "File path relative to /workspace, or under /agent/ (no '..')."

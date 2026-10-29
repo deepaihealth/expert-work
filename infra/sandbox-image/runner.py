@@ -67,7 +67,7 @@ MAX_OUTPUT_CHARS = 1_000_000
 #: ``/usr/local/bin/python3 -I -S`` 按 fd 完成(``open_tree`` / ``move_mount``,理由见
 #: ``exec_view`` 的模块文档),所以镜像必须在这个绝对路径上有 python。它只分隔 NAS 视图:
 #: ``/tmp`` / ``$HOME`` / ``/opt/agents`` / ``/opt/skills`` 是这个沙箱里所有 exec(同一用户的
-#: 所有 agent 与对话)共用的本地状态,不在它管辖之内(单独跟踪)。
+#: 所有 agent 与对话)共用的本地状态,不在它管辖之内(见 B-242)。
 _EXEC_VIEW_SCRIPT = """\
 set -eu
 ew_path="${PATH-}"
