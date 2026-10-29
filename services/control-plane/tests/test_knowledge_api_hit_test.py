@@ -7,13 +7,16 @@ gains ``elapsed_ms`` (the search, not its logging) and ``log_id``, the
 retriever reports it back. Every key the response had before is still there.
 A retriever that logs nothing, or a write that failed, reports ``log_id: null``
 rather than an id that names no row. A result's document comes from its
-document id — no chunk re-read.
+document id — no chunk re-read. The responses (and the retrieval-log reads of
+the row) carry every key the admin UI's shared fixtures name.
 """
 
 from __future__ import annotations
 
 import asyncio
+import json
 from collections.abc import AsyncIterator
+from pathlib import Path
 from typing import Any
 from uuid import UUID
 
@@ -37,11 +40,14 @@ from tests.auth_fixtures import (
     TEST_AUDIENCE,
     TEST_ISSUER,
     build_test_jwt_verifier,
+    grant_system_admin,
     make_test_jwt,
 )
+from tests.test_knowledge_api_logs import _GUIDE
 
 _TENANT = DEFAULT_DEV_TENANT_ID
 _EMPLOYEE = "employee-hit-test"
+_FIXTURES = Path(__file__).resolve().parents[3] / "apps/admin-ui/src/api/__fixtures__"
 #: Keys the hit-test response carried before this change (result / top level).
 _RESULT_KEYS_BEFORE = {
     "content",
@@ -145,6 +151,7 @@ async def test_results_carry_four_scores_and_their_document(setup: _Setup) -> No
             "title": document.title,
             "filename": "h.md",
             "created_at": document.created_at.isoformat() if document.created_at else None,
+            "enabled": True,
         }
     assert document.doc_seq is not None
 
@@ -168,6 +175,44 @@ async def test_the_search_is_logged_as_a_console_test_of_the_employee(setup: _Se
     assert (row.source, row.actor_id, row.run_id) == ("console_test", _EMPLOYEE, None)
     assert (row.kb_ids, row.query, row.status) == ((kb_id,), "deductible", body["status"])
     assert row.result_count == body["count"]
+
+
+@pytest.mark.asyncio
+async def test_a_platform_admins_search_of_another_tenant_is_marked(setup: _Setup) -> None:
+    """User ruling (10-28): platform staff searching a tenant's base from the
+    console still leave the record in that tenant, marked as theirs —
+    ``flags.platform_admin`` — so the tenant sees who searched. Decided on the
+    tenants (the caller's home vs the one searched), not on a role name."""
+    admin = await grant_system_admin(setup.client)
+    resp = await setup.client.post(
+        "/v1/knowledge/bases/kb/test",
+        params={"tenant_id": str(_TENANT)},
+        json={"query": "deductible"},
+        headers=admin,
+    )
+    assert resp.status_code == 200, resp.text
+    [row], _ = await setup.log.list_for_base(tenant_id=_TENANT, kb_id=await _base_id(setup))
+    assert str(row.id) == resp.json()["log_id"]
+    assert row.flags["platform_admin"] is True
+    assert row.actor_id != _EMPLOYEE
+    # Shown to the tenant's own employees, in the list and the detail.
+    base = "/v1/knowledge/bases/kb/retrieval-logs"
+    [listed] = (await setup.client.get(base)).json()["logs"]
+    assert listed["flags"]["platform_admin"] is True
+    detail = (await setup.client.get(f"{base}/{row.id}")).json()
+    assert detail["flags"]["platform_admin"] is True
+
+
+@pytest.mark.asyncio
+async def test_a_search_of_the_callers_own_tenant_is_not_marked(setup: _Setup) -> None:
+    for params in ({}, {"tenant_id": str(_TENANT)}):
+        resp = await setup.client.post(
+            "/v1/knowledge/bases/kb/test", params=params, json={"query": "deductible"}
+        )
+        assert resp.status_code == 200, resp.text
+    rows, total = await setup.log.list_for_base(tenant_id=_TENANT, kb_id=await _base_id(setup))
+    assert total == 2
+    assert all("platform_admin" not in row.flags for row in rows)
 
 
 @pytest.mark.asyncio
@@ -242,3 +287,59 @@ async def test_documents_come_from_the_results_document_ids(
     assert body["results"][0]["document"] is not None
     # The retriever's own attribution read + the response's document read.
     assert calls == ["get_documents", "get_documents"]
+
+
+def _fixture(name: str) -> Any:
+    return json.loads((_FIXTURES / name).read_text(encoding="utf-8"))
+
+
+def _has_keys(actual: Any, expected: Any, where: str) -> None:
+    """``actual`` carries every key ``expected`` (a fixture object) has, down
+    through nested objects and the first item of each list."""
+    if isinstance(expected, dict):
+        assert isinstance(actual, dict), where
+        missing = set(expected) - set(actual)
+        assert not missing, f"{where}: missing {sorted(missing)}"
+        for key, value in expected.items():
+            if actual[key] is not None:
+                _has_keys(actual[key], value, f"{where}.{key}")
+    elif isinstance(expected, list) and expected and actual:
+        _has_keys(actual[0], expected[0], f"{where}[0]")
+
+
+@pytest.mark.asyncio
+async def test_responses_carry_every_key_the_console_reads(setup: _Setup) -> None:
+    """The admin UI's fixtures (``apps/admin-ui/src/api/__fixtures__``) name the
+    keys its retrieval-test tab and record views read: a renamed or dropped
+    key fails here, not silently in the browser. Read from a real search whose
+    first hit is a chunk under a parent row, so every object is filled in
+    (the live ``hit`` too)."""
+    patched = await setup.client.patch("/v1/knowledge/bases/kb", json={"chunk_max_tokens": 128})
+    assert patched.status_code == 200, patched.text
+    uploaded = await setup.client.post(
+        "/v1/knowledge/bases/kb/documents",
+        files={"file": ("guide.md", _GUIDE.encode(), "text/markdown")},
+    )
+    assert uploaded.status_code == 202, uploaded.text
+    await setup.app.state.knowledge_ingestion_runner.drain()
+    tested = (
+        await setup.client.post(
+            "/v1/knowledge/bases/kb/test", json={"query": "pd7 pd8", "method": "keyword"}
+        )
+    ).json()
+    _has_keys(tested, _fixture("knowledge_retrieval_test.json"), "test")
+    assert tested["results"] and tested["results"][0]["document"] is not None
+    assert tested["results"][0]["parent_index"] is not None
+
+    logs = _fixture("knowledge_retrieval_logs.json")
+    base = "/v1/knowledge/bases/kb/retrieval-logs"
+    page = (await setup.client.get(base)).json()
+    _has_keys(page, logs["page"], "page")
+    assert page["logs"]
+    detail = (await setup.client.get(f"{base}/{tested['log_id']}")).json()
+    _has_keys(detail, logs["detail"], "detail")
+    assert detail["results"] and detail["results"][0]["document"] is not None
+    passages = (await setup.client.get(f"{base}/{tested['log_id']}/passages")).json()
+    _has_keys(passages, logs["passages"], "passages")
+    assert passages["passages"][0]["passage"] is not None
+    assert passages["passages"][0]["hit"] is not None

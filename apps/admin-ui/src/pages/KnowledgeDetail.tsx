@@ -4,7 +4,7 @@
  * ``/knowledge/:name/:tab`` — mirrors the platform's list→detail-with-tabs
  * convention (AgentsList→AgentDetail). Stats header + a re-index banner when
  * the base's embedding model is stale; tabs for Documents / Retrieval test /
- * Settings.
+ * Retrieval records (B-175 P2-PR4) / Settings.
  */
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useNavigate, useParams, useSearchParams } from "react-router-dom";
@@ -19,6 +19,7 @@ import { concreteTenantScope, useTenantScope } from "../tenant/TenantScopeContex
 import { useIsTenantSwitched } from "../tenant/useIsTenantSwitched";
 import { PageHeader } from "../components/PageHeader";
 import { DocumentsTab } from "./knowledge_detail/DocumentsTab";
+import { RetrievalLogsTab } from "./knowledge_detail/RetrievalLogsTab";
 import { RetrievalTestTab } from "./knowledge_detail/RetrievalTestTab";
 import { SettingsTab } from "./knowledge_detail/SettingsTab";
 import { ReadonlyTooltip } from "../components/ReadonlyTooltip";
@@ -56,6 +57,10 @@ export function KnowledgeDetail() {
   const isTenantSwitched = useIsTenantSwitched();
   const isForeignRead = readScope != null && readScope !== identity?.homeTenantId;
   const readonly = isTenantSwitched || isForeignRead;
+  // B-175 P3-PR3 — ``manifest:delete`` (tenant admin / system admin): batch
+  // delete and discarding unapplied edits, which delete history.
+  const canDelete =
+    (identity?.isSystemAdmin ?? false) || (identity?.roles.includes("admin") ?? false);
 
   const [base, setBase] = useState<KnowledgeBase | null>(null);
   const [loading, setLoading] = useState(true);
@@ -128,6 +133,23 @@ export function KnowledgeDetail() {
   }
 
   const embedding = base.embedding_model ?? t("knowledge_page.embedding_unset");
+  // B-206 §6 配置摘要行 —— 「切块：小段 400 / 整块 1024 token」.
+  const configSummary =
+    (base.parent_max_tokens != null
+      ? t("kb_maintenance.config_summary", {
+          chunk: base.chunk_max_tokens,
+          parent: base.parent_max_tokens,
+        })
+      : t("kb_maintenance.config_summary_chunk_only", { chunk: base.chunk_max_tokens })) +
+    (base.chunk_overlap_tokens > 0
+      ? t("kb_maintenance.config_summary_overlap", { overlap: base.chunk_overlap_tokens })
+      : "");
+  const goToTab = (key: string) =>
+    navigate(
+      `/knowledge/${encodeURIComponent(name)}/${key}${
+        tenantParam ? `?tenant_id=${encodeURIComponent(tenantParam)}` : ""
+      }`,
+    );
 
   return (
     <div data-testid="knowledge-detail-root">
@@ -145,6 +167,9 @@ export function KnowledgeDetail() {
             </Text>
             <Text type="secondary" style={{ fontSize: 12 }}>
               {t("knowledge_page.stat_embedding")}: <Text code>{embedding}</Text>
+            </Text>
+            <Text type="secondary" style={{ fontSize: 12 }} data-testid="knowledge-config-summary">
+              {configSummary}
             </Text>
             {base.reindexing && (
               <Tag color="processing" bordered={false}>
@@ -193,26 +218,37 @@ export function KnowledgeDetail() {
         activeKey={activeTab}
         // W4 — keep the aggregate row-jump's ``?tenant_id=`` across tab
         // switches, else the read silently falls back to the home tenant.
-        onChange={(k) =>
-          navigate(
-            `/knowledge/${encodeURIComponent(name)}/${k}${
-              tenantParam ? `?tenant_id=${encodeURIComponent(tenantParam)}` : ""
-            }`,
-          )
-        }
+        onChange={goToTab}
         items={[
           { key: "documents", label: t("knowledge_page.tab_documents") },
           { key: "test", label: t("knowledge_page.tab_test") },
+          { key: "logs", label: t("knowledge_retrieval.tab_logs") },
           { key: "settings", label: t("knowledge_page.tab_settings") },
         ]}
       />
 
       {activeTab === "documents" && (
-        <DocumentsTab baseName={name} readScope={readScope} readonly={readonly} />
+        <DocumentsTab
+          baseName={name}
+          readScope={readScope}
+          readonly={readonly}
+          canDelete={canDelete}
+        />
       )}
-      {activeTab === "test" && <RetrievalTestTab base={base} readScope={readScope} />}
+      {activeTab === "test" && (
+        <RetrievalTestTab
+          base={base}
+          readScope={readScope}
+          readonly={readonly}
+          // B-175 P2-PR4 — the saved base as PATCH returned it: a refresh would
+          // show the skeleton, unmounting the tab and its results.
+          onBaseUpdated={setBase}
+          onOpenLogs={() => goToTab("logs")}
+        />
+      )}
+      {activeTab === "logs" && <RetrievalLogsTab baseName={name} readScope={readScope} />}
       {activeTab === "settings" && (
-        <SettingsTab base={base} onSaved={refresh} readonly={readonly} />
+        <SettingsTab base={base} onSaved={refresh} readonly={readonly} readScope={readScope} />
       )}
     </div>
   );

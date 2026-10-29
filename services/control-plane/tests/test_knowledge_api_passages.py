@@ -194,6 +194,51 @@ async def test_every_passage_carries_the_keys_the_frontend_reads(harness: Harnes
     assert set(page) >= set(fixture)
 
 
+async def _review_in_list(harness: Harness) -> dict[str, int]:
+    """The document's ``review`` in a paged and an unpaged document list asked
+    ``with_review`` (the same in both)."""
+    asks: list[dict[str, str]] = [{"limit": "50", "with_review": "true"}, {"with_review": "true"}]
+    lists = [
+        await harness.client.get("/v1/knowledge/bases/kb/documents", params=params)
+        for params in asks
+    ]
+    found = [
+        next(d["review"] for d in page.json()["documents"] if d["id"] == harness.document_id)
+        for page in lists
+    ]
+    assert found[0] == found[1]
+    review: dict[str, int] = found[0]
+    return review
+
+
+async def test_the_document_list_says_nothing_waits_for_review(harness: Harness) -> None:
+    assert await _review_in_list(harness) == {"inherited": 0, "unapplied": 0}
+
+
+async def test_the_document_list_counts_review_only_when_asked(
+    harness: Harness, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``review`` costs a read of the page's chunks: a list read that does not
+    ask (the console's 5-second poll during an ingest) neither runs it nor
+    carries the key."""
+    asked: list[list[UUID]] = []
+    real = harness.store.count_review_items
+
+    async def counting(*, tenant_id: UUID, document_ids: Sequence[UUID]) -> dict[UUID, Any]:
+        asked.append(list(document_ids))
+        return await real(tenant_id=tenant_id, document_ids=document_ids)
+
+    monkeypatch.setattr(harness.store, "count_review_items", counting)
+    unasked: list[dict[str, str]] = [{"limit": "50"}, {}, {"limit": "50", "with_review": "false"}]
+    for params in unasked:
+        listed = await harness.client.get("/v1/knowledge/bases/kb/documents", params=params)
+        assert listed.status_code == 200, listed.text
+        assert all("review" not in d for d in listed.json()["documents"])
+    assert asked == []
+    await _review_in_list(harness)
+    assert asked == [[UUID(harness.document_id)]] * 2  # once per read, the whole page
+
+
 async def test_passages_are_read_with_the_tenant_scope(harness: Harness) -> None:
     admin = await grant_system_admin(harness.client)
     own = await harness.client.get(
@@ -402,6 +447,8 @@ async def test_a_reupload_lists_what_needs_review_and_it_can_be_discarded(
     ((inherited,),) = [review["inherited"]]
     assert (inherited["enabled"], inherited["disabled_reason"]) == (False, "inherited")
     assert "Paragraph c was rewritten in the file." in inherited["content"]
+    # The document list says so (B-175 P3-PR3: the row's 「待复核」).
+    assert await _review_in_list(harness) == {"inherited": 1, "unapplied": 1}
 
     # Discarding deletes history: manifest:delete, which an operator lacks.
     operator = make_test_jwt(tenant_id=_TENANT, subject="user-b", roles=("operator",))
@@ -414,6 +461,7 @@ async def test_a_reupload_lists_what_needs_review_and_it_can_be_discarded(
     assert discarded.json() == {"discarded": 2}
     after = (await harness.client.get(f"{harness.base}/unapplied-edits")).json()
     assert after["unapplied"] == []
+    assert await _review_in_list(harness) == {"inherited": 1, "unapplied": 0}
     history = await harness.client.get(f"{harness.base}/passages/{notes['id']}/revisions")
     assert history.json() == {"revisions": []}
     rows = [r for r in await harness.audit_rows() if r[0] == "knowledge:passage_discard_unapplied"]

@@ -67,6 +67,12 @@ export interface KnowledgeBase {
   /** A re-index is in flight (the base is re-embedding its chunk text). */
   reindexing?: boolean;
   stats?: KnowledgeBaseStats;
+  /** B-206 K-3 — what a document's ``chunk_params_hash`` must equal to be cut
+   *  by the current chunking parameters (else it is stale: re-ingest it). */
+  chunk_params_hash?: string;
+  /** B-175 P3-PR2 — a passage's (整块) token cap, fixed by the platform; an
+   *  edited passage may hold up to twice it. */
+  parent_max_tokens?: number;
 }
 
 export interface KnowledgeDocument {
@@ -101,6 +107,10 @@ export interface KnowledgeDocument {
    *  was ingested before pictures were described. */
   figure_stats?: FigureStats | null;
   enabled?: boolean;
+  /** B-175 P3-PR3 — what waits for a person on this document (list reads
+   *  only): passages switched off by inheritance, and edits a re-ingest
+   *  could not put back (``GET …/unapplied-edits``). */
+  review?: { inherited: number; unapplied: number };
   created_at: string | null;
   updated_at: string | null;
 }
@@ -220,7 +230,32 @@ export interface RetrievalTestResult {
   hit_content?: string | null;
   /** The best hit chunk's own breadcrumb (empty when the result is that chunk). */
   hit_heading_path?: string[];
+  // ── B-175 P2-PR4 — the best hit chunk's four scores (``null`` for a path
+  //    that did not find it; ``vector_score`` is ``score``) and the document. ──
+  vector_score?: number | null;
+  keyword_score?: number | null;
+  fused_score?: number | null;
+  rerank_score?: number | null;
+  /** The document as it is now; ``null`` once deleted. */
+  document?: KnowledgeHitDocument | null;
 }
+
+/** B-175 P2-PR4 — the document a retrieval hit belongs to (B-206 §6: short
+ *  id ``D{doc_seq}``, title, upload time). */
+export interface KnowledgeHitDocument {
+  id: string;
+  doc_seq: number | null;
+  title: string | null;
+  filename: string;
+  created_at: string | null;
+  /** The document's own switch — switching it off leaves its chunks' switches
+   *  on, so a record read later says so here; absent on older backends. */
+  enabled?: boolean;
+}
+
+/** How a knowledge search ended — ``no_hits`` / ``below_threshold`` came back
+ *  empty (every candidate under the rerank floor for the latter). */
+export type SearchStatus = "ok" | "no_hits" | "below_threshold";
 
 export interface RetrievalTestResponse {
   query: string;
@@ -234,6 +269,22 @@ export interface RetrievalTestResponse {
   rerank_threshold_model?: string | null;
   /** The model that scored this search; ``null`` without scores. */
   rerank_model?: string | null;
+  // ── B-175 wave 2 / B-206 — how the search ran (B-175 P2-PR4 shows them). ──
+  status?: SearchStatus;
+  /** Ranked passages the rerank floor was applied to. */
+  candidates?: number;
+  /** K-8 — the question could not be embedded: keyword results only. */
+  embedding_degraded?: boolean;
+  /** K-22 — keyword recall did not finish: the vector path's results only. */
+  keyword_degraded?: boolean;
+  /** K-21② — passages left out as a copy of a better-ranked one. */
+  duplicates_dropped?: number;
+  /** K-14 — candidates the reranker was handed but never scored. */
+  rerank_dropped?: number;
+  /** B-175 P2-PR4 — the search's own time (not its logging). */
+  elapsed_ms?: number;
+  /** The retrieval record this search wrote; ``null`` when none was written. */
+  log_id?: string | null;
 }
 
 /** Update payload — only supplied keys are applied; ``null`` clears a
@@ -257,6 +308,9 @@ export interface RetrievalTestBody {
   method?: RetrievalMethod;
   score_threshold?: number | null;
   rerank?: boolean;
+  /** B-175 wave 2 PR3 — a rerank floor for this search only (calibration);
+   *  omitted = the base's own applies. */
+  rerank_score_threshold?: number;
 }
 
 /** Upload whitelist — mirrors the backend's SUPPORTED_EXTENSIONS
@@ -402,10 +456,15 @@ export async function listDocuments(
   baseName: string,
   page: PageParams,
   tenantScope?: TenantScope,
+  /** B-175 P3-PR3 — ``withReview``: each row's ``review`` (the server reads
+   *  the page's chunks for it; the 5-second poll leaves it out). */
+  options?: { withReview?: boolean },
 ): Promise<DocumentsPage> {
+  const params: Record<string, unknown> = { limit: page.limit, offset: page.offset };
+  if (options?.withReview) params.with_review = true;
   const response = await apiClient.get<DocumentsPage>(
     `/v1/knowledge/bases/${encodeURIComponent(baseName)}/documents`,
-    { params: withTenantScope({ limit: page.limit, offset: page.offset }, tenantScope) },
+    { params: withTenantScope(params, tenantScope) },
   );
   return response.data;
 }

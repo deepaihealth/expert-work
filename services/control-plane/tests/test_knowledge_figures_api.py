@@ -272,7 +272,9 @@ async def test_if_none_match_uses_the_weak_comparison(
     assert response.status_code == status
 
 
-async def test_chunk_lists_confirm_only_figures_the_document_holds(setup: _Setup) -> None:
+async def test_chunk_and_passage_lists_confirm_only_figures_the_document_holds(
+    setup: _Setup,
+) -> None:
     # Security review S-L1: a paragraph an author typed to look like a figure
     # block, or one naming another document's figure, gets no thumbnail.
     forged = "fedcba9876543210"
@@ -297,6 +299,15 @@ async def test_chunk_lists_confirm_only_figures_the_document_holds(setup: _Setup
     assert listed["figure_ids"] == [_ID]
     theirs = (
         await setup.other.get(f"/v1/knowledge/bases/kb/documents/{setup.other_document}/chunks")
+    ).json()
+    assert theirs["figure_ids"] == []
+    # B-175 P3-PR3 — the passage list (the console's 整块 view) the same way.
+    passages = (
+        await setup.client.get(f"/v1/knowledge/bases/kb/documents/{setup.document}/passages")
+    ).json()
+    assert passages["figure_ids"] == [_ID]
+    theirs = (
+        await setup.other.get(f"/v1/knowledge/bases/kb/documents/{setup.other_document}/passages")
     ).json()
     assert theirs["figure_ids"] == []
 

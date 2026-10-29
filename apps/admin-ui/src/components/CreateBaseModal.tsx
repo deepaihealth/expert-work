@@ -102,7 +102,16 @@ export function CreateBaseModal({ open, onClose, onCreated }: CreateBaseModalPro
           >
             <Input data-testid="kb-create-name" aria-label={t("knowledge_page.field_name")} />
           </Form.Item>
-          <Form.Item name="description" label={t("knowledge_page.field_description")}>
+          <Form.Item
+            name="description"
+            label={t("knowledge_page.field_description")}
+            // B-175 P3-PR3 — agents binding several bases pick one by its description.
+            extra={
+              <span data-testid="kb-create-description-hint">
+                {t("kb_maintenance.description_agent_hint")}
+              </span>
+            }
+          >
             <Input.TextArea
               rows={2}
               placeholder={t("knowledge_page.field_description_placeholder")}

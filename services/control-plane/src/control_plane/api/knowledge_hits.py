@@ -17,13 +17,16 @@ from expert_work.protocol import KnowledgeDocument
 
 
 def document_ref(document: KnowledgeDocument) -> dict[str, Any]:
-    """The document as a hit shows it: ``D{doc_seq}``, title, file, upload time."""
+    """The document as a hit shows it: ``D{doc_seq}``, title, file, upload time,
+    and whether it is switched on — switching a document off flips its row
+    only, so a record read later shows its chunks' text unmarked otherwise."""
     return {
         "id": str(document.id),
         "doc_seq": document.doc_seq,
         "title": document.title,
         "filename": document.filename,
         "created_at": document.created_at.isoformat() if document.created_at else None,
+        "enabled": document.enabled,
     }
 
 
