@@ -57,6 +57,7 @@ from expert_work.persistence.knowledge import (
     DuplicateKnowledgeBaseError,
     KnowledgeRetrievalLogStore,
 )
+from expert_work.persistence.knowledge.base import ReviewCounts
 from expert_work.protocol import (
     DEFAULT_CHUNK_MAX_TOKENS,
     DEFAULT_CHUNK_OVERLAP_TOKENS,
@@ -319,6 +320,13 @@ def _document_dict(document: KnowledgeDocument) -> dict[str, Any]:
         "created_at": _iso(document.created_at),
         "updated_at": _iso(document.updated_at),
     }
+
+
+def _review_dict(counts: ReviewCounts | None) -> dict[str, int]:
+    """A document list row's ``review`` (B-175 P3-PR3): passages switched off
+    by inheritance and unapplied edits waiting for a person."""
+    found = counts or ReviewCounts()
+    return {"inherited": found.inherited, "unapplied": found.unapplied}
 
 
 def _chunk_dict(chunk: KnowledgeChunk, parent_index: int | None) -> dict[str, Any]:
@@ -831,6 +839,9 @@ def build_knowledge_router() -> APIRouter:
         # B-175 P3-PR2 — only the documents switched that way / in these statuses.
         enabled: bool | None = None,
         status: Annotated[list[DocumentStatus] | None, Query()] = None,
+        # B-175 P3-PR3 — each row's ``review`` (it reads the page's chunks, so
+        # only when asked: the console's 5-second poll does not).
+        with_review: bool = False,
     ) -> JSONResponse:
         scope = await ensure_single_tenant_scope(
             request.state.principal,
@@ -858,9 +869,22 @@ def build_knowledge_router() -> APIRouter:
                     enabled=enabled,
                     statuses=status,
                 )
+            # B-175 P3-PR3 — the row's 「待复核」: one read for the whole page.
+            review = (
+                await store.count_review_items(
+                    tenant_id=scope.tenant_id, document_ids=[doc.id for doc in documents]
+                )
+                if with_review
+                else None
+            )
         return JSONResponse(
             content={
-                "documents": [_document_dict(doc) for doc in documents],
+                "documents": [
+                    _document_dict(doc)
+                    if review is None
+                    else {**_document_dict(doc), "review": _review_dict(review.get(doc.id))}
+                    for doc in documents
+                ],
                 "total": total,
                 "offset": safe_offset,
                 "limit": safe_limit,

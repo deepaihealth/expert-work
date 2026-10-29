@@ -32,6 +32,7 @@ from expert_work.persistence.knowledge.passages import (
     PassageConflictError,
     PassageLayout,
     PassageRevision,
+    ReviewCounts,
     SwitchOffRecord,
     edited_since,
     manual_passages,
@@ -1135,6 +1136,23 @@ class InMemoryKnowledgeStore(KnowledgeStore):
         discarded = len(self._revisions) - len(kept) + len(self._switch_offs) - len(kept_records)
         self._revisions, self._switch_offs = kept, kept_records
         return discarded
+
+    async def count_review_items(
+        self, *, tenant_id: UUID, document_ids: Sequence[UUID]
+    ) -> dict[UUID, ReviewCounts]:
+        counts: dict[UUID, ReviewCounts] = {}
+        for document_id in dict.fromkeys(document_ids):
+            inherited = sum(
+                1
+                for p in self._passages(tenant_id, document_id)
+                if p.row.disabled_reason == "inherited"
+            )
+            unapplied = len(
+                await self.list_unapplied_revisions(tenant_id=tenant_id, document_id=document_id)
+            )
+            if inherited or unapplied:
+                counts[document_id] = ReviewCounts(inherited=inherited, unapplied=unapplied)
+        return counts
 
     async def list_manual_passages(
         self, *, tenant_id: UUID, document_id: UUID

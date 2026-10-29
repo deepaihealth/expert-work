@@ -67,6 +67,12 @@ export interface KnowledgeBase {
   /** A re-index is in flight (the base is re-embedding its chunk text). */
   reindexing?: boolean;
   stats?: KnowledgeBaseStats;
+  /** B-206 K-3 — what a document's ``chunk_params_hash`` must equal to be cut
+   *  by the current chunking parameters (else it is stale: re-ingest it). */
+  chunk_params_hash?: string;
+  /** B-175 P3-PR2 — a passage's (整块) token cap, fixed by the platform; an
+   *  edited passage may hold up to twice it. */
+  parent_max_tokens?: number;
 }
 
 export interface KnowledgeDocument {
@@ -101,6 +107,10 @@ export interface KnowledgeDocument {
    *  was ingested before pictures were described. */
   figure_stats?: FigureStats | null;
   enabled?: boolean;
+  /** B-175 P3-PR3 — what waits for a person on this document (list reads
+   *  only): passages switched off by inheritance, and edits a re-ingest
+   *  could not put back (``GET …/unapplied-edits``). */
+  review?: { inherited: number; unapplied: number };
   created_at: string | null;
   updated_at: string | null;
 }
@@ -446,10 +456,15 @@ export async function listDocuments(
   baseName: string,
   page: PageParams,
   tenantScope?: TenantScope,
+  /** B-175 P3-PR3 — ``withReview``: each row's ``review`` (the server reads
+   *  the page's chunks for it; the 5-second poll leaves it out). */
+  options?: { withReview?: boolean },
 ): Promise<DocumentsPage> {
+  const params: Record<string, unknown> = { limit: page.limit, offset: page.offset };
+  if (options?.withReview) params.with_review = true;
   const response = await apiClient.get<DocumentsPage>(
     `/v1/knowledge/bases/${encodeURIComponent(baseName)}/documents`,
-    { params: withTenantScope({ limit: page.limit, offset: page.offset }, tenantScope) },
+    { params: withTenantScope(params, tenantScope) },
   );
   return response.data;
 }

@@ -41,6 +41,9 @@ from expert_work.persistence.knowledge.passages import (
     PassageRevision as PassageRevision,
 )
 from expert_work.persistence.knowledge.passages import (
+    ReviewCounts as ReviewCounts,
+)
+from expert_work.persistence.knowledge.passages import (
     SwitchOffRecord as SwitchOffRecord,
 )
 from expert_work.protocol import (
@@ -827,6 +830,17 @@ class KnowledgeStore(abc.ABC):
         history of every passage that is gone, the revisions above the
         current one of a passage still there, and the switch-off records no
         passage holds the text of. Returns the rows deleted."""
+
+    @abc.abstractmethod
+    async def count_review_items(
+        self, *, tenant_id: UUID, document_ids: Sequence[UUID]
+    ) -> dict[UUID, ReviewCounts]:
+        """B-175 P3-PR3 — per document of ``document_ids``, what waits for a
+        person: the passages switched off by inheritance (a passage once, not
+        each of its chunks) and what :meth:`list_unapplied_revisions` lists.
+        Only documents with something to review are in the result (another
+        tenant's and unknown ids never are). One read for all of them — a
+        document list page asks it once."""
 
     @abc.abstractmethod
     async def list_manual_passages(
