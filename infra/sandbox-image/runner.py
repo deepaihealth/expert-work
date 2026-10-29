@@ -6,7 +6,8 @@ writes one request object per line, and reads one response per line:
 
     → {"code": "<python source>", "timeout_s": 30}
     → {"code": "...", "timeout_s": 30, "envs": {"PYTHONUSERBASE": "/opt/agents/a1"},
-       "agent_root": "/mnt/workspace/agents/a1"}
+       "agent_root": "/mnt/workspace/agents/a1",
+       "conv_id": "<uuid>", "compat_dirs": ["style"]}
     ← {"stdout": "...", "stderr": "...", "exit_code": 0, "timed_out": false}
 
 ``envs`` (sandbox migration wave 2, spec 决策 10) is optional and merged onto
@@ -17,6 +18,12 @@ isolation, sent by the supervisor's own ``ExecRequest.envs`` field.
 mount. The runner binds it as ``/workspace`` inside a private mount
 namespace it creates for this one exec, so the child's ``/workspace`` is
 that agent's directory and no other agent's directory is even there.
+
+``conv_id`` / ``compat_dirs`` (B-236) are optional too: with a ``conv_id``
+the child's ``/workspace`` is that conversation's own directory
+(``<agent_root>/threads/<conv_id>/work``) and ``/agent`` is the agent
+directory; ``compat_dirs`` are agent-directory names mapped into
+``/workspace`` during the transition window.
 
 The submitted code runs in a *child* ``python -c`` process rather than in
 this interpreter. A child is killable on timeout and isolates a crashing
@@ -52,13 +59,42 @@ MAX_OUTPUT_CHARS = 1_000_000
 #: shared/ 只读挂入、tmpfs 盖掉 /mnt/workspace。**与 orchestrator
 #: ``exec_view.EXEC_VIEW_SCRIPT`` 逐字相同**(这个文件是镜像代码,不能 import 仓库;
 #: 契约测试 ``test_exec_view_script_matches_the_sandbox_image`` 用 ast 比对两份字面量,
-#: 改一边必红)。参数走位置参数:``$1`` = bind 源(空串 = 未绑,bind 整个用户根)。
+#: 改一边必红)。参数走位置参数:``$1`` = bind 源(空串 = 未绑,bind 整个用户根),
+#: ``$2`` = 对话 id(B-236,空串 = 老视图),``$3`` = 过渡期目录个数,其后是目录名。
 _EXEC_VIEW_SCRIPT = """\
 set -eu
-root="$1"; shift
+root="$1"; conv="$2"; n="$3"; shift 3
+if [ ! -d /agent ]; then
+  echo "ew-exec-view: image lacks /agent" >&2
+  exit 97
+fi
+case "$n" in
+  ''|*[!0-9]*) echo "ew-exec-view: bad compat count" >&2; exit 98 ;;
+esac
+case "$conv" in
+  */*|.|..) echo "ew-exec-view: bad conversation id" >&2; exit 98 ;;
+esac
 if [ -n "$root" ]; then
   mkdir -p "$root"
-  mount --bind "$root" /workspace
+  mount --bind "$root" /agent
+  if [ -n "$conv" ]; then
+    mkdir -p "$root/threads/$conv/work"
+    mount --bind "$root/threads/$conv/work" /workspace
+    mount -t tmpfs -o size=1k,mode=0500 none /agent/threads
+    mkdir -p "/agent/threads/$conv"
+    mount --bind "$root/threads/$conv" "/agent/threads/$conv"
+    for d in uploads inputs .tool_results; do
+      mkdir -p "$root/$d"
+      if [ -L "/workspace/$d" ] || { [ -e "/workspace/$d" ] && [ ! -d "/workspace/$d" ]; }; then
+        echo "ew-exec-view: /workspace/$d is not a directory; $d/ not mounted" >&2
+      else
+        mkdir -p "/workspace/$d"
+        mount --bind "$root/$d" "/workspace/$d"
+      fi
+    done
+  else
+    mount --bind "$root" /workspace
+  fi
   if [ -d /mnt/workspace/shared ]; then
     if [ -L /workspace/shared ] || { [ -e /workspace/shared ] && [ ! -d /workspace/shared ]; }; then
       echo "ew-exec-view: /workspace/shared is not a directory; shared/ not mounted" >&2
@@ -68,9 +104,27 @@ if [ -n "$root" ]; then
       mount -o remount,bind,ro,nosuid,nodev,noexec /workspace/shared
     fi
   fi
+  while [ "$n" -gt 0 ]; do
+    d="$1"; shift; n=$((n - 1))
+    case "$d" in
+      ''|.|..|*/*|threads|uploads|inputs|.tool_results|shared|skills|agents)
+        echo "ew-exec-view: bad compat dir" >&2; exit 98 ;;
+    esac
+    if [ -z "$conv" ] || [ -L "$root/$d" ] || [ ! -d "$root/$d" ] || [ -L "/workspace/$d" ]; then
+      continue
+    fi
+    if [ ! -e "/workspace/$d" ]; then
+      mkdir "/workspace/$d"
+    elif [ ! -d "/workspace/$d" ] || [ -n "$(ls -A "/workspace/$d")" ]; then
+      continue
+    fi
+    mount --bind "$root/$d" "/workspace/$d"
+  done
   mount -t tmpfs -o size=1k none /mnt/workspace
 else
+  mount --bind /mnt/workspace /agent
   mount --bind /mnt/workspace /workspace
+  shift "$n"
 fi
 cd /workspace
 exec "$@"
@@ -82,7 +136,12 @@ exec "$@"
 Response = dict[str, str | int | bool]
 
 
-def _exec_argv(code: str, agent_root: str | None) -> list[str]:
+def _exec_argv(
+    code: str,
+    agent_root: str | None,
+    conv_id: str | None = None,
+    compat_dirs: list[str] | None = None,
+) -> list[str]:
     """The child process argv: the B-60 namespace wrapper around ``python -c code``.
 
     Split out of :func:`run_once` so the runner's own unit tests can swap it for a
@@ -91,7 +150,12 @@ def _exec_argv(code: str, agent_root: str | None) -> list[str]:
     developer's macOS. The contract gate
     ``test_sandbox_runtime_contract.test_exec_view_script_matches_the_sandbox_image``
     finds this list literal by ``ast`` and pins it against the orchestrator's copy.
+
+    B-236 —— the conversation id and the compat names only travel with an agent
+    root (no agent, no conversation view); the script re-validates every name.
     """
+    conv = conv_id if agent_root and conv_id else ""
+    compat = list(compat_dirs or ()) if conv else []
     return [
         "unshare",
         "-Urm",
@@ -103,6 +167,9 @@ def _exec_argv(code: str, agent_root: str | None) -> list[str]:
         _EXEC_VIEW_SCRIPT,
         "ew-exec-view",
         agent_root or "",
+        conv,
+        str(len(compat)),
+        *compat,
         # -E -P, deliberately NOT -I: -I implies -s, which kicks the user
         # site out of sys.path and silently breaks `pip install --user`
         # (the image's PIP_USER=1 flow). -E keeps PYTHON* env-config
@@ -120,6 +187,8 @@ def run_once(
     timeout_s: int,
     envs: dict[str, str] | None = None,
     agent_root: str | None = None,
+    conv_id: str | None = None,
+    compat_dirs: list[str] | None = None,
 ) -> Response:
     """Run ``code`` in a child Python process; capture stdout / stderr / exit.
 
@@ -141,7 +210,7 @@ def run_once(
     """
     timeout_s = max(1, min(timeout_s, MAX_TIMEOUT_S))
     child_env = {**os.environ, **envs} if envs else None
-    argv = _exec_argv(code, agent_root)
+    argv = _exec_argv(code, agent_root, conv_id, compat_dirs)
     try:
         proc = subprocess.run(  # noqa: S603 - arbitrary code execution is the tool
             argv,
@@ -183,7 +252,13 @@ def handle_request(request: dict[str, object]) -> Response:
     )
     raw_root = request.get("agent_root")
     agent_root = raw_root if isinstance(raw_root, str) and raw_root else None
-    return run_once(code, timeout_s, envs, agent_root)
+    raw_conv = request.get("conv_id")
+    conv_id = raw_conv if isinstance(raw_conv, str) and raw_conv else None
+    raw_compat = request.get("compat_dirs")
+    compat_dirs = (
+        [d for d in raw_compat if isinstance(d, str)] if isinstance(raw_compat, list) else None
+    )
+    return run_once(code, timeout_s, envs, agent_root, conv_id, compat_dirs)
 
 
 def handle_line(line: str) -> Response:

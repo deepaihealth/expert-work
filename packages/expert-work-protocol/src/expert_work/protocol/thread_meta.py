@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from datetime import datetime
 from enum import StrEnum
+from typing import Literal
 from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field
@@ -48,6 +49,11 @@ class ThreadMeta(BaseModel):
     agent_version: str | None = Field(default=None, description="manifest version (semver)")
     message_count: int | None = Field(
         default=None, description="第三方可见口径的消息条数;None=尚未算过"
+    )
+    workspace_layout: Literal["conversation", "agent_root"] = Field(
+        default="conversation",
+        description="B-236 沙箱 /workspace 的视图:conversation = 本对话自己的目录;"
+        "agent_root = 发布前已开的对话,沿用 agent 根",
     )
     created_at: datetime | None = None
     updated_at: datetime | None = None

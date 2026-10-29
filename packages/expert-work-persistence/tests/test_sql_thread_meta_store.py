@@ -481,3 +481,26 @@ async def test_list_agent_names_for_user_matches_the_in_memory_predicate(
         ]
     finally:
         await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_workspace_layout_comes_from_the_row(sql_store: SqlStoreFixture) -> None:
+    """B-236 —— ``create`` 不写这一列,新行取库的默认值 ``conversation``;发布前的行
+    (迁移给的 ``agent_root``)原样读回。"""
+    from sqlalchemy import text
+
+    store, engine = sql_store
+    try:
+        new_id, old_id, tenant_id = uuid4(), uuid4(), uuid4()
+        created = await store.create(thread_id=new_id, tenant_id=tenant_id, created_by="u")
+        assert created.workspace_layout == "conversation"
+        await store.create(thread_id=old_id, tenant_id=tenant_id, created_by="u")
+        async with engine.begin() as conn:
+            await conn.execute(
+                text("UPDATE thread_meta SET workspace_layout = 'agent_root' WHERE thread_id = :t"),
+                {"t": old_id},
+            )
+        old = await store.get(old_id, tenant_id=tenant_id)
+        assert old is not None and old.workspace_layout == "agent_root"
+    finally:
+        await engine.dispose()

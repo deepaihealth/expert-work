@@ -815,3 +815,31 @@ async def test_scope_user_drops_agents_with_no_live_code(
         params={"user_id": "孤儿树用户", "scope": "user"},
     )
     assert [f["path"] for f in resp.json()["data"]["files"]] == ["live.md"]
+
+
+@pytest.mark.asyncio
+async def test_conversation_files_carry_their_session_id(
+    external_client, two_agents: _SeededTwoAgents
+) -> None:
+    """B-236 —— 新对话的文件在 ``threads/<会话 id>/work/`` 里:path 多这一段,另带
+    ``session_id``;老文件的 path 与字段不变(``session_id`` 为 ``null``),下载照旧。"""
+    conv = uuid4()
+    two_agents.store.files[f"agents/{_KEY_A}/threads/{conv}/work/report.md"] = b"r"
+    resp = await external_client.get(
+        f"/v1/agents/{_AGENT_A}/workspace/files", params={"user_id": two_agents.user_id}
+    )
+    files = {f["path"]: f for f in resp.json()["data"]["files"]}
+    assert files[f"threads/{conv}/work/report.md"] == {
+        "path": f"threads/{conv}/work/report.md",
+        "size": 1,
+        "agent_code": _AGENT_A,
+        "session_id": str(conv),
+    }
+    assert files["客户案例/x.md"]["session_id"] is None
+    assert files["客户案例/x.md"]["agent_code"] == _AGENT_A
+    download = await external_client.get(
+        f"/v1/agents/{_AGENT_A}/workspace/file",
+        params={"user_id": two_agents.user_id, "path": f"threads/{conv}/work/report.md"},
+    )
+    assert download.status_code == 200
+    assert download.content == b"r"

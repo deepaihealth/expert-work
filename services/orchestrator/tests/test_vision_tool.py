@@ -32,6 +32,7 @@ from orchestrator.tools.sandbox import (
     WorkspacePermissionError,
 )
 from orchestrator.tools.vision import AskImageTool
+from orchestrator.tools.workspace_paths import WorkspaceView
 from orchestrator.tools.workspace_store import RecordingWorkspaceStore, WorkspaceFileEntry
 
 from .test_read_page import _install_office_stubs, _run_render, _snippet_params
@@ -403,7 +404,7 @@ def _figure_rel(
     *, run: str = _NEW_RUN, render: str = "b" * 16, unit: int = 10, agent_key: str = _AGENT
 ) -> str:
     """一张 ``read_page`` 渲染页的**作用域相对**落点(形状与片段产出一致)。"""
-    doc_sha = document_sha(_DOC, agent_key=agent_key)
+    doc_sha = document_sha(_DOC, view=WorkspaceView(agent_key=agent_key))
     assert doc_sha is not None
     return f".tool_results/{run}/figures/{doc_sha}/{render}/_u{unit}/page-{unit:02d}.jpg"
 
@@ -782,6 +783,8 @@ class _LocalRenderRuntime(RecordingSandboxRuntime):
         run_id: UUID | None = None,
         has_skills: bool = False,
         egress: EgressContext | None = None,
+        conv_id: UUID | None = None,
+        compat_dirs: tuple[str, ...] = (),
     ) -> SandboxOutcome:
         await super().exec(
             sandbox_id=sandbox_id,

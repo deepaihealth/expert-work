@@ -244,15 +244,20 @@ from orchestrator.tools.overflow import (
 )
 from orchestrator.tools.registry import (
     TOOL_ALLOWED_STATE_KEYS,
+    WORKSPACE_LAYOUT_KEY,
+    WORKSPACE_THREAD_ID_KEY,
     Tool,
     ToolContext,
     ToolNotFoundError,
     ToolRegistry,
     ToolResult,
     ToolSpec,
+    WorkspaceLayout,
 )
 from orchestrator.tools.scheduling import MAX_TOOL_WORKERS, plan_stages
 from orchestrator.tools.spawn_worker import SPAWN_WORKER_TOOL_NAME
+from orchestrator.tools.workspace_compat import with_workspace_compat
+from orchestrator.tools.workspace_paths import WorkspaceView
 from orchestrator.tools.workspace_store import WorkspaceStore
 from orchestrator.tools.workspace_tree import workspace_prompt_block
 from orchestrator.usage_metering import without_served_by
@@ -918,8 +923,12 @@ def build_react_graph(
         # 一段占位文字。把它作为 ``reserved`` 交给压缩器 —— 只计入估算、不进被总结的
         # 那段(压缩器去总结或丢掉它都是错的)。身份与工作区快照同一个来源:本次 run 的
         # config。每轮重建、不落检查点。
-        figure_agent_key_raw = configurable.get("agent_key")
-        figure_agent_key = figure_agent_key_raw if isinstance(figure_agent_key_raw, str) else ""
+        # B-236 —— 本轮的工作区视图(布局 / 对话 / 过渡期名单)与工具那一侧同一个来源:
+        # ``_build_tool_context`` 读 config, 过渡期名单在宿主侧现算一次。渲染页段与工作区
+        # 快照都用它。
+        turn_view = (
+            await with_workspace_compat(_build_tool_context(config), workspace_store)
+        ).workspace_view
         figure_viewed = state.get("viewed_figures") or []
         figure_documents = state.get("figure_documents") or {}
         figure_tenant = _parse_uuid(configurable.get("tenant_id"))
@@ -933,7 +942,7 @@ def build_react_graph(
                 documents=figure_documents,
                 tenant_id=figure_tenant,
                 user_id=figure_user,
-                agent_key=figure_agent_key,
+                view=turn_view,
             )
             if supports_vision and figure_viewed and workspace_store is not None
             else None
@@ -944,7 +953,7 @@ def build_react_graph(
             supports_vision=supports_vision,
             tenant_id=figure_tenant,
             user_id=figure_user,
-            agent_key=figure_agent_key,
+            view=turn_view,
             freshness=figure_fresh,
         )
         reserved: tuple[BaseMessage, ...] = (figure_block,) if figure_block is not None else ()
@@ -1089,14 +1098,13 @@ def build_react_graph(
         #
         # 身份一律从**本次 run 的** config 取, 与 ``read_file`` / ``list_dir`` 同一个
         # 来源(``_build_tool_context`` 读的也是这三个键)。
-        agent_key_raw = configurable.get("agent_key")
         if workspace_store is not None and tenant_id is not None and user_id is not None:
             messages = await _workspace_block_tail(
                 messages,
                 workspace_store,
                 tenant_id=tenant_id,
                 user_id=user_id,
-                agent_key=agent_key_raw if isinstance(agent_key_raw, str) else "",
+                view=turn_view,
             )
         # B-64 —— 渲染页段(Path A)挂到尾部。块在压缩判定之前就造好了(见那里的
         # 注释);这里与上面工作区快照同一个位置。**无条件调用**:没有块时也要把
@@ -1952,6 +1960,8 @@ def build_react_graph(
             turn_documents=state.get("turn_documents"),
             turn_image_refs=state.get("turn_image_refs"),
         )
+        # B-236 —— 过渡期映射名单每步在宿主侧算一次,同一份交给路径解析与 exec。
+        ctx_obj = await with_workspace_compat(ctx_obj, workspace_store)
         # Stream TE-2 — per-tool-call audit sink (may be None on the dev /
         # unit-test path; ``_dispatch_tool`` treats the emit as best-effort).
         audit_logger = audit_logger_from_config(config)
@@ -2585,7 +2595,7 @@ async def _workspace_block_tail(
     *,
     tenant_id: UUID,
     user_id: UUID,
-    agent_key: str,
+    view: WorkspaceView,
 ) -> list[BaseMessage]:
     """B-84 PR-2 —— 重取一份工作区快照, 挂到提示词尾部;更早的那几段一并剔掉。
 
@@ -2611,9 +2621,7 @@ async def _workspace_block_tail(
     工作区空了、或者这一轮列目录失败, 都不该让上一轮那份过期快照留下来顶班。
     """
     kept = _without_workspace_blocks(messages)
-    block = await workspace_prompt_block(
-        store, tenant_id=tenant_id, user_id=user_id, agent_key=agent_key
-    )
+    block = await workspace_prompt_block(store, tenant_id=tenant_id, user_id=user_id, view=view)
     if not block:
         return kept
     # ``HIDE_FROM_UI`` = 不进任何面向用户/第三方的视图, 也不开新一段;
@@ -4368,6 +4376,13 @@ def _build_tool_context(
     # config 里没有这一项,它的被绑参数就会被静默摘掉)。主 run 的填值不走这里。
     raw_prompt_inputs = configurable.get(PROMPT_INPUTS_KEY)
     prompt_inputs = raw_prompt_inputs if isinstance(raw_prompt_inputs, Mapping) else None
+    # B-236 —— 工作区布局(入口从 thread_meta 取)与按哪个对话分目录(子代是根对话的)。
+    # 不认识的值一律当老视图:失败方向与 B-236 之前逐字相同。
+    layout_raw = configurable.get(WORKSPACE_LAYOUT_KEY)
+    workspace_layout: WorkspaceLayout = (
+        "conversation" if layout_raw == "conversation" else "agent_root"
+    )
+    workspace_thread_id = _parse_uuid(configurable.get(WORKSPACE_THREAD_ID_KEY))
     return ToolContext(
         tenant_id=tenant_id,
         run_id=run_id,
@@ -4389,6 +4404,8 @@ def _build_tool_context(
         agent_key=agent_key,
         inputs_run_id=inputs_run_id,
         prompt_inputs=prompt_inputs,
+        workspace_layout=workspace_layout,
+        workspace_thread_id=workspace_thread_id,
     )
 
 

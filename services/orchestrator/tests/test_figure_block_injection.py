@@ -65,6 +65,7 @@ from orchestrator.tools.read_page import ReadPageTool, document_sha, workspace_f
 from orchestrator.tools.sandbox import EgressContext, RecordingSandboxRuntime, SandboxOutcome
 from orchestrator.tools.sandbox_image_contract import EXEC_VIEW
 from orchestrator.tools.skill_seed import sanitize_agent_key
+from orchestrator.tools.workspace_paths import WorkspaceView
 from orchestrator.tools.workspace_scope import scoped_path, store_scope
 from orchestrator.tools.workspace_store import RecordingWorkspaceStore
 
@@ -109,7 +110,7 @@ def _ref(
             WORKSPACE_OVERFLOW_DIR,
             str(run),
             RENDERED_FIGURE_DIR,
-            str(document_sha(doc, agent_key=agent_key)),
+            str(document_sha(doc, view=WorkspaceView(agent_key=agent_key))),
             _sha(content),
             f"{RENDERED_FIGURE_UNIT_PREFIX}{unit_no}",
             f"{RENDERED_FIGURE_PAGE_STEM}-{page}.jpg",
@@ -136,7 +137,7 @@ def _tail(
         supports_vision=supports_vision,
         tenant_id=tenant_id,
         user_id=user_id,
-        agent_key=agent_key,
+        view=WorkspaceView(agent_key=agent_key),
     )
 
 
@@ -531,7 +532,7 @@ async def test_the_block_never_lands_in_the_checkpoint() -> None:
 
 def _documents(*paths: str) -> dict[str, str]:
     """``read_page`` 写进 ``figure_documents`` 的那个形状:``<doc-sha>`` → 路径。"""
-    return {str(document_sha(p, agent_key=_AGENT_KEY)): p for p in paths}
+    return {str(document_sha(p, view=WorkspaceView(agent_key=_AGENT_KEY))): p for p in paths}
 
 
 def test_a_retired_page_says_which_path_to_pass_back() -> None:
@@ -556,7 +557,9 @@ def test_without_a_recorded_path_the_placeholder_says_so() -> None:
 
 def test_a_path_that_does_not_hash_to_the_key_is_not_shown() -> None:
     """``figure_documents`` 是工具可写的通道:键对不上路径就不采信。"""
-    forged = {str(document_sha("d.pptx", agent_key=_AGENT_KEY)): "别的文件.pptx"}
+    forged = {
+        str(document_sha("d.pptx", view=WorkspaceView(agent_key=_AGENT_KEY))): "别的文件.pptx"
+    }
     text = _block_text(_tail([], [_ref(p) for p in range(1, 6)], documents=forged))
     assert "别的文件" not in text
     assert "路径没记下来" in text
@@ -763,6 +766,8 @@ class _EchoRenderRuntime(RecordingSandboxRuntime):
         run_id: UUID | None = None,
         has_skills: bool = False,
         egress: EgressContext | None = None,
+        conv_id: UUID | None = None,
+        compat_dirs: tuple[str, ...] = (),
     ) -> SandboxOutcome:
         await super().exec(
             sandbox_id=sandbox_id,
@@ -934,7 +939,7 @@ def test_a_page_that_cannot_be_verified_is_withheld_visibly(state: str, phrase: 
         supports_vision=True,
         tenant_id=_TENANT,
         user_id=_USER,
-        agent_key=_AGENT_KEY,
+        view=WorkspaceView(agent_key=_AGENT_KEY),
         freshness={ref: state},  # type: ignore[dict-item]
     )
     assert _pixels(messages) == []
@@ -951,6 +956,6 @@ async def test_a_failing_freshness_check_withholds_the_page_and_does_not_raise()
         documents=_documents("d.pptx"),
         tenant_id=_TENANT,
         user_id=_USER,
-        agent_key=_AGENT_KEY,
+        view=WorkspaceView(agent_key=_AGENT_KEY),
     )
     assert freshness == {ref: "unknown"}

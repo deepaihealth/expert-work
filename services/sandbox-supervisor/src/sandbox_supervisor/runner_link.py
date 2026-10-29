@@ -17,6 +17,7 @@ import json
 import logging
 from dataclasses import dataclass
 from typing import Protocol
+from uuid import UUID
 
 logger = logging.getLogger(__name__)
 
@@ -51,6 +52,8 @@ class RunnerLink(Protocol):
         *,
         envs: dict[str, str] | None = None,
         agent_root: str | None = None,
+        conv_id: UUID | None = None,
+        compat_dirs: tuple[str, ...] = (),
     ) -> ExecResult:
         """Run ``code`` in the sandbox; return its captured outcome.
 
@@ -66,6 +69,10 @@ class RunnerLink(Protocol):
         ``(tenant, user)``. ``None`` (default) → unbound: the whole user
         root becomes the view, pre-feature behaviour. Not a cwd — the
         child's cwd is always ``/workspace``.
+
+        ``conv_id`` / ``compat_dirs`` (B-236) — the conversation view, sent
+        to the runner as ``conv_id`` (string) and ``compat_dirs`` (list);
+        omitted when ``None`` / empty (the pre-feature request shape).
         """
 
     async def close(self) -> None:
@@ -107,6 +114,8 @@ class PipeRunnerLink:
         *,
         envs: dict[str, str] | None = None,
         agent_root: str | None = None,
+        conv_id: UUID | None = None,
+        compat_dirs: tuple[str, ...] = (),
     ) -> ExecResult:
         async with self._lock:
             request: dict[str, object] = {"code": code, "timeout_s": timeout_s}
@@ -114,6 +123,10 @@ class PipeRunnerLink:
                 request["envs"] = envs
             if agent_root:
                 request["agent_root"] = agent_root
+            if conv_id is not None:
+                request["conv_id"] = str(conv_id)
+            if compat_dirs:
+                request["compat_dirs"] = list(compat_dirs)
             await self._write(request)
             # The supervisor's read deadline is the runner's own timeout
             # plus a grace window — a runner past it is itself hung.

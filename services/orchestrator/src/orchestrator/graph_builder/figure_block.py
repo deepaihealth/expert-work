@@ -30,6 +30,7 @@ from expert_work.common.conversation_channel import FIGURE_BLOCK_MARK, HIDE_FROM
 from orchestrator.multimodal import image_ref_block, parse_rendered_figure_ref
 from orchestrator.tools.figure_lookup import FigureFreshness, rendered_page_freshness
 from orchestrator.tools.read_page import document_sha
+from orchestrator.tools.workspace_paths import WorkspaceView
 from orchestrator.tools.workspace_store import WorkspaceStore
 
 logger = logging.getLogger(__name__)
@@ -145,7 +146,9 @@ def _unit_ranges(units: Sequence[int]) -> str:
     return "、".join(str(a) if a == b else f"{a}-{b}" for a, b in runs)
 
 
-def _document_path(doc_sha: str, documents: Mapping[str, object], agent_key: str) -> str | None:
+def _document_path(
+    doc_sha: str, documents: Mapping[str, object], view: WorkspaceView
+) -> str | None:
     """``<doc-sha>`` 对应的、模型能再传给 ``read_page`` 的路径;对不上就 ``None``。
 
     ``figure_documents`` 是工具可写的通道,所以不直接采信:用 ``read_page`` 自己那对
@@ -153,7 +156,7 @@ def _document_path(doc_sha: str, documents: Mapping[str, object], agent_key: str
     「用你当初传的那个路径」—— 宁可少说,不说错。
     """
     path = documents.get(doc_sha)
-    if not isinstance(path, str) or document_sha(path, agent_key=agent_key) != doc_sha:
+    if not isinstance(path, str) or document_sha(path, view=view) != doc_sha:
         return None
     return path
 
@@ -176,7 +179,7 @@ def _placeholder_lines(
     slots: Sequence[tuple[_Figure, list[_Figure]]],
     live_from: int,
     documents: Mapping[str, object],
-    agent_key: str,
+    view: WorkspaceView,
 ) -> list[str]:
     """退役与旧版本的可见文字 —— **按文档折叠**,每份文档一行、路径只写一次。
 
@@ -195,7 +198,7 @@ def _placeholder_lines(
             old_versions.setdefault(current.doc_sha, []).append(current.unit)
     lines: list[str] = []
     for doc_sha in dict.fromkeys([*retired, *old_versions]):
-        path = _document_path(doc_sha, documents, agent_key)
+        path = _document_path(doc_sha, documents, view)
         # 回修第 4 轮 —— 路径每份文档只写一次:两件事并进同一行。
         label = f"文档 {_quote_path(path)}" if path is not None else "一份文档(路径没记下来)"
         path_hint = "这个路径" if path is not None else "你当初调用 read_page 时传的那个路径"
@@ -230,7 +233,7 @@ _WITHHELD_REASONS: dict[FigureFreshness, str] = {
 def _withheld_lines(
     withheld: Sequence[tuple[_Figure, FigureFreshness]],
     documents: Mapping[str, object],
-    agent_key: str,
+    view: WorkspaceView,
 ) -> list[str]:
     """终审 #1 —— 窗口里没附图的页,按 (文档, 原因) 折成一行,写明路径与编号怎么拿回来。"""
     grouped: dict[tuple[str, FigureFreshness], list[int]] = {}
@@ -238,7 +241,7 @@ def _withheld_lines(
         grouped.setdefault((figure.doc_sha, freshness), []).append(figure.unit)
     lines: list[str] = []
     for (doc_sha, freshness), units in grouped.items():
-        path = _document_path(doc_sha, documents, agent_key)
+        path = _document_path(doc_sha, documents, view)
         label = f"文档{_bracket_path(path)}" if path is not None else "一份文档(路径没记下来)"
         path_hint = (
             _bracket_path(path) if path is not None else "你当初调用 read_page 时传的那个路径"
@@ -253,12 +256,12 @@ def _withheld_lines(
 
 
 def _window(
-    viewed: Sequence[object], *, tenant_id: UUID | None, user_id: UUID | None, agent_key: str
+    viewed: Sequence[object], *, tenant_id: UUID | None, user_id: UUID | None, view: WorkspaceView
 ) -> tuple[list[tuple[_Figure, list[_Figure]]], int]:
     """通过三项比对的 ref 按槽归并,外加窗口起点 —— 建块与核对新鲜度看的是同一个窗口。"""
     figures: list[_Figure] = []
     for ref in viewed:
-        fig = _own_figure(ref, tenant_id=tenant_id, user_id=user_id, agent_key=agent_key)
+        fig = _own_figure(ref, tenant_id=tenant_id, user_id=user_id, agent_key=view.agent_key)
         if fig is not None:
             figures.append(fig)
     if len(figures) != len(viewed):
@@ -278,7 +281,7 @@ async def figure_freshness(
     documents: Mapping[str, object],
     tenant_id: UUID | None,
     user_id: UUID | None,
-    agent_key: str,
+    view: WorkspaceView,
 ) -> dict[str, FigureFreshness]:
     """终审 #1 —— 窗口里每一张(至多 :data:`FIGURE_KEEP_RECENT` 张)的新鲜度,按 ref 索引。
 
@@ -287,10 +290,10 @@ async def figure_freshness(
     """
     if tenant_id is None or user_id is None:
         return {}
-    slots, live_from = _window(viewed, tenant_id=tenant_id, user_id=user_id, agent_key=agent_key)
+    slots, live_from = _window(viewed, tenant_id=tenant_id, user_id=user_id, view=view)
     result: dict[str, FigureFreshness] = {}
     for current, _older in slots[live_from:]:
-        path = _document_path(current.doc_sha, documents, agent_key)
+        path = _document_path(current.doc_sha, documents, view)
         if path is None:
             result[current.ref] = "unknown"
             continue
@@ -298,7 +301,7 @@ async def figure_freshness(
             store,
             tenant_id=tenant_id,
             user_id=user_id,
-            agent_key=agent_key,
+            view=view,
             path=path,
             render_rel=current.rel,
         )
@@ -319,7 +322,7 @@ def figure_block_message(
     supports_vision: bool,
     tenant_id: UUID | None,
     user_id: UUID | None,
-    agent_key: str,
+    view: WorkspaceView,
     freshness: Mapping[str, FigureFreshness] | None = None,
 ) -> HumanMessage | None:
     """造这一轮的渲染页段;没有可挂的就 ``None``。
@@ -348,23 +351,23 @@ def figure_block_message(
     """
     if not supports_vision or not viewed:
         return None
-    slots, live_from = _window(viewed, tenant_id=tenant_id, user_id=user_id, agent_key=agent_key)
+    slots, live_from = _window(viewed, tenant_id=tenant_id, user_id=user_id, view=view)
     if not slots:
         return None
-    lines = _placeholder_lines(slots, live_from, documents, agent_key)
+    lines = _placeholder_lines(slots, live_from, documents, view)
     # 回修第 4 轮 —— 窗口里的几张按文档归到一起(文档之间按首次出现排,文档内保持
     # 原次序),路径每份文档只写一次;图片块按同一次序挂,文字与图一一对应。
     in_window = [current for current, _ in slots[live_from:]]
     if freshness is not None:
         withheld = [(f, freshness.get(f.ref, "unknown")) for f in in_window]
         withheld = [(f, state) for f, state in withheld if state != "fresh"]
-        lines.extend(_withheld_lines(withheld, documents, agent_key))
+        lines.extend(_withheld_lines(withheld, documents, view))
         in_window = [f for f in in_window if freshness.get(f.ref) == "fresh"]
     doc_order = list(dict.fromkeys(f.doc_sha for f in in_window))
     live = sorted(in_window, key=lambda f: doc_order.index(f.doc_sha))
     groups: list[str] = []
     for doc_sha in doc_order:
-        path = _document_path(doc_sha, documents, agent_key)
+        path = _document_path(doc_sha, documents, view)
         pages = "、".join(f"第 {f.page} 页" for f in live if f.doc_sha == doc_sha)
         groups.append(f"{_quote_path(path)} {pages}" if path is not None else pages)
     if live:
@@ -401,7 +404,7 @@ def figure_block_tail(
     supports_vision: bool,
     tenant_id: UUID | None,
     user_id: UUID | None,
-    agent_key: str,
+    view: WorkspaceView,
     freshness: Mapping[str, FigureFreshness] | None = None,
 ) -> list[BaseMessage]:
     """:func:`figure_block_message` + :func:`with_figure_block` 一步做完(测试用这个入口)。"""
@@ -411,7 +414,7 @@ def figure_block_tail(
         supports_vision=supports_vision,
         tenant_id=tenant_id,
         user_id=user_id,
-        agent_key=agent_key,
+        view=view,
         freshness=freshness,
     )
     return with_figure_block(messages, block)

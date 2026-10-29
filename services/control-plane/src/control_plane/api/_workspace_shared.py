@@ -37,6 +37,7 @@ from fastapi import HTTPException
 from fastapi.responses import Response
 
 from control_plane.api._artifact_mime import content_disposition_header, infer_content_type
+from expert_work.persistence.thread_meta import ThreadMetaStore
 from expert_work.protocol import ThreadMeta
 from expert_work.protocol.agent_key import sanitize_agent_key
 from orchestrator.tools import (
@@ -46,6 +47,7 @@ from orchestrator.tools import (
     WorkspacePermissionError,
     WorkspaceStore,
 )
+from orchestrator.tools.registry import WorkspaceLayout
 from orchestrator.tools.workspace_paths import AGENTS_DIR
 
 logger = logging.getLogger("expert_work.control_plane.workspace")
@@ -86,6 +88,18 @@ def thread_agent_key(meta: ThreadMeta) -> str:
     「不过滤」和「根目录」这两件事变得无法区分。
     """
     return sanitize_agent_key(meta.agent_name) if meta.agent_name else ""
+
+
+async def thread_workspace_layout(
+    threads: ThreadMetaStore, thread_id: UUID, *, tenant_id: UUID
+) -> WorkspaceLayout:
+    """B-236 —— 这条对话沙箱 ``/workspace`` 的布局,取 ``thread_meta.workspace_layout``。
+
+    找不到那一行时按新对话处理(``conversation``,与库的默认值同一个)—— 发布前已开
+    的对话都有行,它们的老视图由那一行保住。
+    """
+    meta = await threads.get(thread_id, tenant_id=tenant_id)
+    return meta.workspace_layout if meta is not None else "conversation"
 
 
 def _safe_workspace_relpath(path: str) -> str | None:

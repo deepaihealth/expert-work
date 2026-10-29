@@ -145,7 +145,12 @@ class _FakeRuntime:
 class _FakeThreads:
     async def get(self, _thread_id: object, *, tenant_id: object) -> SimpleNamespace:
         del tenant_id
-        return SimpleNamespace(agent_name="agent", agent_version="1.0.0", user_id=None)
+        return SimpleNamespace(
+            agent_name="agent",
+            agent_version="1.0.0",
+            user_id=None,
+            workspace_layout="conversation",
+        )
 
 
 class _FakeAgentRepo:

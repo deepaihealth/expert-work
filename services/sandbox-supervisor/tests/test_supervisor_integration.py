@@ -527,6 +527,105 @@ async def test_exec_agent_root_is_bound_as_workspace_and_hides_the_rest(
 
 
 # ---------------------------------------------------------------------------
+# B-236 — per-conversation /workspace + the shared /agent view, acceptance under
+# the real image and OCI runtime (plan tests 2-5). The script logic is also
+# rehearsed without namespaces in orchestrator tests/test_exec_view.py; this is
+# where the mounts themselves are proven.
+# ---------------------------------------------------------------------------
+
+_B236_ROOT = "/mnt/workspace/agents/a"
+_B236_PROBE = (
+    "import os, json\n"
+    "c = os.environ['EW_CONV']\n"
+    "here = os.stat('.')\n"
+    "work = os.stat(f'/agent/threads/{c}/work')\n"
+    "open('x.txt', 'w').write('conv')\n"
+    "open('/agent/y.txt', 'w').write('agent')\n"
+    "os.makedirs('/workspace/inputs/r1', exist_ok=True)\n"
+    "open('/workspace/inputs/r1/i.json', 'w').write('{}')\n"
+    "open('style/s.md', 'w').write('anchor')\n"
+    "print(json.dumps({'cwd': os.getcwd(), 'same': [here.st_dev, here.st_ino] == "
+    "[work.st_dev, work.st_ino], 'threads': sorted(os.listdir('/agent/threads')), "
+    "'upload': open('/workspace/uploads/u.txt').read()}))\n"
+)
+
+
+@pytest.mark.asyncio
+async def test_exec_conversation_view_binds_its_own_dir_and_the_agent_root(
+    expert_work: _Harness,
+) -> None:
+    import json
+
+    tenant, user = uuid4(), uuid4()
+    response = await expert_work.supervisor.acquire(
+        AcquireRequest(tenant_id=tenant, thread_id="b236", user_id=user)
+    )
+    sid = response.sandbox_id
+    conv, other = uuid4(), uuid4()
+    try:
+        setup = await expert_work.supervisor.exec(
+            sid,
+            code="import os\n"
+            "os.makedirs('/workspace/agents/a/uploads', exist_ok=True)\n"
+            "open('/workspace/agents/a/uploads/u.txt', 'w').write('up')\n"
+            "os.makedirs('/workspace/agents/a/style', exist_ok=True)\n"
+            f"os.makedirs('/workspace/agents/a/threads/{other}/work', exist_ok=True)\n"
+            f"open('/workspace/agents/a/threads/{other}/work/secret.txt', 'w').write('B')\n",
+        )
+        assert setup.exit_code == 0, setup.stderr
+        probe = await expert_work.supervisor.exec(
+            sid,
+            code=f"import os; os.environ['EW_CONV'] = {str(conv)!r}\n" + _B236_PROBE,
+            agent_root=_B236_ROOT,
+            conv_id=conv,
+            compat_dirs=("style",),
+        )
+        assert probe.exit_code == 0, probe.stderr
+        seen = json.loads(probe.stdout.strip().splitlines()[-1])
+        assert seen == {"cwd": "/workspace", "same": True, "threads": [str(conv)], "upload": "up"}
+        check = await expert_work.supervisor.exec(
+            sid,
+            code="import os\n"
+            "r = '/workspace/agents/a'\n"
+            f"print(open(f'{{r}}/threads/{conv}/work/x.txt').read(), open(f'{{r}}/y.txt').read(),"
+            " os.path.exists(f'{r}/x.txt'), open(f'{r}/inputs/r1/i.json').read(),"
+            " open(f'{r}/style/s.md').read())",
+        )
+        assert check.stdout.split() == ["conv", "agent", "False", "{}", "anchor"], check.stderr
+    finally:
+        await expert_work.supervisor.destroy(sid, reason="b236-acceptance")
+
+
+@pytest.mark.asyncio
+async def test_exec_legacy_view_and_bad_compat_name(expert_work: _Harness) -> None:
+    """老视图:``/workspace`` 与 ``/agent`` 是同一个目录(比 inode)。坏的过渡期目录名
+    (绕过 HTTP 边界直接递给 runner)让脚本以 98 退出,代码一行都不跑。"""
+    response = await expert_work.supervisor.acquire(
+        AcquireRequest(tenant_id=uuid4(), thread_id="b236-legacy", user_id=uuid4())
+    )
+    sid = response.sandbox_id
+    try:
+        legacy = await expert_work.supervisor.exec(
+            sid,
+            code="import os; a, w = os.stat('/agent'), os.stat('/workspace'); "
+            "print((a.st_dev, a.st_ino) == (w.st_dev, w.st_ino))",
+            agent_root=_B236_ROOT,
+        )
+        assert legacy.stdout.strip() == "True", legacy.stderr
+        bad = await expert_work.supervisor.exec(
+            sid,
+            code="print('ran')",
+            agent_root=_B236_ROOT,
+            conv_id=uuid4(),
+            compat_dirs=("../x",),
+        )
+        assert bad.exit_code == 98, bad.stderr
+        assert "ran" not in bad.stdout
+    finally:
+        await expert_work.supervisor.destroy(sid, reason="b236-acceptance")
+
+
+# ---------------------------------------------------------------------------
 # #49 — egress network isolation (gate #3)
 # ---------------------------------------------------------------------------
 

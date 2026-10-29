@@ -229,6 +229,8 @@ class _SequenceRuntime(RecordingSandboxRuntime):
         run_id: UUID | None = None,
         has_skills: bool = False,
         egress: EgressContext | None = None,
+        conv_id: UUID | None = None,
+        compat_dirs: tuple[str, ...] = (),
     ) -> SandboxOutcome:
         self.execs.append((sandbox_id, code))
         self.exec_agent_keys.append(agent_key)

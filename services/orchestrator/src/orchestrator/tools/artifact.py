@@ -25,7 +25,6 @@ import logging
 from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from pathlib import PurePosixPath
 from typing import Any, get_args
 from uuid import UUID, uuid4
 
@@ -46,8 +45,15 @@ from orchestrator.tools.sandbox import (
     WorkspacePathEscapeError,
     run_in_sandbox,
 )
-from orchestrator.tools.sandbox_image_contract import EXEC_VIEW
-from orchestrator.tools.workspace_paths import AGENTS_DIR, SHARED_PREFIX, agent_view_alias
+from orchestrator.tools.workspace_compat import record_compat_hit
+from orchestrator.tools.workspace_paths import (
+    AGENTS_DIR,
+    WORKSPACE_PATH_RULE,
+    ResolvedPath,
+    WorkspaceView,
+    agent_relative,
+    resolve_workspace_path,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -56,8 +62,6 @@ _ARTIFACT_KINDS: tuple[str, ...] = get_args(ArtifactKind)
 _DEFAULT_KIND: ArtifactKind = "other"
 #: Thread label for the ``created_in_thread`` column when a run has no id.
 _FALLBACK_THREAD_ID = "save-artifact"
-#: ``shared/`` 目录名 —— 由前缀反推,不写第二份字面量(前缀与目录必须永远同名)。
-_SHARED_DIR_NAME = SHARED_PREFIX.rstrip(":")
 
 #: 产物清单契约 —— per-run 产物记录器的 ``config["configurable"]`` 键。
 #: ``sse.run_agent`` 每 run 注入一个同步 append 回调(镜像
@@ -125,32 +129,29 @@ def _require_str(args: Mapping[str, Any], key: str, tool: str) -> str:
     return raw.strip()
 
 
-def _validate_path(path: str, *, agent_key: str = "") -> str:
-    """Normalise ``path`` to an agent-relative workspace path, or reject it.
+def _validate_path(path: str, *, view: WorkspaceView) -> ResolvedPath:
+    """Resolve ``path`` the way the file tools do, or reject it.
 
-    Folds the two absolute spellings models produce from the tool
-    descriptions — ``/workspace/x`` and ``/workspace/agents/<own key>/x`` —
-    to ``x`` (same rule as ``file_ops._require_path``); any other absolute
-    path, a ``..`` segment, or an ``agents/`` / ``shared/`` first segment
-    (someone else's tree, or the read-only shared area) is rejected. The
-    result is later resolved against the user's workspace volume by the
-    download endpoint, so nothing unnormalised may reach the store.
+    B-236 —— one resolver for every file-touching tool
+    (:func:`~orchestrator.tools.workspace_paths.resolve_workspace_path`): the
+    absolute spellings models produce from the tool descriptions fold, a ``..``
+    segment / any other absolute path / an ``agents/`` or ``shared/`` first
+    segment is rejected. Two extra rules here: the shared area cannot be
+    registered (it is not under the agent root the download resolves against),
+    and a view root is a directory, not a file.
     """
-    cleaned = path.strip()
-    if agent_key:
-        own = f"{agent_view_alias(agent_key)}/"
-        if cleaned.startswith(own):
-            cleaned = cleaned[len(own) :]
-    if cleaned.startswith(f"{EXEC_VIEW}/"):
-        cleaned = cleaned[len(EXEC_VIEW) + 1 :]
-    parts = PurePosixPath(cleaned).parts
-    if not cleaned or cleaned.startswith("/") or ".." in parts:
-        msg = f"artifact path must be a relative workspace path without '..': {path!r}"
+    target = resolve_workspace_path(path, view=view, tool="save_artifact")
+    if target.kind == "compat":
+        record_compat_hit(
+            channel="file_tool", agent_key=view.agent_key, name=target.rel.split("/", 1)[0]
+        )
+    if target.kind == "shared":
+        msg = f"artifact path must not address the read-only shared area: {path!r}"
         raise ValueError(msg)
-    if agent_key and parts and parts[0] in (AGENTS_DIR, _SHARED_DIR_NAME):
-        msg = f"artifact path must not address the reserved {parts[0]}/ tree: {path!r}"
+    if target.rel == ".":
+        msg = f"artifact path must name a file, not a workspace root: {path!r}"
         raise ValueError(msg)
-    return cleaned
+    return target
 
 
 def _coerce_kind(raw: object) -> ArtifactKind:
@@ -203,7 +204,7 @@ class SaveArtifactTool:
             description=(
                 "Register a file you produced in the workspace as a named "
                 "artifact so the user can retrieve it later. Re-saving an "
-                "existing name records a new version."
+                "existing name records a new version. " + WORKSPACE_PATH_RULE
             ),
             parameters={
                 "type": "object",
@@ -215,7 +216,7 @@ class SaveArtifactTool:
                     "path": {
                         "type": "string",
                         "description": (
-                            "Relative path of the file in the workspace "
+                            "Path of the file: relative to /workspace, or under /agent/ "
                             "(optional; defaults to 'name')."
                         ),
                     },
@@ -240,8 +241,12 @@ class SaveArtifactTool:
         name = _require_str(args, "name", "save_artifact")
         raw_path = args.get("path")
         path = raw_path if isinstance(raw_path, str) and raw_path.strip() else name
-        rel = _validate_path(path, agent_key=ctx.agent_key)
-        path_in_workspace = _artifact_path(ctx.agent_key, rel)
+        target = _validate_path(path, view=ctx.workspace_view)
+        rel = target.rel
+        # B-236 —— 登记的是物理位置:对话目录里的 ``x`` 是 ``threads/<conv>/work/x``。
+        path_in_workspace = _artifact_path(
+            ctx.agent_key, agent_relative(target, ctx.workspace_view)
+        )
         kind = _coerce_kind(args.get("kind"))
         thread_id = str(ctx.run_id) if ctx.run_id is not None else _FALLBACK_THREAD_ID
 
@@ -251,7 +256,7 @@ class SaveArtifactTool:
         # ``/workspace/x.pptx``,save_artifact 登记 ``agents/<key>/x.pptx``,两边都
         # 「成功」,说的却不是同一个文件。B-60 之后 ``/workspace`` 就是 agent 自己的
         # 视图,这条 stat 只确认文件真的在那儿 —— 不在就是没写,不再去别处找。
-        await self._locate_file(rel, ctx=ctx)
+        await self._locate_file(target, ctx=ctx)
 
         # B-235 —— 先复制,再登记。副本以这里生成的版本行 id 命名,同一个 id 原样交给
         # ``save_version``:副本与版本行在这一次调用里配对,两段会话并发登记同名时,
@@ -349,7 +354,7 @@ class SaveArtifactTool:
             )
             raise FileOpError(msg) from exc
 
-    async def _locate_file(self, rel: str, *, ctx: ToolContext) -> None:
+    async def _locate_file(self, target: ResolvedPath, *, ctx: ToolContext) -> None:
         """Confirm ``rel`` exists where the registration row will point, or raise.
 
         B-60 —— only stats inside the exec view (the agent's own directory once
@@ -359,9 +364,10 @@ class SaveArtifactTool:
         from the user root" branch is gone with the hole it papered over: exec
         code cannot reach a separate user root any more (spec §4.8).
         """
+        rel = target.rel
         outcome = await run_in_sandbox(
             self.client,
-            code=build_artifact_locate_wrapper(rel),
+            code=build_artifact_locate_wrapper(rel, ws=target.ws),
             timeout_s=None,
             ctx=ctx,
             tool_label="save_artifact",

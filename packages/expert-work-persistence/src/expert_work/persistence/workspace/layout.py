@@ -203,18 +203,37 @@ WORKSPACE_DELETE_PROTECTED_PREFIXES: frozenset[str] = frozenset(
 _CONTAINERS: dict[str, int] = {WORKSPACE_AGENTS_DIR: 2, WORKSPACE_SHARED_DIR: 1}
 
 
+#: B-236 —— 一个对话自己的 ``/workspace`` 在 agent 根下的位置:
+#: ``threads/<conv uuid>/work/``。exec 在里面为平台目录(``uploads/`` 等)建的空挂载桩
+#: 不是 agent 产出,所以它也算一层**位置**容器,与 ``agents/<key>/`` 一样先剥掉再看首段。
+WORKSPACE_THREADS_DIR = "threads"
+WORKSPACE_CONVERSATION_WORK_DIR = "work"
+_UUID_RE = re.compile(_UUID_PATTERN)
+
+
 def _head_after_container(relpath: str) -> str:
     """The first path segment once a known container prefix is stripped.
 
     ``""`` for an empty path. See :func:`is_reserved_workspace_path` for why
     only known containers are stripped and only one segment is examined.
+    B-236 —— after ``agents/<key>/``, a conversation's
+    ``threads/<uuid>/work/`` is stripped too (only that exact shape).
     """
     parts = tuple(p for p in relpath.strip().split("/") if p)
     if not parts:
         return ""
-    skip = _CONTAINERS.get(parts[0])
+    container = parts[0]
+    skip = _CONTAINERS.get(container)
     if skip is not None and len(parts) > skip:
         parts = parts[skip:]
+        if (
+            container == WORKSPACE_AGENTS_DIR
+            and parts[0] == WORKSPACE_THREADS_DIR
+            and len(parts) > 3
+            and _UUID_RE.fullmatch(parts[1])
+            and parts[2] == WORKSPACE_CONVERSATION_WORK_DIR
+        ):
+            parts = parts[3:]
     return parts[0]
 
 

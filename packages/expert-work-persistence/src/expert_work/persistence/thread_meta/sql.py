@@ -40,6 +40,7 @@ def _row_to_meta(row: ThreadMetaRow) -> ThreadMeta:
         agent_name=row.agent_name,
         agent_version=row.agent_version,
         message_count=row.message_count,
+        workspace_layout="agent_root" if row.workspace_layout == "agent_root" else "conversation",
         created_at=row.created_at,
         updated_at=row.updated_at,
     )

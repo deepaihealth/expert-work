@@ -10,12 +10,19 @@ from __future__ import annotations
 from datetime import datetime
 from uuid import UUID
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 #: B-60 —— ``ExecRequest.agent_root`` 唯一合法的前缀。与 orchestrator 的
 #: ``workspace_paths.agent_nas_root()`` 拼出来的形状同义,但这里刻意是自己的字面量:
 #: supervisor 不 import orchestrator,而这道闸要挡的正是「送进来的不是那个函数拼的」。
 _AGENT_ROOT_PREFIX = "/mnt/workspace/agents/"
+
+#: B-236 —— ``ExecRequest.compat_dirs`` 的上限与不许出现的名字。与 runner 那段 sh 的
+#: ``case`` 同一组(这里是 HTTP 边界的第一道,脚本自己还会再查一遍)。
+_MAX_COMPAT_DIRS = 64
+_RESERVED_COMPAT_NAMES = frozenset(
+    {"", ".", "..", "threads", "uploads", "inputs", ".tool_results", "shared", "skills", "agents"}
+)
 
 
 class SeedFile(BaseModel):
@@ -106,6 +113,32 @@ class ExecRequest(BaseModel):
     #: whole user root becomes ``/workspace`` (pre-feature view). Not a cwd — the
     #: child's cwd is always ``/workspace``.
     agent_root: str | None = None
+    #: B-236 —— 对话视图:``/workspace`` 是 ``<agent_root>/threads/<conv_id>/work``,
+    #: ``/agent`` 是 ``agent_root`` 本身。``None`` → 老视图(两者都是 ``agent_root``)。
+    #: 只在绑了 agent(``agent_root`` 非空)时成立。
+    conv_id: UUID | None = None
+    #: B-236 —— 过渡期映射进 ``/workspace`` 的 agent 根一级目录名。
+    compat_dirs: list[str] = Field(default_factory=list, max_length=_MAX_COMPAT_DIRS)
+
+    @field_validator("compat_dirs")
+    @classmethod
+    def _compat_dirs_are_plain_top_level_names(cls, value: list[str]) -> list[str]:
+        """422 任何不是「agent 根下一级、非保留」的名字 —— 它们会被拼成 bind 源与目标。"""
+        for name in value:
+            if "/" in name or "\0" in name or name in _RESERVED_COMPAT_NAMES:
+                msg = f"compat_dirs entry is not a plain directory name: {name!r}"
+                raise ValueError(msg)
+        return value
+
+    @model_validator(mode="after")
+    def _conversation_view_needs_an_agent_root(self) -> ExecRequest:
+        if (self.conv_id is not None or self.compat_dirs) and self.agent_root is None:
+            msg = "conv_id / compat_dirs need agent_root (a conversation view is per agent)"
+            raise ValueError(msg)
+        if self.compat_dirs and self.conv_id is None:
+            msg = "compat_dirs need conv_id (they only exist in the conversation view)"
+            raise ValueError(msg)
+        return self
 
     @field_validator("agent_root")
     @classmethod

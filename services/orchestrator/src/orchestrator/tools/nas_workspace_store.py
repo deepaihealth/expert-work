@@ -180,6 +180,7 @@ from orchestrator.tools.sandbox import (
 from orchestrator.tools.workspace_scope import (
     SCOPE_USER_ROOT,
     normalize_workspace_path,
+    scope_hidden_heads,
     scope_parts,
     scoped_dir,
     scoped_path,
@@ -352,6 +353,7 @@ def _walk_and_match(
     name_glob: str | None,
     content: str | None,
     max_results: int,
+    hidden: frozenset[str] = frozenset(),
 ) -> WorkspaceSearchResult:
     """The body of :meth:`NasWorkspaceStore.search_files` — walk under ``dfd``, match, cap.
 
@@ -396,8 +398,12 @@ def _walk_and_match(
         os.fwalk(".", dir_fd=dfd, follow_symlinks=False, onerror=_on_error),
     )
     with closing(walker):
-        for dirpath, _dirnames, filenames, walk_fd in walker:
+        for dirpath, dirnames, filenames, walk_fd in walker:
             base = PurePosixPath(dirpath)
+            if dirpath == ".":
+                # B-236 —— 作用域根下藏起来的首段(``agent_shared`` 的 ``threads/``)
+                # 连走都不走进去:别的对话的文件不该出现在任何一条结果里。
+                dirnames[:] = [d for d in dirnames if d not in hidden]
             for name in sorted(filenames):
                 rel = str(base / name).removeprefix("./")
                 if is_reserved_workspace_path("/".join((*prefix, rel))):
@@ -904,9 +910,13 @@ class NasWorkspaceStore:
             # (Task 3 fix round 1) — see _on_walk_error: without it, a
             # subtree this process can't scan is silently dropped from the
             # results instead of failing loudly.
-            for dirpath, _dirnames, filenames in os.walk(
+            hidden = scope_hidden_heads(scope)
+            for dirpath, dirnames, filenames in os.walk(
                 walk_root, followlinks=False, onerror=_on_walk_error
             ):
+                if hidden and Path(dirpath) == walk_root:
+                    # B-236 —— ``agent_shared`` 不列各对话自己的 ``threads/``。
+                    dirnames[:] = [d for d in dirnames if d not in hidden]
                 for name in filenames:
                     full = Path(dirpath) / name
                     rel = full.relative_to(walk_root).as_posix()
@@ -975,6 +985,10 @@ class NasWorkspaceStore:
             entries: list[WorkspaceDirEntry] = []
             try:
                 names = sorted(os.listdir(dfd))
+                if not PurePosixPath(path.strip()).parts:
+                    # B-236 —— 作用域根上藏起来的首段不出现在列表里(``agent_shared``
+                    # 的 ``threads/``),与 ``scoped_path`` 拒绝寻址它同一个口径。
+                    names = [n for n in names if n not in scope_hidden_heads(scope)]
                 truncated = len(names) > max_entries
                 for name in names[:max_entries]:
                     try:
@@ -1042,6 +1056,7 @@ class NasWorkspaceStore:
                     name_glob=name_glob,
                     content=content,
                     max_results=max_results,
+                    hidden=scope_hidden_heads(scope),
                 )
             finally:
                 os.close(dfd)

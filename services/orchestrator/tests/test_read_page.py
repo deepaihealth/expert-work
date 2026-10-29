@@ -40,7 +40,7 @@ from orchestrator.tools.read_page import (
 )
 from orchestrator.tools.registry import ToolContext
 from orchestrator.tools.sandbox import _MAX_EXEC_TIMEOUT_S, RecordingSandboxRuntime, SandboxOutcome
-from orchestrator.tools.workspace_paths import WriteToSharedError
+from orchestrator.tools.workspace_paths import WorkspaceView, WriteToSharedError
 from orchestrator.tools.workspace_scope import scoped_path, store_scope
 
 # 回修第 3 轮起 ``ReadPageTool`` 的默认投递档 ``"none"`` 不进沙箱;这个文件里测渲染
@@ -2715,7 +2715,7 @@ async def test_read_page_records_the_path_for_each_rendered_document() -> None:
         client=_one_rendered_page_runtime(ctx), figure_delivery="inline"
     ).call({"path": "d.pptx", "units": [3]}, ctx=ctx)
     assert result.state_updates["figure_documents"] == {
-        document_sha("d.pptx", agent_key=ctx.agent_key): "d.pptx"
+        document_sha("d.pptx", view=WorkspaceView(agent_key=ctx.agent_key)): "d.pptx"
     }
 
 
@@ -2723,7 +2723,9 @@ async def test_read_page_records_the_path_for_each_rendered_document() -> None:
 def test_every_spelling_of_one_path_gives_one_doc_sha(spelling: str) -> None:
     """终审 #4 —— ``./x`` 与 ``x`` 是同一个文件,必须是同一个 ``<doc-sha>``;
     ``..`` 不折(那种写法由调用方拒掉,这里只确认它不被悄悄等同)。"""
-    same = document_sha(spelling, agent_key="") == document_sha("d.pptx", agent_key="")
+    same = document_sha(spelling, view=WorkspaceView(agent_key="")) == document_sha(
+        "d.pptx", view=WorkspaceView(agent_key="")
+    )
     assert same is (".." not in spelling)
 
 
@@ -2737,4 +2739,6 @@ async def test_read_page_renders_a_dot_slash_path_under_the_plain_doc_sha() -> N
         {"path": "./d.pptx", "units": [3]}, ctx=ctx
     )
     out_rel = str(_snippet_params(runtime.execs[0][1])["out_rel"])
-    assert out_rel.endswith(f"/figures/{document_sha('d.pptx', agent_key=ctx.agent_key)}")
+    assert out_rel.endswith(
+        f"/figures/{document_sha('d.pptx', view=WorkspaceView(agent_key=ctx.agent_key))}"
+    )

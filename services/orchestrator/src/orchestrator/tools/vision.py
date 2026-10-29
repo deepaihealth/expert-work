@@ -371,7 +371,7 @@ class AskImageTool:
             )
             raise ValueError(msg)
         unit = _require_unit(args)
-        path = _require_path(args, tool="ask_image", agent_key=ctx.agent_key)
+        path = _require_path(args, tool="ask_image", view=ctx.workspace_view).path
         if ctx.tenant_id is None or ctx.user_id is None:
             msg = "ask_image 'path' + 'unit' requires a tenant and user binding"
             raise ToolBlockedError(msg)
@@ -379,7 +379,7 @@ class AskImageTool:
             self.workspace_store,
             tenant_id=ctx.tenant_id,
             user_id=ctx.user_id,
-            agent_key=ctx.agent_key,
+            view=ctx.workspace_view,
             path=path,
             unit=unit,
             run_id=ctx.run_id,

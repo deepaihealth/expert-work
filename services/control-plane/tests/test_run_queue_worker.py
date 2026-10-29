@@ -39,7 +39,12 @@ class _FakeThreads:
         del tenant_id
         if not self._has_agent:
             return SimpleNamespace(agent_name=None, agent_version=None, user_id=None)
-        return SimpleNamespace(agent_name="a", agent_version="1.0.0", user_id=None)
+        return SimpleNamespace(
+            agent_name="a",
+            agent_version="1.0.0",
+            user_id=None,
+            workspace_layout="conversation",
+        )
 
 
 _SPEC = AgentSpec.model_validate(

@@ -28,6 +28,10 @@ agent 此前在同一棵扁平树里互相读错写错,喂给模型的事实是�
 设计文档都是这么处理二进制下载的)。
 
 **不镜像 DELETE** —— 破坏性操作,第三方缺上下文,需单独拍板。
+
+B-236 —— 新对话写的文件在 agent 根下的 ``threads/<会话 id>/work/`` 里(每个对话自己的
+工作目录),对外 ``path`` 因此多这一段;每条另带 ``session_id``(从这一段解析,不在
+任何对话目录里的是 ``null``)。只做加法:老字段与老文件的 ``path`` 不变,下载照旧。
 """
 
 from __future__ import annotations
@@ -57,6 +61,19 @@ from control_plane.api._workspace_shared import _workspace_file_response, list_w
 from expert_work.persistence.tenant_user import TenantUserStore
 from expert_work.persistence.thread_meta import ThreadMetaStore
 from orchestrator.tools import WorkspaceStore
+from orchestrator.tools.workspace_paths import CONVERSATION_WORK_DIR, THREADS_DIR
+
+
+def conversation_session_id(path: str) -> str | None:
+    """B-236 —— ``threads/<会话 id>/work/…`` 里的会话 id;不在对话工作目录里就 ``None``。"""
+    parts = path.split("/")
+    if len(parts) < 4 or parts[0] != THREADS_DIR or parts[2] != CONVERSATION_WORK_DIR:
+        return None
+    try:
+        session = UUID(parts[1])
+    except ValueError:
+        return None
+    return str(session) if str(session) == parts[1] else None
 
 
 def _get_workspace_store(request: Request) -> WorkspaceStore | None:
@@ -143,7 +160,14 @@ def build_external_workspace_router() -> APIRouter:
             for key, code in by_key.items():
                 external = storage_to_external(entry.path, agent_key=key)
                 if external is not None:
-                    files.append({"path": external, "size": entry.size, "agent_code": code})
+                    files.append(
+                        {
+                            "path": external,
+                            "size": entry.size,
+                            "agent_code": code,
+                            "session_id": conversation_session_id(external),
+                        }
+                    )
                     break
         return JSONResponse({"success": True, "data": {"files": files}, "error": None})
 

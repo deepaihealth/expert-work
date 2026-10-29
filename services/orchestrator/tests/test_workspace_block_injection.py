@@ -404,7 +404,8 @@ async def test_the_listing_is_scoped_to_the_agents_own_layer() -> None:
     text = _texts(llm.seen_prompts[0])
     assert "anchor.py" in text
     assert "decoy.py" not in text
-    assert store.list_scopes[0][2] == f"agent:{_AGENT_KEY}"
+    # B-236 —— 按 ``/agent`` 的作用域列(``agent_shared``):各对话的 ``threads/`` 不混进来。
+    assert store.list_scopes[0][2] == f"agent_shared:{_AGENT_KEY}"
 
 
 # ---------------------------------------------------------------------------

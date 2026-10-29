@@ -41,7 +41,7 @@ from orchestrator.llm.providers._http import client_for
 from orchestrator.tools.inputs_doc import inputs_abs_dir, inputs_abs_path
 from orchestrator.tools.registry import ToolBlockedError, ToolContext, ToolResult, ToolSpec
 from orchestrator.tools.sandbox_image_contract import preinstalled_note
-from orchestrator.tools.workspace_paths import agent_nas_root
+from orchestrator.tools.workspace_paths import EXEC_WORKSPACE_NOTE, agent_nas_root
 
 logger = logging.getLogger(__name__)
 
@@ -363,6 +363,8 @@ class SandboxRuntime(Protocol):
         run_id: UUID | None = None,
         has_skills: bool = False,
         egress: EgressContext | None = None,
+        conv_id: UUID | None = None,
+        compat_dirs: tuple[str, ...] = (),
     ) -> SandboxOutcome:
         """Run ``code`` in the sandbox; return its captured outcome.
 
@@ -384,6 +386,11 @@ class SandboxRuntime(Protocol):
         每次补上:同一用户的热沙箱被他的多个智能体共用,出网变量只能按**本次调用方**
         给,不能跟着沙箱走。云上后端据此每次注入 / 置空代理变量;本地 supervisor 后端
         的出网变量在 ``docker run`` 时按容器烤定,忽略它。
+
+        ``conv_id`` / ``compat_dirs``(B-236)—— 非 ``None`` 时本次 exec 的 ``/workspace``
+        是该对话自己的目录(``agents/<key>/threads/<conv>/work``),``/agent`` 是 agent 根;
+        ``compat_dirs`` 是过渡期映射进 ``/workspace`` 的 agent 根目录名。只在绑了 agent
+        时有意义;``run_in_sandbox`` 从 ``ctx.workspace_view`` 取,wrapper 原样透传。
         """
 
     async def release(self, *, sandbox_id: UUID) -> None:
@@ -466,6 +473,8 @@ class HTTPSupervisorRuntime:
         run_id: UUID | None = None,
         has_skills: bool = False,
         egress: EgressContext | None = None,
+        conv_id: UUID | None = None,
+        compat_dirs: tuple[str, ...] = (),
     ) -> SandboxOutcome:
         # B-217 —— the docker supervisor bakes each container's egress env at
         # `docker run` (acquire carries it) on an `internal: true` network; there
@@ -488,6 +497,12 @@ class HTTPSupervisorRuntime:
         # (``test_sandbox_runtime_contract.py`` 钉这件事)。
         if agent_key:
             payload["agent_root"] = agent_nas_root(agent_key)
+            # B-236 —— 对话视图:runner 把对话目录 bind 成 /workspace、agent 根 bind 成
+            # /agent。未绑 agent 时没有对话视图可言,两项都不发。
+            if conv_id is not None:
+                payload["conv_id"] = str(conv_id)
+                if compat_dirs:
+                    payload["compat_dirs"] = list(compat_dirs)
         # The sandbox enforces the exec wall-clock (it SIGKILLs + returns
         # ``timed_out``); the HTTP read timeout must OUTLAST that enforcement so
         # the orchestrator receives the real outcome instead of giving up early
@@ -601,6 +616,8 @@ class RecordingSandboxRuntime:
     exec_has_skills: list[bool] = field(default_factory=list)
     #: B-217 — the ``egress`` passed to each exec (same reasoning).
     exec_egress: list[EgressContext | None] = field(default_factory=list)
+    #: B-236 — the ``(conv_id, compat_dirs)`` passed to each exec (same reasoning).
+    exec_views: list[tuple[UUID | None, tuple[str, ...]]] = field(default_factory=list)
     released: list[UUID] = field(default_factory=list)
     destroyed: list[tuple[UUID, str]] = field(default_factory=list)
     reaped: list[bool] = field(default_factory=list)
@@ -631,6 +648,8 @@ class RecordingSandboxRuntime:
         run_id: UUID | None = None,
         has_skills: bool = False,
         egress: EgressContext | None = None,
+        conv_id: UUID | None = None,
+        compat_dirs: tuple[str, ...] = (),
     ) -> SandboxOutcome:
         del timeout_s
         self.execs.append((sandbox_id, code))
@@ -638,6 +657,7 @@ class RecordingSandboxRuntime:
         self.exec_run_ids.append(run_id)
         self.exec_has_skills.append(has_skills)
         self.exec_egress.append(egress)
+        self.exec_views.append((conv_id, compat_dirs))
         if self.exec_error is not None:
             raise self.exec_error
         return self.outcome
@@ -699,6 +719,8 @@ class _EgressBindingClient:
         run_id: UUID | None = None,
         has_skills: bool = False,
         egress: EgressContext | None = None,
+        conv_id: UUID | None = None,
+        compat_dirs: tuple[str, ...] = (),
     ) -> SandboxOutcome:
         # This wrapper doesn't own agent_key, run_id or has_skills — it's a pure
         # passthrough here so a chain like _AgentKeyBindingClient(inner=_EgressBindingClient(...))
@@ -713,6 +735,8 @@ class _EgressBindingClient:
             run_id=run_id,
             has_skills=has_skills,
             egress=self.egress,
+            conv_id=conv_id,
+            compat_dirs=compat_dirs,
         )
 
     async def release(self, *, sandbox_id: UUID) -> None:
@@ -778,6 +802,8 @@ class _AgentKeyBindingClient:
         run_id: UUID | None = None,
         has_skills: bool = False,
         egress: EgressContext | None = None,
+        conv_id: UUID | None = None,
+        compat_dirs: tuple[str, ...] = (),
     ) -> SandboxOutcome:
         # B-124 —— 调用方给了 key 就用调用方的:``run_in_sandbox`` 传 ``ctx.agent_key``,
         # 委派出去的子代那里是**父的** key(``_child_run._child_config``),与宿主侧
@@ -794,6 +820,8 @@ class _AgentKeyBindingClient:
             run_id=run_id,
             has_skills=has_skills,
             egress=egress,
+            conv_id=conv_id,
+            compat_dirs=compat_dirs,
         )
 
     async def release(self, *, sandbox_id: UUID) -> None:
@@ -895,6 +923,8 @@ async def run_in_sandbox(
     # 就是「本轮有值」:主 run 来自入口,审批续跑 / 孤儿复活 / 重新生成由入口取回,子代由
     # _child_config 从父那里带下来(父有才带)—— 与 sse.run_agent 写 inputs_run_id 同一口径。
     inputs_run_id = (ctx.inputs_run_id or ctx.run_id) if ctx.prompt_inputs else None
+    # B-236 —— 本次 exec 的视图与宿主侧解析路径用的是同一个值(``ctx.workspace_view``)。
+    view = ctx.workspace_view
     cancelled = False
     try:
         return await client.exec(
@@ -905,6 +935,8 @@ async def run_in_sandbox(
             run_id=inputs_run_id,
             # 技能:种子非空 = 这次 acquire 把技能落到了 /opt/skills/<agent_key>/。
             has_skills=bool(seed_files),
+            conv_id=view.conv_id,
+            compat_dirs=view.compat_dirs,
         )
     except asyncio.CancelledError:
         cancelled = True
@@ -1029,9 +1061,7 @@ class ExecPythonTool:
             description=(
                 "Execute a Python 3 snippet in the sandbox and return "
                 "its stdout / stderr / exit code. Use for calculations, data "
-                "transforms, or anything better done by running code. Runs in "
-                "/workspace, which is your agent's own directory; other "
-                "agents' files are not visible there. "
+                "transforms, or anything better done by running code. " + EXEC_WORKSPACE_NOTE + " "
                 "本轮如果有输入变量，它们在 $EXPERT_WORK_INPUTS 指向的 JSON 文件里"  # noqa: RUF001 — verbatim spec text (B-61 task-4-brief)
                 "（含 URL、编码、本地文件路径）；本轮没有输入变量时这个文件不存在，"  # noqa: RUF001
                 "读不到就照上文办，不必重试。"  # noqa: RUF001
@@ -1047,7 +1077,7 @@ class ExecPythonTool:
                 "文件不在就按清单里的原地址下载。地址一律从清单读或用这些文件，不要手抄。"  # noqa: RUF001
                 # B-82 —— 预装清单。不说,模型就只能「先探测环境」或干脆先装一遍,
                 # 而在阿里云上装一遍是一两分钟(B-81)。渲染在 contract 模块一处。
-                + preinstalled_note()
+                 + preinstalled_note()
             ),
             parameters={
                 "type": "object",
@@ -1068,8 +1098,12 @@ class ExecPythonTool:
         )
 
     async def call(self, args: Mapping[str, Any], *, ctx: ToolContext) -> ToolResult:
+        # 本模块被 workspace_compat 引用(异常类型),顶层互相 import 会成环。
+        from orchestrator.tools.workspace_compat import record_exec_refs
+
         code = self._require_code(args)
         timeout_s = coerce_timeout(args.get("timeout_s"))
+        record_exec_refs(ctx, code)
         outcome = await run_in_sandbox(
             self.client,
             code=code,

@@ -333,6 +333,15 @@ RUN useradd -u 10000 -m -s /usr/sbin/nologin agent \
 # directories down.)
 RUN mkdir -p /opt/skills /opt/agents && chown agent:agent /opt/skills /opt/agents
 
+# B-236 — bind target for the agent root inside every exec's mount namespace
+# (`/agent`, shared by all conversations of one agent; `/workspace` is the
+# conversation's own directory). The rootfs is read-only at run time and the
+# namespace root cannot create a top-level directory, so the image provides
+# the empty mount point. Root-owned is fine: a bind mount inside the user
+# namespace does not need write access to its target. Not the NAS mount path,
+# so it does not collide with the platform-made `/mnt/workspace` symlink.
+RUN mkdir -m 0755 /agent
+
 COPY runner.py /opt/runner.py
 
 # Egress urllib shim (sandbox-egress §3.5): placed in the GLOBAL site-packages

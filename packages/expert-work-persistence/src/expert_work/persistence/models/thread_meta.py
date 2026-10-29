@@ -5,7 +5,7 @@ from __future__ import annotations
 from datetime import datetime
 from uuid import UUID
 
-from sqlalchemy import DateTime, Index, Integer, Text, func, text
+from sqlalchemy import CheckConstraint, DateTime, Index, Integer, Text, func, text
 from sqlalchemy.dialects.postgresql import UUID as PG_UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -36,6 +36,11 @@ class ThreadMetaRow(Base):
     # run finalization. No server_default: pre-existing rows stay NULL
     # ("not yet computed"), distinct from a genuinely empty thread (0).
     message_count: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # B-236 —— 这条对话的沙箱 /workspace 是哪种视图(迁移 0181):发布前已有的行是
+    # ``agent_root``,之后任何入口建的行都取库里的默认值 ``conversation``,代码不写它。
+    workspace_layout: Mapped[str] = mapped_column(
+        Text, nullable=False, server_default="conversation"
+    )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         nullable=False,
@@ -49,6 +54,10 @@ class ThreadMetaRow(Base):
     )
 
     __table_args__ = (
+        CheckConstraint(
+            "workspace_layout IN ('conversation', 'agent_root')",
+            name="thread_meta_workspace_layout_values",
+        ),
         Index("thread_meta_tenant_status_idx", "tenant_id", "status"),
         Index("thread_meta_tenant_user_idx", "tenant_id", "user_id"),
         # Conversation-centric IA — agent-first thread reads (Conversations

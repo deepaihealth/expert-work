@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import pytest
+
 from expert_work.persistence import (
     RENDERED_FIGURE_DIR,
     RENDERED_FIGURE_PAGE_STEM,
@@ -177,3 +179,30 @@ def test_rendered_figure_shape_accepts_every_pdftoppm_padding_width() -> None:
     )
     for page in ("3", "03", "005"):  # <10 页 / 10-99 页 / >99 页
         assert is_rendered_figure_rel(f"{base}{page}.jpg"), page
+
+
+_CONV = "11111111-2222-3333-4444-555555555555"
+
+
+@pytest.mark.parametrize(
+    ("relpath", "reserved"),
+    [
+        (f"agents/k/threads/{_CONV}/work/uploads/x.pdf", True),
+        (f"agents/k/threads/{_CONV}/work/.tool_results/r/x.txt", True),
+        (f"agents/k/threads/{_CONV}/work/客户案例/uploads/x.pdf", False),
+        (f"agents/k/threads/{_CONV}/work/report.md", False),
+        (f"agents/k/threads/{_CONV}/PLAN.md", False),
+        ("agents/k/threads/not-a-uuid/work/uploads/x.pdf", False),
+        (f"shared/threads/{_CONV}/work/uploads/x.pdf", False),
+    ],
+)
+def test_conversation_work_dir_is_a_position_container(relpath: str, reserved: bool) -> None:
+    """B-236 —— exec 在对话目录里为平台目录建的空挂载桩不是 agent 产出:
+    ``agents/<key>/threads/<uuid>/work/`` 与 ``agents/<key>/`` 一样先剥掉再看首段。
+    只认这一个确切形状,对话自己 ``客户案例/uploads/`` 这类子目录照旧显示。"""
+    assert is_reserved_workspace_path(relpath) is reserved
+
+
+def test_conversation_upload_stub_is_delete_protected_but_the_thread_is_not() -> None:
+    assert is_delete_protected_workspace_path(f"agents/k/threads/{_CONV}/work/uploads/x")
+    assert not is_delete_protected_workspace_path(f"agents/k/threads/{_CONV}")

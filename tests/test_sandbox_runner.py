@@ -42,8 +42,15 @@ runner = _load_runner()
 #: 真的那个 argv 拼装函数。模块加载时就抓在手里,免得 fixture / 录制器互相套上去。
 _REAL_EXEC_ARGV = runner._exec_argv
 
-#: ``_EXEC_VIEW_SCRIPT`` 的 ``$0``;它后面一个是 ``$1``(bind 源),再后面是解释器。
+#: ``_EXEC_VIEW_SCRIPT`` 的 ``$0``;它后面是 ``$1``(bind 源)、``$2``(对话 id)、``$3``
+#: (过渡期目录个数)与那几个目录名,再后面是解释器。
 _ARGV0 = "ew-exec-view"
+
+
+def _python_start(argv: list[str]) -> int:
+    """argv 里解释器那一格的下标 —— 跳过 ``$1`` ``$2`` ``$3`` 与 ``$3`` 个目录名。"""
+    at = argv.index(_ARGV0)
+    return at + 4 + int(argv[at + 3])
 
 
 def _root_slot(argv: list[str]) -> str:
@@ -63,9 +70,14 @@ def direct_exec(monkeypatch: pytest.MonkeyPatch) -> None:
     是 runner.py 自己拼的那几个。
     """
 
-    def _without_the_namespace_wrapper(code: str, agent_root: str | None) -> list[str]:
-        argv = _REAL_EXEC_ARGV(code, agent_root)
-        return argv[argv.index(_ARGV0) + 2 :]
+    def _without_the_namespace_wrapper(
+        code: str,
+        agent_root: str | None,
+        conv_id: str | None = None,
+        compat_dirs: list[str] | None = None,
+    ) -> list[str]:
+        argv = _REAL_EXEC_ARGV(code, agent_root, conv_id, compat_dirs)
+        return argv[_python_start(argv) :]
 
     monkeypatch.setattr(runner, "_exec_argv", _without_the_namespace_wrapper)
 
@@ -315,6 +327,8 @@ def test_exec_argv_binds_the_agent_root() -> None:
         runner._EXEC_VIEW_SCRIPT,
         "ew-exec-view",
         "/mnt/workspace/agents/a",
+        "",
+        "0",
         sys.executable,
         "-E",
         "-P",
@@ -343,6 +357,8 @@ def test_exec_argv_unbound_leaves_the_root_slot_empty(agent_root: str | None) ->
         runner._EXEC_VIEW_SCRIPT,
         "ew-exec-view",
         "",
+        "",
+        "0",
         sys.executable,
         "-E",
         "-P",
@@ -354,8 +370,13 @@ def test_exec_argv_unbound_leaves_the_root_slot_empty(agent_root: str | None) ->
 def _recording_exec_argv(seen: list[list[str]], monkeypatch: pytest.MonkeyPatch) -> None:
     """记下真 ``_exec_argv`` 拼出的 argv,再换成一个不进命名空间的空跑子进程。"""
 
-    def _record(code: str, agent_root: str | None) -> list[str]:
-        seen.append(_REAL_EXEC_ARGV(code, agent_root))
+    def _record(
+        code: str,
+        agent_root: str | None,
+        conv_id: str | None = None,
+        compat_dirs: list[str] | None = None,
+    ) -> list[str]:
+        seen.append(_REAL_EXEC_ARGV(code, agent_root, conv_id, compat_dirs))
         return [sys.executable, "-c", "pass"]
 
     monkeypatch.setattr(runner, "_exec_argv", _record)
@@ -405,3 +426,57 @@ def test_handle_request_treats_an_unusable_agent_root_as_unbound(
 # ``/mnt/workspace``)。这两条由 docker 起真镜像的
 # ``services/orchestrator/tests/test_sandbox_runtime_contract.py`` 的
 # ``test_exec_view_is_the_agents_own_directory`` 及其 fail-closed 设计覆盖。
+
+
+# ---------------------------------------------------------------------------
+# B-236 —— 对话视图的两个参数(``conv_id`` / ``compat_dirs``)怎么进 argv。
+# 命名空间里它们干了什么由 ``services/orchestrator/tests/test_exec_view.py`` 的脚本
+# 演练与 ``infra/sandbox-image/smoke_test.py``(CI 起真镜像)覆盖。
+# ---------------------------------------------------------------------------
+
+
+def test_exec_argv_carries_the_conversation_and_compat_dirs() -> None:
+    argv = runner._exec_argv(
+        "print(1)", "/mnt/workspace/agents/a", "11111111-1111-1111-1111-111111111111", ["style"]
+    )
+
+    at = argv.index(_ARGV0)
+    assert argv[at + 1 : at + 5] == [
+        "/mnt/workspace/agents/a",
+        "11111111-1111-1111-1111-111111111111",
+        "1",
+        "style",
+    ]
+    assert argv[_python_start(argv)] == sys.executable
+
+
+def test_exec_argv_drops_the_conversation_without_an_agent_root() -> None:
+    """没绑 agent 就没有对话视图 —— 对话 id 与目录名都不进 argv,脚本走未绑分支。"""
+    argv = runner._exec_argv("print(1)", None, "11111111-1111-1111-1111-111111111111", ["style"])
+
+    at = argv.index(_ARGV0)
+    assert argv[at + 1 : at + 4] == ["", "", "0"]
+
+
+def test_handle_request_passes_the_conversation_view_through(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    seen: list[list[str]] = []
+    _recording_exec_argv(seen, monkeypatch)
+
+    runner.handle_request(
+        {
+            "code": "print(1)",
+            "agent_root": "/mnt/workspace/agents/plan-aaaaaaaa",
+            "conv_id": "11111111-1111-1111-1111-111111111111",
+            "compat_dirs": ["style", 3, "模板"],
+        }
+    )
+
+    at = seen[0].index(_ARGV0)
+    assert seen[0][at + 2 : at + 6] == [
+        "11111111-1111-1111-1111-111111111111",
+        "2",
+        "style",
+        "模板",
+    ]

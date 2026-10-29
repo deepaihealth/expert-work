@@ -27,6 +27,7 @@ from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from fnmatch import fnmatch
+from pathlib import PurePosixPath
 from typing import Any, Protocol, runtime_checkable
 from uuid import UUID
 
@@ -41,6 +42,7 @@ from orchestrator.tools.sandbox import (
 )
 from orchestrator.tools.workspace_scope import (
     SCOPE_USER_ROOT,
+    scope_hidden_heads,
     scope_parts,
     scoped_dir,
     scoped_path,
@@ -148,11 +150,23 @@ def scope_view(entries: Sequence[WorkspaceFileEntry], scope: str) -> list[Worksp
     if not prefix:
         return list(entries)
     base = "/".join(prefix) + "/"
+    hidden = scope_hidden_heads(scope)
     return [
         WorkspaceFileEntry(path=e.path[len(base) :], size=e.size, mtime=e.mtime)
         for e in entries
-        if e.path.startswith(base)
+        if e.path.startswith(base) and e.path[len(base) :].split("/", 1)[0] not in hidden
     ]
+
+
+def without_hidden_heads(
+    listing: WorkspaceDirListing, *, scope: str, path: str
+) -> WorkspaceDirListing:
+    """B-236 —— 作用域根上藏起来的首段不进列表(``agent_shared`` 的 ``threads/``)。"""
+    hidden = scope_hidden_heads(scope)
+    if not hidden or PurePosixPath(path.strip()).parts:
+        return listing
+    kept = tuple(e for e in listing.entries if e.name not in hidden)
+    return WorkspaceDirListing(entries=kept, truncated=listing.truncated)
 
 
 def dir_listing_from_files(
@@ -394,7 +408,8 @@ class SupervisorWorkspaceStore:
         # ``scoped_dir`` 回的已经是**用户根相对**路径(前缀在里面了), 别再拼一次。
         under = scoped_dir(scope, path)
         entries = await self.list_files(tenant_id=tenant_id, user_id=user_id)
-        return dir_listing_from_files(entries, rel=under, max_entries=max_entries)
+        listing = dir_listing_from_files(entries, rel=under, max_entries=max_entries)
+        return without_hidden_heads(listing, scope=scope, path=path)
 
     async def search_files(
         self,
@@ -621,7 +636,8 @@ class RecordingWorkspaceStore:
         # 同 SupervisorWorkspaceStore:``scoped_dir`` 已经含前缀。
         under = scoped_dir(scope, path)
         self.workspace_reads.append((tenant_id, user_id, under))
-        return dir_listing_from_files(self.workspace_files, rel=under, max_entries=max_entries)
+        listing = dir_listing_from_files(self.workspace_files, rel=under, max_entries=max_entries)
+        return without_hidden_heads(listing, scope=scope, path=path)
 
     async def search_files(
         self,

@@ -55,6 +55,7 @@ from control_plane.api._user_scope import (
     get_user_repo,
     resolve_caller_user_id,
 )
+from control_plane.api._workspace_shared import thread_workspace_layout
 from control_plane.api.trace_facade import fetch_and_normalize, fetch_span_raw
 from control_plane.approval_void import (
     close_previous_turn,
@@ -150,6 +151,7 @@ from orchestrator import (
 from orchestrator.multimodal import image_ref_block
 from orchestrator.sse import end_frame_data, format_sse
 from orchestrator.stream_items import STREAM_FORMAT_LEGACY
+from orchestrator.tools.registry import WORKSPACE_LAYOUT_KEY, WorkspaceLayout
 
 logger = logging.getLogger("expert_work.control_plane.runs")
 
@@ -1120,6 +1122,8 @@ async def resolve_approval_decision(
     # 工作区分层 —— agent 身份。续跑段与被续的那一段是同一个 agent 的同一轮活,
     # 漏了这里 = 审批通过之后的后半程写去了用户根,前半程写的在 agent 子树里。
     config["configurable"]["agent_key"] = sanitize_agent_key(spec_record.spec.metadata.name)
+    # B-236 —— 同理,布局取这条对话自己的:续跑段的 /workspace 与批准前同一个目录。
+    config["configurable"][WORKSPACE_LAYOUT_KEY] = meta.workspace_layout
     worker = asyncio.create_task(
         run_agent(
             bridge=runtime.stream_bridge,
@@ -1314,6 +1318,9 @@ async def spawn_run(
 
     run_id = uuid4()
     prior_runs = await runtime.run_manager.list_by_thread(thread_id, tenant_id=tenant_id)
+    workspace_layout = await thread_workspace_layout(
+        request.app.state.thread_meta_repo, thread_id, tenant_id=tenant_id
+    )
 
     # P-1 —— supersede 与建行必须在同一把 per-thread 锁里(spec §8-4):queue worker
     # 只认已存在的 QUEUED 行,行在 supersede 全部写完之后才 INSERT,worker 抢不到
@@ -1492,6 +1499,7 @@ async def spawn_run(
             payload=payload,
             replay_messages=replay_messages,
             inputs=inputs,
+            workspace_layout=workspace_layout,
         )
 
     headers = {
@@ -1608,6 +1616,7 @@ async def _start_run(
     payload: RunRequest,
     replay_messages: tuple[BaseMessage, ...] | None,
     inputs: dict[str, Any] | None,
+    workspace_layout: WorkspaceLayout,
 ) -> None:
     """建好输入与配置、起 ``run_agent``。B-139 抽出来:立即执行与排队轮到后执行
     走同一份,``deadline_at`` 从**真正开跑**那一刻算。"""
@@ -1649,6 +1658,8 @@ async def _start_run(
     configurable["oauth_user_id"] = oauth_subject
     # 工作区分层 —— agent 身份。与 /opt/skills/<agent_key> 同一个值。
     configurable["agent_key"] = sanitize_agent_key(record_spec.metadata.name)
+    # B-236 —— 这条对话的 /workspace 布局(thread_meta;发布前已开的对话是老视图)。
+    configurable[WORKSPACE_LAYOUT_KEY] = workspace_layout
     if built.run_deadline_s > 0:
         configurable["deadline_at"] = time.monotonic() + float(built.run_deadline_s)
     if payload.use_draft:

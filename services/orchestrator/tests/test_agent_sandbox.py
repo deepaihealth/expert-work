@@ -72,6 +72,7 @@ from expert_work.common.egress_token import verify_egress_token
 from expert_work.persistence import SANDBOX_AGENTS_ROOT, SANDBOX_SKILLS_ROOT
 from expert_work.persistence.sandbox_instance_store import (
     _STUCK_CREATE_TTL_S,
+    SANDBOX_LAYOUT_AGENT_CONV,
     SANDBOX_LAYOUT_AGENT_NS,
     SANDBOX_LAYOUT_USER_ROOT,
     InMemorySandboxInstanceStore,
@@ -2361,6 +2362,24 @@ async def test_acquire_rebuilds_a_warm_session_built_with_another_layout() -> No
 
 
 @pytest.mark.asyncio
+async def test_acquire_rebuilds_a_warm_session_from_before_the_conversation_view() -> None:
+    """B-236 —— ``agent-ns`` 的热会话是老镜像起的,没有 ``/agent`` 挂载点,每次 exec 都会
+    以 97 退出;acquire 时就按 ``layout_mismatch`` 换代。"""
+    sdk, store = FakeSdk(), FakeInstanceStore()
+    client = make_client(sdk, store)
+    tenant_id, user_id = uuid4(), uuid4()
+
+    old_id = await client.acquire(tenant_id=tenant_id, thread_id="t1", user_id=user_id)
+    store.rows[old_id]["layout"] = SANDBOX_LAYOUT_AGENT_NS
+
+    new_id = await client.acquire(tenant_id=tenant_id, thread_id="t2", user_id=user_id)
+
+    assert new_id != old_id
+    assert (old_id, _LAYOUT_MISMATCH_DESTROY_REASON) in store.mark_destroyed_calls
+    assert store.rows[new_id]["layout"] == SANDBOX_LAYOUT_AGENT_CONV
+
+
+@pytest.mark.asyncio
 async def test_acquire_reuses_a_warm_session_with_the_same_layout() -> None:
     sdk, store = FakeSdk(), FakeInstanceStore()
     client = make_client(sdk, store)
@@ -3035,17 +3054,44 @@ async def test_exec_command_is_the_shared_exec_view_command() -> None:
 
     assert re.fullmatch(
         re.escape("umask 077 && ") + r"unshare -Urm --propagation private -- sh -c '.*' "
-        r"ew-exec-view /mnt/workspace/agents/plan-aaaaaaaa python -E -P "
+        r"ew-exec-view /mnt/workspace/agents/plan-aaaaaaaa '' 0 python -E -P "
         r"/tmp/ew-exec-[0-9a-f]{32}\.py",
         bound,
         re.DOTALL,
     ), bound
     assert re.fullmatch(
         re.escape("umask 077 && ") + r"unshare -Urm --propagation private -- sh -c '.*' "
-        r"ew-exec-view '' python -E -P /tmp/ew-exec-[0-9a-f]{32}\.py",
+        r"ew-exec-view '' '' 0 python -E -P /tmp/ew-exec-[0-9a-f]{32}\.py",
         unbound,
         re.DOTALL,
     ), unbound
+
+
+@pytest.mark.asyncio
+async def test_exec_command_carries_the_conversation_view() -> None:
+    """B-236 —— 对话视图:``$2`` 是对话 id,``$3`` 是过渡期目录个数,其后是目录名。"""
+    sdk, store = FakeSdk(), FakeInstanceStore()
+    client = make_client(sdk, store)
+    sid = await client.acquire(tenant_id=uuid4(), thread_id="t", user_id=uuid4())
+    conv = uuid4()
+
+    await client.exec(
+        sandbox_id=sid,
+        code="print(1)",
+        timeout_s=5,
+        agent_key="plan-aaaaaaaa",
+        conv_id=conv,
+        compat_dirs=("style",),
+    )
+    command, *_ = sdk.sandbox.commands.calls[-1]
+
+    assert re.fullmatch(
+        re.escape("umask 077 && ") + r"unshare -Urm --propagation private -- sh -c '.*' "
+        rf"ew-exec-view /mnt/workspace/agents/plan-aaaaaaaa {conv} 1 style python -E -P "
+        r"/tmp/ew-exec-[0-9a-f]{32}\.py",  # noqa: S108 — sandbox tmpfs path, not host
+        command,
+        re.DOTALL,
+    ), command
 
 
 @pytest.mark.asyncio
@@ -3075,5 +3121,7 @@ async def test_post_create_mkdir_failure_discards_the_sandbox() -> None:
     )
 
 
-def test_client_lays_out_agent_ns_by_default() -> None:
-    assert make_client(FakeSdk(), FakeInstanceStore()).layout == SANDBOX_LAYOUT_AGENT_NS
+def test_client_lays_out_agent_conv_by_default() -> None:
+    """B-236 —— 新镜像多了 ``/agent`` 挂载点:布局值换成 ``agent-conv``,老镜像起的
+    ``agent-ns`` 热会话在下一次 acquire 时按 ``layout_mismatch`` 重建。"""
+    assert make_client(FakeSdk(), FakeInstanceStore()).layout == SANDBOX_LAYOUT_AGENT_CONV

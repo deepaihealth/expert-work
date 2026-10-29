@@ -59,7 +59,12 @@ from orchestrator.tools._worker_events import (
     build_worker_update_frame,
 )
 from orchestrator.tools.artifact import ARTIFACT_RECORDER_KEY, ArtifactRecorder
-from orchestrator.tools.registry import ToolContext, ToolResult
+from orchestrator.tools.registry import (
+    WORKSPACE_LAYOUT_KEY,
+    WORKSPACE_THREAD_ID_KEY,
+    ToolContext,
+    ToolResult,
+)
 from orchestrator.trajectory import (
     TrajectoryOutcome,
     TrajectoryRecord,
@@ -992,6 +997,13 @@ def _child_config(ctx: ToolContext, *, sub_thread_id: UUID, sub_run_id: UUID) ->
     inputs_run_id = ctx.inputs_run_id or ctx.run_id
     if inputs_run_id is not None:
         configurable["inputs_run_id"] = str(inputs_run_id)
+    # B-236 —— 同理透传父的工作区布局与**根对话**的 id:子代每次都有新的子线程 id,
+    # 按它分目录的话 worker 写的文件落进一个父看不见的 ``threads/<子线程>/work/``。
+    # 孙代沿用父自己已经带着的那个(还是最上面那个对话)。
+    configurable[WORKSPACE_LAYOUT_KEY] = ctx.workspace_layout
+    workspace_thread_id = ctx.workspace_thread_id or ctx.thread_id
+    if workspace_thread_id is not None:
+        configurable[WORKSPACE_THREAD_ID_KEY] = str(workspace_thread_id)
     # B-61 §5.3 —— 同一个理由,绑定面:透传**父的** ``prompt_inputs``。子代跑的是
     # 同一个 ``tools_node``,config 里没有这一项时 ``apply_arg_bindings`` 对每个被绑
     # 参数走「本轮没给值 → 把它删掉」那条分支;而该参数已经从子代的 schema 里剥掉、

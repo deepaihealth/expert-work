@@ -2045,8 +2045,8 @@ def _assemble_system_prompt(
             "$EXPERT_WORK_SKILLS_DIR/<skill name>/ — so when a skill tells you "
             "to run one of its bundled scripts, run it from there "
             '(e.g. python "$EXPERT_WORK_SKILLS_DIR/<skill name>/scripts/gen.py"). '
-            "The sandbox working directory is /workspace, which is NOT where "
-            "skill files live."
+            "The sandbox working directory is /workspace (this conversation's "
+            "directory), which is NOT where skill files live."
             "\n\n<available-skills>\n  "
             + _render_skills_index(skill_summaries)
             + "\n</available-skills>"
