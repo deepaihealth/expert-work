@@ -12,6 +12,7 @@ import { useTranslation } from "react-i18next";
 import type { EstimateSummary } from "../../api/knowledge";
 import { ReadonlyTooltip } from "../../components/ReadonlyTooltip";
 import { daysLeft, formatYuan } from "./ingestCost";
+import type { WaitingDocument } from "./useEstimateActions";
 
 const { Text } = Typography;
 
@@ -21,10 +22,10 @@ interface PendingConfirmationBannerProps {
   busy: boolean;
   onlyWaiting: boolean;
   onConfirmAll: () => void;
-  /** The waiting documents' ids, read when 「全部取消」's confirm opens. */
-  onPrepareWithdrawAll: () => Promise<string[]>;
+  /** The waiting documents, read when 「全部取消」's confirm opens. */
+  onPrepareWithdrawAll: () => Promise<WaitingDocument[]>;
   /** Withdraw exactly those (one uploaded after the confirm opened stays). */
-  onWithdrawAll: (ids: string[]) => void;
+  onWithdrawAll: (waiting: WaitingDocument[]) => void;
   onOnlyWaitingChange: (on: boolean) => void;
 }
 
@@ -40,7 +41,7 @@ export function PendingConfirmationBanner({
 }: PendingConfirmationBannerProps) {
   const { t } = useTranslation();
   /** What 「全部取消」 withdraws: read when its confirm opened (``null``: reading). */
-  const [withdrawIds, setWithdrawIds] = useState<string[] | null>(null);
+  const [withdrawing, setWithdrawing] = useState<WaitingDocument[] | null>(null);
   const waiting = summary ? summary.awaiting + summary.duplicates + summary.estimating : 0;
   if (!summary || (waiting === 0 && !onlyWaiting)) return null;
   const parts = [
@@ -83,19 +84,19 @@ export function PendingConfirmationBanner({
           <ReadonlyTooltip on={readonly}>
             <Popconfirm
               title={t("knowledge_page.estimate_withdraw_all_confirm_title", {
-                count: withdrawIds?.length ?? 0,
+                count: withdrawing?.length ?? 0,
               })}
               description={t("knowledge_page.estimate_withdraw_confirm_body")}
               onOpenChange={(open) => {
                 if (!open) return;
-                setWithdrawIds(null);
+                setWithdrawing(null);
                 void onPrepareWithdrawAll()
-                  .then(setWithdrawIds)
-                  .catch(() => setWithdrawIds([]));
+                  .then(setWithdrawing)
+                  .catch(() => setWithdrawing([]));
               }}
-              okButtonProps={{ disabled: withdrawIds === null || withdrawIds.length === 0 }}
+              okButtonProps={{ disabled: withdrawing === null || withdrawing.length === 0 }}
               onConfirm={() => {
-                if (withdrawIds && withdrawIds.length > 0) onWithdrawAll(withdrawIds);
+                if (withdrawing && withdrawing.length > 0) onWithdrawAll(withdrawing);
               }}
               disabled={readonly || busy || waiting === 0}
             >

@@ -108,6 +108,14 @@ function errMessage(err: unknown): string {
       : "unknown error";
 }
 
+/** A 409 of a re-ingest / 「补识别」 as the user's message: ``busy`` when the
+ *  document is writing its chunks (B-222: try again once ready), ``other``
+ *  for the endpoint's own conflict; ``null`` when it is no 409. */
+function conflictMessage(err: unknown, busy: string, other: string): string | null {
+  if (!(err instanceof ApiError) || err.status !== 409) return null;
+  return err.details?.error === "document_busy" ? busy : other;
+}
+
 /** B-175 P3-PR3 — rows read without ``review`` (the poll) keep the one the
  *  last full read gave them. */
 function keepReview(
@@ -382,11 +390,13 @@ export function DocumentsTab({
         message.success(t("knowledge_page.reingest_started"));
         await refresh();
       } catch (err) {
-        const detail =
-          err instanceof ApiError && err.status === 409
-            ? t("knowledge_page.reingest_no_bytes")
-            : errMessage(err);
-        message.error(detail);
+        message.error(
+          conflictMessage(
+            err,
+            t("knowledge_page.document_busy"),
+            t("knowledge_page.reingest_no_bytes"),
+          ) ?? errMessage(err),
+        );
       }
     },
     [t, baseName, message, refresh],
@@ -399,9 +409,11 @@ export function DocumentsTab({
         message.success(t("knowledge_page.recognize_started"));
       } catch (err) {
         message.error(
-          err instanceof ApiError && err.status === 409
-            ? t("knowledge_page.recognize_nothing")
-            : errMessage(err),
+          conflictMessage(
+            err,
+            t("knowledge_page.document_busy"),
+            t("knowledge_page.recognize_nothing"),
+          ) ?? errMessage(err),
         );
       }
       await refresh();
@@ -807,8 +819,8 @@ export function DocumentsTab({
         busy={estimates.busy}
         onlyWaiting={onlyWaiting}
         onConfirmAll={() => estimateSummary && void estimates.confirmAll(estimateSummary)}
-        onPrepareWithdrawAll={estimates.waitingIds}
-        onWithdrawAll={(ids) => void estimates.withdrawIds(ids)}
+        onPrepareWithdrawAll={estimates.waitingDocuments}
+        onWithdrawAll={(waiting) => void estimates.withdraw(waiting)}
         onOnlyWaitingChange={handleOnlyWaiting}
       />
 

@@ -623,6 +623,58 @@ async def test_ingest_anyway_refuses_a_duplicate_changed_meanwhile(
     assert (await harness.row(copy["id"]))["status"] == "awaiting_confirmation"
 
 
+async def test_a_failed_release_never_fails_the_action_it_follows(
+    harness: _Harness, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """B2b second review: the action is committed; it answers and is audited
+    (the recovery worker's sweep releases the copies later)."""
+    deleted = await harness.upload("deleted.md", b"# Deleted")
+    batch = await harness.upload("batch.md", b"# Batch")
+    discarded = await harness.upload("discarded.md", _MD)
+    await harness.upload("discarded.md", _MD + b"\n\nMore.")
+
+    async def broken(**kwargs: Any) -> Any:
+        msg = "database went away"
+        raise RuntimeError(msg)
+
+    monkeypatch.setattr(harness.store, "release_stale_duplicates", broken)
+    single = await harness.client.delete(f"{_DOCS}/{deleted['id']}")
+    many = await harness.client.post(f"{_DOCS}/batch-delete", json={"document_ids": [batch["id"]]})
+    dropped = await harness.client.post(f"{_DOCS}/{discarded['id']}/discard-pending")
+
+    assert (single.status_code, many.status_code, dropped.status_code) == (204, 200, 200)
+    assert [r[0] for r in await harness.audit_rows("knowledge:document_delete")] == [
+        deleted["id"],
+        batch["id"],
+    ]
+    assert len(await harness.audit_rows("knowledge:document_batch")) == 1
+    assert [r[0] for r in await harness.audit_rows("knowledge:document_discard_pending")] == [
+        discarded["id"]
+    ]
+
+
+async def test_a_cancel_leaves_a_document_confirmed_since_it_was_read(
+    harness: _Harness,
+) -> None:
+    """B2b second review: 「全部取消」 sends the statuses it read."""
+    read_waiting = await harness.upload("a.md", _MD)
+    await confirm_all(harness.client)
+
+    response = await harness.client.post(
+        f"{_DOCS}/cancel",
+        json={
+            "document_ids": [read_waiting["id"]],
+            "expect_status": ["estimating", "awaiting_confirmation"],
+        },
+    )
+
+    assert response.json()["results"] == [
+        {"document_id": read_waiting["id"], "outcome": "status_changed"}
+    ]
+    assert (await harness.row(read_waiting["id"]))["status"] in ("pending", "processing", "ready")
+    assert await harness.audit_rows("knowledge:document_cancel") == []
+
+
 async def test_discarding_a_waiting_new_uploads_new_bytes_estimates_the_first(
     harness: _Harness,
 ) -> None:

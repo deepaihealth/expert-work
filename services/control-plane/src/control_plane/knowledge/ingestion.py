@@ -1159,7 +1159,9 @@ class _ModelsGuard:
     Fails closed (B2b review M6): once a switch is seen every later call is
     refused with the same :class:`StaleIngestionError` — whatever goes wrong
     sending the document back — and the check, re-estimate and snapshot run
-    once per claim however many figure calls ask at the same time (a lock)."""
+    once per claim however many figure calls ask at the same time (a lock).
+    A check that fails is a refusal too (nothing is sent back: the claim is
+    left for a retry once its lease runs out)."""
 
     def __init__(
         self,
@@ -1183,9 +1185,21 @@ class _ModelsGuard:
         async with self._lock:
             if self.refusal is not None:
                 raise self.refusal
-            if not await self._estimator.models_changed(self._claim, self._confirmed.models):
-                return
             claim = self._claim
+            try:
+                changed = await self._estimator.models_changed(claim, self._confirmed.models)
+            except Exception:
+                # B2b review: a check that cannot tell (settings or key lookup
+                # failed) refuses too — the checkpoint would let the call go.
+                logger.warning(
+                    "knowledge.models_check_failed document=%s", claim.document_id, exc_info=True
+                )
+                self.refusal = StaleIngestionError(
+                    f"document {claim.document_id}: its models could not be checked"
+                )
+                raise self.refusal from None
+            if not changed:
+                return
             self.refusal = StaleIngestionError(
                 f"document {claim.document_id}: a model changed since its estimate was confirmed"
             )

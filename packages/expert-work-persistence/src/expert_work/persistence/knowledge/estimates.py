@@ -43,7 +43,11 @@ WAITING_STATUSES: Final = frozenset(
 #: Keys of ``ingest_estimate`` the store sets (whatever estimate is written).
 META_KEYS: Final = ("origin", "allow_duplicate", "restore")
 #: Of them, the ones never shown.
-_STORE_ONLY: Final = ("restore",)
+_STORE_ONLY: Final = ("restore", "first_confirm_by")
+#: B2b review —— the deadline a released duplicate had before it went back
+#: to ``estimating`` (ISO). Its estimate, when it lands, keeps that deadline
+#: (:func:`kept_deadline`): a released copy never outlives its first one.
+FIRST_CONFIRM_BY: Final = "first_confirm_by"
 
 #: A withdrawn estimate puts a document back in one of these as it was; any
 #: other status it came from (an ingest under way) becomes ``cancelled``.
@@ -442,15 +446,35 @@ def duplicate_ref_id(raw: Mapping[str, Any] | None) -> UUID | None:
         return None
 
 
-def released_duplicate(raw: Mapping[str, Any]) -> tuple[DocumentStatus, dict[str, Any]]:
+def released_duplicate(
+    raw: Mapping[str, Any], *, confirm_by: datetime | None
+) -> tuple[DocumentStatus, dict[str, Any]]:
     """K-21 ①, §7 —— a duplicate whose original no longer holds its bytes
     (withdrawn, deleted, replaced): the mark goes. One with a real estimate
     (caught when its estimate finished) waits as a plain estimate; one caught
-    on upload, never parsed, is estimated now (its store-only keys kept)."""
+    on upload, never parsed, is estimated now (its store-only keys kept, and
+    its deadline ``confirm_by``: see :func:`kept_deadline`)."""
     if is_estimated(raw):
         kept = {key: value for key, value in raw.items() if key != "duplicate_of"}
         return DocumentStatus.AWAITING_CONFIRMATION, kept
-    return DocumentStatus.ESTIMATING, meta_of(raw)
+    meta = meta_of(raw)
+    if confirm_by is not None:
+        meta[FIRST_CONFIRM_BY] = confirm_by.isoformat()
+    return DocumentStatus.ESTIMATING, meta
+
+
+def kept_deadline(raw: Mapping[str, Any] | None, confirm_by: datetime) -> datetime:
+    """The deadline a finished estimate gets: ``confirm_by``, or the deadline
+    the document had before it was released (:data:`FIRST_CONFIRM_BY`) when
+    that is earlier."""
+    first = (raw or {}).get(FIRST_CONFIRM_BY)
+    if not isinstance(first, str):
+        return confirm_by
+    try:
+        earlier = datetime.fromisoformat(first)
+    except ValueError:
+        return confirm_by
+    return min(earlier, confirm_by)
 
 
 def _status(value: object) -> DocumentStatus | None:

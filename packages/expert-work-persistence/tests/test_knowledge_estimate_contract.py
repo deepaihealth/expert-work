@@ -37,6 +37,7 @@ from expert_work.persistence import (
     create_async_session_factory,
 )
 from expert_work.persistence.embedding import EMBEDDING_DIM
+from expert_work.persistence.knowledge import sql_estimates
 from expert_work.persistence.knowledge.base import KnowledgeStore, ParseSnapshot
 from expert_work.persistence.knowledge.estimates import EstimateRefused
 from expert_work.persistence.knowledge.passages import ChunkVector
@@ -870,9 +871,9 @@ async def test_a_duplicate_of_a_withdrawn_original_loses_its_mark(store: Knowled
         kept.status is DocumentStatus.ESTIMATING and elsewhere.status is DocumentStatus.ESTIMATING
     )
 
-    assert await store.release_stale_duplicates(tenant_id=tenant, kb_id=base.id) == []
+    assert await store.release_stale_duplicates(tenant_id=tenant, kb_id=base.id, now=_NOW) == []
     await store.cancel_documents(tenant_id=tenant, kb_id=base.id, document_ids=[original.id])
-    released = await store.release_stale_duplicates(tenant_id=tenant, kb_id=base.id)
+    released = await store.release_stale_duplicates(tenant_id=tenant, kb_id=base.id, now=_NOW)
 
     assert [d.id for d in released] == [copy.id]
     again = await _get(store, tenant, copy.id)
@@ -904,7 +905,7 @@ async def test_a_duplicate_of_an_original_that_replaced_its_bytes_loses_its_mark
         tenant_id=tenant, kb_id=base.id, filename="a.md", content=b"v2", content_sha256="v2"
     )
     # v2 still pending: the original still holds v1.
-    assert await store.release_stale_duplicates(tenant_id=tenant, kb_id=base.id) == []
+    assert await store.release_stale_duplicates(tenant_id=tenant, kb_id=base.id, now=_NOW) == []
     generation = await _claim(store, tenant, original.id)
     assert await store.set_document_status(
         tenant_id=tenant,
@@ -914,7 +915,7 @@ async def test_a_duplicate_of_an_original_that_replaced_its_bytes_loses_its_mark
         generation=generation,
     )  # v2 promoted: v1 is gone
 
-    released = await store.release_stale_duplicates(tenant_id=tenant, kb_id=base.id)
+    released = await store.release_stale_duplicates(tenant_id=tenant, kb_id=base.id, now=_NOW)
 
     assert [d.id for d in released] == [copy.id]
     assert (await _get(store, tenant, copy.id)).status is DocumentStatus.ESTIMATING
@@ -938,7 +939,7 @@ async def test_an_estimated_duplicate_of_a_deleted_original_stays_confirmable(
 
     assert await store.delete_document(tenant_id=tenant, document_id=first.id)
     # Across tenants (the recovery worker's sweep).
-    released = await store.release_stale_duplicates()
+    released = await store.release_stale_duplicates(now=_NOW)
 
     assert [d.id for d in released] == [late.id]
     after = await _get(store, tenant, late.id)
@@ -980,6 +981,182 @@ async def test_discarding_the_new_bytes_of_a_waiting_new_upload_estimates_it_aga
     assert await store.cancel_documents(
         tenant_id=tenant, kb_id=base.id, document_ids=[first.id]
     ) == {first.id: "withdrawn_deleted"}
+
+
+async def _copy_of_withdrawn(store: KnowledgeStore, tenant: UUID, kb_id: UUID) -> KnowledgeDocument:
+    """A copy caught on upload (deadline ``_NOW + CONFIRM_WINDOW``) whose
+    original has been withdrawn."""
+    original = await _estimated(
+        store, tenant, (await _upload(store, tenant, kb_id, "a.md", sha="same")).id
+    )
+    copy = await _upload(store, tenant, kb_id, "copy.md", sha="same")
+    assert copy.status is DocumentStatus.AWAITING_CONFIRMATION
+    assert copy.confirm_by == _NOW + CONFIRM_WINDOW
+    await store.cancel_documents(tenant_id=tenant, kb_id=kb_id, document_ids=[original.id])
+    return copy
+
+
+async def test_a_copy_past_its_deadline_is_left_to_the_expiry_sweep(
+    store: KnowledgeStore,
+) -> None:
+    """B2b review: released, it would be estimated again with a new deadline."""
+    tenant = uuid4()
+    base = await store.create_base(tenant_id=tenant, name="kb")
+    copy = await _copy_of_withdrawn(store, tenant, base.id)
+    late = _NOW + CONFIRM_WINDOW + timedelta(seconds=1)
+
+    assert await store.release_stale_duplicates(tenant_id=tenant, kb_id=base.id, now=late) == []
+
+    expired = await store.expire_awaiting(now=late, limit=10)
+    assert [(e.document_id, e.outcome) for e in expired] == [(copy.id, "withdrawn_deleted")]
+
+
+async def test_a_released_copy_keeps_its_first_deadline(store: KnowledgeStore) -> None:
+    """B2b review: its estimate, finished days later, does not start a new window."""
+    tenant = uuid4()
+    base = await store.create_base(tenant_id=tenant, name="kb")
+    copy = await _copy_of_withdrawn(store, tenant, base.id)
+    later = _NOW + timedelta(days=3)
+
+    released = await store.release_stale_duplicates(tenant_id=tenant, kb_id=base.id, now=later)
+
+    assert [d.id for d in released] == [copy.id]
+    done = await _estimated(store, tenant, copy.id, confirm_by=later + CONFIRM_WINDOW)
+    assert done.confirm_by == _NOW + CONFIRM_WINDOW
+    # A later estimate of it (new bytes) starts afresh.
+    await store.begin_upload(
+        tenant_id=tenant,
+        kb_id=base.id,
+        filename="copy.md",
+        content=b"v2",
+        content_sha256="v2",
+        now=later,
+    )
+    again = await _estimated(store, tenant, copy.id, confirm_by=later + CONFIRM_WINDOW)
+    assert again.confirm_by == later + CONFIRM_WINDOW
+
+
+async def test_stale_copies_are_released_batch_by_batch(
+    store: KnowledgeStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """B2b review: a bounded batch per transaction, every batch reached."""
+    monkeypatch.setattr(sql_estimates, "_RELEASE_BATCH", 2)
+    tenant = uuid4()
+    base = await store.create_base(tenant_id=tenant, name="kb")
+    original = await _estimated(
+        store, tenant, (await _upload(store, tenant, base.id, "a.md", sha="same")).id
+    )
+    copies = [await _upload(store, tenant, base.id, f"c{i}.md", sha="same") for i in range(5)]
+    await _estimated(store, tenant, (await _upload(store, tenant, base.id, "k.md", sha="k")).id)
+    held = [await _upload(store, tenant, base.id, f"h{i}.md", sha="k") for i in range(3)]
+    assert all(d.status is DocumentStatus.AWAITING_CONFIRMATION for d in copies + held)
+    await store.cancel_documents(tenant_id=tenant, kb_id=base.id, document_ids=[original.id])
+
+    released = await store.release_stale_duplicates(now=_NOW)
+
+    assert sorted(d.id for d in released) == sorted(d.id for d in copies)
+
+
+async def test_a_document_reclaimed_at_indexing_can_go_back_to_confirmation(
+    store: KnowledgeStore,
+) -> None:
+    """B2b review: the drive died at ``indexing`` (its chunk swap rolled back
+    with it); the reclaim finds a model changed. Left at ``indexing`` it
+    would be refused as busy every lease until its attempts ran out."""
+    tenant = uuid4()
+    base = await store.create_base(tenant_id=tenant, name="kb")
+    waiting = await _estimated(store, tenant, (await _upload(store, tenant, base.id, "a.md")).id)
+    await _confirm(store, tenant, waiting)
+    generation = await _claim(store, tenant, waiting.id)
+    assert await store.set_document_stage(
+        tenant_id=tenant, document_id=waiting.id, stage=IngestStage.INDEXING, generation=generation
+    )
+
+    claims = await store.claim_documents_for_ingest(
+        now=datetime.now(UTC) + timedelta(seconds=_LEASE_S + 1),
+        lease_seconds=_LEASE_S,
+        limit=10,
+        max_attempts=_MAX_ATTEMPTS,
+    )
+
+    assert [c.document_id for c in claims] == [waiting.id]
+    reclaimed = await _get(store, tenant, waiting.id)
+    assert (reclaimed.status, reclaimed.stage) == (DocumentStatus.PROCESSING, IngestStage.QUEUED)
+    assert await store.return_to_confirmation(
+        tenant_id=tenant,
+        document_id=waiting.id,
+        generation=claims[0].generation,
+        estimate=_estimate(999_000),
+        snapshot=_snapshot("again"),
+        confirm_by=_NOW + CONFIRM_WINDOW,
+    )
+    back = await _get(store, tenant, waiting.id)
+    assert back.status is DocumentStatus.AWAITING_CONFIRMATION
+
+
+async def test_the_same_bytes_past_the_deadline_start_a_new_estimate(
+    store: KnowledgeStore,
+) -> None:
+    """B2b review: answered ``unchanged``, the sweep would delete what the user
+    just dropped again."""
+    tenant = uuid4()
+    base = await store.create_base(tenant_id=tenant, name="kb")
+    waiting = await _estimated(
+        store, tenant, (await _upload(store, tenant, base.id, "a.md")).id, confirm_by=_NOW
+    )
+    late = _NOW + timedelta(seconds=1)
+
+    again = await store.begin_upload(
+        tenant_id=tenant,
+        kb_id=base.id,
+        filename="a.md",
+        content=b"bytes of a.md",
+        content_sha256="sha-a.md",
+        now=late,
+    )
+
+    assert again.outcome == "estimating"
+    after = await _get(store, tenant, waiting.id)
+    assert (after.status, after.ingest_generation) == (
+        DocumentStatus.ESTIMATING,
+        waiting.ingest_generation + 1,
+    )
+    assert await store.expire_awaiting(now=late, limit=10) == []
+
+
+async def test_a_cancel_leaves_what_changed_since_it_was_read(store: KnowledgeStore) -> None:
+    """B2b review: ids read as waiting, then confirmed or sent for 「仍入库」."""
+    tenant = uuid4()
+    base = await store.create_base(tenant_id=tenant, name="kb")
+    confirmed = await _estimated(store, tenant, (await _upload(store, tenant, base.id, "a.md")).id)
+    await _confirm(store, tenant, confirmed)
+    plain = await _estimated(store, tenant, (await _upload(store, tenant, base.id, "b.md")).id)
+    await _estimated(store, tenant, (await _upload(store, tenant, base.id, "c.md", sha="same")).id)
+    copy = await _upload(store, tenant, base.id, "copy.md", sha="same")
+    assert copy.ingest_estimate is not None
+    await store.begin_estimate(
+        tenant_id=tenant,
+        document_id=copy.id,
+        origin=EstimateOrigin.UPLOAD,
+        allow_duplicate=True,
+        expect_status=DocumentStatus.AWAITING_CONFIRMATION,
+        expect_estimate_id=copy.ingest_estimate.id,
+    )
+
+    outcomes = await store.cancel_documents(
+        tenant_id=tenant,
+        kb_id=base.id,
+        document_ids=[confirmed.id, plain.id, copy.id],
+        expect_status={DocumentStatus.AWAITING_CONFIRMATION},
+    )
+
+    assert outcomes == {
+        confirmed.id: "status_changed",
+        plain.id: "withdrawn_deleted",
+        copy.id: "status_changed",
+    }
+    assert (await _get(store, tenant, confirmed.id)).status is DocumentStatus.PENDING
+    assert (await _get(store, tenant, copy.id)).status is DocumentStatus.ESTIMATING
 
 
 # -- withdrawing -------------------------------------------------------------------

@@ -157,6 +157,11 @@ class _CancelBody(BaseModel):
     """Body of ``POST /v1/knowledge/bases/{name}/documents/cancel`` (B-222)."""
 
     document_ids: list[UUID] = Field(min_length=1, max_length=DOCUMENTS_PAGE_MAX)
+    #: B2b review —— only documents still in one of these (as the caller
+    #: read them) are stopped; the others answer ``status_changed``.
+    expect_status: list[DocumentStatus] | None = Field(
+        default=None, min_length=1, max_length=len(DocumentStatus)
+    )
 
 
 def _get_knowledge_store(request: Request) -> KnowledgeStore:
@@ -382,8 +387,15 @@ async def _release_duplicates(
 ) -> None:
     """K-21 ① (§7) —— after a document of ``base`` went away or lost its
     bytes: copies of it are no longer duplicates; one never parsed is
-    estimated now (the recovery worker would within a cycle anyway)."""
-    released = await store.release_stale_duplicates(tenant_id=base.tenant_id, kb_id=base.id)
+    estimated now (the recovery worker would within a cycle anyway).
+
+    Runs after the action is committed and audited, and never fails it: an
+    error is logged and the recovery worker's sweep releases them instead."""
+    try:
+        released = await store.release_stale_duplicates(tenant_id=base.tenant_id, kb_id=base.id)
+    except Exception:
+        logger.warning("knowledge.release_duplicates_failed kb=%s", base.id, exc_info=True)
+        return
     if runner is None:
         return
     for document in released:
@@ -1052,7 +1064,6 @@ def build_knowledge_router() -> APIRouter:
             kb_id=document.kb_id if document is not None else base.id,
             document_id=document_id,
         )
-        await _release_duplicates(store, runner, base)  # B-222 PR-2: its copies
         await _audit_write(
             audit,
             request,
@@ -1061,6 +1072,7 @@ def build_knowledge_router() -> APIRouter:
             resource_id=str(document_id),
             details={"kb": base.name},
         )
+        await _release_duplicates(store, runner, base)  # B-222 PR-2: its copies
         return Response(status_code=204)
 
     @router.post(
@@ -1242,7 +1254,6 @@ def build_knowledge_router() -> APIRouter:
             )
         if restored.status is DocumentStatus.ESTIMATING and runner is not None:
             runner.submit(tenant_id=tenant_id, document_id=document_id)
-        await _release_duplicates(store, runner, base)  # its dropped bytes' copies
         await _audit_write(
             audit,
             request,
@@ -1251,6 +1262,7 @@ def build_knowledge_router() -> APIRouter:
             resource_id=str(document_id),
             details={"kb": base.name, "filename": document.filename},
         )
+        await _release_duplicates(store, runner, base)  # its dropped bytes' copies
         return JSONResponse(content=_document_dict(restored))
 
     @router.post(
@@ -1277,11 +1289,18 @@ def build_knowledge_router() -> APIRouter:
         B-222 PR-2: an ``estimating`` / ``awaiting_confirmation`` document's
         estimate is withdrawn instead — ``withdrawn_deleted``: a new upload,
         deleted with its file; ``withdrawn``: new bytes dropped (the previous
-        version serves on), or a re-ingest put back as it was."""
+        version serves on), or a re-ingest put back as it was.
+
+        ``expect_status`` (B2b review): a document no longer in one of these
+        is left alone — ``status_changed`` (read as waiting, then confirmed
+        or sent for 「仍入库」 before this request)."""
         tenant_id: UUID = request.state.tenant_id
         base = await _require_base(store, tenant_id, name)
         outcomes = await store.cancel_documents(
-            tenant_id=tenant_id, kb_id=base.id, document_ids=body.document_ids
+            tenant_id=tenant_id,
+            kb_id=base.id,
+            document_ids=body.document_ids,
+            expect_status=set(body.expect_status) if body.expect_status is not None else None,
         )
         await _record_stopped(request, audit, runner, base, outcomes)
         return JSONResponse(

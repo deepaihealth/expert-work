@@ -138,6 +138,8 @@ describe("upload queue — estimates (B-222 PR-2)", () => {
         { documentId: B.id, estimateId: `e-${B.id}` },
       ]),
     );
-    await waitFor(() => expect(cancel).toHaveBeenCalledWith(BASE_NAME, [COPY.id]));
+    await waitFor(() =>
+      expect(cancel).toHaveBeenCalledWith(BASE_NAME, [COPY.id], ["awaiting_confirmation"]),
+    );
   });
 });

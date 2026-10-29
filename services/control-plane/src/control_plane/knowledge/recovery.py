@@ -225,7 +225,7 @@ class KnowledgeIngestRecoveryWorker:
             now = datetime.now(UTC)
             expired = await self._store.expire_awaiting(now=now, limit=_EXPIRE_BATCH)
             purged = await self._store.purge_expired_snapshots(now=now)
-            released = await self._store.release_stale_duplicates()
+            released = await self._store.release_stale_duplicates(now=now)
         except Exception:
             _cycle_errors.inc()
             logger.exception("knowledge.recovery.expire_failed")

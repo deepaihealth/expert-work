@@ -924,6 +924,10 @@ export interface TranslationKeys {
     estimate_changed: string;
     estimate_all_changed: string;
     estimate_expired: string;
+    estimate_withdraw_changed_one: string;
+    estimate_withdraw_changed_other: string;
+    estimate_ingest_anyway_changed: string;
+    document_busy: string;
   };
   rate_card_page: {
     page_title: string;
@@ -4648,6 +4652,13 @@ const en: TranslationKeys = {
     estimate_changed: "An estimate was made again since — confirm the new amount.",
     estimate_all_changed: "The documents awaiting confirmation changed — check the new total and confirm again.",
     estimate_expired: "An estimate is past its confirmation deadline and is being withdrawn.",
+    estimate_withdraw_changed_one:
+      "{{count}} document changed meanwhile (confirmed, or being estimated again) and was not withdrawn.",
+    estimate_withdraw_changed_other:
+      "{{count}} documents changed meanwhile (confirmed, or being estimated again) and were not withdrawn.",
+    estimate_ingest_anyway_changed:
+      "This document changed meanwhile (withdrawn, confirmed or being estimated again) — check the list again.",
+    document_busy: "This document's new version is being written — try again once it is ready.",
   },
   rate_card_page: {
     page_title: "Model Pricing",

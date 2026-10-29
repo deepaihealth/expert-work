@@ -40,6 +40,7 @@ from expert_work.persistence.knowledge.estimates import (
     is_duplicate,
     is_estimated,
     is_expired,
+    kept_deadline,
     merge_actual,
     meta_of,
     public_estimate,
@@ -249,7 +250,10 @@ class InMemoryEstimates:
                 and self._sha256.get(existing.id) == content_sha256
             )
             under_way_same = (
-                existing.status in _UNDER_WAY and self._estimated_sha(existing.id) == content_sha256
+                existing.status in _UNDER_WAY
+                and self._estimated_sha(existing.id) == content_sha256
+                # Past its deadline it is about to be withdrawn: estimate again.
+                and not is_expired(existing.confirm_by, now)
             )
             if ready_same or under_way_same:
                 return UploadStart(existing, "unchanged")
@@ -428,6 +432,7 @@ class InMemoryEstimates:
             or document.ingest_generation != generation
         ):
             return None
+        confirm_by = kept_deadline(self._estimates.get(document_id), confirm_by)
         meta = meta_of(self._estimates.get(document_id))
         raw = with_estimate(meta, estimate)
         if checks_duplicates(meta):
@@ -686,8 +691,13 @@ class InMemoryEstimates:
         )
 
     async def release_stale_duplicates(
-        self, *, tenant_id: UUID | None = None, kb_id: UUID | None = None
+        self,
+        *,
+        tenant_id: UUID | None = None,
+        kb_id: UUID | None = None,
+        now: datetime | None = None,
     ) -> list[KnowledgeDocument]:
+        now = now or datetime.now(UTC)
         released: list[KnowledgeDocument] = []
         for document in list(self._documents):
             if (tenant_id is not None and document.tenant_id != tenant_id) or (
@@ -698,10 +708,12 @@ class InMemoryEstimates:
             original_id = duplicate_ref_id(raw)
             if document.status is not DocumentStatus.AWAITING_CONFIRMATION or original_id is None:
                 continue
+            if is_expired(document.confirm_by, now):
+                continue  # the expiry sweep withdraws it
             if self._holds(document, original_id):
                 continue
             assert raw is not None  # noqa: S101 — it names an original
-            status, kept = released_duplicate(raw)
+            status, kept = released_duplicate(raw, confirm_by=document.confirm_by)
             update: dict[str, Any] = {"status": status, "updated_at": datetime.now(UTC)}
             if status is DocumentStatus.ESTIMATING:
                 update |= {

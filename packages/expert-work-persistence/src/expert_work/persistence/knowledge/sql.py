@@ -329,6 +329,19 @@ _CLAIMED_STATUS = case(
     ),
     else_=DocumentStatus.PROCESSING.value,
 )
+#: B2b review —— an ingest claim starts again at ``queued``. A claim means no
+#: drive is left: the lease expired, and the chunk swap of one that died at
+#: ``indexing`` committed (READY, not claimable) or rolled back with it (this
+#: UPDATE waits for the row lock the swap holds). Left at ``indexing``, the
+#: row would look past the point of no return to everyone — a return to
+#: confirmation, a re-upload, a cancel — while nothing writes its chunks.
+_CLAIMED_STAGE = case(
+    (
+        KnowledgeDocumentRow.status == DocumentStatus.ESTIMATING.value,
+        KnowledgeDocumentRow.stage,
+    ),
+    else_=IngestStage.QUEUED.value,
+)
 
 
 def _enum_or[E: StrEnum](enum: type[E], value: str | None, default: E | None) -> E | None:
@@ -1762,6 +1775,7 @@ class SqlKnowledgeStore(SqlEstimates, KnowledgeStore):
                     )
                     .values(
                         status=_CLAIMED_STATUS,
+                        stage=_CLAIMED_STAGE,
                         claimed_at=now,
                         lease_until=lease_until,
                         attempts=KnowledgeDocumentRow.attempts + 1,
@@ -1803,6 +1817,7 @@ class SqlKnowledgeStore(SqlEstimates, KnowledgeStore):
                     .where(KnowledgeDocumentRow.id.in_(candidate_ids))
                     .values(
                         status=_CLAIMED_STATUS,
+                        stage=_CLAIMED_STAGE,
                         claimed_at=now,
                         lease_until=lease_until,
                         attempts=KnowledgeDocumentRow.attempts + 1,
@@ -1949,18 +1964,37 @@ class SqlKnowledgeStore(SqlEstimates, KnowledgeStore):
             return _to_document(row)
 
     async def cancel_documents(
-        self, *, tenant_id: UUID, kb_id: UUID, document_ids: Sequence[UUID]
+        self,
+        *,
+        tenant_id: UUID,
+        kb_id: UUID,
+        document_ids: Sequence[UUID],
+        expect_status: Collection[DocumentStatus] | None = None,
     ) -> dict[UUID, CancelOutcome]:
         ids = list(dict.fromkeys(document_ids))
         if not ids:
             return {}
-        in_base = (
+        in_base: tuple[ColumnElement[bool], ...] = (
             KnowledgeDocumentRow.tenant_id == tenant_id,
             KnowledgeDocumentRow.kb_id == kb_id,
             KnowledgeDocumentRow.id.in_(ids),
         )
         now = datetime.now(UTC)
         async with self._sf() as session:
+            changed: set[UUID] = set()
+            if expect_status is not None:
+                # B2b review: lock them all (id order, as below) and leave out
+                # those no longer in a status the caller saw.
+                expected = {status.value for status in expect_status}
+                locked = await session.execute(
+                    select(KnowledgeDocumentRow.id, KnowledgeDocumentRow.status)
+                    .where(*in_base)
+                    .order_by(KnowledgeDocumentRow.id)
+                    .with_for_update()
+                )
+                changed = {row.id for row in locked.all() if row.status not in expected}
+                if changed:
+                    in_base = (*in_base, KnowledgeDocumentRow.id.not_in(sorted(changed)))
             # B-222 PR-2: nothing was spent yet — the estimate is withdrawn.
             waiting = (
                 await session.execute(
@@ -2007,7 +2041,9 @@ class SqlKnowledgeStore(SqlEstimates, KnowledgeStore):
             await session.commit()
         outcomes: dict[UUID, CancelOutcome] = {}
         for document_id in ids:
-            if document_id in withdrawn:
+            if document_id in changed:
+                outcomes[document_id] = "status_changed"
+            elif document_id in withdrawn:
                 outcomes[document_id] = withdrawn[document_id]
             elif document_id in cancelled:
                 outcomes[document_id] = "cancelled"

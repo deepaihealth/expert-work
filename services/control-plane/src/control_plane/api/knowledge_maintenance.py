@@ -293,8 +293,6 @@ def build_knowledge_maintenance_router() -> APIRouter:
                 mine[document_id],
                 batch=True,
             )
-        if done:
-            await _release_duplicates(store, runner, base)  # B-222 PR-2: their copies
         await _audit_write(
             audit,
             request,
@@ -308,6 +306,8 @@ def build_knowledge_maintenance_router() -> APIRouter:
                 "skipped": len(skipped),
             },
         )
+        if done:
+            await _release_duplicates(store, runner, base)  # B-222 PR-2: their copies
         return JSONResponse(
             content={"action": "delete", "done": [str(i) for i in done], "skipped": skipped}
         )

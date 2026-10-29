@@ -184,7 +184,12 @@ class ClaimedIngestion:
 #: B-222 —— what :meth:`KnowledgeStore.cancel_documents` did with one document
 #: (PR-2: ``withdrawn`` / ``withdrawn_deleted`` — its estimate was withdrawn).
 CancelOutcome = Literal[
-    "cancelled", "not_cancellable", "not_found", "withdrawn", "withdrawn_deleted"
+    "cancelled",
+    "not_cancellable",
+    "not_found",
+    "withdrawn",
+    "withdrawn_deleted",
+    "status_changed",
 ]
 
 
@@ -481,8 +486,10 @@ class KnowledgeStore(abc.ABC):
         """Tenant-scoped CAS claim of one document for the fast (in-process)
         ingest path. Succeeds only if it is claimable (``pending``, or
         ``processing`` with an expired lease) and under ``max_attempts``;
-        sets ``processing`` + a fresh lease and bumps ``attempts``. Returns
-        the claim or ``None`` if another worker already holds it.
+        sets ``processing`` + a fresh lease and bumps ``attempts``, and puts
+        ``stage`` back to ``queued`` (no drive is left: one that died at
+        ``indexing`` is not writing its chunks). Returns the claim or
+        ``None`` if another worker already holds it.
 
         B-222 PR-2: an ``estimating`` document with no live lease is claimable
         too — for its estimate only: it stays ``estimating`` (fresh lease,
@@ -548,7 +555,12 @@ class KnowledgeStore(abc.ABC):
 
     @abc.abstractmethod
     async def cancel_documents(
-        self, *, tenant_id: UUID, kb_id: UUID, document_ids: Sequence[UUID]
+        self,
+        *,
+        tenant_id: UUID,
+        kb_id: UUID,
+        document_ids: Sequence[UUID],
+        expect_status: Collection[DocumentStatus] | None = None,
     ) -> dict[UUID, CancelOutcome]:
         """B-222 —— stop the ingest of each of the base's ``pending`` /
         ``processing`` documents: status ``CANCELLED``, ``error='cancelled by
@@ -572,7 +584,12 @@ class KnowledgeStore(abc.ABC):
         ``withdrawn`` — put back (see
         :func:`~expert_work.persistence.knowledge.estimates.withdraw_plan`).
         A ``pending`` / ``processing`` document cancelled loses its snapshot
-        too."""
+        too.
+
+        B2b review: with ``expect_status``, a document whose status (read
+        with its row locked) is not one of them is left alone —
+        ``status_changed`` (the caller read it as waiting, and it was
+        confirmed or sent for 「仍入库」 since)."""
 
     @abc.abstractmethod
     async def sweep_terminal(self, *, now: datetime, max_attempts: int) -> int:
@@ -1108,15 +1125,22 @@ class KnowledgeStore(abc.ABC):
 
     @abc.abstractmethod
     async def release_stale_duplicates(
-        self, *, tenant_id: UUID | None = None, kb_id: UUID | None = None
+        self,
+        *,
+        tenant_id: UUID | None = None,
+        kb_id: UUID | None = None,
+        now: datetime | None = None,
     ) -> list[KnowledgeDocument]:
         """K-21 ①, §7 —— duplicates whose original no longer holds their
         bytes (withdrawn, deleted, replaced) lose the mark
         (:func:`~expert_work.persistence.knowledge.estimates.released_duplicate`):
         a real estimate waits as a plain one; one never parsed goes
         ``estimating`` (generation bumped) for the caller or the recovery
-        worker to estimate. Within ``tenant_id`` / ``kb_id`` when given, else
-        across tenants (caller bypasses RLS). Returns the documents changed."""
+        worker to estimate, and its estimate keeps the deadline it had. One
+        past its deadline at ``now`` (default: the clock) is left to
+        :meth:`expire_awaiting`. Within ``tenant_id`` / ``kb_id`` when given,
+        else across tenants (caller bypasses RLS), in bounded batches. Returns
+        the documents changed."""
 
     @abc.abstractmethod
     async def expire_awaiting(self, *, now: datetime, limit: int) -> list[ExpiredEstimate]:

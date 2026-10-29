@@ -16,7 +16,7 @@ from __future__ import annotations
 import asyncio
 import threading
 from collections.abc import Iterator, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any
 from uuid import UUID, uuid4
@@ -450,3 +450,150 @@ async def test_the_models_guard_fails_closed_and_checks_once() -> None:
     with pytest.raises(StaleIngestionError):
         await guard()
     assert _SwitchedModels.checks == 1
+
+
+# -- B2b second review: a check that cannot tell refuses; keys are not models -------
+
+
+class _CheckFails(IngestEstimator):
+    """The model check itself fails (settings or key lookup) — after
+    answering ``passes`` checks."""
+
+    checks = 0
+    passes = 0
+
+    async def models_changed(self, claim: ClaimedIngestion, confirmed: EstimateModels) -> bool:
+        type(self).checks += 1
+        if type(self).checks <= type(self).passes:
+            return False
+        msg = "settings unavailable"
+        raise RuntimeError(msg)
+
+
+class _CountingStore(InMemoryKnowledgeStore):
+    sent_back = 0
+
+    async def return_to_confirmation(self, **kwargs: Any) -> bool:
+        type(self).sent_back += 1
+        return await super().return_to_confirmation(**kwargs)
+
+
+@pytest.mark.parametrize(
+    "doc",
+    [MIXED_DOCS[0], PICTURE_DOCS[0]],
+    ids=["scanned-page-recognition", "picture-description"],
+)
+@pytest.mark.usefixtures("no_semantic_breaks")
+async def test_a_models_check_that_fails_pays_for_nothing(doc: FormDoc) -> None:
+    """The check as recognition starts passes; the next fails. Before a
+    figure call that is the call's checkpoint, which would log the error and
+    let the call go; before a page batch it would fail the document. Either
+    way: no paid call, and the document is left for a retry."""
+    _CheckFails.checks, _CheckFails.passes = 0, 1
+    store = InMemoryKnowledgeStore()
+    paid = _Paid()
+    settings = _Recognition()
+    recognizer = DocumentRecognizer(
+        store=store, settings=settings, api_keys=_api_key, client_factory=paid.reader
+    )
+    figures = FigureDescriber(
+        store=store,
+        settings=settings,
+        api_keys=_api_key,
+        recognizer=recognizer,
+        client_factory=paid.describer,
+    )
+    embedder = _Keyed("acme/embed-1")
+    runner = KnowledgeIngestionRunner(
+        store=store,
+        embedder=embedder,
+        recognizer=recognizer,
+        figures=figures,
+        estimator=_CheckFails(store=store, settings=settings, recognizer=recognizer),
+    )
+    waiting = await _waiting(store, runner, doc.filename, doc.raw)
+
+    await runner.submit(tenant_id=_TENANT, document_id=waiting.id)
+
+    assert (paid.reads, paid.descriptions, embedder.calls) == (0, 0, 0)
+    after = await store.get_document(tenant_id=_TENANT, document_id=waiting.id)
+    assert after is not None and after.status is DocumentStatus.PROCESSING  # left for a retry
+
+
+async def test_the_models_guard_refuses_when_its_check_fails() -> None:
+    store = _CountingStore()
+    _CountingStore.sent_back = 0
+    _CheckFails.checks, _CheckFails.passes = 0, 0
+    base = await store.create_base(tenant_id=_TENANT, name="kb")
+    document = await store.upsert_document(
+        tenant_id=_TENANT, kb_id=base.id, filename="a.md", content=_TEXT.encode()
+    )
+    estimator = _CheckFails(store=store)
+    local = LocalParse(kind="text", figures_on=False, markdown=_TEXT)
+    confirmed = await estimator.estimate(
+        _claim_of(document), local, embedding_model="acme/embed-1", now=datetime.now(UTC)
+    )
+    guard = _ModelsGuard(store, estimator, _claim_of(document), local, confirmed)
+
+    outcomes = await asyncio.gather(*(guard() for _ in range(3)), return_exceptions=True)
+
+    assert all(isinstance(outcome, StaleIngestionError) for outcome in outcomes)
+    assert (_CheckFails.checks, _CountingStore.sent_back) == (1, 0)
+
+
+@dataclass
+class _Configured:
+    """Recognition settings a test switches."""
+
+    primary: ModelChoice | None = field(default_factory=lambda: ModelChoice("glm", "glm-ocr"))
+    fallback: ModelChoice | None = None
+
+    async def recognition_settings(self) -> RecognitionSettings:
+        return RecognitionSettings(primary=self.primary, fallback=self.fallback, max_pages=1000)
+
+
+@dataclass
+class _Keys:
+    """API keys; ``failing`` providers' lookups fail (a passing outage)."""
+
+    failing: set[str]
+
+    async def __call__(self, *, tenant_id: UUID, provider: str) -> str:
+        if provider in self.failing:
+            msg = f"no key for {provider}"
+            raise RuntimeError(msg)
+        return f"key-{provider}"
+
+
+async def test_a_key_that_cannot_be_read_now_is_not_a_model_switch() -> None:
+    store = InMemoryKnowledgeStore()
+    settings, keys = _Configured(), _Keys(failing=set())
+    recognizer = DocumentRecognizer(
+        store=store, settings=settings, api_keys=keys, client_factory=_Paid().reader
+    )
+    estimator = IngestEstimator(store=store, settings=settings, recognizer=recognizer)
+    claim = ClaimedIngestion(
+        tenant_id=_TENANT,
+        document_id=uuid4(),
+        kb_id=uuid4(),
+        filename="a.pdf",
+        content=b"x",
+        content_sha256="sha",
+        chunk_max_tokens=400,
+        chunk_overlap_tokens=0,
+        attempts=1,
+        generation=1,
+    )
+    confirmed = EstimateModels(embedding="acme/embed-1", recognition="glm/glm-ocr")
+
+    assert not await estimator.models_changed(claim, confirmed)
+    keys.failing = {"glm"}  # the confirmed model's key cannot be read just now
+    assert not await estimator.models_changed(claim, confirmed)
+    settings.fallback = ModelChoice("acme", "ocr-2")  # not counted, unusable: never called
+    keys.failing = {"glm", "acme"}
+    assert not await estimator.models_changed(claim, confirmed)
+    keys.failing = {"glm"}  # ... now usable: it would be called
+    assert await estimator.models_changed(claim, confirmed)
+    settings.fallback, keys.failing = None, set()
+    settings.primary = ModelChoice("acme", "ocr-2")  # switched
+    assert await estimator.models_changed(claim, confirmed)

@@ -948,6 +948,10 @@ const zhCN: TranslationKeys = {
     estimate_changed: "预估已重新计算，请按新的金额再确认。",
     estimate_all_changed: "待确认的文档有变化，请按最新合计再确认。",
     estimate_expired: "有预估已过确认期限，正在撤回。",
+    estimate_withdraw_changed_one: "{{count}} 份在此期间已有变化（已确认或正在重新估算），未撤回。",
+    estimate_withdraw_changed_other: "{{count}} 份在此期间已有变化（已确认或正在重新估算），未撤回。",
+    estimate_ingest_anyway_changed: "该文档在此期间已有变化（已撤回、已确认或正在重新估算），请查看最新列表。",
+    document_busy: "该文档的新版本正在写入分段，写完后再试。",
   },
   rate_card_page: {
     page_title: "模型定价",

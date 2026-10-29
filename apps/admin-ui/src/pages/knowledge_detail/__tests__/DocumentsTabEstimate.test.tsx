@@ -244,7 +244,9 @@ describe("DocumentsTab — estimates (B-222 PR-2)", () => {
     expect(cancel).not.toHaveBeenCalled(); // behind the confirm
     await confirmPopover("OK");
 
-    await waitFor(() => expect(cancel).toHaveBeenCalledWith(BASE_NAME, [PAID.id]));
+    await waitFor(() =>
+      expect(cancel).toHaveBeenCalledWith(BASE_NAME, [PAID.id], ["awaiting_confirmation"]),
+    );
     expect(await screen.findByText("Withdrew 1 estimate.")).toBeInTheDocument();
   });
 
@@ -310,7 +312,80 @@ describe("DocumentsTab — estimates (B-222 PR-2)", () => {
     await confirmPopover("OK");
 
     await waitFor(() => expect(cancel).toHaveBeenCalledTimes(1));
-    expect(cancel).toHaveBeenCalledWith(BASE_NAME, [FREE.id, PAID.id]);
+    expect(cancel).toHaveBeenCalledWith(BASE_NAME, [FREE.id, PAID.id], ["awaiting_confirmation"]);
+  });
+
+  it("「全部取消」 leaves what changed since it was read, and says so (B2b second review)", async () => {
+    const estimating = doc("d0000000-0000-0000-0000-000000000008", "estimating");
+    vi.spyOn(knowledgeSdk, "listDocuments").mockResolvedValue(docPage([PAID, estimating]));
+    const cancel = vi
+      .spyOn(knowledgeSdk, "cancelDocuments")
+      .mockImplementation(async (_base, ids) =>
+        ids.map((id) => ({
+          document_id: id,
+          outcome: id === PAID.id ? ("status_changed" as const) : ("withdrawn_deleted" as const),
+        })),
+      );
+
+    renderTab();
+    await userEvent.click(await screen.findByTestId("doc-estimate-withdraw-all"));
+    await screen.findByText(/Withdraw the 2 estimate\(s\) waiting in this base now/);
+    await confirmPopover("OK");
+
+    // Each as it was read: an estimate under way may have finished meanwhile.
+    await waitFor(() => expect(cancel).toHaveBeenCalledTimes(2));
+    expect(cancel).toHaveBeenCalledWith(BASE_NAME, [PAID.id], ["awaiting_confirmation"]);
+    expect(cancel).toHaveBeenCalledWith(
+      BASE_NAME,
+      [estimating.id],
+      ["estimating", "awaiting_confirmation"],
+    );
+    expect(
+      await screen.findByText(/1 document changed meanwhile .* and was not withdrawn/),
+    ).toBeInTheDocument();
+  });
+
+  it.each([
+    ["re-ingest", "doc-reingest", "reingestDocument"],
+    ["recognize", "doc-recognize", "recognizeDocument"],
+  ] as const)(
+    "a busy %s says to try again once ready, not the endpoint's other conflict",
+    async (_name, testid, call) => {
+      const ready = doc("d0000000-0000-0000-0000-000000000007", "ready", {
+        chunk_count: 3,
+        page_stats: {
+          pages_total: 2,
+          pages_ocr: 1,
+          pages_failed: 1,
+          pages_pending: 0,
+          pages_over_limit: 0,
+        },
+      });
+      vi.spyOn(knowledgeSdk, "listDocuments").mockResolvedValue(docPage([ready]));
+      vi.spyOn(knowledgeSdk, call).mockRejectedValue(
+        new ApiError("busy", "HTTP_409", 409, { error: "document_busy" }),
+      );
+
+      renderTab();
+      await userEvent.click(await screen.findByTestId(`${testid}-${ready.id}`));
+
+      expect(
+        await screen.findByText("This document's new version is being written — try again once it is ready."),
+      ).toBeInTheDocument();
+    },
+  );
+
+  it("「仍入库」 on a duplicate that changed meanwhile says so", async () => {
+    vi.spyOn(knowledgeSdk, "listDocuments").mockResolvedValue(docPage([FREE, COPY]));
+    vi.spyOn(knowledgeSdk, "estimateDuplicate").mockRejectedValue(
+      new ApiError("changed", "HTTP_409", 409, { error: "estimate_changed" }),
+    );
+
+    renderTab();
+    await userEvent.click(await screen.findByTestId(`doc-ingest-anyway-${COPY.id}`));
+
+    expect(await screen.findByText(/This document changed meanwhile/)).toBeInTheDocument();
+    expect(screen.queryByText(/HTTP_409/)).not.toBeInTheDocument();
   });
 });
 

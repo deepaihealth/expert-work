@@ -549,13 +549,15 @@ export async function discardPendingDocument(
 /** B-222 — what cancelling did with one document: ``not_cancellable`` = it
  *  had already settled (ready / failed / cancelled). PR-2: an estimate
  *  withdrawn — ``withdrawn_deleted`` a new upload, deleted with its file;
- *  ``withdrawn`` put back as it was (new bytes dropped). */
+ *  ``withdrawn`` put back as it was (new bytes dropped). ``status_changed``:
+ *  no longer in a status the caller expected — left alone. */
 export type CancelOutcome =
   | "cancelled"
   | "not_cancellable"
   | "not_found"
   | "withdrawn"
-  | "withdrawn_deleted";
+  | "withdrawn_deleted"
+  | "status_changed";
 
 export interface CancelResult {
   document_id: string;
@@ -563,14 +565,18 @@ export interface CancelResult {
 }
 
 /** B-222 — stop the ingest of pending / processing documents; one result per
- *  distinct id, in request order. */
+ *  distinct id, in request order. ``expectStatus``: only documents still in
+ *  one of these (as the caller read them) are touched. */
 export async function cancelDocuments(
   baseName: string,
   documentIds: string[],
+  expectStatus?: DocumentStatus[],
 ): Promise<CancelResult[]> {
   const response = await apiClient.post<{ results: CancelResult[] }>(
     `/v1/knowledge/bases/${encodeURIComponent(baseName)}/documents/cancel`,
-    { document_ids: documentIds },
+    expectStatus
+      ? { document_ids: documentIds, expect_status: expectStatus }
+      : { document_ids: documentIds },
   );
   return response.data.results;
 }

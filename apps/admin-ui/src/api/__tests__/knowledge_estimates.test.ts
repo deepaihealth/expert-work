@@ -8,6 +8,7 @@ import type { AxiosAdapter, InternalAxiosRequestConfig } from "axios";
 
 import { apiClient } from "../client";
 import {
+  cancelDocuments,
   confirmAllDocuments,
   confirmDocuments,
   estimateDuplicate,
@@ -90,6 +91,16 @@ describe("estimate endpoints", () => {
           withdraw_duplicate_ids: ["d3"],
         },
       ],
+    ]);
+  });
+
+  it("withdraws only what is still as it was read, when asked", async () => {
+    const calls = capture({ results: [] });
+    await cancelDocuments("kb", ["d1"], ["awaiting_confirmation"]);
+    await cancelDocuments("kb", ["d2"]);
+    expect(calls.map((c) => c.data)).toEqual([
+      { document_ids: ["d1"], expect_status: ["awaiting_confirmation"] },
+      { document_ids: ["d2"] },
     ]);
   });
 

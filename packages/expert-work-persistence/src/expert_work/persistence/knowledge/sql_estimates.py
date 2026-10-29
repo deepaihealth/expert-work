@@ -19,6 +19,7 @@ from sqlalchemy.dialects.postgresql import ARRAY
 from sqlalchemy.dialects.postgresql import UUID as PG_UUID
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+from sqlalchemy.sql.elements import ColumnElement
 
 from expert_work.persistence.knowledge.base import DocumentFileFacts
 from expert_work.persistence.knowledge.estimates import (
@@ -47,6 +48,7 @@ from expert_work.persistence.knowledge.estimates import (
     is_duplicate,
     is_estimated,
     is_expired,
+    kept_deadline,
     merge_actual,
     meta_of,
     released_duplicate,
@@ -85,6 +87,8 @@ _UNDER_WAY_VALUES = (
 _SEARCHABLE_VALUES = tuple(sorted(chunk_type.value for chunk_type in SEARCHABLE_CHUNK_TYPES))
 #: Hashes per ``chunk_hashes_on_model`` query.
 _HASH_READ_BATCH: Final = 5_000
+#: Duplicates locked (and originals read) per ``release_stale_duplicates`` batch.
+_RELEASE_BATCH: Final = 500
 
 
 def _estimated_sha(row: KnowledgeDocumentRow) -> str | None:
@@ -313,6 +317,8 @@ class SqlEstimates:
                 under_way_same = (
                     existing.status in _UNDER_WAY_VALUES
                     and _estimated_sha(existing) == content_sha256
+                    # Past its deadline it is about to be withdrawn: estimate again.
+                    and not is_expired(existing.confirm_by, now)
                 )
                 if ready_same or under_way_same:
                     await session.commit()
@@ -463,6 +469,7 @@ class SqlEstimates:
             ):
                 await session.commit()
                 return None
+            confirm_by = kept_deadline(row.ingest_estimate, confirm_by)
             meta = meta_of(row.ingest_estimate)
             raw = with_estimate(meta, estimate)
             if checks_duplicates(meta):
@@ -753,17 +760,42 @@ class SqlEstimates:
         )
 
     async def release_stale_duplicates(
-        self, *, tenant_id: UUID | None = None, kb_id: UUID | None = None
+        self,
+        *,
+        tenant_id: UUID | None = None,
+        kb_id: UUID | None = None,
+        now: datetime | None = None,
     ) -> list[KnowledgeDocument]:
+        now = now or datetime.now(UTC)
         where = [
             KnowledgeDocumentRow.status == DocumentStatus.AWAITING_CONFIRMATION.value,
             KnowledgeDocumentRow.ingest_estimate["duplicate_of"].is_not(None),
             func.jsonb_typeof(KnowledgeDocumentRow.ingest_estimate["duplicate_of"]) == "object",
+            # Past its deadline: the expiry sweep withdraws it.
+            or_(
+                KnowledgeDocumentRow.confirm_by.is_(None),
+                KnowledgeDocumentRow.confirm_by > now,
+            ),
         ]
         if tenant_id is not None:
             where.append(KnowledgeDocumentRow.tenant_id == tenant_id)
         if kb_id is not None:
             where.append(KnowledgeDocumentRow.kb_id == kb_id)
+        released: list[KnowledgeDocument] = []
+        after: UUID | None = None
+        while True:  # one transaction per batch: bounded locks and binds
+            batch = [*where, KnowledgeDocumentRow.id > after] if after is not None else where
+            scanned, changed = await self._release_batch(batch)
+            released.extend(changed)
+            if len(scanned) < _RELEASE_BATCH:
+                return released
+            after = scanned[-1]
+
+    async def _release_batch(
+        self, where: Sequence[ColumnElement[bool]]
+    ) -> tuple[list[UUID], list[KnowledgeDocument]]:
+        """One batch of :meth:`release_stale_duplicates`: the ids scanned (in
+        order) and the documents released."""
         released: list[KnowledgeDocumentRow] = []
         async with self._sf() as session:
             rows = list(
@@ -772,10 +804,12 @@ class SqlEstimates:
                         select(KnowledgeDocumentRow)
                         .where(*where)
                         .order_by(KnowledgeDocumentRow.id)
+                        .limit(_RELEASE_BATCH)
                         .with_for_update(skip_locked=True)
                     )
                 ).scalars()
             )
+            scanned = [row.id for row in rows]
             wanted = {
                 original_id
                 for row in rows
@@ -805,7 +839,9 @@ class SqlEstimates:
                     and sha in (original.content_sha256, original.pending_content_sha256)
                 ):
                     continue
-                status, kept = released_duplicate(row.ingest_estimate or {})
+                status, kept = released_duplicate(
+                    row.ingest_estimate or {}, confirm_by=row.confirm_by
+                )
                 row.status = status.value
                 row.ingest_estimate = kept
                 row.updated_at = datetime.now(UTC)
@@ -819,7 +855,7 @@ class SqlEstimates:
             await session.commit()
             for row in released:
                 await session.refresh(row)
-            return [self._document_of(row) for row in released]
+            return scanned, [self._document_of(row) for row in released]
 
     async def chunk_hashes_on_model(
         self,

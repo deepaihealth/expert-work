@@ -603,6 +603,9 @@ class InMemoryKnowledgeStore(InMemoryEstimates, KnowledgeStore):
         claimed = doc.model_copy(
             update={
                 "status": DocumentStatus.ESTIMATING if estimating else DocumentStatus.PROCESSING,
+                # B2b review: a claim means no drive is left; one reclaimed at
+                # ``indexing`` is not writing its chunks any more (see sql.py).
+                "stage": doc.stage if estimating else IngestStage.QUEUED,
                 "attempts": doc.attempts + 1,
                 "updated_at": now,
             }
@@ -712,7 +715,12 @@ class InMemoryKnowledgeStore(InMemoryEstimates, KnowledgeStore):
         return restored
 
     async def cancel_documents(
-        self, *, tenant_id: UUID, kb_id: UUID, document_ids: Sequence[UUID]
+        self,
+        *,
+        tenant_id: UUID,
+        kb_id: UUID,
+        document_ids: Sequence[UUID],
+        expect_status: Collection[DocumentStatus] | None = None,
     ) -> dict[UUID, CancelOutcome]:
         outcomes: dict[UUID, CancelOutcome] = {}
         now = datetime.now(UTC)
@@ -720,6 +728,8 @@ class InMemoryKnowledgeStore(InMemoryEstimates, KnowledgeStore):
             document = await self.get_document(tenant_id=tenant_id, document_id=document_id)
             if document is None or document.kb_id != kb_id:
                 outcomes[document_id] = "not_found"
+            elif expect_status is not None and document.status not in expect_status:
+                outcomes[document_id] = "status_changed"
             elif document.status in WAITING_STATUSES:
                 # B-222 PR-2: nothing was spent yet — the estimate is withdrawn.
                 outcomes[document_id] = self._withdraw(document, now)
