@@ -29,6 +29,7 @@ from control_plane.knowledge.estimate import IngestEstimator
 from control_plane.knowledge.ingestion import (
     CONTENT_MISSING_ERROR,
     LocalIngests,
+    ModelsCheckFailedError,
     StaleIngestionError,
     estimate_document,
     failure_code,
@@ -48,7 +49,7 @@ from expert_work.persistence import KnowledgeStore
 from expert_work.persistence.knowledge.base import ClaimedIngestion
 from expert_work.persistence.knowledge.estimates import ExpiredEstimate
 from expert_work.persistence.rls import bypass_rls_var, current_tenant_id_var
-from expert_work.protocol import AuditAction, DocumentStatus, IngestErrorCode
+from expert_work.protocol import AuditAction, IngestErrorCode
 from expert_work.protocol.knowledge_estimate import IngestOutcome
 from expert_work.runtime.audit.logger import AuditLogger
 from expert_work.runtime.storage import ObjectStore
@@ -386,7 +387,7 @@ class KnowledgeIngestRecoveryWorker:
                     return True  # asked again: nothing spent
                 spend = IngestSpend()
                 with spend_scope(spend):
-                    chunk_count = await ingest_document_bytes(
+                    await ingest_document_bytes(
                         store=self._store,
                         embedder=start.embedder or self._embedder,
                         tenant_id=claim.tenant_id,
@@ -409,6 +410,7 @@ class KnowledgeIngestRecoveryWorker:
                         ),
                         local=start.local,
                         before_paid=start.before_paid,
+                        settle=finishing.set,
                     )
             except asyncio.CancelledError:
                 # Lost / cancelled here (``lost``), or the pod shutting down —
@@ -417,26 +419,19 @@ class KnowledgeIngestRecoveryWorker:
                 raise
             finally:
                 finishing.set()
-            written = True  # this claim's chunks are in place
-            settled = await self._store.set_document_status(
-                tenant_id=claim.tenant_id,
-                document_id=claim.document_id,
-                status=DocumentStatus.READY,
-                chunk_count=chunk_count,
-                generation=claim.generation,
-            )
-            if not settled:
-                raise StaleIngestionError(claim.document_id)
-            ready = True
-        except StaleIngestionError:
-            # 重传 / 已被别的认领收尾 —— 本次驱动的结果作废,什么都不写。
-            logger.info(
-                "knowledge.recovery_stale document=%s generation=%d",
-                claim.document_id,
-                claim.generation,
-            )
-            return False
+            # This claim's chunks are in place and READY, in one transaction.
+            written = ready = True
         except Exception as exc:
+            if isinstance(exc, StaleIngestionError) and not isinstance(exc, ModelsCheckFailedError):
+                # 重传 / 已被别的认领收尾 —— 本次驱动的结果作废,什么都不写。
+                logger.info(
+                    "knowledge.recovery_stale document=%s generation=%d",
+                    claim.document_id,
+                    claim.generation,
+                )
+                return False
+            # B2b review: a models check that could not run is retried like
+            # any failure (snapshot kept), with its own code on the last one.
             gone = False
             try:
                 gone = (

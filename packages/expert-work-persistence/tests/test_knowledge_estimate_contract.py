@@ -39,7 +39,7 @@ from expert_work.persistence import (
 from expert_work.persistence.embedding import EMBEDDING_DIM
 from expert_work.persistence.knowledge import sql_estimates
 from expert_work.persistence.knowledge.base import KnowledgeStore, ParseSnapshot
-from expert_work.persistence.knowledge.estimates import EstimateRefused
+from expert_work.persistence.knowledge.estimates import RELEASED_COPY_GRACE, EstimateRefused
 from expert_work.persistence.knowledge.passages import ChunkVector
 from expert_work.persistence.models import KnowledgeDocumentRow
 from expert_work.protocol import (
@@ -164,8 +164,9 @@ async def _estimated(
     *,
     total: int = 120_000,
     confirm_by: datetime | None = None,
+    now: datetime = _NOW,
 ) -> KnowledgeDocument:
-    """Claim the document's estimate and finish it."""
+    """Claim the document's estimate and finish it (at ``now``)."""
     generation = await _claim(store, tenant, document_id)
     finished = await store.finish_estimate(
         tenant_id=tenant,
@@ -174,6 +175,7 @@ async def _estimated(
         estimate=_estimate(total),
         snapshot=_snapshot(),
         confirm_by=confirm_by or _NOW + CONFIRM_WINDOW,
+        now=now,
     )
     assert finished is not None
     return finished
@@ -1021,7 +1023,7 @@ async def test_a_released_copy_keeps_its_first_deadline(store: KnowledgeStore) -
     released = await store.release_stale_duplicates(tenant_id=tenant, kb_id=base.id, now=later)
 
     assert [d.id for d in released] == [copy.id]
-    done = await _estimated(store, tenant, copy.id, confirm_by=later + CONFIRM_WINDOW)
+    done = await _estimated(store, tenant, copy.id, confirm_by=later + CONFIRM_WINDOW, now=later)
     assert done.confirm_by == _NOW + CONFIRM_WINDOW
     # A later estimate of it (new bytes) starts afresh.
     await store.begin_upload(
@@ -1032,8 +1034,54 @@ async def test_a_released_copy_keeps_its_first_deadline(store: KnowledgeStore) -
         content_sha256="v2",
         now=later,
     )
-    again = await _estimated(store, tenant, copy.id, confirm_by=later + CONFIRM_WINDOW)
+    again = await _estimated(store, tenant, copy.id, confirm_by=later + CONFIRM_WINDOW, now=later)
     assert again.confirm_by == later + CONFIRM_WINDOW
+
+
+async def test_new_bytes_before_a_released_copy_is_estimated_start_afresh(
+    store: KnowledgeStore,
+) -> None:
+    """B2b review: re-uploaded while its estimate is still under way, the
+    copy's first deadline does not carry over to the new bytes."""
+    tenant = uuid4()
+    base = await store.create_base(tenant_id=tenant, name="kb")
+    copy = await _copy_of_withdrawn(store, tenant, base.id)
+    later = _NOW + timedelta(days=3)
+    await store.release_stale_duplicates(tenant_id=tenant, kb_id=base.id, now=later)
+    assert (await _get(store, tenant, copy.id)).status is DocumentStatus.ESTIMATING
+
+    await store.begin_upload(
+        tenant_id=tenant,
+        kb_id=base.id,
+        filename="copy.md",
+        content=b"v2",
+        content_sha256="v2",
+        now=later,
+    )
+
+    done = await _estimated(store, tenant, copy.id, confirm_by=later + CONFIRM_WINDOW, now=later)
+    assert done.confirm_by == later + CONFIRM_WINDOW
+
+
+async def test_a_copy_released_with_minutes_left_still_gets_the_grace(
+    store: KnowledgeStore,
+) -> None:
+    """B2b review: otherwise the next sweep withdraws it before anyone sees it."""
+    tenant = uuid4()
+    base = await store.create_base(tenant_id=tenant, name="kb")
+    copy = await _copy_of_withdrawn(store, tenant, base.id)
+    first = _NOW + CONFIRM_WINDOW
+    await store.release_stale_duplicates(
+        tenant_id=tenant, kb_id=base.id, now=first - timedelta(minutes=10)
+    )
+    finished_at = first - timedelta(minutes=5)
+
+    done = await _estimated(
+        store, tenant, copy.id, confirm_by=finished_at + CONFIRM_WINDOW, now=finished_at
+    )
+
+    assert done.confirm_by == finished_at + RELEASED_COPY_GRACE
+    assert await store.expire_awaiting(now=first + timedelta(minutes=1), limit=10) == []
 
 
 async def test_stale_copies_are_released_batch_by_batch(
@@ -1051,10 +1099,47 @@ async def test_stale_copies_are_released_batch_by_batch(
     held = [await _upload(store, tenant, base.id, f"h{i}.md", sha="k") for i in range(3)]
     assert all(d.status is DocumentStatus.AWAITING_CONFIRMATION for d in copies + held)
     await store.cancel_documents(tenant_id=tenant, kb_id=base.id, document_ids=[original.id])
+    scanned: list[int] = []
+    if isinstance(store, SqlKnowledgeStore):
+        batch = store._release_batch
+
+        async def counted(where: Any) -> Any:
+            seen, changed = await batch(where)
+            scanned.append(len(seen))
+            return seen, changed
+
+        monkeypatch.setattr(store, "_release_batch", counted)
 
     released = await store.release_stale_duplicates(now=_NOW)
 
     assert sorted(d.id for d in released) == sorted(d.id for d in copies)
+    assert all(size <= 2 for size in scanned)  # each transaction locks at most a batch
+
+
+async def test_release_skips_a_copy_another_transaction_holds(store: KnowledgeStore) -> None:
+    """B2b review: SKIP LOCKED — a sweep on another pod (or a withdrawal) holding
+    a copy leaves it for the next cycle instead of waiting on it."""
+    if not isinstance(store, SqlKnowledgeStore):
+        pytest.skip("row locks are the SQL store's")
+    tenant = uuid4()
+    base = await store.create_base(tenant_id=tenant, name="kb")
+    original = await _estimated(
+        store, tenant, (await _upload(store, tenant, base.id, "a.md", sha="same")).id
+    )
+    held, free = [await _upload(store, tenant, base.id, f"c{i}.md", sha="same") for i in range(2)]
+    await store.cancel_documents(tenant_id=tenant, kb_id=base.id, document_ids=[original.id])
+
+    async with store._sf() as other:
+        await other.execute(
+            select(KnowledgeDocumentRow.id)
+            .where(KnowledgeDocumentRow.id == held.id)
+            .with_for_update()
+        )
+        released = await asyncio.wait_for(store.release_stale_duplicates(now=_NOW), timeout=10)
+        await other.rollback()
+
+    assert [d.id for d in released] == [free.id]
+    assert [d.id for d in await store.release_stale_duplicates(now=_NOW)] == [held.id]
 
 
 async def test_a_document_reclaimed_at_indexing_can_go_back_to_confirmation(
@@ -1092,6 +1177,81 @@ async def test_a_document_reclaimed_at_indexing_can_go_back_to_confirmation(
     )
     back = await _get(store, tenant, waiting.id)
     assert back.status is DocumentStatus.AWAITING_CONFIRMATION
+
+
+async def test_a_landed_chunk_swap_is_ready_so_no_reclaim_can_undo_it(
+    store: KnowledgeStore,
+) -> None:
+    """B2b review: the swap and READY are one write. A drive that dies right
+    after its swap leaves a READY document serving the chunks of the bytes it
+    promoted — nothing to reclaim, send back for confirmation or withdraw."""
+    tenant = uuid4()
+    base = await store.create_base(tenant_id=tenant, name="kb")
+    ready = await _ready(store, tenant, base.id, "a.md")
+    await store.begin_upload(
+        tenant_id=tenant,
+        kb_id=base.id,
+        filename="a.md",
+        content=b"v2 bytes",
+        content_sha256="v2",
+        now=_NOW,
+    )
+    await _confirm(store, tenant, await _estimated(store, tenant, ready.id))
+    generation = await _claim(store, tenant, ready.id)
+    assert await store.set_document_stage(
+        tenant_id=tenant, document_id=ready.id, stage=IngestStage.INDEXING, generation=generation
+    )
+    chunk = KnowledgeChunk(
+        id=uuid4(),
+        tenant_id=tenant,
+        kb_id=base.id,
+        document_id=ready.id,
+        chunk_index=0,
+        content="v2 passage",
+        embedding=(1.0,) + (0.0,) * (EMBEDDING_DIM - 1),
+        content_hash="v2h",
+        embedding_model="p/new",
+    )
+
+    assert await store.replace_chunks(
+        tenant_id=tenant,
+        document_id=ready.id,
+        chunks=[chunk],
+        generation=generation,
+        ready_chunk_count=1,
+    )
+    # The drive dies here: it writes nothing more.
+
+    swapped = await _get(store, tenant, ready.id)
+    assert (swapped.status, swapped.stage, swapped.chunk_count, swapped.has_pending) == (
+        DocumentStatus.READY,
+        IngestStage.READY,
+        1,
+        False,
+    )
+    assert await store.get_document_content(tenant_id=tenant, document_id=ready.id) == b"v2 bytes"
+    assert (
+        await store.claim_documents_for_ingest(
+            now=datetime.now(UTC) + timedelta(seconds=_LEASE_S + 1),
+            lease_seconds=_LEASE_S,
+            limit=10,
+            max_attempts=_MAX_ATTEMPTS,
+        )
+        == []
+    )
+    assert not await store.return_to_confirmation(
+        tenant_id=tenant,
+        document_id=ready.id,
+        generation=generation,
+        estimate=_estimate(999_000),
+        snapshot=None,
+        confirm_by=_NOW + CONFIRM_WINDOW,
+    )
+    assert await store.cancel_documents(
+        tenant_id=tenant, kb_id=base.id, document_ids=[ready.id]
+    ) == {ready.id: "not_cancellable"}
+    chunks, _ = await store.list_chunks(tenant_id=tenant, document_id=ready.id)
+    assert [c.content for c in chunks] == ["v2 passage"]
 
 
 async def test_the_same_bytes_past_the_deadline_start_a_new_estimate(

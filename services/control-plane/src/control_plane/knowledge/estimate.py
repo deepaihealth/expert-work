@@ -219,7 +219,9 @@ class IngestEstimator:
         now is still the one configured — a passing lookup failure is not a
         switch. A switch is a confirmed model no longer configured (or in
         another order), or a model it did not count on that would be called
-        now (configured, and usable)."""
+        now (configured, and usable). Pages may then run on the confirmed
+        fallback and cost more than estimated: by the 10-27 decision an
+        actual above its estimate does not pause the ingest (both are shown)."""
         if confirmed.recognition is not None:
             if self._recognizer is None:
                 return True

@@ -20,7 +20,7 @@ from __future__ import annotations
 import hashlib
 from collections.abc import Collection, Iterable, Mapping
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any, Final, Literal
 from uuid import UUID, uuid4
 
@@ -48,6 +48,8 @@ _STORE_ONLY: Final = ("restore", "first_confirm_by")
 #: to ``estimating`` (ISO). Its estimate, when it lands, keeps that deadline
 #: (:func:`kept_deadline`): a released copy never outlives its first one.
 FIRST_CONFIRM_BY: Final = "first_confirm_by"
+#: The least time a released copy's estimate is left to be confirmed in.
+RELEASED_COPY_GRACE: Final = timedelta(hours=1)
 
 #: A withdrawn estimate puts a document back in one of these as it was; any
 #: other status it came from (an ingest under way) becomes ``cancelled``.
@@ -463,10 +465,14 @@ def released_duplicate(
     return DocumentStatus.ESTIMATING, meta
 
 
-def kept_deadline(raw: Mapping[str, Any] | None, confirm_by: datetime) -> datetime:
+def kept_deadline(
+    raw: Mapping[str, Any] | None, confirm_by: datetime, *, now: datetime
+) -> datetime:
     """The deadline a finished estimate gets: ``confirm_by``, or the deadline
     the document had before it was released (:data:`FIRST_CONFIRM_BY`) when
-    that is earlier."""
+    that is earlier — but never less than :data:`RELEASED_COPY_GRACE` from
+    ``now``: a copy released with minutes left is still shown long enough to
+    be confirmed, not withdrawn by the next sweep before anyone sees it."""
     first = (raw or {}).get(FIRST_CONFIRM_BY)
     if not isinstance(first, str):
         return confirm_by
@@ -474,7 +480,7 @@ def kept_deadline(raw: Mapping[str, Any] | None, confirm_by: datetime) -> dateti
         earlier = datetime.fromisoformat(first)
     except ValueError:
         return confirm_by
-    return min(earlier, confirm_by)
+    return min(confirm_by, max(earlier, now + RELEASED_COPY_GRACE))
 
 
 def _status(value: object) -> DocumentStatus | None:

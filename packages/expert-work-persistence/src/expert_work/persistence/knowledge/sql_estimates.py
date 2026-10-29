@@ -459,6 +459,7 @@ class SqlEstimates:
         estimate: Mapping[str, Any],
         snapshot: ParseSnapshot | None,
         confirm_by: datetime,
+        now: datetime | None = None,
     ) -> KnowledgeDocument | None:
         async with self._sf() as session:
             row = await self._lock(session, tenant_id, document_id)
@@ -469,7 +470,9 @@ class SqlEstimates:
             ):
                 await session.commit()
                 return None
-            confirm_by = kept_deadline(row.ingest_estimate, confirm_by)
+            confirm_by = kept_deadline(
+                row.ingest_estimate, confirm_by, now=now or datetime.now(UTC)
+            )
             meta = meta_of(row.ingest_estimate)
             raw = with_estimate(meta, estimate)
             if checks_duplicates(meta):

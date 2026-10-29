@@ -245,7 +245,10 @@ describe("DocumentsTab — estimates (B-222 PR-2)", () => {
     await confirmPopover("OK");
 
     await waitFor(() =>
-      expect(cancel).toHaveBeenCalledWith(BASE_NAME, [PAID.id], ["awaiting_confirmation"]),
+      expect(cancel).toHaveBeenCalledWith(BASE_NAME, [PAID.id], [
+        "estimating",
+        "awaiting_confirmation",
+      ]),
     );
     expect(await screen.findByText("Withdrew 1 estimate.")).toBeInTheDocument();
   });
@@ -312,19 +315,29 @@ describe("DocumentsTab — estimates (B-222 PR-2)", () => {
     await confirmPopover("OK");
 
     await waitFor(() => expect(cancel).toHaveBeenCalledTimes(1));
-    expect(cancel).toHaveBeenCalledWith(BASE_NAME, [FREE.id, PAID.id], ["awaiting_confirmation"]);
+    expect(cancel).toHaveBeenCalledWith(BASE_NAME, [FREE.id, PAID.id], [
+      "estimating",
+      "awaiting_confirmation",
+    ]);
   });
 
-  it("「全部取消」 leaves what changed since it was read, and says so (B2b second review)", async () => {
-    const estimating = doc("d0000000-0000-0000-0000-000000000008", "estimating");
-    vi.spyOn(knowledgeSdk, "listDocuments").mockResolvedValue(docPage([PAID, estimating]));
+  it("「全部取消」 withdraws an estimating original and its waiting copy in one request (B2b third review)", async () => {
+    // Withdrawing the original frees its copy to ``estimating``: a request per
+    // status read would then find the copy changed and leave it behind.
+    const original = doc("d0000000-0000-0000-0000-000000000008", "estimating");
+    const copy = doc("d0000000-0000-0000-0000-000000000006", "awaiting_confirmation", {
+      ingest_estimate: estimate("e6", {
+        estimated: false,
+        items: [],
+        duplicate_of: { id: original.id, doc_seq: 8, filename: "8.md" },
+      }),
+      confirm_by: IN_7_DAYS,
+    });
+    vi.spyOn(knowledgeSdk, "listDocuments").mockResolvedValue(docPage([original, copy]));
     const cancel = vi
       .spyOn(knowledgeSdk, "cancelDocuments")
       .mockImplementation(async (_base, ids) =>
-        ids.map((id) => ({
-          document_id: id,
-          outcome: id === PAID.id ? ("status_changed" as const) : ("withdrawn_deleted" as const),
-        })),
+        ids.map((id) => ({ document_id: id, outcome: "withdrawn_deleted" as const })),
       );
 
     renderTab();
@@ -332,17 +345,42 @@ describe("DocumentsTab — estimates (B-222 PR-2)", () => {
     await screen.findByText(/Withdraw the 2 estimate\(s\) waiting in this base now/);
     await confirmPopover("OK");
 
-    // Each as it was read: an estimate under way may have finished meanwhile.
-    await waitFor(() => expect(cancel).toHaveBeenCalledTimes(2));
-    expect(cancel).toHaveBeenCalledWith(BASE_NAME, [PAID.id], ["awaiting_confirmation"]);
-    expect(cancel).toHaveBeenCalledWith(
-      BASE_NAME,
-      [estimating.id],
-      ["estimating", "awaiting_confirmation"],
-    );
+    await waitFor(() => expect(cancel).toHaveBeenCalledTimes(1));
+    expect(cancel).toHaveBeenCalledWith(BASE_NAME, [original.id, copy.id], [
+      "estimating",
+      "awaiting_confirmation",
+    ]);
+    expect(await screen.findByText("Withdrew 2 estimates.")).toBeInTheDocument();
+    expect(screen.queryByText(/changed meanwhile/)).not.toBeInTheDocument();
+  });
+
+  it("「全部取消」 leaves one confirmed since it was read, and says so (B2b second review)", async () => {
+    vi.spyOn(knowledgeSdk, "listDocuments").mockResolvedValue(docPage([PAID]));
+    vi.spyOn(knowledgeSdk, "cancelDocuments").mockResolvedValue([
+      { document_id: PAID.id, outcome: "status_changed" },
+    ]);
+
+    renderTab();
+    await userEvent.click(await screen.findByTestId("doc-estimate-withdraw-all"));
+    await screen.findByText(/Withdraw the 1 estimate\(s\) waiting in this base now/);
+    await confirmPopover("OK");
+
     expect(
       await screen.findByText(/1 document changed meanwhile .* and was not withdrawn/),
     ).toBeInTheDocument();
+  });
+
+  it("skipping a duplicate on confirm leaves one sent for 「仍入库」 since", async () => {
+    const confirmSpy = vi.spyOn(knowledgeSdk, "confirmDocuments").mockResolvedValue([]);
+    const cancel = vi.spyOn(knowledgeSdk, "cancelDocuments").mockResolvedValue([]);
+    const { result } = renderHook(() => useEstimateActions(BASE_NAME, () => undefined), {
+      wrapper: ({ children }) => <App>{children}</App>,
+    });
+
+    await act(() => result.current.confirm([FREE], [COPY]));
+
+    expect(confirmSpy).toHaveBeenCalledTimes(1);
+    expect(cancel).toHaveBeenCalledWith(BASE_NAME, [COPY.id], ["awaiting_confirmation"]);
   });
 
   it.each([

@@ -487,8 +487,9 @@ class KnowledgeStore(abc.ABC):
         ingest path. Succeeds only if it is claimable (``pending``, or
         ``processing`` with an expired lease) and under ``max_attempts``;
         sets ``processing`` + a fresh lease and bumps ``attempts``, and puts
-        ``stage`` back to ``queued`` (no drive is left: one that died at
-        ``indexing`` is not writing its chunks). Returns the claim or
+        ``stage`` back to ``queued`` (a claimable row has no chunk swap of
+        its own in place: an ingest's swap lands with its READY — see
+        :meth:`replace_chunks` ``ready_chunk_count``). Returns the claim or
         ``None`` if another worker already holds it.
 
         B-222 PR-2: an ``estimating`` document with no live lease is claimable
@@ -1051,6 +1052,7 @@ class KnowledgeStore(abc.ABC):
         estimate: Mapping[str, Any],
         snapshot: ParseSnapshot | None,
         confirm_by: datetime,
+        now: datetime | None = None,
     ) -> KnowledgeDocument | None:
         """Fenced (``estimating`` at ``generation``): the estimate (a dumped
         :class:`~expert_work.protocol.knowledge_estimate.IngestEstimate`) is
@@ -1060,7 +1062,11 @@ class KnowledgeStore(abc.ABC):
         transaction. New bytes are checked once more against the base: when a
         document created before this one holds them, the estimate names it
         (``duplicate_of``) — two identical files uploaded at once. ``None``
-        (nothing written) when the document is no longer this estimate's."""
+        (nothing written) when the document is no longer this estimate's.
+
+        A released duplicate keeps the deadline it had, floored at ``now``
+        (default: the clock) plus the grace (see
+        :func:`~expert_work.persistence.knowledge.estimates.kept_deadline`)."""
 
     @abc.abstractmethod
     async def confirm_documents(
@@ -1213,6 +1219,7 @@ class KnowledgeStore(abc.ABC):
         expect_status: DocumentStatus = DocumentStatus.PROCESSING,
         chunk_params_hash: str | None = None,
         switch_offs: Collection[SwitchOffRecord] = (),
+        ready_chunk_count: int | None = None,
     ) -> bool:
         """Replace all of a document's chunks with ``chunks`` — deletes
         the document's existing chunks, then inserts the new set, in one
@@ -1248,7 +1255,13 @@ class KnowledgeStore(abc.ABC):
         record is inserted; an earlier one is only updated where it still
         exists, so one discarded (or deleted by the retention job) while the
         ingest ran stays gone. Records it does not name are left as they are;
-        text histories never get records' flags or vice versa."""
+        text histories never get records' flags or vice versa.
+
+        ``ready_chunk_count`` (B2b review; fenced writes only): the swap
+        also settles the document READY with that ``chunk_count``, in the
+        same transaction — everything :meth:`set_document_status` writes
+        for a fenced READY. A swap in place then always means READY: a
+        ``processing`` row never serves chunks of its own pending ingest."""
 
     @abc.abstractmethod
     async def list_chunks(

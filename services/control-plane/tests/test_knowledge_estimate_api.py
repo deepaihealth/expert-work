@@ -676,6 +676,49 @@ async def test_a_cancel_leaves_a_document_confirmed_since_it_was_read(
     assert await harness.audit_rows("knowledge:document_cancel") == []
 
 
+async def test_withdrawing_an_original_and_its_copy_in_two_requests_gets_both(
+    harness: _Harness, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """B2b third review: 「全部取消」 split over requests (200 ids each). The
+    first withdraws the original and frees its copy to ``estimating``; the
+    copy, read waiting, is still withdrawn — the console expects either
+    waiting status for every id."""
+    kb = await harness.store.get_base(tenant_id=_TENANT, name="kb")
+    assert kb is not None
+    started = [
+        await harness.store.begin_upload(
+            tenant_id=_TENANT,
+            kb_id=kb.id,
+            filename=name,
+            content=_MD,
+            content_sha256="same",
+            now=datetime.now(UTC),
+        )
+        for name in ("a.md", "copy.md")
+    ]
+    original, copy = (s.document for s in started)
+    assert (original.status.value, copy.status.value) == ("estimating", "awaiting_confirmation")
+    submitted: list[UUID] = []
+    monkeypatch.setattr(
+        harness.runner,
+        "submit",
+        lambda *, tenant_id, document_id: submitted.append(document_id),
+    )
+    waiting = ["estimating", "awaiting_confirmation"]
+
+    outcomes = []
+    for document in (original, copy):
+        response = await harness.client.post(
+            f"{_DOCS}/cancel",
+            json={"document_ids": [str(document.id)], "expect_status": waiting},
+        )
+        outcomes.extend(r["outcome"] for r in response.json()["results"])
+
+    assert submitted == [copy.id]  # freed by the first request
+    assert outcomes == ["withdrawn_deleted", "withdrawn_deleted"]
+    assert await harness.documents() == []
+
+
 async def test_discarding_a_waiting_new_uploads_new_bytes_estimates_the_first(
     harness: _Harness,
 ) -> None:

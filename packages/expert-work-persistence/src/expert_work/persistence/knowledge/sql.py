@@ -329,12 +329,15 @@ _CLAIMED_STATUS = case(
     ),
     else_=DocumentStatus.PROCESSING.value,
 )
-#: B2b review —— an ingest claim starts again at ``queued``. A claim means no
-#: drive is left: the lease expired, and the chunk swap of one that died at
-#: ``indexing`` committed (READY, not claimable) or rolled back with it (this
-#: UPDATE waits for the row lock the swap holds). Left at ``indexing``, the
-#: row would look past the point of no return to everyone — a return to
-#: confirmation, a re-upload, a cancel — while nothing writes its chunks.
+#: B2b review —— an ingest claim starts again at ``queued``. An ingest's chunk
+#: swap and its READY commit together (``replace_chunks(ready_chunk_count=…)``),
+#: so a claimable row — ``processing`` — has no swap of this generation in
+#: place: one that landed made it READY (not claimable), and one under way
+#: holds the row lock this UPDATE waits for. Left at ``indexing``, the row
+#: would look past the point of no return to everyone — a return to
+#: confirmation, a re-upload, a cancel — while nothing writes its chunks. A
+#: stalled earlier drive that swaps later is fenced like any write (status
+#: and generation); its chunks are of the same bytes.
 _CLAIMED_STAGE = case(
     (
         KnowledgeDocumentRow.status == DocumentStatus.ESTIMATING.value,
@@ -342,6 +345,47 @@ _CLAIMED_STAGE = case(
     ),
     else_=IngestStage.QUEUED.value,
 )
+
+
+def _status_values(
+    status: DocumentStatus,
+    *,
+    error: str | None = None,
+    chunk_count: int | None = None,
+    fenced: int | None = None,
+) -> dict[str, object]:
+    """The columns :meth:`SqlKnowledgeStore.set_document_status` writes (and a
+    swap that settles READY with it, :meth:`SqlKnowledgeStore.replace_chunks`)."""
+    values: dict[str, object] = {
+        "status": status.value,
+        "error": error,
+        "updated_at": datetime.now(UTC),
+    }
+    if chunk_count is not None:
+        values["chunk_count"] = chunk_count
+    # Reaching a terminal state releases the durability lease so the
+    # document is never re-claimed.
+    if status.value in _TERMINAL_STATUSES:
+        values["claimed_at"] = None
+        values["lease_until"] = None
+    if status is DocumentStatus.READY:
+        values["stage"] = IngestStage.READY.value
+        values["error_code"] = None
+    if status is DocumentStatus.READY and fenced is not None:
+        # The new version is now serving: promote pending → content in
+        # the same (fenced) statement.
+        values["content"] = func.coalesce(
+            KnowledgeDocumentRow.pending_content, KnowledgeDocumentRow.content
+        )
+        values["content_sha256"] = func.coalesce(
+            KnowledgeDocumentRow.pending_content_sha256, KnowledgeDocumentRow.content_sha256
+        )
+        values["size_bytes"] = func.octet_length(
+            func.coalesce(KnowledgeDocumentRow.pending_content, KnowledgeDocumentRow.content)
+        )
+        values["pending_content"] = None
+        values["pending_content_sha256"] = None
+    return values
 
 
 def _enum_or[E: StrEnum](enum: type[E], value: str | None, default: E | None) -> E | None:
@@ -2159,35 +2203,7 @@ class SqlKnowledgeStore(SqlEstimates, KnowledgeStore):
         chunk_count: int | None = None,
         generation: int | None = None,
     ) -> bool:
-        values: dict[str, object] = {
-            "status": status.value,
-            "error": error,
-            "updated_at": datetime.now(UTC),
-        }
-        if chunk_count is not None:
-            values["chunk_count"] = chunk_count
-        # Reaching a terminal state releases the durability lease so the
-        # document is never re-claimed.
-        if status.value in _TERMINAL_STATUSES:
-            values["claimed_at"] = None
-            values["lease_until"] = None
-        if status is DocumentStatus.READY:
-            values["stage"] = IngestStage.READY.value
-            values["error_code"] = None
-        if status is DocumentStatus.READY and generation is not None:
-            # The new version is now serving: promote pending → content in
-            # the same (fenced) statement.
-            values["content"] = func.coalesce(
-                KnowledgeDocumentRow.pending_content, KnowledgeDocumentRow.content
-            )
-            values["content_sha256"] = func.coalesce(
-                KnowledgeDocumentRow.pending_content_sha256, KnowledgeDocumentRow.content_sha256
-            )
-            values["size_bytes"] = func.octet_length(
-                func.coalesce(KnowledgeDocumentRow.pending_content, KnowledgeDocumentRow.content)
-            )
-            values["pending_content"] = None
-            values["pending_content_sha256"] = None
+        values = _status_values(status, error=error, chunk_count=chunk_count, fenced=generation)
         async with self._sf() as session:
             result = await session.execute(
                 update(KnowledgeDocumentRow)
@@ -2843,7 +2859,11 @@ class SqlKnowledgeStore(SqlEstimates, KnowledgeStore):
         expect_status: DocumentStatus = DocumentStatus.PROCESSING,
         chunk_params_hash: str | None = None,
         switch_offs: Collection[SwitchOffRecord] = (),
+        ready_chunk_count: int | None = None,
     ) -> bool:
+        if ready_chunk_count is not None and generation is None:
+            msg = "replace_chunks settles READY only as a fenced ingest write-back"
+            raise ValueError(msg)
         async with self._sf() as session:
             if generation is not None:
                 # Lock the document row for the length of the swap so a
@@ -2885,14 +2905,23 @@ class SqlKnowledgeStore(SqlEstimates, KnowledgeStore):
                 )
                 await session.flush()
                 session.expunge_all()
+            document_values: dict[str, object] = {}
             if chunk_params_hash is not None:
+                document_values["chunk_params_hash"] = chunk_params_hash
+            if ready_chunk_count is not None:
+                # B2b review: the swap and READY commit together — a swap in
+                # place means READY, never a ``processing`` row serving it.
+                document_values |= _status_values(
+                    DocumentStatus.READY, chunk_count=ready_chunk_count, fenced=generation
+                )
+            if document_values:
                 await session.execute(
                     update(KnowledgeDocumentRow)
                     .where(
                         KnowledgeDocumentRow.tenant_id == tenant_id,
                         KnowledgeDocumentRow.id == document_id,
                     )
-                    .values(chunk_params_hash=chunk_params_hash)
+                    .values(**document_values)
                 )
             await _stamp_orphans(session, tenant_id, document_id)
             await session.commit()

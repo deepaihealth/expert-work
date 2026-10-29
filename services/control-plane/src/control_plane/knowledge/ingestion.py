@@ -92,6 +92,7 @@ from control_plane.knowledge.recognition.ingest_parse import (
     parse_upload,
 )
 from control_plane.knowledge.recognition.recognizer import BatchGuard, DocumentRecognizer
+from control_plane.knowledge.stale import ModelsCheckFailedError as ModelsCheckFailedError
 from control_plane.knowledge.stale import StaleIngestionError as StaleIngestionError
 from control_plane.knowledge.usage import (
     IngestSpend,
@@ -206,6 +207,8 @@ def failure_code(exc: BaseException) -> IngestErrorCode:
     """The ``error_code`` recorded for an ingest that failed with ``exc``."""
     if isinstance(exc, DocumentParseError):
         return exc.code
+    if isinstance(exc, ModelsCheckFailedError):
+        return IngestErrorCode.MODELS_CHECK_FAILED
     tagged = getattr(exc, _ERROR_CODE_ATTR, None)
     return tagged if isinstance(tagged, IngestErrorCode) else IngestErrorCode.INTERNAL_ERROR
 
@@ -557,6 +560,7 @@ async def ingest_document_bytes(
     guard: BatchGuard | None = None,
     local: LocalParse | None = None,
     before_paid: BatchGuard | None = None,
+    settle: Callable[[], None] | None = None,
 ) -> int:
     """Parse → chunk → embed → store one document; return the chunk count.
 
@@ -580,6 +584,12 @@ async def ingest_document_bytes(
     as its snapshot) — the parse pools are not run again; ``before_paid``
     (:attr:`PaidStart.before_paid`) runs before each recognition batch and
     figure call, after the fenced stage write.
+
+    ``settle`` (B2b review; with ``generation``): the chunk swap also settles
+    the document READY, in the same transaction (``replace_chunks``
+    ``ready_chunk_count``) — a swap in place always means READY. It is
+    called just before the swap (the drive's "only fenced writes follow").
+    Without it the caller writes READY itself.
 
     :raises StaleIngestionError: the fenced write-back was rejected.
     """
@@ -622,6 +632,7 @@ async def ingest_document_bytes(
         plain_text=is_plain_text_file(filename),
         usage=usage,
         guard=guard,
+        settle=settle,
     )
 
 
@@ -725,6 +736,7 @@ async def ingest_markdown(
     plain_text: bool = False,
     usage: IngestUsageRecorder | None = None,
     guard: BatchGuard | None = None,
+    settle: Callable[[], None] | None = None,
 ) -> int:
     """Chunk → embed → store already-parsed Markdown; return the chunk count
     (the chunks searched — parent rows are not counted).
@@ -743,7 +755,7 @@ async def ingest_markdown(
     the text as plain text, not Markdown (a ``.txt`` file). ``usage`` bills
     the embedding calls to the tenant (B-209 §5.8, ``knowledge_ingest``).
     ``guard`` runs before each embedding window, topic-break ones included
-    (B-222).
+    (B-222). ``settle``: as :func:`ingest_document_bytes`.
 
     B-206 K-1: the chunks are cut inside parent chunks, and each parent that
     is more than its one chunk is stored as a ``parent`` row next to them
@@ -766,6 +778,7 @@ async def ingest_markdown(
             doc_title=doc_title,
             plain_text=plain_text,
             guard=guard,
+            settle=settle,
         )
 
 
@@ -784,6 +797,7 @@ async def _chunk_embed_store(
     doc_title: str | None,
     plain_text: bool,
     guard: BatchGuard | None,
+    settle: Callable[[], None] | None,
 ) -> int:
     retrying: Embedder = _BackoffEmbedder(pinned)
     if guard is not None:
@@ -840,6 +854,7 @@ async def _chunk_embed_store(
             params_hash=params_hash,
             chunk_max_tokens=chunk_max_tokens,
             chunk_overlap_tokens=chunk_overlap_tokens,
+            settle=settle,
         )
 
 
@@ -857,6 +872,7 @@ async def _embed_store(
     params_hash: str,
     chunk_max_tokens: int,
     chunk_overlap_tokens: int,
+    settle: Callable[[], None] | None,
 ) -> int:
     stage_args = {"tenant_id": tenant_id, "document_id": document_id, "generation": generation}
     await _advance(store, stage=IngestStage.EMBEDDING, **stage_args)
@@ -907,6 +923,8 @@ async def _embed_store(
         overrides=plan.overrides,
     )
     await _advance(store, stage=IngestStage.INDEXING, **stage_args)
+    if settle is not None:
+        settle()
     _ensure_written(
         await store.replace_chunks(
             tenant_id=tenant_id,
@@ -915,6 +933,7 @@ async def _embed_store(
             generation=generation,
             chunk_params_hash=params_hash,
             switch_offs=plan.switch_offs,
+            ready_chunk_count=len(pieces) if settle is not None else None,
         ),
         document_id,
     )
@@ -1194,7 +1213,7 @@ class _ModelsGuard:
                 logger.warning(
                     "knowledge.models_check_failed document=%s", claim.document_id, exc_info=True
                 )
-                self.refusal = StaleIngestionError(
+                self.refusal = ModelsCheckFailedError(
                     f"document {claim.document_id}: its models could not be checked"
                 )
                 raise self.refusal from None
@@ -1591,20 +1610,12 @@ class KnowledgeIngestionRunner:
                             ),
                             local=start.local,
                             before_paid=start.before_paid,
+                            settle=finishing.set,
                         )
                 finally:
                     finishing.set()
-                written = True  # this claim's chunks are in place
-                settled = await self._store.set_document_status(
-                    tenant_id=tenant_id,
-                    document_id=document_id,
-                    status=DocumentStatus.READY,
-                    chunk_count=chunk_count,
-                    generation=claim.generation,
-                )
-                if not settled:
-                    raise StaleIngestionError(document_id)
-                ready = True
+                # This claim's chunks are in place and READY, in one transaction.
+                written = ready = True
                 logger.info(
                     "knowledge.ingest_ready document=%s chunks=%d", document_id, chunk_count
                 )
@@ -1615,6 +1626,20 @@ class KnowledgeIngestionRunner:
             # settled by another claim) or the ingest was cancelled here
             # (B-222) — stop working on a result that can no longer be written.
             logger.info("knowledge.ingest_lost_lease document=%s", document_id)
+        except ModelsCheckFailedError as exc:
+            # B2b review: the check could not run — not stale, and no fault of
+            # the document. Left ``processing`` for the recovery worker once
+            # the lease runs out (its snapshot kept); the last attempt fails
+            # with its own code instead of ``attempts_exhausted``.
+            logger.warning("knowledge.ingest_models_unchecked document=%s", document_id)
+            if claim is not None and claim.attempts >= self._max_attempts:
+                failed = await self._store.mark_document_failed_terminal(
+                    tenant_id=tenant_id,
+                    document_id=document_id,
+                    error=str(exc)[:_ERROR_CAP],
+                    error_code=failure_code(exc),
+                    generation=claim.generation,
+                )
         except StaleIngestionError:
             # 重传 / 已被别的认领收尾 —— 本 worker 的结果作废,什么都不写。
             stale = True

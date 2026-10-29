@@ -424,6 +424,7 @@ class InMemoryEstimates:
         estimate: Mapping[str, Any],
         snapshot: ParseSnapshot | None,
         confirm_by: datetime,
+        now: datetime | None = None,
     ) -> KnowledgeDocument | None:
         document = self._find(tenant_id, document_id)
         if (
@@ -432,7 +433,9 @@ class InMemoryEstimates:
             or document.ingest_generation != generation
         ):
             return None
-        confirm_by = kept_deadline(self._estimates.get(document_id), confirm_by)
+        confirm_by = kept_deadline(
+            self._estimates.get(document_id), confirm_by, now=now or datetime.now(UTC)
+        )
         meta = meta_of(self._estimates.get(document_id))
         raw = with_estimate(meta, estimate)
         if checks_duplicates(meta):

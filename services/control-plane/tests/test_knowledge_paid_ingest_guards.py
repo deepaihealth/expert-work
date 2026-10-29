@@ -42,7 +42,7 @@ from control_plane.knowledge.recognition.recognizer import (
 from control_plane.knowledge.recovery import KnowledgeIngestRecoveryWorker
 from expert_work.persistence import InMemoryKnowledgeStore
 from expert_work.persistence.knowledge.base import ClaimedIngestion, ParseSnapshot
-from expert_work.protocol import DocumentStatus, KnowledgeDocument
+from expert_work.protocol import DocumentStatus, IngestErrorCode, KnowledgeDocument
 from expert_work.protocol.knowledge_estimate import EstimateModels
 from orchestrator.llm import FakeEmbedder
 from tests.knowledge_form_fixtures import MIXED_DOCS, PICTURE_DOCS, FormDoc
@@ -518,6 +518,72 @@ async def test_a_models_check_that_fails_pays_for_nothing(doc: FormDoc) -> None:
     assert (paid.reads, paid.descriptions, embedder.calls) == (0, 0, 0)
     after = await store.get_document(tenant_id=_TENANT, document_id=waiting.id)
     assert after is not None and after.status is DocumentStatus.PROCESSING  # left for a retry
+
+
+@pytest.mark.parametrize("path", ["runner", "recovery"])
+@pytest.mark.usefixtures("no_semantic_breaks")
+async def test_a_models_check_that_keeps_failing_is_retried_then_fails_as_itself(
+    path: str,
+) -> None:
+    """B2b third review: each attempt keeps the parse snapshot; the last one
+    fails ``models_check_failed``, not ``attempts_exhausted``."""
+    _CheckFails.checks, _CheckFails.passes = 0, 0
+    store = InMemoryKnowledgeStore()
+    settings = _Recognition()
+    paid = _Paid()
+    recognizer = DocumentRecognizer(
+        store=store, settings=settings, api_keys=_api_key, client_factory=paid.reader
+    )
+    figures = FigureDescriber(
+        store=store,
+        settings=settings,
+        api_keys=_api_key,
+        recognizer=recognizer,
+        client_factory=paid.describer,
+    )
+    embedder = _Keyed("acme/embed-1")
+    estimator = _CheckFails(store=store, settings=settings, recognizer=recognizer)
+    runner = KnowledgeIngestionRunner(
+        store=store,
+        embedder=embedder,
+        recognizer=recognizer,
+        figures=figures,
+        estimator=estimator,
+        max_attempts=2,
+    )
+    worker = KnowledgeIngestRecoveryWorker(
+        store=store,
+        embedder=embedder,
+        interval_s=30,
+        concurrency=1,
+        lease_seconds=300,
+        max_attempts=2,
+        recognizer=recognizer,
+        figures=figures,
+        estimator=estimator,
+    )
+    doc = PICTURE_DOCS[0]
+    waiting = await _waiting(store, runner, doc.filename, doc.raw)
+
+    async def attempt() -> KnowledgeDocument:
+        if path == "runner":
+            await runner.submit(tenant_id=_TENANT, document_id=waiting.id)
+        else:
+            await worker.run_once()
+        store._lease[waiting.id] = None  # the lease runs out
+        after = await store.get_document(tenant_id=_TENANT, document_id=waiting.id)
+        assert after is not None
+        return after
+
+    first = await attempt()
+    assert first.status is DocumentStatus.PROCESSING
+    assert await _snapshot_of(store, waiting) is not None
+    last = await attempt()
+    assert (last.status, last.error_code) == (
+        DocumentStatus.FAILED,
+        IngestErrorCode.MODELS_CHECK_FAILED,
+    )
+    assert (paid.reads, paid.descriptions, embedder.calls) == (0, 0, 0)
 
 
 async def test_the_models_guard_refuses_when_its_check_fails() -> None:

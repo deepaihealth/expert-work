@@ -831,6 +831,21 @@ class InMemoryKnowledgeStore(InMemoryEstimates, KnowledgeStore):
             return False
         if generation is not None and not _fence_matches(document, generation):
             return False
+        self._set_status(document, status, error=error, chunk_count=chunk_count, fenced=generation)
+        return True
+
+    def _set_status(
+        self,
+        document: KnowledgeDocument,
+        status: DocumentStatus,
+        *,
+        error: str | None = None,
+        chunk_count: int | None = None,
+        fenced: int | None = None,
+    ) -> None:
+        """:meth:`set_document_status` once its fence passed (and a swap that
+        settles READY with it, :meth:`replace_chunks`)."""
+        document_id = document.id
         update: dict[str, object] = {
             "status": status,
             "error": error,
@@ -843,7 +858,7 @@ class InMemoryKnowledgeStore(InMemoryEstimates, KnowledgeStore):
         if status is DocumentStatus.READY:
             update["stage"] = IngestStage.READY
             update["error_code"] = None
-        if status is DocumentStatus.READY and generation is not None:
+        if status is DocumentStatus.READY and fenced is not None:
             # The new version is now serving: promote pending → content.
             pending = self._pending.pop(document_id, None)
             if pending is not None:
@@ -853,7 +868,6 @@ class InMemoryKnowledgeStore(InMemoryEstimates, KnowledgeStore):
             update["has_pending"] = False
             update["has_content"] = serving is not None
         self._documents[self._documents.index(document)] = document.model_copy(update=update)
-        return True
 
     async def delete_document(self, *, tenant_id: UUID, document_id: UUID) -> bool:
         document = await self.get_document(tenant_id=tenant_id, document_id=document_id)
@@ -1413,7 +1427,11 @@ class InMemoryKnowledgeStore(InMemoryEstimates, KnowledgeStore):
         expect_status: DocumentStatus = DocumentStatus.PROCESSING,
         chunk_params_hash: str | None = None,
         switch_offs: Collection[SwitchOffRecord] = (),
+        ready_chunk_count: int | None = None,
     ) -> bool:
+        if ready_chunk_count is not None and generation is None:
+            msg = "replace_chunks settles READY only as a fenced ingest write-back"
+            raise ValueError(msg)
         document = await self.get_document(tenant_id=tenant_id, document_id=document_id)
         if generation is not None:
             # Fenced: a missing document is just "not ours any more".
@@ -1451,8 +1469,13 @@ class InMemoryKnowledgeStore(InMemoryEstimates, KnowledgeStore):
             for c in chunks
         )
         if chunk_params_hash is not None:
-            self._documents[self._documents.index(document)] = document.model_copy(
-                update={"chunk_params_hash": chunk_params_hash}
+            at = self._documents.index(document)
+            document = document.model_copy(update={"chunk_params_hash": chunk_params_hash})
+            self._documents[at] = document
+        if ready_chunk_count is not None:
+            # B2b review: the swap and READY land together (see the SQL store).
+            self._set_status(
+                document, DocumentStatus.READY, chunk_count=ready_chunk_count, fenced=generation
             )
         self._stamp_orphans(tenant_id, document_id)
         return True

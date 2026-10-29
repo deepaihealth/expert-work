@@ -8,9 +8,10 @@
  * Requests carry at most :data:`ESTIMATE_IDS_PER_REQUEST` ids (the server's
  * cap); a larger batch goes in several and the results are added up.
  * 「全部取消」 withdraws exactly the documents waiting when its confirm opened
- * (:func:`waitingDocuments`) — never one uploaded after — and a withdrawal
- * only touches a document still in the status it was read in (confirmed or
- * sent for 「仍入库」 since: left alone, ``status_changed``).
+ * (:func:`waitingDocuments`) — never one uploaded after. A withdrawal only
+ * touches a document still waiting (confirmed since: left alone,
+ * ``status_changed``); skipping a duplicate also leaves one sent for
+ * 「仍入库」 since.
  */
 import { useCallback, useMemo, useState } from "react";
 import { App } from "antd";
@@ -45,12 +46,19 @@ export function inChunks<T>(items: T[], size: number = ESTIMATE_IDS_PER_REQUEST)
   return chunks;
 }
 
-/** The statuses a withdrawal of a document read in ``status`` still applies
- *  to: an estimate under way may have finished meanwhile; anything else must
- *  be as it was read (a confirmed one is ``pending`` now, a duplicate sent for
- *  「仍入库」 ``estimating``). */
+/** Nothing has been spent on a document in either: a withdrawal of one read
+ *  waiting applies while it still waits, whichever of the two it is in now
+ *  (an estimate may have finished; a copy freed by withdrawing its original
+ *  in the same action is estimating again). A confirmed one (``pending``) is
+ *  left alone. */
+const WAITING: DocumentStatus[] = ["estimating", "awaiting_confirmation"];
+
+/** The statuses skipping a duplicate (「确认 · 跳过副本」) still applies to: a
+ *  document read in ``status`` must be as it was read — a duplicate sent
+ *  for 「仍入库」 since (``estimating``) is not withdrawn. An estimate under way
+ *  may have finished meanwhile. */
 export function withdrawableFrom(status: DocumentStatus): DocumentStatus[] {
-  return status === "estimating" ? ["estimating", "awaiting_confirmation"] : [status];
+  return status === "estimating" ? WAITING : [status];
 }
 
 export interface EstimateActions {
@@ -101,11 +109,11 @@ export function useEstimateActions(
   );
 
   const cancelAll = useCallback(
-    async (documents: WaitingDocument[]) => {
+    async (documents: WaitingDocument[], strict: boolean) => {
       if (documents.length === 0) return;
       const groups = new Map<string, { expect: DocumentStatus[]; ids: string[] }>();
       for (const document of documents) {
-        const expect = withdrawableFrom(document.status);
+        const expect = strict ? withdrawableFrom(document.status) : WAITING;
         const key = expect.join(",");
         const group = groups.get(key) ?? { expect, ids: [] };
         group.ids.push(document.id);
@@ -140,7 +148,7 @@ export function useEstimateActions(
           results.push(...(await confirmDocuments(baseName, chunk)));
         }
         if (results.length > 0) reportConfirmed(results);
-        await cancelAll(skip);
+        await cancelAll(skip, true);
       }),
     [baseName, cancelAll, reportConfirmed, run],
   );
@@ -170,7 +178,7 @@ export function useEstimateActions(
   );
 
   const withdraw = useCallback(
-    (documents: WaitingDocument[]) => run(() => cancelAll(documents)),
+    (documents: WaitingDocument[]) => run(() => cancelAll(documents, false)),
     [cancelAll, run],
   );
 
