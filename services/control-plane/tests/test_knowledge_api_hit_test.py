@@ -43,8 +43,8 @@ from tests.auth_fixtures import (
     grant_system_admin,
     make_test_jwt,
 )
-from tests.test_knowledge_api_logs import _GUIDE
 from tests.knowledge_confirm import settle
+from tests.test_knowledge_api_logs import _GUIDE
 
 _TENANT = DEFAULT_DEV_TENANT_ID
 _EMPLOYEE = "employee-hit-test"
