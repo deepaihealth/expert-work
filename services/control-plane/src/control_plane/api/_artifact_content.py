@@ -11,7 +11,8 @@
 * B-235 之前登记的(没有副本)且正是最新版 → 照旧读工作区文件(这一点上与以前逐字相同);
 * B-235 之前登记的、已经不是最新版 → :class:`VersionNotRetained`:那一版的字节早被同名的
   后续登记盖掉了,拿最新版冒充正是 B-235 要修的事;
-* 不存在(从没有过、或已被留存作业清掉)→ :class:`VersionUnknown`。
+* 不存在(从没有过、或已被留存作业清掉),或查到的那一版不属于「最新版」那条产物
+  (``agent_key=None`` 时两次按名字的查询可能落在不同产物上)→ :class:`VersionUnknown`。
 
 **从哪读**:有副本读副本,没有读 ``path_in_workspace``。副本读不到(进程内存后端重启、被
 误删)就是读不到 —— 抛出来的仍是 ``SandboxSupervisorError`` 家族,端点既有的
@@ -55,7 +56,9 @@ def choose_version(
     """
     if requested is None:
         return latest
-    if pinned is None:
+    # ``agent_key=None`` 的会话里「最新版」与「指定版」是两次按名字的独立查询,同名多行时
+    # 可能落在两条不同的产物上 —— 不属于同一条产物的版本当作不存在。
+    if pinned is None or pinned.artifact_id != latest.artifact_id:
         raise VersionUnknown(requested)
     if pinned.snapshot_key is not None or pinned.version == latest.version:
         return pinned

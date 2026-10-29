@@ -42,6 +42,7 @@ from uuid import UUID, uuid4
 from expert_work.persistence import ARTIFACT_SNAPSHOT_DIR
 from orchestrator.tools.nas_workspace_store import NasWorkspaceStore, _openat_dir
 from orchestrator.tools.sandbox import (
+    SandboxSupervisorError,
     WorkspaceFileChangedError,
     WorkspaceFileNotFoundError,
     WorkspaceFileTooLargeError,
@@ -63,6 +64,14 @@ _CHANGED_RETRIES = 1
 _FILE_MODE = 0o600
 
 _DIR_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+
+
+class ArtifactSnapshotReadError(SandboxSupervisorError):
+    """读副本时的 I/O 失败(EIO / ESTALE / …)—— 不是「不在」、不是「没权限」、不是越界。
+
+    仍是 :class:`SandboxSupervisorError` 的子类,下载端点既有的宽 ``except`` 照常接住
+    (回 404「内容取不到」),而不是让裸 ``OSError`` 冒成一个没有信封的 500。
+    """
 
 
 @dataclass(frozen=True)
@@ -161,8 +170,10 @@ class NasArtifactSnapshotStore:
     ) -> SnapshotDigest:
         key = _require_key(snapshot_key)
         data = await self._read_stable(tenant_id=tenant_id, user_id=user_id, path=path)
-        await asyncio.to_thread(_write_copy, self.workspace.root, tenant_id, user_id, key, data)
-        return _digest(data)
+        # sha256 最多 64 MiB 的字节 —— 与写副本一起放进线程,不占事件循环。
+        return await asyncio.to_thread(
+            _write_copy, self.workspace.root, tenant_id, user_id, key, data
+        )
 
     async def _read_stable(self, *, tenant_id: UUID, user_id: UUID, path: str) -> bytes:
         for attempt in range(_CHANGED_RETRIES + 1):
@@ -219,8 +230,12 @@ def _open_user_dir(root: str, tenant_id: UUID, user_id: UUID, *, create: bool) -
         os.close(parent_fd)
 
 
-def _write_copy(root: str, tenant_id: UUID, user_id: UUID, key: str, data: bytes) -> None:
-    """先写 ``{key}.tmp-<随机>``,fsync,再 rename 成 ``{key}`` —— 最终名字下只会出现完整文件。"""
+def _write_copy(root: str, tenant_id: UUID, user_id: UUID, key: str, data: bytes) -> SnapshotDigest:
+    """先写 ``{key}.tmp-<随机>``,fsync,再 rename 成 ``{key}`` —— 最终名字下只会出现完整文件。
+
+    顺带算好摘要返回(在调用方的工作线程里,不在事件循环上)。
+    """
+    digest = _digest(data)
     user_fd = _open_user_dir(root, tenant_id, user_id, create=True)
     tmp = f"{key}.tmp-{uuid4().hex}"
     try:
@@ -243,35 +258,43 @@ def _write_copy(root: str, tenant_id: UUID, user_id: UUID, key: str, data: bytes
             raise
     finally:
         os.close(user_fd)
+    return digest
+
+
+def _copy_error(exc: OSError, key: str, *, where: str) -> SandboxSupervisorError:
+    """把读副本时的 ``OSError`` 翻成下载端点认得的那一族。"""
+    if isinstance(exc, FileNotFoundError):
+        return WorkspaceFileNotFoundError(f"artifact snapshot not found: {key!r}")
+    if isinstance(exc, PermissionError):
+        return WorkspacePermissionError(f"artifact snapshot {where} not readable: {key!r}")
+    if exc.errno == errno.ELOOP or (where == "directory" and exc.errno == errno.ENOTDIR):
+        # O_NOFOLLOW 撞上 symlink:Linux 回 ELOOP;macOS 对 O_DIRECTORY 回 ENOTDIR。
+        return WorkspacePathEscapeError(f"artifact snapshot {where} is a symlink: {key!r}")
+    return ArtifactSnapshotReadError(f"artifact snapshot {where} unreadable ({exc.errno}): {key!r}")
 
 
 def _read_copy(root: str, tenant_id: UUID, user_id: UUID, key: str) -> bytes:
     try:
         user_fd = _open_user_dir(root, tenant_id, user_id, create=False)
-    except FileNotFoundError as exc:
-        raise WorkspaceFileNotFoundError(f"artifact snapshot not found: {key!r}") from exc
     except OSError as exc:
-        raise WorkspacePathEscapeError(f"artifact snapshot directory unusable: {key!r}") from exc
+        raise _copy_error(exc, key, where="directory") from exc
     try:
         try:
             fd = os.open(key, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=user_fd)
-        except FileNotFoundError as exc:
-            raise WorkspaceFileNotFoundError(f"artifact snapshot not found: {key!r}") from exc
-        except PermissionError as exc:
-            raise WorkspacePermissionError(f"artifact snapshot not readable: {key!r}") from exc
         except OSError as exc:
-            if exc.errno == errno.ELOOP:
-                raise WorkspacePathEscapeError(f"artifact snapshot is a symlink: {key!r}") from exc
-            raise WorkspaceFileNotFoundError(f"artifact snapshot not found: {key!r}") from exc
+            raise _copy_error(exc, key, where="file") from exc
     finally:
         os.close(user_fd)
     with os.fdopen(fd, "rb") as handle:
-        info = os.fstat(handle.fileno())
-        if not stat.S_ISREG(info.st_mode):
-            raise WorkspaceFileNotFoundError(f"artifact snapshot is not a file: {key!r}")
-        if info.st_size > MAX_SNAPSHOT_BYTES:
-            raise WorkspaceFileTooLargeError(f"artifact snapshot {key!r} exceeds the read cap")
-        return handle.read()
+        try:
+            info = os.fstat(handle.fileno())
+            if not stat.S_ISREG(info.st_mode):
+                raise WorkspaceFileNotFoundError(f"artifact snapshot is not a file: {key!r}")
+            if info.st_size > MAX_SNAPSHOT_BYTES:
+                raise WorkspaceFileTooLargeError(f"artifact snapshot {key!r} exceeds the read cap")
+            return handle.read()
+        except OSError as exc:
+            raise _copy_error(exc, key, where="file") from exc
 
 
 def _delete_copy(root: str, tenant_id: UUID, user_id: UUID, key: str) -> bool:

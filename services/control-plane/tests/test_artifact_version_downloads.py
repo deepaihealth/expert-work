@@ -32,8 +32,11 @@ from control_plane.settings import DEFAULT_DEV_TENANT_ID, Settings
 from expert_work.persistence import ArtifactStore
 from expert_work.persistence.audit_log import InMemoryAuditLogStore
 from expert_work.protocol.agent_key import sanitize_agent_key
-from orchestrator.tools import RecordingWorkspaceStore
-from orchestrator.tools.artifact_snapshots import InMemoryArtifactSnapshotStore
+from orchestrator.tools import RecordingWorkspaceStore, WorkspacePermissionError
+from orchestrator.tools.artifact_snapshots import (
+    ArtifactSnapshotReadError,
+    InMemoryArtifactSnapshotStore,
+)
 from tests.auth_fixtures import (
     TEST_AUDIENCE,
     TEST_ISSUER,
@@ -408,3 +411,28 @@ async def test_external_pre_release_older_version_stays_409(
     assert older.json()["error"]["code"] == "ARTIFACT_VERSION_MISMATCH"  # type: ignore[attr-defined]
     latest = await _external_get(world, 2)
     assert (latest.status_code, latest.content) == (200, b"OLD-2")  # type: ignore[attr-defined]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("error", "status"),
+    [
+        (WorkspacePermissionError("copy not readable"), 500),
+        (ArtifactSnapshotReadError("copy unreadable (5)"), 404),
+    ],
+)
+async def test_copy_read_failures_go_through_the_error_ladder(
+    session: _Session, monkeypatch: pytest.MonkeyPatch, error: Exception, status: int
+) -> None:
+    """读副本失败:没权限是服务端配置问题(500),I/O 失败按「内容取不到」(404);
+    都不能冒成没有处理的异常。"""
+    await session.save(b"AAA")
+
+    async def broken(**_: object) -> bytes:
+        raise error
+
+    monkeypatch.setattr(session.world.snapshots, "read", broken)
+    resp = await session.download(version=1)
+
+    assert resp.status_code == status, resp.text  # type: ignore[attr-defined]
+    assert "copy not readable" not in resp.text  # type: ignore[attr-defined]

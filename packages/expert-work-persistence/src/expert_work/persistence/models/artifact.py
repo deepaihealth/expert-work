@@ -15,6 +15,7 @@ from sqlalchemy import (
     BigInteger,
     CheckConstraint,
     DateTime,
+    Index,
     Integer,
     Text,
     UniqueConstraint,
@@ -116,4 +117,6 @@ class ArtifactVersionRow(Base):
             "snapshot_key IS NULL OR (size_bytes IS NOT NULL AND sha256 IS NOT NULL)",
             name="artifact_version_snapshot_digest",
         ),
+        # B-235 —— 留存作业「这个路径还有没有别的版本在用」按这三列查(迁移 0180)。
+        Index("artifact_version_path_idx", "tenant_id", "user_id", "path_in_workspace"),
     )

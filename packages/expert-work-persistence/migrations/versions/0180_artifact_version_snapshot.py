@@ -9,6 +9,10 @@ reach, named by the version row id; this column records that copy.
 A row that names a copy must carry its size and sha256: they are computed while the
 copy is taken, never lazily (the CHECK below).
 
+Index ``artifact_version_path_idx`` on ``(tenant_id, user_id, path_in_workspace)``:
+before unlinking an expired version's workspace file, the retention job asks whether
+any other version of that user still points at the same path.
+
 **Expand-only, no backfill**: NULL = registered before B-235 — no copy exists, and
 the content can only be read from ``path_in_workspace`` as before. Old code never
 writes the column, so its inserts stay NULL and pass the CHECK; an image rollback
@@ -33,6 +37,7 @@ depends_on: str | Sequence[str] | None = None
 __all__ = ["branch_labels", "depends_on", "down_revision", "downgrade", "revision", "upgrade"]
 
 _CHECK = "artifact_version_snapshot_digest"
+_INDEX = "artifact_version_path_idx"
 
 
 def upgrade() -> None:
@@ -42,8 +47,10 @@ def upgrade() -> None:
         "artifact_version",
         "snapshot_key IS NULL OR (size_bytes IS NOT NULL AND sha256 IS NOT NULL)",
     )
+    op.create_index(_INDEX, "artifact_version", ["tenant_id", "user_id", "path_in_workspace"])
 
 
 def downgrade() -> None:
+    op.drop_index(_INDEX, table_name="artifact_version")
     op.drop_constraint(_CHECK, "artifact_version", type_="check")
     op.drop_column("artifact_version", "snapshot_key")

@@ -128,3 +128,30 @@ def test_downgrade_drops_the_column(fresh_db: str) -> None:
     command.downgrade(_alembic(fresh_db), _BEFORE)
 
     assert _column(fresh_db) is None
+
+
+_INDEX = "artifact_version_path_idx"
+
+
+def _index(dsn: str) -> str | None:
+    with psycopg.connect(dsn) as conn:
+        row = conn.execute(
+            "SELECT indexdef FROM pg_indexes WHERE tablename = 'artifact_version' "
+            "AND indexname = %s",
+            (_INDEX,),
+        ).fetchone()
+    return None if row is None else str(row[0])
+
+
+def test_the_path_lookup_has_an_index_and_downgrade_drops_it(fresh_db: str) -> None:
+    """留存作业删一个版本前问「这个路径还有没有别的版本在用」,按
+    ``(tenant_id, user_id, path_in_workspace)`` 查 —— 没有索引就是全表扫。"""
+    assert _index(fresh_db) is None
+
+    command.upgrade(_alembic(fresh_db), _REVISION)
+    definition = _index(fresh_db)
+    assert definition is not None
+    assert "(tenant_id, user_id, path_in_workspace)" in definition
+
+    command.downgrade(_alembic(fresh_db), _BEFORE)
+    assert _index(fresh_db) is None

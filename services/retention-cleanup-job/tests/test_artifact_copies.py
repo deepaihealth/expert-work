@@ -15,18 +15,28 @@ from __future__ import annotations
 
 import os
 import time
+from collections.abc import AsyncIterator
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 from uuid import UUID, uuid4
 
+import psycopg
 import pytest
+from alembic import command
+from alembic.config import Config
 
 from expert_work.persistence import (
+    ArtifactStore,
+    DatabaseConfig,
     InMemoryArtifactStore,
     InMemoryUserWorkspaceStore,
+    SqlArtifactStore,
     artifact_snapshot_dir,
+    create_async_engine_from_config,
+    create_async_session_factory,
 )
+from expert_work.persistence.rls import RlsBypassRequiredError
 from expert_work.protocol import ArtifactVersion
 from retention_cleanup_job.artifact_copies import sweep_orphan_copies
 from retention_cleanup_job.job import RetentionCleanupJob
@@ -251,3 +261,97 @@ async def test_a_kept_row_keeps_its_copy(world: _World) -> None:
     assert deleted == 0
     assert [v.id for v in await world.versions()] == [old.id]
     assert (world.copies() / str(old.id)).exists(), "行留着,副本却先删了"
+
+
+# --------------------------------------------------------------------------- RLS 闸(SQL)
+
+_ALEMBIC_INI = (
+    Path(__file__).resolve().parents[3] / "packages" / "expert-work-persistence" / "alembic.ini"
+)
+_DB = "retention_artifact_copies_rls"
+
+
+@pytest.fixture
+async def sql_artifacts(postgres_container: Any) -> AsyncIterator[ArtifactStore]:
+    admin = str(postgres_container.get_connection_url()).replace("+psycopg2", "")
+    with psycopg.connect(admin, autocommit=True) as conn:
+        conn.execute(f'DROP DATABASE IF EXISTS "{_DB}" WITH (FORCE)')
+        conn.execute(f'CREATE DATABASE "{_DB}"')
+    base, _, _ = admin.rpartition("/")
+    dsn = f"{base}/{_DB}"
+    cfg = Config(str(_ALEMBIC_INI))
+    cfg.set_main_option("sqlalchemy.url", dsn.replace("postgresql://", "postgresql+psycopg://", 1))
+    command.upgrade(cfg, "head")
+    engine = create_async_engine_from_config(
+        DatabaseConfig(dsn=dsn.replace("postgresql://", "postgresql+asyncpg://", 1))
+    )
+    try:
+        yield SqlArtifactStore(create_async_session_factory(engine))
+    finally:
+        await engine.dispose()
+        with psycopg.connect(admin, autocommit=True) as conn:
+            conn.execute(f'DROP DATABASE IF EXISTS "{_DB}" WITH (FORCE)')
+
+
+@pytest.mark.integration
+async def test_orphan_sweep_without_the_rls_bypass_deletes_nothing(
+    world: _World, sql_artifacts: ArtifactStore
+) -> None:
+    """强制 RLS 且没声明 bypass 时,「哪些副本还有版本行」会答「一个都没有」—— 那样每个租户
+    满 24 小时的副本都会被当成孤儿删掉。必须拒绝运行,一个文件都不删。"""
+    d = world.copies()
+    d.mkdir(parents=True)
+    copy = d / str(uuid4())
+    copy.write_bytes(b"x")
+    _age(copy, 48)
+
+    with pytest.raises(RlsBypassRequiredError):
+        await sweep_orphan_copies(str(world.root), sql_artifacts)
+
+    assert copy.exists()
+
+
+class _ExplodingStore(InMemoryArtifactStore):
+    async def existing_version_ids(self, ids: Any) -> set[UUID]:
+        raise RuntimeError("db down")
+
+
+async def test_a_failing_orphan_pass_does_not_skip_the_later_passes(world: _World) -> None:
+    """孤儿副本这一 pass 查库失败:记日志、计 0,后面的 pass 照跑(今天的上传 / 线程 /
+    记忆 / 工作区清理不能因为它整个跳过)。"""
+    stray = world.copies() / str(uuid4())
+    stray.parent.mkdir(parents=True)
+    stray.write_bytes(b"x")
+    _age(stray, 48)
+    job = world.job(artifact_store=_ExplodingStore())
+    later: list[str] = []
+
+    async def _zero() -> int:
+        return 0
+
+    async def _audit_log() -> tuple[int, dict[str, int]]:
+        return 0, {}
+
+    async def _memory() -> int:
+        later.append("memory")
+        return 0
+
+    for name in (
+        "_count_unacked_past_retention",
+        "_delete_event_log",
+        "_delete_sandbox_egress_audit",
+        "_delete_finished_memory_writeback_jobs",
+        "_delete_finished_knowledge_tasks",
+        "_delete_orphaned_knowledge_revisions",
+        "_delete_expired_knowledge_retrieval_logs",
+        "_delete_expired_jwt_blacklist",
+    ):
+        setattr(job, name, _zero)
+    job._delete_audit_log = _audit_log  # type: ignore[method-assign]
+    job._sweep_memory = _memory  # type: ignore[method-assign]
+
+    report = await job.run_once()
+
+    assert later == ["memory"], "孤儿副本 pass 一失败,后面的 pass 都没跑"
+    assert report.orphan_artifact_copies_removed == 0
+    assert stray.exists()

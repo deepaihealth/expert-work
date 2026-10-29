@@ -609,7 +609,13 @@ class RetentionCleanupJob:
         No-op when :class:`ArtifactStore` or ``workspace_root`` is missing."""
         if self._artifact_store is None or self._workspace_root is None:
             return 0
-        return await sweep_orphan_copies(self._workspace_root, self._artifact_store)
+        # 这一 pass 失败(查库 / 扫 NAS)只记日志:孤儿副本明天再清不迟,后面的上传 /
+        # 线程 / 记忆 / 工作区清理不能因为它整个跳过。
+        try:
+            return await sweep_orphan_copies(self._workspace_root, self._artifact_store)
+        except Exception:
+            logger.exception("retention.orphan_artifact_copies_failed")
+            return 0
 
     async def _audit(
         self,

@@ -11,7 +11,7 @@ SQL 档在容器里另建一个库(理由同 ``test_artifact_store_agent_scope_c
 
 from __future__ import annotations
 
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Iterator
 from datetime import UTC, datetime
 from pathlib import Path
 from uuid import UUID, uuid4
@@ -30,6 +30,7 @@ from expert_work.persistence import (
     create_async_session_factory,
 )
 from expert_work.persistence.artifact.base import ArtifactStore
+from expert_work.persistence.rls import RlsBypassRequiredError, bypass_rls_var
 from expert_work.protocol import ArtifactVersion
 
 ALEMBIC_INI = Path(__file__).resolve().parent.parent / "alembic.ini"
@@ -197,6 +198,17 @@ async def test_get_version_by_id(store: ArtifactStore) -> None:
     )
 
 
+@pytest.fixture
+def rls_bypass() -> Iterator[None]:
+    """两个跨租户方法只给留存作业用,它整个 sweep 都在 RLS bypass 里跑。"""
+    token = bypass_rls_var.set(True)
+    try:
+        yield
+    finally:
+        bypass_rls_var.reset(token)
+
+
+@pytest.mark.usefixtures("rls_bypass")
 async def test_paths_still_registered_ignores_the_excluded_versions(store: ArtifactStore) -> None:
     """留存作业删 v1 之前问:这个路径还有没有**别的**版本在用?"""
     tenant_id, user_id = uuid4(), uuid4()
@@ -228,9 +240,30 @@ async def test_paths_still_registered_ignores_the_excluded_versions(store: Artif
     assert other_user == set(), "别的用户的同名路径不该算"
 
 
+@pytest.mark.usefixtures("rls_bypass")
 async def test_existing_version_ids(store: ArtifactStore) -> None:
     saved = await _save(store, tenant_id=uuid4(), user_id=uuid4())
     stray = uuid4()
 
     assert await store.existing_version_ids([saved.id, stray]) == {saved.id}
     assert await store.existing_version_ids([]) == set()
+
+
+async def test_cross_tenant_lookups_refuse_to_run_without_the_rls_bypass(
+    store: ArtifactStore,
+) -> None:
+    """强制 RLS 后,没声明 bypass 的会话这两个查询都会拿到空集 —— 孤儿清理会把每个租户
+    满 24 小时的副本都当成孤儿删掉,同路径判断也会说「没人在用」。所以 SQL 档没 bypass
+    就直接拒绝,不给一个看起来正常的空答案。内存档没有 RLS,不适用。"""
+    if isinstance(store, InMemoryArtifactStore):
+        pytest.skip("RLS only exists on the SQL store")
+    saved = await _save(store, tenant_id=uuid4(), user_id=uuid4())
+    with pytest.raises(RlsBypassRequiredError):
+        await store.existing_version_ids([saved.id])
+    with pytest.raises(RlsBypassRequiredError):
+        await store.paths_still_registered(
+            tenant_id=saved.tenant_id,
+            user_id=saved.user_id,
+            paths=[_PATH],
+            excluding_version_ids=[],
+        )

@@ -657,7 +657,9 @@ class _BrokenStore(InMemoryArtifactStore):
 
 
 @pytest.mark.asyncio
-async def test_a_failed_registration_removes_its_copy() -> None:
+async def test_a_failed_registration_leaves_its_copy_to_the_orphan_sweep() -> None:
+    """登记失败时不当场删副本:失败那一刻分不清行到底落没落库(见下一条),删错了就是一个
+    指着空副本的版本。没人认领的副本由留存作业的孤儿清理(满 24 小时、找不到版本行)收走。"""
     snapshots = _snapshots({_REPORT: b"AAA"})
     tool = SaveArtifactTool(snapshots=snapshots, store=_BrokenStore(), client=_sandbox())
     ctx = _ctx(agent_key=_ME)
@@ -665,7 +667,35 @@ async def test_a_failed_registration_removes_its_copy() -> None:
     with pytest.raises(RuntimeError, match="db down"):
         await tool.call({"name": "report.txt"}, ctx=ctx)
 
-    assert await snapshots.delete_all_for_user(tenant_id=ctx.tenant_id, user_id=ctx.user_id) == 0
+    assert await snapshots.delete_all_for_user(tenant_id=ctx.tenant_id, user_id=ctx.user_id) == 1
+
+
+class _CommitsThenCancelled(InMemoryArtifactStore):
+    """提交已经落库,随后 run 被停 / 撞上时限 —— 调用方收到的是 CancelledError。"""
+
+    async def save_version(self, **kwargs: object) -> ArtifactVersion:  # type: ignore[override]
+        await super().save_version(**kwargs)  # type: ignore[arg-type]
+        raise asyncio.CancelledError
+
+
+@pytest.mark.asyncio
+async def test_a_cancel_after_the_commit_keeps_the_committed_rows_copy() -> None:
+    store = _CommitsThenCancelled()
+    snapshots = _snapshots({_REPORT: b"AAA"})
+    tool = SaveArtifactTool(snapshots=snapshots, store=store, client=_sandbox())
+    ctx = _ctx(agent_key=_ME)
+
+    with pytest.raises(asyncio.CancelledError):
+        await tool.call({"name": "report.txt"}, ctx=ctx)
+
+    latest = await store.get_latest_version(
+        tenant_id=ctx.tenant_id, user_id=ctx.user_id, agent_key=_ME, name="report.txt"
+    )
+    assert latest is not None and latest.snapshot_key is not None
+    content = await snapshots.read(
+        tenant_id=ctx.tenant_id, user_id=ctx.user_id, snapshot_key=latest.snapshot_key
+    )
+    assert content == b"AAA", "行已落库,它的副本却被删了 —— 不带 version 的下载从此 404"
 
 
 class _CountingWorkspace(RecordingWorkspaceStore):

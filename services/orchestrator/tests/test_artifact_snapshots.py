@@ -21,16 +21,19 @@ from orchestrator.tools import artifact_snapshots as snapshots_mod
 from orchestrator.tools import nas_workspace_store as nas_mod
 from orchestrator.tools.artifact_snapshots import (
     MAX_SNAPSHOT_BYTES,
+    ArtifactSnapshotReadError,
     InMemoryArtifactSnapshotStore,
     NasArtifactSnapshotStore,
     SnapshotDigest,
 )
 from orchestrator.tools.nas_workspace_store import NasWorkspaceStore, workspace_user_root
 from orchestrator.tools.sandbox import (
+    SandboxSupervisorError,
     WorkspaceFileChangedError,
     WorkspaceFileNotFoundError,
     WorkspaceFileTooLargeError,
     WorkspacePathEscapeError,
+    WorkspacePermissionError,
 )
 from orchestrator.tools.workspace_store import RecordingWorkspaceStore
 
@@ -124,43 +127,96 @@ async def test_capture_follows_no_symlink(
         await nas.capture(tenant_id=tenant, user_id=user, path=_REL, snapshot_key=str(uuid4()))
 
 
-def _changes_on_reads(monkeypatch: pytest.MonkeyPatch, changed_reads: set[int]) -> None:
-    """让第 N 次 ``read_file(stable=True)`` 看到「读后的 fstat 与读前不同」。
+class _ConcurrentWriter:
+    """另一个写入者在读的过程中改写同一个文件 —— 挂在 ``nas_workspace_store`` 的
+    ``os.fstat`` 上,只作用于目标文件的 fd。
 
-    每次读调两次 ``_identity``(读后、读前各一次);``{1}`` = 第一次读的过程中文件变了,
-    ``{1, 2}`` = 重读时又变了。
+    每次读调两次 fstat(读前 / 读后)。``mode``:
+
+    * ``"rewrite"`` —— 读完、读后那次 fstat 之前,把文件改写成**同样长度**的别的内容并
+      推后 mtime:读到的字节数与读前大小相同,只有读前读后的 fstat 对不上。
+    * ``"append"`` —— 读前那次 fstat 之后立刻往文件末尾追加,读后那次 fstat 却谎报读前
+      的结果:只有「读到的字节数 ≠ 读前大小」这一条能发现。
+
+    ``reads`` 是要动手脚的第几次读(从 1 数)。
     """
-    real = nas_mod._identity
-    calls: list[int] = []
 
-    def fake(info: os.stat_result) -> tuple[int, int, int]:
-        calls.append(1)
-        read_no = (len(calls) + 1) // 2
-        size, mtime_ns, ino = real(info)
-        first_of_pair = len(calls) % 2 == 1
-        if read_no in changed_reads and first_of_pair:
-            return (size, mtime_ns + 7_000_000_000, ino)
-        return (size, mtime_ns, ino)
+    def __init__(self, target: Path, mode: str, reads: set[int]) -> None:
+        self.target = target
+        self.mode = mode
+        self.reads = reads
+        self.calls = 0
+        self._real = os.fstat
+        self._before: os.stat_result | None = None
 
-    monkeypatch.setattr(nas_mod, "_identity", fake)
+    def __call__(self, fd: int) -> os.stat_result:
+        info = self._real(fd)
+        if info.st_ino != self._real_target().st_ino:
+            return info
+        self.calls += 1
+        read_no = (self.calls + 1) // 2
+        is_before = self.calls % 2 == 1
+        if read_no not in self.reads:
+            return info
+        if self.mode == "append" and is_before:
+            self._before = info
+            with self.target.open("ab") as handle:
+                handle.write(b"-more")
+            return info
+        if self.mode == "append":
+            assert self._before is not None
+            return self._before
+        if is_before:
+            return info
+        data = self.target.read_bytes()
+        self.target.write_bytes(bytes(reversed(data)) if len(set(data)) > 1 else b"Z" * len(data))
+        later = info.st_mtime_ns + 5_000_000_000
+        os.utime(self.target, ns=(later, later))
+        return self._real(fd)
+
+    def _real_target(self) -> os.stat_result:
+        return os.stat(self.target)
 
 
-async def test_a_file_that_changes_while_read_is_not_kept(
+def _writer(
+    monkeypatch: pytest.MonkeyPatch, target: Path, mode: str, reads: set[int]
+) -> _ConcurrentWriter:
+    writer = _ConcurrentWriter(target, mode, reads)
+    monkeypatch.setattr(nas_mod.os, "fstat", writer)
+    return writer
+
+
+async def test_a_file_rewritten_while_read_is_not_kept(
     tmp_path: Path,
     nas: NasArtifactSnapshotStore,
     ids: tuple[UUID, UUID],
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """读前读后的 fstat 对不上(另一个写入者写到一半)—— 重读一次仍变 → 报错不存。"""
+    """读的过程中文件被改写(同样长度)、重读一次仍在变 → 报错,不存半截 / 混合的内容。"""
     tenant, user = ids
-    _write(tmp_path, tenant, user, _REL, b"AAA")
-    _changes_on_reads(monkeypatch, {1, 2})
+    source = _write(tmp_path, tenant, user, _REL, b"ABC")
+    _writer(monkeypatch, source, "rewrite", {1, 2})
     key = str(uuid4())
 
     with pytest.raises(WorkspaceFileChangedError):
         await nas.capture(tenant_id=tenant, user_id=user, path=_REL, snapshot_key=key)
 
     assert not (artifact_snapshot_dir(str(tmp_path), tenant, user) / key).exists()
+
+
+async def test_a_file_growing_while_read_is_not_kept(
+    tmp_path: Path,
+    nas: NasArtifactSnapshotStore,
+    ids: tuple[UUID, UUID],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """读的过程中文件变长,而读后的 fstat 看不出来 —— 读到的字节数与读前大小对不上也算变了。"""
+    tenant, user = ids
+    source = _write(tmp_path, tenant, user, _REL, b"ABC")
+    _writer(monkeypatch, source, "append", {1, 2})
+
+    with pytest.raises(WorkspaceFileChangedError):
+        await nas.capture(tenant_id=tenant, user_id=user, path=_REL, snapshot_key=str(uuid4()))
 
 
 async def test_a_change_during_the_first_read_is_retried_once(
@@ -170,12 +226,15 @@ async def test_a_change_during_the_first_read_is_retried_once(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     tenant, user = ids
-    _write(tmp_path, tenant, user, _REL, b"AAA")
-    _changes_on_reads(monkeypatch, {1})
+    source = _write(tmp_path, tenant, user, _REL, b"ABC")
+    writer = _writer(monkeypatch, source, "rewrite", {1})
     key = str(uuid4())
 
     digest = await nas.capture(tenant_id=tenant, user_id=user, path=_REL, snapshot_key=key)
 
+    assert writer.calls == 4, "第一次读发现变了之后应当重读一次"
+    copy = artifact_snapshot_dir(str(tmp_path), tenant, user) / key
+    assert copy.read_bytes() == source.read_bytes() == b"CBA"
     assert digest.size_bytes == 3
 
 
@@ -274,3 +333,80 @@ async def test_in_memory_store_copies_through_the_workspace_store(ids: tuple[UUI
     assert await store.delete_all_for_user(tenant_id=tenant, user_id=user) == 1
     with pytest.raises(WorkspaceFileNotFoundError):
         await store.read(tenant_id=tenant, user_id=user, snapshot_key=key)
+
+
+# ---------------------------------------------------------------- 读副本的错误分类(B-235 L2)
+#
+# 下载端点的翻译梯子只认 ``SandboxSupervisorError`` 家族:读不动(权限)→ 500,别的读失败
+# → 404。裸 ``OSError`` 漏出去就是一个没有信封的 500 + traceback。
+
+
+async def _one_copy(
+    tmp_path: Path, nas: NasArtifactSnapshotStore, tenant: UUID, user: UUID
+) -> Path:
+    _write(tmp_path, tenant, user, _REL, b"AAA")
+    key = str(uuid4())
+    await nas.capture(tenant_id=tenant, user_id=user, path=_REL, snapshot_key=key)
+    return artifact_snapshot_dir(str(tmp_path), tenant, user) / key
+
+
+async def test_an_unreadable_copy_directory_is_a_permission_error(
+    tmp_path: Path, nas: NasArtifactSnapshotStore, ids: tuple[UUID, UUID]
+) -> None:
+    tenant, user = ids
+    copy = await _one_copy(tmp_path, nas, tenant, user)
+    copy.parent.chmod(0o000)
+    try:
+        with pytest.raises(WorkspacePermissionError):
+            await nas.read(tenant_id=tenant, user_id=user, snapshot_key=copy.name)
+    finally:
+        copy.parent.chmod(0o700)
+
+
+async def test_an_unreadable_copy_is_a_permission_error(
+    tmp_path: Path, nas: NasArtifactSnapshotStore, ids: tuple[UUID, UUID]
+) -> None:
+    tenant, user = ids
+    copy = await _one_copy(tmp_path, nas, tenant, user)
+    copy.chmod(0o000)
+    try:
+        with pytest.raises(WorkspacePermissionError):
+            await nas.read(tenant_id=tenant, user_id=user, snapshot_key=copy.name)
+    finally:
+        copy.chmod(0o600)
+
+
+async def test_an_io_error_reading_a_copy_stays_in_the_supervisor_error_family(
+    tmp_path: Path,
+    nas: NasArtifactSnapshotStore,
+    ids: tuple[UUID, UUID],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    tenant, user = ids
+    copy = await _one_copy(tmp_path, nas, tenant, user)
+
+    def broken_fstat(fd: int) -> os.stat_result:
+        raise OSError(5, "Input/output error")
+
+    monkeypatch.setattr(snapshots_mod.os, "fstat", broken_fstat)
+    with pytest.raises(ArtifactSnapshotReadError) as excinfo:
+        await nas.read(tenant_id=tenant, user_id=user, snapshot_key=copy.name)
+    assert isinstance(excinfo.value, SandboxSupervisorError)
+    assert not isinstance(excinfo.value, WorkspaceFileNotFoundError)
+
+
+async def test_an_io_error_opening_the_copy_directory_is_not_called_an_escape(
+    tmp_path: Path,
+    nas: NasArtifactSnapshotStore,
+    ids: tuple[UUID, UUID],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    tenant, user = ids
+    copy = await _one_copy(tmp_path, nas, tenant, user)
+
+    def stale(*_: object, **__: object) -> int:
+        raise OSError(70, "Stale NFS file handle")
+
+    monkeypatch.setattr(snapshots_mod, "_open_user_dir", stale)
+    with pytest.raises(ArtifactSnapshotReadError):
+        await nas.read(tenant_id=tenant, user_id=user, snapshot_key=copy.name)

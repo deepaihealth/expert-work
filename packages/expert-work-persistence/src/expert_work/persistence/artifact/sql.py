@@ -12,6 +12,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from expert_work.persistence.artifact.base import ArtifactStore
 from expert_work.persistence.models import ArtifactRow, ArtifactVersionRow
+from expert_work.persistence.rls import require_rls_bypass
 from expert_work.protocol import Artifact, ArtifactKind, ArtifactVersion
 
 
@@ -274,6 +275,8 @@ class SqlArtifactStore(ArtifactStore):
         paths: Sequence[str],
         excluding_version_ids: Sequence[UUID],
     ) -> set[str]:
+        # 强制 RLS 后没 bypass 的会话拿到空集 =「没人在用」→ 删掉别的版本还在用的文件。
+        require_rls_bypass("ArtifactStore.paths_still_registered")
         if not paths:
             return set()
         stmt = select(ArtifactVersionRow.path_in_workspace).where(
@@ -288,6 +291,8 @@ class SqlArtifactStore(ArtifactStore):
         return set(rows)
 
     async def existing_version_ids(self, ids: Sequence[UUID]) -> set[UUID]:
+        # 强制 RLS 后没 bypass 的会话拿到空集 = 所有副本都是孤儿 → 全删。
+        require_rls_bypass("ArtifactStore.existing_version_ids")
         if not ids:
             return set()
         async with self._sf() as session:

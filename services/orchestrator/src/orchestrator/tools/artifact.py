@@ -21,7 +21,6 @@ endpoint (STREAM-J-DESIGN § 10).
 
 from __future__ import annotations
 
-import contextlib
 import logging
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -268,27 +267,24 @@ class SaveArtifactTool:
         )
         # B-50 PR3 —— ``path_in_workspace`` 带 agent 前缀,与 ``write_file`` 的
         # 落盘位置同一个口径(PR2 时有意暂缓,见 ``_artifact_path``)。
-        try:
-            version = await self.store.save_version(
-                tenant_id=tenant_id,
-                user_id=user_id,
-                agent_key=ctx.agent_key,
-                name=name,
-                kind=kind,
-                path_in_workspace=path_in_workspace,
-                created_in_thread=thread_id,
-                version_id=version_id,
-                snapshot_key=snapshot_key,
-                size_bytes=digest.size_bytes,
-                sha256=digest.sha256,
-            )
-        except BaseException:
-            # 行没落下,副本就没人认领 —— 立刻删;删不掉的由留存作业的孤儿清理兜底。
-            with contextlib.suppress(Exception):
-                await self.snapshots.delete(
-                    tenant_id=tenant_id, user_id=user_id, snapshot_key=snapshot_key
-                )
-            raise
+        #
+        # 登记失败时**不**当场删副本:失败那一刻分不清行到底落没落库 —— 提交已经成功、
+        # 随后 run 被停或撞上时限,收到的照样是 CancelledError,这时删副本就留下一个指着
+        # 空副本的版本(不带 version 的下载一律 404,直到下次登记)。没人认领的副本由留存
+        # 作业的孤儿清理收走(满 24 小时、找不到版本行)。
+        version = await self.store.save_version(
+            tenant_id=tenant_id,
+            user_id=user_id,
+            agent_key=ctx.agent_key,
+            name=name,
+            kind=kind,
+            path_in_workspace=path_in_workspace,
+            created_in_thread=thread_id,
+            version_id=version_id,
+            snapshot_key=snapshot_key,
+            size_bytes=digest.size_bytes,
+            sha256=digest.sha256,
+        )
         # 产物清单契约 —— 登记成功即计入本 run 的清单;created_at 优先取
         # 版本行的落库时间(server_default 场景可能缺席,退回登记时刻)。
         if ctx.artifact_recorder is not None:

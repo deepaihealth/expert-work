@@ -240,7 +240,7 @@
 
 默认上限：文档 25 MiB，图片 10 MiB，实际取值以部署配置为准。处理方式：压缩或裁剪后重传，大文档也可以拆分成多份分别上传。
 
-产物下载（`GET /v1/agents/{agent_code}/artifacts/download`）——Agent 产出的文件超过单文件下载上限（64 MiB）。产物本身还在、也会继续出现在产物列表里，只是这个接口下载不了：
+产物下载（`GET /v1/agents/{agent_code}/artifacts/download`）——Agent 产出的文件超过单文件下载上限（64 MiB）。产物本身还在、也会继续出现在产物列表里，只是这个接口下载不了。超过这个上限的文件 Agent 已经登记不了，所以只有「每个版本单独保留内容」上线之前登记的产物才可能遇到（见 [12 更新记录](./changelog#产物下载可以按版本取)）：
 
 ```json [响应 413]
 { "success": false, "data": null, "error": { "code": "ARTIFACT_TOO_LARGE", "message": "artifact exceeds the download size limit" } }

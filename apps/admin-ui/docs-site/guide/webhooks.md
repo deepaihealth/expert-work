@@ -222,7 +222,7 @@ Webhook 端点（一个接收地址加上它订阅的事件类型）只能由租
 | `artifact_id` | string（UUID） | 平台产物记录的标识。对外接口按产物 `name` 定位，不使用它 |
 | `name` | string | 产物名，与 [5.7 产物](./query#_5-7-产物) 里的 `name` 相同 |
 | `kind` | string | 内容类别，与 [3.4 的 `end`](./sse-events#end) 里产物清单的 `kind` 相同 |
-| `version` | integer | 这次登记的版本号，从 1 起 |
+| `version` | integer | 这次登记的版本号，从 1 起。下载时作为 `version` 参数带上，下载到的就是这一版（[5.7 产物](./query#_5-7-产物)） |
 
 这条通知不带终端用户、会话、run 和 Agent，所以只发给没有限定智能体范围的端点。一轮登记了哪些产物，以 `end` 事件或 5.4 run 列表的 `artifacts` 为准。
 
