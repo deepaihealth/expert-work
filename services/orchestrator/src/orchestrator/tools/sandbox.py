@@ -267,6 +267,16 @@ class WorkspaceFileTooLargeError(SandboxSupervisorError):
     """
 
 
+class WorkspaceFileChangedError(SandboxSupervisorError):
+    """读的过程中文件变了(B-235)—— 读到的字节可能是半截。
+
+    产物副本必须是「登记那一刻的完整文件」。同一用户的另一段会话(或者本 run 里还在
+    后台写的进程)正在写同一个文件时,一次读可能拿到前半截旧的、后半截新的。读之前
+    与读之后各 ``fstat`` 一次,大小 / mtime / inode 任何一项不同就报这个,调用方重读
+    或如实报错,不把半截文件当成一个版本存下来。
+    """
+
+
 class WorkspacePathEscapeError(SandboxSupervisorError):
     """路径本身不合法 —— 绝对路径、带 ``..``、带 NUL、或者踩了布局保留段(B-84)。
 

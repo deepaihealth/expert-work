@@ -261,15 +261,20 @@ export async function archiveSession(threadId: string): Promise<void> {
  *  B-50 —— 对话/试运行面手里只有产物名(它是从 SSE 事件里推出来的,没有行 id)。
  *  但一个会话只属于一个 agent,所以「这个会话的 X」是唯一的:走会话作用域端点,
  *  后端用 ``thread_meta.agent_name`` 收口。控制台的跨 agent 浏览面则相反 ——
- *  它有列表行,走 ``downloadArtifact(artifactId, …)``。 */
+ *  它有列表行,走 ``downloadArtifact(artifactId, …)``。
+ *
+ *  B-235 —— ``version`` 是这一轮登记的版本号:给了就下那一版(同名产物之后被别的会话重
+ *  登记过也不受影响)。那一版登记在逐版留存上线之前、又已不是最新版时,后端回 409。 */
 export async function downloadSessionArtifact(
   threadId: string,
   name: string,
   tenantScope?: TenantScope,
+  version?: number,
 ): Promise<string> {
+  const params: Record<string, unknown> = version === undefined ? {} : { version };
   const response = await apiClient.get<Blob>(
     `/v1/sessions/${encodeURIComponent(threadId)}/workspace/artifacts/${encodeURIComponent(name)}/download`,
-    { params: withTenantScope({}, tenantScope), responseType: "blob" },
+    { params: withTenantScope(params, tenantScope), responseType: "blob" },
   );
   const disposition = (response.headers as Record<string, string | undefined>)[
     "content-disposition"

@@ -7,7 +7,8 @@ billing / analytics:
 
 * **HARD-DELETE** (high PII) — the user's threads (checkpoint + runs + meta;
   ``thread_message`` cascades), long-term memory, memory-writeback DLQ,
-  artifacts (+ versions), MCP OAuth connections, agent-instance bindings,
+  artifacts (+ versions, + each version's copy of its bytes — B-235), MCP OAuth
+  connections, agent-instance bindings,
   approvals, triggers (+ their runs), webhook endpoints (+ their deliveries),
   image uploads, volume-backup DLQ, the knowledge retrieval logs (B-175
   P2-PR4: every search in the user's conversations whoever's run made it, their
@@ -67,6 +68,7 @@ from expert_work.runtime.runs import RunStore
 from expert_work.runtime.runs.store import MAX_LIST_LIMIT
 from expert_work.runtime.storage import ObjectStore
 from orchestrator.tools import WorkspaceStore
+from orchestrator.tools.artifact_snapshots import ArtifactSnapshotStore
 
 logger = logging.getLogger("expert_work.control_plane.purge.user")
 
@@ -125,6 +127,9 @@ class PurgeUserDeps:
     #: ``None`` in deployments without a wired supervisor — the workspace step
     #: is then skipped + flagged (mirrors ``sessions.py`` supervisor optionality).
     workspace_store: WorkspaceStore | None
+    #: B-235 —— 产物各版本登记时留下的字节副本。``None`` = 这个部署没有工作区,也就
+    #: 不会有副本。
+    artifact_snapshots: ArtifactSnapshotStore | None = None
 
 
 @dataclass
@@ -460,6 +465,15 @@ async def purge_user(
         deps.memory_dlq.delete_all_for_user(tenant_id=tenant_id, user_id=user_id),
         default=0,
     )
+    # B-235 —— 先删副本再删登记行(同图片:没删掉的副本由留存作业的孤儿清理按「找不到
+    # 版本行」兜底,反过来卡住的登记行没人兜)。
+    if deps.artifact_snapshots is not None:
+        summary.deleted["artifact_snapshot"] = await _step(
+            summary,
+            "artifact_snapshot",
+            deps.artifact_snapshots.delete_all_for_user(tenant_id=tenant_id, user_id=user_id),
+            default=0,
+        )
     summary.deleted["artifact"] = await _step(
         summary,
         "artifact",

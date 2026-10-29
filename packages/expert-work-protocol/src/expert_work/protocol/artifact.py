@@ -34,11 +34,22 @@ class ArtifactVersion(BaseModel):
         description="path of the file inside the user's persistent workspace volume"
     )
     size_bytes: int | None = Field(
-        default=None, ge=0, description="filled lazily on first content read"
+        default=None,
+        ge=0,
+        description=(
+            "computed when the snapshot is taken (B-235); for a version registered "
+            "before snapshots existed, filled lazily on first content read"
+        ),
     )
-    sha256: str | None = Field(default=None, description="filled lazily on first content read")
+    sha256: str | None = Field(
+        default=None, description="same timing as size_bytes — eager with a snapshot, else lazy"
+    )
     created_in_thread: str = Field(description="the thread/run that produced this revision")
     created_at: datetime | None = None
+    #: B-235 —— 这一版字节的副本键(登记那一刻复制的,与工作区里那个文件此后怎么变无关)。
+    #: ``None`` = B-235 之前登记的版本:没有副本,内容只能从 ``path_in_workspace`` 读,
+    #: 而那个文件可能已被后来的同名登记覆盖。
+    snapshot_key: str | None = None
 
 
 class Artifact(BaseModel):

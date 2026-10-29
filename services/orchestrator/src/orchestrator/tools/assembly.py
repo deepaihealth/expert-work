@@ -41,6 +41,7 @@ from orchestrator.multimodal import ImageResolver
 from orchestrator.tools.approval import AskForApprovalTool
 from orchestrator.tools.arg_bindings import bindings_by_tool
 from orchestrator.tools.artifact import ListArtifactsTool, SaveArtifactTool
+from orchestrator.tools.artifact_snapshots import ArtifactSnapshotStore
 from orchestrator.tools.bash import BashTool
 from orchestrator.tools.file_ops import (
     EditFileTool,
@@ -167,6 +168,9 @@ class ToolEnv:
     #: Artifact registry backing the ``save_artifact`` / ``list_artifacts``
     #: builtins (Stream J.9).
     artifact_store: ArtifactStore | None = None
+    #: B-235 —— ``save_artifact`` 每次登记复制一份那一刻的字节到这里。``None`` 时
+    #: ``save_artifact`` 不注册(显式声明则报错),与 ``sandbox_runtime`` 同款处置。
+    artifact_snapshots: ArtifactSnapshotStore | None = None
     #: Resolves an ``agent_ref`` and builds the referenced sub-agent —
     #: backs the ``SubAgentTool``\\s a manifest's ``spec.subagents``
     #: block declares (Stream J.4). Injected by the control-plane, which
@@ -621,7 +625,19 @@ def _register_builtin(
                 "builtin 'save_artifact' declared but no sandbox runtime "
                 "is configured (ToolEnv.sandbox_runtime)"
             )
-        registry.register(SaveArtifactTool(store=artifact_store, client=env.sandbox_runtime))
+        # B-235 —— 每次登记都要留一份那一刻的字节;没有副本存储就登记不了。
+        if env.artifact_snapshots is None:
+            raise AgentFactoryError(
+                "builtin 'save_artifact' declared but no artifact snapshot store "
+                "is configured (ToolEnv.artifact_snapshots)"
+            )
+        registry.register(
+            SaveArtifactTool(
+                store=artifact_store,
+                client=env.sandbox_runtime,
+                snapshots=env.artifact_snapshots,
+            )
+        )
     elif entry.name == "list_artifacts":
         registry.register(ListArtifactsTool(store=_require_artifact_store(env, "list_artifacts")))
     elif entry.name == "ask_for_approval":
@@ -698,7 +714,9 @@ def _register_base_capabilities(
             # ``save_artifact`` 现在多一条依赖:登记前要 stat 工作区里的文件,
             # 所以没有沙箱通道它注册了也只会造出下载 404 的死产物。
             # ``list_artifacts`` 只读库,不受影响。
-            if name == "save_artifact" and env.sandbox_runtime is None:
+            if name == "save_artifact" and (
+                env.sandbox_runtime is None or env.artifact_snapshots is None
+            ):
                 continue
         elif name in _HOST_READ_TOOLS:
             # B-84 —— 这三件的依赖是工作区存储, 不是沙箱。

@@ -217,6 +217,7 @@ async def _amain() -> None:
             "event=%d jwt=%d image_rows=%d image_keys_ok=%d image_keys_failed=%d "
             "artifact_soft=%d artifact_hard=%d "
             "artifact_versions_deleted=%d artifact_files_removed=%d artifacts_expired=%d "
+            "orphan_artifact_copies_removed=%d "
             "uploads_expired=%d upload_files_removed=%d thread_dirs_removed=%d "
             "memory_hard_deleted=%d workspaces_hard_deleted=%d "
             "workspaces_pending_archive=%d tenant_users_hard_deleted=%d "
@@ -234,6 +235,7 @@ async def _amain() -> None:
             report.artifact_versions_deleted,
             report.artifact_files_removed,
             report.artifacts_expired,
+            report.orphan_artifact_copies_removed,
             report.uploads_expired,
             report.upload_files_removed,
             report.thread_dirs_removed,

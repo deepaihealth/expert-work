@@ -63,6 +63,9 @@ export interface ToolCallEntry {
   /** B-206 K-7b —— 这次没用库的重排分数下限:它是在另一个重排模型下标定的
    *  (``artifact.rerank_threshold_paused``)。 */
   rerankThresholdPaused?: true;
+  /** B-235 —— ``save_artifact`` 这次登记出的版本号(``artifact.version``)。下载按它取
+   *  「这一轮登记的那一版」,不是最新版。其它工具没有这个字段。 */
+  savedVersion?: number;
 }
 
 const MCP_PREFIX = "mcp__";
@@ -272,6 +275,15 @@ export function parseToolCalls(
               entry.vlUsage = { input: u.input_tokens, output: u.output_tokens };
             }
           }
+          const saved = rec.version;
+          if (
+            entry.toolName === "save_artifact" &&
+            typeof saved === "number" &&
+            Number.isInteger(saved) &&
+            saved >= 1
+          ) {
+            entry.savedVersion = saved;
+          }
           const rerank = rerankFallbackOf(rec.rerank_outcome);
           if (rerank !== null) entry.rerankOutcome = rerank;
           if (rec.rerank_threshold_paused === true) entry.rerankThresholdPaused = true;
@@ -371,6 +383,15 @@ export function skillsFromTools(events: readonly SseEvent[]): TurnSkill[] {
 export interface TurnArtifact {
   name: string;
   kind: string;
+  /** B-235 —— 这一轮登记的版本号。有它就按版本下载(同名产物后来被别的会话重登记过,也
+   *  拿得到这一轮的那一版);缺席(很老的回放)时下载最新版。 */
+  version?: number;
+}
+
+function withVersion(base: { name: string; kind: string }, version: unknown): TurnArtifact {
+  return typeof version === "number" && Number.isInteger(version) && version >= 1
+    ? { ...base, version }
+    : base;
 }
 
 /** Artifacts registered via a successful ``save_artifact`` call in this turn's
@@ -382,7 +403,7 @@ export function artifactsFromTools(events: readonly SseEvent[]): TurnArtifact[] 
     const name = typeof entry.args.name === "string" ? entry.args.name.trim() : "";
     if (name === "") continue;
     const kind = typeof entry.args.kind === "string" ? entry.args.kind : "other";
-    byName.set(name, { name, kind });
+    byName.set(name, withVersion({ name, kind }, entry.savedVersion));
   }
   return [...byName.values()];
 }
@@ -404,11 +425,11 @@ export function turnArtifacts(events: readonly SseEvent[]): TurnArtifact[] {
     const raw = (e.data as { artifacts?: unknown } | null)?.artifacts;
     if (!Array.isArray(raw)) continue;
     for (const entry of raw) {
-      const item = entry as { name?: unknown; kind?: unknown } | null;
+      const item = entry as { name?: unknown; kind?: unknown; version?: unknown } | null;
       const name = typeof item?.name === "string" ? item.name.trim() : "";
       if (name === "") continue;
       const kind = typeof item?.kind === "string" ? item.kind : "other";
-      byName.set(name, { name, kind });
+      byName.set(name, withVersion({ name, kind }, item?.version));
     }
   }
   return [...byName.values()];

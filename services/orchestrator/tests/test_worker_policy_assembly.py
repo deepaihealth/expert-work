@@ -46,6 +46,7 @@ async def _env(*, worker: bool) -> ToolEnv:
     env = ToolEnv(
         sandbox_runtime=Mock(),
         artifact_store=Mock(),
+        artifact_snapshots=Mock(),
         workspace_store=Mock(),
         allowlist_provider=_allow_all,
         mcp_pool=pool,
@@ -128,6 +129,7 @@ async def test_worker_build_keeps_a_fixed_value_on_a_read_tool() -> None:
         ToolEnv(
             sandbox_runtime=Mock(),
             artifact_store=Mock(),
+            artifact_snapshots=Mock(),
             workspace_store=Mock(),
             allowlist_provider=_allow_all,
             mcp_pool=pool,

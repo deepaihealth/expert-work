@@ -335,6 +335,7 @@ def _build_purge_deps(request: Request) -> PurgeUserDeps:
         tenant_users=state.tenant_user_repo,
         audit=state.audit_logger,
         workspace_store=getattr(state, "workspace_store", None),
+        artifact_snapshots=getattr(state, "artifact_snapshots", None),
     )
 
 

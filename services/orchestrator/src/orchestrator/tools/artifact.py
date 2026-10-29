@@ -8,30 +8,49 @@ artifacts back. Both are tenant- *and* user-scoped — an artifact
 belongs to a ``(tenant, user)`` pair, so a run with no user binding
 cannot use them.
 
-The file *content* stays in the J.15 workspace volume. ``save_artifact``
-**stats the file before registering it** — the row it writes is only a
-*description* of the file, and the download endpoint is the only other
-place that ever touches the real one, so an unverified row surfaces as a
-listed-but-404 artifact. Content download is a control-plane endpoint
-(STREAM-J-DESIGN § 10).
+``save_artifact`` **stats the file before registering it**, then (B-235)
+**copies its bytes at that moment** into a per-version snapshot outside the
+sandbox's reach (:mod:`orchestrator.tools.artifact_snapshots`) and records the
+copy's key, size and sha256 on the version row. Before B-235 the row only
+pointed at the workspace path: two saves of the same name pointed at the same
+file, so a later save silently replaced every earlier version's content. No
+copy, no row — a registration whose content cannot be served later is worse
+than an error the model can act on. Content download is a control-plane
+endpoint (STREAM-J-DESIGN § 10).
 """
 
 from __future__ import annotations
 
+import contextlib
+import logging
 from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import PurePosixPath
 from typing import Any, get_args
-from uuid import UUID
+from uuid import UUID, uuid4
 
 from expert_work.persistence import ArtifactStore
 from expert_work.protocol import ArtifactKind
+from orchestrator.tools.artifact_snapshots import (
+    MAX_SNAPSHOT_BYTES,
+    ArtifactSnapshotStore,
+    SnapshotDigest,
+)
 from orchestrator.tools.file_ops import FileOpError, build_artifact_locate_wrapper, parse_envelope
 from orchestrator.tools.registry import ToolBlockedError, ToolContext, ToolResult, ToolSpec
-from orchestrator.tools.sandbox import SandboxRuntime, run_in_sandbox
+from orchestrator.tools.sandbox import (
+    SandboxRuntime,
+    SandboxSupervisorError,
+    WorkspaceFileChangedError,
+    WorkspaceFileTooLargeError,
+    WorkspacePathEscapeError,
+    run_in_sandbox,
+)
 from orchestrator.tools.sandbox_image_contract import EXEC_VIEW
 from orchestrator.tools.workspace_paths import AGENTS_DIR, SHARED_PREFIX, agent_view_alias
+
+logger = logging.getLogger(__name__)
 
 #: The artifact kinds the manifest's ``ArtifactKind`` literal allows.
 _ARTIFACT_KINDS: tuple[str, ...] = get_args(ArtifactKind)
@@ -174,6 +193,9 @@ class SaveArtifactTool:
     #: 可选开关的话,漏传的调用点会静默退回「不校验」,而那正是这条修复要堵的
     #: 洞(平台缺口改默认,不要设计成让人去配)。
     client: SandboxRuntime
+    #: B-235 —— 每次登记都复制一份那一刻的字节。同样**必填**:没有它就退回「只记路径」,
+    #: 那正是同名登记互相覆盖的洞。
+    snapshots: ArtifactSnapshotStore
 
     @property
     def spec(self) -> ToolSpec:
@@ -232,17 +254,41 @@ class SaveArtifactTool:
         # 视图,这条 stat 只确认文件真的在那儿 —— 不在就是没写,不再去别处找。
         await self._locate_file(rel, ctx=ctx)
 
-        # B-50 PR3 —— ``path_in_workspace`` 带 agent 前缀,与 ``write_file`` 的
-        # 落盘位置同一个口径(PR2 时有意暂缓,见 ``_artifact_path``)。
-        version = await self.store.save_version(
+        # B-235 —— 先复制,再登记。副本以这里生成的版本行 id 命名,同一个 id 原样交给
+        # ``save_version``:副本与版本行在这一次调用里配对,两段会话并发登记同名时,
+        # 版本号由库里的原子 upsert 分配,但谁的副本归谁的行不会串。
+        version_id = uuid4()
+        snapshot_key = str(version_id)
+        digest = await self._capture(
             tenant_id=tenant_id,
             user_id=user_id,
-            agent_key=ctx.agent_key,
-            name=name,
-            kind=kind,
+            rel=rel,
             path_in_workspace=path_in_workspace,
-            created_in_thread=thread_id,
+            snapshot_key=snapshot_key,
         )
+        # B-50 PR3 —— ``path_in_workspace`` 带 agent 前缀,与 ``write_file`` 的
+        # 落盘位置同一个口径(PR2 时有意暂缓,见 ``_artifact_path``)。
+        try:
+            version = await self.store.save_version(
+                tenant_id=tenant_id,
+                user_id=user_id,
+                agent_key=ctx.agent_key,
+                name=name,
+                kind=kind,
+                path_in_workspace=path_in_workspace,
+                created_in_thread=thread_id,
+                version_id=version_id,
+                snapshot_key=snapshot_key,
+                size_bytes=digest.size_bytes,
+                sha256=digest.sha256,
+            )
+        except BaseException:
+            # 行没落下,副本就没人认领 —— 立刻删;删不掉的由留存作业的孤儿清理兜底。
+            with contextlib.suppress(Exception):
+                await self.snapshots.delete(
+                    tenant_id=tenant_id, user_id=user_id, snapshot_key=snapshot_key
+                )
+            raise
         # 产物清单契约 —— 登记成功即计入本 run 的清单;created_at 优先取
         # 版本行的落库时间(server_default 场景可能缺席,退回登记时刻)。
         if ctx.artifact_recorder is not None:
@@ -264,6 +310,48 @@ class SaveArtifactTool:
             ),
             meta={"artifact": name, "version": version.version, "kind": kind},
         )
+
+    async def _capture(
+        self,
+        *,
+        tenant_id: UUID,
+        user_id: UUID,
+        rel: str,
+        path_in_workspace: str,
+        snapshot_key: str,
+    ) -> SnapshotDigest:
+        """复制那一刻的字节;复制不成就是工具错误,什么都不登记。"""
+        try:
+            return await self.snapshots.capture(
+                tenant_id=tenant_id,
+                user_id=user_id,
+                path=path_in_workspace,
+                snapshot_key=snapshot_key,
+            )
+        except WorkspacePathEscapeError as exc:
+            msg = f"save_artifact denied: {rel!r} escapes the workspace"
+            raise ToolBlockedError(msg) from exc
+        except WorkspaceFileTooLargeError as exc:
+            limit_mib = MAX_SNAPSHOT_BYTES // (1024 * 1024)
+            msg = (
+                f"save_artifact: {rel!r} is larger than the {limit_mib} MiB artifact limit — "
+                "nothing was registered. Make the file smaller (compress it, or split it into "
+                "several artifacts) and save again."
+            )
+            raise FileOpError(msg) from exc
+        except WorkspaceFileChangedError as exc:
+            msg = (
+                f"save_artifact: {rel!r} changed while it was being saved — nothing was "
+                "registered. Make sure nothing is still writing the file, then save again."
+            )
+            raise FileOpError(msg) from exc
+        except (SandboxSupervisorError, OSError) as exc:
+            logger.warning("save_artifact.snapshot_failed rel=%s", rel, exc_info=True)
+            msg = (
+                f"save_artifact: could not keep a copy of {rel!r} — nothing was registered. "
+                "Check that the file exists, then save again."
+            )
+            raise FileOpError(msg) from exc
 
     async def _locate_file(self, rel: str, *, ctx: ToolContext) -> None:
         """Confirm ``rel`` exists where the registration row will point, or raise.

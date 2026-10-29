@@ -169,6 +169,7 @@ from expert_work.persistence import (
 )
 from orchestrator.tools.sandbox import (
     SandboxSupervisorError,
+    WorkspaceFileChangedError,
     WorkspaceFileNotFoundError,
     WorkspaceFileTooLargeError,
     WorkspaceNotADirectoryError,
@@ -264,6 +265,11 @@ class _WorkspacePathNotFoundError(SandboxSupervisorError):
     propagate). Every other caller doesn't need to tell the two apart — this
     is still an ordinary :class:`SandboxSupervisorError` to them.
     """
+
+
+def _identity(info: os.stat_result) -> tuple[int, int, int]:
+    """``read_file(stable=True)`` 用来判「读的过程中文件变没变」的三项:大小 / mtime / inode。"""
+    return (info.st_size, info.st_mtime_ns, info.st_ino)
 
 
 def _openat_dir(dfd: int, name: str, *, create: bool) -> int:
@@ -738,7 +744,13 @@ class NasWorkspaceStore:
         path: str,
         scope: str = SCOPE_USER_ROOT,
         max_bytes: int | None = None,
+        stable: bool = False,
     ) -> bytes:
+        """``stable=True``(B-235,只在本实现上,不进 Protocol)—— 读完再 ``fstat`` 一次,
+        与读之前的大小 / mtime / inode 对不上、或读到的字节数不等于读前的大小,就抛
+        :class:`WorkspaceFileChangedError`:产物副本不能是别的写入者写到一半的文件。
+        """
+
         def _read() -> bytes:
             rel = scoped_path(scope, path)
             cap = _MAX_READ_BYTES if max_bytes is None else min(_MAX_READ_BYTES, max_bytes)
@@ -779,9 +791,10 @@ class NasWorkspaceStore:
                 # loaded into memory — the NFS mount has no equivalent to
                 # the supervisor's bounded ``head -c`` subprocess trick.
                 try:
-                    size = os.fstat(handle.fileno()).st_size
+                    before = os.fstat(handle.fileno())
                 except OSError as exc:
                     raise WorkspaceFileNotFoundError(f"workspace file not found: {path!r}") from exc
+                size = before.st_size
                 if size > cap:
                     # 「太大」≠「不存在」—— 窄类型让下载端点能回 413 而不是把
                     # 一个明明列在产物列表里的文件谎报成 404(同
@@ -789,7 +802,7 @@ class NasWorkspaceStore:
                     msg = f"workspace file {path!r} exceeds the {cap}-byte read cap"
                     raise WorkspaceFileTooLargeError(msg)
                 try:
-                    return handle.read()
+                    data = handle.read()
                 except IsADirectoryError as exc:
                     # B-84 —— "它是个目录"不是"它不存在":模型的下一步动作不同
                     # (换个路径 vs 改用 list_dir), 沙箱片段一直把这两件事分成
@@ -798,6 +811,12 @@ class NasWorkspaceStore:
                     raise WorkspaceNotAFileError(f"workspace path is not a file: {path!r}") from exc
                 except OSError as exc:
                     raise WorkspaceFileNotFoundError(f"workspace file not found: {path!r}") from exc
+                if stable:
+                    after = os.fstat(handle.fileno())
+                    if len(data) != size or _identity(after) != _identity(before):
+                        msg = f"workspace file {path!r} changed while it was being read"
+                        raise WorkspaceFileChangedError(msg)
+                return data
 
         return await asyncio.to_thread(_read)
 

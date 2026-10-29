@@ -51,8 +51,17 @@ class ArtifactStore(abc.ABC):
         kind: ArtifactKind,
         path_in_workspace: str,
         created_in_thread: str,
+        version_id: UUID | None = None,
+        snapshot_key: str | None = None,
+        size_bytes: int | None = None,
+        sha256: str | None = None,
     ) -> ArtifactVersion:
         """Register a new version of ``(agent_key, name)``.
+
+        B-235 —— ``save_artifact`` 先把字节复制成副本(以它自己生成的 ``version_id``
+        命名),再带着 ``version_id`` / ``snapshot_key`` / ``size_bytes`` / ``sha256``
+        调这里:副本与版本行在同一次调用里配对,版本号怎么分配都串不了。四个都缺省
+        = B-235 之前的写法(没有副本,行 id 由 store 生成),只剩评测与测试在用。
 
         ``agent_key`` 空串 = 没绑 agent 的调用方(合成执行路径)。它与任何
         非空 key 都是不同的身份,不会跟谁合并。
@@ -124,6 +133,56 @@ class ArtifactStore(abc.ABC):
         约束 —— id 是 UUID 不等于可以跨用户取。``None`` = 未知 / 已软删 /
         跨用户(调用方一律转 404,与 :meth:`get_latest_version` 同一套隐藏规则)。
         """
+
+    @abc.abstractmethod
+    async def get_version(
+        self,
+        *,
+        tenant_id: UUID,
+        user_id: UUID,
+        agent_key: str | None,
+        name: str,
+        version: int,
+    ) -> ArtifactVersion | None:
+        """B-235 —— ``(agent_key, name)`` 的第 ``version`` 版,不是最新版。
+
+        对话页按「这一轮登记的那一版」下载、对外接口按清单里的版本号取,都走这里。
+        隐藏规则与 :meth:`get_latest_version` 相同:未知 / 已软删 / 跨用户 / 跨
+        agent 一律 ``None``。``agent_key=None`` 时同名多行取 ``updated_at`` 最新的。
+        """
+
+    @abc.abstractmethod
+    async def get_version_by_id(
+        self, *, tenant_id: UUID, user_id: UUID, artifact_id: UUID, version: int
+    ) -> ArtifactVersion | None:
+        """B-235 —— 控制台全量视图按 ``artifact_id`` 取第 ``version`` 版。
+
+        隐藏规则同 :meth:`get_latest_version_by_id`。
+        """
+
+    @abc.abstractmethod
+    async def paths_still_registered(
+        self,
+        *,
+        tenant_id: UUID,
+        user_id: UUID,
+        paths: Sequence[str],
+        excluding_version_ids: Sequence[UUID],
+    ) -> set[str]:
+        """B-235 —— ``paths`` 里哪些还被**别的**版本行指着(``excluding_version_ids``
+        之外的、同一 ``(tenant, user)`` 的)。
+
+        留存作业删一个到期版本时据此决定要不要 unlink 工作区文件:同名重登记的
+        各版本指着同一个路径,老版本到期时新版本还在用那个文件。不看父行是否软删
+        —— 软删的产物在硬删宽限期内仍可能被重登记恢复。Caller MUST be inside an
+        RLS bypass scope (the retention job)."""
+
+    @abc.abstractmethod
+    async def existing_version_ids(self, ids: Sequence[UUID]) -> set[UUID]:
+        """B-235 —— ``ids`` 里哪些还有版本行。
+
+        孤儿副本清理用:副本以版本行 id 命名,找不到行的副本就是没人认领的字节。
+        Caller MUST be inside an RLS bypass scope (the retention job)."""
 
     @abc.abstractmethod
     async def soft_delete_by_id(

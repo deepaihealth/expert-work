@@ -11,7 +11,16 @@ from __future__ import annotations
 from datetime import datetime
 from uuid import UUID
 
-from sqlalchemy import BigInteger, DateTime, Integer, Text, UniqueConstraint, func, text
+from sqlalchemy import (
+    BigInteger,
+    CheckConstraint,
+    DateTime,
+    Integer,
+    Text,
+    UniqueConstraint,
+    func,
+    text,
+)
 from sqlalchemy.dialects.postgresql import UUID as PG_UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -89,14 +98,22 @@ class ArtifactVersionRow(Base):
     version: Mapped[int] = mapped_column(Integer, nullable=False)
     #: Path of the file inside the user's persistent workspace volume.
     path_in_workspace: Mapped[str] = mapped_column(Text, nullable=False)
-    #: Filled lazily on the first content read — NULL until then.
+    #: B-235 —— computed when the snapshot is taken; NULL only on versions
+    #: registered before snapshots existed (filled lazily on their first read).
     size_bytes: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
     sha256: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_in_thread: Mapped[str] = mapped_column(Text, nullable=False)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )
+    #: B-235 —— 这一版字节的副本键(迁移 ``0180``)。NULL = B-235 之前登记的版本,
+    #: 内容只能从 ``path_in_workspace`` 读。
+    snapshot_key: Mapped[str | None] = mapped_column(Text, nullable=True)
 
     __table_args__ = (
         UniqueConstraint("artifact_id", "version", name="artifact_version_identity_uniq"),
+        CheckConstraint(
+            "snapshot_key IS NULL OR (size_bytes IS NOT NULL AND sha256 IS NOT NULL)",
+            name="artifact_version_snapshot_digest",
+        ),
     )

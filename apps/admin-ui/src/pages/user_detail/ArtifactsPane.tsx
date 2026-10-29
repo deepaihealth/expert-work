@@ -59,6 +59,7 @@ export function ArtifactsPane({ userId }: { userId: string }) {
   const [error, setError] = useState<string | null>(null);
   const [busyName, setBusyName] = useState<string | null>(null);
   const [versionsFor, setVersionsFor] = useState<string | null>(null);
+  const [versionsArtifactId, setVersionsArtifactId] = useState<string | null>(null);
   const [versions, setVersions] = useState<ArtifactVersion[]>([]);
   const [versionsLoading, setVersionsLoading] = useState(false);
 
@@ -130,6 +131,7 @@ export function ArtifactsPane({ userId }: { userId: string }) {
   const openVersions = useCallback(
     async (artifactId: string, name: string) => {
       setVersionsFor(name);
+      setVersionsArtifactId(artifactId);
       setVersionsLoading(true);
       try {
         const result = await listArtifactVersions(artifactId, userId);
@@ -142,6 +144,25 @@ export function ArtifactsPane({ userId }: { userId: string }) {
       }
     },
     [message, userId],
+  );
+
+  // B-235 —— 逐版下载。留了副本的版本都能单独下;逐版留存上线前登记的只有最新那一版
+  // 下得到(读工作区文件),更早的内容已被后来的同名登记覆盖。
+  const [busyVersion, setBusyVersion] = useState<number | null>(null);
+  const latestShown = versions.reduce((max, v) => Math.max(max, v.version), 0);
+  const handleVersionDownload = useCallback(
+    async (version: number) => {
+      if (versionsArtifactId === null || versionsFor === null) return;
+      setBusyVersion(version);
+      try {
+        await downloadArtifact(versionsArtifactId, versionsFor, userId, undefined, version);
+      } catch (err) {
+        message.error(t("artifacts_page.download_failed", { detail: errMessage(err) }));
+      } finally {
+        setBusyVersion(null);
+      }
+    },
+    [versionsArtifactId, versionsFor, userId, message, t],
   );
 
   const columns: TableColumnsType<ArtifactListItem> = useMemo(
@@ -285,8 +306,28 @@ export function ArtifactsPane({ userId }: { userId: string }) {
             <Text type="secondary">—</Text>
           ),
       },
+      {
+        title: t("artifacts_page.ver_col_download"),
+        key: "download",
+        width: 110,
+        render: (_: unknown, v: ArtifactVersion) =>
+          v.retained || v.version === latestShown ? (
+            <Button
+              size="small"
+              icon={<Download size={13} strokeWidth={1.5} />}
+              loading={busyVersion === v.version}
+              onClick={() => void handleVersionDownload(v.version)}
+              aria-label={`${t("artifacts_page.download")} v${v.version}`}
+              data-testid={`artifact-version-download-${v.version}`}
+            />
+          ) : (
+            <Text type="secondary" style={{ fontSize: 12 }}>
+              {t("artifacts_page.ver_not_kept")}
+            </Text>
+          ),
+      },
     ],
-    [t],
+    [t, latestShown, busyVersion, handleVersionDownload],
   );
 
   return (
@@ -315,7 +356,7 @@ export function ArtifactsPane({ userId }: { userId: string }) {
         title={t("artifacts_page.versions_title", { name: versionsFor ?? "" })}
         open={versionsFor !== null}
         onClose={() => setVersionsFor(null)}
-        width={720}
+        width={820}
         data-testid="artifact-versions-drawer"
       >
         <Table<ArtifactVersion>

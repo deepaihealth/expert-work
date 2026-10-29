@@ -61,6 +61,7 @@ from expert_work.runtime.runs import (
     RunStatus,
 )
 from expert_work.runtime.storage import InMemoryObjectStore, ObjectNotFoundError
+from orchestrator.tools.artifact_snapshots import InMemoryArtifactSnapshotStore
 from orchestrator.tools.workspace_store import RecordingWorkspaceStore
 from tests.auth_fixtures import (
     TEST_AUDIENCE,
@@ -1388,3 +1389,90 @@ async def test_the_second_conversation_pass_is_best_effort() -> None:
     assert (summary.failures, summary.skipped) == ({}, [])
     assert summary.threads_purged == 1
     assert await world.left() == world.kept
+
+
+# ---------------------------------------------------------------------------
+# B-235 —— 产物版本副本随清除用户一起删(副本先删、再删登记行,同图片的取舍:
+# 没删掉的副本由留存作业的孤儿清理兜底,卡住的登记行没人兜)。
+# ---------------------------------------------------------------------------
+
+
+class _BrokenCopies(InMemoryArtifactSnapshotStore):
+    async def delete_all_for_user(self, *, tenant_id: UUID, user_id: UUID) -> int:
+        raise OSError(5, "nas hiccup")
+
+
+async def _copy(store: InMemoryArtifactSnapshotStore, tenant: UUID, user: UUID) -> None:
+    await store.capture(tenant_id=tenant, user_id=user, path="a.txt", snapshot_key=str(uuid4()))
+
+
+@pytest.mark.asyncio
+async def test_purge_user_deletes_the_users_artifact_copies_only() -> None:
+    world = _LogWorld()
+    a = await world.seed()
+    other = uuid4()
+    copies = InMemoryArtifactSnapshotStore(workspace=RecordingWorkspaceStore(workspace_file=b"x"))
+    await _copy(copies, world.t1, a)
+    await _copy(copies, world.t1, a)
+    await _copy(copies, world.t1, other)
+
+    summary = await purge_user(
+        tenant_id=world.t1,
+        user_id=a,
+        subject_id="subj-a",
+        deps=replace(world.deps(), artifact_snapshots=copies),
+        actor_id="admin",
+    )
+
+    assert summary.deleted["artifact_snapshot"] == 2
+    assert "artifact_snapshot" not in summary.failures
+    assert await copies.delete_all_for_user(tenant_id=world.t1, user_id=a) == 0
+    assert await copies.delete_all_for_user(tenant_id=world.t1, user_id=other) == 1
+
+
+@pytest.mark.asyncio
+async def test_a_copy_deletion_failure_is_recorded_and_rows_still_go() -> None:
+    world = _LogWorld()
+    a = await world.seed()
+    deps = replace(
+        world.deps(),
+        artifact_snapshots=_BrokenCopies(workspace=RecordingWorkspaceStore()),
+    )
+    await deps.artifacts.save_version(
+        tenant_id=world.t1,
+        user_id=a,
+        agent_key="k",
+        name="r.txt",
+        kind="document",
+        path_in_workspace="r.txt",
+        created_in_thread="t",
+    )
+
+    summary = await purge_user(
+        tenant_id=world.t1, user_id=a, subject_id="subj-a", deps=deps, actor_id="admin"
+    )
+
+    assert "artifact_snapshot" in summary.failures
+    assert summary.deleted["artifact"] == 1
+
+
+def test_the_purge_endpoint_wires_the_artifact_copy_store() -> None:
+    """生产唯一的装配点要把副本存储接进清除流程 —— 漏接就是静默不删。"""
+    from control_plane.api.agent_users import _build_purge_deps
+
+    app = create_app(
+        settings=Settings(
+            env="dev",
+            auth_mode="dev",
+            oidc_issuer=TEST_ISSUER,
+            oidc_audience=[TEST_AUDIENCE],
+        ),
+        audit_logger=build_default_audit_logger(InMemoryAuditLogStore()),
+        jwt_verifier=build_test_jwt_verifier(),
+    )
+    copies = InMemoryArtifactSnapshotStore(workspace=RecordingWorkspaceStore())
+    app.state.artifact_snapshots = copies
+
+    deps = _build_purge_deps(SimpleNamespace(app=app))  # type: ignore[arg-type]
+
+    assert deps.artifact_snapshots is copies

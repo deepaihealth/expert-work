@@ -43,6 +43,7 @@ def _row_to_version(row: ArtifactVersionRow) -> ArtifactVersion:
         sha256=row.sha256,
         created_in_thread=row.created_in_thread,
         created_at=row.created_at,
+        snapshot_key=row.snapshot_key,
     )
 
 
@@ -62,6 +63,10 @@ class SqlArtifactStore(ArtifactStore):
         kind: ArtifactKind,
         path_in_workspace: str,
         created_in_thread: str,
+        version_id: UUID | None = None,
+        snapshot_key: str | None = None,
+        size_bytes: int | None = None,
+        sha256: str | None = None,
     ) -> ArtifactVersion:
         now = datetime.now(UTC)
         # INSERT ... ON CONFLICT DO UPDATE — a race-free upsert of the
@@ -88,7 +93,7 @@ class SqlArtifactStore(ArtifactStore):
             },
         ).returning(ArtifactRow.id, ArtifactRow.latest_version)
 
-        version_id = uuid4()
+        version_id = version_id or uuid4()
         async with self._sf() as session:
             artifact_id, version = (await session.execute(upsert)).one()
             session.add(
@@ -99,8 +104,11 @@ class SqlArtifactStore(ArtifactStore):
                     user_id=user_id,
                     version=version,
                     path_in_workspace=path_in_workspace,
+                    size_bytes=size_bytes,
+                    sha256=sha256,
                     created_in_thread=created_in_thread,
                     created_at=now,
+                    snapshot_key=snapshot_key,
                 )
             )
             await session.commit()
@@ -112,8 +120,11 @@ class SqlArtifactStore(ArtifactStore):
             user_id=user_id,
             version=version,
             path_in_workspace=path_in_workspace,
+            size_bytes=size_bytes,
+            sha256=sha256,
             created_in_thread=created_in_thread,
             created_at=now,
+            snapshot_key=snapshot_key,
         )
 
     async def list_for_user(
@@ -192,6 +203,104 @@ class SqlArtifactStore(ArtifactStore):
             if artifact is None:
                 return None
             return await self._latest_of(session, artifact)
+
+    async def get_version(
+        self,
+        *,
+        tenant_id: UUID,
+        user_id: UUID,
+        agent_key: str | None,
+        name: str,
+        version: int,
+    ) -> ArtifactVersion | None:
+        # 定位父行的谓词与 ``get_latest_version`` 逐字相同(含 agent_key=None 的
+        # ORDER BY + LIMIT 1),只是最后取的是指定版本。
+        stmt = (
+            select(ArtifactRow)
+            .where(
+                ArtifactRow.tenant_id == tenant_id,
+                ArtifactRow.user_id == user_id,
+                ArtifactRow.name == name,
+                ArtifactRow.deleted_at.is_(None),
+            )
+            .order_by(ArtifactRow.updated_at.desc())
+            .limit(1)
+        )
+        if agent_key is not None:
+            stmt = stmt.where(ArtifactRow.agent_key == agent_key)
+        async with self._sf() as session:
+            artifact = (await session.execute(stmt)).scalar_one_or_none()
+            if artifact is None:
+                return None
+            return await self._version_of(session, artifact.id, version)
+
+    async def get_version_by_id(
+        self, *, tenant_id: UUID, user_id: UUID, artifact_id: UUID, version: int
+    ) -> ArtifactVersion | None:
+        async with self._sf() as session:
+            artifact = (
+                await session.execute(
+                    select(ArtifactRow.id).where(
+                        ArtifactRow.id == artifact_id,
+                        ArtifactRow.tenant_id == tenant_id,
+                        ArtifactRow.user_id == user_id,
+                        ArtifactRow.deleted_at.is_(None),
+                    )
+                )
+            ).scalar_one_or_none()
+            if artifact is None:
+                return None
+            return await self._version_of(session, artifact, version)
+
+    @staticmethod
+    async def _version_of(
+        session: AsyncSession, artifact_id: UUID, version: int
+    ) -> ArtifactVersion | None:
+        row = (
+            await session.execute(
+                select(ArtifactVersionRow).where(
+                    ArtifactVersionRow.artifact_id == artifact_id,
+                    ArtifactVersionRow.version == version,
+                )
+            )
+        ).scalar_one_or_none()
+        return _row_to_version(row) if row is not None else None
+
+    async def paths_still_registered(
+        self,
+        *,
+        tenant_id: UUID,
+        user_id: UUID,
+        paths: Sequence[str],
+        excluding_version_ids: Sequence[UUID],
+    ) -> set[str]:
+        if not paths:
+            return set()
+        stmt = select(ArtifactVersionRow.path_in_workspace).where(
+            ArtifactVersionRow.tenant_id == tenant_id,
+            ArtifactVersionRow.user_id == user_id,
+            ArtifactVersionRow.path_in_workspace.in_(list(paths)),
+        )
+        if excluding_version_ids:
+            stmt = stmt.where(ArtifactVersionRow.id.not_in(list(excluding_version_ids)))
+        async with self._sf() as session:
+            rows = (await session.execute(stmt.distinct())).scalars().all()
+        return set(rows)
+
+    async def existing_version_ids(self, ids: Sequence[UUID]) -> set[UUID]:
+        if not ids:
+            return set()
+        async with self._sf() as session:
+            rows = (
+                (
+                    await session.execute(
+                        select(ArtifactVersionRow.id).where(ArtifactVersionRow.id.in_(list(ids)))
+                    )
+                )
+                .scalars()
+                .all()
+            )
+        return set(rows)
 
     @staticmethod
     async def _latest_of(session: AsyncSession, artifact: ArtifactRow) -> ArtifactVersion | None:

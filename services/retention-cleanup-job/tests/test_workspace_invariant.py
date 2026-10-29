@@ -1,7 +1,9 @@
 """留存链 PR2 —— 三条工作区规则 + **不变式**(波 3 线 R)。
 
 不变式:留存 job 对**活着的**工作区,只删
-(a) 登记过的产物文件(``artifact_version.path_in_workspace``,满 90 天的版本)
+(a) 登记过的产物文件(``artifact_version.path_in_workspace``,满 90 天的版本;B-235 起
+    同一路径还有别的版本在用时不删),以及这一版登记时留在用户根旁边的副本
+    (``{tenant}/.artifact-versions/{user}/{version_id}``)
 (b) ``uploads/`` 下登记过的文件(``user_upload.ref``,满 90 天)
 (c) 孤儿 ``threads/<thread_id>/``(thread 行不存在)
 —— 根目录任何其它文件/目录(``style/``、MEMORY.md、未登记文件、非 UUID 名的
@@ -32,6 +34,7 @@ from expert_work.persistence import (
     InMemoryThreadMetaStore,
     InMemoryUserUploadStore,
     InMemoryUserWorkspaceStore,
+    artifact_snapshot_dir,
 )
 from expert_work.protocol import AuditAction, AuditQuery
 from expert_work.runtime.audit import (
@@ -90,7 +93,11 @@ async def _register_version(
     name: str,
     path: str,
     created_at: datetime,
+    copy_root: Path | None = None,
 ) -> UUID:
+    """``copy_root`` 给了就按 B-235 的写法登记:带副本,副本文件落在用户根旁边。"""
+    version_id = uuid4()
+    with_copy = copy_root is not None
     version = await artifacts.save_version(
         tenant_id=tenant,
         user_id=user,
@@ -99,7 +106,15 @@ async def _register_version(
         kind="document",
         path_in_workspace=path,
         created_in_thread="t",
+        version_id=version_id if with_copy else None,
+        snapshot_key=str(version_id) if with_copy else None,
+        size_bytes=1 if with_copy else None,
+        sha256="s" if with_copy else None,
     )
+    if copy_root is not None:
+        copy = artifact_snapshot_dir(str(copy_root), tenant, user) / str(version_id)
+        copy.parent.mkdir(parents=True, exist_ok=True)
+        copy.write_bytes(b"x")
     artifacts._versions = [  # backdate: the in-memory store stamps now()
         v.model_copy(update={"created_at": created_at}) if v.id == version.id else v
         for v in artifacts._versions
@@ -180,9 +195,35 @@ async def world(tmp_path: Path) -> Iterator[_World]:
     root = tmp_path
 
     # ---- registered artifacts -------------------------------------------
-    # report.pptx: single version, 100d → file + version go, artifact expires.
+    # report.pptx: single version, 100d → file + version + its copy go, artifact expires.
     w.ids["report"] = await _register_version(
-        w.artifacts, tenant=t, user=u, name="report.pptx", path="report.pptx", created_at=_OLD
+        w.artifacts,
+        tenant=t,
+        user=u,
+        name="report.pptx",
+        path="report.pptx",
+        created_at=_OLD,
+        copy_root=root,
+    )
+    # shared.md (B-235): v1 (100d) and v2 (1d) were saved to the SAME path → v1's
+    # row + copy go, the file stays because v2 still points at it.
+    w.ids["shared"] = await _register_version(
+        w.artifacts,
+        tenant=t,
+        user=u,
+        name="shared.md",
+        path="shared.md",
+        created_at=_OLD,
+        copy_root=root,
+    )
+    await _register_version(
+        w.artifacts,
+        tenant=t,
+        user=u,
+        name="shared.md",
+        path="shared.md",
+        created_at=_FRESH,
+        copy_root=root,
     )
     # summary.md: v1 (100d, own file) + v2 (1d) → only v1's file goes, artifact stays active.
     w.ids["summary"] = await _register_version(
@@ -208,8 +249,12 @@ async def world(tmp_path: Path) -> Iterator[_World]:
     w.ids["ghost"] = await _register_version(
         w.artifacts, tenant=t, user=u, name="ghost.md", path="ghost.md", created_at=_OLD
     )
+    # 副本目录里不是 UUID 名字的东西 —— 不是我们写的,不碰。
+    stranger = artifact_snapshot_dir(str(root), t, u) / "README"
+    stranger.write_bytes(b"x")
     for rel in (
         "report.pptx",
+        "shared.md",
         "summary_v1.md",
         "summary.md",
         "plan.json",
@@ -290,12 +335,17 @@ async def test_run_once_touches_only_the_three_registered_shapes(world: _World) 
     w = world
     t, u = w.tenant, w.user
     before = _tree(w.root)
+    shared_versions = await w.artifacts.list_versions_by_artifact(artifact_id=w.ids["shared"])
+    report_versions = await w.artifacts.list_versions_by_artifact(artifact_id=w.ids["report"])
 
     report = await w.job().run_once()
 
     after = _tree(w.root)
     prefix = f"{t}/{u}/"
+    copies = f"{t}/.artifact-versions/{u}/"
     expected_removed = {
+        copies + str(report_versions[0].id),
+        copies + str(shared_versions[-1].id),  # v1 — the oldest
         prefix + "report.pptx",
         prefix + "summary_v1.md",
         prefix + "高血压21天随访/day1.md",
@@ -308,8 +358,10 @@ async def test_run_once_touches_only_the_three_registered_shapes(world: _World) 
     assert after - before == set()  # nothing created either
 
     # Counters line up with the filesystem diff.
-    assert report.artifact_versions_deleted == 4  # report, summary v1, followup, ghost
-    assert report.artifact_files_removed == 3  # ghost was already gone
+    # report, shared v1, summary v1, followup, ghost
+    assert report.artifact_versions_deleted == 5
+    # ghost was already gone; shared.md stays (v2 still points at it)
+    assert report.artifact_files_removed == 3
     assert report.artifacts_expired == 3  # report, followup, ghost — summary keeps v2
     assert report.uploads_expired == 2  # old.pdf + the image-kind row
     assert report.upload_files_removed == 1
@@ -347,6 +399,7 @@ async def test_run_once_touches_only_the_three_registered_shapes(world: _World) 
         str(w.ids["summary"]),
         str(w.ids["followup"]),
         str(w.ids["ghost"]),
+        str(w.ids["shared"]),
     }
     summary_row = next(r for r in expired_rows if r.resource_id == str(w.ids["summary"]))
     assert summary_row.details["versions_deleted"] == [1]
@@ -430,7 +483,7 @@ async def test_unremovable_artifact_file_keeps_its_version_row(world: _World) ->
     versions = await w.artifacts.list_versions(tenant_id=t, user_id=u, artifact_id=artifact_id)
     assert versions is not None and len(versions) == 1
     assert (w.root / str(t) / str(u) / "report.pptx").is_dir()
-    assert report.artifact_versions_deleted == 3  # the other three still went
+    assert report.artifact_versions_deleted == 4  # the other four still went
 
 
 @pytest.mark.asyncio

@@ -21,16 +21,15 @@
  * (``var_drafts``)按 agent+变量名记最后提交值,进入页面仅对空字段预填。
  */
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { Alert, App, Badge, Checkbox, Drawer, Segmented, Tooltip, Typography } from "antd";
+import { Alert, Badge, Checkbox, Drawer, Segmented, Tooltip, Typography } from "antd";
 import { SlidersHorizontal } from "lucide-react";
 import { useTranslation } from "react-i18next";
 
-import { ApiError, errMessage } from "../../api/client";
+import { ApiError } from "../../api/client";
 import { streamRunEvents } from "../../api/runs";
 import { attributedModelsOf, computeSessionStats } from "../../api/session_stats";
 import {
   createSession,
-  downloadSessionArtifact,
   type SseEvent,
   type ThreadMeta,
 } from "../../api/sessions";
@@ -49,6 +48,7 @@ import {
 import { SessionSidebar, type SessionChange } from "../../components/console/SessionSidebar";
 import { StatsBar } from "../../components/console/StatsBar";
 import { Transcript } from "../../components/console/Transcript";
+import { useTurnArtifactDownload } from "../../components/console/useTurnArtifactDownload";
 import { TrajectoryView } from "../../components/console/TrajectoryView";
 import type { TurnTiming } from "../../components/console/types";
 import type { FocusRequest } from "../../components/console/use_trajectory_state";
@@ -103,7 +103,6 @@ const COMPOSER_STYLE: React.CSSProperties = {
 
 export function PlaygroundTab({ detail }: PlaygroundTabProps) {
   const { t } = useTranslation();
-  const { message } = App.useApp();
   const r = detail.record;
   // Langfuse has no per-tenant isolation (single ClickHouse, all tenants
   // mixed), so the per-turn deep link is platform-ops only — TraceToolbar
@@ -499,20 +498,11 @@ export function PlaygroundTab({ detail }: PlaygroundTabProps) {
   );
 
   // The answer bubble's inline artifact download (WorkspacePanel owns its own
-  // copy) — the only surviving use of the old workspace handlers.
-  const handleDownloadArtifact = useCallback(
-    async (name: string) => {
-      const threadId = thread?.thread_id ?? null;
-      if (threadId === null) return;
-      try {
-        // B-50 —— 同 ConversationDetail:走会话作用域端点,后端按会话的 agent 收口。
-        await downloadSessionArtifact(threadId, name, concreteTenantScope(apiTenantScope));
-      } catch (err) {
-        // 静默吞错让「下载失败」表现成「点了没反应」(2026-08-26 用户反馈)。
-        message.error(t("artifacts_page.download_failed", { detail: errMessage(err) }));
-      }
-    },
-    [thread, apiTenantScope, message, t],
+  // copy). B-50 —— 走会话作用域端点,后端按会话的 agent 收口;B-235 —— 按这一轮登记
+  // 的版本下载,409 时提示并给「下载最新版」(见 useTurnArtifactDownload)。
+  const handleDownloadArtifact = useTurnArtifactDownload(
+    thread?.thread_id ?? null,
+    concreteTenantScope(apiTenantScope),
   );
 
   const handleFireResult = useCallback((result: FireNowResult) => {

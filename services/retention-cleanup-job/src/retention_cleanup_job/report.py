@@ -26,6 +26,8 @@ class CleanupReport:
     artifact_versions_deleted: int = 0
     artifact_files_removed: int = 0
     artifacts_expired: int = 0
+    # B-235 —— 找不到版本行的产物副本(登记失败 / 清除用户没删成)满 24 小时清掉。
+    orphan_artifact_copies_removed: int = 0
     # 留存链 —— 上传 90 天。
     uploads_expired: int = 0
     upload_files_removed: int = 0

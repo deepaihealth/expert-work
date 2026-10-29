@@ -29,6 +29,13 @@ active content 强制 attachment / nosniff / 权限失败与不存在分开)全�
 同样在 query —— 与同资源的 GET 保持一致(同资源两个写操作参数位置不一致会
 坑对接方,session 的 PATCH/DELETE 已经踩过)。
 
+B-235 —— 下载的 ``version`` 是「取这一版」:每一版登记时都留了那一刻的字节,传了版本号
+就下那一版(以前是「与最新版不一致就 409」的校验闸——那时旧版本的字节确实已被同名登记
+覆盖)。仍回 409 的只剩两种:版本号不存在(含已被留存清理的),以及 B-235 之前登记、已不
+是最新的一版(那时没留副本,拿最新版冒充正是要防的事)。每个成功响应带
+``X-Artifact-Version`` 头,写明实际下发的版本。选版规则与控制台 / 会话面共用,见
+:mod:`control_plane.api._artifact_content`。
+
 **不镜像**版本历史(``/versions``)、改 ``kind``(PATCH)、硬删(``:purge``)
 —— 前两者对第三方界面价值低,硬删与会话侧一致,永远是 console-only。
 """
@@ -44,6 +51,13 @@ from uuid import UUID
 from fastapi import APIRouter, Depends, Query, Request
 from fastapi.responses import JSONResponse, Response
 
+from control_plane.api._artifact_content import (
+    VERSION_HEADER,
+    VersionNotRetained,
+    VersionUnknown,
+    choose_version,
+    read_version_bytes,
+)
 from control_plane.api._artifact_mime import content_disposition_header, infer_content_type
 from control_plane.api._authz import external_only, require
 from control_plane.api._external import (
@@ -74,6 +88,7 @@ from orchestrator.tools import (
     WorkspacePermissionError,
     WorkspaceStore,
 )
+from orchestrator.tools.artifact_snapshots import ArtifactSnapshotStore
 
 logger = logging.getLogger("expert_work.control_plane.external_artifacts")
 
@@ -84,6 +99,11 @@ def _get_artifact_store(request: Request) -> ArtifactStore:
 
 def _get_workspace_store(request: Request) -> WorkspaceStore | None:
     return request.app.state.workspace_store  # type: ignore[no-any-return]
+
+
+def _get_artifact_snapshots(request: Request) -> ArtifactSnapshotStore | None:
+    """B-235 —— 产物版本副本;没接(测试 / 无工作区部署)时 ``None``。"""
+    return getattr(request.app.state, "artifact_snapshots", None)
 
 
 def _get_quota(request: Request) -> QuotaService:
@@ -216,13 +236,14 @@ def build_external_artifacts_router() -> APIRouter:
         store: Annotated[ArtifactStore, Depends(_get_artifact_store)],
         users: Annotated[TenantUserStore, Depends(get_user_repo)],
         workspace_store: Annotated[WorkspaceStore | None, Depends(_get_workspace_store)],
+        snapshots: Annotated[ArtifactSnapshotStore | None, Depends(_get_artifact_snapshots)],
         quota: Annotated[QuotaService, Depends(_get_quota)],
         audit: Annotated[AuditLogger, Depends(_get_audit)],
         user_id: Annotated[str, Query(min_length=1, max_length=255)],
         name: Annotated[str, Query(min_length=1, max_length=512)],
         version: Annotated[int | None, Query(ge=1)] = None,
     ) -> Response:
-        """Download the latest version of one artifact.
+        """Download one artifact — the latest version, or ``version`` (B-235).
 
         Success is the raw file body, not the ``{success, data, error}``
         envelope (see module docstring); only error paths render it.
@@ -252,18 +273,36 @@ def build_external_artifacts_router() -> APIRouter:
         )
         if latest is None:
             return _artifact_error("ARTIFACT_NOT_FOUND", "artifact not found", 404)
-        # 产物清单契约 —— 可选 ``version`` 是**校验闸**不是取历史:旧版本
-        # 字节被同名重登记覆盖后物理上已不存在(版本行只是元数据),所以这里
-        # 不提供按版本取内容;传了 version 且 ≠ 最新版 → 409 显式冲突,
-        # 保证「拿着旧清单迟到收割」永远不会静默拿到别的内容。
-        if version is not None and version != latest.version:
+        # 产物清单契约 + B-235 —— 可选 ``version`` 是「取这一版」:有登记时的副本就
+        # 下那一版。下不到的两种(版本号不存在 / B-235 之前登记且已不是最新)仍是 409
+        # 显式冲突,保证「拿着旧清单迟到收割」永远不会静默拿到别的内容。
+        pinned = (
+            await store.get_version(
+                tenant_id=tenant_id,
+                user_id=end_user_id,
+                agent_key=agent_key,
+                name=name,
+                version=version,
+            )
+            if version is not None
+            else None
+        )
+        try:
+            chosen = choose_version(latest=latest, requested=version, pinned=pinned)
+        except VersionUnknown:
             return _artifact_error(
                 "ARTIFACT_VERSION_MISMATCH",
-                f"artifact {name!r} is at version {latest.version}, not {version}; "
-                "content of superseded versions is not retained",
+                f"artifact {name!r} has no version {version}; the latest is {latest.version}",
                 409,
             )
-        version = latest
+        except VersionNotRetained:
+            return _artifact_error(
+                "ARTIFACT_VERSION_MISMATCH",
+                f"version {version} of artifact {name!r} was registered before per-version "
+                f"copies were kept and its content is no longer available; the latest is "
+                f"{latest.version}",
+                409,
+            )
         artifacts = await store.list_for_user(
             tenant_id=tenant_id, user_id=end_user_id, agent_key=agent_key
         )
@@ -291,8 +330,12 @@ def build_external_artifacts_router() -> APIRouter:
                 "ARTIFACT_CONTENT_UNAVAILABLE", "artifact content unavailable", 503
             )
         try:
-            data = await workspace_store.read_file(
-                tenant_id=tenant_id, user_id=end_user_id, path=version.path_in_workspace
+            data = await read_version_bytes(
+                chosen,
+                tenant_id=tenant_id,
+                user_id=end_user_id,
+                snapshots=snapshots,
+                workspace_store=workspace_store,
             )
         except WorkspacePermissionError:
             # 元数据行在、内容读不动是权限问题(服务端配置),不是「不存在」——
@@ -300,7 +343,7 @@ def build_external_artifacts_router() -> APIRouter:
             # **必须排在** SandboxSupervisorError 之前:它是后者的子类,顺序
             # 反了永远走不到。traceback 只进日志,不进响应体。
             logger.warning(
-                "external_artifact.permission_denied version=%s", version.id, exc_info=True
+                "external_artifact.permission_denied version=%s", chosen.id, exc_info=True
             )
             return _artifact_error(
                 "ARTIFACT_CONTENT_UNAVAILABLE", "artifact content unavailable", 500
@@ -309,30 +352,31 @@ def build_external_artifacts_router() -> APIRouter:
             # 「太大」≠「不存在」—— 产物列在 GET /artifacts 里,只是超过单文件
             # 下载闸;折进 404 会让对接方以为产物丢了。子类,必须排在宽
             # except 之前。
-            logger.warning("external_artifact.too_large version=%s reason=%s", version.id, exc)
+            logger.warning("external_artifact.too_large version=%s reason=%s", chosen.id, exc)
             return _artifact_error(
                 "ARTIFACT_TOO_LARGE", "artifact exceeds the download size limit", 413
             )
         except SandboxSupervisorError as exc:
             logger.warning(
-                "external_artifact.content_unavailable version=%s reason=%s", version.id, exc
+                "external_artifact.content_unavailable version=%s reason=%s", chosen.id, exc
             )
             return _artifact_error("ARTIFACT_NOT_FOUND", "artifact content not found", 404)
-        # 首次读回填摘要 —— save 时读不到内容(它在工作区卷里),所以那时未知。
-        if version.size_bytes is None:
+        # 首次读回填摘要 —— 只有 B-235 之前登记的版本缺它(副本的摘要登记时就算好了)。
+        if chosen.size_bytes is None:
             await store.set_version_digest(
-                version_id=version.id,
+                version_id=chosen.id,
                 size_bytes=len(data),
                 sha256=hashlib.sha256(data).hexdigest(),
             )
         # MIME 推断 + XSS 安全 disposition:可执行内容(HTML / SVG 等)一律
         # attachment,未识别扩展名回退 application/octet-stream + attachment。
-        inferred = infer_content_type(path=version.path_in_workspace)
+        inferred = infer_content_type(path=chosen.path_in_workspace)
         headers = {
             "Content-Disposition": content_disposition_header(
                 artifact.name, disposition=inferred.disposition
             ),
             "X-Content-Type-Options": "nosniff",
+            VERSION_HEADER: str(chosen.version),
         }
         return Response(content=data, media_type=inferred.content_type, headers=headers)
 

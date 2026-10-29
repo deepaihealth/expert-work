@@ -4,10 +4,18 @@ from __future__ import annotations
 
 import pytest
 
-from control_plane.runtime import build_sandbox_runtime, build_workspace_store
+from control_plane.runtime import (
+    build_artifact_snapshot_store,
+    build_sandbox_runtime,
+    build_workspace_store,
+)
 from control_plane.settings import Settings
 from expert_work.persistence.sandbox_instance_store import InMemorySandboxInstanceStore
 from orchestrator.tools.agent_sandbox import AgentSandboxClient
+from orchestrator.tools.artifact_snapshots import (
+    InMemoryArtifactSnapshotStore,
+    NasArtifactSnapshotStore,
+)
 from orchestrator.tools.nas_workspace_store import NasWorkspaceStore
 from orchestrator.tools.sandbox import HTTPSupervisorRuntime
 from orchestrator.tools.workspace_store import SupervisorWorkspaceStore
@@ -283,3 +291,25 @@ def test_workspace_store_runtime_and_instance_store_default_to_none() -> None:
     assert isinstance(store, NasWorkspaceStore)
     assert store.runtime is None
     assert store.instance_store is None
+
+
+# B-235 —— 产物版本副本跟着工作区后端走:NAS → 副本在 NAS 上(用户根旁边);本地
+# supervisor 后端 → 进程内存;没有工作区 → 没有副本存储(save_artifact 随之不注册)。
+
+
+def test_artifact_snapshots_on_nas_share_the_workspace_store_instance() -> None:
+    workspace = NasWorkspaceStore(root="/mnt/workspaces")
+    snapshots = build_artifact_snapshot_store(workspace)
+    assert isinstance(snapshots, NasArtifactSnapshotStore)
+    assert snapshots.workspace is workspace
+
+
+def test_artifact_snapshots_fall_back_to_memory_on_the_supervisor_backend() -> None:
+    workspace = SupervisorWorkspaceStore(base_url="http://sandbox-supervisor:8000")
+    snapshots = build_artifact_snapshot_store(workspace)
+    assert isinstance(snapshots, InMemoryArtifactSnapshotStore)
+    assert snapshots.workspace is workspace
+
+
+def test_no_workspace_means_no_artifact_snapshots() -> None:
+    assert build_artifact_snapshot_store(None) is None
