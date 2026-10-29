@@ -1220,8 +1220,14 @@ def build_knowledge_router() -> APIRouter:
                 )
             # B-175 P2-PR4 — logged as this employee's console test; the receipt
             # brings back the search's latency and the row id once it is written.
+            # A caller searching another tenant's base than their home one
+            # (platform staff, switched in) is marked on the row, so that tenant
+            # sees who searched (user ruling 2026-10-28).
+            principal = request.state.principal
             caller = RetrievalLogContext(
-                source="console_test", actor_id=request.state.principal.subject_id
+                source="console_test",
+                actor_id=principal.subject_id,
+                flags={"platform_admin": True} if scope.tenant_id != principal.tenant_id else {},
             )
             started = time.monotonic()
             with retrieval_log_scope(caller) as receipt:

@@ -1,0 +1,44 @@
+{
+  "query": "What is the deductible?",
+  "results": [
+    {
+      "content": "Sample paragraph one.\n\nThe deductible is 500 per year.",
+      "heading_path": ["Chapter 1", "Benefits"],
+      "source": "guide.md#3",
+      "filename": "guide.md",
+      "chunk_index": 3,
+      "score": 0.8234,
+      "rerank_score": 0.9112,
+      "recall_source": "both",
+      "parent_index": 1,
+      "hit_chunk_indexes": [3, 4],
+      "hit_content": "The deductible is 500 per year.",
+      "hit_heading_path": ["Chapter 1", "Benefits"],
+      "vector_score": 0.8234,
+      "keyword_score": 0.0607,
+      "fused_score": 0.0328,
+      "document": {
+        "id": "5d0c6f8e-2a41-4b7e-9d35-1c2b3a4d5e01",
+        "doc_seq": 12,
+        "title": "Guide",
+        "filename": "guide.md",
+        "created_at": "2026-10-20T08:00:00+00:00",
+        "enabled": true
+      }
+    }
+  ],
+  "count": 1,
+  "status": "ok",
+  "candidates": 50,
+  "rerank_degraded": false,
+  "rerank_outcome": "ok",
+  "embedding_degraded": false,
+  "keyword_degraded": false,
+  "duplicates_dropped": 0,
+  "rerank_dropped": 0,
+  "rerank_threshold_paused": false,
+  "rerank_threshold_model": null,
+  "rerank_model": "vendor/rerank-model",
+  "elapsed_ms": 412,
+  "log_id": "7e3a9b10-6c2d-4f58-8a91-0b1c2d3e4f02"
+}

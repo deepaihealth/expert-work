@@ -9,8 +9,14 @@
  * B-206 K-1: a result can be a parent row (「整块」) of its hit chunks (「小段」):
  * the whole parent is shown, its best hit chunk highlighted where its text
  * appears verbatim, or shown on its own above the parent where it does not.
+ *
+ * B-175 P2-PR4 (B-206 §6): each result shows its document and the best hit
+ * chunk's four scores; the tab says how long the search took, whether it was
+ * saved to the retrieval records, and how it was degraded; results can be
+ * narrowed to one document; a rerank floor can be tried for this search
+ * (calibration); and the parameters can be saved as the base's defaults.
  */
-import { useCallback, useState } from "react";
+import { useCallback, useMemo, useState } from "react";
 import {
   Alert,
   App,
@@ -19,8 +25,8 @@ import {
   Empty,
   Input,
   InputNumber,
-  Progress,
   Segmented,
+  Select,
   Space,
   Switch,
   Tag,
@@ -43,6 +49,10 @@ import {
   type RerankFallback,
 } from "../../api/rerank_outcome";
 import { HeadingPath } from "./HeadingPath";
+import { documentLabel, HitDocument } from "./HitDocument";
+import { SaveDefaultsButton } from "./SaveDefaultsButton";
+import { ScoreBreakdown } from "./ScoreBreakdown";
+import { SearchNotices } from "./SearchNotices";
 import { thresholdPausedNotice } from "./thresholdPausedNotice";
 
 const { Text, Paragraph } = Typography;
@@ -62,6 +72,19 @@ const RECALL_COLOR: Record<string, string> = {
 };
 
 const BODY_STYLE = { whiteSpace: "pre-wrap", marginBottom: 0, fontSize: 13 } as const;
+
+/** Above this many results the recall pool grows past an agent's default
+ *  (``max(50, min(2 × limit, 100))`` candidates), so rerank scores — relative
+ *  within one request — stop being comparable: calibrate at or below it. */
+const CALIBRATION_MAX_TOP_K = 25;
+
+/** The filter's key for a result whose document is unknown (deleted, or an
+ *  older backend). */
+const NO_DOCUMENT = "";
+
+function documentKey(result: RetrievalTestResult): string {
+  return result.document?.id ?? NO_DOCUMENT;
+}
 
 /** A result's text. Without a parent row it is the hit chunk, shown as before;
  *  with one it is the whole parent, under a line naming the parent and its hit
@@ -136,11 +159,26 @@ interface RetrievalTestTabProps {
   base: KnowledgeBase;
   /** Cross-tenant W4(review C-2)— 权威读口径:URL ``?tenant_id=`` 原样透
    *  传优先;无 URL 参数时取 ambient scope("*" 折叠成 undefined),由
-   *  KnowledgeDetail 统一下传。检索测试是只读探针,无写控件。 */
+   *  KnowledgeDetail 统一下传。检索本身是只读探针;唯一的写控件「存为库默认参数」
+   *  按 ``readonly`` 置灰。 */
   readScope: string | undefined;
+  /** B-175 P2-PR4 — switched-in or foreign deep-link read: 「存为库默认参数」
+   *  would write the same-named base of the caller's own tenant, so it is off.
+   *  Required (no default): a mount that forgets it must not fail open. */
+  readonly: boolean;
+  /** The base as 「存为库默认参数」 saved it (the page shows it without a reload). */
+  onBaseUpdated?: (next: KnowledgeBase) => void;
+  /** Open the retrieval records tab (the link renders only when given). */
+  onOpenLogs?: () => void;
 }
 
-export function RetrievalTestTab({ base, readScope }: RetrievalTestTabProps) {
+export function RetrievalTestTab({
+  base,
+  readScope,
+  readonly,
+  onBaseUpdated,
+  onOpenLogs,
+}: RetrievalTestTabProps) {
   const { t } = useTranslation();
   const { message } = App.useApp();
 
@@ -150,6 +188,10 @@ export function RetrievalTestTab({ base, readScope }: RetrievalTestTabProps) {
   const [method, setMethod] = useState<RetrievalMethod>(config?.method ?? "hybrid");
   const [threshold, setThreshold] = useState<number | null>(config?.score_threshold ?? null);
   const [rerank, setRerank] = useState<boolean>(config?.rerank_enabled ?? true);
+  // B-175 P2-PR4 — a rerank floor for this search only; null = the base's own applies.
+  const [rerankThreshold, setRerankThreshold] = useState<number | null>(null);
+  const [lastResponse, setLastResponse] = useState<RetrievalTestResponse | null>(null);
+  const [docFilter, setDocFilter] = useState<string | null>(null);
 
   const [results, setResults] = useState<RetrievalTestResult[] | null>(null);
   // B-206 K-7 —— 重排没定顺序(退回召回顺序)时的原因;重排正常 / 没开 → null。
@@ -171,12 +213,15 @@ export function RetrievalTestTab({ base, readScope }: RetrievalTestTabProps) {
           method,
           score_threshold: threshold,
           rerank,
+          ...(rerankThreshold !== null ? { rerank_score_threshold: rerankThreshold } : {}),
         },
         readScope,
       );
       setResults(response.results);
       setRerankFallback(rerankFallbackOf(response.rerank_outcome));
       setRerankFloor(response);
+      setLastResponse(response);
+      setDocFilter(null);
     } catch (err) {
       const detail =
         err instanceof ApiError && err.status === 503
@@ -186,7 +231,26 @@ export function RetrievalTestTab({ base, readScope }: RetrievalTestTabProps) {
     } finally {
       setRunning(false);
     }
-  }, [base.name, query, topK, method, threshold, rerank, t, message, readScope]);
+  }, [base.name, query, topK, method, threshold, rerank, rerankThreshold, t, message, readScope]);
+
+  // The documents among the results, for the per-document filter (B-206 §6).
+  const documents = useMemo(() => {
+    const seen = new Map<string, string>();
+    for (const result of results ?? []) {
+      const key = documentKey(result);
+      if (!seen.has(key)) {
+        seen.set(
+          key,
+          result.document
+            ? documentLabel(result.document)
+            : result.document === null
+              ? t("knowledge_retrieval.doc_deleted")
+              : result.filename,
+        );
+      }
+    }
+    return [...seen.entries()].map(([value, label]) => ({ value, label }));
+  }, [results, t]);
 
   return (
     <div data-testid="knowledge-test-tab">
@@ -264,8 +328,43 @@ export function RetrievalTestTab({ base, readScope }: RetrievalTestTabProps) {
             aria-label={t("knowledge_page.test_control_rerank")}
           />
         </Space>
+        <Space size={6}>
+          <Text type="secondary" style={{ fontSize: 12 }}>
+            {t("knowledge_page.field_rerank_threshold")}
+          </Text>
+          <InputNumber
+            size="small"
+            min={0}
+            max={1}
+            step={0.05}
+            value={rerankThreshold}
+            onChange={(v) => setRerankThreshold(v)}
+            placeholder={t("knowledge_retrieval.rerank_threshold_placeholder", {
+              value:
+                config?.rerank_score_threshold ?? t("knowledge_retrieval.rerank_threshold_none"),
+            })}
+            style={{ width: 170 }}
+            aria-label={t("knowledge_page.field_rerank_threshold")}
+            data-testid="kb-test-rerank-threshold"
+          />
+        </Space>
+        <SaveDefaultsButton
+          base={base}
+          params={{ topK, method, threshold, rerank, rerankThreshold }}
+          readonly={readonly}
+          onSaved={onBaseUpdated}
+        />
       </Space>
 
+      {rerankThreshold !== null && topK > CALIBRATION_MAX_TOP_K && (
+        <Alert
+          type="warning"
+          showIcon
+          style={{ marginBottom: 12 }}
+          message={t("knowledge_retrieval.calibration_warning")}
+          data-testid="kb-test-calibration-warning"
+        />
+      )}
       {results !== null && rerankFallback !== null && (
         <Alert
           type={rerankNoticeTone(rerankFallback)}
@@ -288,19 +387,61 @@ export function RetrievalTestTab({ base, readScope }: RetrievalTestTabProps) {
           data-testid="kb-test-rerank-threshold-paused"
         />
       )}
+      {results !== null && lastResponse !== null && (
+        <>
+          <SearchNotices
+            prefix="kb-test"
+            flags={{
+              embedding_degraded: lastResponse.embedding_degraded,
+              keyword_degraded: lastResponse.keyword_degraded,
+              duplicates_dropped: lastResponse.duplicates_dropped,
+              rerank_dropped: lastResponse.rerank_dropped,
+            }}
+          />
+          <SearchMeta response={lastResponse} onOpenLogs={onOpenLogs} />
+        </>
+      )}
+      {documents.length > 1 && (
+        <div style={{ marginBottom: 12 }}>
+          <Space size={6} data-testid="kb-test-doc-filter">
+            <Text type="secondary" style={{ fontSize: 12 }}>
+              {t("knowledge_retrieval.doc_filter")}
+            </Text>
+            <Select<string>
+              size="small"
+              value={docFilter ?? undefined}
+              onChange={(v) => setDocFilter(v ?? null)}
+              allowClear
+              placeholder={t("knowledge_retrieval.doc_filter_all")}
+              options={documents}
+              style={{ minWidth: 220 }}
+              aria-label={t("knowledge_retrieval.doc_filter")}
+            />
+          </Space>
+        </div>
+      )}
       {results === null ? (
         <Empty description={t("knowledge_page.test_empty_hint")} />
       ) : results.length === 0 ? (
-        <Empty description={t("knowledge_page.test_no_results")} />
+        lastResponse?.status === "below_threshold" ? (
+          <Empty
+            description={
+              <span data-testid="kb-test-below-threshold">
+                {t("knowledge_retrieval.below_threshold", {
+                  candidates: lastResponse.candidates ?? 0,
+                })}
+              </span>
+            }
+          />
+        ) : (
+          <Empty description={t("knowledge_page.test_no_results")} />
+        )
       ) : (
         <div data-testid="kb-test-results">
-          {results.map((result, idx) => (
-            <Card key={`${result.source}-${idx}`} size="small" style={{ marginBottom: 12 }}>
-              <Space
-                align="center"
-                style={{ justifyContent: "space-between", width: "100%", marginBottom: 8 }}
-              >
-                <Space size={8}>
+          {results.map((result, idx) =>
+            docFilter !== null && documentKey(result) !== docFilter ? null : (
+              <Card key={`${result.source}-${idx}`} size="small" style={{ marginBottom: 12 }}>
+                <Space size={8} wrap style={{ marginBottom: 4 }}>
                   <Text code style={{ fontSize: 12 }}>
                     {result.source}
                   </Text>
@@ -309,21 +450,69 @@ export function RetrievalTestTab({ base, readScope }: RetrievalTestTabProps) {
                       {t(`knowledge_page.recall_${result.recall_source}`)}
                     </Tag>
                   )}
+                  <HitDocument document={result.document} testId={`kb-test-doc-${idx}`} />
                 </Space>
-                {result.score !== null && (
-                  <Progress
-                    type="line"
-                    percent={Math.round(result.score * 100)}
-                    size="small"
-                    style={{ width: 120 }}
+                <div style={{ marginBottom: 8 }}>
+                  <ScoreBreakdown
+                    testId={`kb-test-scores-${idx}`}
+                    scores={{
+                      // An older backend sends only ``score`` (the vector one).
+                      vector_score: result.vector_score ?? result.score,
+                      keyword_score: result.keyword_score,
+                      fused_score: result.fused_score,
+                      rerank_score: result.rerank_score,
+                    }}
                   />
-                )}
-              </Space>
-              <ResultBody result={result} idx={idx} />
-            </Card>
-          ))}
+                </div>
+                <ResultBody result={result} idx={idx} />
+              </Card>
+            ),
+          )}
         </div>
       )}
     </div>
+  );
+}
+
+/** 「用时 N ms · 已记入检索记录」 — B-175 P2-PR4. */
+function SearchMeta({
+  response,
+  onOpenLogs,
+}: {
+  response: RetrievalTestResponse;
+  onOpenLogs?: () => void;
+}) {
+  const { t } = useTranslation();
+  if (response.elapsed_ms === undefined && response.log_id === undefined) return null;
+  return (
+    <Space size={8} wrap style={{ display: "flex", marginBottom: 12 }}>
+      {response.elapsed_ms !== undefined && (
+        <Text type="secondary" style={{ fontSize: 12 }} data-testid="kb-test-elapsed">
+          {t("knowledge_retrieval.elapsed", { ms: response.elapsed_ms })}
+        </Text>
+      )}
+      {response.log_id ? (
+        <Text type="secondary" style={{ fontSize: 12 }} data-testid="kb-test-logged">
+          {t("knowledge_retrieval.logged")}
+        </Text>
+      ) : (
+        response.log_id === null && (
+          <Text type="warning" style={{ fontSize: 12 }} data-testid="kb-test-not-logged">
+            {t("knowledge_retrieval.not_logged")}
+          </Text>
+        )
+      )}
+      {response.log_id && onOpenLogs && (
+        <Button
+          type="link"
+          size="small"
+          style={{ padding: 0, fontSize: 12 }}
+          onClick={onOpenLogs}
+          data-testid="kb-test-open-logs"
+        >
+          {t("knowledge_retrieval.open_logs")}
+        </Button>
+      )}
+    </Space>
   );
 }

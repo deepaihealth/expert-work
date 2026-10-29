@@ -220,7 +220,32 @@ export interface RetrievalTestResult {
   hit_content?: string | null;
   /** The best hit chunk's own breadcrumb (empty when the result is that chunk). */
   hit_heading_path?: string[];
+  // ── B-175 P2-PR4 — the best hit chunk's four scores (``null`` for a path
+  //    that did not find it; ``vector_score`` is ``score``) and the document. ──
+  vector_score?: number | null;
+  keyword_score?: number | null;
+  fused_score?: number | null;
+  rerank_score?: number | null;
+  /** The document as it is now; ``null`` once deleted. */
+  document?: KnowledgeHitDocument | null;
 }
+
+/** B-175 P2-PR4 — the document a retrieval hit belongs to (B-206 §6: short
+ *  id ``D{doc_seq}``, title, upload time). */
+export interface KnowledgeHitDocument {
+  id: string;
+  doc_seq: number | null;
+  title: string | null;
+  filename: string;
+  created_at: string | null;
+  /** The document's own switch — switching it off leaves its chunks' switches
+   *  on, so a record read later says so here; absent on older backends. */
+  enabled?: boolean;
+}
+
+/** How a knowledge search ended — ``no_hits`` / ``below_threshold`` came back
+ *  empty (every candidate under the rerank floor for the latter). */
+export type SearchStatus = "ok" | "no_hits" | "below_threshold";
 
 export interface RetrievalTestResponse {
   query: string;
@@ -234,6 +259,22 @@ export interface RetrievalTestResponse {
   rerank_threshold_model?: string | null;
   /** The model that scored this search; ``null`` without scores. */
   rerank_model?: string | null;
+  // ── B-175 wave 2 / B-206 — how the search ran (B-175 P2-PR4 shows them). ──
+  status?: SearchStatus;
+  /** Ranked passages the rerank floor was applied to. */
+  candidates?: number;
+  /** K-8 — the question could not be embedded: keyword results only. */
+  embedding_degraded?: boolean;
+  /** K-22 — keyword recall did not finish: the vector path's results only. */
+  keyword_degraded?: boolean;
+  /** K-21② — passages left out as a copy of a better-ranked one. */
+  duplicates_dropped?: number;
+  /** K-14 — candidates the reranker was handed but never scored. */
+  rerank_dropped?: number;
+  /** B-175 P2-PR4 — the search's own time (not its logging). */
+  elapsed_ms?: number;
+  /** The retrieval record this search wrote; ``null`` when none was written. */
+  log_id?: string | null;
 }
 
 /** Update payload — only supplied keys are applied; ``null`` clears a
@@ -257,6 +298,9 @@ export interface RetrievalTestBody {
   method?: RetrievalMethod;
   score_threshold?: number | null;
   rerank?: boolean;
+  /** B-175 wave 2 PR3 — a rerank floor for this search only (calibration);
+   *  omitted = the base's own applies. */
+  rerank_score_threshold?: number;
 }
 
 /** Upload whitelist — mirrors the backend's SUPPORTED_EXTENSIONS
