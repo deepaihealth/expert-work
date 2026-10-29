@@ -8,9 +8,10 @@ import userEvent from "@testing-library/user-event";
 import { MemoryRouter } from "react-router-dom";
 import i18n from "../../../i18n";
 
+import { buildConsoleTurns } from "../console_turns";
 import { TurnFooter } from "../TurnFooter";
 import type { ConsoleTurn } from "../types";
-import type { Turn } from "../../turn/types";
+import type { HistoryTurn, Turn } from "../../turn/types";
 import type { TurnSummary } from "../../../api/turn_summary";
 
 /** ``runId`` 默认给一个真值:P-2 起打分按 run 走,一轮真跑过就有 run id,
@@ -226,6 +227,173 @@ describe("TurnFooter", () => {
     expect(screen.getByTestId("console-turn-status")).toHaveTextContent(
       "已中断（发了新消息，待审批已作废）",
     );
+  });
+
+  it("B-226 ⑥ — a done turn whose end frame says completed=false gets a warning tag", () => {
+    const endFrame = (data: Record<string, unknown>): Turn["events"][number] => ({
+      id: "9",
+      event: "end",
+      data: { status: "success", run_id: "run-1", ...data },
+      rawData: "",
+      receivedAt: "t",
+    });
+    const stopped = makeConsoleTurn({
+      status: "done",
+      events: [endFrame({ completed: false, exit_reason: "max_steps" })],
+    });
+    const { rerender } = render(
+      <MemoryRouter>
+        <TurnFooter
+          turn={stopped}
+          threadId="th-1"
+          summary={EMPTY_SUMMARY}
+          costCny={null}
+          readOnly={false}
+          isTenantSwitched={false}
+          onExport={vi.fn()}
+          exporting={false}
+          onInspect={vi.fn()}
+        />
+      </MemoryRouter>,
+    );
+    const tag = screen.getByTestId("console-turn-status");
+    expect(tag).toHaveTextContent("已结束，未完成（步数用完）");
+    expect(tag.className).toContain("ant-tag-warning");
+
+    // completed=true keeps the green 已完成.
+    const done = makeConsoleTurn({
+      status: "done",
+      events: [endFrame({ completed: true, exit_reason: "text_response" })],
+    });
+    rerender(
+      <MemoryRouter>
+        <TurnFooter
+          turn={done}
+          threadId="th-1"
+          summary={EMPTY_SUMMARY}
+          costCny={null}
+          readOnly={false}
+          isTenantSwitched={false}
+          onExport={vi.fn()}
+          exporting={false}
+          onInspect={vi.fn()}
+        />
+      </MemoryRouter>,
+    );
+    expect(screen.getByTestId("console-turn-status")).toHaveTextContent("已完成");
+    expect(screen.getByTestId("console-turn-status").className).toContain("ant-tag-success");
+  });
+
+  it("B-226 ⑥ — an un-replayed history turn shows the warning tag from its run row, and keeps it after replay", () => {
+    const history = (events: Turn["events"]): ConsoleTurn => ({
+      ...makeConsoleTurn({ status: "done", events }),
+      source: "history",
+      loadState: events.length === 0 ? "pending" : "done",
+      runCompletion: {
+        status: "success", completed: false, exit_reason: "max_steps", unresolved_failures: [],
+      },
+    });
+    const footer = (turn: ConsoleTurn) => (
+      <MemoryRouter>
+        <TurnFooter
+          turn={turn}
+          threadId="th-1"
+          summary={EMPTY_SUMMARY}
+          costCny={null}
+          readOnly={false}
+          isTenantSwitched={false}
+          onExport={vi.fn()}
+          exporting={false}
+          onInspect={vi.fn()}
+        />
+      </MemoryRouter>
+    );
+    // Before replay: no events, the run row alone decides.
+    const { rerender } = render(footer(history([])));
+    const before = screen.getByTestId("console-turn-status");
+    expect(before).toHaveTextContent("已结束，未完成（步数用完）");
+    expect(before.className).toContain("ant-tag-warning");
+
+    // After replay: an end frame that carries no completion field must not
+    // flip the tag back to a green 已完成.
+    rerender(
+      footer(
+        history([
+          { id: "9", event: "end", data: { status: "success", run_id: "run-1" }, rawData: "", receivedAt: "t" },
+        ]),
+      ),
+    );
+    const after = screen.getByTestId("console-turn-status");
+    expect(after).toHaveTextContent("已结束，未完成（步数用完）");
+    expect(after.className).toContain("ant-tag-warning");
+  });
+
+  it("B-226 ⑥ — the not-completed tag's tooltip lists the end frame's unresolved failures", async () => {
+    const turn = makeConsoleTurn({
+      status: "done",
+      events: [
+        {
+          id: "9", event: "end", rawData: "", receivedAt: "t",
+          data: {
+            status: "success", run_id: "run-1", completed: false, exit_reason: "text_response",
+            unresolved_failures: [
+              { tool: "bash", kind: "unknown" },
+              { tool: "mcp__crm__update", kind: "blocked_by_policy" },
+            ],
+          },
+        },
+      ],
+    });
+    render(
+      <MemoryRouter>
+        <TurnFooter
+          turn={turn}
+          threadId="th-1"
+          summary={EMPTY_SUMMARY}
+          costCny={null}
+          readOnly={false}
+          isTenantSwitched={false}
+          onExport={vi.fn()}
+          exporting={false}
+          onInspect={vi.fn()}
+        />
+      </MemoryRouter>,
+    );
+    await userEvent.hover(screen.getByTestId("console-turn-status"));
+    const tooltip = await screen.findByRole("tooltip");
+    expect(tooltip.textContent).toBe(
+      "未解决的失败：bash（unknown）、mcp__crm__update（blocked_by_policy）",
+    );
+  });
+
+  it("B-226 ⑥ — an un-replayed history turn takes the failures from its run row", async () => {
+    const turn: ConsoleTurn = {
+      ...makeConsoleTurn({ status: "done", events: [] }),
+      source: "history",
+      loadState: "pending",
+      runCompletion: {
+        status: "success", completed: false, exit_reason: "text_response",
+        unresolved_failures: [{ tool: "bash", kind: "unknown" }],
+      },
+    };
+    render(
+      <MemoryRouter>
+        <TurnFooter
+          turn={turn}
+          threadId="th-1"
+          summary={EMPTY_SUMMARY}
+          costCny={null}
+          readOnly={false}
+          isTenantSwitched={false}
+          onExport={vi.fn()}
+          exporting={false}
+          onInspect={vi.fn()}
+        />
+      </MemoryRouter>,
+    );
+    await userEvent.hover(screen.getByTestId("console-turn-status"));
+    const tooltip = await screen.findByRole("tooltip");
+    expect(tooltip.textContent).toBe("未解决的失败：bash（unknown）");
   });
 
   it("does not render a view-run link any more", () => {
@@ -683,4 +851,83 @@ it("interrupted turn: 已中断 tag and the feedback bar stays (终审 F4)", () 
   );
   expect(screen.getByTestId("console-turn-status").textContent).toMatch(/已中断|Interrupted/);
   expect(screen.getByTestId("playground-turn-feedback")).toBeInTheDocument();
+});
+
+describe("B-226 ⑥ — buildConsoleTurns → TurnFooter with real run rows", () => {
+  let priorLang: string;
+  beforeEach(async () => {
+    priorLang = i18n.language;
+    await i18n.changeLanguage("zh-CN");
+  });
+  afterEach(async () => {
+    await i18n.changeLanguage(priorLang);
+  });
+
+  function historyRow(over: Partial<HistoryTurn>): HistoryTurn {
+    return {
+      key: "r1", input: "q", fallbackLines: [], runId: "r1", status: "success", tokens: null,
+      createdAt: null, finishedAt: null, runError: null, supersededBy: null, tombstone: false,
+      platformLines: [], completed: null, exitReason: null, ...over,
+    };
+  }
+
+  function footerText(row: HistoryTurn, events: Turn["events"] = []): string {
+    const [turn] = buildConsoleTurns({
+      historyTurns: [row],
+      historyLoads: { [row.runId]: { state: events.length ? "done" : "pending", events } },
+      liveTurns: [],
+      timings: {},
+    });
+    render(
+      <MemoryRouter>
+        <TurnFooter
+          turn={turn}
+          threadId="th-1"
+          summary={EMPTY_SUMMARY}
+          costCny={null}
+          readOnly={false}
+          isTenantSwitched={false}
+          onExport={vi.fn()}
+          exporting={false}
+          onInspect={vi.fn()}
+        />
+      </MemoryRouter>,
+    );
+    return screen.getByTestId("console-turn-status").textContent ?? "";
+  }
+
+  it("a paused run voided by a new turn (interrupted + false + approval_pending) keeps its interrupt label", () => {
+    const text = footerText(
+      historyRow({ status: "interrupted", runError: "new_turn", completed: false, exitReason: "approval_pending" }),
+    );
+    expect(text).toBe("已中断（发了新消息，待审批已作废）");
+    expect(text).not.toContain("未完成");
+  });
+
+  it("buildConsoleTurns keeps the row's own status in runCompletion (not a blanket success)", () => {
+    const [turn] = buildConsoleTurns({
+      historyTurns: [
+        historyRow({ status: "interrupted", runError: "new_turn", completed: false, exitReason: "approval_pending" }),
+      ],
+      historyLoads: {},
+      liveTurns: [],
+      timings: {},
+    });
+    expect(turn.runCompletion).toEqual({
+      status: "interrupted",
+      completed: false,
+      exit_reason: "approval_pending",
+      unresolved_failures: null,
+    });
+  });
+
+  it("an in-flight row whose live end frame already says not completed stays 进行中 until the row is patched", () => {
+    const text = footerText(historyRow({ status: "running" }), [
+      {
+        id: "9", event: "end", rawData: "", receivedAt: "t",
+        data: { status: "success", run_id: "r1", completed: false, exit_reason: "max_steps" },
+      },
+    ]);
+    expect(text).toBe("进行中");
+  });
 });

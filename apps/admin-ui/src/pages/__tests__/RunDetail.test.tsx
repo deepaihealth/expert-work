@@ -15,7 +15,7 @@ import { act, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { MemoryRouter, Route, Routes, useNavigate } from "react-router-dom";
 import type { NavigateFunction } from "react-router-dom";
-import "../../i18n";
+import i18n from "../../i18n";
 
 import { setStoredToken } from "../../api/client";
 import * as convoSdk from "../../api/conversations";
@@ -194,6 +194,50 @@ describe("RunDetail", () => {
     expect(screen.getByText(t_runId(RUN_1))).toBeInTheDocument();
     expect(screen.getByText(RUN_1)).toBeInTheDocument();
     expect(screen.getByText(THREAD_ID)).toBeInTheDocument();
+  });
+
+  it("B-226 ⑥ — a success run with completed=false gets the warning status tag; a done run keeps its status", async () => {
+    const priorLang = i18n.language;
+    await i18n.changeLanguage("zh-CN");
+    try {
+      vi.spyOn(runsSdk, "getRun").mockResolvedValue(
+        runDetail({ completed: false, exit_reason: "max_steps" }),
+      );
+      const { unmount } = renderPage();
+      const stopped = await screen.findByTestId("run-detail-status");
+      expect(stopped).toHaveTextContent("已结束，未完成（步数用完）");
+      expect(stopped.className).toContain("ant-tag-warning");
+      // No failures recorded → no failures line.
+      expect(screen.queryByTestId("run-detail-unresolved-failures")).not.toBeInTheDocument();
+      unmount();
+
+      // B-226 ⑥ —— a natural end with a failed tool lists which tool.
+      vi.spyOn(runsSdk, "getRun").mockResolvedValue(
+        runDetail({
+          completed: false,
+          exit_reason: "text_response",
+          unresolved_failures: [
+            { tool: "bash", kind: "unknown" },
+            { tool: "mcp__crm__update", kind: "blocked_by_policy" },
+          ],
+        }),
+      );
+      const second = renderPage();
+      expect(await screen.findByTestId("run-detail-unresolved-failures")).toHaveTextContent(
+        "未解决的失败：bash（unknown）、mcp__crm__update（blocked_by_policy）",
+      );
+      second.unmount();
+
+      vi.spyOn(runsSdk, "getRun").mockResolvedValue(
+        runDetail({ completed: true, exit_reason: "text_response" }),
+      );
+      renderPage();
+      const done = await screen.findByTestId("run-detail-status");
+      expect(done).toHaveTextContent("success");
+      expect(done.className).not.toContain("ant-tag-warning");
+    } finally {
+      await i18n.changeLanguage(priorLang);
+    }
   });
 
   // ② pending_approval 出 ApprovalCard

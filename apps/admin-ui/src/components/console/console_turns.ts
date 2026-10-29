@@ -9,6 +9,7 @@
  * this module is its only surviving implementation.
  */
 import type { ApprovalItem } from "../../api/approvals";
+import { runCompletionOf } from "../../api/run_completion";
 import type { StatsTurnInput } from "../../api/session_stats";
 import type { SseEvent } from "../../api/sessions";
 import { NON_TERMINAL_RUN_STATUSES } from "../../api/runs";
@@ -146,6 +147,13 @@ export function buildConsoleTurns(args: {
       supersededBy: h.supersededBy,
       tombstone: h.tombstone,
       queued: inFlight && isQueuedTurn(load.events, h.status),
+      // B-226 ⑥ — from the run row, so it is known before the turn replays.
+      runCompletion: runCompletionOf({
+        status: h.status,
+        completed: h.completed,
+        exit_reason: h.exitReason,
+        unresolved_failures: h.unresolvedFailures,
+      }),
     });
     seq += 1;
   }
@@ -170,6 +178,7 @@ export function buildConsoleTurns(args: {
       supersededBy: null,
       tombstone: false,
       queued: turn.status === "running" && isQueuedTurn(turn.events, null),
+      runCompletion: null,
     });
     seq += 1;
   }

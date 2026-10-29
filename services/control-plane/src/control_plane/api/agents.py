@@ -129,6 +129,7 @@ from expert_work.runtime.runs import (
     RunIdempotencyConflict,
     RunInfo,
     RunStore,
+    external_run_status,
 )
 from expert_work.runtime.stream_bridge import StreamBridge
 from orchestrator import AgentFactoryError, PlatformNotConfiguredError
@@ -332,7 +333,9 @@ async def _idempotent_run_response(
             "data": {
                 "run_id": str(run.run_id),
                 "thread_id": str(run.thread_id),
-                "status": run.status.value,
+                # B-226 ⑥ —— a replayed retry of a finished run reports the
+                # same partner status as the run list (``incomplete``).
+                "status": external_run_status(run.status, run.exit_reason),
             },
             "error": None,
         },

@@ -50,7 +50,13 @@ from expert_work.persistence.feedback_store import FeedbackStore
 from expert_work.persistence.tenant_user import TenantUserStore
 from expert_work.persistence.thread_meta import ThreadMetaStore
 from expert_work.protocol.approval import ApprovalStatus
-from expert_work.runtime.runs import RunEventRecord, RunEventStore, RunInfo, RunStore
+from expert_work.runtime.runs import (
+    RunEventRecord,
+    RunEventStore,
+    RunInfo,
+    RunStore,
+    external_run_status,
+)
 from expert_work.runtime.runs.event_store import MAX_LIST_LIMIT
 
 logger = logging.getLogger("expert_work.control_plane.api.external_session_items")
@@ -71,9 +77,8 @@ AUX_EVENT_NAMES: tuple[str, ...] = ("plan", "approval", "error")
 #: 这一页。两次查询各拿满一份预算,谁也挤不掉谁。
 WORKER_EVENT_NAMES: tuple[str, ...] = ("worker",)
 
-#: ``worker`` 帧信封的 ``kind``,以及 ``end`` 帧里非成功的两个 ``outcome``。
+#: ``worker`` 帧信封的 ``kind``。
 _WORKER_KINDS = frozenset({"start", "update", "end"})
-_WORKER_FAILED_OUTCOMES = frozenset({"max_steps", "cancelled"})
 
 
 def _get_thread_repo(request: Request) -> ThreadMetaStore:
@@ -236,8 +241,15 @@ def _worker_trees(records: Sequence[RunEventRecord]) -> dict[str, dict[str, Any]
         elif kind == "update":
             node["steps"].append(_worker_step(frame, data))
         else:
+            # B-226 ⑥ — pass ``outcome`` through as-is. This used to keep only
+            # max_steps / cancelled and turn everything else into success, so a
+            # worker halted at an approval gate (approval_blocked) read as a
+            # success. Future values pass through too (the docs tell clients to
+            # treat unknown values as not done). An end frame without an outcome
+            # gets no invented ending: the node stays ``running``.
             outcome = data.get("outcome")
-            node["status"] = outcome if outcome in _WORKER_FAILED_OUTCOMES else "success"
+            if isinstance(outcome, str) and outcome:
+                node["status"] = outcome
             node["summary"] = {
                 "iteration_used": _int_at(data, "iteration_used") or 0,
                 "llm_call_count": _int_at(data, "llm_call_count") or 0,
@@ -467,7 +479,8 @@ def build_external_session_items_router() -> APIRouter:
                     "runs": [
                         {
                             "run_id": str(run.run_id),
-                            "status": run.status.value,
+                            # B-226 ⑥ —— ``incomplete`` when a platform limit stopped it.
+                            "status": external_run_status(run.status, run.exit_reason),
                             "created_at": run.created_at.isoformat() if run.created_at else None,
                             "duration_ms": _duration_ms(run),
                             "error": run.error,
@@ -483,6 +496,12 @@ def build_external_session_items_router() -> APIRouter:
                             "regenerated_from": str(run.regenerated_from_run_id)
                             if run.regenerated_from_run_id
                             else None,
+                            # B-226 ⑥ — same source as the end frame; null = no record,
+                            # not false.
+                            "completed": run.completed,
+                            "exit_reason": run.exit_reason,
+                            # B-226 ⑥ —— ``[{tool, kind}]``; null = no record.
+                            "unresolved_failures": run.unresolved_failures,
                         }
                         for run in turns
                     ],

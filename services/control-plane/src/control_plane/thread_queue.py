@@ -145,8 +145,18 @@ async def queued_turn_stream(
             row = await store.get(run_id=run_id, tenant_id=tenant_id)
             if row is None or row.status is not RunStatus.QUEUED:
                 if row is not None and row.status in _END_STATUS:
+                    # B-226 ⑥ — the row's completion record rides this end as on
+                    # every other path, so a limit-stopped run reads ``incomplete``.
                     yield format_sse(
-                        "end", end_frame_data(run_id=run_id, status=_END_STATUS[row.status])
+                        "end",
+                        end_frame_data(
+                            run_id=run_id,
+                            status=_END_STATUS[row.status],
+                            artifacts=row.artifacts,
+                            completed=row.completed,
+                            exit_reason=row.exit_reason,
+                            unresolved_failures=row.unresolved_failures,
+                        ),
                     )
                 logger.info(
                     "thread_queue.left_queue run_id=%s status=%s",

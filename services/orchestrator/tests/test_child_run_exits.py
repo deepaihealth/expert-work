@@ -306,6 +306,21 @@ async def test_child_with_no_answer_is_failed_not_completed() -> None:
 
 
 @pytest.mark.asyncio
+async def test_child_with_no_answer_end_frame_is_not_success() -> None:
+    """B-226 ⑥ — the parent gets a "produced no answer" failure, yet the end
+    frame said success. The contract has no ``failed``; a worker that ended
+    without handing back a result uses the existing ``cancelled`` (the same
+    value as an unexpected error)."""
+    graph = _StreamingGraph([], {"messages": [HumanMessage(content="t")], "step_count": 1})
+    frames: list[dict[str, Any]] = []
+
+    await _run(graph, _collecting_ctx(frames))
+
+    (end,) = _ends(frames)
+    assert end["data"]["outcome"] == "cancelled"
+
+
+@pytest.mark.asyncio
 async def test_block_list_answer_is_joined_text_not_a_python_repr() -> None:
     answer = AIMessage(
         content=[

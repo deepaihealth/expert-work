@@ -370,9 +370,13 @@ class RunManager:
         artifacts: list[dict[str, Any]] | None = None,
         completed: bool | None = None,
         exit_reason: str | None = None,
+        unresolved_failures: list[dict[str, Any]] | None = None,
     ) -> bool:
         """Update a run's status. Returns ``True`` iff the run exists
         **and the durable transition landed**.
+
+        ``unresolved_failures`` (B-226 ⑥) rides with ``completed``: the run's
+        final failure ledger as ``[{tool, kind}]``, ``None`` leaves it alone.
 
         ``error`` carries the failure detail for ERROR / TIMEOUT
         transitions; it lands in the durable ``agent_run`` row. A
@@ -415,6 +419,7 @@ class RunManager:
                     artifacts=artifacts,
                     completed=completed,
                     exit_reason=exit_reason,
+                    unresolved_failures=unresolved_failures,
                     expected_statuses=(
                         (RunStatus.PENDING, RunStatus.QUEUED, RunStatus.RUNNING)
                         if status is RunStatus.RUNNING

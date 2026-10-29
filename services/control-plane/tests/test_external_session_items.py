@@ -176,6 +176,9 @@ class _Ctx:
         finished_at: datetime | None = None,
         error: str | None = None,
         regenerated_from_run_id: UUID | None = None,
+        completed: bool | None = None,
+        exit_reason: str | None = None,
+        unresolved_failures: list[dict[str, str]] | None = None,
     ) -> UUID:
         """在同一段会话上再加一轮 —— 直接写 store,时刻才可控。"""
         run_id = uuid4()
@@ -193,6 +196,9 @@ class _Ctx:
                 updated_at=created_at,
                 finished_at=finished_at,
                 regenerated_from_run_id=regenerated_from_run_id,
+                completed=completed,
+                exit_reason=exit_reason,
+                unresolved_failures=unresolved_failures,
             )
         )
         return run_id
@@ -378,6 +384,10 @@ async def test_items_renders_one_turn_end_to_end(ctx: _Ctx) -> None:
             # P-1 —— 普通一轮:两个链接键恒在、恒 null。
             "superseded_by": None,
             "regenerated_from": None,
+            # B-226 ⑥ — this row was never stamped = no record = null (keys always present).
+            "completed": None,
+            "exit_reason": None,
+            "unresolved_failures": None,
         }
     ]
     assert body["runs"][0]["created_at"] is not None
@@ -687,6 +697,59 @@ async def test_items_returns_run_level_info_when_the_checkpoint_is_gone(ctx: _Ct
     ]
 
 
+@pytest.mark.asyncio
+async def test_runs_carry_completed_and_exit_reason(ctx: _Ctx) -> None:
+    """B-226 ⑥ — a turn that used up its steps still has ``status=success``; only
+    ``completed`` / ``exit_reason`` tell "finished but not done" apart. A turn
+    with no record has ``null`` for both."""
+    await ctx.seed_agent()
+    session_id, unstamped = await ctx.open_session()
+    done = await ctx.add_run(
+        session_id,
+        created_at=ctx.origin + timedelta(minutes=1),
+        finished_at=ctx.origin + timedelta(minutes=1, seconds=2),
+        completed=True,
+        exit_reason="text_response",
+    )
+    stopped = await ctx.add_run(
+        session_id,
+        created_at=ctx.origin + timedelta(minutes=2),
+        finished_at=ctx.origin + timedelta(minutes=2, seconds=2),
+        completed=False,
+        exit_reason="max_steps",
+    )
+    failed_tool = await ctx.add_run(
+        session_id,
+        created_at=ctx.origin + timedelta(minutes=3),
+        finished_at=ctx.origin + timedelta(minutes=3, seconds=2),
+        completed=False,
+        exit_reason="text_response",
+        unresolved_failures=[{"tool": "bash", "kind": "unknown"}],
+    )
+
+    resp = await ctx.items(session_id)
+    assert resp.status_code == 200, resp.text
+    by_run = {r["run_id"]: r for r in resp.json()["data"]["runs"]}
+    assert (by_run[str(done)]["completed"], by_run[str(done)]["exit_reason"]) == (
+        True,
+        "text_response",
+    )
+    assert by_run[str(done)]["status"] == "success"
+    # B-226 ⑥ —— a platform limit stopped it: ``incomplete``.
+    assert by_run[str(stopped)]["status"] == "incomplete"
+    # A natural end with a failed tool stays success; the list says which tool.
+    assert by_run[str(failed_tool)]["status"] == "success"
+    assert by_run[str(failed_tool)]["completed"] is False
+    assert by_run[str(failed_tool)]["unresolved_failures"] == [{"tool": "bash", "kind": "unknown"}]
+    assert by_run[str(unstamped)]["unresolved_failures"] is None
+    assert (by_run[str(stopped)]["completed"], by_run[str(stopped)]["exit_reason"]) == (
+        False,
+        "max_steps",
+    )
+    assert by_run[str(unstamped)]["completed"] is None
+    assert by_run[str(unstamped)]["exit_reason"] is None
+
+
 def _worker_frame(
     kind: str,
     *,
@@ -834,6 +897,62 @@ async def test_items_backfills_the_worker_tree_onto_its_tool_call(ctx: _Ctx) -> 
     assert "parent_tool_call_id" not in worker
     # 没派生子任务的那次调用整个键缺席(上面几条证明这不是「回填全失灵」)。
     assert "worker" not in calls["call-plain"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("end_data", "expected"),
+    [
+        ({"outcome": "success"}, "success"),
+        ({"outcome": "max_steps"}, "max_steps"),
+        ({"outcome": "cancelled"}, "cancelled"),
+        # B-226 ⑥ — a worker halted at an approval gate used to read as success here.
+        ({"outcome": "approval_blocked"}, "approval_blocked"),
+        # A future value passes through, never rewritten to success (the docs:
+        # treat unknown values as not done).
+        ({"outcome": "future_value"}, "future_value"),
+        # An end frame without an outcome gets no invented ending.
+        ({}, "running"),
+    ],
+)
+async def test_worker_status_never_rewrites_an_outcome_to_success(
+    ctx: _Ctx, end_data: dict[str, Any], expected: str
+) -> None:
+    await ctx.seed_agent()
+    session_id, run_id = await ctx.open_session()
+    await _seed_one_tool_call_turn(ctx, session_id, run_id)
+    await ctx.event_store.append_batch(
+        [
+            make_event_record(
+                run_id=run_id,
+                seq=0,
+                event_name="worker",
+                data=_worker_frame(
+                    "start",
+                    worker_id="w-1",
+                    wseq=0,
+                    parent_tool_call_id="call-worker",
+                    data={"task_excerpt": "查排班", "role": None, "max_steps": 8},
+                ),
+            ),
+            make_event_record(
+                run_id=run_id,
+                seq=1,
+                event_name="worker",
+                data=_worker_frame(
+                    "end",
+                    worker_id="w-1",
+                    wseq=1,
+                    parent_tool_call_id="call-worker",
+                    data={**end_data, "iteration_used": 1, "llm_call_count": 1, "wall_clock_ms": 9},
+                ),
+            ),
+        ]
+    )
+
+    body = (await ctx.items(session_id)).json()["data"]
+    calls = {i["call_id"]: i for i in body["items"] if i["type"] == "tool_call"}
+    assert calls["call-worker"]["worker"]["status"] == expected
 
 
 @pytest.mark.asyncio

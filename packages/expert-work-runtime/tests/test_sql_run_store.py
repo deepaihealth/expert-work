@@ -958,6 +958,95 @@ async def test_set_status_completion_signal_round_trip_and_none_keeps(
     assert kept.completed is False and kept.exit_reason == "text_response"
 
 
+@pytest.mark.asyncio
+async def test_set_status_unresolved_failures_round_trip_and_none_keeps(
+    run_store: SqlRunStore,
+) -> None:
+    """B-226 ⑥ — mirror of the in-memory case: a list round-trips through the
+    JSONB column, ``[]`` is written, ``None`` leaves the stored value alone."""
+    run_id, tenant_id = uuid4(), uuid4()
+    await run_store.create(_info(run_id=run_id, tenant_id=tenant_id))
+    fresh = await run_store.get(run_id=run_id, tenant_id=tenant_id)
+    assert fresh is not None and fresh.unresolved_failures is None, "never written = no record"
+
+    failures = [
+        {"tool": "bash", "kind": "unknown"},
+        {"tool": "mcp__crm__update", "kind": "blocked_by_policy"},
+    ]
+    await run_store.set_status(
+        run_id=run_id,
+        tenant_id=tenant_id,
+        status=RunStatus.SUCCESS,
+        updated_at=_BASE + timedelta(seconds=5),
+        unresolved_failures=failures,
+    )
+    fetched = await run_store.get(run_id=run_id, tenant_id=tenant_id)
+    assert fetched is not None and fetched.unresolved_failures == failures
+
+    await run_store.set_status(
+        run_id=run_id,
+        tenant_id=tenant_id,
+        status=RunStatus.SUCCESS,
+        updated_at=_BASE + timedelta(seconds=6),
+        unresolved_failures=[],
+    )
+    emptied = await run_store.get(run_id=run_id, tenant_id=tenant_id)
+    assert emptied is not None and emptied.unresolved_failures == []
+
+    await run_store.set_status(
+        run_id=run_id,
+        tenant_id=tenant_id,
+        status=RunStatus.SUCCESS,
+        updated_at=_BASE + timedelta(seconds=7),
+    )
+    kept = await run_store.get(run_id=run_id, tenant_id=tenant_id)
+    assert kept is not None and kept.unresolved_failures == []
+
+
+@pytest.mark.asyncio
+async def test_list_for_tenant_incomplete_predicate_partitions_successes(
+    run_store: SqlRunStore,
+) -> None:
+    """B-226 ⑥ — mirror of the in-memory case on Postgres. The NULL-exit
+    success (``legacy``) is the row a bare ``NOT IN`` would drop: ``NULL NOT IN
+    (...)`` is NULL, not true, so the ``False`` side needs the ``IS NULL`` arm."""
+    tenant_id = uuid4()
+    seeded: dict[str, tuple[RunStatus, str | None]] = {
+        "clean": (RunStatus.SUCCESS, "text_response"),
+        "legacy": (RunStatus.SUCCESS, None),
+        "max_steps": (RunStatus.SUCCESS, "max_steps"),
+        "no_progress": (RunStatus.SUCCESS, "no_progress"),
+        "error": (RunStatus.ERROR, None),
+    }
+    ids: dict[str, UUID] = {}
+    for i, (label, (status, exit_reason)) in enumerate(seeded.items()):
+        run_id = uuid4()
+        await run_store.create(
+            _info(run_id=run_id, tenant_id=tenant_id, created_at=_BASE + timedelta(seconds=i))
+        )
+        await run_store.set_status(
+            run_id=run_id,
+            tenant_id=tenant_id,
+            status=status,
+            updated_at=_BASE + timedelta(seconds=10 + i),
+            exit_reason=exit_reason,
+        )
+        ids[label] = run_id
+
+    async def listed(status: RunStatus, incomplete: bool | None = None) -> set[UUID]:
+        rows = await run_store.list_for_tenant(
+            tenant_id=tenant_id, status=status, incomplete=incomplete
+        )
+        return {r.run_id for r in rows}
+
+    stopped = await listed(RunStatus.SUCCESS, incomplete=True)
+    natural = await listed(RunStatus.SUCCESS, incomplete=False)
+    assert stopped == {ids["max_steps"], ids["no_progress"]}
+    assert natural == {ids["clean"], ids["legacy"]}
+    assert stopped | natural == await listed(RunStatus.SUCCESS)
+    assert await listed(RunStatus.ERROR) == {ids["error"]}
+
+
 # ---------------------------------------------------------------------------
 # 多副本 CAS 守卫 —— 与 in-memory 店谓词 byte-同义(test_run_store 有镜像用例)
 # ---------------------------------------------------------------------------

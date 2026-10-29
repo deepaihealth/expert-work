@@ -287,9 +287,12 @@ class ErrorItem(_ItemBase):
     与 ``runs[].error`` 同源。放进 items 是为了让它出现在时间线的正确位置 ——
     一轮跑了一半才失败时,错误应当排在已产出的内容之后。
 
-    ``name`` 是异常类名,与 SSE ``error`` 帧的同名字段一路同源。对外文档已经
-    就 ``MaxStepsExceededError`` 这个取值给出过语义承诺(撞了步数上限,不是
-    平台故障),只留 ``message`` 会把这份承诺丢掉。取不到时缺席。
+    ``name`` 是异常类名,与 SSE ``error`` 帧的同名字段一路同源。取不到时缺席。
+
+    B-226 ⑥: the partner docs no longer promise any meaning for a ``name``
+    value — it is an open value for logs only. ``MaxStepsExceededError`` used
+    to be documented, but step / budget exhaustion ends the run with
+    ``status=success`` + ``completed=false`` and no ``error`` frame.
     """
 
     TYPE: ClassVar[str] = "error"
