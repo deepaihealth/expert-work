@@ -22,7 +22,12 @@ what was searched and the references of the passages it showed — each re-reada
 with ``knowledge_read``, and the same arguments run the search again. Only the
 query (the model's own words) is echoed; bases are named by handle (``K2``) and
 passages by reference (``D12#7``), a hit without a document number is only
-counted, so no base name, file name or document text leaves the fence.
+counted, so the line itself carries no base name, file name or document text (the
+cross-turn stub's argument header echoes the model's own call arguments, which
+already sit unfenced in its tool call). Handles are positions in the agent's
+base list, so a version that reorders its bases re-points them; passage
+references stay valid. A search with a failed retrieval path or unsearched
+bases says so, and when it found nothing, that this is not absence (K-22).
 
 Consumed by :mod:`orchestrator.context.tool_result_prune`: the in-turn collapse
 (CM-12) and the cross-turn cleanup (B-126).
@@ -44,6 +49,7 @@ _PASSAGE_REF = re.compile(r"D[0-9]+#[0-9]+")
 _BASE_HANDLE = re.compile(r"K[1-9][0-9]*")
 #: A search that ran: found passages, or found none.
 _SEARCH_STATUSES = frozenset({"ok", "no_hits", "below_threshold"})
+_NOTHING_FOUND = "no passage found"
 #: Passage references listed in a search's line; the rest are counted.
 MAX_LISTED_PASSAGES = 10
 
@@ -105,8 +111,16 @@ def knowledge_search_reference(message: BaseMessage) -> str | None:
             searched += f" in bases {', '.join(handles)}"
     if _is_int(args.get("limit")):
         searched += f", limit {args['limit']}"
-    if _count(artifact.get("unsearched")):
+    unsearched = _count(artifact.get("unsearched")) > 0
+    degraded = any(artifact.get(f) is True for f in ("keyword_degraded", "embedding_degraded"))
+    nothing_found = found == _NOTHING_FOUND
+    if unsearched:
         found += "; some knowledge bases could not be searched"
+    if degraded:
+        found += "; the search was incomplete (one of its retrieval paths failed)"
+    if (unsearched or degraded) and nothing_found:
+        # K-22: an incomplete search that found nothing must not read as "not stated".
+        found += ", so finding nothing does not show the knowledge base lacks it"
     rerun = "the search can be run again via the knowledge_search tool"
     if whole:
         rerun += " with the same arguments"
@@ -123,7 +137,7 @@ def _found_passages(artifact: dict[str, Any]) -> str | None:
     :data:`MAX_LISTED_PASSAGES`, the rest counted), how many had no reference,
     or that it found none; ``None`` for a search with hits but no recorded list."""
     if artifact.get("status") != "ok":
-        return "no passage found"
+        return _NOTHING_FOUND
     refs = artifact.get("refs")
     if not isinstance(refs, list):
         return None
@@ -131,7 +145,7 @@ def _found_passages(artifact: dict[str, Any]) -> str | None:
     unnumbered = _count(artifact.get("unnumbered"))
     if not listed:
         if not unnumbered:
-            return "no passage found"
+            return _NOTHING_FOUND
         return f"{unnumbered} passage{'s' if unnumbered != 1 else ''} without a reference"
     found = f"passages {', '.join(listed[:MAX_LISTED_PASSAGES])}"
     if len(listed) > MAX_LISTED_PASSAGES:

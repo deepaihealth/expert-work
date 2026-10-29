@@ -98,8 +98,38 @@ def test_bases_that_could_not_be_searched_are_noted() -> None:
     assert reference is not None
     assert reference.startswith(
         "[knowledge_search for 'q': no passage found; some knowledge bases could not be "
-        "searched — content compressed;"
+        "searched, so finding nothing does not show the knowledge base lacks it — content "
+        "compressed;"
     )
+
+
+def test_a_search_with_a_failed_retrieval_path_is_not_read_as_absence() -> None:
+    # K-22 / K-8: a search whose keyword path or query embedding failed found
+    # nothing for a reason that says nothing about the documents; its collapsed
+    # line must keep that, or the grounding rule turns it into "not stated".
+    for flag in ("keyword_degraded", "embedding_degraded"):
+        meta = {"hits": 0, "status": "no_hits", "args": {"query": "q"}, flag: True}
+
+        reference = knowledge_search_reference(_search("a", meta))
+
+        assert reference is not None
+        assert reference.startswith(
+            "[knowledge_search for 'q': no passage found; the search was incomplete (one of "
+            "its retrieval paths failed), so finding nothing does not show the knowledge base "
+            "lacks it — content compressed;"
+        ), flag
+
+
+def test_a_degraded_search_with_hits_says_it_was_incomplete() -> None:
+    meta = _meta(keyword_degraded=True)
+
+    reference = knowledge_search_reference(_search("a", meta))
+
+    assert reference is not None
+    assert "; the search was incomplete (one of its retrieval paths failed) — content" in (
+        reference
+    )
+    assert "finding nothing" not in reference
 
 
 def test_the_query_is_quoted_and_capped() -> None:
