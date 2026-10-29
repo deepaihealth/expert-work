@@ -537,7 +537,8 @@ async def test_unknown_status_reads_as_failed(
         await session.execute(
             update(KnowledgeDocumentRow)
             .where(KnowledgeDocumentRow.id == document.id)
-            .values(status="awaiting_confirmation")
+            # B-222 PR-2 made ``awaiting_confirmation`` a known status.
+            .values(status="quarantined_by_a_newer_release")
         )
         await session.commit()
 
@@ -546,7 +547,7 @@ async def test_unknown_status_reads_as_failed(
 
     assert read.status is DocumentStatus.FAILED
     assert read.error is not None
-    assert "awaiting_confirmation" in read.error
+    assert "quarantined_by_a_newer_release" in read.error
     assert [d.status for d in listed] == [DocumentStatus.FAILED]
 
 

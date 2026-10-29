@@ -20,24 +20,29 @@ import asyncio
 import logging
 from datetime import UTC, datetime
 
+from control_plane.knowledge.estimate import IngestEstimator
 from control_plane.knowledge.ingestion import (
     CONTENT_MISSING_ERROR,
     LocalIngests,
     StaleIngestionError,
+    estimate_document,
     failure_code,
     ingest_document_bytes,
     lease_guard,
+    record_actual,
     renew_lease_periodically,
+    start_paid_ingest,
 )
 from control_plane.knowledge.parsed_size import DocumentTooLargeError, Hold, reserve_raw_bytes
 from control_plane.knowledge.recognition.figure_pipeline import FigureDescriber
 from control_plane.knowledge.recognition.recognizer import DocumentRecognizer
-from control_plane.knowledge.usage import IngestUsageRecorder
+from control_plane.knowledge.usage import IngestSpend, IngestUsageRecorder, spend_scope
 from expert_work.common.observability import expert_work_counter
 from expert_work.persistence import KnowledgeStore
 from expert_work.persistence.knowledge.base import ClaimedIngestion
 from expert_work.persistence.rls import bypass_rls_var, current_tenant_id_var
 from expert_work.protocol import DocumentStatus, IngestErrorCode
+from expert_work.protocol.knowledge_estimate import IngestOutcome
 from orchestrator.llm import Embedder
 
 logger = logging.getLogger("expert_work.control_plane.knowledge.recovery")
@@ -78,6 +83,7 @@ class KnowledgeIngestRecoveryWorker:
         usage: IngestUsageRecorder | None = None,
         figures: FigureDescriber | None = None,
         local: LocalIngests | None = None,
+        estimator: IngestEstimator | None = None,
     ) -> None:
         if interval_s <= 0:
             msg = "interval_s must be positive"
@@ -87,6 +93,9 @@ class KnowledgeIngestRecoveryWorker:
         self._recognizer = recognizer
         self._usage = usage
         self._figures = figures
+        #: B-222 PR-2 —— estimates claimed documents, prices what ingests cost
+        #: (the runner's, so both price alike).
+        self.estimator = estimator or IngestEstimator(store=store, recognizer=recognizer)
         self._interval_s = interval_s
         # One cycle claims at most ``concurrency`` documents and drives them
         # all at once — never more claims than can be worked, so no lease
@@ -268,31 +277,47 @@ class KnowledgeIngestRecoveryWorker:
             )
             _failed_terminal.inc()
             return True
-        ready = written = False
+        ready = written = settled_failure = retrying = False
+        #: B-222 PR-2 —— what the paid ingest was billed (none for an estimate).
+        spend: IngestSpend | None = None
         try:
             try:
-                chunk_count = await ingest_document_bytes(
-                    store=self._store,
-                    embedder=self._embedder,
-                    tenant_id=claim.tenant_id,
-                    document_id=claim.document_id,
-                    kb_id=claim.kb_id,
-                    filename=claim.filename,
-                    raw=claim.content,
-                    chunk_max_tokens=claim.chunk_max_tokens,
-                    chunk_overlap_tokens=claim.chunk_overlap_tokens,
-                    generation=claim.generation,
-                    recognizer=self._recognizer,
-                    usage=self._usage,
-                    figures=self._figures,
-                    guard=lease_guard(
-                        self._store,
+                if claim.phase == "estimate":
+                    # B-222 PR-2: the free estimate; then it waits for its confirmation.
+                    await estimate_document(
+                        self._store, self.estimator, self._embedder, claim, figures=self._figures
+                    )
+                    return True
+                start = await start_paid_ingest(
+                    self._store, self.estimator, self._embedder, claim, figures=self._figures
+                )
+                if start.returned:
+                    return True  # asked again: nothing spent
+                spend = IngestSpend()
+                with spend_scope(spend):
+                    chunk_count = await ingest_document_bytes(
+                        store=self._store,
+                        embedder=self._embedder,
                         tenant_id=claim.tenant_id,
                         document_id=claim.document_id,
+                        kb_id=claim.kb_id,
+                        filename=claim.filename,
+                        raw=claim.content,
+                        chunk_max_tokens=claim.chunk_max_tokens,
+                        chunk_overlap_tokens=claim.chunk_overlap_tokens,
                         generation=claim.generation,
-                        lease_seconds=self._lease_seconds,
-                    ),
-                )
+                        recognizer=self._recognizer,
+                        usage=self._usage,
+                        figures=self._figures,
+                        guard=lease_guard(
+                            self._store,
+                            tenant_id=claim.tenant_id,
+                            document_id=claim.document_id,
+                            generation=claim.generation,
+                            lease_seconds=self._lease_seconds,
+                        ),
+                        local=start.local,
+                    )
             finally:
                 finishing.set()
             written = True  # this claim's chunks are in place
@@ -338,6 +363,7 @@ class KnowledgeIngestRecoveryWorker:
                     error_code=failure_code(exc),
                     generation=claim.generation,
                 )
+                settled_failure = True
                 _failed_terminal.inc()
                 logger.warning(
                     "knowledge.recovery_failed_terminal document=%s attempts=%d",
@@ -348,6 +374,7 @@ class KnowledgeIngestRecoveryWorker:
                 return True
             # Retries remain — leave it processing; the lease will expire and a
             # later sweep re-claims it.
+            retrying = True
             logger.warning(
                 "knowledge.recovery_retry document=%s attempts=%d",
                 claim.document_id,
@@ -356,7 +383,20 @@ class KnowledgeIngestRecoveryWorker:
             )
             return False
         finally:
-            if self._figures is not None:
+            if spend is not None:
+                outcome: IngestOutcome = (
+                    "ready" if ready else "failed" if settled_failure or retrying else "stopped"
+                )
+                # A retry adds to this attempt's spend (same generation).
+                await record_actual(
+                    self._store,
+                    self.estimator,
+                    claim,
+                    spend,
+                    outcome=outcome,
+                    settled=not retrying,
+                )
+            if self._figures is not None and claim.phase == "ingest":
                 # B-209 PR-2 (review H5): same tidy-up as the fast path.
                 await self._figures.tidy(claim, settled=ready, serving=written)
         _recovered.inc()

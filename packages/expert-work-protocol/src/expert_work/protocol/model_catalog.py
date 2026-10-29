@@ -209,6 +209,26 @@ class OcrCaps(BaseModel):
     rpm: int | None = None
 
 
+class EstimateCaps(BaseModel):
+    """B-222 —— what one call of the model takes, for the ingest estimate (no
+    model is called to estimate). ``None`` = not measured → the platform's
+    generic averages, and the line says so (「按通用均值估」). The source of each
+    value is noted at the entry: a usage measurement, or a cap the platform
+    sends (an over-estimate)."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    # A scanned page read by the model (as page reader or fallback).
+    page_input_tokens: int | None = None
+    page_output_tokens: int | None = None
+    # A figure described by the model (one call per figure).
+    figure_input_tokens: int | None = None
+    figure_output_tokens: int | None = None
+    # Embedding models: the vendor's tokens per token the platform counts
+    # locally (cl100k) on the same text.
+    embed_tokens_per_local_token: float | None = None
+
+
 class ModelEntry(BaseModel):
     """One selectable model for a provider."""
 
@@ -292,6 +312,9 @@ class ModelEntry(BaseModel):
     # B-209 —— 能做知识库扫描页识别的模型。``chat_vlm`` 形态只能挂在 ``vision=True`` 的
     # 条目上;``layout_parsing`` 形态的模型不收提示词,不是对话模型(见 :attr:`ocr_only`)。
     ocr_caps: OcrCaps | None = None
+    # B-222 —— per-call averages for the ingest estimate. None = the platform's
+    # generic averages.
+    estimate_caps: EstimateCaps | None = None
 
     @property
     def ocr_only(self) -> bool:
@@ -648,9 +671,13 @@ MODEL_CATALOG: dict[Provider, tuple[ModelEntry, ...]] = {
         # B-209 知识库扫描页识别的默认模型(2026-10-21 选模型实测:错字率中位 1.8%、每页
         # 1.6 s)。版面解析接口,不收提示词 —— 不是对话模型,不进对话模型下拉。并发 4 偶发
         # 429,默认并发 2。
+        # B-222 估算均值(2026-10-28 测试库只读查 knowledge_ingest 用量,54 次调用):每页输入取
+        # p90(2,035);输出取 8,192 —— p90 与最大值都是它,即厂商自己的输出上限(版面解析接口
+        # 平台不发上限),按上限估、只会多估。
         ModelEntry(
             name="glm-ocr",
             ocr_caps=OcrCaps(api="layout_parsing", max_concurrency=2),
+            estimate_caps=EstimateCaps(page_input_tokens=2_035, page_output_tokens=8_192),
         ),
         ModelEntry(name="glm-4-plus", vision=False, context_window=128_000, deprecated=True),
         ModelEntry(name="glm-4v-plus", vision=True, context_window=8_000, deprecated=True),
@@ -741,6 +768,8 @@ MODEL_CATALOG: dict[Provider, tuple[ModelEntry, ...]] = {
         # 思考形态 / 输出上限字段按同代 qwen3.x 填(budget、enable_thinking、
         # max_completion_tokens 合计上限)—— B-105 的上架探针(开思考 + cap=300、关思考、
         # cap=10,000,000)还没跑,随 B-209 的测试环境验收补跑;max_output_tokens 未实调不填。
+        # B-222 估算均值:扫描页输入 2,733(2026-10-28 测试库 185 次调用每次都是它 —— 页面按固定
+        # 的 2,000 px 长边渲染,输入跟着定);输出按平台发的上限 8,192(``max_output_tokens``)估。
         ModelEntry(
             name="qwen3.7-flash",
             vision=True,
@@ -749,7 +778,11 @@ MODEL_CATALOG: dict[Provider, tuple[ModelEntry, ...]] = {
             output_cap_field="max_completion_tokens",
             thinking_cap=True,
             ocr_caps=OcrCaps(api="chat_vlm", max_output_tokens=8_192),
+            estimate_caps=EstimateCaps(page_input_tokens=2_733, page_output_tokens=8_192),
         ),
+        # B-222 估算均值:每张图输入 2,711(2026-10-28 测试库 18 次调用的最大值;图片同样压到
+        # 2,000 px 长边,与整页渲染同一量级);输出按描述的上限 1,024(``DESCRIBE_MAX_TOKENS``)。
+        # 每张按一次调用估:图表转数据、图中文字另外的调用不计。
         ModelEntry(
             name="qwen3.8-flash",
             vision=True,
@@ -758,6 +791,7 @@ MODEL_CATALOG: dict[Provider, tuple[ModelEntry, ...]] = {
             output_cap_field="max_completion_tokens",
             thinking_cap=True,
             ocr_caps=OcrCaps(api="chat_vlm", max_output_tokens=8_192),
+            estimate_caps=EstimateCaps(figure_input_tokens=2_711, figure_output_tokens=1_024),
         ),
         # Platform embedding model (Stream T, user-specified).
         # B-206 K-5 —— 2026-10-21 真接口实测(中文查询),推翻表 5-A 的「``text_type``,只在

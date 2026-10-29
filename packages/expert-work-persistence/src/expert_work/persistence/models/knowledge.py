@@ -201,6 +201,17 @@ class KnowledgeDocumentRow(Base):
     #: chunks were cut with (``chunking.chunk_params_hash``); one that differs
     #: from the base's current parameters is an old version to re-ingest.
     chunk_params_hash: Mapped[str | None] = mapped_column(Text, nullable=True)
+    #: B-222 PR-2 (migration ``0179``) — the latest estimate (with, for the
+    #: store only, how to put the document back when it is withdrawn), what the
+    #: latest paid ingest was billed, and until when an estimate waits for its
+    #: confirmation.
+    ingest_estimate: Mapped[dict[str, Any] | None] = mapped_column(
+        JSONB(none_as_null=True), nullable=True
+    )
+    ingest_actual: Mapped[dict[str, Any] | None] = mapped_column(
+        JSONB(none_as_null=True), nullable=True
+    )
+    confirm_by: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     size_bytes: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
     mime: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(
@@ -219,7 +230,12 @@ class KnowledgeDocumentRow(Base):
         Index(
             "knowledge_document_recovery_idx",
             "lease_until",
-            postgresql_where=text("status IN ('pending', 'processing')"),
+            postgresql_where=text("status IN ('pending', 'processing', 'estimating')"),
+        ),
+        Index(
+            "knowledge_document_confirm_by_idx",
+            "confirm_by",
+            postgresql_where=text("status = 'awaiting_confirmation'"),
         ),
         UniqueConstraint("tenant_id", "doc_seq", name="knowledge_document_doc_seq_uniq"),
         Index(
@@ -343,6 +359,40 @@ class KnowledgeParseCacheRow(Base):
             name="knowledge_parse_cache_kind_enum",
         ),
     )
+
+
+class KnowledgeParseSnapshotRow(Base):
+    """``knowledge_parse_snapshot`` (migration ``0179``, B-222 PR-2 §5) — an
+    estimate's local parse of the document (gzip JSON, ``format`` names its
+    shape and version), so the ingest it is confirmed for does not parse
+    again. One per document (the latest estimate's, ``estimate_id``); deleted
+    with the document (FK cascade) and once the ingest settles, purged after
+    ``expires_at``. Can hold document text: per document, tenant-isolated."""
+
+    __tablename__ = "knowledge_parse_snapshot"
+
+    tenant_id: Mapped[UUID] = mapped_column(PG_UUID(as_uuid=True), nullable=False)
+    document_id: Mapped[UUID] = mapped_column(
+        PG_UUID(as_uuid=True),
+        ForeignKey(
+            "knowledge_document.id",
+            ondelete="CASCADE",
+            name="fk_knowledge_parse_snapshot_document",
+        ),
+        primary_key=True,
+    )
+    estimate_id: Mapped[UUID] = mapped_column(PG_UUID(as_uuid=True), nullable=False)
+    format: Mapped[str] = mapped_column(Text, nullable=False)
+    payload: Mapped[bytes] = mapped_column(
+        LargeBinary, nullable=False, deferred=True, deferred_raiseload=True
+    )
+    size_bytes: Mapped[int] = mapped_column(Integer, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+    __table_args__ = (Index("knowledge_parse_snapshot_expires_idx", "expires_at"),)
 
 
 class KnowledgeDocSeqRow(Base):

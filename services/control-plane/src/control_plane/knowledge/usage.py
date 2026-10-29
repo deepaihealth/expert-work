@@ -4,13 +4,17 @@
 入库的嵌入(切块时的语义嵌入 + 分段嵌入;按模型合成一行,入库结束时写)。``agent_name``
 留空 —— 这不是哪个智能体的花费。``knowledge_ingest`` 计入账单(不在
 ``NON_BILLABLE_USAGE_KINDS`` 里)。写库失败只记日志,不让入库失败。
+
+B-222 PR-2:一次付费入库期间写的用量行同时记进它的 :class:`IngestSpend`(``spend_scope``),
+入库结束按价目表算成文档的「实际花费」(``ingest_actual``)。
 """
 
 from __future__ import annotations
 
 import logging
-from collections.abc import AsyncIterator, Mapping
-from contextlib import asynccontextmanager
+from collections.abc import AsyncIterator, Iterator, Mapping
+from contextlib import asynccontextmanager, contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 from typing import Any
 from uuid import UUID
@@ -34,6 +38,30 @@ _usage_write_failures = expert_work_counter(
 )
 
 
+@dataclass
+class IngestSpend:
+    """B-222 PR-2 —— the usage rows one paid ingest wrote (``provider``,
+    ``model``, input, output), as the vendor billed them — priced into the
+    document's ``ingest_actual`` once the ingest ends."""
+
+    rows: list[tuple[str | None, str, int, int]] = field(default_factory=list)
+
+
+#: The paid ingest the current task works for (copied into the tasks it starts).
+_spend: ContextVar[IngestSpend | None] = ContextVar("knowledge_ingest_spend", default=None)
+
+
+@contextmanager
+def spend_scope(spend: IngestSpend) -> Iterator[IngestSpend]:
+    """Every usage row recorded inside (and in tasks started inside) also
+    lands in ``spend``."""
+    token = _spend.set(spend)
+    try:
+        yield spend
+    finally:
+        _spend.reset(token)
+
+
 @dataclass(frozen=True)
 class IngestUsageRecorder:
     """Writes ``knowledge_ingest`` usage rows for the uploading tenant."""
@@ -51,6 +79,10 @@ class IngestUsageRecorder:
     ) -> None:
         if input_tokens <= 0 and output_tokens <= 0:
             return
+        spend = _spend.get()
+        if spend is not None:
+            # The vendor billed it, whether or not the row below gets written.
+            spend.rows.append((provider, model, input_tokens, output_tokens))
         record = TokenUsageRecord(
             tenant_id=tenant_id,
             agent_name="",
