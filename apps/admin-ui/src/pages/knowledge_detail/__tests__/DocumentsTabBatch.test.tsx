@@ -128,7 +128,7 @@ describe("DocumentsTab — batch actions (B-175 P3-PR3)", () => {
     await waitFor(() =>
       expect(batch).toHaveBeenCalledWith(BASE_NAME, "reingest", [A.id, B.id]),
     );
-    expect(await screen.findByText("已提交 1 份重新摄取。")).toBeInTheDocument();
+    expect(await screen.findByText("已提交 1 份重新摄取，正在估算费用；估算完成后在「文档」页确认才会开始。")).toBeInTheDocument();
     expect(
       await screen.findByText("跳过 1 份：1 份没保留原文件，需要重新上传"),
     ).toBeInTheDocument();

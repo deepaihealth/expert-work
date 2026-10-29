@@ -104,7 +104,7 @@ describe("SettingsTab — stale documents (B-175 P3-PR3)", () => {
     await userEvent.click(screen.getByTestId("kb-stale-confirm-ok"));
 
     await waitFor(() => expect(reingest).toHaveBeenCalledWith(BASE.name));
-    expect(await screen.findByText("已提交 1 份重新摄取。")).toBeInTheDocument();
+    expect(await screen.findByText("已提交 1 份重新摄取，正在估算费用；估算完成后在「文档」页确认才会开始。")).toBeInTheDocument();
     expect(await screen.findByText("1 份没保留原文件，已跳过，需要重新上传。")).toBeInTheDocument();
     expect(await screen.findByText("还有 3 份没提交，再点一次「全部重新摄取」。")).toBeInTheDocument();
     await waitFor(() => expect(onSaved).toHaveBeenCalled());
@@ -181,7 +181,7 @@ describe("SettingsTab — stale documents (B-175 P3-PR3)", () => {
     await userEvent.click(await screen.findByTestId("kb-settings-reingest-stale"));
     await userEvent.click(await screen.findByTestId("kb-stale-confirm-ok"));
     await waitFor(() => expect(reingest).toHaveBeenCalled());
-    expect(await screen.findByText("已提交 2 份重新摄取。")).toBeInTheDocument();
+    expect(await screen.findByText("已提交 2 份重新摄取，正在估算费用；估算完成后在「文档」页确认才会开始。")).toBeInTheDocument();
     expect(await screen.findByText("所有文档都按当前的切块参数切好了。")).toBeInTheDocument();
   });
 

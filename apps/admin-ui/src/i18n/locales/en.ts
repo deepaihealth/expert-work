@@ -4225,7 +4225,8 @@ const en: TranslationKeys = {
     batch_delete_confirm_body: "Their chunks and revision history go with them. This cannot be undone.",
     batch_done_enable: "Switched on {{n}} documents.",
     batch_done_disable: "Switched off {{n}} documents.",
-    batch_done_reingest: "Re-ingest submitted for {{n}} documents.",
+    batch_done_reingest:
+      "Submitted {{n}} document(s) for re-ingest. Their cost is being estimated — confirm it on the Documents tab to start.",
     batch_done_delete: "Deleted {{n}} documents.",
     batch_skipped: "Skipped {{n}}: {{reasons}}",
     skip_not_found: "{{n}} no longer in this base",
@@ -4245,9 +4246,10 @@ const en: TranslationKeys = {
     stale_confirm_title_other:
       "{{count}} documents are still cut by older chunking parameters. Re-ingest them now?",
     stale_confirm_body:
-      "They are embedded again with the new parameters (billed by usage). Manual changes are put back; what cannot be is listed for review on its document. Documents without their original file are skipped (re-upload them).",
+      "Their cost is estimated first; once you confirm, they are embedded again with the new parameters (billed by usage). Manual changes are put back; what cannot be is listed for review on its document. Documents without their original file are skipped (re-upload them).",
     stale_confirm_later: "Later",
-    stale_submitted: "Re-ingest submitted for {{n}} documents.",
+    stale_submitted:
+      "Submitted {{n}} document(s) for re-ingest. Their cost is being estimated — confirm it on the Documents tab to start.",
     stale_skipped: "{{n}} documents have no original file and were skipped; re-upload them.",
     stale_remaining: "{{n}} more were not submitted; click “Re-ingest them” again.",
     config_summary: "Chunking: chunk {{chunk}} / passage {{parent}} tokens",

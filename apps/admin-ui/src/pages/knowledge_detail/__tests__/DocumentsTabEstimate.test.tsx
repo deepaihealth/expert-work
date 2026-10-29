@@ -255,6 +255,7 @@ describe("DocumentsTab — estimates (B-222 PR-2)", () => {
     await waitFor(() =>
       expect(list).toHaveBeenLastCalledWith(BASE_NAME, { limit: 50, offset: 0 }, undefined, {
         status: ["estimating", "awaiting_confirmation"],
+        withReview: true,
       }),
     );
   });
