@@ -63,8 +63,6 @@ _CHANGED_RETRIES = 1
 #: control-plane / 留存作业这一个 uid 读写它们。
 _FILE_MODE = 0o600
 
-_DIR_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
-
 
 class ArtifactSnapshotReadError(SandboxSupervisorError):
     """读副本时的 I/O 失败(EIO / ESTALE / …)—— 不是「不在」、不是「没权限」、不是越界。

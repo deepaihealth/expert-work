@@ -37,7 +37,6 @@ ALEMBIC_INI = Path(__file__).resolve().parent.parent / "alembic.ini"
 _DB = "artifact_version_snapshot_contract"
 
 _AGENT = "report-writer-1a2b3c4d"
-_OTHER_AGENT = "reviewer-5e6f7a8b"
 _PATH = f"agents/{_AGENT}/report.pdf"
 
 

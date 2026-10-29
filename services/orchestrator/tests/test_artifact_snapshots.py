@@ -292,8 +292,10 @@ async def test_delete_removes_only_that_copy(
     await nas.capture(tenant_id=tenant, user_id=user, path=_REL, snapshot_key=keep)
     await nas.capture(tenant_id=tenant, user_id=user, path=_REL, snapshot_key=drop)
 
-    assert await nas.delete(tenant_id=tenant, user_id=user, snapshot_key=drop) is True
-    assert await nas.delete(tenant_id=tenant, user_id=user, snapshot_key=drop) is False
+    first = await nas.delete(tenant_id=tenant, user_id=user, snapshot_key=drop)
+    second = await nas.delete(tenant_id=tenant, user_id=user, snapshot_key=drop)
+    assert first is True
+    assert second is False
 
     assert [p.name for p in artifact_snapshot_dir(str(tmp_path), tenant, user).iterdir()] == [keep]
 
