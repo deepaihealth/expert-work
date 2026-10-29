@@ -2,13 +2,15 @@
 
 from __future__ import annotations
 
+import asyncio
+import hashlib
 import json
 from uuid import UUID, uuid4
 
 import pytest
 
 from expert_work.persistence import InMemoryArtifactStore
-from expert_work.protocol import BuiltinToolSpec
+from expert_work.protocol import ArtifactVersion, BuiltinToolSpec
 from orchestrator.errors import AgentFactoryError
 from orchestrator.tools import (
     ListArtifactsTool,
@@ -19,8 +21,18 @@ from orchestrator.tools import (
     build_tool_registry,
 )
 from orchestrator.tools.artifact import ArtifactRecorder
+from orchestrator.tools.artifact_snapshots import InMemoryArtifactSnapshotStore, SnapshotDigest
 from orchestrator.tools.file_ops import FileOpError
-from orchestrator.tools.sandbox import RecordingSandboxRuntime, SandboxOutcome
+from orchestrator.tools.sandbox import (
+    RecordingSandboxRuntime,
+    SandboxOutcome,
+    SandboxSupervisorError,
+    WorkspaceFileChangedError,
+    WorkspaceFileNotFoundError,
+    WorkspaceFileTooLargeError,
+    WorkspacePathEscapeError,
+)
+from orchestrator.tools.workspace_store import RecordingWorkspaceStore
 
 
 def _ctx(
@@ -50,6 +62,15 @@ def _sandbox(envelope: dict[str, object] | None = None) -> RecordingSandboxRunti
     return client
 
 
+def _snapshots(contents: dict[str, bytes] | None = None) -> InMemoryArtifactSnapshotStore:
+    """B-235 —— 副本存储。不给 ``contents`` 时任何路径都读到同一串 10 字节(与 ``_sandbox``
+    的「文件在,10 字节」对上);给了就是那棵树,没有的路径 = 不存在。"""
+    workspace = RecordingWorkspaceStore(
+        workspace_file=b"0123456789", workspace_file_contents=dict(contents or {})
+    )
+    return InMemoryArtifactSnapshotStore(workspace=workspace)
+
+
 # ---------------------------------------------------------------------------
 # save_artifact
 # ---------------------------------------------------------------------------
@@ -58,7 +79,7 @@ def _sandbox(envelope: dict[str, object] | None = None) -> RecordingSandboxRunti
 @pytest.mark.asyncio
 async def test_save_artifact_records_version_one() -> None:
     store = InMemoryArtifactStore()
-    tool = SaveArtifactTool(store=store, client=_sandbox())
+    tool = SaveArtifactTool(snapshots=_snapshots(), store=store, client=_sandbox())
     ctx = _ctx()
 
     result = await tool.call({"name": "report.md", "kind": "document"}, ctx=ctx)
@@ -82,7 +103,7 @@ async def test_save_artifact_records_version_one() -> None:
 @pytest.mark.asyncio
 async def test_save_artifact_appends_version_on_resave() -> None:
     store = InMemoryArtifactStore()
-    tool = SaveArtifactTool(store=store, client=_sandbox())
+    tool = SaveArtifactTool(snapshots=_snapshots(), store=store, client=_sandbox())
     ctx = _ctx()
 
     await tool.call({"name": "report.md"}, ctx=ctx)
@@ -94,7 +115,7 @@ async def test_save_artifact_appends_version_on_resave() -> None:
 @pytest.mark.asyncio
 async def test_save_artifact_defaults_path_to_name_and_kind_to_other() -> None:
     store = InMemoryArtifactStore()
-    result = await SaveArtifactTool(store=store, client=_sandbox()).call(
+    result = await SaveArtifactTool(snapshots=_snapshots(), store=store, client=_sandbox()).call(
         {"name": "data.csv"}, ctx=_ctx()
     )
     assert result.meta["kind"] == "other"
@@ -102,7 +123,9 @@ async def test_save_artifact_defaults_path_to_name_and_kind_to_other() -> None:
 
 @pytest.mark.asyncio
 async def test_save_artifact_rejects_unsafe_path() -> None:
-    tool = SaveArtifactTool(store=InMemoryArtifactStore(), client=_sandbox())
+    tool = SaveArtifactTool(
+        snapshots=_snapshots(), store=InMemoryArtifactStore(), client=_sandbox()
+    )
     with pytest.raises(ValueError, match="relative workspace path"):
         await tool.call({"name": "x", "path": "/etc/passwd"}, ctx=_ctx())
     with pytest.raises(ValueError, match="relative workspace path"):
@@ -111,21 +134,27 @@ async def test_save_artifact_rejects_unsafe_path() -> None:
 
 @pytest.mark.asyncio
 async def test_save_artifact_rejects_unknown_kind() -> None:
-    tool = SaveArtifactTool(store=InMemoryArtifactStore(), client=_sandbox())
+    tool = SaveArtifactTool(
+        snapshots=_snapshots(), store=InMemoryArtifactStore(), client=_sandbox()
+    )
     with pytest.raises(ValueError, match="'kind' must be one of"):
         await tool.call({"name": "x", "kind": "spreadsheet"}, ctx=_ctx())
 
 
 @pytest.mark.asyncio
 async def test_save_artifact_requires_name() -> None:
-    tool = SaveArtifactTool(store=InMemoryArtifactStore(), client=_sandbox())
+    tool = SaveArtifactTool(
+        snapshots=_snapshots(), store=InMemoryArtifactStore(), client=_sandbox()
+    )
     with pytest.raises(ValueError, match="non-empty 'name'"):
         await tool.call({"name": "  "}, ctx=_ctx())
 
 
 @pytest.mark.asyncio
 async def test_save_artifact_requires_user_binding() -> None:
-    tool = SaveArtifactTool(store=InMemoryArtifactStore(), client=_sandbox())
+    tool = SaveArtifactTool(
+        snapshots=_snapshots(), store=InMemoryArtifactStore(), client=_sandbox()
+    )
     with pytest.raises(ToolBlockedError, match="tenant \\+ user binding"):
         await tool.call({"name": "x"}, ctx=ToolContext(tenant_id=uuid4(), user_id=None))
 
@@ -139,7 +168,7 @@ async def test_save_artifact_requires_user_binding() -> None:
 async def test_list_artifacts_reports_saved_artifacts() -> None:
     store = InMemoryArtifactStore()
     ctx = _ctx()
-    await SaveArtifactTool(store=store, client=_sandbox()).call(
+    await SaveArtifactTool(snapshots=_snapshots(), store=store, client=_sandbox()).call(
         {"name": "report.md", "kind": "document"}, ctx=ctx
     )
 
@@ -171,7 +200,11 @@ async def test_list_artifacts_requires_user_binding() -> None:
 
 @pytest.mark.asyncio
 async def test_artifact_builtins_assembled_when_store_present() -> None:
-    env = ToolEnv(artifact_store=InMemoryArtifactStore(), sandbox_runtime=_sandbox())
+    env = ToolEnv(
+        artifact_store=InMemoryArtifactStore(),
+        sandbox_runtime=_sandbox(),
+        artifact_snapshots=_snapshots(),
+    )
     registry = await build_tool_registry(
         [BuiltinToolSpec(name="save_artifact"), BuiltinToolSpec(name="list_artifacts")],
         tool_env=env,
@@ -201,7 +234,7 @@ async def test_artifact_builtin_missing_store_raises() -> None:
 async def test_save_artifact_feeds_the_manifest_recorder() -> None:
     """产物清单契约 —— 登记成功即喂 ctx.artifact_recorder 一条清单项。"""
     store = InMemoryArtifactStore()
-    tool = SaveArtifactTool(store=store, client=_sandbox())
+    tool = SaveArtifactTool(snapshots=_snapshots(), store=store, client=_sandbox())
     recorded: list[dict[str, object]] = []
     base = _ctx()
     from dataclasses import replace as _replace
@@ -221,9 +254,9 @@ async def test_save_artifact_feeds_the_manifest_recorder() -> None:
 @pytest.mark.asyncio
 async def test_save_artifact_without_recorder_is_unchanged() -> None:
     """未接线(单测/eval)时零行为变化 —— 登记照常,无清单记录。"""
-    result = await SaveArtifactTool(store=InMemoryArtifactStore(), client=_sandbox()).call(
-        {"name": "a.md"}, ctx=_ctx()
-    )
+    result = await SaveArtifactTool(
+        snapshots=_snapshots(), store=InMemoryArtifactStore(), client=_sandbox()
+    ).call({"name": "a.md"}, ctx=_ctx())
     assert result.meta == {"artifact": "a.md", "version": 1, "kind": "other"}
 
 
@@ -243,7 +276,7 @@ async def test_two_agents_same_artifact_name_do_not_overwrite() -> None:
     store = InMemoryArtifactStore()
     tenant_id, user_id = uuid4(), uuid4()
     for agent_key in ("plan-aaaaaaaa", "sop-bbbbbbbb"):
-        await SaveArtifactTool(store=store, client=_sandbox()).call(
+        await SaveArtifactTool(snapshots=_snapshots(), store=store, client=_sandbox()).call(
             {"name": "报告.docx"},
             ctx=_ctx(tenant_id=tenant_id, user_id=user_id, agent_key=agent_key),
         )
@@ -264,7 +297,7 @@ async def test_list_artifacts_only_shows_the_calling_agents_own() -> None:
     store = InMemoryArtifactStore()
     tenant_id, user_id = uuid4(), uuid4()
     for agent_key, name in (("plan-aaaaaaaa", "计划.docx"), ("sop-bbbbbbbb", "评审.docx")):
-        await SaveArtifactTool(store=store, client=_sandbox()).call(
+        await SaveArtifactTool(snapshots=_snapshots(), store=store, client=_sandbox()).call(
             {"name": name}, ctx=_ctx(tenant_id=tenant_id, user_id=user_id, agent_key=agent_key)
         )
 
@@ -290,7 +323,9 @@ async def test_path_in_workspace_carries_the_agent_prefix() -> None:
     """
     store = InMemoryArtifactStore()
     ctx = _ctx(agent_key="plan-aaaaaaaa")
-    await SaveArtifactTool(store=store, client=_sandbox()).call({"name": "报告.docx"}, ctx=ctx)
+    await SaveArtifactTool(snapshots=_snapshots(), store=store, client=_sandbox()).call(
+        {"name": "报告.docx"}, ctx=ctx
+    )
 
     version = await store.get_latest_version(
         tenant_id=ctx.tenant_id, user_id=ctx.user_id, agent_key="plan-aaaaaaaa", name="报告.docx"
@@ -306,7 +341,9 @@ async def test_path_in_workspace_stays_flat_without_agent_key() -> None:
     它既不是旧位置也不是新位置,搬迁脚本两边都认不出来。"""
     store = InMemoryArtifactStore()
     ctx = _ctx(agent_key="")
-    await SaveArtifactTool(store=store, client=_sandbox()).call({"name": "报告.docx"}, ctx=ctx)
+    await SaveArtifactTool(snapshots=_snapshots(), store=store, client=_sandbox()).call(
+        {"name": "报告.docx"}, ctx=ctx
+    )
 
     version = await store.get_latest_version(
         tenant_id=ctx.tenant_id, user_id=ctx.user_id, agent_key="", name="报告.docx"
@@ -321,7 +358,7 @@ async def test_explicit_path_arg_also_gets_the_prefix() -> None:
     """``path`` 显式给了也一样要前缀 —— 它同样是相对 agent 根的。"""
     store = InMemoryArtifactStore()
     ctx = _ctx(agent_key="plan-aaaaaaaa")
-    await SaveArtifactTool(store=store, client=_sandbox()).call(
+    await SaveArtifactTool(snapshots=_snapshots(), store=store, client=_sandbox()).call(
         {"name": "报告.docx", "path": "out/报告.docx"}, ctx=ctx
     )
 
@@ -347,7 +384,9 @@ async def test_explicit_path_arg_also_gets_the_prefix() -> None:
 @pytest.mark.asyncio
 async def test_save_artifact_refuses_when_the_file_was_never_written() -> None:
     store = InMemoryArtifactStore()
-    tool = SaveArtifactTool(store=store, client=_sandbox({"ok": False, "error": "not_found"}))
+    tool = SaveArtifactTool(
+        snapshots=_snapshots(), store=store, client=_sandbox({"ok": False, "error": "not_found"})
+    )
     ctx = _ctx()
 
     with pytest.raises(FileOpError) as excinfo:
@@ -366,7 +405,9 @@ async def test_save_artifact_refuses_when_the_file_was_never_written() -> None:
 @pytest.mark.asyncio
 async def test_save_artifact_refuses_a_directory() -> None:
     store = InMemoryArtifactStore()
-    tool = SaveArtifactTool(store=store, client=_sandbox({"ok": False, "error": "not_a_file"}))
+    tool = SaveArtifactTool(
+        snapshots=_snapshots(), store=store, client=_sandbox({"ok": False, "error": "not_a_file"})
+    )
     ctx = _ctx()
 
     with pytest.raises(FileOpError):
@@ -382,7 +423,9 @@ async def test_save_artifact_refuses_a_directory() -> None:
 async def test_save_artifact_blocks_a_path_escaping_the_workspace() -> None:
     store = InMemoryArtifactStore()
     tool = SaveArtifactTool(
-        store=store, client=_sandbox({"ok": False, "error": "path_escapes_workspace"})
+        snapshots=_snapshots(),
+        store=store,
+        client=_sandbox({"ok": False, "error": "path_escapes_workspace"}),
     )
 
     with pytest.raises(ToolBlockedError):
@@ -393,9 +436,9 @@ async def test_save_artifact_blocks_a_path_escaping_the_workspace() -> None:
 async def test_save_artifact_stats_under_the_agent_scope_root() -> None:
     """stat 用的根必须与写文件时同一个,否则「写的路径」和「登记的路径」会分家。"""
     client = _sandbox()
-    await SaveArtifactTool(store=InMemoryArtifactStore(), client=client).call(
-        {"name": "deck.pptx"}, ctx=_ctx(agent_key="ai-health-plan-30817804")
-    )
+    await SaveArtifactTool(
+        snapshots=_snapshots(), store=InMemoryArtifactStore(), client=client
+    ).call({"name": "deck.pptx"}, ctx=_ctx(agent_key="ai-health-plan-30817804"))
 
     code = client.execs[-1][1]
     # 带上尾随逗号 —— ``"ws": "/workspace"`` 本身是 ``"ws": "/workspace/agents/…"``
@@ -409,9 +452,9 @@ async def test_save_artifact_stats_under_the_agent_scope_root() -> None:
 async def test_save_artifact_stats_the_explicit_path_not_the_name() -> None:
     """传了 path 就该 stat path —— 名字只是逻辑名,可以跟文件名不同。"""
     client = _sandbox()
-    await SaveArtifactTool(store=InMemoryArtifactStore(), client=client).call(
-        {"name": "第十天食谱", "path": "out/day10.pptx"}, ctx=_ctx()
-    )
+    await SaveArtifactTool(
+        snapshots=_snapshots(), store=InMemoryArtifactStore(), client=client
+    ).call({"name": "第十天食谱", "path": "out/day10.pptx"}, ctx=_ctx())
 
     code = client.execs[-1][1]
     assert "out/day10.pptx" in code
@@ -426,16 +469,16 @@ async def test_save_artifact_stats_the_explicit_path_not_the_name() -> None:
 @pytest.mark.asyncio
 async def test_save_artifact_refuses_the_reserved_shared_segment() -> None:
     with pytest.raises(ValueError, match="reserved"):
-        await SaveArtifactTool(store=InMemoryArtifactStore(), client=_sandbox()).call(
-            {"name": "x", "path": "shared/x.md"}, ctx=_ctx(agent_key="me-aaaaaaaa")
-        )
+        await SaveArtifactTool(
+            snapshots=_snapshots(), store=InMemoryArtifactStore(), client=_sandbox()
+        ).call({"name": "x", "path": "shared/x.md"}, ctx=_ctx(agent_key="me-aaaaaaaa"))
 
 
 @pytest.mark.asyncio
 async def test_save_artifact_result_has_no_claim_note_or_location() -> None:
-    result = await SaveArtifactTool(store=InMemoryArtifactStore(), client=_sandbox()).call(
-        {"name": "a.md"}, ctx=_ctx(agent_key="me-aaaaaaaa")
-    )
+    result = await SaveArtifactTool(
+        snapshots=_snapshots(), store=InMemoryArtifactStore(), client=_sandbox()
+    ).call({"name": "a.md"}, ctx=_ctx(agent_key="me-aaaaaaaa"))
     assert "moved into your agent workspace" not in result.content
     assert "location" not in result.meta
 
@@ -457,7 +500,7 @@ async def test_save_artifact_folds_absolute_paths_like_the_file_tools(
     client = _sandbox()
     ctx = _ctx(agent_key="me-aaaaaaaa")
 
-    await SaveArtifactTool(store=store, client=client).call(
+    await SaveArtifactTool(snapshots=_snapshots(), store=store, client=client).call(
         {"name": "deck.pptx", "path": given}, ctx=ctx
     )
 
@@ -472,7 +515,9 @@ async def test_save_artifact_folds_absolute_paths_like_the_file_tools(
 @pytest.mark.asyncio
 async def test_save_artifact_rejects_another_agents_tree() -> None:
     with pytest.raises(ValueError, match="reserved agents/ tree"):
-        await SaveArtifactTool(store=InMemoryArtifactStore(), client=_sandbox()).call(
+        await SaveArtifactTool(
+            snapshots=_snapshots(), store=InMemoryArtifactStore(), client=_sandbox()
+        ).call(
             {"name": "x", "path": "agents/someone-else-bbbbbbbb/x.md"},
             ctx=_ctx(agent_key="me-aaaaaaaa"),
         )
@@ -506,3 +551,201 @@ def test_scoped_recorder_counts_its_own_subtree() -> None:
     sibling({"name": "e.md"})
     assert (parent.count, child.count, grandchild.count, sibling.count) == (5, 2, 1, 1)
     assert [e["name"] for e in parent.snapshot()] == ["a.md", "b.md", "c.md", "d.md", "e.md"]
+
+
+# ---------------------------------------------------------------------------
+# B-235 —— 每次登记都留一份那一刻的字节。同一用户两段会话用同一个智能体、存同一个
+# 名字时,两个版本指着同一个工作区文件;只登记路径的话,后存的那次把前一版盖掉。
+# ---------------------------------------------------------------------------
+
+_ME = "me-aaaaaaaa"
+_REPORT = f"agents/{_ME}/report.txt"
+
+
+@pytest.mark.asyncio
+async def test_each_save_keeps_the_bytes_of_that_moment() -> None:
+    store = InMemoryArtifactStore()
+    snapshots = _snapshots({_REPORT: b"AAA"})
+    tool = SaveArtifactTool(snapshots=snapshots, store=store, client=_sandbox())
+    ctx = _ctx(agent_key=_ME)
+
+    await tool.call({"name": "report.txt"}, ctx=ctx)
+    snapshots.workspace.workspace_file_contents[_REPORT] = b"BBBB"  # type: ignore[attr-defined]
+    await tool.call({"name": "report.txt"}, ctx=ctx)
+    snapshots.workspace.workspace_file_contents[_REPORT] = b"CC"  # type: ignore[attr-defined]
+
+    [artifact] = await store.list_for_user(
+        tenant_id=ctx.tenant_id, user_id=ctx.user_id, agent_key=_ME
+    )
+    v2, v1 = await store.list_versions_by_artifact(artifact_id=artifact.id)
+    assert v1.snapshot_key == str(v1.id) and v2.snapshot_key == str(v2.id)
+
+    async def _content(key: str | None) -> bytes:
+        assert key is not None
+        return await snapshots.read(tenant_id=ctx.tenant_id, user_id=ctx.user_id, snapshot_key=key)
+
+    assert await _content(v1.snapshot_key) == b"AAA", "v1 的内容被后来的登记盖掉了"
+    assert await _content(v2.snapshot_key) == b"BBBB"
+    assert (v1.size_bytes, v1.sha256) == (3, hashlib.sha256(b"AAA").hexdigest())
+    assert (v2.size_bytes, v2.sha256) == (4, hashlib.sha256(b"BBBB").hexdigest())
+
+
+class _FailingSnapshots(InMemoryArtifactSnapshotStore):
+    def __init__(self, error: Exception) -> None:
+        super().__init__(workspace=RecordingWorkspaceStore())
+        self.error = error
+
+    async def capture(self, **_: object) -> SnapshotDigest:  # type: ignore[override]
+        raise self.error
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("error", "expected"),
+    [
+        (SandboxSupervisorError("nas hiccup"), FileOpError),
+        (OSError(5, "I/O error"), FileOpError),
+        (WorkspaceFileTooLargeError("too big"), FileOpError),
+        (WorkspaceFileChangedError("changed"), FileOpError),
+        (WorkspaceFileNotFoundError("gone"), FileOpError),
+        (WorkspacePathEscapeError("escape"), ToolBlockedError),
+    ],
+)
+async def test_no_copy_means_nothing_registered(error: Exception, expected: type) -> None:
+    """复制失败 → 工具报错、不登记、不进清单:不能报一个没有副本的「成功」。"""
+    store = InMemoryArtifactStore()
+    recorder = ArtifactRecorder()
+    ctx = _ctx(agent_key=_ME)
+    ctx = ToolContext(
+        tenant_id=ctx.tenant_id,
+        run_id=ctx.run_id,
+        user_id=ctx.user_id,
+        agent_key=_ME,
+        artifact_recorder=recorder,
+    )
+    tool = SaveArtifactTool(snapshots=_FailingSnapshots(error), store=store, client=_sandbox())
+
+    with pytest.raises(expected) as excinfo:
+        await tool.call({"name": "report.txt"}, ctx=ctx)
+
+    if expected is FileOpError:
+        assert "nothing was registered" in str(excinfo.value)
+    assert (
+        await store.list_for_user(tenant_id=ctx.tenant_id, user_id=ctx.user_id, agent_key=None)
+        == []
+    )
+    assert recorder.snapshot() == []
+
+
+@pytest.mark.asyncio
+async def test_too_large_names_the_limit() -> None:
+    tool = SaveArtifactTool(
+        snapshots=_FailingSnapshots(WorkspaceFileTooLargeError("x")),
+        store=InMemoryArtifactStore(),
+        client=_sandbox(),
+    )
+    with pytest.raises(FileOpError, match="64 MiB"):
+        await tool.call({"name": "big.bin"}, ctx=_ctx(agent_key=_ME))
+
+
+class _BrokenStore(InMemoryArtifactStore):
+    async def save_version(self, **_: object) -> ArtifactVersion:  # type: ignore[override]
+        raise RuntimeError("db down")
+
+
+@pytest.mark.asyncio
+async def test_a_failed_registration_leaves_its_copy_to_the_orphan_sweep() -> None:
+    """登记失败时不当场删副本:失败那一刻分不清行到底落没落库(见下一条),删错了就是一个
+    指着空副本的版本。没人认领的副本由留存作业的孤儿清理(满 24 小时、找不到版本行)收走。"""
+    snapshots = _snapshots({_REPORT: b"AAA"})
+    tool = SaveArtifactTool(snapshots=snapshots, store=_BrokenStore(), client=_sandbox())
+    ctx = _ctx(agent_key=_ME)
+
+    with pytest.raises(RuntimeError, match="db down"):
+        await tool.call({"name": "report.txt"}, ctx=ctx)
+
+    assert await snapshots.delete_all_for_user(tenant_id=ctx.tenant_id, user_id=ctx.user_id) == 1
+
+
+class _CommitsThenCancelled(InMemoryArtifactStore):
+    """提交已经落库,随后 run 被停 / 撞上时限 —— 调用方收到的是 CancelledError。"""
+
+    async def save_version(self, **kwargs: object) -> ArtifactVersion:  # type: ignore[override]
+        await super().save_version(**kwargs)  # type: ignore[arg-type]
+        raise asyncio.CancelledError
+
+
+@pytest.mark.asyncio
+async def test_a_cancel_after_the_commit_keeps_the_committed_rows_copy() -> None:
+    store = _CommitsThenCancelled()
+    snapshots = _snapshots({_REPORT: b"AAA"})
+    tool = SaveArtifactTool(snapshots=snapshots, store=store, client=_sandbox())
+    ctx = _ctx(agent_key=_ME)
+
+    with pytest.raises(asyncio.CancelledError):
+        await tool.call({"name": "report.txt"}, ctx=ctx)
+
+    latest = await store.get_latest_version(
+        tenant_id=ctx.tenant_id, user_id=ctx.user_id, agent_key=_ME, name="report.txt"
+    )
+    assert latest is not None and latest.snapshot_key is not None
+    content = await snapshots.read(
+        tenant_id=ctx.tenant_id, user_id=ctx.user_id, snapshot_key=latest.snapshot_key
+    )
+    assert content == b"AAA", "行已落库,它的副本却被删了 —— 不带 version 的下载从此 404"
+
+
+class _CountingWorkspace(RecordingWorkspaceStore):
+    """每读一次给出不同的字节,并在读之后让出事件循环 —— 两次并发登记交错进行。"""
+
+    reads_done: int = 0
+
+    async def read_file(self, **kwargs: object) -> bytes:  # type: ignore[override]
+        self.reads_done += 1
+        data = f"content-{self.reads_done}".encode()
+        await asyncio.sleep(0)
+        return data
+
+
+@pytest.mark.asyncio
+async def test_concurrent_saves_pair_each_copy_with_its_own_row() -> None:
+    store = InMemoryArtifactStore()
+    snapshots = InMemoryArtifactSnapshotStore(workspace=_CountingWorkspace())
+    tool = SaveArtifactTool(snapshots=snapshots, store=store, client=_sandbox())
+    ctx = _ctx(agent_key=_ME)
+
+    await asyncio.gather(
+        tool.call({"name": "report.txt"}, ctx=ctx), tool.call({"name": "report.txt"}, ctx=ctx)
+    )
+
+    rows = await store.list_versions_by_artifact(
+        artifact_id=(
+            await store.list_for_user(tenant_id=ctx.tenant_id, user_id=ctx.user_id, agent_key=_ME)
+        )[0].id
+    )
+    assert sorted(r.version for r in rows) == [1, 2]
+    shas = set()
+    for row in rows:
+        assert row.snapshot_key == str(row.id), "副本键与版本行 id 没配上对"
+        data = await snapshots.read(
+            tenant_id=ctx.tenant_id, user_id=ctx.user_id, snapshot_key=row.snapshot_key
+        )
+        assert hashlib.sha256(data).hexdigest() == row.sha256
+        shas.add(row.sha256)
+    assert len(shas) == 2
+
+
+@pytest.mark.asyncio
+async def test_save_artifact_builtin_requires_a_snapshot_store() -> None:
+    """没有副本存储就登记不了 —— 不做成「没有就只记路径」的可选开关(那正是 B-235 的洞)。"""
+    env = ToolEnv(artifact_store=InMemoryArtifactStore(), sandbox_runtime=_sandbox())
+    with pytest.raises(AgentFactoryError, match="snapshot store"):
+        await build_tool_registry([BuiltinToolSpec(name="save_artifact")], tool_env=env)
+
+
+@pytest.mark.asyncio
+async def test_implicit_save_artifact_is_skipped_without_a_snapshot_store() -> None:
+    env = ToolEnv(artifact_store=InMemoryArtifactStore(), sandbox_runtime=_sandbox())
+    registry = await build_tool_registry([], tool_env=env)
+    assert registry.get("save_artifact") is None
+    assert isinstance(registry.get("list_artifacts"), ListArtifactsTool)

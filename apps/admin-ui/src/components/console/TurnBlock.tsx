@@ -81,7 +81,8 @@ export interface TurnBlockProps {
   /** B-139 —— 取消这一轮的排队;不传 = 不出按钮。与 ``readOnly`` 无关:对话页
    *  整页只读,写操作由页面按权限单独放行(同 ``allowDecide``)。 */
   onCancelQueued?: (turn: ConsoleTurn) => void;
-  onDownloadArtifact: (name: string) => Promise<void>;
+  /** B-235 —— ``version`` = 这一轮登记的版本号;缺席时下载最新版。 */
+  onDownloadArtifact: (name: string, version?: number) => Promise<void>;
   onFireResult?: (r: FireNowResult) => void;
   /** 历史轮懒加载 ref(``useHistoryTurns.registerRow(runId, threadId)`` 的
    *  返回);live 轮不传。 */

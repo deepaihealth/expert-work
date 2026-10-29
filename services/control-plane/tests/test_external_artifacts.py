@@ -1041,8 +1041,9 @@ async def test_download_with_matching_version_serves_content(
 async def test_download_with_stale_version_is_409_mismatch(
     external_client, seed_artifact_with_content
 ) -> None:
-    """version 是校验闸不是取历史:旧字节已被覆盖,不一致必须显式 409,
-    永远不能静默下发别的版本的内容(停删世界的迟到收割保护)。"""
+    """B-235 之前登记的版本(这里的种子不带副本):旧字节已被覆盖,要旧版必须显式 409,
+    永远不能静默下发别的版本的内容(迟到收割保护)。有副本的版本按版本号可取,见
+    ``test_artifact_version_downloads.py``。"""
     await seed_artifact_with_content(
         user_id="u-1", name="plan.txt", kind="document", content=b"v1-bytes"
     )

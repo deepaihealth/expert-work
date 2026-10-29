@@ -68,6 +68,11 @@ from expert_work.protocol import (
 from expert_work.runtime.audit import AuditLogger
 from expert_work.runtime.runs.store import RunStore
 from expert_work.runtime.storage import ObjectStore
+from retention_cleanup_job.artifact_copies import (
+    release_version_files,
+    remove_user_copies,
+    sweep_orphan_copies,
+)
 from retention_cleanup_job.knowledge_revisions import delete_orphaned_revisions
 from retention_cleanup_job.orphan_threads import (
     sweep_orphan_thread_dirs,
@@ -252,6 +257,7 @@ class RetentionCleanupJob:
                 artifacts_expired,
             ) = await self._sweep_artifact_versions()
             artifact_soft, artifact_hard = await self._sweep_artifacts()
+            orphan_artifact_copies_removed = await self._sweep_orphan_artifact_copies()
             uploads_expired, upload_files_removed = await self._sweep_uploads()
             thread_dirs_removed = await self._sweep_orphan_thread_dirs()
             tool_result_dirs_removed = await self._sweep_orphan_tool_results()
@@ -273,6 +279,7 @@ class RetentionCleanupJob:
             artifact_versions_deleted=artifact_versions_deleted,
             artifact_files_removed=artifact_files_removed,
             artifacts_expired=artifacts_expired,
+            orphan_artifact_copies_removed=orphan_artifact_copies_removed,
             uploads_expired=uploads_expired,
             upload_files_removed=upload_files_removed,
             thread_dirs_removed=thread_dirs_removed,
@@ -365,6 +372,16 @@ class RetentionCleanupJob:
             except Exception:
                 dependents_failed.append("artifact")
                 logger.exception("retention.workspace_dependents_failed store=artifact")
+            # B-235 —— 产物各版本的副本住在用户根旁边,工作区归档 / rmtree 碰不到,这里删。
+            copies_removed = 0
+            if self._workspace_root is not None:
+                try:
+                    copies_removed = await asyncio.to_thread(
+                        remove_user_copies, self._workspace_root, ws.tenant_id, ws.user_id
+                    )
+                except Exception:
+                    dependents_failed.append("artifact_copy")
+                    logger.exception("retention.workspace_dependents_failed store=artifact_copy")
             try:
                 if self._user_upload_store is not None:
                     uploads_deleted = await self._user_upload_store.delete_all_for_user(
@@ -384,6 +401,7 @@ class RetentionCleanupJob:
                     "archived_object_key": ws.archived_object_key,
                     "archive_object": "left to bucket lifecycle",
                     "artifacts_deleted": artifacts_deleted,
+                    "artifact_copies_removed": copies_removed,
                     "uploads_deleted": uploads_deleted,
                     "dependents_failed": dependents_failed,
                 },
@@ -394,7 +412,9 @@ class RetentionCleanupJob:
         """留存链 B-28 —— 产物按**版本** 90 天。
 
         ``artifact_version.created_at < now - artifact_retention_days`` 的版本:
-        删 NAS 文件(``path_in_workspace``,只 unlink 那一个普通文件)+ 删版本行;
+        删它登记时留的副本(B-235)+ NAS 文件(``path_in_workspace``,只 unlink 那一个
+        普通文件;**同一路径还有别的版本在用时不删**,见
+        :func:`~retention_cleanup_job.artifact_copies.release_version_files`)+ 删版本行;
         同名产物有多版本时逐版本判,新版本留着。一个逻辑产物的版本全部清完 →
         ``artifact`` 行标过期(复用 ``deleted_at``,之后走既有的 hard-delete
         宽限)。每个逻辑产物一次 sweep 写一条 ``ARTIFACT_EXPIRED`` 审计。
@@ -418,14 +438,9 @@ class RetentionCleanupJob:
             by_artifact.setdefault(version.artifact_id, []).append(version)
         versions_deleted = files_removed = artifacts_expired = 0
         for artifact_id, versions in by_artifact.items():
-            deletable: list[UUID] = []
-            removed_here = 0
-            for version in versions:
-                removed = await self._unlink(version)
-                if removed is None:
-                    continue
-                removed_here += int(removed)
-                deletable.append(version.id)
+            deletable, removed_here = await release_version_files(
+                self._artifact_store, self._workspace_root, versions
+            )
             if not deletable:
                 continue
             deleted = await self._artifact_store.delete_versions(version_ids=deletable)
@@ -516,8 +531,11 @@ class RetentionCleanupJob:
                 remaining = await self._artifact_store.list_versions_by_artifact(
                     artifact_id=artifact.id
                 )
-                outcomes = [await self._unlink(v) for v in remaining]
-                if None in outcomes:
+                # B-235 —— 副本一起删;同一路径还被别的产物的版本指着时工作区文件不删。
+                deletable, _removed = await release_version_files(
+                    self._artifact_store, self._workspace_root, remaining
+                )
+                if len(deletable) < len(remaining):
                     continue  # 某个文件删不掉 → 行留着,明天再试
             hard_ids.append(artifact.id)
         if not hard_ids:
@@ -585,21 +603,19 @@ class RetentionCleanupJob:
             return 0
         return await sweep_orphan_tool_results(self._workspace_root, self._run_store)
 
-    async def _unlink(self, version: ArtifactVersion) -> bool | None:
-        """Unlink one registered artifact file. ``True`` removed, ``False`` was
-        already gone, ``None`` could not be removed (logged; caller keeps the row)."""
-        assert self._workspace_root is not None  # noqa: S101 - callers gate on it
+    async def _sweep_orphan_artifact_copies(self) -> int:
+        """B-235 —— 找不到版本行、满 24 小时的产物副本(及 ``.tmp-`` 残件);规则本体在
+        :func:`retention_cleanup_job.artifact_copies.sweep_orphan_copies`。
+        No-op when :class:`ArtifactStore` or ``workspace_root`` is missing."""
+        if self._artifact_store is None or self._workspace_root is None:
+            return 0
+        # 这一 pass 失败(查库 / 扫 NAS)只记日志:孤儿副本明天再清不迟,后面的上传 /
+        # 线程 / 记忆 / 工作区清理不能因为它整个跳过。
         try:
-            return await asyncio.to_thread(
-                unlink_registered_file,
-                self._workspace_root,
-                version.tenant_id,
-                version.user_id,
-                version.path_in_workspace,
-            )
-        except (OSError, UnsafeWorkspacePathError):
-            logger.exception("retention.artifact_file_unlink_failed version_id=%s", version.id)
-            return None
+            return await sweep_orphan_copies(self._workspace_root, self._artifact_store)
+        except Exception:
+            logger.exception("retention.orphan_artifact_copies_failed")
+            return 0
 
     async def _audit(
         self,

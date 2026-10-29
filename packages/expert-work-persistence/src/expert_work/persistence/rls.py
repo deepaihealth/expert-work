@@ -66,6 +66,7 @@ logger = logging.getLogger("expert_work.persistence.rls")
 __all__ = [
     "RLS_GUC_NAME",
     "RLS_USER_GUC_NAME",
+    "RlsBypassRequiredError",
     "build_rls_sessionmaker",
     "bypass_rls_var",
     "current_tenant_id_var",
@@ -104,6 +105,29 @@ bypass_rls_var: ContextVar[bool] = ContextVar(
     "expert_work.rls.bypass",
     default=False,
 )
+
+
+class RlsBypassRequiredError(RuntimeError):
+    """A cross-tenant query ran without declaring an RLS bypass (B-235).
+
+    Declaring the bypass (:data:`bypass_rls_var`) is a necessary condition, not a
+    sufficient one: it only stops this process from emitting the tenant GUC. Whether
+    the database actually shows every tenant's rows depends on the connecting role
+    (``BYPASSRLS`` or superuser) — a role without it still gets an empty answer under
+    enforced RLS. For a caller that deletes whatever is *not* found (the retention
+    job's orphan-copy sweep), or keeps a file only while it *is* found (the
+    shared-path check), an empty answer turns into deleting live data. So these
+    queries refuse to run without the declaration, and the orphan-copy sweep also
+    asks the database (``ArtifactStore.bypasses_row_security``) before deleting.
+    """
+
+
+def require_rls_bypass(operation: str) -> None:
+    """Raise :class:`RlsBypassRequiredError` unless :data:`bypass_rls_var` is set."""
+    if not bypass_rls_var.get():
+        msg = f"{operation} is cross-tenant and must run inside an RLS bypass scope"
+        raise RlsBypassRequiredError(msg)
+
 
 # Module-level flag: do we have the listener attached to ``Session``?
 # A list (not a bool) so it works under hot reloads / test imports

@@ -51,6 +51,7 @@ from orchestrator.tools import (
     WriteFileTool,
     build_tool_registry,
 )
+from orchestrator.tools.artifact_snapshots import InMemoryArtifactSnapshotStore
 from orchestrator.tools.knowledge import KNOWLEDGE_ANSWERABILITY_RULE, KNOWLEDGE_SEARCH_GUIDANCE
 
 
@@ -842,6 +843,7 @@ async def test_base_capabilities_assembled_with_no_manifest_tools() -> None:
     env = ToolEnv(
         sandbox_runtime=RecordingSandboxRuntime(),
         artifact_store=InMemoryArtifactStore(),
+        artifact_snapshots=InMemoryArtifactSnapshotStore(workspace=RecordingWorkspaceStore()),
         workspace_store=RecordingWorkspaceStore(),
     )
     registry = await build_tool_registry([], tool_env=env)
@@ -899,7 +901,12 @@ async def test_host_read_base_capabilities_need_only_the_workspace_store() -> No
 
 @pytest.mark.asyncio
 async def test_save_artifact_base_capability_needs_both_deps() -> None:
-    env = ToolEnv(artifact_store=InMemoryArtifactStore(), sandbox_runtime=RecordingSandboxRuntime())
+    # B-235 —— 三个依赖:登记表、stat 用的沙箱通道、复制字节的副本存储。
+    env = ToolEnv(
+        artifact_store=InMemoryArtifactStore(),
+        sandbox_runtime=RecordingSandboxRuntime(),
+        artifact_snapshots=InMemoryArtifactSnapshotStore(workspace=RecordingWorkspaceStore()),
+    )
     registry = await build_tool_registry([], tool_env=env)
     for name in _BASE_ARTIFACT_TOOLS:
         assert registry.get(name) is not None, name
@@ -968,6 +975,7 @@ async def test_base_capabilities_coexist_with_opt_in_tools() -> None:
         web_search_client=RecordingTavilyClient(),
         sandbox_runtime=RecordingSandboxRuntime(),
         artifact_store=InMemoryArtifactStore(),
+        artifact_snapshots=InMemoryArtifactSnapshotStore(workspace=RecordingWorkspaceStore()),
         workspace_store=RecordingWorkspaceStore(),
     )
     registry = await build_tool_registry([BuiltinToolSpec(name="web_search")], tool_env=env)

@@ -981,6 +981,11 @@ export interface TranslationKeys {
     deleted: string;
     delete_confirm_title: string;
     delete_confirm_body: string;
+    version_not_kept_title: string;
+    version_not_kept_body: string;
+    download_latest: string;
+    ver_col_download: string;
+    ver_not_kept: string;
   };
   manifest_tab: {
     hint: string;
@@ -4725,6 +4730,12 @@ const en: TranslationKeys = {
     delete_confirm_title: "Delete {{name}}?",
     delete_confirm_body:
       "Soft-delete: the artifact disappears from lists and downloads; bytes stay until the retention sweep, and re-saving the same name un-deletes it.",
+    version_not_kept_title: "Version {{version}} of {{name}} is not available",
+    version_not_kept_body:
+      "This version was saved before each version started being kept separately, and its content was not kept — the same name has been saved again since. You can download the latest version instead.",
+    download_latest: "Download latest",
+    ver_col_download: "Download",
+    ver_not_kept: "Content not kept",
   },
   manifest_tab: {
     hint: "Visual config — edit the fields and Save. The YAML tab is a raw escape hatch.",

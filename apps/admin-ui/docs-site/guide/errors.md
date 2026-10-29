@@ -44,7 +44,7 @@
 | [`ARTIFACT_NOT_FOUND`](./query#_5-7-产物) | 404 | 产物下载 / 产物删除 | 产物不存在、已删除，或不属于这个 `user_id`。核对 `user_id` 与产物 `name` |
 | [`APPROVAL_CONFLICT`](./run-control#_4-2-审批决策) | 409 | 审批决策 | 这条审批已经被决定过，或者因同一会话里发起了新一轮而失效。不要重复决策；需要取回上次结果时，带上当时用的 `idempotency_key` |
 | [`SESSION_NOT_BOUND`](./run-control#_4-2-审批决策) | 409 | 审批决策 | run 所在会话没有绑定 Agent。联系租户管理员 |
-| [`ARTIFACT_VERSION_MISMATCH`](#_8-7-409-冲突) | 409 | 产物下载 | 请求带的 `version` 与最新版本不一致。改用最新版或按业务异常处理 |
+| [`ARTIFACT_VERSION_MISMATCH`](#_8-7-409-冲突) | 409 | 产物下载 | 请求带的 `version` 取不到内容：版本号不存在或已被清理，或者是较早登记、已被新版本覆盖的旧版本。改用最新版或按业务异常处理 |
 | [`AGENT_DELETED`](./run-control#_4-2-审批决策) | 410 | 审批决策 | 会话绑定的 Agent 已被删除，不可恢复。改用其它 `agent_code` |
 | [`UPLOAD_TOO_LARGE`](#_8-9-413-超过大小上限) | 413 | 上传附件 | 文档或图片超过大小上限。压缩、裁剪或拆分后重传 |
 | [`ARTIFACT_TOO_LARGE`](#_8-9-413-超过大小上限) | 413 | 产物下载 | 产物文件超过单文件下载上限（64 MiB）。重试无效 |
@@ -216,7 +216,7 @@
 
 **审批决策**（`POST /v1/agents/{agent_code}/runs/{run_id}:decide`）：`APPROVAL_CONFLICT` 表示这条审批已经被决定过，包括重复提交、并发提交中落败的一方，以及同一会话里发起新一轮之后失效的审批，不要重复提交决策；`SESSION_NOT_BOUND` 表示这个 run 所在的会话没有绑定 Agent，联系租户管理员。两个错误码的完整触发条件见 [4.2 审批决策](./run-control#_4-2-审批决策)。
 
-**产物下载**（`GET /v1/agents/{agent_code}/artifacts/download`）：`ARTIFACT_VERSION_MISMATCH` 表示请求带的 `version` 与服务端最新版本不一致——这个名字在你的清单之后又被登记过新版本，被覆盖的旧版本内容不再保留。重试无效；改用最新版重新下载，或按业务异常处理。见 [5.7 下载产物](./query#_5-7-产物)。
+**产物下载**（`GET /v1/agents/{agent_code}/artifacts/download`）：`ARTIFACT_VERSION_MISMATCH` 表示请求带的 `version` 取不到内容。每个版本登记时都会单独保留一份内容，带 `version` 就能下载那一版；取不到只有两种情况：这个版本号不存在，包括超过保留期已被清理的；或者这个版本登记于「每个版本单独保留内容」上线之前、且已不是最新版本，它的内容当时被同名的新版本覆盖了。重试无效；改用最新版重新下载，或按业务异常处理。见 [5.7 下载产物](./query#_5-7-产物)。
 
 **重新生成与编辑重发**（`POST /v1/agents/{agent_code}/runs/{run_id}:regenerate` 与 `…:edit`）：`THREAD_BUSY` 表示这段会话有一轮正在执行或排队，等它结束、或先用取消 run 停掉它再试；`RUN_AWAITING_APPROVAL` 表示目标那一轮正等待审批决策，先做决策（[4.2 审批决策](./run-control#_4-2-审批决策)），再对续跑后的那一轮操作；`RUN_ALREADY_SUPERSEDED` 表示目标那一轮已经被重新生成过，改对最新的那一轮操作。三个错误码原样重试都无效。
 
@@ -240,7 +240,7 @@
 
 默认上限：文档 25 MiB，图片 10 MiB，实际取值以部署配置为准。处理方式：压缩或裁剪后重传，大文档也可以拆分成多份分别上传。
 
-产物下载（`GET /v1/agents/{agent_code}/artifacts/download`）——Agent 产出的文件超过单文件下载上限（64 MiB）。产物本身还在、也会继续出现在产物列表里，只是这个接口下载不了：
+产物下载（`GET /v1/agents/{agent_code}/artifacts/download`）——Agent 产出的文件超过单文件下载上限（64 MiB）。产物本身还在、也会继续出现在产物列表里，只是这个接口下载不了。超过这个上限的文件 Agent 已经登记不了，所以只有「每个版本单独保留内容」上线之前登记的产物才可能遇到（见 [12 更新记录](./changelog#产物下载可以按版本取)）：
 
 ```json [响应 413]
 { "success": false, "data": null, "error": { "code": "ARTIFACT_TOO_LARGE", "message": "artifact exceeds the download size limit" } }

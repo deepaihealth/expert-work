@@ -51,8 +51,17 @@ class ArtifactStore(abc.ABC):
         kind: ArtifactKind,
         path_in_workspace: str,
         created_in_thread: str,
+        version_id: UUID | None = None,
+        snapshot_key: str | None = None,
+        size_bytes: int | None = None,
+        sha256: str | None = None,
     ) -> ArtifactVersion:
         """Register a new version of ``(agent_key, name)``.
+
+        B-235 —— ``save_artifact`` 先把字节复制成副本(以它自己生成的 ``version_id``
+        命名),再带着 ``version_id`` / ``snapshot_key`` / ``size_bytes`` / ``sha256``
+        调这里:副本与版本行在同一次调用里配对,版本号怎么分配都串不了。四个都缺省
+        = B-235 之前的写法(没有副本,行 id 由 store 生成),只剩评测与测试在用。
 
         ``agent_key`` 空串 = 没绑 agent 的调用方(合成执行路径)。它与任何
         非空 key 都是不同的身份,不会跟谁合并。
@@ -124,6 +133,50 @@ class ArtifactStore(abc.ABC):
         约束 —— id 是 UUID 不等于可以跨用户取。``None`` = 未知 / 已软删 /
         跨用户(调用方一律转 404,与 :meth:`get_latest_version` 同一套隐藏规则)。
         """
+
+    @abc.abstractmethod
+    async def get_version_by_id(
+        self, *, tenant_id: UUID, user_id: UUID, artifact_id: UUID, version: int
+    ) -> ArtifactVersion | None:
+        """B-235 —— 按 ``artifact_id`` 取第 ``version`` 版(不是最新版)。
+
+        三个下载端点都先取最新版、再从**同一行**按 id 取指定版本 —— 不按名字查第二次,
+        两次按名字的查询可能落在两条不同的同名产物上。
+
+        隐藏规则同 :meth:`get_latest_version_by_id`。
+        """
+
+    @abc.abstractmethod
+    async def paths_still_registered(
+        self,
+        *,
+        tenant_id: UUID,
+        user_id: UUID,
+        paths: Sequence[str],
+        excluding_version_ids: Sequence[UUID],
+    ) -> set[str]:
+        """B-235 —— ``paths`` 里哪些还被**别的**版本行指着(``excluding_version_ids``
+        之外的、同一 ``(tenant, user)`` 的)。
+
+        留存作业删一个到期版本时据此决定要不要 unlink 工作区文件:同名重登记的
+        各版本指着同一个路径,老版本到期时新版本还在用那个文件。不看父行是否软删
+        —— 软删的产物在硬删宽限期内仍可能被重登记恢复。Caller MUST be inside an
+        RLS bypass scope (the retention job)."""
+
+    @abc.abstractmethod
+    async def existing_version_ids(self, ids: Sequence[UUID]) -> set[UUID]:
+        """B-235 —— ``ids`` 里哪些还有版本行。
+
+        孤儿副本清理用:副本以版本行 id 命名,找不到行的副本就是没人认领的字节。
+        Caller MUST be inside an RLS bypass scope (the retention job)."""
+
+    @abc.abstractmethod
+    async def bypasses_row_security(self) -> bool:
+        """B-235 —— 这个连接能不能看见所有租户的行(库角色有 BYPASSRLS 或是超级用户)。
+
+        ``bypass_rls_var`` 只是让本进程不发租户 GUC;连库角色没有 BYPASSRLS 时,强制 RLS
+        照样把跨租户查询收成空集。孤儿副本清理按「找不到版本行」删字节,删之前必须先问这一
+        句 —— 看不见所有行就不删。"""
 
     @abc.abstractmethod
     async def soft_delete_by_id(

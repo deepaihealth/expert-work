@@ -7,19 +7,21 @@ Artifacts are per-``(tenant, user, agent_key)`` —— B-50 起 ``agent_key`` �
 不再是身份,``?name=`` 会指向不确定的那一条。
 
 * ``GET /v1/artifacts`` — list the caller's artifacts (每条带 ``id`` + ``agent_key``).
-* ``GET /v1/artifacts/download?artifact_id=…`` — stream the latest version's
-  content (MIME-aware + XSS-safe Content-Disposition; J.9-step3,
-  STREAM-J-DESIGN § 10.5).
+* ``GET /v1/artifacts/download?artifact_id=…[&version=N]`` — stream the latest
+  version's content, or version ``N`` (B-235; MIME-aware + XSS-safe
+  Content-Disposition; J.9-step3, STREAM-J-DESIGN § 10.5).
 * ``DELETE /v1/artifacts/{artifact_id}`` — soft-delete (J.9-step3, Mini-ADR
   J-25). Lifecycle is metadata-only; the J.15 volume bytes stay until
   the retention sweep / volume lifecycle removes them.
 * ``PATCH /v1/artifacts/{artifact_id}`` — update ``kind`` (J.9-step3).
 * ``GET /v1/artifacts/{artifact_id}/versions`` — version history (J.9-step3).
 
-Content lives in the user's J.15 workspace volume — only the
-sandbox-supervisor can read a docker volume, so the download endpoint
-proxies to the supervisor's workspace-file API and backfills the
-version's ``size_bytes`` / ``sha256`` on that first read.
+B-235 —— each version saved since then has a copy of its bytes taken at
+registration (``snapshot_key``), with ``size_bytes`` / ``sha256`` computed then;
+downloads read that copy. Versions registered before B-235 have no copy: their
+content is read from the workspace path, and their digest is backfilled on that
+first read. Version selection is shared with the session and external download
+endpoints (:mod:`control_plane.api._artifact_content`).
 """
 
 from __future__ import annotations
@@ -34,6 +36,13 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi.responses import JSONResponse, Response
 from pydantic import BaseModel, ConfigDict
 
+from control_plane.api._artifact_content import (
+    VERSION_HEADER,
+    VersionNotRetained,
+    VersionUnknown,
+    choose_version,
+    read_version_bytes,
+)
 from control_plane.api._artifact_mime import content_disposition_header, infer_content_type
 from control_plane.api._authz import console_only, require
 from control_plane.api._quota_admission import check_admission
@@ -59,6 +68,7 @@ from orchestrator.tools import (
     WorkspacePermissionError,
     WorkspaceStore,
 )
+from orchestrator.tools.artifact_snapshots import ArtifactSnapshotStore
 
 logger = logging.getLogger("expert_work.control_plane.artifacts")
 
@@ -85,6 +95,11 @@ def _get_artifact_store(request: Request) -> ArtifactStore:
 
 def _get_workspace_store(request: Request) -> WorkspaceStore | None:
     return request.app.state.workspace_store  # type: ignore[no-any-return]
+
+
+def _get_artifact_snapshots(request: Request) -> ArtifactSnapshotStore | None:
+    """B-235 —— 产物版本副本;没接(测试 / 无工作区部署)时 ``None``。"""
+    return getattr(request.app.state, "artifact_snapshots", None)
 
 
 def _get_quota(request: Request) -> QuotaService:
@@ -179,6 +194,7 @@ def build_artifacts_router() -> APIRouter:
         store: Annotated[ArtifactStore, Depends(_get_artifact_store)],
         users: Annotated[TenantUserStore, Depends(get_user_repo)],
         workspace_store: Annotated[WorkspaceStore | None, Depends(_get_workspace_store)],
+        snapshots: Annotated[ArtifactSnapshotStore | None, Depends(_get_artifact_snapshots)],
         quota: Annotated[QuotaService, Depends(_get_quota)],
         audit: Annotated[AuditLogger, Depends(_get_audit)],
         # H.8-F1 — tenant-admin governance: act on one member's artifact
@@ -189,6 +205,8 @@ def build_artifacts_router() -> APIRouter:
         # foreign tenant's artifact from the tenant switcher; "*" is
         # meaningless (an artifact belongs to one tenant).
         tenant_id: Annotated[UUID | Literal["*"] | None, Query()] = None,
+        # B-235 —— 版本列表里逐版下载。不给 = 最新版。
+        version: Annotated[int | None, Query(ge=1)] = None,
     ) -> Response:
         scope = await ensure_single_tenant_scope(
             request.state.principal,
@@ -205,11 +223,21 @@ def build_artifacts_router() -> APIRouter:
             raise HTTPException(status_code=404, detail="artifact not found")
         current_user_id_var.set(target_user_id)
         async with applied_scope(scope):
-            version = await store.get_latest_version_by_id(
+            latest = await store.get_latest_version_by_id(
                 tenant_id=target_tenant, user_id=target_user_id, artifact_id=artifact_id
             )
-            if version is None:
+            if latest is None:
                 raise HTTPException(status_code=404, detail="artifact not found")
+            pinned = (
+                await store.get_version_by_id(
+                    tenant_id=target_tenant,
+                    user_id=target_user_id,
+                    artifact_id=artifact_id,
+                    version=version,
+                )
+                if version is not None
+                else None
+            )
             # Re-fetch the parent row to know the ``kind`` for MIME inference.
             artifacts = await store.list_for_user(
                 tenant_id=target_tenant, user_id=target_user_id, agent_key=None
@@ -219,6 +247,18 @@ def build_artifacts_router() -> APIRouter:
             # Defensive — would mean a version exists but its parent does
             # not, which the store invariants forbid.
             raise HTTPException(status_code=404, detail="artifact not found")
+        try:
+            chosen = choose_version(latest=latest, requested=version, pinned=pinned)
+        except VersionUnknown as exc:
+            raise HTTPException(status_code=404, detail="artifact version not found") from exc
+        except VersionNotRetained as exc:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"version {exc.requested} of this artifact was registered before per-version "
+                    f"copies existed and its content was not kept; the latest is {exc.latest}"
+                ),
+            ) from exc
         # Mini-ADR J-25 (J.9-step2) — quota admission. ``cost=1`` deducts
         # from QPS + ``ARTIFACT_DOWNLOAD_COUNT_30D`` (only the
         # dimensions a tenant has rows for run; others are no-ops).
@@ -242,10 +282,12 @@ def build_artifacts_router() -> APIRouter:
                 detail="artifact download unavailable: no sandbox supervisor configured",
             )
         try:
-            data = await workspace_store.read_file(
+            data = await read_version_bytes(
+                chosen,
                 tenant_id=target_tenant,
                 user_id=target_user_id,
-                path=version.path_in_workspace,
+                snapshots=snapshots,
+                workspace_store=workspace_store,
             )
         except WorkspacePermissionError as exc:
             # 元数据行存在,内容读不动是权限问题(服务端配置),不是"这个 artifact
@@ -253,27 +295,28 @@ def build_artifacts_router() -> APIRouter:
             # workspace 端点的坑)。必须排在下面的 SandboxSupervisorError 之前
             # (它的子类,顺序反了永远走不到)。``exc_info=True`` 带全 traceback
             # (同其它八处权限归因站点的既有手法),不进响应体;detail 是固定文案。
-            logger.warning("artifact.permission_denied version=%s", version.id, exc_info=True)
+            logger.warning("artifact.permission_denied version=%s", chosen.id, exc_info=True)
             raise HTTPException(status_code=500, detail="artifact content unavailable") from exc
         except WorkspaceFileTooLargeError as exc:
             # 「太大」≠「不存在」—— 文件在、列表里看得见,只是超过单文件下载
             # 闸。折进 404 会让用户以为产物丢了(2026-08-26 的 pptx 内嵌视频
             # 正是这样)。同样必须排在 SandboxSupervisorError 之前(子类)。
-            logger.warning("artifact.too_large version=%s reason=%s", version.id, exc)
+            logger.warning("artifact.too_large version=%s reason=%s", chosen.id, exc)
             raise HTTPException(
                 status_code=413, detail="artifact exceeds the download size limit"
             ) from exc
         except SandboxSupervisorError as exc:
             # The metadata row exists but the file is gone / unreadable —
             # log the supervisor detail, keep the client response opaque.
-            logger.warning("artifact.content_unavailable version=%s reason=%s", version.id, exc)
+            logger.warning("artifact.content_unavailable version=%s reason=%s", chosen.id, exc)
             raise HTTPException(status_code=404, detail="artifact content not found") from exc
 
-        # Backfill the digest on first read — unknown at save_artifact time.
-        if version.size_bytes is None:
+        # Backfill the digest on first read — only versions registered before
+        # B-235 lack it (a copy's digest is computed when the copy is taken).
+        if chosen.size_bytes is None:
             async with applied_scope(scope):
                 await store.set_version_digest(
-                    version_id=version.id,
+                    version_id=chosen.id,
                     size_bytes=len(data),
                     sha256=hashlib.sha256(data).hexdigest(),
                 )
@@ -282,12 +325,13 @@ def build_artifacts_router() -> APIRouter:
         # always sent ``attachment`` regardless of how the kind / path
         # are spelled; unknown extensions fall through to
         # ``application/octet-stream`` + attachment.
-        inferred = infer_content_type(path=version.path_in_workspace)
+        inferred = infer_content_type(path=chosen.path_in_workspace)
         headers = {
             "Content-Disposition": content_disposition_header(
                 artifact.name, disposition=inferred.disposition
             ),
             "X-Content-Type-Options": "nosniff",
+            VERSION_HEADER: str(chosen.version),
         }
         return Response(content=data, media_type=inferred.content_type, headers=headers)
 
@@ -424,8 +468,11 @@ def build_artifacts_router() -> APIRouter:
 
         Sorted newest-first; soft-deleted artifacts return 404 (same
         hiding rule). Each entry exposes the per-version metadata —
-        ``size_bytes`` / ``sha256`` may still be NULL when the version
-        has never been downloaded (lazy backfill).
+        ``size_bytes`` / ``sha256`` may still be NULL on a version registered
+        before B-235 that has never been downloaded (lazy backfill).
+
+        B-235 —— ``retained``:这一版有没有登记时的副本。有 → 可以单独下载;
+        没有(B-235 之前登记的)→ 只有它是最新版时才下得到。
         """
         scope = await ensure_single_tenant_scope(
             request.state.principal,
@@ -453,6 +500,7 @@ def build_artifacts_router() -> APIRouter:
                 "sha256": v.sha256,
                 "created_in_thread": v.created_in_thread,
                 "created_at": v.created_at.isoformat() if v.created_at else None,
+                "retained": v.snapshot_key is not None,
             }
             for v in versions
         ]

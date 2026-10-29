@@ -236,7 +236,7 @@ describe("AnswerBubble", () => {
     expect(screen.getByTestId("playground-turn-answer-scroll")).toBeInTheDocument();
   });
 
-  it("artifact download row calls onDownloadArtifact(name)", async () => {
+  it("artifact download row calls onDownloadArtifact(name, version)", async () => {
     const events: SseEvent[] = [
       {
         id: "1",
@@ -274,6 +274,8 @@ describe("AnswerBubble", () => {
                 name: "save_artifact",
                 content: "saved",
                 status: "success",
+                // B-235 —— 工具结果带着这一轮登记出的版本号。
+                artifact: { artifact: "report.txt", version: 3, kind: "other" },
               },
             ],
           },
@@ -294,7 +296,8 @@ describe("AnswerBubble", () => {
 
     expect(screen.getByTestId("playground-turn-artifacts")).toBeInTheDocument();
     await userEvent.click(screen.getByTestId("playground-turn-artifact-download"));
-    expect(onDownload).toHaveBeenCalledWith("report.txt");
+    // B-235 —— 带上这一轮登记的版本号:同名产物之后被别的会话重登记过,这里仍是这一版。
+    expect(onDownload).toHaveBeenCalledWith("report.txt", 3);
   });
 });
 

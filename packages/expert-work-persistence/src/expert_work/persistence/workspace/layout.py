@@ -23,6 +23,8 @@ change in one place can never silently desync from the filter.
 from __future__ import annotations
 
 import re
+from pathlib import Path
+from uuid import UUID
 
 #: Activated skill packages, seeded at ``skills/<name>/…`` (skill-runtime §5.1).
 #: Sandbox migration wave 2 (spec § 四) moved the actual seed *destination*
@@ -58,6 +60,24 @@ WORKSPACE_AGENTS_DIR = "agents"
 #: § 7.1). Readable from any agent via the explicit ``shared:`` prefix,
 #: never writable — it is frozen on migration day and decays with time.
 WORKSPACE_SHARED_DIR = "shared"
+
+#: B-235 —— 产物版本副本的目录名。每次 ``save_artifact`` 把那一刻的字节复制一份,
+#: 以版本行 id 命名,放在 ``{root}/{tenant_id}/.artifact-versions/{user_id}/`` ——
+#: 用户根的**旁边**,不在里面:沙箱只挂 ``{tenant_id}/{user_id}`` 这个 subPath,
+#: 所以 agent 跑的代码碰不到副本(同 ``.deleted`` 软删标记的位置理由)。写副本的
+#: control-plane 与删副本的留存作业都经 :func:`artifact_snapshot_dir` 拼这条路径,
+#: 不各拼各的。
+ARTIFACT_SNAPSHOT_DIR = ".artifact-versions"
+
+
+def artifact_snapshot_dir(root: str, tenant_id: UUID, user_id: UUID) -> Path:
+    """一个用户的产物版本副本目录:``{root}/{tenant_id}/.artifact-versions/{user_id}``。
+
+    ``tenant_id`` / ``user_id`` 是 UUID(来自已认证的调用方或库里的行),不是路径文本。
+    只负责拼出路径;打开它时要不要防 symlink 是调用方的事(都走 ``O_NOFOLLOW``)。
+    """
+    return Path(root) / str(tenant_id) / ARTIFACT_SNAPSHOT_DIR / str(user_id)
+
 
 #: Sandbox-local seed root for an agent's activated skill files (sandbox
 #: migration wave 2, spec § 四 — "技能方案"). Materialized at

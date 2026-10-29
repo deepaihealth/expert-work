@@ -36,7 +36,7 @@ import { useTranslation } from "react-i18next";
 import { getAgent } from "../api/agents";
 import { decideApprovals, type ApprovalItem } from "../api/approvals";
 
-import { ApiError, errMessage } from "../api/client";
+import { ApiError } from "../api/client";
 import { getConversation, type ConversationDetail as ConversationDetailModel } from "../api/conversations";
 import { cancelRun, streamRunEvents } from "../api/runs";
 import { configChangePoints } from "./conversation_detail/configChanges";
@@ -48,7 +48,6 @@ import {
   type HistoryMessage,
   type SessionFeedbackItem,
   type SseEvent,
-  downloadSessionArtifact,
 } from "../api/sessions";
 import type { FireNowResult } from "../api/triggers";
 import { useAuth } from "../auth/AuthContext";
@@ -60,6 +59,7 @@ import { TrajectoryView } from "../components/console/TrajectoryView";
 import type { ConsoleTurn, TurnTiming } from "../components/console/types";
 import type { FocusRequest } from "../components/console/use_trajectory_state";
 import { TRAJECTORY_BOX_STYLE } from "../components/console/trajectory_box";
+import { useTurnArtifactDownload } from "../components/console/useTurnArtifactDownload";
 import { ViewPane, type ConsoleView } from "../components/console/ViewPane";
 import { readModel } from "../components/manifest-editor/form_model";
 import { CommentarySegmentLine } from "../components/turn/CommentarySegmentLine";
@@ -537,24 +537,13 @@ export function ConversationDetail() {
     [threadId],
   );
 
-  // Artifacts the agent registered during a replayed turn. ``user_id`` is the
-  // tenant-admin governance target (H.8-F1) — the conversation's own user, not
-  // the operator reading it.
-  const conversationUserId = convo?.user_id ?? null;
-  const handleDownloadArtifact = useCallback(
-    async (name: string) => {
-      try {
-        // B-50 —— 走会话作用域端点:这一面手里只有产物名,而会话只属于一个
-        // agent,后端按 ``thread_meta.agent_name`` 收口,「这个会话的 X」唯一。
-        if (!threadId) return;
-        await downloadSessionArtifact(threadId, name, concreteTenantScope(apiTenantScope));
-      } catch (err) {
-        // 静默吞错让「下载 404 / 413」表现成「点了没反应」,用户以为产物丢了
-        // (2026-08-26 反馈)。toast 带后端 detail(如「太大」「不存在」)。
-        message.error(t("artifacts_page.download_failed", { detail: errMessage(err) }));
-      }
-    },
-    [conversationUserId, apiTenantScope, t],
+  // Artifacts the agent registered during a replayed turn. B-50 —— 走会话作用域
+  // 端点:这一面手里只有产物名,而会话只属于一个 agent,后端按
+  // ``thread_meta.agent_name`` 收口。B-235 —— 按这一轮登记的版本下载(同一用户的
+  // 另一段会话之后再登记同名产物,这一轮仍是这一版);409 时提示并给「下载最新版」。
+  const handleDownloadArtifact = useTurnArtifactDownload(
+    threadId ?? null,
+    concreteTenantScope(apiTenantScope),
   );
 
   // §九「联动」—— 脚注「查看轨迹」:切「轨迹」tab + 选中该轮最后一条 ASSISTANT

@@ -29,6 +29,10 @@ class InMemoryArtifactStore(ArtifactStore):
         kind: ArtifactKind,
         path_in_workspace: str,
         created_in_thread: str,
+        version_id: UUID | None = None,
+        snapshot_key: str | None = None,
+        size_bytes: int | None = None,
+        sha256: str | None = None,
     ) -> ArtifactVersion:
         now = datetime.now(UTC)
         existing = next(
@@ -66,14 +70,17 @@ class InMemoryArtifactStore(ArtifactStore):
         self._artifacts[artifact.id] = artifact
 
         version = ArtifactVersion(
-            id=uuid4(),
+            id=version_id or uuid4(),
             artifact_id=artifact.id,
             tenant_id=tenant_id,
             user_id=user_id,
             version=artifact.latest_version,
             path_in_workspace=path_in_workspace,
+            size_bytes=size_bytes,
+            sha256=sha256,
             created_in_thread=created_in_thread,
             created_at=now,
+            snapshot_key=snapshot_key,
         )
         self._versions.append(version)
         return version
@@ -141,6 +148,51 @@ class InMemoryArtifactStore(ArtifactStore):
         ):
             return None
         return self._latest_of(artifact)
+
+    async def get_version_by_id(
+        self, *, tenant_id: UUID, user_id: UUID, artifact_id: UUID, version: int
+    ) -> ArtifactVersion | None:
+        artifact = self._artifacts.get(artifact_id)
+        if (
+            artifact is None
+            or artifact.tenant_id != tenant_id
+            or artifact.user_id != user_id
+            or artifact.deleted_at is not None
+        ):
+            return None
+        return self._version_of(artifact, version)
+
+    def _version_of(self, artifact: Artifact, version: int) -> ArtifactVersion | None:
+        return next(
+            (v for v in self._versions if v.artifact_id == artifact.id and v.version == version),
+            None,
+        )
+
+    async def paths_still_registered(
+        self,
+        *,
+        tenant_id: UUID,
+        user_id: UUID,
+        paths: Sequence[str],
+        excluding_version_ids: Sequence[UUID],
+    ) -> set[str]:
+        wanted = set(paths)
+        excluded = set(excluding_version_ids)
+        return {
+            v.path_in_workspace
+            for v in self._versions
+            if v.tenant_id == tenant_id
+            and v.user_id == user_id
+            and v.path_in_workspace in wanted
+            and v.id not in excluded
+        }
+
+    async def bypasses_row_security(self) -> bool:
+        return True  # 内存档没有 RLS
+
+    async def existing_version_ids(self, ids: Sequence[UUID]) -> set[UUID]:
+        wanted = set(ids)
+        return {v.id for v in self._versions if v.id in wanted}
 
     def _latest_of(self, artifact: Artifact) -> ArtifactVersion | None:
         return next(

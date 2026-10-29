@@ -718,9 +718,12 @@ describe("PlaygroundTab", () => {
     await user.click(btn);
     // B-50 —— 对话面手里只有产物名(从 SSE 事件推出来的,没有行 id),所以走
     // 会话作用域端点:后端按会话的 agent 收口,「这个会话的 report.pdf」唯一。
+    // B-235 —— 第四个参数是这一轮登记的版本号;这个回放的工具结果不带版本,所以是
+    // undefined(下载最新版)。
     expect(downloadSessionArtifactMock).toHaveBeenCalledWith(
       expect.any(String),
       "report.pdf",
+      undefined,
       undefined,
     );
   });

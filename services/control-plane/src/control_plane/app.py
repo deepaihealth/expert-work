@@ -255,6 +255,7 @@ from control_plane.runtime import (
     ResolvingProviderKeys,
     _build_mcp_client,
     _resolve_template_extends,
+    build_artifact_snapshot_store,
     build_mcp_pool,
     build_middleware_env,
     build_sandbox_runtime,
@@ -835,6 +836,8 @@ def create_app(
         runtime=resolved_sandbox_runtime,
         instance_store=resolved_sandbox_instance_store,
     )
+    # B-235 —— 产物版本副本:save_artifact 写、三个下载端点读、清除用户删。
+    resolved_artifact_snapshots = build_artifact_snapshot_store(resolved_workspace_store)
     resolved_feedback = feedback_repo or (
         sql_stores.feedback if sql_stores else InMemoryFeedbackStore()
     )
@@ -1834,6 +1837,7 @@ def create_app(
                     # 直读 control-plane 自己挂着的 NAS,不起沙箱。与工作区端点
                     # 共用同一个 store 实例,不另造一份。
                     workspace_store=resolved_workspace_store,
+                    artifact_snapshots=resolved_artifact_snapshots,
                     # Stream TE-8 — cross-replica per-workspace write lock for
                     # write_file / bash. A raw (non-RLS) sessionmaker: the
                     # advisory lock touches no tenant tables.
@@ -2775,6 +2779,7 @@ def create_app(
     app.state.knowledge_recovery_worker = None
     app.state.sandbox_runtime = resolved_sandbox_runtime
     app.state.workspace_store = resolved_workspace_store
+    app.state.artifact_snapshots = resolved_artifact_snapshots
     app.state.audit_logger = resolved_audit
     app.state.manifest_loader = resolved_loader
     app.state.jwt_verifier = resolved_verifier

@@ -79,7 +79,8 @@ export interface TranscriptProps {
    *  调试台 live 轮断开连接即取消,对话页历史轮调取消接口。 */
   onCancelQueuedLive?: (turn: ConsoleTurn) => void;
   onCancelQueuedHistory?: (turn: ConsoleTurn) => void;
-  onDownloadArtifact: (name: string) => Promise<void>;
+  /** B-235 —— ``version`` = 这一轮登记的版本号;缺席时下载最新版。 */
+  onDownloadArtifact: (name: string, version?: number) => Promise<void>;
   onFireResult?: (r: FireNowResult) => void;
   /** PR-B Task 3 — ConversationDetail 脚注「查看运行」深链;透传给
    *  ``TurnBlock``。Omitted → 零变化(链接不渲染)。 */

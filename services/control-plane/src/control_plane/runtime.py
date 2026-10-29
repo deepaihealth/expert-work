@@ -141,6 +141,11 @@ from orchestrator.tools import (
     WorkspaceLock,
     WorkspaceStore,
 )
+from orchestrator.tools.artifact_snapshots import (
+    ArtifactSnapshotStore,
+    InMemoryArtifactSnapshotStore,
+    NasArtifactSnapshotStore,
+)
 from orchestrator.tools.knowledge_catalog import catalog_fingerprint
 from orchestrator.tools.knowledge_log import LoggedKnowledgeRetriever, RetrievalLogSink
 from orchestrator.tools.knowledge_rerank import RerankOutcome, RerankRanking
@@ -2006,6 +2011,26 @@ def build_workspace_store(
     return None
 
 
+def build_artifact_snapshot_store(
+    workspace_store: WorkspaceStore | None,
+) -> ArtifactSnapshotStore | None:
+    """B-235 —— 产物版本副本的存储,跟着工作区后端走。
+
+    * NAS(测试 / 生产集群)→ :class:`NasArtifactSnapshotStore`,副本放在 NAS 上用户根
+      旁边,沙箱挂不到;所有副本共享,留存作业也挂着同一棵树,能删。
+    * 本地 supervisor 后端(docker 卷,集群上已退役)→ 进程内存。重启即丢,那时旧版本
+      下载如实回「内容不在」。
+    * 没有工作区 → ``None``:``save_artifact`` 随之不注册(显式声明则报错)。
+
+    传进来的必须是 ``build_workspace_store`` 给工作区端点的同一个实例。
+    """
+    if isinstance(workspace_store, NasWorkspaceStore):
+        return NasArtifactSnapshotStore(workspace=workspace_store)
+    if workspace_store is not None:
+        return InMemoryArtifactSnapshotStore(workspace=workspace_store)
+    return None
+
+
 def build_tool_env(
     tenant_config_service: TenantConfigService,
     *,
@@ -2017,6 +2042,7 @@ def build_tool_env(
     image_resolver: ImageResolver | None = None,
     workspace_lock: WorkspaceLock | None = None,
     workspace_store: WorkspaceStore | None = None,
+    artifact_snapshots: ArtifactSnapshotStore | None = None,
 ) -> ToolEnv:
     """Assemble the M0 :class:`ToolEnv`.
 
@@ -2049,6 +2075,7 @@ def build_tool_env(
         image_resolver=image_resolver,
         workspace_lock=workspace_lock or NullWorkspaceLock(),
         workspace_store=workspace_store,
+        artifact_snapshots=artifact_snapshots,
     )
 
 

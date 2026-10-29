@@ -36,7 +36,8 @@ export interface AnswerBubbleProps {
   summary: TurnSummary;
   /** 流式:当前未落地步的 content(打字机);settled 或历史轮 undefined。 */
   liveText?: string;
-  onDownloadArtifact: (name: string) => Promise<void>;
+  /** B-235 —— ``version`` = 这一轮登记的版本号;缺席时下载最新版。 */
+  onDownloadArtifact: (name: string, version?: number) => Promise<void>;
   /** B-139 —— 排队中这一轮的「取消排队」;不传 = 不出按钮(只读视图)。 */
   onCancelQueued?: () => void;
 }
@@ -80,10 +81,10 @@ export function AnswerBubble({
   const artifacts = useMemo(() => turnArtifacts(turn.turn.events), [turn.turn.events]);
   const [downloadingArtifact, setDownloadingArtifact] = useState<string | null>(null);
   const downloadArtifact = useCallback(
-    async (name: string) => {
+    async (name: string, version?: number) => {
       setDownloadingArtifact(name);
       try {
-        await onDownloadArtifact(name);
+        await onDownloadArtifact(name, version);
       } finally {
         setDownloadingArtifact(null);
       }
@@ -234,7 +235,7 @@ export function AnswerBubble({
               size="small"
               icon={<Download size={11} strokeWidth={1.75} />}
               loading={downloadingArtifact === a.name}
-              onClick={() => void downloadArtifact(a.name)}
+              onClick={() => void downloadArtifact(a.name, a.version)}
               aria-label={t("playground.artifact_download", { name: a.name })}
               data-testid="playground-turn-artifact-download"
             >

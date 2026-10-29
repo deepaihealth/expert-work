@@ -627,9 +627,10 @@ describe("turnArtifacts (end 帧快照 ∪ 工具推导)", () => {
         { name: "《手册》.docx", kind: "document", version: 1 },
       ]),
     ];
+    // B-235 —— 版本号跟着清单走,下载按它取这一轮的那一版。
     expect(turnArtifacts(events)).toEqual([
-      { name: "套一-payload.json", kind: "data" },
-      { name: "《手册》.docx", kind: "document" },
+      { name: "套一-payload.json", kind: "data", version: 1 },
+      { name: "《手册》.docx", kind: "document", version: 1 },
     ]);
   });
 
@@ -639,7 +640,7 @@ describe("turnArtifacts (end 帧快照 ∪ 工具推导)", () => {
       updates("tools", [toolResult("c1", "Saved …")]),
       endFrame([{ name: "report.pdf", kind: "document", version: 2 }]),
     ];
-    expect(turnArtifacts(events)).toEqual([{ name: "report.pdf", kind: "document" }]);
+    expect(turnArtifacts(events)).toEqual([{ name: "report.pdf", kind: "document", version: 2 }]);
   });
 
   it("无 end 帧的老回放退回纯工具推导", () => {

@@ -40,11 +40,15 @@ export interface ArtifactList {
 export interface ArtifactVersion {
   version: number;
   path_in_workspace: string;
-  /** NULL until the version's first download backfills the digest. */
+  /** Computed when the version's copy is taken (B-235); NULL only on a version
+   *  registered before that, until its first download backfills the digest. */
   size_bytes: number | null;
   sha256: string | null;
   created_in_thread: string | null;
   created_at: string | null;
+  /** B-235 —— 这一版登记时留了副本,可以单独下载。``false`` = 逐版留存上线前登记的,
+   *  只有它是最新版时下得到。 */
+  retained: boolean;
 }
 
 export interface ArtifactVersionList {
@@ -95,9 +99,13 @@ export async function downloadArtifact(
   fallbackName: string,
   userId?: string,
   tenantScope?: TenantScope,
+  /** B-235 —— 指定版本;不给 = 最新版。 */
+  version?: number,
 ): Promise<string> {
+  const params: Record<string, unknown> = { artifact_id: artifactId, user_id: userId };
+  if (version !== undefined) params.version = version;
   const response = await apiClient.get<Blob>("/v1/artifacts/download", {
-    params: withTenantScope({ artifact_id: artifactId, user_id: userId }, tenantScope),
+    params: withTenantScope(params, tenantScope),
     responseType: "blob",
   });
   const disposition = (response.headers as Record<string, string | undefined>)[

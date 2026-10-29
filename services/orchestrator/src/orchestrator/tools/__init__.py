@@ -193,6 +193,9 @@ from orchestrator.tools.sandbox import (
     SandboxSupervisorError as SandboxSupervisorError,
 )
 from orchestrator.tools.sandbox import (
+    WorkspaceFileChangedError as WorkspaceFileChangedError,
+)
+from orchestrator.tools.sandbox import (
     WorkspaceFileTooLargeError as WorkspaceFileTooLargeError,
 )
 from orchestrator.tools.sandbox import (
@@ -316,6 +319,7 @@ __all__ = [
     "ToolResult",
     "ToolSpec",
     "WebSearchTool",
+    "WorkspaceFileChangedError",
     "WorkspaceFileEntry",
     "WorkspaceFileTooLargeError",
     "WorkspaceLock",

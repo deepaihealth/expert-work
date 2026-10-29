@@ -30,6 +30,13 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi.responses import JSONResponse, Response
 from pydantic import BaseModel, ConfigDict, Field
 
+from control_plane.api._artifact_content import (
+    VERSION_HEADER,
+    VersionNotRetained,
+    VersionUnknown,
+    choose_version,
+    read_version_bytes,
+)
 from control_plane.api._artifact_mime import content_disposition_header, infer_content_type
 from control_plane.api._authz import console_only, require, require_key_scope
 from control_plane.api._quota_admission import check_admission
@@ -83,6 +90,7 @@ from orchestrator.tools import (
     WorkspacePermissionError,
     WorkspaceStore,
 )
+from orchestrator.tools.artifact_snapshots import ArtifactSnapshotStore
 from orchestrator.tools.overflow import OVERFLOW_DIR
 
 logger = logging.getLogger("expert_work.control_plane.sessions")
@@ -183,6 +191,11 @@ def _get_workspace_store(request: Request) -> UserWorkspaceStore:
 
 def _get_artifact_store(request: Request) -> ArtifactStore:
     return request.app.state.artifact_store  # type: ignore[no-any-return]
+
+
+def _get_artifact_snapshots(request: Request) -> ArtifactSnapshotStore | None:
+    """B-235 —— 产物版本副本;没接(测试 / 无工作区部署)时 ``None``。"""
+    return getattr(request.app.state, "artifact_snapshots", None)
 
 
 def _get_workspace_file_client(request: Request) -> WorkspaceStore | None:
@@ -688,16 +701,23 @@ def build_sessions_router() -> APIRouter:
         users: Annotated[TenantUserStore, Depends(get_user_repo)],
         artifacts: Annotated[ArtifactStore, Depends(_get_artifact_store)],
         workspace_store: Annotated[WorkspaceStore | None, Depends(_get_workspace_file_client)],
+        snapshots: Annotated[ArtifactSnapshotStore | None, Depends(_get_artifact_snapshots)],
         audit: Annotated[AuditLogger, Depends(_get_audit)],
         # W2 read scope — see ``get_session``.
         tenant_id: Annotated[UUID | Literal["*"] | None, Query()] = None,
+        version: Annotated[int | None, Query(ge=1)] = None,
     ) -> Response:
-        """Download the thread user's artifact by logical name (latest version).
+        """Download the thread user's artifact by logical name.
 
         Thread-scoped (the thread's owning user), unlike the caller-scoped
-        ``/v1/artifacts/download``. Resolves the latest version's workspace
-        path + proxies the bytes via the supervisor. 404 hides cross-user /
-        missing / no-supervisor.
+        ``/v1/artifacts/download``. 404 hides cross-user / missing /
+        no-supervisor.
+
+        B-235 —— ``version`` 给了就下那一版(对话页 / 调试台每一轮带上这一轮登记的
+        版本号),不给是最新版;内容读登记时的副本(选版规则见
+        :mod:`control_plane.api._artifact_content`)。B-235 之前登记、已不是最新的
+        一版 → 409:前端据此提示「这一版内容没有单独保留」并给出「下载最新版」,
+        绝不拿最新版冒充。未知版本 → 404。
         """
         scope = await ensure_single_tenant_scope(
             request.state.principal,
@@ -720,17 +740,46 @@ def build_sessions_router() -> APIRouter:
         if meta.user_id is None or workspace_store is None:
             raise HTTPException(status_code=404, detail="artifact not found")
         async with applied_scope(scope):
-            version = await artifacts.get_latest_version(
+            latest = await artifacts.get_latest_version(
                 tenant_id=target_tenant,
                 user_id=meta.user_id,
                 agent_key=_session_agent_key(meta),
                 name=name,
             )
-        if version is None:
+            # 指定版本从「最新版」那一行按 id 取,不再按名字查第二次:两次按名字的查询
+            # 可能落在两条不同的同名产物上(``agent_key=None`` 的老会话、或两次查询之间
+            # 同名产物被更新)。见 :mod:`control_plane.api._artifact_content`。
+            pinned = (
+                await artifacts.get_version_by_id(
+                    tenant_id=target_tenant,
+                    user_id=meta.user_id,
+                    artifact_id=latest.artifact_id,
+                    version=version,
+                )
+                if latest is not None and version is not None
+                else None
+            )
+        if latest is None:
             raise HTTPException(status_code=404, detail="artifact not found")
         try:
-            data = await workspace_store.read_file(
-                tenant_id=target_tenant, user_id=meta.user_id, path=version.path_in_workspace
+            chosen = choose_version(latest=latest, requested=version, pinned=pinned)
+        except VersionUnknown as exc:
+            raise HTTPException(status_code=404, detail="artifact version not found") from exc
+        except VersionNotRetained as exc:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"version {exc.requested} of this artifact was registered before per-version "
+                    f"copies existed and its content was not kept; the latest is {exc.latest}"
+                ),
+            ) from exc
+        try:
+            data = await read_version_bytes(
+                chosen,
+                tenant_id=target_tenant,
+                user_id=meta.user_id,
+                snapshots=snapshots,
+                workspace_store=workspace_store,
             )
         except WorkspacePermissionError as exc:
             # 元数据行存在,内容读不动是权限问题(服务端配置),不是"这个 artifact
@@ -750,12 +799,13 @@ def build_sessions_router() -> APIRouter:
             raise HTTPException(status_code=404, detail="artifact content not found") from exc
         # Path-based MIME + XSS-safe disposition (active content → attachment),
         # same as the workspace-file download; filename is the logical name.
-        inferred = infer_content_type(path=version.path_in_workspace)
+        inferred = infer_content_type(path=chosen.path_in_workspace)
         headers = {
             "Content-Disposition": content_disposition_header(
                 name, disposition=inferred.disposition
             ),
             "X-Content-Type-Options": "nosniff",
+            VERSION_HEADER: str(chosen.version),
         }
         return Response(content=data, media_type=inferred.content_type, headers=headers)
 
