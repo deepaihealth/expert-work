@@ -98,9 +98,12 @@ class InMemoryEstimates:
 
     if TYPE_CHECKING:
 
-        def _bump_doc_seq(self, tenant_id: UUID) -> int: ...
+        def _bump_doc_seq(self, tenant_id: UUID) -> int:
+            """Provided by the store this mixin is mixed into."""
+            raise NotImplementedError
 
-        def _drop_document_state(self, document_ids: set[UUID]) -> None: ...
+        def _drop_document_state(self, document_ids: set[UUID]) -> None:
+            """Provided by the store this mixin is mixed into."""
 
     # -- helpers --------------------------------------------------------------
 

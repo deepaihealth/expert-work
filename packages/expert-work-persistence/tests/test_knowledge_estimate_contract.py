@@ -1161,9 +1161,12 @@ async def test_a_reindex_write_back_lands_while_an_estimate_finishes(
         )
 
     await _estimated(store, tenant, ready.id)  # estimating → awaiting, same generation
-    assert await write(DocumentStatus.ESTIMATING) == 1
+    written = await write(DocumentStatus.ESTIMATING)
+    assert written == 1
     waiting = await _get(store, tenant, ready.id)
     assert waiting.ingest_estimate is not None
     await _confirm(store, tenant, waiting)  # generation bumped: the write-back is refused
-    assert await write(DocumentStatus.ESTIMATING) is None
-    assert await write(DocumentStatus.PENDING) is None
+    stale_estimating = await write(DocumentStatus.ESTIMATING)
+    stale_pending = await write(DocumentStatus.PENDING)
+    assert stale_estimating is None
+    assert stale_pending is None
