@@ -134,7 +134,7 @@ from expert_work.runtime.runs import (
 from expert_work.runtime.stream_bridge import StreamBridge
 from orchestrator import AgentFactoryError, PlatformNotConfiguredError
 from orchestrator.stream_items import STREAM_FORMAT_ITEMS, STREAM_FORMAT_LEGACY
-from orchestrator.tools.registry import UnmatchedArgBinding
+from orchestrator.tools.registry import UnmatchedArgBinding, WorkspaceLayout
 
 logger = logging.getLogger("expert_work.control_plane.agents")
 
@@ -620,10 +620,12 @@ async def _resolve_session(
     instances: AgentInstanceStore,
     disable_service: AgentDisableService,
     first_input: str | None = None,
-) -> tuple[AgentSpecRecord, UUID, UUID]:
+) -> tuple[AgentSpecRecord, UUID, UUID, WorkspaceLayout]:
     """Resolve agent_code → active record, mint the end-user, create / continue
     the session thread, and touch the per-user instance binding. Returns
-    ``(record, thread_id, end_user_id)``. Raises :class:`_SessionError`.
+    ``(record, thread_id, end_user_id, workspace_layout)`` — the last is the
+    thread row's B-236 sandbox view, read from the row this already loads or
+    creates (no extra query). Raises :class:`_SessionError`.
 
     Shared by the external session-bind and run endpoints (M1-5b).
 
@@ -705,9 +707,10 @@ async def _resolve_session(
             raise _SessionError("SESSION_NOT_FOUND", "session not found for this user / agent", 404)
         thread_id = session_id
         needs_title = meta.title is None
+        workspace_layout = meta.workspace_layout
     else:
         thread_id = uuid4()
-        await threads.create(
+        created = await threads.create(
             thread_id=thread_id,
             tenant_id=tenant_id,
             created_by=actor_id,
@@ -715,6 +718,7 @@ async def _resolve_session(
             agent_name=agent_code,
             agent_version=record.version,
         )
+        workspace_layout = created.workspace_layout
         needs_title = True
 
     if needs_title and first_input:
@@ -726,7 +730,7 @@ async def _resolve_session(
                 logger.warning("external_session.auto_title_failed", exc_info=True)
 
     await instances.touch(tenant_id=tenant_id, agent_code=agent_code, user_id=end_user_id)
-    return record, thread_id, end_user_id
+    return record, thread_id, end_user_id, workspace_layout
 
 
 class BindSessionRequest(BaseModel):
@@ -1548,7 +1552,7 @@ def build_agents_router() -> APIRouter:
         actor_id = request.state.actor_id
         trace_id = current_trace_id_hex()
         try:
-            record, thread_id, end_user_id = await _resolve_session(
+            record, thread_id, end_user_id, _layout = await _resolve_session(
                 tenant_id=tenant_id,
                 agent_code=agent_code,
                 actor_id=actor_id,
@@ -1675,7 +1679,7 @@ def build_agents_router() -> APIRouter:
                 )
 
         try:
-            record, thread_id, end_user_id = await _resolve_session(
+            record, thread_id, end_user_id, workspace_layout = await _resolve_session(
                 tenant_id=tenant_id,
                 agent_code=agent_code,
                 actor_id=actor_id,
@@ -1770,6 +1774,7 @@ def build_agents_router() -> APIRouter:
                 oauth_subject=str(end_user_id),
                 payload=run_payload,
                 trace_id=trace_id,
+                workspace_layout=workspace_layout,
                 extra_headers={"X-Expert-Work-Session-Id": str(thread_id)},
                 on_behalf_of=str(end_user_id),
                 idempotency_key=key,

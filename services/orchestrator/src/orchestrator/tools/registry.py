@@ -384,13 +384,13 @@ class ToolContext:
     @property
     def workspace_view(self) -> WorkspaceView:
         """本次调用的工作区视图 —— 文件工具解析路径与 exec 建命名空间用的同一个值。"""
-        conv: UUID | None = None
-        if self.workspace_layout == "conversation" and self.agent_key:
-            conv = self.workspace_thread_id or self.thread_id
+        thread = (self.workspace_thread_id or self.thread_id) if self.agent_key else None
+        conv = thread if self.workspace_layout == "conversation" else None
         return WorkspaceView(
             agent_key=self.agent_key,
             conv_id=conv,
             compat_dirs=self.workspace_compat_dirs if conv is not None else (),
+            thread_id=thread,
         )
 
 

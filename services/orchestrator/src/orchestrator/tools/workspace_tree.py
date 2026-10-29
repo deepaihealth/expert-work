@@ -137,7 +137,7 @@ _WORKSPACE_BLOCK_PREAMBLE = (
 _CONVERSATION_BLOCK_PREAMBLE = (
     "Files under /workspace (this conversation's own directory) and /agent (this agent's "
     "shared area, kept across its conversations) — listed so you do not rebuild what you "
-    "already have. Other conversations' files are not listed and are not reachable.\n"
+    "already have. Other conversations' files are not part of this view and are not listed.\n"
     + _WORKSPACE_BLOCK_PREAMBLE.split("\n", 1)[1].replace(
         "This is NOT everything under /workspace.",
         "This is NOT everything under /workspace and /agent.",
@@ -336,7 +336,7 @@ async def workspace_prompt_block(
         agent = await store.list_files(
             tenant_id=tenant_id,
             user_id=user_id,
-            scope=store_scope(AGENT_VIEW, agent_key=agent_key),
+            scope=store_scope(AGENT_VIEW, agent_key=agent_key, thread_id=view.own_thread),
         )
         if not view.per_conversation:
             return render_workspace_block(agent, max_expanded=max_expanded)

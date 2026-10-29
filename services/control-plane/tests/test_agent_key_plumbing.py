@@ -228,7 +228,7 @@ def test_agent_key_is_always_the_one_canonical_algorithm() -> None:
 # B-236 —— 同一份穷举,第二个键:``workspace_layout``(沙箱 /workspace 是本对话自己的
 # 目录还是老视图)。漏一条入口不会报错:那条路径下 ``ToolContext`` 回落老视图,并发
 # 对话又开始互相覆盖 —— 正是 B-236 要治的形态。取值必须来自这条对话的 ``thread_meta``
-# (``meta.workspace_layout`` / ``thread_workspace_layout``),不许写死。
+# (``meta.workspace_layout``),不许写死。
 # ---------------------------------------------------------------------------
 
 #: 用户 run 入口 → 构造点。技能演化 replay 的 thread_id 不是 UUID,结构上只能是老视图;
@@ -260,8 +260,10 @@ def _layout_assignments(node: ast.AST) -> list[ast.AST]:
 
 
 def _names_layout(value: ast.AST) -> bool:
+    """右值来自这条对话的布局:``meta.workspace_layout`` / 参数 ``workspace_layout``,
+    或(委派子代)父实际生效的视图 ``ctx.workspace_view``。"""
     return any(
-        (isinstance(n, ast.Attribute) and n.attr == "workspace_layout")
+        (isinstance(n, ast.Attribute) and n.attr in ("workspace_layout", "workspace_view"))
         or (isinstance(n, ast.Name) and n.id == "workspace_layout")
         for n in ast.walk(value)
     )
@@ -283,6 +285,20 @@ def test_every_user_run_config_sets_workspace_layout_from_the_thread() -> None:
     assert not missing, f"这些构造点没按 thread_meta 写 workspace_layout: {missing}"
 
 
-def test_spawn_run_reads_the_layout_from_thread_meta() -> None:
-    """``_start_run`` 收的是参数,参数在 ``spawn_run`` 里从 ``thread_meta`` 取。"""
-    assert _calls(_function_node("control-plane/api/runs.py::spawn_run"), "thread_workspace_layout")
+def test_every_spawn_run_call_passes_the_threads_layout() -> None:
+    """``_start_run`` 收的是 ``spawn_run`` 的参数;每个 ``spawn_run`` 调用点都要从它已经
+    读到的那一行 ``thread_meta`` 传 ``workspace_layout``(不再另查一次库)。"""
+    missing: list[str] = []
+    for root in _PKG_ROOTS.values():
+        for path in sorted(root.rglob("*.py")):
+            for node in ast.walk(_parse(path)):
+                if (
+                    isinstance(node, ast.Call)
+                    and isinstance(node.func, ast.Name)
+                    and node.func.id == "spawn_run"
+                ):
+                    passed = {kw.arg: kw.value for kw in node.keywords}
+                    value = passed.get("workspace_layout")
+                    if value is None or not _names_layout(value):
+                        missing.append(f"{path.name}:{node.lineno}")
+    assert missing == [], f"spawn_run 调用点没传 thread_meta 的 workspace_layout: {missing}"

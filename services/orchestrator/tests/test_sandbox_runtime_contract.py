@@ -1596,9 +1596,9 @@ def test_exec_contract_constants_match_the_sandbox_image() -> None:
 def test_exec_view_script_matches_the_sandbox_image() -> None:
     """B-60 —— 两个后端同一段 sh:orchestrator ``exec_view.EXEC_VIEW_SCRIPT`` 与镜像
     ``runner.py`` 的 ``_EXEC_VIEW_SCRIPT`` 逐字相等;argv 前缀也相等。B-236 —— 前缀
-    之后依次是 ``$1`` agent_root、``$2`` 对话 id、``$3`` 目录个数、``*compat`` 目录名
-    (四个都是表达式,不是常量),再 ``sys.executable``;与 orchestrator 那一侧
-    ``exec_view_argv`` 拼出来的位置一一对应。"""
+    之后依次是 ``$1`` agent_root、``$2`` 对话 id、``$3`` 本对话线程 id、``$4`` 目录个数、
+    ``*compat`` 目录名(五个都是表达式,不是常量),再 ``sys.executable``;与 orchestrator
+    那一侧 ``exec_view_argv`` 拼出来的位置一一对应。"""
     from uuid import UUID
 
     from orchestrator.tools.exec_view import (
@@ -1611,12 +1611,21 @@ def test_exec_view_script_matches_the_sandbox_image() -> None:
     argv = _runner_py_exec_argv()
     n = len(EXEC_VIEW_ARGV_PREFIX)
     assert argv[:n] == list(EXEC_VIEW_ARGV_PREFIX), argv[:n]
-    assert argv[n : n + 4] == [None, None, None, None], (
-        "前缀之后必须是 agent_root、对话 id、目录个数、目录名四个表达式"
+    assert argv[n : n + 5] == [None, None, None, None, None], (
+        "前缀之后必须是 agent_root、对话 id、线程 id、目录个数、目录名五个表达式"
     )
-    assert argv[n + 4] == "<sys.executable>"
-    ours = exec_view_argv("a-1", ["py"], conv_id=UUID(int=1), compat_dirs=("style",))
-    assert ours[n:] == ["/mnt/workspace/agents/a-1", str(UUID(int=1)), "1", "style", "py"]
+    assert argv[n + 5] == "<sys.executable>"
+    ours = exec_view_argv(
+        "a-1", ["py"], conv_id=UUID(int=1), thread_id=UUID(int=2), compat_dirs=("style",)
+    )
+    assert ours[n:] == [
+        "/mnt/workspace/agents/a-1",
+        str(UUID(int=1)),
+        str(UUID(int=2)),
+        "1",
+        "style",
+        "py",
+    ]
 
 
 def test_workspace_roots_match_across_packages() -> None:

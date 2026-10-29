@@ -365,6 +365,7 @@ class SandboxRuntime(Protocol):
         egress: EgressContext | None = None,
         conv_id: UUID | None = None,
         compat_dirs: tuple[str, ...] = (),
+        workspace_thread_id: UUID | None = None,
     ) -> SandboxOutcome:
         """Run ``code`` in the sandbox; return its captured outcome.
 
@@ -389,8 +390,10 @@ class SandboxRuntime(Protocol):
 
         ``conv_id`` / ``compat_dirs``(B-236)—— 非 ``None`` 时本次 exec 的 ``/workspace``
         是该对话自己的目录(``agents/<key>/threads/<conv>/work``),``/agent`` 是 agent 根;
-        ``compat_dirs`` 是过渡期映射进 ``/workspace`` 的 agent 根目录名。只在绑了 agent
-        时有意义;``run_in_sandbox`` 从 ``ctx.workspace_view`` 取,wrapper 原样透传。
+        ``compat_dirs`` 是过渡期映射进 ``/workspace`` 的 agent 根目录名。
+        ``workspace_thread_id`` 是本对话的线程 id:两种视图里 ``threads/`` 都只留它那一格
+        (``None`` = 一格都不留)。只在绑了 agent 时有意义;``run_in_sandbox`` 从
+        ``ctx.workspace_view`` 取,wrapper 原样透传。
         """
 
     async def release(self, *, sandbox_id: UUID) -> None:
@@ -475,6 +478,7 @@ class HTTPSupervisorRuntime:
         egress: EgressContext | None = None,
         conv_id: UUID | None = None,
         compat_dirs: tuple[str, ...] = (),
+        workspace_thread_id: UUID | None = None,
     ) -> SandboxOutcome:
         # B-217 —— the docker supervisor bakes each container's egress env at
         # `docker run` (acquire carries it) on an `internal: true` network; there
@@ -503,6 +507,8 @@ class HTTPSupervisorRuntime:
                 payload["conv_id"] = str(conv_id)
                 if compat_dirs:
                     payload["compat_dirs"] = list(compat_dirs)
+            if workspace_thread_id is not None:
+                payload["thread_id"] = str(workspace_thread_id)
         # The sandbox enforces the exec wall-clock (it SIGKILLs + returns
         # ``timed_out``); the HTTP read timeout must OUTLAST that enforcement so
         # the orchestrator receives the real outcome instead of giving up early
@@ -618,6 +624,8 @@ class RecordingSandboxRuntime:
     exec_egress: list[EgressContext | None] = field(default_factory=list)
     #: B-236 — the ``(conv_id, compat_dirs)`` passed to each exec (same reasoning).
     exec_views: list[tuple[UUID | None, tuple[str, ...]]] = field(default_factory=list)
+    #: B-236 — the ``workspace_thread_id`` passed to each exec (same reasoning).
+    exec_thread_ids: list[UUID | None] = field(default_factory=list)
     released: list[UUID] = field(default_factory=list)
     destroyed: list[tuple[UUID, str]] = field(default_factory=list)
     reaped: list[bool] = field(default_factory=list)
@@ -650,6 +658,7 @@ class RecordingSandboxRuntime:
         egress: EgressContext | None = None,
         conv_id: UUID | None = None,
         compat_dirs: tuple[str, ...] = (),
+        workspace_thread_id: UUID | None = None,
     ) -> SandboxOutcome:
         del timeout_s
         self.execs.append((sandbox_id, code))
@@ -658,6 +667,7 @@ class RecordingSandboxRuntime:
         self.exec_has_skills.append(has_skills)
         self.exec_egress.append(egress)
         self.exec_views.append((conv_id, compat_dirs))
+        self.exec_thread_ids.append(workspace_thread_id)
         if self.exec_error is not None:
             raise self.exec_error
         return self.outcome
@@ -721,6 +731,7 @@ class _EgressBindingClient:
         egress: EgressContext | None = None,
         conv_id: UUID | None = None,
         compat_dirs: tuple[str, ...] = (),
+        workspace_thread_id: UUID | None = None,
     ) -> SandboxOutcome:
         # This wrapper doesn't own agent_key, run_id or has_skills — it's a pure
         # passthrough here so a chain like _AgentKeyBindingClient(inner=_EgressBindingClient(...))
@@ -737,6 +748,7 @@ class _EgressBindingClient:
             egress=self.egress,
             conv_id=conv_id,
             compat_dirs=compat_dirs,
+            workspace_thread_id=workspace_thread_id,
         )
 
     async def release(self, *, sandbox_id: UUID) -> None:
@@ -804,6 +816,7 @@ class _AgentKeyBindingClient:
         egress: EgressContext | None = None,
         conv_id: UUID | None = None,
         compat_dirs: tuple[str, ...] = (),
+        workspace_thread_id: UUID | None = None,
     ) -> SandboxOutcome:
         # B-124 —— 调用方给了 key 就用调用方的:``run_in_sandbox`` 传 ``ctx.agent_key``,
         # 委派出去的子代那里是**父的** key(``_child_run._child_config``),与宿主侧
@@ -822,6 +835,7 @@ class _AgentKeyBindingClient:
             egress=egress,
             conv_id=conv_id,
             compat_dirs=compat_dirs,
+            workspace_thread_id=workspace_thread_id,
         )
 
     async def release(self, *, sandbox_id: UUID) -> None:
@@ -937,6 +951,7 @@ async def run_in_sandbox(
             has_skills=bool(seed_files),
             conv_id=view.conv_id,
             compat_dirs=view.compat_dirs,
+            workspace_thread_id=view.thread_id,
         )
     except asyncio.CancelledError:
         cancelled = True
@@ -1061,7 +1076,7 @@ class ExecPythonTool:
             description=(
                 "Execute a Python 3 snippet in the sandbox and return "
                 "its stdout / stderr / exit code. Use for calculations, data "
-                "transforms, or anything better done by running code. " + EXEC_WORKSPACE_NOTE + " "
+                f"transforms, or anything better done by running code. {EXEC_WORKSPACE_NOTE} "
                 "本轮如果有输入变量，它们在 $EXPERT_WORK_INPUTS 指向的 JSON 文件里"  # noqa: RUF001 — verbatim spec text (B-61 task-4-brief)
                 "（含 URL、编码、本地文件路径）；本轮没有输入变量时这个文件不存在，"  # noqa: RUF001
                 "读不到就照上文办，不必重试。"  # noqa: RUF001
@@ -1077,7 +1092,7 @@ class ExecPythonTool:
                 "文件不在就按清单里的原地址下载。地址一律从清单读或用这些文件，不要手抄。"  # noqa: RUF001
                 # B-82 —— 预装清单。不说,模型就只能「先探测环境」或干脆先装一遍,
                 # 而在阿里云上装一遍是一两分钟(B-81)。渲染在 contract 模块一处。
-                 + preinstalled_note()
+                + preinstalled_note()
             ),
             parameters={
                 "type": "object",

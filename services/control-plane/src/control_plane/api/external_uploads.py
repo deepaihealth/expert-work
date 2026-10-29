@@ -227,7 +227,7 @@ def build_external_uploads_router() -> APIRouter:
 
         if session_id is None:
             try:
-                _record, thread_id, end_user_id = await _resolve_session(
+                _record, thread_id, end_user_id, _layout = await _resolve_session(
                     tenant_id=tenant_id,
                     agent_code=agent_code,
                     actor_id=actor_id,

@@ -54,6 +54,7 @@ class RunnerLink(Protocol):
         agent_root: str | None = None,
         conv_id: UUID | None = None,
         compat_dirs: tuple[str, ...] = (),
+        thread_id: UUID | None = None,
     ) -> ExecResult:
         """Run ``code`` in the sandbox; return its captured outcome.
 
@@ -71,7 +72,8 @@ class RunnerLink(Protocol):
         child's cwd is always ``/workspace``.
 
         ``conv_id`` / ``compat_dirs`` (B-236) — the conversation view, sent
-        to the runner as ``conv_id`` (string) and ``compat_dirs`` (list);
+        to the runner as ``conv_id`` (string) and ``compat_dirs`` (list), plus
+        ``thread_id`` (string, the conversation's own ``threads/<id>/``);
         omitted when ``None`` / empty (the pre-feature request shape).
         """
 
@@ -116,6 +118,7 @@ class PipeRunnerLink:
         agent_root: str | None = None,
         conv_id: UUID | None = None,
         compat_dirs: tuple[str, ...] = (),
+        thread_id: UUID | None = None,
     ) -> ExecResult:
         async with self._lock:
             request: dict[str, object] = {"code": code, "timeout_s": timeout_s}
@@ -127,6 +130,8 @@ class PipeRunnerLink:
                 request["conv_id"] = str(conv_id)
             if compat_dirs:
                 request["compat_dirs"] = list(compat_dirs)
+            if thread_id is not None:
+                request["thread_id"] = str(thread_id)
             await self._write(request)
             # The supervisor's read deadline is the runner's own timeout
             # plus a grace window — a runner past it is itself hung.

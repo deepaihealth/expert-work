@@ -1000,7 +1000,11 @@ def _child_config(ctx: ToolContext, *, sub_thread_id: UUID, sub_run_id: UUID) ->
     # B-236 —— 同理透传父的工作区布局与**根对话**的 id:子代每次都有新的子线程 id,
     # 按它分目录的话 worker 写的文件落进一个父看不见的 ``threads/<子线程>/work/``。
     # 孙代沿用父自己已经带着的那个(还是最上面那个对话)。
-    configurable[WORKSPACE_LAYOUT_KEY] = ctx.workspace_layout
+    # 传的是父**实际生效**的视图,不是原样的字段:父的布局是 ``conversation`` 却没有对话
+    # (没绑 agent / 没有线程 id)时它实际看到的是老视图,子代必须看到同一个。
+    configurable[WORKSPACE_LAYOUT_KEY] = (
+        "conversation" if ctx.workspace_view.per_conversation else "agent_root"
+    )
     workspace_thread_id = ctx.workspace_thread_id or ctx.thread_id
     if workspace_thread_id is not None:
         configurable[WORKSPACE_THREAD_ID_KEY] = str(workspace_thread_id)

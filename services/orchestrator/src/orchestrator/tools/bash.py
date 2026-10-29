@@ -93,9 +93,8 @@ class BashTool:
                 "Run a shell command in the agent's sandboxed workspace and "
                 "return its stdout / stderr / exit code. Use for git, grep, "
                 "file manipulation, format conversion, or anything not covered "
-                "by a dedicated tool. "
-                + EXEC_WORKSPACE_NOTE
-                + " NOTE: this is an irreversible action — it runs "
+                f"by a dedicated tool. {EXEC_WORKSPACE_NOTE} NOTE: this is an irreversible "
+                "action — it runs "
                 "serially and may require human approval before executing. "
                 "本轮如果有输入变量，它们在 $EXPERT_WORK_INPUTS 指向的 JSON 文件里"  # noqa: RUF001 — verbatim spec text (B-61 task-4-brief)
                 "（含 URL、编码、本地文件路径）；本轮没有输入变量时这个文件不存在，"  # noqa: RUF001
@@ -112,7 +111,7 @@ class BashTool:
                 "文件不在就按清单里的原地址下载。地址一律从清单读或用这些文件，不要手抄。"  # noqa: RUF001
                 # B-82 —— 预装清单。不说,模型就只能「先探测环境」或干脆先装一遍,
                 # 而在阿里云上装一遍是一两分钟(B-81)。渲染在 contract 模块一处。
-                 + preinstalled_note()
+                + preinstalled_note()
             ),
             parameters={
                 "type": "object",

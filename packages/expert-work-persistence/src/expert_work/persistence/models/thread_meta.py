@@ -36,11 +36,10 @@ class ThreadMetaRow(Base):
     # run finalization. No server_default: pre-existing rows stay NULL
     # ("not yet computed"), distinct from a genuinely empty thread (0).
     message_count: Mapped[int | None] = mapped_column(Integer, nullable=True)
-    # B-236 —— 这条对话的沙箱 /workspace 是哪种视图(迁移 0181):发布前已有的行是
-    # ``agent_root``,之后任何入口建的行都取库里的默认值 ``conversation``,代码不写它。
-    workspace_layout: Mapped[str] = mapped_column(
-        Text, nullable=False, server_default="conversation"
-    )
+    # B-236 —— 这条对话的沙箱 /workspace 是哪种视图(迁移 0181)。库默认 ``agent_root``:
+    # 发布前的行与滚动发布期间老 pod 建的行都是老视图;新代码在唯一的建行处
+    # (``SqlThreadMetaStore.create``)显式写 ``conversation``。
+    workspace_layout: Mapped[str] = mapped_column(Text, nullable=False, server_default="agent_root")
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         nullable=False,

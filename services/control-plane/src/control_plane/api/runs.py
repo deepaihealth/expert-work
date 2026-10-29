@@ -55,7 +55,6 @@ from control_plane.api._user_scope import (
     get_user_repo,
     resolve_caller_user_id,
 )
-from control_plane.api._workspace_shared import thread_workspace_layout
 from control_plane.api.trace_facade import fetch_and_normalize, fetch_span_raw
 from control_plane.approval_void import (
     close_previous_turn,
@@ -1176,6 +1175,7 @@ async def spawn_run(
     oauth_subject: str,
     payload: RunRequest,
     trace_id: str,
+    workspace_layout: WorkspaceLayout,
     extra_headers: dict[str, str] | None = None,
     on_behalf_of: str | None = None,
     idempotency_key: str | None = None,
@@ -1194,7 +1194,9 @@ async def spawn_run(
     to — the long-term-memory RLS, the workspace volume, and per-user token
     accounting all key on it (the caller for a normal session run; the minted
     end-user for an on-behalf-of external run). ``oauth_subject`` keys the per-user
-    OAuth MCP pool. ``on_behalf_of`` records the end-user when a machine principal
+    OAuth MCP pool. ``workspace_layout`` (B-236) is the thread row's sandbox view, passed
+    by the caller from the ``thread_meta`` row it has already loaded (no second query
+    here). ``on_behalf_of`` records the end-user when a machine principal
     acts for one.
 
     ``idempotency_key`` / ``request_digest`` (External-API-v1 P2-a Task 13, Task
@@ -1318,9 +1320,6 @@ async def spawn_run(
 
     run_id = uuid4()
     prior_runs = await runtime.run_manager.list_by_thread(thread_id, tenant_id=tenant_id)
-    workspace_layout = await thread_workspace_layout(
-        request.app.state.thread_meta_repo, thread_id, tenant_id=tenant_id
-    )
 
     # P-1 —— supersede 与建行必须在同一把 per-thread 锁里(spec §8-4):queue worker
     # 只认已存在的 QUEUED 行,行在 supersede 全部写完之后才 INSERT,worker 抢不到
@@ -1927,6 +1926,7 @@ def build_runs_router() -> APIRouter:
             oauth_subject=request.state.principal.subject_id,
             payload=payload,
             trace_id=trace_id,
+            workspace_layout=meta.workspace_layout,
         )
 
     @router.get(

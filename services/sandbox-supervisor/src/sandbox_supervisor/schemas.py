@@ -119,6 +119,9 @@ class ExecRequest(BaseModel):
     conv_id: UUID | None = None
     #: B-236 —— 过渡期映射进 ``/workspace`` 的 agent 根一级目录名。
     compat_dirs: list[str] = Field(default_factory=list, max_length=_MAX_COMPAT_DIRS)
+    #: B-236 —— 本对话的线程 id:两种视图里 ``<agent_root>/threads/`` 都只留它那一格。
+    #: ``None`` → 一格都不留。
+    thread_id: UUID | None = None
 
     @field_validator("compat_dirs")
     @classmethod
@@ -132,8 +135,9 @@ class ExecRequest(BaseModel):
 
     @model_validator(mode="after")
     def _conversation_view_needs_an_agent_root(self) -> ExecRequest:
-        if (self.conv_id is not None or self.compat_dirs) and self.agent_root is None:
-            msg = "conv_id / compat_dirs need agent_root (a conversation view is per agent)"
+        has_view = self.conv_id is not None or self.thread_id is not None or self.compat_dirs
+        if has_view and self.agent_root is None:
+            msg = "conv_id / thread_id / compat_dirs need agent_root (the view is per agent)"
             raise ValueError(msg)
         if self.compat_dirs and self.conv_id is None:
             msg = "compat_dirs need conv_id (they only exist in the conversation view)"

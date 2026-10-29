@@ -1,8 +1,10 @@
 """Migration 0181 — B-236: ``thread_meta.workspace_layout``.
 
 Conversations that already exist at deploy keep today's view (``agent_root``: the
-sandbox ``/workspace`` is the agent root); every thread created afterwards, by any
-create path, gets ``conversation`` from the column default — no code path sets it.
+sandbox ``/workspace`` is the agent root). The column default stays ``agent_root`` —
+an insert that does not name the column (an old pod during a rolling deploy) gets the
+old view; new code writes ``conversation`` explicitly (``SqlThreadMetaStore.create``,
+pinned in ``test_sql_thread_meta_store.py``).
 Runs in its own database inside the container (the shared one is upgraded /
 downgraded by other tests).
 """
@@ -89,7 +91,7 @@ def test_revision_id_fits_alembic_version_column() -> None:
     assert len(_REVISION) <= 32
 
 
-def test_existing_threads_keep_the_agent_root_view_new_ones_get_conversation(
+def test_existing_threads_and_column_less_inserts_keep_the_agent_root_view(
     fresh_db: str,
 ) -> None:
     before = _insert_thread(fresh_db)
@@ -97,8 +99,8 @@ def test_existing_threads_keep_the_agent_root_view_new_ones_get_conversation(
     command.upgrade(_alembic(fresh_db), _REVISION)
 
     assert _layout(fresh_db, before) == "agent_root"
-    after = _insert_thread(fresh_db)  # an insert that does not name the column
-    assert _layout(fresh_db, after) == "conversation"
+    after = _insert_thread(fresh_db)  # an old pod's insert: it does not name the column
+    assert _layout(fresh_db, after) == "agent_root"
 
 
 def test_layout_rejects_unknown_values(fresh_db: str) -> None:

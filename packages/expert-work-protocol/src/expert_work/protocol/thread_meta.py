@@ -51,9 +51,10 @@ class ThreadMeta(BaseModel):
         default=None, description="第三方可见口径的消息条数;None=尚未算过"
     )
     workspace_layout: Literal["conversation", "agent_root"] = Field(
-        default="conversation",
+        default="agent_root",
         description="B-236 沙箱 /workspace 的视图:conversation = 本对话自己的目录;"
-        "agent_root = 发布前已开的对话,沿用 agent 根",
+        "agent_root = 老视图(发布前已开的对话),沿用 agent 根。默认与库的列默认值一致,"
+        "建会话的存储实现显式写 conversation",
     )
     created_at: datetime | None = None
     updated_at: datetime | None = None

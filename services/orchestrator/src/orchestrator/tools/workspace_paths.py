@@ -112,10 +112,12 @@ WORKSPACE_PATH_RULE = (
     "/agent/... is this agent's shared area, kept across its conversations "
     "(templates, style guides, helper scripts meant for reuse belong there)."
 )
-#: B-236 —— ``bash`` / ``exec_python`` 描述里讲工作目录的那一句。
+#: B-236 —— ``bash`` / ``exec_python`` 描述里讲工作目录的那一句。口径照 B-60 spec §4.7/§五:
+#: 不说「隔离」「看不见」,只说默认视图里有什么 —— 命名空间对故意的代码不是绝对边界。
 EXEC_WORKSPACE_NOTE = (
-    "Runs in /workspace — this conversation's own working directory; other "
-    "conversations and other agents do not see it. Files meant to be reused by "
+    "Runs in /workspace — this conversation's own working directory; the default "
+    "view contains only this conversation's directory, not other conversations' or "
+    "other agents' files. Files meant to be reused by "
     "later conversations of this agent (templates, style guides, helper scripts) "
     "belong under /agent/, which all conversations of this agent share. Uploaded "
     "files are in uploads/."
@@ -164,15 +166,25 @@ class WorkspaceView:
     发布前已开的对话、合成执行路径与未绑 agent 的调用都是这一档。``compat_dirs`` 只在
     对话视图里有意义,由 :mod:`orchestrator.tools.workspace_compat` 在宿主侧算好,与 exec
     收到的是同一份。
+
+    ``thread_id`` 是本对话的线程 id:两种视图里 agent 根下的 ``threads/`` 都只留它那一格
+    (老视图也不许看见别的对话 —— 包括发布后新开的对话的工作目录)。对话视图里它就是
+    ``conv_id``(见 :attr:`own_thread`);``None`` = 一格都不留。
     """
 
     agent_key: str = ""
     conv_id: UUID | None = None
     compat_dirs: tuple[str, ...] = ()
+    thread_id: UUID | None = None
 
     @property
     def per_conversation(self) -> bool:
         return bool(self.agent_key) and self.conv_id is not None
+
+    @property
+    def own_thread(self) -> UUID | None:
+        """``threads/`` 底下留给本对话的那一格。"""
+        return self.conv_id if self.conv_id is not None else self.thread_id
 
 
 @dataclass(frozen=True)
@@ -227,10 +239,17 @@ def _shared_target(raw: str, rel: str, *, tool: str) -> ResolvedPath:
     )
 
 
-def _reject_reserved_head(head: str, *, raw: str, tool: str, agent_view: bool) -> None:
-    """布局保留段:``agents/`` 是别人的树、``shared/`` 只能经 ``shared:`` 读;``/agent``
-    底下的 ``threads/`` 是各对话自己的目录,从共享区那一侧不许寻址。"""
-    if head == AGENTS_DIR or (agent_view and head == THREADS_DIR):
+def _reject_reserved_head(
+    parts: tuple[str, ...], *, raw: str, tool: str, agent_view: bool, own_thread: str | None
+) -> None:
+    """布局保留段:``agents/`` 是别人的树、``shared/`` 只能经 ``shared:`` 读;agent 根下的
+    ``threads/`` 是各对话自己的目录 —— ``/agent`` 那一侧一律不许寻址,老视图里只许寻址
+    本对话自己那一格 ``threads/<本对话>/``。"""
+    head = parts[0] if parts else ""
+    other_thread = head == THREADS_DIR and (
+        agent_view or own_thread is None or parts[1:2] != (own_thread,)
+    )
+    if head == AGENTS_DIR or other_thread:
         # B-50 —— 不拒的话迁移期读回落正好把 ``agents/<别人的 key>/x`` 办成一次合法的
         # 跨 agent 读:自己根下找不到 → 回落用户根 → 不偏不倚命中别人的目录。
         msg = (
@@ -303,8 +322,9 @@ def resolve_workspace_path(path: str, *, view: WorkspaceView, tool: str) -> Reso
     parts = PurePosixPath(cleaned).parts
     head = parts[0] if parts else ""
     rel = "/".join(parts) if parts else "."
-    if agent_key:
-        _reject_reserved_head(head, raw=path, tool=tool, agent_view=agent_view)
+    if agent_key and not (head == THREADS_DIR and view.per_conversation and not agent_view):
+        own = str(view.own_thread) if view.own_thread is not None else None
+        _reject_reserved_head(parts, raw=path, tool=tool, agent_view=agent_view, own_thread=own)
     if agent_view:
         return ResolvedPath(ws=AGENT_VIEW, rel=rel, kind="agent", path=_agent_spelling(rel))
     if not view.per_conversation:

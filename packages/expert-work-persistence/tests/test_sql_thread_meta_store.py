@@ -485,8 +485,8 @@ async def test_list_agent_names_for_user_matches_the_in_memory_predicate(
 
 @pytest.mark.asyncio
 async def test_workspace_layout_comes_from_the_row(sql_store: SqlStoreFixture) -> None:
-    """B-236 —— ``create`` 不写这一列,新行取库的默认值 ``conversation``;发布前的行
-    (迁移给的 ``agent_root``)原样读回。"""
+    """B-236 —— ``create`` 显式写 ``conversation``(库默认是 ``agent_root``,留给发布前的行与
+    滚动发布期间老 pod 不写这一列的插入);那样的行原样读回 ``agent_root``。"""
     from sqlalchemy import text
 
     store, engine = sql_store
@@ -494,11 +494,15 @@ async def test_workspace_layout_comes_from_the_row(sql_store: SqlStoreFixture) -
         new_id, old_id, tenant_id = uuid4(), uuid4(), uuid4()
         created = await store.create(thread_id=new_id, tenant_id=tenant_id, created_by="u")
         assert created.workspace_layout == "conversation"
-        await store.create(thread_id=old_id, tenant_id=tenant_id, created_by="u")
+        fetched = await store.get(new_id, tenant_id=tenant_id)
+        assert fetched is not None and fetched.workspace_layout == "conversation"
         async with engine.begin() as conn:
             await conn.execute(
-                text("UPDATE thread_meta SET workspace_layout = 'agent_root' WHERE thread_id = :t"),
-                {"t": old_id},
+                text(
+                    "INSERT INTO thread_meta (thread_id, tenant_id, created_by) "
+                    "VALUES (:t, :tenant, 'old-pod')"
+                ),
+                {"t": old_id, "tenant": tenant_id},
             )
         old = await store.get(old_id, tenant_id=tenant_id)
         assert old is not None and old.workspace_layout == "agent_root"

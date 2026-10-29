@@ -144,6 +144,7 @@ class _SpawnCtx:
             oauth_subject="sa-test",
             payload=RunRequest(input="U", mode=mode, use_draft=use_draft),
             trace_id="0" * 32,
+            workspace_layout="conversation",
             supersede=supersede,
         )
 

@@ -88,7 +88,8 @@ async def discover_compat_dirs(
     """本对话视图要映射哪些 agent 根目录(窗口没开 / 不是对话视图 = 空)。
 
     列两次目录:agent 根(找候选)与本对话目录(排除对话自己已有内容的同名条目)。
-    列不动只记日志、返回空 —— 映射是过渡期的便利,不能让它把一次工具调用拖垮。
+    agent 根还不存在(全新的 agent)安静地返回空;别的列不动只记异常类型、返回空 ——
+    映射是过渡期的便利,不能让它把一次工具调用拖垮。
     """
     if not view.per_conversation or view.conv_id is None or not compat_window_open(today=today):
         return ()
@@ -107,8 +108,11 @@ async def discover_compat_dirs(
                 keep.append(name)
             elif own[name] and await _is_empty_dir(store, tenant_id, user_id, conv_scope, name):
                 keep.append(name)
-    except SandboxSupervisorError:
-        logger.warning("workspace_compat.discovery_failed", exc_info=True)
+    except MISSING_DIR_ERRORS:
+        return ()  # 全新的 agent:根目录还没建出来,没有可映射的东西
+    except SandboxSupervisorError as exc:
+        # 只记异常类型:store 的报错文本带工作区路径,而路径里有客户起的目录名。
+        logger.warning("workspace_compat.discovery_failed error=%s", type(exc).__name__)
         return ()
     return tuple(sorted(keep)[:MAX_COMPAT_DIRS])
 

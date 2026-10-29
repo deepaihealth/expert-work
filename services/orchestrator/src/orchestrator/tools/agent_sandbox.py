@@ -1524,6 +1524,7 @@ class AgentSandboxClient:
         egress: EgressContext | None = None,
         conv_id: UUID | None = None,
         compat_dirs: tuple[str, ...] = (),
+        workspace_thread_id: UUID | None = None,
     ) -> SandboxOutcome:
         """波 1 Task 8(spec § 6.1 四契约点)。契约源头是
         ``infra/sandbox-image/runner.py:28-72``——本地 docker 沙箱里的
@@ -1666,7 +1667,13 @@ class AgentSandboxClient:
             # user+mount ns 里把 agent 目录 bind 成 /workspace(spec §4.3)。cwd= 传挂载点
             # 只是因为 E2B 执行前校验它存在;进 ns 之后脚本自己 cd /workspace。
             result = await sbx.commands.run(
-                build_exec_command(agent_key, script, conv_id=conv_id, compat_dirs=compat_dirs),
+                build_exec_command(
+                    agent_key,
+                    script,
+                    conv_id=conv_id,
+                    thread_id=workspace_thread_id,
+                    compat_dirs=compat_dirs,
+                ),
                 user=SANDBOX_EXEC_USER,
                 timeout=effective,
                 cwd=NAS_MOUNT,

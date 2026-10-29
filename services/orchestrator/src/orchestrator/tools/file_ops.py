@@ -141,7 +141,9 @@ def _require_path(
 def _store_scope(ws: str, ctx: ToolContext) -> str:
     """解析结果的 ``ws`` → 宿主侧作用域,按本次调用的视图(B-236)。"""
     view = ctx.workspace_view
-    return store_scope(ws, agent_key=view.agent_key, conv_id=view.conv_id)
+    return store_scope(
+        ws, agent_key=view.agent_key, conv_id=view.conv_id, thread_id=view.own_thread
+    )
 
 
 # ---------------------------------------------------------------------------

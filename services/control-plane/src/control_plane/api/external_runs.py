@@ -336,6 +336,7 @@ async def _supersede_and_run(
             effective_user_id=end_user_id,
             oauth_subject=str(end_user_id),
             payload=run_payload,
+            workspace_layout=meta.workspace_layout,
             trace_id=trace_id,
             extra_headers={"X-Expert-Work-Session-Id": str(meta.thread_id)},
             on_behalf_of=str(end_user_id),

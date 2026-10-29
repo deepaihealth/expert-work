@@ -74,8 +74,8 @@ _TENANT, _USER = uuid4(), uuid4()
 _KEY = "plan-aaaaaaaa"
 _C1 = UUID("11111111-1111-1111-1111-111111111111")
 _C2 = UUID("22222222-2222-2222-2222-222222222222")
-_CONV1 = WorkspaceView(agent_key=_KEY, conv_id=_C1)
-_LEGACY = WorkspaceView(agent_key=_KEY)
+_CONV1 = WorkspaceView(agent_key=_KEY, conv_id=_C1, thread_id=_C1)
+_LEGACY = WorkspaceView(agent_key=_KEY, thread_id=_C1)
 
 
 def _ctx(
@@ -120,8 +120,10 @@ class _ViewRuntime(RecordingSandboxRuntime):
         egress: EgressContext | None = None,
         conv_id: UUID | None = None,
         compat_dirs: tuple[str, ...] = (),
+        workspace_thread_id: UUID | None = None,
     ) -> SandboxOutcome:
         self.exec_views.append((conv_id, compat_dirs))
+        self.exec_thread_ids.append(workspace_thread_id)
         agent = _agent_root(self.root)
         work = _work(self.root, conv_id) if conv_id is not None else agent
         for d in (agent, work):
@@ -165,7 +167,7 @@ def test_conversation_view_resolution(raw: str, ws: str, rel: str, kind: Resolve
     [
         ("report.md", EXEC_VIEW, "report.md", "legacy"),
         ("uploads/a.pdf", EXEC_VIEW, "uploads/a.pdf", "legacy"),
-        ("threads/t/PLAN.md", EXEC_VIEW, "threads/t/PLAN.md", "legacy"),
+        (f"threads/{_C1}/PLAN.md", EXEC_VIEW, f"threads/{_C1}/PLAN.md", "legacy"),
         ("/agent/style/a.md", AGENT_VIEW, "style/a.md", "agent"),
         (f"/workspace/agents/{_KEY}/a.md", AGENT_VIEW, "a.md", "agent"),
     ],
@@ -251,9 +253,11 @@ def test_agent_shared_scope_never_addresses_threads() -> None:
 
 def test_store_scope_maps_both_views() -> None:
     assert store_scope(EXEC_VIEW, agent_key=_KEY, conv_id=_C1) == conversation_scope(_KEY, _C1)
-    assert store_scope(EXEC_VIEW, agent_key=_KEY) == agent_scope(_KEY)
-    assert store_scope(AGENT_VIEW, agent_key=_KEY, conv_id=_C1) == agent_shared_scope(_KEY)
+    assert store_scope(AGENT_VIEW, agent_key=_KEY, conv_id=_C1) == agent_shared_scope(_KEY, _C1)
+    # 老视图的 /workspace 与 /agent 是同一个 agent 根,threads/ 只留本线程那一格
+    assert store_scope(EXEC_VIEW, agent_key=_KEY, thread_id=_C2) == agent_shared_scope(_KEY, _C2)
     assert store_scope(AGENT_VIEW, agent_key=_KEY) == agent_shared_scope(_KEY)
+    assert store_scope(EXEC_VIEW, agent_key="") != agent_scope(_KEY)
 
 
 def _tree(root: Path) -> None:
@@ -281,6 +285,45 @@ async def test_agent_shared_listing_never_returns_threads(tmp_path: Path) -> Non
         tenant_id=_TENANT, user_id=_USER, scope=scope, content="conversation"
     )
     assert found.entries == ()
+
+
+@pytest.mark.parametrize(
+    "raw", [f"threads/{_C2}/work/theirs.md", "threads/x", "threads", f"threads/{_C2}"]
+)
+def test_legacy_view_never_addresses_another_conversations_thread(raw: str) -> None:
+    with pytest.raises(ValueError):
+        resolve_workspace_path(raw, view=_LEGACY, tool="read_file")
+    with pytest.raises(ValueError):
+        resolve_workspace_path(raw, view=WorkspaceView(agent_key=_KEY), tool="read_file")
+
+
+async def test_a_legacy_conversation_cannot_see_new_conversations(tmp_path: Path) -> None:
+    """发布前开的对话(老视图)搜、读、列都碰不到发布后新对话的工作目录;自己那一格
+    ``threads/<本线程>/`` 仍可读(状态投影在那儿)。"""
+    from orchestrator.tools import ListDirTool
+
+    _tree(tmp_path)
+    store = NasWorkspaceStore(root=str(tmp_path))
+    legacy = _ctx(_C1, layout="agent_root")
+    found = await SearchFilesTool(store=store).call({"content": "conversation"}, ctx=legacy)
+    assert found.meta["paths"] == []
+    with pytest.raises(ValueError):
+        await ReadFileTool(store=store).call({"path": f"threads/{_C2}/work/theirs.md"}, ctx=legacy)
+    listing = await ListDirTool(store=store).call({}, ctx=legacy)
+    assert "threads" not in {e["name"] for e in listing.meta["entries"]}
+    own = await ReadFileTool(store=store).call({"path": f"threads/{_C1}/PLAN.md"}, ctx=legacy)
+    assert own.content == "plan 1"
+    with pytest.raises(WorkspacePathEscapeError):
+        scoped_path(agent_shared_scope(_KEY, _C1), f"threads/{_C2}/work/theirs.md")
+
+
+async def test_a_legacy_exec_carries_its_own_thread_and_no_conversation(tmp_path: Path) -> None:
+    runtime = _ViewRuntime(tmp_path)
+    await WriteFileTool(client=runtime).call(
+        {"path": "a.md", "content": "x"}, ctx=_ctx(_C1, layout="agent_root")
+    )
+    assert runtime.exec_views[-1] == (None, ())
+    assert runtime.exec_thread_ids[-1] == _C1
 
 
 # ---------------------------------------------------------------------------
@@ -561,3 +604,44 @@ def test_tool_text_states_the_two_views_once_and_never_the_old_alias() -> None:
         text = _all_text(tool.spec)
         assert "/workspace/agents/" not in text, tool.spec.name
         assert "agent's own directory" not in text, tool.spec.name
+
+
+def test_children_inherit_the_parents_effective_view_not_its_raw_layout() -> None:
+    """父的布局写着 ``conversation`` 却没有对话(没有线程 id)时,父实际是老视图 ——
+    子代必须是同一个,不能拿到一个父自己都没有的对话视图。"""
+    parent = replace(_ctx(_C1), thread_id=None)
+    assert not parent.workspace_view.per_conversation
+    config = _child_config(parent, sub_thread_id=uuid4(), sub_run_id=uuid4())
+    assert config["configurable"]["workspace_layout"] == "agent_root"
+    assert not _build_tool_context(config).workspace_view.per_conversation
+
+
+async def test_compat_discovery_on_a_brand_new_agent_is_quiet(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    monkeypatch.setenv(COMPAT_UNTIL_ENV, "2099-12-31")
+    with caplog.at_level("WARNING"):
+        dirs = await discover_compat_dirs(
+            NasWorkspaceStore(root=str(tmp_path)), tenant_id=_TENANT, user_id=_USER, view=_CONV1
+        )
+    assert dirs == ()
+    assert caplog.records == []
+
+
+async def test_compat_discovery_failure_logs_the_error_type_only(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    from orchestrator.tools.sandbox import SandboxSupervisorError
+    from orchestrator.tools.workspace_store import RecordingWorkspaceStore
+
+    monkeypatch.setenv(COMPAT_UNTIL_ENV, "2099-12-31")
+    store = RecordingWorkspaceStore(
+        workspace_list_error=SandboxSupervisorError("listing failed: 'agents/k/客户甲'")
+    )
+    with caplog.at_level("WARNING"):
+        dirs = await discover_compat_dirs(store, tenant_id=_TENANT, user_id=_USER, view=_CONV1)
+    assert dirs == ()
+    (record,) = caplog.records
+    assert record.exc_info is None
+    assert "客户甲" not in record.getMessage()
+    assert "SandboxSupervisorError" in record.getMessage()

@@ -47,6 +47,7 @@ class InMemoryThreadMetaStore(ThreadMetaStore):
             agent_name=agent_name,
             agent_version=agent_version,
             message_count=0,
+            workspace_layout="conversation",
             created_at=now,
             updated_at=now,
         )

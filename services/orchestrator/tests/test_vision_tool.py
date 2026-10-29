@@ -785,6 +785,7 @@ class _LocalRenderRuntime(RecordingSandboxRuntime):
         egress: EgressContext | None = None,
         conv_id: UUID | None = None,
         compat_dirs: tuple[str, ...] = (),
+        workspace_thread_id: UUID | None = None,
     ) -> SandboxOutcome:
         await super().exec(
             sandbox_id=sandbox_id,

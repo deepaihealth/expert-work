@@ -393,6 +393,7 @@ class SandboxSupervisor:
         agent_root: str | None = None,
         conv_id: UUID | None = None,
         compat_dirs: tuple[str, ...] = (),
+        thread_id: UUID | None = None,
     ) -> ExecResult:
         """Run ``code`` in an acquired sandbox via its held runner link.
 
@@ -420,8 +421,9 @@ class SandboxSupervisor:
         ``conv_id`` / ``compat_dirs`` (B-236) — the conversation view: the
         runner binds ``<agent_root>/threads/<conv_id>/work`` as ``/workspace``
         and ``agent_root`` as ``/agent``; ``compat_dirs`` are agent-root
-        directories mapped into ``/workspace`` during the transition window.
-        Per-call for the same reason as ``agent_root``.
+        directories mapped into ``/workspace`` during the transition window;
+        ``thread_id`` is the conversation's own ``threads/<id>/`` (the only one
+        left visible in either view). Per-call for the same reason as ``agent_root``.
         """
         link = self._links.get(sandbox_id)
         if link is None:
@@ -438,6 +440,7 @@ class SandboxSupervisor:
                     agent_root=agent_root,
                     conv_id=conv_id,
                     compat_dirs=compat_dirs,
+                    thread_id=thread_id,
                 )
             except RunnerLinkError as exc:
                 msg = f"sandbox exec failed: {exc}"

@@ -11,12 +11,15 @@ fixed-name files. From B-236 on a conversation's ``/workspace`` is its own direc
 * ``'conversation'`` — the per-conversation view, for every thread created after.
 
 The column is added with default ``'agent_root'`` (so every existing row reads it,
-metadata-only in PostgreSQL 11+, no table rewrite), then the default is switched to
-``'conversation'`` in the same migration: new threads from every create path get the
-new view without any code setting it. A CHECK keeps the value to these two.
+metadata-only in PostgreSQL 11+, no table rewrite) and **the default stays
+``'agent_root'``**. New code writes ``'conversation'`` explicitly at the one place a
+thread row is created (``SqlThreadMetaStore.create``). That keeps a rolling deploy
+consistent: a thread created by an old pod (which never names the column, and whose
+exec still lays out the old view) reads ``'agent_root'``, so a new pod that later runs
+it keeps the view its files were written in. A CHECK keeps the value to these two.
 
-**Expand-only.** Old code never names the column, so its inserts take the default and
-it ignores the value; an image rollback needs no downgrade (the downgrade drops it).
+**Expand-only.** Old code never names the column and ignores the value; an image
+rollback needs no downgrade (the downgrade drops it).
 
 Revision ID: 0181_thread_workspace_layout
 Revises: 0180_artifact_version_snapshot
@@ -44,7 +47,6 @@ def upgrade() -> None:
         "thread_meta",
         sa.Column("workspace_layout", sa.Text(), nullable=False, server_default="agent_root"),
     )
-    op.alter_column("thread_meta", "workspace_layout", server_default="conversation")
     op.create_check_constraint(
         _CHECK, "thread_meta", "workspace_layout IN ('conversation', 'agent_root')"
     )

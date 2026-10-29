@@ -80,13 +80,14 @@ def test_argv_bound_passes_the_nas_root_as_first_positional() -> None:
         *EXEC_VIEW_ARGV_PREFIX,
         "/mnt/workspace/agents/plan-aaaaaaaa",
         "",
+        "",
         "0",
         *_PY,
     ]
 
 
 def test_argv_unbound_passes_an_empty_root() -> None:
-    assert exec_view_argv("", _PY) == [*EXEC_VIEW_ARGV_PREFIX, "", "", "0", *_PY]
+    assert exec_view_argv("", _PY) == [*EXEC_VIEW_ARGV_PREFIX, "", "", "", "0", *_PY]
 
 
 def test_build_exec_command_bound_and_unbound_verbatim() -> None:
@@ -96,12 +97,12 @@ def test_build_exec_command_bound_and_unbound_verbatim() -> None:
     assert (
         build_exec_command("plan-aaaaaaaa", "/tmp/ew-exec-abc.py")  # noqa: S108
         == (
-            prefix + " ew-exec-view /mnt/workspace/agents/plan-aaaaaaaa '' 0"
+            prefix + " ew-exec-view /mnt/workspace/agents/plan-aaaaaaaa '' '' 0"
             " python -E -P /tmp/ew-exec-abc.py"
         )
     )
     assert build_exec_command("", "/tmp/ew-exec-abc.py") == (  # noqa: S108
-        prefix + " ew-exec-view '' '' 0 python -E -P /tmp/ew-exec-abc.py"
+        prefix + " ew-exec-view '' '' '' 0 python -E -P /tmp/ew-exec-abc.py"
     )
 
 
@@ -121,12 +122,16 @@ def test_bad_agent_key_is_refused(bad: str) -> None:
 # ---------------------------------------------------------------------------
 
 _CONV = UUID("11111111-2222-3333-4444-555555555555")
+_OTHER = "99999999-8888-7777-6666-555555555555"
 
 
 def test_argv_conversation_view_carries_the_conversation_and_compat_dirs() -> None:
-    assert exec_view_argv("plan-aaaaaaaa", _PY, conv_id=_CONV, compat_dirs=("style", "模板")) == [
+    assert exec_view_argv(
+        "plan-aaaaaaaa", _PY, conv_id=_CONV, thread_id=_CONV, compat_dirs=("style", "模板")
+    ) == [
         *EXEC_VIEW_ARGV_PREFIX,
         "/mnt/workspace/agents/plan-aaaaaaaa",
+        str(_CONV),
         str(_CONV),
         "2",
         "style",
@@ -135,10 +140,23 @@ def test_argv_conversation_view_carries_the_conversation_and_compat_dirs() -> No
     ]
 
 
-def test_argv_unbound_never_carries_a_conversation() -> None:
-    """没绑 agent 没有对话视图:对话 id 与目录名都不发,脚本走未绑分支。"""
-    assert exec_view_argv("", _PY, conv_id=_CONV, compat_dirs=("style",)) == [
+def test_argv_legacy_view_carries_only_the_own_thread() -> None:
+    """老视图:``$2`` 照旧是空串(老视图的约定不变),线程 id 走单独的 ``$3``。"""
+    assert exec_view_argv("plan-aaaaaaaa", _PY, thread_id=_CONV, compat_dirs=("style",)) == [
         *EXEC_VIEW_ARGV_PREFIX,
+        "/mnt/workspace/agents/plan-aaaaaaaa",
+        "",
+        str(_CONV),
+        "0",
+        *_PY,
+    ]
+
+
+def test_argv_unbound_never_carries_a_conversation() -> None:
+    """没绑 agent 没有对话视图:对话 id、线程 id 与目录名都不发,脚本走未绑分支。"""
+    assert exec_view_argv("", _PY, conv_id=_CONV, thread_id=_CONV, compat_dirs=("style",)) == [
+        *EXEC_VIEW_ARGV_PREFIX,
+        "",
         "",
         "",
         "0",
@@ -157,11 +175,13 @@ def test_build_exec_command_quotes_compat_dir_names() -> None:
         "plan-aaaaaaaa",
         "/tmp/x.py",  # noqa: S108
         conv_id=_CONV,
+        thread_id=_CONV,
         compat_dirs=("客户 案例;rm",),
     )
     argv = shlex.split(cmd[len("umask 077 && ") :])
-    assert argv[argv.index("ew-exec-view") + 1 :][:4] == [
+    assert argv[argv.index("ew-exec-view") + 1 :][:5] == [
         "/mnt/workspace/agents/plan-aaaaaaaa",
+        str(_CONV),
         str(_CONV),
         "1",
         "客户 案例;rm",
@@ -172,18 +192,21 @@ def test_script_platform_dirs_are_the_resolver_platform_dirs() -> None:
     """脚本 bind 进 /workspace 的平台目录与宿主侧解析器认的是同一组。"""
     from orchestrator.tools.workspace_paths import PLATFORM_DIRS
 
-    assert f"  for d in {' '.join(PLATFORM_DIRS)}; do\n" in EXEC_VIEW_SCRIPT
+    assert f"    for d in {' '.join(PLATFORM_DIRS)}; do\n" in EXEC_VIEW_SCRIPT
 
 
 # —— 脚本演练:本机没有非特权 user namespace(macOS / CI host 都给不了),所以把脚本里的
 # 三个绝对路径换成临时目录,``mount`` 换成一个记账的假命令(``--bind`` 落成符号链接,
-# tmpfs 只记账),其余逐字照跑。验得住:参数解析、目录建在哪、哪些 bind 被做、过渡期
-# 目录的判据、坏参数 fail closed。验不住:真的挂载语义 —— 那由 CI 起真镜像的
-# ``infra/sandbox-image/smoke_test.py`` 覆盖。
+# tmpfs 只记账),其余逐字照跑。验得住:参数解析、目录建在哪、哪些 bind 被做、bind 源的
+# 真目录检查、过渡期目录的判据、坏参数 fail closed。验不住:真的挂载语义 —— 那由
+# ``infra/sandbox-image/smoke_test.py`` 与 supervisor 的真镜像集成测试覆盖。
 
 _FAKE_MOUNT = """#!/bin/sh
 echo "$*" >> "$EW_MOUNT_LOG"
 if [ "$1" = "--bind" ]; then
+  if [ -d "$3" ] && [ "$(cd -P "$3" && pwd -P)" = "$(cd -P "$2" && pwd -P)" ]; then
+    exit 0  # 经由已经「挂上」的符号链接,目标本来就是源 —— 真内核里是一次同目录 bind
+  fi
   rmdir "$3" 2>/dev/null || true
   ln -s "$2" "$3"
 fi
@@ -192,6 +215,7 @@ fi
 
 class _Rehearsal:
     def __init__(self, tmp: Path) -> None:
+        tmp = tmp.resolve()  # 判据比的是解析后的路径;macOS 的临时目录在 /var → /private/var 底下
         self.tmp = tmp
         self.mnt = tmp / "mnt"
         self.ws = tmp / "ws"
@@ -205,9 +229,7 @@ class _Rehearsal:
         fake.write_text(_FAKE_MOUNT)
         fake.chmod(0o755)
 
-    def run(
-        self, root: str, conv: str, compat: list[str], cmd: str
-    ) -> subprocess.CompletedProcess[str]:
+    def run_raw(self, *args: str) -> subprocess.CompletedProcess[str]:
         script = (
             EXEC_VIEW_SCRIPT.replace("/mnt/workspace", str(self.mnt))
             .replace("/workspace", str(self.ws))
@@ -219,25 +241,19 @@ class _Rehearsal:
             "EW_MOUNT_LOG": str(self.log),
         }
         return subprocess.run(
-            [
-                "sh",
-                "-c",
-                script,
-                "ew-exec-view",
-                root,
-                conv,
-                str(len(compat)),
-                *compat,
-                "sh",
-                "-c",
-                cmd,
-            ],
+            ["sh", "-c", script, "ew-exec-view", *args],
             env=env,
             capture_output=True,
             text=True,
             timeout=30,
             check=False,
         )
+
+    def run(
+        self, root: str, conv: str, compat: list[str], cmd: str, *, own: str | None = None
+    ) -> subprocess.CompletedProcess[str]:
+        thread = conv if own is None else own
+        return self.run_raw(root, conv, thread, str(len(compat)), *compat, "sh", "-c", cmd)
 
     def mounts(self) -> list[str]:
         return self.log.read_text().splitlines() if self.log.exists() else []
@@ -266,21 +282,37 @@ def test_rehearsal_conversation_view_binds_the_conversation_dir_and_the_agent_ro
     assert mounts[-1] == f"-t tmpfs -o size=1k none {r.mnt}"
 
 
-def test_rehearsal_legacy_view_binds_the_agent_root_twice(tmp_path: Path) -> None:
+def test_rehearsal_legacy_view_hides_other_threads_in_both_views(tmp_path: Path) -> None:
+    """老视图:``/workspace`` 与 ``/agent`` 都是 agent 根,但两处的 ``threads/`` 都被盖住,
+    只把本线程那一格 bind 回来 —— 发布后新开的对话的工作目录老对话看不到。"""
     r = _Rehearsal(tmp_path)
-    proc = r.run(str(r.root), "", [], "echo x > out.txt")
+    proc = r.run(str(r.root), "", [], "echo x > out.txt", own=str(_CONV))
 
     assert proc.returncode == 0, proc.stderr
     assert (r.root / "out.txt").read_text() == "x\n"
     mounts = r.mounts()
     assert f"--bind {r.root} {r.agent}" in mounts
     assert f"--bind {r.root} {r.ws}" in mounts
-    assert not any("threads" in m for m in mounts)
+    for view in (r.ws, r.agent):
+        assert f"-t tmpfs -o size=1k,mode=0500 none {view}/threads" in mounts
+        assert f"--bind {r.root}/threads/{_CONV} {view}/threads/{_CONV}" in mounts
+    assert not any(_OTHER in m for m in mounts)
+
+
+def test_rehearsal_legacy_view_without_a_thread_hides_every_thread(tmp_path: Path) -> None:
+    r = _Rehearsal(tmp_path)
+    proc = r.run(str(r.root), "", [], "true", own="")
+
+    assert proc.returncode == 0, proc.stderr
+    mounts = r.mounts()
+    assert f"-t tmpfs -o size=1k,mode=0500 none {r.ws}/threads" in mounts
+    assert f"-t tmpfs -o size=1k,mode=0500 none {r.agent}/threads" in mounts
+    assert not any(m.startswith(f"--bind {r.root}/threads") for m in mounts)
 
 
 def test_rehearsal_unbound_binds_the_user_root_to_both_views(tmp_path: Path) -> None:
     r = _Rehearsal(tmp_path)
-    proc = r.run("", "", [], "true")
+    proc = r.run("", "", [], "true", own="")
 
     assert proc.returncode == 0, proc.stderr
     assert r.mounts() == [f"--bind {r.mnt} {r.agent}", f"--bind {r.mnt} {r.ws}"]
@@ -297,33 +329,107 @@ def test_rehearsal_missing_agent_mount_point_exits_97_before_any_mount(tmp_path:
     assert r.mounts() == []
 
 
+@pytest.mark.parametrize("which", ["threads", "conversation", "work"])
+@pytest.mark.parametrize("plant", ["symlink", "file"])
+def test_rehearsal_conversation_dirs_that_are_not_plain_dirs_fail_closed(
+    tmp_path: Path, which: str, plant: str
+) -> None:
+    """``threads`` / 对话目录 / 工作目录被换成符号链接(指向别的对话)或普通文件:
+    98 退出,一个 bind 都不做,代码一行都不跑。"""
+    r = _Rehearsal(tmp_path)
+    other_work = r.root / "threads" / _OTHER / "work"
+    other_work.mkdir(parents=True)
+    (other_work / "secret.txt").write_text("other conversation")
+    target = {
+        "threads": r.root / "threads",
+        "conversation": r.root / "threads" / str(_CONV),
+        "work": r.root / "threads" / str(_CONV) / "work",
+    }[which]
+    if which == "threads":
+        moved = r.root / "threads-real"
+        (r.root / "threads").rename(moved)
+        source: Path = moved
+    else:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        source = other_work if which == "work" else other_work.parent
+    if plant == "symlink":
+        target.symlink_to(source)
+    else:
+        target.write_text("planted")
+
+    proc = r.run(str(r.root), str(_CONV), [], "echo ran")
+
+    assert proc.returncode == 98, proc.stderr
+    assert "not a plain directory" in proc.stderr
+    assert "ran" not in proc.stdout
+    assert not any("--bind" in m for m in r.mounts())
+
+
+@pytest.mark.parametrize("plant", ["symlink", "file"])
+def test_rehearsal_planted_platform_dir_is_skipped_not_fatal(tmp_path: Path, plant: str) -> None:
+    """agent 根下的 ``uploads`` 被换成指向 ``threads`` 的符号链接(或一个普通文件):这次不挂
+    它、写一行 stderr,exec 照常跑 —— 不能借它看见别的对话,也不能让之后每次 exec 都失败。"""
+    r = _Rehearsal(tmp_path)
+    r.root.mkdir(parents=True)
+    if plant == "symlink":
+        (r.root / "uploads").symlink_to("threads")
+    else:
+        (r.root / "uploads").write_text("planted")
+
+    proc = r.run(str(r.root), str(_CONV), [], "echo ran")
+
+    assert proc.returncode == 0, proc.stderr
+    assert "ran" in proc.stdout
+    assert "uploads is not a plain directory" in proc.stderr
+    mounts = r.mounts()
+    assert not any(m.endswith(f"{r.ws}/uploads") for m in mounts)
+    assert f"--bind {r.root}/inputs {r.ws}/inputs" in mounts
+
+
+def test_rehearsal_symlinked_agent_root_fails_closed(tmp_path: Path) -> None:
+    r = _Rehearsal(tmp_path)
+    elsewhere = r.mnt / "agents" / "someone-else"
+    elsewhere.mkdir(parents=True)
+    r.root.symlink_to(elsewhere)
+
+    proc = r.run(str(r.root), str(_CONV), [], "echo ran")
+
+    assert proc.returncode == 98, proc.stderr
+    assert "ran" not in proc.stdout
+    assert r.mounts() == []
+
+
 def test_rehearsal_compat_dir_maps_only_when_the_conversation_has_none(tmp_path: Path) -> None:
     """过渡期目录:agent 根有、本对话没有(或只有空桩)才映射;本对话自己有内容就不映射;
-    根下的单个文件从不映射。"""
+    根下的单个文件、指向别处的符号链接从不映射。"""
     r = _Rehearsal(tmp_path)
     work = r.root / "threads" / str(_CONV) / "work"
     (r.root / "style").mkdir(parents=True)
     (r.root / "own").mkdir()
     (r.root / "stub").mkdir()
     (r.root / "notes.md").write_text("root file")
+    (r.root / "threads" / _OTHER).mkdir(parents=True)
+    (r.root / "linked").symlink_to(r.root / "threads" / _OTHER)
     (work / "own").mkdir(parents=True)
     (work / "own" / "x").write_text("mine")
     (work / "stub").mkdir()  # 上一次 exec 留下的空挂载桩
 
-    proc = r.run(str(r.root), str(_CONV), ["style", "own", "stub", "notes.md", "absent"], "true")
+    proc = r.run(
+        str(r.root), str(_CONV), ["style", "own", "stub", "notes.md", "absent", "linked"], "true"
+    )
 
     assert proc.returncode == 0, proc.stderr
     mounts = r.mounts()
     assert f"--bind {r.root}/style {r.ws}/style" in mounts
     assert f"--bind {r.root}/stub {r.ws}/stub" in mounts
     assert not any(m.endswith(f"{r.ws}/own") for m in mounts)
-    assert not any("notes.md" in m or "absent" in m for m in mounts)
+    assert not any("notes.md" in m or "absent" in m or "linked" in m for m in mounts)
 
 
 def test_rehearsal_compat_dirs_are_ignored_in_the_legacy_view(tmp_path: Path) -> None:
     r = _Rehearsal(tmp_path)
     (r.root / "style").mkdir(parents=True)
-    proc = r.run(str(r.root), "", ["style"], "true")
+    proc = r.run(str(r.root), "", ["style"], "true", own="")
 
     assert proc.returncode == 0, proc.stderr
     assert not any("style" in m for m in r.mounts())
@@ -338,25 +444,15 @@ def test_rehearsal_bad_compat_dir_fails_closed(tmp_path: Path, bad: str) -> None
     assert "ran" not in proc.stdout
 
 
-@pytest.mark.parametrize(("conv", "count"), [("a/b", "0"), ("..", "0"), (str(_CONV), "x")])
-def test_rehearsal_bad_conversation_or_count_fails_closed(
-    tmp_path: Path, conv: str, count: str
+@pytest.mark.parametrize(
+    ("conv", "own", "count"),
+    [("a/b", "", "0"), ("..", "", "0"), ("", "a/b", "0"), ("", "..", "0"), (str(_CONV), "", "x")],
+)
+def test_rehearsal_bad_ids_or_count_fail_closed(
+    tmp_path: Path, conv: str, own: str, count: str
 ) -> None:
     r = _Rehearsal(tmp_path)
-    script = (
-        EXEC_VIEW_SCRIPT.replace("/mnt/workspace", str(r.mnt))
-        .replace("/workspace", str(r.ws))
-        .replace("/agent", str(r.agent))
-    )
-    env = {**os.environ, "PATH": f"{r.bin}:{os.environ['PATH']}", "EW_MOUNT_LOG": str(r.log)}
-    proc = subprocess.run(
-        ["sh", "-c", script, "ew-exec-view", str(r.root), conv, count, "sh", "-c", "echo ran"],
-        env=env,
-        capture_output=True,
-        text=True,
-        timeout=30,
-        check=False,
-    )
+    proc = r.run_raw(str(r.root), conv, own, count, "sh", "-c", "echo ran")
 
     assert proc.returncode == 98, proc.stderr
     assert "ran" not in proc.stdout

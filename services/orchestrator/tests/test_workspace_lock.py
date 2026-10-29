@@ -66,6 +66,7 @@ class _LockProbeClient:
         has_skills: bool = False,
         conv_id: UUID | None = None,
         compat_dirs: tuple[str, ...] = (),
+        workspace_thread_id: UUID | None = None,
     ) -> SandboxOutcome:
         self.active_at_exec = self.lock.active
         return SandboxOutcome(stdout=self.envelope, stderr="", exit_code=0, timed_out=False)

@@ -579,6 +579,7 @@ async def test_exec_conversation_view_binds_its_own_dir_and_the_agent_root(
             agent_root=_B236_ROOT,
             conv_id=conv,
             compat_dirs=("style",),
+            thread_id=conv,
         )
         assert probe.exit_code == 0, probe.stderr
         seen = json.loads(probe.stdout.strip().splitlines()[-1])
@@ -598,20 +599,30 @@ async def test_exec_conversation_view_binds_its_own_dir_and_the_agent_root(
 
 @pytest.mark.asyncio
 async def test_exec_legacy_view_and_bad_compat_name(expert_work: _Harness) -> None:
-    """老视图:``/workspace`` 与 ``/agent`` 是同一个目录(比 inode)。坏的过渡期目录名
-    (绕过 HTTP 边界直接递给 runner)让脚本以 98 退出,代码一行都不跑。"""
+    """老视图:``/workspace`` 与 ``/agent`` 是同一个目录(比 inode),``threads/`` 只剩本线程
+    那一格(发布后新开的对话的工作目录老对话看不到)。坏的过渡期目录名(绕过 HTTP 边界直接
+    递给 runner)让脚本以 98 退出,代码一行都不跑。"""
     response = await expert_work.supervisor.acquire(
         AcquireRequest(tenant_id=uuid4(), thread_id="b236-legacy", user_id=uuid4())
     )
     sid = response.sandbox_id
+    own, other = uuid4(), uuid4()
     try:
+        await expert_work.supervisor.exec(
+            sid,
+            code="import os\n"
+            f"os.makedirs('/workspace/agents/a/threads/{other}/work', exist_ok=True)\n"
+            f"open('/workspace/agents/a/threads/{other}/work/secret.txt', 'w').write('B')\n",
+        )
         legacy = await expert_work.supervisor.exec(
             sid,
             code="import os; a, w = os.stat('/agent'), os.stat('/workspace'); "
-            "print((a.st_dev, a.st_ino) == (w.st_dev, w.st_ino))",
+            "print((a.st_dev, a.st_ino) == (w.st_dev, w.st_ino), "
+            "os.listdir('threads'), os.listdir('/agent/threads'))",
             agent_root=_B236_ROOT,
+            thread_id=own,
         )
-        assert legacy.stdout.strip() == "True", legacy.stderr
+        assert legacy.stdout.strip() == f"True ['{own}'] ['{own}']", legacy.stderr
         bad = await expert_work.supervisor.exec(
             sid,
             code="print('ran')",
@@ -621,6 +632,56 @@ async def test_exec_legacy_view_and_bad_compat_name(expert_work: _Harness) -> No
         )
         assert bad.exit_code == 98, bad.stderr
         assert "ran" not in bad.stdout
+    finally:
+        await expert_work.supervisor.destroy(sid, reason="b236-acceptance")
+
+
+@pytest.mark.asyncio
+async def test_exec_planted_symlinks_are_refused(expert_work: _Harness) -> None:
+    """agent 根下被换成符号链接的 bind 源:``uploads`` → 跳过(exec 照跑,看不到别的对话);
+    本对话的 ``work`` → 98 退出(不跟着链接进别的对话)。"""
+    response = await expert_work.supervisor.acquire(
+        AcquireRequest(tenant_id=uuid4(), thread_id="b236-symlink", user_id=uuid4())
+    )
+    sid = response.sandbox_id
+    conv, other = uuid4(), uuid4()
+    try:
+        plant = await expert_work.supervisor.exec(
+            sid,
+            code="import os\n"
+            "r = '/workspace/agents/a'\n"
+            f"os.makedirs(f'{{r}}/threads/{other}/work', exist_ok=True)\n"
+            f"open(f'{{r}}/threads/{other}/work/secret.txt', 'w').write('B')\n"
+            "os.symlink('threads', f'{r}/uploads')\n",
+        )
+        assert plant.exit_code == 0, plant.stderr
+        skipped = await expert_work.supervisor.exec(
+            sid,
+            code=f"import os; print(os.path.exists('/workspace/uploads/{other}/work/secret.txt'))",
+            agent_root=_B236_ROOT,
+            conv_id=conv,
+            thread_id=conv,
+        )
+        assert skipped.exit_code == 0, skipped.stderr
+        assert skipped.stdout.strip() == "False"
+        assert "uploads is not a plain directory" in skipped.stderr
+        swap = await expert_work.supervisor.exec(
+            sid,
+            code="import os\n"
+            f"w = '/workspace/agents/a/threads/{conv}/work'\n"
+            "os.rename(w, w + '.old')\n"
+            f"os.symlink('../{other}/work', w)\n",
+        )
+        assert swap.exit_code == 0, swap.stderr
+        refused = await expert_work.supervisor.exec(
+            sid,
+            code="print(open('secret.txt').read())",
+            agent_root=_B236_ROOT,
+            conv_id=conv,
+            thread_id=conv,
+        )
+        assert refused.exit_code == 98, refused.stderr
+        assert "B" not in refused.stdout
     finally:
         await expert_work.supervisor.destroy(sid, reason="b236-acceptance")
 

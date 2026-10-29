@@ -196,8 +196,10 @@ class _FsSandbox(RecordingSandboxRuntime):
         egress: EgressContext | None = None,
         conv_id: UUID | None = None,
         compat_dirs: tuple[str, ...] = (),
+        workspace_thread_id: UUID | None = None,
     ) -> SandboxOutcome:
         del timeout_s, agent_key, run_id, has_skills, egress, conv_id, compat_dirs
+        del workspace_thread_id
         self.execs.append((sandbox_id, code))
         for rel, content in self.files.items():
             if json.dumps(rel) in code:
