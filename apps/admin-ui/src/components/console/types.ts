@@ -5,6 +5,7 @@
  * measure them uniformly. See
  * .superpowers/sdd/2026-08-18-debug-console-pr-a-console/task-5-brief.md.
  */
+import type { RunCompletion } from "../../api/run_completion";
 import type { RunTokens } from "../../api/runs";
 import type { FallbackLine } from "../../pages/agent_detail/playground/history_turns";
 import type { Turn } from "../turn/types";
@@ -61,4 +62,8 @@ export interface ConsoleTurn {
   /** B-139 —— 这一轮在排队:会话里上一轮还没结束,它还没开始执行(见
    *  ``isQueuedTurn``)。``buildConsoleTurns`` 总会填;缺省 = 没在排队。 */
   queued?: boolean;
+  /** B-226 ⑥ — history turns: the run row's completion, end-frame shaped
+   *  (``runCompletionOf``), so the footer can say "finished, not completed"
+   *  before the turn is replayed. Live turns: ``null`` (their end frame says it). */
+  runCompletion?: RunCompletion | null;
 }

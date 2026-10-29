@@ -305,7 +305,14 @@ export function ConversationDetail() {
       return;
     }
     patchHistoryRuns(
-      convoRuns.map((r) => ({ runId: r.run_id, status: r.status, tokens: r.tokens })),
+      convoRuns.map((r) => ({
+        runId: r.run_id,
+        status: r.status,
+        tokens: r.tokens,
+        completed: r.completed ?? null,
+        exitReason: r.exit_reason ?? null,
+        unresolvedFailures: r.unresolved_failures ?? null,
+      })),
     );
   }, [threadId, convoRuns, historyTurns, viewedTenantId, loadHistory, patchHistoryRuns]);
 

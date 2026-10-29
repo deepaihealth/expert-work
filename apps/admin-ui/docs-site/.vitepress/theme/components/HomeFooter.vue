@@ -12,6 +12,8 @@ const chapters = [
   ['8 错误码总表', '/guide/errors'],
   ['9 对接注意事项', '/guide/best-practices'],
   ['10 多语言示例', '/guide/examples'],
+  ['11 Webhook 通知', '/guide/webhooks'],
+  ['12 更新记录', '/guide/changelog'],
 ]
 </script>
 

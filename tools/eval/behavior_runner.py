@@ -37,6 +37,7 @@ from behavior_schema import (  # noqa: E402
     ResultHeader,
     RunRecord,
     TurnRecord,
+    agent_max_steps,
     append_line,
     case_set_hash,
     load_cases,
@@ -154,6 +155,32 @@ def indeterminate_reason(case: Case, record: RunRecord) -> str | None:
         return "no compaction in any turn (requires_compaction)"
     if case.requires_tool_error and not any(t.tool_errors for t in record.turns):
         return "no tool error in any turn (requires_tool_error)"
+    # B-226 —— 撞上限之后的收尾 / 原地打转被拦下之后:没走到那一步同样测不到。
+    if case.requires_exit_reason is not None:
+        got = record.turns[-1].exit_reason if record.turns else None
+        if got != case.requires_exit_reason:
+            return f"exit_reason={got!r}, not {case.requires_exit_reason!r} (requires_exit_reason)"
+    if case.requires_loop_trip and not any(t.loop_trips for t in record.turns):
+        return "no loop-detection trip in any turn (requires_loop_trip)"
+    if case.requires_step_warning:
+        main_max = agent_max_steps(case.agent)  # 子代的预警带它自己的上限, 不算
+        if not any(main_max in t.step_warning_maxes for t in record.turns):
+            return (
+                f"no step-budget warning for the main agent (max {main_max}) in any turn "
+                "(requires_step_warning)"
+            )
+    if case.requires_no_artifact is not None:
+        hit = next(
+            (
+                str(a["name"])
+                for t in record.turns
+                for a in t.artifacts
+                if a.get("name") and fnmatch.fnmatchcase(str(a["name"]), case.requires_no_artifact)
+            ),
+            None,
+        )
+        if hit is not None:
+            return f"artifact {hit!r} registered (requires_no_artifact)"
     return None
 
 

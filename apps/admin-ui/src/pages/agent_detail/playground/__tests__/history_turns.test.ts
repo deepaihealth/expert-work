@@ -8,7 +8,7 @@ function run(
   runId: string,
   status: ThreadRunSummary["status"] = "success",
 ): ThreadRunSummary {
-  return { runId, status, isResume: false, supersededBy: null, regeneratedFrom: null, createdAt: "2026-01-01", finishedAt: null, error: null, tokens: null };
+  return { runId, status, isResume: false, supersededBy: null, regeneratedFrom: null, createdAt: "2026-01-01", finishedAt: null, error: null, tokens: null, completed: null, exitReason: null };
 }
 
 const U = (content: string): HistoryMessage => ({ role: "user", content });
@@ -33,7 +33,7 @@ describe("buildHistoryTurns", () => {
         tokens: null,
         createdAt: "2026-01-01",
         finishedAt: null,
-        runError: null, supersededBy: null, tombstone: false, platformLines: [],
+        runError: null, supersededBy: null, tombstone: false, platformLines: [], completed: null, exitReason: null, unresolvedFailures: null,
       },
       {
         key: "r2",
@@ -44,7 +44,7 @@ describe("buildHistoryTurns", () => {
         tokens: null,
         createdAt: "2026-01-01",
         finishedAt: null,
-        runError: null, supersededBy: null, tombstone: false, platformLines: [],
+        runError: null, supersededBy: null, tombstone: false, platformLines: [], completed: null, exitReason: null, unresolvedFailures: null,
       },
     ]);
   });
@@ -67,7 +67,7 @@ describe("buildHistoryTurns", () => {
         tokens: null,
         createdAt: "2026-01-01",
         finishedAt: null,
-        runError: null, supersededBy: null, tombstone: false, platformLines: [],
+        runError: null, supersededBy: null, tombstone: false, platformLines: [], completed: null, exitReason: null, unresolvedFailures: null,
       },
     ]);
   });
@@ -90,12 +90,38 @@ describe("buildHistoryTurns", () => {
       tokens: null,
       createdAt: "2026-01-01",
       finishedAt: null,
-      runError: null, supersededBy: null, tombstone: false, platformLines: [],
+      runError: null, supersededBy: null, tombstone: false, platformLines: [], completed: null, exitReason: null, unresolvedFailures: null,
     });
   });
 
   it("returns [] for an empty thread", () => {
     expect(buildHistoryTurns([], [])).toEqual([]);
+  });
+
+  it("B-226 ⑥ — carries each run's completed / exitReason onto its turn on both pairing paths", () => {
+    const runs = [
+      { ...run("r1"), completed: false, exitReason: "max_steps", unresolvedFailures: [] },
+      {
+        ...run("r2"),
+        completed: false,
+        exitReason: "text_response",
+        unresolvedFailures: [{ tool: "bash", kind: "unknown" }],
+      },
+    ];
+    const byOrder = buildHistoryTurns([U("q1"), A("a1"), U("q2"), A("a2")], runs);
+    const byRunId = buildHistoryTurns(
+      [
+        { role: "user", content: "q1", run_id: "r1" },
+        { role: "user", content: "q2", run_id: "r2" },
+      ],
+      runs,
+    );
+    for (const turns of [byOrder, byRunId]) {
+      expect(turns?.map((t) => [t.runId, t.completed, t.exitReason, t.unresolvedFailures])).toEqual([
+        ["r1", false, "max_steps", []],
+        ["r2", false, "text_response", [{ tool: "bash", kind: "unknown" }]],
+      ]);
+    }
   });
 
   it("collects ALL assistant messages in a turn (a run can emit several), each its own line", () => {
@@ -119,7 +145,7 @@ describe("buildHistoryTurns", () => {
         tokens: null,
         createdAt: "2026-01-01",
         finishedAt: null,
-        runError: null, supersededBy: null, tombstone: false, platformLines: [],
+        runError: null, supersededBy: null, tombstone: false, platformLines: [], completed: null, exitReason: null, unresolvedFailures: null,
       },
       {
         key: "r2",
@@ -130,7 +156,7 @@ describe("buildHistoryTurns", () => {
         tokens: null,
         createdAt: "2026-01-01",
         finishedAt: null,
-        runError: null, supersededBy: null, tombstone: false, platformLines: [],
+        runError: null, supersededBy: null, tombstone: false, platformLines: [], completed: null, exitReason: null, unresolvedFailures: null,
       },
     ]);
   });
@@ -263,7 +289,7 @@ describe("buildHistoryTurns run_id grouping", () => {
         tokens: null,
         createdAt: "2026-01-01",
         finishedAt: null,
-        runError: null, supersededBy: null, tombstone: false, platformLines: [],
+        runError: null, supersededBy: null, tombstone: false, platformLines: [], completed: null, exitReason: null, unresolvedFailures: null,
       },
       {
         key: "r2",
@@ -274,7 +300,7 @@ describe("buildHistoryTurns run_id grouping", () => {
         tokens: null,
         createdAt: "2026-01-01",
         finishedAt: null,
-        runError: null, supersededBy: null, tombstone: false, platformLines: [],
+        runError: null, supersededBy: null, tombstone: false, platformLines: [], completed: null, exitReason: null, unresolvedFailures: null,
       },
     ]);
   });
@@ -299,7 +325,7 @@ describe("buildHistoryTurns run_id grouping", () => {
         tokens: null,
         createdAt: "2026-01-01",
         finishedAt: null,
-        runError: null, supersededBy: null, tombstone: false, platformLines: [],
+        runError: null, supersededBy: null, tombstone: false, platformLines: [], completed: null, exitReason: null, unresolvedFailures: null,
       },
       {
         key: "r2",
@@ -310,7 +336,7 @@ describe("buildHistoryTurns run_id grouping", () => {
         tokens: null,
         createdAt: "2026-01-01",
         finishedAt: null,
-        runError: null, supersededBy: null, tombstone: false, platformLines: [],
+        runError: null, supersededBy: null, tombstone: false, platformLines: [], completed: null, exitReason: null, unresolvedFailures: null,
       },
     ]);
   });
@@ -329,7 +355,7 @@ describe("buildHistoryTurns run_id grouping", () => {
       tokens: null,
       createdAt: "2026-01-01",
       finishedAt: null,
-      runError: null, supersededBy: null, tombstone: false, platformLines: [],
+      runError: null, supersededBy: null, tombstone: false, platformLines: [], completed: null, exitReason: null, unresolvedFailures: null,
     });
   });
 
@@ -348,7 +374,7 @@ describe("buildHistoryTurns run_id grouping", () => {
         tokens: null,
         createdAt: "2026-01-01",
         finishedAt: null,
-        runError: null, supersededBy: null, tombstone: false, platformLines: [],
+        runError: null, supersededBy: null, tombstone: false, platformLines: [], completed: null, exitReason: null, unresolvedFailures: null,
       },
     ]);
   });
@@ -365,7 +391,7 @@ describe("buildHistoryTurns run_id grouping", () => {
     expect(turns?.[0]).toMatchObject({
       key: "r1", runId: "r1", status: "running", tokens, createdAt: "2026-02-02",
  finishedAt: null,
- runError: null, supersededBy: null, tombstone: false, platformLines: [],
+ runError: null, supersededBy: null, tombstone: false, platformLines: [], completed: null, exitReason: null, unresolvedFailures: null,
     });
   });
 

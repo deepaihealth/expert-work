@@ -116,6 +116,8 @@ class RunTerminalProbe(NamedTuple):
     artifacts: list[dict[str, Any]] | None
     completed: bool | None = None
     exit_reason: str | None = None
+    #: B-226 ⑥ —— the row's ``[{tool, kind}]`` failure ledger; ``None`` = no record.
+    unresolved_failures: list[dict[str, Any]] | None = None
 
 
 def make_run_probe(
@@ -149,7 +151,9 @@ def make_run_probe(
                 run_id,  # codeql[py/log-injection]
             )
             return RunTerminalProbe(RunStatus.INTERRUPTED, None)
-        return RunTerminalProbe(row.status, row.artifacts, row.completed, row.exit_reason)
+        return RunTerminalProbe(
+            row.status, row.artifacts, row.completed, row.exit_reason, row.unresolved_failures
+        )
 
     return _probe
 
@@ -186,6 +190,9 @@ async def build_event_producer(
     # **不是 false**。live-join 分支同样不用它们(从 bridge end 帧 data 透传)。
     run_completed: bool | None = None,
     run_exit_reason: str | None = None,
+    # B-226 ⑥ —— same as ``run_completed``: the row's failure ledger view for
+    # the replay end frame; the live-join branch reads the bridge end data.
+    run_unresolved_failures: list[dict[str, Any]] | None = None,
     event_store: RunEventStore | None,
     stream_bridge: StreamBridge,
     # PROD-1 跨副本兜底 —— 重读 run 行的探针,返回 ``(status, artifacts)``。
@@ -327,6 +334,7 @@ async def build_event_producer(
                 usage_by_model=(await load_usage()) if load_usage else None,
                 completed=run_completed,
                 exit_reason=run_exit_reason,
+                unresolved_failures=run_unresolved_failures,
             ),
         )
 
@@ -510,6 +518,7 @@ async def build_event_producer(
                                 usage_by_model=(await load_usage()) if load_usage else None,
                                 completed=probed.completed,
                                 exit_reason=probed.exit_reason,
+                                unresolved_failures=probed.unresolved_failures,
                             ),
                         )
                         return
@@ -546,6 +555,7 @@ async def build_event_producer(
                         # B-85 ③ —— 与 status / artifacts 同源透传。
                         completed=_end_data.get("completed"),
                         exit_reason=_end_data.get("exit_reason"),
+                        unresolved_failures=_end_data.get("unresolved_failures"),
                     ),
                 )
                 return

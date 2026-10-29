@@ -1245,6 +1245,47 @@ describe("D-5/D-6 live tail + operations", () => {
     );
   });
 
+  it("B-226 ⑥ — a turn in flight at load and finished by a refresh takes the row's not-completed label", async () => {
+    const fx = pausedFixture();
+    // The conversation read already sees the tail run finished but not done;
+    // the paired history (listThreadRuns) still has it running.
+    const finished: ConversationDetailModel = {
+      ...fx.convo,
+      runs: [
+        fx.convo.runs[0],
+        {
+          ...fx.convo.runs[1],
+          status: "success",
+          completed: false,
+          exit_reason: "max_steps",
+          unresolved_failures: [{ tool: "bash", kind: "unknown" }],
+        },
+      ],
+    };
+    vi.spyOn(convoSdk, "getConversation").mockResolvedValue(finished);
+    vi.spyOn(sessionsSdk, "getSessionMessages").mockResolvedValue(fx.messages);
+    vi.spyOn(runsSdk, "listThreadRuns").mockResolvedValue([
+      fx.runs[0],
+      { ...fx.runs[1], status: "running" as const },
+    ]);
+    vi.spyOn(runsSdk, "streamRunEvents").mockImplementation(() => makeStream([]));
+
+    renderPage();
+    const label = /已结束，未完成（步数用完）|Finished, not completed \(step limit reached\)/;
+    await waitFor(() =>
+      expect(
+        screen.getAllByTestId("console-turn-status").some((el) => label.test(el.textContent ?? "")),
+      ).toBe(true),
+    );
+    // The patched row's failures reach the tag's tooltip too.
+    const tag = screen
+      .getAllByTestId("console-turn-status")
+      .find((el) => label.test(el.textContent ?? ""));
+    fireEvent.mouseEnter(tag as HTMLElement);
+    const tooltip = await screen.findByRole("tooltip");
+    expect(tooltip.textContent).toMatch(/bash（unknown）|bash \(unknown\)/);
+  });
+
   it("terminal conversation renders no cancel button even for admins", async () => {
     vi.spyOn(convoSdk, "getConversation").mockResolvedValue(CONVO); // both runs terminal
     vi.spyOn(sessionsSdk, "getSessionMessages").mockResolvedValue(TWO_TURNS);

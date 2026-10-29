@@ -26,6 +26,10 @@ describe("listThreadRuns", () => {
               created_at: "2026-01-01T00:00:00Z",
               finished_at: "2026-01-01T00:00:30Z",
               error: "user_cancel",
+              // B-226 ⑥ — the row's completion fields ride through.
+              completed: false,
+              exit_reason: "max_steps",
+              unresolved_failures: [{ tool: "bash", kind: "unknown" }],
             },
             { run_id: "r2", status: "paused", is_resume: true, created_at: "2026-01-01T00:01:00Z" },
           ],
@@ -46,6 +50,9 @@ describe("listThreadRuns", () => {
         finishedAt: "2026-01-01T00:00:30Z",
         error: "user_cancel",
         tokens: null,
+        completed: false,
+        exitReason: "max_steps",
+        unresolvedFailures: [{ tool: "bash", kind: "unknown" }],
       },
       {
         runId: "r2",
@@ -55,6 +62,9 @@ describe("listThreadRuns", () => {
         finishedAt: null,
         error: null,
         tokens: null,
+        completed: null,
+        exitReason: null,
+        unresolvedFailures: null,
       },
     ]);
   });

@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import json
 import time
 from pathlib import PurePosixPath
@@ -26,6 +27,24 @@ _CONTENT_TYPES = {
 }
 _AI_TYPES = {"ai", "AIMessage", "AIMessageChunk"}
 _TOOL_TYPES = {"tool", "ToolMessage"}
+#: B-226 —— loop-detection 中间件(``expert_work.runtime.middleware.loop_detection``)落的
+#: 隐藏提醒。新版本带标记;旧版本没有, 只能认正文 —— 对照的基线跑在旧版本上。
+_HUMAN_TYPES = {"human", "HumanMessage"}
+_LOOP_REMINDER_MARK = "expert_work_loop_reminder"
+_LOOP_REMINDER_PREFIX = "<system-reminder>Loop detected"
+
+
+def _is_loop_reminder(msg: dict[str, Any]) -> bool:
+    if msg.get("type") not in _HUMAN_TYPES:
+        return False
+    raw = msg.get("additional_kwargs")
+    kwargs = raw if isinstance(raw, dict) else {}
+    if kwargs.get(_LOOP_REMINDER_MARK):
+        return True
+    content = msg.get("content")
+    return bool(kwargs.get("expert_work_hide_from_ui")) and (
+        isinstance(content, str) and content.startswith(_LOOP_REMINDER_PREFIX)
+    )
 
 
 class StreamIncompleteError(RuntimeError):
@@ -51,6 +70,22 @@ def message_text(content: Any) -> str:
             if isinstance(b, dict) and b.get("type") == "text"
         )
     return ""
+
+
+def _failed_exec(msg: dict[str, Any]) -> bool:
+    """B-226: an exec_python / bash non-zero exit stays a ``status="success"`` tool
+    result; the exit code is only in its meta (``artifact``). Same rule as the
+    platform's ledger: exit 1 with nothing on stderr and no timeout is neutral (not
+    counted) — usually a predicate that answered "no" (``grep -q``, ``grep -c``
+    printing 0, ``diff``)."""
+    meta = msg.get("artifact")
+    if not isinstance(meta, dict):
+        return False
+    code = meta.get("exit_code")
+    if not isinstance(code, int) or isinstance(code, bool) or code == 0:
+        return False
+    predicate_no = code == 1 and not meta.get("stderr") and not meta.get("timed_out")
+    return not predicate_no
 
 
 class SseParser:
@@ -96,10 +131,24 @@ class TurnBuilder:
         self._tool_errors = 0
         self._failed_call_ids: set[str] = set()
         self._compactions = 0
+        self._loop_trips = 0
+        self._step_warning_maxes: list[int] = []
 
     def on_frame(self, event: str, raw: str) -> None:
         if event == "compaction":  # 一帧 = 一次真正落地的摘要(压缩器每次调用至多发一帧)
             self._compactions += 1
+            return
+        if event == "guard":  # B-226 —— 进了步数预警窗口(t04 的前提)
+            with contextlib.suppress(json.JSONDecodeError):
+                frame = json.loads(raw)
+                if isinstance(frame, dict) and (frame.get("kind"), frame.get("guard")) == (
+                    "warning",
+                    "max_steps",
+                ):
+                    detail = frame.get("detail")
+                    limit = detail.get("max") if isinstance(detail, dict) else None
+                    if isinstance(limit, int):  # 记上限:子代的预警带它自己的上限
+                        self._step_warning_maxes.append(limit)
             return
         if event not in {"metadata", "updates", "end"}:
             return
@@ -124,6 +173,9 @@ class TurnBuilder:
             for msg in node.get("messages") or []:
                 if not isinstance(msg, dict):
                     continue
+                if _is_loop_reminder(msg):
+                    self._loop_trips += 1
+                    continue
                 mtype = msg.get("type")
                 if mtype in _AI_TYPES:
                     calls = [c for c in msg.get("tool_calls") or [] if isinstance(c, dict)]
@@ -141,7 +193,7 @@ class TurnBuilder:
                     text = message_text(msg.get("content"))
                     if text.strip() and not calls:
                         self._final_text = text
-                elif mtype in _TOOL_TYPES and msg.get("status") == "error":
+                elif mtype in _TOOL_TYPES and (msg.get("status") == "error" or _failed_exec(msg)):
                     self._tool_errors += 1
                     failed_id = msg.get("tool_call_id")
                     if isinstance(failed_id, str):
@@ -179,6 +231,8 @@ class TurnBuilder:
             output_tokens=tokens_out,
             wall_s=round(wall_s, 1),
             compactions=self._compactions,
+            loop_trips=self._loop_trips,
+            step_warning_maxes=self._step_warning_maxes,
         )
 
 

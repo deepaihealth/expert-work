@@ -121,6 +121,9 @@ from expert_work.runtime.middleware.loop_detection import (
     DEFAULT_WINDOW_SIZE as DEFAULT_WINDOW_SIZE,
 )
 from expert_work.runtime.middleware.loop_detection import (
+    LOOP_REMINDER_MARK as LOOP_REMINDER_MARK,
+)
+from expert_work.runtime.middleware.loop_detection import (
     LoopDetectionMiddleware as LoopDetectionMiddleware,
 )
 from expert_work.runtime.middleware.loop_detection import (
@@ -152,6 +155,7 @@ __all__ = [
     "ANCHORS",
     "DEFAULT_REMINDER_TEXT",
     "DEFAULT_WINDOW_SIZE",
+    "LOOP_REMINDER_MARK",
     "BreakerRegistry",
     "CallNext",
     "ChainCycleError",

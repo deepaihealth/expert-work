@@ -95,6 +95,12 @@ class AgentRunRow(Base):
     # token_budget / approval_pending / approval_rejected。
     completed: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
     exit_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # B-226 ⑥ (migration 0178) — the run's final failure ledger as
+    # ``[{"tool", "kind"}]`` (at most 20; ``runs.schemas.unresolved_failures_view``),
+    # written with ``completed``. Tool name and error class only — the ledger's
+    # summary / path can carry tenant content and never land here. NULL = no
+    # record (error / interrupted / runs before this column); ``[]`` = none.
+    unresolved_failures: Mapped[list[dict[str, str]] | None] = mapped_column(JSONB, nullable=True)
     # External-API-v1 P2 block 1-C (migration 0145) — third-party retry
     # dedup. ``idempotency_key`` is the caller's ``Idempotency-Key`` header;
     # ``request_digest`` is a hash of the request body so a *reused* key with

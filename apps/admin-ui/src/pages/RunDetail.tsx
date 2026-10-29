@@ -41,6 +41,12 @@ import { useTranslation } from "react-i18next";
 import { ApiError } from "../api/client";
 import { getConversation } from "../api/conversations";
 import {
+  notCompletedLabel,
+  runCompletionOf,
+  unresolvedFailuresOf,
+  unresolvedFailuresText,
+} from "../api/run_completion";
+import {
   getRun,
   type RunDetail as RunDetailModel,
   type RunStatus,
@@ -339,6 +345,13 @@ export function RunDetail() {
   }
 
   const approval = run.pending_approval;
+  // B-226 ⑥ — success + completed=false (steps / budget used up) is not a
+  // plain green success; same label as the console turn footer.
+  const completion = runCompletionOf(run);
+  const notCompleted = notCompletedLabel(completion);
+  // Why not done (the tools whose failure was never recovered).
+  const failuresText =
+    notCompleted !== null ? unresolvedFailuresText(unresolvedFailuresOf(completion)) : null;
 
   return (
     <div data-testid="run-detail-root">
@@ -351,9 +364,18 @@ export function RunDetail() {
         }}
         subtitle={
           <Space size={8} align="center" wrap>
-            <Tag color={STATUS_COLOR[run.status] ?? "default"} bordered={false}>
-              {run.status}
+            <Tag
+              color={notCompleted !== null ? "warning" : (STATUS_COLOR[run.status] ?? "default")}
+              bordered={false}
+              data-testid="run-detail-status"
+            >
+              {notCompleted ?? run.status}
             </Tag>
+            {failuresText !== null && (
+              <Text type="secondary" data-testid="run-detail-unresolved-failures">
+                {failuresText}
+              </Text>
+            )}
             <span>
               {t("run_detail.thread_label")}:{" "}
               <Text code style={{ fontSize: 12 }}>

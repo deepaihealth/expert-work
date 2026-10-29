@@ -11,7 +11,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime
 from enum import StrEnum
@@ -113,6 +113,93 @@ def compute_completed(*, exit_reason: str, unresolved_failures: Sequence[Any]) -
     return exit_reason == "text_response" and not unresolved_failures
 
 
+#: B-226 ⑥ — the exits a platform limit stamps (``graph_builder.builder.
+#: budget_exit_reason``): the run was stopped before its natural end. Partners
+#: see these runs as ``status="incomplete"``; ``agent_run.status`` stays
+#: ``success`` (internal storage and queue logic do not change).
+INCOMPLETE_EXIT_REASONS: frozenset[str] = frozenset({"max_steps", "no_progress", "token_budget"})
+
+
+def external_run_status(status: str, exit_reason: str | None) -> str:
+    """B-226 ⑥ — the run status a partner sees. **The one place** that derives it.
+
+    ``success`` with an exit in :data:`INCOMPLETE_EXIT_REASONS` becomes
+    ``incomplete`` (stopped by a platform limit). Every other status passes
+    through unchanged — in particular a natural ``text_response`` end with
+    unresolved tool failures stays ``success`` (that is ``completed=false``,
+    not ``incomplete``). Accepts a :class:`RunStatus` or the end frame's
+    external string; always returns a plain ``str``.
+    """
+    value = str(status)
+    if value == RunStatus.SUCCESS.value and exit_reason in INCOMPLETE_EXIT_REASONS:
+        return ExternalRunStatus.INCOMPLETE.value
+    return value
+
+
+class ExternalRunStatus(StrEnum):
+    """B-226 ⑥ — the run status vocabulary a partner sees: every
+    :class:`RunStatus` value plus ``incomplete``. The partner run list's
+    ``status`` filter takes these, so it speaks the same words its rows say
+    (``test_external_run_status_is_run_status_plus_incomplete`` pins the set).
+    """
+
+    PENDING = "pending"
+    QUEUED = "queued"
+    RUNNING = "running"
+    SUCCESS = "success"
+    ERROR = "error"
+    TIMEOUT = "timeout"
+    INTERRUPTED = "interrupted"
+    PAUSED = "paused"
+    INCOMPLETE = "incomplete"
+
+
+def run_status_filter(status: str) -> tuple[RunStatus, bool | None]:
+    """B-226 ⑥ — the inverse of :func:`external_run_status`, for list filters.
+
+    Returns ``(internal status, incomplete)`` for
+    :meth:`RunStore.list_for_tenant`: ``incomplete=True`` keeps only rows whose
+    ``exit_reason`` is in :data:`INCOMPLETE_EXIT_REASONS`, ``False`` keeps only
+    rows whose ``exit_reason`` is NULL or outside it, ``None`` adds no
+    ``exit_reason`` predicate. So filtering ``success`` never returns a row that
+    reads ``incomplete``, and filtering ``incomplete`` returns exactly those.
+    Raises ``ValueError`` for a value outside :class:`ExternalRunStatus`.
+    """
+    if status == ExternalRunStatus.INCOMPLETE.value:
+        return RunStatus.SUCCESS, True
+    internal = RunStatus(status)
+    return internal, (False if internal is RunStatus.SUCCESS else None)
+
+
+#: B-226 ⑥ — at most this many entries in a run's ``unresolved_failures``.
+UNRESOLVED_FAILURES_CAP = 20
+
+
+def unresolved_failures_view(entries: Sequence[Any]) -> list[dict[str, str]]:
+    """B-226 ⑥ — the partner-safe view of the run's final failure ledger.
+
+    Each ``ClassifiedToolError`` (or its checkpoint dict form) becomes
+    ``{"tool": tool_name, "kind": error_class}`` — **nothing else**: the
+    summary, path, advice and arguments can carry tenant content. First
+    :data:`UNRESOLVED_FAILURES_CAP` entries, in ledger order. An entry that
+    cannot be read still counts (``completed`` is already false because of
+    it): ``tool`` falls back to ``""`` and ``kind`` to ``"unknown"``.
+    """
+    view: list[dict[str, str]] = []
+    for entry in entries[:UNRESOLVED_FAILURES_CAP]:
+        if isinstance(entry, Mapping):
+            tool, kind = entry.get("tool_name"), entry.get("error_class")
+        else:
+            tool, kind = getattr(entry, "tool_name", None), getattr(entry, "error_class", None)
+        view.append(
+            {
+                "tool": tool if isinstance(tool, str) else "",
+                "kind": kind if isinstance(kind, str) and kind else "unknown",
+            }
+        )
+    return view
+
+
 #: B-139 —— 一个会话「忙」的口径:里面有 run 处于这三种状态之一。新一轮
 #: 遇到忙的会话就排队;后台队列只领「同会话里没有更早的忙 run」的排队行。
 #: ``PAUSED``(等审批)不算忙:新一轮会作废那条待审批(已拍板的规则)。
@@ -199,6 +286,12 @@ class RunInfo:
     #: ``exit_reason`` 的取值见 :data:`RUN_EXIT_REASONS`。
     completed: bool | None = None
     exit_reason: str | None = None
+    #: B-226 ⑥ — the run's final failure ledger as ``[{tool, kind}]``
+    #: (:func:`unresolved_failures_view`, capped at
+    #: :data:`UNRESOLVED_FAILURES_CAP`). ``None`` = no record (error /
+    #: interrupted / older run); ``[]`` = no unresolved failure. Written with
+    #: ``completed`` in the same terminal ``set_status``.
+    unresolved_failures: list[dict[str, str]] | None = None
     #: 这一轮**实际执行时**用的 manifest 内容哈希(``agent_spec.spec_sha256``
     #: 同一种规范化形式)。配置页对 manifest 是原地编辑,``thread_meta`` 上
     #: 记的 ``agent_name`` / ``agent_version`` 编辑前后完全一样,所以只有这一列

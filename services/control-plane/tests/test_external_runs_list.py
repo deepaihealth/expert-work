@@ -283,6 +283,64 @@ async def test_status_filter(ctx: _Ctx) -> None:
 
 
 @pytest.mark.asyncio
+async def test_status_filter_speaks_the_status_the_rows_say(ctx: _Ctx) -> None:
+    """B-226 ⑥ — the filter uses the vocabulary the rows return: ``incomplete``
+    is accepted and selects exactly the limit-stopped runs, and ``success`` no
+    longer returns rows that read ``incomplete``. Unknown values stay 422."""
+    await ctx.seed_agent()
+    labels = ("clean", "max_steps", "no_progress", "failed")
+    ids: dict[str, str] = {}
+    for label in labels:
+        created = await ctx.client.post(
+            "/v1/agents/support-bot/runs",
+            json={"user_id": "cust-77", "input": "hi", "mode": "queue"},
+            headers=ctx.headers,
+        )
+        assert created.status_code == 202, created.text
+        ids[label] = created.json()["data"]["run_id"]
+    now = datetime.now(UTC)
+    for label, status, exit_reason in (
+        ("clean", RunStatus.SUCCESS, "text_response"),
+        ("max_steps", RunStatus.SUCCESS, "max_steps"),
+        ("no_progress", RunStatus.SUCCESS, "no_progress"),
+        ("failed", RunStatus.ERROR, None),
+    ):
+        await ctx.run_store.set_status(
+            run_id=UUID(ids[label]),
+            tenant_id=ctx.tenant_id,
+            status=status,
+            updated_at=now,
+            finished_at=now,
+            exit_reason=exit_reason,
+        )
+
+    async def listed(status: str) -> list[dict[str, Any]]:
+        resp = await ctx.client.get(
+            "/v1/agents/support-bot/runs",
+            params={"user_id": "cust-77", "status": status},
+            headers=ctx.headers,
+        )
+        assert resp.status_code == 200, resp.text
+        runs: list[dict[str, Any]] = resp.json()["data"]["runs"]
+        return runs
+
+    incomplete = await listed("incomplete")
+    success = await listed("success")
+    assert {r["run_id"] for r in incomplete} == {ids["max_steps"], ids["no_progress"]}
+    assert {r["status"] for r in incomplete} == {"incomplete"}
+    assert [r["run_id"] for r in success] == [ids["clean"]]
+    assert [r["status"] for r in success] == ["success"]
+    assert [r["run_id"] for r in await listed("error")] == [ids["failed"]]
+
+    bogus = await ctx.client.get(
+        "/v1/agents/support-bot/runs",
+        params={"user_id": "cust-77", "status": "done"},
+        headers=ctx.headers,
+    )
+    assert bogus.status_code == 422, bogus.text
+
+
+@pytest.mark.asyncio
 async def test_error_is_returned_verbatim_without_enrichment(ctx: _Ctx) -> None:
     """列表里的 ``error`` 必须是 ``agent_run.error`` 的**原样**,不加工。
 
@@ -373,6 +431,9 @@ async def test_response_shape_is_a_whitelist(ctx: _Ctx) -> None:
             "error",
             "superseded_by",
             "regenerated_from",
+            "completed",
+            "exit_reason",
+            "unresolved_failures",
         }
 
 
@@ -476,6 +537,118 @@ async def test_run_summary_carries_the_artifact_manifest(ctx: _Ctx) -> None:
     assert resp.status_code == 200, resp.text
     runs = resp.json()["data"]["runs"]
     assert runs[0]["artifacts"] == manifest
+
+
+@pytest.mark.asyncio
+async def test_run_summary_carries_completed_and_exit_reason(ctx: _Ctx) -> None:
+    """B-226 ⑥ — ``status`` says the run finished, ``completed`` says the request
+    was done. A run that used up its steps is ``status=success`` +
+    ``completed=false`` and the list must tell it apart; a failed run has no
+    record of either = ``null`` (the keys are always present)."""
+    await ctx.seed_agent()
+    run_ids: list[UUID] = []
+    for _ in range(3):
+        created = await ctx.client.post(
+            "/v1/agents/support-bot/runs",
+            json={"user_id": "cust-77", "input": "hi", "mode": "queue"},
+            headers=ctx.headers,
+        )
+        assert created.status_code == 202, created.text
+        run_ids.append(UUID(created.json()["data"]["run_id"]))
+    done, stopped, failed = run_ids
+    now = datetime.now(UTC)
+    await ctx.run_store.set_status(
+        run_id=done,
+        tenant_id=ctx.tenant_id,
+        status=RunStatus.SUCCESS,
+        updated_at=now,
+        finished_at=now,
+        completed=True,
+        exit_reason="text_response",
+    )
+    await ctx.run_store.set_status(
+        run_id=stopped,
+        tenant_id=ctx.tenant_id,
+        status=RunStatus.SUCCESS,
+        updated_at=now,
+        finished_at=now,
+        completed=False,
+        exit_reason="max_steps",
+    )
+    await ctx.run_store.set_status(
+        run_id=failed,
+        tenant_id=ctx.tenant_id,
+        status=RunStatus.ERROR,
+        updated_at=now,
+        error="boom",
+        finished_at=now,
+    )
+
+    resp = await ctx.client.get(
+        "/v1/agents/support-bot/runs", params={"user_id": "cust-77"}, headers=ctx.headers
+    )
+
+    assert resp.status_code == 200, resp.text
+    by_run = {r["run_id"]: r for r in resp.json()["data"]["runs"]}
+    assert (by_run[str(done)]["completed"], by_run[str(done)]["exit_reason"]) == (
+        True,
+        "text_response",
+    )
+    # B-226 ⑥ —— a platform limit stopped it: partners see ``incomplete``.
+    assert by_run[str(stopped)]["status"] == "incomplete"
+    assert by_run[str(done)]["status"] == "success"
+    assert (by_run[str(stopped)]["completed"], by_run[str(stopped)]["exit_reason"]) == (
+        False,
+        "max_steps",
+    )
+    assert by_run[str(failed)]["completed"] is None
+    assert by_run[str(failed)]["exit_reason"] is None
+
+
+@pytest.mark.asyncio
+async def test_run_summary_carries_unresolved_failures_and_keeps_text_response_success(
+    ctx: _Ctx,
+) -> None:
+    """B-226 ⑥ — a natural end with an unresolved tool failure is ``success`` +
+    ``completed=false`` (NOT ``incomplete``), and ``unresolved_failures`` says
+    which tool. A row with no record gives ``null``."""
+    await ctx.seed_agent()
+    created = await ctx.client.post(
+        "/v1/agents/support-bot/runs",
+        json={"user_id": "cust-77", "input": "hi", "mode": "queue"},
+        headers=ctx.headers,
+    )
+    run_id = UUID(created.json()["data"]["run_id"])
+    blank = await ctx.client.post(
+        "/v1/agents/support-bot/runs",
+        json={"user_id": "cust-77", "input": "hi", "mode": "queue"},
+        headers=ctx.headers,
+    )
+    blank_id = blank.json()["data"]["run_id"]
+    now = datetime.now(UTC)
+    await ctx.run_store.set_status(
+        run_id=run_id,
+        tenant_id=ctx.tenant_id,
+        status=RunStatus.SUCCESS,
+        updated_at=now,
+        finished_at=now,
+        completed=False,
+        exit_reason="text_response",
+        unresolved_failures=[{"tool": "bash", "kind": "unknown"}],
+    )
+
+    resp = await ctx.client.get(
+        "/v1/agents/support-bot/runs", params={"user_id": "cust-77"}, headers=ctx.headers
+    )
+    by_run = {r["run_id"]: r for r in resp.json()["data"]["runs"]}
+    row = by_run[str(run_id)]
+    assert (row["status"], row["completed"], row["exit_reason"]) == (
+        "success",
+        False,
+        "text_response",
+    )
+    assert row["unresolved_failures"] == [{"tool": "bash", "kind": "unknown"}]
+    assert by_run[blank_id]["unresolved_failures"] is None
 
 
 @pytest.mark.asyncio

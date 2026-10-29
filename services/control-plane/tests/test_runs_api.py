@@ -2997,3 +2997,74 @@ async def test_run_token_totals_leave_out_platform_overhead(runs_client: AsyncCl
     assert [r["tokens"]["input_tokens"] for r in thread_runs] == [100]
     listed = {i["run_id"]: i for i in (await runs_client.get("/v1/runs")).json()["data"]["items"]}
     assert listed[str(run_id)]["tokens"]["input_tokens"] == 100
+
+
+@pytest.mark.asyncio
+async def test_admin_run_reads_carry_completed_and_exit_reason(runs_client: AsyncClient) -> None:
+    """B-226 ⑥ — run detail, the thread's run list and the global run list all
+    say "finished but not done": a run that used up its steps is
+    ``status=success`` + ``completed=false``. A row with no record gives
+    ``null`` for both (keys always present)."""
+    thread_id = await _create_session(runs_client)
+    app = runs_client._transport.app  # type: ignore[attr-defined,union-attr]
+    now = datetime.now(UTC)
+    stopped, unstamped = uuid4(), uuid4()
+    failures = [{"tool": "bash", "kind": "unknown"}]
+    for run_id, completed, exit_reason, unresolved in (
+        (stopped, False, "max_steps", failures),
+        (unstamped, None, None, None),
+    ):
+        await app.state.run_store.create(
+            RunInfo(
+                run_id=run_id,
+                tenant_id=DEFAULT_DEV_TENANT_ID,
+                thread_id=UUID(thread_id),
+                user_id=None,
+                status=RunStatus.SUCCESS,
+                on_disconnect=DisconnectMode.CANCEL,
+                is_resume=False,
+                error=None,
+                created_at=now,
+                updated_at=now,
+                finished_at=now,
+                completed=completed,
+                exit_reason=exit_reason,
+                unresolved_failures=unresolved,
+            )
+        )
+
+    detail = (await runs_client.get(f"/v1/sessions/{thread_id}/runs/{stopped}")).json()
+    # The console APIs keep the raw stored status (``success``), not the
+    # partner-facing ``incomplete``; the console derives its own label.
+    assert (detail["status"], detail["completed"], detail["exit_reason"]) == (
+        "success",
+        False,
+        "max_steps",
+    )
+    assert detail["unresolved_failures"] == failures
+    blank = (await runs_client.get(f"/v1/sessions/{thread_id}/runs/{unstamped}")).json()
+    assert {"completed", "exit_reason", "unresolved_failures"} <= set(blank)
+    assert (blank["completed"], blank["exit_reason"], blank["unresolved_failures"]) == (
+        None,
+        None,
+        None,
+    )
+
+    thread_runs = {
+        r["run_id"]: r
+        for r in (await runs_client.get(f"/v1/sessions/{thread_id}/runs")).json()["data"]["runs"]
+    }
+    listed = {i["run_id"]: i for i in (await runs_client.get("/v1/runs")).json()["data"]["items"]}
+    for rows in (thread_runs, listed):
+        assert (rows[str(stopped)]["completed"], rows[str(stopped)]["exit_reason"]) == (
+            False,
+            "max_steps",
+        )
+        assert rows[str(stopped)]["status"] == "success"
+        assert rows[str(stopped)]["unresolved_failures"] == failures
+        assert "completed" in rows[str(unstamped)]
+        assert "exit_reason" in rows[str(unstamped)]
+        assert "unresolved_failures" in rows[str(unstamped)]
+        assert rows[str(unstamped)]["completed"] is None
+        assert rows[str(unstamped)]["exit_reason"] is None
+        assert rows[str(unstamped)]["unresolved_failures"] is None

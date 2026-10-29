@@ -28,11 +28,8 @@ that reads a document in a new status reports it as failed (B-222 PR-1).
 downgrade's ``UPDATE`` by hand (documents waiting for an estimate or a
 confirmation become ``failed``).
 
-Revision chain: written on ``0177_kb_retrieval_log``; ``0178_run_unresolved_failures``
-(B-226) is taken but not on main yet — the merge re-points ``down_revision`` at it.
-
 Revision ID: 0179_kb_ingest_estimate
-Revises: 0177_kb_retrieval_log
+Revises: 0178_run_unresolved_failures
 """
 
 from __future__ import annotations
@@ -44,7 +41,7 @@ from alembic import op
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 
 revision: str = "0179_kb_ingest_estimate"
-down_revision: str | Sequence[str] | None = "0177_kb_retrieval_log"
+down_revision: str | Sequence[str] | None = "0178_run_unresolved_failures"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 

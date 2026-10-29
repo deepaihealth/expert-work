@@ -413,3 +413,57 @@ async def test_required_tool_error_that_happened_is_scored(tmp_path: Path) -> No
         FailingToolClient(1), case, 1, label="b", agent_map={}, fixtures_dir=_fixtures(tmp_path)
     )
     assert res.passed is True and res.indeterminate is None
+
+
+def _run_record(*turns: TurnRecord) -> RunRecord:
+    return RunRecord(case_id="g99-x", rep=1, user_id="u", turns=list(turns))
+
+
+def test_required_exit_reason_on_the_last_turn_or_indeterminate() -> None:
+    """B-226 —— 测「撞上限后的收尾」的用例:这次没撞上(模型提前做完 / 换了出口)就测不到。"""
+    case = _case(requires_exit_reason="max_steps")
+    hit = _run_record(_turn(1), _turn(2, exit_reason="max_steps"))
+    assert runner.indeterminate_reason(case, hit) is None
+    missed = _run_record(_turn(1, exit_reason="max_steps"), _turn(2))
+    reason = runner.indeterminate_reason(case, missed)
+    assert reason is not None and "text_response" in reason and "max_steps" in reason
+    assert runner.indeterminate_reason(_case(), missed) is None
+
+
+def test_required_loop_trip_or_indeterminate() -> None:
+    """B-226 —— 测「原地打转被拦下之后」的用例:一次都没拦下就测不到。"""
+    case = _case(requires_loop_trip=True)
+    assert runner.indeterminate_reason(case, _run_record(_turn(1), _turn(2, loop_trips=1))) is None
+    reason = runner.indeterminate_reason(case, _run_record(_turn(1), _turn(2)))
+    assert reason is not None and "loop" in reason
+    assert runner.indeterminate_reason(_case(), _run_record(_turn(1))) is None
+
+
+def test_required_step_warning_or_indeterminate() -> None:
+    """B-226 —— t04 测「预警之后照样做完」:主 Agent 没进预警窗口(提前做完了)就测不到;
+    只有子代发的预警(带子代自己的上限)不算。上限取评测智能体 manifest 的步数上限。"""
+    case = _case(agent="eval-tight-24", requires_step_warning=True)
+    warned = _run_record(_turn(1), _turn(2, step_warning_maxes=[6, 24]))
+    assert runner.indeterminate_reason(case, warned) is None
+    child_only = _run_record(_turn(1), _turn(2, step_warning_maxes=[6]))
+    reason = runner.indeterminate_reason(case, child_only)
+    assert reason is not None and "step-budget warning" in reason and "24" in reason
+    reason = runner.indeterminate_reason(case, _run_record(_turn(1), _turn(2)))
+    assert reason is not None and "step-budget warning" in reason
+    assert runner.indeterminate_reason(_case(), _run_record(_turn(1))) is None
+    # 没写步数上限的评测智能体按平台默认算
+    general = _case(requires_step_warning=True)
+    at_default = _run_record(_turn(1, step_warning_maxes=[30]))
+    assert runner.indeterminate_reason(general, at_default) is None
+    assert runner.indeterminate_reason(general, _run_record(_turn(1, step_warning_maxes=[24])))
+
+
+def test_required_no_artifact_or_indeterminate() -> None:
+    """B-226 —— 测「什么都没登记时的收尾」:模型照步数预警提前登记了 = 另一种结局, 不判不过。"""
+    case = _case(requires_no_artifact="totals*")
+    saved = _run_record(_turn(1, artifacts=[{"name": "totals.md", "version": 1}]), _turn(2))
+    reason = runner.indeterminate_reason(case, saved)
+    assert reason is not None and "totals.md" in reason
+    other = _run_record(_turn(1, artifacts=[{"name": "notes.md", "version": 1}]))
+    assert runner.indeterminate_reason(case, other) is None
+    assert runner.indeterminate_reason(_case(), saved) is None

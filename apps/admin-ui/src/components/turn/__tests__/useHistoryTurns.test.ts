@@ -124,6 +124,7 @@ describe("useHistoryTurns", () => {
         createdAt: "2026-05-25T00:00:00Z",
         finishedAt: null,
         runError: null, supersededBy: null, tombstone: false, platformLines: [],
+        completed: null, exitReason: null, unresolvedFailures: null,
       },
     ]);
     expect(result.current.loads).toEqual({
@@ -547,5 +548,28 @@ describe("patchRuns (D-5)", () => {
       result.current.patchRuns([{ runId: "r2", status: "success", tokens: null }]);
     });
     expect(result.current.turns).toBe(before);
+  });
+
+  it("B-226 ⑥ — a turn patched to success after load takes the row's completed / exitReason", async () => {
+    getMessagesMock.mockResolvedValue(liveThread.messages);
+    listThreadRunsMock.mockResolvedValue(liveThread.runs as never);
+
+    const { result } = renderHook(() => useHistoryTurns());
+    await act(async () => {
+      await result.current.load("th-1");
+    });
+
+    act(() => {
+      result.current.patchRuns([
+        {
+          runId: "r2", status: "success", tokens: null, completed: false, exitReason: "text_response",
+          unresolvedFailures: [{ tool: "bash", kind: "unknown" }],
+        },
+      ]);
+    });
+    const r2 = result.current.turns?.find((h) => h.runId === "r2");
+    expect([r2?.status, r2?.completed, r2?.exitReason, r2?.unresolvedFailures]).toEqual([
+      "success", false, "text_response", [{ tool: "bash", kind: "unknown" }],
+    ]);
   });
 });
