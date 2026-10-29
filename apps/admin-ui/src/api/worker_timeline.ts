@@ -35,7 +35,16 @@ export interface WorkerStepSummary {
   messages: WorkerMessageSummary[];
 }
 
-export type WorkerStatus = "running" | "success" | "max_steps" | "cancelled";
+/** ``running`` until the ``end`` frame; then the frame's ``outcome`` as sent.
+ *  The outcome set is open: a value not listed here passes through raw and,
+ *  like every non-``success`` value, reads as not done (B-226 ⑥). */
+export type WorkerStatus =
+  | "running"
+  | "success"
+  | "max_steps"
+  | "cancelled"
+  | "approval_blocked"
+  | (string & {});
 
 export interface WorkerTimeline {
   workerId: string;
@@ -168,7 +177,10 @@ export function parseWorkerFrames(events: readonly SseEvent[]): Map<string, Work
       });
     } else {
       const outcome = f.data.outcome;
-      w.status = outcome === "max_steps" || outcome === "cancelled" ? outcome : "success";
+      // B-226 ⑥ — the outcome as sent: approval_blocked and values this build
+      // does not know are not a success. An end frame without an outcome gets
+      // no invented ending (stays running), as in the backend's /items.
+      if (typeof outcome === "string" && outcome !== "") w.status = outcome;
       w.summary = {
         iterationUsed: typeof f.data.iteration_used === "number" ? f.data.iteration_used : 0,
         llmCallCount: typeof f.data.llm_call_count === "number" ? f.data.llm_call_count : 0,

@@ -176,6 +176,13 @@ def _run_to_dict(info: RunInfo, tokens: dict[str, Any] | None) -> dict[str, Any]
         "regenerated_from": str(info.regenerated_from_run_id)
         if info.regenerated_from_run_id
         else None,
+        # B-226 ⑥ — the conversation page patches turns that were in flight at
+        # load from this list. None = no record (usually error / interrupted /
+        # old run); a paused run voided by a new turn keeps false /
+        # approval_pending.
+        "completed": info.completed,
+        "exit_reason": info.exit_reason,
+        "unresolved_failures": info.unresolved_failures,
         "tokens": tokens,
     }
 

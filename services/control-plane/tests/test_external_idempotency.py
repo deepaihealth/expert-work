@@ -222,6 +222,37 @@ async def test_idempotent_retry_envelope_matches_first_request(
 
 
 @pytest.mark.asyncio
+async def test_idempotent_retry_of_a_finished_run_reports_the_partner_status(
+    _external_ctx: _ExternalCtx, plain_agent: _Agent
+) -> None:
+    """B-226 ⑥ — a retry that replays a run a platform limit stopped reports
+    ``incomplete``, the same status the run list and the ``end`` event give;
+    the stored row stays ``success``."""
+    from datetime import UTC, datetime
+
+    url = f"/v1/agents/{plain_agent.code}/runs"
+    h = {"Idempotency-Key": "incomplete-replay-1"}
+    first = await _external_ctx.client.post(url, json=BODY, headers=h)
+    assert first.status_code == 202, first.text
+    run_id = UUID(first.json()["data"]["run_id"])
+    now = datetime.now(UTC)
+    await _external_ctx.run_store.set_status(
+        run_id=run_id,
+        tenant_id=_external_ctx.tenant_id,
+        status=RunStatus.SUCCESS,
+        updated_at=now,
+        finished_at=now,
+        completed=False,
+        exit_reason="max_steps",
+    )
+
+    second = await _external_ctx.client.post(url, json=BODY, headers=h)
+    assert second.status_code == 202, second.text
+    assert second.json()["data"]["run_id"] == str(run_id)
+    assert second.json()["data"]["status"] == "incomplete"
+
+
+@pytest.mark.asyncio
 async def test_same_key_different_body_is_422(
     external_client: AsyncClient, plain_agent: _Agent
 ) -> None:

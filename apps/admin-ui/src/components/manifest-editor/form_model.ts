@@ -150,8 +150,8 @@ export interface AgentManifest {
       clarification_timeout_s?: number;
       // Wall-clock cap on the whole run incl. sub-agent recursion (0 = off).
       run_deadline_s?: number;
-      // No-progress stop — consecutive loop-detection trips after which the
-      // ReAct loop force-wraps up early (0 = off).
+      // No-progress stop — the run force-wraps up early at its Nth
+      // loop-detection trip (0 = the platform rule, the 2nd trip).
       max_no_progress?: number;
       // Stream L.L7 — record completed runs to ObjectStore (privacy toggle).
       trajectory_recording?: boolean;

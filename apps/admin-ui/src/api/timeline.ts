@@ -6,6 +6,7 @@
  * field parsing. See docs/.../2026-07-10-batch3-wireframe.html for the render.
  */
 import i18n from "../i18n";
+import { notCompletedLabel } from "./run_completion";
 import type { SseEvent } from "./sessions";
 import { serverMsOf } from "./sse_id";
 import { parseToolCalls, type ToolCallEntry } from "./tool_timeline";
@@ -182,7 +183,9 @@ export function parseTimeline(events: readonly SseEvent[]): TimelineItem[] {
                 spent: int(detail.spent), limit: int(detail.limit),
               })
           : g === "max_steps"
-            ? i18n.t("console_runtime.guard_max_steps", { steps: int(detail.steps), max: int(detail.max) })
+            ? i18n.t(warn ? "console_runtime.guard_max_steps_warn" : "console_runtime.guard_max_steps", {
+                steps: int(detail.steps), max: int(detail.max),
+              })
             : i18n.t("console_runtime.guard_no_progress", { streak: int(detail.streak), max: int(detail.max) });
       push({ kind: "guard", receivedAt: at, tone: warn ? "warn" : "bad", text });
       continue;
@@ -199,6 +202,14 @@ export function parseTimeline(events: readonly SseEvent[]): TimelineItem[] {
     if (evt.event === "end") {
       // ``end`` 的 data 从 null 变成 {status, run_id}(P3 PR-1)。四值见契约实况
       // 表 F;``timeout`` 后端已归到 ``error``。老流(data 为 null)落回"运行完成"。
+      // B-226 ⑥ — status=success only says the run finished. completed=false
+      // (steps / budget used up, an unresolved failure) is a warn marker, not
+      // the same green as a run that got the job done.
+      const notCompleted = notCompletedLabel(evt.data);
+      if (notCompleted !== null) {
+        push({ kind: "end", receivedAt: at, tone: "warn", text: notCompleted });
+        continue;
+      }
       const m = END_MARKER[str(obj(evt.data).status)] ?? END_MARKER.success;
       push({ kind: "end", receivedAt: at, tone: m.tone, text: i18n.t(m.key) });
       continue;

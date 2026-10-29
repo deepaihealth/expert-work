@@ -1117,13 +1117,14 @@ class PolicySpec(BaseModel):
         default=0,
         ge=0,
         description=(
-            "No-progress stop — consecutive loop-detection trips (the "
-            "loop-detection middleware flags identical tool-call repeats) "
-            "after which the ReAct loop force-wraps up early via the same "
-            "tool-less graceful turn ``max_steps`` uses. ``0`` (default) "
-            "disables it. The first trip already arms one higher-effort "
-            "turn (escalate_next); this caps how many consecutive "
-            "unproductive turns are tolerated before stopping."
+            "No-progress stop — N = the run stops at its Nth loop-detection "
+            "trip (the loop-detection middleware flags identical tool-call "
+            "repeats) and force-wraps up early via the same tool-less graceful "
+            "turn ``max_steps`` uses. Trips are counted per run; a clean turn "
+            "in between does not reset the count. ``0`` (default) applies the "
+            "platform rule: the second trip within a run stops it. 0 no longer "
+            "disables the check; a large value effectively does. The first trip "
+            "already arms one higher-effort turn (escalate_next)."
         ),
     )
     approval_required_tools: list[str] = Field(

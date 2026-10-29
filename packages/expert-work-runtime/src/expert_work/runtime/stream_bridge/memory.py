@@ -51,6 +51,8 @@ class _RunStream:
     #: 同源同临界区;None 时帧上不出现该字段(缺席 ≠ false)。
     end_completed: bool | None = None
     end_exit_reason: str | None = None
+    #: B-226 ⑥ —— the run's final failure ledger ``[{tool, kind}]``, same rule.
+    end_unresolved_failures: list[dict[str, Any]] | None = None
     #: 本 run 的发号器。**只允许在 ``condition`` 临界区内读写** —— 发号与入队
     #: 原子完成,订阅者看到的帧顺序因此恒等于 seq 顺序(见 ``StreamBridge.publish``)。
     next_seq: int = 0
@@ -147,6 +149,7 @@ class InMemoryStreamBridge(StreamBridge):
         artifacts: list[dict[str, Any]] | None = None,
         completed: bool | None = None,
         exit_reason: str | None = None,
+        unresolved_failures: list[dict[str, Any]] | None = None,
     ) -> None:
         stream = self._get_or_create_stream(run_id)
         async with stream.condition:
@@ -156,6 +159,7 @@ class InMemoryStreamBridge(StreamBridge):
             stream.end_artifacts = artifacts
             stream.end_completed = completed
             stream.end_exit_reason = exit_reason
+            stream.end_unresolved_failures = unresolved_failures
             stream.condition.notify_all()
 
     async def subscribe(
@@ -196,6 +200,8 @@ class InMemoryStreamBridge(StreamBridge):
                         end_data["completed"] = stream.end_completed
                     if stream.end_exit_reason is not None:
                         end_data["exit_reason"] = stream.end_exit_reason
+                    if stream.end_unresolved_failures is not None:
+                        end_data["unresolved_failures"] = stream.end_unresolved_failures
                     entry = StreamEvent(id=None, event=END_SENTINEL.event, data=end_data)
                 else:
                     try:

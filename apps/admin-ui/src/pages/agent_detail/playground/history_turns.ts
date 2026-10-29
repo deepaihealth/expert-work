@@ -33,6 +33,7 @@
  * matching the live/replayed rendering instead of flattening narration INTO
  * the answer.
  */
+import type { UnresolvedFailure } from "../../../api/run_completion";
 import type { HistoryMessage } from "../../../api/sessions";
 import { NON_TERMINAL_RUN_STATUSES } from "../../../api/runs";
 import type { RunTokens, ThreadRunSummary } from "../../../api/runs";
@@ -67,6 +68,13 @@ export interface HistoryTurn {
   /** P-1 —— 这一轮的消息已置墓碑(正文清理)。只有按 run_id 分组的路径能判:
    *  顺序配对路径下消息归不到具体的一轮,恒 ``false``。 */
   tombstone: boolean;
+  /** B-226 ⑥ — ``ThreadRunSummary.completed`` / ``exitReason``: the run row is
+   *  the source, so the turn shows "finished, not completed" before replay.
+   *  ``null`` / absent = no record. */
+  completed?: boolean | null;
+  exitReason?: string | null;
+  /** B-226 ⑥ — ``ThreadRunSummary.unresolvedFailures`` (why not done). */
+  unresolvedFailures?: UnresolvedFailure[] | null;
 }
 
 /** A row that can be a turn's input: a user row that is not platform
@@ -151,6 +159,9 @@ export function buildHistoryTurns(
         runError: r.error ?? null,
         supersededBy: r.supersededBy ?? null,
         tombstone: own.some((m) => m.tombstone === true),
+        completed: r.completed ?? null,
+        exitReason: r.exitReason ?? null,
+        unresolvedFailures: r.unresolvedFailures ?? null,
       };
     });
   }
@@ -204,5 +215,8 @@ export function buildHistoryTurns(
     // 的那种(没有 run 戳),只能给 false。
     supersededBy: r.supersededBy ?? null,
     tombstone: false,
+    completed: r.completed ?? null,
+    exitReason: r.exitReason ?? null,
+    unresolvedFailures: r.unresolvedFailures ?? null,
   }));
 }
