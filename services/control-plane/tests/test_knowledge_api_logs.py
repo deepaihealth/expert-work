@@ -344,7 +344,7 @@ async def _upload(setup: _Setup, base: str, filename: str, text: str) -> UUID:
         headers=_ADMIN,
     )
     assert uploaded.status_code == 202, uploaded.text
-    await setup.runner.drain()
+    await settle(setup.client, setup.runner, base, headers=_ADMIN)
     return UUID(uploaded.json()["id"])
 
 

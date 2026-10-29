@@ -322,7 +322,7 @@ async def test_responses_carry_every_key_the_console_reads(setup: _Setup) -> Non
         files={"file": ("guide.md", _GUIDE.encode(), "text/markdown")},
     )
     assert uploaded.status_code == 202, uploaded.text
-    await setup.app.state.knowledge_ingestion_runner.drain()
+    await settle(setup.client, setup.app.state.knowledge_ingestion_runner)
     tested = (
         await setup.client.post(
             "/v1/knowledge/bases/kb/test", json={"query": "pd7 pd8", "method": "keyword"}
