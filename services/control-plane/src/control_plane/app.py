@@ -2220,8 +2220,10 @@ def create_app(
                         local=knowledge_runner.local,
                         estimator=knowledge_estimator,
                         # B-222 PR-2: an estimate withdrawn on its deadline
-                        # is audited (actor ``system``).
+                        # is audited (actor ``system``), a deleted upload's
+                        # figures removed.
                         audit=resolved_audit,
+                        object_store=getattr(_app.state, "object_store", None),
                     )
                     knowledge_recovery_worker.start()
                     _app.state.knowledge_recovery_worker = knowledge_recovery_worker

@@ -62,7 +62,6 @@ from expert_work.persistence.knowledge.base import (
 )
 from expert_work.persistence.knowledge.estimates import (
     WAITING_STATUSES,
-    discarded_estimate,
     public_estimate,
     read_actual,
     reindex_fence_statuses,
@@ -1926,8 +1925,13 @@ class SqlKnowledgeStore(SqlEstimates, KnowledgeStore):
             if not row.has_pending or _writing_chunks(row):
                 await session.commit()
                 return _to_document(row)
+            if row.status in _WAITING_VALUES:
+                # B-222 PR-2: the estimate was for the bytes dropped — it goes too.
+                await SqlEstimates.discard_waiting_row(session, row, datetime.now(UTC))
+                await session.commit()
+                await session.refresh(row)
+                return _to_document(row)
             serving = row.chunk_count > 0
-            waiting = row.status in _WAITING_VALUES
             row.pending_content = None
             row.pending_content_sha256 = None
             row.status = (DocumentStatus.READY if serving else DocumentStatus.FAILED).value
@@ -1940,16 +1944,6 @@ class SqlKnowledgeStore(SqlEstimates, KnowledgeStore):
             row.claimed_at = None
             row.lease_until = None
             row.updated_at = datetime.now(UTC)
-            if waiting:
-                # B-222 PR-2: the estimate was for the bytes dropped — it goes too.
-                row.ingest_estimate = discarded_estimate(row.ingest_estimate)
-                row.confirm_by = None
-                await session.execute(
-                    delete(KnowledgeParseSnapshotRow).where(
-                        KnowledgeParseSnapshotRow.tenant_id == tenant_id,
-                        KnowledgeParseSnapshotRow.document_id == document_id,
-                    )
-                )
             await session.commit()
             await session.refresh(row)
             return _to_document(row)

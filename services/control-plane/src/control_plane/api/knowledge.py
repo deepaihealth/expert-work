@@ -22,7 +22,7 @@ import time
 from collections.abc import Mapping, Sequence
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Annotated, Any, Literal
+from typing import Annotated, Any, Final, Literal
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, File, HTTPException, Query, Request, Response, UploadFile
@@ -61,7 +61,7 @@ from expert_work.persistence.knowledge import (
     KnowledgeRetrievalLogStore,
 )
 from expert_work.persistence.knowledge.base import CancelOutcome, ReviewCounts
-from expert_work.persistence.knowledge.estimates import EstimateSummary
+from expert_work.persistence.knowledge.estimates import EstimateRefused, EstimateSummary
 from expert_work.protocol import (
     DEFAULT_CHUNK_MAX_TOKENS,
     DEFAULT_CHUNK_OVERLAP_TOKENS,
@@ -348,15 +348,47 @@ def _review_dict(counts: ReviewCounts | None) -> dict[str, int]:
 def _summary_dict(summary: EstimateSummary) -> dict[str, Any]:
     """B-222 PR-2 —— a base's documents being estimated or waiting for a
     confirmation: ``awaiting`` / ``total_micros`` / ``unpriced`` are the
-    confirmable ones (what 「全部确认」 confirms); duplicates apart."""
+    confirmable ones (what 「全部确认」 confirms, ``fingerprint`` naming
+    exactly which — the confirm sends it back); duplicates and estimates past
+    their deadline (being withdrawn) apart."""
     return {
         "estimating": summary.estimating,
         "awaiting": summary.awaiting,
         "duplicates": summary.duplicates,
+        "expired": summary.expired,
         "total_micros": summary.total_micros,
         "unpriced": summary.unpriced,
         "earliest_confirm_by": _iso(summary.earliest_confirm_by),
+        "fingerprint": summary.fingerprint,
     }
+
+
+#: B-222 —— the 409 detail for a document past the point of no return.
+DOCUMENT_BUSY: Final = {
+    "error": "document_busy",
+    "message": "the document's new version is being written; try again once it is ready",
+}
+
+
+def refused_409(exc: EstimateRefused) -> HTTPException:
+    """An estimate the store refused to start, as the API's 409."""
+    if exc.reason == "busy":
+        return HTTPException(status_code=409, detail=DOCUMENT_BUSY)
+    return HTTPException(status_code=409, detail={"error": exc.reason})
+
+
+async def _release_duplicates(
+    store: KnowledgeStore, runner: KnowledgeIngestionRunner | None, base: KnowledgeBase
+) -> None:
+    """K-21 ① (§7) —— after a document of ``base`` went away or lost its
+    bytes: copies of it are no longer duplicates; one never parsed is
+    estimated now (the recovery worker would within a cycle anyway)."""
+    released = await store.release_stale_duplicates(tenant_id=base.tenant_id, kb_id=base.id)
+    if runner is None:
+        return
+    for document in released:
+        if document.status is DocumentStatus.ESTIMATING:
+            runner.submit(tenant_id=base.tenant_id, document_id=document.id)
 
 
 #: B-222 PR-2 —— cancel outcomes of an ingest or estimate that may be running here.
@@ -398,6 +430,9 @@ async def _record_stopped(
             if outcome == "cancelled"
             else {"kb": base.name, "outcome": outcome},
         )
+    if any(outcome != "cancelled" for outcome in (outcomes[d] for d in stopped)):
+        store: KnowledgeStore = request.app.state.knowledge_store
+        await _release_duplicates(store, runner, base)
 
 
 def _chunk_dict(chunk: KnowledgeChunk, parent_index: int | None) -> dict[str, Any]:
@@ -479,7 +514,9 @@ async def _redrive(
     Neither byte slot is touched: the estimate (and then the ingest) takes
     the pending upload if there is one (retry a failed new version), else the
     serving bytes, even when they are unchanged. ``None``: the document is
-    gone (deleted meanwhile)."""
+    gone (deleted meanwhile).
+
+    :raises EstimateRefused: ``busy`` — its new chunks are being swapped in."""
     reset = await store.begin_estimate(tenant_id=tenant_id, document_id=document.id, origin=origin)
     if reset is not None:
         runner.submit(tenant_id=tenant_id, document_id=reset.id)
@@ -870,8 +907,11 @@ def build_knowledge_router() -> APIRouter:
             now=datetime.now(UTC),
         )
         document = start.document
+        if start.outcome == "busy":
+            # Its new chunks are being swapped in: nothing was touched.
+            raise HTTPException(status_code=409, detail=DOCUMENT_BUSY)
         # The same bytes the document is ready with, or already estimated /
-        # waiting with → nothing to do: 200 + ``unchanged``.
+        # waiting / queued / ingesting with → nothing to do: 200 + ``unchanged``.
         unchanged = start.outcome == "unchanged"
         if start.outcome == "estimating":
             # The runner re-reads bytes + chunking parameters at claim time,
@@ -996,6 +1036,7 @@ def build_knowledge_router() -> APIRouter:
         document_id: UUID,
         request: Request,
         store: Annotated[KnowledgeStore, Depends(_get_knowledge_store)],
+        runner: Annotated[KnowledgeIngestionRunner | None, Depends(_get_ingestion_runner)],
         audit: Annotated[AuditLogger, Depends(_get_audit)],
     ) -> Response:
         tenant_id: UUID = request.state.tenant_id
@@ -1011,6 +1052,7 @@ def build_knowledge_router() -> APIRouter:
             kb_id=document.kb_id if document is not None else base.id,
             document_id=document_id,
         )
+        await _release_duplicates(store, runner, base)  # B-222 PR-2: its copies
         await _audit_write(
             audit,
             request,
@@ -1038,7 +1080,12 @@ def build_knowledge_router() -> APIRouter:
         base = await _require_base(store, tenant_id, name)
         document = await _require_redrivable(store, runner, tenant_id, base, document_id)
         assert runner is not None  # noqa: S101 — checked above
-        reset = await _redrive(store, runner, tenant_id, document, origin=EstimateOrigin.REINGEST)
+        try:
+            reset = await _redrive(
+                store, runner, tenant_id, document, origin=EstimateOrigin.REINGEST
+            )
+        except EstimateRefused as exc:
+            raise refused_409(exc) from exc
         if reset is None:
             raise HTTPException(status_code=404, detail="document not found")
         await _audit_write(
@@ -1082,7 +1129,12 @@ def build_knowledge_router() -> APIRouter:
                 status_code=409,
                 detail="document has no page or picture that failed, waits or is past the limit",
             )
-        reset = await _redrive(store, runner, tenant_id, document, origin=EstimateOrigin.RECOGNIZE)
+        try:
+            reset = await _redrive(
+                store, runner, tenant_id, document, origin=EstimateOrigin.RECOGNIZE
+            )
+        except EstimateRefused as exc:
+            raise refused_409(exc) from exc
         if reset is None:
             raise HTTPException(status_code=404, detail="document not found")
         await _audit_write(
@@ -1164,10 +1216,13 @@ def build_knowledge_router() -> APIRouter:
         document_id: UUID,
         request: Request,
         store: Annotated[KnowledgeStore, Depends(_get_knowledge_store)],
+        runner: Annotated[KnowledgeIngestionRunner | None, Depends(_get_ingestion_runner)],
         audit: Annotated[AuditLogger, Depends(_get_audit)],
     ) -> JSONResponse:
         """Drop a pending (failed or in-flight) upload and keep serving the
-        previous version — the way back when a re-upload turned out bad."""
+        previous version — the way back when a re-upload turned out bad.
+        B-222 PR-2: a new upload re-uploaded while it waited goes back to
+        estimating its first bytes (still to be confirmed)."""
         tenant_id: UUID = request.state.tenant_id
         base = await _require_base(store, tenant_id, name)
         document = await store.get_document(tenant_id=tenant_id, document_id=document_id)
@@ -1185,6 +1240,9 @@ def build_knowledge_router() -> APIRouter:
                 status_code=409,
                 detail="the new version is being written and about to finish; it can't be dropped",
             )
+        if restored.status is DocumentStatus.ESTIMATING and runner is not None:
+            runner.submit(tenant_id=tenant_id, document_id=document_id)
+        await _release_duplicates(store, runner, base)  # its dropped bytes' copies
         await _audit_write(
             audit,
             request,

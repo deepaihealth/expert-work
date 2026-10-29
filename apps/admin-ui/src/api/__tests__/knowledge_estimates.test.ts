@@ -67,7 +67,12 @@ describe("estimate endpoints", () => {
   it("confirms by estimate id, or all with what the user saw", async () => {
     const calls = capture({ results: [], confirmed: [], withdrawn: [], estimate_summary: {} });
     await confirmDocuments("kb", [{ documentId: "d1", estimateId: "e1" }]);
-    await confirmAllDocuments("kb", { count: 2, totalMicros: 120_000, withdrawDuplicateIds: ["d3"] });
+    await confirmAllDocuments("kb", {
+      count: 2,
+      totalMicros: 120_000,
+      fingerprint: "f1",
+      withdrawDuplicateIds: ["d3"],
+    });
     expect(calls.map((c) => [c.method, new URL(c.uri, "http://x").pathname, c.data])).toEqual([
       [
         "post",
@@ -81,6 +86,7 @@ describe("estimate endpoints", () => {
           all: true,
           expected_count: 2,
           expected_total_micros: 120_000,
+          expected_fingerprint: "f1",
           withdraw_duplicate_ids: ["d3"],
         },
       ],

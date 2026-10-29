@@ -900,6 +900,7 @@ export interface TranslationKeys {
     estimate_confirm_all_other: string;
     estimate_withdraw_all: string;
     estimate_withdraw_all_confirm_title: string;
+    upload_queue_err_busy: string;
     estimate_withdraw_batch_confirm_title: string;
     estimate_withdraw_confirm_title: string;
     estimate_withdraw_confirm_body: string;
@@ -4620,7 +4621,8 @@ const en: TranslationKeys = {
     estimate_confirm_all_one: "Confirm {{count}}",
     estimate_confirm_all_other: "Confirm all {{count}}",
     estimate_withdraw_all: "Cancel all",
-    estimate_withdraw_all_confirm_title: "Withdraw every estimate waiting in this base?",
+    estimate_withdraw_all_confirm_title: "Withdraw the {{count}} estimate(s) waiting in this base now? (Uploads after this stay.)",
+    upload_queue_err_busy: "This document's previous version is writing its chunks — upload again in a moment.",
     estimate_withdraw_batch_confirm_title: "Withdraw this batch's estimates?",
     estimate_withdraw_confirm_title: "Withdraw the estimate of \"{{name}}\"?",
     estimate_withdraw_confirm_body: "Nothing has been billed. A new upload is removed with its file; a re-upload goes back to the previous version; a re-ingest goes back to how it was.",

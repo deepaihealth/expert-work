@@ -75,6 +75,8 @@ _VOLATILE = frozenset(
         "earliest_confirm_by",
         "confirmed_at",
         "finished_at",
+        # A hash of the waiting documents' (run-specific) ids.
+        "fingerprint",
     }
 )
 
@@ -169,6 +171,7 @@ async def _walk(store: KnowledgeStore) -> list[tuple[str, int, Any]]:
                 "all": True,
                 "expected_count": summary["awaiting"],
                 "expected_total_micros": summary["total_micros"],
+                "expected_fingerprint": summary["fingerprint"],
             }
             return await call(step, "POST", f"{docs}/confirm", json=expected)
 

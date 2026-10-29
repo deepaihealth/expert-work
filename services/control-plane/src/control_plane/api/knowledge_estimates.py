@@ -42,9 +42,11 @@ from control_plane.api.knowledge import (
     _record_stopped,
     _require_base,
     _summary_dict,
+    refused_409,
 )
 from control_plane.knowledge.ingestion import KnowledgeIngestionRunner
 from expert_work.persistence import KnowledgeStore
+from expert_work.persistence.knowledge.estimates import EstimateRefused
 from expert_work.protocol import AuditAction, DocumentStatus, KnowledgeBase
 from expert_work.runtime.audit.logger import AuditLogger
 
@@ -66,6 +68,9 @@ class _ConfirmBody(BaseModel):
     all: bool = False
     expected_count: int | None = Field(default=None, ge=0)
     expected_total_micros: int | None = Field(default=None, ge=0)
+    #: ``all``: ``estimate_summary.fingerprint`` as the user was shown it —
+    #: which estimates exactly they confirm.
+    expected_fingerprint: str | None = Field(default=None, max_length=128)
     #: ``all``: the duplicates the user was shown, withdrawn with it (「跳过 M
     #: 份副本」) — one that arrived since is left waiting.
     withdraw_duplicate_ids: list[UUID] = Field(default_factory=list, max_length=DOCUMENTS_PAGE_MAX)
@@ -75,8 +80,12 @@ class _ConfirmBody(BaseModel):
         if (self.documents is not None) == self.all:
             msg = "send either documents or all=true"
             raise ValueError(msg)
-        if self.all and (self.expected_count is None or self.expected_total_micros is None):
-            msg = "all=true needs expected_count and expected_total_micros"
+        if self.all and (
+            self.expected_count is None
+            or self.expected_total_micros is None
+            or self.expected_fingerprint is None
+        ):
+            msg = "all=true needs expected_count, expected_total_micros and expected_fingerprint"
             raise ValueError(msg)
         return self
 
@@ -167,11 +176,13 @@ def build_knowledge_estimates_router() -> APIRouter:
             )
         assert body.expected_count is not None  # noqa: S101 — the body validator
         assert body.expected_total_micros is not None  # noqa: S101
+        assert body.expected_fingerprint is not None  # noqa: S101
         result = await store.confirm_all(
             tenant_id=tenant_id,
             kb_id=base.id,
             expected_count=body.expected_count,
             expected_total_micros=body.expected_total_micros,
+            expected_fingerprint=body.expected_fingerprint,
             confirmed_by=confirmed_by,
             now=now,
             withdraw_duplicates=body.withdraw_duplicate_ids,
@@ -193,6 +204,8 @@ def build_knowledge_estimates_router() -> APIRouter:
                     {"document_id": str(doc_id), "outcome": outcome}
                     for doc_id, outcome in result.withdrawn.items()
                 ],
+                # Past their deadline meanwhile: being withdrawn, not confirmed.
+                "skipped": [str(doc_id) for doc_id in result.skipped],
                 "estimate_summary": _summary_dict(result.summary),
             }
         )
@@ -225,13 +238,19 @@ def build_knowledge_estimates_router() -> APIRouter:
         if estimate is None or estimate.duplicate_of is None:
             raise HTTPException(status_code=409, detail={"error": "not_duplicate"})
         # The upload's own origin: withdrawing it later still deletes a new
-        # upload / drops new bytes.
-        reset = await store.begin_estimate(
-            tenant_id=tenant_id,
-            document_id=document_id,
-            origin=estimate.origin,
-            allow_duplicate=True,
-        )
+        # upload / drops new bytes. Only the duplicate just read (rechecked
+        # with the row locked: withdrawn or re-uploaded meanwhile → 409).
+        try:
+            reset = await store.begin_estimate(
+                tenant_id=tenant_id,
+                document_id=document_id,
+                origin=estimate.origin,
+                allow_duplicate=True,
+                expect_status=DocumentStatus.AWAITING_CONFIRMATION,
+                expect_estimate_id=estimate.id,
+            )
+        except EstimateRefused as exc:
+            raise refused_409(exc) from exc
         if reset is None:
             raise HTTPException(status_code=404, detail="document not found")
         ready_runner.submit(tenant_id=tenant_id, document_id=document_id)

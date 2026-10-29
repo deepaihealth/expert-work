@@ -18,20 +18,25 @@ from expert_work.persistence.knowledge.estimates import (
     WAITING_STATUSES,
     ConfirmAllResult,
     ConfirmOutcome,
+    EstimateRefused,
     EstimateSummary,
     ExpiredEstimate,
     ParseSnapshot,
     UploadStart,
     WithdrawOutcome,
+    WithdrawPlan,
     actual_lands,
     begin_meta,
     capture_restore,
     checks_duplicates,
     confirm_outcome,
     confirmed,
+    discard_plan,
     duplicate_estimate,
     duplicate_ref,
+    duplicate_ref_id,
     estimate_id_of,
+    estimate_refusal,
     is_duplicate,
     is_estimated,
     is_expired,
@@ -39,10 +44,13 @@ from expert_work.persistence.knowledge.estimates import (
     meta_of,
     public_estimate,
     read_actual,
+    released_duplicate,
     summarize,
+    summary_matches,
     with_estimate,
     withdraw_plan,
     withdraws_with_confirm_all,
+    writing_chunks,
 )
 from expert_work.protocol import (
     SEARCHABLE_CHUNK_TYPES,
@@ -75,6 +83,15 @@ def _stage(value: str | None) -> IngestStage | None:
         return IngestStage(value) if value is not None else None
     except ValueError:
         return None
+
+
+#: Re-sending the bytes a document is being estimated, waiting or ingested
+#: with changes nothing (a confirmed ingest is not restarted).
+_UNDER_WAY = WAITING_STATUSES | {DocumentStatus.PENDING, DocumentStatus.PROCESSING}
+
+
+def _stage_value(document: KnowledgeDocument) -> str | None:
+    return document.stage.value if document.stage is not None else None
 
 
 def _error_code(value: str | None) -> IngestErrorCode | None:
@@ -165,6 +182,19 @@ class InMemoryEstimates:
 
     def _withdraw(self, document: KnowledgeDocument, now: datetime) -> WithdrawOutcome:
         plan = withdraw_plan(self._estimates.get(document.id), chunk_count=document.chunk_count)
+        return self._apply(document, plan, now)
+
+    def _discard_waiting(self, document: KnowledgeDocument, now: datetime) -> KnowledgeDocument:
+        """``discard_pending`` of a waiting document (:func:`discard_plan`)."""
+        plan = discard_plan(self._estimates.get(document.id), chunk_count=document.chunk_count)
+        self._apply(document, plan, now)
+        found = self._find(document.tenant_id, document.id)
+        assert found is not None  # noqa: S101 — a discard never deletes
+        return found
+
+    def _apply(
+        self, document: KnowledgeDocument, plan: WithdrawPlan, now: datetime
+    ) -> WithdrawOutcome:
         self._snapshots.pop(document.id, None)
         if plan.delete:
             self._documents.remove(document)
@@ -218,12 +248,13 @@ class InMemoryEstimates:
                 existing.status is DocumentStatus.READY
                 and self._sha256.get(existing.id) == content_sha256
             )
-            waiting_same = (
-                existing.status in WAITING_STATUSES
-                and self._estimated_sha(existing.id) == content_sha256
+            under_way_same = (
+                existing.status in _UNDER_WAY and self._estimated_sha(existing.id) == content_sha256
             )
-            if ready_same or waiting_same:
+            if ready_same or under_way_same:
                 return UploadStart(existing, "unchanged")
+            if writing_chunks(existing.status.value, _stage_value(existing)):
+                return UploadStart(existing, "busy")
             return self._reupload(existing, content, content_sha256, now)
         meta = begin_meta(
             status=None, raw=None, origin=EstimateOrigin.UPLOAD, allow_duplicate=False, restore=None
@@ -337,11 +368,22 @@ class InMemoryEstimates:
         document_id: UUID,
         origin: EstimateOrigin,
         allow_duplicate: bool = False,
+        expect_status: DocumentStatus | None = None,
+        expect_estimate_id: UUID | None = None,
     ) -> KnowledgeDocument | None:
         document = self._find(tenant_id, document_id)
         if document is None:
             return None
         raw = self._estimates.get(document_id)
+        refused = estimate_refusal(
+            status=document.status.value,
+            stage=_stage_value(document),
+            raw=raw,
+            expect_status=expect_status,
+            expect_estimate_id=expect_estimate_id,
+        )
+        if refused is not None:
+            raise EstimateRefused(refused)
         meta = begin_meta(
             status=document.status.value,
             raw=raw,
@@ -491,31 +533,45 @@ class InMemoryEstimates:
         kb_id: UUID,
         expected_count: int,
         expected_total_micros: int,
+        expected_fingerprint: str,
         confirmed_by: str | None,
         now: datetime,
         withdraw_duplicates: Sequence[UUID] = (),
     ) -> ConfirmAllResult:
         mine = [d for d in self._documents if d.tenant_id == tenant_id and d.kb_id == kb_id]
-        summary = summarize((d.status.value, self._estimates.get(d.id), d.confirm_by) for d in mine)
-        if summary.awaiting != expected_count or summary.total_micros != expected_total_micros:
+        summary = summarize(
+            ((d.id, d.status.value, self._estimates.get(d.id), d.confirm_by) for d in mine), now=now
+        )
+        if not summary_matches(
+            summary,
+            count=expected_count,
+            total_micros=expected_total_micros,
+            fingerprint=expected_fingerprint,
+        ):
             return ConfirmAllResult(matched=False, summary=summary)
         seen = frozenset(withdraw_duplicates)
         confirmed_ids: list[UUID] = []
+        skipped: list[UUID] = []
         withdrawn: dict[UUID, WithdrawOutcome] = {}
         for document in mine:
             if document.status is not DocumentStatus.AWAITING_CONFIRMATION:
                 continue
             raw = self._estimates.get(document.id)
+            if is_expired(document.confirm_by, now):
+                skipped.append(document.id)  # the expiry sweep withdraws it
+                continue
             if is_duplicate(raw) or not is_estimated(raw):
                 if withdraws_with_confirm_all(document.id, raw, seen):
                     withdrawn[document.id] = self._withdraw(document, now)
                 continue
-            if is_expired(document.confirm_by, now):
-                continue  # the expiry sweep withdraws it
             self._confirm(document, raw or {}, confirmed_by, now)
             confirmed_ids.append(document.id)
         return ConfirmAllResult(
-            matched=True, summary=summary, confirmed=tuple(confirmed_ids), withdrawn=withdrawn
+            matched=True,
+            summary=summary,
+            confirmed=tuple(confirmed_ids),
+            withdrawn=withdrawn,
+            skipped=tuple(skipped),
         )
 
     async def return_to_confirmation(
@@ -533,6 +589,7 @@ class InMemoryEstimates:
             document is None
             or document.status is not DocumentStatus.PROCESSING
             or document.ingest_generation != generation
+            or writing_chunks(document.status.value, _stage_value(document))
         ):
             return False
         raw = with_estimate(meta_of(self._estimates.get(document_id)), estimate)
@@ -616,12 +673,54 @@ class InMemoryEstimates:
             self._snapshots.pop(document_id, None)
         return True
 
-    async def estimate_summary(self, *, tenant_id: UUID, kb_id: UUID) -> EstimateSummary:
+    async def estimate_summary(
+        self, *, tenant_id: UUID, kb_id: UUID, now: datetime | None = None
+    ) -> EstimateSummary:
         return summarize(
-            (d.status.value, self._estimates.get(d.id), d.confirm_by)
-            for d in self._documents
-            if d.tenant_id == tenant_id and d.kb_id == kb_id
+            (
+                (d.id, d.status.value, self._estimates.get(d.id), d.confirm_by)
+                for d in self._documents
+                if d.tenant_id == tenant_id and d.kb_id == kb_id
+            ),
+            now=now or datetime.now(UTC),
         )
+
+    async def release_stale_duplicates(
+        self, *, tenant_id: UUID | None = None, kb_id: UUID | None = None
+    ) -> list[KnowledgeDocument]:
+        released: list[KnowledgeDocument] = []
+        for document in list(self._documents):
+            if (tenant_id is not None and document.tenant_id != tenant_id) or (
+                kb_id is not None and document.kb_id != kb_id
+            ):
+                continue
+            raw = self._estimates.get(document.id)
+            original_id = duplicate_ref_id(raw)
+            if document.status is not DocumentStatus.AWAITING_CONFIRMATION or original_id is None:
+                continue
+            if self._holds(document, original_id):
+                continue
+            assert raw is not None  # noqa: S101 — it names an original
+            status, kept = released_duplicate(raw)
+            update: dict[str, Any] = {"status": status, "updated_at": datetime.now(UTC)}
+            if status is DocumentStatus.ESTIMATING:
+                update |= {
+                    "ingest_generation": document.ingest_generation + 1,
+                    "attempts": 0,
+                    "confirm_by": None,
+                }
+                self._lease[document.id] = None
+            released.append(self._store_document(document, update, kept))
+        return released
+
+    def _holds(self, document: KnowledgeDocument, original_id: UUID) -> bool:
+        """The original still holds the bytes ``document`` waits with."""
+        original = self._find(document.tenant_id, original_id)
+        sha = self._estimated_sha(document.id)
+        if original is None or original.kb_id != document.kb_id or sha is None:
+            return False
+        pending = self._pending.get(original_id)
+        return self._sha256.get(original_id) == sha or (pending is not None and pending[1] == sha)
 
     async def chunk_hashes_on_model(
         self,

@@ -1,9 +1,14 @@
 /**
  * B-222 PR-2 — the documents tab's estimate actions: confirm (one, a batch,
- * or the base's 「全部确认」 with the count and total the user saw), withdraw
+ * or the base's 「全部确认」 with the very estimates the user saw), withdraw
  * (cancel an estimate: a new upload is deleted, anything else put back) and
  * 「仍入库」 for a duplicate. Each says what happened and calls ``onChanged``
  * so the table, the banner and the upload queue re-read.
+ *
+ * Requests carry at most :data:`ESTIMATE_IDS_PER_REQUEST` ids (the server's
+ * cap); a larger batch goes in several and the results are added up.
+ * 「全部取消」 withdraws exactly the documents waiting when its confirm opened
+ * (:func:`waitingIds`) — never one uploaded after.
  */
 import { useCallback, useMemo, useState } from "react";
 import { App } from "antd";
@@ -14,21 +19,34 @@ import {
   cancelDocuments,
   confirmAllDocuments,
   confirmDocuments,
+  ESTIMATE_IDS_PER_REQUEST,
   estimateDuplicate,
   listDocuments,
+  type CancelResult,
   type ConfirmResult,
   type EstimateSummary,
   type KnowledgeDocument,
 } from "../../api/knowledge";
 
-const WAITING_PAGE = 200;
+/** Pages of waiting documents read for 「全部取消」 at most (200 each). */
+const MAX_WAITING_PAGES = 50;
+
+export function inChunks<T>(items: T[], size: number = ESTIMATE_IDS_PER_REQUEST): T[][] {
+  const chunks: T[][] = [];
+  for (let start = 0; start < items.length; start += size) {
+    chunks.push(items.slice(start, start + size));
+  }
+  return chunks;
+}
 
 export interface EstimateActions {
   busy: boolean;
   confirm: (documents: KnowledgeDocument[], skip?: KnowledgeDocument[]) => Promise<void>;
   confirmAll: (summary: EstimateSummary) => Promise<void>;
   withdraw: (documents: KnowledgeDocument[]) => Promise<void>;
-  withdrawAll: () => Promise<void>;
+  /** The ids 「全部取消」 will withdraw: those waiting now. */
+  waitingIds: () => Promise<string[]>;
+  withdrawIds: (ids: string[]) => Promise<void>;
   ingestAnyway: (document: KnowledgeDocument) => Promise<void>;
 }
 
@@ -69,10 +87,11 @@ export function useEstimateActions(
     [message, t],
   );
 
-  const withdrawIds = useCallback(
+  const cancelAll = useCallback(
     async (ids: string[]) => {
       if (ids.length === 0) return;
-      const results = await cancelDocuments(baseName, ids);
+      const results: CancelResult[] = [];
+      for (const chunk of inChunks(ids)) results.push(...(await cancelDocuments(baseName, chunk)));
       const withdrawn = results.filter(
         (r) => r.outcome === "withdrawn" || r.outcome === "withdrawn_deleted",
       ).length;
@@ -87,10 +106,14 @@ export function useEstimateActions(
         const pairs = documents
           .filter((d) => d.ingest_estimate)
           .map((d) => ({ documentId: d.id, estimateId: d.ingest_estimate!.id }));
-        if (pairs.length > 0) reportConfirmed(await confirmDocuments(baseName, pairs));
-        await withdrawIds(skip.map((d) => d.id));
+        const results: ConfirmResult[] = [];
+        for (const chunk of inChunks(pairs)) {
+          results.push(...(await confirmDocuments(baseName, chunk)));
+        }
+        if (results.length > 0) reportConfirmed(results);
+        await cancelAll(skip.map((d) => d.id));
       }),
-    [baseName, reportConfirmed, run, withdrawIds],
+    [baseName, cancelAll, reportConfirmed, run],
   );
 
   const confirmAll = useCallback(
@@ -100,10 +123,12 @@ export function useEstimateActions(
           const result = await confirmAllDocuments(baseName, {
             count: summary.awaiting,
             totalMicros: summary.total_micros,
+            fingerprint: summary.fingerprint ?? "",
           });
           message.success(
             t("knowledge_page.estimate_confirmed", { count: result.confirmed.length }),
           );
+          if ((result.skipped ?? []).length > 0) message.warning(t("knowledge_page.estimate_expired"));
         } catch (err) {
           if (err instanceof ApiError && err.status === 409) {
             message.warning(t("knowledge_page.estimate_all_changed"));
@@ -116,28 +141,26 @@ export function useEstimateActions(
   );
 
   const withdraw = useCallback(
-    (documents: KnowledgeDocument[]) => run(() => withdrawIds(documents.map((d) => d.id))),
-    [run, withdrawIds],
+    (documents: KnowledgeDocument[]) => run(() => cancelAll(documents.map((d) => d.id))),
+    [cancelAll, run],
   );
 
-  const withdrawAll = useCallback(
-    () =>
-      run(async () => {
-        // Withdrawn documents leave the filter: read the first page again
-        // until none is left (bounded).
-        for (let round = 0; round < 50; round += 1) {
-          const page = await listDocuments(
-            baseName,
-            { limit: WAITING_PAGE, offset: 0 },
-            undefined,
-            { status: ["estimating", "awaiting_confirmation"] },
-          );
-          if (page.documents.length === 0) return;
-          await withdrawIds(page.documents.map((d) => d.id));
-        }
-      }),
-    [baseName, run, withdrawIds],
-  );
+  const waitingIds = useCallback(async () => {
+    const ids: string[] = [];
+    for (let page = 0; page < MAX_WAITING_PAGES; page += 1) {
+      const found = await listDocuments(
+        baseName,
+        { limit: ESTIMATE_IDS_PER_REQUEST, offset: page * ESTIMATE_IDS_PER_REQUEST },
+        undefined,
+        { status: ["estimating", "awaiting_confirmation"] },
+      );
+      ids.push(...found.documents.map((d) => d.id));
+      if (ids.length >= found.total || found.documents.length === 0) break;
+    }
+    return Array.from(new Set(ids));
+  }, [baseName]);
+
+  const withdrawIds = useCallback((ids: string[]) => run(() => cancelAll(ids)), [cancelAll, run]);
 
   const ingestAnyway = useCallback(
     (document: KnowledgeDocument) =>
@@ -149,7 +172,7 @@ export function useEstimateActions(
   );
 
   return useMemo(
-    () => ({ busy, confirm, confirmAll, withdraw, withdrawAll, ingestAnyway }),
-    [busy, confirm, confirmAll, withdraw, withdrawAll, ingestAnyway],
+    () => ({ busy, confirm, confirmAll, withdraw, waitingIds, withdrawIds, ingestAnyway }),
+    [busy, confirm, confirmAll, withdraw, waitingIds, withdrawIds, ingestAnyway],
   );
 }

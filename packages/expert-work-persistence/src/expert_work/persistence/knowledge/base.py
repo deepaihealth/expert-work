@@ -987,9 +987,16 @@ class KnowledgeStore(abc.ABC):
           bytes (serving or pending): ``awaiting_confirmation`` at once, with an
           unparsed estimate naming it (``duplicate_of``, nothing to pay,
           ``confirm_by`` = ``now`` + 7 days);
-        * ``estimating`` — otherwise.
+        * ``estimating`` — otherwise;
+        * ``busy`` — the document is past the point of no return (its new
+          chunks are being swapped in, ``estimates.writing_chunks``): nothing
+          is touched, upload again once it is ready.
 
-        Either way but ``unchanged``: ``ingest_generation`` bumped, ``attempts``
+        The same bytes already queued or being ingested (``pending`` /
+        ``processing``) are ``unchanged`` too: a confirmed ingest is not
+        restarted.
+
+        Either way but ``unchanged`` / ``busy``: ``ingest_generation`` bumped, ``attempts``
         0, lease, ``error`` / ``error_code`` cleared, ``stage=queued``; the
         estimate meta records the origin (``upload`` for a document this call
         created, else ``reupload``) and how to put the document back. A
@@ -1003,12 +1010,19 @@ class KnowledgeStore(abc.ABC):
         document_id: UUID,
         origin: EstimateOrigin,
         allow_duplicate: bool = False,
+        expect_status: DocumentStatus | None = None,
+        expect_estimate_id: UUID | None = None,
     ) -> KnowledgeDocument | None:
         """A re-ingest, 「补识别」, re-chunk or batch re-ingest of the bytes the
         document has (``origin``), or — ``allow_duplicate`` — a duplicate the
         user wants ingested anyway: ``estimating``, with the same resets as
         :meth:`begin_upload` (byte slots untouched); its snapshot is deleted.
-        ``None`` when there is no such document."""
+        ``None`` when there is no such document.
+
+        :raises ~expert_work.persistence.knowledge.estimates.EstimateRefused:
+            nothing changed — ``busy`` (past the point of no return), or the
+            document is no longer in ``expect_status`` / under
+            ``expect_estimate_id`` (checked with the row locked)."""
 
     @abc.abstractmethod
     async def finish_estimate(
@@ -1059,15 +1073,18 @@ class KnowledgeStore(abc.ABC):
         kb_id: UUID,
         expected_count: int,
         expected_total_micros: int,
+        expected_fingerprint: str,
         confirmed_by: str | None,
         now: datetime,
         withdraw_duplicates: Sequence[UUID] = (),
     ) -> ConfirmAllResult:
         """Confirm every confirmable document waiting in the base — only when
-        they still number ``expected_count`` and add up to
-        ``expected_total_micros`` (what the user was shown; checked with the
-        rows locked), else nothing changes. One past its ``confirm_by`` is
-        left for the expiry sweep. Duplicates are never confirmed by it; those
+        they are still exactly the estimates the user was shown
+        (``expected_fingerprint``, :attr:`EstimateSummary.fingerprint`) and
+        number ``expected_count`` and add up to ``expected_total_micros``
+        (checked with the rows locked), else nothing changes. One past its
+        ``confirm_by`` is not confirmable (``skipped``: left for the expiry
+        sweep). Duplicates are never confirmed by it; those
         of ``withdraw_duplicates`` (the ones the user was shown) still waiting
         as duplicates are withdrawn in the same transaction — never one that
         arrived since."""
@@ -1088,6 +1105,18 @@ class KnowledgeStore(abc.ABC):
         total rose past the threshold), so the document waits for the new one
         (``awaiting_confirmation`` until ``confirm_by``, lease released, the
         estimate meta kept, ``snapshot`` replacing the old one)."""
+
+    @abc.abstractmethod
+    async def release_stale_duplicates(
+        self, *, tenant_id: UUID | None = None, kb_id: UUID | None = None
+    ) -> list[KnowledgeDocument]:
+        """K-21 ①, §7 —— duplicates whose original no longer holds their
+        bytes (withdrawn, deleted, replaced) lose the mark
+        (:func:`~expert_work.persistence.knowledge.estimates.released_duplicate`):
+        a real estimate waits as a plain one; one never parsed goes
+        ``estimating`` (generation bumped) for the caller or the recovery
+        worker to estimate. Within ``tenant_id`` / ``kb_id`` when given, else
+        across tenants (caller bypasses RLS). Returns the documents changed."""
 
     @abc.abstractmethod
     async def expire_awaiting(self, *, now: datetime, limit: int) -> list[ExpiredEstimate]:
@@ -1128,7 +1157,9 @@ class KnowledgeStore(abc.ABC):
         was written."""
 
     @abc.abstractmethod
-    async def estimate_summary(self, *, tenant_id: UUID, kb_id: UUID) -> EstimateSummary:
+    async def estimate_summary(
+        self, *, tenant_id: UUID, kb_id: UUID, now: datetime | None = None
+    ) -> EstimateSummary:
         """The base's documents being estimated or waiting for a confirmation,
         added up (:func:`~expert_work.persistence.knowledge.estimates.summarize`)."""
 

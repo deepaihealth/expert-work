@@ -35,6 +35,7 @@ from control_plane.api.knowledge import (
     _get_ingestion_runner,
     _get_knowledge_store,
     _redrive,
+    _release_duplicates,
     _require_base,
 )
 from control_plane.knowledge.chunking import chunk_params_hash
@@ -47,6 +48,7 @@ from control_plane.tenant_scope import (
 )
 from expert_work.common.observability import current_trace_id_hex
 from expert_work.persistence import KnowledgeStore
+from expert_work.persistence.knowledge.estimates import EstimateRefused
 from expert_work.protocol import AuditAction, KnowledgeBase, KnowledgeDocument
 from expert_work.protocol.knowledge_estimate import EstimateOrigin
 from expert_work.runtime.audit.logger import AuditLogger
@@ -94,6 +96,23 @@ async def _base_documents(
     """The named documents that belong to ``base`` (others are absent)."""
     found = await store.get_documents(tenant_id=tenant_id, document_ids=document_ids)
     return {i: d for i, d in found.items() if d.kb_id == base.id}
+
+
+async def _redrive_or_reason(
+    store: KnowledgeStore,
+    runner: KnowledgeIngestionRunner,
+    tenant_id: UUID,
+    document: KnowledgeDocument,
+    origin: EstimateOrigin,
+) -> str | None:
+    """Re-drive one document of a batch; why it was skipped, if it was
+    (``not_found``: deleted meanwhile; ``busy``: its new chunks are being
+    swapped in)."""
+    try:
+        reset = await _redrive(store, runner, tenant_id, document, origin=origin)
+    except EstimateRefused as exc:
+        return exc.reason
+    return None if reset is not None else "not_found"
 
 
 def _runner_or_503(runner: KnowledgeIngestionRunner | None) -> KnowledgeIngestionRunner:
@@ -185,16 +204,11 @@ def build_knowledge_maintenance_router() -> APIRouter:
                 elif not document.has_content and not document.has_pending:
                     skipped.append(_skipped(document_id, "content_missing"))
                 elif (
-                    await _redrive(
-                        store,
-                        ready_runner,
-                        tenant_id,
-                        document,
-                        origin=EstimateOrigin.BATCH_REINGEST,
+                    outcome := await _redrive_or_reason(
+                        store, ready_runner, tenant_id, document, EstimateOrigin.BATCH_REINGEST
                     )
-                    is None
-                ):
-                    skipped.append(_skipped(document_id, "not_found"))  # deleted meanwhile
+                ) is not None:
+                    skipped.append(_skipped(document_id, outcome))
                 else:
                     done.append(document_id)
                     await _audit_document(
@@ -248,6 +262,7 @@ def build_knowledge_maintenance_router() -> APIRouter:
         body: _BatchDeleteBody,
         request: Request,
         store: Annotated[KnowledgeStore, Depends(_get_knowledge_store)],
+        runner: Annotated[KnowledgeIngestionRunner | None, Depends(_get_ingestion_runner)],
         audit: Annotated[AuditLogger, Depends(_get_audit)],
     ) -> JSONResponse:
         tenant_id: UUID = request.state.tenant_id
@@ -278,6 +293,8 @@ def build_knowledge_maintenance_router() -> APIRouter:
                 mine[document_id],
                 batch=True,
             )
+        if done:
+            await _release_duplicates(store, runner, base)  # B-222 PR-2: their copies
         await _audit_write(
             audit,
             request,
@@ -351,11 +368,12 @@ def build_knowledge_maintenance_router() -> APIRouter:
             elif len(queued) >= REINGEST_STALE_MAX:
                 remaining += 1  # the next call takes them
             elif (
-                await _redrive(
-                    store, ready_runner, tenant_id, document, origin=EstimateOrigin.REINGEST_STALE
+                outcome := await _redrive_or_reason(
+                    store, ready_runner, tenant_id, document, EstimateOrigin.REINGEST_STALE
                 )
-                is not None
-            ):
+            ) is not None:
+                skipped.append(_skipped(document.id, outcome))
+            else:
                 queued.append(str(document.id))
                 await _audit_document(
                     audit,

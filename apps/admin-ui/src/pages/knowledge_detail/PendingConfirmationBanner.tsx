@@ -5,6 +5,7 @@
  * not this page), so it survives a reload when the upload queue is gone.
  * Read-only viewers see the numbers; the buttons are disabled.
  */
+import { useState } from "react";
 import { Alert, Button, Popconfirm, Space, Switch, Typography } from "antd";
 import { useTranslation } from "react-i18next";
 
@@ -20,7 +21,10 @@ interface PendingConfirmationBannerProps {
   busy: boolean;
   onlyWaiting: boolean;
   onConfirmAll: () => void;
-  onWithdrawAll: () => void;
+  /** The waiting documents' ids, read when 「全部取消」's confirm opens. */
+  onPrepareWithdrawAll: () => Promise<string[]>;
+  /** Withdraw exactly those (one uploaded after the confirm opened stays). */
+  onWithdrawAll: (ids: string[]) => void;
   onOnlyWaitingChange: (on: boolean) => void;
 }
 
@@ -30,10 +34,13 @@ export function PendingConfirmationBanner({
   busy,
   onlyWaiting,
   onConfirmAll,
+  onPrepareWithdrawAll,
   onWithdrawAll,
   onOnlyWaitingChange,
 }: PendingConfirmationBannerProps) {
   const { t } = useTranslation();
+  /** What 「全部取消」 withdraws: read when its confirm opened (``null``: reading). */
+  const [withdrawIds, setWithdrawIds] = useState<string[] | null>(null);
   const waiting = summary ? summary.awaiting + summary.duplicates + summary.estimating : 0;
   if (!summary || (waiting === 0 && !onlyWaiting)) return null;
   const parts = [
@@ -75,9 +82,21 @@ export function PendingConfirmationBanner({
           </ReadonlyTooltip>
           <ReadonlyTooltip on={readonly}>
             <Popconfirm
-              title={t("knowledge_page.estimate_withdraw_all_confirm_title")}
+              title={t("knowledge_page.estimate_withdraw_all_confirm_title", {
+                count: withdrawIds?.length ?? 0,
+              })}
               description={t("knowledge_page.estimate_withdraw_confirm_body")}
-              onConfirm={onWithdrawAll}
+              onOpenChange={(open) => {
+                if (!open) return;
+                setWithdrawIds(null);
+                void onPrepareWithdrawAll()
+                  .then(setWithdrawIds)
+                  .catch(() => setWithdrawIds([]));
+              }}
+              okButtonProps={{ disabled: withdrawIds === null || withdrawIds.length === 0 }}
+              onConfirm={() => {
+                if (withdrawIds && withdrawIds.length > 0) onWithdrawAll(withdrawIds);
+              }}
               disabled={readonly || busy || waiting === 0}
             >
               <Button

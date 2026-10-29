@@ -16,6 +16,7 @@ from __future__ import annotations
 import asyncio
 import threading
 from collections.abc import Iterator, Sequence
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any
 from uuid import UUID, uuid4
@@ -24,15 +25,27 @@ import pytest
 
 from control_plane.knowledge import parse_snapshot
 from control_plane.knowledge.estimate import IngestEstimator
-from control_plane.knowledge.ingestion import KnowledgeIngestionRunner, shutdown_parse_pool
+from control_plane.knowledge.ingestion import (
+    KnowledgeIngestionRunner,
+    StaleIngestionError,
+    _ModelsGuard,
+    shutdown_parse_pool,
+)
+from control_plane.knowledge.recognition.clients import Reading
+from control_plane.knowledge.recognition.figure_pipeline import FigureDescriber
 from control_plane.knowledge.recognition.ingest_parse import LocalParse
+from control_plane.knowledge.recognition.recognizer import (
+    DocumentRecognizer,
+    ModelChoice,
+    RecognitionSettings,
+)
 from control_plane.knowledge.recovery import KnowledgeIngestRecoveryWorker
 from expert_work.persistence import InMemoryKnowledgeStore
 from expert_work.persistence.knowledge.base import ClaimedIngestion, ParseSnapshot
 from expert_work.protocol import DocumentStatus, KnowledgeDocument
 from expert_work.protocol.knowledge_estimate import EstimateModels
 from orchestrator.llm import FakeEmbedder
-from tests.knowledge_form_fixtures import MIXED_DOCS
+from tests.knowledge_form_fixtures import MIXED_DOCS, PICTURE_DOCS, FormDoc
 
 _TENANT = uuid4()
 _TEXT = "\n\n".join(f"Paragraph {i}: the deductible of plan {i} is {i}00 yuan." for i in range(5))
@@ -88,8 +101,63 @@ class _Stuck(_Keyed):
 class _SwitchedModels(IngestEstimator):
     """Every model check after the confirmation finds a model switched."""
 
+    checks = 0
+
     async def models_changed(self, claim: ClaimedIngestion, confirmed: EstimateModels) -> bool:
+        type(self).checks += 1
         return True
+
+
+@dataclass
+class _Paid:
+    """Fake recognition and description models, counting their paid calls."""
+
+    reads: int = 0
+    descriptions: int = 0
+
+    def reader(self, choice: ModelChoice, key: str) -> _PaidReader:
+        return _PaidReader(self)
+
+    def describer(
+        self, choice: ModelChoice, key: str, prompt: str, user: str, cap: int
+    ) -> _PaidDescriber:
+        return _PaidDescriber(self)
+
+
+@dataclass
+class _PaidReader:
+    paid: _Paid
+
+    async def read(self, image: bytes) -> Reading:
+        self.paid.reads += 1
+        return Reading(text="Scanned page text.")
+
+
+@dataclass
+class _PaidDescriber:
+    paid: _Paid
+
+    async def read(self, image: bytes) -> Reading:
+        self.paid.descriptions += 1
+        return Reading(
+            text='{"text": "none", "chart": false, "description": "A photo."}',
+            finish_reason="stop",
+        )
+
+
+@dataclass
+class _Recognition:
+    async def recognition_settings(self) -> RecognitionSettings:
+        return RecognitionSettings(
+            primary=ModelChoice("glm", "glm-ocr"),
+            fallback=None,
+            max_pages=1000,
+            figure=ModelChoice("qwen", "qwen3.8-flash"),
+        )
+
+
+async def _api_key(*, tenant_id: UUID, provider: str) -> str:
+    return f"key-{provider}"
 
 
 async def _waiting(
@@ -284,3 +352,101 @@ async def test_a_shutdown_of_the_recovery_worker_keeps_the_snapshot_too() -> Non
     await asyncio.gather(cycle, return_exceptions=True)
 
     assert await _snapshot_of(store, waiting) is not None
+
+
+# -- B2b review M6: no paid call after a model switch ------------------------------
+
+
+@pytest.mark.parametrize(
+    "doc",
+    [MIXED_DOCS[0], PICTURE_DOCS[0]],
+    ids=["scanned-page-recognition", "picture-description"],
+)
+@pytest.mark.usefixtures("no_semantic_breaks")
+async def test_a_model_switch_mid_ingest_pays_for_no_recognition_or_description(
+    doc: FormDoc,
+) -> None:
+    store = InMemoryKnowledgeStore()
+    paid = _Paid()
+    settings = _Recognition()
+    recognizer = DocumentRecognizer(
+        store=store, settings=settings, api_keys=_api_key, client_factory=paid.reader
+    )
+    figures = FigureDescriber(
+        store=store,
+        settings=settings,
+        api_keys=_api_key,
+        recognizer=recognizer,
+        client_factory=paid.describer,
+    )
+    embedder = _Keyed("acme/embed-1")
+    runner = KnowledgeIngestionRunner(
+        store=store,
+        embedder=embedder,
+        recognizer=recognizer,
+        figures=figures,
+        estimator=_SwitchedModels(store=store, settings=settings, recognizer=recognizer),
+    )
+    waiting = await _waiting(store, runner, doc.filename, doc.raw)
+
+    await runner.submit(tenant_id=_TENANT, document_id=waiting.id)
+
+    assert (paid.reads, paid.descriptions, embedder.calls) == (0, 0, 0)
+    back = await store.get_document(tenant_id=_TENANT, document_id=waiting.id)
+    assert back is not None and back.status is DocumentStatus.AWAITING_CONFIRMATION
+
+
+def _claim_of(document: KnowledgeDocument) -> ClaimedIngestion:
+    return ClaimedIngestion(
+        tenant_id=_TENANT,
+        document_id=document.id,
+        kb_id=document.kb_id,
+        filename=document.filename,
+        content=_TEXT.encode(),
+        content_sha256="sha",
+        chunk_max_tokens=400,
+        chunk_overlap_tokens=0,
+        attempts=1,
+        generation=document.ingest_generation,
+    )
+
+
+class _BrokenStore(InMemoryKnowledgeStore):
+    sent_back = 0
+
+    async def return_to_confirmation(self, **kwargs: Any) -> bool:
+        type(self).sent_back += 1
+        msg = "database went away"
+        raise RuntimeError(msg)
+
+
+async def test_the_models_guard_fails_closed_and_checks_once() -> None:
+    store = _BrokenStore()
+    base = await store.create_base(tenant_id=_TENANT, name="kb")
+    document = await store.upsert_document(
+        tenant_id=_TENANT, kb_id=base.id, filename="a.md", content=_TEXT.encode()
+    )
+    estimator = _SwitchedModels(store=store)
+    _SwitchedModels.checks = 0
+    confirmed = await estimator.estimate(
+        _claim_of(document),
+        LocalParse(kind="text", figures_on=False, markdown=_TEXT),
+        embedding_model="acme/embed-1",
+        now=datetime.now(UTC),
+    )
+    guard = _ModelsGuard(
+        store,
+        estimator,
+        _claim_of(document),
+        LocalParse(kind="text", figures_on=False, markdown=_TEXT),
+        confirmed,
+    )
+
+    outcomes = await asyncio.gather(*(guard() for _ in range(5)), return_exceptions=True)
+
+    # Sending it back failed, yet every caller is refused; checked and sent back once.
+    assert all(isinstance(outcome, StaleIngestionError) for outcome in outcomes)
+    assert (_SwitchedModels.checks, _BrokenStore.sent_back) == (1, 1)
+    with pytest.raises(StaleIngestionError):
+        await guard()
+    assert _SwitchedModels.checks == 1

@@ -662,10 +662,17 @@ export interface EstimateSummary {
   estimating: number;
   awaiting: number;
   duplicates: number;
+  /** Past their 7 days, being withdrawn: not confirmable. */
+  expired?: number;
   total_micros: number;
   unpriced: boolean;
   earliest_confirm_by: string | null;
+  /** Names exactly which estimates are confirmable — 「全部确认」 sends it back. */
+  fingerprint?: string;
 }
+
+/** Most ids one confirm / cancel request takes (the server's cap). */
+export const ESTIMATE_IDS_PER_REQUEST = 200;
 
 export type ConfirmOutcome =
   | "confirmed"
@@ -697,16 +704,24 @@ export async function confirmDocuments(
 export interface ConfirmAllResult {
   confirmed: string[];
   withdrawn: { document_id: string; outcome: "withdrawn" | "withdrawn_deleted" }[];
+  /** Past their deadline meanwhile: being withdrawn, not confirmed. */
+  skipped?: string[];
   estimate_summary: EstimateSummary;
 }
 
-/** 「全部确认」: every confirmable estimate of the base, provided they still
- *  number and add up to what the user saw (else ``ApiError`` 409 with
- *  ``details.error === "estimate_changed"`` and the summary now). The
- *  duplicates named are withdrawn with it. */
+/** 「全部确认」: every confirmable estimate of the base, provided they are
+ *  still the very estimates the user saw (``fingerprint``) and number and add
+ *  up to it (else ``ApiError`` 409 with ``details.error ===
+ *  "estimate_changed"`` and the summary now). The duplicates named are
+ *  withdrawn with it. */
 export async function confirmAllDocuments(
   baseName: string,
-  expected: { count: number; totalMicros: number; withdrawDuplicateIds?: string[] },
+  expected: {
+    count: number;
+    totalMicros: number;
+    fingerprint: string;
+    withdrawDuplicateIds?: string[];
+  },
 ): Promise<ConfirmAllResult> {
   const response = await apiClient.post<ConfirmAllResult>(
     `/v1/knowledge/bases/${encodeURIComponent(baseName)}/documents/confirm`,
@@ -714,6 +729,7 @@ export async function confirmAllDocuments(
       all: true,
       expected_count: expected.count,
       expected_total_micros: expected.totalMicros,
+      expected_fingerprint: expected.fingerprint,
       withdraw_duplicate_ids: expected.withdrawDuplicateIds ?? [],
     },
   );

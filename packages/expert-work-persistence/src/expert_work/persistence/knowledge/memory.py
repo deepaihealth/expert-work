@@ -22,11 +22,7 @@ from expert_work.persistence.knowledge.base import (
     ParseCacheKind,
     _Unset,
 )
-from expert_work.persistence.knowledge.estimates import (
-    WAITING_STATUSES,
-    discarded_estimate,
-    reindex_fence_statuses,
-)
+from expert_work.persistence.knowledge.estimates import WAITING_STATUSES, reindex_fence_statuses
 from expert_work.persistence.knowledge.memory_estimates import HeldSnapshot, InMemoryEstimates
 from expert_work.persistence.knowledge.passages import (
     SWITCH_OFF_REVISION,
@@ -694,27 +690,24 @@ class InMemoryKnowledgeStore(InMemoryEstimates, KnowledgeStore):
             return None
         if document_id not in self._pending or _writing_chunks(document):
             return document
-        del self._pending[document_id]
-        serving = document.chunk_count > 0
-        update: dict[str, Any] = {
-            "status": DocumentStatus.READY if serving else DocumentStatus.FAILED,
-            "error": None if serving else _DISCARDED_ERROR,
-            "error_code": None,
-            "stage": IngestStage.READY if serving else document.stage,
-            "has_pending": False,
-            "ingest_generation": document.ingest_generation + 1,
-            "attempts": 0,
-            "updated_at": datetime.now(UTC),
-        }
         if document.status in WAITING_STATUSES:
             # B-222 PR-2: the estimate was for the bytes dropped — it goes too.
-            previous = discarded_estimate(self._estimates.get(document_id))
-            self._snapshots.pop(document_id, None)
-            update["confirm_by"] = None
-            restored = self._store_document(document, update, previous)
-        else:
-            restored = document.model_copy(update=update)
-            self._documents[self._documents.index(document)] = restored
+            return self._discard_waiting(document, datetime.now(UTC))
+        del self._pending[document_id]
+        serving = document.chunk_count > 0
+        restored = document.model_copy(
+            update={
+                "status": DocumentStatus.READY if serving else DocumentStatus.FAILED,
+                "error": None if serving else _DISCARDED_ERROR,
+                "error_code": None,
+                "stage": IngestStage.READY if serving else document.stage,
+                "has_pending": False,
+                "ingest_generation": document.ingest_generation + 1,
+                "attempts": 0,
+                "updated_at": datetime.now(UTC),
+            }
+        )
+        self._documents[self._documents.index(document)] = restored
         self._lease[document_id] = None
         return restored
 

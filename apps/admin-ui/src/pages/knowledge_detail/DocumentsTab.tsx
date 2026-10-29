@@ -264,6 +264,10 @@ export function DocumentsTab({
         if (err instanceof ApiError && err.status === 503) {
           throw new Error(t("knowledge_page.embedder_missing"));
         }
+        if (err instanceof ApiError && err.status === 409 && err.details?.error === "document_busy") {
+          // B-222: its previous upload is writing its chunks — retry in a moment.
+          throw new Error(t("knowledge_page.upload_queue_err_busy"));
+        }
         if (err instanceof ApiError && err.status === 413) {
           const serverLimit = err.details?.limit_bytes;
           // Only quote a number the server actually sent — the client cap
@@ -803,7 +807,8 @@ export function DocumentsTab({
         busy={estimates.busy}
         onlyWaiting={onlyWaiting}
         onConfirmAll={() => estimateSummary && void estimates.confirmAll(estimateSummary)}
-        onWithdrawAll={() => void estimates.withdrawAll()}
+        onPrepareWithdrawAll={estimates.waitingIds}
+        onWithdrawAll={(ids) => void estimates.withdrawIds(ids)}
         onOnlyWaitingChange={handleOnlyWaiting}
       />
 

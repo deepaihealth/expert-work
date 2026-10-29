@@ -8,7 +8,10 @@ import hashlib
 from datetime import UTC, datetime, timedelta
 from uuid import UUID
 
+import pytest
+
 from control_plane.audit import build_default_audit_logger
+from control_plane.knowledge import recovery
 from control_plane.knowledge.recovery import KnowledgeIngestRecoveryWorker
 from control_plane.settings import DEFAULT_DEV_TENANT_ID
 from expert_work.persistence import InMemoryKnowledgeStore
@@ -119,6 +122,42 @@ async def test_an_estimate_past_its_deadline_is_withdrawn_and_audited_as_system(
         )
     ]
     assert store.purges == 1
+
+
+async def test_an_expired_new_upload_loses_its_figures_and_frees_its_copies(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Review L7 + M5: as a user's withdrawal does."""
+    deleted: list[UUID | None] = []
+
+    async def record(store: object, *, tenant_id: UUID, kb_id: UUID, document_id: UUID) -> None:
+        deleted.append(document_id)
+
+    monkeypatch.setattr(recovery, "delete_figures_quietly", record)
+    store, audit = _Store(), InMemoryAuditLogStore()
+    now = datetime.now(UTC)
+    original = await _waiting(store, "old.md", confirm_by=now - timedelta(minutes=1))
+    kb = await store.get_base(tenant_id=_TENANT, name="kb")
+    assert kb is not None
+    body = b"# old.md\n\ntext"
+    copy = await store.begin_upload(
+        tenant_id=_TENANT,
+        kb_id=kb.id,
+        filename="copy.md",
+        content=body,
+        content_sha256=hashlib.sha256(body).hexdigest(),
+        now=now,
+    )
+    assert copy.outcome == "duplicate"
+
+    await _worker(store, audit).run_once()
+
+    assert deleted == [original]
+    freed = await store.get_document(tenant_id=_TENANT, document_id=copy.document.id)
+    # Released, then estimated by the same cycle's claims.
+    assert freed is not None and freed.ingest_estimate is not None
+    assert freed.status is DocumentStatus.AWAITING_CONFIRMATION
+    assert freed.ingest_estimate.duplicate_of is None
 
 
 async def test_a_failing_expiry_sweep_leaves_the_claims_of_the_cycle_alone() -> None:

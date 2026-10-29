@@ -8,7 +8,7 @@
  * every amount and disables every action.
  */
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { render, screen, waitFor, within } from "@testing-library/react";
+import { act, render, renderHook, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { App } from "antd";
 import i18n from "../../../i18n";
@@ -16,6 +16,7 @@ import i18n from "../../../i18n";
 import { ApiError } from "../../../api/client";
 import * as knowledgeSdk from "../../../api/knowledge";
 import { DocumentsTab } from "../DocumentsTab";
+import { useEstimateActions } from "../useEstimateActions";
 
 const BASE_NAME = "support-docs";
 const IN_7_DAYS = new Date(Date.now() + 6.5 * 24 * 3600 * 1000).toISOString();
@@ -110,6 +111,7 @@ const SUMMARY: knowledgeSdk.EstimateSummary = {
   total_micros: 120_000,
   unpriced: false,
   earliest_confirm_by: IN_7_DAYS,
+  fingerprint: "fp-shown",
 };
 
 function docPage(
@@ -209,7 +211,11 @@ describe("DocumentsTab — estimates (B-222 PR-2)", () => {
     expect(banner).toHaveTextContent("withdrawn automatically unless confirmed within 7 days");
     await userEvent.click(screen.getByTestId("doc-estimate-confirm-all"));
     await waitFor(() =>
-      expect(all).toHaveBeenCalledWith(BASE_NAME, { count: 2, totalMicros: 120_000 }),
+      expect(all).toHaveBeenCalledWith(BASE_NAME, {
+        count: 2,
+        totalMicros: 120_000,
+        fingerprint: "fp-shown",
+      }),
     );
   });
 
@@ -280,5 +286,57 @@ describe("DocumentsTab — estimates (B-222 PR-2)", () => {
     );
     expect(screen.getByTestId(`doc-confirm-${PAID.id}`)).toHaveTextContent("确认入库");
     expect(screen.getByTestId(`doc-ingest-anyway-${COPY.id}`)).toHaveTextContent("仍入库");
+  });
+
+  it("「全部取消」 withdraws only what was waiting when its confirm opened (review M3)", async () => {
+    const late = doc("d0000000-0000-0000-0000-000000000009", "awaiting_confirmation", {
+      ingest_estimate: estimate("e9"),
+      confirm_by: IN_7_DAYS,
+    });
+    let waiting = [FREE, PAID];
+    vi.spyOn(knowledgeSdk, "listDocuments").mockImplementation(
+      async (_base, _page, _scope, options) =>
+        options?.status ? docPage(waiting) : docPage([FREE, PAID]),
+    );
+    const cancel = vi.spyOn(knowledgeSdk, "cancelDocuments").mockResolvedValue([]);
+
+    renderTab();
+    await userEvent.click(await screen.findByTestId("doc-estimate-withdraw-all"));
+    expect(
+      await screen.findByText(/Withdraw the 2 estimate\(s\) waiting in this base now/),
+    ).toBeInTheDocument();
+    waiting = [FREE, PAID, late]; // uploaded after the confirm opened
+    await confirmPopover("OK");
+
+    await waitFor(() => expect(cancel).toHaveBeenCalledTimes(1));
+    expect(cancel).toHaveBeenCalledWith(BASE_NAME, [FREE.id, PAID.id]);
+  });
+});
+
+describe("estimate actions — more than one request's worth (review M4)", () => {
+  function many(count: number): knowledgeSdk.KnowledgeDocument[] {
+    return Array.from({ length: count }, (_, i) =>
+      doc(`d${String(i).padStart(7, "0")}-0000-0000-0000-000000000000`, "awaiting_confirmation", {
+        ingest_estimate: estimate(`e${i}`),
+      }),
+    );
+  }
+
+  it("confirms and withdraws in chunks of 200 and adds the results up", async () => {
+    const confirm = vi
+      .spyOn(knowledgeSdk, "confirmDocuments")
+      .mockImplementation(async (_base, items) =>
+        items.map((item) => ({ document_id: item.documentId, outcome: "confirmed" as const })),
+      );
+    const cancel = vi.spyOn(knowledgeSdk, "cancelDocuments").mockResolvedValue([]);
+    const { result } = renderHook(() => useEstimateActions(BASE_NAME, () => undefined), {
+      wrapper: ({ children }) => <App>{children}</App>,
+    });
+
+    await act(() => result.current.confirm(many(250), many(201)));
+
+    expect(confirm.mock.calls.map((call) => call[1].length)).toEqual([200, 50]);
+    expect(cancel.mock.calls.map((call) => call[1].length)).toEqual([200, 1]);
+    expect(await screen.findByText("Confirmed 250 documents; ingesting.")).toBeInTheDocument();
   });
 });

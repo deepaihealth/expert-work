@@ -40,6 +40,7 @@ from control_plane.knowledge.ingestion import (
 )
 from control_plane.knowledge.parsed_size import DocumentTooLargeError, Hold, reserve_raw_bytes
 from control_plane.knowledge.recognition.figure_pipeline import FigureDescriber
+from control_plane.knowledge.recognition.figure_storage import delete_figures_quietly
 from control_plane.knowledge.recognition.recognizer import DocumentRecognizer
 from control_plane.knowledge.usage import IngestSpend, IngestUsageRecorder, spend_scope
 from expert_work.common.observability import current_trace_id_hex, expert_work_counter
@@ -50,6 +51,7 @@ from expert_work.persistence.rls import bypass_rls_var, current_tenant_id_var
 from expert_work.protocol import AuditAction, DocumentStatus, IngestErrorCode
 from expert_work.protocol.knowledge_estimate import IngestOutcome
 from expert_work.runtime.audit.logger import AuditLogger
+from expert_work.runtime.storage import ObjectStore
 from orchestrator.llm import Embedder
 
 logger = logging.getLogger("expert_work.control_plane.knowledge.recovery")
@@ -100,11 +102,14 @@ class KnowledgeIngestRecoveryWorker:
         local: LocalIngests | None = None,
         estimator: IngestEstimator | None = None,
         audit: AuditLogger | None = None,
+        object_store: ObjectStore | None = None,
     ) -> None:
         if interval_s <= 0:
             msg = "interval_s must be positive"
             raise ValueError(msg)
         self._store = store
+        #: B-222 PR-2 —— a new upload withdrawn on its deadline loses its figures too.
+        self._object_store = object_store
         self._embedder = embedder
         self._recognizer = recognizer
         self._usage = usage
@@ -209,15 +214,18 @@ class KnowledgeIngestRecoveryWorker:
         """B-222 PR-2 (§6.5) —— withdraw the estimates nobody confirmed by their
         deadline (a new upload deleted, anything else put back as it was), one
         ``knowledge:document_estimate_expired`` audit row each (actor
-        ``system``), and drop parse snapshots past their lifetime. Several pods
-        sweeping at once withdraw each estimate once. A failure here is logged
-        and leaves the claims of this cycle alone."""
+        ``system``; a deleted upload's figures removed), drop parse snapshots
+        past their lifetime, and release duplicates whose original is gone
+        (one never parsed goes ``estimating``: this cycle's claims pick it
+        up). Several pods sweeping at once withdraw each estimate once. A
+        failure here is logged and leaves the claims of this cycle alone."""
         token_bypass = bypass_rls_var.set(True)
         token_tenant = current_tenant_id_var.set(None)
         try:
             now = datetime.now(UTC)
             expired = await self._store.expire_awaiting(now=now, limit=_EXPIRE_BATCH)
             purged = await self._store.purge_expired_snapshots(now=now)
+            released = await self._store.release_stale_duplicates()
         except Exception:
             _cycle_errors.inc()
             logger.exception("knowledge.recovery.expire_failed")
@@ -230,7 +238,16 @@ class KnowledgeIngestRecoveryWorker:
             logger.info("knowledge.recovery.estimates_expired count=%d", len(expired))
         if purged:
             logger.info("knowledge.recovery.snapshots_purged count=%d", purged)
+        if released:
+            logger.info("knowledge.recovery.duplicates_released count=%d", len(released))
         for withdrawn in expired:
+            if withdrawn.outcome == "withdrawn_deleted":
+                await delete_figures_quietly(
+                    self._object_store,
+                    tenant_id=withdrawn.tenant_id,
+                    kb_id=withdrawn.kb_id,
+                    document_id=withdrawn.document_id,
+                )
             await self._audit_expired(withdrawn)
 
     async def _audit_expired(self, withdrawn: ExpiredEstimate) -> None:

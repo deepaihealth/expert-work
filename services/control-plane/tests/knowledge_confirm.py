@@ -27,6 +27,7 @@ async def confirm_all(
                 "all": True,
                 "expected_count": summary["awaiting"],
                 "expected_total_micros": summary["total_micros"],
+                "expected_fingerprint": summary["fingerprint"],
             },
             headers=headers,
         )

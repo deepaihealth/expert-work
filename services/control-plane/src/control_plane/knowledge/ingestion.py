@@ -1149,39 +1149,70 @@ class _KeyedEmbedder:
         return await self.inner.embed(texts, tenant_id=tenant_id)
 
 
-def _models_guard(
-    store: KnowledgeStore,
-    estimator: IngestEstimator,
-    claim: ClaimedIngestion,
-    local: LocalParse,
-    confirmed: IngestEstimate,
-) -> BatchGuard:
+class _ModelsGuard:
     """§14 ④ —— before a recognition batch or figure call of a confirmed
     ingest: the recognition / figure model it would use now is still the one
     the user confirmed, else the document goes back for a confirmation of a
     fresh estimate (what is cached by now is not counted again) and the
-    ingest stops, writing nothing more."""
+    ingest stops, writing nothing more.
 
-    async def guard() -> None:
-        if not await estimator.models_changed(claim, confirmed.models):
-            return
-        now = datetime.now(UTC)
-        fresh = await estimator.estimate(
-            claim, local, embedding_model=confirmed.models.embedding, now=now
+    Fails closed (B2b review M6): once a switch is seen every later call is
+    refused with the same :class:`StaleIngestionError` — whatever goes wrong
+    sending the document back — and the check, re-estimate and snapshot run
+    once per claim however many figure calls ask at the same time (a lock)."""
+
+    def __init__(
+        self,
+        store: KnowledgeStore,
+        estimator: IngestEstimator,
+        claim: ClaimedIngestion,
+        local: LocalParse,
+        confirmed: IngestEstimate,
+    ) -> None:
+        self._store = store
+        self._estimator = estimator
+        self._claim = claim
+        self._local = local
+        self._confirmed = confirmed
+        self._lock = asyncio.Lock()
+        self.refusal: StaleIngestionError | None = None
+
+    async def __call__(self) -> None:
+        if self.refusal is not None:
+            raise self.refusal
+        async with self._lock:
+            if self.refusal is not None:
+                raise self.refusal
+            if not await self._estimator.models_changed(self._claim, self._confirmed.models):
+                return
+            claim = self._claim
+            self.refusal = StaleIngestionError(
+                f"document {claim.document_id}: a model changed since its estimate was confirmed"
+            )
+            try:
+                await self._send_back()
+            except Exception:
+                logger.warning(
+                    "knowledge.estimate_reconfirm_failed document=%s",
+                    claim.document_id,
+                    exc_info=True,
+                )
+            raise self.refusal
+
+    async def _send_back(self) -> None:
+        claim, now = self._claim, datetime.now(UTC)
+        fresh = await self._estimator.estimate(
+            claim, self._local, embedding_model=self._confirmed.models.embedding, now=now
         )
-        await store.return_to_confirmation(
+        await self._store.return_to_confirmation(
             tenant_id=claim.tenant_id,
             document_id=claim.document_id,
             generation=claim.generation,
             estimate=fresh.model_dump(mode="json"),
-            snapshot=await encode_in_thread(local),
+            snapshot=await encode_in_thread(self._local),
             confirm_by=now + CONFIRM_WINDOW,
         )
         logger.info("knowledge.estimate_reconfirm_mid_ingest document=%s", claim.document_id)
-        msg = f"document {claim.document_id}: a model changed since its estimate was confirmed"
-        raise StaleIngestionError(msg)
-
-    return guard
 
 
 async def start_paid_ingest(
@@ -1230,7 +1261,7 @@ async def start_paid_ingest(
         return PaidStart(
             local=local,
             embedder=_KeyedEmbedder(pinned, model_key),
-            before_paid=_models_guard(store, estimator, claim, local, confirmed),
+            before_paid=_ModelsGuard(store, estimator, claim, local, confirmed),
         )
     returned = await store.return_to_confirmation(
         tenant_id=claim.tenant_id,

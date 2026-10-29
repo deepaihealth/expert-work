@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 from collections.abc import AsyncIterator, Collection, Sequence
+from datetime import UTC, datetime
 from typing import Any
 from uuid import UUID, uuid4
 
@@ -29,7 +30,7 @@ from control_plane.knowledge.ingestion import KnowledgeIngestionRunner
 from control_plane.settings import DEFAULT_DEV_TENANT_ID, Settings
 from expert_work.persistence import InMemoryKnowledgeStore
 from expert_work.persistence.audit_log import InMemoryAuditLogStore
-from expert_work.protocol import AuditQuery
+from expert_work.protocol import AuditQuery, IngestStage
 from orchestrator.llm import FakeEmbedder
 from tests.auth_fixtures import (
     TEST_AUDIENCE,
@@ -185,10 +186,13 @@ async def test_an_upload_is_estimated_without_a_model_and_waits_even_at_zero(
     )
     assert row["confirm_by"] is not None and row["ingest_actual"] is None
     assert "restore" not in estimate  # the store-only part is never shown
-    assert await harness.summary() == {
+    summary = await harness.summary()
+    assert len(summary.pop("fingerprint")) == 64
+    assert summary == {
         "estimating": 0,
         "awaiting": 1,
         "duplicates": 0,
+        "expired": 0,
         "total_micros": 0,
         "unpriced": True,
         "earliest_confirm_by": row["confirm_by"],
@@ -273,13 +277,16 @@ async def test_confirm_all_needs_what_the_user_saw(harness: _Harness) -> None:
     summary = await harness.summary()
     assert (summary["awaiting"], summary["duplicates"]) == (2, 1)
 
-    stale = await harness.client.post(
-        f"{_DOCS}/confirm",
-        json={"all": True, "expected_count": 1, "expected_total_micros": 0},
-    )
-    assert stale.status_code == 409
-    assert stale.json()["detail"]["error"] == "estimate_changed"
-    assert stale.json()["detail"]["estimate_summary"]["awaiting"] == 2
+    for wrong in (
+        {"expected_count": 1, "expected_fingerprint": summary["fingerprint"]},
+        {"expected_count": 2, "expected_fingerprint": "0" * 64},  # not the documents shown
+    ):
+        stale = await harness.client.post(
+            f"{_DOCS}/confirm", json={"all": True, "expected_total_micros": 0, **wrong}
+        )
+        assert stale.status_code == 409
+        assert stale.json()["detail"]["error"] == "estimate_changed"
+        assert stale.json()["detail"]["estimate_summary"]["awaiting"] == 2
     assert {d["status"] for d in await harness.documents()} == {"awaiting_confirmation"}
     # Another copy arrives after the user was shown the first one.
     late = await harness.upload("d.md", b"# A\n\ntext a")
@@ -290,6 +297,7 @@ async def test_confirm_all_needs_what_the_user_saw(harness: _Harness) -> None:
             "all": True,
             "expected_count": 2,
             "expected_total_micros": 0,
+            "expected_fingerprint": summary["fingerprint"],
             "withdraw_duplicate_ids": [copy["id"]],
         },
     )
@@ -316,6 +324,7 @@ async def test_confirm_all_needs_what_the_user_saw(harness: _Harness) -> None:
         {},
         {"all": True},
         {"all": True, "expected_count": 1},
+        {"all": True, "expected_count": 1, "expected_total_micros": 0},  # no fingerprint
         {"all": True, "expected_count": 1, "expected_total_micros": 0, "documents": []},
         {"documents": []},
         {"documents": [{"document_id": str(uuid4()), "estimate_id": str(uuid4())}], "all": True},
@@ -325,6 +334,7 @@ async def test_confirm_all_needs_what_the_user_saw(harness: _Harness) -> None:
             "all": True,
             "expected_count": 0,
             "expected_total_micros": 0,
+            "expected_fingerprint": "x",
         },
     ],
 )
@@ -430,7 +440,15 @@ async def test_reupload_reingest_and_batch_estimate_first_and_keep_serving(
 
 async def test_no_estimate_starts_without_a_runner(no_runner: _Harness) -> None:
     for path, body in (
-        (f"{_DOCS}/confirm", {"all": True, "expected_count": 0, "expected_total_micros": 0}),
+        (
+            f"{_DOCS}/confirm",
+            {
+                "all": True,
+                "expected_count": 0,
+                "expected_total_micros": 0,
+                "expected_fingerprint": "",
+            },
+        ),
         (f"{_DOCS}/{uuid4()}/estimate", None),
     ):
         response = await no_runner.client.post(path, json=body)
@@ -518,3 +536,106 @@ async def test_a_viewer_cannot_confirm(harness: _Harness) -> None:
         response = await harness.client.post(path, json=body, headers=_headers("viewer"))
         assert response.status_code == 403, (path, response.text)
     assert (await harness.row(uploaded["id"]))["status"] == "awaiting_confirmation"
+
+
+# -- B2b review fixes -------------------------------------------------------------
+
+
+async def _indexing(harness: _Harness) -> str:
+    """A ready document whose re-upload is having its chunks swapped in."""
+    uploaded = await harness.upload("h.md", _MD)
+    await settle(harness.client, harness.runner)
+    base = await harness.store.get_base(tenant_id=_TENANT, name="kb")
+    assert base is not None
+    await harness.store.upsert_document(
+        tenant_id=_TENANT, kb_id=base.id, filename="h.md", content=b"# v2", content_sha256="v2"
+    )
+    document_id = UUID(uploaded["id"])
+    claim = await harness.store.claim_document(
+        tenant_id=_TENANT,
+        document_id=document_id,
+        now=datetime.now(UTC),
+        lease_seconds=300,
+        max_attempts=5,
+    )
+    assert claim is not None
+    assert await harness.store.set_document_stage(
+        tenant_id=_TENANT,
+        document_id=document_id,
+        stage=IngestStage.INDEXING,
+        generation=claim.generation,
+    )
+    return str(document_id)
+
+
+async def test_nothing_restarts_a_document_writing_its_chunks(harness: _Harness) -> None:
+    """Review M1: 409 ``document_busy`` (a batch skips it as ``busy``)."""
+    document_id = await _indexing(harness)
+    for response in (
+        await harness.client.post(_DOCS, files={"file": ("h.md", b"# v3", "text/markdown")}),
+        await harness.client.post(f"{_DOCS}/{document_id}/reingest"),
+    ):
+        assert response.status_code == 409, response.text
+        assert response.json()["detail"]["error"] == "document_busy"
+    batch = await harness.client.post(
+        f"{_DOCS}/batch", json={"action": "reingest", "document_ids": [document_id]}
+    )
+    assert batch.json()["skipped"] == [{"id": document_id, "reason": "busy"}]
+    row = await harness.row(document_id)
+    assert (row["status"], row["stage"]) == ("processing", "indexing")
+
+
+async def test_withdrawing_or_deleting_an_original_frees_its_copies(harness: _Harness) -> None:
+    """Review M5 (§7): the copy is estimated as a plain upload."""
+    for remove in ("cancel", "delete"):
+        original = await harness.upload(f"{remove}.md", f"# {remove}".encode())
+        copy = await harness.upload(f"{remove}-copy.md", f"# {remove}".encode())
+        assert (await harness.row(copy["id"]))["ingest_estimate"]["duplicate_of"] is not None
+        if remove == "cancel":
+            await harness.client.post(f"{_DOCS}/cancel", json={"document_ids": [original["id"]]})
+        else:
+            await harness.client.delete(f"{_DOCS}/{original['id']}")
+        await harness.runner.drain()
+        row = await harness.row(copy["id"])
+        assert row["status"] == "awaiting_confirmation", remove
+        assert row["ingest_estimate"]["duplicate_of"] is None, remove
+        assert row["ingest_estimate"]["estimated"] is True, remove
+
+
+async def test_ingest_anyway_refuses_a_duplicate_changed_meanwhile(
+    harness: _Harness, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Review L1: what was read is checked again with the row locked."""
+    await harness.upload("a.md", _MD)
+    copy = await harness.upload("copy.md", _MD)
+    read = harness.store.get_document
+
+    async def stale_read(*, tenant_id: UUID, document_id: UUID) -> Any:
+        document = await read(tenant_id=tenant_id, document_id=document_id)
+        assert document is not None and document.ingest_estimate is not None
+        older = document.ingest_estimate.model_copy(update={"id": uuid4()})
+        return document.model_copy(update={"ingest_estimate": older})
+
+    monkeypatch.setattr(harness.store, "get_document", stale_read)
+    response = await harness.client.post(f"{_DOCS}/{copy['id']}/estimate")
+    monkeypatch.undo()
+    assert (response.status_code, response.json()["detail"]["error"]) == (409, "estimate_changed")
+    assert (await harness.row(copy["id"]))["status"] == "awaiting_confirmation"
+
+
+async def test_discarding_a_waiting_new_uploads_new_bytes_estimates_the_first(
+    harness: _Harness,
+) -> None:
+    """Review L2: not left failed with no estimate."""
+    uploaded = await harness.upload("a.md", _MD)
+    await harness.upload("a.md", _MD + b"\n\nMore.")
+    response = await harness.client.post(f"{_DOCS}/{uploaded['id']}/discard-pending")
+    assert response.status_code == 200, response.text
+    assert response.json()["status"] == "estimating"
+    await harness.runner.drain()
+    row = await harness.row(uploaded["id"])
+    assert (row["status"], row["has_pending"], row["ingest_estimate"]["origin"]) == (
+        "awaiting_confirmation",
+        False,
+        "upload",
+    )
