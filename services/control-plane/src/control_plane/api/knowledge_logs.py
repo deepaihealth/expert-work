@@ -12,6 +12,12 @@ belong to another of its bases (``kb_ids`` in the detail lists them).
 ``error`` when it raised (``flags.error`` names the exception type; the
 ``zero_hit`` filter leaves those out — they did not come back empty).
 
+``…/{log_id}/passages`` reads each result's text as it is now, for the console
+to show next to the row: the passage (its parent row, or the chunk standing
+for itself) and the best hit chunk under it — ``null`` once gone, or when the
+chunk is not in one of the row's bases or not of the result's document. The
+row never stores text; this read never logs it.
+
 Gate (user ruling 2026-10-27): the same as conversation records — every
 employee holding ``session:read`` (viewer included), console only (a logged
 question is end-user content; an API key gets 403), one concrete tenant per
@@ -49,6 +55,7 @@ from expert_work.persistence.knowledge import (
     RetrievalLogEntry,
     RetrievalLogSource,
 )
+from expert_work.protocol import KnowledgeChunk
 from expert_work.runtime.audit.logger import AuditLogger
 
 #: Rows per page (default / ceiling).
@@ -102,6 +109,54 @@ async def _detail_dict(
             for result, doc_id in zip(entry.results, document_ids, strict=True)
         ],
     }
+
+
+def _result_uuid(result: Mapping[str, Any], key: str) -> UUID | None:
+    value = result.get(key)
+    try:
+        return UUID(str(value)) if value is not None else None
+    except ValueError:
+        return None
+
+
+def _live_dict(chunk: KnowledgeChunk) -> dict[str, Any]:
+    return {
+        "id": str(chunk.id),
+        "content": chunk.content,
+        "heading_path": list(chunk.heading_path),
+        "enabled": chunk.enabled,
+    }
+
+
+async def _live_passages(
+    store: KnowledgeStore, tenant_id: UUID, entry: RetrievalLogEntry
+) -> list[dict[str, Any]]:
+    """Each result's passage and best hit chunk (``hit``, only under a parent
+    row) as they are now — one read. A chunk outside the row's bases, or of
+    another document than the result names, counts as gone."""
+    wanted: list[tuple[UUID | None, UUID | None, UUID | None]] = []
+    for result in entry.results:
+        chunk_id = _result_uuid(result, "chunk_id")
+        parent_id = _result_uuid(result, "parent_chunk_id")
+        wanted.append(
+            (parent_id or chunk_id, chunk_id if parent_id else None, _document_id(result))
+        )
+    ids = [i for passage, hit, _ in wanted for i in (passage, hit) if i is not None]
+    chunks = (
+        {c.id: c for c in await store.get_chunks(tenant_id=tenant_id, chunk_ids=ids)} if ids else {}
+    )
+    kb_ids = set(entry.kb_ids)
+
+    def live(chunk_id: UUID | None, document_id: UUID | None) -> dict[str, Any] | None:
+        chunk = chunks.get(chunk_id) if chunk_id is not None else None
+        if chunk is None or chunk.kb_id not in kb_ids or chunk.document_id != document_id:
+            return None
+        return _live_dict(chunk)
+
+    return [
+        {"passage": live(passage, document_id), "hit": live(hit, document_id)}
+        for passage, hit, document_id in wanted
+    ]
 
 
 def build_knowledge_logs_router() -> APIRouter:
@@ -189,6 +244,37 @@ def build_knowledge_logs_router() -> APIRouter:
                 raise HTTPException(status_code=404, detail=_NOT_FOUND)
             content = await _detail_dict(store, scope.tenant_id, entry)
         return JSONResponse(content=content)
+
+    @router.get(
+        "/bases/{name}/retrieval-logs/{log_id}/passages",
+        response_model=None,
+        # The row's gate, and the passages' own (the text is the base's).
+        dependencies=[Depends(require("session", "read")), Depends(require("manifest", "read"))],
+    )
+    async def get_retrieval_log_passages(
+        name: str,
+        log_id: UUID,
+        request: Request,
+        store: Annotated[KnowledgeStore, Depends(_get_knowledge_store)],
+        log_store: Annotated[KnowledgeRetrievalLogStore, Depends(_get_retrieval_log_store)],
+        audit: Annotated[AuditLogger, Depends(_get_audit)],
+        tenant_id: Annotated[UUID | Literal["*"] | None, Query()] = None,
+    ) -> JSONResponse:
+        scope = await ensure_single_tenant_scope(
+            request.state.principal,
+            tenant_id,
+            audit,
+            trace_id=current_trace_id_hex(),
+            endpoint="GET /v1/knowledge/bases/{name}/retrieval-logs/{log_id}/passages",
+            cross_tenant_enabled=cross_tenant_query_enabled(request),
+        )
+        async with applied_scope(scope):
+            base = await _require_base(store, scope.tenant_id, name)
+            entry = await log_store.get(tenant_id=scope.tenant_id, log_id=log_id)
+            if entry is None or base.id not in entry.kb_ids:
+                raise HTTPException(status_code=404, detail=_NOT_FOUND)
+            passages = await _live_passages(store, scope.tenant_id, entry)
+        return JSONResponse(content={"passages": passages})
 
     return router
 

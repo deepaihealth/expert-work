@@ -4,7 +4,8 @@ A passage is what a search returns and what the console edits as one unit:
 a parent row with the chunks under it (B-206 K-1), or a chunk standing for
 itself. All under ``/bases/{name}/documents/{document_id}``:
 
-* ``GET …/passages`` — the passages in document order, each with its chunks;
+* ``GET …/passages`` — the passages in document order, each with its chunks
+  (and ``figure_ids``: the pictures they describe whose originals are stored);
 * ``POST …/passages`` — add one at the end of the document;
 * ``PATCH …/passages/{passage_id}`` — new text (``content`` / ``heading_path``;
   needs ``revision``, the one it was read at) and / or ``enabled``;
@@ -46,6 +47,7 @@ from control_plane.knowledge.chunking import (
     normalize_passage_body,
 )
 from control_plane.knowledge.ingestion import KnowledgeIngestionRunner
+from control_plane.knowledge.recognition.figure_storage import confirmed_figure_ids
 from control_plane.tenant_scope import (
     applied_scope,
     cross_tenant_query_enabled,
@@ -305,9 +307,18 @@ def build_knowledge_passages_router() -> APIRouter:
                 )
                 passages = matching[safe_offset : safe_offset + safe_limit]
                 total = len(matching)
+        # B-209 PR-2 —— figures whose originals this document really has (as the chunk list).
+        figure_ids = await confirmed_figure_ids(
+            request.app.state.object_store,
+            tenant_id=scope.tenant_id,
+            kb_id=base.id,
+            document_id=document_id,
+            contents=[c.content for p in passages for c in (p.row, *p.children)],
+        )
         return JSONResponse(
             content={
                 "passages": [_passage_dict(p) for p in passages],
+                "figure_ids": figure_ids,
                 "total": total,
                 "offset": safe_offset,
                 "limit": safe_limit,

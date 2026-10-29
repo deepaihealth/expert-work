@@ -32,6 +32,7 @@ from sqlalchemy import (
     text,
     true,
     tuple_,
+    union_all,
     update,
 )
 from sqlalchemy import values as sa_values
@@ -69,6 +70,7 @@ from expert_work.persistence.knowledge.passages import (
     PassageConflictError,
     PassageLayout,
     PassageRevision,
+    ReviewCounts,
     SwitchOffRecord,
     edited_since,
     manual_passages,
@@ -971,6 +973,109 @@ async def _read_history(
         )
         for row in rows
     ]
+
+
+def _review_counts_stmt(tenant_id: UUID, document_ids: Sequence[UUID]) -> Any:
+    """``count_review_items`` in one statement: rows ``(document_id, kind,
+    n)``, ``kind`` ``inherited`` (passage rows switched off by inheritance) or
+    ``unapplied`` (what :func:`unapplied_revisions` lists, from two parts: a
+    text history whose passage is back at an older revision, or gone with an
+    edit its first revision does not hold; a switch-off record with
+    ``orphaned_at``). Each part reads the documents by their
+    ``document_id`` index."""
+    head = aliased(KnowledgeChunkRow)
+    inherited = (
+        select(head.document_id, literal("inherited", Text).label("kind"), func.count())
+        .where(
+            head.tenant_id == tenant_id,
+            head.document_id.in_(document_ids),
+            head.disabled_reason == "inherited",
+            _is_passage_row(head),
+        )
+        .group_by(head.document_id)
+    )
+    rev = KnowledgeChunkRevisionRow
+    ranked = (
+        select(
+            rev.document_id,
+            rev.chunk_id,
+            rev.revision,
+            rev.content,
+            func.coalesce(rev.heading_path, literal_column("'[]'::jsonb")).label("heading_path"),
+            rev.edited_by,
+            func.row_number()
+            .over(partition_by=(rev.document_id, rev.chunk_id), order_by=rev.revision)
+            .label("oldest"),
+            func.row_number()
+            .over(partition_by=(rev.document_id, rev.chunk_id), order_by=rev.revision.desc())
+            .label("latest"),
+        )
+        .where(
+            rev.tenant_id == tenant_id,
+            rev.document_id.in_(document_ids),
+            rev.switch_off_lost.is_(False),
+        )
+        .cte("review_history")
+    )
+    first, last = ranked.alias("first_revision"), ranked.alias("last_revision")
+    passage = aliased(KnowledgeChunkRow)
+    texts = (
+        select(last.c.document_id, literal("unapplied", Text), func.count())
+        .select_from(
+            last.join(
+                first,
+                and_(
+                    first.c.document_id == last.c.document_id,
+                    first.c.chunk_id == last.c.chunk_id,
+                    first.c.oldest == 1,
+                ),
+            ).outerjoin(
+                passage,
+                and_(
+                    passage.tenant_id == tenant_id,
+                    passage.document_id == last.c.document_id,
+                    passage.id == last.c.chunk_id,
+                    _is_passage_row(passage),
+                ),
+            )
+        )
+        .where(
+            last.c.latest == 1,
+            or_(
+                and_(passage.id.is_not(None), passage.revision < last.c.revision),
+                and_(
+                    passage.id.is_(None),
+                    # ``edited_since``: added by hand, or other text than the first.
+                    or_(
+                        first.c.edited_by.is_not(None),
+                        first.c.content != last.c.content,
+                        first.c.heading_path != last.c.heading_path,
+                    ),
+                ),
+            ),
+        )
+        .group_by(last.c.document_id)
+    )
+    records = (
+        select(rev.document_id, literal("unapplied", Text), func.count())
+        .where(
+            rev.tenant_id == tenant_id,
+            rev.document_id.in_(document_ids),
+            rev.switch_off_lost.is_(True),
+            rev.orphaned_at.is_not(None),
+        )
+        .group_by(rev.document_id)
+    )
+    return union_all(inherited, texts, records)
+
+
+def _is_passage_row(chunk: Any) -> ColumnElement[bool]:
+    """``chunk`` (an alias of ``knowledge_chunk``) is a passage row: a parent
+    row, or a searchable chunk with none (as :func:`_passage_rows_where`)."""
+    return or_(
+        chunk.chunk_type == ChunkType.PARENT.value,
+        and_(chunk.chunk_type.in_(_SEARCHABLE_TYPE_VALUES), chunk.parent_chunk_id.is_(None)),
+    )
 
 
 async def _write_switch_offs(
@@ -2483,6 +2588,25 @@ class SqlKnowledgeStore(KnowledgeStore):
             )
             await session.commit()
         return len(deleted)
+
+    async def count_review_items(
+        self, *, tenant_id: UUID, document_ids: Sequence[UUID]
+    ) -> dict[UUID, ReviewCounts]:
+        asked = list(dict.fromkeys(document_ids))
+        if not asked:
+            return {}
+        async with self._sf() as session:
+            rows = (await session.execute(_review_counts_stmt(tenant_id, asked))).all()
+        found: dict[UUID, dict[str, int]] = {}
+        for document_id, kind, count in rows:
+            kinds = found.setdefault(document_id, {})
+            kinds[kind] = kinds.get(kind, 0) + int(count)
+        return {
+            document_id: ReviewCounts(
+                inherited=kinds.get("inherited", 0), unapplied=kinds.get("unapplied", 0)
+            )
+            for document_id, kinds in found.items()
+        }
 
     async def list_manual_passages(
         self, *, tenant_id: UUID, document_id: UUID

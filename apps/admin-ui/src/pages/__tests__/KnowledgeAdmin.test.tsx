@@ -127,6 +127,10 @@ describe("KnowledgeAdmin (list)", () => {
     renderPage();
     await userEvent.click(screen.getByTestId("kb-create-open"));
     await waitFor(() => expect(screen.getByTestId("kb-create-modal")).toBeInTheDocument());
+    // B-175 P3-PR3 — the description box says agents read it.
+    expect(screen.getByTestId("kb-create-description-hint")).toHaveTextContent(
+      "it reads this description to decide which one to search",
+    );
     await userEvent.type(screen.getByTestId("kb-create-name"), "support-docs");
     await userEvent.click(screen.getByText("Save"));
 

@@ -105,12 +105,14 @@ class RetrievalLogReceipt:
 
 @dataclass(frozen=True)
 class RetrievalLogContext:
-    """A search someone outside a run asked for: its ``source`` and the
-    employee behind it (``actor_id``)."""
+    """A search someone outside a run asked for: its ``source``, the employee
+    behind it (``actor_id``), and flags the caller adds to the row (e.g. the
+    console's ``platform_admin`` for a search of another tenant's base)."""
 
     source: RetrievalLogSource
     actor_id: str | None = None
     receipt: RetrievalLogReceipt = field(default_factory=RetrievalLogReceipt)
+    flags: Mapping[str, Any] = field(default_factory=dict)
 
 
 retrieval_log_context: ContextVar[RetrievalLogContext | None] = ContextVar(
@@ -261,7 +263,10 @@ class LoggedKnowledgeRetriever(KnowledgeRetriever):
                 latency_ms=latency_ms,
                 params=search.params,
                 results=tuple(_result(r) for r in outcome.results) if outcome is not None else (),
-                flags=_flags(outcome) if outcome is not None else {"error": error},
+                flags={
+                    **(_flags(outcome) if outcome is not None else {"error": error}),
+                    **(context.flags if context is not None else {}),
+                },
                 run_id=search.run_id,
                 thread_id=get_current_thread_id(),
                 actor_id=context.actor_id if context is not None else None,

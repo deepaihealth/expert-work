@@ -452,6 +452,220 @@ export interface TranslationKeys {
     as_of_placeholder: string;
     as_of_banner: string;
   };
+  // ── B-175 P3-PR3: document and passage maintenance ──
+  kb_maintenance: {
+    view_review: string;
+    review_alert_one: string;
+    review_alert_other: string;
+    review_open: string;
+    passages_empty: string;
+    add_passage: string;
+    busy_hint: string;
+    passage_chars_one: string;
+    passage_chars_other: string;
+    passage_children_one: string;
+    passage_children_other: string;
+    standalone: string;
+    tag_enabled: string;
+    tag_disabled: string;
+    tag_inherited: string;
+    inherited_hint: string;
+    tag_edited: string;
+    show_children: string;
+    hide_children: string;
+    toggle_aria: string;
+    edit: string;
+    history: string;
+    keep_off: string;
+    toggled_on: string;
+    toggled_off: string;
+    editor_title_edit: string;
+    editor_title_add: string;
+    editor_heading: string;
+    editor_heading_hint: string;
+    editor_content: string;
+    editor_content_hint: string;
+    editor_saved: string;
+    editor_added: string;
+    conflict_title: string;
+    conflict_body: string;
+    conflict_use_theirs: string;
+    conflict_overwrite: string;
+    error_busy: string;
+    error_too_long: string;
+    error_empty: string;
+    error_gone: string;
+    history_title: string;
+    history_empty: string;
+    history_revision: string;
+    history_from_file: string;
+    history_by: string;
+    history_current: string;
+    history_restore: string;
+    history_restore_confirm: string;
+    history_restored: string;
+    history_conflict: string;
+    review_inherited_title: string;
+    review_unapplied_title: string;
+    review_unapplied_hint: string;
+    review_kind_edit: string;
+    review_kind_switch_off: string;
+    review_switch_off_hint: string;
+    review_orphaned_since: string;
+    review_still_there: string;
+    review_empty: string;
+    review_discard: string;
+    review_discard_confirm_title: string;
+    review_discard_confirm_body: string;
+    review_discarded: string;
+    review_discard_nothing: string;
+    needs_admin: string;
+    doc_disabled: string;
+    doc_disabled_hint: string;
+    doc_review_tag: string;
+    doc_review_hint: string;
+    batch_toolbar_aria: string;
+    batch_selected: string;
+    batch_select_row: string;
+    batch_select_all: string;
+    batch_enable: string;
+    batch_disable: string;
+    batch_reingest: string;
+    batch_delete: string;
+    batch_clear: string;
+    batch_reingest_confirm_title: string;
+    batch_reingest_confirm_body: string;
+    batch_delete_confirm_title: string;
+    batch_delete_confirm_body: string;
+    batch_done_enable: string;
+    batch_done_disable: string;
+    batch_done_reingest: string;
+    batch_done_delete: string;
+    batch_skipped: string;
+    skip_not_found: string;
+    skip_content_missing: string;
+    skip_sep: string;
+    description_agent_hint: string;
+    chunk_max_label: string;
+    parent_max: string;
+    stale_line_one: string;
+    stale_line_other: string;
+    stale_none: string;
+    stale_unknown: string;
+    stale_reingest: string;
+    stale_confirm_title_one: string;
+    stale_confirm_title_other: string;
+    stale_confirm_body: string;
+    stale_confirm_later: string;
+    stale_submitted: string;
+    stale_skipped: string;
+    stale_remaining: string;
+    config_summary: string;
+    config_summary_chunk_only: string;
+    config_summary_overlap: string;
+  };
+  /** B-175 P2-PR4 — a base's retrieval records + the retrieval test's scores. */
+  knowledge_retrieval: {
+    tab_logs: string;
+    retention_notice: string;
+    filter_source: string;
+    source_all: string;
+    source_agent: string;
+    source_console_test: string;
+    source_open_api: string;
+    filter_outcome: string;
+    outcome_all: string;
+    outcome_zero_hit: string;
+    outcome_ok: string;
+    outcome_below_threshold: string;
+    outcome_error: string;
+    filter_time: string;
+    clear_filters: string;
+    status_ok: string;
+    status_no_hits: string;
+    status_below_threshold: string;
+    status_error: string;
+    col_time: string;
+    col_source: string;
+    col_query: string;
+    col_status: string;
+    col_results: string;
+    col_latency: string;
+    col_actions: string;
+    view: string;
+    latency_ms: string;
+    pager_total: string;
+    empty: string;
+    empty_filtered: string;
+    load_failed: string;
+    no_permission: string;
+    retry: string;
+    detail_title: string;
+    detail_missing: string;
+    detail_failed: string;
+    field_question: string;
+    field_actor: string;
+    field_links: string;
+    open_conversation: string;
+    open_run: string;
+    links_other_tenant: string;
+    field_params: string;
+    param_default: string;
+    value_on: string;
+    value_off: string;
+    value_none: string;
+    field_flags: string;
+    multibase: string;
+    results_title: string;
+    results_empty: string;
+    doc_deleted: string;
+    doc_disabled: string;
+    platform_admin: string;
+    platform_admin_hint: string;
+    uploaded_at: string;
+    passage_parent: string;
+    passage_chunk: string;
+    text_loading: string;
+    text_gone: string;
+    hit_gone: string;
+    text_disabled: string;
+    text_failed: string;
+    text_live_note: string;
+    score_vector: string;
+    score_keyword: string;
+    score_fused: string;
+    score_rerank: string;
+    score_vector_hint: string;
+    score_keyword_hint: string;
+    score_fused_hint: string;
+    score_rerank_hint: string;
+    notice_embedding_degraded: string;
+    notice_keyword_degraded: string;
+    notice_duplicates_dropped_one: string;
+    notice_duplicates_dropped_other: string;
+    notice_rerank_dropped_one: string;
+    notice_rerank_dropped_other: string;
+    notice_unsearched: string;
+    notice_threshold_paused: string;
+    notice_error: string;
+    flag_candidates: string;
+    flag_rerank_model: string;
+    elapsed: string;
+    logged: string;
+    not_logged: string;
+    open_logs: string;
+    doc_filter: string;
+    doc_filter_all: string;
+    below_threshold: string;
+    rerank_threshold_placeholder: string;
+    rerank_threshold_none: string;
+    calibration_warning: string;
+    save_defaults: string;
+    save_defaults_same: string;
+    save_defaults_confirm: string;
+    save_defaults_rerank_note: string;
+    save_defaults_done: string;
+  };
   knowledge_page: {
     page_title: string;
     subtitle: string;
@@ -599,7 +813,6 @@ export interface TranslationKeys {
     chunk_in_parent: string;
     chunks_view_children: string;
     chunks_view_parents: string;
-    parents_empty: string;
     test_title: string;
     test_query_placeholder: string;
     test_run: string;
@@ -3842,6 +4055,247 @@ const en: TranslationKeys = {
     as_of_placeholder: "View memories as of…",
     as_of_banner: "Historical view — memories valid at {{at}}",
   },
+  // ── B-175 P3-PR3: document and passage maintenance ──
+  kb_maintenance: {
+    view_review: "To review ({{n}})",
+    review_alert_one:
+      "{{count}} item in this document needs review: a passage a re-ingest switched off, or an edit it could not put back.",
+    review_alert_other:
+      "{{count}} items in this document need review: passages a re-ingest switched off, or edits it could not put back.",
+    review_open: "Review",
+    passages_empty: "No passages yet (the document may still be ingesting).",
+    add_passage: "Add passage",
+    busy_hint:
+      "The document is being ingested or has a new version waiting; its passages can be changed once it is ready.",
+    passage_chars_one: "{{count}} character",
+    passage_chars_other: "{{count}} characters",
+    passage_children_one: "{{count}} chunk",
+    passage_children_other: "{{count}} chunks",
+    standalone: "Stands alone",
+    tag_enabled: "On",
+    tag_disabled: "Off",
+    tag_inherited: "Switched off with an earlier passage · review",
+    inherited_hint:
+      "After the file changed, a passage someone had switched off could not be found again. This one holds its text, so it was switched off too. Switch it on to let search find it, or keep it off to confirm; either way it is not switched off for that reason again.",
+    tag_edited: "Edited · revision {{revision}}",
+    show_children: "Show chunks",
+    hide_children: "Hide chunks",
+    toggle_aria: "Switch {{label}} on or off",
+    edit: "Edit",
+    history: "History",
+    keep_off: "Keep off",
+    toggled_on: "Switched on: search can find this passage.",
+    toggled_off: "Switched off: search no longer returns this passage.",
+    editor_title_edit: "Edit {{label}}",
+    editor_title_add: "Add a passage at the end of the document",
+    editor_heading: "Heading path",
+    editor_heading_hint:
+      "One entry per level, outermost first; press Enter to add one. Search reads it with the text.",
+    editor_content: "Text",
+    editor_content_hint:
+      "Saving re-embeds only the chunks whose text changed (billed by usage). The text may be up to twice the passage cap.",
+    editor_saved: "Saved as revision {{revision}}.",
+    editor_added: "Passage added.",
+    conflict_title: "Someone changed this passage after you opened it (it is at revision {{revision}} now).",
+    conflict_body: "This is the version they saved. Use theirs, or overwrite it with yours.",
+    conflict_use_theirs: "Use theirs",
+    conflict_overwrite: "Overwrite with mine",
+    error_busy:
+      "The document is being ingested or has a new version waiting. Try again once it is ready.",
+    error_too_long:
+      "The text is too long: over {{limit}} tokens (twice the passage cap). Shorten it, or add part of it as a new passage.",
+    error_empty: "The text cannot be empty.",
+    error_gone: "This passage is no longer there (the document may have been re-ingested). The list was refreshed.",
+    history_title: "History · {{label}}",
+    history_empty: "Never edited, so there is no history yet.",
+    history_revision: "Revision {{revision}}",
+    history_from_file: "From the file",
+    history_by: "By {{who}}",
+    history_current: "Current",
+    history_restore: "Restore",
+    history_restore_confirm: "Restore the passage to revision {{revision}}? It is saved as a new revision.",
+    history_restored: "Restored: now at revision {{revision}}.",
+    history_conflict: "The passage just changed; its history was refreshed. Pick again.",
+    review_inherited_title: "Switched off with an earlier passage ({{n}})",
+    review_unapplied_title: "Edits not put back ({{n}})",
+    review_unapplied_hint:
+      "A re-ingest could not find the passages these belonged to (the file changed). Copy the text into today's passages if you still need it. They are deleted after the retention period (30 days by default).",
+    review_kind_edit: "Edit · revision {{revision}}",
+    review_kind_switch_off: "Switch-off record",
+    review_switch_off_hint:
+      "Someone switched off a passage holding this text. The new file no longer holds it, so nothing was switched off for it.",
+    review_orphaned_since: "No passage since {{at}}",
+    review_still_there: "The passage is there, without this edit",
+    review_empty: "Nothing to review.",
+    review_discard: "Discard all",
+    review_discard_confirm_title: "Discard these {{n}} items that were not put back?",
+    review_discard_confirm_body: "Their revision history is deleted and cannot be restored.",
+    review_discarded: "Discarded the items that were not put back.",
+    review_discard_nothing:
+      "Nothing is left to discard (it may have been handled meanwhile). The list was refreshed.",
+    needs_admin: "Needs a tenant admin: this deletes data.",
+    doc_disabled: "Off",
+    doc_disabled_hint:
+      "Search leaves this document out. Its chunks are kept and come back when it is switched on.",
+    doc_review_tag: "{{n}} to review",
+    doc_review_hint:
+      "A re-ingest switched passages off, or could not put edits back. Click to review.",
+    batch_toolbar_aria: "Batch actions on the selected documents",
+    batch_selected: "{{n}} selected",
+    batch_select_row: "Select {{name}}",
+    batch_select_all: "Select every document on this page",
+    batch_enable: "Switch on",
+    batch_disable: "Switch off",
+    batch_reingest: "Re-ingest",
+    batch_delete: "Delete",
+    batch_clear: "Clear selection",
+    batch_reingest_confirm_title: "Re-ingest the {{n}} selected documents?",
+    batch_reingest_confirm_body:
+      "They are ingested again with the current chunking; documents cut by other parameters are embedded again (billed by usage). Manual changes are put back; what cannot be is listed for review.",
+    batch_delete_confirm_title: "Delete the {{n}} selected documents?",
+    batch_delete_confirm_body: "Their chunks and revision history go with them. This cannot be undone.",
+    batch_done_enable: "Switched on {{n}} documents.",
+    batch_done_disable: "Switched off {{n}} documents.",
+    batch_done_reingest: "Re-ingest submitted for {{n}} documents.",
+    batch_done_delete: "Deleted {{n}} documents.",
+    batch_skipped: "Skipped {{n}}: {{reasons}}",
+    skip_not_found: "{{n}} no longer in this base",
+    skip_content_missing: "{{n}} without their original file (re-upload them)",
+    skip_sep: "; ",
+    description_agent_hint:
+      "When an agent binds several bases, it reads this description to decide which one to search: say what the documents are and which questions they answer.",
+    chunk_max_label: "Chunk cap (tokens)",
+    parent_max:
+      "Passage cap: {{max}} tokens (fixed by the platform; an edited passage may hold up to twice it).",
+    stale_line_one: "{{count}} document is still cut by older chunking parameters.",
+    stale_line_other: "{{count}} documents are still cut by older chunking parameters.",
+    stale_none: "Every document is cut by the current chunking parameters.",
+    stale_unknown: "Could not read how many documents use older chunking parameters: {{error}}",
+    stale_reingest: "Re-ingest them",
+    stale_confirm_title_one: "{{count}} document is still cut by older chunking parameters. Re-ingest it now?",
+    stale_confirm_title_other:
+      "{{count}} documents are still cut by older chunking parameters. Re-ingest them now?",
+    stale_confirm_body:
+      "They are embedded again with the new parameters (billed by usage). Manual changes are put back; what cannot be is listed for review on its document. Documents without their original file are skipped (re-upload them).",
+    stale_confirm_later: "Later",
+    stale_submitted: "Re-ingest submitted for {{n}} documents.",
+    stale_skipped: "{{n}} documents have no original file and were skipped; re-upload them.",
+    stale_remaining: "{{n}} more were not submitted; click “Re-ingest them” again.",
+    config_summary: "Chunking: chunk {{chunk}} / passage {{parent}} tokens",
+    config_summary_chunk_only: "Chunking: chunk {{chunk}} tokens",
+    config_summary_overlap: " / overlap {{overlap}}",
+  },
+  knowledge_retrieval: {
+    tab_logs: "Retrieval records",
+    retention_notice:
+      "Records are kept for {{days}} days, then deleted. A record keeps the question, the parameters and each hit's passage numbers and scores — not the document text; the text in a record's details is read as it is now.",
+    filter_source: "Source",
+    source_all: "All sources",
+    source_agent: "Agent",
+    source_console_test: "Retrieval test",
+    source_open_api: "Open API",
+    filter_outcome: "Outcome",
+    outcome_all: "All outcomes",
+    outcome_zero_hit: "Zero hits",
+    outcome_ok: "Found results",
+    outcome_below_threshold: "All below the rerank floor",
+    outcome_error: "Failed",
+    filter_time: "Time",
+    clear_filters: "Clear filters",
+    status_ok: "Found",
+    status_no_hits: "No hits",
+    status_below_threshold: "Below rerank floor",
+    status_error: "Failed",
+    col_time: "Time",
+    col_source: "Source",
+    col_query: "Question",
+    col_status: "Outcome",
+    col_results: "Results",
+    col_latency: "Took",
+    col_actions: "Actions",
+    view: "View",
+    latency_ms: "{{ms}} ms",
+    pager_total: "{{total}} records",
+    empty:
+      "No retrieval records yet. Searches of this base by an agent, or from the Retrieval test tab, show up here and are kept for {{days}} days.",
+    empty_filtered: "No records match these filters.",
+    load_failed: "Failed to load retrieval records",
+    no_permission:
+      "You don't have permission to read retrieval records (it takes read access to conversation records).",
+    retry: "Retry",
+    detail_title: "Retrieval record",
+    detail_missing:
+      "This record no longer exists — it passed the retention period or was deleted with its conversation.",
+    detail_failed: "Failed to load the record",
+    field_question: "Question",
+    field_actor: "Run by",
+    field_links: "Conversation",
+    open_conversation: "Open conversation",
+    open_run: "Open run",
+    links_other_tenant: "Switch to this tenant in the tenant switcher to open its conversation.",
+    field_params: "Parameters",
+    param_default: "base default",
+    value_on: "on",
+    value_off: "off",
+    value_none: "none",
+    field_flags: "How it ran",
+    multibase:
+      "This search covered {{count}} bases; the result count and the results span all of them.",
+    results_title: "Results",
+    results_empty: "No results.",
+    doc_deleted: "Document deleted",
+    doc_disabled: "Document switched off",
+    platform_admin: "Platform admin",
+    platform_admin_hint: "Searched by platform staff from outside this tenant.",
+    uploaded_at: "uploaded {{time}}",
+    passage_parent: "Passage #{{parent}} · chunk #{{chunk}}",
+    passage_chunk: "Chunk #{{chunk}}",
+    text_loading: "Reading the text…",
+    text_gone: "This passage no longer exists (the document was re-ingested or the passage edited).",
+    hit_gone: "The matched chunk has changed since; the passage is shown without it.",
+    text_disabled: "Switched off",
+    text_failed: "Couldn't read the text: {{error}}",
+    text_live_note: "Text as it is now — the record does not keep the text the search returned.",
+    score_vector: "Vector",
+    score_keyword: "Keyword",
+    score_fused: "Fused",
+    score_rerank: "Rerank",
+    score_vector_hint: "Semantic similarity between the question and this chunk (0–1).",
+    score_keyword_hint: "Keyword-match score; comparable only within one search.",
+    score_fused_hint: "Both paths' rankings merged; it ordered the results before the rerank.",
+    score_rerank_hint: "The rerank model's score; the base's rerank floor is compared with it.",
+    notice_embedding_degraded: "The question could not be embedded; this search used keywords only.",
+    notice_keyword_degraded: "Keyword search did not finish; these are the vector search's results only.",
+    notice_duplicates_dropped_one: "{{count}} duplicate passage was left out.",
+    notice_duplicates_dropped_other: "{{count}} duplicate passages were left out.",
+    notice_rerank_dropped_one:
+      "{{count}} candidate was past the rerank model's per-request limit and got no rerank score.",
+    notice_rerank_dropped_other:
+      "{{count}} candidates were past the rerank model's per-request limit and got no rerank score.",
+    notice_unsearched: "Not searched (no recall path answered): {{bases}}",
+    notice_threshold_paused:
+      "The base's rerank floor was left out: it was set under another rerank model.",
+    notice_error: "The search failed ({{error}}).",
+    flag_candidates: "Candidates: {{count}}",
+    flag_rerank_model: "Rerank model: {{model}}",
+    elapsed: "Took {{ms}} ms",
+    logged: "Saved to the retrieval records",
+    not_logged: "Not saved to the retrieval records",
+    open_logs: "View records",
+    doc_filter: "Document",
+    doc_filter_all: "All documents",
+    below_threshold:
+      "All {{candidates}} candidates scored below the rerank floor, so nothing was returned.",
+    rerank_threshold_placeholder: "Empty = the base's ({{value}})",
+    rerank_threshold_none: "none",
+    calibration_warning:
+      "With more than 25 results the candidate pool grows, so rerank scores are not comparable with an agent's default search. Calibrate the floor with 25 or fewer.",
+    save_defaults: "Save as base defaults",
+    save_defaults_same: "These parameters are already the base's defaults.",
+    save_defaults_confirm: "Save these as the base's defaults?",
+    save_defaults_rerank_note: "The rerank floor is bound to the current rerank model.",
+    save_defaults_done: "Saved as the base's defaults",
+  },
   knowledge_page: {
     page_title: "Knowledge",
     subtitle: "Tenant-shared knowledge bases feeding agent retrieval.",
@@ -4003,7 +4457,6 @@ const en: TranslationKeys = {
     chunk_in_parent: "Part of passage #{{index}}",
     chunks_view_children: "By chunk",
     chunks_view_parents: "By passage",
-    parents_empty: "This document has no passages: each chunk is returned as a result on its own.",
     test_title: "Retrieval test",
     test_query_placeholder:
       "Enter a query to see which results would be retrieved…",

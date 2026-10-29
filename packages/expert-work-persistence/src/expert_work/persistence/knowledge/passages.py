@@ -151,6 +151,16 @@ class ManualPassage:
         return self.original.heading_path
 
 
+@dataclass(frozen=True)
+class ReviewCounts:
+    """What one document has waiting for a person (B-175 P3-PR3, the document
+    list's 「待复核」): ``inherited`` — passages a re-ingest switched off by
+    inheritance; ``unapplied`` — what ``list_unapplied_revisions`` lists."""
+
+    inherited: int = 0
+    unapplied: int = 0
+
+
 class PassageConflictError(Exception):
     """A passage write refused (the API answers 409): ``revision_conflict``
     (the passage changed since the caller read it; ``current`` is how it
