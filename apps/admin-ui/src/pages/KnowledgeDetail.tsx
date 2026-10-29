@@ -4,7 +4,7 @@
  * ``/knowledge/:name/:tab`` — mirrors the platform's list→detail-with-tabs
  * convention (AgentsList→AgentDetail). Stats header + a re-index banner when
  * the base's embedding model is stale; tabs for Documents / Retrieval test /
- * Settings.
+ * Retrieval records (B-175 P2-PR4) / Settings.
  */
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useNavigate, useParams, useSearchParams } from "react-router-dom";
@@ -19,6 +19,7 @@ import { concreteTenantScope, useTenantScope } from "../tenant/TenantScopeContex
 import { useIsTenantSwitched } from "../tenant/useIsTenantSwitched";
 import { PageHeader } from "../components/PageHeader";
 import { DocumentsTab } from "./knowledge_detail/DocumentsTab";
+import { RetrievalLogsTab } from "./knowledge_detail/RetrievalLogsTab";
 import { RetrievalTestTab } from "./knowledge_detail/RetrievalTestTab";
 import { SettingsTab } from "./knowledge_detail/SettingsTab";
 import { ReadonlyTooltip } from "../components/ReadonlyTooltip";
@@ -143,6 +144,12 @@ export function KnowledgeDetail() {
     (base.chunk_overlap_tokens > 0
       ? t("kb_maintenance.config_summary_overlap", { overlap: base.chunk_overlap_tokens })
       : "");
+  const goToTab = (key: string) =>
+    navigate(
+      `/knowledge/${encodeURIComponent(name)}/${key}${
+        tenantParam ? `?tenant_id=${encodeURIComponent(tenantParam)}` : ""
+      }`,
+    );
 
   return (
     <div data-testid="knowledge-detail-root">
@@ -211,16 +218,11 @@ export function KnowledgeDetail() {
         activeKey={activeTab}
         // W4 — keep the aggregate row-jump's ``?tenant_id=`` across tab
         // switches, else the read silently falls back to the home tenant.
-        onChange={(k) =>
-          navigate(
-            `/knowledge/${encodeURIComponent(name)}/${k}${
-              tenantParam ? `?tenant_id=${encodeURIComponent(tenantParam)}` : ""
-            }`,
-          )
-        }
+        onChange={goToTab}
         items={[
           { key: "documents", label: t("knowledge_page.tab_documents") },
           { key: "test", label: t("knowledge_page.tab_test") },
+          { key: "logs", label: t("knowledge_retrieval.tab_logs") },
           { key: "settings", label: t("knowledge_page.tab_settings") },
         ]}
       />
@@ -233,7 +235,18 @@ export function KnowledgeDetail() {
           canDelete={canDelete}
         />
       )}
-      {activeTab === "test" && <RetrievalTestTab base={base} readScope={readScope} />}
+      {activeTab === "test" && (
+        <RetrievalTestTab
+          base={base}
+          readScope={readScope}
+          readonly={readonly}
+          // B-175 P2-PR4 — the saved base as PATCH returned it: a refresh would
+          // show the skeleton, unmounting the tab and its results.
+          onBaseUpdated={setBase}
+          onOpenLogs={() => goToTab("logs")}
+        />
+      )}
+      {activeTab === "logs" && <RetrievalLogsTab baseName={name} readScope={readScope} />}
       {activeTab === "settings" && (
         <SettingsTab base={base} onSaved={refresh} readonly={readonly} readScope={readScope} />
       )}

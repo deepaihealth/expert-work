@@ -14,6 +14,7 @@ import i18n from "../../i18n";
 
 import * as knowledgeSdk from "../../api/knowledge";
 import * as maintenanceSdk from "../../api/knowledge_maintenance";
+import * as logsSdk from "../../api/knowledge_logs";
 import { ApiError } from "../../api/client";
 import { KnowledgeDetail } from "../KnowledgeDetail";
 import { DocumentsTab } from "../knowledge_detail/DocumentsTab";
@@ -1502,5 +1503,124 @@ describe("KnowledgeDetail — maintenance wiring (B-175 P3-PR3)", () => {
     renderDetail(`/knowledge/support-docs/settings?tenant_id=${FOREIGN_TENANT}`);
     expect(await screen.findByTestId("kb-settings-reingest-stale")).toBeDisabled();
     expect(stale).toHaveBeenCalledWith("support-docs", FOREIGN_TENANT);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// B-175 P2-PR4 — the retrieval records tab, and the retrieval test's
+// 「存为库默认参数」 / 「查看检索记录」 wired to the page.
+// ---------------------------------------------------------------------------
+
+describe("KnowledgeDetail — retrieval records (B-175 P2-PR4)", () => {
+  const EMPTY_LOGS: logsSdk.RetrievalLogsPage = { logs: [], total: 0, offset: 0, limit: 20 };
+
+  it("has a records tab that keeps an aggregate deep link's tenant", async () => {
+    scopeRef.current = "*";
+    vi.spyOn(knowledgeSdk, "getBase").mockResolvedValue(BASE);
+    vi.spyOn(knowledgeSdk, "listDocuments").mockResolvedValue(docPage(DOCS));
+    const list = vi.spyOn(logsSdk, "listRetrievalLogs").mockResolvedValue(EMPTY_LOGS);
+
+    renderDetail(`/knowledge/support-docs?tenant_id=${FOREIGN_TENANT}`);
+    await waitFor(() => expect(screen.getByTestId("knowledge-detail-root")).toBeInTheDocument());
+    await userEvent.click(screen.getByRole("tab", { name: "Retrieval records" }));
+    await screen.findByTestId("knowledge-logs-tab");
+    await waitFor(() =>
+      expect(list).toHaveBeenCalledWith(
+        "support-docs",
+        {},
+        { limit: 20, offset: 0 },
+        FOREIGN_TENANT,
+      ),
+    );
+  });
+
+  // 「存为库默认参数」 PATCHes the caller's own tenant's base by name: on another
+  // tenant's base it must stay off however the parameters change.
+  it.each([
+    [
+      "an aggregate deep link to another tenant's base",
+      "*",
+      false,
+      `/knowledge/support-docs/test?tenant_id=${FOREIGN_TENANT}`,
+    ],
+    ["switched into another tenant", FOREIGN_TENANT, true, "/knowledge/support-docs/test"],
+  ] as const)(
+    "keeps 存为库默认参数 off on %s",
+    async (_case, scope, switched, path) => {
+      scopeRef.current = scope;
+      isTenantSwitchedMock.mockReturnValue(switched);
+      vi.spyOn(knowledgeSdk, "getBase").mockResolvedValue(BASE);
+      const update = vi.spyOn(knowledgeSdk, "updateBase");
+
+      renderDetail(path);
+      const topK = await screen.findByRole("spinbutton", { name: "Top-k" });
+      await userEvent.clear(topK);
+      await userEvent.type(topK, "8");
+      expect(topK).toHaveValue("8");
+      const save = screen.getByTestId("kb-test-save-defaults");
+      expect(save).toBeDisabled();
+      expect(within(screen.getByTestId("knowledge-test-tab")).getByTestId("readonly-tooltip")).toContainElement(save);
+      expect(update).not.toHaveBeenCalled();
+    },
+  );
+
+  it("opens the records tab from the retrieval test", async () => {
+    vi.spyOn(knowledgeSdk, "getBase").mockResolvedValue(BASE);
+    vi.spyOn(knowledgeSdk, "testRetrieval").mockResolvedValue({
+      query: "q",
+      count: 0,
+      results: [],
+      elapsed_ms: 12,
+      log_id: "log-1",
+    });
+    vi.spyOn(logsSdk, "listRetrievalLogs").mockResolvedValue(EMPTY_LOGS);
+
+    renderDetail("/knowledge/support-docs/test");
+    await userEvent.type(await screen.findByTestId("kb-test-query"), "q");
+    await userEvent.click(screen.getByTestId("kb-test-run"));
+    await userEvent.click(await screen.findByTestId("kb-test-open-logs"));
+    expect(await screen.findByTestId("knowledge-logs-tab")).toBeInTheDocument();
+  });
+
+  it("shows the saved defaults without reloading the page, keeping the test's results", async () => {
+    const getBase = vi.spyOn(knowledgeSdk, "getBase").mockResolvedValue(BASE);
+    vi.spyOn(knowledgeSdk, "testRetrieval").mockResolvedValue({
+      query: "q",
+      count: 1,
+      results: [
+        {
+          content: "The deductible is 500.",
+          source: "faq.pdf#0",
+          filename: "faq.pdf",
+          chunk_index: 0,
+          score: 0.9,
+          recall_source: "both",
+        },
+      ],
+    });
+    const saved = {
+      ...BASE,
+      retrieval_config: { ...BASE.retrieval_config!, top_k: 8 },
+    };
+    vi.spyOn(knowledgeSdk, "updateBase").mockResolvedValue(saved);
+
+    renderDetail("/knowledge/support-docs/test");
+    await userEvent.type(await screen.findByTestId("kb-test-query"), "q");
+    await userEvent.click(screen.getByTestId("kb-test-run"));
+    await screen.findByText("The deductible is 500.");
+    const topK = screen.getByRole("spinbutton", { name: "Top-k" });
+    await userEvent.clear(topK);
+    await userEvent.type(topK, "8");
+    await userEvent.click(screen.getByTestId("kb-test-save-defaults"));
+    const confirm = await screen.findAllByRole("button", { name: "Save as base defaults" });
+    await userEvent.click(confirm[confirm.length - 1]);
+
+    // The saved base is the page's now: nothing differs, so nothing to save.
+    await waitFor(() => expect(screen.getByTestId("kb-test-save-defaults")).toBeDisabled());
+    expect(screen.getByText("The deductible is 500.")).toBeInTheDocument();
+    expect(getBase).toHaveBeenCalledTimes(1);
+
+    await userEvent.click(screen.getByRole("tab", { name: "Settings" }));
+    expect(await screen.findByRole("spinbutton", { name: "Results (top-k)" })).toHaveValue("8");
   });
 });

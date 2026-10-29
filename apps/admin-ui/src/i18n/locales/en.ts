@@ -564,6 +564,108 @@ export interface TranslationKeys {
     config_summary_chunk_only: string;
     config_summary_overlap: string;
   };
+  /** B-175 P2-PR4 — a base's retrieval records + the retrieval test's scores. */
+  knowledge_retrieval: {
+    tab_logs: string;
+    retention_notice: string;
+    filter_source: string;
+    source_all: string;
+    source_agent: string;
+    source_console_test: string;
+    source_open_api: string;
+    filter_outcome: string;
+    outcome_all: string;
+    outcome_zero_hit: string;
+    outcome_ok: string;
+    outcome_below_threshold: string;
+    outcome_error: string;
+    filter_time: string;
+    clear_filters: string;
+    status_ok: string;
+    status_no_hits: string;
+    status_below_threshold: string;
+    status_error: string;
+    col_time: string;
+    col_source: string;
+    col_query: string;
+    col_status: string;
+    col_results: string;
+    col_latency: string;
+    col_actions: string;
+    view: string;
+    latency_ms: string;
+    pager_total: string;
+    empty: string;
+    empty_filtered: string;
+    load_failed: string;
+    no_permission: string;
+    retry: string;
+    detail_title: string;
+    detail_missing: string;
+    detail_failed: string;
+    field_question: string;
+    field_actor: string;
+    field_links: string;
+    open_conversation: string;
+    open_run: string;
+    links_other_tenant: string;
+    field_params: string;
+    param_default: string;
+    value_on: string;
+    value_off: string;
+    value_none: string;
+    field_flags: string;
+    multibase: string;
+    results_title: string;
+    results_empty: string;
+    doc_deleted: string;
+    doc_disabled: string;
+    platform_admin: string;
+    platform_admin_hint: string;
+    uploaded_at: string;
+    passage_parent: string;
+    passage_chunk: string;
+    text_loading: string;
+    text_gone: string;
+    hit_gone: string;
+    text_disabled: string;
+    text_failed: string;
+    text_live_note: string;
+    score_vector: string;
+    score_keyword: string;
+    score_fused: string;
+    score_rerank: string;
+    score_vector_hint: string;
+    score_keyword_hint: string;
+    score_fused_hint: string;
+    score_rerank_hint: string;
+    notice_embedding_degraded: string;
+    notice_keyword_degraded: string;
+    notice_duplicates_dropped_one: string;
+    notice_duplicates_dropped_other: string;
+    notice_rerank_dropped_one: string;
+    notice_rerank_dropped_other: string;
+    notice_unsearched: string;
+    notice_threshold_paused: string;
+    notice_error: string;
+    flag_candidates: string;
+    flag_rerank_model: string;
+    elapsed: string;
+    logged: string;
+    not_logged: string;
+    open_logs: string;
+    doc_filter: string;
+    doc_filter_all: string;
+    below_threshold: string;
+    rerank_threshold_placeholder: string;
+    rerank_threshold_none: string;
+    calibration_warning: string;
+    save_defaults: string;
+    save_defaults_same: string;
+    save_defaults_confirm: string;
+    save_defaults_rerank_note: string;
+    save_defaults_done: string;
+  };
   knowledge_page: {
     page_title: string;
     subtitle: string;
@@ -4082,6 +4184,117 @@ const en: TranslationKeys = {
     config_summary: "Chunking: chunk {{chunk}} / passage {{parent}} tokens",
     config_summary_chunk_only: "Chunking: chunk {{chunk}} tokens",
     config_summary_overlap: " / overlap {{overlap}}",
+  },
+  knowledge_retrieval: {
+    tab_logs: "Retrieval records",
+    retention_notice:
+      "Records are kept for {{days}} days, then deleted. A record keeps the question, the parameters and each hit's passage numbers and scores — not the document text; the text in a record's details is read as it is now.",
+    filter_source: "Source",
+    source_all: "All sources",
+    source_agent: "Agent",
+    source_console_test: "Retrieval test",
+    source_open_api: "Open API",
+    filter_outcome: "Outcome",
+    outcome_all: "All outcomes",
+    outcome_zero_hit: "Zero hits",
+    outcome_ok: "Found results",
+    outcome_below_threshold: "All below the rerank floor",
+    outcome_error: "Failed",
+    filter_time: "Time",
+    clear_filters: "Clear filters",
+    status_ok: "Found",
+    status_no_hits: "No hits",
+    status_below_threshold: "Below rerank floor",
+    status_error: "Failed",
+    col_time: "Time",
+    col_source: "Source",
+    col_query: "Question",
+    col_status: "Outcome",
+    col_results: "Results",
+    col_latency: "Took",
+    col_actions: "Actions",
+    view: "View",
+    latency_ms: "{{ms}} ms",
+    pager_total: "{{total}} records",
+    empty:
+      "No retrieval records yet. Searches of this base by an agent, or from the Retrieval test tab, show up here and are kept for {{days}} days.",
+    empty_filtered: "No records match these filters.",
+    load_failed: "Failed to load retrieval records",
+    no_permission:
+      "You don't have permission to read retrieval records (it takes read access to conversation records).",
+    retry: "Retry",
+    detail_title: "Retrieval record",
+    detail_missing:
+      "This record no longer exists — it passed the retention period or was deleted with its conversation.",
+    detail_failed: "Failed to load the record",
+    field_question: "Question",
+    field_actor: "Run by",
+    field_links: "Conversation",
+    open_conversation: "Open conversation",
+    open_run: "Open run",
+    links_other_tenant: "Switch to this tenant in the tenant switcher to open its conversation.",
+    field_params: "Parameters",
+    param_default: "base default",
+    value_on: "on",
+    value_off: "off",
+    value_none: "none",
+    field_flags: "How it ran",
+    multibase:
+      "This search covered {{count}} bases; the result count and the results span all of them.",
+    results_title: "Results",
+    results_empty: "No results.",
+    doc_deleted: "Document deleted",
+    doc_disabled: "Document switched off",
+    platform_admin: "Platform admin",
+    platform_admin_hint: "Searched by platform staff from outside this tenant.",
+    uploaded_at: "uploaded {{time}}",
+    passage_parent: "Passage #{{parent}} · chunk #{{chunk}}",
+    passage_chunk: "Chunk #{{chunk}}",
+    text_loading: "Reading the text…",
+    text_gone: "This passage no longer exists (the document was re-ingested or the passage edited).",
+    hit_gone: "The matched chunk has changed since; the passage is shown without it.",
+    text_disabled: "Switched off",
+    text_failed: "Couldn't read the text: {{error}}",
+    text_live_note: "Text as it is now — the record does not keep the text the search returned.",
+    score_vector: "Vector",
+    score_keyword: "Keyword",
+    score_fused: "Fused",
+    score_rerank: "Rerank",
+    score_vector_hint: "Semantic similarity between the question and this chunk (0–1).",
+    score_keyword_hint: "Keyword-match score; comparable only within one search.",
+    score_fused_hint: "Both paths' rankings merged; it ordered the results before the rerank.",
+    score_rerank_hint: "The rerank model's score; the base's rerank floor is compared with it.",
+    notice_embedding_degraded: "The question could not be embedded; this search used keywords only.",
+    notice_keyword_degraded: "Keyword search did not finish; these are the vector search's results only.",
+    notice_duplicates_dropped_one: "{{count}} duplicate passage was left out.",
+    notice_duplicates_dropped_other: "{{count}} duplicate passages were left out.",
+    notice_rerank_dropped_one:
+      "{{count}} candidate was past the rerank model's per-request limit and got no rerank score.",
+    notice_rerank_dropped_other:
+      "{{count}} candidates were past the rerank model's per-request limit and got no rerank score.",
+    notice_unsearched: "Not searched (no recall path answered): {{bases}}",
+    notice_threshold_paused:
+      "The base's rerank floor was left out: it was set under another rerank model.",
+    notice_error: "The search failed ({{error}}).",
+    flag_candidates: "Candidates: {{count}}",
+    flag_rerank_model: "Rerank model: {{model}}",
+    elapsed: "Took {{ms}} ms",
+    logged: "Saved to the retrieval records",
+    not_logged: "Not saved to the retrieval records",
+    open_logs: "View records",
+    doc_filter: "Document",
+    doc_filter_all: "All documents",
+    below_threshold:
+      "All {{candidates}} candidates scored below the rerank floor, so nothing was returned.",
+    rerank_threshold_placeholder: "Empty = the base's ({{value}})",
+    rerank_threshold_none: "none",
+    calibration_warning:
+      "With more than 25 results the candidate pool grows, so rerank scores are not comparable with an agent's default search. Calibrate the floor with 25 or fewer.",
+    save_defaults: "Save as base defaults",
+    save_defaults_same: "These parameters are already the base's defaults.",
+    save_defaults_confirm: "Save these as the base's defaults?",
+    save_defaults_rerank_note: "The rerank floor is bound to the current rerank model.",
+    save_defaults_done: "Saved as the base's defaults",
   },
   knowledge_page: {
     page_title: "Knowledge",
