@@ -439,6 +439,31 @@ class KnowledgeStore(abc.ABC):
         loop (e.g. retrieval attribution — an N+1 over the result's documents)."""
 
     @abc.abstractmethod
+    async def get_document_by_seq(
+        self, *, tenant_id: UUID, doc_seq: int
+    ) -> KnowledgeDocument | None:
+        """The tenant's document ``D{doc_seq}`` (B-206 K-2), or ``None``. The
+        number is tenant-wide: the caller checks the base."""
+
+    @abc.abstractmethod
+    async def find_documents_by_name(
+        self,
+        *,
+        tenant_id: UUID,
+        kb_ids: Sequence[UUID],
+        name: str,
+        limit: int,
+        exact: bool = False,
+    ) -> list[KnowledgeDocument]:
+        """The switched-on documents of ``kb_ids`` whose file name or title is
+        ``name`` (``exact``) or contains it, case-insensitively and literally (no
+        wildcards), by ``doc_seq``; at most ``limit`` (B-206 K-2:
+        ``knowledge_read`` finding a document by name). A switched-off document
+        is never listed: it is out of the agent's knowledge, as for recall. Both
+        sides are case-folded by the same ``lower()`` (the database's, or
+        Python's in memory)."""
+
+    @abc.abstractmethod
     async def get_document_content(self, *, tenant_id: UUID, document_id: UUID) -> bytes | None:
         """The document's retained original bytes, or ``None`` (legacy rows /
         unknown id)."""

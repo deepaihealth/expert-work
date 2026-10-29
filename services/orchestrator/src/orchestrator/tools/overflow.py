@@ -116,7 +116,10 @@ FALLBACK_MAX_CHARS = 30_000
 #: persist→read→persist loop (the original CM-F3 guard, narrowed from "every
 #: read_only tool" to exactly these — ``web_search`` is read_only too but its
 #: results are NOT cheaply re-readable, so it must still be externalized).
-EXEMPT_TOOLS = frozenset({"read_document", "read_file", "list_dir"})
+#: ``knowledge_read`` (B-206 K-2) re-reads a knowledge document; the pruner
+#: collapses it to a re-read reference instead
+#: (:mod:`orchestrator.context.knowledge_reference`).
+EXEMPT_TOOLS = frozenset({"read_document", "read_file", "list_dir", "knowledge_read"})
 
 
 def _elide(text: str, *, head: int, tail: int, note: str) -> str:

@@ -1683,6 +1683,56 @@ class SqlKnowledgeStore(SqlEstimates, KnowledgeStore):
             rows = (await session.execute(stmt)).scalars().all()
         return {row.id: _to_document(row) for row in rows}
 
+    async def get_document_by_seq(
+        self, *, tenant_id: UUID, doc_seq: int
+    ) -> KnowledgeDocument | None:
+        stmt = select(KnowledgeDocumentRow).where(
+            KnowledgeDocumentRow.tenant_id == tenant_id,
+            KnowledgeDocumentRow.doc_seq == doc_seq,
+        )
+        async with self._sf() as session:
+            row = (await session.execute(stmt)).scalar_one_or_none()
+        return _to_document(row) if row is not None else None
+
+    async def find_documents_by_name(
+        self,
+        *,
+        tenant_id: UUID,
+        kb_ids: Sequence[UUID],
+        name: str,
+        limit: int,
+        exact: bool = False,
+    ) -> list[KnowledgeDocument]:
+        if not kb_ids:
+            return []
+        # Both sides folded by the database's lower(); strpos matches literally
+        # (no LIKE wildcards to escape).
+        needle = func.lower(literal(name))
+        filename = func.lower(KnowledgeDocumentRow.filename)
+        title = func.lower(func.coalesce(KnowledgeDocumentRow.title, ""))
+        named = (
+            or_(filename == needle, title == needle)
+            if exact
+            else or_(func.strpos(filename, needle) > 0, func.strpos(title, needle) > 0)
+        )
+        stmt = (
+            select(KnowledgeDocumentRow)
+            .where(
+                KnowledgeDocumentRow.tenant_id == tenant_id,
+                KnowledgeDocumentRow.kb_id.in_(list(kb_ids)),
+                KnowledgeDocumentRow.enabled.is_(True),
+                named,
+            )
+            .order_by(
+                KnowledgeDocumentRow.doc_seq.asc().nulls_last(),
+                KnowledgeDocumentRow.id.asc(),
+            )
+            .limit(limit)
+        )
+        async with self._sf() as session:
+            rows = (await session.execute(stmt)).scalars().all()
+        return [_to_document(row) for row in rows]
+
     async def get_document_content(self, *, tenant_id: UUID, document_id: UUID) -> bytes | None:
         stmt = select(KnowledgeDocumentRow.content).where(
             KnowledgeDocumentRow.tenant_id == tenant_id,

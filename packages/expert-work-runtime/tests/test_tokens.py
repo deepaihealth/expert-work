@@ -66,6 +66,19 @@ def test_tiktoken_estimator_memoises_repeat_texts() -> None:
     assert fake.calls == 1  # second count served from the memo
 
 
+def test_count_uncached_neither_reads_nor_writes_the_memo() -> None:
+    """B-206 K-2 — a bulk one-off text (a document's passages) is counted
+    without evicting the message prefixes the memo keeps warm."""
+    est = TiktokenEstimator()
+    fake = _FakeEncoding()
+    est._encoding = cast(Encoding, fake)
+    est.count("kept warm")
+    assert est.count_uncached("one-off passage") == len("one-off passage")
+    assert est.count_uncached("kept warm") == len("kept warm")
+    assert list(est._memo) == ["kept warm"]
+    assert fake.calls == 3  # the memo was not read for the uncached count either
+
+
 def test_tiktoken_estimator_memo_is_bounded() -> None:
     est = TiktokenEstimator(memo_max_entries=2)
     est._encoding = cast(Encoding, _FakeEncoding())

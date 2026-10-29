@@ -528,6 +528,40 @@ class InMemoryKnowledgeStore(InMemoryEstimates, KnowledgeStore):
         wanted = set(document_ids)
         return {d.id: d for d in self._documents if d.tenant_id == tenant_id and d.id in wanted}
 
+    async def get_document_by_seq(
+        self, *, tenant_id: UUID, doc_seq: int
+    ) -> KnowledgeDocument | None:
+        return next(
+            (d for d in self._documents if d.tenant_id == tenant_id and d.doc_seq == doc_seq),
+            None,
+        )
+
+    async def find_documents_by_name(
+        self,
+        *,
+        tenant_id: UUID,
+        kb_ids: Sequence[UUID],
+        name: str,
+        limit: int,
+        exact: bool = False,
+    ) -> list[KnowledgeDocument]:
+        needle = name.lower()
+        bases = set(kb_ids)
+
+        def matches(field: str) -> bool:
+            return field == needle if exact else needle in field
+
+        found = [
+            d
+            for d in self._documents
+            if d.tenant_id == tenant_id
+            and d.kb_id in bases
+            and d.enabled
+            and (matches(d.filename.lower()) or matches((d.title or "").lower()))
+        ]
+        found.sort(key=lambda d: (d.doc_seq is None, d.doc_seq or 0, str(d.id)))
+        return found[:limit]
+
     async def get_document_content(self, *, tenant_id: UUID, document_id: UUID) -> bytes | None:
         doc = await self.get_document(tenant_id=tenant_id, document_id=document_id)
         return self._content.get(document_id) if doc is not None else None

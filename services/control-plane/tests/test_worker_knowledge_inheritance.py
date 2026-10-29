@@ -168,7 +168,7 @@ async def test_worker_of_a_one_base_parent_searches_only_that_base(
     [registry] = registries
 
     content = await _search(registry, tenant)
-    assert "[a.md#0]" in content and _UNBOUND not in content
+    assert "[D1#0] a.md" in content and _UNBOUND not in content
     # One base: ``bases`` is not offered and is ignored when passed anyway.
     assert _UNBOUND not in await _search(registry, tenant, bases=[_UNBOUND])
     assert _search_parameters(built) == {"query", "limit"}
@@ -190,8 +190,8 @@ async def test_worker_of_a_two_base_parent_gets_the_catalog(
     assert "bases" in _search_parameters(built)
 
     content = await _search(registry, tenant)
-    assert "[a.md#0]" in content and "[b.md#0]" in content and _UNBOUND not in content
-    assert "[b.md#0]" in await _search(registry, tenant, bases=["K2"])
+    assert "[D1#0] a.md" in content and "[D2#0] b.md" in content and _UNBOUND not in content
+    assert "[D2#0] b.md" in await _search(registry, tenant, bases=["K2"])
     with pytest.raises(GuidedToolError, match="K1 \\(a\\), K2 \\(b\\)"):
         await _search(registry, tenant, bases=[_UNBOUND])
 
@@ -205,6 +205,58 @@ async def test_worker_of_a_parent_without_knowledge_has_neither(
     [registry] = registries
 
     assert registry.get("knowledge_search") is None
-    assert "knowledge_search" not in {e.name for e in built.tool_catalog}
-    for text in ("knowledge_catalog", "# Knowledge bases", "knowledge_search"):
+    assert registry.get("knowledge_read") is None
+    assert {"knowledge_search", "knowledge_read"}.isdisjoint(e.name for e in built.tool_catalog)
+    for text in ("knowledge_catalog", "# Knowledge bases", "knowledge_search", "knowledge_read"):
         assert text not in built.system_prompt
+
+
+async def _read(registry: ToolRegistry, tenant: UUID, document: str) -> str:
+    tool = registry.get("knowledge_read")
+    assert tool is not None
+    result = await tool.call({"document": document}, ctx=ToolContext(tenant_id=tenant))
+    return str(result.content)
+
+
+@pytest.mark.asyncio
+async def test_worker_reads_the_parents_documents_and_no_others(
+    registries: list[ToolRegistry],
+) -> None:
+    """B-206 K-2 — ``knowledge_read`` comes with the inherited block: the
+    worker reads the parent's bases, and a document of a base the parent does
+    not bind reads like one that does not exist — by number or by name."""
+    store, tenant = await _seed(["a", _UNBOUND])
+    built = await _build_worker(store, tenant, _parent(["a"]))
+    [registry] = registries
+
+    assert "knowledge_read" in {e.name for e in built.tool_catalog}
+    assert "policy text from base a" in await _read(registry, tenant, "D1")
+    with pytest.raises(GuidedToolError, match=r"^no document D2 in this agent's knowledge bases$"):
+        await _read(registry, tenant, "D2")
+    with pytest.raises(GuidedToolError, match="no document with that file name or title"):
+        await _read(registry, tenant, f"{_UNBOUND}.md")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("allowed", "has_knowledge"), [(["knowledge_search"], True), (["web_search"], False)]
+)
+async def test_the_worker_allowlist_keys_both_knowledge_tools_on_knowledge_search(
+    registries: list[ToolRegistry], allowed: list[str], has_knowledge: bool
+) -> None:
+    store, tenant = await _seed(["a"])
+    build_fn = make_worker_build_fn(
+        secret_store=LocalDevSecretStore.from_mapping({_KEY_NAME: "sk-ant-test"}),
+        checkpointer=InMemorySaver(),
+        base_tool_env=ToolEnv(
+            knowledge_retriever=KnowledgeRetriever(store=store, embedder=FakeEmbedder())
+        ),
+        max_iterations=8,
+        allowed_toolsets=allowed,
+        credentials_resolver=_credentials(),
+    )
+    await build_fn(_parent(["a"]), tenant_id=tenant, role="probe", depth=1)
+    [registry] = registries
+
+    assert (registry.get("knowledge_search") is not None) is has_knowledge
+    assert (registry.get("knowledge_read") is not None) is has_knowledge

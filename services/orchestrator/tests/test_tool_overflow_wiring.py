@@ -218,6 +218,18 @@ async def test_exempt_fetch_back_tool_is_never_externalized() -> None:
     assert str(_tool_message(state).content) == _CAPPED
 
 
+async def test_a_knowledge_read_page_reaches_the_model_whole() -> None:
+    # B-206 K-2: knowledge_read is a fetch-back reader too (the document is
+    # re-readable); a 16,000-token page the model asked for is not swapped for a
+    # 3,000-character preview, nor written to the workspace.
+    writer = _RecordingWriter()
+    state = await _run_one_turn(
+        tool=_BigResultTool(name="knowledge_read"), writer=writer, thread_id="ov-kr"
+    )
+    assert writer.writes == {}
+    assert str(_tool_message(state).content) == _FULL
+
+
 async def test_read_only_nonexempt_tool_is_externalized() -> None:
     # A read-only tool that is NOT a fetch-back reader (e.g. web_search) is now
     # externalized — its results are not cheaply re-readable, and there is no

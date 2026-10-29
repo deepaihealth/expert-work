@@ -52,6 +52,7 @@ from orchestrator.tools.file_ops import (
 from orchestrator.tools.find_tools import FindToolsTool
 from orchestrator.tools.http import AllowlistProvider, DenylistProvider, HTTPTool
 from orchestrator.tools.knowledge import KnowledgeRetriever, KnowledgeSearchTool
+from orchestrator.tools.knowledge_read import KnowledgeReadTool
 from orchestrator.tools.locks import NullWorkspaceLock, WorkspaceLock
 from orchestrator.tools.mcp import MCPServerPool, register_mcp_tools
 from orchestrator.tools.read_document import ReadDocumentTool
@@ -417,8 +418,10 @@ def _register_knowledge_search(
     registry: ToolRegistry, knowledge: KnowledgeSpec | None, env: ToolEnv
 ) -> None:
     """Register the ``knowledge_search`` tool when the manifest declares a
-    ``knowledge:`` block — Stream J.5. A declared block with no
-    :attr:`ToolEnv.knowledge_retriever` is an un-buildable manifest."""
+    ``knowledge:`` block — Stream J.5 — and ``knowledge_read`` beside it, over
+    the same bases (B-206 K-2: one gate, so an agent with no knowledge base has
+    neither). A declared block with no :attr:`ToolEnv.knowledge_retriever` is an
+    un-buildable manifest."""
     if knowledge is None:
         return
     if env.knowledge_retriever is None:
@@ -426,11 +429,12 @@ def _register_knowledge_search(
             "manifest declares 'knowledge' but no knowledge retriever is "
             "configured (ToolEnv.knowledge_retriever)"
         )
+    refs = tuple(knowledge.knowledge_base_refs)
     registry.register(
-        KnowledgeSearchTool(
-            retriever=env.knowledge_retriever,
-            knowledge_base_refs=tuple(knowledge.knowledge_base_refs),
-        )
+        KnowledgeSearchTool(retriever=env.knowledge_retriever, knowledge_base_refs=refs)
+    )
+    registry.register(
+        KnowledgeReadTool(store=env.knowledge_retriever.store, knowledge_base_refs=refs)
     )
 
 

@@ -103,6 +103,12 @@ class TiktokenEstimator:
                     self._memo.popitem(last=False)
         return value
 
+    def count_uncached(self, text: str) -> int:
+        """:meth:`count` without reading or writing the memo — for bulk one-off
+        texts (B-206 K-2: a knowledge document's passages) that would only evict
+        the message prefixes the memo keeps warm across turns."""
+        return self._count_uncached(text)
+
     def warm(self) -> bool:
         """Load the BPE vocabulary now; ``True`` iff it is usable.
 

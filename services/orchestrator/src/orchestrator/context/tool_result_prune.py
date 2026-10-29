@@ -67,6 +67,7 @@ from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, ToolMe
 from expert_work.common.conversation_channel import is_hidden
 from expert_work.runtime.tokens import TokenEstimator
 from orchestrator.context.compressor import estimate_tokens
+from orchestrator.context.knowledge_reference import knowledge_read_reference
 from orchestrator.context.skill_reference import skill_view_reference
 from orchestrator.tools.overflow import (
     OVERFLOW_DIR,
@@ -220,10 +221,10 @@ def _collapsed_content(message: ToolMessage, *, lossy_note: str) -> str | None:
         return None
     if message.name in _NEVER_PRUNE_TOOLS:
         return None
-    reference = skill_view_reference(message)
+    reference = skill_view_reference(message) or knowledge_read_reference(message)
     if reference is not None:
         # Wrapped in the prune tags so ``_is_already_pruned`` keeps the pass
-        # idempotent for skill stubs too.
+        # idempotent for skill / knowledge_read stubs too.
         return f"{_PRUNE_TAG_OPEN}\n{reference}\n{_PRUNE_TAG_CLOSE}"
     path = _artifact_path(message)
     if path is not None:
@@ -354,8 +355,11 @@ def _lossless_reference(message: ToolMessage) -> str | None:
     抽取)—— 那条路径也可能整段是攻击者伪造的,所以只取这一个结构化字段,
     永远不返回标签之间的原始文本,避免把攻击者的正文内容当作『可信引用』带
     出围栏。
+
+    B-206 K-2: a ``knowledge_read`` result is exempt from externalization and has
+    no persisted copy; reading it again with the same arguments recovers it.
     """
-    reference = skill_view_reference(message)
+    reference = skill_view_reference(message) or knowledge_read_reference(message)
     if reference is not None:
         return reference
     content = message.content
