@@ -135,27 +135,13 @@ class ArtifactStore(abc.ABC):
         """
 
     @abc.abstractmethod
-    async def get_version(
-        self,
-        *,
-        tenant_id: UUID,
-        user_id: UUID,
-        agent_key: str | None,
-        name: str,
-        version: int,
-    ) -> ArtifactVersion | None:
-        """B-235 —— ``(agent_key, name)`` 的第 ``version`` 版,不是最新版。
-
-        对话页按「这一轮登记的那一版」下载、对外接口按清单里的版本号取,都走这里。
-        隐藏规则与 :meth:`get_latest_version` 相同:未知 / 已软删 / 跨用户 / 跨
-        agent 一律 ``None``。``agent_key=None`` 时同名多行取 ``updated_at`` 最新的。
-        """
-
-    @abc.abstractmethod
     async def get_version_by_id(
         self, *, tenant_id: UUID, user_id: UUID, artifact_id: UUID, version: int
     ) -> ArtifactVersion | None:
-        """B-235 —— 控制台全量视图按 ``artifact_id`` 取第 ``version`` 版。
+        """B-235 —— 按 ``artifact_id`` 取第 ``version`` 版(不是最新版)。
+
+        三个下载端点都先取最新版、再从**同一行**按 id 取指定版本 —— 不按名字查第二次,
+        两次按名字的查询可能落在两条不同的同名产物上。
 
         隐藏规则同 :meth:`get_latest_version_by_id`。
         """
@@ -183,6 +169,14 @@ class ArtifactStore(abc.ABC):
 
         孤儿副本清理用:副本以版本行 id 命名,找不到行的副本就是没人认领的字节。
         Caller MUST be inside an RLS bypass scope (the retention job)."""
+
+    @abc.abstractmethod
+    async def bypasses_row_security(self) -> bool:
+        """B-235 —— 这个连接能不能看见所有租户的行(库角色有 BYPASSRLS 或是超级用户)。
+
+        ``bypass_rls_var`` 只是让本进程不发租户 GUC;连库角色没有 BYPASSRLS 时,强制 RLS
+        照样把跨租户查询收成空集。孤儿副本清理按「找不到版本行」删字节,删之前必须先问这一
+        句 —— 看不见所有行就不删。"""
 
     @abc.abstractmethod
     async def soft_delete_by_id(

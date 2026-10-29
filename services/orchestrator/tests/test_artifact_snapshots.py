@@ -350,6 +350,11 @@ async def _one_copy(
     return artifact_snapshot_dir(str(tmp_path), tenant, user) / key
 
 
+@pytest.mark.skipif(
+    os.geteuid() == 0,
+    reason="root 无视文件权限位,chmod 0o000 之后依旧读得动——这条测试的前提"
+    "(权限位真的能挡住读)在 root 下不成立",
+)
 async def test_an_unreadable_copy_directory_is_a_permission_error(
     tmp_path: Path, nas: NasArtifactSnapshotStore, ids: tuple[UUID, UUID]
 ) -> None:
@@ -363,6 +368,11 @@ async def test_an_unreadable_copy_directory_is_a_permission_error(
         copy.parent.chmod(0o700)
 
 
+@pytest.mark.skipif(
+    os.geteuid() == 0,
+    reason="root 无视文件权限位,chmod 0o000 之后依旧读得动——这条测试的前提"
+    "(权限位真的能挡住读)在 root 下不成立",
+)
 async def test_an_unreadable_copy_is_a_permission_error(
     tmp_path: Path, nas: NasArtifactSnapshotStore, ids: tuple[UUID, UUID]
 ) -> None:
@@ -385,8 +395,15 @@ async def test_an_io_error_reading_a_copy_stays_in_the_supervisor_error_family(
     tenant, user = ids
     copy = await _one_copy(tmp_path, nas, tenant, user)
 
+    target_ino = os.stat(copy).st_ino
+    real_fstat = os.fstat
+
     def broken_fstat(fd: int) -> os.stat_result:
-        raise OSError(5, "Input/output error")
+        # 只让这个副本的 fd 出错 —— 补丁打在全局 ``os`` 上,别的 fstat 照常。
+        info = real_fstat(fd)
+        if info.st_ino == target_ino:
+            raise OSError(5, "Input/output error")
+        return info
 
     monkeypatch.setattr(snapshots_mod.os, "fstat", broken_fstat)
     with pytest.raises(ArtifactSnapshotReadError) as excinfo:

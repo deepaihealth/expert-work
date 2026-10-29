@@ -42,6 +42,10 @@ logger = logging.getLogger(__name__)
 _ORPHAN_MIN_AGE_S = 24 * 3600
 #: 一次查库问多少个 id。
 _ID_BATCH = 500
+#: 「大批孤儿」把关:找不到版本行的副本超过这么多、且占了多数时不删。真实的孤儿是零星的
+#: (登记失败、清除用户没删成);一大批同时「找不到行」更像是库里看不见行(连库角色没有
+#: BYPASSRLS、连错了库、表被清空),而删除不可逆 —— 停下来记日志等人看。
+_MASS_ORPHAN_MIN = 50
 _TMP_MARK = ".tmp-"
 
 
@@ -206,12 +210,32 @@ async def sweep_orphan_copies(
     """删找不到版本行的副本与 ``.tmp-`` 残件(都要满 ``min_age_s``);返回删掉的文件数。
 
     Caller MUST be inside an RLS bypass scope (``existing_version_ids`` is cross-tenant).
+    删除不可逆,所以「找不到行」必须是真的找不到,两道把关,任一不过就一个都不删:
+
+    1. 连库角色看得见所有租户的行(:meth:`ArtifactStore.bypasses_row_security`)——
+       ``bypass_rls_var`` 只管本进程不发 GUC,管不了库;
+    2. 找不到行的副本不是「一大批且占多数」(:data:`_MASS_ORPHAN_MIN`)。
     """
+    if not await store.bypasses_row_security():
+        logger.error(
+            "retention.artifact_copy_sweep_refused reason=role_cannot_see_every_row "
+            "— the DB role needs BYPASSRLS; nothing deleted"
+        )
+        return 0
     candidates = await asyncio.to_thread(_candidates, root, older_than=time.time() - min_age_s)
     ids = [c.version_id for c in candidates if c.version_id is not None]
     alive: set[UUID] = set()
     for start in range(0, len(ids), _ID_BATCH):
         alive |= await store.existing_version_ids(ids[start : start + _ID_BATCH])
+    orphans = sum(1 for version_id in ids if version_id not in alive)
+    if orphans > _MASS_ORPHAN_MIN and orphans * 2 > len(ids):
+        logger.error(
+            "retention.artifact_copy_sweep_refused reason=mass_orphans orphans=%d copies=%d "
+            "— looks like rows are invisible rather than gone; nothing deleted",
+            orphans,
+            len(ids),
+        )
+        return 0
     removed = 0
     for candidate in candidates:
         if candidate.version_id is not None and candidate.version_id in alive:

@@ -6,7 +6,7 @@ from collections.abc import Sequence
 from datetime import UTC, datetime
 from uuid import UUID, uuid4
 
-from sqlalchemy import delete, select, update
+from sqlalchemy import delete, select, text, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
@@ -205,36 +205,6 @@ class SqlArtifactStore(ArtifactStore):
                 return None
             return await self._latest_of(session, artifact)
 
-    async def get_version(
-        self,
-        *,
-        tenant_id: UUID,
-        user_id: UUID,
-        agent_key: str | None,
-        name: str,
-        version: int,
-    ) -> ArtifactVersion | None:
-        # 定位父行的谓词与 ``get_latest_version`` 逐字相同(含 agent_key=None 的
-        # ORDER BY + LIMIT 1),只是最后取的是指定版本。
-        stmt = (
-            select(ArtifactRow)
-            .where(
-                ArtifactRow.tenant_id == tenant_id,
-                ArtifactRow.user_id == user_id,
-                ArtifactRow.name == name,
-                ArtifactRow.deleted_at.is_(None),
-            )
-            .order_by(ArtifactRow.updated_at.desc())
-            .limit(1)
-        )
-        if agent_key is not None:
-            stmt = stmt.where(ArtifactRow.agent_key == agent_key)
-        async with self._sf() as session:
-            artifact = (await session.execute(stmt)).scalar_one_or_none()
-            if artifact is None:
-                return None
-            return await self._version_of(session, artifact.id, version)
-
     async def get_version_by_id(
         self, *, tenant_id: UUID, user_id: UUID, artifact_id: UUID, version: int
     ) -> ArtifactVersion | None:
@@ -289,6 +259,17 @@ class SqlArtifactStore(ArtifactStore):
         async with self._sf() as session:
             rows = (await session.execute(stmt.distinct())).scalars().all()
         return set(rows)
+
+    async def bypasses_row_security(self) -> bool:
+        async with self._sf() as session:
+            row = (
+                await session.execute(
+                    text(
+                        "SELECT rolbypassrls OR rolsuper FROM pg_roles WHERE rolname = current_user"
+                    )
+                )
+            ).scalar_one_or_none()
+        return bool(row)
 
     async def existing_version_ids(self, ids: Sequence[UUID]) -> set[UUID]:
         # 强制 RLS 后没 bypass 的会话拿到空集 = 所有副本都是孤儿 → 全删。

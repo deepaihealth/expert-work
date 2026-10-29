@@ -13,6 +13,14 @@ Index ``artifact_version_path_idx`` on ``(tenant_id, user_id, path_in_workspace)
 before unlinking an expired version's workspace file, the retention job asks whether
 any other version of that user still points at the same path.
 
+Not ``CONCURRENTLY`` (same reasoning as 0141 / 0143): alembic runs each migration in a
+transaction, where ``CREATE INDEX CONCURRENTLY`` is not allowed. The plain build holds
+a lock that blocks writes to ``artifact_version`` (reads continue) for the length of
+the build. The table is small — one row per ``save_artifact`` call kept for 90 days,
+thousands of rows, not millions — so the build takes well under a second; writes
+during it (an agent's ``save_artifact``) wait rather than fail. Still, run the
+migration off-peak in production, as the release runbook does for every expand step.
+
 **Expand-only, no backfill**: NULL = registered before B-235 — no copy exists, and
 the content can only be read from ``path_in_workspace`` as before. Old code never
 writes the column, so its inserts stay NULL and pass the CHECK; an image rollback

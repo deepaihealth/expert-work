@@ -413,26 +413,95 @@ async def test_external_pre_release_older_version_stays_409(
     assert (latest.status_code, latest.content) == (200, b"OLD-2")  # type: ignore[attr-defined]
 
 
+@pytest.fixture(params=["session", "console", "external"])
+def surface(request: pytest.FixtureRequest) -> tuple[str, object]:
+    """三个下载面之一(按需建对应的 app 与身份)。"""
+    return request.param, request.getfixturevalue(request.param)
+
+
+async def _download_v1(surface: tuple[str, object]) -> tuple[_World, object]:
+    """在这个下载面上登记一版,返回 (world, 「按版本 1 下载」的协程)。"""
+    name, handle = surface
+    if name == "session":
+        sess: _Session = handle  # type: ignore[assignment]
+        await sess.save(b"AAA")
+        return sess.world, sess.download(version=1)
+    world, user_id = handle  # type: ignore[misc]
+    if name == "console":
+        await _save(world, user_id=user_id, agent_key="a-1", content=b"AAA")
+        artifact_id = await _console_artifact_id(world.client)
+        return world, world.client.get(
+            "/v1/artifacts/download", params={"artifact_id": artifact_id, "version": 1}
+        )
+    await _save(world, user_id=user_id, agent_key=agent_key_for_code(_AGENT_CODE), content=b"AAA")
+    return world, _external_get(world, 1)
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("error", "status"),
+    ("error", "status", "partner_code"),
     [
-        (WorkspacePermissionError("copy not readable"), 500),
-        (ArtifactSnapshotReadError("copy unreadable (5)"), 404),
+        (WorkspacePermissionError("copy not readable"), 500, "ARTIFACT_CONTENT_UNAVAILABLE"),
+        (ArtifactSnapshotReadError("copy unreadable (5)"), 404, "ARTIFACT_NOT_FOUND"),
     ],
 )
 async def test_copy_read_failures_go_through_the_error_ladder(
-    session: _Session, monkeypatch: pytest.MonkeyPatch, error: Exception, status: int
+    surface: tuple[str, object],
+    error: Exception,
+    status: int,
+    partner_code: str,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """读副本失败:没权限是服务端配置问题(500),I/O 失败按「内容取不到」(404);
-    都不能冒成没有处理的异常。"""
-    await session.save(b"AAA")
+    """读副本失败:没权限是服务端配置问题(500),I/O 失败按「内容取不到」(404);三个
+    下载面都不能冒成没有处理的异常,对外面还得是带错误码的信封。"""
+    world, pending = await _download_v1(surface)
 
     async def broken(**_: object) -> bytes:
         raise error
 
-    monkeypatch.setattr(session.world.snapshots, "read", broken)
-    resp = await session.download(version=1)
+    monkeypatch.setattr(world.snapshots, "read", broken)
+    resp = await pending  # type: ignore[misc]
 
-    assert resp.status_code == status, resp.text  # type: ignore[attr-defined]
-    assert "copy not readable" not in resp.text  # type: ignore[attr-defined]
+    assert resp.status_code == status, resp.text
+    assert "copy not readable" not in resp.text
+    if surface[0] == "external":
+        assert resp.json()["error"]["code"] == partner_code
+
+
+@pytest.mark.asyncio
+async def test_a_legacy_session_fetches_the_pinned_version_from_the_latest_row(
+    session: _Session,
+) -> None:
+    """``agent_name`` 为空的老会话不按 agent 收口:同一用户两个 agent 的同名产物都看得见。
+
+    取最新版之后、取指定版本之前,另一个 agent 又登记了同名产物 —— 若再按名字查一次,
+    就落到另一条产物上。端点必须从「最新版」那一行按 id 取指定版本。
+    """
+    app = session.world.client._transport.app  # type: ignore[attr-defined]
+    legacy_thread = uuid4()
+    await app.state.thread_meta_repo.create(
+        thread_id=legacy_thread,
+        tenant_id=_TENANT,
+        created_by="seed",
+        user_id=session.user_id,
+        agent_name=None,
+    )
+    world = session.world
+    await _save(world, user_id=session.user_id, agent_key="agent-b-00000000", content=b"B1")
+    await _save(world, user_id=session.user_id, agent_key="agent-a-00000000", content=b"A1")
+    await _save(world, user_id=session.user_id, agent_key="agent-a-00000000", content=b"A2")
+    real_latest = world.artifacts.get_latest_version
+
+    async def latest_then_race(**kwargs: object) -> object:
+        found = await real_latest(**kwargs)  # type: ignore[arg-type]
+        await _save(world, user_id=session.user_id, agent_key="agent-b-00000000", content=b"B2")
+        return found
+
+    world.artifacts.get_latest_version = latest_then_race  # type: ignore[method-assign]
+
+    resp = await world.client.get(
+        f"/v1/sessions/{legacy_thread}/workspace/artifacts/{_NAME}/download",
+        params={"version": 2},
+    )
+
+    assert (resp.status_code, resp.content) == (200, b"A2"), resp.text

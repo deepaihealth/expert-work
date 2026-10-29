@@ -149,32 +149,6 @@ class InMemoryArtifactStore(ArtifactStore):
             return None
         return self._latest_of(artifact)
 
-    async def get_version(
-        self,
-        *,
-        tenant_id: UUID,
-        user_id: UUID,
-        agent_key: str | None,
-        name: str,
-        version: int,
-    ) -> ArtifactVersion | None:
-        candidates = sorted(
-            (
-                a
-                for a in self._artifacts.values()
-                if a.tenant_id == tenant_id
-                and a.user_id == user_id
-                and (agent_key is None or a.agent_key == agent_key)
-                and a.name == name
-                and a.deleted_at is None
-            ),
-            key=lambda a: a.updated_at or _MIN_AWARE,
-            reverse=True,
-        )
-        if not candidates:
-            return None
-        return self._version_of(candidates[0], version)
-
     async def get_version_by_id(
         self, *, tenant_id: UUID, user_id: UUID, artifact_id: UUID, version: int
     ) -> ArtifactVersion | None:
@@ -212,6 +186,9 @@ class InMemoryArtifactStore(ArtifactStore):
             and v.path_in_workspace in wanted
             and v.id not in excluded
         }
+
+    async def bypasses_row_security(self) -> bool:
+        return True  # 内存档没有 RLS
 
     async def existing_version_ids(self, ids: Sequence[UUID]) -> set[UUID]:
         wanted = set(ids)

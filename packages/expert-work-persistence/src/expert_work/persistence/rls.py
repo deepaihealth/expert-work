@@ -110,10 +110,15 @@ bypass_rls_var: ContextVar[bool] = ContextVar(
 class RlsBypassRequiredError(RuntimeError):
     """A cross-tenant query ran without declaring an RLS bypass (B-235).
 
-    Under enforced RLS such a query silently returns no rows. For a caller that
-    deletes whatever is *not* found (the retention job's orphan-copy sweep), or
-    that keeps a file only while it *is* found (the shared-path check), an empty
-    answer turns into deleting live data — so these queries refuse to run instead.
+    Declaring the bypass (:data:`bypass_rls_var`) is a necessary condition, not a
+    sufficient one: it only stops this process from emitting the tenant GUC. Whether
+    the database actually shows every tenant's rows depends on the connecting role
+    (``BYPASSRLS`` or superuser) — a role without it still gets an empty answer under
+    enforced RLS. For a caller that deletes whatever is *not* found (the retention
+    job's orphan-copy sweep), or keeps a file only while it *is* found (the
+    shared-path check), an empty answer turns into deleting live data. So these
+    queries refuse to run without the declaration, and the orphan-copy sweep also
+    asks the database (``ArtifactStore.bypasses_row_security``) before deleting.
     """
 
 

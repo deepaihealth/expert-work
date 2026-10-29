@@ -574,13 +574,10 @@ async def test_each_save_keeps_the_bytes_of_that_moment() -> None:
     await tool.call({"name": "report.txt"}, ctx=ctx)
     snapshots.workspace.workspace_file_contents[_REPORT] = b"CC"  # type: ignore[attr-defined]
 
-    v1 = await store.get_version(
-        tenant_id=ctx.tenant_id, user_id=ctx.user_id, agent_key=_ME, name="report.txt", version=1
+    [artifact] = await store.list_for_user(
+        tenant_id=ctx.tenant_id, user_id=ctx.user_id, agent_key=_ME
     )
-    v2 = await store.get_version(
-        tenant_id=ctx.tenant_id, user_id=ctx.user_id, agent_key=_ME, name="report.txt", version=2
-    )
-    assert v1 is not None and v2 is not None
+    v2, v1 = await store.list_versions_by_artifact(artifact_id=artifact.id)
     assert v1.snapshot_key == str(v1.id) and v2.snapshot_key == str(v2.id)
 
     async def _content(key: str | None) -> bytes:

@@ -137,39 +137,40 @@ async def test_legacy_save_has_no_snapshot(store: ArtifactStore) -> None:
     assert saved.size_bytes is None
 
 
-async def test_get_version_returns_that_version_not_the_latest(store: ArtifactStore) -> None:
+async def test_get_version_by_id_returns_that_version_not_the_latest(
+    store: ArtifactStore,
+) -> None:
     tenant_id, user_id = uuid4(), uuid4()
     first = await _save(store, tenant_id=tenant_id, user_id=user_id, content=b"AAA")
     await _save(store, tenant_id=tenant_id, user_id=user_id, content=b"BBB")
 
-    got = await store.get_version(
-        tenant_id=tenant_id, user_id=user_id, agent_key=_AGENT, name="report.pdf", version=1
+    got = await store.get_version_by_id(
+        tenant_id=tenant_id, user_id=user_id, artifact_id=first.artifact_id, version=1
     )
 
     assert got is not None
     assert (got.id, got.sha256) == (first.id, "sha-AAA")
 
 
-async def test_get_version_hides_other_agent_other_user_deleted_and_unknown(
+async def test_get_version_by_id_hides_other_user_deleted_and_unknown(
     store: ArtifactStore,
 ) -> None:
     tenant_id, user_id = uuid4(), uuid4()
-    await _save(store, tenant_id=tenant_id, user_id=user_id)
+    saved = await _save(store, tenant_id=tenant_id, user_id=user_id)
 
     async def _get(**over: object) -> ArtifactVersion | None:
         args: dict[str, object] = {
             "tenant_id": tenant_id,
             "user_id": user_id,
-            "agent_key": _AGENT,
-            "name": "report.pdf",
+            "artifact_id": saved.artifact_id,
             "version": 1,
         }
         args.update(over)
-        return await store.get_version(**args)  # type: ignore[arg-type]
+        return await store.get_version_by_id(**args)  # type: ignore[arg-type]
 
     assert await _get() is not None
-    assert await _get(agent_key=_OTHER_AGENT) is None, "跨 agent 取到了别人的版本"
     assert await _get(user_id=uuid4()) is None, "跨用户取到了别人的版本"
+    assert await _get(tenant_id=uuid4()) is None, "跨租户取到了别人的版本"
     assert await _get(version=2) is None
     await store.soft_delete(
         tenant_id=tenant_id,

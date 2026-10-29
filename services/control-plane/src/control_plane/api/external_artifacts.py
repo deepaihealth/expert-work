@@ -276,12 +276,13 @@ def build_external_artifacts_router() -> APIRouter:
         # 产物清单契约 + B-235 —— 可选 ``version`` 是「取这一版」:有登记时的副本就
         # 下那一版。下不到的两种(版本号不存在 / B-235 之前登记且已不是最新)仍是 409
         # 显式冲突,保证「拿着旧清单迟到收割」永远不会静默拿到别的内容。
+        # 指定版本从「最新版」那一行按 id 取,不按名字查第二次(两次按名字的查询之间同名
+        # 产物可能被更新)。
         pinned = (
-            await store.get_version(
+            await store.get_version_by_id(
                 tenant_id=tenant_id,
                 user_id=end_user_id,
-                agent_key=agent_key,
-                name=name,
+                artifact_id=latest.artifact_id,
                 version=version,
             )
             if version is not None

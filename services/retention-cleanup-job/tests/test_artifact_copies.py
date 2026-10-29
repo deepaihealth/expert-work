@@ -36,7 +36,7 @@ from expert_work.persistence import (
     create_async_engine_from_config,
     create_async_session_factory,
 )
-from expert_work.persistence.rls import RlsBypassRequiredError
+from expert_work.persistence.rls import RlsBypassRequiredError, bypass_rls_var
 from expert_work.protocol import ArtifactVersion
 from retention_cleanup_job.artifact_copies import sweep_orphan_copies
 from retention_cleanup_job.job import RetentionCleanupJob
@@ -355,3 +355,113 @@ async def test_a_failing_orphan_pass_does_not_skip_the_later_passes(world: _Worl
     assert later == ["memory"], "孤儿副本 pass 一失败,后面的 pass 都没跑"
     assert report.orphan_artifact_copies_removed == 0
     assert stray.exists()
+
+
+# --------------------------------------------------------------------------- 删之前的两道把关
+
+
+def _orphans(world: _World, n: int) -> list[Path]:
+    d = world.copies()
+    d.mkdir(parents=True, exist_ok=True)
+    paths = []
+    for _ in range(n):
+        p = d / str(uuid4())
+        p.write_bytes(b"x")
+        _age(p, 48)
+        paths.append(p)
+    return paths
+
+
+async def test_a_mass_of_orphans_is_not_deleted(world: _World) -> None:
+    """60 个满 24 小时的副本、一个版本行都找不到 —— 更像是「库里看不见行」(角色没有
+    BYPASSRLS、连错了库)而不是真有 60 个孤儿。删除不可逆,停下来记日志,等人看。"""
+    paths = _orphans(world, 60)
+
+    assert await sweep_orphan_copies(str(world.root), world.artifacts) == 0
+    assert all(p.exists() for p in paths)
+
+
+async def test_orphans_that_are_a_minority_are_deleted(world: _World) -> None:
+    """同样 60 个孤儿,但它们只占少数(还有 100 个副本有版本行)—— 照常清。"""
+    for i in range(100):
+        await world.save(path=f"agents/w/{i}.txt", created_at=_FRESH, name=f"{i}.txt")
+    for kept in world.copies().iterdir():
+        _age(kept, 48)
+    paths = _orphans(world, 60)
+
+    assert await sweep_orphan_copies(str(world.root), world.artifacts) == 60
+    assert not any(p.exists() for p in paths)
+    assert len(list(world.copies().iterdir())) == 100
+
+
+class _BlindStore(InMemoryArtifactStore):
+    """库连接的角色没有 BYPASSRLS:声明了 bypass 也看不见别的租户的行。"""
+
+    async def bypasses_row_security(self) -> bool:
+        return False
+
+
+async def test_a_role_that_cannot_see_every_row_deletes_nothing(world: _World) -> None:
+    paths = _orphans(world, 3)
+
+    assert await sweep_orphan_copies(str(world.root), _BlindStore()) == 0
+    assert all(p.exists() for p in paths)
+
+
+_NOBYPASS_ROLE = "b235_artifact_nobypass"
+_NOBYPASS_PW = "b235-test-only-pw"  # test-only fixture password
+
+
+@pytest.fixture
+async def nobypass_artifacts(postgres_container: Any) -> AsyncIterator[ArtifactStore]:
+    """连库角色没有 BYPASSRLS 的 SQL 档 —— ``bypass_rls_var`` 只是不发 GUC,RLS 照样生效。"""
+    admin = str(postgres_container.get_connection_url()).replace("+psycopg2", "")
+    db = _DB + "_nobypass"
+    with psycopg.connect(admin, autocommit=True) as conn:
+        conn.execute(f'DROP DATABASE IF EXISTS "{db}" WITH (FORCE)')
+        conn.execute(f'CREATE DATABASE "{db}"')
+        exists = conn.execute("SELECT 1 FROM pg_roles WHERE rolname = %s", (_NOBYPASS_ROLE,))
+        if exists.fetchone() is None:
+            conn.execute(
+                f"CREATE ROLE {_NOBYPASS_ROLE} LOGIN NOBYPASSRLS PASSWORD '{_NOBYPASS_PW}'"
+            )
+    base, _, _ = admin.rpartition("/")
+    dsn = f"{base}/{db}"
+    cfg = Config(str(_ALEMBIC_INI))
+    cfg.set_main_option("sqlalchemy.url", dsn.replace("postgresql://", "postgresql+psycopg://", 1))
+    command.upgrade(cfg, "head")
+    with psycopg.connect(dsn, autocommit=True) as conn:
+        conn.execute(f"GRANT USAGE ON SCHEMA public TO {_NOBYPASS_ROLE}")
+        conn.execute(f"GRANT SELECT ON artifact_version, artifact TO {_NOBYPASS_ROLE}")
+    scheme, rest = dsn.split("://", 1)
+    host = rest.split("@", 1)[1]
+    role_dsn = f"postgresql+asyncpg://{_NOBYPASS_ROLE}:{_NOBYPASS_PW}@{host}"
+    del scheme
+    engine = create_async_engine_from_config(DatabaseConfig(dsn=role_dsn))
+    try:
+        yield SqlArtifactStore(create_async_session_factory(engine))
+    finally:
+        await engine.dispose()
+        with psycopg.connect(admin, autocommit=True) as conn:
+            conn.execute(f'DROP DATABASE IF EXISTS "{db}" WITH (FORCE)')
+
+
+@pytest.mark.integration
+async def test_a_db_role_without_bypassrls_deletes_nothing(
+    world: _World, nobypass_artifacts: ArtifactStore
+) -> None:
+    """声明了 bypass(``bypass_rls_var``)但连库角色没有 BYPASSRLS:强制 RLS 下「哪些副本
+    还有版本行」会答「一个都没有」。必须先问库这个角色看不看得见所有行,看不见就不删。"""
+    paths = _orphans(world, 3)
+    token = bypass_rls_var.set(True)
+    try:
+        assert await nobypass_artifacts.bypasses_row_security() is False
+        assert await sweep_orphan_copies(str(world.root), nobypass_artifacts) == 0
+    finally:
+        bypass_rls_var.reset(token)
+    assert all(p.exists() for p in paths)
+
+
+@pytest.mark.integration
+async def test_the_test_superuser_does_see_every_row(sql_artifacts: ArtifactStore) -> None:
+    assert await sql_artifacts.bypasses_row_security() is True

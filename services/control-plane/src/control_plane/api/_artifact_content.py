@@ -11,8 +11,17 @@
 * B-235 之前登记的(没有副本)且正是最新版 → 照旧读工作区文件(这一点上与以前逐字相同);
 * B-235 之前登记的、已经不是最新版 → :class:`VersionNotRetained`:那一版的字节早被同名的
   后续登记盖掉了,拿最新版冒充正是 B-235 要修的事;
-* 不存在(从没有过、或已被留存作业清掉),或查到的那一版不属于「最新版」那条产物
-  (``agent_key=None`` 时两次按名字的查询可能落在不同产物上)→ :class:`VersionUnknown`。
+* 不存在(从没有过、或已被留存作业清掉)→ :class:`VersionUnknown`。
+
+指定版本一律从「最新版」那一行按 id 取(``get_version_by_id(artifact_id=latest.artifact_id)``),
+不按名字查第二次 —— 两次按名字的查询之间同名产物可能被更新,落到另一条产物上。
+
+**已知限制(``agent_key=None`` 的会话)**:``thread_meta.agent_name`` 为空的会话不按 agent
+收口,同一用户两个 agent 的同名产物都看得见,按名字只能取到 ``updated_at`` 最新的那一条。
+这一轮登记的是 agent A 的 X v2,之后 agent B 也登记了 X,那么这一轮的「第 2 版」解析到
+B 的那条产物上(B 有 v2 就下发 B 的 v2,没有就 404)。今天建会话的三条路径(控制台建会话、
+对外发起对话、定时任务)都写 ``agent_name``,为空的只有早期的历史会话;要根治得让产物清单
+带上产物行 id(对外可见的新字段),目前没有做。
 
 **从哪读**:有副本读副本,没有读 ``path_in_workspace``。副本读不到(进程内存后端重启、被
 误删)就是读不到 —— 抛出来的仍是 ``SandboxSupervisorError`` 家族,端点既有的
@@ -56,8 +65,8 @@ def choose_version(
     """
     if requested is None:
         return latest
-    # ``agent_key=None`` 的会话里「最新版」与「指定版」是两次按名字的独立查询,同名多行时
-    # 可能落在两条不同的产物上 —— 不属于同一条产物的版本当作不存在。
+    # 调用方从「最新版」那一行按 id 取 ``pinned``,所以它们本该是同一条产物;不是就当作
+    # 不存在(防御:绝不把别的产物的内容当这一版下发)。
     if pinned is None or pinned.artifact_id != latest.artifact_id:
         raise VersionUnknown(requested)
     if pinned.snapshot_key is not None or pinned.version == latest.version:

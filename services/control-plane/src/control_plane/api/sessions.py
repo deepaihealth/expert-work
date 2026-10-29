@@ -746,12 +746,14 @@ def build_sessions_router() -> APIRouter:
                 agent_key=_session_agent_key(meta),
                 name=name,
             )
+            # 指定版本从「最新版」那一行按 id 取,不再按名字查第二次:两次按名字的查询
+            # 可能落在两条不同的同名产物上(``agent_key=None`` 的老会话、或两次查询之间
+            # 同名产物被更新)。见 :mod:`control_plane.api._artifact_content`。
             pinned = (
-                await artifacts.get_version(
+                await artifacts.get_version_by_id(
                     tenant_id=target_tenant,
                     user_id=meta.user_id,
-                    agent_key=_session_agent_key(meta),
-                    name=name,
+                    artifact_id=latest.artifact_id,
                     version=version,
                 )
                 if latest is not None and version is not None
