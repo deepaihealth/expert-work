@@ -6,9 +6,12 @@ manages bases and their documents:
 * bases — create / list / delete;
 * documents — upload (async ingest) / list (with status) / delete.
 
-Upload is **off the request path**: the document is recorded ``pending``
+Upload is **off the request path**: the document is recorded ``estimating``
 and handed to the :class:`KnowledgeIngestionRunner`; the caller polls the
-document list for its ``status``.
+document list for its ``status``. B-222 PR-2: nothing is spent before the
+user confirms: an upload, re-ingest or 「补识别」 is estimated first (local
+parse and counts, no model called) and waits ``awaiting_confirmation`` until
+it is confirmed (``knowledge_estimates.py``) or withdrawn (``…/cancel``).
 """
 
 from __future__ import annotations
@@ -16,10 +19,10 @@ from __future__ import annotations
 import hashlib
 import logging
 import time
-from collections.abc import Sequence
-from datetime import datetime
+from collections.abc import Mapping, Sequence
+from datetime import UTC, datetime
 from pathlib import Path
-from typing import Annotated, Any, Literal
+from typing import Annotated, Any, Final, Literal
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, File, HTTPException, Query, Request, Response, UploadFile
@@ -57,7 +60,8 @@ from expert_work.persistence.knowledge import (
     DuplicateKnowledgeBaseError,
     KnowledgeRetrievalLogStore,
 )
-from expert_work.persistence.knowledge.base import ReviewCounts
+from expert_work.persistence.knowledge.base import CancelOutcome, ReviewCounts
+from expert_work.persistence.knowledge.estimates import EstimateRefused, EstimateSummary
 from expert_work.protocol import (
     DEFAULT_CHUNK_MAX_TOKENS,
     DEFAULT_CHUNK_OVERLAP_TOKENS,
@@ -72,6 +76,7 @@ from expert_work.protocol import (
     KnowledgeDocument,
     RetrievalMethod,
 )
+from expert_work.protocol.knowledge_estimate import EstimateOrigin
 from expert_work.runtime.audit.logger import AuditLogger
 from orchestrator.tools.knowledge_log import RetrievalLogContext, retrieval_log_scope
 
@@ -152,6 +157,11 @@ class _CancelBody(BaseModel):
     """Body of ``POST /v1/knowledge/bases/{name}/documents/cancel`` (B-222)."""
 
     document_ids: list[UUID] = Field(min_length=1, max_length=DOCUMENTS_PAGE_MAX)
+    #: B2b review —— only documents still in one of these (as the caller
+    #: read them) are stopped; the others answer ``status_changed``.
+    expect_status: list[DocumentStatus] | None = Field(
+        default=None, min_length=1, max_length=len(DocumentStatus)
+    )
 
 
 def _get_knowledge_store(request: Request) -> KnowledgeStore:
@@ -319,6 +329,17 @@ def _document_dict(document: KnowledgeDocument) -> dict[str, Any]:
         "enabled": document.enabled,
         "created_at": _iso(document.created_at),
         "updated_at": _iso(document.updated_at),
+        # B-222 PR-2 —— what the ingest is estimated to cost (null while being
+        # estimated, and for a document never estimated), by when it must be
+        # confirmed (``awaiting_confirmation`` only), and what the latest paid
+        # ingest cost: 「预估 ¥x · 实际 ¥y」.
+        "ingest_estimate": document.ingest_estimate.model_dump(mode="json")
+        if document.ingest_estimate is not None
+        else None,
+        "confirm_by": _iso(document.confirm_by),
+        "ingest_actual": document.ingest_actual.model_dump(mode="json")
+        if document.ingest_actual is not None
+        else None,
     }
 
 
@@ -327,6 +348,103 @@ def _review_dict(counts: ReviewCounts | None) -> dict[str, int]:
     by inheritance and unapplied edits waiting for a person."""
     found = counts or ReviewCounts()
     return {"inherited": found.inherited, "unapplied": found.unapplied}
+
+
+def _summary_dict(summary: EstimateSummary) -> dict[str, Any]:
+    """B-222 PR-2 —— a base's documents being estimated or waiting for a
+    confirmation: ``awaiting`` / ``total_micros`` / ``unpriced`` are the
+    confirmable ones (what 「全部确认」 confirms, ``fingerprint`` naming
+    exactly which — the confirm sends it back); duplicates and estimates past
+    their deadline (being withdrawn) apart."""
+    return {
+        "estimating": summary.estimating,
+        "awaiting": summary.awaiting,
+        "duplicates": summary.duplicates,
+        "expired": summary.expired,
+        "total_micros": summary.total_micros,
+        "unpriced": summary.unpriced,
+        "earliest_confirm_by": _iso(summary.earliest_confirm_by),
+        "fingerprint": summary.fingerprint,
+    }
+
+
+#: B-222 —— the 409 detail for a document past the point of no return.
+DOCUMENT_BUSY: Final = {
+    "error": "document_busy",
+    "message": "the document's new version is being written; try again once it is ready",
+}
+
+
+def refused_409(exc: EstimateRefused) -> HTTPException:
+    """An estimate the store refused to start, as the API's 409."""
+    if exc.reason == "busy":
+        return HTTPException(status_code=409, detail=DOCUMENT_BUSY)
+    return HTTPException(status_code=409, detail={"error": exc.reason})
+
+
+async def _release_duplicates(
+    store: KnowledgeStore, runner: KnowledgeIngestionRunner | None, base: KnowledgeBase
+) -> None:
+    """K-21 ① (§7) —— after a document of ``base`` went away or lost its
+    bytes: copies of it are no longer duplicates; one never parsed is
+    estimated now (the recovery worker would within a cycle anyway).
+
+    Runs after the action is committed and audited, and never fails it: an
+    error is logged and the recovery worker's sweep releases them instead."""
+    try:
+        released = await store.release_stale_duplicates(tenant_id=base.tenant_id, kb_id=base.id)
+    except Exception:
+        logger.warning("knowledge.release_duplicates_failed kb=%s", base.id, exc_info=True)
+        return
+    if runner is None:
+        return
+    for document in released:
+        if document.status is DocumentStatus.ESTIMATING:
+            runner.submit(tenant_id=base.tenant_id, document_id=document.id)
+
+
+#: B-222 PR-2 —— cancel outcomes of an ingest or estimate that may be running here.
+_STOPPED: frozenset[CancelOutcome] = frozenset({"cancelled", "withdrawn", "withdrawn_deleted"})
+
+
+async def _record_stopped(
+    request: Request,
+    audit: AuditLogger,
+    runner: KnowledgeIngestionRunner | None,
+    base: KnowledgeBase,
+    outcomes: Mapping[UUID, CancelOutcome],
+) -> None:
+    """After ``cancel_documents`` (or a confirm-all that withdrew duplicates):
+    stop at once what this pod runs of them, drop the figures of a deleted
+    upload and audit each — ``knowledge:document_cancel`` for an ingest
+    stopped, ``knowledge:document_withdraw`` for an estimate withdrawn."""
+    stopped = [doc_id for doc_id, outcome in outcomes.items() if outcome in _STOPPED]
+    if runner is not None and stopped:
+        runner.cancel_local(stopped)
+    for document_id in stopped:
+        outcome = outcomes[document_id]
+        if outcome == "withdrawn_deleted":
+            await delete_figures_quietly(
+                request.app.state.object_store,
+                tenant_id=base.tenant_id,
+                kb_id=base.id,
+                document_id=document_id,
+            )
+        await _audit_write(
+            audit,
+            request,
+            action=AuditAction.KNOWLEDGE_DOCUMENT_CANCEL
+            if outcome == "cancelled"
+            else AuditAction.KNOWLEDGE_DOCUMENT_WITHDRAW,
+            resource_type="knowledge_document",
+            resource_id=str(document_id),
+            details={"kb": base.name}
+            if outcome == "cancelled"
+            else {"kb": base.name, "outcome": outcome},
+        )
+    if any(outcome != "cancelled" for outcome in (outcomes[d] for d in stopped)):
+        store: KnowledgeStore = request.app.state.knowledge_store
+        await _release_duplicates(store, runner, base)
 
 
 def _chunk_dict(chunk: KnowledgeChunk, parent_index: int | None) -> dict[str, Any]:
@@ -399,20 +517,21 @@ async def _redrive(
     store: KnowledgeStore,
     runner: KnowledgeIngestionRunner,
     tenant_id: UUID,
-    base: KnowledgeBase,
     document: KnowledgeDocument,
-) -> KnowledgeDocument:
-    # Reset to pending without touching either byte slot and re-drive the
-    # fast path: the claim picks the pending upload if there is one (retry
-    # a failed new version), else the serving bytes. ``force``: an explicit
-    # re-ingest must run even though the bytes are unchanged.
-    reset = await store.upsert_document(
-        tenant_id=tenant_id,
-        kb_id=base.id,
-        filename=document.filename,
-        force=True,
-    )
-    runner.submit(tenant_id=tenant_id, document_id=reset.id)
+    *,
+    origin: EstimateOrigin,
+) -> KnowledgeDocument | None:
+    """Re-drive ``document`` (``origin``: what asked for it) — B-222 PR-2:
+    estimated first, free; the paid ingest starts once the user confirms.
+    Neither byte slot is touched: the estimate (and then the ingest) takes
+    the pending upload if there is one (retry a failed new version), else the
+    serving bytes, even when they are unchanged. ``None``: the document is
+    gone (deleted meanwhile).
+
+    :raises EstimateRefused: ``busy`` — its new chunks are being swapped in."""
+    reset = await store.begin_estimate(tenant_id=tenant_id, document_id=document.id, origin=origin)
+    if reset is not None:
+        runner.submit(tenant_id=tenant_id, document_id=reset.id)
     return reset
 
 
@@ -787,18 +906,26 @@ def build_knowledge_router() -> APIRouter:
             raise HTTPException(status_code=400, detail=f"unsupported document type: {filename!r}")
         raw = await _read_upload_capped(file, settings.knowledge_document_max_bytes)
         # Retain the original bytes so a crashed/failed document can be
-        # re-driven (crash recovery + re-ingest) without a re-upload.
-        document = await store.upsert_document(
+        # re-driven (crash recovery + re-ingest) without a re-upload. B-222
+        # PR-2: nothing is spent yet — the upload is estimated (free) and
+        # waits for the user's confirmation; bytes another document of this
+        # base holds wait at once as a duplicate, never parsed (K-21 ①).
+        start = await store.begin_upload(
             tenant_id=tenant_id,
             kb_id=base.id,
             filename=filename,
             content=raw,
             content_sha256=hashlib.sha256(raw).hexdigest(),
+            now=datetime.now(UTC),
         )
-        # Same bytes as the READY document already there → nothing to ingest:
-        # 200 + ``unchanged`` (the store left status / chunks untouched).
-        unchanged = document.status is DocumentStatus.READY
-        if not unchanged:
+        document = start.document
+        if start.outcome == "busy":
+            # Its new chunks are being swapped in: nothing was touched.
+            raise HTTPException(status_code=409, detail=DOCUMENT_BUSY)
+        # The same bytes the document is ready with, or already estimated /
+        # waiting / queued / ingesting with → nothing to do: 200 + ``unchanged``.
+        unchanged = start.outcome == "unchanged"
+        if start.outcome == "estimating":
             # The runner re-reads bytes + chunking parameters at claim time,
             # so a re-upload that lands while this task is queued wins.
             runner.submit(tenant_id=tenant_id, document_id=document.id)
@@ -813,9 +940,10 @@ def build_knowledge_router() -> APIRouter:
                 "filename": filename,
                 "size_bytes": len(raw),
                 "unchanged": unchanged,
+                "outcome": start.outcome,
             },
         )
-        # 202 Accepted — ingestion runs in the background; poll the
+        # 202 Accepted — the estimate runs in the background; poll the
         # document list for its status. 200 when nothing changed.
         return JSONResponse(
             status_code=200 if unchanged else 202,
@@ -842,6 +970,8 @@ def build_knowledge_router() -> APIRouter:
         # B-175 P3-PR3 — each row's ``review`` (it reads the page's chunks, so
         # only when asked: the console's 5-second poll does not).
         with_review: bool = False,
+        # B-222 PR-2 — only these documents (an upload batch the console follows).
+        document_id: Annotated[list[UUID] | None, Query(max_length=DOCUMENTS_PAGE_MAX)] = None,
     ) -> JSONResponse:
         scope = await ensure_single_tenant_scope(
             request.state.principal,
@@ -855,7 +985,21 @@ def build_knowledge_router() -> APIRouter:
         safe_limit = max(1, min(limit, DOCUMENTS_PAGE_MAX)) if limit is not None else None
         async with applied_scope(scope):
             base = await _require_base(store, scope.tenant_id, name)
-            if safe_limit is None:
+            summary = await store.estimate_summary(tenant_id=scope.tenant_id, kb_id=base.id)
+            if document_id:
+                asked = list(dict.fromkeys(document_id))
+                found = await store.get_documents(tenant_id=scope.tenant_id, document_ids=asked)
+                picked = [
+                    doc
+                    for doc in (found.get(i) for i in asked)
+                    if doc is not None
+                    and doc.kb_id == base.id
+                    and (enabled is None or doc.enabled is enabled)
+                    and (not status or doc.status in status)
+                ]
+                end = None if safe_limit is None else safe_offset + safe_limit
+                documents, total = picked[safe_offset:end], len(picked)
+            elif safe_limit is None:
                 everything = await store.list_documents(
                     tenant_id=scope.tenant_id, kb_id=base.id, enabled=enabled, statuses=status
                 )
@@ -888,6 +1032,8 @@ def build_knowledge_router() -> APIRouter:
                 "total": total,
                 "offset": safe_offset,
                 "limit": safe_limit,
+                # B-222 PR-2 — the whole base's, whatever the filters.
+                "estimate_summary": _summary_dict(summary),
             }
         )
 
@@ -902,6 +1048,7 @@ def build_knowledge_router() -> APIRouter:
         document_id: UUID,
         request: Request,
         store: Annotated[KnowledgeStore, Depends(_get_knowledge_store)],
+        runner: Annotated[KnowledgeIngestionRunner | None, Depends(_get_ingestion_runner)],
         audit: Annotated[AuditLogger, Depends(_get_audit)],
     ) -> Response:
         tenant_id: UUID = request.state.tenant_id
@@ -925,6 +1072,7 @@ def build_knowledge_router() -> APIRouter:
             resource_id=str(document_id),
             details={"kb": base.name},
         )
+        await _release_duplicates(store, runner, base)  # B-222 PR-2: its copies
         return Response(status_code=204)
 
     @router.post(
@@ -944,7 +1092,14 @@ def build_knowledge_router() -> APIRouter:
         base = await _require_base(store, tenant_id, name)
         document = await _require_redrivable(store, runner, tenant_id, base, document_id)
         assert runner is not None  # noqa: S101 — checked above
-        reset = await _redrive(store, runner, tenant_id, base, document)
+        try:
+            reset = await _redrive(
+                store, runner, tenant_id, document, origin=EstimateOrigin.REINGEST
+            )
+        except EstimateRefused as exc:
+            raise refused_409(exc) from exc
+        if reset is None:
+            raise HTTPException(status_code=404, detail="document not found")
         await _audit_write(
             audit,
             request,
@@ -986,7 +1141,14 @@ def build_knowledge_router() -> APIRouter:
                 status_code=409,
                 detail="document has no page or picture that failed, waits or is past the limit",
             )
-        reset = await _redrive(store, runner, tenant_id, base, document)
+        try:
+            reset = await _redrive(
+                store, runner, tenant_id, document, origin=EstimateOrigin.RECOGNIZE
+            )
+        except EstimateRefused as exc:
+            raise refused_409(exc) from exc
+        if reset is None:
+            raise HTTPException(status_code=404, detail="document not found")
         await _audit_write(
             audit,
             request,
@@ -1066,10 +1228,13 @@ def build_knowledge_router() -> APIRouter:
         document_id: UUID,
         request: Request,
         store: Annotated[KnowledgeStore, Depends(_get_knowledge_store)],
+        runner: Annotated[KnowledgeIngestionRunner | None, Depends(_get_ingestion_runner)],
         audit: Annotated[AuditLogger, Depends(_get_audit)],
     ) -> JSONResponse:
         """Drop a pending (failed or in-flight) upload and keep serving the
-        previous version — the way back when a re-upload turned out bad."""
+        previous version — the way back when a re-upload turned out bad.
+        B-222 PR-2: a new upload re-uploaded while it waited goes back to
+        estimating its first bytes (still to be confirmed)."""
         tenant_id: UUID = request.state.tenant_id
         base = await _require_base(store, tenant_id, name)
         document = await store.get_document(tenant_id=tenant_id, document_id=document_id)
@@ -1087,6 +1252,8 @@ def build_knowledge_router() -> APIRouter:
                 status_code=409,
                 detail="the new version is being written and about to finish; it can't be dropped",
             )
+        if restored.status is DocumentStatus.ESTIMATING and runner is not None:
+            runner.submit(tenant_id=tenant_id, document_id=document_id)
         await _audit_write(
             audit,
             request,
@@ -1095,6 +1262,7 @@ def build_knowledge_router() -> APIRouter:
             resource_id=str(document_id),
             details={"kb": base.name, "filename": document.filename},
         )
+        await _release_duplicates(store, runner, base)  # its dropped bytes' copies
         return JSONResponse(content=_document_dict(restored))
 
     @router.post(
@@ -1116,24 +1284,25 @@ def build_knowledge_router() -> APIRouter:
         ``not_found``. What was written stays (recognition and topic-break
         caches: a re-ingest does not pay for them again); the version serving
         before, if any, keeps serving. An ingest this pod drives (upload or
-        recovery) stops at once; elsewhere at its next batch."""
+        recovery) stops at once; elsewhere at its next batch.
+
+        B-222 PR-2: an ``estimating`` / ``awaiting_confirmation`` document's
+        estimate is withdrawn instead — ``withdrawn_deleted``: a new upload,
+        deleted with its file; ``withdrawn``: new bytes dropped (the previous
+        version serves on), or a re-ingest put back as it was.
+
+        ``expect_status`` (B2b review): a document no longer in one of these
+        is left alone — ``status_changed`` (read as waiting, then confirmed
+        or sent for 「仍入库」 before this request)."""
         tenant_id: UUID = request.state.tenant_id
         base = await _require_base(store, tenant_id, name)
         outcomes = await store.cancel_documents(
-            tenant_id=tenant_id, kb_id=base.id, document_ids=body.document_ids
+            tenant_id=tenant_id,
+            kb_id=base.id,
+            document_ids=body.document_ids,
+            expect_status=set(body.expect_status) if body.expect_status is not None else None,
         )
-        cancelled = [doc_id for doc_id, outcome in outcomes.items() if outcome == "cancelled"]
-        if runner is not None and cancelled:
-            runner.cancel_local(cancelled)
-        for document_id in cancelled:
-            await _audit_write(
-                audit,
-                request,
-                action=AuditAction.KNOWLEDGE_DOCUMENT_CANCEL,
-                resource_type="knowledge_document",
-                resource_id=str(document_id),
-                details={"kb": base.name},
-            )
+        await _record_stopped(request, audit, runner, base, outcomes)
         return JSONResponse(
             content={
                 "results": [

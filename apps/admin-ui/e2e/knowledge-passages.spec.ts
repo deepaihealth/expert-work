@@ -301,6 +301,6 @@ test("settings: saving changed chunking asks to re-ingest the stale documents", 
     "2 documents are still cut by older chunking parameters. Re-ingest them now?",
   );
   await page.getByTestId("kb-stale-confirm-ok").click();
-  await expect(page.getByText("Re-ingest submitted for 2 documents.")).toBeVisible();
+  await expect(page.getByText("Submitted 2 document(s) for re-ingest. Their cost is being estimated — confirm it on the Documents tab to start.")).toBeVisible();
   expect(reingested).toBe(true);
 });

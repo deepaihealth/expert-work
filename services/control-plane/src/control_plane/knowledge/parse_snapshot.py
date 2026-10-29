@@ -10,6 +10,7 @@ is checked again (§6.3).
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import binascii
 import gzip
@@ -31,10 +32,38 @@ logger = logging.getLogger(__name__)
 SNAPSHOT_FORMAT: Final = "local-parse/1"
 #: A snapshot compressed past this is not kept (§5).
 SNAPSHOT_MAX_BYTES: Final = 32 * 1024 * 1024
+#: A snapshot is not read past this many bytes decompressed (a damaged or
+#: hostile payload must not fill memory).
+SNAPSHOT_MAX_DECODED_BYTES: Final = 8 * SNAPSHOT_MAX_BYTES
+
+
+async def encode_in_thread(local: LocalParse) -> ParseSnapshot | None:
+    """:func:`encode_snapshot` off the event loop (JSON + gzip of tens of MB)."""
+    return await asyncio.to_thread(encode_snapshot, local)
+
+
+async def decode_in_thread(snapshot: ParseSnapshot) -> LocalParse | None:
+    """:func:`decode_snapshot` off the event loop."""
+    return await asyncio.to_thread(decode_snapshot, snapshot)
+
+
+def _image_bytes(local: LocalParse) -> int:
+    return sum(
+        len(candidate.image)
+        for extraction in (local.office_figures, local.pdf_figures)
+        if extraction is not None
+        for candidate in extraction.candidates
+    )
 
 
 def encode_snapshot(local: LocalParse) -> ParseSnapshot | None:
-    """``local`` as a snapshot; ``None`` when it is too large to keep."""
+    """``local`` as a snapshot; ``None`` when it is too large to keep —
+    decided before anything is compressed when its images alone (already
+    compressed formats, gzip barely shrinks them) are past the cap."""
+    images = _image_bytes(local)
+    if images > SNAPSHOT_MAX_BYTES:
+        logger.info("knowledge.snapshot_too_large image_bytes=%d", images)
+        return None
     body = {
         "kind": local.kind,
         "figures_on": local.figures_on,
@@ -58,7 +87,11 @@ def decode_snapshot(snapshot: ParseSnapshot) -> LocalParse | None:
     if snapshot.format != SNAPSHOT_FORMAT:
         return None
     try:
-        body = json.loads(gzip.decompress(snapshot.payload).decode("utf-8", "surrogatepass"))
+        raw = _decompress_capped(snapshot.payload)
+        if raw is None:
+            logger.warning("knowledge.snapshot_too_large_to_read")
+            return None
+        body = json.loads(raw.decode("utf-8", "surrogatepass"))
         return LocalParse(
             kind=body["kind"],
             figures_on=bool(body["figures_on"]),
@@ -71,6 +104,17 @@ def decode_snapshot(snapshot: ParseSnapshot) -> LocalParse | None:
     except (OSError, EOFError, zlib.error, binascii.Error, ValueError, KeyError, TypeError):
         logger.warning("knowledge.snapshot_unreadable", exc_info=True)
         return None
+
+
+def _decompress_capped(payload: bytes) -> bytes | None:
+    """The gunzipped payload; ``None`` past :data:`SNAPSHOT_MAX_DECODED_BYTES`."""
+    inflater = zlib.decompressobj(wbits=16 + zlib.MAX_WBITS)  # gzip framing
+    raw = inflater.decompress(payload, SNAPSHOT_MAX_DECODED_BYTES)
+    if inflater.unconsumed_tail:
+        return None  # more is left than the cap allows
+    if not inflater.eof:
+        raise EOFError("truncated snapshot")
+    return raw
 
 
 def _extraction(extraction: FigureExtraction | None) -> dict[str, Any] | None:

@@ -67,6 +67,12 @@ import { needsRecognition, PageRecognitionTags } from "./PageRecognitionTags";
 import { SegmentPreviewDrawer, type DrawerView } from "./SegmentPreviewDrawer";
 import { UploadQueuePanel } from "./UploadQueuePanel";
 import { ReadonlyTooltip } from "../../components/ReadonlyTooltip";
+import { IngestCostTag } from "./IngestCostTag";
+import { PendingConfirmationBanner } from "./PendingConfirmationBanner";
+import { EstimateActions, UploadBatchBar, UploadRowEstimate } from "./UploadBatchBar";
+import { useEstimateActions } from "./useEstimateActions";
+import { useIngestBatch } from "./useIngestBatch";
+import type { EstimateSummary } from "../../api/knowledge";
 
 const { Text } = Typography;
 
@@ -76,7 +82,12 @@ const STATUS_COLOR: Record<DocumentStatus, string> = {
   ready: "success",
   failed: "error",
   cancelled: "warning",
+  estimating: "processing",
+  awaiting_confirmation: "blue",
 };
+
+/** B-222 PR-2 — what 「只看待确认」 lists. */
+const WAITING_FILTER: DocumentStatus[] = ["estimating", "awaiting_confirmation"];
 
 /** B-222 — the statuses an ingest can still be cancelled from. */
 function isCancellable(status: DocumentStatus): boolean {
@@ -95,6 +106,14 @@ function errMessage(err: unknown): string {
     : err instanceof Error
       ? err.message
       : "unknown error";
+}
+
+/** A 409 of a re-ingest / 「补识别」 as the user's message: ``busy`` when the
+ *  document is writing its chunks (B-222: try again once ready), ``other``
+ *  for the endpoint's own conflict; ``null`` when it is no 409. */
+function conflictMessage(err: unknown, busy: string, other: string): string | null {
+  if (!(err instanceof ApiError) || err.status !== 409) return null;
+  return err.details?.error === "document_busy" ? busy : other;
 }
 
 /** B-175 P3-PR3 — rows read without ``review`` (the poll) keep the one the
@@ -142,6 +161,9 @@ export function DocumentsTab({
 
   const [documents, setDocuments] = useState<KnowledgeDocument[]>([]);
   const [total, setTotal] = useState(0);
+  /** B-222 PR-2 — the base's estimates (the banner) and 「只看待确认」. */
+  const [estimateSummary, setEstimateSummary] = useState<EstimateSummary | undefined>();
+  const [onlyWaiting, setOnlyWaiting] = useState(false);
   /** 1-based page of the server-side paged table. */
   const [page, setPage] = useState(1);
   // Another base (or tenant scope) starts again on page 1 — reset during
@@ -177,11 +199,12 @@ export function DocumentsTab({
       if (!quiet) setLoading(true);
       const seq = ++requestSeqRef.current;
       try {
+        const pageParams = { limit: DOC_TABLE_PAGE_SIZE, offset: (page - 1) * DOC_TABLE_PAGE_SIZE };
         const result = await listDocuments(
           baseName,
-          { limit: DOC_TABLE_PAGE_SIZE, offset: (page - 1) * DOC_TABLE_PAGE_SIZE },
+          pageParams,
           readScope,
-          { withReview },
+          onlyWaiting ? { status: WAITING_FILTER, withReview } : { withReview },
         );
         if (seq !== requestSeqRef.current) return;
         // The page emptied under us (last rows deleted elsewhere) → step
@@ -196,6 +219,7 @@ export function DocumentsTab({
         );
         setSelected((current) => stillShown(current, result.documents));
         setTotal(result.total);
+        setEstimateSummary(result.estimate_summary);
       } catch (err) {
         if (seq === requestSeqRef.current) message.error(errMessage(err));
       } finally {
@@ -204,7 +228,7 @@ export function DocumentsTab({
         if (seq === requestSeqRef.current) setLoading(false);
       }
     },
-    [baseName, message, page, readScope],
+    [baseName, message, onlyWaiting, page, readScope],
   );
 
   useEffect(() => {
@@ -213,8 +237,11 @@ export function DocumentsTab({
 
 
   const hasActiveIngest = useMemo(
-    () => documents.some((d) => d.status === "pending" || d.status === "processing"),
-    [documents],
+    () =>
+      documents.some(
+        (d) => d.status === "pending" || d.status === "processing" || d.status === "estimating",
+      ) || (estimateSummary?.estimating ?? 0) > 0,
+    [documents, estimateSummary],
   );
 
   useEffect(() => {
@@ -244,6 +271,10 @@ export function DocumentsTab({
         if (opts.signal.aborted) throw err;
         if (err instanceof ApiError && err.status === 503) {
           throw new Error(t("knowledge_page.embedder_missing"));
+        }
+        if (err instanceof ApiError && err.status === 409 && err.details?.error === "document_busy") {
+          // B-222: its previous upload is writing its chunks — retry in a moment.
+          throw new Error(t("knowledge_page.upload_queue_err_busy"));
         }
         if (err instanceof ApiError && err.status === 413) {
           const serverLimit = err.details?.limit_bytes;
@@ -276,6 +307,33 @@ export function DocumentsTab({
     }),
   });
   const { enqueue, retry } = queue;
+
+  // B-222 PR-2 — every upload is estimated, then waits for a confirmation:
+  // the queue follows its documents, the banner the base's.
+  const { documents: batchById, refresh: refreshBatch } = useIngestBatch(
+    baseName,
+    readScope,
+    queue.items,
+  );
+  const refreshAll = useCallback(async () => {
+    await Promise.all([refresh({ quiet: true }), refreshBatch().catch(() => undefined)]);
+  }, [refresh, refreshBatch]);
+  const estimates = useEstimateActions(baseName, refreshAll);
+  const batchDocuments = useMemo(() => Object.values(batchById), [batchById]);
+  const handleOnlyWaiting = useCallback((on: boolean) => {
+    setOnlyWaiting(on);
+    setPage(1);
+  }, []);
+  const estimateActionProps = useMemo(
+    () => ({
+      readonly,
+      busy: estimates.busy,
+      onConfirm: (doc: KnowledgeDocument) => void estimates.confirm([doc]),
+      onWithdraw: (doc: KnowledgeDocument) => void estimates.withdraw([doc]),
+      onIngestAnyway: (doc: KnowledgeDocument) => void estimates.ingestAnyway(doc),
+    }),
+    [estimates, readonly],
+  );
 
   const handleBeforeUpload = useCallback(
     (_file: File, batch: File[]) => {
@@ -332,11 +390,13 @@ export function DocumentsTab({
         message.success(t("knowledge_page.reingest_started"));
         await refresh();
       } catch (err) {
-        const detail =
-          err instanceof ApiError && err.status === 409
-            ? t("knowledge_page.reingest_no_bytes")
-            : errMessage(err);
-        message.error(detail);
+        message.error(
+          conflictMessage(
+            err,
+            t("knowledge_page.document_busy"),
+            t("knowledge_page.reingest_no_bytes"),
+          ) ?? errMessage(err),
+        );
       }
     },
     [t, baseName, message, refresh],
@@ -349,9 +409,11 @@ export function DocumentsTab({
         message.success(t("knowledge_page.recognize_started"));
       } catch (err) {
         message.error(
-          err instanceof ApiError && err.status === 409
-            ? t("knowledge_page.recognize_nothing")
-            : errMessage(err),
+          conflictMessage(
+            err,
+            t("knowledge_page.document_busy"),
+            t("knowledge_page.recognize_nothing"),
+          ) ?? errMessage(err),
         );
       }
       await refresh();
@@ -502,6 +564,13 @@ export function DocumentsTab({
         },
       },
       {
+        // B-222 PR-2 — 「预估 ¥x」 waiting, 「预估 ¥x · 实际 ¥y」 once ingested.
+        title: t("knowledge_page.col_cost"),
+        key: "cost",
+        width: 200,
+        render: (_: unknown, record) => <IngestCostTag document={record} />,
+      },
+      {
         title: t("knowledge_page.col_chunks"),
         dataIndex: "chunk_count",
         key: "chunk_count",
@@ -547,6 +616,7 @@ export function DocumentsTab({
                 data-testid={`doc-chunks-${record.id}`}
               />
             </Tooltip>
+            <EstimateActions document={record} {...estimateActionProps} />
             {isCancellable(record.status) && (
               <ReadonlyTooltip on={readonly}>
                 <Popconfirm
@@ -651,7 +721,7 @@ export function DocumentsTab({
         ),
       },
     ],
-    [t, i18n.language, handleReingest, handleRecognize, handleDiscardPending, handleCancel, handleDelete, readonly, openPreview, openReview],
+    [t, i18n.language, handleReingest, handleRecognize, handleDiscardPending, handleCancel, handleDelete, readonly, openPreview, openReview, estimateActionProps],
   );
 
   const pagination = useMemo<TablePaginationConfig>(
@@ -727,6 +797,31 @@ export function DocumentsTab({
         onRetry={handleRetry}
         onCancelAll={queue.cancelAll}
         onClearDone={queue.clearDone}
+        batchBar={
+          <UploadBatchBar
+            documents={batchDocuments}
+            readonly={readonly}
+            busy={estimates.busy}
+            onConfirm={(confirm, skip) => void estimates.confirm(confirm, skip)}
+            onWithdraw={(waiting) => void estimates.withdraw(waiting)}
+          />
+        }
+        rowExtra={(item) =>
+          item.result && !item.result.unchanged ? (
+            <UploadRowEstimate document={batchById[item.result.id]} {...estimateActionProps} />
+          ) : null
+        }
+      />
+
+      <PendingConfirmationBanner
+        summary={estimateSummary}
+        readonly={readonly}
+        busy={estimates.busy}
+        onlyWaiting={onlyWaiting}
+        onConfirmAll={() => estimateSummary && void estimates.confirmAll(estimateSummary)}
+        onPrepareWithdrawAll={estimates.waitingDocuments}
+        onWithdrawAll={(waiting) => void estimates.withdraw(waiting)}
+        onOnlyWaitingChange={handleOnlyWaiting}
       />
 
       <DocumentBatchBar

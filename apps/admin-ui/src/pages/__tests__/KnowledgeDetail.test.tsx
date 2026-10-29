@@ -959,9 +959,13 @@ describe("DocumentsTab — upload queue (B-175 L3)", () => {
       return d.promise;
     });
 
+    // B-222 PR-2: the queue also reads its own documents (``documentIds``);
+    // only the table's refreshes are counted here.
+    const tableCalls = () => listSpy.mock.calls.filter((c) => !c[3]?.documentIds);
+
     renderDetail();
     await waitFor(() => expect(screen.getByText("faq.pdf")).toBeInTheDocument());
-    const listCallsBefore = listSpy.mock.calls.length;
+    const listCallsBefore = tableCalls().length;
 
     pickFiles(BATCH);
 
@@ -983,7 +987,7 @@ describe("DocumentsTab — upload queue (B-175 L3)", () => {
     await userEvent.click(within(summary).getByRole("button", { name: /show list/i }));
     expect(countBy(rowStatuses())).toEqual({ uploading: 3, queued: 1, skipped: 2 });
     // nothing settled yet → no refresh
-    expect(listSpy).toHaveBeenCalledTimes(listCallsBefore);
+    expect(tableCalls()).toHaveLength(listCallsBefore);
 
     await act(async () => {
       pending[0].resolve(DOCS[0]);
@@ -992,18 +996,18 @@ describe("DocumentsTab — upload queue (B-175 L3)", () => {
     });
     await waitFor(() => expect(uploadSpy).toHaveBeenCalledTimes(4));
     expect(uploadSpy.mock.calls[3][1].name).toBe("d.txt");
-    expect(listSpy).toHaveBeenCalledTimes(listCallsBefore);
+    expect(tableCalls()).toHaveLength(listCallsBefore);
 
     await act(async () => {
       pending[3].resolve(DOCS[0]);
     });
-    await waitFor(() => expect(listSpy).toHaveBeenCalledTimes(listCallsBefore + 1));
+    await waitFor(() => expect(tableCalls()).toHaveLength(listCallsBefore + 1));
     expect(countBy(rowStatuses())).toEqual({ done: 4, skipped: 2 });
     // and no second refresh trails in
     await act(async () => {
       await new Promise((r) => setTimeout(r, 30));
     });
-    expect(listSpy).toHaveBeenCalledTimes(listCallsBefore + 1);
+    expect(tableCalls()).toHaveLength(listCallsBefore + 1);
   });
 
   it("a server 413 lands the row in failed with the server's limit; retry re-sends", async () => {

@@ -13,3 +13,12 @@ class StaleIngestionError(Exception):
     ``ingest_generation``), cancelled (B-222) or already settled while this
     worker was busy. Nothing was written; the worker must stop quietly — the
     document now belongs to another claim."""
+
+
+class ModelsCheckFailedError(StaleIngestionError):
+    """B2b review —— a confirmed ingest's model check could not run (settings
+    or key lookup failed). Refused like a stale claim — every paid call that
+    checks stops (a call's checkpoint only stops on a
+    :class:`StaleIngestionError`) — but the document is still this claim's:
+    it is retried, its parse snapshot kept, and fails with
+    ``models_check_failed`` once its attempts are used up."""

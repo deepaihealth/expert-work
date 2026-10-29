@@ -62,6 +62,7 @@ from expert_work.protocol import (
 from expert_work.protocol.knowledge_estimate import (
     EstimateBasis,
     EstimateKind,
+    EstimateModels,
     EstimateNote,
     IngestEstimate,
 )
@@ -576,3 +577,31 @@ def test_the_generic_averages_err_on_the_high_side() -> None:
         values = [getattr(caps, field_name) for caps in measured]
         default = getattr(DEFAULT_ESTIMATE_CAPS, field_name)
         assert all(value <= default for value in values if value is not None), field_name
+
+
+# -- the models a confirmed ingest may call (B2a review, §14 ④) --------------------
+
+
+async def test_a_switched_recognition_or_figure_model_is_noticed() -> None:
+    settings = _Settings()
+    setup = await _new(_MIXED.filename, _MIXED.raw, settings=settings)
+    confirmed = EstimateModels(
+        embedding=_EMBED,
+        recognition="acme/ocr-1",
+        fallback="acme/vlm-1",
+        figure="qwen/qwen3.8-flash",
+    )
+    claim = _claim(setup)
+    assert not await setup.estimator.models_changed(claim, confirmed)
+
+    settings.figure = ModelChoice("qwen", "qwen3.9-flash")
+    assert await setup.estimator.models_changed(claim, confirmed)
+    settings.figure = ModelChoice("qwen", "qwen3.8-flash")
+    settings.fallback = ModelChoice("acme", "vlm-2")
+    assert await setup.estimator.models_changed(claim, confirmed)
+    settings.fallback = ModelChoice("acme", "vlm-1")
+    settings.primary = ModelChoice("acme", "ocr-2")
+    assert await setup.estimator.models_changed(claim, confirmed)
+    # Models the estimate did not count on are not compared.
+    unused = EstimateModels(embedding=_EMBED)
+    assert not await setup.estimator.models_changed(claim, unused)

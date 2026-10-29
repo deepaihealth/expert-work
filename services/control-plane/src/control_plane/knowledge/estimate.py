@@ -209,6 +209,42 @@ class IngestEstimator:
             items=items,
         )
 
+    async def models_changed(self, claim: ClaimedIngestion, confirmed: EstimateModels) -> bool:
+        """§14 ④ during a confirmed ingest: the recognition or figure model it
+        would call now is not the one in the estimate the user confirmed.
+        Only the models the estimate counted on are compared.
+
+        Recognition is compared on the configured models, not the usable
+        ones (B2b review): a confirmed model whose key cannot be read right
+        now is still the one configured — a passing lookup failure is not a
+        switch. A switch is a confirmed model no longer configured (or in
+        another order), or a model it did not count on that would be called
+        now (configured, and usable). Pages may then run on the confirmed
+        fallback and cost more than estimated: by the 10-27 decision an
+        actual above its estimate does not pause the ingest (both are shown)."""
+        if confirmed.recognition is not None:
+            if self._recognizer is None:
+                return True
+            plan = await self._recognizer.plan(tenant_id=claim.tenant_id)
+            counted = tuple(
+                key for key in (confirmed.recognition, confirmed.fallback) if key is not None
+            )
+            configured = [engine.choice.key for engine in plan.engines]
+            if tuple(key for key in configured if key in counted) != counted:
+                return True
+            if any(
+                engine.client is not None
+                for engine in plan.engines
+                if engine.choice.key not in counted
+            ):
+                return True
+        if confirmed.figure is not None and self._settings is not None:
+            settings = await self._settings.recognition_settings()
+            figure = settings.figure.key if settings.figure is not None else None
+            if figure != confirmed.figure:
+                return True
+        return False
+
     # -- counts ----------------------------------------------------------------
 
     async def _pages(

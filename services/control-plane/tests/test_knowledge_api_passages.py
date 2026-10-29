@@ -44,6 +44,7 @@ from tests.auth_fixtures import (
     grant_system_admin,
     make_test_jwt,
 )
+from tests.knowledge_confirm import settle
 
 _TENANT = DEFAULT_DEV_TENANT_ID
 _FIXTURE = (
@@ -150,7 +151,7 @@ async def harness() -> AsyncIterator[Harness]:
             "/v1/knowledge/bases/kb/documents",
             files={"file": ("guide.md", _DOC.encode(), "text/markdown")},
         )
-        await runner.drain()
+        await settle(client, runner)
         yield Harness(client, runner, store, audit, embedder, str(uploaded.json()["id"]))
 
 
@@ -436,7 +437,7 @@ async def test_a_reupload_lists_what_needs_review_and_it_can_be_discarded(
         files={"file": ("guide.md", changed.encode(), "text/markdown")},
     )
     assert uploaded.status_code == 202
-    await harness.runner.drain()
+    await settle(harness.client, harness.runner)
 
     review = (await harness.client.get(f"{harness.base}/unapplied-edits")).json()
     ((unapplied,),) = [review["unapplied"]]

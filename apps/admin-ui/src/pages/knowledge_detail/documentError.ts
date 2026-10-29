@@ -30,6 +30,8 @@ export function documentErrorText(
   document: Pick<KnowledgeDocument, "error" | "error_code">,
 ): string | null {
   const code = document.error_code;
+  // B-222: the recorded error names the document; the user acts on settings.
+  if (code === "models_check_failed") return t("knowledge_page.error_models_check_failed");
   if (code !== "text_too_large" && code !== "too_many_chunks") return document.error;
   const { pattern, key } = REFUSALS[code];
   const match = document.error ? pattern.exec(document.error) : null;

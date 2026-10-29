@@ -26,6 +26,7 @@ from tests.auth_fixtures import (
     build_test_jwt_verifier,
     make_test_jwt,
 )
+from tests.knowledge_confirm import settle
 
 _BODY = b"# H\n\nThe deductible is 500 dollars."
 
@@ -73,6 +74,15 @@ async def _client(
                 files={"file": (name, _BODY, "text/markdown")},
             )
         await runner.drain()
+        # B-222 PR-2 (K-21 ①): a copy is held back on upload — 「仍入库」 it.
+        listed = (await client.get("/v1/knowledge/bases/kb/documents")).json()["documents"]
+        for document in listed:
+            if (document["ingest_estimate"] or {}).get("duplicate_of"):
+                resp = await client.post(
+                    f"/v1/knowledge/bases/kb/documents/{document['id']}/estimate"
+                )
+                assert resp.status_code == 202, resp.text
+        await settle(client, runner)
         yield client
 
 

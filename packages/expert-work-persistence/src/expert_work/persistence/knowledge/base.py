@@ -184,7 +184,12 @@ class ClaimedIngestion:
 #: B-222 —— what :meth:`KnowledgeStore.cancel_documents` did with one document
 #: (PR-2: ``withdrawn`` / ``withdrawn_deleted`` — its estimate was withdrawn).
 CancelOutcome = Literal[
-    "cancelled", "not_cancellable", "not_found", "withdrawn", "withdrawn_deleted"
+    "cancelled",
+    "not_cancellable",
+    "not_found",
+    "withdrawn",
+    "withdrawn_deleted",
+    "status_changed",
 ]
 
 
@@ -481,8 +486,11 @@ class KnowledgeStore(abc.ABC):
         """Tenant-scoped CAS claim of one document for the fast (in-process)
         ingest path. Succeeds only if it is claimable (``pending``, or
         ``processing`` with an expired lease) and under ``max_attempts``;
-        sets ``processing`` + a fresh lease and bumps ``attempts``. Returns
-        the claim or ``None`` if another worker already holds it.
+        sets ``processing`` + a fresh lease and bumps ``attempts``, and puts
+        ``stage`` back to ``queued`` (a claimable row has no chunk swap of
+        its own in place: an ingest's swap lands with its READY — see
+        :meth:`replace_chunks` ``ready_chunk_count``). Returns the claim or
+        ``None`` if another worker already holds it.
 
         B-222 PR-2: an ``estimating`` document with no live lease is claimable
         too — for its estimate only: it stays ``estimating`` (fresh lease,
@@ -548,7 +556,12 @@ class KnowledgeStore(abc.ABC):
 
     @abc.abstractmethod
     async def cancel_documents(
-        self, *, tenant_id: UUID, kb_id: UUID, document_ids: Sequence[UUID]
+        self,
+        *,
+        tenant_id: UUID,
+        kb_id: UUID,
+        document_ids: Sequence[UUID],
+        expect_status: Collection[DocumentStatus] | None = None,
     ) -> dict[UUID, CancelOutcome]:
         """B-222 —— stop the ingest of each of the base's ``pending`` /
         ``processing`` documents: status ``CANCELLED``, ``error='cancelled by
@@ -572,7 +585,12 @@ class KnowledgeStore(abc.ABC):
         ``withdrawn`` — put back (see
         :func:`~expert_work.persistence.knowledge.estimates.withdraw_plan`).
         A ``pending`` / ``processing`` document cancelled loses its snapshot
-        too."""
+        too.
+
+        B2b review: with ``expect_status``, a document whose status (read
+        with its row locked) is not one of them is left alone —
+        ``status_changed`` (the caller read it as waiting, and it was
+        confirmed or sent for 「仍入库」 since)."""
 
     @abc.abstractmethod
     async def sweep_terminal(self, *, now: datetime, max_attempts: int) -> int:
@@ -987,9 +1005,16 @@ class KnowledgeStore(abc.ABC):
           bytes (serving or pending): ``awaiting_confirmation`` at once, with an
           unparsed estimate naming it (``duplicate_of``, nothing to pay,
           ``confirm_by`` = ``now`` + 7 days);
-        * ``estimating`` — otherwise.
+        * ``estimating`` — otherwise;
+        * ``busy`` — the document is past the point of no return (its new
+          chunks are being swapped in, ``estimates.writing_chunks``): nothing
+          is touched, upload again once it is ready.
 
-        Either way but ``unchanged``: ``ingest_generation`` bumped, ``attempts``
+        The same bytes already queued or being ingested (``pending`` /
+        ``processing``) are ``unchanged`` too: a confirmed ingest is not
+        restarted.
+
+        Either way but ``unchanged`` / ``busy``: ``ingest_generation`` bumped, ``attempts``
         0, lease, ``error`` / ``error_code`` cleared, ``stage=queued``; the
         estimate meta records the origin (``upload`` for a document this call
         created, else ``reupload``) and how to put the document back. A
@@ -1003,12 +1028,19 @@ class KnowledgeStore(abc.ABC):
         document_id: UUID,
         origin: EstimateOrigin,
         allow_duplicate: bool = False,
+        expect_status: DocumentStatus | None = None,
+        expect_estimate_id: UUID | None = None,
     ) -> KnowledgeDocument | None:
         """A re-ingest, 「补识别」, re-chunk or batch re-ingest of the bytes the
         document has (``origin``), or — ``allow_duplicate`` — a duplicate the
         user wants ingested anyway: ``estimating``, with the same resets as
         :meth:`begin_upload` (byte slots untouched); its snapshot is deleted.
-        ``None`` when there is no such document."""
+        ``None`` when there is no such document.
+
+        :raises ~expert_work.persistence.knowledge.estimates.EstimateRefused:
+            nothing changed — ``busy`` (past the point of no return), or the
+            document is no longer in ``expect_status`` / under
+            ``expect_estimate_id`` (checked with the row locked)."""
 
     @abc.abstractmethod
     async def finish_estimate(
@@ -1020,6 +1052,7 @@ class KnowledgeStore(abc.ABC):
         estimate: Mapping[str, Any],
         snapshot: ParseSnapshot | None,
         confirm_by: datetime,
+        now: datetime | None = None,
     ) -> KnowledgeDocument | None:
         """Fenced (``estimating`` at ``generation``): the estimate (a dumped
         :class:`~expert_work.protocol.knowledge_estimate.IngestEstimate`) is
@@ -1029,7 +1062,11 @@ class KnowledgeStore(abc.ABC):
         transaction. New bytes are checked once more against the base: when a
         document created before this one holds them, the estimate names it
         (``duplicate_of``) — two identical files uploaded at once. ``None``
-        (nothing written) when the document is no longer this estimate's."""
+        (nothing written) when the document is no longer this estimate's.
+
+        A released duplicate keeps the deadline it had, floored at ``now``
+        (default: the clock) plus the grace (see
+        :func:`~expert_work.persistence.knowledge.estimates.kept_deadline`)."""
 
     @abc.abstractmethod
     async def confirm_documents(
@@ -1048,7 +1085,8 @@ class KnowledgeStore(abc.ABC):
         more day. One outcome per distinct document: ``confirmed``,
         ``estimate_changed`` (estimated again since), ``not_awaiting``,
         ``duplicate`` (caught on upload, never estimated — estimate it first),
-        ``not_found`` (not in this base)."""
+        ``expired`` (its ``confirm_by`` has passed: it is withdrawn, never
+        confirmed), ``not_found`` (not in this base)."""
 
     @abc.abstractmethod
     async def confirm_all(
@@ -1058,15 +1096,21 @@ class KnowledgeStore(abc.ABC):
         kb_id: UUID,
         expected_count: int,
         expected_total_micros: int,
+        expected_fingerprint: str,
         confirmed_by: str | None,
         now: datetime,
-        withdraw_duplicates: bool,
+        withdraw_duplicates: Sequence[UUID] = (),
     ) -> ConfirmAllResult:
         """Confirm every confirmable document waiting in the base — only when
-        they still number ``expected_count`` and add up to
-        ``expected_total_micros`` (what the user was shown; checked with the
-        rows locked), else nothing changes. Duplicates are never confirmed by
-        it; ``withdraw_duplicates`` withdraws them in the same transaction."""
+        they are still exactly the estimates the user was shown
+        (``expected_fingerprint``, :attr:`EstimateSummary.fingerprint`) and
+        number ``expected_count`` and add up to ``expected_total_micros``
+        (checked with the rows locked), else nothing changes. One past its
+        ``confirm_by`` is not confirmable (``skipped``: left for the expiry
+        sweep). Duplicates are never confirmed by it; those
+        of ``withdraw_duplicates`` (the ones the user was shown) still waiting
+        as duplicates are withdrawn in the same transaction — never one that
+        arrived since."""
 
     @abc.abstractmethod
     async def return_to_confirmation(
@@ -1084,6 +1128,25 @@ class KnowledgeStore(abc.ABC):
         total rose past the threshold), so the document waits for the new one
         (``awaiting_confirmation`` until ``confirm_by``, lease released, the
         estimate meta kept, ``snapshot`` replacing the old one)."""
+
+    @abc.abstractmethod
+    async def release_stale_duplicates(
+        self,
+        *,
+        tenant_id: UUID | None = None,
+        kb_id: UUID | None = None,
+        now: datetime | None = None,
+    ) -> list[KnowledgeDocument]:
+        """K-21 ①, §7 —— duplicates whose original no longer holds their
+        bytes (withdrawn, deleted, replaced) lose the mark
+        (:func:`~expert_work.persistence.knowledge.estimates.released_duplicate`):
+        a real estimate waits as a plain one; one never parsed goes
+        ``estimating`` (generation bumped) for the caller or the recovery
+        worker to estimate, and its estimate keeps the deadline it had. One
+        past its deadline at ``now`` (default: the clock) is left to
+        :meth:`expire_awaiting`. Within ``tenant_id`` / ``kb_id`` when given,
+        else across tenants (caller bypasses RLS), in bounded batches. Returns
+        the documents changed."""
 
     @abc.abstractmethod
     async def expire_awaiting(self, *, now: datetime, limit: int) -> list[ExpiredEstimate]:
@@ -1124,7 +1187,9 @@ class KnowledgeStore(abc.ABC):
         was written."""
 
     @abc.abstractmethod
-    async def estimate_summary(self, *, tenant_id: UUID, kb_id: UUID) -> EstimateSummary:
+    async def estimate_summary(
+        self, *, tenant_id: UUID, kb_id: UUID, now: datetime | None = None
+    ) -> EstimateSummary:
         """The base's documents being estimated or waiting for a confirmation,
         added up (:func:`~expert_work.persistence.knowledge.estimates.summarize`)."""
 
@@ -1154,6 +1219,7 @@ class KnowledgeStore(abc.ABC):
         expect_status: DocumentStatus = DocumentStatus.PROCESSING,
         chunk_params_hash: str | None = None,
         switch_offs: Collection[SwitchOffRecord] = (),
+        ready_chunk_count: int | None = None,
     ) -> bool:
         """Replace all of a document's chunks with ``chunks`` — deletes
         the document's existing chunks, then inserts the new set, in one
@@ -1189,7 +1255,15 @@ class KnowledgeStore(abc.ABC):
         record is inserted; an earlier one is only updated where it still
         exists, so one discarded (or deleted by the retention job) while the
         ingest ran stays gone. Records it does not name are left as they are;
-        text histories never get records' flags or vice versa."""
+        text histories never get records' flags or vice versa.
+
+        ``ready_chunk_count`` (B2b review; a fenced ingest write-back only —
+        ``generation`` given and ``expect_status`` ``processing``, else
+        :class:`ValueError`, so a re-index never settles anything): the swap
+        also settles the document READY with that ``chunk_count``, in the
+        same transaction — everything :meth:`set_document_status` writes
+        for a fenced READY. A swap in place then always means READY: a
+        ``processing`` row never serves chunks of its own pending ingest."""
 
     @abc.abstractmethod
     async def list_chunks(

@@ -43,6 +43,7 @@ from tests.auth_fixtures import (
     grant_system_admin,
     make_test_jwt,
 )
+from tests.knowledge_confirm import settle
 from tests.test_knowledge_api_logs import _GUIDE
 
 _TENANT = DEFAULT_DEV_TENANT_ID
@@ -125,7 +126,7 @@ async def setup() -> AsyncIterator[_Setup]:
             "/v1/knowledge/bases/kb/documents",
             files={"file": ("h.md", b"# H\n\nThe deductible is 500 dollars.", "text/markdown")},
         )
-        await runner.drain()
+        await settle(client, runner)
         yield _Setup(client, store, log, app)
 
 
@@ -321,7 +322,7 @@ async def test_responses_carry_every_key_the_console_reads(setup: _Setup) -> Non
         files={"file": ("guide.md", _GUIDE.encode(), "text/markdown")},
     )
     assert uploaded.status_code == 202, uploaded.text
-    await setup.app.state.knowledge_ingestion_runner.drain()
+    await settle(setup.client, setup.app.state.knowledge_ingestion_runner)
     tested = (
         await setup.client.post(
             "/v1/knowledge/bases/kb/test", json={"query": "pd7 pd8", "method": "keyword"}
