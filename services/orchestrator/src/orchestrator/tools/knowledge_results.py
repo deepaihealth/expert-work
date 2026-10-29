@@ -57,7 +57,7 @@ def collapse_to_parents(
 
 @dataclass(frozen=True)
 class ResultText:
-    """One result as the budget sees it: its ``[file#index]`` header, its full
+    """One result as the budget sees it: its ``[D12#7] <file>`` header, its full
     text (the parent's), and its hit child's text, the shorter stand-in when the
     full text does not fit (``None`` when the full text is the hit child's own)."""
 

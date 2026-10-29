@@ -11,7 +11,8 @@
   ``matches_reference``,归成 答对 / 编造 / 正确说没写 / 误拒(另有 答偏 / 其它 / 判分失败)。
 * B-206 K-2 起, 生产里有知识库的智能体还有 ``knowledge_read``:默认一起给模型(每题最多读 3 次,
   不占检索次数;模型最多回 8 轮), 读到的内容记进结果行的 ``reads``、也给判分看;
-  ``--no-read`` = 只给 ``knowledge_search``(K-2 之前的工具组合)。
+  ``--no-read`` = 不给 ``knowledge_read``(读文档关掉)。它**不是**改动前的基线:检索结果标头、
+  工具说明、模型最多回几轮都已是 K-2 之后的;改动前那一臂要在改动前的检出上用当时的脚本跑。
 
 选题:主集与真实问法集各取全部「资料没写」题 + 固定种子各抽 15 道有答案的题(与 B-175 PR3
 同一批 60 题:30 + 30)。判分时给的「含答案的完整段落」= 期望文档里含锚文本的段,建库后从库里取。
@@ -872,7 +873,10 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--no-read",
         action="store_true",
-        help="不给模型 knowledge_read(B-206 K-2 之前的工具组合)",
+        help=(
+            "读文档关掉:不给模型 knowledge_read。不是改动前的基线(标头、工具说明、最多回几轮"
+            "都已是 K-2 之后的)"
+        ),
     )
     parser.add_argument("--rerank", default="dashscope", choices=("dashscope", "off"))
     # B-206 K-14 对照组,与 kb_eval.py 同名同义;默认 = 生产默认。
@@ -1019,7 +1023,7 @@ async def _run(
                 todo=todo,
                 models=models,
                 tool=KnowledgeSearchTool(retriever=retriever, knowledge_base_refs=refs),
-                # B-206 K-2:生产里有知识库的智能体两个工具都有;--no-read 是改动前那一臂。
+                # B-206 K-2:生产里有知识库的智能体两个工具都有;--no-read 只是读文档关掉。
                 reader=None
                 if args.no_read
                 else KnowledgeReadTool(store=store, knowledge_base_refs=refs),

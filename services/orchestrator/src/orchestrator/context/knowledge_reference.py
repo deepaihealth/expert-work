@@ -8,11 +8,14 @@ read collapses to this one-line reference instead — what was read and that the
 same arguments read it again (the version in use then; a re-ingest may have
 changed it). Same shape and rules as :mod:`orchestrator.context.skill_reference`:
 only a successful read gets one, model-written arguments are ``repr``-escaped
-and capped, and there is no call syntax (the L2 summariser drops it).
+and capped at what the tool accepts (so they are whole: "the same arguments"),
+and there is no call syntax (the L2 summariser drops it).
 
 The line is built from the ``ToolResult.meta`` the dispatch layer surfaced in
 ``ToolMessage.artifact`` (``args`` and the page position): platform-built, with
-only the model's own arguments echoed — never document text.
+only the model's own section / find echoed — never document text. A document
+without a number is "this document": its reference would be its file name, and
+the line sits outside the spotlight fence.
 
 Consumed by :mod:`orchestrator.context.tool_result_prune`: the in-turn collapse
 (CM-12) and the cross-turn cleanup (B-126).
@@ -24,9 +27,9 @@ import re
 
 from langchain_core.messages import BaseMessage, ToolMessage
 
+from orchestrator.tools.knowledge_read_reader import MAX_ARGUMENT_CHARS
+
 KNOWLEDGE_READ_TOOL_NAME = "knowledge_read"
-#: Bound on a model-written argument echoed into the reference.
-_ARGUMENT_CHAR_CAP = 80
 _DOCUMENT_REF = re.compile(r"D[0-9]+(?:#[0-9]+)?")
 
 
@@ -44,7 +47,7 @@ def knowledge_read_reference(message: BaseMessage) -> str | None:
     if not isinstance(args, dict) or not isinstance(args.get("document"), str):
         return None
     document = args["document"]
-    parts = [document if _DOCUMENT_REF.fullmatch(document) else _quoted(document)]
+    parts = [document if _DOCUMENT_REF.fullmatch(document) else "this document"]
     for key in ("section", "find"):
         if isinstance(args.get(key), str):
             parts.append(f"{key} {_quoted(args[key])}")
@@ -61,7 +64,7 @@ def knowledge_read_reference(message: BaseMessage) -> str | None:
 
 
 def _quoted(text: str) -> str:
-    return repr(text[:_ARGUMENT_CHAR_CAP])
+    return repr(text[:MAX_ARGUMENT_CHARS])
 
 
 def _is_int(value: object) -> bool:

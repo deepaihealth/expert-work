@@ -526,29 +526,29 @@ class InMemoryKnowledgeStore(KnowledgeStore):
         )
 
     async def find_documents_by_name(
-        self, *, tenant_id: UUID, kb_ids: Sequence[UUID], name: str, limit: int
+        self,
+        *,
+        tenant_id: UUID,
+        kb_ids: Sequence[UUID],
+        name: str,
+        limit: int,
+        exact: bool = False,
     ) -> list[KnowledgeDocument]:
         needle = name.lower()
         bases = set(kb_ids)
 
-        def fields(doc: KnowledgeDocument) -> tuple[str, str]:
-            return doc.filename.lower(), (doc.title or "").lower()
+        def matches(field: str) -> bool:
+            return field == needle if exact else needle in field
 
         found = [
             d
             for d in self._documents
             if d.tenant_id == tenant_id
             and d.kb_id in bases
-            and any(needle in field for field in fields(d))
+            and d.enabled
+            and (matches(d.filename.lower()) or matches((d.title or "").lower()))
         ]
-        found.sort(
-            key=lambda d: (
-                needle not in fields(d),
-                d.doc_seq is None,
-                d.doc_seq or 0,
-                str(d.id),
-            )
-        )
+        found.sort(key=lambda d: (d.doc_seq is None, d.doc_seq or 0, str(d.id)))
         return found[:limit]
 
     async def get_document_content(self, *, tenant_id: UUID, document_id: UUID) -> bytes | None:

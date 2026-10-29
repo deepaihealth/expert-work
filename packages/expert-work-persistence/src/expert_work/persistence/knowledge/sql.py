@@ -1523,26 +1523,35 @@ class SqlKnowledgeStore(KnowledgeStore):
         return _to_document(row) if row is not None else None
 
     async def find_documents_by_name(
-        self, *, tenant_id: UUID, kb_ids: Sequence[UUID], name: str, limit: int
+        self,
+        *,
+        tenant_id: UUID,
+        kb_ids: Sequence[UUID],
+        name: str,
+        limit: int,
+        exact: bool = False,
     ) -> list[KnowledgeDocument]:
         if not kb_ids:
             return []
-        needle = name.lower()
+        # Both sides folded by the database's lower(); strpos matches literally
+        # (no LIKE wildcards to escape).
+        needle = func.lower(literal(name))
         filename = func.lower(KnowledgeDocumentRow.filename)
         title = func.lower(func.coalesce(KnowledgeDocumentRow.title, ""))
-        exact = or_(filename == needle, title == needle)
+        named = (
+            or_(filename == needle, title == needle)
+            if exact
+            else or_(func.strpos(filename, needle) > 0, func.strpos(title, needle) > 0)
+        )
         stmt = (
             select(KnowledgeDocumentRow)
             .where(
                 KnowledgeDocumentRow.tenant_id == tenant_id,
                 KnowledgeDocumentRow.kb_id.in_(list(kb_ids)),
-                or_(
-                    filename.contains(needle, autoescape=True),
-                    title.contains(needle, autoescape=True),
-                ),
+                KnowledgeDocumentRow.enabled.is_(True),
+                named,
             )
             .order_by(
-                case((exact, 0), else_=1),
                 KnowledgeDocumentRow.doc_seq.asc().nulls_last(),
                 KnowledgeDocumentRow.id.asc(),
             )

@@ -4,8 +4,9 @@ A document is read as its passages (:class:`ReadPassage`: a parent row, or a
 chunk standing for itself), in reading order. Each mode picks some of them —
 a page (:func:`pack_pages`), the window around one (:func:`around_window`),
 those under a heading (:func:`section_paths` / :func:`in_section`), those that
-contain given words (:func:`find_units`) — and the tool lays them out. Sizes are
-token counts the tool measured; nothing here reads a store or counts tokens.
+contain given words (:func:`find_matches`, with :func:`neighbours` added while
+they :func:`fit_greedily`) — and the tool lays them out. Sizes are token counts
+the tool measured; nothing here reads a store or counts tokens.
 
 A passage is labelled by the chunk numbers under it (``D12#7-9``): a
 ``knowledge_search`` result names its best chunk (``D12#8``), and any number in
@@ -16,7 +17,7 @@ from __future__ import annotations
 
 import re
 import unicodedata
-from collections.abc import Sequence
+from collections.abc import Collection, Sequence
 from dataclasses import dataclass
 from typing import Literal
 from uuid import UUID
@@ -160,24 +161,36 @@ def haystack(passage: ReadPassage) -> str:
     return squeeze(f"{headings}\n{passage.text}")
 
 
-def find_units(haystacks: Sequence[str], words: Sequence[str]) -> list[list[tuple[int, Role]]]:
-    """The passages that contain every one of ``words`` (squeezed), each as a
-    unit with the passage before and after it — a neighbour already shown, or
-    that is itself a match, is not repeated. In reading order."""
-    matches = [i for i, text in enumerate(haystacks) if all(w in text for w in words)]
-    matched = set(matches)
-    shown: set[int] = set()
-    units: list[list[tuple[int, Role]]] = []
-    for m in matches:
-        unit: list[tuple[int, Role]] = []
-        if m - 1 >= 0 and m - 1 not in matched and m - 1 not in shown:
-            unit.append((m - 1, "context_before"))
-        unit.append((m, "match"))
-        if m + 1 < len(haystacks) and m + 1 not in matched:
-            unit.append((m + 1, "context_after"))
-        shown.update(i for i, _role in unit)
-        units.append(unit)
-    return units
+def find_matches(haystacks: Sequence[str], words: Sequence[str]) -> list[int]:
+    """The passages that contain every one of ``words`` (squeezed), in reading
+    order."""
+    return [i for i, text in enumerate(haystacks) if all(w in text for w in words)]
+
+
+def neighbours(hits: Sequence[int], total: int, matched: Collection[int]) -> list[tuple[int, Role]]:
+    """The passage before and after each of ``hits`` (in order: before, then
+    after), each once — never a passage that is itself a match."""
+    found: dict[int, Role] = {}
+    for hit in hits:
+        sides: tuple[tuple[int, Role], ...] = (
+            (hit - 1, "context_before"),
+            (hit + 1, "context_after"),
+        )
+        for index, role in sides:
+            if 0 <= index < total and index not in matched and index not in found:
+                found[index] = role
+    return list(found.items())
+
+
+def fit_greedily(used: int, sizes: Sequence[int], budget: int) -> list[int]:
+    """Which of ``sizes`` (in order) to add to ``used`` so the total stays within
+    ``budget``: each one that still fits, skipping those that do not."""
+    kept: list[int] = []
+    for i, size in enumerate(sizes):
+        if used + size <= budget:
+            used += size
+            kept.append(i)
+    return kept
 
 
 def word_counts(haystacks: Sequence[str], words: Sequence[str]) -> list[tuple[str, int]]:

@@ -6,33 +6,40 @@ that contain given words — as the tool's result: the document's details, the
 passages (each labelled ``[D12#7-9]``), a notice of platform facts (page n of N,
 what to pass next) and ``meta`` recording what was read.
 
-Sizes are tokens, counted with the tool's estimator off the event loop. A page
-fills to :data:`PAGE_SHARE` of ``max_tokens`` and always holds one whole passage;
-one longer than :data:`MAX_MAX_TOKENS` (only a hand edit makes one) is cut and
-marked. Tenant text — file names, titles, base names, metadata, headings,
-bodies — goes in the content only; notices and errors carry ``D`` references,
-numbers and fixed text (:attr:`OpenDocument.spoken`).
+Sizes are tokens (:class:`PassageTokens`), counted off the event loop, as is
+find's normalising of every passage. A page fills to :data:`PAGE_SHARE` of
+``max_tokens`` and always holds one whole passage; find keeps its hits whole and
+adds a neighbour only when it fits; a passage longer than :data:`MAX_MAX_TOKENS`
+(only a hand edit makes one) is cut and marked. Tenant text — file names,
+titles, base names, metadata, headings, bodies — goes in the content only;
+notices and errors carry ``D`` references, numbers and fixed text
+(:attr:`OpenDocument.spoken`).
 """
 
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Mapping, Sequence
+import hashlib
+import threading
+from collections import OrderedDict
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import PurePosixPath
 from typing import Any
 
 from expert_work.protocol import DocumentStatus, KnowledgeBase, KnowledgeDocument
-from expert_work.runtime.tokens import TokenEstimator
+from expert_work.runtime.tokens import TiktokenEstimator, TokenEstimator
 from orchestrator.tools.error_classifier import GuidedToolError
 from orchestrator.tools.knowledge_read_view import (
     ReadPassage,
     Role,
     around_window,
-    find_units,
+    find_matches,
+    fit_greedily,
     haystack,
     in_section,
     label,
+    neighbours,
     normalize,
     outline,
     pack_pages,
@@ -77,6 +84,13 @@ _REINGEST_NOTICE = (
     "[knowledge_read: a newer version of this document is being ingested; this is the version "
     "in use.]"
 )
+#: A newer upload whose ingest failed or was cancelled (``has_pending``).
+_NOT_INGESTED_NOTICE = (
+    "[knowledge_read: a newer version of this document was uploaded but not ingested (its "
+    "ingest failed or was cancelled); this is the version in use.]"
+)
+#: Passage texts whose token counts a tool keeps (about 100 bytes each).
+_PASSAGE_TOKEN_ENTRIES = 10_000
 _CUT_NOTICE = (
     f"[knowledge_read: a passage longer than {MAX_MAX_TOKENS} tokens is cut, marked "
     f"{TRUNCATED_MARK}; the rest of it cannot be shown.]"
@@ -98,11 +112,49 @@ class OpenDocument:
         return self.ref if self.row.doc_seq is not None else "this document"
 
 
+class PassageTokens:
+    """Token counts for one tool's reads, never through the shared estimator's
+    cache: that cache keeps every run's message prefixes warm, and a document's
+    passages and labels written into it would evict them. :meth:`of` keeps a
+    passage text's count here instead, keyed by a hash of the text (an edit or a
+    re-ingest is a new key), so a document read page after page is counted once;
+    :meth:`once` counts a short text (a label) without keeping it. Thread-safe:
+    counting runs on worker threads."""
+
+    def __init__(self, estimator: TokenEstimator, max_entries: int = _PASSAGE_TOKEN_ENTRIES):
+        self._count: Callable[[str], int] = (
+            estimator.count_uncached
+            if isinstance(estimator, TiktokenEstimator)
+            else estimator.count
+        )
+        self._max_entries = max_entries
+        self._known: OrderedDict[bytes, int] = OrderedDict()
+        self._lock = threading.Lock()
+
+    def of(self, text: str) -> int:
+        key = hashlib.blake2b(text.encode("utf-8"), digest_size=16).digest()
+        with self._lock:
+            known = self._known.get(key)
+            if known is not None:
+                self._known.move_to_end(key)
+                return known
+        tokens = self._count(text)
+        with self._lock:
+            self._known[key] = tokens
+            while len(self._known) > self._max_entries:
+                self._known.popitem(last=False)
+        return tokens
+
+    def once(self, text: str) -> int:
+        return self._count(text)
+
+
 @dataclass(frozen=True)
 class _Shown:
-    """One passage on the page: its view, role, and its text as shown (cut
-    when over the ceiling)."""
+    """One passage on the page: its position and view, role, and its text as
+    shown (cut when over the ceiling)."""
 
+    index: int
     passage: ReadPassage
     role: Role | None
     text: str
@@ -114,7 +166,7 @@ class _Shown:
 class DocumentReader:
     """One call's reads of one document's ``passages``."""
 
-    estimator: TokenEstimator
+    tokens: PassageTokens
     doc: OpenDocument
     passages: list[ReadPassage]
     max_tokens: int
@@ -203,45 +255,50 @@ class DocumentReader:
                 f"{MAX_ARGUMENT_CHARS} characters"
             )
             raise ValueError(msg)
-        haystacks = [haystack(p) for p in self.passages]
-        units = find_units(haystacks, words)
-        if not units:
-            counts = "\n".join(
-                f"{w}: {_count(n, 'passage')}" for w, n in word_counts(haystacks, words)
-            )
-            body = f"[no passage of {self.doc.ref} contains every word]\n{counts}"
+        # Normalising every passage is the whole document's text: off the loop.
+        matches, counts = await asyncio.to_thread(self._matching, words)
+        if not matches:
+            listed = "\n".join(f"{w}: {_count(n, 'passage')}" for w, n in counts)
+            body = f"[no passage of {self.doc.ref} contains every word]\n{listed}"
             return self._listing(
                 "find", "no_match", f'find "{find}": no passage', body, _NO_MATCH_NOTICE
             )
-        shown = await self._show([item for unit in units for item in unit])
-        sizes, cursor = [], 0
-        for unit in units:
-            sizes.append(sum(s.tokens for s in shown[cursor : cursor + len(unit)]))
-            cursor += len(unit)
-        pages = pack_pages(sizes, self.budget, max_per_page=MAX_FIND_MATCHES)
+        # A page holds its hits whole (at most MAX_FIND_MATCHES); a neighbour
+        # joins only when it fits what the page has left.
+        hits = await self._show([(m, "match") for m in matches])
+        pages = pack_pages([s.tokens for s in hits], self.budget, max_per_page=MAX_FIND_MATCHES)
         first, last = _pick(pages, page, "the find results have", self.max_tokens)
-        start = sum(len(u) for u in units[:first])
-        end = start + sum(len(u) for u in units[first:last])
-        verb = "contains" if len(units) == 1 else "contain"
+        on_page = hits[first:last]
+        around = await self._show(neighbours(matches[first:last], len(self.passages), set(matches)))
+        kept = fit_greedily(sum(s.tokens for s in on_page), [s.tokens for s in around], self.budget)
+        shown = sorted([*on_page, *(around[i] for i in kept)], key=lambda s: s.index)
+        verb = "contains" if len(matches) == 1 else "contain"
         position = (
-            f'find "{find}": {_count(len(units), "passage")} {verb} every word · '
+            f'find "{find}": {_count(len(matches), "passage")} {verb} every word · '
             f"page {page} of {len(pages)}"
         )
         nxt = _next_page(page, len(pages), " with the same find")
         notice = (
-            f"[knowledge_read: matches {first + 1}-{last} of the {len(units)} passages that "
+            f"[knowledge_read: matches {first + 1}-{last} of the {len(matches)} passages that "
             f"contain every word (page {page} of {len(pages)}){nxt}]"
         )
         return self._result(
             "find",
-            shown[start:end],
+            shown,
             position,
             notice,
             {"find": find, "page": page},
             pages=len(pages),
             page=page,
-            matches=len(units),
+            matches=len(matches),
         )
+
+    def _matching(self, words: Sequence[str]) -> tuple[list[int], list[tuple[str, int]]]:
+        """The passages that contain every word, and — when none does — how many
+        contain each word on its own."""
+        haystacks = [haystack(p) for p in self.passages]
+        matches = find_matches(haystacks, words)
+        return matches, ([] if matches else word_counts(haystacks, words))
 
     def _no_section(
         self, section: str, found: Mapping[tuple[str, ...], tuple[str, ...]]
@@ -270,18 +327,17 @@ class DocumentReader:
     async def _show(self, items: Sequence[tuple[int, Role | None]]) -> list[_Shown]:
         """``items`` (passage index, role) with their token sizes, counted off
         the event loop (a long document's first count is a lot of BPE work; the
-        platform estimator is thread-safe: a lock guards its vocabulary load and
-        its cache)."""
+        platform estimator is thread-safe: a lock guards its vocabulary load)."""
         return await asyncio.to_thread(self._measure, items)
 
     def _measure(self, items: Sequence[tuple[int, Role | None]]) -> list[_Shown]:
-        separator = self.estimator.count(RESULT_SEPARATOR)
+        separator = self.tokens.once(RESULT_SEPARATOR)
         shown: list[_Shown] = []
         for index, role in items:
             passage = self.passages[index]
-            text, tokens, truncated = _fit(self.estimator, passage.text)
-            head = self.estimator.count(_head(self.doc.ref, passage, role))
-            shown.append(_Shown(passage, role, text, head + tokens + separator, truncated))
+            text, tokens, truncated = _fit(self.tokens, passage.text)
+            head = self.tokens.once(_head(self.doc.ref, passage, role))
+            shown.append(_Shown(index, passage, role, text, head + tokens + separator, truncated))
         return shown
 
     def _details(self) -> str:
@@ -311,11 +367,10 @@ class DocumentReader:
         lines = [notice] if notice else []
         if any(s.truncated for s in shown):
             lines.append(_CUT_NOTICE)
-        if self.doc.row.has_pending or self.doc.row.status in (
-            DocumentStatus.PENDING,
-            DocumentStatus.PROCESSING,
-        ):
+        if self.doc.row.status in (DocumentStatus.PENDING, DocumentStatus.PROCESSING):
             lines.append(_REINGEST_NOTICE)
+        elif self.doc.row.has_pending:
+            lines.append(_NOT_INGESTED_NOTICE)
         return "\n".join(lines) or None
 
     def _result(
@@ -380,18 +435,18 @@ def _head(ref: str, passage: ReadPassage, role: Role | None) -> str:
     return f"[{label(ref, passage.chunk_indexes)}]{mark}\n"
 
 
-def _fit(estimator: TokenEstimator, text: str) -> tuple[str, int, bool]:
+def _fit(tokens: PassageTokens, text: str) -> tuple[str, int, bool]:
     """``text``, its tokens, and whether it was cut: a passage over
     :data:`MAX_MAX_TOKENS` is cut to it (by characters, shrunk until it fits)
     and marked."""
-    tokens = estimator.count(text)
-    if tokens <= MAX_MAX_TOKENS:
-        return text, tokens, False
-    keep = len(text) * MAX_MAX_TOKENS // tokens
-    while keep > 0 and estimator.count(text[:keep]) > MAX_MAX_TOKENS:
+    full = tokens.of(text)
+    if full <= MAX_MAX_TOKENS:
+        return text, full, False
+    keep = len(text) * MAX_MAX_TOKENS // full
+    while keep > 0 and tokens.once(text[:keep]) > MAX_MAX_TOKENS:
         keep = keep * 9 // 10
     cut = f"{text[:keep]}\n{TRUNCATED_MARK}"
-    return cut, estimator.count(cut), True
+    return cut, tokens.once(cut), True
 
 
 def _pick(

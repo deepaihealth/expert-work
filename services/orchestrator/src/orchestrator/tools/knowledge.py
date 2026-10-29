@@ -291,7 +291,8 @@ class RetrievedChunk:
 
     ``content`` is the chunk body; ``heading_path`` its section breadcrumb.
     The agent sees (and the eval matches against) :attr:`retrieval_text`, the
-    two joined, under a ``[filename#index]`` header. The reranker judges a
+    two joined, under a ``[D<doc_seq>#<index>] <filename>`` header (B-206 K-2;
+    ``[<filename>#<index>]`` without a number). The reranker judges a
     text built from the stored chunk (see :data:`RerankView`), which also
     carries the document title — here it would only repeat the header.
     """

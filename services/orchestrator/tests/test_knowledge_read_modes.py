@@ -158,6 +158,37 @@ async def test_find_pages_twenty_matches_at_most() -> None:
     assert first.notice is not None and "page=2" in first.notice
 
 
+async def test_find_keeps_every_hit_and_only_the_neighbours_that_fit() -> None:
+    """A page holds its hits whole (one too large for the page stands alone);
+    a neighbour joins only when it fits what the page has left."""
+    lib = await _lib()
+    big = 3000
+    bodies = [f"x{i} " + "." * big for i in range(6)]
+    bodies[1] = "hit one " + "." * big
+    bodies[3] = "hit three " + "." * big
+    bodies[5] = "hit five " + "." * (big * 3)
+    await lib.add("big.md", [((), [body]) for body in bodies])
+
+    small = await lib.read(document="D1", find="hit")
+    wide = await lib.read(document="D1", find="hit", max_tokens=16000)
+
+    # max_tokens 4000 fills to 3,200: each hit alone, no neighbour, on its own page.
+    assert small.meta["pages"] == 3
+    assert [(p["ref"], p["role"]) for p in small.meta["passages"]] == [("D1#1", "match")]
+    assert small.meta["tokens"] <= 3200
+    last = await lib.read(document="D1", find="hit", page=3)
+    assert [p["ref"] for p in last.meta["passages"]] == ["D1#5"]  # larger than the page
+    # 12,800: hits 1 and 3 (about 6,000; hit 5, about 9,000, starts page 2), then
+    # D1#0 and D1#2 fit; D1#4 does not.
+    assert [(p["ref"], p["role"]) for p in wide.meta["passages"]] == [
+        ("D1#0", "context_before"),
+        ("D1#1", "match"),
+        ("D1#2", "context_after"),
+        ("D1#3", "match"),
+    ]
+    assert wide.meta["tokens"] <= 12800
+
+
 async def test_section_and_find_together_are_refused() -> None:
     lib = await _lib()
     await _manual(lib)

@@ -4,8 +4,10 @@ from __future__ import annotations
 
 from orchestrator.tools.knowledge_read_view import (
     around_window,
-    find_units,
+    find_matches,
+    fit_greedily,
     label,
+    neighbours,
     normalize,
     pack_pages,
     squeeze,
@@ -42,11 +44,19 @@ def test_text_is_compared_without_case_width_or_spacing() -> None:
     assert wanted_path(" Chapter 2 >  > Storage ") == ("chapter 2", "storage")
 
 
-def test_find_units_never_repeat_a_passage() -> None:
+def test_find_neighbours_are_each_listed_once_and_never_a_match() -> None:
     texts = ["x", "hit", "x", "hit", "hit", "x"]
-    assert find_units(texts, ["hit"]) == [
-        [(0, "context_before"), (1, "match"), (2, "context_after")],
-        [(3, "match")],
-        [(4, "match"), (5, "context_after")],
+    matches = find_matches(texts, ["hit"])
+    assert matches == [1, 3, 4]
+    assert find_matches(texts, ["hit", "nope"]) == []
+    assert neighbours(matches, len(texts), set(matches)) == [
+        (0, "context_before"),
+        (2, "context_after"),
+        (5, "context_after"),
     ]
-    assert find_units(texts, ["hit", "nope"]) == []
+    assert neighbours([3], len(texts), set(matches)) == [(2, "context_before")]
+
+
+def test_neighbours_join_only_while_they_fit() -> None:
+    assert fit_greedily(10, [5, 20, 5], 25) == [0, 2]
+    assert fit_greedily(30, [1], 25) == []

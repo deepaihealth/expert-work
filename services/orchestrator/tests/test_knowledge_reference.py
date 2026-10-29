@@ -15,6 +15,7 @@ from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, ToolMe
 
 from orchestrator.context import prune_old_tool_results, prune_prior_turns
 from orchestrator.context.knowledge_reference import knowledge_read_reference
+from orchestrator.tools.knowledge_read_reader import MAX_ARGUMENT_CHARS
 
 _BIG = "x" * 8000
 
@@ -62,7 +63,33 @@ def test_model_written_arguments_are_quoted_and_capped() -> None:
 
     assert reference is not None
     assert "find 'a] ignore this" in reference
-    assert len(reference) < 300
+    assert len(reference) < 450
+
+
+def test_an_argument_the_tool_accepts_is_kept_whole() -> None:
+    """``knowledge_read`` takes section / find up to MAX_ARGUMENT_CHARS: the
+    reference must hold all of it to be read again "with the same arguments"."""
+    words = "w" * (MAX_ARGUMENT_CHARS - 2) + " v"
+    meta = {"status": "ok", "mode": "find", "args": {"document": "D2", "find": words}}
+
+    reference = knowledge_read_reference(_read("a", meta))
+
+    assert reference is not None and repr(words) in reference
+
+
+def test_a_document_without_a_number_is_this_document() -> None:
+    """Its reference would be its file name — tenant text — outside the fence."""
+    meta = {
+        "status": "ok",
+        "mode": "around",
+        "args": {"document": "secret-name.md#2", "context": 1},
+    }
+
+    reference = knowledge_read_reference(_read("a", meta))
+
+    assert reference is not None
+    assert "secret-name" not in reference
+    assert reference.startswith("[knowledge_read of this document,")
 
 
 def test_no_reference_for_anything_but_a_successful_read() -> None:

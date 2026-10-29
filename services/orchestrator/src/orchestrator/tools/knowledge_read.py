@@ -50,6 +50,7 @@ from orchestrator.tools.knowledge_read_reader import (
     MAX_MAX_TOKENS,
     DocumentReader,
     OpenDocument,
+    PassageTokens,
 )
 from orchestrator.tools.knowledge_read_view import ReadPassage
 from orchestrator.tools.registry import ToolBlockedError, ToolContext, ToolResult, ToolSpec
@@ -131,7 +132,12 @@ _CHOOSE_NOTICE = (
 )
 
 _BRACKETED = re.compile(r"\[([^\[\]]+)\]")
-_NUMBERED = re.compile(r"[Dd]?([0-9]{1,18})(?:#([0-9]{1,9}))?")
+#: A number, optionally ``D``-prefixed, with an optional ``#`` chunk part. The
+#: tool's own labels list a passage's chunks as runs (``D12#7-9,41``): the first
+#: number is the reference, the rest is read past.
+_NUMBERED = re.compile(r"([Dd])?\s*([0-9]{1,18})\s*(?:#\s*(?:([0-9]{1,9})[0-9,\-\s]*)?)?")
+#: The ``· match`` mark a label carries in find / around results.
+_MATCH_MARK = re.compile(r"\s*·\s*match\s*$")
 _CHUNK_SUFFIX = re.compile(r"(.+)#([0-9]{1,9})")
 _NO_TEXT_YET = {
     DocumentStatus.PENDING: "has no readable text yet: its first ingest has not finished",
@@ -145,7 +151,8 @@ _NO_TEXT_YET = {
 class _Target:
     """What ``document`` names: a number, or else a name (``alternative``: the
     name without a trailing ``#<chunk>``, tried when the whole name matches
-    nothing); and a chunk number, which makes it an around read."""
+    nothing); and a chunk number, which makes it an around read. A number
+    written without ``D`` (``2024``) that finds nothing is tried as ``name``."""
 
     doc_seq: int | None = None
     name: str = ""
@@ -157,11 +164,17 @@ class _Target:
 class KnowledgeReadTool:
     """The ``knowledge_read`` tool over ``knowledge_base_refs`` — registered with
     ``knowledge_search`` for a manifest's ``knowledge:`` block, never without it.
-    ``estimator`` counts page sizes (the platform's ``o200k_base`` estimator)."""
+    ``estimator`` counts page sizes (the platform's ``o200k_base`` estimator),
+    through ``tokens``, which keeps this tool's passage counts out of the
+    estimator's shared cache."""
 
     store: KnowledgeStore
     knowledge_base_refs: tuple[str, ...]
     estimator: TokenEstimator = field(default_factory=default_estimator)
+    tokens: PassageTokens = field(init=False, repr=False, compare=False)
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "tokens", PassageTokens(self.estimator))
 
     @property
     def spec(self) -> ToolSpec:
@@ -192,7 +205,7 @@ class KnowledgeReadTool:
             return found
         doc, chunk = found
         passages = await self._passages(ctx.tenant_id, doc)
-        reader = DocumentReader(self.estimator, doc, passages, max_tokens, len(bases) > 1)
+        reader = DocumentReader(self.tokens, doc, passages, max_tokens, len(bases) > 1)
         if find is not None:
             return await reader.find(find, page)
         if section is not None:
@@ -228,35 +241,53 @@ class KnowledgeReadTool:
         not exist and one outside the agent's bases."""
         if target.doc_seq is not None:
             row = await self.store.get_document_by_seq(tenant_id=tenant_id, doc_seq=target.doc_seq)
-            if row is None or row.kb_id not in bases:
+            if row is not None and row.kb_id in bases:
+                return _opened(row, bases), target.chunk
+            if not target.name:  # D-prefixed: a number, never a name
                 msg = f"no document D{target.doc_seq} in this agent's knowledge bases"
                 raise GuidedToolError(msg, advice=_NOT_FOUND_ADVICE)
-            return _opened(row, bases), target.chunk
-        exact, partial = await self._by_name(tenant_id, target.name, bases)
-        chunk = target.chunk
-        if not exact and target.alternative is not None:
-            name, chunk = target.alternative
-            exact, partial = await self._by_name(tenant_id, name, bases)
-        if len(exact) == 1:
-            return _opened(exact[0], bases), chunk
-        if exact:
-            return _candidates("ambiguous", target.name, exact, bases)
-        if partial:
-            return _candidates("no_match_name", target.name, partial, bases)
+        found = await self._named(tenant_id, target, bases)
+        if found is not None:
+            return found
         msg = "no document with that file name or title in this agent's knowledge bases"
+        if target.doc_seq is not None:
+            msg = (
+                f"no document D{target.doc_seq} in this agent's knowledge bases, and none with "
+                "that file name or title"
+            )
         raise GuidedToolError(msg, advice=_NOT_FOUND_ADVICE)
 
-    async def _by_name(
-        self, tenant_id: UUID, name: str, bases: Mapping[UUID, KnowledgeBase]
-    ) -> tuple[list[KnowledgeDocument], list[KnowledgeDocument]]:
-        """Documents whose file name or title is ``name`` (case-insensitive),
-        and those that only contain it."""
-        found = await self.store.find_documents_by_name(
-            tenant_id=tenant_id, kb_ids=list(bases), name=name, limit=MAX_CANDIDATES + 1
+    async def _named(
+        self, tenant_id: UUID, target: _Target, bases: Mapping[UUID, KnowledgeBase]
+    ) -> tuple[OpenDocument, int | None] | ToolResult | None:
+        """The document whose file name or title is the name (or, failing that,
+        the name without its ``#<chunk>``), the candidates when several are or
+        none is but some contain it, else ``None``. Switched-off documents are
+        never listed (the store leaves them out)."""
+        tries = [(target.name, target.chunk)]
+        if target.alternative is not None:
+            tries.append(target.alternative)
+        for name, chunk in tries:
+            exact = await self._find(tenant_id, name, bases, exact=True)
+            if len(exact) == 1:
+                return _opened(exact[0], bases), chunk
+            if exact:
+                return _candidates("ambiguous", target.name, exact, bases)
+        partial = await self._find(tenant_id, tries[-1][0], bases, exact=False)
+        if partial:
+            return _candidates("no_match_name", target.name, partial, bases)
+        return None
+
+    async def _find(
+        self, tenant_id: UUID, name: str, bases: Mapping[UUID, KnowledgeBase], *, exact: bool
+    ) -> list[KnowledgeDocument]:
+        return await self.store.find_documents_by_name(
+            tenant_id=tenant_id,
+            kb_ids=list(bases),
+            name=name,
+            limit=MAX_CANDIDATES + 1,
+            exact=exact,
         )
-        wanted = name.lower()
-        exact = [d for d in found if wanted in (d.filename.lower(), (d.title or "").lower())]
-        return exact, [d for d in found if d not in exact]
 
     async def _passages(self, tenant_id: UUID, doc: OpenDocument) -> list[ReadPassage]:
         """The document's readable passages. Reading them takes two statements;
@@ -280,31 +311,47 @@ class KnowledgeReadTool:
 
 
 def _parse_document(raw: object) -> _Target:
-    """``document`` as a number (``D12``, ``12``, ``[D12#7]``, a JSON integer,
-    a copied header ``[D12#7] name``) or a name (``name#7`` too)."""
+    """``document`` as a number (``D12``, ``12``, ``[D12#7]``, a JSON integer, a
+    copied header ``[D12#7] name``, one of the tool's own labels ``[D12#7-9] ·
+    match``) or a name (``name#7`` too)."""
     if isinstance(raw, int) and not isinstance(raw, bool):
-        return _Target(doc_seq=raw)
+        return _Target(doc_seq=raw, name=str(raw))
     if not isinstance(raw, str) or not raw.strip() or len(raw) > MAX_ARGUMENT_CHARS * 2:
         msg = "knowledge_read requires 'document': a reference like D12 or D12#7, or a file name"
         raise ValueError(msg)
     text = raw.strip()
-    if (bracketed := _BRACKETED.match(text)) is not None:
-        inner = bracketed.group(1).strip()
-        if (number := _NUMBERED.fullmatch(inner)) is not None:
-            return _numbered(number)
+    bare = _MATCH_MARK.sub("", text)
+    if (bracketed := _BRACKETED.match(bare)) is not None:
+        if (reference := _reference(bracketed.group(1).strip())) is not None:
+            return reference
         if bracketed.end() == len(text):
-            text = inner
-    if (number := _NUMBERED.fullmatch(text)) is not None:
-        return _numbered(number)
-    alternative = None
-    if (suffixed := _CHUNK_SUFFIX.fullmatch(text)) is not None and suffixed.group(1).strip():
-        alternative = (suffixed.group(1).strip(), int(suffixed.group(2)))
-    return _Target(name=text, alternative=alternative)
+            text = bracketed.group(1).strip()
+    elif (reference := _reference(bare)) is not None:
+        return reference
+    return _Target(name=text, alternative=_without_chunk(text))
 
 
-def _numbered(match: re.Match[str]) -> _Target:
-    chunk = match.group(2)
-    return _Target(doc_seq=int(match.group(1)), chunk=int(chunk) if chunk is not None else None)
+def _reference(text: str) -> _Target | None:
+    """``text`` as a number reference, or ``None``. Written without ``D`` it
+    keeps ``text`` as the name to try when the number finds nothing."""
+    match = _NUMBERED.fullmatch(text)
+    if match is None:
+        return None
+    prefixed, number, chunk = match.groups()
+    return _Target(
+        doc_seq=int(number),
+        chunk=int(chunk) if chunk is not None else None,
+        name="" if prefixed else text,
+        alternative=None if prefixed else _without_chunk(text),
+    )
+
+
+def _without_chunk(text: str) -> tuple[str, int] | None:
+    """``name#7`` as ``(name, 7)``."""
+    suffixed = _CHUNK_SUFFIX.fullmatch(text)
+    if suffixed is None or not suffixed.group(1).strip():
+        return None
+    return suffixed.group(1).strip(), int(suffixed.group(2))
 
 
 def _text_arg(args: Mapping[str, Any], key: str) -> str | None:

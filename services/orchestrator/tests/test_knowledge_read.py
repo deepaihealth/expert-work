@@ -28,8 +28,10 @@ import pytest
 from expert_work.persistence import InMemoryKnowledgeStore
 from expert_work.persistence.knowledge.passages import Passage as StoredPassage
 from expert_work.protocol import ChunkType, DocumentStatus, KnowledgeChunk, KnowledgeDocument
+from expert_work.runtime.tokens import TiktokenEstimator
 from orchestrator.tools.error_classifier import GuidedToolError
 from orchestrator.tools.knowledge_read import KnowledgeReadTool
+from orchestrator.tools.knowledge_read_view import ReadPassage, haystack
 from orchestrator.tools.knowledge_results import TRUNCATED_MARK
 from orchestrator.tools.registry import ToolBlockedError, ToolContext, ToolResult
 
@@ -38,12 +40,14 @@ PassageSpec = tuple[tuple[str, ...], list[str]]
 
 @dataclass
 class _Chars:
-    """One token per character; records the threads it counted on."""
+    """One token per character; records the threads it counted on and what."""
 
     threads: set[int] = field(default_factory=set)
+    texts: list[str] = field(default_factory=list)
 
     def count(self, text: str) -> int:
         self.threads.add(threading.get_ident())
+        self.texts.append(text)
         return len(text)
 
 
@@ -400,6 +404,67 @@ async def test_an_unknown_name_is_an_error() -> None:
         await lib.read(document="nothing-like-it.pdf")
 
 
+async def test_a_switched_off_document_is_not_offered_by_name() -> None:
+    """Out of the agent's knowledge, as for recall: its name, number and base are
+    never listed, and it makes no name ambiguous."""
+    lib = await _lib()
+    other = await lib.store.create_base(tenant_id=lib.tenant, name="kb2")
+    off = await lib.add("same.md", _flat(1))
+    await _add(lib.store, lib.tenant, other.id, "same.md", _flat(1))
+    alone = await lib.add("off-only.md", _flat(1))
+    await lib.store.set_documents_enabled(
+        tenant_id=lib.tenant, kb_id=lib.kb_id, document_ids=[off.id, alone.id], enabled=False
+    )
+
+    same = await lib.read(refs=("kb", "kb2"), document="same.md")
+    partial = await lib.read(refs=("kb", "kb2"), document="same")
+    with pytest.raises(GuidedToolError, match="no document with that file name or title"):
+        await lib.read(refs=("kb", "kb2"), document="off-only.md")
+
+    assert same.content.startswith("[D2] same.md\n")
+    assert partial.content.startswith("[D2] same.md\n")
+
+
+@pytest.mark.parametrize(
+    "document", ["D2#3-5", "[D2#3-5] · match", "D2#3-5,9", "D2 # 3", "D2#3 · match", "d2#3,4"]
+)
+async def test_the_tools_own_labels_read_back_as_references(document: str) -> None:
+    lib = await _lib()
+    await _manual(lib)
+
+    result = await lib.read(document=document)
+
+    assert result.meta["mode"] == "around"
+    assert [p["ref"] for p in result.meta["passages"] if p["role"] == "match"] == ["D2#3"]
+
+
+async def test_a_reference_without_a_chunk_number_reads_by_page() -> None:
+    lib = await _lib()
+    await _manual(lib)
+
+    result = await lib.read(document="D2#")
+
+    assert result.meta["mode"] == "page"
+
+
+async def test_an_unprefixed_number_that_finds_nothing_is_tried_as_a_name() -> None:
+    lib = await _lib()
+    await lib.add("first.md", _flat(1))
+    await lib.add("2024.md", _flat(1))
+
+    by_title = await lib.read(document="2024")
+    with pytest.raises(GuidedToolError) as prefixed:
+        await lib.read(document="D2024")
+    with pytest.raises(GuidedToolError) as neither:
+        await lib.read(document="77")
+
+    assert by_title.content.startswith("[D2] 2024.md\n")
+    assert str(prefixed.value) == "no document D2024 in this agent's knowledge bases"
+    assert str(neither.value) == (
+        "no document D77 in this agent's knowledge bases, and none with that file name or title"
+    )
+
+
 # ---------------------------------------------------------------------------
 # Whose documents
 # ---------------------------------------------------------------------------
@@ -501,6 +566,42 @@ async def test_a_document_being_ingested_again_reads_the_version_in_use() -> Non
     assert _markers(result.content) == ["P00", "P01", "P02"]
     assert result.notice is not None
     assert "a newer version of this document is being ingested" in result.notice
+
+
+async def test_a_newer_version_that_failed_is_not_said_to_be_ingesting() -> None:
+    lib = await _lib()
+    document = await _manual(lib)
+    await lib.store.upsert_document(
+        tenant_id=lib.tenant,
+        kb_id=lib.kb_id,
+        filename="manual.md",
+        content=b"v2",
+        content_sha256="v2",
+    )
+    claim = await lib.store.claim_document(
+        tenant_id=lib.tenant,
+        document_id=document.id,
+        now=datetime.now(UTC),
+        lease_seconds=600,
+        max_attempts=5,
+    )
+    assert claim is not None
+    assert await lib.store.set_document_status(
+        tenant_id=lib.tenant,
+        document_id=document.id,
+        status=DocumentStatus.FAILED,
+        error="parse failed",
+        generation=claim.generation,
+    )
+    current = await lib.store.get_document(tenant_id=lib.tenant, document_id=document.id)
+    assert current is not None and current.status is DocumentStatus.FAILED and current.has_pending
+
+    result = await lib.read(document="D2")
+
+    assert _markers(result.content) == ["P00", "P01", "P02"]
+    assert result.notice is not None
+    assert "being ingested" not in result.notice
+    assert "a newer version of this document was uploaded but not ingested" in result.notice
 
 
 class _TornStore(InMemoryKnowledgeStore):
@@ -670,3 +771,52 @@ async def test_tokens_are_counted_off_the_event_loop() -> None:
 
     assert lib.chars.threads
     assert threading.get_ident() not in lib.chars.threads
+
+
+async def test_find_normalises_the_document_off_the_event_loop(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    threads: set[int] = set()
+
+    def recording(passage: ReadPassage) -> str:
+        threads.add(threading.get_ident())
+        return haystack(passage)
+
+    monkeypatch.setattr("orchestrator.tools.knowledge_read_reader.haystack", recording)
+    lib = await _lib()
+    await _manual(lib)
+
+    await lib.read(document="D2", find="P05")
+    await lib.read(document="D2", find="nowhere")
+
+    assert threads and threading.get_ident() not in threads
+
+
+async def test_reads_never_write_the_shared_estimators_cache() -> None:
+    """The platform estimator's cache keeps every run's message prefixes warm; a
+    document's passages and labels counted into it would evict them."""
+    shared = TiktokenEstimator(encoding_name="no-such-encoding")  # chars // 4, no network
+    lib = await _lib()
+    await _manual(lib, 30)
+    tool = KnowledgeReadTool(store=lib.store, knowledge_base_refs=("kb",), estimator=shared)
+    ctx = ToolContext(tenant_id=lib.tenant)
+
+    for args in ({"document": "D2"}, {"document": "D2#4"}, {"document": "D2", "find": "P1"}):
+        result = await tool.call(args, ctx=ctx)
+        assert result.meta["status"] == "ok"
+
+    assert shared._memo == {}
+
+
+async def test_a_documents_passages_are_counted_once_across_reads() -> None:
+    lib = await _lib()
+    await _manual(lib)
+    tool = lib.tool()  # one tool, as one agent build holds it across its calls
+    ctx = ToolContext(tenant_id=lib.tenant)
+
+    for args in ({"document": "D2"}, {"document": "D2", "page": 2}, {"document": "D2#4"}):
+        await tool.call(args, ctx=ctx)
+
+    passages = [t for t in lib.chars.texts if t.startswith("P")]
+    assert sorted(passages) == sorted(set(passages))
+    assert len(passages) == 10

@@ -2,9 +2,10 @@
 (B-206 K-2: what ``knowledge_read`` resolves its ``document`` argument with).
 
 ``get_document_by_seq`` reads the tenant's document ``D{doc_seq}``;
-``find_documents_by_name`` lists the documents of the given bases whose file
-name or title holds a name, case-insensitively — exact matches first. The
-memory run goes into unit CI; the SQL run is marked ``integration``.
+``find_documents_by_name`` lists the switched-on documents of the given bases
+whose file name or title is a name (``exact``) or holds it, case-insensitively,
+by number. The memory run goes into unit CI; the SQL run is marked
+``integration``.
 
 Before running the SQL tests locally:
 export DOCKER_HOST=unix:///Users/mac/.docker/run/docker.sock
@@ -102,10 +103,16 @@ async def _library(store: KnowledgeStore) -> _Library:
 
 
 async def _names(
-    store: KnowledgeStore, lib: _Library, name: str, kb_ids: list[UUID], limit: int = 20
+    store: KnowledgeStore,
+    lib: _Library,
+    name: str,
+    kb_ids: list[UUID],
+    limit: int = 20,
+    *,
+    exact: bool = False,
 ) -> list[tuple[UUID, str]]:
     found = await store.find_documents_by_name(
-        tenant_id=lib.tenant, kb_ids=kb_ids, name=name, limit=limit
+        tenant_id=lib.tenant, kb_ids=kb_ids, name=name, limit=limit, exact=exact
     )
     return [(doc.kb_id, doc.filename) for doc in found]
 
@@ -127,37 +134,61 @@ async def test_a_document_is_found_by_its_number_in_its_own_tenant_only(
     assert await store.get_document_by_seq(tenant_id=uuid4(), doc_seq=1) is None
 
 
-async def test_exact_file_names_come_first_across_the_given_bases_only(
-    store: KnowledgeStore,
-) -> None:
+async def test_exact_file_names_across_the_given_bases_only(store: KnowledgeStore) -> None:
     lib = await _library(store)
 
-    assert await _names(store, lib, "合同.docx", [lib.kb1, lib.kb2]) == [
+    assert await _names(store, lib, "合同.docx", [lib.kb1, lib.kb2], exact=True) == [
         (lib.kb1, "合同.docx"),
         (lib.kb2, "合同.docx"),
     ]
 
 
-async def test_a_title_match_is_exact_and_ranks_before_names_that_only_contain_it(
-    store: KnowledgeStore,
-) -> None:
+async def test_a_title_is_an_exact_name_and_holding_it_is_not(store: KnowledgeStore) -> None:
     lib = await _library(store)
 
     # "合同" is the title of both 合同.docx (the file name without its
-    # extension); 采购合同2024.pdf only contains it — and was uploaded first.
-    assert await _names(store, lib, "合同", [lib.kb1, lib.kb2]) == [
+    # extension); 采购合同2024.pdf only holds it — and was uploaded first.
+    assert await _names(store, lib, "合同", [lib.kb1, lib.kb2], exact=True) == [
         (lib.kb1, "合同.docx"),
         (lib.kb2, "合同.docx"),
-        (lib.kb1, "采购合同2024.pdf"),
     ]
-    assert await _names(store, lib, "合同", [lib.kb1, lib.kb2], limit=1) == [(lib.kb1, "合同.docx")]
+    assert await _names(store, lib, "合同", [lib.kb1, lib.kb2]) == [
+        (lib.kb1, "采购合同2024.pdf"),
+        (lib.kb1, "合同.docx"),
+        (lib.kb2, "合同.docx"),
+    ]
+    assert await _names(store, lib, "合同", [lib.kb1, lib.kb2], limit=1) == [
+        (lib.kb1, "采购合同2024.pdf")
+    ]
 
 
 async def test_names_match_without_regard_to_case(store: KnowledgeStore) -> None:
     lib = await _library(store)
 
-    assert await _names(store, lib, "report_q1.MD", [lib.kb1]) == [(lib.kb1, "Report_Q1.md")]
+    assert await _names(store, lib, "report_q1.MD", [lib.kb1], exact=True) == [
+        (lib.kb1, "Report_Q1.md")
+    ]
+    assert await _names(store, lib, "REPORT", [lib.kb1], exact=True) == []
     assert await _names(store, lib, "REPORT", [lib.kb1]) == [(lib.kb1, "Report_Q1.md")]
+
+
+async def test_a_switched_off_document_is_never_listed(store: KnowledgeStore) -> None:
+    """A switched-off document is out of the agent's knowledge (recall leaves it
+    out): listing it by name would show its name, number and base, and make an
+    unambiguous name look ambiguous."""
+    lib = await _library(store)
+    off, _seq = lib.docs[(lib.kb1, "合同.docx")]
+    await store.set_documents_enabled(
+        tenant_id=lib.tenant, kb_id=lib.kb1, document_ids=[off], enabled=False
+    )
+
+    assert await _names(store, lib, "合同.docx", [lib.kb1, lib.kb2], exact=True) == [
+        (lib.kb2, "合同.docx")
+    ]
+    assert await _names(store, lib, "合同", [lib.kb1, lib.kb2]) == [
+        (lib.kb1, "采购合同2024.pdf"),
+        (lib.kb2, "合同.docx"),
+    ]
 
 
 async def test_like_wildcards_in_a_name_are_literal(store: KnowledgeStore) -> None:
