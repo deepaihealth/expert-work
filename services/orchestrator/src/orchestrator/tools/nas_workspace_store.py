@@ -393,29 +393,35 @@ def _walk_and_match(
         Generator[tuple[str, list[str], list[str], int], None, None],
         os.fwalk(".", dir_fd=dfd, follow_symlinks=False, onerror=_on_error),
     )
-    with closing(walker):
-        for dirpath, _dirnames, filenames, walk_fd in walker:
-            base = PurePosixPath(dirpath)
-            for name in sorted(filenames):
-                rel = str(base / name).removeprefix("./")
-                if is_reserved_workspace_path("/".join((*prefix, rel))):
-                    continue
-                if name_glob is not None and not _name_matches(rel, name, name_glob):
-                    continue
-                try:
-                    info = os.lstat(name, dir_fd=walk_fd)
-                except OSError:
-                    continue  # racing unlink — a miss, not a failure.
-                if not stat.S_ISREG(info.st_mode):
-                    continue  # symlink / fifo / socket — never read through it.
-                if content is not None and not _content_matches(walk_fd, name, info, content):
-                    continue
-                if len(hits) >= max_results:
-                    truncated = True
+    try:
+        with closing(walker):
+            for dirpath, _dirnames, filenames, walk_fd in walker:
+                base = PurePosixPath(dirpath)
+                for name in sorted(filenames):
+                    rel = str(base / name).removeprefix("./")
+                    if is_reserved_workspace_path("/".join((*prefix, rel))):
+                        continue
+                    if name_glob is not None and not _name_matches(rel, name, name_glob):
+                        continue
+                    try:
+                        info = os.lstat(name, dir_fd=walk_fd)
+                    except OSError:
+                        continue  # racing unlink — a miss, not a failure.
+                    if not stat.S_ISREG(info.st_mode):
+                        continue  # symlink / fifo / socket — never read through it.
+                    if content is not None and not _content_matches(walk_fd, name, info, content):
+                        continue
+                    if len(hits) >= max_results:
+                        truncated = True
+                        break
+                    hits.append(_entry(rel, info))
+                if truncated:
                     break
-                hits.append(_entry(rel, info))
-            if truncated:
-                break
+    except PermissionError as exc:
+        # 同 list_files:fwalk 对已开目录的 scandir / fstat 失败不走 onerror。
+        raise WorkspacePermissionError("workspace search not readable") from exc
+    except OSError as exc:
+        raise SandboxSupervisorError(f"workspace search failed: {exc.strerror}") from exc
     hits.sort(key=lambda entry: entry.path)
     return WorkspaceSearchResult(entries=tuple(hits), truncated=truncated)
 
@@ -947,8 +953,12 @@ class NasWorkspaceStore:
                     for dirpath, _dirnames, filenames, walk_fd in walker:
                         _list_dir_entries(prefix, dirpath, filenames, walk_fd, entries)
             except PermissionError as exc:
-                # fwalk 开起点(".")失败不走 onerror, 直接抛 —— 同 os.stat 那处。
+                # fwalk 开起点(".")、对已开目录 scandir / fstat 的失败不走 onerror,
+                # 直接抛 —— 照 os.walk 时代的口径收成同两类, 调用方只认这两类。
                 raise WorkspacePermissionError(f"workspace listing not readable: {'.'!r}") from exc
+            except OSError as exc:
+                # 典型是 NFS 上列到一半目录被删(ESTALE)。
+                raise SandboxSupervisorError(f"workspace listing failed: {exc.strerror}") from exc
             finally:
                 os.close(dfd)
             entries.sort(key=lambda entry: entry.path)
