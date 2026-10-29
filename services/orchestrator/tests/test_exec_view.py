@@ -22,10 +22,11 @@ _PY = ["python", "-E", "-P", "/tmp/ew-exec-abc.py"]  # noqa: S108 — 沙箱 tmp
 
 def test_script_fails_closed_and_names_both_roots() -> None:
     assert EXEC_VIEW_SCRIPT.startswith("set -eu\n")
-    assert 'mount --bind "$root" /workspace\n' in EXEC_VIEW_SCRIPT
+    assert 'bind_same "$root" /workspace || fail "agent root changed"\n' in EXEC_VIEW_SCRIPT
     assert "mount -t tmpfs -o size=1k none /mnt/workspace\n" in EXEC_VIEW_SCRIPT
     assert "mount --bind /mnt/workspace /workspace\n" in EXEC_VIEW_SCRIPT  # 未绑分支
-    assert EXEC_VIEW_SCRIPT.endswith('cd /workspace\nexec "$@"\n')
+    # 载荷跑在嵌套的 user namespace 里:它不拥有这个 mount ns,卸不掉任何一层覆盖
+    assert EXEC_VIEW_SCRIPT.endswith('cd /workspace\nexec unshare -Ur -- "$@"\n')
     # spec §零 #2:uploads 在 agents/<key>/uploads,挂用户根的 uploads 会遮住它 ——
     # B-236 起对话视图里 bind 进来的是 agent 根那一份,从不是用户根那一份。
     assert "/mnt/workspace/uploads" not in EXEC_VIEW_SCRIPT
@@ -204,12 +205,34 @@ def test_script_platform_dirs_are_the_resolver_platform_dirs() -> None:
 _FAKE_MOUNT = """#!/bin/sh
 echo "$*" >> "$EW_MOUNT_LOG"
 if [ "$1" = "--bind" ]; then
-  if [ -d "$3" ] && [ "$(cd -P "$3" && pwd -P)" = "$(cd -P "$2" && pwd -P)" ]; then
+  src="$2"
+  if [ -n "${EW_SWAP_SRC:-}" ] && [ "$2" = "$EW_SWAP_SRC" ]; then
+    src="$EW_SWAP_TO"  # 模拟检查之后、mount 之前源被换成了别处的目录
+  fi
+  if [ -d "$3" ] && [ "$(cd -P "$3" && pwd -P)" = "$(cd -P "$src" && pwd -P)" ]; then
     exit 0  # 经由已经「挂上」的符号链接,目标本来就是源 —— 真内核里是一次同目录 bind
   fi
   rmdir "$3" 2>/dev/null || true
-  ln -s "$2" "$3"
+  ln -s "$src" "$3"
 fi
+"""
+
+#: ``bind_same`` 用的 ``stat -c %d:%i -- <path>``;跟随符号链接(演练里的 bind 就是符号链接)。
+_FAKE_STAT = """#!/bin/sh
+exec python3 -c 'import os, sys; s = os.stat(sys.argv[1]); print(f"{s.st_dev}:{s.st_ino}")' "$4"
+"""
+
+_FAKE_UMOUNT = """#!/bin/sh
+echo "umount $*" >> "$EW_MOUNT_LOG"
+rm -f "$1" && mkdir "$1"
+"""
+
+#: 脚本末尾的 ``exec unshare -Ur -- "$@"``:本机给不了 user namespace,原样执行载荷并记一笔。
+_FAKE_UNSHARE = """#!/bin/sh
+echo "$*" > "$EW_UNSHARE_LOG"
+while [ "$1" != "--" ]; do shift; done
+shift
+exec "$@"
 """
 
 
@@ -225,9 +248,17 @@ class _Rehearsal:
         self.bin = tmp / "bin"
         for d in (self.mnt, self.ws, self.agent, self.bin):
             d.mkdir()
-        fake = self.bin / "mount"
-        fake.write_text(_FAKE_MOUNT)
-        fake.chmod(0o755)
+        self.unshare_log = tmp / "unshare.log"
+        self.extra_env: dict[str, str] = {}
+        for name, body in (
+            ("mount", _FAKE_MOUNT),
+            ("stat", _FAKE_STAT),
+            ("umount", _FAKE_UMOUNT),
+            ("unshare", _FAKE_UNSHARE),
+        ):
+            fake = self.bin / name
+            fake.write_text(body)
+            fake.chmod(0o755)
 
     def run_raw(self, *args: str) -> subprocess.CompletedProcess[str]:
         script = (
@@ -239,6 +270,8 @@ class _Rehearsal:
             **os.environ,
             "PATH": f"{self.bin}:{os.environ['PATH']}",
             "EW_MOUNT_LOG": str(self.log),
+            "EW_UNSHARE_LOG": str(self.unshare_log),
+            **self.extra_env,
         }
         return subprocess.run(
             ["sh", "-c", script, "ew-exec-view", *args],
@@ -397,6 +430,67 @@ def test_rehearsal_symlinked_agent_root_fails_closed(tmp_path: Path) -> None:
     assert proc.returncode == 98, proc.stderr
     assert "ran" not in proc.stdout
     assert r.mounts() == []
+
+
+def test_rehearsal_payload_runs_in_a_nested_user_namespace(tmp_path: Path) -> None:
+    """载荷由 ``unshare -Ur`` 起:它所在的 user ns 不拥有挂载那一层,卸不掉覆盖。"""
+    r = _Rehearsal(tmp_path)
+    proc = r.run(str(r.root), str(_CONV), [], "echo ran")
+
+    assert proc.returncode == 0, proc.stderr
+    assert proc.stdout == "ran\n"
+    assert r.unshare_log.read_text().split()[:3] == ["-Ur", "--", "sh"]
+
+
+def test_rehearsal_swapped_work_dir_fails_closed(tmp_path: Path) -> None:
+    """检查通过之后、mount 之前工作目录被换掉:bind 之后核对 ``设备:inode`` 对不上 → 卸掉、98。
+    (本对话那一格的 bind 在演练里由符号链接父目录表达不出来,真内核上由 smoke 覆盖。)"""
+    r = _Rehearsal(tmp_path)
+    elsewhere = r.root / "threads" / _OTHER / "work"
+    elsewhere.mkdir(parents=True)
+    r.extra_env = {
+        "EW_SWAP_SRC": str(r.root / "threads" / str(_CONV) / "work"),
+        "EW_SWAP_TO": str(elsewhere),
+    }
+    proc = r.run(str(r.root), str(_CONV), [], "echo ran")
+
+    assert proc.returncode == 98, proc.stderr
+    assert "changed" in proc.stderr
+    assert "ran" not in proc.stdout
+    assert any(m.startswith("umount ") for m in r.mounts())
+
+
+def test_rehearsal_swapped_platform_source_is_unmounted_and_skipped(tmp_path: Path) -> None:
+    r = _Rehearsal(tmp_path)
+    elsewhere = r.root / "threads" / _OTHER
+    elsewhere.mkdir(parents=True)
+    r.extra_env = {"EW_SWAP_SRC": str(r.root / "uploads"), "EW_SWAP_TO": str(elsewhere)}
+    proc = r.run(str(r.root), str(_CONV), [], "ls uploads | wc -l")
+
+    assert proc.returncode == 0, proc.stderr
+    assert proc.stdout.strip() == "0"
+    assert "uploads changed while it was being mounted" in proc.stderr
+    assert f"umount {r.ws}/uploads" in r.mounts()
+
+
+def test_rehearsal_compat_stub_created_concurrently_is_still_mapped(tmp_path: Path) -> None:
+    """另一次 exec 恰好在「不存在」判断与 ``mkdir`` 之间建出了同一个空挂载桩:``mkdir`` 失败
+    不是错(``set -e`` 下曾让整个 exec 失败),目录已经在就接着走,照样映射。"""
+    r = _Rehearsal(tmp_path)
+    (r.root / "style").mkdir(parents=True)
+    racer = r.bin / "mkdir"
+    racer.write_text(
+        "#!/bin/sh\n"
+        'if [ "$#" = 1 ] && [ "${1##*/}" = "$EW_RACE_DIR" ]; then /bin/mkdir "$1"; exit 1; fi\n'
+        'exec /bin/mkdir "$@"\n'
+    )
+    racer.chmod(0o755)
+    r.extra_env = {"EW_RACE_DIR": "style"}
+    proc = r.run(str(r.root), str(_CONV), ["style"], "echo ran")
+
+    assert proc.returncode == 0, proc.stderr
+    assert proc.stdout == "ran\n"
+    assert f"--bind {r.root}/style {r.ws}/style" in r.mounts()
 
 
 def test_rehearsal_compat_dir_maps_only_when_the_conversation_has_none(tmp_path: Path) -> None:

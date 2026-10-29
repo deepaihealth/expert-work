@@ -37,10 +37,19 @@ python argv。对话视图:
 → 98 退出;平台目录与过渡期目录不合格 → 写一行 stderr、这次不挂,exec 照常跑(一个被
 种下的普通文件不该让这个 agent 之后的每一次 exec 都失败)。
 
-**残留的竞态,写明。** 检查与 mount 之间有一个窗口:同一个用户的另一次 exec 若恰好在这
-个窗口里把已检查过的目录换成符号链接,mount 仍会跟过去。窗口是微秒级,而且要求攻击者
-是同一用户名下、已经在跑代码的另一次 exec;根治要在 mount 时用 ``O_PATH`` + 不跟随
-符号链接的新挂载接口(``open_tree``/``move_mount``),镜像里的 ``mount(8)`` 做不到。
+**先 bind、再核对。** 检查与 mount 之间仍有一个窗口:同一个用户的另一次 exec 可能恰好在这
+个窗口里把已检查过的目录换成符号链接,而 bind 会跟过去。所以每一次 bind(agent 根、工作目录、
+本对话那一格、平台目录、过渡期目录)都先记下源的 ``设备:inode``(``stat -c %d:%i``,不跟
+符号链接),bind 之后再看目标是不是同一个;对不上就当场 ``umount``,平台目录与过渡期目录
+跳过这一次,agent 根 / 工作目录 / 本对话那一格 98 退出。bind 完成之后源再被换掉不影响
+已经挂上的那个目录。
+
+**载荷跑在嵌套的 user namespace 里。** 脚本最后 ``exec unshare -Ur -- "$@"``:载荷所在的
+user namespace 不拥有这个 mount namespace,于是它 ``umount`` 不掉盖住 ``/mnt/workspace`` /
+``threads/`` 的那几层(B-60 spec §五 记过的「能挪开 tmpfs」那条残留就此关上);它即便自己再
+``unshare -m``,复制过去的挂载也是锁住的(``MNT_LOCKED``),同样卸不掉。载荷里的 uid 仍是
+0(映射回外层的 0,即沙箱用户),文件属主不变。云上 ACS 沙箱不挂 seccomp,本地后端的
+seccomp profile 已为外层 ``unshare`` 放行同一组系统调用,内层不需要新的放行。
 
 镜像里没有 ``/agent`` 时以 97 退出(没钉上新镜像);参数或 bind 源不合法以 98 退出。
 """
@@ -88,11 +97,20 @@ ensure_dir() {
     fail "$1 is not a plain directory under the agent root"
   fi
 }
+bind_same() {
+  want="$(stat -c %d:%i -- "$1")" || return 1
+  mount --bind "$1" "$2" || return 1
+  if [ "$(stat -c %d:%i -- "$2")" != "$want" ]; then
+    umount "$2" || exit 98
+    echo "ew-exec-view: $1 changed while it was being mounted; not mounted" >&2
+    return 1
+  fi
+}
 hide_threads() {
   mount -t tmpfs -o size=1k,mode=0500 none "$1/threads"
   if [ -n "$own" ]; then
     mkdir -p "$1/threads/$own"
-    mount --bind "$root/threads/$own" "$1/threads/$own"
+    bind_same "$root/threads/$own" "$1/threads/$own" || fail "conversation directory changed"
   fi
 }
 if [ -n "$root" ]; then
@@ -108,9 +126,9 @@ if [ -n "$root" ]; then
   if [ -n "$conv" ]; then
     ensure_dir "$root/threads/$conv/work"
   fi
-  mount --bind "$root" /agent
+  bind_same "$root" /agent || fail "agent root changed"
   if [ -n "$conv" ]; then
-    mount --bind "$root/threads/$conv/work" /workspace
+    bind_same "$root/threads/$conv/work" /workspace || fail "conversation directory changed"
     for d in uploads inputs .tool_results; do
       if [ -L "$root/$d" ] || ! { mkdir -p "$root/$d" 2>/dev/null && plain_dir "$root/$d"; }; then
         echo "ew-exec-view: $d is not a plain directory in the agent root; not mounted" >&2
@@ -118,11 +136,11 @@ if [ -n "$root" ]; then
         echo "ew-exec-view: /workspace/$d is not a directory; $d/ not mounted" >&2
       else
         mkdir -p "/workspace/$d"
-        mount --bind "$root/$d" "/workspace/$d"
+        bind_same "$root/$d" "/workspace/$d" || true
       fi
     done
   else
-    mount --bind "$root" /workspace
+    bind_same "$root" /workspace || fail "agent root changed"
     hide_threads /workspace
   fi
   hide_threads /agent
@@ -145,11 +163,12 @@ if [ -n "$root" ]; then
       continue
     fi
     if [ ! -e "/workspace/$d" ]; then
-      mkdir "/workspace/$d"
-    elif [ ! -d "/workspace/$d" ] || [ -n "$(ls -A "/workspace/$d")" ]; then
+      mkdir "/workspace/$d" 2>/dev/null || [ -d "/workspace/$d" ] || continue
+    fi
+    if [ -L "/workspace/$d" ] || [ ! -d "/workspace/$d" ] || [ -n "$(ls -A "/workspace/$d")" ]; then
       continue
     fi
-    mount --bind "$root/$d" "/workspace/$d"
+    bind_same "$root/$d" "/workspace/$d" || true
   done
   mount -t tmpfs -o size=1k none /mnt/workspace
 else
@@ -158,7 +177,7 @@ else
   shift "$n"
 fi
 cd /workspace
-exec "$@"
+exec unshare -Ur -- "$@"
 """
 
 #: ``sh -c <script> <$0> <$1> <$2> <$3> <$4> <compat…> <python argv…>``;``$0`` 只是报错时的名字。

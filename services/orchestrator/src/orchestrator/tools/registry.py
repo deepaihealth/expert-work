@@ -36,6 +36,37 @@ WorkspaceLayout = Literal["conversation", "agent_root"]
 WORKSPACE_LAYOUT_KEY = "workspace_layout"
 WORKSPACE_THREAD_ID_KEY = "workspace_thread_id"
 
+
+def workspace_view_fields(configurable: Mapping[str, Any]) -> dict[str, Any]:
+    """B-236 —— 从 ``config["configurable"]`` 取工作区视图要的四个值(agent 身份、本对话
+    线程、布局、根对话),给 :class:`ToolContext` 用。
+
+    **每个建 ToolContext 的地方都从这里取**(``builder._build_tool_context`` 与平台自己的
+    exec,如 PLAN.md 回读):少一项,exec 就落成另一个视图 —— 没有线程 id 时
+    ``/agent/threads/`` 整个被盖住,回读读成「不存在」,用户的改动被静默丢掉。
+    ``configurable`` 不可信(一路从 HTTP 载荷来):类型不对一律当没有,布局不认识就是老视图。
+    """
+    agent_key = configurable.get("agent_key")
+    layout = configurable.get(WORKSPACE_LAYOUT_KEY)
+    return {
+        "agent_key": agent_key if isinstance(agent_key, str) else "",
+        "thread_id": _uuid_or_none(configurable.get("thread_id")),
+        "workspace_layout": "conversation" if layout == "conversation" else "agent_root",
+        "workspace_thread_id": _uuid_or_none(configurable.get(WORKSPACE_THREAD_ID_KEY)),
+    }
+
+
+def _uuid_or_none(raw: object) -> UUID | None:
+    if isinstance(raw, UUID):
+        return raw
+    if not isinstance(raw, str):
+        return None
+    try:
+        return UUID(raw)
+    except ValueError:
+        return None
+
+
 if TYPE_CHECKING:
     from orchestrator.tools.arg_bindings import ToolArgBindings
 

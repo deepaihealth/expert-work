@@ -108,19 +108,22 @@ def agent_view_alias(agent_key: str) -> str:
 #: B-236 —— 工具描述里讲路径规矩的那一句,文件类工具共用一份(措辞两种视图都成立:
 #: 老视图里 ``/workspace`` 与 ``/agent`` 是同一个目录)。
 WORKSPACE_PATH_RULE = (
-    "Relative paths and /workspace/... refer to this conversation's working directory; "
-    "/agent/... is this agent's shared area, kept across its conversations "
+    "Relative paths and /workspace/... refer to the sandbox working directory — in a "
+    "conversation started after this release, that conversation's own directory; "
+    "/agent/... is this agent's directory, kept across all of its conversations "
     "(templates, style guides, helper scripts meant for reuse belong there)."
 )
 #: B-236 —— ``bash`` / ``exec_python`` 描述里讲工作目录的那一句。口径照 B-60 spec §4.7/§五:
 #: 不说「隔离」「看不见」,只说默认视图里有什么 —— 命名空间对故意的代码不是绝对边界。
+#: 每一种视图里都得是真话:工具描述随 agent 构建缓存、不分对话,发布前已开的对话(老视图)
+#: 读到的也是这一句,那里 ``/workspace`` 就是 agent 目录。
 EXEC_WORKSPACE_NOTE = (
-    "Runs in /workspace — this conversation's own working directory; the default "
-    "view contains only this conversation's directory, not other conversations' or "
-    "other agents' files. Files meant to be reused by "
-    "later conversations of this agent (templates, style guides, helper scripts) "
-    "belong under /agent/, which all conversations of this agent share. Uploaded "
-    "files are in uploads/."
+    "Runs in /workspace. In a conversation started after this release, /workspace is "
+    "that conversation's own working directory; in an older conversation it is the "
+    "agent's directory. /agent/ is always this agent's directory, shared by all of "
+    "its conversations — put files meant to be reused by later conversations "
+    "(templates, style guides, helper scripts) there. Other agents' files are not "
+    "part of the default view. Uploaded files are in uploads/."
 )
 #: B-236 —— 文件类工具 ``path`` 参数的说明。
 PATH_ARG_DESCRIPTION = "File path relative to /workspace, or under /agent/ (no '..')."

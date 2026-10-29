@@ -13,7 +13,9 @@ checks on the real kernel (``_view_requests``): relative writes land in the
 conversation's own directory, other conversations are absent from ``/agent``,
 ``uploads/`` reaches the agent root, a planted symlink at the agent root's
 ``uploads`` is skipped while one at the conversation's ``work`` fails closed,
-and the old view sees only its own ``threads/<id>/``.
+the old view sees only its own ``threads/<id>/``, and the payload — running in a
+nested user namespace — can neither ``umount`` the covers nor escape them with
+its own ``unshare -m``.
 
 Usage:
     python smoke_test.py <image-tag>
@@ -108,8 +110,17 @@ def _view_requests() -> list[tuple[str, dict[str, object], object]]:
         "print(json.dumps([os.listdir('threads'), os.listdir('/agent/threads'), "
         f"os.path.exists('threads/{_B}')]))"
     )
+    locked = (
+        "import os, subprocess\n"
+        "def fails(cmd):\n"
+        "    return subprocess.run(cmd, capture_output=True).returncode != 0\n"
+        "print(fails(['umount', '/agent/threads']), fails(['umount', '/mnt/workspace']), "
+        "fails(['unshare', '-m', 'sh', '-c', 'umount /mnt/workspace']), "
+        "len(os.listdir('/agent/threads')))"
+    )
     return [
         ("seed", unbound(seed), "seeded"),
+        ("covers cannot be unmounted from the payload", conv(locked), "True True True 1"),
         ("conversation view", conv(probe), f'[["{_A}"], false, "up"]'),
         ("relative write lands in threads/<conv>/work", unbound(landed), "True False"),
         ("plant uploads -> threads", unbound(plant_uploads), "planted"),

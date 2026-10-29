@@ -637,6 +637,32 @@ async def test_exec_legacy_view_and_bad_compat_name(expert_work: _Harness) -> No
 
 
 @pytest.mark.asyncio
+async def test_exec_payload_cannot_unmount_the_covers(expert_work: _Harness) -> None:
+    """载荷跑在嵌套的 user namespace 里:``umount`` 覆盖层、自己 ``unshare -m`` 再卸,都失败。"""
+    response = await expert_work.supervisor.acquire(
+        AcquireRequest(tenant_id=uuid4(), thread_id="b236-locked", user_id=uuid4())
+    )
+    sid = response.sandbox_id
+    conv = uuid4()
+    try:
+        probe = await expert_work.supervisor.exec(
+            sid,
+            code="import subprocess\n"
+            "def fails(cmd):\n"
+            "    return subprocess.run(cmd, capture_output=True).returncode != 0\n"
+            "print(fails(['umount', '/agent/threads']), fails(['umount', '/mnt/workspace']), "
+            "fails(['unshare', '-m', 'sh', '-c', 'umount /mnt/workspace']))",
+            agent_root=_B236_ROOT,
+            conv_id=conv,
+            thread_id=conv,
+        )
+        assert probe.exit_code == 0, probe.stderr
+        assert probe.stdout.strip() == "True True True"
+    finally:
+        await expert_work.supervisor.destroy(sid, reason="b236-acceptance")
+
+
+@pytest.mark.asyncio
 async def test_exec_planted_symlinks_are_refused(expert_work: _Harness) -> None:
     """agent 根下被换成符号链接的 bind 源:``uploads`` → 跳过(exec 照跑,看不到别的对话);
     本对话的 ``work`` → 98 退出(不跟着链接进别的对话)。"""

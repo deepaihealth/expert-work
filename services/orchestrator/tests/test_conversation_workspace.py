@@ -604,6 +604,15 @@ def test_tool_text_states_the_two_views_once_and_never_the_old_alias() -> None:
         text = _all_text(tool.spec)
         assert "/workspace/agents/" not in text, tool.spec.name
         assert "agent's own directory" not in text, tool.spec.name
+        # 描述随 agent 构建缓存、不分对话:老视图的对话读到的是同一句,所以不许无条件说
+        # 「/workspace 就是本对话的目录」,也不许说「别人看不见 / 够不着」(B-60 §五 口径)。
+        assert "/workspace is that conversation's own" not in text or "older" in text
+        for claim in (
+            "do not see it",
+            "/workspace — this conversation",
+            "this conversation's working",
+        ):
+            assert claim not in text, (tool.spec.name, claim)
 
 
 def test_children_inherit_the_parents_effective_view_not_its_raw_layout() -> None:

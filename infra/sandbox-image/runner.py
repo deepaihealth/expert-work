@@ -94,11 +94,20 @@ ensure_dir() {
     fail "$1 is not a plain directory under the agent root"
   fi
 }
+bind_same() {
+  want="$(stat -c %d:%i -- "$1")" || return 1
+  mount --bind "$1" "$2" || return 1
+  if [ "$(stat -c %d:%i -- "$2")" != "$want" ]; then
+    umount "$2" || exit 98
+    echo "ew-exec-view: $1 changed while it was being mounted; not mounted" >&2
+    return 1
+  fi
+}
 hide_threads() {
   mount -t tmpfs -o size=1k,mode=0500 none "$1/threads"
   if [ -n "$own" ]; then
     mkdir -p "$1/threads/$own"
-    mount --bind "$root/threads/$own" "$1/threads/$own"
+    bind_same "$root/threads/$own" "$1/threads/$own" || fail "conversation directory changed"
   fi
 }
 if [ -n "$root" ]; then
@@ -114,9 +123,9 @@ if [ -n "$root" ]; then
   if [ -n "$conv" ]; then
     ensure_dir "$root/threads/$conv/work"
   fi
-  mount --bind "$root" /agent
+  bind_same "$root" /agent || fail "agent root changed"
   if [ -n "$conv" ]; then
-    mount --bind "$root/threads/$conv/work" /workspace
+    bind_same "$root/threads/$conv/work" /workspace || fail "conversation directory changed"
     for d in uploads inputs .tool_results; do
       if [ -L "$root/$d" ] || ! { mkdir -p "$root/$d" 2>/dev/null && plain_dir "$root/$d"; }; then
         echo "ew-exec-view: $d is not a plain directory in the agent root; not mounted" >&2
@@ -124,11 +133,11 @@ if [ -n "$root" ]; then
         echo "ew-exec-view: /workspace/$d is not a directory; $d/ not mounted" >&2
       else
         mkdir -p "/workspace/$d"
-        mount --bind "$root/$d" "/workspace/$d"
+        bind_same "$root/$d" "/workspace/$d" || true
       fi
     done
   else
-    mount --bind "$root" /workspace
+    bind_same "$root" /workspace || fail "agent root changed"
     hide_threads /workspace
   fi
   hide_threads /agent
@@ -151,11 +160,12 @@ if [ -n "$root" ]; then
       continue
     fi
     if [ ! -e "/workspace/$d" ]; then
-      mkdir "/workspace/$d"
-    elif [ ! -d "/workspace/$d" ] || [ -n "$(ls -A "/workspace/$d")" ]; then
+      mkdir "/workspace/$d" 2>/dev/null || [ -d "/workspace/$d" ] || continue
+    fi
+    if [ -L "/workspace/$d" ] || [ ! -d "/workspace/$d" ] || [ -n "$(ls -A "/workspace/$d")" ]; then
       continue
     fi
-    mount --bind "$root/$d" "/workspace/$d"
+    bind_same "$root/$d" "/workspace/$d" || true
   done
   mount -t tmpfs -o size=1k none /mnt/workspace
 else
@@ -164,7 +174,7 @@ else
   shift "$n"
 fi
 cd /workspace
-exec "$@"
+exec unshare -Ur -- "$@"
 """
 
 #: A response is always this 4-key shape, so the supervisor parses one

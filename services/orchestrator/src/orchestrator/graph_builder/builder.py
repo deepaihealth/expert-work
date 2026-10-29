@@ -244,15 +244,13 @@ from orchestrator.tools.overflow import (
 )
 from orchestrator.tools.registry import (
     TOOL_ALLOWED_STATE_KEYS,
-    WORKSPACE_LAYOUT_KEY,
-    WORKSPACE_THREAD_ID_KEY,
     Tool,
     ToolContext,
     ToolNotFoundError,
     ToolRegistry,
     ToolResult,
     ToolSpec,
-    WorkspaceLayout,
+    workspace_view_fields,
 )
 from orchestrator.tools.scheduling import MAX_TOOL_WORKERS, plan_stages
 from orchestrator.tools.spawn_worker import SPAWN_WORKER_TOOL_NAME
@@ -4364,10 +4362,10 @@ def _build_tool_context(
     # 仍然逐项清洗:这两个通道的值一路从 HTTP 载荷传下来,不是进程内对象。
     docs = _string_list(turn_documents)
     images = _string_list(turn_image_refs)
-    # 工作区分层 —— 本次调用的 agent 身份。``configurable`` 是不可信输入
-    # (一路从 HTTP 载荷传下来),非字符串一律当没有,回落空串。
-    agent_key_raw = configurable.get("agent_key")
-    agent_key = agent_key_raw if isinstance(agent_key_raw, str) else ""
+    # 工作区分层 —— 本次调用的 agent 身份与 B-236 的视图(布局 / 本对话 / 根对话),与
+    # 平台自己的 exec(PLAN.md 回读)同一个取法。``configurable`` 是不可信输入,非字符串
+    # 一律当没有,回落空串;不认识的布局一律当老视图。
+    view_fields = workspace_view_fields(configurable)
     # B-61 §4.4 —— 子代要指向**父** run 的 inputs.json(``_child_config`` 写进来
     # 的);审批续跑段要指向这一轮首段的(``run_agent`` 写进来的)。新开一轮的
     # 主 run 没有这一项,回落 ``None`` = 用自己的 run_id。
@@ -4376,13 +4374,6 @@ def _build_tool_context(
     # config 里没有这一项,它的被绑参数就会被静默摘掉)。主 run 的填值不走这里。
     raw_prompt_inputs = configurable.get(PROMPT_INPUTS_KEY)
     prompt_inputs = raw_prompt_inputs if isinstance(raw_prompt_inputs, Mapping) else None
-    # B-236 —— 工作区布局(入口从 thread_meta 取)与按哪个对话分目录(子代是根对话的)。
-    # 不认识的值一律当老视图:失败方向与 B-236 之前逐字相同。
-    layout_raw = configurable.get(WORKSPACE_LAYOUT_KEY)
-    workspace_layout: WorkspaceLayout = (
-        "conversation" if layout_raw == "conversation" else "agent_root"
-    )
-    workspace_thread_id = _parse_uuid(configurable.get(WORKSPACE_THREAD_ID_KEY))
     return ToolContext(
         tenant_id=tenant_id,
         run_id=run_id,
@@ -4401,11 +4392,11 @@ def _build_tool_context(
         artifact_recorder=artifact_recorder,
         turn_documents=docs,
         turn_image_refs=images,
-        agent_key=agent_key,
+        agent_key=view_fields["agent_key"],
         inputs_run_id=inputs_run_id,
         prompt_inputs=prompt_inputs,
-        workspace_layout=workspace_layout,
-        workspace_thread_id=workspace_thread_id,
+        workspace_layout=view_fields["workspace_layout"],
+        workspace_thread_id=view_fields["workspace_thread_id"],
     )
 
 
