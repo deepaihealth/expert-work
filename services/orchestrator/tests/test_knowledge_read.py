@@ -175,6 +175,16 @@ def test_the_tool_is_a_read_only_knowledge_read() -> None:
     assert (props["max_tokens"]["minimum"], props["max_tokens"]["maximum"]) == (4000, 16000)
 
 
+def test_the_description_does_not_assume_the_answer_is_there() -> None:
+    """B-206 track D — reading on is not presumed to reach an answer, and a
+    passage that now shows only as a compressed reference is read again."""
+    spec = KnowledgeReadTool(store=InMemoryKnowledgeStore(), knowledge_base_refs=("kb",)).spec
+    description = " ".join(spec.description.split())
+    assert "stops before the answer" not in description
+    assert "or may continue in the passages around it," in description
+    assert "unless they now show only as a compressed reference" in description
+
+
 async def test_a_read_needs_a_tenant() -> None:
     lib = await _lib()
     with pytest.raises(ToolBlockedError):

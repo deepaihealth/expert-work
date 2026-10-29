@@ -68,8 +68,8 @@ MAX_CANDIDATES = 10
 _DESCRIPTION = (
     "Read a document of the knowledge bases knowledge_search searches: the passages around "
     "a search result, a page of the document, the passages under a heading, or the passages "
-    "that contain given words. Use it when a search result is cut short or stops before the "
-    "answer, to check what comes before or after a result, and to check each candidate "
+    "that contain given words. Use it when a search result is cut short or may continue in the "
+    "passages around it, to check what comes before or after a result, and to check each candidate "
     "document against every condition of a question that asks for all / every / how many. "
     "document is a reference from a knowledge_search result: D12#7 reads the passage holding "
     "chunk 7 with context passages on each side, D12 reads the document page by page; a file "
@@ -78,7 +78,7 @@ _DESCRIPTION = (
     "heading (one heading, or a path like A > B). find returns the passages that contain "
     "every word given, in any order, ignoring case, with one passage on each side. A result "
     "starts with the document's details. Passages already returned in full in this task do "
-    "not need to be read again."
+    "not need to be read again, unless they now show only as a compressed reference."
 )
 _PARAMETERS: dict[str, Any] = {
     "type": "object",

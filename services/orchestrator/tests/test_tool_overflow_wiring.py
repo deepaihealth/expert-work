@@ -230,6 +230,22 @@ async def test_a_knowledge_read_page_reaches_the_model_whole() -> None:
     assert str(_tool_message(state).content) == _FULL
 
 
+async def test_a_knowledge_search_result_is_neither_saved_nor_externalized() -> None:
+    # B-206 track D: an old knowledge_search result collapses to a reference
+    # (passages re-read with knowledge_read, the search run again), so a
+    # workspace copy of it is dead weight: one sandbox write per search.
+    for tool, thread_id in (
+        (_MediumResultTool(name="knowledge_search"), "ov-ks-medium"),
+        (_BigResultTool(name="knowledge_search"), "ov-ks-big"),
+    ):
+        writer = _RecordingWriter()
+        state = await _run_one_turn(tool=tool, writer=writer, thread_id=thread_id)
+        message = _tool_message(state)
+        assert writer.writes == {}
+        assert str(message.content) == tool.content
+        assert message.artifact is None
+
+
 async def test_read_only_nonexempt_tool_is_externalized() -> None:
     # A read-only tool that is NOT a fetch-back reader (e.g. web_search) is now
     # externalized — its results are not cheaply re-readable, and there is no

@@ -260,6 +260,14 @@ def select_bases(refs: tuple[str, ...], raw: object) -> tuple[str, ...]:
     return tuple(ref for ref in refs if ref in chosen)
 
 
+def base_handles(refs: tuple[str, ...], chosen: Sequence[str]) -> list[str]:
+    """The handles of the ``chosen`` refs, in manifest order: how a search's
+    bases are recorded for text outside the spotlight fence (B-206 track D),
+    where a base name — tenant text — must not go."""
+    picked = set(chosen)
+    return [_handle(position) for position, ref in enumerate(refs, 1) if ref in picked]
+
+
 def _key(value: str) -> str:
     """``value`` as a lookup key: a handle in any case (``k2``) as ``K2``."""
     return value.upper() if _HANDLE.fullmatch(value) else value

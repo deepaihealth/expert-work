@@ -1627,7 +1627,7 @@ async def test_no_hits_keeps_its_message_and_suggests_one_rephrased_search() -> 
     assert result.content.startswith("[no relevant knowledge found for the query")
     assert result.notice is not None
     assert "a search in their terms" in result.notice
-    assert result.meta == {"hits": 0, "status": "no_hits"}
+    assert result.meta == {"hits": 0, "status": "no_hits", "args": {"query": "anything"}}
 
 
 async def test_below_threshold_says_how_many_passages_were_turned_down() -> None:
@@ -1640,7 +1640,7 @@ async def test_below_threshold_says_how_many_passages_were_turned_down() -> None
 
     assert result.content.startswith("[no relevant knowledge found for the query")
     assert "3 passages" in result.content
-    assert result.meta == {"hits": 0, "status": "below_threshold"}
+    assert result.meta == {"hits": 0, "status": "below_threshold", "args": {"query": "q"}}
 
 
 async def test_missing_bases_are_a_guided_error_not_an_empty_result() -> None:
@@ -1731,7 +1731,12 @@ async def test_a_degraded_embedding_is_flagged_in_meta() -> None:
     assert result.meta["hits"] == 1
     # Nothing found by keywords either: still flagged, not a plain "no hits".
     missed = await tool.call({"query": "zzz"}, ctx=ToolContext(tenant_id=tenant))
-    assert missed.meta == {"hits": 0, "status": "no_hits", "embedding_degraded": True}
+    assert missed.meta == {
+        "hits": 0,
+        "status": "no_hits",
+        "args": {"query": "zzz"},
+        "embedding_degraded": True,
+    }
 
 
 def _embed_status_error(code: int) -> httpx.HTTPStatusError:
@@ -1828,7 +1833,18 @@ async def test_a_search_query_goes_through_embed_query_when_the_embedder_has_one
 
 
 def test_the_tool_description_states_the_answerability_rule() -> None:
-    assert KNOWLEDGE_ANSWERABILITY_RULE in _tool(InMemoryKnowledgeStore()).spec.description
+    description = _tool(InMemoryKnowledgeStore()).spec.description
+    assert KNOWLEDGE_ANSWERABILITY_RULE in description
+    # B-206 track D — the rule covers what knowledge_read shows too, not only
+    # search results, and names where an inferred answer comes from.
+    for phrase in (
+        "knowledge_read shows more of a document",
+        "If no text you have read states the specific fact asked",
+        "neighbouring passages",
+        "what the text states about other items",
+        "general knowledge",
+    ):
+        assert phrase in KNOWLEDGE_ANSWERABILITY_RULE, phrase
 
 
 def test_the_tool_description_states_how_to_search_and_conclude() -> None:
