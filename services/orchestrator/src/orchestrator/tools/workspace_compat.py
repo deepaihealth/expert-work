@@ -3,21 +3,24 @@
 B-236 之前每个 agent 只有一个 ``/workspace``(agent 根),存量 agent 的提示词与脚本
 按相对路径读写那里的长期目录(风格锚、模板……)。切到「每个对话一个 ``/workspace``」
 之后这些相对路径会落进对话自己的空目录。过渡期内,agent 根下**已有的一级目录**在
-对话视图里也能按原来的相对路径用:宿主侧解析器把它们解析到 ``/agent``,exec 脚本把
-它们读写 bind 进 ``/workspace``。两边用的是本模块算出来的**同一份**名单。
+对话视图里也能按原来的相对路径**读**:宿主侧解析器把它们解析到 ``/agent``(``write_file`` /
+``edit_file`` 拒写),exec 脚本把它们**只读** bind 进 ``/workspace``(B-236 M4:两个对话
+不能再经由同一个老目录互相覆盖)。两边用的是本模块算出来的**同一份**名单。
 
 * **只映射目录,根下的单个文件从不映射** —— 它们正是并发对话互相覆盖的那类固定文件名
   中间产物。
 * **本对话自己已有同名条目就不映射**,除非那只是上一次 exec 留下的空挂载桩(exec 脚本
   的判据与这里相同:不存在,或是一个空的真目录)。
-* 窗口由运维设置 ``EXPERT_WORK_WORKSPACE_COMPAT_ROOT_DIRS_UNTIL``(ISO 日期,含当天)
-  决定;没设、设错、已过期 = 不映射。不是对接方配置。
+* 窗口由运维设置 ``EXPERT_WORK_WORKSPACE_COMPAT_ROOT_DIRS_UNTIL``(ISO 日期,含当天,
+  按 UTC 日期算 —— 截止日**次日 00:00 UTC** 关窗)决定;没设、设错、已过期 = 不映射。
+  不是对接方配置。
 * 每次命中计数(``expert_work_workspace_compat_dir_hits_total``)并记一条结构化日志,
   日志里目录名只留形状(不带客户内容),好据此决定什么时候收掉。
 """
 
 from __future__ import annotations
 
+import functools
 import logging
 import os
 import re
@@ -35,7 +38,8 @@ from orchestrator.tools.workspace_store import WorkspaceStore
 
 logger = logging.getLogger(__name__)
 
-#: 过渡期截止日(ISO 日期,含当天)。运维设置,不是对接方配置。
+#: 过渡期截止日(ISO 日期,含当天)。按 UTC 日期比较:窗口开到截止日当天结束,即截止日
+#: **次日 00:00 UTC** 关(东八区是次日 08:00)。运维设置,不是对接方配置。
 COMPAT_UNTIL_ENV = "EXPERT_WORK_WORKSPACE_COMPAT_ROOT_DIRS_UNTIL"
 
 #: 「目录不存在」在各个 store 里的两种形态 —— NAS 对不存在的目录抛它模块内部的
@@ -59,15 +63,21 @@ _SHAPE_RE = re.compile(r"(?P<N>[0-9]+)|(?P<A>[A-Za-z]+)|(?P<H>[^\x00-\x7f]+)")
 
 
 def compat_until(raw: str | None = None) -> date | None:
-    """过渡期截止日;没设或写错是 ``None``(写错记一条 warning,按没设处理)。"""
+    """过渡期截止日;没设或写错是 ``None``(写错按没设处理,同一个错值只记一条 warning ——
+    这个函数每次构建工具上下文都要调)。"""
     value = os.environ.get(COMPAT_UNTIL_ENV) if raw is None else raw
     if not value or not value.strip():
         return None
     try:
         return date.fromisoformat(value.strip())
     except ValueError:
-        logger.warning("workspace_compat.invalid_until value=%r — mapping disabled", value)
+        _warn_invalid_until(value)
         return None
+
+
+@functools.cache
+def _warn_invalid_until(value: str) -> None:
+    logger.warning("workspace_compat.invalid_until value=%r — mapping disabled", value)
 
 
 def compat_window_open(*, today: date | None = None) -> bool:

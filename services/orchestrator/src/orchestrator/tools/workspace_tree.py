@@ -295,13 +295,14 @@ def render_conversation_block(
 
     展开预算先给本对话那一节,剩下的给 ``/agent``。两节都空才整块不出现;只有一节空时
     那一节写 ``(empty)`` —— 新对话的 ``/workspace`` 本来就是空的,不写就读不出这件事。
-    过渡期映射的目录在 ``/agent`` 一节那一行末尾注明还能按原相对路径用到哪天。
+    过渡期映射的目录在 ``/agent`` 一节那一行末尾注明还能按原相对路径**只读**用到哪天
+    (B-236 M4:exec 里只读 bind,文件工具拒写)。
     """
     if not conversation and not agent:
         return ""
     conv_tree, used = _render_tree(conversation, max_expanded=max_expanded)
     until = f" until {compat_until_text}" if compat_until_text else ""
-    notes = {f"{d}/": f"   (also reachable as {d}/{until})" for d in compat_dirs}
+    notes = {f"{d}/": f"   (also readable as {d}/{until}, read-only)" for d in compat_dirs}
     agent_tree, _ = _render_tree(agent, max_expanded=max(max_expanded - used, 0), notes=notes)
     return (
         f"{WORKSPACE_BLOCK_HEADING}\n{_CONVERSATION_BLOCK_PREAMBLE}\n\n"

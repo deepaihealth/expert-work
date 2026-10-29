@@ -1636,15 +1636,17 @@ def test_workspace_roots_match_across_packages() -> None:
     from orchestrator.tools.sandbox_image_contract import EXEC_VIEW, NAS_MOUNT
 
     assert (SANDBOX_NAS_MOUNT, SANDBOX_EXEC_VIEW) == (NAS_MOUNT, EXEC_VIEW)
-    assert f'bind_same "$root" {EXEC_VIEW} || fail "agent root changed"\n' in EXEC_VIEW_SCRIPT
-    assert f"mount -t tmpfs -o size=1k none {NAS_MOUNT}\n" in EXEC_VIEW_SCRIPT
+    assert f'    workspace = os.open("{EXEC_VIEW}", DIR)\n' in EXEC_VIEW_SCRIPT
+    assert f'    nas = os.open("{NAS_MOUNT}", os.O_PATH | os.O_DIRECTORY | os.O_CLOEXEC)\n' in (
+        EXEC_VIEW_SCRIPT
+    )
+    cover = '    attach(tmpfs((b"size", b"1k")), nas)\n'
+    assert cover in EXEC_VIEW_SCRIPT
     # 共享 bind 必须排在 tmpfs 覆盖之前 —— 反过来会静默 fail OPEN:把 cover 提前到
-    # bind 之上,[ -d /mnt/workspace/shared ] 守卫读到的是空 tmpfs,悄悄判假,
+    # bind 之上,用户根的 ``shared`` 在空 tmpfs 里找不到,悄悄判「没有」,
     # shared/ 从此再也没被 bind 过,而 test_exec_view_shared_is_read_only 之外没
     # 有任何东西会发现——那条用例连的是真集群,不是每次全仓扫描都跑。
-    assert EXEC_VIEW_SCRIPT.index(
-        f"mount --bind {NAS_MOUNT}/shared {EXEC_VIEW}/shared"
-    ) < EXEC_VIEW_SCRIPT.index(f"mount -t tmpfs -o size=1k none {NAS_MOUNT}")
+    assert EXEC_VIEW_SCRIPT.index("bind_ro(shared, target") < EXEC_VIEW_SCRIPT.index(cover)
 
 
 def test_egress_token_ttl_matches_supervisor_default() -> None:

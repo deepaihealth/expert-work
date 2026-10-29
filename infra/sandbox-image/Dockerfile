@@ -340,7 +340,12 @@ RUN mkdir -p /opt/skills /opt/agents && chown agent:agent /opt/skills /opt/agent
 # the empty mount point. Root-owned is fine: a bind mount inside the user
 # namespace does not need write access to its target. Not the NAS mount path,
 # so it does not collide with the platform-made `/mnt/workspace` symlink.
-RUN mkdir -m 0755 /agent
+# The exec-view script calls its mount helper and the final `unshare` by
+# absolute path (never via PATH once the NAS is touched — B-236 review 3), so
+# assert both paths here instead of failing every exec at deploy time.
+RUN mkdir -m 0755 /agent \
+    && test -x /usr/local/bin/python3 \
+    && test -x /usr/bin/unshare
 
 COPY runner.py /opt/runner.py
 

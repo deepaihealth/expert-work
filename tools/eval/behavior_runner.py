@@ -229,7 +229,7 @@ async def run_case_once(
                     (str(entry["name"]), data) if entry and data is not None else None
                 )
             else:
-                data = await client.read_workspace_file(agent, user_id, name)
+                data = await read_session_file(client, agent, user_id, session_id, name)
                 files[(kind, name)] = (name, data) if data is not None else None
         return RunRecord(
             case_id=case.id, rep=rep, user_id=user_id, session_id=session_id, turns=turns
@@ -238,6 +238,20 @@ async def run_case_once(
         if session_id is not None:
             with contextlib.suppress(httpx.HTTPError):
                 await client.archive(agent, user_id, session_id)
+
+
+async def read_session_file(
+    client: Client, agent: str, user_id: str, session_id: str | None, name: str
+) -> bytes | None:
+    """用例里 ``workspace_file_*`` 的 ``path`` 是模型按相对路径写的文件名。B-236 起新会话的
+    相对路径落在本会话自己的工作目录 ``threads/<会话 id>/work/``,对外 ``workspace/file``
+    的 ``path`` 相对 agent 根,所以先读那里;读不到再按 agent 根读(B-236 之前的部署,
+    基线对比要跑得动)。"""
+    if session_id is not None:
+        data = await client.read_workspace_file(agent, user_id, f"threads/{session_id}/work/{name}")
+        if data is not None:
+            return data
+    return await client.read_workspace_file(agent, user_id, name)
 
 
 async def run_one(

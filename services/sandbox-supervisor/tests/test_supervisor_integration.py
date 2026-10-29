@@ -529,8 +529,8 @@ async def test_exec_agent_root_is_bound_as_workspace_and_hides_the_rest(
 # ---------------------------------------------------------------------------
 # B-236 — per-conversation /workspace + the shared /agent view, acceptance under
 # the real image and OCI runtime (plan tests 2-5). The script logic is also
-# rehearsed without namespaces in orchestrator tests/test_exec_view.py; this is
-# where the mounts themselves are proven.
+# proven on a real kernel in orchestrator tests/test_exec_view_kernel.py; this is
+# where they are proven through the supervisor + runner path.
 # ---------------------------------------------------------------------------
 
 _B236_ROOT = "/mnt/workspace/agents/a"
@@ -543,10 +543,16 @@ _B236_PROBE = (
     "open('/agent/y.txt', 'w').write('agent')\n"
     "os.makedirs('/workspace/inputs/r1', exist_ok=True)\n"
     "open('/workspace/inputs/r1/i.json', 'w').write('{}')\n"
-    "open('style/s.md', 'w').write('anchor')\n"
+    "anchor = open('style/s.md').read()\n"
+    "try:\n"
+    "    open('style/s.md', 'w').write('overwritten')\n"
+    "    style_write = 'WRITABLE'\n"
+    "except OSError as e:\n"
+    "    style_write = 'EROFS' if e.errno == 30 else str(e.errno)\n"
     "print(json.dumps({'cwd': os.getcwd(), 'same': [here.st_dev, here.st_ino] == "
     "[work.st_dev, work.st_ino], 'threads': sorted(os.listdir('/agent/threads')), "
-    "'upload': open('/workspace/uploads/u.txt').read()}))\n"
+    "'upload': open('/workspace/uploads/u.txt').read(), 'anchor': anchor, "
+    "'style_write': style_write}))\n"
 )
 
 
@@ -569,6 +575,7 @@ async def test_exec_conversation_view_binds_its_own_dir_and_the_agent_root(
             "os.makedirs('/workspace/agents/a/uploads', exist_ok=True)\n"
             "open('/workspace/agents/a/uploads/u.txt', 'w').write('up')\n"
             "os.makedirs('/workspace/agents/a/style', exist_ok=True)\n"
+            "open('/workspace/agents/a/style/s.md', 'w').write('anchor')\n"
             f"os.makedirs('/workspace/agents/a/threads/{other}/work', exist_ok=True)\n"
             f"open('/workspace/agents/a/threads/{other}/work/secret.txt', 'w').write('B')\n",
         )
@@ -583,7 +590,16 @@ async def test_exec_conversation_view_binds_its_own_dir_and_the_agent_root(
         )
         assert probe.exit_code == 0, probe.stderr
         seen = json.loads(probe.stdout.strip().splitlines()[-1])
-        assert seen == {"cwd": "/workspace", "same": True, "threads": [str(conv)], "upload": "up"}
+        # B-236 M4 —— 过渡期目录只读:老锚点读得到,经 style/ 的写是 EROFS(不再落到
+        # agents/<key>/style/,两个对话不能经由它互相覆盖)。
+        assert seen == {
+            "cwd": "/workspace",
+            "same": True,
+            "threads": [str(conv)],
+            "upload": "up",
+            "anchor": "anchor",
+            "style_write": "EROFS",
+        }
         check = await expert_work.supervisor.exec(
             sid,
             code="import os\n"

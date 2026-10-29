@@ -12,7 +12,8 @@ exec 并发互不影响。
 拼接。``infra/sandbox-image/runner.py`` 是镜像代码、不能 import 仓库,自带一份逐字相同
 的字面量,``test_exec_view_script_matches_the_sandbox_image`` 用 ``ast`` 钉两份相等。
 
-失败即失败:``set -e`` 让任一条 mount 失败都非零退出,exec 报错,**不回落**到用户根。
+失败即失败:``set -e`` 加上内嵌 python 任一步挂载失败都非零退出,exec 报错,**不回落**到
+用户根。
 
 B-236 —— 按对话分目录。``$2`` 是对话 id(空 = 老视图,发布前已开的对话),``$3`` 是
 本对话的线程 id(老视图里用它把自己那一格 ``threads/<id>/`` 留出来;对话视图里与
@@ -27,29 +28,45 @@ python argv。对话视图:
 * 平台目录(``uploads`` / ``inputs`` / ``.tool_results``)仍在 agent 根,读写 bind 进
   ``/workspace``,平台发给模型的相对路径照旧可用。
 * 过渡期目录:agent 根下已有的同名目录,本对话里没有(或只有一个空的挂载桩)时
-  读写 bind 进 ``/workspace``。只映射目录,根下的单个文件从不映射。宿主侧的判据
-  (:func:`orchestrator.tools.workspace_compat.discover_compat_dirs`)是同一个。
+  **只读** bind 进 ``/workspace``(与 ``shared/`` 同一组 flag:ro,nosuid,nodev,noexec)——
+  老锚点照读,但两个对话不能再经由 agent 根的同一个老目录(如 ``output/``)互相覆盖;
+  要写就写本对话自己的目录,要共享就写 ``/agent/<目录>/``。只映射目录,根下的单个
+  文件从不映射。宿主侧的判据
+  (:func:`orchestrator.tools.workspace_compat.discover_compat_dirs`)是同一个,宿主侧
+  文件工具对过渡期路径的写同样拒绝。
 
-**bind 源一律先验是不是真目录。** agent 根以下的任何路径都可能被上一次 exec 里的代码
-换成符号链接或普通文件(它对 agent 根有写权限)。bind 跟着符号链接走,所以每个源都要
-满足「不是符号链接,且解析后正是它字面上那个位置」(``plain_dir``;agent 根本身先解析
-一次,NAS 挂载点在云上就是平台建的符号链接)。``threads`` / 本对话目录 / 工作目录不合格
-→ 98 退出;平台目录与过渡期目录不合格 → 写一行 stderr、这次不挂,exec 照常跑(一个被
-种下的普通文件不该让这个 agent 之后的每一次 exec 都失败)。
+**NAS 上的路径一律按 fd 挂,不按路径名挂。** agent 根以下的任何路径(含本对话
+``work/`` 里的挂载桩)都可能被上一次 exec 留下的后台进程随时换成符号链接或普通文件
+(它对这些目录有写权限)。按路径名「先检查、再 mount」中间永远有窗口,mount 会跟着
+换上来的符号链接挂到别处 —— review 3 的 PoC 就是在这个窗口里把可写的 ``uploads`` 挂到
+``/usr/local/bin`` 上、让脚本随后执行的 ``stat`` 变成攻击者的程序(此时它还握着这个
+mount ns 的全部能力,``/mnt/workspace`` 也还没盖住)。所以整个挂载阶段由脚本里内嵌的
+一段 python(``/usr/local/bin/python3 -I -S``,只用 ctypes 直接发系统调用,不起任何
+外部命令)完成:
 
-**先 bind、再核对。** 检查与 mount 之间仍有一个窗口:同一个用户的另一次 exec 可能恰好在这
-个窗口里把已检查过的目录换成符号链接,而 bind 会跟过去。所以每一次 bind(agent 根、工作目录、
-本对话那一格、平台目录、过渡期目录)都先记下源的 ``设备:inode``(``stat -c %d:%i``,不跟
-符号链接),bind 之后再看目标是不是同一个;对不上就当场 ``umount``,平台目录与过渡期目录
-跳过这一次,agent 根 / 工作目录 / 本对话那一格 98 退出。bind 完成之后源再被换掉不影响
-已经挂上的那个目录。
+* 源与目标都从可信的起点 fd(``/mnt/workspace``、``/agent``、``/workspace``、刚挂上的
+  那棵树的根)逐段 ``openat(O_PATH|O_NOFOLLOW|O_DIRECTORY)`` 拿到;缺的挂载桩在已钉住的
+  父 fd 上 ``mkdirat``,再 ``O_NOFOLLOW`` 重开并核对是目录。名字之后再被换掉,手里的 fd
+  指的还是原来那个目录。
+* bind = ``open_tree(OPEN_TREE_CLONE)`` + ``move_mount``(两端都是 fd);盖 ``threads/``
+  与 ``/mnt/workspace`` 的 tmpfs 用 ``fsopen`` / ``fsmount`` 建好再 ``move_mount``,本对话那
+  一格的挂载桩在 tmpfs 挂上之前就在它里面建好。``shared/`` 的只读 remount 走
+  ``/proc/self/fd/<那棵树>``(内核 5.10 还没有 ``mount_setattr``)。
+* agent 根:``$1`` 的最后两段(``agents`` 与 key)不许是符号链接,其余前缀(NAS 挂载点,
+  云上是平台建的符号链接)照常解析。``threads`` / 本对话目录 / 工作目录不合格 → 98 退出;
+  平台目录与过渡期目录不合格 → 写一行 stderr、这次不挂,exec 照常跑(一个被种下的普通
+  文件不该让这个 agent 之后的每一次 exec 都失败);用户根的 ``shared`` 不是真目录同样跳过。
+* 第一次碰 NAS 之后不再按 ``PATH`` 找任何命令:python 与最后的 ``unshare`` 都写绝对路径,
+  脚本开头另把 ``PATH`` 钉成系统目录(纵深防御),交给载荷之前还原成调用方给的值。
+  内嵌 python 只用 ASCII、不含单引号:它是 sh 单引号串,而且 ``-c`` 的源码按 locale 解码。
 
-**载荷跑在嵌套的 user namespace 里。** 脚本最后 ``exec unshare -Ur -- "$@"``:载荷所在的
+**载荷跑在嵌套的 user namespace 里。** 脚本最后 ``exec /usr/bin/unshare -Ur -- "$@"``:载荷所在的
 user namespace 不拥有这个 mount namespace,于是它 ``umount`` 不掉盖住 ``/mnt/workspace`` /
 ``threads/`` 的那几层(B-60 spec §五 记过的「能挪开 tmpfs」那条残留就此关上);它即便自己再
 ``unshare -m``,复制过去的挂载也是锁住的(``MNT_LOCKED``),同样卸不掉。载荷里的 uid 仍是
 0(映射回外层的 0,即沙箱用户),文件属主不变。云上 ACS 沙箱不挂 seccomp,本地后端的
-seccomp profile 已为外层 ``unshare`` 放行同一组系统调用,内层不需要新的放行。
+seccomp profile 已为外层 ``unshare`` 放行同一组系统调用(``open_tree`` / ``move_mount`` /
+``fsopen`` / ``fsconfig`` / ``fsmount`` 在那条无条件放行的规则里),内层不需要新的放行。
 
 镜像里没有 ``/agent`` 时以 97 退出(没钉上新镜像);参数或 bind 源不合法以 98 退出。
 """
@@ -63,12 +80,14 @@ from uuid import UUID
 from orchestrator.tools.sandbox_image_contract import SANDBOX_PYTHON_FLAGS
 from orchestrator.tools.workspace_paths import agent_nas_root, require_compat_dir_name
 
-#: 逐条见 spec §4.3。``remount,bind,ro,nosuid,nodev,noexec``:userns 里 remount 不能
+#: 逐条见 spec §4.3。``REMOUNT_RO``(remount,bind,ro,nosuid,nodev,noexec):userns 里 remount 不能
 #: **去掉**源挂载上锁住的 flag,但可以**加**,三个都写上永远合法。``size=1k`` 让盖住
 #: 用户根的 tmpfs 没法当可写盘。**不挂用户根的 uploads**:它在 ``agents/<key>/uploads``
 #: (对话视图里 bind 进来的是 agent 根的那一份)。
 EXEC_VIEW_SCRIPT = """\
 set -eu
+ew_path="${PATH-}"
+PATH=/usr/sbin:/usr/bin:/sbin:/bin
 root="$1"; conv="$2"; own="$3"; n="$4"; shift 4
 if [ ! -d /agent ]; then
   echo "ew-exec-view: image lacks /agent" >&2
@@ -77,6 +96,10 @@ fi
 case "$n" in
   ''|*[!0-9]*) echo "ew-exec-view: bad compat count" >&2; exit 98 ;;
 esac
+if [ "$n" -gt "$#" ]; then
+  echo "ew-exec-view: bad compat count" >&2
+  exit 98
+fi
 for id in "$conv" "$own"; do
   case "$id" in
     */*|.|..) echo "ew-exec-view: bad conversation id" >&2; exit 98 ;;
@@ -85,99 +108,194 @@ done
 if [ -n "$conv" ]; then
   own="$conv"
 fi
-fail() {
-  echo "ew-exec-view: $1" >&2
-  exit 98
-}
-plain_dir() {
-  [ ! -L "$1" ] && [ -d "$1" ] && [ "$(cd -P -- "$1" && pwd -P)" = "$rroot${1#"$root"}" ]
-}
-ensure_dir() {
-  if [ -L "$1" ] || ! { mkdir -p "$1" 2>/dev/null && plain_dir "$1"; }; then
-    fail "$1 is not a plain directory under the agent root"
-  fi
-}
-bind_same() {
-  want="$(stat -c %d:%i -- "$1")" || return 1
-  mount --bind "$1" "$2" || return 1
-  if [ "$(stat -c %d:%i -- "$2")" != "$want" ]; then
-    umount "$2" || exit 98
-    echo "ew-exec-view: $1 changed while it was being mounted; not mounted" >&2
-    return 1
-  fi
-}
-hide_threads() {
-  mount -t tmpfs -o size=1k,mode=0500 none "$1/threads"
-  if [ -n "$own" ]; then
-    mkdir -p "$1/threads/$own"
-    bind_same "$root/threads/$own" "$1/threads/$own" || fail "conversation directory changed"
-  fi
-}
-if [ -n "$root" ]; then
-  mkdir -p "$root"
-  if [ -L "$root" ] || [ -L "${root%/*}" ]; then
-    fail "the agent root is a symlink"
-  fi
-  rroot="$(cd -P -- "$root" && pwd -P)"
-  ensure_dir "$root/threads"
-  if [ -n "$own" ]; then
-    ensure_dir "$root/threads/$own"
-  fi
-  if [ -n "$conv" ]; then
-    ensure_dir "$root/threads/$conv/work"
-  fi
-  bind_same "$root" /agent || fail "agent root changed"
-  if [ -n "$conv" ]; then
-    bind_same "$root/threads/$conv/work" /workspace || fail "conversation directory changed"
-    for d in uploads inputs .tool_results; do
-      if [ -L "$root/$d" ] || ! { mkdir -p "$root/$d" 2>/dev/null && plain_dir "$root/$d"; }; then
-        echo "ew-exec-view: $d is not a plain directory in the agent root; not mounted" >&2
-      elif [ -L "/workspace/$d" ] || { [ -e "/workspace/$d" ] && [ ! -d "/workspace/$d" ]; }; then
-        echo "ew-exec-view: /workspace/$d is not a directory; $d/ not mounted" >&2
-      else
-        mkdir -p "/workspace/$d"
-        bind_same "$root/$d" "/workspace/$d" || true
-      fi
-    done
-  else
-    bind_same "$root" /workspace || fail "agent root changed"
-    hide_threads /workspace
-  fi
-  hide_threads /agent
-  if [ -d /mnt/workspace/shared ]; then
-    if [ -L /workspace/shared ] || { [ -e /workspace/shared ] && [ ! -d /workspace/shared ]; }; then
-      echo "ew-exec-view: /workspace/shared is not a directory; shared/ not mounted" >&2
-    else
-      mkdir -p /workspace/shared
-      mount --bind /mnt/workspace/shared /workspace/shared
-      mount -o remount,bind,ro,nosuid,nodev,noexec /workspace/shared
-    fi
-  fi
-  while [ "$n" -gt 0 ]; do
-    d="$1"; shift; n=$((n - 1))
-    case "$d" in
-      ''|.|..|*/*|threads|uploads|inputs|.tool_results|shared|skills|agents)
-        echo "ew-exec-view: bad compat dir" >&2; exit 98 ;;
-    esac
-    if [ -z "$conv" ] || ! plain_dir "$root/$d" || [ -L "/workspace/$d" ]; then
-      continue
-    fi
-    if [ ! -e "/workspace/$d" ]; then
-      mkdir "/workspace/$d" 2>/dev/null || [ -d "/workspace/$d" ] || continue
-    fi
-    if [ -L "/workspace/$d" ] || [ ! -d "/workspace/$d" ] || [ -n "$(ls -A "/workspace/$d")" ]; then
-      continue
-    fi
-    bind_same "$root/$d" "/workspace/$d" || true
-  done
-  mount -t tmpfs -o size=1k none /mnt/workspace
-else
-  mount --bind /mnt/workspace /agent
-  mount --bind /mnt/workspace /workspace
-  shift "$n"
-fi
+i=0
+for d in "$@"; do
+  [ "$i" -lt "$n" ] || break
+  case "$d" in
+    ''|.|..|*/*|threads|uploads|inputs|.tool_results|shared|skills|agents)
+      echo "ew-exec-view: bad compat dir" >&2; exit 98 ;;
+  esac
+  i=$((i + 1))
+done
+/usr/local/bin/python3 -I -S -c '
+import ctypes, os, stat, sys
+
+# Every NAS path is reached by an O_NOFOLLOW openat walk and mounted by fd
+# (open_tree + move_mount, fsopen/fsmount for tmpfs): a name swapped for a
+# symlink after it was opened changes nothing. No external command runs here.
+libc = ctypes.CDLL(None, use_errno=True)
+libc.syscall.restype = ctypes.c_long
+libc.mount.argtypes = (
+    ctypes.c_char_p, ctypes.c_char_p, ctypes.c_char_p, ctypes.c_ulong, ctypes.c_void_p
+)
+OPEN_TREE, MOVE_MOUNT, FSOPEN, FSCONFIG, FSMOUNT = 428, 429, 430, 431, 432
+CLONE = 0x1 | os.O_CLOEXEC | 0x1000  # OPEN_TREE_CLONE | OPEN_TREE_CLOEXEC | AT_EMPTY_PATH
+MOVE = 0x4 | 0x40  # MOVE_MOUNT_F_EMPTY_PATH | MOVE_MOUNT_T_EMPTY_PATH
+REMOUNT_RO = 0x20 | 0x1000 | 0x1 | 0x2 | 0x4 | 0x8  # REMOUNT BIND RDONLY NOSUID NODEV NOEXEC
+DIR = os.O_PATH | os.O_NOFOLLOW | os.O_DIRECTORY | os.O_CLOEXEC
+LIST = os.O_RDONLY | os.O_NOFOLLOW | os.O_DIRECTORY | os.O_CLOEXEC
+PLATFORM_DIRS = ("uploads", "inputs", ".tool_results")
+
+
+def sc(nr, *args):
+    r = libc.syscall(
+        ctypes.c_long(nr), *[ctypes.c_long(a) if isinstance(a, int) else a for a in args]
+    )
+    if r < 0:
+        e = ctypes.get_errno()
+        raise OSError(e, os.strerror(e))
+    return r
+
+
+def say(msg):
+    sys.stderr.write("ew-exec-view: " + msg + chr(10))
+
+
+def die(msg):
+    say(msg)
+    sys.exit(98)
+
+
+def sub(fd, name, make, flags=DIR):
+    if name in ("", ".", "..") or "/" in name:
+        raise OSError(22, "bad name")
+    try:
+        got = os.open(name, flags, dir_fd=fd)
+    except FileNotFoundError:
+        if not make:
+            raise
+        try:
+            os.mkdir(name, 0o777, dir_fd=fd)
+        except FileExistsError:
+            pass
+        got = os.open(name, flags, dir_fd=fd)
+    if not stat.S_ISDIR(os.fstat(got).st_mode):
+        os.close(got)
+        raise NotADirectoryError(20, "not a directory")
+    return got
+
+
+def attach(tree, target):
+    sc(MOVE_MOUNT, tree, b"", target, b"", MOVE)
+    return tree
+
+
+def bind(source, target):
+    return attach(sc(OPEN_TREE, source, b"", CLONE), target)
+
+
+def bind_ro(source, target, what):
+    tree = bind(source, target)
+    fd_path = ("/proc/self/fd/" + str(tree)).encode()
+    if libc.mount(None, fd_path, None, REMOUNT_RO, None) != 0:
+        die(what + " could not be made read-only")
+
+
+def tmpfs(*options):
+    fs = sc(FSOPEN, b"tmpfs", 1)
+    for key, value in options:
+        sc(FSCONFIG, fs, 1, key, value, 0)
+    sc(FSCONFIG, fs, 6, None, None, 0)
+    mnt = sc(FSMOUNT, fs, 1, 0)
+    os.close(fs)
+    return mnt
+
+
+def need(fd, name, label):
+    try:
+        return sub(fd, name, True)
+    except OSError:
+        die(label + " is not a plain directory under the agent root")
+
+
+def hide_threads(view, own_dir, own):
+    cover = tmpfs((b"size", b"1k"), (b"mode", b"0500"))
+    slot = None
+    if own:
+        os.mkdir(own, 0o777, dir_fd=cover)
+        slot = sub(cover, own, False)
+    attach(cover, sub(view, "threads", False))
+    if slot is not None:
+        bind(own_dir, slot)
+
+
+def main(root, conv, own, compat):
+    nas = os.open("/mnt/workspace", os.O_PATH | os.O_DIRECTORY | os.O_CLOEXEC)
+    agent = os.open("/agent", DIR)
+    workspace = os.open("/workspace", DIR)
+    if not root:
+        bind(nas, agent)
+        bind(nas, workspace)
+        return
+    try:
+        head, mid, key = root.rsplit("/", 2)
+        base = os.open(head or "/", os.O_PATH | os.O_DIRECTORY | os.O_CLOEXEC)
+        top = sub(sub(base, mid, True), key, True)
+    except (OSError, ValueError):
+        die("the agent root is a symlink or not a plain directory")
+    threads = need(top, "threads", root + "/threads")
+    own_dir = need(threads, own, root + "/threads/" + own) if own else None
+    work = need(own_dir, "work", root + "/threads/" + own + "/work") if conv else None
+    view = bind(top, agent)
+    if conv:
+        ws = bind(work, workspace)
+        for d in PLATFORM_DIRS:
+            try:
+                source = sub(top, d, True)
+            except OSError:
+                say(d + " is not a plain directory in the agent root; not mounted")
+                continue
+            try:
+                target = sub(ws, d, True)
+            except OSError:
+                say("/workspace/" + d + " is not a directory; " + d + "/ not mounted")
+                continue
+            try:
+                bind(source, target)
+            except OSError as e:
+                say(d + "/ not mounted: " + str(e))
+    else:
+        ws = bind(top, workspace)
+        hide_threads(ws, own_dir, own)
+    hide_threads(view, own_dir, own)
+    try:
+        shared = sub(nas, "shared", False)
+    except FileNotFoundError:
+        shared = None
+    except OSError:
+        say("shared is not a plain directory in the user root; shared/ not mounted")
+        shared = None
+    if shared is not None:
+        try:
+            target = sub(ws, "shared", True)
+        except OSError:
+            say("/workspace/shared is not a directory; shared/ not mounted")
+        else:
+            bind_ro(shared, target, "shared/")
+    for d in compat if conv else ():
+        try:
+            source = sub(top, d, False)
+            target = sub(ws, d, True, LIST)
+            if os.listdir(target):
+                continue
+        except OSError:
+            continue
+        try:
+            bind_ro(source, target, d + "/")
+        except OSError as e:
+            say(d + "/ not mounted: " + str(e))
+    attach(tmpfs((b"size", b"1k")), nas)
+
+
+try:
+    main(sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[5 : 5 + int(sys.argv[4])])
+except OSError as e:
+    die("mount failed: " + str(e))
+' "$root" "$conv" "$own" "$n" "$@"
+shift "$n"
 cd /workspace
-exec unshare -Ur -- "$@"
+PATH="$ew_path"
+exec /usr/bin/unshare -Ur -- "$@"
 """
 
 #: ``sh -c <script> <$0> <$1> <$2> <$3> <$4> <compat…> <python argv…>``;``$0`` 只是报错时的名字。

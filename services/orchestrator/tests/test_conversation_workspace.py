@@ -376,6 +376,60 @@ async def test_legacy_view_maps_nothing(tmp_path: Path, monkeypatch: pytest.Monk
     assert dirs == ()
 
 
+async def test_compat_dirs_are_read_only_for_the_file_tools(tmp_path: Path) -> None:
+    """B-236 M4 —— 过渡期目录只读,宿主侧与 exec 一致:``write_file`` / ``edit_file`` 写
+    ``style/…`` 被拒,拒绝说明里给出两条能走的路(本对话自己的目录 / ``/agent/style/…``);
+    读照常;改走 ``/agent/style/…`` 的写照样落 agent 根。"""
+    from orchestrator.tools import EditFileTool
+
+    _compat_tree(tmp_path)
+    runtime = _ViewRuntime(tmp_path)
+    store = NasWorkspaceStore(root=str(tmp_path))
+    ctx = _ctx(_C1, compat=("style",))
+    anchor = _agent_root(tmp_path) / "style" / "a.md"
+
+    for tool, args in (
+        (WriteFileTool(client=runtime), {"path": "style/a.md", "content": "B"}),
+        (WriteFileTool(client=runtime), {"path": "/workspace/style/new.md", "content": "B"}),
+        (
+            EditFileTool(client=runtime),
+            {"path": "style/a.md", "old_string": "a", "new_string": "B"},
+        ),
+    ):
+        with pytest.raises(ValueError, match="read-only") as refused:
+            await tool.call(args, ctx=ctx)
+        assert "/agent/style/" in str(refused.value)
+        assert "conversation's own directory" in str(refused.value)
+    assert runtime.exec_views == []  # 被拒的写一次 exec 都没发
+    assert anchor.read_text() == "a"
+    assert not (_work(tmp_path, _C1) / "style").exists()
+
+    assert (await ReadFileTool(store=store).call({"path": "style/a.md"}, ctx=ctx)).content == "a"
+    await WriteFileTool(client=runtime).call({"path": "/agent/style/a.md", "content": "B"}, ctx=ctx)
+    assert anchor.read_text() == "B"
+
+
+def test_compat_read_only_rule_is_only_for_the_writing_file_tools() -> None:
+    mapped = replace(_CONV1, compat_dirs=("style",))
+    for tool in ("read_file", "list_dir", "read_document", "read_page", "save_artifact"):
+        assert resolve_workspace_path("style/a.md", view=mapped, tool=tool).kind == "compat"
+    for tool in ("write_file", "edit_file"):
+        with pytest.raises(ValueError, match="read-only"):
+            resolve_workspace_path("style/a.md", view=mapped, tool=tool)
+        # 未映射时同名路径是本对话自己的目录,照常可写
+        assert resolve_workspace_path("style/a.md", view=_CONV1, tool=tool).kind == "conversation"
+
+
+def test_a_malformed_window_is_warned_about_once(caplog: pytest.LogCaptureFixture) -> None:
+    from orchestrator.tools.workspace_compat import compat_until
+
+    with caplog.at_level("WARNING", logger="orchestrator.tools.workspace_compat"):
+        for _ in range(3):
+            assert compat_until("2026-13-99") is None
+        assert compat_until("2026-12-10") is not None
+    assert [r.getMessage().count("2026-13-99") for r in caplog.records] == [1]
+
+
 def _hits(channel: str) -> float:
     return float(compat_dir_hits_total.labels(channel=channel, agent_key=_KEY)._value.get())
 
@@ -546,7 +600,7 @@ async def test_the_block_lists_this_conversation_and_the_agent_root_only(tmp_pat
     assert block.index(CONVERSATION_SECTION) < block.index(AGENT_SECTION)
     assert "mine.md" in block
     assert "anchor.md" in block
-    assert "also reachable as style/" in block
+    assert "also readable as style/" in block and "read-only" in block
     assert "theirs.md" not in block
     assert "PLAN.md" not in block
     assert "threads" not in block

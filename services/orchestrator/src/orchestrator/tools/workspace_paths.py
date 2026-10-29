@@ -68,6 +68,12 @@ _SHARED_DIR = WORKSPACE_SHARED_DIR
 #: 文档共用一个 out_dir)。
 _WRITE_TOOLS = frozenset({"write_file", "edit_file", "read_page"})
 
+#: B-236 M4 —— 过渡期目录在 exec 里是只读 bind;宿主侧这两个改字节的文件工具对它同样拒写
+#: (它们经 ``/agent`` 视图落盘,不拒就绕过了那层只读)。``read_page`` 不在里面:它的渲染
+#: 产物落 agent 根的 ``.tool_results/``,不落进过渡期目录;``save_artifact`` 只读源文件做
+#: 快照,也不在里面。
+_COMPAT_READ_ONLY_TOOLS = frozenset({"write_file", "edit_file"})
+
 #: B-225 —— skill files are seeded outside the workspace, under
 #: ``SANDBOX_SKILLS_ROOT``; models reach for them with ``../opt/skills/…``. The
 #: rejection names the two ways that work, so the next call does not guess.
@@ -136,8 +142,8 @@ THREADS_DIR = "threads"
 CONVERSATION_WORK_DIR = "work"
 
 #: B-236 —— 对话视图里**仍在 agent 根**、读写 bind 进 ``/workspace`` 的平台目录。与
-#: ``exec_view.EXEC_VIEW_SCRIPT`` 里 ``for d in uploads inputs .tool_results`` 是同一组
-#: (``test_workspace_paths`` 钉两边相等):平台发给模型的 ``uploads/<名>`` /
+#: ``exec_view.EXEC_VIEW_SCRIPT`` 内嵌 python 里的 ``PLATFORM_DIRS`` 是同一组
+#: (``test_exec_view`` 钉两边相等):平台发给模型的 ``uploads/<名>`` /
 #: ``inputs/<run>/…`` / ``.tool_results/<run>/…`` 在任何对话里都照常可读。
 PLATFORM_DIRS: tuple[str, ...] = (
     WORKSPACE_UPLOADS_DIR,
@@ -283,7 +289,7 @@ def resolve_workspace_path(path: str, *, view: WorkspaceView, tool: str) -> Reso
       ``shared`` 开头拒。老写法 ``/workspace/agents/<自己>/x`` 一直指 agent 根,同此。
     * ``/workspace/x`` 或相对 ``x``:老视图 —— agent 根,与 B-236 之前逐字相同;对话视图 ——
       首段是平台目录(``uploads`` / ``inputs`` / ``.tool_results``)走 agent 根,首段是过渡期
-      目录走 agent 根,其余是本对话自己的目录。
+      目录走 agent 根(只读:``write_file`` / ``edit_file`` 拒),其余是本对话自己的目录。
     """
     raw = path.strip()
     if not raw:
@@ -335,8 +341,23 @@ def resolve_workspace_path(path: str, *, view: WorkspaceView, tool: str) -> Reso
     if head in PLATFORM_DIRS:
         return ResolvedPath(ws=AGENT_VIEW, rel=rel, kind="platform", path=rel)
     if head and head in view.compat_dirs:
+        if tool in _COMPAT_READ_ONLY_TOOLS:
+            raise ValueError(_compat_write_message(tool, head, rel, raw=path))
         return ResolvedPath(ws=AGENT_VIEW, rel=rel, kind="compat", path=rel)
     return ResolvedPath(ws=EXEC_VIEW, rel=rel, kind="conversation", path=rel)
+
+
+def _compat_write_message(tool: str, head: str, rel: str, *, raw: str) -> str:
+    """拒写过渡期目录时给模型的话:为什么只读、两条能走的路(本对话自己的目录 / 要共享就写
+    ``/agent/<目录>/``),路径都能原样再传回来。"""
+    rest = rel[len(head) :].lstrip("/") or "<file>"
+    return (
+        f"{tool} cannot write {raw!r}: {head}/ is a read-only view of the agent's old "
+        f"{head}/ directory during the workspace transition. Write it under this "
+        f"conversation's own directory instead (e.g. {rest!r}), or to "
+        f"'{AGENT_VIEW}/{head}/{rest}' if the file is meant to be shared by every "
+        "conversation of this agent."
+    )
 
 
 def _agent_spelling(rel: str) -> str:
