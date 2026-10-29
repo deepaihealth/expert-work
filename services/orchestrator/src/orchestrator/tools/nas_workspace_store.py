@@ -133,17 +133,16 @@ that narrow window fails closed rather than open), but it eliminates the
 specific mechanism (re-walking a string path) that made the previous
 version's re-checks ineffective.
 
-:meth:`list_files` is a narrower case: it only reads metadata, never opens
-file content, and its :func:`os.walk` call passes ``followlinks=False`` so
-it never *descends into* a symlinked subdirectory (an intermediate-
-component escape of the kind described above can't make it enumerate files
-outside the tree). A symlink placed as a plain file entry (not a directory)
-still appears in the listing under its own in-tree relative path, but its
-reported size comes from :func:`os.lstat` (not :func:`os.stat`) — the
-symlink's own byte length, never a stat of whatever it points at — so no
-metadata about anything outside the tree is ever surfaced. Nothing here
-needs ``dir_fd`` chaining: there is no content read and no follow-through
-target to escape into.
+:meth:`list_files` only reads metadata, but it needs the same pinning. A
+path-based walk (:func:`os.walk`, even with ``followlinks=False``) checks
+``islink`` on a subdirectory and *later* lists it by name, and a payload that
+keeps swapping a directory in its own workspace for a symlink wins that gap:
+the walk then lists whatever the symlink points at, up to the root of the NAS
+volume, i.e. other tenants' file names. So it walks with :func:`os.fwalk`
+from the scope's own fd with ``follow_symlinks=False``: each subdirectory is
+``lstat``-ed, opened, and dropped unless the opened fd is the same inode.
+A symlink placed as a plain file entry still appears under its own in-tree
+relative path, with its own :func:`os.lstat` size, never a stat of its target.
 """
 
 from __future__ import annotations
@@ -361,8 +360,7 @@ def _walk_and_match(
     普通文件), 也读不出内容(``ELOOP``)。
 
     ``follow_symlinks=False`` keeps the walk itself from descending through a
-    symlinked subdirectory, the same reason :meth:`NasWorkspaceStore.list_files`
-    passes ``followlinks=False``.
+    symlinked subdirectory, the same as :meth:`NasWorkspaceStore.list_files`.
     """
 
     def _on_error(exc: OSError) -> None:
@@ -420,6 +418,41 @@ def _walk_and_match(
                 break
     hits.sort(key=lambda entry: entry.path)
     return WorkspaceSearchResult(entries=tuple(hits), truncated=truncated)
+
+
+def _list_dir_entries(
+    prefix: tuple[str, ...],
+    dirpath: str,
+    filenames: list[str],
+    walk_fd: int,
+    entries: list[WorkspaceFileEntry],
+) -> None:
+    """One directory of :meth:`NasWorkspaceStore.list_files`' walk, ``dir_fd``-relative."""
+    base = PurePosixPath(dirpath)
+    for name in filenames:
+        rel = str(base / name).removeprefix("./")
+        # 保留前缀的判据吃的是**用户根相对**路径 ——
+        # ``is_reserved_workspace_path`` 自己会剥掉 ``agents/<key>``
+        # 这层容器再看头一段(见 ``persistence/workspace/layout.py``)。
+        # 喂作用域相对路径进去在今天恰好也对, 但那是巧合不是契约:
+        # 换一个容器层级就静默错位, 而错位的形态是"文件凭空消失"。
+        if is_reserved_workspace_path("/".join((*prefix, rel))):
+            continue
+        # lstat, not stat — a symlink appearing as a plain file entry must
+        # report its own byte length, never a stat() of whatever it points at
+        # outside the tree (see module docstring). B-84 —— 一次 lstat 同时取大小
+        # 与 mtime: 这个循环在一棵几千文件的树上跑, 每多一次系统调用就是一次 NFS 往返。
+        try:
+            info = os.lstat(name, dir_fd=walk_fd)
+        except PermissionError as exc:
+            # 同 read_file:列不动 ≠ 不存在,不能被下面吞掉。
+            raise WorkspacePermissionError(f"workspace listing not readable: {rel!r}") from exc
+        except OSError as exc:
+            # 复审 N-2 —— 错误文案只带工作区相对路径, 不带 ``exc`` 自己的 filename。
+            raise SandboxSupervisorError(
+                f"workspace listing failed: {rel!r}: {exc.strerror}"
+            ) from exc
+        entries.append(_entry(rel, info))
 
 
 def _name_matches(rel: str, name: str, name_glob: str) -> bool:
@@ -664,7 +697,7 @@ class NasWorkspaceStore:
             return os.open(user_root, os.O_RDONLY | os.O_DIRECTORY)
         except PermissionError as exc:
             # 复审 C-1 —— 这句是 read_file/write_file/delete_file 三个方法共用
-            # 的入口(list_files 走独立的 os.stat/os.walk,从不调用这个方法,
+            # 的入口(list_files 起点的 os.stat 不经过这个方法,
             # 上一版这里的注释把它也算进去是错的,见复审 N-1):落在这里之
             # 前 create=False 的 read_file/delete_file 从不会碰上面的 mkdir
             # 分支,直接从这里第一次触到 user_root。反过来说也一样漏:
@@ -867,9 +900,9 @@ class NasWorkspaceStore:
                 return []
 
             def _on_walk_error(exc: OSError) -> None:
-                """``os.walk``'s ``onerror`` callback — Task 3 fix round 1.
+                """The walk's ``onerror`` callback — Task 3 fix round 1.
 
-                ``os.walk`` 默认 ``onerror=None``:一个扫不动的子树(典型是
+                ``os.walk`` / ``os.fwalk`` 默认 ``onerror=None``:一个扫不动的子树(典型是
                 ``EACCES``)会被**静默吞掉**——那棵子树下的文件从结果里凭空消
                 失,不报错也不留任何痕迹,而这恰恰是"列不动"最常见的形态,比
                 单个文件 ``lstat`` 失败常见得多(下面那处 ``try/except`` 只挡
@@ -877,69 +910,47 @@ class NasWorkspaceStore:
                 :class:`SandboxSupervisorError`,把它翻成 ``{"success": true,
                 "files": []}`` —— 一次真实的权限故障被这层静默吞声悄悄变成
                 "工作区是空的",正是这整个任务要根治的那类失败。传给
-                ``os.walk`` 的 ``onerror=`` 让这类错误显式地把这次调用整个炸
+                walk 的 ``onerror=`` 让这类错误显式地把这次调用整个炸
                 掉,而不是悄悄漏掉一部分结果。
 
-                复审 I-1 —— 定义成 ``_list`` 内部的闭包(而不是模块级函数)只
-                为了能拿到 ``user_root`` 把 ``exc.filename``(``os.walk`` 给的
-                永远是绝对路径,NAS 挂载点在服务端的真实文件系统路径)转成工
-                作区相对路径。全局约束"用户可见的错误文案不含路径":下面兄弟
-                分支(``full.lstat()`` 那处 ``except PermissionError``)已经在
-                用相对的 ``rel``,这里之前是唯一还在裸拼 ``exc.filename!r`` 的
-                地方。
+                复审 I-1 —— 全局约束"用户可见的错误文案不含服务端绝对路径"。
+                改成 ``os.fwalk`` 之后 ``exc.filename`` 是相对当前目录 fd 的名
+                字(不再是 NAS 挂载点下的绝对路径), 直接用即可。
                 """
                 if isinstance(exc, PermissionError):
-                    rel = os.path.relpath(exc.filename, walk_root) if exc.filename else "."
+                    # fwalk 给的 filename 是相对当前目录 fd 的名字, 不是绝对路径。
+                    rel = os.fsdecode(exc.filename) if exc.filename else "."
                     raise WorkspacePermissionError(
                         f"workspace listing not readable: {rel!r}"
                     ) from exc
-                # 复审 N-2 —— 同上,``exc`` 是 os.walk 内部 scandir 失败的
-                # OSError,``filename`` 是绝对路径,``str(exc)`` 会带着它。
+                # 复审 N-2 —— 只带 strerror, 不带 ``str(exc)``(会附上 filename)。
                 raise SandboxSupervisorError(f"workspace listing failed: {exc.strerror}") from exc
 
+            # 起点也按 fd 开(逐段 O_NOFOLLOW, 同 search_files):上面的 os.stat 只回答
+            # "有没有、是不是目录", 真正走路从这把 fd 出发。
+            try:
+                dfd = self._open_scope_dir_fd(tenant_id, user_id, "/".join(prefix))
+            except _WorkspacePathNotFoundError:
+                return []  # 检查之后被删 —— 与 stat 那里的"没有"同义。
             entries: list[WorkspaceFileEntry] = []
-            # followlinks=False — see module docstring: never descend into a
-            # symlinked subdirectory, so an intermediate-component escape
-            # can't make this enumerate files outside the tree. onerror=
-            # (Task 3 fix round 1) — see _on_walk_error: without it, a
-            # subtree this process can't scan is silently dropped from the
-            # results instead of failing loudly.
-            for dirpath, _dirnames, filenames in os.walk(
-                walk_root, followlinks=False, onerror=_on_walk_error
-            ):
-                for name in filenames:
-                    full = Path(dirpath) / name
-                    rel = full.relative_to(walk_root).as_posix()
-                    # 保留前缀的判据吃的是**用户根相对**路径 ——
-                    # ``is_reserved_workspace_path`` 自己会剥掉 ``agents/<key>``
-                    # 这层容器再看头一段(见 ``persistence/workspace/layout.py``)。
-                    # 喂作用域相对路径进去在今天恰好也对, 但那是巧合不是契约:
-                    # 换一个容器层级就静默错位, 而错位的形态是"文件凭空消失"。
-                    if is_reserved_workspace_path("/".join((*prefix, rel))):
-                        continue
-                    # lstat, not stat — a symlink appearing as a plain file
-                    # entry must report its own byte length, never a stat()
-                    # of whatever it points at outside the tree (see module
-                    # docstring).
-                    try:
-                        # B-84 —— 一次 lstat 同时取大小与 mtime, 不为 mtime 多跑
-                        # 一次 stat: 这个循环在一棵几千文件的树上跑, 每多一次系
-                        # 统调用就是一次 NFS 往返。
-                        info = full.lstat()
-                    except PermissionError as exc:
-                        # 同 read_file:列不动 ≠ 不存在,不能被下面吞掉。
-                        raise WorkspacePermissionError(
-                            f"workspace listing not readable: {rel!r}"
-                        ) from exc
-                    except OSError as exc:
-                        # 复审 N-2(同类,这条不在复审原话点名的两处,但
-                        # ``full.lstat()`` 是普通路径调用,同款泄露,顺手在
-                        # 这一遍改掉)—— ``full`` 是绝对路径,``exc`` 会带
-                        # ``filename``,``str(exc)`` 原样带过来。
-                        raise SandboxSupervisorError(
-                            f"workspace listing failed: {rel!r}: {exc.strerror}"
-                        ) from exc
-                    entries.append(_entry(rel, info))
+            # fwalk + follow_symlinks=False —— 见模块 docstring:子目录先 lstat 再
+            # 开、开出来的 fd 与 lstat 不是同一个 inode 就跳过, 被换成 symlink 的
+            # 目录名因此走不出去。os.walk 是先 islink 后按名字列, 中间那段空隙就是
+            # 跨租户列出文件名的口子。onerror= (Task 3 fix round 1) —— 见
+            # _on_walk_error:扫不动的子树必须炸, 不能静默漏掉。
+            walker = cast(
+                Generator[tuple[str, list[str], list[str], int], None, None],
+                os.fwalk(".", dir_fd=dfd, follow_symlinks=False, onerror=_on_walk_error),
+            )
+            try:
+                with closing(walker):
+                    for dirpath, _dirnames, filenames, walk_fd in walker:
+                        _list_dir_entries(prefix, dirpath, filenames, walk_fd, entries)
+            except PermissionError as exc:
+                # fwalk 开起点(".")失败不走 onerror, 直接抛 —— 同 os.stat 那处。
+                raise WorkspacePermissionError(f"workspace listing not readable: {'.'!r}") from exc
+            finally:
+                os.close(dfd)
             entries.sort(key=lambda entry: entry.path)
             return entries[:_MAX_LIST_ENTRIES]
 
@@ -1025,8 +1036,8 @@ class NasWorkspaceStore:
         :func:`os.fwalk` with ``dir_fd=`` rather than :func:`os.walk`: this one
         actually *reads* file bytes, so every open has to be ``dir_fd``-relative
         with ``O_NOFOLLOW`` — a symlink planted as a plain file entry pointing at
-        ``/etc/passwd`` must not be readable through here. :meth:`list_files` can
-        get away with :func:`os.walk` because it only ever ``lstat``s.
+        ``/etc/passwd`` must not be readable through here. :meth:`list_files` walks
+        the same way.
         """
         if name_glob is None and content is None:
             msg = "search_files needs at least one of 'name_glob' / 'content'"

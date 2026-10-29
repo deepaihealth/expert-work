@@ -486,16 +486,15 @@ async def test_list_files_reports_permission_denied_for_a_single_unstattable_ent
     tenant_id, user_id = uuid4(), uuid4()
     store = _store(tmp_path)
     await store.write_file(tenant_id=tenant_id, user_id=user_id, path="a.txt", data=b"x")
-    user_root = tmp_path / str(tenant_id) / str(user_id)
-    target = user_root / "a.txt"
-    real_lstat = Path.lstat
+    real_lstat = os.lstat
 
-    def _fake_lstat(self: Path, *args: Any, **kwargs: Any) -> os.stat_result:
-        if self == target:
+    def _fake_lstat(path: Any, *args: Any, **kwargs: Any) -> os.stat_result:
+        # list_files lstats each entry by name relative to the walk's dir fd.
+        if path == "a.txt" and kwargs.get("dir_fd") is not None:
             raise PermissionError(13, "Permission denied")
-        return real_lstat(self, *args, **kwargs)
+        return real_lstat(path, *args, **kwargs)
 
-    monkeypatch.setattr(Path, "lstat", _fake_lstat)
+    monkeypatch.setattr(os, "lstat", _fake_lstat)
 
     with pytest.raises(WorkspacePermissionError) as excinfo:
         await store.list_files(tenant_id=tenant_id, user_id=user_id)
@@ -556,6 +555,46 @@ async def test_an_agent_written_marker_filename_does_not_soft_delete_anything(
     assert not (tmp_path / str(tenant_id) / DELETED_DIR).exists()
     # 同理,删它也不再被拒 —— 它就是个名字奇怪的普通文件。
     await store.delete_file(tenant_id=tenant_id, user_id=user_id, path=".ew-workspace-deleted")
+
+
+async def test_list_files_does_not_follow_a_directory_swapped_for_a_symlink_mid_walk(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A payload can keep swapping a directory in its own workspace for a symlink.
+
+    The swap lands after the walk has decided ``zz`` is a real directory and before
+    it lists ``zz``. A path-based walk then re-resolves ``.../zz`` and follows the
+    symlink. With the symlink pointing at ``../..``-style targets, that is the whole
+    NAS volume, so other tenants' file names show up in this user's listing (the
+    per-turn workspace block, the external ``/v1`` listing, the console). The swap
+    is simulated deterministically, at the moment the walk asks to list ``zz``.
+    """
+    tenant_id, user_id = uuid4(), uuid4()
+    store = _store(tmp_path)
+    await store.write_file(tenant_id=tenant_id, user_id=user_id, path="zz/mine.txt", data=b"x")
+    other_tenant = tmp_path / "other-tenant"
+    other_tenant.mkdir()
+    (other_tenant / "other-tenant-secret.txt").write_text("y")
+    zz = tmp_path / str(tenant_id) / str(user_id) / "zz"
+    zz_ino = zz.stat().st_ino
+    real_scandir = os.scandir
+    swapped: list[bool] = []
+
+    def _scandir_then_swap(arg: Any = ".") -> Any:
+        # A fd-pinned walk hands over the fd it already opened (and checked); a
+        # path-based walk hands over the name, which still resolves to ``zz``.
+        target = os.fstat(arg) if isinstance(arg, int) else os.stat(arg)
+        if not swapped and target.st_ino == zz_ino:
+            swapped.append(True)
+            _swap_dir_for_symlink(zz, other_tenant)
+        return real_scandir(arg)
+
+    monkeypatch.setattr(os, "scandir", _scandir_then_swap)
+
+    files = await store.list_files(tenant_id=tenant_id, user_id=user_id)
+
+    assert swapped, "the swap never happened, so this test proved nothing"
+    assert not any("other-tenant-secret" in f.path for f in files), [f.path for f in files]
 
 
 async def test_list_files_does_not_hide_a_file_named_like_the_legacy_marker(
