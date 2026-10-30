@@ -149,6 +149,7 @@ from __future__ import annotations
 
 import asyncio
 import errno
+import json
 import logging
 import os
 import shutil
@@ -280,6 +281,16 @@ class _WorkspacePathNotFoundError(SandboxSupervisorError):
 MISSING_DIR_ERRORS = (WorkspaceFileNotFoundError, _WorkspacePathNotFoundError)
 
 
+#: review 9 —— 按 fd 遍历(``list_files`` / ``search_files``)最多下到第几层。``fwalk`` 每深一层
+#: 同时多握一个目录 fd,沙箱能造任意深的目录链;64 远超真实工作区(实测最深 5 层)。
+MAX_WALK_DEPTH = 64
+
+
+def _walk_depth(dirpath: str) -> int:
+    """``fwalk(".")`` 给的 ``dirpath`` 有几层:``"."`` 是 0,``"./a"`` 是 1。"""
+    return 0 if dirpath == "." else dirpath.count("/")
+
+
 def _is_conversation_work(prefix: tuple[str, ...]) -> bool:
     """作用域是不是某个对话的 ``agents/<k>/threads/<conv>/work``。"""
     return (
@@ -301,34 +312,101 @@ def _is_seed_marker(path: str) -> bool:
     )
 
 
+#: B-236 review 9 —— ``.seeded`` 标记读多大就不读了(按 500 个文件的清单量出来的上限,留足余量)。
+#: 超过 = 当没有清单,什么都不藏。
+MAX_SEED_MARKER_BYTES = 256 * 1024
+
+#: 对话目录 ``agents/<k>/threads/<conv>`` → 开场复制的清单:``work/`` 相对路径 → (大小, ctime)。
+SeedManifests = dict[str, dict[str, tuple[int, int]]]
+
+
+def parse_seed_manifest(data: bytes) -> dict[str, tuple[int, int]] | None:
+    """``.seeded`` 标记里的复制清单;格式不对 / 没有清单 → ``None``(什么都不藏)。"""
+    try:
+        doc = json.loads(data)
+    except ValueError:
+        return None
+    files = doc.get("files") if isinstance(doc, dict) else None
+    if not isinstance(files, list):
+        return None
+    out: dict[str, tuple[int, int]] = {}
+    for item in files:
+        if (
+            isinstance(item, list)
+            and len(item) == 3
+            and isinstance(item[0], str)
+            and type(item[1]) is int
+            and type(item[2]) is int
+        ):
+            out[item[0]] = (item[1], item[2])
+    return out
+
+
+def _read_seed_manifest(conv_fd: int) -> dict[str, tuple[int, int]] | None:
+    """在已经钉住的 ``threads/<conv>/`` 目录 fd 上读标记的清单。
+
+    没有、不是普通文件、超过 :data:`MAX_SEED_MARKER_BYTES`、读不动、解析不了 —— 一律 ``None``:
+    认副本只是为了少列,出错的方向必须是多列(review 9)。``O_NONBLOCK`` 防 FIFO。
+    """
+    try:
+        fd = os.open(
+            WORKSPACE_SEED_MARKER,
+            os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC,
+            dir_fd=conv_fd,
+        )
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        logger.warning("nas_workspace_store.seed_marker_unreadable error=%s", exc.strerror)
+        return None
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode) or info.st_size > MAX_SEED_MARKER_BYTES:
+            return None
+        data = os.read(fd, MAX_SEED_MARKER_BYTES + 1)
+    except OSError as exc:
+        logger.warning("nas_workspace_store.seed_marker_unreadable error=%s", exc.strerror)
+        return None
+    finally:
+        os.close(fd)
+    if len(data) > MAX_SEED_MARKER_BYTES:
+        return None
+    return parse_seed_manifest(data)
+
+
 def _drop_seed_copies(
     prefix: tuple[str, ...],
     entries: list[WorkspaceFileEntry],
-    seeded_at: dict[str, int],
+    manifests: SeedManifests,
     ctimes: dict[str, int],
 ) -> list[WorkspaceFileEntry]:
-    """剔掉开场复制进对话、之后**没被碰过**的副本(review 8 的判据)。
+    """剔掉开场复制进对话、之后**没被碰过**的副本(review 9 的判据)。
 
-    ``agents/<k>/threads/<conv>/work/<目录>/…`` 里的文件,``st_ctime_ns`` 不晚于本对话
-    ``.seeded`` 标记的 ``mtime`` 就是原样副本:标记在复制(含 ``utime``)全部做完之后才写,
-    之后对副本的任何写入、改权限、``touch`` 都会把它的 ctime 推到标记之后。ctime 由文件系统
-    (NFS 上是服务端)设,用户态改不回去。不跟 ``/agent`` 的现状比:源文件之后被改,老对话的
-    副本照样是副本;对话自己的产出被 ``cp -a`` 进 ``/agent``,也不会因此被当成副本藏起来。
-    没有标记的对话里一个都不算。``seeded_at`` 的键是 ``agents/<k>/threads/<conv>``。
+    ``agents/<k>/threads/<conv>/work/<相对路径>`` 的文件,当且仅当它在本对话 ``.seeded`` 标记的
+    复制清单里、且现在的大小与 ``st_ctime_ns`` 都与清单记下的相同,才是原样副本。清单记的是复制
+    写出那一刻(保留 mtime 的 ``utime`` 之后)的 ctime;之后对它的任何写入、改权限、``touch`` 都会
+    让 ctime 对不上。ctime 由文件系统(NFS 上是服务端)设,用户态改不回去。
+
+    * 不在清单里的从不藏:复制失败之后模型自己写的、改了名的(``mv customers clients``)都照常列。
+    * 不跟 ``/agent`` 的现状比:源文件之后被改,老对话的副本照样是副本;对话自己的产出被
+      ``cp -a`` 进 ``/agent``,对话里那份也不会被当成副本。
+    * 没有清单(没有标记、标记坏了)的对话里一个都不藏。清单在沙箱够得着的地方:伪造它只影响
+      这个用户自己这个对话的列表。
     """
-    if not seeded_at:
+    if not manifests:
         return entries
     kept: list[WorkspaceFileEntry] = []
     for entry in entries:
         parts = (*prefix, *entry.path.split("/"))
         if (
-            len(parts) >= 7
+            len(parts) >= 6
             and parts[0] == WORKSPACE_AGENTS_DIR
             and parts[2] == WORKSPACE_THREADS_DIR
             and parts[4] == WORKSPACE_CONVERSATION_WORK_DIR
         ):
-            marked = seeded_at.get("/".join(parts[:4]))
-            if marked is not None and ctimes.get(entry.path, marked + 1) <= marked:
+            manifest = manifests.get("/".join(parts[:4]))
+            recorded = manifest.get("/".join(parts[5:])) if manifest else None
+            if recorded is not None and recorded == (entry.size, ctimes.get(entry.path)):
                 continue
         kept.append(entry)
     return kept
@@ -441,6 +519,7 @@ def _walk_and_match(
 
     hits: list[WorkspaceFileEntry] = []
     truncated = False
+    too_deep = False
     # ``closing`` —— 命中上限时我们会 ``break`` 出去, 而 :func:`os.fwalk` 是个持有
     # 目录 fd 的生成器。
     #
@@ -470,6 +549,11 @@ def _walk_and_match(
                     # B-236 —— 作用域根下藏起来的首段(``agent_shared`` 的 ``threads/``)
                     # 连走都不走进去:别的对话的文件不该出现在任何一条结果里。
                     dirnames[:] = [d for d in dirnames if d not in hidden]
+                if dirnames and _walk_depth(dirpath) >= MAX_WALK_DEPTH:
+                    # review 9 —— 再往下不走:fwalk 每深一层多握一个目录 fd。结果标成截断
+                    # (不在这里置 ``truncated``:那会让整个遍历在这一层就停,别的分支也不搜了)。
+                    dirnames[:] = []
+                    too_deep = True
                 for name in sorted(filenames):
                     rel = str(base / name).removeprefix("./")
                     if is_reserved_workspace_path("/".join((*prefix, rel))):
@@ -496,7 +580,7 @@ def _walk_and_match(
     except OSError as exc:
         raise SandboxSupervisorError(f"workspace search failed: {exc.strerror}") from exc
     hits.sort(key=lambda entry: entry.path)
-    return WorkspaceSearchResult(entries=tuple(hits), truncated=truncated)
+    return WorkspaceSearchResult(entries=tuple(hits), truncated=truncated or too_deep)
 
 
 def _list_dir_entries(
@@ -506,12 +590,12 @@ def _list_dir_entries(
     walk_fd: int,
     entries: list[WorkspaceFileEntry],
     *,
-    seeded_at: dict[str, int] | None = None,
+    seeded_at: SeedManifests | None = None,
     ctimes: dict[str, int] | None = None,
 ) -> None:
     """One directory of :meth:`NasWorkspaceStore.list_files`' walk, ``dir_fd``-relative.
 
-    B-236 —— ``threads/<conv>/.seeded`` 标记不列(平台状态),它的 mtime 记进 ``seeded_at``;
+    B-236 —— ``threads/<conv>/.seeded`` 标记不列(平台状态),它的复制清单记进 ``seeded_at``;
     每个文件的 ctime 记进 ``ctimes``(作用域相对路径为键),认原样副本用。
     """
     base = PurePosixPath(dirpath)
@@ -540,8 +624,10 @@ def _list_dir_entries(
             ) from exc
         full = "/".join((*prefix, rel))
         if name == WORKSPACE_SEED_MARKER and _is_seed_marker(full):
-            if seeded_at is not None and stat.S_ISREG(info.st_mode):
-                seeded_at[full.rsplit("/", 1)[0]] = info.st_mtime_ns
+            if seeded_at is not None:
+                manifest = _read_seed_manifest(walk_fd)
+                if manifest:
+                    seeded_at[full.rsplit("/", 1)[0]] = manifest
             continue  # B-236 —— 开场复制的标记是平台状态,不是产出
         entries.append(_entry(rel, info))
         if ctimes is not None:
@@ -853,21 +939,24 @@ class NasWorkspaceStore:
         return dfd
 
     def _note_seed_marker(
-        self, tenant_id: UUID, user_id: UUID, conv_dir: tuple[str, ...], seeded_at: dict[str, int]
+        self, tenant_id: UUID, user_id: UUID, conv_dir: tuple[str, ...], seeded_at: SeedManifests
     ) -> None:
-        """``agents/<k>/threads/<conv>/.seeded`` 的 mtime 记进 ``seeded_at``(没有就不记)。"""
+        """``agents/<k>/threads/<conv>/.seeded`` 的复制清单记进 ``seeded_at``(没有就不记)。
+
+        目录链经 :meth:`_open_scope_dir_fd`,失败只会是本 store 自己的异常类型;标记文件本身
+        读不动 / 坏了按「没有清单」处理(见 :func:`_read_seed_manifest`)。不放裸 ``OSError``
+        出去(review 9)。
+        """
         try:
             dfd = self._open_scope_dir_fd(tenant_id, user_id, "/".join(conv_dir))
         except _WorkspacePathNotFoundError:
             return
         try:
-            info = os.lstat(WORKSPACE_SEED_MARKER, dir_fd=dfd)
-        except FileNotFoundError:
-            return
+            manifest = _read_seed_manifest(dfd)
         finally:
             os.close(dfd)
-        if stat.S_ISREG(info.st_mode):
-            seeded_at["/".join(conv_dir)] = info.st_mtime_ns
+        if manifest:
+            seeded_at["/".join(conv_dir)] = manifest
 
     def _open_scope_dir_fd(self, tenant_id: UUID, user_id: UUID, relpath: str) -> int:
         """A directory's **own** fd, not its parent's — backs ``list_dir`` / ``search_files``.
@@ -1044,9 +1133,10 @@ class NasWorkspaceStore:
                 Generator[tuple[str, list[str], list[str], int], None, None],
                 os.fwalk(".", dir_fd=dfd, follow_symlinks=False, onerror=_on_walk_error),
             )
-            #: B-236 —— 各对话 ``threads/<conv>/.seeded`` 标记的 mtime 与各文件的 ctime(纳秒),
+            #: B-236 —— 各对话 ``threads/<conv>/.seeded`` 的复制清单与各文件的 ctime(纳秒),
             #: 认原样副本用。
-            seeded_at: dict[str, int] = {}
+            seeded_at: SeedManifests = {}
+            too_deep = False
             ctimes: dict[str, int] = {}
             try:
                 with closing(walker):
@@ -1054,6 +1144,15 @@ class NasWorkspaceStore:
                         if dirpath == "." and hidden:
                             # B-236 —— ``agent_shared`` 不列各对话自己的 ``threads/``。
                             dirnames[:] = [d for d in dirnames if d not in hidden]
+                        if dirnames and _walk_depth(dirpath) >= MAX_WALK_DEPTH:
+                            # review 9 —— 再往下不走(fwalk 每深一层多握一个目录 fd),记一条日志。
+                            dirnames[:] = []
+                            if not too_deep:
+                                too_deep = True
+                                logger.warning(
+                                    "nas_workspace_store.list_files_depth_capped depth=%d",
+                                    MAX_WALK_DEPTH,
+                                )
                         _list_dir_entries(
                             prefix,
                             dirpath,
@@ -1215,7 +1314,12 @@ class NasWorkspaceStore:
                         _LEAF_FILE_MODE,
                         dir_fd=dfd,
                     )
-                    if not stat.S_ISREG(os.fstat(fd).st_mode):
+                    try:
+                        mode = os.fstat(fd).st_mode
+                    except OSError:
+                        os.close(fd)  # review 9 —— fstat 失败也不能漏掉这个 fd
+                        raise
+                    if not stat.S_ISREG(mode):
                         os.close(fd)
                         raise WorkspaceNotARegularFileError(
                             f"workspace path is not a regular file: {path!r}"

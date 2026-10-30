@@ -614,3 +614,153 @@ async def test_copies_are_dropped_before_the_listing_cap(
     )
 
     assert [e.path for e in scoped] == ["zz-report.md"]
+
+
+# ---------------------------------------------------------------------------
+# review 9 —— 认副本按开场复制的清单,不按时间
+# ---------------------------------------------------------------------------
+
+
+async def _views(tmp_path: Path) -> tuple[list[str], str]:
+    from orchestrator.tools.workspace_paths import WorkspaceView
+    from orchestrator.tools.workspace_tree import workspace_prompt_block
+
+    store = NasWorkspaceStore(root=str(tmp_path))
+    listed = await store.list_files(
+        tenant_id=_TENANT, user_id=_USER, scope=f"conversation:{_KEY}:{_C1}"
+    )
+    block = await workspace_prompt_block(
+        store,
+        tenant_id=_TENANT,
+        user_id=_USER,
+        view=WorkspaceView(agent_key=_KEY, conv_id=_C1, thread_id=_C1),
+    )
+    ours = block.split("## /workspace (this conversation)\n", 1)[1].split("\n\n", 1)[0]
+    return sorted(e.path for e in listed), ours
+
+
+async def test_outputs_written_before_a_late_seed_are_never_hidden(tmp_path: Path) -> None:
+    """(a) 第一次复制失败,模型在 ``reports/`` 里写了产出,第二次 run 复制成功:产出不是副本。"""
+    _put(_agent(tmp_path) / "customers" / "c.md", "c")
+    _put(_agent(tmp_path) / "reports" / "tpl.md", "t")
+    _put(_work(tmp_path) / "reports" / "q3.md", "run-1 output")
+    store = NasWorkspaceStore(root=str(tmp_path))
+    report = seed_mod.seed_conversation_sync(store, _TENANT, _USER, _KEY, _C1)
+    assert report is not None and report.skipped_existing == ("reports",)
+
+    listed, ours = await _views(tmp_path)
+
+    assert listed == ["reports/q3.md"]
+    assert "unchanged copy of /agent/reports/" not in ours
+    assert "unchanged copy of /agent/customers/" in ours
+
+
+async def test_a_renamed_copy_is_listed_and_not_called_a_copy(tmp_path: Path) -> None:
+    """(b) ``mv customers clients``:新名字下的路径不在清单里,照常列,块里不说它是副本。"""
+    _put(_agent(tmp_path) / "customers" / "c.md", "c")
+    store = NasWorkspaceStore(root=str(tmp_path))
+    seed_mod.seed_conversation_sync(store, _TENANT, _USER, _KEY, _C1)
+    os.rename(_work(tmp_path) / "customers", _work(tmp_path) / "clients")
+
+    listed, ours = await _views(tmp_path)
+
+    assert listed == ["clients/c.md"]
+    assert "unchanged copy" not in ours
+
+
+async def test_a_copy_missing_a_file_is_not_called_unchanged(tmp_path: Path) -> None:
+    """(c) 副本里删了一个文件:剩下的仍不列(它们仍是原样副本),但块里不再说「unchanged copy」。"""
+    for i in range(3):
+        _put(_agent(tmp_path) / "customers" / f"c{i}.md", "c")
+    store = NasWorkspaceStore(root=str(tmp_path))
+    seed_mod.seed_conversation_sync(store, _TENANT, _USER, _KEY, _C1)
+    (_work(tmp_path) / "customers" / "c1.md").unlink()
+
+    listed, ours = await _views(tmp_path)
+
+    assert listed == []
+    assert "unchanged copy of /agent/customers/" not in ours
+    assert "customers/" in ours
+
+
+@pytest.mark.parametrize("marker", ["garbage", "oversized", "fifo"])
+async def test_a_bad_marker_hides_nothing(tmp_path: Path, marker: str) -> None:
+    """标记坏了 / 太大 / 被换成 FIFO:一律当没有清单,什么都不藏(出错的方向是多列)。"""
+    _put(_agent(tmp_path) / "customers" / "c.md", "c")
+    store = NasWorkspaceStore(root=str(tmp_path))
+    seed_mod.seed_conversation_sync(store, _TENANT, _USER, _KEY, _C1)
+    m = _conv(tmp_path) / SEED_MARKER
+    valid = m.read_text()
+    m.unlink()
+    if marker == "garbage":
+        m.write_text("{not json")
+    elif marker == "oversized":
+        from orchestrator.tools.nas_workspace_store import MAX_SEED_MARKER_BYTES
+
+        m.write_text(valid + " " * MAX_SEED_MARKER_BYTES)  # 清单本身有效,只是太大
+    else:
+        os.mkfifo(m)
+    # FIFO 里先塞一份有效清单、写端一直开着:只看「读出来能不能解析」的话它会被当成清单。
+    held = os.open(m, os.O_RDWR | os.O_NONBLOCK) if marker == "fifo" else None
+    try:
+        if held is not None:
+            os.write(held, valid.encode())
+        listed, _ours = await _views(tmp_path)
+    finally:
+        if held is not None:
+            os.close(held)
+
+    assert listed == ["customers/c.md"]
+
+
+async def test_an_unreadable_marker_hides_nothing_and_raises_nothing(tmp_path: Path) -> None:
+    _put(_agent(tmp_path) / "customers" / "c.md", "c")
+    store = NasWorkspaceStore(root=str(tmp_path))
+    seed_mod.seed_conversation_sync(store, _TENANT, _USER, _KEY, _C1)
+    m = _conv(tmp_path) / SEED_MARKER
+    m.chmod(0)
+    try:
+        listed = await store.list_files(
+            tenant_id=_TENANT, user_id=_USER, scope=f"conversation:{_KEY}:{_C1}"
+        )
+        everything = await store.list_files(tenant_id=_TENANT, user_id=_USER)
+    finally:
+        m.chmod(0o600)
+    assert [e.path for e in listed] == ["customers/c.md"]
+    assert f"agents/{_KEY}/threads/{_C1}/work/customers/c.md" in [e.path for e in everything]
+
+
+async def test_too_large_names_are_capped_with_a_count(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """review 9 —— 「太大」目录名最多记 MAX_REPORTED_DIRS 个,再多只记个数(报告与标记都不跟着涨)。"""
+    monkeypatch.setattr(seed_mod, "MAX_SEED_VISITS", 2)
+    for j in range(seed_mod.MAX_REPORTED_DIRS + 15):
+        (_agent(tmp_path) / f"d{j:03d}").mkdir(parents=True)
+
+    report = await _seed(tmp_path)
+
+    assert report is not None
+    assert len(report.skipped_too_large) == seed_mod.MAX_REPORTED_DIRS
+    assert len(report.copied) + seed_mod.MAX_REPORTED_DIRS + report.skipped_too_large_more == (
+        seed_mod.MAX_REPORTED_DIRS + 15
+    )
+    marker = json.loads((_conv(tmp_path) / SEED_MARKER).read_text())
+    assert len(marker["skipped_too_large"]) == seed_mod.MAX_REPORTED_DIRS
+
+
+def test_a_copy_whose_size_no_longer_matches_is_listed() -> None:
+    """判据是 (大小, ctime) 两个都对上;只对上 ctime 不算原样(用户态造不出这种文件,直接喂函数)。"""
+    from orchestrator.tools.nas_workspace_store import _drop_seed_copies
+
+    conv = f"agents/{_KEY}/threads/{_C1}"
+    entries = [
+        WorkspaceFileEntry(path=f"{conv}/work/a.md", size=1),
+        WorkspaceFileEntry(path=f"{conv}/work/b.md", size=2),
+    ]
+    manifests = {conv: {"a.md": (1, 7), "b.md": (1, 7)}}
+    ctimes = {f"{conv}/work/a.md": 7, f"{conv}/work/b.md": 7}
+
+    kept = _drop_seed_copies((), entries, manifests, ctimes)
+
+    assert [e.path for e in kept] == [f"{conv}/work/b.md"]

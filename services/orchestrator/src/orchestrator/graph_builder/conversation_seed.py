@@ -29,15 +29,19 @@ from expert_work.common.observability import (
 from orchestrator.graph_builder._config import cancellation_token, configurable_uuid
 from orchestrator.graph_builder.memory import MemoryNode
 from orchestrator.state import AgentState
-from orchestrator.tools.conversation_seed import SeedQuotaGate, seed_conversation
+from orchestrator.tools.conversation_seed import (
+    MAX_REPORTED_DIRS,
+    SeedQuotaGate,
+    seed_conversation,
+)
 from orchestrator.tools.locks import KeyedLock
 from orchestrator.tools.nas_workspace_store import NasWorkspaceStore
 from orchestrator.tools.registry import ToolContext, workspace_view_fields
 
 logger = logging.getLogger(__name__)
 
-#: 记进状态的没复制目录最多几个、每个名字最多多长(review 7)。快照段渲染时还会再收一遍。
-MAX_REPORTED_DIRS = 20
+#: 记进状态的没复制目录名最多多长(review 7)。个数上限 :data:`MAX_REPORTED_DIRS` 在复制那一侧
+#: 就收住了。快照段渲染时还会再收一遍。
 MAX_REPORTED_NAME_CHARS = 120
 
 conversation_seed_total = expert_work_counter(

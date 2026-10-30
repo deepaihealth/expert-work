@@ -90,6 +90,10 @@ MAX_SEED_DEPTH = 12
 #: 实测最多 77 个文件,两遍不到 200;2000 是十倍余量,只防攻击形态。
 MAX_SEED_VISITS = 2000
 
+#: review 9 —— 报告 / 状态 / 标记里最多记多少个「太大」的目录名;再多只记个数。名字是沙箱能起的,
+#: 一个塞满几万个一级目录的 agent 根不能让标记与内存跟着涨。
+MAX_REPORTED_DIRS = 20
+
 #: run 被取消后最多等复制线程这么久再放锁(秒)。见 :func:`_drain`。
 CANCEL_DRAIN_S = 120.0
 
@@ -143,7 +147,17 @@ class _Budget:
     stop: threading.Event | None = None
     copied: list[str] = field(default_factory=list)
     too_large: list[str] = field(default_factory=list)
+    #: 超过 :data:`MAX_REPORTED_DIRS` 之后没记名字的「太大」目录个数。
+    too_large_more: int = 0
     existing: list[str] = field(default_factory=list)
+    #: review 9 —— 这次真正写进 ``work/`` 的每个文件:``(work/ 相对路径, 大小, ctime 纳秒)``。
+    manifest: list[tuple[str, int, int]] = field(default_factory=list)
+
+    def report_too_large(self, name: str) -> None:
+        if len(self.too_large) < MAX_REPORTED_DIRS:
+            self.too_large.append(name)
+        else:
+            self.too_large_more += 1
 
     def tally(self) -> _Tally:
         return _Tally(budget=self, max_bytes=self.bytes, max_entries=self.entries)
@@ -172,6 +186,8 @@ class _Tally:
     entries: int = 0
     #: 跳过的条目:符号链接、FIFO / 设备 / socket、编码不成 UTF-8 的名字。
     skipped: int = 0
+    #: 复制写出的文件 ``(work/ 相对路径, 大小, ctime)``;目录改名进 ``work/`` 之后才并进清单。
+    files: list[tuple[str, int, int]] = field(default_factory=list)
 
     def take(self, *, size: int = 0, entries: int = 1) -> None:
         self.bytes += size
@@ -190,8 +206,10 @@ class SeedReport:
     """一次复制的结果。目录名只给调用方用(写进状态、告诉模型),日志里只记个数。"""
 
     copied: tuple[str, ...] = ()
-    #: 超出上限、整个没复制的目录 —— 只在 ``/agent/<目录>/``。
+    #: 超出上限、整个没复制的目录 —— 只在 ``/agent/<目录>/``(最多 :data:`MAX_REPORTED_DIRS` 个)。
     skipped_too_large: tuple[str, ...] = ()
+    #: 超过上面那个上限、没记名字的「太大」目录个数。
+    skipped_too_large_more: int = 0
     #: 本对话 ``work/`` 里已经有同名条目、不覆盖的目录。
     skipped_existing: tuple[str, ...] = ()
     #: 用户工作区配额满了、一个都没复制的目录(review 7)。
@@ -200,6 +218,9 @@ class SeedReport:
     skipped_entries: int = 0
     bytes_copied: int = 0
     entries_copied: int = 0
+    #: review 9 —— 复制写出的每个文件 ``(work/ 相对路径, 大小, ctime 纳秒)``,写进标记。浏览列表
+    #: 据此认「原样副本」:在清单里、且现在的大小与 ctime 都没变。
+    manifest: tuple[tuple[str, int, int], ...] = ()
 
 
 def _utf8(name: str) -> bool:
@@ -258,7 +279,7 @@ def _keep_times(fd: int, info: os.stat_result) -> None:
     os.utime(fd, ns=(info.st_atime_ns, info.st_mtime_ns))
 
 
-def _copy_file(src_dir: int, dst_dir: int, name: str, tally: _Tally) -> None:
+def _copy_file(src_dir: int, dst_dir: int, name: str, tally: _Tally, rel: str) -> None:
     try:
         src = os.open(name, _READ_FLAGS, dir_fd=src_dir)
     except OSError:
@@ -289,16 +310,20 @@ def _copy_file(src_dir: int, dst_dir: int, name: str, tally: _Tally) -> None:
                 while view:
                     view = view[os.write(dst, view) :]
             _keep_times(dst, info)
+            # 最后一次改它的就是上面的 utime:此刻的 ctime 记进清单,之后任何写入 / 改权限 /
+            # touch 都会让它对不上。
+            done = os.fstat(dst)
+            tally.files.append((rel, done.st_size, done.st_ctime_ns))
         finally:
             os.close(dst)
     finally:
         os.close(src)
 
 
-def _copy_dir(src_dir: int, dst_dir: int, depth: int, tally: _Tally) -> None:
+def _copy_dir(src_dir: int, dst_dir: int, depth: int, tally: _Tally, prefix: str) -> None:
     for name, info in _children(src_dir, tally):
         if stat.S_ISREG(info.st_mode):
-            _copy_file(src_dir, dst_dir, name, tally)
+            _copy_file(src_dir, dst_dir, name, tally, f"{prefix}{name}")
             continue
         if depth >= MAX_SEED_DEPTH:
             raise _TooLargeError
@@ -309,7 +334,7 @@ def _copy_dir(src_dir: int, dst_dir: int, depth: int, tally: _Tally) -> None:
             tally.take()
             out = _openat_dir(dst_dir, name, create=True)
             try:
-                _copy_dir(sub, out, depth + 1, tally)
+                _copy_dir(sub, out, depth + 1, tally, f"{prefix}{name}/")
                 _keep_times(out, os.fstat(sub))
             finally:
                 os.close(out)
@@ -346,7 +371,7 @@ def _candidates(agent_fd: int, budget: _Budget) -> list[str]:
         if capped:
             with contextlib.suppress(OSError):
                 if _utf8(name) and entry.is_dir(follow_symlinks=False):
-                    budget.too_large.append(name)
+                    budget.report_too_large(name)
             continue
         if not _utf8(name):
             budget.skipped += 1
@@ -373,7 +398,7 @@ def _measure_one(agent_fd: int, name: str, budget: _Budget) -> _Tally | None:
         measured.take()
         _measure(src, 1, measured)
     except _TooLargeError:
-        budget.too_large.append(name)
+        budget.report_too_large(name)
         return None
     finally:
         os.close(src)
@@ -394,13 +419,13 @@ def _seed_one(agent_fd: int, tmp_fd: int, work_fd: int, name: str, budget: _Budg
             copied.take()
             out = _openat_dir(tmp_fd, name, create=True)
             try:
-                _copy_dir(src, out, 1, copied)
+                _copy_dir(src, out, 1, copied, f"{name}/")
                 _keep_times(out, os.fstat(src))
             finally:
                 os.close(out)
         except _TooLargeError:  # 量完之后又变大了
             shutil.rmtree(name, dir_fd=tmp_fd)
-            budget.too_large.append(name)
+            budget.report_too_large(name)
             return
         finally:
             budget.skipped += copied.skipped
@@ -417,6 +442,7 @@ def _seed_one(agent_fd: int, tmp_fd: int, work_fd: int, name: str, budget: _Budg
         return
     budget.spend(copied)
     budget.copied.append(name)
+    budget.manifest.extend(copied.files)
 
 
 def _conversation_dir(
@@ -451,9 +477,12 @@ def seeded(
 def _write_marker(conv_fd: int, report: SeedReport) -> None:
     body = json.dumps(
         {
-            "version": 1,
+            "version": 2,
             "copied": list(report.copied),
             "skipped_too_large": list(report.skipped_too_large),
+            "skipped_too_large_more": report.skipped_too_large_more,
+            # review 9 —— 浏览列表认「原样副本」的唯一依据(见 ``nas_workspace_store``)。
+            "files": [list(f) for f in report.manifest],
             "skipped_existing": list(report.skipped_existing),
             "skipped_quota": list(report.skipped_quota),
             "skipped_entries": report.skipped_entries,
@@ -543,7 +572,7 @@ def seed_conversation_sync(
                         if _exists(work_fd, name):
                             budget.existing.append(name)
                         elif budget.visits >= MAX_SEED_VISITS:
-                            budget.too_large.append(name)  # 看过的名字到顶:不再碰它
+                            budget.report_too_large(name)  # 看过的名字到顶:不再碰它
                         else:
                             _seed_one(agent_fd, tmp_fd, work_fd, name, budget)
                 finally:
@@ -557,10 +586,12 @@ def seed_conversation_sync(
         report = SeedReport(
             copied=tuple(budget.copied),
             skipped_too_large=tuple(budget.too_large),
+            skipped_too_large_more=budget.too_large_more,
             skipped_existing=tuple(budget.existing),
             skipped_entries=budget.skipped,
             bytes_copied=_max_bytes() - budget.bytes,
             entries_copied=_max_entries() - budget.entries,
+            manifest=tuple(budget.manifest),
         )
         _write_marker(conv_fd, report)
         return report

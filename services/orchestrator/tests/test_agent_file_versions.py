@@ -301,24 +301,55 @@ async def test_a_run_ending_after_the_user_was_purged_writes_nothing(tmp_path: P
 # ---------------------------------------------------------------------------
 
 
-async def test_the_observing_agent_pays_for_the_cap_first(
+async def test_the_newest_version_of_a_file_is_never_pruned(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """超了上限先删这次观察的 agent 自己的旧版本;别的 agent 的历史不因它改得勤被挤掉。"""
-    monkeypatch.setattr(versions_mod, "MAX_USER_VERSION_BYTES", 6_000)
-    other = tmp_path / str(_TENANT) / str(_USER) / "agents" / "other-bbbbbbbb"
-    _put(other / "keep.md", "o" * 1_000)
-    await _store(tmp_path).observe(tenant_id=_TENANT, user_id=_USER, agent_key="other-bbbbbbbb")
-    await asyncio.sleep(0.01)
-    tpl = _agent(tmp_path) / "tpl" / "t.md"
-    for i in range(8):
+    """review 9 —— 合计超了上限,每个文件最新的那份也留着:不让任何文件一份历史都没有。"""
+    monkeypatch.setattr(versions_mod, "MAX_USER_VERSION_BYTES", 1_000)
+    _put(_agent(tmp_path) / "big.md", "b" * 5_000)
+    await _observe(tmp_path)
+    assert _history(tmp_path) == {"big.md": ["b" * 5_000]}
+
+
+async def test_the_largest_consumer_pays_first(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """review 9 —— 一个旧历史很占地方的 agent 先让出空间;刚改了文件的小 agent 历史照留。"""
+    monkeypatch.setattr(versions_mod, "MAX_USER_VERSION_BYTES", 10_000)
+    bulky = tmp_path / str(_TENANT) / str(_USER) / "agents" / "bulky-bbbbbbbb"
+    store = _store(tmp_path)
+    for i in range(4):
+        f = _put(bulky / "big.md", f"{i}".ljust(2_000, "b"))
+        os.utime(f, ns=(i * 10**9 + 1, i * 10**9 + 1))
+        await store.observe(tenant_id=_TENANT, user_id=_USER, agent_key="bulky-bbbbbbbb")
+        await asyncio.sleep(0.01)
+    tpl = _agent(tmp_path) / "t.md"
+    for i in range(3):
         _put(tpl, f"{i}".ljust(1_000, "x"))
         os.utime(tpl, ns=(i * 10**9 + 1, i * 10**9 + 1))
         await _observe(tmp_path)
 
-    others = list((_versions_root(tmp_path) / "other-bbbbbbbb").rglob("v*"))
-    assert len(others) == 1  # 另一个 agent 唯一的那份还在
-    assert _version_bytes(tmp_path) <= 6_000
+    assert len(_history(tmp_path)["t.md"]) == 3  # 小的那个一份都没丢
+    assert len(list((_versions_root(tmp_path) / "bulky-bbbbbbbb").rglob("v*"))) == 3
+    assert _version_bytes(tmp_path) <= 10_000
+
+
+async def test_dirs_of_deleted_sources_go_before_stable_live_files(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """review 9 —— 版本目录超了上限:先删源文件已不见的,不是先删一直没改的活文件。"""
+    agent = _agent(tmp_path)
+    _put(agent / "stable.md", "s")
+    await _observe(tmp_path)
+    gone = _put(agent / "gone.md", "g")
+    await _observe(tmp_path)
+    gone.unlink()
+    await _observe(tmp_path)  # gone.md 记下「不见」(这一步刷新了它版本目录的 mtime)
+    monkeypatch.setattr(versions_mod, "MAX_VERSION_DIRS_PER_AGENT", 2)
+    _put(agent / "new.md", "n")
+    await _observe(tmp_path)
+
+    assert set(_history(tmp_path)) == {"stable.md", "new.md"}
 
 
 async def test_version_dirs_per_agent_are_capped(

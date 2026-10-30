@@ -369,7 +369,7 @@ def _housekeep(root: str, tenant_id: UUID, user_id: UUID, agent_key: str, scan: 
                     _enforce_dir_cap(agent_dir, scan)
                 finally:
                     os.close(agent_dir)
-            _enforce_user_cap(user_fd, scan, agent_key)
+            _enforce_user_cap(user_fd, scan)
     finally:
         os.close(user_fd)
 
@@ -423,34 +423,72 @@ def _sweep_missing(agent_dir: int, scan: _Scan, now: float) -> None:
             scan.dropped += 1
 
 
+def _drop_order(agent_dir: int, key: str) -> tuple[int, int]:
+    """版本目录的删除先后:源文件已不见(有 ``missing`` 标记)的排最前,其次按最新那份版本写下的
+    时间(ctime)从旧到新;打不开 / 没有版本的最先。"""
+    try:
+        file_dir = _openat_dir(agent_dir, key, create=False)
+    except OSError:
+        return (0, 0)
+    try:
+        live = 0 if _exists_at(file_dir, _MISSING_FILE) else 1
+        versions = _versions(file_dir)
+        if not versions:
+            return (0, 0)
+        return (live, os.lstat(versions[-1][2], dir_fd=file_dir).st_ctime_ns)
+    except OSError:
+        return (0, 0)
+    finally:
+        os.close(file_dir)
+
+
+def _exists_at(dir_fd: int, name: str) -> bool:
+    try:
+        os.lstat(name, dir_fd=dir_fd)
+    except FileNotFoundError:
+        return False
+    return True
+
+
 def _enforce_dir_cap(agent_dir: int, scan: _Scan) -> None:
-    """本 agent 的版本目录超过 :data:`MAX_VERSION_DIRS_PER_AGENT`:按目录最近一次变动从旧到新
-    整个删掉,直到不超。"""
+    """本 agent 的版本目录超过 :data:`MAX_VERSION_DIRS_PER_AGENT`:整个删掉一些,直到不超。
+
+    review 9 —— 先删源文件已经不见的(``missing`` 标记在),再按目录里**最新那份版本**写下的时间
+    从旧到新。不按目录 mtime:``missing`` 标记的建与撤会刷新目录 mtime,按它排,已经删掉的源文件
+    反而显得「新」,还活着、只是一直没改的文件先丢了历史。"""
     keys = os.listdir(agent_dir)
     excess = len(keys) - MAX_VERSION_DIRS_PER_AGENT
     if excess <= 0:
         return
-    aged: list[tuple[int, str]] = []
-    for key in keys:
-        with contextlib.suppress(FileNotFoundError):
-            info = os.lstat(key, dir_fd=agent_dir)
-            if stat.S_ISDIR(info.st_mode):
-                aged.append((info.st_mtime_ns, key))
-    for _mtime, key in sorted(aged)[:excess]:
-        shutil.rmtree(key, dir_fd=agent_dir)
-        scan.dropped += 1
+    aged = sorted((_drop_order(agent_dir, key), key) for key in keys)
+    for _order, key in aged[:excess]:
+        with contextlib.suppress(FileNotFoundError, NotADirectoryError):
+            shutil.rmtree(key, dir_fd=agent_dir)
+            scan.dropped += 1
 
 
-def _enforce_user_cap(user_fd: int, scan: _Scan, observing: str) -> None:
-    """用户合计超过上限:从最早写下(ctime)的版本删起,**先删这次观察的 agent 自己的**,它一个
-    删不回上限才动别的 agent 的(同样从最早的起)。
+@dataclass
+class _Candidate:
+    ctime: int
+    agent: str
+    key: str
+    name: str
+    size: int
 
-    review 8 —— 选「观察者先付」而不是按 agent 平分:超限只会在某次观察写了新版本之后发生,
-    让写的那个 agent 先让出空间,别的 agent 的历史不会因为另一个 agent 改得勤而被挤掉;平分
-    要先定「份额」(按 agent 数?按用量?),agent 数会变,份额跟着漂移,收益不抵复杂度。
+
+def _enforce_user_cap(user_fd: int, scan: _Scan) -> None:
+    """用户合计超过上限时删版本,直到不超或者没有可删的(review 9):
+
+    * **每个文件最新的那份版本从不删** —— 任何一个 agent 都不会被删到「一份历史都没有」。
+    * 其余版本里,**用得最多的 agent 先付**(按它当前占的字节),它内部从最早写下(ctime)的删起;
+      每删一份重新比一次谁用得最多。
+
+    取代 review 8 的「观察者先付」:那样一个旧历史很占地方的 agent,能让另一个刚改了文件的
+    agent 一份历史都留不住。最新版本加起来仍受「单文件 8 MiB 乘每个 agent 2000 个目录」约束。
     """
-    found: list[tuple[int, str, str, str, int]] = []  # (ctime, agent, key, name, size)
     total = 0
+    used: dict[str, int] = {}
+    candidates: dict[str, list[_Candidate]] = {}
     for agent_key in os.listdir(user_fd):
         try:
             agent_dir = _openat_dir(user_fd, agent_key, create=False)
@@ -463,32 +501,40 @@ def _enforce_user_cap(user_fd: int, scan: _Scan, observing: str) -> None:
                 except OSError:
                     continue
                 try:
-                    for name in os.listdir(file_dir):
-                        if not _VERSION_RE.match(name):
-                            continue
+                    versions = _versions(file_dir)
+                    for i, (_seq, _sha, name) in enumerate(versions):
                         info = os.lstat(name, dir_fd=file_dir)
-                        found.append((info.st_ctime_ns, agent_key, key, name, info.st_size))
                         total += info.st_size
+                        used[agent_key] = used.get(agent_key, 0) + info.st_size
+                        if i < len(versions) - 1:  # 最新那份不进候选
+                            candidates.setdefault(agent_key, []).append(
+                                _Candidate(info.st_ctime_ns, agent_key, key, name, info.st_size)
+                            )
                 finally:
                     os.close(file_dir)
         finally:
             os.close(agent_dir)
-    found.sort(key=lambda f: (f[1] != observing, f[0]))
-    for _ctime, agent_key, key, name, size in found:
-        if total <= MAX_USER_VERSION_BYTES:
+    for queue in candidates.values():
+        queue.sort(key=lambda c: c.ctime, reverse=True)  # 从尾巴 pop 最早的
+    while total > MAX_USER_VERSION_BYTES:
+        payers = [a for a, queue in candidates.items() if queue]
+        if not payers:
             return
-        agent_dir = _openat_dir(user_fd, agent_key, create=False)
+        payer = max(payers, key=lambda a: used[a])
+        victim = candidates[payer].pop()
+        agent_dir = _openat_dir(user_fd, victim.agent, create=False)
         try:
-            file_dir = _openat_dir(agent_dir, key, create=False)
+            file_dir = _openat_dir(agent_dir, victim.key, create=False)
             try:
                 with contextlib.suppress(FileNotFoundError):
-                    os.unlink(name, dir_fd=file_dir)
+                    os.unlink(victim.name, dir_fd=file_dir)
                     scan.pruned += 1
             finally:
                 os.close(file_dir)
         finally:
             os.close(agent_dir)
-        total -= size
+        total -= victim.size
+        used[payer] -= victim.size
 
 
 def _read_all(fd: int, size: int) -> bytes:

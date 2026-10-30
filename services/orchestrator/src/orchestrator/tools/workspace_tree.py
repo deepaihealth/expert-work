@@ -61,11 +61,16 @@ from datetime import datetime
 from uuid import UUID
 
 from expert_work.persistence import WORKSPACE_RESERVED_PREFIXES
+from expert_work.persistence.workspace.layout import WORKSPACE_SEED_MARKER as SEED_MARKER
 from orchestrator.tools.error_classifier import EXISTENCE_UNKNOWN
-from orchestrator.tools.nas_workspace_store import MISSING_DIR_ERRORS
+from orchestrator.tools.nas_workspace_store import (
+    MAX_SEED_MARKER_BYTES,
+    MISSING_DIR_ERRORS,
+    parse_seed_manifest,
+)
 from orchestrator.tools.sandbox_image_contract import AGENT_VIEW, EXEC_VIEW
-from orchestrator.tools.workspace_paths import WorkspaceView
-from orchestrator.tools.workspace_scope import store_scope
+from orchestrator.tools.workspace_paths import THREADS_DIR, WorkspaceView
+from orchestrator.tools.workspace_scope import agent_scope, store_scope
 from orchestrator.tools.workspace_store import WorkspaceFileEntry, WorkspaceStore
 
 logger = logging.getLogger(__name__)
@@ -276,21 +281,30 @@ def render_workspace_block(
 
 
 def _seed_copies(
-    conversation: Sequence[WorkspaceFileEntry], pristine: frozenset[str]
+    conversation: Sequence[WorkspaceFileEntry],
+    pristine: frozenset[str],
+    manifest: frozenset[str],
 ) -> frozenset[str]:
     """本对话里哪些一级目录整个是开场复制进来、之后一个文件都没碰过的副本。
 
-    ``pristine`` 是存储认出来的原样副本(按对话路径;NAS 实现按 ctime 与 ``.seeded`` 标记比,
-    见 ``nas_workspace_store._drop_seed_copies``)。目录里只要有一个文件不在其中 —— 本对话改过、
-    新写的 —— 整个目录就照常展开:那是这个对话自己的改动,模型要看得见。
+    review 9 —— 三件事同时成立才算:开场复制清单(``manifest``,本对话 ``work/`` 相对路径)里在
+    这个目录下的文件**一个不少**都还在;它们都还是原样副本(``pristine``,存储按清单与 ctime 认的,
+    见 ``nas_workspace_store._drop_seed_copies``);目录下没有清单之外的文件。删过一个、改过一个、
+    新写一个、整个目录改了名(``mv customers clients`` —— 新名字下的路径不在清单里),都照常展开:
+    那是这个对话自己的改动,模型要看得见,也不能对它说「这是 /agent 里某目录的原样副本」。
     """
-    by_top: dict[str, list[str]] = {}
+    by_top: dict[str, set[str]] = {}
     for e in conversation:
         top, sep, _rest = e.path.partition("/")
         if sep:
-            by_top.setdefault(top, []).append(e.path)
+            by_top.setdefault(top, set()).add(e.path)
+    expected: dict[str, set[str]] = {}
+    for path in manifest:
+        top, sep, _rest = path.partition("/")
+        if sep:
+            expected.setdefault(top, set()).add(path)
     return frozenset(
-        name for name, paths in by_top.items() if all(path in pristine for path in paths)
+        name for name, paths in by_top.items() if paths == expected.get(name) and paths <= pristine
     )
 
 
@@ -326,6 +340,7 @@ def render_conversation_block(
     agent: Sequence[WorkspaceFileEntry],
     *,
     pristine: frozenset[str] = frozenset(),
+    manifest: frozenset[str] = frozenset(),
     seed_skipped: Sequence[str] = (),
     seed_quota_blocked: bool = False,
     max_expanded: int = DEFAULT_MAX_EXPANDED,
@@ -343,7 +358,7 @@ def render_conversation_block(
     """
     if not conversation and not agent and not seed_skipped:
         return ""
-    copies = _seed_copies(conversation, pristine)
+    copies = _seed_copies(conversation, pristine, manifest)
     own = [e for e in conversation if e.path.partition("/")[0] not in copies]
     conv_tree, used = _render_tree(own, max_expanded=max_expanded)
     agent_tree, _ = _render_tree(agent, max_expanded=max(max_expanded - used, 0))
@@ -402,6 +417,7 @@ async def workspace_prompt_block(
             outputs = await store.list_files(tenant_id=tenant_id, user_id=user_id, scope=conv_scope)
         except MISSING_DIR_ERRORS:
             conversation = outputs = []
+        manifest = await _seed_manifest(store, tenant_id=tenant_id, user_id=user_id, view=view)
     except Exception:
         logger.warning(
             "workspace_tree.listing_failed agent_key=%s — workspace block omitted",
@@ -414,7 +430,30 @@ async def workspace_prompt_block(
         conversation,
         agent,
         pristine=frozenset(e.path for e in conversation if e.path not in kept),
+        manifest=manifest,
         seed_skipped=seed_skipped,
         seed_quota_blocked=seed_quota_blocked,
         max_expanded=max_expanded,
     )
+
+
+async def _seed_manifest(
+    store: WorkspaceStore, *, tenant_id: UUID, user_id: UUID, view: WorkspaceView
+) -> frozenset[str]:
+    """本对话开场复制清单里的路径(``work/`` 相对);读不到 / 没有 / 坏了 → 空(什么都不收成一行)。
+
+    经存储读(按 fd 走、``O_NONBLOCK``、有大小上限),不另开一条路径。
+    """
+    assert view.conv_id is not None  # noqa: S101 - 只在对话视图里调
+    try:
+        data = await store.read_file(
+            tenant_id=tenant_id,
+            user_id=user_id,
+            path=f"{THREADS_DIR}/{view.conv_id}/{SEED_MARKER}",
+            scope=agent_scope(view.agent_key),
+            max_bytes=MAX_SEED_MARKER_BYTES,
+        )
+    except Exception:
+        return frozenset()
+    manifest = parse_seed_manifest(data)
+    return frozenset(manifest) if manifest else frozenset()

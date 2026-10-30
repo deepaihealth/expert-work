@@ -707,9 +707,9 @@ def _raise_for_store_error(exc: SandboxSupervisorError, *, tool: str) -> NoRetur
 
     B-84 —— 读路径挪到宿主之后, 失败不再是沙箱片段打印的 ``{"ok": false, "error":
     ...}``, 而是 store 抛的异常。**模型看到的 kind 必须逐字不变**(``not_found`` /
-    ``is_a_directory`` / ``not_a_directory`` / ``file_too_large`` / ``io_error``, 越权
-    仍是 :class:`ToolBlockedError`), 所以这里按**类型**分叉, 不按消息文本 —— 文本
-    匹配是下一个人改一句文案就静默失效的那种判据。
+    ``is_a_directory`` / ``not_a_directory`` / ``file_too_large`` / ``io_error``;B-236 起
+    FIFO / 设备 / socket 是 ``not_a_regular_file``;越权仍是 :class:`ToolBlockedError`),
+    所以这里按**类型**分叉, 不按消息文本 —— 文本匹配是下一个人改一句文案就静默失效的那种判据。
 
     窄类型必须排在基类前面:它们都是 :class:`SandboxSupervisorError` 的子类。
     """

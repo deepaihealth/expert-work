@@ -482,7 +482,10 @@ def test_an_unchanged_seed_copy_takes_one_line_and_no_budget() -> None:
         _entry("mine.md"),
     ]
     pristine = frozenset({*(f"style/s{i}.md" for i in range(20)), "tpl/u.md"})
-    block = render_conversation_block(conv, agent, pristine=pristine, max_expanded=24)
+    manifest = frozenset({*(f"style/s{i}.md" for i in range(20)), "tpl/t.md", "tpl/u.md"})
+    block = render_conversation_block(
+        conv, agent, pristine=pristine, manifest=manifest, max_expanded=24
+    )
     ours = block.split(CONVERSATION_SECTION + "\n", 1)[1].split("\n\n", 1)[0]
     assert "  style/" in ours and "unchanged copy of /agent/style/" in ours
     assert "s0.md" not in ours  # 未改动的副本不展开

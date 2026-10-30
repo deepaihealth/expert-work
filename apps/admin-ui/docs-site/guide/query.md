@@ -485,7 +485,9 @@ curl -X DELETE "https://<your-domain>/v1/agents/{agent_code}/sessions/{session_i
 
 每个会话有自己的工作目录，Agent 在会话里写出的文件放在这里，`path` 的形态是 `threads/{session_id}/work/…`，响应里的 `session_id` 指明是哪个会话。不在任何会话工作目录里的文件是 Agent 级文件，由这个 Agent 的所有会话共用，`session_id` 为 `null`。
 
-会话开始时，平台把 Agent 级的目录复制一份到这个会话的工作目录。复制过来之后没有改动过的文件不出现在列表里，它们与 Agent 级的同名文件内容相同；会话里改动过的文件和新写的文件照常列出。
+会话开始时，平台把 Agent 级的目录复制一份到这个会话的工作目录。复制过来之后没有改动过的文件不出现在列表里；会话里改动过的文件和新写的文件照常列出。
+
+不列出的这些文件是会话开始时 Agent 级同名文件的副本，之后 Agent 级文件可能已经改动，两者的内容不一定相同。需要会话里那一份的，按 `threads/{session_id}/work/<同一相对路径>` 下载。
 
 ### 列出文件
 

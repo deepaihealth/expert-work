@@ -109,3 +109,76 @@ async def test_read_file_tool_calls_a_fifo_not_a_regular_file(tmp_path: Path) ->
                 {"path": "notes.md"}, ctx=ctx
             ),
         )
+
+
+# ---------------------------------------------------------------------------
+# review 9 —— 遍历深度封顶、write_file 的 fstat 失败不漏 fd
+# ---------------------------------------------------------------------------
+
+
+def _deep(root: Path, depth: int) -> None:
+    d = root / str(_TENANT) / str(_USER) / "deep"
+    for _ in range(depth):
+        d = d / "d"
+    d.mkdir(parents=True)
+    (d / "leaf.txt").write_text("x")
+    (root / str(_TENANT) / str(_USER) / "shallow.txt").write_text("y")
+
+
+async def test_listing_stops_descending_past_the_depth_cap(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from orchestrator.tools import nas_workspace_store as nws
+
+    monkeypatch.setattr(nws, "MAX_WALK_DEPTH", 8)
+    _deep(tmp_path, 20)
+    files = await NasWorkspaceStore(root=str(tmp_path)).list_files(tenant_id=_TENANT, user_id=_USER)
+    assert [e.path for e in files] == ["shallow.txt"]
+
+
+async def test_search_past_the_depth_cap_is_reported_truncated(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from orchestrator.tools import nas_workspace_store as nws
+
+    monkeypatch.setattr(nws, "MAX_WALK_DEPTH", 8)
+    _deep(tmp_path, 20)
+    result = await NasWorkspaceStore(root=str(tmp_path)).search_files(
+        tenant_id=_TENANT, user_id=_USER, name_glob="*.txt"
+    )
+    assert [e.path for e in result.entries] == ["shallow.txt"]
+    assert result.truncated is True
+
+
+async def test_write_file_closes_its_fd_when_fstat_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from orchestrator.tools import nas_workspace_store as nws
+
+    opened: list[int] = []
+    closed: list[int] = []
+    real_open, real_close, real_fstat = os.open, os.close, os.fstat
+
+    def spy_open(*args: Any, **kwargs: Any) -> int:
+        fd = real_open(*args, **kwargs)
+        if args and args[0] == "out.txt":
+            opened.append(fd)
+        return fd
+
+    def spy_close(fd: int) -> None:
+        closed.append(fd)
+        real_close(fd)
+
+    def failing_fstat(fd: int) -> os.stat_result:
+        if fd in opened:
+            raise OSError(5, "EIO")
+        return real_fstat(fd)
+
+    monkeypatch.setattr(nws.os, "open", spy_open)
+    monkeypatch.setattr(nws.os, "close", spy_close)
+    monkeypatch.setattr(nws.os, "fstat", failing_fstat)
+    with pytest.raises(SandboxSupervisorError):
+        await NasWorkspaceStore(root=str(tmp_path)).write_file(
+            tenant_id=_TENANT, user_id=_USER, path="out.txt", data=b"x"
+        )
+    assert opened and opened[0] in closed
