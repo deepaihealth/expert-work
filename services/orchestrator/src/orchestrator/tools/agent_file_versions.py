@@ -80,8 +80,9 @@ MAX_AGENT_VERSION_BYTES = 100 * 1024 * 1024
 #: (空文件能把目录数顶满,字节预算挡不住,索引的历史就这样被整个删掉过)。
 MAX_VERSION_DIRS_PER_AGENT = 2000
 
-#: review 10 —— 没有 ``path`` 或一份版本都没有的版本目录,建了满这么久还这样就删掉(正常写入
-#: 是建目录、写 ``path``、写版本一气呵成;留一小时是不跟另一次同时进行的观察抢)。
+#: review 10/14 —— 一份版本都没有的版本目录(孤儿),建了满这么久还这样就删掉(正常写入是建目录、
+#: 写 ``path``、写版本一气呵成;留一小时是不跟另一次同时进行的观察抢)。有版本、只是 ``path`` 坏了的
+#: 不是孤儿。review 15 —— 版本目录里写到一半被杀留下的 ``.tmp-*`` 也按这个时长清掉。
 ORPHAN_DIR_GRACE_S = 3600
 
 #: review 11/13 —— 受保护、预算吃紧也不删的最新几份:活的(或这次没法确认的)文件 2 份,源文件
@@ -92,9 +93,9 @@ MIN_KEPT_LIVE_VERSIONS = 2
 MIN_KEPT_MISSING_VERSIONS = 1
 MIN_KEPT_INDEX_VERSIONS = 3
 
-#: review 13 —— 一次观察遍历最多看多少个名字(所有目录合计,含跳过的点开头 / 保留 / 非 UTF-8
-#: 名字)。到顶就停,到顶时手上那个目录算「没列全」(里面没看到的文件既不算在也不算不见)。
-#: 与开场复制同一个数。
+#: review 13/14 —— 一次观察遍历最多看多少个名字(所有目录合计,含跳过的点开头 / 保留 / 非 UTF-8
+#: 名字)。到顶就不再读新名字;已经读到的照常处理,到顶时正在读的目录和之后才打开的目录算「没列全」
+#: (里面没看到的文件「不知道」)。与开场复制同一个数。
 MAX_OBSERVE_VISITS = MAX_SEED_VISITS
 
 #: review 7 —— 源文件从 ``/agent`` 消失满这么久,它的版本目录整个删掉。「从哪天起不见」记在
@@ -188,17 +189,24 @@ class _Scan:
     present_dirs: set[str] = field(default_factory=set)
     #: review 13 —— 索引在不在,单独查的(不受条目上限影响);``None`` = 没查。
     index_present: bool | None = None
+    #: review 15 —— 单独查索引时出了「不存在」以外的错(根目录可读不可进 ``0644`` 之类):索引这次
+    #: 「不知道」。不能只留 ``index_present=None`` —— 那样根目录里只有索引和点开头的名字时,根目录
+    #: 算「列全了」,一个好好在着的索引会被判不见。
+    index_unknown: bool = False
     over_reasons: set[str] = field(default_factory=set)
 
     def status(self, rel: str) -> str:
         """``live`` / ``missing`` / ``unknown`` —— 源文件这次在不在(review 13,按目录判)。
 
         看到了就是在。没看到:一路往下,每一层都列全了、下一段却不在那一层里(或那一层列全了却
-        没有这个文件),才算不见;中间哪一层没列全(打不开、太深、上限到顶)就是不知道 —— 不知道
-        的按在算(全额保护),也不动它的 ``missing`` 标记。索引单独查过,查的结果说了算。
+        没有这个文件),才算不见;中间哪一层没列全(打不开、读不了、太深、上限到顶)就是不知道 ——
+        不知道的按在算(全额保护),并撤掉它的 ``missing`` 标记(review 14,见 :func:`_sweep`)。索引
+        单独查过,查的结果说了算(查出错就是不知道)。
         """
         if rel in self.seen:
             return "live"
+        if rel == AGENT_NOTES_FILE and self.index_unknown:
+            return "unknown"
         if rel == AGENT_NOTES_FILE and self.index_present is not None:
             return "live" if self.index_present else "missing"
         parts = rel.split("/")
@@ -270,14 +278,18 @@ def _files(dir_fd: int, prefix: str, depth: int, scan: _Scan) -> Iterator[tuple[
     if scan.visits_exhausted:
         complete = False
     else:
-        with os.scandir(dir_fd) as it:
-            for entry in it:
-                scan.visits += 1
-                if scan.visits > MAX_OBSERVE_VISITS:
-                    scan.visits_exhausted = True
-                    complete = False
-                    break
-                names.append(entry.name)
+        try:
+            with os.scandir(dir_fd) as it:
+                for entry in it:
+                    scan.visits += 1
+                    if scan.visits > MAX_OBSERVE_VISITS:
+                        scan.visits_exhausted = True
+                        complete = False
+                        break
+                    names.append(entry.name)
+        except OSError:
+            complete = False  # review 15 —— 读目录出错:读到的照常处理,这一层没列全
+
     for name in sorted(names):
         if scan.stopped:
             complete = False
@@ -297,9 +309,10 @@ def _files(dir_fd: int, prefix: str, depth: int, scan: _Scan) -> Iterator[tuple[
             break
         try:
             info = os.lstat(name, dir_fd=dir_fd)
-        except FileNotFoundError:
-            # review 14 —— 读目录时还在、``lstat`` 时没了(正被改名之类):这一层算没列全,不据此
-            # 判下面任何文件「不见」。
+        except OSError:
+            # review 14/15 —— 读目录时还在、``lstat`` 时没了(正被改名),或 ``lstat`` 不让(目录可读
+            # 不可进 ``0644``:沙箱与控制面同一个 uid,它能这么设):这一层算没列全,不据此判下面
+            # 任何文件「不见」,整个观察也不因此失败。
             complete = False
             continue
         rel = f"{prefix}{name}"
@@ -338,6 +351,11 @@ def _check_index(agent_fd: int, scan: _Scan) -> Iterator[tuple[str, int]]:
         info = os.lstat(AGENT_NOTES_FILE, dir_fd=agent_fd)
     except FileNotFoundError:
         scan.index_present = False
+        return
+    except OSError:
+        # review 15 —— 查不了(根目录可读不可进之类):索引这次「不知道」,不是「不见」。
+        scan.index_unknown = True
+        scan.incomplete = True
         return
     scan.index_present = stat.S_ISREG(info.st_mode)
     if scan.index_present:
@@ -491,8 +509,9 @@ _INDEX_KEY = _key_of(AGENT_NOTES_FILE)
 def _valid_path(file_dir: int, key: str) -> str | None:
     """这个版本目录记的源路径;没有 ``path``、或内容和目录名对不上(空的、写了一半的)→ ``None``。
 
-    review 14 —— 只有「不存在」才是 ``None``;别的读错误(EIO / ESTALE / EMFILE…)原样抛出,调用方
-    这一次跳过这个目录(不知道,绝不删)。
+    review 14 —— 只有「不存在」才是 ``None``;别的读错误(EIO / ESTALE / EMFILE…)原样抛出:
+    :func:`_sweep` 这一次跳过这个目录(不删、不动标记),:func:`_dir_usage` 把它当「不知道」(按在算、
+    全额保护)。
     """
     rel = _read_path(file_dir)
     if rel is None or _key_of(rel) != key:
@@ -512,13 +531,46 @@ def observe_sync(
     require_safe_key(agent_key)
     if os.path.lexists(workspace_deleted_marker(workspace.root, tenant_id, user_id)):
         return ObserveReport()
+    scan = _Scan()
+    pending: list[_Pending] = []
     try:
         agent_fd = workspace._open_scope_dir_fd(tenant_id, user_id, f"{AGENTS_DIR}/{agent_key}")
     except MISSING_DIR_ERRORS:
         return ObserveReport()  # agent 根还没建:没有可留的
-    scan = _Scan()
-    pending: list[_Pending] = []
-    agent_dir = _open_agent_versions(workspace.root, tenant_id, user_id, agent_key, create=False)
+    except BaseException:
+        _after_failed_walk(workspace.root, tenant_id, user_id, agent_key)
+        raise
+    try:
+        _walk_and_read(workspace.root, tenant_id, user_id, agent_key, agent_fd, scan, pending)
+    except BaseException:
+        _after_failed_walk(workspace.root, tenant_id, user_id, agent_key)
+        raise
+    finally:
+        os.close(agent_fd)
+    _housekeep(workspace.root, tenant_id, user_id, agent_key, scan, pending)
+    return ObserveReport(
+        snapshotted=scan.snapshotted,
+        unchanged=scan.unchanged,
+        skipped=scan.skipped,
+        pruned=scan.pruned,
+        dropped=scan.dropped,
+        over_budget=bool(scan.over_reasons),
+        over_budget_reasons=tuple(sorted(scan.over_reasons)),
+        walk_incomplete=scan.incomplete,
+    )
+
+
+def _walk_and_read(
+    root: str,
+    tenant_id: UUID,
+    user_id: UUID,
+    agent_key: str,
+    agent_fd: int,
+    scan: _Scan,
+    pending: list[_Pending],
+) -> None:
+    """遍历 + 把变了的文件读进 ``pending``(单个文件的错误只跳过那一个)。"""
+    agent_dir = _open_agent_versions(root, tenant_id, user_id, agent_key, create=False)
     try:
         walked = [*_check_index(agent_fd, scan), *_files(agent_fd, "", 0, scan)]
         for rel in _observe_order(iter(walked)):
@@ -532,18 +584,25 @@ def observe_sync(
     finally:
         if agent_dir is not None:
             os.close(agent_dir)
-        os.close(agent_fd)
-    _housekeep(workspace.root, tenant_id, user_id, agent_key, scan, pending)
-    return ObserveReport(
-        snapshotted=scan.snapshotted,
-        unchanged=scan.unchanged,
-        skipped=scan.skipped,
-        pruned=scan.pruned,
-        dropped=scan.dropped,
-        over_budget=bool(scan.over_reasons),
-        over_budget_reasons=tuple(sorted(scan.over_reasons)),
-        walk_incomplete=scan.incomplete,
-    )
+
+
+def _after_failed_walk(root: str, tenant_id: UUID, user_id: UUID, agent_key: str) -> None:
+    """review 15 —— 打不开 agent 根、或遍历本身抛了异常:照样用一个**空的**扫描结果收一次尾再让
+    异常往外抛。空扫描里每个文件都是「不知道」,所以这一遍只会撤掉各目录的 ``missing`` 标记、删
+    一份版本都没有的孤儿;``pending`` 是空的,不写、不按预算删、不按「不见满 30 天」删。
+
+    就是要守住:**没有哪种失败能让 T0 的旧标记一直作数**(否则「确认不见 → 一个月里每次观察都
+    失败 → 藏一次」就能把整个目录一下删掉)。直接复用 :func:`_housekeep`(而不是另写一个只撤标记
+    的分支):同一条路径,软删标记的检查也一起有;它自己的错误只记日志,不盖住原来的异常。
+    """
+    try:
+        _housekeep(root, tenant_id, user_id, agent_key, _Scan(), [])
+    except Exception as exc:
+        logger.warning(
+            "agent_file_versions.failed_walk_sweep_failed agent_key=%s error=%s",
+            agent_key,
+            type(exc).__name__,
+        )
 
 
 def _observe_order(found: Iterator[tuple[str, int]]) -> list[str]:
@@ -626,7 +685,8 @@ def _housekeep(
                 usage = _usage(agent_dir, scan)
                 _write_pending(agent_dir, pending, scan, usage)
                 if scan.snapshotted:
-                    _enforce_budget(agent_dir, scan, usage)
+                    # review 15 —— 写过之后重读一次:别的副本同时写下的版本也算进去。
+                    _enforce_budget(agent_dir, scan, _usage(agent_dir, scan))
         finally:
             os.close(agent_dir)
     finally:
@@ -713,15 +773,23 @@ def _write_pending(
             continue
         dirs += 1 if new_dir else 0
         try:
-            if new_dir or current.rel != item.rel:
-                _write_path(file_dir, item.rel)  # 新目录,或 ``path`` 坏了:原子地(重)写
-            _write_version(file_dir, item.data, item.info, item.digest, item.seq)
+            try:
+                if new_dir or current.rel != item.rel:
+                    _write_path(file_dir, item.rel)  # 新目录,或 ``path`` 坏了:原子地(重)写
+                _write_version(file_dir, item.data, item.info, item.digest, item.seq)
+            except OSError:
+                scan.skipped += 1
+                continue
             scan.snapshotted += 1
-            _prune(file_dir, scan)
-            usage[item.key] = _dir_usage(file_dir, item.key, scan)
-            floor += usage[item.key].floor() - current.floor()
-        except OSError:
-            scan.skipped += 1
+            # review 15 —— 账先按保守的记上(这一份已经写下了),再做可能出错的清理与重读:清理
+            # 出错时后面的放行判断仍按「多了这一份」算,不会把预算算松。
+            usage[item.key] = after
+            floor = grown
+            with contextlib.suppress(OSError):
+                _prune(file_dir, scan)
+                fresh = _dir_usage(file_dir, item.key, scan)
+                floor += fresh.floor() - after.floor()
+                usage[item.key] = fresh
         finally:
             os.close(file_dir)
 
@@ -797,6 +865,7 @@ def _sweep(agent_dir: int, scan: _Scan, now: float) -> None:
     * 不知道(``unknown``:某一层没列全,或 ``path`` 坏了):撤掉标记(review 14)—— 之后要再确认一次
       不见、从那时重新算 30 天;不然「确认不见 → 一个月都看不清 → 藏一次」就能把整个目录一下删掉。
     """
+    seen_by_key = {_key_of(rel): rel for rel in scan.seen}
     for key in os.listdir(agent_dir):
         try:
             file_dir = _openat_dir(agent_dir, key, create=False)
@@ -804,6 +873,7 @@ def _sweep(agent_dir: int, scan: _Scan, now: float) -> None:
             continue
         drop = False
         try:
+            _sweep_tmp(file_dir, now)
             if not _versions(file_dir):
                 drop = now - os.fstat(file_dir).st_mtime >= ORPHAN_DIR_GRACE_S
                 continue
@@ -811,6 +881,12 @@ def _sweep(agent_dir: int, scan: _Scan, now: float) -> None:
                 rel = _valid_path(file_dir, key)
             except OSError:
                 continue  # 读不动:这一次跳过,不当孤儿、不判不见
+            if rel is None and key in seen_by_key:
+                # review 15 —— ``path`` 坏了、源文件这次看到了(没改,所以不会走写入那条修复):在这里
+                # 原子地修好,不然它一直「不知道」、删掉后也永远不会到期。
+                with contextlib.suppress(OSError):
+                    _write_path(file_dir, seen_by_key[key])
+                    rel = seen_by_key[key]
             status = scan.status(rel) if rel is not None else "unknown"
             if status == "missing":
                 drop = _note_missing(file_dir, now)
@@ -821,6 +897,17 @@ def _sweep(agent_dir: int, scan: _Scan, now: float) -> None:
             os.close(file_dir)
             if drop:
                 _drop_dir(agent_dir, key, scan)
+
+
+def _sweep_tmp(file_dir: int, now: float) -> None:
+    """review 15 —— 写版本 / ``path`` 写到一半被杀留下的 ``.tmp-*``(不算版本、不进预算,目录有版本
+    又不是孤儿,所以没人清):建了满 :data:`ORPHAN_DIR_GRACE_S` 就删(不跟正在写的观察抢)。"""
+    for name in os.listdir(file_dir):
+        if not name.startswith(".tmp-"):
+            continue
+        with contextlib.suppress(OSError):
+            if now - os.lstat(name, dir_fd=file_dir).st_mtime >= ORPHAN_DIR_GRACE_S:
+                os.unlink(name, dir_fd=file_dir)
 
 
 def _drop_dir(agent_dir: int, key: str, scan: _Scan) -> None:
@@ -957,7 +1044,7 @@ def _delete_path_versions(root: str, tenant_id: UUID, user_id: UUID, path: str) 
     if parts[2].startswith(".") or parts[2] in AGENT_ROOT_RESERVED:
         return 0
     require_safe_key(agent_key)
-    key = hashlib.sha256(rel.encode()).hexdigest()[:32]
+    key = _key_of(rel)
     try:
         user_fd = _open_versions_root(root, tenant_id, user_id, create=False)
     except FileNotFoundError:

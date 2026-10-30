@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
+import hashlib
 import os
 import shutil
 import time
+from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 from uuid import UUID, uuid4
@@ -19,7 +22,8 @@ from orchestrator.tools.agent_file_versions import (
     dispatch_observation,
 )
 from orchestrator.tools.conversation_seed import MAX_SEED_DEPTH, MAX_SEED_ENTRIES
-from orchestrator.tools.nas_workspace_store import NasWorkspaceStore
+from orchestrator.tools.nas_workspace_store import NasWorkspaceStore, _openat_dir
+from orchestrator.tools.sandbox import WorkspacePermissionError
 from orchestrator.tools.workspace_paths import AGENT_NOTES_FILE
 
 _TENANT, _USER = uuid4(), uuid4()
@@ -815,11 +819,10 @@ async def test_a_restored_file_is_live_even_when_the_walk_is_incomplete(
     assert kept[-2:] == ["F-PREV-STATE", "F-BAD".ljust(12, "f")]
 
 
-async def test_a_hidden_index_survives_junk_regardless_of_clock_skew(
+async def test_an_index_hidden_in_the_same_run_as_junk_keeps_its_newest_versions(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """索引被藏起来、同一轮写垃圾:它的最新几份受保护(review 13 起索引不论在不在都留 3 份),与
-    ``missing`` 标记的时间、NAS 服务端时钟比本机慢多少都无关。"""
+    """索引被藏起来、同一轮写垃圾:它的最新几份受保护(review 13 起索引不论在不在都留 3 份)。"""
     monkeypatch.setattr(versions_mod, "MAX_AGENT_VERSION_BYTES", 10_000)
     agent = _agent(tmp_path)
     notes = agent / "AGENT_NOTES.md"
@@ -830,13 +833,6 @@ async def test_a_hidden_index_survives_junk_regardless_of_clock_skew(
     for i in range(2):
         _put(static, f"{i}".ljust(3_000, "s"))
         await _observe(tmp_path)
-    real_since = versions_mod._missing_since
-
-    def server_clock_behind(file_dir: int) -> float | None:
-        since = real_since(file_dir)
-        return None if since is None else since - 3_600  # NAS 服务端时钟比本机慢一小时
-
-    monkeypatch.setattr(versions_mod, "_missing_since", server_clock_behind)
     notes.rename(agent / ".hidden")
     _put(agent / "junk.bin", "j" * 3_950)
 
@@ -1537,3 +1533,350 @@ async def test_a_dir_opened_after_the_name_cap_is_not_fully_listed(
 
     assert report.dropped == 0
     assert _history(tmp_path)["b/x.md"] == ["x"]
+
+
+# ---------------------------------------------------------------------------
+# review 15 —— 观察失败也撤旧标记、读不了 ≠ 不见、``.tmp-*`` 清理、账先记保守的、坏 ``path`` 就地修
+# ---------------------------------------------------------------------------
+
+_SAME_UID_PERMS = pytest.mark.skipif(
+    hasattr(os, "geteuid") and os.geteuid() == 0, reason="root 绕过权限检查"
+)
+
+
+def _markers(root: Path) -> list[Path]:
+    return list(_versions_root(root).rglob("missing"))
+
+
+@contextlib.contextmanager
+def _mode(path: Path, mode: int) -> Iterator[None]:
+    os.chmod(path, mode)
+    try:
+        yield
+    finally:
+        os.chmod(path, 0o700)
+
+
+async def _confirm_missing_then_restore(root: Path, f: Path) -> None:
+    saved = f.read_bytes()
+    f.unlink()
+    await _observe(root)  # T0:确认不见,记标记
+    assert len(_markers(root)) == 1
+    f.write_bytes(saved)
+
+
+@_SAME_UID_PERMS
+async def test_an_unsearchable_subdir_neither_fails_the_observation_nor_hides_the_index(
+    tmp_path: Path,
+) -> None:
+    """``tpl/`` 可读不可进(0644):``lstat`` 在里面报 EACCES —— 那一层没列全,观察照常完成,
+    索引照常留版本,根目录的旧标记照常撤掉。"""
+    agent = _agent(tmp_path)
+    _put(agent / "tpl" / "t.md", "t")
+    prefs = _put(agent / "prefs.md", "p1")
+    notes = _put(agent / "AGENT_NOTES.md", "good index")
+    await _observe(tmp_path)
+    await _confirm_missing_then_restore(tmp_path, prefs)
+    _put(notes, "edited index")
+    with _mode(agent / "tpl", 0o644):
+        report = await _observe(tmp_path)
+
+    assert report.walk_incomplete is True
+    assert _history(tmp_path)["AGENT_NOTES.md"] == ["good index", "edited index"]
+    assert _markers(tmp_path) == []
+
+
+@_SAME_UID_PERMS
+async def test_an_unsearchable_root_clears_markers_and_judges_nothing_missing(
+    tmp_path: Path,
+) -> None:
+    """根目录 0644:索引查不了(「不知道」,不是「不见」),别的文件也都「不知道」—— 旧标记撤掉,
+    不新记任何标记。根目录进不去时索引也没法留版本(spec 里记着)。"""
+    agent = _agent(tmp_path)
+    prefs = _put(agent / "prefs.md", "p1")
+    _put(agent / "AGENT_NOTES.md", "good index")
+    await _observe(tmp_path)
+    await _confirm_missing_then_restore(tmp_path, prefs)
+    with _mode(agent, 0o644):
+        report = await _observe(tmp_path)
+
+    assert report.walk_incomplete is True
+    assert _markers(tmp_path) == []
+
+
+@_SAME_UID_PERMS
+async def test_an_index_only_unsearchable_root_does_not_mark_the_index_missing(
+    tmp_path: Path,
+) -> None:
+    """r6:根目录 0644、里面只有索引和点开头的名字 —— 根目录能「列全」,但索引查不了:索引是
+    「不知道」,不能记「不见」。"""
+    agent = _agent(tmp_path)
+    _put(agent / "AGENT_NOTES.md", "i")
+    (agent / ".cache").mkdir()
+    await _observe(tmp_path)
+    with _mode(agent, 0o644):
+        await _observe(tmp_path)
+
+    assert _markers(tmp_path) == []
+
+
+@_SAME_UID_PERMS
+async def test_an_unopenable_root_still_clears_old_markers(tmp_path: Path) -> None:
+    """根目录 000:打不开、观察抛异常 —— 抛之前照样用空扫描收一次尾,旧标记撤掉。"""
+    agent = _agent(tmp_path)
+    prefs = _put(agent / "prefs.md", "p1")
+    await _observe(tmp_path)
+    await _confirm_missing_then_restore(tmp_path, prefs)
+    with _mode(agent, 0o000), pytest.raises(WorkspacePermissionError):
+        await _observe(tmp_path)
+
+    assert _markers(tmp_path) == []
+    assert _history(tmp_path)["prefs.md"] == ["p1"]
+
+
+async def test_a_failing_walk_still_clears_old_markers(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """遍历自己抛了异常(任何原因):抛之前用空扫描收一次尾 —— 只撤标记,不写、不删版本。"""
+    agent = _agent(tmp_path)
+    prefs = _put(agent / "prefs.md", "p1")
+    await _observe(tmp_path)
+    await _confirm_missing_then_restore(tmp_path, prefs)
+
+    def boom(*args: Any) -> Any:
+        raise OSError(5, "EIO")
+
+    monkeypatch.setattr(versions_mod, "_files", boom)
+    with pytest.raises(OSError):
+        await _observe(tmp_path)
+
+    assert _markers(tmp_path) == []
+    assert _history(tmp_path)["prefs.md"] == ["p1"]
+
+
+@_SAME_UID_PERMS
+async def test_a_month_of_unsearchable_subdir_does_not_let_a_stale_marker_expire(
+    tmp_path: Path,
+) -> None:
+    """r4 端到端:T0 确认不见 → 放回 + ``tpl/`` 0644 一个月 → 恢复权限、藏一次:旧标记早被撤掉,
+    这次只是重新开始计时,整个历史都在。"""
+    agent = _agent(tmp_path)
+    _put(agent / "tpl" / "t.md", "t")
+    prefs = agent / "prefs.md"
+    _put(prefs, "good prefs v1")
+    await _observe(tmp_path)
+    _put(prefs, "good prefs v2 (longer)")
+    await _observe(tmp_path)
+    await _confirm_missing_then_restore(tmp_path, prefs)
+    with _mode(agent / "tpl", 0o644):
+        await _observe(tmp_path)
+    _age_markers(tmp_path)
+    prefs.unlink()
+
+    report = await _observe(tmp_path)
+
+    assert report.dropped == 0
+    assert _history(tmp_path)["prefs.md"] == ["good prefs v1", "good prefs v2 (longer)"]
+
+
+async def test_leftover_tmp_files_are_swept_after_the_grace(tmp_path: Path) -> None:
+    """写到一半被杀留下的 ``.tmp-*``:满宽限期删掉,新的不动。"""
+    _put(_agent(tmp_path) / "f.md", "f")
+    await _observe(tmp_path)
+    (file_dir,) = (_versions_root(tmp_path) / _KEY).iterdir()
+    old_tmp, new_tmp = file_dir / ".tmp-old", file_dir / ".tmp-new"
+    old_tmp.write_text("x" * 100)
+    new_tmp.write_text("y")
+    os.utime(old_tmp, (1_000_000_000, 1_000_000_000))
+
+    await _observe(tmp_path)
+
+    assert not old_tmp.exists()
+    assert new_tmp.exists()
+
+
+async def test_a_failing_prune_keeps_the_books_conservative(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """p1:写下一份之后清理出错 —— 账已经按「多了这一份」记上,后面放不下的照样拦(``bytes``),
+    这一份也不重复算成 skipped。"""
+    import errno
+
+    monkeypatch.setattr(versions_mod, "MAX_AGENT_VERSION_BYTES", 4_000)
+    agent = _agent(tmp_path)
+    for name, ch, mt in (("a.md", "a", 100), ("b.md", "b", 99)):
+        f = _put(agent / name, ch * 1_000)
+        os.utime(f, (mt, mt))
+    await _observe(tmp_path)
+    for name, ch, mt in (("a.md", "A", 300), ("b.md", "B", 299), ("c.md", "c", 298)):
+        f = _put(agent / name, ch * 1_000)
+        os.utime(f, (mt, mt))
+    real = versions_mod._prune
+    calls = 0
+
+    def flaky(file_dir: int, scan: Any) -> None:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise OSError(errno.EIO, "EIO")
+        real(file_dir, scan)
+
+    monkeypatch.setattr(versions_mod, "_prune", flaky)
+
+    report = await _observe(tmp_path)
+
+    assert "bytes" in report.over_budget_reasons
+    assert report.snapshotted + report.skipped == 3
+
+
+async def test_enforce_sees_versions_another_replica_wrote_meanwhile(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """p5:写的同时另一个副本也写下了版本:收回预算时重读一次,把它们也算进去。"""
+    import hashlib
+
+    monkeypatch.setattr(versions_mod, "MAX_AGENT_VERSION_BYTES", 4_000)
+    agent = _agent(tmp_path)
+    for ch in "ab":
+        _put(agent / "a.md", ch * 1_000)
+        _put(agent / "b.md", ch.upper() * 1_000)
+        await _observe(tmp_path)
+    real = versions_mod._write_pending
+
+    def other_replica_writes_too(*args: Any) -> None:
+        real(*args)
+        d = _versions_root(tmp_path) / _KEY / hashlib.sha256(b"b.md").hexdigest()[:32]
+        (d / ("v00000099-" + "0" * 64)).write_text("Z" * 1_000)
+
+    monkeypatch.setattr(versions_mod, "_write_pending", other_replica_writes_too)
+    _put(agent / "a.md", "d" * 1_000)
+
+    await _observe(tmp_path)
+
+    assert _agent_version_bytes(tmp_path) <= 4_000
+
+
+async def test_a_torn_path_of_an_unchanged_file_is_repaired_in_place(tmp_path: Path) -> None:
+    """p3:``path`` 坏了、文件一直没改(走不到写入那条修复):扫的时候看到了文件就就地修好;之后删掉
+    照常按 30 天到期。"""
+    f = _put(_agent(tmp_path) / "notes" / "f.md", "v1")
+    await _observe(tmp_path)
+    _put(f, "v2-longer")
+    await _observe(tmp_path)
+    (file_dir,) = (_versions_root(tmp_path) / _KEY).iterdir()
+    (file_dir / "path").write_text("")
+
+    await _observe(tmp_path)
+
+    assert (file_dir / "path").read_text() == "notes/f.md"
+    f.unlink()
+    await _observe(tmp_path)
+    _age_markers(tmp_path)
+    report = await _observe(tmp_path)
+    assert report.dropped == 1
+
+
+async def test_an_index_dir_with_a_broken_path_keeps_three(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """索引的版本目录 ``path`` 坏了(索引也不在):按目录名认出是索引,仍留最新 3 份。"""
+    monkeypatch.setattr(versions_mod, "MAX_AGENT_VERSION_BYTES", 10_000)
+    agent = _agent(tmp_path)
+    notes = agent / "AGENT_NOTES.md"
+    for i in range(5):
+        _put(notes, f"GOOD index v{i}".ljust(1_000, "."))
+        await _observe(tmp_path)
+    index_dir = _versions_root(tmp_path) / _KEY / hashlib.sha256(b"AGENT_NOTES.md").hexdigest()[:32]
+    notes.unlink()
+    (index_dir / "path").write_text("")
+    for r, size in enumerate((3_500, 4_000)):  # 第二份要删到 2 份才放得下:不放
+        _fill(agent, f"j{r}", [size])
+        await _observe(tmp_path)
+
+    assert len([p for p in index_dir.iterdir() if p.name.startswith("v")]) >= 3
+
+
+async def test_a_broken_path_with_versions_is_unknown_and_keeps_two(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``path`` 坏了、源文件也没看到:「不知道」(按在算,留 2 份),不是「不见」(那只留 1 份)。"""
+    monkeypatch.setattr(versions_mod, "MAX_AGENT_VERSION_BYTES", 10_000)
+    agent = _agent(tmp_path)
+    g = agent / "g.md"
+    for i in range(4):
+        _put(g, f"g{i}".ljust(1_000, "g"))
+        await _observe(tmp_path)
+    g_dir = _versions_root(tmp_path) / _KEY / hashlib.sha256(b"g.md").hexdigest()[:32]
+    g.unlink()
+    (g_dir / "path").write_text("")
+    for r, size in enumerate((4_000, 4_500)):  # 第二份要把它删到 1 份才放得下:不放
+        _fill(agent, f"j{r}", [size])
+        await _observe(tmp_path)
+
+    assert len([p for p in g_dir.iterdir() if p.name.startswith("v")]) >= 2
+
+
+def _walk_incomplete_count() -> float:
+    return float(
+        versions_mod.agent_file_versions_total.labels(outcome="walk_incomplete")._value.get()
+    )
+
+
+@pytest.mark.parametrize("cause", ["depth", "unopenable"])
+async def test_walk_incomplete_is_reported_logged_and_counted(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    cause: str,
+) -> None:
+    """深度到顶、目录打不开:都报 ``walk_incomplete``,记日志、计数。"""
+    agent = _agent(tmp_path)
+    if cause == "depth":
+        deep = agent
+        for i in range(MAX_SEED_DEPTH + 2):
+            deep = deep / f"d{i}"
+        _put(deep / "x.txt", "x")
+    else:
+        _put(agent / "locked" / "x.txt", "x")
+        real_openat = _openat_dir
+
+        def refuse(dir_fd: int, name: str, *, create: bool) -> int:
+            if name == "locked":
+                raise PermissionError(13, "EACCES")
+            return real_openat(dir_fd, name, create=create)
+
+        monkeypatch.setattr(versions_mod, "_openat_dir", refuse)
+    _put(agent / "f.md", "f")
+    caplog.set_level("WARNING", logger=versions_mod.__name__)
+    before = _walk_incomplete_count()
+
+    await versions_mod._observe_logged(_store(tmp_path), _TENANT, _USER, _KEY)
+
+    assert _walk_incomplete_count() == before + 1
+    assert any("walk_incomplete" in r.getMessage() for r in caplog.records)
+
+
+async def test_a_dir_that_fails_to_list_is_unlisted_and_the_observation_completes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """读目录本身出错(EIO 之类):这一层没列全、里面的文件「不知道」,观察照常完成。"""
+    import errno
+
+    agent = _agent(tmp_path)
+    _put(agent / "sub" / "x.md", "x")
+    _put(agent / "f.md", "f")
+    await _observe(tmp_path)
+    sub_ino = (agent / "sub").stat().st_ino
+    real_scandir = os.scandir
+
+    def failing(path: Any) -> Any:
+        if isinstance(path, int) and os.fstat(path).st_ino == sub_ino:
+            raise OSError(errno.EIO, "EIO")
+        return real_scandir(path)
+
+    monkeypatch.setattr(os, "scandir", failing)
+    report = await _observe(tmp_path)
+    monkeypatch.setattr(os, "scandir", real_scandir)
+
+    assert report.walk_incomplete is True
+    assert _markers(tmp_path) == []
