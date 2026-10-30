@@ -97,8 +97,7 @@ from orchestrator.tools import (
 )
 from orchestrator.tools.artifact_snapshots import ArtifactSnapshotStore
 from orchestrator.tools.overflow import OVERFLOW_DIR
-from orchestrator.tools.workspace_scope import agent_shared_scope, conversation_scope
-from orchestrator.tools.workspace_store import WorkspaceFileEntry, without_seed_copies
+from orchestrator.tools.workspace_scope import conversation_scope
 
 logger = logging.getLogger("expert_work.control_plane.sessions")
 
@@ -137,14 +136,12 @@ async def _session_files(
     if meta.workspace_layout != "conversation" or not key:
         entries = await store.list_files(tenant_id=tenant_id, user_id=meta.user_id)
         return [{"path": e.path, "size": e.size} for e in entries]
-    own: list[WorkspaceFileEntry] = await store.list_files(
+    # review 8 —— 原样副本由存储剔(按 ctime 与本对话 ``.seeded`` 标记比),剔完才截 2000 条。
+    own = await store.list_files(
         tenant_id=tenant_id, user_id=meta.user_id, scope=conversation_scope(key, thread_id)
     )
-    agent = await store.list_files(
-        tenant_id=tenant_id, user_id=meta.user_id, scope=agent_shared_scope(key)
-    )
     base = f"{WORKSPACE_THREADS_DIR}/{thread_id}/{WORKSPACE_CONVERSATION_WORK_DIR}"
-    return [{"path": f"{base}/{e.path}", "size": e.size} for e in without_seed_copies(own, agent)]
+    return [{"path": f"{base}/{e.path}", "size": e.size} for e in own]
 
 
 class CreateSessionPayload(BaseModel):

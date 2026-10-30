@@ -66,6 +66,11 @@ MAX_OBSERVE_READ_BYTES = 20 * 1024 * 1024
 #: 跨 agent。版本也计入这个用户的工作区配额(``WorkspaceQuotaService.refresh``)。
 MAX_USER_VERSION_BYTES = 200 * 1024 * 1024
 
+#: review 8 —— 每个 agent 最多这么多个版本目录(每个被留过版本的路径一个)。字节上限管不住
+#: 「换着名字写空文件」:每次观察最多 500 个新路径,不封顶的话目录与 inode 无限涨。超了按
+#: 目录最近一次变动从旧到新删整个版本目录。实测每个 agent 根最多 77 个文件,2000 留足余量。
+MAX_VERSION_DIRS_PER_AGENT = 2000
+
 #: review 7 —— 源文件从 ``/agent`` 消失满这么久,它的版本目录整个删掉。「从哪天起不见」记在
 #: 版本目录里的 ``missing`` 标记上(第一次发现不见时建,文件回来就删)。
 MISSING_SOURCE_GRACE_S = 30 * 24 * 3600
@@ -158,13 +163,18 @@ def _files(dir_fd: int, prefix: str, depth: int, scan: _Scan) -> Iterator[tuple[
             try:
                 sub = _openat_dir(dir_fd, name, create=False)
             except OSError:
+                # review 8 —— 打不开(``chmod 000`` / 刚被换成链接)的目录里有什么不知道:这次
+                # 遍历不完整,不能据此判任何文件「不见了」开始 30 天倒计时。
                 scan.skipped += 1
+                scan.complete = False
                 continue
             try:
                 yield from _files(sub, f"{rel}/", depth + 1, scan)
             finally:
                 os.close(sub)
         else:
+            if stat.S_ISDIR(info.st_mode):
+                scan.complete = False  # 深度到顶,下面没看(同上:不判「不见」)
             scan.skipped += 1
 
 
@@ -332,7 +342,8 @@ def observe_sync(
 
 
 def _housekeep(root: str, tenant_id: UUID, user_id: UUID, agent_key: str, scan: _Scan) -> None:
-    """观察之后的两件收尾(版本目录不存在就什么都不做)。"""
+    """观察之后的三件收尾(版本目录不存在就什么都不做):源文件不见满 30 天的删掉、本 agent
+    版本目录数封顶、用户合计字节封顶。"""
     try:
         user_fd = _open_versions_root(root, tenant_id, user_id, create=False)
     except FileNotFoundError:
@@ -349,7 +360,16 @@ def _housekeep(root: str, tenant_id: UUID, user_id: UUID, agent_key: str, scan: 
                 finally:
                     os.close(agent_dir)
         if scan.snapshotted:
-            _enforce_user_cap(user_fd, scan)
+            try:
+                agent_dir = _openat_dir(user_fd, agent_key, create=False)
+            except FileNotFoundError:
+                agent_dir = None
+            if agent_dir is not None:
+                try:
+                    _enforce_dir_cap(agent_dir, scan)
+                finally:
+                    os.close(agent_dir)
+            _enforce_user_cap(user_fd, scan, agent_key)
     finally:
         os.close(user_fd)
 
@@ -403,8 +423,32 @@ def _sweep_missing(agent_dir: int, scan: _Scan, now: float) -> None:
             scan.dropped += 1
 
 
-def _enforce_user_cap(user_fd: int, scan: _Scan) -> None:
-    """用户合计超过上限:按写下的先后(ctime)从最早的版本删起,跨文件、跨 agent。"""
+def _enforce_dir_cap(agent_dir: int, scan: _Scan) -> None:
+    """本 agent 的版本目录超过 :data:`MAX_VERSION_DIRS_PER_AGENT`:按目录最近一次变动从旧到新
+    整个删掉,直到不超。"""
+    keys = os.listdir(agent_dir)
+    excess = len(keys) - MAX_VERSION_DIRS_PER_AGENT
+    if excess <= 0:
+        return
+    aged: list[tuple[int, str]] = []
+    for key in keys:
+        with contextlib.suppress(FileNotFoundError):
+            info = os.lstat(key, dir_fd=agent_dir)
+            if stat.S_ISDIR(info.st_mode):
+                aged.append((info.st_mtime_ns, key))
+    for _mtime, key in sorted(aged)[:excess]:
+        shutil.rmtree(key, dir_fd=agent_dir)
+        scan.dropped += 1
+
+
+def _enforce_user_cap(user_fd: int, scan: _Scan, observing: str) -> None:
+    """用户合计超过上限:从最早写下(ctime)的版本删起,**先删这次观察的 agent 自己的**,它一个
+    删不回上限才动别的 agent 的(同样从最早的起)。
+
+    review 8 —— 选「观察者先付」而不是按 agent 平分:超限只会在某次观察写了新版本之后发生,
+    让写的那个 agent 先让出空间,别的 agent 的历史不会因为另一个 agent 改得勤而被挤掉;平分
+    要先定「份额」(按 agent 数?按用量?),agent 数会变,份额跟着漂移,收益不抵复杂度。
+    """
     found: list[tuple[int, str, str, str, int]] = []  # (ctime, agent, key, name, size)
     total = 0
     for agent_key in os.listdir(user_fd):
@@ -429,7 +473,8 @@ def _enforce_user_cap(user_fd: int, scan: _Scan) -> None:
                     os.close(file_dir)
         finally:
             os.close(agent_dir)
-    for _ctime, agent_key, key, name, size in sorted(found):
+    found.sort(key=lambda f: (f[1] != observing, f[0]))
+    for _ctime, agent_key, key, name, size in found:
         if total <= MAX_USER_VERSION_BYTES:
             return
         agent_dir = _openat_dir(user_fd, agent_key, create=False)

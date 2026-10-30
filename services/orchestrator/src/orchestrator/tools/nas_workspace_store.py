@@ -133,17 +133,16 @@ that narrow window fails closed rather than open), but it eliminates the
 specific mechanism (re-walking a string path) that made the previous
 version's re-checks ineffective.
 
-:meth:`list_files` is a narrower case: it only reads metadata, never opens
-file content, and its :func:`os.walk` call passes ``followlinks=False`` so
-it never *descends into* a symlinked subdirectory (an intermediate-
-component escape of the kind described above can't make it enumerate files
-outside the tree). A symlink placed as a plain file entry (not a directory)
-still appears in the listing under its own in-tree relative path, but its
-reported size comes from :func:`os.lstat` (not :func:`os.stat`) — the
-symlink's own byte length, never a stat of whatever it points at — so no
-metadata about anything outside the tree is ever surfaced. Nothing here
-needs ``dir_fd`` chaining: there is no content read and no follow-through
-target to escape into.
+:meth:`list_files` only reads metadata, but it needs the same pinning. A
+path-based walk (:func:`os.walk`, even with ``followlinks=False``) checks
+``islink`` on a subdirectory and *later* lists it by name, and a payload that
+keeps swapping a directory in its own workspace for a symlink wins that gap:
+the walk then lists whatever the symlink points at, up to the root of the NAS
+volume, i.e. other tenants' file names. So it walks with :func:`os.fwalk`
+from the scope's own fd with ``follow_symlinks=False``: each subdirectory is
+``lstat``-ed, opened, and dropped unless the opened fd is the same inode.
+A symlink placed as a plain file entry still appears under its own in-tree
+relative path, with its own :func:`os.lstat` size, never a stat of its target.
 """
 
 from __future__ import annotations
@@ -180,6 +179,7 @@ from orchestrator.tools.sandbox import (
     WorkspaceFileTooLargeError,
     WorkspaceNotADirectoryError,
     WorkspaceNotAFileError,
+    WorkspaceNotARegularFileError,
     WorkspacePathEscapeError,
     WorkspacePermissionError,
 )
@@ -280,6 +280,16 @@ class _WorkspacePathNotFoundError(SandboxSupervisorError):
 MISSING_DIR_ERRORS = (WorkspaceFileNotFoundError, _WorkspacePathNotFoundError)
 
 
+def _is_conversation_work(prefix: tuple[str, ...]) -> bool:
+    """作用域是不是某个对话的 ``agents/<k>/threads/<conv>/work``。"""
+    return (
+        len(prefix) == 5
+        and prefix[0] == WORKSPACE_AGENTS_DIR
+        and prefix[2] == WORKSPACE_THREADS_DIR
+        and prefix[4] == WORKSPACE_CONVERSATION_WORK_DIR
+    )
+
+
 def _is_seed_marker(path: str) -> bool:
     """``agents/<k>/threads/<conv>/.seeded`` —— 用户根相对路径。"""
     parts = path.split("/")
@@ -291,26 +301,37 @@ def _is_seed_marker(path: str) -> bool:
     )
 
 
-def _pristine_seed_copies(stamps: dict[str, tuple[int, int]]) -> frozenset[str]:
-    """``agents/<k>/threads/<conv>/work/<目录>/…`` 里与 ``agents/<k>/<目录>/…`` 大小、mtime
-    (纳秒)都相同的文件 —— 开场复制保留 mtime,所以没动过的副本逐项相等;改过的不相等。
+def _drop_seed_copies(
+    prefix: tuple[str, ...],
+    entries: list[WorkspaceFileEntry],
+    seeded_at: dict[str, int],
+    ctimes: dict[str, int],
+) -> list[WorkspaceFileEntry]:
+    """剔掉开场复制进对话、之后**没被碰过**的副本(review 8 的判据)。
 
-    只用这次遍历已经 ``lstat`` 到的数,不为认副本多跑一次 NAS 往返;也不读 ``.seeded``
-    标记(它在沙箱够得着的地方,而且「与源一模一样」本身就是要的判据)。一级文件从不复制,
-    不算。
+    ``agents/<k>/threads/<conv>/work/<目录>/…`` 里的文件,``st_ctime_ns`` 不晚于本对话
+    ``.seeded`` 标记的 ``mtime`` 就是原样副本:标记在复制(含 ``utime``)全部做完之后才写,
+    之后对副本的任何写入、改权限、``touch`` 都会把它的 ctime 推到标记之后。ctime 由文件系统
+    (NFS 上是服务端)设,用户态改不回去。不跟 ``/agent`` 的现状比:源文件之后被改,老对话的
+    副本照样是副本;对话自己的产出被 ``cp -a`` 进 ``/agent``,也不会因此被当成副本藏起来。
+    没有标记的对话里一个都不算。``seeded_at`` 的键是 ``agents/<k>/threads/<conv>``。
     """
-    out: set[str] = set()
-    for path, stamp in stamps.items():
-        parts = path.split("/")
+    if not seeded_at:
+        return entries
+    kept: list[WorkspaceFileEntry] = []
+    for entry in entries:
+        parts = (*prefix, *entry.path.split("/"))
         if (
             len(parts) >= 7
             and parts[0] == WORKSPACE_AGENTS_DIR
             and parts[2] == WORKSPACE_THREADS_DIR
             and parts[4] == WORKSPACE_CONVERSATION_WORK_DIR
-            and stamps.get("/".join((parts[0], parts[1], *parts[5:]))) == stamp
         ):
-            out.add(path)
-    return frozenset(out)
+            marked = seeded_at.get("/".join(parts[:4]))
+            if marked is not None and ctimes.get(entry.path, marked + 1) <= marked:
+                continue
+        kept.append(entry)
+    return kept
 
 
 def _identity(info: os.stat_result) -> tuple[int, int, int]:
@@ -408,8 +429,7 @@ def _walk_and_match(
     普通文件), 也读不出内容(``ELOOP``)。
 
     ``follow_symlinks=False`` keeps the walk itself from descending through a
-    symlinked subdirectory, the same reason :meth:`NasWorkspaceStore.list_files`
-    passes ``followlinks=False``.
+    symlinked subdirectory, the same as :meth:`NasWorkspaceStore.list_files`.
     """
 
     def _on_error(exc: OSError) -> None:
@@ -442,35 +462,90 @@ def _walk_and_match(
         Generator[tuple[str, list[str], list[str], int], None, None],
         os.fwalk(".", dir_fd=dfd, follow_symlinks=False, onerror=_on_error),
     )
-    with closing(walker):
-        for dirpath, dirnames, filenames, walk_fd in walker:
-            base = PurePosixPath(dirpath)
-            if dirpath == ".":
-                # B-236 —— 作用域根下藏起来的首段(``agent_shared`` 的 ``threads/``)
-                # 连走都不走进去:别的对话的文件不该出现在任何一条结果里。
-                dirnames[:] = [d for d in dirnames if d not in hidden]
-            for name in sorted(filenames):
-                rel = str(base / name).removeprefix("./")
-                if is_reserved_workspace_path("/".join((*prefix, rel))):
-                    continue
-                if name_glob is not None and not _name_matches(rel, name, name_glob):
-                    continue
-                try:
-                    info = os.lstat(name, dir_fd=walk_fd)
-                except OSError:
-                    continue  # racing unlink — a miss, not a failure.
-                if not stat.S_ISREG(info.st_mode):
-                    continue  # symlink / fifo / socket — never read through it.
-                if content is not None and not _content_matches(walk_fd, name, info, content):
-                    continue
-                if len(hits) >= max_results:
-                    truncated = True
+    try:
+        with closing(walker):
+            for dirpath, dirnames, filenames, walk_fd in walker:
+                base = PurePosixPath(dirpath)
+                if dirpath == ".":
+                    # B-236 —— 作用域根下藏起来的首段(``agent_shared`` 的 ``threads/``)
+                    # 连走都不走进去:别的对话的文件不该出现在任何一条结果里。
+                    dirnames[:] = [d for d in dirnames if d not in hidden]
+                for name in sorted(filenames):
+                    rel = str(base / name).removeprefix("./")
+                    if is_reserved_workspace_path("/".join((*prefix, rel))):
+                        continue
+                    if name_glob is not None and not _name_matches(rel, name, name_glob):
+                        continue
+                    try:
+                        info = os.lstat(name, dir_fd=walk_fd)
+                    except OSError:
+                        continue  # racing unlink — a miss, not a failure.
+                    if not stat.S_ISREG(info.st_mode):
+                        continue  # symlink / fifo / socket — never read through it.
+                    if content is not None and not _content_matches(walk_fd, name, info, content):
+                        continue
+                    if len(hits) >= max_results:
+                        truncated = True
+                        break
+                    hits.append(_entry(rel, info))
+                if truncated:
                     break
-                hits.append(_entry(rel, info))
-            if truncated:
-                break
+    except PermissionError as exc:
+        # 同 list_files:fwalk 对已开目录的 scandir / fstat 失败不走 onerror。
+        raise WorkspacePermissionError("workspace search not readable") from exc
+    except OSError as exc:
+        raise SandboxSupervisorError(f"workspace search failed: {exc.strerror}") from exc
     hits.sort(key=lambda entry: entry.path)
     return WorkspaceSearchResult(entries=tuple(hits), truncated=truncated)
+
+
+def _list_dir_entries(
+    prefix: tuple[str, ...],
+    dirpath: str,
+    filenames: list[str],
+    walk_fd: int,
+    entries: list[WorkspaceFileEntry],
+    *,
+    seeded_at: dict[str, int] | None = None,
+    ctimes: dict[str, int] | None = None,
+) -> None:
+    """One directory of :meth:`NasWorkspaceStore.list_files`' walk, ``dir_fd``-relative.
+
+    B-236 —— ``threads/<conv>/.seeded`` 标记不列(平台状态),它的 mtime 记进 ``seeded_at``;
+    每个文件的 ctime 记进 ``ctimes``(作用域相对路径为键),认原样副本用。
+    """
+    base = PurePosixPath(dirpath)
+    for name in filenames:
+        rel = str(base / name).removeprefix("./")
+        # 保留前缀的判据吃的是**用户根相对**路径 ——
+        # ``is_reserved_workspace_path`` 自己会剥掉 ``agents/<key>``
+        # 这层容器再看头一段(见 ``persistence/workspace/layout.py``)。
+        # 喂作用域相对路径进去在今天恰好也对, 但那是巧合不是契约:
+        # 换一个容器层级就静默错位, 而错位的形态是"文件凭空消失"。
+        if is_reserved_workspace_path("/".join((*prefix, rel))):
+            continue
+        # lstat, not stat — a symlink appearing as a plain file entry must
+        # report its own byte length, never a stat() of whatever it points at
+        # outside the tree (see module docstring). B-84 —— 一次 lstat 同时取大小
+        # 与 mtime: 这个循环在一棵几千文件的树上跑, 每多一次系统调用就是一次 NFS 往返。
+        try:
+            info = os.lstat(name, dir_fd=walk_fd)
+        except PermissionError as exc:
+            # 同 read_file:列不动 ≠ 不存在,不能被下面吞掉。
+            raise WorkspacePermissionError(f"workspace listing not readable: {rel!r}") from exc
+        except OSError as exc:
+            # 复审 N-2 —— 错误文案只带工作区相对路径, 不带 ``exc`` 自己的 filename。
+            raise SandboxSupervisorError(
+                f"workspace listing failed: {rel!r}: {exc.strerror}"
+            ) from exc
+        full = "/".join((*prefix, rel))
+        if name == WORKSPACE_SEED_MARKER and _is_seed_marker(full):
+            if seeded_at is not None and stat.S_ISREG(info.st_mode):
+                seeded_at[full.rsplit("/", 1)[0]] = info.st_mtime_ns
+            continue  # B-236 —— 开场复制的标记是平台状态,不是产出
+        entries.append(_entry(rel, info))
+        if ctimes is not None:
+            ctimes[rel] = info.st_ctime_ns
 
 
 def _name_matches(rel: str, name: str, name_glob: str) -> bool:
@@ -718,7 +793,7 @@ class NasWorkspaceStore:
             return os.open(user_root, os.O_RDONLY | os.O_DIRECTORY)
         except PermissionError as exc:
             # 复审 C-1 —— 这句是 read_file/write_file/delete_file 三个方法共用
-            # 的入口(list_files 走独立的 os.stat/os.walk,从不调用这个方法,
+            # 的入口(list_files 起点的 os.stat 不经过这个方法,
             # 上一版这里的注释把它也算进去是错的,见复审 N-1):落在这里之
             # 前 create=False 的 read_file/delete_file 从不会碰上面的 mkdir
             # 分支,直接从这里第一次触到 user_root。反过来说也一样漏:
@@ -776,6 +851,23 @@ class NasWorkspaceStore:
             os.close(dfd)
             dfd = nfd
         return dfd
+
+    def _note_seed_marker(
+        self, tenant_id: UUID, user_id: UUID, conv_dir: tuple[str, ...], seeded_at: dict[str, int]
+    ) -> None:
+        """``agents/<k>/threads/<conv>/.seeded`` 的 mtime 记进 ``seeded_at``(没有就不记)。"""
+        try:
+            dfd = self._open_scope_dir_fd(tenant_id, user_id, "/".join(conv_dir))
+        except _WorkspacePathNotFoundError:
+            return
+        try:
+            info = os.lstat(WORKSPACE_SEED_MARKER, dir_fd=dfd)
+        except FileNotFoundError:
+            return
+        finally:
+            os.close(dfd)
+        if stat.S_ISREG(info.st_mode):
+            seeded_at["/".join(conv_dir)] = info.st_mtime_ns
 
     def _open_scope_dir_fd(self, tenant_id: UUID, user_id: UUID, relpath: str) -> int:
         """A directory's **own** fd, not its parent's — backs ``list_dir`` / ``search_files``.
@@ -852,10 +944,14 @@ class NasWorkspaceStore:
                     before = os.fstat(handle.fileno())
                 except OSError as exc:
                     raise WorkspaceFileNotFoundError(f"workspace file not found: {path!r}") from exc
-                if not stat.S_ISREG(before.st_mode):
-                    # 目录 / FIFO / 设备 / socket:不读。与下面 ``IsADirectoryError`` 同一个
-                    # 窄类型 —— 「它不是文件」,不是「它不存在」。
+                if stat.S_ISDIR(before.st_mode):
+                    # 「它是目录」,不是「它不存在」—— 与下面 ``IsADirectoryError`` 同一个窄类型。
                     raise WorkspaceNotAFileError(f"workspace path is not a file: {path!r}")
+                if not stat.S_ISREG(before.st_mode):
+                    # FIFO / 设备 / socket:不读(review 8 —— 别说它是目录)。
+                    raise WorkspaceNotARegularFileError(
+                        f"workspace path is not a regular file: {path!r}"
+                    )
                 size = before.st_size
                 if size > cap:
                     # 「太大」≠「不存在」—— 窄类型让下载端点能回 413 而不是把
@@ -883,55 +979,33 @@ class NasWorkspaceStore:
         return await asyncio.to_thread(_read)
 
     async def list_files(
-        self, *, tenant_id: UUID, user_id: UUID, scope: str = SCOPE_USER_ROOT
+        self,
+        *,
+        tenant_id: UUID,
+        user_id: UUID,
+        scope: str = SCOPE_USER_ROOT,
+        include_seed_copies: bool = False,
     ) -> list[WorkspaceFileEntry]:
+        """B-236 —— 默认不列开场复制进对话、之后没被碰过的副本(见 :func:`_drop_seed_copies`),
+        也不列 ``.seeded`` 标记;先剔再截 2000 条。``include_seed_copies=True`` 照旧全列(工作区
+        快照段要拿两份清单的差认出副本)。"""
+
         def _list() -> list[WorkspaceFileEntry]:
-            user_root = self._user_root(tenant_id, user_id)
             # B-84 —— 作用域只改**起点**, 不改走路的方式。遍历的根从用户根挪到
             # ``{user_root}/agents/<key>`` 之类, 其余一个字不动;``scope_parts``
             # 已经把 agent_key 过了同一道安全闸, 这里拼的每一段都是校验过的。
             # 回给调用方的 ``path`` 是**作用域相对**的 —— 默认作用域是用户根,
             # 所以浏览端点 / 产物下载那批既有调用方看到的东西逐字不变。
             prefix = scope_parts(scope)
-            walk_root = user_root.joinpath(*prefix)
-            # ``Path.is_dir()``'s error-swallowing behaviour is not stable
-            # across CPython versions: 3.12/3.13 re-raise ``PermissionError``
-            # (only ``ENOENT``/``ENOTDIR``/``EBADF``/``ELOOP`` are treated as
-            # "doesn't exist"), but 3.14's default (``follow_symlinks=True``)
-            # path delegates to ``os.path.isdir()``, which swallows *every*
-            # ``OSError`` unconditionally — on 3.14 the ``except
-            # PermissionError`` below would simply never fire, silently
-            # reintroducing the exact "unreadable subtree → empty result"
-            # failure this exists to close (this repo's ``pyproject.toml``
-            # pins ``>=3.12``, which admits 3.14; measured against the real
-            # store on 3.12.8/3.13.1 vs 3.14.0 to confirm the divergence, not
-            # assumed). ``stat.S_ISDIR(os.stat(...).st_mode)`` is the
-            # version-independent equivalent — a bare ``os.stat`` call whose
-            # exception behaviour is a stable OS-level contract, not a
-            # pathlib convenience wrapper's.
-            try:
-                is_dir = stat.S_ISDIR(os.stat(walk_root).st_mode)
-            except (FileNotFoundError, NotADirectoryError):
-                return []
-            except PermissionError as exc:
-                # "." — this checks user_root itself, not an entry under it,
-                # so there is no meaningful relative path to name; and it
-                # must not be the absolute server-side mount path (sibling
-                # wraps below use the workspace-relative ``rel``, not an
-                # absolute path — same reason).
-                raise WorkspacePermissionError(f"workspace listing not readable: {'.'!r}") from exc
-            except OSError as exc:
-                # 复审 N-2 —— 同上一条 except 的路径泄露:``os.stat(user_root)``
-                # 是普通路径调用,失败的 ``OSError`` 会自带绝对 ``filename``,
-                # ``str(exc)`` 原样带着它。``exc.strerror`` 只留错误原因。
-                raise SandboxSupervisorError(f"workspace listing failed: {exc.strerror}") from exc
-            if not is_dir:
-                return []
 
+            # review 8 —— 作用域起点只按 fd 开(逐段 O_NOFOLLOW,``_open_scope_dir_fd``),不再先
+            # 拿路径字符串 ``os.stat`` 一遍:不存在 / 不是目录 → 空;某一段是符号链接 →
+            # ``WorkspacePathEscapeError``(载荷把自己的 ``work/`` 换成指向上层的链接,列出来的
+            # 就是别的租户的文件名);读不动 → ``WorkspacePermissionError``。
             def _on_walk_error(exc: OSError) -> None:
-                """``os.walk``'s ``onerror`` callback — Task 3 fix round 1.
+                """The walk's ``onerror`` callback — Task 3 fix round 1.
 
-                ``os.walk`` 默认 ``onerror=None``:一个扫不动的子树(典型是
+                ``os.walk`` / ``os.fwalk`` 默认 ``onerror=None``:一个扫不动的子树(典型是
                 ``EACCES``)会被**静默吞掉**——那棵子树下的文件从结果里凭空消
                 失,不报错也不留任何痕迹,而这恰恰是"列不动"最常见的形态,比
                 单个文件 ``lstat`` 失败常见得多(下面那处 ``try/except`` 只挡
@@ -939,85 +1013,72 @@ class NasWorkspaceStore:
                 :class:`SandboxSupervisorError`,把它翻成 ``{"success": true,
                 "files": []}`` —— 一次真实的权限故障被这层静默吞声悄悄变成
                 "工作区是空的",正是这整个任务要根治的那类失败。传给
-                ``os.walk`` 的 ``onerror=`` 让这类错误显式地把这次调用整个炸
+                walk 的 ``onerror=`` 让这类错误显式地把这次调用整个炸
                 掉,而不是悄悄漏掉一部分结果。
 
-                复审 I-1 —— 定义成 ``_list`` 内部的闭包(而不是模块级函数)只
-                为了能拿到 ``user_root`` 把 ``exc.filename``(``os.walk`` 给的
-                永远是绝对路径,NAS 挂载点在服务端的真实文件系统路径)转成工
-                作区相对路径。全局约束"用户可见的错误文案不含路径":下面兄弟
-                分支(``full.lstat()`` 那处 ``except PermissionError``)已经在
-                用相对的 ``rel``,这里之前是唯一还在裸拼 ``exc.filename!r`` 的
-                地方。
+                复审 I-1 —— 全局约束"用户可见的错误文案不含服务端绝对路径"。
+                改成 ``os.fwalk`` 之后 ``exc.filename`` 是相对当前目录 fd 的名
+                字(不再是 NAS 挂载点下的绝对路径), 直接用即可。
                 """
                 if isinstance(exc, PermissionError):
-                    rel = os.path.relpath(exc.filename, walk_root) if exc.filename else "."
+                    # fwalk 给的 filename 是相对当前目录 fd 的名字, 不是绝对路径。
+                    rel = os.fsdecode(exc.filename) if exc.filename else "."
                     raise WorkspacePermissionError(
                         f"workspace listing not readable: {rel!r}"
                     ) from exc
-                # 复审 N-2 —— 同上,``exc`` 是 os.walk 内部 scandir 失败的
-                # OSError,``filename`` 是绝对路径,``str(exc)`` 会带着它。
+                # 复审 N-2 —— 只带 strerror, 不带 ``str(exc)``(会附上 filename)。
                 raise SandboxSupervisorError(f"workspace listing failed: {exc.strerror}") from exc
 
+            try:
+                dfd = self._open_scope_dir_fd(tenant_id, user_id, "/".join(prefix))
+            except _WorkspacePathNotFoundError:
+                return []
             entries: list[WorkspaceFileEntry] = []
-            #: 用户根相对路径 → (大小, mtime 纳秒),认开场复制的原样副本用(review 7)。
-            stamps: dict[str, tuple[int, int]] = {}
-            # followlinks=False — see module docstring: never descend into a
-            # symlinked subdirectory, so an intermediate-component escape
-            # can't make this enumerate files outside the tree. onerror=
-            # (Task 3 fix round 1) — see _on_walk_error: without it, a
-            # subtree this process can't scan is silently dropped from the
-            # results instead of failing loudly.
             hidden = scope_hidden_heads(scope)
-            for dirpath, dirnames, filenames in os.walk(
-                walk_root, followlinks=False, onerror=_on_walk_error
-            ):
-                if hidden and Path(dirpath) == walk_root:
-                    # B-236 —— ``agent_shared`` 不列各对话自己的 ``threads/``。
-                    dirnames[:] = [d for d in dirnames if d not in hidden]
-                for name in filenames:
-                    full = Path(dirpath) / name
-                    rel = full.relative_to(walk_root).as_posix()
-                    # 保留前缀的判据吃的是**用户根相对**路径 ——
-                    # ``is_reserved_workspace_path`` 自己会剥掉 ``agents/<key>``
-                    # 这层容器再看头一段(见 ``persistence/workspace/layout.py``)。
-                    # 喂作用域相对路径进去在今天恰好也对, 但那是巧合不是契约:
-                    # 换一个容器层级就静默错位, 而错位的形态是"文件凭空消失"。
-                    if is_reserved_workspace_path("/".join((*prefix, rel))):
-                        continue
-                    if name == WORKSPACE_SEED_MARKER and _is_seed_marker("/".join((*prefix, rel))):
-                        continue  # B-236 —— 开场复制的标记是平台状态,不是产出
-                    # lstat, not stat — a symlink appearing as a plain file
-                    # entry must report its own byte length, never a stat()
-                    # of whatever it points at outside the tree (see module
-                    # docstring).
-                    try:
-                        # B-84 —— 一次 lstat 同时取大小与 mtime, 不为 mtime 多跑
-                        # 一次 stat: 这个循环在一棵几千文件的树上跑, 每多一次系
-                        # 统调用就是一次 NFS 往返。
-                        info = full.lstat()
-                    except PermissionError as exc:
-                        # 同 read_file:列不动 ≠ 不存在,不能被下面吞掉。
-                        raise WorkspacePermissionError(
-                            f"workspace listing not readable: {rel!r}"
-                        ) from exc
-                    except OSError as exc:
-                        # 复审 N-2(同类,这条不在复审原话点名的两处,但
-                        # ``full.lstat()`` 是普通路径调用,同款泄露,顺手在
-                        # 这一遍改掉)—— ``full`` 是绝对路径,``exc`` 会带
-                        # ``filename``,``str(exc)`` 原样带过来。
-                        raise SandboxSupervisorError(
-                            f"workspace listing failed: {rel!r}: {exc.strerror}"
-                        ) from exc
-                    entries.append(_entry(rel, info))
-                    stamps["/".join((*prefix, rel))] = (info.st_size, info.st_mtime_ns)
-            if not prefix or (prefix[0] == WORKSPACE_AGENTS_DIR and len(prefix) == 2):
-                # 用户根 / 整个 agent 作用域(浏览面):开场复制进各对话、一个字节都没动过的
-                # 副本不列 —— 每个对话都带着 agent 全部文件的一份,不剔的话几十个对话就把
-                # 列表的 2000 条上限占满,真正的产出被截掉(review 7)。
-                copies = _pristine_seed_copies(stamps)
-                if copies:
-                    entries = [e for e in entries if "/".join((*prefix, e.path)) not in copies]
+            # fwalk + follow_symlinks=False —— 见模块 docstring:子目录先 lstat 再
+            # 开、开出来的 fd 与 lstat 不是同一个 inode 就跳过, 被换成 symlink 的
+            # 目录名因此走不出去。os.walk 是先 islink 后按名字列, 中间那段空隙就是
+            # 跨租户列出文件名的口子。onerror= (Task 3 fix round 1) —— 见
+            # _on_walk_error:扫不动的子树必须炸, 不能静默漏掉。
+            walker = cast(
+                Generator[tuple[str, list[str], list[str], int], None, None],
+                os.fwalk(".", dir_fd=dfd, follow_symlinks=False, onerror=_on_walk_error),
+            )
+            #: B-236 —— 各对话 ``threads/<conv>/.seeded`` 标记的 mtime 与各文件的 ctime(纳秒),
+            #: 认原样副本用。
+            seeded_at: dict[str, int] = {}
+            ctimes: dict[str, int] = {}
+            try:
+                with closing(walker):
+                    for dirpath, dirnames, filenames, walk_fd in walker:
+                        if dirpath == "." and hidden:
+                            # B-236 —— ``agent_shared`` 不列各对话自己的 ``threads/``。
+                            dirnames[:] = [d for d in dirnames if d not in hidden]
+                        _list_dir_entries(
+                            prefix,
+                            dirpath,
+                            filenames,
+                            walk_fd,
+                            entries,
+                            seeded_at=seeded_at,
+                            ctimes=ctimes,
+                        )
+            except PermissionError as exc:
+                # fwalk 开起点(".")、对已开目录 scandir / fstat 的失败不走 onerror,
+                # 直接抛 —— 照 os.walk 时代的口径收成同两类, 调用方只认这两类。
+                raise WorkspacePermissionError(f"workspace listing not readable: {'.'!r}") from exc
+            except OSError as exc:
+                # 典型是 NFS 上列到一半目录被删(ESTALE)。
+                raise SandboxSupervisorError(f"workspace listing failed: {exc.strerror}") from exc
+            finally:
+                os.close(dfd)
+            # B-236 —— 开场复制进对话、之后没被碰过的副本不列(见 :func:`_drop_seed_copies`);
+            # 先剔再截 2000 条,否则副本照样把真正的产出挤出上限。
+            if not include_seed_copies:
+                if _is_conversation_work(prefix):
+                    # 标记在 ``threads/<conv>/``,不在这次遍历里:按 fd 多看一眼。
+                    self._note_seed_marker(tenant_id, user_id, prefix[:4], seeded_at)
+                entries = _drop_seed_copies(prefix, entries, seeded_at, ctimes)
             entries.sort(key=lambda entry: entry.path)
             return entries[:_MAX_LIST_ENTRIES]
 
@@ -1107,8 +1168,8 @@ class NasWorkspaceStore:
         :func:`os.fwalk` with ``dir_fd=`` rather than :func:`os.walk`: this one
         actually *reads* file bytes, so every open has to be ``dir_fd``-relative
         with ``O_NOFOLLOW`` — a symlink planted as a plain file entry pointing at
-        ``/etc/passwd`` must not be readable through here. :meth:`list_files` can
-        get away with :func:`os.walk` because it only ever ``lstat``s.
+        ``/etc/passwd`` must not be readable through here. :meth:`list_files` walks
+        the same way.
         """
         if name_glob is None and content is None:
             msg = "search_files needs at least one of 'name_glob' / 'content'"
@@ -1156,7 +1217,9 @@ class NasWorkspaceStore:
                     )
                     if not stat.S_ISREG(os.fstat(fd).st_mode):
                         os.close(fd)
-                        raise WorkspaceNotAFileError(f"workspace path is not a file: {path!r}")
+                        raise WorkspaceNotARegularFileError(
+                            f"workspace path is not a regular file: {path!r}"
+                        )
                 except PermissionError as exc:
                     # 写不动同样是"配置问题"而非"不存在"——见
                     # WorkspacePermissionError 的说明,W2-BUG-1 那一类故障

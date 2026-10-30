@@ -294,3 +294,66 @@ async def test_a_run_ending_after_the_user_was_purged_writes_nothing(tmp_path: P
 
     assert await _observe(tmp_path) == versions_mod.ObserveReport()
     assert not _versions_root(tmp_path).exists()
+
+
+# ---------------------------------------------------------------------------
+# review 8 —— 观察者先付、版本目录封顶、遍历不全不判「不见」
+# ---------------------------------------------------------------------------
+
+
+async def test_the_observing_agent_pays_for_the_cap_first(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """超了上限先删这次观察的 agent 自己的旧版本;别的 agent 的历史不因它改得勤被挤掉。"""
+    monkeypatch.setattr(versions_mod, "MAX_USER_VERSION_BYTES", 6_000)
+    other = tmp_path / str(_TENANT) / str(_USER) / "agents" / "other-bbbbbbbb"
+    _put(other / "keep.md", "o" * 1_000)
+    await _store(tmp_path).observe(tenant_id=_TENANT, user_id=_USER, agent_key="other-bbbbbbbb")
+    await asyncio.sleep(0.01)
+    tpl = _agent(tmp_path) / "tpl" / "t.md"
+    for i in range(8):
+        _put(tpl, f"{i}".ljust(1_000, "x"))
+        os.utime(tpl, ns=(i * 10**9 + 1, i * 10**9 + 1))
+        await _observe(tmp_path)
+
+    others = list((_versions_root(tmp_path) / "other-bbbbbbbb").rglob("v*"))
+    assert len(others) == 1  # 另一个 agent 唯一的那份还在
+    assert _version_bytes(tmp_path) <= 6_000
+
+
+async def test_version_dirs_per_agent_are_capped(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """换着名字写空文件:字节上限管不住目录数,这道闸管。"""
+    monkeypatch.setattr(versions_mod, "MAX_VERSION_DIRS_PER_AGENT", 5)
+    agent = _agent(tmp_path)
+    for i in range(12):
+        for f in agent.glob("churn-*"):
+            f.unlink()
+        _put(agent / f"churn-{i}", "")
+        await _observe(tmp_path)
+
+    assert len(list((_versions_root(tmp_path) / _KEY).iterdir())) <= 5
+
+
+async def test_an_unreadable_dir_does_not_start_the_missing_clock(tmp_path: Path) -> None:
+    """``chmod 000`` 的目录里有什么不知道:这次遍历不完整,不给里面的文件记「不见」。"""
+    sub = _agent(tmp_path) / "tpl"
+    _put(sub / "t.md", "t")
+    await _observe(tmp_path)
+    sub.chmod(0)
+    try:
+        await _observe(tmp_path)
+    finally:
+        sub.chmod(0o700)
+    assert list(_versions_root(tmp_path).rglob("missing")) == []
+
+
+async def test_the_depth_limit_does_not_start_the_missing_clock(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _put(_agent(tmp_path) / "a" / "b" / "c.md", "c")
+    await _observe(tmp_path)
+    monkeypatch.setattr(versions_mod, "MAX_SEED_DEPTH", 2)
+    await _observe(tmp_path)
+    assert list(_versions_root(tmp_path).rglob("missing")) == []

@@ -346,6 +346,9 @@ async def test_workspace_files_and_download_with_supervisor(
         assert "attachment" in download.headers["content-disposition"]
         assert "report.pdf" in download.headers["content-disposition"]
 
+        # B-236 review 8 —— 删掉之后连它的历史版本一起删(按投影后的存储路径)。
+        versions = _RecordingVersions()
+        app.state.agent_file_versions = versions
         # Delete proxies the path through to the supervisor (thread-scoped).
         deleted = await client.request(
             "DELETE", f"/v1/sessions/{thread_id}/workspace/file", params={"path": "report.pdf"}
@@ -361,6 +364,7 @@ async def test_workspace_files_and_download_with_supervisor(
         agent_key = sanitize_agent_key(meta.agent_name or "")
         assert agent_key, "会话必须绑着 agent,否则这条验的是退化路径"
         assert [d[2] for d in store.workspace_deletes] == [f"agents/{agent_key}/report.pdf"]
+        assert versions.deleted == [f"agents/{agent_key}/report.pdf"]
 
         # A traversal path is rejected before reaching the supervisor.
         bad = await client.request(
@@ -1584,3 +1588,15 @@ async def test_purge_thread_dir_failure_is_audit_visible_and_not_fatal(
     details = _purge_audit_details(page, tid)
     assert details["meta_removed"] is True
     assert details["threads_dir_delete_failed"] is True
+
+
+class _RecordingVersions:
+    """B-236 —— 记下删文件接口让版本存储删了哪些路径。"""
+
+    def __init__(self) -> None:
+        self.deleted: list[str] = []
+
+    async def delete_for_path(self, *, tenant_id: UUID, user_id: UUID, path: str) -> int:
+        del tenant_id, user_id
+        self.deleted.append(path)
+        return 1

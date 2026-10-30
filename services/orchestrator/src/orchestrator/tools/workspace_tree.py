@@ -276,25 +276,22 @@ def render_workspace_block(
 
 
 def _seed_copies(
-    conversation: Sequence[WorkspaceFileEntry], agent: Sequence[WorkspaceFileEntry]
+    conversation: Sequence[WorkspaceFileEntry], pristine: frozenset[str]
 ) -> frozenset[str]:
-    """本对话里哪些一级目录是 ``/agent`` 同名目录**原样未改**的副本。
+    """本对话里哪些一级目录整个是开场复制进来、之后一个文件都没碰过的副本。
 
-    开场复制(``conversation_seed``)保留 mtime,所以没动过的副本与源目录的
-    ``(相对路径, 大小, mtime)`` 集合逐项相等;改过、加过、删过任何一个文件就不相等,那个
-    目录按普通目录展开 —— 那是这个对话自己的改动,模型要看得见。
+    ``pristine`` 是存储认出来的原样副本(按对话路径;NAS 实现按 ctime 与 ``.seeded`` 标记比,
+    见 ``nas_workspace_store._drop_seed_copies``)。目录里只要有一个文件不在其中 —— 本对话改过、
+    新写的 —— 整个目录就照常展开:那是这个对话自己的改动,模型要看得见。
     """
-
-    def by_top(entries: Sequence[WorkspaceFileEntry]) -> dict[str, set[tuple[str, int, object]]]:
-        out: dict[str, set[tuple[str, int, object]]] = {}
-        for e in entries:
-            top, sep, rest = e.path.partition("/")
-            if sep:
-                out.setdefault(top, set()).add((rest, e.size, e.mtime))
-        return out
-
-    ours, theirs = by_top(conversation), by_top(agent)
-    return frozenset(name for name, files in ours.items() if theirs.get(name) == files)
+    by_top: dict[str, list[str]] = {}
+    for e in conversation:
+        top, sep, _rest = e.path.partition("/")
+        if sep:
+            by_top.setdefault(top, []).append(e.path)
+    return frozenset(
+        name for name, paths in by_top.items() if all(path in pristine for path in paths)
+    )
 
 
 #: review 7 —— 「没复制」那一行最多列几个目录、每个名字最多几个字符。名字是沙箱能起的。
@@ -328,6 +325,7 @@ def render_conversation_block(
     conversation: Sequence[WorkspaceFileEntry],
     agent: Sequence[WorkspaceFileEntry],
     *,
+    pristine: frozenset[str] = frozenset(),
     seed_skipped: Sequence[str] = (),
     seed_quota_blocked: bool = False,
     max_expanded: int = DEFAULT_MAX_EXPANDED,
@@ -345,12 +343,13 @@ def render_conversation_block(
     """
     if not conversation and not agent and not seed_skipped:
         return ""
-    copies = _seed_copies(conversation, agent)
+    copies = _seed_copies(conversation, pristine)
     own = [e for e in conversation if e.path.partition("/")[0] not in copies]
     conv_tree, used = _render_tree(own, max_expanded=max_expanded)
     agent_tree, _ = _render_tree(agent, max_expanded=max(max_expanded - used, 0))
     copy_lines = [
-        f"{_INDENT_DIR}{name + '/':<{_NAME_WIDTH}}unchanged copy of {AGENT_VIEW}/{name}/"
+        f"{_INDENT_DIR}{name + '/':<{_NAME_WIDTH}}"
+        f"unchanged copy of {AGENT_VIEW}/{name}/ (as of this conversation's start)"
         for name in sorted(copies)
     ]
     skipped = _skipped_line(seed_skipped, quota=seed_quota_blocked)
@@ -395,13 +394,14 @@ async def workspace_prompt_block(
         if not view.per_conversation:
             return render_workspace_block(agent, max_expanded=max_expanded)
         try:
+            conv_scope = store_scope(EXEC_VIEW, agent_key=agent_key, conv_id=view.conv_id)
+            # B-236 —— 两份清单:全量的(含原样副本)与存储剔过副本的;差就是原样副本。
             conversation = await store.list_files(
-                tenant_id=tenant_id,
-                user_id=user_id,
-                scope=store_scope(EXEC_VIEW, agent_key=agent_key, conv_id=view.conv_id),
+                tenant_id=tenant_id, user_id=user_id, scope=conv_scope, include_seed_copies=True
             )
+            outputs = await store.list_files(tenant_id=tenant_id, user_id=user_id, scope=conv_scope)
         except MISSING_DIR_ERRORS:
-            conversation = []
+            conversation = outputs = []
     except Exception:
         logger.warning(
             "workspace_tree.listing_failed agent_key=%s — workspace block omitted",
@@ -409,9 +409,11 @@ async def workspace_prompt_block(
             exc_info=True,
         )
         return ""
+    kept = {e.path for e in outputs}
     return render_conversation_block(
         conversation,
         agent,
+        pristine=frozenset(e.path for e in conversation if e.path not in kept),
         seed_skipped=seed_skipped,
         seed_quota_blocked=seed_quota_blocked,
         max_expanded=max_expanded,

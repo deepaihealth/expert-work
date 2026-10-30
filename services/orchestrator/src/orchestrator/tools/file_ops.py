@@ -65,6 +65,7 @@ from orchestrator.tools.sandbox import (
     WorkspaceFileTooLargeError,
     WorkspaceNotADirectoryError,
     WorkspaceNotAFileError,
+    WorkspaceNotARegularFileError,
     WorkspacePathEscapeError,
     WorkspacePermissionError,
     run_in_sandbox,
@@ -715,6 +716,10 @@ def _raise_for_store_error(exc: SandboxSupervisorError, *, tool: str) -> NoRetur
     if isinstance(exc, WorkspacePathEscapeError):
         msg = f"{tool}: path escapes the workspace"
         raise ToolBlockedError(msg) from exc
+    if isinstance(exc, WorkspaceNotARegularFileError):
+        # B-236 review 8 —— FIFO / 设备 / socket:不是目录,别让模型去 list_dir。
+        msg = f"{tool} failed: not_a_regular_file"
+        raise FileOpError(msg) from exc
     if isinstance(exc, WorkspaceNotAFileError):
         msg = f"{tool} failed: is_a_directory"
         raise FileOpError(msg) from exc

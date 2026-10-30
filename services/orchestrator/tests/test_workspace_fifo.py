@@ -94,3 +94,18 @@ async def test_a_fifo_index_never_hangs_the_notes_node(tmp_path: Path) -> None:
     }
     state: Any = {"messages": [HumanMessage(content="hi")]}
     assert await _promptly(fifo, node(state, config)) == {}  # type: ignore[arg-type]
+
+
+async def test_read_file_tool_calls_a_fifo_not_a_regular_file(tmp_path: Path) -> None:
+    """review 8 —— 说它是目录是假话(模型会去 list_dir):如实说不是普通文件。"""
+    from orchestrator.tools import FileOpError, ReadFileTool, ToolContext
+
+    fifo = _fifo(tmp_path, f"agents/{_KEY}/notes.md")
+    ctx = ToolContext(tenant_id=_TENANT, user_id=_USER, agent_key=_KEY)
+    with pytest.raises(FileOpError, match="not_a_regular_file"):
+        await _promptly(
+            fifo,
+            ReadFileTool(store=NasWorkspaceStore(root=str(tmp_path))).call(
+                {"path": "notes.md"}, ctx=ctx
+            ),
+        )

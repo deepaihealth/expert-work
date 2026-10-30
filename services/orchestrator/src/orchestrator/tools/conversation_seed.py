@@ -90,6 +90,9 @@ MAX_SEED_DEPTH = 12
 #: 实测最多 77 个文件,两遍不到 200;2000 是十倍余量,只防攻击形态。
 MAX_SEED_VISITS = 2000
 
+#: run 被取消后最多等复制线程这么久再放锁(秒)。见 :func:`_drain`。
+CANCEL_DRAIN_S = 120.0
+
 #: 本对话复制做完的标记,最后写。在 ``threads/<conv>/`` 下,不在 ``work/`` 里。
 SEED_MARKER = WORKSPACE_SEED_MARKER
 
@@ -325,15 +328,26 @@ def _exists(dir_fd: int, name: str) -> bool:
 def _candidates(agent_fd: int, budget: _Budget) -> list[str]:
     """agent 根下可复制的一级目录:不是点开头、不是布局 / 平台保留名、是真目录。
 
-    看过的名字计数;到顶之后剩下的名字不再 ``lstat``(也就不再是候选)。"""
+    看过的名字计数;到顶之后剩下的名字不再 ``lstat``,其中目录项类型(``readdir`` 给的,不另
+    发系统调用)是目录的记成「太大」—— 只在 ``/agent/<目录>/``(review 8)。"""
     out: list[str] = []
-    for name in sorted(os.listdir(agent_fd)):
+    with os.scandir(agent_fd) as it:
+        listed = sorted(it, key=lambda e: e.name)
+    capped = False
+    for entry in listed:
+        name = entry.name
         if name.startswith(".") or name in AGENT_ROOT_RESERVED:
             continue
-        try:
-            budget.visit()
-        except _TooLargeError:
-            break
+        if not capped:
+            try:
+                budget.visit()
+            except _TooLargeError:
+                capped = True
+        if capped:
+            with contextlib.suppress(OSError):
+                if _utf8(name) and entry.is_dir(follow_symlinks=False):
+                    budget.too_large.append(name)
+            continue
         if not _utf8(name):
             budget.skipped += 1
             continue
@@ -582,9 +596,26 @@ async def _copy_holding_the_lock(
         return await asyncio.shield(work)
     except asyncio.CancelledError:
         stop.set()
-        with contextlib.suppress(Exception):
-            await work
+        await _drain(work)
         raise
+
+
+async def _drain(work: asyncio.Future[SeedReport | None]) -> None:
+    """取消之后等复制线程停下 —— 期间再来的取消一律吞掉接着等(review 8:第二次取消不能让
+    调用方在线程还在写时就放锁),但最多等 :data:`CANCEL_DRAIN_S` 秒。停止标志在每个名字处
+    检查,线程最多再写完手上那一个文件(≤ 20 MB),正常远用不到这个上限;真到了就记一条
+    日志放手,不让一个卡住的 NAS 把取消永远挡住。"""
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + CANCEL_DRAIN_S
+    while not work.done():
+        remaining = deadline - loop.time()
+        if remaining <= 0:
+            logger.warning("conversation_seed.cancel_drain_timed_out")
+            return
+        with contextlib.suppress(asyncio.CancelledError):
+            await asyncio.wait({work}, timeout=remaining)
+    with contextlib.suppress(BaseException):
+        work.result()
 
 
 async def seed_conversation(

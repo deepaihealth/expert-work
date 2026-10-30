@@ -450,10 +450,13 @@ async def test_browse_listings_leave_pristine_seed_copies_out(tmp_path: Path) ->
     assert f"{work}/{first}/work/style/f0.md" in paths and edited.exists()
     assert f"{work}/{first}/work/style/new.md" in paths
     assert len(paths) == 22 + 3  # agent 自己的 22 个 + 三个本对话的产出;标记也不列
-    scoped = await store.list_files(
-        tenant_id=_TENANT, user_id=_USER, scope=f"conversation:{_KEY}:{first}"
+    scope = f"conversation:{_KEY}:{first}"
+    scoped = await store.list_files(tenant_id=_TENANT, user_id=_USER, scope=scope)
+    assert sorted(e.path for e in scoped) == ["style/f0.md", "style/new.md"]
+    everything = await store.list_files(
+        tenant_id=_TENANT, user_id=_USER, scope=scope, include_seed_copies=True
     )
-    assert len(scoped) == 23  # 对话作用域照旧全列(快照段要拿它认副本)
+    assert len(everything) == 23  # 快照段要拿全量那份认副本
 
 
 async def test_a_same_size_copy_with_another_mtime_is_listed(tmp_path: Path) -> None:
@@ -474,3 +477,140 @@ def test_skipped_dir_names_are_bounded_and_escaped() -> None:
     assert "x" * 61 not in line
     assert "and 44 more under /agent/" in line
     assert len(line) < 800
+
+
+async def test_editing_the_source_later_keeps_old_copies_hidden(tmp_path: Path) -> None:
+    """review 8 —— 判据是「副本的 ctime 不晚于本对话的 ``.seeded``」,不是「与 /agent 现状相同」:
+    源文件之后被改,老对话的副本照样是原样副本,不回到列表里。"""
+    src = _put(_agent(tmp_path) / "style" / "s.md", "v1")
+    store = NasWorkspaceStore(root=str(tmp_path))
+    seed_mod.seed_conversation_sync(store, _TENANT, _USER, _KEY, _C1)
+    _put(src, "v2 — edited in /agent after the conversation started")
+
+    paths = [e.path for e in await store.list_files(tenant_id=_TENANT, user_id=_USER)]
+
+    assert paths == [f"agents/{_KEY}/style/s.md"]
+
+
+async def test_an_output_copied_into_agent_with_cp_a_stays_listed(tmp_path: Path) -> None:
+    """review 8 —— 对话自己的产出被 ``cp -a`` 进 /agent(同大小、同 mtime):对话里那份不是副本。"""
+    import shutil
+
+    _put(_agent(tmp_path) / "style" / "s.md", "v1")
+    store = NasWorkspaceStore(root=str(tmp_path))
+    seed_mod.seed_conversation_sync(store, _TENANT, _USER, _KEY, _C1)
+    out = _put(_work(tmp_path) / "style" / "report.md", "mine")
+    shutil.copy2(out, _agent(tmp_path) / "style" / "report.md")
+
+    paths = [e.path for e in await store.list_files(tenant_id=_TENANT, user_id=_USER)]
+
+    assert f"agents/{_KEY}/threads/{_C1}/work/style/report.md" in paths
+
+
+async def test_without_a_marker_nothing_in_the_conversation_is_a_copy(tmp_path: Path) -> None:
+    _put(_agent(tmp_path) / "style" / "s.md", "v1")
+    store = NasWorkspaceStore(root=str(tmp_path))
+    seed_mod.seed_conversation_sync(store, _TENANT, _USER, _KEY, _C1)
+    (_conv(tmp_path) / SEED_MARKER).unlink()
+
+    paths = [e.path for e in await store.list_files(tenant_id=_TENANT, user_id=_USER)]
+
+    assert f"agents/{_KEY}/threads/{_C1}/work/style/s.md" in paths
+
+
+async def test_the_block_collapses_a_copy_whose_source_changed_later(tmp_path: Path) -> None:
+    from orchestrator.tools.workspace_paths import WorkspaceView
+    from orchestrator.tools.workspace_tree import workspace_prompt_block
+
+    src = _put(_agent(tmp_path) / "style" / "s.md", "v1")
+    _put(_agent(tmp_path) / "tpl" / "t.md", "t")
+    store = NasWorkspaceStore(root=str(tmp_path))
+    seed_mod.seed_conversation_sync(store, _TENANT, _USER, _KEY, _C1)
+    _put(src, "v2")
+    _put(_work(tmp_path) / "tpl" / "t.md", "x")  # 同大小,内容改了
+
+    block = await workspace_prompt_block(
+        store,
+        tenant_id=_TENANT,
+        user_id=_USER,
+        view=WorkspaceView(agent_key=_KEY, conv_id=_C1, thread_id=_C1),
+    )
+    ours = block.split("## /workspace (this conversation)\n", 1)[1].split("\n\n", 1)[0]
+    assert "unchanged copy of /agent/style/" in ours
+    assert "t.md" in ours and "unchanged copy of /agent/tpl/" not in ours
+
+
+async def test_a_second_cancel_does_not_release_the_lock_while_copying(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """review 8 —— 等复制线程停下的那段里再来一次取消,也要等线程停了才往外抛(锁才放)。"""
+    for i in range(20):
+        _put(_agent(tmp_path) / "tpl" / f"f{i:02d}", "x")
+    real = seed_mod._copy_file
+    state: dict[str, Any] = {"started": asyncio.Event(), "running": False}
+    loop = asyncio.get_running_loop()
+
+    def slow_copy(*args: Any) -> None:
+        state["running"] = True
+        loop.call_soon_threadsafe(state["started"].set)
+        try:
+            time.sleep(0.3)
+            real(*args)
+        finally:
+            state["running"] = False
+
+    monkeypatch.setattr(seed_mod, "_copy_file", slow_copy)
+    task = asyncio.create_task(_seed(tmp_path))
+    await state["started"].wait()
+    task.cancel()
+    await asyncio.sleep(0.05)
+    task.cancel()  # 第二次取消,落在等线程停下的那段里
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert state["running"] is False
+    assert not (_conv(tmp_path) / SEED_MARKER).exists()
+
+
+async def test_top_level_dirs_past_the_visit_cap_are_reported(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(seed_mod, "MAX_SEED_VISITS", 3)
+    for j in range(6):
+        _put(_agent(tmp_path) / f"d{j}" / "f", "")
+
+    report = await _seed(tmp_path)
+
+    assert report is not None
+    assert set(report.skipped_too_large) | set(report.copied) == {f"d{j}" for j in range(6)}
+    assert {"d4", "d5"} <= set(report.skipped_too_large)
+
+
+def test_seed_state_is_stripped_from_sse_updates() -> None:
+    from orchestrator.sse import _strip_internal_state_keys
+
+    chunk = {
+        "conversation_seed": {"seed_skipped_dirs": ["big"], "seed_quota_blocked": True},
+        "agent": {"messages": []},
+    }
+    assert _strip_internal_state_keys(chunk) == {"conversation_seed": {}, "agent": {"messages": []}}
+
+
+async def test_copies_are_dropped_before_the_listing_cap(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """review 8 —— 先剔副本再截上限:对话作用域里副本多于上限时,真正的产出照样列得出来。"""
+    from orchestrator.tools import nas_workspace_store as nws
+
+    for i in range(6):
+        _put(_agent(tmp_path) / "style" / f"s{i}.md", "x")
+    store = NasWorkspaceStore(root=str(tmp_path))
+    seed_mod.seed_conversation_sync(store, _TENANT, _USER, _KEY, _C1)
+    _put(_work(tmp_path) / "zz-report.md", "r")
+    monkeypatch.setattr(nws, "_MAX_LIST_ENTRIES", 3)
+
+    scoped = await store.list_files(
+        tenant_id=_TENANT, user_id=_USER, scope=f"conversation:{_KEY}:{_C1}"
+    )
+
+    assert [e.path for e in scoped] == ["zz-report.md"]

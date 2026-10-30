@@ -313,6 +313,15 @@ class WorkspaceNotAFileError(SandboxSupervisorError):
     """
 
 
+class WorkspaceNotARegularFileError(WorkspaceNotAFileError):
+    """路径指到的既不是文件也不是目录 —— FIFO / 设备 / socket(B-236 review 8)。
+
+    沙箱能在工作区里种这些东西;宿主侧一律不读不写。子类而不是兄弟:只认
+    :class:`WorkspaceNotAFileError` 的老调用方照旧接得住;``file_ops`` 先认它,告诉模型
+    ``not_a_regular_file`` 而不是 ``is_a_directory``(说它是目录是假话,模型会去 ``list_dir``)。
+    """
+
+
 class WorkspaceNotADirectoryError(SandboxSupervisorError):
     """路径指到的是文件, 不是目录(B-84)。:class:`WorkspaceNotAFileError` 的反面。"""
 

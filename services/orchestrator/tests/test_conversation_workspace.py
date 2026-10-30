@@ -478,18 +478,15 @@ def test_an_unchanged_seed_copy_takes_one_line_and_no_budget() -> None:
     conv = [
         *(_entry(f"style/s{i}.md") for i in range(20)),
         _entry("tpl/t.md", size=2, day=9),  # 本对话改过
+        _entry("tpl/u.md"),  # 与原样副本同目录:整个目录照常展开
         _entry("mine.md"),
     ]
-    # review 7 —— 大小一样、mtime 变了:也是改过的副本,照常展开
-    same_size = render_conversation_block(
-        [_entry("tpl/t.md", day=9)], [_entry("tpl/t.md")], max_expanded=23
-    )
-    assert "unchanged copy" not in same_size and "t.md" in same_size
-    block = render_conversation_block(conv, agent, max_expanded=23)
+    pristine = frozenset({*(f"style/s{i}.md" for i in range(20)), "tpl/u.md"})
+    block = render_conversation_block(conv, agent, pristine=pristine, max_expanded=24)
     ours = block.split(CONVERSATION_SECTION + "\n", 1)[1].split("\n\n", 1)[0]
     assert "  style/" in ours and "unchanged copy of /agent/style/" in ours
     assert "s0.md" not in ours  # 未改动的副本不展开
-    assert "t.md" in ours and "mine.md" in ours  # 改过的副本与本对话自己的文件照常列
+    assert "t.md" in ours and "u.md" in ours and "mine.md" in ours  # 改过的目录照常展开
     theirs = block.split(AGENT_SECTION + "\n", 1)[1]
     assert "s0.md" in theirs  # 预算没被副本吃掉,/agent 一节照样展开
 

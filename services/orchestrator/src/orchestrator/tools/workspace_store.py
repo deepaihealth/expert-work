@@ -138,22 +138,6 @@ def _entry_from_wire(raw: Mapping[str, Any]) -> WorkspaceFileEntry:
     return WorkspaceFileEntry(path=str(raw["path"]), size=int(raw["size"]), mtime=mtime)
 
 
-def without_seed_copies(
-    conversation: Sequence[WorkspaceFileEntry], agent: Sequence[WorkspaceFileEntry]
-) -> list[WorkspaceFileEntry]:
-    """B-236 review 7 —— 一个对话的文件(相对它的 ``work/``)去掉开场复制进来、原样未改的副本。
-
-    ``agent`` 是 agent 根的文件(相对 agent 根)。副本只会出现在子目录里(一级文件从不复制),
-    且大小与 mtime 都与源相同(复制保留 mtime);拿不到 mtime 的后端一律不剔,宁可多列。
-    """
-    source = {e.path: (e.size, e.mtime) for e in agent if e.mtime is not None}
-    return [
-        e
-        for e in conversation
-        if "/" not in e.path or e.mtime is None or source.get(e.path) != (e.size, e.mtime)
-    ]
-
-
 def scope_view(entries: Sequence[WorkspaceFileEntry], scope: str) -> list[WorkspaceFileEntry]:
     """把一份**用户根相对**的清单裁到一个作用域里, 并剥掉前缀。
 
@@ -261,13 +245,21 @@ class WorkspaceStore(Protocol):
         """
 
     async def list_files(
-        self, *, tenant_id: UUID, user_id: UUID, scope: str = SCOPE_USER_ROOT
+        self,
+        *,
+        tenant_id: UUID,
+        user_id: UUID,
+        scope: str = SCOPE_USER_ROOT,
+        include_seed_copies: bool = False,
     ) -> list[WorkspaceFileEntry]:
         """List the files in a user's persistent workspace volume (browse).
 
         递归, 且过滤保留前缀(``uploads/`` / ``skills/`` / ``inputs/`` /
         ``.tool_results/``)—— 这是"产物"视图。要"这一个目录里有什么"用
         :meth:`list_dir`, 两者不是同一件事。``path`` 回的是**作用域相对**路径。
+
+        ``include_seed_copies``(B-236)—— 默认不列开场复制进对话、之后没被碰过的副本(只有
+        NAS 实现认得出副本;别的实现照旧全列)。``True`` 全列。
         """
 
     async def list_dir(
@@ -461,7 +453,12 @@ class SupervisorWorkspaceStore:
         return search_result(hits, max_results=max_results)
 
     async def list_files(
-        self, *, tenant_id: UUID, user_id: UUID, scope: str = SCOPE_USER_ROOT
+        self,
+        *,
+        tenant_id: UUID,
+        user_id: UUID,
+        scope: str = SCOPE_USER_ROOT,
+        include_seed_copies: bool = False,
     ) -> list[WorkspaceFileEntry]:
         url = f"{self.base_url}/v1/workspaces/{tenant_id}/{user_id}/files"
         async with self._make_client() as client:
@@ -631,7 +628,12 @@ class RecordingWorkspaceStore:
         return data
 
     async def list_files(
-        self, *, tenant_id: UUID, user_id: UUID, scope: str = SCOPE_USER_ROOT
+        self,
+        *,
+        tenant_id: UUID,
+        user_id: UUID,
+        scope: str = SCOPE_USER_ROOT,
+        include_seed_copies: bool = False,
     ) -> list[WorkspaceFileEntry]:
         self.workspace_reads.append((tenant_id, user_id, ""))
         if self.workspace_list_error is not None:

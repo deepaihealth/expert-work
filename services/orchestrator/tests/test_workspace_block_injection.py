@@ -123,8 +123,14 @@ class _PerUserStore(RecordingWorkspaceStore):
     list_scopes: list[tuple[UUID, UUID, str]] = field(default_factory=list)
 
     async def list_files(
-        self, *, tenant_id: UUID, user_id: UUID, scope: str = SCOPE_USER_ROOT
+        self,
+        *,
+        tenant_id: UUID,
+        user_id: UUID,
+        scope: str = SCOPE_USER_ROOT,
+        include_seed_copies: bool = False,
     ) -> list[WorkspaceFileEntry]:
+        del include_seed_copies
         self.list_scopes.append((tenant_id, user_id, scope))
         return scope_view(self.by_user.get(user_id, []), scope)
 
@@ -137,8 +143,14 @@ class _TurnVaryingStore(RecordingWorkspaceStore):
     served: int = 0
 
     async def list_files(
-        self, *, tenant_id: UUID, user_id: UUID, scope: str = SCOPE_USER_ROOT
+        self,
+        *,
+        tenant_id: UUID,
+        user_id: UUID,
+        scope: str = SCOPE_USER_ROOT,
+        include_seed_copies: bool = False,
     ) -> list[WorkspaceFileEntry]:
+        del include_seed_copies
         del tenant_id, user_id
         idx = min(self.served, len(self.trees) - 1)
         self.served += 1
