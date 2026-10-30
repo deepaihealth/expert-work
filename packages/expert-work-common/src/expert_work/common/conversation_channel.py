@@ -247,6 +247,7 @@ def visible_turns(
 
 
 __all__ = [
+    "AGENT_NOTES_BLOCK_MARK",
     "CHANNEL_COMMENTARY",
     "CHANNEL_FINAL",
     "FIGURE_BLOCK_MARK",

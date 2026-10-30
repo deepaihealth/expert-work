@@ -103,7 +103,6 @@ SEED_MARKER = WORKSPACE_SEED_MARKER
 #: 复制进行中的临时目录名前缀(``threads/<conv>/.seed-tmp-<随机>/``)。
 SEED_TMP_PREFIX = ".seed-tmp-"
 
-_DIR_MODE = 0o700
 _FILE_MODE = 0o600
 _CHUNK = 1024 * 1024
 #: 源文件:不跟符号链接;``O_NONBLOCK`` 让被换成 FIFO 的名字打开时不卡住(随后 ``fstat`` 拒)。
