@@ -12,7 +12,9 @@ agent 自己的记忆(偏好、模板、脚本、索引 ``AGENT_NOTES.md``)住�
   sha256,内容相同只把副本的 mtime 对齐。
 * **留在哪。** ``{root}/{tenant}/.agent-file-versions/{user}/{agent_key}/{sha256(路径)[:32]}/``:
   用户根的旁边,沙箱挂不到(同产物版本副本的位置理由)。每个文件一个目录,``path`` 记它的
-  路径,版本文件名 ``v<序号>-<sha256>``;每个文件只留最近 :data:`MAX_VERSIONS_PER_FILE` 份。
+  路径,版本文件名 ``v<序号>-<sha256>``;每个文件只留最近 :data:`MAX_VERSIONS_PER_FILE` 份,
+  且每个 agent 的全部版本合计不超过它自己的 :data:`MAX_AGENT_VERSION_BYTES`(review 10:只删
+  这个 agent 自己的版本,各 agent 之间按构造隔离)。
 * **失败不连累 run。** 整个观察在 run 结束之后 fire-and-forget,任何异常只记日志(异常类型)
   和计数。清除用户时整个用户目录删掉(``purge_user`` / 留存作业)。
 
@@ -48,7 +50,7 @@ from orchestrator.tools.nas_workspace_store import (
     workspace_deleted_marker,
 )
 from orchestrator.tools.sandbox import WorkspacePathEscapeError
-from orchestrator.tools.workspace_paths import AGENT_ROOT_RESERVED, AGENTS_DIR
+from orchestrator.tools.workspace_paths import AGENT_NOTES_FILE, AGENT_ROOT_RESERVED, AGENTS_DIR
 
 logger = logging.getLogger(__name__)
 
@@ -62,14 +64,21 @@ MAX_VERSIONED_FILE_BYTES = 8 * 1024 * 1024
 #: 一次观察最多读这么多字节(只读大小 / mtime 变了的文件)。读不完的留到下一次 run 结束。
 MAX_OBSERVE_READ_BYTES = 20 * 1024 * 1024
 
-#: review 7 —— 一个用户全部版本(所有 agent)合计的上限。超了从最早写下的版本删起,跨文件、
-#: 跨 agent。版本也计入这个用户的工作区配额(``WorkspaceQuotaService.refresh``)。
-MAX_USER_VERSION_BYTES = 200 * 1024 * 1024
+#: review 10 —— 每个(用户, agent)自己的版本字节预算,**各文件最新那份也算在内**。删只删这个
+#: agent 自己的版本,别的 agent 再大也碰不到这里(取代 review 7~9 的用户合计 200 MiB 跨 agent
+#: 删除:「谁来付」连着三轮审查都有洞,改成按构造隔离)。测试环境实测最大的 agent 根 25.5 MB:
+#: 50 MiB 放得下它当前全部文件一份,再加差不多同样多的历史。一个用户的合计因此不超过「agent 数
+#: 乘 50 MiB」,且照旧计入这个用户的工作区配额(``WorkspaceQuotaService.refresh``)。
+MAX_AGENT_VERSION_BYTES = 50 * 1024 * 1024
 
-#: review 8 —— 每个 agent 最多这么多个版本目录(每个被留过版本的路径一个)。字节上限管不住
-#: 「换着名字写空文件」:每次观察最多 500 个新路径,不封顶的话目录与 inode 无限涨。超了按
-#: 目录最近一次变动从旧到新删整个版本目录。实测每个 agent 根最多 77 个文件,2000 留足余量。
+#: review 8 —— 每个 agent 最多这么多个版本目录(每个被留过版本的路径一个)。字节预算管不住
+#: 「换着名字写空文件」:每次观察最多 500 个新路径,不封顶的话目录与 inode 无限涨。实测每个
+#: agent 根最多 77 个文件,2000 留足余量。review 10 起每次观察都查(不只在写了新版本时)。
 MAX_VERSION_DIRS_PER_AGENT = 2000
+
+#: review 10 —— 没有 ``path`` 或一份版本都没有的版本目录,建了满这么久还这样就删掉(正常写入
+#: 是建目录、写 ``path``、写版本一气呵成;留一小时是不跟另一次同时进行的观察抢)。
+ORPHAN_DIR_GRACE_S = 3600
 
 #: review 7 —— 源文件从 ``/agent`` 消失满这么久,它的版本目录整个删掉。「从哪天起不见」记在
 #: 版本目录里的 ``missing`` 标记上(第一次发现不见时建,文件回来就删)。
@@ -83,7 +92,8 @@ _READ_FLAGS = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC
 
 agent_file_versions_total = expert_work_counter(
     "expert_work_agent_file_versions_total",
-    "B-236 run-end observation of /agent files: snapshots written, and observations "
+    "B-236 run-end observation of /agent files: snapshots written, observations that "
+    "stopped snapshotting because the agent's version budget is full, and observations "
     "that failed (logged, never fail the run).",
     ("outcome",),
 )
@@ -99,6 +109,8 @@ class ObserveReport:
     pruned: int = 0
     #: 源文件不见满 30 天、整个删掉的版本目录数。
     dropped: int = 0
+    #: review 10 —— 这个 agent 各活文件最新那份加起来已经顶到预算:这次停了留新版本。
+    over_budget: bool = False
 
 
 @runtime_checkable
@@ -128,6 +140,32 @@ class _Scan:
     seen: set[str] = field(default_factory=set)
     #: 条目数上限截断了这次遍历:``seen`` 不全,不判「不见」。
     complete: bool = True
+    over_budget: bool = False
+
+
+@dataclass(frozen=True)
+class _Pending:
+    """读好了、还没写的一份新版本(review 10:先全读完,再按预算决定写不写)。"""
+
+    rel: str
+    key: str
+    data: bytes
+    info: os.stat_result
+    digest: str
+    seq: int
+
+
+@dataclass
+class _DirUsage:
+    """一个版本目录:源文件是不是已不见(``missing`` 标记)、各版本 ``(ctime, 文件名, 大小)``
+    按序号升序。"""
+
+    missing: bool
+    versions: list[tuple[int, str, int]]
+
+    @property
+    def newest_size(self) -> int:
+        return self.versions[-1][2] if self.versions else 0
 
 
 def _utf8(name: str) -> bool:
@@ -138,8 +176,8 @@ def _utf8(name: str) -> bool:
     return True
 
 
-def _files(dir_fd: int, prefix: str, depth: int, scan: _Scan) -> Iterator[tuple[int, str, str]]:
-    """``(所在目录 fd, 名字, agent 根相对路径)``,一路 ``O_NOFOLLOW``;顶层跳过保留名。"""
+def _files(dir_fd: int, prefix: str, depth: int, scan: _Scan) -> Iterator[tuple[str, int]]:
+    """``(agent 根相对路径, mtime 纳秒)``,一路 ``O_NOFOLLOW``;顶层跳过保留名。"""
     for name in sorted(os.listdir(dir_fd)):
         if depth == 0 and (name.startswith(".") or name in AGENT_ROOT_RESERVED):
             continue
@@ -158,7 +196,7 @@ def _files(dir_fd: int, prefix: str, depth: int, scan: _Scan) -> Iterator[tuple[
         rel = f"{prefix}{name}"
         if stat.S_ISREG(info.st_mode):
             scan.seen.add(rel)
-            yield dir_fd, name, rel
+            yield rel, info.st_mtime_ns
         elif stat.S_ISDIR(info.st_mode) and depth + 1 < MAX_SEED_DEPTH:
             try:
                 sub = _openat_dir(dir_fd, name, create=False)
@@ -245,40 +283,47 @@ def _prune(file_dir: int, scan: _Scan) -> None:
             scan.pruned += 1
 
 
-def _observe_file(agent_dir: int, src_dir: int, name: str, rel: str, scan: _Scan) -> None:
+def _observe_file(
+    agent_dir: int | None, src_dir: int, name: str, rel: str, scan: _Scan
+) -> _Pending | None:
+    """看一个文件:没变 → ``None``;变了 → 读好的一份待写版本。
+
+    review 10 —— 这里**不建**版本目录:读预算不够、读失败、内容其实没变,都不该留下一个空的、
+    没有 ``path`` 的目录(那样换着名字就能绕过目录数上限)。目录在真正写版本时才建。
+    """
     key = hashlib.sha256(rel.encode()).hexdigest()[:32]
     src = os.open(name, _READ_FLAGS, dir_fd=src_dir)
     try:
         info = os.fstat(src)
         if not stat.S_ISREG(info.st_mode) or info.st_size > MAX_VERSIONED_FILE_BYTES:
             scan.skipped += 1
-            return
-        file_dir = _openat_dir(agent_dir, key, create=True)
+            return None
+        file_dir: int | None = None
+        if agent_dir is not None:
+            with contextlib.suppress(FileNotFoundError):
+                file_dir = _openat_dir(agent_dir, key, create=False)
         try:
-            versions = _versions(file_dir)
+            versions = _versions(file_dir) if file_dir is not None else []
             latest = versions[-1] if versions else None
-            if latest is not None:
+            if latest is not None and file_dir is not None:
                 copy = os.lstat(latest[2], dir_fd=file_dir)
                 if (copy.st_size, copy.st_mtime_ns) == (info.st_size, info.st_mtime_ns):
                     scan.unchanged += 1
-                    return
+                    return None
             if scan.read_bytes + info.st_size > MAX_OBSERVE_READ_BYTES:
                 scan.skipped += 1  # 这一次读不下了,下一次 run 结束再看
-                return
+                return None
             data = _read_all(src, info.st_size)
             scan.read_bytes += len(data)
             digest = hashlib.sha256(data).hexdigest()
-            if latest is not None and latest[1] == digest:
+            if latest is not None and file_dir is not None and latest[1] == digest:
                 os.utime(latest[2], ns=(info.st_atime_ns, info.st_mtime_ns), dir_fd=file_dir)
                 scan.unchanged += 1
-                return
-            if not versions:
-                _write_path(file_dir, rel)
-            _write_version(file_dir, data, info, digest, (latest[0] + 1) if latest else 1)
-            scan.snapshotted += 1
-            _prune(file_dir, scan)
+                return None
+            return _Pending(rel, key, data, info, digest, (latest[0] + 1) if latest else 1)
         finally:
-            os.close(file_dir)
+            if file_dir is not None:
+                os.close(file_dir)
     finally:
         os.close(src)
 
@@ -300,11 +345,11 @@ def _write_path(file_dir: int, rel: str) -> None:
 def observe_sync(
     workspace: NasWorkspaceStore, tenant_id: UUID, user_id: UUID, agent_key: str
 ) -> ObserveReport:
-    """扫一遍该 agent 的 ``/agent``,改过的文件各留一份。版本目录在遇到第一个文件时才建。
+    """扫一遍该 agent 的 ``/agent``,改过的文件各留一份。
 
     review 7 —— 用户已被清除(``.deleted`` 软删标记在)就什么都不做:清除之后才结束的 run 不能
-    把版本又建回来。之后两件收尾:源文件不见满 30 天的版本目录删掉;本次写了新版本时,用户
-    合计超过 :data:`MAX_USER_VERSION_BYTES` 就从最早的版本删起。
+    把版本又建回来。review 10 —— 先把变了的文件读好,再在 :func:`_housekeep` 里按这个 agent 的
+    字节预算决定写不写、删哪些;版本目录只在真正写版本时才建。
     """
     require_safe_key(agent_key)
     if os.path.lexists(workspace_deleted_marker(workspace.root, tenant_id, user_id)):
@@ -314,64 +359,200 @@ def observe_sync(
     except MISSING_DIR_ERRORS:
         return ObserveReport()  # agent 根还没建:没有可留的
     scan = _Scan()
-    agent_dir: int | None = None
+    pending: list[_Pending] = []
+    agent_dir = _open_agent_versions(workspace.root, tenant_id, user_id, agent_key, create=False)
     try:
-        for src_dir, name, rel in _files(agent_fd, "", 0, scan):
-            if agent_dir is None:
-                versions_fd = _open_versions_root(workspace.root, tenant_id, user_id, create=True)
-                try:
-                    agent_dir = _openat_dir(versions_fd, agent_key, create=True)
-                finally:
-                    os.close(versions_fd)
+        for rel in _observe_order(_files(agent_fd, "", 0, scan)):
             try:
-                _observe_file(agent_dir, src_dir, name, rel, scan)
+                found = _observe_at(agent_fd, agent_dir, rel, scan)
             except OSError:
                 scan.skipped += 1  # 刚被换成符号链接 / 删掉了:这一个跳过
+                continue
+            if found is not None:
+                pending.append(found)
     finally:
         if agent_dir is not None:
             os.close(agent_dir)
         os.close(agent_fd)
-    _housekeep(workspace.root, tenant_id, user_id, agent_key, scan)
+    _housekeep(workspace.root, tenant_id, user_id, agent_key, scan, pending)
     return ObserveReport(
         snapshotted=scan.snapshotted,
         unchanged=scan.unchanged,
         skipped=scan.skipped,
         pruned=scan.pruned,
         dropped=scan.dropped,
+        over_budget=scan.over_budget,
     )
 
 
-def _housekeep(root: str, tenant_id: UUID, user_id: UUID, agent_key: str, scan: _Scan) -> None:
-    """观察之后的三件收尾(版本目录不存在就什么都不做):源文件不见满 30 天的删掉、本 agent
-    版本目录数封顶、用户合计字节封顶。"""
+def _observe_order(found: Iterator[tuple[str, int]]) -> list[str]:
+    """先看完整棵树,再定读的先后(review 10):索引 ``AGENT_NOTES.md`` 永远第一个,其余按 mtime
+    从新到旧。
+
+    一次观察最多读 :data:`MAX_OBSERVE_READ_BYTES`。按名字排时,排在前面、每轮只被 ``touch``(内容
+    没变、mtime 变了 —— 只能读一遍算 sha256 才知道没变)的大文件能把预算用光,排在后面的真改动
+    (包括索引)永远轮不上。大小与 mtime 都没变的文件本来就不读、不花预算。
+    """
+    entries = list(found)
+    return [
+        rel
+        for rel, _mtime in sorted(
+            entries, key=lambda item: (item[0] != AGENT_NOTES_FILE, -item[1], item[0])
+        )
+    ]
+
+
+def _observe_at(agent_fd: int, agent_dir: int | None, rel: str, scan: _Scan) -> _Pending | None:
+    """按 ``rel`` 从 agent 根 fd 逐段 ``O_NOFOLLOW`` 打开所在目录再看这个文件(遍历时的目录 fd
+    已经关了;中间某段被换成链接 → ``OSError``,调用方跳过)。"""
+    *parents, name = rel.split("/")
+    dir_fd = os.dup(agent_fd)
     try:
-        user_fd = _open_versions_root(root, tenant_id, user_id, create=False)
+        for part in parents:
+            nfd = _openat_dir(dir_fd, part, create=False)
+            os.close(dir_fd)
+            dir_fd = nfd
+        return _observe_file(agent_dir, dir_fd, name, rel, scan)
+    finally:
+        os.close(dir_fd)
+
+
+def _open_agent_versions(
+    root: str, tenant_id: UUID, user_id: UUID, agent_key: str, *, create: bool
+) -> int | None:
+    """``.agent-file-versions/{user}/{agent_key}`` 的目录 fd;不建时不存在 → ``None``。"""
+    try:
+        user_fd = _open_versions_root(root, tenant_id, user_id, create=create)
     except FileNotFoundError:
-        return
+        return None
     try:
-        if scan.complete:
-            try:
-                agent_dir = _openat_dir(user_fd, agent_key, create=False)
-            except FileNotFoundError:
-                agent_dir = None
-            if agent_dir is not None:
-                try:
-                    _sweep_missing(agent_dir, scan, time.time())
-                finally:
-                    os.close(agent_dir)
-        if scan.snapshotted:
-            try:
-                agent_dir = _openat_dir(user_fd, agent_key, create=False)
-            except FileNotFoundError:
-                agent_dir = None
-            if agent_dir is not None:
-                try:
-                    _enforce_dir_cap(agent_dir, scan)
-                finally:
-                    os.close(agent_dir)
-            _enforce_user_cap(user_fd, scan)
+        return _openat_dir(user_fd, agent_key, create=create)
+    except FileNotFoundError:
+        return None
     finally:
         os.close(user_fd)
+
+
+def _housekeep(
+    root: str,
+    tenant_id: UUID,
+    user_id: UUID,
+    agent_key: str,
+    scan: _Scan,
+    pending: list[_Pending],
+) -> None:
+    """观察之后的收尾,只动**这个 agent 自己**的版本目录(不存在、也没有要写的就什么都不做):
+
+    1. 扫一遍各版本目录:源文件不见的记下 / 满 30 天删掉(遍历完整时);没有 ``path`` 或没有
+       版本的孤儿目录删掉;
+    2. 按字节预算写这次读好的新版本(:func:`_write_pending`);
+    3. 写了新版本就把总量收回预算内(:func:`_enforce_budget`);
+    4. 版本目录数封顶(每次都查)。
+    """
+    agent_dir = _open_agent_versions(root, tenant_id, user_id, agent_key, create=bool(pending))
+    if agent_dir is None:
+        return
+    try:
+        _sweep(agent_dir, scan, time.time())
+        if pending:
+            _write_pending(agent_dir, pending, scan)
+        if scan.snapshotted:
+            _enforce_budget(agent_dir, scan)
+        _enforce_dir_cap(agent_dir, scan)
+    finally:
+        os.close(agent_dir)
+
+
+def _usage(agent_dir: int) -> dict[str, _DirUsage]:
+    """这个 agent 每个版本目录的现状(打不开的跳过)。"""
+    out: dict[str, _DirUsage] = {}
+    for key in os.listdir(agent_dir):
+        try:
+            file_dir = _openat_dir(agent_dir, key, create=False)
+        except OSError:
+            continue
+        try:
+            versions: list[tuple[int, str, int]] = []
+            for _seq, _sha, name in _versions(file_dir):
+                with contextlib.suppress(FileNotFoundError):
+                    info = os.lstat(name, dir_fd=file_dir)
+                    versions.append((info.st_ctime_ns, name, info.st_size))
+            out[key] = _DirUsage(_exists_at(file_dir, _MISSING_FILE), versions)
+        finally:
+            os.close(file_dir)
+    return out
+
+
+def _write_pending(agent_dir: int, pending: list[_Pending], scan: _Scan) -> None:
+    """按预算写这次读好的新版本。
+
+    review 10 —— 写之前算「各活文件最新那份加起来」:写了这一份之后会超预算,就**停**(这次剩下
+    的都不写,记 ``over_budget``),绝不靠删某个活文件的最新版本腾地方。源文件已不见的版本不算
+    在这一项里:它们之后整个可删。
+    """
+    usage = _usage(agent_dir)
+    newest_live = sum(d.newest_size for d in usage.values() if not d.missing)
+    for item in pending:
+        current = usage.get(item.key)
+        old = current.newest_size if current is not None and not current.missing else 0
+        if newest_live - old + len(item.data) > MAX_AGENT_VERSION_BYTES:
+            scan.over_budget = True
+            return
+        try:
+            file_dir = _openat_dir(agent_dir, item.key, create=True)
+        except OSError:
+            scan.skipped += 1
+            continue
+        try:
+            _write_path(file_dir, item.rel)
+            _write_version(file_dir, item.data, item.info, item.digest, item.seq)
+            scan.snapshotted += 1
+            newest_live += len(item.data) - old
+            _prune(file_dir, scan)
+        except OSError:
+            scan.skipped += 1
+        finally:
+            os.close(file_dir)
+
+
+def _enforce_budget(agent_dir: int, scan: _Scan) -> None:
+    """这个 agent 的版本总量超过 :data:`MAX_AGENT_VERSION_BYTES` 就删,直到不超(review 10):
+
+    1. 源文件已不见(``missing`` 标记在)的版本,从最早写下的(ctime)删起,最新那份也删;
+    2. 活文件**除最新那份之外**的版本,从最早写下的删起。
+
+    活文件的最新版本从不删。:func:`_write_pending` 保证它们加起来不超预算,所以删完一定回到预算
+    之内;删完仍超(并发写入之类)就记 ``over_budget``。
+    """
+    usage = _usage(agent_dir)
+    total = sum(size for d in usage.values() for _c, _n, size in d.versions)
+    if total <= MAX_AGENT_VERSION_BYTES:
+        return
+    gone = sorted(
+        (c, key, n, size) for key, d in usage.items() if d.missing for c, n, size in d.versions
+    )
+    old = sorted(
+        (c, key, n, size)
+        for key, d in usage.items()
+        if not d.missing
+        for c, n, size in d.versions[:-1]
+    )
+    for _ctime, key, name, size in (*gone, *old):
+        if total <= MAX_AGENT_VERSION_BYTES:
+            return
+        try:
+            file_dir = _openat_dir(agent_dir, key, create=False)
+        except OSError:
+            continue
+        try:
+            with contextlib.suppress(FileNotFoundError):
+                os.unlink(name, dir_fd=file_dir)
+                scan.pruned += 1
+        finally:
+            os.close(file_dir)
+        total -= size
+    if total > MAX_AGENT_VERSION_BYTES:
+        scan.over_budget = True
 
 
 def _read_path(file_dir: int) -> str | None:
@@ -387,45 +568,58 @@ def _read_path(file_dir: int) -> str | None:
         os.close(fd)
 
 
-def _sweep_missing(agent_dir: int, scan: _Scan, now: float) -> None:
-    """源文件不在了:第一次发现时记下(``missing`` 标记),满 30 天删掉整个版本目录;
-    源文件回来了就撤掉标记。"""
+def _sweep(agent_dir: int, scan: _Scan, now: float) -> None:
+    """扫一遍这个 agent 的版本目录。
+
+    * 孤儿(没有 ``path``,或一份版本都没有)建了满 :data:`ORPHAN_DIR_GRACE_S` 就删(review 10)。
+    * 遍历完整时:源文件不在了,第一次发现时记下(``missing`` 标记),满 30 天删掉整个版本目录;
+      源文件回来了就撤掉标记。
+    """
     for key in os.listdir(agent_dir):
         try:
             file_dir = _openat_dir(agent_dir, key, create=False)
         except OSError:
             continue
+        drop = False
         try:
             rel = _read_path(file_dir)
-            if rel is None:
-                continue
-            if rel in scan.seen:
-                with contextlib.suppress(FileNotFoundError):
-                    os.unlink(_MISSING_FILE, dir_fd=file_dir)
-                continue
-            try:
-                since = os.lstat(_MISSING_FILE, dir_fd=file_dir).st_mtime
-            except FileNotFoundError:
-                with contextlib.suppress(FileExistsError):
-                    os.close(
-                        os.open(
-                            _MISSING_FILE,
-                            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC,
-                            _FILE_MODE,
-                            dir_fd=file_dir,
-                        )
-                    )
-                continue
+            if rel is None or not _versions(file_dir):
+                drop = now - os.fstat(file_dir).st_mtime >= ORPHAN_DIR_GRACE_S
+            elif scan.complete:
+                drop = _note_missing(file_dir, rel, scan, now)
         finally:
             os.close(file_dir)
-        if now - since >= MISSING_SOURCE_GRACE_S:
-            shutil.rmtree(key, dir_fd=agent_dir)
-            scan.dropped += 1
+        if drop:
+            with contextlib.suppress(FileNotFoundError, NotADirectoryError):
+                shutil.rmtree(key, dir_fd=agent_dir)
+                scan.dropped += 1
+
+
+def _note_missing(file_dir: int, rel: str, scan: _Scan, now: float) -> bool:
+    """记 / 撤 ``missing`` 标记;源文件已不见满 :data:`MISSING_SOURCE_GRACE_S` 时回 ``True``。"""
+    if rel in scan.seen:
+        with contextlib.suppress(FileNotFoundError):
+            os.unlink(_MISSING_FILE, dir_fd=file_dir)
+        return False
+    try:
+        since = os.lstat(_MISSING_FILE, dir_fd=file_dir).st_mtime
+    except FileNotFoundError:
+        with contextlib.suppress(FileExistsError):
+            os.close(
+                os.open(
+                    _MISSING_FILE,
+                    os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC,
+                    _FILE_MODE,
+                    dir_fd=file_dir,
+                )
+            )
+        return False
+    return now - since >= MISSING_SOURCE_GRACE_S
 
 
 def _drop_order(agent_dir: int, key: str) -> tuple[int, int]:
-    """版本目录的删除先后:源文件已不见(有 ``missing`` 标记)的排最前,其次按最新那份版本写下的
-    时间(ctime)从旧到新;打不开 / 没有版本的最先。"""
+    """版本目录的删除先后:打不开 / 没有版本 / 没有 ``path`` 的最先,其次源文件已不见(有
+    ``missing`` 标记)的,再按最新那份版本写下的时间(ctime)从旧到新。"""
     try:
         file_dir = _openat_dir(agent_dir, key, create=False)
     except OSError:
@@ -433,7 +627,7 @@ def _drop_order(agent_dir: int, key: str) -> tuple[int, int]:
     try:
         live = 0 if _exists_at(file_dir, _MISSING_FILE) else 1
         versions = _versions(file_dir)
-        if not versions:
+        if not versions or not _exists_at(file_dir, _PATH_FILE):
             return (0, 0)
         return (live, os.lstat(versions[-1][2], dir_fd=file_dir).st_ctime_ns)
     except OSError:
@@ -465,76 +659,6 @@ def _enforce_dir_cap(agent_dir: int, scan: _Scan) -> None:
         with contextlib.suppress(FileNotFoundError, NotADirectoryError):
             shutil.rmtree(key, dir_fd=agent_dir)
             scan.dropped += 1
-
-
-@dataclass
-class _Candidate:
-    ctime: int
-    agent: str
-    key: str
-    name: str
-    size: int
-
-
-def _enforce_user_cap(user_fd: int, scan: _Scan) -> None:
-    """用户合计超过上限时删版本,直到不超或者没有可删的(review 9):
-
-    * **每个文件最新的那份版本从不删** —— 任何一个 agent 都不会被删到「一份历史都没有」。
-    * 其余版本里,**用得最多的 agent 先付**(按它当前占的字节),它内部从最早写下(ctime)的删起;
-      每删一份重新比一次谁用得最多。
-
-    取代 review 8 的「观察者先付」:那样一个旧历史很占地方的 agent,能让另一个刚改了文件的
-    agent 一份历史都留不住。最新版本加起来仍受「单文件 8 MiB 乘每个 agent 2000 个目录」约束。
-    """
-    total = 0
-    used: dict[str, int] = {}
-    candidates: dict[str, list[_Candidate]] = {}
-    for agent_key in os.listdir(user_fd):
-        try:
-            agent_dir = _openat_dir(user_fd, agent_key, create=False)
-        except OSError:
-            continue
-        try:
-            for key in os.listdir(agent_dir):
-                try:
-                    file_dir = _openat_dir(agent_dir, key, create=False)
-                except OSError:
-                    continue
-                try:
-                    versions = _versions(file_dir)
-                    for i, (_seq, _sha, name) in enumerate(versions):
-                        info = os.lstat(name, dir_fd=file_dir)
-                        total += info.st_size
-                        used[agent_key] = used.get(agent_key, 0) + info.st_size
-                        if i < len(versions) - 1:  # 最新那份不进候选
-                            candidates.setdefault(agent_key, []).append(
-                                _Candidate(info.st_ctime_ns, agent_key, key, name, info.st_size)
-                            )
-                finally:
-                    os.close(file_dir)
-        finally:
-            os.close(agent_dir)
-    for queue in candidates.values():
-        queue.sort(key=lambda c: c.ctime, reverse=True)  # 从尾巴 pop 最早的
-    while total > MAX_USER_VERSION_BYTES:
-        payers = [a for a, queue in candidates.items() if queue]
-        if not payers:
-            return
-        payer = max(payers, key=lambda a: used[a])
-        victim = candidates[payer].pop()
-        agent_dir = _openat_dir(user_fd, victim.agent, create=False)
-        try:
-            file_dir = _openat_dir(agent_dir, victim.key, create=False)
-            try:
-                with contextlib.suppress(FileNotFoundError):
-                    os.unlink(victim.name, dir_fd=file_dir)
-                    scan.pruned += 1
-            finally:
-                os.close(file_dir)
-        finally:
-            os.close(agent_dir)
-        total -= victim.size
-        used[payer] -= victim.size
 
 
 def _read_all(fd: int, size: int) -> bytes:
@@ -665,6 +789,14 @@ async def _observe_logged(
         return
     if report.snapshotted:
         agent_file_versions_total.labels(outcome="snapshotted").inc(report.snapshotted)
+    if report.over_budget:
+        # review 10 —— 各活文件最新那份加起来顶到了这个 agent 的预算:停了留新版本(不删活的)。
+        agent_file_versions_total.labels(outcome="over_budget").inc()
+        logger.warning(
+            "agent_file_versions.over_budget agent_key=%s budget_bytes=%d",
+            agent_key,
+            MAX_AGENT_VERSION_BYTES,
+        )
     logger.info(
         "agent_file_versions.observed agent_key=%s snapshotted=%d unchanged=%d skipped=%d "
         "pruned=%d",

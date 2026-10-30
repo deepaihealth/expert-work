@@ -1112,6 +1112,7 @@ def build_react_graph(
                 view=turn_view,
                 seed_skipped=state.get("seed_skipped_dirs") or (),
                 seed_quota_blocked=bool(state.get("seed_quota_blocked")),
+                seed_skipped_more=int(state.get("seed_skipped_more") or 0),
             )
         # B-64 —— 渲染页段(Path A)挂到尾部。块在压缩判定之前就造好了(见那里的
         # 注释);这里与上面工作区快照同一个位置。**无条件调用**:没有块时也要把
@@ -2644,6 +2645,7 @@ async def _workspace_block_tail(
     view: WorkspaceView,
     seed_skipped: Sequence[str] = (),
     seed_quota_blocked: bool = False,
+    seed_skipped_more: int = 0,
 ) -> list[BaseMessage]:
     """B-84 PR-2 —— 重取一份工作区快照, 挂到提示词尾部;更早的那几段一并剔掉。
 
@@ -2676,6 +2678,7 @@ async def _workspace_block_tail(
         view=view,
         seed_skipped=seed_skipped,
         seed_quota_blocked=seed_quota_blocked,
+        seed_skipped_more=seed_skipped_more,
     )
     if not block:
         return kept

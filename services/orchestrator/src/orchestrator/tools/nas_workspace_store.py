@@ -154,7 +154,7 @@ import logging
 import os
 import shutil
 import stat
-from collections.abc import Generator
+from collections.abc import Container, Generator, Mapping
 from contextlib import closing
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -301,6 +301,25 @@ def _is_conversation_work(prefix: tuple[str, ...]) -> bool:
     )
 
 
+def _is_uuid_name(name: str) -> bool:
+    """规范写法的 UUID(对话目录名都是 ``str(UUID)``)。"""
+    try:
+        return str(UUID(name)) == name
+    except ValueError:
+        return False
+
+
+def _in_conversation_work(parts: tuple[str, ...]) -> bool:
+    """用户根相对路径的各段是不是 ``agents/<k>/threads/<对话 UUID>/work/<…>`` 下的一个文件。"""
+    return (
+        len(parts) >= 6
+        and parts[0] == WORKSPACE_AGENTS_DIR
+        and parts[2] == WORKSPACE_THREADS_DIR
+        and parts[4] == WORKSPACE_CONVERSATION_WORK_DIR
+        and _is_uuid_name(parts[3])
+    )
+
+
 def _is_seed_marker(path: str) -> bool:
     """``agents/<k>/threads/<conv>/.seeded`` —— 用户根相对路径。"""
     parts = path.split("/")
@@ -316,15 +335,25 @@ def _is_seed_marker(path: str) -> bool:
 #: 超过 = 当没有清单,什么都不藏。
 MAX_SEED_MARKER_BYTES = 256 * 1024
 
+#: review 10 —— 一次列表最多读这么多字节的 ``.seeded`` 标记(所有对话合计)。超了之后的对话
+#: 按「没有清单」处理:出错的方向是多列,不是多占内存。正常一个标记几 KB。
+MAX_LISTING_MANIFEST_BYTES = 4 * 1024 * 1024
+
 #: 对话目录 ``agents/<k>/threads/<conv>`` → 开场复制的清单:``work/`` 相对路径 → (大小, ctime)。
 SeedManifests = dict[str, dict[str, tuple[int, int]]]
 
 
-def parse_seed_manifest(data: bytes) -> dict[str, tuple[int, int]] | None:
-    """``.seeded`` 标记里的复制清单;格式不对 / 没有清单 → ``None``(什么都不藏)。"""
+def parse_seed_manifest(
+    data: bytes, keep: Container[str] | None = None
+) -> dict[str, tuple[int, int]] | None:
+    """``.seeded`` 标记里的复制清单;格式不对 / 没有清单 → ``None``(什么都不藏)。
+
+    ``keep`` 给了就只留这些路径(review 10:列表只留这次真走到的路径,不整份留在内存里)。
+    标记在沙箱够得着的地方:嵌套极深(``[[[…``)的 JSON 会 ``RecursionError``,也按坏了处理。
+    """
     try:
         doc = json.loads(data)
-    except ValueError:
+    except (ValueError, RecursionError, TypeError):
         return None
     files = doc.get("files") if isinstance(doc, dict) else None
     if not isinstance(files, list):
@@ -337,16 +366,22 @@ def parse_seed_manifest(data: bytes) -> dict[str, tuple[int, int]] | None:
             and isinstance(item[0], str)
             and type(item[1]) is int
             and type(item[2]) is int
+            and (keep is None or item[0] in keep)
         ):
             out[item[0]] = (item[1], item[2])
     return out
 
 
-def _read_seed_manifest(conv_fd: int) -> dict[str, tuple[int, int]] | None:
+def _read_seed_manifest(
+    conv_fd: int, keep: Container[str] | None = None, budget: list[int] | None = None
+) -> dict[str, tuple[int, int]] | None:
     """在已经钉住的 ``threads/<conv>/`` 目录 fd 上读标记的清单。
 
     没有、不是普通文件、超过 :data:`MAX_SEED_MARKER_BYTES`、读不动、解析不了 —— 一律 ``None``:
     认副本只是为了少列,出错的方向必须是多列(review 9)。``O_NONBLOCK`` 防 FIFO。
+
+    ``budget``(review 10)是这次列表还剩多少字节可读(单元素列表,读了就扣);标记比剩下的大就
+    不读,按没有清单处理。
     """
     try:
         fd = os.open(
@@ -363,6 +398,11 @@ def _read_seed_manifest(conv_fd: int) -> dict[str, tuple[int, int]] | None:
         info = os.fstat(fd)
         if not stat.S_ISREG(info.st_mode) or info.st_size > MAX_SEED_MARKER_BYTES:
             return None
+        if budget is not None:
+            if info.st_size > budget[0]:
+                budget[0] = 0  # 之后的一律不读(先到先得,不挑小的读)
+                return None
+            budget[0] -= info.st_size
         data = os.read(fd, MAX_SEED_MARKER_BYTES + 1)
     except OSError as exc:
         logger.warning("nas_workspace_store.seed_marker_unreadable error=%s", exc.strerror)
@@ -371,14 +411,21 @@ def _read_seed_manifest(conv_fd: int) -> dict[str, tuple[int, int]] | None:
         os.close(fd)
     if len(data) > MAX_SEED_MARKER_BYTES:
         return None
-    return parse_seed_manifest(data)
+    return parse_seed_manifest(data, keep)
+
+
+def is_pristine_seed_copy(
+    manifest: Mapping[str, tuple[int, int]], rel: str, entry: WorkspaceFileEntry
+) -> bool:
+    """``rel``(``work/`` 相对)在清单里,且现在的大小与 ctime 都与清单记下的相同。"""
+    recorded = manifest.get(rel)
+    return recorded is not None and recorded == (entry.size, entry.ctime_ns)
 
 
 def _drop_seed_copies(
     prefix: tuple[str, ...],
     entries: list[WorkspaceFileEntry],
     manifests: SeedManifests,
-    ctimes: dict[str, int],
 ) -> list[WorkspaceFileEntry]:
     """剔掉开场复制进对话、之后**没被碰过**的副本(review 9 的判据)。
 
@@ -398,15 +445,9 @@ def _drop_seed_copies(
     kept: list[WorkspaceFileEntry] = []
     for entry in entries:
         parts = (*prefix, *entry.path.split("/"))
-        if (
-            len(parts) >= 6
-            and parts[0] == WORKSPACE_AGENTS_DIR
-            and parts[2] == WORKSPACE_THREADS_DIR
-            and parts[4] == WORKSPACE_CONVERSATION_WORK_DIR
-        ):
+        if _in_conversation_work(parts):
             manifest = manifests.get("/".join(parts[:4]))
-            recorded = manifest.get("/".join(parts[5:])) if manifest else None
-            if recorded is not None and recorded == (entry.size, ctimes.get(entry.path)):
+            if manifest and is_pristine_seed_copy(manifest, "/".join(parts[5:]), entry):
                 continue
         kept.append(entry)
     return kept
@@ -580,7 +621,7 @@ def _walk_and_match(
     except OSError as exc:
         raise SandboxSupervisorError(f"workspace search failed: {exc.strerror}") from exc
     hits.sort(key=lambda entry: entry.path)
-    return WorkspaceSearchResult(entries=tuple(hits), truncated=truncated or too_deep)
+    return WorkspaceSearchResult(entries=tuple(hits), truncated=truncated, too_deep=too_deep)
 
 
 def _list_dir_entries(
@@ -590,13 +631,12 @@ def _list_dir_entries(
     walk_fd: int,
     entries: list[WorkspaceFileEntry],
     *,
-    seeded_at: SeedManifests | None = None,
-    ctimes: dict[str, int] | None = None,
+    marker_dirs: set[str] | None = None,
 ) -> None:
     """One directory of :meth:`NasWorkspaceStore.list_files`' walk, ``dir_fd``-relative.
 
-    B-236 —— ``threads/<conv>/.seeded`` 标记不列(平台状态),它的复制清单记进 ``seeded_at``;
-    每个文件的 ctime 记进 ``ctimes``(作用域相对路径为键),认原样副本用。
+    B-236 —— ``threads/<conv>/.seeded`` 标记不列(平台状态),它所在的对话目录记进
+    ``marker_dirs``(review 10:遍历时不读,遍历完只读本次真走到 ``work/`` 文件的那些对话的)。
     """
     base = PurePosixPath(dirpath)
     for name in filenames:
@@ -624,14 +664,10 @@ def _list_dir_entries(
             ) from exc
         full = "/".join((*prefix, rel))
         if name == WORKSPACE_SEED_MARKER and _is_seed_marker(full):
-            if seeded_at is not None:
-                manifest = _read_seed_manifest(walk_fd)
-                if manifest:
-                    seeded_at[full.rsplit("/", 1)[0]] = manifest
+            if marker_dirs is not None:
+                marker_dirs.add(full.rsplit("/", 1)[0])
             continue  # B-236 —— 开场复制的标记是平台状态,不是产出
         entries.append(_entry(rel, info))
-        if ctimes is not None:
-            ctimes[rel] = info.st_ctime_ns
 
 
 def _name_matches(rel: str, name: str, name_glob: str) -> bool:
@@ -684,6 +720,7 @@ def _entry(rel: str, info: os.stat_result) -> WorkspaceFileEntry:
         path=rel,
         size=info.st_size,
         mtime=datetime.fromtimestamp(info.st_mtime, tz=UTC),
+        ctime_ns=info.st_ctime_ns,
     )
 
 
@@ -938,25 +975,44 @@ class NasWorkspaceStore:
             dfd = nfd
         return dfd
 
-    def _note_seed_marker(
-        self, tenant_id: UUID, user_id: UUID, conv_dir: tuple[str, ...], seeded_at: SeedManifests
-    ) -> None:
-        """``agents/<k>/threads/<conv>/.seeded`` 的复制清单记进 ``seeded_at``(没有就不记)。
+    def _seed_manifests(
+        self,
+        tenant_id: UUID,
+        user_id: UUID,
+        prefix: tuple[str, ...],
+        entries: list[WorkspaceFileEntry],
+        marker_dirs: set[str],
+    ) -> SeedManifests:
+        """遍历完之后读开场复制清单(review 10):只读**这次走到了 ``work/`` 文件**的对话,每份只留
+        走到的那些路径,所有标记合计最多读 :data:`MAX_LISTING_MANIFEST_BYTES`。
 
-        目录链经 :meth:`_open_scope_dir_fd`,失败只会是本 store 自己的异常类型;标记文件本身
-        读不动 / 坏了按「没有清单」处理(见 :func:`_read_seed_manifest`)。不放裸 ``OSError``
-        出去(review 9)。
+        对话目录名必须是规范写法的 UUID(载荷在 ``threads/`` 下随手建的假目录不读)。标记要么在
+        这次遍历里见过(``marker_dirs``),要么作用域就是那个对话的 ``work/``(标记在遍历之外)。
+        目录链经 :meth:`_open_scope_dir_fd`;读不动 / 坏了按「没有清单」处理,不放裸
+        ``OSError`` 出去(review 9)。
         """
-        try:
-            dfd = self._open_scope_dir_fd(tenant_id, user_id, "/".join(conv_dir))
-        except _WorkspacePathNotFoundError:
-            return
-        try:
-            manifest = _read_seed_manifest(dfd)
-        finally:
-            os.close(dfd)
-        if manifest:
-            seeded_at["/".join(conv_dir)] = manifest
+        walked: dict[str, set[str]] = {}
+        for entry in entries:
+            parts = (*prefix, *entry.path.split("/"))
+            if _in_conversation_work(parts):
+                walked.setdefault("/".join(parts[:4]), set()).add("/".join(parts[5:]))
+        own = "/".join(prefix[:4]) if _is_conversation_work(prefix) else None
+        budget = [MAX_LISTING_MANIFEST_BYTES]
+        out: SeedManifests = {}
+        for conv_dir in sorted(walked):
+            if conv_dir != own and conv_dir not in marker_dirs:
+                continue
+            try:
+                dfd = self._open_scope_dir_fd(tenant_id, user_id, conv_dir)
+            except _WorkspacePathNotFoundError:
+                continue
+            try:
+                manifest = _read_seed_manifest(dfd, walked[conv_dir], budget)
+            finally:
+                os.close(dfd)
+            if manifest:
+                out[conv_dir] = manifest
+        return out
 
     def _open_scope_dir_fd(self, tenant_id: UUID, user_id: UUID, relpath: str) -> int:
         """A directory's **own** fd, not its parent's — backs ``list_dir`` / ``search_files``.
@@ -1049,7 +1105,8 @@ class NasWorkspaceStore:
                     msg = f"workspace file {path!r} exceeds the {cap}-byte read cap"
                     raise WorkspaceFileTooLargeError(msg)
                 try:
-                    data = handle.read()
+                    # review 10 —— 最多读 cap + 1:fstat 之后文件还在长,也不会读进超过上限的量。
+                    data = handle.read(cap + 1)
                 except IsADirectoryError as exc:
                     # B-84 —— "它是个目录"不是"它不存在":模型的下一步动作不同
                     # (换个路径 vs 改用 list_dir), 沙箱片段一直把这两件事分成
@@ -1058,6 +1115,9 @@ class NasWorkspaceStore:
                     raise WorkspaceNotAFileError(f"workspace path is not a file: {path!r}") from exc
                 except OSError as exc:
                     raise WorkspaceFileNotFoundError(f"workspace file not found: {path!r}") from exc
+                if len(data) > cap:
+                    msg = f"workspace file {path!r} exceeds the {cap}-byte read cap"
+                    raise WorkspaceFileTooLargeError(msg)
                 if stable:
                     after = os.fstat(handle.fileno())
                     if len(data) != size or _identity(after) != _identity(before):
@@ -1133,11 +1193,9 @@ class NasWorkspaceStore:
                 Generator[tuple[str, list[str], list[str], int], None, None],
                 os.fwalk(".", dir_fd=dfd, follow_symlinks=False, onerror=_on_walk_error),
             )
-            #: B-236 —— 各对话 ``threads/<conv>/.seeded`` 的复制清单与各文件的 ctime(纳秒),
-            #: 认原样副本用。
-            seeded_at: SeedManifests = {}
+            #: B-236 —— 这次遍历见到 ``.seeded`` 标记的对话目录。
+            marker_dirs: set[str] = set()
             too_deep = False
-            ctimes: dict[str, int] = {}
             try:
                 with closing(walker):
                     for dirpath, dirnames, filenames, walk_fd in walker:
@@ -1159,8 +1217,7 @@ class NasWorkspaceStore:
                             filenames,
                             walk_fd,
                             entries,
-                            seeded_at=seeded_at,
-                            ctimes=ctimes,
+                            marker_dirs=marker_dirs,
                         )
             except PermissionError as exc:
                 # fwalk 开起点(".")、对已开目录 scandir / fstat 的失败不走 onerror,
@@ -1174,10 +1231,8 @@ class NasWorkspaceStore:
             # B-236 —— 开场复制进对话、之后没被碰过的副本不列(见 :func:`_drop_seed_copies`);
             # 先剔再截 2000 条,否则副本照样把真正的产出挤出上限。
             if not include_seed_copies:
-                if _is_conversation_work(prefix):
-                    # 标记在 ``threads/<conv>/``,不在这次遍历里:按 fd 多看一眼。
-                    self._note_seed_marker(tenant_id, user_id, prefix[:4], seeded_at)
-                entries = _drop_seed_copies(prefix, entries, seeded_at, ctimes)
+                manifests = self._seed_manifests(tenant_id, user_id, prefix, entries, marker_dirs)
+                entries = _drop_seed_copies(prefix, entries, manifests)
             entries.sort(key=lambda entry: entry.path)
             return entries[:_MAX_LIST_ENTRIES]
 

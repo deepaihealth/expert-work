@@ -70,6 +70,7 @@ def test_required_keys_present() -> None:
         "context_summary",
         "seed_skipped_dirs",
         "seed_quota_blocked",
+        "seed_skipped_more",
     }
 
 

@@ -136,7 +136,8 @@ async def _session_files(
     if meta.workspace_layout != "conversation" or not key:
         entries = await store.list_files(tenant_id=tenant_id, user_id=meta.user_id)
         return [{"path": e.path, "size": e.size} for e in entries]
-    # review 8 —— 原样副本由存储剔(按 ctime 与本对话 ``.seeded`` 标记比),剔完才截 2000 条。
+    # review 9 —— 原样副本由存储剔(本对话 ``.seeded`` 标记里的复制清单:路径、大小、ctime 都对上
+    # 才算),剔完才截 2000 条。
     own = await store.list_files(
         tenant_id=tenant_id, user_id=meta.user_id, scope=conversation_scope(key, thread_id)
     )

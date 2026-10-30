@@ -103,11 +103,17 @@ def make_conversation_seed_node(
             report.bytes_copied,
         )
         if report.skipped_quota:
-            return {
-                "seed_skipped_dirs": _bounded(report.skipped_quota),
-                "seed_quota_blocked": True,
-            }
-        return {"seed_skipped_dirs": _bounded(report.skipped_too_large)}
+            names, more = report.skipped_quota, 0
+            update: dict[str, Any] = {"seed_quota_blocked": True}
+        else:
+            names, more = report.skipped_too_large, report.skipped_too_large_more
+            update = {}
+        update["seed_skipped_dirs"] = _bounded(names)
+        # review 10 —— 名字只记前 MAX_REPORTED_DIRS 个,其余只有个数:也告诉模型(「… and N more」)。
+        more += max(0, len(names) - MAX_REPORTED_DIRS)
+        if more:
+            update["seed_skipped_more"] = more
+        return update
 
     return conversation_seed_node
 

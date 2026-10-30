@@ -376,3 +376,6 @@ class AgentState(TypedDict):
     #: B-236 review 7 —— 开场复制因用户工作区配额满了整个没做(``seed_skipped_dirs`` 里是本该
     #: 复制的目录)。快照段据此换一句说明。
     seed_quota_blocked: NotRequired[bool]
+    #: B-236 review 10 —— ``seed_skipped_dirs`` 之外还有几个目录没复制(名字只记前
+    #: ``MAX_REPORTED_DIRS`` 个)。快照段写成「… and N more」。
+    seed_skipped_more: NotRequired[int]

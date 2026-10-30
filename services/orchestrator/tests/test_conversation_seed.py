@@ -683,7 +683,7 @@ async def test_a_copy_missing_a_file_is_not_called_unchanged(tmp_path: Path) -> 
     assert "customers/" in ours
 
 
-@pytest.mark.parametrize("marker", ["garbage", "oversized", "fifo"])
+@pytest.mark.parametrize("marker", ["garbage", "oversized", "fifo", "deep"])
 async def test_a_bad_marker_hides_nothing(tmp_path: Path, marker: str) -> None:
     """标记坏了 / 太大 / 被换成 FIFO:一律当没有清单,什么都不藏(出错的方向是多列)。"""
     _put(_agent(tmp_path) / "customers" / "c.md", "c")
@@ -694,6 +694,8 @@ async def test_a_bad_marker_hides_nothing(tmp_path: Path, marker: str) -> None:
     m.unlink()
     if marker == "garbage":
         m.write_text("{not json")
+    elif marker == "deep":
+        m.write_text("[" * 200_000)  # review 10 —— json 解析 RecursionError,也按坏了处理
     elif marker == "oversized":
         from orchestrator.tools.nas_workspace_store import MAX_SEED_MARKER_BYTES
 
@@ -755,12 +757,154 @@ def test_a_copy_whose_size_no_longer_matches_is_listed() -> None:
 
     conv = f"agents/{_KEY}/threads/{_C1}"
     entries = [
-        WorkspaceFileEntry(path=f"{conv}/work/a.md", size=1),
-        WorkspaceFileEntry(path=f"{conv}/work/b.md", size=2),
+        WorkspaceFileEntry(path=f"{conv}/work/a.md", size=1, ctime_ns=7),
+        WorkspaceFileEntry(path=f"{conv}/work/b.md", size=2, ctime_ns=7),
     ]
     manifests = {conv: {"a.md": (1, 7), "b.md": (1, 7)}}
-    ctimes = {f"{conv}/work/a.md": 7, f"{conv}/work/b.md": 7}
 
-    kept = _drop_seed_copies((), entries, manifests, ctimes)
+    kept = _drop_seed_copies((), entries, manifests)
 
     assert [e.path for e in kept] == [f"{conv}/work/b.md"]
+
+
+# ---------------------------------------------------------------------------
+# review 10 —— 列表里的清单:遍历完才读、只读走到了 work/ 的对话、只留走到的路径、合计有预算
+# ---------------------------------------------------------------------------
+
+
+def _count_manifest_reads(monkeypatch: pytest.MonkeyPatch) -> list[int]:
+    from orchestrator.tools import nas_workspace_store as nws
+
+    calls: list[int] = []
+    real = nws._read_seed_manifest
+
+    def spy(*args: Any, **kwargs: Any) -> Any:
+        calls.append(1)
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(nws, "_read_seed_manifest", spy)
+    return calls
+
+
+async def test_fake_markers_without_walked_outputs_are_never_read(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """review 10 —— 非 UUID 的假对话目录、没有 work/ 文件的对话:标记一个都不读(再多也不涨)。"""
+    _put(_agent(tmp_path) / "customers" / "c.md", "c")
+    store = NasWorkspaceStore(root=str(tmp_path))
+    seed_mod.seed_conversation_sync(store, _TENANT, _USER, _KEY, _C1)
+    body = (_conv(tmp_path) / SEED_MARKER).read_bytes()
+    for i in range(30):
+        _put(_agent(tmp_path) / "threads" / f"f{i:05d}" / SEED_MARKER, body.decode())
+        _put(_agent(tmp_path) / "threads" / f"f{i:05d}" / "work" / "customers" / "c.md", "c")
+        _put(_agent(tmp_path) / "threads" / str(uuid4()) / SEED_MARKER, body.decode())
+    _put(_agent(tmp_path) / "threads" / str(uuid4()) / "work" / "out.md", "no marker here")
+    calls = _count_manifest_reads(monkeypatch)
+
+    listed = await store.list_files(tenant_id=_TENANT, user_id=_USER)
+
+    assert len(calls) == 1  # 只有真对话 _C1 的
+    paths = [e.path for e in listed]
+    assert f"agents/{_KEY}/threads/{_C1}/work/customers/c.md" not in paths  # 原样副本照旧不列
+    assert f"agents/{_KEY}/threads/f00000/work/customers/c.md" in paths  # 假目录里的照列
+
+
+async def test_manifests_past_the_listing_budget_hide_nothing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """review 10 —— 一次列表读标记的字节合计有上限;超了的对话按没有清单处理(多列,不多占内存)。"""
+    from orchestrator.tools import nas_workspace_store as nws
+
+    _put(_agent(tmp_path) / "customers" / "c.md", "c")
+    store = NasWorkspaceStore(root=str(tmp_path))
+    first, second = UUID(int=1), UUID(int=2)
+    for conv in (first, second):
+        seed_mod.seed_conversation_sync(store, _TENANT, _USER, _KEY, conv)
+    size = (_conv(tmp_path, first) / SEED_MARKER).stat().st_size
+    monkeypatch.setattr(nws, "MAX_LISTING_MANIFEST_BYTES", size + 1)
+
+    listed = [e.path for e in await store.list_files(tenant_id=_TENANT, user_id=_USER)]
+
+    assert f"agents/{_KEY}/threads/{first}/work/customers/c.md" not in listed
+    assert f"agents/{_KEY}/threads/{second}/work/customers/c.md" in listed
+
+
+def test_a_manifest_keeps_only_the_walked_paths() -> None:
+    from orchestrator.tools.nas_workspace_store import parse_seed_manifest
+
+    data = json.dumps({"files": [["a.md", 1, 2], ["b.md", 3, 4]]}).encode()
+
+    assert parse_seed_manifest(data, {"b.md", "z.md"}) == {"b.md": (3, 4)}
+
+
+async def test_the_block_never_collapses_a_truncated_listing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """review 10 —— 清单被条目上限截断:截掉的部分里可能有新写的文件,不说「未改动的副本」。"""
+    from orchestrator.tools import nas_workspace_store as nws
+
+    for i in range(3):
+        _put(_agent(tmp_path) / "customers" / f"c{i}.md", "c")
+    store = NasWorkspaceStore(root=str(tmp_path))
+    seed_mod.seed_conversation_sync(store, _TENANT, _USER, _KEY, _C1)
+    _put(_work(tmp_path) / "customers" / "zz-new-output.md", "model output")
+    monkeypatch.setattr(nws, "_MAX_LIST_ENTRIES", 3)
+
+    _listed, ours = await _views(tmp_path)
+
+    assert "unchanged copy" not in ours
+
+
+async def test_the_block_reads_the_marker_once_per_turn(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """review 10 —— 每轮只读一次本对话的 ``.seeded``(不再存储剔一遍、块里再读一遍)。"""
+    from orchestrator.tools.workspace_paths import WorkspaceView
+    from orchestrator.tools.workspace_tree import workspace_prompt_block
+
+    _put(_agent(tmp_path) / "customers" / "c.md", "c")
+    store = NasWorkspaceStore(root=str(tmp_path))
+    seed_mod.seed_conversation_sync(store, _TENANT, _USER, _KEY, _C1)
+    calls = _count_manifest_reads(monkeypatch)
+    reads: list[str] = []
+    real_read = store.read_file
+
+    async def spy_read(**kwargs: Any) -> bytes:
+        reads.append(kwargs["path"])
+        return await real_read(**kwargs)
+
+    monkeypatch.setattr(store, "read_file", spy_read)
+
+    block = await workspace_prompt_block(
+        store,
+        tenant_id=_TENANT,
+        user_id=_USER,
+        view=WorkspaceView(agent_key=_KEY, conv_id=_C1, thread_id=_C1),
+    )
+
+    assert "unchanged copy of /agent/customers/" in block
+    assert len(calls) + sum(1 for r in reads if r.endswith(SEED_MARKER)) == 1
+
+
+def test_names_past_the_report_cap_are_told_as_a_count() -> None:
+    """review 10 —— 只记了个数的「太大」目录也告诉模型(「… and N more」)。"""
+    block = render_conversation_block([], [], seed_skipped=["a", "b"], seed_skipped_more=7)
+
+    assert "and 7 more under /agent/" in block
+
+
+async def test_the_seed_node_reports_unnamed_skipped_dirs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """review 10 —— 节点把只记了个数的那些也写进状态,快照段才说得出「and N more」。"""
+    monkeypatch.setattr(seed_mod, "MAX_SEED_VISITS", 2)
+    for j in range(seed_mod.MAX_REPORTED_DIRS + 5):
+        (_agent(tmp_path) / f"d{j:03d}").mkdir(parents=True)
+    node = make_conversation_seed_node(
+        store=NasWorkspaceStore(root=str(tmp_path)), lock=ProcessKeyedLock()
+    )
+
+    update = await node({"messages": []}, _config())  # type: ignore[typeddict-item]
+
+    assert len(update["seed_skipped_dirs"]) == seed_mod.MAX_REPORTED_DIRS
+    assert update["seed_skipped_more"] > 0

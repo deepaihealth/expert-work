@@ -62,10 +62,12 @@ from uuid import UUID
 
 from expert_work.persistence import WORKSPACE_RESERVED_PREFIXES
 from expert_work.persistence.workspace.layout import WORKSPACE_SEED_MARKER as SEED_MARKER
+from orchestrator.tools import nas_workspace_store as _nws
 from orchestrator.tools.error_classifier import EXISTENCE_UNKNOWN
 from orchestrator.tools.nas_workspace_store import (
     MAX_SEED_MARKER_BYTES,
     MISSING_DIR_ERRORS,
+    is_pristine_seed_copy,
     parse_seed_manifest,
 )
 from orchestrator.tools.sandbox_image_contract import AGENT_VIEW, EXEC_VIEW
@@ -321,11 +323,12 @@ def _safe_name(name: str) -> str:
     return cleaned
 
 
-def _skipped_line(names: Sequence[str], *, quota: bool) -> str:
+def _skipped_line(names: Sequence[str], *, quota: bool, unnamed: int = 0) -> str:
+    """``unnamed``(review 10)是开场复制只记了个数、没记名字的那些目录。"""
     if not names:
         return ""
     shown = ", ".join(f"{AGENT_VIEW}/{_safe_name(d)}/" for d in names[:_MAX_SKIPPED_SHOWN])
-    more = len(names) - _MAX_SKIPPED_SHOWN
+    more = max(len(names) - _MAX_SKIPPED_SHOWN, 0) + max(unnamed, 0)
     tail = f" and {more} more under {AGENT_VIEW}/" if more > 0 else ""
     reason = (
         "Not copied into this conversation (the storage quota is full)"
@@ -341,8 +344,10 @@ def render_conversation_block(
     *,
     pristine: frozenset[str] = frozenset(),
     manifest: frozenset[str] = frozenset(),
+    listing_truncated: bool = False,
     seed_skipped: Sequence[str] = (),
     seed_quota_blocked: bool = False,
+    seed_skipped_more: int = 0,
     max_expanded: int = DEFAULT_MAX_EXPANDED,
 ) -> str:
     """B-236 对话视图的块:``/workspace``(本对话)一节在前,``/agent`` 一节在后。
@@ -355,10 +360,13 @@ def render_conversation_block(
     展开预算 —— 它的文件在 ``/agent`` 一节里已经列着,副本再展开一遍只会把本对话自己的
     产出挤出预算。``seed_skipped`` 是开场复制时因超出上限没复制的目录:本对话那一节末尾
     一行写明它们只在 ``/agent/<目录>/``。
+
+    ``listing_truncated``(review 10)—— 本对话的清单被条目上限截断了:截掉的部分里可能有新写的
+    文件,任何目录都不能说成「未改动的副本」,全部照常展开。
     """
     if not conversation and not agent and not seed_skipped:
         return ""
-    copies = _seed_copies(conversation, pristine, manifest)
+    copies = frozenset() if listing_truncated else _seed_copies(conversation, pristine, manifest)
     own = [e for e in conversation if e.path.partition("/")[0] not in copies]
     conv_tree, used = _render_tree(own, max_expanded=max_expanded)
     agent_tree, _ = _render_tree(agent, max_expanded=max(max_expanded - used, 0))
@@ -367,7 +375,7 @@ def render_conversation_block(
         f"unchanged copy of {AGENT_VIEW}/{name}/ (as of this conversation's start)"
         for name in sorted(copies)
     ]
-    skipped = _skipped_line(seed_skipped, quota=seed_quota_blocked)
+    skipped = _skipped_line(seed_skipped, quota=seed_quota_blocked, unnamed=seed_skipped_more)
     conv_body = "\n".join(part for part in (conv_tree, *copy_lines, skipped) if part)
     return (
         f"{WORKSPACE_BLOCK_HEADING}\n{_CONVERSATION_BLOCK_PREAMBLE}\n\n"
@@ -384,6 +392,7 @@ async def workspace_prompt_block(
     view: WorkspaceView,
     seed_skipped: Sequence[str] = (),
     seed_quota_blocked: bool = False,
+    seed_skipped_more: int = 0,
     max_expanded: int = DEFAULT_MAX_EXPANDED,
 ) -> str:
     """列当前视图的工作区并渲染成块。**拿不到就返回 ``""``, 永不抛。**
@@ -410,13 +419,13 @@ async def workspace_prompt_block(
             return render_workspace_block(agent, max_expanded=max_expanded)
         try:
             conv_scope = store_scope(EXEC_VIEW, agent_key=agent_key, conv_id=view.conv_id)
-            # B-236 —— 两份清单:全量的(含原样副本)与存储剔过副本的;差就是原样副本。
+            # B-236 —— 全量清单(含原样副本);副本按开场复制清单与 ctime 在这里认(review 10:
+            # 标记每轮只读这一次,不再让存储剔一遍、这里再读一遍)。
             conversation = await store.list_files(
                 tenant_id=tenant_id, user_id=user_id, scope=conv_scope, include_seed_copies=True
             )
-            outputs = await store.list_files(tenant_id=tenant_id, user_id=user_id, scope=conv_scope)
         except MISSING_DIR_ERRORS:
-            conversation = outputs = []
+            conversation = []
         manifest = await _seed_manifest(store, tenant_id=tenant_id, user_id=user_id, view=view)
     except Exception:
         logger.warning(
@@ -425,24 +434,30 @@ async def workspace_prompt_block(
             exc_info=True,
         )
         return ""
-    kept = {e.path for e in outputs}
     return render_conversation_block(
         conversation,
         agent,
-        pristine=frozenset(e.path for e in conversation if e.path not in kept),
-        manifest=manifest,
+        pristine=frozenset(
+            e.path for e in conversation if is_pristine_seed_copy(manifest, e.path, e)
+        ),
+        manifest=frozenset(manifest),
+        # 条数到了存储的上限 = 可能截断了(恰好 2000 条也按截断算,宁可多展开)。
+        listing_truncated=len(conversation) >= _nws._MAX_LIST_ENTRIES,
         seed_skipped=seed_skipped,
         seed_quota_blocked=seed_quota_blocked,
+        seed_skipped_more=seed_skipped_more,
         max_expanded=max_expanded,
     )
 
 
 async def _seed_manifest(
     store: WorkspaceStore, *, tenant_id: UUID, user_id: UUID, view: WorkspaceView
-) -> frozenset[str]:
-    """本对话开场复制清单里的路径(``work/`` 相对);读不到 / 没有 / 坏了 → 空(什么都不收成一行)。
+) -> dict[str, tuple[int, int]]:
+    """本对话的开场复制清单(``work/`` 相对路径 → 大小与 ctime);读不到 / 没有 / 坏了 → 空
+    (什么都不认成副本)。
 
-    经存储读(按 fd 走、``O_NONBLOCK``、有大小上限),不另开一条路径。
+    经存储读(按 fd 走、``O_NONBLOCK``、有大小上限),不另开一条路径。整份留着:判「目录里一个
+    不少」要看清单里有、对话里已经没有的那些路径。一个对话一份,上限 256 KiB。
     """
     assert view.conv_id is not None  # noqa: S101 - 只在对话视图里调
     try:
@@ -454,6 +469,5 @@ async def _seed_manifest(
             max_bytes=MAX_SEED_MARKER_BYTES,
         )
     except Exception:
-        return frozenset()
-    manifest = parse_seed_manifest(data)
-    return frozenset(manifest) if manifest else frozenset()
+        return {}
+    return parse_seed_manifest(data) or {}

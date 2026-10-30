@@ -1186,7 +1186,7 @@ class SearchFilesTool:
         if ctx.workspace_view.per_conversation:
             searches.append((_store_scope(AGENT_VIEW, ctx), f"{AGENT_VIEW}/"))
         hits: list[WorkspaceFileEntry] = []
-        truncated = False
+        truncated = too_deep = False
         for scope, prefix in searches:
             if len(hits) >= self.max_results:
                 truncated = True
@@ -1208,7 +1208,8 @@ class SearchFilesTool:
                 _raise_for_store_error(exc, tool="search_files")
             hits.extend(replace(e, path=f"{prefix}{e.path}") for e in found.entries)
             truncated = truncated or found.truncated
-        found = WorkspaceSearchResult(entries=tuple(hits), truncated=truncated)
+            too_deep = too_deep or found.too_deep
+        found = WorkspaceSearchResult(entries=tuple(hits), truncated=truncated, too_deep=too_deep)
         return ToolResult(
             content=_format_search(found),
             meta={
@@ -1217,6 +1218,7 @@ class SearchFilesTool:
                 "paths": [entry.path for entry in found.entries],
                 "n_results": len(found.entries),
                 "truncated": found.truncated,
+                "too_deep": found.too_deep,
             },
         )
 
@@ -1244,13 +1246,19 @@ def _format_search(found: WorkspaceSearchResult) -> str:
     """Human-readable search result for the LLM.
 
     截断时**明说还有多少没列出**, 不静悄悄少几行 —— 一个被悄悄截断的列表会被读成
-    "就这些了", 而那正是 B-84 要治的误判形态。
+    "就这些了", 而那正是 B-84 要治的误判形态。B-236 review 10 —— 有目录太深没搜(``too_deep``)
+    单独一行说,零命中时也说:那时的「没找到」不等于「没有」。
     """
-    if not found.entries:
-        return "(no matching files)"
     lines = [f"{entry.path}  ({entry.size} bytes)" for entry in found.entries]
+    if not lines:
+        lines.append("(no matching files)")
     if found.truncated:
         lines.append(f"... (more matches not listed; showing the first {len(found.entries)})")
+    if found.too_deep:
+        lines.append(
+            "... (some directories are nested too deep to search; files below that depth "
+            "were not searched)"
+        )
     return "\n".join(lines)
 
 

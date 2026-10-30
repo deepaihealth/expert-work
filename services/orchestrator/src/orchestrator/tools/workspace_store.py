@@ -77,6 +77,9 @@ class WorkspaceFileEntry:
     #: :class:`~orchestrator.tools.nas_workspace_store.NasWorkspaceStore`
     #: (生产唯一在跑的实现)永远给真值。
     mtime: datetime | None = None
+    #: B-236 review 10 —— ``st_ctime_ns``,认开场复制的原样副本用(与 ``.seeded`` 清单比)。只有
+    #: NAS 实现给;不参与相等比较,也不进任何对外视图。
+    ctime_ns: int | None = field(default=None, compare=False, repr=False)
 
 
 @dataclass(frozen=True)
@@ -113,10 +116,15 @@ class WorkspaceSearchResult:
     截断标记是单独一个字段, 不是「``len(entries) == max_results``」这种推断:
     恰好命中 N 条和命中了更多被截到 N 条, 对模型是两个不同的事实, 推断法把它们
     混成一个。照 ``list_dir`` 既有的 ``truncated`` 约定, 不发明第二种。
+
+    ``too_deep``(B-236 review 10)—— 有目录比遍历深度上限还深、没往下搜。和 ``truncated``
+    (命中够了 ``max_results`` 条、后面没列)是两件事:前者的「没找到」不等于「没有」,即使
+    一条命中都没有也要告诉模型。
     """
 
     entries: tuple[WorkspaceFileEntry, ...]
     truncated: bool
+    too_deep: bool = False
 
 
 def _entry_from_wire(raw: Mapping[str, Any]) -> WorkspaceFileEntry:

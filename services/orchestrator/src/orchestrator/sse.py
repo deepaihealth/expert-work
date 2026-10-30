@@ -232,7 +232,7 @@ SYSTEM_PROMPT_EVENT = "system_prompt"
 #: directory names the conversation-start copy left out) only feeds the model's
 #: workspace block; it is not run output either.
 _INTERNAL_STATE_KEYS: frozenset[str] = frozenset(
-    {"context_summary", "seed_skipped_dirs", "seed_quota_blocked"}
+    {"context_summary", "seed_skipped_dirs", "seed_quota_blocked", "seed_skipped_more"}
 )
 
 

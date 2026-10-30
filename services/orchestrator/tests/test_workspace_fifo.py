@@ -136,7 +136,7 @@ async def test_listing_stops_descending_past_the_depth_cap(
     assert [e.path for e in files] == ["shallow.txt"]
 
 
-async def test_search_past_the_depth_cap_is_reported_truncated(
+async def test_search_past_the_depth_cap_is_reported_too_deep(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     from orchestrator.tools import nas_workspace_store as nws
@@ -147,7 +147,21 @@ async def test_search_past_the_depth_cap_is_reported_truncated(
         tenant_id=_TENANT, user_id=_USER, name_glob="*.txt"
     )
     assert [e.path for e in result.entries] == ["shallow.txt"]
-    assert result.truncated is True
+    assert result.too_deep is True
+    assert result.truncated is False  # 「命中太多没列」是另一回事
+
+
+@pytest.mark.parametrize("hits", [0, 1])
+def test_search_text_says_too_deep_apart_from_more_matches(hits: int) -> None:
+    """review 10 —— 太深没搜单独一行,零命中时也说(那时「没找到」≠「没有」)。"""
+    from orchestrator.tools.file_ops import _format_search
+    from orchestrator.tools.workspace_store import WorkspaceFileEntry, WorkspaceSearchResult
+
+    entries = tuple(WorkspaceFileEntry(path="a.txt", size=1) for _ in range(hits))
+    text = _format_search(WorkspaceSearchResult(entries=entries, truncated=False, too_deep=True))
+
+    assert "nested too deep to search" in text
+    assert "more matches not listed" not in text
 
 
 async def test_write_file_closes_its_fd_when_fstat_fails(
@@ -182,3 +196,53 @@ async def test_write_file_closes_its_fd_when_fstat_fails(
             tenant_id=_TENANT, user_id=_USER, path="out.txt", data=b"x"
         )
     assert opened and opened[0] in closed
+
+
+async def test_read_file_never_returns_more_than_the_cap_of_a_growing_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """review 10 —— fstat 之后文件还在长:最多读 cap + 1,超了照样报太大,不把整个文件读进来。"""
+    from orchestrator.tools import nas_workspace_store as nws
+    from orchestrator.tools.sandbox import WorkspaceFileTooLargeError
+
+    f = tmp_path / str(_TENANT) / str(_USER) / "grow.txt"
+    f.parent.mkdir(parents=True)
+    f.write_bytes(b"x" * 5_000)
+    real_fstat = os.fstat
+
+    def stale_fstat(fd: int) -> os.stat_result:
+        info = real_fstat(fd)
+        if info.st_size == 5_000:  # 假装 fstat 那一刻文件还只有 10 字节
+            fields = list(info)
+            fields[6] = 10
+            return os.stat_result(fields)
+        return info
+
+    sizes: list[int] = []
+    real_fdopen = os.fdopen
+
+    class _Spy:
+        def __init__(self, handle: Any) -> None:
+            self._h = handle
+
+        def __enter__(self) -> _Spy:
+            self._h.__enter__()
+            return self
+
+        def __exit__(self, *exc: object) -> None:
+            self._h.__exit__(*exc)
+
+        def fileno(self) -> int:
+            return int(self._h.fileno())
+
+        def read(self, size: int = -1) -> bytes:
+            sizes.append(size)
+            return bytes(self._h.read(size))
+
+    monkeypatch.setattr(nws.os, "fstat", stale_fstat)
+    monkeypatch.setattr(nws.os, "fdopen", lambda *a, **k: _Spy(real_fdopen(*a, **k)))
+    with pytest.raises(WorkspaceFileTooLargeError):
+        await NasWorkspaceStore(root=str(tmp_path)).read_file(
+            tenant_id=_TENANT, user_id=_USER, path="grow.txt", max_bytes=100
+        )
+    assert sizes == [101]  # 只读上限加一个字节,不读整个文件
