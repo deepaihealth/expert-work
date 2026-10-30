@@ -220,7 +220,7 @@ async def test_a_dispatched_observation_runs_and_a_failure_is_only_logged(
         failing = dispatch_observation(_store(tmp_path), _configurable())
         assert failing is not None
         await asyncio.wait_for(failing, timeout=5)
-    (record,) = [r for r in caplog.records if "agent_file_versions" in r.getMessage()]
+    (record,) = [r for r in caplog.records if "observe_failed" in r.getMessage()]
     assert "OSError" in record.getMessage() and "客户甲" not in record.getMessage()
 
 
