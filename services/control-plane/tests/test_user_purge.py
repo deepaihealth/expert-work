@@ -1523,6 +1523,7 @@ async def test_versions_recreated_by_a_run_ending_mid_purge_are_deleted(tmp_path
     notes.write_text("- a\n")
     versions = NasAgentFileVersionStore(workspace=NasWorkspaceStore(root=str(tmp_path)))
     history = tmp_path / str(world.t1) / ".agent-file-versions" / str(a)
+    await versions.observe(tenant_id=world.t1, user_id=a, agent_key="k")  # 第一遍删它
 
     class _RunEndsBeforeTheMark(RecordingWorkspaceStore):
         async def mark_deleted(self, *, tenant_id: UUID, user_id: UUID) -> None:
@@ -1542,6 +1543,7 @@ async def test_versions_recreated_by_a_run_ending_mid_purge_are_deleted(tmp_path
     )
 
     assert "agent_file_version_after_mark" not in summary.failures
+    assert summary.deleted["agent_file_version"] == 2  # 第一遍 1 份 + 标记之后第二遍 1 份
     assert not history.exists()
 
 

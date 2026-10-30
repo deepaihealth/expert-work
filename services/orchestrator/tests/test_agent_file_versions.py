@@ -427,40 +427,6 @@ async def test_orphan_version_dirs_are_swept_after_the_grace(tmp_path: Path) -> 
     assert len(list(base.iterdir())) == 2  # t.md 的目录 + 刚建的那个
 
 
-async def test_the_dir_cap_is_enforced_without_a_new_snapshot(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """review 10 —— 目录数上限每次观察都查,不只在写了新版本时。"""
-    agent = _agent(tmp_path)
-    for i in range(4):
-        _put(agent / f"f{i}.md", f"{i}")
-    await _observe(tmp_path)
-    monkeypatch.setattr(versions_mod, "MAX_VERSION_DIRS_PER_AGENT", 2)
-
-    report = await _observe(tmp_path)
-
-    assert report.snapshotted == 0
-    assert len(list((_versions_root(tmp_path) / _KEY).iterdir())) == 2
-
-
-async def test_dirs_of_deleted_sources_go_before_stable_live_files(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """review 9 —— 版本目录超了上限:先删源文件已不见的,不是先删一直没改的活文件。"""
-    agent = _agent(tmp_path)
-    _put(agent / "stable.md", "s")
-    await _observe(tmp_path)
-    gone = _put(agent / "gone.md", "g")
-    await _observe(tmp_path)
-    gone.unlink()
-    await _observe(tmp_path)  # gone.md 记下「不见」(这一步刷新了它版本目录的 mtime)
-    monkeypatch.setattr(versions_mod, "MAX_VERSION_DIRS_PER_AGENT", 2)
-    _put(agent / "new.md", "n")
-    await _observe(tmp_path)
-
-    assert set(_history(tmp_path)) == {"stable.md", "new.md"}
-
-
 async def test_version_dirs_per_agent_are_capped(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -629,33 +595,6 @@ async def test_over_budget_is_logged_with_tenant_and_user(
     assert f"tenant_id={_TENANT}" in line and f"user_id={_USER}" in line
 
 
-async def test_the_dir_cap_spares_fresh_empty_dirs_and_survives_a_racing_writer(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """review 11 —— 目录数封顶不删刚建、还没写进版本的目录(另一次观察正要写);删目录撞上
-    ``ENOTEMPTY`` 只跳过那一个,整次观察照常结束。"""
-    import errno
-
-    agent = _agent(tmp_path)
-    for i in range(3):
-        _put(agent / f"f{i}.md", f"{i}")
-    await _observe(tmp_path)
-    fresh = _versions_root(tmp_path) / _KEY / ("f" * 32)
-    fresh.mkdir()
-    monkeypatch.setattr(versions_mod, "MAX_VERSION_DIRS_PER_AGENT", 3)
-
-    await _observe(tmp_path)
-    assert fresh.exists()  # 多出来的那个删的是别的,不是刚建的空目录
-
-    def racing_rmtree(*args: Any, **kwargs: Any) -> None:
-        raise OSError(errno.ENOTEMPTY, "Directory not empty")
-
-    monkeypatch.setattr(versions_mod.shutil, "rmtree", racing_rmtree)
-    _put(agent / "f9.md", "9")
-    report = await _observe(tmp_path)  # 不抛
-    assert report.snapshotted >= 1  # f9.md(还有上一次被封顶删掉、这次重新留的那个)
-
-
 def test_the_budget_never_deletes_the_newest_version_of_a_live_file(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -799,3 +738,208 @@ async def test_the_longest_missing_file_loses_its_last_version_first(
     kept = _history(tmp_path)
     assert kept.get("m1.md", []) == []
     assert len(kept["m2.md"]) == 1
+
+
+# ---------------------------------------------------------------------------
+# review 12 —— 目录数上限只挡新的不删旧的、清除竞态、标记只看这次扫描、看到了就撤「不见」
+# ---------------------------------------------------------------------------
+
+
+def _deleted_marker(root: Path) -> Path:
+    from orchestrator.tools.nas_workspace_store import workspace_deleted_marker
+
+    return Path(workspace_deleted_marker(str(root), _TENANT, _USER))
+
+
+async def test_empty_files_at_the_dir_cap_never_evict_the_index_history(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """exp_protected_eviction dircap 的形状:空文件把版本目录数顶满(字节预算挡不住),索引的历史
+    一份不少;放不下的新文件不留,记 over_budget。"""
+    monkeypatch.setattr(versions_mod, "MAX_VERSION_DIRS_PER_AGENT", 10)
+    agent = _agent(tmp_path)
+    notes = agent / "AGENT_NOTES.md"
+    for r in range(1, 6):
+        _put(notes, f"GOOD notes v{r}")
+        _put(agent / "prefs.md", f"pref v{r}")
+        await _observe(tmp_path)
+    _put(notes, "BAD poisoned notes")
+    await _observe(tmp_path)
+    for r in range(7, 10):
+        for i in range(6):
+            _put(agent / f"{99 - r:02d}_{i:03d}", "")  # 名字排在前面、一直留着
+        report = await _observe(tmp_path)
+
+    assert report.over_budget is True
+    assert len(list((_versions_root(tmp_path) / _KEY).iterdir())) == 10
+    kept = _history(tmp_path)
+    assert kept["AGENT_NOTES.md"][:5] == [f"GOOD notes v{r}" for r in range(1, 6)]
+    assert len(kept["prefs.md"]) == 5
+
+
+async def test_a_file_that_fails_to_drop_does_not_fail_the_observation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """删版本目录撞上另一次观察同时往里写(``ENOTEMPTY``):只跳过那一个,这次观察照常结束。"""
+    import errno
+
+    _put(_agent(tmp_path) / "t.md", "t")
+    await _observe(tmp_path)
+    orphan = _versions_root(tmp_path) / _KEY / ("0" * 32)
+    orphan.mkdir()
+    os.utime(orphan, (1_000_000_000, 1_000_000_000))
+
+    def racing_rmtree(*args: Any, **kwargs: Any) -> None:
+        raise OSError(errno.ENOTEMPTY, "Directory not empty")
+
+    monkeypatch.setattr(versions_mod.shutil, "rmtree", racing_rmtree)
+    _put(_agent(tmp_path) / "u.md", "u")
+
+    report = await _observe(tmp_path)
+
+    assert report.snapshotted == 1
+    assert orphan.exists()
+
+
+async def test_a_restored_file_is_live_even_when_the_walk_is_incomplete(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """probe12b C2 的形状:文件删了(记「不见」)又恢复,同时有一个太深的目录让遍历不完整 ——
+    看到了就是在:撤掉标记,它按活文件留最新 2 份。"""
+    monkeypatch.setattr(versions_mod, "MAX_AGENT_VERSION_BYTES", 10_000)
+    agent = _agent(tmp_path)
+    f = agent / "f.md"
+    for i in range(3):
+        _put(f, f"F-v{i}".ljust(1_500, "f"))
+        await _observe(tmp_path)
+    f.unlink()
+    await _observe(tmp_path)  # 记下「不见」
+    deep = agent
+    for i in range(versions_mod.MAX_SEED_DEPTH + 2):
+        deep = deep / f"d{i}"
+    _put(deep / "x.txt", "x")
+    _put(f, "F-PREV-STATE".ljust(1_500, "f"))
+    await _observe(tmp_path)
+    _put(f, "F-BAD".ljust(1_500, "f"))
+    await _observe(tmp_path)
+    big = agent / "big.bin"
+    for r in range(4):
+        _put(big, f"{r}".ljust(3_900, "b"))
+        await _observe(tmp_path)
+
+    kept = [v[:12] for v in _history(tmp_path)["f.md"]]
+    assert kept[-2:] == ["F-PREV-STATE", "F-BAD".ljust(12, "f")]
+
+
+async def test_the_same_run_index_guard_does_not_depend_on_clocks(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """索引这一次才被记「不见」:只看这次扫描建没建标记,不比时间(NAS 服务端时钟比本机慢时,
+    比时间的做法护不住)。"""
+    monkeypatch.setattr(versions_mod, "MAX_AGENT_VERSION_BYTES", 10_000)
+    agent = _agent(tmp_path)
+    notes = agent / "AGENT_NOTES.md"
+    for i in range(5):
+        _put(notes, f"good notes v{i}".ljust(100, "."))
+        await _observe(tmp_path)
+    static = agent / "static.bin"
+    for i in range(2):
+        _put(static, f"{i}".ljust(3_000, "s"))
+        await _observe(tmp_path)
+    real_since = versions_mod._missing_since
+
+    def server_clock_behind(file_dir: int) -> float | None:
+        since = real_since(file_dir)
+        return None if since is None else since - 3_600  # NAS 服务端时钟比本机慢一小时
+
+    monkeypatch.setattr(versions_mod, "_missing_since", server_clock_behind)
+    notes.rename(agent / ".hidden")
+    _put(agent / "junk.bin", "j" * 3_950)
+
+    await _observe(tmp_path)
+
+    assert _history(tmp_path)["AGENT_NOTES.md"][-1].startswith("good notes v4")
+
+
+async def test_a_purge_landing_before_housekeeping_leaves_nothing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """观察已经过了开头那次软删标记检查,清除才落下:收尾前再看一次,什么都不建。"""
+    _put(_agent(tmp_path) / "AGENT_NOTES.md", "a")
+    real_order = versions_mod._observe_order
+
+    def purge_lands(found: Any) -> list[str]:
+        marker = _deleted_marker(tmp_path)
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        marker.touch()
+        return real_order(found)
+
+    monkeypatch.setattr(versions_mod, "_observe_order", purge_lands)
+    writes: list[int] = []
+    real_write = versions_mod._write_pending
+
+    def spy_write(agent_dir: int, pending: Any, scan: Any) -> None:
+        writes.append(len(pending))
+        real_write(agent_dir, pending, scan)
+
+    monkeypatch.setattr(versions_mod, "_write_pending", spy_write)
+
+    await _observe(tmp_path)
+
+    assert writes == []  # 一份都没写过(不是写了再删)
+    assert not _versions_root(tmp_path).exists()
+
+
+async def test_a_purge_landing_during_the_writes_leaves_nothing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """清除(标记 + 第二遍删除)落在写的过程中:最后一次写之后再看一次,这个用户的版本整个删掉。"""
+    _put(_agent(tmp_path) / "AGENT_NOTES.md", "a")
+    real_write = versions_mod._write_pending
+
+    def purge_lands(agent_dir: int, pending: Any, scan: Any) -> None:
+        real_write(agent_dir, pending, scan)
+        marker = _deleted_marker(tmp_path)
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        marker.touch()
+
+    monkeypatch.setattr(versions_mod, "_write_pending", purge_lands)
+
+    await _observe(tmp_path)
+
+    assert not _versions_root(tmp_path).exists()
+
+
+async def test_observations_of_one_agent_take_turns_in_a_process(tmp_path: Path) -> None:
+    """同一个(租户, 用户, agent)的两次观察在本进程里不重叠(各自按旧现状算预算会冲过预算)。"""
+    import threading
+
+    _put(_agent(tmp_path) / "t.md", "t")
+    store = _store(tmp_path)
+    active = 0
+    peak = 0
+    guard = threading.Lock()
+    real = versions_mod.observe_sync
+
+    def counting(*args: Any) -> Any:
+        nonlocal active, peak
+        with guard:
+            active += 1
+            peak = max(peak, active)
+        time.sleep(0.05)
+        try:
+            return real(*args)
+        finally:
+            with guard:
+                active -= 1
+
+    versions_mod_observe = versions_mod.observe_sync
+    versions_mod.observe_sync = counting  # type: ignore[assignment]
+    try:
+        await asyncio.gather(
+            *(store.observe(tenant_id=_TENANT, user_id=_USER, agent_key=_KEY) for _ in range(3))
+        )
+    finally:
+        versions_mod.observe_sync = versions_mod_observe  # type: ignore[assignment]
+
+    assert peak == 1
