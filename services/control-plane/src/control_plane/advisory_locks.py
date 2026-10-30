@@ -81,7 +81,10 @@ __all__ = [
 ]
 
 #: ``workspace_lock.PgWorkspaceLock`` — per-workspace write lock, key
-#: ``"{tenant_id}:{user_id}"``.
+#: ``"{tenant_id}:{user_id}"``; a new-layout conversation (B-236) uses
+#: ``"{tenant_id}:{user_id}:conv:{conversation_id}"`` under the same classid,
+#: and a file write into the agent's shared area adds
+#: ``"{tenant_id}:{user_id}:agent:{agent_key}"`` (taken second).
 WORKSPACE_LOCK_CLASSID: Final[int] = 1
 
 #: ``mcp_oauth_refresh_lock`` — per-(tenant, user) OAuth token refresh, key
