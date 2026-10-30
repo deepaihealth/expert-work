@@ -596,9 +596,11 @@ async def purge_user(
         summary.workspace_marked_deleted = "workspace" not in summary.failures
     else:
         summary.failures["workspace"] = "no supervisor client wired"
-    # B-236 review 11 —— 软删标记落下之后再删一遍 ``/agent`` 文件的版本:上面第一遍删完到标记落下
-    # 之间结束的 run,它的观察看不到标记,会把 ``.agent-file-versions/{user}`` 又建回来。标记落下
-    # 之后结束的 run 看到标记就不观察,所以这一遍之后不会再长出来。
+    # B-236 review 11/13 —— 软删标记落下之后再删一遍 ``/agent`` 文件的版本:上面第一遍删完到标记落下
+    # 之间结束的 run,它的观察看不到标记,会把 ``.agent-file-versions/{user}`` 又建回来。这一遍之后
+    # 还在写的观察,最后一次写之后会再看一次标记、看到就自己删掉(``agent_file_versions._housekeep``
+    # 的 ``finally``)—— 前提是它在同一个挂载上看得到标记;跨副本的 NFS 属性缓存可能晚几秒,兜底是
+    # 留存作业按用户删整个版本目录。
     if deps.agent_file_versions is not None:
         summary.deleted["agent_file_version"] = summary.deleted.get(
             "agent_file_version", 0
