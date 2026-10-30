@@ -66,6 +66,14 @@ async def _observe(root: Path) -> Any:
     return await _store(root).observe(tenant_id=_TENANT, user_id=_USER, agent_key=_KEY)
 
 
+def _age_marker(marker: Path) -> None:
+    """一个月前第一次确认不见、之后每周都有观察再确认过(review 16:内容 = 第一次的时间,mtime =
+    最近一次确认)。"""
+    marker.write_text("1000000000")
+    now = time.time()
+    os.utime(marker, (now, now))
+
+
 async def test_a_changed_file_is_snapshotted_and_an_unchanged_one_is_not(tmp_path: Path) -> None:
     agent = _agent(tmp_path)
     _put(agent / "AGENT_NOTES.md", "- tpl: /agent/tpl/t.md\n")
@@ -239,8 +247,7 @@ async def test_versions_of_a_source_gone_for_thirty_days_are_dropped(tmp_path: P
     assert set(_history(tmp_path)) == {"tpl/keep.md", "tpl/gone.md"}
     markers = list(_versions_root(tmp_path).rglob("missing"))
     assert len(markers) == 1
-    old = 1_000_000_000
-    os.utime(markers[0], (old, old))
+    _age_marker(markers[0])
 
     report = await _observe(tmp_path)
 
@@ -1127,7 +1134,7 @@ async def test_deleted_files_age_out_although_another_subtree_is_too_deep(
     await _observe(tmp_path)
     markers = list(_versions_root(tmp_path).rglob("missing"))
     assert len(markers) == 1
-    os.utime(markers[0], (1_000_000_000, 1_000_000_000))
+    _age_marker(markers[0])
 
     report = await _observe(tmp_path)
 
@@ -1210,7 +1217,7 @@ async def test_a_cancelled_observation_keeps_the_lock_until_its_thread_ends(
 
 def _age_markers(root: Path) -> None:
     for marker in _versions_root(root).rglob("missing"):
-        os.utime(marker, (1_000_000_000, 1_000_000_000))
+        _age_marker(marker)
 
 
 def _dot_flood(agent: Path, n: int) -> None:
@@ -1679,20 +1686,28 @@ async def test_a_month_of_unsearchable_subdir_does_not_let_a_stale_marker_expire
     assert _history(tmp_path)["prefs.md"] == ["good prefs v1", "good prefs v2 (longer)"]
 
 
-async def test_leftover_tmp_files_are_swept_after_the_grace(tmp_path: Path) -> None:
-    """写到一半被杀留下的 ``.tmp-*``:满宽限期删掉,新的不动。"""
+async def test_leftover_tmp_files_are_aged_by_ctime_not_by_a_copied_mtime(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """review 16 —— 临时文件带着抄来的源文件 mtime(载荷定的:1970 或 2100):按 ctime 算,刚建的不删
+    (另一个副本正在写),满 1 小时的删(哪怕 mtime 在将来)。"""
     _put(_agent(tmp_path) / "f.md", "f")
     await _observe(tmp_path)
     (file_dir,) = (_versions_root(tmp_path) / _KEY).iterdir()
-    old_tmp, new_tmp = file_dir / ".tmp-old", file_dir / ".tmp-new"
-    old_tmp.write_text("x" * 100)
-    new_tmp.write_text("y")
-    os.utime(old_tmp, (1_000_000_000, 1_000_000_000))
+    past, future = file_dir / ".tmp-past", file_dir / ".tmp-future"
+    past.write_text("x" * 100)
+    future.write_text("y")
+    os.utime(past, (1_000_000_000, 1_000_000_000))
+    os.utime(future, (4_102_444_800, 4_102_444_800))
 
     await _observe(tmp_path)
+    assert past.exists() and future.exists()  # ctime 是刚才:正在写的不删
 
-    assert not old_tmp.exists()
-    assert new_tmp.exists()
+    real_time = time.time
+    monkeypatch.setattr(time, "time", lambda: real_time() + 2 * 3_600)
+    await _observe(tmp_path)
+
+    assert not past.exists() and not future.exists()
 
 
 async def test_a_failing_prune_keeps_the_books_conservative(
@@ -1880,3 +1895,180 @@ async def test_a_dir_that_fails_to_list_is_unlisted_and_the_observation_complete
 
     assert report.walk_incomplete is True
     assert _markers(tmp_path) == []
+
+
+# ---------------------------------------------------------------------------
+# review 16 —— 不观察的那段时间不算进 30 天、一个目录出错不连累别的、根目录的读错误、临时文件
+# ---------------------------------------------------------------------------
+
+
+async def test_an_unobserved_gap_restarts_the_thirty_days(tmp_path: Path) -> None:
+    """repro_gap:T0 确认不见 → 文件被不走观察的路径放回、一个月没有观察 → T31 一次藏起来:
+    上一次确认已经过了 7 天以上,从现在重新算 30 天,不会一下子删掉。"""
+    agent = _agent(tmp_path)
+    f = agent / "tpl" / "t.md"
+    for i in range(3):
+        _put(f, f"v{i}")
+        await _observe(tmp_path)
+    f.rename(agent / ".stash")
+    await _observe(tmp_path)  # T0
+    (marker,) = _markers(tmp_path)
+    old = time.time() - 31 * 86_400
+    marker.write_text(f"{old:.0f}")
+    os.utime(marker, (old, old))  # 一个月里没有任何观察再确认过
+
+    report = await _observe(tmp_path)  # T31:又不见
+
+    assert report.dropped == 0
+    assert _history(tmp_path)["tpl/t.md"] == ["v0", "v1", "v2"]
+    assert float(marker.read_text()) > time.time() - 60  # 从现在重新算
+
+
+async def test_a_torn_marker_restarts_the_thirty_days(tmp_path: Path) -> None:
+    """标记内容写坏了(空的):当作重新开始,不删。"""
+    gone = _put(_agent(tmp_path) / "gone.md", "g")
+    await _observe(tmp_path)
+    gone.unlink()
+    await _observe(tmp_path)
+    (marker,) = _markers(tmp_path)
+    marker.write_text("")
+
+    report = await _observe(tmp_path)
+
+    assert report.dropped == 0
+    assert float(marker.read_text()) > time.time() - 60
+
+
+async def test_one_dirs_error_does_not_stop_the_sweep_of_later_dirs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """repro_enospc 的形状(注入错误代替真把盘写满):扫到某个目录时出错(写标记 ENOSPC),后面目录里
+    在着的文件的旧标记照样撤掉。"""
+    import errno
+
+    agent = _agent(tmp_path)
+    for i in range(6):
+        _put(agent / f"w{i}.md", f"w{i}")
+    x = _put(agent / "x.md", "precious")
+    await _observe(tmp_path)
+    await _confirm_missing_then_restore(tmp_path, x)
+    for i in range(6):
+        (agent / f"w{i}.md").unlink()  # 这些要记「不见」:写标记时满盘
+    real_open = os.open
+
+    def enospc(path: Any, flags: int, mode: int = 0o777, *, dir_fd: int | None = None) -> int:
+        if isinstance(path, str) and "missing" in path and flags & os.O_CREAT:
+            raise OSError(errno.ENOSPC, "No space left on device")
+        return real_open(path, flags, mode, dir_fd=dir_fd)
+
+    monkeypatch.setattr(os, "open", enospc)
+    await _observe(tmp_path)
+    monkeypatch.setattr(os, "open", real_open)
+
+    x_dir = _versions_root(tmp_path) / _KEY / hashlib.sha256(b"x.md").hexdigest()[:32]
+    assert not (x_dir / "missing").exists()
+
+
+@pytest.mark.parametrize("err", ["EMFILE", "EIO"])
+async def test_a_non_enoent_error_opening_the_root_is_a_failure_that_still_sweeps(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, err: str
+) -> None:
+    """repro_rootopen:打开 agent 根出 EMFILE / EIO(存储层也收成「不存在」):不是「还没有根」——
+    照样空扫描撤旧标记,再抛出去(计失败)。"""
+    import errno
+
+    agent = _agent(tmp_path)
+    x = _put(agent / "x.md", "x")
+    await _observe(tmp_path)
+    await _confirm_missing_then_restore(tmp_path, x)
+    real_open = os.open
+    calls = 0
+
+    def flaky(path: Any, flags: int, mode: int = 0o777, *, dir_fd: int | None = None) -> int:
+        nonlocal calls
+        if path == _KEY and flags & os.O_DIRECTORY:
+            calls += 1
+            if calls == 1:  # 只有第一次:打开工作区里的 agent 根;版本区的同名目录照常
+                raise OSError(getattr(errno, err), err)
+        return real_open(path, flags, mode, dir_fd=dir_fd)
+
+    monkeypatch.setattr(os, "open", flaky)
+    with pytest.raises(Exception, match="not found"):
+        await _observe(tmp_path)
+    monkeypatch.setattr(os, "open", real_open)
+
+    assert _markers(tmp_path) == []
+
+
+async def test_a_missing_agent_root_is_not_a_failure(tmp_path: Path) -> None:
+    """agent 根真的还没建(ENOENT):什么都不做,不算失败。"""
+    report = await _observe(tmp_path)
+
+    assert report == versions_mod.ObserveReport()
+
+
+async def test_a_failing_tmp_unlink_after_link_still_counts_the_version(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """probe_unlink_eio:版本已经 ``link`` 好,删临时文件出 EIO —— 这份照样算写下了、记进账里。"""
+    import errno
+
+    _put(_agent(tmp_path) / "a.md", "a" * 1_000)
+    real_unlink = os.unlink
+
+    def unlink(name: Any, *, dir_fd: int | None = None) -> None:
+        if isinstance(name, str) and name.startswith(".tmp-") and "-path-" not in name:
+            raise OSError(errno.EIO, "EIO")
+        real_unlink(name, dir_fd=dir_fd)
+
+    monkeypatch.setattr(os, "unlink", unlink)
+    report = await _observe(tmp_path)
+    monkeypatch.setattr(os, "unlink", real_unlink)
+
+    assert report.snapshotted == 1 and report.skipped == 0
+    assert _history(tmp_path)["a.md"] == ["a" * 1_000]
+
+
+async def test_the_walk_error_wins_when_the_fallback_sweep_also_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """遍历抛了、兜底收尾也抛了:往外抛的是遍历的那个错误(兜底的只记日志)。"""
+    _put(_agent(tmp_path) / "x.md", "x")
+
+    def walk_fails(*args: Any) -> Any:
+        raise KeyError("walk")
+
+    def sweep_fails(*args: Any) -> None:
+        raise OSError(5, "EIO")
+
+    monkeypatch.setattr(versions_mod, "_files", walk_fails)
+    monkeypatch.setattr(versions_mod, "_housekeep", sweep_fails)
+
+    with pytest.raises(KeyError, match="walk"):
+        await _observe(tmp_path)
+
+
+async def test_a_dir_that_errors_still_gets_its_stale_marker_cleared(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """一个版本目录自己列不出来(EIO):接住之后照样试着撤掉它的旧标记(它不是「确认不见」)。"""
+    import errno
+
+    agent = _agent(tmp_path)
+    x = _put(agent / "x.md", "x")
+    await _observe(tmp_path)
+    await _confirm_missing_then_restore(tmp_path, x)
+    x_dir = _versions_root(tmp_path) / _KEY / hashlib.sha256(b"x.md").hexdigest()[:32]
+    x_ino = x_dir.stat().st_ino
+    real_listdir = os.listdir
+
+    def failing(path: Any = ".") -> list[str]:
+        if isinstance(path, int) and os.fstat(path).st_ino == x_ino:
+            raise OSError(errno.EIO, "EIO")
+        return real_listdir(path)
+
+    monkeypatch.setattr(os, "listdir", failing)
+    await _observe(tmp_path)
+    monkeypatch.setattr(os, "listdir", real_listdir)
+
+    assert not (x_dir / "missing").exists()

@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import errno
 import hashlib
 import logging
 import os
@@ -102,6 +103,11 @@ MAX_OBSERVE_VISITS = MAX_SEED_VISITS
 #: 版本目录里的 ``missing`` 标记上(第一次发现不见时建,文件回来就删)。
 MISSING_SOURCE_GRACE_S = 30 * 24 * 3600
 
+#: review 16 —— 两次「确认不见」之间隔了这么久(中间没有观察,比如老视图的对话、控制台上传在改
+#: ``/agent``,文件可能早就回来过),就从这一次重新算 30 天。``missing`` 标记的内容是第一次确认不见
+#: 的时间(30 天从它算),mtime 是最近一次确认的时间(每次确认都刷新)。
+MISSING_CONFIRM_GAP_S = 7 * 24 * 3600
+
 _PATH_FILE = "path"
 _MISSING_FILE = "missing"
 _VERSION_RE = re.compile(r"^v(\d{8})-([0-9a-f]{64})$")
@@ -145,8 +151,8 @@ class ObserveReport:
     over_budget: bool = False
     #: 上面三种原因里出现了哪些(排好序)。
     over_budget_reasons: tuple[str, ...] = ()
-    #: review 14 —— 这次遍历有目录没列全(名字数 / 条目数到顶、打不开、太深、读的时候名字没了):
-    #: 那些目录里没看到的文件这次「不知道」在不在。
+    #: review 14/15 —— 这次遍历有目录没列全(名字数 / 条目数到顶、打不开、读目录出错、太深、
+    #: 读的时候名字没了、``lstat`` 被拒),或索引单独查出错:那些文件这次「不知道」在不在。
     walk_incomplete: bool = False
 
 
@@ -365,8 +371,12 @@ def _check_index(agent_fd: int, scan: _Scan) -> Iterator[tuple[str, int]]:
 
 def _versions(file_dir: int) -> list[tuple[int, str, str]]:
     """``(序号, sha256, 文件名)``,按序号升序。"""
+    return _parse_versions(os.listdir(file_dir))
+
+
+def _parse_versions(names: list[str]) -> list[tuple[int, str, str]]:
     out: list[tuple[int, str, str]] = []
-    for name in os.listdir(file_dir):
+    for name in names:
         m = _VERSION_RE.match(name)
         if m:
             out.append((int(m.group(1)), m.group(2), name))
@@ -418,7 +428,9 @@ def _write_version(file_dir: int, data: bytes, info: os.stat_result, digest: str
                 continue  # 另一次观察同时写了同一号
         raise FileExistsError(f"no free version slot after v{seq:08d}")
     finally:
-        with contextlib.suppress(FileNotFoundError):
+        # review 16 —— 删临时文件出什么错都不管(版本可能已经 ``link`` 好了):剩下的由收尾扫描按
+        # 1 小时清掉(:func:`_sweep_tmp`)。
+        with contextlib.suppress(OSError):
             os.unlink(tmp, dir_fd=file_dir)
 
 
@@ -478,7 +490,11 @@ def _observe_file(
 def _write_path(file_dir: int, rel: str) -> None:
     """``path`` 原子地写(review 14):先写临时文件、fsync,再 ``rename`` 盖上去 —— 不会留下写了
     一半 / 空的 ``path``;已有的(哪怕坏了)也一并换掉。"""
-    tmp = f".tmp-path-{uuid4().hex}"
+    _atomic_write(file_dir, _PATH_FILE, rel.encode())
+
+
+def _atomic_write(file_dir: int, name: str, data: bytes) -> None:
+    tmp = f".tmp-{name}-{uuid4().hex}"
     fd = os.open(
         tmp,
         os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC,
@@ -487,15 +503,15 @@ def _write_path(file_dir: int, rel: str) -> None:
     )
     try:
         try:
-            view = memoryview(rel.encode())
+            view = memoryview(data)
             while view:
                 view = view[os.write(fd, view) :]
             os.fsync(fd)
         finally:
             os.close(fd)
-        os.rename(tmp, _PATH_FILE, src_dir_fd=file_dir, dst_dir_fd=file_dir)
+        os.rename(tmp, name, src_dir_fd=file_dir, dst_dir_fd=file_dir)
     finally:
-        with contextlib.suppress(FileNotFoundError):
+        with contextlib.suppress(OSError):
             os.unlink(tmp, dir_fd=file_dir)
 
 
@@ -535,8 +551,12 @@ def observe_sync(
     pending: list[_Pending] = []
     try:
         agent_fd = workspace._open_scope_dir_fd(tenant_id, user_id, f"{AGENTS_DIR}/{agent_key}")
-    except MISSING_DIR_ERRORS:
-        return ObserveReport()  # agent 根还没建:没有可留的
+    except MISSING_DIR_ERRORS as exc:
+        if _really_absent(exc):
+            return ObserveReport()  # agent 根还没建:没有可留的
+        # review 16 —— 存储层把 EIO / ESTALE / EMFILE 也收成「不存在」:那是失败,不是没有根。
+        _after_failed_walk(workspace.root, tenant_id, user_id, agent_key)
+        raise
     except BaseException:
         _after_failed_walk(workspace.root, tenant_id, user_id, agent_key)
         raise
@@ -586,10 +606,17 @@ def _walk_and_read(
             os.close(agent_dir)
 
 
+def _really_absent(exc: BaseException) -> bool:
+    """存储层的「路径不存在」背后真是 ENOENT / ENOTDIR(不是被一起收进来的 EIO、ESTALE、EMFILE)。"""
+    cause = exc.__cause__
+    return isinstance(cause, OSError) and cause.errno in (errno.ENOENT, errno.ENOTDIR)
+
+
 def _after_failed_walk(root: str, tenant_id: UUID, user_id: UUID, agent_key: str) -> None:
     """review 15 —— 打不开 agent 根、或遍历本身抛了异常:照样用一个**空的**扫描结果收一次尾再让
     异常往外抛。空扫描里每个文件都是「不知道」,所以这一遍只会撤掉各目录的 ``missing`` 标记、删
-    一份版本都没有的孤儿;``pending`` 是空的,不写、不按预算删、不按「不见满 30 天」删。
+    一份版本都没有的孤儿和满 1 小时的 ``.tmp-*``,以及(清除用户的软删标记在时)删掉这个用户的
+    全部版本;``pending`` 是空的,不写、不按预算删、不按「不见满 30 天」删。
 
     就是要守住:**没有哪种失败能让 T0 的旧标记一直作数**(否则「确认不见 → 一个月里每次观察都
     失败 → 藏一次」就能把整个目录一下删掉)。直接复用 :func:`_housekeep`(而不是另写一个只撤标记
@@ -665,9 +692,10 @@ def _housekeep(
 
     1. 扫一遍各版本目录(:func:`_sweep`):在的撤「不见」标记、确认不见的记下 / 满 30 天删掉、
        不知道的撤掉标记(下一次确认不见重新计时);一份版本都没有的孤儿满 1 小时删掉;
-    2. 按字节预算与版本目录数上限写这次读好的新版本(:func:`_write_pending`);
-    3. 写了新版本就把总量收回预算内(:func:`_enforce_budget`)。2、3 共用一次 :func:`_usage`
-       (写了哪个目录就只重读那一个)。
+    2. 按字节预算与版本目录数上限写这次读好的新版本(:func:`_write_pending`,用一次
+       :func:`_usage`,写了哪个目录就只重读那一个);
+    3. 写了新版本就重读一次 :func:`_usage`(别的副本同时写下的也算进去),把总量收回预算内
+       (:func:`_enforce_budget`)。
 
     review 12 —— 开始前与最后一次写之后都看一眼清除用户的软删标记:开始前在就什么都不做;写完
     才在(清除的第二遍删除可能已经跑完)就把这个用户的版本整个删掉。
@@ -724,13 +752,6 @@ def _dir_usage(file_dir: int, key: str, scan: _Scan) -> _DirUsage:
         rel = None
     status = scan.status(rel) if rel is not None else "unknown"
     return _DirUsage(rel, status, versions, is_index=key == _INDEX_KEY)
-
-
-def _missing_since(file_dir: int) -> float | None:
-    try:
-        return os.lstat(_MISSING_FILE, dir_fd=file_dir).st_mtime
-    except FileNotFoundError:
-        return None
 
 
 def _write_pending(
@@ -857,13 +878,18 @@ def _read_path(file_dir: int) -> str | None:
 def _sweep(agent_dir: int, scan: _Scan, now: float) -> None:
     """扫一遍这个 agent 的版本目录。
 
+    * 写到一半留下的 ``.tmp-*`` 满 1 小时删掉(:func:`_sweep_tmp`)。
     * 孤儿 —— **一份版本都没有**的目录 —— 建了满 :data:`ORPHAN_DIR_GRACE_S` 就删(review 10/14:
       有版本的目录从不当孤儿;``path`` 没了或坏了只算「不知道」)。
-    * ``path`` 读不动(EIO / ESTALE…,review 14):这次跳过这个目录,什么都不动。
+    * ``path`` 读不动(EIO / ESTALE…,review 14):这次跳过这个目录,不删、不动它的标记。
     * 源文件在(``live``):撤掉 ``missing`` 标记。
-    * 确认不见(``missing``:一路上的目录都列全了):第一次发现时记下标记,满 30 天删掉整个版本目录。
+    * 确认不见(``missing``:一路上的目录都列全了):记 / 刷新标记(:func:`_note_missing`),满 30 天
+      删掉整个版本目录。
     * 不知道(``unknown``:某一层没列全,或 ``path`` 坏了):撤掉标记(review 14)—— 之后要再确认一次
       不见、从那时重新算 30 天;不然「确认不见 → 一个月都看不清 → 藏一次」就能把整个目录一下删掉。
+
+    review 16 —— 一个目录出错(满盘 ENOSPC、EIO…)只影响它自己:接住、照样试着撤掉它的标记(除非它
+    确认不见),接着扫后面的目录。不然一个目录出错就让后面所有目录的旧标记一直作数。
     """
     seen_by_key = {_key_of(rel): rel for rel in scan.seen}
     for key in os.listdir(agent_dir):
@@ -872,15 +898,18 @@ def _sweep(agent_dir: int, scan: _Scan, now: float) -> None:
         except OSError:
             continue
         drop = False
+        status = "unknown"
         try:
-            _sweep_tmp(file_dir, now)
-            if not _versions(file_dir):
+            names = os.listdir(file_dir)
+            _sweep_tmp(file_dir, now, names)
+            if not _parse_versions(names):
                 drop = now - os.fstat(file_dir).st_mtime >= ORPHAN_DIR_GRACE_S
                 continue
             try:
                 rel = _valid_path(file_dir, key)
             except OSError:
-                continue  # 读不动:这一次跳过,不当孤儿、不判不见
+                status = "skip"
+                continue  # 读不动:这一次跳过,不当孤儿、不判不见、不动标记
             if rel is None and key in seen_by_key:
                 # review 15 —— ``path`` 坏了、源文件这次看到了(没改,所以不会走写入那条修复):在这里
                 # 原子地修好,不然它一直「不知道」、删掉后也永远不会到期。
@@ -893,20 +922,30 @@ def _sweep(agent_dir: int, scan: _Scan, now: float) -> None:
             else:
                 with contextlib.suppress(FileNotFoundError):
                     os.unlink(_MISSING_FILE, dir_fd=file_dir)
+        except OSError as exc:
+            drop = False
+            logger.debug("agent_file_versions.sweep_dir_failed error=%s", type(exc).__name__)
+            if status not in ("missing", "skip"):
+                with contextlib.suppress(OSError):
+                    os.unlink(_MISSING_FILE, dir_fd=file_dir)
         finally:
             os.close(file_dir)
             if drop:
                 _drop_dir(agent_dir, key, scan)
 
 
-def _sweep_tmp(file_dir: int, now: float) -> None:
-    """review 15 —— 写版本 / ``path`` 写到一半被杀留下的 ``.tmp-*``(不算版本、不进预算,目录有版本
-    又不是孤儿,所以没人清):建了满 :data:`ORPHAN_DIR_GRACE_S` 就删(不跟正在写的观察抢)。"""
-    for name in os.listdir(file_dir):
+def _sweep_tmp(file_dir: int, now: float, names: list[str] | None = None) -> None:
+    """review 15/16 —— 写版本 / ``path`` / 标记写到一半被杀留下的 ``.tmp-*``(不算版本、不进预算,
+    目录有版本又不是孤儿,所以没人清):按 **ctime** 建了满 :data:`ORPHAN_DIR_GRACE_S` 就删。
+
+    不按 mtime:写版本时会把源文件的 mtime 抄到临时文件上(那是载荷定的,可以是 1970 年,让另一个
+    副本的扫描把正在写的临时文件删掉;也可以是 2100 年,永远删不掉)。ctime 由文件系统定、载荷改不了,
+    抄 mtime 那一下也把 ctime 刷成「现在」。"""
+    for name in os.listdir(file_dir) if names is None else names:
         if not name.startswith(".tmp-"):
             continue
         with contextlib.suppress(OSError):
-            if now - os.lstat(name, dir_fd=file_dir).st_mtime >= ORPHAN_DIR_GRACE_S:
+            if now - os.lstat(name, dir_fd=file_dir).st_ctime >= ORPHAN_DIR_GRACE_S:
                 os.unlink(name, dir_fd=file_dir)
 
 
@@ -922,21 +961,39 @@ def _drop_dir(agent_dir: int, key: str, scan: _Scan) -> None:
 
 
 def _note_missing(file_dir: int, now: float) -> bool:
-    """源文件确认不见了:第一次发现时记 ``missing`` 标记;已不见满 :data:`MISSING_SOURCE_GRACE_S`
-    时回 ``True``。"""
-    since = _missing_since(file_dir)
-    if since is None:
-        with contextlib.suppress(FileExistsError):
-            os.close(
-                os.open(
-                    _MISSING_FILE,
-                    os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC,
-                    _FILE_MODE,
-                    dir_fd=file_dir,
-                )
-            )
-        return False
-    return now - since >= MISSING_SOURCE_GRACE_S
+    """源文件确认不见了:记 / 刷新 ``missing`` 标记;从第一次确认不见满
+    :data:`MISSING_SOURCE_GRACE_S` 时回 ``True``。
+
+    review 16 —— 标记的内容是第一次确认不见的时间,mtime 是最近一次确认的时间。没有标记、内容坏了
+    (写了一半)、第一次的时间在将来、或离上一次确认已经超过 :data:`MISSING_CONFIRM_GAP_S`(中间没有
+    观察,文件可能回来过):都从现在重新开始算 30 天。出错的方向只会是「晚到期 / 不到期」。
+    """
+    first = _marker_first_missing(file_dir)
+    if first is not None and first <= now:
+        last = os.lstat(_MISSING_FILE, dir_fd=file_dir).st_mtime
+        if now - last <= MISSING_CONFIRM_GAP_S:
+            os.utime(_MISSING_FILE, (now, now), dir_fd=file_dir, follow_symlinks=False)
+            return now - first >= MISSING_SOURCE_GRACE_S
+    _atomic_write(file_dir, _MISSING_FILE, f"{now:.0f}".encode())
+    return False
+
+
+def _marker_first_missing(file_dir: int) -> float | None:
+    """标记里记的第一次确认不见的时间;没有标记、不是普通文件、内容解析不了 → ``None``(重新开始)。"""
+    try:
+        fd = os.open(_MISSING_FILE, _READ_FLAGS, dir_fd=file_dir)
+    except FileNotFoundError:
+        return None
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            return None
+        raw = os.read(fd, 64)
+    finally:
+        os.close(fd)
+    try:
+        return float(raw.decode("ascii").strip())
+    except (UnicodeDecodeError, ValueError):
+        return None
 
 
 def _read_all(fd: int, size: int) -> bytes:
@@ -1106,8 +1163,9 @@ async def _observe_logged(
             MAX_AGENT_VERSION_BYTES,
         )
     if report.walk_incomplete:
-        # review 14 —— 有目录没列全:那些目录里没看到的文件这次既不算在也不算不见(不开始、也不
-        # 继续 30 天倒计时)。名字数 / 条目数到顶时整个根目录都可能没列全。
+        # review 14~16 —— 有目录没列全(或索引查不了):那些文件这次「不知道」—— 按在算,撤掉它们的
+        # 「不见」标记(之后要重新确认、重新计时)。条目数在任何地方到顶、或根目录自己超过名字数
+        # 上限时,根目录这一层也可能没列全。
         agent_file_versions_total.labels(outcome="walk_incomplete").inc()
         logger.warning(
             "agent_file_versions.walk_incomplete tenant_id=%s user_id=%s agent_key=%s",
