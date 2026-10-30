@@ -39,9 +39,17 @@ def _versions_root(root: Path) -> Path:
     return root / str(_TENANT) / ".agent-file-versions" / str(_USER)
 
 
+_last_put_ns = 0
+
+
 def _put(path: Path, text: str) -> Path:
+    """写文件,并给一个**严格递增**的 mtime(≥ 现在,比上一次至少晚 1 ms)。review 17 —— 同样大小的
+    连续重写在 mtime 粒度粗的文件系统上(容器的 overlay 之类)可能拿到同一个 mtime,被看成「没变」。"""
+    global _last_put_ns
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(text)
+    _last_put_ns = max(time.time_ns(), _last_put_ns + 1_000_000)
+    os.utime(path, ns=(_last_put_ns, _last_put_ns))
     return path
 
 
@@ -69,9 +77,17 @@ async def _observe(root: Path) -> Any:
 def _age_marker(marker: Path) -> None:
     """一个月前第一次确认不见、之后每周都有观察再确认过(review 16:内容 = 第一次的时间,mtime =
     最近一次确认)。"""
-    marker.write_text("1000000000")
     now = time.time()
+    marker.write_text(f"{now - 31 * 86_400:.0f}")
     os.utime(marker, (now, now))
+
+
+def _put_v(path: Path, text: str, i: int) -> Path:
+    """第 ``i`` 次重写:显式给一个不同的 mtime(review 17:mtime 粒度粗的文件系统上,同样大小的连续
+    重写可能被看成「没变」)。"""
+    _put(path, text)
+    os.utime(path, ns=(1_700_000_000_000_000_000 + i * 10**9,) * 2)
+    return path
 
 
 async def test_a_changed_file_is_snapshotted_and_an_unchanged_one_is_not(tmp_path: Path) -> None:
@@ -1238,7 +1254,7 @@ async def test_a_stale_marker_does_not_survive_an_unknown_stretch(
     agent = _agent(tmp_path)
     f = agent / "notes" / "f.md"
     for i in range(3):
-        _put(f, f"good-v{i}")
+        _put_v(f, f"good-v{i}", i)
         await _observe(tmp_path)
     stash = agent / ".stash"
     stash.mkdir()
@@ -1431,8 +1447,8 @@ async def test_a_missing_file_keeps_exactly_one_and_a_live_file_two(
     monkeypatch.setattr(versions_mod, "MAX_AGENT_VERSION_BYTES", 10_000)
     agent = _agent(tmp_path)
     for i in range(3):
-        _put(agent / "gone.md", f"g{i}".ljust(1_000, "g"))
-        _put(agent / "live.md", f"l{i}".ljust(1_000, "l"))
+        _put_v(agent / "gone.md", f"g{i}".ljust(1_000, "g"), i)
+        _put_v(agent / "live.md", f"l{i}".ljust(1_000, "l"), i)
         await _observe(tmp_path)
         await asyncio.sleep(0.01)
     (agent / "gone.md").unlink()
@@ -1454,7 +1470,7 @@ async def test_a_hidden_index_behind_a_truncated_root_is_known_missing(
     agent = _agent(tmp_path)
     notes = agent / "AGENT_NOTES.md"
     for i in range(4):
-        _put(notes, f"GOOD index v{i}")
+        _put_v(notes, f"GOOD index v{i}", i)
         await _observe(tmp_path)
     notes.rename(agent / ".bak")
     for i in range(MAX_SEED_ENTRIES + 5):
@@ -1799,7 +1815,7 @@ async def test_an_index_dir_with_a_broken_path_keeps_three(
     agent = _agent(tmp_path)
     notes = agent / "AGENT_NOTES.md"
     for i in range(5):
-        _put(notes, f"GOOD index v{i}".ljust(1_000, "."))
+        _put_v(notes, f"GOOD index v{i}".ljust(1_000, "."), i)
         await _observe(tmp_path)
     index_dir = _versions_root(tmp_path) / _KEY / hashlib.sha256(b"AGENT_NOTES.md").hexdigest()[:32]
     notes.unlink()
@@ -1819,7 +1835,7 @@ async def test_a_broken_path_with_versions_is_unknown_and_keeps_two(
     agent = _agent(tmp_path)
     g = agent / "g.md"
     for i in range(4):
-        _put(g, f"g{i}".ljust(1_000, "g"))
+        _put_v(g, f"g{i}".ljust(1_000, "g"), i)
         await _observe(tmp_path)
     g_dir = _versions_root(tmp_path) / _KEY / hashlib.sha256(b"g.md").hexdigest()[:32]
     g.unlink()
@@ -1908,7 +1924,7 @@ async def test_an_unobserved_gap_restarts_the_thirty_days(tmp_path: Path) -> Non
     agent = _agent(tmp_path)
     f = agent / "tpl" / "t.md"
     for i in range(3):
-        _put(f, f"v{i}")
+        _put_v(f, f"v{i}", i)
         await _observe(tmp_path)
     f.rename(agent / ".stash")
     await _observe(tmp_path)  # T0
@@ -1961,11 +1977,24 @@ async def test_one_dirs_error_does_not_stop_the_sweep_of_later_dirs(
             raise OSError(errno.ENOSPC, "No space left on device")
         return real_open(path, flags, mode, dir_fd=dir_fd)
 
+    x_key = hashlib.sha256(b"x.md").hexdigest()[:32]
+    agent_ino = (_versions_root(tmp_path) / _KEY).stat().st_ino
+    real_listdir = os.listdir
+
+    def x_last(path: Any = ".") -> list[str]:
+        names = real_listdir(path)
+        if isinstance(path, int) and os.fstat(path).st_ino == agent_ino:
+            # review 17 —— 出错的目录一律排在 x.md 的前面:与真实列目录的顺序无关
+            names = sorted(names, key=lambda n: n == x_key)
+        return names
+
+    monkeypatch.setattr(os, "listdir", x_last)
     monkeypatch.setattr(os, "open", enospc)
     await _observe(tmp_path)
     monkeypatch.setattr(os, "open", real_open)
+    monkeypatch.setattr(os, "listdir", real_listdir)
 
-    x_dir = _versions_root(tmp_path) / _KEY / hashlib.sha256(b"x.md").hexdigest()[:32]
+    x_dir = _versions_root(tmp_path) / _KEY / x_key
     assert not (x_dir / "missing").exists()
 
 
@@ -2072,3 +2101,93 @@ async def test_a_dir_that_errors_still_gets_its_stale_marker_cleared(
     monkeypatch.setattr(os, "listdir", real_listdir)
 
     assert not (x_dir / "missing").exists()
+
+
+# ---------------------------------------------------------------------------
+# review 17 —— 标记的内容与 mtime 同一个 inode、不合理的时间、读 ``path`` 出错但文件在
+# ---------------------------------------------------------------------------
+
+
+async def _stale_marker(tmp_path: Path) -> Path:
+    f = _agent(tmp_path) / "t.md"
+    for i in range(3):
+        _put_v(f, f"v{i}", i)
+        await _observe(tmp_path)
+    f.unlink()
+    await _observe(tmp_path)  # T0
+    (marker,) = _markers(tmp_path)
+    old = time.time() - 31 * 86_400
+    marker.write_text(f"{old:.0f}")
+    os.utime(marker, (old, old))  # 一个月没有再确认过
+    return marker
+
+
+async def test_a_marker_rewritten_by_another_replica_mid_read_is_not_mixed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """review 17(test_r17_race2 的形状):读完旧标记的内容之后,另一个副本把它重写成新的 ——
+    不能拼成「旧的开始时间 + 新的确认时间」而一下子到期。"""
+    await _stale_marker(tmp_path)
+    real = versions_mod._marker_first_missing
+
+    def other_replica_rewrites(file_dir: int) -> Any:
+        out = real(file_dir)
+        versions_mod._atomic_write(file_dir, "missing", f"{time.time():.0f}".encode())
+        return out
+
+    monkeypatch.setattr(versions_mod, "_marker_first_missing", other_replica_rewrites)
+
+    report = await _observe(tmp_path)
+
+    assert report.dropped == 0
+    assert _history(tmp_path)["t.md"] == ["v0", "v1", "v2"]
+
+
+@pytest.mark.parametrize("content", [b"0", b"-inf", b"nan", b"1e400", b"1000000000"])
+async def test_an_implausible_first_missing_time_restarts(tmp_path: Path, content: bytes) -> None:
+    """review 17:内容不是有限数、或早于 2020 年(哪怕 mtime 是刚确认的):当作没有标记,重新开始。"""
+    marker = await _stale_marker(tmp_path)
+    marker.write_bytes(content)
+    now = time.time()
+    os.utime(marker, (now, now))
+
+    report = await _observe(tmp_path)
+
+    assert report.dropped == 0
+    assert abs(float(marker.read_text()) - time.time()) < 60
+
+
+async def test_a_future_first_missing_time_is_rewritten_to_now(tmp_path: Path) -> None:
+    """review 17:内容在将来、mtime 是刚确认的:下一次确认把它改写成现在。"""
+    marker = await _stale_marker(tmp_path)
+    marker.write_text(f"{time.time() + 365 * 86_400:.0f}")
+    now = time.time()
+    os.utime(marker, (now, now))
+
+    await _observe(tmp_path)
+
+    assert abs(float(marker.read_text()) - time.time()) < 60
+
+
+async def test_a_path_read_error_still_clears_the_marker_of_a_seen_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """review 17:读 ``path`` 出 EIO、但源文件这次看到了(按目录名认得出):旧标记照样撤掉。"""
+    import errno
+
+    x = _put(_agent(tmp_path) / "x.md", "x")
+    await _observe(tmp_path)
+    await _confirm_missing_then_restore(tmp_path, x)
+    real_open = os.open
+
+    def flaky(path: Any, flags: int, mode: int = 0o777, *, dir_fd: int | None = None) -> int:
+        if path == "path" and dir_fd is not None:
+            raise OSError(errno.EIO, "EIO")
+        return real_open(path, flags, mode, dir_fd=dir_fd)
+
+    monkeypatch.setattr(os, "open", flaky)
+    report = await _observe(tmp_path)
+    monkeypatch.setattr(os, "open", real_open)
+
+    assert report.dropped == 0
+    assert _markers(tmp_path) == []

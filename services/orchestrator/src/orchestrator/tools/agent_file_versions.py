@@ -30,6 +30,7 @@ import contextlib
 import errno
 import hashlib
 import logging
+import math
 import os
 import re
 import shutil
@@ -908,8 +909,12 @@ def _sweep(agent_dir: int, scan: _Scan, now: float) -> None:
             try:
                 rel = _valid_path(file_dir, key)
             except OSError:
-                status = "skip"
-                continue  # 读不动:这一次跳过,不当孤儿、不判不见、不动标记
+                # 读不动:这一次跳过,不当孤儿、不判不见。review 17 —— 源文件这次看到了(按目录名
+                # 认得出),它就是在:旧标记照样撤掉。
+                if key in seen_by_key:
+                    with contextlib.suppress(OSError):
+                        os.unlink(_MISSING_FILE, dir_fd=file_dir)
+                continue
             if rel is None and key in seen_by_key:
                 # review 15 —— ``path`` 坏了、源文件这次看到了(没改,所以不会走写入那条修复):在这里
                 # 原子地修好,不然它一直「不知道」、删掉后也永远不会到期。
@@ -925,7 +930,7 @@ def _sweep(agent_dir: int, scan: _Scan, now: float) -> None:
         except OSError as exc:
             drop = False
             logger.debug("agent_file_versions.sweep_dir_failed error=%s", type(exc).__name__)
-            if status not in ("missing", "skip"):
+            if status != "missing":
                 with contextlib.suppress(OSError):
                     os.unlink(_MISSING_FILE, dir_fd=file_dir)
         finally:
@@ -965,12 +970,15 @@ def _note_missing(file_dir: int, now: float) -> bool:
     :data:`MISSING_SOURCE_GRACE_S` 时回 ``True``。
 
     review 16 —— 标记的内容是第一次确认不见的时间,mtime 是最近一次确认的时间。没有标记、内容坏了
-    (写了一半)、第一次的时间在将来、或离上一次确认已经超过 :data:`MISSING_CONFIRM_GAP_S`(中间没有
-    观察,文件可能回来过):都从现在重新开始算 30 天。出错的方向只会是「晚到期 / 不到期」。
+    (写了一半)、第一次的时间在将来或不合理、或离上一次确认已经超过 :data:`MISSING_CONFIRM_GAP_S`
+    (中间没有观察,文件可能回来过):都从现在重新开始算 30 天。review 17 —— 内容与 mtime 从同一个
+    inode 读(同一次 ``fstat``):另一个副本这时把标记换成新的,也不会拼出「旧的开始时间 + 新的确认
+    时间」。这些都只会让到期变晚或不到期;唯一的例外是各副本的时钟:30 天从写标记那个副本的时钟算,
+    副本之间的时钟差多少,到期就早或晚多少。
     """
-    first = _marker_first_missing(file_dir)
-    if first is not None and first <= now:
-        last = os.lstat(_MISSING_FILE, dir_fd=file_dir).st_mtime
+    marker = _marker_first_missing(file_dir)
+    if marker is not None and marker[0] <= now:
+        first, last = marker
         if now - last <= MISSING_CONFIRM_GAP_S:
             os.utime(_MISSING_FILE, (now, now), dir_fd=file_dir, follow_symlinks=False)
             return now - first >= MISSING_SOURCE_GRACE_S
@@ -978,22 +986,36 @@ def _note_missing(file_dir: int, now: float) -> bool:
     return False
 
 
-def _marker_first_missing(file_dir: int) -> float | None:
-    """标记里记的第一次确认不见的时间;没有标记、不是普通文件、内容解析不了 → ``None``(重新开始)。"""
+#: review 17 —— 早于这个时间(2020-01-01)的「第一次确认不见」不可能是真的:当作没有标记、重新开始。
+_EARLIEST_PLAUSIBLE_MARKER = 1_577_836_800.0
+
+
+def _marker_first_missing(file_dir: int) -> tuple[float, float] | None:
+    """标记里记的 ``(第一次确认不见的时间, 最近一次确认的时间)``,两者取自同一个 inode(review 17)。
+
+    没有标记、不是普通文件(比如一个目录)、内容解析不了、不是有限数、早于 2020 年 → ``None``
+    (重新开始;要是标记是个目录,重写会失败,这个目录这次就跳过,永远不会按它到期)。标记是符号链接
+    时 ``O_NOFOLLOW`` 抛 ELOOP,往外抛:调用方把这个目录这次跳过(仍是「确认不见」,不撤也不删),
+    同样永远不会按它到期。两种都只会「不到期」,是安全的方向。
+    """
     try:
         fd = os.open(_MISSING_FILE, _READ_FLAGS, dir_fd=file_dir)
     except FileNotFoundError:
         return None
     try:
-        if not stat.S_ISREG(os.fstat(fd).st_mode):
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode):
             return None
         raw = os.read(fd, 64)
     finally:
         os.close(fd)
     try:
-        return float(raw.decode("ascii").strip())
+        first = float(raw.decode("ascii").strip())
     except (UnicodeDecodeError, ValueError):
         return None
+    if not math.isfinite(first) or first < _EARLIEST_PLAUSIBLE_MARKER:
+        return None
+    return first, info.st_mtime
 
 
 def _read_all(fd: int, size: int) -> bytes:
