@@ -109,3 +109,22 @@ async def test_no_conversation_keeps_the_per_user_key() -> None:
 
     lock_calls = [p for s, p in session.executed if "pg_advisory_xact_lock" in s]
     assert lock_calls == [{"classid": 1, "k": f"{tenant}:{user}"}]
+
+
+async def test_agent_area_key_is_taken_second_in_the_same_transaction() -> None:
+    # 写 agent 共用区的 write_file / edit_file 再加一把按 agent 的键:总在对话 / 用户键之后、
+    # 同一个事务里(一起释放),同一个 classid。
+    session = _RecordingSession()
+    lock = PgWorkspaceLock(_FakeSessionFactory(session))  # type: ignore[arg-type]
+    tenant, user, conv = uuid4(), uuid4(), uuid4()
+
+    async with lock.acquire(
+        tenant_id=tenant, user_id=user, conversation_id=conv, agent_key="report-agent"
+    ):
+        pass
+
+    lock_calls = [p for s, p in session.executed if "pg_advisory_xact_lock" in s]
+    assert lock_calls == [
+        {"classid": 1, "k": f"{tenant}:{user}:conv:{conv}"},
+        {"classid": 1, "k": f"{tenant}:{user}:agent:report-agent"},
+    ]

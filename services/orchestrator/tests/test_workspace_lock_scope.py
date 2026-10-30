@@ -46,7 +46,7 @@ def _ctx(*, layout: str, agent_key: str = "report-agent", **kw: Any) -> ToolCont
 
 
 async def _call(
-    name: str, lock: RecordingWorkspaceLock, ctx: ToolContext
+    name: str, lock: RecordingWorkspaceLock, ctx: ToolContext, *, path: str = "a.txt"
 ) -> RecordingSandboxRuntime:
     client = RecordingSandboxRuntime()
     client.outcome = SandboxOutcome(stdout=_OK_WRITE, stderr="", exit_code=0, timed_out=False)
@@ -54,11 +54,11 @@ async def _call(
         await BashTool(client=client, workspace_lock=lock).call({"command": "true"}, ctx=ctx)
     elif name == "write_file":
         await WriteFileTool(client=client, workspace_lock=lock).call(
-            {"path": "a.txt", "content": "x"}, ctx=ctx
+            {"path": path, "content": "x"}, ctx=ctx
         )
     else:
         await EditFileTool(client=client, workspace_lock=lock).call(
-            {"path": "a.txt", "old_string": "a", "new_string": "b"}, ctx=ctx
+            {"path": path, "old_string": "a", "new_string": "b"}, ctx=ctx
         )
     return client
 
@@ -133,3 +133,60 @@ async def test_null_lock_accepts_a_conversation() -> None:
         tenant_id=uuid4(), user_id=uuid4(), conversation_id=conv
     ):
         pass
+
+
+# ---------------------------------------------------------------------------
+# The agent-wide area. write_file / edit_file into a file every conversation of the
+# agent can reach also take the agent key, so two conversations' edits of one
+# ``/agent`` file cannot silently lose one. bash never takes it.
+# ---------------------------------------------------------------------------
+
+_FILE_TOOLS = ("write_file", "edit_file")
+
+
+@pytest.mark.parametrize("name", _FILE_TOOLS)
+@pytest.mark.parametrize("path", ["/agent/AGENT_NOTES.md", "/agent/templates/a.md", "uploads/a.md"])
+async def test_new_layout_file_write_into_the_agent_area_adds_the_agent_key(
+    name: str, path: str
+) -> None:
+    lock = RecordingWorkspaceLock()
+    ctx = _ctx(layout="conversation")
+    await _call(name, lock, ctx, path=path)
+    assert lock.conversations == [ctx.thread_id]
+    assert lock.agent_keys == ["report-agent"]
+
+
+@pytest.mark.parametrize("name", _FILE_TOOLS)
+@pytest.mark.parametrize("path", ["a.md", "/workspace/out/a.md"])
+async def test_new_layout_file_write_into_its_own_workspace_takes_no_agent_key(
+    name: str, path: str
+) -> None:
+    lock = RecordingWorkspaceLock()
+    ctx = _ctx(layout="conversation")
+    await _call(name, lock, ctx, path=path)
+    assert lock.agent_keys == [None]
+
+
+@pytest.mark.parametrize("name", _FILE_TOOLS)
+@pytest.mark.parametrize("path", ["a.md", "/agent/a.md"])
+async def test_old_layout_file_write_adds_the_agent_key(name: str, path: str) -> None:
+    # 老视图的 /workspace 就是 agent 根 —— 与新视图的 /agent 是同一批文件。
+    lock = RecordingWorkspaceLock()
+    ctx = _ctx(layout="agent_root")
+    await _call(name, lock, ctx, path=path)
+    assert lock.conversations == [None]
+    assert lock.agent_keys == ["report-agent"]
+
+
+@pytest.mark.parametrize("layout", ["conversation", "agent_root"])
+async def test_bash_never_takes_the_agent_key(layout: str) -> None:
+    lock = RecordingWorkspaceLock()
+    await _call("bash", lock, _ctx(layout=layout))
+    assert lock.agent_keys == [None]
+
+
+@pytest.mark.parametrize("name", _FILE_TOOLS)
+async def test_no_agent_bound_takes_no_agent_key(name: str) -> None:
+    lock = RecordingWorkspaceLock()
+    await _call(name, lock, _ctx(layout="conversation", agent_key=""))
+    assert lock.agent_keys == [None]
