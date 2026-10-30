@@ -28,6 +28,7 @@ from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
 
+from control_plane.mcp_retired_clients import RetiredMcpClients, close_retired
 from control_plane.tenant_scope import bypass_rls_session
 from expert_work.persistence import McpConnectorCatalogStore
 from expert_work.protocol import McpConnectorCatalogRecord
@@ -50,6 +51,9 @@ _MAX_BUILD_ATTEMPTS = 5
 # pool lives forever, so one lost bus event would be permanent staleness.
 _POOL_TTL_S = 1800.0
 
+# The platform pool has a single cache entry; its retired clients share one key.
+_RETIRED_KEY = "platform"
+
 # Provider handed to the agent builder: () -> the platform pool.
 PlatformMcpPoolProvider = Callable[[], Awaitable[MCPServerPool]]
 
@@ -63,7 +67,7 @@ class _ToolFilteringClient:
     ``list_tools`` so they are never registered / exposed to a tenant agent.
 
     Satisfies the runtime-checkable ``MCPClient`` protocol; ``call_tool`` /
-    ``close`` pass straight through to the wrapped transport.
+    ``close`` / ``retire`` pass straight through to the wrapped transport.
     """
 
     inner: MCPClient
@@ -77,6 +81,12 @@ class _ToolFilteringClient:
 
     async def close(self) -> None:
         await self.inner.close()
+
+    async def retire(self) -> None:
+        # Pool TTL expiry: retire the wrapped remote client so holders keep
+        # working; a transport without ``retire`` is closed instead.
+        retire = getattr(self.inner, "retire", None)
+        await (retire() if retire is not None else self.inner.close())
 
 
 def _record_to_config(record: McpConnectorCatalogRecord) -> MCPServerConfig:
@@ -137,7 +147,10 @@ class PlatformMcpPoolService:
         self._clock = clock  # injectable monotonic time (tests)
         # (pool, built_at monotonic stamp for the TTL backstop)
         self._pool: tuple[MCPServerPool, float] | None = None
-        self._guard = asyncio.Lock()  # guards _pool + _generation
+        self._guard = asyncio.Lock()  # guards _pool + _generation + _retired
+        # Clients retired on TTL expiry that runs may still hold (weak): a
+        # later ``invalidate`` / ``close_all`` must hard-stop them too.
+        self._retired: RetiredMcpClients[str] = RetiredMcpClients()
         self._build_lock = asyncio.Lock()  # dedups concurrent builds
         self._generation = 0
 
@@ -160,14 +173,17 @@ class PlatformMcpPoolService:
                     cached_pool, built_at = cached
                     if self._clock() - built_at < _POOL_TTL_S:
                         return cached_pool
-                    # TTL backstop (PR-E3a): expired — close + drop exactly
-                    # like ``invalidate`` (the generation bump keeps any
-                    # concurrent build from caching stale data), then rebuild.
+                    # TTL backstop (PR-E3a): expired — drop like ``invalidate``
+                    # (the generation bump keeps any concurrent build from
+                    # caching stale data), then rebuild. Retire, not close:
+                    # cached agents and in-flight runs still hold these
+                    # clients and keep calling them on one-shot sessions.
                     async with self._guard:
                         self._generation += 1
                         self._pool = None
+                        self._retired.add_pool(_RETIRED_KEY, cached_pool)
                     try:
-                        await cached_pool.close_all()
+                        await cached_pool.retire_all()
                     except Exception:
                         logger.warning("platform_mcp_pool.expired_close_failed")
                 async with self._guard:
@@ -210,25 +226,30 @@ class PlatformMcpPoolService:
         raise RuntimeError("get_or_build: retry loop exited without returning")  # pragma: no cover
 
     async def invalidate(self) -> None:
-        """Close + drop the cached pool (next build rebuilds from the catalog)."""
+        """Close + drop the cached pool (next build rebuilds from the catalog),
+        and hard-stop clients an earlier TTL expiry retired."""
         async with self._guard:
             self._generation += 1
             entry = self._pool
             self._pool = None
+            retired = self._retired.pop_all()
         if entry is not None:
             try:
                 await entry[0].close_all()
             except Exception:
                 logger.warning("platform_mcp_pool.invalidate_close_failed")
+        await close_retired(retired)
 
     async def close_all(self) -> None:
-        """Close the cached pool (app shutdown)."""
+        """Close the cached pool and every retired client (app shutdown)."""
         async with self._guard:
             self._generation += 1
             entry = self._pool
             self._pool = None
+            retired = self._retired.pop_all()
         if entry is not None:
             try:
                 await entry[0].close_all()
             except Exception:
                 logger.warning("platform_mcp_pool.close_all_failed")
+        await close_retired(retired)

@@ -18,6 +18,7 @@ import time
 from collections.abc import Awaitable, Callable
 from uuid import UUID
 
+from control_plane.mcp_retired_clients import RetiredMcpClients, close_retired
 from expert_work.persistence import TenantMcpServerStore
 from expert_work.protocol import TenantMcpServerRecord
 from expert_work.runtime.secret_store import SecretStore
@@ -89,6 +90,10 @@ class TenantMcpPoolService:
         self._locks_guard = asyncio.Lock()  # guards _pools + _tenant_locks + _generation
         self._tenant_locks: dict[UUID, asyncio.Lock] = {}
         self._generation: dict[UUID, int] = {}
+        # Clients retired on TTL expiry that runs may still hold (weak): a
+        # later ``invalidate`` / ``close_all`` must hard-stop them too.
+        # Guarded by ``_locks_guard`` like ``_pools``.
+        self._retired: RetiredMcpClients[UUID] = RetiredMcpClients()
 
     async def _tenant_lock(self, tenant_id: UUID) -> asyncio.Lock:
         async with self._locks_guard:
@@ -128,14 +133,17 @@ class TenantMcpPoolService:
                     cached_pool, built_at = cached
                     if self._clock() - built_at < _POOL_TTL_S:
                         return cached_pool
-                    # TTL backstop (PR-E3a): expired — close + drop exactly
-                    # like ``invalidate`` (the generation bump keeps any
-                    # concurrent build from caching stale data), then rebuild.
+                    # TTL backstop (PR-E3a): expired — drop like ``invalidate``
+                    # (the generation bump keeps any concurrent build from
+                    # caching stale data), then rebuild. Retire, not close:
+                    # cached agents and in-flight runs still hold these
+                    # clients and keep calling them on one-shot sessions.
                     async with self._locks_guard:
                         self._generation[tenant_id] = self._generation.get(tenant_id, 0) + 1
                         self._pools.pop(tenant_id, None)
+                        self._retired.add_pool(tenant_id, cached_pool)
                     try:
-                        await cached_pool.close_all()
+                        await cached_pool.retire_all()
                     except Exception:
                         logger.warning("tenant_mcp_pool.expired_close_failed")
                 async with self._locks_guard:
@@ -177,21 +185,25 @@ class TenantMcpPoolService:
         raise RuntimeError("get_or_build: retry loop exited without returning")  # pragma: no cover
 
     async def invalidate(self, tenant_id: UUID) -> None:
-        """Close + drop the tenant's cached pool (next build rebuilds it)."""
+        """Close + drop the tenant's cached pool (next build rebuilds it), and
+        hard-stop the tenant's clients an earlier TTL expiry retired."""
         async with self._locks_guard:
             self._generation[tenant_id] = self._generation.get(tenant_id, 0) + 1
             entry = self._pools.pop(tenant_id, None)
+            retired = self._retired.pop(tenant_id)
         if entry is not None:
             try:
                 await entry[0].close_all()
             except Exception:
                 logger.warning("tenant_mcp_pool.invalidate_close_failed")
+        await close_retired(retired)
 
     async def close_all(self) -> None:
-        """Close every cached pool (app shutdown)."""
+        """Close every cached pool and every retired client (app shutdown)."""
         async with self._locks_guard:
             pools = [entry[0] for entry in self._pools.values()]
             self._pools.clear()
+            retired = self._retired.pop_all()
             # Bump every known tenant's generation so any in-flight build won't
             # cache a stale pool after shutdown clears the store.
             for tid in list(self._tenant_locks):
@@ -206,3 +218,4 @@ class TenantMcpPoolService:
                     len(pools),
                     exc_info=exc,
                 )
+        await close_retired(retired)

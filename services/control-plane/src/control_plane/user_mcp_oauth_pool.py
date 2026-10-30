@@ -29,6 +29,7 @@ from datetime import UTC, datetime
 from uuid import UUID
 
 from control_plane.mcp_oauth_refresh import McpOAuthRefresher
+from control_plane.mcp_retired_clients import RetiredMcpClients, close_retired
 from control_plane.tenant_scope import bypass_rls_session
 from expert_work.persistence import McpConnectorCatalogStore, McpOAuthConnectionStore
 from expert_work.protocol import McpConnectorCatalogRecord, McpOAuthConnectionRecord
@@ -84,6 +85,10 @@ class UserMcpOAuthPoolService:
         self._locks_guard = asyncio.Lock()
         self._key_locks: dict[tuple[UUID, str], asyncio.Lock] = {}
         self._generation: dict[tuple[UUID, str], int] = {}
+        # Clients retired on TTL expiry that runs may still hold (weak): a
+        # later ``invalidate`` (disconnect) / ``close_all`` must hard-stop them.
+        # Guarded by ``_locks_guard`` like ``_pools``.
+        self._retired: RetiredMcpClients[tuple[UUID, str]] = RetiredMcpClients()
 
     async def _key_lock(self, key: tuple[UUID, str]) -> asyncio.Lock:
         async with self._locks_guard:
@@ -139,14 +144,17 @@ class UserMcpOAuthPoolService:
                     cached_pool, built_at = cached
                     if self._monotonic_clock() - built_at < _POOL_TTL_S:
                         return cached_pool
-                    # TTL backstop (PR-E3a): expired — close + drop exactly
-                    # like ``invalidate`` (the generation bump keeps any
-                    # concurrent build from caching stale data), then rebuild.
+                    # TTL backstop (PR-E3a): expired — drop like ``invalidate``
+                    # (the generation bump keeps any concurrent build from
+                    # caching stale data), then rebuild. Retire, not close:
+                    # cached agents and in-flight runs still hold these
+                    # clients and keep calling them on one-shot sessions.
                     async with self._locks_guard:
                         self._generation[key] = self._generation.get(key, 0) + 1
                         self._pools.pop(key, None)
+                        self._retired.add_pool(key, cached_pool)
                     try:
-                        await cached_pool.close_all()
+                        await cached_pool.retire_all()
                     except Exception:
                         logger.warning("user_mcp_oauth_pool.expired_close_failed")
                 async with self._locks_guard:
@@ -192,22 +200,26 @@ class UserMcpOAuthPoolService:
         raise RuntimeError("get_or_build: retry loop exited")  # pragma: no cover
 
     async def invalidate(self, tenant_id: UUID, user_id: str) -> None:
-        """Close + drop the (tenant, user) cached pool (next build rebuilds)."""
+        """Close + drop the (tenant, user) cached pool (next build rebuilds),
+        and hard-stop that user's clients an earlier TTL expiry retired."""
         key = (tenant_id, user_id)
         async with self._locks_guard:
             self._generation[key] = self._generation.get(key, 0) + 1
             entry = self._pools.pop(key, None)
+            retired = self._retired.pop(key)
         if entry is not None:
             try:
                 await entry[0].close_all()
             except Exception:
                 logger.warning("user_mcp_oauth_pool.invalidate_close_failed")
+        await close_retired(retired)
 
     async def close_all(self) -> None:
-        """Close every cached pool (app shutdown)."""
+        """Close every cached pool and every retired client (app shutdown)."""
         async with self._locks_guard:
             pools = [entry[0] for entry in self._pools.values()]
             self._pools.clear()
+            retired = self._retired.pop_all()
             for key in list(self._key_locks):
                 self._generation[key] = self._generation.get(key, 0) + 1
             self._key_locks.clear()
@@ -216,3 +228,4 @@ class UserMcpOAuthPoolService:
                 await pool.close_all()
             except Exception as exc:
                 logger.warning("user_mcp_oauth_pool.close_all_failed", exc_info=exc)
+        await close_retired(retired)
