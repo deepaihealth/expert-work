@@ -229,4 +229,4 @@ async def test_conversation_seed_lock_does_not_hold_the_users_write_lock(
     async with asyncio.timeout(_HOLD_S):
         async with write.acquire(tenant_id=tenant, user_id=user):
             pass
-    await task
+    _ = await task

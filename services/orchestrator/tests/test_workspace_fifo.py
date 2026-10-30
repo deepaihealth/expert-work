@@ -39,7 +39,7 @@ async def _promptly[T](fifo: Path, awaitable: Awaitable[T]) -> T:
         for flags in (os.O_WRONLY | os.O_NONBLOCK, os.O_RDONLY | os.O_NONBLOCK):
             with contextlib.suppress(OSError):
                 os.close(os.open(fifo, flags))  # 放掉卡住的线程
-        pytest.fail("a FIFO in the workspace blocked a host-side open")
+        raise AssertionError("a FIFO in the workspace blocked a host-side open") from None
 
 
 async def test_reading_a_fifo_is_refused_promptly(tmp_path: Path) -> None:

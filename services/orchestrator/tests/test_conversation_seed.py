@@ -419,7 +419,7 @@ async def test_cancelling_the_run_stops_the_copy_before_the_lock_is_released(
     await state["started"].wait()  # type: ignore[attr-defined]
     task.cancel()
     with pytest.raises(asyncio.CancelledError):
-        await task
+        _ = await task
 
     assert state["running"] is False  # 线程已经停了,取消才抛出来
     assert state["copies"] < 20
@@ -566,7 +566,7 @@ async def test_a_second_cancel_does_not_release_the_lock_while_copying(
     await asyncio.sleep(0.05)
     task.cancel()  # 第二次取消,落在等线程停下的那段里
     with pytest.raises(asyncio.CancelledError):
-        await task
+        _ = await task
 
     assert state["running"] is False
     assert not (_conv(tmp_path) / SEED_MARKER).exists()

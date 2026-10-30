@@ -209,7 +209,7 @@ async def test_a_dispatched_observation_runs_and_a_failure_is_only_logged(
     _put(_agent(tmp_path) / "AGENT_NOTES.md", "a")
     task = dispatch_observation(_store(tmp_path), _configurable())
     assert task is not None
-    await task
+    _ = await task
     assert _history(tmp_path) == {"AGENT_NOTES.md": ["a"]}
 
     def boom(*_args: Any) -> None:
@@ -1223,7 +1223,7 @@ async def test_a_cancelled_observation_keeps_the_lock_until_its_thread_ends(
 
     assert peak == 1
     with pytest.raises(asyncio.CancelledError):
-        await first
+        _ = await first
 
 
 # ---------------------------------------------------------------------------
@@ -1293,7 +1293,7 @@ async def test_a_transient_error_reading_path_drops_nothing(
         os.utime(d, (1_000_000_000, 1_000_000_000))
     real_open = os.open
 
-    def flaky(path: Any, flags: int, mode: int = 0o777, *, dir_fd: int | None = None) -> int:
+    def flaky(path: Any, flags: int, mode: int = 0o600, *, dir_fd: int | None = None) -> int:
         if path == "path" and dir_fd is not None:
             raise OSError(errno.ESTALE, "Stale file handle")
         return real_open(path, flags, mode, dir_fd=dir_fd)
@@ -1532,7 +1532,7 @@ async def test_a_double_cancel_still_waits_and_the_thread_error_is_logged(
 
     assert peak == 1
     with pytest.raises(asyncio.CancelledError):
-        await first
+        _ = await first
     assert any(
         "observe_failed" in r.getMessage() and "OSError" in r.getMessage() for r in caplog.records
     )
@@ -1601,7 +1601,7 @@ async def test_an_unsearchable_subdir_neither_fails_the_observation_nor_hides_th
     await _observe(tmp_path)
     await _confirm_missing_then_restore(tmp_path, prefs)
     _put(notes, "edited index")
-    with _mode(agent / "tpl", 0o644):
+    with _mode(agent / "tpl", 0o600):
         report = await _observe(tmp_path)
 
     assert report.walk_incomplete is True
@@ -1620,7 +1620,7 @@ async def test_an_unsearchable_root_clears_markers_and_judges_nothing_missing(
     _put(agent / "AGENT_NOTES.md", "good index")
     await _observe(tmp_path)
     await _confirm_missing_then_restore(tmp_path, prefs)
-    with _mode(agent, 0o644):
+    with _mode(agent, 0o600):
         report = await _observe(tmp_path)
 
     assert report.walk_incomplete is True
@@ -1637,7 +1637,7 @@ async def test_an_index_only_unsearchable_root_does_not_mark_the_index_missing(
     _put(agent / "AGENT_NOTES.md", "i")
     (agent / ".cache").mkdir()
     await _observe(tmp_path)
-    with _mode(agent, 0o644):
+    with _mode(agent, 0o600):
         await _observe(tmp_path)
 
     assert _markers(tmp_path) == []
@@ -1691,7 +1691,7 @@ async def test_a_month_of_unsearchable_subdir_does_not_let_a_stale_marker_expire
     _put(prefs, "good prefs v2 (longer)")
     await _observe(tmp_path)
     await _confirm_missing_then_restore(tmp_path, prefs)
-    with _mode(agent / "tpl", 0o644):
+    with _mode(agent / "tpl", 0o600):
         await _observe(tmp_path)
     _age_markers(tmp_path)
     prefs.unlink()
@@ -1972,7 +1972,7 @@ async def test_one_dirs_error_does_not_stop_the_sweep_of_later_dirs(
         (agent / f"w{i}.md").unlink()  # 这些要记「不见」:写标记时满盘
     real_open = os.open
 
-    def enospc(path: Any, flags: int, mode: int = 0o777, *, dir_fd: int | None = None) -> int:
+    def enospc(path: Any, flags: int, mode: int = 0o600, *, dir_fd: int | None = None) -> int:
         if isinstance(path, str) and "missing" in path and flags & os.O_CREAT:
             raise OSError(errno.ENOSPC, "No space left on device")
         return real_open(path, flags, mode, dir_fd=dir_fd)
@@ -2013,7 +2013,7 @@ async def test_a_non_enoent_error_opening_the_root_is_a_failure_that_still_sweep
     real_open = os.open
     calls = 0
 
-    def flaky(path: Any, flags: int, mode: int = 0o777, *, dir_fd: int | None = None) -> int:
+    def flaky(path: Any, flags: int, mode: int = 0o600, *, dir_fd: int | None = None) -> int:
         nonlocal calls
         if path == _KEY and flags & os.O_DIRECTORY:
             calls += 1
@@ -2180,7 +2180,7 @@ async def test_a_path_read_error_still_clears_the_marker_of_a_seen_file(
     await _confirm_missing_then_restore(tmp_path, x)
     real_open = os.open
 
-    def flaky(path: Any, flags: int, mode: int = 0o777, *, dir_fd: int | None = None) -> int:
+    def flaky(path: Any, flags: int, mode: int = 0o600, *, dir_fd: int | None = None) -> int:
         if path == "path" and dir_fd is not None:
             raise OSError(errno.EIO, "EIO")
         return real_open(path, flags, mode, dir_fd=dir_fd)
