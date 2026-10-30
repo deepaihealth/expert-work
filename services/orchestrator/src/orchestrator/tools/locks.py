@@ -25,14 +25,21 @@ writes only**:
   failed in production on 2026-10-30: one integrator user ran 15 reports at
   once and every write queued behind the others' bash (waits up to 6 min,
   some hitting the 360 s lock statement timeout). Old-layout conversations
-  still share the agent root and keep the per-user key. Writes into
-  ``/agent`` (shared by all conversations of the agent) are deliberately not
-  locked across conversations: concurrent writes to the same file there are
-  last-writer-wins, accepted as a product decision. ``write_file`` /
-  ``edit_file`` replace the file atomically (``mkstemp`` in the same
-  directory + ``os.replace``), so a reader never sees a torn file — but an
-  ``edit_file`` from another conversation can be overwritten, and ``bash``
-  writes carry no atomicity at all.
+  still share the agent root and keep the per-user key; that key excludes
+  only other old-layout conversations — a new-layout conversation writing the
+  same tree through ``/agent`` holds a different key.
+- **The agent-wide area.** ``bash`` is not locked across conversations for
+  writes into ``/agent`` (shared by all conversations of the agent):
+  concurrent writes to the same file there are last-writer-wins, accepted as
+  a product decision. ``write_file`` / ``edit_file`` narrow that: when the
+  target is outside the conversation's own directory
+  (:func:`write_lock_agent_area`) they also take an agent key, after the
+  conversation / user key and in the same transaction, so two conversations'
+  edits of one ``/agent`` file cannot silently lose one. It is held for one file
+  write, including the sandbox acquire (a cold start can take seconds), and
+  never for ``bash``. Both tools replace the file atomically
+  (``mkstemp`` in the same directory + ``os.replace``), so a reader never
+  sees a torn file; ``bash`` writes carry no such guarantee.
 - **Reads take no lock.** ``write_file`` writes atomically (temp file +
   ``os.replace``), so a reader always sees a complete old-or-new snapshot.
   That is what lets reads run lock-free despite PG advisory locks having no
@@ -55,7 +62,7 @@ from typing import TYPE_CHECKING, Protocol, runtime_checkable
 from uuid import UUID
 
 if TYPE_CHECKING:
-    from orchestrator.tools.workspace_paths import WorkspaceView
+    from orchestrator.tools.workspace_paths import ResolvedPath, WorkspaceView
 
 
 @runtime_checkable
@@ -67,7 +74,8 @@ class WorkspaceLock(Protocol):
     ``user_id`` of ``None`` denotes an ephemeral (non-shared) workspace and
     implementations may treat it as a no-op. A ``conversation_id`` narrows the
     scope to that conversation's own directory (B-236 new layout); ``None``
-    keeps the per-user scope."""
+    keeps the per-user scope. An ``agent_key`` additionally holds that agent's
+    shared area (taken second, released together)."""
 
     def acquire(
         self,
@@ -75,6 +83,7 @@ class WorkspaceLock(Protocol):
         tenant_id: UUID | None,
         user_id: UUID | None,
         conversation_id: UUID | None = None,
+        agent_key: str | None = None,
     ) -> AbstractAsyncContextManager[None]:
         """Hold the workspace write lock for the duration of the ``async with``
         block. Released (and any backing transaction committed/rolled back)
@@ -94,6 +103,7 @@ class NullWorkspaceLock:
         tenant_id: UUID | None,
         user_id: UUID | None,
         conversation_id: UUID | None = None,
+        agent_key: str | None = None,
     ) -> AsyncIterator[None]:
         yield
 
@@ -103,12 +113,14 @@ class RecordingWorkspaceLock:
     """Recording :class:`WorkspaceLock` for tests.
 
     Records each ``(tenant_id, user_id)`` acquisition (and, in step, each
-    ``conversation_id`` in ``conversations``) and tracks how many holders are
+    ``conversation_id`` in ``conversations`` and each ``agent_key`` in
+    ``agent_keys``) and tracks how many holders are
     currently inside the context (``active``) so a test can assert the guarded
     work ran *while the lock was held*."""
 
     acquired: list[tuple[UUID | None, UUID | None]] = field(default_factory=list)
     conversations: list[UUID | None] = field(default_factory=list)
+    agent_keys: list[str | None] = field(default_factory=list)
     active: int = 0
 
     @asynccontextmanager
@@ -118,9 +130,11 @@ class RecordingWorkspaceLock:
         tenant_id: UUID | None,
         user_id: UUID | None,
         conversation_id: UUID | None = None,
+        agent_key: str | None = None,
     ) -> AsyncIterator[None]:
         self.acquired.append((tenant_id, user_id))
         self.conversations.append(conversation_id)
+        self.agent_keys.append(agent_key)
         self.active += 1
         try:
             yield
@@ -136,6 +150,18 @@ def write_lock_conversation(view: WorkspaceView) -> UUID | None:
     与 ``run_in_sandbox`` 给 exec 的 ``conv_id`` 取自同一个视图,锁的与写的不会是两个目录。
     """
     return view.conv_id if view.per_conversation else None
+
+
+def write_lock_agent_area(target: ResolvedPath, view: WorkspaceView) -> str | None:
+    """write_file / edit_file 的目标在 agent 各对话共用的那棵树里时,返回要多锁的 agent key。
+
+    ``agent``(``/agent/…``)、``platform``(新视图里的 ``uploads/`` 等,在 agent 根下)、
+    ``legacy``(老视图的 ``/workspace`` 就是 agent 根)都算;``conversation``(本对话自己的
+    ``work/``)不算。没绑 agent 时老视图是整个用户根,已由按用户的键挡住 → ``None``。
+    """
+    if not view.agent_key or target.kind not in ("agent", "platform", "legacy"):
+        return None
+    return view.agent_key
 
 
 @runtime_checkable

@@ -48,7 +48,12 @@ from pathlib import PurePosixPath
 from typing import Any, NoReturn
 from uuid import UUID
 
-from orchestrator.tools.locks import NullWorkspaceLock, WorkspaceLock, write_lock_conversation
+from orchestrator.tools.locks import (
+    NullWorkspaceLock,
+    WorkspaceLock,
+    write_lock_agent_area,
+    write_lock_conversation,
+)
 from orchestrator.tools.nas_workspace_store import MISSING_DIR_ERRORS
 from orchestrator.tools.registry import (
     ToolBlockedError,
@@ -1031,6 +1036,7 @@ class WriteFileTool:
             tenant_id=ctx.tenant_id,
             user_id=ctx.user_id,
             conversation_id=write_lock_conversation(ctx.workspace_view),
+            agent_key=write_lock_agent_area(target, ctx.workspace_view),
         ):
             outcome = await run_in_sandbox(
                 self.client,
@@ -1423,6 +1429,7 @@ class EditFileTool:
             tenant_id=ctx.tenant_id,
             user_id=ctx.user_id,
             conversation_id=write_lock_conversation(ctx.workspace_view),
+            agent_key=write_lock_agent_area(target, ctx.workspace_view),
         ):
             outcome = await run_in_sandbox(
                 self.client,
