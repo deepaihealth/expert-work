@@ -229,8 +229,9 @@ def image() -> str:
         )
     except (OSError, subprocess.SubprocessError):
         pytest.skip("docker CLI unavailable")
-    if probe.returncode != 0:
-        pytest.skip("docker daemon unreachable")
+    else:
+        if probe.returncode != 0:
+            pytest.skip("docker daemon unreachable")
     plan = sandbox_image_plan(_IMAGE, _IMAGE_CONTEXT)
     built = subprocess.run(  # noqa: S603
         ["docker", *plan.argv],  # noqa: S607
