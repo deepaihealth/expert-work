@@ -636,7 +636,7 @@ async def test_the_block_lists_this_conversation_and_the_agent_root_only(tmp_pat
     assert "mine.md" in block
     assert "anchor.md" in block
     assert "Also readable, read-only, by their old relative path" in block
-    assert ": style/. To change a file in one, write it to /agent/<dir>/" in block
+    assert ": style/. To write into one, use /agent/<dir>/" in block
     assert "theirs.md" not in block
     assert "PLAN.md" not in block
     assert "threads" not in block
@@ -658,8 +658,8 @@ def test_every_compat_dir_gets_the_read_only_note_whatever_its_shape() -> None:
     note = block.rsplit("\n", 1)[1]
     assert note == (
         "  Also readable, read-only, by their old relative path until 2026-12-10: "
-        "empty/, output/, style/. To change a file in one, write it to /agent/<dir>/… "
-        "(shared) or under a new name in this conversation."
+        "empty/, output/, style/. To write into one, use /agent/<dir>/… (shared) or a "
+        "path outside these directories in this conversation."
     )
 
 
@@ -679,6 +679,10 @@ def test_the_transition_hint_appears_only_with_mapped_dirs() -> None:
     section = only_compat.split(AGENT_SECTION + "\n", 1)[1]
     assert section.startswith("  Also readable, read-only")
     assert "(empty)" not in section
+    # 两节都没有文件时映射目录照样 bind 着, 这一行仍要出现(bash 写入只会拿到裸 EROFS)。
+    nothing_but_compat = render_conversation_block([], [], compat_dirs=("output",))
+    assert "Also readable, read-only" in nothing_but_compat
+    assert render_conversation_block([], []) == ""
     for word in ("transition", "read-only", "<dir>"):
         assert word not in EXEC_WORKSPACE_NOTE
 

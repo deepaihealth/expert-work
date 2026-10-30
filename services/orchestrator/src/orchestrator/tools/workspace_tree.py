@@ -285,7 +285,8 @@ def render_conversation_block(
 ) -> str:
     """B-236 对话视图的块:``/workspace``(本对话)一节在前,``/agent`` 一节在后。
 
-    展开预算先给本对话那一节,剩下的给 ``/agent``。两节都空才整块不出现;只有一节空时
+    展开预算先给本对话那一节,剩下的给 ``/agent``。两节都空、也没有映射目录才整块不出现
+    (映射目录那一行是 bash 写入时唯一的提示);只有一节空时
     那一节写 ``(empty)`` —— 新对话的 ``/workspace`` 本来就是空的,不写就读不出这件事。
     过渡期映射的目录在 ``/agent`` 一节末尾单独一行列全:还能按原相对路径**只读**用到哪天
     (B-236 M4:exec 里只读 bind,文件工具拒写)。不挂在目录行上 —— 目录行按文件的父路径
@@ -294,7 +295,7 @@ def render_conversation_block(
     出现,工具描述是按 agent 构建、所有视图共用的,不放这种话(review 5)。``/agent`` 没有
     文件但有映射目录时不写 ``(empty)``,直接是这一行。
     """
-    if not conversation and not agent:
+    if not conversation and not agent and not compat_dirs:
         return ""
     conv_tree, used = _render_tree(conversation, max_expanded=max_expanded)
     until = f" until {compat_until_text}" if compat_until_text else ""
@@ -302,8 +303,8 @@ def render_conversation_block(
     compat = (
         f"  Also readable, read-only, by their old relative path{until}: "
         + ", ".join(f"{d}/" for d in compat_dirs)
-        + ". To change a file in one, write it to /agent/<dir>/… (shared) or under a new "
-        "name in this conversation."
+        + ". To write into one, use /agent/<dir>/… (shared) or a path outside these "
+        "directories in this conversation."
         if compat_dirs
         else ""
     )
