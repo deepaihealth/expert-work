@@ -111,6 +111,7 @@ from orchestrator.stream_items import (
 from orchestrator.tools._budget import DELEGATION_GATE_KEY, DelegationGate
 from orchestrator.tools._guards import GUARD_SINK_KEY, TOKEN_BUDGET_KEY, TokenBudget
 from orchestrator.tools._worker_events import WORKER_EVENT_SINK_KEY
+from orchestrator.tools.agent_file_versions import AgentFileVersionStore, dispatch_observation
 from orchestrator.tools.artifact import ARTIFACT_RECORDER_KEY, ArtifactRecorder
 from orchestrator.tools.spawn_worker import WorkerSpawnBudget
 from orchestrator.trajectory import (
@@ -227,8 +228,12 @@ SYSTEM_PROMPT_EVENT = "system_prompt"
 #: reaching a live SSE subscriber, a third-party API consumer, or the
 #: debug console's raw "updates" view, nor being duplicated into the
 #: durable event log. Stripped once, at the single choke point both paths
-#: share — see ``_strip_internal_state_keys``.
-_INTERNAL_STATE_KEYS: frozenset[str] = frozenset({"context_summary"})
+#: share — see ``_strip_internal_state_keys``. B-236 —— ``seed_skipped_dirs`` (agent
+#: directory names the conversation-start copy left out) only feeds the model's
+#: workspace block; it is not run output either.
+_INTERNAL_STATE_KEYS: frozenset[str] = frozenset(
+    {"context_summary", "seed_skipped_dirs", "seed_quota_blocked", "seed_skipped_more"}
+)
 
 
 def _strip_internal_state_keys(chunk: Any) -> Any:
@@ -399,6 +404,7 @@ async def run_agent(
     token_budget: int = 0,
     prompt_inputs: Mapping[str, Any] | None = None,
     inputs_run_id: UUID | None = None,
+    agent_file_versions: AgentFileVersionStore | None = None,
 ) -> None:
     """Drive ``graph`` to completion, publishing events to ``bridge``.
 
@@ -1169,6 +1175,10 @@ async def run_agent(
         # 兜底 Exception / PAUSED)。fire-and-forget,不 await —— ``finally``
         # 也跑在 ``asyncio.CancelledError`` 的拆除路径上,那条路上 await 不可靠。
         _dispatch_thread_stats(thread_stats_recorder, graph, effective_config, record)
+        # B-236 第三层 —— /agent 里改过的文件各留一份版本。挂 ``finally``(与上面同一个理由:
+        # 一处覆盖全部调用方与终局分支),fire-and-forget。交接出去的一轮没有结束,不观察。
+        if not handed_off:
+            dispatch_observation(agent_file_versions, effective_config.get("configurable") or {})
         # Fire-and-forget cleanup; keep a reference so the task isn't
         # garbage-collected mid-flight.
         cleanup_task = asyncio.create_task(bridge.cleanup(run_id, delay=_CLEANUP_DELAY_S))

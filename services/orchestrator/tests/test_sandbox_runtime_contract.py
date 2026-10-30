@@ -1595,16 +1595,28 @@ def test_exec_contract_constants_match_the_sandbox_image() -> None:
 
 def test_exec_view_script_matches_the_sandbox_image() -> None:
     """B-60 —— 两个后端同一段 sh:orchestrator ``exec_view.EXEC_VIEW_SCRIPT`` 与镜像
-    ``runner.py`` 的 ``_EXEC_VIEW_SCRIPT`` 逐字相等;argv 前缀也相等,前缀之后紧跟
-    ``agent_root``(非常量)再 ``sys.executable``。"""
-    from orchestrator.tools.exec_view import EXEC_VIEW_ARGV_PREFIX, EXEC_VIEW_SCRIPT
+    ``runner.py`` 的 ``_EXEC_VIEW_SCRIPT`` 逐字相等;argv 前缀也相等。B-236 —— 前缀
+    之后依次是 ``$1`` agent_root、``$2`` 对话 id、``$3`` 本对话线程 id(三个都是表达式,
+    不是常量),再 ``sys.executable``;与 orchestrator 那一侧 ``exec_view_argv`` 拼出来的
+    位置一一对应。"""
+    from uuid import UUID
+
+    from orchestrator.tools.exec_view import (
+        EXEC_VIEW_ARGV_PREFIX,
+        EXEC_VIEW_SCRIPT,
+        exec_view_argv,
+    )
 
     assert _runner_py_string_constant("_EXEC_VIEW_SCRIPT") == EXEC_VIEW_SCRIPT
     argv = _runner_py_exec_argv()
     n = len(EXEC_VIEW_ARGV_PREFIX)
     assert argv[:n] == list(EXEC_VIEW_ARGV_PREFIX), argv[:n]
-    assert argv[n] is None, "前缀之后必须是 agent_root(表达式),不是常量"
-    assert argv[n + 1] == "<sys.executable>"
+    assert argv[n : n + 3] == [None, None, None], (
+        "前缀之后必须是 agent_root、对话 id、线程 id 三个表达式"
+    )
+    assert argv[n + 3] == "<sys.executable>"
+    ours = exec_view_argv("a-1", ["py"], conv_id=UUID(int=1), thread_id=UUID(int=2))
+    assert ours[n:] == ["/mnt/workspace/agents/a-1", str(UUID(int=1)), str(UUID(int=2)), "py"]
 
 
 def test_workspace_roots_match_across_packages() -> None:
@@ -1615,15 +1627,17 @@ def test_workspace_roots_match_across_packages() -> None:
     from orchestrator.tools.sandbox_image_contract import EXEC_VIEW, NAS_MOUNT
 
     assert (SANDBOX_NAS_MOUNT, SANDBOX_EXEC_VIEW) == (NAS_MOUNT, EXEC_VIEW)
-    assert f'mount --bind "$root" {EXEC_VIEW}\n' in EXEC_VIEW_SCRIPT
-    assert f"mount -t tmpfs -o size=1k none {NAS_MOUNT}\n" in EXEC_VIEW_SCRIPT
+    assert f'    workspace = os.open("{EXEC_VIEW}", DIR)\n' in EXEC_VIEW_SCRIPT
+    assert f'    nas = os.open("{NAS_MOUNT}", os.O_PATH | os.O_DIRECTORY | os.O_CLOEXEC)\n' in (
+        EXEC_VIEW_SCRIPT
+    )
+    cover = '    attach(tmpfs((b"size", b"1k")), nas)\n'
+    assert cover in EXEC_VIEW_SCRIPT
     # 共享 bind 必须排在 tmpfs 覆盖之前 —— 反过来会静默 fail OPEN:把 cover 提前到
-    # bind 之上,[ -d /mnt/workspace/shared ] 守卫读到的是空 tmpfs,悄悄判假,
+    # bind 之上,用户根的 ``shared`` 在空 tmpfs 里找不到,悄悄判「没有」,
     # shared/ 从此再也没被 bind 过,而 test_exec_view_shared_is_read_only 之外没
     # 有任何东西会发现——那条用例连的是真集群,不是每次全仓扫描都跑。
-    assert EXEC_VIEW_SCRIPT.index(
-        f"mount --bind {NAS_MOUNT}/shared {EXEC_VIEW}/shared"
-    ) < EXEC_VIEW_SCRIPT.index(f"mount -t tmpfs -o size=1k none {NAS_MOUNT}")
+    assert EXEC_VIEW_SCRIPT.index("bind_ro(shared, target") < EXEC_VIEW_SCRIPT.index(cover)
 
 
 def test_egress_token_ttl_matches_supervisor_default() -> None:

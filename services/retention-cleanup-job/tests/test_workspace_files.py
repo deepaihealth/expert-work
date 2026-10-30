@@ -367,3 +367,20 @@ def test_agent_subtree_rejects_unsafe_keys(tmp_path: Path, bad: str) -> None:
         return
     with pytest.raises(UnsafeWorkspacePathError):
         agent_subtree(tmp_path, bad)
+
+
+def test_remove_thread_dir_takes_the_conversation_work_dir_with_it(tmp_path: Path) -> None:
+    """B-236 —— 对话自己的 ``/workspace`` 在 ``threads/<uuid>/work/`` 里:孤儿扫描删整个
+    ``threads/<uuid>/``,它的工作目录(含子目录)一起走;agent 根的其它文件不动。"""
+    tenant, user, tid = uuid4(), uuid4(), uuid4()
+    base = tmp_path / str(tenant) / str(user) / "agents" / "plan-aaaaaaaa"
+    _seed(tmp_path, tenant, user, f"agents/plan-aaaaaaaa/{THREADS_DIR}/{tid}/PLAN.md")
+    _seed(tmp_path, tenant, user, f"agents/plan-aaaaaaaa/{THREADS_DIR}/{tid}/work/out/r.md")
+    keep = _seed(tmp_path, tenant, user, "agents/plan-aaaaaaaa/style/anchor.md")
+
+    (found,) = iter_thread_dirs(str(tmp_path))
+    assert found.thread_id == tid
+
+    assert remove_thread_dir(str(tmp_path), tenant, user, tid, agent_key="plan-aaaaaaaa")
+    assert not (base / THREADS_DIR / str(tid)).exists()
+    assert keep.read_text()

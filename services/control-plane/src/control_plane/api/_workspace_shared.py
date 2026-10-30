@@ -33,7 +33,7 @@ import logging
 from pathlib import PurePosixPath
 from uuid import UUID
 
-from fastapi import HTTPException
+from fastapi import HTTPException, Request
 from fastapi.responses import Response
 
 from control_plane.api._artifact_mime import content_disposition_header, infer_content_type
@@ -49,6 +49,24 @@ from orchestrator.tools import (
 from orchestrator.tools.workspace_paths import AGENTS_DIR
 
 logger = logging.getLogger("expert_work.control_plane.workspace")
+
+
+async def drop_file_versions(
+    request: Request, *, tenant_id: UUID, user_id: UUID, path: str
+) -> None:
+    """B-236 review 7 —— 删文件接口删掉 ``path``(用户根相对)之后,连它的历史版本一起删。
+
+    尽力而为:版本存储没接(非 NAS 部署)就跳过;删失败只记日志(异常类型),文件本身已经删了,
+    接口照常回成功 —— 剩下的版本在源文件不见满 30 天时由运行结束的观察删掉。
+    """
+    versions = getattr(request.app.state, "agent_file_versions", None)
+    if versions is None:
+        return
+    try:
+        await versions.delete_for_path(tenant_id=tenant_id, user_id=user_id, path=path)
+    except Exception as exc:
+        logger.warning("workspace.drop_file_versions_failed error=%s", type(exc).__name__)
+
 
 #: 路径校验失败的固定文案。导出成常量是因为对外平面在**加 agent 前缀之前**
 #: 自己跑一次校验(``_external_agent_scope.external_storage_path``),两处必须

@@ -123,6 +123,9 @@ _REASON_STUCK_CREATE_TAKEOVER = "stuck_create_takeover"
 #: 钉它俩相等。
 SANDBOX_LAYOUT_USER_ROOT = "user-root"
 SANDBOX_LAYOUT_AGENT_NS = "agent-ns"
+#: B-236 —— 镜像多了 ``/agent`` 挂载点、exec 命令串多了对话参数:老镜像起的热会话
+#: 每次 exec 都会以 97 退出,所以换一个值让它们在下一次 acquire 时重建。
+SANDBOX_LAYOUT_AGENT_CONV = "agent-conv"
 
 
 class SandboxClaimContendedError(RuntimeError):

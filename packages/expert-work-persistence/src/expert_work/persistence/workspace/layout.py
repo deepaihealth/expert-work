@@ -79,6 +79,19 @@ def artifact_snapshot_dir(root: str, tenant_id: UUID, user_id: UUID) -> Path:
     return Path(root) / str(tenant_id) / ARTIFACT_SNAPSHOT_DIR / str(user_id)
 
 
+#: B-236 第三层 —— ``/agent`` 里文件的历史版本(运行结束时看到改过的就留一份,每个文件留最近
+#: 20 份)。与 :data:`ARTIFACT_SNAPSHOT_DIR` 同一个位置理由:放在用户根**旁边**,
+#: ``{root}/{tenant_id}/.agent-file-versions/{user_id}/{agent_key}/…``,沙箱只挂
+#: ``{tenant_id}/{user_id}``,agent 跑的代码改不了、删不了自己的历史。control-plane 写,
+#: 清除用户与留存作业删,都经 :func:`agent_file_versions_dir` 拼。
+AGENT_FILE_VERSIONS_DIR = ".agent-file-versions"
+
+
+def agent_file_versions_dir(root: str, tenant_id: UUID, user_id: UUID) -> Path:
+    """一个用户的 agent 文件版本目录:``{root}/{tenant_id}/.agent-file-versions/{user_id}``。"""
+    return Path(root) / str(tenant_id) / AGENT_FILE_VERSIONS_DIR / str(user_id)
+
+
 #: Sandbox-local seed root for an agent's activated skill files (sandbox
 #: migration wave 2, spec § 四 — "技能方案"). Materialized at
 #: ``{SANDBOX_SKILLS_ROOT}/<agent_key>/<skill-name>/…`` on every sandbox
@@ -203,18 +216,40 @@ WORKSPACE_DELETE_PROTECTED_PREFIXES: frozenset[str] = frozenset(
 _CONTAINERS: dict[str, int] = {WORKSPACE_AGENTS_DIR: 2, WORKSPACE_SHARED_DIR: 1}
 
 
+#: B-236 —— 一个对话自己的 ``/workspace`` 在 agent 根下的位置:
+#: ``threads/<conv uuid>/work/``。exec 在里面为平台目录(``uploads/`` 等)建的空挂载桩
+#: 不是 agent 产出,所以它也算一层**位置**容器,与 ``agents/<key>/`` 一样先剥掉再看首段。
+WORKSPACE_THREADS_DIR = "threads"
+WORKSPACE_CONVERSATION_WORK_DIR = "work"
+#: B-236 —— 对话开场复制做完的标记 ``threads/<conv>/.seeded``(``conversation_seed`` 写)。平台
+#: 状态不是产出:浏览列表不列它。
+WORKSPACE_SEED_MARKER = ".seeded"
+_UUID_RE = re.compile(_UUID_PATTERN)
+
+
 def _head_after_container(relpath: str) -> str:
     """The first path segment once a known container prefix is stripped.
 
     ``""`` for an empty path. See :func:`is_reserved_workspace_path` for why
     only known containers are stripped and only one segment is examined.
+    B-236 —— after ``agents/<key>/``, a conversation's
+    ``threads/<uuid>/work/`` is stripped too (only that exact shape).
     """
     parts = tuple(p for p in relpath.strip().split("/") if p)
     if not parts:
         return ""
-    skip = _CONTAINERS.get(parts[0])
+    container = parts[0]
+    skip = _CONTAINERS.get(container)
     if skip is not None and len(parts) > skip:
         parts = parts[skip:]
+        if (
+            container == WORKSPACE_AGENTS_DIR
+            and parts[0] == WORKSPACE_THREADS_DIR
+            and len(parts) > 3
+            and _UUID_RE.fullmatch(parts[1])
+            and parts[2] == WORKSPACE_CONVERSATION_WORK_DIR
+        ):
+            parts = parts[3:]
     return parts[0]
 
 

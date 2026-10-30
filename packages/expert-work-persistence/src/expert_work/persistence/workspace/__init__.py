@@ -30,6 +30,9 @@ from expert_work.persistence.workspace.dlq import (
     VolumeOpKind as VolumeOpKind,
 )
 from expert_work.persistence.workspace.layout import (
+    AGENT_FILE_VERSIONS_DIR as AGENT_FILE_VERSIONS_DIR,
+)
+from expert_work.persistence.workspace.layout import (
     ARTIFACT_SNAPSHOT_DIR as ARTIFACT_SNAPSHOT_DIR,
 )
 from expert_work.persistence.workspace.layout import (
@@ -75,6 +78,9 @@ from expert_work.persistence.workspace.layout import (
     WORKSPACE_UPLOADS_DIR as WORKSPACE_UPLOADS_DIR,
 )
 from expert_work.persistence.workspace.layout import (
+    agent_file_versions_dir as agent_file_versions_dir,
+)
+from expert_work.persistence.workspace.layout import (
     artifact_snapshot_dir as artifact_snapshot_dir,
 )
 from expert_work.persistence.workspace.layout import (
@@ -94,6 +100,7 @@ from expert_work.persistence.workspace.sql import (
 )
 
 __all__ = [
+    "AGENT_FILE_VERSIONS_DIR",
     "ARTIFACT_SNAPSHOT_DIR",
     "RENDERED_FIGURE_DIR",
     "RENDERED_FIGURE_PAGE_STEM",
@@ -118,6 +125,7 @@ __all__ = [
     "VolumeDLQRow",
     "VolumeOpKind",
     "WorkspaceNotFoundError",
+    "agent_file_versions_dir",
     "artifact_snapshot_dir",
     "is_delete_protected_workspace_path",
     "is_rendered_figure_rel",

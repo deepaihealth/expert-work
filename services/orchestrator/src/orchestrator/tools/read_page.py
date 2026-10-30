@@ -197,9 +197,15 @@ from orchestrator.tools.document_figures import (
 from orchestrator.tools.file_ops import _require_path, _snippet, run_scoped_read
 from orchestrator.tools.registry import ToolContext, ToolResult, ToolSpec
 from orchestrator.tools.sandbox import SandboxRuntime
-from orchestrator.tools.sandbox_image_contract import EXEC_VIEW
-from orchestrator.tools.workspace_paths import resolve_scope
-from orchestrator.tools.workspace_scope import scoped_path, store_scope
+from orchestrator.tools.sandbox_image_contract import AGENT_VIEW, EXEC_VIEW
+from orchestrator.tools.workspace_paths import (
+    PATH_ARG_DESCRIPTION,
+    WORKSPACE_PATH_RULE,
+    WorkspaceView,
+    agent_relative,
+    resolve_workspace_path,
+)
+from orchestrator.tools.workspace_scope import SCOPE_USER_ROOT, agent_scope, scoped_path
 
 #: 渲染分辨率(dpi)。100 不是 150:``test_render_dpi_keeps_every_page_under_the_vision_limit``
 #: 钉了四种常见页型在 100 dpi 下全部 ≤1.15 MP / 长边 ≤1568px(Anthropic 视觉输入线),
@@ -992,20 +998,45 @@ def _doc_sha(ws: str, rel: str) -> str:
     return hashlib.sha256(f"{ws}/{canonical}".encode()).hexdigest()[:RENDERED_FIGURE_SHA_HEX_LEN]
 
 
-def document_sha(path: str, *, agent_key: str) -> str | None:
+def document_sha(path: str, *, view: WorkspaceView) -> str | None:
     """``read_page`` 对 ``path`` 算出来的 ``<doc-sha>``;路径解析不了就 ``None``。
 
     B-64 Task 7 回修第 3 轮 —— 提示词里的渲染页段要把 ``<doc-sha>``(路径哈希,不可逆)
     翻回模型能再传给 ``read_page`` 的路径。路径记在 ``state["figure_documents"]``,
     那是工具可写的通道,所以用这个函数**正向**算一遍、与键对上才采信 —— 与
-    :meth:`ReadPageTool.call` 算 ``doc_sha`` 是同一对函数(``resolve_scope`` +
+    :meth:`ReadPageTool.call` 算 ``doc_sha`` 是同一对函数(:func:`render_source` +
     :func:`_doc_sha`)。
     """
     try:
-        ws, rel = resolve_scope(path, agent_key=agent_key, tool="read_page")
+        doc_sha, _agent_rel = render_source(path, view=view)
     except ValueError:
         return None
-    return _doc_sha(ws, rel)
+    return doc_sha
+
+
+def render_source(path: str, *, view: WorkspaceView) -> tuple[str, str]:
+    """``path`` 的 ``(<doc-sha>, 相对 agent 根的位置)``。
+
+    B-236 —— 渲染一律在 ``/agent`` 视图里做:源文档按它相对 agent 根的位置找(对话目录
+    里的 ``x`` 是 ``threads/<conv>/work/x``,对话视图里本对话那一格在 ``/agent`` 底下看得
+    见),渲出来的页落 agent 根的 ``.tool_results/``。``<doc-sha>`` 按同一个物理位置算,
+    两个对话里同名的文档因此不共用渲染目录;老视图沿用 ``/workspace/<rel>`` 的算法,
+    已渲染的页照旧命中。
+    """
+    target = resolve_workspace_path(path, view=view, tool="read_page")
+    agent_rel = agent_relative(target, view)
+    if target.kind == "legacy":
+        return _doc_sha(EXEC_VIEW, target.rel), agent_rel
+    return _doc_sha(AGENT_VIEW, agent_rel), agent_rel
+
+
+def figure_scope(view: WorkspaceView) -> str:
+    """渲染页与源文档在宿主侧的作用域:绑了 agent 是整个 agent 目录,没绑是用户根。
+
+    不用模型那一侧的 ``agent_shared``:那个作用域藏起 ``threads/``,而对话目录里的
+    源文档正在那底下。路径都是 :func:`render_source` 从解析结果算的,不是模型原样给的。
+    """
+    return agent_scope(view.agent_key) if view.agent_key else SCOPE_USER_ROOT
 
 
 def _explain_error(kind: str, detail: object) -> str:
@@ -1158,15 +1189,14 @@ class ReadPageTool:
                 "to each figure — for some formats those are page/slide numbers, "
                 "for others the page is resolved for you, so pass the number the "
                 "map printed rather than a page you guessed. At most "
-                f"{MAX_PAGES_PER_CALL} per call — call it again for more. Paths "
-                "are relative to your own workspace root."
+                f"{MAX_PAGES_PER_CALL} per call — call it again for more. " + WORKSPACE_PATH_RULE
             ),
             parameters={
                 "type": "object",
                 "properties": {
                     "path": {
                         "type": "string",
-                        "description": "Workspace-relative document path (no leading '/' or '..').",
+                        "description": PATH_ARG_DESCRIPTION,
                     },
                     "units": {
                         "type": "array",
@@ -1191,7 +1221,7 @@ class ReadPageTool:
         )
 
     async def call(self, args: Mapping[str, Any], *, ctx: ToolContext) -> ToolResult:
-        raw = _require_path(args, tool="read_page", agent_key=ctx.agent_key)
+        raw = _require_path(args, tool="read_page", view=ctx.workspace_view).path
         units = _require_units(args)
         # ``ext`` 上提到这里(回修第 1 轮 M-3)—— 下面那句拒绝文案要按格式选量词:
         # docx 传进来的是图清单编号,说"你传了 4 页"是在用一个它没有的单位说话。
@@ -1224,15 +1254,14 @@ class ReadPageTool:
         if ctx.tenant_id is None or ctx.user_id is None or ctx.run_id is None:
             # 约束 B —— 三个 id 缺一个就没法造 workspace ref;说明白,不崩。
             return ToolResult(content="无法渲染:这条 run 缺少租户/用户/run 绑定。")
-        ws, rel = resolve_scope(raw, agent_key=ctx.agent_key, tool="read_page")
-        doc_sha = _doc_sha(ws, rel)
+        doc_sha, agent_rel = render_source(raw, view=ctx.workspace_view)
         out_rel = f"{WORKSPACE_OVERFLOW_DIR}/{ctx.run_id}/{RENDERED_FIGURE_DIR}/{doc_sha}"
         env = await run_scoped_read(
             self.client,
             build=lambda w: build_render_wrapper(
-                rel, units=units, ws=w, out_rel=out_rel, dpi=RENDER_DPI
+                agent_rel, units=units, ws=w, out_rel=out_rel, dpi=RENDER_DPI
             ),
-            ws=ws,
+            ws=AGENT_VIEW,
             ctx=ctx,
             tool="read_page",
             seed_files=self.skill_seed_files,
@@ -1263,7 +1292,7 @@ class ReadPageTool:
 
         # 回修 C1 —— 沙箱回来的 rel 是相对沙箱自己的 exec 视图算的;翻成用户
         # 根相对路径才能造出 NasWorkspaceImageResolver 能解析的 ref。
-        scope = store_scope(ws, agent_key=ctx.agent_key)
+        scope = figure_scope(ctx.workspace_view)
         refs: list[str] = []
         #: ``(unit, page)`` —— 两者对 pptx/pdf 相等,对 docx 不等(Task 4b)。
         rendered_units: list[tuple[int, int]] = []

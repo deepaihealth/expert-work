@@ -51,12 +51,13 @@ from orchestrator.tools.nas_workspace_store import _WorkspacePathNotFoundError
 from orchestrator.tools.read_page import (
     _DEFAULT_UNIT_LABEL,
     _UNIT_LABELS,
-    document_sha,
+    figure_scope,
+    render_source,
     workspace_figure_ref,
 )
 from orchestrator.tools.sandbox import WorkspaceFileNotFoundError
-from orchestrator.tools.workspace_paths import resolve_scope
-from orchestrator.tools.workspace_scope import SCOPE_USER_ROOT, scoped_path, store_scope
+from orchestrator.tools.workspace_paths import WorkspaceView
+from orchestrator.tools.workspace_scope import SCOPE_USER_ROOT, scoped_path
 from orchestrator.tools.workspace_store import WorkspaceDirEntry, WorkspaceStore
 
 logger = logging.getLogger(__name__)
@@ -151,7 +152,7 @@ async def resolve_rendered_figure(
     *,
     tenant_id: UUID,
     user_id: UUID,
-    agent_key: str,
+    view: WorkspaceView,
     path: str,
     unit: int,
     run_id: UUID | None = None,
@@ -164,12 +165,14 @@ async def resolve_rendered_figure(
     修改时间、闸没法判,抛 ``RuntimeError``。``run_id`` 是当前 run,它自己的目录
     先查(见 :func:`_rendered_candidates`)。
     """
-    doc_sha = document_sha(path, agent_key=agent_key)
-    if doc_sha is None:
+    try:
+        doc_sha, rel = render_source(path, view=view)
+    except ValueError as exc:
         msg = f"ask_image 的 path 解析不了:{path!r} —— 填调用 read_page 时用的那条文档路径。"
-        raise ValueError(msg)
-    ws, rel = resolve_scope(path, agent_key=agent_key, tool="read_page")
-    scope = store_scope(ws, agent_key=agent_key)
+        raise ValueError(msg) from exc
+    # B-236 —— 与 read_page 同一个落点口径:源文档按相对 agent 根的位置找,渲染页在
+    # agent 根的 ``.tool_results/`` 底下。
+    scope = figure_scope(view)
     lister = _ScopeLister(store=store, tenant_id=tenant_id, user_id=user_id, scope=scope)
     label = _UNIT_LABELS.get(PurePosixPath(path).suffix.lower().lstrip("."), _DEFAULT_UNIT_LABEL)
     document = await lister.entry_at(PurePosixPath(rel).parts)
@@ -293,7 +296,7 @@ async def rendered_page_freshness(
     *,
     tenant_id: UUID,
     user_id: UUID,
-    agent_key: str,
+    view: WorkspaceView,
     path: str,
     render_rel: str,
 ) -> FigureFreshness:
@@ -306,8 +309,8 @@ async def rendered_page_freshness(
     悄悄当成「新鲜」—— 一律回 ``"unknown"``,由调用方换成可见文字。
     """
     try:
-        ws, rel = resolve_scope(path, agent_key=agent_key, tool="read_page")
-        doc_rel = scoped_path(store_scope(ws, agent_key=agent_key), rel)
+        _doc_sha, rel = render_source(path, view=view)
+        doc_rel = scoped_path(figure_scope(view), rel)
         lister = _ScopeLister(
             store=store, tenant_id=tenant_id, user_id=user_id, scope=SCOPE_USER_ROOT
         )

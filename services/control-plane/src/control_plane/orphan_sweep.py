@@ -62,6 +62,7 @@ from expert_work.protocol.agent_key import sanitize_agent_key
 from expert_work.runtime.audit.logger import AuditLogger
 from expert_work.runtime.runs import RunInfo, RunStore
 from orchestrator import AgentFactoryError, run_agent
+from orchestrator.tools.registry import WORKSPACE_LAYOUT_KEY
 
 logger = logging.getLogger("expert_work.control_plane.orphan_sweep")
 
@@ -408,6 +409,8 @@ class OrphanSweep:
                 configurable["user_id"] = str(orphan.user_id)
             # 工作区分层 —— agent 身份。与 /opt/skills/<agent_key> 同一个值。
             configurable["agent_key"] = sanitize_agent_key(record.spec.metadata.name)
+            # B-236 —— 复活的那一轮沿用这条对话自己的布局,/workspace 与中断前同一个目录。
+            configurable[WORKSPACE_LAYOUT_KEY] = meta.workspace_layout
             if built.run_deadline_s > 0:
                 configurable["deadline_at"] = time.monotonic() + float(built.run_deadline_s)
             config: RunnableConfig = {"configurable": configurable}
@@ -483,6 +486,7 @@ class OrphanSweep:
                     trajectory_enabled=built.trajectory_recording,
                     # P2 块 2 — run 终局重算 thread_meta.message_count。
                     thread_stats_recorder=self._runtime.thread_stats_recorder,
+                    agent_file_versions=self._runtime.agent_file_versions,
                     token_budget=built.token_budget,
                     worker_spawn_budget=await self._runtime.new_worker_spawn_budget(
                         requested_max_concurrent=built.worker_max_concurrent,

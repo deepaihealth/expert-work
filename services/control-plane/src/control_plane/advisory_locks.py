@@ -66,6 +66,7 @@ from typing import Final
 
 __all__ = [
     "CLASSID_BY_OWNER",
+    "CONVERSATION_SEED_LOCK_CLASSID",
     "FIGURE_RECONCILE_LOCK_CLASSID",
     "MCP_OAUTH_REFRESH_LOCK_CLASSID",
     "MEMORY_CONSOLIDATOR_LOCK_CLASSID",
@@ -126,6 +127,12 @@ MEMORY_WRITEBACK_CLAIM_LOCK_CLASSID: Final[int] = 8622
 #: key ``"figure_reconcile"``.
 FIGURE_RECONCILE_LOCK_CLASSID: Final[int] = 8623
 
+#: ``conversation_seed_lock`` (B-236, ``workspace_lock.PgConversationSeedLock``) —
+#: per-conversation start-of-conversation copy of the agent's base directories, key
+#: ``"{tenant_id}:{conversation_id}"``. Not the per-user ``WORKSPACE_LOCK_CLASSID``:
+#: that one would hold every other write of the same user for the copy's duration.
+CONVERSATION_SEED_LOCK_CLASSID: Final[int] = 8624
+
 #: Every registered classid, keyed by the owning module. The self-audit test
 #: asserts the values are unique *and* that every ``*_CLASSID`` constant above
 #: appears here.
@@ -142,5 +149,6 @@ CLASSID_BY_OWNER: Final[Mapping[str, int]] = MappingProxyType(
         "workspace_janitor": WORKSPACE_JANITOR_LOCK_CLASSID,
         "memory_writeback_job": MEMORY_WRITEBACK_CLAIM_LOCK_CLASSID,
         "figure_reconcile": FIGURE_RECONCILE_LOCK_CLASSID,
+        "conversation_seed_lock": CONVERSATION_SEED_LOCK_CLASSID,
     }
 )

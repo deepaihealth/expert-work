@@ -150,6 +150,7 @@ from orchestrator import (
 from orchestrator.multimodal import image_ref_block
 from orchestrator.sse import end_frame_data, format_sse
 from orchestrator.stream_items import STREAM_FORMAT_LEGACY
+from orchestrator.tools.registry import WORKSPACE_LAYOUT_KEY, WorkspaceLayout
 
 logger = logging.getLogger("expert_work.control_plane.runs")
 
@@ -1120,6 +1121,8 @@ async def resolve_approval_decision(
     # 工作区分层 —— agent 身份。续跑段与被续的那一段是同一个 agent 的同一轮活,
     # 漏了这里 = 审批通过之后的后半程写去了用户根,前半程写的在 agent 子树里。
     config["configurable"]["agent_key"] = sanitize_agent_key(spec_record.spec.metadata.name)
+    # B-236 —— 同理,布局取这条对话自己的:续跑段的 /workspace 与批准前同一个目录。
+    config["configurable"][WORKSPACE_LAYOUT_KEY] = meta.workspace_layout
     worker = asyncio.create_task(
         run_agent(
             bridge=runtime.stream_bridge,
@@ -1138,6 +1141,7 @@ async def resolve_approval_decision(
             trajectory_enabled=built.trajectory_recording,
             # P2 块 2 — run 终局重算 thread_meta.message_count。
             thread_stats_recorder=runtime.thread_stats_recorder,
+            agent_file_versions=runtime.agent_file_versions,
             token_budget=built.token_budget,
             worker_spawn_budget=await runtime.new_worker_spawn_budget(
                 requested_max_concurrent=built.worker_max_concurrent,
@@ -1172,6 +1176,7 @@ async def spawn_run(
     oauth_subject: str,
     payload: RunRequest,
     trace_id: str,
+    workspace_layout: WorkspaceLayout,
     extra_headers: dict[str, str] | None = None,
     on_behalf_of: str | None = None,
     idempotency_key: str | None = None,
@@ -1190,7 +1195,9 @@ async def spawn_run(
     to — the long-term-memory RLS, the workspace volume, and per-user token
     accounting all key on it (the caller for a normal session run; the minted
     end-user for an on-behalf-of external run). ``oauth_subject`` keys the per-user
-    OAuth MCP pool. ``on_behalf_of`` records the end-user when a machine principal
+    OAuth MCP pool. ``workspace_layout`` (B-236) is the thread row's sandbox view, passed
+    by the caller from the ``thread_meta`` row it has already loaded (no second query
+    here). ``on_behalf_of`` records the end-user when a machine principal
     acts for one.
 
     ``idempotency_key`` / ``request_digest`` (External-API-v1 P2-a Task 13, Task
@@ -1492,6 +1499,7 @@ async def spawn_run(
             payload=payload,
             replay_messages=replay_messages,
             inputs=inputs,
+            workspace_layout=workspace_layout,
         )
 
     headers = {
@@ -1608,6 +1616,7 @@ async def _start_run(
     payload: RunRequest,
     replay_messages: tuple[BaseMessage, ...] | None,
     inputs: dict[str, Any] | None,
+    workspace_layout: WorkspaceLayout,
 ) -> None:
     """建好输入与配置、起 ``run_agent``。B-139 抽出来:立即执行与排队轮到后执行
     走同一份,``deadline_at`` 从**真正开跑**那一刻算。"""
@@ -1649,6 +1658,8 @@ async def _start_run(
     configurable["oauth_user_id"] = oauth_subject
     # 工作区分层 —— agent 身份。与 /opt/skills/<agent_key> 同一个值。
     configurable["agent_key"] = sanitize_agent_key(record_spec.metadata.name)
+    # B-236 —— 这条对话的 /workspace 布局(thread_meta;发布前已开的对话是老视图)。
+    configurable[WORKSPACE_LAYOUT_KEY] = workspace_layout
     if built.run_deadline_s > 0:
         configurable["deadline_at"] = time.monotonic() + float(built.run_deadline_s)
     if payload.use_draft:
@@ -1679,6 +1690,7 @@ async def _start_run(
             trajectory_enabled=built.trajectory_recording,
             # P2 块 2 — run 终局重算 thread_meta.message_count。
             thread_stats_recorder=runtime.thread_stats_recorder,
+            agent_file_versions=runtime.agent_file_versions,
             token_budget=built.token_budget,
             worker_spawn_budget=await runtime.new_worker_spawn_budget(
                 requested_max_concurrent=built.worker_max_concurrent,
@@ -1916,6 +1928,7 @@ def build_runs_router() -> APIRouter:
             oauth_subject=request.state.principal.subject_id,
             payload=payload,
             trace_id=trace_id,
+            workspace_layout=meta.workspace_layout,
         )
 
     @router.get(

@@ -48,6 +48,7 @@ from expert_work.protocol import AgentSpecStatus, AuditAction, TriggerRecord
 from expert_work.protocol.agent_key import sanitize_agent_key
 from expert_work.runtime.audit.logger import AuditLogger
 from orchestrator import AgentFactoryError, run_agent
+from orchestrator.tools.registry import WORKSPACE_LAYOUT_KEY
 
 logger = logging.getLogger("expert_work.control_plane.trigger_firing")
 
@@ -217,7 +218,7 @@ async def fire_trigger(
 
     # A triggered run is an independent conversation — fresh thread.
     thread_id = uuid4()
-    await thread_store.create(
+    meta = await thread_store.create(
         thread_id=thread_id,
         tenant_id=trigger.tenant_id,
         created_by=f"trigger:{trigger.id}",
@@ -301,6 +302,8 @@ async def fire_trigger(
     configurable["trigger_origin"] = True
     # 工作区分层 —— agent 身份。与 /opt/skills/<agent_key> 同一个值。
     configurable["agent_key"] = sanitize_agent_key(record.spec.metadata.name)
+    # B-236 —— 每次触发都是新对话,布局取新建那一行的(库默认值):各自一个目录。
+    configurable[WORKSPACE_LAYOUT_KEY] = meta.workspace_layout
     config: RunnableConfig = {"configurable": configurable}
 
     worker = asyncio.create_task(
@@ -321,6 +324,7 @@ async def fire_trigger(
             trajectory_enabled=built.trajectory_recording,
             # P2 块 2 — run 终局重算 thread_meta.message_count。
             thread_stats_recorder=runtime.thread_stats_recorder,
+            agent_file_versions=runtime.agent_file_versions,
             token_budget=built.token_budget,
             worker_spawn_budget=await runtime.new_worker_spawn_budget(
                 requested_max_concurrent=built.worker_max_concurrent,

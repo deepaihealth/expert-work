@@ -14,6 +14,7 @@ from __future__ import annotations
 from collections.abc import AsyncIterator, Collection, Sequence
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from types import SimpleNamespace
 from uuid import UUID, uuid4
 
@@ -1476,3 +1477,94 @@ def test_the_purge_endpoint_wires_the_artifact_copy_store() -> None:
     deps = _build_purge_deps(SimpleNamespace(app=app))  # type: ignore[arg-type]
 
     assert deps.artifact_snapshots is copies
+
+
+@pytest.mark.asyncio
+async def test_purge_user_deletes_the_users_agent_file_versions(tmp_path: Path) -> None:
+    """B-236 —— ``/agent`` 文件的历史版本住在用户根旁边,工作区那步删不到:清除用户时单独删。"""
+    from orchestrator.tools.agent_file_versions import NasAgentFileVersionStore
+    from orchestrator.tools.nas_workspace_store import NasWorkspaceStore
+
+    world = _LogWorld()
+    a = await world.seed()
+    notes = tmp_path / str(world.t1) / str(a) / "agents" / "k" / "AGENT_NOTES.md"
+    notes.parent.mkdir(parents=True)
+    notes.write_text("- a\n")
+    versions = NasAgentFileVersionStore(workspace=NasWorkspaceStore(root=str(tmp_path)))
+    await versions.observe(tenant_id=world.t1, user_id=a, agent_key="k")
+    history = tmp_path / str(world.t1) / ".agent-file-versions" / str(a)
+    assert history.exists()
+
+    summary = await purge_user(
+        tenant_id=world.t1,
+        user_id=a,
+        subject_id="subj-a",
+        deps=replace(world.deps(), agent_file_versions=versions),
+        actor_id="admin",
+    )
+
+    assert summary.deleted["agent_file_version"] == 1
+    assert "agent_file_version" not in summary.failures
+    assert not history.exists()
+
+
+@pytest.mark.asyncio
+async def test_versions_recreated_by_a_run_ending_mid_purge_are_deleted(tmp_path: Path) -> None:
+    """B-236 review 11 —— 第一遍删完、软删标记落下之前结束的 run 会把版本建回来:标记落下之后
+    再删一遍。"""
+    from orchestrator.tools.agent_file_versions import NasAgentFileVersionStore
+    from orchestrator.tools.nas_workspace_store import NasWorkspaceStore
+    from orchestrator.tools.workspace_store import RecordingWorkspaceStore
+
+    world = _LogWorld()
+    a = await world.seed()
+    notes = tmp_path / str(world.t1) / str(a) / "agents" / "k" / "AGENT_NOTES.md"
+    notes.parent.mkdir(parents=True)
+    notes.write_text("- a\n")
+    versions = NasAgentFileVersionStore(workspace=NasWorkspaceStore(root=str(tmp_path)))
+    history = tmp_path / str(world.t1) / ".agent-file-versions" / str(a)
+    await versions.observe(tenant_id=world.t1, user_id=a, agent_key="k")  # 第一遍删它
+
+    class _RunEndsBeforeTheMark(RecordingWorkspaceStore):
+        async def mark_deleted(self, *, tenant_id: UUID, user_id: UUID) -> None:
+            notes.write_text("- written by a run that ended mid-purge\n")
+            await versions.observe(tenant_id=tenant_id, user_id=user_id, agent_key="k")
+            assert history.exists()  # 那次 run 的观察把版本又建了回来
+            await super().mark_deleted(tenant_id=tenant_id, user_id=user_id)
+
+    summary = await purge_user(
+        tenant_id=world.t1,
+        user_id=a,
+        subject_id="subj-a",
+        deps=replace(
+            world.deps(), agent_file_versions=versions, workspace_store=_RunEndsBeforeTheMark()
+        ),
+        actor_id="admin",
+    )
+
+    assert "agent_file_version_after_mark" not in summary.failures
+    assert summary.deleted["agent_file_version"] == 2  # 第一遍 1 份 + 标记之后第二遍 1 份
+    assert not history.exists()
+
+
+def test_the_purge_endpoint_wires_the_agent_file_version_store() -> None:
+    from control_plane.api.agent_users import _build_purge_deps
+    from orchestrator.tools.agent_file_versions import NasAgentFileVersionStore
+    from orchestrator.tools.nas_workspace_store import NasWorkspaceStore
+
+    app = create_app(
+        settings=Settings(
+            env="dev",
+            auth_mode="dev",
+            oidc_issuer=TEST_ISSUER,
+            oidc_audience=[TEST_AUDIENCE],
+        ),
+        audit_logger=build_default_audit_logger(InMemoryAuditLogStore()),
+        jwt_verifier=build_test_jwt_verifier(),
+    )
+    versions = NasAgentFileVersionStore(workspace=NasWorkspaceStore(root="/nonexistent"))
+    app.state.agent_file_versions = versions
+
+    deps = _build_purge_deps(SimpleNamespace(app=app))  # type: ignore[arg-type]
+
+    assert deps.agent_file_versions is versions

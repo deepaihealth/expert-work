@@ -31,6 +31,7 @@ owns the database engine; the orchestrator tool layer depends on the
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import AsyncIterator
 from contextlib import AbstractAsyncContextManager, asynccontextmanager
 from dataclasses import dataclass, field
@@ -85,3 +86,36 @@ class RecordingWorkspaceLock:
             yield
         finally:
             self.active -= 1
+
+
+@runtime_checkable
+class KeyedLock(Protocol):
+    """B-236 —— 按任意字符串键互斥的锁(对话开场复制用,键是 ``{tenant}:{conv}``)。
+
+    与 :class:`WorkspaceLock` 分开:那把锁按 ``(tenant, user)`` 串行一个用户的所有写,开场
+    复制要的是「同一个对话只复制一次」,不该把同一用户别的对话的写挡在外面。生产实现在控制面
+    (Postgres advisory lock,独立的 classid)。"""
+
+    def acquire(self, *, key: str) -> AbstractAsyncContextManager[None]:
+        """在 ``async with`` 期间独占 ``key``。"""
+
+
+@dataclass
+class ProcessKeyedLock:
+    """进程内的 :class:`KeyedLock` —— 单进程 / 单元测试。**不跨副本**;生产接的是
+    Postgres 实现。没人等的键随即删掉,字典不随对话数增长。"""
+
+    _locks: dict[str, asyncio.Lock] = field(default_factory=dict)
+    _holders: dict[str, int] = field(default_factory=dict)
+
+    @asynccontextmanager
+    async def acquire(self, *, key: str) -> AsyncIterator[None]:
+        lock = self._locks.setdefault(key, asyncio.Lock())
+        self._holders[key] = self._holders.get(key, 0) + 1
+        try:
+            async with lock:
+                yield
+        finally:
+            self._holders[key] -= 1
+            if not self._holders[key]:
+                del self._holders[key], self._locks[key]

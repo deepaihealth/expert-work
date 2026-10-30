@@ -336,3 +336,28 @@ async def test_refresh_soon_debounces_60s(tmp_path: Path, monkeypatch: pytest.Mo
     service.refresh_soon(tenant_id=tenant_id, user_id=user_a)
     await asyncio.sleep(0)
     assert calls == [(tenant_id, user_a), (tenant_id, user_b), (tenant_id, user_a)]
+
+
+async def test_refresh_counts_the_users_agent_file_versions(tmp_path: Path) -> None:
+    """B-236 review 7 —— /agent 文件的历史版本住在用户根旁边,同样计入这个用户的配额。"""
+    from expert_work.persistence import agent_file_versions_dir
+
+    workspace_root = str(tmp_path)
+    tenant_id, user_id = uuid4(), uuid4()
+    root = workspace_user_root(workspace_root, tenant_id, user_id)
+    root.mkdir(parents=True)
+    (root / "a.txt").write_bytes(b"x" * 100)
+    versions = agent_file_versions_dir(workspace_root, tenant_id, user_id) / "k" / ("a" * 32)
+    versions.mkdir(parents=True)
+    (versions / f"v00000001-{'0' * 64}").write_bytes(b"y" * 1000)
+    other = agent_file_versions_dir(workspace_root, tenant_id, uuid4())
+    other.mkdir(parents=True)
+    (other / "z").write_bytes(b"z" * 5000)  # 别的用户的版本不算
+    user_workspaces = InMemoryUserWorkspaceStore()
+    service = _make_service(workspace_root, user_workspaces=user_workspaces)
+
+    await service.refresh(tenant_id=tenant_id, user_id=user_id)
+
+    ws = await user_workspaces.get(tenant_id=tenant_id, user_id=user_id)
+    assert ws is not None
+    assert ws.size_bytes == 1100

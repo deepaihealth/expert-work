@@ -19,6 +19,7 @@ import pytest
 from expert_work.persistence import WORKSPACE_RESERVED_PREFIXES
 from orchestrator.tools.error_classifier import EXISTENCE_UNKNOWN
 from orchestrator.tools.skill_seed import sanitize_agent_key
+from orchestrator.tools.workspace_paths import WorkspaceView
 from orchestrator.tools.workspace_store import RecordingWorkspaceStore, WorkspaceFileEntry
 from orchestrator.tools.workspace_tree import (
     ROOT_GROUP,
@@ -201,7 +202,9 @@ async def test_block_reads_the_agents_own_layer_by_key_not_by_name() -> None:
             _entry("agents/other-agent-deadbeef/style/other.py", 21173),
         ]
     )
-    block = await workspace_prompt_block(store, tenant_id=_TENANT, user_id=_USER, agent_key=key)
+    block = await workspace_prompt_block(
+        store, tenant_id=_TENANT, user_id=_USER, view=WorkspaceView(agent_key=key)
+    )
     assert "anchor.py" in block
     assert "decoy.py" not in block
     assert "other.py" not in block
@@ -212,7 +215,9 @@ async def test_listing_failure_omits_the_block_and_never_raises(
 ) -> None:
     store = RecordingWorkspaceStore(workspace_list_error=RuntimeError("NAS is down"))
     with caplog.at_level(logging.WARNING):
-        block = await workspace_prompt_block(store, tenant_id=_TENANT, user_id=_USER, agent_key="k")
+        block = await workspace_prompt_block(
+            store, tenant_id=_TENANT, user_id=_USER, view=WorkspaceView(agent_key="k")
+        )
     assert block == ""
     assert "workspace_tree.listing_failed" in caplog.text
 
@@ -229,5 +234,7 @@ async def test_block_never_reads_file_contents() -> None:
             raise AssertionError("workspace block must never read file contents")
 
     store = _TripWire(workspace_files=[_entry("agents/k/style/render_plan.py", 21173)])
-    block = await workspace_prompt_block(store, tenant_id=_TENANT, user_id=_USER, agent_key="k")
+    block = await workspace_prompt_block(
+        store, tenant_id=_TENANT, user_id=_USER, view=WorkspaceView(agent_key="k")
+    )
     assert "render_plan.py" in block

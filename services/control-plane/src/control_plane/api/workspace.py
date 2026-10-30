@@ -32,6 +32,7 @@ from control_plane.api._workspace_shared import (
     _safe_workspace_relpath,
     _workspace_file_response,
     _workspace_files_payload,
+    drop_file_versions,
 )
 from control_plane.audit import emit
 from control_plane.tenant_scope import (
@@ -279,6 +280,9 @@ def build_workspace_router() -> APIRouter:
         except SandboxSupervisorError as exc:
             logger.warning("workspace.delete_failed", exc_info=True)
             raise HTTPException(status_code=404, detail="file not found") from exc
+        await drop_file_versions(
+            request, tenant_id=tenant_id, user_id=target_user_id, path=safe_path
+        )
         details: dict[str, object] = {"path": safe_path}
         if target_user_id != caller_user_id:
             details["target_user_id"] = str(target_user_id)

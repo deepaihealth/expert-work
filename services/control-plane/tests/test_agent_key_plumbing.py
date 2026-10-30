@@ -222,3 +222,83 @@ def test_agent_key_is_always_the_one_canonical_algorithm() -> None:
             )
 
     assert not wrong, "; ".join(wrong)
+
+
+# ---------------------------------------------------------------------------
+# B-236 —— 同一份穷举,第二个键:``workspace_layout``(沙箱 /workspace 是本对话自己的
+# 目录还是老视图)。漏一条入口不会报错:那条路径下 ``ToolContext`` 回落老视图,并发
+# 对话又开始互相覆盖 —— 正是 B-236 要治的形态。取值必须来自这条对话的 ``thread_meta``
+# (``meta.workspace_layout``),不许写死。
+# ---------------------------------------------------------------------------
+
+#: 用户 run 入口 → 构造点。技能演化 replay 的 thread_id 不是 UUID,结构上只能是老视图;
+#: 委派子代透传父的(``_child_config`` 从 ``ctx.workspace_layout`` 取)。
+_LAYOUT_BUILDERS = {
+    "control-plane/api/runs.py::_start_run",
+    "control-plane/api/runs.py::resolve_approval_decision",
+    "control-plane/run_queue_worker.py::_execute",
+    "control-plane/trigger_firing.py::fire_trigger",
+    "control-plane/orphan_sweep.py::_respawn",
+    "orchestrator/tools/_child_run.py::_child_config",
+}
+
+
+def _layout_assignments(node: ast.AST) -> list[ast.AST]:
+    """``x[WORKSPACE_LAYOUT_KEY] = <value>`` 的右值。"""
+    values: list[ast.AST] = []
+    for sub in ast.walk(node):
+        if not isinstance(sub, ast.Assign):
+            continue
+        for target in sub.targets:
+            if (
+                isinstance(target, ast.Subscript)
+                and isinstance(target.slice, ast.Name)
+                and target.slice.id == "WORKSPACE_LAYOUT_KEY"
+            ):
+                values.append(sub.value)
+    return values
+
+
+def _names_layout(value: ast.AST) -> bool:
+    """右值来自这条对话的布局:``meta.workspace_layout`` / 参数 ``workspace_layout``,
+    或(委派子代)父实际生效的视图 ``ctx.workspace_view``。"""
+    return any(
+        (isinstance(n, ast.Attribute) and n.attr in ("workspace_layout", "workspace_view"))
+        or (isinstance(n, ast.Name) and n.id == "workspace_layout")
+        for n in ast.walk(value)
+    )
+
+
+def test_layout_builders_are_registered_launch_builders() -> None:
+    registered = {entry[0] for entry in _LAUNCH_SITES.values() if entry is not None}
+    assert registered - _LAYOUT_BUILDERS == {
+        "control-plane/skill_evolution_wiring.py::_make_replay_config_factory"
+    }
+
+
+def test_every_user_run_config_sets_workspace_layout_from_the_thread() -> None:
+    missing = sorted(
+        site
+        for site in _LAYOUT_BUILDERS
+        if not any(_names_layout(v) for v in _layout_assignments(_function_node(site)))
+    )
+    assert not missing, f"这些构造点没按 thread_meta 写 workspace_layout: {missing}"
+
+
+def test_every_spawn_run_call_passes_the_threads_layout() -> None:
+    """``_start_run`` 收的是 ``spawn_run`` 的参数;每个 ``spawn_run`` 调用点都要从它已经
+    读到的那一行 ``thread_meta`` 传 ``workspace_layout``(不再另查一次库)。"""
+    missing: list[str] = []
+    for root in _PKG_ROOTS.values():
+        for path in sorted(root.rglob("*.py")):
+            for node in ast.walk(_parse(path)):
+                if (
+                    isinstance(node, ast.Call)
+                    and isinstance(node.func, ast.Name)
+                    and node.func.id == "spawn_run"
+                ):
+                    passed = {kw.arg: kw.value for kw in node.keywords}
+                    value = passed.get("workspace_layout")
+                    if value is None or not _names_layout(value):
+                        missing.append(f"{path.name}:{node.lineno}")
+    assert missing == [], f"spawn_run 调用点没传 thread_meta 的 workspace_layout: {missing}"

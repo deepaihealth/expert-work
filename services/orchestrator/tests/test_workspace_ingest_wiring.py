@@ -194,8 +194,11 @@ class _FsSandbox(RecordingSandboxRuntime):
         run_id: UUID | None = None,
         has_skills: bool = False,
         egress: EgressContext | None = None,
+        conv_id: UUID | None = None,
+        workspace_thread_id: UUID | None = None,
     ) -> SandboxOutcome:
-        del timeout_s, agent_key, run_id, has_skills, egress
+        del timeout_s, agent_key, run_id, has_skills, egress, conv_id
+        del workspace_thread_id
         self.execs.append((sandbox_id, code))
         for rel, content in self.files.items():
             if json.dumps(rel) in code:
@@ -372,3 +375,78 @@ async def test_genuine_edit_between_runs_is_still_ingested() -> None:
     assert "write the summary in French" in recitation
     assert state["plan"] is not None
     assert state["plan"].goal == "summarise last quarter"
+
+
+@dataclass
+class _ViewedSandbox(RecordingSandboxRuntime):
+    """B-236 —— 按 exec 视图答读片段:``/agent/threads/`` 只留本线程那一格(exec 脚本的
+    ``hide_threads``),所以只有带着 agent 身份与本线程 id 的 exec 读得到投影的 PLAN.md;
+    其余一律 ``not_found`` —— 与真沙箱里那次静默丢掉用户改动同一个形状。"""
+
+    plan_md: str = ""
+    agent_key: str = "plan-aaaaaaaa"
+
+    async def exec(
+        self,
+        *,
+        sandbox_id: UUID,
+        code: str,
+        timeout_s: int | None,
+        agent_key: str = "",
+        run_id: UUID | None = None,
+        has_skills: bool = False,
+        egress: EgressContext | None = None,
+        conv_id: UUID | None = None,
+        workspace_thread_id: UUID | None = None,
+    ) -> SandboxOutcome:
+        await super().exec(
+            sandbox_id=sandbox_id,
+            code=code,
+            timeout_s=timeout_s,
+            agent_key=agent_key,
+            run_id=run_id,
+            has_skills=has_skills,
+            egress=egress,
+            conv_id=conv_id,
+            workspace_thread_id=workspace_thread_id,
+        )
+        own = conv_id or workspace_thread_id
+        if agent_key == self.agent_key and own is not None and f"threads/{own}/" in code:
+            return _read_envelope(self.plan_md)
+        return SandboxOutcome(
+            stdout=json.dumps({"ok": False, "error": "not_found"}),
+            stderr="",
+            exit_code=0,
+            timed_out=False,
+        )
+
+
+async def test_ingest_exec_carries_the_agent_and_the_own_thread() -> None:
+    """B-236 回归 —— ingest 的 exec 要带 agent 身份、布局与本线程 id:不带的话脚本把
+    ``/agent/threads/`` 整个盖住,PLAN.md 读成 ``not_found``,用户的改动被静默丢掉。"""
+    plan = _plan()
+    edited = render_plan_md(plan).replace("- [ ] 3. review", "- [ ] 3. review twice")
+    client = _ViewedSandbox(plan_md=edited)
+    node = make_workspace_ingest_node(client=client)
+    config: RunnableConfig = {
+        "configurable": {
+            "thread_id": _THREAD,
+            "tenant_id": str(uuid4()),
+            "user_id": str(uuid4()),
+            "run_id": str(uuid4()),
+            "agent_key": "plan-aaaaaaaa",
+            "workspace_layout": "conversation",
+        }
+    }
+    update = await node(
+        {
+            "messages": [HumanMessage(content="go")],
+            "plan": plan,
+            "last_plan_md_digest": plan_md_digest(render_plan_md(plan)),
+        },  # type: ignore[typeddict-item]
+        config,
+    )
+    assert client.exec_agent_keys == ["plan-aaaaaaaa"]
+    assert client.exec_thread_ids == [UUID(_THREAD)]
+    assert client.exec_views == [UUID(_THREAD)]
+    assert update["plan"].steps[2].description == "review twice"

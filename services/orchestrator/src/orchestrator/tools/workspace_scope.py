@@ -20,6 +20,20 @@
   = bind(``{NAS_MOUNT}``)
 ===============================  ===============================================
 
+B-236 起又多两档(对话视图,``exec_view`` 脚本的 ``$2`` 非空时):
+
+===================================  ===========================================
+沙箱里的视图                          宿主侧作用域
+===================================  ===========================================
+``/workspace`` = 本对话的目录          ``conversation:<key>:<conv>``
+                                      → ``agents/<key>/threads/<conv>/work/``;
+                                      首段是平台目录时改指 ``agents/<key>/<首段>/``
+                                      (脚本把它们从 agent 根 bind 进来)
+``/agent`` = agent 根;老视图的        ``agent_shared:<key>[:<thread>]`` →
+``/workspace`` 也是它                  ``agents/<key>/``;不列出 ``threads/``,
+                                      只许寻址本对话那一格 ``threads/<thread>/``
+===================================  ===========================================
+
 **``agent_key`` 不是 agent 名。** ``sanitize_agent_key()``
 (``expert_work.protocol.agent_key``)的产物是「净化后的名字 + 原始名字 sha256 的前
 8 位」—— 叫 ``pf-probe`` 的 agent 在 NAS 上的目录是 ``pf-probe-33086dc0``。任何地方
@@ -36,11 +50,17 @@
 from __future__ import annotations
 
 from pathlib import PurePosixPath
+from uuid import UUID
 
 from expert_work.persistence import WORKSPACE_AGENTS_DIR, WORKSPACE_SHARED_DIR
 from orchestrator.tools.sandbox import SandboxSupervisorError, WorkspacePathEscapeError
-from orchestrator.tools.sandbox_image_contract import EXEC_VIEW
-from orchestrator.tools.workspace_paths import require_safe_key
+from orchestrator.tools.sandbox_image_contract import AGENT_VIEW, EXEC_VIEW
+from orchestrator.tools.workspace_paths import (
+    CONVERSATION_WORK_DIR,
+    PLATFORM_DIRS,
+    THREADS_DIR,
+    require_safe_key,
+)
 
 #: 整个用户根 —— 没绑 agent 时 ``/workspace`` 就是它。也是每个方法的默认值:
 #: 浏览端点 / 产物下载 / 留存清扫本来就是这一档,它们一个字都不用改。
@@ -52,9 +72,15 @@ SCOPE_SHARED = WORKSPACE_SHARED_DIR
 
 #: ``agent:<agent_key>`` 的前缀。
 SCOPE_AGENT_PREFIX = "agent:"
+#: B-236 —— ``conversation:<agent_key>:<conv uuid>`` 的前缀(对话自己的 ``/workspace``)。
+SCOPE_CONVERSATION_PREFIX = "conversation:"
+#: B-236 —— ``agent_shared:<agent_key>[:<thread uuid>]`` 的前缀(模型看到的 agent 根:
+#: ``/agent``,以及老视图的 ``/workspace``)—— 各对话自己的 ``threads/`` 不列出、只许寻址
+#: 本对话那一格。整棵 ``agent:`` 仍留给控制台、对外接口与平台自己的渲染页查找。
+SCOPE_AGENT_SHARED_PREFIX = "agent_shared:"
 
 #: 沙箱视图里 ``shared/`` 的样子 —— 由 :data:`EXEC_VIEW` 与目录名拼出来, 与
-#: ``workspace_paths.resolve_scope`` 返回的那个字符串必须永远同形。
+#: ``workspace_paths.resolve_workspace_path`` 返回的那个字符串必须永远同形。
 _SHARED_VIEW = f"{EXEC_VIEW}/{WORKSPACE_SHARED_DIR}"
 
 #: 布局里的保留段。绑了 agent 的调用一律不许拿它们寻址 —— 与
@@ -68,6 +94,60 @@ _RESERVED_HEADS = frozenset({WORKSPACE_AGENTS_DIR, WORKSPACE_SHARED_DIR})
 def agent_scope(agent_key: str) -> str:
     """``agent_key`` 的作用域字符串。**要传 key,不是 agent 名** —— 见模块 docstring。"""
     return f"{SCOPE_AGENT_PREFIX}{agent_key}"
+
+
+def conversation_scope(agent_key: str, conv_id: UUID) -> str:
+    """B-236 —— 对话 ``conv_id`` 自己的 ``/workspace`` 的作用域字符串。"""
+    return f"{SCOPE_CONVERSATION_PREFIX}{agent_key}:{conv_id}"
+
+
+def agent_shared_scope(agent_key: str, thread_id: UUID | None = None) -> str:
+    """B-236 —— 模型看到的 agent 根的作用域字符串;``thread_id`` 是留给本对话的那一格。"""
+    own = f":{thread_id}" if thread_id is not None else ""
+    return f"{SCOPE_AGENT_SHARED_PREFIX}{agent_key}{own}"
+
+
+def scope_hidden_heads(scope: str) -> frozenset[str]:
+    """该作用域根下**不列出、不许寻址**的首段 —— ``agent_shared`` 藏各对话的 ``threads/``。"""
+    if scope.startswith(SCOPE_AGENT_SHARED_PREFIX):
+        return frozenset({THREADS_DIR})
+    return frozenset()
+
+
+def _safe_key(scope: str, key: str) -> str:
+    try:
+        require_safe_key(key)
+    except ValueError as exc:
+        raise WorkspacePathEscapeError(f"workspace scope is not safe: {scope!r}") from exc
+    return key
+
+
+def _canonical_uuid(scope: str, raw: str) -> str:
+    try:
+        canonical = str(UUID(raw)) == raw
+    except ValueError:
+        canonical = False
+    if not canonical:
+        raise WorkspacePathEscapeError(f"workspace scope is not safe: {scope!r}")
+    return raw
+
+
+def _agent_shared_parts(scope: str) -> tuple[str, str | None]:
+    """``agent_shared:<key>[:<thread>]`` → ``(key, thread 或 None)``;thread 必须是规范 UUID。"""
+    key, sep, own = scope[len(SCOPE_AGENT_SHARED_PREFIX) :].partition(":")
+    return _safe_key(scope, key), (_canonical_uuid(scope, own) if sep else None)
+
+
+def _conversation_parts(scope: str) -> tuple[str, str]:
+    """``conversation:<key>:<conv>`` → ``(key, conv)``;``conv`` 必须是规范写法的 UUID。
+
+    不规范的写法(大写、不带连字符、带花括号)同样拒:同一个对话拼出两个不同目录,
+    比报错更糟。
+    """
+    key, sep, conv = scope[len(SCOPE_CONVERSATION_PREFIX) :].partition(":")
+    if not sep:
+        raise WorkspacePathEscapeError(f"workspace scope is not safe: {scope!r}")
+    return _safe_key(scope, key), _canonical_uuid(scope, conv)
 
 
 def normalize_workspace_path(path: str) -> tuple[str, tuple[str, ...]]:
@@ -141,12 +221,12 @@ def scope_parts(scope: str) -> tuple[str, ...]:
     if scope == SCOPE_SHARED:
         return (WORKSPACE_SHARED_DIR,)
     if scope.startswith(SCOPE_AGENT_PREFIX):
-        key = scope[len(SCOPE_AGENT_PREFIX) :]
-        try:
-            require_safe_key(key)
-        except ValueError as exc:
-            raise WorkspacePathEscapeError(f"workspace scope is not safe: {scope!r}") from exc
-        return (WORKSPACE_AGENTS_DIR, key)
+        return (WORKSPACE_AGENTS_DIR, _safe_key(scope, scope[len(SCOPE_AGENT_PREFIX) :]))
+    if scope.startswith(SCOPE_AGENT_SHARED_PREFIX):
+        return (WORKSPACE_AGENTS_DIR, _agent_shared_parts(scope)[0])
+    if scope.startswith(SCOPE_CONVERSATION_PREFIX):
+        key, conv = _conversation_parts(scope)
+        return (WORKSPACE_AGENTS_DIR, key, THREADS_DIR, conv, CONVERSATION_WORK_DIR)
     raise SandboxSupervisorError(f"unknown workspace scope: {scope!r}")
 
 
@@ -161,7 +241,21 @@ def scoped_path(scope: str, path: str) -> str:
     prefix = scope_parts(scope)
     _relpath, parts = normalize_workspace_path(path)
     _reject_reserved_head(prefix, parts, path)
+    if parts[0] in scope_hidden_heads(scope) and not _own_thread_path(scope, parts):
+        raise WorkspacePathEscapeError(
+            f"workspace path must not address {parts[0]!r} from this scope: {path!r}"
+        )
+    if scope.startswith(SCOPE_CONVERSATION_PREFIX) and parts[0] in PLATFORM_DIRS:
+        # 与 exec 视图同一张挂载表:对话目录里的 ``uploads`` / ``inputs`` /
+        # ``.tool_results`` 是 agent 根那一份的 bind,沙箱回来的这类相对路径要落回去。
+        prefix = prefix[:2]
     return "/".join((*prefix, *parts))
+
+
+def _own_thread_path(scope: str, parts: tuple[str, ...]) -> bool:
+    """``threads/<本对话>/…`` —— ``agent_shared`` 作用域里唯一许寻址的那一格。"""
+    own = _agent_shared_parts(scope)[1] if scope.startswith(SCOPE_AGENT_SHARED_PREFIX) else None
+    return own is not None and parts[0] == THREADS_DIR and parts[1:2] == (own,)
 
 
 def scoped_dir(scope: str, path: str) -> str:
@@ -199,18 +293,27 @@ def _reject_reserved_head(prefix: tuple[str, ...], parts: tuple[str, ...], path:
         )
 
 
-def store_scope(ws: str, *, agent_key: str) -> str:
-    """``resolve_scope`` 的 ``ws`` → 宿主侧作用域 —— 沙箱与宿主之间唯一的翻译点。
+def store_scope(
+    ws: str, *, agent_key: str, conv_id: UUID | None = None, thread_id: UUID | None = None
+) -> str:
+    """解析结果的 ``ws`` → 宿主侧作用域 —— 沙箱与宿主之间唯一的翻译点。
 
-    ``ws`` 只有两种取值(见 :func:`~orchestrator.tools.workspace_paths.resolve_scope`):
-    ``EXEC_VIEW`` 本身, 或者 ``EXEC_VIEW/shared``。前者绑了 agent 就是那个 agent 的
-    目录、没绑就是整个用户根;后者是只读 bind 进来的 ``shared/``。
+    ``ws`` 只有三种取值(见 :func:`~orchestrator.tools.workspace_paths.resolve_workspace_path`):
+    ``EXEC_VIEW``、``AGENT_VIEW``,或者 ``EXEC_VIEW/shared``。``conv_id`` 非 ``None``
+    (B-236 对话视图,只在绑了 agent 时成立)时 ``EXEC_VIEW`` 是本对话的目录;其余情况
+    (``AGENT_VIEW``,以及老视图的 ``EXEC_VIEW``)都是 agent 根,``threads/`` 只留
+    ``thread_id`` 那一格(``conv_id`` 优先)—— 与 exec 视图同一张挂载表。没绑 agent 时
+    两者都是整个用户根。
 
-    刻意不接受第三种写法:``ws`` 是本进程自己算出来的, 出现别的值意味着上游改了
+    刻意不接受别的写法:``ws`` 是本进程自己算出来的, 出现别的值意味着上游改了
     而这里没跟上 —— 那种时候静默回落到用户根就是一次静默的越权扩大。
     """
     if ws == _SHARED_VIEW:
         return SCOPE_SHARED
-    if ws != EXEC_VIEW:
+    if ws not in (EXEC_VIEW, AGENT_VIEW):
         raise SandboxSupervisorError(f"unknown workspace view: {ws!r}")
-    return agent_scope(agent_key) if agent_key else SCOPE_USER_ROOT
+    if not agent_key:
+        return SCOPE_USER_ROOT
+    if ws == EXEC_VIEW and conv_id is not None:
+        return conversation_scope(agent_key, conv_id)
+    return agent_shared_scope(agent_key, conv_id if conv_id is not None else thread_id)

@@ -40,6 +40,7 @@ def _row_to_meta(row: ThreadMetaRow) -> ThreadMeta:
         agent_name=row.agent_name,
         agent_version=row.agent_version,
         message_count=row.message_count,
+        workspace_layout="conversation" if row.workspace_layout == "conversation" else "agent_root",
         created_at=row.created_at,
         updated_at=row.updated_at,
     )
@@ -116,6 +117,9 @@ class SqlThreadMetaStore(ThreadMetaStore):
             agent_name=agent_name,
             agent_version=agent_version,
             message_count=0,
+            # B-236 —— 新对话一律是对话视图;显式写,不靠库默认值(库默认是老视图,
+            # 留给滚动发布期间老 pod 建的行,见迁移 0181)。
+            workspace_layout="conversation",
             created_at=now,
             updated_at=now,
         )

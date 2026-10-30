@@ -39,7 +39,12 @@ class _FakeThreads:
         del tenant_id
         if not self._has_agent:
             return SimpleNamespace(agent_name=None, agent_version=None, user_id=None)
-        return SimpleNamespace(agent_name="a", agent_version="1.0.0", user_id=None)
+        return SimpleNamespace(
+            agent_name="a",
+            agent_version="1.0.0",
+            user_id=None,
+            workspace_layout="conversation",
+        )
 
 
 _SPEC = AgentSpec.model_validate(
@@ -84,6 +89,7 @@ class _FakeRuntime:
         self.skill_run_usage_recorder = None
         self.trajectory_recorder = None
         self.thread_stats_recorder = None
+        self.agent_file_versions = None
 
     async def get_agent(self, **_kw):
         return SimpleNamespace(

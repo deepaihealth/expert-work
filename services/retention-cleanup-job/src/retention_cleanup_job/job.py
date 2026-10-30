@@ -70,6 +70,7 @@ from expert_work.runtime.runs.store import RunStore
 from expert_work.runtime.storage import ObjectStore
 from retention_cleanup_job.artifact_copies import (
     release_version_files,
+    remove_user_agent_file_versions,
     remove_user_copies,
     sweep_orphan_copies,
 )
@@ -373,7 +374,7 @@ class RetentionCleanupJob:
                 dependents_failed.append("artifact")
                 logger.exception("retention.workspace_dependents_failed store=artifact")
             # B-235 —— 产物各版本的副本住在用户根旁边,工作区归档 / rmtree 碰不到,这里删。
-            copies_removed = 0
+            copies_removed = versions_removed = 0
             if self._workspace_root is not None:
                 try:
                     copies_removed = await asyncio.to_thread(
@@ -382,6 +383,19 @@ class RetentionCleanupJob:
                 except Exception:
                     dependents_failed.append("artifact_copy")
                     logger.exception("retention.workspace_dependents_failed store=artifact_copy")
+                # B-236 —— /agent 文件的历史版本同样住在用户根旁边。
+                try:
+                    versions_removed = await asyncio.to_thread(
+                        remove_user_agent_file_versions,
+                        self._workspace_root,
+                        ws.tenant_id,
+                        ws.user_id,
+                    )
+                except Exception:
+                    dependents_failed.append("agent_file_version")
+                    logger.exception(
+                        "retention.workspace_dependents_failed store=agent_file_version"
+                    )
             try:
                 if self._user_upload_store is not None:
                     uploads_deleted = await self._user_upload_store.delete_all_for_user(
@@ -402,6 +416,7 @@ class RetentionCleanupJob:
                     "archive_object": "left to bucket lifecycle",
                     "artifacts_deleted": artifacts_deleted,
                     "artifact_copies_removed": copies_removed,
+                    "agent_file_versions_removed": versions_removed,
                     "uploads_deleted": uploads_deleted,
                     "dependents_failed": dependents_failed,
                 },

@@ -24,7 +24,7 @@ from alembic.config import Config
 from sqlalchemy.ext.asyncio import AsyncEngine
 from testcontainers.postgres import PostgresContainer
 
-from control_plane.workspace_lock import PgWorkspaceLock
+from control_plane.workspace_lock import PgConversationSeedLock, PgWorkspaceLock
 from expert_work.persistence import SqlUserWorkspaceStore
 from expert_work.persistence.database import (
     DatabaseConfig,
@@ -183,3 +183,50 @@ async def test_lock_distinct_workspaces_scale_concurrently(engine: AsyncEngine) 
 
     await asyncio.gather(*(worker(u) for u in users))
     assert state["max"] >= 2  # genuine concurrency across workspaces
+
+
+async def test_conversation_seed_lock_serialises_one_conversation_only(
+    engine: AsyncEngine,
+) -> None:
+    """B-236 —— 开场复制按对话互斥:同一个对话的两个持有者串行,不同对话并发。"""
+    lock = PgConversationSeedLock(create_async_session_factory(engine))
+    tenant = uuid4()
+    same, other = f"{tenant}:{uuid4()}", f"{tenant}:{uuid4()}"
+    order: list[str] = []
+
+    async def worker(name: str, key: str) -> None:
+        async with lock.acquire(key=key):
+            order.append(f"{name}-enter")
+            await asyncio.sleep(_HOLD_S)
+            order.append(f"{name}-exit")
+
+    await asyncio.gather(worker("A", same), worker("B", same))
+    assert order in (
+        ["A-enter", "A-exit", "B-enter", "B-exit"],
+        ["B-enter", "B-exit", "A-enter", "A-exit"],
+    )
+    order.clear()
+    await asyncio.gather(worker("A", same), worker("C", other))
+    assert order[:2] in (["A-enter", "C-enter"], ["C-enter", "A-enter"])
+
+
+async def test_conversation_seed_lock_does_not_hold_the_users_write_lock(
+    engine: AsyncEngine,
+) -> None:
+    """独立 classid:复制期间同一用户的写(``PgWorkspaceLock``)照常进行。"""
+    factory = create_async_session_factory(engine)
+    seed, write = PgConversationSeedLock(factory), PgWorkspaceLock(factory)
+    tenant, user = uuid4(), uuid4()
+    entered = asyncio.Event()
+
+    async def seeding() -> None:
+        async with seed.acquire(key=f"{tenant}:{uuid4()}"):
+            entered.set()
+            await asyncio.sleep(_HOLD_S * 3)
+
+    task = asyncio.create_task(seeding())
+    await entered.wait()
+    async with asyncio.timeout(_HOLD_S):
+        async with write.acquire(tenant_id=tenant, user_id=user):
+            pass
+    _ = await task

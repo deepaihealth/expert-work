@@ -15,31 +15,36 @@ from orchestrator.tools import workspace_paths
 from orchestrator.tools.sandbox_image_contract import EXEC_VIEW, NAS_MOUNT
 from orchestrator.tools.workspace_paths import (
     SHARED_PREFIX,
+    WorkspaceView,
     WriteToSharedError,
     agent_nas_root,
     agent_view_alias,
-    resolve_scope,
+    resolve_workspace_path,
 )
+
+
+def _resolve(path: str, *, agent_key: str, tool: str) -> tuple[str, str]:
+    """老视图下的 ``(ws, rel)`` —— B-236 之前 ``resolve_scope`` 的那对返回值。"""
+    target = resolve_workspace_path(path, view=WorkspaceView(agent_key=agent_key), tool=tool)
+    return target.ws, target.rel
 
 
 def test_bare_path_resolves_to_the_exec_view() -> None:
     """B-60 —— 文件工具的片段与用户代码在同一个命名空间里,看同一个视图:
     绑了 agent 时 /workspace **就是** agent 目录,ws 不再拼 agents/<key>。"""
-    ws, rel = resolve_scope("MEMORY.md", agent_key="plan-aaaaaaaa", tool="read_file")
+    ws, rel = _resolve("MEMORY.md", agent_key="plan-aaaaaaaa", tool="read_file")
     assert (ws, rel) == (EXEC_VIEW, "MEMORY.md")
 
 
 def test_shared_prefix_resolves_to_shared_root() -> None:
-    ws, rel = resolve_scope(
-        "shared:style/PLAN_STYLE.md", agent_key="plan-aaaaaaaa", tool="read_file"
-    )
+    ws, rel = _resolve("shared:style/PLAN_STYLE.md", agent_key="plan-aaaaaaaa", tool="read_file")
     assert ws == "/workspace/shared"
     assert rel == "style/PLAN_STYLE.md"
 
 
 def test_empty_agent_key_falls_back_to_user_root() -> None:
     """迁移期回落:没绑 agent 时读写用户根,与今天行为一致。"""
-    ws, rel = resolve_scope("MEMORY.md", agent_key="", tool="read_file")
+    ws, rel = _resolve("MEMORY.md", agent_key="", tool="read_file")
     assert ws == EXEC_VIEW
     assert rel == "MEMORY.md"
 
@@ -47,29 +52,29 @@ def test_empty_agent_key_falls_back_to_user_root() -> None:
 def test_shared_prefix_is_rejected_for_writes() -> None:
     """写 ``shared:`` 必须显式报错,不能静默改写到 agent 目录。"""
     with pytest.raises(WriteToSharedError):
-        resolve_scope("shared:x.md", agent_key="plan-aaaaaaaa", tool="write_file")
+        _resolve("shared:x.md", agent_key="plan-aaaaaaaa", tool="write_file")
 
 
 def test_shared_prefix_is_rejected_for_edits() -> None:
     """``edit_file`` 与 ``write_file`` 同档 —— 它也会改字节。"""
     with pytest.raises(WriteToSharedError):
-        resolve_scope("shared:x.md", agent_key="plan-aaaaaaaa", tool="edit_file")
+        _resolve("shared:x.md", agent_key="plan-aaaaaaaa", tool="edit_file")
 
 
 def test_shared_prefix_still_rejects_traversal() -> None:
     """``shared:`` 不是绕过 ``..`` 校验的后门。"""
     with pytest.raises(ValueError, match=r"\.\."):
-        resolve_scope("shared:../../etc/passwd", agent_key="plan-aaaaaaaa", tool="read_file")
+        _resolve("shared:../../etc/passwd", agent_key="plan-aaaaaaaa", tool="read_file")
 
 
 def test_shared_prefix_rejects_absolute_remainder() -> None:
     with pytest.raises(ValueError):
-        resolve_scope("shared:/etc/passwd", agent_key="plan-aaaaaaaa", tool="read_file")
+        _resolve("shared:/etc/passwd", agent_key="plan-aaaaaaaa", tool="read_file")
 
 
 def test_shared_prefix_rejects_empty_remainder() -> None:
     with pytest.raises(ValueError):
-        resolve_scope("shared:", agent_key="plan-aaaaaaaa", tool="read_file")
+        _resolve("shared:", agent_key="plan-aaaaaaaa", tool="read_file")
 
 
 def test_bad_agent_key_is_refused_even_though_it_no_longer_shapes_the_path() -> None:
@@ -77,7 +82,7 @@ def test_bad_agent_key_is_refused_even_though_it_no_longer_shapes_the_path() -> 
     ``agent_view_alias(agent_key)`` 在做校验。没有这条用例,把那一句删掉整个文件照样绿,
     而坏 key 会一路走到下游(``_require_path`` 的折叠、``save_artifact``)才被发现。"""
     with pytest.raises(ValueError):
-        resolve_scope("x", agent_key="..", tool="read_file")
+        _resolve("x", agent_key="..", tool="read_file")
 
 
 # ``..`` / ``.`` **单独**列出来不是凑数:原来这张表里每一项都带分隔符或是
@@ -134,7 +139,7 @@ def test_shared_prefix_always_names_the_shared_dir() -> None:
     目录,报的是「文件不存在」,看不出是前缀错了。
     """
     assert workspace_paths.SHARED_PREFIX == f"{WORKSPACE_SHARED_DIR}:"
-    assert workspace_paths.resolve_scope(
+    assert _resolve(
         f"{WORKSPACE_SHARED_DIR}:MEMORY.md", agent_key="plan-aaaaaaaa", tool="read_file"
     ) == (f"{EXEC_VIEW}/{WORKSPACE_SHARED_DIR}", "MEMORY.md")
 

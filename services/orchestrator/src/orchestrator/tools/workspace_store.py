@@ -22,11 +22,12 @@ in every method name added nothing.
 from __future__ import annotations
 
 import logging
-from collections.abc import AsyncIterator, Mapping, Sequence
+from collections.abc import AsyncIterator, Iterable, Mapping, Sequence
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from fnmatch import fnmatch
+from pathlib import PurePosixPath
 from typing import Any, Protocol, runtime_checkable
 from uuid import UUID
 
@@ -41,6 +42,7 @@ from orchestrator.tools.sandbox import (
 )
 from orchestrator.tools.workspace_scope import (
     SCOPE_USER_ROOT,
+    scope_hidden_heads,
     scope_parts,
     scoped_dir,
     scoped_path,
@@ -75,6 +77,9 @@ class WorkspaceFileEntry:
     #: :class:`~orchestrator.tools.nas_workspace_store.NasWorkspaceStore`
     #: (生产唯一在跑的实现)永远给真值。
     mtime: datetime | None = None
+    #: B-236 review 10 —— ``st_ctime_ns``,认开场复制的原样副本用(与 ``.seeded`` 清单比)。只有
+    #: NAS 实现给;不参与相等比较,也不进任何对外视图。
+    ctime_ns: int | None = field(default=None, compare=False, repr=False)
 
 
 @dataclass(frozen=True)
@@ -104,6 +109,21 @@ class WorkspaceDirListing:
     truncated: bool
 
 
+class WorkspaceFileListing(list[WorkspaceFileEntry]):
+    """``list_files`` 的结果(就是条目列表),外加 NAS 实现能给的一个旁注(B-236 review 11):
+
+    ``too_deep`` —— 有目录比遍历深度上限还深、下面的文件没列。工作区快照段据此不把任何目录说成
+    「未改动的副本」(同条目上限截断)。别的实现回普通 ``list``,读的一方用
+    ``getattr(listing, "too_deep", False)``。
+    """
+
+    def __init__(
+        self, entries: Iterable[WorkspaceFileEntry] = (), *, too_deep: bool = False
+    ) -> None:
+        super().__init__(entries)
+        self.too_deep = too_deep
+
+
 @dataclass(frozen=True)
 class WorkspaceSearchResult:
     """``search_files`` 的返回 —— 命中 + 是否被 ``max_results`` 截断。
@@ -111,10 +131,15 @@ class WorkspaceSearchResult:
     截断标记是单独一个字段, 不是「``len(entries) == max_results``」这种推断:
     恰好命中 N 条和命中了更多被截到 N 条, 对模型是两个不同的事实, 推断法把它们
     混成一个。照 ``list_dir`` 既有的 ``truncated`` 约定, 不发明第二种。
+
+    ``too_deep``(B-236 review 10)—— 有目录比遍历深度上限还深、没往下搜。和 ``truncated``
+    (命中够了 ``max_results`` 条、后面没列)是两件事:前者的「没找到」不等于「没有」,即使
+    一条命中都没有也要告诉模型。
     """
 
     entries: tuple[WorkspaceFileEntry, ...]
     truncated: bool
+    too_deep: bool = False
 
 
 def _entry_from_wire(raw: Mapping[str, Any]) -> WorkspaceFileEntry:
@@ -148,11 +173,23 @@ def scope_view(entries: Sequence[WorkspaceFileEntry], scope: str) -> list[Worksp
     if not prefix:
         return list(entries)
     base = "/".join(prefix) + "/"
+    hidden = scope_hidden_heads(scope)
     return [
         WorkspaceFileEntry(path=e.path[len(base) :], size=e.size, mtime=e.mtime)
         for e in entries
-        if e.path.startswith(base)
+        if e.path.startswith(base) and e.path[len(base) :].split("/", 1)[0] not in hidden
     ]
+
+
+def without_hidden_heads(
+    listing: WorkspaceDirListing, *, scope: str, path: str
+) -> WorkspaceDirListing:
+    """B-236 —— 作用域根上藏起来的首段不进列表(``agent_shared`` 的 ``threads/``)。"""
+    hidden = scope_hidden_heads(scope)
+    if not hidden or PurePosixPath(path.strip()).parts:
+        return listing
+    kept = tuple(e for e in listing.entries if e.name not in hidden)
+    return WorkspaceDirListing(entries=kept, truncated=listing.truncated)
 
 
 def dir_listing_from_files(
@@ -231,13 +268,21 @@ class WorkspaceStore(Protocol):
         """
 
     async def list_files(
-        self, *, tenant_id: UUID, user_id: UUID, scope: str = SCOPE_USER_ROOT
+        self,
+        *,
+        tenant_id: UUID,
+        user_id: UUID,
+        scope: str = SCOPE_USER_ROOT,
+        include_seed_copies: bool = False,
     ) -> list[WorkspaceFileEntry]:
         """List the files in a user's persistent workspace volume (browse).
 
         递归, 且过滤保留前缀(``uploads/`` / ``skills/`` / ``inputs/`` /
         ``.tool_results/``)—— 这是"产物"视图。要"这一个目录里有什么"用
         :meth:`list_dir`, 两者不是同一件事。``path`` 回的是**作用域相对**路径。
+
+        ``include_seed_copies``(B-236)—— 默认不列开场复制进对话、之后没被碰过的副本(只有
+        NAS 实现认得出副本;别的实现照旧全列)。``True`` 全列。
         """
 
     async def list_dir(
@@ -394,7 +439,8 @@ class SupervisorWorkspaceStore:
         # ``scoped_dir`` 回的已经是**用户根相对**路径(前缀在里面了), 别再拼一次。
         under = scoped_dir(scope, path)
         entries = await self.list_files(tenant_id=tenant_id, user_id=user_id)
-        return dir_listing_from_files(entries, rel=under, max_entries=max_entries)
+        listing = dir_listing_from_files(entries, rel=under, max_entries=max_entries)
+        return without_hidden_heads(listing, scope=scope, path=path)
 
     async def search_files(
         self,
@@ -430,7 +476,12 @@ class SupervisorWorkspaceStore:
         return search_result(hits, max_results=max_results)
 
     async def list_files(
-        self, *, tenant_id: UUID, user_id: UUID, scope: str = SCOPE_USER_ROOT
+        self,
+        *,
+        tenant_id: UUID,
+        user_id: UUID,
+        scope: str = SCOPE_USER_ROOT,
+        include_seed_copies: bool = False,
     ) -> list[WorkspaceFileEntry]:
         url = f"{self.base_url}/v1/workspaces/{tenant_id}/{user_id}/files"
         async with self._make_client() as client:
@@ -600,7 +651,12 @@ class RecordingWorkspaceStore:
         return data
 
     async def list_files(
-        self, *, tenant_id: UUID, user_id: UUID, scope: str = SCOPE_USER_ROOT
+        self,
+        *,
+        tenant_id: UUID,
+        user_id: UUID,
+        scope: str = SCOPE_USER_ROOT,
+        include_seed_copies: bool = False,
     ) -> list[WorkspaceFileEntry]:
         self.workspace_reads.append((tenant_id, user_id, ""))
         if self.workspace_list_error is not None:
@@ -621,7 +677,8 @@ class RecordingWorkspaceStore:
         # 同 SupervisorWorkspaceStore:``scoped_dir`` 已经含前缀。
         under = scoped_dir(scope, path)
         self.workspace_reads.append((tenant_id, user_id, under))
-        return dir_listing_from_files(self.workspace_files, rel=under, max_entries=max_entries)
+        listing = dir_listing_from_files(self.workspace_files, rel=under, max_entries=max_entries)
+        return without_hidden_heads(listing, scope=scope, path=path)
 
     async def search_files(
         self,

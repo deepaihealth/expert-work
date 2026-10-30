@@ -45,7 +45,7 @@ from uuid import UUID
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from control_plane.advisory_locks import WORKSPACE_LOCK_CLASSID
+from control_plane.advisory_locks import CONVERSATION_SEED_LOCK_CLASSID, WORKSPACE_LOCK_CLASSID
 
 logger = logging.getLogger(__name__)
 
@@ -123,3 +123,30 @@ class PgWorkspaceLock:
                 user_id,
                 exc_info=True,
             )
+
+
+@dataclass
+class PgConversationSeedLock:
+    """B-236 —— 对话开场复制按对话互斥(``{tenant}:{conv}``),跨副本。
+
+    同一个对话的两个 run 同时开始时只让一个去复制;另一个拿到锁后看到标记,什么都不做。
+    与 :class:`PgWorkspaceLock` 同一种做法(事务级 advisory lock、``SET LOCAL`` 把超时抬到
+    复制时长之上),但是另一个 classid、另一个键 —— 不挡同一用户别的对话的写。
+
+    Structurally satisfies ``orchestrator.tools.locks.KeyedLock``."""
+
+    #: A *raw* (non-RLS) sessionmaker — the lock touches no tenant tables.
+    session_factory: async_sessionmaker[AsyncSession]
+
+    @asynccontextmanager
+    async def acquire(self, *, key: str) -> AsyncIterator[None]:
+        async with self.session_factory() as session, session.begin():
+            await session.execute(
+                text(f"SET LOCAL idle_in_transaction_session_timeout = {_LOCK_TXN_TIMEOUT_MS}")
+            )
+            await session.execute(text(f"SET LOCAL statement_timeout = {_LOCK_TXN_TIMEOUT_MS}"))
+            await session.execute(
+                text("SELECT pg_advisory_xact_lock(:classid, hashtext(:k))"),
+                {"classid": CONVERSATION_SEED_LOCK_CLASSID, "k": key},
+            )
+            yield

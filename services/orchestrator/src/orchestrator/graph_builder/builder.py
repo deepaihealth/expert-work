@@ -81,6 +81,7 @@ from langgraph.graph import END, START, StateGraph
 from opentelemetry.trace import Status, StatusCode
 
 from expert_work.common.conversation_channel import (
+    AGENT_NOTES_BLOCK_MARK,
     HIDE_FROM_UI,
     INPUTS_BLOCK_MARK,
     WORKSPACE_BLOCK_MARK,
@@ -250,9 +251,11 @@ from orchestrator.tools.registry import (
     ToolRegistry,
     ToolResult,
     ToolSpec,
+    workspace_view_fields,
 )
 from orchestrator.tools.scheduling import MAX_TOOL_WORKERS, plan_stages
 from orchestrator.tools.spawn_worker import SPAWN_WORKER_TOOL_NAME
+from orchestrator.tools.workspace_paths import WorkspaceView
 from orchestrator.tools.workspace_store import WorkspaceStore
 from orchestrator.tools.workspace_tree import workspace_prompt_block
 from orchestrator.usage_metering import without_served_by
@@ -506,6 +509,11 @@ def build_react_graph(
     workspace_ingest_node: MemoryNode | None = None,
     # B-61 — run-start inputs.json materialize + in-sandbox prefetch.
     inputs_node: MemoryNode | None = None,
+    # B-236 —— run-start copy of the agent's base directories into this conversation's
+    # /workspace (once per conversation; ``conversation_seed``).
+    conversation_seed_node: MemoryNode | None = None,
+    # B-236 第三层 —— 对话第一次 run 开场时读一次 /agent/AGENT_NOTES.md(``agent_notes``)。
+    agent_notes_node: MemoryNode | None = None,
     # B-67 §七 —— 本 agent 声明为 ``trusted`` 的变量名。手抄守卫的提示只对这些变量写出
     # 链接名与模型抄的那串(那条合成消息不过 spotlight 围栏);默认空 = 一律不写。
     trusted_input_names: frozenset[str] = frozenset(),
@@ -756,6 +764,9 @@ def build_react_graph(
         # 不去重的话 coalesce 会把 N 份拼成一条,前缀缓存每轮在上一份末尾断开。
         # 放在一切上下文闸之前,让它们按真实大小估算。检查点不动(CM-C4)。
         messages = keep_latest_system_prompt(messages)
+        # B-236 —— 开场注入的记忆索引段(落在第一轮)。下面的滑窗 / 压缩可能把它挤出提示词
+        # 视图,那之后放回原件(:func:`_keep_agent_notes_block`)。
+        notes_block = _latest_agent_notes_block(messages)
         # Stream CM-12 — mechanical tool-result prune: the cheapest, least-lossy
         # gate, run FIRST. When over threshold it collapses OLD tool results
         # (beyond the most-recent N) to 1-line references — lossless for
@@ -918,8 +929,9 @@ def build_react_graph(
         # 一段占位文字。把它作为 ``reserved`` 交给压缩器 —— 只计入估算、不进被总结的
         # 那段(压缩器去总结或丢掉它都是错的)。身份与工作区快照同一个来源:本次 run 的
         # config。每轮重建、不落检查点。
-        figure_agent_key_raw = configurable.get("agent_key")
-        figure_agent_key = figure_agent_key_raw if isinstance(figure_agent_key_raw, str) else ""
+        # B-236 —— 本轮的工作区视图(布局 / 对话)与工具那一侧同一个来源:
+        # ``_build_tool_context`` 读 config。渲染页段与工作区快照都用它。
+        turn_view = _build_tool_context(config).workspace_view
         figure_viewed = state.get("viewed_figures") or []
         figure_documents = state.get("figure_documents") or {}
         figure_tenant = _parse_uuid(configurable.get("tenant_id"))
@@ -933,7 +945,7 @@ def build_react_graph(
                 documents=figure_documents,
                 tenant_id=figure_tenant,
                 user_id=figure_user,
-                agent_key=figure_agent_key,
+                view=turn_view,
             )
             if supports_vision and figure_viewed and workspace_store is not None
             else None
@@ -944,7 +956,7 @@ def build_react_graph(
             supports_vision=supports_vision,
             tenant_id=figure_tenant,
             user_id=figure_user,
-            agent_key=figure_agent_key,
+            view=turn_view,
             freshness=figure_fresh,
         )
         reserved: tuple[BaseMessage, ...] = (figure_block,) if figure_block is not None else ()
@@ -1060,6 +1072,8 @@ def build_react_graph(
                 logger.info(
                     "tools.promotion_demoted count=%d step=%d", len(demoted_tools), step_count
                 )
+        # B-236 —— 滑窗或压缩把记忆索引段挤出了提示词视图就放回原件。
+        messages = _keep_agent_notes_block(notes_block, messages)
         configurable = config.get("configurable") or {}
         tenant_id = _parse_uuid(configurable.get("tenant_id"))
         # Stream Agent-Templates (M1-5a) — the end-user this run is for, threaded
@@ -1089,14 +1103,16 @@ def build_react_graph(
         #
         # 身份一律从**本次 run 的** config 取, 与 ``read_file`` / ``list_dir`` 同一个
         # 来源(``_build_tool_context`` 读的也是这三个键)。
-        agent_key_raw = configurable.get("agent_key")
         if workspace_store is not None and tenant_id is not None and user_id is not None:
             messages = await _workspace_block_tail(
                 messages,
                 workspace_store,
                 tenant_id=tenant_id,
                 user_id=user_id,
-                agent_key=agent_key_raw if isinstance(agent_key_raw, str) else "",
+                view=turn_view,
+                seed_skipped=state.get("seed_skipped_dirs") or (),
+                seed_quota_blocked=bool(state.get("seed_quota_blocked")),
+                seed_skipped_more=int(state.get("seed_skipped_more") or 0),
             )
         # B-64 —— 渲染页段(Path A)挂到尾部。块在压缩判定之前就造好了(见那里的
         # 注释);这里与上面工作区快照同一个位置。**无条件调用**:没有块时也要把
@@ -2290,6 +2306,17 @@ def build_react_graph(
         plan_tail = "workspace_ingest"
     if plan_tail is not None:
         tails.append(plan_tail)
+    # B-236 —— 开场复制自成一支:写集(本对话的 work/ 与 ``seed_skipped_dirs``)与上面两支
+    # 都不相交;agent 等它做完再开始,第一轮的 /workspace 里就有基础目录的副本。
+    if conversation_seed_node is not None:
+        graph.add_node("conversation_seed", conversation_seed_node)  # type: ignore[arg-type]
+        graph.add_edge(START, "conversation_seed")
+        tails.append("conversation_seed")
+    # B-236 第三层 —— 记忆索引注入同样自成一支(只写 ``messages``,追加在本轮输入之后)。
+    if agent_notes_node is not None:
+        graph.add_node("agent_notes", agent_notes_node)  # type: ignore[arg-type]
+        graph.add_edge(START, "agent_notes")
+        tails.append("agent_notes")
     if not tails:
         tails.append(START)
     if len(tails) > 1:
@@ -2544,6 +2571,36 @@ def _keep_latest_inputs_block(
     return [*after, block]
 
 
+def _latest_agent_notes_block(messages: Sequence[BaseMessage]) -> BaseMessage | None:
+    """B-236 —— 提示词视图里的记忆索引段(第一轮开场时注入的那条)。"""
+    for msg in reversed(messages):
+        if isinstance(msg, HumanMessage) and (msg.additional_kwargs or {}).get(
+            AGENT_NOTES_BLOCK_MARK
+        ):
+            return msg
+    return None
+
+
+def _keep_agent_notes_block(
+    block: BaseMessage | None, after: Sequence[BaseMessage]
+) -> list[BaseMessage]:
+    """B-236 —— 滑窗 / 压缩之后,记忆索引段若被挤出提示词视图就放回去(按标记认)。
+
+    与 :func:`_keep_latest_inputs_block` 同一位置口径(隐藏 HumanMessage 挂尾部,不开新一轮,
+    也不会插进 tool_call ↔ tool_result 之间)。它只在第一轮注入一次、之后不重读,被摘要掉就
+    再也回不来 —— 而「这个 agent 记得什么」正是长对话后段最需要的。只改这一次的提示词视图,
+    检查点不动(CM-C4)。
+
+    review 7 —— 按 :data:`AGENT_NOTES_BLOCK_MARK` 认,不按 identity:中间的
+    ``escape_forged_recovery_advisories`` 遇到正文里的 ``<recovery-advisory>`` 字样会换成一份
+    转义过的**副本**,按 identity 找不到它,每一步就多挂一份原件。放回去的原件之后照样过那一道
+    转义(``with_recovery_advisories``)。
+    """
+    if block is None or any((m.additional_kwargs or {}).get(AGENT_NOTES_BLOCK_MARK) for m in after):
+        return list(after)
+    return [*after, block]
+
+
 def _is_workspace_block(msg: BaseMessage) -> bool:
     """B-84 PR-2 —— 这条消息是不是平台注入的工作区快照段。"""
     return isinstance(msg, HumanMessage) and bool(
@@ -2585,7 +2642,10 @@ async def _workspace_block_tail(
     *,
     tenant_id: UUID,
     user_id: UUID,
-    agent_key: str,
+    view: WorkspaceView,
+    seed_skipped: Sequence[str] = (),
+    seed_quota_blocked: bool = False,
+    seed_skipped_more: int = 0,
 ) -> list[BaseMessage]:
     """B-84 PR-2 —— 重取一份工作区快照, 挂到提示词尾部;更早的那几段一并剔掉。
 
@@ -2612,7 +2672,13 @@ async def _workspace_block_tail(
     """
     kept = _without_workspace_blocks(messages)
     block = await workspace_prompt_block(
-        store, tenant_id=tenant_id, user_id=user_id, agent_key=agent_key
+        store,
+        tenant_id=tenant_id,
+        user_id=user_id,
+        view=view,
+        seed_skipped=seed_skipped,
+        seed_quota_blocked=seed_quota_blocked,
+        seed_skipped_more=seed_skipped_more,
     )
     if not block:
         return kept
@@ -2648,13 +2714,19 @@ def _inject_plan(messages: list[BaseMessage], plan: Plan) -> list[BaseMessage]:
 _MEMORY_TRUNCATION_MARKER = " [... truncated: memory injection token budget]"
 
 
-def _truncate_to_tokens(text: str, max_tokens: int, count: Callable[[str], int]) -> str:
+def _truncate_to_tokens(
+    text: str,
+    max_tokens: int,
+    count: Callable[[str], int],
+    marker: str = _MEMORY_TRUNCATION_MARKER,
+) -> str:
     """RT-2 PR-2 — cut ``text`` down to roughly ``max_tokens`` per ``count``.
 
     Proportional shrink with a bounded refinement loop: the estimator is
     a heuristic (tiktoken or chars//4), so exact-token precision is not
     the contract — the budget is approximate by design, and the marker's
-    own few tokens ride on top.
+    own few tokens ride on top. B-236 —— ``marker`` lets the agent-notes block
+    name the file to read for the rest.
     """
     keep = len(text)
     for _ in range(6):
@@ -2667,7 +2739,7 @@ def _truncate_to_tokens(text: str, max_tokens: int, count: Callable[[str], int])
         if keep <= 0:
             keep = 0
             break
-    return text[:keep] + _MEMORY_TRUNCATION_MARKER
+    return text[:keep] + marker
 
 
 def _render_memory_lines(
@@ -4356,10 +4428,10 @@ def _build_tool_context(
     # 仍然逐项清洗:这两个通道的值一路从 HTTP 载荷传下来,不是进程内对象。
     docs = _string_list(turn_documents)
     images = _string_list(turn_image_refs)
-    # 工作区分层 —— 本次调用的 agent 身份。``configurable`` 是不可信输入
-    # (一路从 HTTP 载荷传下来),非字符串一律当没有,回落空串。
-    agent_key_raw = configurable.get("agent_key")
-    agent_key = agent_key_raw if isinstance(agent_key_raw, str) else ""
+    # 工作区分层 —— 本次调用的 agent 身份与 B-236 的视图(布局 / 本对话 / 根对话),与
+    # 平台自己的 exec(PLAN.md 回读)同一个取法。``configurable`` 是不可信输入,非字符串
+    # 一律当没有,回落空串;不认识的布局一律当老视图。
+    view_fields = workspace_view_fields(configurable)
     # B-61 §4.4 —— 子代要指向**父** run 的 inputs.json(``_child_config`` 写进来
     # 的);审批续跑段要指向这一轮首段的(``run_agent`` 写进来的)。新开一轮的
     # 主 run 没有这一项,回落 ``None`` = 用自己的 run_id。
@@ -4386,9 +4458,12 @@ def _build_tool_context(
         artifact_recorder=artifact_recorder,
         turn_documents=docs,
         turn_image_refs=images,
-        agent_key=agent_key,
+        agent_key=view_fields["agent_key"],
         inputs_run_id=inputs_run_id,
         prompt_inputs=prompt_inputs,
+        workspace_layout=view_fields["workspace_layout"],
+        workspace_thread_id=view_fields["workspace_thread_id"],
+        child_run=configurable.get("child_run") is True,
     )
 
 

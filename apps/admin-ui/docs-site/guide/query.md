@@ -481,7 +481,13 @@ curl -X DELETE "https://<your-domain>/v1/agents/{agent_code}/sessions/{session_i
 排查时按这个顺序确认：文件当前归属哪个 `agent_code`（用 `scope=user` 列一次就能看到），再用那个 `agent_code` 去下载。
 :::
 
-`path` 的取值形态没有变化：列出文件返回的 `path` 相对该 Agent 自己的工作区根，不含 Agent 相关的前缀。客户端缓存过的 `path` 继续有效，下载时原样回传即可。
+列出文件返回的 `path` 相对该 Agent 自己的工作区根，不含 Agent 相关的前缀，下载时原样回传即可。客户端缓存过的 `path` 继续有效。
+
+每个会话有自己的工作目录，Agent 在会话里写出的文件放在这里，`path` 的形态是 `threads/{session_id}/work/…`，响应里的 `session_id` 指明是哪个会话。不在任何会话工作目录里的文件是 Agent 级文件，由这个 Agent 的所有会话共用，`session_id` 为 `null`。
+
+会话开始时，平台把 Agent 级的目录复制一份到这个会话的工作目录。复制过来之后没有改动过的文件不出现在列表里；会话里改动过的文件和新写的文件照常列出。
+
+不列出的这些文件是会话开始时 Agent 级同名文件的副本，之后 Agent 级文件可能已经改动，两者的内容不一定相同。需要会话里那一份的，按 `threads/{session_id}/work/<同一相对路径>` 下载。
 
 ### 列出文件
 
@@ -509,6 +515,7 @@ GET /v1/agents/{agent_code}/workspace/files
 | `path` | string | 文件在这个 Agent 的工作区里的相对路径，可能包含子目录。下载时原样回传给下载接口 |
 | `size` | integer | 文件大小，单位是字节 |
 | `agent_code` | string | 这份文件归属的 Agent。`scope=agent` 时恒等于路径里的那个值 |
+| `session_id` | string 或 null | 文件所在会话的 `session_id`。会话工作目录（`threads/{session_id}/work/…`）里的文件为该会话的 id；Agent 级文件为 `null`。会话已删除时同样为 `null` |
 
 `scope=user` 时，`path` 仍然相对各自 Agent 的工作区根，所以两个 Agent 可以有同名文件而不冲突，靠 `agent_code` 区分。下载时把这两个字段配成一对用：`agent_code` 放路径，`path` 放查询字符串。
 
@@ -524,8 +531,18 @@ curl "https://<your-domain>/v1/agents/{agent_code}/workspace/files?user_id=u-123
   "success": true,
   "data": {
     "files": [
-      { "path": "report.pdf", "size": 235112, "agent_code": "weekly-report" },
-      { "path": "charts/q3.png", "size": 88213, "agent_code": "weekly-report" }
+      {
+        "path": "templates/weekly.md",
+        "size": 2210,
+        "agent_code": "weekly-report",
+        "session_id": null
+      },
+      {
+        "path": "threads/6f1c2a9e-3b4d-4e5f-8a7b-9c0d1e2f3a4b/work/report.pdf",
+        "size": 235112,
+        "agent_code": "weekly-report",
+        "session_id": "6f1c2a9e-3b4d-4e5f-8a7b-9c0d1e2f3a4b"
+      }
     ]
   },
   "error": null
@@ -544,8 +561,8 @@ curl "https://<your-domain>/v1/agents/{agent_code}/workspace/files?user_id=u-123
   "success": true,
   "data": {
     "files": [
-      { "path": "report.pdf", "size": 235112, "agent_code": "weekly-report" },
-      { "path": "report.pdf", "size": 41980, "agent_code": "sales-digest" }
+      { "path": "report.pdf", "size": 235112, "agent_code": "weekly-report", "session_id": null },
+      { "path": "report.pdf", "size": 41980, "agent_code": "sales-digest", "session_id": null }
     ]
   },
   "error": null

@@ -10,7 +10,7 @@ from __future__ import annotations
 from datetime import datetime
 from uuid import UUID
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 #: B-60 —— ``ExecRequest.agent_root`` 唯一合法的前缀。与 orchestrator 的
 #: ``workspace_paths.agent_nas_root()`` 拼出来的形状同义,但这里刻意是自己的字面量:
@@ -106,6 +106,21 @@ class ExecRequest(BaseModel):
     #: whole user root becomes ``/workspace`` (pre-feature view). Not a cwd — the
     #: child's cwd is always ``/workspace``.
     agent_root: str | None = None
+    #: B-236 —— 对话视图:``/workspace`` 是 ``<agent_root>/threads/<conv_id>/work``,
+    #: ``/agent`` 是 ``agent_root`` 本身。``None`` → 老视图(两者都是 ``agent_root``)。
+    #: 只在绑了 agent(``agent_root`` 非空)时成立。
+    conv_id: UUID | None = None
+    #: B-236 —— 本对话的线程 id:两种视图里 ``<agent_root>/threads/`` 都只留它那一格。
+    #: ``None`` → 一格都不留。
+    thread_id: UUID | None = None
+
+    @model_validator(mode="after")
+    def _conversation_view_needs_an_agent_root(self) -> ExecRequest:
+        has_view = self.conv_id is not None or self.thread_id is not None
+        if has_view and self.agent_root is None:
+            msg = "conv_id / thread_id need agent_root (the view is per agent)"
+            raise ValueError(msg)
+        return self
 
     @field_validator("agent_root")
     @classmethod

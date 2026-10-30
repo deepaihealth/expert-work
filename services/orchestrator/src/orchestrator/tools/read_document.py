@@ -46,7 +46,7 @@ from orchestrator.tools.sandbox import (
     SandboxRuntime,
 )
 from orchestrator.tools.sandbox_image_contract import EXEC_VIEW
-from orchestrator.tools.workspace_paths import resolve_scope
+from orchestrator.tools.workspace_paths import PATH_ARG_DESCRIPTION, WORKSPACE_PATH_RULE
 
 #: B-60 —— 与 ``file_ops`` 同一个真源(``sandbox_image_contract.EXEC_VIEW``)。
 #: 这个模块此前自己写了一份字面量;``read_document`` 也读用户工作区,PR3 的计划里
@@ -218,8 +218,9 @@ class ReadDocumentTool:
                 "Extract the text of a document in your own workspace — PDF, "
                 "Word (.docx), Excel (.xlsx), PowerPoint (.pptx), or a plain-text "
                 "format (.txt/.md/.csv/.json/...). Use this for binary documents "
-                "that read_file cannot decode. Paths are relative to your own "
-                "workspace root. Prefix a path with 'shared:' to read the shared "
+                "that read_file cannot decode. "
+                + WORKSPACE_PATH_RULE
+                + " Prefix a path with 'shared:' to read the shared "
                 "legacy area (read-only)."
             ),
             parameters={
@@ -227,7 +228,7 @@ class ReadDocumentTool:
                 "properties": {
                     "path": {
                         "type": "string",
-                        "description": "Workspace-relative document path (no leading '/' or '..').",
+                        "description": PATH_ARG_DESCRIPTION,
                     },
                 },
                 "required": ["path"],
@@ -239,8 +240,8 @@ class ReadDocumentTool:
         )
 
     async def call(self, args: Mapping[str, Any], *, ctx: ToolContext) -> ToolResult:
-        raw = _require_path(args, tool="read_document", agent_key=ctx.agent_key)
-        ws, rel = resolve_scope(raw, agent_key=ctx.agent_key, tool="read_document")
+        target = _require_path(args, tool="read_document", view=ctx.workspace_view)
+        ws, rel = target.ws, target.rel
         env = await run_scoped_read(
             self.client,
             build=lambda w: build_read_document_wrapper(rel, cap=self.output_char_cap, ws=w),

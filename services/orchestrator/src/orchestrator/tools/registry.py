@@ -27,6 +27,45 @@ from expert_work.runtime.cancellation import CancellationToken
 from orchestrator.tools._budget import DelegationGate, WorkerSpawnBudget
 from orchestrator.tools._guards import TokenBudget
 from orchestrator.tools.ranking import build_document, rank_tools
+from orchestrator.tools.workspace_paths import WorkspaceView
+
+#: B-236 —— ``thread_meta.workspace_layout`` 的两个取值。
+WorkspaceLayout = Literal["conversation", "agent_root"]
+#: B-236 —— ``config["configurable"]`` 里的两个键:每条 run 入口按 ``thread_meta`` 写布局,
+#: ``_child_run._child_config`` 给子代写根对话的 id。
+WORKSPACE_LAYOUT_KEY = "workspace_layout"
+WORKSPACE_THREAD_ID_KEY = "workspace_thread_id"
+
+
+def workspace_view_fields(configurable: Mapping[str, Any]) -> dict[str, Any]:
+    """B-236 —— 从 ``config["configurable"]`` 取工作区视图要的四个值(agent 身份、本对话
+    线程、布局、根对话),给 :class:`ToolContext` 用。
+
+    **每个建 ToolContext 的地方都从这里取**(``builder._build_tool_context`` 与平台自己的
+    exec,如 PLAN.md 回读):少一项,exec 就落成另一个视图 —— 没有线程 id 时
+    ``/agent/threads/`` 整个被盖住,回读读成「不存在」,用户的改动被静默丢掉。
+    ``configurable`` 不可信(一路从 HTTP 载荷来):类型不对一律当没有,布局不认识就是老视图。
+    """
+    agent_key = configurable.get("agent_key")
+    layout = configurable.get(WORKSPACE_LAYOUT_KEY)
+    return {
+        "agent_key": agent_key if isinstance(agent_key, str) else "",
+        "thread_id": _uuid_or_none(configurable.get("thread_id")),
+        "workspace_layout": "conversation" if layout == "conversation" else "agent_root",
+        "workspace_thread_id": _uuid_or_none(configurable.get(WORKSPACE_THREAD_ID_KEY)),
+    }
+
+
+def _uuid_or_none(raw: object) -> UUID | None:
+    if isinstance(raw, UUID):
+        return raw
+    if not isinstance(raw, str):
+        return None
+    try:
+        return UUID(raw)
+    except ValueError:
+        return None
+
 
 if TYPE_CHECKING:
     from orchestrator.tools.arg_bindings import ToolArgBindings
@@ -360,6 +399,25 @@ class ToolContext:
     #: 主 run 的填值不读这里,它直接读 ``config["configurable"]``(那是这些值的
     #: 出处);``None`` = 这条 run 没有声明变量。
     prompt_inputs: Mapping[str, Any] | None = None
+    #: B-236 —— 这条对话的 ``/workspace`` 布局:``"conversation"`` = 本对话自己的目录
+    #: (``agents/<key>/threads/<conv>/work``),``"agent_root"`` = 老视图(agent 根)。取自
+    #: ``thread_meta.workspace_layout``,每条 run 入口写进 ``configurable``;没写的(单测 /
+    #: 合成评测)是老视图 —— 失败方向与 B-236 之前逐字相同。
+    workspace_layout: WorkspaceLayout = "agent_root"
+    #: B-236 —— 工作区按**哪个对话**分目录。主 run 留 ``None``(用 ``thread_id``);委派
+    #: 出去的子代各有自己的子线程 id,``_child_config`` 把根对话的 id 传下来 —— 子代干的
+    #: 是父的活,写的文件父要读得到(与 ``agent_key`` / ``inputs_run_id`` 同一个取值口径)。
+    workspace_thread_id: UUID | None = None
+    #: B-236 第三层 —— 这是一次委派出去的子代(worker / 静态子 Agent)的调用:``_child_config``
+    #: 写的 ``configurable["child_run"]``。子代不许改 agent 的记忆索引(``file_ops``)。
+    child_run: bool = False
+
+    @property
+    def workspace_view(self) -> WorkspaceView:
+        """本次调用的工作区视图 —— 文件工具解析路径与 exec 建命名空间用的同一个值。"""
+        thread = (self.workspace_thread_id or self.thread_id) if self.agent_key else None
+        conv = thread if self.workspace_layout == "conversation" else None
+        return WorkspaceView(agent_key=self.agent_key, conv_id=conv, thread_id=thread)
 
 
 #: Stream K.K8 — keys a tool is allowed to write back to ``AgentState``

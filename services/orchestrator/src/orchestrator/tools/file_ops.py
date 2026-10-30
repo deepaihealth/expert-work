@@ -43,13 +43,13 @@ import hashlib
 import json
 import re
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import PurePosixPath
 from typing import Any, NoReturn
 from uuid import UUID
 
-from expert_work.persistence import SANDBOX_SKILLS_ROOT
 from orchestrator.tools.locks import NullWorkspaceLock, WorkspaceLock
+from orchestrator.tools.nas_workspace_store import MISSING_DIR_ERRORS
 from orchestrator.tools.registry import (
     ToolBlockedError,
     ToolContext,
@@ -65,26 +65,29 @@ from orchestrator.tools.sandbox import (
     WorkspaceFileTooLargeError,
     WorkspaceNotADirectoryError,
     WorkspaceNotAFileError,
+    WorkspaceNotARegularFileError,
     WorkspacePathEscapeError,
     WorkspacePermissionError,
     run_in_sandbox,
 )
-from orchestrator.tools.sandbox_image_contract import EXEC_VIEW
+from orchestrator.tools.sandbox_image_contract import AGENT_VIEW, EXEC_VIEW
 from orchestrator.tools.workspace_paths import (
-    AGENTS_DIR,
-    SHARED_PREFIX,
-    agent_view_alias,
-    resolve_scope,
+    AGENT_NOTES_FILE,
+    PATH_ARG_DESCRIPTION,
+    WORKSPACE_PATH_RULE,
+    ResolvedPath,
+    WorkspaceView,
+    agent_relative,
+    resolve_workspace_path,
 )
 from orchestrator.tools.workspace_scope import store_scope
 from orchestrator.tools.workspace_store import (
     DEFAULT_SEARCH_RESULTS,
+    WorkspaceDirListing,
+    WorkspaceFileEntry,
     WorkspaceSearchResult,
     WorkspaceStore,
 )
-
-#: ``shared/`` 目录名 —— 由前缀反推,不写第二份字面量(前缀与目录必须永远同名)。
-_SHARED_DIR_NAME = SHARED_PREFIX.rstrip(":")
 
 #: Workspace mount inside the sandbox (see infra/sandbox-image).
 #:
@@ -92,6 +95,10 @@ _SHARED_DIR_NAME = SHARED_PREFIX.rstrip(":")
 #: ``/workspace`` 就是 agent 目录,没绑时是整个用户根 —— 两种情况片段的 ``ws``
 #: 参数都是这同一个值。
 _WORKSPACE_ROOT = EXEC_VIEW
+#: B-236 —— 平台自己写 / 读的文件(状态投影 ``threads/<id>/PLAN.md``、根下的旧投影、
+#: 超长工具结果 ``.tool_results/…``)一律按 **agent 根** 寻址,不随对话视图走:
+#: ``/agent`` 在两种视图里都是 agent 根(对话视图里 ``threads/`` 只剩本对话那一格)。
+_INTERNAL_ROOT = AGENT_VIEW
 #: Largest file ``read_file`` will pull into the sandbox (whole file is hashed
 #: for TE-9 CAS, so the read can't be capped to the returned slice). Bigger
 #: files should use the dedicated ``read_workspace_file`` download path.
@@ -104,17 +111,6 @@ _MAX_WRITE_CHARS = 10 * 1024 * 1024
 _MAX_LIST_ENTRIES = 1000
 
 
-#: B-225 —— skill files are seeded outside the workspace, under
-#: ``SANDBOX_SKILLS_ROOT``; models reach for them with ``../opt/skills/…``. The
-#: rejection names the two ways that work, so the next call does not guess.
-_SKILLS_SEGMENT = SANDBOX_SKILLS_ROOT.lstrip("/") + "/"
-_SKILLS_PATH_HINT = (
-    ". Skill files are outside the workspace: load one with "
-    "skill_view(skill_name, path), or read or run it with bash under "
-    "$EXPERT_WORK_SKILLS_DIR/<skill name>/."
-)
-
-
 class FileOpError(RuntimeError):
     """A workspace file operation failed for a non-security reason
     (missing file, binary content, I/O error). The ReAct tools node wraps
@@ -123,77 +119,47 @@ class FileOpError(RuntimeError):
 
 
 def _require_path(
-    args: Mapping[str, Any], *, tool: str, default: str | None = None, agent_key: str = ""
-) -> str:
-    """Validate the orchestrator-side ``path`` arg: a relative workspace
-    path without ``..`` or NUL. Mirrors ``artifact.py:_validate_path`` for a
-    consistent contract across file-touching tools; the in-sandbox snippet
+    args: Mapping[str, Any],
+    *,
+    tool: str,
+    view: WorkspaceView,
+    default: str | None = None,
+) -> ResolvedPath:
+    """Validate and resolve the orchestrator-side ``path`` arg (B-236: one resolver,
+    :func:`~orchestrator.tools.workspace_paths.resolve_workspace_path`). Shared by
+    every file-touching tool for a consistent contract; the in-sandbox snippet
     re-checks via ``realpath`` to also defeat symlink escape."""
     raw = args.get("path", default)
     if not isinstance(raw, str):
         msg = f"{tool} requires a 'path' string"
         raise ValueError(msg)
-    cleaned = raw.strip()
-    if not cleaned:
-        msg = f"{tool} requires a non-empty 'path'"
-        raise ValueError(msg)
-    if "\x00" in cleaned:
-        msg = f"{tool} path must not contain a NUL byte"
-        raise ValueError(msg)
-    # Fold the well-known sandbox root: every tool description anchors paths at
-    # /workspace, so models routinely pass "/workspace/foo" — treat that as the
-    # workspace-relative "foo" instead of bouncing the call (a reject costs a
-    # whole recovery round). Only this exact root folds; any other absolute
-    # path (and any ``..`` that survives the fold) still rejects below, and the
-    # in-sandbox realpath re-check remains the actual escape boundary.
-    # B-50 —— ``shared:`` 是显式作用域前缀,不是路径的一部分。剥掉再校验,
-    # 校验完由 ``resolve_scope`` 重新识别;剥掉之后的余部它自己也再查一遍 ``..``。
-    prefix = ""
-    if cleaned.startswith(SHARED_PREFIX):
-        prefix, cleaned = SHARED_PREFIX, cleaned[len(SHARED_PREFIX) :].strip()
-        if not cleaned:
-            msg = f"{tool} requires a non-empty 'path'"
-            raise ValueError(msg)
-    # B-50 —— 先折**自己**那一段。``list_dir`` 现在回给模型的是 agent 根下的
-    # 相对名,但模型也会照着工具描述回传 ``/workspace/agents/<自己>/x``;不先折
-    # 这一段,下面的通用 ``/workspace/`` 折叠会留下 ``agents/<自己>/x``,再拼一次
-    # agent 根就成了 ``agents/<自己>/agents/<自己>/x``。
-    if not prefix and agent_key:
-        own = f"{agent_view_alias(agent_key)}/"
-        if cleaned == own.rstrip("/"):
-            cleaned = "."
-        elif cleaned.startswith(own):
-            cleaned = cleaned[len(own) :]
-    if cleaned in (EXEC_VIEW, EXEC_VIEW + "/"):
-        cleaned = "."
-    elif cleaned.startswith(EXEC_VIEW + "/"):
-        cleaned = cleaned[len(EXEC_VIEW) + 1 :]
-    if cleaned.startswith("/") or ".." in PurePosixPath(cleaned).parts:
-        msg = f"{tool} path must be a relative workspace path without '..': {raw!r}"
-        if _SKILLS_SEGMENT in raw:
-            msg += _SKILLS_PATH_HINT
-        raise ValueError(msg)
-    # B-50 —— ``agents/`` 是布局的保留段,绑了 agent 的调用一律不许拿它寻址。
-    # 不拒的话迁移期读回落正好把 ``agents/<别人的 key>/x`` 办成一次合法的跨 agent
-    # 读:自己根下找不到 → 回落用户根 → 不偏不倚命中别人的目录。这正是 B-50 要
-    # 关掉的那扇门,不能在开门的同一个 PR 里自己留一条缝。
-    # B-60 —— ``shared/`` 同样保留:视图里 /workspace/shared 是只读 bind(spec §4.3),裸
-    # 相对路径写进去是 EROFS、读则读到 legacy 区。要读就显式 ``shared:``,写一律不许。
-    if agent_key and not prefix:
-        head = PurePosixPath(cleaned).parts[:1]
-        if head == (AGENTS_DIR,):
-            msg = (
-                f"{tool} path must be relative to your own workspace; "
-                f"{AGENTS_DIR!r} is a reserved layout segment: {raw!r}"
-            )
-            raise ValueError(msg)
-        if head == (_SHARED_DIR_NAME,):
-            msg = (
-                f"{tool}: {_SHARED_DIR_NAME!r} is the read-only shared area — read it with "
-                f"the {SHARED_PREFIX!r} prefix; it is not a directory in your workspace: {raw!r}"
-            )
-            raise ValueError(msg)
-    return prefix + cleaned
+    target = resolve_workspace_path(raw, view=view, tool=tool)
+    return target
+
+
+def _refuse_notes_write_from_a_child(target: ResolvedPath, ctx: ToolContext, *, tool: str) -> None:
+    """B-236 第三层 —— 委派子代(worker / 静态子 Agent)不改 agent 的记忆索引。
+
+    照 B-122 的边界:子代不永久改变 Agent 自己。索引由主对话维护;子代该记下的,写进它的
+    最终回复,由主对话决定要不要记。只认 agent 根下那一个文件(``/agent/AGENT_NOTES.md``,
+    老视图里也就是相对路径 ``AGENT_NOTES.md``);对话自己目录里的同名文件不是索引。
+    """
+    if not ctx.child_run or target.kind == "shared":
+        return
+    if agent_relative(target, ctx.workspace_view) == AGENT_NOTES_FILE:
+        msg = (
+            f"{tool}: delegated runs cannot change /agent/{AGENT_NOTES_FILE} (this agent's "
+            "memory index); put what should be remembered in your final message instead."
+        )
+        raise ToolBlockedError(msg)
+
+
+def _store_scope(ws: str, ctx: ToolContext) -> str:
+    """解析结果的 ``ws`` → 宿主侧作用域,按本次调用的视图(B-236)。"""
+    view = ctx.workspace_view
+    return store_scope(
+        ws, agent_key=view.agent_key, conv_id=view.conv_id, thread_id=view.own_thread
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -741,15 +707,19 @@ def _raise_for_store_error(exc: SandboxSupervisorError, *, tool: str) -> NoRetur
 
     B-84 —— 读路径挪到宿主之后, 失败不再是沙箱片段打印的 ``{"ok": false, "error":
     ...}``, 而是 store 抛的异常。**模型看到的 kind 必须逐字不变**(``not_found`` /
-    ``is_a_directory`` / ``not_a_directory`` / ``file_too_large`` / ``io_error``, 越权
-    仍是 :class:`ToolBlockedError`), 所以这里按**类型**分叉, 不按消息文本 —— 文本
-    匹配是下一个人改一句文案就静默失效的那种判据。
+    ``is_a_directory`` / ``not_a_directory`` / ``file_too_large`` / ``io_error``;B-236 起
+    FIFO / 设备 / socket 是 ``not_a_regular_file``;越权仍是 :class:`ToolBlockedError`),
+    所以这里按**类型**分叉, 不按消息文本 —— 文本匹配是下一个人改一句文案就静默失效的那种判据。
 
     窄类型必须排在基类前面:它们都是 :class:`SandboxSupervisorError` 的子类。
     """
     if isinstance(exc, WorkspacePathEscapeError):
         msg = f"{tool}: path escapes the workspace"
         raise ToolBlockedError(msg) from exc
+    if isinstance(exc, WorkspaceNotARegularFileError):
+        # B-236 review 8 —— FIFO / 设备 / socket:不是目录,别让模型去 list_dir。
+        msg = f"{tool} failed: not_a_regular_file"
+        raise FileOpError(msg) from exc
     if isinstance(exc, WorkspaceNotAFileError):
         msg = f"{tool} failed: is_a_directory"
         raise FileOpError(msg) from exc
@@ -917,8 +887,8 @@ class ReadFileTool:
                 "when the result does not reach the end of the file, a note after "
                 "it gives the line range shown and the 'offset' to pass to read "
                 "on. Use 'offset' / 'limit' to read a specific range of lines. "
-                "Paths are relative to your own "
-                "workspace root. Files belonging to other agents working for "
+                + WORKSPACE_PATH_RULE
+                + " Files belonging to other agents working for "
                 "the same user are not reachable. Prefix a path with 'shared:' "
                 "to read the shared legacy area (read-only)."
             ),
@@ -927,7 +897,7 @@ class ReadFileTool:
                 "properties": {
                     "path": {
                         "type": "string",
-                        "description": "Workspace-relative file path (no leading '/' or '..').",
+                        "description": PATH_ARG_DESCRIPTION,
                     },
                     "offset": {
                         "type": "integer",
@@ -951,10 +921,10 @@ class ReadFileTool:
         )
 
     async def call(self, args: Mapping[str, Any], *, ctx: ToolContext) -> ToolResult:
-        raw = _require_path(args, tool="read_file", agent_key=ctx.agent_key)
+        target = _require_path(args, tool="read_file", view=ctx.workspace_view)
         offset = _optional_line_arg(args, "offset") or 1
         limit = _optional_line_arg(args, "limit")
-        ws, rel = resolve_scope(raw, agent_key=ctx.agent_key, tool="read_file")
+        ws, rel = target.ws, target.rel
         if not PurePosixPath(rel).parts:
             # ``/workspace`` 折成 ``.`` —— 指的是作用域根, 一个目录。沙箱片段过去
             # 在这里回 ``is_a_directory``, 保住同一个 kind:宿主侧的归一化会把 ``.``
@@ -968,7 +938,7 @@ class ReadFileTool:
                 tenant_id=tenant_id,
                 user_id=user_id,
                 path=rel,
-                scope=store_scope(ws, agent_key=ctx.agent_key),
+                scope=_store_scope(ws, ctx),
                 max_bytes=_MAX_READ_BYTES,
             )
         except SandboxSupervisorError as exc:
@@ -1016,8 +986,8 @@ class WriteFileTool:
                 "workspace. The write is atomic and replaces the whole file. To "
                 "change part of an existing file, use edit_file instead (several "
                 "changes fit in one call). "
-                "Paths are relative to your own workspace root; parent "
-                "directories are created. Writing to 'shared:' is refused — "
+                + WORKSPACE_PATH_RULE
+                + " Parent directories are created. Writing to 'shared:' is refused — "
                 "that area is read-only."
             ),
             parameters={
@@ -1025,7 +995,7 @@ class WriteFileTool:
                 "properties": {
                     "path": {
                         "type": "string",
-                        "description": "Workspace-relative file path (no leading '/' or '..').",
+                        "description": PATH_ARG_DESCRIPTION,
                     },
                     "content": {
                         "type": "string",
@@ -1041,9 +1011,10 @@ class WriteFileTool:
         )
 
     async def call(self, args: Mapping[str, Any], *, ctx: ToolContext) -> ToolResult:
-        raw = _require_path(args, tool="write_file", agent_key=ctx.agent_key)
+        target = _require_path(args, tool="write_file", view=ctx.workspace_view)
+        _refuse_notes_write_from_a_child(target, ctx, tool="write_file")
         # 写永不回落 —— 新内容一律落自己的目录,从第一天起就分好。
-        ws, rel = resolve_scope(raw, agent_key=ctx.agent_key, tool="write_file")
+        ws, rel = target.ws, target.rel
         content = args.get("content")
         if not isinstance(content, str):
             msg = "write_file requires a 'content' string"
@@ -1094,8 +1065,9 @@ class ListDirTool:
             name="list_dir",
             description=(
                 "List the entries of a directory in your own workspace "
-                "(name, is_dir, size). Paths are relative to your own workspace "
-                "root and default to it. Files belonging to other agents working "
+                "(name, is_dir, size). The path defaults to /workspace. "
+                + WORKSPACE_PATH_RULE
+                + " Files belonging to other agents working "
                 "for the same user are not listed here. Prefix a path with "
                 "'shared:' to list the shared legacy area (read-only)."
             ),
@@ -1104,7 +1076,10 @@ class ListDirTool:
                 "properties": {
                     "path": {
                         "type": "string",
-                        "description": "Workspace-relative directory path; defaults to '.'.",
+                        "description": (
+                            "Directory path relative to /workspace, or under /agent/; "
+                            "defaults to '.'."
+                        ),
                     },
                 },
             },
@@ -1115,17 +1090,22 @@ class ListDirTool:
         )
 
     async def call(self, args: Mapping[str, Any], *, ctx: ToolContext) -> ToolResult:
-        raw = _require_path(args, tool="list_dir", default=".", agent_key=ctx.agent_key)
-        ws, rel = resolve_scope(raw, agent_key=ctx.agent_key, tool="list_dir")
+        target = _require_path(args, tool="list_dir", default=".", view=ctx.workspace_view)
+        ws, rel = target.ws, target.rel
         tenant_id, user_id = _require_workspace_binding(ctx, tool="list_dir")
         try:
             listing = await self.store.list_dir(
                 tenant_id=tenant_id,
                 user_id=user_id,
-                scope=store_scope(ws, agent_key=ctx.agent_key),
+                scope=_store_scope(ws, ctx),
                 path=rel,
                 max_entries=_MAX_LIST_ENTRIES,
             )
+        except MISSING_DIR_ERRORS as exc:
+            if target.kind != "conversation" or rel != ".":
+                _raise_for_store_error(exc, tool="list_dir")
+            # B-236 —— 新对话的目录要等第一次 exec 才建出来;它的根是空的,不是「不存在」。
+            listing = WorkspaceDirListing(entries=(), truncated=False)
         except SandboxSupervisorError as exc:
             _raise_for_store_error(exc, tool="list_dir")
         # 渲染与 meta 的形状与 B-84 之前逐字相同 —— 改的是实现与失败率,
@@ -1169,9 +1149,10 @@ class SearchFilesTool:
                 "workspace-relative path (e.g. '*.py', 'style/*.md'); 'content' "
                 "is a plain substring searched inside text files (binary files "
                 "are skipped). Give at least one of them; giving both means "
-                "name matches AND content contains. Results are file paths "
-                "relative to your own workspace root - pass one straight to "
-                "read_file."
+                "name matches AND content contains. Searches /workspace and "
+                "/agent: results under /workspace are relative paths, results "
+                "under /agent start with /agent/ - pass one straight to "
+                "read_file. " + WORKSPACE_PATH_RULE
             ),
             parameters={
                 "type": "object",
@@ -1197,21 +1178,38 @@ class SearchFilesTool:
         if name_glob is None and content is None:
             msg = "search_files requires 'name_glob' and/or 'content'"
             raise ValueError(msg)
-        # 作用域与 list_dir 完全一致 —— 同一个起点解析, 不另写一份。``.`` 是
-        # "本作用域根", search 没有 path 参数, 搜的就是整个作用域。
-        ws, _rel = resolve_scope(".", agent_key=ctx.agent_key, tool="search_files")
         tenant_id, user_id = _require_workspace_binding(ctx, tool="search_files")
-        try:
-            found = await self.store.search_files(
-                tenant_id=tenant_id,
-                user_id=user_id,
-                scope=store_scope(ws, agent_key=ctx.agent_key),
-                name_glob=name_glob,
-                content=content,
-                max_results=self.max_results,
-            )
-        except SandboxSupervisorError as exc:
-            _raise_for_store_error(exc, tool="search_files")
+        # 作用域与 list_dir 完全一致 —— search 没有 path 参数, 搜的是 ``/workspace`` 整个
+        # 作用域;B-236 对话视图里再搜一遍 ``/agent``(该 agent 各对话共用的那一份),
+        # 那边的命中带 ``/agent/`` 前缀, 原样能交给 read_file。
+        searches = [(_store_scope(EXEC_VIEW, ctx), "")]
+        if ctx.workspace_view.per_conversation:
+            searches.append((_store_scope(AGENT_VIEW, ctx), f"{AGENT_VIEW}/"))
+        hits: list[WorkspaceFileEntry] = []
+        truncated = too_deep = False
+        for scope, prefix in searches:
+            if len(hits) >= self.max_results:
+                truncated = True
+                break
+            try:
+                found = await self.store.search_files(
+                    tenant_id=tenant_id,
+                    user_id=user_id,
+                    scope=scope,
+                    name_glob=name_glob,
+                    content=content,
+                    max_results=self.max_results - len(hits),
+                )
+            except MISSING_DIR_ERRORS as exc:
+                if prefix or not ctx.workspace_view.per_conversation:
+                    _raise_for_store_error(exc, tool="search_files")
+                continue  # 新对话的目录还没建出来 = 里面什么都没有
+            except SandboxSupervisorError as exc:
+                _raise_for_store_error(exc, tool="search_files")
+            hits.extend(replace(e, path=f"{prefix}{e.path}") for e in found.entries)
+            truncated = truncated or found.truncated
+            too_deep = too_deep or found.too_deep
+        found = WorkspaceSearchResult(entries=tuple(hits), truncated=truncated, too_deep=too_deep)
         return ToolResult(
             content=_format_search(found),
             meta={
@@ -1220,6 +1218,7 @@ class SearchFilesTool:
                 "paths": [entry.path for entry in found.entries],
                 "n_results": len(found.entries),
                 "truncated": found.truncated,
+                "too_deep": found.too_deep,
             },
         )
 
@@ -1247,13 +1246,19 @@ def _format_search(found: WorkspaceSearchResult) -> str:
     """Human-readable search result for the LLM.
 
     截断时**明说还有多少没列出**, 不静悄悄少几行 —— 一个被悄悄截断的列表会被读成
-    "就这些了", 而那正是 B-84 要治的误判形态。
+    "就这些了", 而那正是 B-84 要治的误判形态。B-236 review 10 —— 有目录太深没搜(``too_deep``)
+    单独一行说,零命中时也说:那时的「没找到」不等于「没有」。
     """
-    if not found.entries:
-        return "(no matching files)"
     lines = [f"{entry.path}  ({entry.size} bytes)" for entry in found.entries]
+    if not lines:
+        lines.append("(no matching files)")
     if found.truncated:
         lines.append(f"... (more matches not listed; showing the first {len(found.entries)})")
+    if found.too_deep:
+        lines.append(
+            "... (some directories are nested too deep to search; files below that depth "
+            "were not searched)"
+        )
     return "\n".join(lines)
 
 
@@ -1348,15 +1353,16 @@ class EditFileTool:
                 "occurrence is replaced). If an 'old_string' isn't found exactly, a "
                 "whitespace-tolerant line-block match is attempted (ignores indent / "
                 "trailing-space drift; that fallback normalizes line endings to LF "
-                "unless the file is uniformly CRLF). Paths are relative to your own "
-                "workspace root; editing 'shared:' is refused — that area is read-only."
+                "unless the file is uniformly CRLF). "
+                + WORKSPACE_PATH_RULE
+                + " Editing 'shared:' is refused — that area is read-only."
             ),
             parameters={
                 "type": "object",
                 "properties": {
                     "path": {
                         "type": "string",
-                        "description": "Workspace-relative file path (no leading '/' or '..').",
+                        "description": PATH_ARG_DESCRIPTION,
                     },
                     "edits": {
                         "type": "array",
@@ -1398,10 +1404,11 @@ class EditFileTool:
         )
 
     async def call(self, args: Mapping[str, Any], *, ctx: ToolContext) -> ToolResult:
-        raw = _require_path(args, tool="edit_file", agent_key=ctx.agent_key)
+        target = _require_path(args, tool="edit_file", view=ctx.workspace_view)
+        _refuse_notes_write_from_a_child(target, ctx, tool="edit_file")
         # 写永不回落(edit 也改字节)——「读得到 legacy」不等于「可以就地改它」:
         # 那会把一份归属不明的文件悄悄变成本 agent 的既成事实。
-        ws, rel = resolve_scope(raw, agent_key=ctx.agent_key, tool="edit_file")
+        ws, rel = target.ws, target.rel
         edits = _parse_edits(args)
         expected, hash_ignored = _expected_hash(args.get("expected_hash"))
         # Stream TE-8 — lock scopes to the run's user (durable workspace that
@@ -1470,7 +1477,7 @@ class SandboxWorkspaceWriter:
         in ``agent_factory`` (CM-0 plan/state projection opt-in)."""
         outcome = await run_in_sandbox(
             self.client,
-            code=build_write_wrapper(rel, content),
+            code=build_write_wrapper(rel, content, ws=_INTERNAL_ROOT),
             timeout_s=None,
             ctx=self.ctx,
             tool_label="workspace_projection",
@@ -1492,7 +1499,7 @@ class SandboxWorkspaceWriter:
         fails the read, and the projector leaves it alone."""
         outcome = await run_in_sandbox(
             self.client,
-            code=build_read_wrapper(rel, cap=_MAX_READ_BYTES),
+            code=build_read_wrapper(rel, cap=_MAX_READ_BYTES, ws=_INTERNAL_ROOT),
             timeout_s=None,
             ctx=self.ctx,
             tool_label="workspace_projection",
@@ -1527,7 +1534,7 @@ class SandboxWorkspaceReader:
         # existence stays gated by the manifest flag in agent_factory (CM-0).
         outcome = await run_in_sandbox(
             self.client,
-            code=build_read_wrapper(rel, cap=DEFAULT_OUTPUT_CHAR_CAP),
+            code=build_read_wrapper(rel, cap=DEFAULT_OUTPUT_CHAR_CAP, ws=_INTERNAL_ROOT),
             timeout_s=None,
             ctx=self.ctx,
             tool_label="workspace_ingest",
