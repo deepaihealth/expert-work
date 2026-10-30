@@ -441,8 +441,10 @@ async def workspace_prompt_block(
             e.path for e in conversation if is_pristine_seed_copy(manifest, e.path, e)
         ),
         manifest=frozenset(manifest),
-        # 条数到了存储的上限 = 可能截断了(恰好 2000 条也按截断算,宁可多展开)。
-        listing_truncated=len(conversation) >= _nws._MAX_LIST_ENTRIES,
+        # 条数到了存储的上限 = 可能截断了(恰好 2000 条也按截断算,宁可多展开);有目录太深没列
+        # (review 11)同样按截断算 —— 两种情况下都可能有新写的文件没在清单里。
+        listing_truncated=len(conversation) >= _nws._MAX_LIST_ENTRIES
+        or bool(getattr(conversation, "too_deep", False)),
         seed_skipped=seed_skipped,
         seed_quota_blocked=seed_quota_blocked,
         seed_skipped_more=seed_skipped_more,

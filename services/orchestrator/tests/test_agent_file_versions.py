@@ -499,30 +499,161 @@ async def test_the_depth_limit_does_not_start_the_missing_clock(
     assert list(_versions_root(tmp_path).rglob("missing")) == []
 
 
-async def test_versions_of_deleted_sources_go_before_old_versions_of_live_files(
+async def test_a_deleted_file_keeps_its_newest_version_while_a_big_file_churns(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """review 10 —— 收回预算时先删源文件已不见的(最新那份也删),活文件的旧版本留到后面。"""
+    """review 11(probe_versions 的形状)—— 一次 run 删了 customers.md、同时大文件照常重写:
+    这一次观察里 customers.md 最新那份还在(按 rank 删,大文件先让出自己的旧版本)。"""
     monkeypatch.setattr(versions_mod, "MAX_AGENT_VERSION_BYTES", 10_000)
     agent = _agent(tmp_path)
-    live = agent / "live.md"
-    for i in range(3):
-        _put(live, f"{i}".ljust(2_000, "l"))
-        os.utime(live, ns=(i * 10**9 + 1, i * 10**9 + 1))
+    customers = agent / "customers.md"
+    for i in range(5):
+        _put(customers, f"customer notes v{i}".ljust(200, "."))
         await _observe(tmp_path)
-        await asyncio.sleep(0.01)
-    gone = _put(agent / "gone.md", "g" * 3_000)
-    await _observe(tmp_path)
-    gone.unlink()
-    await _observe(tmp_path)  # 记下「不见」
-    _put(agent / "new.md", "n" * 2_500)
+    big = agent / "data.xlsx"
+    for r in range(8):
+        _put(big, f"{r}".ljust(2_000, "x"))
+        await _observe(tmp_path)
+    customers.unlink()
+    _put(big, "bad".ljust(2_000, "x"))
 
     await _observe(tmp_path)
 
     assert _agent_version_bytes(tmp_path) <= 10_000
-    kept = _history(tmp_path)
-    assert "gone.md" not in kept or kept["gone.md"] == []
-    assert len(kept["live.md"]) == 3  # 活文件的历史一份没动
+    assert _history(tmp_path)["customers.md"][-1].startswith("customer notes v4")
+
+
+async def test_the_index_keeps_its_good_version_through_a_bad_run_under_churn(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """review 11(probe_versions2 的形状)—— 大文件每轮重写把预算顶满,坏的一轮覆盖了索引:
+    好的那几份(最新 3 份之内)都还在。"""
+    monkeypatch.setattr(versions_mod, "MAX_AGENT_VERSION_BYTES", 10_000)
+    agent = _agent(tmp_path)
+    notes = agent / "AGENT_NOTES.md"
+    for i in range(3):
+        _put(notes, f"GOOD index v{i}".ljust(300, "."))
+        await _observe(tmp_path)
+    big = agent / "data.xlsx"
+    for r in range(8):
+        _put(big, f"{r}".ljust(4_000, "x"))
+        await _observe(tmp_path)
+    _put(notes, "BAD overwrite")
+    _put(big, "bad".ljust(4_000, "x"))
+
+    await _observe(tmp_path)
+
+    kept = _history(tmp_path)["AGENT_NOTES.md"]
+    assert kept[-1] == "BAD overwrite"
+    assert [v[:12] for v in kept[-3:-1]] == ["GOOD index v", "GOOD index v"]
+    assert kept[-2].startswith("GOOD index v2")
+
+
+async def test_a_hostile_rename_of_the_index_does_not_evict_its_history(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """review 11(exp_history_eviction 的形状)—— 一次 run 把索引改名成点开头的名字(遍历照样
+    「完整」)再写一堆垃圾:这一次索引仍按活文件护着,最新几份都在。"""
+    monkeypatch.setattr(versions_mod, "MAX_AGENT_VERSION_BYTES", 10_000)
+    agent = _agent(tmp_path)
+    notes = agent / "AGENT_NOTES.md"
+    for i in range(5):
+        _put(notes, f"good notes v{i}".ljust(100, "."))
+        await _observe(tmp_path)
+    static = agent / "static.bin"
+    for i in range(2):
+        _put(static, f"{i}".ljust(3_000, "s"))
+        await _observe(tmp_path)
+    notes.rename(agent / ".hidden")
+    _put(agent / "junk.bin", "j" * 3_950)
+
+    await _observe(tmp_path)
+
+    assert _history(tmp_path)["AGENT_NOTES.md"][-1].startswith("good notes v4")
+
+
+async def test_one_item_that_does_not_fit_does_not_block_later_ones(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """review 11 —— 放不下的那一份跳过,后面放得下的照写(之前整个停下,真改动跟着丢)。"""
+    monkeypatch.setattr(versions_mod, "MAX_AGENT_VERSION_BYTES", 10_000)
+    agent = _agent(tmp_path)
+    a = _put(agent / "a.md", "a" * 6_000)
+    os.utime(a, ns=(10**9, 10**9))
+    x = _put(agent / "x.md", "good-0".ljust(1_000, "."))
+    os.utime(x, ns=(2 * 10**9, 2 * 10**9))
+    await _observe(tmp_path)
+    now = time.time_ns()
+    _put(x, "GOOD-1".ljust(1_000, "."))
+    os.utime(x, ns=(now, now))
+    b = _put(agent / "b.md", "b" * 4_000)  # 更新,排在前面,放不下
+    os.utime(b, ns=(now + 10**9, now + 10**9))
+
+    report = await _observe(tmp_path)
+
+    assert report.over_budget is True
+    assert [v[:6] for v in _history(tmp_path)["x.md"]] == ["good-0", "GOOD-1"]
+    assert "b.md" not in _history(tmp_path)
+
+
+async def test_another_agent_rewriting_one_file_never_touches_this_agents_versions(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """review 11(test_r11_isolation_probe 的加强版)—— A 反复重写一个文件,B 的版本一份不少。
+    B 的旧版本 rank 比 A 的高:预算要是跨 agent 算,先删的就是 B 的。"""
+    monkeypatch.setattr(versions_mod, "MAX_AGENT_VERSION_BYTES", 10_000)
+    notes = _agent_dir(tmp_path, "b-agent") / "AGENT_NOTES.md"
+    for i in range(6):
+        _put(notes, f"good notes v{i}")
+        os.utime(notes, ns=(i * 10**9 + 1, i * 10**9 + 1))
+        await _observe_key(tmp_path, "b-agent")
+    big = _agent_dir(tmp_path, "a-agent") / "big.bin"
+    for r in range(8):
+        _put(big, f"{r}".ljust(3_000, "x"))
+        await _observe_key(tmp_path, "a-agent")
+
+    assert _version_count(tmp_path, "b-agent") == 6
+
+
+async def test_over_budget_is_logged_with_tenant_and_user(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """review 11 —— 运维要知道是谁:告警带租户与用户 id。"""
+    monkeypatch.setattr(versions_mod, "MAX_AGENT_VERSION_BYTES", 1_000)
+    _put(_agent(tmp_path) / "big.md", "b" * 5_000)
+    caplog.set_level("WARNING", logger=versions_mod.__name__)
+
+    await versions_mod._observe_logged(_store(tmp_path), _TENANT, _USER, _KEY)
+
+    line = next(r.getMessage() for r in caplog.records if "over_budget" in r.getMessage())
+    assert f"tenant_id={_TENANT}" in line and f"user_id={_USER}" in line
+
+
+async def test_the_dir_cap_spares_fresh_empty_dirs_and_survives_a_racing_writer(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """review 11 —— 目录数封顶不删刚建、还没写进版本的目录(另一次观察正要写);删目录撞上
+    ``ENOTEMPTY`` 只跳过那一个,整次观察照常结束。"""
+    import errno
+
+    agent = _agent(tmp_path)
+    for i in range(3):
+        _put(agent / f"f{i}.md", f"{i}")
+    await _observe(tmp_path)
+    fresh = _versions_root(tmp_path) / _KEY / ("f" * 32)
+    fresh.mkdir()
+    monkeypatch.setattr(versions_mod, "MAX_VERSION_DIRS_PER_AGENT", 3)
+
+    await _observe(tmp_path)
+    assert fresh.exists()  # 多出来的那个删的是别的,不是刚建的空目录
+
+    def racing_rmtree(*args: Any, **kwargs: Any) -> None:
+        raise OSError(errno.ENOTEMPTY, "Directory not empty")
+
+    monkeypatch.setattr(versions_mod.shutil, "rmtree", racing_rmtree)
+    _put(agent / "f9.md", "9")
+    report = await _observe(tmp_path)  # 不抛
+    assert report.snapshotted >= 1  # f9.md(还有上一次被封顶删掉、这次重新留的那个)
 
 
 def test_the_budget_never_deletes_the_newest_version_of_a_live_file(
@@ -583,3 +714,88 @@ async def test_a_recent_edit_beats_older_touched_files_for_the_budget(
         _put(tpl, f"v{r}")  # 真改动,mtime = 现在
         await _observe(tmp_path)
         assert _history(tmp_path)["tpl/t.md"][-1] == f"v{r}"
+
+
+# ---------------------------------------------------------------------------
+# review 11 —— 按 rank 删、每个文件公平:各条规则各钉一条
+# ---------------------------------------------------------------------------
+
+
+async def test_a_churning_big_file_gives_up_its_own_old_versions_first(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """同 rank 才比大小:小文件的第 5 新与大文件的第 5 新相比,先删大的;小文件只让出比大文件
+    rank 更高的那几份(不是「最早写下的先删」把小文件的历史整个冲掉)。"""
+    monkeypatch.setattr(versions_mod, "MAX_AGENT_VERSION_BYTES", 10_000)
+    agent = _agent(tmp_path)
+    small = agent / "s.md"
+    for i in range(6):
+        _put(small, f"s{i}".ljust(100, "."))
+        await _observe(tmp_path)
+    big = agent / "big.bin"
+    for r in range(10):
+        _put(big, f"{r}".ljust(2_000, "x"))
+        await _observe(tmp_path)
+        assert _agent_version_bytes(tmp_path) <= 10_000
+
+    assert len(_history(tmp_path)["s.md"]) == 5
+
+
+async def test_a_live_file_keeps_two_versions_and_a_misfit_is_skipped(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """活文件最新 2 份受保护:新文件放进来要删到 1 份才放得下,就不放(记 over_budget)。"""
+    monkeypatch.setattr(versions_mod, "MAX_AGENT_VERSION_BYTES", 10_000)
+    agent = _agent(tmp_path)
+    a = agent / "a.md"
+    for i in range(3):
+        _put(a, f"{i}".ljust(3_000, "a"))
+        await _observe(tmp_path)
+    _put(agent / "b.md", "b" * 4_500)
+
+    report = await _observe(tmp_path)
+
+    assert report.over_budget is True
+    assert "b.md" not in _history(tmp_path)
+    assert len(_history(tmp_path)["a.md"]) >= 2
+
+
+async def test_the_live_index_keeps_three_versions(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """活的索引最新 3 份受保护:新文件放进来要删到 2 份才放得下,就不放。"""
+    monkeypatch.setattr(versions_mod, "MAX_AGENT_VERSION_BYTES", 10_000)
+    agent = _agent(tmp_path)
+    notes = agent / "AGENT_NOTES.md"
+    for i in range(4):
+        _put(notes, f"{i}".ljust(2_000, "n"))
+        await _observe(tmp_path)
+    _put(agent / "c.md", "c" * 4_500)
+
+    await _observe(tmp_path)
+
+    assert len(_history(tmp_path)["AGENT_NOTES.md"]) >= 3
+
+
+async def test_the_longest_missing_file_loses_its_last_version_first(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """源文件已不见的最新那份最后才删,其中不见得最久的先删(不是先删大的)。"""
+    monkeypatch.setattr(versions_mod, "MAX_AGENT_VERSION_BYTES", 10_000)
+    agent = _agent(tmp_path)
+    for name, size in (("m1.md", 1_000), ("m2.md", 2_000)):
+        f = _put(agent / name, name[:2] * (size // 2))
+        await _observe(tmp_path)
+        f.unlink()
+        await _observe(tmp_path)  # 记下「不见」
+    base = _versions_root(tmp_path) / _KEY
+    for d in base.iterdir():
+        age = 7_200 if (d / "path").read_text() == "m1.md" else 3_600
+        os.utime(d / "missing", (time.time() - age, time.time() - age))
+    _put(agent / "live.bin", "l" * 7_500)
+
+    await _observe(tmp_path)
+
+    kept = _history(tmp_path)
+    assert kept.get("m1.md", []) == []
+    assert len(kept["m2.md"]) == 1

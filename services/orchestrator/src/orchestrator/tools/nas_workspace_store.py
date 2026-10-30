@@ -196,6 +196,7 @@ from orchestrator.tools.workspace_store import (
     WorkspaceDirEntry,
     WorkspaceDirListing,
     WorkspaceFileEntry,
+    WorkspaceFileListing,
     WorkspaceSearchResult,
 )
 
@@ -591,8 +592,8 @@ def _walk_and_match(
                     # 连走都不走进去:别的对话的文件不该出现在任何一条结果里。
                     dirnames[:] = [d for d in dirnames if d not in hidden]
                 if dirnames and _walk_depth(dirpath) >= MAX_WALK_DEPTH:
-                    # review 9 —— 再往下不走:fwalk 每深一层多握一个目录 fd。结果标成截断
-                    # (不在这里置 ``truncated``:那会让整个遍历在这一层就停,别的分支也不搜了)。
+                    # review 9 —— 再往下不走:fwalk 每深一层多握一个目录 fd。结果标成 ``too_deep``
+                    # (review 10 起与 ``truncated`` 分开;也不在这里停整个遍历,别的分支照搜)。
                     dirnames[:] = []
                     too_deep = True
                 for name in sorted(filenames):
@@ -1139,7 +1140,7 @@ class NasWorkspaceStore:
         也不列 ``.seeded`` 标记;先剔再截 2000 条。``include_seed_copies=True`` 照旧全列(工作区
         快照段要拿两份清单的差认出副本)。"""
 
-        def _list() -> list[WorkspaceFileEntry]:
+        def _list() -> WorkspaceFileListing:
             # B-84 —— 作用域只改**起点**, 不改走路的方式。遍历的根从用户根挪到
             # ``{user_root}/agents/<key>`` 之类, 其余一个字不动;``scope_parts``
             # 已经把 agent_key 过了同一道安全闸, 这里拼的每一段都是校验过的。
@@ -1181,7 +1182,7 @@ class NasWorkspaceStore:
             try:
                 dfd = self._open_scope_dir_fd(tenant_id, user_id, "/".join(prefix))
             except _WorkspacePathNotFoundError:
-                return []
+                return WorkspaceFileListing()
             entries: list[WorkspaceFileEntry] = []
             hidden = scope_hidden_heads(scope)
             # fwalk + follow_symlinks=False —— 见模块 docstring:子目录先 lstat 再
@@ -1234,7 +1235,7 @@ class NasWorkspaceStore:
                 manifests = self._seed_manifests(tenant_id, user_id, prefix, entries, marker_dirs)
                 entries = _drop_seed_copies(prefix, entries, manifests)
             entries.sort(key=lambda entry: entry.path)
-            return entries[:_MAX_LIST_ENTRIES]
+            return WorkspaceFileListing(entries[:_MAX_LIST_ENTRIES], too_deep=too_deep)
 
         return await asyncio.to_thread(_list)
 

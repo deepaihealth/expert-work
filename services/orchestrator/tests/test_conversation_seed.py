@@ -908,3 +908,20 @@ async def test_the_seed_node_reports_unnamed_skipped_dirs(
 
     assert len(update["seed_skipped_dirs"]) == seed_mod.MAX_REPORTED_DIRS
     assert update["seed_skipped_more"] > 0
+
+
+async def test_the_block_never_collapses_when_the_listing_hit_the_depth_cap(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """review 11 —— 有目录太深没列:没列到的文件里可能就有新写的,同截断一样什么都不收成一行。"""
+    from orchestrator.tools import nas_workspace_store as nws
+
+    _put(_agent(tmp_path) / "customers" / "c.md", "c")
+    store = NasWorkspaceStore(root=str(tmp_path))
+    seed_mod.seed_conversation_sync(store, _TENANT, _USER, _KEY, _C1)
+    _put(_work(tmp_path) / "customers" / "a" / "b" / "c" / "new.md", "model output")
+    monkeypatch.setattr(nws, "MAX_WALK_DEPTH", 2)
+
+    _listed, ours = await _views(tmp_path)
+
+    assert "unchanged copy" not in ours

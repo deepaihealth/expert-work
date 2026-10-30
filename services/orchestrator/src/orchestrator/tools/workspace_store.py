@@ -22,7 +22,7 @@ in every method name added nothing.
 from __future__ import annotations
 
 import logging
-from collections.abc import AsyncIterator, Mapping, Sequence
+from collections.abc import AsyncIterator, Iterable, Mapping, Sequence
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -107,6 +107,21 @@ class WorkspaceDirListing:
 
     entries: tuple[WorkspaceDirEntry, ...]
     truncated: bool
+
+
+class WorkspaceFileListing(list[WorkspaceFileEntry]):
+    """``list_files`` 的结果(就是条目列表),外加 NAS 实现能给的一个旁注(B-236 review 11):
+
+    ``too_deep`` —— 有目录比遍历深度上限还深、下面的文件没列。工作区快照段据此不把任何目录说成
+    「未改动的副本」(同条目上限截断)。别的实现回普通 ``list``,读的一方用
+    ``getattr(listing, "too_deep", False)``。
+    """
+
+    def __init__(
+        self, entries: Iterable[WorkspaceFileEntry] = (), *, too_deep: bool = False
+    ) -> None:
+        super().__init__(entries)
+        self.too_deep = too_deep
 
 
 @dataclass(frozen=True)

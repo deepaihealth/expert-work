@@ -596,6 +596,18 @@ async def purge_user(
         summary.workspace_marked_deleted = "workspace" not in summary.failures
     else:
         summary.failures["workspace"] = "no supervisor client wired"
+    # B-236 review 11 —— 软删标记落下之后再删一遍 ``/agent`` 文件的版本:上面第一遍删完到标记落下
+    # 之间结束的 run,它的观察看不到标记,会把 ``.agent-file-versions/{user}`` 又建回来。标记落下
+    # 之后结束的 run 看到标记就不观察,所以这一遍之后不会再长出来。
+    if deps.agent_file_versions is not None:
+        summary.deleted["agent_file_version"] = summary.deleted.get(
+            "agent_file_version", 0
+        ) + await _step(
+            summary,
+            "agent_file_version_after_mark",
+            deps.agent_file_versions.delete_all_for_user(tenant_id=tenant_id, user_id=user_id),
+            default=0,
+        )
 
     # 5) Identity — soft-deactivate the tenant_user row (kept, recoverable).
     summary.deactivated = await _step(
