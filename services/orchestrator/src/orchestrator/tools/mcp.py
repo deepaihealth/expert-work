@@ -43,7 +43,7 @@ import json
 import logging
 import re
 import time
-from collections.abc import Callable, Collection, Mapping, Sequence
+from collections.abc import Awaitable, Callable, Collection, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from typing import Any, Literal, Protocol, runtime_checkable
 
@@ -647,6 +647,11 @@ class StdioMCPClient:
             await stack.__aexit__(None, None, None)
 
 
+#: Cap on closing a retired client's one-shot session (seconds; the budget is
+#: ``min(timeout_s, cap)``). Past it the transport is cancelled, not awaited.
+_ONE_SHOT_CLOSE_CAP_S = 5.0
+
+
 @dataclass
 class _RemoteMCPClientBase:
     """Shared scaffolding for :class:`SseMCPClient` /
@@ -669,6 +674,16 @@ class _RemoteMCPClientBase:
     #: BUG-17 — serialises :meth:`_restart` so N concurrent callers hitting
     #: one dead session reconnect exactly once.
     _restart_lock: asyncio.Lock = field(default_factory=asyncio.Lock, init=False, repr=False)
+    #: Set by :meth:`retire` (pool TTL expiry). Cached ``BuiltAgent``s and
+    #: in-flight runs keep ``MCPTool``s bound to this object after the pool
+    #: drops it (prod 2026-10-30: every call failed "not started" for up to
+    #: 30 min), so a retired client serves each call on a one-shot session and
+    #: nothing long-lived outlives the pool. :meth:`close` clears it again.
+    _retired: bool = field(default=False, init=False, repr=False)
+    _retired_logged: bool = field(default=False, init=False, repr=False)
+    #: Set by :meth:`close` (invalidation, shutdown): a hard stop — later
+    #: calls fail "not started" and a later :meth:`retire` cannot revive it.
+    _closed: bool = field(default=False, init=False, repr=False)
 
     def __post_init__(self) -> None:
         self._breaker = MCPCircuitBreaker(server=self.config.name)
@@ -698,11 +713,58 @@ class _RemoteMCPClientBase:
 
         return await _open_owned_session(_open)
 
+    def _not_started(self) -> RuntimeError:
+        return RuntimeError(f"{type(self).__name__} {self.config.name!r} not started")
+
     def _require_session(self) -> Any:
         if self._session is None:
-            msg = f"{type(self).__name__} {self.config.name!r} not started"
-            raise RuntimeError(msg)
+            raise self._not_started()
         return self._session
+
+    async def _one_shot(self, op: Callable[[Any], Awaitable[Any]]) -> Any:
+        """Run ``op(session)`` on a fresh session of a retired client.
+
+        Open + initialize + ``op`` share one ``timeout_s`` deadline (raises
+        ``TimeoutError``): unlike a live call, the deadline also covers the
+        connect and the ``initialize`` handshake, so a server stuck before
+        answering ``initialize`` cannot hang the run. A ``close()`` that lands
+        during the handshake stops the call before ``op`` reaches the server.
+        The session is then closed on its own short, suppressed budget: a slow
+        teardown never fails a finished call.
+        """
+        if not self._retired_logged:
+            self._retired_logged = True
+            logger.info(
+                "mcp.retired_client_call server=%s transport=%s",
+                self.config.name,
+                self.config.transport,
+            )
+        stack: _OwnedSession | None = None
+        try:
+            async with asyncio.timeout(self.config.timeout_s):
+                stack, session = await self._open_session()
+                if self._closed:
+                    # Invalidation / shutdown hard-stopped the client mid-handshake.
+                    raise self._not_started()
+                return await op(session)
+        finally:
+            if stack is not None:
+                await self._close_one_shot(stack)
+
+    async def _close_one_shot(self, stack: _OwnedSession) -> None:
+        # On timeout, wait_for cancels the owner task, which unwinds the
+        # transport; only the error type is logged (no URL / tenant data).
+        try:
+            await asyncio.wait_for(
+                stack.__aexit__(None, None, None),
+                timeout=min(self.config.timeout_s, _ONE_SHOT_CLOSE_CAP_S),
+            )
+        except Exception as exc:
+            logger.warning(
+                "mcp.retired_session_close_failed server=%s err=%s",
+                self.config.name,
+                type(exc).__name__,
+            )
 
     async def _restart(self, failed_session: Any) -> None:
         """BUG-17 — tear down the dead transport and reconnect in place.
@@ -736,22 +798,40 @@ class _RemoteMCPClientBase:
             )
 
     async def list_tools(self) -> Sequence[MCPToolDef]:
-        session = self._require_session()
         try:
-            result = await session.list_tools()
+            result = await self._list_tools_raw()
+        except TimeoutError as exc:
+            msg = f"mcp list_tools timed out after {self.config.timeout_s}s on {self.config.name!r}"
+            raise MCPCallTimeoutError(msg) from exc
+        return _materialize_tool_defs(result.tools, server=self.config.name)
+
+    async def _list_tools_raw(self) -> Any:
+        # Every path is bounded by ``timeout_s``: the SDK never fails a request
+        # whose session was torn down underneath it (``retire`` / ``close``).
+        # ``None`` = retired (pool TTL expiry): served on a one-shot session.
+        session = None if self._retired else self._require_session()
+        if session is None:
+            return await self._one_shot(lambda one_shot: one_shot.list_tools())
+        try:
+            return await asyncio.wait_for(session.list_tools(), timeout=self.config.timeout_s)
         except (anyio.BrokenResourceError, anyio.ClosedResourceError):
             # list_tools is read-only and idempotent — safe to retry after
-            # send- OR receive-side stream death (BUG-17).
+            # send- OR receive-side stream death (BUG-17), on a one-shot
+            # session when retire() tore the live one down meanwhile.
             await self._restart(session)
-            result = await self._require_session().list_tools()
-        return _materialize_tool_defs(result.tools, server=self.config.name)
+            if self._retired:
+                return await self._one_shot(lambda one_shot: one_shot.list_tools())
+            return await asyncio.wait_for(
+                self._require_session().list_tools(), timeout=self.config.timeout_s
+            )
 
     async def call_tool(
         self,
         name: str,
         args: Mapping[str, Any],
     ) -> MCPCallResult:
-        session = self._require_session()
+        # ``None`` = retired (pool TTL expiry): served on a one-shot session.
+        session = None if self._retired else self._require_session()
         transport = self.config.transport
         server = self.config.name
         # Circuit breaker (audit #3): a server that has tripped open is
@@ -762,26 +842,36 @@ class _RemoteMCPClientBase:
             msg = f"mcp server {server!r} circuit open — skipping call to {name!r}"
             raise MCPServerUnhealthyError(msg)
         try:
-            try:
-                result = await asyncio.wait_for(
-                    session.call_tool(name, dict(args)),
-                    timeout=self.config.timeout_s,
-                )
-            except anyio.ClosedResourceError:
-                # BUG-17 — retry ONLY on send-phase death: ClosedResourceError
-                # is raised by the write stream before the request reaches the
-                # server, so a resend cannot double-execute a non-idempotent
-                # tool. BrokenResourceError / McpError / timeouts can occur
-                # AFTER the server accepted the request — the tool may already
-                # have run, so those are never resent. The restarted attempt
-                # resolves this call's breaker outcome: heal-and-succeed
-                # records success below; a failed restart or failed retry
-                # falls through to the failure handlers like any other error.
-                await self._restart(session)
-                result = await asyncio.wait_for(
-                    self._require_session().call_tool(name, dict(args)),
-                    timeout=self.config.timeout_s,
-                )
+            if session is None:
+                result = await self._one_shot(lambda one_shot: one_shot.call_tool(name, dict(args)))
+            else:
+                try:
+                    result = await asyncio.wait_for(
+                        session.call_tool(name, dict(args)),
+                        timeout=self.config.timeout_s,
+                    )
+                except anyio.ClosedResourceError:
+                    # BUG-17 — retry ONLY on send-phase death: ClosedResourceError
+                    # is raised by the write stream before the request reaches the
+                    # server, so a resend cannot double-execute a non-idempotent
+                    # tool. BrokenResourceError / McpError / timeouts can occur
+                    # AFTER the server accepted the request — the tool may already
+                    # have run, so those are never resent. The restarted attempt
+                    # resolves this call's breaker outcome: heal-and-succeed
+                    # records success below; a failed restart or failed retry
+                    # falls through to the failure handlers like any other error.
+                    await self._restart(session)
+                    if self._retired:
+                        # retire() raced this call and tore the session down;
+                        # the send never reached the server, so resend once.
+                        result = await self._one_shot(
+                            lambda one_shot: one_shot.call_tool(name, dict(args))
+                        )
+                    else:
+                        result = await asyncio.wait_for(
+                            self._require_session().call_tool(name, dict(args)),
+                            timeout=self.config.timeout_s,
+                        )
         except TimeoutError as exc:
             self._breaker.record_failure()
             record_mcp_call(transport=transport, server=server, result="timeout")
@@ -798,10 +888,24 @@ class _RemoteMCPClientBase:
             is_error=bool(getattr(result, "isError", False)),
         )
 
+    async def retire(self) -> None:
+        """Pool TTL expiry: drop the long-lived session, but keep serving the
+        holders that still reference this client (cached agents, in-flight
+        runs) on one-shot sessions. No effect on the state of a closed client."""
+        await self._release(retire=True)
+
     async def close(self) -> None:
+        """Hard stop (invalidation, shutdown): later calls fail "not started",
+        even on a client that was retired first."""
+        await self._release(retire=False)
+
+    async def _release(self, *, retire: bool) -> None:
         # Under the restart lock, refs cleared first: an in-flight
-        # ``_restart`` must not resurrect a client the pool just closed.
+        # ``_restart`` must not resurrect a client the pool just released.
         async with self._restart_lock:
+            if not retire:
+                self._closed = True
+            self._retired = retire and not self._closed
             stack = self._stack
             self._stack = None
             self._session = None
@@ -1023,11 +1127,22 @@ class MCPServerPool:
         return list(self._clients.keys())
 
     async def close_all(self) -> None:
+        """Close every client — a hard stop for anything still holding one."""
+        await self._release_all(retire=False)
+
+    async def retire_all(self) -> None:
+        """Pool TTL expiry: :meth:`_RemoteMCPClientBase.retire` every client
+        that supports it, so holders keep working; close the rest (stdio,
+        test doubles)."""
+        await self._release_all(retire=True)
+
+    async def _release_all(self, *, retire: bool) -> None:
         async with self._lock:
             errors: list[Exception] = []
             for name, client in list(self._clients.items()):
+                release = getattr(client, "retire", None) if retire else None
                 try:
-                    await client.close()
+                    await (release() if release is not None else client.close())
                 except Exception as exc:
                     logger.warning("mcp.close_failed server=%s err=%s", name, exc)
                     errors.append(exc)
