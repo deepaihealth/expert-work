@@ -1523,7 +1523,6 @@ class AgentSandboxClient:
         has_skills: bool = False,
         egress: EgressContext | None = None,
         conv_id: UUID | None = None,
-        compat_dirs: tuple[str, ...] = (),
         workspace_thread_id: UUID | None = None,
     ) -> SandboxOutcome:
         """波 1 Task 8(spec § 6.1 四契约点)。契约源头是
@@ -1672,7 +1671,6 @@ class AgentSandboxClient:
                     script,
                     conv_id=conv_id,
                     thread_id=workspace_thread_id,
-                    compat_dirs=compat_dirs,
                 ),
                 user=SANDBOX_EXEC_USER,
                 timeout=effective,

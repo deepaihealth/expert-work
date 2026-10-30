@@ -230,7 +230,6 @@ class _SequenceRuntime(RecordingSandboxRuntime):
         has_skills: bool = False,
         egress: EgressContext | None = None,
         conv_id: UUID | None = None,
-        compat_dirs: tuple[str, ...] = (),
         workspace_thread_id: UUID | None = None,
     ) -> SandboxOutcome:
         self.execs.append((sandbox_id, code))

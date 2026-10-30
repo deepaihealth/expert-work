@@ -141,6 +141,10 @@ from orchestrator.tools import (
     WorkspaceLock,
     WorkspaceStore,
 )
+from orchestrator.tools.agent_file_versions import (
+    AgentFileVersionStore,
+    NasAgentFileVersionStore,
+)
 from orchestrator.tools.artifact_snapshots import (
     ArtifactSnapshotStore,
     InMemoryArtifactSnapshotStore,
@@ -149,6 +153,7 @@ from orchestrator.tools.artifact_snapshots import (
 from orchestrator.tools.knowledge_catalog import catalog_fingerprint
 from orchestrator.tools.knowledge_log import LoggedKnowledgeRetriever, RetrievalLogSink
 from orchestrator.tools.knowledge_rerank import RerankOutcome, RerankRanking
+from orchestrator.tools.locks import KeyedLock, ProcessKeyedLock
 from orchestrator.trajectory.recorder import TrajectoryRecorder
 from orchestrator.usage_metering import (
     MeteredLLMCaller,
@@ -308,6 +313,9 @@ class AgentRuntime:
     #: ``app.py`` 注入 :class:`~control_plane.thread_stats.ThreadStatsRecorderImpl`;
     #: ``None``(测试 / 未接线)让计数保持 ``NULL``,不影响 run。
     thread_stats_recorder: ThreadStatsRecorder | None = None
+    #: B-236 第三层 —— run 终局观察 ``/agent``,改过的文件各留一份版本(NAS 才有;``app.py``
+    #: 注入)。``None``(没接 NAS / 测试)= 不留版本,不影响 run。
+    agent_file_versions: AgentFileVersionStore | None = None
     #: 1.3 Orchestrator-Worker — per-run dynamic-worker spawn bounds. Set in
     #: the app lifespan from platform settings. ``enabled=False`` makes
     #: :meth:`new_worker_spawn_budget` return ``None`` (no per-run caps; the
@@ -2031,6 +2039,16 @@ def build_artifact_snapshot_store(
     return None
 
 
+def build_agent_file_version_store(
+    workspace_store: WorkspaceStore | None,
+) -> AgentFileVersionStore | None:
+    """B-236 第三层 —— ``/agent`` 文件的版本存储,只有 NAS 后端有(放在用户根旁边、沙箱挂不到
+    的地方);别的后端 ``None`` = 不留版本。传进来的必须是工作区端点用的同一个实例。"""
+    if isinstance(workspace_store, NasWorkspaceStore):
+        return NasAgentFileVersionStore(workspace=workspace_store)
+    return None
+
+
 def build_tool_env(
     tenant_config_service: TenantConfigService,
     *,
@@ -2043,6 +2061,7 @@ def build_tool_env(
     workspace_lock: WorkspaceLock | None = None,
     workspace_store: WorkspaceStore | None = None,
     artifact_snapshots: ArtifactSnapshotStore | None = None,
+    conversation_seed_lock: KeyedLock | None = None,
 ) -> ToolEnv:
     """Assemble the M0 :class:`ToolEnv`.
 
@@ -2076,6 +2095,8 @@ def build_tool_env(
         workspace_lock=workspace_lock or NullWorkspaceLock(),
         workspace_store=workspace_store,
         artifact_snapshots=artifact_snapshots,
+        # B-236 —— 对话开场复制按对话互斥;没给(单测 / 无库)就是进程内的锁。
+        conversation_seed_lock=conversation_seed_lock or ProcessKeyedLock(),
     )
 
 

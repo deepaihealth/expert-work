@@ -89,8 +89,8 @@ class FakeRunnerLink:
         self.exec_envs_calls: list[dict[str, str] | None] = []
         #: B-60 —— 每次 exec 的 agent_root,与 envs 同一条通道。
         self.exec_agent_root_calls: list[str | None] = []
-        #: B-236 —— 每次 exec 的 (conv_id, compat_dirs)。
-        self.exec_view_calls: list[tuple[UUID | None, tuple[str, ...]]] = []
+        #: B-236 —— 每次 exec 的 conv_id。
+        self.exec_view_calls: list[UUID | None] = []
         self.exec_thread_calls: list[UUID | None] = []
 
     async def wait_ready(self, timeout_s: float) -> None:
@@ -106,13 +106,12 @@ class FakeRunnerLink:
         envs: dict[str, str] | None = None,
         agent_root: str | None = None,
         conv_id: UUID | None = None,
-        compat_dirs: tuple[str, ...] = (),
         thread_id: UUID | None = None,
     ) -> ExecResult:
         self.exec_calls.append((code, timeout_s))
         self.exec_envs_calls.append(envs)
         self.exec_agent_root_calls.append(agent_root)
-        self.exec_view_calls.append((conv_id, compat_dirs))
+        self.exec_view_calls.append(conv_id)
         self.exec_thread_calls.append(thread_id)
         if self._exec_error is not None:
             raise self._exec_error
@@ -1397,32 +1396,20 @@ _CONV = "11111111-2222-3333-4444-555555555555"
     "fields",
     [
         {"agent_root": _ROOT, "conv_id": "not-a-uuid"},
-        {"agent_root": _ROOT, "conv_id": _CONV, "compat_dirs": ["a/b"]},
-        {"agent_root": _ROOT, "conv_id": _CONV, "compat_dirs": ["threads"]},
-        {"agent_root": _ROOT, "conv_id": _CONV, "compat_dirs": [".tool_results"]},
-        {"agent_root": _ROOT, "conv_id": _CONV, "compat_dirs": [".."]},
-        {"agent_root": _ROOT, "conv_id": _CONV, "compat_dirs": [""]},
-        # review 4 —— GBK 目录名经 os.listdir 成了孤立代理字符,编码不成 UTF-8
-        {"agent_root": _ROOT, "conv_id": _CONV, "compat_dirs": ["\udcd7\udcca"]},
-        {"agent_root": _ROOT, "conv_id": _CONV, "compat_dirs": [f"d{i}" for i in range(65)]},
         {"conv_id": _CONV},
         {"thread_id": _CONV},
         {"agent_root": _ROOT, "thread_id": "not-a-uuid"},
-        {"agent_root": _ROOT, "compat_dirs": ["style"]},
     ],
 )
 def test_exec_request_refuses_a_bad_conversation_view(fields: dict[str, object]) -> None:
-    """B-236 —— 对话 id 与过渡期目录名都会被 runner 拼成 bind 的源与目标:边界上 422。"""
+    """B-236 —— 对话 id 与线程 id 都会被 runner 拼成 bind 的源与目标:边界上 422。"""
     with pytest.raises(ValidationError):
         ExecRequest(code="print(1)", **fields)  # type: ignore[arg-type]
 
 
 def test_exec_request_accepts_a_conversation_view() -> None:
-    request = ExecRequest(
-        code="print(1)", agent_root=_ROOT, conv_id=UUID(_CONV), compat_dirs=["style", "模板"]
-    )
+    request = ExecRequest(code="print(1)", agent_root=_ROOT, conv_id=UUID(_CONV))
     assert str(request.conv_id) == _CONV
-    assert request.compat_dirs == ["style", "模板"]
 
 
 @pytest.mark.asyncio
@@ -1436,12 +1423,11 @@ async def test_exec_forwards_the_conversation_view_to_the_runner_link() -> None:
         code="print(1)",
         agent_root=_ROOT,
         conv_id=UUID(_CONV),
-        compat_dirs=("style",),
         thread_id=UUID(_CONV),
     )
     await h.supervisor.exec(response.sandbox_id, code="print(2)", agent_root=_ROOT)
 
-    assert link.exec_view_calls == [(UUID(_CONV), ("style",)), (None, ())]
+    assert link.exec_view_calls == [UUID(_CONV), None]
     assert link.exec_thread_calls == [UUID(_CONV), None]
 
 

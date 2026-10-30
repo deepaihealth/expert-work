@@ -136,7 +136,6 @@ class _ViewRuntime(RecordingSandboxRuntime):
         has_skills: bool = False,
         egress: EgressContext | None = None,
         conv_id: UUID | None = None,
-        compat_dirs: tuple[str, ...] = (),
         workspace_thread_id: UUID | None = None,
     ) -> SandboxOutcome:
         self.exec_agent_keys.append(agent_key)

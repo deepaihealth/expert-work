@@ -66,6 +66,7 @@ class _FakeRuntime:
         self.skill_run_usage_recorder = None
         self.trajectory_recorder = None
         self.thread_stats_recorder = None
+        self.agent_file_versions = None
 
     async def get_agent(self, **_kw: object) -> SimpleNamespace:
         return SimpleNamespace(

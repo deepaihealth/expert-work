@@ -344,7 +344,6 @@ def _register_routes(app: FastAPI) -> None:
             envs=body.envs or None,
             agent_root=body.agent_root,
             conv_id=body.conv_id,
-            compat_dirs=tuple(body.compat_dirs),
             thread_id=body.thread_id,
         )
         return ExecResponse(

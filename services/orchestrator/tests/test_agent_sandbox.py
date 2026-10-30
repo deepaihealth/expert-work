@@ -3054,14 +3054,14 @@ async def test_exec_command_is_the_shared_exec_view_command() -> None:
 
     assert re.fullmatch(
         re.escape("umask 077 && ") + r"unshare -Urm --propagation private -- sh -c '.*' "
-        r"ew-exec-view /mnt/workspace/agents/plan-aaaaaaaa '' '' 0 python -E -P "
+        r"ew-exec-view /mnt/workspace/agents/plan-aaaaaaaa '' '' python -E -P "
         r"/tmp/ew-exec-[0-9a-f]{32}\.py",
         bound,
         re.DOTALL,
     ), bound
     assert re.fullmatch(
         re.escape("umask 077 && ") + r"unshare -Urm --propagation private -- sh -c '.*' "
-        r"ew-exec-view '' '' '' 0 python -E -P /tmp/ew-exec-[0-9a-f]{32}\.py",
+        r"ew-exec-view '' '' '' python -E -P /tmp/ew-exec-[0-9a-f]{32}\.py",
         unbound,
         re.DOTALL,
     ), unbound
@@ -3069,7 +3069,7 @@ async def test_exec_command_is_the_shared_exec_view_command() -> None:
 
 @pytest.mark.asyncio
 async def test_exec_command_carries_the_conversation_view() -> None:
-    """B-236 —— 对话视图:``$2`` 是对话 id,``$3`` 是过渡期目录个数,其后是目录名。"""
+    """B-236 —— 对话视图:``$2`` 是对话 id,``$3`` 是本对话线程 id,其后是载荷。"""
     sdk, store = FakeSdk(), FakeInstanceStore()
     client = make_client(sdk, store)
     sid = await client.acquire(tenant_id=uuid4(), thread_id="t", user_id=uuid4())
@@ -3081,14 +3081,13 @@ async def test_exec_command_carries_the_conversation_view() -> None:
         timeout_s=5,
         agent_key="plan-aaaaaaaa",
         conv_id=conv,
-        compat_dirs=("style",),
         workspace_thread_id=conv,
     )
     command, *_ = sdk.sandbox.commands.calls[-1]
 
     assert re.fullmatch(
         re.escape("umask 077 && ") + r"unshare -Urm --propagation private -- sh -c '.*' "
-        rf"ew-exec-view /mnt/workspace/agents/plan-aaaaaaaa {conv} {conv} 1 style python -E -P "
+        rf"ew-exec-view /mnt/workspace/agents/plan-aaaaaaaa {conv} {conv} python -E -P "
         r"/tmp/ew-exec-[0-9a-f]{32}\.py",  # noqa: S108 — sandbox tmpfs path, not host
         command,
         re.DOTALL,

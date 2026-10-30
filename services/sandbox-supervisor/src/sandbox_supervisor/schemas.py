@@ -17,13 +17,6 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 #: supervisor 不 import orchestrator,而这道闸要挡的正是「送进来的不是那个函数拼的」。
 _AGENT_ROOT_PREFIX = "/mnt/workspace/agents/"
 
-#: B-236 —— ``ExecRequest.compat_dirs`` 的上限与不许出现的名字。与 runner 那段 sh 的
-#: ``case`` 同一组(这里是 HTTP 边界的第一道,脚本自己还会再查一遍)。
-_MAX_COMPAT_DIRS = 64
-_RESERVED_COMPAT_NAMES = frozenset(
-    {"", ".", "..", "threads", "uploads", "inputs", ".tool_results", "shared", "skills", "agents"}
-)
-
 
 class SeedFile(BaseModel):
     """One file to materialize into the sandbox ``/workspace`` at acquire time.
@@ -117,37 +110,15 @@ class ExecRequest(BaseModel):
     #: ``/agent`` 是 ``agent_root`` 本身。``None`` → 老视图(两者都是 ``agent_root``)。
     #: 只在绑了 agent(``agent_root`` 非空)时成立。
     conv_id: UUID | None = None
-    #: B-236 —— 过渡期映射进 ``/workspace`` 的 agent 根一级目录名。
-    compat_dirs: list[str] = Field(default_factory=list, max_length=_MAX_COMPAT_DIRS)
     #: B-236 —— 本对话的线程 id:两种视图里 ``<agent_root>/threads/`` 都只留它那一格。
     #: ``None`` → 一格都不留。
     thread_id: UUID | None = None
 
-    @field_validator("compat_dirs")
-    @classmethod
-    def _compat_dirs_are_plain_top_level_names(cls, value: list[str]) -> list[str]:
-        """422 任何不是「agent 根下一级、非保留」的名字 —— 它们会被拼成 bind 源与目标。
-        编码不成 UTF-8 的(孤立代理字符,即 GBK 之类的文件名)同样 422:它们过不了下游的
-        编码(review 4)。"""
-        for name in value:
-            if "/" in name or "\0" in name or name in _RESERVED_COMPAT_NAMES:
-                msg = f"compat_dirs entry is not a plain directory name: {name!r}"
-                raise ValueError(msg)
-            try:
-                name.encode("utf-8")
-            except UnicodeEncodeError:
-                msg = f"compat_dirs entry is not valid UTF-8: {name!r}"
-                raise ValueError(msg) from None
-        return value
-
     @model_validator(mode="after")
     def _conversation_view_needs_an_agent_root(self) -> ExecRequest:
-        has_view = self.conv_id is not None or self.thread_id is not None or self.compat_dirs
+        has_view = self.conv_id is not None or self.thread_id is not None
         if has_view and self.agent_root is None:
-            msg = "conv_id / thread_id / compat_dirs need agent_root (the view is per agent)"
-            raise ValueError(msg)
-        if self.compat_dirs and self.conv_id is None:
-            msg = "compat_dirs need conv_id (they only exist in the conversation view)"
+            msg = "conv_id / thread_id need agent_root (the view is per agent)"
             raise ValueError(msg)
         return self
 

@@ -349,6 +349,9 @@ from expert_work.persistence.webhook import SqlWebhookEndpointStore as SqlWebhoo
 from expert_work.persistence.webhook import WebhookDeliveryStore as WebhookDeliveryStore
 from expert_work.persistence.webhook import WebhookEndpointStore as WebhookEndpointStore
 from expert_work.persistence.workspace import (
+    AGENT_FILE_VERSIONS_DIR as AGENT_FILE_VERSIONS_DIR,
+)
+from expert_work.persistence.workspace import (
     ARTIFACT_SNAPSHOT_DIR as ARTIFACT_SNAPSHOT_DIR,
 )
 from expert_work.persistence.workspace import (
@@ -418,6 +421,9 @@ from expert_work.persistence.workspace import (
     WorkspaceNotFoundError as WorkspaceNotFoundError,
 )
 from expert_work.persistence.workspace import (
+    agent_file_versions_dir as agent_file_versions_dir,
+)
+from expert_work.persistence.workspace import (
     artifact_snapshot_dir as artifact_snapshot_dir,
 )
 from expert_work.persistence.workspace import (
@@ -434,6 +440,7 @@ from expert_work.persistence.workspace import (
 )
 
 __all__ = [
+    "AGENT_FILE_VERSIONS_DIR",
     "ARTIFACT_SNAPSHOT_DIR",
     "RENDERED_FIGURE_DIR",
     "RENDERED_FIGURE_PAGE_STEM",
@@ -598,6 +605,7 @@ __all__ = [
     "WebhookDeliveryStore",
     "WebhookEndpointStore",
     "WorkspaceNotFoundError",
+    "agent_file_versions_dir",
     "artifact_snapshot_dir",
     "build_rls_sessionmaker",
     "bypass_rls_var",

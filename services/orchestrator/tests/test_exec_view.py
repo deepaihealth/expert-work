@@ -32,7 +32,7 @@ def _sh_and_helper() -> tuple[str, str]:
 
 
 _HELPER_OPEN = "/usr/local/bin/python3 -I -S -c '"
-_HELPER_CLOSE = '\n\' "$root" "$conv" "$own" "$n" "$@"\n'
+_HELPER_CLOSE = '\n\' "$root" "$conv" "$own"\n'
 
 
 def test_script_fails_closed_and_names_both_roots() -> None:
@@ -64,19 +64,18 @@ def test_sh_part_runs_no_mount_and_no_command_found_via_path() -> None:
 
 
 def test_helper_opens_every_nas_path_without_following_symlinks() -> None:
-    """内嵌 python 里每一次 ``os.open`` 要么带 ``O_NOFOLLOW`` 的 ``DIR`` / ``LIST``(经
-    ``sub``),要么是两个可信起点:``/mnt/workspace``(平台建的符号链接)与 agent 根的前缀。
+    """内嵌 python 里每一次 ``os.open`` 要么带 ``O_NOFOLLOW`` 的 ``DIR``(经 ``sub``),
+    要么是两个可信起点:``/mnt/workspace``(平台建的符号链接)与 agent 根的前缀。
     挂载只经 ``open_tree`` / ``move_mount`` / ``fsmount`` 与 ``/proc/self/fd`` 上的 remount。"""
     _, helper = _sh_and_helper()
     assert "DIR = os.O_PATH | os.O_NOFOLLOW | os.O_DIRECTORY | os.O_CLOEXEC\n" in helper
-    assert "LIST = os.O_RDONLY | os.O_NOFOLLOW | os.O_DIRECTORY | os.O_CLOEXEC\n" in helper
     opens = re.findall(r"os\.open\(([^)]*)\)", helper)
     trusted = {
         '"/mnt/workspace", os.O_PATH | os.O_DIRECTORY | os.O_CLOEXEC',
         'head or "/", os.O_PATH | os.O_DIRECTORY | os.O_CLOEXEC',
     }
     for args in opens:
-        assert args in trusted or args.endswith(("DIR", "flags, dir_fd=fd")), args
+        assert args in trusted or args.endswith(("DIR", "DIR, dir_fd=fd")), args
     assert re.findall(r"libc\.mount\(([^)]*)\)", helper) == [
         "None, fd_path, None, REMOUNT_RO, None"
     ]
@@ -90,14 +89,13 @@ def test_embedded_helper_compiles_and_is_plain_ascii() -> None:
     compile(helper, "<ew-exec-view helper>", "exec")
 
 
-def test_shared_and_compat_are_bound_read_only_with_locked_flags_kept() -> None:
+def test_shared_is_bound_read_only_with_locked_flags_kept() -> None:
     """``MS_REMOUNT | MS_BIND | MS_RDONLY | MS_NOSUID | MS_NODEV | MS_NOEXEC``:userns 里
-    remount 不能去掉源挂载上锁住的 flag,但可以加;atime 不写 = 沿用源挂载的。B-236 M4 ——
-    过渡期目录与 ``shared/`` 走同一个 ``bind_ro``。"""
+    remount 不能去掉源挂载上锁住的 flag,但可以加;atime 不写 = 沿用源挂载的。B-236 ——
+    只读 bind 只剩 ``shared/`` 一处(agent 根的基础目录改为开场复制,不再挂进来)。"""
     _, helper = _sh_and_helper()
     assert "REMOUNT_RO = 0x20 | 0x1000 | 0x1 | 0x2 | 0x4 | 0x8" in helper
-    assert '            bind_ro(shared, target, "shared/")\n' in helper
-    assert '            bind_ro(source, target, d + "/")\n' in helper
+    assert re.findall(r"bind_ro\(([^)]*)\)\n", helper) == ['shared, target, "shared/"']
 
 
 def test_non_directory_shared_skips_the_mount_loudly_instead_of_bricking_the_agent() -> None:
@@ -141,13 +139,12 @@ def test_argv_bound_passes_the_nas_root_as_first_positional() -> None:
         "/mnt/workspace/agents/plan-aaaaaaaa",
         "",
         "",
-        "0",
         *_PY,
     ]
 
 
 def test_argv_unbound_passes_an_empty_root() -> None:
-    assert exec_view_argv("", _PY) == [*EXEC_VIEW_ARGV_PREFIX, "", "", "", "0", *_PY]
+    assert exec_view_argv("", _PY) == [*EXEC_VIEW_ARGV_PREFIX, "", "", "", *_PY]
 
 
 def test_build_exec_command_bound_and_unbound_verbatim() -> None:
@@ -157,12 +154,12 @@ def test_build_exec_command_bound_and_unbound_verbatim() -> None:
     assert (
         build_exec_command("plan-aaaaaaaa", "/tmp/ew-exec-abc.py")  # noqa: S108
         == (
-            prefix + " ew-exec-view /mnt/workspace/agents/plan-aaaaaaaa '' '' 0"
+            prefix + " ew-exec-view /mnt/workspace/agents/plan-aaaaaaaa '' ''"
             " python -E -P /tmp/ew-exec-abc.py"
         )
     )
     assert build_exec_command("", "/tmp/ew-exec-abc.py") == (  # noqa: S108
-        prefix + " ew-exec-view '' '' '' 0 python -E -P /tmp/ew-exec-abc.py"
+        prefix + " ew-exec-view '' '' '' python -E -P /tmp/ew-exec-abc.py"
     )
 
 
@@ -185,66 +182,35 @@ _CONV = UUID("11111111-2222-3333-4444-555555555555")
 _OTHER = "99999999-8888-7777-6666-555555555555"
 
 
-def test_argv_conversation_view_carries_the_conversation_and_compat_dirs() -> None:
-    assert exec_view_argv(
-        "plan-aaaaaaaa", _PY, conv_id=_CONV, thread_id=_CONV, compat_dirs=("style", "模板")
-    ) == [
+def test_argv_conversation_view_carries_the_conversation() -> None:
+    assert exec_view_argv("plan-aaaaaaaa", _PY, conv_id=_CONV, thread_id=_CONV) == [
         *EXEC_VIEW_ARGV_PREFIX,
         "/mnt/workspace/agents/plan-aaaaaaaa",
         str(_CONV),
         str(_CONV),
-        "2",
-        "style",
-        "模板",
         *_PY,
     ]
 
 
 def test_argv_legacy_view_carries_only_the_own_thread() -> None:
     """老视图:``$2`` 照旧是空串(老视图的约定不变),线程 id 走单独的 ``$3``。"""
-    assert exec_view_argv("plan-aaaaaaaa", _PY, thread_id=_CONV, compat_dirs=("style",)) == [
+    assert exec_view_argv("plan-aaaaaaaa", _PY, thread_id=_CONV) == [
         *EXEC_VIEW_ARGV_PREFIX,
         "/mnt/workspace/agents/plan-aaaaaaaa",
         "",
         str(_CONV),
-        "0",
         *_PY,
     ]
 
 
 def test_argv_unbound_never_carries_a_conversation() -> None:
-    """没绑 agent 没有对话视图:对话 id、线程 id 与目录名都不发,脚本走未绑分支。"""
-    assert exec_view_argv("", _PY, conv_id=_CONV, thread_id=_CONV, compat_dirs=("style",)) == [
+    """没绑 agent 没有对话视图:对话 id、线程 id 都不发,脚本走未绑分支。"""
+    assert exec_view_argv("", _PY, conv_id=_CONV, thread_id=_CONV) == [
         *EXEC_VIEW_ARGV_PREFIX,
         "",
         "",
         "",
-        "0",
         *_PY,
-    ]
-
-
-@pytest.mark.parametrize("bad", ["", ".", "..", "a/b", "threads", "uploads", ".tool_results"])
-def test_argv_refuses_an_unmappable_compat_dir(bad: str) -> None:
-    with pytest.raises(ValueError):
-        exec_view_argv("plan-aaaaaaaa", _PY, conv_id=_CONV, compat_dirs=(bad,))
-
-
-def test_build_exec_command_quotes_compat_dir_names() -> None:
-    cmd = build_exec_command(
-        "plan-aaaaaaaa",
-        "/tmp/x.py",  # noqa: S108
-        conv_id=_CONV,
-        thread_id=_CONV,
-        compat_dirs=("客户 案例;rm",),
-    )
-    argv = shlex.split(cmd[len("umask 077 && ") :])
-    assert argv[argv.index("ew-exec-view") + 1 :][:5] == [
-        "/mnt/workspace/agents/plan-aaaaaaaa",
-        str(_CONV),
-        str(_CONV),
-        "1",
-        "客户 案例;rm",
     ]
 
 
@@ -256,14 +222,6 @@ def test_script_platform_dirs_are_the_resolver_platform_dirs() -> None:
     assert f"PLATFORM_DIRS = ({names})\n" in EXEC_VIEW_SCRIPT
 
 
-def test_script_reserved_compat_names_are_the_resolver_reserved_names() -> None:
-    from orchestrator.tools.workspace_paths import _COMPAT_RESERVED
-
-    sh, _ = _sh_and_helper()
-    line = next(x for x in sh.splitlines() if x.strip().startswith("''|.|..|*/*|"))
-    assert set(line.strip().rstrip(")").split("|")[4:]) == _COMPAT_RESERVED
-
-
 # —— sh 部分的演练:本机没有非特权 user namespace(macOS / CI host 都给不了),挂载阶段
 # 又全在内嵌 python 里直接发系统调用,所以这里只演练 sh 那一层:把 ``/agent`` /
 # ``/workspace`` 换成临时目录,把 python 换成记账的假命令(``EW_PY_RC`` 决定它的退出码),
@@ -272,7 +230,7 @@ def test_script_reserved_compat_names_are_the_resolver_reserved_names() -> None:
 # 只读、竞态)由 ``test_exec_view_kernel.py`` 在真镜像真内核上验。
 
 _FAKE_PY = """#!/bin/sh
-shift 4  # -I -S -c <helper>
+shift 4  # -I -S -c <helper>(其后只有挂载阶段的三个参数)
 printf '%s\\n' "$@" > "$EW_PY_LOG"
 exit "${EW_PY_RC:-0}"
 """
@@ -325,10 +283,10 @@ class _Rehearsal:
         )
 
     def run(
-        self, conv: str, compat: list[str], cmd: str, *, own: str | None = None
+        self, conv: str, cmd: str, *, own: str | None = None
     ) -> subprocess.CompletedProcess[str]:
         thread = conv if own is None else own
-        return self.run_raw(self.root, conv, thread, str(len(compat)), *compat, "sh", "-c", cmd)
+        return self.run_raw(self.root, conv, thread, "sh", "-c", cmd)
 
     def helper_args(self) -> list[str] | None:
         return self.py_log.read_text().splitlines() if self.py_log.exists() else None
@@ -338,21 +296,11 @@ def test_rehearsal_hands_the_mount_phase_to_the_helper_then_runs_the_payload(
     tmp_path: Path,
 ) -> None:
     r = _Rehearsal(tmp_path)
-    proc = r.run(str(_CONV), ["style", "模板"], 'echo "$PWD|$PATH"')
+    proc = r.run(str(_CONV), 'echo "$PWD|$PATH"')
 
     assert proc.returncode == 0, proc.stderr
-    # 挂载阶段拿到 $1..$4 + 目录名(其后的载荷 argv 它不看)
-    assert r.helper_args() == [
-        r.root,
-        str(_CONV),
-        str(_CONV),
-        "2",
-        "style",
-        "模板",
-        "sh",
-        "-c",
-        'echo "$PWD|$PATH"',
-    ]
+    # 挂载阶段只拿到 $1..$3,载荷 argv 不交给它
+    assert r.helper_args() == [r.root, str(_CONV), str(_CONV)]
     # 载荷:在 /workspace 里、PATH 还原成调用方的、由 unshare -Ur 起
     assert proc.stdout == f"{r.ws}|{r.bin}:/usr/bin:/bin\n"
     assert r.unshare_log.read_text().split()[:3] == ["-Ur", "--", "sh"]
@@ -361,16 +309,16 @@ def test_rehearsal_hands_the_mount_phase_to_the_helper_then_runs_the_payload(
 def test_rehearsal_conversation_id_wins_over_the_thread_id(tmp_path: Path) -> None:
     """对话视图里本对话那一格就是对话 id;老视图里才用 ``$3``。"""
     r = _Rehearsal(tmp_path)
-    assert r.run(str(_CONV), [], "true", own="").returncode == 0
-    assert (r.helper_args() or [])[:4] == [r.root, str(_CONV), str(_CONV), "0"]
-    assert r.run("", [], "true", own=_OTHER).returncode == 0
-    assert (r.helper_args() or [])[:4] == [r.root, "", _OTHER, "0"]
+    assert r.run(str(_CONV), "true", own="").returncode == 0
+    assert r.helper_args() == [r.root, str(_CONV), str(_CONV)]
+    assert r.run("", "true", own=_OTHER).returncode == 0
+    assert r.helper_args() == [r.root, "", _OTHER]
 
 
 def test_rehearsal_mount_failure_never_runs_the_payload(tmp_path: Path) -> None:
     r = _Rehearsal(tmp_path)
     r.extra_env = {"EW_PY_RC": "98"}
-    proc = r.run(str(_CONV), [], "echo ran")
+    proc = r.run(str(_CONV), "echo ran")
 
     assert proc.returncode == 98
     assert "ran" not in proc.stdout
@@ -380,7 +328,7 @@ def test_rehearsal_mount_failure_never_runs_the_payload(tmp_path: Path) -> None:
 def test_rehearsal_missing_agent_mount_point_exits_97_before_any_mount(tmp_path: Path) -> None:
     r = _Rehearsal(tmp_path)
     r.agent.rmdir()
-    proc = r.run(str(_CONV), [], "echo ran")
+    proc = r.run(str(_CONV), "echo ran")
 
     assert proc.returncode == 97
     assert "image lacks" in proc.stderr
@@ -389,34 +337,12 @@ def test_rehearsal_missing_agent_mount_point_exits_97_before_any_mount(tmp_path:
 
 
 @pytest.mark.parametrize(
-    "bad", ["../x", "a/b", "threads", ".tool_results", "shared", "agents", "..", ""]
+    ("conv", "own"),
+    [("a/b", ""), ("..", ""), ("", "a/b"), ("", "..")],
 )
-def test_rehearsal_bad_compat_dir_fails_closed_before_any_mount(tmp_path: Path, bad: str) -> None:
+def test_rehearsal_bad_ids_fail_closed(tmp_path: Path, conv: str, own: str) -> None:
     r = _Rehearsal(tmp_path)
-    proc = r.run(str(_CONV), ["style", bad], "echo ran")
-
-    assert proc.returncode == 98, proc.stderr
-    assert "ran" not in proc.stdout
-    assert r.helper_args() is None
-
-
-@pytest.mark.parametrize(
-    ("conv", "own", "count"),
-    [
-        ("a/b", "", "0"),
-        ("..", "", "0"),
-        ("", "a/b", "0"),
-        ("", "..", "0"),
-        (str(_CONV), "", "x"),
-        (str(_CONV), "", ""),
-        (str(_CONV), "", "9"),  # 比剩下的参数还多
-    ],
-)
-def test_rehearsal_bad_ids_or_count_fail_closed(
-    tmp_path: Path, conv: str, own: str, count: str
-) -> None:
-    r = _Rehearsal(tmp_path)
-    proc = r.run_raw(r.root, conv, own, count, "sh", "-c", "echo ran")
+    proc = r.run_raw(r.root, conv, own, "sh", "-c", "echo ran")
 
     assert proc.returncode == 98, proc.stderr
     assert "ran" not in proc.stdout

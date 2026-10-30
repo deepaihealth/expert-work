@@ -79,6 +79,19 @@ def artifact_snapshot_dir(root: str, tenant_id: UUID, user_id: UUID) -> Path:
     return Path(root) / str(tenant_id) / ARTIFACT_SNAPSHOT_DIR / str(user_id)
 
 
+#: B-236 第三层 —— ``/agent`` 里文件的历史版本(运行结束时看到改过的就留一份,每个文件留最近
+#: 20 份)。与 :data:`ARTIFACT_SNAPSHOT_DIR` 同一个位置理由:放在用户根**旁边**,
+#: ``{root}/{tenant_id}/.agent-file-versions/{user_id}/{agent_key}/…``,沙箱只挂
+#: ``{tenant_id}/{user_id}``,agent 跑的代码改不了、删不了自己的历史。control-plane 写,
+#: 清除用户与留存作业删,都经 :func:`agent_file_versions_dir` 拼。
+AGENT_FILE_VERSIONS_DIR = ".agent-file-versions"
+
+
+def agent_file_versions_dir(root: str, tenant_id: UUID, user_id: UUID) -> Path:
+    """一个用户的 agent 文件版本目录:``{root}/{tenant_id}/.agent-file-versions/{user_id}``。"""
+    return Path(root) / str(tenant_id) / AGENT_FILE_VERSIONS_DIR / str(user_id)
+
+
 #: Sandbox-local seed root for an agent's activated skill files (sandbox
 #: migration wave 2, spec § 四 — "技能方案"). Materialized at
 #: ``{SANDBOX_SKILLS_ROOT}/<agent_key>/<skill-name>/…`` on every sandbox

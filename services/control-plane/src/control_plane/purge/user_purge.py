@@ -68,6 +68,7 @@ from expert_work.runtime.runs import RunStore
 from expert_work.runtime.runs.store import MAX_LIST_LIMIT
 from expert_work.runtime.storage import ObjectStore
 from orchestrator.tools import WorkspaceStore
+from orchestrator.tools.agent_file_versions import AgentFileVersionStore
 from orchestrator.tools.artifact_snapshots import ArtifactSnapshotStore
 
 logger = logging.getLogger("expert_work.control_plane.purge.user")
@@ -130,6 +131,9 @@ class PurgeUserDeps:
     #: B-235 —— 产物各版本登记时留下的字节副本。``None`` = 这个部署没有工作区,也就
     #: 不会有副本。
     artifact_snapshots: ArtifactSnapshotStore | None = None
+    #: B-236 第三层 —— ``/agent`` 文件的历史版本(住在用户根旁边,工作区那步删不到)。
+    #: ``None`` = 这个部署不留版本。
+    agent_file_versions: AgentFileVersionStore | None = None
 
 
 @dataclass
@@ -472,6 +476,13 @@ async def purge_user(
             summary,
             "artifact_snapshot",
             deps.artifact_snapshots.delete_all_for_user(tenant_id=tenant_id, user_id=user_id),
+            default=0,
+        )
+    if deps.agent_file_versions is not None:
+        summary.deleted["agent_file_version"] = await _step(
+            summary,
+            "agent_file_version",
+            deps.agent_file_versions.delete_all_for_user(tenant_id=tenant_id, user_id=user_id),
             default=0,
         )
     summary.deleted["artifact"] = await _step(

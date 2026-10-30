@@ -268,6 +268,12 @@ class _WorkspacePathNotFoundError(SandboxSupervisorError):
     """
 
 
+#: B-236 —— 「目录不存在」在各个 store 里的两种形态:NAS 对不存在的目录抛本模块内部的
+#: :class:`_WorkspacePathNotFoundError`,supervisor 后端抛 ``WorkspaceFileNotFoundError``。
+#: 新对话的目录要到第一次 exec(或开场的基础目录复制)才建出来,它的根是空的,不是故障。
+MISSING_DIR_ERRORS = (WorkspaceFileNotFoundError, _WorkspacePathNotFoundError)
+
+
 def _identity(info: os.stat_result) -> tuple[int, int, int]:
     """``read_file(stable=True)`` 用来判「读的过程中文件变没变」的三项:大小 / mtime / inode。"""
     return (info.st_size, info.st_mtime_ns, info.st_ino)

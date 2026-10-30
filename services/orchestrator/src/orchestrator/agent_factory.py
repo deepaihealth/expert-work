@@ -114,6 +114,12 @@ from orchestrator.graph_builder import (
     make_reflect_node,
     make_workspace_ingest_node,
 )
+from orchestrator.graph_builder.agent_notes import (
+    SANDBOX_WRITE_TOOLS,
+    agent_memory_rules,
+    make_agent_notes_node,
+)
+from orchestrator.graph_builder.conversation_seed import make_conversation_seed_node
 from orchestrator.graph_builder.platform_context import PLATFORM_CONTEXT_SYSTEM_CLAUSE
 from orchestrator.llm import (
     AnthropicProvider,
@@ -148,6 +154,7 @@ from orchestrator.tools.file_ops import SandboxWorkspaceWriter
 from orchestrator.tools.knowledge import Reranker
 from orchestrator.tools.knowledge_catalog import CATALOG_UNAVAILABLE, load_knowledge_catalog
 from orchestrator.tools.manage_task import ManageTaskTool
+from orchestrator.tools.nas_workspace_store import NasWorkspaceStore
 from orchestrator.tools.overflow import tool_output_budget_enabled
 from orchestrator.tools.registry import ToolContext, ToolRegistry
 from orchestrator.tools.sandbox import EgressContext, SandboxRuntime, bind_agent_key, bind_egress
@@ -1178,6 +1185,15 @@ async def build_agent(
     )
     # B-175 P4 — only an agent binding two or more knowledge bases.
     knowledge_catalog, knowledge_fingerprint = await _knowledge_catalog(spec, env, tenant_id)
+    # B-236 第三层 —— agent 自己的记忆(/agent 与索引):只给能写工作区、且不是委派子代的
+    # 构建。子代(静态子 Agent / worker,``subagent_depth > 0``)不改 agent 自己(B-122 边界),
+    # 它们读不到这几句规矩,写索引也被 ``file_ops`` 拒。构建期就能判,所以规矩进系统提示词;
+    # 索引内容是每个用户自己的,不进这里(见 ``agent_notes``)。
+    agent_memory = (
+        subagent_depth == 0
+        and not env.worker_policy
+        and any(name in registry for name in SANDBOX_WRITE_TOOLS)
+    )
     final_system_prompt = _assemble_system_prompt(
         base=spec.spec.system_prompt.template,
         skill_fragments=loaded_skills.prompt_fragments,
@@ -1194,6 +1210,9 @@ async def build_agent(
         # that one fact, so an agent without the tool never reads its rubric.
         worker_delegation=SPAWN_WORKER_TOOL_NAME in registry,
         knowledge_catalog=knowledge_catalog,
+        agent_memory=(
+            agent_memory_rules(has_edit_file="edit_file" in registry) if agent_memory else None
+        ),
     )
 
     # Capability Uplift Sprint #8 (Mini-ADR U-8) — render mode for the
@@ -1235,12 +1254,29 @@ async def build_agent(
             client=env.sandbox_runtime,
             variables=tuple(spec.spec.system_prompt.variables),
         )
+    # B-236 —— 对话开场把 agent 根的基础目录复制进本对话的 /workspace。复制按目录 fd 在
+    # 宿主侧做,只有 NAS 存储做得到;没接 NAS(本地 supervisor 后端 / 单测)= 不装节点。
+    # 节点自己只在对话视图、非委派子代时动手。
+    conversation_seed_node = (
+        make_conversation_seed_node(store=env.workspace_store, lock=env.conversation_seed_lock)
+        if isinstance(env.workspace_store, NasWorkspaceStore)
+        else None
+    )
     # Stream PI-1b — one unguessable nonce per build (stable across the
     # session so the spotlighted memory block stays prompt-cache friendly;
     # the untrusted content's author never sees it, so it can't forge the
     # closing fence). ``None`` when spotlighting is off → no wrapping.
     spotlight_nonce = (
         uuid4().hex[:12] if spec.spec.defenses.prompt_injection == "spotlight" else None
+    )
+    # B-236 第三层 —— 对话第一次 run 开场读一次 /agent/AGENT_NOTES.md。与上面的规矩同一道
+    # 构建期门,再要一个宿主侧的工作区存储;对话视图 / 第一轮 / 非子代在节点里判。
+    agent_notes_node = (
+        make_agent_notes_node(
+            store=env.workspace_store, spotlight_nonce=spotlight_nonce, estimator=estimator
+        )
+        if agent_memory and env.workspace_store is not None
+        else None
     )
     # Stream RT-1 PR-3 (RT-ADR-4) — Tier3 structured final reply. Deep
     # JSON-Schema validity is checked here (the protocol model only shape-
@@ -1290,6 +1326,8 @@ async def build_agent(
         supports_vision=spec.spec.model.supports_vision,
         workspace_ingest_node=workspace_ingest_node,
         inputs_node=inputs_node,
+        conversation_seed_node=conversation_seed_node,
+        agent_notes_node=agent_notes_node,
         # B-67 §七 —— 手抄守卫的提示只对 trusted 变量写链接名。
         trusted_input_names=frozenset(
             var.name for var in spec.spec.system_prompt.variables if var.trusted
@@ -1983,6 +2021,7 @@ def _assemble_system_prompt(
     spotlight: bool = False,
     worker_delegation: bool = False,
     knowledge_catalog: str | None = None,
+    agent_memory: str | None = None,
 ) -> str:
     """Splice base system prompt + skill summary list + ordered body
     fragments (eager skills only) + SE-10 text-class component blocks.
@@ -2087,6 +2126,11 @@ def _assemble_system_prompt(
     # append-a-section convention above.
     if worker_delegation:
         pieces.append("\n\n# Subtask delegation\n" + _worker_delegation_block())
+
+    # B-236 第三层 —— agent 自己的记忆规矩(只给能写工作区、不是委派子代的构建;每个
+    # 用户自己的索引内容不在这里,见 ``graph_builder.agent_notes``)。
+    if agent_memory:
+        pieces.append("\n\n" + agent_memory)
 
     # B-175 P4 — the knowledge catalog (``knowledge_catalog`` module; 2+ bound
     # bases). Last, so a description edit or a document-count bucket change

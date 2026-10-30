@@ -45,7 +45,6 @@ from orchestrator.tools.sandbox import (
     WorkspacePathEscapeError,
     run_in_sandbox,
 )
-from orchestrator.tools.workspace_compat import record_compat_hit
 from orchestrator.tools.workspace_paths import (
     AGENTS_DIR,
     WORKSPACE_PATH_RULE,
@@ -141,10 +140,6 @@ def _validate_path(path: str, *, view: WorkspaceView) -> ResolvedPath:
     and a view root is a directory, not a file.
     """
     target = resolve_workspace_path(path, view=view, tool="save_artifact")
-    if target.kind == "compat":
-        record_compat_hit(
-            channel="file_tool", agent_key=view.agent_key, name=target.rel.split("/", 1)[0]
-        )
     if target.kind == "shared":
         msg = f"artifact path must not address the read-only shared area: {path!r}"
         raise ValueError(msg)

@@ -46,7 +46,6 @@ from orchestrator.tools.sandbox import (
     run_in_sandbox,
 )
 from orchestrator.tools.sandbox_image_contract import preinstalled_note
-from orchestrator.tools.workspace_compat import record_exec_refs
 from orchestrator.tools.workspace_paths import EXEC_WORKSPACE_NOTE
 
 #: ``acquire`` thread label when the run has no id (ad-hoc call).
@@ -139,7 +138,6 @@ class BashTool:
     async def call(self, args: Mapping[str, Any], *, ctx: ToolContext) -> ToolResult:
         command = self._require_command(args)
         timeout_s = coerce_timeout(args.get("timeout_s"))
-        record_exec_refs(ctx, command)
         # Stream TE-8 — hold the per-workspace write lock around the command so
         # bash serialises against write_file (and other bash) across replicas.
         # The lock scopes to the run's user — the durable workspace that may be

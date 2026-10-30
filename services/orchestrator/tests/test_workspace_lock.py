@@ -65,7 +65,6 @@ class _LockProbeClient:
         run_id: UUID | None = None,
         has_skills: bool = False,
         conv_id: UUID | None = None,
-        compat_dirs: tuple[str, ...] = (),
         workspace_thread_id: UUID | None = None,
     ) -> SandboxOutcome:
         self.active_at_exec = self.lock.active

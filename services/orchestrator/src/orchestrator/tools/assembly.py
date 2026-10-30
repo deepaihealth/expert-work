@@ -54,7 +54,12 @@ from orchestrator.tools.find_tools import FindToolsTool
 from orchestrator.tools.http import AllowlistProvider, DenylistProvider, HTTPTool
 from orchestrator.tools.knowledge import KnowledgeRetriever, KnowledgeSearchTool
 from orchestrator.tools.knowledge_read import KnowledgeReadTool
-from orchestrator.tools.locks import NullWorkspaceLock, WorkspaceLock
+from orchestrator.tools.locks import (
+    KeyedLock,
+    NullWorkspaceLock,
+    ProcessKeyedLock,
+    WorkspaceLock,
+)
 from orchestrator.tools.mcp import MCPServerPool, register_mcp_tools
 from orchestrator.tools.read_document import ReadDocumentTool
 from orchestrator.tools.read_page import FigureDelivery, ReadPageTool
@@ -209,6 +214,9 @@ class ToolEnv:
     #: :class:`NullWorkspaceLock` (single process / tests); the control plane
     #: injects a Postgres advisory-lock implementation in production.
     workspace_lock: WorkspaceLock = field(default_factory=NullWorkspaceLock)
+    #: B-236 —— 对话开场复制(``conversation_seed``)按对话互斥的锁。默认是进程内的;
+    #: 控制面注入 Postgres advisory-lock 实现(独立 classid,不是上面那把按用户的写锁)。
+    conversation_seed_lock: KeyedLock = field(default_factory=ProcessKeyedLock)
     #: B-122 —— 这是一次动态子智能体(worker)构建。控制面在 ``make_worker_build_fn``
     #: 里置 True(孙级复用同一个 env,自动带上);主 Agent、静态子 Agent 恒为 False。
     #: 为 True 时:不注册 ``WORKER_DENIED_BUILTINS``(含基础能力 ``save_artifact``)、

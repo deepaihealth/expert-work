@@ -195,10 +195,9 @@ class _FsSandbox(RecordingSandboxRuntime):
         has_skills: bool = False,
         egress: EgressContext | None = None,
         conv_id: UUID | None = None,
-        compat_dirs: tuple[str, ...] = (),
         workspace_thread_id: UUID | None = None,
     ) -> SandboxOutcome:
-        del timeout_s, agent_key, run_id, has_skills, egress, conv_id, compat_dirs
+        del timeout_s, agent_key, run_id, has_skills, egress, conv_id
         del workspace_thread_id
         self.execs.append((sandbox_id, code))
         for rel, content in self.files.items():
@@ -398,7 +397,6 @@ class _ViewedSandbox(RecordingSandboxRuntime):
         has_skills: bool = False,
         egress: EgressContext | None = None,
         conv_id: UUID | None = None,
-        compat_dirs: tuple[str, ...] = (),
         workspace_thread_id: UUID | None = None,
     ) -> SandboxOutcome:
         await super().exec(
@@ -410,7 +408,6 @@ class _ViewedSandbox(RecordingSandboxRuntime):
             has_skills=has_skills,
             egress=egress,
             conv_id=conv_id,
-            compat_dirs=compat_dirs,
             workspace_thread_id=workspace_thread_id,
         )
         own = conv_id or workspace_thread_id
@@ -451,5 +448,5 @@ async def test_ingest_exec_carries_the_agent_and_the_own_thread() -> None:
     )
     assert client.exec_agent_keys == ["plan-aaaaaaaa"]
     assert client.exec_thread_ids == [UUID(_THREAD)]
-    assert client.exec_views == [(UUID(_THREAD), ())]
+    assert client.exec_views == [UUID(_THREAD)]
     assert update["plan"].steps[2].description == "review twice"

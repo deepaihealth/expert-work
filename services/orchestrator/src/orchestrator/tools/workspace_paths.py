@@ -68,12 +68,6 @@ _SHARED_DIR = WORKSPACE_SHARED_DIR
 #: 文档共用一个 out_dir)。
 _WRITE_TOOLS = frozenset({"write_file", "edit_file", "read_page"})
 
-#: B-236 M4 —— 过渡期目录在 exec 里是只读 bind;宿主侧这两个改字节的文件工具对它同样拒写
-#: (它们经 ``/agent`` 视图落盘,不拒就绕过了那层只读)。``read_page`` 不在里面:它的渲染
-#: 产物落 agent 根的 ``.tool_results/``,不落进过渡期目录;``save_artifact`` 只读源文件做
-#: 快照,也不在里面。
-_COMPAT_READ_ONLY_TOOLS = frozenset({"write_file", "edit_file"})
-
 #: B-225 —— skill files are seeded outside the workspace, under
 #: ``SANDBOX_SKILLS_ROOT``; models reach for them with ``../opt/skills/…``. The
 #: rejection names the two ways that work, so the next call does not guess.
@@ -112,12 +106,14 @@ def agent_view_alias(agent_key: str) -> str:
 
 
 #: B-236 —— 工具描述里讲路径规矩的那一句,文件类工具共用一份(措辞两种视图都成立:
-#: 老视图里 ``/workspace`` 与 ``/agent`` 是同一个目录)。
+#: 老视图里 ``/workspace`` 与 ``/agent`` 是同一个目录,没有副本可言)。对话视图里
+#: ``/workspace`` 开场时带着 agent 根各目录的副本(``conversation_seed``),改副本只影响本对话。
 WORKSPACE_PATH_RULE = (
     "Relative paths and /workspace/... refer to the sandbox working directory — in a "
-    "conversation started after this release, that conversation's own directory; "
-    "/agent/... is this agent's directory, kept across all of its conversations "
-    "(templates, style guides, helper scripts meant for reuse belong there)."
+    "conversation started after this release, that conversation's own directory, which "
+    "starts with copies of the agent's directories; /agent/... is this agent's directory, "
+    "kept across all of its conversations. Editing a copy changes only this conversation; "
+    "put anything meant for later conversations under /agent/."
 )
 #: B-236 —— ``bash`` / ``exec_python`` 描述里讲工作目录的那一句。口径照 B-60 spec §4.7/§五:
 #: 不说「隔离」「看不见」,只说默认视图里有什么 —— 命名空间对故意的代码不是绝对边界。
@@ -125,9 +121,10 @@ WORKSPACE_PATH_RULE = (
 #: 读到的也是这一句,那里 ``/workspace`` 就是 agent 目录。
 EXEC_WORKSPACE_NOTE = (
     "Runs in /workspace. In a conversation started after this release, /workspace is "
-    "that conversation's own working directory; in an older conversation it is the "
-    "agent's directory. /agent/ is always this agent's directory, shared by all of "
-    "its conversations — put files meant to be reused by later conversations "
+    "that conversation's own working directory, which starts with copies of the agent's "
+    "directories (editing a copy changes only this conversation); in an older "
+    "conversation it is the agent's directory. /agent/ is always this agent's directory, "
+    "shared by all of its conversations — put files meant for later conversations "
     "(templates, style guides, helper scripts) there. Other agents' files are not "
     "part of the default view. Uploaded files are in uploads/."
 )
@@ -151,41 +148,27 @@ PLATFORM_DIRS: tuple[str, ...] = (
     WORKSPACE_OVERFLOW_DIR,
 )
 
-#: 不许当过渡期目录的名字 —— 与 ``EXEC_VIEW_SCRIPT`` 里那条 ``case`` 同一组。
-_COMPAT_RESERVED = frozenset(
+#: B-236 —— agent 根下不算「基础目录」的一级名字:布局与平台自己的目录。开场复制
+#: (``conversation_seed``)与运行结束时的版本留存(``agent_file_versions``)都不碰它们;
+#: 点开头的名字另由调用方跳过。
+AGENT_ROOT_RESERVED = frozenset(
     {THREADS_DIR, *PLATFORM_DIRS, WORKSPACE_SHARED_DIR, WORKSPACE_SKILLS_DIR, AGENTS_DIR}
 )
 
-ResolvedKind = Literal["conversation", "agent", "platform", "compat", "shared", "legacy"]
+#: B-236 第三层 —— agent 自己的记忆索引(agent 根下,模型看到的是 ``/agent/AGENT_NOTES.md``)。
+#: 刻意不叫 ``MEMORY.md``:那个名字是老视图里平台投影长期记忆的文件。委派子代不许写它
+#: (``file_ops``),对话第一次 run 开场时读一次(``graph_builder.agent_notes``)。
+AGENT_NOTES_FILE = "AGENT_NOTES.md"
 
-
-def require_compat_dir_name(name: str) -> str:
-    """过渡期目录名必须是 agent 根下的一级目录名,且不是布局保留名。不合法就 ``ValueError``。
-
-    review 4 —— 还必须能编码成 UTF-8。老对话在 agent 根解压过 Windows zip 时,GBK 文件名在
-    ``os.listdir`` 里是孤立的代理字符(surrogateescape);它一旦进了名单,ACS 的命令串在
-    e2b 的 protobuf 编码那一步 ``UnicodeEncodeError``,这个 agent 每个新对话的每次 exec
-    都失败,直到窗口关上。这样的目录不映射(:func:`workspace_compat._mappable` 跳过它)。
-    """
-    if not name or name in (".", "..") or "/" in name or "\0" in name or name in _COMPAT_RESERVED:
-        msg = f"not a mappable workspace directory name: {name!r}"
-        raise ValueError(msg)
-    try:
-        name.encode("utf-8")
-    except UnicodeEncodeError:
-        msg = f"workspace directory name is not valid UTF-8: {name!r}"
-        raise ValueError(msg) from None
-    return name
+ResolvedKind = Literal["conversation", "agent", "platform", "shared", "legacy"]
 
 
 @dataclass(frozen=True)
 class WorkspaceView:
-    """一次工具调用看到的工作区:哪个 agent、哪个对话、过渡期映射哪些目录。
+    """一次工具调用看到的工作区:哪个 agent、哪个对话。
 
     ``conv_id`` 为 ``None`` = 老视图(``/workspace`` 与 ``/agent`` 都是 agent 根),
-    发布前已开的对话、合成执行路径与未绑 agent 的调用都是这一档。``compat_dirs`` 只在
-    对话视图里有意义,由 :mod:`orchestrator.tools.workspace_compat` 在宿主侧算好,与 exec
-    收到的是同一份。
+    发布前已开的对话、合成执行路径与未绑 agent 的调用都是这一档。
 
     ``thread_id`` 是本对话的线程 id:两种视图里 agent 根下的 ``threads/`` 都只留它那一格
     (老视图也不许看见别的对话 —— 包括发布后新开的对话的工作目录)。对话视图里它就是
@@ -194,7 +177,6 @@ class WorkspaceView:
 
     agent_key: str = ""
     conv_id: UUID | None = None
-    compat_dirs: tuple[str, ...] = ()
     thread_id: UUID | None = None
 
     @property
@@ -299,8 +281,8 @@ def resolve_workspace_path(path: str, *, view: WorkspaceView, tool: str) -> Reso
     * ``/agent`` / ``/agent/x`` —— agent 根(所有对话共用);``threads`` / ``agents`` /
       ``shared`` 开头拒。老写法 ``/workspace/agents/<自己>/x`` 一直指 agent 根,同此。
     * ``/workspace/x`` 或相对 ``x``:老视图 —— agent 根,与 B-236 之前逐字相同;对话视图 ——
-      首段是平台目录(``uploads`` / ``inputs`` / ``.tool_results``)走 agent 根,首段是过渡期
-      目录走 agent 根(只读:``write_file`` / ``edit_file`` 拒),其余是本对话自己的目录。
+      首段是平台目录(``uploads`` / ``inputs`` / ``.tool_results``)走 agent 根,其余是本对话
+      自己的目录(开场复制进来的基础目录副本也在这里)。
     """
     raw = path.strip()
     if not raw:
@@ -351,24 +333,7 @@ def resolve_workspace_path(path: str, *, view: WorkspaceView, tool: str) -> Reso
         return ResolvedPath(ws=EXEC_VIEW, rel=rel, kind="legacy", path=rel)
     if head in PLATFORM_DIRS:
         return ResolvedPath(ws=AGENT_VIEW, rel=rel, kind="platform", path=rel)
-    if head and head in view.compat_dirs:
-        if tool in _COMPAT_READ_ONLY_TOOLS:
-            raise ValueError(_compat_write_message(tool, head, rel, raw=path))
-        return ResolvedPath(ws=AGENT_VIEW, rel=rel, kind="compat", path=rel)
     return ResolvedPath(ws=EXEC_VIEW, rel=rel, kind="conversation", path=rel)
-
-
-def _compat_write_message(tool: str, head: str, rel: str, *, raw: str) -> str:
-    """拒写过渡期目录时给模型的话:为什么只读、两条能走的路(本对话自己的目录 / 要共享就写
-    ``/agent/<目录>/``),路径都能原样再传回来。"""
-    rest = rel[len(head) :].lstrip("/") or "<file>"
-    return (
-        f"{tool} cannot write {raw!r}: {head}/ is a read-only view of the agent's old "
-        f"{head}/ directory during the workspace transition. Write it under this "
-        f"conversation's own directory instead (e.g. {rest!r}), or to "
-        f"'{AGENT_VIEW}/{head}/{rest}' if the file is meant to be shared by every "
-        "conversation of this agent."
-    )
 
 
 def _agent_spelling(rel: str) -> str:
@@ -379,8 +344,8 @@ def agent_relative(target: ResolvedPath, view: WorkspaceView) -> str:
     """``target`` 相对 **agent 根**(``/agent``)的写法 —— 产物登记、渲染页落点与宿主侧
     查找都按这个物理位置算,不随模型用的是哪种写法变。
 
-    对话目录里的 ``x`` 是 ``threads/<conv>/work/x``;其余(agent 根、平台目录、过渡期目录、
-    老视图)本来就相对 agent 根。共享区不在 agent 根下,没有这种写法。
+    对话目录里的 ``x`` 是 ``threads/<conv>/work/x``;其余(agent 根、平台目录、老视图)本来
+    就相对 agent 根。共享区不在 agent 根下,没有这种写法。
     """
     if target.kind == "shared":
         msg = "the shared area is not under the agent root"

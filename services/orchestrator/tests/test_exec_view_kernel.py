@@ -23,7 +23,6 @@ import textwrap
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
-from uuid import UUID
 
 import pytest
 
@@ -78,14 +77,14 @@ def chown_all():
     os.chown(U, 10000, 10000)
 
 
-def argv_of(code, conv="", own=None, compat=(), key="a"):
+def argv_of(code, conv="", own=None, key="a"):
     chown_all()
     root = "/mnt/workspace/agents/" + key if key else ""
     own = conv if own is None else own
     return [
         "setpriv", "--reuid", "10000", "--regid", "10000", "--clear-groups",
         "sh", "-c", 'umask 077 && exec "$@"', "x",
-        *PREFIX, root, conv, own, str(len(compat)), *compat, "sh", "-c", code,
+        *PREFIX, root, conv, own, "sh", "-c", code,
     ]
 
 
@@ -396,68 +395,27 @@ def test_planted_symlinks_are_skipped_or_refused(scenario: Scenario) -> None:
     assert root["rc"] == 98 and root["out"] == "", root
 
 
-def test_compat_dirs_map_read_only_and_only_when_the_conversation_has_none(
-    scenario: Scenario,
-) -> None:
-    """B-236 M4 —— 过渡期目录只读映射:老锚点读得到,写一律 EROFS(两个对话不能再经由
-    agent 根的同一个老目录互相覆盖);本对话自己有内容就不映射;根下的单个文件、指向别处
-    的符号链接从不映射。"""
-    r = scenario(f"""
-        put("agents/a/style/s.md", "anchor\\n")
-        mkd("agents/a/own")
-        mkd("agents/a/stub")
-        put("agents/a/notes.md", "root file")
-        mkd("agents/a/threads/{_OTHER}")
-        link("agents/a/linked", "threads/{_OTHER}")
-        put("agents/a/threads/{_CONV}/work/own/x", "mine")
-        mkd("agents/a/threads/{_CONV}/work/stub")
-        run = ex(
-            "cat style/s.md; (echo w > style/a) 2>&1 | grep -c 'Read-only file system'; "
-            "echo w > own/y; " + MOUNTS,
-            conv="{_CONV}",
-            compat=("style", "own", "stub", "notes.md", "absent", "linked"),
-        )
-        result["run"] = run
-        result["mounts"] = mounts_of(run)
-        result["style_a"] = os.path.exists(AG + "/style/a")
-        result["legacy"] = ex("ls -A /workspace | grep -c style", own="", compat=("style",))
-    """)
-    run = r["run"]
-    assert run["rc"] == 0, run["err"]
-    assert run["out"].splitlines()[:2] == ["anchor", "1"]
-    assert r["style_a"] is False  # 经 style/ 的写没有落到 agents/<key>/style/
-    mounts = r["mounts"]
-    assert mounts["/workspace/style"].startswith("ro,nosuid,nodev,noexec"), mounts
-    assert mounts["/workspace/stub"].startswith("ro,nosuid,nodev,noexec"), mounts
-    for d in ("own", "notes.md", "absent", "linked"):
-        assert f"/workspace/{d}" not in mounts, (d, mounts)
-    legacy = r["legacy"]
-    assert legacy["rc"] == 0, legacy["err"]
-    assert legacy["out"].strip() == "1"  # 老视图:/workspace 就是 agent 根,style 原样在,不挂
-
-
 def test_mount_target_swapped_for_a_symlink_at_mount_time(scenario: Scenario) -> None:
-    """review 3 CRITICAL 的回归用例(PoC 的确定性版):脚本要把过渡期目录 ``style``(agent 根
-    下、载荷可写,里面种了一个假的 ``stat``)挂到本对话 ``work/style`` 这个挂载桩上 —— 挂载
+    """review 3 CRITICAL 的回归用例(PoC 的确定性版):脚本要把平台目录 ``uploads``(agent 根
+    下、载荷可写,里面种了一个假的 ``stat``)挂到本对话 ``work/uploads`` 这个挂载桩上 —— 挂载
     已经开始、还没执行时,把挂载桩换成指向 ``/usr/local/bin`` 的符号链接。按路径名挂载会跟着
-    链接把 ``style`` 盖到 ``/usr/local/bin`` 上(旧脚本随后按 ``PATH`` 执行的 ``stat`` 就是
+    链接把 ``uploads`` 盖到 ``/usr/local/bin`` 上(旧脚本随后按 ``PATH`` 执行的 ``stat`` 就是
     种下的那个,它还握着这个 mount ns 的全部能力);按 fd 挂,挂载落在原来那个目录上(此刻它
     叫 ``.lnk``),``/usr/local/bin`` 原封不动,载荷照常跑完。"""
     r = scenario(f"""
-        put("agents/a/style/s.md", "anchor\\n")
-        put("agents/a/style/stat", "#!/bin/sh" + chr(10) + "echo evil-stat >&2" + chr(10)
+        put("agents/a/uploads/s.md", "anchor\\n")
+        put("agents/a/uploads/stat", "#!/bin/sh" + chr(10) + "echo evil-stat >&2" + chr(10)
             + "exec /usr/bin/stat -L " + chr(34) + "$@" + chr(34) + chr(10))
-        os.chmod(AG + "/style/stat", 0o755)
-        mkd("agents/a/threads/{_CONV}/work/style")
+        os.chmod(AG + "/uploads/stat", 0o755)
+        mkd("agents/a/threads/{_CONV}/work/uploads")
         result["run"] = ex_racing(
             "grep -c ' /usr/local/bin ' /proc/self/mountinfo; "
             "test -x /usr/local/bin/python3 && echo python-ok; cat .lnk/s.md; echo ran",
-            "style",
-            AG + "/threads/{_CONV}/work/style",
+            "uploads",
+            AG + "/threads/{_CONV}/work/uploads",
             ".lnk",
             "/usr/local/bin",
             conv="{_CONV}",
-            compat=("style",),
         )
     """)
     run = r["run"]
@@ -465,51 +423,3 @@ def test_mount_target_swapped_for_a_symlink_at_mount_time(scenario: Scenario) ->
     assert run["rc"] == 0, run["err"]
     assert "evil-stat" not in run["err"]
     assert run["out"].splitlines() == ["0", "python-ok", "anchor", "ran"], run
-
-
-async def test_compat_predicate_matches_the_host_side(
-    scenario: Scenario,
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """计划测试 10 —— 同一棵树,宿主侧 ``discover_compat_dirs`` 选中的目录与脚本真的
-    bind 的目录必须是同一组(两边各写一份判据:不存在,或只是一个空的真目录)。"""
-    from orchestrator.tools.nas_workspace_store import NasWorkspaceStore
-    from orchestrator.tools.workspace_compat import COMPAT_UNTIL_ENV, discover_compat_dirs
-    from orchestrator.tools.workspace_paths import WorkspaceView
-
-    tenant, user = UUID(int=7), UUID(int=8)
-    host_root = tmp_path / "host"
-    agent = host_root / str(tenant) / str(user) / "agents" / "plan-aaaaaaaa"
-    work = agent / "threads" / _CONV / "work"
-    for d in ("style", "own", "stub", "linked-target"):
-        (agent / d).mkdir(parents=True)
-    (agent / "linked").symlink_to(agent / "linked-target")
-    (work / "own").mkdir(parents=True)
-    (work / "own" / "x").write_text("mine")
-    (work / "stub").mkdir()
-    (work / "linked-target").symlink_to(agent / "style")
-    candidates = ["linked", "linked-target", "own", "stub", "style"]
-
-    monkeypatch.setenv(COMPAT_UNTIL_ENV, "2099-12-31")
-    host = await discover_compat_dirs(
-        NasWorkspaceStore(root=str(host_root)),
-        tenant_id=tenant,
-        user_id=user,
-        view=WorkspaceView(agent_key="plan-aaaaaaaa", conv_id=UUID(_CONV)),
-    )
-    r = scenario(f"""
-        for d in ("style", "own", "stub", "linked-target"):
-            mkd("agents/a/" + d)
-        link("agents/a/linked", "linked-target")
-        put("agents/a/threads/{_CONV}/work/own/x", "mine")
-        mkd("agents/a/threads/{_CONV}/work/stub")
-        link("agents/a/threads/{_CONV}/work/linked-target", "/mnt/workspace/agents/a/style")
-        run = ex(MOUNTS, conv="{_CONV}", compat={candidates!r})
-        result["run"] = run
-        result["bound"] = sorted(
-            p.rsplit("/", 1)[-1] for p in mounts_of(run) if p.rsplit("/", 1)[-1] in {candidates!r}
-        )
-    """)
-    assert host == ("stub", "style")
-    assert tuple(r["bound"]) == host

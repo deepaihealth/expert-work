@@ -364,7 +364,6 @@ class SandboxRuntime(Protocol):
         has_skills: bool = False,
         egress: EgressContext | None = None,
         conv_id: UUID | None = None,
-        compat_dirs: tuple[str, ...] = (),
         workspace_thread_id: UUID | None = None,
     ) -> SandboxOutcome:
         """Run ``code`` in the sandbox; return its captured outcome.
@@ -388,9 +387,8 @@ class SandboxRuntime(Protocol):
         给,不能跟着沙箱走。云上后端据此每次注入 / 置空代理变量;本地 supervisor 后端
         的出网变量在 ``docker run`` 时按容器烤定,忽略它。
 
-        ``conv_id`` / ``compat_dirs``(B-236)—— 非 ``None`` 时本次 exec 的 ``/workspace``
-        是该对话自己的目录(``agents/<key>/threads/<conv>/work``),``/agent`` 是 agent 根;
-        ``compat_dirs`` 是过渡期映射进 ``/workspace`` 的 agent 根目录名。
+        ``conv_id``(B-236)—— 非 ``None`` 时本次 exec 的 ``/workspace`` 是该对话自己的
+        目录(``agents/<key>/threads/<conv>/work``),``/agent`` 是 agent 根。
         ``workspace_thread_id`` 是本对话的线程 id:两种视图里 ``threads/`` 都只留它那一格
         (``None`` = 一格都不留)。只在绑了 agent 时有意义;``run_in_sandbox`` 从
         ``ctx.workspace_view`` 取,wrapper 原样透传。
@@ -477,7 +475,6 @@ class HTTPSupervisorRuntime:
         has_skills: bool = False,
         egress: EgressContext | None = None,
         conv_id: UUID | None = None,
-        compat_dirs: tuple[str, ...] = (),
         workspace_thread_id: UUID | None = None,
     ) -> SandboxOutcome:
         # B-217 —— the docker supervisor bakes each container's egress env at
@@ -505,8 +502,6 @@ class HTTPSupervisorRuntime:
             # /agent。未绑 agent 时没有对话视图可言,两项都不发。
             if conv_id is not None:
                 payload["conv_id"] = str(conv_id)
-                if compat_dirs:
-                    payload["compat_dirs"] = list(compat_dirs)
             if workspace_thread_id is not None:
                 payload["thread_id"] = str(workspace_thread_id)
         # The sandbox enforces the exec wall-clock (it SIGKILLs + returns
@@ -622,8 +617,8 @@ class RecordingSandboxRuntime:
     exec_has_skills: list[bool] = field(default_factory=list)
     #: B-217 — the ``egress`` passed to each exec (same reasoning).
     exec_egress: list[EgressContext | None] = field(default_factory=list)
-    #: B-236 — the ``(conv_id, compat_dirs)`` passed to each exec (same reasoning).
-    exec_views: list[tuple[UUID | None, tuple[str, ...]]] = field(default_factory=list)
+    #: B-236 — the ``conv_id`` passed to each exec (same reasoning).
+    exec_views: list[UUID | None] = field(default_factory=list)
     #: B-236 — the ``workspace_thread_id`` passed to each exec (same reasoning).
     exec_thread_ids: list[UUID | None] = field(default_factory=list)
     released: list[UUID] = field(default_factory=list)
@@ -657,7 +652,6 @@ class RecordingSandboxRuntime:
         has_skills: bool = False,
         egress: EgressContext | None = None,
         conv_id: UUID | None = None,
-        compat_dirs: tuple[str, ...] = (),
         workspace_thread_id: UUID | None = None,
     ) -> SandboxOutcome:
         del timeout_s
@@ -666,7 +660,7 @@ class RecordingSandboxRuntime:
         self.exec_run_ids.append(run_id)
         self.exec_has_skills.append(has_skills)
         self.exec_egress.append(egress)
-        self.exec_views.append((conv_id, compat_dirs))
+        self.exec_views.append(conv_id)
         self.exec_thread_ids.append(workspace_thread_id)
         if self.exec_error is not None:
             raise self.exec_error
@@ -730,7 +724,6 @@ class _EgressBindingClient:
         has_skills: bool = False,
         egress: EgressContext | None = None,
         conv_id: UUID | None = None,
-        compat_dirs: tuple[str, ...] = (),
         workspace_thread_id: UUID | None = None,
     ) -> SandboxOutcome:
         # This wrapper doesn't own agent_key, run_id or has_skills — it's a pure
@@ -747,7 +740,6 @@ class _EgressBindingClient:
             has_skills=has_skills,
             egress=self.egress,
             conv_id=conv_id,
-            compat_dirs=compat_dirs,
             workspace_thread_id=workspace_thread_id,
         )
 
@@ -815,7 +807,6 @@ class _AgentKeyBindingClient:
         has_skills: bool = False,
         egress: EgressContext | None = None,
         conv_id: UUID | None = None,
-        compat_dirs: tuple[str, ...] = (),
         workspace_thread_id: UUID | None = None,
     ) -> SandboxOutcome:
         # B-124 —— 调用方给了 key 就用调用方的:``run_in_sandbox`` 传 ``ctx.agent_key``,
@@ -834,7 +825,6 @@ class _AgentKeyBindingClient:
             has_skills=has_skills,
             egress=egress,
             conv_id=conv_id,
-            compat_dirs=compat_dirs,
             workspace_thread_id=workspace_thread_id,
         )
 
@@ -950,7 +940,6 @@ async def run_in_sandbox(
             # 技能:种子非空 = 这次 acquire 把技能落到了 /opt/skills/<agent_key>/。
             has_skills=bool(seed_files),
             conv_id=view.conv_id,
-            compat_dirs=view.compat_dirs,
             workspace_thread_id=view.thread_id,
         )
     except asyncio.CancelledError:
@@ -1113,12 +1102,8 @@ class ExecPythonTool:
         )
 
     async def call(self, args: Mapping[str, Any], *, ctx: ToolContext) -> ToolResult:
-        # 本模块被 workspace_compat 引用(异常类型),顶层互相 import 会成环。
-        from orchestrator.tools.workspace_compat import record_exec_refs
-
         code = self._require_code(args)
         timeout_s = coerce_timeout(args.get("timeout_s"))
-        record_exec_refs(ctx, code)
         outcome = await run_in_sandbox(
             self.client,
             code=code,

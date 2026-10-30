@@ -255,6 +255,7 @@ from control_plane.runtime import (
     ResolvingProviderKeys,
     _build_mcp_client,
     _resolve_template_extends,
+    build_agent_file_version_store,
     build_artifact_snapshot_store,
     build_mcp_pool,
     build_middleware_env,
@@ -294,7 +295,7 @@ from control_plane.transcript_mirror_sweep import TranscriptMirrorSweep
 from control_plane.user_mcp_oauth_pool import UserMcpOAuthPoolService
 from control_plane.webhook_delivery_worker import WebhookDeliveryWorker
 from control_plane.workspace_janitor import WorkspaceJanitorWorker
-from control_plane.workspace_lock import PgWorkspaceLock
+from control_plane.workspace_lock import PgConversationSeedLock, PgWorkspaceLock
 from control_plane.workspace_quota import WorkspaceQuotaService
 from expert_work.common.credentials import CredentialsResolver
 from expert_work.common.health import DefaultHealthProvider
@@ -866,6 +867,10 @@ def create_app(
     # control-plane(只有它能 import ``transcript.extract_turns``,对外消息
     # 端点的同一口径),orchestrator 那侧只有 Protocol,这里注入。
     resolved_agent_runtime.thread_stats_recorder = ThreadStatsRecorderImpl(threads=resolved_threads)
+    # B-236 第三层 —— /agent 文件的版本放在 NAS 上用户根旁边;只有 NAS 后端有。
+    resolved_agent_runtime.agent_file_versions = build_agent_file_version_store(
+        resolved_workspace_store
+    )
     # Late-bound PII resolver: lets the audit logger reference
     # tenant_config without forcing it to exist yet (D.2 cycle break).
     pii_resolver = TenantConfigPiiResolver()
@@ -1846,6 +1851,12 @@ def create_app(
                         if sql_stores is not None
                         else None
                     ),
+                    # B-236 —— 对话开场复制按对话互斥(独立 classid,不是上面那把按用户的锁)。
+                    conversation_seed_lock=(
+                        PgConversationSeedLock(create_async_session_factory(sql_stores.engine))
+                        if sql_stores is not None
+                        else None
+                    ),
                 )
                 # Stream HX-7 — resolve the Langfuse client once: the
                 # SDK adapter when the deployment configures an instance,
@@ -2780,6 +2791,8 @@ def create_app(
     app.state.sandbox_runtime = resolved_sandbox_runtime
     app.state.workspace_store = resolved_workspace_store
     app.state.artifact_snapshots = resolved_artifact_snapshots
+    # B-236 第三层 —— 清除用户时连同 /agent 文件的历史版本一起删(``purge_user``)。
+    app.state.agent_file_versions = resolved_agent_runtime.agent_file_versions
     app.state.audit_logger = resolved_audit
     app.state.manifest_loader = resolved_loader
     app.state.jwt_verifier = resolved_verifier

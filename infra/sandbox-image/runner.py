@@ -7,7 +7,7 @@ writes one request object per line, and reads one response per line:
     → {"code": "<python source>", "timeout_s": 30}
     → {"code": "...", "timeout_s": 30, "envs": {"PYTHONUSERBASE": "/opt/agents/a1"},
        "agent_root": "/mnt/workspace/agents/a1",
-       "conv_id": "<uuid>", "thread_id": "<uuid>", "compat_dirs": ["style"]}
+       "conv_id": "<uuid>", "thread_id": "<uuid>"}
     ← {"stdout": "...", "stderr": "...", "exit_code": 0, "timed_out": false}
 
 ``envs`` (sandbox migration wave 2, spec 决策 10) is optional and merged onto
@@ -19,13 +19,12 @@ mount. The runner binds it as ``/workspace`` inside a private mount
 namespace it creates for this one exec, so the child's ``/workspace`` is
 that agent's directory and no other agent's directory is even there.
 
-``conv_id`` / ``compat_dirs`` (B-236) are optional too: with a ``conv_id``
-the child's ``/workspace`` is that conversation's own directory
+``conv_id`` (B-236) is optional too: with a ``conv_id`` the child's
+``/workspace`` is that conversation's own directory
 (``<agent_root>/threads/<conv_id>/work``) and ``/agent`` is the agent
 directory; ``thread_id`` is the conversation's own thread (the one
 ``threads/<id>/`` left visible — every other conversation's directory is
-covered in both views); ``compat_dirs`` are agent-directory names mapped into
-``/workspace`` during the transition window.
+covered in both views).
 
 The submitted code runs in a *child* ``python -c`` process rather than in
 this interpreter. A child is killable on timeout and isolates a crashing
@@ -63,7 +62,7 @@ MAX_OUTPUT_CHARS = 1_000_000
 #: 契约测试 ``test_exec_view_script_matches_the_sandbox_image`` 用 ast 比对两份字面量,
 #: 改一边必红)。参数走位置参数:``$1`` = bind 源(空串 = 未绑,bind 整个用户根),
 #: ``$2`` = 对话 id(B-236,空串 = 老视图),``$3`` = 本对话线程 id(老视图里留出自己那一格
-#: ``threads/<id>/``),``$4`` = 过渡期目录个数,其后是目录名。挂载阶段由脚本内嵌的一段
+#: ``threads/<id>/``),其后是载荷 argv。挂载阶段由脚本内嵌的一段
 #: ``/usr/local/bin/python3 -I -S`` 按 fd 完成(``open_tree`` / ``move_mount``,理由见
 #: ``exec_view`` 的模块文档),所以镜像必须在这个绝对路径上有 python。它只分隔 NAS 视图:
 #: ``/tmp`` / ``$HOME`` / ``/opt/agents`` / ``/opt/skills`` 是这个沙箱里所有 exec(同一用户的
@@ -72,17 +71,10 @@ _EXEC_VIEW_SCRIPT = """\
 set -eu
 ew_path="${PATH-}"
 PATH=/usr/sbin:/usr/bin:/sbin:/bin
-root="$1"; conv="$2"; own="$3"; n="$4"; shift 4
+root="$1"; conv="$2"; own="$3"; shift 3
 if [ ! -d /agent ]; then
   echo "ew-exec-view: image lacks /agent" >&2
   exit 97
-fi
-case "$n" in
-  ''|*[!0-9]*) echo "ew-exec-view: bad compat count" >&2; exit 98 ;;
-esac
-if [ "$n" -gt "$#" ]; then
-  echo "ew-exec-view: bad compat count" >&2
-  exit 98
 fi
 for id in "$conv" "$own"; do
   case "$id" in
@@ -92,15 +84,6 @@ done
 if [ -n "$conv" ]; then
   own="$conv"
 fi
-i=0
-for d in "$@"; do
-  [ "$i" -lt "$n" ] || break
-  case "$d" in
-    ''|.|..|*/*|threads|uploads|inputs|.tool_results|shared|skills|agents)
-      echo "ew-exec-view: bad compat dir" >&2; exit 98 ;;
-  esac
-  i=$((i + 1))
-done
 /usr/local/bin/python3 -I -S -c '
 import ctypes, os, stat, sys
 
@@ -117,7 +100,6 @@ CLONE = 0x1 | os.O_CLOEXEC | 0x1000  # OPEN_TREE_CLONE | OPEN_TREE_CLOEXEC | AT_
 MOVE = 0x4 | 0x40  # MOVE_MOUNT_F_EMPTY_PATH | MOVE_MOUNT_T_EMPTY_PATH
 REMOUNT_RO = 0x20 | 0x1000 | 0x1 | 0x2 | 0x4 | 0x8  # REMOUNT BIND RDONLY NOSUID NODEV NOEXEC
 DIR = os.O_PATH | os.O_NOFOLLOW | os.O_DIRECTORY | os.O_CLOEXEC
-LIST = os.O_RDONLY | os.O_NOFOLLOW | os.O_DIRECTORY | os.O_CLOEXEC
 PLATFORM_DIRS = ("uploads", "inputs", ".tool_results")
 
 
@@ -140,11 +122,11 @@ def die(msg):
     sys.exit(98)
 
 
-def sub(fd, name, make, flags=DIR):
+def sub(fd, name, make):
     if name in ("", ".", "..") or "/" in name:
         raise OSError(22, "bad name")
     try:
-        got = os.open(name, flags, dir_fd=fd)
+        got = os.open(name, DIR, dir_fd=fd)
     except FileNotFoundError:
         if not make:
             raise
@@ -152,7 +134,7 @@ def sub(fd, name, make, flags=DIR):
             os.mkdir(name, 0o777, dir_fd=fd)
         except FileExistsError:
             pass
-        got = os.open(name, flags, dir_fd=fd)
+        got = os.open(name, DIR, dir_fd=fd)
     if not stat.S_ISDIR(os.fstat(got).st_mode):
         os.close(got)
         raise NotADirectoryError(20, "not a directory")
@@ -203,7 +185,7 @@ def hide_threads(view, own_dir, own):
         bind(own_dir, slot)
 
 
-def main(root, conv, own, compat):
+def main(root, conv, own):
     nas = os.open("/mnt/workspace", os.O_PATH | os.O_DIRECTORY | os.O_CLOEXEC)
     agent = os.open("/agent", DIR)
     workspace = os.open("/workspace", DIR)
@@ -256,27 +238,14 @@ def main(root, conv, own, compat):
             say("/workspace/shared is not a directory; shared/ not mounted")
         else:
             bind_ro(shared, target, "shared/")
-    for d in compat if conv else ():
-        try:
-            source = sub(top, d, False)
-            target = sub(ws, d, True, LIST)
-            if os.listdir(target):
-                continue
-        except OSError:
-            continue
-        try:
-            bind_ro(source, target, d + "/")
-        except OSError as e:
-            say(d + "/ not mounted: " + str(e))
     attach(tmpfs((b"size", b"1k")), nas)
 
 
 try:
-    main(sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[5 : 5 + int(sys.argv[4])])
+    main(sys.argv[1], sys.argv[2], sys.argv[3])
 except OSError as e:
     die("mount failed: " + str(e))
-' "$root" "$conv" "$own" "$n" "$@"
-shift "$n"
+' "$root" "$conv" "$own"
 cd /workspace
 PATH="$ew_path"
 exec /usr/bin/unshare -Ur -- "$@"
@@ -292,7 +261,6 @@ def _exec_argv(
     code: str,
     agent_root: str | None,
     conv_id: str | None = None,
-    compat_dirs: list[str] | None = None,
     thread_id: str | None = None,
 ) -> list[str]:
     """The child process argv: the B-60 namespace wrapper around ``python -c code``.
@@ -304,12 +272,11 @@ def _exec_argv(
     ``test_sandbox_runtime_contract.test_exec_view_script_matches_the_sandbox_image``
     finds this list literal by ``ast`` and pins it against the orchestrator's copy.
 
-    B-236 —— the conversation id and the compat names only travel with an agent
-    root (no agent, no conversation view); the script re-validates every name.
+    B-236 —— the conversation and thread ids only travel with an agent root (no
+    agent, no conversation view); the script re-validates them.
     """
     conv = conv_id if agent_root and conv_id else ""
     thread = thread_id if agent_root and thread_id else ""
-    compat = list(compat_dirs or ()) if conv else []
     return [
         "unshare",
         "-Urm",
@@ -323,8 +290,6 @@ def _exec_argv(
         agent_root or "",
         conv,
         thread,
-        str(len(compat)),
-        *compat,
         # -E -P, deliberately NOT -I: -I implies -s, which kicks the user
         # site out of sys.path and silently breaks `pip install --user`
         # (the image's PIP_USER=1 flow). -E keeps PYTHON* env-config
@@ -343,7 +308,6 @@ def run_once(
     envs: dict[str, str] | None = None,
     agent_root: str | None = None,
     conv_id: str | None = None,
-    compat_dirs: list[str] | None = None,
     thread_id: str | None = None,
 ) -> Response:
     """Run ``code`` in a child Python process; capture stdout / stderr / exit.
@@ -369,7 +333,7 @@ def run_once(
     """
     timeout_s = max(1, min(timeout_s, MAX_TIMEOUT_S))
     child_env = {**os.environ, **envs} if envs else None
-    argv = _exec_argv(code, agent_root, conv_id, compat_dirs, thread_id)
+    argv = _exec_argv(code, agent_root, conv_id, thread_id)
     try:
         proc = subprocess.run(  # noqa: S603 - arbitrary code execution is the tool
             argv,
@@ -413,13 +377,9 @@ def handle_request(request: dict[str, object]) -> Response:
     agent_root = raw_root if isinstance(raw_root, str) and raw_root else None
     raw_conv = request.get("conv_id")
     conv_id = raw_conv if isinstance(raw_conv, str) and raw_conv else None
-    raw_compat = request.get("compat_dirs")
-    compat_dirs = (
-        [d for d in raw_compat if isinstance(d, str)] if isinstance(raw_compat, list) else None
-    )
     raw_thread = request.get("thread_id")
     thread_id = raw_thread if isinstance(raw_thread, str) and raw_thread else None
-    return run_once(code, timeout_s, envs, agent_root, conv_id, compat_dirs, thread_id)
+    return run_once(code, timeout_s, envs, agent_root, conv_id, thread_id)
 
 
 def handle_line(line: str) -> Response:

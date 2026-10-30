@@ -767,7 +767,6 @@ class _EchoRenderRuntime(RecordingSandboxRuntime):
         has_skills: bool = False,
         egress: EgressContext | None = None,
         conv_id: UUID | None = None,
-        compat_dirs: tuple[str, ...] = (),
         workspace_thread_id: UUID | None = None,
     ) -> SandboxOutcome:
         await super().exec(

@@ -15,7 +15,6 @@ from __future__ import annotations
 import contextlib
 import io
 import json
-import os
 from dataclasses import replace
 from pathlib import Path
 from typing import Any
@@ -46,12 +45,6 @@ from orchestrator.tools.sandbox import (
     WorkspacePathEscapeError,
 )
 from orchestrator.tools.sandbox_image_contract import AGENT_VIEW, EXEC_VIEW
-from orchestrator.tools.workspace_compat import (
-    COMPAT_UNTIL_ENV,
-    compat_dir_hits_total,
-    discover_compat_dirs,
-    name_shape,
-)
 from orchestrator.tools.workspace_paths import (
     ResolvedKind,
     WorkspaceView,
@@ -79,9 +72,7 @@ _CONV1 = WorkspaceView(agent_key=_KEY, conv_id=_C1, thread_id=_C1)
 _LEGACY = WorkspaceView(agent_key=_KEY, thread_id=_C1)
 
 
-def _ctx(
-    conv: UUID | None, *, layout: str = "conversation", compat: tuple[str, ...] = ()
-) -> ToolContext:
+def _ctx(conv: UUID | None, *, layout: str = "conversation") -> ToolContext:
     return ToolContext(
         tenant_id=_TENANT,
         user_id=_USER,
@@ -89,7 +80,6 @@ def _ctx(
         thread_id=conv,
         agent_key=_KEY,
         workspace_layout=layout,  # type: ignore[arg-type]
-        workspace_compat_dirs=compat,
     )
 
 
@@ -120,10 +110,9 @@ class _ViewRuntime(RecordingSandboxRuntime):
         has_skills: bool = False,
         egress: EgressContext | None = None,
         conv_id: UUID | None = None,
-        compat_dirs: tuple[str, ...] = (),
         workspace_thread_id: UUID | None = None,
     ) -> SandboxOutcome:
-        self.exec_views.append((conv_id, compat_dirs))
+        self.exec_views.append(conv_id)
         self.exec_thread_ids.append(workspace_thread_id)
         agent = _agent_root(self.root)
         work = _work(self.root, conv_id) if conv_id is not None else agent
@@ -180,14 +169,12 @@ def test_legacy_view_resolution_is_the_agent_root(
     assert (target.ws, target.rel, target.kind) == (ws, rel, kind)
 
 
-def test_compat_dir_resolves_to_the_agent_root_only_when_listed() -> None:
-    mapped = replace(_CONV1, compat_dirs=("style",))
-    assert resolve_workspace_path("style/a.md", view=mapped, tool="read_file").kind == "compat"
-    assert resolve_workspace_path("style/a.md", view=_CONV1, tool="read_file").kind == (
-        "conversation"
-    )
-    # 根下单个文件从不映射 —— 名单里只会有目录名,同名文件也照样落本对话。
-    assert resolve_workspace_path("style", view=mapped, tool="read_file").kind == "compat"
+def test_a_base_dir_name_is_this_conversations_own_copy() -> None:
+    """B-236 —— agent 根的基础目录在对话开场时复制进本对话:同名相对路径就是本对话自己的
+    目录,读写都落 ``work/``;要改所有对话共用的那份,写 ``/agent/<目录>/``。"""
+    for tool in ("read_file", "write_file", "edit_file", "save_artifact"):
+        target = resolve_workspace_path("style/a.md", view=_CONV1, tool=tool)
+        assert (target.ws, target.kind) == (EXEC_VIEW, "conversation")
 
 
 @pytest.mark.parametrize(
@@ -222,8 +209,6 @@ def test_view_is_legacy_unless_the_layout_is_conversation() -> None:
     assert _ctx(_C1, layout="agent_root").workspace_view == _LEGACY
     unbound = replace(_ctx(_C1), agent_key="")
     assert unbound.workspace_view.conv_id is None
-    # 过渡期名单只在对话视图里生效
-    assert _ctx(_C1, layout="agent_root", compat=("style",)).workspace_view.compat_dirs == ()
 
 
 # ---------------------------------------------------------------------------
@@ -323,172 +308,8 @@ async def test_a_legacy_exec_carries_its_own_thread_and_no_conversation(tmp_path
     await WriteFileTool(client=runtime).call(
         {"path": "a.md", "content": "x"}, ctx=_ctx(_C1, layout="agent_root")
     )
-    assert runtime.exec_views[-1] == (None, ())
+    assert runtime.exec_views[-1] is None
     assert runtime.exec_thread_ids[-1] == _C1
-
-
-# ---------------------------------------------------------------------------
-# 过渡期映射(计划测试 10 宿主侧 / 22)
-# ---------------------------------------------------------------------------
-
-
-def _compat_tree(root: Path) -> None:
-    agent = _agent_root(root)
-    work = _work(root, _C1)
-    for d in ("style", "own", "stub", ".hidden", "uploads", "threads"):
-        (agent / d).mkdir(parents=True, exist_ok=True)
-    (agent / "style" / "a.md").write_text("a")
-    (agent / "notes.md").write_text("root file")
-    (work / "own").mkdir(parents=True)
-    (work / "own" / "x").write_text("mine")
-    (work / "stub").mkdir()
-
-
-async def test_compat_dirs_are_existing_root_dirs_the_conversation_lacks(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    _compat_tree(tmp_path)
-    monkeypatch.setenv(COMPAT_UNTIL_ENV, "2099-12-31")
-    dirs = await discover_compat_dirs(
-        NasWorkspaceStore(root=str(tmp_path)), tenant_id=_TENANT, user_id=_USER, view=_CONV1
-    )
-    # own/ 本对话自己有内容;notes.md 是文件;.hidden / uploads / threads 不映射
-    assert dirs == ("stub", "style")
-
-
-async def test_a_root_dir_whose_name_is_not_utf8_is_never_mapped(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """review 4 —— 老对话在 agent 根解压过 Windows zip,留下 GBK 名字的目录(``资`` 的 GBK
-    字节 ``\\xd7\\xca``)。``os.listdir`` 给的是孤立代理字符;映射它会让 ACS 命令串在 e2b
-    的 protobuf 编码上 ``UnicodeEncodeError``,这个 agent 的每次 exec 都失败。跳过它,其余照映射。"""
-    _compat_tree(tmp_path)
-    bad = os.fsencode(_agent_root(tmp_path)) + b"/\xd7\xca"
-    try:
-        os.mkdir(bad)
-    except OSError as exc:  # macOS APFS 拒绝非 UTF-8 文件名
-        pytest.skip(f"filesystem refuses a non-UTF-8 name: {exc}")
-    monkeypatch.setenv(COMPAT_UNTIL_ENV, "2099-12-31")
-    dirs = await discover_compat_dirs(
-        NasWorkspaceStore(root=str(tmp_path)), tenant_id=_TENANT, user_id=_USER, view=_CONV1
-    )
-    assert dirs == ("stub", "style")
-    assert all(d.encode("utf-8") for d in dirs)
-
-
-@pytest.mark.parametrize("name", ["\udcd7\udcca", "a\udcff"])
-def test_a_name_that_is_not_utf8_is_not_a_compat_dir_name(name: str) -> None:
-    """平台无关的那一半:名单校验(宿主侧发现与 ``exec_view_argv`` 共用)拒绝它。"""
-    from orchestrator.tools.exec_view import exec_view_argv
-    from orchestrator.tools.workspace_compat import _mappable
-    from orchestrator.tools.workspace_paths import require_compat_dir_name
-
-    with pytest.raises(ValueError, match="UTF-8"):
-        require_compat_dir_name(name)
-    assert _mappable(name) is False
-    with pytest.raises(ValueError, match="UTF-8"):
-        exec_view_argv(_KEY, ["python"], conv_id=_C1, compat_dirs=(name,))
-
-
-@pytest.mark.parametrize("until", ["2000-01-01", "", "not-a-date"])
-async def test_closed_or_unset_window_maps_nothing(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, until: str
-) -> None:
-    _compat_tree(tmp_path)
-    monkeypatch.setenv(COMPAT_UNTIL_ENV, until)
-    dirs = await discover_compat_dirs(
-        NasWorkspaceStore(root=str(tmp_path)), tenant_id=_TENANT, user_id=_USER, view=_CONV1
-    )
-    assert dirs == ()
-
-
-async def test_legacy_view_maps_nothing(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    _compat_tree(tmp_path)
-    monkeypatch.setenv(COMPAT_UNTIL_ENV, "2099-12-31")
-    dirs = await discover_compat_dirs(
-        NasWorkspaceStore(root=str(tmp_path)), tenant_id=_TENANT, user_id=_USER, view=_LEGACY
-    )
-    assert dirs == ()
-
-
-async def test_compat_dirs_are_read_only_for_the_file_tools(tmp_path: Path) -> None:
-    """B-236 M4 —— 过渡期目录只读,宿主侧与 exec 一致:``write_file`` / ``edit_file`` 写
-    ``style/…`` 被拒,拒绝说明里给出两条能走的路(本对话自己的目录 / ``/agent/style/…``);
-    读照常;改走 ``/agent/style/…`` 的写照样落 agent 根。"""
-    from orchestrator.tools import EditFileTool
-
-    _compat_tree(tmp_path)
-    runtime = _ViewRuntime(tmp_path)
-    store = NasWorkspaceStore(root=str(tmp_path))
-    ctx = _ctx(_C1, compat=("style",))
-    anchor = _agent_root(tmp_path) / "style" / "a.md"
-
-    for tool, args in (
-        (WriteFileTool(client=runtime), {"path": "style/a.md", "content": "B"}),
-        (WriteFileTool(client=runtime), {"path": "/workspace/style/new.md", "content": "B"}),
-        (
-            EditFileTool(client=runtime),
-            {"path": "style/a.md", "old_string": "a", "new_string": "B"},
-        ),
-    ):
-        with pytest.raises(ValueError, match="read-only") as refused:
-            await tool.call(args, ctx=ctx)
-        assert "/agent/style/" in str(refused.value)
-        assert "conversation's own directory" in str(refused.value)
-    assert runtime.exec_views == []  # 被拒的写一次 exec 都没发
-    assert anchor.read_text() == "a"
-    assert not (_work(tmp_path, _C1) / "style").exists()
-
-    assert (await ReadFileTool(store=store).call({"path": "style/a.md"}, ctx=ctx)).content == "a"
-    await WriteFileTool(client=runtime).call({"path": "/agent/style/a.md", "content": "B"}, ctx=ctx)
-    assert anchor.read_text() == "B"
-
-
-def test_compat_read_only_rule_is_only_for_the_writing_file_tools() -> None:
-    mapped = replace(_CONV1, compat_dirs=("style",))
-    for tool in ("read_file", "list_dir", "read_document", "read_page", "save_artifact"):
-        assert resolve_workspace_path("style/a.md", view=mapped, tool=tool).kind == "compat"
-    for tool in ("write_file", "edit_file"):
-        with pytest.raises(ValueError, match="read-only"):
-            resolve_workspace_path("style/a.md", view=mapped, tool=tool)
-        # 未映射时同名路径是本对话自己的目录,照常可写
-        assert resolve_workspace_path("style/a.md", view=_CONV1, tool=tool).kind == "conversation"
-
-
-def test_a_malformed_window_is_warned_about_once(caplog: pytest.LogCaptureFixture) -> None:
-    from orchestrator.tools.workspace_compat import compat_until
-
-    with caplog.at_level("WARNING", logger="orchestrator.tools.workspace_compat"):
-        for _ in range(3):
-            assert compat_until("2026-13-99") is None
-        assert compat_until("2026-12-10") is not None
-    assert [r.getMessage().count("2026-13-99") for r in caplog.records] == [1]
-
-
-def _hits(channel: str) -> float:
-    return float(compat_dir_hits_total.labels(channel=channel, agent_key=_KEY)._value.get())
-
-
-async def test_compat_hits_are_counted_for_file_tools_and_exec_refs(tmp_path: Path) -> None:
-    _compat_tree(tmp_path)
-    store = NasWorkspaceStore(root=str(tmp_path))
-    ctx = _ctx(_C1, compat=("style",))
-    before_file, before_exec = _hits("file_tool"), _hits("exec_ref")
-
-    result = await ReadFileTool(store=store).call({"path": "style/a.md"}, ctx=ctx)
-    await BashTool(client=RecordingSandboxRuntime()).call(
-        {"command": "ls style/ && cat notes.md"}, ctx=ctx
-    )
-
-    assert result.content == "a"
-    assert _hits("file_tool") == before_file + 1
-    assert _hits("exec_ref") == before_exec + 1
-
-
-def test_logged_dir_names_keep_only_their_shape() -> None:
-    assert name_shape("style") == "<A>"
-    assert name_shape("客户案例2024") == "<H><N>"
-    assert name_shape("v2_draft") == "<A><N>_<A>"
 
 
 # ---------------------------------------------------------------------------
@@ -507,7 +328,7 @@ async def test_a_conversation_never_sees_another_conversations_files(tmp_path: P
 
     assert (_work(tmp_path, _C1) / "report.md").read_text() == "A"
     assert (_work(tmp_path, _C2) / "report.md").read_text() == "B"
-    assert runtime.exec_views[0] == (_C1, ())
+    assert runtime.exec_views[0] == _C1
     read = ReadFileTool(store=store)
     assert (await read.call({"path": "report.md"}, ctx=_ctx(_C1))).content == "A"
     assert (await read.call({"path": "report.md"}, ctx=_ctx(_C2))).content == "B"
@@ -630,61 +451,54 @@ async def test_the_block_lists_this_conversation_and_the_agent_root_only(tmp_pat
         NasWorkspaceStore(root=str(tmp_path)),
         tenant_id=_TENANT,
         user_id=_USER,
-        view=replace(_CONV1, compat_dirs=("style",)),
+        view=_CONV1,
     )
     assert block.index(CONVERSATION_SECTION) < block.index(AGENT_SECTION)
     assert "mine.md" in block
     assert "anchor.md" in block
-    assert "Also readable, read-only, by their old relative path" in block
-    assert ": style/. To write into one, use /agent/<dir>/" in block
     assert "theirs.md" not in block
     assert "PLAN.md" not in block
     assert "threads" not in block
 
 
-def test_every_compat_dir_gets_the_read_only_note_whatever_its_shape() -> None:
-    """review 4 LOW-1 —— 目录行按文件的父路径分组:空的过渡期目录、只有更深层文件的过渡期
-    目录(``output/2026-10/r.docx``)都没有自己那一行,说明不能挂在目录行上。"""
+def _entry(path: str, size: int = 1, day: int = 1) -> Any:
+    from datetime import UTC, datetime
+
     from orchestrator.tools.workspace_store import WorkspaceFileEntry
+
+    return WorkspaceFileEntry(path=path, size=size, mtime=datetime(2026, 10, day, tzinfo=UTC))
+
+
+def test_an_unchanged_seed_copy_takes_one_line_and_no_budget() -> None:
+    """B-236 —— 开场复制进来、一个文件都没动过的目录:本对话那一节只占一行(不占展开预算,
+    它的文件在 ``/agent`` 一节已经列着);改过的副本照常展开 —— 那是本对话自己的改动。"""
     from orchestrator.tools.workspace_tree import render_conversation_block
 
-    agent = [
-        WorkspaceFileEntry(path="style/anchor.md", size=1, mtime=None),
-        WorkspaceFileEntry(path="output/2026-10/r.docx", size=1, mtime=None),
+    agent = [_entry(f"style/s{i}.md") for i in range(20)] + [_entry("tpl/t.md")]
+    conv = [
+        *(_entry(f"style/s{i}.md") for i in range(20)),
+        _entry("tpl/t.md", size=2, day=9),  # 本对话改过
+        _entry("mine.md"),
     ]
-    block = render_conversation_block(
-        [], agent, compat_dirs=("empty", "output", "style"), compat_until_text="2026-12-10"
-    )
-    note = block.rsplit("\n", 1)[1]
-    assert note == (
-        "  Also readable, read-only, by their old relative path until 2026-12-10: "
-        "empty/, output/, style/. To write into one, use /agent/<dir>/… (shared) or a "
-        "path outside these directories in this conversation."
-    )
+    block = render_conversation_block(conv, agent, max_expanded=23)
+    ours = block.split(CONVERSATION_SECTION + "\n", 1)[1].split("\n\n", 1)[0]
+    assert "  style/" in ours and "unchanged copy of /agent/style/" in ours
+    assert "s0.md" not in ours  # 未改动的副本不展开
+    assert "t.md" in ours and "mine.md" in ours  # 改过的副本与本对话自己的文件照常列
+    theirs = block.split(AGENT_SECTION + "\n", 1)[1]
+    assert "s0.md" in theirs  # 预算没被副本吃掉,/agent 一节照样展开
 
 
-def test_the_transition_hint_appears_only_with_mapped_dirs() -> None:
-    """review 5 —— 「只读 + 写到哪」只出现在对话块里、且确有映射目录时;工具描述按 agent
-    构建、所有视图共用(未绑 agent、老视图、窗口关了以后都读得到),不带过渡期的话。
-    ``/agent`` 没有文件、只有映射目录时不写 ``(empty)``。"""
-    from orchestrator.tools.workspace_paths import EXEC_WORKSPACE_NOTE
-    from orchestrator.tools.workspace_store import WorkspaceFileEntry
+def test_dirs_too_large_to_copy_are_named_with_their_agent_path() -> None:
     from orchestrator.tools.workspace_tree import render_conversation_block
 
-    conv = [WorkspaceFileEntry(path="mine.md", size=1, mtime=None)]
-    agent = [WorkspaceFileEntry(path="style/anchor.md", size=1, mtime=None)]
-    for plain in (render_conversation_block(conv, agent), render_conversation_block(conv, [])):
-        assert "read-only" not in plain and "/agent/<dir>/" not in plain
-    only_compat = render_conversation_block(conv, [], compat_dirs=("style",))
-    section = only_compat.split(AGENT_SECTION + "\n", 1)[1]
-    assert section.startswith("  Also readable, read-only")
-    assert "(empty)" not in section
-    # 两节都没有文件时映射目录照样 bind 着, 这一行仍要出现(bash 写入只会拿到裸 EROFS)。
-    nothing_but_compat = render_conversation_block([], [], compat_dirs=("output",))
-    assert "Also readable, read-only" in nothing_but_compat
+    block = render_conversation_block([], [_entry("big/x.bin")], seed_skipped=("big", "大目录"))
+    ours = block.split(CONVERSATION_SECTION + "\n", 1)[1].split("\n\n", 1)[0]
+    assert ours == (
+        "  Too large to copy into this conversation — use in place: /agent/big/, /agent/大目录/"
+    )
+    assert render_conversation_block([], [], seed_skipped=("big",)) != ""
     assert render_conversation_block([], []) == ""
-    for word in ("transition", "read-only", "<dir>"):
-        assert word not in EXEC_WORKSPACE_NOTE
 
 
 async def test_the_legacy_block_no_longer_lists_other_conversations_projections(
@@ -758,34 +572,3 @@ def test_children_inherit_the_parents_effective_view_not_its_raw_layout() -> Non
     config = _child_config(parent, sub_thread_id=uuid4(), sub_run_id=uuid4())
     assert config["configurable"]["workspace_layout"] == "agent_root"
     assert not _build_tool_context(config).workspace_view.per_conversation
-
-
-async def test_compat_discovery_on_a_brand_new_agent_is_quiet(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
-) -> None:
-    monkeypatch.setenv(COMPAT_UNTIL_ENV, "2099-12-31")
-    with caplog.at_level("WARNING"):
-        dirs = await discover_compat_dirs(
-            NasWorkspaceStore(root=str(tmp_path)), tenant_id=_TENANT, user_id=_USER, view=_CONV1
-        )
-    assert dirs == ()
-    assert caplog.records == []
-
-
-async def test_compat_discovery_failure_logs_the_error_type_only(
-    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
-) -> None:
-    from orchestrator.tools.sandbox import SandboxSupervisorError
-    from orchestrator.tools.workspace_store import RecordingWorkspaceStore
-
-    monkeypatch.setenv(COMPAT_UNTIL_ENV, "2099-12-31")
-    store = RecordingWorkspaceStore(
-        workspace_list_error=SandboxSupervisorError("listing failed: 'agents/k/客户甲'")
-    )
-    with caplog.at_level("WARNING"):
-        dirs = await discover_compat_dirs(store, tenant_id=_TENANT, user_id=_USER, view=_CONV1)
-    assert dirs == ()
-    (record,) = caplog.records
-    assert record.exc_info is None
-    assert "客户甲" not in record.getMessage()
-    assert "SandboxSupervisorError" in record.getMessage()

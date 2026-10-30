@@ -108,10 +108,6 @@ data:
   EXPERT_WORK_WORKSPACE_NAS_ROOT: "/mnt/workspaces"
   EXPERT_WORK_SANDBOX_WORKSPACE_PV_NAME: "workspace-nas"
   EXPERT_WORK_SANDBOX_WORKSPACE_SUBPATH_PREFIX: ""
-  # B-236 过渡期截止日(ISO,含当天,按 UTC 日期 —— 次日 00:00 UTC 关窗):窗口内
-  # agent 根下已有的一级目录在对话视图里按原相对路径只读可见。不设 = 不映射。
-  # 生产那一份在 B-236 生产发布时要改成「生产发布日 + 4 周」。
-  EXPERT_WORK_WORKSPACE_COMPAT_ROOT_DIRS_UNTIL: "2026-12-10"
   # EXPERT_WORK_SANDBOX_EGRESS_PROXY_HOST/_PORT keep their settings.py
   # defaults (credential-proxy.expert-work.svc.cluster.local:8081), which
   # are already right here: sandboxes run in `default` while the proxy

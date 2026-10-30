@@ -369,3 +369,7 @@ class AgentState(TypedDict):
     #: B-126 —— L2 滚动摘要写回检查点:``{"through_id": <消息 id>, "text": <整段摘要>}``。
     #: 下一次压缩时被覆盖的历史未变就直接复用,不再每步重写(spec §3.7)。默认覆盖 reducer。
     context_summary: NotRequired[dict[str, str] | None]
+    #: B-236 —— 对话开场复制时超出上限、整个没复制的 agent 根目录名(``conversation_seed``
+    #: 节点只在复制那一次写)。工作区快照段每轮据此告诉模型它们只在 ``/agent/<目录>/``。
+    #: 默认覆盖 reducer;之后的 run 不写,值随检查点留着。
+    seed_skipped_dirs: NotRequired[list[str]]

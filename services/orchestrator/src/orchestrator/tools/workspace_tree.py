@@ -62,8 +62,8 @@ from uuid import UUID
 
 from expert_work.persistence import WORKSPACE_RESERVED_PREFIXES
 from orchestrator.tools.error_classifier import EXISTENCE_UNKNOWN
+from orchestrator.tools.nas_workspace_store import MISSING_DIR_ERRORS
 from orchestrator.tools.sandbox_image_contract import AGENT_VIEW, EXEC_VIEW
-from orchestrator.tools.workspace_compat import MISSING_DIR_ERRORS, compat_until
 from orchestrator.tools.workspace_paths import WorkspaceView
 from orchestrator.tools.workspace_scope import store_scope
 from orchestrator.tools.workspace_store import WorkspaceFileEntry, WorkspaceStore
@@ -275,44 +275,67 @@ def render_workspace_block(
     return f"{WORKSPACE_BLOCK_HEADING}\n{_WORKSPACE_BLOCK_PREAMBLE}\n\n{tree}"
 
 
+def _seed_copies(
+    conversation: Sequence[WorkspaceFileEntry], agent: Sequence[WorkspaceFileEntry]
+) -> frozenset[str]:
+    """本对话里哪些一级目录是 ``/agent`` 同名目录**原样未改**的副本。
+
+    开场复制(``conversation_seed``)保留 mtime,所以没动过的副本与源目录的
+    ``(相对路径, 大小, mtime)`` 集合逐项相等;改过、加过、删过任何一个文件就不相等,那个
+    目录按普通目录展开 —— 那是这个对话自己的改动,模型要看得见。
+    """
+
+    def by_top(entries: Sequence[WorkspaceFileEntry]) -> dict[str, set[tuple[str, int, object]]]:
+        out: dict[str, set[tuple[str, int, object]]] = {}
+        for e in entries:
+            top, sep, rest = e.path.partition("/")
+            if sep:
+                out.setdefault(top, set()).add((rest, e.size, e.mtime))
+        return out
+
+    ours, theirs = by_top(conversation), by_top(agent)
+    return frozenset(name for name, files in ours.items() if theirs.get(name) == files)
+
+
 def render_conversation_block(
     conversation: Sequence[WorkspaceFileEntry],
     agent: Sequence[WorkspaceFileEntry],
     *,
-    compat_dirs: Sequence[str] = (),
-    compat_until_text: str = "",
+    seed_skipped: Sequence[str] = (),
     max_expanded: int = DEFAULT_MAX_EXPANDED,
 ) -> str:
     """B-236 对话视图的块:``/workspace``(本对话)一节在前,``/agent`` 一节在后。
 
-    展开预算先给本对话那一节,剩下的给 ``/agent``。两节都空、也没有映射目录才整块不出现
-    (映射目录那一行是 bash 写入时唯一的提示);只有一节空时
-    那一节写 ``(empty)`` —— 新对话的 ``/workspace`` 本来就是空的,不写就读不出这件事。
-    过渡期映射的目录在 ``/agent`` 一节末尾单独一行列全:还能按原相对路径**只读**用到哪天
-    (B-236 M4:exec 里只读 bind,文件工具拒写)。不挂在目录行上 —— 目录行按文件的父路径
-    分组,空目录或只有更深层文件的目录(``output/2026-10/r.docx``)根本没有 ``output/``
-    那一行(review 4)。写的去处也只写在这一行:它只在对话视图、窗口开着、确有映射目录时
-    出现,工具描述是按 agent 构建、所有视图共用的,不放这种话(review 5)。``/agent`` 没有
-    文件但有映射目录时不写 ``(empty)``,直接是这一行。
+    展开预算先给本对话那一节,剩下的给 ``/agent``。只有一节空时那一节写 ``(empty)`` ——
+    新对话的 ``/workspace`` 本来就可能是空的,不写就读不出这件事;两节都空、也没有被跳过
+    的目录才整块不出现。
+
+    开场复制进来、一个文件都没动过的目录在本对话那一节只占一行(「未改动的副本」),不占
+    展开预算 —— 它的文件在 ``/agent`` 一节里已经列着,副本再展开一遍只会把本对话自己的
+    产出挤出预算。``seed_skipped`` 是开场复制时因超出上限没复制的目录:本对话那一节末尾
+    一行写明它们只在 ``/agent/<目录>/``。
     """
-    if not conversation and not agent and not compat_dirs:
+    if not conversation and not agent and not seed_skipped:
         return ""
-    conv_tree, used = _render_tree(conversation, max_expanded=max_expanded)
-    until = f" until {compat_until_text}" if compat_until_text else ""
+    copies = _seed_copies(conversation, agent)
+    own = [e for e in conversation if e.path.partition("/")[0] not in copies]
+    conv_tree, used = _render_tree(own, max_expanded=max_expanded)
     agent_tree, _ = _render_tree(agent, max_expanded=max(max_expanded - used, 0))
-    compat = (
-        f"  Also readable, read-only, by their old relative path{until}: "
-        + ", ".join(f"{d}/" for d in compat_dirs)
-        + ". To write into one, use /agent/<dir>/… (shared) or a path outside these "
-        "directories in this conversation."
-        if compat_dirs
+    copy_lines = [
+        f"{_INDENT_DIR}{name + '/':<{_NAME_WIDTH}}unchanged copy of {AGENT_VIEW}/{name}/"
+        for name in sorted(copies)
+    ]
+    skipped = (
+        "  Too large to copy into this conversation — use in place: "
+        + ", ".join(f"{AGENT_VIEW}/{d}/" for d in seed_skipped)
+        if seed_skipped
         else ""
     )
-    agent_body = "\n".join(part for part in (agent_tree, compat) if part) or _EMPTY_SECTION
+    conv_body = "\n".join(part for part in (conv_tree, *copy_lines, skipped) if part)
     return (
         f"{WORKSPACE_BLOCK_HEADING}\n{_CONVERSATION_BLOCK_PREAMBLE}\n\n"
-        f"{CONVERSATION_SECTION}\n{conv_tree or _EMPTY_SECTION}\n\n"
-        f"{AGENT_SECTION}\n{agent_body}"
+        f"{CONVERSATION_SECTION}\n{conv_body or _EMPTY_SECTION}\n\n"
+        f"{AGENT_SECTION}\n{agent_tree or _EMPTY_SECTION}"
     )
 
 
@@ -322,6 +345,7 @@ async def workspace_prompt_block(
     tenant_id: UUID,
     user_id: UUID,
     view: WorkspaceView,
+    seed_skipped: Sequence[str] = (),
     max_expanded: int = DEFAULT_MAX_EXPANDED,
 ) -> str:
     """列当前视图的工作区并渲染成块。**拿不到就返回 ``""``, 永不抛。**
@@ -361,11 +385,6 @@ async def workspace_prompt_block(
             exc_info=True,
         )
         return ""
-    until = compat_until()
     return render_conversation_block(
-        conversation,
-        agent,
-        compat_dirs=view.compat_dirs,
-        compat_until_text=until.isoformat() if until is not None else "",
-        max_expanded=max_expanded,
+        conversation, agent, seed_skipped=seed_skipped, max_expanded=max_expanded
     )

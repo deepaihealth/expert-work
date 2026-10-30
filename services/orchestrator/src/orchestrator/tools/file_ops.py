@@ -49,6 +49,7 @@ from typing import Any, NoReturn
 from uuid import UUID
 
 from orchestrator.tools.locks import NullWorkspaceLock, WorkspaceLock
+from orchestrator.tools.nas_workspace_store import MISSING_DIR_ERRORS
 from orchestrator.tools.registry import (
     ToolBlockedError,
     ToolContext,
@@ -69,12 +70,13 @@ from orchestrator.tools.sandbox import (
     run_in_sandbox,
 )
 from orchestrator.tools.sandbox_image_contract import AGENT_VIEW, EXEC_VIEW
-from orchestrator.tools.workspace_compat import MISSING_DIR_ERRORS, record_compat_hit
 from orchestrator.tools.workspace_paths import (
+    AGENT_NOTES_FILE,
     PATH_ARG_DESCRIPTION,
     WORKSPACE_PATH_RULE,
     ResolvedPath,
     WorkspaceView,
+    agent_relative,
     resolve_workspace_path,
 )
 from orchestrator.tools.workspace_scope import store_scope
@@ -131,11 +133,24 @@ def _require_path(
         msg = f"{tool} requires a 'path' string"
         raise ValueError(msg)
     target = resolve_workspace_path(raw, view=view, tool=tool)
-    if target.kind == "compat":
-        record_compat_hit(
-            channel="file_tool", agent_key=view.agent_key, name=target.rel.split("/", 1)[0]
-        )
     return target
+
+
+def _refuse_notes_write_from_a_child(target: ResolvedPath, ctx: ToolContext, *, tool: str) -> None:
+    """B-236 第三层 —— 委派子代(worker / 静态子 Agent)不改 agent 的记忆索引。
+
+    照 B-122 的边界:子代不永久改变 Agent 自己。索引由主对话维护;子代该记下的,写进它的
+    最终回复,由主对话决定要不要记。只认 agent 根下那一个文件(``/agent/AGENT_NOTES.md``,
+    老视图里也就是相对路径 ``AGENT_NOTES.md``);对话自己目录里的同名文件不是索引。
+    """
+    if not ctx.child_run or target.kind == "shared":
+        return
+    if agent_relative(target, ctx.workspace_view) == AGENT_NOTES_FILE:
+        msg = (
+            f"{tool}: delegated runs cannot change /agent/{AGENT_NOTES_FILE} (this agent's "
+            "memory index); put what should be remembered in your final message instead."
+        )
+        raise ToolBlockedError(msg)
 
 
 def _store_scope(ws: str, ctx: ToolContext) -> str:
@@ -992,6 +1007,7 @@ class WriteFileTool:
 
     async def call(self, args: Mapping[str, Any], *, ctx: ToolContext) -> ToolResult:
         target = _require_path(args, tool="write_file", view=ctx.workspace_view)
+        _refuse_notes_write_from_a_child(target, ctx, tool="write_file")
         # 写永不回落 —— 新内容一律落自己的目录,从第一天起就分好。
         ws, rel = target.ws, target.rel
         content = args.get("content")
@@ -1376,6 +1392,7 @@ class EditFileTool:
 
     async def call(self, args: Mapping[str, Any], *, ctx: ToolContext) -> ToolResult:
         target = _require_path(args, tool="edit_file", view=ctx.workspace_view)
+        _refuse_notes_write_from_a_child(target, ctx, tool="edit_file")
         # 写永不回落(edit 也改字节)——「读得到 legacy」不等于「可以就地改它」:
         # 那会把一份归属不明的文件悄悄变成本 agent 的既成事实。
         ws, rel = target.ws, target.rel

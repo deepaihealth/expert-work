@@ -408,21 +408,16 @@ class ToolContext:
     #: 出去的子代各有自己的子线程 id,``_child_config`` 把根对话的 id 传下来 —— 子代干的
     #: 是父的活,写的文件父要读得到(与 ``agent_key`` / ``inputs_run_id`` 同一个取值口径)。
     workspace_thread_id: UUID | None = None
-    #: B-236 —— 过渡期映射进 ``/workspace`` 的 agent 根目录名(``workspace_compat``
-    #: 在宿主侧每步算一次);宿主侧解析与沙箱 exec 用的是同一份。
-    workspace_compat_dirs: tuple[str, ...] = ()
+    #: B-236 第三层 —— 这是一次委派出去的子代(worker / 静态子 Agent)的调用:``_child_config``
+    #: 写的 ``configurable["child_run"]``。子代不许改 agent 的记忆索引(``file_ops``)。
+    child_run: bool = False
 
     @property
     def workspace_view(self) -> WorkspaceView:
         """本次调用的工作区视图 —— 文件工具解析路径与 exec 建命名空间用的同一个值。"""
         thread = (self.workspace_thread_id or self.thread_id) if self.agent_key else None
         conv = thread if self.workspace_layout == "conversation" else None
-        return WorkspaceView(
-            agent_key=self.agent_key,
-            conv_id=conv,
-            compat_dirs=self.workspace_compat_dirs if conv is not None else (),
-            thread_id=thread,
-        )
+        return WorkspaceView(agent_key=self.agent_key, conv_id=conv, thread_id=thread)
 
 
 #: Stream K.K8 — keys a tool is allowed to write back to ``AgentState``

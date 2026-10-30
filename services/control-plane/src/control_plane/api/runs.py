@@ -1141,6 +1141,7 @@ async def resolve_approval_decision(
             trajectory_enabled=built.trajectory_recording,
             # P2 块 2 — run 终局重算 thread_meta.message_count。
             thread_stats_recorder=runtime.thread_stats_recorder,
+            agent_file_versions=runtime.agent_file_versions,
             token_budget=built.token_budget,
             worker_spawn_budget=await runtime.new_worker_spawn_budget(
                 requested_max_concurrent=built.worker_max_concurrent,
@@ -1689,6 +1690,7 @@ async def _start_run(
             trajectory_enabled=built.trajectory_recording,
             # P2 块 2 — run 终局重算 thread_meta.message_count。
             thread_stats_recorder=runtime.thread_stats_recorder,
+            agent_file_versions=runtime.agent_file_versions,
             token_budget=built.token_budget,
             worker_spawn_budget=await runtime.new_worker_spawn_budget(
                 requested_max_concurrent=built.worker_max_concurrent,

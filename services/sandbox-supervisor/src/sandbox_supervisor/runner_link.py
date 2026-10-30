@@ -53,7 +53,6 @@ class RunnerLink(Protocol):
         envs: dict[str, str] | None = None,
         agent_root: str | None = None,
         conv_id: UUID | None = None,
-        compat_dirs: tuple[str, ...] = (),
         thread_id: UUID | None = None,
     ) -> ExecResult:
         """Run ``code`` in the sandbox; return its captured outcome.
@@ -71,10 +70,9 @@ class RunnerLink(Protocol):
         root becomes the view, pre-feature behaviour. Not a cwd — the
         child's cwd is always ``/workspace``.
 
-        ``conv_id`` / ``compat_dirs`` (B-236) — the conversation view, sent
-        to the runner as ``conv_id`` (string) and ``compat_dirs`` (list), plus
-        ``thread_id`` (string, the conversation's own ``threads/<id>/``);
-        omitted when ``None`` / empty (the pre-feature request shape).
+        ``conv_id`` (B-236) — the conversation view, sent to the runner as
+        ``conv_id`` (string), plus ``thread_id`` (string, the conversation's own
+        ``threads/<id>/``); omitted when ``None`` (the pre-feature request shape).
         """
 
     async def close(self) -> None:
@@ -117,7 +115,6 @@ class PipeRunnerLink:
         envs: dict[str, str] | None = None,
         agent_root: str | None = None,
         conv_id: UUID | None = None,
-        compat_dirs: tuple[str, ...] = (),
         thread_id: UUID | None = None,
     ) -> ExecResult:
         async with self._lock:
@@ -128,8 +125,6 @@ class PipeRunnerLink:
                 request["agent_root"] = agent_root
             if conv_id is not None:
                 request["conv_id"] = str(conv_id)
-            if compat_dirs:
-                request["compat_dirs"] = list(compat_dirs)
             if thread_id is not None:
                 request["thread_id"] = str(thread_id)
             await self._write(request)
