@@ -164,8 +164,14 @@ from typing import TYPE_CHECKING, cast
 from uuid import UUID
 
 from expert_work.persistence import (
+    WORKSPACE_AGENTS_DIR,
     is_delete_protected_workspace_path,
     is_reserved_workspace_path,
+)
+from expert_work.persistence.workspace.layout import (
+    WORKSPACE_CONVERSATION_WORK_DIR,
+    WORKSPACE_SEED_MARKER,
+    WORKSPACE_THREADS_DIR,
 )
 from orchestrator.tools.sandbox import (
     SandboxSupervisorError,
@@ -272,6 +278,39 @@ class _WorkspacePathNotFoundError(SandboxSupervisorError):
 #: :class:`_WorkspacePathNotFoundError`,supervisor 后端抛 ``WorkspaceFileNotFoundError``。
 #: 新对话的目录要到第一次 exec(或开场的基础目录复制)才建出来,它的根是空的,不是故障。
 MISSING_DIR_ERRORS = (WorkspaceFileNotFoundError, _WorkspacePathNotFoundError)
+
+
+def _is_seed_marker(path: str) -> bool:
+    """``agents/<k>/threads/<conv>/.seeded`` —— 用户根相对路径。"""
+    parts = path.split("/")
+    return (
+        len(parts) == 5
+        and parts[0] == WORKSPACE_AGENTS_DIR
+        and parts[2] == WORKSPACE_THREADS_DIR
+        and parts[4] == WORKSPACE_SEED_MARKER
+    )
+
+
+def _pristine_seed_copies(stamps: dict[str, tuple[int, int]]) -> frozenset[str]:
+    """``agents/<k>/threads/<conv>/work/<目录>/…`` 里与 ``agents/<k>/<目录>/…`` 大小、mtime
+    (纳秒)都相同的文件 —— 开场复制保留 mtime,所以没动过的副本逐项相等;改过的不相等。
+
+    只用这次遍历已经 ``lstat`` 到的数,不为认副本多跑一次 NAS 往返;也不读 ``.seeded``
+    标记(它在沙箱够得着的地方,而且「与源一模一样」本身就是要的判据)。一级文件从不复制,
+    不算。
+    """
+    out: set[str] = set()
+    for path, stamp in stamps.items():
+        parts = path.split("/")
+        if (
+            len(parts) >= 7
+            and parts[0] == WORKSPACE_AGENTS_DIR
+            and parts[2] == WORKSPACE_THREADS_DIR
+            and parts[4] == WORKSPACE_CONVERSATION_WORK_DIR
+            and stamps.get("/".join((parts[0], parts[1], *parts[5:]))) == stamp
+        ):
+            out.add(path)
+    return frozenset(out)
 
 
 def _identity(info: os.stat_result) -> tuple[int, int, int]:
@@ -454,11 +493,14 @@ def _content_matches(walk_fd: int, name: str, info: os.stat_result, needle: str)
     if info.st_size > _MAX_SEARCH_FILE_BYTES:
         return False
     try:
-        fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=walk_fd)
+        # review 7 —— lstat 之后名字可能被换成 FIFO:``O_NONBLOCK`` 不等写端,fstat 再核一遍。
+        fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=walk_fd)
     except OSError:
         return False
     with os.fdopen(fd, "rb") as handle:
         try:
+            if not stat.S_ISREG(os.fstat(handle.fileno()).st_mode):
+                return False
             data = handle.read()
         except OSError:
             return False
@@ -775,7 +817,11 @@ class NasWorkspaceStore:
                 # any *earlier* path component after it was opened can
                 # redirect this call.
                 try:
-                    fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=dfd)
+                    # review 7 —— ``O_NONBLOCK``:沙箱能在这个名字上种一个 FIFO,不带它
+                    # ``open`` 会一直等写端,把一条执行器线程永久卡住(每个新对话开场
+                    # 读一次记忆索引就卡一条)。普通文件不理会这个标志;下面 ``fstat`` 拒
+                    # 一切不是普通文件的东西。
+                    fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=dfd)
                 except PermissionError as exc:
                     # W2-BUG-1 —— 读不动 ≠ 不存在。合到下面那句 SandboxSupervisorError
                     # 里的话,端点翻成 404,用户看到"文件不存在"而它明明列在
@@ -806,6 +852,10 @@ class NasWorkspaceStore:
                     before = os.fstat(handle.fileno())
                 except OSError as exc:
                     raise WorkspaceFileNotFoundError(f"workspace file not found: {path!r}") from exc
+                if not stat.S_ISREG(before.st_mode):
+                    # 目录 / FIFO / 设备 / socket:不读。与下面 ``IsADirectoryError`` 同一个
+                    # 窄类型 —— 「它不是文件」,不是「它不存在」。
+                    raise WorkspaceNotAFileError(f"workspace path is not a file: {path!r}")
                 size = before.st_size
                 if size > cap:
                     # 「太大」≠「不存在」—— 窄类型让下载端点能回 413 而不是把
@@ -910,6 +960,8 @@ class NasWorkspaceStore:
                 raise SandboxSupervisorError(f"workspace listing failed: {exc.strerror}") from exc
 
             entries: list[WorkspaceFileEntry] = []
+            #: 用户根相对路径 → (大小, mtime 纳秒),认开场复制的原样副本用(review 7)。
+            stamps: dict[str, tuple[int, int]] = {}
             # followlinks=False — see module docstring: never descend into a
             # symlinked subdirectory, so an intermediate-component escape
             # can't make this enumerate files outside the tree. onerror=
@@ -933,6 +985,8 @@ class NasWorkspaceStore:
                     # 换一个容器层级就静默错位, 而错位的形态是"文件凭空消失"。
                     if is_reserved_workspace_path("/".join((*prefix, rel))):
                         continue
+                    if name == WORKSPACE_SEED_MARKER and _is_seed_marker("/".join((*prefix, rel))):
+                        continue  # B-236 —— 开场复制的标记是平台状态,不是产出
                     # lstat, not stat — a symlink appearing as a plain file
                     # entry must report its own byte length, never a stat()
                     # of whatever it points at outside the tree (see module
@@ -956,6 +1010,14 @@ class NasWorkspaceStore:
                             f"workspace listing failed: {rel!r}: {exc.strerror}"
                         ) from exc
                     entries.append(_entry(rel, info))
+                    stamps["/".join((*prefix, rel))] = (info.st_size, info.st_mtime_ns)
+            if not prefix or (prefix[0] == WORKSPACE_AGENTS_DIR and len(prefix) == 2):
+                # 用户根 / 整个 agent 作用域(浏览面):开场复制进各对话、一个字节都没动过的
+                # 副本不列 —— 每个对话都带着 agent 全部文件的一份,不剔的话几十个对话就把
+                # 列表的 2000 条上限占满,真正的产出被截掉(review 7)。
+                copies = _pristine_seed_copies(stamps)
+                if copies:
+                    entries = [e for e in entries if "/".join((*prefix, e.path)) not in copies]
             entries.sort(key=lambda entry: entry.path)
             return entries[:_MAX_LIST_ENTRIES]
 
@@ -1084,12 +1146,17 @@ class NasWorkspaceStore:
                 # only reader is the uid that wrote it, which is now the same
                 # uid on both sides (workspace-gid-sharing design § 六).
                 try:
+                    # review 7 —— ``O_NONBLOCK``:名字上若是沙箱种下的 FIFO,没有读端时
+                    # ``open`` 立刻 ENXIO 失败,不会把线程卡住;有读端时下面 fstat 拒。
                     fd = os.open(
                         name,
-                        os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW,
+                        os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW | os.O_NONBLOCK,
                         _LEAF_FILE_MODE,
                         dir_fd=dfd,
                     )
+                    if not stat.S_ISREG(os.fstat(fd).st_mode):
+                        os.close(fd)
+                        raise WorkspaceNotAFileError(f"workspace path is not a file: {path!r}")
                 except PermissionError as exc:
                     # 写不动同样是"配置问题"而非"不存在"——见
                     # WorkspacePermissionError 的说明,W2-BUG-1 那一类故障

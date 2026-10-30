@@ -1258,7 +1258,9 @@ async def build_agent(
     # 宿主侧做,只有 NAS 存储做得到;没接 NAS(本地 supervisor 后端 / 单测)= 不装节点。
     # 节点自己只在对话视图、非委派子代时动手。
     conversation_seed_node = (
-        make_conversation_seed_node(store=env.workspace_store, lock=env.conversation_seed_lock)
+        make_conversation_seed_node(
+            store=env.workspace_store, lock=env.conversation_seed_lock, quota=env.workspace_quota
+        )
         if isinstance(env.workspace_store, NasWorkspaceStore)
         else None
     )

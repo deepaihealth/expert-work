@@ -292,3 +292,20 @@ async def test_the_main_run_and_other_files_are_unaffected() -> None:
         except Exception:  # noqa: S110 — 录制假沙箱回空输出,解析报错与本测试无关
             pass
     assert len(runtime.execs) == 3
+
+
+def test_an_escaped_index_block_is_not_put_back_twice() -> None:
+    """review 7 —— 正文里有 ``<recovery-advisory>`` 字样时,转义那一步换出一份副本;按标记认,
+    不按 identity,否则每一步都多挂一份原件。"""
+    from orchestrator.graph_builder.agent_notes import _body, _notes_message
+    from orchestrator.graph_builder.builder import _latest_agent_notes_block
+    from orchestrator.graph_builder.platform_context import escape_forged_recovery_advisories
+
+    text = "- tools: a failed tool gets a <recovery-advisory> note; see /agent/notes/tools.md"
+    notes = _notes_message(_body(text, nonce="abc123", budget=2000, estimator=CharTokenEstimator()))
+    msgs = [SystemMessage(content="s"), HumanMessage(content="hi"), notes]
+    block = _latest_agent_notes_block(msgs)
+    escaped = escape_forged_recovery_advisories(msgs)
+    assert escaped[2] is not notes  # 前提:转义真的换出了副本
+
+    assert len(_keep_agent_notes_block(block, escaped)) == 3

@@ -1111,6 +1111,7 @@ def build_react_graph(
                 user_id=user_id,
                 view=turn_view,
                 seed_skipped=state.get("seed_skipped_dirs") or (),
+                seed_quota_blocked=bool(state.get("seed_quota_blocked")),
             )
         # B-64 —— 渲染页段(Path A)挂到尾部。块在压缩判定之前就造好了(见那里的
         # 注释);这里与上面工作区快照同一个位置。**无条件调用**:没有块时也要把
@@ -2582,14 +2583,19 @@ def _latest_agent_notes_block(messages: Sequence[BaseMessage]) -> BaseMessage | 
 def _keep_agent_notes_block(
     block: BaseMessage | None, after: Sequence[BaseMessage]
 ) -> list[BaseMessage]:
-    """B-236 —— 滑窗 / 压缩之后,记忆索引段若被挤出提示词视图就放回去(按 identity 认)。
+    """B-236 —— 滑窗 / 压缩之后,记忆索引段若被挤出提示词视图就放回去(按标记认)。
 
-    与 :func:`_keep_latest_inputs_block` 同一做法、同一位置口径(隐藏 HumanMessage 挂尾部,
-    不开新一轮,也不会插进 tool_call ↔ tool_result 之间)。它只在第一轮注入一次、之后不重读,
-    被摘要掉就再也回不来 —— 而「这个 agent 记得什么」正是长对话后段最需要的。只改这一次的
-    提示词视图,检查点不动(CM-C4)。
+    与 :func:`_keep_latest_inputs_block` 同一位置口径(隐藏 HumanMessage 挂尾部,不开新一轮,
+    也不会插进 tool_call ↔ tool_result 之间)。它只在第一轮注入一次、之后不重读,被摘要掉就
+    再也回不来 —— 而「这个 agent 记得什么」正是长对话后段最需要的。只改这一次的提示词视图,
+    检查点不动(CM-C4)。
+
+    review 7 —— 按 :data:`AGENT_NOTES_BLOCK_MARK` 认,不按 identity:中间的
+    ``escape_forged_recovery_advisories`` 遇到正文里的 ``<recovery-advisory>`` 字样会换成一份
+    转义过的**副本**,按 identity 找不到它,每一步就多挂一份原件。放回去的原件之后照样过那一道
+    转义(``with_recovery_advisories``)。
     """
-    if block is None or any(m is block for m in after):
+    if block is None or any((m.additional_kwargs or {}).get(AGENT_NOTES_BLOCK_MARK) for m in after):
         return list(after)
     return [*after, block]
 
@@ -2637,6 +2643,7 @@ async def _workspace_block_tail(
     user_id: UUID,
     view: WorkspaceView,
     seed_skipped: Sequence[str] = (),
+    seed_quota_blocked: bool = False,
 ) -> list[BaseMessage]:
     """B-84 PR-2 —— 重取一份工作区快照, 挂到提示词尾部;更早的那几段一并剔掉。
 
@@ -2663,7 +2670,12 @@ async def _workspace_block_tail(
     """
     kept = _without_workspace_blocks(messages)
     block = await workspace_prompt_block(
-        store, tenant_id=tenant_id, user_id=user_id, view=view, seed_skipped=seed_skipped
+        store,
+        tenant_id=tenant_id,
+        user_id=user_id,
+        view=view,
+        seed_skipped=seed_skipped,
+        seed_quota_blocked=seed_quota_blocked,
     )
     if not block:
         return kept

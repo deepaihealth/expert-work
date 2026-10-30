@@ -49,6 +49,7 @@ from control_plane.api._user_scope import (
 )
 from control_plane.api._workspace_shared import (
     _safe_workspace_relpath,
+    drop_file_versions,
     thread_agent_key,
     workspace_agent_path,
 )
@@ -74,6 +75,10 @@ from expert_work.persistence.tenant_user import TenantUserStore
 from expert_work.persistence.thread_meta import ThreadMetaStore
 from expert_work.persistence.thread_meta.base import ThreadOrder
 from expert_work.persistence.workspace import UserWorkspaceStore
+from expert_work.persistence.workspace.layout import (
+    WORKSPACE_CONVERSATION_WORK_DIR,
+    WORKSPACE_THREADS_DIR,
+)
 from expert_work.protocol import (
     AgentSpecStatus,
     AuditAction,
@@ -92,6 +97,8 @@ from orchestrator.tools import (
 )
 from orchestrator.tools.artifact_snapshots import ArtifactSnapshotStore
 from orchestrator.tools.overflow import OVERFLOW_DIR
+from orchestrator.tools.workspace_scope import agent_shared_scope, conversation_scope
+from orchestrator.tools.workspace_store import WorkspaceFileEntry, without_seed_copies
 
 logger = logging.getLogger("expert_work.control_plane.sessions")
 
@@ -113,6 +120,31 @@ def _session_agent_key(meta: ThreadMeta) -> str | None:
     机器线程)没有可用归属,按它过滤只会一条都列不出来。
     """
     return sanitize_agent_key(meta.agent_name) if meta.agent_name else None
+
+
+async def _session_files(
+    store: WorkspaceStore, meta: ThreadMeta, thread_id: UUID, tenant_id: UUID
+) -> list[dict[str, object]]:
+    """一个会话的文件清单。
+
+    B-236 review 7 —— 对话视图的会话只列它自己的 ``threads/<id>/work/``,并去掉开场复制进来、
+    原样未改的副本(那是 agent 的模板,不是这个会话的产出)。``path`` 写成 agent 相对
+    (``threads/<id>/work/…``):本会话的下载 / 删除端点按 ``workspace_agent_path`` 投影的
+    正是这种写法。老视图的会话照旧列整个用户根,一个字不变。
+    """
+    assert meta.user_id is not None  # noqa: S101 - 调用方已判
+    key = _session_agent_key(meta)
+    if meta.workspace_layout != "conversation" or not key:
+        entries = await store.list_files(tenant_id=tenant_id, user_id=meta.user_id)
+        return [{"path": e.path, "size": e.size} for e in entries]
+    own: list[WorkspaceFileEntry] = await store.list_files(
+        tenant_id=tenant_id, user_id=meta.user_id, scope=conversation_scope(key, thread_id)
+    )
+    agent = await store.list_files(
+        tenant_id=tenant_id, user_id=meta.user_id, scope=agent_shared_scope(key)
+    )
+    base = f"{WORKSPACE_THREADS_DIR}/{thread_id}/{WORKSPACE_CONVERSATION_WORK_DIR}"
+    return [{"path": f"{base}/{e.path}", "size": e.size} for e in without_seed_copies(own, agent)]
 
 
 class CreateSessionPayload(BaseModel):
@@ -536,9 +568,7 @@ def build_sessions_router() -> APIRouter:
         if meta.user_id is None or workspace_store is None:
             return JSONResponse({"success": True, "data": {"files": []}})
         try:
-            entries = await workspace_store.list_files(
-                tenant_id=target_tenant, user_id=meta.user_id
-            )
+            files = await _session_files(workspace_store, meta, thread_id, target_tenant)
         except WorkspacePermissionError as exc:
             # 与 /v1/workspace/files 同一坑:权限失败(共享 uid 没配上/存量目录属
             # 主没迁移/mode 不对)是服务端配置问题,不是"这个用户没有文件"。吞成
@@ -549,7 +579,6 @@ def build_sessions_router() -> APIRouter:
         except SandboxSupervisorError:
             logger.warning("session_workspace.list_failed", exc_info=True)
             return JSONResponse({"success": True, "data": {"files": []}})
-        files = [{"path": e.path, "size": e.size} for e in entries]
         return JSONResponse({"success": True, "data": {"files": files}})
 
     @router.get(
@@ -673,10 +702,9 @@ def build_sessions_router() -> APIRouter:
         try:
             # 同上 —— 不投影的话删的是用户根下的同名文件(多半不存在,于是
             # 静默变成 no-op:界面显示删成功,文件还在)。
+            stored_path = workspace_agent_path(safe_path, agent_key=thread_agent_key(meta))
             await workspace_store.delete_file(
-                tenant_id=tenant_id,
-                user_id=meta.user_id,
-                path=workspace_agent_path(safe_path, agent_key=thread_agent_key(meta)),
+                tenant_id=tenant_id, user_id=meta.user_id, path=stored_path
             )
         except WorkspacePermissionError as exc:
             # 同上——权限失败不是"这个文件不存在",必须排在 SandboxSupervisorError
@@ -686,6 +714,9 @@ def build_sessions_router() -> APIRouter:
         except SandboxSupervisorError as exc:
             logger.warning("session_workspace.delete_failed", exc_info=True)
             raise HTTPException(status_code=404, detail="file not found") from exc
+        await drop_file_versions(
+            request, tenant_id=tenant_id, user_id=meta.user_id, path=stored_path
+        )
         return JSONResponse({"success": True, "data": {"deleted": safe_path}})
 
     @router.get(

@@ -23,8 +23,22 @@
   (工作区快照段据此认出「原样未改的副本」)。
 
 **上限。** 一个对话合计 :data:`MAX_SEED_BYTES`(用户拍板 20 MB);会超出的目录**整个**不复制,
-在工作区快照段里写明它只在 ``/agent/<目录>/``。另有条目数与深度两道闸,只为给一次复制的系统
-调用数与递归深度封顶 —— 取值见常量注释(依据测试环境 2,079 个 agent 根的实测)。
+在工作区快照段里写明它只在 ``/agent/<目录>/``。另有条目数、深度与「看过的名字数」三道闸,只为
+给一次复制的系统调用数与递归深度封顶 —— 取值见常量注释(依据测试环境 2,079 个 agent 根的实测)。
+跳过的名字(符号链接、特殊文件)同样计入条目数,量过又放弃的目录同样计入看过的名字数:一个
+种满符号链接的目录不能让开场做无上限的 ``lstat``。
+
+**配额(review 7)。** 复制前先只量不读算出要复制多少字节,问一次用户的工作区配额(与上传同一
+道闸:已用 + 这次 > 上限就拦);拦下就一个目录都不复制,写标记,快照段写明是配额满了;复制完
+触发一次配额重算。
+
+**标记被删。** 标记在沙箱够得着的 ``threads/<conv>/`` 下,载荷删掉它,下一次 run 会再复制一次
+本对话 ``work/`` 里**没有**的目录。这是有意接受的:从不覆盖,单次仍受 20 MB 上限与配额闸约束,
+而载荷自己用 ``cp`` 也能写出同样多的字节 —— 把标记挪到沙箱外换来的只是更多的清理面(清除用户、
+留存作业都要跟着删)。
+
+**取消。** run 被取消时,等着复制的协程置停止标志、**仍持锁**等复制线程在下一个文件处停下
+(最多再写完手上那一个文件)再放锁:线程不会在锁放掉之后还在写,下一个持锁者看到的不会是一半。
 """
 
 from __future__ import annotations
@@ -36,10 +50,13 @@ import logging
 import os
 import shutil
 import stat
+import threading
 from collections.abc import Iterator
 from dataclasses import dataclass, field
+from typing import Protocol
 from uuid import UUID, uuid4
 
+from expert_work.persistence.workspace.layout import WORKSPACE_SEED_MARKER
 from expert_work.protocol.agent_key import require_safe_key
 from orchestrator.tools.locks import KeyedLock
 from orchestrator.tools.nas_workspace_store import (
@@ -47,6 +64,7 @@ from orchestrator.tools.nas_workspace_store import (
     _openat_dir,
     _WorkspacePathNotFoundError,
 )
+from orchestrator.tools.sandbox import WorkspaceQuotaExceededError
 from orchestrator.tools.workspace_paths import (
     AGENT_ROOT_RESERVED,
     AGENTS_DIR,
@@ -68,8 +86,12 @@ MAX_SEED_ENTRIES = 500
 #: 与同时打开的目录 fd 数封顶。
 MAX_SEED_DEPTH = 12
 
+#: 一次开场复制最多看多少个名字(量 + 复制两遍、所有目录合计,含跳过的与量过放弃的)。
+#: 实测最多 77 个文件,两遍不到 200;2000 是十倍余量,只防攻击形态。
+MAX_SEED_VISITS = 2000
+
 #: 本对话复制做完的标记,最后写。在 ``threads/<conv>/`` 下,不在 ``work/`` 里。
-SEED_MARKER = ".seeded"
+SEED_MARKER = WORKSPACE_SEED_MARKER
 
 #: 复制进行中的临时目录名前缀(``threads/<conv>/.seed-tmp-<随机>/``)。
 SEED_TMP_PREFIX = ".seed-tmp-"
@@ -82,40 +104,21 @@ _READ_FLAGS = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC
 
 
 class _TooLargeError(Exception):
-    """这个目录放不进剩下的额度(字节 / 条目 / 深度):整个跳过。"""
+    """这个目录放不进剩下的额度(字节 / 条目 / 深度 / 看过的名字数):整个跳过。"""
 
 
-@dataclass
-class _Tally:
-    """一个候选目录的计数,超出剩余额度就抛 :class:`_TooLargeError`。"""
-
-    max_bytes: int
-    max_entries: int
-    bytes: int = 0
-    entries: int = 0
-    #: 跳过的条目:符号链接、FIFO / 设备 / socket、编码不成 UTF-8 的名字。
-    skipped: int = 0
-
-    def take(self, *, size: int = 0, entries: int = 1) -> None:
-        self.bytes += size
-        self.entries += entries
-        if self.bytes > self.max_bytes or self.entries > self.max_entries:
-            raise _TooLargeError
+class _StoppedError(Exception):
+    """run 被取消了:在下一个文件处停下(不写标记、清临时目录)。"""
 
 
-@dataclass(frozen=True)
-class SeedReport:
-    """一次复制的结果。目录名只给调用方用(写进状态、告诉模型),日志里只记个数。"""
+class SeedQuotaGate(Protocol):
+    """用户工作区配额闸 —— 控制面的 ``WorkspaceQuotaService`` 满足它(上传用的同一道闸)。"""
 
-    copied: tuple[str, ...] = ()
-    #: 超出上限、整个没复制的目录 —— 只在 ``/agent/<目录>/``。
-    skipped_too_large: tuple[str, ...] = ()
-    #: 本对话 ``work/`` 里已经有同名条目、不覆盖的目录。
-    skipped_existing: tuple[str, ...] = ()
-    #: 跳过的条目数(符号链接、特殊文件、编码不成 UTF-8 的名字)。
-    skipped_entries: int = 0
-    bytes_copied: int = 0
-    entries_copied: int = 0
+    async def check_upload(self, *, tenant_id: UUID, user_id: UUID, incoming_bytes: int) -> None:
+        """已用 + ``incoming_bytes`` > 上限时抛 ``WorkspaceQuotaExceededError``。"""
+
+    def refresh_soon(self, *, tenant_id: UUID, user_id: UUID) -> None:
+        """fire-and-forget 重算该用户的已用字节(实现自带防抖)。"""
 
 
 def _max_bytes() -> int:
@@ -132,17 +135,68 @@ class _Budget:
 
     bytes: int = field(default_factory=_max_bytes)
     entries: int = field(default_factory=_max_entries)
+    visits: int = 0
     skipped: int = 0
+    stop: threading.Event | None = None
     copied: list[str] = field(default_factory=list)
     too_large: list[str] = field(default_factory=list)
     existing: list[str] = field(default_factory=list)
 
     def tally(self) -> _Tally:
-        return _Tally(max_bytes=self.bytes, max_entries=self.entries)
+        return _Tally(budget=self, max_bytes=self.bytes, max_entries=self.entries)
 
     def spend(self, tally: _Tally) -> None:
         self.bytes -= tally.bytes
         self.entries -= tally.entries
+
+    def visit(self) -> None:
+        """看一个名字:停止标志在就停;看过的名字总数到顶就让手上这个目录放弃。"""
+        if self.stop is not None and self.stop.is_set():
+            raise _StoppedError
+        self.visits += 1
+        if self.visits > MAX_SEED_VISITS:
+            raise _TooLargeError
+
+
+@dataclass
+class _Tally:
+    """一个候选目录的计数,超出剩余额度就抛 :class:`_TooLargeError`。"""
+
+    budget: _Budget
+    max_bytes: int
+    max_entries: int
+    bytes: int = 0
+    entries: int = 0
+    #: 跳过的条目:符号链接、FIFO / 设备 / socket、编码不成 UTF-8 的名字。
+    skipped: int = 0
+
+    def take(self, *, size: int = 0, entries: int = 1) -> None:
+        self.bytes += size
+        self.entries += entries
+        if self.bytes > self.max_bytes or self.entries > self.max_entries:
+            raise _TooLargeError
+
+    def skip(self) -> None:
+        """跳过的名字同样占一个条目:一个种满符号链接的目录在 500 个之后就整个放弃。"""
+        self.skipped += 1
+        self.take()
+
+
+@dataclass(frozen=True)
+class SeedReport:
+    """一次复制的结果。目录名只给调用方用(写进状态、告诉模型),日志里只记个数。"""
+
+    copied: tuple[str, ...] = ()
+    #: 超出上限、整个没复制的目录 —— 只在 ``/agent/<目录>/``。
+    skipped_too_large: tuple[str, ...] = ()
+    #: 本对话 ``work/`` 里已经有同名条目、不覆盖的目录。
+    skipped_existing: tuple[str, ...] = ()
+    #: 用户工作区配额满了、一个都没复制的目录(review 7)。
+    skipped_quota: tuple[str, ...] = ()
+    #: 跳过的条目数(符号链接、特殊文件、编码不成 UTF-8 的名字)。
+    skipped_entries: int = 0
+    bytes_copied: int = 0
+    entries_copied: int = 0
 
 
 def _utf8(name: str) -> bool:
@@ -154,10 +208,11 @@ def _utf8(name: str) -> bool:
 
 
 def _children(dir_fd: int, tally: _Tally) -> Iterator[tuple[str, os.stat_result]]:
-    """``dir_fd`` 下的子目录与普通文件(按名字排序);其余一律计入 ``tally.skipped``。"""
+    """``dir_fd`` 下的子目录与普通文件(按名字排序);其余一律跳过并计数。"""
     for name in sorted(os.listdir(dir_fd)):
+        tally.budget.visit()
         if not _utf8(name):
-            tally.skipped += 1
+            tally.skip()
             continue
         try:
             info = os.lstat(name, dir_fd=dir_fd)
@@ -166,7 +221,7 @@ def _children(dir_fd: int, tally: _Tally) -> Iterator[tuple[str, os.stat_result]
         if stat.S_ISDIR(info.st_mode) or stat.S_ISREG(info.st_mode):
             yield name, info
         else:
-            tally.skipped += 1
+            tally.skip()
 
 
 def _open_child_dir(dir_fd: int, name: str, tally: _Tally) -> int | None:
@@ -174,7 +229,7 @@ def _open_child_dir(dir_fd: int, name: str, tally: _Tally) -> int | None:
     try:
         return _openat_dir(dir_fd, name, create=False)
     except OSError:
-        tally.skipped += 1
+        tally.skip()
         return None
 
 
@@ -204,12 +259,12 @@ def _copy_file(src_dir: int, dst_dir: int, name: str, tally: _Tally) -> None:
     try:
         src = os.open(name, _READ_FLAGS, dir_fd=src_dir)
     except OSError:
-        tally.skipped += 1  # 刚被换成符号链接(ELOOP)/ socket(ENXIO)/ 删掉了
+        tally.skip()  # 刚被换成符号链接(ELOOP)/ socket(ENXIO)/ 删掉了
         return
     try:
         info = os.fstat(src)
         if not stat.S_ISREG(info.st_mode):
-            tally.skipped += 1
+            tally.skip()
             return
         tally.take(size=info.st_size)
         mode = _FILE_MODE | (info.st_mode & stat.S_IXUSR)
@@ -268,11 +323,17 @@ def _exists(dir_fd: int, name: str) -> bool:
 
 
 def _candidates(agent_fd: int, budget: _Budget) -> list[str]:
-    """agent 根下可复制的一级目录:不是点开头、不是布局 / 平台保留名、是真目录。"""
+    """agent 根下可复制的一级目录:不是点开头、不是布局 / 平台保留名、是真目录。
+
+    看过的名字计数;到顶之后剩下的名字不再 ``lstat``(也就不再是候选)。"""
     out: list[str] = []
     for name in sorted(os.listdir(agent_fd)):
         if name.startswith(".") or name in AGENT_ROOT_RESERVED:
             continue
+        try:
+            budget.visit()
+        except _TooLargeError:
+            break
         if not _utf8(name):
             budget.skipped += 1
             continue
@@ -287,20 +348,33 @@ def _candidates(agent_fd: int, budget: _Budget) -> list[str]:
     return out
 
 
+def _measure_one(agent_fd: int, name: str, budget: _Budget) -> _Tally | None:
+    """量一个候选目录;放不进剩下的额度就记成「太大」、返回 ``None``。"""
+    measured = budget.tally()
+    src = _open_child_dir(agent_fd, name, measured)
+    if src is None:
+        budget.skipped += 1
+        return None
+    try:
+        measured.take()
+        _measure(src, 1, measured)
+    except _TooLargeError:
+        budget.too_large.append(name)
+        return None
+    finally:
+        os.close(src)
+    return measured
+
+
 def _seed_one(agent_fd: int, tmp_fd: int, work_fd: int, name: str, budget: _Budget) -> None:
     """量 → 复制进临时目录 → 改名进 ``work/``(同名已存在就不动)。"""
+    if _measure_one(agent_fd, name, budget) is None:
+        return
     src = _open_child_dir(agent_fd, name, budget.tally())
     if src is None:
         budget.skipped += 1
         return
     try:
-        measured = budget.tally()
-        try:
-            measured.take()
-            _measure(src, 1, measured)
-        except _TooLargeError:
-            budget.too_large.append(name)
-            return
         copied = budget.tally()
         try:
             copied.take()
@@ -367,6 +441,7 @@ def _write_marker(conv_fd: int, report: SeedReport) -> None:
             "copied": list(report.copied),
             "skipped_too_large": list(report.skipped_too_large),
             "skipped_existing": list(report.skipped_existing),
+            "skipped_quota": list(report.skipped_quota),
             "skipped_entries": report.skipped_entries,
             "bytes_copied": report.bytes_copied,
         },
@@ -387,18 +462,64 @@ def _write_marker(conv_fd: int, report: SeedReport) -> None:
         os.close(fd)
 
 
-def seed_conversation_sync(
+def plan_seed_bytes(
     store: NasWorkspaceStore, tenant_id: UUID, user_id: UUID, agent_key: str, conv_id: UUID
+) -> int | None:
+    """只量不读:这次开场会复制多少字节(问配额用)。已经复制过 / agent 根不在返回 ``None``。"""
+    try:
+        conv_fd = _conversation_dir(store, tenant_id, user_id, agent_key, conv_id, create=False)
+    except _WorkspacePathNotFoundError:
+        conv_fd = None
+    try:
+        if conv_fd is not None and _exists(conv_fd, SEED_MARKER):
+            return None
+        try:
+            agent_fd = store._open_scope_dir_fd(tenant_id, user_id, f"{AGENTS_DIR}/{agent_key}")
+        except _WorkspacePathNotFoundError:
+            return None
+        try:
+            budget = _Budget()
+            planned = 0
+            for name in _candidates(agent_fd, budget):
+                tally = _measure_one(agent_fd, name, budget)
+                if tally is not None:
+                    budget.spend(tally)
+                    planned += tally.bytes
+            return planned
+        finally:
+            os.close(agent_fd)
+    finally:
+        if conv_fd is not None:
+            os.close(conv_fd)
+
+
+def seed_conversation_sync(
+    store: NasWorkspaceStore,
+    tenant_id: UUID,
+    user_id: UUID,
+    agent_key: str,
+    conv_id: UUID,
+    *,
+    stop: threading.Event | None = None,
+    quota_blocked: bool = False,
 ) -> SeedReport | None:
-    """复制本对话的基础目录;已经复制过返回 ``None``。失败抛,不写标记、不留临时目录。"""
+    """复制本对话的基础目录;已经复制过返回 ``None``。失败抛,不写标记、不留临时目录。
+
+    ``quota_blocked`` —— 配额闸拦下了:一个目录都不复制,候选目录全记成「配额」,照样写标记
+    (每个对话只问一次)。``stop`` 置位时在下一个名字处停下(抛 :class:`_StoppedError`)。
+    """
     conv_fd = _conversation_dir(store, tenant_id, user_id, agent_key, conv_id, create=True)
     try:
         if _exists(conv_fd, SEED_MARKER):
             return None
         agent_fd = store._open_scope_dir_fd(tenant_id, user_id, f"{AGENTS_DIR}/{agent_key}")
         try:
-            budget = _Budget()
+            budget = _Budget(stop=stop)
             names = _candidates(agent_fd, budget)
+            if quota_blocked:
+                report = SeedReport(skipped_quota=tuple(names), skipped_entries=budget.skipped)
+                _write_marker(conv_fd, report)
+                return report
             work_fd = _openat_dir(conv_fd, CONVERSATION_WORK_DIR, create=True)
             try:
                 tmp = f"{SEED_TMP_PREFIX}{uuid4().hex}"
@@ -407,8 +528,10 @@ def seed_conversation_sync(
                     for name in names:
                         if _exists(work_fd, name):
                             budget.existing.append(name)
-                            continue
-                        _seed_one(agent_fd, tmp_fd, work_fd, name, budget)
+                        elif budget.visits >= MAX_SEED_VISITS:
+                            budget.too_large.append(name)  # 看过的名字到顶:不再碰它
+                        else:
+                            _seed_one(agent_fd, tmp_fd, work_fd, name, budget)
                 finally:
                     os.close(tmp_fd)
                     with contextlib.suppress(FileNotFoundError):
@@ -431,6 +554,39 @@ def seed_conversation_sync(
         os.close(conv_fd)
 
 
+async def _copy_holding_the_lock(
+    store: NasWorkspaceStore,
+    tenant_id: UUID,
+    user_id: UUID,
+    agent_key: str,
+    conv_id: UUID,
+    *,
+    quota_blocked: bool,
+) -> SeedReport | None:
+    """在线程里复制;本协程被取消时置停止标志,并**等线程停下**再把取消往外抛 —— 调用方的
+    锁因此一直持到线程不再写为止。"""
+    stop = threading.Event()
+    work = asyncio.ensure_future(
+        asyncio.to_thread(
+            seed_conversation_sync,
+            store,
+            tenant_id,
+            user_id,
+            agent_key,
+            conv_id,
+            stop=stop,
+            quota_blocked=quota_blocked,
+        )
+    )
+    try:
+        return await asyncio.shield(work)
+    except asyncio.CancelledError:
+        stop.set()
+        with contextlib.suppress(Exception):
+            await work
+        raise
+
+
 async def seed_conversation(
     store: NasWorkspaceStore,
     *,
@@ -439,12 +595,32 @@ async def seed_conversation(
     agent_key: str,
     conv_id: UUID,
     lock: KeyedLock,
+    quota: SeedQuotaGate | None = None,
 ) -> SeedReport | None:
-    """对话开场的复制;已经复制过返回 ``None``(先不加锁看一眼标记,锁内再看一次)。"""
+    """对话开场的复制;已经复制过返回 ``None``(先不加锁看一眼标记,锁内再看一次)。
+
+    ``quota`` 接上时:先量要复制多少字节,问配额(已用 + 这次 > 上限就拦,整个不复制);
+    复制了字节之后触发一次配额重算。
+    """
     require_safe_key(agent_key)
     if await asyncio.to_thread(seeded, store, tenant_id, user_id, agent_key, conv_id):
         return None
     async with lock.acquire(key=f"{tenant_id}:{conv_id}"):
-        return await asyncio.to_thread(
-            seed_conversation_sync, store, tenant_id, user_id, agent_key, conv_id
+        blocked = False
+        if quota is not None:
+            planned = await asyncio.to_thread(
+                plan_seed_bytes, store, tenant_id, user_id, agent_key, conv_id
+            )
+            if planned:
+                try:
+                    await quota.check_upload(
+                        tenant_id=tenant_id, user_id=user_id, incoming_bytes=planned
+                    )
+                except WorkspaceQuotaExceededError:
+                    blocked = True
+        report = await _copy_holding_the_lock(
+            store, tenant_id, user_id, agent_key, conv_id, quota_blocked=blocked
         )
+    if quota is not None and report is not None and report.bytes_copied:
+        quota.refresh_soon(tenant_id=tenant_id, user_id=user_id)
+    return report

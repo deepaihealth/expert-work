@@ -43,7 +43,7 @@ runner = _load_runner()
 _REAL_EXEC_ARGV = runner._exec_argv
 
 #: ``_EXEC_VIEW_SCRIPT`` 的 ``$0``;它后面是 ``$1``(bind 源)、``$2``(对话 id)、``$3``
-#: (本对话线程 id)、``$4``(过渡期目录个数)与那几个目录名,再后面是解释器。
+#: (本对话线程 id),再后面是解释器。
 _ARGV0 = "ew-exec-view"
 
 

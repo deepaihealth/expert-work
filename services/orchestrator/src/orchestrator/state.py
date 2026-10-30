@@ -373,3 +373,6 @@ class AgentState(TypedDict):
     #: 节点只在复制那一次写)。工作区快照段每轮据此告诉模型它们只在 ``/agent/<目录>/``。
     #: 默认覆盖 reducer;之后的 run 不写,值随检查点留着。
     seed_skipped_dirs: NotRequired[list[str]]
+    #: B-236 review 7 —— 开场复制因用户工作区配额满了整个没做(``seed_skipped_dirs`` 里是本该
+    #: 复制的目录)。快照段据此换一句说明。
+    seed_quota_blocked: NotRequired[bool]

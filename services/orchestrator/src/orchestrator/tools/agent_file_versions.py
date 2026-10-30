@@ -30,8 +30,9 @@ import os
 import re
 import shutil
 import stat
+import time
 from collections.abc import Iterator, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Protocol, runtime_checkable
 from uuid import UUID, uuid4
@@ -44,6 +45,7 @@ from orchestrator.tools.nas_workspace_store import (
     MISSING_DIR_ERRORS,
     NasWorkspaceStore,
     _openat_dir,
+    workspace_deleted_marker,
 )
 from orchestrator.tools.sandbox import WorkspacePathEscapeError
 from orchestrator.tools.workspace_paths import AGENT_ROOT_RESERVED, AGENTS_DIR
@@ -60,7 +62,16 @@ MAX_VERSIONED_FILE_BYTES = 8 * 1024 * 1024
 #: 一次观察最多读这么多字节(只读大小 / mtime 变了的文件)。读不完的留到下一次 run 结束。
 MAX_OBSERVE_READ_BYTES = 20 * 1024 * 1024
 
+#: review 7 —— 一个用户全部版本(所有 agent)合计的上限。超了从最早写下的版本删起,跨文件、
+#: 跨 agent。版本也计入这个用户的工作区配额(``WorkspaceQuotaService.refresh``)。
+MAX_USER_VERSION_BYTES = 200 * 1024 * 1024
+
+#: review 7 —— 源文件从 ``/agent`` 消失满这么久,它的版本目录整个删掉。「从哪天起不见」记在
+#: 版本目录里的 ``missing`` 标记上(第一次发现不见时建,文件回来就删)。
+MISSING_SOURCE_GRACE_S = 30 * 24 * 3600
+
 _PATH_FILE = "path"
+_MISSING_FILE = "missing"
 _VERSION_RE = re.compile(r"^v(\d{8})-([0-9a-f]{64})$")
 _FILE_MODE = 0o600
 _READ_FLAGS = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC
@@ -81,6 +92,8 @@ class ObserveReport:
     unchanged: int = 0
     skipped: int = 0
     pruned: int = 0
+    #: 源文件不见满 30 天、整个删掉的版本目录数。
+    dropped: int = 0
 
 
 @runtime_checkable
@@ -93,6 +106,9 @@ class AgentFileVersionStore(Protocol):
     async def delete_all_for_user(self, *, tenant_id: UUID, user_id: UUID) -> int:
         """删一个用户的全部版本(清除用户数据);返回删掉的版本文件数。"""
 
+    async def delete_for_path(self, *, tenant_id: UUID, user_id: UUID, path: str) -> int:
+        """工作区删文件接口删掉 ``path``(用户根相对)时,连它的版本一起删;返回版本文件数。"""
+
 
 @dataclass
 class _Scan:
@@ -102,6 +118,11 @@ class _Scan:
     unchanged: int = 0
     skipped: int = 0
     pruned: int = 0
+    dropped: int = 0
+    #: 这次看到的普通文件(agent 根相对)—— 判「源文件还在不在」用。
+    seen: set[str] = field(default_factory=set)
+    #: 条目数上限截断了这次遍历:``seen`` 不全,不判「不见」。
+    complete: bool = True
 
 
 def _utf8(name: str) -> bool:
@@ -123,6 +144,7 @@ def _files(dir_fd: int, prefix: str, depth: int, scan: _Scan) -> Iterator[tuple[
         scan.entries += 1
         if scan.entries > MAX_SEED_ENTRIES:
             scan.skipped += 1
+            scan.complete = False
             return
         try:
             info = os.lstat(name, dir_fd=dir_fd)
@@ -130,6 +152,7 @@ def _files(dir_fd: int, prefix: str, depth: int, scan: _Scan) -> Iterator[tuple[
             continue
         rel = f"{prefix}{name}"
         if stat.S_ISREG(info.st_mode):
+            scan.seen.add(rel)
             yield dir_fd, name, rel
         elif stat.S_ISDIR(info.st_mode) and depth + 1 < MAX_SEED_DEPTH:
             try:
@@ -267,8 +290,15 @@ def _write_path(file_dir: int, rel: str) -> None:
 def observe_sync(
     workspace: NasWorkspaceStore, tenant_id: UUID, user_id: UUID, agent_key: str
 ) -> ObserveReport:
-    """扫一遍该 agent 的 ``/agent``,改过的文件各留一份。版本目录在遇到第一个文件时才建。"""
+    """扫一遍该 agent 的 ``/agent``,改过的文件各留一份。版本目录在遇到第一个文件时才建。
+
+    review 7 —— 用户已被清除(``.deleted`` 软删标记在)就什么都不做:清除之后才结束的 run 不能
+    把版本又建回来。之后两件收尾:源文件不见满 30 天的版本目录删掉;本次写了新版本时,用户
+    合计超过 :data:`MAX_USER_VERSION_BYTES` 就从最早的版本删起。
+    """
     require_safe_key(agent_key)
+    if os.path.lexists(workspace_deleted_marker(workspace.root, tenant_id, user_id)):
+        return ObserveReport()
     try:
         agent_fd = workspace._open_scope_dir_fd(tenant_id, user_id, f"{AGENTS_DIR}/{agent_key}")
     except MISSING_DIR_ERRORS:
@@ -291,12 +321,129 @@ def observe_sync(
         if agent_dir is not None:
             os.close(agent_dir)
         os.close(agent_fd)
+    _housekeep(workspace.root, tenant_id, user_id, agent_key, scan)
     return ObserveReport(
         snapshotted=scan.snapshotted,
         unchanged=scan.unchanged,
         skipped=scan.skipped,
         pruned=scan.pruned,
+        dropped=scan.dropped,
     )
+
+
+def _housekeep(root: str, tenant_id: UUID, user_id: UUID, agent_key: str, scan: _Scan) -> None:
+    """观察之后的两件收尾(版本目录不存在就什么都不做)。"""
+    try:
+        user_fd = _open_versions_root(root, tenant_id, user_id, create=False)
+    except FileNotFoundError:
+        return
+    try:
+        if scan.complete:
+            try:
+                agent_dir = _openat_dir(user_fd, agent_key, create=False)
+            except FileNotFoundError:
+                agent_dir = None
+            if agent_dir is not None:
+                try:
+                    _sweep_missing(agent_dir, scan, time.time())
+                finally:
+                    os.close(agent_dir)
+        if scan.snapshotted:
+            _enforce_user_cap(user_fd, scan)
+    finally:
+        os.close(user_fd)
+
+
+def _read_path(file_dir: int) -> str | None:
+    try:
+        fd = os.open(_PATH_FILE, _READ_FLAGS, dir_fd=file_dir)
+    except OSError:
+        return None
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            return None
+        return os.read(fd, 4096).decode("utf-8", errors="replace")
+    finally:
+        os.close(fd)
+
+
+def _sweep_missing(agent_dir: int, scan: _Scan, now: float) -> None:
+    """源文件不在了:第一次发现时记下(``missing`` 标记),满 30 天删掉整个版本目录;
+    源文件回来了就撤掉标记。"""
+    for key in os.listdir(agent_dir):
+        try:
+            file_dir = _openat_dir(agent_dir, key, create=False)
+        except OSError:
+            continue
+        try:
+            rel = _read_path(file_dir)
+            if rel is None:
+                continue
+            if rel in scan.seen:
+                with contextlib.suppress(FileNotFoundError):
+                    os.unlink(_MISSING_FILE, dir_fd=file_dir)
+                continue
+            try:
+                since = os.lstat(_MISSING_FILE, dir_fd=file_dir).st_mtime
+            except FileNotFoundError:
+                with contextlib.suppress(FileExistsError):
+                    os.close(
+                        os.open(
+                            _MISSING_FILE,
+                            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC,
+                            _FILE_MODE,
+                            dir_fd=file_dir,
+                        )
+                    )
+                continue
+        finally:
+            os.close(file_dir)
+        if now - since >= MISSING_SOURCE_GRACE_S:
+            shutil.rmtree(key, dir_fd=agent_dir)
+            scan.dropped += 1
+
+
+def _enforce_user_cap(user_fd: int, scan: _Scan) -> None:
+    """用户合计超过上限:按写下的先后(ctime)从最早的版本删起,跨文件、跨 agent。"""
+    found: list[tuple[int, str, str, str, int]] = []  # (ctime, agent, key, name, size)
+    total = 0
+    for agent_key in os.listdir(user_fd):
+        try:
+            agent_dir = _openat_dir(user_fd, agent_key, create=False)
+        except OSError:
+            continue
+        try:
+            for key in os.listdir(agent_dir):
+                try:
+                    file_dir = _openat_dir(agent_dir, key, create=False)
+                except OSError:
+                    continue
+                try:
+                    for name in os.listdir(file_dir):
+                        if not _VERSION_RE.match(name):
+                            continue
+                        info = os.lstat(name, dir_fd=file_dir)
+                        found.append((info.st_ctime_ns, agent_key, key, name, info.st_size))
+                        total += info.st_size
+                finally:
+                    os.close(file_dir)
+        finally:
+            os.close(agent_dir)
+    for _ctime, agent_key, key, name, size in sorted(found):
+        if total <= MAX_USER_VERSION_BYTES:
+            return
+        agent_dir = _openat_dir(user_fd, agent_key, create=False)
+        try:
+            file_dir = _openat_dir(agent_dir, key, create=False)
+            try:
+                with contextlib.suppress(FileNotFoundError):
+                    os.unlink(name, dir_fd=file_dir)
+                    scan.pruned += 1
+            finally:
+                os.close(file_dir)
+        finally:
+            os.close(agent_dir)
+        total -= size
 
 
 def _read_all(fd: int, size: int) -> bytes:
@@ -364,6 +511,48 @@ class NasAgentFileVersionStore:
         return await asyncio.to_thread(
             _delete_user_versions, self.workspace.root, tenant_id, user_id
         )
+
+    async def delete_for_path(self, *, tenant_id: UUID, user_id: UUID, path: str) -> int:
+        return await asyncio.to_thread(
+            _delete_path_versions, self.workspace.root, tenant_id, user_id, path
+        )
+
+
+def _delete_path_versions(root: str, tenant_id: UUID, user_id: UUID, path: str) -> int:
+    """``agents/<key>/<rel>``(用户根相对)的版本目录整个删掉。别的路径(对话目录、平台目录、
+    老布局的扁平路径)没有版本,返回 0。"""
+    parts = [p for p in path.split("/") if p not in ("", ".")]
+    if len(parts) < 3 or parts[0] != AGENTS_DIR or ".." in parts:
+        return 0
+    agent_key, rel = parts[1], "/".join(parts[2:])
+    if parts[2].startswith(".") or parts[2] in AGENT_ROOT_RESERVED:
+        return 0
+    require_safe_key(agent_key)
+    key = hashlib.sha256(rel.encode()).hexdigest()[:32]
+    try:
+        user_fd = _open_versions_root(root, tenant_id, user_id, create=False)
+    except FileNotFoundError:
+        return 0
+    try:
+        try:
+            agent_dir = _openat_dir(user_fd, agent_key, create=False)
+        except FileNotFoundError:
+            return 0
+        try:
+            try:
+                file_dir = _openat_dir(agent_dir, key, create=False)
+            except FileNotFoundError:
+                return 0
+            try:
+                count = sum(1 for n in os.listdir(file_dir) if _VERSION_RE.match(n))
+            finally:
+                os.close(file_dir)
+            shutil.rmtree(key, dir_fd=agent_dir)
+            return count
+        finally:
+            os.close(agent_dir)
+    finally:
+        os.close(user_fd)
 
 
 #: fire-and-forget 观察任务的引用(不留引用,任务可能在跑完之前被回收)。

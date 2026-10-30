@@ -172,8 +172,8 @@ _PERSONAL_DEFAULT = "report-style/personal.json"
 
 
 def test_personal_default_lives_under_the_agent_root(root):
-    """B-236 —— 每个对话的 ``/workspace`` 是它自己的目录,相对路径的个人默认只落进本对话、
-    以后的对话读不到(过渡期里同名老目录还是只读的,写会 EROFS)。文档里每一处都必须是
+    """B-236 —— 每个对话的 ``/workspace`` 是它自己的目录(开场带着 agent 各目录的副本),
+    相对路径的个人默认只改进本对话那份副本、以后的对话读不到。文档里每一处都必须是
     ``/agent/`` 下的绝对路径。"""
     docs = [root / "SKILL.md", *sorted((root / "reference").glob("*.md"))]
     seen = 0

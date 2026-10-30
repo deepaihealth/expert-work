@@ -221,6 +221,9 @@ _CONTAINERS: dict[str, int] = {WORKSPACE_AGENTS_DIR: 2, WORKSPACE_SHARED_DIR: 1}
 #: 不是 agent 产出,所以它也算一层**位置**容器,与 ``agents/<key>/`` 一样先剥掉再看首段。
 WORKSPACE_THREADS_DIR = "threads"
 WORKSPACE_CONVERSATION_WORK_DIR = "work"
+#: B-236 —— 对话开场复制做完的标记 ``threads/<conv>/.seeded``(``conversation_seed`` 写)。平台
+#: 状态不是产出:浏览列表不列它。
+WORKSPACE_SEED_MARKER = ".seeded"
 _UUID_RE = re.compile(_UUID_PATTERN)
 
 

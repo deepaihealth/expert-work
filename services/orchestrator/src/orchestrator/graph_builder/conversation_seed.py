@@ -9,6 +9,9 @@
   和计数,返回 ``{}``;没写标记,下一次 run 再试;
 * 超出上限没复制的目录写进 ``seed_skipped_dirs``,工作区快照段每轮据此告诉模型它们只在
   ``/agent/<目录>/``。之后的 run 标记已在,节点什么都不返回,状态里的值随检查点留着。
+  配额满了整个没复制时另置 ``seed_quota_blocked``,快照段换一句说明。
+* 状态里的名单有上限(:data:`MAX_REPORTED_DIRS` 个、每个 :data:`MAX_REPORTED_NAME_CHARS`
+  字符):名字是沙箱能起的,它们进检查点、每轮进提示词。
 """
 
 from __future__ import annotations
@@ -26,12 +29,16 @@ from expert_work.common.observability import (
 from orchestrator.graph_builder._config import cancellation_token, configurable_uuid
 from orchestrator.graph_builder.memory import MemoryNode
 from orchestrator.state import AgentState
-from orchestrator.tools.conversation_seed import seed_conversation
+from orchestrator.tools.conversation_seed import SeedQuotaGate, seed_conversation
 from orchestrator.tools.locks import KeyedLock
 from orchestrator.tools.nas_workspace_store import NasWorkspaceStore
 from orchestrator.tools.registry import ToolContext, workspace_view_fields
 
 logger = logging.getLogger(__name__)
+
+#: 记进状态的没复制目录最多几个、每个名字最多多长(review 7)。快照段渲染时还会再收一遍。
+MAX_REPORTED_DIRS = 20
+MAX_REPORTED_NAME_CHARS = 120
 
 conversation_seed_total = expert_work_counter(
     "expert_work_conversation_seed_total",
@@ -41,7 +48,9 @@ conversation_seed_total = expert_work_counter(
 )
 
 
-def make_conversation_seed_node(*, store: NasWorkspaceStore, lock: KeyedLock) -> MemoryNode:
+def make_conversation_seed_node(
+    *, store: NasWorkspaceStore, lock: KeyedLock, quota: SeedQuotaGate | None = None
+) -> MemoryNode:
     """构造开场复制节点。``store`` 必须是 NAS 实现(复制按目录 fd 在宿主侧做)。"""
 
     async def conversation_seed_node(state: AgentState, config: RunnableConfig) -> dict[str, Any]:
@@ -65,6 +74,7 @@ def make_conversation_seed_node(*, store: NasWorkspaceStore, lock: KeyedLock) ->
                     agent_key=view.agent_key,
                     conv_id=view.conv_id,
                     lock=lock,
+                    quota=quota,
                 )
             except Exception as exc:
                 conversation_seed_total.labels(outcome="failed").inc()
@@ -79,14 +89,24 @@ def make_conversation_seed_node(*, store: NasWorkspaceStore, lock: KeyedLock) ->
         conversation_seed_total.labels(outcome="seeded").inc()
         logger.info(
             "conversation_seed.done agent_key=%s copied=%d too_large=%d existing=%d "
-            "skipped_entries=%d bytes=%d",
+            "quota=%d skipped_entries=%d bytes=%d",
             view.agent_key,
             len(report.copied),
             len(report.skipped_too_large),
             len(report.skipped_existing),
+            len(report.skipped_quota),
             report.skipped_entries,
             report.bytes_copied,
         )
-        return {"seed_skipped_dirs": list(report.skipped_too_large)}
+        if report.skipped_quota:
+            return {
+                "seed_skipped_dirs": _bounded(report.skipped_quota),
+                "seed_quota_blocked": True,
+            }
+        return {"seed_skipped_dirs": _bounded(report.skipped_too_large)}
 
     return conversation_seed_node
+
+
+def _bounded(names: tuple[str, ...]) -> list[str]:
+    return [n[:MAX_REPORTED_NAME_CHARS] for n in names[:MAX_REPORTED_DIRS]]

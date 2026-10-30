@@ -323,11 +323,20 @@ async def test_workspace_files_and_download_with_supervisor(
             json={"agent_name": "code-reviewer", "agent_version": "1.0.0"},
         )
         thread_id = create.json()["data"]["thread_id"]
+        # B-236 review 7 —— 新会话是对话视图:清单只列它自己的 ``threads/<id>/work/``,路径写成
+        # agent 相对(本会话的下载 / 删除端点按这种写法投影)。别的地方的文件不列。
+        work = f"threads/{thread_id}/work"
+        app.state.workspace_store.workspace_files = [
+            WorkspaceFileEntry(
+                path=f"agents/{sanitize_agent_key('code-reviewer')}/{work}/report.pdf", size=2048
+            ),
+            WorkspaceFileEntry(path="report.pdf", size=1),
+        ]
 
         listing = await client.get(f"/v1/sessions/{thread_id}/workspace/files")
         assert listing.status_code == 200
         files = listing.json()["data"]["files"]
-        assert files == [{"path": "report.pdf", "size": 2048}]
+        assert files == [{"path": f"{work}/report.pdf", "size": 2048}]
 
         download = await client.get(
             f"/v1/sessions/{thread_id}/workspace/file", params={"path": "report.pdf"}

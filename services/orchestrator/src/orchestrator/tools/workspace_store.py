@@ -138,6 +138,22 @@ def _entry_from_wire(raw: Mapping[str, Any]) -> WorkspaceFileEntry:
     return WorkspaceFileEntry(path=str(raw["path"]), size=int(raw["size"]), mtime=mtime)
 
 
+def without_seed_copies(
+    conversation: Sequence[WorkspaceFileEntry], agent: Sequence[WorkspaceFileEntry]
+) -> list[WorkspaceFileEntry]:
+    """B-236 review 7 —— 一个对话的文件(相对它的 ``work/``)去掉开场复制进来、原样未改的副本。
+
+    ``agent`` 是 agent 根的文件(相对 agent 根)。副本只会出现在子目录里(一级文件从不复制),
+    且大小与 mtime 都与源相同(复制保留 mtime);拿不到 mtime 的后端一律不剔,宁可多列。
+    """
+    source = {e.path: (e.size, e.mtime) for e in agent if e.mtime is not None}
+    return [
+        e
+        for e in conversation
+        if "/" not in e.path or e.mtime is None or source.get(e.path) != (e.size, e.mtime)
+    ]
+
+
 def scope_view(entries: Sequence[WorkspaceFileEntry], scope: str) -> list[WorkspaceFileEntry]:
     """把一份**用户根相对**的清单裁到一个作用域里, 并剥掉前缀。
 

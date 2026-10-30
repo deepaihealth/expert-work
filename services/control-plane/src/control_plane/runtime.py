@@ -150,6 +150,7 @@ from orchestrator.tools.artifact_snapshots import (
     InMemoryArtifactSnapshotStore,
     NasArtifactSnapshotStore,
 )
+from orchestrator.tools.conversation_seed import SeedQuotaGate
 from orchestrator.tools.knowledge_catalog import catalog_fingerprint
 from orchestrator.tools.knowledge_log import LoggedKnowledgeRetriever, RetrievalLogSink
 from orchestrator.tools.knowledge_rerank import RerankOutcome, RerankRanking
@@ -2062,6 +2063,7 @@ def build_tool_env(
     workspace_store: WorkspaceStore | None = None,
     artifact_snapshots: ArtifactSnapshotStore | None = None,
     conversation_seed_lock: KeyedLock | None = None,
+    workspace_quota: SeedQuotaGate | None = None,
 ) -> ToolEnv:
     """Assemble the M0 :class:`ToolEnv`.
 
@@ -2097,6 +2099,8 @@ def build_tool_env(
         artifact_snapshots=artifact_snapshots,
         # B-236 —— 对话开场复制按对话互斥;没给(单测 / 无库)就是进程内的锁。
         conversation_seed_lock=conversation_seed_lock or ProcessKeyedLock(),
+        # B-236 review 7 —— 开场复制前问的配额闸(与上传同一道)。
+        workspace_quota=workspace_quota,
     )
 
 

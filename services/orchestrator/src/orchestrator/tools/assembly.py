@@ -43,6 +43,7 @@ from orchestrator.tools.arg_bindings import bindings_by_tool
 from orchestrator.tools.artifact import ListArtifactsTool, SaveArtifactTool
 from orchestrator.tools.artifact_snapshots import ArtifactSnapshotStore
 from orchestrator.tools.bash import BashTool
+from orchestrator.tools.conversation_seed import SeedQuotaGate
 from orchestrator.tools.file_ops import (
     EditFileTool,
     ListDirTool,
@@ -217,6 +218,9 @@ class ToolEnv:
     #: B-236 —— 对话开场复制(``conversation_seed``)按对话互斥的锁。默认是进程内的;
     #: 控制面注入 Postgres advisory-lock 实现(独立 classid,不是上面那把按用户的写锁)。
     conversation_seed_lock: KeyedLock = field(default_factory=ProcessKeyedLock)
+    #: B-236 review 7 —— 开场复制前问的用户工作区配额闸(控制面的 ``WorkspaceQuotaService``,
+    #: 与上传同一道)。``None`` = 这个部署没有配额闸,照旧复制。
+    workspace_quota: SeedQuotaGate | None = None
     #: B-122 —— 这是一次动态子智能体(worker)构建。控制面在 ``make_worker_build_fn``
     #: 里置 True(孙级复用同一个 env,自动带上);主 Agent、静态子 Agent 恒为 False。
     #: 为 True 时:不注册 ``WORKER_DENIED_BUILTINS``(含基础能力 ``save_artifact``)、

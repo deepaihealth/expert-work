@@ -297,11 +297,39 @@ def _seed_copies(
     return frozenset(name for name, files in ours.items() if theirs.get(name) == files)
 
 
+#: review 7 —— 「没复制」那一行最多列几个目录、每个名字最多几个字符。名字是沙箱能起的。
+_MAX_SKIPPED_SHOWN = 8
+_MAX_SKIPPED_NAME_CHARS = 60
+
+
+def _safe_name(name: str) -> str:
+    """控制字符(含换行)转义成 ``\\xNN``,过长截断 —— 名字是数据,不能在块里另起一行。"""
+    cleaned = "".join(ch if ch.isprintable() else f"\\x{ord(ch):02x}" for ch in name)
+    if len(cleaned) > _MAX_SKIPPED_NAME_CHARS:
+        cleaned = cleaned[: _MAX_SKIPPED_NAME_CHARS - 1] + "…"
+    return cleaned
+
+
+def _skipped_line(names: Sequence[str], *, quota: bool) -> str:
+    if not names:
+        return ""
+    shown = ", ".join(f"{AGENT_VIEW}/{_safe_name(d)}/" for d in names[:_MAX_SKIPPED_SHOWN])
+    more = len(names) - _MAX_SKIPPED_SHOWN
+    tail = f" and {more} more under {AGENT_VIEW}/" if more > 0 else ""
+    reason = (
+        "Not copied into this conversation (the storage quota is full)"
+        if quota
+        else "Too large to copy into this conversation"
+    )
+    return f"  {reason} — use in place: {shown}{tail}"
+
+
 def render_conversation_block(
     conversation: Sequence[WorkspaceFileEntry],
     agent: Sequence[WorkspaceFileEntry],
     *,
     seed_skipped: Sequence[str] = (),
+    seed_quota_blocked: bool = False,
     max_expanded: int = DEFAULT_MAX_EXPANDED,
 ) -> str:
     """B-236 对话视图的块:``/workspace``(本对话)一节在前,``/agent`` 一节在后。
@@ -325,12 +353,7 @@ def render_conversation_block(
         f"{_INDENT_DIR}{name + '/':<{_NAME_WIDTH}}unchanged copy of {AGENT_VIEW}/{name}/"
         for name in sorted(copies)
     ]
-    skipped = (
-        "  Too large to copy into this conversation — use in place: "
-        + ", ".join(f"{AGENT_VIEW}/{d}/" for d in seed_skipped)
-        if seed_skipped
-        else ""
-    )
+    skipped = _skipped_line(seed_skipped, quota=seed_quota_blocked)
     conv_body = "\n".join(part for part in (conv_tree, *copy_lines, skipped) if part)
     return (
         f"{WORKSPACE_BLOCK_HEADING}\n{_CONVERSATION_BLOCK_PREAMBLE}\n\n"
@@ -346,6 +369,7 @@ async def workspace_prompt_block(
     user_id: UUID,
     view: WorkspaceView,
     seed_skipped: Sequence[str] = (),
+    seed_quota_blocked: bool = False,
     max_expanded: int = DEFAULT_MAX_EXPANDED,
 ) -> str:
     """列当前视图的工作区并渲染成块。**拿不到就返回 ``""``, 永不抛。**
@@ -386,5 +410,9 @@ async def workspace_prompt_block(
         )
         return ""
     return render_conversation_block(
-        conversation, agent, seed_skipped=seed_skipped, max_expanded=max_expanded
+        conversation,
+        agent,
+        seed_skipped=seed_skipped,
+        seed_quota_blocked=seed_quota_blocked,
+        max_expanded=max_expanded,
     )

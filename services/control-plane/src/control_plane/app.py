@@ -1857,6 +1857,7 @@ def create_app(
                         if sql_stores is not None
                         else None
                     ),
+                    workspace_quota=resolved_workspace_quota,
                 )
                 # Stream HX-7 — resolve the Langfuse client once: the
                 # SDK adapter when the deployment configures an instance,

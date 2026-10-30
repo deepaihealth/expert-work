@@ -190,3 +190,107 @@ async def test_a_dispatched_observation_runs_and_a_failure_is_only_logged(
         await asyncio.wait_for(failing, timeout=5)
     (record,) = [r for r in caplog.records if "agent_file_versions" in r.getMessage()]
     assert "OSError" in record.getMessage() and "客户甲" not in record.getMessage()
+
+
+# ---------------------------------------------------------------------------
+# review 7 —— 用户合计上限、源文件不见满 30 天、删文件接口、清除之后不再建
+# ---------------------------------------------------------------------------
+
+
+def _version_bytes(root: Path) -> int:
+    return sum(p.stat().st_size for p in _versions_root(root).rglob("v*") if p.is_file())
+
+
+async def test_the_users_versions_are_capped_oldest_first(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """合计超过上限:从最早写下的版本删起,跨文件 —— 最新的版本留着。"""
+    monkeypatch.setattr(versions_mod, "MAX_USER_VERSION_BYTES", 10_000)
+    agent = _agent(tmp_path)
+    for i in range(6):
+        for name in ("a.md", "b.md"):
+            p = _put(agent / "tpl" / name, f"{name}{i}".ljust(1_000, "x"))
+            os.utime(p, ns=(i * 10**9 + 1, i * 10**9 + 1))
+        await _observe(tmp_path)
+        await asyncio.sleep(0.01)  # 让各版本的 ctime 分得开
+
+    assert _version_bytes(tmp_path) <= 10_000
+    kept = _history(tmp_path)
+    assert kept["tpl/a.md"][-1].startswith("a.md5") and kept["tpl/b.md"][-1].startswith("b.md5")
+    assert not any(v.startswith(("a.md0", "b.md0")) for vs in kept.values() for v in vs)
+
+
+async def test_versions_of_a_source_gone_for_thirty_days_are_dropped(tmp_path: Path) -> None:
+    agent = _agent(tmp_path)
+    keep = _put(agent / "tpl" / "keep.md", "k")
+    gone = _put(agent / "tpl" / "gone.md", "g")
+    await _observe(tmp_path)
+    gone.unlink()
+
+    await _observe(tmp_path)  # 第一次发现不见:记下,不删
+    assert set(_history(tmp_path)) == {"tpl/keep.md", "tpl/gone.md"}
+    markers = list(_versions_root(tmp_path).rglob("missing"))
+    assert len(markers) == 1
+    old = 1_000_000_000
+    os.utime(markers[0], (old, old))
+
+    report = await _observe(tmp_path)
+
+    assert report.dropped == 1
+    assert set(_history(tmp_path)) == {"tpl/keep.md"}
+    assert keep.exists()
+
+
+async def test_a_source_that_comes_back_clears_its_missing_mark(tmp_path: Path) -> None:
+    f = _put(_agent(tmp_path) / "tpl" / "t.md", "t")
+    await _observe(tmp_path)
+    f.unlink()
+    await _observe(tmp_path)
+    _put(f, "t")
+    await _observe(tmp_path)
+    assert list(_versions_root(tmp_path).rglob("missing")) == []
+
+
+async def test_deleting_a_file_through_the_api_removes_its_versions(tmp_path: Path) -> None:
+    from types import SimpleNamespace
+
+    from control_plane.api._workspace_shared import drop_file_versions
+
+    _put(_agent(tmp_path) / "tpl" / "t.md", "t")
+    _put(_agent(tmp_path) / "tpl" / "u.md", "u")
+    await _observe(tmp_path)
+    request = SimpleNamespace(
+        app=SimpleNamespace(state=SimpleNamespace(agent_file_versions=_store(tmp_path)))
+    )
+
+    await drop_file_versions(
+        request,  # type: ignore[arg-type]
+        tenant_id=_TENANT,
+        user_id=_USER,
+        path=f"agents/{_KEY}/tpl/t.md",
+    )
+
+    assert set(_history(tmp_path)) == {"tpl/u.md"}
+    for not_versioned in (
+        f"agents/{_KEY}/threads/x/work/a.md",
+        "flat.md",
+        f"agents/{_KEY}/uploads/a",
+    ):
+        assert (
+            await _store(tmp_path).delete_for_path(
+                tenant_id=_TENANT, user_id=_USER, path=not_versioned
+            )
+            == 0
+        )
+
+
+async def test_a_run_ending_after_the_user_was_purged_writes_nothing(tmp_path: Path) -> None:
+    from orchestrator.tools.nas_workspace_store import workspace_deleted_marker
+
+    _put(_agent(tmp_path) / "AGENT_NOTES.md", "a")
+    marker = workspace_deleted_marker(str(tmp_path), _TENANT, _USER)
+    marker.parent.mkdir(parents=True, exist_ok=True)
+    marker.touch()
+
+    assert await _observe(tmp_path) == versions_mod.ObserveReport()
+    assert not _versions_root(tmp_path).exists()
