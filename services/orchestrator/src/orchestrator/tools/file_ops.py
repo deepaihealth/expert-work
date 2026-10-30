@@ -48,7 +48,7 @@ from pathlib import PurePosixPath
 from typing import Any, NoReturn
 from uuid import UUID
 
-from orchestrator.tools.locks import NullWorkspaceLock, WorkspaceLock
+from orchestrator.tools.locks import NullWorkspaceLock, WorkspaceLock, write_lock_conversation
 from orchestrator.tools.nas_workspace_store import MISSING_DIR_ERRORS
 from orchestrator.tools.registry import (
     ToolBlockedError,
@@ -1025,8 +1025,13 @@ class WriteFileTool:
         # Stream TE-8 — hold the per-workspace write lock around the write exec
         # so concurrent writes (and bash) across replicas serialise. The lock
         # scopes to the run's user (the durable workspace that may be shared);
-        # a user-less (ephemeral) run needs no lock.
-        async with self.workspace_lock.acquire(tenant_id=ctx.tenant_id, user_id=ctx.user_id):
+        # a user-less (ephemeral) run needs no lock. B-236: a new-layout
+        # conversation narrows it to its own directory.
+        async with self.workspace_lock.acquire(
+            tenant_id=ctx.tenant_id,
+            user_id=ctx.user_id,
+            conversation_id=write_lock_conversation(ctx.workspace_view),
+        ):
             outcome = await run_in_sandbox(
                 self.client,
                 code=build_write_wrapper(rel, content, ws=ws),
@@ -1413,7 +1418,12 @@ class EditFileTool:
         expected, hash_ignored = _expected_hash(args.get("expected_hash"))
         # Stream TE-8 — lock scopes to the run's user (durable workspace that
         # may be shared across replicas); a user-less run needs no lock.
-        async with self.workspace_lock.acquire(tenant_id=ctx.tenant_id, user_id=ctx.user_id):
+        # B-236: a new-layout conversation narrows it to its own directory.
+        async with self.workspace_lock.acquire(
+            tenant_id=ctx.tenant_id,
+            user_id=ctx.user_id,
+            conversation_id=write_lock_conversation(ctx.workspace_view),
+        ):
             outcome = await run_in_sandbox(
                 self.client,
                 code=build_edits_wrapper(rel, edits, expected_hash=expected, ws=ws),
