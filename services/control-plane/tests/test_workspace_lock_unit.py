@@ -80,3 +80,32 @@ async def test_acquire_ephemeral_takes_no_lock() -> None:
         pass
 
     assert session.executed == []  # no transaction, no lock for ephemeral
+
+
+async def test_new_layout_conversation_gets_its_own_key() -> None:
+    # B-236 follow-up —— 新布局的对话有自己的 /workspace,锁按对话;键与按用户的那把不同,
+    # 但还在同一个 classid / 两参数键空间里。last_write_at 仍按 (tenant, user) 记。
+    session = _RecordingSession()
+    lock = PgWorkspaceLock(_FakeSessionFactory(session))  # type: ignore[arg-type]
+    tenant, user, conv = uuid4(), uuid4(), uuid4()
+
+    async with lock.acquire(tenant_id=tenant, user_id=user, conversation_id=conv):
+        pass
+
+    lock_calls = [p for s, p in session.executed if "pg_advisory_xact_lock" in s]
+    assert lock_calls == [{"classid": 1, "k": f"{tenant}:{user}:conv:{conv}"}]
+    bumps = [p for s, p in session.executed if "last_write_at" in s]
+    assert bumps == [{"t": str(tenant), "u": str(user)}]
+
+
+async def test_no_conversation_keeps_the_per_user_key() -> None:
+    # 老布局 / 不知道布局 —— 键与改动前逐字相同。
+    session = _RecordingSession()
+    lock = PgWorkspaceLock(_FakeSessionFactory(session))  # type: ignore[arg-type]
+    tenant, user = uuid4(), uuid4()
+
+    async with lock.acquire(tenant_id=tenant, user_id=user, conversation_id=None):
+        pass
+
+    lock_calls = [p for s, p in session.executed if "pg_advisory_xact_lock" in s]
+    assert lock_calls == [{"classid": 1, "k": f"{tenant}:{user}"}]

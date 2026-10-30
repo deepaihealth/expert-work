@@ -230,3 +230,91 @@ async def test_conversation_seed_lock_does_not_hold_the_users_write_lock(
         async with write.acquire(tenant_id=tenant, user_id=user):
             pass
     await task
+
+
+async def test_two_new_layout_conversations_of_one_user_run_concurrently(
+    engine: AsyncEngine,
+) -> None:
+    """B-236 follow-up —— 同一用户的两个新布局对话各有各的 /workspace,写锁不互相挡。
+
+    10-30 生产:一个用户名下 15 个并发 run 排在同一把按用户的锁上,100 字节的写等 3~6 分钟。
+    """
+    lock = PgWorkspaceLock(create_async_session_factory(engine))
+    tenant, user = uuid4(), uuid4()
+    conv_a, conv_b = uuid4(), uuid4()
+    order: list[str] = []
+
+    async def worker(name: str, conv: object) -> None:
+        async with lock.acquire(tenant_id=tenant, user_id=user, conversation_id=conv):  # type: ignore[arg-type]
+            order.append(f"{name}-enter")
+            await asyncio.sleep(_HOLD_S)
+            order.append(f"{name}-exit")
+
+    await asyncio.gather(worker("A", conv_a), worker("B", conv_b))
+    assert order[:2] in (["A-enter", "B-enter"], ["B-enter", "A-enter"])
+
+
+async def test_one_new_layout_conversation_still_serialises(engine: AsyncEngine) -> None:
+    """同一个对话(及其子代)共用一个 /workspace:一次 bash 的中间文件仍要按对话互斥。"""
+    lock = PgWorkspaceLock(create_async_session_factory(engine))
+    tenant, user, conv = uuid4(), uuid4(), uuid4()
+    order: list[str] = []
+
+    async def worker(name: str) -> None:
+        async with lock.acquire(tenant_id=tenant, user_id=user, conversation_id=conv):
+            order.append(f"{name}-enter")
+            await asyncio.sleep(_HOLD_S)
+            order.append(f"{name}-exit")
+
+    await asyncio.gather(worker("A"), worker("B"))
+    assert order in (
+        ["A-enter", "A-exit", "B-enter", "B-exit"],
+        ["B-enter", "B-exit", "A-enter", "A-exit"],
+    )
+
+
+async def test_two_old_layout_conversations_of_one_user_still_serialise(
+    engine: AsyncEngine,
+) -> None:
+    """老布局的对话共用 agent 根:不带对话 id 的写仍按用户串行。"""
+    lock = PgWorkspaceLock(create_async_session_factory(engine))
+    tenant, user = uuid4(), uuid4()
+    order: list[str] = []
+
+    async def worker(name: str) -> None:
+        async with lock.acquire(tenant_id=tenant, user_id=user, conversation_id=None):
+            order.append(f"{name}-enter")
+            await asyncio.sleep(_HOLD_S)
+            order.append(f"{name}-exit")
+
+    await asyncio.gather(worker("A"), worker("B"))
+    assert order in (
+        ["A-enter", "A-exit", "B-enter", "B-exit"],
+        ["B-enter", "B-exit", "A-enter", "A-exit"],
+    )
+
+
+async def test_conversation_write_bumps_the_users_last_write_at(
+    postgres_container: PostgresContainer,
+) -> None:
+    """RT-6 的 last_write_at 仍按 (tenant, user) 记,与锁按不按对话无关。"""
+    cfg = Config(str(_ALEMBIC_INI))
+    cfg.set_main_option("sqlalchemy.url", _sync_dsn(postgres_container))
+    command.upgrade(cfg, "head")
+
+    eng = create_async_engine_from_config(
+        DatabaseConfig(dsn=_async_dsn(postgres_container), pgbouncer_mode=False)
+    )
+    try:
+        sf = create_async_session_factory(eng)
+        store = SqlUserWorkspaceStore(sf)
+        lock = PgWorkspaceLock(sf)
+        tenant, user = uuid4(), uuid4()
+        await store.resolve(tenant_id=tenant, user_id=user)
+
+        async with lock.acquire(tenant_id=tenant, user_id=user, conversation_id=uuid4()):
+            pass
+        after = await store.get(tenant_id=tenant, user_id=user)
+        assert after is not None and after.last_write_at is not None
+    finally:
+        await eng.dispose()

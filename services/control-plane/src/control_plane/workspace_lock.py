@@ -32,6 +32,16 @@ deliberate differences the technique alone doesn't cover:
 The lock is taken on a *raw* (non-RLS) session: it never reads a
 tenant-scoped table, so it needs no tenant role / RLS context. Tenant
 isolation comes from the ``{tenant}:{user}`` key itself.
+
+B-236 follow-up — a new-layout conversation (its own ``/workspace``) passes
+``conversation_id`` and is locked on ``{tenant}:{user}:conv:{conversation}``
+instead, in the same classid / two-arg key space; old-layout conversations
+pass ``None`` and keep ``{tenant}:{user}``. The two string shapes never
+coincide; ``hashtext`` is 32-bit, so distinct keys can collide, which only
+makes two unrelated writers wait for each other (as it already could) — it
+never lets two holders of the *same* key in at once. The RT-6
+``last_write_at`` bump stays per ``(tenant, user)`` — ``user_workspace`` has no
+conversation column and the drift check reads it per user.
 """
 
 from __future__ import annotations
@@ -65,7 +75,13 @@ class PgWorkspaceLock:
     session_factory: async_sessionmaker[AsyncSession]
 
     @asynccontextmanager
-    async def acquire(self, *, tenant_id: UUID | None, user_id: UUID | None) -> AsyncIterator[None]:
+    async def acquire(
+        self,
+        *,
+        tenant_id: UUID | None,
+        user_id: UUID | None,
+        conversation_id: UUID | None = None,
+    ) -> AsyncIterator[None]:
         # An ephemeral workspace (no user binding) is a per-sandbox tmpfs, not
         # a shared volume, so it needs no cross-replica lock. A call with no
         # tenant binding is rejected downstream before any write; skip+log so a
@@ -75,6 +91,11 @@ class PgWorkspaceLock:
             yield
             return
         key = f"{tenant_id}:{user_id}"
+        if conversation_id is not None:
+            # B-236 —— 新布局的对话只写自己的目录,按对话锁;同一用户的别的对话不再排队。
+            # 写进 /agent(该 agent 所有对话共用)不再跨对话互斥:同一文件并发写是后写者
+            # 胜(产品已接受),write_file / edit_file 是 mkstemp + os.replace,读者不会看到半截。
+            key = f"{key}:conv:{conversation_id}"
         async with self.session_factory() as session, session.begin():
             # SET LOCAL is txn-scoped and auto-reverted — safe under PgBouncer
             # transaction mode (a SET SESSION would leak to the next pooled txn).

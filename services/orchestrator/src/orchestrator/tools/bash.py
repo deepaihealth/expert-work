@@ -36,7 +36,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Any
 
-from orchestrator.tools.locks import NullWorkspaceLock, WorkspaceLock
+from orchestrator.tools.locks import NullWorkspaceLock, WorkspaceLock, write_lock_conversation
 from orchestrator.tools.registry import ToolContext, ToolResult, ToolSpec
 from orchestrator.tools.sandbox import (
     DEFAULT_OUTPUT_CHAR_CAP,
@@ -142,7 +142,12 @@ class BashTool:
         # bash serialises against write_file (and other bash) across replicas.
         # The lock scopes to the run's user — the durable workspace that may be
         # shared across replicas; a user-less (ephemeral) run needs no lock.
-        async with self.workspace_lock.acquire(tenant_id=ctx.tenant_id, user_id=ctx.user_id):
+        # B-236: a new-layout conversation narrows it to its own directory.
+        async with self.workspace_lock.acquire(
+            tenant_id=ctx.tenant_id,
+            user_id=ctx.user_id,
+            conversation_id=write_lock_conversation(ctx.workspace_view),
+        ):
             outcome = await run_in_sandbox(
                 self.client,
                 code=_build_wrapper(command),
