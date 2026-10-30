@@ -323,7 +323,7 @@ async def test_cancelled_retired_call_closes_its_session() -> None:
 
     task.cancel()
     with pytest.raises(asyncio.CancelledError):
-        await task
+        _ = await task
 
     assert (client.opens, client.closes) == (2, 2)
     assert _live_owner_tasks() == []
@@ -430,7 +430,7 @@ async def test_close_during_one_shot_handshake_stops_the_call(mcp_calls: list[st
     client.open_gate.set()
 
     with pytest.raises(RuntimeError, match="not started"):
-        await task
+        _ = await task
     assert _ECHO_CALLS == []
     assert (client.opens, client.closes) == (2, 2)
     assert _live_owner_tasks() == []
