@@ -242,6 +242,36 @@ async def test_a_name_that_is_not_utf8_is_skipped_and_counted(tmp_path: Path) ->
     assert report.skipped_entries == 1
 
 
+@pytest.mark.skipif(os.geteuid() == 0, reason="root ignores directory permission bits")
+async def test_a_dir_that_can_be_listed_but_not_entered_is_skipped_not_fatal(
+    tmp_path: Path,
+) -> None:
+    """B-244 —— 沙箱一个 ``chmod 644`` 就能做出「能列名、不能 ``lstat``」的目录。它里面的名字
+    跳过并计数,别的目录照常复制;之前 ``EACCES`` 冒出去,整次复制失败、每轮重试每轮失败,
+    这个 agent 之后的新对话一个副本都拿不到(10-31 测试环境 §73.12)。"""
+    _base_tree(tmp_path)
+    agent = _agent(tmp_path)
+    _put(agent / "locked" / "l.txt", "l")
+    _put(agent / "style" / "inner" / "i.txt", "i")
+    (agent / "locked").chmod(0o644)
+    (agent / "style" / "inner").chmod(0o644)
+    try:
+        report = await _seed(tmp_path)
+    finally:
+        (agent / "locked").chmod(0o755)
+        (agent / "style" / "inner").chmod(0o755)
+
+    assert report is not None
+    # 进不去的目录照样复制,只是空的(名字都算跳过);不为它另起「不复制」的分支。
+    assert set(report.copied) == {"locked", "style", "tpl"}
+    assert report.skipped_entries == 2  # locked/l.txt、style/inner/i.txt
+    work = _work(tmp_path)
+    assert (work / "style" / "s.md").read_text() == "anchor"
+    assert not (work / "style" / "inner" / "i.txt").exists()
+    assert not (work / "locked" / "l.txt").exists()
+    assert (_conv(tmp_path) / SEED_MARKER).exists()
+
+
 def _config(**extra: Any) -> dict[str, Any]:
     return {
         "configurable": {
