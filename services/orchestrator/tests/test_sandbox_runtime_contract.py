@@ -91,6 +91,7 @@ import ast
 import os
 import re
 from pathlib import Path
+from typing import Any
 from uuid import UUID, uuid4
 
 import httpx
@@ -1196,21 +1197,38 @@ async def test_seed_files_land_under_the_sandbox_skills_root(runtime: SandboxRun
     wave 2's whole point is skills no longer occupying user workspace quota).
     ``relpath`` here is exactly what the caller passes — the ``<agent_key>/``
     namespace prefix is the *caller's* job (``build_skill_seed_files``), not
-    this layer's."""
+    this layer's.
+
+    B-242 —— exec 里的 ``SANDBOX_SKILLS_ROOT`` 只露出本 agent 那一格(只读):自己的
+    key 读得到,别的 key 读不到(同一个热沙箱里另一个 agent 的技能不可见)。"""
     from expert_work.persistence import SANDBOX_SKILLS_ROOT
 
     sid = await runtime.acquire(
         tenant_id=uuid4(),
         thread_id="c5",
-        seed_files=(("seeded.txt", b"SEED_CONTENT"),),
+        seed_files=(("contract-agent/seeded.txt", b"SEED_CONTENT"),),
     )
+    read = f"print(open('{SANDBOX_SKILLS_ROOT}/contract-agent/seeded.txt').read())"
     try:
         outcome = await runtime.exec(
             sandbox_id=sid,
-            code=f"print(open('{SANDBOX_SKILLS_ROOT}/seeded.txt').read())",
+            code=read,
             timeout_s=30,
+            agent_key="contract-agent",
+            has_skills=True,
+            workspace_thread_id=uuid4(),
         )
-        assert "SEED_CONTENT" in outcome.stdout
+        assert "SEED_CONTENT" in outcome.stdout, outcome.stderr
+        other = await runtime.exec(
+            sandbox_id=sid,
+            code=read,
+            timeout_s=30,
+            agent_key="other-agent",
+            has_skills=True,
+            workspace_thread_id=uuid4(),
+        )
+        assert "SEED_CONTENT" not in other.stdout
+        assert "FileNotFoundError" in other.stderr, other.stderr
     finally:
         await runtime.destroy(sandbox_id=sid, reason="contract-test")
 
@@ -1249,8 +1267,11 @@ async def test_seed_files_land_under_the_agent_key_skill_namespace(runtime: Sand
                 f"print(open('{SANDBOX_SKILLS_ROOT}/{agent_key}/contract-skill/SKILL.md').read())"
             ),
             timeout_s=30,
+            agent_key=agent_key,
+            has_skills=True,
+            workspace_thread_id=uuid4(),
         )
-        assert outcome.stdout.strip() == skill_md.strip()
+        assert outcome.stdout.strip() == skill_md.strip(), outcome.stderr
     finally:
         await runtime.destroy(sandbox_id=sid, reason="contract-test")
 
@@ -1301,8 +1322,13 @@ async def test_exec_user_site_survives_to_the_next_exec(runtime: SandboxRuntime)
     可写),第二步全新子进程 import 它 —— 等价于「pip install --user 之后
     下一次 exec import 得到」,但不依赖网络。旧旗标 ``-I``(含 ``-s``)下
     第二步必失败。
+
+    B-242 —— user site 按对话分:同一 agent、同一对话的下一次 exec import 得到;
+    同一 agent 的另一个对话看不到(装的包不跨对话)。
     """
     sid = await runtime.acquire(tenant_id=uuid4(), thread_id="c13")
+    conv, other_conv = uuid4(), uuid4()
+    probe = "import ew_contract_usersite; print(ew_contract_usersite.MARK)"
     try:
         seeded = await runtime.exec(
             sandbox_id=sid,
@@ -1314,15 +1340,28 @@ async def test_exec_user_site_survives_to_the_next_exec(runtime: SandboxRuntime)
                 "print('seeded', d)\n"
             ),
             timeout_s=30,
+            agent_key="contract-agent",
+            workspace_thread_id=conv,
         )
         assert seeded.exit_code == 0, seeded.stderr
         outcome = await runtime.exec(
             sandbox_id=sid,
-            code="import ew_contract_usersite; print(ew_contract_usersite.MARK)",
+            code=probe,
             timeout_s=30,
+            agent_key="contract-agent",
+            workspace_thread_id=conv,
         )
         assert outcome.exit_code == 0, outcome.stderr
         assert "usersite-ok" in outcome.stdout
+        other = await runtime.exec(
+            sandbox_id=sid,
+            code=probe,
+            timeout_s=30,
+            agent_key="contract-agent",
+            workspace_thread_id=other_conv,
+        )
+        assert other.exit_code != 0
+        assert "ModuleNotFoundError" in other.stderr, other.stderr
     finally:
         await runtime.destroy(sandbox_id=sid, reason="contract-test")
 
@@ -1353,8 +1392,9 @@ async def test_exec_pip_user_install_then_import(runtime: SandboxRuntime) -> Non
     """PR-C #2 的端到端本尊:``pip install --user`` 之后,下一次 exec 的
     全新子进程要 import 得到。选 sortedcontainers(纯 py、无依赖、镜像
     requirements 未收);第一步先断言它当前 import 不到,防镜像哪天把它
-    收编后本用例退化成空转。走真网络,超时给足。"""
+    收编后本用例退化成空转。走真网络,超时给足。B-242 —— 两次 exec 同一 agent、同一对话。"""
     sid = await runtime.acquire(tenant_id=uuid4(), thread_id="c15")
+    bound: dict[str, Any] = {"agent_key": "contract-agent", "workspace_thread_id": uuid4()}
     try:
         installed = await runtime.exec(
             sandbox_id=sid,
@@ -1367,6 +1407,7 @@ async def test_exec_pip_user_install_then_import(runtime: SandboxRuntime) -> Non
                 "print('pip-rc', r.returncode)\n"
             ),
             timeout_s=240,
+            **bound,
         )
         assert installed.exit_code == 0, installed.stderr
         assert "pip-rc 0" in installed.stdout, installed.stdout
@@ -1374,6 +1415,7 @@ async def test_exec_pip_user_install_then_import(runtime: SandboxRuntime) -> Non
             sandbox_id=sid,
             code="import sortedcontainers; print('import-ok', sortedcontainers.__version__)",
             timeout_s=30,
+            **bound,
         )
         assert outcome.exit_code == 0, outcome.stderr
         assert "import-ok 2.4.0" in outcome.stdout
