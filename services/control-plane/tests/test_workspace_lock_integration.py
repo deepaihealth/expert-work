@@ -595,7 +595,7 @@ async def test_exec_python_does_not_block_another_conversation(engine: AsyncEngi
         assert order == ["py-enter", "sh-enter", "sh-exit"]
     finally:
         finish.set()
-        await py
+        _ = await py  # 等后台 exec 跑完并把结果 / 异常带出来
 
 
 async def test_exec_python_old_layout_takes_no_lock(engine: AsyncEngine) -> None:
@@ -620,7 +620,7 @@ async def test_exec_python_old_layout_takes_no_lock(engine: AsyncEngine) -> None
         assert order == ["py-enter", "sh-enter", "sh-exit"]
     finally:
         finish.set()
-        await py
+        _ = await py  # 等后台 exec 跑完并把结果 / 异常带出来
 
 
 @pytest.mark.parametrize("outcome", ["error", "cancel"])
@@ -641,16 +641,16 @@ async def test_exec_python_releases_the_lock_on_error_and_cancel(
     except AssertionError:
         py.cancel()  # 判据红了也收掉挂着的 exec,别把整轮测试卡住
         with contextlib.suppress(asyncio.CancelledError):
-            await py
+            _ = await py  # 等后台 exec 跑完并把结果 / 异常带出来
         raise
     if outcome == "cancel":
         py.cancel()
         with pytest.raises(asyncio.CancelledError):
-            await py
+            _ = await py  # 等后台 exec 跑完并把结果 / 异常带出来
     else:
         finish.set()
         with pytest.raises(SandboxSupervisorError):
-            await py
+            _ = await py  # 等后台 exec 跑完并把结果 / 异常带出来
     assert await _granted_workspace_keys(engine, [key]) == {key: 0}
     async with asyncio.timeout(_HOLD_S * 5):
         await _bash(lock, _another_run_of(conv), _SlowExecClient("sh", order))
