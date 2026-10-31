@@ -12,6 +12,9 @@ from uuid import UUID, uuid4
 
 from expert_work.persistence.knowledge.base import (
     ALL_TENANTS_BASES_LIMIT,
+    PAGE_OCR_PAGE,
+    PAGE_OCR_READER,
+    PAGE_OCR_SOURCE,
     UNSET,
     CancelOutcome,
     ClaimedIngestion,
@@ -21,6 +24,7 @@ from expert_work.persistence.knowledge.base import (
     ParseCacheEntry,
     ParseCacheKind,
     _Unset,
+    is_page_index,
 )
 from expert_work.persistence.knowledge.estimates import WAITING_STATUSES, reindex_fence_statuses
 from expert_work.persistence.knowledge.memory_estimates import HeldSnapshot, InMemoryEstimates
@@ -991,6 +995,24 @@ class InMemoryKnowledgeStore(InMemoryEstimates, KnowledgeStore):
         self._parse_cache[(tenant_id, document_id, kind, key)] = ParseCacheEntry(
             model=model, result=dict(result)
         )
+
+    async def cached_page_indexes(
+        self,
+        *,
+        tenant_id: UUID,
+        document_id: UUID,
+        source_sha256: str,
+        readers: Sequence[str],
+    ) -> set[int]:
+        wanted = set(readers)
+        return {
+            entry.result[PAGE_OCR_PAGE]
+            for (tenant, document, kind, _), entry in self._parse_cache.items()
+            if (tenant, document, kind) == (tenant_id, document_id, "page_ocr")
+            and entry.result.get(PAGE_OCR_READER) in wanted
+            and entry.result.get(PAGE_OCR_SOURCE) == source_sha256
+            and is_page_index(entry.result.get(PAGE_OCR_PAGE))
+        }
 
     # -- maintenance (B-175 P3-PR2) -------------------------------------------
 

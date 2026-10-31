@@ -27,7 +27,14 @@ from expert_work.persistence import (
     create_async_engine_from_config,
     create_async_session_factory,
 )
-from expert_work.persistence.knowledge.base import KnowledgeStore, ParseCacheEntry
+from expert_work.persistence.knowledge.base import (
+    PAGE_OCR_PAGE,
+    PAGE_OCR_READER,
+    PAGE_OCR_SOURCE,
+    KnowledgeStore,
+    ParseCacheEntry,
+    ParseCacheKind,
+)
 from expert_work.persistence.platform_recognition_config import (
     InMemoryPlatformRecognitionConfigStore,
     PlatformRecognitionConfigRecord,
@@ -254,6 +261,51 @@ async def test_parse_cache_is_per_document_and_a_later_reading_replaces_it(
         )
         == {}
     )
+
+
+async def test_cached_pages_are_listed_by_source_and_reader(store: KnowledgeStore) -> None:
+    # B-238: the estimate's pages read before (e.g. by a cancelled ingest).
+    tenant = uuid4()
+    document_id, _ = await _document(store, tenant)
+    base = await store.get_base(tenant_id=tenant, name="kb")
+    assert base is not None
+    second = await store.upsert_document(
+        tenant_id=tenant, kb_id=base.id, filename="copy.pdf", content=b"%PDF"
+    )
+
+    def tags(page: object, source: str = "src-v2", reader: str = "glm") -> dict[str, object]:
+        return {PAGE_OCR_PAGE: page, PAGE_OCR_SOURCE: source, PAGE_OCR_READER: reader}
+
+    rows: list[tuple[ParseCacheKind, UUID, dict[str, object]]] = [
+        ("page_ocr", document_id, tags(0)),
+        ("page_ocr", document_id, tags(3, reader="qwen")),
+        ("page_ocr", document_id, tags(3)),  # the same page read by both models
+        ("page_ocr", document_id, tags(5, source="src-v1")),  # other bytes
+        ("page_ocr", document_id, tags(6, reader="old-prompt")),  # read another way
+        ("page_ocr", document_id, {}),  # cached before pages were recorded
+        ("page_ocr", document_id, tags("7")),  # not a page index
+        ("figure_ocr", document_id, tags(8)),  # a figure's text
+        ("page_ocr", second.id, tags(9)),  # another document
+    ]
+    for number, (kind, document, extra) in enumerate(rows):
+        await store.put_parse_cache(
+            tenant_id=tenant,
+            document_id=document,
+            kind=kind,
+            key=f"k{number}",
+            model="glm/glm-ocr",
+            result={**_RAW, **extra},
+        )
+
+    async def pages(readers: list[str], tenant_id: UUID = tenant) -> set[int]:
+        return await store.cached_page_indexes(
+            tenant_id=tenant_id, document_id=document_id, source_sha256="src-v2", readers=readers
+        )
+
+    assert await pages(["glm", "qwen"]) == {0, 3}
+    assert await pages(["qwen"]) == {3}
+    assert await pages([]) == set()
+    assert await pages(["glm"], uuid4()) == set()
 
 
 async def test_deleting_a_document_deletes_its_recognized_text(store: KnowledgeStore) -> None:
