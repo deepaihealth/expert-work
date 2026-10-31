@@ -28,7 +28,7 @@ from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
 
-from control_plane.mcp_retired_clients import RetiredMcpClients, close_retired
+from control_plane.mcp_retired_clients import RetiredMcpClients, close_retired, retire_in_place
 from control_plane.tenant_scope import bypass_rls_session
 from expert_work.persistence import McpConnectorCatalogStore
 from expert_work.protocol import McpConnectorCatalogRecord
@@ -141,10 +141,15 @@ class PlatformMcpPoolService:
         store: McpConnectorCatalogStore,
         client_factory: McpClientFactory,
         clock: Callable[[], float] = time.monotonic,
+        on_expire: Callable[[], None] | None = None,
     ) -> None:
         self._store = store
         self._client_factory = client_factory
         self._clock = clock  # injectable monotonic time (tests)
+        # B-248 — called once the TTL retired the pool: the app evicts every
+        # cached agent build (they hold its clients), so only runs already in
+        # flight are left on the retired clients' one-shot sessions.
+        self._on_expire = on_expire
         # (pool, built_at monotonic stamp for the TTL backstop)
         self._pool: tuple[MCPServerPool, float] | None = None
         self._guard = asyncio.Lock()  # guards _pool + _generation + _retired
@@ -186,6 +191,13 @@ class PlatformMcpPoolService:
                         await cached_pool.retire_all()
                     except Exception:
                         logger.warning("platform_mcp_pool.expired_close_failed")
+                    if self._on_expire is not None:
+                        try:
+                            self._on_expire()
+                        except Exception as exc:  # never fails the build
+                            logger.warning(
+                                "platform_mcp_pool.on_expire_failed err=%s", type(exc).__name__
+                            )
                 async with self._guard:
                     gen = self._generation
                 pool = MCPServerPool()
@@ -217,7 +229,12 @@ class PlatformMcpPoolService:
                         self._pool = (pool, self._clock())
                         return pool
                     if last_attempt:
-                        return pool  # serve fresh-but-uncached; next caller rebuilds
+                        # B-248 — no cache entry will ever close it: track it
+                        # for invalidate / close_all, retire it below.
+                        self._retired.add_pool(_RETIRED_KEY, pool)
+            if last_attempt:
+                await retire_in_place(pool)  # outside the build lock (B-248)
+                return pool  # serve fresh-but-uncached; next caller rebuilds
             # Invalidation landed mid-build: close the orphan and retry.
             try:
                 await pool.close_all()

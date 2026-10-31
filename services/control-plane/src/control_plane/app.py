@@ -1587,6 +1587,10 @@ def create_app(
                     store=resolved_tenant_mcp_server_store,
                     secret_store=resolved_secret_store,
                     client_factory=_tenant_mcp_client_factory,
+                    # B-248 — a pool retired by its TTL takes the builds
+                    # holding its clients with it (local: each replica's pool
+                    # has its own clock, so nothing is broadcast).
+                    on_expire=resolved_agent_runtime.invalidate_tenant,
                 )
                 stack.push_async_callback(tenant_mcp_pool_service.close_all)
                 _app.state.tenant_mcp_pool_service = tenant_mcp_pool_service
@@ -1601,6 +1605,7 @@ def create_app(
                 platform_mcp_pool_service = PlatformMcpPoolService(
                     store=resolved_mcp_connector_catalog_store,
                     client_factory=_tenant_mcp_client_factory,
+                    on_expire=resolved_agent_runtime.invalidate_all,  # B-248, as above
                 )
                 stack.push_async_callback(platform_mcp_pool_service.close_all)
                 _app.state.platform_mcp_pool_service = platform_mcp_pool_service
@@ -1666,6 +1671,7 @@ def create_app(
                     catalog_store=resolved_mcp_connector_catalog_store,
                     client_factory=_tenant_mcp_client_factory,
                     refresher=mcp_oauth_refresher,
+                    on_expire=resolved_agent_runtime.invalidate_user,  # B-248, as above
                 )
                 stack.push_async_callback(user_mcp_oauth_pool_service.close_all)
                 _app.state.user_mcp_oauth_pool_service = user_mcp_oauth_pool_service

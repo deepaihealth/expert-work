@@ -895,3 +895,124 @@ async def test_create_patch_delete_invalidate_platform_pool(ctx: _Ctx) -> None:
     delete = await ctx.client.delete(f"/v1/platform/mcp-catalog/{cid}", headers=ctx.admin_headers)
     assert delete.status_code == 204, delete.text
     assert (pool.invalidated, runtime.invalidated_all) == (3, 3)
+
+
+# ---------------------------------------------------------------------------
+# B-248 — switching an oauth2 entry off (disable / force-delete) or back on
+# reaches the user OAuth pools as ONE event per connector; a save that does
+# not change ``enabled`` (the admin form always sends it) reaches nothing.
+# ---------------------------------------------------------------------------
+
+
+class _SpyUserPoolService:
+    def __init__(self) -> None:
+        self.switched: list[tuple[str, str]] = []
+
+    async def connector_off(self, name: str) -> None:
+        self.switched.append(("off", name))
+
+    async def connector_on(self, name: str) -> None:
+        self.switched.append(("on", name))
+
+
+class _SpyBus:
+    def __init__(self) -> None:
+        self.events: list[tuple[str, str | None]] = []
+
+    async def publish(self, event: object) -> None:
+        self.events.append((event.kind, event.connector))  # type: ignore[attr-defined]
+
+
+async def _oauth_entry_with_users(ctx: _Ctx) -> tuple[str, _SpyUserPoolService, _SpyBus]:
+    """An oauth2 entry two users connected to."""
+    resp = await ctx.client.post(
+        "/v1/platform/mcp-catalog",
+        json={
+            "name": "linear",
+            "display_name": "Linear",
+            "transport": "sse",
+            "url_template": "https://mcp.example.com/linear",
+            "auth_type": "oauth2",
+            "oauth_client_id": "cid",
+        },
+        headers=ctx.admin_headers,
+    )
+    assert resp.status_code == 201, resp.text
+    catalog_id = UUID(resp.json()["data"]["id"])
+    for user_id in ("user-1", "user-2"):
+        await _seed_oauth_connection(
+            ctx, catalog_id=catalog_id, tenant_id=uuid4(), user_id=user_id, name="linear"
+        )
+    pools, bus = _SpyUserPoolService(), _SpyBus()
+    ctx.app.state.user_mcp_oauth_pool_service = pools  # type: ignore[attr-defined]
+    ctx.app.state.invalidation_bus = bus  # type: ignore[attr-defined]
+    return str(catalog_id), pools, bus
+
+
+def _form_body(enabled: bool) -> dict[str, object]:
+    """The body the admin edit form sends on every save (CatalogConfigForm)."""
+    return {
+        "display_name": "Linear 2",
+        "description": "",
+        "category": "",
+        "icon": "",
+        "url_template": "https://mcp.example.com/linear",
+        "required_tier": "free",
+        "enabled": enabled,
+    }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "body", [{"enabled": True}, _form_body(True), {"display_name": "Linear"}], ids=str
+)
+async def test_save_without_switching_oauth2_entry_leaves_user_pools(
+    ctx: _Ctx, body: dict[str, object]
+) -> None:
+    cid, pools, bus = await _oauth_entry_with_users(ctx)
+
+    resp = await ctx.client.patch(
+        f"/v1/platform/mcp-catalog/{cid}", json=body, headers=ctx.admin_headers
+    )
+
+    assert resp.status_code == 200, resp.text
+    assert pools.switched == []
+    assert bus.events == [("platform_mcp", None)]
+
+
+@pytest.mark.asyncio
+async def test_disable_then_enable_oauth2_entry_switches_it_once_each(ctx: _Ctx) -> None:
+    cid, pools, bus = await _oauth_entry_with_users(ctx)
+
+    off = await ctx.client.patch(
+        f"/v1/platform/mcp-catalog/{cid}", json=_form_body(False), headers=ctx.admin_headers
+    )
+    again = await ctx.client.patch(
+        f"/v1/platform/mcp-catalog/{cid}", json=_form_body(False), headers=ctx.admin_headers
+    )
+    on = await ctx.client.patch(
+        f"/v1/platform/mcp-catalog/{cid}", json={"enabled": True}, headers=ctx.admin_headers
+    )
+
+    assert (off.status_code, again.status_code, on.status_code) == (200, 200, 200)
+    assert pools.switched == [("off", "linear"), ("on", "linear")]
+    assert bus.events == [
+        ("user_mcp_oauth_connector_off", "linear"),
+        ("platform_mcp", None),
+        ("platform_mcp", None),
+        ("user_mcp_oauth_connector_on", "linear"),
+        ("platform_mcp", None),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_force_delete_oauth2_entry_switches_it_off(ctx: _Ctx) -> None:
+    cid, pools, bus = await _oauth_entry_with_users(ctx)
+
+    resp = await ctx.client.delete(
+        f"/v1/platform/mcp-catalog/{cid}", params={"force": "true"}, headers=ctx.admin_headers
+    )
+
+    assert resp.status_code == 204, resp.text
+    assert pools.switched == [("off", "linear")]
+    assert bus.events == [("user_mcp_oauth_connector_off", "linear"), ("platform_mcp", None)]

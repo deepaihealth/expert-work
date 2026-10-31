@@ -90,6 +90,10 @@ def _get_invalidation_bus(request: Request) -> object:  # type: ignore[no-untype
     return getattr(request.app.state, "invalidation_bus", None)
 
 
+def _get_user_mcp_oauth_pool_service(request: Request) -> object:
+    return getattr(request.app.state, "user_mcp_oauth_pool_service", None)
+
+
 async def _invalidate_platform_mcp(
     pool_service: object, agent_runtime: object, bus: object = None
 ) -> None:
@@ -109,6 +113,22 @@ async def _invalidate_platform_mcp(
         agent_runtime.invalidate_all()  # type: ignore[attr-defined]
     if bus is not None:
         await bus.publish(InvalidationEvent(kind="platform_mcp"))  # type: ignore[attr-defined]
+
+
+async def _oauth_connector_switched(
+    name: str, *, on: bool, user_pool_service: object, bus: object
+) -> None:
+    """B-248 — an ``oauth2`` entry was switched off (disabled / force-deleted)
+    or back on. Off hard-stops that connector in every user's pool, on expires
+    the pools built without it; the users' other connectors keep serving. One
+    event for all users, here and on peer replicas. Without this a connected
+    user kept calling a disabled connector with their old token."""
+    if user_pool_service is not None:
+        switch = user_pool_service.connector_on if on else user_pool_service.connector_off  # type: ignore[attr-defined]
+        await switch(name)
+    if bus is not None:
+        kind = "user_mcp_oauth_connector_on" if on else "user_mcp_oauth_connector_off"
+        await bus.publish(InvalidationEvent(kind=kind, connector=name))  # type: ignore[attr-defined]
 
 
 def _bearer_secret_name(name: str) -> str:
@@ -334,6 +354,7 @@ def build_mcp_catalog_router() -> APIRouter:
         secret_store: Annotated[SecretStore, Depends(_get_secret_store)],
         audit: Annotated[AuditLogger, Depends(_get_audit)],
         pool_service: Annotated[object, Depends(_get_platform_mcp_pool_service)],
+        user_pool_service: Annotated[object, Depends(_get_user_mcp_oauth_pool_service)],
         agent_runtime: Annotated[object, Depends(_get_agent_runtime)],
         bus: Annotated[object, Depends(_get_invalidation_bus)],
     ) -> dict[str, object]:
@@ -388,7 +409,9 @@ def build_mcp_catalog_router() -> APIRouter:
             )
         try:
             async with bypass_rls_session():
-                record = await store.update(catalog_id=catalog_id, patch=patch)
+                before, record = await store.update_with_previous(
+                    catalog_id=catalog_id, patch=patch
+                )
         except McpConnectorCatalogNotFoundError as exc:
             raise HTTPException(
                 status_code=404,
@@ -416,6 +439,14 @@ def build_mcp_catalog_router() -> APIRouter:
                 "enabled": record.enabled,
             },
         )
+        if record.auth_type == "oauth2" and before.enabled != record.enabled:
+            # B-248 — the admin form always sends ``enabled``: only a real
+            # switch (``before`` read under the row lock) reaches the user
+            # pools. Of an oauth2 row they read only ``enabled`` (transport is
+            # immutable, the URL is each connection's own).
+            await _oauth_connector_switched(
+                record.name, on=record.enabled, user_pool_service=user_pool_service, bus=bus
+            )
         await _invalidate_platform_mcp(pool_service, agent_runtime, bus)
         return {"success": True, "data": _public(record), "error": None}
 
@@ -431,6 +462,7 @@ def build_mcp_catalog_router() -> APIRouter:
         secret_store: Annotated[SecretStore, Depends(_get_secret_store)],
         audit: Annotated[AuditLogger, Depends(_get_audit)],
         pool_service: Annotated[object, Depends(_get_platform_mcp_pool_service)],
+        user_pool_service: Annotated[object, Depends(_get_user_mcp_oauth_pool_service)],
         agent_runtime: Annotated[object, Depends(_get_agent_runtime)],
         bus: Annotated[object, Depends(_get_invalidation_bus)],
         force: Annotated[bool, Query()] = False,
@@ -546,6 +578,10 @@ def build_mcp_catalog_router() -> APIRouter:
                 "secrets_failed": secrets_failed,
             },
         )
+        if force and connection_count > 0:
+            await _oauth_connector_switched(
+                existing.name, on=False, user_pool_service=user_pool_service, bus=bus
+            )
         await _invalidate_platform_mcp(pool_service, agent_runtime, bus)
 
     return router

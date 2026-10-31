@@ -143,10 +143,18 @@ class SqlMcpConnectorCatalogStore(McpConnectorCatalogStore):
     async def update(
         self, *, catalog_id: UUID, patch: McpConnectorCatalogPatch
     ) -> McpConnectorCatalogRecord:
+        return (await self.update_with_previous(catalog_id=catalog_id, patch=patch))[1]
+
+    async def update_with_previous(
+        self, *, catalog_id: UUID, patch: McpConnectorCatalogPatch
+    ) -> tuple[McpConnectorCatalogRecord, McpConnectorCatalogRecord]:
         async with self._sf() as session:
-            existing = await session.get(McpConnectorCatalogRow, catalog_id)
+            # FOR UPDATE: a concurrent update waits, then reads our result as
+            # its ``before`` (B-248).
+            existing = await session.get(McpConnectorCatalogRow, catalog_id, with_for_update=True)
             if existing is None:
                 raise McpConnectorCatalogNotFoundError(catalog_id=catalog_id)
+            before = _row_to_record(existing)
             if patch.display_name is not None:
                 existing.display_name = patch.display_name
             if patch.description is not None:
@@ -178,7 +186,7 @@ class SqlMcpConnectorCatalogStore(McpConnectorCatalogStore):
             # rolls back — no corrupt row is persisted.
             record = _row_to_record(existing)
             await session.commit()
-            return record
+            return before, record
 
     async def delete(self, catalog_id: UUID) -> None:
         stmt = (

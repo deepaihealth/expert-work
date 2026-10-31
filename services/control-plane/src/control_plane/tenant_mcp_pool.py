@@ -18,7 +18,7 @@ import time
 from collections.abc import Awaitable, Callable
 from uuid import UUID
 
-from control_plane.mcp_retired_clients import RetiredMcpClients, close_retired
+from control_plane.mcp_retired_clients import RetiredMcpClients, close_retired, retire_in_place
 from expert_work.persistence import TenantMcpServerStore
 from expert_work.protocol import TenantMcpServerRecord
 from expert_work.runtime.secret_store import SecretStore
@@ -80,11 +80,16 @@ class TenantMcpPoolService:
         secret_store: SecretStore | None,
         client_factory: McpClientFactory,
         clock: Callable[[], float] = time.monotonic,
+        on_expire: Callable[[UUID], None] | None = None,
     ) -> None:
         self._store = store
         self._secret_store = secret_store
         self._client_factory = client_factory
         self._clock = clock  # injectable monotonic time (tests)
+        # B-248 — called once the TTL retired a tenant's pool: the app evicts
+        # that tenant's cached agent builds (they hold its clients), so only
+        # runs already in flight are left on the retired clients.
+        self._on_expire = on_expire
         # tenant_id -> (pool, built_at monotonic stamp for the TTL backstop)
         self._pools: dict[UUID, tuple[MCPServerPool, float]] = {}
         self._locks_guard = asyncio.Lock()  # guards _pools + _tenant_locks + _generation
@@ -146,6 +151,13 @@ class TenantMcpPoolService:
                         await cached_pool.retire_all()
                     except Exception:
                         logger.warning("tenant_mcp_pool.expired_close_failed")
+                    if self._on_expire is not None:
+                        try:
+                            self._on_expire(tenant_id)
+                        except Exception as exc:  # never fails the build
+                            logger.warning(
+                                "tenant_mcp_pool.on_expire_failed err=%s", type(exc).__name__
+                            )
                 async with self._locks_guard:
                     gen = self._generation.get(tenant_id, 0)
                 pool = MCPServerPool()
@@ -173,9 +185,14 @@ class TenantMcpPoolService:
                         self._pools[tenant_id] = (pool, self._clock())
                         return pool
                     if last_attempt:
-                        # Give up retrying — serve this fresh pool uncached
-                        # (still usable; the next caller rebuilds).
-                        return pool
+                        # B-248 — no cache entry will ever close it: track it
+                        # for invalidate / close_all, retire it below.
+                        self._retired.add_pool(tenant_id, pool)
+            if last_attempt:
+                # Give up retrying — serve this fresh pool uncached (still
+                # usable; the next caller rebuilds). Outside the tenant lock.
+                await retire_in_place(pool)
+                return pool
             # Invalidation landed mid-build: close the orphan and retry so the
             # caller gets a usable pool instead of a closed, empty one.
             try:

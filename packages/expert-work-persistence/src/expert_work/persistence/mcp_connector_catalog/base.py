@@ -86,6 +86,15 @@ class McpConnectorCatalogStore(abc.ABC):
         :class:`McpConnectorCatalogNotFoundError` if absent."""
 
     @abc.abstractmethod
+    async def update_with_previous(
+        self, *, catalog_id: UUID, patch: McpConnectorCatalogPatch
+    ) -> tuple[McpConnectorCatalogRecord, McpConnectorCatalogRecord]:
+        """:meth:`update`, returning ``(before, after)``. ``before`` is read in
+        the same transaction under a row lock, so two concurrent updates never
+        see the same ``before`` (B-248: a switch of ``enabled`` is acted on
+        exactly once)."""
+
+    @abc.abstractmethod
     async def delete(self, catalog_id: UUID) -> None:
         """Delete the entry. Raises
         :class:`McpConnectorCatalogNotFoundError` if absent."""

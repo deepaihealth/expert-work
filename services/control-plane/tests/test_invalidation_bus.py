@@ -901,3 +901,44 @@ async def test_run_cancel_handler_ignores_terminal_and_pending_records() -> None
 async def test_run_cancel_handler_is_noop_without_a_runtime() -> None:
     handlers = build_invalidation_handlers(SimpleNamespace())
     await handlers["run_cancel"](_run_cancel_event(uuid4(), uuid4()))
+
+
+# ---------------------------------------------------------------------------
+# B-248 — one event per oauth2 connector switch, not one per user
+# ---------------------------------------------------------------------------
+
+
+class _SpyConnectorPool:
+    def __init__(self) -> None:
+        self.switched: list[tuple[str, str]] = []
+
+    async def connector_off(self, name: str) -> None:
+        self.switched.append(("off", name))
+
+    async def connector_on(self, name: str) -> None:
+        self.switched.append(("on", name))
+
+
+@pytest.mark.asyncio
+async def test_oauth_connector_events_round_trip_and_reach_the_pool() -> None:
+    redis = _FakeRedis()
+    bus = _bus(redis)
+    pool = _SpyConnectorPool()
+    handlers = build_invalidation_handlers(SimpleNamespace(user_mcp_oauth_pool_service=pool))
+    bus.start(handlers)
+    try:
+        await _wait_until(lambda: redis.queues)
+        await bus.publish(
+            InvalidationEvent(kind="user_mcp_oauth_connector_off", connector="linear")
+        )
+        await bus.publish(InvalidationEvent(kind="user_mcp_oauth_connector_on", connector="linear"))
+        await _wait_until(lambda: len(pool.switched) == 2)
+    finally:
+        await bus.stop()
+
+    assert pool.switched == [("off", "linear"), ("on", "linear")]
+    data = json.loads(redis.published[0][1])
+    assert data["connector"] == "linear"
+    # Every other kind keeps its exact wire shape (old pods parse it too).
+    await bus.publish(InvalidationEvent(kind="platform_mcp"))
+    assert "connector" not in json.loads(redis.published[-1][1])

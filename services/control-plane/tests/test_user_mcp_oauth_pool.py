@@ -15,8 +15,10 @@ from expert_work.persistence import (
 )
 from expert_work.protocol import (
     McpConnectorAuthSchema,
+    McpConnectorCatalogPatch,
     McpConnectorCatalogUpsert,
     McpOAuthConnectionPatch,
+    McpOAuthConnectionRecord,
 )
 from orchestrator.tools.mcp import MCPServerConfig, MCPToolDef, RecordingMCPClient
 
@@ -148,6 +150,50 @@ async def test_pending_connection_skipped() -> None:
     calls: list[str] = []
     pool = await _svc(oauth_store, cat_store, calls).get_or_build(tid, uid)
     assert pool.names() == []
+
+
+@pytest.mark.asyncio
+async def test_connector_disabled_in_catalog_skipped_without_refresh() -> None:
+    """B-248 — disabling an oauth2 catalog entry turns it off for every user
+    already connected (a new connect is refused already); it used to keep
+    attaching, and its token kept being refreshed."""
+    cat_store = InMemoryMcpConnectorCatalogStore()
+    oauth_store = InMemoryMcpOAuthConnectionStore()
+    tid, uid = uuid4(), "user-1"
+    off_id = await _seed_catalog(cat_store, name="linear")
+    on_id = await _seed_catalog(cat_store, name="notion")
+    for cat_id, name in ((off_id, "linear"), (on_id, "notion")):
+        await _seed_connection(
+            oauth_store,
+            tenant_id=tid,
+            user_id=uid,
+            catalog_id=cat_id,
+            name=name,
+            expires_at=_NOW + timedelta(hours=1),
+        )
+    async with bypass_rls_session():
+        await cat_store.update(catalog_id=off_id, patch=McpConnectorCatalogPatch(enabled=False))
+    refreshed: list[str] = []
+
+    class _SpyRefresher:
+        async def ensure_fresh(self, record: McpOAuthConnectionRecord) -> McpOAuthConnectionRecord:
+            refreshed.append(record.name)
+            return record
+
+    calls: list[str] = []
+    svc = UserMcpOAuthPoolService(
+        oauth_store=oauth_store,
+        catalog_store=cat_store,
+        client_factory=_factory_spy(calls),
+        refresher=_SpyRefresher(),  # type: ignore[arg-type]
+        clock=lambda: _NOW,
+    )
+
+    pool = await svc.get_or_build(tid, uid)
+
+    assert pool.names() == ["notion"]
+    assert calls == ["notion"]
+    assert refreshed == ["notion"]
 
 
 @pytest.mark.asyncio
