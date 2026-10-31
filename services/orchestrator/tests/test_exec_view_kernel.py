@@ -828,7 +828,7 @@ def test_lingering_process_cannot_reach_another_conversation_through_proc(
     自己嵌套的 user namespace 里:A 对 B(以及沙箱里任何别的进程)的 ``/proc/<pid>/root``、
     ``/proc/<pid>/ns/mnt`` 都是 ``EACCES``,往 B 的 ``PYTHONUSERBASE`` 种 ``.pth`` 落不下去。
     (进程本身仍看得见,是 P2。)"""
-    a_code = "setsid python3 -I /t/watch.py </dev/null >/dev/null 2>&1 & echo started"
+    a_code = "setsid python3 -I /t/watch.py </dev/null >/dev/null 2>/workspace/w.err & echo started"
     b_code = (
         "echo $$ > /workspace/pid; sleep 3; "
         "ls $(python3 -m site --user-site) 2>/dev/null | grep -c pth; true"
@@ -845,7 +845,21 @@ def test_lingering_process_cannot_reach_another_conversation_through_proc(
             if os.path.exists(log):
                 break
             time.sleep(0.2)
-        result["log"] = json.load(open(log))
+        if os.path.exists(log):
+            result["log"] = json.load(open(log))
+        else:  # 监视进程没写出结果:把它的 stderr 和进程表带出来,别只剩一个 FileNotFoundError
+            err = AG + "/threads/{_CONV}/work/w.err"
+            procs = {{}}
+            for pid in os.listdir("/proc"):
+                try:
+                    raw = open("/proc/" + pid + "/cmdline", "rb").read()
+                    procs[pid] = raw.replace(b"\\0", b" ").decode()
+                except (OSError, ValueError):
+                    pass
+            result["log"] = {{
+                "missing": open(err).read() if os.path.exists(err) else "no w.err",
+                "procs": procs,
+            }}
         result["b_pid"] = open(AG + "/threads/{_B}/work/pid").read().strip()
         """,
         files={"watch.py": _WATCH},
