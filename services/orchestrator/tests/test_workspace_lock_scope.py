@@ -21,6 +21,7 @@ from orchestrator.graph_builder.builder import _build_tool_context
 from orchestrator.tools import (
     BashTool,
     EditFileTool,
+    ExecPythonTool,
     RecordingSandboxRuntime,
     RecordingWorkspaceLock,
     SandboxOutcome,
@@ -52,6 +53,8 @@ async def _call(
     client.outcome = SandboxOutcome(stdout=_OK_WRITE, stderr="", exit_code=0, timed_out=False)
     if name == "bash":
         await BashTool(client=client, workspace_lock=lock).call({"command": "true"}, ctx=ctx)
+    elif name == "exec_python":
+        await ExecPythonTool(client=client, workspace_lock=lock).call({"code": "pass"}, ctx=ctx)
     elif name == "write_file":
         await WriteFileTool(client=client, workspace_lock=lock).call(
             {"path": path, "content": "x"}, ctx=ctx
@@ -64,9 +67,11 @@ async def _call(
 
 
 _WRITE_TOOLS = ("bash", "write_file", "edit_file")
+# B-249 —— exec_python 新布局与 bash 同一条规矩(每次拿、键按对话);老布局不拿,见下。
+_NEW_LAYOUT_WRITE_TOOLS = (*_WRITE_TOOLS, "exec_python")
 
 
-@pytest.mark.parametrize("name", _WRITE_TOOLS)
+@pytest.mark.parametrize("name", _NEW_LAYOUT_WRITE_TOOLS)
 async def test_new_layout_locks_on_its_conversation(name: str) -> None:
     lock = RecordingWorkspaceLock()
     ctx = _ctx(layout="conversation")
@@ -95,7 +100,7 @@ async def test_new_layout_without_an_agent_is_the_old_view(name: str) -> None:
     assert lock.conversations == [None]
 
 
-@pytest.mark.parametrize("name", _WRITE_TOOLS)
+@pytest.mark.parametrize("name", _NEW_LAYOUT_WRITE_TOOLS)
 async def test_child_of_new_layout_locks_on_the_parent_conversation(name: str) -> None:
     parent = _ctx(layout="conversation")
     child = _build_tool_context(_child_config(parent, sub_thread_id=uuid4(), sub_run_id=uuid4()))
@@ -117,6 +122,32 @@ async def test_child_of_old_layout_keeps_the_per_user_lock(name: str) -> None:
     lock = RecordingWorkspaceLock()
     await _call(name, lock, child)
     assert lock.conversations == [None]
+
+
+@pytest.mark.parametrize(
+    ("layout", "agent_key"),
+    [("agent_root", "report-agent"), ("conversation", "")],
+    ids=["old_layout", "no_agent"],
+)
+async def test_exec_python_takes_no_lock_without_a_conversation_key(
+    layout: str, agent_key: str
+) -> None:
+    # B-249 —— 老布局 / 没绑 agent 的键按用户;exec_python 在那里不拿锁(维持原样),bash 照拿。
+    lock = RecordingWorkspaceLock()
+    ctx = _ctx(layout=layout, agent_key=agent_key)
+    await _call("exec_python", lock, ctx)
+    assert lock.acquired == []
+    await _call("bash", lock, ctx)
+    assert lock.acquired == [(ctx.tenant_id, ctx.user_id)]
+    assert lock.conversations == [None]
+
+
+async def test_exec_python_child_of_old_layout_takes_no_lock() -> None:
+    parent = _ctx(layout="agent_root")
+    child = _build_tool_context(_child_config(parent, sub_thread_id=uuid4(), sub_run_id=uuid4()))
+    lock = RecordingWorkspaceLock()
+    await _call("exec_python", lock, child)
+    assert lock.acquired == []
 
 
 def test_lock_scope_is_the_exec_directory_owner() -> None:
@@ -182,6 +213,12 @@ async def test_old_layout_file_write_adds_the_agent_key(name: str, path: str) ->
 async def test_bash_never_takes_the_agent_key(layout: str) -> None:
     lock = RecordingWorkspaceLock()
     await _call("bash", lock, _ctx(layout=layout))
+    assert lock.agent_keys == [None]
+
+
+async def test_exec_python_never_takes_the_agent_key() -> None:
+    lock = RecordingWorkspaceLock()
+    await _call("exec_python", lock, _ctx(layout="conversation"))
     assert lock.agent_keys == [None]
 
 
