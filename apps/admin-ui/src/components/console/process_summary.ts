@@ -26,11 +26,12 @@ export interface ProcessSummary {
   toolBreakdown: string;
   /** 本轮成功读取过的技能(`skill_view`),首读顺序;没有 → []。 */
   skills: TurnSkill[];
-  /** 每次模型调用的时长 + 非 think 行的 durationMs 之和(null 一律按 0);
-   *  一个都没有 → null。**不含 `subagent` 行** —— 见 {@link summarizeProcess}。 */
+  /** 每次模型调用的时长 + 工具时长(`toolMs`)+ 其余非 think 行的 durationMs 之和
+   *  (null 一律按 0);一个都没有 → null。**不含 `subagent` 行** —— 见 {@link summarizeProcess}。 */
   durationMs: number | null;
   /** B-254 —— 合计拆开:模型调用的时长、工具行的时长、其中出错工具行的时长;
-   *  与 `durationMs` 同口径(null 按 0,一个都没有 → null;不含 `subagent` 行)。 */
+   *  与 `durationMs` 同口径(null 按 0,一个都没有 → null;不含 `subagent` 行)。
+   *  B-255 —— 工具时长按「一批同时跑的调用」取墙钟,不是逐条相加,见 {@link toolTimeOf}。 */
   modelMs: number | null;
   toolMs: number | null;
   failedMs: number | null;
@@ -40,10 +41,12 @@ export interface ProcessSummary {
 }
 
 /** `rows` 是过程条要显示的紧凑行;`modelCalls` 是这一轮的全部模型调用
- *  (`modelCallsOf`),与哪些行被显示无关 —— 次数和模型那部分时长都只认它。 */
+ *  (`modelCallsOf`),与哪些行被显示无关 —— 次数和模型那部分时长都只认它。
+ *  `toolNodeMs` 是本轮每个 `tools` 节点帧的墙钟(`toolNodeMsOf`),工具时长按它算。 */
 export function summarizeProcess(
   rows: readonly CompactRow[],
   modelCalls: readonly ModelCall[],
+  toolNodeMs: ReadonlyMap<number, number>,
 ): ProcessSummary {
   let tools = 0;
   let other = 0;
@@ -51,8 +54,6 @@ export function summarizeProcess(
   let dur = 0;
   let any = false;
   let modelMs: number | null = null;
-  let toolMs: number | null = null;
-  let failedMs: number | null = null;
   const byTool = new Map<string, number>();
   const skillsByName = new Map<string, TurnSkill>();
   for (const call of modelCalls) {
@@ -85,15 +86,21 @@ export function summarizeProcess(
     // subagent 行,全加就等于把同一段时间计两遍——那次的过程条因此显示
     // 44m23s,而整轮墙钟只有 23m45s,「思考」耗时反超总耗时。
     // 并行派多个 worker 时更明显:工具行是这一批的真实墙钟,而 n 个
-    // subagent 行相加会数倍于它。
-    if (r.durationMs !== null && r.kind !== "think" && r.kind !== "subagent") {
+    // subagent 行相加会数倍于它。工具行本身也不逐条加 —— 见下面 `toolTimeOf`(B-255)。
+    if (
+      r.durationMs !== null &&
+      r.kind !== "think" &&
+      r.kind !== "subagent" &&
+      r.kind !== "tool"
+    ) {
       dur += r.durationMs;
       any = true;
-      if (r.kind === "tool") {
-        toolMs = (toolMs ?? 0) + r.durationMs;
-        if (r.status === "error") failedMs = (failedMs ?? 0) + r.durationMs;
-      }
     }
+  }
+  const { toolMs, failedMs } = toolTimeOf(rows, toolNodeMs);
+  if (toolMs !== null) {
+    dur += toolMs;
+    any = true;
   }
   const toolBreakdown = [...byTool.entries()]
     .sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]))
@@ -112,6 +119,60 @@ export function summarizeProcess(
     failedMs,
     otherMs: any ? dur - (modelMs ?? 0) - (toolMs ?? 0) : 0,
   };
+}
+
+/** 一批同时跑的工具调用:同一个 `tools` 节点帧(墙钟已知),或帧没带时长时的同一步。 */
+interface ToolBatch {
+  /** 该 `tools` 节点帧的 `_duration_ms`;不知道 → null。 */
+  frameMs: number | null;
+  /** 批内各行时长的最大值(帧时长缺失时的兜底);都没有 → null。 */
+  maxMs: number | null;
+  /** 批内出错行的时长之和;没有带时长的出错行 → null。 */
+  failedSumMs: number | null;
+}
+
+/** B-255 —— 工具时长 = 每一批的墙钟之和,不是每条工具行时长之和。同一步里的
+ *  调用是并发跑的(tools 节点按 stage `asyncio.gather`),逐条相加会把重叠的
+ *  时间算好几遍:测试对话 8478cedb 那一轮墙钟 34 分钟,几步里各有 2~3 个
+ *  ~120s 的 `ask_image` 并发,过程条报「工具 33m14s」,而状态栏按 tools 节点
+ *  帧算的是 18m11s。所以一批的墙钟取该 `tools` 节点帧的 `_duration_ms`(与
+ *  `session_stats.ts` `nodeDurations` 同一个数);帧没带时长(还在跑 / 老帧)
+ *  退回批内最长一条 —— 并发下这是下限,但不会重复计。`step` 为 null 的工具行
+ *  自成一批(原样用自己的时长)。
+ *  出错时长 = min(批墙钟, 批内出错行时长之和):出错调用串行时(stage 之间、
+ *  bash 这类强制独占的调用)和是准的,并发时由墙钟封顶 —— 失败那段永远不超过
+ *  它所在那批的工具时长。 */
+function toolTimeOf(
+  rows: readonly CompactRow[],
+  toolNodeMs: ReadonlyMap<number, number>,
+): { toolMs: number | null; failedMs: number | null } {
+  const batches = new Map<string, ToolBatch>();
+  for (const r of rows) {
+    if (r.kind !== "tool") continue;
+    // 工具行的 eventIndexes = [所属 agent 帧, 结果所在 tools 帧];只有后者在表里。
+    const frame = r.eventIndexes.find((i) => toolNodeMs.has(i));
+    const key =
+      frame !== undefined ? `frame:${frame}` : r.step !== null ? `step:${r.step}` : `row:${r.id}`;
+    const batch = batches.get(key) ?? {
+      frameMs: frame === undefined ? null : (toolNodeMs.get(frame) ?? null),
+      maxMs: null,
+      failedSumMs: null,
+    };
+    if (r.durationMs !== null) {
+      batch.maxMs = Math.max(batch.maxMs ?? 0, r.durationMs);
+      if (r.status === "error") batch.failedSumMs = (batch.failedSumMs ?? 0) + r.durationMs;
+    }
+    batches.set(key, batch);
+  }
+  let toolMs: number | null = null;
+  let failedMs: number | null = null;
+  for (const b of batches.values()) {
+    const wall = b.frameMs ?? b.maxMs;
+    if (wall === null) continue;
+    toolMs = (toolMs ?? 0) + wall;
+    if (b.failedSumMs !== null) failedMs = (failedMs ?? 0) + Math.min(wall, b.failedSumMs);
+  }
+  return { toolMs, failedMs };
 }
 
 /** 「模型调用 3 次 · 工具 5 次(web_search ×4 · http ×1) · 1 次失败」——无工具

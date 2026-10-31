@@ -70,6 +70,7 @@ from expert_work.persistence.knowledge.passages import (
     SWITCH_OFF_REVISION,
     ChunkVector,
     DisabledReason,
+    DiscardedEdits,
     ManualPassage,
     Passage,
     PassageChild,
@@ -2708,7 +2709,9 @@ class SqlKnowledgeStore(SqlEstimates, KnowledgeStore):
             records = await _read_history(session, tenant_id, document_id, switch_offs=True)
         return unapplied_revisions(histories, current, records)
 
-    async def discard_unapplied_revisions(self, *, tenant_id: UUID, document_id: UUID) -> int:
+    async def discard_unapplied_revisions(
+        self, *, tenant_id: UUID, document_id: UUID
+    ) -> DiscardedEdits:
         async with self._sf() as session:
             histories: dict[UUID, list[PassageRevision]] = {}
             for record in await _read_history(session, tenant_id, document_id):
@@ -2717,7 +2720,7 @@ class SqlKnowledgeStore(SqlEstimates, KnowledgeStore):
             records = await _read_history(session, tenant_id, document_id, switch_offs=True)
             unapplied = unapplied_revisions(histories, current, records)
             if not unapplied:
-                return 0
+                return DiscardedEdits()
             # Gone: the whole history; still there: the revisions above its
             # own; a switch-off record: itself.
             doomed = [
@@ -2746,7 +2749,7 @@ class SqlKnowledgeStore(SqlEstimates, KnowledgeStore):
                 .all()
             )
             await session.commit()
-        return len(deleted)
+        return DiscardedEdits(entries=len(unapplied), revisions=len(deleted))
 
     async def count_review_items(
         self, *, tenant_id: UUID, document_ids: Sequence[UUID]

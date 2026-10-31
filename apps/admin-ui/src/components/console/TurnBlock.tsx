@@ -27,7 +27,7 @@ import { ReadonlyTooltip } from "../ReadonlyTooltip";
 import { ApprovalGate } from "../turn/ApprovalGate";
 import type { Turn } from "../turn/types";
 import { AnswerBubble } from "./AnswerBubble";
-import { liveSyntheticRows, modelCallsOf, settledStepsOf } from "./live_rows";
+import { liveSyntheticRows, modelCallsOf, settledStepsOf, toolNodeMsOf } from "./live_rows";
 import { PlatformRows } from "./PlatformRows";
 import { ProcessStrip } from "./ProcessStrip";
 import { TurnFooter } from "./TurnFooter";
@@ -148,6 +148,7 @@ export function TurnBlock(props: TurnBlockProps): JSX.Element {
     [events, liveByStep],
   );
   const modelCalls = useMemo(() => modelCallsOf(events, liveByStep), [events, liveByStep]);
+  const toolNodeMs = useMemo(() => toolNodeMsOf(events), [events]);
   // 合成行的 think `text` 是整段还在增长的 reasoning buffer,要走 CompactRow
   // 的 `liveText` 分支(标签换成 `console.row_think_live`、取最新一行);已落
   // `updates` 帧的 settled 行仍取首行,所以只给合成 think 行带 liveText。
@@ -226,6 +227,7 @@ export function TurnBlock(props: TurnBlockProps): JSX.Element {
       <ProcessStrip
         rows={rows}
         modelCalls={modelCalls}
+        toolNodeMs={toolNodeMs}
         running={turn.turn.status === "running"}
         expandedRowIds={expandedIds}
         onToggleRow={toggleRow}
