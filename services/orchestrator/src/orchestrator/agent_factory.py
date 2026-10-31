@@ -169,6 +169,7 @@ from orchestrator.tools.skill_seed import (
 )
 from orchestrator.tools.spawn_worker import SPAWN_WORKER_TOOL_NAME
 from orchestrator.tools.update_plan import UpdatePlanTool
+from orchestrator.tools.vision import ASK_IMAGE_DEEP_TIMEOUT_S
 from orchestrator.tools.worker_policy import worker_policy_enabled
 from orchestrator.usage_metering import (
     MeteredLLMCaller,
@@ -197,7 +198,14 @@ logger = logging.getLogger("expert_work.orchestrator.agent_factory")
 #: 流式请求的 httpx 超时设了 ``read=None``(``providers/openai.py`` / ``anthropic.py``),
 #: 只管连接/写入/取连接池,不管读流。所以 60s 真正约束的只是「开流后 60 秒内一个 delta
 #: (含思考)都没有」,持续吐思考的推理模型不会被它误杀。
+#:
+#: B-257 —— 有快看兜底时 deep 只等 ``ASK_IMAGE_DEEP_TIMEOUT_S``(60s),与这里相等,工具会先
+#: 把整条链取消;所以那时 deep 路由的首 token 超时改用 :data:`VL_DEEP_FIRST_TOKEN_TIMEOUT_S`。
 VL_FIRST_TOKEN_TIMEOUT_S = 60
+
+#: B-257 —— 有快看兜底时 deep 路由(以及配置原样那条)的首 token / httpx 超时:deep 上限的
+#: 一半,主看图模型卡死时备用还剩约 30s。理由同上:思考增量也算进展,不会误杀慢而正常的调用。
+VL_DEEP_FIRST_TOKEN_TIMEOUT_S = ASK_IMAGE_DEEP_TIMEOUT_S / 2
 
 #: Floor for the chat / worker router wall-clock deadline. A single heavy
 #: generation (a large-context step, an orchestrator-worker doing real work)
@@ -759,6 +767,7 @@ async def build_agent(
     # outlive an otherwise-cancelled run.
     vl_caller: LLMCaller | None = None
     quick_vl_caller: LLMCaller | None = None
+    plain_vl_caller: LLMCaller | None = None
     # B-64 Task 9 —— VL 调用的记账。主模型的用量由 after_llm_call 链上的
     # TokenUsageMiddleware 落行,那条链只在 agent 节点里跑;ask_image 在工具里直接调
     # vl_caller,绕开了它。没接用量存储时(测试 / 无控制面)两边都不记,VL 路由也不加
@@ -784,10 +793,13 @@ async def build_agent(
             float(min(manifest_dl, VL_FIRST_TOKEN_TIMEOUT_S)) if manifest_dl > 0 else None
         )
 
-        # B-64 Task 10 —— deep 路由 = 配置原样;quick 路由 = 同一条链上每个模型各自按
-        # 所属厂商「关思考 / 最低档」发送。两者只在模型规格上不同,记账盖章、超时、备用链
-        # 设置完全一样,所以同一个闭包建两次。
-        async def _vl_router(model: ModelSpec, fallbacks: list[ModelSpec]) -> LLMCaller:
+        # B-64 Task 10 —— deep 路由 = 配置原样(B-257:没设思考深度的补平台默认档位,
+        # 见 _deep_vision_model);quick 路由 = 同一条链上每个模型各自按所属厂商「关思考 /
+        # 最低档」发送。两者只在模型规格上不同(B-257:还有 deep 的首 token 超时,见下),
+        # 记账盖章、备用链设置完全一样,所以同一个闭包建两次。
+        async def _vl_router(
+            model: ModelSpec, fallbacks: list[ModelSpec], deadline_s: float | None
+        ) -> LLMCaller:
             return await build_llm_router(
                 model,
                 secret_store=secret_store,
@@ -799,11 +811,11 @@ async def build_agent(
                     else chains.around_llm_call
                 ),
                 image_resolver=env.image_resolver,
-                first_token_timeout_s=vl_deadline_s,
+                first_token_timeout_s=deadline_s,
                 # VL also streams (same OpenAI provider), so pass the same idle
                 # timer as chat — keep the VL floor for first-token only.
                 idle_timeout_s=_chat_idle_timeout_s(spec.spec.idle_timeout_s),
-                provider_timeout_s=vl_deadline_s,
+                provider_timeout_s=deadline_s,
                 # Mini-ADR J-33 — VL fallback chain (J.6.补强-4).
                 extra_fallbacks=fallbacks,
                 provider_key_resolver=provider_key_resolver,
@@ -812,13 +824,26 @@ async def build_agent(
                 rate_limiter_factory=rate_limiter_factory,
             )
 
-        vl_caller = await _vl_router(vision_block.model, list(vision_block.fallbacks))
+        plain_fallbacks = list(vision_block.fallbacks)
         quick_model = _thinking_off(vision_block.model)
-        quick_fallbacks = [_thinking_off(m) for m in vision_block.fallbacks]
+        quick_fallbacks = [_thinking_off(m) for m in plain_fallbacks]
         # 整条链上没有一个模型能关思考(没有思考开关 / 目录外 / 已配成关)时 quick 与
         # deep 相同,不建第二个路由。
-        if quick_model != vision_block.model or quick_fallbacks != list(vision_block.fallbacks):
-            quick_vl_caller = await _vl_router(quick_model, quick_fallbacks)
+        has_quick = quick_model != vision_block.model or quick_fallbacks != plain_fallbacks
+        # B-257 —— 有快看兜底时 deep 只等 60s;首 token 超时要更短,主看图模型卡死时备用链
+        # 才轮得到(见 VL_DEEP_FIRST_TOKEN_TIMEOUT_S)。
+        deep_deadline_s = vl_deadline_s
+        if has_quick and vl_deadline_s is not None:
+            deep_deadline_s = min(vl_deadline_s, VL_DEEP_FIRST_TOKEN_TIMEOUT_S)
+        deep_model = _deep_vision_model(vision_block.model)
+        deep_fallbacks = [_deep_vision_model(m) for m in plain_fallbacks]
+        vl_caller = await _vl_router(deep_model, deep_fallbacks, deep_deadline_s)
+        if has_quick:
+            quick_vl_caller = await _vl_router(quick_model, quick_fallbacks, vl_deadline_s)
+        # B-257 —— 平台默认档位真改了什么,才另建一条配置原样的路由:默认档位 / 快看被厂商
+        # 拒(4xx)时退回它。
+        if deep_model != vision_block.model or deep_fallbacks != plain_fallbacks:
+            plain_vl_caller = await _vl_router(vision_block.model, plain_fallbacks, deep_deadline_s)
         if usage_store is not None:
             vl_models = chain_models(vision_block.model)
             for extra in vision_block.fallbacks:
@@ -955,6 +980,7 @@ async def build_agent(
         vision=vision_block,
         vl_caller=vl_caller,
         quick_vl_caller=quick_vl_caller,
+        plain_vl_caller=plain_vl_caller,
         vl_usage_meter=vl_usage_meter,
         # Stream HX-12 — feeds the small-deferred-pool escape hatch.
         context_window=_resolved_context_window(spec.spec.model),
@@ -2491,6 +2517,52 @@ def _thinking_off(model: ModelSpec) -> ModelSpec:
     if fallback != model.fallback:
         update["fallback"] = fallback
     return model.model_copy(update=update) if update else model
+
+
+#: B-257 —— ``ask_image`` 深入看在看图模型没设思考深度时用的平台默认档位。10-31 实测
+#: (豆包 seed-2.1-pro,化验单 + 趋势图各 3 次):不设(≈ high)95~123 s、一次超时;
+#: medium 58~63 s;low 22~44 s;各档答案都对。
+DEEP_VISION_DEFAULT_EFFORT: Literal["medium"] = "medium"
+
+
+def _deep_vision_model(model: ModelSpec) -> ModelSpec:
+    """B-257 —— ``ask_image`` 深入看用的模型规格:没设思考深度的节点补平台默认档位。
+
+    只补「目录形态是 effort / budget、思考开着(显式开,或没设且目录默认开)、``effort`` /
+    ``adaptive_thinking`` / ``thinking_max_tokens`` 都没设」的节点;厂商取值沿用
+    :func:`_thinking_payload`(effort 厂商发各自的 medium 档,budget 厂商按档位换算预算)。
+    显式设置一律优先;只有开关的厂商、目录外模型原样。目录默认不思考又没显式开的也原样 ——
+    补档位会把思考打开,反而更慢。备用树逐个节点各自判断(同 :func:`_thinking_off`)。
+    """
+    entry = catalog_entry(model.provider, model.name)
+    update: dict[str, Any] = {}
+    thinking_on = model.thinking_enabled is True or (
+        model.thinking_enabled is None and entry is not None and entry.thinking_default
+    )
+    if (
+        entry is not None
+        and entry.thinking in ("effort", "budget")
+        and thinking_on
+        and model.effort is None
+        and not model.adaptive_thinking
+        and model.thinking_max_tokens is None
+        and not _cap_too_small_for_budget(model, entry)
+    ):
+        update["effort"] = DEEP_VISION_DEFAULT_EFFORT
+    fallback = [_deep_vision_model(child) for child in model.fallback]
+    if fallback != model.fallback:
+        update["fallback"] = fallback
+    return model.model_copy(update=update) if update else model
+
+
+def _cap_too_small_for_budget(model: ModelSpec, entry: ModelEntry) -> bool:
+    """B-257 —— budget 厂商输出上限不到两倍最低思考预算(1024)时不补默认档位:预算按档位
+    换算后至少 1024,会挤掉回答(split 形态甚至超过上限)。"""
+    return (
+        entry.thinking == "budget"
+        and model.max_tokens is not None
+        and model.max_tokens < 2 * _THINKING_BUDGET_MIN
+    )
 
 
 def _thinking_payload(model: ModelSpec) -> dict[str, Any] | None:

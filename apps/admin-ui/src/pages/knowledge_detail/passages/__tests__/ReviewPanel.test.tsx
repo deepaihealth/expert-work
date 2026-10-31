@@ -141,7 +141,40 @@ describe("ReviewPanel", () => {
 
     await waitFor(() => expect(discard).toHaveBeenCalledWith(BASE_NAME, "d1"));
     expect(onChanged).toHaveBeenCalled();
-    expect(await screen.findByText("已丢弃没套回去的内容。")).toBeInTheDocument();
+    // B-241 —— the toast counts entries, like the confirm (what the server says went).
+    expect(await screen.findByText("已丢弃 3 条没套回去的内容。")).toBeInTheDocument();
+  });
+
+  it("someone else discarded after the confirm: says nothing was left, not 「0 条」", async () => {
+    const discard = vi.spyOn(sdk, "discardUnappliedEdits").mockResolvedValue(0);
+    vi.spyOn(sdk, "getUnappliedEdits").mockResolvedValue(review());
+    const { onChanged } = renderPanel();
+
+    await userEvent.click(screen.getByTestId("kb-review-discard"));
+    expect(await screen.findByText("丢弃这 2 条没套回去的内容？")).toBeInTheDocument();
+    const ok = await screen.findAllByRole("button", { name: /全部丢弃|丢 弃/ });
+    await userEvent.click(ok[ok.length - 1]);
+
+    await waitFor(() => expect(discard).toHaveBeenCalledWith(BASE_NAME, "d1"));
+    expect(
+      await screen.findByText("已经没有可丢弃的内容（可能已被处理），已刷新。"),
+    ).toBeInTheDocument();
+    expect(screen.queryByText(/已丢弃/)).toBeNull();
+    expect(onChanged).toHaveBeenCalled();
+  });
+
+  it("names an edit's author by account, the user id on hover; the id when no name is known", async () => {
+    const shown = review();
+    const named = { ...shown.unapplied[0], edited_by_name: "a@example.com" };
+    const unnamed = revision({ passage_id: "other", revision: 3, edited_by: "user-b" });
+    renderPanel({ data: { ...shown, unapplied: [named, unnamed] } });
+
+    const edit = screen.getByTestId("kb-review-unapplied-gone-edit-2");
+    expect(edit).toHaveTextContent("a@example.com 修改");
+    expect(edit).not.toHaveTextContent("user-a");
+    expect(screen.getByTestId("kb-review-unapplied-other-3")).toHaveTextContent("user-b 修改");
+    await userEvent.hover(screen.getByTestId("kb-revision-editor"));
+    expect(await screen.findByRole("tooltip")).toHaveTextContent("user-a");
   });
 
   it("nothing left to discard by then: no delete, the panel is read again", async () => {
