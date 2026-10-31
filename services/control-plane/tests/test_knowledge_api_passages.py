@@ -11,7 +11,8 @@
   ``enabled`` switches the passage;
 * ``POST …/passages`` adds one at the end; ``GET …/revisions`` /
   ``POST …/restore`` show and restore its history; ``GET
-  …/unapplied-edits`` lists edits a re-ingest could not put back;
+  …/unapplied-edits`` lists edits a re-ingest could not put back; each
+  revision names its editor's account (B-241);
 * every write is audited on the document.
 """
 
@@ -20,6 +21,7 @@ from __future__ import annotations
 import json
 from collections.abc import AsyncIterator, Sequence
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 from uuid import UUID, uuid4
@@ -34,6 +36,8 @@ from control_plane.knowledge.ingestion import KnowledgeIngestionRunner
 from control_plane.settings import DEFAULT_DEV_TENANT_ID, Settings
 from expert_work.persistence import InMemoryKnowledgeStore
 from expert_work.persistence.audit_log import InMemoryAuditLogStore
+from expert_work.persistence.tenant_member import InMemoryTenantMemberStore
+from expert_work.persistence.tenant_user import InMemoryTenantUserStore
 from expert_work.protocol import AuditQuery
 from orchestrator.llm import FakeEmbedder
 from orchestrator.tools import KnowledgeRetriever
@@ -90,6 +94,8 @@ class Harness:
     audit: InMemoryAuditLogStore
     embedder: _Counting
     document_id: str
+    users: InMemoryTenantUserStore
+    members: InMemoryTenantMemberStore
 
     @property
     def base(self) -> str:
@@ -122,6 +128,8 @@ async def harness() -> AsyncIterator[Harness]:
     embedder = _Counting()
     runner = KnowledgeIngestionRunner(store=store, embedder=embedder)
     audit = InMemoryAuditLogStore()
+    users = InMemoryTenantUserStore()
+    members = InMemoryTenantMemberStore()
     app = create_app(
         settings=Settings(
             env="dev",
@@ -135,6 +143,8 @@ async def harness() -> AsyncIterator[Harness]:
         knowledge_ingestion_runner=runner,
         audit_logger=build_default_audit_logger(audit),
         jwt_verifier=build_test_jwt_verifier(),
+        tenant_user_repo=users,
+        tenant_member_repo=members,
     )
     app.state.knowledge_retriever = KnowledgeRetriever(store=store, embedder=embedder)
     token = make_test_jwt(tenant_id=_TENANT, subject="user-a")
@@ -152,7 +162,9 @@ async def harness() -> AsyncIterator[Harness]:
             files={"file": ("guide.md", _DOC.encode(), "text/markdown")},
         )
         await settle(client, runner)
-        yield Harness(client, runner, store, audit, embedder, str(uploaded.json()["id"]))
+        yield Harness(
+            client, runner, store, audit, embedder, str(uploaded.json()["id"]), users, members
+        )
 
 
 # -- reading -----------------------------------------------------------------------
@@ -459,7 +471,8 @@ async def test_a_reupload_lists_what_needs_review_and_it_can_be_discarded(
     assert denied.status_code == 403
     discarded = await harness.client.delete(f"{harness.base}/unapplied-edits")
     assert discarded.status_code == 200, discarded.text
-    assert discarded.json() == {"discarded": 2}
+    # B-241 —— one entry (what the console counts), two revision rows (its 1 and 2).
+    assert discarded.json() == {"discarded": 1, "revisions_deleted": 2}
     after = (await harness.client.get(f"{harness.base}/unapplied-edits")).json()
     assert after["unapplied"] == []
     assert await _review_in_list(harness) == {"inherited": 1, "unapplied": 0}
@@ -467,5 +480,149 @@ async def test_a_reupload_lists_what_needs_review_and_it_can_be_discarded(
     assert history.json() == {"revisions": []}
     rows = [r for r in await harness.audit_rows() if r[0] == "knowledge:passage_discard_unapplied"]
     assert [(r[1], r[2], r[3]) for r in rows] == [
-        ("knowledge_document", harness.document_id, {"kb": "kb", "discarded": 2})
+        (
+            "knowledge_document",
+            harness.document_id,
+            {"kb": "kb", "discarded": 1, "revisions_deleted": 2},
+        )
+    ]
+
+
+async def _member(
+    harness: Harness,
+    subject: str,
+    email: str,
+    *,
+    name: str | None = None,
+    member_name: str | None = None,
+) -> None:
+    """``subject`` signed in as a member of the tenant: a ``tenant_user`` row
+    (``display_name`` ``name``) and an active member row linked to it (its
+    ``display_name`` ``member_name``)."""
+    user = await harness.users.resolve(
+        tenant_id=_TENANT, subject_type="user", subject_id=subject, display_name=name
+    )
+    member = await harness.members.create(
+        tenant_id=_TENANT,
+        email=email,
+        role="admin",
+        invited_by="seed",
+        display_name=member_name,
+        keycloak_user_id=subject,
+    )
+    assert await harness.members.transition(
+        member_id=member.id,
+        tenant_id=_TENANT,
+        to="active",
+        now=datetime.now(UTC),
+        subject_id=user.id,
+    )
+
+
+async def test_a_revision_names_its_editor_by_account(harness: Harness) -> None:
+    """B-241 —— a revision carries ``edited_by_name``: the member's
+    ``display_name``, else the ``tenant_user``'s ``display_name``, else ``null``
+    (the UI falls back to ``edited_by``) — never a coworker's email. Each
+    editor is looked up once per response, in the base's tenant — also when a
+    system admin reads it from another tenant."""
+    await _member(harness, "user-a", "a@example.com")
+    await _member(harness, "user-b", "b@example.com", name="Bea", member_name="B. Member")
+    await harness.users.resolve(
+        tenant_id=_TENANT, subject_type="user", subject_id="user-d", display_name="Dee"
+    )
+    _, notes = await harness.passages()
+
+    def as_(subject: str) -> dict[str, str]:
+        return {"Authorization": f"Bearer {make_test_jwt(tenant_id=_TENANT, subject=subject)}"}
+
+    for revision, headers in (
+        (1, None),
+        (2, None),
+        (3, as_("user-b")),
+        (4, as_("user-d")),
+        (5, as_("user-c")),
+    ):
+        edited = await harness.client.patch(
+            f"{harness.base}/passages/{notes['id']}",
+            json={"content": f"Deductible: {revision}00.", "revision": revision},
+            headers=headers,
+        )
+        assert edited.status_code == 200, edited.text
+    lookups: list[str] = []
+    real = harness.users.get_by_subject
+
+    async def counting(*, tenant_id: UUID, subject_type: Any, subject_id: str) -> Any:
+        lookups.append(subject_id)
+        return await real(tenant_id=tenant_id, subject_type=subject_type, subject_id=subject_id)
+
+    harness.users.get_by_subject = counting  # type: ignore[method-assign]
+    admin = await grant_system_admin(harness.client)
+    for headers, params in ((None, {}), (admin, {"tenant_id": str(_TENANT)})):
+        lookups.clear()
+        history = await harness.client.get(
+            f"{harness.base}/passages/{notes['id']}/revisions", params=params, headers=headers
+        )
+        assert history.status_code == 200, history.text
+        assert [(r["edited_by"], r["edited_by_name"]) for r in history.json()["revisions"]] == [
+            (None, None),  # the text the file gave
+            ("user-a", None),  # a member with no display name: not their email
+            ("user-a", None),
+            ("user-b", "B. Member"),  # the member's name before the tenant_user's
+            ("user-d", "Dee"),  # no member row: the tenant_user's name
+            ("user-c", None),  # no name anywhere: the UI shows the id
+        ]
+        assert sorted(lookups) == ["user-a", "user-b", "user-c", "user-d"]  # once per editor
+
+    changed = _DOC.replace(
+        "The deductible is 500 dollars per year.", "The deductible is 600 dollars per year."
+    )
+    uploaded = await harness.client.post(
+        "/v1/knowledge/bases/kb/documents",
+        files={"file": ("guide.md", changed.encode(), "text/markdown")},
+    )
+    assert uploaded.status_code == 202
+    await settle(harness.client, harness.runner)
+    review = await harness.client.get(f"{harness.base}/unapplied-edits")
+    assert [(r["edited_by"], r["edited_by_name"]) for r in review.json()["unapplied"]] == [
+        ("user-c", None)
+    ]
+    await _member(harness, "user-c", "c@example.com", member_name="Cee")
+    review = await harness.client.get(
+        f"{harness.base}/unapplied-edits", params={"tenant_id": str(_TENANT)}, headers=admin
+    )
+    assert [(r["edited_by"], r["edited_by_name"]) for r in review.json()["unapplied"]] == [
+        ("user-c", "Cee")
+    ]
+
+
+async def test_your_own_edits_name_your_login_email(harness: Harness) -> None:
+    """B-241 —— a system admin has no member row and no ``display_name``: their
+    own edits are named by the email they signed in with. Someone else sees
+    the id (no name is stored for them — a known limit)."""
+    _, notes = await harness.passages()
+    token = make_test_jwt(
+        tenant_id=_TENANT, subject="root-x", extra_claims={"email": "root@example.com"}
+    )
+    as_root = {"Authorization": f"Bearer {token}"}
+    edited = await harness.client.patch(
+        f"{harness.base}/passages/{notes['id']}",
+        json={"content": "Deductible: 100.", "revision": 1},
+        headers=as_root,
+    )
+    assert edited.status_code == 200, edited.text
+    url = f"{harness.base}/passages/{notes['id']}/revisions"
+
+    mine = (await harness.client.get(url, headers=as_root)).json()["revisions"]
+    assert [(r["edited_by"], r["edited_by_name"]) for r in mine] == [
+        (None, None),
+        ("root-x", "root@example.com"),
+    ]
+    other = make_test_jwt(
+        tenant_id=_TENANT, subject="root-y", extra_claims={"email": "other@example.com"}
+    )
+    # Another admin's own email never names root-x's edit.
+    theirs = await harness.client.get(url, headers={"Authorization": f"Bearer {other}"})
+    assert [(r["edited_by"], r["edited_by_name"]) for r in theirs.json()["revisions"]] == [
+        (None, None),
+        ("root-x", None),
     ]

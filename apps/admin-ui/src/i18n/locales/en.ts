@@ -4218,7 +4218,7 @@ const en: TranslationKeys = {
     review_discard: "Discard all",
     review_discard_confirm_title: "Discard these {{n}} items that were not put back?",
     review_discard_confirm_body: "Their revision history is deleted and cannot be restored.",
-    review_discarded: "Discarded the items that were not put back.",
+    review_discarded: "Discarded {{n}} items that were not put back.",
     review_discard_nothing:
       "Nothing is left to discard (it may have been handled meanwhile). The list was refreshed.",
     needs_admin: "Needs a tenant admin: this deletes data.",
@@ -5634,7 +5634,7 @@ const en: TranslationKeys = {
     process_time_split: "model {{model}} · tools {{tools}}",
     process_time_split_other: "model {{model}} · tools {{tools}} · other {{other}}",
     process_time_split_tip:
-      "each step's own time added up; tool calls that ran in parallel in one step are each counted",
+      "each step's own time added up; tool calls that ran in parallel in one step count once, as that step's actual time",
     process_empty: "No steps",
     process_more: "{{n}} more steps…",
     process_skills: "Skills",

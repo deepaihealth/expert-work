@@ -10,7 +10,7 @@ import i18n from "../../../i18n";
 
 import type { SseEvent } from "../../../api/sessions";
 import { compactRowsOf } from "../../../api/trajectory_rows";
-import { modelCallsOf } from "../live_rows";
+import { modelCallsOf, toolNodeMsOf } from "../live_rows";
 import { processHeadline, summarizeProcess } from "../process_summary";
 
 const t = (key: string, opts?: Record<string, unknown>): string => i18n.t(key, opts);
@@ -21,10 +21,15 @@ function ev(event: string, data: unknown): SseEvent {
 function upd(node: string, channels: Record<string, unknown>): SseEvent {
   return ev("updates", { [node]: channels });
 }
-/** 过程条的真实输入:显示的紧凑行 + 这一轮的全部模型调用(TurnBlock 同款)。 */
+/** 过程条的真实输入:显示的紧凑行 + 这一轮的全部模型调用 + tools 节点帧墙钟(TurnBlock 同款)。 */
 function summarize(events: readonly SseEvent[]) {
-  return summarizeProcess(compactRowsOf(events), modelCallsOf(events, undefined));
+  return summarizeProcess(
+    compactRowsOf(events),
+    modelCallsOf(events, undefined),
+    toolNodeMsOf(events),
+  );
 }
+const NO_FRAMES: ReadonlyMap<number, number> = new Map();
 
 interface ToolCall {
   id: string;
@@ -52,10 +57,13 @@ function agentStep(
     ],
   });
 }
+/** `nodeMs` = 这个 tools 节点帧的 `_duration_ms`(这一批调用的墙钟);省略 = 老帧没带。 */
 function toolResults(
   results: { id: string; name: string; ok: boolean; durationMs?: number }[],
+  nodeMs?: number,
 ): SseEvent {
   return upd("tools", {
+    ...(nodeMs === undefined ? {} : { _duration_ms: nodeMs }),
     messages: results.map((r) => ({
       type: "tool",
       tool_call_id: r.id,
@@ -118,7 +126,7 @@ describe("summarizeProcess", () => {
     const rows = compactRowsOf(events);
     // Guard the premise: the think row really is `error` here.
     expect(rows.filter((r) => r.status === "error")).toHaveLength(2);
-    expect(summarizeProcess(rows, modelCallsOf(events, undefined))).toMatchObject({
+    expect(summarizeProcess(rows, modelCallsOf(events, undefined), toolNodeMsOf(events))).toMatchObject({
       modelCalls: 1,
       tools: 1,
       failed: 1,
@@ -180,7 +188,7 @@ describe("summarizeProcess", () => {
       agentStep(2, "再想一下", []),
     ];
     expect(summarize(events).durationMs).toBe(1500);
-    expect(summarizeProcess([], []).durationMs).toBeNull();
+    expect(summarizeProcess([], [], NO_FRAMES).durationMs).toBeNull();
     // Rows that all lack a duration read as "unknown" (null), not 0.
     expect(summarize([agentStep(1, "只想不干", [])]).durationMs).toBeNull();
   });
@@ -197,18 +205,22 @@ describe("summarizeProcess", () => {
         ],
         4000,
       ),
-      toolResults([
-        { id: "c1", name: "ask_image", ok: true, durationMs: 1000 },
-        { id: "c2", name: "ask_image", ok: false, durationMs: 3000 },
-      ]),
+      // 两个调用并发跑,这一批的墙钟是 tools 节点帧的 3.2s(B-255:不是 1s + 3s)。
+      toolResults(
+        [
+          { id: "c1", name: "ask_image", ok: true, durationMs: 1000 },
+          { id: "c2", name: "ask_image", ok: false, durationMs: 3000 },
+        ],
+        3200,
+      ),
       agentStep(2, "收尾", [], 2000),
     ];
     const s = summarize(events);
     expect(s.modelMs).toBe(6000);
-    expect(s.toolMs).toBe(4000);
+    expect(s.toolMs).toBe(3200);
     expect(s.failedMs).toBe(3000);
-    expect(s.durationMs).toBe(10000);
-    const empty = summarizeProcess([], []);
+    expect(s.durationMs).toBe(9200);
+    const empty = summarizeProcess([], [], NO_FRAMES);
     expect(empty.modelMs).toBeNull();
     expect(empty.toolMs).toBeNull();
     expect(empty.failedMs).toBeNull();
@@ -248,7 +260,7 @@ describe("summarizeProcess", () => {
     const rows = compactRowsOf(events);
     // Premise: only step 2 projects a think row.
     expect(rows.filter((r) => r.kind === "think")).toHaveLength(1);
-    expect(summarizeProcess(rows, modelCallsOf(events, undefined))).toMatchObject({
+    expect(summarizeProcess(rows, modelCallsOf(events, undefined), toolNodeMsOf(events))).toMatchObject({
       modelCalls: 3,
       tools: 2,
       durationMs: 4_000 + 500 + 1_000 + 300 + 2_000,
@@ -283,7 +295,131 @@ describe("summarizeProcess", () => {
     // still carries its own duration for per-row display — only the total
     // must not add it on top of the parent tool's.
     expect(rows.some((r) => r.kind === "subagent" && r.durationMs === 933_000)).toBe(true);
-    expect(summarizeProcess(rows, modelCallsOf(events, undefined)).durationMs).toBe(939_112);
+    expect(summarizeProcess(rows, modelCallsOf(events, undefined), toolNodeMsOf(events)).durationMs).toBe(939_112);
+  });
+
+  describe("B-255 — parallel tool calls in one step count once, as that step's wall clock", () => {
+    // 测试对话 8478cedb:一轮墙钟 34 分钟,几步里各有 2~3 个 ~120s 的 ask_image
+    // 并发。过程条逐条相加报「工具 33m14s」,状态栏按 tools 节点帧算的是 18m11s。
+    const PARALLEL_3: ToolCall[] = [
+      { id: "c1", name: "ask_image" },
+      { id: "c2", name: "ask_image" },
+      { id: "c3", name: "ask_image" },
+    ];
+
+    it("takes the tools-node frame's wall (125s), not the sum of three 120s calls (360s)", () => {
+      const events: SseEvent[] = [
+        agentStep(1, null, PARALLEL_3, 5_000),
+        toolResults(
+          PARALLEL_3.map((c) => ({ ...c, ok: true, durationMs: 120_000 })),
+          125_000,
+        ),
+        agentStep(2, "收尾", [], 3_000),
+      ];
+      const s = summarize(events);
+      expect(s.toolMs).toBe(125_000);
+      expect(s.modelMs).toBe(8_000);
+      expect(s.durationMs).toBe(133_000);
+      expect(s.otherMs).toBe(0);
+    });
+
+    it("falls back to the step's longest call when the frame carries no duration", () => {
+      const events: SseEvent[] = [
+        agentStep(1, null, PARALLEL_3, 5_000),
+        toolResults([
+          { id: "c1", name: "ask_image", ok: true, durationMs: 120_000 },
+          { id: "c2", name: "ask_image", ok: true, durationMs: 90_000 },
+          { id: "c3", name: "ask_image", ok: true, durationMs: 60_000 },
+        ]),
+      ];
+      const s = summarize(events);
+      expect(s.toolMs).toBe(120_000);
+      expect(s.durationMs).toBe(125_000);
+    });
+
+    it("sequential steps add up — each its own wall", () => {
+      const events: SseEvent[] = [
+        agentStep(1, null, PARALLEL_3, 5_000),
+        toolResults(
+          PARALLEL_3.map((c) => ({ ...c, ok: true, durationMs: 120_000 })),
+          125_000,
+        ),
+        agentStep(2, null, [{ id: "c4", name: "web_search" }], 2_000),
+        toolResults([{ id: "c4", name: "web_search", ok: true, durationMs: 40_000 }], 41_000),
+        // 第 3 步的帧没带时长 → 退回它自己最长的那条。
+        agentStep(3, null, [{ id: "c5", name: "http" }, { id: "c6", name: "http" }], 1_000),
+        toolResults([
+          { id: "c5", name: "http", ok: true, durationMs: 7_000 },
+          { id: "c6", name: "http", ok: true, durationMs: 9_000 },
+        ]),
+      ];
+      expect(summarize(events).toolMs).toBe(125_000 + 41_000 + 9_000);
+    });
+
+    it("a failed call inside a parallel step never costs more than that step's tool time", () => {
+      // 三个 120s 的调用两个失败:失败之和 240s,但这一步的工具只花了 125s。
+      const events: SseEvent[] = [
+        agentStep(1, null, PARALLEL_3, 5_000),
+        toolResults(
+          [
+            { id: "c1", name: "ask_image", ok: false, durationMs: 120_000 },
+            { id: "c2", name: "ask_image", ok: false, durationMs: 120_000 },
+            { id: "c3", name: "ask_image", ok: true, durationMs: 120_000 },
+          ],
+          125_000,
+        ),
+        // 单个失败、帧没带时长:失败那段 = 它自己的 30s(不超过这一步兜底的 50s)。
+        agentStep(2, null, [{ id: "c4", name: "http" }, { id: "c5", name: "http" }], 1_000),
+        toolResults([
+          { id: "c4", name: "http", ok: false, durationMs: 30_000 },
+          { id: "c5", name: "http", ok: true, durationMs: 50_000 },
+        ]),
+      ];
+      const s = summarize(events);
+      expect(s.failed).toBe(3);
+      expect(s.toolMs).toBe(125_000 + 50_000);
+      expect(s.failedMs).toBe(125_000 + 30_000);
+    });
+
+    it("keeps 模型 + 工具 + 其他 = 合计 with other rows and a worker in the turn", () => {
+      const events: SseEvent[] = [
+        agentStep(1, null, [{ id: "p1", name: "update_plan" }], 1_000),
+        toolResults([{ id: "p1", name: "update_plan", ok: true, durationMs: 200 }], 250),
+        agentStep(2, null, PARALLEL_3, 5_000),
+        toolResults(
+          PARALLEL_3.map((c) => ({ ...c, ok: true, durationMs: 120_000 })),
+          125_000,
+        ),
+        agentStep(3, null, [{ id: "w1", name: "spawn_worker" }, { id: "w2", name: "spawn_worker" }], 2_000),
+        ev("worker", {
+          worker_id: "w-1", parent_worker_id: null, parent_tool_call_id: "w1",
+          label: "甲", agent_ref: "dynamic:general", depth: 1, kind: "start", wseq: 0,
+          data: { task_excerpt: "查资料", role: null, max_steps: 8 },
+        }),
+        ev("worker", {
+          worker_id: "w-1", parent_worker_id: null, parent_tool_call_id: "w1",
+          label: "甲", agent_ref: "dynamic:general", depth: 1, kind: "end", wseq: 1,
+          data: { outcome: "success", iteration_used: 3, llm_call_count: 3, wall_clock_ms: 60_000 },
+        }),
+        toolResults(
+          [
+            { id: "w1", name: "spawn_worker", ok: true, durationMs: 61_000 },
+            { id: "w2", name: "spawn_worker", ok: true, durationMs: 58_000 },
+          ],
+          62_000,
+        ),
+      ];
+      // Premise: the worker really projects a timed subagent row (excluded from the sums).
+      expect(
+        compactRowsOf(events).some((r) => r.kind === "subagent" && r.durationMs === 60_000),
+      ).toBe(true);
+      const s = summarize(events);
+      expect(s.modelMs).toBe(8_000);
+      expect(s.toolMs).toBe(125_000 + 62_000);
+      expect(s.otherMs).toBe(200); // the update_plan row
+      expect(s.durationMs).toBe((s.modelMs ?? 0) + (s.toolMs ?? 0) + s.otherMs);
+      expect(s.durationMs).toBe(8_000 + 187_000 + 200);
+    });
   });
 });
 
