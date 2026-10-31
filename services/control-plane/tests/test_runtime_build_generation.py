@@ -69,7 +69,7 @@ class _Builder:
         if self.during is not None:
             pending = self.during(n)
             if pending is not None:
-                await pending
+                _ = await pending  # 构建在这里卡住,等外面发失效
         return _Built(n)
 
 
