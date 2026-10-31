@@ -729,7 +729,7 @@ async def test_close_waiting_for_the_restart_lock_already_stops_calls(retired: b
         await asyncio.sleep(0)
         with pytest.raises(RuntimeError, match="not started"):
             await client.call_tool("echo", {"text": "x"})
-    await closing
+    _ = await closing  # 等关闭跑完
 
     assert client.opens == opens
     assert _ECHO_CALLS == []
