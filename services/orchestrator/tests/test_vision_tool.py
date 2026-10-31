@@ -598,7 +598,8 @@ async def test_ask_image_without_a_workspace_store_has_no_short_form() -> None:
         await tool.call({"path": _DOC, "unit": 10, "question": "?"}, ctx=_ctx(user_id=uuid4()))
 
 
-def test_ask_image_with_a_workspace_store_offers_both_forms() -> None:
+def test_ask_image_with_a_workspace_store_offers_all_three_forms() -> None:
+    """B-250 / B-251 —— 工作区图片只给 ``path``;文档页没渲染会自动渲染,不再要求先调 read_page。"""
     spec = AskImageTool(
         vl_caller=_FakeVLCaller(),
         image_resolver=_resolver(),
@@ -606,7 +607,9 @@ def test_ask_image_with_a_workspace_store_offers_both_forms() -> None:
     ).spec
     assert {"path", "unit", "image_ref", "question"} <= set(spec.parameters["properties"])
     assert spec.parameters["required"] == ["question"]
-    assert "Prefer this for document pages" in spec.description
+    assert "an image file in the workspace" in spec.description
+    assert "rendered for you" in spec.description
+    assert "Do not copy long references by hand" in spec.description
 
 
 @pytest.mark.anyio

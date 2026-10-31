@@ -1773,6 +1773,10 @@ export interface TranslationKeys {
     process_tools_detailed: string;
     process_other: string;
     process_failed: string;
+    process_failed_time: string;
+    process_time_split: string;
+    process_time_split_other: string;
+    process_time_split_tip: string;
     process_empty: string;
     process_more: string;
     process_skills: string;
@@ -5626,6 +5630,11 @@ const en: TranslationKeys = {
     process_tools_detailed: "Tools ×{{n}} ({{breakdown}})",
     process_other: "{{n}} other steps",
     process_failed: "{{n}} failed",
+    process_failed_time: "{{n}} failed ({{d}})",
+    process_time_split: "model {{model}} · tools {{tools}}",
+    process_time_split_other: "model {{model}} · tools {{tools}} · other {{other}}",
+    process_time_split_tip:
+      "each step's own time added up; tool calls that ran in parallel in one step are each counted",
     process_empty: "No steps",
     process_more: "{{n}} more steps…",
     process_skills: "Skills",

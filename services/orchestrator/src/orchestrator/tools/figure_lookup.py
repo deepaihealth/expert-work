@@ -147,6 +147,13 @@ class _ScopeLister:
         return found
 
 
+class FigureNotRenderedError(FileNotFoundError):
+    """B-251 —— 文档在,但这一页没有能用的渲染(没渲过 / 读不出来 / 比文档旧)。
+
+    与「文档本身不在」分开:这一种重新渲染一次就能好,``ask_image`` 会代模型调
+    ``read_page``;文档不在时渲染也没用,仍是普通的 ``FileNotFoundError``。"""
+
+
 async def resolve_rendered_figure(
     store: WorkspaceStore,
     *,
@@ -202,7 +209,7 @@ async def resolve_rendered_figure(
             f"{path} 的第 {unit} {label}还没渲染 —— "
             f"请先调用 read_page(path={path!r}, units=[{unit}]),再调用 ask_image。"
         )
-        raise FileNotFoundError(msg)
+        raise FigureNotRenderedError(msg)
     # 终审 #7 —— 读不出修改时间的候选(lstat 撞上留存清理、坏符号链接)只丢掉它自己,
     # 不拖垮整次查找;一张都用不了时才失败,并说对原因。
     newest = _newest(candidates)
@@ -211,7 +218,7 @@ async def resolve_rendered_figure(
             f"{path} 第 {unit} {label}的渲染页读不出来(可能正被清理)—— "
             f"请重新调用 read_page(path={path!r}, units=[{unit}]),再调用 ask_image。"
         )
-        raise FileNotFoundError(msg)
+        raise FigureNotRenderedError(msg)
     newest_mtime, newest_page = newest
     if render_is_stale(document.mtime, newest_mtime):
         msg = (
@@ -219,7 +226,7 @@ async def resolve_rendered_figure(
             f"请先重新调用 read_page(path={path!r}, units=[{unit}]) 渲染第 {unit} {label},"
             "再调用 ask_image。"
         )
-        raise FileNotFoundError(msg)
+        raise FigureNotRenderedError(msg)
     return workspace_figure_ref(tenant_id, user_id, scoped_path(scope, newest_page.rel))
 
 

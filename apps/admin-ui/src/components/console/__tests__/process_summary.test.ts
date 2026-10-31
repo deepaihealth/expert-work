@@ -185,6 +185,55 @@ describe("summarizeProcess", () => {
     expect(summarize([agentStep(1, "只想不干", [])]).durationMs).toBeNull();
   });
 
+  it("B-254 — splits the turn's time into model, tool and failed-tool time", () => {
+    // 10-31 测试对话 099d9b9b:47 分钟里 80% 在模型思考,过程条只给一个合计,看不出来。
+    const events: SseEvent[] = [
+      agentStep(
+        1,
+        null,
+        [
+          { id: "c1", name: "ask_image" },
+          { id: "c2", name: "ask_image" },
+        ],
+        4000,
+      ),
+      toolResults([
+        { id: "c1", name: "ask_image", ok: true, durationMs: 1000 },
+        { id: "c2", name: "ask_image", ok: false, durationMs: 3000 },
+      ]),
+      agentStep(2, "收尾", [], 2000),
+    ];
+    const s = summarize(events);
+    expect(s.modelMs).toBe(6000);
+    expect(s.toolMs).toBe(4000);
+    expect(s.failedMs).toBe(3000);
+    expect(s.durationMs).toBe(10000);
+    const empty = summarizeProcess([], []);
+    expect(empty.modelMs).toBeNull();
+    expect(empty.toolMs).toBeNull();
+    expect(empty.failedMs).toBeNull();
+  });
+
+  it("B-254 — plan rows land in 'other', not in tool time; untimed failures cost nothing", () => {
+    const events: SseEvent[] = [
+      agentStep(1, null, [
+        { id: "p1", name: "update_plan" },
+        { id: "c1", name: "bash" },
+      ], 1000),
+      toolResults([
+        { id: "p1", name: "update_plan", ok: true, durationMs: 2000 },
+        { id: "c1", name: "bash", ok: false },
+      ]),
+    ];
+    const s = summarize(events);
+    expect(s.modelMs).toBe(1000);
+    expect(s.toolMs).toBeNull(); // the only tool row has no time
+    expect(s.failedMs).toBeNull();
+    expect(s.otherMs).toBe(2000);
+    expect(s.failed).toBe(1);
+    expect(s.durationMs).toBe(3000);
+  });
+
   it("B-202 — a step that only calls tools (no reasoning → no think row) still counts, time included", () => {
     // glm 系列常见:22 次调用只有 7 次写了思考。没思考的步骤在紧凑投影里不出
     // think 行,原来过程条按行求和,它们的模型耗时整段丢了(会话 0e878fd6
@@ -258,13 +307,13 @@ describe("processHeadline", () => {
   it("headline omits the tool parenthesis without tools and the failed tail without failures", () => {
     expect(
       processHeadline(
-        { modelCalls: 2, tools: 0, other: 0, failed: 0, toolBreakdown: "", skills: [], durationMs: 1200 },
+        { modelCalls: 2, tools: 0, other: 0, failed: 0, toolBreakdown: "", skills: [], durationMs: 1200, modelMs: null, toolMs: null, failedMs: null, otherMs: 0 },
         t,
       ),
     ).toBe("模型调用 2 次");
     expect(
       processHeadline(
-        { modelCalls: 0, tools: 0, other: 0, failed: 0, toolBreakdown: "", skills: [], durationMs: null },
+        { modelCalls: 0, tools: 0, other: 0, failed: 0, toolBreakdown: "", skills: [], durationMs: null, modelMs: null, toolMs: null, failedMs: null, otherMs: 0 },
         t,
       ),
     ).toBe("无过程");
@@ -273,7 +322,7 @@ describe("processHeadline", () => {
   it("counts every non-model-call / non-tool row （plan / memory / marker …） as 其他 N 步", () => {
     expect(
       processHeadline(
-        { modelCalls: 0, tools: 0, other: 3, failed: 0, toolBreakdown: "", skills: [], durationMs: null },
+        { modelCalls: 0, tools: 0, other: 3, failed: 0, toolBreakdown: "", skills: [], durationMs: null, modelMs: null, toolMs: null, failedMs: null, otherMs: 0 },
         t,
       ),
     ).toBe("其他 3 步");
