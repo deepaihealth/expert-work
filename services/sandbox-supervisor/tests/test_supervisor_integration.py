@@ -357,12 +357,16 @@ async def test_seed_files_land_under_the_sandbox_skills_root(expert_work: _Harne
     (spec § 四)。
     """
     content = b"SEED_CONTENT"
-    seed_files = [SeedFile(path="seeded.txt", content_b64=base64.b64encode(content).decode())]
+    # B-242 —— exec 的视图里 /opt/skills 只剩本 agent 那一格(只读),种子照生产的形状落在
+    # <agent_key>/ 底下,exec 也带上这个 agent。
+    seed_files = [SeedFile(path="a/seeded.txt", content_b64=base64.b64encode(content).decode())]
     acquired = await expert_work.supervisor.acquire(
         AcquireRequest(tenant_id=uuid4(), thread_id="t-seed", seed_files=seed_files)
     )
     result = await expert_work.supervisor.exec(
-        acquired.sandbox_id, code=f"print(open('{SANDBOX_SKILLS_ROOT}/seeded.txt').read())"
+        acquired.sandbox_id,
+        code=f"print(open('{SANDBOX_SKILLS_ROOT}/a/seeded.txt').read())",
+        agent_root="/mnt/workspace/agents/a",
     )
     await expert_work.supervisor.release(acquired.sandbox_id)
 

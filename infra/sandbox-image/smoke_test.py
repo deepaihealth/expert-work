@@ -15,7 +15,8 @@ conversation's own directory, other conversations are absent from ``/agent``,
 ``uploads`` is skipped while one at the conversation's ``work`` fails closed,
 the old view sees only its own ``threads/<id>/``, and the payload — running in a
 nested user namespace — can neither ``umount`` the covers nor escape them with
-its own ``unshare -m``.
+its own ``unshare -m``. B-242 — a conversation's ``/tmp`` and HOME carry over to
+its next exec and are absent from another conversation's.
 
 Usage:
     python smoke_test.py <image-tag>
@@ -110,6 +111,9 @@ def _view_requests() -> list[tuple[str, dict[str, object], object]]:
         "print(json.dumps([os.listdir('threads'), os.listdir('/agent/threads'), "
         f"os.path.exists('threads/{_B}')]))"
     )
+    # B-242 —— sandbox-local state is per conversation, also through the runner.
+    keep = "open('/tmp/m', 'w').write('A'); open('/home/agent/m', 'w').write('A'); print('kept')"
+    seen = "import os; print(os.path.exists('/tmp/m'), os.path.exists('/home/agent/m'))"
     locked = (
         "import os, subprocess\n"
         "def fails(cmd):\n"
@@ -129,6 +133,9 @@ def _view_requests() -> list[tuple[str, dict[str, object], object]]:
         ("symlinked work dir fails closed", conv("print('ran')"), 98),
         ("restore", unbound(restore), "restored"),
         ("legacy view hides other threads", legacy(legacy_probe), f'[["{_A}"], ["{_A}"], false]'),
+        ("B-242: conversation keeps its own /tmp and HOME", conv(keep), "kept"),
+        ("B-242: same conversation sees them", conv(seen), "True True"),
+        ("B-242: another conversation does not", conv(seen, _B), "False False"),
     ]
 
 
@@ -163,6 +170,12 @@ def main(image: str) -> int:
             #   * `apparmor=unconfined` — docker-default AppArmor carries
             #     `deny mount,`, which blocks the namespace's own mount(2)
             #     calls too.
+            #   * `--user 10000:10000` (B-242) — every real exec runs as the agent
+            #     uid; as root the namespace maps only uid 0, so the agent-owned
+            #     /home/agent and /opt/* (where each conversation keeps its own
+            #     copy) are not writable and every bound exec exits 98.
+            "--user",
+            "10000:10000",
             "--tmpfs",
             "/mnt/workspace:rw,size=64m,mode=1777",
             "--tmpfs",

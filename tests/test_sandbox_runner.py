@@ -43,13 +43,13 @@ runner = _load_runner()
 _REAL_EXEC_ARGV = runner._exec_argv
 
 #: ``_EXEC_VIEW_SCRIPT`` 的 ``$0``;它后面是 ``$1``(bind 源)、``$2``(对话 id)、``$3``
-#: (本对话线程 id),再后面是解释器。
+#: (本对话线程 id)、``$4`` / ``$5``(B-242:代码文件名与 sha256,本地恒为空),再后面是解释器。
 _ARGV0 = "ew-exec-view"
 
 
 def _python_start(argv: list[str]) -> int:
-    """argv 里解释器那一格的下标 —— 跳过 ``$1``…``$3``。"""
-    return argv.index(_ARGV0) + 4
+    """argv 里解释器那一格的下标 —— 跳过 ``$1``…``$5``。"""
+    return argv.index(_ARGV0) + 6
 
 
 def _root_slot(argv: list[str]) -> str:
@@ -316,16 +316,18 @@ def test_exec_argv_binds_the_agent_root() -> None:
     argv = runner._exec_argv("print(1)", "/mnt/workspace/agents/a")
 
     assert argv == [
-        "unshare",
-        "-Urm",
+        "/usr/bin/unshare",
+        "-Urmi",
         "--propagation",
         "private",
         "--",
-        "sh",
+        "/bin/sh",
         "-c",
         runner._EXEC_VIEW_SCRIPT,
         "ew-exec-view",
         "/mnt/workspace/agents/a",
+        "",
+        "",
         "",
         "",
         sys.executable,
@@ -346,15 +348,17 @@ def test_exec_argv_unbound_leaves_the_root_slot_empty(agent_root: str | None) ->
     argv = runner._exec_argv("print(1)", agent_root)
 
     assert argv == [
-        "unshare",
-        "-Urm",
+        "/usr/bin/unshare",
+        "-Urmi",
         "--propagation",
         "private",
         "--",
-        "sh",
+        "/bin/sh",
         "-c",
         runner._EXEC_VIEW_SCRIPT,
         "ew-exec-view",
+        "",
+        "",
         "",
         "",
         "",
@@ -456,8 +460,8 @@ def test_exec_argv_drops_the_conversation_without_an_agent_root() -> None:
     argv = runner._exec_argv("print(1)", None, "11111111-1111-1111-1111-111111111111", "x")
 
     at = argv.index(_ARGV0)
-    assert argv[at + 1 : at + 4] == ["", "", ""]
-    assert argv[at + 4] == sys.executable
+    assert argv[at + 1 : at + 6] == ["", "", "", "", ""]
+    assert argv[at + 6] == sys.executable
 
 
 def test_handle_request_passes_the_conversation_view_through(
