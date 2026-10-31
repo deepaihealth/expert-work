@@ -1597,8 +1597,8 @@ def test_exec_view_script_matches_the_sandbox_image() -> None:
     """B-60 —— 两个后端同一段 sh:orchestrator ``exec_view.EXEC_VIEW_SCRIPT`` 与镜像
     ``runner.py`` 的 ``_EXEC_VIEW_SCRIPT`` 逐字相等;argv 前缀也相等。B-236 —— 前缀
     之后依次是 ``$1`` agent_root、``$2`` 对话 id、``$3`` 本对话线程 id(三个都是表达式,
-    不是常量),再 ``sys.executable``;与 orchestrator 那一侧 ``exec_view_argv`` 拼出来的
-    位置一一对应。"""
+    不是常量),B-242 —— 再 ``$4`` / ``$5`` 代码文件名与 sha256(本地走 ``-c``,恒为空串),
+    再 ``sys.executable``;与 orchestrator 那一侧 ``exec_view_argv`` 拼出来的位置一一对应。"""
     from uuid import UUID
 
     from orchestrator.tools.exec_view import (
@@ -1614,9 +1614,17 @@ def test_exec_view_script_matches_the_sandbox_image() -> None:
     assert argv[n : n + 3] == [None, None, None], (
         "前缀之后必须是 agent_root、对话 id、线程 id 三个表达式"
     )
-    assert argv[n + 3] == "<sys.executable>"
+    assert argv[n + 3 : n + 5] == ["", ""], "本地走 -c,没有代码文件"
+    assert argv[n + 5] == "<sys.executable>"
     ours = exec_view_argv("a-1", ["py"], conv_id=UUID(int=1), thread_id=UUID(int=2))
-    assert ours[n:] == ["/mnt/workspace/agents/a-1", str(UUID(int=1)), str(UUID(int=2)), "py"]
+    assert ours[n:] == [
+        "/mnt/workspace/agents/a-1",
+        str(UUID(int=1)),
+        str(UUID(int=2)),
+        "",
+        "",
+        "py",
+    ]
 
 
 def test_workspace_roots_match_across_packages() -> None:

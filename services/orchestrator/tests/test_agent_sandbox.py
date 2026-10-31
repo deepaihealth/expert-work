@@ -51,6 +51,7 @@ Task 9 独立审查 Important-1/2 追加(task-9-report.md 有完整记录):
 from __future__ import annotations
 
 import base64
+import hashlib
 import json
 import logging
 import os
@@ -73,6 +74,7 @@ from expert_work.persistence import SANDBOX_AGENTS_ROOT, SANDBOX_SKILLS_ROOT
 from expert_work.persistence.sandbox_instance_store import (
     _STUCK_CREATE_TTL_S,
     SANDBOX_LAYOUT_AGENT_CONV,
+    SANDBOX_LAYOUT_AGENT_CONV_LOCAL,
     SANDBOX_LAYOUT_AGENT_NS,
     SANDBOX_LAYOUT_USER_ROOT,
     InMemorySandboxInstanceStore,
@@ -94,6 +96,7 @@ from orchestrator.tools.agent_sandbox import (
     SANDBOX_IMAGE_ENV,
     AgentSandboxClient,
 )
+from orchestrator.tools.exec_view import EXEC_SHELL_ENV
 from orchestrator.tools.nas_workspace_store import workspace_deleted_marker
 from orchestrator.tools.registry import ToolBlockedError, ToolContext
 from orchestrator.tools.sandbox import (
@@ -1278,7 +1281,9 @@ async def test_exec_sets_owner_only_umask_before_running_the_script() -> None:
     await client.exec(sandbox_id=sid, code="print(1)", timeout_s=5)
 
     cmd, *_ = sdk.sandbox.commands.calls[-1]
-    assert cmd.startswith("umask 077 && unshare -Urm --propagation private -- sh -c "), cmd
+    assert cmd.startswith(
+        "umask 077 && /usr/bin/unshare -Urmi --propagation private -- /bin/sh -c "
+    ), cmd
 
 
 # ---------------------------------------------------------------------------
@@ -1766,6 +1771,7 @@ async def test_exec_injects_pythonuserbase_when_agent_key_set() -> None:
         # 平台级,每次 exec 都带(与提示词「当前日期」行同源)
         "TZ": resolve_agent_timezone().key,
         "PYTHONUSERBASE": f"{SANDBOX_AGENTS_ROOT}/my-agent",
+        **EXEC_SHELL_ENV,
     }
 
 
@@ -1786,6 +1792,7 @@ async def test_exec_injects_the_skills_dir_only_when_skills_are_bound() -> None:
         "TZ": resolve_agent_timezone().key,
         "PYTHONUSERBASE": f"{SANDBOX_AGENTS_ROOT}/my-agent",
         "EXPERT_WORK_SKILLS_DIR": f"{SANDBOX_SKILLS_ROOT}/my-agent",
+        **EXEC_SHELL_ENV,
     }
 
 
@@ -1799,7 +1806,10 @@ async def test_exec_omits_pythonuserbase_when_agent_key_unset() -> None:
 
     await client.exec(sandbox_id=sid, code="print(1)", timeout_s=5)
 
-    assert sdk.sandbox.commands.envs_calls[-1] == {"TZ": resolve_agent_timezone().key}
+    assert sdk.sandbox.commands.envs_calls[-1] == {
+        "TZ": resolve_agent_timezone().key,
+        **EXEC_SHELL_ENV,
+    }
 
 
 @pytest.mark.asyncio
@@ -1823,6 +1833,7 @@ async def test_exec_injects_expert_work_inputs_when_run_id_set() -> None:
         "TZ": resolve_agent_timezone().key,
         "EXPERT_WORK_INPUTS": inputs_abs_path(run_id),
         "EXPERT_WORK_INPUTS_DIR": inputs_abs_dir(run_id),
+        **EXEC_SHELL_ENV,
     }
 
 
@@ -2376,7 +2387,25 @@ async def test_acquire_rebuilds_a_warm_session_from_before_the_conversation_view
 
     assert new_id != old_id
     assert (old_id, _LAYOUT_MISMATCH_DESTROY_REASON) in store.mark_destroyed_calls
-    assert store.rows[new_id]["layout"] == SANDBOX_LAYOUT_AGENT_CONV
+    assert store.rows[new_id]["layout"] == SANDBOX_LAYOUT_AGENT_CONV_LOCAL
+
+
+@pytest.mark.asyncio
+async def test_acquire_rebuilds_a_warm_session_from_before_local_state_isolation() -> None:
+    """B-242 —— ``agent-conv`` 的热会话里可能还活着老视图(看得见命名空间外 ``/tmp`` 等)的
+    后台进程,各对话那份本地状态就放在那里:acquire 时按 ``layout_mismatch`` 换代。"""
+    sdk, store = FakeSdk(), FakeInstanceStore()
+    client = make_client(sdk, store)
+    tenant_id, user_id = uuid4(), uuid4()
+
+    old_id = await client.acquire(tenant_id=tenant_id, thread_id="t1", user_id=user_id)
+    store.rows[old_id]["layout"] = SANDBOX_LAYOUT_AGENT_CONV
+
+    new_id = await client.acquire(tenant_id=tenant_id, thread_id="t2", user_id=user_id)
+
+    assert new_id != old_id
+    assert (old_id, _LAYOUT_MISMATCH_DESTROY_REASON) in store.mark_destroyed_calls
+    assert store.rows[new_id]["layout"] == SANDBOX_LAYOUT_AGENT_CONV_LOCAL
 
 
 @pytest.mark.asyncio
@@ -3053,15 +3082,14 @@ async def test_exec_command_is_the_shared_exec_view_command() -> None:
     unbound, *_ = sdk.sandbox.commands.calls[-1]
 
     assert re.fullmatch(
-        re.escape("umask 077 && ") + r"unshare -Urm --propagation private -- sh -c '.*' "
-        r"ew-exec-view /mnt/workspace/agents/plan-aaaaaaaa '' '' python -E -P "
-        r"/tmp/ew-exec-[0-9a-f]{32}\.py",
+        _COMMAND_HEAD + r"ew-exec-view /mnt/workspace/agents/plan-aaaaaaaa '' '' "
+        r"(ew-exec-[0-9a-f]{32}\.py) [0-9a-f]{64} python -E -P /tmp/\.ew-exec/\1",
         bound,
         re.DOTALL,
     ), bound
     assert re.fullmatch(
-        re.escape("umask 077 && ") + r"unshare -Urm --propagation private -- sh -c '.*' "
-        r"ew-exec-view '' '' '' python -E -P /tmp/ew-exec-[0-9a-f]{32}\.py",
+        _COMMAND_HEAD + r"ew-exec-view '' '' '' "
+        r"(ew-exec-[0-9a-f]{32}\.py) [0-9a-f]{64} python -E -P /tmp/\.ew-exec/\1",
         unbound,
         re.DOTALL,
     ), unbound
@@ -3086,12 +3114,46 @@ async def test_exec_command_carries_the_conversation_view() -> None:
     command, *_ = sdk.sandbox.commands.calls[-1]
 
     assert re.fullmatch(
-        re.escape("umask 077 && ") + r"unshare -Urm --propagation private -- sh -c '.*' "
-        rf"ew-exec-view /mnt/workspace/agents/plan-aaaaaaaa {conv} {conv} python -E -P "
-        r"/tmp/ew-exec-[0-9a-f]{32}\.py",  # noqa: S108 — sandbox tmpfs path, not host
+        _COMMAND_HEAD + rf"ew-exec-view /mnt/workspace/agents/plan-aaaaaaaa {conv} {conv} "
+        r"(ew-exec-[0-9a-f]{32}\.py) [0-9a-f]{64} python -E -P /tmp/\.ew-exec/\1",
         command,
         re.DOTALL,
     ), command
+
+
+#: B-242 —— 外层的 unshare / sh 都是绝对路径。
+_COMMAND_HEAD = (
+    re.escape("umask 077 && ") + r"/usr/bin/unshare -Urmi --propagation private -- /bin/sh -c '.*' "
+)
+
+
+@pytest.mark.asyncio
+async def test_exec_hands_the_script_over_by_hash_and_keeps_bash_off_the_writable_home() -> None:
+    """B-242 —— 代码按字节写到 ``/tmp/ew-exec-<hex>.py``,命令串带同一份字节的 sha256(挂载
+    阶段核对后才跑);外层 ``bash -l`` 的 ``HOME`` / ``BASH_ENV`` / ``ENV`` 最后写,出网那组
+    盖不掉它。"""
+    sdk, store = FakeSdk(), FakeInstanceStore()
+    client = make_client(sdk, store)
+    egress = EgressContext(policy="proxy", agent_name="plan", agent_version="1")
+    sid = await client.acquire(tenant_id=uuid4(), thread_id="t", user_id=uuid4(), egress=egress)
+    code = "print('中文')\n"
+
+    await client.exec(
+        sandbox_id=sid, code=code, timeout_s=5, agent_key="plan-aaaaaaaa", egress=egress
+    )
+
+    path, data, _ = sdk.sandbox.files.written[-1]
+    assert data == code.encode()
+    name = path.removeprefix("/tmp/")  # noqa: S108 — 沙箱里的路径
+    assert re.fullmatch(r"ew-exec-[0-9a-f]{32}\.py", name), path
+    argv = shlex.split(sdk.sandbox.commands.calls[-1][0].removeprefix("umask 077 && "))
+    at = argv.index("ew-exec-view")
+    assert argv[at + 4 : at + 6] == [name, hashlib.sha256(code.encode()).hexdigest()]
+    assert argv[-1] == f"/tmp/.ew-exec/{name}"  # noqa: S108
+    envs = sdk.sandbox.commands.envs_calls[-1]
+    assert envs is not None
+    assert (envs["HOME"], envs["BASH_ENV"], envs["ENV"]) == ("/", "", "")
+    assert envs["HTTPS_PROXY"], "出网那组仍在"
 
 
 @pytest.mark.asyncio
@@ -3121,7 +3183,8 @@ async def test_post_create_mkdir_failure_discards_the_sandbox() -> None:
     )
 
 
-def test_client_lays_out_agent_conv_by_default() -> None:
+def test_client_lays_out_agent_conv_local_by_default() -> None:
     """B-236 —— 新镜像多了 ``/agent`` 挂载点:布局值换成 ``agent-conv``,老镜像起的
-    ``agent-ns`` 热会话在下一次 acquire 时按 ``layout_mismatch`` 重建。"""
-    assert make_client(FakeSdk(), FakeInstanceStore()).layout == SANDBOX_LAYOUT_AGENT_CONV
+    ``agent-ns`` 热会话在下一次 acquire 时按 ``layout_mismatch`` 重建。B-242 —— 再换成
+    ``agent-conv-local``:上线前起的热会话一律重建。"""
+    assert make_client(FakeSdk(), FakeInstanceStore()).layout == SANDBOX_LAYOUT_AGENT_CONV_LOCAL

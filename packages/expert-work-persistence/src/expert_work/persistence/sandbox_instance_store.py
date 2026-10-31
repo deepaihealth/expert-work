@@ -126,6 +126,10 @@ SANDBOX_LAYOUT_AGENT_NS = "agent-ns"
 #: B-236 —— 镜像多了 ``/agent`` 挂载点、exec 命令串多了对话参数:老镜像起的热会话
 #: 每次 exec 都会以 97 退出,所以换一个值让它们在下一次 acquire 时重建。
 SANDBOX_LAYOUT_AGENT_CONV = "agent-conv"
+#: B-242 —— 沙箱本地状态按对话分。上线前起的热会话里可能还活着老视图里的后台进程,它们
+#: 看得见命名空间外的 ``/tmp`` / ``/opt/agents`` 等(各对话那份就放在那里),所以换一个值,
+#: 让这些沙箱在下一次 acquire 时重建,不靠人工回收。
+SANDBOX_LAYOUT_AGENT_CONV_LOCAL = "agent-conv-local"
 
 
 class SandboxClaimContendedError(RuntimeError):

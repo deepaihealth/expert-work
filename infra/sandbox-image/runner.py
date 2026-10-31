@@ -64,28 +64,39 @@ MAX_OUTPUT_CHARS = 1_000_000
 #: ``$2`` = 对话 id(B-236,空串 = 老视图),``$3`` = 本对话线程 id(老视图里留出自己那一格
 #: ``threads/<id>/``),其后是载荷 argv。挂载阶段由脚本内嵌的一段
 #: ``/usr/local/bin/python3 -I -S`` 按 fd 完成(``open_tree`` / ``move_mount``,理由见
-#: ``exec_view`` 的模块文档),所以镜像必须在这个绝对路径上有 python。它只分隔 NAS 视图:
-#: ``/tmp`` / ``$HOME`` / ``/opt/agents`` / ``/opt/skills`` 是这个沙箱里所有 exec(同一用户的
-#: 所有 agent 与对话)共用的本地状态,不在它管辖之内(见 B-242)。
+#: ``exec_view`` 的模块文档),所以镜像必须在这个绝对路径上有 python。B-242 —— 沙箱本地状态
+#: (``/tmp``、``$HOME``、``/var/tmp``、``/run/lock``、``/opt/agents/<key>``)也换成本对话自己
+#: 的那一份,``/dev/shm`` 每次一块新的,``/opt/skills`` 只留自己 key 那一格且只读,其余挂载一律
+#: 只读;``$4`` / ``$5`` 是代码文件名与 sha256,这里走 ``-c``,恒为空串。
 _EXEC_VIEW_SCRIPT = """\
 set -eu
 ew_path="${PATH-}"
 PATH=/usr/sbin:/usr/bin:/sbin:/bin
-root="$1"; conv="$2"; own="$3"; shift 3
+root="$1"; conv="$2"; own="$3"; code="$4"; sum="$5"; shift 5
+drop() {
+  case "$code" in
+    ""|*/*|.*) ;;
+    *) /bin/rm -f -- "/tmp/$code" ;;
+  esac
+}
 if [ ! -d /agent ]; then
   echo "ew-exec-view: image lacks /agent" >&2
+  drop
   exit 97
 fi
 for id in "$conv" "$own"; do
   case "$id" in
-    */*|.|..) echo "ew-exec-view: bad conversation id" >&2; exit 98 ;;
+    */*|.|..) echo "ew-exec-view: bad conversation id" >&2; drop; exit 98 ;;
   esac
 done
+case "$code" in
+  */*|.*) echo "ew-exec-view: bad script name" >&2; exit 98 ;;
+esac
 if [ -n "$conv" ]; then
   own="$conv"
 fi
 /usr/local/bin/python3 -I -S -c '
-import ctypes, os, stat, sys
+import ctypes, hashlib, os, shutil, stat, sys, time
 
 # Every NAS path is reached by an O_NOFOLLOW openat walk and mounted by fd
 # (open_tree + move_mount, fsopen/fsmount for tmpfs): a name swapped for a
@@ -98,9 +109,19 @@ libc.mount.argtypes = (
 OPEN_TREE, MOVE_MOUNT, FSOPEN, FSCONFIG, FSMOUNT = 428, 429, 430, 431, 432
 CLONE = 0x1 | os.O_CLOEXEC | 0x1000  # OPEN_TREE_CLONE | OPEN_TREE_CLOEXEC | AT_EMPTY_PATH
 MOVE = 0x4 | 0x40  # MOVE_MOUNT_F_EMPTY_PATH | MOVE_MOUNT_T_EMPTY_PATH
-REMOUNT_RO = 0x20 | 0x1000 | 0x1 | 0x2 | 0x4 | 0x8  # REMOUNT BIND RDONLY NOSUID NODEV NOEXEC
+RDONLY, NOSUID, NODEV, NOEXEC = 0x1, 0x2, 0x4, 0x8
+REMOUNT_BIND = 0x20 | 0x1000  # MS_REMOUNT | MS_BIND
+SEALED = RDONLY | NOSUID | NODEV | NOEXEC
 DIR = os.O_PATH | os.O_NOFOLLOW | os.O_DIRECTORY | os.O_CLOEXEC
 PLATFORM_DIRS = ("uploads", "inputs", ".tool_results")
+# Sandbox-local dirs every exec could write: each is replaced by a copy kept per conversation
+# (<dir>/.ew-conv/<conv>), or a fresh tmpfs when there is no conversation.
+KEPT = ("/tmp", "/home/agent", "/var/tmp", "/run/lock")
+AGENTS, SKILLS = "/opt/agents", "/opt/skills"
+# Per-conversation copies untouched this long are removed (the sandbox lives <= 12 h).
+STALE_S = 2 * 3600
+# Mounts this script made; every other mount ends up read-only (freeze).
+OURS = set()
 
 
 def sc(nr, *args):
@@ -141,8 +162,17 @@ def sub(fd, name, make):
     return got
 
 
+def mnt_id(fd):
+    with open("/proc/self/fdinfo/" + str(fd), "rb") as f:
+        for line in f:
+            if line.startswith(b"mnt_id:"):
+                return int(line.split()[1])
+    die("no mnt_id for fd " + str(fd))
+
+
 def attach(tree, target):
     sc(MOVE_MOUNT, tree, b"", target, b"", MOVE)
+    OURS.add(mnt_id(tree))
     return tree
 
 
@@ -150,11 +180,20 @@ def bind(source, target):
     return attach(sc(OPEN_TREE, source, b"", CLONE), target)
 
 
-def bind_ro(source, target, what):
-    tree = bind(source, target)
+def ro(tree, what, flags):
+    # A bind remount sets the per-mount flags as a whole: the ones the source
+    # mount already has are locked in a user namespace and must be kept.
+    f = os.fstatvfs(tree).f_flag
+    for st, ms in ((os.ST_NOSUID, NOSUID), (os.ST_NODEV, NODEV), (os.ST_NOEXEC, NOEXEC)):
+        if f & st:
+            flags |= ms
     fd_path = ("/proc/self/fd/" + str(tree)).encode()
-    if libc.mount(None, fd_path, None, REMOUNT_RO, None) != 0:
+    if libc.mount(None, fd_path, None, REMOUNT_BIND | flags, None) != 0:
         die(what + " could not be made read-only")
+
+
+def bind_ro(source, target, what):
+    ro(bind(source, target), what, SEALED)
 
 
 def tmpfs(*options):
@@ -185,7 +224,7 @@ def hide_threads(view, own_dir, own):
         bind(own_dir, slot)
 
 
-def main(root, conv, own):
+def nas_view(root, conv, own):
     nas = os.open("/mnt/workspace", os.O_PATH | os.O_DIRECTORY | os.O_CLOEXEC)
     agent = os.open("/agent", DIR)
     workspace = os.open("/workspace", DIR)
@@ -241,13 +280,186 @@ def main(root, conv, own):
     attach(tmpfs((b"size", b"1k")), nas)
 
 
+def local(path):
+    return os.open(path, os.O_PATH | os.O_DIRECTORY | os.O_CLOEXEC)
+
+
+def take(tmp, name, digest):
+    # The exec script, written to the outer /tmp: unlinked first (so it is gone
+    # whatever happens next), then checked against the hash the caller sent.
+    try:
+        fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC, dir_fd=tmp)
+        try:
+            os.unlink(name, dir_fd=tmp)
+            if not stat.S_ISREG(os.fstat(fd).st_mode):
+                die("exec script is not a regular file")
+            chunks = []
+            while True:
+                chunk = os.read(fd, 1 << 20)
+                if not chunk:
+                    break
+                chunks.append(chunk)
+        finally:
+            os.close(fd)
+    except OSError as e:
+        die("exec script unreadable: " + str(e))
+    data = b"".join(chunks)
+    if hashlib.sha256(data).hexdigest() != digest:
+        die("exec script does not match its sha256")
+    return data
+
+
+def prune(store, own):
+    # A copy idle for STALE_S is renamed away, then removed only if nobody touched
+    # it in between (an exec of that conversation touches its copy first).
+    listing = os.open(".", os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC, dir_fd=store)
+    try:
+        names = os.listdir(listing)
+    finally:
+        os.close(listing)
+    for name in names:
+        try:
+            if name == own or time.time() - os.lstat(name, dir_fd=store).st_mtime < STALE_S:
+                continue
+            gone = name
+            if not name.startswith(".trash-"):
+                gone = ".trash-" + name + "-" + os.urandom(4).hex()
+                os.rename(name, gone, src_dir_fd=store, dst_dir_fd=store)
+                if time.time() - os.lstat(gone, dir_fd=store).st_mtime < STALE_S:
+                    os.rename(gone, name, src_dir_fd=store, dst_dir_fd=store)
+                    continue
+            shutil.rmtree(gone, ignore_errors=True, dir_fd=store)
+        except OSError:
+            continue
+
+
+def mine(base, own):
+    try:
+        store = sub(base, ".ew-conv", True)
+        prune(store, own)
+        if not own:
+            return None
+        try:
+            os.utime(own, dir_fd=store, follow_symlinks=False)
+        except FileNotFoundError:
+            pass
+        return sub(store, own, True)
+    except OSError:
+        die("the local state of this conversation is not a plain directory")
+
+
+def private(target, source):
+    if source is None:
+        return attach(tmpfs((b"size", b"256m"), (b"mode", b"0700")), target)
+    return bind(source, target)
+
+
+def only(target, key, fill):
+    # An empty tmpfs over target; only target/<key> is put back, by fill.
+    cover = tmpfs((b"size", b"1k"), (b"mode", b"0500"))
+    slot = None
+    if key and fill is not None:
+        os.mkdir(key, 0o777, dir_fd=cover)
+        slot = sub(cover, key, False)
+    attach(cover, target)
+    if slot is not None:
+        fill(slot)
+
+
+def local_view(tmp, key, own, name, data):
+    # Every source is opened before anything is covered.
+    kept = []
+    for path in KEPT:
+        try:
+            base = tmp if path == "/tmp" else local(path)
+        except FileNotFoundError:
+            continue
+        if os.fstatvfs(base).f_flag & os.ST_RDONLY:
+            continue  # nobody can write it (local backend: --read-only rootfs)
+        kept.append((path, base, mine(base, own)))
+    try:
+        shm = local("/dev/shm")
+    except FileNotFoundError:
+        shm = None
+    agents, skills = local(AGENTS), local(SKILLS)
+    pyuser = mine(agents, own) if key else None
+    skill = None
+    if key:
+        try:
+            skill = sub(skills, key, False)
+        except FileNotFoundError:
+            pass
+        except OSError:
+            say(SKILLS + "/" + key + " is not a plain directory; skills not mounted")
+    tmp_tree = None
+    for path, base, source in kept:
+        tree = private(base, source)
+        if path == "/tmp":
+            tmp_tree = tree
+    if shm is not None:
+        attach(tmpfs((b"size", b"64m"), (b"mode", b"1777")), shm)
+    only(agents, key, lambda slot: private(slot, pyuser))
+
+    def skills_ro(slot):
+        ro(bind(skill, slot), SKILLS + "/" + key, RDONLY | NOSUID | NODEV)
+
+    only(skills, key, None if skill is None else skills_ro)
+    if data is not None:
+        if tmp_tree is None:
+            die("/tmp is not writable; nowhere to put the exec script")
+        box = tmpfs((b"size", str(len(data) + 65536).encode()), (b"mode", b"0700"))
+        fd = os.open(name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC, 0o600, dir_fd=box)
+        with os.fdopen(fd, "wb") as f:
+            f.write(data)
+        ro(attach(box, sub(tmp_tree, ".ew-exec", True)), "the exec script", SEALED)
+
+
+def freeze():
+    # Fail closed: every mount this namespace was copied with goes read-only, so a
+    # writable path nobody listed is not shared between conversations. The /proc
+    # subtree stays as it is: the nested unshare writes uid_map, and the runtime
+    # masks under it (/dev/null binds, ro proc/tmpfs) hold no storage. The mounts
+    # made above keep their flags; a mount hidden under one of them is skipped.
+    bs = bytes([92])
+    with open("/proc/self/mountinfo", "rb") as f:
+        rows = [line.split(b" ") for line in f.read().splitlines()]
+    for row in rows:
+        point = row[4]
+        for code, ch in ((b"040", b" "), (b"011", bytes([9])), (b"012", bytes([10])), (b"134", bs)):
+            point = point.replace(bs + code, ch)
+        if int(row[0]) in OURS or point == b"/proc" or point.startswith(b"/proc/"):
+            continue
+        try:
+            fd = os.open(point, os.O_PATH | os.O_NOFOLLOW | os.O_CLOEXEC)
+        except OSError:
+            continue  # out of reach here, so out of reach of the payload too
+        try:
+            if mnt_id(fd) == int(row[0]):
+                ro(fd, point.decode("utf-8", "replace"), RDONLY)
+        finally:
+            os.close(fd)
+
+
+def main(root, conv, own, name, digest):
+    tmp = local("/tmp")
+    data = take(tmp, name, digest) if name else None
+    nas_view(root, conv, own)
+    local_view(tmp, root.rsplit("/", 1)[-1] if root else "", own, name, data)
+    freeze()
+
+
 try:
-    main(sys.argv[1], sys.argv[2], sys.argv[3])
+    main(sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5])
 except OSError as e:
     die("mount failed: " + str(e))
-' "$root" "$conv" "$own"
+' "$root" "$conv" "$own" "$code" "$sum" || { rc=$?; drop; exit "$rc"; }
 cd /workspace
 PATH="$ew_path"
+HOME=/home/agent
+MPLCONFIGDIR=/home/agent/.mplconfig
+TMPDIR=/tmp
+export HOME MPLCONFIGDIR TMPDIR
+unset BASH_ENV ENV
 exec /usr/bin/unshare -Ur -- "$@"
 """
 
@@ -278,18 +490,21 @@ def _exec_argv(
     conv = conv_id if agent_root and conv_id else ""
     thread = thread_id if agent_root and thread_id else ""
     return [
-        "unshare",
-        "-Urm",
+        "/usr/bin/unshare",
+        "-Urmi",
         "--propagation",
         "private",
         "--",
-        "sh",
+        "/bin/sh",
         "-c",
         _EXEC_VIEW_SCRIPT,
         "ew-exec-view",
         agent_root or "",
         conv,
         thread,
+        # B-242 —— 代码文件名与 sha256:本地走 -c,不落文件。
+        "",
+        "",
         # -E -P, deliberately NOT -I: -I implies -s, which kicks the user
         # site out of sys.path and silently breaks `pip install --user`
         # (the image's PIP_USER=1 flow). -E keeps PYTHON* env-config
@@ -323,9 +538,9 @@ def run_once(
     directory is bind-mounted as ``/workspace``, ``shared/`` is bound read-only
     and the NAS mount itself is covered by an empty tmpfs — so absolute
     ``/workspace/x`` lands in the agent's directory and other agents' NAS
-    directories are not in the view. That partitions the NAS only: sandbox-local
-    state (``/tmp``, ``$HOME``, ``/opt/agents``, ``/opt/skills``) is shared by every
-    exec in this sandbox, i.e. by all agents and conversations of the same user.
+    directories are not in the view. B-242 —— sandbox-local state (``/tmp``,
+    ``$HOME``, ``/opt/agents/<key>`` …) is the conversation's own copy too, and
+    ``/opt/skills`` shows only this agent's key, read-only.
     ``None`` → the whole user root is ``/workspace``.
     The directory is created inside the namespace (``mkdir -p``, umask 0o077
     inherited from this process). Any mount failure exits non-zero before the
