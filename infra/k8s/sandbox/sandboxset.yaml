@@ -170,7 +170,7 @@ spec:
           #
           # Rolling back is a one-line edit to the public host, and it needs
           # no credential change — the Secret carries both hosts (see above).
-          image: crpi-sgadimluo7wm655m-vpc.cn-hangzhou.personal.cr.aliyuncs.com/expert-work/sandbox:daf63cb1
+          image: crpi-sgadimluo7wm655m-vpc.cn-hangzhou.personal.cr.aliyuncs.com/expert-work/sandbox:deaefa60
           imagePullPolicy: IfNotPresent
           # See the ENTRYPOINT note in this file's header.
           command:
