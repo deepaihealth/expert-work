@@ -285,6 +285,10 @@ def scenario(image: str, tmp_path: Path) -> Scenario:
         (tmp_path / "data.json").write_text(json.dumps(data))
         for name, text in (files or {}).items():
             (tmp_path / name).write_text(text)
+            (tmp_path / name).chmod(0o644)
+        # pytest 建的 tmp_path 是 0700(属主是跑测试的账号):Linux CI 上容器里 uid 10000 进
+        # 不去,exec 里读 ``/t/<files>`` 就是 EACCES。Docker Desktop 的共享目录不报这个错。
+        tmp_path.chmod(0o755)
         (tmp_path / "driver.py").write_text(
             _DRIVER + textwrap.dedent(body) + "\nprint(json.dumps(result))\n"
         )
