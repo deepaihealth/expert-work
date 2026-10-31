@@ -561,24 +561,29 @@ def test_vl_first_token_timeout_is_below_the_ask_image_cap() -> None:
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("stream_deadline_s", "expected"),
+    ("stream_deadline_s", "expected", "deep"),
     [
-        (None, 60.0),  # manifest 默认值大于 60 → 60
-        (300, 60.0),
-        (30, 30.0),  # manifest 更小 → 取更小
-        (0, None),  # 0 = 关掉 deadline,照旧尊重
+        # B-257 —— 有快看兜底时 deep 只等 60s,deep 路由首 token 取 30s(低于 60s)。
+        (None, 60.0, 30.0),  # manifest 默认值大于 60 → 60
+        (300, 60.0, 30.0),
+        (30, 30.0, 30.0),  # manifest 更小 → 取更小
+        (20, 20.0, 20.0),
+        (0, None, None),  # 0 = 关掉 deadline,照旧尊重
     ],
 )
 async def test_vl_routers_use_the_capped_first_token_and_http_timeout(
-    monkeypatch: pytest.MonkeyPatch, stream_deadline_s: int | None, expected: float | None
+    monkeypatch: pytest.MonkeyPatch,
+    stream_deadline_s: int | None,
+    expected: float | None,
+    deep: float | None,
 ) -> None:
     harness = _Harness(stream_deadline_s=stream_deadline_s)
-    # 有思考开关 → deep + quick 两个路由,两个都要吃到同一组超时。
+    # 有思考开关 → deep、quick 两个路由;deep 补了默认档位 → 再加一条配置原样的(同 deep 超时)。
     vision = {"model": {"provider": "qwen", "name": "qwen3.6-plus"}}
 
     await harness.run(monkeypatch, vision, depth=None)
 
-    assert harness.vl_router_timeouts == [(expected, expected), (expected, expected)]
+    assert harness.vl_router_timeouts == [(deep, deep), (expected, expected), (deep, deep)]
 
 
 @pytest.mark.asyncio
