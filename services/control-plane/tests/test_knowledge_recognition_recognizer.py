@@ -5,12 +5,14 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 from typing import Any
 from uuid import UUID, uuid4
 
 import pytest
+from prometheus_client import REGISTRY
 
 from control_plane.knowledge.recognition.cleaning import NO_TEXT_SENTENCE
 from control_plane.knowledge.recognition.clients import (
@@ -313,6 +315,119 @@ async def test_a_malformed_answer_is_billed_and_falls_back() -> None:
     assert usage.rows[0] == (doc.tenant, "glm", "glm-ocr", 700, 30)
 
 
+# -- B-237: why a page fell back -------------------------------------------------------
+
+
+def _fallback_counts() -> dict[str, float]:
+    return {
+        sample.labels["reason"]: sample.value
+        for metric in REGISTRY.collect()
+        if metric.name == "expert_work_knowledge_recognition_fallback"
+        for sample in metric.samples
+        if sample.name.endswith("_total")
+    }
+
+
+def _fallback_lines(caplog: pytest.LogCaptureFixture) -> list[str]:
+    return [
+        record.getMessage()
+        for record in caplog.records
+        if record.getMessage().startswith("knowledge.recognition_fallback")
+    ]
+
+
+@pytest.mark.parametrize(
+    ("primary", "keys", "reason"),
+    [
+        (
+            RecognitionCallError("429 slow down", kind="busy", cause="rate_limited"),
+            None,
+            "vendor_unavailable_rate_limited",
+        ),
+        (RecognitionCallError("400 bad image", kind="rejected"), None, "vendor_rejected"),
+        (_TRUNCATED, None, "bad_output_truncated"),
+        (_GOOD, _Keys(frozenset({"qwen"})), "credential_missing"),
+    ],
+)
+async def test_a_fallback_is_logged_and_counted_with_why_the_primary_was_not_used(
+    caplog: pytest.LogCaptureFixture,
+    primary: Reading | RecognitionCallError,
+    keys: _Keys | None,
+    reason: str,
+) -> None:
+    caplog.set_level(logging.INFO)
+    doc = await _doc()
+    # Page 1 is read by the primary; page 2 falls back.
+    clients = {GLM_OCR: _Fake(_GOOD, primary), QWEN_FLASH: _Fake(_GOOD)}
+    if keys is not None:
+        clients[GLM_OCR] = _Fake(_GOOD)
+    before = _fallback_counts()
+    outcomes = await _recognize(
+        _recognizer(doc, clients=clients, keys=keys), doc, images=(b"page-1", b"page-2")
+    )
+    after = _fallback_counts()
+    assert [o.model for o in outcomes][-1] == "qwen3.7-flash"
+    expected_pages = 2 if keys is not None else 1  # no primary key: every page falls back
+    assert after.get(reason, 0.0) - before.get(reason, 0.0) == expected_pages
+    assert sum(after.values()) - sum(before.values()) == expected_pages
+    lines = _fallback_lines(caplog)
+    assert len(lines) == expected_pages
+    assert lines[-1] == (
+        f"knowledge.recognition_fallback document={doc.document} reading=page_ocr index=1 "
+        f"model=qwen/qwen3.7-flash reasons=glm/glm-ocr: {reason}"
+    )
+    assert _PAGE_TEXT not in caplog.text
+
+
+async def test_a_failed_call_is_logged_with_its_cause_and_the_page(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # B-237: the warning matches the fallback line (document, page).
+    doc = await _doc()
+    timeout = RecognitionCallError("ReadTimeout: timed out", kind="busy", cause="timeout")
+    clients = {GLM_OCR: _Fake(_GOOD, timeout), QWEN_FLASH: _Fake(_GOOD)}
+    await _recognize(_recognizer(doc, clients=clients), doc, images=(b"page-1", b"page-2"))
+    failed = [
+        record.getMessage()
+        for record in caplog.records
+        if record.getMessage().startswith("knowledge.recognition_call_failed")
+    ]
+    assert failed == [
+        "knowledge.recognition_call_failed model=glm/glm-ocr kind=busy cause=timeout "
+        f"document={doc.document} reading=page_ocr index=1 detail=ReadTimeout: timed out"
+    ]
+
+
+async def test_no_fallback_no_log_and_no_count(caplog: pytest.LogCaptureFixture) -> None:
+    caplog.set_level(logging.INFO)
+    doc = await _doc()
+    clients = {GLM_OCR: _Fake(_GOOD), QWEN_FLASH: _Fake(_GOOD)}
+    recognizer = _recognizer(doc, clients=clients)
+    before = _fallback_counts()
+    (outcome,) = await _recognize(recognizer, doc)
+    assert outcome.model == "glm-ocr"
+    assert _fallback_lines(caplog) == []
+    assert _fallback_counts() == before
+
+
+async def test_a_fallback_reading_from_the_cache_is_not_logged_again(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # The fallback was logged when it happened; a re-ingest reads its cached
+    # reading without asking the primary — nothing fell back this time.
+    caplog.set_level(logging.INFO)
+    doc = await _doc()
+    clients = {GLM_OCR: _Fake(_EMPTY), QWEN_FLASH: _Fake(_GOOD)}
+    recognizer = _recognizer(doc, clients=clients)
+    await _recognize(recognizer, doc)
+    assert len(_fallback_lines(caplog)) == 1
+    before = _fallback_counts()
+    (outcome,) = await _recognize(recognizer, doc)
+    assert outcome.cached and outcome.model == "qwen3.7-flash"
+    assert len(_fallback_lines(caplog)) == 1
+    assert _fallback_counts() == before
+
+
 async def test_a_recognized_page_is_never_billed_twice() -> None:
     doc, usage = await _doc(), _Usage()
     clients = {GLM_OCR: _Fake(_EMPTY), QWEN_FLASH: _Fake(_GOOD)}
@@ -558,6 +673,55 @@ async def test_a_reingest_without_keys_keeps_recognized_pages_from_the_cache() -
     ]
     assert again[0].cached and again[1].cached
     assert clients[GLM_OCR].calls == 2
+
+
+async def test_a_scanned_page_reading_records_its_page_source_and_reader() -> None:
+    # B-238: the estimate counts pages read before (a cancelled ingest) by these.
+    doc = await _doc()
+    clients = {GLM_OCR: _Fake(_GOOD, _EMPTY), QWEN_FLASH: _Fake(_GOOD)}
+    recognizer = _recognizer(doc, clients=clients)
+    outcomes = await recognizer.recognize_document(
+        tenant_id=doc.tenant,
+        document_id=doc.document,
+        pages=[0, 1],
+        render=_render,
+        source_sha256="src",
+    )
+    assert [outcomes[0].model, outcomes[1].model] == ["glm-ocr", "qwen3.7-flash"]
+    primary, fallback = (await recognizer.plan(tenant_id=doc.tenant)).page_readers()
+
+    async def pages(source: str, *readers: str) -> set[int]:
+        return await doc.store.cached_page_indexes(
+            tenant_id=doc.tenant, document_id=doc.document, source_sha256=source, readers=readers
+        )
+
+    assert await pages("src", primary, fallback) == {0, 1}
+    assert await pages("src", primary) == {0}
+    assert await pages("src", fallback) == {1}
+    assert await pages("other", primary, fallback) == set()
+
+
+async def test_readings_without_a_source_or_of_figures_record_no_page() -> None:
+    doc = await _doc()
+    recognizer = _recognizer(doc, clients={GLM_OCR: _Fake(_GOOD), QWEN_FLASH: _Fake(_GOOD)})
+    plan = await recognizer.plan(tenant_id=doc.tenant)
+    await recognizer.recognize(
+        tenant_id=doc.tenant,
+        document_id=doc.document,
+        plan=plan,
+        images={0: b"figure-0"},
+        render=_RENDER,
+        kind="figure_ocr",
+        source_sha256="src",
+    )
+    await recognizer.recognize_document(
+        tenant_id=doc.tenant, document_id=doc.document, pages=[1], render=_render
+    )
+    results = [entry.result for entry in doc.store._parse_cache.values()]
+    assert len(results) == 2
+    assert all(
+        set(result) == {"raw", "finish_reason", "layout_chars", "layout_size"} for result in results
+    )
 
 
 async def test_pages_past_the_cap_are_over_limit() -> None:

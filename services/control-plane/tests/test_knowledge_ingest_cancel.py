@@ -16,15 +16,18 @@ from __future__ import annotations
 import asyncio
 import json
 from collections.abc import Awaitable, Callable, Iterator, Sequence
+from datetime import UTC, datetime
 from typing import Any
 from uuid import UUID, uuid4
 
 import pymupdf
 import pytest
 
+from control_plane.knowledge.estimate import IngestEstimator
 from control_plane.knowledge.ingestion import (
     KnowledgeIngestionRunner,
     StaleIngestionError,
+    parse_locally,
     shutdown_parse_pool,
 )
 from control_plane.knowledge.recognition.clients import (
@@ -44,7 +47,9 @@ from control_plane.knowledge.recognition.recognizer import (
 )
 from control_plane.knowledge.recovery import KnowledgeIngestRecoveryWorker
 from expert_work.persistence import InMemoryKnowledgeStore
-from expert_work.protocol import DocumentStatus
+from expert_work.persistence.knowledge.base import ClaimedIngestion
+from expert_work.protocol import DEFAULT_CHUNK_MAX_TOKENS, DocumentStatus
+from expert_work.protocol.knowledge_estimate import EstimateKind
 from expert_work.runtime.storage import InMemoryObjectStore
 from orchestrator.llm import FakeEmbedder
 from tests.figure_test_images import noise_png
@@ -489,6 +494,59 @@ async def test_cancel_stops_recognition_between_batches() -> None:
     # finished, the next one never starts.
     assert 0 < model.calls <= 16
     await _assert_cancelled_and_empty(store, document_id)
+
+
+async def test_the_estimate_after_a_cancel_leaves_out_the_pages_already_read() -> None:
+    # B-238: what was read before the cancel stays in the cache and is not
+    # billed again — the next estimate counts it as read (10-29: 40 pages,
+    # cancelled after 9, estimated 40 to read instead of 31).
+    raw = _scanned_pdf(40)
+    store = InMemoryKnowledgeStore()
+    kb_id, document_id = await _document(store, "scan.pdf", raw)
+    model = _CancellingModel(_Canceller(store, kb_id, document_id), "Recognised words.")
+    recognizer = DocumentRecognizer(
+        store=store, settings=_Settings(), api_keys=_keys, client_factory=model.reader
+    )
+    runner = KnowledgeIngestionRunner(store=store, embedder=FakeEmbedder(), recognizer=recognizer)
+    await runner.submit(tenant_id=_TENANT, document_id=document_id)
+    assert 0 < model.calls < 40
+
+    claim = ClaimedIngestion(
+        tenant_id=_TENANT,
+        document_id=document_id,
+        kb_id=kb_id,
+        filename="scan.pdf",
+        content=raw,
+        content_sha256="sha",
+        chunk_max_tokens=DEFAULT_CHUNK_MAX_TOKENS,
+        chunk_overlap_tokens=0,
+        attempts=1,
+        generation=1,
+        phase="estimate",
+        origin="reingest",
+        serving_sha256="sha",
+    )
+    local = await parse_locally(
+        store,
+        tenant_id=_TENANT,
+        kb_id=kb_id,
+        document_id=document_id,
+        filename="scan.pdf",
+        raw=raw,
+        figures=None,
+    )
+    estimator = IngestEstimator(store=store, recognizer=recognizer)
+    estimate = await estimator.estimate(claim, local, embedding_model=None, now=datetime.now(UTC))
+    (line,) = [item for item in estimate.items if item.kind is EstimateKind.RECOGNITION]
+    assert (line.units, line.reused_units) == (40, model.calls)
+
+    # The promise: ingesting again reads (and bills) exactly the pages estimated.
+    read_before = model.calls
+    await store.upsert_document(tenant_id=_TENANT, kb_id=kb_id, filename="scan.pdf")
+    await runner.submit(tenant_id=_TENANT, document_id=document_id)
+    document = await store.get_document(tenant_id=_TENANT, document_id=document_id)
+    assert document is not None and document.status is DocumentStatus.READY
+    assert model.calls - read_before == line.units - line.reused_units
 
 
 # ---------------------------------------------------------------------------

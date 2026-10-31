@@ -18,7 +18,7 @@ from collections.abc import Collection, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import PurePosixPath
-from typing import Any, Final, Literal
+from typing import Any, Final, Literal, TypeGuard
 from uuid import UUID
 
 # B-222 PR-2 — estimate types both stores share, re-exported.
@@ -197,6 +197,20 @@ CancelOutcome = Literal[
 #: raw reading (PR-1); a figure's description / text (PR-2); the semantic
 #: chunker's topic-shift decisions for one embedding model (B-215).
 ParseCacheKind = Literal["page_ocr", "figure_desc", "figure_ocr", "semantic_break"]
+
+#: B-238 —— what a ``page_ocr`` reading also records: the 0-based page it was
+#: read from, the sha256 of the document bytes that page was rendered from, and
+#: who read it how (model, request and render parameters: the cache key less the
+#: image) — :meth:`KnowledgeStore.cached_page_indexes`; readings cached before
+#: B-238 record none of them.
+PAGE_OCR_PAGE = "page"
+PAGE_OCR_SOURCE = "source_sha256"
+PAGE_OCR_READER = "reader"
+
+
+def is_page_index(value: object) -> TypeGuard[int]:
+    """A recorded ``page_ocr`` page: a 0-based page index."""
+    return isinstance(value, int) and not isinstance(value, bool) and value >= 0
 
 
 @dataclass(frozen=True)
@@ -773,6 +787,22 @@ class KnowledgeStore(abc.ABC):
         same) is replaced: a reading cached under the key is only read again
         when the current rules reject it, and the fresh one must then stand,
         or every later ingest would pay for it again."""
+
+    @abc.abstractmethod
+    async def cached_page_indexes(
+        self,
+        *,
+        tenant_id: UUID,
+        document_id: UUID,
+        source_sha256: str,
+        readers: Sequence[str],
+    ) -> set[int]:
+        """The 0-based pages of the document's cached ``page_ocr`` readings
+        rendered from the bytes ``source_sha256`` and read as one of
+        ``readers`` records (B-238 —— the estimate's pages read before, e.g. by
+        a cancelled ingest: it renders no page, so it cannot match cache
+        keys). A reading that does not record them (cached before B-238) is
+        left out."""
 
     # -- maintenance (B-175 P3-PR2) -------------------------------------------
 
