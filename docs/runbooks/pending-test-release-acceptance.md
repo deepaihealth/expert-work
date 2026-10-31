@@ -1601,3 +1601,15 @@ PY
 - [x] **73.17 健康方案技能的长期默认(带出 B-245)**:绑 `health-plan-report` 的临时智能体,员工说「主色都用 #1F3A93,以后都这样」。**结果**:模型按平台记忆规矩写了 `/agent/preferences/report-style.md` 与索引一行,没有调用技能的 `resolve_style.py --merge-into /agent/report-style/personal.json`;渲染只读 `personal.json`,下次出报告时这个偏好要靠模型自己翻译。登记 B-245。 **10-31 复验 `82464fb78`(#1985)3 / 3 过**:三个新对外用户各说一次同一句话,三次都先 `skill_view` 打开技能,再跑 `resolve_style.py --merge-into /agent/report-style/personal.json --set color.primary=#1F3A93`,索引记的是 `personal.json` 这一路径,没有 `/agent/preferences/`。
 
 **上生产前**:① 先钉沙箱镜像、等生产池全部换新、回收所有在用沙箱,再发代码(见上「发布顺序」),发完 `grep -c 'lacks /agent'` 为 0;② 量生产各 agent 根的大小(只读);③ 通知深护智康:工作区文件 `path` 多 `threads/<session_id>/work/` 一段、新增 `session_id`,原样副本不列;会话文件列表只列本会话 `work/`;④ B-244 / B-245 修复(#1985)随同上线(测试 `82464fb78` 已复验)。
+
+## §75 取消后重新入库只估没识别的页 + 记下转备用识别的原因(B-238 / B-237)
+
+**背景**:B-238 —— 取消入库留下的识别缓存不会再收费,但估算只认上一次**完成**入库的逐页记录,显示的待识别页数偏高。现在每条扫描页缓存记下页号、文件内容指纹、读法指纹(模型 + 请求参数 + 渲染参数),估算只把三者都对得上的页算已识别。B-237 —— 主识别模型失败或回复不合格转备用时,原来查不到原因(回复不合格不记日志);现在每页打一行 `knowledge.recognition_fallback`,并计数 `expert_work_knowledge_recognition_fallback_total{reason}`。
+
+**怎么进**:测试环境控制台(system_admin,平台租户)建临时知识库 `kbb238`;扫描件用 §63 的脚本生成(每页一行不同的字,JPEG,`/tmp/b238-scan40.pdf`,40 页)。数据库查询走只读连接;日志 `kubectl -n expert-work logs <pod> -c control-plane`。**全节费用 < ¥0.1**。
+
+- [ ] **75.1 取消后重新入库的估算**:上传 `/tmp/b238-scan40.pdf` 并确认,`stage=recognizing` 时点「取消入库」;`SELECT count(*) FROM knowledge_parse_cache WHERE document_id='<id>' AND kind='page_ocr' AND result ? 'page'` 记为 N(新缓存都带页号)。点「重新摄取」。判据:待确认的悬浮分项「扫描页识别:40 页 …(其中 N 页上次已识别,不重复收费)」;确认后新增 glm-ocr + 备用识别用量行合计 = 40 − N。**没修好时**:估算按 40 页算钱。
+- [ ] **75.2 换了内容不算**:同名上传一份每页文字不同的 40 页扫描件。判据:估算的「已识别」为 0。**没修好时**:旧内容的缓存被当成已识别,估低。
+- [ ] **75.3 发布前的缓存不算**:找一份发布前取消过、留有缓存的文档(没有就跳过,单测覆盖),重新摄取。判据:那些缓存行(`result` 里没有 `page`)不计入「已识别」,估算偏高、不偏低。
+- [ ] **75.4 转备用有原因**:75.1 里若有页走了备用(`GET …/documents/<id>/pages` 的 `model` 不是 glm-ocr),日志里每页一行 `knowledge.recognition_fallback document=<id> reading=page_ocr index=<页> model=<备用> reasons=glm/glm-ocr: <原因>`,原因是 `vendor_unavailable_rate_limited` / `_timeout` / `_server_error` / `bad_output_<码>` 之类;control-plane `/metrics` 有对应 `reason` 的计数。没有页转备用:确认 `/metrics` 里这条计数没有出现(或为 0)、`recognition_call_failed` 行也没有,记「未触发」。**没修好时**:转备用查不到原因。
+- [ ] **75.5 收尾**:删 `kbb238`;`SELECT count(*) FROM knowledge_parse_cache WHERE document_id IN (<两份 id>)` = 0。

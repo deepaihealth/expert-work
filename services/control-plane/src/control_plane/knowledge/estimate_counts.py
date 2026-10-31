@@ -7,7 +7,9 @@
   the same embedding model; plus the blocks topic detection would embed;
 * **pages** —— a PDF's pages decided for recognition, up to the per-document
   limit, less the ones read before (the bytes unchanged, the page on record as
-  recognized: its reading is in the document's cache);
+  recognized: its reading is in the document's cache; or, B-238, a reading
+  of the page by a model in use, from these very bytes, is in the cache — a
+  cancelled ingest leaves no page records);
 * **figures** —— the document's figures that pass the tenant-wide filter and
   the per-document cap, less the ones described before (bytes unchanged).
 
@@ -18,7 +20,7 @@ is spent (``TEXT_TOO_LARGE`` / ``TOO_MANY_CHUNKS``).
 from __future__ import annotations
 
 import hashlib
-from collections.abc import Sequence
+from collections.abc import Collection, Sequence
 from dataclasses import dataclass
 from uuid import UUID
 
@@ -167,9 +169,11 @@ def count_pages(
     max_pages: int,
     previous: Sequence[DocumentPage],
     bytes_unchanged: bool,
+    cached: Collection[int],
 ) -> PageCount:
     """:class:`PageCount` of a PDF (``previous``: the page records of its last
-    ingest)."""
+    ingest; ``cached``: the 0-based pages whose reading from these bytes by a
+    model in use is in the document's cache)."""
     scanned = [page.index for page in analysis.ocr_pages]
     within = scanned[:max_pages]
     read_before = (
@@ -177,7 +181,8 @@ def count_pages(
         if bytes_unchanged
         else set()
     )
-    reused = sum(1 for index in within if index + 1 in read_before)
+    # B-238 —— 取消过的入库没有逐页记录,但已读的页在缓存里、再入库不再计费。
+    reused = sum(1 for index in within if index + 1 in read_before or index in cached)
     return PageCount(
         scanned=len(scanned), within=len(within), over=len(scanned) - len(within), reused=reused
     )

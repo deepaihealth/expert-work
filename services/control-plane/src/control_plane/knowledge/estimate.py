@@ -11,6 +11,7 @@ descriptions. Nothing here calls a model or names a vendor.
 
 from __future__ import annotations
 
+import asyncio
 import math
 from dataclasses import dataclass
 from datetime import datetime
@@ -34,6 +35,7 @@ from control_plane.knowledge.recognition.ingest_parse import LocalParse
 from control_plane.knowledge.recognition.recognizer import (
     DocumentRecognizer,
     RecognitionSettingsSource,
+    source_digest,
 )
 from expert_work.persistence import KnowledgeStore
 from expert_work.persistence.knowledge.base import ClaimedIngestion
@@ -101,6 +103,8 @@ class _Recognition:
     fallback: str | None
     max_pages: int
     configured: bool
+    #: B-238 —— how the usable models read the pages (:meth:`RecognitionPlan.page_readers`).
+    readers: tuple[str, ...] = ()
 
 
 @dataclass
@@ -263,11 +267,24 @@ class IngestEstimator:
             if bytes_unchanged
             else None
         )
+        # B-238 —— 取消后再入库:已读页的识别在文档缓存里(主 / 兜底模型的都算),
+        # 只认记了页码、来源正是这份字节、读法与这次入库相同的识别。
+        cached = (
+            await self._store.cached_page_indexes(
+                tenant_id=claim.tenant_id,
+                document_id=claim.document_id,
+                source_sha256=await asyncio.to_thread(source_digest, claim.content),
+                readers=recognition.readers,
+            )
+            if recognition.readers and claim.content is not None
+            else set()
+        )
         return count_pages(
             local.analysis,
             max_pages=recognition.max_pages,
             previous=previous or [],
             bytes_unchanged=bytes_unchanged,
+            cached=cached,
         )
 
     async def _recognition(self, claim: ClaimedIngestion) -> _Recognition:
@@ -280,6 +297,7 @@ class IngestEstimator:
             fallback=usable[1] if len(usable) > 1 else None,
             max_pages=plan.max_pages,
             configured=bool(plan.engines),
+            readers=plan.page_readers(),
         )
 
     async def _figures_of(

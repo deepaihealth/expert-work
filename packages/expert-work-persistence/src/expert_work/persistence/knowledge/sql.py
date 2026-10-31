@@ -48,6 +48,9 @@ from sqlalchemy.sql.selectable import CTE
 from expert_work.persistence.embedding import EMBEDDING_DIM
 from expert_work.persistence.knowledge.base import (
     ALL_TENANTS_BASES_LIMIT,
+    PAGE_OCR_PAGE,
+    PAGE_OCR_READER,
+    PAGE_OCR_SOURCE,
     UNSET,
     CancelOutcome,
     ClaimedIngestion,
@@ -59,6 +62,7 @@ from expert_work.persistence.knowledge.base import (
     ParseCacheKind,
     RowSecurityActiveError,
     _Unset,
+    is_page_index,
 )
 from expert_work.persistence.knowledge.estimates import (
     WAITING_STATUSES,
@@ -2458,6 +2462,31 @@ class SqlKnowledgeStore(SqlEstimates, KnowledgeStore):
                 )
             )
             await session.commit()
+
+    async def cached_page_indexes(
+        self,
+        *,
+        tenant_id: UUID,
+        document_id: UUID,
+        source_sha256: str,
+        readers: Sequence[str],
+    ) -> set[int]:
+        if not readers:
+            return set()
+        result = KnowledgeParseCacheRow.result
+        async with self._sf() as session:
+            pages = (
+                await session.execute(
+                    select(result[PAGE_OCR_PAGE]).where(
+                        KnowledgeParseCacheRow.tenant_id == tenant_id,
+                        KnowledgeParseCacheRow.document_id == document_id,
+                        KnowledgeParseCacheRow.kind == "page_ocr",
+                        result[PAGE_OCR_SOURCE].astext == source_sha256,
+                        result[PAGE_OCR_READER].astext.in_(list(readers)),
+                    )
+                )
+            ).scalars()
+            return {page for page in pages if is_page_index(page)}
 
     # -- maintenance (B-175 P3-PR2) -------------------------------------------
 
