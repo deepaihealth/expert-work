@@ -1679,3 +1679,93 @@ WHERE l.locktype = 'advisory' AND l.classid = 1 AND l.objsubid = 2;
 - [ ] **80.3 60 秒改快速看**:看图模型思考档位设为「高」,对一张复杂页(如 §74 用过的整页渲染图)用 deep 连看几次,直到有一次超过 60 秒。判据:那次工具结果开头注明「timed out after 60 seconds」、`meta.deep_timed_out = true`、拿到快速看的回答;工具耗时约 60 秒 + 快速看的时间,不是 120 秒。**没修好时**:等满 120 秒。没碰上超时:记「未触发」,单测覆盖。
 - [ ] **80.4 主模型不受影响**:同一 run 主模型请求参数与改前一致(没有新增档位)。
 - [ ] **80.5 收尾**:删 `acc-b257`。
+
+## §82 智能体缓存不存失效的构建(B-260)
+
+**背景**:`AgentRuntime.get_agent` 把构建好的智能体缓存 30 分钟,之前没有代次保护:一次构建先拿到 MCP 池子(平台 / 租户 / 用户 OAuth)的客户端,构建还没结束时来了一次失效(改 MCP 服务器、平台目录、OAuth 连接 / 断开、平台配置等触发的 `invalidate_all` / `invalidate_tenant` / `invalidate_user`),池子把这些客户端关掉、缓存被清空,构建结束后又把拿着已关闭客户端的智能体写回缓存 → 之后 30 分钟这个智能体每次 run 都报 `StreamableHttpMCPClient … not started`(10-30 生产故障的同款症状)。改成与三个池子同一套闸:三级失效代次(全局 / 租户 / 租户下的用户)各自 +1,在定键之前记下、入缓存前比对(定键期间就变了——多是取用户池时 OAuth 刷新令牌——只重新定键,不白构建);变了就丢弃这次构建重来,最多 3 次,第 3 次仍撞上失效就交出这次构建但不入缓存(下一次调用重建)。不按智能体单独失效(运行时没有这个入口)。委派用的子智能体构建缓存(`make_child_agent_builder`)有同一个竞态,用同一套闸(各持一份代次,由运行时 `invalidate_*` 的挂钩 +1);**防串用户**:缓存键里有没有用户,取决于定键时这个用户有没有授权连接;没有就是全租户共享的键。子代构建只挂定键时那份用户池;主智能体构建自己取池,构建后再取一次、必须仍是定键时那个池对象才入缓存 —— 否则「定键时没连、构建中刚连上」的构建会带着这个用户的授权工具落在共享键下,同租户其他人 30 分钟内都会拿到(独立审查带出,已加回归测试)。
+
+**怎么进**:不建智能体、不跑模型。失效窗口只有构建的那几秒,真栈很难稳定撞上,所以用 pod 内离线探针:脚本在 control-plane pod 里用发布后的 `AgentRuntime`(82.4 再加上 `make_child_agent_builder`)和一个假的构建函数(不连 MCP、不读写库;子代的规格放在进程内存里),在第 N 次构建进行中触发失效,看返回的是哪一次构建、缓存里是什么、下一次 get 是否重建。**花费**:0。
+
+```bash
+kubectl exec deploy/control-plane -- python -c '
+import asyncio, uuid
+from control_plane.runtime import AgentRuntime
+from expert_work.protocol import AgentSpec
+from expert_work.runtime.runs import RunManager
+from expert_work.runtime.stream_bridge import InMemoryStreamBridge
+SPEC = AgentSpec.model_validate({"apiVersion": "expert_work.io/v1", "kind": "Agent", "metadata": {"name": "acc-b260", "version": "1", "tenant": "t"}, "spec": {"tenant_config": {}, "model": {"provider": "glm", "name": "glm-5.3"}, "system_prompt": {"template": "x"}, "sandbox": {"resources": {"cpu": "1.0", "memory": "1Gi"}, "network": {"egress": "none", "allowlist": []}, "filesystem": {"readonly_root": True, "writable": []}}}})
+T, OTHER = uuid.uuid4(), uuid.uuid4()
+async def case(label, fire_on):
+    calls = []
+    rt = None
+    async def builder(spec, *, tenant_id=None, user_id=None):
+        calls.append(1)
+        n = len(calls)
+        await asyncio.sleep(0)
+        fire = fire_on(n)
+        if fire: fire(rt)
+        return n
+    rt = AgentRuntime(run_manager=RunManager(store=None), stream_bridge=InMemoryStreamBridge(), agent_builder=builder)
+    got = await rt.get_agent(tenant_id=T, name="acc-b260", version="1", spec=SPEC, user_id="u1")
+    cached = [b for b, _ in rt._cache.values()]
+    nxt = await rt.get_agent(tenant_id=T, name="acc-b260", version="1", spec=SPEC, user_id="u1")
+    print(label, "got", got, "cached", cached, "next", nxt, "builds", len(calls))
+async def main():
+    await case("all", lambda n: (lambda rt: rt.invalidate_all()) if n == 1 else None)
+    await case("tenant", lambda n: (lambda rt: rt.invalidate_tenant(T)) if n == 1 else None)
+    await case("user", lambda n: (lambda rt: rt.invalidate_user(T, "u1")) if n == 1 else None)
+    await case("other", lambda n: (lambda rt: (rt.invalidate_tenant(OTHER), rt.invalidate_user(T, "u2"))) if n == 1 else None)
+    await case("storm", lambda n: (lambda rt: rt.invalidate_tenant(T)) if n <= 3 else None)
+asyncio.run(main())
+'
+```
+
+- [ ] **82.1 构建中失效的那次不入缓存**:看输出的 `all` / `tenant` / `user` 三行。判据:三行都是 `got 2 cached [2] next 2 builds 2` —— 撞上失效的第 1 次构建既没交出去也没进缓存,重建的第 2 次进了缓存,下一次 get 直接命中、不再构建。**没修好时**:三行都是 `got 1 cached [1] next 1 builds 1`(失效之前的构建被写回缓存并一直被用)。
+- [ ] **82.2 不相干的失效不丢弃**:看 `other` 行(构建中失效的是另一个租户、同租户另一个用户)。判据:`got 1 cached [1] next 1 builds 1`。
+- [ ] **82.3 重试有上限**:看 `storm` 行(前 3 次构建每次都撞上失效)。判据:`got 3 cached [] next 4 builds 4` —— 只构建 3 次,交出第 3 次但不入缓存,下一次 get 重建(第 4 次)。**没修好时**:`got 1 cached [1] next 1 builds 1`。
+- [ ] **82.4 子智能体缓存同样不存失效的构建**:执行下面的命令。脚本把 `control_plane.subagent_runtime.build_agent` 换成假的(只在这个 python 进程里),子代构建器像线上一样把失效挂钩注册到 `AgentRuntime`,失效从运行时的 `invalidate_*` 发出。判据:`child all` / `child tenant` / `child user` 三行都是 `got 2 next 2 builds 2`;`child other` 是 `got 1 next 1 builds 1`;`child storm` 是 `got 3 next 4 builds 4`。**没修好时**:五行全是 `got 1 next 1 builds 1`(10-31 本地用改前代码跑过)。
+
+```bash
+kubectl exec deploy/control-plane -- python -c '
+import asyncio, uuid
+import control_plane.subagent_runtime as sm
+from control_plane.runtime import AgentRuntime
+from expert_work.persistence.agent_spec import InMemoryAgentSpecStore
+from expert_work.protocol import AgentSpec
+from expert_work.runtime.runs import RunManager
+from expert_work.runtime.stream_bridge import InMemoryStreamBridge
+from expert_work.testing import InMemorySecretStore
+from langgraph.checkpoint.memory import InMemorySaver
+from orchestrator import BuiltAgent, ToolEnv
+SPEC = AgentSpec.model_validate({"apiVersion": "expert_work.io/v1", "kind": "Agent", "metadata": {"name": "acc-b260-child", "version": "1", "tenant": "t"}, "spec": {"tenant_config": {}, "model": {"provider": "glm", "name": "glm-5.3"}, "system_prompt": {"template": "x"}, "sandbox": {"resources": {"cpu": "1.0", "memory": "1Gi"}, "network": {"egress": "none", "allowlist": []}, "filesystem": {"readonly_root": True, "writable": []}}}})
+T, OTHER = uuid.uuid4(), uuid.uuid4()
+async def case(label, fire_on):
+    calls, holder = [], {}
+    async def fake_build_agent(spec, **kw):
+        calls.append(1)
+        n = len(calls)
+        await asyncio.sleep(0)
+        fire = fire_on(n)
+        if fire: fire(holder["rt"])
+        return BuiltAgent(graph=object(), system_prompt=str(n), max_steps=1)
+    sm.build_agent = fake_build_agent
+    async def unused(spec, **kw): raise AssertionError
+    rt = holder["rt"] = AgentRuntime(run_manager=RunManager(store=None), stream_bridge=InMemoryStreamBridge(), agent_builder=unused)
+    store = InMemoryAgentSpecStore()
+    await store.create(tenant_id=T, spec=SPEC, spec_sha256="a" * 64, created_by="acc-b260")
+    child = sm.make_child_agent_builder(spec_store=store, secret_store=InMemorySecretStore(), checkpointer=InMemorySaver(), base_tool_env=ToolEnv(), register_invalidation=rt.register_invalidation_hook, register_invalidation_all=rt.register_invalidation_all, register_user_invalidation=rt.register_user_invalidation_hook)
+    get = lambda: child(tenant_id=T, name="acc-b260-child", version="1", depth=1, oauth_user_id="u1")
+    got = (await get()).system_prompt
+    nxt = (await get()).system_prompt
+    print("child", label, "got", got, "next", nxt, "builds", len(calls))
+async def main():
+    await case("all", lambda n: (lambda rt: rt.invalidate_all()) if n == 1 else None)
+    await case("tenant", lambda n: (lambda rt: rt.invalidate_tenant(T)) if n == 1 else None)
+    await case("user", lambda n: (lambda rt: rt.invalidate_user(T, "u1")) if n == 1 else None)
+    await case("other", lambda n: (lambda rt: (rt.invalidate_tenant(OTHER), rt.invalidate_user(T, "u2"))) if n == 1 else None)
+    await case("storm", lambda n: (lambda rt: rt.invalidate_tenant(T)) if n <= 3 else None)
+asyncio.run(main())
+'
+```
+
+- [ ] **82.5 真栈没有新的报错(只读)**:发布后 24 小时,`kubectl logs deploy/control-plane --since=24h | grep -c 'not started'` 与发布前同时长对比不增加;`grep -c 'reason=invalidated_mid_build'`(主智能体与子智能体两种日志都含这一段)有数就说明真栈撞上过这个竞态并被拦下(0 也正常,窗口很窄)。
