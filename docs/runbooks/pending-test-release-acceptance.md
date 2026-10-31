@@ -1625,3 +1625,22 @@ PY
 - [ ] **75.3 发布前的缓存不算**:找一份发布前取消过、留有缓存的文档(没有就跳过,单测覆盖),重新摄取。判据:那些缓存行(`result` 里没有 `page`)不计入「已识别」,估算偏高、不偏低。
 - [ ] **75.4 转备用有原因**:75.1 里若有页走了备用(`GET …/documents/<id>/pages` 的 `model` 不是 glm-ocr),日志里每页一行 `knowledge.recognition_fallback document=<id> reading=page_ocr index=<页> model=<备用> reasons=glm/glm-ocr: <原因>`,原因是 `vendor_unavailable_rate_limited` / `_timeout` / `_server_error` / `bad_output_<码>` 之类;control-plane `/metrics` 有对应 `reason` 的计数。没有页转备用:确认 `/metrics` 里这条计数没有出现(或为 0)、`recognition_call_failed` 行也没有,记「未触发」。**没修好时**:转备用查不到原因。
 - [ ] **75.5 收尾**:删 `kbb238`;`SELECT count(*) FROM knowledge_parse_cache WHERE document_id IN (<两份 id>)` = 0。
+
+## §77 exec_python 也拿工作区写锁(B-249)
+
+**背景**:工作区写锁是 Postgres advisory lock(classid 1),新布局对话的键是 `{tenant}:{user}:conv:{对话}`,老布局(`thread_meta.workspace_layout = 'agent_root'`)是 `{tenant}:{user}`(B-236 #1976、#1983)。`bash` / `write_file` / `edit_file` 写之前都拿这把锁,`exec_python` 不拿 —— 它同样能写工作区里任何文件,同一对话里并行的写会交错。修复后 `exec_python` **只在新布局**照 `bash` 的规矩拿锁:每次调用都拿(代码写不写文件事先看不出来)、键按对话(委派出的子代按父对话)、不拿 agent 键、报错 / 取消都释放。**老布局 / 没绑 agent 时不拿(维持原样)**:那里的键按用户,拿了就把一个用户的每次 `exec_python` 排成一队 —— 10-30 生产一个对接用户 15 个并发 run 排在按用户的锁上、写等 3~6 分钟,就是这个形状;生产目前全是老布局(B-236 未上生产,老对话永远是 `agent_root`),所以这条规矩与发布顺序无关、不会把生产拖回那个样子。**锁住的时长**:沙箱取用 + 写 + exec(exec 最长 300 秒),锁事务的 `idle_in_transaction_session_timeout` / `statement_timeout` 是 360 秒,余量约 60 秒;**已知**:没有镜像缓存的冷启动 + 跑满 300 秒的 exec 可能超过 360 秒,事务被掐、锁提前释放 —— `bash` 一直如此,不是本修复带来的。本节 77.1、77.2、77.4 只对新布局对话成立;77.3 确认老布局维持原样。
+
+**怎么进**:测试环境控制台(system_admin,平台租户)沿用 §73 的临时智能体 `acc-b236`(带 `bash` / `exec_python`),没有就照 §73 建;77.1、77.2、77.4 用发布后新开的会话(新布局)。命令都让智能体「只调用一次 exec_python / bash,代码逐字为 …」,时间取工具返回里的原始 stdout,不取模型转述。数据库查询走只读连接,锁用下面这句看(两参数形式的 advisory lock,`objid` 是键的 `hashtext`):
+
+```sql
+SELECT l.pid, l.granted, l.objid, a.query_start
+FROM pg_locks l JOIN pg_stat_activity a USING (pid)
+WHERE l.locktype = 'advisory' AND l.classid = 1 AND l.objsubid = 2;
+```
+
+键对应的 `objid` 用 `SELECT (hashtext('<tenant>:<user>:conv:<对话>')::bigint & 4294967295)::oid` 算。**花费**:约 6 次短 run(77.1 带两个子任务),不到 ¥1。
+
+- [ ] **77.1 同一对话:exec_python 与 bash 不交错**:一个 run 内部碰不到这种并发 —— 调度器本来就让 `bash`(不可撤销)与 `exec_python`(没声明路径的写)不会同时执行,同一对话的两个 run 也按会话串行(B-139)。会并发写同一个 `/workspace` 的是**同一步里并行的两个子任务**(`spawn_worker` 允许并行,子任务写父对话的目录、拿父对话的键)。让智能体在同一步并行派两个子任务:子任务 A「只调用一次 exec_python,代码逐字为 `import time,datetime;open('same.txt','w').write('PY');print('py-start',datetime.datetime.now().isoformat());time.sleep(30);print('py-end',datetime.datetime.now().isoformat(),open('same.txt').read())`」,子任务 B「只调用一次 bash,命令逐字为 `sleep 5; date -Iseconds; echo SH > same.txt; cat same.txt`」。两个子任务都开始后 10 秒内查上面的 SQL。判据(与谁先拿到锁无关):B 打印的时间不落在 A 的 `[py-start, py-end]` 之间(B 先跑完 A 才开始,或 A 跑完 B 才开始);A 的 `py-end` 读回 `PY`;如果查到时两边都在跑,同一个 `objid`(父对话键的 hash)上一行 `granted = t`、一行 `granted = f`。**没修好时**:B 的时间落在 A 的 `[py-start, py-end]` 之间,A 读回 `SH`;`pg_locks` 里只有 bash 的那一把。
+- [ ] **77.2 另一段对话不受影响**:77.1 的子任务 A 正在 `sleep` 时,同一用户另开一段新会话跑 `bash`:`date -Iseconds; echo OTHER > same.txt`。判据:立刻返回(时间早于 77.1 的 `py-end`);`pg_locks` 同时有两把不同 `objid`、都 `granted = t`;77.1 的 `same.txt` 仍是 `PY`。**没修好时**:不会因本修复变坏 —— 这条防的是「锁错成按用户」把同一用户的对话又串成一队(B-236 之前 10-30 生产的样子)。
+- [ ] **77.3 老布局维持原样:exec_python 不拿锁、不挡同一用户的别的对话**:照 §73.3 的办法(经用户批准改测试库一行)把两段新会话标成 `agent_root`。会话 1 直接调 77.1 子任务 A 的 `exec_python`;它 `sleep` 时会话 2 跑 `bash`:`date -Iseconds; echo SH2 > other.txt`。判据:会话 2 立刻返回(时间早于会话 1 的 `py-end`);会话 1 跑着、会话 2 还没开始时,`pg_locks` 里没有 `objid = hashtext('{tenant}:{user}')` 的行(exec_python 不持锁);会话 2 跑时这个键只出现它自己的一行。**没修好时**(锁错拿到老布局):会话 2 等到会话 1 的 `py-end` 之后才开始,`pg_locks` 在会话 1 跑着时就有按用户的那一把 —— 一个用户的 exec_python 全排成一队。
+- [ ] **77.4 报错 / 取消后立刻释放(只验释放)**:新会话跑 `exec_python`:`import time;time.sleep(60)`,先查到本对话键 `granted = t`,10 秒后在控制台点「停止」;接着跑 `bash`:`date -Iseconds`。另跑一次 `exec_python`:`import time;time.sleep(10);raise SystemExit(3)`,接着跑 `bash`。判据:停止后 1 秒内 `pg_locks` 里本对话键的行消失;两次 bash 都立刻开始;control-plane 日志没有 `idle_in_transaction` 超时。**没修好时**:这一步只验「持锁之后会释放」,不验是否拿锁(那是 77.1);释放坏了的样子是锁一直挂到 360 秒的事务超时、后面的写全部排队。

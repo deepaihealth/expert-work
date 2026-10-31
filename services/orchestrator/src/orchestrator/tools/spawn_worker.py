@@ -242,8 +242,10 @@ class SpawnWorkerTool:
             # Sibling workers each run on their own thread / checkpoint, so the
             # scheduler may run them concurrently (bounded by the budget). They
             # DO share the sandbox session and workspace — sessions are per
-            # (tenant, user) — and bash / write_file / edit_file serialize on
-            # the user-level workspace lock, so concurrent writes don't interleave.
+            # (tenant, user) — and bash / write_file / edit_file serialize on the
+            # workspace lock (per conversation on the new layout, per user on the
+            # old one; exec_python only on the new layout, B-249), so concurrent
+            # writes don't interleave.
             is_parallel_safe=True,
         )
 

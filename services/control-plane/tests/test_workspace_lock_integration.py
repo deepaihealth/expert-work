@@ -14,6 +14,7 @@ No schema is needed — ``pg_advisory_xact_lock`` is a built-in.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from pathlib import Path
@@ -23,9 +24,11 @@ from uuid import UUID, uuid4
 import pytest
 from alembic import command
 from alembic.config import Config
+from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncEngine
 from testcontainers.postgres import PostgresContainer
 
+from control_plane.advisory_locks import WORKSPACE_LOCK_CLASSID
 from control_plane.workspace_lock import PgConversationSeedLock, PgWorkspaceLock
 from expert_work.persistence import SqlUserWorkspaceStore
 from expert_work.persistence.database import (
@@ -33,7 +36,15 @@ from expert_work.persistence.database import (
     create_async_engine_from_config,
     create_async_session_factory,
 )
-from orchestrator.tools import EditFileTool, SandboxOutcome, ToolContext, WriteFileTool
+from orchestrator.tools import (
+    BashTool,
+    EditFileTool,
+    ExecPythonTool,
+    SandboxOutcome,
+    SandboxSupervisorError,
+    ToolContext,
+    WriteFileTool,
+)
 
 pytestmark = pytest.mark.integration
 
@@ -447,3 +458,200 @@ async def test_own_workspace_write_is_not_blocked_by_an_agent_file_write(
         ),
     )
     assert order[:2] in (["A-enter", "B-enter"], ["B-enter", "A-enter"])
+
+
+# ---------------------------------------------------------------------------
+# B-249 — exec_python takes the same write lock as bash, end to end through the
+# real tools on a real Postgres: same conversation → exec_python and bash
+# serialise; another new-layout conversation → side by side; old layout → no lock
+# at all for exec_python (status quo); error / cancel → released at once.
+# ---------------------------------------------------------------------------
+
+
+def _old_layout_conversation(tenant: UUID, user: UUID) -> ToolContext:
+    return ToolContext(
+        tenant_id=tenant,
+        user_id=user,
+        run_id=uuid4(),
+        thread_id=uuid4(),
+        agent_key="report-agent",
+        workspace_layout="agent_root",
+    )
+
+
+def _another_run_of(ctx: ToolContext) -> ToolContext:
+    # 同一个对话的另一次执行(另一个 run,同一个 thread):写的是同一个 /workspace。
+    return ToolContext(
+        tenant_id=ctx.tenant_id,
+        user_id=ctx.user_id,
+        run_id=uuid4(),
+        thread_id=ctx.thread_id,
+        agent_key=ctx.agent_key,
+        workspace_layout=ctx.workspace_layout,
+    )
+
+
+async def _exec_python(lock: PgWorkspaceLock, ctx: ToolContext, client: Any) -> None:
+    await ExecPythonTool(client=client, workspace_lock=lock).call(
+        {"code": "open('same.txt', 'w').write('py')"}, ctx=ctx
+    )
+
+
+async def _bash(lock: PgWorkspaceLock, ctx: ToolContext, client: Any) -> None:
+    await BashTool(client=client, workspace_lock=lock).call(
+        {"command": "echo sh > same.txt"}, ctx=ctx
+    )
+
+
+async def _bash_after(started: asyncio.Event, *args: Any) -> None:
+    # 让 exec_python 先拿到锁,bash 再来 —— 顺序固定,判据才不靠运气。
+    await started.wait()
+    await _bash(*args)
+
+
+@dataclass
+class _HeldExecClient:
+    """exec_python 的沙箱:进 exec 后 ``entered`` 置位,等 ``finish`` 才返回(或抛 ``error``)。"""
+
+    order: list[str]
+    entered: asyncio.Event
+    finish: asyncio.Event
+    error: BaseException | None = None
+
+    async def acquire(self, **_: Any) -> UUID:
+        return uuid4()
+
+    async def exec(self, **_: Any) -> SandboxOutcome:
+        self.order.append("py-enter")
+        self.entered.set()
+        try:
+            await self.finish.wait()
+            if self.error is not None:
+                raise self.error
+        finally:
+            self.order.append("py-exit")
+        return SandboxOutcome(stdout="ok", stderr="", exit_code=0, timed_out=False)
+
+    async def release(self, *, sandbox_id: UUID) -> None:
+        return None
+
+    async def destroy(self, *, sandbox_id: UUID, reason: str) -> None:
+        return None
+
+    async def reap(self, *, force: bool) -> int:
+        return 0
+
+
+async def _granted_workspace_keys(engine: AsyncEngine, keys: list[str]) -> dict[str, int]:
+    """``pg_locks`` 里 classid 1 上每个键被持有(granted)的个数。两参数形式:objid 是第二参数。"""
+    async with engine.connect() as conn:
+        rows = await conn.execute(
+            text(
+                "SELECT k, count(l.*) FROM unnest(CAST(:keys AS text[])) AS k "
+                "LEFT JOIN pg_locks l ON l.locktype = 'advisory' AND l.granted "
+                "AND l.classid = :classid AND l.objsubid = 2 "
+                "AND l.objid = (hashtext(k)::bigint & 4294967295)::oid "
+                "GROUP BY k"
+            ),
+            {"keys": keys, "classid": WORKSPACE_LOCK_CLASSID},
+        )
+        return {str(k): int(n) for k, n in rows.all()}
+
+
+async def test_exec_python_and_bash_in_one_conversation_serialise(engine: AsyncEngine) -> None:
+    lock = PgWorkspaceLock(create_async_session_factory(engine))
+    tenant, user = uuid4(), uuid4()
+    conv = _conversation(tenant, user)
+    order: list[str] = []
+    entered, finish = asyncio.Event(), asyncio.Event()
+    py = asyncio.create_task(_exec_python(lock, conv, _HeldExecClient(order, entered, finish)))
+    sh = asyncio.create_task(
+        _bash_after(entered, lock, _another_run_of(conv), _SlowExecClient("sh", order))
+    )
+    key = f"{tenant}:{user}:conv:{conv.thread_id}"
+    try:
+        await entered.wait()
+        await asyncio.sleep(_HOLD_S)  # bash 有足够时间去抢 —— 修好时它在等锁
+        assert await _granted_workspace_keys(engine, [key]) == {key: 1}
+        assert order == ["py-enter"]
+    finally:
+        finish.set()  # 判据红了也放行 exec,别让挂着的任务把整轮测试卡住
+        await asyncio.gather(py, sh)
+    assert order == ["py-enter", "py-exit", "sh-enter", "sh-exit"]
+
+
+async def test_exec_python_does_not_block_another_conversation(engine: AsyncEngine) -> None:
+    lock = PgWorkspaceLock(create_async_session_factory(engine))
+    tenant, user = uuid4(), uuid4()
+    order: list[str] = []
+    entered, finish = asyncio.Event(), asyncio.Event()
+    py = asyncio.create_task(
+        _exec_python(lock, _conversation(tenant, user), _HeldExecClient(order, entered, finish))
+    )
+    try:
+        await entered.wait()
+        async with asyncio.timeout(_HOLD_S * 5):
+            await _bash(lock, _conversation(tenant, user), _SlowExecClient("sh", order))
+        assert order == ["py-enter", "sh-enter", "sh-exit"]
+    finally:
+        finish.set()
+        await py
+
+
+async def test_exec_python_old_layout_takes_no_lock(engine: AsyncEngine) -> None:
+    # 老布局的键按用户:exec_python 在那里不拿锁(维持原样),否则一个用户的每次 exec_python
+    # 都排成一队(10-30 生产的形状)。另一段老布局对话的 bash 照常进来、键 {tenant}:{user}
+    # 只被 bash 持有过。
+    lock = PgWorkspaceLock(create_async_session_factory(engine))
+    tenant, user = uuid4(), uuid4()
+    order: list[str] = []
+    entered, finish = asyncio.Event(), asyncio.Event()
+    py = asyncio.create_task(
+        _exec_python(
+            lock, _old_layout_conversation(tenant, user), _HeldExecClient(order, entered, finish)
+        )
+    )
+    key = f"{tenant}:{user}"
+    try:
+        await entered.wait()
+        assert await _granted_workspace_keys(engine, [key]) == {key: 0}
+        async with asyncio.timeout(_HOLD_S * 5):
+            await _bash(lock, _old_layout_conversation(tenant, user), _SlowExecClient("sh", order))
+        assert order == ["py-enter", "sh-enter", "sh-exit"]
+    finally:
+        finish.set()
+        await py
+
+
+@pytest.mark.parametrize("outcome", ["error", "cancel"])
+async def test_exec_python_releases_the_lock_on_error_and_cancel(
+    engine: AsyncEngine, outcome: str
+) -> None:
+    lock = PgWorkspaceLock(create_async_session_factory(engine))
+    tenant, user = uuid4(), uuid4()
+    conv = _conversation(tenant, user)
+    order: list[str] = []
+    entered, finish = asyncio.Event(), asyncio.Event()
+    client = _HeldExecClient(order, entered, finish, error=SandboxSupervisorError("boom"))
+    py = asyncio.create_task(_exec_python(lock, conv, client))
+    key = f"{tenant}:{user}:conv:{conv.thread_id}"
+    await entered.wait()
+    try:
+        assert await _granted_workspace_keys(engine, [key]) == {key: 1}  # 确实持着,才谈得上释放
+    except AssertionError:
+        py.cancel()  # 判据红了也收掉挂着的 exec,别把整轮测试卡住
+        with contextlib.suppress(asyncio.CancelledError):
+            await py
+        raise
+    if outcome == "cancel":
+        py.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await py
+    else:
+        finish.set()
+        with pytest.raises(SandboxSupervisorError):
+            await py
+    assert await _granted_workspace_keys(engine, [key]) == {key: 0}
+    async with asyncio.timeout(_HOLD_S * 5):
+        await _bash(lock, _another_run_of(conv), _SlowExecClient("sh", order))
+    assert order == ["py-enter", "py-exit", "sh-enter", "sh-exit"]
