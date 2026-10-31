@@ -28,6 +28,7 @@ vi.mock("../../tenant/TenantScopeContext", async (importOriginal) => {
     scopeRef,
   );
 });
+vi.mock("../../tenant/useIsTenantSwitched", () => ({ useIsTenantSwitched: () => false }));
 
 const USER_ID = "aaaaaaaa-0000-0000-0000-000000000001";
 
