@@ -510,3 +510,94 @@ async def test_upload_with_a_foreign_session_never_mints_a_ghost_user(ctx: _Ctx)
         "POST .../uploads minted a tenant_user row for a user_id that does not "
         "own the supplied session"
     )
+
+
+# ---------------------------------------------------------------------------
+# B-262 —— 同名上传不再覆盖(对外端点)
+# ---------------------------------------------------------------------------
+
+
+async def _upload_document(ctx: _Ctx, raw: bytes, *, user_id: str = "cust-77") -> dict[str, Any]:
+    """不带 ``session_id``:每次新建一条会话 —— 对接方一个用户下的不同终端客户。"""
+    resp = await ctx.client.post(
+        "/v1/agents/support-bot/uploads",
+        data={"user_id": user_id},
+        files={"file": ("report.pdf", raw, "application/pdf")},
+        headers=ctx.headers,
+    )
+    assert resp.status_code == 201, resp.text
+    data: dict[str, Any] = resp.json()["data"]
+    return data
+
+
+async def _upload_row(ctx: _Ctx, data: dict[str, Any]) -> Any:
+    upload_id = parse_upload_id(data["upload_id"])
+    assert upload_id is not None
+    row = await ctx.app.state.user_upload_store.get(upload_id=upload_id, tenant_id=ctx.tenant_id)
+    assert row is not None
+    return row
+
+
+@pytest.mark.asyncio
+async def test_same_name_uploads_from_two_sessions_are_both_kept(ctx: _Ctx) -> None:
+    """客户 A、B 各传一份 ``report.pdf``:两份都在,B 的换了名;登记行、下载、进 run 的
+    ``[file attached: …]`` 一律是实际落盘的名字。响应字段一个不变。"""
+    import hashlib
+
+    from control_plane.api.agents import ExternalFileRef, resolve_external_files
+    from control_plane.api.runs import _build_human_message
+
+    await ctx.seed_agent()
+    raw_a, raw_b = b"%PDF-1.4 customer A", b"%PDF-1.4 customer B"
+    first = await _upload_document(ctx, raw_a)
+    second = await _upload_document(ctx, raw_b)
+
+    assert set(first) == set(second) == {"upload_id", "session_id", "type", "mime", "size"}
+    assert first["upload_id"] != second["upload_id"]
+    rows = [await _upload_row(ctx, d) for d in (first, second)]
+    renamed = f"report-{hashlib.sha256(raw_b).hexdigest()[:8]}.pdf"
+    assert [(r.ref, r.filename) for r in rows] == [
+        ("uploads/report.pdf", "report.pdf"),
+        (f"uploads/{renamed}", renamed),
+    ]
+    key = agent_key_for_code("support-bot")
+    assert ctx.workspace_store.created_files == {
+        f"agents/{key}/uploads/report.pdf": raw_a,
+        f"agents/{key}/uploads/{renamed}": raw_b,
+    }
+
+    for data, raw, name in ((first, raw_a, "report.pdf"), (second, raw_b, renamed)):
+        resp = await ctx.client.get(
+            f"/v1/agents/support-bot/uploads/{data['upload_id']}",
+            params={"user_id": "cust-77"},
+            headers=ctx.headers,
+        )
+        assert resp.status_code == 200, resp.text
+        assert resp.content == raw
+        assert name in resp.headers["content-disposition"]
+
+    _images, document_names = await resolve_external_files(
+        files=[ExternalFileRef(upload_id=second["upload_id"])],
+        tenant_id=ctx.tenant_id,
+        end_user_id=rows[1].user_id,
+        thread_id=UUID(second["session_id"]),
+        uploads_store=ctx.app.state.user_upload_store,
+    )
+    assert document_names == [f"uploads/{renamed}"]
+    message = _build_human_message(
+        input_text="看一下", image_refs=[], supports_vision=False, document_names=document_names
+    )
+    assert f"[file attached: uploads/{renamed}]" in message.content
+
+
+@pytest.mark.asyncio
+async def test_same_bytes_from_two_sessions_share_one_file(ctx: _Ctx) -> None:
+    """同内容同名:两个 ``upl_`` id 指向同一个文件,只写一次。"""
+    await ctx.seed_agent()
+    first = await _upload_document(ctx, b"%PDF-1.4 same")
+    second = await _upload_document(ctx, b"%PDF-1.4 same")
+
+    rows = [await _upload_row(ctx, d) for d in (first, second)]
+    assert first["upload_id"] != second["upload_id"]
+    assert rows[0].ref == rows[1].ref == "uploads/report.pdf"
+    assert len(ctx.workspace_store.workspace_writes) == 1

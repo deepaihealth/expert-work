@@ -1660,3 +1660,21 @@ PY
 - [ ] **80.3 60 秒改快速看**:看图模型思考档位设为「高」,对一张复杂页(如 §74 用过的整页渲染图)用 deep 连看几次,直到有一次超过 60 秒。判据:那次工具结果开头注明「timed out after 60 seconds」、`meta.deep_timed_out = true`、拿到快速看的回答;工具耗时约 60 秒 + 快速看的时间,不是 120 秒。**没修好时**:等满 120 秒。没碰上超时:记「未触发」,单测覆盖。
 - [ ] **80.4 主模型不受影响**:同一 run 主模型请求参数与改前一致(没有新增档位)。
 - [ ] **80.5 收尾**:删 `acc-b257`。
+
+## §84 同名上传不再覆盖 + 看图不串对话(B-262 P0)
+
+**背景**:同一智能体的所有对话共用 `agents/<key>/uploads/` 与 `agents/<key>/.tool_results/`(对接方一个平台用户下跑很多终端客户)。① 同名上传原来直接覆盖:客户 B 的 `report.pdf` 顶掉客户 A 的,A 的 `upload_id` 下载到 B 的内容。改成:同名不同内容的落成 `report-<内容 sha256 前 8 位>.pdf`(先写同目录临时文件再 `link` 成目标名:原子,两个同时到也不覆盖,读不到写了一半的文件;同一挂载上 §73.8 的文件版本库用的是同一做法);文件名按 UTF-8 字节截,给换名后缀留余量;同名同内容复用已有文件(不再写、不重复记配额,审计 `details.reused_existing = true`);上传响应的 `path`、`user_upload` 行、审计、本轮消息里的 `[file attached: …]`、下载的文件名一律是实际落盘的名字。对外响应字段不变。② `ask_image(path, unit)` 原来扫智能体下**全部** run 的渲染页,渲染目录只认路径,所以对话 A 能拿到对话 B 在同名文档上渲的页。改成:只看本对话渲染过页的 run(取自本对话检查点里的 `viewed_figures`,委派的子代并上父的)与本 run。渲染页位置不变(P1 再搬)。
+
+**怎么进**:测试环境控制台(system_admin,平台租户)建临时智能体 `acc-b262`(glm-5.3,看图模型照平台默认,`egress: none`);对外接口用平台租户临时 API key,`user_id` 用 `u-b262`。合成文件(零租户内容):`/tmp/b262-a.pdf`、`/tmp/b262-b.pdf` 是两份内容不同的一页 PDF(各印一行 `CUSTOMER-A` / `CUSTOMER-B`),都按 `report.pdf` 上传。命令都让智能体「只调用一次 bash,command 逐字为 …」,结果取工具返回里的原始 stdout,不取模型转述。NAS 在 control-plane pod 的 `/mnt/workspaces`;数据库查询走只读连接。**花费**:约 10 次短 run,合计不到 ¥1。
+
+- [ ] **84.1 同名不同内容两份都在**:不带 `session_id` 各传一次(两段会话):`curl -F user_id=u-b262 -F "file=@/tmp/b262-a.pdf;type=application/pdf;filename=report.pdf" …/v1/agents/acc-b262/uploads`,再用 `b262-b.pdf` 传一次。判据:两个 `upload_id` 不同、响应字段仍是 `upload_id / session_id / type / mime / size`;下载第一个得到 A 的字节(`sha256sum` 对得上)、`Content-Disposition` 是 `report.pdf`;下载第二个得到 B 的字节、文件名 `report-<8 位>.pdf`(= `sha256sum b262-b.pdf` 前 8 位);NAS `ls agents/acc-b262/uploads/` 两个文件都在;审计两行 `document:upload` 的 `resource_id` 各是自己的名字。**没修好时**:两个 `upload_id` 下载到的都是 B。
+- [ ] **84.2 同名同内容复用**:再传一次 `b262-a.pdf`(新会话)。判据:新 `upload_id` 下载到 A 的字节、文件名 `report.pdf`;NAS 上没有多出文件,`report.pdf` 的 mtime 不变;审计这一行 `details.reused_existing = true`。**没修好时**:又写一份(mtime 变)或换了名。
+- [ ] **84.3 模型看到的是实际名字**:在 84.1 第二段会话里发起 run,`files` 带第二个 `upload_id`,让智能体逐字执行 `head -c 400 uploads/report-<8 位>.pdf | strings | grep CUSTOMER`。判据:这一轮的用户消息(对话条目 / Langfuse 输入)含 `[file attached: uploads/report-<8 位>.pdf]`;stdout 是 `CUSTOMER-B`。**没修好时**:消息里是 `uploads/report.pdf`,读到的是被覆盖后的那份。
+- [ ] **84.4 两个同名同时上传不覆盖**:再准备两份内容不同的一页 PDF(印 `CUSTOMER-C` / `CUSTOMER-D`),两条 `curl … filename=report.pdf` 用 `&` 同时发、`wait`。判据:两个响应都 201;两份各得一个带自己内容后缀的名字(`report.pdf` 已被 A 占着);各自下载到自己的内容;`report.pdf` 等已有文件的 mtime 不变;`ls -a agents/acc-b262/uploads/` 没有残留的 `.tmp-*`。**没修好时**:后到的一份覆盖先到的,或覆盖 `report.pdf`。
+- [ ] **84.5 控制台上传**:调试台两段会话各传一份内容不同的 `report.pdf`。判据:第二段消息里附的路径是 `uploads/report-<8 位>.pdf`;会话文件 / 下载拿到各自的内容。
+- [ ] **84.6 看图不用别的对话渲的页**:会话 B 上传 `b262-a.pdf`(复用 84.1 的 `uploads/report.pdf`,同一路径),让智能体 `read_page(path="uploads/report.pdf", units=[1])`;记下 NAS `.tool_results/<B 的 run>/figures/` 下新出现的目录。再开会话 C(从没渲染过),让它 `ask_image(path="uploads/report.pdf", unit=1, question="这页印的是什么")`。判据:C 这一轮自动补渲染(B-251)、`.tool_results/<C 的 run>/figures/` 出现新目录,工具 `meta.image_ref` 里的 run 段是 C 的 run,不是 B 的。**没修好时**:C 不渲染,直接用 B 那次 run 的页(ref 里是 B 的 run id)。
+- [ ] **84.7 本对话上一轮渲的页照用**:会话 C 下一轮再问同一页。判据:不再渲染(这一轮的 run 下没有 `figures/`),`meta.image_ref` 的 run 段是 C 上一轮的 run。
+- [ ] **84.8 委派的子代用父渲好的页**:会话 C 让 `spawn_worker` 的子任务对同一页调 `ask_image`。判据:子任务不渲染,`meta.image_ref` 的 run 段是 C 的某一轮;子任务对 B 渲过、C 没渲过的页(B 再渲第 2 页,子任务看第 2 页)要自己渲。
+- [ ] **84.9 收尾**:删 `acc-b262`;对外用户 `u-b262` 走 `POST /v1/users/<id>:purge`;`ls` 确认 `agents/acc-b262/` 已清。
+
+**上生产前**:通知深护智康 —— 更新记录「同名文档上传不再覆盖」(行为变化,提前通知):同一 `user_id` 再传同名不同内容的文档会换名保存,下载文件名与告知 Agent 的文件名带后缀;响应字段不变。

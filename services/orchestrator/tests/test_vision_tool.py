@@ -73,9 +73,15 @@ class _AnyRefResolver:
 
 
 def _ctx(
-    tenant_id: UUID | None = _TENANT, *, user_id: UUID | None = None, agent_key: str = ""
+    tenant_id: UUID | None = _TENANT,
+    *,
+    user_id: UUID | None = None,
+    agent_key: str = "",
+    figure_run_ids: frozenset[UUID] = frozenset(),
 ) -> ToolContext:
-    return ToolContext(tenant_id=tenant_id, user_id=user_id, agent_key=agent_key)
+    return ToolContext(
+        tenant_id=tenant_id, user_id=user_id, agent_key=agent_key, figure_run_ids=figure_run_ids
+    )
 
 
 @pytest.mark.asyncio
@@ -398,6 +404,8 @@ _AGENT = "pf-probe-33086dc0"
 _DOC = "uploads/report.pdf"
 _OLD_RUN = "ffffffff-ffff-4fff-bfff-ffffffffffff"
 _NEW_RUN = "00000000-0000-4000-8000-000000000000"
+#: B-262 —— 本对话渲染过页的 run。短形态只在这些 run(与本 run)的目录里找。
+_CONV_RUNS = frozenset({UUID(_OLD_RUN), UUID(_NEW_RUN)})
 
 
 def _figure_rel(
@@ -446,7 +454,7 @@ async def test_ask_image_short_form_resolves_the_rendered_page(tmp_path: Path) -
 
     result = await _short_form_tool(tmp_path, vl).call(
         {"path": _DOC, "unit": 10, "question": "图里是什么"},
-        ctx=_ctx(tenant_id=tenant, user_id=user, agent_key=_AGENT),
+        ctx=_ctx(tenant_id=tenant, user_id=user, agent_key=_AGENT, figure_run_ids=_CONV_RUNS),
     )
 
     expected = workspace_figure_ref(tenant, user, f"agents/{_AGENT}/{rel}")
@@ -474,7 +482,7 @@ async def test_ask_image_short_form_works_on_the_in_memory_store() -> None:
 
     await tool.call(
         {"path": _DOC, "unit": 10, "question": "?"},
-        ctx=_ctx(tenant_id=tenant, user_id=user, agent_key=_AGENT),
+        ctx=_ctx(tenant_id=tenant, user_id=user, agent_key=_AGENT, figure_run_ids=_CONV_RUNS),
     )
 
     assert _sent_ref(vl) == workspace_figure_ref(tenant, user, f"agents/{_AGENT}/{rel}")
@@ -494,7 +502,7 @@ async def test_ask_image_short_form_picks_the_newest_render(tmp_path: Path) -> N
 
     await _short_form_tool(tmp_path, vl).call(
         {"path": _DOC, "unit": 10, "question": "?"},
-        ctx=_ctx(tenant_id=tenant, user_id=user, agent_key=_AGENT),
+        ctx=_ctx(tenant_id=tenant, user_id=user, agent_key=_AGENT, figure_run_ids=_CONV_RUNS),
     )
 
     assert _sent_ref(vl) == workspace_figure_ref(tenant, user, f"agents/{_AGENT}/{new}")
@@ -513,7 +521,7 @@ async def test_ask_image_short_form_refuses_a_render_older_than_the_document(
     with pytest.raises(FileNotFoundError) as info:
         await _short_form_tool(tmp_path, vl).call(
             {"path": _DOC, "unit": 10, "question": "?"},
-            ctx=_ctx(tenant_id=tenant, user_id=user, agent_key=_AGENT),
+            ctx=_ctx(tenant_id=tenant, user_id=user, agent_key=_AGENT, figure_run_ids=_CONV_RUNS),
         )
 
     assert "改过" in str(info.value)
@@ -532,7 +540,7 @@ async def test_ask_image_short_form_without_a_render_says_call_read_page(tmp_pat
     with pytest.raises(FileNotFoundError) as info:
         await _short_form_tool(tmp_path, vl).call(
             {"path": _DOC, "unit": 10, "question": "?"},
-            ctx=_ctx(tenant_id=tenant, user_id=user, agent_key=_AGENT),
+            ctx=_ctx(tenant_id=tenant, user_id=user, agent_key=_AGENT, figure_run_ids=_CONV_RUNS),
         )
 
     assert "还没渲染" in str(info.value)
@@ -556,7 +564,7 @@ async def test_ask_image_short_form_only_searches_the_run_own_scope(tmp_path: Pa
     with pytest.raises(FileNotFoundError, match="还没渲染"):
         await _short_form_tool(tmp_path, vl).call(
             {"path": _DOC, "unit": 10, "question": "?"},
-            ctx=_ctx(tenant_id=tenant, user_id=user, agent_key=_AGENT),
+            ctx=_ctx(tenant_id=tenant, user_id=user, agent_key=_AGENT, figure_run_ids=_CONV_RUNS),
         )
 
     assert vl.calls == []
@@ -737,7 +745,7 @@ async def test_ask_image_short_form_skips_a_candidate_without_mtime() -> None:
 
     await tool.call(
         {"path": _DOC, "unit": 10, "question": "?"},
-        ctx=_ctx(tenant_id=tenant, user_id=user, agent_key=_AGENT),
+        ctx=_ctx(tenant_id=tenant, user_id=user, agent_key=_AGENT, figure_run_ids=_CONV_RUNS),
     )
 
     assert _sent_ref(vl) == workspace_figure_ref(tenant, user, f"agents/{_AGENT}/{good}")
@@ -753,7 +761,9 @@ async def test_ask_image_short_form_with_no_usable_candidate_says_render_again()
     with pytest.raises(FileNotFoundError) as info:
         await tool.call(
             {"path": _DOC, "unit": 10, "question": "?"},
-            ctx=_ctx(tenant_id=uuid4(), user_id=uuid4(), agent_key=_AGENT),
+            ctx=_ctx(
+                tenant_id=uuid4(), user_id=uuid4(), agent_key=_AGENT, figure_run_ids=_CONV_RUNS
+            ),
         )
 
     assert "读不出来" in str(info.value)

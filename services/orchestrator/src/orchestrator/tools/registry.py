@@ -35,6 +35,9 @@ WorkspaceLayout = Literal["conversation", "agent_root"]
 #: ``_child_run._child_config`` 给子代写根对话的 id。
 WORKSPACE_LAYOUT_KEY = "workspace_layout"
 WORKSPACE_THREAD_ID_KEY = "workspace_thread_id"
+#: B-262 —— ``_child_run._child_config`` 给子代写父对话渲染过页的 run(见
+#: :attr:`ToolContext.figure_run_ids`)。
+FIGURE_RUN_IDS_KEY = "figure_run_ids"
 
 
 def workspace_view_fields(configurable: Mapping[str, Any]) -> dict[str, Any]:
@@ -411,6 +414,11 @@ class ToolContext:
     #: B-236 第三层 —— 这是一次委派出去的子代(worker / 静态子 Agent)的调用:``_child_config``
     #: 写的 ``configurable["child_run"]``。子代不许改 agent 的记忆索引(``file_ops``)。
     child_run: bool = False
+    #: B-262 —— 本对话渲染过文档页的 run(取自检查点 ``viewed_figures`` 里每条 ref 的 run 段;
+    #: 子代另并上父传下来的)。``ask_image`` 按 path + 页号找渲染页时只看这些 run 与本 run
+    #: 的目录:渲染页落在 agent 级的 ``.tool_results/<run>/``,同一智能体的别的对话在同名文档
+    #: 上渲过的页不许拿来用。
+    figure_run_ids: frozenset[UUID] = frozenset()
 
     @property
     def workspace_view(self) -> WorkspaceView:

@@ -60,6 +60,7 @@ from orchestrator.tools._worker_events import (
 )
 from orchestrator.tools.artifact import ARTIFACT_RECORDER_KEY, ArtifactRecorder
 from orchestrator.tools.registry import (
+    FIGURE_RUN_IDS_KEY,
     WORKSPACE_LAYOUT_KEY,
     WORKSPACE_THREAD_ID_KEY,
     ToolContext,
@@ -1008,6 +1009,11 @@ def _child_config(ctx: ToolContext, *, sub_thread_id: UUID, sub_run_id: UUID) ->
     workspace_thread_id = ctx.workspace_thread_id or ctx.thread_id
     if workspace_thread_id is not None:
         configurable[WORKSPACE_THREAD_ID_KEY] = str(workspace_thread_id)
+    # B-262 —— 子代的检查点是新的,没有父对话的 ``viewed_figures``;把父对话渲染过页的 run
+    # (连同父这一个 run)传下去,子代 ``ask_image`` 才找得到父刚渲好的页,又不会去看别的对话的。
+    figure_runs = set(ctx.figure_run_ids) | ({ctx.run_id} if ctx.run_id is not None else set())
+    if figure_runs:
+        configurable[FIGURE_RUN_IDS_KEY] = sorted(str(run) for run in figure_runs)
     # B-61 §5.3 —— 同一个理由,绑定面:透传**父的** ``prompt_inputs``。子代跑的是
     # 同一个 ``tools_node``,config 里没有这一项时 ``apply_arg_bindings`` 对每个被绑
     # 参数走「本轮没给值 → 把它删掉」那条分支;而该参数已经从子代的 schema 里剥掉、

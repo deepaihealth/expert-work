@@ -303,6 +303,13 @@ class WorkspaceFileNotFoundError(SandboxSupervisorError):
     """
 
 
+class WorkspaceFileExistsError(SandboxSupervisorError):
+    """B-262 —— :meth:`WorkspaceStore.create_file` 的目标名字上已经有东西,没写。
+
+    上传据此换一个名字落盘,不覆盖别的对话传上来的同名文件。
+    """
+
+
 class WorkspaceNotAFileError(SandboxSupervisorError):
     """路径指到的是目录, 不是文件(B-84)。
 

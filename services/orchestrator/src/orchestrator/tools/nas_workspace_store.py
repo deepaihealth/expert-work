@@ -148,6 +148,7 @@ relative path, with its own :func:`os.lstat` size, never a stat of its target.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import errno
 import json
 import logging
@@ -161,7 +162,7 @@ from datetime import UTC, datetime
 from fnmatch import fnmatch
 from pathlib import Path, PurePosixPath
 from typing import TYPE_CHECKING, cast
-from uuid import UUID
+from uuid import UUID, uuid4
 
 from expert_work.persistence import (
     WORKSPACE_AGENTS_DIR,
@@ -176,6 +177,7 @@ from expert_work.persistence.workspace.layout import (
 from orchestrator.tools.sandbox import (
     SandboxSupervisorError,
     WorkspaceFileChangedError,
+    WorkspaceFileExistsError,
     WorkspaceFileNotFoundError,
     WorkspaceFileTooLargeError,
     WorkspaceNotADirectoryError,
@@ -1421,6 +1423,55 @@ class NasWorkspaceStore:
                 ) from exc
 
         await asyncio.to_thread(_write)
+
+    async def create_file(self, *, tenant_id: UUID, user_id: UUID, path: str, data: bytes) -> None:
+        """B-262 —— 名字上没有东西才建,而且名字一出现内容就是完整的。
+
+        先写同目录的 ``.tmp-<uuid>``,再 ``link`` 成目标名:``link`` 在 NFS 服务端是原子的,
+        名字已被占就 ``EEXIST``(文件 / 目录 / 符号链接都算),两个同时到只有一个建得成;
+        别人永远看不到写了一半的文件。最后删临时名。同一挂载上 B-236 的文件版本库用的是
+        同一做法(手册 §73.8 真 NFS 过)。写失败时目标名从没出现过,不用回删。"""
+
+        def _create() -> None:
+            if len(data) > _MAX_WRITE_BYTES:
+                msg = f"upload {path!r} exceeds the {_MAX_WRITE_BYTES}-byte write cap"
+                raise SandboxSupervisorError(msg)
+            dfd, name = self._open_parent_dir_fd(tenant_id, user_id, path, create=True)
+            tmp = f".tmp-{uuid4().hex}"
+            try:
+                try:
+                    fd = os.open(
+                        tmp,
+                        os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC,
+                        _LEAF_FILE_MODE,
+                        dir_fd=dfd,
+                    )
+                    try:
+                        view = memoryview(data)
+                        while view:
+                            view = view[os.write(fd, view) :]
+                    finally:
+                        os.close(fd)
+                    os.link(tmp, name, src_dir_fd=dfd, dst_dir_fd=dfd, follow_symlinks=False)
+                except FileExistsError as exc:
+                    raise WorkspaceFileExistsError(
+                        f"workspace file already exists: {path!r}"
+                    ) from exc
+                except PermissionError as exc:
+                    raise WorkspacePermissionError(
+                        f"workspace file not writable: {path!r}"
+                    ) from exc
+                except OSError as exc:
+                    raise SandboxSupervisorError(
+                        f"workspace file write failed: {path!r}: {exc}"
+                    ) from exc
+                finally:
+                    with contextlib.suppress(OSError):
+                        os.unlink(tmp, dir_fd=dfd)
+            finally:
+                os.close(dfd)
+
+        await asyncio.to_thread(_create)
 
     async def delete_file(self, *, tenant_id: UUID, user_id: UUID, path: str) -> None:
         def _delete() -> None:
