@@ -5256,7 +5256,7 @@ const en: TranslationKeys = {
       "The main model can't see images. Configure a vision model to let it read images and figures in documents.",
     vision_clear: "Clear (no image understanding)",
     section_vision_help:
-      "Shown only when the main model is text-only.\nThe vision model answers image-related questions; the main model coordinates.\nLeave empty = the agent can't see images.\nExample: qwen-vl-max",
+      "Shown only when the main model is text-only.\nThe vision model answers image-related questions; the main model coordinates.\nLeave empty = the agent can't see images.\nImage questions default to a quick look (thinking off or its lowest tier); a deep look uses medium depth when the vision model's reasoning depth is not set (on models that have one).\nExample: qwen-vl-max",
     section_fallback: "Fallback models",
     section_fallback_help:
       "If the main model fails or times out, the run switches to the fallback models in order instead of failing.\nNone configured = the agent only uses its main model.\nTip: pick fallbacks from different vendors so one vendor's outage doesn't take down the whole chain.",

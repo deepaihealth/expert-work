@@ -83,6 +83,11 @@ _SYSTEM_PROMPT = (
 #: 所以这里在工具层再加一道整体上限。
 ASK_IMAGE_TIMEOUT_S = 120.0
 
+#: B-257 —— 有单独的快看路由时,deep 最多等这么久就改用快看(B-252 的退路)。测试环境
+#: 30 天:quick p95 15 s、最长 28 s;deep 中位 43 s、p90 107 s,约 23 % 等满 120 s。
+#: 没有快看路由(deep 超时没有退路)时 deep 仍用 :data:`ASK_IMAGE_TIMEOUT_S`。
+ASK_IMAGE_DEEP_TIMEOUT_S = 60.0
+
 #: B-252 —— deep 超时后自动用快看再看一次的次数。
 ask_image_deep_retry_total = expert_work_counter(
     "expert_work_ask_image_deep_timeout_quick_retry_total",
@@ -94,6 +99,14 @@ ask_image_deep_retry_total = expert_work_counter(
 vision_quick_fallback_total = expert_work_counter(
     "expert_work_vision_quick_fallback_total",
     "ask_image quick looks rejected by the vendor and retried with the configured thinking.",
+    ("model",),
+)
+
+#: B-257 —— deep 路由带的平台默认思考档位被厂商拒(4xx)、改用配置原样的路由再看的次数。
+vision_deep_default_fallback_total = expert_work_counter(
+    "expert_work_vision_deep_default_fallback_total",
+    "ask_image deep looks whose platform-default thinking depth (B-257) was rejected by the "
+    "vendor and retried with the configuration as written.",
     ("model",),
 )
 
@@ -126,9 +139,13 @@ class PageRenderer(Protocol):
 class _AskImageTimeoutError(GuidedTimeoutError):
     """本层限时触发的超时;``by_run_deadline`` 为真表示是 run 的剩余时间用完了。"""
 
-    def __init__(self, message: str, *, advice: str, by_run_deadline: bool) -> None:
+    def __init__(
+        self, message: str, *, advice: str, by_run_deadline: bool, waited_s: float = 0.0
+    ) -> None:
         super().__init__(message, advice=advice)
         self.by_run_deadline = by_run_deadline
+        #: B-257 —— 这次实际等了多久(秒),改用快看时写进回答开头。
+        self.waited_s = waited_s
 
 
 @dataclass(frozen=True)
@@ -164,8 +181,13 @@ class AskImageTool:
     #: 最低档」发送。``None`` = 与 ``vl_caller`` 相同(整条链上没有可关的思考),
     #: quick 与 deep 走同一条路由。
     quick_vl_caller: LLMCaller | None = None
+    #: B-257 —— 配置原样(不补平台默认档位)的路由:默认档位被厂商拒时、以及快看被拒时
+    #: 退回它。``None`` = 默认档位什么都没改,与 ``vl_caller`` 相同。
+    plain_vl_caller: LLMCaller | None = None
     #: B-64 Task 10 —— 单次 VL 调用的整体上限;只有测试会改它。
     timeout_s: float = ASK_IMAGE_TIMEOUT_S
+    #: B-257 —— 有快看路由时 deep 的上限(不超过 ``timeout_s``);只有测试会改它。
+    deep_timeout_s: float = ASK_IMAGE_DEEP_TIMEOUT_S
     #: B-105 —— 看图主模型名,只用作快看退回计数器的标签。
     vl_model_name: str = ""
     #: B-105 —— 看图模型(含备用树)的截断标签 / 上限解析器:实际应答的是谁、它的输出上限。
@@ -284,7 +306,7 @@ class AskImageTool:
                 ]
             ),
         ]
-        deep_timed_out = False
+        deep_timed_out, waited_s = False, 0.0
         try:
             response = await self._ask(messages, depth=depth, ctx=ctx)
         except _AskImageTimeoutError as exc:
@@ -295,12 +317,23 @@ class AskImageTool:
                 raise
             logger.info("ask_image.deep_timeout_quick_retry")
             ask_image_deep_retry_total.inc()
-            deep_timed_out, depth = True, "quick"
+            deep_timed_out, depth, waited_s = True, "quick", exc.waited_s
             try:
                 response = await self._ask(messages, depth=depth, ctx=ctx, deep_fallback=False)
             except LLMClientError as rejected:
                 # 快看被厂商拒:平时退回正常看图,这里正常看图刚超时,不再原样等一整个窗口。
-                raise exc from rejected
+                # 报错不再建议「先换快看」—— 快看刚被拒。
+                msg = (
+                    f"ask_image timed out ({exc.waited_s:.0f} seconds) with depth='deep', and "
+                    "the quick look was rejected by the vision model's vendor, so there is no "
+                    "answer from the vision model."
+                )
+                raise _AskImageTimeoutError(
+                    msg,
+                    advice=_DEEP_AND_QUICK_FAILED_ADVICE,
+                    by_run_deadline=False,
+                    waited_s=exc.waited_s,
+                ) from rejected
         # B-64 Task 9 —— VL 的开销与主模型同样算数:先扣全树共享 token 池(B3),再落
         # ``token_usage``。与 agent 节点处理主模型那次调用同序;VL 调用抛错 / 被取消时
         # 两样都不做,也与主模型一致。
@@ -315,7 +348,7 @@ class AskImageTool:
         answer = _stringify(response.content) or "[VL model returned no text]"
         if deep_timed_out:
             answer = (
-                f"(depth='deep' timed out after {self.timeout_s:.0f} seconds, so this is the "
+                f"(depth='deep' timed out after {waited_s:.0f} seconds, so this is the "
                 "quick look's answer — it may miss fine detail.)\n" + answer
             )
         # Surface VL provenance in the ToolMessage artifact (event stream /
@@ -349,11 +382,24 @@ class AskImageTool:
                 if not _quick_rejected(exc) or not deep_fallback:
                     raise
                 # B-105 —— 关思考的参数被这家拒了(目录没实调过的新模型最常见):退回 Agent
-                # 原本的看图配置再看一次,而不是让看图整个失败。
+                # 原本的看图配置再看一次,而不是让看图整个失败。B-257:是配置原样那条路由,
+                # 不带平台默认档位 —— 没实调过的厂商可能连默认档位也拒。
                 vision_quick_fallback_total.labels(model=self.vl_model_name).inc()
                 logger.warning("ask_image.quick_rejected_fallback err=%s", type(exc).__name__)
+                plain = self.plain_vl_caller or self.vl_caller
+                with expert_work_span(ExpertWorkComponent.ORCHESTRATOR, "vision"):
+                    return await self._call_with_limit(plain, messages, depth=depth, ctx=ctx)
+        try:
+            with expert_work_span(ExpertWorkComponent.ORCHESTRATOR, "vision"):
+                return await self._call_with_limit(self.vl_caller, messages, depth=depth, ctx=ctx)
+        except LLMClientError as exc:
+            if self.plain_vl_caller is None or not _quick_rejected(exc):
+                raise
+            # B-257 —— 平台默认档位被这家拒了:用配置原样的路由再看一次(同 B-105 的判法)。
+            vision_deep_default_fallback_total.labels(model=self.vl_model_name).inc()
+            logger.warning("ask_image.deep_default_rejected_fallback err=%s", type(exc).__name__)
         with expert_work_span(ExpertWorkComponent.ORCHESTRATOR, "vision"):
-            return await self._call_with_limit(self.vl_caller, messages, depth=depth, ctx=ctx)
+            return await self._call_with_limit(self.plain_vl_caller, messages, depth=depth, ctx=ctx)
 
     def _raise_truncated(self, response: AIMessage) -> None:
         if self.output_cap_resolver is not None:
@@ -387,6 +433,9 @@ class AskImageTool:
         所以调用方不扣池也不记账(与 Task 9「失败不记账」一致)。
         """
         limit_s = self.timeout_s
+        if depth == "deep" and self.quick_vl_caller is not None:
+            # B-257 —— deep 超时有快看兜底(B-252),不必等满整体上限。
+            limit_s = min(self.deep_timeout_s, limit_s)
         by_run_deadline = False
         if ctx.deadline_at is not None:
             remaining_s = ctx.deadline_at - time.monotonic()
@@ -406,7 +455,7 @@ class AskImageTool:
             advice = _NO_TIME_LEFT_ADVICE if by_run_deadline else _TIMEOUT_ADVICE
             message = _timeout_message(limit_s, depth, by_run_deadline)
             raise _AskImageTimeoutError(
-                message, advice=advice, by_run_deadline=by_run_deadline
+                message, advice=advice, by_run_deadline=by_run_deadline, waited_s=limit_s
             ) from exc
 
     async def _image_ref_from_args(self, args: Mapping[str, Any], *, ctx: ToolContext) -> _Located:
@@ -616,6 +665,11 @@ _TIMEOUT_ADVICE = (
 )
 _NO_TIME_LEFT_ADVICE = (
     "This run has no time left. Do not call ask_image again; finish with what you already have."
+)
+#: B-257 —— deep 超时、改用的快看又被厂商拒:两条路都走过了,不再建议换 quick。
+_DEEP_AND_QUICK_FAILED_ADVICE = (
+    "Do not repeat the identical call. Retry only with a narrower, more specific question; "
+    "otherwise continue without this image answer."
 )
 #: B-105 —— 看图模型截断:原样再问只会再截一次(上限没变)。
 _TRUNCATED_ADVICE = (
