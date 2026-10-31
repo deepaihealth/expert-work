@@ -839,6 +839,22 @@ async def test_file_op_write_tools_receive_workspace_lock() -> None:
     assert edit_tool.workspace_lock is lock
 
 
+async def test_sandbox_exec_tools_receive_workspace_lock() -> None:
+    # B-249 —— exec_python 与 bash 一样接到控制面注入的那把写锁(漏接 = 默认的空锁)。
+    lock = RecordingWorkspaceLock()
+    env = ToolEnv(sandbox_runtime=RecordingSandboxRuntime(), workspace_lock=lock)
+    registry = await build_tool_registry(
+        [BuiltinToolSpec(name="exec_python"), BuiltinToolSpec(name="bash")],
+        tool_env=env,
+    )
+    exec_tool = registry.get("exec_python")
+    bash_tool = registry.get("bash")
+    assert isinstance(exec_tool, ExecPythonTool)
+    assert isinstance(bash_tool, BashTool)
+    assert exec_tool.workspace_lock is lock
+    assert bash_tool.workspace_lock is lock
+
+
 async def test_file_op_without_supervisor_raises() -> None:
     with pytest.raises(AgentFactoryError):
         await build_tool_registry([BuiltinToolSpec(name="edit_file")], tool_env=ToolEnv())

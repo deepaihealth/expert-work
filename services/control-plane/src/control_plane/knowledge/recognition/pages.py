@@ -46,6 +46,10 @@ GARBLED_SHARE = 0.3
 RENDER_DPI = 200
 RENDER_MAX_EDGE_PX = 2000
 RENDER_JPEG_QUALITY = 85
+#: B-256 —— the library that draws the pages: a new version may draw other image bytes
+#: (every cache key then misses), so how a cached page was read records it too
+#: (:func:`~.recognizer.reader_digest`); the cache key needs none (it hashes the image).
+RENDERER_VERSION = f"pymupdf={pymupdf.VersionFitz};mupdf={pymupdf.VersionBind}"
 
 #: ``get_texttrace`` span type of invisible text (PDF text render mode 3) —
 #: what a scanner's OCR layer is written as.

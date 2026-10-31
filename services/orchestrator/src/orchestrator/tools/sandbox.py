@@ -39,6 +39,7 @@ from expert_work.persistence import SANDBOX_AGENTS_ROOT, SANDBOX_SKILLS_ROOT
 from orchestrator.agent_timezone import resolve_agent_timezone
 from orchestrator.llm.providers._http import client_for
 from orchestrator.tools.inputs_doc import inputs_abs_dir, inputs_abs_path
+from orchestrator.tools.locks import NullWorkspaceLock, WorkspaceLock, write_lock_conversation
 from orchestrator.tools.registry import ToolBlockedError, ToolContext, ToolResult, ToolSpec
 from orchestrator.tools.sandbox_image_contract import preinstalled_note
 from orchestrator.tools.workspace_paths import EXEC_WORKSPACE_NOTE, agent_nas_root
@@ -1066,6 +1067,10 @@ class ExecPythonTool:
     #: under ``/opt/skills/<agent_key>/<name>/`` on each acquire (sandbox
     #: migration wave 2). Set at build.
     skill_seed_files: tuple[tuple[str, bytes], ...] = ()
+    #: B-249 —— 与 bash 同一把跨副本写锁(Stream TE-8):exec_python 同样能写工作区里
+    #: 任何文件,不拿锁就与同一对话的 bash / write_file / edit_file 交错写。只在新布局用
+    #: (见 :meth:`call`)。
+    workspace_lock: WorkspaceLock = field(default_factory=NullWorkspaceLock)
 
     @property
     def spec(self) -> ToolSpec:
@@ -1113,15 +1118,26 @@ class ExecPythonTool:
     async def call(self, args: Mapping[str, Any], *, ctx: ToolContext) -> ToolResult:
         code = self._require_code(args)
         timeout_s = coerce_timeout(args.get("timeout_s"))
-        outcome = await run_in_sandbox(
-            self.client,
-            code=code,
-            timeout_s=timeout_s,
-            ctx=ctx,
-            tool_label="exec_python",
-            fallback_thread_id=_FALLBACK_THREAD_ID,
-            seed_files=self.skill_seed_files,
-        )
+        # B-249 —— 只在新布局(按对话的键,含这种对话派出的子代)拿锁:代码写不写文件事先
+        # 看不出来,所以每次都拿;不拿 agent 键;报错 / 取消都经 async with 释放。老布局 / 没绑
+        # agent 不拿(维持原样):那里的键按用户,一个用户的每次 exec_python 都会排成一队 ——
+        # 10-30 生产一个对接用户 15 个并发 run 排在按用户的锁上,写等 3~6 分钟,就是这个形状。
+        conversation_id = write_lock_conversation(ctx.workspace_view)
+        lock = self.workspace_lock if conversation_id is not None else NullWorkspaceLock()
+        async with lock.acquire(
+            tenant_id=ctx.tenant_id,
+            user_id=ctx.user_id,
+            conversation_id=conversation_id,
+        ):
+            outcome = await run_in_sandbox(
+                self.client,
+                code=code,
+                timeout_s=timeout_s,
+                ctx=ctx,
+                tool_label="exec_python",
+                fallback_thread_id=_FALLBACK_THREAD_ID,
+                seed_files=self.skill_seed_files,
+            )
         return format_sandbox_outcome(outcome, self.output_char_cap)
 
     def _require_code(self, args: Mapping[str, Any]) -> str:

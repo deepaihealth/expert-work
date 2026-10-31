@@ -211,7 +211,8 @@ class ToolEnv:
     #: records via the orchestrator's SSE worker.
     trajectory_recorder: TrajectoryRecorder | None = None
     #: Stream TE-8 — cross-replica per-workspace write lock held around
-    #: ``write_file`` / ``bash`` writes. Defaults to the no-op
+    #: ``write_file`` / ``bash`` writes, and ``exec_python`` on the new layout only
+    #: (B-249). Defaults to the no-op
     #: :class:`NullWorkspaceLock` (single process / tests); the control plane
     #: injects a Postgres advisory-lock implementation in production.
     workspace_lock: WorkspaceLock = field(default_factory=NullWorkspaceLock)
@@ -779,6 +780,7 @@ def _register_exec_python(
     registry.register(
         ExecPythonTool(
             client=env.sandbox_runtime,
+            workspace_lock=env.workspace_lock,
             skill_seed_files=skill_seed_files,
         )
     )
