@@ -1,4 +1,4 @@
-"""B-206 K-2 — reference lines for ``knowledge_read`` results.
+"""B-206 K-2 — reference lines for ``knowledge_read`` and ``knowledge_search`` results.
 
 ``knowledge_read`` results are exempt from externalization
 (:data:`~orchestrator.tools.overflow.EXEMPT_TOOLS`): the document is re-readable,
@@ -17,6 +17,18 @@ only the model's own section / find echoed — never document text. A document
 without a number is "this document": its reference would be its file name, and
 the line sits outside the spotlight fence.
 
+``knowledge_search`` (B-206 track D) is exempt too: an old search collapses to
+what was searched and the references of the passages it showed — each re-readable
+with ``knowledge_read``, and the same arguments run the search again. Only the
+query (the model's own words) is echoed; bases are named by handle (``K2``) and
+passages by reference (``D12#7``), a hit without a document number is only
+counted, so the line itself carries no base name, file name or document text (the
+cross-turn stub's argument header echoes the model's own call arguments, which
+already sit unfenced in its tool call). Handles are positions in the agent's
+base list, so a version that reorders its bases re-points them; passage
+references stay valid. A search with a failed retrieval path or unsearched
+bases says so, and when it found nothing, that this is not absence (K-22).
+
 Consumed by :mod:`orchestrator.context.tool_result_prune`: the in-turn collapse
 (CM-12) and the cross-turn cleanup (B-126).
 """
@@ -24,13 +36,22 @@ Consumed by :mod:`orchestrator.context.tool_result_prune`: the in-turn collapse
 from __future__ import annotations
 
 import re
+from typing import Any
 
 from langchain_core.messages import BaseMessage, ToolMessage
 
 from orchestrator.tools.knowledge_read_reader import MAX_ARGUMENT_CHARS
 
 KNOWLEDGE_READ_TOOL_NAME = "knowledge_read"
+KNOWLEDGE_SEARCH_TOOL_NAME = "knowledge_search"
 _DOCUMENT_REF = re.compile(r"D[0-9]+(?:#[0-9]+)?")
+_PASSAGE_REF = re.compile(r"D[0-9]+#[0-9]+")
+_BASE_HANDLE = re.compile(r"K[1-9][0-9]*")
+#: A search that ran: found passages, or found none.
+_SEARCH_STATUSES = frozenset({"ok", "no_hits", "below_threshold"})
+_NOTHING_FOUND = "no passage found"
+#: Passage references listed in a search's line; the rest are counted.
+MAX_LISTED_PASSAGES = 10
 
 
 def knowledge_read_reference(message: BaseMessage) -> str | None:
@@ -63,9 +84,85 @@ def knowledge_read_reference(message: BaseMessage) -> str | None:
     )
 
 
+def knowledge_search_reference(message: BaseMessage) -> str | None:
+    """One-line reference replacing a ``knowledge_search`` result's content, or
+    ``None`` when ``message`` is not a search that ran with recorded arguments
+    (a result checkpointed before they were recorded keeps the generic path)."""
+    if not isinstance(message, ToolMessage) or message.name != KNOWLEDGE_SEARCH_TOOL_NAME:
+        return None
+    if getattr(message, "status", "success") == "error":
+        return None
+    artifact = message.artifact
+    if not isinstance(artifact, dict) or artifact.get("status") not in _SEARCH_STATUSES:
+        return None
+    args = artifact.get("args")
+    if not isinstance(args, dict) or not isinstance(args.get("query"), str):
+        return None
+    found = _found_passages(artifact)
+    if found is None:
+        return None
+    query = args["query"]
+    whole = len(query) <= MAX_ARGUMENT_CHARS
+    searched = f"knowledge_search for {_quoted(query)}{'' if whole else '…'}"
+    bases = args.get("bases")
+    if isinstance(bases, list):
+        handles = [b for b in bases if isinstance(b, str) and _BASE_HANDLE.fullmatch(b)]
+        if handles:
+            searched += f" in bases {', '.join(handles)}"
+    if _is_int(args.get("limit")):
+        searched += f", limit {args['limit']}"
+    unsearched = _count(artifact.get("unsearched")) > 0
+    degraded = any(artifact.get(f) is True for f in ("keyword_degraded", "embedding_degraded"))
+    nothing_found = found == _NOTHING_FOUND
+    if unsearched:
+        found += "; some knowledge bases could not be searched"
+    if degraded:
+        found += "; the search was incomplete (one of its retrieval paths failed)"
+    if (unsearched or degraded) and nothing_found:
+        # K-22: an incomplete search that found nothing must not read as "not stated".
+        found += ", so finding nothing does not show the knowledge base lacks it"
+    rerun = "the search can be run again via the knowledge_search tool"
+    if whole:
+        rerun += " with the same arguments"
+    if found.startswith("passages "):
+        rerun = (
+            "each passage is re-readable via the knowledge_read tool with its reference, and "
+            + rerun
+        )
+    return f"[{searched}: {found} — content compressed; {rerun}]"
+
+
+def _found_passages(artifact: dict[str, Any]) -> str | None:
+    """What a search showed: its passages' references (the first
+    :data:`MAX_LISTED_PASSAGES`, the rest counted), how many had no reference,
+    or that it found none; ``None`` for a search with hits but no recorded list."""
+    if artifact.get("status") != "ok":
+        return _NOTHING_FOUND
+    refs = artifact.get("refs")
+    if not isinstance(refs, list):
+        return None
+    listed = [r for r in refs if isinstance(r, str) and _PASSAGE_REF.fullmatch(r)]
+    unnumbered = _count(artifact.get("unnumbered"))
+    if not listed:
+        if not unnumbered:
+            return _NOTHING_FOUND
+        return f"{unnumbered} passage{'s' if unnumbered != 1 else ''} without a reference"
+    found = f"passages {', '.join(listed[:MAX_LISTED_PASSAGES])}"
+    if len(listed) > MAX_LISTED_PASSAGES:
+        found += f" and {len(listed) - MAX_LISTED_PASSAGES} more"
+    if unnumbered:
+        found += f" and {unnumbered} without a reference"
+    return found
+
+
 def _quoted(text: str) -> str:
     return repr(text[:MAX_ARGUMENT_CHARS])
 
 
 def _is_int(value: object) -> bool:
     return isinstance(value, int) and not isinstance(value, bool)
+
+
+def _count(value: object) -> int:
+    """``value`` when it is a positive count, else ``0``."""
+    return value if isinstance(value, int) and not isinstance(value, bool) and value > 0 else 0

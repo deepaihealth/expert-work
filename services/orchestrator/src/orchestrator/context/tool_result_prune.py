@@ -44,6 +44,12 @@ Design anchors (docs/design/tool-result-context-budget.md §Phase 2):
   handle than even the workspace footer. Failure/blocked placeholders (drift /
   redacted / archived are security stops) keep the generic ladder — never
   rewritten into a re-read encouragement.
+* **Knowledge references (B-206 K-2 / track D)** — a successful
+  ``knowledge_read`` or ``knowledge_search`` result (both exempt from
+  externalization, so usually with no workspace copy) collapses the same way,
+  to a one-line reference saying what was read or searched and how to recover
+  it (:mod:`orchestrator.context.knowledge_reference`); a result recorded
+  without its arguments keeps the generic ladder.
 * **Prompt-view only** (CM-C4) — like the window, the gate shapes only the
   message list handed to *this* LLM call; ``agent_node`` returns just the new
   response tail and the ``add_messages`` reducer never deletes, so the
@@ -67,7 +73,10 @@ from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, ToolMe
 from expert_work.common.conversation_channel import is_hidden
 from expert_work.runtime.tokens import TokenEstimator
 from orchestrator.context.compressor import estimate_tokens
-from orchestrator.context.knowledge_reference import knowledge_read_reference
+from orchestrator.context.knowledge_reference import (
+    knowledge_read_reference,
+    knowledge_search_reference,
+)
 from orchestrator.context.skill_reference import skill_view_reference
 from orchestrator.tools.overflow import (
     OVERFLOW_DIR,
@@ -194,6 +203,9 @@ def _collapsed_content(message: ToolMessage, *, lossy_note: str) -> str | None:
        durable while the workspace copy is run-scoped, so ``skill_view``
        re-read is the better recovery handle. Blocked/error placeholders get
        no reference (see :mod:`orchestrator.context.skill_reference`).
+       A ``knowledge_read`` / ``knowledge_search`` result recorded with its
+       arguments collapses to its reference the same way (see
+       :mod:`orchestrator.context.knowledge_reference`).
     1. **Artifact path** (item 2 persist floor) — render a footer reference to
        the persisted copy. Checked BEFORE the in-context footer (security —
        the builder always records this path alongside a real footer, so
@@ -221,10 +233,14 @@ def _collapsed_content(message: ToolMessage, *, lossy_note: str) -> str | None:
         return None
     if message.name in _NEVER_PRUNE_TOOLS:
         return None
-    reference = skill_view_reference(message) or knowledge_read_reference(message)
+    reference = (
+        skill_view_reference(message)
+        or knowledge_read_reference(message)
+        or knowledge_search_reference(message)
+    )
     if reference is not None:
         # Wrapped in the prune tags so ``_is_already_pruned`` keeps the pass
-        # idempotent for skill / knowledge_read stubs too.
+        # idempotent for skill / knowledge_read / knowledge_search stubs too.
         return f"{_PRUNE_TAG_OPEN}\n{reference}\n{_PRUNE_TAG_CLOSE}"
     path = _artifact_path(message)
     if path is not None:
@@ -358,8 +374,14 @@ def _lossless_reference(message: ToolMessage) -> str | None:
 
     B-206 K-2: a ``knowledge_read`` result is exempt from externalization and has
     no persisted copy; reading it again with the same arguments recovers it.
+    B-206 track D: so is a ``knowledge_search`` result; its passages are re-read
+    by reference and the same arguments run the search again.
     """
-    reference = skill_view_reference(message) or knowledge_read_reference(message)
+    reference = (
+        skill_view_reference(message)
+        or knowledge_read_reference(message)
+        or knowledge_search_reference(message)
+    )
     if reference is not None:
         return reference
     content = message.content

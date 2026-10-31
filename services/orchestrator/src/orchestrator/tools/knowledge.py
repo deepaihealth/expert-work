@@ -37,7 +37,11 @@ from expert_work.protocol import (
     chunk_retrieval_text,
 )
 from orchestrator.tools.error_classifier import GuidedToolError
-from orchestrator.tools.knowledge_catalog import select_bases, with_bases_parameter
+from orchestrator.tools.knowledge_catalog import (
+    base_handles,
+    select_bases,
+    with_bases_parameter,
+)
 from orchestrator.tools.knowledge_dedup import (
     drop_copied_children,
     passage_key,
@@ -140,10 +144,16 @@ RERANK_INSTRUCTION = (
 #: tool, so an agent with no knowledge base never sees it. The rule itself sits in
 #: the tool description; the text appended to results states facts rather than
 #: commands (B-163: command-voiced out-of-band text trips injection defenses).
+#: B-206 track D: the rule's subject is everything read, so a page read with
+#: ``knowledge_read`` falls under it as much as a search result does, and it
+#: names the places an inferred answer is taken from.
 KNOWLEDGE_ANSWERABILITY_RULE = (
-    "Results are the closest passages, not confirmed answers: rely only on what they "
-    "explicitly state, and if none states the specific fact asked, say the knowledge "
-    "base does not state it instead of inferring or guessing it."
+    "Search results are the closest passages and knowledge_read shows more of a document; "
+    "neither is a confirmed answer: rely only on what the text explicitly states about the "
+    "exact thing asked. If no text you have read states the specific fact asked, say the "
+    "knowledge base does not state it instead of inferring or guessing it — not from "
+    "neighbouring passages, from what the text states about other items, or from general "
+    "knowledge."
 )
 #: B-206 K-6 — how to search, in the tool description only (so, like the rule
 #: above, an agent with no knowledge base never sees it). Searching more widely is
@@ -1101,8 +1111,19 @@ class KnowledgeSearchTool:
             msg = "none of this agent's knowledge bases exists: " + ", ".join(base_names)
             raise GuidedToolError(msg, advice=_NO_BASES_ADVICE)
         meta: dict[str, Any] = {"hits": len(outcome.results), "status": outcome.status}
+        # B-206 track D — what an old result's reference line names
+        # (:mod:`orchestrator.context.knowledge_reference`): the arguments the
+        # search ran with, its bases by handle (never a name: tenant text).
+        searched: dict[str, Any] = {"query": query}
+        if args.get("limit") is not None:
+            searched["limit"] = limit
+        if narrowed:
+            searched["bases"] = base_handles(self.knowledge_base_refs, base_names)
+        meta["args"] = searched
         if narrowed:
             meta["bases"] = list(base_names)
+        if outcome.unsearched_bases:
+            meta["unsearched"] = len(outcome.unsearched_bases)
         if outcome.rerank_degraded:
             meta["rerank_degraded"] = True
         if outcome.embedding_degraded:
@@ -1139,6 +1160,14 @@ class KnowledgeSearchTool:
                 notice=no_hits_notice,
             )
         laid_out = _lay_out_results(outcome.results)
+        # The references of the passages shown (lower ones dropped for the text
+        # budget are not); a passage with no document number would be named by its
+        # file name, so it is only counted.
+        shown = outcome.results[: laid_out.shown]
+        meta["refs"] = [f"D{r.doc_seq}#{r.chunk_index}" for r in shown if r.doc_seq is not None]
+        unnumbered = sum(1 for r in shown if r.doc_seq is None)
+        if unnumbered:
+            meta["unnumbered"] = unnumbered
         content = laid_out.text
         cut = ""
         if laid_out.truncated:
