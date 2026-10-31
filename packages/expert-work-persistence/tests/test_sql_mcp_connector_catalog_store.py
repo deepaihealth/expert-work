@@ -254,3 +254,25 @@ async def test_update_invalid_patch_rolls_back(
         assert [f.key for f in after.auth_schema.fields] == ["token", "org"]
     finally:
         await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_concurrent_updates_never_see_the_same_before(
+    catalog_store: tuple[SqlMcpConnectorCatalogStore, AsyncEngine],
+) -> None:
+    """B-248: the API acts on a real ``enabled`` switch; two admins disabling
+    at once must not both see ``enabled=True`` as ``before`` (row lock)."""
+    import asyncio
+
+    store, engine = catalog_store
+    try:
+        for _ in range(5):
+            created = await store.create(upsert=_bearer_upsert(), actor_id="sysadmin")
+            off = McpConnectorCatalogPatch(enabled=False)
+            results = await asyncio.gather(
+                *(store.update_with_previous(catalog_id=created.id, patch=off) for _ in range(3))
+            )
+            assert sorted(before.enabled for before, _ in results) == [False, False, True]
+            assert all(after.enabled is False for _, after in results)
+    finally:
+        await engine.dispose()

@@ -45,6 +45,9 @@ KINDS = frozenset(
         "tenant_mcp",  # tenant MCP pool (+ agent builds, two-layer)
         "platform_mcp",  # platform MCP pool (+ all agent builds)
         "user_mcp_oauth",  # (tenant, user) OAuth pool (+ user builds)
+        # B-248 — one oauth2 connector off (disabled / deleted) / back on, every user
+        "user_mcp_oauth_connector_off",
+        "user_mcp_oauth_connector_on",
         "tenant_config",  # tenant config cache (+ secret values, + agent builds)
         # --- PR-E3b-1: platform config plane ---
         "platform_secrets",  # credential overlay + secret values (+ builds, scoped)
@@ -95,6 +98,9 @@ class InvalidationEvent:
     #: ``run_cancel`` only — the run whose cancel CAS just won. Serialized only
     #: when set, so every other kind keeps its exact pre-existing wire shape.
     run_id: str | None = None
+    #: ``user_mcp_oauth_connector_*`` only (B-248) — the connector's name.
+    #: Serialized only when set, like ``run_id``.
+    connector: str | None = None
 
 
 Handler = Callable[[InvalidationEvent], Awaitable[None]]
@@ -133,6 +139,8 @@ class InvalidationBus:
         }
         if event.run_id is not None:
             body["run_id"] = event.run_id
+        if event.connector is not None:
+            body["connector"] = event.connector
         body["origin"] = event.origin or self._origin
         payload = json.dumps(body)
         try:
@@ -197,6 +205,7 @@ class InvalidationBus:
                 user_id=data.get("user_id"),
                 origin=str(data.get("origin") or ""),
                 run_id=data.get("run_id"),
+                connector=data.get("connector"),
             )
         except Exception:
             _errors.labels(stage="subscribe").inc()
@@ -319,6 +328,22 @@ def build_invalidation_handlers(state: Any) -> dict[str, Handler]:
             await pool.invalidate(UUID(event.tenant_id), event.user_id)
         await _agent_build_user(event)
 
+    def _oauth_connector(*, on: bool) -> Handler:
+        """B-248 — one event per connector change, not one per user: each
+        replica finds its own affected pools (the pool service evicts their
+        builds through ``on_expire``)."""
+
+        async def _handler(event: InvalidationEvent) -> None:
+            pool = getattr(state, "user_mcp_oauth_pool_service", None)
+            if pool is None or event.connector is None:
+                return
+            if on:
+                await pool.connector_on(event.connector)
+            else:
+                await pool.connector_off(event.connector)
+
+        return _handler
+
     async def _tenant_config(event: InvalidationEvent) -> None:
         if event.tenant_id is None:
             return
@@ -433,6 +458,8 @@ def build_invalidation_handlers(state: Any) -> dict[str, Handler]:
         "tenant_mcp": _tenant_mcp,
         "platform_mcp": _platform_mcp,
         "user_mcp_oauth": _user_mcp_oauth,
+        "user_mcp_oauth_connector_off": _oauth_connector(on=False),
+        "user_mcp_oauth_connector_on": _oauth_connector(on=True),
         "tenant_config": _tenant_config,
         "platform_secrets": _platform_secrets,
         "platform_judge": _platform_config("platform_judge_config_service", rebuild=True),

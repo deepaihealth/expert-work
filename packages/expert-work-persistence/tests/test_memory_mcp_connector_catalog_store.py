@@ -256,3 +256,24 @@ async def test_get_by_ids_batches_and_skips_missing() -> None:
 async def test_get_by_ids_empty_input_returns_empty() -> None:
     store = InMemoryMcpConnectorCatalogStore()
     assert await store.get_by_ids([]) == {}
+
+
+@pytest.mark.asyncio
+async def test_update_with_previous_returns_before_and_after() -> None:
+    """B-248: concurrent updates each see the previous one's result."""
+    import asyncio
+
+    store = InMemoryMcpConnectorCatalogStore()
+    created = await _make(store)
+    off = McpConnectorCatalogPatch(enabled=False)
+
+    results = await asyncio.gather(
+        *(store.update_with_previous(catalog_id=created.id, patch=off) for _ in range(3))
+    )
+
+    assert sorted(before.enabled for before, _ in results) == [False, False, True]
+    assert all(after.enabled is False for _, after in results)
+    on_before, on_after = await store.update_with_previous(
+        catalog_id=created.id, patch=McpConnectorCatalogPatch(enabled=True)
+    )
+    assert (on_before.enabled, on_after.enabled) == (False, True)

@@ -87,6 +87,11 @@ class InMemoryMcpConnectorCatalogStore(McpConnectorCatalogStore):
     async def update(
         self, *, catalog_id: UUID, patch: McpConnectorCatalogPatch
     ) -> McpConnectorCatalogRecord:
+        return (await self.update_with_previous(catalog_id=catalog_id, patch=patch))[1]
+
+    async def update_with_previous(
+        self, *, catalog_id: UUID, patch: McpConnectorCatalogPatch
+    ) -> tuple[McpConnectorCatalogRecord, McpConnectorCatalogRecord]:
         async with self._lock:
             existing = self._rows.get(catalog_id)
             if existing is None:
@@ -124,7 +129,7 @@ class InMemoryMcpConnectorCatalogStore(McpConnectorCatalogStore):
                 existing.model_copy(update=changes).model_dump()
             )
             self._rows[catalog_id] = updated
-            return updated
+            return existing, updated
 
     async def delete(self, catalog_id: UUID) -> None:
         async with self._lock:

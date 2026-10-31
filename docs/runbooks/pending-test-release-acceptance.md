@@ -1625,3 +1625,28 @@ PY
 - [ ] **75.3 发布前的缓存不算**:找一份发布前取消过、留有缓存的文档(没有就跳过,单测覆盖),重新摄取。判据:那些缓存行(`result` 里没有 `page`)不计入「已识别」,估算偏高、不偏低。
 - [ ] **75.4 转备用有原因**:75.1 里若有页走了备用(`GET …/documents/<id>/pages` 的 `model` 不是 glm-ocr),日志里每页一行 `knowledge.recognition_fallback document=<id> reading=page_ocr index=<页> model=<备用> reasons=glm/glm-ocr: <原因>`,原因是 `vendor_unavailable_rate_limited` / `_timeout` / `_server_error` / `bad_output_<码>` 之类;control-plane `/metrics` 有对应 `reason` 的计数。没有页转备用:确认 `/metrics` 里这条计数没有出现(或为 0)、`recognition_call_failed` 行也没有,记「未触发」。**没修好时**:转备用查不到原因。
 - [ ] **75.5 收尾**:删 `kbb238`;`SELECT count(*) FROM knowledge_parse_cache WHERE document_id IN (<两份 id>)` = 0。
+
+## §79 MCP 池到期的收尾(B-248)
+
+**背景**:#1979 把平台 / 租户 / 用户授权三个 MCP 池 30 分钟到期时的「关掉」改成「退役」(缓存的智能体与在跑的运行拿着旧连接时,每次调用临时开一次性连接),那次留下五条尾巴,本节验其中四条:
+① 池到期时同一范围(平台池 = 全部租户、租户池 = 该租户、用户池 = 该用户)的缓存智能体构建一并清掉,之后只有到期时已在跑的运行走一次性连接。平台池这一条等于每个副本大约每 30 分钟清空一次全部构建、随后按需重建(接受的代价,与构建自身 30 分钟到期大致同步)。
+② 到期那一刻正在长连接上进行的调用在原连接上做完,最后一个做完后在后台关掉它(原来连接被当场拆掉,调用等满 `timeout_s` 报超时,而服务端可能已经执行了)。
+③ 构建期间连续被失效打断、最后一次不进缓存直接交出去的池,先登记再原地退役(原来它的长连接永远没人关,失效 / 关机也够不着);退役放在构建锁外面做。代价(接受,换掉泄漏):用这个池建出的智能体在它 30 分钟到期前,每次 MCP 调用都要重新连接 + 握手;这条路径要连续五次被失效打断才会走到。
+④ 平台停用 / 强制删除一个 oauth2 目录项:**只**切断这个连接器(每个用户的池里的那一个客户端,含已退役的副本),同一用户的其它连接器退役后照常可用、进行中的调用做完;重新启用:让「当时因为停用而没装它」的池到期重建(不切断任何东西)。是否「真的变了」以更新时在行锁下读到的旧值为准(两个管理员同时改只会触发一次)。切断不怕卡:`close()` 在等任何锁之前就把客户端标成已停,10 秒的批量收尾预算到了也不会让正在重连的会话复活;构建中途发生的停用,最后一次不进缓存的池里那个连接器同样被切断。全平台一条总线事件(`user_mcp_oauth_connector_off` / `_on`,带连接器名),各副本自己找受影响的池;只有 `enabled` 真的变了才发(管理端表单每次保存都带 `enabled`)。建池时跳过已停用的目录项(用户已拍板:停用 = 对所有用户停,含已连上的)。
+⑤ 同名客户端泄漏不修:三个池的名字都有唯一约束兜着(`tenant_mcp_server_name_uniq`、`mcp_connector_catalog_name_uniq`,授权连接名 = 目录项名且每个目录项每个用户一条),走不到。
+
+**已知,不在本次范围**:停用期间这些连接不刷新令牌,停用很久后再启用,用户可能要重新授权,而界面上仍显示「已连接」;租户的 MCP 允许清单在建用户池时不检查(原有行为,只在发起授权时检查);运行时的智能体构建缓存没有代次保护,失效时正在进行的构建仍可能把旧池放回缓存(B-260 单独修)。
+
+**滚动发布期间不要停用 / 启用 oauth2 目录项**:老 pod 不认 `user_mcp_oauth_connector_off` / `_on`,只记一行 `invalidation_bus.unknown_kind` 就忽略,那些 pod 上的用户池不会跟着变。若发布期间改过,发布完成后把它切到相反状态再切回来。
+
+**怎么进**:① ~ ③ 沿用 #1979 上线时的做法 —— 在测试环境 control-plane pod 里跑一个自建池的脚本(`kubectl cp` 进 pod 再 `kubectl exec … -- python /tmp/b248.py`,不用 stdin 喂脚本:EOF 后远端输出会丢),时钟用假的,对测试环境的平台 MCP 服务只调 `list_tools`(只读,不触发任何工具)。④ 用控制台(system_admin)和只读数据库连接。**花费**:不调模型,0 元。
+
+- [ ] **79.1 到期清掉同范围的缓存构建(①)**:脚本建 `PlatformMcpPoolService(…, clock=假时钟, on_expire=记录)`、`TenantMcpPoolService` 同理,`get_or_build` 一次、假时钟 +1801 秒再 `get_or_build` 一次。判据:`on_expire` 各被调一次,平台池参数为空、租户池参数是该租户;未到期的再次 `get_or_build` 不调;`on_expire` 抛错时 `get_or_build` 照样返回池。真栈信号(不看缓存条数 gauge:触发到期的那次构建会在同一次调用里把自己放回缓存):平台池到期后,到期前已缓存的智能体下一次运行要重新构建 —— 它的 `mcp.registered server=…` 日志再出现一次,且这次运行里不出现 `mcp.retired_client_call`。**没修好时**:缓存的智能体最长再拿 30 分钟退役连接,到期后新开始的运行里也出现 `mcp.retired_client_call`。
+- [ ] **79.2 到期时进行中的调用做完(②)**:脚本对一个平台 MCP 服务 `start()` 一个客户端,把 `_session.list_tools` 包一层「先等一个事件再转发」,起任务调 `list_tools`,等它进到包装里后 `retire()`,再放行。判据:`list_tools` 正常返回工具清单,不报 `MCPCallTimeoutError`;放行前长连接没关、放行后在后台关(`_drain_close` 完成);`close()` 之后 `_open_owned_session` 的后台任务为 0。再测一次「进行中调用 + `close()`」:`close()` 当场关掉那条连接,之后的调用 `not started`。**没修好时**:等满 `timeout_s` 报 `MCPCallTimeoutError`。
+- [ ] **79.3 不进缓存的池也受管(③)**:脚本用一个包装过的目录存储,每次读都先 `invalidate()` 一次,让 `get_or_build` 五次都被打断。判据:返回的池能 `list_tools`(走一次性连接,日志 `mcp.retired_client_call`);之后 `invalidate()`,再调同一个客户端报 `not started`、不再连服务端。**没修好时**:客户端一直挂着长连接,`invalidate()` 之后照常能调。
+- [ ] **79.4 oauth2 目录项停用 / 启用 / 删除(④)**:先只读查有连接的 oauth2 目录项:`SELECT c.name, o.status, count(*) FROM mcp_oauth_connection o JOIN mcp_connector_catalog c ON c.id = o.catalog_id WHERE c.auth_type = 'oauth2' GROUP BY 1, 2`。没有 `connected` 的就记「不可达,单测覆盖」跳过。有的话(事先确认没有别人在用;结束后改回),最好挑一个同时连了两个 oauth2 连接器的用户:
+  ① 控制台编辑别的字段(如显示名)保存一次。判据:各 control-plane pod 的 `expert_work_control_plane_invalidation_bus_received_total{kind=~"user_mcp_oauth.*"}` 不变。
+  ② 停用它。判据:上面的计数里 `kind="user_mcp_oauth_connector_off"` 每个 pod 只增加 1(不随用户数增长);这个用户下一个运行的工具里没有这个连接器,另一个连接器还在;停用那一刻正在调另一个连接器的运行不报 `not started`。
+  ③ 改回启用。判据:`kind="user_mcp_oauth_connector_on"` 每个 pod 增加 1,该用户下一个运行工具回来。
+  **没修好时**:停用后已连上的用户照常调用(建池不看 `enabled`);或者任何一次保存都让这些用户的整个池被切断,在跑的运行报 `not started`。
+- [ ] **79.5 #1979 的行为不退**:同一脚本:到期后旧客户端照常可用(一次性连接)、`invalidate()` / `close_all()` 之后立刻 `not started`(含已退役的)。

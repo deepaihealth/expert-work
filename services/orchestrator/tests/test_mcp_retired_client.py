@@ -35,6 +35,10 @@ import orchestrator.tools.mcp as mcp_mod
 _SERVER_TASKS: set[asyncio.Task[None]] = set()
 #: Every ``echo`` the in-process server actually executed (reset per test).
 _ECHO_CALLS: list[str] = []
+#: B-248 — ``gated(key)`` runs until ``_GATES[key]`` is set; ``_GATED_CALLS``
+#: records each key the server started on (both reset per test).
+_GATES: dict[str, asyncio.Event] = {}
+_GATED_CALLS: list[str] = []
 
 
 def _fastmcp() -> FastMCP:
@@ -49,6 +53,12 @@ def _fastmcp() -> FastMCP:
     async def slow() -> str:
         await asyncio.sleep(5)
         return "late"
+
+    @srv.tool()
+    async def gated(key: str) -> str:
+        _GATED_CALLS.append(key)
+        await _GATES.setdefault(key, asyncio.Event()).wait()
+        return f"opened {key}"
 
     return srv
 
@@ -117,6 +127,12 @@ async def _retired_client(timeout_s: float = 5.0) -> _CountingClient:
     return client
 
 
+async def _drained(client: _CountingClient) -> None:
+    """Wait for the background close of a drained session (B-248)."""
+    if client._drain_close is not None:
+        await client._drain_close
+
+
 def _live_owner_tasks() -> list[asyncio.Task[Any]]:
     """Session owner tasks (``_open_owned_session.<locals>._own``) still running."""
     return [
@@ -129,6 +145,8 @@ def _live_owner_tasks() -> list[asyncio.Task[Any]]:
 @pytest.fixture(autouse=True)
 async def _stop_servers() -> AsyncIterator[None]:
     _ECHO_CALLS.clear()
+    _GATES.clear()
+    _GATED_CALLS.clear()
     yield
     for task in list(_SERVER_TASKS):
         task.cancel()
@@ -188,8 +206,9 @@ async def test_retired_client_list_tools_uses_a_one_shot_session() -> None:
     client = await _retired_client()
 
     tools = await client.list_tools()
+    await _drained(client)
 
-    assert sorted(t.name for t in tools) == ["echo", "slow"]
+    assert sorted(t.name for t in tools) == ["echo", "gated", "slow"]
     assert (client.opens, client.closes) == (2, 2)
     assert _live_owner_tasks() == []
 
@@ -348,6 +367,7 @@ async def test_send_phase_death_racing_retire_resends_on_a_one_shot_session() ->
     client._session = _RetiredUnderneath()
 
     result = await client.call_tool("echo", {"text": "resent"})
+    await _drained(client)
 
     assert result.content == "resent"
     assert spy.events == ["success"]
@@ -507,7 +527,210 @@ async def test_list_tools_stream_death_racing_retire_uses_a_one_shot_session() -
     client._session = _RetiredUnderneath()
 
     tools = await client.list_tools()
+    await _drained(client)
 
-    assert sorted(t.name for t in tools) == ["echo", "slow"]
+    assert sorted(t.name for t in tools) == ["echo", "gated", "slow"]
     assert (client.opens, client.closes) == (2, 2)
+    assert _live_owner_tasks() == []
+
+
+# ---------------------------------------------------------------------------
+# B-248 — retire() drains the calls already running on the live session
+# ---------------------------------------------------------------------------
+
+
+async def _start_gated_call(client: _CountingClient, key: str) -> asyncio.Task[Any]:
+    """A live ``call_tool`` the server has started and is still running."""
+    task = asyncio.create_task(client.call_tool("gated", {"key": key}))
+    while key not in _GATED_CALLS:
+        await asyncio.sleep(0.01)
+    return task
+
+
+@pytest.mark.timeout(30)
+async def test_retire_lets_an_in_flight_call_finish_on_its_session(mcp_calls: list[str]) -> None:
+    """Pool TTL expiry while a call is running on the long-lived session. It
+    used to tear the session down under the call: the response never arrived,
+    the call failed after ``timeout_s`` although the server had run the tool."""
+    client = _client(timeout_s=1.0)
+    await client.start()
+    task = await _start_gated_call(client, "a")
+
+    await client.retire()
+
+    assert client.closes == 0  # parked for the call, not torn down under it
+    _GATES["a"].set()
+    result = await asyncio.wait_for(task, timeout=5)
+    await _drained(client)
+    assert result.content == "opened a"
+    assert mcp_calls == ["ok"]
+    assert (client.opens, client.closes) == (1, 1)  # the last one out closed it
+    assert _live_owner_tasks() == []
+
+
+@pytest.mark.timeout(30)
+async def test_draining_session_closes_after_the_last_call_only() -> None:
+    client = _client()
+    await client.start()
+    first = await _start_gated_call(client, "a")
+    second = await _start_gated_call(client, "b")
+    await client.retire()
+
+    _GATES["a"].set()
+    assert (await first).content == "opened a"
+    assert client.closes == 0  # "b" still running on it
+
+    # A call after retire() goes out on its own one-shot session.
+    assert (await client.call_tool("echo", {"text": "new"})).content == "new"
+    assert (client.opens, client.closes) == (2, 1)
+
+    _GATES["b"].set()
+    assert (await second).content == "opened b"
+    await _drained(client)
+    assert (client.opens, client.closes) == (2, 2)
+    assert _live_owner_tasks() == []
+
+
+@pytest.mark.timeout(30)
+async def test_retire_drains_an_in_flight_list_tools() -> None:
+    client = _client()
+    await client.start()
+    live = client._session
+    entered, gate = asyncio.Event(), asyncio.Event()
+
+    class _Gated:
+        async def list_tools(self) -> Any:
+            entered.set()
+            await gate.wait()
+            return await live.list_tools()
+
+    client._session = _Gated()
+    task = asyncio.create_task(client.list_tools())
+    await entered.wait()
+
+    await client.retire()
+
+    assert client.closes == 0
+    gate.set()
+    tools = await asyncio.wait_for(task, timeout=5)
+    await _drained(client)
+    assert sorted(t.name for t in tools) == ["echo", "gated", "slow"]
+    assert (client.opens, client.closes) == (1, 1)  # served by the parked session
+    assert _live_owner_tasks() == []
+
+
+@pytest.mark.timeout(30)
+async def test_close_hard_stops_a_draining_session() -> None:
+    """Invalidation / shutdown while a retired session drains: it closes now,
+    not when the in-flight call ends."""
+    client = _client(timeout_s=0.5)
+    await client.start()
+    task = await _start_gated_call(client, "a")
+    await client.retire()
+
+    await client.close()
+
+    assert client.closes == 1
+    with pytest.raises(mcp_mod.MCPCallTimeoutError):
+        _ = await asyncio.wait_for(task, timeout=5)
+    assert client.closes == 1  # not closed a second time by the last caller
+    await _assert_hard_stop(client)
+    assert _live_owner_tasks() == []
+
+
+@pytest.mark.timeout(30)
+async def test_cancelled_in_flight_call_still_closes_the_draining_session() -> None:
+    client = _client(timeout_s=10)
+    await client.start()
+    task = await _start_gated_call(client, "a")
+    await client.retire()
+
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        _ = await task
+    await _drained(client)
+
+    assert (client.opens, client.closes) == (1, 1)
+    assert _live_owner_tasks() == []
+
+
+@pytest.mark.timeout(30)
+async def test_last_call_returns_before_the_drained_session_is_torn_down() -> None:
+    """Review L3: the drained session's teardown (up to ``min(timeout_s, 5)``
+    for a stuck DELETE) runs in the background, not in the call; ``close()``
+    still waits for it, so nothing outlives the client."""
+    client = _client(timeout_s=2.0)
+    client.mode = "hang_teardown"
+    await client.start()
+    task = await _start_gated_call(client, "a")
+    await client.retire()
+
+    _GATES["a"].set()
+    started = time.monotonic()
+    result = await asyncio.wait_for(task, timeout=5)
+
+    assert result.content == "opened a"
+    assert time.monotonic() - started < 1.0  # not held by the 2 s teardown budget
+    assert client.closes == 0
+    await client.close()
+    assert client.closes == 1
+    assert _live_owner_tasks() == []
+
+
+@pytest.mark.timeout(30)
+async def test_close_cancelled_behind_a_reconnect_is_still_a_hard_stop(
+    mcp_calls: list[str],
+) -> None:
+    """Review-3 M1: a BUG-17 reconnect holds the restart lock for its whole
+    handshake. A close() waiting behind it can be cancelled (the bulk teardown
+    budget); the reconnect must not then install a session that serves a
+    connector the platform switched off."""
+    client = _client()
+    await client.start()
+
+    class _DeadOnSend:
+        async def call_tool(self, name: str, args: dict[str, Any]) -> Any:
+            raise anyio.ClosedResourceError
+
+    client._session = _DeadOnSend()
+    client.open_gate = asyncio.Event()  # the reconnect's handshake hangs
+    call = asyncio.create_task(client.call_tool("echo", {"text": "after off"}))
+    while client.opens < 2:
+        await asyncio.sleep(0.01)
+
+    with pytest.raises(TimeoutError):
+        async with asyncio.timeout(0.2):
+            await client.close()  # stuck behind the restart lock, then cancelled
+    client.open_gate.set()
+
+    with pytest.raises(RuntimeError, match="not started"):
+        _ = await call
+    assert _ECHO_CALLS == []
+    opens = client.opens
+    with pytest.raises(RuntimeError, match="not started"):
+        await client.call_tool("echo", {"text": "later"})
+    assert client.opens == opens
+    assert client.opens == client.closes
+    assert _live_owner_tasks() == []
+
+
+@pytest.mark.timeout(30)
+@pytest.mark.parametrize("retired", [False, True])
+async def test_close_waiting_for_the_restart_lock_already_stops_calls(retired: bool) -> None:
+    """While close() waits for the restart lock, calls already fail "not
+    started" and nothing is dialed — live or retired client alike."""
+    client = await _retired_client() if retired else _client()
+    if not retired:
+        await client.start()
+    opens = client.opens
+
+    async with client._restart_lock:  # e.g. a reconnect in progress
+        closing = asyncio.create_task(client.close())
+        await asyncio.sleep(0)
+        with pytest.raises(RuntimeError, match="not started"):
+            await client.call_tool("echo", {"text": "x"})
+    await closing
+
+    assert client.opens == opens
+    assert _ECHO_CALLS == []
     assert _live_owner_tasks() == []

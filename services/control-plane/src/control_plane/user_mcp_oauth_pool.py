@@ -29,7 +29,12 @@ from datetime import UTC, datetime
 from uuid import UUID
 
 from control_plane.mcp_oauth_refresh import McpOAuthRefresher
-from control_plane.mcp_retired_clients import RetiredMcpClients, close_retired
+from control_plane.mcp_retired_clients import (
+    RetiredMcpClients,
+    close_retired,
+    release_clients,
+    retire_in_place,
+)
 from control_plane.tenant_scope import bypass_rls_session
 from expert_work.persistence import McpConnectorCatalogStore, McpOAuthConnectionStore
 from expert_work.protocol import McpConnectorCatalogRecord, McpOAuthConnectionRecord
@@ -71,6 +76,7 @@ class UserMcpOAuthPoolService:
         refresher: McpOAuthRefresher | None = None,
         clock: Clock = _utc_now,
         monotonic_clock: Callable[[], float] = time.monotonic,
+        on_expire: Callable[[UUID, str], None] | None = None,
     ) -> None:
         self._oauth_store = oauth_store
         self._catalog_store = catalog_store
@@ -80,6 +86,10 @@ class UserMcpOAuthPoolService:
         # ``clock`` is wall-time for token expiry; the TTL backstop needs a
         # monotonic source (injectable in tests), hence the separate knob.
         self._monotonic_clock = monotonic_clock
+        # B-248 — called once the TTL retired a user's pool: the app evicts
+        # that user's cached agent builds (they hold its clients), so only
+        # runs already in flight are left on the retired clients.
+        self._on_expire = on_expire
         # key -> (pool, built_at monotonic stamp for the TTL backstop)
         self._pools: dict[tuple[UUID, str], tuple[MCPServerPool, float]] = {}
         self._locks_guard = asyncio.Lock()
@@ -89,6 +99,13 @@ class UserMcpOAuthPoolService:
         # later ``invalidate`` (disconnect) / ``close_all`` must hard-stop them.
         # Guarded by ``_locks_guard`` like ``_pools``.
         self._retired: RetiredMcpClients[tuple[UUID, str]] = RetiredMcpClients()
+        # B-248 — per cached key, the connectors left out because the platform
+        # had disabled them, so re-enabling one expires only those pools.
+        self._skipped_off: dict[tuple[UUID, str], frozenset[str]] = {}
+        # Connectors switched off on this replica (``connector_off`` until a
+        # ``connector_on``): a last-attempt build that read the catalog before
+        # the switch must not serve them. Guarded by ``_locks_guard``.
+        self._switched_off: set[str] = set()
 
     async def _key_lock(self, key: tuple[UUID, str]) -> asyncio.Lock:
         async with self._locks_guard:
@@ -157,9 +174,11 @@ class UserMcpOAuthPoolService:
                         await cached_pool.retire_all()
                     except Exception:
                         logger.warning("user_mcp_oauth_pool.expired_close_failed")
+                    self._notify_expired(key)
                 async with self._locks_guard:
                     gen = self._generation.get(key, 0)
                 pool = MCPServerPool()
+                skipped_off: set[str] = set()
                 records = await self._oauth_store.list_for_user(
                     tenant_id=tenant_id, user_id=user_id
                 )
@@ -169,6 +188,12 @@ class UserMcpOAuthPoolService:
                 async with bypass_rls_session():
                     entries = await self._catalog_store.get_by_ids([r.catalog_id for r in records])
                 for record in records:
+                    entry = entries.get(record.catalog_id)
+                    if entry is not None and not entry.enabled:
+                        # B-248 — a connector the platform disabled is off
+                        # for every user (as for new connects), no refresh.
+                        skipped_off.add(record.name)
+                        continue
                     usable = await self._resolve_usable(record)
                     if usable is None:
                         continue
@@ -187,17 +212,86 @@ class UserMcpOAuthPoolService:
                         break
                     except Exception:
                         logger.warning("user_mcp_oauth_pool.server_build_failed")
+                switched_off: list[MCPClient] = []
                 async with self._locks_guard:
                     if self._generation.get(key, 0) == gen:
                         self._pools[key] = (pool, self._monotonic_clock())
+                        self._skipped_off[key] = frozenset(skipped_off)
                         return pool
                     if last_attempt:
-                        return pool
+                        # B-248 — no cache entry will ever close it: track it
+                        # for invalidate / close_all, retire it below.
+                        self._retired.add_pool(key, pool)
+                        for server in pool.names():
+                            found = pool.get(server)
+                            if server in self._switched_off and found is not None:
+                                switched_off.append(found)
+            if last_attempt:
+                # Outside the key lock (B-248). A connector switched off
+                # mid-build is stopped, the rest retired.
+                await release_clients(close=switched_off)
+                await retire_in_place(pool)
+                return pool
             try:
                 await pool.close_all()
             except Exception:
                 logger.warning("user_mcp_oauth_pool.stale_close_failed")
         raise RuntimeError("get_or_build: retry loop exited")  # pragma: no cover
+
+    def _notify_expired(self, key: tuple[UUID, str]) -> None:
+        """Run ``on_expire`` (build eviction); a failure never fails the caller."""
+        if self._on_expire is None:
+            return
+        try:
+            self._on_expire(*key)
+        except Exception as exc:
+            logger.warning("user_mcp_oauth_pool.on_expire_failed err=%s", type(exc).__name__)
+
+    def _bump_all_generations(self) -> None:
+        """Make every in-flight build retry (it may have read the catalog
+        before the change). Caller holds ``_locks_guard``."""
+        for key in self._key_locks:
+            self._generation[key] = self._generation.get(key, 0) + 1
+
+    async def connector_off(self, name: str) -> None:
+        """B-248 — the platform disabled / force-deleted oauth2 connector
+        ``name``: hard-stop its clients (cached and retired copies) for every
+        user. The rest of each affected pool is retired, not closed, so the
+        user's other connectors keep serving runs already in flight."""
+        async with self._locks_guard:
+            self._switched_off.add(name)
+            hit = [key for key, (pool, _) in self._pools.items() if name in pool.names()]
+            stop = self._retired.pop_named(name)
+            rest: list[MCPClient] = []
+            for key in hit:
+                pool, _ = self._pools.pop(key)
+                self._retired.add_pool(key, pool)
+                for server in pool.names():
+                    client = pool.get(server)
+                    if client is not None:
+                        (stop if server == name else rest).append(client)
+            self._bump_all_generations()
+        # Builds first, so no new run picks a cached agent mid-teardown.
+        for key in hit:
+            self._notify_expired(key)
+        await release_clients(close=stop, retire=rest)
+
+    async def connector_on(self, name: str) -> None:
+        """B-248 — oauth2 connector ``name`` was re-enabled: expire (retire,
+        never stop) the pools built while it was off, so their next build
+        picks it up."""
+        async with self._locks_guard:
+            self._switched_off.discard(name)
+            hit = [key for key in self._pools if name in self._skipped_off.get(key, ())]
+            rest: list[MCPClient] = []
+            for key in hit:
+                pool, _ = self._pools.pop(key)
+                self._retired.add_pool(key, pool)
+                rest.extend(c for c in map(pool.get, pool.names()) if c is not None)
+            self._bump_all_generations()
+        for key in hit:
+            self._notify_expired(key)
+        await release_clients(retire=rest)
 
     async def invalidate(self, tenant_id: UUID, user_id: str) -> None:
         """Close + drop the (tenant, user) cached pool (next build rebuilds),
