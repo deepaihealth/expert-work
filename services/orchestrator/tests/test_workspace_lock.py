@@ -1,7 +1,7 @@
 """Stream TE-8 — per-workspace write lock wiring (orchestrator side).
 
 Verifies the tool layer holds the :class:`WorkspaceLock` around the *write*
-exec (``write_file`` / ``bash``) and that reads are lock-free. The real
+exec (``write_file`` / ``bash`` / ``exec_python``) and that reads are lock-free. The real
 cross-replica behaviour (PG advisory lock serialises concurrent writers) is
 covered by the control-plane integration test; here the lock is a recording
 double and a probe client asserts the exec ran while the lock was held.
@@ -19,12 +19,14 @@ import pytest
 from orchestrator.tools import (
     BashTool,
     EditFileTool,
+    ExecPythonTool,
     ListDirTool,
     NullWorkspaceLock,
     ReadFileTool,
     RecordingSandboxRuntime,
     RecordingWorkspaceLock,
     SandboxOutcome,
+    SandboxSupervisorError,
     ToolContext,
     WriteFileTool,
 )
@@ -164,6 +166,58 @@ async def test_edit_file_user_less_locks_with_none_user() -> None:
     assert lock.acquired == [(ctx.tenant_id, None)]
 
 
+def _new_layout_ctx() -> ToolContext:
+    return ToolContext(
+        tenant_id=uuid4(),
+        run_id=uuid4(),
+        user_id=uuid4(),
+        thread_id=uuid4(),
+        agent_key="report-agent",
+        workspace_layout="conversation",
+    )
+
+
+async def test_exec_python_holds_lock_during_exec() -> None:
+    # B-249 —— exec_python 与 bash 一样能写工作区里任何文件,新布局拿同一把(按对话的)锁。
+    lock = RecordingWorkspaceLock()
+    client = _LockProbeClient(lock=lock, envelope="done")
+    ctx = _new_layout_ctx()
+    tool = ExecPythonTool(client=client, workspace_lock=lock)
+    await tool.call({"code": "open('a.txt', 'w').write('x')"}, ctx=ctx)
+    assert client.active_at_exec == 1  # exec ran inside the lock
+    assert lock.acquired == [(ctx.tenant_id, ctx.user_id)]
+    assert lock.conversations == [ctx.thread_id]
+    assert lock.active == 0  # released on exit
+
+
+async def test_exec_python_old_layout_takes_no_lock() -> None:
+    # B-249 —— 老布局的键按用户:拿了就把一个用户的每次 exec_python 排成一队(10-30 的形状)。
+    lock = RecordingWorkspaceLock()
+    client = _LockProbeClient(lock=lock, envelope="done")
+    tool = ExecPythonTool(client=client, workspace_lock=lock)
+    await tool.call({"code": "print(1)"}, ctx=_ctx())
+    assert client.active_at_exec == 0
+    assert lock.acquired == []
+
+
+@pytest.mark.parametrize(
+    "error",
+    [asyncio.CancelledError(), SandboxSupervisorError("supervisor unreachable")],
+    ids=["cancelled", "exec_error"],
+)
+async def test_exec_python_releases_lock_when_exec_fails(error: BaseException) -> None:
+    # B-249 —— 取消与报错都必须经锁的上下文退出,否则 PG 实现的事务不回滚、锁一直挂着。
+    lock = RecordingWorkspaceLock()
+    client = RecordingSandboxRuntime()
+    client.exec_error = error
+    ctx = _new_layout_ctx()
+    tool = ExecPythonTool(client=client, workspace_lock=lock)
+    with pytest.raises(type(error)):
+        await tool.call({"code": "print(1)"}, ctx=ctx)
+    assert lock.acquired == [(ctx.tenant_id, ctx.user_id)]  # the lock was taken
+    assert lock.active == 0  # ...and released despite the failure
+
+
 def test_reads_are_lock_free() -> None:
     # read_file / list_dir declare no workspace_lock field — reads never
     # serialise; only the write tools carry the lock.
@@ -172,3 +226,4 @@ def test_reads_are_lock_free() -> None:
     assert "workspace_lock" in {f.name for f in fields(WriteFileTool)}
     assert "workspace_lock" in {f.name for f in fields(EditFileTool)}
     assert "workspace_lock" in {f.name for f in fields(BashTool)}
+    assert "workspace_lock" in {f.name for f in fields(ExecPythonTool)}

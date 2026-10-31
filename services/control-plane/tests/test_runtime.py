@@ -491,13 +491,20 @@ def _runtime_with_oauth(builds: list[tuple[str | None, ...]], users_with_oauth: 
         builds.append((str(tenant_id), user_id))
         return object()
 
+    # Cached per (tenant, user) like the real ``get_or_build`` — B-260 compares the
+    # pool object the key was decided from with the one fetched after the build.
+    pools: dict[tuple[UUID, str], MCPServerPool] = {}
+
     async def _provider(tenant_id: UUID, user_id: str) -> MCPServerPool:
+        if (tenant_id, user_id) in pools:
+            return pools[(tenant_id, user_id)]
         pool = MCPServerPool()
         if user_id in users_with_oauth:
             await pool.add(
                 "linear",
                 RecordingMCPClient(tools=(MCPToolDef(name="t", description="", input_schema={}),)),
             )
+        pools[(tenant_id, user_id)] = pool
         return pool
 
     return AgentRuntime(
