@@ -25,6 +25,8 @@ from control_plane.platform_judge_config import PlatformJudgeConfigService
 from control_plane.platform_mcp_pool import PlatformMcpPoolProvider
 from control_plane.platform_tool_budget_config import PlatformToolBudgetConfigService
 from control_plane.runtime import (
+    MAX_AGENT_BUILD_ATTEMPTS,
+    BuildGenerations,
     catalog_build_cacheable,
     knowledge_catalog_fingerprint,
     make_mcp_allowlist_provider,
@@ -41,13 +43,20 @@ from expert_work.common.uplift_metrics import set_built_agent_cache_entries
 from expert_work.persistence.agent_spec import AgentSpecStore
 from expert_work.persistence.platform_agent_template import compute_spec_sha256
 from expert_work.persistence.skill import SkillStore
-from expert_work.protocol import AgentSpec, BuiltinToolSpec, SystemPromptSpec, ToolSpecEntry
+from expert_work.protocol import (
+    AgentSpec,
+    AgentSpecRecord,
+    BuiltinToolSpec,
+    SystemPromptSpec,
+    ToolSpecEntry,
+)
 from expert_work.runtime.audit.logger import AuditLogger
 from expert_work.runtime.secret_store import SecretStore
 from expert_work.runtime.skill_assets import ObjectStore as SkillAssetStore
 from orchestrator import BuiltAgent, MemoryEnv, MiddlewareEnv, ToolEnv, build_agent
 from orchestrator.llm import RateLimiterFactory
 from orchestrator.tools import ChildAgentBuilder
+from orchestrator.tools.mcp import MCPServerPool
 from orchestrator.tools.spawn_worker import WorkerBuildFn
 from orchestrator.tools.worker_policy import WORKER_DENIED_BUILTINS, worker_policy_enabled
 
@@ -388,6 +397,8 @@ def make_child_agent_builder(
     # only backstops invalidation paths that were never wired; explicit
     # invalidation (the registered hooks below) stays the primary path.
     cache: OrderedDict[_ChildKey, tuple[BuiltAgent, float]] = OrderedDict()
+    # B-260 —— 本缓存自己的失效代次,由下面三个失效函数(经运行时的挂钩)+1。
+    build_generations = BuildGenerations()
 
     def _publish_cache_size() -> None:
         """Refresh the subagent-scope cache size gauge (二期 PR2 T4)."""
@@ -402,12 +413,95 @@ def make_child_agent_builder(
         oauth_user_id: str | None = None,
         token_usage_kind: str = "conversation",  # noqa: S107 — usage label, not a secret
     ) -> BuiltAgent:
+        # B-260 —— 与 ``AgentRuntime.get_agent`` 同一套闸:构建前记代次、入缓存前比对,
+        # 构建期间落了覆盖它的失效(池子已关掉它拿到的客户端)就丢弃重建,最多
+        # ``MAX_AGENT_BUILD_ATTEMPTS`` 次,最后一次仍撞上就交出、不入缓存。
+        for attempt in range(MAX_AGENT_BUILD_ATTEMPTS):
+            last_attempt = attempt == MAX_AGENT_BUILD_ATTEMPTS - 1
+            # 代次记在定键之前:定键时取的用户池若随后被失效关掉,代次必在这之后 +1。
+            generations = build_generations.snapshot(tenant_id, oauth_user_id)
+            record, key, user_pool = await _child_key(
+                tenant_id=tenant_id,
+                name=name,
+                version=version,
+                depth=depth,
+                oauth_user_id=oauth_user_id,
+                token_usage_kind=token_usage_kind,
+            )
+            cached = _cached(key)
+            if cached is not None:
+                return cached
+            if (
+                build_generations.snapshot(tenant_id, oauth_user_id) != generations
+                and not last_attempt
+            ):
+                # 定键期间就失效了(多是取用户池时 OAuth 刷新令牌):重新定键,不白构建。
+                continue
+            built = await _build_child(
+                record,
+                tenant_id=tenant_id,
+                depth=depth,
+                user_pool=user_pool,
+                token_usage_kind=token_usage_kind,
+            )
+            # 定键时的用户池若在这期间到期退役,它的客户端已被清空(到期不 +1 运行时代次):
+            # 挂着空池的构建不入缓存,否则这个用户的子代 30 分钟里都没有授权工具。
+            pool_emptied = user_pool is not None and not user_pool.names()
+            if pool_emptied or build_generations.snapshot(tenant_id, oauth_user_id) != generations:
+                logger.info(
+                    "control_plane.subagent.build_not_cached reason=invalidated_mid_build "
+                    "attempt=%d",
+                    attempt + 1,
+                )
+                if last_attempt:
+                    return built
+                continue
+            # B-175 P4 — a build that froze another catalog than the key read is
+            # served but not cached (``catalog_build_cacheable``).
+            keyed_catalog = (
+                child_tool_env.knowledge_retriever is not None
+                and record.spec.spec.knowledge is not None
+            )
+            if catalog_build_cacheable(key[-1], built, checked=keyed_catalog):
+                cache[key] = (built, clock() + cache_ttl_s)
+                cache.move_to_end(key)
+                while len(cache) > cache_max_size:
+                    # LRU eviction — pure abandonment, no close (same rationale as
+                    # the expiry branch in ``_cached``).
+                    cache.popitem(last=False)
+                _publish_cache_size()
+            logger.info(
+                "control_plane.subagent.built name=%s version=%s depth=%d",
+                name,
+                version,
+                depth,
+            )
+            return built
+        raise RuntimeError("child build: retry loop exited without returning")  # pragma: no cover
+
+    async def _resolve_user_pool(
+        tenant_id: UUID, oauth_user_id: str | None
+    ) -> MCPServerPool | None:
+        """The caller's OAuth pool when it has ≥1 connected server, else ``None``."""
+        if user_mcp_oauth_pool_provider is None or oauth_user_id is None:
+            return None
+        candidate = await user_mcp_oauth_pool_provider(tenant_id, oauth_user_id)
+        return candidate if candidate.names() else None
+
+    async def _child_key(
+        *,
+        tenant_id: UUID,
+        name: str,
+        version: str,
+        depth: int,
+        oauth_user_id: str | None,
+        token_usage_kind: str,
+    ) -> tuple[AgentSpecRecord, _ChildKey, MCPServerPool | None]:
+        """Read the manifest and build the content-addressed cache key; also return
+        the user OAuth pool the key was decided from (B-260 —— the build attaches
+        exactly this pool, so key and build always agree on whose tools it holds)."""
         # Resolve the caller's OAuth pool up front so the cache key can reflect it.
-        user_pool = None
-        if user_mcp_oauth_pool_provider is not None and oauth_user_id is not None:
-            candidate = await user_mcp_oauth_pool_provider(tenant_id, oauth_user_id)
-            if candidate.names():
-                user_pool = candidate
+        user_pool = await _resolve_user_pool(tenant_id, oauth_user_id)
         # The manifest read moved AHEAD of the cache lookup: the key hashes the
         # spec, so the spec has to be in hand before we can ask the cache
         # anything. Costs one indexed single-row read per delegation (previously
@@ -434,6 +528,10 @@ def make_child_agent_builder(
                 tenant_id=tenant_id,
             ),
         )
+        return record, key, user_pool
+
+    def _cached(key: _ChildKey) -> BuiltAgent | None:
+        """A live cache entry for ``key`` (refreshing its LRU slot), else ``None``."""
         cached = cache.get(key)
         if cached is not None:
             cached_built, expires_at = cached
@@ -448,6 +546,17 @@ def make_child_agent_builder(
             # config change (二期 PR2 T4).
             del cache[key]
             _publish_cache_size()
+        return None
+
+    async def _build_child(
+        record: AgentSpecRecord,
+        *,
+        tenant_id: UUID,
+        depth: int,
+        user_pool: MCPServerPool | None,
+        token_usage_kind: str,
+    ) -> BuiltAgent:
+        """One uncached child build from an already-read manifest record."""
         provider_key_resolver = (
             make_provider_key_resolver(resolver=credentials_resolver, tenant_id=tenant_id)
             if credentials_resolver is not None
@@ -484,7 +593,8 @@ def make_child_agent_builder(
                 call_tool_env = replace(call_tool_env, tenant_mcp_pool=tenant_pool)
         # MCP-OAUTH (OA-3b-后续) — inject the caller's per-user OAuth pool so the
         # delegated child resolves the SAME OAuth-connected MCP servers as the
-        # parent (resolved above for the cache key).
+        # parent. B-260 —— 挂定键时那一份,不重新取:重新取到刚连上的池而键是共享键,
+        # 就会把这个用户的授权工具缓存给同租户所有人。
         if user_pool is not None:
             call_tool_env = replace(call_tool_env, user_mcp_oauth_pool=user_pool)
         # BUG-19b —— 子 Agent 不排任务(既定意图):spec 层剥 manage_task,
@@ -538,26 +648,6 @@ def make_child_agent_builder(
             http_client=http_client,
             rate_limiter_factory=rate_limiter_factory,
         )
-        # B-175 P4 — a build that froze another catalog than the key read is
-        # served but not cached (``catalog_build_cacheable``).
-        keyed_catalog = (
-            child_tool_env.knowledge_retriever is not None
-            and record.spec.spec.knowledge is not None
-        )
-        if catalog_build_cacheable(key[-1], built, checked=keyed_catalog):
-            cache[key] = (built, clock() + cache_ttl_s)
-            cache.move_to_end(key)
-            while len(cache) > cache_max_size:
-                # LRU eviction — pure abandonment, no close (same rationale as
-                # the expiry branch above).
-                cache.popitem(last=False)
-            _publish_cache_size()
-        logger.info(
-            "control_plane.subagent.built name=%s version=%s depth=%d",
-            name,
-            version,
-            depth,
-        )
         return built
 
     def _invalidate_tenant(tenant_id: UUID) -> None:
@@ -567,6 +657,7 @@ def make_child_agent_builder(
         change evicts stale delegated sub-agents (whose ``ToolEnv`` holds a
         now-closed tenant MCP pool), mirroring the top-level cache.
         """
+        build_generations.bump_tenant(tenant_id)  # B-260 —— 进行中的子代构建不入缓存
         for key in [k for k in cache if k[0] == tenant_id]:
             del cache[key]
         _publish_cache_size()
@@ -578,6 +669,7 @@ def make_child_agent_builder(
         change (the platform shared catalog) evicts stale delegated sub-agents
         across all tenants, mirroring the top-level cache.
         """
+        build_generations.bump_all()  # B-260
         cache.clear()
         _publish_cache_size()
 
@@ -593,6 +685,7 @@ def make_child_agent_builder(
         ``_ChildKey``) and is ``None`` on the shared builds, which therefore
         never match a real subject.
         """
+        build_generations.bump_user(tenant_id, user_id)  # B-260
         for key in [k for k in cache if k[0] == tenant_id and k[6] == user_id]:
             del cache[key]
         _publish_cache_size()
