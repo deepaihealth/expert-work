@@ -157,11 +157,7 @@ class IngestEstimator:
         )
         scanned = local.kind == "pdf" and local.analysis is not None and local.analysis.ocr_pages
         recognition = await self._recognition(claim) if scanned else None
-        pages = (
-            await self._pages(claim, local, recognition, bytes_unchanged)
-            if recognition is not None
-            else None
-        )
+        pages = await self._pages(claim, local, recognition) if recognition is not None else None
         figure_model, figure_count = await self._figures_of(claim, local, bytes_unchanged)
         embedding = await count_embedding(
             self._store,
@@ -256,19 +252,12 @@ class IngestEstimator:
         claim: ClaimedIngestion,
         local: LocalParse,
         recognition: _Recognition,
-        bytes_unchanged: bool,
     ) -> PageCount | None:
         if local.analysis is None:
             return None
-        previous = (
-            await self._store.list_document_pages(
-                tenant_id=claim.tenant_id, document_id=claim.document_id
-            )
-            if bytes_unchanged
-            else None
-        )
-        # B-238 —— 取消后再入库:已读页的识别在文档缓存里(主 / 兜底模型的都算),
-        # 只认记了页码、来源正是这份字节、读法与这次入库相同的识别。
+        # B-238 / B-256 —— 已读页的识别在文档缓存里(主 / 兜底模型的都算),只认记了页码、
+        # 来源正是这份字节、读法与这次入库相同的识别:入库也只复用这些(按缓存键查),
+        # 上次入库的逐页记录不看(换了模型 / 提示词版本时它们全部要重新收费)。
         cached = (
             await self._store.cached_page_indexes(
                 tenant_id=claim.tenant_id,
@@ -279,13 +268,7 @@ class IngestEstimator:
             if recognition.readers and claim.content is not None
             else set()
         )
-        return count_pages(
-            local.analysis,
-            max_pages=recognition.max_pages,
-            previous=previous or [],
-            bytes_unchanged=bytes_unchanged,
-            cached=cached,
-        )
+        return count_pages(local.analysis, max_pages=recognition.max_pages, cached=cached)
 
     async def _recognition(self, claim: ClaimedIngestion) -> _Recognition:
         if self._recognizer is None:

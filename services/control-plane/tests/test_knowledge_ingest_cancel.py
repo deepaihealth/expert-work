@@ -47,7 +47,12 @@ from control_plane.knowledge.recognition.recognizer import (
 )
 from control_plane.knowledge.recovery import KnowledgeIngestRecoveryWorker
 from expert_work.persistence import InMemoryKnowledgeStore
-from expert_work.persistence.knowledge.base import ClaimedIngestion
+from expert_work.persistence.knowledge.base import (
+    PAGE_OCR_PAGE,
+    PAGE_OCR_READER,
+    PAGE_OCR_SOURCE,
+    ClaimedIngestion,
+)
 from expert_work.protocol import DEFAULT_CHUNK_MAX_TOKENS, DocumentStatus
 from expert_work.protocol.knowledge_estimate import EstimateKind
 from expert_work.runtime.storage import InMemoryObjectStore
@@ -547,6 +552,152 @@ async def test_the_estimate_after_a_cancel_leaves_out_the_pages_already_read() -
     document = await store.get_document(tenant_id=_TENANT, document_id=document_id)
     assert document is not None and document.status is DocumentStatus.READY
     assert model.calls - read_before == line.units - line.reused_units
+
+
+class _SwitchableSettings:
+    """The platform's recognition settings; the primary model can be switched."""
+
+    def __init__(self) -> None:
+        self.primary = ModelChoice("glm", "glm-ocr")
+
+    async def recognition_settings(self) -> RecognitionSettings:
+        return RecognitionSettings(primary=self.primary, fallback=None, max_pages=1000, figure=None)
+
+
+async def _never_cancel() -> None:
+    return None
+
+
+async def test_the_estimate_after_a_model_switch_bills_every_page_read_again() -> None:
+    # B-256: the last ingest finished — every page on record as recognized,
+    # the bytes unchanged — then the recognition model was switched. The ingest
+    # finds no reading of the new model in the cache and reads every page again:
+    # the estimate must say so (it used to count them all as read).
+    raw = _scanned_pdf(6)
+    store = InMemoryKnowledgeStore()
+    kb_id, document_id = await _document(store, "scan.pdf", raw)
+    model = _CancellingModel(_never_cancel, "Recognised words.")
+    settings = _SwitchableSettings()
+    recognizer = DocumentRecognizer(
+        store=store, settings=settings, api_keys=_keys, client_factory=model.reader
+    )
+    runner = KnowledgeIngestionRunner(store=store, embedder=FakeEmbedder(), recognizer=recognizer)
+    await runner.submit(tenant_id=_TENANT, document_id=document_id)
+    first = await store.get_document(tenant_id=_TENANT, document_id=document_id)
+    assert first is not None and first.status is DocumentStatus.READY
+    assert first.page_stats is not None and first.page_stats.pages_ocr == 6
+    assert model.calls == 6
+
+    claim = ClaimedIngestion(
+        tenant_id=_TENANT,
+        document_id=document_id,
+        kb_id=kb_id,
+        filename="scan.pdf",
+        content=raw,
+        content_sha256="sha",
+        chunk_max_tokens=DEFAULT_CHUNK_MAX_TOKENS,
+        chunk_overlap_tokens=0,
+        attempts=1,
+        generation=1,
+        phase="estimate",
+        origin="reingest",
+        serving_sha256="sha",
+    )
+    local = await parse_locally(
+        store,
+        tenant_id=_TENANT,
+        kb_id=kb_id,
+        document_id=document_id,
+        filename="scan.pdf",
+        raw=raw,
+        figures=None,
+    )
+    estimator = IngestEstimator(store=store, recognizer=recognizer)
+
+    async def recognition_line() -> tuple[int, int]:
+        estimate = await estimator.estimate(
+            claim, local, embedding_model=None, now=datetime.now(UTC)
+        )
+        (line,) = [item for item in estimate.items if item.kind is EstimateKind.RECOGNITION]
+        return line.units, line.reused_units
+
+    async def ingest_again() -> int:
+        before = model.calls
+        await store.upsert_document(tenant_id=_TENANT, kb_id=kb_id, filename="scan.pdf")
+        await runner.submit(tenant_id=_TENANT, document_id=document_id)
+        document = await store.get_document(tenant_id=_TENANT, document_id=document_id)
+        assert document is not None and document.status is DocumentStatus.READY
+        return model.calls - before
+
+    # The same model: every page comes from the cache, none is billed.
+    units, reused = await recognition_line()
+    assert (units, reused) == (6, 6)
+    assert await ingest_again() == units - reused == 0
+
+    # Another model: every page is read — and billed — again, as estimated.
+    settings.primary = ModelChoice("qwen", "qwen3.8-flash")
+    units, reused = await recognition_line()
+    assert (units, reused) == (6, 0)
+    assert await ingest_again() == units - reused == 6
+
+
+async def test_pages_read_before_b238_are_free_again_after_one_reingest() -> None:
+    # B-256: readings cached before B-238 record no page / bytes / reader, so the
+    # estimate bills them (high, the safe side) although the ingest reuses them;
+    # that ingest tags them, and from then on they are estimated free.
+    raw = _scanned_pdf(4)
+    store = InMemoryKnowledgeStore()
+    kb_id, document_id = await _document(store, "scan.pdf", raw)
+    model = _CancellingModel(_never_cancel, "Recognised words.")
+    recognizer = DocumentRecognizer(
+        store=store, settings=_SwitchableSettings(), api_keys=_keys, client_factory=model.reader
+    )
+    runner = KnowledgeIngestionRunner(store=store, embedder=FakeEmbedder(), recognizer=recognizer)
+    await runner.submit(tenant_id=_TENANT, document_id=document_id)
+    assert model.calls == 4
+    # As a reading cached before B-238 looks.
+    for entry in store._parse_cache.values():
+        for name in (PAGE_OCR_PAGE, PAGE_OCR_SOURCE, PAGE_OCR_READER):
+            entry.result.pop(name, None)
+
+    claim = ClaimedIngestion(
+        tenant_id=_TENANT,
+        document_id=document_id,
+        kb_id=kb_id,
+        filename="scan.pdf",
+        content=raw,
+        content_sha256="sha",
+        chunk_max_tokens=DEFAULT_CHUNK_MAX_TOKENS,
+        chunk_overlap_tokens=0,
+        attempts=1,
+        generation=1,
+        phase="estimate",
+        origin="reingest",
+        serving_sha256="sha",
+    )
+    local = await parse_locally(
+        store,
+        tenant_id=_TENANT,
+        kb_id=kb_id,
+        document_id=document_id,
+        filename="scan.pdf",
+        raw=raw,
+        figures=None,
+    )
+    estimator = IngestEstimator(store=store, recognizer=recognizer)
+
+    async def recognition_line() -> tuple[int, int]:
+        estimate = await estimator.estimate(
+            claim, local, embedding_model=None, now=datetime.now(UTC)
+        )
+        (line,) = [item for item in estimate.items if item.kind is EstimateKind.RECOGNITION]
+        return line.units, line.reused_units
+
+    assert await recognition_line() == (4, 0)
+    await store.upsert_document(tenant_id=_TENANT, kb_id=kb_id, filename="scan.pdf")
+    await runner.submit(tenant_id=_TENANT, document_id=document_id)
+    assert model.calls == 4  # reused from the cache, not read again
+    assert await recognition_line() == (4, 4)
 
 
 # ---------------------------------------------------------------------------

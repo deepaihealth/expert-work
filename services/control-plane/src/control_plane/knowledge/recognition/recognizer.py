@@ -55,7 +55,7 @@ from control_plane.knowledge.recognition.figure_markup import (
     region_placeholder,
     resolve_figures,
 )
-from control_plane.knowledge.recognition.pages import render_params
+from control_plane.knowledge.recognition.pages import RENDERER_VERSION, render_params
 from control_plane.knowledge.stale import StaleIngestionError
 from expert_work.common.observability import expert_work_counter
 from expert_work.persistence.knowledge.base import (
@@ -65,6 +65,7 @@ from expert_work.persistence.knowledge.base import (
     KnowledgeStore,
     ParseCacheEntry,
     ParseCacheKind,
+    is_page_index,
 )
 from expert_work.protocol import OcrCaps, PageStatus, catalog_entry
 from orchestrator.agent_factory import thinking_off_request_fields
@@ -370,10 +371,24 @@ def cache_key(image: bytes, engine_key: str, cache_tag: str, render: str) -> str
 
 def reader_digest(engine_key: str, cache_tag: str, render: str) -> str:
     """B-238 —— a cache key less the image: the model, its request parameters
-    and the rendering."""
+    and the rendering; B-256 —— and the renderer's version (a new one may draw
+    other bytes: the cache keys miss while the rest of the digest still matches)."""
     # The estimate trusts this digest: a change to ``_accept`` / ``reading_failure`` or to
-    # the renderer that changes outcomes must bump OCR_PROMPT_VERSION / the render params.
-    return hashlib.sha256(f"{engine_key}|{cache_tag}|{render}".encode()).hexdigest()
+    # the renderer's own code that changes outcomes must bump OCR_PROMPT_VERSION / the
+    # render params.
+    return hashlib.sha256(
+        f"{engine_key}|{cache_tag}|{render}|{RENDERER_VERSION}".encode()
+    ).hexdigest()
+
+
+def _page_tags(index: int, engine: _Engine, source: _PageSource) -> dict[str, object]:
+    """B-238 —— what a scanned page's cached reading records: its page, the
+    bytes it was rendered from and how it was read."""
+    return {
+        PAGE_OCR_PAGE: index,
+        PAGE_OCR_SOURCE: source.sha256,
+        PAGE_OCR_READER: reader_digest(engine.choice.key, engine.cache_tag, source.render),
+    }
 
 
 def source_digest(raw: bytes) -> str:
@@ -666,6 +681,10 @@ class DocumentRecognizer:
                 _accept, _reading_from_cache(hit), image
             )
             if failure is None:
+                if source is not None:
+                    await self._tag(
+                        tenant_id, document_id, kind, key, hit, _page_tags(index, engine, source)
+                    )
                 return PageOutcome(
                     status=PageStatus.RECOGNIZED,
                     text=text,
@@ -725,17 +744,7 @@ class DocumentRecognizer:
                 unavailable_only = False
                 continue
             # B-238 —— 扫描页的识别记下页码、来源字节与读法,估算按它数「已识别的页」。
-            tags = (
-                {
-                    PAGE_OCR_PAGE: index,
-                    PAGE_OCR_SOURCE: source.sha256,
-                    PAGE_OCR_READER: reader_digest(
-                        engine.choice.key, engine.cache_tag, source.render
-                    ),
-                }
-                if source is not None
-                else {}
-            )
+            tags = _page_tags(index, engine, source) if source is not None else {}
             await self._remember(tenant_id, document_id, kind, key, engine.choice, reading, tags)
             if skipped:
                 _note_fallback(document_id, kind, index, engine.choice, skipped)
@@ -774,6 +783,42 @@ class DocumentRecognizer:
             input_tokens=input_tokens,
             output_tokens=output_tokens,
         )
+
+    async def _tag(
+        self,
+        tenant_id: UUID,
+        document_id: UUID,
+        kind: ParseCacheKind,
+        key: str,
+        hit: ParseCacheEntry,
+        tags: Mapping[str, object],
+    ) -> None:
+        """B-256 —— a scanned page taken from the cache records its page, bytes
+        and reader too, when the reading does not yet (cached before B-238, of
+        other bytes with the same page image, before the reader digest changed):
+        otherwise every later estimate bills it although the ingest reuses it.
+        The key it was found under already encodes the model, request and
+        rendering, so the tags are right by construction. Best effort."""
+        current = hit.result
+        if is_page_index(current.get(PAGE_OCR_PAGE)) and all(
+            current.get(name) == tags[name] for name in (PAGE_OCR_SOURCE, PAGE_OCR_READER)
+        ):
+            # Tagged already. A page index of its own is kept: two identical page images
+            # share one reading, and rewriting it each ingest would only move it back and forth.
+            return
+        try:
+            await self._store.put_parse_cache(
+                tenant_id=tenant_id,
+                document_id=document_id,
+                kind=kind,
+                key=key,
+                model=hit.model,
+                result={**current, **tags},
+            )
+        except Exception:
+            logger.warning(
+                "knowledge.recognition_cache_tag_failed document=%s", document_id, exc_info=True
+            )
 
     async def _remember(
         self,
