@@ -49,6 +49,9 @@ from expert_work.persistence.knowledge.passages import (
     DisabledReason as DisabledReason,
 )
 from expert_work.persistence.knowledge.passages import (
+    DiscardedEdits as DiscardedEdits,
+)
+from expert_work.persistence.knowledge.passages import (
     ManualPassage as ManualPassage,
 )
 from expert_work.persistence.knowledge.passages import (
@@ -959,11 +962,14 @@ class KnowledgeStore(abc.ABC):
         retention job (30 days after ``orphaned_at``)."""
 
     @abc.abstractmethod
-    async def discard_unapplied_revisions(self, *, tenant_id: UUID, document_id: UUID) -> int:
+    async def discard_unapplied_revisions(
+        self, *, tenant_id: UUID, document_id: UUID
+    ) -> DiscardedEdits:
         """Delete what :meth:`list_unapplied_revisions` lists: the whole
         history of every passage that is gone, the revisions above the
         current one of a passage still there, and the switch-off records no
-        passage holds the text of. Returns the rows deleted."""
+        passage holds the text of. Returns how many entries that listing had
+        and how many revision rows went (B-241)."""
 
     @abc.abstractmethod
     async def count_review_items(

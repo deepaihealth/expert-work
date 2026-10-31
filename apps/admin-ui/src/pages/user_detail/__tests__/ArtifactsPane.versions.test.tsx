@@ -11,6 +11,15 @@ import "../../../i18n";
 import * as artifactsSdk from "../../../api/artifacts";
 import { ArtifactsPane } from "../ArtifactsPane";
 
+vi.mock("../../../tenant/TenantScopeContext", async (importOriginal) => {
+  const { mockTenantScopeModule } = await import("../../../test-utils/tenantScopeMock");
+  return mockTenantScopeModule(
+    await importOriginal<typeof import("../../../tenant/TenantScopeContext")>(),
+    { current: undefined },
+  );
+});
+vi.mock("../../../tenant/useIsTenantSwitched", () => ({ useIsTenantSwitched: () => false }));
+
 const list = vi.spyOn(artifactsSdk, "listArtifacts");
 const versions = vi.spyOn(artifactsSdk, "listArtifactVersions");
 const download = vi.spyOn(artifactsSdk, "downloadArtifact");
