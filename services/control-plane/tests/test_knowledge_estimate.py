@@ -3,8 +3,9 @@
 The estimate lists only what the tenant is billed (embeddings, scanned-page
 recognition, figure descriptions), counts chunks as the ingest cuts them
 (less the vectors the document already has from the same model), pages and
-figures from the local parse (less what was read before when the bytes are
-unchanged), takes per-call averages from the model catalog (else the platform's
+figures from the local parse (less what was read before: pages whose reading
+by a model in use is in the document's cache, figures described before when the
+bytes are unchanged), takes per-call averages from the model catalog (else the platform's
 generic ones, said so), prices with the rate card (no row: unpriced), refuses
 what the ingest would refuse before anything is spent, and calls no model.
 """
@@ -39,6 +40,7 @@ from control_plane.knowledge.parsed_size import (
 )
 from control_plane.knowledge.parsing import DocumentParseError
 from control_plane.knowledge.pricing import Rate, RateCardPrices, price_spend
+from control_plane.knowledge.recognition import recognizer as recognizer_module
 from control_plane.knowledge.recognition.clients import Reading
 from control_plane.knowledge.recognition.figure_pipeline import FigureDescriber
 from control_plane.knowledge.recognition.ingest_parse import LocalParse
@@ -476,22 +478,16 @@ async def test_without_a_usable_recognition_model_the_pages_wait_unbilled() -> N
     assert EstimateNote.RECOGNITION_UNAVAILABLE.value in estimate.notes
 
 
-async def test_pages_read_before_are_not_counted_again_when_the_bytes_are_unchanged() -> None:
-    setup = await _new(_MIXED.filename, _MIXED.raw)
+async def _record_recognized(setup: _Setup, *pages: int) -> None:
+    """The last ingest's page records: ``pages`` (1-based) recognized."""
     await setup.store.set_document_pages(
         tenant_id=setup.tenant,
         document_id=setup.document,
         pages=[
-            DocumentPage(page=1, decision=PageDecision.TEXT),
-            DocumentPage(page=2, decision=PageDecision.OCR, status=PageStatus.RECOGNIZED),
-            DocumentPage(page=3, decision=PageDecision.TEXT),
+            DocumentPage(page=page, decision=PageDecision.OCR, status=PageStatus.RECOGNIZED)
+            for page in pages
         ],
     )
-    same = await _estimate(setup, serving="sha-1")
-    (line,) = _items(same, EstimateKind.RECOGNITION)
-    assert (line.units, line.reused_units, line.input_tokens) == (1, 1, 0)
-    changed = await _estimate(setup, serving="sha-0")
-    assert _items(changed, EstimateKind.RECOGNITION)[0].reused_units == 0
 
 
 # B-238 —— pages read before a cancelled ingest: each cached reading records its
@@ -577,21 +573,91 @@ async def test_a_cached_page_past_the_page_limit_is_not_counted() -> None:
     assert (await _reused(setup))[:2] == (3, 1)
 
 
-async def test_a_page_both_on_record_and_cached_counts_once() -> None:
+# B-256 —— the last ingest's page records are not enough: the ingest takes a page
+# from the cache only when it was read the way it reads now (model, prompt
+# version, rendering), else the page is read — and billed — again.
+
+
+async def test_a_page_read_the_way_it_reads_now_is_not_counted_again() -> None:
+    setup = await _new(_MIXED.filename, _MIXED.raw)
+    await _record_recognized(setup, 2)  # 1-based: the scanned page, index 1
+    primary, _ = await _readers(setup)
+    await _cache_page(setup, 1, primary)
+    assert await _reused(setup, serving="sha-1") == (1, 1, 0)
+
+
+async def test_a_page_on_record_without_its_reading_in_the_cache_is_billed() -> None:
+    # The bytes unchanged, the page on record as recognized — but no reading of
+    # it by a model in use: the ingest reads it again.
+    setup = await _new(_MIXED.filename, _MIXED.raw)
+    await _record_recognized(setup, 2)
+    assert await _reused(setup, serving="sha-1") == (1, 0, 2_733)
+
+
+async def test_pages_on_record_are_billed_once_the_recognition_model_is_switched() -> None:
+    settings = _Settings()
+    setup = await _new("scan.pdf", _scanned_pdf(pages=3), settings=settings)
+    await _record_recognized(setup, 1, 2, 3)
+    primary, fallback = await _readers(setup)
+    for page in range(3):
+        await _cache_page(setup, page, primary)
+    assert (await _reused(setup, serving="sha-1"))[:2] == (3, 3)
+    # The tenant switches the recognition model: every cache key misses.
+    settings.primary = ModelChoice("acme", "ocr-2")
+    assert (await _reused(setup, serving="sha-1"))[:2] == (3, 0)
+    # The fallback, still configured, reads the same way: its readings count.
+    await _cache_page(setup, 0, fallback)
+    assert (await _reused(setup, serving="sha-1"))[:2] == (3, 1)
+
+
+async def test_pages_on_record_are_billed_once_the_recognition_prompt_changes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings = _Settings(primary=ModelChoice("qwen", "qwen3.8-flash"), fallback=None)
+    setup = await _new("scan.pdf", _scanned_pdf(pages=2), settings=settings)
+    await _record_recognized(setup, 1, 2)
+    (reader,) = (await setup.recognizer.plan(tenant_id=setup.tenant)).page_readers()
+    for page in range(2):
+        await _cache_page(setup, page, reader)
+    assert (await _reused(setup, serving="sha-1"))[:2] == (2, 2)
+    # The platform bumps the recognition prompt version.
+    monkeypatch.setattr(recognizer_module, "OCR_PROMPT_VERSION", "scan-ocr-next")
+    assert (await _reused(setup, serving="sha-1"))[:2] == (2, 0)
+
+
+async def test_pages_read_by_another_renderer_version_are_billed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A new renderer may draw other image bytes: every cache key misses although
+    # the model, prompt and render settings are the same.
+    setup = await _new("scan.pdf", _scanned_pdf(pages=2))
+    primary, _ = await _readers(setup)
+    for page in range(2):
+        await _cache_page(setup, page, primary)
+    assert (await _reused(setup))[:2] == (2, 2)
+    monkeypatch.setattr(recognizer_module, "RENDERER_VERSION", "pymupdf=9.9.9;mupdf=9.9.9")
+    assert (await _reused(setup))[:2] == (2, 0)
+
+
+async def test_pages_on_record_with_only_untagged_readings_are_billed() -> None:
+    # Read before B-238: the readings record no page / bytes / reader. They may
+    # still be reused by the ingest, but the estimate cannot tell — it errs high.
+    setup = await _new("scan.pdf", _scanned_pdf(pages=2))
+    await _record_recognized(setup, 1, 2)
+    primary, _ = await _readers(setup)
+    for page in range(2):
+        await _cache_page(setup, page, primary, tagged=False)
+    assert (await _reused(setup, serving="sha-1"))[:2] == (2, 0)
+
+
+async def test_only_the_cache_counts_whether_or_not_the_page_is_on_record() -> None:
     setup = await _new("scan.pdf", _scanned_pdf(pages=4))
-    await setup.store.set_document_pages(
-        tenant_id=setup.tenant,
-        document_id=setup.document,
-        pages=[
-            DocumentPage(page=page, decision=PageDecision.OCR, status=PageStatus.RECOGNIZED)
-            for page in (1, 2)  # 1-based: pages 0 and 1
-        ],
-    )
+    await _record_recognized(setup, 1, 2)  # 1-based: pages 0 and 1
     primary, _ = await _readers(setup)
     for page in (1, 2):
         await _cache_page(setup, page, primary)
-    assert (await _reused(setup, serving="sha-1"))[1] == 3
-    # The records are of the serving version: other bytes leave only the cache.
+    # Page 0 is on record only: billed. Pages 1 and 2 are cached: free.
+    assert (await _reused(setup, serving="sha-1"))[1] == 2
     assert (await _reused(setup, serving="sha-0"))[1] == 2
 
 

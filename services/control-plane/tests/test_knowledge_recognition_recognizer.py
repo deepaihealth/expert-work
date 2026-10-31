@@ -30,8 +30,10 @@ from control_plane.knowledge.recognition.recognizer import (
     PageOutcome,
     RecognitionSettings,
     default_client,
+    reader_digest,
 )
 from expert_work.persistence import InMemoryKnowledgeStore
+from expert_work.persistence.knowledge.base import PAGE_OCR_PAGE, PAGE_OCR_READER, PAGE_OCR_SOURCE
 from expert_work.protocol import PageStatus
 
 GLM_OCR = ModelChoice("glm", "glm-ocr")
@@ -722,6 +724,117 @@ async def test_readings_without_a_source_or_of_figures_record_no_page() -> None:
     assert all(
         set(result) == {"raw", "finish_reason", "layout_chars", "layout_size"} for result in results
     )
+
+
+# B-256 —— a page taken from a reading cached before B-238 (no page / bytes /
+# reader recorded) is tagged on the way: the estimate counts it from then on.
+
+_TAGS = {PAGE_OCR_PAGE, PAGE_OCR_SOURCE, PAGE_OCR_READER}
+
+
+class _WriteCountingStore(InMemoryKnowledgeStore):
+    def __init__(self) -> None:
+        super().__init__()
+        self.writes = 0
+        self.fail_writes = False
+
+    async def put_parse_cache(self, **kwargs: Any) -> None:
+        self.writes += 1
+        if self.fail_writes:
+            raise RuntimeError("cache down")
+        await super().put_parse_cache(**kwargs)
+
+
+async def _read_untagged(store: _WriteCountingStore) -> tuple[_Doc, DocumentRecognizer, _Fake]:
+    """Two pages read with no source: as a reading cached before B-238 looks."""
+    doc = await _doc(store)
+    clients = {GLM_OCR: _Fake(_GOOD), QWEN_FLASH: _Fake(_GOOD)}
+    recognizer = _recognizer(doc, clients=clients)
+    await recognizer.recognize_document(
+        tenant_id=doc.tenant, document_id=doc.document, pages=[0, 1], render=_render
+    )
+    assert all(not _TAGS & set(e.result) for e in store._parse_cache.values())
+    store.writes = 0
+    return doc, recognizer, clients[GLM_OCR]
+
+
+async def _read_with_source(doc: _Doc, recognizer: DocumentRecognizer) -> dict[int, PageOutcome]:
+    return await recognizer.recognize_document(
+        tenant_id=doc.tenant,
+        document_id=doc.document,
+        pages=[0, 1],
+        render=_render,
+        source_sha256="src",
+    )
+
+
+async def test_a_page_reused_from_an_untagged_reading_is_tagged() -> None:
+    store = _WriteCountingStore()
+    doc, recognizer, model = await _read_untagged(store)
+    again = await _read_with_source(doc, recognizer)
+    assert all(o.status is PageStatus.RECOGNIZED and o.cached for o in again.values())
+    assert model.calls == 2  # nothing read again
+    (primary, _) = (await recognizer.plan(tenant_id=doc.tenant)).page_readers()
+    assert await doc.store.cached_page_indexes(
+        tenant_id=doc.tenant, document_id=doc.document, source_sha256="src", readers=[primary]
+    ) == {0, 1}
+    # The reading itself is kept as it was.
+    assert {e.result["raw"] for e in store._parse_cache.values()} == {_PAGE_TEXT}
+    # Tagged once: the next ingest writes nothing.
+    store.writes = 0
+    await _read_with_source(doc, recognizer)
+    assert store.writes == 0
+
+
+async def test_a_reading_tagged_with_another_reader_is_tagged_again() -> None:
+    # e.g. read before the reader digest took in the renderer's version.
+    store = _WriteCountingStore()
+    doc = await _doc(store)
+    clients = {GLM_OCR: _Fake(_GOOD), QWEN_FLASH: _Fake(_GOOD)}
+    recognizer = _recognizer(doc, clients=clients)
+    await recognizer.recognize_document(
+        tenant_id=doc.tenant,
+        document_id=doc.document,
+        pages=[0],
+        render=_render,
+        source_sha256="src",
+    )
+    for entry in store._parse_cache.values():
+        entry.result[PAGE_OCR_READER] = "an-older-digest"
+    store.writes = 0
+    await recognizer.recognize_document(
+        tenant_id=doc.tenant,
+        document_id=doc.document,
+        pages=[0],
+        render=_render,
+        source_sha256="src",
+    )
+    assert (store.writes, clients[GLM_OCR].calls) == (1, 1)
+    (primary, _) = (await recognizer.plan(tenant_id=doc.tenant)).page_readers()
+    assert {e.result[PAGE_OCR_READER] for e in store._parse_cache.values()} == {primary}
+
+
+async def test_a_failed_tag_write_does_not_fail_the_page(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    store = _WriteCountingStore()
+    doc, recognizer, model = await _read_untagged(store)
+    store.fail_writes = True
+    with caplog.at_level(logging.WARNING):
+        again = await _read_with_source(doc, recognizer)
+    assert all(o.status is PageStatus.RECOGNIZED and o.cached for o in again.values())
+    assert (model.calls, store.writes) == (2, 2)
+    assert sum("knowledge.recognition_cache_tag_failed" in r.message for r in caplog.records) == 2
+
+
+def test_the_reader_covers_the_renderer_version(monkeypatch: pytest.MonkeyPatch) -> None:
+    # B-256: a new renderer may draw other bytes — every cache key misses — so a
+    # reading by the old one must not count as read the way pages are read now.
+    from control_plane.knowledge.recognition import recognizer as recognizer_module
+
+    before = reader_digest("glm/glm-ocr", "layout_parsing", _RENDER)
+    monkeypatch.setattr(recognizer_module, "RENDERER_VERSION", "pymupdf=9.9.9;mupdf=9.9.9")
+    assert reader_digest("glm/glm-ocr", "layout_parsing", _RENDER) != before
 
 
 async def test_pages_past_the_cap_are_over_limit() -> None:
