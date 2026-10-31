@@ -849,17 +849,25 @@ async def test_none_with_bearer_token_rejected(ctx: _Ctx) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Stream MCP platform-servers (P1b) — catalog mutations invalidate the shared
-# pool + every cached agent (the pool feeds all tenants' builds).
+# Stream MCP platform-servers (P1b) + B-259 — a catalog mutation reaches only
+# the entry it concerns: cosmetic edits nothing, a connection change retires
+# that server, disable / delete stops it (never the whole pool), and every
+# non-cosmetic change evicts the builds. Peers get the same, by name.
 # ---------------------------------------------------------------------------
 
 
 class _SpyPoolService:
     def __init__(self) -> None:
-        self.invalidated = 0
+        self.calls: list[tuple[str, str | None]] = []
 
     async def invalidate(self) -> None:
-        self.invalidated += 1
+        self.calls.append(("invalidate", None))
+
+    async def server_changed(self, name: str) -> None:
+        self.calls.append(("changed", name))
+
+    async def server_removed(self, name: str) -> None:
+        self.calls.append(("removed", name))
 
 
 class _SpyRuntime:
@@ -870,31 +878,205 @@ class _SpyRuntime:
         self.invalidated_all += 1
 
 
-@pytest.mark.asyncio
-async def test_create_patch_delete_invalidate_platform_pool(ctx: _Ctx) -> None:
-    pool = _SpyPoolService()
-    runtime = _SpyRuntime()
-    ctx.app.state.platform_mcp_pool_service = pool  # type: ignore[attr-defined]
-    ctx.app.state.agent_runtime = runtime  # type: ignore[attr-defined]
+class _SpyAnyBus:
+    def __init__(self) -> None:
+        self.events: list[tuple[str, str | None]] = []
 
+    async def publish(self, event: object) -> None:
+        self.events.append((event.kind, event.connector))  # type: ignore[attr-defined]
+
+
+class _Wired:
+    def __init__(self, ctx: _Ctx) -> None:
+        self.ctx = ctx
+        self.pool, self.runtime, self.bus = _SpyPoolService(), _SpyRuntime(), _SpyAnyBus()
+        ctx.app.state.platform_mcp_pool_service = self.pool  # type: ignore[attr-defined]
+        ctx.app.state.agent_runtime = self.runtime  # type: ignore[attr-defined]
+        ctx.app.state.invalidation_bus = self.bus  # type: ignore[attr-defined]
+
+    def take(self) -> tuple[list[tuple[str, str | None]], int, list[tuple[str, str | None]]]:
+        """(pool calls, build evictions, bus events) since the last take."""
+        seen = (list(self.pool.calls), self.runtime.invalidated_all, list(self.bus.events))
+        self.pool.calls.clear()
+        self.runtime.invalidated_all = 0
+        self.bus.events.clear()
+        return seen
+
+    async def patch(self, cid: str, body: dict[str, object]) -> None:
+        resp = await self.ctx.client.patch(
+            f"/v1/platform/mcp-catalog/{cid}", json=body, headers=self.ctx.admin_headers
+        )
+        assert resp.status_code == 200, resp.text
+
+
+def _shared_entry(name: str = "deep") -> dict[str, object]:
+    """A platform shared server (``none``) — lives in the platform pool."""
+    return {
+        "name": name,
+        "display_name": "Deep",
+        "description": "d",
+        "category": "health",
+        "transport": "streamable_http",
+        "url_template": "https://mcp.example.com/mcp",
+        "auth_type": "none",
+        "required_tier": "free",
+    }
+
+
+def _changed(name: str) -> tuple[list[tuple[str, str | None]], int, list[tuple[str, str | None]]]:
+    return [("changed", name)], 1, [("platform_mcp_server_changed", name)]
+
+
+def _removed(name: str) -> tuple[list[tuple[str, str | None]], int, list[tuple[str, str | None]]]:
+    return [("removed", name)], 1, [("platform_mcp_server_removed", name)]
+
+
+_NOTHING: tuple[list[tuple[str, str | None]], int, list[tuple[str, str | None]]] = ([], 0, [])
+_BUILDS_ONLY: tuple[list[tuple[str, str | None]], int, list[tuple[str, str | None]]] = (
+    [],
+    1,
+    [("agent_build_all", None)],
+)
+
+
+async def _created_shared(ctx: _Ctx) -> tuple[_Wired, str]:
+    wired = _Wired(ctx)
+    resp = await ctx.client.post(
+        "/v1/platform/mcp-catalog", json=_shared_entry(), headers=ctx.admin_headers
+    )
+    assert resp.status_code == 201, resp.text
+    assert wired.take() == _changed("deep")  # create: nothing to stop, builds evicted
+    return wired, resp.json()["data"]["id"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "body",
+    [
+        {"display_name": "Deep 2"},
+        {"description": "new words"},
+        {"category": "other"},
+        {"icon": "heart"},
+        {"required_tier": "pro"},
+        # What the admin edit form sends on a description-only save.
+        {
+            "display_name": "Deep",
+            "description": "edited",
+            "category": "health",
+            "icon": "",
+            "url_template": "https://mcp.example.com/mcp",
+            "required_tier": "free",
+            "enabled": True,
+        },
+    ],
+    ids=str,
+)
+async def test_cosmetic_catalog_edit_touches_nothing(ctx: _Ctx, body: dict[str, object]) -> None:
+    wired, cid = await _created_shared(ctx)
+
+    await wired.patch(cid, body)
+
+    assert wired.take() == _NOTHING
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "body",
+    [
+        {"url_template": "https://mcp2.example.com/mcp"},
+        {"timeout_s": 12.0},
+        {"sse_read_timeout_s": 90.0},
+        {"disabled_tools": ["echo"]},
+    ],
+    ids=str,
+)
+async def test_connection_change_retires_only_that_entry(
+    ctx: _Ctx, body: dict[str, object]
+) -> None:
+    wired, cid = await _created_shared(ctx)
+
+    await wired.patch(cid, body)
+
+    assert wired.take() == _changed("deep")
+
+
+@pytest.mark.asyncio
+async def test_repasted_bearer_token_counts_as_a_connection_change(ctx: _Ctx) -> None:
+    """The secret ref is name-derived, so it does not change on a re-paste —
+    the value behind it does."""
+    wired = _Wired(ctx)
+    create = await ctx.client.post(
+        "/v1/platform/mcp-catalog", json=_platform_bearer_entry(), headers=ctx.admin_headers
+    )
+    assert create.status_code == 201, create.text
+    wired.take()
+
+    await wired.patch(create.json()["data"]["id"], {"bearer_token": "rotated-token"})
+
+    assert wired.take() == _changed("sharedbearer")
+
+
+@pytest.mark.asyncio
+async def test_disable_stops_only_that_entry_and_reenable_brings_it_back(ctx: _Ctx) -> None:
+    wired, cid = await _created_shared(ctx)
+
+    await wired.patch(cid, {"enabled": False})
+    assert wired.take() == _removed("deep")
+
+    await wired.patch(cid, {"description": "still off"})
+    assert wired.take() == _NOTHING
+
+    await wired.patch(cid, {"enabled": True})
+    assert wired.take() == _changed("deep")
+
+
+@pytest.mark.asyncio
+async def test_delete_stops_only_that_entry(ctx: _Ctx) -> None:
+    wired, cid = await _created_shared(ctx)
+
+    resp = await ctx.client.delete(f"/v1/platform/mcp-catalog/{cid}", headers=ctx.admin_headers)
+
+    assert resp.status_code == 204, resp.text
+    assert wired.take() == _removed("deep")
+
+
+@pytest.mark.asyncio
+async def test_entry_outside_the_platform_pool_only_evicts_builds(ctx: _Ctx) -> None:
+    """A legacy tenant-fills bearer entry never enters the platform pool:
+    create / a runtime-relevant edit evict builds and stop nothing. Its delete
+    is a (spare, idempotent) stop like every none / bearer delete — see below."""
+    wired = _Wired(ctx)
     create = await ctx.client.post(
         "/v1/platform/mcp-catalog", json=_valid_entry(), headers=ctx.admin_headers
     )
     assert create.status_code == 201, create.text
-    assert (pool.invalidated, runtime.invalidated_all) == (1, 1)
-
     cid = create.json()["data"]["id"]
-    patch = await ctx.client.patch(
-        f"/v1/platform/mcp-catalog/{cid}",
-        json={"display_name": "GitHub 2"},
-        headers=ctx.admin_headers,
-    )
-    assert patch.status_code == 200, patch.text
-    assert (pool.invalidated, runtime.invalidated_all) == (2, 2)
+    assert wired.take() == _BUILDS_ONLY
+
+    await wired.patch(cid, {"display_name": "GitHub 2"})
+    assert wired.take() == _NOTHING
+
+    await wired.patch(cid, {"url_template": "https://mcp2.github.com/mcp"})
+    assert wired.take() == _BUILDS_ONLY
 
     delete = await ctx.client.delete(f"/v1/platform/mcp-catalog/{cid}", headers=ctx.admin_headers)
     assert delete.status_code == 204, delete.text
-    assert (pool.invalidated, runtime.invalidated_all) == (3, 3)
+    assert wired.take() == _removed("github")
+
+
+@pytest.mark.asyncio
+async def test_delete_of_an_entry_read_as_disabled_still_stops_it(ctx: _Ctx) -> None:
+    """Delete reads the row without a lock: a concurrent re-enable may already
+    have built it into the pool. A none / bearer delete therefore always stops
+    the server (a spare stop of an absent one is harmless)."""
+    wired, cid = await _created_shared(ctx)
+    await wired.patch(cid, {"enabled": False})
+    wired.take()
+
+    resp = await ctx.client.delete(f"/v1/platform/mcp-catalog/{cid}", headers=ctx.admin_headers)
+
+    assert resp.status_code == 204, resp.text
+    assert wired.take() == _removed("deep")
 
 
 # ---------------------------------------------------------------------------
@@ -977,7 +1159,7 @@ async def test_save_without_switching_oauth2_entry_leaves_user_pools(
 
     assert resp.status_code == 200, resp.text
     assert pools.switched == []
-    assert bus.events == [("platform_mcp", None)]
+    assert bus.events == []  # B-259: no runtime field changed
 
 
 @pytest.mark.asyncio
@@ -996,12 +1178,11 @@ async def test_disable_then_enable_oauth2_entry_switches_it_once_each(ctx: _Ctx)
 
     assert (off.status_code, again.status_code, on.status_code) == (200, 200, 200)
     assert pools.switched == [("off", "linear"), ("on", "linear")]
-    assert bus.events == [
+    assert bus.events == [  # B-259: never the platform pool (oauth2 is not in it)
         ("user_mcp_oauth_connector_off", "linear"),
-        ("platform_mcp", None),
-        ("platform_mcp", None),
+        ("agent_build_all", None),
         ("user_mcp_oauth_connector_on", "linear"),
-        ("platform_mcp", None),
+        ("agent_build_all", None),
     ]
 
 
@@ -1015,4 +1196,4 @@ async def test_force_delete_oauth2_entry_switches_it_off(ctx: _Ctx) -> None:
 
     assert resp.status_code == 204, resp.text
     assert pools.switched == [("off", "linear")]
-    assert bus.events == [("user_mcp_oauth_connector_off", "linear"), ("platform_mcp", None)]
+    assert bus.events == [("user_mcp_oauth_connector_off", "linear"), ("agent_build_all", None)]

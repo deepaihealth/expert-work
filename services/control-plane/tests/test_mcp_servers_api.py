@@ -655,16 +655,23 @@ async def test_delete_counts_deprecated_wildcard_follower_in_implicit_all(
 async def test_post_and_delete_invalidate_tenant_mcp_cache(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """POST and DELETE both call pool_service.invalidate + agent_runtime.invalidate_tenant."""
+    """POST retires only that server (nothing to stop, B-259), DELETE stops only
+    it; both evict the tenant's builds. Never the whole tenant pool."""
     app, admin_headers, tenant_id = await _make_app_with_admin()
     monkeypatch.setattr("control_plane.api.mcp_servers.probe_remote_mcp", _fake_probe_ok)
 
     class _PoolSpy:
         def __init__(self) -> None:
-            self.invalidated: list[UUID] = []
+            self.calls: list[tuple[str, UUID, str]] = []
 
         async def invalidate(self, tid: UUID) -> None:
-            self.invalidated.append(tid)
+            self.calls.append(("invalidate", tid, ""))
+
+        async def server_changed(self, tid: UUID, name: str) -> None:
+            self.calls.append(("changed", tid, name))
+
+        async def server_removed(self, tid: UUID, name: str) -> None:
+            self.calls.append(("removed", tid, name))
 
     class _RuntimeSpy:
         def __init__(self) -> None:
@@ -694,7 +701,10 @@ async def test_post_and_delete_invalidate_tenant_mcp_cache(
         delete_resp = await client.delete("/v1/mcp-servers/github", headers=admin_headers)
         assert delete_resp.status_code == 200
 
-    assert pool_spy.invalidated.count(tenant_id) == 2
+    assert pool_spy.calls == [
+        ("changed", tenant_id, "github"),
+        ("removed", tenant_id, "github"),
+    ]
     assert rt_spy.invalidated.count(tenant_id) == 2
 
 
@@ -1017,36 +1027,66 @@ async def test_server_tools_platform_oauth2_409(monkeypatch: pytest.MonkeyPatch)
         assert r.json()["detail"]["code"] == "MCP_SERVER_OAUTH_PROBE_UNSUPPORTED"
 
 
+class _TenantPoolSpy:
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, UUID, str]] = []
+
+    async def invalidate(self, tid: UUID) -> None:
+        self.calls.append(("invalidate", tid, ""))
+
+    async def server_changed(self, tid: UUID, name: str) -> None:
+        self.calls.append(("changed", tid, name))
+
+    async def server_removed(self, tid: UUID, name: str) -> None:
+        self.calls.append(("removed", tid, name))
+
+
+class _TenantRuntimeSpy:
+    def __init__(self) -> None:
+        self.invalidated: list[UUID] = []
+
+    def invalidate_tenant(self, tid: UUID) -> None:
+        self.invalidated.append(tid)
+
+
+class _TenantBusSpy:
+    def __init__(self) -> None:
+        self.events: list[tuple[str, str | None, str | None]] = []
+
+    async def publish(self, event: object) -> None:
+        self.events.append(
+            (event.kind, event.tenant_id, event.connector)  # type: ignore[attr-defined]
+        )
+
+
 @pytest.mark.asyncio
-async def test_patch_invalidates_tenant_mcp_cache(
-    monkeypatch: pytest.MonkeyPatch,
+@pytest.mark.parametrize(
+    ("body", "expected"),
+    [
+        ({"enabled": False}, "removed"),
+        ({"url": "https://y.example.com/sse"}, "changed"),
+        ({"timeout_s": 12.0}, "changed"),
+        ({"sse_read_timeout_s": 90.0}, "changed"),
+        ({"custom_headers": {"X-Org": "acme"}}, "changed"),  # re-pasted: same ref
+        # What a form save without changes sends — nothing to do.
+        ({"url": "https://x.example.com/sse", "enabled": True}, None),
+    ],
+    ids=str,
+)
+async def test_patch_reaches_only_that_server(
+    monkeypatch: pytest.MonkeyPatch, body: dict[str, object], expected: str | None
 ) -> None:
-    """PATCH calls pool_service.invalidate + agent_runtime.invalidate_tenant."""
+    """B-259 — a PATCH retires (connection change) or stops (disable) only the
+    server it concerns; a no-op save touches nothing. Peers get the same."""
     app, admin_headers, tenant_id = await _make_app_with_admin()
     monkeypatch.setattr("control_plane.api.mcp_servers.probe_remote_mcp", _fake_probe_ok)
-
-    class _PoolSpy:
-        def __init__(self) -> None:
-            self.invalidated: list[UUID] = []
-
-        async def invalidate(self, tid: UUID) -> None:
-            self.invalidated.append(tid)
-
-    class _RuntimeSpy:
-        def __init__(self) -> None:
-            self.invalidated: list[UUID] = []
-
-        def invalidate_tenant(self, tid: UUID) -> None:
-            self.invalidated.append(tid)
-
-    pool_spy = _PoolSpy()
-    rt_spy = _RuntimeSpy()
+    pool_spy, rt_spy, bus = _TenantPoolSpy(), _TenantRuntimeSpy(), _TenantBusSpy()
     app.state.tenant_mcp_pool_service = pool_spy
     app.state.agent_runtime = rt_spy
+    app.state.invalidation_bus = bus
 
     transport = ASGITransport(app=app)
     async with AsyncClient(transport=transport, base_url="http://cp.test") as client:
-        # Register first
         post_resp = await client.post(
             "/v1/mcp-servers",
             json={
@@ -1058,19 +1098,52 @@ async def test_patch_invalidates_tenant_mcp_cache(
             headers=admin_headers,
         )
         assert post_resp.status_code == 201
-        # Reset spy counts after POST
-        pool_spy.invalidated.clear()
+        pool_spy.calls.clear()
         rt_spy.invalidated.clear()
-        # PATCH to disable
-        patch_resp = await client.patch(
-            "/v1/mcp-servers/github",
-            json={"enabled": False},
+        bus.events.clear()
+        patch_resp = await client.patch("/v1/mcp-servers/github", json=body, headers=admin_headers)
+        assert patch_resp.status_code == 200, patch_resp.text
+
+    if expected is None:
+        assert (pool_spy.calls, rt_spy.invalidated, bus.events) == ([], [], [])
+    else:
+        assert pool_spy.calls == [(expected, tenant_id, "github")]
+        assert rt_spy.invalidated == [tenant_id]
+        assert bus.events == [(f"tenant_mcp_server_{expected}", str(tenant_id), "github")]
+
+
+@pytest.mark.asyncio
+async def test_patch_rotating_the_token_counts_as_a_connection_change(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The token secret's ref is name-derived — a rotation keeps the ref and
+    changes the value behind it, so the fingerprint alone cannot see it."""
+    app, admin_headers, tenant_id = await _make_app_with_admin()
+    monkeypatch.setattr("control_plane.api.mcp_servers.probe_remote_mcp", _fake_probe_ok)
+    pool_spy = _TenantPoolSpy()
+    app.state.tenant_mcp_pool_service = pool_spy
+
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://cp.test") as client:
+        post_resp = await client.post(
+            "/v1/mcp-servers",
+            json={
+                "name": "github",
+                "transport": "sse",
+                "url": "https://x.example.com/sse",
+                "auth_type": "bearer",
+                "token": "t1",
+            },
             headers=admin_headers,
         )
-        assert patch_resp.status_code == 200
+        assert post_resp.status_code == 201, post_resp.text
+        pool_spy.calls.clear()
+        patch_resp = await client.patch(
+            "/v1/mcp-servers/github", json={"token": "t2"}, headers=admin_headers
+        )
+        assert patch_resp.status_code == 200, patch_resp.text
 
-    assert pool_spy.invalidated.count(tenant_id) == 1
-    assert rt_spy.invalidated.count(tenant_id) == 1
+    assert pool_spy.calls == [("changed", tenant_id, "github")]
 
 
 @pytest.mark.asyncio
@@ -1764,13 +1837,16 @@ class _PoolSpyX5:
 @pytest.mark.asyncio
 async def test_remove_allowlist_name_drops_stale_entry_and_broadcasts() -> None:
     """残留名(目录里没有)按名字移出:200 + allowlist 清空 + /available 不再列出;
-    本 pod MCP 池失效,总线收到 tenant_mcp(池/构建)与 tenant_config(60s 配置缓存)。"""
+    总线收到 tenant_config(60s 配置缓存 + 构建)。B-259:租户自己的 MCP 池不读
+    allowlist,不再整池关掉(也不再发 tenant_mcp)。"""
     app, headers, tenant_id = await _make_app_with_admin()
     await _enable_for_tenant(app, tenant_id, "ghost-server")  # never seeded in the catalog
     bus = _SpyBusX5()
     pool = _PoolSpyX5()
+    runtime = _TenantRuntimeSpy()
     app.state.invalidation_bus = bus  # type: ignore[attr-defined]
     app.state.tenant_mcp_pool_service = pool  # type: ignore[attr-defined]
+    app.state.agent_runtime = runtime  # type: ignore[attr-defined]
     transport = ASGITransport(app=app)
     async with AsyncClient(transport=transport, base_url="http://cp.test") as client:
         resp = await client.delete("/v1/mcp-servers/allowlist/ghost-server", headers=headers)
@@ -1785,10 +1861,10 @@ async def test_remove_allowlist_name_drops_stale_entry_and_broadcasts() -> None:
         assert [r["name"] for r in avail.json()["data"]] == []
     record = await app.state.tenant_config_service.store.get(tenant_id=tenant_id)  # type: ignore[attr-defined]
     assert record is not None and record.mcp_allowlist == []
-    assert pool.invalidated == [tenant_id]
+    assert pool.invalidated == []
+    assert runtime.invalidated == [tenant_id]  # builds still pick up the new allowlist
     kinds = [getattr(e, "kind", None) for e in bus.events]
-    assert "tenant_mcp" in kinds
-    assert "tenant_config" in kinds
+    assert kinds == ["tenant_config"]
     assert all(getattr(e, "tenant_id", None) == str(tenant_id) for e in bus.events)
 
 

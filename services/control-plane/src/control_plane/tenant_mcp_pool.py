@@ -2,9 +2,11 @@
 
 A tenant's registered remote MCP servers (``tenant_mcp_server``) are built
 into a per-tenant :class:`MCPServerPool` on first use and reused across agent
-builds. The pool is invalidated (closed + dropped) when the tenant's registry
-changes (the registration API calls :meth:`invalidate`) and all pools are
-closed at app shutdown (:meth:`close_all`).
+builds. A registry change reaches only the server it concerns (B-259:
+:meth:`server_changed` retires it, :meth:`server_removed` stops it, the
+tenant's other servers' clients are reused by the next build);
+:meth:`invalidate` (legacy whole-pool event) and :meth:`close_all` (shutdown)
+close everything.
 
 Decoupling: the orchestrator never imports this — the agent builder receives a
 ``Callable`` provider bound to this service (mirrors ``mcp_allowlist_provider``).
@@ -16,9 +18,16 @@ import asyncio
 import logging
 import time
 from collections.abc import Awaitable, Callable
+from typing import Literal
 from uuid import UUID
 
-from control_plane.mcp_retired_clients import RetiredMcpClients, close_retired, retire_in_place
+from control_plane.mcp_kept_clients import KeptClient, KeptMcpClients
+from control_plane.mcp_retired_clients import (
+    RetiredMcpClients,
+    close_retired,
+    release_clients,
+    retire_in_place,
+)
 from expert_work.persistence import TenantMcpServerStore
 from expert_work.protocol import TenantMcpServerRecord
 from expert_work.runtime.secret_store import SecretStore
@@ -70,6 +79,47 @@ def _record_to_config(record: TenantMcpServerRecord) -> MCPServerConfig:
     )
 
 
+def connection_fingerprint(record: TenantMcpServerRecord) -> object:
+    """B-259 —— 池里这一项的客户端由什么决定;与 ``_record_to_config`` 同源。
+    注意:令牌 / 自定义头原地重贴时引用不变、指纹也不变,调用方要另行按「变了」处理。"""
+    return _record_to_config(record)
+
+
+#: 一次租户服务修改对池的影响(B-259)。
+ServerChange = Literal["none", "changed", "removed"]
+
+#: B-259 —— 运行期不读的字段(行元数据 + 探活结果);其余字段一律当作会影响运行,
+#: 新加的字段默认也算(与平台目录同一原则)。
+_NO_RUNTIME_EFFECT = frozenset(
+    {
+        "id",
+        "tenant_id",
+        "created_at",
+        "updated_at",
+        "created_by",
+        "last_probe_at",
+        "last_probe_status",
+        "last_probe_error",
+    }
+)
+
+
+def classify_server_patch(
+    before: TenantMcpServerRecord, after: TenantMcpServerRecord, *, secret_rewritten: bool
+) -> ServerChange:
+    """B-259 —— 改完是停用的一律按 ``removed``(幂等):``before`` 不是行锁下读的,
+    并发的启用 / 停用可能让它过期,宁可多硬停一次空的,也不漏停一个。
+    否则重新启用、任何运行期字段变了、或令牌 / 头原地重贴 = ``changed``;都没有 = ``none``。"""
+    if not after.enabled:
+        return "removed"
+    if not before.enabled or secret_rewritten:
+        return "changed"
+    ignored = set(_NO_RUNTIME_EFFECT)
+    if before.model_dump(exclude=ignored) != after.model_dump(exclude=ignored):
+        return "changed"
+    return "none"
+
+
 class TenantMcpPoolService:
     """Caches one :class:`MCPServerPool` per tenant, built from the registry."""
 
@@ -99,6 +149,9 @@ class TenantMcpPoolService:
         # later ``invalidate`` / ``close_all`` must hard-stop them too.
         # Guarded by ``_locks_guard`` like ``_pools``.
         self._retired: RetiredMcpClients[UUID] = RetiredMcpClients()
+        # B-259 —— 缓存池成员的连接指纹;改一项时其它项暂存在这里给下次构建复用。
+        # Guarded by ``_locks_guard``.
+        self._kept: KeptMcpClients[UUID] = KeptMcpClients()
 
     async def _tenant_lock(self, tenant_id: UUID) -> asyncio.Lock:
         async with self._locks_guard:
@@ -147,59 +200,125 @@ class TenantMcpPoolService:
                         self._generation[tenant_id] = self._generation.get(tenant_id, 0) + 1
                         self._pools.pop(tenant_id, None)
                         self._retired.add_pool(tenant_id, cached_pool)
+                        self._kept.dropped(tenant_id)
                     try:
                         await cached_pool.retire_all()
                     except Exception:
                         logger.warning("tenant_mcp_pool.expired_close_failed")
-                    if self._on_expire is not None:
-                        try:
-                            self._on_expire(tenant_id)
-                        except Exception as exc:  # never fails the build
-                            logger.warning(
-                                "tenant_mcp_pool.on_expire_failed err=%s", type(exc).__name__
-                            )
+                    self._notify_expired(tenant_id)
                 async with self._locks_guard:
                     gen = self._generation.get(tenant_id, 0)
-                pool = MCPServerPool()
-                records = await self._store.list_for_tenant(tenant_id=tenant_id)
-                for record in records:
-                    if not record.enabled:
-                        continue
-                    try:
-                        client = await self._client_factory(_record_to_config(record))
-                        await pool.add(record.name, client)
-                    except MCPServerPoolLimitError:
-                        # Cap reached: close the just-opened client (it was never
-                        # added, so pool.close_all can't reach it) and stop —
-                        # further adds would also be rejected.
-                        try:
-                            await client.close()
-                        except Exception:
-                            logger.warning("tenant_mcp_pool.cap_orphan_close_failed")
-                        logger.warning("tenant_mcp_pool.server_cap_reached")
-                        break
-                    except Exception:
-                        logger.warning("tenant_mcp_pool.server_build_failed")
+                    carried = self._kept.peek(tenant_id)
+                pool, members, fresh = await self._build(tenant_id, carried)
+                unused: list[MCPClient] = []
                 async with self._locks_guard:
-                    if self._generation.get(tenant_id, 0) == gen:
-                        self._pools[tenant_id] = (pool, self._clock())
-                        return pool
-                    if last_attempt:
+                    cached_now = self._generation.get(tenant_id, 0) == gen
+                    if cached_now:
+                        for server, client in self._kept.cached(tenant_id, members):
+                            self._retired.add(tenant_id, server, client)
+                            unused.append(client)
+                        # 复用的长连接按它最早的出生时间算 TTL,兜底时限不被拉长。
+                        born = [m.born_at for m in members.values()]
+                        self._pools[tenant_id] = (pool, min([*born, self._clock()]))
+                    elif last_attempt:
                         # B-248 — no cache entry will ever close it: track it
                         # for invalidate / close_all, retire it below.
                         self._retired.add_pool(tenant_id, pool)
+                        self._kept.adopted(tenant_id, members)
+            if cached_now:
+                # B-259 —— 暂存里没被复用的(指纹变了 / 这一项没了):退役。
+                await release_clients(retire=unused)
+                return pool
             if last_attempt:
                 # Give up retrying — serve this fresh pool uncached (still
                 # usable; the next caller rebuilds). Outside the tenant lock.
                 await retire_in_place(pool)
                 return pool
-            # Invalidation landed mid-build: close the orphan and retry so the
-            # caller gets a usable pool instead of a closed, empty one.
-            try:
-                await pool.close_all()
-            except Exception:
-                logger.warning("tenant_mcp_pool.stale_close_failed")
+            # Invalidation landed mid-build: close what this attempt opened and
+            # retry so the caller gets a usable pool instead of a closed, empty
+            # one. B-259 —— 复用来的暂存客户端不关:别的构建 / run 还拿着它们。
+            await release_clients(close=fresh)
         raise RuntimeError("get_or_build: retry loop exited without returning")  # pragma: no cover
+
+    async def _build(
+        self, tenant_id: UUID, carried: dict[str, KeptClient]
+    ) -> tuple[MCPServerPool, dict[str, KeptClient], list[MCPClient]]:
+        """Build the tenant's pool from the registry; returns it, its members
+        and the clients this call opened (as opposed to reused from ``carried``)."""
+        pool = MCPServerPool()
+        members: dict[str, KeptClient] = {}
+        fresh: list[MCPClient] = []
+        records = await self._store.list_for_tenant(tenant_id=tenant_id)
+        for record in records:
+            if not record.enabled:
+                continue
+            fingerprint = connection_fingerprint(record)
+            kept = carried.get(record.name)
+            if kept is not None and kept.fingerprint != fingerprint:
+                kept = None
+            try:
+                if kept is not None:
+                    # B-259 —— 连接配置没变:复用暂存的长连接,不重连。
+                    client, born_at = kept.client, kept.born_at
+                else:
+                    client = await self._client_factory(_record_to_config(record))
+                    born_at = self._clock()
+                await pool.add(record.name, client)
+                members[record.name] = KeptClient(client, fingerprint, born_at)
+                if kept is None:
+                    fresh.append(client)
+            except MCPServerPoolLimitError:
+                # Cap reached: close the just-opened client (it was never
+                # added, so pool.close_all can't reach it) and stop — further
+                # adds would also be rejected. A reused one stays carried.
+                if kept is None:
+                    try:
+                        await client.close()
+                    except Exception:
+                        logger.warning("tenant_mcp_pool.cap_orphan_close_failed")
+                logger.warning("tenant_mcp_pool.server_cap_reached")
+                break
+            except Exception:
+                logger.warning("tenant_mcp_pool.server_build_failed")
+        return pool, members, fresh
+
+    def _notify_expired(self, tenant_id: UUID) -> None:
+        """Run ``on_expire`` (build eviction); a failure never fails the caller."""
+        if self._on_expire is None:
+            return
+        try:
+            self._on_expire(tenant_id)
+        except Exception as exc:
+            logger.warning("tenant_mcp_pool.on_expire_failed err=%s", type(exc).__name__)
+
+    async def server_changed(self, tenant_id: UUID, name: str) -> None:
+        """B-259 —— 租户的服务 ``name`` 新加 / 改了连接配置 / 重新启用:只退役它自己的
+        客户端(正在跑的调用跑完;之后走一次性会话、仍是旧配置,直到持有它的构建被清掉),
+        该租户其它服务的长连接留给下一次构建复用。"""
+        await self._switch(tenant_id, name, stop=False)
+
+    async def server_removed(self, tenant_id: UUID, name: str) -> None:
+        """B-259 —— 租户的服务 ``name`` 被停用 / 删除:只硬停它自己(连同 TTL 先前
+        退役的副本),该租户其它服务照常。"""
+        await self._switch(tenant_id, name, stop=True)
+
+    async def _switch(self, tenant_id: UUID, name: str, *, stop: bool) -> None:
+        async with self._locks_guard:
+            # 正在进行的构建可能是按旧登记读的:让它重来。
+            self._generation[tenant_id] = self._generation.get(tenant_id, 0) + 1
+            self._pools.pop(tenant_id, None)
+            hit = self._kept.switch(tenant_id, name)
+            target = [hit.client] if hit is not None else []
+            if stop:
+                target += self._retired.pop_one(tenant_id, name)
+            elif hit is not None:
+                self._retired.add(tenant_id, name, hit.client)
+        # 先清构建,再拆连接:新 run 不会在拆的过程中拿到旧构建(B-248 同序)。
+        self._notify_expired(tenant_id)
+        if stop:
+            await release_clients(close=target)
+        else:
+            await release_clients(retire=target)
 
     async def invalidate(self, tenant_id: UUID) -> None:
         """Close + drop the tenant's cached pool (next build rebuilds it), and
@@ -207,7 +326,7 @@ class TenantMcpPoolService:
         async with self._locks_guard:
             self._generation[tenant_id] = self._generation.get(tenant_id, 0) + 1
             entry = self._pools.pop(tenant_id, None)
-            retired = self._retired.pop(tenant_id)
+            retired = self._retired.pop(tenant_id) + self._kept.pop_key(tenant_id)
         if entry is not None:
             try:
                 await entry[0].close_all()
@@ -220,7 +339,7 @@ class TenantMcpPoolService:
         async with self._locks_guard:
             pools = [entry[0] for entry in self._pools.values()]
             self._pools.clear()
-            retired = self._retired.pop_all()
+            retired = self._retired.pop_all() + self._kept.pop_all()
             # Bump every known tenant's generation so any in-flight build won't
             # cache a stale pool after shutdown clears the store.
             for tid in list(self._tenant_locks):

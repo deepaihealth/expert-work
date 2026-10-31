@@ -55,6 +55,10 @@ class RetiredMcpClients[K: Hashable]:
             if client is not None:
                 self._clients[(key, name, id(client))] = client
 
+    def add(self, key: K, name: str, client: MCPClient) -> None:
+        """B-259 —— 只记一个客户端(改了配置的那一项,池里其它项不动)。"""
+        self._clients[(key, name, id(client))] = client
+
     def pop(self, key: K) -> list[MCPClient]:
         """Remove and return the live retired clients recorded under ``key``."""
         return self._pop(lambda entry: entry[0] == key)
@@ -62,6 +66,10 @@ class RetiredMcpClients[K: Hashable]:
     def pop_named(self, name: str) -> list[MCPClient]:
         """Remove and return every live retired client of server ``name``."""
         return self._pop(lambda entry: entry[1] == name)
+
+    def pop_one(self, key: K, name: str) -> list[MCPClient]:
+        """B-259 —— 移除并返回 ``key`` 下服务 ``name`` 的退役副本。"""
+        return self._pop(lambda entry: entry[0] == key and entry[1] == name)
 
     def pop_all(self) -> list[MCPClient]:
         """Remove and return every live retired client."""

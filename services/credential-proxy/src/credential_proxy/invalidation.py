@@ -29,6 +29,12 @@ a stale hit, and needs nothing here. Verified 2026-09-08 against every
 - ``user_mcp_oauth`` — ``api/mcp_oauth_api.py`` + ``mcp_oauth_refresh.py``:
   OAuth access / refresh tokens, slot derived from (tenant, connection).
 
+B-259 —— 改 MCP 目录 / 租户 MCP 服务不再发整池的 ``platform_mcp`` /
+``tenant_mcp``,改发只动一项的 ``platform_mcp_server_*`` /
+``tenant_mcp_server_*``(令牌、自定义头重贴也走它们),所以这四个也要听;
+两个旧类型留着,滚动发布期间旧的 control-plane pod 还在发。本服务没更新前
+听不到新类型,MCP 令牌重贴后最多旧值用到 ``cache_ttl_s``。
+
 Failure posture mirrors control-plane's bus: a bad payload is logged and
 skipped, a dropped connection reconnects with capped exponential backoff,
 and only cancellation (shutdown) exits the loop. Unset Redis URL → no
@@ -65,6 +71,10 @@ SECRET_VALUE_KINDS = frozenset(
         "platform_mcp",
         "tenant_mcp",
         "user_mcp_oauth",
+        "platform_mcp_server_changed",
+        "platform_mcp_server_removed",
+        "tenant_mcp_server_changed",
+        "tenant_mcp_server_removed",
     }
 )
 
