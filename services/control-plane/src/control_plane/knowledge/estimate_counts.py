@@ -6,10 +6,10 @@
   retrieval text once, less those the document already has a vector for from
   the same embedding model; plus the blocks topic detection would embed;
 * **pages** —— a PDF's pages decided for recognition, up to the per-document
-  limit, less the ones read before (the bytes unchanged, the page on record as
-  recognized: its reading is in the document's cache; or, B-238, a reading
-  of the page by a model in use, from these very bytes, is in the cache — a
-  cancelled ingest leaves no page records);
+  limit, less the ones read before: a reading of the page by a model in use,
+  read the way it reads now, from these very bytes, is in the document's
+  cache (B-238 / B-256 —— what the ingest takes from the cache instead of
+  calling a model; the page records of the last ingest are not enough);
 * **figures** —— the document's figures that pass the tenant-wide filter and
   the per-document cap, less the ones described before (bytes unchanged).
 
@@ -20,7 +20,7 @@ is spent (``TEXT_TOO_LARGE`` / ``TOO_MANY_CHUNKS``).
 from __future__ import annotations
 
 import hashlib
-from collections.abc import Collection, Sequence
+from collections.abc import Collection
 from dataclasses import dataclass
 from uuid import UUID
 
@@ -39,7 +39,7 @@ from control_plane.knowledge.recognition.figure_markup import resolve_figures
 from control_plane.knowledge.recognition.ingest_parse import LocalParse
 from control_plane.knowledge.recognition.pages import PdfAnalysis
 from expert_work.persistence import KnowledgeStore
-from expert_work.protocol import DocumentPage, FigureStats, PageStatus, chunk_retrieval_text
+from expert_work.protocol import FigureStats, chunk_retrieval_text
 
 
 @dataclass(frozen=True)
@@ -163,26 +163,18 @@ def _digest(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
-def count_pages(
-    analysis: PdfAnalysis,
-    *,
-    max_pages: int,
-    previous: Sequence[DocumentPage],
-    bytes_unchanged: bool,
-    cached: Collection[int],
-) -> PageCount:
-    """:class:`PageCount` of a PDF (``previous``: the page records of its last
-    ingest; ``cached``: the 0-based pages whose reading from these bytes by a
-    model in use is in the document's cache)."""
+def count_pages(analysis: PdfAnalysis, *, max_pages: int, cached: Collection[int]) -> PageCount:
+    """:class:`PageCount` of a PDF (``cached``: the 0-based pages whose
+    reading from these bytes by a model in use, read the way it reads now,
+    is in the document's cache)."""
     scanned = [page.index for page in analysis.ocr_pages]
     within = scanned[:max_pages]
-    read_before = (
-        {page.page for page in previous if page.status is PageStatus.RECOGNIZED}
-        if bytes_unchanged
-        else set()
-    )
-    # B-238 —— 取消过的入库没有逐页记录,但已读的页在缓存里、再入库不再计费。
-    reused = sum(1 for index in within if index + 1 in read_before or index in cached)
+    # B-256 —— 只认缓存里当前读法(模型 + 提示词版本 + 渲染参数 + 渲染库版本)读过的页:换了识别
+    # 模型或升了提示词版本,再入库时缓存全部对不上、整页重新收费,上次入库「已识别」的逐页记录
+    # 不能再当免费。B-238 之前的缓存没记页码 / 读法,这些页按要收费估(估高,方向安全;入库从
+    # 缓存取到时补记,之后照常免费);当前不可用的模型缓存过的页入库时照样复用,这里也按要收费估
+    # (估高,可接受)。
+    reused = sum(1 for index in within if index in cached)
     return PageCount(
         scanned=len(scanned), within=len(within), over=len(scanned) - len(within), reused=reused
     )
