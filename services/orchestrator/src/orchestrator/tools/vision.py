@@ -119,7 +119,8 @@ class VLUsageMeter(Protocol):
 class PageRenderer(Protocol):
     """B-251 —— 代模型渲一页用的 ``read_page``(就是注册表里那个工具实例)。"""
 
-    async def call(self, args: Mapping[str, Any], *, ctx: ToolContext) -> ToolResult: ...
+    async def call(self, args: Mapping[str, Any], *, ctx: ToolContext) -> ToolResult:
+        """渲 ``args["path"]`` 的 ``args["units"]``,与模型自己调 ``read_page`` 同一个入口。"""
 
 
 class _AskImageTimeoutError(GuidedTimeoutError):
