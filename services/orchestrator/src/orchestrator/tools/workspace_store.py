@@ -36,6 +36,7 @@ import httpx
 from orchestrator.llm.providers._http import client_for
 from orchestrator.tools.sandbox import (
     SandboxSupervisorError,
+    WorkspaceFileExistsError,
     WorkspaceFileNotFoundError,
     WorkspaceFileTooLargeError,
     _traced_headers,
@@ -325,6 +326,14 @@ class WorkspaceStore(Protocol):
         workspace so a later run's ``read_document`` can read them. Only
         the supervisor can write a per-user docker volume."""
 
+    async def create_file(self, *, tenant_id: UUID, user_id: UUID, path: str, data: bytes) -> None:
+        """B-262 —— 同 :meth:`write_file`,但 ``path`` 上已经有东西就不写,抛
+        :class:`WorkspaceFileExistsError`。
+
+        上传用它落盘:同一 agent 的不同对话(对接方一个用户下跑很多终端客户)传同名文件时,
+        后一个换名字,不覆盖前一个。「先看在不在再写」挡不住两个同名上传同时到:判在不在
+        与创建必须是同一个原子动作。"""
+
     async def delete_file(self, *, tenant_id: UUID, user_id: UUID, path: str) -> None:
         """Delete one file from a user's persistent workspace volume.
 
@@ -522,6 +531,19 @@ class SupervisorWorkspaceStore:
             )
             raise SandboxSupervisorError(msg)
 
+    async def create_file(self, *, tenant_id: UUID, user_id: UUID, path: str, data: bytes) -> None:
+        # B-262 —— supervisor 的 HTTP API 没有「不存在才创建」,这里只能先读一次再写,
+        # 两个同名上传同时到时**不是**原子的。这个后端在集群上已经退役(只剩本地 dev /
+        # CI),生产走 NasWorkspaceStore 的 ``O_EXCL``。
+        try:
+            await self.read_file(tenant_id=tenant_id, user_id=user_id, path=path, max_bytes=1)
+        except WorkspaceFileNotFoundError:
+            await self.write_file(tenant_id=tenant_id, user_id=user_id, path=path, data=data)
+            return
+        except WorkspaceFileTooLargeError:
+            pass  # 读得到、只是大于 1 字节 —— 存在
+        raise WorkspaceFileExistsError(f"workspace file already exists: {path!r}")
+
     async def delete_file(self, *, tenant_id: UUID, user_id: UUID, path: str) -> None:
         url = f"{self.base_url}/v1/workspaces/{tenant_id}/{user_id}/file"
         async with self._make_client() as client:
@@ -610,6 +632,10 @@ class RecordingWorkspaceStore:
     workspace_reads: list[tuple[UUID, UUID, str]] = field(default_factory=list)
     workspace_writes: list[tuple[UUID, UUID, str, bytes]] = field(default_factory=list)
     workspace_write_error: Exception | None = None
+    #: B-262 —— :meth:`create_file` 建出来的文件(用户根相对路径 → 字节)。名字已占用就
+    #: 抛 :class:`WorkspaceFileExistsError`;:meth:`read_file` 先认这里,上传「同名同内容
+    #: 就复用」那条比对才读得到真内容。
+    created_files: dict[str, bytes] = field(default_factory=dict)
     workspace_deletes: list[tuple[UUID, UUID, str]] = field(default_factory=list)
     workspace_delete_error: Exception | None = None
     #: 留存链 B-27 — the ``(tenant_id, user_id, path)`` of each delete_tree call.
@@ -634,7 +660,9 @@ class RecordingWorkspaceStore:
         self.workspace_reads.append((tenant_id, user_id, rel))
         if self.workspace_file_error is not None:
             raise self.workspace_file_error
-        if self.workspace_file_contents:
+        if rel in self.created_files:
+            data = self.created_files[rel]
+        elif self.workspace_file_contents:
             # 配了内容表就当它是**权威的那棵树**:没有的路径 = 不存在。不这样的话
             # 替身对任何路径都回 :attr:`workspace_file`, 于是「读别的 agent 的文件
             # 读不到」这类测试会因为拿到一串空字节而变绿 —— 变绿的理由与它要验的
@@ -714,6 +742,14 @@ class RecordingWorkspaceStore:
     async def write_file(self, *, tenant_id: UUID, user_id: UUID, path: str, data: bytes) -> None:
         if self.workspace_write_error is not None:
             raise self.workspace_write_error
+        self.workspace_writes.append((tenant_id, user_id, path, data))
+
+    async def create_file(self, *, tenant_id: UUID, user_id: UUID, path: str, data: bytes) -> None:
+        if self.workspace_write_error is not None:
+            raise self.workspace_write_error
+        if path in self.created_files or path in self.workspace_file_contents:
+            raise WorkspaceFileExistsError(f"workspace file already exists: {path!r}")
+        self.created_files[path] = data
         self.workspace_writes.append((tenant_id, user_id, path, data))
 
     async def delete_file(self, *, tenant_id: UUID, user_id: UUID, path: str) -> None:

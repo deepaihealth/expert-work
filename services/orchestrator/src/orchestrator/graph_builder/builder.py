@@ -228,6 +228,7 @@ from orchestrator.tools.error_classifier import (
     classify_tool_error,
     render_recovery_advisory,
 )
+from orchestrator.tools.figure_lookup import figure_run_ids
 from orchestrator.tools.find_tools import promotion_events
 from orchestrator.tools.mcp import parse_mcp_tool_name
 from orchestrator.tools.mutation_classifier import classify as classify_mutation
@@ -244,6 +245,7 @@ from orchestrator.tools.overflow import (
     render_overflow_footer,
 )
 from orchestrator.tools.registry import (
+    FIGURE_RUN_IDS_KEY,
     TOOL_ALLOWED_STATE_KEYS,
     Tool,
     ToolContext,
@@ -1967,6 +1969,7 @@ def build_react_graph(
             plan=state.get("plan"),
             turn_documents=state.get("turn_documents"),
             turn_image_refs=state.get("turn_image_refs"),
+            viewed_figures=state.get("viewed_figures"),
         )
         # Stream TE-2 — per-tool-call audit sink (may be None on the dev /
         # unit-test path; ``_dispatch_tool`` treats the emit as best-effort).
@@ -4376,6 +4379,7 @@ def _build_tool_context(
     plan: Plan | None = None,
     turn_documents: list[str] | None = None,
     turn_image_refs: list[str] | None = None,
+    viewed_figures: list[str] | None = None,
 ) -> ToolContext:
     """Lift tenant / user binding out of ``config["configurable"]`` into
     a :class:`ToolContext`. Missing values fall through as ``None`` —
@@ -4440,6 +4444,15 @@ def _build_tool_context(
     # config 里没有这一项,它的被绑参数就会被静默摘掉)。主 run 的填值不走这里。
     raw_prompt_inputs = configurable.get(PROMPT_INPUTS_KEY)
     prompt_inputs = raw_prompt_inputs if isinstance(raw_prompt_inputs, Mapping) else None
+    # B-262 —— 本对话渲染过页的 run:检查点里的 ``viewed_figures``(按对话存),子代再并上
+    # ``_child_config`` 传下来的父那一份。``configurable`` 不可信,逐项解析,坏的丢掉。
+    inherited_runs = {
+        parsed
+        for parsed in (
+            _parse_uuid(raw) for raw in _string_list(configurable.get(FIGURE_RUN_IDS_KEY))
+        )
+        if parsed is not None
+    }
     return ToolContext(
         tenant_id=tenant_id,
         run_id=run_id,
@@ -4464,6 +4477,7 @@ def _build_tool_context(
         workspace_layout=view_fields["workspace_layout"],
         workspace_thread_id=view_fields["workspace_thread_id"],
         child_run=configurable.get("child_run") is True,
+        figure_run_ids=figure_run_ids(_string_list(viewed_figures)) | inherited_runs,
     )
 
 

@@ -8,8 +8,9 @@
 **不在宿主复刻沙箱片段的 ``_render_sha``**(那是片段里对文档字节 + dpi 求的哈希,
 宿主再写一份就是两份算法,迟早漂移)。换成两步:
 
-1. 在**本 agent 作用域**里找 ``.tool_results/*/figures/<doc-sha>/*/_u<unit>/`` 下
-   形状合法的渲染页,取修改时间最新的那一张;
+1. 在**本 agent 作用域**里、**本对话的 run**(B-262,见 :func:`figure_run_ids`)的
+   ``.tool_results/<run>/figures/<doc-sha>/*/_u<unit>/`` 下找形状合法的渲染页,取修改时间
+   最新的那一张;
 2. **新鲜度闸**:文档自己的修改时间晚于那张渲染 → 不采用,显式失败,让模型重渲。
 
 闸的道理:渲染发生在文档最后一次修改**之后**,渲的就是当前内容。两个方向都会错:
@@ -24,8 +25,9 @@
 **只用** :meth:`WorkspaceStore.list_dir`,而且只往列表里**确认是目录**的条目里走:
 NAS 实现对不存在的目录抛内部异常、内存替身回空列表,两者对「不存在」的说法不同;
 只走确认过的条目,两者的答案就一样(「SQL↔内存 store 谓词必同义」的同一条规矩)。
-有两处**不经确认**直接列(作用域根本身;本 run 自己的目录,见
-:func:`_own_run_candidates`),那两处把 NAS 的「不存在」接住、当空处理 —— 只接
+有三处**不经确认**直接列(作用域根本身;本 run 自己的目录,见
+:func:`_own_run_candidates`;B-262 起本对话其余 run 的目录,见
+:func:`_other_run_candidates`),那三处把 NAS 的「不存在」接住、当空处理 —— 只接
 「不存在」,越界与权限错误照样抛。
 ``list_dir`` 用 ``lstat``,符号链接不会被当成目录走进去。
 
@@ -35,6 +37,7 @@ NAS 实现对不存在的目录抛内部异常、内存替身回空列表,两者
 from __future__ import annotations
 
 import logging
+from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import PurePosixPath
@@ -47,6 +50,7 @@ from expert_work.persistence import (
     WORKSPACE_OVERFLOW_DIR,
     is_rendered_figure_rel,
 )
+from orchestrator.multimodal import parse_rendered_figure_ref
 from orchestrator.tools.nas_workspace_store import _WorkspacePathNotFoundError
 from orchestrator.tools.read_page import (
     _DEFAULT_UNIT_LABEL,
@@ -69,6 +73,26 @@ logger = logging.getLogger(__name__)
 #: * ``"missing"``:文档已不在工作区里;
 #: * ``"unknown"``:核对不了(读不出修改时间、列目录失败、路径没记下来)。
 FigureFreshness = Literal["fresh", "stale", "missing", "unknown"]
+
+
+def figure_run_ids(refs: Iterable[str]) -> frozenset[UUID]:
+    """B-262 —— 一组渲染页 ref(检查点里的 ``viewed_figures``)各自落在哪个 run 的目录。
+
+    渲染页落在 agent 级的 ``.tool_results/<run>/figures/…``,同一智能体所有对话共用;
+    ``<doc-sha>`` 只认路径,两个对话里同名的上传算出来是同一个。检查点是按对话存的,
+    这里记下的 run 就是**本对话**渲染过页的全部 run。形状不对的 ref 跳过。
+    """
+    found: set[UUID] = set()
+    for ref in refs:
+        parsed = parse_rendered_figure_ref(ref)
+        if parsed is None:
+            continue
+        # 形状已过 ``is_rendered_figure_rel``:倒数第 6 段就是 run 目录名(UUID)。
+        try:
+            found.add(UUID(PurePosixPath(parsed.workspace.rel).parts[-6]))
+        except (IndexError, ValueError):
+            continue
+    return frozenset(found)
 
 
 def render_is_stale(document_mtime: datetime, render_mtime: datetime) -> bool:
@@ -163,6 +187,7 @@ async def resolve_rendered_figure(
     path: str,
     unit: int,
     run_id: UUID | None = None,
+    conversation_run_ids: Iterable[UUID] = (),
 ) -> str:
     """``path`` 第 ``unit`` 页(docx 为第 ``unit`` 处)最新一次渲染的工作区 ref。
 
@@ -170,7 +195,11 @@ async def resolve_rendered_figure(
     ``<doc-sha>`` 用的同一个输入。解析不了抛 ``ValueError``;文档不在、没渲过、
     渲完文档又改过,都抛 ``FileNotFoundError``(文字说清下一步);工作区后端不报
     修改时间、闸没法判,抛 ``RuntimeError``。``run_id`` 是当前 run,它自己的目录
-    先查(见 :func:`_rendered_candidates`)。
+    先查(见 :func:`_own_run_candidates`)。
+
+    B-262 —— 别的 run 只看 ``conversation_run_ids``(本对话渲染过页的 run,见
+    :func:`figure_run_ids`),不再扫 ``.tool_results`` 下全部 run:那里是同一智能体所有
+    对话共用的,另一个对话在同名文档上渲的页会被当成本对话的。
     """
     try:
         doc_sha, rel = render_source(path, view=view)
@@ -202,7 +231,7 @@ async def resolve_rendered_figure(
     if own_newest is not None and not render_is_stale(document.mtime, own_newest[0]):
         return workspace_figure_ref(tenant_id, user_id, scoped_path(scope, own_newest[1].rel))
     candidates = own + await _other_run_candidates(
-        lister, doc_sha=doc_sha, unit=unit, run_id=run_id
+        lister, doc_sha=doc_sha, unit=unit, run_id=run_id, run_ids=conversation_run_ids
     )
     if not candidates:
         msg = (
@@ -253,16 +282,20 @@ async def _own_run_candidates(
 
 
 async def _other_run_candidates(
-    lister: _ScopeLister, *, doc_sha: str, unit: int, run_id: UUID | None
+    lister: _ScopeLister,
+    *,
+    doc_sha: str,
+    unit: int,
+    run_id: UUID | None,
+    run_ids: Iterable[UUID],
 ) -> list[_Rendered]:
-    """其余 run 按 ``.tool_results`` 的列表扫(截掉的只是更早的 run)。"""
-    own = str(run_id) if run_id is not None else None
+    """B-262 —— 本对话的其余 run,逐个直接查各自的目录(不列 ``.tool_results``)。
+
+    目录已被留存清理删掉的 run 当空。"""
     found: list[_Rendered] = []
-    if not await lister.has_dir("", WORKSPACE_OVERFLOW_DIR):
-        return found
-    for name in await lister.subdirs(WORKSPACE_OVERFLOW_DIR):
-        run_dir = f"{WORKSPACE_OVERFLOW_DIR}/{name}"
-        if name == own or not await lister.has_dir(run_dir, RENDERED_FIGURE_DIR):
+    for other in sorted(set(run_ids) - {run_id}, key=str):
+        run_dir = f"{WORKSPACE_OVERFLOW_DIR}/{other}"
+        if RENDERED_FIGURE_DIR not in await _subdir_names(lister, run_dir):
             continue
         found.extend(await _run_pages(lister, run_dir, doc_sha=doc_sha, unit=unit))
     return found
