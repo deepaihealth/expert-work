@@ -68,6 +68,18 @@ export function ProcessStrip({
   const visible = isOpen ? (tailOnly ? rows.slice(-AUTO_VISIBLE_ROWS) : rows) : [];
   // 失败尾段由本组件单独渲染成红字,所以摘要按 `failed: 0` 取。
   const headline = processHeadline({ ...summary, failed: 0 }, t);
+  const failedText =
+    summary.failedMs !== null && summary.failedMs > 0
+      ? t("console.process_failed_time", { n: summary.failed, d: fmtDuration(summary.failedMs) })
+      : t("console.process_failed", { n: summary.failed });
+  const split =
+    summary.modelMs !== null && summary.toolMs !== null
+      ? t(summary.otherMs > 0 ? "console.process_time_split_other" : "console.process_time_split", {
+          model: fmtDuration(summary.modelMs),
+          tools: fmtDuration(summary.toolMs),
+          other: fmtDuration(summary.otherMs),
+        })
+      : null;
 
   return (
     <div className="ew-process">
@@ -83,17 +95,28 @@ export function ProcessStrip({
         </span>
         {/* 截断成省略号后 hover 有全文 —— 「工具 17 次(…)」被拦腰截断时
             不用展开也能看清工具分布(2026-08-26 用户反馈)。 */}
-        <span className="ew-process__headline" title={headline}>
+        <span
+          className="ew-process__headline"
+          title={summary.failed > 0 ? `${headline} · ${failedText}` : headline}
+        >
           {headline}
           {summary.failed > 0 && (
             <>
               {" · "}
-              <span className="ew-process__failed">
-                {t("console.process_failed", { n: summary.failed })}
-              </span>
+              <span className="ew-process__failed">{failedText}</span>
             </>
           )}
         </span>
+        {/* B-254 —— 慢在哪一眼看出来:模型思考、工具,还是失败重试(失败那段在红字里)。 */}
+        {split !== null && (
+          <span
+            className="ew-process__split"
+            data-testid="console-process-time-split"
+            title={`${split} — ${t("console.process_time_split_tip")}`}
+          >
+            {split}
+          </span>
+        )}
         {summary.durationMs !== null && (
           <span className="ew-process__duration">{fmtDuration(summary.durationMs)}</span>
         )}

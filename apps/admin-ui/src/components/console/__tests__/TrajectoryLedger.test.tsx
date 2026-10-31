@@ -310,7 +310,7 @@ describe("TrajectoryLedger", () => {
       { kind: "record", record: records[0] },
       {
         kind: "turn-summary", turnKey: "t1", turnSeq: 0, runId: "run-1", hasError: false, anchorIndex: 0,
-        summary: { modelCalls: 2, tools: 1, other: 0, failed: 0, toolBreakdown: "bash ×1", skills: [], durationMs: 1500 },
+        summary: { modelCalls: 2, tools: 1, other: 0, failed: 0, toolBreakdown: "bash ×1", skills: [], durationMs: 1500, modelMs: null, toolMs: null, failedMs: null, otherMs: 0 },
       },
     ];
     render(<TrajectoryLedger {...baseProps({ rows, onToggleTurn })} />);
@@ -471,7 +471,7 @@ describe("TrajectoryLedger", () => {
       { kind: "record", record: records[0] },
       {
         kind: "turn-summary", turnKey: "t1", turnSeq: 0, runId: "run-1", hasError: false, anchorIndex: 0,
-        summary: { modelCalls: 2, tools: 1, other: 0, failed: 0, toolBreakdown: "bash ×1", skills: [], durationMs: 1500 },
+        summary: { modelCalls: 2, tools: 1, other: 0, failed: 0, toolBreakdown: "bash ×1", skills: [], durationMs: 1500, modelMs: null, toolMs: null, failedMs: null, otherMs: 0 },
       },
     ];
     render(<TrajectoryLedger {...baseProps({ rows, onToggleTurn })} />);

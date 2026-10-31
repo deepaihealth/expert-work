@@ -513,6 +513,9 @@ def _register_ask_image(
             quick_vl_caller=quick_vl_caller,
             vl_model_name=vision.model.name,
             output_cap_resolver=served_output_cap(vision.model),
+            # B-251 —— 按页看时那一页没渲染,用这个 agent 自己的 read_page 先渲一次。
+            # read_page 是基础能力,先于这里注册;没有它(没接沙箱)就保持旧行为。
+            page_renderer=registry.get("read_page"),
         )
     )
 

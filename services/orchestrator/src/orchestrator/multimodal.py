@@ -58,6 +58,9 @@ _MEDIA_TYPE_BY_EXT: Final[dict[str, str]] = {
     ".gif": "image/gif",
 }
 
+#: B-250 —— 工作区里能直接交给看图模型的文件扩展名(小写、带点),即上表的键。
+WORKSPACE_IMAGE_EXTENSIONS: Final[frozenset[str]] = frozenset(_MEDIA_TYPE_BY_EXT)
+
 #: B-64 —— per-file read cap for :class:`NasWorkspaceImageResolver`. Mirrors
 #: ``orchestrator.tools.nas_workspace_store._MAX_READ_BYTES`` /
 #: ``sandbox_supervisor.supervisor._MAX_ARTIFACT_BYTES`` (same 64 MiB value,

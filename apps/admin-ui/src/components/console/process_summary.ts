@@ -29,6 +29,14 @@ export interface ProcessSummary {
   /** 每次模型调用的时长 + 非 think 行的 durationMs 之和(null 一律按 0);
    *  一个都没有 → null。**不含 `subagent` 行** —— 见 {@link summarizeProcess}。 */
   durationMs: number | null;
+  /** B-254 —— 合计拆开:模型调用的时长、工具行的时长、其中出错工具行的时长;
+   *  与 `durationMs` 同口径(null 按 0,一个都没有 → null;不含 `subagent` 行)。 */
+  modelMs: number | null;
+  toolMs: number | null;
+  failedMs: number | null;
+  /** 合计里既不是模型调用、也不是工具行的那部分(计划 / 规划 / 反思 / 记忆等行),
+   *  让「模型 + 工具 + 其他 = 合计」对得上;没有就是 0。拆分不显示时无意义。 */
+  otherMs: number;
 }
 
 /** `rows` 是过程条要显示的紧凑行;`modelCalls` 是这一轮的全部模型调用
@@ -42,12 +50,16 @@ export function summarizeProcess(
   let failed = 0;
   let dur = 0;
   let any = false;
+  let modelMs: number | null = null;
+  let toolMs: number | null = null;
+  let failedMs: number | null = null;
   const byTool = new Map<string, number>();
   const skillsByName = new Map<string, TurnSkill>();
   for (const call of modelCalls) {
     if (call.durationMs === null) continue;
     dur += call.durationMs;
     any = true;
+    modelMs = (modelMs ?? 0) + call.durationMs;
   }
   for (const r of rows) {
     if (r.kind === "tool") {
@@ -77,6 +89,10 @@ export function summarizeProcess(
     if (r.durationMs !== null && r.kind !== "think" && r.kind !== "subagent") {
       dur += r.durationMs;
       any = true;
+      if (r.kind === "tool") {
+        toolMs = (toolMs ?? 0) + r.durationMs;
+        if (r.status === "error") failedMs = (failedMs ?? 0) + r.durationMs;
+      }
     }
   }
   const toolBreakdown = [...byTool.entries()]
@@ -91,6 +107,10 @@ export function summarizeProcess(
     toolBreakdown,
     skills: [...skillsByName.values()],
     durationMs: any ? dur : null,
+    modelMs,
+    toolMs,
+    failedMs,
+    otherMs: any ? dur - (modelMs ?? 0) - (toolMs ?? 0) : 0,
   };
 }
 

@@ -21,8 +21,9 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+import weakref
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Literal, Protocol
 from uuid import UUID
 
@@ -45,6 +46,7 @@ from orchestrator.llm.truncation import (
     output_truncated_total,
 )
 from orchestrator.multimodal import (
+    WORKSPACE_IMAGE_EXTENSIONS,
     ImageResolver,
     image_ref_block,
     is_missing_file,
@@ -53,9 +55,12 @@ from orchestrator.multimodal import (
 )
 from orchestrator.tools._guards import usage_total
 from orchestrator.tools.error_classifier import GuidedTimeoutError, GuidedToolError
-from orchestrator.tools.figure_lookup import resolve_rendered_figure
+from orchestrator.tools.figure_lookup import FigureNotRenderedError, resolve_rendered_figure
 from orchestrator.tools.file_ops import _require_path
+from orchestrator.tools.read_page import figure_scope, workspace_figure_ref
 from orchestrator.tools.registry import ToolBlockedError, ToolContext, ToolResult, ToolSpec
+from orchestrator.tools.workspace_paths import agent_relative, resolve_workspace_path
+from orchestrator.tools.workspace_scope import scoped_path
 from orchestrator.tools.workspace_store import WorkspaceStore
 
 if TYPE_CHECKING:
@@ -77,6 +82,13 @@ _SYSTEM_PROMPT = (
 #: 超时对「一直在吐思考 token」的推理模型不触发(实测同类问题 11s 与 234s 两次),
 #: 所以这里在工具层再加一道整体上限。
 ASK_IMAGE_TIMEOUT_S = 120.0
+
+#: B-252 —— deep 超时后自动用快看再看一次的次数。
+ask_image_deep_retry_total = expert_work_counter(
+    "expert_work_ask_image_deep_timeout_quick_retry_total",
+    "ask_image calls whose depth='deep' look timed out and were retried once with the "
+    "quick look (B-252).",
+)
 
 #: B-105 —— 快看的「关思考」参数被厂商拒(4xx)、退回正常看图的次数。``model`` 是看图主模型名。
 vision_quick_fallback_total = expert_work_counter(
@@ -102,6 +114,30 @@ class VLUsageMeter(Protocol):
     async def __call__(
         self, response: AIMessage, *, tenant_id: UUID, user_id: UUID | None
     ) -> None: ...
+
+
+class PageRenderer(Protocol):
+    """B-251 —— 代模型渲一页用的 ``read_page``(就是注册表里那个工具实例)。"""
+
+    async def call(self, args: Mapping[str, Any], *, ctx: ToolContext) -> ToolResult:
+        """渲 ``args["path"]`` 的 ``args["units"]``,与模型自己调 ``read_page`` 同一个入口。"""
+
+
+class _AskImageTimeoutError(GuidedTimeoutError):
+    """本层限时触发的超时;``by_run_deadline`` 为真表示是 run 的剩余时间用完了。"""
+
+    def __init__(self, message: str, *, advice: str, by_run_deadline: bool) -> None:
+        super().__init__(message, advice=advice)
+        self.by_run_deadline = by_run_deadline
+
+
+@dataclass(frozen=True)
+class _Located:
+    """``_image_ref_from_args`` 的结果:要看的 ref、它从哪来、代调 ``read_page`` 带回的 state。"""
+
+    ref: str
+    resolved_from: dict[str, Any] | None = None
+    state_updates: Mapping[str, Any] | None = None
 
 
 @dataclass(frozen=True)
@@ -135,6 +171,16 @@ class AskImageTool:
     #: B-105 —— 看图模型(含备用树)的截断标签 / 上限解析器:实际应答的是谁、它的输出上限。
     #: ``None`` = 没接(测试),截断标签记 ``vl_model_name``、上限按厂商默认报。
     output_cap_resolver: ServedOutputCap | None = None
+    #: B-251 —— 按页看时那一页没渲染 / 已过期,用它先渲一次再看。``None`` = 这个 agent
+    #: 没有 ``read_page``:照旧报错,让模型自己去渲。
+    page_renderer: PageRenderer | None = None
+    #: B-251 回修 —— 同一 run 同一文档的代渲染排队。``ask_image`` 是只读工具,调度器会并行
+    #: 跑;两次同时渲同一份文档会在同一个渲染目录里互删(read_page 自己靠「非只读 + 同路径」
+    #: 串行,代调绕开了它)。锁只在有人等时存活(弱引用),进程内即可:一个 run 的工具调用
+    #: 都在同一个进程里。
+    _render_locks: weakref.WeakValueDictionary[tuple[object, str], asyncio.Lock] = field(
+        default_factory=weakref.WeakValueDictionary, compare=False, repr=False
+    )
 
     @property
     def spec(self) -> ToolSpec:
@@ -181,7 +227,8 @@ class AskImageTool:
         if ctx.tenant_id is None:
             msg = "ask_image requires a tenant binding"
             raise ToolBlockedError(msg)
-        ref_str, resolved_from = await self._image_ref_from_args(args, ctx=ctx)
+        located = await self._image_ref_from_args(args, ctx=ctx)
+        ref_str, resolved_from = located.ref, located.resolved_from
         question = _require_string(args, "question")
         depth = _require_depth(args)
         # B-64 —— 工作区 ref(平台渲出来的文档页)与上传 ref 走两套互相独立的
@@ -217,6 +264,7 @@ class AskImageTool:
             if workspace_ref.agent_key != (ctx.agent_key or None):
                 msg = "ask_image image_ref agent scope does not match the run agent"
                 raise ToolBlockedError(msg)
+            _refuse_other_conversation(workspace_ref.rel, ctx)
         else:
             tenant_of_ref = parse_image_ref(ref_str).tenant_id  # raises ValueError on malformed
         if tenant_of_ref != ctx.tenant_id:
@@ -236,28 +284,23 @@ class AskImageTool:
                 ]
             ),
         ]
-        if depth == "quick" and self.quick_vl_caller is not None:
+        deep_timed_out = False
+        try:
+            response = await self._ask(messages, depth=depth, ctx=ctx)
+        except _AskImageTimeoutError as exc:
+            # B-252 —— deep 超时、run 还有时间、有单独的快看路由:用快看再看一次,而不是把
+            # 「换 quick 再试」留给模型 —— 那要多一轮模型思考(10-31 那次一轮就是几十秒到
+            # 几分钟)。没有单独的快看路由时两条是同一条,再调一次就是原样重试,不做。
+            if depth != "deep" or exc.by_run_deadline or self.quick_vl_caller is None:
+                raise
+            logger.info("ask_image.deep_timeout_quick_retry")
+            ask_image_deep_retry_total.inc()
+            deep_timed_out, depth = True, "quick"
             try:
-                with expert_work_span(ExpertWorkComponent.ORCHESTRATOR, "vision"):
-                    response = await self._call_with_limit(
-                        self.quick_vl_caller, messages, depth=depth, ctx=ctx
-                    )
-            except LLMClientError as exc:
-                if not _quick_rejected(exc):
-                    raise
-                # B-105 —— 关思考的参数被这家拒了(目录没实调过的新模型最常见):退回 Agent
-                # 原本的看图配置再看一次,而不是让看图整个失败。
-                vision_quick_fallback_total.labels(model=self.vl_model_name).inc()
-                logger.warning("ask_image.quick_rejected_fallback err=%s", type(exc).__name__)
-                with expert_work_span(ExpertWorkComponent.ORCHESTRATOR, "vision"):
-                    response = await self._call_with_limit(
-                        self.vl_caller, messages, depth=depth, ctx=ctx
-                    )
-        else:
-            with expert_work_span(ExpertWorkComponent.ORCHESTRATOR, "vision"):
-                response = await self._call_with_limit(
-                    self.vl_caller, messages, depth=depth, ctx=ctx
-                )
+                response = await self._ask(messages, depth=depth, ctx=ctx, deep_fallback=False)
+            except LLMClientError as rejected:
+                # 快看被厂商拒:平时退回正常看图,这里正常看图刚超时,不再原样等一整个窗口。
+                raise exc from rejected
         # B-64 Task 9 —— VL 的开销与主模型同样算数:先扣全树共享 token 池(B3),再落
         # ``token_usage``。与 agent 节点处理主模型那次调用同序;VL 调用抛错 / 被取消时
         # 两样都不做,也与主模型一致。
@@ -270,15 +313,47 @@ class AskImageTool:
         if is_unusable_truncation(response):
             self._raise_truncated(response)
         answer = _stringify(response.content) or "[VL model returned no text]"
+        if deep_timed_out:
+            answer = (
+                f"(depth='deep' timed out after {self.timeout_s:.0f} seconds, so this is the "
+                "quick look's answer — it may miss fine detail.)\n" + answer
+            )
         # Surface VL provenance in the ToolMessage artifact (event stream /
         # audit): the image ref plus the VL call's token usage — otherwise the
         # separate VL round-trip's cost is invisible (the tool only returns text).
         meta: dict[str, Any] = {"image_ref": ref_str, "depth": depth}
         if resolved_from is not None:
             meta["resolved_from"] = resolved_from
+        if deep_timed_out:
+            meta["deep_timed_out"] = True
         if response.usage_metadata:
             meta["vl_usage"] = dict(response.usage_metadata)
-        return ToolResult(content=answer, meta=meta)
+        return ToolResult(content=answer, meta=meta, state_updates=located.state_updates or {})
+
+    async def _ask(
+        self,
+        messages: Sequence[BaseMessage],
+        *,
+        depth: AskImageDepth,
+        ctx: ToolContext,
+        deep_fallback: bool = True,
+    ) -> AIMessage:
+        """按 ``depth`` 选路由调一次看图模型。``deep_fallback=False``:快看被拒时不退回正常看图。"""
+        if depth == "quick" and self.quick_vl_caller is not None:
+            try:
+                with expert_work_span(ExpertWorkComponent.ORCHESTRATOR, "vision"):
+                    return await self._call_with_limit(
+                        self.quick_vl_caller, messages, depth=depth, ctx=ctx
+                    )
+            except LLMClientError as exc:
+                if not _quick_rejected(exc) or not deep_fallback:
+                    raise
+                # B-105 —— 关思考的参数被这家拒了(目录没实调过的新模型最常见):退回 Agent
+                # 原本的看图配置再看一次,而不是让看图整个失败。
+                vision_quick_fallback_total.labels(model=self.vl_model_name).inc()
+                logger.warning("ask_image.quick_rejected_fallback err=%s", type(exc).__name__)
+        with expert_work_span(ExpertWorkComponent.ORCHESTRATOR, "vision"):
+            return await self._call_with_limit(self.vl_caller, messages, depth=depth, ctx=ctx)
 
     def _raise_truncated(self, response: AIMessage) -> None:
         if self.output_cap_resolver is not None:
@@ -319,7 +394,7 @@ class AskImageTool:
                 limit_s, by_run_deadline = remaining_s, True
         if limit_s <= 0:
             msg = "ask_image was not run: this run has no time left before its deadline."
-            raise GuidedTimeoutError(msg, advice=_NO_TIME_LEFT_ADVICE)
+            raise _AskImageTimeoutError(msg, advice=_NO_TIME_LEFT_ADVICE, by_run_deadline=True)
         limit = asyncio.timeout(limit_s)
         try:
             async with limit:
@@ -330,17 +405,18 @@ class AskImageTool:
                 raise
             advice = _NO_TIME_LEFT_ADVICE if by_run_deadline else _TIMEOUT_ADVICE
             message = _timeout_message(limit_s, depth, by_run_deadline)
-            raise GuidedTimeoutError(message, advice=advice) from exc
+            raise _AskImageTimeoutError(
+                message, advice=advice, by_run_deadline=by_run_deadline
+            ) from exc
 
-    async def _image_ref_from_args(
-        self, args: Mapping[str, Any], *, ctx: ToolContext
-    ) -> tuple[str, dict[str, Any] | None]:
-        """两种用法二选一,返回 ``(image_ref, resolved_from)``。
+    async def _image_ref_from_args(self, args: Mapping[str, Any], *, ctx: ToolContext) -> _Located:
+        """三种用法,返回要看的 ref 与它的来历。
 
         B-64 Task 8 —— ``path`` + ``unit`` 只负责**找到** ref;找到之后回到调用方,
         走 ``image_ref`` 那条路的全部校验(tenant / user / agent_key 三项、
-        :meth:`_require_readable_workspace_image`),不为短形态另写一套。
-        ``resolved_from`` 只在短形态下非 ``None``,记进 meta 便于真栈比对。
+        :meth:`_require_readable_workspace_image`),不为短形态另写一套。B-250 的
+        「``path`` 指向一张图」同样只是换算出工作区 ref,校验仍走那一条路。
+        ``resolved_from`` 只在后两种用法下非 ``None``,记进 meta 便于真栈比对。
         """
         has_ref = _given(args, "image_ref")
         has_path = _given(args, "path")
@@ -349,25 +425,33 @@ class AskImageTool:
             if has_path or has_unit:
                 msg = "ask_image here only accepts 'image_ref'; 'path' / 'unit' are not available"
                 raise ValueError(msg)
-            return _require_string(args, "image_ref"), None
+            return _Located(_require_string(args, "image_ref"))
         if has_ref and (has_path or has_unit):
             msg = (
-                "ask_image takes either 'image_ref' or 'path' + 'unit', not both — "
-                "for a document page you rendered with read_page, pass only 'path' + 'unit'"
+                "ask_image takes either 'image_ref' or 'path' (+ 'unit'), not both — "
+                "for a document page or an image file in the workspace, pass only 'path'"
             )
             raise ValueError(msg)
         if has_ref:
-            return _require_string(args, "image_ref"), None
+            raw = _require_string(args, "image_ref")
+            # B-250 —— 10-31 那次模型把工作区里的 ``work/x.png`` 填进了 ``image_ref``;
+            # 不是平台 ref、又是图片路径,就当 ``path`` 处理,省一轮「参数不对」。
+            if not raw.startswith("expert_work://") and _is_image_path(raw):
+                return await self._workspace_image(raw, ctx=ctx)
+            return _Located(raw)
+        if has_path and not has_unit and _is_image_path(args.get("path")):
+            return await self._workspace_image(args["path"], ctx=ctx)
         if not has_path and not has_unit:
             msg = (
-                "ask_image needs either 'image_ref' (an uploaded image) or 'path' + 'unit' "
-                "(a document page you rendered with read_page)"
+                "ask_image needs either 'image_ref' (an uploaded image), 'path' (an image "
+                "file in the workspace) or 'path' + 'unit' (a document page)"
             )
             raise ValueError(msg)
         if not (has_path and has_unit):
             msg = (
-                "ask_image 'path' and 'unit' go together: 'path' is the document path you "
-                "gave read_page, 'unit' is the page number you rendered"
+                "ask_image 'path' and 'unit' go together for a document: 'path' is the "
+                "document path, 'unit' the page number (an image file — "
+                f"{'/'.join(sorted(WORKSPACE_IMAGE_EXTENSIONS))} — needs only 'path')"
             )
             raise ValueError(msg)
         unit = _require_unit(args)
@@ -375,16 +459,59 @@ class AskImageTool:
         if ctx.tenant_id is None or ctx.user_id is None:
             msg = "ask_image 'path' + 'unit' requires a tenant and user binding"
             raise ToolBlockedError(msg)
-        ref = await resolve_rendered_figure(
-            self.workspace_store,
-            tenant_id=ctx.tenant_id,
-            user_id=ctx.user_id,
-            view=ctx.workspace_view,
-            path=path,
-            unit=unit,
-            run_id=ctx.run_id,
-        )
-        return ref, {"path": path, "unit": unit}
+        store, tenant_id, user_id = self.workspace_store, ctx.tenant_id, ctx.user_id
+
+        async def find() -> str:
+            return await resolve_rendered_figure(
+                store,
+                tenant_id=tenant_id,
+                user_id=user_id,
+                view=ctx.workspace_view,
+                path=path,
+                unit=unit,
+                run_id=ctx.run_id,
+            )
+
+        try:
+            ref = await find()
+        except FigureNotRenderedError:
+            if self.page_renderer is None:
+                raise
+            # B-251 —— 文档在、这一页没渲染或已过期:代模型调一次 read_page(同一个工具
+            # 实例、同一套沙箱)再找。它回来的 state 原样带回去,与模型自己调一样。
+            key = (ctx.run_id, path)
+            lock = self._render_locks.get(key)
+            if lock is None:
+                lock = self._render_locks[key] = asyncio.Lock()
+            async with lock:
+                try:  # 排队时别人可能已经渲好了
+                    return _Located(await find(), {"path": path, "unit": unit})
+                except FigureNotRenderedError:
+                    pass
+                rendered = await self.page_renderer.call({"path": path, "units": [unit]}, ctx=ctx)
+                try:
+                    ref = await find()
+                except FigureNotRenderedError as exc:
+                    msg = f"ask_image 先调了 read_page 渲染这一页,没有成功:{rendered.content}"
+                    raise FigureNotRenderedError(msg) from exc
+            return _Located(
+                ref,
+                {"path": path, "unit": unit, "auto_rendered": True},
+                rendered.state_updates,
+            )
+        return _Located(ref, {"path": path, "unit": unit})
+
+    async def _workspace_image(self, raw_path: Any, *, ctx: ToolContext) -> _Located:
+        """B-250 —— 工作区里的一张图 → 工作区 ref。路径按本 run 的视图解析(与文件工具同一套
+        越界 / 保留目录校验),换算成用户根相对路径;读不读得到交给 :meth:`call` 里那道检查。"""
+        path = _require_path({"path": raw_path}, tool="ask_image", view=ctx.workspace_view).path
+        if ctx.tenant_id is None or ctx.user_id is None:
+            msg = "ask_image 'path' requires a tenant and user binding"
+            raise ToolBlockedError(msg)
+        view = ctx.workspace_view
+        target = resolve_workspace_path(path, view=view, tool="ask_image")
+        rel = scoped_path(figure_scope(view), agent_relative(target, view))
+        return _Located(workspace_figure_ref(ctx.tenant_id, ctx.user_id, rel), {"path": path})
 
     async def _require_readable_workspace_image(self, ref_str: str) -> None:
         """B-64 Task 7 回修第 2 轮 —— 工作区图读不出来就让**这一次工具调用**显式失败。
@@ -425,12 +552,14 @@ def _spec_with_short_form() -> ToolSpec:
         name="ask_image",
         description=(
             "Ask a vision model a specific question about an image. Point at the image "
-            "in exactly one of two ways: (1) a document page you rendered with read_page "
-            "— pass 'path' (the same document path you gave read_page) and 'unit' (the "
-            "page number you rendered; for .docx the figure number read_page used). "
-            "Prefer this for document pages: do not copy long references by hand. "
-            "(2) 'image_ref' — an ``expert_work://image/...`` reference attached to the "
-            "user message, for images the user uploaded. Ask narrow, specific questions; "
+            "in exactly one of three ways: (1) an image file in the workspace (png, jpg, "
+            "jpeg, webp, gif — e.g. a crop you saved) — pass only 'path'; no need to put it "
+            "into a PDF first. (2) a document page — pass 'path' (the document path) and "
+            "'unit' (the page number; for .docx the figure number read_page used); if that "
+            "page has not been rendered yet it is rendered for you. Do not copy long "
+            "references by hand. (3) 'image_ref' — an ``expert_work://image/...`` reference "
+            "attached to the user message, for images the user uploaded. Ask narrow, "
+            "specific questions; "
             "call ask_image repeatedly with sharper follow-ups if the first answer is too "
             "vague — the image stays accessible. By default it is a quick look (good for "
             "reading text, recognising content, finding numbers); pass depth='deep' only "
@@ -442,16 +571,16 @@ def _spec_with_short_form() -> ToolSpec:
                 "path": {
                     "type": "string",
                     "description": (
-                        "Document page form: the document path exactly as you passed it "
-                        "to read_page. Use together with 'unit'."
+                        "An image file in the workspace (alone), or a document path "
+                        "(together with 'unit')."
                     ),
                 },
                 "unit": {
                     "type": "integer",
                     "minimum": 1,
                     "description": (
-                        "Document page form: one of the 'units' you passed to read_page "
-                        "(page/slide number; for .docx the figure number)."
+                        "Document page form only: the page/slide number (for .docx the "
+                        "figure number read_page listed)."
                     ),
                 },
                 "image_ref": {
@@ -523,6 +652,28 @@ def _require_depth(args: Mapping[str, Any]) -> AskImageDepth:
             return depth
     msg = f"ask_image 'depth' must be one of {list(_DEPTHS)}, got {raw!r}"
     raise ValueError(msg)
+
+
+def _is_image_path(raw: object) -> bool:
+    """B-250 —— 一个字符串路径,扩展名是看图模型认的图片格式。"""
+    if not isinstance(raw, str) or not raw.strip():
+        return False
+    name = raw.rsplit("/", 1)[-1]
+    stem, dot, suffix = name.rpartition(".")
+    return bool(dot and stem) and f".{suffix.lower()}" in WORKSPACE_IMAGE_EXTENSIONS
+
+
+def _refuse_other_conversation(rel: str, ctx: ToolContext) -> None:
+    """B-236 —— 工作区 ref 落在 ``agents/<key>/threads/<id>/`` 底下时,``<id>`` 必须是本对话。
+
+    路径形态(``path``)走 ``resolve_workspace_path``,本来就到不了别的对话;这里补的是模型
+    手写 ``expert_work://workspace/...`` 的那条路(审查回修:B-236 之前就能这样写)。"""
+    parts = rel.split("/")
+    if len(parts) >= 4 and parts[0] == "agents" and parts[2] == "threads":
+        own = ctx.workspace_view.own_thread
+        if own is None or parts[3] != str(own):
+            msg = "ask_image image_ref points into another conversation's directory"
+            raise ToolBlockedError(msg)
 
 
 def _given(args: Mapping[str, Any], key: str) -> bool:

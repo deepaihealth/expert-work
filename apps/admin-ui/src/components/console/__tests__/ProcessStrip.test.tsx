@@ -269,6 +269,82 @@ describe("ProcessStrip", () => {
     expect(head).toHaveTextContent("7.0s");
   });
 
+  it("B-254 — shows how the time splits between model and tools, and what the failures cost", () => {
+    const events: SseEvent[] = [
+      upd("agent", {
+        step_count: 1,
+        _duration_ms: 4_000,
+        messages: [
+          {
+            type: "ai",
+            content: "",
+            tool_calls: [
+              { id: "c1", name: "ask_image", args: { q: "a" } },
+              { id: "c2", name: "ask_image", args: { q: "b" } },
+            ],
+          },
+        ],
+      }),
+      upd("tools", {
+        messages: [
+          {
+            type: "tool",
+            tool_call_id: "c1",
+            name: "ask_image",
+            content: "ok",
+            status: "success",
+            additional_kwargs: { duration_ms: 1_000 },
+          },
+          {
+            type: "tool",
+            tool_call_id: "c2",
+            name: "ask_image",
+            content: "boom",
+            status: "error",
+            additional_kwargs: { duration_ms: 3_000 },
+          },
+        ],
+      }),
+      upd("agent", {
+        step_count: 2,
+        _duration_ms: 2_000,
+        messages: [{ type: "ai", content: "答复" }],
+      }),
+    ];
+    renderStrip(makeProps(fromEvents(events)));
+    expect(screen.getByTestId("console-process-time-split")).toHaveTextContent(
+      "模型 6.0s · 工具 4.0s",
+    );
+    expect(screen.getByTestId("console-process-head")).toHaveTextContent(
+      "1 次失败（3.0s）",
+    );
+    expect(screen.getByTestId("console-process-head")).toHaveTextContent(
+      "10.0s",
+    );
+  });
+
+  it("B-254 — no tool timings → no split; untimed failures read as a plain count", () => {
+    const events: SseEvent[] = [
+      upd("agent", {
+        step_count: 1,
+        _duration_ms: 1_000,
+        messages: [
+          { type: "ai", content: "", tool_calls: [{ id: "c1", name: "bash", args: { q: "x" } }] },
+        ],
+      }),
+      upd("tools", {
+        messages: [
+          { type: "tool", tool_call_id: "c1", name: "bash", content: "boom", status: "error" },
+        ],
+      }),
+    ];
+    renderStrip(makeProps(fromEvents(events)));
+    expect(screen.queryByTestId("console-process-time-split")).not.toBeInTheDocument();
+    const head = screen.getByTestId("console-process-head");
+    expect(head).toHaveTextContent("1 次失败");
+    expect(head).not.toHaveTextContent("1 次失败（");
+  });
+
   it("renders nothing for a turn without process rows", () => {
     renderStrip(makeProps({ rows: [] }));
     expect(screen.queryByTestId("console-process-head")).not.toBeInTheDocument();

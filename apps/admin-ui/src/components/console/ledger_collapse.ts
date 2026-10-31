@@ -116,6 +116,12 @@ export function turnSummaryOf(records: readonly LedgerRecord[]): ProcessSummary 
     toolBreakdown: breakdownOf(toolLabels),
     skills: [...skillsByName.values()],
     durationMs: first === null || last === null ? null : last - first,
+    // B-254 —— 这里的合计是整轮墙钟(并行工具不重复算);逐条相加的拆分会和它对不上,
+    // 账本视图不给拆分,只有过程条给。
+    modelMs: null,
+    toolMs: null,
+    failedMs: null,
+    otherMs: 0,
   };
 }
 
