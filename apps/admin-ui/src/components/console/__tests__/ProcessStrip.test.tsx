@@ -13,7 +13,7 @@ import i18n from "../../../i18n";
 
 import type { SseEvent } from "../../../api/sessions";
 import { compactRowsOf } from "../../../api/trajectory_rows";
-import { modelCallsOf } from "../live_rows";
+import { modelCallsOf, toolNodeMsOf } from "../live_rows";
 import { ProcessStrip, type ProcessStripProps } from "../ProcessStrip";
 
 function ev(event: string, data: unknown): SseEvent {
@@ -49,11 +49,14 @@ function stepEvents(n: number): SseEvent[] {
   return out;
 }
 
-/** TurnBlock 同款:紧凑行 + 这一轮的全部模型调用。 */
-function fromEvents(events: readonly SseEvent[]): Pick<ProcessStripProps, "rows" | "modelCalls"> {
+/** TurnBlock 同款:紧凑行 + 这一轮的全部模型调用 + tools 节点帧墙钟。 */
+function fromEvents(
+  events: readonly SseEvent[],
+): Pick<ProcessStripProps, "rows" | "modelCalls" | "toolNodeMs"> {
   return {
     rows: compactRowsOf(events).map((row) => ({ row })),
     modelCalls: modelCallsOf(events, undefined),
+    toolNodeMs: toolNodeMsOf(events),
   };
 }
 
@@ -285,7 +288,9 @@ describe("ProcessStrip", () => {
           },
         ],
       }),
+      // 两个调用并发跑,这一批的墙钟是 3.2s(B-255:不是 1s + 3s)。
       upd("tools", {
+        _duration_ms: 3_200,
         messages: [
           {
             type: "tool",
@@ -313,14 +318,53 @@ describe("ProcessStrip", () => {
     ];
     renderStrip(makeProps(fromEvents(events)));
     expect(screen.getByTestId("console-process-time-split")).toHaveTextContent(
-      "模型 6.0s · 工具 4.0s",
+      "模型 6.0s · 工具 3.2s",
     );
     expect(screen.getByTestId("console-process-head")).toHaveTextContent(
       "1 次失败（3.0s）",
     );
     expect(screen.getByTestId("console-process-head")).toHaveTextContent(
-      "10.0s",
+      "9.2s",
     );
+  });
+
+  it("B-255 — three parallel 120s calls in one step show that step's 125s wall, not 6m0s", () => {
+    // 测试对话 8478cedb:并发的 ask_image 逐条相加,过程条报「工具 33m14s」,
+    // 而状态栏按 tools 节点帧算的是 18m11s(整轮墙钟 34 分钟)。
+    const calls = ["c1", "c2", "c3"];
+    const events: SseEvent[] = [
+      upd("agent", {
+        step_count: 1,
+        _duration_ms: 5_000,
+        messages: [
+          {
+            type: "ai",
+            content: "",
+            tool_calls: calls.map((id) => ({ id, name: "ask_image", args: { q: id } })),
+          },
+        ],
+      }),
+      upd("tools", {
+        _duration_ms: 125_000,
+        messages: calls.map((id) => ({
+          type: "tool",
+          tool_call_id: id,
+          name: "ask_image",
+          content: id === "c1" ? "boom" : "ok",
+          status: id === "c1" ? "error" : "success",
+          additional_kwargs: { duration_ms: 120_000 },
+        })),
+      }),
+      upd("agent", { step_count: 2, _duration_ms: 3_000, messages: [{ type: "ai", content: "答复" }] }),
+    ];
+    renderStrip(makeProps(fromEvents(events)));
+    expect(screen.getByTestId("console-process-time-split")).toHaveTextContent(
+      "模型 8.0s · 工具 2m5s",
+    );
+    const head = screen.getByTestId("console-process-head");
+    expect(head).toHaveTextContent("1 次失败（2m0s）");
+    // 合计 = 8s + 125s = 2m13s,不是 8s + 360s。
+    expect(head).toHaveTextContent("2m13s");
   });
 
   it("B-254 — no tool timings → no split; untimed failures read as a plain count", () => {

@@ -32,6 +32,7 @@ from expert_work.persistence.knowledge.passages import (
     SWITCH_OFF_REVISION,
     ChunkVector,
     DisabledReason,
+    DiscardedEdits,
     ManualPassage,
     Passage,
     PassageChild,
@@ -1218,7 +1219,9 @@ class InMemoryKnowledgeStore(InMemoryEstimates, KnowledgeStore):
         current = {p.row.id: p.row.revision for p in self._passages(tenant_id, document_id)}
         return unapplied_revisions(histories, current, self._records(tenant_id, document_id))
 
-    async def discard_unapplied_revisions(self, *, tenant_id: UUID, document_id: UUID) -> int:
+    async def discard_unapplied_revisions(
+        self, *, tenant_id: UUID, document_id: UUID
+    ) -> DiscardedEdits:
         unapplied = await self.list_unapplied_revisions(
             tenant_id=tenant_id, document_id=document_id
         )
@@ -1244,9 +1247,9 @@ class InMemoryKnowledgeStore(InMemoryEstimates, KnowledgeStore):
             for entry in self._switch_offs
             if not (entry[:2] == mine and entry[2].passage_id in records)
         ]
-        discarded = len(self._revisions) - len(kept) + len(self._switch_offs) - len(kept_records)
+        rows = len(self._revisions) - len(kept) + len(self._switch_offs) - len(kept_records)
         self._revisions, self._switch_offs = kept, kept_records
-        return discarded
+        return DiscardedEdits(entries=len(unapplied), revisions=rows)
 
     async def count_review_items(
         self, *, tenant_id: UUID, document_ids: Sequence[UUID]
