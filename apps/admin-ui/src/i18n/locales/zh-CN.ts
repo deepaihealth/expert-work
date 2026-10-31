@@ -530,7 +530,7 @@ const zhCN: TranslationKeys = {
     review_discard: "全部丢弃",
     review_discard_confirm_title: "丢弃这 {{n}} 条没套回去的内容？",
     review_discard_confirm_body: "会删除它们的修订历史，不能恢复。",
-    review_discarded: "已丢弃没套回去的内容。",
+    review_discarded: "已丢弃 {{n}} 条没套回去的内容。",
     review_discard_nothing: "已经没有可丢弃的内容（可能已被处理），已刷新。",
     needs_admin: "需要租户管理员权限：这会删除数据。",
     doc_disabled: "已停用",
@@ -1513,7 +1513,7 @@ const zhCN: TranslationKeys = {
     vision_hint: "主模型不能看图，配置视觉模型后才能看图片和文档里的图。",
     vision_clear: "清除（不配置图像理解）",
     section_vision_help:
-      "仅当主模型为纯文本模型时显示。\n配的视觉模型专门回答图片相关问题，主模型负责统筹。\n留空 = 智能体不能看图。\n示例：qwen-vl-max",
+      "仅当主模型为纯文本模型时显示。\n配的视觉模型专门回答图片相关问题，主模型负责统筹。\n留空 = 智能体不能看图。\n看图默认是快速看（关思考或最低档）；深入看时，视觉模型的推理深度没填就按中档（模型支持调深度时）。\n示例：qwen-vl-max",
     section_fallback: "备用模型",
     section_fallback_help:
       "主模型失败或超时时，按顺序切换到备用模型，而不是让整次运行失败。\n不配 = 只用主模型。\n建议：备用选不同厂商的模型，避免单一厂商故障导致整条备用链不可用。",
@@ -1880,7 +1880,7 @@ const zhCN: TranslationKeys = {
     process_failed_time: "{{n}} 次失败（{{d}}）",
     process_time_split: "模型 {{model}} · 工具 {{tools}}",
     process_time_split_other: "模型 {{model}} · 工具 {{tools}} · 其他 {{other}}",
-    process_time_split_tip: "各步骤耗时相加；同一步里并行的工具调用各自计入",
+    process_time_split_tip: "各步骤耗时相加；同一步里并行的工具调用按那一步实际花的时间算一次",
     process_empty: "无过程",
     process_more: "还有 {{n}} 步…",
     process_skills: "技能",

@@ -4218,7 +4218,7 @@ const en: TranslationKeys = {
     review_discard: "Discard all",
     review_discard_confirm_title: "Discard these {{n}} items that were not put back?",
     review_discard_confirm_body: "Their revision history is deleted and cannot be restored.",
-    review_discarded: "Discarded the items that were not put back.",
+    review_discarded: "Discarded {{n}} items that were not put back.",
     review_discard_nothing:
       "Nothing is left to discard (it may have been handled meanwhile). The list was refreshed.",
     needs_admin: "Needs a tenant admin: this deletes data.",
@@ -5256,7 +5256,7 @@ const en: TranslationKeys = {
       "The main model can't see images. Configure a vision model to let it read images and figures in documents.",
     vision_clear: "Clear (no image understanding)",
     section_vision_help:
-      "Shown only when the main model is text-only.\nThe vision model answers image-related questions; the main model coordinates.\nLeave empty = the agent can't see images.\nExample: qwen-vl-max",
+      "Shown only when the main model is text-only.\nThe vision model answers image-related questions; the main model coordinates.\nLeave empty = the agent can't see images.\nImage questions default to a quick look (thinking off or its lowest tier); a deep look uses medium depth when the vision model's reasoning depth is not set (on models that have one).\nExample: qwen-vl-max",
     section_fallback: "Fallback models",
     section_fallback_help:
       "If the main model fails or times out, the run switches to the fallback models in order instead of failing.\nNone configured = the agent only uses its main model.\nTip: pick fallbacks from different vendors so one vendor's outage doesn't take down the whole chain.",
@@ -5634,7 +5634,7 @@ const en: TranslationKeys = {
     process_time_split: "model {{model}} · tools {{tools}}",
     process_time_split_other: "model {{model}} · tools {{tools}} · other {{other}}",
     process_time_split_tip:
-      "each step's own time added up; tool calls that ran in parallel in one step are each counted",
+      "each step's own time added up; tool calls that ran in parallel in one step count once, as that step's actual time",
     process_empty: "No steps",
     process_more: "{{n}} more steps…",
     process_skills: "Skills",

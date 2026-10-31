@@ -20,7 +20,7 @@ import {
   type PassageRevision,
 } from "../../../api/knowledge_maintenance";
 import { HeadingPath } from "../HeadingPath";
-import { usePassageLabel, WriteGate } from "./PassageCard";
+import { EditedBy, usePassageLabel, WriteGate } from "./PassageCard";
 import { passageWriteError } from "./passageErrors";
 
 const { Paragraph, Text } = Typography;
@@ -56,9 +56,11 @@ function RevisionCard({
 }): ReactElement {
   const { t } = useTranslation();
   const who =
-    record.edited_by === null
-      ? t("kb_maintenance.history_from_file")
-      : t("kb_maintenance.history_by", { who: record.edited_by });
+    record.edited_by === null ? (
+      t("kb_maintenance.history_from_file")
+    ) : (
+      <EditedBy record={record} />
+    );
   return (
     <Card
       size="small"
