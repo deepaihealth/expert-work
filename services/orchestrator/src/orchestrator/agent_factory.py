@@ -1211,7 +1211,12 @@ async def build_agent(
         worker_delegation=SPAWN_WORKER_TOOL_NAME in registry,
         knowledge_catalog=knowledge_catalog,
         agent_memory=(
-            agent_memory_rules(has_edit_file="edit_file" in registry) if agent_memory else None
+            agent_memory_rules(
+                has_edit_file="edit_file" in registry,
+                has_skills=bool(loaded_skills.skill_summaries),
+            )
+            if agent_memory
+            else None
         ),
     )
 

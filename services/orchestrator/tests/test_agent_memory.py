@@ -33,6 +33,7 @@ _TENANT, _USER = uuid4(), uuid4()
 _KEY = "plan-aaaaaaaa"
 _C1 = UUID("11111111-1111-1111-1111-111111111111")
 _RULES_HEADING = "# Agent memory (/agent)"
+_SKILL_CLAUSE = "says where that kind of setting is kept"
 _ANTHROPIC = "expert-work/dev/llm/anthropic"
 
 _SPEC: dict[str, Any] = {
@@ -114,6 +115,74 @@ def test_the_rules_are_categories_and_tenant_neutral() -> None:
     assert "authoritative" in text and "hints" in text
     assert "edit_file" not in agent_memory_rules(has_edit_file=False)
     assert len(text) < 1600  # 每次构建都在:保持短
+
+
+def test_the_skill_clause_appears_only_when_skills_are_bound() -> None:
+    """B-245 —— 技能自己规定了设置存在哪(比如样式默认值文件),先按技能来。只给挂了技能的
+    构建;没挂技能的不读这一句。"""
+    from orchestrator.graph_builder.agent_notes import agent_memory_rules
+
+    with_skills = agent_memory_rules(has_edit_file=True, has_skills=True)
+    without = agent_memory_rules(has_edit_file=True, has_skills=False)
+    assert _SKILL_CLAUSE in with_skills
+    assert _SKILL_CLAUSE not in without
+    assert "preference or setting" in with_skills
+    assert "same path under /agent/" in with_skills
+    for word in ("health", "report", "style", "customer-specific"):
+        assert word not in with_skills.split("Before saving a preference")[1].split("\n")[0]
+    assert len(with_skills) < 1900
+
+
+async def test_a_build_with_a_bound_skill_carries_the_skill_clause(tmp_path: Path) -> None:
+    from datetime import UTC, datetime
+
+    from expert_work.protocol.skill import SkillVersion
+    from orchestrator.agent_factory import _SkillLookupResult
+
+    version = SkillVersion(
+        id=uuid4(),
+        skill_id=uuid4(),
+        tenant_id=uuid4(),
+        version=1,
+        prompt_fragment="keep defaults in /agent/style/defaults.json",
+        tool_names=(),
+        description="style defaults",
+        category=None,
+        required_models=(),
+        authored_by="human",
+        created_at=datetime.now(UTC),
+    )
+
+    async def resolver(tenant_id: UUID, name: str, ver: int | None) -> _SkillLookupResult:
+        del tenant_id, ver
+        return (
+            _SkillLookupResult.ok(version)
+            if name == "style-kit"
+            else _SkillLookupResult.not_found()
+        )
+
+    doc = deepcopy(_SPEC)
+    doc["spec"]["skills"] = ["style-kit"]
+    env = ToolEnv(
+        sandbox_runtime=RecordingSandboxRuntime(),
+        workspace_store=NasWorkspaceStore(root=str(tmp_path)),
+    )
+
+    async with make_checkpointer("memory") as cp:
+        with_skill = await build_agent(
+            AgentSpec.model_validate(doc),
+            secret_store=LocalDevSecretStore.from_mapping({_ANTHROPIC: "sk-ant-test"}),
+            checkpointer=cp,
+            tool_env=env,
+            provider_key_resolver=_resolver,
+            skill_resolver=resolver,
+            tenant_id=uuid4(),
+        )
+    without = await _build(env)
+
+    assert _SKILL_CLAUSE in with_skill.system_prompt
+    assert _RULES_HEADING in without.system_prompt
+    assert _SKILL_CLAUSE not in without.system_prompt
 
 
 # ---------------------------------------------------------------------------

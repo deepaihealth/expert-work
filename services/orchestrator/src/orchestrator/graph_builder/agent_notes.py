@@ -71,9 +71,21 @@ agent_notes_total = expert_work_counter(
 )
 
 
-def agent_memory_rules(*, has_edit_file: bool) -> str:
-    """系统提示词里的固定规矩(英文:平台给模型的话)。``edit_file`` 没注册时不点它的名。"""
+def agent_memory_rules(*, has_edit_file: bool, has_skills: bool = False) -> str:
+    """系统提示词里的固定规矩(英文:平台给模型的话)。``edit_file`` 没注册时不点它的名。
+
+    B-245 —— 挂了技能的构建多一句:技能自己规定了某类设置存在哪(默认值文件等),按技能来。
+    否则模型按这里的「一事一文件」另写一份笔记,技能的脚本读不到(10-31 §73.17)。"""
     edit = "with edit_file (targeted edits)" if has_edit_file else "with targeted edits"
+    skills = (
+        "Before saving a preference or setting, check whether a skill whose description fits "
+        "says where that kind of setting is kept (for example a defaults file) and how to "
+        "change it; if one does, save it that way and at that path (a path under /workspace "
+        "means the same path under /agent/), and list that path in the index instead of "
+        "writing a separate note.\n"
+        if has_skills
+        else ""
+    )
     return (
         "# Agent memory (/agent)\n"
         "/agent/ is this agent's own directory and outlasts every conversation. Save there "
@@ -87,6 +99,7 @@ def agent_memory_rules(*, has_edit_file: bool) -> str:
         f"Keep one file per topic under /agent/ and change existing files {edit}, not by "
         f"rewriting them whole. List every saved item in {NOTES_PATH}, one line each: what it "
         "is and where it lives.\n"
+        f"{skills}"
         "When /workspace holds a copy of an /agent directory, editing the copy changes only "
         "this conversation; to make a change last, edit /agent/<dir>/... instead.\n"
         f"{NOTES_PATH} is authoritative for this agent. Long-term memories recalled from past "

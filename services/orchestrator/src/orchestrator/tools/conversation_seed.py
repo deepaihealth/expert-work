@@ -241,6 +241,11 @@ def _children(dir_fd: int, tally: _Tally) -> Iterator[tuple[str, os.stat_result]
             info = os.lstat(name, dir_fd=dir_fd)
         except FileNotFoundError:
             continue
+        except OSError:
+            # B-244 —— 目录能列名、不能进(``chmod 644``):``lstat`` 每个名字都 EACCES。跳过计数,
+            # 不让它冒出去把整次复制弄失败(失败不写标记、每轮重试每轮失败)。
+            tally.skip()
+            continue
         if stat.S_ISDIR(info.st_mode) or stat.S_ISREG(info.st_mode):
             yield name, info
         else:
