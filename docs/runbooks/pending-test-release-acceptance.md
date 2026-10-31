@@ -1824,6 +1824,28 @@ asyncio.run(main())
 
 - [ ] **82.5 真栈没有新的报错(只读)**:发布后 24 小时,`kubectl logs deploy/control-plane --since=24h | grep -c 'not started'` 与发布前同时长对比不增加;`grep -c 'reason=invalidated_mid_build'`(主智能体与子智能体两种日志都含这一段)有数就说明真栈撞上过这个竞态并被拦下(0 也正常,窗口很窄)。
 
+## §83 改 MCP 目录不再打断正在用的连接(B-259)
+
+**背景**:以前平台 MCP 目录任何一次新建 / 修改 / 删除(连只改说明、图标)都把整个平台池关掉,本副本和所有其它副本上每个平台 MCP 连接都被硬停,正在跑的运行此后每次调平台 MCP 工具都报 `not started`,一直到运行结束(10-30 事故同款症状,日常改目录就能触发)。租户自己的 MCP 服务改动、租户开通 / 取消平台服务(允许清单)同样整池关掉该租户的全部连接。现在按「改了什么」分:
+① 只改展示字段(显示名、说明、分类、图标、所需档位)—— 什么都不动,构建也不清(运行期没人读这些字段;档位只在租户新开通时校验)。
+② 改连接配置(地址、超时、读超时、禁用工具、重贴令牌)—— 只**退役**这一项:进行中的调用在原连接上做完,这次运行之后的调用走一次性连接(仍是旧配置);全部构建清掉,新运行用新配置。池里其它项的长连接留着,下一次构建直接复用、不重连。
+③ 停用 / 删除 —— 只**硬停**这一项(含池到期时退役的副本),其它项照常。
+④ 新建 / 重新启用 —— 什么都不停,构建清掉,下一个运行就能用上。
+oauth2 目录项本来就不在平台池里:不再碰平台池;`enabled` 切换照旧走 B-248 的 `user_mcp_oauth_connector_*`,其它运行期字段变了只清构建(`agent_build_all`)。租户 MCP 服务同理(按租户):改地址 / 超时 / 令牌 / 自定义头 = 退役这一项,停用 / 删除 = 只硬停这一项,新建 = 什么都不停;改完是停用的一律按停用处理(幂等)。允许清单改动只清该租户的构建,不再碰租户 MCP 池。
+
+跨副本:新事件 `platform_mcp_server_changed` / `platform_mcp_server_removed`、`tenant_mcp_server_changed` / `tenant_mcp_server_removed`,带服务名(`connector` 字段,租户事件另带 `tenant_id`),各副本只处理那一项;只改展示字段不发事件。credential-proxy 也听这四个新事件(令牌 / 自定义头原地重贴后靠它们清缓存)。
+
+**滚动发布期间不要改 MCP 目录 / 租户 MCP 服务**:老 pod 不认新事件,只记一行 `invalidation_bus.unknown_kind` 就忽略,它的池保持旧配置,直到自己 30 分钟到期或被替换;反过来,老 pod 上改的仍发旧的整池事件(`platform_mcp` / `tenant_mcp`),新 pod 照旧整池关掉(兼容保留,只在发布窗口出现)。credential-proxy 没更新到这一版前听不到新事件,令牌重贴后最多 60 秒(它的缓存时长)仍用旧值。
+
+**怎么进**:测试环境控制台(system_admin,平台租户)。先只读查两个已启用、都在平台池里的平台 MCP 服务(`none` 或带平台令牌的 `bearer`):`SELECT name, auth_type, bearer_token_ref IS NOT NULL, enabled FROM mcp_connector_catalog WHERE enabled AND auth_type IN ('none','bearer')`,记为 A、B,确认平台租户的允许清单里两个都开着。建临时智能体 `acc-b259`(主模型 glm-5.3),提示词让它「交替调用 A、B 各一个只读工具(不改任何数据),各 15 次,每次报出结果」;只挑只读工具。改目录前先记下各 control-plane pod 的 `expert_work_control_plane_invalidation_bus_received_total{kind=~".*mcp.*"}`。所有改动结束后改回原值。**花费**:约 ¥2(5 次运行,每次 30 次左右工具调用)。
+
+- [ ] **83.1 只改说明不打断**:运行 `acc-b259`,看到它调过几次 A 之后,控制台编辑 A 只改说明保存。判据:这次运行此后所有 A、B 调用都成功,工具结果里没有 `not started`;日志里这次运行没有 `mcp.retired_client_call server=A`(还在原长连接上);各 pod 的上述计数不变(没发事件)。**没修好时**:保存之后这次运行里每次 A、B 调用都报 `... not started`。
+- [ ] **83.2 改连接配置:在途做完、之后一次性连接、新运行用新配置**:再跑一次,运行中把 A 的超时改一个值(如 30 → 31;有等价的备用地址也可以改地址)。判据:保存那一刻进行中的 A 调用正常返回;这次运行之后的 A 调用成功,日志有 `mcp.retired_client_call server=A`;B 调用成功且没有 `mcp.retired_client_call server=B`(B 的长连接没动);每个 pod `kind="platform_mcp_server_changed"` 的接收计数各 +1。运行结束后再跑一次:开头重新构建,全程没有 `mcp.retired_client_call`。**没修好时**:保存后 A、B 都报 `not started`。
+- [ ] **83.3 停用只停这一项**:再跑一次,运行中停用 A。判据:之后 A 调用报 `not started`(或模型说工具不可用),B 调用全部成功、没有 `mcp.retired_client_call server=B`;`kind="platform_mcp_server_removed"` 每个 pod +1。改回启用:`kind="platform_mcp_server_changed"` 每个 pod +1,下一个运行 A 回来。**没修好时**:停用后 B 也报 `not started`。
+- [ ] **83.4 新建 / 删除**:运行中新建临时目录项 `acc-b259-tmp`(`none`,地址同 A)并在平台租户允许清单里开通。判据:这次运行 A、B 照常、没有 `not started`;下一个运行的工具里有 `acc-b259-tmp`。再跑一次让它也调 `acc-b259-tmp`,运行中删除这个目录项(先在允许清单里关掉)。判据:之后只有 `acc-b259-tmp` 的调用失败,A、B 照常。
+- [ ] **83.5 租户 MCP 服务与允许清单**:平台租户若有自己登记的 MCP 服务(`SELECT name FROM tenant_mcp_server WHERE tenant_id = '<平台租户>' AND enabled`)且有只读工具:让 `acc-b259` 交替调它和 A,运行中在租户 MCP 页改它的超时 → 判据同 83.2(它的调用走 `mcp.retired_client_call`,A 不受影响,`kind="tenant_mcp_server_changed"` +1);再停用它 → 判据同 83.3。运行中在允许清单里关掉 B → 这次运行里租户自己的服务调用照常(**没修好时**整池关掉报 `not started`);改回。没有租户自己的服务就记「不可达,单测覆盖」。
+- [ ] **83.6 收尾**:删 `acc-b259`、`acc-b259-tmp`,A 的超时、启用状态、允许清单改回原值。
+
 ## §84 同名上传不再覆盖 + 看图不串对话(B-262 P0)
 
 **背景**:同一智能体的所有对话共用 `agents/<key>/uploads/` 与 `agents/<key>/.tool_results/`(对接方一个平台用户下跑很多终端客户)。① 同名上传原来直接覆盖:客户 B 的 `report.pdf` 顶掉客户 A 的,A 的 `upload_id` 下载到 B 的内容。改成:同名不同内容的落成 `report-<内容 sha256 前 8 位>.pdf`(先写同目录临时文件再 `link` 成目标名:原子,两个同时到也不覆盖,读不到写了一半的文件;同一挂载上 §73.8 的文件版本库用的是同一做法);文件名按 UTF-8 字节截,给换名后缀留余量;同名同内容复用已有文件(不再写、不重复记配额,审计 `details.reused_existing = true`);上传响应的 `path`、`user_upload` 行、审计、本轮消息里的 `[file attached: …]`、下载的文件名一律是实际落盘的名字。对外响应字段不变。② `ask_image(path, unit)` 原来扫智能体下**全部** run 的渲染页,渲染目录只认路径,所以对话 A 能拿到对话 B 在同名文档上渲的页。改成:只看本对话渲染过页的 run(取自本对话检查点里的 `viewed_figures`,委派的子代并上父的)与本 run。渲染页位置不变(P1 再搬)。

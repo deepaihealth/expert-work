@@ -44,6 +44,13 @@ KINDS = frozenset(
         "agent_build_user",  # (tenant, user) OAuth builds
         "tenant_mcp",  # tenant MCP pool (+ agent builds, two-layer)
         "platform_mcp",  # platform MCP pool (+ all agent builds)
+        # B-259 —— 只动改到的那一项(``connector`` = 服务名);旧 pod 不认识,记一条
+        # unknown_kind 后忽略,它的池等自己的 TTL / 被滚动替换。上面两个整池类型
+        # 只剩旧 pod 还在发,新 pod 照旧处理。
+        "platform_mcp_server_changed",  # 退役这一项 (+ all agent builds)
+        "platform_mcp_server_removed",  # 硬停这一项 (+ all agent builds)
+        "tenant_mcp_server_changed",  # 该租户退役这一项 (+ tenant builds)
+        "tenant_mcp_server_removed",  # 该租户硬停这一项 (+ tenant builds)
         "user_mcp_oauth",  # (tenant, user) OAuth pool (+ user builds)
         # B-248 — one oauth2 connector off (disabled / deleted) / back on, every user
         "user_mcp_oauth_connector_off",
@@ -98,8 +105,9 @@ class InvalidationEvent:
     #: ``run_cancel`` only — the run whose cancel CAS just won. Serialized only
     #: when set, so every other kind keeps its exact pre-existing wire shape.
     run_id: str | None = None
-    #: ``user_mcp_oauth_connector_*`` only (B-248) — the connector's name.
-    #: Serialized only when set, like ``run_id``.
+    #: ``user_mcp_oauth_connector_*`` (B-248) / ``*_mcp_server_*`` (B-259)
+    #: only — the connector's / server's name. Serialized only when set, like
+    #: ``run_id``.
     connector: str | None = None
 
 
@@ -320,6 +328,34 @@ def build_invalidation_handlers(state: Any) -> dict[str, Handler]:
             await pool.invalidate()
         await _agent_build_all(event)
 
+    def _platform_mcp_server(*, stop: bool) -> Handler:
+        """B-259 —— 目录里一项变了:本副本只退役 / 硬停这一项,其它项不动。"""
+
+        async def _handler(event: InvalidationEvent) -> None:
+            if event.connector is None:
+                return
+            pool = getattr(state, "platform_mcp_pool_service", None)
+            if pool is not None:
+                switch = pool.server_removed if stop else pool.server_changed
+                await switch(event.connector)
+            await _agent_build_all(event)
+
+        return _handler
+
+    def _tenant_mcp_server(*, stop: bool) -> Handler:
+        """B-259 —— 租户的一项服务变了:本副本只退役 / 硬停这一项。"""
+
+        async def _handler(event: InvalidationEvent) -> None:
+            if event.tenant_id is None or event.connector is None:
+                return
+            pool = getattr(state, "tenant_mcp_pool_service", None)
+            if pool is not None:
+                switch = pool.server_removed if stop else pool.server_changed
+                await switch(UUID(event.tenant_id), event.connector)
+            await _agent_build(event)
+
+        return _handler
+
     async def _user_mcp_oauth(event: InvalidationEvent) -> None:
         if event.tenant_id is None or event.user_id is None:
             return
@@ -457,6 +493,10 @@ def build_invalidation_handlers(state: Any) -> dict[str, Handler]:
         "agent_build_user": _agent_build_user,
         "tenant_mcp": _tenant_mcp,
         "platform_mcp": _platform_mcp,
+        "platform_mcp_server_changed": _platform_mcp_server(stop=False),
+        "platform_mcp_server_removed": _platform_mcp_server(stop=True),
+        "tenant_mcp_server_changed": _tenant_mcp_server(stop=False),
+        "tenant_mcp_server_removed": _tenant_mcp_server(stop=True),
         "user_mcp_oauth": _user_mcp_oauth,
         "user_mcp_oauth_connector_off": _oauth_connector(on=False),
         "user_mcp_oauth_connector_on": _oauth_connector(on=True),
