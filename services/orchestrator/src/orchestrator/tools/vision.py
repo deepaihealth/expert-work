@@ -519,6 +519,7 @@ class AskImageTool:
                 path=path,
                 unit=unit,
                 run_id=ctx.run_id,
+                conversation_run_ids=ctx.figure_run_ids,
             )
 
         try:

@@ -48,7 +48,7 @@ from expert_work.protocol.multimodal import ImageRef
 from expert_work.runtime.audit.logger import AuditLogger
 from expert_work.runtime.storage import ObjectStore
 from orchestrator.tools import SandboxSupervisorError, WorkspacePermissionError, WorkspaceStore
-from orchestrator.tools.sandbox import WorkspaceQuotaExceededError
+from orchestrator.tools.sandbox import WorkspaceFileExistsError, WorkspaceQuotaExceededError
 
 logger = logging.getLogger("expert_work.control_plane.uploads")
 
@@ -90,6 +90,9 @@ _UPLOAD_DIR: Final[str] = WORKSPACE_UPLOADS_DIR
 #: outside ``\w`` and collapse to ``_``. The previous ASCII-only set is a
 #: strict subset, so every historically issued ``upload_id`` still validates.
 _SAFE_STEM_RE: Final[re.Pattern[str]] = re.compile(r"[^\w.-]+")
+#: B-262 —— 单个文件名的字节上限(NAME_MAX)与换名后缀(``-`` + 最长 12 位随机)要留的字节。
+_MAX_LEAF_BYTES: Final[int] = 255
+_RENAME_SUFFIX_BYTES: Final[int] = 13
 
 
 def _safe_workspace_name(filename: str, ext: str) -> str:
@@ -102,7 +105,83 @@ def _safe_workspace_name(filename: str, ext: str) -> str:
     stem = _SAFE_STEM_RE.sub("_", filename.rsplit("/", 1)[-1].rsplit(".", 1)[0]).strip("._")
     if not stem:
         stem = uuid4().hex
-    return f"{_UPLOAD_DIR}/{stem[:120]}{ext}"
+    # B-262 —— 再按 UTF-8 字节截:文件名上限 255 字节,换名要加 ``-<12 位>``。中文一字 3 字节,
+    # 只按 120 字截的话,换名后超长、报错 502 而不是换名。截在字符边界上(``ignore`` 丢半个字)。
+    max_bytes = _MAX_LEAF_BYTES - _RENAME_SUFFIX_BYTES - len(ext.encode())
+    stem = stem[:120].encode()[:max_bytes].decode("utf-8", "ignore")
+    return f"{_UPLOAD_DIR}/{stem}{ext}"
+
+
+#: B-262 —— 同名不同内容时,新名字的后缀取内容 sha256 的前几位(``report-3f9a1c2b.pdf``)。
+#: 取内容而不是序号:同一份资料再传一次落到同一个名字上(复用),模型也看得出这是另一份。
+_NAME_TAG_HEX_LEN: Final[int] = 8
+#: 内容后缀那个名字也被别的内容占了(32 位前缀撞上,实际碰不到)之后,再试几个随机后缀。
+_RANDOM_NAME_ATTEMPTS: Final[int] = 3
+
+
+def _tagged_name(workspace_path: str, ext: str, tag: str) -> str:
+    """``uploads/report.pdf`` + ``3f9a1c2b`` → ``uploads/report-3f9a1c2b.pdf``(B-262)。
+
+    后缀只含 ``[0-9a-f]`` 与 ``-``,结果仍是 :func:`is_safe_document_upload_id` 认的形状。"""
+    return f"{workspace_path[: -len(ext)]}-{tag}{ext}"
+
+
+async def _same_bytes(
+    workspace_store: WorkspaceStore, *, tenant_id: UUID, user_id: UUID, path: str, raw: bytes
+) -> bool:
+    """名字上已有的那个文件,内容是不是逐字节等于 ``raw``(B-262)。
+
+    读不出来(太大、是目录、刚被删)一律当「不同」,换下一个名字;读不动(权限)是服务端
+    配置问题,原样抛给调用方翻 500。"""
+    try:
+        existing = await workspace_store.read_file(
+            tenant_id=tenant_id, user_id=user_id, path=path, max_bytes=len(raw)
+        )
+    except WorkspacePermissionError:
+        raise
+    except SandboxSupervisorError:
+        return False
+    return existing == raw
+
+
+async def _land_document_bytes(
+    workspace_store: WorkspaceStore,
+    *,
+    tenant_id: UUID,
+    user_id: UUID,
+    agent_key: str,
+    workspace_path: str,
+    ext: str,
+    raw: bytes,
+    sha256_hex: str,
+) -> tuple[str, bool]:
+    """B-262 —— 把上传落到一个**不覆盖任何已有文件**的名字上,回 ``(实际名字, 是否复用)``。
+
+    同一智能体的所有对话共用 ``uploads/``(对接方一个用户下跑很多终端客户),原来同名
+    上传直接覆盖 —— 客户 B 的 ``report.pdf`` 顶掉客户 A 的。现在按顺序试:原名 →
+    ``<原名>-<内容 sha256 前 8 位>`` → 几个随机后缀。每个名字都用 ``create_file``(不存在
+    才建,原子),所以两个同名上传同时到也只有一个拿到原名。名字被占时比一下内容:
+    逐字节相同就复用那个文件(同一份资料重复上传,不多存一份、不重复记配额)。
+    """
+    candidates = [workspace_path, _tagged_name(workspace_path, ext, sha256_hex[:_NAME_TAG_HEX_LEN])]
+    candidates += [
+        _tagged_name(workspace_path, ext, uuid4().hex[:12]) for _ in range(_RANDOM_NAME_ATTEMPTS)
+    ]
+    for candidate in candidates:
+        stored = workspace_agent_path(candidate, agent_key=agent_key)
+        try:
+            await workspace_store.create_file(
+                tenant_id=tenant_id, user_id=user_id, path=stored, data=raw
+            )
+        except WorkspaceFileExistsError:
+            if await _same_bytes(
+                workspace_store, tenant_id=tenant_id, user_id=user_id, path=stored, raw=raw
+            ):
+                return candidate, True
+            continue
+        return candidate, False
+    msg = f"no free upload name for {workspace_path!r}"
+    raise SandboxSupervisorError(msg)
 
 
 def is_safe_document_upload_id(value: str) -> bool:
@@ -166,6 +245,8 @@ class DocumentUploadResult:
 
     path: str
     size_bytes: int
+    #: B-262 —— 同名同内容的文件已经在了,这次没写,``path`` 指向那个已有文件。
+    reused: bool = False
 
 
 async def _handle_document_upload(
@@ -239,13 +320,20 @@ async def _handle_document_upload(
     # 落盘要投影:``workspace_store`` 是按 ``(tenant, user)`` 开的,不知道
     # agent。不投影的话新上传永远落扁平根,而 run 去 agent 根下找——今天靠
     # 迁移期读回落兜着,Task 14 摘掉回落就断(B-50 补漏)。
-    workspace_path = _safe_workspace_name(filename, ext)
+    #
+    # B-262 —— 名字不一定是用户给的那个:同名已被别的内容占了就换名(见
+    # ``_land_document_bytes``)。下面回给调用方、写审计、进 run 的一律是实际落盘的名字。
+    sha256_hex = hashlib.sha256(raw).hexdigest()
     try:
-        await workspace_store.write_file(
+        workspace_path, reused = await _land_document_bytes(
+            workspace_store,
             tenant_id=tenant_id,
             user_id=caller_user_id,
-            path=workspace_agent_path(workspace_path, agent_key=agent_key),
-            data=raw,
+            agent_key=agent_key,
+            workspace_path=_safe_workspace_name(filename, ext),
+            ext=ext,
+            raw=raw,
+            sha256_hex=sha256_hex,
         )
     except WorkspacePermissionError as exc:
         # 权限失败是服务端配置问题(共享 uid 没配上/存量目录属主没迁移/mode 不
@@ -264,7 +352,6 @@ async def _handle_document_upload(
         raise HTTPException(status_code=502, detail="workspace write failed") from exc
 
     actor_id: str = getattr(request.state, "actor_id", "anonymous")
-    sha256_hex = hashlib.sha256(raw).hexdigest()
     await audit_emit(
         audit,
         tenant_id=tenant_id,
@@ -280,11 +367,12 @@ async def _handle_document_upload(
             "file_size_bytes": len(raw),
             "mime_type": content_type,
             "sha256": sha256_hex,
+            "reused_existing": reused,
         },
     )
-    if quota_service is not None:
-        # 记账第 1 层(spec § 3.2):增量入账,便宜且即时。同名覆盖上传会
-        # 重复计数 —— 已知偏差,janitor 全量扫兜正,不做减法补偿。写已成功、
+    if quota_service is not None and not reused:
+        # 记账第 1 层(spec § 3.2):增量入账,便宜且即时。B-262 起上传不再覆盖
+        # 同名文件;复用已有文件时没写字节,不记账。写已成功、
         # audit 已记 SUCCESS,记账是 best-effort(与 service 侧 refresh 的取舍
         # 一致):失败不该把整个请求打成 500——客户端分不清"上传失败"还是
         # "记账打嗝",重试还会造重复文件。
@@ -294,7 +382,7 @@ async def _handle_document_upload(
             )
         except Exception:
             logger.warning("upload.quota_accounting_failed", exc_info=True)
-    return DocumentUploadResult(path=workspace_path, size_bytes=len(raw))
+    return DocumentUploadResult(path=workspace_path, size_bytes=len(raw), reused=reused)
 
 
 def _get_object_store(request: Request) -> ObjectStore | None:

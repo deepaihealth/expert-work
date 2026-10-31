@@ -943,7 +943,7 @@ def _reject_unrenderable_format(ext: str) -> str | None:
     return f"read_page 不支持 {label} 这种格式 —— 目前只能渲染 {renderable}。"
 
 
-def _validate_rendered_rel(rel: object) -> str | None:
+def _validate_rendered_rel(rel: object, *, under: str | None = None) -> str | None:
     """约束 A —— 沙箱回来的 ``rel``(相对沙箱自己的 exec 视图 ``ws``)必须落在
     ``.tool_results/`` 下、不越权、扩展名是 ``.jpg``(回修 M2)。
 
@@ -971,6 +971,10 @@ def _validate_rendered_rel(rel: object) -> str | None:
     if ".." in PurePosixPath(rel).parts:
         return None
     if rel != WORKSPACE_OVERFLOW_DIR and not rel.startswith(f"{WORKSPACE_OVERFLOW_DIR}/"):
+        return None
+    # B-262 —— 给了 ``under``(本次调用自己的产出目录 ``.tool_results/<run>/figures/<doc-sha>``)
+    # 就必须落在它底下:被篡改的回包不能把别的 run(别的对话)的页塞进 ``viewed_figures``。
+    if under is not None and not rel.startswith(f"{under}/"):
         return None
     return rel
 
@@ -1312,7 +1316,7 @@ class ReadPageTool:
                 rejected.append({"unit": _UNKNOWN_UNIT, "why": "malformed_item"})
                 continue
             unit = item.get("unit")
-            safe_rel = _validate_rendered_rel(item.get("rel"))
+            safe_rel = _validate_rendered_rel(item.get("rel"), under=out_rel)
             if safe_rel is None:
                 # 回修第 3 轮 Minor-2 —— 无条件记账,不只挑 unit 是 int 的那
                 # 一支:沙箱回一个字符串/None 形态的 unit 时,New-3 想堵的沉默

@@ -7,10 +7,13 @@ import contextlib
 import io
 import json
 import os
+import re
 import shutil
 import sys
 import zipfile
+from dataclasses import dataclass, replace
 from pathlib import Path
+from typing import Any
 from uuid import uuid4
 
 import pytest
@@ -351,6 +354,22 @@ def _snippet_params(code: str) -> dict:
     """
     first_line = code.split("\n", 1)[0]
     return json.loads(ast.literal_eval(first_line.split(" = ", 1)[1]))
+
+
+#: 手写回包里 ``.tool_results/<run>/figures/<doc-sha>`` 那一段。
+_CANNED_OUT_RE = re.compile(r"\.tool_results/[^/\"]+/figures/[^/\"]+")
+
+
+@dataclass
+class _CannedRuntime(RecordingSandboxRuntime):
+    """B-262 —— 宿主只收落在本次调用自己产出目录(``out_rel``)下的 rel。手写回包里的
+    ``.tool_results/<run>/figures/<doc-sha>`` 一段换成宿主真传给片段的 ``out_rel``,
+    其余(渲染哈希、unit、页号、越界路径)原样。"""
+
+    async def exec(self, **kwargs: Any) -> SandboxOutcome:
+        outcome = await super().exec(**kwargs)
+        out_rel = str(_snippet_params(kwargs["code"])["out_rel"])
+        return replace(outcome, stdout=_CANNED_OUT_RE.sub(out_rel, outcome.stdout))
 
 
 async def _real_out_rel(*, path: str = "d.pptx", ctx: ToolContext | None = None) -> str:
@@ -1920,7 +1939,7 @@ async def test_duplicate_units_do_not_eat_the_page_budget() -> None:
 
 @pytest.mark.anyio
 async def test_rendered_pages_become_refs_in_state() -> None:
-    runtime = RecordingSandboxRuntime(
+    runtime = _CannedRuntime(
         SandboxOutcome(
             stdout=json.dumps(
                 {
@@ -1953,7 +1972,7 @@ async def test_rendered_pages_become_agent_scoped_refs_when_agent_bound() -> Non
     """回修 C1 —— 绑了 agent 的 run,ref 里必须带 ``agents/<key>/`` 前缀:沙箱
     视图相对的 rel 直接拼进 ref 会让 ``NasWorkspaceImageResolver`` 按用户根
     ``openat`` 找不到文件(见模块 docstring),而这里已经报了成功。"""
-    runtime = RecordingSandboxRuntime(
+    runtime = _CannedRuntime(
         SandboxOutcome(
             stdout=json.dumps(
                 {
@@ -1977,7 +1996,8 @@ async def test_rendered_pages_become_agent_scoped_refs_when_agent_bound() -> Non
         {"path": "d.pptx", "units": [3]}, ctx=ctx
     )
     ref = result.state_updates["viewed_figures"][0]
-    assert "/agents/pf-probe-33086dc0/.tool_results/r1/figures/abc/page-03.jpg" in ref
+    out_rel = _snippet_params(runtime.execs[0][1])["out_rel"]
+    assert f"/agents/pf-probe-33086dc0/{out_rel}/page-03.jpg" in ref
 
 
 @pytest.mark.anyio
@@ -2016,7 +2036,7 @@ async def test_rel_rejected_by_validate_rendered_rel_is_not_silently_swallowed()
     ``_validate_rendered_rel`` 这道闸(越权路径,像片段被攻破或出了 bug),
     ``call()`` 此前直接 ``continue`` 把它整条丢弃,content 对模型只字不提 ——
     模型请求了 2 页,只被告知拿到了 1 页,看不出另一页发生了什么。"""
-    runtime = RecordingSandboxRuntime(
+    runtime = _CannedRuntime(
         SandboxOutcome(
             stdout=json.dumps(
                 {
@@ -2055,7 +2075,7 @@ async def test_rejected_rel_with_a_non_int_unit_is_still_reported() -> None:
     沙箱回一个字符串形态的 unit(片段被攻破或出了 bug 都可能出现这种形状),
     证明补救不是只挑 ``isinstance(unit, int)`` 那一支——``_describe_failed_units``
     只是把 unit 塞进 f-string,任何类型都能渲成一句话。"""
-    runtime = RecordingSandboxRuntime(
+    runtime = _CannedRuntime(
         SandboxOutcome(
             stdout=json.dumps(
                 {
@@ -2089,7 +2109,7 @@ async def test_malformed_rendered_items_are_not_silently_dropped() -> None:
     ``continue`` 丢掉,一个字都不记账:请求 3 页、沙箱回 1 张图 + 两个
     ``"bogus"`` 时,模型读到的是"已渲染 d.pptx 第 1 页,已放进你的上下文",
     另外两页只字不提 —— 与 New-3/Minor-2 花力气堵的那条静默失效逐字同形。"""
-    runtime = RecordingSandboxRuntime(
+    runtime = _CannedRuntime(
         SandboxOutcome(
             stdout=json.dumps(
                 {
@@ -2124,7 +2144,7 @@ async def test_the_fallback_wording_reports_a_count_not_a_page_number() -> None:
     ``unit:"8"``(字符串形态)加两条合法 rel,模型被告知"已渲染 d.pptx 第 2
     页",而上下文里躺的是第 7、8 页 —— 一个具体而错误的页码比不报页码坏得多。
     """
-    runtime = RecordingSandboxRuntime(
+    runtime = _CannedRuntime(
         SandboxOutcome(
             stdout=json.dumps(
                 {
@@ -2331,7 +2351,7 @@ async def test_docx_content_names_both_the_figure_number_and_the_page() -> None:
     """docx 的 ``unit`` 是图清单里的编号,不是页号 —— 只说 "第 7 页" 会给模型
     一个**不存在的页码**(与回修第 4 轮 New-M2 是同一条教训),只说页号又对不上
     它问的那处图。两个都说。"""
-    runtime = RecordingSandboxRuntime(
+    runtime = _CannedRuntime(
         SandboxOutcome(
             stdout=json.dumps(
                 {
@@ -2362,7 +2382,7 @@ async def test_docx_content_names_both_the_figure_number_and_the_page() -> None:
 async def test_docx_anchor_only_fallback_is_told_to_the_model() -> None:
     """回落分支渲**成功**了,但那一页不是被图本身钉死的 —— 保留意见必须出现在
     content 里,否则模型会把一张可能不含目标图的页当成确凿证据。"""
-    runtime = RecordingSandboxRuntime(
+    runtime = _CannedRuntime(
         SandboxOutcome(
             stdout=json.dumps(
                 {
@@ -2397,7 +2417,7 @@ async def test_docx_ambiguous_page_fallback_is_told_to_the_model() -> None:
     这是整条链最容易悄悄断的一节:片段算对了、note 也挂上了,宿主要是不播报,
     模型拿到的仍然是一张"看起来很确定"的页。
     """
-    runtime = RecordingSandboxRuntime(
+    runtime = _CannedRuntime(
         SandboxOutcome(
             stdout=json.dumps(
                 {
@@ -2600,7 +2620,7 @@ async def test_shared_copy_hint_is_runnable_for_names_with_spaces_and_parens() -
 def _one_rendered_page_runtime(ctx: ToolContext) -> RecordingSandboxRuntime:
     """沙箱回一张 ``read_page`` 真实落点形状的第 3 页。"""
     rel = f".tool_results/{ctx.run_id}/figures/{'a' * 16}/{'b' * 16}/_u3/page-03.jpg"
-    return RecordingSandboxRuntime(
+    return _CannedRuntime(
         SandboxOutcome(
             stdout=json.dumps({"ok": True, "rendered": [{"unit": 3, "rel": rel, "bytes": 100}]}),
             stderr="",
@@ -2664,7 +2684,7 @@ async def test_the_ask_image_receipt_for_docx_gives_the_unit_not_the_page() -> N
     回执里让模型填的必须是 unit(第 7 处),不是 pdf 页号(第 3 页)。"""
     ctx = _ctx()
     rel = f".tool_results/{ctx.run_id}/figures/{'a' * 16}/{'b' * 16}/_u7/page-03.jpg"
-    runtime = RecordingSandboxRuntime(
+    runtime = _CannedRuntime(
         SandboxOutcome(
             stdout=json.dumps(
                 {"ok": True, "rendered": [{"unit": 7, "page": 3, "rel": rel, "bytes": 100}]}
@@ -2742,3 +2762,42 @@ async def test_read_page_renders_a_dot_slash_path_under_the_plain_doc_sha() -> N
     assert out_rel.endswith(
         f"/figures/{document_sha('d.pptx', view=WorkspaceView(agent_key=ctx.agent_key))}"
     )
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    "foreign",
+    [
+        # 别的 run(别的对话)的渲染目录,形状完全合法。
+        f".tool_results/{uuid4()}/figures/{'a' * 16}/{'b' * 16}/_u3/page-03.jpg",
+        # 本 run、别的文档。
+        "{run}/figures/" + "c" * 16 + "/" + "b" * 16 + "/_u3/page-03.jpg",
+    ],
+    ids=["another-run", "another-document"],
+)
+async def test_a_rel_outside_this_calls_own_output_dir_is_rejected(foreign: str) -> None:
+    """B-262 —— 沙箱回包只能报告本次调用自己产出目录(``.tool_results/<本 run>/figures/<本文档>``)
+    下的页。被篡改的回包不能把别的 run 的页塞进 ``viewed_figures``(那会让本对话的看图查找
+    认下别的对话的 run)。"""
+    ctx = _ctx()
+    rel = foreign.replace("{run}", f".tool_results/{ctx.run_id}")
+    runtime = RecordingSandboxRuntime(
+        SandboxOutcome(
+            stdout=json.dumps({"ok": True, "rendered": [{"unit": 3, "rel": rel, "bytes": 100}]}),
+            stderr="",
+            exit_code=0,
+            timed_out=False,
+        )
+    )
+    result = await ReadPageTool(client=runtime, figure_delivery="inline").call(
+        {"path": "d.pptx", "units": [3]}, ctx=ctx
+    )
+    assert not result.state_updates.get("viewed_figures")
+    assert "第 3 页没取到" in result.content
+
+
+def test_validate_rendered_rel_under_requires_the_prefix_as_a_directory() -> None:
+    """``under`` 按目录比,不是按字符串前缀:``…/abc`` 不能放行 ``…/abcd/…``。"""
+    under = ".tool_results/r1/figures/abc"
+    assert _validate_rendered_rel(f"{under}/x/_u1/page-1.jpg", under=under) is not None
+    assert _validate_rendered_rel(".tool_results/r1/figures/abcd/x/page-1.jpg", under=under) is None
