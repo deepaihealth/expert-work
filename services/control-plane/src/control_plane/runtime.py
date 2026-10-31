@@ -229,6 +229,46 @@ logger = logging.getLogger(__name__)
 # The cached value carries its ``expires_at`` (二期 PR2 T4).
 _CacheKey = tuple[UUID, str, str, str, str | None, str | None]
 
+# B-260 —— 构建开始后、结束前若落了一次失效(全局 / 租户 / 用户),这次构建可能拿着
+# 已被关掉的 MCP 客户端;它只返回不入缓存并重建,最多这么多次。三个池子同款闸是 5 次,
+# 这里每次是一整次智能体构建(秒级),3 次够覆盖连着两次失效;第 3 次仍撞上就把这次
+# 构建不入缓存地交出去(下一次调用会重建),不无限重试。主智能体与子智能体缓存共用。
+MAX_AGENT_BUILD_ATTEMPTS = 3
+
+
+@dataclass
+class BuildGenerations:
+    """B-260 —— 智能体构建缓存的失效代次,与三个 MCP 池子同一套闸。
+
+    竞态:构建先拿到池子客户端,失效随后关掉它们并清缓存,构建再把 BuiltAgent 写回
+    缓存 → 整个 TTL(30 分钟)里每次 run 都报 ``StreamableHttpMCPClient … not started``。
+    失效时按范围 +1;构建前 :meth:`snapshot`,入缓存前再比一次,变了就不入缓存。
+    主智能体(``AgentRuntime``)与子智能体(``make_child_agent_builder``)各持一份。
+    """
+
+    _all: int = 0
+    _tenant: dict[UUID, int] = field(default_factory=dict)
+    _user: dict[tuple[UUID, str], int] = field(default_factory=dict)
+
+    def bump_all(self) -> None:
+        # 全局 +1 后,之前记下的快照都已比不上;顺手清空两张表,别让它们随租户 / 用户只增不减。
+        self._all += 1
+        self._tenant.clear()
+        self._user.clear()
+
+    def bump_tenant(self, tenant_id: UUID) -> None:
+        self._tenant[tenant_id] = self._tenant.get(tenant_id, 0) + 1
+
+    def bump_user(self, tenant_id: UUID, user_id: str) -> None:
+        key = (tenant_id, user_id)
+        self._user[key] = self._user.get(key, 0) + 1
+
+    def snapshot(self, tenant_id: UUID, user_id: str | None) -> tuple[int, int, int]:
+        """(全局, 该租户, 该租户下该用户) 的代次;``user_id`` 为空时用户级恒为 0。"""
+        user_gen = self._user.get((tenant_id, user_id), 0) if user_id is not None else 0
+        return (self._all, self._tenant.get(tenant_id, 0), user_gen)
+
+
 # Stream Agent-Templates (M1-3) — resolves a platform template ``(name, version)``
 # (``version`` may be ``"latest"``) to its base ``AgentSpec``, or ``None`` if the
 # template is absent. Bound in the app lifespan to the platform-template store
@@ -375,6 +415,9 @@ class AgentRuntime:
     _user_invalidation_hooks: list[Callable[[UUID, str], None]] = field(
         default_factory=list, repr=False
     )
+    #: B-260 —— 失效代次:``invalidate_*`` 按范围 +1,``get_agent`` 构建前记下、
+    #: 入缓存前比对(见 :class:`BuildGenerations`)。
+    _generations: BuildGenerations = field(default_factory=BuildGenerations, repr=False)
 
     async def new_worker_spawn_budget(
         self,
@@ -470,7 +513,45 @@ class AgentRuntime:
         argument), so hashing it here needs nothing from the call sites and
         cannot be forgotten at one of them.
         """
+        for attempt in range(MAX_AGENT_BUILD_ATTEMPTS):
+            last_attempt = attempt == MAX_AGENT_BUILD_ATTEMPTS - 1
+            # B-260 —— 代次记在定键之前:定键到入缓存之间落的失效都比得出来。池子都是
+            # 先出缓存、运行时后 +1,构建拿到的客户端若被关掉,代次必在这之后 +1。
+            # 别挪到 ``_cache_key`` 之后:那样定键时取池与记代次之间的失效就比不出来了。
+            generations = self._generations.snapshot(tenant_id, user_id)
+            key, key_pool = await self._cache_key(tenant_id, name, version, spec, user_id)
+            cached = self._cached(key)
+            if cached is not None:
+                return cached
+            if self._generations.snapshot(tenant_id, user_id) != generations and not last_attempt:
+                # 定键期间就失效了(多是取用户池时 OAuth 刷新令牌):重新定键,不白构建。
+                continue
+            built = await self.agent_builder(spec, tenant_id=tenant_id, user_id=user_id)
+            same_pool = await self._user_pool_unchanged(tenant_id, user_id, key_pool)
+            # 比对与写缓存之间没有 await,失效插不进来。失效先于知识目录判断:撞上失效
+            # 的构建不能因为目录不符就直接交出去。
+            if not same_pool or self._generations.snapshot(tenant_id, user_id) != generations:
+                logger.info(
+                    "control_plane.build_not_cached reason=invalidated_mid_build attempt=%d",
+                    attempt + 1,
+                )
+                if last_attempt:
+                    # B-260 —— 次次都撞上失效:交出最后一次构建(不入缓存),下一次调用会重建。
+                    return built
+                continue
+            keyed_catalog = self.knowledge_store is not None and spec.spec.knowledge is not None
+            if catalog_build_cacheable(key[-1], built, checked=keyed_catalog):
+                self._store(key, built)
+            return built
+        raise RuntimeError("get_agent: retry loop exited without returning")  # pragma: no cover
+
+    async def _cache_key(
+        self, tenant_id: UUID, name: str, version: str, spec: AgentSpec, user_id: str | None
+    ) -> tuple[_CacheKey, MCPServerPool | None]:
+        """The content-addressed cache key (see ``_CacheKey``) for one build, and the
+        user OAuth pool the key was decided from (``None`` without user / provider)."""
         oauth_subject: str | None = None
+        user_pool: MCPServerPool | None = None
         if user_id is not None and self.user_oauth_pool_provider is not None:
             user_pool = await self.user_oauth_pool_provider(tenant_id, user_id)
             if user_pool.names():
@@ -483,24 +564,43 @@ class AgentRuntime:
             oauth_subject,
             await knowledge_catalog_fingerprint(self.knowledge_store, spec, tenant_id=tenant_id),
         )
+        return key, user_pool
+
+    async def _user_pool_unchanged(
+        self, tenant_id: UUID, user_id: str | None, key_pool: MCPServerPool | None
+    ) -> bool:
+        """B-260 —— 构建挂的用户池是不是定键时那一个。
+
+        构建自己再取一次用户池。定键时池是空的(共享键、同租户所有人共用)而构建取到了
+        刚连上的池,入缓存就把这个用户的授权工具发给了同租户所有人,``invalidate_user``
+        也清不到共享键。池子出缓存后只会建新对象,所以构建后再取仍是定键那个对象 ⇒
+        构建挂的就是它。
+        """
+        if key_pool is None or user_id is None or self.user_oauth_pool_provider is None:
+            return True
+        return await self.user_oauth_pool_provider(tenant_id, user_id) is key_pool
+
+    def _cached(self, key: _CacheKey) -> BuiltAgent | None:
+        """A live cache entry for ``key`` (refreshing its LRU slot), else ``None``."""
         cached = self._cache.get(key)
-        if cached is not None:
-            built, expires_at = cached
-            if self._clock() < expires_at:
-                self._cache.move_to_end(key)
-                return built
-            # Expired — drop and treat as a miss. Pure abandonment: the
-            # BuiltAgent may hold live MCP connections (MCPServerPool) still
-            # in use by an in-flight run, so never close() here; dropping the
-            # reference leaves cleanup to GC, matching invalidate_* behavior.
-            # No hook fan-out: hooks broadcast config changes, and natural
-            # expiry is not one (二期 PR2 T4).
-            del self._cache[key]
-            self._publish_cache_size()
-        built = await self.agent_builder(spec, tenant_id=tenant_id, user_id=user_id)
-        keyed_catalog = self.knowledge_store is not None and spec.spec.knowledge is not None
-        if not catalog_build_cacheable(key[-1], built, checked=keyed_catalog):
+        if cached is None:
+            return None
+        built, expires_at = cached
+        if self._clock() < expires_at:
+            self._cache.move_to_end(key)
             return built
+        # Expired — drop and treat as a miss. Pure abandonment: the
+        # BuiltAgent may hold live MCP connections (MCPServerPool) still
+        # in use by an in-flight run, so never close() here; dropping the
+        # reference leaves cleanup to GC, matching invalidate_* behavior.
+        # No hook fan-out: hooks broadcast config changes, and natural
+        # expiry is not one (二期 PR2 T4).
+        del self._cache[key]
+        self._publish_cache_size()
+        return None
+
+    def _store(self, key: _CacheKey, built: BuiltAgent) -> None:
+        """Cache ``built`` under ``key`` with a fresh TTL, LRU-bounded."""
         self._cache[key] = (built, self._clock() + self.cache_ttl_s)
         self._cache.move_to_end(key)
         while len(self._cache) > self.cache_max_size:
@@ -508,7 +608,6 @@ class AgentRuntime:
             # rationale as the expiry branch above).
             self._cache.popitem(last=False)
         self._publish_cache_size()
-        return built
 
     def _publish_cache_size(self) -> None:
         """Refresh the runtime-scope built-agent cache size gauge (二期 PR2 T4)."""
@@ -551,6 +650,7 @@ class AgentRuntime:
         against the refreshed pool. Registered clear-all hooks (e.g. the
         sub-agent builder cache) are fanned out too.
         """
+        self._generations.bump_all()  # B-260 —— 进行中的构建一律不入缓存
         self._cache.clear()
         self._publish_cache_size()
         for hook in self._invalidate_all_hooks:
@@ -566,6 +666,8 @@ class AgentRuntime:
         every key shape. Registered hooks (e.g. the sub-agent builder cache) are
         fanned out too.
         """
+        # B-260 —— 该租户进行中的构建不入缓存
+        self._generations.bump_tenant(tenant_id)
         for key in [k for k in self._cache if k[0] == tenant_id]:
             del self._cache[key]
         self._publish_cache_size()
@@ -584,6 +686,8 @@ class AgentRuntime:
         Registered user hooks (the sub-agent builder cache, 二期 PR2 T2) are
         fanned out too.
         """
+        # B-260 —— 该用户进行中的构建不入缓存(含按共享键构建、但带着这个 user_id 的)
+        self._generations.bump_user(tenant_id, user_id)
         for key in [k for k in self._cache if k[0] == tenant_id and k[4] == user_id]:
             del self._cache[key]
         self._publish_cache_size()
