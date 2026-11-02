@@ -27,6 +27,11 @@ from control_plane.api._authz import platform_only, require
 from control_plane.audit import emit
 from control_plane.invalidation_bus import InvalidationEvent
 from control_plane.mcp_probe import McpProbeError, probe_remote_mcp
+from control_plane.platform_mcp_pool import (
+    CatalogChange,
+    classify_catalog_change,
+    classify_catalog_delete,
+)
 from control_plane.tenant_scope import bypass_rls_session
 from expert_work.common.observability import current_trace_id_hex
 from expert_work.persistence import (
@@ -94,25 +99,36 @@ def _get_user_mcp_oauth_pool_service(request: Request) -> object:
     return getattr(request.app.state, "user_mcp_oauth_pool_service", None)
 
 
-async def _invalidate_platform_mcp(
-    pool_service: object, agent_runtime: object, bus: object = None
+#: B-259 —— 每类改动广播给其它副本的事件类型(``none`` 不广播)。
+_CHANGE_EVENT_KIND: dict[CatalogChange, str] = {
+    "builds": "agent_build_all",
+    "changed": "platform_mcp_server_changed",
+    "removed": "platform_mcp_server_removed",
+}
+
+
+async def _apply_catalog_change(
+    change: CatalogChange, name: str, *, pool_service: object, agent_runtime: object, bus: object
 ) -> None:
-    """Rebuild the platform shared pool + evict every cached agent (P1b).
+    """B-259 —— 按改动类别处理平台池,本副本做完再广播给其它副本。
 
-    A catalog create / update / delete changes the process-global platform
-    shared MCP pool, which feeds every tenant's build — so the pool is dropped
-    (next build rebuilds from the catalog) and every cached built-agent is
-    invalidated across all tenants.
-
-    PR-E3a — the local eviction is also broadcast on the invalidation bus so
-    peer replicas drop their pool + built-agent copies (``None`` when unwired).
+    以前任何新建 / 修改 / 删除(连改说明)都整池关掉、硬停每个平台连接,正在跑的
+    run 后面的调用全部 "not started"。现在只动改到的那一项:``changed`` 退役它、
+    ``removed`` 硬停它,其它项的长连接留给下一次构建;``builds`` 只清构建;
+    ``none``(只改展示字段)什么都不做。构建总是一起清掉,新 run 用新配置。
     """
-    if pool_service is not None:
-        await pool_service.invalidate()  # type: ignore[attr-defined]
+    if change == "none":
+        return
+    if change != "builds" and pool_service is not None:
+        switch = pool_service.server_removed if change == "removed" else pool_service.server_changed  # type: ignore[attr-defined]
+        await switch(name)
     if agent_runtime is not None:
         agent_runtime.invalidate_all()  # type: ignore[attr-defined]
     if bus is not None:
-        await bus.publish(InvalidationEvent(kind="platform_mcp"))  # type: ignore[attr-defined]
+        connector = None if change == "builds" else name
+        await bus.publish(  # type: ignore[attr-defined]
+            InvalidationEvent(kind=_CHANGE_EVENT_KIND[change], connector=connector)
+        )
 
 
 async def _oauth_connector_switched(
@@ -240,7 +256,13 @@ def build_mcp_catalog_router() -> APIRouter:
                 "transport": record.transport,
             },  # NEVER include any secret value
         )
-        await _invalidate_platform_mcp(pool_service, agent_runtime, bus)
+        await _apply_catalog_change(
+            classify_catalog_change(None, record),
+            record.name,
+            pool_service=pool_service,
+            agent_runtime=agent_runtime,
+            bus=bus,
+        )
         return {"success": True, "data": _public(record), "error": None}
 
     @router.get("")
@@ -447,7 +469,17 @@ def build_mcp_catalog_router() -> APIRouter:
             await _oauth_connector_switched(
                 record.name, on=record.enabled, user_pool_service=user_pool_service, bus=bus
             )
-        await _invalidate_platform_mcp(pool_service, agent_runtime, bus)
+        # B-259 —— 按前后两份记录(``before`` 在同一事务行锁下读)分类;令牌重贴时
+        # 引用不变而值变了,单独算作连接变化。
+        await _apply_catalog_change(
+            classify_catalog_change(
+                before, record, secret_rewritten=payload.bearer_token is not None
+            ),
+            record.name,
+            pool_service=pool_service,
+            agent_runtime=agent_runtime,
+            bus=bus,
+        )
         return {"success": True, "data": _public(record), "error": None}
 
     @router.delete("/{catalog_id}", status_code=204)
@@ -582,6 +614,12 @@ def build_mcp_catalog_router() -> APIRouter:
             await _oauth_connector_switched(
                 existing.name, on=False, user_pool_service=user_pool_service, bus=bus
             )
-        await _invalidate_platform_mcp(pool_service, agent_runtime, bus)
+        await _apply_catalog_change(
+            classify_catalog_delete(existing),
+            existing.name,
+            pool_service=pool_service,
+            agent_runtime=agent_runtime,
+            bus=bus,
+        )
 
     return router

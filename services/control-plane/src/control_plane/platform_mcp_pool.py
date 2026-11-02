@@ -11,9 +11,11 @@ precedence (above tenant + per-user pools), gated per-tenant by
 ``oauth2`` catalog entries are **not** here — they are per-user and flow through
 ``user_mcp_oauth_pool`` after each user authorizes.
 
-The pool is rebuilt lazily and invalidated (closed + dropped) when the catalog
-changes (the catalog admin API calls :meth:`invalidate`); it is closed at app
-shutdown (:meth:`close_all`). Catalog rows are NULL-tenant, so the store call
+The pool is rebuilt lazily. A catalog change reaches only the entry it
+concerns (B-259: :meth:`server_changed` retires it, :meth:`server_removed`
+stops it, the other entries' clients are reused by the next build);
+:meth:`invalidate` (legacy whole-pool event) and :meth:`close_all` (shutdown)
+close everything. Catalog rows are NULL-tenant, so the store call
 runs inside ``bypass_rls_session()`` (the W-8 trap — a scoped session hides
 them). Decoupling mirrors ``tenant_mcp_pool``: the orchestrator never imports
 this; the agent builder receives a ``Callable`` provider bound to the service.
@@ -26,9 +28,15 @@ import logging
 import time
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Literal
 
-from control_plane.mcp_retired_clients import RetiredMcpClients, close_retired, retire_in_place
+from control_plane.mcp_kept_clients import KeptClient, KeptMcpClients
+from control_plane.mcp_retired_clients import (
+    RetiredMcpClients,
+    close_retired,
+    release_clients,
+    retire_in_place,
+)
 from control_plane.tenant_scope import bypass_rls_session
 from expert_work.persistence import McpConnectorCatalogStore
 from expert_work.protocol import McpConnectorCatalogRecord
@@ -132,6 +140,71 @@ def _is_shared_server(record: McpConnectorCatalogRecord) -> bool:
     return False  # oauth2 → user_mcp_oauth_pool
 
 
+def connection_fingerprint(record: McpConnectorCatalogRecord) -> object:
+    """B-259 —— 池里这一项的客户端由什么决定(连哪、怎么认证、超时、滤掉哪些工具)。
+    指纹相同 = 同一个连接,可以原样复用;和 ``_record_to_config`` 同源,不会漂移。"""
+    return (_record_to_config(record), frozenset(record.disabled_tools))
+
+
+#: 目录改动对运行期的影响,由轻到重(B-259)。
+CatalogChange = Literal["none", "builds", "changed", "removed"]
+
+#: B-259 —— 运行期不读的字段:只给人看的,和只在租户新开通时校验的档位(已开通
+#: 的构建不再查它)。其余字段一律当作会影响运行,新加的字段默认也算。
+_NO_RUNTIME_EFFECT = frozenset(
+    {
+        "display_name",
+        "description",
+        "category",
+        "icon",
+        "required_tier",
+        "id",
+        "created_at",
+        "updated_at",
+        "updated_by",
+    }
+)
+
+
+def classify_catalog_change(
+    before: McpConnectorCatalogRecord | None,
+    after: McpConnectorCatalogRecord | None,
+    *,
+    secret_rewritten: bool = False,
+) -> CatalogChange:
+    """B-259 —— 一次目录新建 / 修改 / 删除(``None`` 表示不存在)对平台池的影响:
+
+    * ``removed`` —— 这一项离开平台池(停用 / 删除 / 不再是共享服务):只硬停它;
+    * ``changed`` —— 新进平台池,或连接指纹变了,或令牌原地重贴(引用不变、值变了):
+      只退役它;
+    * ``builds`` —— 平台池不受影响,但别的运行期字段变了(oauth2 条目等):只清构建;
+    * ``none`` —— 只改了展示类字段:什么都不动。
+    """
+    was = before is not None and _is_shared_server(before)
+    now = after is not None and _is_shared_server(after)
+    if was and not now:
+        return "removed"
+    if now and after is not None:
+        if before is None or not was or secret_rewritten:
+            return "changed"
+        if connection_fingerprint(before) != connection_fingerprint(after):
+            return "changed"
+    if before is None or after is None:
+        return "builds"
+    ignored = set(_NO_RUNTIME_EFFECT)
+    if before.model_dump(exclude=ignored) != after.model_dump(exclude=ignored):
+        return "builds"
+    return "none"
+
+
+def classify_catalog_delete(existing: McpConnectorCatalogRecord) -> CatalogChange:
+    """B-259 —— 删除前读的 ``existing`` 不在行锁下:并发的重新启用可能已把它建进池。
+    none / bearer 一律按 ``removed``(多停一次空的无害,幂等),oauth2 只清构建。"""
+    if existing.auth_type in ("none", "bearer"):
+        return "removed"
+    return classify_catalog_change(existing, None)
+
+
 class PlatformMcpPoolService:
     """Caches the single process-global platform MCP server pool."""
 
@@ -158,6 +231,9 @@ class PlatformMcpPoolService:
         self._retired: RetiredMcpClients[str] = RetiredMcpClients()
         self._build_lock = asyncio.Lock()  # dedups concurrent builds
         self._generation = 0
+        # B-259 —— 缓存池成员的连接指纹;改一项时其它项暂存在这里给下次构建复用。
+        # Guarded by ``_guard``.
+        self._kept: KeptMcpClients[str] = KeptMcpClients()
 
     async def get_or_build(self) -> MCPServerPool:
         """Return the platform pool, building (and caching) on miss.
@@ -187,60 +263,126 @@ class PlatformMcpPoolService:
                         self._generation += 1
                         self._pool = None
                         self._retired.add_pool(_RETIRED_KEY, cached_pool)
+                        self._kept.dropped(_RETIRED_KEY)
                     try:
                         await cached_pool.retire_all()
                     except Exception:
                         logger.warning("platform_mcp_pool.expired_close_failed")
-                    if self._on_expire is not None:
-                        try:
-                            self._on_expire()
-                        except Exception as exc:  # never fails the build
-                            logger.warning(
-                                "platform_mcp_pool.on_expire_failed err=%s", type(exc).__name__
-                            )
+                    self._notify_expired()
                 async with self._guard:
                     gen = self._generation
-                pool = MCPServerPool()
-                async with bypass_rls_session():
-                    records = await self._store.list()
-                for record in records:
-                    if not _is_shared_server(record):
-                        continue
-                    try:
-                        client = await self._client_factory(_record_to_config(record))
-                        if record.disabled_tools:
-                            # Platform-curated tool denylist — drop disabled tools
-                            # from list_tools so no tenant agent ever registers them.
-                            client = _ToolFilteringClient(
-                                inner=client, disabled=frozenset(record.disabled_tools)
-                            )
-                        await pool.add(record.name, client)
-                    except MCPServerPoolLimitError:
-                        try:
-                            await client.close()
-                        except Exception:
-                            logger.warning("platform_mcp_pool.cap_orphan_close_failed")
-                        logger.warning("platform_mcp_pool.server_cap_reached")
-                        break
-                    except Exception:
-                        logger.warning("platform_mcp_pool.server_build_failed")
+                    carried = self._kept.peek(_RETIRED_KEY)
+                pool, members, fresh = await self._build(carried)
+                unused: list[MCPClient] = []
                 async with self._guard:
-                    if self._generation == gen:
-                        self._pool = (pool, self._clock())
-                        return pool
-                    if last_attempt:
+                    cached_now = self._generation == gen
+                    if cached_now:
+                        for server, client in self._kept.cached(_RETIRED_KEY, members):
+                            self._retired.add(_RETIRED_KEY, server, client)
+                            unused.append(client)
+                        # 复用的长连接按它最早的出生时间算 TTL,兜底时限不被拉长。
+                        born = [m.born_at for m in members.values()]
+                        self._pool = (pool, min([*born, self._clock()]))
+                    elif last_attempt:
                         # B-248 — no cache entry will ever close it: track it
                         # for invalidate / close_all, retire it below.
                         self._retired.add_pool(_RETIRED_KEY, pool)
+                        self._kept.adopted(_RETIRED_KEY, members)
+            if cached_now:
+                # B-259 —— 暂存里没被复用的(指纹变了 / 这一项没了):退役。
+                await release_clients(retire=unused)
+                return pool
             if last_attempt:
                 await retire_in_place(pool)  # outside the build lock (B-248)
                 return pool  # serve fresh-but-uncached; next caller rebuilds
-            # Invalidation landed mid-build: close the orphan and retry.
-            try:
-                await pool.close_all()
-            except Exception:
-                logger.warning("platform_mcp_pool.stale_close_failed")
+            # Invalidation landed mid-build: close what this attempt opened and
+            # retry. B-259 —— 复用来的暂存客户端不关:别的构建 / run 还拿着它们。
+            await release_clients(close=fresh)
         raise RuntimeError("get_or_build: retry loop exited without returning")  # pragma: no cover
+
+    async def _build(
+        self, carried: dict[str, KeptClient]
+    ) -> tuple[MCPServerPool, dict[str, KeptClient], list[MCPClient]]:
+        """Build a pool from the catalog; returns it, its members and the
+        clients this call opened (as opposed to reused from ``carried``)."""
+        pool = MCPServerPool()
+        members: dict[str, KeptClient] = {}
+        fresh: list[MCPClient] = []
+        async with bypass_rls_session():
+            records = await self._store.list()
+        for record in records:
+            if not _is_shared_server(record):
+                continue
+            fingerprint = connection_fingerprint(record)
+            kept = carried.get(record.name)
+            if kept is not None and kept.fingerprint != fingerprint:
+                kept = None
+            try:
+                if kept is not None:
+                    # B-259 —— 连接配置没变:复用暂存的长连接,不重连。
+                    client, born_at = kept.client, kept.born_at
+                else:
+                    client = await self._client_factory(_record_to_config(record))
+                    if record.disabled_tools:
+                        # Platform-curated tool denylist — drop disabled tools
+                        # from list_tools so no tenant agent ever registers them.
+                        client = _ToolFilteringClient(
+                            inner=client, disabled=frozenset(record.disabled_tools)
+                        )
+                    born_at = self._clock()
+                await pool.add(record.name, client)
+                members[record.name] = KeptClient(client, fingerprint, born_at)
+                if kept is None:
+                    fresh.append(client)
+            except MCPServerPoolLimitError:
+                if kept is None:
+                    try:
+                        await client.close()
+                    except Exception:
+                        logger.warning("platform_mcp_pool.cap_orphan_close_failed")
+                logger.warning("platform_mcp_pool.server_cap_reached")
+                break
+            except Exception:
+                logger.warning("platform_mcp_pool.server_build_failed")
+        return pool, members, fresh
+
+    def _notify_expired(self) -> None:
+        """Run ``on_expire`` (build eviction); a failure never fails the caller."""
+        if self._on_expire is None:
+            return
+        try:
+            self._on_expire()
+        except Exception as exc:
+            logger.warning("platform_mcp_pool.on_expire_failed err=%s", type(exc).__name__)
+
+    async def server_changed(self, name: str) -> None:
+        """B-259 —— 目录项 ``name`` 新加 / 改了连接配置 / 重新启用:只退役它自己的客户端
+        (正在跑的调用跑完;之后的调用走一次性会话、仍是旧配置,直到持有它的构建被清掉),
+        池里其它项的长连接留给下一次构建复用。"""
+        await self._switch(name, stop=False)
+
+    async def server_removed(self, name: str) -> None:
+        """B-259 —— 目录项 ``name`` 被停用 / 删除:只硬停它自己(连同 TTL 先前退役的
+        副本),其它项照常服务。"""
+        await self._switch(name, stop=True)
+
+    async def _switch(self, name: str, *, stop: bool) -> None:
+        async with self._guard:
+            # 正在进行的构建可能是按旧目录读的:让它重来。
+            self._generation += 1
+            self._pool = None
+            hit = self._kept.switch(_RETIRED_KEY, name)
+            target = [hit.client] if hit is not None else []
+            if stop:
+                target += self._retired.pop_one(_RETIRED_KEY, name)
+            elif hit is not None:
+                self._retired.add(_RETIRED_KEY, name, hit.client)
+        # 先清构建,再拆连接:新 run 不会在拆的过程中拿到旧构建(B-248 同序)。
+        self._notify_expired()
+        if stop:
+            await release_clients(close=target)
+        else:
+            await release_clients(retire=target)
 
     async def invalidate(self) -> None:
         """Close + drop the cached pool (next build rebuilds from the catalog),
@@ -249,7 +391,7 @@ class PlatformMcpPoolService:
             self._generation += 1
             entry = self._pool
             self._pool = None
-            retired = self._retired.pop_all()
+            retired = self._retired.pop_all() + self._kept.pop_key(_RETIRED_KEY)
         if entry is not None:
             try:
                 await entry[0].close_all()
@@ -263,7 +405,7 @@ class PlatformMcpPoolService:
             self._generation += 1
             entry = self._pool
             self._pool = None
-            retired = self._retired.pop_all()
+            retired = self._retired.pop_all() + self._kept.pop_all()
         if entry is not None:
             try:
                 await entry[0].close_all()

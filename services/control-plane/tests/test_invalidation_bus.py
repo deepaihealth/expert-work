@@ -942,3 +942,88 @@ async def test_oauth_connector_events_round_trip_and_reach_the_pool() -> None:
     # Every other kind keeps its exact wire shape (old pods parse it too).
     await bus.publish(InvalidationEvent(kind="platform_mcp"))
     assert "connector" not in json.loads(redis.published[-1][1])
+
+
+# ---------------------------------------------------------------------------
+# B-259 — a catalog / tenant MCP change names the one server it concerns
+# ---------------------------------------------------------------------------
+
+
+class _SpyServerPools:
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, str | None, str]] = []
+
+    async def server_changed(self, *args: Any) -> None:
+        self.calls.append(("changed", *self._scope(args)))
+
+    async def server_removed(self, *args: Any) -> None:
+        self.calls.append(("removed", *self._scope(args)))
+
+    @staticmethod
+    def _scope(args: tuple[Any, ...]) -> tuple[str | None, str]:
+        return (str(args[0]), args[1]) if len(args) == 2 else (None, args[0])
+
+
+@pytest.mark.asyncio
+async def test_mcp_server_events_round_trip_and_reach_the_pools() -> None:
+    redis = _FakeRedis()
+    bus = _bus(redis)
+    pools = _SpyServerPools()
+    runtime = _SpyRuntime()
+    tid = str(uuid4())
+    handlers = build_invalidation_handlers(
+        SimpleNamespace(
+            platform_mcp_pool_service=pools, tenant_mcp_pool_service=pools, agent_runtime=runtime
+        )
+    )
+    bus.start(handlers)
+    try:
+        await _wait_until(lambda: redis.queues)
+        for kind, tenant in (
+            ("platform_mcp_server_changed", None),
+            ("platform_mcp_server_removed", None),
+            ("tenant_mcp_server_changed", tid),
+            ("tenant_mcp_server_removed", tid),
+        ):
+            await bus.publish(InvalidationEvent(kind=kind, tenant_id=tenant, connector="deep"))
+        await _wait_until(lambda: len(pools.calls) == 4)
+    finally:
+        await bus.stop()
+
+    assert pools.calls == [
+        ("changed", None, "deep"),
+        ("removed", None, "deep"),
+        ("changed", tid, "deep"),
+        ("removed", tid, "deep"),
+    ]
+    assert runtime.all_calls == 2
+    assert [str(t) for t in runtime.tenant_calls] == [tid, tid]
+    assert {json.loads(p)["connector"] for _, p in redis.published} == {"deep"}
+
+
+@pytest.mark.asyncio
+async def test_a_pod_without_the_new_kinds_ignores_them() -> None:
+    """Rolling deploy: an old pod's handler map has no B-259 kinds — the event
+    is logged and dropped, nothing raises and no pool is touched."""
+    redis = _FakeRedis()
+    bus = _bus(redis)
+    pools = _SpyServerPools()
+    old_handlers = build_invalidation_handlers(SimpleNamespace(platform_mcp_pool_service=pools))
+    for kind in [k for k in old_handlers if "_mcp_server_" in k]:
+        del old_handlers[kind]
+    later: list[str] = []
+
+    async def _later(event: InvalidationEvent) -> None:
+        later.append(event.kind)
+
+    old_handlers["agent_build_all"] = _later
+    bus.start(old_handlers)
+    try:
+        await _wait_until(lambda: redis.queues)
+        await bus.publish(InvalidationEvent(kind="platform_mcp_server_removed", connector="deep"))
+        await bus.publish(InvalidationEvent(kind="agent_build_all"))
+        # Sequential consumer: once the second event is handled, the first was.
+        await _wait_until(lambda: later)
+    finally:
+        await bus.stop()
+    assert pools.calls == []
