@@ -1,8 +1,10 @@
-"""B-257 —— ``ask_image`` 深入看更快:最多等 60 秒就改快看,没设思考深度时按中档发。
+"""B-257 —— ``ask_image`` 深入看更快:最多等 60 秒就改快看,没设思考深度时按平台默认档位发
+(B-265 起是低档)。
 
 测试环境 30 天:quick p95 15 s、最长 28 s;deep 中位 43 s、p90 107 s,约 23 % 等满 120 s。
 豆包 seed-2.1-pro 实测(化验单 + 趋势图各 3 次):不设档位(≈ high)95~123 s、一次超时;
-medium 58~63 s;low 22~44 s;各档答案都对。
+medium 58~63 s;low 22~44 s;各档答案都对。B-265 复测 729 次:quick / low / medium 准确率
+相同,难图超 60 s medium 15%、low 8%,故默认改 low。
 """
 
 from __future__ import annotations
@@ -139,17 +141,15 @@ async def test_quick_keeps_its_120s(limits: list[float], quick_route: bool) -> N
 
 
 # ---------------------------------------------------------------------------
-# 构建:deep 路由没设思考深度时按平台默认档位「中档」发
+# 构建:deep 路由没设思考深度时按平台默认档位「低档」发
 # ---------------------------------------------------------------------------
 
 _DOUBAO = "doubao-seed-2-1-pro-260628"
 
 
-def _medium_budget(max_tokens: int | None = None) -> dict[str, Any]:
-    return {
-        "enable_thinking": True,
-        "thinking_budget": agent_factory._thinking_budget("medium", max_tokens),
-    }
+def _low_budget(budget: int) -> dict[str, Any]:
+    """low 档换算出的预算写成字面量:改了 low 的换算比例或下限,这里要红。"""
+    return {"enable_thinking": True, "thinking_budget": budget}
 
 
 @dataclass
@@ -176,36 +176,39 @@ class _WireHarness(_Harness):
 @pytest.mark.parametrize(
     ("vision_model", "expected"),
     [
-        # effort 厂商、没设:发它自己的 medium 档(以前什么都不发 = 厂商默认 ≈ high)。
-        ({"provider": "doubao", "name": _DOUBAO}, {"reasoning_effort": "medium"}),
+        # effort 厂商、没设:发它自己的 low 档(以前什么都不发 = 厂商默认 ≈ high)。
+        ({"provider": "doubao", "name": _DOUBAO}, {"reasoning_effort": "low"}),
         (
             {"provider": "doubao", "name": _DOUBAO, "thinking_enabled": True},
-            {"reasoning_effort": "medium"},
+            {"reasoning_effort": "low"},
         ),
-        # effort_map:平台 medium → 厂商 high。
-        ({"provider": "kimi", "name": "kimi-k3"}, {"reasoning_effort": "high"}),
+        # effort_map 只把 medium 顶到 high;low 是 K3 自己的档位,原样发。
+        ({"provider": "kimi", "name": "kimi-k3"}, {"reasoning_effort": "low"}),
         # 显式设置一律优先。
-        ({"provider": "doubao", "name": _DOUBAO, "effort": "low"}, {"reasoning_effort": "low"}),
+        ({"provider": "doubao", "name": _DOUBAO, "effort": "high"}, {"reasoning_effort": "high"}),
         (
             {"provider": "doubao", "name": _DOUBAO, "thinking_enabled": False},
             {"thinking": {"type": "disabled"}},
         ),
-        # budget 厂商:按档位换算的 medium 预算。
-        ({"provider": "qwen", "name": "qwen3.6-plus"}, _medium_budget()),
-        ({"provider": "qwen", "name": "qwen3-vl-plus", "thinking_enabled": True}, _medium_budget()),
+        # budget 厂商:按档位换算的 low 预算。
+        ({"provider": "qwen", "name": "qwen3.6-plus"}, _low_budget(16384)),
+        (
+            {"provider": "qwen", "name": "qwen3-vl-plus", "thinking_enabled": True},
+            _low_budget(16384),
+        ),
         # 目录默认不思考、没显式开:补档位会把思考打开,原样。
         ({"provider": "qwen", "name": "qwen3-vl-plus"}, None),
         # budget 厂商输出上限不到 2048:最低预算 1024 会挤掉回答,不补。
         ({"provider": "qwen", "name": "qwen3.6-plus", "max_tokens": 2000}, None),
-        ({"provider": "qwen", "name": "qwen3.6-plus", "max_tokens": 2048}, _medium_budget(2048)),
+        ({"provider": "qwen", "name": "qwen3.6-plus", "max_tokens": 2048}, _low_budget(1024)),
         # 只有开关的厂商、目录外模型:原样。
         ({"provider": "glm", "name": "glm-5v-turbo"}, None),
         ({"provider": "doubao", "name": "doubao-seed-2-1-pro"}, None),
-        # OpenAI / Anthropic 也是 effort 形态,同样按 medium 发。
-        ({"provider": "openai", "name": "gpt-5.4-mini"}, {"reasoning_effort": "medium"}),
+        # OpenAI / Anthropic 也是 effort 形态,同样按 low 发。
+        ({"provider": "openai", "name": "gpt-5.4-mini"}, {"reasoning_effort": "low"}),
         (
             {"provider": "anthropic", "name": "claude-opus-4-8"},
-            {"output_config": {"effort": "medium"}},
+            {"output_config": {"effort": "low"}},
         ),
     ],
 )
@@ -229,15 +232,15 @@ async def test_deep_default_applies_per_node_down_the_fallback_chain(
             "name": "qwen3.6-plus",
             "fallback": [{"provider": "doubao", "name": "doubao-seed-2.0-pro"}],
         },
-        "fallbacks": [{"provider": "doubao", "name": _DOUBAO, "effort": "low"}],
+        "fallbacks": [{"provider": "doubao", "name": _DOUBAO, "effort": "high"}],
     }
 
     await harness.run(monkeypatch, vision, depth="deep")
 
     assert harness.answered == [
-        ("qwen3.6-plus", _medium_budget()),
-        ("doubao-seed-2.0-pro", {"reasoning_effort": "medium"}),
-        (_DOUBAO, {"reasoning_effort": "low"}),
+        ("qwen3.6-plus", _low_budget(16384)),
+        ("doubao-seed-2.0-pro", {"reasoning_effort": "low"}),
+        (_DOUBAO, {"reasoning_effort": "high"}),
     ]
 
 
@@ -254,7 +257,7 @@ async def test_quick_route_is_unchanged_for_an_untouched_vision_model(
 async def test_the_main_model_of_the_same_agent_is_untouched(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    # 主模型与看图模型都是没设档位的 effort 厂商:只有 deep 看图路由补中档。
+    # 主模型与看图模型都是没设档位的 effort 厂商:只有 deep 看图路由补低档。
     main_name = "doubao-seed-2.0-pro"
     built: list[tuple[str, str | None, Any]] = []
     answered: list[tuple[str, Any]] = []
@@ -314,7 +317,7 @@ async def test_the_main_model_of_the_same_agent_is_untouched(
             config=cfg,
         )
 
-    assert answered == [(_DOUBAO, {"reasoning_effort": "medium"})]
+    assert answered == [(_DOUBAO, {"reasoning_effort": "low"})]
     main_builds = [(effort, payload) for name, effort, payload in built if name == main_name]
     assert main_builds and all(effort is None for effort, _ in main_builds)
     assert all(payload is None for _, payload in main_builds)  # 厂商默认,与改动前一致
@@ -426,16 +429,14 @@ _PRO = "gpt-5.5-pro"
 
 @pytest.mark.parametrize(
     ("depth", "first"),
-    [(None, {"reasoning_effort": "minimal"}), ("deep", {"reasoning_effort": "medium"})],
+    [(None, {"reasoning_effort": "minimal"}), ("deep", {"reasoning_effort": "low"})],
 )
 async def test_vendor_rejecting_both_tiers_still_answers_as_configured(
     monkeypatch: pytest.MonkeyPatch, depth: str | None, first: dict[str, str]
 ) -> None:
-    # 没实调过的厂商既不认 minimal(快看)也不认 medium(平台默认):两种深度都退回配置原样
+    # 没实调过的厂商既不认 minimal(快看)也不认 low(平台默认):两种深度都退回配置原样
     # (什么都不发)那条路由,看图不至于整个不可用。
-    harness = _WireHarness(
-        rejected=({"reasoning_effort": "minimal"}, {"reasoning_effort": "medium"})
-    )
+    harness = _WireHarness(rejected=({"reasoning_effort": "minimal"}, {"reasoning_effort": "low"}))
 
     content, _ = await harness.run(
         monkeypatch, {"model": {"provider": "openai", "name": _PRO}}, depth=depth
@@ -448,8 +449,8 @@ async def test_vendor_rejecting_both_tiers_still_answers_as_configured(
 @pytest.mark.parametrize(
     ("vision_model", "routers"),
     [
-        ({"provider": "doubao", "name": _DOUBAO}, 3),  # deep(中档)+ quick + 配置原样
-        ({"provider": "doubao", "name": _DOUBAO, "effort": "low"}, 2),  # 默认没改什么
+        ({"provider": "doubao", "name": _DOUBAO}, 3),  # deep(低档)+ quick + 配置原样
+        ({"provider": "doubao", "name": _DOUBAO, "effort": "high"}, 2),  # 默认没改什么
         ({"provider": "glm", "name": "glm-5v-turbo"}, 2),
     ],
 )
