@@ -62,7 +62,11 @@ from orchestrator.tools.figure_lookup import FigureNotRenderedError, resolve_ren
 from orchestrator.tools.file_ops import _require_path
 from orchestrator.tools.read_page import figure_scope, workspace_figure_ref
 from orchestrator.tools.registry import ToolBlockedError, ToolContext, ToolResult, ToolSpec
-from orchestrator.tools.workspace_paths import agent_relative, resolve_workspace_path
+from orchestrator.tools.workspace_paths import (
+    PLATFORM_DIRS,
+    agent_relative,
+    resolve_workspace_path,
+)
 from orchestrator.tools.workspace_scope import scoped_path
 from orchestrator.tools.workspace_store import WorkspaceStore
 
@@ -726,8 +730,9 @@ def _refuse_other_conversation(rel: str, ctx: ToolContext) -> None:
     """B-236 —— 工作区 ref 落在 ``agents/<key>/threads/<id>/`` 底下时,``<id>`` 必须是本对话。
 
     路径形态(``path``)走 ``resolve_workspace_path``,本来就到不了别的对话;这里补的是模型
-    手写 ``expert_work://workspace/...`` 的那条路(审查回修:B-236 之前就能这样写)。"""
-    parts = rel.split("/")
+    手写 ``expert_work://workspace/...`` 的那条路(审查回修:B-236 之前就能这样写)。B-262
+    review —— 分段与读侧同一个算法(``PurePosixPath``;``rel`` 已由解析器保证是规范写法)。"""
+    parts = PurePosixPath(rel).parts
     if len(parts) >= 4 and parts[0] == "agents" and parts[2] == "threads":
         own = ctx.workspace_view.own_thread
         if own is None or parts[3] != str(own):
@@ -736,23 +741,33 @@ def _refuse_other_conversation(rel: str, ctx: ToolContext) -> None:
 
 
 def _refuse_another_conversations_run(ref: WorkspaceImageRef, ctx: ToolContext) -> None:
-    """B-262 —— ref 落在 agent 根(没绑 agent 时是用户根)的 ``.tool_results/<run>/`` 下时,
-    ``<run>`` 必须是本对话的:``ctx.figure_run_ids``(本对话渲染过页的 run,子代含父链)或本 run。
+    """B-262 —— ref 落在 agent 根(没绑 agent 时是用户根)的平台目录下时:
 
-    那一层是同一 agent 各对话共用的(老视图对话的渲染页、超长结果都在那里),模型手写的 ref
-    原来能读到别的对话渲的页。本对话 ``threads/<conv>/work/`` 下的由
-    :func:`_refuse_other_conversation` 管,这里不碰。"""
+    * ``.tool_results/<run>/``:``<run>`` 必须是本对话的 —— ``ctx.figure_run_ids``(本对话渲染
+      过页的 run,子代含父链)或本 run。两种视图都是(迁移过来的老对话要用自己 run 的页)。
+    * 对话视图里 ``uploads/`` / ``inputs/``(含预拉缓存)一律拒:exec 视图里它们被盖住,那是
+      老视图对话的件。老视图里它们就是本对话的 ``/workspace``,照旧放行。
+
+    那一层是同一 agent 各对话共用的,模型手写的 ref 原来能读到别的对话的件。本对话
+    ``threads/<conv>/work/`` 下的由 :func:`_refuse_other_conversation` 管,这里不碰。"""
     parts = PurePosixPath(ref.rel).parts[2 if ref.agent_key is not None else 0 :]
-    if not parts or parts[0] != WORKSPACE_OVERFLOW_DIR:
+    if not parts or parts[0] not in PLATFORM_DIRS:
         return
-    own = set(ctx.figure_run_ids) | ({ctx.run_id} if ctx.run_id is not None else set())
-    try:
-        run = UUID(parts[1]) if len(parts) > 1 else None
-    except ValueError:
-        run = None
-    if run is None or run not in own:
-        msg = "ask_image image_ref points into another conversation's tool results"
-        raise ToolBlockedError(msg)
+    if parts[0] == WORKSPACE_OVERFLOW_DIR:
+        own = set(ctx.figure_run_ids) | ({ctx.run_id} if ctx.run_id is not None else set())
+        try:
+            run = UUID(parts[1]) if len(parts) > 1 else None
+        except ValueError:
+            run = None
+        if run is not None and run in own:
+            return
+    elif not ctx.workspace_view.per_conversation:
+        return
+    msg = (
+        "ask_image image_ref points into another conversation's files; only this "
+        f"conversation's own files can be read ({parts[0]}/ under the agent directory is not)"
+    )
+    raise ToolBlockedError(msg)
 
 
 def _given(args: Mapping[str, Any], key: str) -> bool:

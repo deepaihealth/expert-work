@@ -121,12 +121,14 @@ class _Ctx:
         tenant_id: UUID,
         headers: dict[str, str],
         workspace_store: RecordingWorkspaceStore,
+        audit_store: InMemoryAuditLogStore | None = None,
     ):
         self.client = client
         self.app = app
         self.tenant_id = tenant_id
         self.headers = headers
         self.workspace_store = workspace_store
+        self.audit_store = audit_store or InMemoryAuditLogStore()
 
     async def seed_agent(self) -> None:
         await self.app.state.agent_spec_repo.create(
@@ -149,11 +151,12 @@ async def ctx() -> AsyncIterator[_Ctx]:
     lifecycle.mark_ready()
     run_store = InMemoryRunStore()
     run_event_store = InMemoryRunEventStore()
+    audit_store = InMemoryAuditLogStore()
     app = create_app(
         settings=_build_settings(),
         lifecycle=lifecycle,
         jwt_verifier=build_test_jwt_verifier(),
-        audit_logger=build_default_audit_logger(InMemoryAuditLogStore()),
+        audit_logger=build_default_audit_logger(audit_store),
         agent_runtime=stub_agent_runtime(run_store=run_store, run_event_store=run_event_store),
         run_repo=run_store,
         run_event_repo=run_event_store,
@@ -181,7 +184,7 @@ async def ctx() -> AsyncIterator[_Ctx]:
     headers = {"Authorization": f"Bearer {jwt}"}
     transport = ASGITransport(app=app)
     async with AsyncClient(transport=transport, base_url="http://cp.test") as client:
-        yield _Ctx(client, app, tenant_id, headers, workspace_store)
+        yield _Ctx(client, app, tenant_id, headers, workspace_store, audit_store)
 
 
 @pytest.mark.asyncio
@@ -605,7 +608,7 @@ async def test_same_name_uploads_from_two_sessions_each_land_in_their_own_conver
         thread_id=UUID(third["session_id"]),
         uploads_store=ctx.app.state.user_upload_store,
         threads=ctx.app.state.thread_meta_repo,
-        workspace_store=ctx.workspace_store,
+        copier=_copier(ctx),
     )
     assert document_names == [f"uploads/{renamed}"]
     message = _build_human_message(
@@ -654,6 +657,17 @@ async def test_an_old_layout_session_still_uploads_into_the_agent_root(ctx: _Ctx
 # ---------------------------------------------------------------------------
 
 
+def _copier(ctx: _Ctx) -> Any:
+    from control_plane.api.uploads import LandingAccount
+
+    return LandingAccount(
+        workspace_store=ctx.workspace_store,
+        audit=ctx.app.state.audit_logger,
+        actor_id="sa-external-app",
+        quota_service=getattr(ctx.app.state, "workspace_quota_service", None),
+    )
+
+
 async def _attach(ctx: _Ctx, upload: dict[str, Any], *, into: str) -> list[str]:
     from control_plane.api.agents import ExternalFileRef, resolve_external_files
 
@@ -665,7 +679,7 @@ async def _attach(ctx: _Ctx, upload: dict[str, Any], *, into: str) -> list[str]:
         thread_id=UUID(into),
         uploads_store=ctx.app.state.user_upload_store,
         threads=ctx.app.state.thread_meta_repo,
-        workspace_store=ctx.workspace_store,
+        copier=_copier(ctx),
     )
     return names
 
@@ -779,4 +793,189 @@ async def test_an_upload_whose_session_is_gone_is_not_found(ctx: _Ctx) -> None:
 
     with pytest.raises(ExternalScopeError) as info:
         await _attach(ctx, a, into=b["session_id"])
-    assert info.value.code == "UPLOAD_NOT_FOUND"
+    # B-262 review —— 与「上传不存在」分开:登记行在,它所在的会话被删了。
+    assert (info.value.code, info.value.status_code) == ("UPLOAD_SESSION_DELETED", 404)
+    assert "deleted" in info.value.message
+
+
+# ---------------------------------------------------------------------------
+# B-262 review —— 跨会话复制要像上传一样记账(配额 + 审计),出错按上传端点的码回;
+# 源会话已删、源文件被改过也要说清楚。
+# ---------------------------------------------------------------------------
+
+
+class _QuotaRecorder:
+    def __init__(self, *, full: bool = False) -> None:
+        self.full = full
+        self.checked: list[int] = []
+        self.written: list[int] = []
+
+    async def check_upload(self, *, tenant_id: UUID, user_id: UUID, incoming_bytes: int) -> None:
+        from orchestrator.tools.sandbox import WorkspaceQuotaExceededError
+
+        self.checked.append(incoming_bytes)
+        if self.full:
+            raise WorkspaceQuotaExceededError("full")
+
+    async def note_written(self, *, tenant_id: UUID, user_id: UUID, delta_bytes: int) -> None:
+        self.written.append(delta_bytes)
+
+
+async def _document_audit_rows(ctx: _Ctx) -> list[Any]:
+    from expert_work.protocol import AuditAction, AuditQuery
+
+    page = await ctx.audit_store.query(AuditQuery(tenant_id=ctx.tenant_id, limit=100))
+    rows = [r for r in page.entries if r.action == AuditAction.DOCUMENT_UPLOAD]
+    return sorted(rows, key=lambda r: r.id or 0)
+
+
+async def _upload_row_count(ctx: _Ctx) -> int:
+    from datetime import UTC, datetime, timedelta
+
+    rows = await ctx.app.state.user_upload_store.list_expired(
+        before=datetime.now(UTC) + timedelta(days=1)
+    )
+    return len(rows)
+
+
+@pytest.mark.asyncio
+async def test_a_copy_is_accounted_and_audited_like_an_upload(ctx: _Ctx) -> None:
+    await ctx.seed_agent()
+    a = await _upload_document(ctx, b"%PDF-1.4 A")
+    b = await _upload_document(ctx, b"%PDF-1.4 B")
+    quota = _QuotaRecorder()
+    ctx.app.state.workspace_quota_service = quota
+    before_rows = len(await _document_audit_rows(ctx))
+    upload_rows = await _upload_row_count(ctx)
+
+    names = await _attach(ctx, a, into=b["session_id"])
+    again = await _attach(ctx, a, into=b["session_id"])
+
+    assert again == names
+    assert quota.checked == [len(b"%PDF-1.4 A")] * 2
+    assert quota.written == [len(b"%PDF-1.4 A")]  # 复用同内容那次不记
+    rows = (await _document_audit_rows(ctx))[before_rows:]
+    sha = hashlib.sha256(b"%PDF-1.4 A").hexdigest()
+    assert [
+        (
+            r.details["thread_id"],
+            r.details["workspace_path"],
+            r.details["sha256"],
+            r.details["reused_existing"],
+            r.details["copied_from_upload_id"],
+        )
+        for r in rows
+    ] == [
+        (b["session_id"], names[0], sha, False, a["upload_id"]),
+        (b["session_id"], names[0], sha, True, a["upload_id"]),
+    ]
+    assert await _upload_row_count(ctx) == upload_rows  # 不新建登记行
+
+
+@pytest.mark.asyncio
+async def test_a_copy_into_a_full_workspace_is_refused_like_an_upload(ctx: _Ctx) -> None:
+    from control_plane.api._external import ExternalScopeError
+
+    await ctx.seed_agent()
+    a = await _upload_document(ctx, b"%PDF-1.4 A")
+    b = await _upload_document(ctx, b"%PDF-1.4 B")
+    ctx.app.state.workspace_quota_service = _QuotaRecorder(full=True)
+    writes = len(ctx.workspace_store.workspace_writes)
+
+    with pytest.raises(ExternalScopeError) as info:
+        await _attach(ctx, a, into=b["session_id"])
+    assert (info.value.code, info.value.status_code) == ("QUOTA_EXCEEDED", 429)
+    assert len(ctx.workspace_store.workspace_writes) == writes
+
+
+@pytest.mark.asyncio
+async def test_an_upload_whose_session_is_gone_resolves_as_before_for_an_old_view_target(
+    ctx: _Ctx,
+) -> None:
+    """源会话已删(登记行在 purge 后还留着)、本会话是老视图:照 P1 之前,按本 agent 根解析
+    ``row.ref``,不复制。"""
+    await ctx.seed_agent()
+    a = await _upload_document(ctx, b"%PDF-1.4 A")
+    b = await _upload_document(ctx, b"%PDF-1.4 B")
+    _old_layout(ctx, b["session_id"])
+    await ctx.app.state.thread_meta_repo.delete(UUID(a["session_id"]), tenant_id=ctx.tenant_id)
+    writes = len(ctx.workspace_store.workspace_writes)
+
+    assert await _attach(ctx, a, into=b["session_id"]) == ["uploads/report.pdf"]
+    assert len(ctx.workspace_store.workspace_writes) == writes
+
+
+@pytest.mark.asyncio
+async def test_a_missing_source_file_is_not_found(ctx: _Ctx) -> None:
+    from control_plane.api._external import ExternalScopeError
+
+    await ctx.seed_agent()
+    a = await _upload_document(ctx, b"%PDF-1.4 A")
+    b = await _upload_document(ctx, b"%PDF-1.4 B")
+    key = agent_key_for_code("support-bot")
+    ctx.workspace_store.created_files.pop(
+        f"agents/{key}/threads/{a['session_id']}/work/uploads/report.pdf"
+    )
+    ctx.workspace_store.workspace_file_contents = {"elsewhere": b"x"}  # 内容表权威:没有即不存在
+
+    with pytest.raises(ExternalScopeError) as info:
+        await _attach(ctx, a, into=b["session_id"])
+    assert (info.value.code, info.value.status_code) == ("UPLOAD_NOT_FOUND", 404)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("where", "error", "expected"),
+    [
+        ("read", "too_large", ("UPLOAD_TOO_LARGE", 413)),
+        ("read", "permission", ("UPLOAD_FAILED", 500)),
+        ("read", "other", ("UPLOAD_FAILED", 502)),
+        ("write", "permission", ("UPLOAD_FAILED", 500)),
+        ("write", "other", ("UPLOAD_FAILED", 502)),
+    ],
+)
+async def test_copy_failures_use_the_upload_endpoints_codes(
+    ctx: _Ctx, where: str, error: str, expected: tuple[str, int]
+) -> None:
+    from control_plane.api._external import ExternalScopeError
+    from orchestrator.tools.sandbox import (
+        SandboxSupervisorError,
+        WorkspaceFileTooLargeError,
+        WorkspacePermissionError,
+    )
+
+    await ctx.seed_agent()
+    a = await _upload_document(ctx, b"%PDF-1.4 A")
+    b = await _upload_document(ctx, b"%PDF-1.4 B")
+    exc = {
+        "too_large": WorkspaceFileTooLargeError("big"),
+        "permission": WorkspacePermissionError("denied"),
+        "other": SandboxSupervisorError("boom"),
+    }[error]
+    if where == "read":
+        ctx.workspace_store.workspace_file_error = exc
+    else:
+        ctx.workspace_store.workspace_write_error = exc
+
+    with pytest.raises(ExternalScopeError) as info:
+        await _attach(ctx, a, into=b["session_id"])
+    assert (info.value.code, info.value.status_code) == expected
+
+
+@pytest.mark.asyncio
+async def test_a_source_changed_since_upload_is_refused(ctx: _Ctx) -> None:
+    """源对话的模型把文件改写了(大小与登记行对不上):不悄悄复制改过的内容。"""
+    from control_plane.api._external import ExternalScopeError
+
+    await ctx.seed_agent()
+    a = await _upload_document(ctx, b"%PDF-1.4 A")
+    b = await _upload_document(ctx, b"%PDF-1.4 B")
+    key = agent_key_for_code("support-bot")
+    source = f"agents/{key}/threads/{a['session_id']}/work/uploads/report.pdf"
+    ctx.workspace_store.created_files[source] = b"%PDF-1.4 A, rewritten by the model"
+    writes = len(ctx.workspace_store.workspace_writes)
+
+    with pytest.raises(ExternalScopeError) as info:
+        await _attach(ctx, a, into=b["session_id"])
+    assert (info.value.code, info.value.status_code) == ("UPLOAD_CHANGED", 409)
+    assert len(ctx.workspace_store.workspace_writes) == writes

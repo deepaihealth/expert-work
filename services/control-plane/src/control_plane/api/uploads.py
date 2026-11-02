@@ -20,9 +20,10 @@ import io
 import logging
 import re
 import zipfile
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import PurePosixPath
-from typing import Annotated, Final
+from typing import Annotated, Any, Final
 from uuid import UUID, uuid4
 
 from fastapi import APIRouter, Depends, File, HTTPException, Request, UploadFile
@@ -49,12 +50,26 @@ from expert_work.common.observability import current_trace_id_hex
 from expert_work.persistence import WORKSPACE_UPLOADS_DIR
 from expert_work.persistence.image_upload import ImageUploadStore
 from expert_work.persistence.tenant_user import TenantUserStore
-from expert_work.protocol import AuditAction, AuditResult, QuotaDimension, ThreadMeta
+from expert_work.protocol import (
+    AuditAction,
+    AuditResult,
+    QuotaDimension,
+    ThreadMeta,
+    UserUpload,
+    render_upload_id,
+)
 from expert_work.protocol.multimodal import ImageRef
 from expert_work.runtime.audit.logger import AuditLogger
 from expert_work.runtime.storage import ObjectStore
 from orchestrator.tools import SandboxSupervisorError, WorkspacePermissionError, WorkspaceStore
-from orchestrator.tools.sandbox import WorkspaceFileExistsError, WorkspaceQuotaExceededError
+from orchestrator.tools.nas_workspace_store import _WorkspacePathNotFoundError
+from orchestrator.tools.sandbox import (
+    WorkspaceFileExistsError,
+    WorkspaceFileNotFoundError,
+    WorkspaceFileTooLargeError,
+    WorkspaceNotAFileError,
+    WorkspaceQuotaExceededError,
+)
 
 logger = logging.getLogger("expert_work.control_plane.uploads")
 
@@ -193,10 +208,11 @@ async def _land_document_bytes(
 
 
 async def copy_document_into_thread(
-    workspace_store: WorkspaceStore,
+    account: LandingAccount,
     *,
     tenant_id: UUID,
     user_id: UUID,
+    upload: UserUpload,
     ref: str,
     source: ThreadMeta,
     target: ThreadMeta,
@@ -206,25 +222,68 @@ async def copy_document_into_thread(
     复用、不同内容加 ``-<sha8>``)。两条会话的那个位置本来就是同一个文件(都是同一 agent 的老
     视图)时不复制,原样回 ``ref``。
 
-    源按 ``source`` 自己的 agent 与布局定位,不按 ``target`` 的目录找同名文件。读写失败原样抛
-    (``SandboxSupervisorError`` 族),由调用方翻成对外错误。
+    源按 ``source`` 自己的 agent 与布局定位,不按 ``target`` 的目录找同名文件。
+
+    B-262 review —— 像一次上传一样记账(:func:`_land_and_account`:配额闸、写了才记字节、
+    给 ``target`` 记一条 ``DOCUMENT_UPLOAD`` 审计,``copied_from_upload_id`` 是登记行的
+    ``upl_`` id);不新建登记行。源文件大小与登记行对不上(源对话里被改写过)就拒,不悄悄复制
+    改过的内容(只比大小:登记行与审计都不便宜地给出 sha256)。
+
+    失败抛 ``HTTPException``,状态码同上传端点(503 / 413 / 429 / 500 / 502);另有源文件不在
+    404、源被改过 409。
     """
+    store = account.workspace_store
+    if store is None:
+        raise HTTPException(status_code=503, detail="document upload unavailable: no sandbox")
     source_path = thread_workspace_path(ref, source)
     if source_path == thread_workspace_path(ref, target):
         return ref
-    raw = await workspace_store.read_file(tenant_id=tenant_id, user_id=user_id, path=source_path)
-    landed, _reused = await _land_document_bytes(
-        workspace_store,
+    try:
+        raw = await store.read_file(tenant_id=tenant_id, user_id=user_id, path=source_path)
+    except (WorkspaceFileNotFoundError, WorkspaceNotAFileError, _WorkspacePathNotFoundError) as exc:
+        raise HTTPException(status_code=404, detail="upload content not found") from exc
+    except WorkspaceFileTooLargeError as exc:
+        raise HTTPException(status_code=413, detail="document exceeds the read limit") from exc
+    except WorkspacePermissionError as exc:
+        logger.warning("upload.copy_read_permission_denied", exc_info=True)
+        raise HTTPException(status_code=500, detail="workspace read failed") from exc
+    except SandboxSupervisorError as exc:
+        logger.warning("upload.copy_read_failed", exc_info=True)
+        raise HTTPException(status_code=502, detail="workspace read failed") from exc
+    if len(raw) != upload.size_bytes:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "the uploaded file was changed in its session after it was uploaded; "
+                "upload it again"
+            ),
+        )
+    result = await _land_and_account(
+        account,
         tenant_id=tenant_id,
         user_id=user_id,
+        thread_id=target.thread_id,
         agent_key=thread_agent_key(target),
         conv_id=thread_conversation_id(target),
         workspace_path=ref,
         ext=PurePosixPath(ref).suffix,
         raw=raw,
-        sha256_hex=hashlib.sha256(raw).hexdigest(),
+        content_type=upload.mime_type,
+        extra_details={"copied_from_upload_id": render_upload_id(upload.id)},
     )
-    return landed
+    return result.path
+
+
+#: 上传失败(``HTTPException`` 的状态码)→ 对外信封的 ``code``。对外上传端点与跨会话复制附件
+#: (B-262)共用这一张表:同一种失败对接方看到的是同一个码。
+UPLOAD_ERROR_CODES: Final[dict[int, str]] = {
+    400: "INVALID_UPLOAD",
+    413: "UPLOAD_TOO_LARGE",
+    429: "QUOTA_EXCEEDED",
+    500: "UPLOAD_FAILED",
+    502: "UPLOAD_FAILED",
+    503: "UPLOAD_UNAVAILABLE",
+}
 
 
 def is_safe_document_upload_id(value: str) -> bool:
@@ -340,13 +399,78 @@ async def _handle_document_upload(
         raise HTTPException(status_code=400, detail="uploaded file is empty")
     _reject_zip_bomb(raw, ext)
 
-    quota_service = getattr(request.app.state, "workspace_quota_service", None)
+    return await _land_and_account(
+        LandingAccount(
+            workspace_store=workspace_store,
+            audit=audit,
+            actor_id=getattr(request.state, "actor_id", "anonymous"),
+            quota_service=getattr(request.app.state, "workspace_quota_service", None),
+        ),
+        tenant_id=tenant_id,
+        user_id=caller_user_id,
+        thread_id=thread_id,
+        agent_key=agent_key,
+        conv_id=conv_id,
+        workspace_path=_safe_workspace_name(filename, ext),
+        ext=ext,
+        raw=raw,
+        content_type=content_type,
+    )
+
+
+@dataclass(frozen=True)
+class LandingAccount:
+    """B-262 review —— 落一份文档进工作区时记账要用的东西:工作区、审计、配额。
+
+    上传端点与跨会话复制附件(:func:`copy_document_into_thread`)共用 :func:`_land_and_account`,
+    配额闸、记账、``DOCUMENT_UPLOAD`` 审计行只写一份。``quota_service`` 未接线(非 NAS
+    部署)为 ``None``。
+    """
+
+    workspace_store: WorkspaceStore | None
+    audit: AuditLogger
+    actor_id: str
+    quota_service: Any = None
+
+    @classmethod
+    def from_request(cls, request: Request) -> LandingAccount:
+        state = request.app.state
+        return cls(
+            workspace_store=getattr(state, "workspace_store", None),
+            audit=state.audit_logger,
+            actor_id=getattr(request.state, "actor_id", "anonymous"),
+            quota_service=getattr(state, "workspace_quota_service", None),
+        )
+
+
+async def _land_and_account(
+    account: LandingAccount,
+    *,
+    tenant_id: UUID,
+    user_id: UUID,
+    thread_id: UUID,
+    agent_key: str,
+    conv_id: UUID | None,
+    workspace_path: str,
+    ext: str,
+    raw: bytes,
+    content_type: str,
+    extra_details: Mapping[str, Any] | None = None,
+) -> DocumentUploadResult:
+    """配额闸 → 落盘(不覆盖,见 :func:`_land_document_bytes`)→ 审计 → 记账。
+
+    失败抛 ``HTTPException``:没有工作区 503、写完会超配额 429、写权限 500、其余写失败 502
+    (同上传端点)。
+    """
+    if account.workspace_store is None:
+        raise HTTPException(status_code=503, detail="document upload unavailable: no sandbox")
+    quota_service = account.quota_service
     if quota_service is not None:
         try:
             # 闸 B(spec § 3.3):写完会超就拦(+incoming >)。与闸 A 的
             # >= 谓词刻意不同 —— 上传知道 incoming 大小,acquire 不知道。
             await quota_service.check_upload(
-                tenant_id=tenant_id, user_id=caller_user_id, incoming_bytes=len(raw)
+                tenant_id=tenant_id, user_id=user_id, incoming_bytes=len(raw)
             )
         except WorkspaceQuotaExceededError as exc:
             # 固定文案不插值异常对象(本文件既有约定);429 与 supervisor 时代的
@@ -370,13 +494,13 @@ async def _handle_document_upload(
     # ``_land_document_bytes``)。下面回给调用方、写审计、进 run 的一律是实际落盘的名字。
     sha256_hex = hashlib.sha256(raw).hexdigest()
     try:
-        workspace_path, reused = await _land_document_bytes(
-            workspace_store,
+        landed, reused = await _land_document_bytes(
+            account.workspace_store,
             tenant_id=tenant_id,
-            user_id=caller_user_id,
+            user_id=user_id,
             agent_key=agent_key,
             conv_id=conv_id,
-            workspace_path=_safe_workspace_name(filename, ext),
+            workspace_path=workspace_path,
             ext=ext,
             raw=raw,
             sha256_hex=sha256_hex,
@@ -397,23 +521,23 @@ async def _handle_document_upload(
         logger.warning("upload.write_failed", exc_info=True)
         raise HTTPException(status_code=502, detail="workspace write failed") from exc
 
-    actor_id: str = getattr(request.state, "actor_id", "anonymous")
     await audit_emit(
-        audit,
+        account.audit,
         tenant_id=tenant_id,
-        actor_id=actor_id,
+        actor_id=account.actor_id,
         action=AuditAction.DOCUMENT_UPLOAD,
         resource_type="user_workspace",
-        resource_id=workspace_path,
+        resource_id=landed,
         result=AuditResult.SUCCESS,
         trace_id=current_trace_id_hex(),
         details={
             "thread_id": str(thread_id),
-            "workspace_path": workspace_path,
+            "workspace_path": landed,
             "file_size_bytes": len(raw),
             "mime_type": content_type,
             "sha256": sha256_hex,
             "reused_existing": reused,
+            **dict(extra_details or {}),
         },
     )
     if quota_service is not None and not reused:
@@ -424,11 +548,11 @@ async def _handle_document_upload(
         # "记账打嗝",重试还会造重复文件。
         try:
             await quota_service.note_written(
-                tenant_id=tenant_id, user_id=caller_user_id, delta_bytes=len(raw)
+                tenant_id=tenant_id, user_id=user_id, delta_bytes=len(raw)
             )
         except Exception:
             logger.warning("upload.quota_accounting_failed", exc_info=True)
-    return DocumentUploadResult(path=workspace_path, size_bytes=len(raw), reused=reused)
+    return DocumentUploadResult(path=landed, size_bytes=len(raw), reused=reused)
 
 
 def _get_object_store(request: Request) -> ObjectStore | None:

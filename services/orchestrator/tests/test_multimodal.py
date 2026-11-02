@@ -445,36 +445,25 @@ def test_is_cacheable_image_ref_false_for_an_ordinary_file_under_an_agent_scope(
 
 
 @pytest.mark.parametrize(
-    "scope_spelling",
+    "rel",
     [
-        "agents/./pf-probe-33086dc0",
-        "agents//pf-probe-33086dc0",
-        "agents/pf-probe-33086dc0/.",
+        "agents/./pf-probe-33086dc0/{tail}",
+        "agents//pf-probe-33086dc0/{tail}",
+        "agents/pf-probe-33086dc0/./{tail}",
+        "agents/pf-probe-33086dc0//{tail}",
+        "./{tail}",
+        "{tail}/",
     ],
 )
-def test_is_cacheable_image_ref_true_for_non_normalized_agent_scoped_rel(
-    scope_spelling: str,
-) -> None:
-    """B-64 回修第 2 轮 New-4 —— ``parsed.rel`` 不保证被归一化过(``agent_key``
-    是拿 ``PurePosixPath(rel).parts`` 解出来的,但归一化结果从没写回 ``rel``
-    字段本身)。按字节长度砍 ``agents/<key>/`` 前缀,在带 ``.``/双斜杠这类写法
-    下会砍错位置,把真正落在渲染子树里的页误判成不可缓存。"""
+def test_a_non_canonical_workspace_ref_is_rejected(rel: str) -> None:
+    """B-262 review —— ``rel`` 里的空段、``.`` 段、结尾斜杠:读侧按归一化分段走,而按原样
+    切分的守卫会对错位置(``agents/<k>//threads/<别的对话>/…`` 绕过对话守卫)。解析时就拒,
+    之后所有消费方看到的 ``rel`` 都是规范写法。(B-64 回修第 2/3 轮曾让这类写法「也判可缓存」,
+    那两条用例随之改为钉拒绝。)"""
     t, u = uuid4(), uuid4()
-    ref = f"expert_work://workspace/{t}/{u}/{scope_spelling}/{_rendered_rel()}"
-    assert is_cacheable_image_ref(ref) is True
-
-
-def test_is_cacheable_image_ref_true_for_non_normalized_unscoped_rel() -> None:
-    """B-64 回修第 3 轮 Minor-4 —— 上一条 New-4 的回归钉只覆盖了
-    ``agent_key is not None`` 那一支;没绑 agent 时,``is_cacheable_image_ref``
-    仍然直接拿未归一化的 ``parsed.rel`` 字符串去比,没有像绑 agent 那一支一样
-    先用 ``PurePosixPath`` 重新分段。``./.tool_results/...`` 这个 rel 里的
-    ``.`` 段在字符串层面挡在最前面,``str.startswith(".tool_results/")`` 判
-    False;而它真实落在渲染子树里,归一化之后应当判 True —— 与 round-2 的字节
-    长度 bug 是同一类"没把 ``rel`` 归一化就直接用"。"""
-    t, u = uuid4(), uuid4()
-    ref = f"expert_work://workspace/{t}/{u}/./{_rendered_rel()}"
-    assert is_cacheable_image_ref(ref) is True
+    ref = f"expert_work://workspace/{t}/{u}/" + rel.format(tail=_rendered_rel())
+    with pytest.raises(ValueError, match="canonical"):
+        parse_workspace_image_ref(ref)
 
 
 class _CountingResolver:
@@ -670,28 +659,18 @@ def test_parse_image_ref_still_refuses_workspace_scheme() -> None:
         parse_image_ref("expert_work://workspace/t/u/x.jpg")
 
 
-@pytest.mark.parametrize(
-    "rel_tail",
-    [
-        "agents/./k1/.tool_results/r1/page.jpg",
-        "agents//k1/.tool_results/r1/page.jpg",
-        "agents/k1/./.tool_results/r1/page.jpg",
-        "agents/k1/.tool_results/r1/page.jpg",
-    ],
-)
-def test_agent_key_matches_the_first_two_normalized_parts_of_rel(rel_tail: str) -> None:
-    """B-64 回修第 2 轮 New-4 —— ``agent_key`` 是拿归一化后的
-    ``PurePosixPath(rel).parts`` 解出来的,但 ``rel`` 字段本身不保证被归一化
-    (混了 ``.``/双斜杠这类写法也照样解得出 ``agent_key``)。这条测试钉住两者
-    必须永远一致:``agent_key`` 非 ``None`` 时,重新对 ``rel`` 分段,前两段
-    恒等于 ``("agents", agent_key)`` —— 任何在 ``rel`` 上按字节长度砍前缀的
-    消费方(如 ``is_cacheable_image_ref``)都依赖这条不变式成立。
-    """
+def test_agent_key_matches_the_first_two_parts_of_rel() -> None:
+    """``agent_key`` 非 ``None`` 时,``rel`` 的前两段恒等于 ``("agents", agent_key)``;B-262
+    起 ``rel`` 一定是规范写法(非规范的在解析时就拒,见上),``rel.split("/")`` 与
+    ``PurePosixPath(rel).parts`` 一致。"""
     t, u = uuid4(), uuid4()
-    parsed = parse_workspace_image_ref(f"expert_work://workspace/{t}/{u}/{rel_tail}")
+    parsed = parse_workspace_image_ref(
+        f"expert_work://workspace/{t}/{u}/agents/k1/.tool_results/r1/page.jpg"
+    )
     assert parsed.agent_key is not None
     parts = PurePosixPath(parsed.rel).parts
     assert parts[:2] == ("agents", parsed.agent_key)
+    assert tuple(parsed.rel.split("/")) == parts
 
 
 class _CancelledResolver:

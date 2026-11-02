@@ -268,8 +268,9 @@ def remove_tool_result_dir(
     目录)。
 
     B-262 P1 —— ``conversation_id`` 非空:对话视图的那一份,在该 agent 的
-    ``threads/<conv>/work/`` 下。中间三段(``threads`` / 对话目录 / ``work``)逐段 ``lstat``,
-    任何一段不是真目录(载荷能把本对话的 ``work`` 换成软链)→ :class:`UnsafeWorkspacePathError`。
+    ``threads/<conv>/work/`` 下。中间四段(``threads`` / 对话目录 / ``work`` / ``.tool_results``)
+    逐段 ``lstat``,任何一段不是真目录(载荷能把本对话的 ``work`` 或 ``.tool_results`` 换成软链)
+    → :class:`UnsafeWorkspacePathError`。
     """
     if conversation_id is None:
         return _remove_uuid_named_dir(
@@ -280,7 +281,7 @@ def remove_tool_result_dir(
     _ensure_plain_dirs(root, tenant_id, user_id)
     base = agent_subtree(user_root(root, tenant_id, user_id), agent_key)
     work = base
-    for part in (THREADS_DIR, str(conversation_id), CONVERSATION_WORK_DIR):
+    for part in (THREADS_DIR, str(conversation_id), CONVERSATION_WORK_DIR, TOOL_RESULTS_DIR):
         work = work / part
         try:
             st = os.lstat(work)

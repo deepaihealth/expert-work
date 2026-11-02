@@ -49,6 +49,7 @@ from control_plane.api._run_event_stream import EXTERNAL_HIDDEN_EVENTS, make_run
 from control_plane.api._run_usage import make_usage_loader
 from control_plane.api._session_title import title_from_text
 from control_plane.api._user_scope import get_user_repo
+from control_plane.api._workspace_shared import thread_conversation_id
 from control_plane.api.external_events import build_events_response
 from control_plane.api.runs import (
     MAX_RUN_IMAGE_REFS,
@@ -61,7 +62,12 @@ from control_plane.api.runs import (
     check_run_inputs_bound,
     spawn_run,
 )
-from control_plane.api.uploads import copy_document_into_thread, is_safe_document_upload_id
+from control_plane.api.uploads import (
+    UPLOAD_ERROR_CODES,
+    LandingAccount,
+    copy_document_into_thread,
+    is_safe_document_upload_id,
+)
 from control_plane.audit import emit
 from control_plane.auth.abac import ResourceAttrs
 from control_plane.delegation_policy import (
@@ -118,6 +124,7 @@ from expert_work.protocol import (
     Principal,
     Provider,
     TenantPlan,
+    UserUpload,
     parse_upload_id,
     tier_satisfies,
 )
@@ -134,7 +141,6 @@ from expert_work.runtime.runs import (
 from expert_work.runtime.stream_bridge import StreamBridge
 from orchestrator import AgentFactoryError, PlatformNotConfiguredError
 from orchestrator.stream_items import STREAM_FORMAT_ITEMS, STREAM_FORMAT_LEGACY
-from orchestrator.tools import SandboxSupervisorError, WorkspacePermissionError, WorkspaceStore
 from orchestrator.tools.registry import UnmatchedArgBinding, WorkspaceLayout
 
 logger = logging.getLogger("expert_work.control_plane.agents")
@@ -385,7 +391,7 @@ async def resolve_external_files(
     thread_id: UUID,
     uploads_store: UserUploadStore,
     threads: ThreadMetaStore,
-    workspace_store: WorkspaceStore | None,
+    copier: LandingAccount,
 ) -> tuple[list[str], list[str]]:
     """``files[]`` → 内部 ``(image_refs, document_names)``(对外附件模型统一)。
 
@@ -411,8 +417,9 @@ async def resolve_external_files(
 
     B-262 P1 §3 —— document 行属于**别的会话**(同一 agent 或另一个 agent)时,把文件从那条
     会话自己的目录复制进本会话的 ``uploads/``(:func:`~control_plane.api.uploads.
-    copy_document_into_thread`),``document_names`` 里写实际落地的名字。登记行的会话已经不在
-    → 404 ``UPLOAD_NOT_FOUND``(找不到源)。
+    copy_document_into_thread`,像一次上传一样记账与审计),``document_names`` 里写实际落地的
+    名字。登记行的会话已经不在(purge 不删登记行):本会话是老视图时照 P1 之前,按本 agent 根
+    解析 ``ref``、不复制;否则 404 ``UPLOAD_SESSION_DELETED``。
     """
     image_refs: list[str] = []
     document_names: list[str] = []
@@ -435,13 +442,13 @@ async def resolve_external_files(
             ref = _safe_document_name_or_422(row.ref)
             if row.thread_id != thread_id:
                 ref = await _copy_into_this_session(
+                    row,
                     ref,
                     tenant_id=tenant_id,
                     end_user_id=end_user_id,
-                    source_thread_id=row.thread_id,
                     thread_id=thread_id,
                     threads=threads,
-                    workspace_store=workspace_store,
+                    copier=copier,
                 )
             document_names.append(ref)
     if len(image_refs) > MAX_RUN_IMAGE_REFS:
@@ -453,42 +460,49 @@ async def resolve_external_files(
     return image_refs, document_names
 
 
+#: B-262 review —— 跨会话复制附件特有的两种失败;其余状态码沿用上传端点那张表。
+_COPY_ERROR_CODES: dict[int, str] = {404: "UPLOAD_NOT_FOUND", 409: "UPLOAD_CHANGED"}
+
+
 async def _copy_into_this_session(
+    row: UserUpload,
     ref: str,
     *,
     tenant_id: UUID,
     end_user_id: UUID,
-    source_thread_id: UUID,
     thread_id: UUID,
     threads: ThreadMetaStore,
-    workspace_store: WorkspaceStore | None,
+    copier: LandingAccount,
 ) -> str:
-    """B-262 P1 §3 —— 别的会话的上传复制进本会话;失败翻成对外错误(措辞同下载端点)。"""
-    source = await threads.get(source_thread_id, tenant_id=tenant_id)
+    """B-262 P1 §3 —— 别的会话的上传复制进本会话;失败翻成对外错误(码同上传端点)。"""
     target = await threads.get(thread_id, tenant_id=tenant_id)
-    if source is None or target is None:
+    if target is None:
         raise ExternalScopeError("UPLOAD_NOT_FOUND", "upload not found", 404)
-    if workspace_store is None:
-        raise ExternalScopeError("UPLOAD_CONTENT_UNAVAILABLE", "upload content unavailable", 503)
+    source = await threads.get(row.thread_id, tenant_id=tenant_id)
+    if source is None:
+        if thread_conversation_id(target) is None:
+            # 老视图:照 P1 之前,``ref`` 相对本 agent 根(会话删了,件还在 agent 根)。
+            return ref
+        raise ExternalScopeError(
+            "UPLOAD_SESSION_DELETED",
+            "the session this upload was made in has been deleted; upload the file again",
+            404,
+        )
     try:
         return await copy_document_into_thread(
-            workspace_store,
+            copier,
             tenant_id=tenant_id,
             user_id=end_user_id,
+            upload=row,
             ref=ref,
             source=source,
             target=target,
         )
-    except WorkspacePermissionError as exc:
-        # 服务端配置问题,不是「不存在」(同 ``external_uploads.download_upload``);必须排在
-        # 父类 SandboxSupervisorError 之前。
-        logger.warning("external_run.attach_copy_permission_denied", exc_info=True)
-        raise ExternalScopeError(
-            "UPLOAD_CONTENT_UNAVAILABLE", "upload content unavailable", 500
-        ) from exc
-    except SandboxSupervisorError as exc:
-        logger.warning("external_run.attach_copy_failed reason=%s", type(exc).__name__)
-        raise ExternalScopeError("UPLOAD_NOT_FOUND", "upload content not found", 404) from exc
+    except HTTPException as exc:
+        code = _COPY_ERROR_CODES.get(exc.status_code) or UPLOAD_ERROR_CODES.get(
+            exc.status_code, "UPLOAD_ERROR"
+        )
+        raise ExternalScopeError(code, str(exc.detail), exc.status_code) from exc
 
 
 def external_run_bounds_error(
@@ -1790,7 +1804,7 @@ def build_agents_router() -> APIRouter:
                 thread_id=thread_id,
                 uploads_store=uploads_store,
                 threads=threads,
-                workspace_store=getattr(request.app.state, "workspace_store", None),
+                copier=LandingAccount.from_request(request),
             )
         except ExternalScopeError as exc:
             return _envelope_error(exc.code, exc.message, exc.status_code)

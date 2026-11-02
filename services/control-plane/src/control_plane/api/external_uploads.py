@@ -63,6 +63,7 @@ from control_plane.api._user_scope import get_user_repo
 from control_plane.api._workspace_shared import thread_workspace_path
 from control_plane.api.agents import _resolve_session, _SessionError
 from control_plane.api.uploads import (
+    UPLOAD_ERROR_CODES,
     _handle_document_upload,
     _land_image_upload,
     _prepare_image_upload,
@@ -89,14 +90,7 @@ logger = logging.getLogger("expert_work.control_plane.external_uploads")
 #: ``_decision_error_envelope`` — every external endpoint owns translating
 #: its internal ``HTTPException``s into the ``{success, data, error}``
 #: contract rather than letting FastAPI's bare ``{"detail": ...}`` leak.
-_UPLOAD_ERROR_CODES: dict[int, str] = {
-    400: "INVALID_UPLOAD",
-    413: "UPLOAD_TOO_LARGE",
-    429: "QUOTA_EXCEEDED",
-    500: "UPLOAD_FAILED",
-    502: "UPLOAD_FAILED",
-    503: "UPLOAD_UNAVAILABLE",
-}
+_UPLOAD_ERROR_CODES = UPLOAD_ERROR_CODES
 
 
 def _upload_error_envelope(exc: HTTPException) -> JSONResponse:
