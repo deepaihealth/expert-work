@@ -32,6 +32,7 @@ from orchestrator.multimodal import (
     ResolvedImage,
     image_ref_block,
     is_cacheable_image_ref,
+    parse_rendered_figure_ref,
     resolve_message_images,
     split_human_content,
 )
@@ -402,6 +403,37 @@ def test_is_cacheable_image_ref_true_for_a_rendered_page_under_an_agent_scope() 
     t, u = uuid4(), uuid4()
     ref = f"expert_work://workspace/{t}/{u}/agents/pf-probe-33086dc0/{_rendered_rel()}"
     assert is_cacheable_image_ref(ref) is True
+
+
+_CONV_PREFIX = "agents/pf-probe-33086dc0/threads/11111111-2222-3333-4444-555555555555/work"
+
+
+def test_a_rendered_page_in_a_conversation_dir_is_recognised() -> None:
+    """B-262 —— 对话视图的渲染页落在 ``agents/<k>/threads/<conv>/work/.tool_results/…``:
+    再剥 ``threads/<uuid>/work`` 三段之后比形状;页号照样读得出来。"""
+    t, u = uuid4(), uuid4()
+    ref = f"expert_work://workspace/{t}/{u}/{_CONV_PREFIX}/{_rendered_rel()}"
+    assert is_cacheable_image_ref(ref) is True
+    parsed = parse_rendered_figure_ref(ref)
+    assert parsed is not None and (parsed.unit, parsed.page) == (3, 3)
+
+
+@pytest.mark.parametrize(
+    "prefix",
+    [
+        # 只认 ``threads/<规范 uuid>/work`` 这一种形状
+        "agents/pf-probe-33086dc0/threads/not-a-uuid/work",
+        "agents/pf-probe-33086dc0/threads/11111111-2222-3333-4444-555555555555/other",
+        "agents/pf-probe-33086dc0/x/11111111-2222-3333-4444-555555555555/work",
+        # 没绑 agent 的 ref 不剥这三段
+        "threads/11111111-2222-3333-4444-555555555555/work",
+    ],
+)
+def test_only_the_conversation_work_shape_is_stripped(prefix: str) -> None:
+    t, u = uuid4(), uuid4()
+    ref = f"expert_work://workspace/{t}/{u}/{prefix}/{_rendered_rel()}"
+    assert is_cacheable_image_ref(ref) is False
+    assert parse_rendered_figure_ref(ref) is None
 
 
 def test_is_cacheable_image_ref_false_for_an_ordinary_file_under_an_agent_scope() -> None:

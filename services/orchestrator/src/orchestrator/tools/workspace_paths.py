@@ -138,10 +138,11 @@ THREADS_DIR = "threads"
 #: 免得模型自己写的 ``PLAN.md`` / ``MEMORY.md`` 被每轮结束时的投影覆盖。
 CONVERSATION_WORK_DIR = "work"
 
-#: B-236 —— 对话视图里**仍在 agent 根**、读写 bind 进 ``/workspace`` 的平台目录。与
+#: B-236 —— 平台目录:上传件、本轮注入变量与预拉缓存、超长工具结果与渲染页。与
 #: ``exec_view.EXEC_VIEW_SCRIPT`` 内嵌 python 里的 ``PLATFORM_DIRS`` 是同一组
-#: (``test_exec_view`` 钉两边相等):平台发给模型的 ``uploads/<名>`` /
-#: ``inputs/<run>/…`` / ``.tool_results/<run>/…`` 在任何对话里都照常可读。
+#: (``test_exec_view`` 钉两边相等)。B-262 起对话视图里它们是本对话 ``work/`` 下的普通子目录,
+#: agent 根下的同名目录(老视图的对话还在用)在 ``/agent`` 里被盖住;平台发给模型的
+#: ``uploads/<名>`` / ``inputs/<run>/…`` / ``.tool_results/<run>/…`` 写法不变。
 PLATFORM_DIRS: tuple[str, ...] = (
     WORKSPACE_UPLOADS_DIR,
     WORKSPACE_INPUTS_DIR,
@@ -160,7 +161,7 @@ AGENT_ROOT_RESERVED = frozenset(
 #: (``file_ops``),对话第一次 run 开场时读一次(``graph_builder.agent_notes``)。
 AGENT_NOTES_FILE = "AGENT_NOTES.md"
 
-ResolvedKind = Literal["conversation", "agent", "platform", "shared", "legacy"]
+ResolvedKind = Literal["conversation", "agent", "shared", "legacy"]
 
 
 @dataclass(frozen=True)
@@ -281,8 +282,8 @@ def resolve_workspace_path(path: str, *, view: WorkspaceView, tool: str) -> Reso
     * ``/agent`` / ``/agent/x`` —— agent 根(所有对话共用);``threads`` / ``agents`` /
       ``shared`` 开头拒。老写法 ``/workspace/agents/<自己>/x`` 一直指 agent 根,同此。
     * ``/workspace/x`` 或相对 ``x``:老视图 —— agent 根,与 B-236 之前逐字相同;对话视图 ——
-      首段是平台目录(``uploads`` / ``inputs`` / ``.tool_results``)走 agent 根,其余是本对话
-      自己的目录(开场复制进来的基础目录副本也在这里)。
+      本对话自己的目录(开场复制进来的基础目录副本、B-262 起的平台目录也在这里)。对话视图里
+      ``/agent/<平台目录>/…`` 拒(exec 视图里那三个目录被盖住)。
     """
     raw = path.strip()
     if not raw:
@@ -328,11 +329,17 @@ def resolve_workspace_path(path: str, *, view: WorkspaceView, tool: str) -> Reso
         own = str(view.own_thread) if view.own_thread is not None else None
         _reject_reserved_head(parts, raw=path, tool=tool, agent_view=agent_view, own_thread=own)
     if agent_view:
+        if view.per_conversation and head in PLATFORM_DIRS:
+            # B-262 —— 与 exec 视图同一张挂载表:对话视图里 agent 根的平台目录被盖住(那是
+            # 老视图对话的件),本对话的在 ``/workspace`` 下同样的位置。
+            msg = (
+                f"{tool}: /agent/{head}/ is not part of this conversation's view; "
+                f"this conversation's {head}/ is /workspace/{head}/: {path!r}"
+            )
+            raise ValueError(msg)
         return ResolvedPath(ws=AGENT_VIEW, rel=rel, kind="agent", path=_agent_spelling(rel))
     if not view.per_conversation:
         return ResolvedPath(ws=EXEC_VIEW, rel=rel, kind="legacy", path=rel)
-    if head in PLATFORM_DIRS:
-        return ResolvedPath(ws=AGENT_VIEW, rel=rel, kind="platform", path=rel)
     return ResolvedPath(ws=EXEC_VIEW, rel=rel, kind="conversation", path=rel)
 
 
@@ -344,8 +351,8 @@ def agent_relative(target: ResolvedPath, view: WorkspaceView) -> str:
     """``target`` 相对 **agent 根**(``/agent``)的写法 —— 产物登记、渲染页落点与宿主侧
     查找都按这个物理位置算,不随模型用的是哪种写法变。
 
-    对话目录里的 ``x`` 是 ``threads/<conv>/work/x``;其余(agent 根、平台目录、老视图)本来
-    就相对 agent 根。共享区不在 agent 根下,没有这种写法。
+    对话目录里的 ``x`` 是 ``threads/<conv>/work/x``;其余(agent 根、老视图)本来就相对
+    agent 根。共享区不在 agent 根下,没有这种写法。
     """
     if target.kind == "shared":
         msg = "the shared area is not under the agent root"
@@ -354,3 +361,14 @@ def agent_relative(target: ResolvedPath, view: WorkspaceView) -> str:
         return target.rel
     base = f"{THREADS_DIR}/{view.conv_id}/{CONVERSATION_WORK_DIR}"
     return base if target.rel == "." else f"{base}/{target.rel}"
+
+
+def conversation_work_prefix(view: WorkspaceView) -> str:
+    """B-262 —— 平台自己往本对话 ``/workspace`` 写东西(注入变量、超长工具结果、渲染页)时,
+    在 ``/agent`` 视图里要加的前缀:对话视图是 ``threads/<conv>/work/``(``/agent/threads/``
+    下只留本对话那一格,它就是 ``/workspace``),老视图 / 没绑 agent 是空串(``/agent`` 与
+    ``/workspace`` 是同一个目录)。子代的 ``conv_id`` 是根对话的,写进的就是父的目录。
+    """
+    if not view.per_conversation:
+        return ""
+    return f"{THREADS_DIR}/{view.conv_id}/{CONVERSATION_WORK_DIR}/"

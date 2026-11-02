@@ -183,6 +183,39 @@ async def test_shared_tool_results_are_never_touched(tmp_path: Path, user_root: 
     assert (d / "PLAN.md").exists()
 
 
+async def test_tool_results_in_a_conversations_work_dir_are_swept(
+    tmp_path: Path, user_root: Path
+) -> None:
+    """B-262 P1 —— 对话视图的超长结果 / 渲染页在 ``threads/<conv>/work/.tool_results/<run>/``:
+    同一套规矩(行不在 + 过宽限期才删,行在的不动)。长期对话不清会一直涨。"""
+    conv, gone, kept = uuid4(), uuid4(), uuid4()
+    base = f"agents/{_KEY}/threads/{conv}/work/.tool_results"
+    orphan = _seed(user_root, f"{base}/{gone}")
+    live = _seed(user_root, f"{base}/{kept}")
+    store = InMemoryRunStore()
+    await store.create(_run(kept, conv))
+
+    removed = await sweep_orphan_tool_results(str(tmp_path), store)
+
+    assert removed == 1
+    assert not orphan.exists() and live.exists()
+
+
+async def test_a_symlinked_conversation_work_dir_is_not_followed(
+    tmp_path: Path, user_root: Path
+) -> None:
+    """``work`` 被换成软链(载荷写得进本对话那一格):不跟过去删。"""
+    victim = _seed(tmp_path / "victim", f".tool_results/{uuid4()}")
+    conv = user_root / "agents" / _KEY / "threads" / str(uuid4())
+    conv.mkdir(parents=True)
+    (conv / "work").symlink_to(tmp_path / "victim")
+
+    removed = await sweep_orphan_tool_results(str(tmp_path), InMemoryRunStore())
+
+    assert removed == 0
+    assert victim.exists()
+
+
 async def test_legacy_tool_results_at_the_user_root_are_swept(
     tmp_path: Path, user_root: Path
 ) -> None:

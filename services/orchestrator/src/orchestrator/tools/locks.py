@@ -155,11 +155,11 @@ def write_lock_conversation(view: WorkspaceView) -> UUID | None:
 def write_lock_agent_area(target: ResolvedPath, view: WorkspaceView) -> str | None:
     """write_file / edit_file 的目标在 agent 各对话共用的那棵树里时,返回要多锁的 agent key。
 
-    ``agent``(``/agent/…``)、``platform``(新视图里的 ``uploads/`` 等,在 agent 根下)、
-    ``legacy``(老视图的 ``/workspace`` 就是 agent 根)都算;``conversation``(本对话自己的
-    ``work/``)不算。没绑 agent 时老视图是整个用户根,已由按用户的键挡住 → ``None``。
+    ``agent``(``/agent/…``)、``legacy``(老视图的 ``/workspace`` 就是 agent 根)都算;
+    ``conversation``(本对话自己的 ``work/``,B-262 起含 ``uploads/`` 等平台目录)不算。没绑
+    agent 时老视图是整个用户根,已由按用户的键挡住 → ``None``。
     """
-    if not view.agent_key or target.kind not in ("agent", "platform", "legacy"):
+    if not view.agent_key or target.kind not in ("agent", "legacy"):
         return None
     return view.agent_key
 

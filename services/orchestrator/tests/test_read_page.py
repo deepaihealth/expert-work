@@ -14,7 +14,7 @@ import zipfile
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import pytest
 
@@ -2801,3 +2801,121 @@ def test_validate_rendered_rel_under_requires_the_prefix_as_a_directory() -> Non
     under = ".tool_results/r1/figures/abc"
     assert _validate_rendered_rel(f"{under}/x/_u1/page-1.jpg", under=under) is not None
     assert _validate_rendered_rel(".tool_results/r1/figures/abcd/x/page-1.jpg", under=under) is None
+
+
+# ---------------------------------------------------------------------------
+# B-262 —— 对话视图里渲染页落本对话的 ``work/.tool_results/``(agent 根那一份在 exec 视图里被
+# 盖住);ref 带 ``agents/<k>/threads/<conv>/work/`` 前缀,仍认得出是渲染页、仍可缓存。
+# ---------------------------------------------------------------------------
+
+_B262_KEY = "pf-probe-33086dc0"
+_B262_CONV = UUID("55555555-5555-5555-5555-555555555555")
+
+
+def _conv_ctx(**extra: Any) -> ToolContext:
+    return ToolContext(
+        tenant_id=uuid4(),
+        run_id=uuid4(),
+        user_id=uuid4(),
+        thread_id=extra.pop("thread_id", _B262_CONV),
+        agent_key=_B262_KEY,
+        workspace_layout=extra.pop("workspace_layout", "conversation"),
+        **extra,
+    )
+
+
+def _canned_one_page() -> _CannedRuntime:
+    return _CannedRuntime(
+        SandboxOutcome(
+            stdout=json.dumps(
+                {
+                    "ok": True,
+                    "rendered": [
+                        {"unit": 3, "rel": ".tool_results/r1/figures/abc/s/_u3/page-3.jpg"}
+                    ],
+                }
+            ),
+            stderr="",
+            exit_code=0,
+            timed_out=False,
+        )
+    )
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("child", [False, True], ids=["conversation", "child-of-conversation"])
+async def test_conversation_view_renders_into_its_own_tool_results(child: bool) -> None:
+    ctx = _conv_ctx(thread_id=uuid4(), workspace_thread_id=_B262_CONV) if child else _conv_ctx()
+    runtime = _canned_one_page()
+    result = await ReadPageTool(client=runtime, figure_delivery="inline").call(
+        {"path": "uploads/d.pptx", "units": [3]}, ctx=ctx
+    )
+    params = _snippet_params(runtime.execs[0][1])
+    base = f"threads/{_B262_CONV}/work/"
+    assert params["ws"] == "/agent"
+    assert params["rel"] == f"{base}uploads/d.pptx"
+    assert str(params["out_rel"]).startswith(f"{base}.tool_results/{ctx.run_id}/figures/")
+    (ref,) = result.state_updates["viewed_figures"]
+    assert f"/agents/{_B262_KEY}/{base}.tool_results/{ctx.run_id}/figures/" in ref
+
+
+@pytest.mark.anyio
+async def test_legacy_view_still_renders_into_the_agent_root() -> None:
+    runtime = _canned_one_page()
+    ctx = _conv_ctx(workspace_layout="agent_root")
+    await ReadPageTool(client=runtime, figure_delivery="inline").call(
+        {"path": "uploads/d.pptx", "units": [3]}, ctx=ctx
+    )
+    params = _snippet_params(runtime.execs[0][1])
+    assert params["rel"] == "uploads/d.pptx"
+    assert str(params["out_rel"]).startswith(f".tool_results/{ctx.run_id}/figures/")
+
+
+@pytest.mark.anyio
+async def test_a_page_outside_this_calls_conversation_dir_is_rejected() -> None:
+    """被篡改的回包把别的对话的页(或 agent 根的页)塞回来:不进 ``viewed_figures``。"""
+    other = UUID("66666666-6666-6666-6666-666666666666")
+    ctx = _conv_ctx()
+    for forged in (
+        f"threads/{other}/work/.tool_results/{ctx.run_id}/figures/abc/s/_u3/page-3.jpg",
+        f".tool_results/{ctx.run_id}/figures/abc/s/_u3/page-3.jpg",
+    ):
+        runtime = RecordingSandboxRuntime(
+            SandboxOutcome(
+                stdout=json.dumps({"ok": True, "rendered": [{"unit": 3, "rel": forged}]}),
+                stderr="",
+                exit_code=0,
+                timed_out=False,
+            )
+        )
+        result = await ReadPageTool(client=runtime, figure_delivery="inline").call(
+            {"path": "d.pptx", "units": [3]}, ctx=ctx
+        )
+        assert not result.state_updates.get("viewed_figures"), forged
+
+
+@pytest.mark.anyio
+async def test_a_real_conversation_view_ref_is_recognised_end_to_end(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """同 :func:`test_a_real_read_page_ref_is_recognised_end_to_end`,对话视图那一档:out_rel
+    取自宿主真跑,尾巴取自片段真跑(``ws`` 是 agent 根),拼成的 ref 判得出是渲染页。"""
+    from orchestrator.multimodal import parse_rendered_figure_ref
+    from orchestrator.tools.figure_lookup import figure_run_ids
+    from orchestrator.tools.read_page import figure_scope
+
+    _install_office_stubs(tmp_path, monkeypatch)
+    work = tmp_path / "threads" / str(_B262_CONV) / "work"
+    work.mkdir(parents=True)
+    (work / "d.pptx").write_text("source")
+    ctx = _conv_ctx()
+    out_rel = await _real_out_rel(ctx=ctx)
+    env = _run_render(tmp_path, f"threads/{_B262_CONV}/work/d.pptx", units=[3], out_rel=out_rel)
+    assert env["ok"] is True
+    rel = env["rendered"][0]["rel"]
+    scoped = scoped_path(figure_scope(ctx.workspace_view), rel)
+    ref = workspace_figure_ref(uuid4(), uuid4(), scoped)
+    assert is_cacheable_image_ref(ref) is True
+    parsed = parse_rendered_figure_ref(ref)
+    assert parsed is not None and parsed.unit == 3
+    assert figure_run_ids([ref]) == {ctx.run_id}

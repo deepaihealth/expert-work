@@ -21,6 +21,7 @@ import logging
 import re
 import zipfile
 from dataclasses import dataclass
+from pathlib import PurePosixPath
 from typing import Annotated, Final
 from uuid import UUID, uuid4
 
@@ -35,7 +36,12 @@ from control_plane.api._user_scope import (
     get_user_repo,
     resolve_caller_user_id,
 )
-from control_plane.api._workspace_shared import thread_agent_key, workspace_agent_path
+from control_plane.api._workspace_shared import (
+    conversation_workspace_path,
+    thread_agent_key,
+    thread_conversation_id,
+    thread_workspace_path,
+)
 from control_plane.audit import emit as audit_emit
 from control_plane.quota.base import QuotaService
 from control_plane.settings import Settings
@@ -43,7 +49,7 @@ from expert_work.common.observability import current_trace_id_hex
 from expert_work.persistence import WORKSPACE_UPLOADS_DIR
 from expert_work.persistence.image_upload import ImageUploadStore
 from expert_work.persistence.tenant_user import TenantUserStore
-from expert_work.protocol import AuditAction, AuditResult, QuotaDimension
+from expert_work.protocol import AuditAction, AuditResult, QuotaDimension, ThreadMeta
 from expert_work.protocol.multimodal import ImageRef
 from expert_work.runtime.audit.logger import AuditLogger
 from expert_work.runtime.storage import ObjectStore
@@ -123,7 +129,7 @@ def _tagged_name(workspace_path: str, ext: str, tag: str) -> str:
     """``uploads/report.pdf`` + ``3f9a1c2b`` → ``uploads/report-3f9a1c2b.pdf``(B-262)。
 
     后缀只含 ``[0-9a-f]`` 与 ``-``,结果仍是 :func:`is_safe_document_upload_id` 认的形状。"""
-    return f"{workspace_path[: -len(ext)]}-{tag}{ext}"
+    return f"{workspace_path[: len(workspace_path) - len(ext)]}-{tag}{ext}"
 
 
 async def _same_bytes(
@@ -150,6 +156,7 @@ async def _land_document_bytes(
     tenant_id: UUID,
     user_id: UUID,
     agent_key: str,
+    conv_id: UUID | None,
     workspace_path: str,
     ext: str,
     raw: bytes,
@@ -157,8 +164,9 @@ async def _land_document_bytes(
 ) -> tuple[str, bool]:
     """B-262 —— 把上传落到一个**不覆盖任何已有文件**的名字上,回 ``(实际名字, 是否复用)``。
 
-    同一智能体的所有对话共用 ``uploads/``(对接方一个用户下跑很多终端客户),原来同名
-    上传直接覆盖 —— 客户 B 的 ``report.pdf`` 顶掉客户 A 的。现在按顺序试:原名 →
+    老视图里同一智能体的所有对话共用 ``uploads/``(对接方一个用户下跑很多终端客户),原来同名
+    上传直接覆盖 —— 客户 B 的 ``report.pdf`` 顶掉客户 A 的。P1 起对话视图的会话落本对话自己的
+    ``uploads/``(``conv_id``),同一对话里的同名规则不变。现在按顺序试:原名 →
     ``<原名>-<内容 sha256 前 8 位>`` → 几个随机后缀。每个名字都用 ``create_file``(不存在
     才建,原子),所以两个同名上传同时到也只有一个拿到原名。名字被占时比一下内容:
     逐字节相同就复用那个文件(同一份资料重复上传,不多存一份、不重复记配额)。
@@ -168,7 +176,7 @@ async def _land_document_bytes(
         _tagged_name(workspace_path, ext, uuid4().hex[:12]) for _ in range(_RANDOM_NAME_ATTEMPTS)
     ]
     for candidate in candidates:
-        stored = workspace_agent_path(candidate, agent_key=agent_key)
+        stored = conversation_workspace_path(candidate, agent_key=agent_key, conv_id=conv_id)
         try:
             await workspace_store.create_file(
                 tenant_id=tenant_id, user_id=user_id, path=stored, data=raw
@@ -182,6 +190,41 @@ async def _land_document_bytes(
         return candidate, False
     msg = f"no free upload name for {workspace_path!r}"
     raise SandboxSupervisorError(msg)
+
+
+async def copy_document_into_thread(
+    workspace_store: WorkspaceStore,
+    *,
+    tenant_id: UUID,
+    user_id: UUID,
+    ref: str,
+    source: ThreadMeta,
+    target: ThreadMeta,
+) -> str:
+    """B-262 P1 §3 —— 会话 ``source`` 的上传 ``ref``(``uploads/<名字>``)挂到会话 ``target``
+    的 run 上:复制进 ``target`` 自己的 ``uploads/``,回实际落地的名字(同 P0 的同名规则:同内容
+    复用、不同内容加 ``-<sha8>``)。两条会话的那个位置本来就是同一个文件(都是同一 agent 的老
+    视图)时不复制,原样回 ``ref``。
+
+    源按 ``source`` 自己的 agent 与布局定位,不按 ``target`` 的目录找同名文件。读写失败原样抛
+    (``SandboxSupervisorError`` 族),由调用方翻成对外错误。
+    """
+    source_path = thread_workspace_path(ref, source)
+    if source_path == thread_workspace_path(ref, target):
+        return ref
+    raw = await workspace_store.read_file(tenant_id=tenant_id, user_id=user_id, path=source_path)
+    landed, _reused = await _land_document_bytes(
+        workspace_store,
+        tenant_id=tenant_id,
+        user_id=user_id,
+        agent_key=thread_agent_key(target),
+        conv_id=thread_conversation_id(target),
+        workspace_path=ref,
+        ext=PurePosixPath(ref).suffix,
+        raw=raw,
+        sha256_hex=hashlib.sha256(raw).hexdigest(),
+    )
+    return landed
 
 
 def is_safe_document_upload_id(value: str) -> bool:
@@ -259,6 +302,7 @@ async def _handle_document_upload(
     caller_user_id: UUID | None,
     thread_id: UUID,
     agent_key: str,
+    conv_id: UUID | None,
     settings: Settings,
     workspace_store: WorkspaceStore | None,
     audit: AuditLogger,
@@ -313,9 +357,10 @@ async def _handle_document_upload(
                 detail="workspace is full — delete files to free space",
             ) from exc
 
-    # ``workspace_path`` 是**对 agent 相对**的 ``uploads/<name>``——它同时是
-    # 回给调用方的 ``upload_id``,也是 run 里 ``read_document`` 收到的参数,
-    # 两处都在 agent 根下解析(PR3),所以这个值不带前缀。
+    # ``workspace_path`` 是**对会话 ``/workspace`` 相对**的 ``uploads/<name>``——它同时是
+    # 回给调用方的 ``upload_id``,也是 run 里 ``read_document`` 收到的参数,两处都相对
+    # 这个会话的 ``/workspace`` 解析(老视图是 agent 根,B-262 起对话视图是本对话的
+    # ``work/``,由 ``conv_id`` 决定),所以这个值不带前缀。
     #
     # 落盘要投影:``workspace_store`` 是按 ``(tenant, user)`` 开的,不知道
     # agent。不投影的话新上传永远落扁平根,而 run 去 agent 根下找——今天靠
@@ -330,6 +375,7 @@ async def _handle_document_upload(
             tenant_id=tenant_id,
             user_id=caller_user_id,
             agent_key=agent_key,
+            conv_id=conv_id,
             workspace_path=_safe_workspace_name(filename, ext),
             ext=ext,
             raw=raw,
@@ -625,6 +671,7 @@ def build_uploads_router() -> APIRouter:
                 caller_user_id=caller_user_id,
                 thread_id=thread_id,
                 agent_key=thread_agent_key(meta),
+                conv_id=thread_conversation_id(meta),
                 settings=settings,
                 workspace_store=workspace_store,
                 audit=audit,

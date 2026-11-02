@@ -37,7 +37,8 @@ WORKSPACE_SKILLS_DIR = "skills"
 WORKSPACE_UPLOADS_DIR = "uploads"
 
 #: 注入变量的落点(B-61):``inputs/<run_id>/inputs.json`` 是本轮声明变量的文档,
-#: ``inputs/cache/<sha256(url)[:32]><ext>`` 是按 agent 共享的内容寻址预拉缓存。
+#: ``inputs/cache/<sha256(url)[:32]><ext>`` 是内容寻址的预拉缓存(B-262 起对话视图里在本对话
+#: ``threads/<conv>/work/inputs/`` 下,按对话;老视图仍在 agent 根)。
 #:
 #: 两者都是**平台自己派生的机械产物**,不是 agent 产出:文档由 run 启动时的 inputs
 #: 节点写,缓存条目是平台代模型下载的副本(重下即得)。所以它和 ``uploads`` /

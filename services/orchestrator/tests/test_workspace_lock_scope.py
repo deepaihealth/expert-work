@@ -176,7 +176,7 @@ _FILE_TOOLS = ("write_file", "edit_file")
 
 
 @pytest.mark.parametrize("name", _FILE_TOOLS)
-@pytest.mark.parametrize("path", ["/agent/AGENT_NOTES.md", "/agent/templates/a.md", "uploads/a.md"])
+@pytest.mark.parametrize("path", ["/agent/AGENT_NOTES.md", "/agent/templates/a.md"])
 async def test_new_layout_file_write_into_the_agent_area_adds_the_agent_key(
     name: str, path: str
 ) -> None:
@@ -188,7 +188,8 @@ async def test_new_layout_file_write_into_the_agent_area_adds_the_agent_key(
 
 
 @pytest.mark.parametrize("name", _FILE_TOOLS)
-@pytest.mark.parametrize("path", ["a.md", "/workspace/out/a.md"])
+# B-262 —— ``uploads/`` 等平台目录在对话视图里是本对话自己的,不再在 agent 根下。
+@pytest.mark.parametrize("path", ["a.md", "/workspace/out/a.md", "uploads/a.md"])
 async def test_new_layout_file_write_into_its_own_workspace_takes_no_agent_key(
     name: str, path: str
 ) -> None:

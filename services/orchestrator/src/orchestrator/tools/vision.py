@@ -24,6 +24,7 @@ import time
 import weakref
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
+from pathlib import PurePosixPath
 from typing import TYPE_CHECKING, Any, Literal, Protocol
 from uuid import UUID
 
@@ -31,8 +32,10 @@ from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, System
 
 from expert_work.common.observability import ExpertWorkComponent, expert_work_span
 from expert_work.common.observability.metrics import expert_work_counter
+from expert_work.persistence import WORKSPACE_OVERFLOW_DIR
 from expert_work.protocol.multimodal import (
     WORKSPACE_REF_PREFIX,
+    WorkspaceImageRef,
     parse_image_ref,
     parse_workspace_image_ref,
 )
@@ -293,6 +296,7 @@ class AskImageTool:
             msg = "ask_image image_ref tenant does not match the run tenant"
             raise ToolBlockedError(msg)
         if ref_str.startswith(WORKSPACE_REF_PREFIX):
+            _refuse_another_conversations_run(parse_workspace_image_ref(ref_str), ctx)
             await self._require_readable_workspace_image(ref_str)
         # Round-trip the image through the VL model. The provider adapter
         # resolves the ``image_ref`` content block to bytes via the same
@@ -729,6 +733,26 @@ def _refuse_other_conversation(rel: str, ctx: ToolContext) -> None:
         if own is None or parts[3] != str(own):
             msg = "ask_image image_ref points into another conversation's directory"
             raise ToolBlockedError(msg)
+
+
+def _refuse_another_conversations_run(ref: WorkspaceImageRef, ctx: ToolContext) -> None:
+    """B-262 —— ref 落在 agent 根(没绑 agent 时是用户根)的 ``.tool_results/<run>/`` 下时,
+    ``<run>`` 必须是本对话的:``ctx.figure_run_ids``(本对话渲染过页的 run,子代含父链)或本 run。
+
+    那一层是同一 agent 各对话共用的(老视图对话的渲染页、超长结果都在那里),模型手写的 ref
+    原来能读到别的对话渲的页。本对话 ``threads/<conv>/work/`` 下的由
+    :func:`_refuse_other_conversation` 管,这里不碰。"""
+    parts = PurePosixPath(ref.rel).parts[2 if ref.agent_key is not None else 0 :]
+    if not parts or parts[0] != WORKSPACE_OVERFLOW_DIR:
+        return
+    own = set(ctx.figure_run_ids) | ({ctx.run_id} if ctx.run_id is not None else set())
+    try:
+        run = UUID(parts[1]) if len(parts) > 1 else None
+    except ValueError:
+        run = None
+    if run is None or run not in own:
+        msg = "ask_image image_ref points into another conversation's tool results"
+        raise ToolBlockedError(msg)
 
 
 def _given(args: Mapping[str, Any], key: str) -> bool:

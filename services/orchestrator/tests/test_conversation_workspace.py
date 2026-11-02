@@ -139,9 +139,10 @@ _CONV_TABLE: list[tuple[str, str, str, ResolvedKind]] = [
     ("/agent/style/a.md", AGENT_VIEW, "style/a.md", "agent"),
     ("/agent", AGENT_VIEW, ".", "agent"),
     (f"/workspace/agents/{_KEY}/style/a.md", AGENT_VIEW, "style/a.md", "agent"),
-    ("./uploads/a.pdf", AGENT_VIEW, "uploads/a.pdf", "platform"),
-    ("inputs/r/inputs.json", AGENT_VIEW, "inputs/r/inputs.json", "platform"),
-    ("/workspace/.tool_results/r/x.txt", AGENT_VIEW, ".tool_results/r/x.txt", "platform"),
+    # B-262 —— 平台目录是本对话自己的,与普通相对路径同一档。
+    ("./uploads/a.pdf", EXEC_VIEW, "uploads/a.pdf", "conversation"),
+    ("inputs/r/inputs.json", EXEC_VIEW, "inputs/r/inputs.json", "conversation"),
+    ("/workspace/.tool_results/r/x.txt", EXEC_VIEW, ".tool_results/r/x.txt", "conversation"),
     ("shared:legacy.md", f"{EXEC_VIEW}/shared", "legacy.md", "shared"),
 ]
 
@@ -160,6 +161,7 @@ def test_conversation_view_resolution(raw: str, ws: str, rel: str, kind: Resolve
         (f"threads/{_C1}/PLAN.md", EXEC_VIEW, f"threads/{_C1}/PLAN.md", "legacy"),
         ("/agent/style/a.md", AGENT_VIEW, "style/a.md", "agent"),
         (f"/workspace/agents/{_KEY}/a.md", AGENT_VIEW, "a.md", "agent"),
+        ("/agent/uploads/a.pdf", AGENT_VIEW, "uploads/a.pdf", "agent"),
     ],
 )
 def test_legacy_view_resolution_is_the_agent_root(
@@ -197,6 +199,16 @@ def test_resolver_rejects(raw: str, view: WorkspaceView) -> None:
         resolve_workspace_path(raw, view=view, tool="read_file")
 
 
+@pytest.mark.parametrize(
+    "raw", ["/agent/uploads/a.pdf", "/agent/inputs/r/inputs.json", "/agent/.tool_results/r/x"]
+)
+def test_conversation_view_rejects_the_agent_root_platform_dirs(raw: str) -> None:
+    """B-262 —— 对话视图里 ``/agent`` 下的三个平台目录被盖住(那是老视图对话的件),
+    文件工具同样不许寻址;报错指向本对话自己的那一份。"""
+    with pytest.raises(ValueError, match="/workspace/"):
+        resolve_workspace_path(raw, view=_CONV1, tool="read_file")
+
+
 def test_agent_relative_puts_conversation_files_under_their_work_dir() -> None:
     target = resolve_workspace_path("out/r.md", view=_CONV1, tool="save_artifact")
     assert agent_relative(target, _CONV1) == f"threads/{_C1}/work/out/r.md"
@@ -216,11 +228,14 @@ def test_view_is_legacy_unless_the_layout_is_conversation() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_conversation_scope_is_the_work_dir_and_platform_dirs_point_at_the_agent_root() -> None:
+def test_conversation_scope_is_the_work_dir_platform_dirs_included() -> None:
     scope = conversation_scope(_KEY, _C1)
-    assert scoped_path(scope, "a/b.md") == f"agents/{_KEY}/threads/{_C1}/work/a/b.md"
-    assert scoped_path(scope, ".tool_results/r/p.jpg") == f"agents/{_KEY}/.tool_results/r/p.jpg"
-    assert scoped_path(scope, "uploads/x.pdf") == f"agents/{_KEY}/uploads/x.pdf"
+    work = f"agents/{_KEY}/threads/{_C1}/work"
+    assert scoped_path(scope, "a/b.md") == f"{work}/a/b.md"
+    # B-262 —— 平台目录不再改指 agent 根。
+    assert scoped_path(scope, ".tool_results/r/p.jpg") == f"{work}/.tool_results/r/p.jpg"
+    assert scoped_path(scope, "uploads/x.pdf") == f"{work}/uploads/x.pdf"
+    assert scoped_path(scope, "inputs/r/inputs.json") == f"{work}/inputs/r/inputs.json"
 
 
 _CX = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
@@ -237,9 +252,24 @@ def test_agent_shared_scope_never_addresses_threads() -> None:
         scoped_path(agent_shared_scope(_KEY), f"threads/{_C2}/work/secret.md")
 
 
+@pytest.mark.parametrize("head", ["uploads", "inputs", ".tool_results"])
+def test_agent_scope_seen_from_a_conversation_hides_the_platform_dirs(head: str) -> None:
+    """B-262 —— 对话视图的 ``/agent`` 与 exec 同一张挂载表:agent 根的平台目录被盖住。老视图
+    (同一个 agent 根作用域,不带对话)照旧能寻址。"""
+    from_conversation = agent_shared_scope(_KEY, _C1, conversation=True)
+    with pytest.raises(WorkspacePathEscapeError):
+        scoped_path(from_conversation, f"{head}/x")
+    assert scoped_path(from_conversation, f"threads/{_C1}/PLAN.md") == (
+        f"agents/{_KEY}/threads/{_C1}/PLAN.md"
+    )
+    assert scoped_path(agent_shared_scope(_KEY, _C1), f"{head}/x") == f"agents/{_KEY}/{head}/x"
+
+
 def test_store_scope_maps_both_views() -> None:
     assert store_scope(EXEC_VIEW, agent_key=_KEY, conv_id=_C1) == conversation_scope(_KEY, _C1)
-    assert store_scope(AGENT_VIEW, agent_key=_KEY, conv_id=_C1) == agent_shared_scope(_KEY, _C1)
+    assert store_scope(AGENT_VIEW, agent_key=_KEY, conv_id=_C1) == agent_shared_scope(
+        _KEY, _C1, conversation=True
+    )
     # 老视图的 /workspace 与 /agent 是同一个 agent 根,threads/ 只留本线程那一格
     assert store_scope(EXEC_VIEW, agent_key=_KEY, thread_id=_C2) == agent_shared_scope(_KEY, _C2)
     assert store_scope(AGENT_VIEW, agent_key=_KEY) == agent_shared_scope(_KEY)
@@ -350,15 +380,41 @@ async def test_a_new_conversation_lists_and_searches_an_empty_workspace(tmp_path
     assert found.meta["paths"] == ["/agent/style/anchor.md"]
 
 
-async def test_platform_paths_read_the_agent_root_from_a_conversation(tmp_path: Path) -> None:
-    """上传件、本轮 inputs.json、超长工具结果的回读路径都在 agent 根。"""
-    agent = _agent_root(tmp_path)
-    for rel in ("uploads/a.txt", "inputs/r1/inputs.json", ".tool_results/r1/out.txt"):
-        (agent / rel).parent.mkdir(parents=True, exist_ok=True)
-        (agent / rel).write_text(rel)
+_PLATFORM_FILES = ("uploads/a.txt", "inputs/r1/inputs.json", ".tool_results/r1/out.txt")
+
+
+async def test_platform_paths_read_this_conversations_own_copy(tmp_path: Path) -> None:
+    """B-262 —— 上传件、本轮 inputs.json、超长工具结果的回读路径在本对话的 ``work/`` 里;
+    agent 根那一份(老视图对话的)读不到。老视图仍读 agent 根。"""
+    agent, work = _agent_root(tmp_path), _work(tmp_path, _C1)
+    for base, tag in ((agent, "agent"), (work, "conversation")):
+        for rel in _PLATFORM_FILES:
+            (base / rel).parent.mkdir(parents=True, exist_ok=True)
+            (base / rel).write_text(f"{tag}:{rel}")
     read = ReadFileTool(store=NasWorkspaceStore(root=str(tmp_path)))
-    for rel in ("uploads/a.txt", "inputs/r1/inputs.json", ".tool_results/r1/out.txt"):
-        assert (await read.call({"path": rel}, ctx=_ctx(_C1))).content == rel
+    for rel in _PLATFORM_FILES:
+        assert (await read.call({"path": rel}, ctx=_ctx(_C1))).content == f"conversation:{rel}"
+        legacy = _ctx(_C1, layout="agent_root")
+        assert (await read.call({"path": rel}, ctx=legacy)).content == f"agent:{rel}"
+
+
+async def test_agent_root_platform_files_stay_out_of_a_conversations_listing_and_search(
+    tmp_path: Path,
+) -> None:
+    """B-262 —— 对话视图搜 ``/agent`` 时不进 agent 根的平台目录(别的对话的上传与渲染页)。"""
+    from orchestrator.tools import ListDirTool
+
+    agent = _agent_root(tmp_path)
+    for rel in ("uploads/needle.md", "inputs/r1/needle.md", ".tool_results/r1/needle.md"):
+        (agent / rel).parent.mkdir(parents=True, exist_ok=True)
+        (agent / rel).write_text("needle")
+    (agent / "style.md").write_text("needle")
+    store = NasWorkspaceStore(root=str(tmp_path))
+    found = await SearchFilesTool(store=store).call({"content": "needle"}, ctx=_ctx(_C1))
+    assert found.meta["paths"] == ["/agent/style.md"]
+    listing = await ListDirTool(store=store).call({"path": "/agent"}, ctx=_ctx(_C1))
+    names = {entry["name"] for entry in listing.meta["entries"]}
+    assert names.isdisjoint({"uploads", "inputs", ".tool_results"}), names
 
 
 async def test_save_artifact_registers_the_physical_location(tmp_path: Path) -> None:
@@ -407,11 +463,11 @@ def test_render_source_keys_documents_by_their_physical_location() -> None:
     assert rel1 == f"threads/{_C1}/work/d.pptx"
     assert rel2 == f"threads/{_C2}/work/d.pptx"
     assert legacy_rel == "d.pptx"
-    # 两个对话里同名的文档不共用渲染目录;上传件是同一份,共用。
+    # 两个对话里同名的文档不共用渲染目录;B-262 起上传件也是各对话自己的,同样不共用。
     assert len({sha1, sha2, legacy_sha}) == 3
     up1, up_rel = render_source("uploads/d.pptx", view=_CONV1)
     up2, _ = render_source("uploads/d.pptx", view=WorkspaceView(agent_key=_KEY, conv_id=_C2))
-    assert up1 == up2 and up_rel == "uploads/d.pptx"
+    assert up1 != up2 and up_rel == f"threads/{_C1}/work/uploads/d.pptx"
 
 
 # ---------------------------------------------------------------------------

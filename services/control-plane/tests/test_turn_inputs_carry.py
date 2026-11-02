@@ -21,6 +21,7 @@ from __future__ import annotations
 import ast
 import asyncio
 import json
+import re
 from collections.abc import AsyncIterator, Mapping, Sequence
 from contextlib import asynccontextmanager
 from copy import deepcopy
@@ -190,11 +191,22 @@ class _RecordingAuditStore(InMemoryAuditLogStore):
         return stamped
 
 
+def _written_rels(writer: RecordingSandboxRuntime) -> list[str]:
+    """写文件片段的 ``rel``(相对 ``/agent``,对话视图里带 ``threads/<conv>/work/`` 前缀)。"""
+    rels: list[str] = []
+    for _sandbox_id, code in writer.execs:
+        first = code.split("\n", 1)[0]
+        if first.startswith("_PARAMS = "):
+            rels.append(json.loads(ast.literal_eval(first.removeprefix("_PARAMS = ")))["rel"])
+    return rels
+
+
 def _written_docs(writer: RecordingSandboxRuntime) -> dict[str, dict[str, Any]]:
-    """``inputs`` 节点经沙箱写下的文件:相对路径 → 解析后的 JSON。
+    """``inputs`` 节点经沙箱写下的文件:``/workspace`` 相对路径 → 解析后的 JSON。
 
     写文件的代码片段首行是 ``_PARAMS = '<json>'``(``file_ops._snippet``),照原样解出来,
-    不去猜片段的其余部分。
+    不去猜片段的其余部分。B-262 —— 对话视图里写手按 ``/agent`` 寻址,``rel`` 带本对话的
+    ``threads/<conv>/work/`` 前缀(落点另由 :func:`_written_rels` 钉);这里剥掉它。
     """
     docs: dict[str, dict[str, Any]] = {}
     for _sandbox_id, code in writer.execs:
@@ -202,7 +214,8 @@ def _written_docs(writer: RecordingSandboxRuntime) -> dict[str, dict[str, Any]]:
         if not first.startswith("_PARAMS = "):
             continue
         params = json.loads(ast.literal_eval(first.removeprefix("_PARAMS = ")))
-        docs[params["rel"]] = json.loads(params["content"])
+        rel = re.sub(r"^threads/[0-9a-f-]{36}/work/", "", params["rel"])
+        docs[rel] = json.loads(params["content"])
     return docs
 
 
@@ -484,7 +497,7 @@ async def test_a_resumed_run_that_pauses_again_still_carries_the_turn_inputs() -
         _DONE,
     ]
     async with _stack(script, gated=frozenset({_WIRE})) as s:
-        _thread, r0 = await s.start(inputs=_INPUTS)
+        thread, r0 = await s.start(inputs=_INPUTS)
         assert await s.wait(r0) is RunStatus.PAUSED
         c1 = await s.decide(r0)
         assert await s.wait(c1) is RunStatus.PAUSED
@@ -497,6 +510,8 @@ async def test_a_resumed_run_that_pauses_again_still_carries_the_turn_inputs() -
         # B —— inputs.json 只在这一轮开头写过一次,写在 r0 名下;续跑段的沙箱指向它。
         docs = _written_docs(s.writer)
         assert list(docs) == [inputs_rel_path(r0)]
+        # B-262 —— 落在本对话自己的 ``work/inputs/`` 下(对话视图的会话)。
+        assert _written_rels(s.writer) == [f"threads/{thread}/work/{inputs_rel_path(r0)}"]
         assert docs[inputs_rel_path(r0)]["variables"][_VARIABLE]["value"] == _VALUE
         assert s.sandbox.exec_run_ids == [r0]
 

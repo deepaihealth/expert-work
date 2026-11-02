@@ -33,6 +33,10 @@ from expert_work.persistence import (
     RENDERED_FIGURE_UNIT_PREFIX,
     is_rendered_figure_rel,
 )
+from expert_work.persistence.workspace.layout import (
+    WORKSPACE_CONVERSATION_WORK_DIR,
+    WORKSPACE_THREADS_DIR,
+)
 from expert_work.protocol.multimodal import (
     IMAGE_REF_PREFIX,
     WORKSPACE_REF_PREFIX,
@@ -485,9 +489,37 @@ def is_cacheable_image_ref(ref: str) -> bool:
     if not ref.startswith(WORKSPACE_REF_PREFIX):
         return True
     parsed = parse_workspace_image_ref(ref)
-    skip = 2 if parsed.agent_key is not None else 0
-    tail = "/".join(PurePosixPath(parsed.rel).parts[skip:])
-    return is_rendered_figure_rel(tail)
+    return is_rendered_figure_rel("/".join(_figure_tail_parts(parsed)))
+
+
+#: B-262 —— 对话视图的渲染页落在本对话的 ``threads/<conv>/work/`` 下:``agents/<key>/`` 之后
+#: 再剥这三段(只认这一种形状,与 ``layout._head_after_container`` 同一口径)。
+_CONVERSATION_WORK_SEGMENTS = 3
+
+
+def _figure_tail_parts(parsed: WorkspaceImageRef) -> tuple[str, ...]:
+    """ref 的 ``rel`` 按**分段数**剥掉作用域前缀之后的部分:绑了 agent 剥 ``agents/<key>``
+    两段;其后是 ``threads/<uuid>/work`` 时再剥三段(B-262)。"""
+    parts = PurePosixPath(parsed.rel).parts
+    if parsed.agent_key is None:
+        return parts
+    parts = parts[2:]
+    head = parts[:_CONVERSATION_WORK_SEGMENTS]
+    if (
+        len(parts) > _CONVERSATION_WORK_SEGMENTS
+        and head[0] == WORKSPACE_THREADS_DIR
+        and _is_canonical_uuid(head[1])
+        and head[2] == WORKSPACE_CONVERSATION_WORK_DIR
+    ):
+        return parts[_CONVERSATION_WORK_SEGMENTS:]
+    return parts
+
+
+def _is_canonical_uuid(raw: str) -> bool:
+    try:
+        return str(UUID(raw)) == raw
+    except ValueError:
+        return False
 
 
 @dataclass(frozen=True)
@@ -527,8 +559,7 @@ def parse_rendered_figure_ref(ref: str) -> RenderedFigureRef | None:
         parsed = parse_workspace_image_ref(ref)
     except ValueError:
         return None
-    skip = 2 if parsed.agent_key is not None else 0
-    parts = PurePosixPath(parsed.rel).parts[skip:]
+    parts = _figure_tail_parts(parsed)
     if not is_rendered_figure_rel("/".join(parts)):
         return None
     # 形状已经过了上面那道正则,下面四段的位置与格式都是它保证的。

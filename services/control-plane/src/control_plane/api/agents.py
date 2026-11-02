@@ -61,7 +61,7 @@ from control_plane.api.runs import (
     check_run_inputs_bound,
     spawn_run,
 )
-from control_plane.api.uploads import is_safe_document_upload_id
+from control_plane.api.uploads import copy_document_into_thread, is_safe_document_upload_id
 from control_plane.audit import emit
 from control_plane.auth.abac import ResourceAttrs
 from control_plane.delegation_policy import (
@@ -134,6 +134,7 @@ from expert_work.runtime.runs import (
 from expert_work.runtime.stream_bridge import StreamBridge
 from orchestrator import AgentFactoryError, PlatformNotConfiguredError
 from orchestrator.stream_items import STREAM_FORMAT_ITEMS, STREAM_FORMAT_LEGACY
+from orchestrator.tools import SandboxSupervisorError, WorkspacePermissionError, WorkspaceStore
 from orchestrator.tools.registry import UnmatchedArgBinding, WorkspaceLayout
 
 logger = logging.getLogger("expert_work.control_plane.agents")
@@ -383,6 +384,8 @@ async def resolve_external_files(
     end_user_id: UUID,
     thread_id: UUID,
     uploads_store: UserUploadStore,
+    threads: ThreadMetaStore,
+    workspace_store: WorkspaceStore | None,
 ) -> tuple[list[str], list[str]]:
     """``files[]`` → 内部 ``(image_refs, document_names)``(对外附件模型统一)。
 
@@ -405,6 +408,11 @@ async def resolve_external_files(
     P-1:从 ``run_agent_for_user`` 抽出,``:edit`` 端点复用同一份查表分流;语义一字
     不改。抛 :class:`ExternalScopeError` 或 :class:`HTTPException`,由端点各自渲染成
     对外信封。
+
+    B-262 P1 §3 —— document 行属于**别的会话**(同一 agent 或另一个 agent)时,把文件从那条
+    会话自己的目录复制进本会话的 ``uploads/``(:func:`~control_plane.api.uploads.
+    copy_document_into_thread`),``document_names`` 里写实际落地的名字。登记行的会话已经不在
+    → 404 ``UPLOAD_NOT_FOUND``(找不到源)。
     """
     image_refs: list[str] = []
     document_names: list[str] = []
@@ -424,7 +432,18 @@ async def resolve_external_files(
                 raise ExternalScopeError("UPLOAD_NOT_FOUND", "upload not found", 404)
             image_refs.append(row.ref)
         else:
-            document_names.append(_safe_document_name_or_422(row.ref))
+            ref = _safe_document_name_or_422(row.ref)
+            if row.thread_id != thread_id:
+                ref = await _copy_into_this_session(
+                    ref,
+                    tenant_id=tenant_id,
+                    end_user_id=end_user_id,
+                    source_thread_id=row.thread_id,
+                    thread_id=thread_id,
+                    threads=threads,
+                    workspace_store=workspace_store,
+                )
+            document_names.append(ref)
     if len(image_refs) > MAX_RUN_IMAGE_REFS:
         raise ExternalScopeError(
             "TOO_MANY_IMAGE_REFS",
@@ -432,6 +451,44 @@ async def resolve_external_files(
             422,
         )
     return image_refs, document_names
+
+
+async def _copy_into_this_session(
+    ref: str,
+    *,
+    tenant_id: UUID,
+    end_user_id: UUID,
+    source_thread_id: UUID,
+    thread_id: UUID,
+    threads: ThreadMetaStore,
+    workspace_store: WorkspaceStore | None,
+) -> str:
+    """B-262 P1 §3 —— 别的会话的上传复制进本会话;失败翻成对外错误(措辞同下载端点)。"""
+    source = await threads.get(source_thread_id, tenant_id=tenant_id)
+    target = await threads.get(thread_id, tenant_id=tenant_id)
+    if source is None or target is None:
+        raise ExternalScopeError("UPLOAD_NOT_FOUND", "upload not found", 404)
+    if workspace_store is None:
+        raise ExternalScopeError("UPLOAD_CONTENT_UNAVAILABLE", "upload content unavailable", 503)
+    try:
+        return await copy_document_into_thread(
+            workspace_store,
+            tenant_id=tenant_id,
+            user_id=end_user_id,
+            ref=ref,
+            source=source,
+            target=target,
+        )
+    except WorkspacePermissionError as exc:
+        # 服务端配置问题,不是「不存在」(同 ``external_uploads.download_upload``);必须排在
+        # 父类 SandboxSupervisorError 之前。
+        logger.warning("external_run.attach_copy_permission_denied", exc_info=True)
+        raise ExternalScopeError(
+            "UPLOAD_CONTENT_UNAVAILABLE", "upload content unavailable", 500
+        ) from exc
+    except SandboxSupervisorError as exc:
+        logger.warning("external_run.attach_copy_failed reason=%s", type(exc).__name__)
+        raise ExternalScopeError("UPLOAD_NOT_FOUND", "upload content not found", 404) from exc
 
 
 def external_run_bounds_error(
@@ -1732,6 +1789,8 @@ def build_agents_router() -> APIRouter:
                 end_user_id=end_user_id,
                 thread_id=thread_id,
                 uploads_store=uploads_store,
+                threads=threads,
+                workspace_store=getattr(request.app.state, "workspace_store", None),
             )
         except ExternalScopeError as exc:
             return _envelope_error(exc.code, exc.message, exc.status_code)

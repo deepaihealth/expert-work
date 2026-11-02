@@ -257,7 +257,7 @@ from orchestrator.tools.registry import (
 )
 from orchestrator.tools.scheduling import MAX_TOOL_WORKERS, plan_stages
 from orchestrator.tools.spawn_worker import SPAWN_WORKER_TOOL_NAME
-from orchestrator.tools.workspace_paths import WorkspaceView
+from orchestrator.tools.workspace_paths import WorkspaceView, conversation_work_prefix
 from orchestrator.tools.workspace_store import WorkspaceStore
 from orchestrator.tools.workspace_tree import workspace_prompt_block
 from orchestrator.usage_metering import without_served_by
@@ -4722,7 +4722,12 @@ async def _externalize_tool_overflow(
 
     rel = overflow_rel_path(run_id=ctx.run_id, call_id=call_id, tool_name=tool.spec.name)
     try:
-        await writer.write(rel=rel, content=clamp_overflow(source))
+        # B-262 —— ``rel`` 相对本对话的 ``/workspace``(模型据此回读);写手按 ``/agent`` 寻址,
+        # 对话视图里要落进本对话那一格(子代落根对话的)。
+        await writer.write(
+            rel=conversation_work_prefix(ctx.workspace_view) + rel,
+            content=clamp_overflow(source),
+        )
     except (asyncio.CancelledError, RunCancelledError):
         raise
     except Exception as exc:

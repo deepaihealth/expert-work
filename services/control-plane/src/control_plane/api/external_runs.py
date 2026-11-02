@@ -291,6 +291,8 @@ async def _supersede_and_run(
                 end_user_id=end_user_id,
                 thread_id=meta.thread_id,
                 uploads_store=state.user_upload_store,
+                threads=threads,
+                workspace_store=getattr(state, "workspace_store", None),
             )
         except ExternalScopeError as exc:
             return external_error(exc)

@@ -103,6 +103,8 @@ _WORKSPACE_ROOT = EXEC_VIEW
 #: B-236 —— 平台自己写 / 读的文件(状态投影 ``threads/<id>/PLAN.md``、根下的旧投影、
 #: 超长工具结果 ``.tool_results/…``)一律按 **agent 根** 寻址,不随对话视图走:
 #: ``/agent`` 在两种视图里都是 agent 根(对话视图里 ``threads/`` 只剩本对话那一格)。
+#: B-262 —— 落进本对话 ``/workspace`` 的(超长工具结果、注入变量)由调用方加
+#: :func:`~orchestrator.tools.workspace_paths.conversation_work_prefix`。
 _INTERNAL_ROOT = AGENT_VIEW
 #: Largest file ``read_file`` will pull into the sandbox (whole file is hashed
 #: for TE-9 CAS, so the read can't be capped to the returned slice). Bigger

@@ -406,3 +406,51 @@ def test_only_names_with_an_image_extension_count_as_images(raw: str, expected: 
     from orchestrator.tools.vision import _is_image_path
 
     assert _is_image_path(raw) is expected
+
+
+_EARLIER = UUID("77777777-7777-4777-8777-777777777777")
+_STRANGER = UUID("88888888-8888-4888-8888-888888888888")
+
+
+def _page(run: UUID | str) -> str:
+    return f".tool_results/{run}/figures/{'a' * 16}/{'b' * 16}/_u3/page-3.jpg"
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("conversation", [False, True], ids=["legacy", "conversation"])
+async def test_a_raw_ref_into_another_conversations_run_is_refused(
+    tmp_path: Path, conversation: bool
+) -> None:
+    """B-262 —— agent 根的 ``.tool_results/<run>/`` 是同一 agent 各对话共用的:手写 ref 只认本
+    对话的 run(``figure_run_ids``,含父链)与本 run,别的 run(别的对话渲的页)一律拒。"""
+    from dataclasses import replace
+
+    from orchestrator.tools.registry import ToolBlockedError
+
+    ctx = replace(_ctx(conversation=conversation), figure_run_ids=frozenset({_EARLIER}))
+    vl = _VL()
+    for run in (_STRANGER, "not-a-run"):
+        rel = f"agents/{_AGENT}/{_page(run)}"
+        _put(tmp_path, rel)
+        with pytest.raises(ToolBlockedError, match="another conversation"):
+            await _tool(tmp_path, vl).call(
+                {"image_ref": workspace_figure_ref(_TENANT, _USER, rel), "question": "?"}, ctx=ctx
+            )
+    assert vl.calls == []
+
+    for run in (_EARLIER, _RUN):
+        rel = f"agents/{_AGENT}/{_page(run)}"
+        _put(tmp_path, rel)
+        await _tool(tmp_path, vl).call(
+            {"image_ref": workspace_figure_ref(_TENANT, _USER, rel), "question": "?"}, ctx=ctx
+        )
+    assert len(vl.calls) == 2
+
+    # 本对话自己 ``work/`` 下的渲染页不受这条限制(那一格本来就只有本对话的)。
+    if conversation:
+        own = f"agents/{_AGENT}/threads/{_CONV}/work/{_page(_STRANGER)}"
+        _put(tmp_path, own)
+        await _tool(tmp_path, vl).call(
+            {"image_ref": workspace_figure_ref(_TENANT, _USER, own), "question": "?"}, ctx=ctx
+        )
+        assert len(vl.calls) == 3

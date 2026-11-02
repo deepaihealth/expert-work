@@ -549,7 +549,8 @@ _B236_PROBE = (
     "open('/workspace/inputs/r1/i.json', 'w').write('{}')\n"
     "print(json.dumps({'cwd': os.getcwd(), 'same': [here.st_dev, here.st_ino] == "
     "[work.st_dev, work.st_ino], 'threads': sorted(os.listdir('/agent/threads')), "
-    "'upload': open('/workspace/uploads/u.txt').read(), "
+    "'upload': os.path.exists('/workspace/uploads/u.txt'), "
+    "'agent_uploads': os.listdir('/agent/uploads'), "
     "'anchor': open('/agent/style/s.md').read(), 'style_here': os.path.exists('style')}))\n"
 )
 
@@ -588,12 +589,14 @@ async def test_exec_conversation_view_binds_its_own_dir_and_the_agent_root(
         assert probe.exit_code == 0, probe.stderr
         seen = json.loads(probe.stdout.strip().splitlines()[-1])
         # B-236 —— agent 根的基础目录不挂进 /workspace(开场时由控制面在宿主侧复制进本对话
-        # 的 work/,这里没走那一步);经 /agent 照常读得到。
+        # 的 work/,这里没走那一步);经 /agent 照常读得到。B-262 —— agent 根的 uploads/
+        # (老视图对话的件)不进对话视图,/agent 下那一份被盖住。
         assert seen == {
             "cwd": "/workspace",
             "same": True,
             "threads": [str(conv)],
-            "upload": "up",
+            "upload": False,
+            "agent_uploads": [],
             "anchor": "anchor",
             "style_here": False,
         }
@@ -602,10 +605,13 @@ async def test_exec_conversation_view_binds_its_own_dir_and_the_agent_root(
             code="import os\n"
             "r = '/workspace/agents/a'\n"
             f"print(open(f'{{r}}/threads/{conv}/work/x.txt').read(), open(f'{{r}}/y.txt').read(),"
-            " os.path.exists(f'{r}/x.txt'), open(f'{r}/inputs/r1/i.json').read(),"
-            " open(f'{r}/style/s.md').read())",
+            " os.path.exists(f'{r}/x.txt'),"
+            f" open(f'{{r}}/threads/{conv}/work/inputs/r1/i.json').read(),"
+            " os.path.exists(f'{r}/inputs/r1/i.json'), open(f'{r}/style/s.md').read())",
         )
-        assert check.stdout.split() == ["conv", "agent", "False", "{}", "anchor"], check.stderr
+        assert check.stdout.split() == ["conv", "agent", "False", "{}", "False", "anchor"], (
+            check.stderr
+        )
     finally:
         await expert_work.supervisor.destroy(sid, reason="b236-acceptance")
 
@@ -667,8 +673,8 @@ async def test_exec_payload_cannot_unmount_the_covers(expert_work: _Harness) -> 
 
 @pytest.mark.asyncio
 async def test_exec_planted_symlinks_are_refused(expert_work: _Harness) -> None:
-    """agent 根下被换成符号链接的 bind 源:``uploads`` → 跳过(exec 照跑,看不到别的对话);
-    本对话的 ``work`` → 98 退出(不跟着链接进别的对话)。"""
+    """agent 根下被换成符号链接的 ``uploads``(B-262:对话视图里要盖住的那个)→ 跳过(exec
+    照跑,看不到别的对话);本对话的 ``work`` → 98 退出(不跟着链接进别的对话)。"""
     response = await expert_work.supervisor.acquire(
         AcquireRequest(tenant_id=uuid4(), thread_id="b236-symlink", user_id=uuid4())
     )
@@ -686,7 +692,7 @@ async def test_exec_planted_symlinks_are_refused(expert_work: _Harness) -> None:
         assert plant.exit_code == 0, plant.stderr
         skipped = await expert_work.supervisor.exec(
             sid,
-            code=f"import os; print(os.path.exists('/workspace/uploads/{other}/work/secret.txt'))",
+            code=f"import os; print(os.path.exists('/agent/uploads/{other}/work/secret.txt'))",
             agent_root=_B236_ROOT,
             conv_id=conv,
             thread_id=conv,

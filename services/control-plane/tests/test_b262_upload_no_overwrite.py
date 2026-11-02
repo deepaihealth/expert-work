@@ -58,12 +58,18 @@ class _Console:
         self.client = client
         self.audit = audit
 
-    async def thread(self, *, agent_name: str | None = None) -> UUID:
-        """一条会话 = 一个终端客户的对话;同一个平台用户、同一个智能体。"""
+    async def thread(self, *, agent_name: str | None = None, layout: str = "conversation") -> UUID:
+        """一条会话 = 一个终端客户的对话;同一个平台用户、同一个智能体。
+
+        ``layout="agent_root"`` 摆出 B-236 之前开的老视图会话(内存仓库新建的一律是对话视图)。
+        """
         thread_id = uuid4()
-        await self.app.state.thread_meta_repo.create(
+        repo = self.app.state.thread_meta_repo
+        meta = await repo.create(
             thread_id=thread_id, tenant_id=_TENANT, created_by="user-a", agent_name=agent_name
         )
+        if layout != meta.workspace_layout:
+            repo._rows[thread_id] = meta.model_copy(update={"workspace_layout": layout})
         return thread_id
 
     async def upload(self, thread_id: UUID, raw: bytes, name: str = "report.pdf") -> str:
@@ -126,17 +132,46 @@ async def test_same_name_different_bytes_keeps_both_and_renames_the_second() -> 
 
 
 @pytest.mark.asyncio
-async def test_agent_scoped_uploads_do_not_overwrite_either() -> None:
-    """绑了 agent 的会话:落 ``agents/<key>/uploads/``;回给调用方的 path 不带前缀。"""
+async def test_old_layout_agent_scoped_uploads_do_not_overwrite_either() -> None:
+    """绑了 agent 的老视图会话:落 ``agents/<key>/uploads/``(各对话共用);回给调用方的 path
+    不带前缀。"""
     store = RecordingWorkspaceStore()
     console, client = await _console(store)
     key = sanitize_agent_key("support-bot")
     async with client:
-        first = await console.upload(await console.thread(agent_name="support-bot"), _A)
-        second = await console.upload(await console.thread(agent_name="support-bot"), _B)
+        a = await console.thread(agent_name="support-bot", layout="agent_root")
+        b = await console.thread(agent_name="support-bot", layout="agent_root")
+        first = await console.upload(a, _A)
+        second = await console.upload(b, _B)
 
     assert (first, second) == ("uploads/report.pdf", f"uploads/report-{_tag(_B)}.pdf")
     assert store.created_files == {f"agents/{key}/{first}": _A, f"agents/{key}/{second}": _B}
+
+
+@pytest.mark.asyncio
+async def test_conversation_layout_uploads_land_in_each_conversations_own_dir() -> None:
+    """B-262 P1 —— 对话视图的会话:落本对话的 ``threads/<conv>/work/uploads/``。两个客户各传一份
+    ``report.pdf``,各在各的目录里、都叫原名;同一对话里再传一份不同内容的才换名。"""
+    store = RecordingWorkspaceStore()
+    console, client = await _console(store)
+    key = sanitize_agent_key("support-bot")
+    async with client:
+        a = await console.thread(agent_name="support-bot")
+        b = await console.thread(agent_name="support-bot")
+        first = await console.upload(a, _A)
+        second = await console.upload(b, _B)
+        third = await console.upload(a, _B)
+
+    assert (first, second, third) == (
+        "uploads/report.pdf",
+        "uploads/report.pdf",
+        f"uploads/report-{_tag(_B)}.pdf",
+    )
+    assert store.created_files == {
+        f"agents/{key}/threads/{a}/work/uploads/report.pdf": _A,
+        f"agents/{key}/threads/{b}/work/uploads/report.pdf": _B,
+        f"agents/{key}/threads/{a}/work/uploads/report-{_tag(_B)}.pdf": _B,
+    }
 
 
 @pytest.mark.asyncio
