@@ -302,3 +302,45 @@ def test_every_spawn_run_call_passes_the_threads_layout() -> None:
                     if value is None or not _names_layout(value):
                         missing.append(f"{path.name}:{node.lineno}")
     assert missing == [], f"spawn_run 调用点没传 thread_meta 的 workspace_layout: {missing}"
+
+
+# ---------------------------------------------------------------------------
+# B-262 P3 —— 起**新** run 的构造点在把布局写进 configurable 之前迁移老对话(这一轮就跑在
+# 新视图里);审批续跑与孤儿复活接着跑已有的 run,不迁(中途换视图,前半程写的文件后半程找
+# 不到);触发器每次新建对话,委派子代用父的视图,都不迁。
+# ---------------------------------------------------------------------------
+
+_MIGRATING_BUILDERS = {
+    "control-plane/api/runs.py::_start_run",
+    "control-plane/run_queue_worker.py::_execute",
+}
+
+
+def _migrates(node: ast.AST) -> bool:
+    return _calls(node, "prepare_run_workspace")
+
+
+def _sets_migrated_flag(node: ast.AST) -> bool:
+    return any(
+        isinstance(sub, ast.Subscript)
+        and isinstance(sub.slice, ast.Name)
+        and sub.slice.id == "WORKSPACE_MIGRATED_KEY"
+        for sub in ast.walk(node)
+    )
+
+
+def test_new_run_builders_migrate_before_writing_the_layout() -> None:
+    missing = sorted(
+        site
+        for site in _MIGRATING_BUILDERS
+        if not (_migrates(_function_node(site)) and _sets_migrated_flag(_function_node(site)))
+    )
+    assert not missing, f"这些起新 run 的构造点没先迁移老对话: {missing}"
+
+
+def test_resumes_and_other_launches_never_migrate() -> None:
+    others = sorted(_LAYOUT_BUILDERS - _MIGRATING_BUILDERS)
+    assert "control-plane/api/runs.py::resolve_approval_decision" in others
+    assert "control-plane/orphan_sweep.py::_respawn" in others
+    wrong = [site for site in others if _migrates(_function_node(site))]
+    assert not wrong, f"续跑 / 复活 / 触发器 / 子代不该迁移: {wrong}"

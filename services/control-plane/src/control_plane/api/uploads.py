@@ -229,8 +229,8 @@ async def copy_document_into_thread(
     ``upl_`` id);不新建登记行。源文件大小与登记行对不上(源对话里被改写过)就拒,不悄悄复制
     改过的内容(只比大小:登记行与审计都不便宜地给出 sha256)。
 
-    失败抛 ``HTTPException``,状态码同上传端点(503 / 413 / 429 / 500 / 502);另有源文件不在
-    404、源被改过 409。
+    失败抛 ``HTTPException``,状态码同上传端点(503 / 429 / 500 / 502);另有源文件不在 404、
+    源被改过 409(读按登记的大小 + 1 封顶,读超了也算改过)。
     """
     store = account.workspace_store
     if store is None:
@@ -238,12 +238,25 @@ async def copy_document_into_thread(
     source_path = thread_workspace_path(ref, source)
     if source_path == thread_workspace_path(ref, target):
         return ref
+    changed = HTTPException(
+        status_code=409,
+        detail=(
+            "the uploaded file was changed in its session after it was uploaded; upload it again"
+        ),
+    )
     try:
-        raw = await store.read_file(tenant_id=tenant_id, user_id=user_id, path=source_path)
+        # 按登记的大小 + 1 封顶读:变大 / 被换掉的源不整个读进内存再比(review 2)。
+        raw = await store.read_file(
+            tenant_id=tenant_id,
+            user_id=user_id,
+            path=source_path,
+            max_bytes=upload.size_bytes + 1,
+        )
     except (WorkspaceFileNotFoundError, WorkspaceNotAFileError, _WorkspacePathNotFoundError) as exc:
         raise HTTPException(status_code=404, detail="upload content not found") from exc
     except WorkspaceFileTooLargeError as exc:
-        raise HTTPException(status_code=413, detail="document exceeds the read limit") from exc
+        # 上传时就过了大小上限,读超了只能是之后被改大了。
+        raise changed from exc
     except WorkspacePermissionError as exc:
         logger.warning("upload.copy_read_permission_denied", exc_info=True)
         raise HTTPException(status_code=500, detail="workspace read failed") from exc
@@ -251,13 +264,7 @@ async def copy_document_into_thread(
         logger.warning("upload.copy_read_failed", exc_info=True)
         raise HTTPException(status_code=502, detail="workspace read failed") from exc
     if len(raw) != upload.size_bytes:
-        raise HTTPException(
-            status_code=409,
-            detail=(
-                "the uploaded file was changed in its session after it was uploaded; "
-                "upload it again"
-            ),
-        )
+        raise changed
     result = await _land_and_account(
         account,
         tenant_id=tenant_id,

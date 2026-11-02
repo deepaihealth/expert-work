@@ -229,6 +229,7 @@ from control_plane.platform_dynamic_worker_config import (
 from control_plane.platform_embedding_config import PlatformEmbeddingConfigService
 from control_plane.platform_judge_config import PlatformJudgeConfigService
 from control_plane.platform_mcp_pool import PlatformMcpPoolService
+from control_plane.platform_migration import PlatformMigration
 from control_plane.platform_quality_config import PlatformQualityConfigService
 from control_plane.platform_recognition_config import PlatformRecognitionConfigService
 from control_plane.platform_secrets import PlatformSecretsService
@@ -591,6 +592,8 @@ from orchestrator.tools import (
     HTTPSupervisorRuntime,
     SupervisorWorkspaceStore,
 )
+from orchestrator.tools.locks import ProcessKeyedLock
+from orchestrator.tools.nas_workspace_store import NasWorkspaceStore
 from orchestrator.trajectory import TrajectoryReader
 
 __all__ = ["create_app"]
@@ -1500,6 +1503,22 @@ def create_app(
                 # endpoint can read a thread's checkpoint directly (no agent
                 # rebuild). Same instance bound into ``agent_builder`` below.
                 resolved_agent_runtime.durable_checkpointer = checkpointer
+                # B-262 P3 —— 老对话在下一次新 run 开始前迁到对话视图。宿主侧复制,只有 NAS
+                # 工作区有;锁与开场复制同一个 classid、同一个键(按对话)。
+                if isinstance(resolved_workspace_store, NasWorkspaceStore):
+                    resolved_agent_runtime.platform_migration = PlatformMigration(
+                        workspace_store=resolved_workspace_store,
+                        lock=(
+                            PgConversationSeedLock(create_async_session_factory(sql_stores.engine))
+                            if sql_stores is not None
+                            else ProcessKeyedLock()
+                        ),
+                        threads=resolved_threads,
+                        uploads=resolved_user_upload_store,
+                        runs=resolved_agent_runtime.run_manager,
+                        audit_store=sql_stores.audit_log if sql_stores is not None else None,
+                        checkpointer=checkpointer,
+                    )
                 # Stream O Mini-ADR O-9/O-10 — one CredentialsResolver over
                 # the effective (legacy-derived) catalog. The web_search /
                 # embedder / reranker callers and the consolidator aux model

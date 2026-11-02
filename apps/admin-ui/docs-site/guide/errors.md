@@ -48,7 +48,7 @@
 | [`SESSION_NOT_BOUND`](./run-control#_4-2-审批决策) | 409 | 审批决策 | run 所在会话没有绑定 Agent。联系租户管理员 |
 | [`ARTIFACT_VERSION_MISMATCH`](#_8-7-409-冲突) | 409 | 产物下载 | 请求带的 `version` 取不到内容：版本号不存在或已被清理，或者是较早登记、已被新版本覆盖的旧版本。改用最新版或按业务异常处理 |
 | [`AGENT_DELETED`](./run-control#_4-2-审批决策) | 410 | 审批决策 | 会话绑定的 Agent 已被删除，不可恢复。改用其它 `agent_code` |
-| [`UPLOAD_TOO_LARGE`](#_8-9-413-超过大小上限) | 413 | 上传附件 / 发起对话 / 编辑重发 | 文档或图片超过大小上限。压缩、裁剪或拆分后重传 |
+| [`UPLOAD_TOO_LARGE`](#_8-9-413-超过大小上限) | 413 | 上传附件 | 文档或图片超过大小上限。压缩、裁剪或拆分后重传 |
 | [`ARTIFACT_TOO_LARGE`](#_8-9-413-超过大小上限) | 413 | 产物下载 | 产物文件超过单文件下载上限（64 MiB）。重试无效 |
 | [`INVALID_REQUEST`](#_8-10-422-请求参数不合法) | 422 | 全部端点 | 请求体字段或查询参数未通过基础校验。检查字段的类型、长度与取值范围 |
 | [`INVALID_USER_ID`](#_8-10-422-请求参数不合法) | 422 | 要求 `user_id` 的端点 | `user_id` 去掉首尾空白后是空字符串。传一个非空白的 `user_id` |
@@ -79,7 +79,7 @@
 | `UPLOAD_ERROR` | 与原始失败一致 | 上传附件 | 上传接口内部的失败没有对应专用错误码时的默认取值，很少出现。按 HTTP 状态码处理 |
 | `APPROVAL_ERROR` | 与原始失败一致 | 审批决策 | 审批决策端点内部的失败没有对应专用错误码时的默认取值，很少出现。按 HTTP 状态码处理 |
 
-`UPLOAD_SESSION_DELETED`、`UPLOAD_CHANGED`，以及发起对话、编辑重发返回的 `UPLOAD_TOO_LARGE`、`QUOTA_EXCEEDED`、`UPLOAD_FAILED`、`UPLOAD_UNAVAILABLE`，只在 `files[]` 引用了别的会话上传的文档、平台把它复制到本次会话时出现，见 [2.6 引用别的会话上传的文档](./chat#引用别的会话上传的文档)。
+`UPLOAD_SESSION_DELETED`、`UPLOAD_CHANGED`，以及发起对话、编辑重发返回的 `QUOTA_EXCEEDED`、`UPLOAD_FAILED`、`UPLOAD_UNAVAILABLE`，只在 `files[]` 引用了别的会话上传的文档、平台把它复制到本次会话时出现，见 [2.6 引用别的会话上传的文档](./chat#引用别的会话上传的文档)。
 
 这张表覆盖的是带 `error.code` 的失败，**不是全部失败的穷尽清单**。表外还有三类：
 
@@ -241,7 +241,7 @@
 
 两个端点会返回 413，都是标准格式。
 
-上传附件（`POST /v1/agents/{agent_code}/uploads`）——你交给服务端的文件太大。发起对话接口收到的是 `files[]` 里的 `upload_id` 引用，不是文件本身，只有在把别的会话上传的文档复制到本次会话、文件超过服务端单次读取上限时才返回这个 413：
+上传附件（`POST /v1/agents/{agent_code}/uploads`）——你交给服务端的文件太大。发起对话接口不会返回这个 413，因为它收到的是 `files[]` 里的 `upload_id` 引用，不是文件本身：
 
 ```json [响应 413]
 { "success": false, "data": null, "error": { "code": "UPLOAD_TOO_LARGE", "message": "document exceeds 26214400-byte limit" } }

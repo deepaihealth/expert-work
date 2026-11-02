@@ -49,7 +49,6 @@ from control_plane.api._run_event_stream import EXTERNAL_HIDDEN_EVENTS, make_run
 from control_plane.api._run_usage import make_usage_loader
 from control_plane.api._session_title import title_from_text
 from control_plane.api._user_scope import get_user_repo
-from control_plane.api._workspace_shared import thread_conversation_id
 from control_plane.api.external_events import build_events_response
 from control_plane.api.runs import (
     MAX_RUN_IMAGE_REFS,
@@ -418,8 +417,7 @@ async def resolve_external_files(
     B-262 P1 §3 —— document 行属于**别的会话**(同一 agent 或另一个 agent)时,把文件从那条
     会话自己的目录复制进本会话的 ``uploads/``(:func:`~control_plane.api.uploads.
     copy_document_into_thread`,像一次上传一样记账与审计),``document_names`` 里写实际落地的
-    名字。登记行的会话已经不在(purge 不删登记行):本会话是老视图时照 P1 之前,按本 agent 根
-    解析 ``ref``、不复制;否则 404 ``UPLOAD_SESSION_DELETED``。
+    名字。登记行的会话已经不在(purge 不删登记行):404 ``UPLOAD_SESSION_DELETED``。
     """
     image_refs: list[str] = []
     document_names: list[str] = []
@@ -480,9 +478,8 @@ async def _copy_into_this_session(
         raise ExternalScopeError("UPLOAD_NOT_FOUND", "upload not found", 404)
     source = await threads.get(row.thread_id, tenant_id=tenant_id)
     if source is None:
-        if thread_conversation_id(target) is None:
-            # 老视图:照 P1 之前,``ref`` 相对本 agent 根(会话删了,件还在 agent 根)。
-            return ref
+        # 不论本会话是哪种视图都拒(review 2):P1 起 ``uploads/<名字>`` 只在它自己那段会话的
+        # ``work/`` 里唯一,按本 agent 根解析同名文件可能挂上别的客户的件。
         raise ExternalScopeError(
             "UPLOAD_SESSION_DELETED",
             "the session this upload was made in has been deleted; upload the file again",

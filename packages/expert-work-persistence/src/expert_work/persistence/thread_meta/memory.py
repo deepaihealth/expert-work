@@ -292,6 +292,15 @@ class InMemoryThreadMetaStore(ThreadMetaStore):
         )
         return True
 
+    async def promote_workspace_layout(self, thread_id: UUID, *, tenant_id: UUID) -> bool:
+        row = self._rows.get(thread_id)
+        if row is None or row.tenant_id != tenant_id or row.workspace_layout != "agent_root":
+            return False
+        self._rows[thread_id] = row.model_copy(
+            update={"workspace_layout": "conversation", "updated_at": datetime.now(UTC)}
+        )
+        return True
+
     async def check_access(self, thread_id: UUID, tenant_id: UUID) -> bool:
         row = self._rows.get(thread_id)
         return row is not None and row.tenant_id == tenant_id

@@ -171,6 +171,7 @@ from expert_work.persistence import (
 )
 from expert_work.persistence.workspace.layout import (
     WORKSPACE_CONVERSATION_WORK_DIR,
+    WORKSPACE_PLATFORM_MIGRATED_MARKER,
     WORKSPACE_SEED_MARKER,
     WORKSPACE_THREADS_DIR,
 )
@@ -323,14 +324,15 @@ def _in_conversation_work(parts: tuple[str, ...]) -> bool:
     )
 
 
-def _is_seed_marker(path: str) -> bool:
-    """``agents/<k>/threads/<conv>/.seeded`` —— 用户根相对路径。"""
+def _is_seed_marker(path: str, marker: str = WORKSPACE_SEED_MARKER) -> bool:
+    """``agents/<k>/threads/<conv>/.seeded`` —— 用户根相对路径。B-262 P3 的
+    ``.platform-migrated`` 同一个位置,传 ``marker``。"""
     parts = path.split("/")
     return (
         len(parts) == 5
         and parts[0] == WORKSPACE_AGENTS_DIR
         and parts[2] == WORKSPACE_THREADS_DIR
-        and parts[4] == WORKSPACE_SEED_MARKER
+        and parts[4] == marker
     )
 
 
@@ -670,6 +672,10 @@ def _list_dir_entries(
             if marker_dirs is not None:
                 marker_dirs.add(full.rsplit("/", 1)[0])
             continue  # B-236 —— 开场复制的标记是平台状态,不是产出
+        if name == WORKSPACE_PLATFORM_MIGRATED_MARKER and _is_seed_marker(
+            full, WORKSPACE_PLATFORM_MIGRATED_MARKER
+        ):
+            continue  # B-262 P3 —— 迁移标记同理
         entries.append(_entry(rel, info))
 
 

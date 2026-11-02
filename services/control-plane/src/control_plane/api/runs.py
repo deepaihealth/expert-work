@@ -64,6 +64,7 @@ from control_plane.approval_void import (
 from control_plane.audit import emit
 from control_plane.inputs_block import block_stats, build_inputs_block, inputs_block_message
 from control_plane.kill_switch import run_block_reason
+from control_plane.platform_migration import prepare_run_workspace
 from control_plane.prompt_render import (
     PromptRenderError,
     bound_variable_names,
@@ -150,7 +151,11 @@ from orchestrator import (
 from orchestrator.multimodal import image_ref_block
 from orchestrator.sse import end_frame_data, format_sse
 from orchestrator.stream_items import STREAM_FORMAT_LEGACY
-from orchestrator.tools.registry import WORKSPACE_LAYOUT_KEY, WorkspaceLayout
+from orchestrator.tools.registry import (
+    WORKSPACE_LAYOUT_KEY,
+    WORKSPACE_MIGRATED_KEY,
+    WorkspaceLayout,
+)
 
 logger = logging.getLogger("expert_work.control_plane.runs")
 
@@ -1659,7 +1664,18 @@ async def _start_run(
     # 工作区分层 —— agent 身份。与 /opt/skills/<agent_key> 同一个值。
     configurable["agent_key"] = sanitize_agent_key(record_spec.metadata.name)
     # B-236 —— 这条对话的 /workspace 布局(thread_meta;发布前已开的对话是老视图)。
+    # B-262 P3 —— 起新 run 之前先把老对话的平台文件迁进对话目录(做过的不再做):迁成了这一轮
+    # 就按对话视图跑,并给模型一句一次性说明。失败照原布局跑,下一次再试。
+    prepared = await prepare_run_workspace(
+        runtime.platform_migration,
+        thread_id=thread_id,
+        tenant_id=tenant_id,
+        workspace_layout=workspace_layout,
+    )
+    workspace_layout = prepared.workspace_layout
     configurable[WORKSPACE_LAYOUT_KEY] = workspace_layout
+    if prepared.migrated:
+        configurable[WORKSPACE_MIGRATED_KEY] = True
     if built.run_deadline_s > 0:
         configurable["deadline_at"] = time.monotonic() + float(built.run_deadline_s)
     if payload.use_draft:

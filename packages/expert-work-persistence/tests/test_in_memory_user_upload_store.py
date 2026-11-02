@@ -206,3 +206,36 @@ async def test_list_expired_and_soft_delete() -> None:
     assert [r.id for r in await store.list_expired(before=cutoff)] == [older]
     fresh_row = await store.get(upload_id=fresh, tenant_id=tenant)
     assert fresh_row is not None and fresh_row.deleted_at is None
+
+
+@pytest.mark.asyncio
+async def test_list_documents_for_thread_keeps_this_threads_live_documents() -> None:
+    """B-262 P3 —— 迁移按会话找它自己的上传:只要本会话、本租户、文档类、没删的,按上传先后。"""
+    store = InMemoryUserUploadStore()
+    tenant, thread, user = uuid4(), uuid4(), uuid4()
+
+    async def _put(*, thread_id: UUID, tenant_id: UUID = tenant, kind: str = "document") -> UUID:
+        uid = uuid4()
+        await store.insert(
+            upload_id=uid,
+            tenant_id=tenant_id,
+            user_id=user,
+            thread_id=thread_id,
+            kind=kind,  # type: ignore[arg-type]
+            ref="uploads/a.pdf" if kind == "document" else "expert_work://image/x/y/z.png",
+            mime_type="application/pdf",
+            size_bytes=3,
+            filename="a.pdf",
+        )
+        return uid
+
+    first = await _put(thread_id=thread)
+    second = await _put(thread_id=thread)
+    await _put(thread_id=thread, kind="image")
+    await _put(thread_id=uuid4())
+    await _put(thread_id=thread, tenant_id=uuid4())
+    gone = await _put(thread_id=thread)
+    await store.soft_delete(upload_id=gone, tenant_id=tenant, now=datetime.now(UTC))
+
+    rows = await store.list_documents_for_thread(tenant_id=tenant, thread_id=thread)
+    assert [r.id for r in rows] == [first, second]

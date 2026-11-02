@@ -889,19 +889,26 @@ async def test_a_copy_into_a_full_workspace_is_refused_like_an_upload(ctx: _Ctx)
 
 
 @pytest.mark.asyncio
-async def test_an_upload_whose_session_is_gone_resolves_as_before_for_an_old_view_target(
+async def test_an_upload_whose_session_is_gone_is_not_found_for_an_old_view_target_either(
     ctx: _Ctx,
 ) -> None:
-    """源会话已删(登记行在 purge 后还留着)、本会话是老视图:照 P1 之前,按本 agent 根解析
-    ``row.ref``,不复制。"""
+    """源会话已删(登记行在 purge 后还留着)、本会话是老视图:同样 404,不按本 agent 根解析
+    ``row.ref`` —— P1 起 ``uploads/<名字>`` 只在它自己那段会话的 ``work/`` 里唯一,agent 根下
+    同名的可能是别的客户的件(这里摆一份)。"""
+    from control_plane.api._external import ExternalScopeError
+
     await ctx.seed_agent()
     a = await _upload_document(ctx, b"%PDF-1.4 A")
     b = await _upload_document(ctx, b"%PDF-1.4 B")
     _old_layout(ctx, b["session_id"])
+    key = agent_key_for_code("support-bot")
+    ctx.workspace_store.created_files[f"agents/{key}/uploads/report.pdf"] = b"another customer"
     await ctx.app.state.thread_meta_repo.delete(UUID(a["session_id"]), tenant_id=ctx.tenant_id)
     writes = len(ctx.workspace_store.workspace_writes)
 
-    assert await _attach(ctx, a, into=b["session_id"]) == ["uploads/report.pdf"]
+    with pytest.raises(ExternalScopeError) as info:
+        await _attach(ctx, a, into=b["session_id"])
+    assert (info.value.code, info.value.status_code) == ("UPLOAD_SESSION_DELETED", 404)
     assert len(ctx.workspace_store.workspace_writes) == writes
 
 
@@ -927,7 +934,8 @@ async def test_a_missing_source_file_is_not_found(ctx: _Ctx) -> None:
 @pytest.mark.parametrize(
     ("where", "error", "expected"),
     [
-        ("read", "too_large", ("UPLOAD_TOO_LARGE", 413)),
+        # 读按登记的大小 + 1 封顶(B-262 review):读超了就是文件变了(变大),不是上传太大。
+        ("read", "too_large", ("UPLOAD_CHANGED", 409)),
         ("read", "permission", ("UPLOAD_FAILED", 500)),
         ("read", "other", ("UPLOAD_FAILED", 502)),
         ("write", "permission", ("UPLOAD_FAILED", 500)),
@@ -979,3 +987,23 @@ async def test_a_source_changed_since_upload_is_refused(ctx: _Ctx) -> None:
         await _attach(ctx, a, into=b["session_id"])
     assert (info.value.code, info.value.status_code) == ("UPLOAD_CHANGED", 409)
     assert len(ctx.workspace_store.workspace_writes) == writes
+
+
+@pytest.mark.asyncio
+async def test_the_source_read_is_bounded_by_the_recorded_size(
+    ctx: _Ctx, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """B-262 review —— 源文件按登记的大小 + 1 读,变大 / 被换掉的源不会被整个读进内存再比。"""
+    await ctx.seed_agent()
+    a = await _upload_document(ctx, b"%PDF-1.4 A")
+    b = await _upload_document(ctx, b"%PDF-1.4 B")
+    caps: list[int | None] = []
+    real = ctx.workspace_store.read_file
+
+    async def spy(**kwargs: Any) -> bytes:
+        caps.append(kwargs.get("max_bytes"))
+        return await real(**kwargs)
+
+    monkeypatch.setattr(ctx.workspace_store, "read_file", spy)
+    await _attach(ctx, a, into=b["session_id"])
+    assert caps[0] == len(b"%PDF-1.4 A") + 1

@@ -225,6 +225,9 @@ WORKSPACE_CONVERSATION_WORK_DIR = "work"
 #: B-236 —— 对话开场复制做完的标记 ``threads/<conv>/.seeded``(``conversation_seed`` 写)。平台
 #: 状态不是产出:浏览列表不列它。
 WORKSPACE_SEED_MARKER = ".seeded"
+#: B-262 P3 —— 老对话的平台文件(本对话的上传、工具结果)迁进本对话 ``work/`` 做完的标记
+#: ``threads/<conv>/.platform-migrated``(``platform_migration`` 写)。平台状态,浏览列表不列它。
+WORKSPACE_PLATFORM_MIGRATED_MARKER = ".platform-migrated"
 _UUID_RE = re.compile(_UUID_PATTERN)
 
 

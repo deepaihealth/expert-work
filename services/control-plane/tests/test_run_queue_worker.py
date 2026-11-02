@@ -32,8 +32,9 @@ from expert_work.runtime.runs import InMemoryRunStore, RunManager, RunStatus
 
 
 class _FakeThreads:
-    def __init__(self, *, has_agent: bool = True) -> None:
+    def __init__(self, *, has_agent: bool = True, layout: str = "conversation") -> None:
         self._has_agent = has_agent
+        self._layout = layout
 
     async def get(self, _thread_id, *, tenant_id):
         del tenant_id
@@ -43,7 +44,7 @@ class _FakeThreads:
             agent_name="a",
             agent_version="1.0.0",
             user_id=None,
-            workspace_layout="conversation",
+            workspace_layout=self._layout,
         )
 
 
@@ -90,6 +91,7 @@ class _FakeRuntime:
         self.trajectory_recorder = None
         self.thread_stats_recorder = None
         self.agent_file_versions = None
+        self.platform_migration = None
 
     async def get_agent(self, **_kw):
         return SimpleNamespace(
@@ -690,3 +692,46 @@ async def test_worker_does_not_start_a_turn_while_an_earlier_one_runs(
     assert first_row is not None and first_row.status is RunStatus.RUNNING
     assert second_row is not None and second_row.status is RunStatus.QUEUED
     assert await worker.run_once() == 0
+
+
+@pytest.mark.asyncio
+async def test_a_queued_run_migrates_an_old_conversation_before_it_starts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """B-262 P3 —— 排队的新 run 开跑之前先迁老对话:迁成了就按对话视图跑、带一次性说明的键。"""
+    from control_plane.platform_migration import PreparedWorkspace
+    from orchestrator.tools.registry import WORKSPACE_LAYOUT_KEY, WORKSPACE_MIGRATED_KEY
+
+    spawns: list[dict] = []
+    calls: list[dict] = []
+
+    async def _fake_run_agent(**kw):
+        spawns.append(kw)
+
+    class _Migration:
+        async def prepare(self, **kw):
+            calls.append(kw)
+            return PreparedWorkspace("conversation", migrated=True)
+
+    monkeypatch.setattr(worker_module, "run_agent", _fake_run_agent)
+    store = InMemoryRunStore()
+    runtime = _FakeRuntime(store)
+    runtime.platform_migration = _Migration()
+    run_id, tenant, thread = uuid4(), uuid4(), uuid4()
+    await runtime.run_manager.enqueue(
+        run_id=run_id,
+        thread_id=thread,
+        tenant_id=tenant,
+        enqueued_input={"input": "hi", "image_refs": [], "untrusted_content": []},
+    )
+
+    threads = _FakeThreads(layout="agent_root")
+    assert await _worker(store, runtime, threads=threads).run_once() == 1
+    await asyncio.sleep(0)
+
+    assert [(c["thread_id"], c["tenant_id"], c["workspace_layout"]) for c in calls] == [
+        (thread, tenant, "agent_root")
+    ]
+    configurable = spawns[0]["config"]["configurable"]
+    assert configurable[WORKSPACE_LAYOUT_KEY] == "conversation"
+    assert configurable[WORKSPACE_MIGRATED_KEY] is True
