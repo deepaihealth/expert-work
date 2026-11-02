@@ -1876,3 +1876,26 @@ oauth2 目录项本来就不在平台池里:不再碰平台池;`enabled` 切换�
 - [ ] **85.2 显式配置优先**:把看图模型思考档位设为「中」再看一次。判据:请求里 `reasoning_effort: medium`。
 - [ ] **85.3 快速看不受影响**:同一智能体不带 depth 看一次。判据:请求里是关思考(`thinking: {type: disabled}`),没有 `reasoning_effort`。
 - [ ] **85.4 收尾**:删 `acc-b265`。
+
+## §86 上传 / 输入 / 工具结果按对话分开 + 老对话自动迁移(B-262 P1 + P3)
+
+**背景**:对话视图里 `uploads/` `inputs/` `.tool_results/` 原是 agent 根那一份的 bind,同一 agent 的所有对话共用。改成就在 `threads/<conv>/work/` 下(模型看到的路径不变),`/agent` 下同名三个目录在对话视图里盖住;引用别的会话 / 别的 agent 的上传会复制进本会话;老对话在下一次**新** run 开始时迁移(复制本对话自己的上传与工具结果 → `agent_root` 改 `conversation` → 写标记),这一轮带一次性说明。方案:`docs/superpowers/specs/2026-11-02-b262-p1-p3-conversation-platform-dirs.md`。
+
+**发布注意**:沙箱布局版本改为 `agent-conv-platform`,热沙箱会按新脚本重建(同 B-242),低峰发。**P1 不能单独发**,P3 同一镜像。
+
+**怎么进**:测试环境控制台(system_admin,平台租户)建临时智能体 `acc-b262a`、`acc-b262b`(glm-5.3,看图模型照平台默认);对外接口用平台租户临时 API key,`user_id` 用 `u-b262p`。合成文件(零租户内容,同 §84 做法):`/tmp/b262p-a.pdf` / `b262p-b.pdf` 两份不同的一页 PDF(印 `CUSTOMER-A` / `CUSTOMER-B`)。NAS 用 control-plane pod 只读 `ls`;数据库只读连接。**花费**:约 ¥3。
+
+- [ ] **86.1 上传落在本对话**:`acc-b262a` 会话 A 上传 `b262p-a.pdf`(对外接口)。判据:NAS 上文件在 `agents/<key>/threads/<A>/work/uploads/`,agent 根 `uploads/` 没有新文件;run 里 `[file attached: uploads/…]` 路径形状与以前相同;`GET …/uploads/<upload_id>` 下载到 A 的字节。**没修好时**:落在 agent 根。
+- [ ] **86.2 别的对话看不到**:同一 agent 会话 B 让智能体逐字执行 `ls -la /workspace/uploads /agent/uploads; echo x > /agent/uploads/t`。判据:`/workspace/uploads` 没有 A 的文件;`/agent/uploads` 为空;写入报只读错误。再让它 `list_dir`/`search_files` 查 `/agent`:不出现 `uploads` / `inputs` / `.tool_results`。
+- [ ] **86.3 渲染页与看图按对话**:A 里 `read_page(path="uploads/<A 的名字>", units=[1])`。判据:NAS 页在 `threads/<A>/work/.tool_results/<run>/figures/…`。B 里让模型手写 `ask_image(image_ref="expert_work://workspace/<t>/<u>/agents/<key>/threads/<A>/work/.tool_results/…")`,再写一次中间加 `//` 的同一 ref。判据:两次都被拒(「another conversation」/「canonical」),拿不到 A 的页。
+- [ ] **86.4 注入变量预拉缓存按对话**:给 `acc-b262a` 声明一个 URL 类型输入变量(用 §44 的公开测试图片地址),A、B 各跑一次。判据:`inputs/cache/` 在各自 `threads/<conv>/work/` 下各一份;agent 根 `inputs/cache` 无新文件。
+- [ ] **86.5 引用别的会话的上传会复制**:在会话 B 发 run,`files` 带 A 的 `upload_id`。判据:B 的 `work/uploads/` 出现同名(或带 `-<8 位>`)文件、内容是 A 的;审计新增一行 `document:upload`,`details.copied_from_upload_id` = A 的 id、`thread_id` = B;模型读到 `CUSTOMER-A`。再用 `acc-b262b` 的会话 C 引用同一 id:同样复制进 C。
+- [ ] **86.6 复制的拒绝情形**:(a) 在 A 里让智能体把那份上传改写成不同长度,再在 B 引用 → 409 `UPLOAD_CHANGED`;(b) 删除会话 A(会话删除接口)后再在 B 引用 → 404 `UPLOAD_SESSION_DELETED`;(c) 删除会话后 NAS 上 `threads/<A>/` 已不在(含上传)。
+- [ ] **86.7 老对话迁移(情形 a)**:发布前在旧镜像上用 `acc-b262a` 开一段会话 O(老布局),上传 `b262p-b.pdf`、`read_page` 渲一页、让智能体写 `/workspace/notes/o.txt`;发布后在 O 发新一轮。判据:只读查 `thread_meta.workspace_layout` = `conversation`;NAS `threads/<O>/work/uploads/` 有 B 的文件、`.tool_results/<O 的旧 run>/` 已复制、`threads/<O>/.platform-migrated` 存在;这一轮 Langfuse 输入里有一次 `[workspace notice]`,下一轮没有;模型能读 `/agent/notes/o.txt`(开场复制后 `/workspace/notes/o.txt` 也在);日志 `platform_migration outcome=migrated`。
+- [ ] **86.8 已是对话视图的老会话(情形 b)**:发布前在旧镜像上开对话视图会话 P(B-236 之后的默认)并上传一份。判据:发布后 P 的新一轮 `outcome=copied_only`,上传出现在 `threads/<P>/work/uploads/`,布局本来就是 `conversation`,没有说明。
+- [ ] **86.9 续跑不迁移**:另开一段老布局会话 Q,发布前让它停在一个审批上;发布后批准。判据:这次续跑仍是老视图(`thread_meta` 仍 `agent_root`、日志没有迁移行);Q 的下一个新 run 才迁移。没碰上审批场景:记「未触发」,单测覆盖。
+- [ ] **86.10 计数**:`expert_work_platform_migration_total` 各 outcome 有数,`failed` 为 0(非 0 看 warning 行的错误类型)。
+- [ ] **86.11 收尾**:删 `acc-b262a`、`acc-b262b`;`u-b262p` 走 `POST /v1/users/<id>:purge`。
+
+**上生产前**:通知深护智康 —— 更新记录「引用别的会话的上传会复制进本会话」(附件名可能带 `-<8 位>`,原会话已删除时报 `UPLOAD_SESSION_DELETED`,文件被改过时报 `UPLOAD_CHANGED`);生产老会话全部是老布局,发布后每段会话第一次新提问时迁移(先在生产只读统计老布局活跃会话数与 `agents/*/uploads`、`.tool_results` 总量,命令随发布单给出)。
+
