@@ -2519,10 +2519,14 @@ def _thinking_off(model: ModelSpec) -> ModelSpec:
     return model.model_copy(update=update) if update else model
 
 
-#: B-257 —— ``ask_image`` 深入看在看图模型没设思考深度时用的平台默认档位。10-31 实测
-#: (豆包 seed-2.1-pro,化验单 + 趋势图各 3 次):不设(≈ high)95~123 s、一次超时;
-#: medium 58~63 s;low 22~44 s;各档答案都对。
-DEEP_VISION_DEFAULT_EFFORT: Literal["medium"] = "medium"
+#: B-257 / B-265 —— ``ask_image`` 深入看在看图模型没设思考深度时用的平台默认档位。
+#: 10-31 探针(豆包 seed-2.1-pro,每档 3 次):不设(≈ high)95~123 s,medium 58~63 s,
+#: low 22~44 s,答案都对 → 先定 medium。11-02 复测(同模型,合成化验单 / 走势图共 729 次):
+#: quick / low / medium 准确率相同(99~100%);难图超 60 s(deep 等待上限)medium 15%、
+#: low 8%(思考 1,882 vs 1,522 token),普通图 low 约 1%;high 50% 超 60 s、最长 198 s,
+#: 准确率不升。耗时与思考长度近线性(r²=0.97)→ 改 low。两次都只测了豆包;别家 effort / budget
+#: 厂商(含 effort_map 原先把 medium 顶到 high 的 kimi-k3 / glm)按同一档位发,没有单独实测。
+DEEP_VISION_DEFAULT_EFFORT: Literal["low"] = "low"
 
 
 def _deep_vision_model(model: ModelSpec) -> ModelSpec:
@@ -2530,7 +2534,7 @@ def _deep_vision_model(model: ModelSpec) -> ModelSpec:
 
     只补「目录形态是 effort / budget、思考开着(显式开,或没设且目录默认开)、``effort`` /
     ``adaptive_thinking`` / ``thinking_max_tokens`` 都没设」的节点;厂商取值沿用
-    :func:`_thinking_payload`(effort 厂商发各自的 medium 档,budget 厂商按档位换算预算)。
+    :func:`_thinking_payload`(effort 厂商发各自的对应档,budget 厂商按档位换算预算)。
     显式设置一律优先;只有开关的厂商、目录外模型原样。目录默认不思考又没显式开的也原样 ——
     补档位会把思考打开,反而更慢。备用树逐个节点各自判断(同 :func:`_thinking_off`)。
     """
