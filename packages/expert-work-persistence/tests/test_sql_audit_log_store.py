@@ -169,3 +169,41 @@ async def test_query_wildcard_tenant_returns_all(sql_store: SqlStoreFixture) -> 
         assert {e.tenant_id for e in all_rows.entries} >= {tenant_a, tenant_b}
     finally:
         await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_document_uploads_for_thread_is_targeted(sql_store: SqlStoreFixture) -> None:
+    """B-262 P3 review 3 —— 与内存实现同一谓词(``details->>'thread_id'``)。"""
+    from datetime import UTC, datetime, timedelta
+
+    store, engine = sql_store
+    try:
+        tenant, thread = uuid4(), uuid4()
+
+        async def _put(
+            *,
+            tenant_id: UUID = tenant,
+            thread_id: UUID = thread,
+            action: AuditAction = AuditAction.DOCUMENT_UPLOAD,
+        ) -> AuditEntry:
+            entry = _entry(tenant_id, action=action, resource_type="user_workspace")
+            return await store.append(
+                entry.model_copy(update={"details": {"thread_id": str(thread_id)}})
+            )
+
+        first = await _put()
+        second = await _put()
+        await _put(thread_id=uuid4())
+        await _put(tenant_id=uuid4())
+        await _put(action=AuditAction.MANIFEST_WRITE)
+
+        got = await store.list_document_uploads_for_thread(tenant_id=tenant, thread_id=thread)
+        assert [e.id for e in got] == [first.id, second.id]
+        assert (
+            await store.list_document_uploads_for_thread(
+                tenant_id=tenant, thread_id=thread, since=datetime.now(UTC) + timedelta(minutes=1)
+            )
+            == []
+        )
+    finally:
+        await engine.dispose()

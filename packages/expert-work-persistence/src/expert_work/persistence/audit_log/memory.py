@@ -9,7 +9,7 @@ from uuid import UUID
 
 from expert_work.persistence.audit_log.base import AuditLogStore
 from expert_work.persistence.audit_log.cursor import decode_cursor, encode_cursor
-from expert_work.protocol import AuditEntry, AuditPage, AuditQuery
+from expert_work.protocol import AuditAction, AuditEntry, AuditPage, AuditQuery, AuditResult
 
 
 class InMemoryAuditLogStore(AuditLogStore):
@@ -42,6 +42,20 @@ class InMemoryAuditLogStore(AuditLogStore):
         if row is None or row.tenant_id != tenant_id:
             return None
         return row
+
+    async def list_document_uploads_for_thread(
+        self, *, tenant_id: UUID, thread_id: UUID, since: datetime | None = None
+    ) -> list[AuditEntry]:
+        rows = [
+            r
+            for r in self._rows.values()
+            if r.tenant_id == tenant_id
+            and r.action == AuditAction.DOCUMENT_UPLOAD
+            and r.result == AuditResult.SUCCESS
+            and (r.details or {}).get("thread_id") == str(thread_id)
+            and (since is None or (r.occurred_at is not None and r.occurred_at >= since))
+        ]
+        return sorted(rows, key=lambda r: r.id or 0)
 
     async def query(self, query: AuditQuery) -> AuditPage:
         cursor_id = decode_cursor(query.cursor) if query.cursor else None

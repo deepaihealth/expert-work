@@ -14,15 +14,17 @@ B-262 P1 之后,对话视图里 ``uploads/`` / ``inputs/`` / ``.tool_results/`` 
   结果整棵复制进临时目录,再改名进 ``work/.tool_results/<run>``。中途崩溃最多留一个临时目录
   (下次清掉),不会留一份写了一半的同名文件让下次当成「已存在」跳过。
 * **上传件核对内容**:P0 之前同名上传会覆盖,agent 根里的 ``uploads/report.pdf`` 可能已经
-  是别的客户的了。调用方给出这个名字在本对话上传时记下的 sha256(审计)/ 大小(登记行),
-  对不上就不复制 —— 宁可这一份没迁过来,不把别人的件放进本对话。
-* **上限**:一个对话合计 :data:`MAX_MIGRATION_BYTES`,另有条目数与深度上限(只防攻击形态);
-  放不下的那一项整个跳过、记数。
+  是别的客户的了。调用方给出这个名字在本对话上传时记下的 sha256(审计),对不上就不复制;
+  没有 sha256 的记成「确认不了」也不复制(只凭大小,同样大小的别人的件也对得上)。读不动
+  (不是「不在」也不是「对不上」)整次失败:调用方不翻布局、不写标记,下次再试。
+* **上限**:工具结果合计 :data:`MAX_MIGRATION_BYTES`,另有条目数与深度上限(只防攻击形态);
+  放不下的那个 run 整个跳过、记数。本对话的上传件不受这个上限(review 3:不能让它们滞留)。
 """
 
 from __future__ import annotations
 
 import contextlib
+import errno
 import hashlib
 import json
 import logging
@@ -87,7 +89,8 @@ class MigrationCopyReport:
     uploads_existing: int = 0
     uploads_missing: int = 0
     uploads_mismatched: int = 0
-    uploads_over_cap: int = 0
+    #: 没有上传时记下的 sha256,确认不了还是本对话那一份,不复制(review 3)。
+    uploads_unverifiable: int = 0
     runs_copied: int = 0
     runs_existing: int = 0
     runs_missing: int = 0
@@ -126,7 +129,7 @@ class _Budget:
             uploads_existing=c.get("uploads_existing", 0),
             uploads_missing=c.get("uploads_missing", 0),
             uploads_mismatched=c.get("uploads_mismatched", 0),
-            uploads_over_cap=c.get("uploads_over_cap", 0),
+            uploads_unverifiable=c.get("uploads_unverifiable", 0),
             runs_copied=c.get("runs_copied", 0),
             runs_existing=c.get("runs_existing", 0),
             runs_missing=c.get("runs_missing", 0),
@@ -148,11 +151,14 @@ def _exists(dir_fd: int, name: str) -> bool:
     return True
 
 
-def _optional_dir(dir_fd: int, name: str) -> int | None:
-    """``name`` 的目录 fd;不存在、是符号链接、不是目录都当没有。"""
+def _optional_dir(dir_fd: int, name: str, *, strict: bool = False) -> int | None:
+    """``name`` 的目录 fd;不存在、是符号链接、不是目录都当没有。``strict``:其余失败(读不动)
+    照抛 —— 上传件目录打不开不能当成「没有上传」(review 3)。"""
     try:
         return _openat_dir(dir_fd, name, create=False)
-    except OSError:
+    except OSError as exc:
+        if strict and exc.errno not in _MISSING_ERRNOS:
+            raise
         return None
 
 
@@ -233,42 +239,47 @@ def _write_copy(src: int, size: int, dst_dir: int, name: str, info: os.stat_resu
     return digest.hexdigest()
 
 
-def _copy_upload(
-    src_dir: int | None, dst_dir: int, tmp_dir: int, expected: ExpectedUpload, budget: _Budget
-) -> str:
+#: 打开上传件源时这几种失败算「源不在了」(不存在 / 被换成符号链接 / socket / 不是目录);其余
+#: (EIO、EACCES ……)是读不动,整次复制失败、下次再试。
+_MISSING_ERRNOS = frozenset({errno.ENOENT, errno.ELOOP, errno.ENXIO, errno.ENOTDIR})
+
+
+def _copy_upload(src_dir: int | None, dst_dir: int, tmp_dir: int, expected: ExpectedUpload) -> str:
     """一个上传件;回计数键的后缀(``copied`` / ``existing`` / ``missing`` / ``mismatched`` /
-    ``over_cap``)。"""
+    ``unverifiable``)。读写失败(不是源不在、不是内容对不上)直接抛。
+
+    review 3 —— 上传件不算进字节上限;没有上传时记下的 sha256 就不复制(只凭大小,同样大小的
+    别人的件也对得上)。"""
     name = expected.name
     if not _safe_leaf(name) or src_dir is None:
         return "missing"
     if _exists(dst_dir, name):
         return "existing"
-    if not expected.sha256s and not expected.sizes:
-        return "mismatched"
+    if not expected.sha256s:
+        return "unverifiable"
     try:
         src = os.open(name, _READ_FLAGS, dir_fd=src_dir)
-    except OSError:
-        return "missing"  # 不存在 / 是符号链接(ELOOP)/ socket(ENXIO)
+    except OSError as exc:
+        if exc.errno in _MISSING_ERRNOS:
+            return "missing"
+        raise
     try:
         info = os.fstat(src)
         if not stat.S_ISREG(info.st_mode):
             return "missing"
-        if expected.sizes and not expected.sha256s and info.st_size not in expected.sizes:
+        if expected.sizes and info.st_size not in expected.sizes:
             return "mismatched"
-        if info.st_size > budget.bytes_left or budget.entries_left < 1:
-            return "over_cap"
         tmp_name = uuid4().hex
         digest = _write_copy(src, info.st_size, tmp_dir, tmp_name, info)
     finally:
         os.close(src)
     try:
-        if expected.sha256s and digest not in expected.sha256s:
+        if digest not in expected.sha256s:
             return "mismatched"
         try:
             os.link(tmp_name, name, src_dir_fd=tmp_dir, dst_dir_fd=dst_dir, follow_symlinks=False)
         except FileExistsError:
             return "existing"
-        budget.spend(size=info.st_size, files=1, entries=1)
         return "copied"
     finally:
         with contextlib.suppress(FileNotFoundError):
@@ -403,8 +414,8 @@ def copy_platform_files(
     """把本对话自己的上传件与 run 的工具结果从 agent 根复制进 ``threads/<conv>/work/``。
 
     同步、阻塞,调用方放进线程里跑。上传件在前(它们比工具结果要紧)。目标端
-    ``work/uploads`` / ``work/.tool_results`` 被换成符号链接之类会抛(不写标记、下次再试);
-    源端缺失或不合格的那一项只记数。
+    ``work/uploads`` / ``work/.tool_results`` 被换成符号链接之类、上传件读写失败都会抛(不写
+    标记、下次再试);源端缺失、内容对不上、确认不了的那一项只记数。
     """
     budget = _Budget(bytes_left=max_bytes)
     conv_fd = _conv_dir(store, tenant_id, user_id, agent_key, conv_id, create=True)
@@ -440,11 +451,20 @@ def _copy_uploads(
     uploads: Sequence[ExpectedUpload],
     budget: _Budget,
 ) -> None:
-    src = _optional_dir(agent_fd, WORKSPACE_UPLOADS_DIR) if agent_fd is not None else None
+    src = (
+        _optional_dir(agent_fd, WORKSPACE_UPLOADS_DIR, strict=True)
+        if agent_fd is not None
+        else None
+    )
     dst = _openat_dir(work_fd, WORKSPACE_UPLOADS_DIR, create=True)
     try:
         for expected in uploads:
-            budget.bump("uploads_" + _copy_upload(src, dst, tmp_fd, expected, budget))
+            outcome = _copy_upload(src, dst, tmp_fd, expected)
+            budget.bump("uploads_" + outcome)
+            if outcome == "copied":
+                size = os.lstat(expected.name, dir_fd=dst).st_size
+                budget.bytes += size  # 上传件不占 ``bytes_left``(只算工具结果)
+                budget.files += 1
     finally:
         os.close(dst)
         if src is not None:

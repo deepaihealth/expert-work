@@ -15,6 +15,7 @@ self-audit on read.
 from __future__ import annotations
 
 import abc
+from datetime import datetime
 from uuid import UUID
 
 from expert_work.protocol import AuditEntry, AuditPage, AuditQuery
@@ -48,6 +49,13 @@ class AuditLogStore(abc.ABC):
         Returns ``None`` when the row does not exist or belongs to a
         different tenant — never reveals cross-tenant existence.
         """
+
+    @abc.abstractmethod
+    async def list_document_uploads_for_thread(
+        self, *, tenant_id: UUID, thread_id: UUID, since: datetime | None = None
+    ) -> list[AuditEntry]:
+        """B-262 P3 —— 这个会话的成功 ``document:upload`` 审计行(``details.thread_id``),
+        ``since`` 起,按发生先后。老对话迁移按它找控制台上传(那些上传没有登记行)。"""
 
     @abc.abstractmethod
     async def query(self, query: AuditQuery) -> AuditPage:

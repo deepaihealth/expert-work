@@ -1515,7 +1515,10 @@ def create_app(
                         ),
                         threads=resolved_threads,
                         uploads=resolved_user_upload_store,
-                        runs=resolved_agent_runtime.run_manager,
+                        # 落库的 run 表(不是 RunManager 的进程内登记:重启 / 别的副本起的
+                        # run 不在那里)。没有落库(无库部署)就不搬 .tool_results(滤不掉
+                        # 别的会话的 run)。
+                        runs=resolved_agent_runtime.run_manager.store,
                         audit_store=sql_stores.audit_log if sql_stores is not None else None,
                         checkpointer=checkpointer,
                     )

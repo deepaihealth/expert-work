@@ -70,7 +70,7 @@ def test_own_uploads_are_copied_when_their_content_checks_out(tmp_path: Path) ->
         tmp_path,
         uploads=[
             ExpectedUpload(name="a.pdf", sha256s=frozenset({_sha(b"AAAA")})),
-            ExpectedUpload(name="b.pdf", sizes=frozenset({4})),
+            ExpectedUpload(name="b.pdf", sizes=frozenset({4}), sha256s=frozenset({_sha(b"BBBB")})),
         ],
     )
 
@@ -79,6 +79,17 @@ def test_own_uploads_are_copied_when_their_content_checks_out(tmp_path: Path) ->
     assert os.stat(_work(tmp_path) / "uploads" / "a.pdf").st_mtime == 1_000_000
     assert (report.uploads_copied, report.files_copied, report.bytes_copied) == (2, 2, 8)
     assert a.exists()  # 源不动:老视图的其它对话、/agent 下都还在
+
+
+def test_an_upload_without_a_recorded_sha256_is_unverifiable(tmp_path: Path) -> None:
+    """B-262 review 3 —— 只知道大小不够:同样大小的别人的件也对得上。没有 sha256 就不复制,
+    记成 ``unverifiable``(不挡迁移)。"""
+    _put(_agent(tmp_path) / "uploads" / "notes.txt", b"theirs:BBB")
+
+    report = _copy(tmp_path, uploads=[ExpectedUpload(name="notes.txt", sizes=frozenset({10}))])
+
+    assert not (_work(tmp_path) / "uploads" / "notes.txt").exists()
+    assert (report.uploads_unverifiable, report.files_copied) == (1, 0)
 
 
 def test_an_upload_overwritten_by_another_customer_is_not_copied(tmp_path: Path) -> None:
@@ -94,7 +105,11 @@ def test_an_upload_overwritten_by_another_customer_is_not_copied(tmp_path: Path)
     )
     sized = _copy(
         tmp_path,
-        uploads=[ExpectedUpload(name="report.pdf", sizes=frozenset({4}))],
+        uploads=[
+            ExpectedUpload(
+                name="report.pdf", sizes=frozenset({4}), sha256s=frozenset({_sha(b"mine")})
+            )
+        ],
     )
 
     assert not (_work(tmp_path) / "uploads" / "report.pdf").exists()
@@ -110,7 +125,7 @@ def test_existing_names_are_never_overwritten(tmp_path: Path) -> None:
 
     report = _copy(
         tmp_path,
-        uploads=[ExpectedUpload(name="a.pdf", sizes=frozenset({4}))],
+        uploads=[ExpectedUpload(name="a.pdf", sha256s=frozenset({_sha(b"AAAA")}))],
         runs=[run],
     )
 
@@ -136,27 +151,40 @@ def test_own_run_tool_results_are_copied_as_whole_trees(tmp_path: Path) -> None:
     assert not [n for n in os.listdir(dst.parent.parent) if n.startswith(pm.MIGRATE_TMP_PREFIX)]
 
 
-def test_the_byte_cap_skips_what_does_not_fit(tmp_path: Path) -> None:
-    """一个对话合计 ``max_bytes``:放不下的那一项整个跳过、记数,其余照常。"""
-    _put(_agent(tmp_path) / "uploads" / "a.pdf", b"A" * 6)
-    _put(_agent(tmp_path) / "uploads" / "b.pdf", b"B" * 6)
-    run = uuid4()
-    _put(_agent(tmp_path) / ".tool_results" / str(run) / "x.txt", b"X" * 3)
+def test_the_byte_cap_applies_to_tool_results_only(tmp_path: Path) -> None:
+    """一个对话合计 ``max_bytes`` 只算工具结果(review 3):本对话的上传不受它限,超了也照复制。
+    放不下的 run 整个跳过、记数,其余照常。"""
+    _put(_agent(tmp_path) / "uploads" / "big.pdf", b"U" * 20)
+    first, second = uuid4(), uuid4()
+    _put(_agent(tmp_path) / ".tool_results" / str(first) / "x.txt", b"X" * 6)
+    _put(_agent(tmp_path) / ".tool_results" / str(second) / "y.txt", b"Y" * 6)
 
     report = _copy(
         tmp_path,
-        uploads=[
-            ExpectedUpload(name="a.pdf", sizes=frozenset({6})),
-            ExpectedUpload(name="b.pdf", sizes=frozenset({6})),
-        ],
-        runs=[run],
+        uploads=[ExpectedUpload(name="big.pdf", sha256s=frozenset({_sha(b"U" * 20)}))],
+        runs=[first, second],
         max_bytes=10,
     )
 
-    assert (_work(tmp_path) / "uploads" / "a.pdf").exists()
-    assert not (_work(tmp_path) / "uploads" / "b.pdf").exists()
-    assert (_work(tmp_path) / ".tool_results" / str(run) / "x.txt").exists()
-    assert (report.uploads_over_cap, report.runs_over_cap, report.bytes_copied) == (1, 0, 9)
+    assert (_work(tmp_path) / "uploads" / "big.pdf").exists()
+    assert (_work(tmp_path) / ".tool_results" / str(first) / "x.txt").exists()
+    assert not (_work(tmp_path) / ".tool_results" / str(second)).exists()
+    assert (report.uploads_copied, report.runs_copied, report.runs_over_cap) == (1, 1, 1)
+    assert report.bytes_copied == 26
+
+
+def test_an_upload_that_cannot_be_read_fails_the_copy(tmp_path: Path) -> None:
+    """review 3 —— 上传件读不动(不是「不存在」也不是「内容对不上」):整次复制失败,调用方不翻、
+    不写标记,下次再试 —— 不能让本对话的上传就这么滞留在 agent 根。"""
+    src = _put(_agent(tmp_path) / "uploads" / "a.pdf", b"AAAA")
+    src.chmod(0)
+    try:
+        with pytest.raises(PermissionError):
+            _copy(
+                tmp_path, uploads=[ExpectedUpload(name="a.pdf", sha256s=frozenset({_sha(b"AAAA")}))]
+            )
+    finally:
+        src.chmod(0o600)
 
 
 def test_symlinks_are_never_followed(tmp_path: Path) -> None:
@@ -169,7 +197,7 @@ def test_symlinks_are_never_followed(tmp_path: Path) -> None:
 
     report = _copy(
         tmp_path,
-        uploads=[ExpectedUpload(name="a.pdf", sizes=frozenset({6}))],
+        uploads=[ExpectedUpload(name="a.pdf", sha256s=frozenset({_sha(b"SECRET")}))],
         runs=[run],
     )
 
@@ -180,7 +208,7 @@ def test_symlinks_are_never_followed(tmp_path: Path) -> None:
 
 @pytest.mark.parametrize("name", ["", ".", "..", "a/b", ".hidden", "x\x00y"])
 def test_unsafe_upload_names_are_refused(tmp_path: Path, name: str) -> None:
-    report = _copy(tmp_path, uploads=[ExpectedUpload(name=name, sizes=frozenset({1}))])
+    report = _copy(tmp_path, uploads=[ExpectedUpload(name=name, sha256s=frozenset({"0" * 64}))])
     assert report.uploads_missing == 1 and report.files_copied == 0
 
 
