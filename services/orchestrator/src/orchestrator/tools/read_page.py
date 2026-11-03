@@ -197,6 +197,7 @@ from orchestrator.tools.document_figures import (
     MIN_FIGURE_EDGE_PT,
     RENDERABLE_EXTENSIONS,
 )
+from orchestrator.tools.error_classifier import GuidedToolError
 from orchestrator.tools.file_ops import _require_path, _snippet, run_scoped_read
 from orchestrator.tools.region_zoom import Box, image_size, parse_box, pixel_box, region_dpi
 from orchestrator.tools.registry import ToolContext, ToolResult, ToolSpec
@@ -939,11 +940,24 @@ def _convert(full, out_dir):
     return pdfs[0], None
 
 
+def _discard(path):
+    try:
+        os.unlink(path)
+    except OSError:
+        pass
+
+
 def _render_job(pdf, out_dir, job):
     target = os.path.join(out_dir, job["name"])
     if os.path.isfile(target) and not os.path.islink(target):
+        # 复用时刷新修改时间: 新鲜度闸拿它与文档比, 留存清理也按它算。
+        try:
+            os.utime(target)
+        except OSError:
+            pass
         return target, True, None
     part = target[: -len(".jpg")] + "." + str(os.getpid()) + ".part"
+    made = part + ".jpg"
     try:
         result = subprocess.run(
             ["pdftoppm", "-jpeg", "-r", str(job["dpi"]),
@@ -953,13 +967,11 @@ def _render_job(pdf, out_dir, job):
              "-singlefile", pdf, part],
             capture_output=True, timeout=_P["render_timeout_s"], check=False)
     except Exception as exc:
+        # 超时被杀的 pdftoppm 可能已经写了半张: 不留给下一次。
+        _discard(made)
         return None, False, type(exc).__name__
-    made = part + ".jpg"
     if result.returncode != 0 or not os.path.isfile(made):
-        try:
-            os.unlink(made)
-        except OSError:
-            pass
+        _discard(made)
         return None, False, "pdftoppm_failed"
     os.replace(made, target)
     return target, False, None
@@ -1054,10 +1066,6 @@ def build_region_wrapper(
 
 #: 渲局部失败时给模型的话(English:B-266 起新增的平台文字)。
 _REGION_ERRORS: Final[dict[str, str]] = {
-    "stale": (
-        "the document changed after this page was rendered, so the region no longer matches it "
-        "- render the page again with read_page first"
-    ),
     "not_found": "the document is no longer in the workspace",
     "path_escapes_workspace": "the document path is outside the workspace",
     "io_error": "the document could not be read (I/O error)",
@@ -1069,6 +1077,18 @@ _REGION_ERRORS: Final[dict[str, str]] = {
 
 class RegionRenderError(RuntimeError):
     """B-266 —— 文档页的局部没能渲出来(文字说清原因与下一步)。"""
+
+
+class RegionStaleError(GuidedToolError, RegionRenderError):
+    """B-266 —— 整页渲染之后文档换了内容:原样重试没用,要先重新 ``read_page``。
+
+    带工具自己的建议(``GuidedToolError``),不走只读工具默认的「可安全重试一次」。"""
+
+
+_STALE_ADVICE = (
+    "Do not retry this call as is: call read_page for this page again first, then ask for the "
+    "region again."
+)
 
 
 @dataclass(frozen=True)
@@ -1736,24 +1756,38 @@ class ReadPageTool:
         )
         if not env.get("ok"):
             kind = str(env.get("error", "unknown"))
+            if kind == "stale":
+                msg = (
+                    f"{path} changed after page {figure.page} was rendered, so a region of that "
+                    f"render would not match the document. Call read_page(path={path!r}, "
+                    f"units=[{figure.unit}]) again first, then ask for the region again."
+                )
+                raise RegionStaleError(msg, advice=_STALE_ADVICE)
             reason = _REGION_ERRORS.get(kind, f"the region render failed ({kind})")
             raise RegionRenderError(reason)
         scope = figure_scope(ctx.workspace_view)
-        made: dict[str, Mapping[str, Any]] = {}
+        # 回包只是沙箱的说法:每一条的 rel 必须过 ``_validate_rendered_rel``(本次产出目录内、
+        # 不越权)、是裁图形状、并且正是宿主替这一项算好的那个文件 —— 否则当这一块没渲出来。
+        made: dict[str, tuple[str, Mapping[str, Any]]] = {}
         for item in env.get("crops") or ():
             if not isinstance(item, Mapping):
                 continue
+            name = str(item.get("name"))
             rel = _validate_rendered_rel(item.get("rel"), under=out_rel, base=base)
-            if rel is not None and is_rendered_crop_rel(rel[len(base) :]):
-                made[rel] = item
+            if (
+                rel is not None
+                and rel == f"{out_rel}/{name}"
+                and is_rendered_crop_rel(rel[len(base) :])
+            ):
+                made[name] = (rel, item)
         crops: list[RegionCrop] = []
         failed: list[tuple[Box, str]] = []
         for box, job in zip(boxes, jobs, strict=True):
-            rel = f"{out_rel}/{job['name']}"
-            item = made.get(rel)
-            if item is None:
+            found = made.get(str(job["name"]))
+            if found is None:
                 failed.append((box, _job_failure(env.get("failed"), str(job["name"]))))
                 continue
+            rel, item = found
             crops.append(
                 RegionCrop(
                     box=box,

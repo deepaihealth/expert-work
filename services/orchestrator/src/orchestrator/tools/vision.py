@@ -41,6 +41,7 @@ from expert_work.persistence import (
 )
 from expert_work.protocol.multimodal import (
     WORKSPACE_REF_PREFIX,
+    ImageRef,
     WorkspaceImageRef,
     parse_image_ref,
     parse_workspace_image_ref,
@@ -79,22 +80,24 @@ from orchestrator.tools.read_page import (
 from orchestrator.tools.region_zoom import (
     AUTO_REGION,
     LARGE_IMAGE_PIXELS,
-    NOT_FOUND,
     REGION_HINT,
     Box,
     Region,
     Tile,
-    TileResult,
-    aggregate_tiles,
     auto_tiles,
     crop_image,
+    crop_output_size,
     image_size,
-    is_not_found,
     parse_region,
-    pixel_box,
-    tile_question,
 )
 from orchestrator.tools.registry import ToolBlockedError, ToolContext, ToolResult, ToolSpec
+from orchestrator.tools.tile_reading import (
+    TileResult,
+    aggregate_tiles,
+    parse_tile_reply,
+    tile_meta,
+    tile_question,
+)
 from orchestrator.tools.workspace_paths import (
     PLATFORM_DIRS,
     agent_relative,
@@ -155,9 +158,26 @@ vision_deep_default_fallback_total = expert_work_counter(
 ask_image_region_auto_total = expert_work_counter(
     "expert_work_ask_image_region_auto_total",
     "ask_image region='auto' looks by aggregate outcome: one answer (single), tiles disagreeing "
-    "(conflict) or every tile answering NOT_FOUND (none) (B-266).",
+    "(conflict) or no tile reading a value (none) (B-266).",
     ("outcome",),
 )
+
+#: B-266 review —— 进程内同时在飞的「切块」看图调用上限。8 个并行 ``ask_image`` 各切 6 块
+#: 就是 48 个调用;超出的块排队,排队时间算在单次调用的上限里(等不到就按超时记)。
+MAX_TILE_CALLS_IN_FLIGHT = 12
+_TILE_SLOTS: weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, asyncio.Semaphore] = (
+    weakref.WeakKeyDictionary()
+)
+
+
+def _tile_slots() -> asyncio.Semaphore:
+    """本事件循环的切块调用闸(信号量绑定在创建它的循环上,所以按循环各一个)。"""
+    loop = asyncio.get_running_loop()
+    slots = _TILE_SLOTS.get(loop)
+    if slots is None:
+        slots = _TILE_SLOTS[loop] = asyncio.Semaphore(MAX_TILE_CALLS_IN_FLIGHT)
+    return slots
+
 
 AskImageDepth = Literal["quick", "deep"]
 _DEPTHS: tuple[AskImageDepth, ...] = ("quick", "deep")
@@ -313,7 +333,7 @@ class AskImageTool:
                 "required": ["image_ref", "question"],
             },
             # Stream L.L6 — VL LLM call against an immutable image
-            # reference. Pure read.
+            # reference; this variant has no ``region``, so it writes nothing.
             is_read_only=True,
         )
 
@@ -365,6 +385,8 @@ class AskImageTool:
         if tenant_of_ref != ctx.tenant_id:
             msg = "ask_image image_ref tenant does not match the run tenant"
             raise ToolBlockedError(msg)
+        if not ref_str.startswith(WORKSPACE_REF_PREFIX):
+            _refuse_another_conversations_upload(parse_image_ref(ref_str), ctx)
         if ref_str.startswith(WORKSPACE_REF_PREFIX):
             _refuse_another_conversations_run(parse_workspace_image_ref(ref_str), ctx)
             await self._require_readable_workspace_image(ref_str)
@@ -469,7 +491,7 @@ class AskImageTool:
         requested_depth: AskImageDepth,
         ctx: ToolContext,
     ) -> tuple[str, dict[str, Any]]:
-        """B-266 ``region="auto"`` —— 切 2x3 块并行快看,每块看不到完整答案就回 NOT_FOUND,再汇总。
+        """B-266 ``region="auto"`` —— 切 2x3 块并行快看,每块回一小段 JSON,再保守汇总。
 
         一律快看(``depth`` 忽略、meta 里注明):推理留给主模型。某几块失败(报错 / 超时 /
         截断)就汇总其余的、说清哪几块没看;全部失败才报错,与整页看失败同一种错误。
@@ -482,13 +504,13 @@ class AskImageTool:
         prompt = tile_question(question)
         outcomes = await asyncio.gather(
             *(
-                self._ask(_messages(crop_by_box[tile.box].ref, prompt), depth="quick", ctx=ctx)
+                self._ask_tile(_messages(crop_by_box[tile.box].ref, prompt), ctx=ctx)
                 for tile in looked
             ),
             return_exceptions=True,
         )
         by_label: dict[str, TileResult] = {}
-        tile_meta: dict[str, dict[str, Any]] = {}
+        crop_meta: dict[str, dict[str, Any]] = {}
         usages: list[Mapping[str, Any]] = []
         errors: list[Exception] = []
         for tile, outcome in zip(looked, outcomes, strict=True):
@@ -499,13 +521,13 @@ class AskImageTool:
             if isinstance(outcome, AIMessage) and outcome.usage_metadata:
                 usages.append(outcome.usage_metadata)
             crop = crop_by_box[tile.box]
-            tile_meta[tile.label] = {"dpi": crop.dpi, "pixels": [crop.width, crop.height]}
+            crop_meta[tile.label] = {"dpi": crop.dpi, "pixels": [crop.width, crop.height]}
         for tile in tiles:
             if tile.label not in by_label:
                 why = render_failed.get(tile.box, "not rendered")
-                by_label[tile.label] = TileResult(tile=tile, answer=None, error=why)
+                by_label[tile.label] = TileResult(tile=tile, reply=None, error=why)
         results = [by_label[tile.label] for tile in tiles]
-        if all(result.answer is None for result in results):
+        if all(result.reply is None for result in results):
             if errors:
                 raise errors[0]
             msg = "ask_image region='auto' could not look at any tile of this image"
@@ -516,7 +538,9 @@ class AskImageTool:
             "region": AUTO_REGION,
             "depth": "quick",
             "aggregate": verdict.outcome,
-            "tiles": [_tile_meta(result, tile_meta.get(result.tile.label)) for result in results],
+            "tiles": [
+                {**tile_meta(result), **crop_meta.get(result.tile.label, {})} for result in results
+            ],
             "vl_calls": len(looked),
         }
         if requested_depth != "quick":
@@ -524,6 +548,26 @@ class AskImageTool:
         if usages:
             meta["vl_usage"] = _sum_usage(usages)
         return verdict.content, meta
+
+    async def _ask_tile(self, messages: Sequence[BaseMessage], *, ctx: ToolContext) -> AIMessage:
+        """一块的快看:先排进 :data:`MAX_TILE_CALLS_IN_FLIGHT` 个名额里,排队不超过单次调用的上限
+        (也不超过 run 的剩余时间)。"""
+        slots = _tile_slots()
+        wait_s = self.timeout_s
+        if ctx.deadline_at is not None:
+            wait_s = min(wait_s, ctx.deadline_at - time.monotonic())
+        try:
+            async with asyncio.timeout(max(wait_s, 0.0)):
+                await slots.acquire()
+        except TimeoutError as exc:
+            msg = f"ask_image waited {wait_s:.0f} seconds for a free vision slot and gave up."
+            raise _AskImageTimeoutError(
+                msg, advice=_TIMEOUT_ADVICE, by_run_deadline=False, waited_s=wait_s
+            ) from exc
+        try:
+            return await self._ask(messages, depth="quick", ctx=ctx)
+        finally:
+            slots.release()
 
     async def _tile_result(
         self, tile: Tile, outcome: AIMessage | BaseException, *, ctx: ToolContext
@@ -533,17 +577,17 @@ class AskImageTool:
             raise outcome  # 取消等:照常往上走
         if isinstance(outcome, Exception):
             reason = "timed out" if isinstance(outcome, TimeoutError) else type(outcome).__name__
-            return TileResult(tile=tile, answer=None, error=reason), outcome
+            return TileResult(tile=tile, reply=None, error=reason), outcome
         await self._meter(outcome, ctx=ctx)
         if is_unusable_truncation(outcome):
             try:
                 self._raise_truncated(outcome)
             except GuidedToolError as exc:
-                return TileResult(tile=tile, answer=None, error="truncated"), exc
+                return TileResult(tile=tile, reply=None, error="truncated"), exc
         text = _stringify(outcome.content).strip()
         if not text:
-            return TileResult(tile=tile, answer=None, error="no text"), None
-        return TileResult(tile=tile, answer=text), None
+            return TileResult(tile=tile, reply=None, error="no text"), None
+        return TileResult(tile=tile, reply=parse_tile_reply(text)), None
 
     async def _crops(
         self, located: _Located, boxes: Sequence[Box], *, ctx: ToolContext
@@ -584,31 +628,33 @@ class AskImageTool:
         lister = _ScopeLister(
             store=store, tenant_id=ctx.tenant_id, user_id=ctx.user_id, scope=SCOPE_USER_ROOT
         )
-        existing = await lister.entries_if_present(out_dir)
-        reusable = {n for n in names if n in existing and not existing[n].is_dir}
-        todo = [box for box in boxes if region_crop_stem(box) + ".jpg" not in reusable]
-        pieces = (
-            dict(zip(todo, await asyncio.to_thread(crop_image, data, todo), strict=True))
-            if todo
-            else {}
-        )
-        size = image_size(data) if reusable else None
         crops: list[RegionCrop] = []
-        for box in boxes:
-            rel = f"{out_dir}/{region_crop_stem(box)}.jpg"
-            piece = pieces.get(box)
-            if piece is not None:
-                await store.write_file(
-                    tenant_id=ctx.tenant_id, user_id=ctx.user_id, path=rel, data=piece.data
-                )
-                width, height = piece.width, piece.height
-            else:
-                left, top, right, bottom = pixel_box(box, size or (0, 0))
-                width, height = right - left, bottom - top
-            ref = workspace_figure_ref(ctx.tenant_id, ctx.user_id, rel)
-            crops.append(
-                RegionCrop(box=box, ref=ref, width=width, height=height, reused=piece is None)
+        # 并行的两次 ask_image 看同一张图(常见:同一张化验单问两个值)会写同一批文件:排队,
+        # 后来的直接复用 —— 不排队时两边同时写同一个名字,NAS 的写入会互相踩掉。
+        async with self._render_lock((ctx.run_id, out_dir)):
+            existing = await lister.entries_if_present(out_dir)
+            reusable = {n for n in names if n in existing and not existing[n].is_dir}
+            todo = [box for box in boxes if region_crop_stem(box) + ".jpg" not in reusable]
+            pieces = (
+                dict(zip(todo, await asyncio.to_thread(crop_image, data, todo), strict=True))
+                if todo
+                else {}
             )
+            size = image_size(data) if reusable else None
+            for box in boxes:
+                rel = f"{out_dir}/{region_crop_stem(box)}.jpg"
+                piece = pieces.get(box)
+                if piece is not None:
+                    await store.write_file(
+                        tenant_id=ctx.tenant_id, user_id=ctx.user_id, path=rel, data=piece.data
+                    )
+                    width, height = piece.width, piece.height
+                else:
+                    width, height = crop_output_size(box, size or (0, 0))
+                ref = workspace_figure_ref(ctx.tenant_id, ctx.user_id, rel)
+                crops.append(
+                    RegionCrop(box=box, ref=ref, width=width, height=height, reused=piece is None)
+                )
         return RegionRender(crops=tuple(crops))
 
     def _render_lock(self, key: tuple[object, str]) -> asyncio.Lock:
@@ -891,8 +937,9 @@ def _spec_with_short_form() -> ToolSpec:
             "vague — the image stays accessible. In this order: first a quick look at the "
             "whole image (the default); when you need a specific value, a table entry or small "
             "text, look again with region='auto' — the image is cut into 6 overlapping tiles "
-            "read in parallel, and a tile that cannot see the complete answer says NOT_FOUND "
-            "instead of guessing; when you already know where it is (e.g. the vision model "
+            "read in parallel, each tile reports whether it can see the value instead of "
+            "guessing, and disagreements come back as a conflict with each tile's region; "
+            "when you already know where it is (e.g. the vision model "
             "told you), pass region=[x1, y1, x2, y2] on a 0-1000 scale to look at just that "
             "part. Pass depth='deep' only when the text is readable and the answer still needs "
             "reasoning, such as a chart's trend or a complex layout."
@@ -946,7 +993,10 @@ def _spec_with_short_form() -> ToolSpec:
             },
             "required": ["question"],
         },
-        # Stream L.L6 — VL LLM call against an immutable image reference. Pure read.
+        # Stream L.L6 —— 对源图只读。B-266 的 ``region`` 会往本 run 自己的
+        # ``.tool_results/<run>/crops/`` 写裁图:文件名由源内容哈希 + 框决定、写同样的字节,
+        # 文档页的局部在 ``(run, path)`` 锁里渲,图片的裁图在 ``(run, 裁图目录)`` 锁里写;
+        # 不改任何别人读的东西,所以调度上仍按只读处理。
         is_read_only=True,
     )
 
@@ -1024,6 +1074,25 @@ def _refuse_other_conversation(rel: str, ctx: ToolContext) -> None:
         if own is None or parts[3] != str(own):
             msg = "ask_image image_ref points into another conversation's directory"
             raise ToolBlockedError(msg)
+
+
+def _refuse_another_conversations_upload(ref: ImageRef, ctx: ToolContext) -> None:
+    """B-266 review —— 上传图 ref 里带着上传时的会话(``thread_id``):只认本对话的。
+
+    以前只比租户:同租户里换一条别的会话的上传 ref 就能看(带 ``region`` 时还会把它的像素
+    裁进本对话的工作区)。本对话 = ``ctx.thread_id``;委派出去的子代另认根对话
+    (``ctx.workspace_thread_id``)—— 父这一轮的图会原样交给子代。合法来源都是本会话的:
+    控制台 / 对外接口建 run 时都要求 ref 的 thread 就是本会话(``runs._validate_image_refs``、
+    ``agents.resolve_external_files``),``:edit`` / 重新生成也在同一会话里。
+
+    run 没绑会话(两个都是 ``None``,只有单测 / 合成评测)时无从比较,照旧放行。"""
+    own = {thread for thread in (ctx.thread_id, ctx.workspace_thread_id) if thread is not None}
+    if own and ref.thread_id not in own:
+        msg = (
+            "ask_image image_ref is an image uploaded in another conversation; only this "
+            "conversation's images can be read"
+        )
+        raise ToolBlockedError(msg)
 
 
 def _refuse_another_conversations_run(ref: WorkspaceImageRef, ctx: ToolContext) -> None:
@@ -1116,20 +1185,6 @@ def _messages(ref_str: str, text: str) -> list[BaseMessage]:
         SystemMessage(content=_SYSTEM_PROMPT),
         HumanMessage(content=[{"type": "text", "text": text}, image_ref_block(ref_str)]),
     ]
-
-
-def _tile_meta(result: TileResult, crop: Mapping[str, Any] | None) -> dict[str, Any]:
-    """meta 里一块的记录:位置、框、分辨率 / 像素、结果(NOT_FOUND / 值 / 失败原因)。"""
-    entry: dict[str, Any] = {"tile": result.tile.label, "box": list(result.tile.box)}
-    if crop is not None:
-        entry.update(crop)
-    if result.answer is None:
-        entry["error"] = result.error
-    elif is_not_found(result.answer):
-        entry["result"] = NOT_FOUND
-    else:
-        entry["result"] = result.answer
-    return entry
 
 
 def _sum_usage(usages: Sequence[Mapping[str, Any]]) -> dict[str, int]:

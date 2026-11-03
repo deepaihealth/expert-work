@@ -44,6 +44,7 @@ from orchestrator.tools.read_page import (
     _RENDER_TIMEOUT_S,
     ReadPageTool,
     RegionRenderError,
+    RegionStaleError,
     document_sha,
     workspace_figure_ref,
 )
@@ -51,16 +52,11 @@ from orchestrator.tools.region_zoom import (
     AUTO_REGION,
     MAX_REGION_DPI,
     MIN_REGION_AREA,
-    NOT_FOUND,
     REGION_HINT,
     REGION_TARGET_PIXELS,
-    TILE_INSTRUCTION,
     Tile,
-    TileResult,
-    aggregate_tiles,
     auto_tiles,
     crop_image,
-    is_not_found,
     parse_box,
     parse_region,
     pixel_box,
@@ -68,6 +64,7 @@ from orchestrator.tools.region_zoom import (
 )
 from orchestrator.tools.registry import ToolBlockedError, ToolContext
 from orchestrator.tools.sandbox import RecordingSandboxRuntime, SandboxOutcome
+from orchestrator.tools.tile_reading import TILE_INSTRUCTION
 from orchestrator.tools.vision import AskImageTool, ask_image_region_auto_total
 from orchestrator.tools.workspace_paths import WorkspaceView
 
@@ -181,75 +178,13 @@ def test_pixel_box_rounds_outwards_and_clamps_to_the_image() -> None:
     assert (left, right) == (333, 335)
 
 
-@pytest.mark.parametrize(
-    "answer",
-    ["NOT_FOUND", "not_found", " NOT_FOUND.", "**NOT_FOUND**", "`NOT_FOUND`", "Not found"],
-)
-def test_not_found_variants(answer: str) -> None:
-    assert is_not_found(answer)
-
-
-@pytest.mark.parametrize("answer", ["5.6 mmol/L", "NOTE: 5.6", "", "The value is NOT_FOUND"])
-def test_values_are_not_not_found(answer: str) -> None:
-    assert not is_not_found(answer)
-
-
 _TILES = auto_tiles()
+#: 一块按提示词回的 JSON(B-266 review M3)。
+NOT_FOUND = '{"status": "not_found", "label": "", "value": "", "unit": ""}'
 
 
-def _results(*answers: str | None) -> list[TileResult]:
-    return [
-        TileResult(tile=tile, answer=answer, error=None if answer is not None else "timed out")
-        for tile, answer in zip(_TILES, answers, strict=True)
-    ]
-
-
-def test_one_value_is_the_answer() -> None:
-    verdict = aggregate_tiles(
-        _results(NOT_FOUND, NOT_FOUND, "5.6", NOT_FOUND, NOT_FOUND, NOT_FOUND)
-    )
-    assert verdict.outcome == "single"
-    assert verdict.content.startswith("5.6\n")
-    assert "middle-left" in verdict.content
-    assert "other 5 replied NOT_FOUND" in verdict.content
-
-
-def test_identical_values_from_overlapping_tiles_agree() -> None:
-    verdict = aggregate_tiles(
-        _results(NOT_FOUND, NOT_FOUND, "5.6 mmol/L", "5.6  mmol/L.", NOT_FOUND, NOT_FOUND)
-    )
-    assert verdict.outcome == "single"
-    assert "middle-left, middle-right" in verdict.content
-    assert "conflict" not in verdict.content
-
-
-def test_different_values_are_returned_as_a_conflict() -> None:
-    verdict = aggregate_tiles(_results("5.6", NOT_FOUND, "6.5", NOT_FOUND, NOT_FOUND, NOT_FOUND))
-    assert verdict.outcome == "conflict"
-    assert "- top-left: 5.6" in verdict.content
-    assert "- middle-left: 6.5" in verdict.content
-    assert "Decide which one is right" in verdict.content
-
-
-def test_all_not_found_says_so_and_invents_nothing() -> None:
-    verdict = aggregate_tiles(_results(*[NOT_FOUND] * 6))
-    assert verdict.outcome == "none"
-    assert "every tile replied NOT_FOUND" in verdict.content
-    assert "too small" in verdict.content
-
-
-def test_failed_tiles_are_named_and_the_rest_still_aggregate() -> None:
-    verdict = aggregate_tiles(_results(None, NOT_FOUND, "5.6", NOT_FOUND, None, NOT_FOUND))
-    assert verdict.outcome == "single"
-    assert verdict.content.startswith("5.6\n")
-    assert "top-left (timed out), bottom-left (timed out)" in verdict.content
-
-
-def test_not_found_among_failures_does_not_claim_every_tile() -> None:
-    verdict = aggregate_tiles(_results(None, NOT_FOUND, NOT_FOUND, NOT_FOUND, NOT_FOUND, NOT_FOUND))
-    assert verdict.outcome == "none"
-    assert "every tile that answered" in verdict.content
-    assert "top-left (timed out)" in verdict.content
+def _found(value: str, *, unit: str = "", label: str = "") -> str:
+    return json.dumps({"status": "found", "label": label, "value": value, "unit": unit})
 
 
 # ---------------------------------------------------------------------------
@@ -632,12 +567,16 @@ async def test_a_region_on_a_document_changed_since_the_render_is_refused(
     vl = _VL()
     tool, _read_page, _runtime = _tools(doc, vl)
 
-    with pytest.raises(RegionRenderError, match="changed after this page was rendered"):
+    with pytest.raises(RegionStaleError, match="changed after page 1 was rendered") as info:
         await tool.call(
             {"path": doc.path, "unit": 1, "question": "?", "region": [0, 0, 500, 500]},
             ctx=doc.ctx,
         )
 
+    # B-266 review (f) —— 不是「原样重试一次」:先重新 read_page 这一页。
+    assert f"read_page(path={doc.path!r}, units=[1])" in str(info.value)
+    assert "call read_page for this page again first" in info.value.advice
+    assert isinstance(info.value, RegionRenderError)
     assert vl.calls == []
     assert _calls(bin_dir, "pdftoppm") == 0
 
@@ -672,7 +611,11 @@ async def test_auto_on_a_document_page_renders_six_tiles_in_one_exec_and_aggrega
     doc = _doc(tmp_path)
     middle_left = region_crop_stem(_TILES[2].box)
     vl = _VL(
-        answer=lambda ref: "5.6 mmol/L" if ref.endswith(f"-{middle_left}.jpg") else NOT_FOUND,
+        answer=lambda ref: (
+            _found("5.6", unit="mmol/L", label="GLU")
+            if ref.endswith(f"-{middle_left}.jpg")
+            else NOT_FOUND
+        ),
         usage={"input_tokens": 1400, "output_tokens": 5, "total_tokens": 1405},
     )
     metered: list[AIMessage] = []
@@ -706,8 +649,11 @@ async def test_auto_on_a_document_page_renders_six_tiles_in_one_exec_and_aggrega
         "total_tokens": 8430,
     }
     tiles = {t["tile"]: t for t in result.meta["tiles"]}
-    assert tiles["middle-left"]["result"] == "5.6 mmol/L"
-    assert tiles["top-left"]["result"] == NOT_FOUND
+    assert tiles["middle-left"]["status"] == "found"
+    assert (tiles["middle-left"]["value"], tiles["middle-left"]["unit"]) == ("5.6", "mmol/L")
+    assert tiles["middle-left"]["label"] == "GLU"
+    assert tiles["middle-left"]["parse_mode"] == "json"
+    assert tiles["top-left"]["status"] == "not_found"
     assert all(t["dpi"] and t["pixels"] for t in tiles.values())
     assert ask_image_region_auto_total.labels(outcome="single")._value.get() == before + 1
 
@@ -797,7 +743,7 @@ async def test_auto_on_an_upload_with_failing_tiles_names_them(tmp_path: Path) -
     def answer(ref: str) -> str:
         if ref.endswith(f"/{bottom}.jpg"):
             raise RuntimeError("vendor 500")
-        return "7" if ref.endswith(f"/{top_right}.jpg") else NOT_FOUND
+        return _found("7") if ref.endswith(f"/{top_right}.jpg") else NOT_FOUND
 
     vl = _VL(answer=answer)
     up = _upload(tmp_path, vl)
@@ -848,7 +794,7 @@ async def test_auto_tiles_that_time_out_are_reported_as_timed_out(tmp_path: Path
 
     assert result.meta["aggregate"] == "none"
     assert "top-left (timed out)" in result.content
-    assert "every tile that answered replied NOT_FOUND" in result.content
+    assert "no tile could see the complete answer (5 replied not_found)" in result.content
 
 
 @pytest.mark.anyio
@@ -965,7 +911,7 @@ def test_ask_image_offers_region_with_the_order_of_use() -> None:
     assert description.index("first a quick look") < description.index("region='auto'")
     assert description.index("region='auto'") < description.index("depth='deep' only when")
     assert "0-1000" in description
-    assert "NOT_FOUND" in description
+    assert "reports whether it can see the value instead of guessing" in description
 
 
 @pytest.mark.parametrize(

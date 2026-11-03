@@ -1,4 +1,5 @@
-"""B-266 —— 看图「放大局部」:``region`` 参数的校验、切块几何、分辨率、汇总,以及图片的宿主侧裁剪。
+"""B-266 —— 看图「放大局部」:``region`` 参数的校验、切块几何、分辨率,以及图片的宿主侧裁剪。
+每块回答的解析与汇总在 :mod:`orchestrator.tools.tile_reading`。
 
 为什么要裁:看图模型不论图多大都压到约 1,400 输入 token,整页里 7-10 像素的小字读对率只有一成;
 裁成一块再看,同样的预算看更小的面积(实测与数据见
@@ -16,11 +17,13 @@ from __future__ import annotations
 
 import io
 import math
+import threading
 from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Final, Literal
 
-from PIL import ExifTags, Image, ImageOps, UnidentifiedImageError
+from PIL import ExifTags, Image, UnidentifiedImageError
+from PIL.JpegImagePlugin import JpegImageFile
 
 #: 坐标尺度:``[x1, y1, x2, y2]`` 都在 0..1000。
 REGION_SCALE: Final = 1000
@@ -43,14 +46,6 @@ LARGE_IMAGE_PIXELS: Final = 2_000_000
 #: 裁图存成 JPEG 的质量 —— 与 B-263 上传转码同一档。
 CROP_JPEG_QUALITY: Final = 92
 
-#: 每块看不到完整答案时要回的那个词。
-NOT_FOUND: Final = "NOT_FOUND"
-#: 每块的提示词在用户原问题后面追加这一段;问题本身原样不动。
-TILE_INSTRUCTION: Final = (
-    "This image is one tile cut from a larger image, so the answer may not be in it. "
-    f"If the complete answer is not fully visible in this tile, reply with exactly {NOT_FOUND} "
-    "and nothing else. Do not guess."
-)
 #: 整页快看一张文档页或大图之后追加的提示。
 REGION_HINT: Final = (
     "(To read small text or exact numbers precisely, call ask_image again on the same image "
@@ -59,7 +54,6 @@ REGION_HINT: Final = (
 
 Box = tuple[int, int, int, int]
 Region = Box | Literal["auto"]
-AutoOutcome = Literal["single", "conflict", "none"]
 
 _ROW_NAMES: Final = ("top", "middle", "bottom")
 _COLUMN_NAMES: Final = ("left", "right")
@@ -158,88 +152,36 @@ def pixel_box(box: Box, size: tuple[float, float]) -> tuple[int, int, int, int]:
     return left, top, max(right, left + 1), max(bottom, top + 1)
 
 
-def tile_question(question: str) -> str:
-    """一块的提示词:用户的问题原样,后面加 :data:`TILE_INSTRUCTION`。"""
-    return f"{question}\n\n{TILE_INSTRUCTION}"
-
-
-def is_not_found(answer: str) -> bool:
-    """这一块的回答是不是「没看到」:去掉引号 / 星号后以 ``NOT_FOUND``(或 ``NOT FOUND``)开头。"""
-    head = answer.strip().strip("`*_\"'").upper()
-    return head.startswith((NOT_FOUND, "NOT FOUND"))
-
-
-@dataclass(frozen=True)
-class TileResult:
-    """一块看下来的结果:``answer`` 为 ``None`` 表示这一块的调用失败了(``error`` 是原因)。"""
-
-    tile: Tile
-    answer: str | None
-    error: str | None = None
-
-
-@dataclass(frozen=True)
-class AutoVerdict:
-    outcome: AutoOutcome
-    content: str
-
-
-def _normalize(answer: str) -> str:
-    return " ".join(answer.split()).strip().rstrip(".\u3002").casefold()
-
-
-def aggregate_tiles(results: Sequence[TileResult]) -> AutoVerdict:
-    """把各块的回答汇成一个结论(spec §1):单值 / 冲突 / 全无。至少要有一块没失败。"""
-    answered = [r for r in results if r.answer is not None]
-    failed = [r for r in results if r.answer is None]
-    values: dict[str, list[TileResult]] = {}
-    for result in answered:
-        if result.answer is not None and not is_not_found(result.answer):
-            values.setdefault(_normalize(result.answer), []).append(result)
-    if not values:
-        scope = "every tile" if not failed else "every tile that answered"
-        content = (
-            f"region='auto': {scope} replied {NOT_FOUND} - none of them could see the complete "
-            "answer. The text may be too small to read, or it is not in this image."
-        )
-        outcome: AutoOutcome = "none"
-    elif len(values) == 1:
-        group = next(iter(values.values()))
-        labels = ", ".join(r.tile.label for r in group)
-        others = len(answered) - len(group)
-        rest = f"; the other {others} replied {NOT_FOUND}" if others else ""
-        content = (
-            f"{(group[0].answer or '').strip()}\n\n(region='auto': read in tile {labels}{rest}.)"
-        )
-        outcome = "single"
-    else:
-        lines = [
-            f"- {', '.join(r.tile.label for r in group)}: {(group[0].answer or '').strip()}"
-            for group in values.values()
-        ]
-        content = (
-            "region='auto': the tiles gave conflicting answers:\n"
-            + "\n".join(lines)
-            + "\nDecide which one is right, or look again with an explicit region around the "
-            "part you need."
-        )
-        outcome = "conflict"
-    if failed:
-        names = ", ".join(f"{r.tile.label} ({r.error})" for r in failed)
-        content += f"\n(These tiles failed and were not read: {names}.)"
-    return AutoVerdict(outcome=outcome, content=content)
-
-
 #: EXIF 方向标记里「宽高互换」的那几个值(转 90 / 270 度)。
 _SWAPPED_ORIENTATIONS: Final = frozenset({5, 6, 7, 8})
+#: 方向标记 → 把原图转正要做的变换(与 ``ImageOps.exif_transpose`` 同一张表)。
+_UPRIGHT_METHODS: Final[dict[int, Image.Transpose]] = {
+    2: Image.Transpose.FLIP_LEFT_RIGHT,
+    3: Image.Transpose.ROTATE_180,
+    4: Image.Transpose.FLIP_TOP_BOTTOM,
+    5: Image.Transpose.TRANSPOSE,
+    6: Image.Transpose.ROTATE_270,
+    7: Image.Transpose.TRANSVERSE,
+    8: Image.Transpose.ROTATE_90,
+}
+#: 打开模型 / 用户给的字节时只认上传白名单这几种格式:别让 Pillow 按魔数去试 TIFF / PSD
+#: 之类别的解码器。手机的多图 JPEG(MPO)由 "JPEG" 这一项打开(Pillow 没有单独的 "MPO"
+#: 打开项,写进来反而 ``KeyError``)。
+OPEN_FORMATS: Final = ("PNG", "JPEG", "WEBP", "GIF")
+#: JPEG 缩小解码可选的倍数(libjpeg 的 DCT 缩放),从大往小试。
+_JPEG_DRAFT_SCALES: Final = (8, 4, 2)
+#: 进程内同时在做的宿主裁图上限:一张 6000 万像素的图解开就是几百 MB,
+#: 并行的 ``ask_image`` 不许一起解。阻塞在线程里等(调用方本来就在线程里跑)。
+HOST_CROP_SLOTS: Final = 2
+_HOST_CROP_SEMAPHORE = threading.BoundedSemaphore(HOST_CROP_SLOTS)
 
 
 def image_size(data: bytes) -> tuple[int, int] | None:
     """图片转正之后的像素尺寸(只读文件头,不解码);认不出来是 ``None``。"""
     try:
-        with Image.open(io.BytesIO(data)) as image:
+        with Image.open(io.BytesIO(data), formats=OPEN_FORMATS) as image:
             width, height = image.size
-            if image.getexif().get(ExifTags.Base.Orientation) in _SWAPPED_ORIENTATIONS:
+            if _orientation(image) in _SWAPPED_ORIENTATIONS:
                 return height, width
             return width, height
     except (UnidentifiedImageError, OSError, ValueError, Image.DecompressionBombError):
@@ -254,32 +196,120 @@ class CroppedImage:
 
 
 def crop_image(data: bytes, boxes: Sequence[Box]) -> list[CroppedImage]:
-    """按原像素裁出每个框(不放大),存成 JPEG。先按 EXIF 方向转正,与 B-263 上传的处理一致。
+    """按原像素裁出每个框(不放大;超过约 1.5 百万像素的缩到那个量),存成 JPEG。
+
+    省内存(一张 6000 万像素的 RGBA PNG 整张转一次就是几百 MB):
+    * 进程内最多 :data:`HOST_CROP_SLOTS` 张同时在裁;
+    * EXIF 方向不转整张图:把框换算到原图坐标、裁下来之后只转这一小块;
+    * 转 RGB / 铺白底只对裁下来的那一小块做;
+    * JPEG 在每一块都还够 :data:`REGION_TARGET_PIXELS` 的前提下用 ``draft`` 缩小解码。
 
     解码前先看像素数:超过 :data:`MAX_DECODE_PIXELS` 不解码,抛 :class:`RegionImageError`。
     同步、吃 CPU —— 调用方放到线程里跑。
     """
-    try:
-        with Image.open(io.BytesIO(data)) as image:
-            width, height = image.size
-            if width * height > MAX_DECODE_PIXELS:
-                msg = (
-                    f"the image is {width}x{height} pixels, over the {MAX_DECODE_PIXELS}-pixel "
-                    "limit for cropping"
-                )
-                raise RegionImageError(msg)
-            upright = ImageOps.exif_transpose(image)
-            rgb = _flatten(upright)
-    except (UnidentifiedImageError, OSError, Image.DecompressionBombError) as exc:
-        msg = f"the image could not be decoded for cropping ({type(exc).__name__})"
-        raise RegionImageError(msg) from exc
+    with _HOST_CROP_SEMAPHORE:
+        try:
+            with Image.open(io.BytesIO(data), formats=OPEN_FORMATS) as image:
+                return _crop_open_image(image, boxes)
+        except RegionImageError:
+            raise
+        except (UnidentifiedImageError, OSError, Image.DecompressionBombError) as exc:
+            msg = f"the image could not be decoded for cropping ({type(exc).__name__})"
+            raise RegionImageError(msg) from exc
+
+
+def _crop_open_image(image: Image.Image, boxes: Sequence[Box]) -> list[CroppedImage]:
+    width, height = image.size
+    if width * height > MAX_DECODE_PIXELS:
+        msg = (
+            f"the image is {width}x{height} pixels, over the {MAX_DECODE_PIXELS}-pixel "
+            "limit for cropping"
+        )
+        raise RegionImageError(msg)
+    orientation = _orientation(image)
+    if isinstance(image, JpegImageFile):
+        scale = _draft_scale((width, height), boxes)
+        if scale > 1:
+            image.draft(image.mode, (-(-width // scale), -(-height // scale)))
     crops: list[CroppedImage] = []
     for box in boxes:
-        piece = rgb.crop(pixel_box(box, rgb.size))
+        piece = _flatten(crop_upright(image, box, orientation))
+        piece = _cap_pixels(piece)
         buffer = io.BytesIO()
         piece.save(buffer, format="JPEG", quality=CROP_JPEG_QUALITY)
         crops.append(CroppedImage(data=buffer.getvalue(), width=piece.width, height=piece.height))
     return crops
+
+
+def _orientation(image: Image.Image) -> int:
+    value = image.getexif().get(ExifTags.Base.Orientation, 1)
+    return value if isinstance(value, int) and value in _UPRIGHT_METHODS else 1
+
+
+def _draft_scale(size: tuple[int, int], boxes: Sequence[Box]) -> int:
+    """JPEG 能缩小解码多少倍:每一块缩小后仍不少于 :data:`REGION_TARGET_PIXELS`(不够就不缩)。"""
+    width, height = size
+    smallest = min(
+        (x2 - x1) * (y2 - y1) * width * height / (REGION_SCALE * REGION_SCALE)
+        for x1, y1, x2, y2 in boxes
+    )
+    for scale in _JPEG_DRAFT_SCALES:
+        if smallest / (scale * scale) >= REGION_TARGET_PIXELS:
+            return scale
+    return 1
+
+
+def crop_upright(image: Image.Image, box: Box, orientation: int) -> Image.Image:
+    """转正之后那张图上的 ``box`` —— 不转整张图:框换算到原图坐标,裁下来再只转这一块。
+
+    与 ``ImageOps.exif_transpose(image).crop(pixel_box(box, 转正后尺寸))`` 逐像素相同
+    (测试对 8 种方向钉住)。"""
+    width, height = image.size
+    swapped = orientation in _SWAPPED_ORIENTATIONS
+    upright_size = (height, width) if swapped else (width, height)
+    left, top, right, bottom = pixel_box(box, upright_size)
+    corners = [
+        _raw_point(x, y, orientation, (width, height)) for x, y in ((left, top), (right, bottom))
+    ]
+    xs, ys = sorted(c[0] for c in corners), sorted(c[1] for c in corners)
+    piece = image.crop((xs[0], ys[0], xs[1], ys[1]))
+    method = _UPRIGHT_METHODS.get(orientation)
+    return piece if method is None else piece.transpose(method)
+
+
+def _raw_point(x: int, y: int, orientation: int, raw: tuple[int, int]) -> tuple[int, int]:
+    """转正后坐标 ``(x, y)`` 在原图上的位置(像素网格的角点,不是像素中心)。"""
+    width, height = raw
+    return {
+        1: (x, y),
+        2: (width - x, y),
+        3: (width - x, height - y),
+        4: (x, height - y),
+        5: (y, x),
+        6: (y, height - x),
+        7: (width - y, height - x),
+        8: (width - y, x),
+    }[orientation]
+
+
+def _capped(width: int, height: int) -> tuple[int, int]:
+    """超过约 1.5 百万像素就等比缩到那个量(看图模型反正会压);从不放大。"""
+    pixels = width * height
+    if pixels <= REGION_TARGET_PIXELS:
+        return width, height
+    factor = math.sqrt(REGION_TARGET_PIXELS / pixels)
+    return max(1, math.floor(width * factor)), max(1, math.floor(height * factor))
+
+
+def _cap_pixels(piece: Image.Image) -> Image.Image:
+    size = _capped(piece.width, piece.height)
+    return piece if size == piece.size else piece.resize(size, Image.Resampling.LANCZOS)
+
+
+def crop_output_size(box: Box, upright_size: tuple[int, int]) -> tuple[int, int]:
+    """:func:`crop_image` 对这个框出的图有多大(复用已裁好的图时报尺寸用)。"""
+    left, top, right, bottom = pixel_box(box, upright_size)
+    return _capped(right - left, bottom - top)
 
 
 def _flatten(image: Image.Image) -> Image.Image:

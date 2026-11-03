@@ -36,7 +36,7 @@ from orchestrator.tools.registry import ToolContext
 
 from .test_in_run_usage_metering import _KEY, _MAIN, _TENANT, _USER, _any_key
 from .test_served_model_metering import _QWEN, _U, _middleware, _record, _stamped
-from .test_vl_usage_metering import _fake_providers, _ref, _resolver, _vision_spec
+from .test_vl_usage_metering import _THREAD, _fake_providers, _ref, _resolver, _vision_spec
 
 
 @pytest.fixture
@@ -85,6 +85,8 @@ def _worker_ctx(frames: list[dict[str, Any]]) -> ToolContext:
         tenant_id=_TENANT,
         user_id=_USER,
         run_id=uuid4(),
+        # B-266 review —— 父 run 的会话就是图上传时的会话(子代按根对话认上传图)。
+        thread_id=_THREAD,
         worker_event_sink=_sink,
         tool_call_id="call-1",
         token_budget=TokenBudget(limit=10_000_000),

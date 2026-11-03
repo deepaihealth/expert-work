@@ -10,6 +10,7 @@ from io import BytesIO
 import pytest
 from PIL import Image, JpegImagePlugin
 
+from control_plane.api import _image_sanitize
 from control_plane.api._image_sanitize import ImageSanitizeError, ImageTooLargeError, strip_exif
 from control_plane.knowledge.recognition.figure_images import MAX_DECODE_PIXELS
 
@@ -460,3 +461,65 @@ def test_strip_exif_still_refuses_over_cap_non_jpeg_headers() -> None:
     """PNG 没有缩小解码,超上限照旧拒收(不解码)。"""
     with pytest.raises(ImageTooLargeError, match="pixel"):
         strip_exif(_png_header_only(8_000, 8_000), mime_type="image/png")
+
+
+# ---------------------------------------------------------------------------
+# B-266 review M4 —— 重编码后超过字节上限:先降质量再存,仍超就是「太大」。
+# ---------------------------------------------------------------------------
+
+
+def _q85_noisy_jpeg() -> bytes:
+    buf = BytesIO()
+    _noisy_rgb().save(buf, format="JPEG", quality=85)
+    return buf.getvalue()
+
+
+def test_strip_exif_falls_back_to_lower_quality_to_stay_within_the_byte_cap() -> None:
+    raw = _q85_noisy_jpeg()
+    with Image.open(BytesIO(raw)) as decoded:
+        decoded.load()
+        at_92 = BytesIO()
+        decoded.save(at_92, format="JPEG", quality=92)
+    assert len(at_92.getvalue()) > len(raw)  # 前提:q85 的原图按 q92 重存会变大
+
+    sanitised = strip_exif(raw, mime_type="image/jpeg", max_bytes=len(raw))
+
+    assert len(sanitised) <= len(raw)
+    with Image.open(BytesIO(sanitised)) as image:
+        assert image.format == "JPEG"
+
+
+def test_strip_exif_refuses_when_even_the_lowest_quality_is_over_the_byte_cap() -> None:
+    with pytest.raises(ImageTooLargeError, match="byte"):
+        strip_exif(_q85_noisy_jpeg(), mime_type="image/jpeg", max_bytes=1000)
+
+
+def test_strip_exif_refuses_a_lossless_reencode_over_the_byte_cap() -> None:
+    buf = BytesIO()
+    _noisy_rgb((64, 64)).save(buf, format="PNG")
+    with pytest.raises(ImageTooLargeError, match="byte"):
+        strip_exif(buf.getvalue(), mime_type="image/png", max_bytes=100)
+
+
+def test_strip_exif_without_a_cap_keeps_quality_92() -> None:
+    raw = _q85_noisy_jpeg()
+    with Image.open(BytesIO(raw)) as decoded:
+        decoded.load()
+        at_92 = BytesIO()
+        decoded.save(at_92, format="JPEG", quality=92, exif=b"")
+    assert strip_exif(raw, mime_type="image/jpeg") == at_92.getvalue()
+
+
+def test_strip_exif_shrinks_an_over_cap_mpo_like_a_jpeg(monkeypatch: pytest.MonkeyPatch) -> None:
+    """B-266 review —— 手机的多图 JPEG(MPO)``format`` 是 "MPO",也要走缩小解码,不能拒收。"""
+    monkeypatch.setattr(_image_sanitize, "MAX_DECODE_PIXELS", 20_000)
+    first, second = _noisy_rgb((200, 200)), _noisy_rgb((200, 200))
+    buf = BytesIO()
+    first.save(buf, format="MPO", save_all=True, append_images=[second])
+    with Image.open(BytesIO(buf.getvalue())) as probe:
+        assert probe.format == "MPO"
+
+    sanitised = strip_exif(buf.getvalue(), mime_type="image/jpeg")
+
+    with Image.open(BytesIO(sanitised)) as image:
+        assert image.width * image.height <= 20_000

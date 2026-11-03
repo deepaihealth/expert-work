@@ -642,9 +642,10 @@ async def _prepare_image_upload(
     # + gets sha256'd for the audit row — every consumer sees the
     # same metadata-free bytes.
     try:
-        raw = strip_exif(raw, mime_type=content_type)
+        raw = strip_exif(raw, mime_type=content_type, max_bytes=max_bytes)
     except ImageTooLargeError as exc:
-        # B-263:像素数超上限(解压炸弹 / 超大海报扫描)与超字节上限同属「太大」,同一个 413。
+        # B-263:像素数超上限(解压炸弹 / 超大海报扫描)与超字节上限同属「太大」,同一个 413;
+        # 重编码后降质量仍超字节上限的也在这里(B-266 review)。
         raise HTTPException(status_code=413, detail=str(exc)) from exc
     except ImageSanitizeError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc

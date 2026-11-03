@@ -368,7 +368,8 @@ async def test_built_agent_meters_ask_image_under_the_run_trace(
         )
         cfg: RunnableConfig = {
             "configurable": {
-                "thread_id": str(uuid4()),
+                # B-266 review —— run 的会话 = 图上传时的会话(建 run 时就是这么校验的)。
+                "thread_id": str(_THREAD),
                 "tenant_id": str(_TENANT),
                 "user_id": str(_USER),
                 "run_id": str(uuid4()),

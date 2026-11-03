@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import random
 import struct
 import zlib
 from collections.abc import AsyncIterator
@@ -903,4 +904,35 @@ async def test_upload_rejects_over_cap_png_with_413(setup: Setup) -> None:
     )
     assert response.status_code == 413
     assert "pixel" in response.json()["detail"]
+    assert await store.list_prefix(f"{_TENANT}/uploads/{thread_id}/") == []
+
+
+def _jpeg_that_grows_on_reencode() -> bytes:
+    """40 x 40 随机像素存成 q20:原图在 1024 字节的上限内,按 q92 / q85 / q75 重存都超过它。"""
+    rng = random.Random(0)  # noqa: S311 —— 测试数据,要的是可复现
+    image = Image.new("RGB", (40, 40))
+    image.putdata([tuple(rng.randrange(256) for _ in range(3)) for _ in range(40 * 40)])
+    buf = BytesIO()
+    image.save(buf, format="JPEG", quality=20)
+    return buf.getvalue()
+
+
+@pytest.mark.asyncio
+async def test_upload_rejects_an_image_that_reencodes_past_the_byte_cap(setup: Setup) -> None:
+    """B-266 review M4:原图在字节上限内,但重编码(连降到 q75)后超过 —— 413,不存一份超限的。"""
+    raw = _jpeg_that_grows_on_reencode()
+    assert len(raw) <= 1024
+    with Image.open(BytesIO(raw)) as decoded:
+        decoded.load()
+        for quality in (92, 85, 75):
+            again = BytesIO()
+            decoded.save(again, format="JPEG", quality=quality)
+            assert len(again.getvalue()) > 1024, quality
+    client, thread_id, store = setup
+    response = await client.post(
+        f"/v1/sessions/{thread_id}/uploads",
+        files={"file": ("photo.jpg", raw, "image/jpeg")},
+    )
+    assert response.status_code == 413
+    assert "byte" in response.json()["detail"]
     assert await store.list_prefix(f"{_TENANT}/uploads/{thread_id}/") == []
