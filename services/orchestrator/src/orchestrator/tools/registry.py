@@ -35,6 +35,10 @@ WorkspaceLayout = Literal["conversation", "agent_root"]
 #: ``_child_run._child_config`` 给子代写根对话的 id。
 WORKSPACE_LAYOUT_KEY = "workspace_layout"
 WORKSPACE_THREAD_ID_KEY = "workspace_thread_id"
+#: B-262 P3 —— 这一轮 run 开始前,控制面把这条老对话迁到了对话视图(``control_plane.
+#: platform_migration``):这一轮的平台段给模型一句一次性说明。只有起新 run 的入口写它;
+#: ``_child_config`` 不往子代传。
+WORKSPACE_MIGRATED_KEY = "workspace_migrated"
 #: B-262 —— ``_child_run._child_config`` 给子代写父对话渲染过页的 run(见
 #: :attr:`ToolContext.figure_run_ids`)。
 FIGURE_RUN_IDS_KEY = "figure_run_ids"

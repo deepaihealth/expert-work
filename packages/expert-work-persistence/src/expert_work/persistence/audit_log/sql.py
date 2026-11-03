@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from datetime import datetime
 from typing import Final
 from uuid import UUID
 
@@ -104,6 +105,24 @@ class SqlAuditLogStore(AuditLogStore):
             if row is None or row.tenant_id != tenant_id:
                 return None
             return _row_to_entry(row)
+
+    async def list_document_uploads_for_thread(
+        self, *, tenant_id: UUID, thread_id: UUID, since: datetime | None = None
+    ) -> list[AuditEntry]:
+        # ``audit_log_action_idx (tenant_id, action, occurred_at)`` 把扫描收在本租户、本动作、
+        # ``since`` 之后;``details->>'thread_id'`` 没有索引,在那批行上过滤。
+        stmt = select(AuditLogRow).where(
+            AuditLogRow.tenant_id == tenant_id,
+            AuditLogRow.action == AuditAction.DOCUMENT_UPLOAD.value,
+            AuditLogRow.result == AuditResult.SUCCESS.value,
+            AuditLogRow.details["thread_id"].astext == str(thread_id),
+        )
+        if since is not None:
+            stmt = stmt.where(AuditLogRow.occurred_at >= since)
+        stmt = stmt.order_by(AuditLogRow.id.asc())
+        async with self._sf() as session:
+            rows = list((await session.execute(stmt)).scalars().all())
+        return [_row_to_entry(r) for r in rows]
 
     async def query(self, query: AuditQuery) -> AuditPage:
         stmt = select(AuditLogRow)

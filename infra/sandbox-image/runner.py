@@ -224,6 +224,19 @@ def hide_threads(view, own_dir, own):
         bind(own_dir, slot)
 
 
+def hide_platform(view):
+    # Conversation view: /workspace/<d> is a plain dir of this conversation; the
+    # agent-root ones (used by older conversations of this agent) are covered by
+    # an empty read-only tmpfs, so a write there fails instead of vanishing.
+    for d in PLATFORM_DIRS:
+        try:
+            target = sub(view, d, True)
+        except OSError:
+            say(d + " is not a plain directory in the agent root; not covered")
+            continue
+        ro(attach(tmpfs((b"size", b"1k"), (b"mode", b"0500")), target), "/agent/" + d, SEALED)
+
+
 def nas_view(root, conv, own):
     nas = os.open("/mnt/workspace", os.O_PATH | os.O_DIRECTORY | os.O_CLOEXEC)
     agent = os.open("/agent", DIR)
@@ -244,21 +257,7 @@ def nas_view(root, conv, own):
     view = bind(top, agent)
     if conv:
         ws = bind(work, workspace)
-        for d in PLATFORM_DIRS:
-            try:
-                source = sub(top, d, True)
-            except OSError:
-                say(d + " is not a plain directory in the agent root; not mounted")
-                continue
-            try:
-                target = sub(ws, d, True)
-            except OSError:
-                say("/workspace/" + d + " is not a directory; " + d + "/ not mounted")
-                continue
-            try:
-                bind(source, target)
-            except OSError as e:
-                say(d + "/ not mounted: " + str(e))
+        hide_platform(view)
     else:
         ws = bind(top, workspace)
         hide_threads(ws, own_dir, own)

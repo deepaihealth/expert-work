@@ -46,7 +46,7 @@ from orchestrator.tools import (
     WorkspacePermissionError,
     WorkspaceStore,
 )
-from orchestrator.tools.workspace_paths import AGENTS_DIR
+from orchestrator.tools.workspace_paths import AGENTS_DIR, CONVERSATION_WORK_DIR, THREADS_DIR
 
 logger = logging.getLogger("expert_work.control_plane.workspace")
 
@@ -93,6 +93,36 @@ def workspace_agent_path(rel: str, *, agent_key: str) -> str:
     if not agent_key:
         return rel
     return f"{AGENTS_DIR}/{agent_key}/{rel}"
+
+
+def conversation_workspace_path(rel: str, *, agent_key: str, conv_id: UUID | None) -> str:
+    """B-262 —— 一个会话 ``/workspace`` 相对的路径(``uploads/<名字>`` 这类)→ 用户根下的
+    存储路径。
+
+    ``conv_id`` 非 ``None``(对话视图的会话,且绑了 agent)时是本对话的
+    ``agents/<key>/threads/<conv>/work/<rel>``;否则(老视图 / 没绑 agent)与
+    :func:`workspace_agent_path` 一样落 agent 根(或用户根)。
+    """
+    if conv_id is None or not agent_key:
+        return workspace_agent_path(rel, agent_key=agent_key)
+    return workspace_agent_path(
+        f"{THREADS_DIR}/{conv_id}/{CONVERSATION_WORK_DIR}/{rel}", agent_key=agent_key
+    )
+
+
+def thread_conversation_id(meta: ThreadMeta) -> UUID | None:
+    """B-262 —— 这个会话有没有自己的 ``/workspace``:对话视图且绑了 agent → 会话 id;否则
+    ``None``(``/workspace`` 是 agent 根或用户根)。与 exec 视图同一个判据。"""
+    if meta.workspace_layout != "conversation" or not thread_agent_key(meta):
+        return None
+    return meta.thread_id
+
+
+def thread_workspace_path(rel: str, meta: ThreadMeta) -> str:
+    """B-262 —— 会话 ``meta`` 的 ``/workspace`` 相对路径 → 用户根下的存储路径(按它自己的布局)。"""
+    return conversation_workspace_path(
+        rel, agent_key=thread_agent_key(meta), conv_id=thread_conversation_id(meta)
+    )
 
 
 def thread_agent_key(meta: ThreadMeta) -> str:

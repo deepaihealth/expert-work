@@ -450,3 +450,41 @@ async def test_a_deeply_nested_real_list_never_fails_the_run(
     assert runtime.execs == []
     own = [r for r in caplog.records if r.name == "orchestrator.graph_builder.inputs_node"]
     assert [r.getMessage() for r in own] == ["inputs.build_failed"]
+
+
+class _ViewRecordingRuntime(_FakeRuntime):
+    """B-262 —— 另记下每次 exec 的视图参数(agent key / 对话 / 线程)。"""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.views: list[tuple[Any, Any, Any]] = []
+
+    async def exec(self, *, code: str, **kwargs: Any) -> Any:
+        self.views.append(
+            (kwargs.get("agent_key"), kwargs.get("conv_id"), kwargs.get("workspace_thread_id"))
+        )
+        return await super().exec(code=code, **kwargs)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("layout", ["conversation", "agent_root"])
+async def test_inputs_land_in_this_conversations_workspace(layout: str) -> None:
+    """B-262 —— 对话视图里 ``inputs.json`` 与预拉缓存都在本对话 ``work/inputs/``:写文件按
+    ``/agent`` 寻址时加上本对话那一格,预拉 exec 跑在对话视图里(``$EXPERT_WORK_INPUTS`` /
+    ``inputs/cache`` 都相对它的 ``/workspace``)。老视图照旧落 agent 根。"""
+    runtime = _ViewRecordingRuntime()
+    run_id, conv = uuid4(), uuid4()
+    node = make_inputs_node(client=runtime, variables=(PromptVariableSpec(name="org_logo"),))
+    config = _config(run_id, uuid4(), uuid4(), {"org_logo": "https://x/a.jpg"})
+    config["configurable"].update(
+        agent_key="plan-aaaaaaaa", thread_id=str(conv), workspace_layout=layout
+    )
+    await node({}, config)
+    write_code, _prefetch = runtime.execs
+    rel = f"inputs/{run_id}/inputs.json"
+    if layout == "conversation":
+        assert json.dumps(f"threads/{conv}/work/{rel}") in write_code
+        assert runtime.views == [("plan-aaaaaaaa", conv, conv)] * 2
+    else:
+        assert json.dumps(rel) in write_code and "threads/" not in write_code
+        assert runtime.views == [("plan-aaaaaaaa", None, conv)] * 2

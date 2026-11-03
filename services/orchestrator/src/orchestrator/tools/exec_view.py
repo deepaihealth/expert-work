@@ -52,8 +52,10 @@ B-236 —— 按对话分目录。``$2`` 是对话 id(空 = 老视图,发布前�
 * ``/agent/threads`` 被一块空 tmpfs 盖住,只把**本对话**那一格 bind 回来(状态投影写
   ``threads/<conv>/PLAN.md`` 要用)。老视图同理:``/workspace/threads`` 与
   ``/agent/threads`` 都盖住,只留自己那一格;线程 id 为空就整个 ``threads/`` 都不给看。
-* 平台目录(``uploads`` / ``inputs`` / ``.tool_results``)仍在 agent 根,读写 bind 进
-  ``/workspace``,平台发给模型的相对路径照旧可用。
+* B-262 —— 平台目录(``uploads`` / ``inputs`` / ``.tool_results``)就是本对话 ``work/``
+  下的普通子目录,不再从 agent 根 bind 进来;``/agent`` 下的同名三个目录(老视图的对话还在
+  用)各盖一块空 tmpfs(与 ``threads/`` 同一手法,另加只读:写进去报错而不是悄悄丢掉)。
+  平台发给模型的相对路径一个字不变。
 * agent 根下原有的基础目录(风格锚、模板……)不在这里挂:对话开场时控制面在宿主侧把它们
   复制进本对话的 ``work/``(:mod:`orchestrator.graph_builder.conversation_seed`),exec 看到的
   就是本对话自己的那份。
@@ -77,8 +79,9 @@ mount ns 的全部能力,``/mnt/workspace`` 也还没盖住)。所以整个挂�
   ``/proc/self/fd/<那棵树>``(内核 5.10 还没有 ``mount_setattr``)。
 * agent 根:``$1`` 的最后两段(``agents`` 与 key)不许是符号链接,其余前缀(NAS 挂载点,
   云上是平台建的符号链接)照常解析。``threads`` / 本对话目录 / 工作目录不合格 → 98 退出;
-  平台目录不合格 → 写一行 stderr、这次不挂,exec 照常跑(一个被种下的普通
-  文件不该让这个 agent 之后的每一次 exec 都失败);用户根的 ``shared`` 不是真目录同样跳过。
+  agent 根下的平台目录(对话视图里要盖住的)不合格 → 写一行 stderr、这次不盖,exec 照常跑
+  (一个被种下的普通文件不该让这个 agent 之后的每一次 exec 都失败);用户根的 ``shared`` 不是
+  真目录同样跳过。
 * 第一次碰 NAS 之后不再按 ``PATH`` 找任何命令:python 与最后的 ``unshare`` 都写绝对路径,
   脚本开头另把 ``PATH`` 钉成系统目录(纵深防御),交给载荷之前还原成调用方给的值。B-242 起
   外层的 ``unshare`` / ``sh`` 也写绝对路径。
@@ -110,7 +113,7 @@ from orchestrator.tools.workspace_paths import agent_nas_root
 #: 逐条见 spec §4.3。``REMOUNT_RO``(remount,bind,ro,nosuid,nodev,noexec):userns 里 remount 不能
 #: **去掉**源挂载上锁住的 flag,但可以**加**,三个都写上永远合法。``size=1k`` 让盖住
 #: 用户根的 tmpfs 没法当可写盘。**不挂用户根的 uploads**:它在 ``agents/<key>/uploads``
-#: (对话视图里 bind 进来的是 agent 根的那一份)。
+#: (B-262 起对话视图里是本对话 ``work/uploads``,agent 根那一份被盖住)。
 EXEC_VIEW_SCRIPT = """\
 set -eu
 ew_path="${PATH-}"
@@ -267,6 +270,19 @@ def hide_threads(view, own_dir, own):
         bind(own_dir, slot)
 
 
+def hide_platform(view):
+    # Conversation view: /workspace/<d> is a plain dir of this conversation; the
+    # agent-root ones (used by older conversations of this agent) are covered by
+    # an empty read-only tmpfs, so a write there fails instead of vanishing.
+    for d in PLATFORM_DIRS:
+        try:
+            target = sub(view, d, True)
+        except OSError:
+            say(d + " is not a plain directory in the agent root; not covered")
+            continue
+        ro(attach(tmpfs((b"size", b"1k"), (b"mode", b"0500")), target), "/agent/" + d, SEALED)
+
+
 def nas_view(root, conv, own):
     nas = os.open("/mnt/workspace", os.O_PATH | os.O_DIRECTORY | os.O_CLOEXEC)
     agent = os.open("/agent", DIR)
@@ -287,21 +303,7 @@ def nas_view(root, conv, own):
     view = bind(top, agent)
     if conv:
         ws = bind(work, workspace)
-        for d in PLATFORM_DIRS:
-            try:
-                source = sub(top, d, True)
-            except OSError:
-                say(d + " is not a plain directory in the agent root; not mounted")
-                continue
-            try:
-                target = sub(ws, d, True)
-            except OSError:
-                say("/workspace/" + d + " is not a directory; " + d + "/ not mounted")
-                continue
-            try:
-                bind(source, target)
-            except OSError as e:
-                say(d + "/ not mounted: " + str(e))
+        hide_platform(view)
     else:
         ws = bind(top, workspace)
         hide_threads(ws, own_dir, own)

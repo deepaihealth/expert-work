@@ -47,6 +47,11 @@ DELETED_DIR = ".deleted"
 #: ``.tool_results/<run_id>/``(不跨包 import,理由见模块头)。
 TOOL_RESULTS_DIR = ".tool_results"
 
+#: B-262 P1 —— 对话视图里一个对话的 ``/workspace`` 是 ``threads/<conv>/work/``(与
+#: ``orchestrator.tools.workspace_paths.CONVERSATION_WORK_DIR`` 同值),它的
+#: ``.tool_results/`` 在那下面。
+CONVERSATION_WORK_DIR = "work"
+
 #: ``agent_key`` 目录名的合法形状,与 ``sanitize_agent_key`` 的产物一致
 #: (``expert_work.protocol.agent_key``)。目录名是从 ``scandir`` 读来的,
 #: 会被拼进一条要 ``rmtree`` 的路径 —— 带 ``/`` 或 ``..`` 的名字能把删除
@@ -91,6 +96,8 @@ class ToolResultDir:
     path: Path
     newest_mtime: float
     agent_key: str = ""
+    #: B-262 P1 —— 在哪个对话的 ``threads/<conv>/work/`` 下;``None`` = agent 根(或用户根)。
+    conversation_id: UUID | None = None
 
 
 def user_root(root: str, tenant_id: UUID, user_id: UUID) -> Path:
@@ -244,18 +251,51 @@ def remove_thread_dir(
 
 
 def remove_tool_result_dir(
-    root: str, tenant_id: UUID, user_id: UUID, run_id: UUID, *, agent_key: str = ""
+    root: str,
+    tenant_id: UUID,
+    user_id: UUID,
+    run_id: UUID,
+    *,
+    agent_key: str = "",
+    conversation_id: UUID | None = None,
 ) -> bool:
-    """``rm -rf {user_root}/[agents/<key>/].tool_results/{run_id}``。
+    """``rm -rf {user_root}/[agents/<key>/][threads/<conv>/work/].tool_results/{run_id}``。
 
     spec §4.2:``.tool_results/<run_id>/`` 与 ``threads/<id>/`` 同一套生命周期
     (会话 purge 连带删 + 孤儿宽限扫描)。在此之前它**从没被清过** ——
     ``overflow.py`` 的注释声称留存机制负责它的生命周期,而留存 job 的不变式
     恰恰是「根目录其它文件永不触碰」,那条注释是假的(实测单用户堆了 40 个 run
     目录)。
+
+    B-262 P1 —— ``conversation_id`` 非空:对话视图的那一份,在该 agent 的
+    ``threads/<conv>/work/`` 下。中间四段(``threads`` / 对话目录 / ``work`` / ``.tool_results``)
+    逐段 ``lstat``,任何一段不是真目录(载荷能把本对话的 ``work`` 或 ``.tool_results`` 换成软链)
+    → :class:`UnsafeWorkspacePathError`。
     """
+    if conversation_id is None:
+        return _remove_uuid_named_dir(
+            root, tenant_id, user_id, agent_key=agent_key, container=TOOL_RESULTS_DIR, name=run_id
+        )
+    if not agent_key:
+        raise UnsafeWorkspacePathError("a conversation directory needs an agent subtree")
+    _ensure_plain_dirs(root, tenant_id, user_id)
+    base = agent_subtree(user_root(root, tenant_id, user_id), agent_key)
+    work = base
+    for part in (THREADS_DIR, str(conversation_id), CONVERSATION_WORK_DIR, TOOL_RESULTS_DIR):
+        work = work / part
+        try:
+            st = os.lstat(work)
+        except FileNotFoundError:
+            return False
+        if stat.S_ISLNK(st.st_mode) or not stat.S_ISDIR(st.st_mode):
+            raise UnsafeWorkspacePathError(f"conversation path is not a directory: {part}")
     return _remove_uuid_named_dir(
-        root, tenant_id, user_id, agent_key=agent_key, container=TOOL_RESULTS_DIR, name=run_id
+        root,
+        tenant_id,
+        user_id,
+        agent_key=agent_key,
+        container=f"{THREADS_DIR}/{conversation_id}/{CONVERSATION_WORK_DIR}/{TOOL_RESULTS_DIR}",
+        name=run_id,
     )
 
 
@@ -371,26 +411,54 @@ def iter_thread_dirs(root: str) -> Iterator[ThreadDir]:
             )
 
 
+def _is_plain_dir(path: Path) -> bool:
+    """``lstat`` 判:真目录(不是软链)。不存在 / stat 失败当作不是。"""
+    try:
+        return stat.S_ISDIR(os.lstat(path).st_mode)
+    except OSError:
+        return False
+
+
+def _conversation_work_dirs(base: Path) -> Iterator[tuple[UUID, Path]]:
+    """B-262 P1 —— 一个 agent 子树下各对话的 ``threads/<conv>/work/``(三段都得是真目录,
+    对话目录名得是 UUID —— 载荷写得进本对话那一格,能把 ``work`` 换成软链)。"""
+    if not _is_plain_dir(base / THREADS_DIR):
+        return
+    for conv_id, conv_dir in _uuid_dirs(base / THREADS_DIR):
+        work = conv_dir / CONVERSATION_WORK_DIR
+        if _is_plain_dir(work):
+            yield conv_id, work
+
+
 def iter_tool_result_dirs(root: str) -> Iterator[ToolResultDir]:
-    """枚举 ``{root}/<tenant>/<user>/[agents/<key>/].tool_results/<run_id>/``。
+    """枚举 ``{root}/<tenant>/<user>/[agents/<key>/][threads/<conv>/work/]``
+    ``.tool_results/<run_id>/``。
 
     与 :func:`iter_thread_dirs` 同一套规矩,只是容器段和 id 的含义不同
-    (run_id 而非 thread_id)。
+    (run_id 而非 thread_id)。B-262 P1 起还枚举每个 agent 子树下各对话 ``work/`` 里的那一份
+    (对话视图的超长结果与渲染页落在那里)。
     """
     for tenant_id, user_id, agent_key, base in _scan_roots(root):
-        for run_id, run_dir in _uuid_dirs(base / TOOL_RESULTS_DIR):
-            try:
-                newest = _newest_mtime(run_dir)
-            except OSError:
+        hosts: list[tuple[UUID | None, Path]] = [(None, base)]
+        if agent_key:
+            hosts += list(_conversation_work_dirs(base))
+        for conversation_id, host in hosts:
+            if not _is_plain_dir(host / TOOL_RESULTS_DIR):
                 continue
-            yield ToolResultDir(
-                tenant_id=tenant_id,
-                user_id=user_id,
-                run_id=run_id,
-                path=run_dir,
-                newest_mtime=newest,
-                agent_key=agent_key,
-            )
+            for run_id, run_dir in _uuid_dirs(host / TOOL_RESULTS_DIR):
+                try:
+                    newest = _newest_mtime(run_dir)
+                except OSError:
+                    continue
+                yield ToolResultDir(
+                    tenant_id=tenant_id,
+                    user_id=user_id,
+                    run_id=run_id,
+                    path=run_dir,
+                    newest_mtime=newest,
+                    agent_key=agent_key,
+                    conversation_id=conversation_id,
+                )
 
 
 __all__ = [

@@ -456,6 +456,21 @@ class SqlThreadMetaStore(ThreadMetaStore):
             await session.commit()
             return int(getattr(result, "rowcount", 0) or 0) > 0
 
+    async def promote_workspace_layout(self, thread_id: UUID, *, tenant_id: UUID) -> bool:
+        stmt = (
+            update(ThreadMetaRow)
+            .where(
+                ThreadMetaRow.thread_id == thread_id,
+                ThreadMetaRow.tenant_id == tenant_id,
+                ThreadMetaRow.workspace_layout == "agent_root",
+            )
+            .values(workspace_layout="conversation", updated_at=datetime.now(UTC))
+        )
+        async with self._sf() as session:
+            result = await session.execute(stmt)
+            await session.commit()
+            return int(getattr(result, "rowcount", 0) or 0) > 0
+
     async def check_access(self, thread_id: UUID, tenant_id: UUID) -> bool:
         async with self._sf() as session:
             row = await session.get(ThreadMetaRow, thread_id)

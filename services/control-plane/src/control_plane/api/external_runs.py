@@ -51,6 +51,7 @@ from control_plane.api.agents import (
     resolve_external_files,
 )
 from control_plane.api.runs import MAX_RUN_INPUT_CHARS, RunRequest, SupersedeRequest, spawn_run
+from control_plane.api.uploads import LandingAccount
 from control_plane.run_cancel import cancel_run_two_level
 from control_plane.supersede import SupersedeError
 from expert_work.common.observability import current_trace_id_hex
@@ -291,6 +292,8 @@ async def _supersede_and_run(
                 end_user_id=end_user_id,
                 thread_id=meta.thread_id,
                 uploads_store=state.user_upload_store,
+                threads=threads,
+                copier=LandingAccount.from_request(request),
             )
         except ExternalScopeError as exc:
             return external_error(exc)

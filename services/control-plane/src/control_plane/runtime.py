@@ -34,6 +34,7 @@ from control_plane.platform_dynamic_worker_config import PlatformDynamicWorkerCo
 from control_plane.platform_embedding_config import PlatformEmbeddingConfigService
 from control_plane.platform_judge_config import PlatformJudgeConfigService
 from control_plane.platform_mcp_pool import PlatformMcpPoolProvider
+from control_plane.platform_migration import PlatformMigration
 from control_plane.platform_tool_budget_config import PlatformToolBudgetConfigService
 from control_plane.rerank_vendors import callable_rerank_api, instruction_kwargs, vendor_reranker
 from control_plane.settings import Settings
@@ -357,6 +358,9 @@ class AgentRuntime:
     #: B-236 第三层 —— run 终局观察 ``/agent``,改过的文件各留一份版本(NAS 才有;``app.py``
     #: 注入)。``None``(没接 NAS / 测试)= 不留版本,不影响 run。
     agent_file_versions: AgentFileVersionStore | None = None
+    #: B-262 P3 —— 老对话在下一次新 run 开始前迁到对话视图(NAS 才有;``app.py`` 注入)。
+    #: ``None``(没接 NAS / 测试)= 不迁,run 照会话的布局跑。
+    platform_migration: PlatformMigration | None = None
     #: 1.3 Orchestrator-Worker — per-run dynamic-worker spawn bounds. Set in
     #: the app lifespan from platform settings. ``enabled=False`` makes
     #: :meth:`new_worker_spawn_budget` return ``None`` (no per-run caps; the

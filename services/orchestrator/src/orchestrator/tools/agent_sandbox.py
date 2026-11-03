@@ -121,7 +121,7 @@ from uuid import UUID, uuid4
 from expert_work.common.egress_token import mint_egress_token
 from expert_work.persistence import SANDBOX_SKILLS_ROOT
 from expert_work.persistence.sandbox_instance_store import (
-    SANDBOX_LAYOUT_AGENT_CONV_LOCAL,
+    SANDBOX_LAYOUT_AGENT_CONV_PLATFORM,
     SandboxClaimContendedError,
 )
 from orchestrator.tools.e2b_patch import _ensure_e2b_patched
@@ -420,8 +420,9 @@ class AgentSandboxClient:
     #: 就 ``layout_mismatch`` 重建。PR-C 起本进程铺的就是 ``agent-ns``——exec 命令串
     #: 已经翻成命名空间版本(见 :meth:`exec`),``user-root`` 是 PR-B 的过渡值。B-236 起是
     #: ``agent-conv``:新镜像带 ``/agent`` 挂载点,``agent-ns`` 的热会话(老镜像)重建。B-242 起
-    #: 是 ``agent-conv-local``:上线前的热会话里可能有老视图的后台进程,一律重建。
-    layout: str = SANDBOX_LAYOUT_AGENT_CONV_LOCAL
+    #: 是 ``agent-conv-local``:上线前的热会话里可能有老视图的后台进程,一律重建。B-262 起是
+    #: ``agent-conv-platform``:对话视图的平台目录不再 bind agent 根,老脚本起的后台进程一律重建。
+    layout: str = SANDBOX_LAYOUT_AGENT_CONV_PLATFORM
     #: 沙箱迁移波 3 —— 可选工作区配额闸。None(默认)= 无闸,行为与波 2
     #: 完全一致(本地 compose / 未配 NAS 的部署)。control-plane 在 app.py
     #: 里 post-assign(照 resolved_workspace_store.http 的先例),不走

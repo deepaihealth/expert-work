@@ -34,8 +34,9 @@ from orchestrator.tools.inputs_doc import (
     iter_url_sites,
 )
 from orchestrator.tools.prefetch_script import script_source
-from orchestrator.tools.registry import ToolContext
+from orchestrator.tools.registry import ToolContext, workspace_view_fields
 from orchestrator.tools.sandbox import SandboxOutcome, SandboxRuntime, run_in_sandbox
+from orchestrator.tools.workspace_paths import conversation_work_prefix
 
 logger = logging.getLogger(__name__)
 
@@ -195,16 +196,24 @@ def make_inputs_node(
         if rel.startswith("/"):
             logger.warning("inputs.rel_path_not_relative", extra={"variable_names": variable_names})
             return {}
+        # B-262 —— 带上本对话的视图(与 ``workspace_ingest`` 同一个取值):对话视图里
+        # ``inputs.json`` 与预拉缓存都落本对话的 ``work/inputs/``,不再落 agent 根(各对话共用、
+        # 缓存目录列得出别的客户的下载件)。写文件按 ``/agent`` 寻址,所以加上本对话那一格;
+        # 预拉 exec 跑在同一个视图里,``inputs_abs_path`` 相对它的 ``/workspace``。
         ctx = ToolContext(
             tenant_id=tenant_id,
             run_id=run_id,
             user_id=configurable_uuid(config, "user_id"),
             cancellation_token=token,
+            **workspace_view_fields(configurable),
         )
         with expert_work_span(ExpertWorkComponent.ORCHESTRATOR, "inputs_materialize"):
             writer = SandboxWorkspaceWriter(client=client, ctx=ctx)
             try:
-                await writer.write(rel=rel, content=json.dumps(doc, ensure_ascii=False))
+                await writer.write(
+                    rel=conversation_work_prefix(ctx.workspace_view) + rel,
+                    content=json.dumps(doc, ensure_ascii=False),
+                )
             except Exception:
                 # 永不让 run 失败:模型仍可按今天的老办法自己下载(退化到
                 # B-61 之前,不是退化到坏掉)。不记 doc/值——只记变量名(spec

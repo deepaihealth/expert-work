@@ -126,6 +126,7 @@ async def sweep_orphan_tool_results(root: str, run_store: RunStore) -> int:
                     user_id,
                     entry.run_id,
                     agent_key=entry.agent_key,
+                    conversation_id=entry.conversation_id,
                 ):
                     removed += 1
             except (OSError, UnsafeWorkspacePathError):

@@ -406,3 +406,118 @@ def test_only_names_with_an_image_extension_count_as_images(raw: str, expected: 
     from orchestrator.tools.vision import _is_image_path
 
     assert _is_image_path(raw) is expected
+
+
+_EARLIER = UUID("77777777-7777-4777-8777-777777777777")
+_STRANGER = UUID("88888888-8888-4888-8888-888888888888")
+
+
+def _page(run: UUID | str) -> str:
+    return f".tool_results/{run}/figures/{'a' * 16}/{'b' * 16}/_u3/page-3.jpg"
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("conversation", [False, True], ids=["legacy", "conversation"])
+async def test_a_raw_ref_into_another_conversations_run_is_refused(
+    tmp_path: Path, conversation: bool
+) -> None:
+    """B-262 —— agent 根的 ``.tool_results/<run>/`` 是同一 agent 各对话共用的:手写 ref 只认本
+    对话的 run(``figure_run_ids``,含父链)与本 run,别的 run(别的对话渲的页)一律拒。"""
+    from dataclasses import replace
+
+    from orchestrator.tools.registry import ToolBlockedError
+
+    ctx = replace(_ctx(conversation=conversation), figure_run_ids=frozenset({_EARLIER}))
+    vl = _VL()
+    for run in (_STRANGER, "not-a-run"):
+        rel = f"agents/{_AGENT}/{_page(run)}"
+        _put(tmp_path, rel)
+        with pytest.raises(ToolBlockedError, match="another conversation"):
+            await _tool(tmp_path, vl).call(
+                {"image_ref": workspace_figure_ref(_TENANT, _USER, rel), "question": "?"}, ctx=ctx
+            )
+    assert vl.calls == []
+
+    for run in (_EARLIER, _RUN):
+        rel = f"agents/{_AGENT}/{_page(run)}"
+        _put(tmp_path, rel)
+        await _tool(tmp_path, vl).call(
+            {"image_ref": workspace_figure_ref(_TENANT, _USER, rel), "question": "?"}, ctx=ctx
+        )
+    assert len(vl.calls) == 2
+
+    # 本对话自己 ``work/`` 下的渲染页不受这条限制(那一格本来就只有本对话的)。
+    if conversation:
+        own = f"agents/{_AGENT}/threads/{_CONV}/work/{_page(_STRANGER)}"
+        _put(tmp_path, own)
+        await _tool(tmp_path, vl).call(
+            {"image_ref": workspace_figure_ref(_TENANT, _USER, own), "question": "?"}, ctx=ctx
+        )
+        assert len(vl.calls) == 3
+
+
+_OTHER_CONV = UUID("55555555-5555-4555-8555-555555555555")
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("sep", ["//", "/./"])
+async def test_a_non_canonical_ref_into_another_conversation_is_refused(
+    tmp_path: Path, sep: str
+) -> None:
+    """B-262 review —— ``agents/<k>//threads/<B>/…`` 或 ``agents/<k>/./threads/<B>/…``:读侧按
+    归一化分段走到对话 B 的文件,而对话守卫按 ``/`` 原样切、对不上位置,于是放行。非规范写法
+    在解析时就拒(所有守卫与读侧看到的是同一份分段)。"""
+    real = f"agents/{_AGENT}/threads/{_OTHER_CONV}/work/uploads/scan.png"
+    _put(tmp_path, real)
+    vl = _VL()
+    rel = f"agents/{_AGENT}{sep}threads/{_OTHER_CONV}/work/uploads/scan.png"
+    with pytest.raises(ValueError, match="canonical"):
+        await _tool(tmp_path, vl).call(
+            {"image_ref": workspace_figure_ref(_TENANT, _USER, rel), "question": "?"},
+            ctx=_ctx(conversation=True),
+        )
+    assert vl.calls == []
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    "sub", ["uploads/old.png", "inputs/cache/abcd.png", "inputs/r1/x.png", f"{_page(_STRANGER)}"]
+)
+async def test_an_agent_root_platform_dir_ref_is_refused_in_the_conversation_view(
+    tmp_path: Path, sub: str
+) -> None:
+    """B-262 review —— 对话视图里 agent 根的 ``uploads/`` / ``inputs/`` / ``.tool_results/`` 是
+    老视图对话的件(exec 视图里盖住了):手写 ref 一律拒;唯一例外是本对话自己 run 的
+    ``.tool_results/<run>/``(迁移过来的老对话)。老视图照旧放行(那就是它自己的目录)。"""
+    from dataclasses import replace
+
+    from orchestrator.tools.registry import ToolBlockedError
+
+    rel = f"agents/{_AGENT}/{sub}"
+    _put(tmp_path, rel)
+    ref = workspace_figure_ref(_TENANT, _USER, rel)
+    vl = _VL()
+    conv = replace(_ctx(conversation=True), figure_run_ids=frozenset({_EARLIER}))
+    with pytest.raises(ToolBlockedError, match="this conversation"):
+        await _tool(tmp_path, vl).call({"image_ref": ref, "question": "?"}, ctx=conv)
+    assert vl.calls == []
+
+    if not sub.startswith(".tool_results/"):
+        await _tool(tmp_path, vl).call({"image_ref": ref, "question": "?"}, ctx=_ctx())
+        assert len(vl.calls) == 1
+
+
+@pytest.mark.anyio
+async def test_an_own_runs_agent_root_page_stays_readable_in_the_conversation_view(
+    tmp_path: Path,
+) -> None:
+    from dataclasses import replace
+
+    rel = f"agents/{_AGENT}/{_page(_EARLIER)}"
+    _put(tmp_path, rel)
+    vl = _VL()
+    conv = replace(_ctx(conversation=True), figure_run_ids=frozenset({_EARLIER}))
+    await _tool(tmp_path, vl).call(
+        {"image_ref": workspace_figure_ref(_TENANT, _USER, rel), "question": "?"}, ctx=conv
+    )
+    assert len(vl.calls) == 1

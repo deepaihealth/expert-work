@@ -53,6 +53,20 @@ class InMemoryUserUploadStore(UserUploadStore):
     async def get(self, *, upload_id: UUID, tenant_id: UUID) -> UserUpload | None:
         return self._rows.get((tenant_id, upload_id))
 
+    async def list_documents_for_thread(
+        self, *, tenant_id: UUID, thread_id: UUID
+    ) -> list[UserUpload]:
+        rows = [
+            r
+            for r in self._rows.values()
+            if r.tenant_id == tenant_id
+            and r.thread_id == thread_id
+            and r.kind == "document"
+            and r.deleted_at is None
+        ]
+        rows.sort(key=lambda r: (r.created_at, str(r.id)))
+        return rows
+
     async def list_expired(self, *, before: datetime, limit: int = 1000) -> list[UserUpload]:
         rows = [r for r in self._rows.values() if r.deleted_at is None and r.created_at < before]
         rows.sort(key=lambda r: (r.created_at, str(r.id)))

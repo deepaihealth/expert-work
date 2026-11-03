@@ -247,6 +247,7 @@ from orchestrator.tools.overflow import (
 from orchestrator.tools.registry import (
     FIGURE_RUN_IDS_KEY,
     TOOL_ALLOWED_STATE_KEYS,
+    WORKSPACE_MIGRATED_KEY,
     Tool,
     ToolContext,
     ToolNotFoundError,
@@ -257,7 +258,7 @@ from orchestrator.tools.registry import (
 )
 from orchestrator.tools.scheduling import MAX_TOOL_WORKERS, plan_stages
 from orchestrator.tools.spawn_worker import SPAWN_WORKER_TOOL_NAME
-from orchestrator.tools.workspace_paths import WorkspaceView
+from orchestrator.tools.workspace_paths import WorkspaceView, conversation_work_prefix
 from orchestrator.tools.workspace_store import WorkspaceStore
 from orchestrator.tools.workspace_tree import workspace_prompt_block
 from orchestrator.usage_metering import without_served_by
@@ -1155,6 +1156,11 @@ def build_react_graph(
                 step_count=step_count, max_steps=max_steps, registers=saves_artifacts
             )
         )
+        # B-262 P3 —— 控制面在这一轮开始前把老对话迁到了对话视图:每一步都把一次性说明并进平台段
+        # (只进提示词视图),这一轮之后的 run 没有这个键;委派子代不看(``_child_config`` 不传,
+        # 这里再挡一道)。
+        if configurable.get(WORKSPACE_MIGRATED_KEY) is True and not configurable.get("child_run"):
+            messages = _append_tail_human_message(messages, WORKSPACE_MIGRATION_NOTE)
         # 两条都有时步数预警在前(B-226 ②)。
         if step_notice is not None:
             messages = _append_tail_human_message(messages, step_notice)
@@ -2530,6 +2536,15 @@ def _after_reflect(state: AgentState) -> Literal["agent", "__end__"]:
     if reflections and reflections[-1].verdict == "revise":
         return "agent"
     return "__end__"
+
+
+#: B-262 P3 —— 老对话迁到对话视图的那一轮,平台段里的一次性说明。平台文字,不含任何租户内容。
+WORKSPACE_MIGRATION_NOTE = (
+    "[workspace notice] The workspace of this conversation is now per conversation. "
+    "Files that were under /workspace in earlier turns are now at the same paths under "
+    "/agent/. This conversation's uploads, inputs and tool results are still under "
+    "/workspace/."
+)
 
 
 def _append_tail_human_message(messages: list[BaseMessage], block: str) -> list[BaseMessage]:
@@ -4722,7 +4737,12 @@ async def _externalize_tool_overflow(
 
     rel = overflow_rel_path(run_id=ctx.run_id, call_id=call_id, tool_name=tool.spec.name)
     try:
-        await writer.write(rel=rel, content=clamp_overflow(source))
+        # B-262 —— ``rel`` 相对本对话的 ``/workspace``(模型据此回读);写手按 ``/agent`` 寻址,
+        # 对话视图里要落进本对话那一格(子代落根对话的)。
+        await writer.write(
+            rel=conversation_work_prefix(ctx.workspace_view) + rel,
+            content=clamp_overflow(source),
+        )
     except (asyncio.CancelledError, RunCancelledError):
         raise
     except Exception as exc:

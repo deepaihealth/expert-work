@@ -130,6 +130,10 @@ SANDBOX_LAYOUT_AGENT_CONV = "agent-conv"
 #: 看得见命名空间外的 ``/tmp`` / ``/opt/agents`` 等(各对话那份就放在那里),所以换一个值,
 #: 让这些沙箱在下一次 acquire 时重建,不靠人工回收。
 SANDBOX_LAYOUT_AGENT_CONV_LOCAL = "agent-conv-local"
+#: B-262 —— 对话视图里平台目录(``uploads`` / ``inputs`` / ``.tool_results``)改为本对话自己的,
+#: 不再从 agent 根 bind 进来。上线前起的热会话里可能还活着老视图里的后台进程,它们手里的
+#: ``/workspace/uploads`` 等仍是 agent 根那一份,所以换一个值,让这些沙箱在下一次 acquire 时重建。
+SANDBOX_LAYOUT_AGENT_CONV_PLATFORM = "agent-conv-platform"
 
 
 class SandboxClaimContendedError(RuntimeError):

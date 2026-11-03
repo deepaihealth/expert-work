@@ -26,12 +26,14 @@ B-236 起又多两档(对话视图,``exec_view`` 脚本的 ``$2`` 非空时):
 沙箱里的视图                          宿主侧作用域
 ===================================  ===========================================
 ``/workspace`` = 本对话的目录          ``conversation:<key>:<conv>``
-                                      → ``agents/<key>/threads/<conv>/work/``;
-                                      首段是平台目录时改指 ``agents/<key>/<首段>/``
-                                      (脚本把它们从 agent 根 bind 进来)
+                                      → ``agents/<key>/threads/<conv>/work/``
+                                      (B-262 起平台目录也在这里,不再改指 agent 根)
 ``/agent`` = agent 根;老视图的        ``agent_shared:<key>[:<thread>]`` →
 ``/workspace`` 也是它                  ``agents/<key>/``;不列出 ``threads/``,
                                       只许寻址本对话那一格 ``threads/<thread>/``
+对话视图的 ``/agent``                  ``agent_conv:<key>:<conv>``(B-262)→ 同上,
+                                      另外 ``uploads`` / ``inputs`` / ``.tool_results``
+                                      也不列出、不许寻址(脚本把它们盖住了)
 ===================================  ===========================================
 
 **``agent_key`` 不是 agent 名。** ``sanitize_agent_key()``
@@ -78,6 +80,10 @@ SCOPE_CONVERSATION_PREFIX = "conversation:"
 #: ``/agent``,以及老视图的 ``/workspace``)—— 各对话自己的 ``threads/`` 不列出、只许寻址
 #: 本对话那一格。整棵 ``agent:`` 仍留给控制台、对外接口与平台自己的渲染页查找。
 SCOPE_AGENT_SHARED_PREFIX = "agent_shared:"
+#: B-262 —— ``agent_conv:<agent_key>:<conv uuid>``:对话视图里模型看到的 ``/agent``。与
+#: ``agent_shared`` 同一棵树、同样只留本对话那一格 ``threads/<conv>/``,另外藏起 agent 根的
+#: 平台目录(exec 视图里它们被盖住,那是老视图对话的件)。
+SCOPE_AGENT_CONVERSATION_PREFIX = "agent_conv:"
 
 #: 沙箱视图里 ``shared/`` 的样子 —— 由 :data:`EXEC_VIEW` 与目录名拼出来, 与
 #: ``workspace_paths.resolve_workspace_path`` 返回的那个字符串必须永远同形。
@@ -101,16 +107,27 @@ def conversation_scope(agent_key: str, conv_id: UUID) -> str:
     return f"{SCOPE_CONVERSATION_PREFIX}{agent_key}:{conv_id}"
 
 
-def agent_shared_scope(agent_key: str, thread_id: UUID | None = None) -> str:
-    """B-236 —— 模型看到的 agent 根的作用域字符串;``thread_id`` 是留给本对话的那一格。"""
+def agent_shared_scope(
+    agent_key: str, thread_id: UUID | None = None, *, conversation: bool = False
+) -> str:
+    """B-236 —— 模型看到的 agent 根的作用域字符串;``thread_id`` 是留给本对话的那一格。
+
+    B-262 —— ``conversation=True``(对话视图,``thread_id`` 就是对话 id)给
+    ``agent_conv:`` 作用域:平台目录也藏起来。
+    """
+    if conversation and thread_id is not None:
+        return f"{SCOPE_AGENT_CONVERSATION_PREFIX}{agent_key}:{thread_id}"
     own = f":{thread_id}" if thread_id is not None else ""
     return f"{SCOPE_AGENT_SHARED_PREFIX}{agent_key}{own}"
 
 
 def scope_hidden_heads(scope: str) -> frozenset[str]:
-    """该作用域根下**不列出、不许寻址**的首段 —— ``agent_shared`` 藏各对话的 ``threads/``。"""
+    """该作用域根下**不列出、不许寻址**的首段 —— ``agent_shared`` 藏各对话的 ``threads/``,
+    ``agent_conv`` 再加上 agent 根的平台目录(B-262)。"""
     if scope.startswith(SCOPE_AGENT_SHARED_PREFIX):
         return frozenset({THREADS_DIR})
+    if scope.startswith(SCOPE_AGENT_CONVERSATION_PREFIX):
+        return frozenset({THREADS_DIR, *PLATFORM_DIRS})
     return frozenset()
 
 
@@ -133,9 +150,18 @@ def _canonical_uuid(scope: str, raw: str) -> str:
 
 
 def _agent_shared_parts(scope: str) -> tuple[str, str | None]:
-    """``agent_shared:<key>[:<thread>]`` → ``(key, thread 或 None)``;thread 必须是规范 UUID。"""
-    key, sep, own = scope[len(SCOPE_AGENT_SHARED_PREFIX) :].partition(":")
+    """``agent_shared:<key>[:<thread>]`` / ``agent_conv:<key>:<conv>`` → ``(key, thread 或
+    None)``;thread 必须是规范 UUID,``agent_conv`` 必须带。"""
+    conversation = scope.startswith(SCOPE_AGENT_CONVERSATION_PREFIX)
+    prefix = SCOPE_AGENT_CONVERSATION_PREFIX if conversation else SCOPE_AGENT_SHARED_PREFIX
+    key, sep, own = scope[len(prefix) :].partition(":")
+    if conversation and not sep:
+        raise WorkspacePathEscapeError(f"workspace scope is not safe: {scope!r}")
     return _safe_key(scope, key), (_canonical_uuid(scope, own) if sep else None)
+
+
+def _is_agent_view_scope(scope: str) -> bool:
+    return scope.startswith((SCOPE_AGENT_SHARED_PREFIX, SCOPE_AGENT_CONVERSATION_PREFIX))
 
 
 def _conversation_parts(scope: str) -> tuple[str, str]:
@@ -222,7 +248,7 @@ def scope_parts(scope: str) -> tuple[str, ...]:
         return (WORKSPACE_SHARED_DIR,)
     if scope.startswith(SCOPE_AGENT_PREFIX):
         return (WORKSPACE_AGENTS_DIR, _safe_key(scope, scope[len(SCOPE_AGENT_PREFIX) :]))
-    if scope.startswith(SCOPE_AGENT_SHARED_PREFIX):
+    if _is_agent_view_scope(scope):
         return (WORKSPACE_AGENTS_DIR, _agent_shared_parts(scope)[0])
     if scope.startswith(SCOPE_CONVERSATION_PREFIX):
         key, conv = _conversation_parts(scope)
@@ -245,16 +271,12 @@ def scoped_path(scope: str, path: str) -> str:
         raise WorkspacePathEscapeError(
             f"workspace path must not address {parts[0]!r} from this scope: {path!r}"
         )
-    if scope.startswith(SCOPE_CONVERSATION_PREFIX) and parts[0] in PLATFORM_DIRS:
-        # 与 exec 视图同一张挂载表:对话目录里的 ``uploads`` / ``inputs`` /
-        # ``.tool_results`` 是 agent 根那一份的 bind,沙箱回来的这类相对路径要落回去。
-        prefix = prefix[:2]
     return "/".join((*prefix, *parts))
 
 
 def _own_thread_path(scope: str, parts: tuple[str, ...]) -> bool:
-    """``threads/<本对话>/…`` —— ``agent_shared`` 作用域里唯一许寻址的那一格。"""
-    own = _agent_shared_parts(scope)[1] if scope.startswith(SCOPE_AGENT_SHARED_PREFIX) else None
+    """``threads/<本对话>/…`` —— ``agent_shared`` / ``agent_conv`` 作用域里唯一许寻址的那一格。"""
+    own = _agent_shared_parts(scope)[1] if _is_agent_view_scope(scope) else None
     return own is not None and parts[0] == THREADS_DIR and parts[1:2] == (own,)
 
 
@@ -302,8 +324,8 @@ def store_scope(
     ``EXEC_VIEW``、``AGENT_VIEW``,或者 ``EXEC_VIEW/shared``。``conv_id`` 非 ``None``
     (B-236 对话视图,只在绑了 agent 时成立)时 ``EXEC_VIEW`` 是本对话的目录;其余情况
     (``AGENT_VIEW``,以及老视图的 ``EXEC_VIEW``)都是 agent 根,``threads/`` 只留
-    ``thread_id`` 那一格(``conv_id`` 优先)—— 与 exec 视图同一张挂载表。没绑 agent 时
-    两者都是整个用户根。
+    ``thread_id`` 那一格(``conv_id`` 优先)—— 与 exec 视图同一张挂载表;对话视图的
+    ``AGENT_VIEW`` 另外藏起平台目录(B-262,``agent_conv``)。没绑 agent 时两者都是整个用户根。
 
     刻意不接受别的写法:``ws`` 是本进程自己算出来的, 出现别的值意味着上游改了
     而这里没跟上 —— 那种时候静默回落到用户根就是一次静默的越权扩大。
@@ -314,6 +336,8 @@ def store_scope(
         raise SandboxSupervisorError(f"unknown workspace view: {ws!r}")
     if not agent_key:
         return SCOPE_USER_ROOT
-    if ws == EXEC_VIEW and conv_id is not None:
-        return conversation_scope(agent_key, conv_id)
-    return agent_shared_scope(agent_key, conv_id if conv_id is not None else thread_id)
+    if conv_id is not None:
+        if ws == EXEC_VIEW:
+            return conversation_scope(agent_key, conv_id)
+        return agent_shared_scope(agent_key, conv_id, conversation=True)
+    return agent_shared_scope(agent_key, thread_id)

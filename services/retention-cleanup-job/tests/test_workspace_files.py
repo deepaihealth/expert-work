@@ -356,6 +356,50 @@ def test_remove_dirs_honour_the_agent_key(tmp_path: Path) -> None:
     assert not legacy_r.exists()
 
 
+@pytest.mark.parametrize("swapped", ["conversation", "work", "tool_results"])
+def test_remove_in_a_conversation_never_follows_a_symlinked_segment(
+    tmp_path: Path, swapped: str
+) -> None:
+    """B-262 review —— 对话视图的 ``threads/<conv>/work/.tool_results/<run>``:载荷写得进本对话
+    那一格,能把对话目录、``work`` 或 ``.tool_results`` 换成软链。删除逐段 ``lstat``,任何一段
+    是软链都拒,软链指向的那棵树一个字节不动(枚举那一侧另有一道闸,这里直接打删除入口)。"""
+    tenant, user, conv, run_id = uuid4(), uuid4(), uuid4(), uuid4()
+    base = tmp_path / str(tenant) / str(user)
+    victim = _seed_dir(tmp_path / "victim", f"work/.tool_results/{run_id}")
+    real = {
+        "conversation": tmp_path / "victim",
+        "work": tmp_path / "victim" / "work",
+        "tool_results": tmp_path / "victim" / "work" / ".tool_results",
+    }[swapped]
+    conv_dir = base / "agents" / "plan-aaaaaaaa" / THREADS_DIR / str(conv)
+    link = {
+        "conversation": conv_dir,
+        "work": conv_dir / "work",
+        "tool_results": conv_dir / "work" / ".tool_results",
+    }[swapped]
+    link.parent.mkdir(parents=True, exist_ok=True)
+    link.symlink_to(real)
+
+    with pytest.raises(UnsafeWorkspacePathError):
+        remove_tool_result_dir(
+            str(tmp_path), tenant, user, run_id, agent_key="plan-aaaaaaaa", conversation_id=conv
+        )
+    assert victim.is_dir()
+
+
+def test_remove_in_a_conversation_deletes_the_real_run_dir(tmp_path: Path) -> None:
+    tenant, user, conv, run_id = uuid4(), uuid4(), uuid4(), uuid4()
+    base = tmp_path / str(tenant) / str(user)
+    run_dir = _seed_dir(
+        base, f"agents/plan-aaaaaaaa/{THREADS_DIR}/{conv}/work/.tool_results/{run_id}"
+    )
+
+    assert remove_tool_result_dir(
+        str(tmp_path), tenant, user, run_id, agent_key="plan-aaaaaaaa", conversation_id=conv
+    )
+    assert not run_dir.exists()
+
+
 @pytest.mark.parametrize("bad", ["../..", "a/b", "", "."])
 def test_agent_subtree_rejects_unsafe_keys(tmp_path: Path, bad: str) -> None:
     """目录名从 scandir 读来,会被拼进一条要 rmtree 的路径 —— 自己校验形状。

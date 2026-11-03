@@ -203,6 +203,7 @@ from orchestrator.tools.workspace_paths import (
     WORKSPACE_PATH_RULE,
     WorkspaceView,
     agent_relative,
+    conversation_work_prefix,
     resolve_workspace_path,
 )
 from orchestrator.tools.workspace_scope import SCOPE_USER_ROOT, agent_scope, scoped_path
@@ -943,7 +944,7 @@ def _reject_unrenderable_format(ext: str) -> str | None:
     return f"read_page 不支持 {label} 这种格式 —— 目前只能渲染 {renderable}。"
 
 
-def _validate_rendered_rel(rel: object, *, under: str | None = None) -> str | None:
+def _validate_rendered_rel(rel: object, *, under: str | None = None, base: str = "") -> str | None:
     """约束 A —— 沙箱回来的 ``rel``(相对沙箱自己的 exec 视图 ``ws``)必须落在
     ``.tool_results/`` 下、不越权、扩展名是 ``.jpg``(回修 M2)。
 
@@ -970,7 +971,12 @@ def _validate_rendered_rel(rel: object, *, under: str | None = None) -> str | No
         return None
     if ".." in PurePosixPath(rel).parts:
         return None
-    if rel != WORKSPACE_OVERFLOW_DIR and not rel.startswith(f"{WORKSPACE_OVERFLOW_DIR}/"):
+    # B-262 —— 对话视图里渲染落本对话的 ``work/.tool_results/``,片段相对 ``/agent`` 回的 rel
+    # 带着 ``base``(``threads/<conv>/work/``);剥掉它再比 ``.tool_results/`` 前缀。
+    if not rel.startswith(base):
+        return None
+    inner = rel[len(base) :]
+    if inner != WORKSPACE_OVERFLOW_DIR and not inner.startswith(f"{WORKSPACE_OVERFLOW_DIR}/"):
         return None
     # B-262 —— 给了 ``under``(本次调用自己的产出目录 ``.tool_results/<run>/figures/<doc-sha>``)
     # 就必须落在它底下:被篡改的回包不能把别的 run(别的对话)的页塞进 ``viewed_figures``。
@@ -1023,9 +1029,9 @@ def render_source(path: str, *, view: WorkspaceView) -> tuple[str, str]:
 
     B-236 —— 渲染一律在 ``/agent`` 视图里做:源文档按它相对 agent 根的位置找(对话目录
     里的 ``x`` 是 ``threads/<conv>/work/x``,对话视图里本对话那一格在 ``/agent`` 底下看得
-    见),渲出来的页落 agent 根的 ``.tool_results/``。``<doc-sha>`` 按同一个物理位置算,
-    两个对话里同名的文档因此不共用渲染目录;老视图沿用 ``/workspace/<rel>`` 的算法,
-    已渲染的页照旧命中。
+    见),渲出来的页落 ``.tool_results/``(B-262 起对话视图里是本对话 ``work/`` 下那一份)。
+    ``<doc-sha>`` 按同一个物理位置算,两个对话里同名的文档(B-262 起含上传件)因此不共用渲染
+    目录;老视图沿用 ``/workspace/<rel>`` 的算法,已渲染的页照旧命中。
     """
     target = resolve_workspace_path(path, view=view, tool="read_page")
     agent_rel = agent_relative(target, view)
@@ -1259,7 +1265,11 @@ class ReadPageTool:
             # 约束 B —— 三个 id 缺一个就没法造 workspace ref;说明白,不崩。
             return ToolResult(content="无法渲染:这条 run 缺少租户/用户/run 绑定。")
         doc_sha, agent_rel = render_source(raw, view=ctx.workspace_view)
-        out_rel = f"{WORKSPACE_OVERFLOW_DIR}/{ctx.run_id}/{RENDERED_FIGURE_DIR}/{doc_sha}"
+        # B-262 —— 渲染在 ``/agent`` 视图里做(源文档可能在 ``/agent`` 下),产出落本对话的
+        # ``/workspace/.tool_results/``:对话视图里加本对话那一格(agent 根的 ``.tool_results``
+        # 在 exec 视图里被盖住),老视图没有前缀,与今天逐字相同。
+        base = conversation_work_prefix(ctx.workspace_view)
+        out_rel = f"{base}{WORKSPACE_OVERFLOW_DIR}/{ctx.run_id}/{RENDERED_FIGURE_DIR}/{doc_sha}"
         env = await run_scoped_read(
             self.client,
             build=lambda w: build_render_wrapper(
@@ -1316,7 +1326,7 @@ class ReadPageTool:
                 rejected.append({"unit": _UNKNOWN_UNIT, "why": "malformed_item"})
                 continue
             unit = item.get("unit")
-            safe_rel = _validate_rendered_rel(item.get("rel"), under=out_rel)
+            safe_rel = _validate_rendered_rel(item.get("rel"), under=out_rel, base=base)
             if safe_rel is None:
                 # 回修第 3 轮 Minor-2 —— 无条件记账,不只挑 unit 是 int 的那
                 # 一支:沙箱回一个字符串/None 形态的 unit 时,New-3 想堵的沉默

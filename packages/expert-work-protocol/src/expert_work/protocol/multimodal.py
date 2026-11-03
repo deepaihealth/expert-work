@@ -192,6 +192,12 @@ def parse_workspace_image_ref(uri: str) -> WorkspaceImageRef:
     if not rel or rel.startswith("/") or ".." in segments:
         msg = f"workspace image ref path must be relative and free of '..': {uri!r}"
         raise ValueError(msg)
+    if "/".join(segments) != rel:
+        # B-262 review —— 空段(``a//b``)、``.`` 段、结尾斜杠:读侧按归一化分段走,按原样切分
+        # 的守卫却会对错位置(``agents/<k>//threads/<别的对话>/…`` 曾绕过对话守卫)。只收
+        # 规范写法,所有消费方看到的 ``rel`` 与 ``PurePosixPath(rel).parts`` 逐段一致。
+        msg = f"workspace image ref path must be canonical (no empty or '.' segments): {uri!r}"
+        raise ValueError(msg)
     if segments and segments[0] == "shared":
         msg = f"workspace image ref must not address the reserved {segments[0]}/ tree: {uri!r}"
         raise ValueError(msg)

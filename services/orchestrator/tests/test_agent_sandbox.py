@@ -75,6 +75,7 @@ from expert_work.persistence.sandbox_instance_store import (
     _STUCK_CREATE_TTL_S,
     SANDBOX_LAYOUT_AGENT_CONV,
     SANDBOX_LAYOUT_AGENT_CONV_LOCAL,
+    SANDBOX_LAYOUT_AGENT_CONV_PLATFORM,
     SANDBOX_LAYOUT_AGENT_NS,
     SANDBOX_LAYOUT_USER_ROOT,
     InMemorySandboxInstanceStore,
@@ -2387,7 +2388,7 @@ async def test_acquire_rebuilds_a_warm_session_from_before_the_conversation_view
 
     assert new_id != old_id
     assert (old_id, _LAYOUT_MISMATCH_DESTROY_REASON) in store.mark_destroyed_calls
-    assert store.rows[new_id]["layout"] == SANDBOX_LAYOUT_AGENT_CONV_LOCAL
+    assert store.rows[new_id]["layout"] == SANDBOX_LAYOUT_AGENT_CONV_PLATFORM
 
 
 @pytest.mark.asyncio
@@ -2405,7 +2406,26 @@ async def test_acquire_rebuilds_a_warm_session_from_before_local_state_isolation
 
     assert new_id != old_id
     assert (old_id, _LAYOUT_MISMATCH_DESTROY_REASON) in store.mark_destroyed_calls
-    assert store.rows[new_id]["layout"] == SANDBOX_LAYOUT_AGENT_CONV_LOCAL
+    assert store.rows[new_id]["layout"] == SANDBOX_LAYOUT_AGENT_CONV_PLATFORM
+
+
+@pytest.mark.asyncio
+async def test_acquire_rebuilds_a_warm_session_from_before_conversation_platform_dirs() -> None:
+    """B-262 —— ``agent-conv-local`` 的热会话里可能还活着老脚本起的后台进程,它们手里的
+    ``/workspace/uploads`` 等仍是 agent 根那一份(各对话共用):acquire 时按 ``layout_mismatch``
+    换代。"""
+    sdk, store = FakeSdk(), FakeInstanceStore()
+    client = make_client(sdk, store)
+    tenant_id, user_id = uuid4(), uuid4()
+
+    old_id = await client.acquire(tenant_id=tenant_id, thread_id="t1", user_id=user_id)
+    store.rows[old_id]["layout"] = SANDBOX_LAYOUT_AGENT_CONV_LOCAL
+
+    new_id = await client.acquire(tenant_id=tenant_id, thread_id="t2", user_id=user_id)
+
+    assert new_id != old_id
+    assert (old_id, _LAYOUT_MISMATCH_DESTROY_REASON) in store.mark_destroyed_calls
+    assert store.rows[new_id]["layout"] == SANDBOX_LAYOUT_AGENT_CONV_PLATFORM
 
 
 @pytest.mark.asyncio
@@ -3183,8 +3203,8 @@ async def test_post_create_mkdir_failure_discards_the_sandbox() -> None:
     )
 
 
-def test_client_lays_out_agent_conv_local_by_default() -> None:
+def test_client_lays_out_agent_conv_platform_by_default() -> None:
     """B-236 —— 新镜像多了 ``/agent`` 挂载点:布局值换成 ``agent-conv``,老镜像起的
     ``agent-ns`` 热会话在下一次 acquire 时按 ``layout_mismatch`` 重建。B-242 —— 再换成
-    ``agent-conv-local``:上线前起的热会话一律重建。"""
-    assert make_client(FakeSdk(), FakeInstanceStore()).layout == SANDBOX_LAYOUT_AGENT_CONV_LOCAL
+    ``agent-conv-local``:上线前起的热会话一律重建。B-262 —— 再换成 ``agent-conv-platform``。"""
+    assert make_client(FakeSdk(), FakeInstanceStore()).layout == SANDBOX_LAYOUT_AGENT_CONV_PLATFORM

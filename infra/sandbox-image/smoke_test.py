@@ -11,8 +11,9 @@ runc in CI.
 B-236 — the same container then runs a short sequence of per-conversation view
 checks on the real kernel (``_view_requests``): relative writes land in the
 conversation's own directory, other conversations are absent from ``/agent``,
-``uploads/`` reaches the agent root, a planted symlink at the agent root's
-``uploads`` is skipped while one at the conversation's ``work`` fails closed,
+the agent root's ``uploads/`` is covered (B-262: the conversation has its own),
+a planted symlink at the agent root's ``uploads`` is skipped while one at the
+conversation's ``work`` fails closed,
 the old view sees only its own ``threads/<id>/``, and the payload — running in a
 nested user namespace — can neither ``umount`` the covers nor escape them with
 its own ``unshare -m``. B-242 — a conversation's ``/tmp`` and HOME carry over to
@@ -77,7 +78,8 @@ def _view_requests() -> list[tuple[str, dict[str, object], object]]:
         "import os, json\n"
         "open('rel.txt','w').write('a')\n"
         "print(json.dumps([os.listdir('/agent/threads'), "
-        f"os.path.exists('/agent/threads/{_B}'), open('uploads/u.txt').read()]))"
+        f"os.path.exists('/agent/threads/{_B}'), os.path.exists('uploads/u.txt'), "
+        "os.listdir('/agent/uploads')]))"
     )
     landed = (
         "import os\n"
@@ -90,7 +92,7 @@ def _view_requests() -> list[tuple[str, dict[str, object], object]]:
         "os.symlink('threads', '/workspace/agents/smoke/uploads')\n"
         "print('planted')"
     )
-    via_uploads = f"import os\nprint(os.path.exists('/workspace/uploads/{_B}/work/secret.txt'))"
+    via_uploads = f"import os\nprint(os.path.exists('/agent/uploads/{_B}/work/secret.txt'))"
     plant_work = (
         "import os\n"
         f"w = '/workspace/agents/smoke/threads/{_A}/work'\n"
@@ -125,7 +127,7 @@ def _view_requests() -> list[tuple[str, dict[str, object], object]]:
     return [
         ("seed", unbound(seed), "seeded"),
         ("covers cannot be unmounted from the payload", conv(locked), "True True True 1"),
-        ("conversation view", conv(probe), f'[["{_A}"], false, "up"]'),
+        ("conversation view", conv(probe), f'[["{_A}"], false, false, []]'),
         ("relative write lands in threads/<conv>/work", unbound(landed), "True False"),
         ("plant uploads -> threads", unbound(plant_uploads), "planted"),
         ("symlinked uploads is skipped", conv(via_uploads), "False"),

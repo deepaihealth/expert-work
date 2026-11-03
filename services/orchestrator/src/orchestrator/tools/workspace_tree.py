@@ -413,7 +413,9 @@ async def workspace_prompt_block(
         agent = await store.list_files(
             tenant_id=tenant_id,
             user_id=user_id,
-            scope=store_scope(AGENT_VIEW, agent_key=agent_key, thread_id=view.own_thread),
+            scope=store_scope(
+                AGENT_VIEW, agent_key=agent_key, conv_id=view.conv_id, thread_id=view.own_thread
+            ),
         )
         if not view.per_conversation:
             return render_workspace_block(agent, max_expanded=max_expanded)

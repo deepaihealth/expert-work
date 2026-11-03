@@ -170,3 +170,43 @@ async def test_query_pagination_via_cursor() -> None:
     )
     assert [e.id for e in page_three.entries] == [1]
     assert page_three.next_cursor is None
+
+
+@pytest.mark.asyncio
+async def test_document_uploads_for_thread_is_targeted() -> None:
+    """B-262 P3 review 3 —— 迁移按会话找它的上传审计:本租户、``document:upload``、成功的、
+    ``details.thread_id`` 是这个会话、不早于 ``since``,按发生先后。"""
+    store = InMemoryAuditLogStore()
+    tenant, thread = uuid4(), uuid4()
+    mine: dict[str, object] = {"thread_id": str(thread), "workspace_path": "uploads/a.pdf"}
+
+    first = await store.append(
+        _entry(tenant_id=tenant, action=AuditAction.DOCUMENT_UPLOAD, details=mine)
+    )
+    second = await store.append(
+        _entry(tenant_id=tenant, action=AuditAction.DOCUMENT_UPLOAD, details=mine)
+    )
+    await store.append(
+        _entry(
+            tenant_id=tenant,
+            action=AuditAction.DOCUMENT_UPLOAD,
+            details={"thread_id": str(uuid4())},
+        )
+    )
+    await store.append(_entry(tenant_id=uuid4(), action=AuditAction.DOCUMENT_UPLOAD, details=mine))
+    await store.append(_entry(tenant_id=tenant, action=AuditAction.MANIFEST_WRITE, details=mine))
+    await store.append(
+        _entry(
+            tenant_id=tenant,
+            action=AuditAction.DOCUMENT_UPLOAD,
+            details=mine,
+            result=AuditResult.DENIED,
+        )
+    )
+
+    got = await store.list_document_uploads_for_thread(tenant_id=tenant, thread_id=thread)
+    assert [e.id for e in got] == [first.id, second.id]
+    later = await store.list_document_uploads_for_thread(
+        tenant_id=tenant, thread_id=thread, since=datetime.now(UTC) + timedelta(minutes=1)
+    )
+    assert later == []

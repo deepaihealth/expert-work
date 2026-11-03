@@ -203,3 +203,90 @@ async def test_the_real_tools_node_hands_the_conversation_runs_to_the_tool() -> 
 
     assert len(tool.seen) == 1, "工具没被调用,下面什么也没验"
     assert tool.seen[0].figure_run_ids == frozenset({earlier})
+
+
+# ---------------------------------------------------------------------------
+# B-262 P1 —— 对话视图里渲染页落本对话的 ``work/.tool_results/``:按页查图先找本对话目录,
+# 再找 agent 根下**本对话自己的** run(迁移过来的老对话要用);别的对话目录里的不看。
+# ---------------------------------------------------------------------------
+
+_CONV = UUID("33333333-3333-4333-8333-333333333333")
+_CONV_WORK = f"agents/{_AGENT}/threads/{_CONV}/work"
+
+
+def _conv_ctx(tenant: UUID, user: UUID, *, runs: frozenset[UUID]) -> ToolContext:
+    return ToolContext(
+        tenant_id=tenant,
+        user_id=user,
+        agent_key=_AGENT,
+        run_id=uuid4(),
+        thread_id=_CONV,
+        workspace_layout="conversation",
+        figure_run_ids=runs,
+    )
+
+
+def _conv_figure_rel(*, run: str, render: str = "b" * 16, conv: UUID = _CONV) -> str:
+    from orchestrator.tools.read_page import document_sha
+    from orchestrator.tools.workspace_paths import WorkspaceView
+
+    doc_sha = document_sha(_DOC, view=WorkspaceView(agent_key=_AGENT, conv_id=conv, thread_id=conv))
+    assert doc_sha is not None
+    return f".tool_results/{run}/figures/{doc_sha}/{render}/_u10/page-10.jpg"
+
+
+@pytest.mark.anyio
+async def test_conversation_view_finds_the_page_in_its_own_work_dir(tmp_path: Path) -> None:
+    tenant, user = uuid4(), uuid4()
+    page = _conv_figure_rel(run=_THIS_CONV_EARLIER)
+    _put(tmp_path, tenant, user, f"{_CONV_WORK}/{_DOC}", mtime=1_000)
+    _put(tmp_path, tenant, user, f"{_CONV_WORK}/{page}", mtime=2_000)
+    vl = _FakeVLCaller(response=AIMessage(content="ok"))
+
+    await _short_form_tool(tmp_path, vl).call(
+        {"path": _DOC, "unit": 10, "question": "?"},
+        ctx=_conv_ctx(tenant, user, runs=frozenset({UUID(_THIS_CONV_EARLIER)})),
+    )
+
+    assert _sent_ref(vl) == workspace_figure_ref(tenant, user, f"{_CONV_WORK}/{page}")
+
+
+@pytest.mark.anyio
+async def test_conversation_view_also_finds_its_own_run_under_the_agent_root(
+    tmp_path: Path,
+) -> None:
+    """迁移过来的老对话:它自己的 run 的渲染页还在 agent 根的 ``.tool_results/<run>/``。"""
+    tenant, user = uuid4(), uuid4()
+    page = _conv_figure_rel(run=_THIS_CONV_EARLIER)
+    _put(tmp_path, tenant, user, f"{_CONV_WORK}/{_DOC}", mtime=1_000)
+    _put(tmp_path, tenant, user, f"agents/{_AGENT}/{page}", mtime=2_000)
+    vl = _FakeVLCaller(response=AIMessage(content="ok"))
+
+    await _short_form_tool(tmp_path, vl).call(
+        {"path": _DOC, "unit": 10, "question": "?"},
+        ctx=_conv_ctx(tenant, user, runs=frozenset({UUID(_THIS_CONV_EARLIER)})),
+    )
+
+    assert _sent_ref(vl) == workspace_figure_ref(tenant, user, f"agents/{_AGENT}/{page}")
+
+
+@pytest.mark.anyio
+async def test_conversation_view_never_uses_another_conversations_dir(tmp_path: Path) -> None:
+    """别的对话目录里同一个 run 名下的页(不论 doc-sha 是否撞上)不看;agent 根下不是本对话的
+    run 也不看。"""
+    tenant, user = uuid4(), uuid4()
+    other_conv = UUID(_OTHER_CONV)
+    page = _conv_figure_rel(run=_THIS_CONV_EARLIER)
+    _put(tmp_path, tenant, user, f"{_CONV_WORK}/{_DOC}", mtime=1_000)
+    _put(tmp_path, tenant, user, f"agents/{_AGENT}/threads/{other_conv}/work/{page}", mtime=2_000)
+    _put(
+        tmp_path, tenant, user, f"agents/{_AGENT}/{_conv_figure_rel(run=_OTHER_CONV)}", mtime=2_000
+    )
+    vl = _FakeVLCaller()
+
+    with pytest.raises(FileNotFoundError, match="还没渲染"):
+        await _short_form_tool(tmp_path, vl).call(
+            {"path": _DOC, "unit": 10, "question": "?"},
+            ctx=_conv_ctx(tenant, user, runs=frozenset({UUID(_THIS_CONV_EARLIER)})),
+        )
+    assert vl.calls == []

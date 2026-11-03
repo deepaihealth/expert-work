@@ -241,3 +241,43 @@ async def test_list_expired_and_soft_delete(sql_store: SqlStoreFixture) -> None:
         assert fresh_row is not None and fresh_row.deleted_at is None
     finally:
         await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_list_documents_for_thread(sql_store: SqlStoreFixture) -> None:
+    """B-262 P3 —— 与内存实现同一谓词:本租户、本会话、文档类、没删的,按上传先后。"""
+    from datetime import UTC, datetime
+
+    store, engine = sql_store
+    try:
+        tenant, thread, user = uuid4(), uuid4(), uuid4()
+
+        async def _put(
+            *, thread_id: UUID, tenant_id: UUID = tenant, kind: str = "document"
+        ) -> UUID:
+            uid = uuid4()
+            await store.insert(
+                upload_id=uid,
+                tenant_id=tenant_id,
+                user_id=user,
+                thread_id=thread_id,
+                kind=kind,  # type: ignore[arg-type]
+                ref="uploads/a.pdf",
+                mime_type="application/pdf",
+                size_bytes=3,
+                filename="a.pdf",
+            )
+            return uid
+
+        first = await _put(thread_id=thread)
+        second = await _put(thread_id=thread)
+        await _put(thread_id=thread, kind="image")
+        await _put(thread_id=uuid4())
+        await _put(thread_id=thread, tenant_id=uuid4())
+        gone = await _put(thread_id=thread)
+        await store.soft_delete(upload_id=gone, tenant_id=tenant, now=datetime.now(UTC))
+
+        rows = await store.list_documents_for_thread(tenant_id=tenant, thread_id=thread)
+        assert [r.id for r in rows] == [first, second]
+    finally:
+        await engine.dispose()

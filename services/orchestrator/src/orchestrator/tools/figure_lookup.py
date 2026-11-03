@@ -8,9 +8,10 @@
 **不在宿主复刻沙箱片段的 ``_render_sha``**(那是片段里对文档字节 + dpi 求的哈希,
 宿主再写一份就是两份算法,迟早漂移)。换成两步:
 
-1. 在**本 agent 作用域**里、**本对话的 run**(B-262,见 :func:`figure_run_ids`)的
+1. 在**本对话的 run**(B-262,见 :func:`figure_run_ids`)的
    ``.tool_results/<run>/figures/<doc-sha>/*/_u<unit>/`` 下找形状合法的渲染页,取修改时间
-   最新的那一张;
+   最新的那一张。B-262 P1 起对话视图先找本对话 ``work/`` 下的 ``.tool_results``(新渲染都落
+   那里),再找 agent 根下的(迁移过来的老对话自己的 run);老视图只有 agent 根那一处;
 2. **新鲜度闸**:文档自己的修改时间晚于那张渲染 → 不采用,显式失败,让模型重渲。
 
 闸的道理:渲染发生在文档最后一次修改**之后**,渲的就是当前内容。两个方向都会错:
@@ -61,7 +62,7 @@ from orchestrator.tools.read_page import (
 )
 from orchestrator.tools.sandbox import WorkspaceFileNotFoundError
 from orchestrator.tools.workspace_paths import WorkspaceView
-from orchestrator.tools.workspace_scope import SCOPE_USER_ROOT, scoped_path
+from orchestrator.tools.workspace_scope import SCOPE_USER_ROOT, conversation_scope, scoped_path
 from orchestrator.tools.workspace_store import WorkspaceDirEntry, WorkspaceStore
 
 logger = logging.getLogger(__name__)
@@ -110,6 +111,8 @@ class _Rendered:
     #: 作用域相对路径,形状已过 ``is_rendered_figure_rel``。
     rel: str
     mtime: datetime | None
+    #: B-262 —— ``rel`` 相对的那个作用域(本对话目录或 agent 根),拼 ref 用。
+    scope: str
 
 
 @dataclass(frozen=True)
@@ -206,10 +209,16 @@ async def resolve_rendered_figure(
     except ValueError as exc:
         msg = f"ask_image 的 path 解析不了:{path!r} —— 填调用 read_page 时用的那条文档路径。"
         raise ValueError(msg) from exc
-    # B-236 —— 与 read_page 同一个落点口径:源文档按相对 agent 根的位置找,渲染页在
-    # agent 根的 ``.tool_results/`` 底下。
+    # B-236 —— 与 read_page 同一个落点口径:源文档按相对 agent 根的位置找。B-262 —— 渲染页
+    # 在对话视图里先找本对话 ``work/.tool_results/``,再找 agent 根的(只看本对话自己的 run)。
     scope = figure_scope(view)
     lister = _ScopeLister(store=store, tenant_id=tenant_id, user_id=user_id, scope=scope)
+    page_listers = [lister]
+    if view.per_conversation and view.conv_id is not None:
+        own_scope = conversation_scope(view.agent_key, view.conv_id)
+        page_listers.insert(
+            0, _ScopeLister(store=store, tenant_id=tenant_id, user_id=user_id, scope=own_scope)
+        )
     label = _UNIT_LABELS.get(PurePosixPath(path).suffix.lower().lstrip("."), _DEFAULT_UNIT_LABEL)
     document = await lister.entry_at(PurePosixPath(rel).parts)
     if document is None or document.is_dir:
@@ -226,13 +235,18 @@ async def resolve_rendered_figure(
         raise RuntimeError(msg)
     # 终审 #6 —— 本 run 自己的目录里有一张过得了闸的,就不再扫全部 run:别的 run 的
     # 渲染要么更旧,要么同样得过这道闸,换不来更对的答案,只多花 O(run 数) 次列目录。
-    own = await _own_run_candidates(lister, doc_sha=doc_sha, unit=unit, run_id=run_id)
+    own: list[_Rendered] = []
+    for page_lister in page_listers:
+        own += await _own_run_candidates(page_lister, doc_sha=doc_sha, unit=unit, run_id=run_id)
     own_newest = _newest(own)
     if own_newest is not None and not render_is_stale(document.mtime, own_newest[0]):
-        return workspace_figure_ref(tenant_id, user_id, scoped_path(scope, own_newest[1].rel))
-    candidates = own + await _other_run_candidates(
-        lister, doc_sha=doc_sha, unit=unit, run_id=run_id, run_ids=conversation_run_ids
-    )
+        return _figure_ref(tenant_id, user_id, own_newest[1])
+    others: list[_Rendered] = []
+    for page_lister in page_listers:
+        others += await _other_run_candidates(
+            page_lister, doc_sha=doc_sha, unit=unit, run_id=run_id, run_ids=conversation_run_ids
+        )
+    candidates = own + others
     if not candidates:
         msg = (
             f"{path} 的第 {unit} {label}还没渲染 —— "
@@ -256,7 +270,11 @@ async def resolve_rendered_figure(
             "再调用 ask_image。"
         )
         raise FigureNotRenderedError(msg)
-    return workspace_figure_ref(tenant_id, user_id, scoped_path(scope, newest_page.rel))
+    return _figure_ref(tenant_id, user_id, newest_page)
+
+
+def _figure_ref(tenant_id: UUID, user_id: UUID, page: _Rendered) -> str:
+    return workspace_figure_ref(tenant_id, user_id, scoped_path(page.scope, page.rel))
 
 
 def _newest(candidates: list[_Rendered]) -> tuple[datetime, _Rendered] | None:
@@ -327,7 +345,7 @@ async def _unit_pages(lister: _ScopeLister, doc_dir: str, *, unit: int) -> list[
         for name, entry in (await lister.entries(unit_dir)).items():
             rel = f"{unit_dir}/{name}"
             if not entry.is_dir and is_rendered_figure_rel(rel):
-                pages.append(_Rendered(rel=rel, mtime=entry.mtime))
+                pages.append(_Rendered(rel=rel, mtime=entry.mtime, scope=lister.scope))
     return pages
 
 

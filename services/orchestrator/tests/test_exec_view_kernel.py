@@ -319,12 +319,21 @@ def scenario(image: str, tmp_path: Path) -> Scenario:
 
 
 def test_conversation_view_mounts(scenario: Scenario) -> None:
+    """B-262 —— 对话视图:``uploads`` / ``inputs`` / ``.tool_results`` 是本对话 ``work/`` 下的
+    普通子目录(不 bind agent 根);agent 根下同名的三个目录在 ``/agent`` 里被空 tmpfs 盖住,
+    别的对话(老视图)传上来的件看不到、也写不进。"""
     r = scenario(f"""
         put("agents/a/uploads/u.txt", "up\\n")
+        put("agents/a/.tool_results/r1/x.txt", "R")
         put("agents/a/threads/{_OTHER}/work/secret.txt", "B")
         put("shared/legacy.md", "LEGACY\\n")
         run = ex(
-            "echo x > out.txt; echo y > /agent/a.txt; cat uploads/u.txt; ls /agent/threads; "
+            "echo x > out.txt; echo y > /agent/a.txt; "
+            "test -e uploads/u.txt && echo leak || echo own-uploads; "
+            "mkdir -p uploads inputs .tool_results && echo mine > uploads/m.txt; "
+            "ls -A /agent/uploads /agent/inputs /agent/.tool_results | grep -c . ; "
+            "touch /agent/uploads/w 2>/dev/null && echo agent-uploads-w || echo agent-uploads-ro; "
+            "ls /agent/threads; "
             "ls -A /mnt/workspace | wc -l; cat shared/legacy.md; "
             "touch shared/w 2>/dev/null || echo shared-ro; pwd; " + MOUNTS,
             conv="{_CONV}",
@@ -333,16 +342,29 @@ def test_conversation_view_mounts(scenario: Scenario) -> None:
         result["mounts"] = mounts_of(run)
         result["out_txt"] = open(AG + "/threads/{_CONV}/work/out.txt").read()
         result["a_txt"] = open(AG + "/a.txt").read()
+        result["m_txt"] = open(AG + "/threads/{_CONV}/work/uploads/m.txt").read()
+        result["agent_uploads"] = sorted(os.listdir(AG + "/uploads"))
     """)
     run = r["run"]
     assert run["rc"] == 0, run["err"]
-    assert run["out"].splitlines()[:6] == ["up", _CONV, "0", "LEGACY", "shared-ro", "/workspace"]
-    assert (r["out_txt"], r["a_txt"]) == ("x\n", "y\n")
+    assert run["out"].splitlines()[:8] == [
+        "own-uploads",
+        "3",  # ls 的三行标题,三个目录都是空的
+        "agent-uploads-ro",
+        _CONV,
+        "0",
+        "LEGACY",
+        "shared-ro",
+        "/workspace",
+    ], run
+    assert (r["out_txt"], r["a_txt"], r["m_txt"]) == ("x\n", "y\n", "mine\n")
+    assert r["agent_uploads"] == ["u.txt"]
     mounts = r["mounts"]
     for point in ("/agent", "/workspace", "/agent/threads", f"/agent/threads/{_CONV}"):
         assert point in mounts, mounts
     for d in ("uploads", "inputs", ".tool_results"):
-        assert mounts[f"/workspace/{d}"].startswith("rw"), mounts
+        assert f"/workspace/{d}" not in mounts, mounts
+        assert f"/agent/{d}" in mounts, mounts
     assert mounts["/workspace/shared"].startswith("ro,nosuid,nodev,noexec"), mounts
 
 
@@ -355,6 +377,8 @@ def test_legacy_and_unbound_views(scenario: Scenario) -> None:
         result["none"] = ex("ls -A threads /agent/threads", own="")
         result["unbound"] = ex("ls /workspace /agent", key="")
         result["out_txt"] = open(AG + "/out.txt").read()
+        put("agents/a/uploads/u.txt", "up\\n")
+        result["uploads"] = ex("cat uploads/u.txt /agent/uploads/u.txt", own="{_CONV}")
     """)
     assert r["own"] == {"rc": 0, "out": f"{_CONV}\n{_CONV}\n", "err": ""}
     assert r["out_txt"] == "x\n"
@@ -363,6 +387,8 @@ def test_legacy_and_unbound_views(scenario: Scenario) -> None:
     assert _OTHER not in none["out"]
     unbound = r["unbound"]
     assert unbound["out"].split() == ["/agent:", "agents", "/workspace:", "agents"]
+    # B-262 —— 老视图不变:平台目录就是 agent 根那一份,两个写法读到同一个文件。
+    assert r["uploads"] == {"rc": 0, "out": "up\nup\n", "err": ""}
 
 
 def test_conversation_dirs_that_are_not_plain_dirs_fail_closed(scenario: Scenario) -> None:
@@ -401,20 +427,22 @@ def test_conversation_dirs_that_are_not_plain_dirs_fail_closed(scenario: Scenari
 
 
 def test_planted_symlinks_are_skipped_or_refused(scenario: Scenario) -> None:
-    """平台目录的源(agent 根下)与目标(本对话 ``work/`` 里的挂载桩)、用户根的 ``shared``
-    被换成指向别处的符号链接:这一格不挂、写一行 stderr、exec 照跑,链接指向的地方上
-    什么都没挂;agent 根本身是符号链接 → 98。"""
+    """agent 根下要盖住的平台目录(B-262)、用户根的 ``shared`` 被换成指向别处的符号链接:这一格
+    不盖 / 不挂、写一行 stderr、exec 照跑,链接指向的地方上什么都没挂;本对话 ``work/`` 里的
+    ``inputs`` 是个指向别处的符号链接:不挂任何东西(对话视图不再往 ``work/`` 里挂平台目录);
+    agent 根本身是符号链接 → 98。"""
     r = scenario(f"""
         os.makedirs("/srv/outside")
         put("agents/a/threads/{_OTHER}/work/secret.txt", "B")
         link("agents/a/uploads", "threads")
         mkd("agents/a/inputs")
+        link("agents/a/.tool_results", "/srv/outside")
         link("agents/a/threads/{_CONV}/work/inputs", "/srv/outside")
         mkd("shared-real")
         put("shared-real/x.md", "S")
         link("shared", "agents/a/threads")
         result["skip"] = ex(
-            "ls -A uploads inputs/ shared/ 2>&1; ls -A /srv/outside; "
+            "ls -A /agent/uploads/ /agent/inputs/ shared/ 2>&1; ls -A /srv/outside; "
             "grep -c ' /srv/outside ' /proc/self/mountinfo; echo ran",
             conv="{_CONV}",
         )
@@ -423,8 +451,9 @@ def test_planted_symlinks_are_skipped_or_refused(scenario: Scenario) -> None:
     """)
     skip = r["skip"]
     assert skip["rc"] == 0, skip["err"]
-    assert "uploads is not a plain directory in the agent root" in skip["err"]
-    assert "/workspace/inputs is not a directory; inputs/ not mounted" in skip["err"]
+    assert "uploads is not a plain directory in the agent root; not covered" in skip["err"]
+    assert ".tool_results is not a plain directory in the agent root; not covered" in skip["err"]
+    assert "inputs is not a plain directory" not in skip["err"]
     assert "shared is not a plain directory in the user root" in skip["err"]
     assert _OTHER not in skip["out"] and "x.md" not in skip["out"]
     assert skip["out"].splitlines()[-2:] == ["0", "ran"]
@@ -433,33 +462,32 @@ def test_planted_symlinks_are_skipped_or_refused(scenario: Scenario) -> None:
 
 
 def test_mount_target_swapped_for_a_symlink_at_mount_time(scenario: Scenario) -> None:
-    """review 3 CRITICAL 的回归用例(PoC 的确定性版):脚本要把平台目录 ``uploads``(agent 根
-    下、载荷可写,里面种了一个假的 ``stat``)挂到本对话 ``work/uploads`` 这个挂载桩上 —— 挂载
-    已经开始、还没执行时,把挂载桩换成指向 ``/usr/local/bin`` 的符号链接。按路径名挂载会跟着
-    链接把 ``uploads`` 盖到 ``/usr/local/bin`` 上(旧脚本随后按 ``PATH`` 执行的 ``stat`` 就是
-    种下的那个,它还握着这个 mount ns 的全部能力);按 fd 挂,挂载落在原来那个目录上(此刻它
-    叫 ``.lnk``),``/usr/local/bin`` 原封不动,载荷照常跑完。"""
+    """review 3 CRITICAL 的回归用例(PoC 的确定性版)。B-262 起对话视图不再往 ``work/`` 里
+    bind 平台目录,载荷写得进的挂载目标换成了 agent 根的 ``uploads``(脚本要拿一块空 tmpfs 盖
+    住它)—— 挂载已经开始、还没执行时,把它换成指向 ``/usr/local/bin`` 的符号链接。按路径名
+    挂载会跟着链接把空 tmpfs 盖到 ``/usr/local/bin`` 上(python 与 ``unshare`` 都没了);按 fd
+    挂,挂载落在原来那个目录上(此刻它叫 ``.lnk``,里面的件被盖住),``/usr/local/bin`` 原封
+    不动,载荷照常跑完。"""
     r = scenario(f"""
         put("agents/a/uploads/s.md", "anchor\\n")
-        put("agents/a/uploads/stat", "#!/bin/sh" + chr(10) + "echo evil-stat >&2" + chr(10)
-            + "exec /usr/bin/stat -L " + chr(34) + "$@" + chr(34) + chr(10))
-        os.chmod(AG + "/uploads/stat", 0o755)
-        mkd("agents/a/threads/{_CONV}/work/uploads")
+        mkd("agents/a/threads/{_CONV}/work")
         result["run"] = ex_racing(
             "grep -c ' /usr/local/bin ' /proc/self/mountinfo; "
-            "test -x /usr/local/bin/python3 && echo python-ok; cat .lnk/s.md; echo ran",
+            "test -x /usr/local/bin/python3 && echo python-ok; ls -A /agent/.lnk | wc -l; "
+            "echo ran",
             "uploads",
-            AG + "/threads/{_CONV}/work/uploads",
+            AG + "/uploads",
             ".lnk",
             "/usr/local/bin",
             conv="{_CONV}",
         )
+        result["kept"] = open(AG + "/.lnk/s.md").read()
     """)
     run = r["run"]
     assert run["fired"] == [0], ("没拦到那次挂载 —— 用例没有真的制造出竞态", run)
     assert run["rc"] == 0, run["err"]
-    assert "evil-stat" not in run["err"]
-    assert run["out"].splitlines() == ["0", "python-ok", "anchor", "ran"], run
+    assert run["out"].splitlines() == ["0", "python-ok", "0", "ran"], run
+    assert r["kept"] == "anchor\n"
 
 
 # ---------------------------------------------------------------------------

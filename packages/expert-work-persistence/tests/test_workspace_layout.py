@@ -189,6 +189,7 @@ _CONV = "11111111-2222-3333-4444-555555555555"
     [
         (f"agents/k/threads/{_CONV}/work/uploads/x.pdf", True),
         (f"agents/k/threads/{_CONV}/work/.tool_results/r/x.txt", True),
+        (f"agents/k/threads/{_CONV}/work/inputs/r/inputs.json", True),
         (f"agents/k/threads/{_CONV}/work/客户案例/uploads/x.pdf", False),
         (f"agents/k/threads/{_CONV}/work/report.md", False),
         (f"agents/k/threads/{_CONV}/PLAN.md", False),
@@ -204,5 +205,8 @@ def test_conversation_work_dir_is_a_position_container(relpath: str, reserved: b
 
 
 def test_conversation_upload_stub_is_delete_protected_but_the_thread_is_not() -> None:
+    """B-262 P1 起对话视图的上传真落在 ``work/uploads/`` 里(不再是挂载桩):客户端照样删不掉;
+    ``.tool_results`` 照旧不受删除保护(平台自己要回收)。"""
     assert is_delete_protected_workspace_path(f"agents/k/threads/{_CONV}/work/uploads/x")
+    assert not is_delete_protected_workspace_path(f"agents/k/threads/{_CONV}/work/.tool_results/x")
     assert not is_delete_protected_workspace_path(f"agents/k/threads/{_CONV}")

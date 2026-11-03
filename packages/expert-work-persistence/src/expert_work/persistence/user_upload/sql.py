@@ -80,6 +80,23 @@ class SqlUserUploadStore(UserUploadStore):
             ).scalar_one_or_none()
         return _row_to_dto(row) if row is not None else None
 
+    async def list_documents_for_thread(
+        self, *, tenant_id: UUID, thread_id: UUID
+    ) -> list[UserUpload]:
+        stmt = (
+            select(UserUploadRow)
+            .where(
+                UserUploadRow.tenant_id == tenant_id,
+                UserUploadRow.thread_id == thread_id,
+                UserUploadRow.kind == "document",
+                UserUploadRow.deleted_at.is_(None),
+            )
+            .order_by(UserUploadRow.created_at.asc(), UserUploadRow.id.asc())
+        )
+        async with self._sf() as session:
+            rows = (await session.execute(stmt)).scalars().all()
+        return [_row_to_dto(row) for row in rows]
+
     async def list_expired(self, *, before: datetime, limit: int = 1000) -> list[UserUpload]:
         stmt = (
             select(UserUploadRow)

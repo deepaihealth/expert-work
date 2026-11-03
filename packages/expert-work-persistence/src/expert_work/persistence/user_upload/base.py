@@ -55,6 +55,13 @@ class UserUploadStore(abc.ABC):
         or ``deleted_at`` — the caller compares both itself."""
 
     @abc.abstractmethod
+    async def list_documents_for_thread(
+        self, *, tenant_id: UUID, thread_id: UUID
+    ) -> list[UserUpload]:
+        """B-262 P3 —— 这个会话自己的文档类上传(没删的),按上传先后。老对话迁移按它找本对话
+        的上传件。"""
+
+    @abc.abstractmethod
     async def list_expired(self, *, before: datetime, limit: int = 1000) -> list[UserUpload]:
         """留存链(上传 90 天)—— 跨租户列出 ``deleted_at IS NULL AND created_at <
         before`` 的行,最老在前。Caller MUST be inside an RLS bypass scope(the
