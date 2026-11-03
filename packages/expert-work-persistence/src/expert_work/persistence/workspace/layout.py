@@ -183,6 +183,52 @@ def is_rendered_figure_rel(rel: str) -> bool:
     return _RENDERED_FIGURE_RE.match(rel) is not None
 
 
+#: B-266 —— 「放大局部」裁出来的图落在 ``.tool_results/<run_id>/crops/`` 下,两种形状:
+#:
+#: * 文档页的局部(沙箱按区域高分辨率渲):
+#:   ``crops/<doc-sha>/<render-sha>/_u<unit>/page-<N>-<x1>-<y1>-<x2>-<y2>.jpg``
+#:   —— 前三段与渲染页同义(Path A 按它排槽、找回文档、核对新鲜度),文件名是真实页号 + 框;
+#: * 图片的局部(宿主按原像素裁):``crops/<src-sha>/<x1>-<y1>-<x2>-<y2>.jpg``,
+#:   ``<src-sha>`` 是源图字节的哈希。
+#:
+#: 两种都由「源内容哈希 + 框」唯一决定(分辨率是这两样的确定函数),所以与渲染页一样可缓存。
+#: 框是 0-1000 的整数坐标。
+RENDERED_CROP_DIR = "crops"
+_BOX_PATTERN = "[0-9]{1,4}-[0-9]{1,4}-[0-9]{1,4}-[0-9]{1,4}"
+_RENDERED_CROP_RE = re.compile(
+    "^"
+    + re.escape(WORKSPACE_OVERFLOW_DIR)
+    + "/"
+    + _UUID_PATTERN
+    + "/"
+    + re.escape(RENDERED_CROP_DIR)
+    + "/"
+    + _SHA_PATTERN
+    + "/(?:"
+    + _SHA_PATTERN
+    + "/"
+    + re.escape(RENDERED_FIGURE_UNIT_PREFIX)
+    + "[1-9][0-9]*/"
+    + re.escape(RENDERED_FIGURE_PAGE_STEM)
+    + "-[0-9]+-)?"
+    + _BOX_PATTERN
+    + r"\.jpg\Z"
+)
+
+
+def region_crop_stem(box: tuple[int, int, int, int]) -> str:
+    """框在裁图文件名里的写法 ``<x1>-<y1>-<x2>-<y2>`` —— 写的人(``tools.region_zoom``)与
+    读的人(``multimodal.parse_rendered_figure_ref``)都经这里。"""
+    return "-".join(str(v) for v in box)
+
+
+def is_rendered_crop_rel(rel: str) -> bool:
+    """``rel``(剥掉作用域前缀后)是不是一张「放大局部」裁图的落点(见 :data:`RENDERED_CROP_DIR`)。
+
+    与 :func:`is_rendered_figure_rel` 同样严:判错成 ``False`` 只是少缓存一次。"""
+    return _RENDERED_CROP_RE.match(rel) is not None
+
+
 #: Workspace prefixes that hold machinery / inputs rather than agent output —
 #: hidden from the "agent products" browse view. Add a new reserved namespace
 #: here (and use the matching constant where it is written) and every browse

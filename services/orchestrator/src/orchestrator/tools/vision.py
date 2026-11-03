@@ -19,6 +19,7 @@ See ``docs/streams/STREAM-J-DESIGN.md`` § 13.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import logging
 import time
 import weakref
@@ -32,7 +33,12 @@ from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, System
 
 from expert_work.common.observability import ExpertWorkComponent, expert_work_span
 from expert_work.common.observability.metrics import expert_work_counter
-from expert_work.persistence import WORKSPACE_OVERFLOW_DIR
+from expert_work.persistence import (
+    RENDERED_CROP_DIR,
+    RENDERED_FIGURE_SHA_HEX_LEN,
+    WORKSPACE_OVERFLOW_DIR,
+    region_crop_stem,
+)
 from expert_work.protocol.multimodal import (
     WORKSPACE_REF_PREFIX,
     WorkspaceImageRef,
@@ -58,16 +64,44 @@ from orchestrator.multimodal import (
 )
 from orchestrator.tools._guards import usage_total
 from orchestrator.tools.error_classifier import GuidedTimeoutError, GuidedToolError
-from orchestrator.tools.figure_lookup import FigureNotRenderedError, resolve_rendered_figure
+from orchestrator.tools.figure_lookup import (
+    FigureNotRenderedError,
+    _ScopeLister,
+    resolve_rendered_figure,
+)
 from orchestrator.tools.file_ops import _require_path
-from orchestrator.tools.read_page import figure_scope, workspace_figure_ref
+from orchestrator.tools.read_page import (
+    RegionCrop,
+    RegionRender,
+    figure_scope,
+    workspace_figure_ref,
+)
+from orchestrator.tools.region_zoom import (
+    AUTO_REGION,
+    LARGE_IMAGE_PIXELS,
+    NOT_FOUND,
+    REGION_HINT,
+    Box,
+    Region,
+    Tile,
+    TileResult,
+    aggregate_tiles,
+    auto_tiles,
+    crop_image,
+    image_size,
+    is_not_found,
+    parse_region,
+    pixel_box,
+    tile_question,
+)
 from orchestrator.tools.registry import ToolBlockedError, ToolContext, ToolResult, ToolSpec
 from orchestrator.tools.workspace_paths import (
     PLATFORM_DIRS,
     agent_relative,
+    conversation_work_prefix,
     resolve_workspace_path,
 )
-from orchestrator.tools.workspace_scope import scoped_path
+from orchestrator.tools.workspace_scope import SCOPE_USER_ROOT, scoped_path
 from orchestrator.tools.workspace_store import WorkspaceStore
 
 if TYPE_CHECKING:
@@ -117,6 +151,14 @@ vision_deep_default_fallback_total = expert_work_counter(
     ("model",),
 )
 
+#: B-266 —— ``region="auto"`` 的汇总结论分布:单值 / 冲突 / 全无。
+ask_image_region_auto_total = expert_work_counter(
+    "expert_work_ask_image_region_auto_total",
+    "ask_image region='auto' looks by aggregate outcome: one answer (single), tiles disagreeing "
+    "(conflict) or every tile answering NOT_FOUND (none) (B-266).",
+    ("outcome",),
+)
+
 AskImageDepth = Literal["quick", "deep"]
 _DEPTHS: tuple[AskImageDepth, ...] = ("quick", "deep")
 
@@ -125,6 +167,14 @@ _DEPTH_DESCRIPTION = (
     "thinking tier) — right for reading text, recognising content, finding numbers. Pass "
     "'deep' only when the answer needs reasoning, e.g. inferring a chart trend or "
     "understanding a complex layout; it is much slower."
+)
+
+
+_REGION_DESCRIPTION = (
+    "Optional: look at part of the image at higher resolution. 'auto' = 6 overlapping tiles "
+    "read in parallel (always a quick look; depth is ignored), for a specific value or small "
+    "text anywhere in the image. [x1, y1, x2, y2] = one box on a 0-1000 scale "
+    "(0 <= x1 < x2 <= 1000, 0 <= y1 < y2 <= 1000, at least 1% of the image)."
 )
 
 
@@ -142,6 +192,11 @@ class PageRenderer(Protocol):
     async def call(self, args: Mapping[str, Any], *, ctx: ToolContext) -> ToolResult:
         """渲 ``args["path"]`` 的 ``args["units"]``,与模型自己调 ``read_page`` 同一个入口。"""
 
+    async def render_regions(
+        self, *, path: str, figure_ref: str, boxes: Sequence[Box], ctx: ToolContext
+    ) -> RegionRender:
+        """B-266 —— 这一页(``figure_ref`` 是它的整页渲染)按 ``boxes`` 各渲一张高分辨率局部。"""
+
 
 class _AskImageTimeoutError(GuidedTimeoutError):
     """本层限时触发的超时;``by_run_deadline`` 为真表示是 run 的剩余时间用完了。"""
@@ -153,6 +208,16 @@ class _AskImageTimeoutError(GuidedTimeoutError):
         self.by_run_deadline = by_run_deadline
         #: B-257 —— 这次实际等了多久(秒),改用快看时写进回答开头。
         self.waited_s = waited_s
+
+
+@dataclass(frozen=True)
+class _Look:
+    """一次看图的结果:回答、实际用的 depth(deep 超时会改成 quick)、VL 用量。"""
+
+    answer: str
+    depth: AskImageDepth
+    deep_timed_out: bool = False
+    usage: dict[str, Any] | None = None
 
 
 @dataclass(frozen=True)
@@ -256,6 +321,7 @@ class AskImageTool:
         if ctx.tenant_id is None:
             msg = "ask_image requires a tenant binding"
             raise ToolBlockedError(msg)
+        region = self._require_region(args)
         located = await self._image_ref_from_args(args, ctx=ctx)
         ref_str, resolved_from = located.ref, located.resolved_from
         question = _require_string(args, "question")
@@ -302,18 +368,48 @@ class AskImageTool:
         if ref_str.startswith(WORKSPACE_REF_PREFIX):
             _refuse_another_conversations_run(parse_workspace_image_ref(ref_str), ctx)
             await self._require_readable_workspace_image(ref_str)
+        # B-266 —— 安全检查都对**原图**做完了;``region`` 只是在本对话自己的目录里多裁一张。
+        meta: dict[str, Any] = {"image_ref": ref_str}
+        if resolved_from is not None:
+            meta["resolved_from"] = resolved_from
+        if region == AUTO_REGION:
+            answer, auto_meta = await self._look_auto(
+                located, question, requested_depth=depth, ctx=ctx
+            )
+            meta.update(auto_meta)
+            return ToolResult(content=answer, meta=meta, state_updates=located.state_updates or {})
+        look_ref = ref_str
+        if region is not None:
+            crop = (await self._crops(located, [region], ctx=ctx)).crops[0]
+            look_ref = crop.ref
+            meta["region"] = list(region)
+            meta["crop"] = {
+                "dpi": crop.dpi,
+                "pixels": [crop.width, crop.height],
+                "reused": crop.reused,
+            }
+        look = await self._look(look_ref, question, depth=depth, ctx=ctx)
+        answer = look.answer
+        if region is None and look.depth == "quick" and await self._wants_region_hint(ref_str):
+            answer = f"{answer}\n\n{REGION_HINT}"
+        # Surface VL provenance in the ToolMessage artifact (event stream /
+        # audit): the image ref plus the VL call's token usage — otherwise the
+        # separate VL round-trip's cost is invisible (the tool only returns text).
+        meta["depth"] = look.depth
+        if look.deep_timed_out:
+            meta["deep_timed_out"] = True
+        if look.usage:
+            meta["vl_usage"] = look.usage
+        return ToolResult(content=answer, meta=meta, state_updates=located.state_updates or {})
+
+    async def _look(
+        self, ref_str: str, question: str, *, depth: AskImageDepth, ctx: ToolContext
+    ) -> _Look:
+        """一次看图:``depth`` 路由 + deep 超时改快看(B-252)+ 扣池 / 记账 + 截断判定。"""
         # Round-trip the image through the VL model. The provider adapter
         # resolves the ``image_ref`` content block to bytes via the same
         # shared resolver threaded into the VL caller (PR3 + PR4 + PR6).
-        messages = [
-            SystemMessage(content=_SYSTEM_PROMPT),
-            HumanMessage(
-                content=[
-                    {"type": "text", "text": question},
-                    image_ref_block(ref_str),
-                ]
-            ),
-        ]
+        messages = _messages(ref_str, question)
         deep_timed_out, waited_s = False, 0.0
         try:
             response = await self._ask(messages, depth=depth, ctx=ctx)
@@ -342,13 +438,7 @@ class AskImageTool:
                     by_run_deadline=False,
                     waited_s=exc.waited_s,
                 ) from rejected
-        # B-64 Task 9 —— VL 的开销与主模型同样算数:先扣全树共享 token 池(B3),再落
-        # ``token_usage``。与 agent 节点处理主模型那次调用同序;VL 调用抛错 / 被取消时
-        # 两样都不做,也与主模型一致。
-        if ctx.token_budget is not None:
-            ctx.token_budget.add(usage_total(response.usage_metadata))
-        if self.usage_meter is not None:
-            await self.usage_meter(response, tenant_id=ctx.tenant_id, user_id=ctx.user_id)
+        await self._meter(response, ctx=ctx)
         # B-105 —— 截断成空回答(思考吃满上限)不当成「看图模型没说话」:上面已照常扣池 / 记账,
         # 这里计数后给模型一个说清原因的工具错误,别让它原样再问一遍。
         if is_unusable_truncation(response):
@@ -359,17 +449,191 @@ class AskImageTool:
                 f"(depth='deep' timed out after {waited_s:.0f} seconds, so this is the "
                 "quick look's answer — it may miss fine detail.)\n" + answer
             )
-        # Surface VL provenance in the ToolMessage artifact (event stream /
-        # audit): the image ref plus the VL call's token usage — otherwise the
-        # separate VL round-trip's cost is invisible (the tool only returns text).
-        meta: dict[str, Any] = {"image_ref": ref_str, "depth": depth}
-        if resolved_from is not None:
-            meta["resolved_from"] = resolved_from
-        if deep_timed_out:
-            meta["deep_timed_out"] = True
-        if response.usage_metadata:
-            meta["vl_usage"] = dict(response.usage_metadata)
-        return ToolResult(content=answer, meta=meta, state_updates=located.state_updates or {})
+        usage = dict(response.usage_metadata) if response.usage_metadata else None
+        return _Look(answer=answer, depth=depth, deep_timed_out=deep_timed_out, usage=usage)
+
+    async def _meter(self, response: AIMessage, *, ctx: ToolContext) -> None:
+        """B-64 Task 9 —— VL 的开销与主模型同样算数:先扣全树共享 token 池(B3),再落
+        ``token_usage``。与 agent 节点处理主模型那次调用同序;VL 调用抛错 / 被取消时
+        两样都不做,也与主模型一致。B-266:``region="auto"`` 的每一块各记一次。"""
+        if ctx.token_budget is not None:
+            ctx.token_budget.add(usage_total(response.usage_metadata))
+        if self.usage_meter is not None and ctx.tenant_id is not None:
+            await self.usage_meter(response, tenant_id=ctx.tenant_id, user_id=ctx.user_id)
+
+    async def _look_auto(
+        self,
+        located: _Located,
+        question: str,
+        *,
+        requested_depth: AskImageDepth,
+        ctx: ToolContext,
+    ) -> tuple[str, dict[str, Any]]:
+        """B-266 ``region="auto"`` —— 切 2x3 块并行快看,每块看不到完整答案就回 NOT_FOUND,再汇总。
+
+        一律快看(``depth`` 忽略、meta 里注明):推理留给主模型。某几块失败(报错 / 超时 /
+        截断)就汇总其余的、说清哪几块没看;全部失败才报错,与整页看失败同一种错误。
+        """
+        tiles = auto_tiles()
+        rendered = await self._crops(located, [tile.box for tile in tiles], ctx=ctx)
+        crop_by_box = {crop.box: crop for crop in rendered.crops}
+        render_failed = dict(rendered.failed)
+        looked = [tile for tile in tiles if tile.box in crop_by_box]
+        prompt = tile_question(question)
+        outcomes = await asyncio.gather(
+            *(
+                self._ask(_messages(crop_by_box[tile.box].ref, prompt), depth="quick", ctx=ctx)
+                for tile in looked
+            ),
+            return_exceptions=True,
+        )
+        by_label: dict[str, TileResult] = {}
+        tile_meta: dict[str, dict[str, Any]] = {}
+        usages: list[Mapping[str, Any]] = []
+        errors: list[Exception] = []
+        for tile, outcome in zip(looked, outcomes, strict=True):
+            result, error = await self._tile_result(tile, outcome, ctx=ctx)
+            by_label[tile.label] = result
+            if error is not None:
+                errors.append(error)
+            if isinstance(outcome, AIMessage) and outcome.usage_metadata:
+                usages.append(outcome.usage_metadata)
+            crop = crop_by_box[tile.box]
+            tile_meta[tile.label] = {"dpi": crop.dpi, "pixels": [crop.width, crop.height]}
+        for tile in tiles:
+            if tile.label not in by_label:
+                why = render_failed.get(tile.box, "not rendered")
+                by_label[tile.label] = TileResult(tile=tile, answer=None, error=why)
+        results = [by_label[tile.label] for tile in tiles]
+        if all(result.answer is None for result in results):
+            if errors:
+                raise errors[0]
+            msg = "ask_image region='auto' could not look at any tile of this image"
+            raise RuntimeError(msg)
+        verdict = aggregate_tiles(results)
+        ask_image_region_auto_total.labels(outcome=verdict.outcome).inc()
+        meta: dict[str, Any] = {
+            "region": AUTO_REGION,
+            "depth": "quick",
+            "aggregate": verdict.outcome,
+            "tiles": [_tile_meta(result, tile_meta.get(result.tile.label)) for result in results],
+            "vl_calls": len(looked),
+        }
+        if requested_depth != "quick":
+            meta["depth_ignored"] = requested_depth
+        if usages:
+            meta["vl_usage"] = _sum_usage(usages)
+        return verdict.content, meta
+
+    async def _tile_result(
+        self, tile: Tile, outcome: AIMessage | BaseException, *, ctx: ToolContext
+    ) -> tuple[TileResult, Exception | None]:
+        """一块的调用结果 → :class:`TileResult`;成功的这里记账,失败的带回异常。"""
+        if isinstance(outcome, BaseException) and not isinstance(outcome, Exception):
+            raise outcome  # 取消等:照常往上走
+        if isinstance(outcome, Exception):
+            reason = "timed out" if isinstance(outcome, TimeoutError) else type(outcome).__name__
+            return TileResult(tile=tile, answer=None, error=reason), outcome
+        await self._meter(outcome, ctx=ctx)
+        if is_unusable_truncation(outcome):
+            try:
+                self._raise_truncated(outcome)
+            except GuidedToolError as exc:
+                return TileResult(tile=tile, answer=None, error="truncated"), exc
+        text = _stringify(outcome.content).strip()
+        if not text:
+            return TileResult(tile=tile, answer=None, error="no text"), None
+        return TileResult(tile=tile, answer=text), None
+
+    async def _crops(
+        self, located: _Located, boxes: Sequence[Box], *, ctx: ToolContext
+    ) -> RegionRender:
+        """B-266 —— 按 ``boxes`` 裁出局部:文档页(``path`` + ``unit``)在沙箱里按区域高分辨率渲,
+        别的图(上传图、工作区图片)在宿主按原像素裁。都落本对话 ``.tool_results/<run>/crops/``。"""
+        source = located.resolved_from or {}
+        path, unit = source.get("path"), source.get("unit")
+        if isinstance(path, str) and unit is not None:
+            if self.page_renderer is None:
+                msg = "ask_image 'region' on a document page needs this agent's read_page tool"
+                raise ToolBlockedError(msg)
+            async with self._render_lock((ctx.run_id, path)):
+                return await self.page_renderer.render_regions(
+                    path=path, figure_ref=located.ref, boxes=boxes, ctx=ctx
+                )
+        return await self._crop_image(located.ref, boxes, ctx=ctx)
+
+    async def _crop_image(
+        self, ref_str: str, boxes: Sequence[Box], *, ctx: ToolContext
+    ) -> RegionRender:
+        """宿主侧裁图:字节经同一个 resolver 拿(上传图来自对象存储),原像素裁,写进本对话
+        ``.tool_results/<run>/crops/<源图哈希>/<框>.jpg``;同一张图同一个框已经裁过就直接用。"""
+        store = self.workspace_store
+        if store is None or ctx.tenant_id is None or ctx.user_id is None or ctx.run_id is None:
+            msg = "ask_image 'region' needs a workspace and a tenant, user and run binding"
+            raise ToolBlockedError(msg)
+        data = (await self.image_resolver.resolve(ref_str)).data
+        source_sha = hashlib.sha256(data).hexdigest()[:RENDERED_FIGURE_SHA_HEX_LEN]
+        view = ctx.workspace_view
+        scope = figure_scope(view)
+        out_dir = scoped_path(
+            scope,
+            f"{conversation_work_prefix(view)}{WORKSPACE_OVERFLOW_DIR}/{ctx.run_id}/"
+            f"{RENDERED_CROP_DIR}/{source_sha}",
+        )
+        names = {region_crop_stem(box) + ".jpg" for box in boxes}
+        lister = _ScopeLister(
+            store=store, tenant_id=ctx.tenant_id, user_id=ctx.user_id, scope=SCOPE_USER_ROOT
+        )
+        existing = await lister.entries_if_present(out_dir)
+        reusable = {n for n in names if n in existing and not existing[n].is_dir}
+        todo = [box for box in boxes if region_crop_stem(box) + ".jpg" not in reusable]
+        pieces = (
+            dict(zip(todo, await asyncio.to_thread(crop_image, data, todo), strict=True))
+            if todo
+            else {}
+        )
+        size = image_size(data) if reusable else None
+        crops: list[RegionCrop] = []
+        for box in boxes:
+            rel = f"{out_dir}/{region_crop_stem(box)}.jpg"
+            piece = pieces.get(box)
+            if piece is not None:
+                await store.write_file(
+                    tenant_id=ctx.tenant_id, user_id=ctx.user_id, path=rel, data=piece.data
+                )
+                width, height = piece.width, piece.height
+            else:
+                left, top, right, bottom = pixel_box(box, size or (0, 0))
+                width, height = right - left, bottom - top
+            ref = workspace_figure_ref(ctx.tenant_id, ctx.user_id, rel)
+            crops.append(
+                RegionCrop(box=box, ref=ref, width=width, height=height, reused=piece is None)
+            )
+        return RegionRender(crops=tuple(crops))
+
+    def _render_lock(self, key: tuple[object, str]) -> asyncio.Lock:
+        """同一 run 同一文档的代渲染 / 渲局部排队(见 ``_render_locks``)。"""
+        lock = self._render_locks.get(key)
+        if lock is None:
+            lock = self._render_locks[key] = asyncio.Lock()
+        return lock
+
+    async def _wants_region_hint(self, ref_str: str) -> bool:
+        """B-266 —— 整页快看一张文档页或大图(≥ 2 百万像素)后,提示可以 ``region="auto"`` 再看。
+
+        只在 ``region`` 可用(接了工作区)时提示。图片尺寸只读文件头;读不出来就不提示
+        (这条路只决定加不加一句话,不许让看图失败)。"""
+        if self.workspace_store is None:
+            return False
+        figure = parse_rendered_figure_ref(ref_str)
+        if figure is not None:
+            return figure.region is None
+        try:
+            size = image_size((await self.image_resolver.resolve(ref_str)).data)
+        except Exception:
+            logger.debug("ask_image.region_hint_size_unknown", exc_info=True)
+            return False
+        return size is not None and size[0] * size[1] >= LARGE_IMAGE_PIXELS
 
     async def _ask(
         self,
@@ -466,6 +730,15 @@ class AskImageTool:
                 message, advice=advice, by_run_deadline=by_run_deadline, waited_s=limit_s
             ) from exc
 
+    def _require_region(self, args: Mapping[str, Any]) -> Region | None:
+        """B-266 —— ``region``:要往本对话目录里写裁图,只有接了工作区的那一版才有。"""
+        if not _given(args, "region"):
+            return None
+        if self.workspace_store is None:
+            msg = "ask_image here does not accept 'region'"
+            raise ValueError(msg)
+        return parse_region(args.get("region"), tool="ask_image")
+
     async def _image_ref_from_args(self, args: Mapping[str, Any], *, ctx: ToolContext) -> _Located:
         """三种用法,返回要看的 ref 与它的来历。
 
@@ -537,11 +810,7 @@ class AskImageTool:
                 raise
             # B-251 —— 文档在、这一页没渲染或已过期:代模型调一次 read_page(同一个工具
             # 实例、同一套沙箱)再找。它回来的 state 原样带回去,与模型自己调一样。
-            key = (ctx.run_id, path)
-            lock = self._render_locks.get(key)
-            if lock is None:
-                lock = self._render_locks[key] = asyncio.Lock()
-            async with lock:
+            async with self._render_lock((ctx.run_id, path)):
                 try:  # 排队时别人可能已经渲好了
                     return _Located(await find(), {"path": path, "unit": unit})
                 except FigureNotRenderedError:
@@ -619,9 +888,14 @@ def _spec_with_short_form() -> ToolSpec:
             "attached to the user message, for images the user uploaded. Ask narrow, "
             "specific questions; "
             "call ask_image repeatedly with sharper follow-ups if the first answer is too "
-            "vague — the image stays accessible. By default it is a quick look (good for "
-            "reading text, recognising content, finding numbers); pass depth='deep' only "
-            "for questions that need reasoning, such as a chart's trend or a complex layout."
+            "vague — the image stays accessible. In this order: first a quick look at the "
+            "whole image (the default); when you need a specific value, a table entry or small "
+            "text, look again with region='auto' — the image is cut into 6 overlapping tiles "
+            "read in parallel, and a tile that cannot see the complete answer says NOT_FOUND "
+            "instead of guessing; when you already know where it is (e.g. the vision model "
+            "told you), pass region=[x1, y1, x2, y2] on a 0-1000 scale to look at just that "
+            "part. Pass depth='deep' only when the text is readable and the answer still needs "
+            "reasoning, such as a chart's trend or a complex layout."
         ),
         parameters={
             "type": "object",
@@ -656,6 +930,18 @@ def _spec_with_short_form() -> ToolSpec:
                     "type": "string",
                     "enum": list(_DEPTHS),
                     "description": _DEPTH_DESCRIPTION,
+                },
+                "region": {
+                    "anyOf": [
+                        {"type": "string", "enum": [AUTO_REGION]},
+                        {
+                            "type": "array",
+                            "items": {"type": "integer", "minimum": 0, "maximum": 1000},
+                            "minItems": 4,
+                            "maxItems": 4,
+                        },
+                    ],
+                    "description": _REGION_DESCRIPTION,
                 },
             },
             "required": ["question"],
@@ -822,3 +1108,36 @@ def _stringify(content: Any) -> str:
                     parts.append(text)
         return "".join(parts)
     return ""
+
+
+def _messages(ref_str: str, text: str) -> list[BaseMessage]:
+    """一次看图的消息:系统提示 + ``[问题, 图]``。"""
+    return [
+        SystemMessage(content=_SYSTEM_PROMPT),
+        HumanMessage(content=[{"type": "text", "text": text}, image_ref_block(ref_str)]),
+    ]
+
+
+def _tile_meta(result: TileResult, crop: Mapping[str, Any] | None) -> dict[str, Any]:
+    """meta 里一块的记录:位置、框、分辨率 / 像素、结果(NOT_FOUND / 值 / 失败原因)。"""
+    entry: dict[str, Any] = {"tile": result.tile.label, "box": list(result.tile.box)}
+    if crop is not None:
+        entry.update(crop)
+    if result.answer is None:
+        entry["error"] = result.error
+    elif is_not_found(result.answer):
+        entry["result"] = NOT_FOUND
+    else:
+        entry["result"] = result.answer
+    return entry
+
+
+def _sum_usage(usages: Sequence[Mapping[str, Any]]) -> dict[str, int]:
+    """几次 VL 调用的用量相加(只加三个总数;明细各块自己的回执里有)。"""
+    total: dict[str, int] = {}
+    for usage in usages:
+        for key in ("input_tokens", "output_tokens", "total_tokens"):
+            value = usage.get(key)
+            if isinstance(value, int):
+                total[key] = total.get(key, 0) + value
+    return total

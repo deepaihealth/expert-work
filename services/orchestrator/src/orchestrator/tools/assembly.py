@@ -512,6 +512,7 @@ def _register_ask_image(
         )
     # B-64 Task 8 —— 带上工作区存储,``ask_image`` 才有 ``path`` + ``unit`` 短形态;
     # 没接时它只收 ``image_ref``,描述里也不提短形态。
+    read_page = registry.get("read_page")
     registry.register(
         AskImageTool(
             vl_caller=vl_caller,
@@ -524,7 +525,8 @@ def _register_ask_image(
             output_cap_resolver=served_output_cap(vision.model),
             # B-251 —— 按页看时那一页没渲染,用这个 agent 自己的 read_page 先渲一次。
             # read_page 是基础能力,先于这里注册;没有它(没接沙箱)就保持旧行为。
-            page_renderer=registry.get("read_page"),
+            # B-266 —— 它也负责渲文档页的局部(``render_regions``)。
+            page_renderer=read_page if isinstance(read_page, ReadPageTool) else None,
         )
     )
 
@@ -890,6 +892,8 @@ def _register_read_page(
             client=env.sandbox_runtime,
             skill_seed_files=skill_seed_files,
             figure_delivery=figure_delivery,
+            # B-266 —— 渲局部(read_page / ask_image 的 region)要读整页渲染的像素尺寸。
+            image_resolver=env.image_resolver,
         )
     )
 

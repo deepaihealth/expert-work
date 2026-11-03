@@ -355,6 +355,9 @@ from expert_work.persistence.workspace import (
     ARTIFACT_SNAPSHOT_DIR as ARTIFACT_SNAPSHOT_DIR,
 )
 from expert_work.persistence.workspace import (
+    RENDERED_CROP_DIR as RENDERED_CROP_DIR,
+)
+from expert_work.persistence.workspace import (
     RENDERED_FIGURE_DIR as RENDERED_FIGURE_DIR,
 )
 from expert_work.persistence.workspace import (
@@ -430,10 +433,16 @@ from expert_work.persistence.workspace import (
     is_delete_protected_workspace_path as is_delete_protected_workspace_path,
 )
 from expert_work.persistence.workspace import (
+    is_rendered_crop_rel as is_rendered_crop_rel,
+)
+from expert_work.persistence.workspace import (
     is_rendered_figure_rel as is_rendered_figure_rel,
 )
 from expert_work.persistence.workspace import (
     is_reserved_workspace_path as is_reserved_workspace_path,
+)
+from expert_work.persistence.workspace import (
+    region_crop_stem as region_crop_stem,
 )
 from expert_work.persistence.workspace import (
     workspace_volume_name as workspace_volume_name,
@@ -442,6 +451,7 @@ from expert_work.persistence.workspace import (
 __all__ = [
     "AGENT_FILE_VERSIONS_DIR",
     "ARTIFACT_SNAPSHOT_DIR",
+    "RENDERED_CROP_DIR",
     "RENDERED_FIGURE_DIR",
     "RENDERED_FIGURE_PAGE_STEM",
     "RENDERED_FIGURE_SHA_HEX_LEN",
@@ -614,7 +624,9 @@ __all__ = [
     "current_tenant_id_var",
     "current_user_id_var",
     "is_delete_protected_workspace_path",
+    "is_rendered_crop_rel",
     "is_rendered_figure_rel",
     "is_reserved_workspace_path",
+    "region_crop_stem",
     "workspace_volume_name",
 ]

@@ -180,14 +180,17 @@ from typing import Any, Final, Literal, TypeGuard
 from uuid import UUID
 
 from expert_work.persistence import (
+    RENDERED_CROP_DIR,
     RENDERED_FIGURE_DIR,
     RENDERED_FIGURE_PAGE_STEM,
     RENDERED_FIGURE_SHA_HEX_LEN,
     RENDERED_FIGURE_UNIT_PREFIX,
     WORKSPACE_OVERFLOW_DIR,
+    is_rendered_crop_rel,
+    region_crop_stem,
 )
 from expert_work.protocol.multimodal import WORKSPACE_REF_PREFIX
-from orchestrator.multimodal import parse_rendered_figure_ref
+from orchestrator.multimodal import ImageResolver, RenderedFigureRef, parse_rendered_figure_ref
 from orchestrator.tools.document_figures import (
     _DOCX_INVENTORY_FRAGMENT,
     MIN_FIGURE_AREA_RATIO,
@@ -195,6 +198,7 @@ from orchestrator.tools.document_figures import (
     RENDERABLE_EXTENSIONS,
 )
 from orchestrator.tools.file_ops import _require_path, _snippet, run_scoped_read
+from orchestrator.tools.region_zoom import Box, image_size, parse_box, pixel_box, region_dpi
 from orchestrator.tools.registry import ToolContext, ToolResult, ToolSpec
 from orchestrator.tools.sandbox import SandboxRuntime
 from orchestrator.tools.sandbox_image_contract import AGENT_VIEW, EXEC_VIEW
@@ -399,17 +403,61 @@ _DEFAULT_UNIT_LABEL: Final = "页"
 _ANCHOR_ECHO_CHARS: Final = 40
 
 
+#: B-266 —— 渲整页(:data:`_RENDER_MAIN`)与渲局部(:data:`_REGION_MAIN`)共用的两段:内容哈希
+#: 必须是**同一个算法**(局部要核对文档还是渲整页时那一份),清目录的那道闸也不该有第二份。
+_RENDER_HELPERS = """
+
+import glob as _glob
+import shutil
+import subprocess
+
+
+def _render_sha(full):
+    # 产出路径必须跟着**渲染输入**走, 不是只跟着路径走(回修第 4 轮 New-I1)。
+    # 宿主侧的 out_rel 只按 (run_id, 路径) 算, 同一条路径换了内容拿到的是逐字
+    # 相同的产出 rel —— 前三层的洞(pdftoppm 层、soffice 层、缓存层)共享的正
+    # 是这一个前提。这个哈希在片段里算, 不在宿主侧算: ReadPageTool 手里只有
+    # SandboxRuntime 这一条通道(没有 workspace store), 够不着这个文件。
+    #
+    # **dpi 也要进来**(回修第 5 轮 M-1): 变了会让产出字节变、而 rel 不变的量,
+    # 一个都不能留在路径外面。dpi 是 build_render_wrapper 的公开参数(带默认值),
+    # 今天生产路径写死 RENDER_DPI 所以不可达 —— 但"公开入口的前置条件没人执行
+    # 就等于没有"正是审计 B 刚关掉的那个形状, 靠 docstring 钉不住。同一份文件
+    # 按 100dpi 与 300dpi 渲出的字节不同, 拼进来之后 rel 也就不同了。
+    # 其余参数核过: ws/rel 已在 doc_sha 里, units 已在 _u<unit>/page-NN 里,
+    # 两个 timeout 只决定成功与否、不决定成功时的字节。
+    #
+    # 流式读: 上传里见过 47.8MB 的 deck, 不能一次读进内存。
+    digest = hashlib.sha256()
+    digest.update(("dpi=" + str(_P["dpi"]) + ";").encode())
+    with open(full, "rb") as fh:
+        while True:
+            chunk = fh.read(1024 * 1024)
+            if not chunk:
+                break
+            digest.update(chunk)
+    return digest.hexdigest()[:_P["sha_hex_len"]]
+
+
+def _fresh_dir(path):
+    # 清空 + 重建, 并确认真的清干净了(回修第 3 轮 Minor-3)—— shutil.rmtree
+    # 配 ignore_errors=True 会静默吞掉"path 是指向别处的目录符号链接"这类
+    # 错误(rmtree 拒绝 follow 符号链接), 而 os.makedirs(exist_ok=True) 对一个
+    # 符号链接指向的已存在目录不会报错, 于是"这里已经清空"这个前提会悄悄落
+    # 空, 后面的 subprocess/glob 全部建在这个前提之上。返回 False 时调用方
+    # 必须把它当一次真实失败播报, 不能当没看见继续往下走(否则又是 New-2/
+    # Important-1 那个坑的第三次重演)。
+    shutil.rmtree(path, ignore_errors=True)
+    os.makedirs(path, exist_ok=True)
+    return not (os.path.islink(path) or os.listdir(path))
+"""
+
 # 沙箱内渲染片段。``os`` / ``json`` / ``_P`` / ``_resolve`` 来自共享的
 # ``_PRELUDE``(见 file_ops);``_docx_inventory`` 来自与 ``document_figures``
 # 共用的 :data:`~orchestrator.tools.document_figures._DOCX_INVENTORY_FRAGMENT`
 # (Task 4b —— 两处各抄一份会让 ``unit`` 指向不同的段落,而且不报错)。
 _RENDER_MAIN = (
-    """
-
-import glob as _glob
-import shutil
-import subprocess
-"""
+    _RENDER_HELPERS
     + _DOCX_INVENTORY_FRAGMENT
     + """
 
@@ -651,46 +699,6 @@ def _resolve_docx_page(ctx, unit):
     return next(iter(unexplained)), None, anchor
 
 
-def _render_sha(full):
-    # 产出路径必须跟着**渲染输入**走, 不是只跟着路径走(回修第 4 轮 New-I1)。
-    # 宿主侧的 out_rel 只按 (run_id, 路径) 算, 同一条路径换了内容拿到的是逐字
-    # 相同的产出 rel —— 前三层的洞(pdftoppm 层、soffice 层、缓存层)共享的正
-    # 是这一个前提。这个哈希在片段里算, 不在宿主侧算: ReadPageTool 手里只有
-    # SandboxRuntime 这一条通道(没有 workspace store), 够不着这个文件。
-    #
-    # **dpi 也要进来**(回修第 5 轮 M-1): 变了会让产出字节变、而 rel 不变的量,
-    # 一个都不能留在路径外面。dpi 是 build_render_wrapper 的公开参数(带默认值),
-    # 今天生产路径写死 RENDER_DPI 所以不可达 —— 但"公开入口的前置条件没人执行
-    # 就等于没有"正是审计 B 刚关掉的那个形状, 靠 docstring 钉不住。同一份文件
-    # 按 100dpi 与 300dpi 渲出的字节不同, 拼进来之后 rel 也就不同了。
-    # 其余参数核过: ws/rel 已在 doc_sha 里, units 已在 _u<unit>/page-NN 里,
-    # 两个 timeout 只决定成功与否、不决定成功时的字节。
-    #
-    # 流式读: 上传里见过 47.8MB 的 deck, 不能一次读进内存。
-    digest = hashlib.sha256()
-    digest.update(("dpi=" + str(_P["dpi"]) + ";").encode())
-    with open(full, "rb") as fh:
-        while True:
-            chunk = fh.read(1024 * 1024)
-            if not chunk:
-                break
-            digest.update(chunk)
-    return digest.hexdigest()[:_P["sha_hex_len"]]
-
-
-def _fresh_dir(path):
-    # 清空 + 重建, 并确认真的清干净了(回修第 3 轮 Minor-3)—— shutil.rmtree
-    # 配 ignore_errors=True 会静默吞掉"path 是指向别处的目录符号链接"这类
-    # 错误(rmtree 拒绝 follow 符号链接), 而 os.makedirs(exist_ok=True) 对一个
-    # 符号链接指向的已存在目录不会报错, 于是"这里已经清空"这个前提会悄悄落
-    # 空, 后面的 subprocess/glob 全部建在这个前提之上。返回 False 时调用方
-    # 必须把它当一次真实失败播报, 不能当没看见继续往下走(否则又是 New-2/
-    # Important-1 那个坑的第三次重演)。
-    shutil.rmtree(path, ignore_errors=True)
-    os.makedirs(path, exist_ok=True)
-    return not (os.path.islink(path) or os.listdir(path))
-
-
 def _main():
     full = _resolve(_P["rel"])
     if full is None:
@@ -886,6 +894,212 @@ def build_render_wrapper(
         },
         _RENDER_MAIN,
     )
+
+
+#: B-266 —— 沙箱内「渲局部」片段:一页文档按若干个框各渲一张高分辨率 jpeg,**一次 exec 渲完**。
+#:
+#: * 先核对文档内容还是渲整页时那一份(同一个 ``_render_sha``):页号、页面尺寸都取自那张整页
+#:   渲染,文档之后换了内容,框就对不上了 —— 回 ``stale``,不渲;
+#: * docx / pptx 复用 ``read_page`` 已转好的 PDF(``pdf_rels`` 按序找),都不在(被清理 / 在本视图
+#:   里看不见)就在本次裁图目录的 ``_pdf/`` 里重转一份(同一道清目录的闸);
+#: * 每个框的目标文件名由宿主算好(源内容哈希在目录里,框在文件名里):已经在了就直接复用;
+#:   否则 ``pdftoppm -x -y -W -H -singlefile`` 渲到本进程私有的临时名,成功后 ``os.replace``
+#:   换上 —— 失败不会留下半张图被下一次当成复用。
+_REGION_MAIN = (
+    _RENDER_HELPERS
+    + """
+
+def _first_pdf(rel):
+    folder = _resolve(rel)
+    if folder is None or os.path.islink(folder) or not os.path.isdir(folder):
+        return None
+    pdfs = sorted(_glob.glob(os.path.join(folder, "*.pdf")))
+    return pdfs[0] if pdfs else None
+
+
+def _convert(full, out_dir):
+    if shutil.which("soffice") is None:
+        return None, {"ok": False, "error": "soffice_missing", "detail": "soffice"}
+    conv = os.path.join(out_dir, "_pdf")
+    if not _fresh_dir(conv):
+        return None, {"ok": False, "error": "convert_failed", "detail": "conv_dir_not_clean"}
+    try:
+        result = subprocess.run(
+            ["soffice", "--headless", "--norestore", "--convert-to", "pdf",
+             "--outdir", conv, full],
+            capture_output=True, timeout=_P["convert_timeout_s"], check=False)
+    except Exception as exc:
+        return None, {"ok": False, "error": "convert_failed", "detail": type(exc).__name__}
+    if result.returncode != 0:
+        return None, {"ok": False, "error": "convert_failed",
+                      "detail": "exit=" + str(result.returncode)}
+    pdfs = _glob.glob(os.path.join(conv, "*.pdf"))
+    if not pdfs:
+        return None, {"ok": False, "error": "convert_failed"}
+    return pdfs[0], None
+
+
+def _render_job(pdf, out_dir, job):
+    target = os.path.join(out_dir, job["name"])
+    if os.path.isfile(target) and not os.path.islink(target):
+        return target, True, None
+    part = target[: -len(".jpg")] + "." + str(os.getpid()) + ".part"
+    try:
+        result = subprocess.run(
+            ["pdftoppm", "-jpeg", "-r", str(job["dpi"]),
+             "-f", str(_P["page"]), "-l", str(_P["page"]),
+             "-x", str(job["x"]), "-y", str(job["y"]),
+             "-W", str(job["w"]), "-H", str(job["h"]),
+             "-singlefile", pdf, part],
+            capture_output=True, timeout=_P["render_timeout_s"], check=False)
+    except Exception as exc:
+        return None, False, type(exc).__name__
+    made = part + ".jpg"
+    if result.returncode != 0 or not os.path.isfile(made):
+        try:
+            os.unlink(made)
+        except OSError:
+            pass
+        return None, False, "pdftoppm_failed"
+    os.replace(made, target)
+    return target, False, None
+
+
+def _main():
+    full = _resolve(_P["rel"])
+    if full is None:
+        return {"ok": False, "error": "path_escapes_workspace"}
+    try:
+        os.path.getsize(full)
+    except FileNotFoundError:
+        return {"ok": False, "error": "not_found"}
+    except OSError as exc:
+        return {"ok": False, "error": "io_error", "detail": str(exc)}
+    if shutil.which("pdftoppm") is None:
+        return {"ok": False, "error": "soffice_missing", "detail": "pdftoppm"}
+    try:
+        render_sha = _render_sha(full)
+    except OSError as exc:
+        return {"ok": False, "error": "io_error", "detail": str(exc)}
+    if render_sha != _P["render_sha"]:
+        return {"ok": False, "error": "stale"}
+    # 与渲整页同一种拼法(不走 realpath):回报的 rel 要相对字面的 ws 算, 宿主才认得。
+    out_dir = os.path.join(_P["ws"], _P["out_rel"])
+    os.makedirs(out_dir, exist_ok=True)
+    if os.path.splitext(full)[1].lower() == ".pdf":
+        pdf = full
+    else:
+        pdf = None
+        for rel in _P["pdf_rels"]:
+            pdf = _first_pdf(rel)
+            if pdf is not None:
+                break
+        if pdf is None:
+            pdf, error = _convert(full, out_dir)
+            if error is not None:
+                return error
+    crops = []
+    failed = []
+    for job in _P["jobs"]:
+        target, reused, why = _render_job(pdf, out_dir, job)
+        if target is None:
+            failed.append({"name": job["name"], "why": why})
+            continue
+        crops.append({"name": job["name"], "rel": os.path.relpath(target, _P["ws"]),
+                      "reused": reused})
+    if not crops:
+        return {"ok": False, "error": "render_failed", "failed": failed}
+    return {"ok": True, "crops": crops, "failed": failed}
+
+
+print(json.dumps(_main()))
+"""
+)
+
+
+def build_region_wrapper(
+    rel: str,
+    *,
+    page: int,
+    render_sha: str,
+    jobs: Sequence[Mapping[str, Any]],
+    out_rel: str,
+    pdf_rels: Sequence[str] = (),
+    ws: str = _WORKSPACE_ROOT,
+    convert_timeout_s: int = _CONVERT_TIMEOUT_S,
+    render_timeout_s: int = _RENDER_TIMEOUT_S,
+) -> str:
+    """B-266 沙箱片段:把 ``ws/rel`` 第 ``page`` 页按 ``jobs``(每项 ``name`` / ``dpi`` /
+    ``x`` / ``y`` / ``w`` / ``h``,像素按该 dpi 算)各渲一张,落在 ``ws/out_rel/<name>``。
+
+    ``render_sha`` 是那张整页渲染路径里的内容哈希;``dpi`` 喂的是整页的 :data:`RENDER_DPI`,
+    让 ``_render_sha`` 与渲整页时逐字同一个算法、同一个输入。"""
+    return _snippet(
+        {
+            "ws": ws,
+            "rel": rel,
+            "page": page,
+            "render_sha": render_sha,
+            "jobs": [dict(job) for job in jobs],
+            "out_rel": out_rel,
+            "pdf_rels": list(pdf_rels),
+            "dpi": RENDER_DPI,
+            "sha_hex_len": RENDERED_FIGURE_SHA_HEX_LEN,
+            "convert_timeout_s": convert_timeout_s,
+            "render_timeout_s": render_timeout_s,
+        },
+        _REGION_MAIN,
+    )
+
+
+#: 渲局部失败时给模型的话(English:B-266 起新增的平台文字)。
+_REGION_ERRORS: Final[dict[str, str]] = {
+    "stale": (
+        "the document changed after this page was rendered, so the region no longer matches it "
+        "- render the page again with read_page first"
+    ),
+    "not_found": "the document is no longer in the workspace",
+    "path_escapes_workspace": "the document path is outside the workspace",
+    "io_error": "the document could not be read (I/O error)",
+    "soffice_missing": "the sandbox is missing the rendering tools",
+    "convert_failed": "the document could not be converted to PDF",
+    "render_failed": "none of the regions could be rendered",
+}
+
+
+class RegionRenderError(RuntimeError):
+    """B-266 —— 文档页的局部没能渲出来(文字说清原因与下一步)。"""
+
+
+@dataclass(frozen=True)
+class RegionCrop:
+    """一个框渲出来的局部:工作区 ref + 实际分辨率 / 像素。``dpi`` 为 ``None`` 是原像素裁的图片。"""
+
+    box: Box
+    ref: str
+    width: int
+    height: int
+    dpi: int | None = None
+    reused: bool = False
+
+
+@dataclass(frozen=True)
+class RegionRender:
+    crops: tuple[RegionCrop, ...]
+    #: 没渲出来的框与原因。
+    failed: tuple[tuple[Box, str], ...] = ()
+
+
+def _figure_pdf_rel(figure: RenderedFigureRef) -> str:
+    """整页渲染旁边 ``read_page`` 转好的 PDF 目录,写成 ``/agent`` 视图相对路径。
+
+    ``figure.workspace.rel`` 是用户根相对:绑了 agent 先剥 ``agents/<key>`` 两段;再去掉
+    ``_u<unit>/page-NN.jpg`` 两段就是 ``<render-sha>/`` 目录。对话视图里 agent 根的
+    ``.tool_results`` 被盖住,那时片段找不到它,会自己重转。"""
+    parts = PurePosixPath(figure.workspace.rel).parts
+    if figure.workspace.agent_key is not None:
+        parts = parts[2:]
+    return "/".join((*parts[:-2], "_pdf"))
 
 
 def workspace_figure_ref(tenant_id: UUID, user_id: UUID, rel: str) -> str:
@@ -1177,6 +1391,15 @@ class ReadPageTool:
     #: 同一处的判据算好传进来,这里不重推。默认 ``"none"``:没接线时宁可说
     #: 「你看不到」,也不许说「已放进你的上下文」。
     figure_delivery: FigureDelivery = "none"
+    #: B-266 —— 渲局部时读整页渲染的像素尺寸用(页面多大、框落在哪);``None`` = 没接,
+    #: ``region`` 不可用(参数表里也不出现)。
+    image_resolver: ImageResolver | None = None
+
+    @property
+    def _offers_region(self) -> bool:
+        """B-266 —— ``read_page`` 的 ``region`` 只给能直接看图的主模型(Path A):看不了图的走
+        ``ask_image(region=...)``。"""
+        return self.figure_delivery == "inline" and self.image_resolver is not None
 
     @property
     def spec(self) -> ToolSpec:
@@ -1187,6 +1410,37 @@ class ReadPageTool:
         # 没有任何测试会红。改成从同一个集合插值,并且不点名"谁被拒"(不然又是
         # 同一个坑换个位置)。
         renderable = " / ".join(sorted(ext.upper() for ext in RENDERABLE_EXTENSIONS))
+        properties: dict[str, Any] = {
+            "path": {
+                "type": "string",
+                "description": PATH_ARG_DESCRIPTION,
+            },
+            "units": {
+                "type": "array",
+                "items": {"type": "integer", "minimum": 1},
+                "description": (
+                    "1-based entry numbers from the figure map to render "
+                    f"(max {MAX_PAGES_PER_CALL})."
+                ),
+            },
+        }
+        region_rule = ""
+        if self._offers_region:
+            properties["region"] = {
+                "type": "array",
+                "items": {"type": "integer", "minimum": 0, "maximum": 1000},
+                "minItems": 4,
+                "maxItems": 4,
+                "description": (
+                    "Optional [x1, y1, x2, y2] on a 0-1000 scale of the page (with exactly one "
+                    "unit): render only that part of the page at high resolution."
+                ),
+            }
+            region_rule = (
+                " To read small text or exact numbers on a page you have already looked at, "
+                "call it again with one unit and 'region' set to the box around that part; the "
+                "region comes back at much higher resolution."
+            )
         return ToolSpec(
             name="read_page",
             description=(
@@ -1199,24 +1453,14 @@ class ReadPageTool:
                 "to each figure — for some formats those are page/slide numbers, "
                 "for others the page is resolved for you, so pass the number the "
                 "map printed rather than a page you guessed. At most "
-                f"{MAX_PAGES_PER_CALL} per call — call it again for more. " + WORKSPACE_PATH_RULE
+                f"{MAX_PAGES_PER_CALL} per call — call it again for more."
+                + region_rule
+                + " "
+                + WORKSPACE_PATH_RULE
             ),
             parameters={
                 "type": "object",
-                "properties": {
-                    "path": {
-                        "type": "string",
-                        "description": PATH_ARG_DESCRIPTION,
-                    },
-                    "units": {
-                        "type": "array",
-                        "items": {"type": "integer", "minimum": 1},
-                        "description": (
-                            "1-based entry numbers from the figure map to render "
-                            f"(max {MAX_PAGES_PER_CALL})."
-                        ),
-                    },
-                },
+                "properties": properties,
                 "required": ["path", "units"],
             },
             # 回修 I2 —— 这个工具会 makedirs + 落中间 pdf/jpg 到工作区的
@@ -1237,6 +1481,18 @@ class ReadPageTool:
         # docx 传进来的是图清单编号,说"你传了 4 页"是在用一个它没有的单位说话。
         ext = PurePosixPath(raw).suffix.lower().lstrip(".")
         label = _UNIT_LABELS.get(ext, _DEFAULT_UNIT_LABEL)
+        region = parse_box(args.get("region"), tool="read_page")
+        if region is not None and not self._offers_region:
+            return ToolResult(
+                content=(
+                    "read_page 'region' is only available when the model sees images directly; "
+                    "use ask_image with 'path', 'unit' and 'region' instead."
+                )
+            )
+        if region is not None and len(units) != 1:
+            return ToolResult(
+                content="read_page with 'region' takes exactly one unit: the page the region is on."
+            )
         if len(units) > MAX_PAGES_PER_CALL:
             return ToolResult(
                 content=(
@@ -1351,6 +1607,10 @@ class ReadPageTool:
             if per_unit:
                 msg = f"{msg} {per_unit}"
             return ToolResult(content=msg)
+        if region is not None:
+            return await self._region_result(
+                raw, refs[0], region, ctx=ctx, doc_sha=doc_sha, notes=notes, label=label
+            )
 
         # 回修第 4 轮 New-M2 —— 兜底值不能写成页码。原来是
         # `str(len(refs))` 直接插进"第 {pages} 页"这句**页码**文案:沙箱回
@@ -1384,3 +1644,151 @@ class ReadPageTool:
             # 历史里这条回执之后仍在。
             state_updates={"viewed_figures": refs, "figure_documents": {doc_sha: raw}},
         )
+
+    async def _region_result(
+        self,
+        raw: str,
+        page_ref: str,
+        region: Box,
+        *,
+        ctx: ToolContext,
+        doc_sha: str,
+        notes: Sequence[Mapping[str, Any]],
+        label: str,
+    ) -> ToolResult:
+        """B-266 —— ``read_page(region=…)``:整页已渲好,再把这一块高分辨率渲出来,像一页那样
+        进 ``viewed_figures``(下一轮内联给主模型)。只放局部,不放整页。"""
+        try:
+            rendered = await self.render_regions(
+                path=raw, figure_ref=page_ref, boxes=[region], ctx=ctx
+            )
+        except RegionRenderError as exc:
+            return ToolResult(content=f"Could not render region {list(region)} of {raw}: {exc}")
+        crop = rendered.crops[0]
+        figure = parse_rendered_figure_ref(page_ref)
+        page = figure.page if figure is not None else "?"
+        content = (
+            f"Rendered region {list(region)} of page {page} of {raw} at {crop.dpi} dpi "
+            f"({crop.width}x{crop.height} px); from the next turn you will see it in your context."
+        )
+        caveats = _describe_render_notes(notes, unit_label=label)
+        if caveats:
+            content = f"{content} {caveats}"
+        return ToolResult(
+            content=content,
+            meta={
+                "region": list(region),
+                "dpi": crop.dpi,
+                "pixels": [crop.width, crop.height],
+                "reused": crop.reused,
+            },
+            state_updates={"viewed_figures": [crop.ref], "figure_documents": {doc_sha: raw}},
+        )
+
+    async def render_regions(
+        self, *, path: str, figure_ref: str, boxes: Sequence[Box], ctx: ToolContext
+    ) -> RegionRender:
+        """B-266 —— 文档 ``path`` 的一页(``figure_ref`` 是它的整页渲染)按 ``boxes`` 各渲一张局部。
+
+        分辨率按每个框的面积定(约 1.5 百万像素,上限 400 dpi),页面尺寸取整页渲染的像素;
+        一次沙箱执行渲完全部框,落本对话 ``.tool_results/<本 run>/crops/…``。``ask_image``
+        的 ``region`` 也走这里(它在同一把 ``(run, path)`` 锁里调)。
+        """
+        figure = parse_rendered_figure_ref(figure_ref)
+        if figure is None or figure.region is not None:
+            msg = "region needs a rendered page to zoom into"
+            raise RegionRenderError(msg)
+        if ctx.tenant_id is None or ctx.user_id is None or ctx.run_id is None:
+            msg = "rendering a region needs a tenant, user and run binding"
+            raise RegionRenderError(msg)
+        if self.image_resolver is None:
+            msg = "rendering a region is not available in this deployment"
+            raise RegionRenderError(msg)
+        size = image_size((await self.image_resolver.resolve(figure_ref)).data)
+        if size is None:
+            msg = "the rendered page could not be read to place the region"
+            raise RegionRenderError(msg)
+        doc_sha, agent_rel = render_source(path, view=ctx.workspace_view)
+        if doc_sha != figure.doc_sha:
+            msg = "the rendered page does not belong to this document"
+            raise RegionRenderError(msg)
+        base = conversation_work_prefix(ctx.workspace_view)
+        out_rel = (
+            f"{base}{WORKSPACE_OVERFLOW_DIR}/{ctx.run_id}/{RENDERED_CROP_DIR}/"
+            f"{doc_sha}/{figure.render_sha}/{figure.unit_dir}"
+        )
+        jobs = [_region_job(box, page=figure.page, page_px=size) for box in boxes]
+        env = await run_scoped_read(
+            self.client,
+            build=lambda w: build_region_wrapper(
+                agent_rel,
+                page=figure.page,
+                render_sha=figure.render_sha,
+                jobs=jobs,
+                out_rel=out_rel,
+                pdf_rels=(_figure_pdf_rel(figure), f"{out_rel}/_pdf"),
+                ws=w,
+            ),
+            ws=AGENT_VIEW,
+            ctx=ctx,
+            tool="read_page",
+            seed_files=self.skill_seed_files,
+        )
+        if not env.get("ok"):
+            kind = str(env.get("error", "unknown"))
+            reason = _REGION_ERRORS.get(kind, f"the region render failed ({kind})")
+            raise RegionRenderError(reason)
+        scope = figure_scope(ctx.workspace_view)
+        made: dict[str, Mapping[str, Any]] = {}
+        for item in env.get("crops") or ():
+            if not isinstance(item, Mapping):
+                continue
+            rel = _validate_rendered_rel(item.get("rel"), under=out_rel, base=base)
+            if rel is not None and is_rendered_crop_rel(rel[len(base) :]):
+                made[rel] = item
+        crops: list[RegionCrop] = []
+        failed: list[tuple[Box, str]] = []
+        for box, job in zip(boxes, jobs, strict=True):
+            rel = f"{out_rel}/{job['name']}"
+            item = made.get(rel)
+            if item is None:
+                failed.append((box, _job_failure(env.get("failed"), str(job["name"]))))
+                continue
+            crops.append(
+                RegionCrop(
+                    box=box,
+                    ref=workspace_figure_ref(ctx.tenant_id, ctx.user_id, scoped_path(scope, rel)),
+                    width=int(job["w"]),
+                    height=int(job["h"]),
+                    dpi=int(job["dpi"]),
+                    reused=bool(item.get("reused")),
+                )
+            )
+        if not crops:
+            msg = "none of the regions could be rendered"
+            raise RegionRenderError(msg)
+        return RegionRender(crops=tuple(crops), failed=tuple(failed))
+
+
+def _region_job(box: Box, *, page: int, page_px: tuple[int, int]) -> dict[str, Any]:
+    """一个框 → 片段里的一项:目标文件名、分辨率、按那个分辨率算的像素框。"""
+    dpi = region_dpi(page_px, box, base_dpi=RENDER_DPI)
+    scale = dpi / RENDER_DPI
+    left, top, right, bottom = pixel_box(box, (page_px[0] * scale, page_px[1] * scale))
+    return {
+        "name": f"{RENDERED_FIGURE_PAGE_STEM}-{page}-{region_crop_stem(box)}.jpg",
+        "dpi": dpi,
+        "x": left,
+        "y": top,
+        "w": right - left,
+        "h": bottom - top,
+    }
+
+
+def _job_failure(failed: object, name: str) -> str:
+    """片段回的 ``failed`` 里这一项的原因;找不到就说产出路径不合法(被宿主校验剔掉了)。"""
+    if isinstance(failed, list):
+        for entry in failed:
+            if isinstance(entry, Mapping) and entry.get("name") == name:
+                return str(entry.get("why", "unknown"))
+    return "rejected_rel"

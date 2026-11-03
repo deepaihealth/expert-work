@@ -24,6 +24,7 @@ from orchestrator.multimodal import (
 )
 from orchestrator.tools.nas_workspace_store import NasWorkspaceStore
 from orchestrator.tools.read_page import ReadPageTool, document_sha, workspace_figure_ref
+from orchestrator.tools.region_zoom import REGION_HINT
 from orchestrator.tools.registry import ToolBlockedError, ToolContext
 from orchestrator.tools.sandbox import (
     EgressContext,
@@ -476,7 +477,8 @@ async def test_ask_image_short_form_resolves_the_rendered_page(tmp_path: Path) -
 
     expected = workspace_figure_ref(tenant, user, f"agents/{_AGENT}/{rel}")
     assert _sent_ref(vl) == expected
-    assert result.content == "血糖曲线"
+    # B-266 —— 整页快看一张文档页:末尾提示可以 region='auto' 再看小字。
+    assert result.content == f"血糖曲线\n\n{REGION_HINT}"
     assert result.meta["image_ref"] == expected
     assert result.meta["resolved_from"] == {"path": _DOC, "unit": 10}
 
