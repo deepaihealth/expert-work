@@ -7,19 +7,20 @@ import json
 
 import pytest
 
-from orchestrator.tools.region_zoom import auto_tiles
+from orchestrator.tools.region_zoom import auto_bands
 from orchestrator.tools.tile_reading import (
     TILE_INSTRUCTION,
     TileResult,
     aggregate_tiles,
     compatible,
+    decide_auto,
     parse_reading,
     parse_tile_reply,
     tile_meta,
     tile_question,
 )
 
-_TILES = auto_tiles()
+_TILES = auto_bands(6)
 
 
 def _json(status: str, value: str = "", *, unit: str = "", label: str = "") -> str:
@@ -180,7 +181,7 @@ def test_same_readings(a: str, b: str) -> None:
     [
         ("5.6", "5.9", ""),
         ("120 g/L", "12.0 g/dL", "units differ"),
-        ("<0.5", "0.5", "tile edge may have cut it off"),
+        ("<0.5", "0.5", "band edge may have cut it off"),
         ("5\u2191", "5\u2193", "flagged high and the other low"),
         ("+", "++", ""),
         ("\u9634\u6027", "\u5f31\u9633\u6027", ""),  # 阴性 / 弱阳性
@@ -223,22 +224,22 @@ _NF = _json("not_found")
 def test_all_not_found_says_so_and_invents_nothing() -> None:
     verdict = aggregate_tiles(_results(*[_NF] * 6))
     assert verdict.outcome == "none"
-    assert "no tile could see the complete answer (6 replied not_found)" in verdict.content
+    assert "no band could see the complete answer (6 replied not_found)" in verdict.content
     assert "region=[" not in verdict.content
 
 
 def test_partial_tiles_suggest_a_region_around_their_union() -> None:
     verdict = aggregate_tiles(_results(_NF, _NF, _json("partial"), _json("partial"), _NF, _NF))
     assert verdict.outcome == "none"
-    middle_left, middle_right = _TILES[2].box, _TILES[3].box
+    third, fourth = _TILES[2].box, _TILES[3].box
     union = [
-        min(middle_left[0], middle_right[0]),
-        min(middle_left[1], middle_right[1]),
-        max(middle_left[2], middle_right[2]),
-        max(middle_left[3], middle_right[3]),
+        min(third[0], fourth[0]),
+        min(third[1], fourth[1]),
+        max(third[2], fourth[2]),
+        max(third[3], fourth[3]),
     ]
     assert f"region={union}" in verdict.content
-    assert "middle-left, middle-right" in verdict.content
+    assert "band 3, band 4 saw it cut off" in verdict.content
 
 
 def test_one_value_and_five_not_found_is_the_answer() -> None:
@@ -248,8 +249,8 @@ def test_one_value_and_five_not_found_is_the_answer() -> None:
     assert verdict.outcome == "single"
     assert verdict.content.startswith("5.6 mmol/L\n")
     assert 'label "GLU"' in verdict.content
-    assert "read in tile middle-left" in verdict.content
-    assert "5 tile(s) replied not_found" in verdict.content
+    assert "read in band 3" in verdict.content
+    assert "5 band(s) replied not_found" in verdict.content
 
 
 def test_agreeing_tiles_show_the_most_complete_form_and_the_variants() -> None:
@@ -282,8 +283,9 @@ def test_two_agree_and_one_disagrees_is_a_conflict_not_a_vote() -> None:
     assert verdict.outcome == "conflict"
     assert "same label, different readings" in verdict.content
     assert "no reading is preferred by count" in verdict.content
-    top_left = list(_TILES[0].box)
-    assert f'- tile top-left region={top_left} label "GLU": "5.6"' in verdict.content
+    first = list(_TILES[0].box)
+    assert first == [0, 0, 1000, first[3]]
+    assert f'- band 1 region={first} label "GLU": "5.6"' in verdict.content
 
 
 def test_a_reading_must_agree_with_every_member_of_a_group() -> None:
@@ -322,14 +324,14 @@ def test_a_comparator_conflict_says_the_edge_may_have_cut_it() -> None:
         _results(_json("found", "<0.5"), _json("found", "0.5"), _NF, _NF, _NF, _NF)
     )
     assert verdict.outcome == "conflict"
-    assert "a tile edge may have cut it off" in verdict.content
+    assert "a band edge may have cut it off" in verdict.content
 
 
 def test_a_failed_tile_beside_a_value() -> None:
     verdict = aggregate_tiles(_results(None, _NF, _json("found", "5.6"), _NF, _NF, _NF))
     assert verdict.outcome == "single"
     assert verdict.content.startswith("5.6\n")
-    assert "top-left (timed out)" in verdict.content
+    assert "band 1 (timed out)" in verdict.content
 
 
 def test_unparseable_tiles_are_named_and_never_values() -> None:
@@ -350,7 +352,7 @@ def test_tile_meta_records_the_parsed_reply() -> None:
     (result,) = [TileResult(tile=_TILES[2], reply=parse_tile_reply(text))]
     entry = tile_meta(result)
     assert entry == {
-        "tile": "middle-left",
+        "tile": "band 3",
         "box": list(_TILES[2].box),
         "status": "found",
         "raw": text,
@@ -364,4 +366,75 @@ def test_tile_meta_records_the_parsed_reply() -> None:
         len(str(tile_meta(TileResult(tile=_TILES[0], reply=parse_tile_reply(long)))["raw"])) == 200
     )
     failed = tile_meta(TileResult(tile=_TILES[0], reply=None, error="timed out"))
-    assert failed == {"tile": "top-left", "box": list(_TILES[0].box), "error": "timed out"}
+    assert failed == {"tile": "band 1", "box": list(_TILES[0].box), "error": "timed out"}
+
+
+# ---------------------------------------------------------------------------
+# 重设计 §4 —— 横条值 / 退回整张读
+# ---------------------------------------------------------------------------
+
+_FULL = "The glucose value is 5.6 mmol/L."
+
+
+def test_the_band_prompt_has_the_redesign_clauses() -> None:
+    assert "full-width horizontal band" in TILE_INSTRUCTION
+    assert "the requested value or text (number, name, date, word...) exactly as printed" in (
+        TILE_INSTRUCTION
+    )
+    assert (
+        "If this part of the image alone is not enough to answer - e.g. the question needs "
+        "counting or comparing across the whole image, or an axis, legend or row/column header "
+        'that is not visible here - use "not_found".'
+    ) in TILE_INSTRUCTION
+
+
+def test_a_single_band_value_is_the_answer() -> None:
+    results = _results(_NF, _NF, _json("found", "5.6", unit="mmol/L"), _NF, _NF, _NF)
+    decision = decide_auto(results, full_answer=_FULL, full_error=None)
+    assert (decision.path, decision.reason, decision.bands) == ("bands", "single", "single")
+    assert decision.content.startswith("5.6 mmol/L\n")
+    assert _FULL not in decision.content
+
+
+def test_a_band_conflict_falls_back_to_the_whole_image_answer_with_band_details() -> None:
+    results = _results(_json("found", "5.6"), _NF, _json("found", "5.9"), _NF, _NF, _NF)
+    decision = decide_auto(results, full_answer=_FULL, full_error=None)
+    assert (decision.path, decision.reason, decision.bands) == (
+        "full_fallback",
+        "conflict",
+        "conflict",
+    )
+    assert decision.content.startswith(_FULL + "\n\n")
+    assert "whole-image reading; small print may be unreliable" in decision.content
+    assert "the bands disagree" in decision.content
+    assert f"- band 1 region={list(_TILES[0].box)}" in decision.content
+    assert f"- band 3 region={list(_TILES[2].box)}" in decision.content
+
+
+def test_no_band_value_falls_back_to_the_whole_image_answer() -> None:
+    decision = decide_auto(_results(*[_NF] * 6), full_answer=_FULL, full_error=None)
+    assert (decision.path, decision.reason) == ("full_fallback", "none")
+    assert decision.content.startswith(_FULL)
+    assert "no band read the value" in decision.content
+
+
+def test_a_partial_band_beats_a_single_found_value() -> None:
+    """规则 4c:有一条报「被边缘截断」,哪怕别的条给出唯一一个值,也不采用横条的值。"""
+    results = _results(_NF, _json("partial"), _json("found", "3"), _NF, _NF, _NF)
+    decision = decide_auto(results, full_answer="There are 5 bars.", full_error=None)
+    assert (decision.path, decision.reason) == ("full_fallback", "partial")
+    assert decision.content.startswith("There are 5 bars.")
+    assert "a band saw the value cut off at its edge" in decision.content
+
+
+def test_all_bands_failed_falls_back_to_the_whole_image_answer() -> None:
+    decision = decide_auto(_results(*[None] * 6), full_answer=_FULL, full_error=None)
+    assert (decision.path, decision.reason) == ("full_fallback", "bands_failed")
+
+
+def test_a_failed_whole_image_read_leaves_the_band_summary() -> None:
+    results = _results(_json("found", "5.6"), _NF, _json("found", "5.9"), _NF, _NF, _NF)
+    decision = decide_auto(results, full_answer=None, full_error="timed out")
+    assert (decision.path, decision.reason) == ("bands", "conflict+full_failed")
+    assert "the bands gave conflicting readings" in decision.content
+    assert "The whole-image read failed too: timed out" in decision.content

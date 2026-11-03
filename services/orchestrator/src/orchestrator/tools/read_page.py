@@ -244,6 +244,9 @@ _WORKSPACE_ROOT = EXEC_VIEW
 _CONVERT_TIMEOUT_S = 90
 #: pdftoppm 只渲一页,给一个小得多的超时。
 _RENDER_TIMEOUT_S = 30
+#: B-266 —— 渲局部时每一块 pdftoppm 的超时。``region="auto"`` 最多 8 条横条:重转一次 PDF(90 s)
+#: 加 8 x 20 s 仍在沙箱 300 s 的兜底之下(整页那条路是至多 3 页 x 30 s)。
+_REGION_RENDER_TIMEOUT_S = 20
 
 #: read_page 目前真正能渲染的格式 —— 单一真源在 ``document_figures.py``
 #: (回修第 1 轮关切 2:两处各写一份字面量是本仓已经吃过亏的病,见那边
@@ -1706,11 +1709,19 @@ class ReadPageTool:
         )
 
     async def render_regions(
-        self, *, path: str, figure_ref: str, boxes: Sequence[Box], ctx: ToolContext
+        self,
+        *,
+        path: str,
+        figure_ref: str,
+        boxes: Sequence[Box],
+        ctx: ToolContext,
+        dpi: int | None = None,
     ) -> RegionRender:
         """B-266 —— 文档 ``path`` 的一页(``figure_ref`` 是它的整页渲染)按 ``boxes`` 各渲一张局部。
 
-        分辨率按每个框的面积定(约 1.5 百万像素,上限 400 dpi),页面尺寸取整页渲染的像素;
+        分辨率按每个框的面积定(约 1.5 百万像素,上限 400 dpi);给了 ``dpi`` 就全部按它渲
+        (``region="auto"`` 的横条按 :data:`~orchestrator.tools.region_zoom.DOCUMENT_ZOOM_DPI`)。
+        页面尺寸取整页渲染的像素;
         一次沙箱执行渲完全部框,落本对话 ``.tool_results/<本 run>/crops/…``。``ask_image``
         的 ``region`` 也走这里(它在同一把 ``(run, path)`` 锁里调)。
         """
@@ -1737,7 +1748,7 @@ class ReadPageTool:
             f"{base}{WORKSPACE_OVERFLOW_DIR}/{ctx.run_id}/{RENDERED_CROP_DIR}/"
             f"{doc_sha}/{figure.render_sha}/{figure.unit_dir}"
         )
-        jobs = [_region_job(box, page=figure.page, page_px=size) for box in boxes]
+        jobs = [_region_job(box, page=figure.page, page_px=size, dpi=dpi) for box in boxes]
         env = await run_scoped_read(
             self.client,
             build=lambda w: build_region_wrapper(
@@ -1748,6 +1759,7 @@ class ReadPageTool:
                 out_rel=out_rel,
                 pdf_rels=(_figure_pdf_rel(figure), f"{out_rel}/_pdf"),
                 ws=w,
+                render_timeout_s=_REGION_RENDER_TIMEOUT_S,
             ),
             ws=AGENT_VIEW,
             ctx=ctx,
@@ -1804,9 +1816,12 @@ class ReadPageTool:
         return RegionRender(crops=tuple(crops), failed=tuple(failed))
 
 
-def _region_job(box: Box, *, page: int, page_px: tuple[int, int]) -> dict[str, Any]:
+def _region_job(
+    box: Box, *, page: int, page_px: tuple[int, int], dpi: int | None = None
+) -> dict[str, Any]:
     """一个框 → 片段里的一项:目标文件名、分辨率、按那个分辨率算的像素框。"""
-    dpi = region_dpi(page_px, box, base_dpi=RENDER_DPI)
+    if dpi is None:
+        dpi = region_dpi(page_px, box, base_dpi=RENDER_DPI)
     scale = dpi / RENDER_DPI
     left, top, right, bottom = pixel_box(box, (page_px[0] * scale, page_px[1] * scale))
     return {

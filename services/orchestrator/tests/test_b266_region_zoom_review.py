@@ -39,6 +39,7 @@ from orchestrator.tools.read_page import (
 )
 from orchestrator.tools.region_zoom import (
     REGION_TARGET_PIXELS,
+    auto_bands,
     crop_image,
     crop_upright,
     image_size,
@@ -52,7 +53,6 @@ from .test_b266_region_zoom import (
     _CONV,
     _KEY,
     _PDFTOPPM_PAGE_OR_REGION,
-    _TILES,
     _VL,
     _calls,
     _doc,
@@ -273,17 +273,37 @@ class _CountingVL(_VL):
             self.in_flight -= 1
 
 
+#: 600 万像素:4 条横条 + 1 次整张读 = 每次 5 个调用。
+_BIG = (3000, 2000)
+_FOUR = auto_bands(4)
+
+
 @pytest.mark.anyio
-async def test_parallel_auto_looks_keep_at_most_twelve_tile_calls_in_flight(
+async def test_the_whole_image_read_runs_in_parallel_with_the_bands(tmp_path: Path) -> None:
+    vl = _CountingVL(answer=lambda _ref: "NOT_FOUND")
+    up = _upload(tmp_path, vl, size=_BIG)
+
+    result = await up.tool.call(
+        {"image_ref": up.ref, "question": "?", "region": "auto"}, ctx=up.ctx
+    )
+
+    assert len(vl.calls) == 5
+    assert vl.peak == 5  # 整张读与 4 条横条同时在飞
+    assert result.meta["vl_calls"] == 5
+
+
+@pytest.mark.anyio
+async def test_parallel_auto_looks_keep_at_most_twelve_calls_in_flight(
     tmp_path: Path,
 ) -> None:
+    """每次 N+1 个调用(4 条横条 + 整张读),3 次并行共 15 个:同时在飞的不超过 12 个。"""
     vl = _CountingVL(answer=lambda _ref: "NOT_FOUND")
-    up = _upload(tmp_path, vl)
+    up = _upload(tmp_path, vl, size=_BIG)
     args = {"image_ref": up.ref, "question": "?", "region": "auto"}
 
     await asyncio.gather(*(up.tool.call(args, ctx=up.ctx) for _ in range(3)))
 
-    assert len(vl.calls) == 18
+    assert len(vl.calls) == 15
     assert vl.peak == vision.MAX_TILE_CALLS_IN_FLIGHT == 12
 
 
@@ -291,30 +311,33 @@ async def test_parallel_auto_looks_keep_at_most_twelve_tile_calls_in_flight(
 async def test_a_tile_that_cannot_get_a_slot_in_time_counts_as_timed_out(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """一个名额、前两块各占 0.2 s、上限 0.3 s:第 2 块等 0.2 s 拿到名额,第 3 块起等不到。"""
+    """一个名额、上限 0.3 s:整张读(先排)与第 1 条各占 0.2 s;第 1 条等 0.2 s 拿到名额,
+    第 2 条起要等 0.4 s,等不到。"""
     monkeypatch.setattr(vision, "MAX_TILE_CALLS_IN_FLIGHT", 1)
     monkeypatch.setattr(vision, "_TILE_SLOTS", weakref.WeakKeyDictionary())
-    slow = {region_crop_stem(_TILES[0].box), region_crop_stem(_TILES[1].box)}
+    first = region_crop_stem(_FOUR[0].box)
 
     @dataclass
     class _SlowFirstTwo(_VL):
         async def __call__(
             self, *, messages: Sequence[BaseMessage], tools: Sequence[Any]
         ) -> AIMessage:
-            if _image_ref_of(messages).rsplit("/", 1)[1][: -len(".jpg")] in slow:
+            ref = _image_ref_of(messages)
+            if "/crops/" not in ref or ref.endswith(f"/{first}.jpg"):
                 await asyncio.sleep(0.2)
             return await super().__call__(messages=messages, tools=tools)
 
     vl = _SlowFirstTwo(answer=lambda _ref: "7")
-    up = _upload(tmp_path, vl, timeout_s=0.3)
+    up = _upload(tmp_path, vl, size=_BIG, timeout_s=0.3)
 
     result = await up.tool.call(
         {"image_ref": up.ref, "question": "?", "region": "auto"}, ctx=up.ctx
     )
 
-    tiles = {t["tile"]: t for t in result.meta["tiles"]}
-    assert tiles["top-left"]["value"] == tiles["top-right"]["value"] == "7"
-    late = [tiles[label] for label in ("middle-left", "middle-right", "bottom-left")]
+    bands = {t["tile"]: t for t in result.meta["bands"]}
+    assert bands["band 1"]["value"] == "7"
+    assert result.meta["full"] == {"answer": "7"}
+    late = [bands[label] for label in ("band 2", "band 3", "band 4")]
     assert all(t["error"] == "timed out" for t in late)
     assert len(vl.calls) == 2
 
@@ -434,7 +457,7 @@ def test_figure_pdf_rel_without_an_agent_binding() -> None:
 
 @pytest.mark.anyio
 async def test_a_truncated_tile_is_reported_as_truncated(tmp_path: Path) -> None:
-    truncated = region_crop_stem(_TILES[3].box)
+    truncated = region_crop_stem(_FOUR[3].box)
 
     @dataclass
     class _TruncatesOne(_VL):
@@ -446,13 +469,13 @@ async def test_a_truncated_tile_is_reported_as_truncated(tmp_path: Path) -> None
                 return AIMessage(content="", response_metadata={"finish_reason": "length"})
             return AIMessage(content="9")
 
-    up = _upload(tmp_path, _TruncatesOne())
+    up = _upload(tmp_path, _TruncatesOne(), size=_BIG)
     result = await up.tool.call(
         {"image_ref": up.ref, "question": "?", "region": "auto"}, ctx=up.ctx
     )
-    tiles = {t["tile"]: t for t in result.meta["tiles"]}
-    assert tiles["middle-right"]["error"] == "truncated"
-    assert "middle-right (truncated)" in result.content
+    bands = {t["tile"]: t for t in result.meta["bands"]}
+    assert bands["band 4"]["error"] == "truncated"
+    assert "band 4 (truncated)" in result.content
     assert result.meta["aggregate"] == "single"
 
 

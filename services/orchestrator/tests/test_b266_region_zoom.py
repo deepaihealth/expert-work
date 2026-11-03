@@ -12,6 +12,7 @@ import hashlib
 import io
 import itertools
 import json
+import math
 import os
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
@@ -40,8 +41,8 @@ from orchestrator.tools.nas_workspace_store import NasWorkspaceStore
 from orchestrator.tools.read_page import (
     _CONVERT_TIMEOUT_S,
     _REGION_MAIN,
+    _REGION_RENDER_TIMEOUT_S,
     _RENDER_MAIN,
-    _RENDER_TIMEOUT_S,
     ReadPageTool,
     RegionRenderError,
     RegionStaleError,
@@ -49,13 +50,15 @@ from orchestrator.tools.read_page import (
     workspace_figure_ref,
 )
 from orchestrator.tools.region_zoom import (
+    AUTO_MAX_BANDS,
+    AUTO_MIN_BANDS,
     AUTO_REGION,
     MAX_REGION_DPI,
     MIN_REGION_AREA,
     REGION_HINT,
     REGION_TARGET_PIXELS,
-    Tile,
-    auto_tiles,
+    auto_bands,
+    band_count,
     crop_image,
     parse_box,
     parse_region,
@@ -123,41 +126,55 @@ def test_auto_is_a_region_but_not_a_box() -> None:
         parse_box("auto", tool="read_page")
 
 
-def test_auto_cuts_two_columns_by_three_rows_in_reading_order() -> None:
-    tiles = auto_tiles()
-    assert [t.label for t in tiles] == [
-        "top-left",
-        "top-right",
-        "middle-left",
-        "middle-right",
-        "bottom-left",
-        "bottom-right",
-    ]
-    for tile in tiles:
-        x1, y1, x2, y2 = tile.box
-        assert parse_box(list(tile.box), tool="t") == tile.box
+@pytest.mark.parametrize(
+    ("pixels", "count"),
+    [
+        (0, 3),
+        (3_999_999, 3),
+        (4_500_000, 3),
+        (4_500_001, 4),
+        (8_700_000, 6),
+        (12_000_000, 8),
+        (60_000_000, 8),
+    ],
+)
+def test_band_count_is_pixels_over_one_and_a_half_megapixels_clamped(
+    pixels: int, count: int
+) -> None:
+    assert band_count(pixels) == count
+
+
+@pytest.mark.parametrize("count", range(AUTO_MIN_BANDS, AUTO_MAX_BANDS + 1))
+def test_bands_are_full_width_cover_the_height_and_overlap_twelve_percent(count: int) -> None:
+    bands = auto_bands(count)
+    assert [b.label for b in bands] == [f"band {i}" for i in range(1, count + 1)]
+    for band in bands:
+        x1, y1, x2, y2 = band.box
+        assert (x1, x2) == (0, 1000)
+        assert parse_box(list(band.box), tool="t") == band.box
         assert (x2 - x1) * (y2 - y1) >= MIN_REGION_AREA
+    assert bands[0].box[1] == 0
+    assert bands[-1].box[3] == 1000
+    for upper, lower in itertools.pairwise(bands):
+        overlap = upper.box[3] - lower.box[1]
+        for band in (upper, lower):
+            assert overlap >= 0.12 * (band.box[3] - band.box[1]), (count, overlap)
 
 
-def _spans(tiles: Sequence[Tile], axis: int) -> list[tuple[int, int]]:
-    return sorted({(t.box[axis], t.box[axis + 2]) for t in tiles})
-
-
-@pytest.mark.parametrize("axis", [0, 1], ids=["columns", "rows"])
-def test_auto_tiles_cover_the_whole_image_with_at_least_15_percent_overlap(axis: int) -> None:
-    spans = _spans(auto_tiles(), axis)
-    assert spans[0][0] == 0
-    assert spans[-1][1] == 1000
-    for (a1, a2), (b1, b2) in itertools.pairwise(spans):
-        overlap = a2 - b1
-        assert overlap >= 0.15 * (a2 - a1), (spans, overlap)
-        assert overlap >= 0.15 * (b2 - b1), (spans, overlap)
+@pytest.mark.parametrize("count", range(AUTO_MIN_BANDS, AUTO_MAX_BANDS + 1))
+def test_a_text_row_no_taller_than_the_overlap_is_never_split(count: int) -> None:
+    """一行字(高度不超过重叠)放在任何位置,总有一条横条把它整个装下。"""
+    bands = auto_bands(count)
+    row = math.floor(min(b.box[3] - b.box[1] for b in bands) * 0.12)
+    for top in range(0, 1000 - row + 1):
+        assert any(b.box[1] <= top and top + row <= b.box[3] for b in bands), (count, top)
 
 
 def test_region_dpi_targets_one_and_a_half_megapixels() -> None:
     whole = region_dpi(_A4_AT_100DPI, (0, 0, 1000, 1000), base_dpi=100)
-    tile = region_dpi(_A4_AT_100DPI, auto_tiles()[0].box, base_dpi=100)
-    for dpi, box in ((whole, (0, 0, 1000, 1000)), (tile, auto_tiles()[0].box)):
+    corner = (0, 0, 541, 371)
+    tile = region_dpi(_A4_AT_100DPI, corner, base_dpi=100)
+    for dpi, box in ((whole, (0, 0, 1000, 1000)), (tile, corner)):
         scale = dpi / 100
         left, top, right, bottom = pixel_box(
             box, (_A4_AT_100DPI[0] * scale, _A4_AT_100DPI[1] * scale)
@@ -178,7 +195,7 @@ def test_pixel_box_rounds_outwards_and_clamps_to_the_image() -> None:
     assert (left, right) == (333, 335)
 
 
-_TILES = auto_tiles()
+_TILES = auto_bands(6)
 #: 一块按提示词回的 JSON(B-266 review M3)。
 NOT_FOUND = '{"status": "not_found", "label": "", "value": "", "unit": ""}'
 
@@ -398,6 +415,7 @@ def _doc(
     unit: int = 1,
     page: int = 1,
     with_pdf: bool = True,
+    page_px: tuple[int, int] = _A4_AT_100DPI,
 ) -> _Doc:
     tenant, user = uuid4(), uuid4()
     root = tmp_path / "nas"
@@ -421,7 +439,7 @@ def _doc(
     render_dir = f".tool_results/{ctx.run_id}/figures/{doc_sha}/{render_sha}"
     page_file = work / render_dir / f"_u{unit}" / f"page-{page}.jpg"
     page_file.parent.mkdir(parents=True)
-    Image.new("RGB", _A4_AT_100DPI, "white").save(page_file, "JPEG")
+    Image.new("RGB", page_px, "white").save(page_file, "JPEG")
     os.utime(page_file, (2_000, 2_000))
     if with_pdf and not name.endswith(".pdf"):
         (work / render_dir / "_pdf").mkdir()
@@ -603,17 +621,25 @@ async def test_a_failed_region_render_leaves_no_half_written_crop(
     assert list(crops.rglob("*.jpg")) == []
 
 
+def _is_band(ref: str) -> bool:
+    return "/crops/" in ref
+
+
 @pytest.mark.anyio
-async def test_auto_on_a_document_page_renders_six_tiles_in_one_exec_and_aggregates(
+async def test_auto_on_a_document_page_reads_bands_and_the_whole_page_in_parallel(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    """A4 页按 300 dpi 约 870 万像素:6 条横条一次沙箱渲完(300 dpi),同时整页快看一次;
+    横条给出唯一的值 → 用横条的值。7 次调用全部记账。"""
     _install_office_stubs(tmp_path, monkeypatch, pdftoppm_body=_PDFTOPPM_PAGE_OR_REGION)
     doc = _doc(tmp_path)
-    middle_left = region_crop_stem(_TILES[2].box)
+    third = region_crop_stem(_TILES[2].box)
     vl = _VL(
         answer=lambda ref: (
-            _found("5.6", unit="mmol/L", label="GLU")
-            if ref.endswith(f"-{middle_left}.jpg")
+            "The glucose looks like 5.8."
+            if not _is_band(ref)
+            else _found("5.6", unit="mmol/L", label="GLU")
+            if ref.endswith(f"-{third}.jpg")
             else NOT_FOUND
         ),
         usage={"input_tokens": 1400, "output_tokens": 5, "total_tokens": 1405},
@@ -624,38 +650,67 @@ async def test_auto_on_a_document_page_renders_six_tiles_in_one_exec_and_aggrega
         metered.append(response)
 
     tool, _read_page, runtime = _tools(doc, vl, usage_meter=meter)
-    before = ask_image_region_auto_total.labels(outcome="single")._value.get()
+    before = ask_image_region_auto_total.labels(path="bands", reason="single")._value.get()
 
     result = await tool.call(
         {"path": doc.path, "unit": 1, "question": "glucose?", "region": "auto", "depth": "deep"},
         ctx=doc.ctx,
     )
 
-    assert len(runtime.execs) == 1  # 六块一次沙箱执行渲完
-    assert len(vl.calls) == 6
-    assert len(metered) == 6  # 每次调用都记账
-    for call in vl.calls:
+    assert len(runtime.execs) == 1  # 六条一次沙箱执行渲完
+    assert len(vl.calls) == 7
+    assert len(metered) == 7  # 每次调用都记账
+    full = [call for call in vl.calls if not _is_band(_image_ref_of(call))]
+    bands = [call for call in vl.calls if _is_band(_image_ref_of(call))]
+    assert [_image_ref_of(call) for call in full] == [doc.page_ref]
+    assert _question_of(full[0]) == "glucose?"  # 整张读用原问题,不加 JSON 要求
+    for call in bands:
         assert _question_of(call) == f"glucose?\n\n{TILE_INSTRUCTION}"
     assert result.content.startswith("5.6 mmol/L\n")
-    assert "middle-left" in result.content
-    assert result.meta["region"] == "auto"
-    assert result.meta["aggregate"] == "single"
-    assert result.meta["depth"] == "quick"
-    assert result.meta["depth_ignored"] == "deep"
-    assert result.meta["vl_calls"] == 6
-    assert result.meta["vl_usage"] == {
-        "input_tokens": 8400,
-        "output_tokens": 30,
-        "total_tokens": 8430,
-    }
-    tiles = {t["tile"]: t for t in result.meta["tiles"]}
-    assert tiles["middle-left"]["status"] == "found"
-    assert (tiles["middle-left"]["value"], tiles["middle-left"]["unit"]) == ("5.6", "mmol/L")
-    assert tiles["middle-left"]["label"] == "GLU"
-    assert tiles["middle-left"]["parse_mode"] == "json"
-    assert tiles["top-left"]["status"] == "not_found"
-    assert all(t["dpi"] and t["pixels"] for t in tiles.values())
-    assert ask_image_region_auto_total.labels(outcome="single")._value.get() == before + 1
+    assert "band 3" in result.content
+    assert "5.8" not in result.content
+    meta = result.meta
+    assert (meta["region"], meta["auto"], meta["auto_reason"]) == ("auto", "bands", "single")
+    assert meta["auto_pixels"] == _A4_AT_100DPI[0] * _A4_AT_100DPI[1] * 9
+    assert (meta["aggregate"], meta["depth"], meta["depth_ignored"]) == ("single", "quick", "deep")
+    assert meta["vl_calls"] == 7
+    assert meta["vl_usage"] == {"input_tokens": 9800, "output_tokens": 35, "total_tokens": 9835}
+    assert meta["full"] == {"answer": "The glucose looks like 5.8."}
+    by_band = {t["tile"]: t for t in meta["bands"]}
+    assert list(by_band) == [f"band {i}" for i in range(1, 7)]
+    assert by_band["band 3"]["status"] == "found"
+    assert (by_band["band 3"]["value"], by_band["band 3"]["unit"]) == ("5.6", "mmol/L")
+    assert by_band["band 1"]["status"] == "not_found"
+    assert all(
+        t["dpi"] == 300 and t["box"][0] == 0 and t["box"][2] == 1000 for t in by_band.values()
+    )
+    args = _crop_path(doc, _image_ref_of(bands[0])).read_text().split()
+    assert args[args.index("-r") + 1] == "300"
+    assert ask_image_region_auto_total.labels(path="bands", reason="single")._value.get() == (
+        before + 1
+    )
+
+
+@pytest.mark.anyio
+async def test_auto_on_a_small_document_page_is_gated(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """一页小卡片:100 dpi 渲出 400 x 500,按 300 dpi 是 180 万像素 —— 不切,整页快看一次。"""
+    _install_office_stubs(tmp_path, monkeypatch, pdftoppm_body=_PDFTOPPM_PAGE_OR_REGION)
+    doc = _doc(tmp_path, page_px=(400, 500))
+    vl = _VL(answer=lambda _ref: "A small card.")
+    tool, _read_page, runtime = _tools(doc, vl)
+
+    result = await tool.call(
+        {"path": doc.path, "unit": 1, "question": "what?", "region": "auto"}, ctx=doc.ctx
+    )
+
+    assert runtime.execs == []
+    assert [_image_ref_of(call) for call in vl.calls] == [doc.page_ref]
+    assert _question_of(vl.calls[0]) == "what?"
+    assert result.content.startswith("A small card.\n\n(region='auto': the image is small enough")
+    assert (result.meta["auto"], result.meta["auto_reason"]) == ("gated", "small_image")
+    assert result.meta["auto_pixels"] == 400 * 500 * 9
 
 
 # ---------------------------------------------------------------------------
@@ -735,66 +790,142 @@ async def test_an_upload_crop_is_reused_on_the_same_box(tmp_path: Path) -> None:
     assert again.meta["crop"] == {"dpi": None, "pixels": [600, 600], "reused": True}
 
 
+_BIG = (3000, 2000)  # 600 万像素 -> 4 条横条
+_FOUR = auto_bands(4)
+
+
 @pytest.mark.anyio
-async def test_auto_on_an_upload_with_failing_tiles_names_them(tmp_path: Path) -> None:
-    top_right = region_crop_stem(_TILES[1].box)
-    bottom = region_crop_stem(_TILES[5].box)
-
-    def answer(ref: str) -> str:
-        if ref.endswith(f"/{bottom}.jpg"):
-            raise RuntimeError("vendor 500")
-        return _found("7") if ref.endswith(f"/{top_right}.jpg") else NOT_FOUND
-
-    vl = _VL(answer=answer)
-    up = _upload(tmp_path, vl)
+@pytest.mark.parametrize(
+    ("size", "gated"),
+    [((1999, 2000), True), ((2000, 2000), False)],
+    ids=["just-under-4MP", "exactly-4MP"],
+)
+async def test_the_auto_gate_is_four_megapixels(
+    tmp_path: Path, size: tuple[int, int], gated: bool
+) -> None:
+    vl = _VL(answer=lambda ref: NOT_FOUND if _is_band(ref) else "whole")
+    up = _upload(tmp_path, vl, size=size)
 
     result = await up.tool.call(
         {"image_ref": up.ref, "question": "?", "region": "auto"}, ctx=up.ctx
     )
 
-    assert len(vl.calls) == 6
-    assert result.content.startswith("7\n")
-    assert "bottom-right (RuntimeError)" in result.content
-    tiles = {t["tile"]: t for t in result.meta["tiles"]}
-    assert tiles["bottom-right"]["error"] == "RuntimeError"
-    assert tiles["top-right"]["dpi"] is None
+    assert (result.meta["auto"] == "gated") is gated
+    assert len(vl.calls) == (1 if gated else 4)  # 3 条横条 + 整张
+    assert result.meta["auto_pixels"] == size[0] * size[1]
 
 
 @pytest.mark.anyio
-async def test_auto_with_every_tile_failing_is_an_error_like_a_whole_look(
+async def test_auto_on_an_upload_with_failing_bands_names_them(tmp_path: Path) -> None:
+    second = region_crop_stem(_FOUR[1].box)
+    last = region_crop_stem(_FOUR[3].box)
+
+    def answer(ref: str) -> str:
+        if not _is_band(ref):
+            return "whole: 7"
+        if ref.endswith(f"/{last}.jpg"):
+            raise RuntimeError("vendor 500")
+        return _found("7") if ref.endswith(f"/{second}.jpg") else NOT_FOUND
+
+    vl = _VL(answer=answer)
+    up = _upload(tmp_path, vl, size=_BIG)
+
+    result = await up.tool.call(
+        {"image_ref": up.ref, "question": "?", "region": "auto"}, ctx=up.ctx
+    )
+
+    assert len(vl.calls) == 5
+    assert result.content.startswith("7\n")
+    assert "band 4 (RuntimeError)" in result.content
+    by_band = {t["tile"]: t for t in result.meta["bands"]}
+    assert by_band["band 4"]["error"] == "RuntimeError"
+    assert by_band["band 2"]["dpi"] is None
+    assert result.meta["auto"] == "bands"
+
+
+@pytest.mark.anyio
+async def test_a_band_conflict_returns_the_whole_image_answer_marked_uncertain(
+    tmp_path: Path,
+) -> None:
+    first, third = region_crop_stem(_FOUR[0].box), region_crop_stem(_FOUR[2].box)
+
+    def answer(ref: str) -> str:
+        if not _is_band(ref):
+            return "The total is 42."
+        if ref.endswith(f"/{first}.jpg"):
+            return _found("40", label="Total")
+        return _found("42", label="Total") if ref.endswith(f"/{third}.jpg") else NOT_FOUND
+
+    up = _upload(tmp_path, _VL(answer=answer), size=_BIG)
+    result = await up.tool.call(
+        {"image_ref": up.ref, "question": "total?", "region": "auto"}, ctx=up.ctx
+    )
+
+    assert result.content.startswith("The total is 42.\n\n")
+    assert "whole-image reading; small print may be unreliable" in result.content
+    assert f"- band 1 region={list(_FOUR[0].box)}" in result.content
+    assert f"- band 3 region={list(_FOUR[2].box)}" in result.content
+    assert (result.meta["auto"], result.meta["auto_reason"]) == ("full_fallback", "conflict")
+
+
+@pytest.mark.anyio
+async def test_a_partial_band_falls_back_to_the_whole_image_count(tmp_path: Path) -> None:
+    """规则 4c(验证里那一次漏判):一条只数到自己那一截、另一条报被截断 —— 用整张读的答案。"""
+    first, second = region_crop_stem(_FOUR[0].box), region_crop_stem(_FOUR[1].box)
+
+    def answer(ref: str) -> str:
+        if not _is_band(ref):
+            return "There are 9 people."
+        if ref.endswith(f"/{first}.jpg"):
+            return _found("4")
+        partial = json.dumps({"status": "partial", "label": "", "value": "", "unit": ""})
+        return partial if ref.endswith(f"/{second}.jpg") else NOT_FOUND
+
+    up = _upload(tmp_path, _VL(answer=answer), size=_BIG)
+    result = await up.tool.call(
+        {"image_ref": up.ref, "question": "how many people?", "region": "auto"}, ctx=up.ctx
+    )
+
+    assert result.content.startswith("There are 9 people.")
+    assert (result.meta["auto"], result.meta["auto_reason"]) == ("full_fallback", "partial")
+
+
+@pytest.mark.anyio
+async def test_auto_with_every_call_failing_is_an_error_like_a_whole_look(
     tmp_path: Path,
 ) -> None:
     def answer(_ref: str) -> str:
         raise RuntimeError("vendor 500")
 
-    up = _upload(tmp_path, _VL(answer=answer))
+    up = _upload(tmp_path, _VL(answer=answer), size=_BIG)
     with pytest.raises(RuntimeError, match="vendor 500"):
         await up.tool.call({"image_ref": up.ref, "question": "?", "region": "auto"}, ctx=up.ctx)
 
 
 @pytest.mark.anyio
-async def test_auto_tiles_that_time_out_are_reported_as_timed_out(tmp_path: Path) -> None:
-    top_left = region_crop_stem(_TILES[0].box)
+async def test_auto_bands_that_time_out_are_reported_as_timed_out(tmp_path: Path) -> None:
+    first = region_crop_stem(_FOUR[0].box)
 
     @dataclass
     class _SlowOnOne(_VL):
         async def __call__(
             self, *, messages: Sequence[BaseMessage], tools: Sequence[Any]
         ) -> AIMessage:
-            if _image_ref_of(messages).endswith(f"/{top_left}.jpg"):
+            if _image_ref_of(messages).endswith(f"/{first}.jpg"):
                 await asyncio.sleep(5)
             return await super().__call__(messages=messages, tools=tools)
 
-    vl = _SlowOnOne(answer=lambda _ref: NOT_FOUND)
-    up = _upload(tmp_path, vl, timeout_s=0.2)
+    vl = _SlowOnOne(answer=lambda ref: NOT_FOUND if _is_band(ref) else "Nothing like that.")
+    up = _upload(tmp_path, vl, size=_BIG, timeout_s=0.2)
 
     result = await up.tool.call(
         {"image_ref": up.ref, "question": "?", "region": "auto"}, ctx=up.ctx
     )
 
-    assert result.meta["aggregate"] == "none"
-    assert "top-left (timed out)" in result.content
-    assert "no tile could see the complete answer (5 replied not_found)" in result.content
+    assert (result.meta["aggregate"], result.meta["auto"]) == ("none", "full_fallback")
+    assert result.content.startswith("Nothing like that.")
+    assert "band 1 (timed out)" in result.content
+    assert "no band could see the complete answer (3 replied not_found)" in result.content
 
 
 @pytest.mark.anyio
@@ -850,7 +981,9 @@ async def test_region_is_not_accepted_without_a_workspace() -> None:
 
 @pytest.mark.anyio
 @pytest.mark.parametrize(
-    ("size", "hinted"), [((2000, 1000), True), ((1999, 1000), False)], ids=["2MP", "under-2MP"]
+    ("size", "hinted"),
+    [((2000, 2000), True), ((1999, 2000), False)],
+    ids=["4MP", "under-4MP"],
 )
 async def test_a_whole_image_quick_look_on_a_large_upload_suggests_auto(
     tmp_path: Path, size: tuple[int, int], hinted: bool
@@ -908,10 +1041,27 @@ def test_ask_image_offers_region_with_the_order_of_use() -> None:
     assert region["anyOf"][0]["enum"] == ["auto"]
     assert region["anyOf"][1]["minItems"] == region["anyOf"][1]["maxItems"] == 4
     description = spec.description
-    assert description.index("first a quick look") < description.index("region='auto'")
+    assert "Looking at the whole image is the default." in description
+    assert (
+        "Use region='auto' only to read one specific small printed value, name or date in "
+        "a large, dense page or photo"
+    ) in description
+    assert (
+        "never use it for counting, comparisons, trends, 'which is highest' or any question "
+        "about the whole picture"
+    ) in description
+    assert "re-ask with an explicit region or tell the user the value is uncertain" in description
     assert description.index("region='auto'") < description.index("depth='deep' only when")
     assert "0-1000" in description
-    assert "reports whether it can see the value instead of guessing" in description
+    for word in ("lab", "report", "glucose", "patient", "health", "medical"):
+        assert word not in description.lower()
+    assert "not for counting, comparisons" in region["description"]
+
+
+def test_the_hint_matches_the_description() -> None:
+    assert "one specific small printed value, name or date" in REGION_HINT
+    assert "region='auto'" in REGION_HINT
+    assert "do not use it for counting, comparisons" in REGION_HINT
 
 
 @pytest.mark.parametrize(
@@ -938,8 +1088,8 @@ def test_both_snippets_share_one_render_hash() -> None:
 
 
 def test_the_region_render_budget_fits_under_the_exec_timeout_cap() -> None:
-    """最坏情形:重转一次 PDF + 六块逐块渲满各自的超时,仍在沙箱 300 s 的兜底之下。"""
-    assert _CONVERT_TIMEOUT_S + len(auto_tiles()) * _RENDER_TIMEOUT_S < 300
+    """最坏情形:重转一次 PDF + 8 条横条逐条渲满各自的超时,仍在沙箱 300 s 的兜底之下。"""
+    assert _CONVERT_TIMEOUT_S + AUTO_MAX_BANDS * _REGION_RENDER_TIMEOUT_S < 300
 
 
 # ---------------------------------------------------------------------------

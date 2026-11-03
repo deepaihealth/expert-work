@@ -1,5 +1,5 @@
 """B-266 —— 看图「放大局部」:``region`` 参数的校验、切块几何、分辨率,以及图片的宿主侧裁剪。
-每块回答的解析与汇总在 :mod:`orchestrator.tools.tile_reading`。
+每条横条回答的解析与汇总在 :mod:`orchestrator.tools.tile_reading`。
 
 为什么要裁:看图模型不论图多大都压到约 1,400 输入 token,整页里 7-10 像素的小字读对率只有一成;
 裁成一块再看,同样的预算看更小的面积(实测与数据见
@@ -29,11 +29,20 @@ from PIL.JpegImagePlugin import JpegImageFile
 REGION_SCALE: Final = 1000
 #: 框的最小面积:整图的 1%(``(x2-x1)*(y2-y1) >= 10000``)。更小的框几乎只会是定位错。
 MIN_REGION_AREA: Final = REGION_SCALE * REGION_SCALE // 100
-#: ``region="auto"``:切 2 列 x 3 行;相邻块重叠 15%(实测 8% 时有目标贴边没认出)。
 AUTO_REGION: Final = "auto"
-AUTO_COLUMNS: Final = 2
-AUTO_ROWS: Final = 3
-AUTO_OVERLAP: Final = 0.15
+#: ``region="auto"`` 的门槛(B-266 重设计,11-03 验证):图(文档页按 :data:`DOCUMENT_ZOOM_DPI`
+#: 算)不到 400 万像素就不切,整张快看一次。实测 300 万时图表会被切开、多出一个错答案。
+AUTO_GATE_PIXELS: Final = 4_000_000
+#: 切成整宽的横条:条数 = ceil(像素 / 150 万),夹在 3..8 之间;相邻两条重叠条高的 12%。
+#: 整宽是为了让一行字、一张表的一行永远不被竖着切开(原来的 2x3 把图表、宽表切坏了)。
+AUTO_BAND_PIXELS: Final = 1_500_000
+AUTO_MIN_BANDS: Final = 3
+AUTO_MAX_BANDS: Final = 8
+AUTO_BAND_OVERLAP: Final = 0.12
+#: 文档页「放大来看」用的分辨率:门槛按这一档的页面像素算,横条也按这一档渲。300 dpi 的 A4 是
+#: 2480 x 3508(约 870 万像素)—— 验证用的合成化验单就是这个尺寸。文档页没有「原像素」(矢量),
+#: 已有的整页渲染只有 100 dpi(A4 约 97 万像素),拿它比门槛会把每一页都当成小图。
+DOCUMENT_ZOOM_DPI: Final = 300
 #: 文档页的局部按这个像素数选分辨率(约 1.5 百万像素),上限 400 dpi。
 REGION_TARGET_PIXELS: Final = 1_500_000
 MAX_REGION_DPI: Final = 400
@@ -41,22 +50,20 @@ MAX_REGION_DPI: Final = 400
 #: B-263)同一个值;编排层不能 import control-plane,这里另记一份,
 #: ``services/control-plane/tests/test_region_zoom_decode_cap.py`` 钉两边相等。
 MAX_DECODE_PIXELS: Final = 60_000_000
-#: 整页快看一张不小于这么多像素的图时,结果末尾提示可以 ``region="auto"`` 再看(spec §4)。
-LARGE_IMAGE_PIXELS: Final = 2_000_000
+#: 整页快看之后,只有 ``region="auto"`` 不会被门槛挡回来的图才提示它(与门槛同一个数)。
+LARGE_IMAGE_PIXELS: Final = AUTO_GATE_PIXELS
 #: 裁图存成 JPEG 的质量 —— 与 B-263 上传转码同一档。
 CROP_JPEG_QUALITY: Final = 92
 
 #: 整页快看一张文档页或大图之后追加的提示。
 REGION_HINT: Final = (
-    "(To read small text or exact numbers precisely, call ask_image again on the same image "
-    "with region='auto'.)"
+    "(To read one specific small printed value, name or date in this large image precisely, "
+    "you can call ask_image again with region='auto'; do not use it for counting, comparisons, "
+    "trends or questions about the whole image.)"
 )
 
 Box = tuple[int, int, int, int]
 Region = Box | Literal["auto"]
-
-_ROW_NAMES: Final = ("top", "middle", "bottom")
-_COLUMN_NAMES: Final = ("left", "right")
 
 
 class RegionImageError(ValueError):
@@ -102,28 +109,31 @@ def parse_box(raw: object, *, tool: str, expected: str = _BOX_SHAPE) -> Box | No
 
 @dataclass(frozen=True)
 class Tile:
-    """``region="auto"`` 的一块:位置名(给模型看)+ 框。"""
+    """``region="auto"`` 的一条:名字(给模型看,``band 1`` 在最上面)+ 框。"""
 
     label: str
     box: Box
 
 
-def _spans(count: int) -> list[tuple[int, int]]:
-    """一条边切 ``count`` 段,相邻段重叠不少于 :data:`AUTO_OVERLAP`(起点向下取整、终点向上取整)。"""
-    size = REGION_SCALE / (count - (count - 1) * AUTO_OVERLAP)
-    step = size * (1 - AUTO_OVERLAP)
-    return [
-        (math.floor(i * step), min(REGION_SCALE, math.ceil(i * step + size))) for i in range(count)
-    ]
+def band_count(pixels: int) -> int:
+    """切几条:``ceil(像素 / 150 万)``,夹在 :data:`AUTO_MIN_BANDS`..:data:`AUTO_MAX_BANDS`。"""
+    wanted = math.ceil(pixels / AUTO_BAND_PIXELS) if pixels > 0 else AUTO_MIN_BANDS
+    return max(AUTO_MIN_BANDS, min(AUTO_MAX_BANDS, wanted))
 
 
-def auto_tiles() -> tuple[Tile, ...]:
-    """2 列 x 3 行,按行从上到下、行内从左到右。"""
-    tiles: list[Tile] = []
-    for row, (y1, y2) in zip(_ROW_NAMES, _spans(AUTO_ROWS), strict=True):
-        for col, (x1, x2) in zip(_COLUMN_NAMES, _spans(AUTO_COLUMNS), strict=True):
-            tiles.append(Tile(label=f"{row}-{col}", box=(x1, y1, x2, y2)))
-    return tuple(tiles)
+def auto_bands(count: int) -> tuple[Tile, ...]:
+    """``count`` 条整宽横条,从上到下,相邻两条重叠不少于条高的 :data:`AUTO_BAND_OVERLAP`
+    (起点向下取整、终点向上取整),合起来盖满整个高度。"""
+    height = REGION_SCALE / (count - (count - 1) * AUTO_BAND_OVERLAP)
+    step = height * (1 - AUTO_BAND_OVERLAP)
+    bands: list[Tile] = []
+    for index in range(count):
+        top = math.floor(index * step)
+        bottom = min(REGION_SCALE, math.ceil(index * step + height))
+        if index == count - 1:
+            bottom = REGION_SCALE
+        bands.append(Tile(label=f"band {index + 1}", box=(0, top, REGION_SCALE, bottom)))
+    return tuple(bands)
 
 
 def region_dpi(page_px: tuple[int, int], box: Box, *, base_dpi: int) -> int:

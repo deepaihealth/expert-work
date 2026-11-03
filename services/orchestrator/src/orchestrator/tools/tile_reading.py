@@ -1,10 +1,11 @@
-"""B-266 ``region="auto"`` —— 每块回答的解析、读数归一与保守汇总。
+"""B-266 ``region="auto"`` —— 每条横条回答的解析、读数归一、保守汇总与最终答案的取舍。
 
-每块按提示词回一小段 JSON(``{"status", "label", "value", "unit"}``,所有厂商都只靠提示词,
-不用各家的结构化输出:GLM-V 没有 ``response_format``,Qwen-VL 带图时会降级它)。实测(豆包,
-2x3 块,24 题 x 2 次):94% 读对,236 块不含目标的没有一块报「找到」,288 次回答全是合法 JSON。
+每条横条按提示词回一小段 JSON(``{"status", "label", "value", "unit"}``,所有厂商都只靠提示词,
+不用各家的结构化输出:GLM-V 没有 ``response_format``,Qwen-VL 带图时会降级它)。JSON 回答的实测
+(豆包,原 2x3 块,24 题 x 2 次):94% 读对,236 块不含目标的没有一块报「找到」,288 次全是合法 JSON。
+重设计(门槛 + 整宽横条 + 并行整张读,见 :func:`decide_auto`)的验证:具体问题 98%、整张图的问题 11/12。
 
-**解析阶梯**(每块一样):去 ``<think>…</think>`` 与代码围栏 → ``json.loads`` → 第一个配平的
+**解析阶梯**(每条一样):去 ``<think>…</think>`` 与代码围栏 → ``json.loads`` → 第一个配平的
 ``{…}`` → 字段校验与交叉核对 → 都不是 JSON 才走散文兜底(见 :func:`parse_tile_reply`)。
 
 **汇总宁可报冲突,不可错合并**:读数先归一成带类型的 :class:`Reading`(比较符、数、范围、
@@ -30,17 +31,20 @@ Status = Literal["found", "not_found", "partial", "unparseable"]
 ParseMode = Literal["json", "prose", "none"]
 AutoOutcome = Literal["single", "conflict", "none"]
 
-#: 每块的提示词在用户原问题后面追加这一段;问题本身原样不动。
+#: 每条横条的提示词在用户原问题后面追加这一段;问题本身原样不动。
 TILE_INSTRUCTION: Final = (
-    "This image is one tile cut from a larger image, so the answer may not be in it. "
-    "Reply only with JSON, nothing else: "
+    "This image is one full-width horizontal band cut from a larger image, so the answer may "
+    "not be in it. Reply only with JSON, nothing else: "
     '{"status": "found|not_found|partial", '
     '"label": "<the row or field name printed next to the value, or empty>", '
-    '"value": "<the value exactly as printed, keeping marks such as < > \u2191 \u2193 \u00b1 (-); '
-    'empty unless found>", '
+    '"value": "<the requested value or text (number, name, date, word...) exactly as printed, '
+    'keeping marks such as < > \u2191 \u2193 \u00b1 (-); empty unless found>", '
     '"unit": "<the unit as printed, or empty>"}. '
-    'Use "not_found" if the requested item or its value is not visible in this tile. '
-    'Use "partial" if the value is cut off by the edge of the tile. Do not guess.'
+    'Use "not_found" if the requested item or its value is not visible in this band. '
+    "If this part of the image alone is not enough to answer - e.g. the question needs "
+    "counting or comparing across the whole image, or an axis, legend or row/column header "
+    'that is not visible here - use "not_found". '
+    'Use "partial" if the value is cut off by the edge of the band. Do not guess.'
 )
 
 #: 交给主模型 / 记进 meta 的原文最多保留多少字符。
@@ -387,7 +391,7 @@ def compatible(a: Reading, b: Reading) -> tuple[bool, str]:
         if {a.kind, b.kind} == {"number", "comparator"}:
             return False, (
                 "one reading has a comparator (< or >) and the other does not; "
-                "a tile edge may have cut it off"
+                "a band edge may have cut it off"
             )
         return False, ""
     if {"up", "down"} <= a.flags | b.flags:
@@ -496,7 +500,7 @@ def aggregate_tiles(results: Sequence[TileResult]) -> AutoVerdict:
     if not groups:
         outcome: AutoOutcome = "none"
         content = (
-            "region='auto': no tile could see the complete answer"
+            "no band could see the complete answer"
             f" ({len(not_found)} replied not_found). The text may be too small to read, or it is "
             "not in this image."
         )
@@ -504,8 +508,8 @@ def aggregate_tiles(results: Sequence[TileResult]) -> AutoVerdict:
             union = _union_box([r.tile.box for r in partial])
             names = ", ".join(r.tile.label for r in partial)
             content += (
-                f" Tiles {names} saw it cut off at their edge, so it probably sits on a seam "
-                f"between tiles: look again with region={_box_text(union)}."
+                f" {names} saw it cut off at their edge, so it probably sits on a seam "
+                f"between bands: look again with region={_box_text(union)}."
             )
     elif len(groups) == 1:
         outcome = "single"
@@ -522,15 +526,15 @@ def _single_text(group: _Group, not_found: int, partial: int) -> str:
     labels = [r.reply.label for r in group.members if r.reply is not None and r.reply.label]
     label = max(set(labels), key=labels.count) if labels else ""
     variants = list(dict.fromkeys(_display(r) for r in group.members))
-    parts = [f"read in tile {', '.join(r.tile.label for r in group.members)}"]
+    parts = [f"read in {', '.join(r.tile.label for r in group.members)}"]
     if label:
         parts.insert(0, f'label "{label}"')
-    parts.append(f"{not_found} tile(s) replied not_found")
+    parts.append(f"{not_found} band(s) replied not_found")
     if partial:
         parts.append(f"{partial} saw it cut off")
     if len(variants) > 1:
         parts.append("written as " + " / ".join(f'"{v}"' for v in variants))
-    return f"{_display(best)}\n\n(region='auto': {'; '.join(parts)}.)"
+    return f"{_display(best)}\n\n(region='auto', read in bands: {'; '.join(parts)}.)"
 
 
 def _conflict_text(groups: Sequence[_Group], reasons: Sequence[str]) -> str:
@@ -550,12 +554,12 @@ def _conflict_text(groups: Sequence[_Group], reasons: Sequence[str]) -> str:
             reply = _reply(result)
             label = f' label "{reply.label}"' if reply.label else ""
             lines.append(
-                f"- tile {result.tile.label} region={_box_text(result.tile.box)}{label}: "
+                f"- {result.tile.label} region={_box_text(result.tile.box)}{label}: "
                 f'"{_display(result)}"'
             )
     detail = f" ({'; '.join(reasons)})" if reasons else ""
     return (
-        f"region='auto': the tiles gave conflicting readings - {why}{detail}:\n"
+        f"the bands gave conflicting readings - {why}{detail}:\n"
         + "\n".join(lines)
         + f"\n{len(groups)} different readings; no reading is preferred by count. Decide which "
         "one answers the question, or look again with one of the regions above."
@@ -567,12 +571,12 @@ def _side_notes(unreadable: Sequence[TileResult], failed: Sequence[TileResult]) 
     for result in unreadable:
         raw = result.reply.raw if result.reply is not None else ""
         notes += (
-            f"\n(Tile {result.tile.label} replied in a form that could not be read, so it was not "
+            f"\n({result.tile.label} replied in a form that could not be read, so it was not "
             f'counted: "{raw[:80]}")'
         )
     if failed:
         names = ", ".join(f"{r.tile.label} ({r.error})" for r in failed)
-        notes += f"\n(These tiles failed and were not read: {names}.)"
+        notes += f"\n(These bands failed and were not read: {names}.)"
     return notes
 
 
@@ -596,3 +600,57 @@ def tile_meta(result: TileResult) -> dict[str, object]:
     if reply.note:
         entry["note"] = reply.note
     return entry
+
+
+AutoPath = Literal["bands", "full_fallback", "gated"]
+
+#: 退回整张读的原因 → 给主模型的半句话。
+_FALLBACK_REASONS: Final[dict[str, str]] = {
+    "partial": "a band saw the value cut off at its edge, so no band value was taken",
+    "conflict": "the bands disagree",
+    "none": "no band read the value",
+    "bands_failed": "every band failed",
+}
+
+
+@dataclass(frozen=True)
+class AutoDecision:
+    """``region="auto"`` 的最终答案:走了哪条路、为什么、给主模型的文字、横条汇总的结论。"""
+
+    path: AutoPath
+    reason: str
+    content: str
+    bands: AutoOutcome
+
+
+def decide_auto(
+    results: Sequence[TileResult], *, full_answer: str | None, full_error: str | None
+) -> AutoDecision:
+    """横条读数 + 并行的整张读 → 最终答案(重设计 §4)。
+
+    * 横条给出一个前后一致的值、且没有一条报 ``partial`` → 用它(``bands``);
+    * 冲突、全无、有横条报 ``partial``(那条只数到了自己那一截,验证里它推翻过整张读的正确
+      计数)或横条全失败 → 用整张读的回答,明说不确定,横条的读数与框附在后面(``full_fallback``);
+    * 要退回整张读、整张读却失败了 → 只给横条的汇总,并说明整张读失败(仍记 ``bands``)。
+    """
+    verdict = aggregate_tiles(results)
+    has_partial = any(r.reply is not None and r.reply.status == "partial" for r in results)
+    if verdict.outcome == "single" and not has_partial:
+        return AutoDecision("bands", "single", verdict.content, verdict.outcome)
+    if all(r.reply is None for r in results):
+        reason = "bands_failed"
+    elif has_partial:
+        reason = "partial"
+    else:
+        reason = verdict.outcome
+    if full_answer is None:
+        content = (
+            f"region='auto': {verdict.content}\n(The whole-image read failed too: {full_error}.)"
+        )
+        return AutoDecision("bands", f"{reason}+full_failed", content, verdict.outcome)
+    content = (
+        f"{full_answer}\n\n(region='auto': whole-image reading; small print may be unreliable - "
+        f"{_FALLBACK_REASONS[reason]}. Re-ask with an explicit region from the band readings "
+        f"below, or say the value is uncertain.)\nBand readings: {verdict.content}"
+    )
+    return AutoDecision("full_fallback", reason, content, verdict.outcome)

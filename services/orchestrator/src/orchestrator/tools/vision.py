@@ -72,19 +72,23 @@ from orchestrator.tools.figure_lookup import (
 )
 from orchestrator.tools.file_ops import _require_path
 from orchestrator.tools.read_page import (
+    RENDER_DPI,
     RegionCrop,
     RegionRender,
     figure_scope,
     workspace_figure_ref,
 )
 from orchestrator.tools.region_zoom import (
+    AUTO_GATE_PIXELS,
     AUTO_REGION,
+    DOCUMENT_ZOOM_DPI,
     LARGE_IMAGE_PIXELS,
     REGION_HINT,
     Box,
     Region,
     Tile,
-    auto_tiles,
+    auto_bands,
+    band_count,
     crop_image,
     crop_output_size,
     image_size,
@@ -92,8 +96,9 @@ from orchestrator.tools.region_zoom import (
 )
 from orchestrator.tools.registry import ToolBlockedError, ToolContext, ToolResult, ToolSpec
 from orchestrator.tools.tile_reading import (
+    RAW_META_CHARS,
     TileResult,
-    aggregate_tiles,
+    decide_auto,
     parse_tile_reply,
     tile_meta,
     tile_question,
@@ -154,12 +159,13 @@ vision_deep_default_fallback_total = expert_work_counter(
     ("model",),
 )
 
-#: B-266 —— ``region="auto"`` 的汇总结论分布:单值 / 冲突 / 全无。
+#: B-266 —— ``region="auto"`` 走了哪条路(横条 / 退回整张读 / 门槛挡回)与原因。
 ask_image_region_auto_total = expert_work_counter(
     "expert_work_ask_image_region_auto_total",
-    "ask_image region='auto' looks by aggregate outcome: one answer (single), tiles disagreeing "
-    "(conflict) or no tile reading a value (none) (B-266).",
-    ("outcome",),
+    "ask_image region='auto' looks by the path taken: bands (a band value was used), "
+    "full_fallback (the parallel whole-image answer was used) or gated (the image was small "
+    "enough to read whole), with the reason (B-266).",
+    ("path", "reason"),
 )
 
 #: B-266 review —— 进程内同时在飞的「切块」看图调用上限。8 个并行 ``ask_image`` 各切 6 块
@@ -191,9 +197,10 @@ _DEPTH_DESCRIPTION = (
 
 
 _REGION_DESCRIPTION = (
-    "Optional: look at part of the image at higher resolution. 'auto' = 6 overlapping tiles "
-    "read in parallel (always a quick look; depth is ignored), for a specific value or small "
-    "text anywhere in the image. [x1, y1, x2, y2] = one box on a 0-1000 scale "
+    "Optional: look at part of the image at higher resolution. 'auto' = read one specific "
+    "small printed value, name or date in a large, dense image (always a quick look; depth "
+    "is ignored; small images are simply read whole); not for counting, comparisons or "
+    "questions about the whole image. [x1, y1, x2, y2] = one box on a 0-1000 scale "
     "(0 <= x1 < x2 <= 1000, 0 <= y1 < y2 <= 1000, at least 1% of the image)."
 )
 
@@ -213,7 +220,13 @@ class PageRenderer(Protocol):
         """渲 ``args["path"]`` 的 ``args["units"]``,与模型自己调 ``read_page`` 同一个入口。"""
 
     async def render_regions(
-        self, *, path: str, figure_ref: str, boxes: Sequence[Box], ctx: ToolContext
+        self,
+        *,
+        path: str,
+        figure_ref: str,
+        boxes: Sequence[Box],
+        ctx: ToolContext,
+        dpi: int | None = None,
     ) -> RegionRender:
         """B-266 —— 这一页(``figure_ref`` 是它的整页渲染)按 ``boxes`` 各渲一张高分辨率局部。"""
 
@@ -412,7 +425,7 @@ class AskImageTool:
             }
         look = await self._look(look_ref, question, depth=depth, ctx=ctx)
         answer = look.answer
-        if region is None and look.depth == "quick" and await self._wants_region_hint(ref_str):
+        if region is None and look.depth == "quick" and await self._wants_region_hint(located):
             answer = f"{answer}\n\n{REGION_HINT}"
         # Surface VL provenance in the ToolMessage artifact (event stream /
         # audit): the image ref plus the VL call's token usage — otherwise the
@@ -491,63 +504,139 @@ class AskImageTool:
         requested_depth: AskImageDepth,
         ctx: ToolContext,
     ) -> tuple[str, dict[str, Any]]:
-        """B-266 ``region="auto"`` —— 切 2x3 块并行快看,每块回一小段 JSON,再保守汇总。
+        """B-266 ``region="auto"``(11-03 验证过的重设计)。一律快看(``depth`` 忽略、meta 注明)。
 
-        一律快看(``depth`` 忽略、meta 里注明):推理留给主模型。某几块失败(报错 / 超时 /
-        截断)就汇总其余的、说清哪几块没看;全部失败才报错,与整页看失败同一种错误。
+        1. 门槛:图(文档页按 :data:`DOCUMENT_ZOOM_DPI` 算)不到 :data:`AUTO_GATE_PIXELS` → 不切,
+           整张快看一次(``gated``);
+        2. 否则切 :func:`band_count` 条整宽横条,每条回一小段 JSON;**同时**并行一次整张快看
+           (原问题、不加 JSON 要求),两者都计入在飞名额与记账;
+        3. 最终答案见 :func:`~orchestrator.tools.tile_reading.decide_auto`。横条与整张读全失败
+           才报错,与整页看失败同一种错误。
         """
-        tiles = auto_tiles()
-        rendered = await self._crops(located, [tile.box for tile in tiles], ctx=ctx)
+        pixels, document = await self._zoom_pixels(located)
+        meta: dict[str, Any] = {"region": AUTO_REGION, "depth": "quick", "auto_pixels": pixels}
+        if requested_depth != "quick":
+            meta["depth_ignored"] = requested_depth
+        if pixels is not None and pixels < AUTO_GATE_PIXELS:
+            look = await self._look(located.ref, question, depth="quick", ctx=ctx)
+            ask_image_region_auto_total.labels(path="gated", reason="small_image").inc()
+            meta.update({"auto": "gated", "auto_reason": "small_image", "vl_calls": 1})
+            if look.usage:
+                meta["vl_usage"] = look.usage
+            content = (
+                f"{look.answer}\n\n(region='auto': the image is small enough "
+                f"({pixels / 1_000_000:.1f} MP) to read whole, so it was read whole.)"
+            )
+            return content, meta
+        bands = auto_bands(band_count(pixels or 0))
+        rendered = await self._crops(
+            located,
+            [band.box for band in bands],
+            ctx=ctx,
+            dpi=DOCUMENT_ZOOM_DPI if document else None,
+        )
         crop_by_box = {crop.box: crop for crop in rendered.crops}
         render_failed = dict(rendered.failed)
-        looked = [tile for tile in tiles if tile.box in crop_by_box]
+        looked = [band for band in bands if band.box in crop_by_box]
         prompt = tile_question(question)
+        full_call = self._ask_tile(_messages(located.ref, question), ctx=ctx)
         outcomes = await asyncio.gather(
+            full_call,
             *(
-                self._ask_tile(_messages(crop_by_box[tile.box].ref, prompt), ctx=ctx)
-                for tile in looked
+                self._ask_tile(_messages(crop_by_box[band.box].ref, prompt), ctx=ctx)
+                for band in looked
             ),
             return_exceptions=True,
         )
+        full_outcome, band_outcomes = outcomes[0], outcomes[1:]
         by_label: dict[str, TileResult] = {}
         crop_meta: dict[str, dict[str, Any]] = {}
         usages: list[Mapping[str, Any]] = []
         errors: list[Exception] = []
-        for tile, outcome in zip(looked, outcomes, strict=True):
-            result, error = await self._tile_result(tile, outcome, ctx=ctx)
-            by_label[tile.label] = result
+        for band, outcome in zip(looked, band_outcomes, strict=True):
+            result, error = await self._tile_result(band, outcome, ctx=ctx)
+            by_label[band.label] = result
             if error is not None:
                 errors.append(error)
             if isinstance(outcome, AIMessage) and outcome.usage_metadata:
                 usages.append(outcome.usage_metadata)
-            crop = crop_by_box[tile.box]
-            crop_meta[tile.label] = {"dpi": crop.dpi, "pixels": [crop.width, crop.height]}
-        for tile in tiles:
-            if tile.label not in by_label:
-                why = render_failed.get(tile.box, "not rendered")
-                by_label[tile.label] = TileResult(tile=tile, reply=None, error=why)
-        results = [by_label[tile.label] for tile in tiles]
-        if all(result.reply is None for result in results):
-            if errors:
-                raise errors[0]
-            msg = "ask_image region='auto' could not look at any tile of this image"
+            crop = crop_by_box[band.box]
+            crop_meta[band.label] = {"dpi": crop.dpi, "pixels": [crop.width, crop.height]}
+        for band in bands:
+            if band.label not in by_label:
+                why = render_failed.get(band.box, "not rendered")
+                by_label[band.label] = TileResult(tile=band, reply=None, error=why)
+        results = [by_label[band.label] for band in bands]
+        full_answer, full_error, full_exc = await self._full_result(full_outcome, ctx=ctx)
+        if isinstance(full_outcome, AIMessage) and full_outcome.usage_metadata:
+            usages.append(full_outcome.usage_metadata)
+        if full_answer is None and all(result.reply is None for result in results):
+            first = errors[0] if errors else full_exc
+            if first is not None:
+                raise first
+            msg = "ask_image region='auto' could not look at this image at all"
             raise RuntimeError(msg)
-        verdict = aggregate_tiles(results)
-        ask_image_region_auto_total.labels(outcome=verdict.outcome).inc()
-        meta: dict[str, Any] = {
-            "region": AUTO_REGION,
-            "depth": "quick",
-            "aggregate": verdict.outcome,
-            "tiles": [
-                {**tile_meta(result), **crop_meta.get(result.tile.label, {})} for result in results
-            ],
-            "vl_calls": len(looked),
-        }
-        if requested_depth != "quick":
-            meta["depth_ignored"] = requested_depth
+        decision = decide_auto(results, full_answer=full_answer, full_error=full_error)
+        ask_image_region_auto_total.labels(path=decision.path, reason=decision.reason).inc()
+        meta.update(
+            {
+                "auto": decision.path,
+                "auto_reason": decision.reason,
+                "aggregate": decision.bands,
+                "bands": [
+                    {**tile_meta(result), **crop_meta.get(result.tile.label, {})}
+                    for result in results
+                ],
+                "full": {"answer": full_answer[:RAW_META_CHARS]}
+                if full_answer is not None
+                else {"error": full_error},
+                "vl_calls": len(looked) + 1,
+            }
+        )
         if usages:
             meta["vl_usage"] = _sum_usage(usages)
-        return verdict.content, meta
+        return decision.content, meta
+
+    async def _full_result(
+        self, outcome: AIMessage | BaseException, *, ctx: ToolContext
+    ) -> tuple[str | None, str | None, Exception | None]:
+        """并行那次整张快看的结果:``(回答, 失败原因, 异常)``;成功的这里记账。"""
+        if isinstance(outcome, BaseException) and not isinstance(outcome, Exception):
+            raise outcome  # 取消等:照常往上走
+        if isinstance(outcome, Exception):
+            reason = "timed out" if isinstance(outcome, TimeoutError) else type(outcome).__name__
+            return None, reason, outcome
+        await self._meter(outcome, ctx=ctx)
+        if is_unusable_truncation(outcome):
+            try:
+                self._raise_truncated(outcome)
+            except GuidedToolError as exc:
+                return None, "truncated", exc
+        text = _stringify(outcome.content).strip()
+        if not text:
+            return None, "no text", None
+        return text, None, None
+
+    async def _zoom_pixels(self, located: _Located) -> tuple[int | None, bool]:
+        """``region="auto"`` 门槛用的像素数,以及这是不是一张文档页。
+
+        图片:转正后的原像素。文档页(``path`` + ``unit``):按 :data:`DOCUMENT_ZOOM_DPI` 放大
+        之后的页面像素 —— 已有的整页渲染是 100 dpi,乘 (300/100)^2。读不出尺寸就是 ``None``。"""
+        source = located.resolved_from or {}
+        document = (
+            isinstance(source.get("path"), str)
+            and source.get("unit") is not None
+            and self.page_renderer is not None
+        )
+        try:
+            size = image_size((await self.image_resolver.resolve(located.ref)).data)
+        except Exception:
+            logger.debug("ask_image.zoom_pixels_unknown", exc_info=True)
+            return None, document
+        if size is None:
+            return None, document
+        scale = (DOCUMENT_ZOOM_DPI / RENDER_DPI) ** 2 if document else 1
+        return round(size[0] * size[1] * scale), document
 
     async def _ask_tile(self, messages: Sequence[BaseMessage], *, ctx: ToolContext) -> AIMessage:
         """一块的快看:先排进 :data:`MAX_TILE_CALLS_IN_FLIGHT` 个名额里,排队不超过单次调用的上限
@@ -590,7 +679,12 @@ class AskImageTool:
         return TileResult(tile=tile, reply=parse_tile_reply(text)), None
 
     async def _crops(
-        self, located: _Located, boxes: Sequence[Box], *, ctx: ToolContext
+        self,
+        located: _Located,
+        boxes: Sequence[Box],
+        *,
+        ctx: ToolContext,
+        dpi: int | None = None,
     ) -> RegionRender:
         """B-266 —— 按 ``boxes`` 裁出局部:文档页(``path`` + ``unit``)在沙箱里按区域高分辨率渲,
         别的图(上传图、工作区图片)在宿主按原像素裁。都落本对话 ``.tool_results/<run>/crops/``。"""
@@ -602,7 +696,7 @@ class AskImageTool:
                 raise ToolBlockedError(msg)
             async with self._render_lock((ctx.run_id, path)):
                 return await self.page_renderer.render_regions(
-                    path=path, figure_ref=located.ref, boxes=boxes, ctx=ctx
+                    path=path, figure_ref=located.ref, boxes=boxes, ctx=ctx, dpi=dpi
                 )
         return await self._crop_image(located.ref, boxes, ctx=ctx)
 
@@ -664,22 +758,18 @@ class AskImageTool:
             lock = self._render_locks[key] = asyncio.Lock()
         return lock
 
-    async def _wants_region_hint(self, ref_str: str) -> bool:
-        """B-266 —— 整页快看一张文档页或大图(≥ 2 百万像素)后,提示可以 ``region="auto"`` 再看。
+    async def _wants_region_hint(self, located: _Located) -> bool:
+        """B-266 —— 整页快看之后,只有 ``region="auto"`` 不会被门槛挡回来的图才提示它。
 
-        只在 ``region`` 可用(接了工作区)时提示。图片尺寸只读文件头;读不出来就不提示
+        只在 ``region`` 可用(接了工作区)时提示。尺寸只读文件头;读不出来就不提示
         (这条路只决定加不加一句话,不许让看图失败)。"""
         if self.workspace_store is None:
             return False
-        figure = parse_rendered_figure_ref(ref_str)
-        if figure is not None:
-            return figure.region is None
-        try:
-            size = image_size((await self.image_resolver.resolve(ref_str)).data)
-        except Exception:
-            logger.debug("ask_image.region_hint_size_unknown", exc_info=True)
+        figure = parse_rendered_figure_ref(located.ref)
+        if figure is not None and figure.region is not None:
             return False
-        return size is not None and size[0] * size[1] >= LARGE_IMAGE_PIXELS
+        pixels, _document = await self._zoom_pixels(located)
+        return pixels is not None and pixels >= LARGE_IMAGE_PIXELS
 
     async def _ask(
         self,
@@ -934,14 +1024,14 @@ def _spec_with_short_form() -> ToolSpec:
             "attached to the user message, for images the user uploaded. Ask narrow, "
             "specific questions; "
             "call ask_image repeatedly with sharper follow-ups if the first answer is too "
-            "vague — the image stays accessible. In this order: first a quick look at the "
-            "whole image (the default); when you need a specific value, a table entry or small "
-            "text, look again with region='auto' — the image is cut into 6 overlapping tiles "
-            "read in parallel, each tile reports whether it can see the value instead of "
-            "guessing, and disagreements come back as a conflict with each tile's region; "
-            "when you already know where it is (e.g. the vision model "
-            "told you), pass region=[x1, y1, x2, y2] on a 0-1000 scale to look at just that "
-            "part. Pass depth='deep' only when the text is readable and the answer still needs "
+            "vague — the image stays accessible. Looking at the whole image is the default. "
+            "Use region='auto' only to read one specific small printed value, name or date in "
+            "a large, dense page or photo; never use it for counting, comparisons, trends, "
+            "'which is highest' or any question about the whole picture. If its result says it "
+            "is uncertain, re-ask with an explicit region or tell the user the value is "
+            "uncertain. When you already know where something is (e.g. the vision model told "
+            "you), pass region=[x1, y1, x2, y2] on a 0-1000 scale to look at just that part. "
+            "Pass depth='deep' only when the text is readable and the answer still needs "
             "reasoning, such as a chart's trend or a complex layout."
         ),
         parameters={
