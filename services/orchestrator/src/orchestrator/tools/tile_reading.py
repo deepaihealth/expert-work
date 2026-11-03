@@ -58,9 +58,6 @@ def tile_instruction(axis: BandAxis = "y") -> str:
     )
 
 
-#: 横条(最常见的那一种)的提示词。
-TILE_INSTRUCTION: Final = tile_instruction("y")
-
 #: 交给主模型 / 记进 meta 的原文最多保留多少字符。
 RAW_META_CHARS: Final = 200
 #: 散文兜底:不超过这么多字符、带数字或定性词的回答才算一个值。

@@ -26,7 +26,6 @@ from orchestrator.tools.region_zoom import (
 )
 from orchestrator.tools.tile_reading import (
     MAX_REPLY_CHARS,
-    TILE_INSTRUCTION,
     TileResult,
     compatible,
     decide_auto,
@@ -421,7 +420,6 @@ def test_the_band_prompt_names_the_piece_by_axis() -> None:
     assert "cut off by the edge of the strip" in vertical
     assert "horizontal band" not in vertical
     assert tile_question("q?", "x") == f"q?\n\n{vertical}"
-    assert TILE_INSTRUCTION == horizontal
 
 
 @pytest.mark.anyio

@@ -9,13 +9,13 @@ import pytest
 
 from orchestrator.tools.region_zoom import auto_bands
 from orchestrator.tools.tile_reading import (
-    TILE_INSTRUCTION,
     TileResult,
     aggregate_tiles,
     compatible,
     decide_auto,
     parse_reading,
     parse_tile_reply,
+    tile_instruction,
     tile_meta,
     tile_question,
 )
@@ -35,11 +35,11 @@ def _json(status: str, value: str = "", *, unit: str = "", label: str = "") -> s
 def test_the_tile_prompt_keeps_the_question_and_asks_for_json() -> None:
     prompt = tile_question("What is the glucose value?")
     assert prompt.startswith("What is the glucose value?\n\n")
-    assert prompt.endswith(TILE_INSTRUCTION)
+    assert prompt.endswith(tile_instruction("y"))
     for needle in ("JSON", '"not_found"', '"partial"', "Do not guess", '"label"', '"unit"'):
-        assert needle in TILE_INSTRUCTION
-    assert "reason" not in TILE_INSTRUCTION
-    assert TILE_INSTRUCTION.isascii() is False  # 保留了 < > ↑ ↓ ± 这些记号的说明
+        assert needle in tile_instruction("y")
+    assert "reason" not in tile_instruction("y")
+    assert tile_instruction("y").isascii() is False  # 保留了 < > ↑ ↓ ± 这些记号的说明
 
 
 # ---------------------------------------------------------------------------
@@ -377,15 +377,15 @@ _FULL = "The glucose value is 5.6 mmol/L."
 
 
 def test_the_band_prompt_has_the_redesign_clauses() -> None:
-    assert "full-width horizontal band" in TILE_INSTRUCTION
+    assert "full-width horizontal band" in tile_instruction("y")
     assert "the requested value or text (number, name, date, word...) exactly as printed" in (
-        TILE_INSTRUCTION
+        tile_instruction("y")
     )
     assert (
         "If this part of the image alone is not enough to answer - e.g. the question needs "
         "counting or comparing across the whole image, or an axis, legend or row/column header "
         'that is not visible here - use "not_found".'
-    ) in TILE_INSTRUCTION
+    ) in tile_instruction("y")
 
 
 def test_a_single_band_value_is_the_answer() -> None:

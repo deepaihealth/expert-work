@@ -67,7 +67,7 @@ from orchestrator.tools.region_zoom import (
 )
 from orchestrator.tools.registry import ToolBlockedError, ToolContext
 from orchestrator.tools.sandbox import RecordingSandboxRuntime, SandboxOutcome
-from orchestrator.tools.tile_reading import TILE_INSTRUCTION
+from orchestrator.tools.tile_reading import tile_instruction
 from orchestrator.tools.vision import AskImageTool, ask_image_region_auto_total
 from orchestrator.tools.workspace_paths import WorkspaceView
 
@@ -367,18 +367,23 @@ class _LocalRuntime(RecordingSandboxRuntime):
         return SandboxOutcome(stdout=buffer.getvalue(), stderr="", exit_code=0, timed_out=False)
 
 
+def _answer_ok(_ref: str) -> str:
+    return "ok"
+
+
 @dataclass
 class _VL:
     """看图模型替身:按图 ref 回答(``answer(ref)`` 返回文字或抛异常),记下每次调用。"""
 
-    answer: Callable[[str], str] = lambda _ref: "ok"
+    answer: Callable[[str], str] | None = None
     usage: dict[str, int] | None = None
     calls: list[list[BaseMessage]] = field(default_factory=list)
 
     async def __call__(self, *, messages: Sequence[BaseMessage], tools: Sequence[Any]) -> AIMessage:
         self.calls.append(list(messages))
         await asyncio.sleep(0)
-        return AIMessage(content=self.answer(_image_ref_of(messages)), usage_metadata=self.usage)  # type: ignore[arg-type]
+        reply = self.answer or _answer_ok
+        return AIMessage(content=reply(_image_ref_of(messages)), usage_metadata=self.usage)  # type: ignore[arg-type]
 
 
 def _image_ref_of(messages: Sequence[BaseMessage]) -> str:
@@ -669,7 +674,7 @@ async def test_auto_on_a_document_page_reads_bands_and_the_whole_page_in_paralle
     assert [_image_ref_of(call) for call in full] == [doc.page_ref]
     assert _question_of(full[0]) == "glucose?"  # 整张读用原问题,不加 JSON 要求
     for call in bands:
-        assert _question_of(call) == f"glucose?\n\n{TILE_INSTRUCTION}"
+        assert _question_of(call) == f"glucose?\n\n{tile_instruction('y')}"
     assert result.content.startswith("5.6 mmol/L\n")
     assert "band 3" in result.content
     assert "5.8" not in result.content
