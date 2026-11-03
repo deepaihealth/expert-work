@@ -31,6 +31,7 @@ from uuid import UUID
 from expert_work.persistence import (
     RENDERED_FIGURE_PAGE_STEM,
     RENDERED_FIGURE_UNIT_PREFIX,
+    is_rendered_crop_rel,
     is_rendered_figure_rel,
 )
 from expert_work.persistence.workspace.layout import (
@@ -489,7 +490,9 @@ def is_cacheable_image_ref(ref: str) -> bool:
     if not ref.startswith(WORKSPACE_REF_PREFIX):
         return True
     parsed = parse_workspace_image_ref(ref)
-    return is_rendered_figure_rel("/".join(_figure_tail_parts(parsed)))
+    tail = "/".join(_figure_tail_parts(parsed))
+    # B-266 —— 「放大局部」的裁图同样由源内容哈希 + 框派生(``is_rendered_crop_rel``),同理可缓存。
+    return is_rendered_figure_rel(tail) or is_rendered_crop_rel(tail)
 
 
 #: B-262 —— 对话视图的渲染页落在本对话的 ``threads/<conv>/work/`` 下:``agents/<key>/`` 之后
@@ -541,6 +544,8 @@ class RenderedFigureRef:
     unit: int
     #: 真实 PDF 页号,取自文件名 ``page-NN.jpg``(pdftoppm 按总页数补零,几位都认)。
     page: int
+    #: B-266 —— 这是那一页的「放大局部」裁图时,裁的框(0-1000 坐标);整页渲染是 ``None``。
+    region: tuple[int, int, int, int] | None = None
 
 
 def parse_rendered_figure_ref(ref: str) -> RenderedFigureRef | None:
@@ -560,11 +565,20 @@ def parse_rendered_figure_ref(ref: str) -> RenderedFigureRef | None:
     except ValueError:
         return None
     parts = _figure_tail_parts(parsed)
-    if not is_rendered_figure_rel("/".join(parts)):
+    tail = "/".join(parts)
+    region: tuple[int, int, int, int] | None = None
+    if is_rendered_figure_rel(tail):
+        # 形状已经过了上面那道正则,下面四段的位置与格式都是它保证的。
+        doc_sha, render_sha, unit_dir, name = parts[-4:]
+        page = int(PurePosixPath(name).stem.removeprefix(f"{RENDERED_FIGURE_PAGE_STEM}-"))
+    elif is_rendered_crop_rel(tail) and parts[-2].startswith(RENDERED_FIGURE_UNIT_PREFIX):
+        # B-266 —— 文档页的局部裁图:``page-<N>-<x1>-<y1>-<x2>-<y2>-d<dpi>.jpg``(形状已过正则)。
+        doc_sha, render_sha, unit_dir, name = parts[-4:]
+        fields = PurePosixPath(name).stem.split("-")
+        numbers = [int(v) for v in fields[1:6]]
+        page, region = numbers[0], (numbers[1], numbers[2], numbers[3], numbers[4])
+    else:
         return None
-    # 形状已经过了上面那道正则,下面四段的位置与格式都是它保证的。
-    doc_sha, render_sha, unit_dir, name = parts[-4:]
-    page = int(PurePosixPath(name).stem.removeprefix(f"{RENDERED_FIGURE_PAGE_STEM}-"))
     unit = int(unit_dir.removeprefix(RENDERED_FIGURE_UNIT_PREFIX))
     return RenderedFigureRef(
         workspace=parsed,
@@ -573,6 +587,7 @@ def parse_rendered_figure_ref(ref: str) -> RenderedFigureRef | None:
         unit_dir=unit_dir,
         unit=unit,
         page=page,
+        region=region,
     )
 
 

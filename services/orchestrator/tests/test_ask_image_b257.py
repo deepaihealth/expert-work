@@ -40,6 +40,7 @@ from orchestrator.tools.vision import (
 from .test_ask_image_depth_timeout import (
     _KEY,
     _TENANT,
+    _THREAD,
     _USER,
     _Answer,
     _any_key,
@@ -306,7 +307,8 @@ async def test_the_main_model_of_the_same_agent_is_untouched(
         )
         cfg: RunnableConfig = {
             "configurable": {
-                "thread_id": str(uuid4()),
+                # B-266 review —— run 的会话 = 图上传时的会话(建 run 时就是这么校验的)。
+                "thread_id": str(_THREAD),
                 "tenant_id": str(_TENANT),
                 "user_id": str(_USER),
                 "run_id": str(uuid4()),
