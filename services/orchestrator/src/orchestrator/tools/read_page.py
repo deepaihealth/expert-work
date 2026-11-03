@@ -199,7 +199,14 @@ from orchestrator.tools.document_figures import (
 )
 from orchestrator.tools.error_classifier import GuidedToolError
 from orchestrator.tools.file_ops import _require_path, _snippet, run_scoped_read
-from orchestrator.tools.region_zoom import Box, image_size, parse_box, pixel_box, region_dpi
+from orchestrator.tools.region_zoom import (
+    Box,
+    band_dpi,
+    image_size,
+    parse_box,
+    pixel_box,
+    region_dpi,
+)
 from orchestrator.tools.registry import ToolContext, ToolResult, ToolSpec
 from orchestrator.tools.sandbox import SandboxRuntime
 from orchestrator.tools.sandbox_image_contract import AGENT_VIEW, EXEC_VIEW
@@ -1715,12 +1722,13 @@ class ReadPageTool:
         figure_ref: str,
         boxes: Sequence[Box],
         ctx: ToolContext,
-        dpi: int | None = None,
+        bands: bool = False,
     ) -> RegionRender:
         """B-266 —— 文档 ``path`` 的一页(``figure_ref`` 是它的整页渲染)按 ``boxes`` 各渲一张局部。
 
-        分辨率按每个框的面积定(约 1.5 百万像素,上限 400 dpi);给了 ``dpi`` 就全部按它渲
-        (``region="auto"`` 的横条按 :data:`~orchestrator.tools.region_zoom.DOCUMENT_ZOOM_DPI`)。
+        分辨率按每个框的面积定(约 1.5 百万像素,上限 400 dpi,长边不超过 4000 像素);``bands=True``
+        (``region="auto"`` 的横条)按 :func:`~orchestrator.tools.region_zoom.band_dpi` —— 300 dpi,
+        每条超过 300 万像素或长边 4000 像素就降。dpi 写进文件名,只复用同 dpi 的图。
         页面尺寸取整页渲染的像素;
         一次沙箱执行渲完全部框,落本对话 ``.tool_results/<本 run>/crops/…``。``ask_image``
         的 ``region`` 也走这里(它在同一把 ``(run, path)`` 锁里调)。
@@ -1748,7 +1756,7 @@ class ReadPageTool:
             f"{base}{WORKSPACE_OVERFLOW_DIR}/{ctx.run_id}/{RENDERED_CROP_DIR}/"
             f"{doc_sha}/{figure.render_sha}/{figure.unit_dir}"
         )
-        jobs = [_region_job(box, page=figure.page, page_px=size, dpi=dpi) for box in boxes]
+        jobs = [_region_job(box, page=figure.page, page_px=size, bands=bands) for box in boxes]
         env = await run_scoped_read(
             self.client,
             build=lambda w: build_region_wrapper(
@@ -1817,15 +1825,17 @@ class ReadPageTool:
 
 
 def _region_job(
-    box: Box, *, page: int, page_px: tuple[int, int], dpi: int | None = None
+    box: Box, *, page: int, page_px: tuple[int, int], bands: bool = False
 ) -> dict[str, Any]:
     """一个框 → 片段里的一项:目标文件名、分辨率、按那个分辨率算的像素框。"""
-    if dpi is None:
+    if bands:
+        dpi = band_dpi(page_px, box, base_dpi=RENDER_DPI)
+    else:
         dpi = region_dpi(page_px, box, base_dpi=RENDER_DPI)
     scale = dpi / RENDER_DPI
     left, top, right, bottom = pixel_box(box, (page_px[0] * scale, page_px[1] * scale))
     return {
-        "name": f"{RENDERED_FIGURE_PAGE_STEM}-{page}-{region_crop_stem(box)}.jpg",
+        "name": f"{RENDERED_FIGURE_PAGE_STEM}-{page}-{region_crop_stem(box)}-d{dpi}.jpg",
         "dpi": dpi,
         "x": left,
         "y": top,

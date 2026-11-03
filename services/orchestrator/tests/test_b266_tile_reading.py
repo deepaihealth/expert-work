@@ -437,4 +437,5 @@ def test_a_failed_whole_image_read_leaves_the_band_summary() -> None:
     decision = decide_auto(results, full_answer=None, full_error="timed out")
     assert (decision.path, decision.reason) == ("bands", "conflict+full_failed")
     assert "the bands gave conflicting readings" in decision.content
-    assert "The whole-image read failed too: timed out" in decision.content
+    assert decision.content.startswith("region='auto': no reliable reading - the bands disagree")
+    assert "the whole-image read failed too (timed out)" in decision.content

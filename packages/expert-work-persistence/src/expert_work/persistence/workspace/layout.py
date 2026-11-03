@@ -186,8 +186,9 @@ def is_rendered_figure_rel(rel: str) -> bool:
 #: B-266 —— 「放大局部」裁出来的图落在 ``.tool_results/<run_id>/crops/`` 下,两种形状:
 #:
 #: * 文档页的局部(沙箱按区域高分辨率渲):
-#:   ``crops/<doc-sha>/<render-sha>/_u<unit>/page-<N>-<x1>-<y1>-<x2>-<y2>.jpg``
-#:   —— 前三段与渲染页同义(Path A 按它排槽、找回文档、核对新鲜度),文件名是真实页号 + 框;
+#:   ``crops/<doc-sha>/<render-sha>/_u<unit>/page-<N>-<x1>-<y1>-<x2>-<y2>-d<dpi>.jpg``
+#:   —— 前三段与渲染页同义(Path A 按它排槽、找回文档、核对新鲜度),文件名是真实页号 + 框 +
+#:   实际渲染的 dpi(同一个框按不同 dpi 渲出的是两张图,不许互相复用);
 #: * 图片的局部(宿主按原像素裁):``crops/<src-sha>/<x1>-<y1>-<x2>-<y2>.jpg``,
 #:   ``<src-sha>`` 是源图字节的哈希。
 #:
@@ -210,9 +211,11 @@ _RENDERED_CROP_RE = re.compile(
     + re.escape(RENDERED_FIGURE_UNIT_PREFIX)
     + "[1-9][0-9]*/"
     + re.escape(RENDERED_FIGURE_PAGE_STEM)
-    + "-[0-9]+-)?"
+    + "-[0-9]+-"
     + _BOX_PATTERN
-    + r"\.jpg\Z"
+    + "-d[1-9][0-9]{0,3}|"
+    + _BOX_PATTERN
+    + r")\.jpg\Z"
 )
 
 

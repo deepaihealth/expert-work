@@ -28,6 +28,7 @@ from expert_work.protocol.multimodal import ImageRef
 from orchestrator.multimodal import InMemoryImageResolver, ResolvedImage, parse_rendered_figure_ref
 from orchestrator.tools import region_zoom, vision
 from orchestrator.tools.error_classifier import classify_tool_error
+from orchestrator.tools.nas_workspace_store import NasWorkspaceStore
 from orchestrator.tools.read_page import (
     ReadPageTool,
     RegionRenderError,
@@ -174,34 +175,85 @@ def test_only_upload_formats_are_opened(fmt: str) -> None:
         crop_image(buffer.getvalue(), [(0, 0, 500, 500)])
 
 
-def test_at_most_two_host_crops_run_at_once(monkeypatch: pytest.MonkeyPatch) -> None:
-    active, peak = 0, 0
-    lock = threading.Lock()
-    original = region_zoom._crop_open_image
+def _crop_tool(tmp_path: Path, images: dict[str, bytes]) -> tuple[vision.AskImageTool, ToolContext]:
+    tenant, user = uuid4(), uuid4()
+    root = tmp_path / "nas"
+    (root / str(tenant) / str(user)).mkdir(parents=True)
+    resolver = InMemoryImageResolver(
+        images={
+            ref: ResolvedImage(media_type="image/png", data=data) for ref, data in images.items()
+        }
+    )
+    tool = vision.AskImageTool(
+        vl_caller=_VL(), image_resolver=resolver, workspace_store=NasWorkspaceStore(root=str(root))
+    )
+    ctx = ToolContext(
+        tenant_id=tenant,
+        user_id=user,
+        run_id=uuid4(),
+        thread_id=_CONV,
+        agent_key=_KEY,
+        workspace_layout="conversation",
+    )
+    return tool, ctx
 
-    def slow(image: Image.Image, boxes: Sequence[region_zoom.Box]) -> Any:
-        nonlocal active, peak
-        with lock:
-            active += 1
-            peak = max(peak, active)
+
+@dataclass
+class _CropSpy:
+    """替换 ``vision.crop_image``:记下同时在线程里跑的个数和总调用数。"""
+
+    active: int = 0
+    peak: int = 0
+    calls: int = 0
+    lock: threading.Lock = field(default_factory=threading.Lock)
+
+    def __call__(self, data: bytes, boxes: Sequence[region_zoom.Box]) -> Any:
+        with self.lock:
+            self.active += 1
+            self.calls += 1
+            self.peak = max(self.peak, self.active)
         time.sleep(0.05)
         try:
-            return original(image, boxes)
+            return crop_image(data, boxes)
         finally:
-            with lock:
-                active -= 1
+            with self.lock:
+                self.active -= 1
 
-    monkeypatch.setattr(region_zoom, "_crop_open_image", slow)
-    data = _image_bytes((200, 200))
-    threads = [
-        threading.Thread(target=crop_image, args=(data, [(0, 0, 500, 500)])) for _ in range(6)
-    ]
-    for thread in threads:
-        thread.start()
-    for thread in threads:
-        thread.join()
 
-    assert peak == region_zoom.HOST_CROP_SLOTS == 2
+@pytest.mark.anyio
+async def test_at_most_two_host_crops_run_at_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """名额在进线程之前用 asyncio 拿:6 张不同的图同时裁,线程里同时最多 2 张,没有线程在里面等。"""
+    spy = _CropSpy()
+    monkeypatch.setattr(vision, "crop_image", spy)
+    monkeypatch.setattr(vision, "_HOST_CROP_GATES", weakref.WeakKeyDictionary())
+    images = {f"img-{i}": _image_bytes((200 + i, 200), fmt="PNG") for i in range(6)}
+    tool, ctx = _crop_tool(tmp_path, images)
+
+    await asyncio.gather(*(tool._crop_image(ref, [(0, 0, 500, 500)], ctx=ctx) for ref in images))
+
+    assert spy.calls == 6
+    assert spy.peak == region_zoom.HOST_CROP_SLOTS == 2
+
+
+@pytest.mark.anyio
+async def test_two_concurrent_crops_of_one_image_are_serialised_and_the_second_reuses(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """同一 run、同一张图、同一个框并发裁两次:按 (run, 裁图目录) 排队,只裁一次,第二次复用。"""
+    spy = _CropSpy()
+    monkeypatch.setattr(vision, "crop_image", spy)
+    tool, ctx = _crop_tool(tmp_path, {"img": _image_bytes((400, 300), fmt="PNG")})
+
+    first, second = await asyncio.gather(
+        tool._crop_image("img", [(0, 0, 500, 500)], ctx=ctx),
+        tool._crop_image("img", [(0, 0, 500, 500)], ctx=ctx),
+    )
+
+    assert spy.calls == 1
+    assert sorted([first.crops[0].reused, second.crops[0].reused]) == [False, True]
+    assert first.crops[0].ref == second.crops[0].ref
 
 
 # ---------------------------------------------------------------------------
@@ -359,7 +411,7 @@ _RUN = UUID("99999999-9999-4999-8999-999999999999")
 def _page_ref(tenant: UUID, user: UUID, *, crop: bool = False) -> str:
     doc_sha = document_sha("d.pdf", view=ToolContext(agent_key=_KEY).workspace_view)
     tail = "crops" if crop else "figures"
-    name = "page-1-0-0-500-500.jpg" if crop else "page-1.jpg"
+    name = "page-1-0-0-500-500-d200.jpg" if crop else "page-1.jpg"
     rel = f"agents/{_KEY}/.tool_results/{_RUN}/{tail}/{doc_sha}/{'b' * 16}/_u1/{name}"
     return workspace_figure_ref(tenant, user, rel)
 
@@ -512,7 +564,7 @@ def _region_setup(tmp_path: Path) -> tuple[Path, str, list[dict[str, Any]], Path
     ws.mkdir()
     (ws / "d.pdf").write_text("PDF")
     render_sha = hashlib.sha256(b"dpi=100;PDF").hexdigest()[:16]
-    jobs = [{"name": "page-1-0-0-500-500.jpg", "dpi": 200, "x": 0, "y": 0, "w": 10, "h": 10}]
+    jobs = [{"name": "page-1-0-0-500-500-d200.jpg", "dpi": 200, "x": 0, "y": 0, "w": 10, "h": 10}]
     return ws, render_sha, jobs, ws / "out" / jobs[0]["name"]
 
 

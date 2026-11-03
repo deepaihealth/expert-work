@@ -82,9 +82,14 @@ _THINK_RE: Final = re.compile(r"<think>.*?(?:</think>|\Z)", re.DOTALL | re.IGNOR
 _FENCE_RE: Final = re.compile(r"```(?:json|JSON)?")
 
 
+#: 解析前先截到这么长:合法回答不到 300 字符,截断让每一步都有界(review round 2 N1 ——
+#: 原来的配平扫描是平方级的,2 万个 ``{`` 要 8.7 s,而它在共享的事件循环上跑)。
+MAX_REPLY_CHARS: Final = 4096
+
+
 def parse_tile_reply(text: str) -> TileReply:
     """一块的原始回答 → :class:`TileReply`(解析阶梯见模块 docstring)。"""
-    raw = text.strip()
+    raw = text.strip()[:MAX_REPLY_CHARS]
     cleaned = _FENCE_RE.sub("", _THINK_RE.sub("", raw)).strip()
     obj = _json_object(cleaned)
     if obj is not None:
@@ -110,29 +115,36 @@ def _json_object(text: str) -> dict[str, object] | None:
 
 
 def _first_balanced_object(text: str) -> str | None:
-    """第一个配平的 ``{…}``(跳过字符串里的花括号);没有就 ``None``。"""
+    """最靠前的一个配平的 ``{…}``(跳过字符串里的花括号);没有就 ``None``。
+
+    一遍扫完(线性):栈里记还没合上的 ``{`` 的位置;每合上一对,记下起点最靠前的那一对;栈空的
+    那一刻合上的就是迄今最外层的,直接返回。字符串 / 转义状态从第一个 ``{`` 起算一次。"""
     start = text.find("{")
-    while start != -1:
-        depth, in_string, escaped = 0, False, False
-        for index in range(start, len(text)):
-            char = text[index]
-            if in_string:
-                if escaped:
-                    escaped = False
-                elif char == "\\":
-                    escaped = True
-                elif char == '"':
-                    in_string = False
+    if start == -1:
+        return None
+    opens: list[int] = []
+    best: tuple[int, int] | None = None
+    in_string, escaped = False, False
+    for index in range(start, len(text)):
+        char = text[index]
+        if in_string:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
             elif char == '"':
-                in_string = True
-            elif char == "{":
-                depth += 1
-            elif char == "}":
-                depth -= 1
-                if depth == 0:
-                    return text[start : index + 1]
-        start = text.find("{", start + 1)
-    return None
+                in_string = False
+        elif char == '"':
+            in_string = True
+        elif char == "{":
+            opens.append(index)
+        elif char == "}" and opens:
+            begin = opens.pop()
+            if best is None or begin < best[0]:
+                best = (begin, index)
+            if not opens:
+                return text[begin : index + 1]
+    return text[best[0] : best[1] + 1] if best is not None else None
 
 
 def _field(obj: dict[str, object], key: str) -> str:
@@ -177,10 +189,11 @@ _NOT_FOUND_LEXICON: Final = tuple(
         r".{0,20}(?:\u4e0d\u5b8c\u6574|\u88ab\u622a\u65ad|\u88ab\u88c1\u5207).{0,20}",
         r"(?:the )?(?:value |item )?(?:is )?not (?:visible|shown).{0,40}",
         r"(?:i )?(?:cannot|can ?t|can not) (?:see|read|find).{0,40}",
-        r"n ?/? ?a",
-        r"\u65e0|\u6ca1\u6709",
     )
 )
+#: 只在散文兜底里认的单独一个词(「无」「没有」「N/A」):JSON 里 ``found`` 的值是「无」时,那是
+#: 一个读数(比如「过敏史:无」),不是「没看到」。
+_BARE_NOT_FOUND_RE: Final = re.compile(r"n ?/? ?a|\u65e0|\u6ca1\u6709", re.IGNORECASE)
 _PUNCT_RE: Final = re.compile(
     r"[\s\"'`*_.,:;!?()\[\]\u3002\uff0c\uff1a\uff1b\uff01\uff1f\u201c\u201d\u2018\u2019\uff08\uff09\u3001]+"
 )
@@ -197,18 +210,23 @@ def _flat(text: str) -> str:
     return _PUNCT_RE.sub(" ", unicodedata.normalize("NFKC", text)).strip().casefold()
 
 
-def _says_not_found(text: str) -> bool:
-    """散文里的「没看到 / 看不全」:``NOT_FOUND`` 记号在任何位置,或整句命中词表。"""
+def _says_not_found(text: str, *, prose: bool = False) -> bool:
+    """「没看到 / 看不全」:``NOT_FOUND`` 记号在任何位置,或整句命中词表。单独一个「无」「没有」
+    「N/A」只在 ``prose=True``(散文兜底)时算。"""
     if _NOT_FOUND_TOKEN_RE.search(text):
         return True
     flat = _flat(text)
-    return bool(flat) and any(pattern.fullmatch(flat) for pattern in _NOT_FOUND_LEXICON)
+    if not flat:
+        return False
+    if prose and _BARE_NOT_FOUND_RE.fullmatch(flat):
+        return True
+    return any(pattern.fullmatch(flat) for pattern in _NOT_FOUND_LEXICON)
 
 
 def _from_prose(text: str, raw: str) -> TileReply:
     if not text:
         return TileReply(status="unparseable", raw=raw, parse_mode="none")
-    if _says_not_found(text):
+    if _says_not_found(text, prose=True):
         return TileReply(status="not_found", raw=raw, parse_mode="prose")
     if len(text) <= PROSE_VALUE_MAX_CHARS and _QUALITATIVE_HINT_RE.search(text):
         return TileReply(status="found", raw=raw, parse_mode="prose", value=text)
@@ -291,9 +309,20 @@ _QUALITATIVE_SPLIT_RE: Final = re.compile(
 )
 
 
+_SUPERSCRIPTS: Final = str.maketrans(
+    "\u2070\u00b9\u00b2\u00b3\u2074\u2075\u2076\u2077\u2078\u2079\u207b\u207a", "0123456789-+"
+)
+_SUPERSCRIPT_RUN_RE: Final = re.compile("[\u2070\u00b9\u00b2\u00b3\u2074-\u2079\u207a\u207b]+")
+
+
+def _expand_superscripts(text: str) -> str:
+    """上标数字 → ``^数字``(在 NFKC 之前:NFKC 会把 ``10⁹`` 压成 ``109``)。"""
+    return _SUPERSCRIPT_RUN_RE.sub(lambda m: "^" + m.group(0).translate(_SUPERSCRIPTS), text)
+
+
 def canonical_text(text: str) -> str:
-    """NFKC、统一减号、数字之间的范围分隔符统一成 ``~``、去掉千分位逗号。"""
-    text = unicodedata.normalize("NFKC", text)
+    """上标展开、NFKC、统一减号、数字之间的范围分隔符统一成 ``~``、去掉千分位逗号。"""
+    text = unicodedata.normalize("NFKC", _expand_superscripts(text))
     text = _MINUS_RE.sub("-", text)
     text = _THOUSANDS_RE.sub(lambda m: m.group(0).replace(",", ""), text)
     return _RANGE_RE.sub(r"\1~", text).strip()
@@ -301,7 +330,7 @@ def canonical_text(text: str) -> str:
 
 def normalize_unit(unit: str) -> str:
     """单位只统一写法:大小写、μ/µ/u、``x10^9/L`` 的几种写法、空白。**不换算。**"""
-    text = unicodedata.normalize("NFKC", unit).strip()
+    text = unicodedata.normalize("NFKC", _expand_superscripts(unit)).strip()
     text = re.sub(r"^[\u00d7xX*]\s*(?=10)", "", text)
     text = re.sub(r"10\s*[\^*]\s*([-+]?\d+)", r"10^\1", text)
     text = text.replace("\u03bc", "u").replace("\u00b5", "u")
@@ -330,7 +359,11 @@ def parse_reading(value: str, unit: str = "") -> Reading:
     qualitative = _qualitative_class(compact)
     if qualitative and not comparator:
         return Reading(kind="qualitative", qualitative=qualitative, flags=frozenset(flags))
-    reading = _numeric_reading(text, unit, comparator, flags)
+    try:
+        reading = _numeric_reading(text, unit, comparator, flags)
+    except (ArithmeticError, ValueError):
+        # 超大指数、超长数字串(int 的位数上限)之类:不算数,按文字比。
+        reading = None
     if reading is not None:
         return reading
     normalized = " ".join(text.split()).rstrip(".\u3002").casefold()
@@ -358,11 +391,11 @@ def _numeric_reading(text: str, unit: str, comparator: str, flags: set[str]) -> 
             return None
         number = _decimal(match.group(1))
         if match.group(2):
-            number = number.scaleb(int(match.group(2)))
+            number = number.scaleb(_exponent(match.group(2)))
         rest = match.group(3)
         scientific = _SCIENTIFIC_TAIL_RE.fullmatch(rest)
         if scientific is not None:
-            number, rest = number.scaleb(int(scientific.group(1))), ""
+            number, rest = number.scaleb(_exponent(scientific.group(1))), ""
         numbers = (number,)
         kind = "comparator" if comparator else "number"
     hl = _HL_FLAG_RE.fullmatch(rest)
@@ -376,6 +409,21 @@ def _numeric_reading(text: str, unit: str, comparator: str, flags: set[str]) -> 
         flags=frozenset(flags),
         unit=normalize_unit(rest.strip() or unit),
     )
+
+
+#: 科学计数的指数上限:化验单上最大也就 10^12 这一级,再大只会是读错或恶意输入。
+MAX_EXPONENT: Final = 50
+
+
+def _exponent(text: str) -> int:
+    if len(text.lstrip("+-")) > 3:
+        msg = f"exponent {text[:20]!r} is out of range"
+        raise ValueError(msg)
+    value = int(text)
+    if abs(value) > MAX_EXPONENT:
+        msg = f"exponent {value} is out of range"
+        raise ValueError(msg)
+    return value
 
 
 def _decimal(text: str) -> Decimal:
@@ -610,6 +658,7 @@ _FALLBACK_REASONS: Final[dict[str, str]] = {
     "conflict": "the bands disagree",
     "none": "no band read the value",
     "bands_failed": "every band failed",
+    "bands_unavailable": "the bands could not be prepared",
 }
 
 
@@ -644,8 +693,11 @@ def decide_auto(
     else:
         reason = verdict.outcome
     if full_answer is None:
+        # 横条本身没给出可用的值(冲突 / 全无 / 有一条被截断),整张读又失败:不拿任何一条的
+        # 值当答案(review round 2 e —— 被截断时那条唯一的值不可信)。
         content = (
-            f"region='auto': {verdict.content}\n(The whole-image read failed too: {full_error}.)"
+            f"region='auto': no reliable reading - {_FALLBACK_REASONS[reason]}, and the "
+            f"whole-image read failed too ({full_error}). Band readings: {verdict.content}"
         )
         return AutoDecision("bands", f"{reason}+full_failed", content, verdict.outcome)
     content = (

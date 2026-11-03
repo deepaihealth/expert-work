@@ -572,9 +572,10 @@ def parse_rendered_figure_ref(ref: str) -> RenderedFigureRef | None:
         doc_sha, render_sha, unit_dir, name = parts[-4:]
         page = int(PurePosixPath(name).stem.removeprefix(f"{RENDERED_FIGURE_PAGE_STEM}-"))
     elif is_rendered_crop_rel(tail) and parts[-2].startswith(RENDERED_FIGURE_UNIT_PREFIX):
-        # B-266 —— 文档页的局部裁图:``page-<N>-<x1>-<y1>-<x2>-<y2>.jpg``(形状同样已过正则)。
+        # B-266 —— 文档页的局部裁图:``page-<N>-<x1>-<y1>-<x2>-<y2>-d<dpi>.jpg``(形状已过正则)。
         doc_sha, render_sha, unit_dir, name = parts[-4:]
-        numbers = [int(v) for v in PurePosixPath(name).stem.split("-")[1:]]
+        fields = PurePosixPath(name).stem.split("-")
+        numbers = [int(v) for v in fields[1:6]]
         page, region = numbers[0], (numbers[1], numbers[2], numbers[3], numbers[4])
     else:
         return None

@@ -273,7 +273,7 @@ def test_crop_image_refuses_bytes_that_are_not_an_image() -> None:
 
 _RUN = "99999999-9999-4999-8999-999999999999"
 _SHA_A, _SHA_B = "a" * 16, "b" * 16
-_DOC_CROP = f".tool_results/{_RUN}/crops/{_SHA_A}/{_SHA_B}/_u5/page-2-100-200-600-500.jpg"
+_DOC_CROP = f".tool_results/{_RUN}/crops/{_SHA_A}/{_SHA_B}/_u5/page-2-100-200-600-500-d289.jpg"
 _IMAGE_CROP = f".tool_results/{_RUN}/crops/{_SHA_A}/0-0-541-371.jpg"
 
 
@@ -292,6 +292,10 @@ def test_both_crop_shapes_are_platform_renders(rel: str) -> None:
         f".tool_results/{_RUN}/crops/{_SHA_A}/0-0-541-371.png",
         f".tool_results/{_RUN}/crops/{_SHA_A}/0-0-541-371.jpg\n",
         f".tool_results/{_RUN}/crops/{_SHA_A}/{_SHA_B}/_u5/page-2.jpg",
+        # 文档页的局部必须带实际 dpi(review round 2 N2):没有 dpi 的老写法不认。
+        f".tool_results/{_RUN}/crops/{_SHA_A}/{_SHA_B}/_u5/page-2-100-200-600-500.jpg",
+        f".tool_results/{_RUN}/crops/{_SHA_A}/{_SHA_B}/_u5/page-2-100-200-600-500-d0.jpg",
+        f".tool_results/{_RUN}/crops/{_SHA_A}/{_SHA_B}/_u5/page-2-100-200-600-500-d12345.jpg",
         f".tool_results/{_RUN}/figures/{_SHA_A}/0-0-541-371.jpg",
         f"x/.tool_results/{_RUN}/crops/{_SHA_A}/0-0-541-371.jpg",
     ],
@@ -639,7 +643,7 @@ async def test_auto_on_a_document_page_reads_bands_and_the_whole_page_in_paralle
             "The glucose looks like 5.8."
             if not _is_band(ref)
             else _found("5.6", unit="mmol/L", label="GLU")
-            if ref.endswith(f"-{third}.jpg")
+            if ref.endswith(f"-{third}-d300.jpg")
             else NOT_FOUND
         ),
         usage={"input_tokens": 1400, "output_tokens": 5, "total_tokens": 1405},
@@ -1138,7 +1142,7 @@ def test_a_page_and_its_crop_take_separate_slots() -> None:
     base = f"agents/{_KEY}/.tool_results/{_RUN}"
     page = workspace_figure_ref(tenant, user, f"{base}/figures/{_SHA_A}/{_SHA_B}/_u2/page-2.jpg")
     crop = workspace_figure_ref(
-        tenant, user, f"{base}/crops/{_SHA_A}/{_SHA_B}/_u2/page-2-0-0-500-500.jpg"
+        tenant, user, f"{base}/crops/{_SHA_A}/{_SHA_B}/_u2/page-2-0-0-500-500-d200.jpg"
     )
     block = figure_block_message(
         viewed=[page, crop],

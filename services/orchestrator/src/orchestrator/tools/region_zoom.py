@@ -17,7 +17,6 @@ from __future__ import annotations
 
 import io
 import math
-import threading
 from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Final, Literal
@@ -43,6 +42,14 @@ AUTO_BAND_OVERLAP: Final = 0.12
 #: 2480 x 3508(约 870 万像素)—— 验证用的合成化验单就是这个尺寸。文档页没有「原像素」(矢量),
 #: 已有的整页渲染只有 100 dpi(A4 约 97 万像素),拿它比门槛会把每一页都当成小图。
 DOCUMENT_ZOOM_DPI: Final = 300
+#: 横条的上限(review round 2 N2):文档页的横条按 300 dpi 渲,但大幅面的页(A0、海报)会因此出
+#: 几千万像素的图 —— 每条不超过 300 万像素、长边不超过 4000 像素(厂商单边上限 8000 留一半余量),
+#: 超了就降 dpi。门槛仍按 300 dpi 的页面像素算。
+MAX_BAND_PIXELS: Final = 3_000_000
+MAX_SIDE_PIXELS: Final = 4_000
+#: 宽:高超过 4:1 的图改切竖条(整高、沿宽度切);每条长边:短边尽量不超过 8(条太细时少切几条)。
+VERTICAL_BANDS_ASPECT: Final = 4.0
+MAX_BAND_ASPECT: Final = 8.0
 #: 文档页的局部按这个像素数选分辨率(约 1.5 百万像素),上限 400 dpi。
 REGION_TARGET_PIXELS: Final = 1_500_000
 MAX_REGION_DPI: Final = 400
@@ -121,19 +128,79 @@ def band_count(pixels: int) -> int:
     return max(AUTO_MIN_BANDS, min(AUTO_MAX_BANDS, wanted))
 
 
-def auto_bands(count: int) -> tuple[Tile, ...]:
-    """``count`` 条整宽横条,从上到下,相邻两条重叠不少于条高的 :data:`AUTO_BAND_OVERLAP`
-    (起点向下取整、终点向上取整),合起来盖满整个高度。"""
-    height = REGION_SCALE / (count - (count - 1) * AUTO_BAND_OVERLAP)
-    step = height * (1 - AUTO_BAND_OVERLAP)
-    bands: list[Tile] = []
+BandAxis = Literal["x", "y"]
+
+
+def _band_spans(count: int) -> list[tuple[int, int]]:
+    """沿一条边切 ``count`` 段,相邻两段重叠不少于段长的 :data:`AUTO_BAND_OVERLAP`
+    (起点向下取整、终点向上取整),合起来盖满整条边。"""
+    length = REGION_SCALE / (count - (count - 1) * AUTO_BAND_OVERLAP)
+    step = length * (1 - AUTO_BAND_OVERLAP)
+    spans: list[tuple[int, int]] = []
     for index in range(count):
-        top = math.floor(index * step)
-        bottom = min(REGION_SCALE, math.ceil(index * step + height))
-        if index == count - 1:
-            bottom = REGION_SCALE
-        bands.append(Tile(label=f"band {index + 1}", box=(0, top, REGION_SCALE, bottom)))
+        start = math.floor(index * step)
+        end = (
+            REGION_SCALE
+            if index == count - 1
+            else min(REGION_SCALE, math.ceil(index * step + length))
+        )
+        spans.append((start, end))
+    return spans
+
+
+def auto_bands(count: int, axis: BandAxis = "y") -> tuple[Tile, ...]:
+    """``count`` 条横条(``axis="y"``:整宽、从上到下)或竖条(``axis="x"``:整高、从左到右)。"""
+    bands: list[Tile] = []
+    for index, (start, end) in enumerate(_band_spans(count)):
+        box = (0, start, REGION_SCALE, end) if axis == "y" else (start, 0, end, REGION_SCALE)
+        bands.append(Tile(label=f"band {index + 1}", box=box))
     return tuple(bands)
+
+
+def _band_aspect(size: tuple[int, int], count: int, axis: BandAxis) -> float:
+    width, height = size
+    share = 1 / (count - (count - 1) * AUTO_BAND_OVERLAP)
+    band = (width, height * share) if axis == "y" else (width * share, height)
+    return max(band) / max(min(band), 1e-9)
+
+
+def plan_bands(size: tuple[int, int], pixels: int) -> tuple[Tile, ...]:
+    """这张图怎么切:宽:高超过 4:1 切竖条,否则横条;条数按像素定,条太细(长:短 > 8)就少切几条,
+    最少 :data:`AUTO_MIN_BANDS` 条。``size`` 只用来看比例(文档页给 100 dpi 的整页尺寸即可)。"""
+    width, height = size
+    axis: BandAxis = "x" if height > 0 and width > VERTICAL_BANDS_ASPECT * height else "y"
+    count = band_count(pixels)
+    while count > AUTO_MIN_BANDS and _band_aspect(size, count, axis) > MAX_BAND_ASPECT:
+        count -= 1
+    return auto_bands(count, axis)
+
+
+def _box_size_at(page_px: tuple[int, int], box: Box, *, base_dpi: int) -> tuple[float, float]:
+    """框在 ``base_dpi`` 下的像素宽高。"""
+    x1, y1, x2, y2 = box
+    return (
+        page_px[0] * (x2 - x1) / REGION_SCALE,
+        page_px[1] * (y2 - y1) / REGION_SCALE,
+    )
+
+
+def _capped_dpi(page_px: tuple[int, int], box: Box, *, base_dpi: int, pixels: int) -> float:
+    """让这个框不超过 ``pixels`` 像素、长边不超过 :data:`MAX_SIDE_PIXELS` 的最大 dpi。
+
+    像素框向外取整会多出一两行像素,所以两条线各留一点余量。"""
+    width, height = _box_size_at(page_px, box, base_dpi=base_dpi)
+    if width <= 0 or height <= 0:
+        return float(MAX_REGION_DPI)
+    by_area = base_dpi * math.sqrt(pixels * 0.99 / (width * height))
+    by_side = base_dpi * (MAX_SIDE_PIXELS - 4) / max(width, height)
+    return min(by_area, by_side)
+
+
+def band_dpi(page_px: tuple[int, int], box: Box, *, base_dpi: int) -> int:
+    """文档页的一条横条按多少 dpi 渲::data:`DOCUMENT_ZOOM_DPI`,超过每条 300 万像素或长边 4000
+    像素就降下来。"""
+    capped = _capped_dpi(page_px, box, base_dpi=base_dpi, pixels=MAX_BAND_PIXELS)
+    return max(1, math.floor(min(DOCUMENT_ZOOM_DPI, capped)))
 
 
 def region_dpi(page_px: tuple[int, int], box: Box, *, base_dpi: int) -> int:
@@ -147,7 +214,9 @@ def region_dpi(page_px: tuple[int, int], box: Box, *, base_dpi: int) -> int:
     if area_at_base <= 0:
         return MAX_REGION_DPI
     dpi = base_dpi * math.sqrt(REGION_TARGET_PIXELS / area_at_base)
-    return max(1, min(MAX_REGION_DPI, math.floor(dpi)))
+    # 又细又长的框(整宽的一窄条)按面积定会出上万像素宽的图:长边也不超过 4000 像素。
+    side = _capped_dpi(page_px, box, base_dpi=base_dpi, pixels=MAX_BAND_PIXELS)
+    return max(1, min(MAX_REGION_DPI, math.floor(min(dpi, side))))
 
 
 def pixel_box(box: Box, size: tuple[float, float]) -> tuple[int, int, int, int]:
@@ -180,10 +249,10 @@ _UPRIGHT_METHODS: Final[dict[int, Image.Transpose]] = {
 OPEN_FORMATS: Final = ("PNG", "JPEG", "WEBP", "GIF")
 #: JPEG 缩小解码可选的倍数(libjpeg 的 DCT 缩放),从大往小试。
 _JPEG_DRAFT_SCALES: Final = (8, 4, 2)
-#: 进程内同时在做的宿主裁图上限:一张 6000 万像素的图解开就是几百 MB,
-#: 并行的 ``ask_image`` 不许一起解。阻塞在线程里等(调用方本来就在线程里跑)。
+#: 进程内同时在做的宿主裁图上限:一张 6000 万像素的图解开就是几百 MB,并行的 ``ask_image``
+#: 不许一起解。闸在调用方(``tools.vision``)进线程**之前**用 ``asyncio.Semaphore`` 拿,
+#: 线程池里的线程从不阻塞着等(review round 2 g)。
 HOST_CROP_SLOTS: Final = 2
-_HOST_CROP_SEMAPHORE = threading.BoundedSemaphore(HOST_CROP_SLOTS)
 
 
 def image_size(data: bytes) -> tuple[int, int] | None:
@@ -209,7 +278,7 @@ def crop_image(data: bytes, boxes: Sequence[Box]) -> list[CroppedImage]:
     """按原像素裁出每个框(不放大;超过约 1.5 百万像素的缩到那个量),存成 JPEG。
 
     省内存(一张 6000 万像素的 RGBA PNG 整张转一次就是几百 MB):
-    * 进程内最多 :data:`HOST_CROP_SLOTS` 张同时在裁;
+    * 进程内最多 :data:`HOST_CROP_SLOTS` 张同时在裁(闸在调用方);
     * EXIF 方向不转整张图:把框换算到原图坐标、裁下来之后只转这一小块;
     * 转 RGB / 铺白底只对裁下来的那一小块做;
     * JPEG 在每一块都还够 :data:`REGION_TARGET_PIXELS` 的前提下用 ``draft`` 缩小解码。
@@ -217,15 +286,14 @@ def crop_image(data: bytes, boxes: Sequence[Box]) -> list[CroppedImage]:
     解码前先看像素数:超过 :data:`MAX_DECODE_PIXELS` 不解码,抛 :class:`RegionImageError`。
     同步、吃 CPU —— 调用方放到线程里跑。
     """
-    with _HOST_CROP_SEMAPHORE:
-        try:
-            with Image.open(io.BytesIO(data), formats=OPEN_FORMATS) as image:
-                return _crop_open_image(image, boxes)
-        except RegionImageError:
-            raise
-        except (UnidentifiedImageError, OSError, Image.DecompressionBombError) as exc:
-            msg = f"the image could not be decoded for cropping ({type(exc).__name__})"
-            raise RegionImageError(msg) from exc
+    try:
+        with Image.open(io.BytesIO(data), formats=OPEN_FORMATS) as image:
+            return _crop_open_image(image, boxes)
+    except RegionImageError:
+        raise
+    except (UnidentifiedImageError, OSError, Image.DecompressionBombError) as exc:
+        msg = f"the image could not be decoded for cropping ({type(exc).__name__})"
+        raise RegionImageError(msg) from exc
 
 
 def _crop_open_image(image: Image.Image, boxes: Sequence[Box]) -> list[CroppedImage]:
@@ -303,11 +371,16 @@ def _raw_point(x: int, y: int, orientation: int, raw: tuple[int, int]) -> tuple[
 
 
 def _capped(width: int, height: int) -> tuple[int, int]:
-    """超过约 1.5 百万像素就等比缩到那个量(看图模型反正会压);从不放大。"""
+    """超过约 1.5 百万像素、或长边超过 :data:`MAX_SIDE_PIXELS`,就等比缩到线内(看图模型反正会压);
+    从不放大。"""
     pixels = width * height
-    if pixels <= REGION_TARGET_PIXELS:
+    factor = min(
+        1.0,
+        math.sqrt(REGION_TARGET_PIXELS / pixels) if pixels else 1.0,
+        MAX_SIDE_PIXELS / max(width, height, 1),
+    )
+    if factor >= 1.0:
         return width, height
-    factor = math.sqrt(REGION_TARGET_PIXELS / pixels)
     return max(1, math.floor(width * factor)), max(1, math.floor(height * factor))
 
 

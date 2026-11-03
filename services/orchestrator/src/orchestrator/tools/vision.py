@@ -82,17 +82,18 @@ from orchestrator.tools.region_zoom import (
     AUTO_GATE_PIXELS,
     AUTO_REGION,
     DOCUMENT_ZOOM_DPI,
+    HOST_CROP_SLOTS,
     LARGE_IMAGE_PIXELS,
     REGION_HINT,
     Box,
+    CroppedImage,
     Region,
     Tile,
-    auto_bands,
-    band_count,
     crop_image,
     crop_output_size,
     image_size,
     parse_region,
+    plan_bands,
 )
 from orchestrator.tools.registry import ToolBlockedError, ToolContext, ToolResult, ToolSpec
 from orchestrator.tools.tile_reading import (
@@ -176,6 +177,22 @@ _TILE_SLOTS: weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, asyncio.Semaph
 )
 
 
+#: B-266 review round 2 g —— 宿主裁图的进程内名额(:data:`HOST_CROP_SLOTS`),在**进线程之前**
+#: 用 ``asyncio.Semaphore`` 拿:线程池里的线程从不阻塞着等。信号量绑定在创建它的循环上,按循环各一个。
+_HOST_CROP_GATES: weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, asyncio.Semaphore] = (
+    weakref.WeakKeyDictionary()
+)
+
+
+async def _crop_in_thread(data: bytes, boxes: Sequence[Box]) -> list[CroppedImage]:
+    loop = asyncio.get_running_loop()
+    gate = _HOST_CROP_GATES.get(loop)
+    if gate is None:
+        gate = _HOST_CROP_GATES[loop] = asyncio.Semaphore(HOST_CROP_SLOTS)
+    async with gate:
+        return await asyncio.to_thread(crop_image, data, boxes)
+
+
 def _tile_slots() -> asyncio.Semaphore:
     """本事件循环的切块调用闸(信号量绑定在创建它的循环上,所以按循环各一个)。"""
     loop = asyncio.get_running_loop()
@@ -226,7 +243,7 @@ class PageRenderer(Protocol):
         figure_ref: str,
         boxes: Sequence[Box],
         ctx: ToolContext,
-        dpi: int | None = None,
+        bands: bool = False,
     ) -> RegionRender:
         """B-266 —— 这一页(``figure_ref`` 是它的整页渲染)按 ``boxes`` 各渲一张高分辨率局部。"""
 
@@ -513,7 +530,7 @@ class AskImageTool:
         3. 最终答案见 :func:`~orchestrator.tools.tile_reading.decide_auto`。横条与整张读全失败
            才报错,与整页看失败同一种错误。
         """
-        pixels, document = await self._zoom_pixels(located)
+        pixels, size, document = await self._zoom_pixels(located)
         meta: dict[str, Any] = {"region": AUTO_REGION, "depth": "quick", "auto_pixels": pixels}
         if requested_depth != "quick":
             meta["depth_ignored"] = requested_depth
@@ -528,13 +545,15 @@ class AskImageTool:
                 f"({pixels / 1_000_000:.1f} MP) to read whole, so it was read whole.)"
             )
             return content, meta
-        bands = auto_bands(band_count(pixels or 0))
-        rendered = await self._crops(
-            located,
-            [band.box for band in bands],
-            ctx=ctx,
-            dpi=DOCUMENT_ZOOM_DPI if document else None,
-        )
+        bands = plan_bands(size or (1, 1), pixels or 0)
+        try:
+            rendered = await self._crops(
+                located, [band.box for band in bands], ctx=ctx, bands=document
+            )
+        except Exception as exc:
+            # review round 2 d —— 横条渲不出来(渲染失败、文档改过、图解不开……):仍整张读一次,
+            # 明说不确定与原因;整张读也失败才报错。
+            return await self._auto_without_bands(located, question, exc, meta=meta, ctx=ctx)
         crop_by_box = {crop.box: crop for crop in rendered.crops}
         render_failed = dict(rendered.failed)
         looked = [band for band in bands if band.box in crop_by_box]
@@ -617,11 +636,47 @@ class AskImageTool:
             return None, "no text", None
         return text, None, None
 
-    async def _zoom_pixels(self, located: _Located) -> tuple[int | None, bool]:
-        """``region="auto"`` 门槛用的像素数,以及这是不是一张文档页。
+    async def _auto_without_bands(
+        self,
+        located: _Located,
+        question: str,
+        error: Exception,
+        *,
+        meta: dict[str, Any],
+        ctx: ToolContext,
+    ) -> tuple[str, dict[str, Any]]:
+        """横条准备不出来时:整张快看一次,标不确定并说原因;这一次也失败就报它(原因链上挂横条的错)。"""
+        try:
+            look = await self._look(located.ref, question, depth="quick", ctx=ctx)
+        except Exception as full_error:
+            raise full_error from error
+        ask_image_region_auto_total.labels(path="full_fallback", reason="bands_unavailable").inc()
+        reason = f"{type(error).__name__}: {error}"
+        meta.update(
+            {
+                "auto": "full_fallback",
+                "auto_reason": "bands_unavailable",
+                "bands_error": reason[:RAW_META_CHARS],
+                "vl_calls": 1,
+            }
+        )
+        if look.usage:
+            meta["vl_usage"] = look.usage
+        content = (
+            f"{look.answer}\n\n(region='auto': whole-image reading; small print may be unreliable "
+            f"- the bands could not be prepared ({reason}). Re-ask with an explicit region, or say "
+            "the value is uncertain.)"
+        )
+        return content, meta
+
+    async def _zoom_pixels(
+        self, located: _Located
+    ) -> tuple[int | None, tuple[int, int] | None, bool]:
+        """``region="auto"`` 门槛用的像素数、图的(转正后)尺寸,以及这是不是一张文档页。
 
         图片:转正后的原像素。文档页(``path`` + ``unit``):按 :data:`DOCUMENT_ZOOM_DPI` 放大
-        之后的页面像素 —— 已有的整页渲染是 100 dpi,乘 (300/100)^2。读不出尺寸就是 ``None``。"""
+        之后的页面像素 —— 已有的整页渲染是 100 dpi,乘 (300/100)^2;尺寸给 100 dpi 的(只用来
+        看宽高比)。读不出尺寸就是 ``None``。"""
         source = located.resolved_from or {}
         document = (
             isinstance(source.get("path"), str)
@@ -632,11 +687,11 @@ class AskImageTool:
             size = image_size((await self.image_resolver.resolve(located.ref)).data)
         except Exception:
             logger.debug("ask_image.zoom_pixels_unknown", exc_info=True)
-            return None, document
+            return None, None, document
         if size is None:
-            return None, document
+            return None, None, document
         scale = (DOCUMENT_ZOOM_DPI / RENDER_DPI) ** 2 if document else 1
-        return round(size[0] * size[1] * scale), document
+        return round(size[0] * size[1] * scale), size, document
 
     async def _ask_tile(self, messages: Sequence[BaseMessage], *, ctx: ToolContext) -> AIMessage:
         """一块的快看:先排进 :data:`MAX_TILE_CALLS_IN_FLIGHT` 个名额里,排队不超过单次调用的上限
@@ -684,7 +739,7 @@ class AskImageTool:
         boxes: Sequence[Box],
         *,
         ctx: ToolContext,
-        dpi: int | None = None,
+        bands: bool = False,
     ) -> RegionRender:
         """B-266 —— 按 ``boxes`` 裁出局部:文档页(``path`` + ``unit``)在沙箱里按区域高分辨率渲,
         别的图(上传图、工作区图片)在宿主按原像素裁。都落本对话 ``.tool_results/<run>/crops/``。"""
@@ -696,7 +751,7 @@ class AskImageTool:
                 raise ToolBlockedError(msg)
             async with self._render_lock((ctx.run_id, path)):
                 return await self.page_renderer.render_regions(
-                    path=path, figure_ref=located.ref, boxes=boxes, ctx=ctx, dpi=dpi
+                    path=path, figure_ref=located.ref, boxes=boxes, ctx=ctx, bands=bands
                 )
         return await self._crop_image(located.ref, boxes, ctx=ctx)
 
@@ -729,11 +784,7 @@ class AskImageTool:
             existing = await lister.entries_if_present(out_dir)
             reusable = {n for n in names if n in existing and not existing[n].is_dir}
             todo = [box for box in boxes if region_crop_stem(box) + ".jpg" not in reusable]
-            pieces = (
-                dict(zip(todo, await asyncio.to_thread(crop_image, data, todo), strict=True))
-                if todo
-                else {}
-            )
+            pieces = dict(zip(todo, await _crop_in_thread(data, todo), strict=True)) if todo else {}
             size = image_size(data) if reusable else None
             for box in boxes:
                 rel = f"{out_dir}/{region_crop_stem(box)}.jpg"
@@ -768,7 +819,7 @@ class AskImageTool:
         figure = parse_rendered_figure_ref(located.ref)
         if figure is not None and figure.region is not None:
             return False
-        pixels, _document = await self._zoom_pixels(located)
+        pixels, _size, _document = await self._zoom_pixels(located)
         return pixels is not None and pixels >= LARGE_IMAGE_PIXELS
 
     async def _ask(
