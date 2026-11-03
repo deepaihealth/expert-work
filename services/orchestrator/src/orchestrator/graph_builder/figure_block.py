@@ -64,10 +64,20 @@ class _Figure:
     page: int
     #: 这张渲染页的**用户根相对**路径(``agents/<key>/`` 前缀在内)—— 核对新鲜度时要 stat 它。
     rel: str
+    #: B-266 —— ``read_page(region=…)`` 的局部图:裁的框(0-1000)。整页是 ``None``。
+    region: tuple[int, int, int, int] | None = None
 
     @property
-    def slot(self) -> tuple[str, int]:
-        return (self.doc_sha, self.unit)
+    def slot(self) -> tuple[str, int, tuple[int, int, int, int] | None]:
+        # 同一页的局部图与整页、不同框的局部图各占一个槽。
+        return (self.doc_sha, self.unit, self.region)
+
+    @property
+    def label(self) -> str:
+        """文字段里这一张怎么称呼:``第 N 页``,局部图再带上框。"""
+        if self.region is None:
+            return f"第 {self.page} 页"
+        return f"第 {self.page} 页的局部 {list(self.region)}"
 
 
 def _own_figure(
@@ -109,6 +119,7 @@ def _own_figure(
         render_sha=figure.render_sha,
         page=figure.page,
         rel=parsed.rel,
+        region=figure.region,
     )
 
 
@@ -191,9 +202,12 @@ def _placeholder_lines(
     """
     retired: dict[str, list[int]] = {}
     old_versions: dict[str, list[int]] = {}
+    retired_regions: set[str] = set()
     for i, (current, older) in enumerate(slots):
         if i < live_from:
             retired.setdefault(current.doc_sha, []).append(current.unit)
+            if current.region is not None:
+                retired_regions.add(current.doc_sha)
         if older:
             old_versions.setdefault(current.doc_sha, []).append(current.unit)
     lines: list[str] = []
@@ -204,9 +218,11 @@ def _placeholder_lines(
         path_hint = "这个路径" if path is not None else "你当初调用 read_page 时传的那个路径"
         parts: list[str] = []
         if doc_sha in retired:
+            # B-266 —— 退役的是局部图时,提醒重看要带上 region(框不在这行里,模型自己记得)。
+            region_hint = ";局部图再带上 region" if doc_sha in retired_regions else ""
             parts.append(
                 f"编号 {_unit_ranges(retired[doc_sha])} 的图已退出上下文"
-                f"(需要重看就调用 read_page,path 填{path_hint},units 填要看的编号)"
+                f"(需要重看就调用 read_page,path 填{path_hint},units 填要看的编号{region_hint})"
             )
         if doc_sha in old_versions:
             parts.append(
@@ -368,7 +384,7 @@ def figure_block_message(
     groups: list[str] = []
     for doc_sha in doc_order:
         path = _document_path(doc_sha, documents, view)
-        pages = "、".join(f"第 {f.page} 页" for f in live if f.doc_sha == doc_sha)
+        pages = "、".join(f.label for f in live if f.doc_sha == doc_sha)
         groups.append(f"{_quote_path(path)} {pages}" if path is not None else pages)
     if live:
         lines.append(f"下面依次附上 {len(live)} 张:" + ";".join(groups) + "。")

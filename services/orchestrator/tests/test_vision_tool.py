@@ -476,6 +476,8 @@ async def test_ask_image_short_form_resolves_the_rendered_page(tmp_path: Path) -
 
     expected = workspace_figure_ref(tenant, user, f"agents/{_AGENT}/{rel}")
     assert _sent_ref(vl) == expected
+    # B-266 —— 这里的「渲染页」只是几个字节、读不出尺寸,所以不加 region='auto' 的提示
+    # (提示与 auto 的门槛同一个判据;有真页的用例在 test_b266_region_zoom)。
     assert result.content == "血糖曲线"
     assert result.meta["image_ref"] == expected
     assert result.meta["resolved_from"] == {"path": _DOC, "unit": 10}
