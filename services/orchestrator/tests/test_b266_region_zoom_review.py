@@ -314,12 +314,24 @@ async def test_a_child_may_look_at_its_root_conversations_upload() -> None:
 class _CountingVL(_VL):
     in_flight: int = 0
     peak: int = 0
+    #: 给了就把每个调用挡住,直到同时在飞的达到这个数才一起放行(最多等 10 s),峰值不再取决于
+    #: 机器快慢:CI 上 0.05 s 的固定停顿不够让 15 个调用叠满 12 个名额。
+    release_at: int | None = None
+    _go: asyncio.Event | None = None
 
     async def __call__(self, *, messages: Sequence[BaseMessage], tools: Sequence[Any]) -> AIMessage:
         self.in_flight += 1
         self.peak = max(self.peak, self.in_flight)
         try:
-            await asyncio.sleep(0.05)
+            if self.release_at is None:
+                await asyncio.sleep(0.05)
+            else:
+                if self._go is None:
+                    self._go = asyncio.Event()
+                if self.in_flight >= self.release_at:
+                    self._go.set()
+                with contextlib.suppress(TimeoutError):
+                    await asyncio.wait_for(self._go.wait(), timeout=10)
             return await super().__call__(messages=messages, tools=tools)
         finally:
             self.in_flight -= 1
@@ -349,7 +361,7 @@ async def test_parallel_auto_looks_keep_at_most_twelve_calls_in_flight(
     tmp_path: Path,
 ) -> None:
     """每次 N+1 个调用(4 条横条 + 整张读),3 次并行共 15 个:同时在飞的不超过 12 个。"""
-    vl = _CountingVL(answer=lambda _ref: "NOT_FOUND")
+    vl = _CountingVL(answer=lambda _ref: "NOT_FOUND", release_at=vision.MAX_TILE_CALLS_IN_FLIGHT)
     up = _upload(tmp_path, vl, size=_BIG)
     args = {"image_ref": up.ref, "question": "?", "region": "auto"}
 
