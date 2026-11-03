@@ -879,3 +879,28 @@ async def test_upload_rejects_decompression_bomb_with_413(setup: Setup) -> None:
     assert response.status_code == 413
     assert "pixel" in response.json()["detail"]
     assert await store.list_prefix(f"{_TENANT}/uploads/{thread_id}/") == []
+
+
+@pytest.mark.asyncio
+async def test_upload_rejects_over_cap_png_with_413(setup: Setup) -> None:
+    """B-263:8000 x 8000 的 PNG 超 6000 万像素上限、但没到 Pillow 炸弹阈值 —— PNG 不缩小,回 413。"""
+
+    def chunk(kind: bytes, data: bytes) -> bytes:
+        return (
+            struct.pack(">I", len(data)) + kind + data + struct.pack(">I", zlib.crc32(kind + data))
+        )
+
+    over_cap = (
+        b"\x89PNG\r\n\x1a\n"
+        + chunk(b"IHDR", struct.pack(">IIBBBBB", 8_000, 8_000, 1, 0, 0, 0, 0))
+        + chunk(b"IDAT", zlib.compress(b""))
+        + chunk(b"IEND", b"")
+    )
+    client, thread_id, store = setup
+    response = await client.post(
+        f"/v1/sessions/{thread_id}/uploads",
+        files={"file": ("poster.png", over_cap, "image/png")},
+    )
+    assert response.status_code == 413
+    assert "pixel" in response.json()["detail"]
+    assert await store.list_prefix(f"{_TENANT}/uploads/{thread_id}/") == []

@@ -8,9 +8,10 @@ import zlib
 from io import BytesIO
 
 import pytest
-from PIL import Image
+from PIL import Image, JpegImagePlugin
 
 from control_plane.api._image_sanitize import ImageSanitizeError, ImageTooLargeError, strip_exif
+from control_plane.knowledge.recognition.figure_images import MAX_DECODE_PIXELS
 
 
 def _png_with_metadata() -> bytes:
@@ -305,3 +306,157 @@ def test_strip_exif_removes_gif_comment() -> None:
     sanitised = strip_exif(buf.getvalue(), mime_type="image/gif")
 
     assert b"expert-work-test-gif-comment" not in sanitised
+
+
+# ---------------------------------------------------------------------------
+# B-263 —— 超过像素上限的 JPEG 用 ``draft`` 按 1/2、1/4、1/8 缩小解码,不整张解开
+# ---------------------------------------------------------------------------
+
+#: 竖拍的正图 6000 x 10800 = 6480 万像素,超过上限;缩到 1/2 后 1620 万。
+_BIG_UPRIGHT = (6000, 10800)
+_BIG_DARK, _BIG_MID, _BIG_LIGHT = 0, 60, 200
+
+
+def _big_camera_jpeg(orientation: int | None) -> bytes:
+    """超上限的灰度 JPEG:正图上半浅、下半深,左上角一块黑;按方向标签存成相机的样子。
+
+    先画 60 x 108 的小图再最近邻放大,内存只占一份大图(灰度 6480 万字节)。"""
+    small = Image.new("L", (60, 108), _BIG_LIGHT)
+    small.paste(_BIG_MID, (0, 54, 60, 108))
+    small.paste(_BIG_DARK, (0, 0, 20, 18))
+    if orientation is not None:
+        small = small.transpose(_STORED_TRANSPOSE_BY_ORIENTATION[orientation])
+    width, height = _BIG_UPRIGHT
+    stored_size = (height, width) if orientation in (6, 8) else _BIG_UPRIGHT
+    big = small.resize(stored_size, Image.Resampling.NEAREST)
+    exif = Image.Exif()
+    if orientation is not None:
+        exif[_ORIENTATION_TAG] = orientation
+    buf = BytesIO()
+    big.save(buf, format="JPEG", quality=75, exif=exif)
+    return buf.getvalue()
+
+
+def _assert_big_upright(image: Image.Image, size: tuple[int, int]) -> None:
+    width, height = size
+    assert image.size == size
+    gray = image.convert("L")
+    for point, expected in (
+        ((width // 6, height // 12), _BIG_DARK),
+        ((width * 5 // 6, height // 4), _BIG_LIGHT),
+        ((width // 2, height * 3 // 4), _BIG_MID),
+    ):
+        actual = gray.getpixel(point)
+        assert isinstance(actual, (int, float))
+        assert abs(actual - expected) <= 40, (point, actual, expected)
+
+
+def _record_jpeg_decode_sizes(monkeypatch: pytest.MonkeyPatch) -> list[tuple[int, int]]:
+    """记下每次 JPEG 真正解码出来的像素尺寸 —— 先整张解开再缩小的实现在这里现形。"""
+    decoded: list[tuple[int, int]] = []
+    original_load = JpegImagePlugin.JpegImageFile.load
+
+    def spy_load(self: JpegImagePlugin.JpegImageFile) -> object:
+        # ``tile`` 非空 = 这次真去解码;已解过的再调 ``load()`` 是空操作,不记。
+        decoding = bool(self.tile)
+        result = original_load(self)
+        if decoding:
+            decoded.append(self.im.size)
+        return result
+
+    monkeypatch.setattr(JpegImagePlugin.JpegImageFile, "load", spy_load)
+    return decoded
+
+
+def test_strip_exif_shrinks_over_cap_jpeg_instead_of_refusing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    decoded = _record_jpeg_decode_sizes(monkeypatch)
+    width, height = _BIG_UPRIGHT
+    assert width * height > MAX_DECODE_PIXELS
+
+    sanitised = strip_exif(_big_camera_jpeg(None), mime_type="image/jpeg")
+
+    # 解码就是 1/2 尺寸,从没整张解开。
+    assert decoded == [(width // 2, height // 2)]
+    decoded.clear()
+    with Image.open(BytesIO(sanitised)) as image:
+        image.load()
+        assert image.format == "JPEG"
+        assert image.width * image.height <= MAX_DECODE_PIXELS
+        _assert_big_upright(image, (width // 2, height // 2))
+
+
+def test_strip_exif_shrinks_over_cap_jpeg_and_still_rotates_it_upright(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """方向 6:相机存的是 10800 x 6000;先缩小解码再转正,得到 3000 x 5400 的正图。"""
+    decoded = _record_jpeg_decode_sizes(monkeypatch)
+    width, height = _BIG_UPRIGHT
+
+    sanitised = strip_exif(_big_camera_jpeg(6), mime_type="image/jpeg")
+
+    assert decoded == [(height // 2, width // 2)]
+    with Image.open(BytesIO(sanitised)) as image:
+        image.load()
+        assert image.getexif().get(_ORIENTATION_TAG) is None
+        _assert_big_upright(image, (width // 2, height // 2))
+
+
+def _jpeg_header_only(width: int, height: int) -> bytes:
+    """只有 SOF / SOS 段的 JPEG:声明尺寸,没有像素数据。"""
+
+    def segment(marker: bytes, data: bytes) -> bytes:
+        return b"\xff" + marker + struct.pack(">H", len(data) + 2) + data
+
+    sof = struct.pack(">BHHB", 8, height, width, 3) + b"".join(
+        bytes([component, 0x11, 0]) for component in (1, 2, 3)
+    )
+    sos = (
+        bytes([3]) + b"".join(bytes([component, 0]) for component in (1, 2, 3)) + bytes([0, 63, 0])
+    )
+    return b"\xff\xd8" + segment(b"\xc0", sof) + segment(b"\xda", sos) + b"\xff\xd9"
+
+
+def test_strip_exif_picks_smallest_draft_scale_that_fits(monkeypatch: pytest.MonkeyPatch) -> None:
+    """2 万 x 2 万:1/2 还有 1 亿像素,1/4 才进上限 —— 选 1/4,不多缩。
+
+    默认的 Pillow 炸弹阈值(约 1.79 亿)会在 ``Image.open`` 就拦下这张图,这里放开阈值单测选档。"""
+    monkeypatch.setattr(Image, "MAX_IMAGE_PIXELS", None)
+    drafted: list[tuple[int, int]] = []
+    original_draft = JpegImagePlugin.JpegImageFile.draft
+
+    def spy_draft(
+        self: JpegImagePlugin.JpegImageFile, mode: str | None, size: tuple[int, int] | None
+    ) -> object:
+        result = original_draft(self, mode, size)
+        drafted.append(self.size)
+        return result
+
+    monkeypatch.setattr(JpegImagePlugin.JpegImageFile, "draft", spy_draft)
+
+    # 只有文件头、没有像素数据:缩小解码这一步会失败,这里只看选了哪一档。
+    with pytest.raises(ImageSanitizeError):
+        strip_exif(_jpeg_header_only(20_000, 20_000), mime_type="image/jpeg")
+    assert drafted == [(5_000, 5_000)]
+
+
+def test_strip_exif_refuses_jpeg_still_over_cap_at_one_eighth(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """65535 x 65535 缩到 1/8 仍有 6700 万像素:拒收(只有放开炸弹阈值才走得到这里)。"""
+    monkeypatch.setattr(Image, "MAX_IMAGE_PIXELS", None)
+    with pytest.raises(ImageTooLargeError, match="pixel"):
+        strip_exif(_jpeg_header_only(65_535, 65_535), mime_type="image/jpeg")
+
+
+def test_strip_exif_refuses_jpeg_over_pillow_bomb_threshold() -> None:
+    """超过 Pillow 炸弹阈值的 JPEG 在 ``Image.open`` 就抛错,轮不到缩小解码:拒收。"""
+    with pytest.raises(ImageTooLargeError):
+        strip_exif(_jpeg_header_only(20_000, 20_000), mime_type="image/jpeg")
+
+
+def test_strip_exif_still_refuses_over_cap_non_jpeg_headers() -> None:
+    """PNG 没有缩小解码,超上限照旧拒收(不解码)。"""
+    with pytest.raises(ImageTooLargeError, match="pixel"):
+        strip_exif(_png_header_only(8_000, 8_000), mime_type="image/png")

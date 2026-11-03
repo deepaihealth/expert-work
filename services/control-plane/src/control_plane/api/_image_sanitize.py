@@ -19,9 +19,11 @@ B-263 —— 重编码不再丢方向、不再压糊:
 * JPEG 用质量 :data:`JPEG_QUALITY`、WebP 用 :data:`WEBP_QUALITY` 重编码(Pillow 默认 75 / 80
   会把化验单、处方上的小字压糊);色度仍是 4:2:0 —— 手机原图本来就是 4:2:0,改存 4:4:4 补不回
   丢掉的色度,只让文件变大(3000 x 4000 合成照片实测比原图大 1.1~1.4 倍);PNG 无损不变;
-* 解码前按像素数设上限(与知识库图片同一个 :data:`MAX_DECODE_PIXELS`),超过的图不解码、
-  抛 :class:`ImageTooLargeError`(上传接口回 413)—— 字节上限挡不住「几 KB 声明几亿像素」的
-  解压炸弹;
+* 解码前按像素数设上限(与知识库图片同一个 :data:`MAX_DECODE_PIXELS`)—— 字节上限挡不住
+  「几 KB 声明几亿像素」的解压炸弹。超过上限的 JPEG 用 Pillow 的 ``draft`` 按 1/2、1/4、1/8
+  缩小解码(DCT 阶段直接出小图,整张图从不在内存里展开),取能进上限的最小缩小倍数;其它格式
+  没有缩小解码,超过就不解码、抛 :class:`ImageTooLargeError`(上传接口回 413)。超过 Pillow
+  炸弹阈值(约 1.79 亿像素)的图在 ``Image.open`` 读文件头时就被拦下,JPEG 也一样拒收;
 * GIF 只保留第一帧(``save`` 不带 ``save_all``):图片是给看图模型看的,看的是静帧。
 """
 
@@ -33,6 +35,9 @@ from typing import Final
 from PIL import Image, ImageOps, UnidentifiedImageError
 
 from control_plane.knowledge.recognition.figure_images import MAX_DECODE_PIXELS
+
+#: JPEG 缩小解码可选的倍数(libjpeg 的 DCT 缩放只支持这几档),从小往大试。
+_JPEG_DRAFT_SCALES: Final = (2, 4, 8)
 
 #: 有损格式的重编码质量(B-263)。
 JPEG_QUALITY: Final = 92
@@ -96,11 +101,8 @@ def strip_exif(raw: bytes, *, mime_type: str) -> bytes:
         raise ImageSanitizeError(msg)
     try:
         with Image.open(BytesIO(raw)) as image:
-            # 只读了文件头:先看声明的像素数,超限就不解码(B-263)。
-            width, height = image.size
-            if width * height > MAX_DECODE_PIXELS:
-                msg = f"image exceeds {MAX_DECODE_PIXELS}-pixel limit"
-                raise ImageTooLargeError(msg)
+            # 只读了文件头:先看声明的像素数,超限的 JPEG 缩小解码、其它格式不解码(B-263)。
+            _fit_pixel_cap(image)
             # Force a full decode so partially-read streams surface here
             # as ``ImageSanitizeError`` rather than later in ``save``.
             image.load()
@@ -129,3 +131,23 @@ def strip_exif(raw: bytes, *, mime_type: str) -> bytes:
     except (UnidentifiedImageError, OSError, ValueError) as exc:
         msg = f"strip_exif: cannot re-encode image as {pil_format}"
         raise ImageSanitizeError(msg) from exc
+
+
+def _fit_pixel_cap(image: Image.Image) -> None:
+    """让接下来的 ``load()`` 解出不超过 :data:`MAX_DECODE_PIXELS` 的像素,做不到就抛
+    :class:`ImageTooLargeError`。只在 ``Image.open`` 之后、``load()`` 之前调用。
+
+    JPEG 用 ``draft`` 选能进上限的最小缩小倍数;``draft`` 之后 ``image.size`` 就是将要解出的
+    尺寸,所以最后按它再核一次 —— ``draft`` 没生效(返回 ``None``)或 1/8 仍超限都在这里拒收。
+    """
+    width, height = image.size
+    if width * height <= MAX_DECODE_PIXELS:
+        return
+    if image.format == "JPEG":
+        for scale in _JPEG_DRAFT_SCALES:
+            if -(-width // scale) * -(-height // scale) <= MAX_DECODE_PIXELS:
+                image.draft(image.mode, (max(1, width // scale), max(1, height // scale)))
+                break
+    if image.width * image.height > MAX_DECODE_PIXELS:
+        msg = f"image exceeds {MAX_DECODE_PIXELS}-pixel limit"
+        raise ImageTooLargeError(msg)
