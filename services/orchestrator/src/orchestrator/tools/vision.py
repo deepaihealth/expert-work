@@ -75,6 +75,7 @@ from orchestrator.tools.read_page import (
     RENDER_DPI,
     RegionCrop,
     RegionRender,
+    RegionStaleError,
     figure_scope,
     workspace_figure_ref,
 )
@@ -89,6 +90,7 @@ from orchestrator.tools.region_zoom import (
     CroppedImage,
     Region,
     Tile,
+    band_axis,
     crop_image,
     crop_output_size,
     image_size,
@@ -550,14 +552,17 @@ class AskImageTool:
             rendered = await self._crops(
                 located, [band.box for band in bands], ctx=ctx, bands=document
             )
+        except RegionStaleError:
+            # 文档在整页渲染之后改过:整张读看的也是那张过期的页,不能拿来回答 —— 与指定框一样报错。
+            raise
         except Exception as exc:
-            # review round 2 d —— 横条渲不出来(渲染失败、文档改过、图解不开……):仍整张读一次,
-            # 明说不确定与原因;整张读也失败才报错。
+            # review round 2 d —— 横条渲不出来(渲染失败、图解不开……):仍整张读一次,明说不确定;
+            # 整张读也失败才报错。
             return await self._auto_without_bands(located, question, exc, meta=meta, ctx=ctx)
         crop_by_box = {crop.box: crop for crop in rendered.crops}
         render_failed = dict(rendered.failed)
         looked = [band for band in bands if band.box in crop_by_box]
-        prompt = tile_question(question)
+        prompt = tile_question(question, band_axis(bands))
         full_call = self._ask_tile(_messages(located.ref, question), ctx=ctx)
         outcomes = await asyncio.gather(
             full_call,
@@ -651,12 +656,16 @@ class AskImageTool:
         except Exception as full_error:
             raise full_error from error
         ask_image_region_auto_total.labels(path="full_fallback", reason="bands_unavailable").inc()
-        reason = f"{type(error).__name__}: {error}"
+        # 异常的文字可能带 NAS 路径之类:给模型与 meta 的只有类型和一句固定的话,细节只进日志。
+        logger.warning(
+            "ask_image.auto_bands_unavailable err=%s", type(error).__name__, exc_info=error
+        )
+        reason = f"{type(error).__name__}: the region render failed"
         meta.update(
             {
                 "auto": "full_fallback",
                 "auto_reason": "bands_unavailable",
-                "bands_error": reason[:RAW_META_CHARS],
+                "bands_error": type(error).__name__,
                 "vl_calls": 1,
             }
         )

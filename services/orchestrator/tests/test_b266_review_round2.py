@@ -11,7 +11,7 @@ from pathlib import Path
 import pytest
 
 from orchestrator.multimodal import parse_rendered_figure_ref
-from orchestrator.tools.read_page import RENDER_DPI, _region_job
+from orchestrator.tools.read_page import RENDER_DPI, RegionStaleError, _region_job
 from orchestrator.tools.region_zoom import (
     AUTO_MIN_BANDS,
     MAX_BAND_ASPECT,
@@ -26,11 +26,14 @@ from orchestrator.tools.region_zoom import (
 )
 from orchestrator.tools.tile_reading import (
     MAX_REPLY_CHARS,
+    TILE_INSTRUCTION,
     TileResult,
     compatible,
     decide_auto,
     parse_reading,
     parse_tile_reply,
+    tile_instruction,
+    tile_question,
 )
 
 from .test_b266_region_zoom import (
@@ -41,13 +44,24 @@ from .test_b266_region_zoom import (
     _crop_path,
     _doc,
     _image_ref_of,
+    _question_of,
     _tools,
+    _upload,
 )
 from .test_read_page import _install_office_stubs
 
 # ---------------------------------------------------------------------------
 # N1 —— 回答先截断,配平扫描是线性的
 # ---------------------------------------------------------------------------
+
+
+def test_a_long_think_block_does_not_push_the_json_past_the_cap() -> None:
+    """round 3 —— 先去 ``<think>`` 再截 4 KB:约 6 KB 的思考后面跟合法 JSON,照样读得出。"""
+    think = "<think>" + "Let me look at the rows one by one. " * 170 + "</think>"
+    assert 5_500 < len(think) < 6_500
+    text = think + json.dumps({"status": "found", "label": "", "value": "5.6", "unit": ""})
+    reply = parse_tile_reply(text)
+    assert (reply.status, reply.value) == ("found", "5.6")
 
 
 @pytest.mark.parametrize("unit", ["{", '{"a'], ids=["braces", "open-strings"])
@@ -229,18 +243,21 @@ def test_superscript_units_match_the_caret_and_star_spellings() -> None:
 
 
 # ---------------------------------------------------------------------------
-# (d) 横条准备失败:仍整张读,标不确定;整张读也失败才报错
+# (d) 横条准备失败:仍整张读,标不确定(只说类型);文档改过照样报错;整张读也失败才报错
 # ---------------------------------------------------------------------------
+
+#: pdftoppm 桩:整页照常渲,局部一律失败(非零退出)。
+_PDFTOPPM_REGIONS_FAIL = (
+    'if "-singlefile" in args:\n    sys.exit(1)\n'
+) + _PDFTOPPM_PAGE_OR_REGION.split("else:\n", 1)[1].replace("\n    ", "\n").lstrip()
 
 
 @pytest.mark.anyio
 async def test_a_band_render_failure_still_returns_the_whole_image_reading(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    _install_office_stubs(tmp_path, monkeypatch, pdftoppm_body=_PDFTOPPM_PAGE_OR_REGION)
+    _install_office_stubs(tmp_path, monkeypatch, pdftoppm_body=_PDFTOPPM_REGIONS_FAIL)
     doc = _doc(tmp_path)
-    (doc.work / doc.path).write_text("CHANGED")  # 内容哈希对不上 -> 横条报 stale
-    os.utime(doc.work / doc.path, (1_000, 1_000))
     vl = _VL(answer=lambda _ref: "The glucose is 5.6.")
     tool, _read_page, _runtime = _tools(doc, vl)
 
@@ -251,22 +268,69 @@ async def test_a_band_render_failure_still_returns_the_whole_image_reading(
     assert [_image_ref_of(call) for call in vl.calls] == [doc.page_ref]
     assert result.content.startswith("The glucose is 5.6.\n\n")
     assert "whole-image reading; small print may be unreliable" in result.content
-    assert "the bands could not be prepared (RegionStaleError" in result.content
+    assert (
+        "the bands could not be prepared (RegionRenderError: the region render failed)"
+        in result.content
+    )
     assert (result.meta["auto"], result.meta["auto_reason"]) == (
         "full_fallback",
         "bands_unavailable",
     )
-    assert "RegionStaleError" in result.meta["bands_error"]
+    assert result.meta["bands_error"] == "RegionRenderError"
+
+
+@pytest.mark.anyio
+async def test_the_bands_error_text_never_reaches_the_model_or_meta(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """异常的文字可能带 NAS 路径:给模型与 meta 的只有类型和一句固定的话,细节只进日志。"""
+    _install_office_stubs(tmp_path, monkeypatch, pdftoppm_body=_PDFTOPPM_PAGE_OR_REGION)
+    doc = _doc(tmp_path)
+    tool, read_page, _runtime = _tools(doc, _VL(answer=lambda _ref: "whole"))
+    secret = "/mnt/nas/tenant-root/agents/secret/report.pdf"
+
+    async def boom(**_kwargs: object) -> object:
+        raise OSError(f"cannot open {secret}")
+
+    monkeypatch.setattr(read_page, "render_regions", boom)
+
+    with caplog.at_level("WARNING"):
+        result = await tool.call(
+            {"path": doc.path, "unit": 1, "question": "?", "region": "auto"}, ctx=doc.ctx
+        )
+
+    assert secret not in result.content
+    assert secret not in json.dumps(result.meta)
+    assert result.meta["bands_error"] == "OSError"
+    assert "(OSError: the region render failed)" in result.content
+    assert any(secret in (record.exc_text or "") for record in caplog.records)
+
+
+@pytest.mark.anyio
+async def test_a_stale_render_in_auto_mode_is_an_error_like_an_explicit_region(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """文档在整页渲染之后改过:整张读看的也是那张过期的页,不能拿来回答。"""
+    _install_office_stubs(tmp_path, monkeypatch, pdftoppm_body=_PDFTOPPM_PAGE_OR_REGION)
+    doc = _doc(tmp_path)
+    (doc.work / doc.path).write_text("CHANGED")  # 内容哈希对不上 -> 横条报 stale
+    os.utime(doc.work / doc.path, (1_000, 1_000))
+    vl = _VL(answer=lambda _ref: "from the stale page")
+    tool, _read_page, _runtime = _tools(doc, vl)
+
+    with pytest.raises(RegionStaleError, match="read_page"):
+        await tool.call(
+            {"path": doc.path, "unit": 1, "question": "?", "region": "auto"}, ctx=doc.ctx
+        )
+    assert vl.calls == []
 
 
 @pytest.mark.anyio
 async def test_a_band_render_failure_and_a_failed_whole_read_is_an_error(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    _install_office_stubs(tmp_path, monkeypatch, pdftoppm_body=_PDFTOPPM_PAGE_OR_REGION)
+    _install_office_stubs(tmp_path, monkeypatch, pdftoppm_body=_PDFTOPPM_REGIONS_FAIL)
     doc = _doc(tmp_path)
-    (doc.work / doc.path).write_text("CHANGED")
-    os.utime(doc.work / doc.path, (1_000, 1_000))
 
     def fail(_ref: str) -> str:
         raise RuntimeError("vendor 500")
@@ -276,7 +340,7 @@ async def test_a_band_render_failure_and_a_failed_whole_read_is_an_error(
         await tool.call(
             {"path": doc.path, "unit": 1, "question": "?", "region": "auto"}, ctx=doc.ctx
         )
-    assert type(info.value.__cause__).__name__ == "RegionStaleError"
+    assert type(info.value.__cause__).__name__ == "RegionRenderError"
 
 
 # ---------------------------------------------------------------------------
@@ -340,3 +404,38 @@ def test_a_moderately_wide_image_uses_fewer_bands_to_stay_near_the_aspect_limit(
     bands = plan_bands(size, 12_000_000)
     assert len(bands) < band_count(12_000_000)
     assert len(bands) >= AUTO_MIN_BANDS
+
+
+# ---------------------------------------------------------------------------
+# round 3 —— 提示词按横条 / 竖条说
+# ---------------------------------------------------------------------------
+
+
+def test_the_band_prompt_names_the_piece_by_axis() -> None:
+    horizontal, vertical = tile_instruction("y"), tile_instruction("x")
+    assert "one full-width horizontal band" in horizontal
+    assert "not visible in this band" in horizontal
+    assert "cut off by the edge of the band" in horizontal
+    assert "one full-height vertical strip" in vertical
+    assert "not visible in this strip" in vertical
+    assert "cut off by the edge of the strip" in vertical
+    assert "horizontal band" not in vertical
+    assert tile_question("q?", "x") == f"q?\n\n{vertical}"
+    assert TILE_INSTRUCTION == horizontal
+
+
+@pytest.mark.anyio
+async def test_a_very_wide_image_gets_the_vertical_strip_prompt(tmp_path: Path) -> None:
+    vl = _VL(answer=lambda _ref: "NOT_FOUND")
+    up = _upload(tmp_path, vl, size=(9_000, 1_000))
+
+    result = await up.tool.call(
+        {"image_ref": up.ref, "question": "q?", "region": "auto"}, ctx=up.ctx
+    )
+
+    strips = [call for call in vl.calls if "/crops/" in _image_ref_of(call)]
+    assert strips
+    for call in strips:
+        assert _question_of(call) == f"q?\n\n{tile_instruction('x')}"
+    for band in result.meta["bands"]:
+        assert (band["box"][1], band["box"][3]) == (0, 1000)

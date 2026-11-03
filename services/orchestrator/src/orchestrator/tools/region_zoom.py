@@ -157,6 +157,13 @@ def auto_bands(count: int, axis: BandAxis = "y") -> tuple[Tile, ...]:
     return tuple(bands)
 
 
+def band_axis(bands: tuple[Tile, ...]) -> BandAxis:
+    """这组条是横条(``"y"``,整宽)还是竖条(``"x"``,整高)。"""
+    if bands and (bands[0].box[0], bands[0].box[2]) != (0, REGION_SCALE):
+        return "x"
+    return "y"
+
+
 def _band_aspect(size: tuple[int, int], count: int, axis: BandAxis) -> float:
     width, height = size
     share = 1 / (count - (count - 1) * AUTO_BAND_OVERLAP)

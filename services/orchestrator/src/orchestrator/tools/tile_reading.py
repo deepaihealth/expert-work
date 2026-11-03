@@ -25,27 +25,41 @@ from dataclasses import dataclass, field
 from decimal import Decimal, InvalidOperation
 from typing import Final, Literal
 
-from orchestrator.tools.region_zoom import Box, Tile
+from orchestrator.tools.region_zoom import BandAxis, Box, Tile
 
 Status = Literal["found", "not_found", "partial", "unparseable"]
 ParseMode = Literal["json", "prose", "none"]
 AutoOutcome = Literal["single", "conflict", "none"]
 
 #: 每条横条的提示词在用户原问题后面追加这一段;问题本身原样不动。
-TILE_INSTRUCTION: Final = (
-    "This image is one full-width horizontal band cut from a larger image, so the answer may "
-    "not be in it. Reply only with JSON, nothing else: "
-    '{"status": "found|not_found|partial", '
-    '"label": "<the row or field name printed next to the value, or empty>", '
-    '"value": "<the requested value or text (number, name, date, word...) exactly as printed, '
-    'keeping marks such as < > \u2191 \u2193 \u00b1 (-); empty unless found>", '
-    '"unit": "<the unit as printed, or empty>"}. '
-    'Use "not_found" if the requested item or its value is not visible in this band. '
-    "If this part of the image alone is not enough to answer - e.g. the question needs "
-    "counting or comparing across the whole image, or an axis, legend or row/column header "
-    'that is not visible here - use "not_found". '
-    'Use "partial" if the value is cut off by the edge of the band. Do not guess.'
-)
+#: 横条(``axis="y"``)与竖条(``axis="x"``)在提示词里的叫法。
+_PIECE_NAMES: Final[dict[str, tuple[str, str]]] = {
+    "y": ("one full-width horizontal band", "band"),
+    "x": ("one full-height vertical strip", "strip"),
+}
+
+
+def tile_instruction(axis: BandAxis = "y") -> str:
+    """每条横条 / 竖条的提示词在用户原问题后面追加的这一段;问题本身原样不动。"""
+    whole, piece = _PIECE_NAMES[axis]
+    return (
+        f"This image is {whole} cut from a larger image, so the answer may "
+        "not be in it. Reply only with JSON, nothing else: "
+        '{"status": "found|not_found|partial", '
+        '"label": "<the row or field name printed next to the value, or empty>", '
+        '"value": "<the requested value or text (number, name, date, word...) exactly as '
+        'printed, keeping marks such as < > \u2191 \u2193 \u00b1 (-); empty unless found>", '
+        '"unit": "<the unit as printed, or empty>"}. '
+        f'Use "not_found" if the requested item or its value is not visible in this {piece}. '
+        "If this part of the image alone is not enough to answer - e.g. the question needs "
+        "counting or comparing across the whole image, or an axis, legend or row/column header "
+        'that is not visible here - use "not_found". '
+        f'Use "partial" if the value is cut off by the edge of the {piece}. Do not guess.'
+    )
+
+
+#: 横条(最常见的那一种)的提示词。
+TILE_INSTRUCTION: Final = tile_instruction("y")
 
 #: 交给主模型 / 记进 meta 的原文最多保留多少字符。
 RAW_META_CHARS: Final = 200
@@ -54,9 +68,9 @@ PROSE_VALUE_MAX_CHARS: Final = 40
 _STATUSES: Final = frozenset({"found", "not_found", "partial"})
 
 
-def tile_question(question: str) -> str:
-    """一块的提示词:用户的问题原样,后面加 :data:`TILE_INSTRUCTION`。"""
-    return f"{question}\n\n{TILE_INSTRUCTION}"
+def tile_question(question: str, axis: BandAxis = "y") -> str:
+    """一条的提示词:用户的问题原样,后面加 :func:`tile_instruction`(按横条 / 竖条)。"""
+    return f"{question}\n\n{tile_instruction(axis)}"
 
 
 # ---------------------------------------------------------------------------
@@ -85,12 +99,17 @@ _FENCE_RE: Final = re.compile(r"```(?:json|JSON)?")
 #: 解析前先截到这么长:合法回答不到 300 字符,截断让每一步都有界(review round 2 N1 ——
 #: 原来的配平扫描是平方级的,2 万个 ``{`` 要 8.7 s,而它在共享的事件循环上跑)。
 MAX_REPLY_CHARS: Final = 4096
+#: 去 ``<think>`` 之前的上限(去 think 那一步是线性的正则,这道限只为让它也有界)。
+MAX_RAW_CHARS: Final = 65_536
 
 
 def parse_tile_reply(text: str) -> TileReply:
     """一块的原始回答 → :class:`TileReply`(解析阶梯见模块 docstring)。"""
-    raw = text.strip()[:MAX_REPLY_CHARS]
-    cleaned = _FENCE_RE.sub("", _THINK_RE.sub("", raw)).strip()
+    # 先去 ``<think>`` 再截:推理模型的思考可能有几 KB,先截会把后面的 JSON 截掉(round 3)。
+    # 去 think 之前另有一道宽得多的上限,让那一步本身也有界。
+    bounded = text.strip()[:MAX_RAW_CHARS]
+    raw = bounded[:MAX_REPLY_CHARS]
+    cleaned = _FENCE_RE.sub("", _THINK_RE.sub("", bounded)).strip()[:MAX_REPLY_CHARS]
     obj = _json_object(cleaned)
     if obj is not None:
         return _from_json(obj, raw)
