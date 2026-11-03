@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import struct
+import zlib
 from collections.abc import AsyncIterator
 from io import BytesIO
 from uuid import UUID, uuid4
@@ -852,3 +854,28 @@ class TestSafeWorkspaceNameUnicode:
         assert not is_safe_document_upload_id("uploads/a/b.pdf")
         assert not is_safe_document_upload_id("uploads/a\x00.pdf")
         assert not is_safe_document_upload_id("体检报告.pdf")
+
+
+@pytest.mark.asyncio
+async def test_upload_rejects_decompression_bomb_with_413(setup: Setup) -> None:
+    """B-263:几十字节的 PNG 声明 2 万 x 2 万像素 —— 不解码,回 413(与超字节上限同一个码)。"""
+
+    def chunk(kind: bytes, data: bytes) -> bytes:
+        return (
+            struct.pack(">I", len(data)) + kind + data + struct.pack(">I", zlib.crc32(kind + data))
+        )
+
+    bomb = (
+        b"\x89PNG\r\n\x1a\n"
+        + chunk(b"IHDR", struct.pack(">IIBBBBB", 20_000, 20_000, 1, 0, 0, 0, 0))
+        + chunk(b"IDAT", zlib.compress(b""))
+        + chunk(b"IEND", b"")
+    )
+    client, thread_id, store = setup
+    response = await client.post(
+        f"/v1/sessions/{thread_id}/uploads",
+        files={"file": ("bomb.png", bomb, "image/png")},
+    )
+    assert response.status_code == 413
+    assert "pixel" in response.json()["detail"]
+    assert await store.list_prefix(f"{_TENANT}/uploads/{thread_id}/") == []

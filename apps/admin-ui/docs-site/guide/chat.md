@@ -275,7 +275,7 @@ Content-Type: multipart/form-data
 | 文档 | `application/pdf`、`application/vnd.openxmlformats-officedocument.wordprocessingml.document`（.docx）、`application/vnd.openxmlformats-officedocument.spreadsheetml.sheet`（.xlsx）、`application/vnd.openxmlformats-officedocument.presentationml.presentation`（.pptx）、`text/plain`、`text/markdown`、`text/csv` | 25 MiB |
 | 图片 | `image/png`、`image/jpeg`、`image/webp`、`image/gif` | 10 MiB |
 
-两条大小上限以实际部署的配置为准。超出上限返回 413 `UPLOAD_TOO_LARGE`，见 [8.9](./errors#_8-9-413-超过大小上限)。
+两条大小上限以实际部署的配置为准。图片另有像素上限：宽乘高不超过 6000 万像素。超出任一上限返回 413 `UPLOAD_TOO_LARGE`，见 [8.9](./errors#_8-9-413-超过大小上限)。
 
 #### 上传文档
 
@@ -340,7 +340,7 @@ curl -X POST https://<your-domain>/v1/agents/{agent_code}/uploads \
 |---|---|---|
 | `upload_id` | string | 这份附件的标识，形如 `upl_<uuid>`。原样存下来，原样回传 |
 | `session_id` | UUID | 这份附件绑定的会话。请求里传了 `session_id` 时是传入的那个值，没传时是这次新建的那一段 |
-| `type` | string | 这份附件的类别。取值：`document`（文档，内容保存到这个终端用户的工作区，Agent 执行时能读到它）/ `image`（图片，内容由平台单独保存，拍摄参数等 EXIF 信息已被移除） |
+| `type` | string | 这份附件的类别。取值：`document`（文档，内容保存到这个终端用户的工作区，Agent 执行时能读到它）/ `image`（图片，内容由平台单独保存。保存前按拍摄方向转正、移除拍摄参数等 EXIF 信息，GIF 动图只保留第一帧） |
 | `mime` | string | 服务端记下来的 `Content-Type`，取值见上文「允许的文件类型」 |
 | `size` | integer | 这份附件的字节数，非负整数，不超过对应类别的大小上限 |
 
