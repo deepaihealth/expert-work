@@ -97,7 +97,7 @@ kubectl get imagecaches.image.alibabacloud.com | grep -E 'daf63cb1|f2ee1b4a'
 ```
 
 期望:
-- [ ] 沙箱是 `…-vpc…/sandbox:daf63cb1`、`cache=true`、`sg=sg-bp1a9oa7oi3v4s3ccquu`(10-29 Step G 之后的状态)
+- [ ] 沙箱是 `…-vpc…/sandbox:daf63cb1`、`cache=true`、**`sg=` 为空**:11-03 ACS 自动升级 CSI 组件后沙箱专用安全组挡住 NAS 挂载、所有沙箱开不出来,用户用 JSON patch 摘掉了模板上的安全组注解(池回到集群安全组),等 VPC 流日志查清被拒的目的地再恢复(B-217 隔离暂时打开)。今晚**不恢复**安全组
 - [ ] 两个 namespace 的 `acr-pull` 各打印出两个 host
 - [ ] control-plane / credential-proxy 是 `:5a1600934`,admin-ui 是 `:0db5633d3-prod`
 - [ ] `secret/canary-credentials` 存在
@@ -368,14 +368,12 @@ grep -E 'mirror|Pushing' "${OUT}/build-migrate.log" | tail -5    # 记下选中�
 release.sh 为什么不做:SandboxSet 在 `default` namespace,不在 overlay 里。
 漏了会怎样(§73「发布顺序」,`pending-test-release-acceptance.md:1584`):新代码拿到旧镜像的沙箱,每次 exec 都以 97 退出(`ew-exec-view: image lacks /agent`)。布局判断只比 `sandbox_instance.layout`、不看镜像,不会自愈,要等那台沙箱过期(最长约 12 小时)。这期间那个用户的所有沙箱工具都不可用。
 
-**必须用 `apply -k infra/k8s/sandbox-prod`,不能 `apply -f sandboxset.yaml`**:后者不带安全组注解,新开的沙箱会悄悄回到集群安全组、和数据库 / Redis 互通(B-217,`sandbox-prod/security-group-patch.yaml:15-20`)。
+**今晚只换镜像,用 JSON patch,不能 `apply -k infra/k8s/sandbox-prod`,也不用 `apply -f sandboxset.yaml`**:`apply -k sandbox-prod` 会把安全组注解加回去,在阿里云给出放行清单之前,这等于重演 11-03 的事故(所有沙箱 `csi mount: deadline_exceeded`);`apply -f sandboxset.yaml` 会删掉池上的 `sg-dns-peers` / `sg-apiserver-peers` 两条注解(smoke 要用)。JSON patch 先 `test` 旧镜像再 `replace`,只动这一个字段。这一行的改动和仓库里 `sandboxset.yaml` 在 `5a1600934..${REL}` 之间的差异(只有镜像一行,0.2 已核)相同。
 
 ```sh
-kubectl kustomize infra/k8s/sandbox-prod | grep -E 'expert-work/sandbox:|security-group-ids'
-#   必须是 …-vpc….personal.cr.aliyuncs.com/expert-work/sandbox:f2ee1b4a 和 "sg-bp1a9oa7oi3v4s3ccquu"
 kubectl -n default get pods -l agents.kruise.io/sandbox-pool=expert-work-sandbox -L agents.kruise.io/sandbox-claimed
 #   看 claimed=true 有几台;挑 0.4 的 runs_in_flight 为 0 的时候做
-kubectl apply -k infra/k8s/sandbox-prod 2>&1 | tee "${OUT}/sandbox-apply.log"
+kubectl -n default patch sandboxset expert-work-sandbox --type=json -p '[{"op":"test","path":"/spec/template/spec/containers/0/image","value":"crpi-sgadimluo7wm655m-vpc.cn-hangzhou.personal.cr.aliyuncs.com/expert-work/sandbox:daf63cb1"},{"op":"replace","path":"/spec/template/spec/containers/0/image","value":"crpi-sgadimluo7wm655m-vpc.cn-hangzhou.personal.cr.aliyuncs.com/expert-work/sandbox:f2ee1b4a"}]' 2>&1 | tee "${OUT}/sandbox-apply.log"
 kubectl -n default delete sandbox -l agents.kruise.io/sandbox-pool=expert-work-sandbox
 kubectl -n default get sandboxset expert-work-sandbox -w        # 等 availableReplicas=1,Ctrl-C
 kubectl -n default get pods -l agents.kruise.io/sandbox-pool=expert-work-sandbox -o jsonpath='{range .items[*]}{.metadata.name}{" "}{.spec.containers[?(@.name=="main")].image}{"\n"}{end}'
@@ -385,7 +383,7 @@ tools/deploy/pg_upgrade/run_canary.sh prod 2>&1 | tee "${OUT}/canary-old-code-ne
 
 判据:
 - [ ] 池里**每一台**沙箱都是 `sandbox:f2ee1b4a`,没有一台还是 `daf63cb1`
-- [ ] 模板 `sg=sg-bp1a9oa7oi3v4s3ccquu` 仍在
+- [ ] 模板 `sg=` 仍为空(安全组今晚不动;smoke 的 `WARN sandbox network (B-217)` 是预期)
 - [ ] 金丝雀 `RESULT: PASS`。这一步验的是「旧代码 `5a1600934` + 新镜像」,这个组合在测试上**没有直接验过**:73.11 验的是 `deaefa60` + `5a1600934`,81.9 验的是 `f2ee1b4a` + `e86a81a29`。红了就把镜像退回去(见段 4 第 5 行),今晚停发。
 
 回收那一刻正在执行的工具调用会失败一次;工作区在 NAS 上,重建不丢数据。
@@ -530,7 +528,7 @@ kubectl -n ${NS} exec -i "${POD_NEW}" -- python3 - < "${OUT}/agent_roots.py"; ku
 
 - [ ] 记录 PR `chore(deploy): prod newTag ${TAG} — …`,写上:
   - 上一版 control-plane / credential-proxy 是 `5a1600934`、admin-ui 是 `0db5633d3-prod`
-  - 沙箱 `daf63cb1 → f2ee1b4a`(apply -k sandbox-prod)
+  - 沙箱 `daf63cb1 → f2ee1b4a`(JSON patch 只换镜像;安全组仍摘着,等流日志,B-217 隔离未恢复)
   - 迁移 0181 + 0182 先单独跑
   - 回滚命令(段 4)
   - 0.x 的盘点数字(只放聚合)
@@ -578,7 +576,7 @@ tools/deploy/rollback.sh prod 0db5633d3 --images admin-ui
 | 2.1 迁移失败 | 什么都没滚。库在 0180(事务回滚),沙箱已经是新镜像 + 旧代码,金丝雀已验。停发即可,沙箱镜像可以留着 |
 | 2.2 stage 1–2 失败 | 没动集群,原地重跑 |
 | 2.2 stage 3–6 失败 | 用上面两条 `rollback.sh`。迁移已经是只增不删,不用动库 |
-| 1.3 之后、代码之前就要撤 | 用 `5a1600934` 的树退镜像,保留安全组:`git worktree add --detach ~/ew-prod-prev 5a1600934 && cd ~/ew-prod-prev && kubectl apply -k infra/k8s/sandbox-prod && kubectl -n default delete sandbox -l agents.kruise.io/sandbox-pool=expert-work-sandbox`(那棵树钉的是 `daf63cb1`、带 `sandbox-prod`) |
+| 1.3 之后、代码之前就要撤 | 同样用 JSON patch 把镜像退回(安全组不动):`kubectl -n default patch sandboxset expert-work-sandbox --type=json -p '[{"op":"test","path":"/spec/template/spec/containers/0/image","value":"crpi-sgadimluo7wm655m-vpc.cn-hangzhou.personal.cr.aliyuncs.com/expert-work/sandbox:f2ee1b4a"},{"op":"replace","path":"/spec/template/spec/containers/0/image","value":"crpi-sgadimluo7wm655m-vpc.cn-hangzhou.personal.cr.aliyuncs.com/expert-work/sandbox:daf63cb1"}]' && kubectl -n default delete sandbox -l agents.kruise.io/sandbox-pool=expert-work-sandbox` |
 
 ---
 
