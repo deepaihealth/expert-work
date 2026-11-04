@@ -2735,6 +2735,23 @@ async def test_read_page_does_not_render_when_the_model_cannot_see_the_page() ->
 
 
 @pytest.mark.anyio
+async def test_read_page_points_to_workers_when_they_can_see_the_page() -> None:
+    """B-276 —— 看不了图但 worker 能看:拒绝里指给 spawn_worker,不进沙箱;否则这个
+    主模型会照「去配视觉模型」走不通,转而自己装 OCR 重读 worker 已读过的页。"""
+    ctx = _ctx()
+    runtime = _one_rendered_page_runtime(ctx)
+    result = await ReadPageTool(
+        client=runtime, figure_delivery="none", workers_view_pages=True
+    ).call({"path": "d.pptx", "units": [3]}, ctx=ctx)
+    assert runtime.execs == []
+    assert result.content == "Not rendered: d.pptx."
+    # 理由是平台文字:放 notice(不可信围栏之外),不放 content。
+    assert result.notice is not None and "spawn_worker" in result.notice
+    assert "spawn_worker" not in result.content
+    assert "viewed_figures" not in result.state_updates
+
+
+@pytest.mark.anyio
 async def test_read_page_records_the_path_for_each_rendered_document() -> None:
     """回修第 3 轮 —— 渲染页段的退役占位要给出拿回来的路径,而 ref 里只有路径哈希。
     记下的键必须是 ``document_sha`` 对这条路径正向算出的那个值(读的一侧按它核对)。"""

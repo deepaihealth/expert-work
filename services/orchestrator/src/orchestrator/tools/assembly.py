@@ -306,6 +306,8 @@ async def build_tool_registry(
     """
     registry = ToolRegistry()
     figure_delivery = _figure_delivery(supports_vision=supports_vision, vision=vision)
+    # B-276 —— 主模型看不了图、worker 能看:spawn_worker 说明与 read_page 的拒绝都要说出来。
+    vision_gap = _spawn_worker_vision_gap(tool_env, parent_spec, dynamic_workers, subagent_depth)
     # B-61 §5.4(评审 I-3)—— 参数绑定先**跨条目**并成一张表,再发给每一条 mcp
     # 条目。一份 manifest 可以有多个 ``mcp`` 条目(协议层合法、也有测试),而每一条
     # 都会把它选中的服务器整个再注册一遍。按条目各发各的,后注册那一条就会用「我
@@ -332,6 +334,7 @@ async def build_tool_registry(
                 skill_seed_files,
                 figure_delivery=figure_delivery,
                 knowledge_first=knowledge_first,
+                workers_view_pages=vision_gap,
             )
         elif isinstance(entry, HTTPToolSpec):
             _register_http(registry, tool_env)
@@ -380,10 +383,16 @@ async def build_tool_registry(
                     binding.server, binding.tool, params, reason="name_collision"
                 )
     _register_base_capabilities(
-        registry, tool_env, skill_seed_files, figure_delivery=figure_delivery
+        registry,
+        tool_env,
+        skill_seed_files,
+        figure_delivery=figure_delivery,
+        workers_view_pages=vision_gap,
     )
     _register_subagents(registry, subagents, tool_env, subagent_depth)
-    _register_spawn_worker(registry, tool_env, parent_spec, dynamic_workers, subagent_depth)
+    _register_spawn_worker(
+        registry, tool_env, parent_spec, dynamic_workers, subagent_depth, vision_gap=vision_gap
+    )
     _register_knowledge_search(registry, knowledge, tool_env)
     _register_ask_image(
         registry, vision, tool_env, vl_caller, quick_vl_caller, plain_vl_caller, vl_usage_meter
@@ -604,6 +613,8 @@ def _register_spawn_worker(
     parent_spec: AgentSpec | None,
     dynamic_workers: DynamicWorkersSpec | None,
     subagent_depth: int,
+    *,
+    vision_gap: bool = False,
 ) -> None:
     """Register the ``spawn_worker`` tool — 1.3 dynamic Orchestrator-Worker.
 
@@ -615,12 +626,11 @@ def _register_spawn_worker(
     ``subagents``, a missing builder is **not** an error — the feature is
     default-on but optional, so an unwired deployment simply runs without it.
     """
-    if dynamic_workers is not None and not dynamic_workers.enabled:
+    if not _spawn_worker_registrable(env, parent_spec, dynamic_workers, subagent_depth):
+        if subagent_depth >= MAX_SUBAGENT_DEPTH:
+            logger.warning("tools.spawn_worker_depth_cap depth=%d not_registered", subagent_depth)
         return
-    if env.worker_build_fn is None or parent_spec is None:
-        return
-    if subagent_depth >= MAX_SUBAGENT_DEPTH:
-        logger.warning("tools.spawn_worker_depth_cap depth=%d not_registered", subagent_depth)
+    if parent_spec is None or env.worker_build_fn is None:  # narrowed by the gate above
         return
     build_fn = env.worker_build_fn
     child_depth = subagent_depth + 1
@@ -641,8 +651,56 @@ def _register_spawn_worker(
             builder=_builder,
             child_depth=child_depth,
             trajectory_recorder=env.trajectory_recorder,
+            vision_gap=vision_gap,
         )
     )
+
+
+def _spawn_worker_registrable(
+    env: ToolEnv,
+    parent_spec: AgentSpec | None,
+    dynamic_workers: DynamicWorkersSpec | None,
+    subagent_depth: int,
+) -> bool:
+    """The one set of gates for ``spawn_worker`` (B-276: read_page's refusal
+    must never point to a spawn_worker that is not there)."""
+    if dynamic_workers is not None and not dynamic_workers.enabled:
+        return False
+    if env.worker_build_fn is None or parent_spec is None:
+        return False
+    return subagent_depth < MAX_SUBAGENT_DEPTH
+
+
+def _spawn_worker_vision_gap(
+    env: ToolEnv,
+    parent_spec: AgentSpec | None,
+    dynamic_workers: DynamicWorkersSpec | None,
+    subagent_depth: int,
+) -> bool:
+    """B-276 —— ``spawn_worker`` will be registered and its workers can see
+    images this agent cannot."""
+    if parent_spec is None or not _spawn_worker_registrable(
+        env, parent_spec, dynamic_workers, subagent_depth
+    ):
+        return False
+    return _workers_see_what_parent_cannot(parent_spec, dynamic_workers)
+
+
+def _workers_see_what_parent_cannot(
+    parent_spec: AgentSpec, dynamic_workers: DynamicWorkersSpec | None
+) -> bool:
+    """B-276 — the parent has no way to look at images (not multimodal, no
+    ``vision`` block → no ``ask_image``) while the workers' model is multimodal
+    (``dynamic_workers.model`` overrides the parent's model for workers)."""
+    parent_model = parent_spec.spec.model
+    if parent_model.supports_vision or parent_spec.spec.vision is not None:
+        return False
+    worker_model = (
+        dynamic_workers.model
+        if dynamic_workers is not None and dynamic_workers.model is not None
+        else parent_model
+    )
+    return worker_model.supports_vision
 
 
 def _register_builtin(
@@ -653,6 +711,7 @@ def _register_builtin(
     *,
     figure_delivery: FigureDelivery = "none",
     knowledge_first: bool = False,
+    workers_view_pages: bool = False,
 ) -> None:
     if entry.name not in KNOWN_BUILTINS:
         raise AgentFactoryError(
@@ -669,7 +728,9 @@ def _register_builtin(
     elif entry.name == "read_document":
         _register_read_document(registry, env, skill_seed_files)
     elif entry.name == "read_page":
-        _register_read_page(registry, env, skill_seed_files, figure_delivery)
+        _register_read_page(
+            registry, env, skill_seed_files, figure_delivery, workers_view_pages=workers_view_pages
+        )
     elif entry.name == "save_artifact":
         # 登记前要 stat 工作区里那个文件,所以和 read_file/write_file 一样需要
         # 沙箱执行通道;没有它就没有「文件」这个概念,登记只会造出死产物。
@@ -743,6 +804,7 @@ def _register_base_capabilities(
     skill_seed_files: tuple[tuple[str, bytes], ...],
     *,
     figure_delivery: FigureDelivery = "none",
+    workers_view_pages: bool = False,
 ) -> None:
     """Register the Tier 1 base capabilities the manifest did not declare.
 
@@ -784,6 +846,7 @@ def _register_base_capabilities(
             env,
             skill_seed_files,
             figure_delivery=figure_delivery,
+            workers_view_pages=workers_view_pages,
         )
 
 
@@ -928,6 +991,8 @@ def _register_read_page(
     env: ToolEnv,
     skill_seed_files: tuple[tuple[str, bytes], ...],
     figure_delivery: FigureDelivery,
+    *,
+    workers_view_pages: bool = False,
 ) -> None:
     # B-64 —— read_page rides the same warm sandbox runtime exec channel as
     # read_document (soffice / pdftoppm run inside the per-user sandbox).
@@ -941,6 +1006,7 @@ def _register_read_page(
             client=env.sandbox_runtime,
             skill_seed_files=skill_seed_files,
             figure_delivery=figure_delivery,
+            workers_view_pages=workers_view_pages,
             # B-266 —— 渲局部(read_page / ask_image 的 region)要读整页渲染的像素尺寸。
             image_resolver=env.image_resolver,
         )

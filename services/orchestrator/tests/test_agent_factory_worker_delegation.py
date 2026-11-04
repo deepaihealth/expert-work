@@ -9,7 +9,11 @@ carry a single character of it — the strict-absence tests pin that down.
 
 from __future__ import annotations
 
-from orchestrator.agent_factory import _WORKER_DELEGATION_BLOCK, _assemble_system_prompt
+from orchestrator.agent_factory import (
+    _WORKER_DELEGATION_BLOCK,
+    _WORKER_POLICY_PARENT_ADDENDUM,
+    _assemble_system_prompt,
+)
 
 
 def test_worker_delegation_appends_rubric_to_base() -> None:
@@ -72,3 +76,16 @@ def test_worker_delegation_appends_after_other_blocks() -> None:
     )
     assert prompt.index("# Subtask delegation") > prompt.index("# Long-term memory")
     assert prompt.index("# Subtask delegation") > prompt.index("# Current date")
+
+
+def test_worker_report_guidance_checks_here_and_re_delegates_instead_of_redoing() -> None:
+    """B-276 —— 不能看图的主模型逐字引用了「check its key claims … before relying on
+    them」,然后在沙箱装 OCR 重读 worker 已读过的页(测试 4 次里 4 次,2 次撞 12 分钟上限)。"""
+    text = _WORKER_POLICY_PARENT_ADDENDUM
+    assert "check its key claims" not in text
+    assert "open the files it lists" in text
+    assert "do not redo its work with workarounds" in text
+    assert "spawn a worker to re-check that item" in text
+    # B-122 的交付物与失败兜底两句不变。
+    assert "not deliverables until they are registered" in text
+    assert "do that part yourself instead of abandoning the task" in text

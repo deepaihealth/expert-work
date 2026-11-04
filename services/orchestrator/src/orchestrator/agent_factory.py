@@ -1926,8 +1926,12 @@ _WORKER_DELEGATION_BLOCK = (
 #: B-122 —— worker 已拿不到登记交付物 / 对外写 / 改 Agent 自己的工具:父侧要知道
 #: 小结是自述、文件登记了才算交付、worker 做不了的自己接。阀关时不追加。
 _WORKER_POLICY_PARENT_ADDENDUM = (
-    " A worker's final message is its own report: check its key claims — open "
-    "the files it lists — before relying on them or passing them on. Files a "
+    # B-276 —— 原文「check its key claims … before relying on them」被不能看图的主模型
+    # 逐字引用,然后装 OCR 重读 worker 已读过的页。改成能在这里做的检查 + 可疑项再派。
+    " A worker's final message is its own report: confirm what you can confirm "
+    "quickly here — open the files it lists, check that numbers add up — before "
+    "relying on it or passing it on, but do not redo its work with workarounds; if "
+    "a key claim looks wrong, spawn a worker to re-check that item. Files a "
     "worker writes are not deliverables until they are registered as such — do "
     "that yourself with save_artifact, or, if you do not have that tool, list "
     "them in your own final message. If a worker fails, returns something "
