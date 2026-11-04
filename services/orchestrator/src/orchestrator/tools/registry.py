@@ -42,6 +42,9 @@ WORKSPACE_MIGRATED_KEY = "workspace_migrated"
 #: B-262 —— ``_child_run._child_config`` 给子代写父对话渲染过页的 run(见
 #: :attr:`ToolContext.figure_run_ids`)。
 FIGURE_RUN_IDS_KEY = "figure_run_ids"
+#: B-268 —— ``sse.run_agent`` 给审批续跑段写这一轮首段的 run id(见
+#: :attr:`ToolContext.turn_root_run_id`);新开一轮 / 孤儿复活同一个 run 时不写。
+TURN_ROOT_RUN_KEY = "turn_root_run_id"
 
 
 def workspace_view_fields(configurable: Mapping[str, Any]) -> dict[str, Any]:
@@ -423,6 +426,12 @@ class ToolContext:
     #: 的目录:渲染页落在 agent 级的 ``.tool_results/<run>/``,同一智能体的别的对话在同名文档
     #: 上渲过的页不许拿来用。
     figure_run_ids: frozenset[UUID] = frozenset()
+    #: B-268 —— 检查点里的 ``figure_reads``(本 run 的 ``read_page`` 读取账,原样、未校验;
+    #: 读的一侧 ``tools.figure_reads`` 逐条校验)。
+    figure_reads: tuple[Any, ...] = ()
+    #: B-268 —— 这一轮首段的 run id(审批续跑段是新 run_id;``None`` = 本 run 就是首段)。
+    #: ``read_page`` 的读取账按它记,续跑段接着上一段的计数。子代不继承(它有自己的 state)。
+    turn_root_run_id: UUID | None = None
 
     @property
     def workspace_view(self) -> WorkspaceView:
@@ -451,8 +460,16 @@ class ToolContext:
 #:   (state.py 的通道用 ``_merge_viewed_figures`` 跨轮 union,按最近一次看到排序)。
 #: - ``figure_documents`` —— B-64 ``read_page`` 记下 ``<doc-sha>`` → 路径
 #:   (渲染页段的退役占位靠它给出拿回来的路径;读的一侧正向重算哈希再采信)。
+#: - ``figure_reads`` —— B-268 ``read_page`` 本 run 的读取账(每次渲染追加一条)。
 TOOL_ALLOWED_STATE_KEYS: frozenset[str] = frozenset(
-    {"plan", "subagent_invocations", "promoted_tools", "viewed_figures", "figure_documents"}
+    {
+        "plan",
+        "subagent_invocations",
+        "promoted_tools",
+        "viewed_figures",
+        "figure_documents",
+        "figure_reads",
+    }
 )
 
 

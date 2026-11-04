@@ -29,6 +29,7 @@ from orchestrator.tools.document_figures import (
 )
 from orchestrator.tools.read_page import (
     _CONVERT_TIMEOUT_S,
+    _PAGE_COUNT_TIMEOUT_S,
     _RENDER_TIMEOUT_S,
     MAX_PAGES_PER_CALL,
     RENDER_DPI,
@@ -92,6 +93,10 @@ def test_internal_render_budget_fits_under_the_exec_timeout_cap() -> None:
     # docx 多两个子进程:整篇 pdftotext 一次 + pdfimages -list 一次。两者都用
     # _RENDER_TIMEOUT_S(它们本来就快),不是 _CONVERT_TIMEOUT_S。
     docx = _CONVERT_TIMEOUT_S + 2 * _RENDER_TIMEOUT_S + MAX_PAGES_PER_CALL * _RENDER_TIMEOUT_S
+    # B-268 —— 两条路最后都再跑一次 pdfinfo(页数)。
+    non_docx += _PAGE_COUNT_TIMEOUT_S
+    docx += _PAGE_COUNT_TIMEOUT_S
+    assert non_docx < _MAX_EXEC_TIMEOUT_S
     assert docx < _MAX_EXEC_TIMEOUT_S, (
         f"docx 支路最坏 {docx}s 没有严格小于 exec 上限 {_MAX_EXEC_TIMEOUT_S}s"
     )
@@ -231,8 +236,9 @@ def _install_office_stubs(
     pdftoppm_body: str = _PDFTOPPM_WRITES_A_JPEG,
     pdftotext_body: str | None = None,
     pdfimages_body: str | None = None,
+    pdfinfo_body: str = "sys.exit(1)\n",
 ) -> Path:
-    """伪造 soffice / pdftoppm / pdftotext / pdfimages 到 PATH 最前面,只让剧本
+    """伪造 soffice / pdftoppm / pdftotext / pdfimages / pdfinfo 到 PATH 最前面,只让剧本
     那一段随测试变。返回放桩的目录(调用计数文件也在那里)。
 
     回修第 4 轮 New-M6 —— 这里原先是五个 helper 各自内联一整份 soffice +
@@ -258,6 +264,8 @@ def _install_office_stubs(
             "",
             pdfimages_body if pdfimages_body is not None else _pdfimages_rows([(1, *_BIG_ROW)]),
         ),
+        # B-268 —— 页数只是附加信息:默认桩失败(没有页数),回包与之前逐字相同。
+        "pdfinfo": ("", pdfinfo_body),
     }
     for binary, (preamble, body) in bodies.items():
         script = bin_dir / binary
