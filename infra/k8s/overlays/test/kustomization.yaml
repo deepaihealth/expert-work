@@ -40,13 +40,13 @@ images:
   newTag: 24.12-alpine-r1
 - name: crpi-sgadimluo7wm655m.cn-hangzhou.personal.cr.aliyuncs.com/expert-work/admin-ui
   newName: crpi-sgadimluo7wm655m.cn-hangzhou.personal.cr.aliyuncs.com/expert-work/admin-ui
-  newTag: b164af88e-test
+  newTag: 72abce48b-test
 - name: crpi-sgadimluo7wm655m.cn-hangzhou.personal.cr.aliyuncs.com/expert-work/control-plane
   newName: crpi-sgadimluo7wm655m.cn-hangzhou.personal.cr.aliyuncs.com/expert-work/control-plane
-  newTag: b164af88e
+  newTag: 72abce48b
 - name: crpi-sgadimluo7wm655m.cn-hangzhou.personal.cr.aliyuncs.com/expert-work/credential-proxy
   newName: crpi-sgadimluo7wm655m.cn-hangzhou.personal.cr.aliyuncs.com/expert-work/credential-proxy
-  newTag: b164af88e
+  newTag: 72abce48b
 - name: grafana/grafana
   newName: crpi-sgadimluo7wm655m.cn-hangzhou.personal.cr.aliyuncs.com/expert-work/grafana
 - name: grafana/tempo
@@ -72,15 +72,15 @@ images:
 # Replaces base's vendored searxng settings with the mainland-engine-only
 # variant — the cluster VPC cannot reach the upstream default engines
 # (google/ddg/wikipedia); see searxng-settings-cn.yml's header.
+# B-267 —— web_search 固定结果夹具(只在测试环境),由 web-search-fixtures-patch.yaml 挂进
+# control-plane。源文件在 tools/eval/datasets/kb_route/,这里是拷贝(见该 patch 头注)。
+# 写明 namespace:本 overlay 不设 namespace,不写的话生成的 ConfigMap 没有命名空间,
+# Deployment 里对它的引用也不会被改成带哈希后缀的名字。
 configMapGenerator:
 - behavior: replace
   files:
   - settings.yml=searxng-settings-cn.yml
   name: searxng-settings
-# B-267 —— web_search 固定结果夹具(只在测试环境),由 web-search-fixtures-patch.yaml 挂进
-# control-plane。源文件在 tools/eval/datasets/kb_route/,这里是拷贝(见该 patch 头注)。
-# 写明 namespace:本 overlay 不设 namespace,不写的话生成的 ConfigMap 没有命名空间,
-# Deployment 里对它的引用也不会被改成带哈希后缀的名字。
 - files:
   - web-search-fixtures/b267-kb-route.json
   name: web-search-fixtures
