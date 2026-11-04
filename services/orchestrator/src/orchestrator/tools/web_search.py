@@ -24,7 +24,7 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, Protocol, runtime_checkable
 from uuid import UUID
 
@@ -159,6 +159,19 @@ class SearXNGClient:
 # The tool itself
 # ---------------------------------------------------------------------------
 
+_DESCRIPTION = (
+    "Search the public web via Tavily. Use for current events, "
+    "facts you're unsure about, or any external lookup."
+)
+#: B-267 step 1 — appended when the agent also binds a knowledge base and the
+#: platform switch ``ToolEnv.kb_first_routing`` is on. Without a knowledge base
+#: the description stays byte-identical.
+WEB_SEARCH_KNOWLEDGE_FIRST_RULE = (
+    "When a knowledge base is bound, search it first; use web_search when its results do "
+    "not state the fact asked, or the question needs current or external information. Do "
+    "not put document content into web queries."
+)
+
 
 @dataclass
 class WebSearchTool:
@@ -173,14 +186,18 @@ class WebSearchTool:
     client: TavilyClient
     default_max_results: int = DEFAULT_MAX_RESULTS
     content_char_cap: int = DEFAULT_CONTENT_CHAR_CAP
+    #: B-267 — add :data:`WEB_SEARCH_KNOWLEDGE_FIRST_RULE` (a knowledge base is
+    #: bound and the platform switch is on).
+    knowledge_first: bool = False
 
     @property
     def spec(self) -> ToolSpec:
         return ToolSpec(
             name="web_search",
             description=(
-                "Search the public web via Tavily. Use for current events, "
-                "facts you're unsure about, or any external lookup."
+                f"{_DESCRIPTION} {WEB_SEARCH_KNOWLEDGE_FIRST_RULE}"
+                if self.knowledge_first
+                else _DESCRIPTION
             ),
             parameters={
                 "type": "object",
@@ -214,7 +231,13 @@ class WebSearchTool:
         raw = await self.client.search(
             query=query, max_results=max_results, tenant_id=ctx.tenant_id
         )
-        return self._format(raw, max_results=max_results)
+        result = self._format(raw, max_results=max_results)
+        # B-267 — the fixture backend says which entry answered; that goes to the
+        # meta (trace / event stream), never into the text the model reads.
+        fixture = raw.get("fixture")
+        if isinstance(fixture, Mapping):
+            return replace(result, meta={**result.meta, **fixture})
+        return result
 
     # ------------------------------------------------------------------
 

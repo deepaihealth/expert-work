@@ -71,6 +71,7 @@ from orchestrator.tools.spawn_worker import SpawnWorkerTool, WorkerBuildFn
 from orchestrator.tools.subagent import MAX_SUBAGENT_DEPTH, ChildAgentBuilder, SubAgentTool
 from orchestrator.tools.vision import AskImageTool, VLUsageMeter
 from orchestrator.tools.web_search import DEFAULT_MAX_RESULTS, TavilyClient, WebSearchTool
+from orchestrator.tools.web_search_fixture import WebSearchFixtureError, load_web_search_fixture
 from orchestrator.tools.worker_policy import READ_ONLY_HTTP_METHODS, WORKER_DENIED_BUILTINS
 from orchestrator.tools.workspace_store import WorkspaceStore
 from orchestrator.trajectory import TrajectoryRecorder
@@ -228,6 +229,17 @@ class ToolEnv:
     #: MCP 只注册标了只读的、http 只放行读方法、不做「绑定落空」判定。
     #: 进程内字段,**不是** manifest 字段(extra="forbid" 的回滚坑)。
     worker_policy: bool = False
+    #: B-267 —— 平台总开关「先查知识库」(控制面 ``Settings.kb_first_routing``,
+    #: ``EXPERT_WORK_KB_FIRST_ROUTING``,平台默认开)。只对绑了知识库的构建生效:
+    #: ``knowledge_search`` / ``web_search`` 说明加规则、单个库也出目录;后续第 2 步
+    #: (画像进目录)、第 3 步(每轮探测)也读它。这里默认 False = 没接线(单测 / 旧调用方)
+    #: 时与开关关闭完全一样;控制面恒按设置传入。进程内字段,不是 manifest 字段。
+    kb_first_routing: bool = False
+    #: B-267 —— ``web_search`` 固定结果替身的夹具目录(控制面
+    #: ``Settings.web_search_fixtures_dir``,只在测试环境配)。manifest 的 ``web_search``
+    #: 条目写 ``config.fixture: <名字>`` 时从这里读 ``<名字>.json``;``None`` 时选了
+    #: 夹具就是构建期配置错误,绝不悄悄退回真搜索。
+    web_search_fixtures_dir: str | None = None
 
 
 async def build_tool_registry(
@@ -303,12 +315,19 @@ async def build_tool_registry(
         if isinstance(entry, MCPToolSpec)
         for binding in entry.arg_bindings
     ]
+    # B-267 —— 绑了知识库且平台开关开着:``web_search`` 说明加「先查知识库」那句。
+    knowledge_first = tool_env.kb_first_routing and knowledge is not None
     for entry in tool_specs:
         if isinstance(entry, BuiltinToolSpec):
             if tool_env.worker_policy and entry.name in WORKER_DENIED_BUILTINS:
                 continue
             _register_builtin(
-                registry, entry, tool_env, skill_seed_files, figure_delivery=figure_delivery
+                registry,
+                entry,
+                tool_env,
+                skill_seed_files,
+                figure_delivery=figure_delivery,
+                knowledge_first=knowledge_first,
             )
         elif isinstance(entry, HTTPToolSpec):
             _register_http(registry, tool_env)
@@ -454,7 +473,11 @@ def _register_knowledge_search(
         )
     refs = tuple(knowledge.knowledge_base_refs)
     registry.register(
-        KnowledgeSearchTool(retriever=env.knowledge_retriever, knowledge_base_refs=refs)
+        KnowledgeSearchTool(
+            retriever=env.knowledge_retriever,
+            knowledge_base_refs=refs,
+            knowledge_first=env.kb_first_routing,
+        )
     )
     registry.register(
         KnowledgeReadTool(store=env.knowledge_retriever.store, knowledge_base_refs=refs)
@@ -625,13 +648,14 @@ def _register_builtin(
     skill_seed_files: tuple[tuple[str, bytes], ...],
     *,
     figure_delivery: FigureDelivery = "none",
+    knowledge_first: bool = False,
 ) -> None:
     if entry.name not in KNOWN_BUILTINS:
         raise AgentFactoryError(
             f"unknown builtin tool {entry.name!r} (known: {sorted(KNOWN_BUILTINS)})"
         )
     if entry.name == "web_search":
-        _register_web_search(registry, entry, env)
+        _register_web_search(registry, entry, env, knowledge_first=knowledge_first)
     elif entry.name == "exec_python":
         _register_exec_python(registry, env, skill_seed_files)
     elif entry.name == "bash":
@@ -759,14 +783,35 @@ def _register_base_capabilities(
         )
 
 
-def _register_web_search(registry: ToolRegistry, entry: BuiltinToolSpec, env: ToolEnv) -> None:
+def _register_web_search(
+    registry: ToolRegistry, entry: BuiltinToolSpec, env: ToolEnv, *, knowledge_first: bool = False
+) -> None:
+    client = _web_search_client(entry, env)
+    max_results = int(entry.config.get("max_results", DEFAULT_MAX_RESULTS))
+    registry.register(
+        WebSearchTool(
+            client=client,
+            default_max_results=max_results,
+            knowledge_first=knowledge_first,
+        )
+    )
+
+
+def _web_search_client(entry: BuiltinToolSpec, env: ToolEnv) -> TavilyClient:
+    """The backend of a ``web_search`` entry: B-267's fixed-result fixture when the
+    entry picks one (``config.fixture``) — a fixture that cannot be loaded is a
+    build error, never a fall back to real search — else the platform's client."""
+    if "fixture" in entry.config:
+        try:
+            return load_web_search_fixture(env.web_search_fixtures_dir, entry.config["fixture"])
+        except WebSearchFixtureError as exc:
+            raise AgentFactoryError(str(exc)) from exc
     if env.web_search_client is None:
         raise AgentFactoryError(
             "builtin 'web_search' declared but no Tavily client is "
             "configured (ToolEnv.web_search_client)"
         )
-    max_results = int(entry.config.get("max_results", DEFAULT_MAX_RESULTS))
-    registry.register(WebSearchTool(client=env.web_search_client, default_max_results=max_results))
+    return env.web_search_client
 
 
 def _register_exec_python(

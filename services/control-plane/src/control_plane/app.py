@@ -1886,6 +1886,9 @@ def create_app(
                         else None
                     ),
                     workspace_quota=resolved_workspace_quota,
+                    # B-267 —— 「先查知识库」总开关 + web_search 固定结果夹具目录。
+                    kb_first_routing=resolved_settings.kb_first_routing,
+                    web_search_fixtures_dir=resolved_settings.web_search_fixtures_dir,
                 )
                 # Stream HX-7 — resolve the Langfuse client once: the
                 # SDK adapter when the deployment configures an instance,
@@ -2140,6 +2143,8 @@ def create_app(
                 # B-175 P4 — the knowledge catalog's fingerprint joins the build
                 # cache key; read from the store the builds read it from.
                 resolved_agent_runtime.knowledge_store = resolved_knowledge_store
+                # B-267 —— 同一个开关决定单个库有没有目录,缓存键要与构建读得一致。
+                resolved_agent_runtime.kb_first_routing = resolved_settings.kb_first_routing
                 # Stream T (PR B) — these background workers (ingestion runner,
                 # DLQ worker, consolidator) are ALWAYS started. ``embedder`` is a
                 # ``DynamicResolvingEmbedder`` that resolves the live platform

@@ -2006,8 +2006,9 @@ async def _knowledge_catalog(
     spec: AgentSpec, env: ToolEnv, tenant_id: Any
 ) -> tuple[str | None, str | None]:
     """B-175 P4 — ``(section body, fingerprint)`` of the ``# Knowledge bases``
-    section of an agent binding two or more knowledge bases (``(None, None)``
-    otherwise, or without a tenant).
+    section of an agent binding two or more knowledge bases — or one, with the
+    B-267 switch ``ToolEnv.kb_first_routing`` on — (``(None, None)`` otherwise,
+    or without a tenant).
 
     A store failure builds without it, warned, fingerprint
     :data:`CATALOG_UNAVAILABLE`: the catalog only steers where to search, and
@@ -2024,6 +2025,8 @@ async def _knowledge_catalog(
             env.knowledge_retriever.store,
             tenant_id=tenant_id,
             refs=knowledge.knowledge_base_refs,
+            # B-267 — the platform switch also lists a lone base.
+            single_base=env.kb_first_routing,
         )
     except Exception:
         logger.warning(

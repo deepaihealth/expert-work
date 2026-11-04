@@ -526,6 +526,8 @@ def make_child_agent_builder(
                 else None,
                 record.spec,
                 tenant_id=tenant_id,
+                # B-267 —— 与子代构建读目录时同一个开关(子代 env 继承自 base_tool_env)。
+                single_base=child_tool_env.kb_first_routing,
             ),
         )
         return record, key, user_pool

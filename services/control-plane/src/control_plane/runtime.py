@@ -279,11 +279,15 @@ PlatformTemplateResolver = Callable[[str, str], Awaitable[AgentSpec | None]]
 
 
 async def knowledge_catalog_fingerprint(
-    store: KnowledgeStore | None, spec: AgentSpec, *, tenant_id: UUID
+    store: KnowledgeStore | None, spec: AgentSpec, *, tenant_id: UUID, single_base: bool = False
 ) -> str | None:
     """B-175 P4 — the build cache key's knowledge-catalog slot for ``spec``:
     ``None`` when no store is wired or the spec binds fewer than two bases (the
     store is not read then), else :func:`catalog_fingerprint`.
+
+    B-267 — ``single_base`` must be the build's ``ToolEnv.kb_first_routing``
+    (the switch lists a lone base too); a mismatch would leave every such build
+    uncached (:func:`catalog_build_cacheable`).
 
     It reads the spec as the caller holds it, before the builder merges a
     template's ``extends``: a fork that inherits its ``knowledge`` block from
@@ -292,7 +296,9 @@ async def knowledge_catalog_fingerprint(
     knowledge = spec.spec.knowledge
     if store is None or knowledge is None:
         return None
-    return await catalog_fingerprint(store, tenant_id=tenant_id, refs=knowledge.knowledge_base_refs)
+    return await catalog_fingerprint(
+        store, tenant_id=tenant_id, refs=knowledge.knowledge_base_refs, single_base=single_base
+    )
 
 
 def catalog_build_cacheable(keyed: str | None, built: BuiltAgent, *, checked: bool) -> bool:
@@ -342,6 +348,10 @@ class AgentRuntime:
     #: cache key's catalog fingerprint (see ``_CacheKey``). ``None`` leaves the
     #: slot empty: a catalog edit then waits for the TTL.
     knowledge_store: KnowledgeStore | None = None
+    #: B-267 —— 平台总开关 ``Settings.kb_first_routing``(``app.py`` 与构建用的
+    #: ``ToolEnv.kb_first_routing`` 取同一个设置)。开时只绑 1 个库的智能体也有目录,
+    #: 缓存键的目录槽据此去读;``False``(测试 / 未接线)= 与开关关闭相同。
+    kb_first_routing: bool = False
     #: Stream SE (SE-7d-3b-ii) — emits ``skill_run_usage`` at each run's terminal
     #: hook (one row per distilled skill bound), feeding the rollback monitor.
     #: ``None`` disables emission (the monitor then stays a safe no-op).
@@ -566,7 +576,12 @@ class AgentRuntime:
             version,
             compute_spec_sha256(spec),
             oauth_subject,
-            await knowledge_catalog_fingerprint(self.knowledge_store, spec, tenant_id=tenant_id),
+            await knowledge_catalog_fingerprint(
+                self.knowledge_store,
+                spec,
+                tenant_id=tenant_id,
+                single_base=self.kb_first_routing,
+            ),
         )
         return key, user_pool
 
@@ -2172,6 +2187,8 @@ def build_tool_env(
     artifact_snapshots: ArtifactSnapshotStore | None = None,
     conversation_seed_lock: KeyedLock | None = None,
     workspace_quota: SeedQuotaGate | None = None,
+    kb_first_routing: bool = False,
+    web_search_fixtures_dir: str | None = None,
 ) -> ToolEnv:
     """Assemble the M0 :class:`ToolEnv`.
 
@@ -2209,6 +2226,9 @@ def build_tool_env(
         conversation_seed_lock=conversation_seed_lock or ProcessKeyedLock(),
         # B-236 review 7 —— 开场复制前问的配额闸(与上传同一道)。
         workspace_quota=workspace_quota,
+        # B-267 —— 平台总开关与 web_search 夹具目录(都来自 Settings)。
+        kb_first_routing=kb_first_routing,
+        web_search_fixtures_dir=web_search_fixtures_dir,
     )
 
 

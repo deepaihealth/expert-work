@@ -1,0 +1,24 @@
+# B-267 —— web_search 固定结果替身的夹具,只挂在测试环境的 control-plane 上。
+# 夹具文件由本 overlay 的 configMapGenerator(web-search-fixtures)生成,目录由
+# configmap-patch.yaml 的 EXPERT_WORK_WEB_SEARCH_FIXTURES_DIR 指过来;智能体在 manifest
+# 的 web_search 条目写 `config.fixture: <名字>` 选 `<名字>.json`。生产 overlay 不挂、不配:
+# 在那里选夹具会在构建时报配置错误,不会退回真搜索。
+# 夹具源文件在 tools/eval/datasets/kb_route/(kustomize 不能读 overlay 外的文件,所以这里
+# 是一份拷贝,tools/eval/test_kb_route_web_fixture.py 校验两份逐字节相同)。
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: control-plane
+spec:
+  template:
+    spec:
+      containers:
+        - name: control-plane
+          volumeMounts:
+            - name: web-search-fixtures
+              mountPath: /etc/expert-work/web-search-fixtures
+              readOnly: true
+      volumes:
+        - name: web-search-fixtures
+          configMap:
+            name: web-search-fixtures
