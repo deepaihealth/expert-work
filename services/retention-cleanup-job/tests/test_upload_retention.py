@@ -493,7 +493,7 @@ async def test_a_fifo_leaf_does_not_hang_the_job(world: _World) -> None:
 async def test_a_symlinked_user_root_is_not_followed(
     world: _World, tmp_path_factory: pytest.TempPathFactory
 ) -> None:
-    """``{user}`` 目录沙箱碰不到:它是软链说明环境不对 —— 不跟、整个 pass 失败、行不动。"""
+    """``{user}`` 目录是软链:不跟;按这个用户处理 —— 他的行这一轮不标,pass 记失败。"""
     meta = await world.thread(layout="agent_root")
     elsewhere = tmp_path_factory.mktemp("elsewhere")
     victim = elsewhere / thread_workspace_path(_REF, meta)
@@ -504,8 +504,9 @@ async def test_a_symlinked_user_root_is_not_followed(
     upload = await world.register(meta.thread_id)
     job = world.job()
 
-    assert _counts(await job._sweep_uploads()) == (0, 0, 0)
+    tally = await job._sweep_uploads()
 
+    assert (_counts(tally), tally.owners_unavailable) == ((0, 0, 0), 1)
     assert job._failed_passes == ["uploads"]
     assert victim.read_bytes() == _BODY
     assert not await world.deleted(upload)
@@ -1031,7 +1032,7 @@ def _another_user(world: _World) -> _World:
 @pytest.mark.asyncio
 @_as_root
 async def test_an_unreadable_tenant_dir_fails_the_pass_and_touches_no_row(world: _World) -> None:
-    """``{tenant}`` 沙箱碰不到:读不了是环境问题(作业 uid / NAS 属主),不是这一行的路径坏了。"""
+    """``{tenant}`` 读不了不是这一行的路径坏了:行不动、pass 记失败。"""
     meta = await world.thread(layout="conversation")
     real = world.place(meta)
     upload = await world.register(meta.thread_id)
@@ -1158,3 +1159,79 @@ async def test_transient_failures_log_once_per_class_with_a_count(
         "retention.upload_rows_failed class=OSError/EIO count=2"
     ]
     assert records[0].exc_info is not None
+
+
+# ------------------------------------------------------------ review round 4 (owner dirs)
+
+
+@pytest.mark.asyncio
+@_as_root
+async def test_one_users_unreadable_root_skips_only_that_user(
+    world: _World, caplog: pytest.LogCaptureFixture
+) -> None:
+    """没绑 agent 的会话以整个用户根为 ``/workspace``,模型能 ``chmod 000`` 它:只跳过这个用户
+    这一轮的行(第二条不再碰盘),别的用户照常到期,pass 记失败(退出码 3)。"""
+    locked_user = _another_user(world)
+    metas = [await locked_user.thread(layout="conversation") for _ in range(2)]
+    locked_rows = []
+    for meta in metas:
+        locked_user.place(meta)
+        locked_rows.append(await locked_user.register(meta.thread_id))
+    other = await world.thread(layout="conversation")
+    other_file = world.place(other)
+    other_upload = await world.register(other.thread_id, created_at=_OLD + timedelta(hours=1))
+    locked_user.user_dir.chmod(0o000)
+    try:
+        job = world.job()
+        with caplog.at_level(logging.ERROR, logger="retention_cleanup_job.uploads"):
+            tally = await job._sweep_uploads()
+    finally:
+        locked_user.user_dir.chmod(0o755)
+
+    # 第二条不再碰盘、不再刷一遍错误。
+    owner_errors = [r for r in caplog.records if "upload_owner_unavailable" in r.getMessage()]
+    assert len(owner_errors) == 1
+    assert (_counts(tally), tally.owners_unavailable, tally.rows_owner_skipped) == (
+        (1, 1, 0),
+        1,
+        2,
+    )
+    assert job._failed_passes == ["uploads"]
+    assert not other_file.exists()
+    assert await world.deleted(other_upload)
+    assert not any([await locked_user.deleted(r) for r in locked_rows])
+
+
+@pytest.mark.asyncio
+@_as_root
+async def test_unreadable_roots_for_many_users_abort_the_pass_keeping_its_tally(
+    world: _World,
+) -> None:
+    """超过 3 个用户的用户根都打不开:更像环境问题,整个 pass 中止;中止前做了的照样计数。"""
+    first = await world.thread(layout="conversation")
+    first_file = world.place(first)
+    first_upload = await world.register(first.thread_id, created_at=_OLD - timedelta(days=1))
+    locked = []
+    for _ in range(4):
+        who = _another_user(world)
+        meta = await who.thread(layout="conversation")
+        who.place(meta)
+        locked.append((who, await who.register(meta.thread_id)))
+    last = await world.thread(layout="conversation")
+    last_file = world.place(last)
+    last_upload = await world.register(last.thread_id, created_at=_OLD + timedelta(hours=1))
+    for who, _ in locked:
+        who.user_dir.chmod(0o000)
+    try:
+        job = world.job()
+        tally = await job._sweep_uploads()
+    finally:
+        for who, _ in locked:
+            who.user_dir.chmod(0o755)
+
+    assert job._failed_passes == ["uploads"]
+    assert (_counts(tally), tally.owners_unavailable) == ((1, 1, 0), 4)
+    assert not first_file.exists() and await world.deleted(first_upload)
+    assert not any([await who.deleted(upload) for who, upload in locked])
+    # 中止之后的行这一轮没处理。
+    assert last_file.exists() and not await world.deleted(last_upload)

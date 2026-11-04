@@ -40,6 +40,8 @@ class CleanupReport:
     upload_rows_abandoned: int = 0
     #: B-271 —— 要放弃的行涉及的用户太多(像环境问题),熔断拦下、这一轮没标的行。
     upload_rows_held: int = 0
+    #: B-271 —— ``{tenant}`` / ``{user}`` 目录打不开的用户数(他们这一轮的上传行跳过、不标)。
+    upload_owners_unavailable: int = 0
     # 留存链 B-27 —— 孤儿 threads/<id>/ 目录。
     thread_dirs_removed: int = 0
     #: B-50 spec §4.2 —— 孤儿 ``.tool_results/<run_id>/``。此前从没被清过

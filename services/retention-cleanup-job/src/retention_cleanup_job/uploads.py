@@ -24,7 +24,9 @@
 「放弃」(路径不可用、过期太久)**先看完全批、后标记**:涉及的用户超过
 :data:`_BREAKER_MAX_USERS` 个就一条都不标(``rows_held``)—— 那更像环境(uid / NAS 属主漂了)
 或代码回归。有行被放弃或被拦下,调用方都把这个 pass 记成失败(进程退出码 3),让人去看。
-配置的工作区根、``{tenant}`` / ``{user}`` 目录打不开同样是环境问题,整个 pass 失败。
+某个用户的 ``{tenant}`` / ``{user}`` 目录打不开(不是不在):只跳过这个用户这一轮的行,
+pass 记失败,别的用户照常 —— 没绑 agent 的会话以整个用户根为 ``/workspace``,模型 ``chmod``
+得到它;超过 :data:`_BREAKER_MAX_USERS` 个用户这样、或配置的工作区根自己打不开,整个 pass 中止。
 """
 
 from __future__ import annotations
@@ -46,6 +48,7 @@ from expert_work.persistence.workspace.layout import WORKSPACE_UPLOADS_DIR
 from expert_work.protocol import ThreadMeta, UserUpload
 from retention_cleanup_job.workspace_files import (
     UnsafeWorkspacePathError,
+    WorkspaceOwnerUnavailableError,
     WorkspaceRootUnavailableError,
     open_upload_file,
     upload_relpath,
@@ -66,6 +69,7 @@ _IN_CHUNK = 5000
 _SHA256_RE = re.compile(r"[0-9a-f]{64}")
 
 _ThreadKey = tuple[UUID, UUID]
+_OwnerKey = tuple[UUID, UUID]
 #: 为什么放弃一行:路径不可用 / 过了到期日太久还在失败。
 _GiveUp = Literal["unsafe", "abandoned"]
 
@@ -122,11 +126,15 @@ class UploadSweepTally:
     rows_abandoned: int = 0
     #: 熔断(:data:`_BREAKER_MAX_USERS`)拦下、这一轮没标的「放弃」行。
     rows_held: int = 0
+    #: ``{tenant}`` / ``{user}`` 目录打不开的用户数;他们这一轮的文档行跳过、不标。
+    owners_unavailable: int = 0
+    #: 因为属主目录打不开而跳过的行。
+    rows_owner_skipped: int = 0
 
     @property
     def needs_attention(self) -> bool:
-        """有行被放弃或被熔断拦下 —— 调用方把这个 pass 记成失败,让人去看。"""
-        return self.rows_abandoned > 0 or self.rows_held > 0
+        """有行被放弃、被熔断拦下,或有用户的目录打不开 —— 调用方把这个 pass 记成失败,让人去看。"""
+        return self.rows_abandoned > 0 or self.rows_held > 0 or self.owners_unavailable > 0
 
 
 def _chunks(ids: Iterable[UUID]) -> Iterator[list[UUID]]:
@@ -157,6 +165,9 @@ class UploadSweep:
         self._root = root
         self._audit = audit
         self._metas: dict[_ThreadKey, ThreadMeta | None] = {}
+        #: 这一轮的计数;pass 中途中止时调用方照样拿得到已经做了的部分。
+        self.tally = UploadSweepTally()
+        self._bad_owners: set[_OwnerKey] = set()
 
     async def run(
         self, expired: list[UserUpload], *, cutoff: datetime, now: datetime
@@ -169,10 +180,13 @@ class UploadSweep:
             # 补 sha256 是锦上添花:读不到就退回只比大小,不让整个 pass 失败。
             logger.warning("retention.upload_audit_lookup_failed", exc_info=True)
             audited = {}
-        tally = UploadSweepTally()
+        tally = self.tally
         giving_up: list[tuple[UserUpload, _GiveUp]] = []
         failures: dict[str, _FailureClass] = {}
         for row in expired:
+            if (row.tenant_id, row.user_id) in self._bad_owners and _is_document(row):
+                tally.rows_owner_skipped += 1
+                continue
             try:
                 if await self._release(row, audited.get(row.id, row.sha256), cutoff, tally):
                     await self._mark(row, now, tally)
@@ -180,6 +194,8 @@ class UploadSweep:
                     giving_up.append((row, "unsafe"))
             except WorkspaceRootUnavailableError:
                 raise
+            except WorkspaceOwnerUnavailableError:
+                self._owner_unavailable(row)
             except Exception as exc:
                 if row.created_at >= cutoff - _GIVE_UP_AFTER:
                     _note_failure(failures, row, exc)
@@ -194,6 +210,24 @@ class UploadSweep:
         _log_failures(failures)
         await self._give_up(giving_up, now, tally)
         return tally
+
+    def _owner_unavailable(self, row: UserUpload) -> None:
+        """这个用户的 ``{tenant}`` / ``{user}`` 目录打不开:他这一轮的文档行都跳过、不标(一个
+        没绑 agent 的会话里的模型就能 ``chmod`` 掉自己的用户根,不能让它停掉所有人的到期)。
+        超过 :data:`_BREAKER_MAX_USERS` 个用户这样 → 更像环境问题,整个 pass 中止。"""
+        self._bad_owners.add((row.tenant_id, row.user_id))
+        self.tally.owners_unavailable = len(self._bad_owners)
+        self.tally.rows_owner_skipped += 1
+        logger.error(
+            "retention.upload_owner_unavailable tenant=%s user=%s upload_id=%s",
+            row.tenant_id,
+            row.user_id,
+            row.id,
+            exc_info=True,
+        )
+        if len(self._bad_owners) > _BREAKER_MAX_USERS:
+            msg = f"workspace owner directories unusable for {len(self._bad_owners)} users"
+            raise WorkspaceRootUnavailableError(msg)
 
     async def _release(
         self, row: UserUpload, sha256: str | None, cutoff: datetime, tally: UploadSweepTally

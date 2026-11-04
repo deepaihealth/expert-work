@@ -292,6 +292,7 @@ class RetentionCleanupJob:
             upload_rows_failed=uploads.rows_failed,
             upload_rows_abandoned=uploads.rows_abandoned,
             upload_rows_held=uploads.rows_held,
+            upload_owners_unavailable=uploads.owners_unavailable,
             failed_passes=tuple(self._failed_passes),
             thread_dirs_removed=thread_dirs_removed,
             tool_result_dirs_removed=tool_result_dirs_removed,
@@ -604,9 +605,10 @@ class RetentionCleanupJob:
         except Exception:
             logger.exception("retention.upload_sweep_failed")
             self._failed_passes.append("uploads")
-            return UploadSweepTally()
+            return sweep.tally  # 中止之前已经做了的照样计数
         if tally.needs_attention:
-            # 有行被放弃(过期太久还在失败)或被熔断拦下:进程以非 0 退出,让人去看。
+            # 有行被放弃(过期太久还在失败)、被熔断拦下,或有用户的目录打不开:进程以非 0
+            # 退出,让人去看。
             self._failed_passes.append("uploads")
         return tally
 

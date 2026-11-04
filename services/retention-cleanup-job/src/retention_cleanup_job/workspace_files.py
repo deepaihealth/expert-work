@@ -251,6 +251,13 @@ class WorkspaceRootUnavailableError(Exception):
     失败、明天再来,不能把每一行都当成坏路径处理。"""
 
 
+class WorkspaceOwnerUnavailableError(Exception):
+    """``{tenant}`` 或 ``{user}`` 目录打不开(不是不在)。可能是环境(作业 uid / NAS 属主漂了),
+    也可能是会话里的模型:没绑 agent 的会话以整个用户根为 ``/workspace``
+    (``orchestrator.tools.workspace_scope`` 的 ``SCOPE_USER_ROOT``),``chmod 000 /workspace``
+    就是这一级。所以按**这一个用户**处理:跳过他这一轮的行、不标,pass 记失败;别的用户照常。"""
+
+
 @contextmanager
 def _in_user_subtree(name: str) -> Iterator[None]:
     """把用户子树里(``{tenant}`` 及以下)的 ``OSError`` 分三类:不在 →
@@ -290,21 +297,25 @@ def _open_child(parent_fd: int, name: str, flags: int) -> int:
         return os.open(name, flags, dir_fd=parent_fd)
 
 
-#: ``{tenant}`` / ``{user}`` 两段:沙箱只挂到 ``{tenant}/{user}`` 之下,碰不到这两级目录。
+#: ``{tenant}`` / ``{user}`` 两段 —— 一个用户的工作区「属主」那两级。沙箱挂的是 ``{tenant}/{user}``
+#: 这个 subPath:``{tenant}`` 它碰不到;``{user}`` 就是没绑 agent 的会话的 ``/workspace`` 本身,
+#: 模型 ``chmod`` 得到它(见 :class:`WorkspaceOwnerUnavailableError`)。
 _OWNER_SEGMENTS = 2
 
 
 def _open_owner_dir(parent_fd: int, name: str) -> int:
     """打开 ``{tenant}`` 或 ``{user}``。不在 → 文件本来就没了(工作区已归档);其它任何错误
-    (``EACCES``、软链……)都不可能是会话里的模型造成的 → 环境问题(作业 uid / NAS 属主漂了),
-    :class:`WorkspaceRootUnavailableError`:整个 pass 失败、行不动。"""
+    (``EACCES``、软链……)→ :class:`WorkspaceOwnerUnavailableError`:跳过这个用户这一轮的行、
+    行不动(调用方按用户处理,用户多了才整个 pass 中止)。"""
     try:
         return os.open(name, _DIR_FLAGS, dir_fd=parent_fd)
     except FileNotFoundError as exc:
         raise _PathMissingError from exc
     except OSError as exc:
         code = errno.errorcode.get(exc.errno or 0, str(exc.errno))
-        raise WorkspaceRootUnavailableError(f"workspace owner directory unusable ({code})") from exc
+        raise WorkspaceOwnerUnavailableError(
+            f"workspace owner directory unusable ({code})"
+        ) from exc
 
 
 def _close_all(fds: list[int]) -> None:
@@ -315,8 +326,8 @@ def _close_all(fds: list[int]) -> None:
 def _open_parent_chain(root: str, dirs: list[str]) -> list[int]:
     """从 ``root``(启动时校验过不是软链)起逐段打开 ``dirs``,回全部 fd(最后一个是叶子的父目录)。
     哪一段不在 → :class:`_PathMissingError`;是软链 / 不是目录 → :class:`UnsafeWorkspacePathError`。
-    ``root`` 自己、或 ``{tenant}`` / ``{user}`` 打不开(不是不在)→
-    :class:`WorkspaceRootUnavailableError`。出错时已打开的 fd 全部关掉。"""
+    ``root`` 自己打不开 → :class:`WorkspaceRootUnavailableError`;``{tenant}`` / ``{user}`` 打不开
+    (不是不在)→ :class:`WorkspaceOwnerUnavailableError`。出错时已打开的 fd 全部关掉。"""
     try:
         fds = [os.open(Path(root).resolve(), os.O_RDONLY | os.O_DIRECTORY)]
     except OSError as exc:
@@ -390,8 +401,9 @@ def open_upload_file(
     模型写得到的地方,检查之后把某一段换成指向别的用户目录的软链也改不了删的是哪个文件。
     任何一段是软链 / 不是目录、叶子不是普通文件(含 FIFO,``O_NONBLOCK`` 打开不阻塞)、以及用户
     子树里除暂时性以外的任何 ``OSError``(``chmod 000`` 的目录 / 文件、套接字……)→
-    :class:`UnsafeWorkspacePathError`;暂时性的(:data:`_TRANSIENT_ERRNOS`)原样抛;``root``
-    自己打不开 → :class:`WorkspaceRootUnavailableError`。哪一段不在 → ``"missing"``。
+    :class:`UnsafeWorkspacePathError`;暂时性的(:data:`_TRANSIENT_ERRNOS`)原样抛;``{tenant}`` /
+    ``{user}`` 打不开 → :class:`WorkspaceOwnerUnavailableError`;``root`` 自己打不开 →
+    :class:`WorkspaceRootUnavailableError`。哪一段不在 → ``"missing"``。
     大小或内容与登记时不一致 → ``"changed"``。都对 → ``"present"``,调用方
     :meth:`OpenedUpload.unlink` / ``close``。
     """
@@ -701,6 +713,7 @@ __all__ = [
     "ToolResultDir",
     "UnsafeWorkspacePathError",
     "UploadFileOutcome",
+    "WorkspaceOwnerUnavailableError",
     "WorkspaceRootUnavailableError",
     "deleted_marker",
     "iter_thread_dirs",
