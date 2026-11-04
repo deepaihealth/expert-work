@@ -40,6 +40,7 @@ bare ``{"detail": ...}`` shape.
 
 from __future__ import annotations
 
+import hashlib
 import logging
 from typing import Annotated
 from uuid import UUID, uuid4
@@ -320,6 +321,7 @@ def build_external_uploads_router() -> APIRouter:
                     mime_type=content_type,
                     size_bytes=doc_result.size_bytes,
                     filename=doc_result.path.rsplit("/", 1)[-1],
+                    sha256=doc_result.sha256,
                 )
                 return JSONResponse(
                     status_code=201,
@@ -377,6 +379,8 @@ def build_external_uploads_router() -> APIRouter:
                 mime_type=content_type,
                 size_bytes=len(raw),
                 filename=f"{image_ref.image_id}{image_ref.ext}",
+                # B-271 —— 同 ``image_upload.sha256``:``raw`` 就是落进对象存储的那份字节。
+                sha256=hashlib.sha256(raw).hexdigest(),
             )
             return JSONResponse(
                 status_code=201,

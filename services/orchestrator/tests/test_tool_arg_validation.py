@@ -8,6 +8,7 @@ from typing import Any
 from uuid import uuid4
 
 import pytest
+from prometheus_client import REGISTRY
 
 from orchestrator import ToolContext, ToolResult, ToolSpec
 from orchestrator.graph_builder.builder import _invoke_tool, _validate_tool_args
@@ -112,3 +113,138 @@ async def test_invoke_tool_dispatches_valid_args() -> None:
     assert msg.status != "error"
     assert tool.calls == [{"url": "https://x"}]
     assert classified is None
+
+
+# --- B-272: stringified array / object arguments --------------------------
+
+_REGION_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "question": {"type": "string"},
+        "region": {
+            "anyOf": [
+                {"type": "string", "enum": ["auto"]},
+                {
+                    "type": "array",
+                    "items": {"type": "integer", "minimum": 0, "maximum": 1000},
+                    "minItems": 4,
+                    "maxItems": 4,
+                },
+            ]
+        },
+        "headers": {"type": "object"},
+    },
+    "required": ["question"],
+    "additionalProperties": False,
+}
+
+
+def _coerced_count() -> float:
+    return (
+        REGISTRY.get_sample_value("expert_work_tool_args_coerced_total", {"tool": "fetch"}) or 0.0
+    )
+
+
+@pytest.mark.asyncio
+async def test_stringified_array_is_restored_and_dispatched() -> None:
+    tool = _SchemaTool(parameters=_REGION_SCHEMA)
+    args = {"question": "q", "region": "[0, 0, 100, 100]"}
+    before = _coerced_count()
+    msg, _state, _refund, classified = await _invoke_tool(tool, args, "tc-1", _ctx())
+    assert msg.status != "error"
+    assert classified is None
+    assert tool.calls == [{"question": "q", "region": [0, 0, 100, 100]}]
+    # The caller's dict (what the trajectory / audit record) keeps the model's original value.
+    assert args == {"question": "q", "region": "[0, 0, 100, 100]"}
+    assert _coerced_count() == before + 1
+
+
+@pytest.mark.asyncio
+async def test_stringified_object_is_restored_and_dispatched() -> None:
+    tool = _SchemaTool(parameters=_REGION_SCHEMA)
+    args = {"question": "q", "headers": '{"Accept": "text/plain"}'}
+    msg, *_ = await _invoke_tool(tool, args, "tc-1", _ctx())
+    assert msg.status != "error"
+    assert tool.calls == [{"question": "q", "headers": {"Accept": "text/plain"}}]
+
+
+@pytest.mark.asyncio
+async def test_still_invalid_after_restore_returns_original_error_uncalled() -> None:
+    tool = _SchemaTool(parameters=_REGION_SCHEMA)
+    args = {"question": "q", "region": "[0, 0, 100]"}  # three numbers, not four
+    before = _coerced_count()
+    msg, _state, _refund, classified = await _invoke_tool(tool, args, "tc-1", _ctx())
+    assert msg.status == "error"
+    assert str(msg.content) == f"[invalid args] {_validate_tool_args(tool, args)}"
+    assert not tool.calls
+    assert classified is not None and classified.error_class == "invalid_arguments"
+    assert _coerced_count() == before
+
+
+@pytest.mark.asyncio
+async def test_restore_requires_the_whole_copy_to_validate() -> None:
+    """A restorable key does not rescue a call whose other key is still wrong."""
+    tool = _SchemaTool(parameters=_REGION_SCHEMA)
+    args = {"question": 7, "region": "[0, 0, 100, 100]"}
+    msg, *_ = await _invoke_tool(tool, args, "tc-1", _ctx())
+    assert msg.status == "error"
+    assert str(msg.content) == f"[invalid args] {_validate_tool_args(tool, args)}"
+    assert not tool.calls
+
+
+@pytest.mark.asyncio
+async def test_non_json_string_is_still_rejected() -> None:
+    tool = _SchemaTool(parameters=_REGION_SCHEMA)
+    msg, *_ = await _invoke_tool(tool, {"question": "q", "region": "0,0,100,100"}, "tc-1", _ctx())
+    assert msg.status == "error"
+    assert not tool.calls
+
+
+@pytest.mark.asyncio
+async def test_json_scalar_string_is_not_restored() -> None:
+    """Only list / dict results count — ``"5"`` must not become ``5``."""
+    schema = {"type": "object", "properties": {"n": {"type": "integer"}}}
+    tool = _SchemaTool(parameters=schema)
+    msg, *_ = await _invoke_tool(tool, {"n": "5"}, "tc-1", _ctx())
+    assert msg.status == "error"
+    assert not tool.calls
+
+
+@pytest.mark.asyncio
+async def test_parameters_that_accept_strings_are_untouched() -> None:
+    tool = _SchemaTool(parameters=_REGION_SCHEMA)
+    await _invoke_tool(tool, {"question": "[1, 2]", "region": "auto"}, "tc-1", _ctx())
+    assert tool.calls == [{"question": "[1, 2]", "region": "auto"}]
+
+
+@pytest.mark.asyncio
+async def test_rejected_restore_never_echoes_the_value() -> None:
+    tool = _SchemaTool(parameters=_REGION_SCHEMA)
+    args = {"question": "q", "region": '["zz-secret-zz", 0, 0, 0]'}
+    msg, *_ = await _invoke_tool(tool, args, "tc-1", _ctx())
+    assert msg.status == "error"
+    assert "zz-secret-zz" not in str(msg.content)
+    assert not tool.calls
+
+
+@pytest.mark.asyncio
+async def test_a_deeply_nested_string_is_a_normal_invalid_args_error() -> None:
+    """Review L4 — ``json.loads`` raises RecursionError on deep nesting; that is not a crash."""
+    tool = _SchemaTool(parameters=_REGION_SCHEMA)
+    args = {"question": "q", "region": "[" * 50_000 + "]" * 50_000}
+    msg, *_ = await _invoke_tool(tool, args, "tc-1", _ctx())
+    assert msg.status == "error"
+    assert str(msg.content).startswith("[invalid args] ")
+    assert not tool.calls
+
+
+@pytest.mark.asyncio
+async def test_an_oversized_string_is_not_parsed() -> None:
+    tool = _SchemaTool(parameters={"type": "object", "properties": {"rows": {"type": "array"}}})
+    big = "[" + ",".join(["1"] * 600_000) + "]"  # valid JSON, over 1M characters
+    msg, *_ = await _invoke_tool(tool, {"rows": big}, "tc-1", _ctx())
+    assert msg.status == "error"
+    assert not tool.calls
+    small = "[" + ",".join(["1"] * 1_000) + "]"
+    ok, *_ = await _invoke_tool(tool, {"rows": small}, "tc-2", _ctx())
+    assert ok.status != "error"

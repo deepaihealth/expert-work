@@ -40,8 +40,12 @@ class UserUploadStore(abc.ABC):
         mime_type: str,
         size_bytes: int,
         filename: str,
+        sha256: str | None = None,
     ) -> UserUpload:
         """Persist one row for a successful upload.
+
+        ``sha256`` (B-271) is the hex digest of the landed bytes; the retention
+        sweep compares it before deleting the file.
 
         Returns the materialised row including the server-assigned
         ``created_at`` so the caller can echo it back in the API
@@ -67,6 +71,14 @@ class UserUploadStore(abc.ABC):
         before`` 的行,最老在前。Caller MUST be inside an RLS bypass scope(the
         retention job's ``_bypass_rls``)。Already soft-deleted rows are not
         candidates — the sweep marks, it does not re-mark."""
+
+    @abc.abstractmethod
+    async def list_active_by_ref(
+        self, *, tenant_id: UUID, user_id: UUID, ref: str
+    ) -> list[UserUpload]:
+        """B-271 —— 同租户、同用户、同 ``ref``、没删(``deleted_at IS NULL``)的行,不论会话、
+        不论是否已到期。留存作业的引用检查用它找「还有谁可能指着同一个文件」(老视图同一 agent
+        的各对话共用 ``uploads/``,同名同内容复用让多行指向一个文件)。"""
 
     @abc.abstractmethod
     async def soft_delete(self, *, upload_id: UUID, tenant_id: UUID, now: datetime) -> bool:

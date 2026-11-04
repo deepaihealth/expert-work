@@ -37,7 +37,11 @@ from expert_work.protocol import (
     chunk_retrieval_text,
 )
 from orchestrator.tools.error_classifier import GuidedToolError
-from orchestrator.tools.knowledge_catalog import select_bases, with_bases_parameter
+from orchestrator.tools.knowledge_catalog import (
+    MIN_CATALOG_BASES,
+    select_bases,
+    with_bases_parameter,
+)
 from orchestrator.tools.knowledge_dedup import (
     drop_copied_children,
     passage_key,
@@ -131,6 +135,27 @@ RERANK_INSTRUCTION = (
     "the title only identifies the document"
 )
 
+#: B-267 step 1 — the knowledge-first rule, behind the platform switch
+#: ``ToolEnv.kb_first_routing``. Agents that bind a knowledge base and also have
+#: ``web_search`` picked the web for questions that read like general knowledge
+#: (test session b9cadbf4: "who wrote <a book in the bound base>") — nothing told
+#: them the base holds the tenant's own documents. In the tool description only,
+#: so an agent with no knowledge base never sees it.
+KNOWLEDGE_FIRST_RULE = (
+    "The bound knowledge base holds the tenant's own documents. Search it before answering "
+    "any question about a topic, person, product, document or term — including ones that "
+    "read like general knowledge — unless the message is small talk or cannot involve the "
+    "documents. A name or description of the knowledge base does not show everything it "
+    "contains, so it cannot rule out an answer."
+)
+#: The same rule for an agent binding two or more bases.
+MULTI_KNOWLEDGE_FIRST_RULE = (
+    "The bound knowledge bases hold the tenant's own documents. Search them before answering "
+    "any question about a topic, person, product, document or term — including ones that "
+    "read like general knowledge — unless the message is small talk or cannot involve the "
+    "documents. A name or description of a knowledge base does not show everything it "
+    "contains, so it cannot rule out an answer."
+)
 #: B-175 wave 2 PR3 — what the model is told about a knowledge result. Results
 #: are the closest passages, which are often on topic without stating the fact
 #: asked (a question about a product the documents cover, for a detail they never
@@ -700,6 +725,12 @@ class KnowledgeRetriever:
             )
             return exc
 
+    async def query_vector(self, query: str, tenant_id: UUID) -> tuple[float, ...] | None:
+        """B-267 —— ``query`` embedded exactly as a search embeds it (the
+        per-turn probe compares it with the same vectors); ``None`` when the
+        embedding vendor failed."""
+        return await self._embed_query(query, tenant_id)
+
     async def _embed_query(self, query: str, tenant_id: UUID) -> tuple[float, ...] | None:
         """The query's vector — ``None`` when the embedding vendor failed (B-206
         K-8): the search then runs on keywords alone and says so, logged here
@@ -1038,6 +1069,9 @@ class KnowledgeSearchTool:
 
     retriever: KnowledgeRetriever
     knowledge_base_refs: tuple[str, ...]
+    #: B-267 — add :data:`KNOWLEDGE_FIRST_RULE` to the description (the
+    #: platform switch ``ToolEnv.kb_first_routing``); off keeps it byte-identical.
+    knowledge_first: bool = False
 
     @property
     def spec(self) -> ToolSpec:
@@ -1047,12 +1081,19 @@ class KnowledgeSearchTool:
 
     @property
     def _base_spec(self) -> ToolSpec:
+        rule = (
+            MULTI_KNOWLEDGE_FIRST_RULE
+            if len(self.knowledge_base_refs) >= MIN_CATALOG_BASES
+            else KNOWLEDGE_FIRST_RULE
+        )
+        first = f" {rule}" if self.knowledge_first else ""
         return ToolSpec(
             name="knowledge_search",
             description=(
                 "Search the tenant's knowledge base for information relevant "
                 "to a query. Use it to ground answers in internal documents "
-                f"rather than guessing. {KNOWLEDGE_ANSWERABILITY_RULE} {KNOWLEDGE_SEARCH_GUIDANCE}"
+                f"rather than guessing.{first} {KNOWLEDGE_ANSWERABILITY_RULE} "
+                f"{KNOWLEDGE_SEARCH_GUIDANCE}"
             ),
             parameters={
                 "type": "object",

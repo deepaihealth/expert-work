@@ -63,12 +63,20 @@ class EstimateKind(StrEnum):
     EMBEDDING = "embedding"
     RECOGNITION = "recognition"
     FIGURE = "figure"
+    #: B-267 —— the base profile refreshed once the documents are in (one call
+    #: of the platform's auxiliary model), and the probe calibration (a fixed
+    #: set of generic queries embedded). Only while the platform switch
+    #: ``kb_first_routing`` is on.
+    PROFILE = "profile"
+    PROFILE_CALIBRATION = "profile_calibration"
 
 
 class EstimateUnit(StrEnum):
     CHUNKS = "chunks"
     PAGES = "pages"
     FIGURES = "figures"
+    BASES = "bases"
+    QUERIES = "queries"
 
 
 class EstimateBasis(StrEnum):
@@ -80,6 +88,9 @@ class EstimateBasis(StrEnum):
     CATALOG_AVERAGE = "catalog_average"
     #: The platform's generic averages (「按通用均值估」): the catalog declares none.
     DEFAULT_AVERAGE = "default_average"
+    #: B-267 —— the most the call can take (the base profile's prompt is cut to
+    #: a fixed budget): the bill is usually lower.
+    UPPER_BOUND = "upper_bound"
 
 
 class EstimateNote(StrEnum):
@@ -105,6 +116,9 @@ class EstimateNote(StrEnum):
     #: A figure is counted as one description call: a chart's data and a
     #: text-heavy figure's text take more calls — charts may cost more.
     FIGURE_EXTRA_CALLS_NOT_COUNTED = "figure_extra_calls_not_counted"
+    #: B-267 —— the base profile is refreshed once per base after a batch of
+    #: documents is in, yet every document's estimate counts it.
+    PROFILE_ONCE_PER_BASE = "profile_once_per_base"
 
 
 class EstimateItem(BaseModel):
@@ -147,10 +161,16 @@ class EstimateModels(BaseModel):
     recognition: str | None = None
     fallback: str | None = None
     figure: str | None = None
+    #: B-267 —— the auxiliary model the base profile is refreshed with (``None``:
+    #: no profile counted). Joins the fingerprint only when set, so estimates
+    #: made without it keep the fingerprint they had.
+    profile: str | None = None
 
     def fingerprint(self) -> str:
         models = (self.embedding, self.recognition, self.fallback, self.figure)
         joined = "|".join(model or "" for model in models)
+        if self.profile is not None:
+            joined += f"|profile={self.profile}"
         return hashlib.sha256(joined.encode("utf-8")).hexdigest()[:16]
 
 

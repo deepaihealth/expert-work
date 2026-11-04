@@ -239,3 +239,61 @@ async def test_list_documents_for_thread_keeps_this_threads_live_documents() -> 
 
     rows = await store.list_documents_for_thread(tenant_id=tenant, thread_id=thread)
     assert [r.id for r in rows] == [first, second]
+
+
+@pytest.mark.asyncio
+async def test_insert_records_sha256_and_old_rows_have_none() -> None:
+    """B-271 —— 上传时算出的 sha256 落进登记行;不给(老调用点)就是 ``None``。"""
+    store = InMemoryUserUploadStore()
+    tenant = uuid4()
+    common = {
+        "tenant_id": tenant,
+        "user_id": uuid4(),
+        "thread_id": uuid4(),
+        "kind": "document",
+        "ref": "uploads/a.pdf",
+        "mime_type": "application/pdf",
+        "size_bytes": 3,
+        "filename": "a.pdf",
+    }
+    hashed = await store.insert(upload_id=uuid4(), sha256="ab" * 32, **common)  # type: ignore[arg-type]
+    legacy = await store.insert(upload_id=uuid4(), **common)  # type: ignore[arg-type]
+    assert hashed.sha256 == "ab" * 32
+    assert legacy.sha256 is None
+    fetched = await store.get(upload_id=hashed.id, tenant_id=tenant)
+    assert fetched is not None and fetched.sha256 == "ab" * 32
+
+
+@pytest.mark.asyncio
+async def test_list_active_by_ref_matches_tenant_user_and_ref_only_live_rows() -> None:
+    """B-271 —— 留存作业的引用检查:同租户、同用户、同 ``ref``、没删的行,不论会话、不论新旧。"""
+    store = InMemoryUserUploadStore()
+    tenant, user = uuid4(), uuid4()
+
+    async def _put(
+        *, tenant_id: UUID = tenant, user_id: UUID = user, ref: str = "uploads/a.pdf"
+    ) -> UUID:
+        uid = uuid4()
+        await store.insert(
+            upload_id=uid,
+            tenant_id=tenant_id,
+            user_id=user_id,
+            thread_id=uuid4(),
+            kind="document",
+            ref=ref,
+            mime_type="application/pdf",
+            size_bytes=3,
+            filename="a.pdf",
+        )
+        return uid
+
+    first = await _put()
+    second = await _put()
+    await _put(ref="uploads/b.pdf")
+    await _put(user_id=uuid4())
+    await _put(tenant_id=uuid4())
+    gone = await _put()
+    await store.soft_delete(upload_id=gone, tenant_id=tenant, now=datetime.now(UTC))
+
+    rows = await store.list_active_by_ref(tenant_id=tenant, user_id=user, ref="uploads/a.pdf")
+    assert sorted(r.id for r in rows) == sorted([first, second])

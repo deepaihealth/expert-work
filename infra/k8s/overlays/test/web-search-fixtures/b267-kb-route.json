@@ -1,0 +1,406 @@
+{
+  "entries": [
+    {
+      "id": "precool-reefer",
+      "match": [
+        ["预冷"],
+        ["冷藏车", "预冷"],
+        ["预冷", "时间"],
+        ["预冷", "多久"],
+        ["预冷", "温度"],
+        ["precool"]
+      ],
+      "results": [
+        {
+          "title": "冷藏车预冷操作要点",
+          "url": "https://encyclopedia.example.org/wiki/reefer-precooling",
+          "content": "冷藏车装货前一般需要预冷约 30 分钟,使车厢温度降到货物要求的温度范围后再装货;预冷时间与车厢大小、环境温度有关。"
+        }
+      ]
+    },
+    {
+      "id": "freezer-temperature",
+      "match": [
+        ["冷冻", "温度"],
+        ["冷冻库"],
+        ["冷冻区"],
+        ["冷冻", "标准"],
+        ["frozen", "storage"],
+        ["freezer"]
+      ],
+      "results": [
+        {
+          "title": "冷冻食品贮存温度要求",
+          "url": "https://encyclopedia.example.org/wiki/frozen-storage",
+          "content": "冷冻食品的贮存温度通常要求保持在 -18℃ 及以下,这也是冷链行业最常见的冷冻库标准;温度波动应尽量控制在 ±2℃ 以内。"
+        }
+      ]
+    },
+    {
+      "id": "refrigerated-temperature",
+      "match": [
+        ["冷藏", "温度"],
+        ["冷藏区"],
+        ["冷藏库"],
+        ["refrigerat"]
+      ],
+      "results": [
+        {
+          "title": "冷藏储存温度范围",
+          "url": "https://encyclopedia.example.org/wiki/refrigerated-storage",
+          "content": "冷藏药品和多数冷藏食品的储存温度范围通常为 2℃~8℃,超出范围需评估对产品质量的影响。"
+        }
+      ]
+    },
+    {
+      "id": "cool-storage-temperature",
+      "match": [
+        ["阴凉"],
+        ["cool", "storage"]
+      ],
+      "results": [
+        {
+          "title": "阴凉库温度要求",
+          "url": "https://encyclopedia.example.org/wiki/cool-storage",
+          "content": "阴凉库(阴凉区)一般指温度不高于 20℃ 的储存场所,常用于对温度有一定要求但不需冷藏的物品。"
+        }
+      ]
+    },
+    {
+      "id": "room-temperature-storage",
+      "match": [
+        ["常温库"],
+        ["常温区"],
+        ["常温", "温度"],
+        ["常温", "储存"],
+        ["room", "temperature", "storage"]
+      ],
+      "results": [
+        {
+          "title": "常温库温度范围",
+          "url": "https://encyclopedia.example.org/wiki/room-temperature-storage",
+          "content": "常温库的温度范围通常为 10℃~30℃,相对湿度保持在适宜范围内。"
+        }
+      ]
+    },
+    {
+      "id": "warehouse-humidity",
+      "match": [
+        ["仓库", "湿度"],
+        ["库房", "湿度"],
+        ["仓储", "湿度"],
+        ["储存", "湿度"],
+        ["warehouse", "relative", "humidity"],
+        ["warehouse", "humidity"]
+      ],
+      "results": [
+        {
+          "title": "仓库湿度控制范围",
+          "url": "https://encyclopedia.example.org/wiki/warehouse-humidity",
+          "content": "仓库的相对湿度一般控制在 35%~75% 之间,湿度过高易受潮霉变,过低易产生静电或干裂。"
+        }
+      ]
+    },
+    {
+      "id": "logger-calibration",
+      "match": [
+        ["校准"],
+        ["calibrat"]
+      ],
+      "results": [
+        {
+          "title": "温湿度记录仪的校准周期",
+          "url": "https://encyclopedia.example.org/wiki/data-logger-calibration",
+          "content": "温湿度记录仪等计量器具通常每 12 个月(一年)校准一次,使用频繁或环境恶劣时可适当缩短周期。"
+        }
+      ]
+    },
+    {
+      "id": "dew-point-saturation",
+      "match": [
+        ["露点", "湿度"],
+        ["dew", "humidity"]
+      ],
+      "results": [
+        {
+          "title": "露点与相对湿度",
+          "url": "https://encyclopedia.example.org/wiki/dew-point-and-humidity",
+          "content": "当气温降到露点时,空气中的水汽达到饱和,此时相对湿度为 100%;气温与露点越接近,相对湿度越高。"
+        }
+      ]
+    },
+    {
+      "id": "dew-point",
+      "match": [
+        ["露点"],
+        ["dew", "point"],
+        ["dewpoint"]
+      ],
+      "results": [
+        {
+          "title": "露点",
+          "url": "https://encyclopedia.example.org/wiki/dew-point",
+          "content": "露点是在气压和水汽含量不变的条件下,空气冷却到水汽开始凝结成露水时的温度。露点越高说明空气中的水汽越多。"
+        }
+      ]
+    },
+    {
+      "id": "relative-humidity",
+      "match": [
+        ["相对湿度"],
+        ["relative", "humidity"]
+      ],
+      "results": [
+        {
+          "title": "相对湿度",
+          "url": "https://encyclopedia.example.org/wiki/relative-humidity",
+          "content": "相对湿度是空气中实际水汽压与同温度下饱和水汽压之比,即实际含水量占最大可容纳水汽量的百分比,单位为 %RH。"
+        }
+      ]
+    },
+    {
+      "id": "celsius-fahrenheit",
+      "match": [
+        ["摄氏", "华氏"],
+        ["华氏度"],
+        ["celsius", "fahrenheit"]
+      ],
+      "results": [
+        {
+          "title": "摄氏度与华氏度换算",
+          "url": "https://encyclopedia.example.org/wiki/celsius-fahrenheit",
+          "content": "华氏度 = 摄氏度 × 9/5 + 32,即摄氏度乘以 1.8 再加 32;摄氏度 = (华氏度 − 32) × 5/9。"
+        }
+      ]
+    },
+    {
+      "id": "mean-kinetic-temperature",
+      "match": [
+        ["平均动力学温度"],
+        ["动力学温度"],
+        ["mkt"],
+        ["mean", "kinetic", "temperature"]
+      ],
+      "results": [
+        {
+          "title": "平均动力学温度(MKT)",
+          "url": "https://encyclopedia.example.org/wiki/mean-kinetic-temperature",
+          "content": "平均动力学温度(MKT)是把一段时间内波动的储存温度折算成的单一等效恒定温度,用于评估温度波动对产品稳定性的综合影响。它按阿伦尼乌斯方程计算,高温时段权重更大(呈指数关系),因此 MKT 通常高于算术平均温度。"
+        }
+      ]
+    },
+    {
+      "id": "resolution-vs-accuracy",
+      "match": [
+        ["分辨率", "精度"],
+        ["分辨率", "准确度"],
+        ["resolution", "accuracy"]
+      ],
+      "results": [
+        {
+          "title": "仪表的分辨率与精度",
+          "url": "https://encyclopedia.example.org/wiki/resolution-vs-accuracy",
+          "content": "分辨率是仪器能显示或识别的最小变化量;精度(准确度)是测量值与真实值之间的接近程度,常用最大允许误差或偏差表示。分辨率高不等于精度高。"
+        }
+      ]
+    },
+    {
+      "id": "cold-chain-break",
+      "match": [
+        ["断链"],
+        ["冷链", "中断"],
+        ["cold", "chain", "break"]
+      ],
+      "results": [
+        {
+          "title": "冷链断链",
+          "url": "https://encyclopedia.example.org/wiki/cold-chain-break",
+          "content": "冷链「断链」指货物在运输、装卸或储存的某一环节脱离了规定的温度控制,导致冷链不连续,可能影响产品质量与安全。"
+        }
+      ]
+    },
+    {
+      "id": "beijing-weather",
+      "match": [
+        ["北京", "天气"],
+        ["beijing", "weather"]
+      ],
+      "results": [
+        {
+          "title": "北京天气预报",
+          "url": "https://news.example.com/weather/beijing",
+          "content": "北京今天多云转晴,气温 8℃~17℃,北风 2~3 级,空气质量良。"
+        }
+      ]
+    },
+    {
+      "id": "usd-cny-rate",
+      "match": [
+        ["美元", "人民币"],
+        ["美元", "汇率"],
+        ["usd", "cny"],
+        ["dollar", "yuan"],
+        ["dollar", "rmb"]
+      ],
+      "results": [
+        {
+          "title": "人民币汇率中间价",
+          "url": "https://news.example.com/finance/usd-cny",
+          "content": "今日银行间外汇市场人民币汇率中间价:1 美元对人民币 7.1 元左右,较上一交易日小幅波动。"
+        }
+      ]
+    },
+    {
+      "id": "tech-news",
+      "match": [
+        ["科技", "新闻"],
+        ["科技", "动态"],
+        ["科技", "资讯"],
+        ["tech", "news"],
+        ["technology", "news"]
+      ],
+      "results": [
+        {
+          "title": "科技要闻",
+          "url": "https://news.example.com/tech",
+          "content": "本周科技要闻:多家厂商发布新一代人工智能芯片;国内首个商用量子计算云平台扩容;多款折叠屏手机新品上市。"
+        },
+        {
+          "title": "科技动态",
+          "url": "https://news.example.com/tech/weekly",
+          "content": "人工智能大模型应用继续向办公、医疗等行业落地;新能源汽车智能驾驶功能持续更新。"
+        }
+      ]
+    },
+    {
+      "id": "everest-height",
+      "match": [
+        ["珠穆朗玛"],
+        ["珠峰"],
+        ["everest"]
+      ],
+      "results": [
+        {
+          "title": "珠穆朗玛峰高程",
+          "url": "https://encyclopedia.example.org/wiki/mount-everest",
+          "content": "2020 年中国与尼泊尔联合宣布,珠穆朗玛峰最新测定的雪面高程为 8848.86 米。"
+        }
+      ]
+    },
+    {
+      "id": "world-cup-2026",
+      "match": [
+        ["世界杯"],
+        ["world", "cup"]
+      ],
+      "results": [
+        {
+          "title": "2026 年世界杯",
+          "url": "https://encyclopedia.example.org/wiki/2026-world-cup",
+          "content": "2026 年国际足联世界杯由美国、加拿大和墨西哥三国联合举办,是首届 48 支球队参赛的世界杯。"
+        }
+      ]
+    },
+    {
+      "id": "latest-iphone",
+      "match": [
+        ["iphone"],
+        ["苹果", "手机"]
+      ],
+      "results": [
+        {
+          "title": "苹果新品发布",
+          "url": "https://news.example.com/tech/apple",
+          "content": "苹果在今年秋季发布会上推出了新一代 iPhone 系列,包括标准版、Plus 与 Pro 机型。"
+        }
+      ]
+    },
+    {
+      "id": "france-capital",
+      "match": [
+        ["法国", "首都"],
+        ["france", "capital"]
+      ],
+      "results": [
+        {
+          "title": "法国",
+          "url": "https://encyclopedia.example.org/wiki/france",
+          "content": "法国的首都是巴黎,也是法国最大的城市。"
+        }
+      ]
+    },
+    {
+      "id": "speed-of-light",
+      "match": [
+        ["光速"],
+        ["speed", "light"]
+      ],
+      "results": [
+        {
+          "title": "光速",
+          "url": "https://encyclopedia.example.org/wiki/speed-of-light",
+          "content": "真空中的光速是 299792458 米/秒,约为 30 万千米/秒(3×10^8 m/s)。"
+        }
+      ]
+    },
+    {
+      "id": "cr2477-price",
+      "match": [
+        ["cr2477"]
+      ],
+      "results": [
+        {
+          "title": "CR2477 纽扣电池",
+          "url": "https://news.example.com/shop/cr2477",
+          "content": "CR2477 是 3V 锂锰纽扣电池,网购单颗价格一般在 10~20 元之间。"
+        }
+      ]
+    },
+    {
+      "id": "shanghai-hotel",
+      "match": [
+        ["上海", "酒店"],
+        ["上海", "住宿"],
+        ["shanghai", "hotel"]
+      ],
+      "results": [
+        {
+          "title": "上海酒店价格参考",
+          "url": "https://news.example.com/travel/shanghai-hotels",
+          "content": "上海市区每晚 600~700 元一般可以住到中档连锁或商务型酒店,高档酒店通常每晚 1000 元以上。"
+        }
+      ]
+    },
+    {
+      "id": "express-delivery-time",
+      "match": [
+        ["快递", "几天"],
+        ["快递", "时效"],
+        ["快递", "送达"],
+        ["快递", "多久"]
+      ],
+      "results": [
+        {
+          "title": "国内快递时效",
+          "url": "https://news.example.com/logistics/express",
+          "content": "国内快递同城一般 1 天、省内 1~2 天、跨省 2~4 天送达,偏远地区更久。"
+        }
+      ]
+    },
+    {
+      "id": "logger-accuracy",
+      "match": [
+        ["记录仪", "精度"],
+        ["精度", "同类"],
+        ["logger", "accuracy"]
+      ],
+      "results": [
+        {
+          "title": "温湿度记录仪精度对比",
+          "url": "https://encyclopedia.example.org/wiki/data-logger-accuracy",
+          "content": "常见温湿度记录仪的温度精度多在 ±0.5℃ 左右,较好的产品可达 ±0.2℃~±0.3℃。"
+        }
+      ]
+    }
+  ]
+}

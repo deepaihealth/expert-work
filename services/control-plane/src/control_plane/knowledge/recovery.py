@@ -40,6 +40,7 @@ from control_plane.knowledge.ingestion import (
     start_paid_ingest,
 )
 from control_plane.knowledge.parsed_size import DocumentTooLargeError, Hold, reserve_raw_bytes
+from control_plane.knowledge.profile import schedule_after_ingest
 from control_plane.knowledge.recognition.figure_pipeline import FigureDescriber
 from control_plane.knowledge.recognition.figure_storage import delete_figures_quietly
 from control_plane.knowledge.recognition.recognizer import DocumentRecognizer
@@ -104,6 +105,7 @@ class KnowledgeIngestRecoveryWorker:
         estimator: IngestEstimator | None = None,
         audit: AuditLogger | None = None,
         object_store: ObjectStore | None = None,
+        profile_refresh: bool = False,
     ) -> None:
         if interval_s <= 0:
             msg = "interval_s must be positive"
@@ -130,6 +132,9 @@ class KnowledgeIngestRecoveryWorker:
         self.local = local if local is not None else LocalIngests()
         #: B-222 PR-2 —— audits each estimate withdrawn on its deadline.
         self._audit = audit
+        #: B-267 —— the platform switch ``kb_first_routing``: a ready document
+        #: whose confirmed estimate counted the profile asks for its refresh.
+        self._profile_refresh = profile_refresh
         self._task: asyncio.Task[None] | None = None
         self._stop = asyncio.Event()
 
@@ -421,6 +426,8 @@ class KnowledgeIngestRecoveryWorker:
                 finishing.set()
             # This claim's chunks are in place and READY, in one transaction.
             written = ready = True
+            # B-267 —— its confirmed estimate counted the base profile: refresh it.
+            await schedule_after_ingest(self._store, claim, enabled=self._profile_refresh)
         except Exception as exc:
             if isinstance(exc, StaleIngestionError) and not isinstance(exc, ModelsCheckFailedError):
                 # 重传 / 已被别的认领收尾 —— 本次驱动的结果作废,什么都不写。

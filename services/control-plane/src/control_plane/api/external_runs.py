@@ -41,6 +41,7 @@ from control_plane.api._idempotency import (
 )
 from control_plane.api._quota_admission import check_admission
 from control_plane.api._run_event_stream import EXTERNAL_HIDDEN_EVENTS
+from control_plane.api._run_progress import run_info_fields
 from control_plane.api._run_usage import make_usage_loader
 from control_plane.api._user_scope import get_user_repo
 from control_plane.api.agents import (
@@ -473,6 +474,13 @@ def build_external_runs_router() -> APIRouter:
             limit=limit,
             offset=offset,
         )
+        # B-269 / B-270 —— 开始时刻、心跳、排在谁后面、进度;一个会话一次、整页一次。
+        run_fields = await run_info_fields(
+            runs=runs,
+            events=getattr(request.app.state, "run_event_store", None),
+            rows=rows,
+            same_user=True,
+        )
         return JSONResponse(
             {
                 "success": True,
@@ -505,6 +513,7 @@ def build_external_runs_router() -> APIRouter:
                             "exit_reason": r.exit_reason,
                             # B-226 ⑥ —— why not done: ``[{tool, kind}]``, null = no record.
                             "unresolved_failures": r.unresolved_failures,
+                            **run_fields[r.run_id],
                         }
                         for r in rows
                     ],

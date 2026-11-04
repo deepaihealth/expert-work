@@ -20,7 +20,7 @@ def test_required_keys_present() -> None:
     B-35 ``plan_first_dispatch_plan_hash`` / ``plan_first_dispatch_active``
     / ``plan_first_dispatch_retries``,本轮附件 ``turn_documents`` /
     ``turn_image_refs``,B-85 ③ ``unresolved_failures`` / ``exit_reason``,
-    B-64 ``viewed_figures`` / ``figure_documents``,
+    B-64 ``viewed_figures`` / ``figure_documents``, B-268 ``figure_reads``,
     B-126 ``context_summary``, B-168 ``written_memory_count`` / ``memory_writeback_failed`` /
     ``memory_writeback_queued``, B-226 ``step_budget_warned`` / ``loop_trip_count``
     (B-226 drops ``no_progress_streak``: the no-progress stop counts trips per run),
@@ -67,6 +67,7 @@ def test_required_keys_present() -> None:
         "plan_first_dispatched_steps",
         "viewed_figures",
         "figure_documents",
+        "figure_reads",
         "context_summary",
         "seed_skipped_dirs",
         "seed_quota_blocked",

@@ -207,3 +207,62 @@ async def test_document_uploads_for_thread_is_targeted(sql_store: SqlStoreFixtur
         )
     finally:
         await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_document_uploads_for_threads_is_one_batched_window_read(
+    sql_store: SqlStoreFixture,
+) -> None:
+    """B-271 —— 与内存实现同一谓词:本租户、``document:upload``、成功、``details->>'thread_id'``
+    在这批会话里、``occurred_at`` 在 ``[since, until]``。"""
+    from datetime import UTC, datetime, timedelta
+
+    store, engine = sql_store
+    try:
+        tenant, first_thread, second_thread = uuid4(), uuid4(), uuid4()
+
+        async def _put(
+            thread_id: UUID,
+            *,
+            tenant_id: UUID = tenant,
+            action: AuditAction = AuditAction.DOCUMENT_UPLOAD,
+            result: AuditResult = AuditResult.SUCCESS,
+        ) -> AuditEntry:
+            entry = _entry(tenant_id, action=action, resource_type="user_workspace", result=result)
+            return await store.append(
+                entry.model_copy(update={"details": {"thread_id": str(thread_id)}})
+            )
+
+        a = await _put(first_thread)
+        b = await _put(second_thread)
+        await _put(uuid4())
+        await _put(first_thread, tenant_id=uuid4())
+        await _put(first_thread, action=AuditAction.MANIFEST_WRITE)
+        await _put(first_thread, result=AuditResult.DENIED)
+        now = datetime.now(UTC)
+
+        got = await store.list_document_uploads_for_threads(
+            tenant_id=tenant,
+            thread_ids=[first_thread, second_thread],
+            since=now - timedelta(minutes=5),
+            until=now + timedelta(minutes=5),
+        )
+        assert [e.id for e in got] == [a.id, b.id]
+        for since, until in (
+            (now + timedelta(minutes=5), now + timedelta(minutes=10)),
+            (now - timedelta(minutes=10), now - timedelta(minutes=5)),
+        ):
+            assert (
+                await store.list_document_uploads_for_threads(
+                    tenant_id=tenant, thread_ids=[first_thread], since=since, until=until
+                )
+                == []
+            )
+        assert (
+            await store.list_document_uploads_for_threads(
+                tenant_id=tenant, thread_ids=[], since=now - timedelta(minutes=5), until=now
+            )
+            == []
+        )
+    finally:
+        await engine.dispose()

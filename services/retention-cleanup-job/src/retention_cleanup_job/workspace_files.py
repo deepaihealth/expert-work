@@ -21,17 +21,23 @@ job 只删 (a) 登记过的产物文件 (b) ``uploads/`` 下登记过的文件 (
 
 from __future__ import annotations
 
+import errno
+import hashlib
 import logging
 import os
 import re
 import shutil
 import stat
 from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
+from typing import Literal
 from uuid import UUID
 
 from expert_work.persistence import WORKSPACE_AGENTS_DIR
+from expert_work.protocol import ThreadMeta
+from expert_work.protocol.agent_key import sanitize_agent_key
 
 logger = logging.getLogger(__name__)
 
@@ -193,6 +199,244 @@ def unlink_registered_file(root: str, tenant_id: UUID, user_id: UUID, relpath: s
     except FileNotFoundError:
         return False
     return True
+
+
+#: :func:`open_upload_file` / :meth:`OpenedUpload.unlink` 的结果:还在(已打开)/ 删了 /
+#: 本来就不在 / 与登记时不一致或打开后被换掉所以没删。
+UploadFileOutcome = Literal["present", "removed", "missing", "changed"]
+
+#: 逐段打开目录:不跟软链(``O_NOFOLLOW`` 只管最后一段,所以必须一段一段开)。
+_DIR_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+#: 叶子:不跟软链;``O_NONBLOCK`` 让被换成 FIFO 的叶子不会把整个作业卡死在 ``open`` 上。
+_LEAF_FLAGS = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK
+#: 用户子树里出这些 errno 算**暂时性**的(NAS / NFS 抖动、一时资源不够、整卷只读这类环境
+#: 问题,不是这一行的路径坏了):这一行跳过、明天再试。其余 errno 都算这一行自己的路径不可用
+#: —— 软链(``ELOOP``,BSD 系 ``EMLINK``)、非目录(``ENOTDIR``)、``chmod 000``(``EACCES`` /
+#: ``EPERM``)、套接字(Linux ``ENXIO``、macOS ``EOPNOTSUPP``)……:作业与沙箱同一个 uid,会话里
+#: 的模型就能把文件弄成这样,重试不会变好,留着不标只会天天排在最前。
+_TRANSIENT_ERRNOS = frozenset(
+    getattr(errno, name)
+    for name in (
+        "EIO",
+        "ESTALE",
+        "ETIMEDOUT",
+        "EINTR",
+        "EAGAIN",
+        "EWOULDBLOCK",
+        "ENOMEM",
+        "EMFILE",
+        "ENFILE",
+        "EBUSY",
+        "EROFS",
+        "ENOLCK",
+        "EDEADLK",
+        "ENOTCONN",
+        "ECONNRESET",
+        "ECONNABORTED",
+        "EHOSTDOWN",
+        "EHOSTUNREACH",
+        "ENETDOWN",
+        "ENETUNREACH",
+    )
+    if hasattr(errno, name)
+)
+
+
+class _PathMissingError(Exception):
+    """路径上某一段不在 —— 文件本来就没了。"""
+
+
+class WorkspaceRootUnavailableError(Exception):
+    """配置的工作区根本身打不开 —— 环境问题(NAS 没挂上 / 掉了),不归哪一行:整个 pass
+    失败、明天再来,不能把每一行都当成坏路径处理。"""
+
+
+class WorkspaceOwnerUnavailableError(Exception):
+    """``{tenant}`` 或 ``{user}`` 目录打不开(不是不在)。可能是环境(作业 uid / NAS 属主漂了),
+    也可能是会话里的模型:没绑 agent 的会话以整个用户根为 ``/workspace``
+    (``orchestrator.tools.workspace_scope`` 的 ``SCOPE_USER_ROOT``),``chmod 000 /workspace``
+    就是这一级。所以按**这一个用户**处理:跳过他这一轮的行、不标,pass 记失败;别的用户照常。"""
+
+
+@contextmanager
+def _in_user_subtree(name: str) -> Iterator[None]:
+    """把用户子树里(``{tenant}`` 及以下)的 ``OSError`` 分三类:不在 →
+    :class:`_PathMissingError`;暂时性(:data:`_TRANSIENT_ERRNOS`)→ 原样抛;其余 →
+    :class:`UnsafeWorkspacePathError`(这一行的路径不可用,永久)。"""
+    try:
+        yield
+    except FileNotFoundError as exc:
+        raise _PathMissingError from exc
+    except OSError as exc:
+        if exc.errno in _TRANSIENT_ERRNOS:
+            raise
+        code = errno.errorcode.get(exc.errno or 0, str(exc.errno))
+        raise UnsafeWorkspacePathError(f"upload path is unusable ({code}): {name!r}") from exc
+
+
+def upload_relpath(ref: str, meta: ThreadMeta) -> str:
+    """一条上传登记行的 ``ref``(会话 ``/workspace`` 相对的 ``uploads/<名字>``)按会话 ``meta``
+    **当前**的 agent 与布局落成用户根相对路径(B-271)。
+
+    与 ``control_plane.api._workspace_shared.thread_workspace_path`` 同一拼法 —— 上传端点写、
+    下载端点读都走那一个。作业不 import control-plane(理由同模块头),parity 由
+    ``tests/test_upload_retention.py`` 钉住:没绑 agent → ``ref`` 本身;老视图 →
+    ``agents/<key>/<ref>``;对话视图 → ``agents/<key>/threads/<会话>/work/<ref>``。
+    """
+    if not meta.agent_name:
+        return ref
+    prefix = f"{WORKSPACE_AGENTS_DIR}/{sanitize_agent_key(meta.agent_name)}"
+    if meta.workspace_layout == "conversation":
+        prefix = f"{prefix}/{THREADS_DIR}/{meta.thread_id}/{CONVERSATION_WORK_DIR}"
+    return f"{prefix}/{ref}"
+
+
+def _open_child(parent_fd: int, name: str, flags: int) -> int:
+    """在已打开的目录 ``parent_fd`` 里打开一项(不按路径字符串重新解析)。"""
+    with _in_user_subtree(name):
+        return os.open(name, flags, dir_fd=parent_fd)
+
+
+#: ``{tenant}`` / ``{user}`` 两段 —— 一个用户的工作区「属主」那两级。沙箱挂的是 ``{tenant}/{user}``
+#: 这个 subPath:``{tenant}`` 它碰不到;``{user}`` 就是没绑 agent 的会话的 ``/workspace`` 本身,
+#: 模型 ``chmod`` 得到它(见 :class:`WorkspaceOwnerUnavailableError`)。
+_OWNER_SEGMENTS = 2
+
+
+def _open_owner_dir(parent_fd: int, name: str) -> int:
+    """打开 ``{tenant}`` 或 ``{user}``。不在 → 文件本来就没了(工作区已归档);其它任何错误
+    (``EACCES``、软链……)→ :class:`WorkspaceOwnerUnavailableError`:跳过这个用户这一轮的行、
+    行不动(调用方按用户处理,用户多了才整个 pass 中止)。"""
+    try:
+        return os.open(name, _DIR_FLAGS, dir_fd=parent_fd)
+    except FileNotFoundError as exc:
+        raise _PathMissingError from exc
+    except OSError as exc:
+        code = errno.errorcode.get(exc.errno or 0, str(exc.errno))
+        raise WorkspaceOwnerUnavailableError(
+            f"workspace owner directory unusable ({code})"
+        ) from exc
+
+
+def _close_all(fds: list[int]) -> None:
+    for fd in fds:
+        os.close(fd)
+
+
+def _open_parent_chain(root: str, dirs: list[str]) -> list[int]:
+    """从 ``root``(启动时校验过不是软链)起逐段打开 ``dirs``,回全部 fd(最后一个是叶子的父目录)。
+    哪一段不在 → :class:`_PathMissingError`;是软链 / 不是目录 → :class:`UnsafeWorkspacePathError`。
+    ``root`` 自己打不开 → :class:`WorkspaceRootUnavailableError`;``{tenant}`` / ``{user}`` 打不开
+    (不是不在)→ :class:`WorkspaceOwnerUnavailableError`。出错时已打开的 fd 全部关掉。"""
+    try:
+        fds = [os.open(Path(root).resolve(), os.O_RDONLY | os.O_DIRECTORY)]
+    except OSError as exc:
+        raise WorkspaceRootUnavailableError(
+            f"workspace root cannot be opened: {exc.strerror}"
+        ) from exc
+    try:
+        for index, part in enumerate(dirs):
+            if index < _OWNER_SEGMENTS:
+                fds.append(_open_owner_dir(fds[-1], part))
+            else:
+                fds.append(_open_child(fds[-1], part, _DIR_FLAGS))
+    except BaseException:
+        _close_all(fds)
+        raise
+    return fds
+
+
+def _same_as_registered(leaf_fd: int, size_bytes: int, sha256: str | None) -> bool:
+    """打开的那个文件还是登记时那一份吗:大小相等,登记行有 sha256 时内容哈希也相等(老行只比大小)。"""
+    if os.fstat(leaf_fd).st_size != size_bytes:
+        return False
+    if sha256 is None:
+        return True
+    with os.fdopen(os.dup(leaf_fd), "rb") as fh:
+        return hashlib.file_digest(fh, "sha256").hexdigest() == sha256
+
+
+@dataclass
+class OpenedUpload:
+    """:func:`open_upload_file` 的结果。``outcome == "present"`` 时持有叶子的父目录 fd 与叶子 fd,
+    调用方要么 :meth:`unlink`,要么不删;两种都必须 :meth:`close`。"""
+
+    outcome: UploadFileOutcome
+    parent_fd: int = -1
+    leaf_fd: int = -1
+    name: str = ""
+
+    def unlink(self) -> UploadFileOutcome:
+        """在**已打开的父目录**里删这个名字,前提是它仍是打开、核对过的那个文件
+        (``(st_dev, st_ino)`` 相同)—— 核对之后名字被换成别的文件(会话里的模型写得到)就不删。"""
+        try:
+            with _in_user_subtree(self.name):
+                opened = os.fstat(self.leaf_fd)
+                current = os.stat(self.name, dir_fd=self.parent_fd, follow_symlinks=False)
+                if (current.st_dev, current.st_ino) != (opened.st_dev, opened.st_ino):
+                    return "changed"
+                os.unlink(self.name, dir_fd=self.parent_fd)
+        except _PathMissingError:
+            return "missing"
+        return "removed"
+
+    def close(self) -> None:
+        _close_all([fd for fd in (self.leaf_fd, self.parent_fd) if fd >= 0])
+        self.leaf_fd = self.parent_fd = -1
+
+
+def open_upload_file(
+    root: str,
+    tenant_id: UUID,
+    user_id: UUID,
+    relpath: str,
+    *,
+    size_bytes: int,
+    sha256: str | None,
+) -> OpenedUpload:
+    """打开一条到期上传指向的文件并核对(B-271)。``relpath`` 来自 :func:`upload_relpath`。
+
+    从 ``root`` 起**用目录 fd 逐段**打开 ``{tenant}/{user}/…``(``openat`` + ``O_NOFOLLOW``),
+    之后的核对与删除都在这些已打开的 fd 上做,不再按路径字符串重新解析 —— 对话的 ``work/`` 是
+    模型写得到的地方,检查之后把某一段换成指向别的用户目录的软链也改不了删的是哪个文件。
+    任何一段是软链 / 不是目录、叶子不是普通文件(含 FIFO,``O_NONBLOCK`` 打开不阻塞)、以及用户
+    子树里除暂时性以外的任何 ``OSError``(``chmod 000`` 的目录 / 文件、套接字……)→
+    :class:`UnsafeWorkspacePathError`;暂时性的(:data:`_TRANSIENT_ERRNOS`)原样抛;``{tenant}`` /
+    ``{user}`` 打不开 → :class:`WorkspaceOwnerUnavailableError`;``root`` 自己打不开 →
+    :class:`WorkspaceRootUnavailableError`。哪一段不在 → ``"missing"``。
+    大小或内容与登记时不一致 → ``"changed"``。都对 → ``"present"``,调用方
+    :meth:`OpenedUpload.unlink` / ``close``。
+    """
+    parts = PurePosixPath(relpath).parts
+    if not parts or relpath.startswith("/") or "\0" in relpath or ".." in parts:
+        raise UnsafeWorkspacePathError(f"not a relative workspace path: {relpath!r}")
+    dirs = [str(tenant_id), str(user_id), *parts[:-1]]
+    try:
+        fds = _open_parent_chain(root, dirs)
+    except _PathMissingError:
+        return OpenedUpload("missing")
+    try:
+        leaf_fd = _open_child(fds[-1], parts[-1], _LEAF_FLAGS)
+    except _PathMissingError:
+        _close_all(fds)
+        return OpenedUpload("missing")
+    except BaseException:
+        _close_all(fds)
+        raise
+    opened = OpenedUpload("present", parent_fd=fds.pop(), leaf_fd=leaf_fd, name=parts[-1])
+    _close_all(fds)
+    try:
+        with _in_user_subtree(parts[-1]):
+            if not stat.S_ISREG(os.fstat(leaf_fd).st_mode):
+                raise UnsafeWorkspacePathError(f"upload is not a regular file: {parts[-1]!r}")
+            same = _same_as_registered(leaf_fd, size_bytes, sha256)
+        if not same:
+            opened.close()
+            return OpenedUpload("changed")
+    except BaseException:
+        opened.close()
+        raise
+    return opened
 
 
 def agent_subtree(user_dir: Path, agent_key: str) -> Path:
@@ -464,15 +708,21 @@ def iter_tool_result_dirs(root: str) -> Iterator[ToolResultDir]:
 __all__ = [
     "DELETED_DIR",
     "THREADS_DIR",
+    "OpenedUpload",
     "ThreadDir",
     "ToolResultDir",
     "UnsafeWorkspacePathError",
+    "UploadFileOutcome",
+    "WorkspaceOwnerUnavailableError",
+    "WorkspaceRootUnavailableError",
     "deleted_marker",
     "iter_thread_dirs",
     "iter_tool_result_dirs",
+    "open_upload_file",
     "remove_thread_dir",
     "remove_tool_result_dir",
     "unlink_registered_file",
+    "upload_relpath",
     "user_root",
     "validate_workspace_root",
 ]

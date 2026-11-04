@@ -41,6 +41,7 @@ from expert_work.runtime.runs.store import SqlRunStore
 from expert_work.runtime.storage import make_object_store
 from expert_work.runtime.storage.factory import S3CompatibleConfig
 from retention_cleanup_job.job import RetentionCleanupJob
+from retention_cleanup_job.report import CleanupReport
 from retention_cleanup_job.settings import RetentionCleanupSettings
 from retention_cleanup_job.workspace_files import validate_workspace_root
 
@@ -110,7 +111,18 @@ def configure_logging(settings: RetentionCleanupSettings, *, stream: IO[str] | N
     )
 
 
-async def _amain() -> None:
+#: B-271 —— 有 pass 失败(吞掉异常、其余 pass 照跑完)时进程的退出码,让 CronJob 显示失败。
+#: 与启动校验拒跑的 ``2`` 区分开。``backoffLimit: 1`` 会再起一个 pod 重跑一次:每个 pass 都
+#: 幂等,重跑只是多一份日志,不会多删东西。
+EXIT_PASS_FAILED = 3
+
+
+def exit_code(report: CleanupReport) -> int:
+    """``run_once`` 跑完之后进程该以什么退出:有 pass 失败 → :data:`EXIT_PASS_FAILED`。"""
+    return EXIT_PASS_FAILED if report.failed_passes else 0
+
+
+async def _amain() -> int:
     settings = RetentionCleanupSettings()
     configure_logging(settings)
     # 连库之前先定工作区根:不合格就退出,一条 DELETE 都不发。
@@ -176,8 +188,9 @@ async def _amain() -> None:
         user_upload_store = SqlUserUploadStore(session_factory)
         thread_store = SqlThreadMetaStore(session_factory)
         run_store = SqlRunStore(session_factory)
+        audit_log_store = SqlAuditLogStore(session_factory)
         audit_logger = AuditLogger(
-            store=SqlAuditLogStore(session_factory),
+            store=audit_log_store,
             redactor=DefaultSecretRedactor(),
             fallback=InMemoryAuditFallbackQueue(),
         )
@@ -209,6 +222,7 @@ async def _amain() -> None:
             run_store=run_store,
             workspace_root=workspace_root,
             audit_logger=audit_logger,
+            audit_log_store=audit_log_store,
         )
         logger.info("retention_cleanup_job.start batch=%d", settings.batch_size)
         report = await job.run_once()
@@ -218,11 +232,14 @@ async def _amain() -> None:
             "artifact_soft=%d artifact_hard=%d "
             "artifact_versions_deleted=%d artifact_files_removed=%d artifacts_expired=%d "
             "orphan_artifact_copies_removed=%d "
-            "uploads_expired=%d upload_files_removed=%d thread_dirs_removed=%d "
+            "uploads_expired=%d upload_files_removed=%d upload_files_unsafe=%d "
+            "upload_rows_failed=%d upload_rows_abandoned=%d upload_rows_held=%d "
+            "upload_owners_unavailable=%d "
+            "thread_dirs_removed=%d "
             "memory_hard_deleted=%d workspaces_hard_deleted=%d "
             "workspaces_pending_archive=%d tenant_users_hard_deleted=%d "
             "sandbox_egress_audit=%d memory_writeback_jobs=%d knowledge_tasks=%d "
-            "knowledge_revisions=%d knowledge_retrieval_logs=%d duration=%.2fs",
+            "knowledge_revisions=%d knowledge_retrieval_logs=%d failed_passes=%s duration=%.2fs",
             report.audit_deleted,
             report.audit_skipped_unacked,
             report.event_deleted,
@@ -238,6 +255,11 @@ async def _amain() -> None:
             report.orphan_artifact_copies_removed,
             report.uploads_expired,
             report.upload_files_removed,
+            report.upload_files_unsafe,
+            report.upload_rows_failed,
+            report.upload_rows_abandoned,
+            report.upload_rows_held,
+            report.upload_owners_unavailable,
             report.thread_dirs_removed,
             report.memory_hard_deleted,
             report.workspaces_hard_deleted,
@@ -248,6 +270,7 @@ async def _amain() -> None:
             report.knowledge_tasks_deleted,
             report.knowledge_revisions_deleted,
             report.knowledge_retrieval_logs_deleted,
+            ",".join(report.failed_passes) or "-",
             report.duration_seconds,
         )
         if report.audit_skipped_unacked > 0:
@@ -260,12 +283,22 @@ async def _amain() -> None:
                 "retention.image_object_keys_failed count=%d — object store unhealthy?",
                 report.image_object_keys_failed,
             )
+        if report.upload_rows_failed > 0:
+            logger.warning(
+                "retention.upload_rows_failed count=%d — retried tomorrow; abandoned after 7 days",
+                report.upload_rows_failed,
+            )
+        if report.failed_passes:
+            logger.error("retention.passes_failed passes=%s", ",".join(report.failed_passes))
 
     await engine.dispose()
+    return exit_code(report)
 
 
 def main() -> None:
-    asyncio.run(_amain())
+    code = asyncio.run(_amain())
+    if code:
+        raise SystemExit(code)
 
 
 if __name__ == "__main__":

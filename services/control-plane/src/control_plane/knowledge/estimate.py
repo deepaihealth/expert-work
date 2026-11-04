@@ -31,6 +31,11 @@ from control_plane.knowledge.estimate_counts import (
 )
 from control_plane.knowledge.parsing import FIGURE_OFFICE_EXTENSIONS, is_plain_text_file
 from control_plane.knowledge.pricing import PriceSource, price_tokens, split_model_key
+from control_plane.knowledge.profile import (
+    CALIBRATION_QUERIES,
+    calibration_tokens,
+    profile_token_bounds,
+)
 from control_plane.knowledge.recognition.ingest_parse import LocalParse
 from control_plane.knowledge.recognition.recognizer import (
     DocumentRecognizer,
@@ -129,11 +134,16 @@ class IngestEstimator:
         settings: RecognitionSettingsSource | None = None,
         recognizer: DocumentRecognizer | None = None,
         prices: PriceSource | None = None,
+        profile_model: str | None = None,
     ) -> None:
         self._store = store
         self._settings = settings
         self._recognizer = recognizer
         self._prices = prices
+        #: B-267 —— the platform auxiliary model (``provider/model``) the base
+        #: profile is refreshed with once the document is in; ``None`` (the
+        #: platform switch ``kb_first_routing`` off): no profile, no line.
+        self._profile_model = profile_model
 
     @property
     def prices(self) -> PriceSource | None:
@@ -178,6 +188,7 @@ class IngestEstimator:
         await self._embedding_line(
             lines, embedding, embedding_model, page_text + figure_text, claim.chunk_max_tokens
         )
+        await self._profile_lines(lines, embedding_model)
         if any(item.basis is EstimateBasis.DEFAULT_AVERAGE for item in lines.items):
             lines.notes.add(EstimateNote.DEFAULT_AVERAGE)
         if any(not item.priced for item in lines.items):
@@ -188,6 +199,7 @@ class IngestEstimator:
             recognition=recognition.primary if recognition is not None and reads else None,
             fallback=recognition.fallback if recognition is not None and reads else None,
             figure=figure_model if figure_count is not None and figure_count.kept else None,
+            profile=self._profile_model,
         )
         items = tuple(lines.items)
         return IngestEstimate(
@@ -422,6 +434,40 @@ class IngestEstimator:
                 basis=EstimateBasis.LOCAL_COUNT if ratio.from_catalog else _basis(ratio),
             )
         )
+
+    async def _profile_lines(self, lines: _Lines, embedding_model: str | None) -> None:
+        """B-267 —— the base profile's one call (at most its bounds) and the
+        probe calibration's generic queries, embedded like a search query.
+        One refresh per base after a batch, counted on every document."""
+        if self._profile_model is None:
+            return
+        input_bound, output_bound = profile_token_bounds()
+        lines.items.append(
+            await self._item(
+                EstimateKind.PROFILE,
+                EstimateUnit.BASES,
+                units=1,
+                reused=0,
+                model=self._profile_model,
+                input_tokens=input_bound,
+                output_tokens=output_bound,
+                basis=EstimateBasis.UPPER_BOUND,
+            )
+        )
+        ratio = _caps_average(embedding_model, "embed_tokens_per_local_token")
+        lines.items.append(
+            await self._item(
+                EstimateKind.PROFILE_CALIBRATION,
+                EstimateUnit.QUERIES,
+                units=len(CALIBRATION_QUERIES),
+                reused=0,
+                model=embedding_model,
+                input_tokens=math.ceil(calibration_tokens() * ratio.value),
+                output_tokens=0,
+                basis=EstimateBasis.LOCAL_COUNT if ratio.from_catalog else _basis(ratio),
+            )
+        )
+        lines.notes.add(EstimateNote.PROFILE_ONCE_PER_BASE)
 
     async def _item(
         self,

@@ -40,6 +40,9 @@ class AgentRunRow(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    #: B-269/B-270 (migration ``0182``): when the run first entered RUNNING.
+    #: Set once (an orphan reclaim keeps it); NULL for older rows.
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     # Stream H.3 PR 2 — Mini-ADR H-9.5. ``current_trace_id_hex()`` is 32
     # chars (16 bytes hex). NULL for legacy rows + auto-triggered runs
     # (scheduler / trigger worker that explicitly pass ``trace_id=None``).

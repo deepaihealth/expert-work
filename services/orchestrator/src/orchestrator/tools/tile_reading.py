@@ -666,7 +666,7 @@ def tile_meta(result: TileResult) -> dict[str, object]:
     return entry
 
 
-AutoPath = Literal["bands", "full_fallback", "gated"]
+AutoPath = Literal["bands", "full_fallback", "gated", "whole_question"]
 
 #: 退回整张读的原因 → 给主模型的半句话。
 _FALLBACK_REASONS: Final[dict[str, str]] = {
@@ -675,6 +675,10 @@ _FALLBACK_REASONS: Final[dict[str, str]] = {
     "none": "no band read the value",
     "bands_failed": "every band failed",
     "bands_unavailable": "the bands could not be prepared",
+    "multi_band": (
+        "more than one band reported this value, and not as one row seen twice where two "
+        "neighbouring bands overlap, so each band may have counted only its own part"
+    ),
 }
 
 
@@ -688,24 +692,50 @@ class AutoDecision:
     bands: AutoOutcome
 
 
+def _boxes_overlap(a: Box, b: Box) -> bool:
+    return a[0] < b[2] and b[0] < a[2] and a[1] < b[3] and b[1] < a[3]
+
+
+def _one_row_seen_twice(found: Sequence[TileResult]) -> bool:
+    """B-273 R2 —— 几条横条报了同一个值时,只认「相邻两条在重叠处看到同一行」:恰好两条、框有重叠
+    (只有相邻的横条重叠)、字段名相同或有一条为空。别的(三条以上、隔开的两条、字段名不同)在
+    E1 里是各条只数到自己那一截、碰巧相等 —— 按冲突处理,走整张读。"""
+    if len(found) < 2:
+        return True
+    if len(found) > 2:
+        return False
+    first, second = found
+    labels = [_label_key(r.reply.label) if r.reply is not None else "" for r in found]
+    same_label = labels[0] == labels[1] or not labels[0] or not labels[1]
+    return same_label and _boxes_overlap(first.tile.box, second.tile.box)
+
+
 def decide_auto(
-    results: Sequence[TileResult], *, full_answer: str | None, full_error: str | None
+    results: Sequence[TileResult],
+    *,
+    full_answer: str | None,
+    full_error: str | None,
 ) -> AutoDecision:
     """横条读数 + 并行的整张读 → 最终答案(重设计 §4)。
 
-    * 横条给出一个前后一致的值、且没有一条报 ``partial`` → 用它(``bands``);
+    * 横条给出一个前后一致的值、且没有一条报 ``partial`` → 用它(``bands``);几条都报了这个值时
+      只认相邻两条在重叠处看到的同一行(R2,:func:`_one_row_seen_twice`),否则走整张读;
     * 冲突、全无、有横条报 ``partial``(那条只数到了自己那一截,验证里它推翻过整张读的正确
       计数)或横条全失败 → 用整张读的回答,明说不确定,横条的读数与框附在后面(``full_fallback``);
     * 要退回整张读、整张读却失败了 → 只给横条的汇总,并说明整张读失败(仍记 ``bands``)。
     """
     verdict = aggregate_tiles(results)
     has_partial = any(r.reply is not None and r.reply.status == "partial" for r in results)
-    if verdict.outcome == "single" and not has_partial:
+    found = [r for r in results if r.reply is not None and r.reply.status == "found"]
+    seen_once = _one_row_seen_twice(found)
+    if verdict.outcome == "single" and not has_partial and seen_once:
         return AutoDecision("bands", "single", verdict.content, verdict.outcome)
     if all(r.reply is None for r in results):
         reason = "bands_failed"
     elif has_partial:
         reason = "partial"
+    elif verdict.outcome == "single":
+        reason = "multi_band"
     else:
         reason = verdict.outcome
     if full_answer is None:
@@ -722,3 +752,64 @@ def decide_auto(
         f"below, or say the value is uncertain.)\nBand readings: {verdict.content}"
     )
     return AutoDecision("full_fallback", reason, content, verdict.outcome)
+
+
+_NUMBER_IN_TEXT_RE: Final = re.compile(r"\d+(?:\.\d+)?")
+
+
+def _answer_gives(answer: str, reply: TileReply) -> bool:
+    """整张读的回答里有没有这条横条读到的值:数一律按数比(都在回答里出现过),别的按归一后的子串。"""
+    reading = parse_reading(reply.value, reply.unit)
+    if reading.numbers:
+        given = {Decimal(n) for n in _NUMBER_IN_TEXT_RE.findall(canonical_text(answer))}
+        return all(n in given for n in reading.numbers)
+    return _flat(reply.value) in _flat(answer)
+
+
+def _labelled_field(found: Sequence[TileResult]) -> TileResult | None:
+    """横条读到的、像「一个印着名字的字段」的那个值:恰好一条带字段名,或相邻两条在重叠处看到
+    同一行(R2)且至少一条带字段名。别的情形(没有字段名、隔开的几条、三条以上)都不算。"""
+    labelled = [r for r in found if r.reply is not None and r.reply.label]
+    if not labelled or not _one_row_seen_twice(found):
+        return None
+    return labelled[0]
+
+
+def decide_whole_question(
+    results: Sequence[TileResult],
+    *,
+    full_answer: str | None,
+    full_error: str | None,
+    count_question: bool,
+) -> AutoDecision:
+    """B-273 V1 —— 整体类问题(``question_scope``):以整张读为准,横条只用来提示一句。
+
+    词表会把个别查值问题(名称里带「平均」「count」的测量项)误判成整体类问题;横条照样并行读
+    (与切条那条路同样的开销)。但整体类问题上「一条横条报了自己那一截的数」是常态(E1:111 次里
+    45 次),所以只在下面三条同时成立时提示:不是计数类问题;横条给出**一个**前后一致的值、而且
+    是带字段名的那种(:func:`_labelled_field`);整张读的回答里没有这个值。提示的措辞中立 ——
+    不说哪一个更可能对,只说横条只看到一部分、要查印着的值就放大那个字段。整张读失败 → 照常走
+    :func:`decide_auto`。
+    """
+    if full_answer is None:
+        return decide_auto(results, full_answer=full_answer, full_error=full_error)
+    verdict = aggregate_tiles(results)
+    found = [r for r in results if r.reply is not None and r.reply.status == "found"]
+    field = _labelled_field(found) if verdict.outcome == "single" and not count_question else None
+    if (
+        field is not None
+        and field.reply is not None
+        and not _answer_gives(full_answer, field.reply)
+    ):
+        content = (
+            f"{full_answer}\n\n(region='auto': whole-image reading: the answer above. A band "
+            f"(which sees only part of the image) read field '{field.reply.label}' as "
+            f"{_display(field)} at region={list(field.tile.box)}. If the question asks for a "
+            "value printed in the image, check that field with a region zoom.)"
+        )
+        return AutoDecision("whole_question", "bands_disagree", content, verdict.outcome)
+    content = (
+        f"{full_answer}\n\n(region='auto': the question is about the whole image (counting, "
+        "totals, highest or lowest, ranking or trends), so the whole-image reading is used.)"
+    )
+    return AutoDecision("whole_question", "agrees", content, verdict.outcome)

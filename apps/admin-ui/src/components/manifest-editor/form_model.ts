@@ -229,7 +229,12 @@ export interface AgentManifest {
     } | null;
     // RAG — tenant knowledge bases this agent may search (activates the
     // knowledge_search tool). Block absent = no knowledge access.
-    knowledge?: { knowledge_base_refs?: string[]; [k: string]: unknown } | null;
+    // B-267 — ``probe: false`` turns the per-turn knowledge probe off (default on).
+    knowledge?: {
+      knowledge_base_refs?: string[];
+      probe?: boolean;
+      [k: string]: unknown;
+    } | null;
     // Stream RT-1 (RT-ADR-4) — structured final reply: a JSON Schema the
     // agent's FINAL assistant message must validate against (intermediate
     // tool-calling turns are unaffected). Flat schemas are editable in the
@@ -1549,7 +1554,8 @@ export const readKnowledgeRefs = (m: unknown): string[] =>
 export function setKnowledgeRefs(m: unknown, refs: string[]): AgentManifest {
   const knowledge = specOf(m).knowledge ?? {};
   if (refs.length === 0) {
-    const { knowledge_base_refs: _dropped, ...rest } = knowledge;
+    // ``probe`` means nothing without a base: it goes with the refs.
+    const { knowledge_base_refs: _dropped, probe: _probe, ...rest } = knowledge;
     return patchSpec(m, {
       knowledge: Object.keys(rest).length > 0 ? rest : undefined,
     });
@@ -1557,6 +1563,16 @@ export function setKnowledgeRefs(m: unknown, refs: string[]): AgentManifest {
   return patchSpec(m, {
     knowledge: { ...knowledge, knowledge_base_refs: refs },
   });
+}
+
+// B-267 — the per-turn knowledge probe: on unless the manifest says
+// ``probe: false``; only ``false`` is written (on = key absent).
+export const readKnowledgeProbe = (m: unknown): boolean =>
+  specOf(m).knowledge?.probe !== false;
+
+export function setKnowledgeProbe(m: unknown, on: boolean): AgentManifest {
+  const { probe: _dropped, ...rest } = specOf(m).knowledge ?? {};
+  return patchSpec(m, { knowledge: on ? rest : { ...rest, probe: false } });
 }
 
 // ---- skills (attached skill refs) ----

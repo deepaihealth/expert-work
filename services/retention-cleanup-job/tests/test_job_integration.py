@@ -16,6 +16,7 @@ The test app role is granted both ``audit_writer`` (for seeding) and
 
 from __future__ import annotations
 
+import hashlib
 import os
 import time
 from collections.abc import Iterator
@@ -31,6 +32,7 @@ from sqlalchemy import create_engine, text
 from sqlalchemy.ext.asyncio import AsyncEngine
 from testcontainers.postgres import PostgresContainer
 
+from control_plane.api._workspace_shared import thread_workspace_path
 from expert_work.persistence import (
     DatabaseConfig,
     SqlAuditLogStore,
@@ -668,31 +670,45 @@ async def test_workspace_rules_end_to_end_against_postgres(
         style = _write(user, "style/rules.md")
         memory_md = _write(user, "MEMORY.md")
 
-        # ---- uploads: old (goes) + fresh (stays) ----------------------------
-        old_upload = await uploads.insert(
-            upload_id=uuid4(),
-            tenant_id=tenant,
-            user_id=user,
-            thread_id=uuid4(),
-            kind="document",
-            ref="uploads/old.pdf",
-            mime_type="application/pdf",
-            size_bytes=1,
-            filename="old.pdf",
+        # ---- uploads (B-271): files at the REAL locations, per the thread's layout ----
+        # A conversation-view thread: old (goes) + fresh (stays) in its own ``work/uploads/``.
+        conv_thread = await threads.create(
+            thread_id=uuid4(), tenant_id=tenant, created_by="u", user_id=user, agent_name="bot"
         )
-        fresh_upload = await uploads.insert(
-            upload_id=uuid4(),
-            tenant_id=tenant,
-            user_id=user,
-            thread_id=uuid4(),
-            kind="document",
-            ref="uploads/new.pdf",
-            mime_type="application/pdf",
-            size_bytes=1,
-            filename="new.pdf",
-        )
-        old_upload_file = _write(user, "uploads/old.pdf")
-        fresh_upload_file = _write(user, "uploads/new.pdf")
+        # Two old-view threads of the same agent share ``agents/<key>/uploads/``: the old
+        # row's file is still the fresh row's file → stays.
+        shared_threads = [
+            await threads.create(
+                thread_id=uuid4(), tenant_id=tenant, created_by="u", user_id=user, agent_name="bot"
+            )
+            for _ in range(2)
+        ]
+
+        async def _upload(thread_id: UUID, ref: str) -> UUID:
+            row = await uploads.insert(
+                upload_id=uuid4(),
+                tenant_id=tenant,
+                user_id=user,
+                thread_id=thread_id,
+                kind="document",
+                ref=ref,
+                mime_type="application/pdf",
+                size_bytes=1,
+                filename=ref.rsplit("/", 1)[-1],
+                sha256=hashlib.sha256(b"x").hexdigest(),
+            )
+            return row.id
+
+        old_upload = await _upload(conv_thread.thread_id, "uploads/old.pdf")
+        fresh_upload = await _upload(conv_thread.thread_id, "uploads/new.pdf")
+        shared_old = await _upload(shared_threads[0].thread_id, "uploads/shared.pdf")
+        shared_fresh = await _upload(shared_threads[1].thread_id, "uploads/shared.pdf")
+        agent_root_meta = shared_threads[0].model_copy(update={"workspace_layout": "agent_root"})
+        old_upload_file = _write(user, thread_workspace_path("uploads/old.pdf", conv_thread))
+        fresh_upload_file = _write(user, thread_workspace_path("uploads/new.pdf", conv_thread))
+        shared_file = _write(user, thread_workspace_path("uploads/shared.pdf", agent_root_meta))
+        assert "/work/uploads/" in str(old_upload_file)
+        assert "/work/" not in str(shared_file)
 
         # ---- threads: live row (dir stays) + orphan dir (goes) --------------
         live_thread, orphan_thread = uuid4(), uuid4()
@@ -730,13 +746,22 @@ async def test_workspace_rules_end_to_end_against_postgres(
                     ),
                     {"v": old_v.id},
                 )
-                conn.execute(
-                    text(
-                        "UPDATE user_upload SET created_at = now() - interval '100 days' "
-                        "WHERE id = :u"
-                    ),
-                    {"u": old_upload.id},
-                )
+                for upload_id in (old_upload, shared_old):
+                    conn.execute(
+                        text(
+                            "UPDATE user_upload SET created_at = now() - interval '100 days' "
+                            "WHERE id = :u"
+                        ),
+                        {"u": upload_id},
+                    )
+                for thread in shared_threads:
+                    conn.execute(
+                        text(
+                            "UPDATE thread_meta SET workspace_layout = 'agent_root' "
+                            "WHERE thread_id = :t"
+                        ),
+                        {"t": thread.thread_id},
+                    )
         finally:
             admin.dispose()
 
@@ -762,6 +787,7 @@ async def test_workspace_rules_end_to_end_against_postgres(
         assert not orphan_dir.exists()
         assert fresh_file.exists()
         assert fresh_upload_file.exists()
+        assert shared_file.exists()
         assert style.exists() and memory_md.exists()
         assert (live_dir / "MEMORY.md").exists()
 
@@ -777,10 +803,24 @@ async def test_workspace_rules_end_to_end_against_postgres(
         }
         assert by_name["report.pptx"].deleted_at is not None
         assert by_name["plan.json"].deleted_at is None
-        old_row = await uploads.get(upload_id=old_upload.id, tenant_id=tenant)
-        fresh_row = await uploads.get(upload_id=fresh_upload.id, tenant_id=tenant)
-        assert old_row is not None and old_row.deleted_at is not None
-        assert fresh_row is not None and fresh_row.deleted_at is None
+        upload_rows = {
+            name: await uploads.get(upload_id=upload_id, tenant_id=tenant)
+            for name, upload_id in {
+                "old": old_upload,
+                "fresh": fresh_upload,
+                "shared_old": shared_old,
+                "shared_fresh": shared_fresh,
+            }.items()
+        }
+        assert {
+            name: row is not None and row.deleted_at is not None
+            for name, row in upload_rows.items()
+        } == {"old": True, "fresh": False, "shared_old": True, "shared_fresh": False}
+        # The CI integration job shares one database across packages, so other tests'
+        # expired upload rows can be swept too: the per-row and per-file checks above are
+        # the exact ones, the report counts are lower bounds (like the thread/workspace ones).
+        assert report.uploads_expired >= 2
+        assert report.upload_files_removed >= 1
         assert await workspaces.get(tenant_id=tenant, user_id=purged_user) is None
         assert (
             await artifacts.list_for_user(
@@ -1075,4 +1115,93 @@ async def test_knowledge_retrieval_log_retention_deletes_rows_past_30_days(
         assert remaining == [1, 29]
         assert report.knowledge_retrieval_logs_deleted >= 5
     finally:
+        await worker_engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_a_legacy_upload_reads_its_audit_sha256_before_the_audit_pass_deletes_it(
+    db_fixture: tuple[AsyncEngine, AsyncEngine, str], tmp_path: Path
+) -> None:
+    """B-271 review L1 —— 没有 sha256 的老上传行从登记时的 ``DOCUMENT_UPLOAD`` 审计行补 sha256。
+    那条审计与上传同一天满 90 天(已备份确认 → 这一轮的审计 pass 会删它),所以上传 pass 必须
+    排在审计删除之前:这里文件同大小但内容被改过,读到审计的 sha256 才知道不能删。"""
+    from expert_work.persistence import SqlThreadMetaStore, SqlUserUploadStore
+    from retention_cleanup_job.main import build_session_factory
+
+    app_engine, worker_engine, sync_admin = db_fixture
+    try:
+        tenant, user = uuid4(), uuid4()
+        _seed_tenant_config(sync_admin, tenant_id=tenant, audit_days=90, event_days=30)
+        sf = build_session_factory(worker_engine)
+        threads = SqlThreadMetaStore(sf)
+        uploads = SqlUserUploadStore(sf)
+        meta = await threads.create(
+            thread_id=uuid4(), tenant_id=tenant, created_by="u", user_id=user, agent_name="bot"
+        )
+        original = b"%PDF-1.4 report"
+        row = await uploads.insert(
+            upload_id=uuid4(),
+            tenant_id=tenant,
+            user_id=user,
+            thread_id=meta.thread_id,
+            kind="document",
+            ref="uploads/report.pdf",
+            mime_type="application/pdf",
+            size_bytes=len(original),
+            filename="report.pdf",
+        )
+        audit = await SqlAuditLogStore(create_async_session_factory(app_engine)).append(
+            AuditEntry(
+                tenant_id=tenant,
+                actor_type="user",
+                actor_id="ext",
+                action=AuditAction.DOCUMENT_UPLOAD,
+                resource_type="user_workspace",
+                resource_id="uploads/report.pdf",
+                result=AuditResult.SUCCESS,
+                details={
+                    "thread_id": str(meta.thread_id),
+                    "workspace_path": "uploads/report.pdf",
+                    "file_size_bytes": len(original),
+                    "sha256": hashlib.sha256(original).hexdigest(),
+                },
+            )
+        )
+        uploaded_at = datetime.now(tz=UTC) - timedelta(days=100)
+        admin = create_engine(sync_admin, isolation_level="AUTOCOMMIT")
+        try:
+            with admin.connect() as conn:
+                conn.execute(
+                    text("UPDATE user_upload SET created_at = :t WHERE id = :u"),
+                    {"t": uploaded_at, "u": row.id},
+                )
+                conn.execute(
+                    text(
+                        "UPDATE audit_log SET occurred_at = :t, backup_acked = true, "
+                        "backup_acked_at = now() WHERE id = :id"
+                    ),
+                    {"t": uploaded_at - timedelta(seconds=1), "id": audit.id},
+                )
+        finally:
+            admin.dispose()
+        edited = (
+            tmp_path / str(tenant) / str(user) / thread_workspace_path("uploads/report.pdf", meta)
+        )
+        edited.parent.mkdir(parents=True)
+        edited.write_bytes(b"%PDF-1.4 REPORT")  # same size, other bytes
+
+        report = await RetentionCleanupJob(
+            db_session_factory=sf,
+            user_upload_store=uploads,
+            thread_store=threads,
+            workspace_root=str(tmp_path),
+            audit_log_store=SqlAuditLogStore(sf),
+        ).run_once()
+
+        assert edited.read_bytes() == b"%PDF-1.4 REPORT"
+        assert (report.uploads_expired, report.upload_files_removed) == (1, 0)
+        # The audit row really was past retention and went in the same run.
+        assert report.audit_deleted_by_tenant == {str(tenant): 1}
+    finally:
+        await app_engine.dispose()
         await worker_engine.dispose()

@@ -1553,3 +1553,11 @@ async def test_thread_queue_in_memory(
 ) -> None:
     for scenario in thread_queue_scenarios:
         await scenario(InMemoryRunStore())
+
+
+@pytest.mark.asyncio
+async def test_started_at_in_memory(
+    started_at_contract: Callable[[RunStore], Awaitable[None]],
+) -> None:
+    """B-269 —— 断言体在 ``conftest`` 的契约里,与 SQL 版共用一份。"""
+    await started_at_contract(InMemoryRunStore())
