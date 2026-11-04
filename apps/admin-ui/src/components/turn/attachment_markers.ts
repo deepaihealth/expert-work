@@ -104,6 +104,10 @@ export function splitAttachmentMarkers(input: string): SplitInput {
     kind,
     value,
   }));
-  const text = [tail.text, untrusted].filter((part) => part !== "").join("\n\n");
+  // Producers put a blank line before the untrusted block only after mention
+  // lines; with none lifted the body is the user's text as stored, so re-join
+  // it exactly (a cut inside the user's own text must not add a blank line).
+  const sep = tail.found.length > 0 ? "\n\n" : "";
+  const text = [tail.text, untrusted].filter((part) => part !== "").join(sep);
   return { text, attachments };
 }

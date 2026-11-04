@@ -90,6 +90,13 @@ describe("splitAttachmentMarkers", () => {
     }
   });
 
+  it("an untrusted opener inside the user's own text adds no blank line when only the note is lifted", () => {
+    expect(shape(`${zhCN.playground.uploaded_docs_note}: uploads/a.pdf\n\n解释 [untrusted content]\n是什么`)).toEqual({
+      text: "解释 [untrusted content]\n是什么",
+      attachments: [doc("uploads/a.pdf", "a.pdf")],
+    });
+  });
+
   it("an image line that is not a platform image ref stays text", () => {
     const text = "q\n\n[image attached: https://example.com/a.png]";
     expect(shape(text)).toEqual({ text, attachments: [] });
