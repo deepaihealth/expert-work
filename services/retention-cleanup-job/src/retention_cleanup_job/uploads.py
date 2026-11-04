@@ -17,19 +17,26 @@
   文件、记一条 warning、计数,行照样软删:留着不标就会天天重试,按 ``created_at`` 排在最前把
   整批饿死。
 
-暂时性 I/O 失败或单行查库出错:这一行跳过、明天再试(``rows_failed``),不影响同批其它行;
-过了到期日还连着失败 :data:`_GIVE_UP_AFTER` 的,不再等,行软删、文件不动(``rows_abandoned``)
-—— 什么都不会无限重试。配置的工作区根自己打不开是环境问题,整个 pass 失败(调用方记下)。
+暂时性 I/O 失败或单行查库出错:这一行跳过、明天再试(``rows_failed``,每类一条 warning),
+不影响同批其它行;过了到期日还连着失败 :data:`_GIVE_UP_AFTER` 的,不再等,行软删、文件不动
+(``rows_abandoned``)—— 什么都不会无限重试。
+
+「放弃」(路径不可用、过期太久)**先看完全批、后标记**:涉及的用户超过
+:data:`_BREAKER_MAX_USERS` 个就一条都不标(``rows_held``)—— 那更像环境(uid / NAS 属主漂了)
+或代码回归。有行被放弃或被拦下,调用方都把这个 pass 记成失败(进程退出码 3),让人去看。
+配置的工作区根、``{tenant}`` / ``{user}`` 目录打不开同样是环境问题,整个 pass 失败。
 """
 
 from __future__ import annotations
 
 import asyncio
+import errno
 import logging
 import re
 from collections.abc import Iterable, Iterator
 from dataclasses import dataclass
 from datetime import datetime, timedelta
+from typing import Literal
 from uuid import UUID
 
 from expert_work.persistence.audit_log import AuditLogStore
@@ -59,6 +66,48 @@ _IN_CHUNK = 5000
 _SHA256_RE = re.compile(r"[0-9a-f]{64}")
 
 _ThreadKey = tuple[UUID, UUID]
+#: 为什么放弃一行:路径不可用 / 过了到期日太久还在失败。
+_GiveUp = Literal["unsafe", "abandoned"]
+
+#: 熔断:一轮里要放弃的行涉及的用户超过这个数,就一条都不标、pass 记失败。模型弄坏路径
+#: (软链、``chmod``、套接字)只碰得到**自己那个用户**的工作区(沙箱只挂这个用户的子目录),
+#: 所以真实的这类情况每轮只牵涉一两个用户;一夜之间三个以上不相干的用户同时「坏」,更像
+#: 作业的 uid / NAS 属主漂了(W2-BUG-1 出过)或代码回归 —— 那时放弃就是把整批文件变成孤儿。
+#: 留 3 是给一两个巧合的余量。
+_BREAKER_MAX_USERS = 3
+
+
+@dataclass
+class _FailureClass:
+    count: int
+    sample_upload_id: UUID
+    sample: BaseException
+
+
+def _failure_key(exc: BaseException) -> str:
+    code = getattr(exc, "errno", None)
+    name = errno.errorcode.get(code, str(code)) if isinstance(code, int) else "-"
+    return f"{type(exc).__name__}/{name}"
+
+
+def _note_failure(failures: dict[str, _FailureClass], row: UserUpload, exc: BaseException) -> None:
+    key = _failure_key(exc)
+    if key in failures:
+        failures[key].count += 1
+    else:
+        failures[key] = _FailureClass(count=1, sample_upload_id=row.id, sample=exc)
+
+
+def _log_failures(failures: dict[str, _FailureClass]) -> None:
+    """暂时性失败每轮每类(异常类型 / errno)一条 warning + 计数,带一个样本的 traceback。"""
+    for key, cls in failures.items():
+        logger.warning(
+            "retention.upload_rows_failed class=%s count=%d sample_upload_id=%s",
+            key,
+            cls.count,
+            cls.sample_upload_id,
+            exc_info=cls.sample,
+        )
 
 
 @dataclass
@@ -71,6 +120,13 @@ class UploadSweepTally:
     rows_failed: int = 0
     #: 过了到期日 :data:`_GIVE_UP_AFTER` 还在失败、不再等的行;行已软删、文件没动。
     rows_abandoned: int = 0
+    #: 熔断(:data:`_BREAKER_MAX_USERS`)拦下、这一轮没标的「放弃」行。
+    rows_held: int = 0
+
+    @property
+    def needs_attention(self) -> bool:
+        """有行被放弃或被熔断拦下 —— 调用方把这个 pass 记成失败,让人去看。"""
+        return self.rows_abandoned > 0 or self.rows_held > 0
 
 
 def _chunks(ids: Iterable[UUID]) -> Iterator[list[UUID]]:
@@ -114,51 +170,82 @@ class UploadSweep:
             logger.warning("retention.upload_audit_lookup_failed", exc_info=True)
             audited = {}
         tally = UploadSweepTally()
+        giving_up: list[tuple[UserUpload, _GiveUp]] = []
+        failures: dict[str, _FailureClass] = {}
         for row in expired:
             try:
-                await self._expire(row, audited.get(row.id, row.sha256), cutoff, now, tally)
+                if await self._release(row, audited.get(row.id, row.sha256), cutoff, tally):
+                    await self._mark(row, now, tally)
+                else:
+                    giving_up.append((row, "unsafe"))
             except WorkspaceRootUnavailableError:
                 raise
-            except Exception:
-                await self._row_failed(row, cutoff, now, tally)
+            except Exception as exc:
+                if row.created_at >= cutoff - _GIVE_UP_AFTER:
+                    _note_failure(failures, row, exc)
+                    tally.rows_failed += 1
+                else:
+                    logger.warning(
+                        "retention.upload_row_abandoning upload_id=%s error=%s",
+                        row.id,
+                        type(exc).__name__,
+                    )
+                    giving_up.append((row, "abandoned"))
+        _log_failures(failures)
+        await self._give_up(giving_up, now, tally)
         return tally
 
-    async def _row_failed(
-        self, row: UserUpload, cutoff: datetime, now: datetime, tally: UploadSweepTally
-    ) -> None:
-        """在 ``except`` 里调用。到期没满 :data:`_GIVE_UP_AFTER` → 跳过、明天再试;满了 →
-        行软删、文件不动(兜底:什么都不无限重试)。"""
-        if row.created_at >= cutoff - _GIVE_UP_AFTER:
-            logger.exception("retention.upload_row_failed upload_id=%s", row.id)
-            tally.rows_failed += 1
-            return
-        logger.warning("retention.upload_row_abandoned upload_id=%s", row.id, exc_info=True)
+    async def _release(
+        self, row: UserUpload, sha256: str | None, cutoff: datetime, tally: UploadSweepTally
+    ) -> bool:
+        """文件那一半。``True`` → 照常到期(文件删了 / 不该删 / 本来不在);``False`` → 路径不可用,
+        进「放弃」清单,等全批看完再由熔断决定标不标。"""
+        if not _is_document(row):
+            return True
         try:
-            if await self._uploads.soft_delete(upload_id=row.id, tenant_id=row.tenant_id, now=now):
-                tally.marked += 1
-                tally.rows_abandoned += 1
-        except Exception:
-            logger.exception("retention.upload_row_failed upload_id=%s", row.id)
-            tally.rows_failed += 1
+            removed = await self._release_file(row, sha256, cutoff)
+        except UnsafeWorkspacePathError:
+            logger.warning("retention.upload_path_unusable upload_id=%s", row.id)
+            return False
+        tally.files_removed += int(removed)
+        return True
 
-    async def _expire(
-        self,
-        row: UserUpload,
-        sha256: str | None,
-        cutoff: datetime,
-        now: datetime,
-        tally: UploadSweepTally,
-    ) -> None:
-        if _is_document(row):
-            try:
-                removed = await self._release_file(row, sha256, cutoff)
-            except UnsafeWorkspacePathError:
-                logger.warning("retention.upload_path_unusable upload_id=%s", row.id)
-                tally.files_unsafe += 1
-                removed = False
-            tally.files_removed += int(removed)
+    async def _mark(self, row: UserUpload, now: datetime, tally: UploadSweepTally) -> bool:
         if await self._uploads.soft_delete(upload_id=row.id, tenant_id=row.tenant_id, now=now):
             tally.marked += 1
+            return True
+        return False
+
+    async def _give_up(
+        self, giving_up: list[tuple[UserUpload, _GiveUp]], now: datetime, tally: UploadSweepTally
+    ) -> None:
+        """先看完、后标记:要放弃的行(路径不可用 / 过了到期日 7 天还在失败)涉及的用户超过
+        :data:`_BREAKER_MAX_USERS` 个 → 这一轮一条都不标(``rows_held``,调用方记 pass 失败),
+        因为那更像环境问题或代码回归,而不是哪个会话里的模型弄坏了自己的文件。"""
+        users = {(row.tenant_id, row.user_id) for row, _ in giving_up}
+        if len(users) > _BREAKER_MAX_USERS:
+            tally.rows_held = len(giving_up)
+            logger.error(
+                "retention.upload_breaker_tripped rows=%d users=%d unsafe=%d abandoned=%d "
+                "— not expiring them this run; looks environmental, not per-user",
+                len(giving_up),
+                len(users),
+                sum(1 for _, why in giving_up if why == "unsafe"),
+                sum(1 for _, why in giving_up if why == "abandoned"),
+            )
+            return
+        for row, why in giving_up:
+            try:
+                if await self._mark(row, now, tally):
+                    if why == "unsafe":
+                        tally.files_unsafe += 1
+                    else:
+                        tally.rows_abandoned += 1
+            except Exception as exc:
+                logger.warning(
+                    "retention.upload_row_failed upload_id=%s error=%s", row.id, type(exc).__name__
+                )
+                tally.rows_failed += 1
 
     async def _release_file(self, row: UserUpload, sha256: str | None, cutoff: datetime) -> bool:
         meta = self._metas.get((row.tenant_id, row.thread_id))

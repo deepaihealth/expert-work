@@ -290,6 +290,23 @@ def _open_child(parent_fd: int, name: str, flags: int) -> int:
         return os.open(name, flags, dir_fd=parent_fd)
 
 
+#: ``{tenant}`` / ``{user}`` 两段:沙箱只挂到 ``{tenant}/{user}`` 之下,碰不到这两级目录。
+_OWNER_SEGMENTS = 2
+
+
+def _open_owner_dir(parent_fd: int, name: str) -> int:
+    """打开 ``{tenant}`` 或 ``{user}``。不在 → 文件本来就没了(工作区已归档);其它任何错误
+    (``EACCES``、软链……)都不可能是会话里的模型造成的 → 环境问题(作业 uid / NAS 属主漂了),
+    :class:`WorkspaceRootUnavailableError`:整个 pass 失败、行不动。"""
+    try:
+        return os.open(name, _DIR_FLAGS, dir_fd=parent_fd)
+    except FileNotFoundError as exc:
+        raise _PathMissingError from exc
+    except OSError as exc:
+        code = errno.errorcode.get(exc.errno or 0, str(exc.errno))
+        raise WorkspaceRootUnavailableError(f"workspace owner directory unusable ({code})") from exc
+
+
 def _close_all(fds: list[int]) -> None:
     for fd in fds:
         os.close(fd)
@@ -298,7 +315,8 @@ def _close_all(fds: list[int]) -> None:
 def _open_parent_chain(root: str, dirs: list[str]) -> list[int]:
     """从 ``root``(启动时校验过不是软链)起逐段打开 ``dirs``,回全部 fd(最后一个是叶子的父目录)。
     哪一段不在 → :class:`_PathMissingError`;是软链 / 不是目录 → :class:`UnsafeWorkspacePathError`。
-    ``root`` 自己打不开 → :class:`WorkspaceRootUnavailableError`。出错时已打开的 fd 全部关掉。"""
+    ``root`` 自己、或 ``{tenant}`` / ``{user}`` 打不开(不是不在)→
+    :class:`WorkspaceRootUnavailableError`。出错时已打开的 fd 全部关掉。"""
     try:
         fds = [os.open(Path(root).resolve(), os.O_RDONLY | os.O_DIRECTORY)]
     except OSError as exc:
@@ -306,8 +324,11 @@ def _open_parent_chain(root: str, dirs: list[str]) -> list[int]:
             f"workspace root cannot be opened: {exc.strerror}"
         ) from exc
     try:
-        for part in dirs:
-            fds.append(_open_child(fds[-1], part, _DIR_FLAGS))
+        for index, part in enumerate(dirs):
+            if index < _OWNER_SEGMENTS:
+                fds.append(_open_owner_dir(fds[-1], part))
+            else:
+                fds.append(_open_child(fds[-1], part, _DIR_FLAGS))
     except BaseException:
         _close_all(fds)
         raise

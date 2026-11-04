@@ -233,7 +233,7 @@ async def _amain() -> int:
             "artifact_versions_deleted=%d artifact_files_removed=%d artifacts_expired=%d "
             "orphan_artifact_copies_removed=%d "
             "uploads_expired=%d upload_files_removed=%d upload_files_unsafe=%d "
-            "upload_rows_failed=%d upload_rows_abandoned=%d "
+            "upload_rows_failed=%d upload_rows_abandoned=%d upload_rows_held=%d "
             "thread_dirs_removed=%d "
             "memory_hard_deleted=%d workspaces_hard_deleted=%d "
             "workspaces_pending_archive=%d tenant_users_hard_deleted=%d "
@@ -257,6 +257,7 @@ async def _amain() -> int:
             report.upload_files_unsafe,
             report.upload_rows_failed,
             report.upload_rows_abandoned,
+            report.upload_rows_held,
             report.thread_dirs_removed,
             report.memory_hard_deleted,
             report.workspaces_hard_deleted,

@@ -291,6 +291,7 @@ class RetentionCleanupJob:
             upload_files_unsafe=uploads.files_unsafe,
             upload_rows_failed=uploads.rows_failed,
             upload_rows_abandoned=uploads.rows_abandoned,
+            upload_rows_held=uploads.rows_held,
             failed_passes=tuple(self._failed_passes),
             thread_dirs_removed=thread_dirs_removed,
             tool_result_dirs_removed=tool_result_dirs_removed,
@@ -599,11 +600,15 @@ class RetentionCleanupJob:
             expired = await self._user_upload_store.list_expired(
                 before=cutoff, limit=self._batch_size
             )
-            return await sweep.run(expired, cutoff=cutoff, now=now)
+            tally = await sweep.run(expired, cutoff=cutoff, now=now)
         except Exception:
             logger.exception("retention.upload_sweep_failed")
             self._failed_passes.append("uploads")
             return UploadSweepTally()
+        if tally.needs_attention:
+            # 有行被放弃(过期太久还在失败)或被熔断拦下:进程以非 0 退出,让人去看。
+            self._failed_passes.append("uploads")
+        return tally
 
     async def _sweep_orphan_thread_dirs(self) -> int:
         """留存链 B-27 —— 孤儿 ``threads/<thread_id>/`` 目录;规则本体在

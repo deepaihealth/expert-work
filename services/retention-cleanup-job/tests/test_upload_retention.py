@@ -11,8 +11,10 @@ B-50 起上传落 ``agents/<key>/uploads/``(老视图),B-262 起对话视图落
 from __future__ import annotations
 
 import asyncio
+import copy
 import errno
 import hashlib
+import logging
 import os
 import socket
 import stat
@@ -491,6 +493,7 @@ async def test_a_fifo_leaf_does_not_hang_the_job(world: _World) -> None:
 async def test_a_symlinked_user_root_is_not_followed(
     world: _World, tmp_path_factory: pytest.TempPathFactory
 ) -> None:
+    """``{user}`` 目录沙箱碰不到:它是软链说明环境不对 —— 不跟、整个 pass 失败、行不动。"""
     meta = await world.thread(layout="agent_root")
     elsewhere = tmp_path_factory.mktemp("elsewhere")
     victim = elsewhere / thread_workspace_path(_REF, meta)
@@ -498,11 +501,14 @@ async def test_a_symlinked_user_root_is_not_followed(
     victim.write_bytes(_BODY)
     world.user_dir.parent.mkdir(parents=True)
     os.symlink(elsewhere, world.user_dir)
-    await world.register(meta.thread_id)
+    upload = await world.register(meta.thread_id)
+    job = world.job()
 
-    assert _counts(await world.job()._sweep_uploads()) == (1, 0, 1)
+    assert _counts(await job._sweep_uploads()) == (0, 0, 0)
 
+    assert job._failed_passes == ["uploads"]
     assert victim.read_bytes() == _BODY
+    assert not await world.deleted(upload)
 
 
 # ------------------------------------------------------------ review follow-up (L2)
@@ -916,7 +922,8 @@ async def test_a_row_failing_a_week_past_its_expiry_is_abandoned(
     upload = await world.register(meta.thread_id, created_at=datetime.now(UTC) - timedelta(days=98))
     _fail_reading_with(monkeypatch, errno.EIO)
 
-    tally = await world.job()._sweep_uploads()
+    job = world.job()
+    tally = await job._sweep_uploads()
 
     assert (tally.marked, tally.files_removed, tally.rows_failed, tally.rows_abandoned) == (
         1,
@@ -926,6 +933,7 @@ async def test_a_row_failing_a_week_past_its_expiry_is_abandoned(
     )
     assert real.exists()
     assert await world.deleted(upload)
+    assert job._failed_passes == ["uploads"]  # abandoning is something a human should see
 
 
 # ------------------------------------------------------------ review round 2 (R-L1 / R-L2)
@@ -1008,3 +1016,145 @@ async def test_a_failing_orphan_copy_pass_is_reported_too(
 
     assert report.failed_passes == ("orphan_artifact_copies",)
     assert exit_code(report) == EXIT_PASS_FAILED
+
+
+# ------------------------------------------------------------ review round 3 (breaker)
+
+
+def _another_user(world: _World) -> _World:
+    """同一租户、同一套库与根,换一个用户。"""
+    other = copy.copy(world)
+    other.user = uuid4()
+    return other
+
+
+@pytest.mark.asyncio
+@_as_root
+async def test_an_unreadable_tenant_dir_fails_the_pass_and_touches_no_row(world: _World) -> None:
+    """``{tenant}`` 沙箱碰不到:读不了是环境问题(作业 uid / NAS 属主),不是这一行的路径坏了。"""
+    meta = await world.thread(layout="conversation")
+    real = world.place(meta)
+    upload = await world.register(meta.thread_id)
+    tenant_dir = world.user_dir.parent
+    tenant_dir.chmod(0o000)
+    try:
+        job = world.job()
+        tally = await job._sweep_uploads()
+    finally:
+        tenant_dir.chmod(0o755)
+
+    assert (_counts(tally), job._failed_passes) == ((0, 0, 0), ["uploads"])
+    assert real.read_bytes() == _BODY
+    assert not await world.deleted(upload)
+
+
+async def _unlink_denied_users(
+    world: _World, count: int, *, extra_rows_for_first: int = 0
+) -> list[tuple[_World, Path, UUID]]:
+    """``count`` 个用户,各一条到期上传(第一个用户再多 ``extra_rows_for_first`` 条),父目录只读
+    (删不了)。"""
+    out = []
+    for index in range(count):
+        who = _another_user(world)
+        meta = await who.thread(layout="conversation")
+        for n in range(1 + (extra_rows_for_first if index == 0 else 0)):
+            ref = _REF if n == 0 else f"uploads/extra-{n}.pdf"
+            real = who.place(meta, ref=ref)
+            out.append((who, real, await who.register(meta.thread_id, ref=ref)))
+    for _, real, _ in out:
+        real.parent.chmod(0o555)
+    return out
+
+
+@pytest.mark.asyncio
+@_as_root
+async def test_unusable_paths_across_many_users_trip_the_breaker(world: _World) -> None:
+    """很多用户同时「删不了」更像环境问题:这一轮一条都不放弃、pass 记失败;同一轮里正常的
+    删除照常。"""
+    denied = await _unlink_denied_users(world, 4)
+    fine = await world.thread(layout="conversation")
+    fine_file = world.place(fine)
+    fine_upload = await world.register(fine.thread_id)
+    try:
+        job = world.job()
+        tally = await job._sweep_uploads()
+    finally:
+        for _, real, _ in denied:
+            real.parent.chmod(0o755)
+
+    assert (_counts(tally), tally.rows_held) == ((1, 1, 0), 4)
+    assert job._failed_passes == ["uploads"]
+    for who, real, upload in denied:
+        assert real.exists()
+        assert not await who.deleted(upload)
+    assert not fine_file.exists()
+    assert await world.deleted(fine_upload)
+
+
+@pytest.mark.asyncio
+@_as_root
+async def test_unusable_paths_within_the_breaker_still_expire(world: _World) -> None:
+    """3 个用户以内(模型弄坏自己工作区的量级)照常放弃:行软删、文件不动、不算 pass 失败。
+    熔断按**用户**数,不按行数:一个用户名下多条坏行照样放弃。"""
+    denied = await _unlink_denied_users(world, 3, extra_rows_for_first=2)
+    try:
+        job = world.job()
+        tally = await job._sweep_uploads()
+    finally:
+        for _, real, _ in denied:
+            real.parent.chmod(0o755)
+
+    assert (_counts(tally), tally.rows_held) == ((5, 0, 5), 0)
+    assert job._failed_passes == []
+    for who, real, upload in denied:
+        assert real.exists()
+        assert await who.deleted(upload)
+
+
+@pytest.mark.asyncio
+async def test_a_code_bug_in_every_old_row_is_held_not_abandoned(
+    world: _World, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """回归让每一行都抛、而且都过了到期日 7 天:涉及的用户多 → 一条都不放弃,pass 记失败。"""
+    rows = []
+    for _ in range(4):
+        who = _another_user(world)
+        meta = await who.thread(layout="conversation")
+        real = who.place(meta)
+        rows.append((who, real, await who.register(meta.thread_id)))
+
+    async def _regression(*_args: object) -> bool:
+        raise TypeError("regression")
+
+    monkeypatch.setattr(uploads_module.UploadSweep, "_release_file", _regression)
+    job = world.job()
+
+    tally = await job._sweep_uploads()
+
+    assert (tally.marked, tally.rows_abandoned, tally.rows_held) == (0, 0, 4)
+    assert job._failed_passes == ["uploads"]
+    for who, real, upload in rows:
+        assert real.exists()
+        assert not await who.deleted(upload)
+
+
+@pytest.mark.asyncio
+async def test_transient_failures_log_once_per_class_with_a_count(
+    world: _World, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    recent = datetime.now(UTC) - timedelta(days=92)
+    for _ in range(2):
+        meta = await world.thread(layout="conversation")
+        world.place(meta)
+        await world.register(meta.thread_id, created_at=recent)
+    _fail_reading_with(monkeypatch, errno.EIO)
+
+    with caplog.at_level(logging.WARNING, logger="retention_cleanup_job.uploads"):
+        tally = await world.job()._sweep_uploads()
+
+    assert tally.rows_failed == 2
+    records = [r for r in caplog.records if "retention.upload_row" in r.getMessage()]
+    assert [r.getMessage().split(" sample_upload_id")[0] for r in records] == [
+        "retention.upload_rows_failed class=OSError/EIO count=2"
+    ]
+    assert records[0].exc_info is not None
