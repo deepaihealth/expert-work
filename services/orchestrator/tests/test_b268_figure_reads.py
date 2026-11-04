@@ -421,6 +421,50 @@ async def test_two_refusals_end_the_run_with_a_wrap_up() -> None:
     assert llm.calls == 6
 
 
+async def test_parallel_refusals_in_one_batch_count_as_one_trip() -> None:
+    """Two refused reads in one parallel batch are one loop trip, like a loop-detection
+    stop (once per step) — the run gets one more step before the wrap-up."""
+    runtime = _Renders()
+    registry = ToolRegistry()
+    registry.register(ReadPageTool(client=runtime, figure_delivery="inline"))
+    pair = AIMessage(
+        content="",
+        tool_calls=[
+            {"name": "read_page", "args": {"path": "a.pdf", "units": [1]}, "id": "p1"},
+            {"name": "read_page", "args": {"path": "a.pdf", "units": [1]}, "id": "p2"},
+        ],
+    )
+    responses = [_read_call("c0"), _read_call("c1"), _read_call("c2"), pair]
+    llm = _RecordingLLM(responses=responses + [_read_call(f"d{i}") for i in range(6)])
+    config: RunnableConfig = {
+        "configurable": {
+            "thread_id": str(uuid4()),
+            "run_id": str(_RUN),
+            "tenant_id": str(_TENANT),
+            "user_id": str(_USER),
+            "agent_key": _AGENT_KEY,
+        }
+    }
+    async with make_checkpointer("memory") as cp:
+        graph = GraphRunner(checkpointer=cp).compile(
+            build_react_graph(llm_caller=llm, tool_registry=registry, supports_vision=True)
+        )
+        final = await graph.ainvoke(
+            {"messages": [HumanMessage(content="read")], "step_count": 0, "max_steps": 20},
+            config=config,
+        )
+    refusals = [
+        m
+        for m in final["messages"]
+        if isinstance(m, ToolMessage) and "Nothing was rendered" in str(m.content)
+    ]
+    assert len(runtime.execs) == 3
+    # The pair (2 refusals, 1 trip), one more refused read (2nd trip), then the wrap-up.
+    assert len(refusals) == 3
+    assert final["loop_trip_count"] == 2
+    assert llm.calls == 6
+
+
 def test_the_tool_context_reads_the_turns_root_run() -> None:
     root = uuid4()
     ctx = _build_tool_context({"configurable": {TURN_ROOT_RUN_KEY: str(root)}})

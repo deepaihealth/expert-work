@@ -77,6 +77,9 @@ PROBE_MAX_BASES: Final = MAX_CATALOG_BASES
 PROBE_CONCURRENCY: Final = 4
 #: The whole probe (every base, both paths, the query embedding) gets this long.
 PROBE_TIMEOUT_S: Final = 1.5
+#: The probe reads only the tail of a very long message: segmenting and
+#: searching a whole paste would mostly run past the time budget anyway.
+PROBE_MAX_QUERY_CHARS: Final = 2000
 #: A keyword hit without an identifier needs this many distinct content words
 #: of the message in one passage, each at least :data:`MIN_TERM_CHARS` long.
 MIN_SHARED_TERMS: Final = 2
@@ -351,11 +354,11 @@ class KnowledgeProbe:
             return ProbeOutcome(reason="not_turn_start")
         if is_small_talk(latest):
             return self._done(ProbeOutcome(reason="small_talk"))
-        query = turn_query(messages) or latest
-        # Segmenting loads jieba's dictionary on first use (about a second,
-        # blocking): done in a thread, outside the time budget.
-        terms = await asyncio.to_thread(build_kb_keyword_query, query)
         try:
+            query = (turn_query(messages) or latest)[-PROBE_MAX_QUERY_CHARS:]
+            # Segmenting loads jieba's dictionary on first use (about a second,
+            # blocking): done in a thread, outside the time budget.
+            terms = await asyncio.to_thread(build_kb_keyword_query, query)
             hits = await asyncio.wait_for(
                 self._hits(tenant_id, query, terms), timeout=self.timeout_s
             )

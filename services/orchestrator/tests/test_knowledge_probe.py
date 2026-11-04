@@ -40,7 +40,7 @@ from expert_work.protocol.knowledge_profile import ProbeCalibration
 from orchestrator import ToolEnv
 from orchestrator.agent_factory import _knowledge_probe
 from orchestrator.llm import FakeEmbedder
-from orchestrator.tools import KnowledgeRetriever
+from orchestrator.tools import KnowledgeRetriever, knowledge_probe
 from orchestrator.tools.knowledge_probe import (
     MIN_SHARED_TERMS,
     MIN_TERM_CHARS,
@@ -424,6 +424,37 @@ async def test_a_failing_probe_adds_nothing() -> None:
         tenant_id=tenant, messages=_turn("大国食养谁写的")
     )
     assert outcome.reason == "error" and outcome.line is None
+
+
+async def test_a_failing_segmentation_adds_nothing(monkeypatch: pytest.MonkeyPatch) -> None:
+    store, tenant = InMemoryKnowledgeStore(), uuid4()
+    await _base(store, tenant, "books", ["大国食养"])
+
+    def _boom(query: str) -> str:
+        raise RuntimeError("segmenter down")
+
+    monkeypatch.setattr(knowledge_probe, "build_kb_keyword_query", _boom)
+    outcome = await _probe(store, ("books",)).run(
+        tenant_id=tenant, messages=_turn("大国食养谁写的")
+    )
+    assert outcome.reason == "error" and outcome.line is None
+
+
+async def test_a_long_message_is_probed_by_its_tail(monkeypatch: pytest.MonkeyPatch) -> None:
+    store, tenant = InMemoryKnowledgeStore(), uuid4()
+    await _base(store, tenant, "books", ["大国食养"])
+    seen: list[str] = []
+    real = knowledge_probe.build_kb_keyword_query
+
+    def _spy(query: str) -> str:
+        seen.append(query)
+        return real(query)
+
+    monkeypatch.setattr(knowledge_probe, "build_kb_keyword_query", _spy)
+    text = "资料" * 5000 + "大国食养谁写的"
+    await _probe(store, ("books",)).run(tenant_id=tenant, messages=_turn(text))
+    assert seen and len(seen[0]) <= knowledge_probe.PROBE_MAX_QUERY_CHARS
+    assert seen[0].endswith("大国食养谁写的")
 
 
 def test_follow_up_is_whether_the_model_searched() -> None:

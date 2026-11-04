@@ -2237,8 +2237,9 @@ def build_react_graph(
             result_dict["promoted_tool_last_used"] = used_stamps
         # B-268 —— 与 loop-detection 拦下同一本账:第 N 次(``DEFAULT_LOOP_TRIPS_PER_RUN``)
         # 后 ``agent_node`` 走无进展收尾。只在有拒绝时写,没有时 state 形状不变。
+        # 一批里几次并行拒绝只算一次(同 loop-detection 每步至多一次)。
         if refused_reads:
-            result_dict["loop_trip_count"] = int(state.get("loop_trip_count", 0)) + refused_reads
+            result_dict["loop_trip_count"] = int(state.get("loop_trip_count", 0)) + 1
         # 层 1 — persist the nudge dedupe key only when a nudge actually fired;
         # the absent case leaves the channel (and no-spawn_worker builds'
         # state shape) untouched.
