@@ -77,6 +77,14 @@ configMapGenerator:
   files:
   - settings.yml=searxng-settings-cn.yml
   name: searxng-settings
+# B-267 —— web_search 固定结果夹具(只在测试环境),由 web-search-fixtures-patch.yaml 挂进
+# control-plane。源文件在 tools/eval/datasets/kb_route/,这里是拷贝(见该 patch 头注)。
+# 写明 namespace:本 overlay 不设 namespace,不写的话生成的 ConfigMap 没有命名空间,
+# Deployment 里对它的引用也不会被改成带哈希后缀的名字。
+- files:
+  - web-search-fixtures/b267-kb-route.json
+  name: web-search-fixtures
+  namespace: expert-work
 
 patches:
 - path: configmap-patch.yaml
@@ -85,3 +93,4 @@ patches:
 - path: keycloak-patch.yaml
 - path: langfuse-configmap-patch.yaml
 - path: langfuse-ingress-patch.yaml
+- path: web-search-fixtures-patch.yaml

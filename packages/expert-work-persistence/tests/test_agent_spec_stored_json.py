@@ -225,6 +225,26 @@ def test_reading_back_a_row_with_an_unknown_field_ignores_it() -> None:
     assert entry.servers == ["deepcare"]
 
 
+def test_a_knowledge_key_from_a_newer_version_is_ignored_on_read() -> None:
+    """B-267 rollback: an image without ``knowledge.probe`` reads a manifest that
+    has it (the key it does not know is dropped), so the agent still loads —
+    shown here with a key this version does not know either."""
+    row_json = _stored()
+    row_json["spec"]["knowledge"] = {"knowledge_base_refs": ["kb"], "from_a_future_version": False}
+    loaded = load_stored_spec(row_json)
+    assert loaded.spec.knowledge is not None
+    assert loaded.spec.knowledge.knowledge_base_refs == ["kb"]
+
+
+def test_the_digest_of_a_knowledge_agent_is_unchanged_by_probe() -> None:
+    """B-267: a knowledge agent saved without an opt-out hashes as before."""
+    row_json = _stored()
+    row_json["spec"]["knowledge"] = {"knowledge_base_refs": ["kb"]}
+    before = compute_spec_sha256(load_stored_spec(deepcopy(row_json)))
+    row_json["spec"]["knowledge"]["probe"] = True
+    assert compute_spec_sha256(load_stored_spec(row_json)) == before
+
+
 def test_reading_back_an_intact_row_returns_it_unchanged() -> None:
     loaded = load_stored_spec(_stored())
     assert loaded.metadata.name == "planner"

@@ -179,6 +179,57 @@ describe("DocumentsTab — estimates (B-222 PR-2)", () => {
     );
   });
 
+  it("B-267 —— the profile and its calibration are listed with the note", async () => {
+    const withProfile = doc("d0000000-0000-0000-0000-000000000005", "awaiting_confirmation", {
+      ingest_estimate: estimate("e5", {
+        notes: ["profile_once_per_base"],
+        items: [
+          {
+            kind: "profile",
+            units: 1,
+            unit: "bases",
+            reused_units: 0,
+            model: "acme/chat-1",
+            input_tokens: 6000,
+            output_tokens: 800,
+            micros: 18_400,
+            basis: "upper_bound",
+            priced: true,
+          },
+          {
+            kind: "profile_calibration",
+            units: 16,
+            unit: "queries",
+            reused_units: 0,
+            model: "acme/embed-1",
+            input_tokens: 126,
+            output_tokens: 0,
+            micros: 63,
+            basis: "local_count",
+            priced: true,
+          },
+        ],
+      }),
+      confirm_by: IN_7_DAYS,
+    });
+    vi.spyOn(knowledgeSdk, "listDocuments").mockResolvedValue(docPage([withProfile]));
+    renderTab();
+    const tag = within(await screen.findByTestId(`doc-cost-${withProfile.id}`)).getByText(
+      /Estimate/,
+    );
+    await userEvent.hover(tag);
+    const breakdown = await screen.findByTestId("doc-estimate-breakdown");
+    expect(breakdown).toHaveTextContent(
+      "Knowledge base profile (acme/chat-1): one refresh, up to 6800 tokens — ¥0.02",
+    );
+    expect(breakdown).toHaveTextContent(
+      "Search probe calibration (acme/embed-1): 16 generic queries · 126 tokens — < ¥0.01",
+    );
+    expect(breakdown).toHaveTextContent(
+      "The knowledge base profile is refreshed once per knowledge base after this batch is in",
+    );
+  });
+
   it("a duplicate names its original and is ingested anyway, not confirmed", async () => {
     vi.spyOn(knowledgeSdk, "listDocuments").mockResolvedValue(docPage([COPY]));
     const anyway = vi

@@ -90,6 +90,7 @@ from expert_work.persistence.knowledge.passages import (
     unapplied_revisions,
 )
 from expert_work.persistence.knowledge.sql_estimates import SqlEstimates
+from expert_work.persistence.knowledge.sql_profiles import SqlProfiles, mark_profile_stale
 from expert_work.persistence.knowledge.text_search import (
     KB_DOC_TITLE_HIT_WEIGHT,
     KB_KEYWORD_PHRASE_BOOST,
@@ -129,6 +130,7 @@ from expert_work.protocol import (
     ScoredChunk,
     chunk_retrieval_text,
 )
+from expert_work.protocol.knowledge_profile import parse_profile_record
 
 logger = logging.getLogger(__name__)
 
@@ -427,6 +429,7 @@ def _to_base(row: KnowledgeBaseRow) -> KnowledgeBase:
         or KnowledgeBaseKind.DOCUMENT,
         metadata_schema=row.metadata_schema,
         api_access_enabled=row.api_access_enabled,
+        profile=parse_profile_record(row.profile),
         created_at=row.created_at,
         updated_at=row.updated_at,
     )
@@ -1262,7 +1265,7 @@ async def _settle_switch_offs(
             await session.execute(delete(KnowledgeChunkRevisionRow).where(*mine))
 
 
-class SqlKnowledgeStore(SqlEstimates, KnowledgeStore):
+class SqlKnowledgeStore(SqlEstimates, SqlProfiles, KnowledgeStore):
     """Postgres-backed knowledge repository (pgvector)."""
 
     def __init__(self, session_factory: async_sessionmaker[AsyncSession]) -> None:
@@ -2229,14 +2232,14 @@ class SqlKnowledgeStore(SqlEstimates, KnowledgeStore):
             # deadlock against each other.
             exists = (
                 await session.execute(
-                    select(KnowledgeDocumentRow.id)
+                    select(KnowledgeDocumentRow.kb_id, KnowledgeDocumentRow.chunk_count)
                     .where(
                         KnowledgeDocumentRow.tenant_id == tenant_id,
                         KnowledgeDocumentRow.id == document_id,
                     )
                     .with_for_update()
                 )
-            ).scalar_one_or_none()
+            ).one_or_none()
             if exists is None:
                 return False
             await session.execute(
@@ -2272,6 +2275,9 @@ class SqlKnowledgeStore(SqlEstimates, KnowledgeStore):
                     KnowledgeDocumentRow.id == document_id,
                 )
             )
+            if exists.chunk_count > 0:
+                # B-267 —— what it held must not keep showing through the profile.
+                await mark_profile_stale(session, tenant_id, exists.kb_id, datetime.now(UTC))
             await session.commit()
         return True
 
@@ -2497,21 +2503,32 @@ class SqlKnowledgeStore(SqlEstimates, KnowledgeStore):
         if not document_ids:
             return []
         async with self._sf() as session:
-            done = set(
-                (
-                    await session.execute(
-                        update(KnowledgeDocumentRow)
-                        .where(
-                            *_documents_where(tenant_id, kb_id),
-                            KnowledgeDocumentRow.id.in_(list(dict.fromkeys(document_ids))),
-                        )
-                        .values(enabled=enabled, updated_at=datetime.now(UTC))
-                        .returning(KnowledgeDocumentRow.id)
+            switching_off = (
+                await session.execute(
+                    select(KnowledgeDocumentRow.id).where(
+                        *_documents_where(tenant_id, kb_id),
+                        KnowledgeDocumentRow.id.in_(list(dict.fromkeys(document_ids))),
+                        KnowledgeDocumentRow.enabled.is_(True),
+                        KnowledgeDocumentRow.chunk_count > 0,
                     )
                 )
-                .scalars()
-                .all()
-            )
+            ).first()
+            changed = (
+                await session.execute(
+                    update(KnowledgeDocumentRow)
+                    .where(
+                        *_documents_where(tenant_id, kb_id),
+                        KnowledgeDocumentRow.id.in_(list(dict.fromkeys(document_ids))),
+                    )
+                    .values(enabled=enabled, updated_at=datetime.now(UTC))
+                    .returning(KnowledgeDocumentRow.id)
+                )
+            ).all()
+            done = {row.id for row in changed}
+            # Only a document that was on and had passages changes what shows.
+            if not enabled and switching_off is not None:
+                # B-267 —— switched-off content must not keep showing through the profile.
+                await mark_profile_stale(session, tenant_id, kb_id, datetime.now(UTC))
             await session.commit()
         return [document_id for document_id in dict.fromkeys(document_ids) if document_id in done]
 
