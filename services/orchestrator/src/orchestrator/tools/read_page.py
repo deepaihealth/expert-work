@@ -1442,6 +1442,14 @@ def _delivery_sentence(
     return f"{head},下一轮起你会在上下文里直接看到这几页的图。"
 
 
+#: B-276 —— the refusal for an agent that cannot see images while its workers can.
+WORKERS_VIEW_PAGES_REFUSAL: Final = (
+    "Not rendered: {path}. You cannot see images, but your workers can — "
+    "delegate reading these pages to a worker with spawn_worker (name the file "
+    "and the pages in the task). Do not install OCR or render pages yourself."
+)
+
+
 @dataclass
 class ReadPageTool:
     """按需把文档单页渲成 jpeg(暴露为 ``read_page``)。"""
@@ -1457,6 +1465,9 @@ class ReadPageTool:
     #: B-266 —— 渲局部时读整页渲染的像素尺寸用(页面多大、框落在哪);``None`` = 没接,
     #: ``region`` 不可用(参数表里也不出现)。
     image_resolver: ImageResolver | None = None
+    #: B-276 —— 这个 Agent 看不了图,但它的 worker 能看(``spawn_worker`` 已注册、worker 模型
+    #: 是多模态):拒绝时指给它 worker,而不是只说「去配视觉模型」—— 否则它自己装 OCR 去读。
+    workers_view_pages: bool = False
 
     @property
     def _offers_region(self) -> bool:
@@ -1567,6 +1578,8 @@ class ReadPageTool:
         if rejection is not None:
             return ToolResult(content=rejection)
         delivery = self.figure_delivery
+        if delivery == "none" and self.workers_view_pages:
+            return ToolResult(content=WORKERS_VIEW_PAGES_REFUSAL.format(path=raw))
         if delivery == "none":
             # 回修第 3 轮 —— 看不了图、也没有 ask_image 时不进沙箱:渲出来也没人看,
             # 白跑一次 soffice + pdftoppm。**仍然注册** read_page,不是撤掉它 ——

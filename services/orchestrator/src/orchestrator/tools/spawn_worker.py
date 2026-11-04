@@ -31,7 +31,7 @@ import time
 from collections.abc import AsyncIterator, Mapping
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Any, Final, Protocol, runtime_checkable
 from uuid import UUID
 
 from expert_work.common.observability import expert_work_counter
@@ -137,6 +137,15 @@ class WorkerBuildFn(Protocol):
         ``_bind_delegation_usage_kind``)."""
 
 
+#: B-276 — shown only when the workers can see images and this agent cannot.
+VISION_GAP_SENTENCE: Final = (
+    "Workers can see images and rendered document pages; you cannot. Delegate "
+    "anything that needs reading an image or a page, and take what the worker "
+    "read as the reading — do not install OCR or render pages yourself to "
+    "re-read it."
+)
+
+
 @dataclass(frozen=True)
 class SpawnWorkerTool:
     """The ``spawn_worker`` tool — 1.3 dynamic Orchestrator-Worker."""
@@ -145,6 +154,10 @@ class SpawnWorkerTool:
     #: The worker's build-time recursion depth (parent depth + 1).
     child_depth: int
     trajectory_recorder: TrajectoryRecorder | None = None
+    #: B-276 — this agent cannot look at images (not multimodal, no
+    #: ``ask_image``) while its workers' model can: say so, so it delegates
+    #: image reading and does not re-read pages with OCR workarounds.
+    vision_gap: bool = False
 
     @property
     def spec(self) -> ToolSpec:
@@ -216,8 +229,17 @@ class SpawnWorkerTool:
                 "in this conversation by a head/tail preview plus a path to the "
                 "full text, so offloading keeps the result complete and your "
                 "context small.\n"
-                "Treat worker results as raw material — "
-                "verify key conclusions here before relying on them."
+                # B-276 — "verify key conclusions here" was unconditional: a
+                # main model that cannot see images re-read its vision
+                # worker's pages by installing OCR in the sandbox (2 of 6
+                # acceptance runs capped at 12 min). Check what can be checked
+                # here; re-delegate a doubtful item instead of redoing it.
+                "Check a worker's result with quick checks you can make here — "
+                "totals that should add up, files it says it wrote, facts already "
+                "in this conversation — but do not redo a worker's work with "
+                "workarounds. If a key result looks wrong or incomplete, spawn a "
+                "worker to re-check that specific item."
+                + (f"\n{VISION_GAP_SENTENCE}" if self.vision_gap else "")
             ),
             parameters={
                 "type": "object",
