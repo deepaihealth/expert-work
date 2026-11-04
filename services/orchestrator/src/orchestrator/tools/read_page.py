@@ -191,6 +191,7 @@ from expert_work.persistence import (
 )
 from expert_work.protocol.multimodal import WORKSPACE_REF_PREFIX
 from orchestrator.multimodal import ImageResolver, RenderedFigureRef, parse_rendered_figure_ref
+from orchestrator.tools._guards import LOOP_TRIP_META_KEY
 from orchestrator.tools.document_figures import (
     _DOCX_INVENTORY_FRAGMENT,
     MIN_FIGURE_AREA_RATIO,
@@ -198,6 +199,7 @@ from orchestrator.tools.document_figures import (
     RENDERABLE_EXTENSIONS,
 )
 from orchestrator.tools.error_classifier import GuidedToolError
+from orchestrator.tools.figure_reads import FigureRead, ledger_entries, read_notice, read_refusal
 from orchestrator.tools.file_ops import _require_path, _snippet, run_scoped_read
 from orchestrator.tools.region_zoom import (
     Box,
@@ -244,6 +246,10 @@ MAX_PAGES_PER_CALL: Final = 3
 #
 # 上线后按真实 run 数一下每个 run 实际渲多少页(spec §13.3 观察项),
 # **真有失控再按数据定**,而不是再猜一个数。
+#
+# B-268(11-03)—— 数据来了:E2 评测里 3 槽窗口让模型轮流重看到步数上限。按 run 的
+# 读取熔断见 :mod:`orchestrator.tools.figure_reads`(同一页第 4 次、同一文档超过
+# 2 x 页数 + 3 次),那是按重复读取熔断,仍然不是按像素累计的上限。
 
 _WORKSPACE_ROOT = EXEC_VIEW
 #: soffice 转 pdf 的子进程超时。文档偶尔较大,给足预算;真超时时片段吞异常降级成
@@ -251,6 +257,8 @@ _WORKSPACE_ROOT = EXEC_VIEW
 _CONVERT_TIMEOUT_S = 90
 #: pdftoppm 只渲一页,给一个小得多的超时。
 _RENDER_TIMEOUT_S = 30
+#: B-268 —— ``pdfinfo`` 读页数(只读交叉引用表,很快);拿不到就当不知道页数。
+_PAGE_COUNT_TIMEOUT_S = 10
 #: B-266 —— 渲局部时每一块 pdftoppm 的超时。``region="auto"`` 最多 8 条横条:重转一次 PDF(90 s)
 #: 加 8 x 20 s 仍在沙箱 300 s 的兜底之下(整页那条路是至多 3 页 x 30 s)。
 _REGION_RENDER_TIMEOUT_S = 20
@@ -477,6 +485,26 @@ _FORM_FEED = chr(12)
 
 def _norm_ws(text):
     return " ".join(text.split())
+
+
+def _pdf_page_count(pdf):
+    # B-268 —— 整份文档的页数, 宿主拿它给熔断定上限、给长文档预告。尽力而为: 没有
+    # pdfinfo、跑失败、读不出 "Pages:" 都返回 None(宿主当不知道, 只按单页规则熔断),
+    # 绝不让渲染失败。超时用 page_count_timeout_s(很短: pdfinfo 只读交叉引用表)。
+    if shutil.which("pdfinfo") is None:
+        return None
+    try:
+        result = subprocess.run(["pdfinfo", pdf], capture_output=True,
+                                timeout=_P["page_count_timeout_s"], check=False)
+    except Exception:
+        return None
+    if result.returncode != 0:
+        return None
+    for line in result.stdout.decode("utf-8", "replace").splitlines():
+        if line.startswith("Pages:"):
+            value = line.split(":", 1)[1].strip()
+            return int(value) if value.isdigit() and int(value) > 0 else None
+    return None
 
 
 def _pdf_page_texts(pdf):
@@ -843,7 +871,11 @@ def _main():
         rendered.append(item)
     if not rendered:
         return {"ok": False, "error": "render_failed", "failed": failed}
-    return {"ok": True, "rendered": rendered, "failed": failed}
+    envelope = {"ok": True, "rendered": rendered, "failed": failed}
+    pages = _pdf_page_count(pdf)
+    if pages is not None:
+        envelope["pages"] = pages
+    return envelope
 
 
 print(json.dumps(_main()))
@@ -895,6 +927,7 @@ def build_render_wrapper(
             "page_stem": RENDERED_FIGURE_PAGE_STEM,
             "convert_timeout_s": convert_timeout_s,
             "render_timeout_s": render_timeout_s,
+            "page_count_timeout_s": _PAGE_COUNT_TIMEOUT_S,
             # 装饰图阈值也是共享真源喂进来的(回修第 1 轮 I-3):docx 的
             # unit -> anchor 片段要它,`_pdf_figure_pages` 的滤子也要它,而且
             # **必须是同一个值**。今天它们读的是同一个片段里的同一行, 结构上
@@ -1551,6 +1584,12 @@ class ReadPageTool:
             # 约束 B —— 三个 id 缺一个就没法造 workspace ref;说明白,不崩。
             return ToolResult(content="无法渲染:这条 run 缺少租户/用户/run 绑定。")
         doc_sha, agent_rel = render_source(raw, view=ctx.workspace_view)
+        # B-268 —— 熔断在进沙箱之前判:本 run 同一页读满 3 次 / 同一文档渲染超过 2 x 页数 + 3 次。
+        refusal = read_refusal(
+            ctx.figure_reads, run_id=ctx.run_id, doc_sha=doc_sha, units=units, region=region
+        )
+        if refusal is not None:
+            return ToolResult(content=refusal, meta={LOOP_TRIP_META_KEY: True})
         # B-262 —— 渲染在 ``/agent`` 视图里做(源文档可能在 ``/agent`` 下),产出落本对话的
         # ``/workspace/.tool_results/``:对话视图里加本对话那一格(agent 根的 ``.tool_results``
         # 在 exec 视图里被盖住),老视图没有前缀,与今天逐字相同。
@@ -1637,9 +1676,18 @@ class ReadPageTool:
             if per_unit:
                 msg = f"{msg} {per_unit}"
             return ToolResult(content=msg)
+        page_count = _page_count(env.get("pages"))
         if region is not None:
             return await self._region_result(
-                raw, refs[0], region, ctx=ctx, doc_sha=doc_sha, notes=notes, label=label
+                raw,
+                refs[0],
+                region,
+                ctx=ctx,
+                doc_sha=doc_sha,
+                notes=notes,
+                label=label,
+                unit=units[0],
+                pages=page_count,
             )
 
         # 回修第 4 轮 New-M2 —— 兜底值不能写成页码。原来是
@@ -1667,12 +1715,28 @@ class ReadPageTool:
         per_unit = _describe_failed_units(all_failed, unit_label=label)
         if per_unit:
             content = f"{content} {per_unit}"
+        reads = [FigureRead(unit=u, page=p) for u, p in rendered_units]
         return ToolResult(
             content=content,
+            notice=self._read_notice(ctx, doc_sha=doc_sha, reads=reads, pages=page_count),
             # 回修第 3 轮 —— 顺带记下 ``<doc-sha>`` → 模型传的路径。提示词里的渲染页段
             # 靠它告诉模型「退役的页用哪个路径拿回来」;它在 state 里,压缩总结掉
             # 历史里这条回执之后仍在。
-            state_updates={"viewed_figures": refs, "figure_documents": {doc_sha: raw}},
+            state_updates={
+                "viewed_figures": refs,
+                "figure_documents": {doc_sha: raw},
+                **_ledger_update(ctx, doc_sha, reads, page_count),
+            },
+        )
+
+    def _read_notice(
+        self, ctx: ToolContext, *, doc_sha: str, reads: Sequence[FigureRead], pages: int | None
+    ) -> str | None:
+        """B-268 —— 重看回执 + 超上限预告;只给直接看图的模型(说的是「在你眼前」)。"""
+        if self.figure_delivery != "inline":
+            return None
+        return read_notice(
+            ctx.figure_reads, run_id=ctx.run_id, doc_sha=doc_sha, reads=reads, pages=pages
         )
 
     async def _region_result(
@@ -1685,6 +1749,8 @@ class ReadPageTool:
         doc_sha: str,
         notes: Sequence[Mapping[str, Any]],
         label: str,
+        unit: int,
+        pages: int | None,
     ) -> ToolResult:
         """B-266 —— ``read_page(region=…)``:整页已渲好,再把这一块高分辨率渲出来,像一页那样
         进 ``viewed_figures``(下一轮内联给主模型)。只放局部,不放整页。"""
@@ -1704,15 +1770,21 @@ class ReadPageTool:
         caveats = _describe_render_notes(notes, unit_label=label)
         if caveats:
             content = f"{content} {caveats}"
+        reads = [FigureRead(unit=unit, page=figure.page, region=region)] if figure else []
         return ToolResult(
             content=content,
+            notice=self._read_notice(ctx, doc_sha=doc_sha, reads=reads, pages=pages),
             meta={
                 "region": list(region),
                 "dpi": crop.dpi,
                 "pixels": [crop.width, crop.height],
                 "reused": crop.reused,
             },
-            state_updates={"viewed_figures": [crop.ref], "figure_documents": {doc_sha: raw}},
+            state_updates={
+                "viewed_figures": [crop.ref],
+                "figure_documents": {doc_sha: raw},
+                **_ledger_update(ctx, doc_sha, reads, pages),
+            },
         )
 
     async def render_regions(
@@ -1822,6 +1894,20 @@ class ReadPageTool:
             msg = "none of the regions could be rendered"
             raise RegionRenderError(msg)
         return RegionRender(crops=tuple(crops), failed=tuple(failed))
+
+
+def _page_count(raw: object) -> int | None:
+    """渲染片段回的 ``pages``(``pdfinfo``,尽力而为);不是正整数就当不知道。"""
+    return raw if _is_plain_int(raw) and raw > 0 else None
+
+
+def _ledger_update(
+    ctx: ToolContext, doc_sha: str, reads: Sequence[FigureRead], pages: int | None
+) -> dict[str, Any]:
+    """B-268 —— 这次渲染追加进本 run 读取账的 ``state_updates`` 片段;没有 run 就不记。"""
+    if ctx.run_id is None or not reads:
+        return {}
+    return {"figure_reads": ledger_entries(ctx.run_id, doc_sha, reads, pages)}
 
 
 def _region_job(

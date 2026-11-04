@@ -37,6 +37,7 @@ from orchestrator.multimodal import (
 )
 from orchestrator.tools import region_zoom
 from orchestrator.tools.figure_lookup import figure_run_ids
+from orchestrator.tools.figure_reads import FigureRead, ledger_entries
 from orchestrator.tools.nas_workspace_store import NasWorkspaceStore
 from orchestrator.tools.read_page import (
     _CONVERT_TIMEOUT_S,
@@ -867,7 +868,7 @@ async def test_a_band_conflict_returns_the_whole_image_answer_marked_uncertain(
 
     up = _upload(tmp_path, _VL(answer=answer), size=_BIG)
     result = await up.tool.call(
-        {"image_ref": up.ref, "question": "total?", "region": "auto"}, ctx=up.ctx
+        {"image_ref": up.ref, "question": "amount?", "region": "auto"}, ctx=up.ctx
     )
 
     assert result.content.startswith("The total is 42.\n\n")
@@ -892,7 +893,7 @@ async def test_a_partial_band_falls_back_to_the_whole_image_count(tmp_path: Path
 
     up = _upload(tmp_path, _VL(answer=answer), size=_BIG)
     result = await up.tool.call(
-        {"image_ref": up.ref, "question": "how many people?", "region": "auto"}, ctx=up.ctx
+        {"image_ref": up.ref, "question": "people?", "region": "auto"}, ctx=up.ctx
     )
 
     assert result.content.startswith("There are 9 people.")
@@ -1126,6 +1127,11 @@ async def test_read_page_region_puts_the_crop_in_viewed_figures(
     dpi = region_dpi(_A4_AT_100DPI, (100, 200, 600, 500), base_dpi=100)
     assert f"at {dpi} dpi" in result.content
     assert result.meta["region"] == [100, 200, 600, 500]
+    # B-268 —— 局部图按 (文档, 编号, 框) 记进本 run 的读取账,与整页分开计。
+    assert doc.ctx.run_id is not None
+    assert result.state_updates["figure_reads"] == ledger_entries(
+        doc.ctx.run_id, crop.doc_sha, [FigureRead(1, 1, (100, 200, 600, 500))], None
+    )
 
     block = figure_block_message(
         viewed=[crop_ref],

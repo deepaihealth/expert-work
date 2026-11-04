@@ -423,6 +423,9 @@ class ToolContext:
     #: 的目录:渲染页落在 agent 级的 ``.tool_results/<run>/``,同一智能体的别的对话在同名文档
     #: 上渲过的页不许拿来用。
     figure_run_ids: frozenset[UUID] = frozenset()
+    #: B-268 —— 检查点里的 ``figure_reads``(本 run 的 ``read_page`` 读取账,原样、未校验;
+    #: 读的一侧 ``tools.figure_reads`` 逐条校验)。
+    figure_reads: tuple[Any, ...] = ()
 
     @property
     def workspace_view(self) -> WorkspaceView:
@@ -451,8 +454,16 @@ class ToolContext:
 #:   (state.py 的通道用 ``_merge_viewed_figures`` 跨轮 union,按最近一次看到排序)。
 #: - ``figure_documents`` —— B-64 ``read_page`` 记下 ``<doc-sha>`` → 路径
 #:   (渲染页段的退役占位靠它给出拿回来的路径;读的一侧正向重算哈希再采信)。
+#: - ``figure_reads`` —— B-268 ``read_page`` 本 run 的读取账(每次渲染追加一条)。
 TOOL_ALLOWED_STATE_KEYS: frozenset[str] = frozenset(
-    {"plan", "subagent_invocations", "promoted_tools", "viewed_figures", "figure_documents"}
+    {
+        "plan",
+        "subagent_invocations",
+        "promoted_tools",
+        "viewed_figures",
+        "figure_documents",
+        "figure_reads",
+    }
 )
 
 

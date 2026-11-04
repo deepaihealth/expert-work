@@ -2,7 +2,8 @@
 
 渲染本身归 ``test_read_page``;这一份钉的是**挂哪几张、怎么退役、给谁看**:
 
-1. 滑窗:只有最近 :data:`FIGURE_KEEP_RECENT` 个槽带像素。
+1. 滑窗(B-268):正在读的那份文档的整页全部保留(上限 :data:`FIGURE_PAGES_IN_VIEW`),
+   局部图单独一条道(:data:`FIGURE_CROPS_IN_VIEW`),只挤局部图。
 2. 退役是替换不是删除:超窗的换成可见文字,写明怎么拿回来。
 3. 三项比对(tenant / user / agent_key)缺一不可 —— ``viewed_figures`` 是任何
    工具都能写的通道,而 resolver 的身份取自 ref 自身。
@@ -34,11 +35,13 @@ from langchain_core.runnables import RunnableConfig
 
 from expert_work.common.conversation_channel import FIGURE_BLOCK_MARK, HIDE_FROM_UI
 from expert_work.persistence import (
+    RENDERED_CROP_DIR,
     RENDERED_FIGURE_DIR,
     RENDERED_FIGURE_PAGE_STEM,
     RENDERED_FIGURE_SHA_HEX_LEN,
     RENDERED_FIGURE_UNIT_PREFIX,
     WORKSPACE_OVERFLOW_DIR,
+    region_crop_stem,
 )
 from expert_work.protocol import StructuredOutputSpec
 from expert_work.runtime.checkpointer import make_checkpointer
@@ -53,13 +56,13 @@ from orchestrator import (
 )
 from orchestrator.context import ContextCompressor
 from orchestrator.graph_builder.figure_block import (
-    FIGURE_KEEP_RECENT,
     figure_block_tail,
     figure_freshness,
 )
 from orchestrator.llm.providers._streaming import LLMDelta
 from orchestrator.multimodal import parse_rendered_figure_ref
 from orchestrator.state import _merge_viewed_figures
+from orchestrator.tools.figure_reads import FIGURE_CROPS_IN_VIEW, FIGURE_PAGES_IN_VIEW
 from orchestrator.tools.nas_workspace_store import NasWorkspaceStore
 from orchestrator.tools.read_page import ReadPageTool, document_sha, workspace_figure_ref
 from orchestrator.tools.sandbox import EgressContext, RecordingSandboxRuntime, SandboxOutcome
@@ -96,6 +99,7 @@ def _ref(
     tenant: UUID = _TENANT,
     user: UUID = _USER,
     agent_key: str = _AGENT_KEY,
+    region: tuple[int, int, int, int] | None = None,
 ) -> str:
     """一条 ``read_page`` 形状的 ref。
 
@@ -105,17 +109,32 @@ def _ref(
     ``content`` 决定 ``<render-sha>``(内容派生)。
     """
     unit_no = int(page) if unit is None else unit
-    rel = "/".join(
-        [
-            WORKSPACE_OVERFLOW_DIR,
-            str(run),
-            RENDERED_FIGURE_DIR,
-            str(document_sha(doc, view=WorkspaceView(agent_key=agent_key))),
-            _sha(content),
-            f"{RENDERED_FIGURE_UNIT_PREFIX}{unit_no}",
-            f"{RENDERED_FIGURE_PAGE_STEM}-{page}.jpg",
-        ]
-    )
+    doc_sha = str(document_sha(doc, view=WorkspaceView(agent_key=agent_key)))
+    unit_dir = f"{RENDERED_FIGURE_UNIT_PREFIX}{unit_no}"
+    if region is None:
+        rel = "/".join(
+            [
+                WORKSPACE_OVERFLOW_DIR,
+                str(run),
+                RENDERED_FIGURE_DIR,
+                doc_sha,
+                _sha(content),
+                unit_dir,
+                f"{RENDERED_FIGURE_PAGE_STEM}-{page}.jpg",
+            ]
+        )
+    else:  # B-266 —— ``read_page(region=…)`` 的裁图形状
+        rel = "/".join(
+            [
+                WORKSPACE_OVERFLOW_DIR,
+                str(run),
+                RENDERED_CROP_DIR,
+                doc_sha,
+                _sha(content),
+                unit_dir,
+                f"{RENDERED_FIGURE_PAGE_STEM}-{page}-{region_crop_stem(region)}-d300.jpg",
+            ]
+        )
     scope = store_scope(EXEC_VIEW, agent_key=agent_key)
     return workspace_figure_ref(tenant, user, scoped_path(scope, rel))
 
@@ -170,11 +189,42 @@ def _block_text(messages: Sequence[BaseMessage]) -> str:
 # ---------------------------------------------------------------------------
 
 
-def test_only_the_newest_three_figures_carry_pixels() -> None:
-    viewed = [_ref(p) for p in range(1, 6)]
+def test_the_document_being_read_keeps_its_newest_six_pages() -> None:
+    viewed = [_ref(p) for p in range(1, 9)]
     out = _tail([], viewed)
-    assert FIGURE_KEEP_RECENT == 3
-    assert _pixels(out) == viewed[-3:]
+    assert FIGURE_PAGES_IN_VIEW == 6
+    assert _pixels(out) == viewed[-6:]
+
+
+def test_a_four_page_document_stays_in_view_whole() -> None:
+    """B-268 E2 —— 3 槽窗口下 4 页文档按「最早那页退出 → 重看」严格轮转。"""
+    viewed = [_ref(p) for p in range(1, 5)]
+    out = _tail([], viewed)
+    assert _pixels(out) == viewed
+    assert "left your context" not in _block_text(out)
+
+
+def test_the_document_being_read_wins_over_more_recent_pages_of_another() -> None:
+    """正在读的 = 最近一次 read_page 的那份(这里是 a 的局部图):a 的 4 页整页全留,
+    b 只剩最近的 2 页。只按「最近优先」的话留下的是 b 的 4 页 + a 的 2 页。"""
+    a = [_ref(p, doc="a.pdf") for p in range(1, 5)]
+    b = [_ref(p, doc="b.pdf") for p in range(1, 5)]
+    crop = _ref(1, doc="a.pdf", region=(0, 0, 500, 500))
+    out = _tail([], [*a, *b, crop])
+    pixels = _pixels(out)
+    assert set(pixels) == {*a, b[2], b[3], crop}
+
+
+def test_region_crops_have_their_own_lane_of_two() -> None:
+    """B-268 E2 —— 3 张局部图曾把 3 页整页全挤掉;局部图只挤局部图。"""
+    pages = [_ref(p) for p in (1, 2, 3)]
+    crops = [_ref(1, region=(0, 0, 100 * i, 100 * i)) for i in (1, 2, 3)]
+    out = _tail([], [*pages, *crops])
+    assert FIGURE_CROPS_IN_VIEW == 2
+    assert set(_pixels(out)) == {*pages, crops[1], crops[2]}
+    text = _block_text(out)
+    assert "zoomed regions of units 1 have left your context" in text
+    assert f"at most {FIGURE_CROPS_IN_VIEW} zoomed regions are in view at once" in text
 
 
 # ---------------------------------------------------------------------------
@@ -184,11 +234,21 @@ def test_only_the_newest_three_figures_carry_pixels() -> None:
 
 def test_retired_figures_leave_a_visible_placeholder() -> None:
     """删除是静默失效 —— 模型必须看得见这里原来有张图,以及怎么拿回来。"""
-    out = _tail([], [_ref(p) for p in range(1, 6)])
+    out = _tail([], [_ref(p) for p in range(1, 9)])
     text = _block_text(out)
     # 1、2 两页退役,按文档折叠成一行、编号压成区间;3 仍在窗口里。
-    assert "编号 1-2 的图已退出上下文" in text
+    assert "the page images for units 1-2 have left your context" in text
+    assert f"at most {FIGURE_PAGES_IN_VIEW} pages are in view at once" in text
     assert "read_page" in text
+
+
+def test_the_eviction_notice_does_not_send_the_model_after_a_page() -> None:
+    """B-268 E2 —— 旧提示「需要重看就调用 read_page,units 填…」被模型直接当成重看理由。"""
+    text = _block_text(_tail([], [_ref(p) for p in range(1, 9)]))
+    assert "do not re-read pages in turn just to check them side by side" in text
+    assert "only if you are actually missing a specific number" in text
+    assert "units 填" not in text
+    assert "需要重看" not in text
 
 
 def test_a_re_read_retired_page_comes_back_into_the_window() -> None:
@@ -197,11 +257,11 @@ def test_a_re_read_retired_page_comes_back_into_the_window() -> None:
     同一个 run 里重读同一页拿到的是逐字相同的 ref,经过真 reducer 合并之后,它必须
     重新带像素。按「首次看到」排的 reducer 下它永远回不来。
     """
-    first = [_ref(p) for p in range(1, 6)]
+    first = [_ref(p) for p in range(1, 9)]
     again = _merge_viewed_figures(first, [_ref(1)])
     out = _tail([], again)
     assert _ref(1) in _pixels(out)
-    assert "编号 2-3 的图已退出上下文" in _block_text(out)
+    assert "units 2-3 have left your context" in _block_text(out)
 
 
 # ---------------------------------------------------------------------------
@@ -281,12 +341,12 @@ def test_no_run_identity_means_no_pixels() -> None:
 
 
 def test_two_versions_of_one_page_share_one_pixel_slot() -> None:
-    """次序刻意排成「新旧两版之间夹着一页」:不归槽的话,最近 3 条是旧版 + 两页,
-    会把最早那一页挤掉 —— 这条测试才区分得出有没有归槽。"""
+    """次序刻意排成「新旧两版之间夹着几页」:不归槽的话,旧版 + 新版占两个位置,
+    会把最早那一页挤出 6 页的窗口 —— 这条测试才区分得出有没有归槽。"""
     old, new = _ref(3, content="v1"), _ref(3, content="v2")
-    p5, p7 = _ref(5), _ref(7)
-    out = _tail([], [p5, old, p7, new])
-    assert _pixels(out) == [p5, p7, new]
+    others = [_ref(p) for p in (1, 2, 4, 5, 6)]
+    out = _tail([], [others[0], old, *others[1:], new])
+    assert _pixels(out) == [*others, new]
     text = _block_text(out)
     assert "编号 3 有旧版本(文档之后被改过)" in text
 
@@ -540,19 +600,17 @@ def test_a_retired_page_says_which_path_to_pass_back() -> None:
     out = _tail(
         [],
         [_ref(p, doc="uploads/a.pptx") for p in (1, 2)]
-        + [_ref(p, doc="uploads/b.pdf") for p in (1, 2, 3)],
+        + [_ref(p, doc="uploads/b.pdf") for p in range(1, 7)],
         documents=_documents("uploads/a.pptx", "uploads/b.pdf"),
     )
     text = _block_text(out)
-    assert '文档 "uploads/a.pptx":编号 1-2 的图已退出上下文' in text
-    assert "path 填这个路径" in text
+    assert '文档 "uploads/a.pptx":the page images for units 1-2 have left your context' in text
     assert '"uploads/b.pdf" 第 1 页' in text
 
 
 def test_without_a_recorded_path_the_placeholder_says_so() -> None:
-    text = _block_text(_tail([], [_ref(p) for p in range(1, 6)]))
+    text = _block_text(_tail([], [_ref(p) for p in range(1, 9)]))
     assert "路径没记下来" in text
-    assert "你当初调用 read_page 时传的那个路径" in text
 
 
 def test_a_path_that_does_not_hash_to_the_key_is_not_shown() -> None:
@@ -560,7 +618,7 @@ def test_a_path_that_does_not_hash_to_the_key_is_not_shown() -> None:
     forged = {
         str(document_sha("d.pptx", view=WorkspaceView(agent_key=_AGENT_KEY))): "别的文件.pptx"
     }
-    text = _block_text(_tail([], [_ref(p) for p in range(1, 6)], documents=forged))
+    text = _block_text(_tail([], [_ref(p) for p in range(1, 9)], documents=forged))
     assert "别的文件" not in text
     assert "路径没记下来" in text
 
@@ -576,9 +634,9 @@ def test_placeholders_grow_with_documents_not_with_pages() -> None:
         ]
         return _block_text(_tail([], viewed, documents=_documents("uploads/a.pptx")))
 
-    few, many = text_for(5), text_for(40)
+    few, many = text_for(8), text_for(40)
     assert few.count("\n") == many.count("\n")
-    assert "编号 1-37 的图已退出上下文" in many
+    assert "units 1-34 have left your context" in many
     assert "编号 1-40 有旧版本" in many
 
 
@@ -804,7 +862,7 @@ def _read_page_call(path: str, units: list[int], call_id: str) -> AIMessage:
 
 
 async def test_the_path_read_page_recorded_reaches_later_prompts_and_runs() -> None:
-    """两次 read_page(共 4 页)→ 第 3 次模型调用时第 1 页已退役,占位里必须是
+    """三次 read_page(共 7 页)→ 第 4 次模型调用时第 1 页已退役,占位里必须是
     read_page 自己记下的路径;同一会话的下一个 run 里也还在。
 
     ``agent_node`` 若不把 ``state["figure_documents"]`` 交给建块函数,占位会退化成
@@ -821,8 +879,9 @@ async def test_the_path_read_page_recorded_reaches_later_prompts_and_runs() -> N
     async with make_checkpointer("memory") as cp:
         llm = _RecordingLLM(
             responses=[
-                _read_page_call("a.pptx", [1, 2], "c1"),
-                _read_page_call("a.pptx", [3, 4], "c2"),
+                _read_page_call("a.pptx", [1, 2, 3], "c1"),
+                _read_page_call("a.pptx", [4, 5, 6], "c2"),
+                _read_page_call("a.pptx", [7], "c3"),
             ]
         )
         graph = GraphRunner(checkpointer=cp).compile(
@@ -832,8 +891,8 @@ async def test_the_path_read_page_recorded_reaches_later_prompts_and_runs() -> N
             {"messages": [HumanMessage(content="看图")], "step_count": 0, "max_steps": 8},
             config=_config(),
         )
-        third = _block_text(llm.seen_prompts[2])
-        assert '文档 "a.pptx":编号 1 的图已退出上下文' in third
+        fourth = _block_text(llm.seen_prompts[3])
+        assert '文档 "a.pptx":the page images for units 1 have left your context' in fourth
 
         llm2 = _RecordingLLM()
         graph2 = GraphRunner(checkpointer=cp).compile(
@@ -843,7 +902,9 @@ async def test_the_path_read_page_recorded_reaches_later_prompts_and_runs() -> N
             {"messages": [HumanMessage(content="继续")], "step_count": 0, "max_steps": 4},
             config=_config(),
         )
-        assert '文档 "a.pptx":编号 1 的图已退出上下文' in _block_text(llm2.seen_prompts[0])
+        assert '文档 "a.pptx":the page images for units 1 have left' in _block_text(
+            llm2.seen_prompts[0]
+        )
 
 
 # ---------------------------------------------------------------------------

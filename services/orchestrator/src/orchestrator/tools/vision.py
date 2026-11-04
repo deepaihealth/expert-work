@@ -71,6 +71,7 @@ from orchestrator.tools.figure_lookup import (
     resolve_rendered_figure,
 )
 from orchestrator.tools.file_ops import _require_path
+from orchestrator.tools.question_scope import is_count_question, is_whole_image_question
 from orchestrator.tools.read_page import (
     RENDER_DPI,
     RegionCrop,
@@ -527,6 +528,8 @@ class AskImageTool:
 
         1. 门槛:图(文档页按 :data:`DOCUMENT_ZOOM_DPI` 算)不到 :data:`AUTO_GATE_PIXELS` → 不切,
            整张快看一次(``gated``);
+        1b. B-273 —— 问题像整体类问题(计数 / 合计 / 最高最低 ...)→ 同样不切、整张快看一次
+           (``gated`` / ``whole_question``,见 :meth:`_look_whole_question`);
         2. 否则切 :func:`band_count` 条整宽横条,每条回一小段 JSON;**同时**并行一次整张快看
            (原问题、不加 JSON 要求),两者都计入在飞名额与记账;
         3. 最终答案见 :func:`~orchestrator.tools.tile_reading.decide_auto`。横条与整张读全失败
@@ -547,6 +550,8 @@ class AskImageTool:
                 f"({pixels / 1_000_000:.1f} MP) to read whole, so it was read whole.)"
             )
             return content, meta
+        if is_whole_image_question(question):
+            return await self._look_whole_question(located, question, meta=meta, ctx=ctx)
         bands = plan_bands(size or (1, 1), pixels or 0)
         try:
             rendered = await self._crops(
@@ -600,7 +605,12 @@ class AskImageTool:
                 raise first
             msg = "ask_image region='auto' could not look at this image at all"
             raise RuntimeError(msg)
-        decision = decide_auto(results, full_answer=full_answer, full_error=full_error)
+        decision = decide_auto(
+            results,
+            full_answer=full_answer,
+            full_error=full_error,
+            count_question=is_count_question(question),
+        )
         ask_image_region_auto_total.labels(path=decision.path, reason=decision.reason).inc()
         meta.update(
             {
@@ -620,6 +630,24 @@ class AskImageTool:
         if usages:
             meta["vl_usage"] = _sum_usage(usages)
         return decision.content, meta
+
+    async def _look_whole_question(
+        self, located: _Located, question: str, *, meta: dict[str, Any], ctx: ToolContext
+    ) -> tuple[str, dict[str, Any]]:
+        """B-273 V1 —— 整体类问题(计数 / 合计 / 平均 / 最高最低 / 排名 / 趋势 ...,见
+        :mod:`~orchestrator.tools.question_scope`)不切条:每条只看得到一截,条上的答案在 E1 里
+        55 次只对 1 次。与小图同一条路(``gated``)整张快看一次。整张读的答案不标不确定。"""
+        look = await self._look(located.ref, question, depth="quick", ctx=ctx)
+        ask_image_region_auto_total.labels(path="gated", reason="whole_question").inc()
+        meta.update({"auto": "gated", "auto_reason": "whole_question", "vl_calls": 1})
+        if look.usage:
+            meta["vl_usage"] = look.usage
+        content = (
+            f"{look.answer}\n\n(region='auto': the question is about the whole image (counting, "
+            "totals, highest or lowest, ranking or trends), so the image was read whole rather "
+            "than in bands.)"
+        )
+        return content, meta
 
     async def _full_result(
         self, outcome: AIMessage | BaseException, *, ctx: ToolContext

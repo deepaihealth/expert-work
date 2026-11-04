@@ -675,6 +675,10 @@ _FALLBACK_REASONS: Final[dict[str, str]] = {
     "none": "no band read the value",
     "bands_failed": "every band failed",
     "bands_unavailable": "the bands could not be prepared",
+    "multi_band": (
+        "more than one band reported this value, and not as one row seen twice where two "
+        "neighbouring bands overlap, so each band may have counted only its own part"
+    ),
 }
 
 
@@ -688,24 +692,77 @@ class AutoDecision:
     bands: AutoOutcome
 
 
+def _boxes_overlap(a: Box, b: Box) -> bool:
+    return a[0] < b[2] and b[0] < a[2] and a[1] < b[3] and b[1] < a[3]
+
+
+def _one_row_seen_twice(found: Sequence[TileResult]) -> bool:
+    """B-273 R2 —— 几条横条报了同一个值时,只认「相邻两条在重叠处看到同一行」:恰好两条、框有重叠
+    (只有相邻的横条重叠)、字段名相同或有一条为空。别的(三条以上、隔开的两条、字段名不同)在
+    E1 里是各条只数到自己那一截、碰巧相等 —— 按冲突处理,走整张读。"""
+    if len(found) < 2:
+        return True
+    if len(found) > 2:
+        return False
+    first, second = found
+    labels = [_label_key(r.reply.label) if r.reply is not None else "" for r in found]
+    same_label = labels[0] == labels[1] or not labels[0] or not labels[1]
+    return same_label and _boxes_overlap(first.tile.box, second.tile.box)
+
+
+def zero_counts_as_not_found(results: Sequence[TileResult]) -> list[TileResult]:
+    """B-273 V2 —— 计数类问题上,一条横条报 0 只说明它那一截里没有,不是整张图的答案:当作没找到。"""
+    out: list[TileResult] = []
+    for result in results:
+        reply = result.reply
+        if reply is not None and reply.status == "found":
+            reading = parse_reading(reply.value, reply.unit)
+            if reading.kind == "number" and reading.numbers == (Decimal(0),):
+                result = TileResult(
+                    tile=result.tile,
+                    reply=TileReply(
+                        status="not_found",
+                        raw=reply.raw,
+                        parse_mode=reply.parse_mode,
+                        label=reply.label,
+                        note="zero_count",
+                    ),
+                )
+        out.append(result)
+    return out
+
+
 def decide_auto(
-    results: Sequence[TileResult], *, full_answer: str | None, full_error: str | None
+    results: Sequence[TileResult],
+    *,
+    full_answer: str | None,
+    full_error: str | None,
+    count_question: bool = False,
 ) -> AutoDecision:
     """横条读数 + 并行的整张读 → 最终答案(重设计 §4)。
 
-    * 横条给出一个前后一致的值、且没有一条报 ``partial`` → 用它(``bands``);
+    * B-273 —— ``count_question``(计数类问题)时,横条报的 0 先当作没找到(V2,
+      :func:`zero_counts_as_not_found`);
+    * 横条给出一个前后一致的值、且没有一条报 ``partial`` → 用它(``bands``);几条都报了这个值时
+      只认相邻两条在重叠处看到的同一行(R2,:func:`_one_row_seen_twice`),否则走整张读;
     * 冲突、全无、有横条报 ``partial``(那条只数到了自己那一截,验证里它推翻过整张读的正确
       计数)或横条全失败 → 用整张读的回答,明说不确定,横条的读数与框附在后面(``full_fallback``);
     * 要退回整张读、整张读却失败了 → 只给横条的汇总,并说明整张读失败(仍记 ``bands``)。
     """
+    if count_question:
+        results = zero_counts_as_not_found(results)
     verdict = aggregate_tiles(results)
     has_partial = any(r.reply is not None and r.reply.status == "partial" for r in results)
-    if verdict.outcome == "single" and not has_partial:
+    found = [r for r in results if r.reply is not None and r.reply.status == "found"]
+    seen_once = _one_row_seen_twice(found)
+    if verdict.outcome == "single" and not has_partial and seen_once:
         return AutoDecision("bands", "single", verdict.content, verdict.outcome)
     if all(r.reply is None for r in results):
         reason = "bands_failed"
     elif has_partial:
         reason = "partial"
+    elif verdict.outcome == "single":
+        reason = "multi_band"
     else:
         reason = verdict.outcome
     if full_answer is None:

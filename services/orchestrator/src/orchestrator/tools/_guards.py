@@ -26,6 +26,9 @@ GuardSink = Callable[[dict[str, Any]], Awaitable[None]]
 #: 轮次不清零。拦下之后提醒在同一个 run 里交回模型, 按「连续」算的话「打转 → 换个调用 →
 #: 再打转」会一路跑到步数上限。住在 tools 层:子代收尾说明(``_child_run``)也要用。
 DEFAULT_LOOP_TRIPS_PER_RUN = 2
+#: B-268 —— 工具结果 ``meta`` 里的这个键为真 = 这次调用是平台拒绝的重复读取(``read_page``
+#: 熔断);tools 节点把它计进本 run 的 ``loop_trip_count``,与 loop-detection 拦下同一本账。
+LOOP_TRIP_META_KEY = "expert_work_loop_trip"
 
 
 @dataclass
