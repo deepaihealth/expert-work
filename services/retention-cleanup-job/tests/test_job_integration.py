@@ -816,7 +816,11 @@ async def test_workspace_rules_end_to_end_against_postgres(
             name: row is not None and row.deleted_at is not None
             for name, row in upload_rows.items()
         } == {"old": True, "fresh": False, "shared_old": True, "shared_fresh": False}
-        assert (report.uploads_expired, report.upload_files_removed) == (2, 1)
+        # The CI integration job shares one database across packages, so other tests'
+        # expired upload rows can be swept too: the per-row and per-file checks above are
+        # the exact ones, the report counts are lower bounds (like the thread/workspace ones).
+        assert report.uploads_expired >= 2
+        assert report.upload_files_removed >= 1
         assert await workspaces.get(tenant_id=tenant, user_id=purged_user) is None
         assert (
             await artifacts.list_for_user(
