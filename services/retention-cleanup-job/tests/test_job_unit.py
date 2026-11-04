@@ -46,6 +46,9 @@ def test_cleanup_report_default_is_all_zero() -> None:
     assert report.uploads_expired == 0
     assert report.upload_files_removed == 0
     assert report.upload_files_unsafe == 0
+    assert report.upload_rows_failed == 0
+    assert report.upload_rows_abandoned == 0
+    assert report.failed_passes == ()
     assert report.thread_dirs_removed == 0
     assert report.tenant_users_hard_deleted == 0
     assert report.sandbox_egress_audit_deleted == 0

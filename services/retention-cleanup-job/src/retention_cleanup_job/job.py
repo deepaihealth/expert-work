@@ -80,7 +80,7 @@ from retention_cleanup_job.orphan_threads import (
     sweep_orphan_tool_results,
 )
 from retention_cleanup_job.report import CleanupReport
-from retention_cleanup_job.uploads import UploadSweep
+from retention_cleanup_job.uploads import UploadSweep, UploadSweepTally
 
 logger = logging.getLogger(__name__)
 
@@ -221,6 +221,8 @@ class RetentionCleanupJob:
         self._audit_logger = audit_logger
         #: B-271 —— 只读:给没有 sha256 的老上传行从 ``DOCUMENT_UPLOAD`` 审计行补 sha256。
         self._audit_log_store = audit_log_store
+        #: 吞掉异常继续跑的 pass 失败时记在这里(``run_once`` 开头清空),进 ``CleanupReport``。
+        self._failed_passes: list[str] = []
 
     async def run_once(self) -> CleanupReport:
         """Run the retention passes once and return a tally.
@@ -242,11 +244,8 @@ class RetentionCleanupJob:
         with _bypass_rls():
             # B-271 —— 上传 pass 排在审计删除之前:老上传行要从登记时的 ``DOCUMENT_UPLOAD``
             # 审计行补 sha256,而那条审计与上传同一天满默认 90 天,先删审计就读不到了。
-            (
-                uploads_expired,
-                upload_files_removed,
-                upload_files_unsafe,
-            ) = await self._sweep_uploads()
+            self._failed_passes = []
+            uploads = await self._sweep_uploads()
             audit_deleted, audit_by_tenant = await self._delete_audit_log()
             audit_skipped = await self._count_unacked_past_retention()
             event_deleted = await self._delete_event_log()
@@ -287,9 +286,12 @@ class RetentionCleanupJob:
             artifact_files_removed=artifact_files_removed,
             artifacts_expired=artifacts_expired,
             orphan_artifact_copies_removed=orphan_artifact_copies_removed,
-            uploads_expired=uploads_expired,
-            upload_files_removed=upload_files_removed,
-            upload_files_unsafe=upload_files_unsafe,
+            uploads_expired=uploads.marked,
+            upload_files_removed=uploads.files_removed,
+            upload_files_unsafe=uploads.files_unsafe,
+            upload_rows_failed=uploads.rows_failed,
+            upload_rows_abandoned=uploads.rows_abandoned,
+            failed_passes=tuple(self._failed_passes),
             thread_dirs_removed=thread_dirs_removed,
             tool_result_dirs_removed=tool_result_dirs_removed,
             memory_hard_deleted=memory_hard_deleted,
@@ -565,7 +567,7 @@ class RetentionCleanupJob:
         hard_count = await self._artifact_store.hard_delete(artifact_ids=hard_ids)
         return soft_count, hard_count
 
-    async def _sweep_uploads(self) -> tuple[int, int, int]:
+    async def _sweep_uploads(self) -> UploadSweepTally:
         """留存链 —— 上传 90 天;规则本体在 :class:`retention_cleanup_job.uploads.UploadSweep`
         (B-271:按会话当前的 agent / 布局删真实位置上的文件,引用检查、改动保护、不安全路径)。
 
@@ -574,17 +576,17 @@ class RetentionCleanupJob:
         上传与跨会话引用复制(copy-on-attach)不建 ``user_upload`` 行,这里永远看不到它们
         (B-271 不改,另立)。
 
-        Returns ``(rows_marked, files_removed, files_unsafe)``。No-op when
-        :class:`UserUploadStore`, :class:`ThreadMetaStore` or ``workspace_root`` is missing ——
-        没有会话就算不出文件在哪,只标行不删文件等于留下永久孤儿。这一 pass 整体失败(列行 /
-        预取会话出错)只记日志,后面的 pass 照跑。
+        Returns the :class:`UploadSweepTally`。No-op when :class:`UserUploadStore`,
+        :class:`ThreadMetaStore` or ``workspace_root`` is missing —— 没有会话就算不出文件在哪,
+        只标行不删文件等于留下永久孤儿。这一 pass 整体失败(列行 / 预取会话出错 / 工作区根打不开)
+        记日志、记进 ``failed_passes``(进程最后以非 0 退出),后面的 pass 照跑。
         """
         if (
             self._user_upload_store is None
             or self._thread_store is None
             or self._workspace_root is None
         ):
-            return 0, 0, 0
+            return UploadSweepTally()
         now = datetime.now(UTC)
         cutoff = now - timedelta(days=self._upload_retention_days)
         sweep = UploadSweep(
@@ -597,11 +599,11 @@ class RetentionCleanupJob:
             expired = await self._user_upload_store.list_expired(
                 before=cutoff, limit=self._batch_size
             )
-            tally = await sweep.run(expired, cutoff=cutoff, now=now)
+            return await sweep.run(expired, cutoff=cutoff, now=now)
         except Exception:
             logger.exception("retention.upload_sweep_failed")
-            return 0, 0, 0
-        return tally.marked, tally.files_removed, tally.files_unsafe
+            self._failed_passes.append("uploads")
+            return UploadSweepTally()
 
     async def _sweep_orphan_thread_dirs(self) -> int:
         """留存链 B-27 —— 孤儿 ``threads/<thread_id>/`` 目录;规则本体在
@@ -631,6 +633,7 @@ class RetentionCleanupJob:
             return await sweep_orphan_copies(self._workspace_root, self._artifact_store)
         except Exception:
             logger.exception("retention.orphan_artifact_copies_failed")
+            self._failed_passes.append("orphan_artifact_copies")
             return 0
 
     async def _audit(

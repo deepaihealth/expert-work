@@ -11,8 +11,11 @@ B-50 起上传落 ``agents/<key>/uploads/``(老视图),B-262 起对话视图落
 from __future__ import annotations
 
 import asyncio
+import errno
 import hashlib
 import os
+import socket
+import stat
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Literal
@@ -22,13 +25,19 @@ import pytest
 
 from control_plane.api._workspace_shared import thread_workspace_path
 from expert_work.persistence import (
+    InMemoryArtifactStore,
     InMemoryAuditLogStore,
     InMemoryThreadMetaStore,
     InMemoryUserUploadStore,
 )
 from expert_work.protocol import AuditAction, AuditEntry, AuditResult, ThreadMeta
+from retention_cleanup_job import job as job_module
+from retention_cleanup_job import main as main_module
+from retention_cleanup_job import uploads as uploads_module
 from retention_cleanup_job import workspace_files
 from retention_cleanup_job.job import RetentionCleanupJob
+from retention_cleanup_job.main import EXIT_PASS_FAILED, exit_code
+from retention_cleanup_job.uploads import UploadSweepTally
 from retention_cleanup_job.workspace_files import upload_relpath
 
 _OLD = datetime.now(UTC) - timedelta(days=100)
@@ -119,6 +128,11 @@ class _World:
         return RetentionCleanupJob(**kwargs)  # type: ignore[arg-type]
 
 
+def _counts(tally: UploadSweepTally) -> tuple[int, int, int]:
+    """``(rows_marked, files_removed, files_unsafe)``。"""
+    return tally.marked, tally.files_removed, tally.files_unsafe
+
+
 @pytest.fixture
 def world(tmp_path: Path) -> _World:
     return _World(tmp_path)
@@ -137,7 +151,7 @@ async def test_agent_root_layout_removes_the_file_under_the_agent_subtree(world:
     legacy.write_bytes(_BODY)
     upload = await world.register(meta.thread_id)
 
-    assert await world.job()._sweep_uploads() == (1, 1, 0)
+    assert _counts(await world.job()._sweep_uploads()) == (1, 1, 0)
 
     assert not real.exists()
     assert legacy.exists()
@@ -155,7 +169,7 @@ async def test_conversation_layout_removes_the_file_in_the_conversation_work_dir
     agent_root_copy = world.place(meta.model_copy(update={"workspace_layout": "agent_root"}))
     upload = await world.register(meta.thread_id)
 
-    assert await world.job()._sweep_uploads() == (1, 1, 0)
+    assert _counts(await world.job()._sweep_uploads()) == (1, 1, 0)
 
     assert not real.exists()
     assert agent_root_copy.exists()
@@ -167,7 +181,7 @@ async def test_a_missing_file_still_expires_the_row(world: _World) -> None:
     meta = await world.thread(layout="conversation")
     upload = await world.register(meta.thread_id)
 
-    assert await world.job()._sweep_uploads() == (1, 0, 0)
+    assert _counts(await world.job()._sweep_uploads()) == (1, 0, 0)
 
     assert await world.deleted(upload)
 
@@ -186,7 +200,7 @@ async def test_a_file_another_live_row_points_at_is_kept(world: _World) -> None:
     old = await world.register(first.thread_id)
     fresh = await world.register(second.thread_id, created_at=_FRESH)
 
-    assert await world.job()._sweep_uploads() == (1, 0, 0)
+    assert _counts(await world.job()._sweep_uploads()) == (1, 0, 0)
 
     assert shared.read_bytes() == _BODY
     assert await world.deleted(old)
@@ -202,7 +216,7 @@ async def test_a_shared_file_goes_once_every_row_pointing_at_it_has_expired(
     shared = world.place(first)
     rows = [await world.register(t.thread_id) for t in (first, second)]
 
-    assert await world.job()._sweep_uploads() == (2, 1, 0)
+    assert _counts(await world.job()._sweep_uploads()) == (2, 1, 0)
 
     assert not shared.exists()
     assert all([await world.deleted(r) for r in rows])
@@ -217,7 +231,7 @@ async def test_another_expired_row_does_not_hold_the_file_past_the_batch(world: 
     oldest = await world.register(first.thread_id, created_at=_OLD - timedelta(days=1))
     later = await world.register(second.thread_id)
 
-    assert await world.job(batch_size=1)._sweep_uploads() == (1, 1, 0)
+    assert _counts(await world.job(batch_size=1)._sweep_uploads()) == (1, 1, 0)
 
     assert not shared.exists()
     assert await world.deleted(oldest)
@@ -236,7 +250,7 @@ async def test_a_live_row_with_the_same_ref_at_another_path_does_not_hold_the_fi
     await world.register(old_view.thread_id)
     fresh = await world.register(new_view.thread_id, created_at=_FRESH)
 
-    assert await world.job()._sweep_uploads() == (1, 1, 0)
+    assert _counts(await world.job()._sweep_uploads()) == (1, 1, 0)
 
     assert not expiring.exists()
     assert other.exists()
@@ -252,7 +266,7 @@ async def test_a_soft_deleted_row_does_not_hold_the_file(world: _World) -> None:
     gone = await world.register(second.thread_id, created_at=_FRESH)
     await world.uploads.soft_delete(upload_id=gone, tenant_id=world.tenant, now=_FRESH)
 
-    assert await world.job()._sweep_uploads() == (1, 1, 0)
+    assert _counts(await world.job()._sweep_uploads()) == (1, 1, 0)
 
     assert not shared.exists()
 
@@ -271,7 +285,7 @@ async def test_a_file_changed_since_upload_is_kept(world: _World, now_on_disk: b
     real = world.place(meta, data=now_on_disk)
     upload = await world.register(meta.thread_id)
 
-    assert await world.job()._sweep_uploads() == (1, 0, 0)
+    assert _counts(await world.job()._sweep_uploads()) == (1, 0, 0)
 
     assert real.read_bytes() == now_on_disk
     assert await world.deleted(upload)
@@ -291,7 +305,7 @@ async def test_a_legacy_row_without_sha256_is_checked_by_size_only(
     real = world.place(meta, data=now_on_disk)
     await world.register(meta.thread_id, sha256=None)
 
-    assert await world.job()._sweep_uploads() == (1, int(removed), 0)
+    assert _counts(await world.job()._sweep_uploads()) == (1, int(removed), 0)
 
     assert real.exists() is not removed
 
@@ -306,7 +320,7 @@ async def test_a_row_whose_thread_is_gone_expires_without_touching_files(world: 
     upload = await world.register(meta.thread_id)
     del world.threads._rows[meta.thread_id]
 
-    assert await world.job()._sweep_uploads() == (1, 0, 0)
+    assert _counts(await world.job()._sweep_uploads()) == (1, 0, 0)
 
     assert real.exists()
     assert await world.deleted(upload)
@@ -319,7 +333,7 @@ async def test_without_a_thread_store_nothing_is_touched(world: _World) -> None:
     real = world.place(meta)
     upload = await world.register(meta.thread_id)
 
-    assert await world.job(thread_store=None)._sweep_uploads() == (0, 0, 0)
+    assert _counts(await world.job(thread_store=None)._sweep_uploads()) == (0, 0, 0)
 
     assert real.exists()
     assert not await world.deleted(upload)
@@ -356,7 +370,7 @@ async def test_a_symlink_anywhere_on_the_path_is_not_followed(
         os.symlink(victim, real)
     upload = await world.register(meta.thread_id)
 
-    assert await world.job()._sweep_uploads() == (1, 0, 1)
+    assert _counts(await world.job()._sweep_uploads()) == (1, 0, 1)
 
     assert victim.read_bytes() == _BODY
     assert await world.deleted(upload)
@@ -420,7 +434,7 @@ async def test_a_directory_swapped_for_a_symlink_after_the_check_is_not_followed
 
     monkeypatch.setattr(workspace_files, "_open_child", _open_then_swap)
 
-    assert await world.job()._sweep_uploads() == (1, 1, 0)
+    assert _counts(await world.job()._sweep_uploads()) == (1, 1, 0)
 
     assert swapped
     assert victim.read_bytes() == _BODY
@@ -445,7 +459,7 @@ async def test_a_leaf_replaced_after_verification_is_not_deleted(
 
     monkeypatch.setattr(workspace_files.OpenedUpload, "unlink", _replace_then_unlink)
 
-    assert await world.job()._sweep_uploads() == (1, 0, 0)
+    assert _counts(await world.job()._sweep_uploads()) == (1, 0, 0)
 
     assert real.read_bytes() == b"written by the model later"
     assert await world.deleted(upload)
@@ -467,7 +481,7 @@ async def test_a_fifo_leaf_does_not_hang_the_job(world: _World) -> None:
         await asyncio.to_thread(lambda: os.close(os.open(real, os.O_WRONLY)))
         await sweep
         pytest.fail("opening a FIFO leaf blocked the sweep")
-    assert sweep.result() == (1, 0, 1)
+    assert _counts(sweep.result()) == (1, 0, 1)
 
     assert real.exists()
     assert await world.deleted(upload)
@@ -486,7 +500,7 @@ async def test_a_symlinked_user_root_is_not_followed(
     os.symlink(elsewhere, world.user_dir)
     await world.register(meta.thread_id)
 
-    assert await world.job()._sweep_uploads() == (1, 0, 1)
+    assert _counts(await world.job()._sweep_uploads()) == (1, 0, 1)
 
     assert victim.read_bytes() == _BODY
 
@@ -514,7 +528,7 @@ async def test_a_row_inserted_between_the_check_and_the_unlink_keeps_the_file(
 
     monkeypatch.setattr(world.uploads, "list_active_by_ref", _list_with_a_late_insert)
 
-    assert await world.job()._sweep_uploads() == (1, 0, 0)
+    assert _counts(await world.job()._sweep_uploads()) == (1, 0, 0)
 
     assert len(calls) == 2
     assert shared.read_bytes() == _BODY
@@ -534,7 +548,7 @@ async def test_a_live_candidate_whose_thread_is_gone_does_not_hold_the_file(
     await world.register(second.thread_id, created_at=_FRESH)
     del world.threads._rows[second.thread_id]
 
-    assert await world.job()._sweep_uploads() == (1, 1, 0)
+    assert _counts(await world.job()._sweep_uploads()) == (1, 1, 0)
 
     assert not shared.exists()
 
@@ -570,7 +584,7 @@ async def test_a_live_row_of_another_user_or_tenant_does_not_hold_the_file(
         sha256=hashlib.sha256(_BODY).hexdigest(),
     )
 
-    assert await world.job()._sweep_uploads() == (1, 1, 0)
+    assert _counts(await world.job()._sweep_uploads()) == (1, 1, 0)
 
     assert not real.exists()
 
@@ -586,6 +600,7 @@ async def _audit_upload(
     occurred_at: datetime,
     ref: str = _REF,
     size: int | None = None,
+    sha256: str | None = None,
 ) -> None:
     await world.audit.append(
         AuditEntry(
@@ -600,7 +615,7 @@ async def _audit_upload(
                 "thread_id": str(thread_id),
                 "workspace_path": ref,
                 "file_size_bytes": len(data) if size is None else size,
-                "sha256": hashlib.sha256(data).hexdigest(),
+                "sha256": sha256 or hashlib.sha256(data).hexdigest(),
             },
             occurred_at=occurred_at,
         )
@@ -616,7 +631,7 @@ async def test_a_legacy_row_takes_its_sha256_from_the_upload_audit_row(world: _W
     upload = await world.register(meta.thread_id, sha256=None)
     await _audit_upload(world, meta.thread_id, data=_BODY, occurred_at=_OLD - timedelta(seconds=2))
 
-    assert await world.job()._sweep_uploads() == (1, 0, 0)
+    assert _counts(await world.job()._sweep_uploads()) == (1, 0, 0)
 
     assert real.exists()
     assert await world.deleted(upload)
@@ -625,7 +640,15 @@ async def test_a_legacy_row_takes_its_sha256_from_the_upload_audit_row(world: _W
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     "case",
-    ["ambiguous", "outside-window", "other-thread", "other-name", "other-size", "no-audit-store"],
+    [
+        "ambiguous",
+        "outside-window",
+        "other-thread",
+        "other-name",
+        "other-size",
+        "malformed-sha",
+        "no-audit-store",
+    ],
 )
 async def test_an_unmatched_audit_row_leaves_a_legacy_row_on_size_only(
     world: _World, case: str
@@ -659,10 +682,13 @@ async def test_an_unmatched_audit_row_leaves_a_legacy_row_on_size_only(
         kwargs["ref"] = "uploads/other.pdf"
     elif case == "other-size":
         kwargs["size"] = len(_BODY) + 1
+    elif case == "malformed-sha":
+        # 不是 64 位小写十六进制(这里是大写):不认。
+        kwargs["sha256"] = hashlib.sha256(_BODY).hexdigest().upper()
     await _audit_upload(world, meta.thread_id, data=_BODY, occurred_at=near, **kwargs)  # type: ignore[arg-type]
     overrides = {"audit_log_store": None} if case == "no-audit-store" else {}
 
-    assert await world.job(**overrides)._sweep_uploads() == expected
+    assert _counts(await world.job(**overrides)._sweep_uploads()) == expected
 
     assert not real.exists()
 
@@ -694,7 +720,7 @@ async def test_threads_are_read_once_per_tenant_per_batch(world: _World) -> None
         await world.register(meta.thread_id)
     counting = _CountingThreads(world.threads)
 
-    assert await world.job(thread_store=counting)._sweep_uploads() == (3, 3, 0)
+    assert _counts(await world.job(thread_store=counting)._sweep_uploads()) == (3, 3, 0)
 
     assert (counting.get_many_calls, counting.get_calls) == (1, 0)
 
@@ -716,24 +742,269 @@ async def test_one_failing_row_does_not_stop_the_rest(
 
     monkeypatch.setattr(world.uploads, "soft_delete", _flaky)
 
-    assert await world.job()._sweep_uploads() == (1, 2, 0)
+    assert _counts(await world.job()._sweep_uploads()) == (1, 2, 0)
 
     assert not any(f.exists() for f in files)
     assert not await world.deleted(first)
     assert await world.deleted(second)
 
 
-@pytest.mark.asyncio
-async def test_a_failing_pass_does_not_raise(world: _World) -> None:
-    class _Broken(InMemoryThreadMetaStore):
-        async def get_many(self, thread_ids: object, *, tenant_id: UUID) -> dict[UUID, ThreadMeta]:
-            raise RuntimeError("db down")
+def _stub_sql_passes(job: RetentionCleanupJob) -> None:
+    """The raw-SQL passes need Postgres; a marker value on the last one proves it still ran."""
 
+    async def _audit_log() -> tuple[int, dict[str, int]]:
+        return 0, {}
+
+    async def _zero() -> int:
+        return 0
+
+    async def _jwt() -> int:
+        return 7
+
+    job._delete_audit_log = _audit_log  # type: ignore[method-assign]
+    job._count_unacked_past_retention = _zero  # type: ignore[method-assign]
+    job._delete_event_log = _zero  # type: ignore[method-assign]
+    job._delete_sandbox_egress_audit = _zero  # type: ignore[method-assign]
+    job._delete_finished_memory_writeback_jobs = _zero  # type: ignore[method-assign]
+    job._delete_finished_knowledge_tasks = _zero  # type: ignore[method-assign]
+    job._delete_orphaned_knowledge_revisions = _zero  # type: ignore[method-assign]
+    job._delete_expired_jwt_blacklist = _jwt  # type: ignore[method-assign]
+
+
+@pytest.mark.asyncio
+async def test_a_failing_pass_is_reported_and_fails_the_process_after_every_pass_ran(
+    world: _World, monkeypatch: pytest.MonkeyPatch
+) -> None:
     meta = await world.thread(layout="conversation")
     real = world.place(meta)
     upload = await world.register(meta.thread_id)
 
-    assert await world.job(thread_store=_Broken())._sweep_uploads() == (0, 0, 0)
+    async def _down(**_kwargs: object) -> list[object]:
+        raise RuntimeError("db down")
 
+    monkeypatch.setattr(world.uploads, "list_expired", _down)
+    job = world.job()
+    _stub_sql_passes(job)
+
+    report = await job.run_once()
+
+    assert report.failed_passes == ("uploads",)
+    assert report.jwt_blacklist_deleted == 7  # a later pass still ran
+    assert exit_code(report) == EXIT_PASS_FAILED
     assert real.exists()
     assert not await world.deleted(upload)
+
+
+@pytest.mark.asyncio
+async def test_a_clean_run_exits_zero(world: _World) -> None:
+    meta = await world.thread(layout="conversation")
+    world.place(meta)
+    await world.register(meta.thread_id)
+    job = world.job()
+    _stub_sql_passes(job)
+
+    report = await job.run_once()
+
+    assert (report.failed_passes, report.uploads_expired, report.upload_files_removed) == ((), 1, 1)
+    assert exit_code(report) == 0
+
+
+@pytest.mark.asyncio
+async def test_an_unopenable_workspace_root_fails_the_pass_not_the_rows(
+    world: _World, tmp_path_factory: pytest.TempPathFactory
+) -> None:
+    """配置的根自己打不开是环境问题:整个 pass 失败,行不标、不算坏路径、不进 7 天兜底。"""
+    meta = await world.thread(layout="conversation")
+    upload = await world.register(meta.thread_id)
+    gone = tmp_path_factory.mktemp("gone")
+    gone.rmdir()
+    job = world.job(workspace_root=str(gone))
+    _stub_sql_passes(job)
+
+    report = await job.run_once()
+
+    assert report.failed_passes == ("uploads",)
+    assert (report.upload_files_unsafe, report.upload_rows_abandoned) == (0, 0)
+    assert not await world.deleted(upload)
+
+
+# ------------------------------------------------------------ review round 2 (R-M1)
+
+_as_root = pytest.mark.skipif(os.geteuid() == 0, reason="root ignores permission bits")
+
+
+@pytest.mark.asyncio
+@_as_root
+@pytest.mark.parametrize("target", ["uploads-dir", "file", "unlink-denied"])
+async def test_a_path_the_job_cannot_read_expires_the_row_and_keeps_the_file(
+    world: _World, target: str
+) -> None:
+    """作业与沙箱同一个 uid,模型能 ``chmod``:读不了 / 删不了是这一行自己的永久问题 —— 行软删、
+    文件不动、计数,不进每天重试。"""
+    meta = await world.thread(layout="conversation")
+    real = world.place(meta)
+    upload = await world.register(meta.thread_id)
+    locked, mode = {
+        "uploads-dir": (real.parent, 0o000),
+        "file": (real, 0o000),
+        "unlink-denied": (real.parent, 0o555),
+    }[target]
+    locked.chmod(mode)
+    try:
+        tally = await world.job()._sweep_uploads()
+    finally:
+        locked.chmod(0o755)
+
+    assert (_counts(tally), tally.rows_failed) == ((1, 0, 1), 0)
+    assert real.read_bytes() == _BODY
+    assert await world.deleted(upload)
+
+
+@pytest.mark.asyncio
+async def test_a_socket_at_the_upload_path_expires_the_row(
+    world: _World, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """套接字:``open`` 在 Linux 回 ``ENXIO``、macOS 回 ``EOPNOTSUPP`` —— 都是永久的。"""
+    meta = await world.thread(layout="conversation")
+    real = world.place(meta)
+    real.unlink()
+    monkeypatch.chdir(real.parent)  # AF_UNIX paths are length-limited; bind by a relative name
+    server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        server.bind(real.name)
+        upload = await world.register(meta.thread_id)
+
+        tally = await world.job()._sweep_uploads()
+    finally:
+        server.close()
+
+    assert (_counts(tally), tally.rows_failed) == ((1, 0, 1), 0)
+    assert stat.S_ISSOCK(os.lstat(real).st_mode)
+    assert await world.deleted(upload)
+
+
+def _fail_reading_with(monkeypatch: pytest.MonkeyPatch, code: int) -> None:
+    def _broken(*_args: object) -> bool:
+        raise OSError(code, os.strerror(code))
+
+    monkeypatch.setattr(workspace_files, "_same_as_registered", _broken)
+
+
+@pytest.mark.asyncio
+async def test_a_transient_io_error_is_retried_tomorrow(
+    world: _World, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    meta = await world.thread(layout="conversation")
+    real = world.place(meta)
+    upload = await world.register(meta.thread_id, created_at=datetime.now(UTC) - timedelta(days=92))
+    _fail_reading_with(monkeypatch, errno.EIO)
+
+    tally = await world.job()._sweep_uploads()
+
+    assert (_counts(tally), tally.rows_failed, tally.rows_abandoned) == ((0, 0, 0), 1, 0)
+    assert real.exists()
+    assert not await world.deleted(upload)
+
+
+@pytest.mark.asyncio
+async def test_a_row_failing_a_week_past_its_expiry_is_abandoned(
+    world: _World, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """兜底:过了到期日 7 天还在暂时性失败,不再等 —— 行软删、文件不动、计数。"""
+    meta = await world.thread(layout="conversation")
+    real = world.place(meta)
+    upload = await world.register(meta.thread_id, created_at=datetime.now(UTC) - timedelta(days=98))
+    _fail_reading_with(monkeypatch, errno.EIO)
+
+    tally = await world.job()._sweep_uploads()
+
+    assert (tally.marked, tally.files_removed, tally.rows_failed, tally.rows_abandoned) == (
+        1,
+        0,
+        0,
+        1,
+    )
+    assert real.exists()
+    assert await world.deleted(upload)
+
+
+# ------------------------------------------------------------ review round 2 (R-L1 / R-L2)
+
+
+@pytest.mark.asyncio
+async def test_a_failing_audit_lookup_falls_back_to_size_only(
+    world: _World, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    meta = await world.thread(layout="conversation")
+    real = world.place(meta)
+    await world.register(meta.thread_id, sha256=None)
+
+    async def _down(**_kwargs: object) -> list[AuditEntry]:
+        raise RuntimeError("audit store down")
+
+    monkeypatch.setattr(world.audit, "list_document_uploads_for_threads", _down)
+    job = world.job()
+    _stub_sql_passes(job)
+
+    report = await job.run_once()
+
+    assert (report.uploads_expired, report.upload_files_removed, report.failed_passes) == (1, 1, ())
+    assert not real.exists()
+
+
+@pytest.mark.asyncio
+async def test_id_lists_are_bound_in_chunks(world: _World, monkeypatch: pytest.MonkeyPatch) -> None:
+    """``IN (...)`` 每个 id 一个绑定参数(Postgres 上限 32767):会话预取与审计读都分块。"""
+    monkeypatch.setattr(uploads_module, "_IN_CHUNK", 2)
+    metas = [await world.thread(layout="conversation") for _ in range(3)]
+    for meta in metas:
+        world.place(meta)
+        await world.register(meta.thread_id, sha256=None)
+    counting = _CountingThreads(world.threads)
+    audit_calls: list[int] = []
+    real_read = world.audit.list_document_uploads_for_threads
+
+    async def _counting_read(**kwargs: object) -> list[AuditEntry]:
+        audit_calls.append(len(kwargs["thread_ids"]))  # type: ignore[arg-type]
+        return await real_read(**kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(world.audit, "list_document_uploads_for_threads", _counting_read)
+
+    tally = await world.job(thread_store=counting)._sweep_uploads()
+
+    assert _counts(tally) == (3, 3, 0)
+    assert counting.get_many_calls == 2
+    assert sorted(audit_calls) == [1, 2]
+
+
+@pytest.mark.parametrize("code", [0, EXIT_PASS_FAILED])
+def test_main_exits_with_the_code_run_once_produced(
+    monkeypatch: pytest.MonkeyPatch, code: int
+) -> None:
+    async def _fake_amain() -> int:
+        return code
+
+    monkeypatch.setattr(main_module, "_amain", _fake_amain)
+    if code == 0:
+        main_module.main()
+        return
+    with pytest.raises(SystemExit) as exited:
+        main_module.main()
+    assert exited.value.code == EXIT_PASS_FAILED
+
+
+@pytest.mark.asyncio
+async def test_a_failing_orphan_copy_pass_is_reported_too(
+    world: _World, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    async def _down(*_args: object) -> int:
+        raise RuntimeError("nas scan failed")
+
+    monkeypatch.setattr(job_module, "sweep_orphan_copies", _down)
+    job = world.job(artifact_store=InMemoryArtifactStore())
+    _stub_sql_passes(job)
+
+    report = await job.run_once()
+
+    assert report.failed_passes == ("orphan_artifact_copies",)
+    assert exit_code(report) == EXIT_PASS_FAILED

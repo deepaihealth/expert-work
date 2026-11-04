@@ -42,7 +42,7 @@ or a Kubernetes CronJob. Settings via `EXPERT_WORK_RETENTION_*` env (see
 | 规则 | 删什么 | 不删什么 |
 |---|---|---|
 | B-28 产物版本 | `artifact_version.created_at` 满 90 天:`path_in_workspace` 那一个文件 + 版本行;版本清空的 `artifact` 行标 `deleted_at`(`ARTIFACT_EXPIRED` 审计) | 同名产物的新版本;文件所在目录;删不掉的文件对应的行(明天再试) |
-| 上传 | `user_upload.created_at` 满 90 天:按会话**当前**的 agent / 布局算出的 `agents/<key>/[threads/<会话>/work/]uploads/<file>`(B-271)+ 标 `deleted_at` | 图片类 `expert_work://image/…` 的字节(归 `image_upload` 自己的 pass);会话已不在的行的文件(对话视图的目录随会话 purge 走;**老视图的文件在 agent 共用的 `agents/<key>/uploads/` 里,purge 不删、这里也不删,留在那里**);还有没到期的行指着的文件;大小 / sha256 与登记时不符的文件(没有 sha256 的老行先从登记时的 `DOCUMENT_UPLOAD` 审计行补,补不到只比大小);路径形状不安全的(某段是软链 / 不是目录、叶子不是普通文件,计入 `upload_files_unsafe`)—— 以上几种行照样标 `deleted_at`;暂时性 I/O 失败的行(明天再试);没有登记行的控制台上传与引用复制 |
+| 上传 | `user_upload.created_at` 满 90 天:按会话**当前**的 agent / 布局算出的 `agents/<key>/[threads/<会话>/work/]uploads/<file>`(B-271)+ 标 `deleted_at` | 图片类 `expert_work://image/…` 的字节(归 `image_upload` 自己的 pass);会话已不在的行的文件(对话视图的目录随会话 purge 走;**老视图的文件在 agent 共用的 `agents/<key>/uploads/` 里,purge 不删、这里也不删,留在那里**);还有没到期的行指着的文件;大小 / sha256 与登记时不符的文件(没有 sha256 的老行先从登记时的 `DOCUMENT_UPLOAD` 审计行补,补不到只比大小);路径不可用的(某段是软链 / 不是目录、叶子不是普通文件,或用户子树里除暂时性以外的任何 I/O 错误:`chmod 000`、套接字……,计入 `upload_files_unsafe`)—— 以上几种行照样标 `deleted_at`;暂时性 I/O 失败的行(明天再试,计入 `upload_rows_failed`;过了到期日 7 天还在失败就只标行、不动文件,计入 `upload_rows_abandoned`);工作区根打不开时整个 pass 失败(`failed_passes`,进程退出码 3);没有登记行的控制台上传与引用复制 |
 | B-27 threads/ | `threads/<thread_id>/` 且 `thread_meta` 行不存在 | 行还在的目录(**不按时间删活会话**);非 UUID 名的子目录;已软删用户的整棵树 |
 | X-4 ② 已删工作区 | 软删且已归档满 90 天的 `user_workspace` 行 + 该用户的 artifact / artifact_version / user_upload 行(`WORKSPACE_HARD_DELETE` 审计) | OSS 归档对象(桶生命周期到期);`.deleted/<user>` 标记 |
 

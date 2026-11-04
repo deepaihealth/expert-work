@@ -29,6 +29,7 @@ import re
 import shutil
 import stat
 from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import Literal
@@ -208,13 +209,62 @@ UploadFileOutcome = Literal["present", "removed", "missing", "changed"]
 _DIR_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
 #: 叶子:不跟软链;``O_NONBLOCK`` 让被换成 FIFO 的叶子不会把整个作业卡死在 ``open`` 上。
 _LEAF_FLAGS = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK
-#: ``O_NOFOLLOW`` 碰到软链(Linux / macOS 是 ``ELOOP``,BSD 系有的回 ``EMLINK``)、
-#: ``O_DIRECTORY`` 碰到非目录(``ENOTDIR``)—— 都是「这条路径的形状不对」,不是暂时故障。
-_UNSAFE_ERRNOS = frozenset({errno.ELOOP, errno.EMLINK, errno.ENOTDIR})
+#: 用户子树里出这些 errno 算**暂时性**的(NAS / NFS 抖动、一时资源不够、整卷只读这类环境
+#: 问题,不是这一行的路径坏了):这一行跳过、明天再试。其余 errno 都算这一行自己的路径不可用
+#: —— 软链(``ELOOP``,BSD 系 ``EMLINK``)、非目录(``ENOTDIR``)、``chmod 000``(``EACCES`` /
+#: ``EPERM``)、套接字(Linux ``ENXIO``、macOS ``EOPNOTSUPP``)……:作业与沙箱同一个 uid,会话里
+#: 的模型就能把文件弄成这样,重试不会变好,留着不标只会天天排在最前。
+_TRANSIENT_ERRNOS = frozenset(
+    getattr(errno, name)
+    for name in (
+        "EIO",
+        "ESTALE",
+        "ETIMEDOUT",
+        "EINTR",
+        "EAGAIN",
+        "EWOULDBLOCK",
+        "ENOMEM",
+        "EMFILE",
+        "ENFILE",
+        "EBUSY",
+        "EROFS",
+        "ENOLCK",
+        "EDEADLK",
+        "ENOTCONN",
+        "ECONNRESET",
+        "ECONNABORTED",
+        "EHOSTDOWN",
+        "EHOSTUNREACH",
+        "ENETDOWN",
+        "ENETUNREACH",
+    )
+    if hasattr(errno, name)
+)
 
 
 class _PathMissingError(Exception):
     """路径上某一段不在 —— 文件本来就没了。"""
+
+
+class WorkspaceRootUnavailableError(Exception):
+    """配置的工作区根本身打不开 —— 环境问题(NAS 没挂上 / 掉了),不归哪一行:整个 pass
+    失败、明天再来,不能把每一行都当成坏路径处理。"""
+
+
+@contextmanager
+def _in_user_subtree(name: str) -> Iterator[None]:
+    """把用户子树里(``{tenant}`` 及以下)的 ``OSError`` 分三类:不在 →
+    :class:`_PathMissingError`;暂时性(:data:`_TRANSIENT_ERRNOS`)→ 原样抛;其余 →
+    :class:`UnsafeWorkspacePathError`(这一行的路径不可用,永久)。"""
+    try:
+        yield
+    except FileNotFoundError as exc:
+        raise _PathMissingError from exc
+    except OSError as exc:
+        if exc.errno in _TRANSIENT_ERRNOS:
+            raise
+        code = errno.errorcode.get(exc.errno or 0, str(exc.errno))
+        raise UnsafeWorkspacePathError(f"upload path is unusable ({code}): {name!r}") from exc
 
 
 def upload_relpath(ref: str, meta: ThreadMeta) -> str:
@@ -236,14 +286,8 @@ def upload_relpath(ref: str, meta: ThreadMeta) -> str:
 
 def _open_child(parent_fd: int, name: str, flags: int) -> int:
     """在已打开的目录 ``parent_fd`` 里打开一项(不按路径字符串重新解析)。"""
-    try:
+    with _in_user_subtree(name):
         return os.open(name, flags, dir_fd=parent_fd)
-    except FileNotFoundError as exc:
-        raise _PathMissingError from exc
-    except OSError as exc:
-        if exc.errno in _UNSAFE_ERRNOS:
-            raise UnsafeWorkspacePathError(f"upload path has an unsafe segment: {name!r}") from exc
-        raise
 
 
 def _close_all(fds: list[int]) -> None:
@@ -254,8 +298,13 @@ def _close_all(fds: list[int]) -> None:
 def _open_parent_chain(root: str, dirs: list[str]) -> list[int]:
     """从 ``root``(启动时校验过不是软链)起逐段打开 ``dirs``,回全部 fd(最后一个是叶子的父目录)。
     哪一段不在 → :class:`_PathMissingError`;是软链 / 不是目录 → :class:`UnsafeWorkspacePathError`。
-    出错时已打开的 fd 全部关掉。"""
-    fds = [os.open(Path(root).resolve(), os.O_RDONLY | os.O_DIRECTORY)]
+    ``root`` 自己打不开 → :class:`WorkspaceRootUnavailableError`。出错时已打开的 fd 全部关掉。"""
+    try:
+        fds = [os.open(Path(root).resolve(), os.O_RDONLY | os.O_DIRECTORY)]
+    except OSError as exc:
+        raise WorkspaceRootUnavailableError(
+            f"workspace root cannot be opened: {exc.strerror}"
+        ) from exc
     try:
         for part in dirs:
             fds.append(_open_child(fds[-1], part, _DIR_FLAGS))
@@ -288,16 +337,14 @@ class OpenedUpload:
     def unlink(self) -> UploadFileOutcome:
         """在**已打开的父目录**里删这个名字,前提是它仍是打开、核对过的那个文件
         (``(st_dev, st_ino)`` 相同)—— 核对之后名字被换成别的文件(会话里的模型写得到)就不删。"""
-        opened = os.fstat(self.leaf_fd)
         try:
-            current = os.stat(self.name, dir_fd=self.parent_fd, follow_symlinks=False)
-        except FileNotFoundError:
-            return "missing"
-        if (current.st_dev, current.st_ino) != (opened.st_dev, opened.st_ino):
-            return "changed"
-        try:
-            os.unlink(self.name, dir_fd=self.parent_fd)
-        except FileNotFoundError:
+            with _in_user_subtree(self.name):
+                opened = os.fstat(self.leaf_fd)
+                current = os.stat(self.name, dir_fd=self.parent_fd, follow_symlinks=False)
+                if (current.st_dev, current.st_ino) != (opened.st_dev, opened.st_ino):
+                    return "changed"
+                os.unlink(self.name, dir_fd=self.parent_fd)
+        except _PathMissingError:
             return "missing"
         return "removed"
 
@@ -320,9 +367,12 @@ def open_upload_file(
     从 ``root`` 起**用目录 fd 逐段**打开 ``{tenant}/{user}/…``(``openat`` + ``O_NOFOLLOW``),
     之后的核对与删除都在这些已打开的 fd 上做,不再按路径字符串重新解析 —— 对话的 ``work/`` 是
     模型写得到的地方,检查之后把某一段换成指向别的用户目录的软链也改不了删的是哪个文件。
-    任何一段是软链 / 不是目录、叶子不是普通文件(含 FIFO,``O_NONBLOCK`` 打开不阻塞)→
-    :class:`UnsafeWorkspacePathError`。哪一段不在 → ``"missing"``。大小或内容与登记时
-    不一致 → ``"changed"``。都对 → ``"present"``,调用方 :meth:`OpenedUpload.unlink` / ``close``。
+    任何一段是软链 / 不是目录、叶子不是普通文件(含 FIFO,``O_NONBLOCK`` 打开不阻塞)、以及用户
+    子树里除暂时性以外的任何 ``OSError``(``chmod 000`` 的目录 / 文件、套接字……)→
+    :class:`UnsafeWorkspacePathError`;暂时性的(:data:`_TRANSIENT_ERRNOS`)原样抛;``root``
+    自己打不开 → :class:`WorkspaceRootUnavailableError`。哪一段不在 → ``"missing"``。
+    大小或内容与登记时不一致 → ``"changed"``。都对 → ``"present"``,调用方
+    :meth:`OpenedUpload.unlink` / ``close``。
     """
     parts = PurePosixPath(relpath).parts
     if not parts or relpath.startswith("/") or "\0" in relpath or ".." in parts:
@@ -343,9 +393,11 @@ def open_upload_file(
     opened = OpenedUpload("present", parent_fd=fds.pop(), leaf_fd=leaf_fd, name=parts[-1])
     _close_all(fds)
     try:
-        if not stat.S_ISREG(os.fstat(leaf_fd).st_mode):
-            raise UnsafeWorkspacePathError(f"upload is not a regular file: {parts[-1]!r}")
-        if not _same_as_registered(leaf_fd, size_bytes, sha256):
+        with _in_user_subtree(parts[-1]):
+            if not stat.S_ISREG(os.fstat(leaf_fd).st_mode):
+                raise UnsafeWorkspacePathError(f"upload is not a regular file: {parts[-1]!r}")
+            same = _same_as_registered(leaf_fd, size_bytes, sha256)
+        if not same:
             opened.close()
             return OpenedUpload("changed")
     except BaseException:
@@ -628,6 +680,7 @@ __all__ = [
     "ToolResultDir",
     "UnsafeWorkspacePathError",
     "UploadFileOutcome",
+    "WorkspaceRootUnavailableError",
     "deleted_marker",
     "iter_thread_dirs",
     "iter_tool_result_dirs",

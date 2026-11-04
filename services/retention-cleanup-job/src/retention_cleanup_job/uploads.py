@@ -12,17 +12,22 @@
 * 文件与登记时不一致(大小;有 sha256 时还比内容)—— 上传后在会话里被改写过。没有 sha256 的
   老行,先按同一会话、同名、同大小、时间贴着登记行的 ``DOCUMENT_UPLOAD`` 审计行补 sha256
   (唯一一个值才用),找不到就只比大小。
-* 路径形状不安全(某段是软链 / 不是目录、叶子不是普通文件)—— 永久性的,不删文件、记一条
-  warning、计数,行照样软删:留着不标就会天天重试,按 ``created_at`` 排在最前把整批饿死。
+* 路径不可用(某段是软链 / 不是目录、叶子不是普通文件,或用户子树里除暂时性以外的任何
+  ``OSError``:``chmod 000``、套接字……作业与沙箱同一个 uid,模型弄得出来)—— 永久性的,不删
+  文件、记一条 warning、计数,行照样软删:留着不标就会天天重试,按 ``created_at`` 排在最前把
+  整批饿死。
 
-暂时性 I/O 失败或单行查库出错:这一行跳过、明天再试,不影响同批其它行。
+暂时性 I/O 失败或单行查库出错:这一行跳过、明天再试(``rows_failed``),不影响同批其它行;
+过了到期日还连着失败 :data:`_GIVE_UP_AFTER` 的,不再等,行软删、文件不动(``rows_abandoned``)
+—— 什么都不会无限重试。配置的工作区根自己打不开是环境问题,整个 pass 失败(调用方记下)。
 """
 
 from __future__ import annotations
 
 import asyncio
 import logging
-from collections.abc import Iterable
+import re
+from collections.abc import Iterable, Iterator
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from uuid import UUID
@@ -34,6 +39,7 @@ from expert_work.persistence.workspace.layout import WORKSPACE_UPLOADS_DIR
 from expert_work.protocol import ThreadMeta, UserUpload
 from retention_cleanup_job.workspace_files import (
     UnsafeWorkspacePathError,
+    WorkspaceRootUnavailableError,
     open_upload_file,
     upload_relpath,
 )
@@ -45,6 +51,13 @@ logger = logging.getLogger(__name__)
 _AUDIT_BEFORE = timedelta(minutes=10)
 _AUDIT_AFTER = timedelta(minutes=1)
 
+#: 过了到期日还连着暂时性失败这么久,就不再等:行软删,文件不动(计数)。
+_GIVE_UP_AFTER = timedelta(days=7)
+#: 一次绑定多少个 id(``IN (...)`` 每个元素一个绑定参数,Postgres 上限 32767)。
+_IN_CHUNK = 5000
+#: 审计行里的 sha256 只认 64 位小写十六进制(上传端点 ``hexdigest()`` 的形状)。
+_SHA256_RE = re.compile(r"[0-9a-f]{64}")
+
 _ThreadKey = tuple[UUID, UUID]
 
 
@@ -52,7 +65,18 @@ _ThreadKey = tuple[UUID, UUID]
 class UploadSweepTally:
     marked: int = 0
     files_removed: int = 0
+    #: 路径不可用(软链 / 非普通文件 / 权限 / 套接字……)而没删文件的行;行已软删。
     files_unsafe: int = 0
+    #: 暂时性失败、这一轮跳过的行(明天再试)。
+    rows_failed: int = 0
+    #: 过了到期日 :data:`_GIVE_UP_AFTER` 还在失败、不再等的行;行已软删、文件没动。
+    rows_abandoned: int = 0
+
+
+def _chunks(ids: Iterable[UUID]) -> Iterator[list[UUID]]:
+    ordered = sorted(set(ids), key=str)
+    for start in range(0, len(ordered), _IN_CHUNK):
+        yield ordered[start : start + _IN_CHUNK]
 
 
 def _is_document(row: UserUpload) -> bool:
@@ -83,14 +107,39 @@ class UploadSweep:
     ) -> UploadSweepTally:
         docs = [r for r in expired if _is_document(r)]
         await self._load_threads((r.tenant_id, r.thread_id) for r in docs)
-        audited = await self._audited_sha256s([r for r in docs if r.sha256 is None])
+        try:
+            audited = await self._audited_sha256s([r for r in docs if r.sha256 is None])
+        except Exception:
+            # 补 sha256 是锦上添花:读不到就退回只比大小,不让整个 pass 失败。
+            logger.warning("retention.upload_audit_lookup_failed", exc_info=True)
+            audited = {}
         tally = UploadSweepTally()
         for row in expired:
             try:
                 await self._expire(row, audited.get(row.id, row.sha256), cutoff, now, tally)
+            except WorkspaceRootUnavailableError:
+                raise
             except Exception:
-                logger.exception("retention.upload_row_failed upload_id=%s", row.id)
+                await self._row_failed(row, cutoff, now, tally)
         return tally
+
+    async def _row_failed(
+        self, row: UserUpload, cutoff: datetime, now: datetime, tally: UploadSweepTally
+    ) -> None:
+        """在 ``except`` 里调用。到期没满 :data:`_GIVE_UP_AFTER` → 跳过、明天再试;满了 →
+        行软删、文件不动(兜底:什么都不无限重试)。"""
+        if row.created_at >= cutoff - _GIVE_UP_AFTER:
+            logger.exception("retention.upload_row_failed upload_id=%s", row.id)
+            tally.rows_failed += 1
+            return
+        logger.warning("retention.upload_row_abandoned upload_id=%s", row.id, exc_info=True)
+        try:
+            if await self._uploads.soft_delete(upload_id=row.id, tenant_id=row.tenant_id, now=now):
+                tally.marked += 1
+                tally.rows_abandoned += 1
+        except Exception:
+            logger.exception("retention.upload_row_failed upload_id=%s", row.id)
+            tally.rows_failed += 1
 
     async def _expire(
         self,
@@ -104,7 +153,7 @@ class UploadSweep:
             try:
                 removed = await self._release_file(row, sha256, cutoff)
             except UnsafeWorkspacePathError:
-                logger.warning("retention.upload_path_unsafe upload_id=%s", row.id)
+                logger.warning("retention.upload_path_unusable upload_id=%s", row.id)
                 tally.files_unsafe += 1
                 removed = False
             tally.files_removed += int(removed)
@@ -172,9 +221,10 @@ class UploadSweep:
             if (tenant_id, thread_id) not in self._metas:
                 by_tenant.setdefault(tenant_id, set()).add(thread_id)
         for tenant_id, thread_ids in by_tenant.items():
-            found = await self._threads.get_many(thread_ids, tenant_id=tenant_id)
-            for thread_id in thread_ids:
-                self._metas[(tenant_id, thread_id)] = found.get(thread_id)
+            for chunk in _chunks(thread_ids):
+                found = await self._threads.get_many(chunk, tenant_id=tenant_id)
+                for thread_id in chunk:
+                    self._metas[(tenant_id, thread_id)] = found.get(thread_id)
 
     async def _audited_sha256s(self, rows: list[UserUpload]) -> dict[UUID, str]:
         """没有 sha256 的老行 → 登记时 ``DOCUMENT_UPLOAD`` 审计行里的 sha256。
@@ -191,12 +241,14 @@ class UploadSweep:
             by_tenant.setdefault(row.tenant_id, []).append(row)
         out: dict[UUID, str] = {}
         for tenant_id, tenant_rows in by_tenant.items():
-            entries = await self._audit.list_document_uploads_for_threads(
-                tenant_id=tenant_id,
-                thread_ids={r.thread_id for r in tenant_rows},
-                since=min(r.created_at for r in tenant_rows) - _AUDIT_BEFORE,
-                until=max(r.created_at for r in tenant_rows) + _AUDIT_AFTER,
-            )
+            entries = []
+            for chunk in _chunks(r.thread_id for r in tenant_rows):
+                entries += await self._audit.list_document_uploads_for_threads(
+                    tenant_id=tenant_id,
+                    thread_ids=chunk,
+                    since=min(r.created_at for r in tenant_rows) - _AUDIT_BEFORE,
+                    until=max(r.created_at for r in tenant_rows) + _AUDIT_AFTER,
+                )
             for row in tenant_rows:
                 shas = {
                     e.details.get("sha256")
@@ -208,7 +260,11 @@ class UploadSweep:
                     and e.details.get("workspace_path") == row.ref
                     and e.details.get("file_size_bytes") == row.size_bytes
                 }
-                if len(shas) == 1 and isinstance(sha := next(iter(shas)), str):
+                if (
+                    len(shas) == 1
+                    and isinstance(sha := next(iter(shas)), str)
+                    and _SHA256_RE.fullmatch(sha)
+                ):
                     out[row.id] = sha
         return out
 
