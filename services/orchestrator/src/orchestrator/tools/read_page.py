@@ -199,7 +199,7 @@ from orchestrator.tools.document_figures import (
     RENDERABLE_EXTENSIONS,
 )
 from orchestrator.tools.error_classifier import GuidedToolError
-from orchestrator.tools.figure_reads import FigureRead, ledger_entries, read_notice, read_refusal
+from orchestrator.tools.figure_reads import FigureRead, ledger_entries, plan_reads, read_notice
 from orchestrator.tools.file_ops import _require_path, _snippet, run_scoped_read
 from orchestrator.tools.region_zoom import (
     Box,
@@ -1584,12 +1584,18 @@ class ReadPageTool:
             # 约束 B —— 三个 id 缺一个就没法造 workspace ref;说明白,不崩。
             return ToolResult(content="无法渲染:这条 run 缺少租户/用户/run 绑定。")
         doc_sha, agent_rel = render_source(raw, view=ctx.workspace_view)
-        # B-268 —— 熔断在进沙箱之前判:本 run 同一页读满 3 次 / 同一文档渲染超过 2 x 页数 + 3 次。
-        refusal = read_refusal(
-            ctx.figure_reads, run_id=ctx.run_id, doc_sha=doc_sha, units=units, region=region
+        # B-268 —— 熔断在进沙箱之前判(见 ``figure_reads``):超了的编号不渲,其余照渲;整次都没渲
+        # 才计一次防循环。拒绝的说明是平台文字,放 ``notice``(不进不可信数据的围栏)。
+        plan = plan_reads(
+            ctx.figure_reads, run_id=_ledger_run(ctx), doc_sha=doc_sha, units=units, region=region
         )
-        if refusal is not None:
-            return ToolResult(content=refusal, meta={LOOP_TRIP_META_KEY: True})
+        if not plan.units:
+            return ToolResult(
+                content="Nothing was rendered.",
+                notice=plan.refused,
+                meta={LOOP_TRIP_META_KEY: True},
+            )
+        units = list(plan.units)
         # B-262 —— 渲染在 ``/agent`` 视图里做(源文档可能在 ``/agent`` 下),产出落本对话的
         # ``/workspace/.tool_results/``:对话视图里加本对话那一格(agent 根的 ``.tool_results``
         # 在 exec 视图里被盖住),老视图没有前缀,与今天逐字相同。
@@ -1715,10 +1721,14 @@ class ReadPageTool:
         per_unit = _describe_failed_units(all_failed, unit_label=label)
         if per_unit:
             content = f"{content} {per_unit}"
-        reads = [FigureRead(unit=u, page=p) for u, p in rendered_units]
+        reads = [FigureRead(unit=u) for u, _page in rendered_units]
+        notices = [
+            plan.refused,
+            self._read_notice(ctx, doc_sha=doc_sha, reads=reads, pages=page_count),
+        ]
         return ToolResult(
             content=content,
-            notice=self._read_notice(ctx, doc_sha=doc_sha, reads=reads, pages=page_count),
+            notice=" ".join(n for n in notices if n) or None,
             # 回修第 3 轮 —— 顺带记下 ``<doc-sha>`` → 模型传的路径。提示词里的渲染页段
             # 靠它告诉模型「退役的页用哪个路径拿回来」;它在 state 里,压缩总结掉
             # 历史里这条回执之后仍在。
@@ -1736,7 +1746,7 @@ class ReadPageTool:
         if self.figure_delivery != "inline":
             return None
         return read_notice(
-            ctx.figure_reads, run_id=ctx.run_id, doc_sha=doc_sha, reads=reads, pages=pages
+            ctx.figure_reads, run_id=_ledger_run(ctx), doc_sha=doc_sha, reads=reads, pages=pages
         )
 
     async def _region_result(
@@ -1770,7 +1780,7 @@ class ReadPageTool:
         caveats = _describe_render_notes(notes, unit_label=label)
         if caveats:
             content = f"{content} {caveats}"
-        reads = [FigureRead(unit=unit, page=figure.page, region=region)] if figure else []
+        reads = [FigureRead(unit=unit, region=region)]
         return ToolResult(
             content=content,
             notice=self._read_notice(ctx, doc_sha=doc_sha, reads=reads, pages=pages),
@@ -1901,13 +1911,19 @@ def _page_count(raw: object) -> int | None:
     return raw if _is_plain_int(raw) and raw > 0 else None
 
 
+def _ledger_run(ctx: ToolContext) -> UUID | None:
+    """B-268 —— 读取账按**轮**记:审批续跑段是新 run_id,用这一轮首段的(没有就是自己)。"""
+    return ctx.turn_root_run_id or ctx.run_id
+
+
 def _ledger_update(
     ctx: ToolContext, doc_sha: str, reads: Sequence[FigureRead], pages: int | None
 ) -> dict[str, Any]:
-    """B-268 —— 这次渲染追加进本 run 读取账的 ``state_updates`` 片段;没有 run 就不记。"""
-    if ctx.run_id is None or not reads:
+    """B-268 —— 这次渲染追加进本轮读取账的 ``state_updates`` 片段;没有 run 就不记。"""
+    run = _ledger_run(ctx)
+    if run is None or not reads:
         return {}
-    return {"figure_reads": ledger_entries(ctx.run_id, doc_sha, reads, pages)}
+    return {"figure_reads": ledger_entries(run, doc_sha, reads, pages)}
 
 
 def _region_job(

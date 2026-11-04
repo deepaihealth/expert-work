@@ -666,7 +666,7 @@ def tile_meta(result: TileResult) -> dict[str, object]:
     return entry
 
 
-AutoPath = Literal["bands", "full_fallback", "gated"]
+AutoPath = Literal["bands", "full_fallback", "gated", "whole_question"]
 
 #: 退回整张读的原因 → 给主模型的半句话。
 _FALLBACK_REASONS: Final[dict[str, str]] = {
@@ -710,47 +710,20 @@ def _one_row_seen_twice(found: Sequence[TileResult]) -> bool:
     return same_label and _boxes_overlap(first.tile.box, second.tile.box)
 
 
-def zero_counts_as_not_found(results: Sequence[TileResult]) -> list[TileResult]:
-    """B-273 V2 —— 计数类问题上,一条横条报 0 只说明它那一截里没有,不是整张图的答案:当作没找到。"""
-    out: list[TileResult] = []
-    for result in results:
-        reply = result.reply
-        if reply is not None and reply.status == "found":
-            reading = parse_reading(reply.value, reply.unit)
-            if reading.kind == "number" and reading.numbers == (Decimal(0),):
-                result = TileResult(
-                    tile=result.tile,
-                    reply=TileReply(
-                        status="not_found",
-                        raw=reply.raw,
-                        parse_mode=reply.parse_mode,
-                        label=reply.label,
-                        note="zero_count",
-                    ),
-                )
-        out.append(result)
-    return out
-
-
 def decide_auto(
     results: Sequence[TileResult],
     *,
     full_answer: str | None,
     full_error: str | None,
-    count_question: bool = False,
 ) -> AutoDecision:
     """横条读数 + 并行的整张读 → 最终答案(重设计 §4)。
 
-    * B-273 —— ``count_question``(计数类问题)时,横条报的 0 先当作没找到(V2,
-      :func:`zero_counts_as_not_found`);
     * 横条给出一个前后一致的值、且没有一条报 ``partial`` → 用它(``bands``);几条都报了这个值时
       只认相邻两条在重叠处看到的同一行(R2,:func:`_one_row_seen_twice`),否则走整张读;
     * 冲突、全无、有横条报 ``partial``(那条只数到了自己那一截,验证里它推翻过整张读的正确
       计数)或横条全失败 → 用整张读的回答,明说不确定,横条的读数与框附在后面(``full_fallback``);
     * 要退回整张读、整张读却失败了 → 只给横条的汇总,并说明整张读失败(仍记 ``bands``)。
     """
-    if count_question:
-        results = zero_counts_as_not_found(results)
     verdict = aggregate_tiles(results)
     has_partial = any(r.reply is not None and r.reply.status == "partial" for r in results)
     found = [r for r in results if r.reply is not None and r.reply.status == "found"]
@@ -779,3 +752,44 @@ def decide_auto(
         f"below, or say the value is uncertain.)\nBand readings: {verdict.content}"
     )
     return AutoDecision("full_fallback", reason, content, verdict.outcome)
+
+
+_NUMBER_IN_TEXT_RE: Final = re.compile(r"\d+(?:\.\d+)?")
+
+
+def _answer_gives(answer: str, reply: TileReply) -> bool:
+    """整张读的回答里有没有这条横条读到的值:数一律按数比(都在回答里出现过),别的按归一后的子串。"""
+    reading = parse_reading(reply.value, reply.unit)
+    if reading.numbers:
+        given = {Decimal(n) for n in _NUMBER_IN_TEXT_RE.findall(canonical_text(answer))}
+        return all(n in given for n in reading.numbers)
+    return _flat(reply.value) in _flat(answer)
+
+
+def decide_whole_question(
+    results: Sequence[TileResult], *, full_answer: str | None, full_error: str | None
+) -> AutoDecision:
+    """B-273 V1 —— 整体类问题(``question_scope``):以整张读为准,横条只用来标不确定。
+
+    词表会把个别查值问题(名称里带「平均」「count」的测量项)误判成整体类问题;横条照样并行读
+    (与切条那条路同样的开销),于是误判只花措辞、不丢准确率:横条给出**一个**前后一致的值、而
+    整张读的回答里没有这个值 → 用整张读的回答、标不确定、附上横条的读数。横条之间互相冲突(各数
+    到自己那一截)正是整体类问题在横条上的样子,不标。整张读失败 → 照常走 :func:`decide_auto`。
+    """
+    if full_answer is None:
+        return decide_auto(results, full_answer=full_answer, full_error=full_error)
+    verdict = aggregate_tiles(results)
+    found = [r.reply for r in results if r.reply is not None and r.reply.status == "found"]
+    if verdict.outcome == "single" and not any(_answer_gives(full_answer, r) for r in found):
+        content = (
+            f"{full_answer}\n\n(region='auto': read whole because the question looks like it is "
+            "about the whole image, but the answer is uncertain - the bands read a different "
+            "value, which is the answer if the question asks for one printed value. Band "
+            f"readings: {verdict.content})"
+        )
+        return AutoDecision("whole_question", "bands_disagree", content, verdict.outcome)
+    content = (
+        f"{full_answer}\n\n(region='auto': the question is about the whole image (counting, "
+        "totals, highest or lowest, ranking or trends), so the whole-image reading is used.)"
+    )
+    return AutoDecision("whole_question", "agrees", content, verdict.outcome)

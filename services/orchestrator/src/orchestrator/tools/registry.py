@@ -42,6 +42,9 @@ WORKSPACE_MIGRATED_KEY = "workspace_migrated"
 #: B-262 —— ``_child_run._child_config`` 给子代写父对话渲染过页的 run(见
 #: :attr:`ToolContext.figure_run_ids`)。
 FIGURE_RUN_IDS_KEY = "figure_run_ids"
+#: B-268 —— ``sse.run_agent`` 给审批续跑段写这一轮首段的 run id(见
+#: :attr:`ToolContext.turn_root_run_id`);新开一轮 / 孤儿复活同一个 run 时不写。
+TURN_ROOT_RUN_KEY = "turn_root_run_id"
 
 
 def workspace_view_fields(configurable: Mapping[str, Any]) -> dict[str, Any]:
@@ -426,6 +429,9 @@ class ToolContext:
     #: B-268 —— 检查点里的 ``figure_reads``(本 run 的 ``read_page`` 读取账,原样、未校验;
     #: 读的一侧 ``tools.figure_reads`` 逐条校验)。
     figure_reads: tuple[Any, ...] = ()
+    #: B-268 —— 这一轮首段的 run id(审批续跑段是新 run_id;``None`` = 本 run 就是首段)。
+    #: ``read_page`` 的读取账按它记,续跑段接着上一段的计数。子代不继承(它有自己的 state)。
+    turn_root_run_id: UUID | None = None
 
     @property
     def workspace_view(self) -> WorkspaceView:

@@ -34,6 +34,7 @@ from orchestrator.sse import (
     sse_consumer,
 )
 from orchestrator.stream_items import STREAM_FORMAT_ITEMS
+from orchestrator.tools.registry import TURN_ROOT_RUN_KEY
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -1602,6 +1603,33 @@ async def test_run_agent_points_a_continuation_at_its_turns_inputs_dir() -> None
             assert configurable["inputs_run_id"] == str(root)
         else:
             assert "inputs_run_id" not in configurable, (inputs, which)
+
+
+@pytest.mark.asyncio
+async def test_run_agent_tells_a_continuation_which_turn_it_belongs_to() -> None:
+    """B-268 review L1 —— 审批续跑段是新 run_id;``read_page`` 的读取账要按这一轮记,所以
+    续跑段(有首段、且不是自己)总带上首段的 run id,有没有 inputs 都一样。"""
+    root = uuid4()
+    for which, expected in (("root", True), ("none", False), ("self", False)):
+        rm = RunManager()
+        record = await _new_record(rm)
+        graph = _ConfigCapturingGraph(chunks=[{"agent": {"step_count": 1}}])
+        inputs_run_id = {"root": root, "none": None, "self": record.run_id}[which]
+        await run_agent(
+            bridge=InMemoryStreamBridge(),
+            run_manager=rm,
+            record=record,
+            graph=graph,
+            graph_input=None,
+            config={},
+            prompt_inputs={},
+            inputs_run_id=inputs_run_id,
+        )
+        (configurable,) = graph.seen
+        if expected:
+            assert configurable[TURN_ROOT_RUN_KEY] == str(root)
+        else:
+            assert TURN_ROOT_RUN_KEY not in configurable, which
 
 
 @pytest.mark.asyncio

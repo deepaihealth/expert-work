@@ -29,7 +29,11 @@ from langchain_core.messages import BaseMessage, HumanMessage
 from expert_work.common.conversation_channel import FIGURE_BLOCK_MARK, HIDE_FROM_UI
 from orchestrator.multimodal import image_ref_block, parse_rendered_figure_ref
 from orchestrator.tools.figure_lookup import FigureFreshness, rendered_page_freshness
-from orchestrator.tools.figure_reads import FIGURE_CROPS_IN_VIEW, FIGURE_PAGES_IN_VIEW
+from orchestrator.tools.figure_reads import (
+    FIGURE_CROPS_IN_VIEW,
+    FIGURE_OTHER_PAGES_IN_VIEW,
+    FIGURE_PAGES_IN_VIEW,
+)
 from orchestrator.tools.read_page import document_sha
 from orchestrator.tools.workspace_paths import WorkspaceView
 from orchestrator.tools.workspace_store import WorkspaceStore
@@ -146,8 +150,8 @@ def _figure_slots(figures: Sequence[_Figure]) -> list[tuple[_Figure, list[_Figur
     return slots
 
 
-def _unit_ranges(units: Sequence[int]) -> str:
-    """``[1, 2, 3, 7, 9, 10]`` → ``"1-3、7、9-10"``(先去重排序)。"""
+def _unit_ranges(units: Sequence[int], *, sep: str = "、") -> str:
+    """``[1, 2, 3, 7, 9, 10]`` → ``"1-3、7、9-10"``(先去重排序;英文行用 ``sep=", "``)。"""
     ordered = sorted(set(units))
     runs: list[tuple[int, int]] = []
     for unit in ordered:
@@ -155,7 +159,7 @@ def _unit_ranges(units: Sequence[int]) -> str:
             runs[-1] = (runs[-1][0], unit)
         else:
             runs.append((unit, unit))
-    return "、".join(str(a) if a == b else f"{a}-{b}" for a, b in runs)
+    return sep.join(str(a) if a == b else f"{a}-{b}" for a, b in runs)
 
 
 def _document_path(
@@ -187,24 +191,37 @@ def _quote_path(path: str) -> str:
     )
 
 
-def _retired_notice(pages: Sequence[int], crops: Sequence[int]) -> str:
-    """B-268 第 4 点 —— 退役提示:说上限、不点名下一个该取哪页(旧提示「需要重看就调用
-    read_page,units 填…」被模型直接当成轮流重看的理由)。"""
+def _units_have(units: Sequence[int]) -> str:
+    """``unit 1 has`` / ``units 1-2, 4 have`` —— 英文退役行的主语。"""
+    ranges = _unit_ranges(units, sep=", ")
+    return f"unit {ranges} has" if len(set(units)) == 1 else f"units {ranges} have"
+
+
+def _retired_line(label: str, pages: Sequence[int], crops: Sequence[int], *, reading: bool) -> str:
+    """B-268 第 4 点 —— 一份文档的退役提示,整行英文:说上限、不点名下一个该取哪页(旧提示
+    「需要重看就调用 read_page,units 填…」被模型直接当成轮流重看的理由)。"""
     parts: list[str] = []
-    if pages:
+    if pages and reading:
         parts.append(
-            f"the page images for units {_unit_ranges(pages)} have left your context: "
-            f"at most {FIGURE_PAGES_IN_VIEW} pages are in view at once"
+            f"{_units_have(pages)} left your context: at most {FIGURE_PAGES_IN_VIEW} pages of "
+            "the document you are reading stay in view at once"
+        )
+    elif pages:
+        parts.append(
+            f"{_units_have(pages)} left your context: only the document you are reading keeps "
+            f"up to {FIGURE_PAGES_IN_VIEW} pages in view, other documents "
+            f"{FIGURE_OTHER_PAGES_IN_VIEW} pages at most"
         )
     if crops:
         parts.append(
-            f"zoomed regions of units {_unit_ranges(crops)} have left your context: "
-            f"at most {FIGURE_CROPS_IN_VIEW} zoomed regions are in view at once"
+            f"the zoomed region{'s' if len(set(crops)) > 1 else ''} of {_units_have(crops)} "
+            f"left your context: at most {FIGURE_CROPS_IN_VIEW} zoomed regions stay in view at "
+            "once"
         )
     return (
-        "; ".join(parts) + ". What you already wrote in your replies or in files is still "
-        "valid — do not re-read pages in turn just to check them side by side. Call read_page "
-        "for a page only if you are actually missing a specific number from it"
+        f"[{label}: " + "; ".join(parts) + ". What you already wrote in your replies or in "
+        "files is still valid — do not re-read pages in turn just to check them side by side. "
+        "Call read_page for a unit only if you are actually missing a specific number from it.]"
     )
 
 
@@ -231,20 +248,31 @@ def _placeholder_lines(
             lane.setdefault(current.doc_sha, []).append(current.unit)
         if older:
             old_versions.setdefault(current.doc_sha, []).append(current.unit)
+    reading = slots[-1][0].doc_sha if slots else ""
     lines: list[str] = []
     for doc_sha in dict.fromkeys([*retired, *retired_crops, *old_versions]):
         path = _document_path(doc_sha, documents, view)
-        # 回修第 4 轮 —— 路径每份文档只写一次:两件事并进同一行。
-        label = f"文档 {_quote_path(path)}" if path is not None else "一份文档(路径没记下来)"
-        parts: list[str] = []
+        # B-268 review L6 —— 退役提示自成一行、整行英文;旧版本那一行照旧(中文)。
         if doc_sha in retired or doc_sha in retired_crops:
-            parts.append(_retired_notice(retired.get(doc_sha, []), retired_crops.get(doc_sha, [])))
-        if doc_sha in old_versions:
-            parts.append(
-                f"编号 {_unit_ranges(old_versions[doc_sha])} 有旧版本(文档之后被改过),"
-                "旧版本不再展示,以新版本为准"
+            label = (
+                f"Document {_quote_path(path)}"
+                if path is not None
+                else ("A document (path not recorded)")
             )
-        lines.append(f"[{label}:" + ";".join(parts) + "。]")
+            lines.append(
+                _retired_line(
+                    label,
+                    retired.get(doc_sha, []),
+                    retired_crops.get(doc_sha, []),
+                    reading=doc_sha == reading,
+                )
+            )
+        if doc_sha in old_versions:
+            label = f"文档 {_quote_path(path)}" if path is not None else "一份文档(路径没记下来)"
+            lines.append(
+                f"[{label}:编号 {_unit_ranges(old_versions[doc_sha])} 有旧版本(文档之后被改过),"
+                "旧版本不再展示,以新版本为准。]"
+            )
     return lines
 
 
@@ -291,9 +319,9 @@ def _live_slots(
 ) -> set[tuple[str, int, tuple[int, int, int, int] | None]]:
     """B-268 —— 这一轮带像素的槽。
 
-    * 整页一条道,上限 :data:`FIGURE_PAGES_IN_VIEW`:**正在读的那份文档**(最近一次
-      ``read_page`` 的那份,整页或局部都算)的整页按最近优先先放,剩下的位置再给别的文档
-      的整页,同样最近优先;
+    * 整页一条道:**正在读的那份文档**(最近一次 ``read_page`` 的那份,整页或局部都算)的整页
+      按最近优先放 :data:`FIGURE_PAGES_IN_VIEW` 页;别的文档的整页只分旧窗口
+      (:data:`FIGURE_OTHER_PAGES_IN_VIEW` 页)里它没占用的位置,同样最近优先;
     * 局部图一条道,上限 :data:`FIGURE_CROPS_IN_VIEW`,最近优先,只挤局部图、不挤整页。
     """
     if not slots:
@@ -301,9 +329,14 @@ def _live_slots(
     newest_first = [current for current, _ in reversed(slots)]
     reading = newest_first[0].doc_sha
     pages = [f for f in newest_first if f.region is None]
-    pages = [f for f in pages if f.doc_sha == reading] + [f for f in pages if f.doc_sha != reading]
+    mine = [f for f in pages if f.doc_sha == reading][:FIGURE_PAGES_IN_VIEW]
+    others = [f for f in pages if f.doc_sha != reading]
     crops = [f for f in newest_first if f.region is not None]
-    kept = pages[:FIGURE_PAGES_IN_VIEW] + crops[:FIGURE_CROPS_IN_VIEW]
+    kept = (
+        mine
+        + others[: max(0, FIGURE_OTHER_PAGES_IN_VIEW - len(mine))]
+        + crops[:FIGURE_CROPS_IN_VIEW]
+    )
     return {f.slot for f in kept}
 
 

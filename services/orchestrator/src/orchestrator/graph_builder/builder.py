@@ -248,6 +248,7 @@ from orchestrator.tools.overflow import (
 from orchestrator.tools.registry import (
     FIGURE_RUN_IDS_KEY,
     TOOL_ALLOWED_STATE_KEYS,
+    TURN_ROOT_RUN_KEY,
     WORKSPACE_MIGRATED_KEY,
     Tool,
     ToolContext,
@@ -4513,6 +4514,7 @@ def _build_tool_context(
         child_run=configurable.get("child_run") is True,
         figure_run_ids=figure_run_ids(_string_list(viewed_figures)) | inherited_runs,
         figure_reads=tuple(figure_reads) if isinstance(figure_reads, list) else (),
+        turn_root_run_id=_parse_uuid(configurable.get(TURN_ROOT_RUN_KEY)),
     )
 
 
@@ -4586,6 +4588,10 @@ def _tool_schema_validator(tool: Tool) -> Draft202012Validator | None:
     return Draft202012Validator(schema)
 
 
+#: B-272 —— 超过这么长的字符串不去 ``json.loads``(只是为了让还原的开销有界)。
+_RESTORE_MAX_CHARS = 1_000_000
+
+
 def _restore_stringified_args(tool: Tool, args: Mapping[str, Any]) -> dict[str, Any] | None:
     """B-272 — a copy of ``args`` with JSON-stringified arrays / objects restored.
 
@@ -4609,9 +4615,11 @@ def _restore_stringified_args(tool: Tool, args: Mapping[str, Any]) -> dict[str, 
         if not isinstance(key, str) or not isinstance(copy.get(key), str):
             continue
         value = copy[key]
+        if len(value) > _RESTORE_MAX_CHARS:
+            continue
         try:
             parsed = json.loads(value)
-        except ValueError:
+        except (ValueError, RecursionError):  # deep nesting → the normal [invalid args] path
             continue
         if isinstance(parsed, list | dict):
             copy[key] = parsed

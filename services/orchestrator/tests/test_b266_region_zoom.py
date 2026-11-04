@@ -1130,7 +1130,7 @@ async def test_read_page_region_puts_the_crop_in_viewed_figures(
     # B-268 —— 局部图按 (文档, 编号, 框) 记进本 run 的读取账,与整页分开计。
     assert doc.ctx.run_id is not None
     assert result.state_updates["figure_reads"] == ledger_entries(
-        doc.ctx.run_id, crop.doc_sha, [FigureRead(1, 1, (100, 200, 600, 500))], None
+        doc.ctx.run_id, crop.doc_sha, [FigureRead(1, (100, 200, 600, 500))], None
     )
 
     block = figure_block_message(

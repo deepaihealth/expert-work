@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import pytest
 
-from orchestrator.tools.question_scope import is_count_question, is_whole_image_question
+from orchestrator.tools.question_scope import is_whole_image_question
 
 WHOLE = [
     # E1 synthetic whole-image questions
@@ -46,6 +46,21 @@ WHOLE = [
     "Which month had the most visits?",
     # an apostrophe is not a quote: "total" here is a real cue
     "What's the total of John's scores?",
+    # the generic shapes the H1 guards keep
+    "表中最高值是多少?",
+    "这几天血压的平均值是多少?",
+    "数值的平均是多少?",
+    "Count the rows marked pending.",
+    "Count rows marked pending.",
+    "Who had the most visits?",
+    "血压的平均值是多少?",
+    "What is the count of pending rows?",
+    "What is the total?",
+    "What is the number of rows marked pending?",
+    "What is the maximum value in the list?",
+    "Which month has the maximum rainfall?",
+    "What was the most common diagnosis?",
+    "What is the mean of the readings?",
 ]
 
 LOOKUP = [
@@ -71,6 +86,27 @@ LOOKUP = [
     "血红蛋白的结果是多少?",
     "第 3 行的日期是哪一天?",
     "What is the patient's name?",
+    # review round 1 (H1): single values on dense documents whose names contain a cue word
+    "平均红细胞体积是多少",
+    "平均血红蛋白浓度是多少",
+    "请读出平均红细胞血红蛋白浓度(MCHC)的结果",
+    "药品的数量是多少盒",
+    "白细胞数量是多少",
+    "收缩压最高值是多少",
+    "这个月的趋势图标题是什么",
+    "What is the platelet count?",
+    "white blood cell count?",
+    "total cholesterol",
+    "total bilirubin",
+    "reference range of total protein",
+    "mean corpuscular volume",
+    "phone number of the clinic",
+    "invoice number of this bill",
+    "Heart rate at 10 min after exercise",
+    "most recent test date",
+    "Total amount due",
+    "minimum payment due",
+    "What was the heart rate at 10 min?",
 ]
 
 
@@ -91,21 +127,6 @@ def test_full_width_punctuation_is_folded_before_matching() -> None:
     assert is_whole_image_question("谁最高\uff1f")
 
 
-@pytest.mark.parametrize(
-    ("question", "count"),
-    [
-        ("这段聊天里客户一共报了几次血压?", True),
-        ("How many rows are marked pending?", True),
-        ("这份清单一共有多少项?", True),
-        ("表中指标值最高的是哪个姓名?", False),
-        ("What is the sum of the amounts?", False),
-        ("最高血压是多少?", False),
-    ],
-)
-def test_count_like_questions(question: str, count: bool) -> None:
-    assert is_count_question(question) is count
-
-
 def test_an_empty_question_is_not_whole() -> None:
     assert not is_whole_image_question("")
-    assert not is_count_question("   ")
+    assert not is_whole_image_question("   ")

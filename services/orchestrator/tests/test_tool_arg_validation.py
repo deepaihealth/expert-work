@@ -225,3 +225,26 @@ async def test_rejected_restore_never_echoes_the_value() -> None:
     assert msg.status == "error"
     assert "zz-secret-zz" not in str(msg.content)
     assert not tool.calls
+
+
+@pytest.mark.asyncio
+async def test_a_deeply_nested_string_is_a_normal_invalid_args_error() -> None:
+    """Review L4 — ``json.loads`` raises RecursionError on deep nesting; that is not a crash."""
+    tool = _SchemaTool(parameters=_REGION_SCHEMA)
+    args = {"question": "q", "region": "[" * 50_000 + "]" * 50_000}
+    msg, *_ = await _invoke_tool(tool, args, "tc-1", _ctx())
+    assert msg.status == "error"
+    assert str(msg.content).startswith("[invalid args] ")
+    assert not tool.calls
+
+
+@pytest.mark.asyncio
+async def test_an_oversized_string_is_not_parsed() -> None:
+    tool = _SchemaTool(parameters={"type": "object", "properties": {"rows": {"type": "array"}}})
+    big = "[" + ",".join(["1"] * 600_000) + "]"  # valid JSON, over 1M characters
+    msg, *_ = await _invoke_tool(tool, {"rows": big}, "tc-1", _ctx())
+    assert msg.status == "error"
+    assert not tool.calls
+    small = "[" + ",".join(["1"] * 1_000) + "]"
+    ok, *_ = await _invoke_tool(tool, {"rows": small}, "tc-2", _ctx())
+    assert ok.status != "error"

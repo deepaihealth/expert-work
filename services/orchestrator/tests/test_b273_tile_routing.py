@@ -1,6 +1,6 @@
-"""B-273 —— whole-image questions skip the bands (V1); the band rules that stay as fallbacks:
-R2 (several bands with the same value count only as one row seen twice where two neighbouring
-bands overlap) and V2 (on a counting question a band's 0 means "not found")."""
+"""B-273 —— whole-image questions are answered from the whole image (V1); the band rule that stays
+as a fallback: R2 (several bands with the same value count only as one row seen twice where two
+neighbouring bands overlap)."""
 
 from __future__ import annotations
 
@@ -10,10 +10,22 @@ from pathlib import Path
 import pytest
 
 from orchestrator.tools.region_zoom import auto_bands
-from orchestrator.tools.tile_reading import TileResult, decide_auto, parse_tile_reply
+from orchestrator.tools.tile_reading import (
+    TileResult,
+    decide_auto,
+    decide_whole_question,
+    parse_tile_reply,
+)
 from orchestrator.tools.vision import ask_image_region_auto_total
 
-from .test_b266_region_zoom import _VL, NOT_FOUND, _found, _is_band, _question_of, _upload
+from .test_b266_region_zoom import (
+    _VL,
+    _found,
+    _image_ref_of,
+    _is_band,
+    _question_of,
+    _upload,
+)
 
 _TILES = auto_bands(6)
 _FULL = "There are 7 rows in total."
@@ -82,53 +94,74 @@ def test_neighbouring_bands_with_different_labels_fall_back() -> None:
 
 
 # ---------------------------------------------------------------------------
-# V2 —— on a counting question a band's 0 is "not found"
+# V1 —— whole-image questions: the whole-image answer is used, the bands only flag it
 # ---------------------------------------------------------------------------
 
 
-def test_a_zero_from_one_band_does_not_answer_a_counting_question() -> None:
-    results = _results(_json("found", "0"), _NF, _NF, _NF, _NF, _NF)
-    counted = decide_auto(results, full_answer=_FULL, full_error=None, count_question=True)
-    assert (counted.path, counted.reason) == ("full_fallback", "none")
-    plain = decide_auto(results, full_answer=_FULL, full_error=None)
-    assert (plain.path, plain.reason) == ("bands", "single")
+def test_the_whole_image_answer_is_used_when_no_band_contradicts_it() -> None:
+    results = _results(_NF, _NF, _NF, _NF, _NF, _NF)
+    decision = decide_whole_question(results, full_answer=_FULL, full_error=None)
+    assert (decision.path, decision.reason) == ("whole_question", "agrees")
+    assert decision.content.startswith(f"{_FULL}\n\n(region='auto': the question is about")
+    assert "uncertain" not in decision.content
 
 
-def test_a_non_zero_count_from_one_band_is_kept() -> None:
-    results = _results(_NF, _json("found", "4"), _NF, _NF, _NF, _NF)
-    decision = decide_auto(results, full_answer=_FULL, full_error=None, count_question=True)
+def test_a_band_value_the_whole_image_answer_also_gives_agrees() -> None:
+    results = _results(_NF, _json("found", "7"), _NF, _NF, _NF, _NF)
+    decision = decide_whole_question(results, full_answer=_FULL, full_error=None)
+    assert (decision.path, decision.reason) == ("whole_question", "agrees")
+
+
+def test_a_band_value_the_whole_image_answer_does_not_give_marks_it_uncertain() -> None:
+    """A wrongly routed lookup ("platelet count") costs wording, not accuracy: the band that saw
+    the value is attached and the answer is marked uncertain."""
+    results = _results(_NF, _NF, _json("found", "245", label="PLT"), _NF, _NF, _NF)
+    decision = decide_whole_question(results, full_answer=_FULL, full_error=None)
+    assert (decision.path, decision.reason) == ("whole_question", "bands_disagree")
+    assert decision.content.startswith(f"{_FULL}\n\n")
+    assert "uncertain" in decision.content
+    assert "245" in decision.content and "band 3" in decision.content
+
+
+def test_bands_that_disagree_with_each_other_do_not_flag_the_whole_image_answer() -> None:
+    """Different partial counts per band are what a whole-image question looks like in bands."""
+    results = _results(_json("found", "2"), _NF, _NF, _json("found", "3"), _NF, _NF)
+    decision = decide_whole_question(results, full_answer=_FULL, full_error=None)
+    assert (decision.path, decision.reason) == ("whole_question", "agrees")
+
+
+def test_without_a_whole_image_answer_the_band_rules_apply() -> None:
+    results = _results(_NF, _NF, _json("found", "245"), _NF, _NF, _NF)
+    decision = decide_whole_question(results, full_answer=None, full_error="timed out")
     assert (decision.path, decision.reason) == ("bands", "single")
 
 
-# ---------------------------------------------------------------------------
-# V1 —— the question decides before any band is cut
-# ---------------------------------------------------------------------------
-
-
 @pytest.mark.anyio
-async def test_a_whole_image_question_is_read_whole_without_bands(tmp_path: Path) -> None:
+async def test_a_whole_image_question_reads_bands_and_whole_and_prefers_whole(
+    tmp_path: Path,
+) -> None:
     vl = _VL(answer=lambda ref: _found("3") if _is_band(ref) else "7 rows")
-    up = _upload(tmp_path, vl, size=(3000, 2000))  # 6 MP: would be cut into bands
-    before = ask_image_region_auto_total.labels(path="gated", reason="whole_question")._value.get()
+    up = _upload(tmp_path, vl, size=(3000, 2000))  # 6 MP: 4 bands
+    labels = {"path": "whole_question", "reason": "bands_disagree"}
+    before = ask_image_region_auto_total.labels(**labels)._value.get()
 
     result = await up.tool.call(
         {"image_ref": up.ref, "question": "How many rows are marked pending?", "region": "auto"},
         ctx=up.ctx,
     )
 
-    assert len(vl.calls) == 1
-    assert not _is_band(str(vl.calls[0][1].content[1]["ref"]))  # type: ignore[index]
-    assert _question_of(vl.calls[0]) == "How many rows are marked pending?"
-    assert result.content.startswith("7 rows\n\n(region='auto': the question is about the whole")
-    assert (result.meta["auto"], result.meta["auto_reason"]) == ("gated", "whole_question")
-    assert result.meta["vl_calls"] == 1
-    after = ask_image_region_auto_total.labels(path="gated", reason="whole_question")._value.get()
-    assert after == before + 1
+    assert len(vl.calls) == 5  # 4 bands + the whole image, as on the band path
+    whole = [call for call in vl.calls if not _is_band(_image_ref_of(call))]
+    assert [_question_of(call) for call in whole] == ["How many rows are marked pending?"]
+    assert result.content.startswith("7 rows\n\n")
+    assert (result.meta["auto"], result.meta["auto_reason"]) == ("whole_question", "bands_disagree")
+    assert result.meta["vl_calls"] == 5
+    assert ask_image_region_auto_total.labels(**labels)._value.get() == before + 1
 
 
 @pytest.mark.anyio
-async def test_a_lookup_question_is_still_read_in_bands(tmp_path: Path) -> None:
-    vl = _VL(answer=lambda ref: NOT_FOUND if _is_band(ref) else "whole")
+async def test_a_lookup_question_is_still_decided_by_the_bands(tmp_path: Path) -> None:
+    vl = _VL(answer=lambda ref: _found("3") if _is_band(ref) else "whole")
     up = _upload(tmp_path, vl, size=(3000, 2000))
 
     result = await up.tool.call(
@@ -136,5 +169,5 @@ async def test_a_lookup_question_is_still_read_in_bands(tmp_path: Path) -> None:
         ctx=up.ctx,
     )
 
-    assert len(vl.calls) == 5  # 4 bands + the whole image in parallel
-    assert result.meta["auto"] != "gated"
+    assert len(vl.calls) == 5
+    assert result.meta["auto"] != "whole_question"

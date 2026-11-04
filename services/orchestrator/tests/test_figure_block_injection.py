@@ -22,6 +22,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
@@ -62,7 +63,11 @@ from orchestrator.graph_builder.figure_block import (
 from orchestrator.llm.providers._streaming import LLMDelta
 from orchestrator.multimodal import parse_rendered_figure_ref
 from orchestrator.state import _merge_viewed_figures
-from orchestrator.tools.figure_reads import FIGURE_CROPS_IN_VIEW, FIGURE_PAGES_IN_VIEW
+from orchestrator.tools.figure_reads import (
+    FIGURE_CROPS_IN_VIEW,
+    FIGURE_OTHER_PAGES_IN_VIEW,
+    FIGURE_PAGES_IN_VIEW,
+)
 from orchestrator.tools.nas_workspace_store import NasWorkspaceStore
 from orchestrator.tools.read_page import ReadPageTool, document_sha, workspace_figure_ref
 from orchestrator.tools.sandbox import EgressContext, RecordingSandboxRuntime, SandboxOutcome
@@ -205,14 +210,30 @@ def test_a_four_page_document_stays_in_view_whole() -> None:
 
 
 def test_the_document_being_read_wins_over_more_recent_pages_of_another() -> None:
-    """正在读的 = 最近一次 read_page 的那份(这里是 a 的局部图):a 的 4 页整页全留,
-    b 只剩最近的 2 页。只按「最近优先」的话留下的是 b 的 4 页 + a 的 2 页。"""
+    """正在读的 = 最近一次 read_page 的那份(这里是 a 的局部图):a 的 4 页整页全留;
+    别的文档只分旧窗口(3 页)剩下的位置 —— 这里一页都不剩。"""
     a = [_ref(p, doc="a.pdf") for p in range(1, 5)]
     b = [_ref(p, doc="b.pdf") for p in range(1, 5)]
     crop = _ref(1, doc="a.pdf", region=(0, 0, 500, 500))
     out = _tail([], [*a, *b, crop])
-    pixels = _pixels(out)
-    assert set(pixels) == {*a, b[2], b[3], crop}
+    assert set(_pixels(out)) == {*a, crop}
+    text = _block_text(_tail([], [*a, *b, crop], documents=_documents("a.pdf", "b.pdf")))
+    (line,) = [ln for ln in text.splitlines() if ln.startswith('[Document "b.pdf"')]
+    assert line.startswith(
+        '[Document "b.pdf": units 1-4 have left your context: only the document you are '
+        f"reading keeps up to {FIGURE_PAGES_IN_VIEW} pages in view, other documents "
+        f"{FIGURE_OTHER_PAGES_IN_VIEW} pages at most."
+    )
+    assert not re.search("[\u4e00-\u9fff]", line)  # L6: no Chinese mixed into this line
+
+
+def test_other_documents_share_what_is_left_of_the_old_window_of_three() -> None:
+    """B-268 review M2 —— only the document being read gets the bigger window."""
+    b = [_ref(p, doc="b.pdf") for p in range(1, 5)]
+    a1 = _ref(1, doc="a.pdf")
+    out = _tail([], [*b, a1])
+    assert FIGURE_OTHER_PAGES_IN_VIEW == 3
+    assert set(_pixels(out)) == {a1, b[2], b[3]}
 
 
 def test_region_crops_have_their_own_lane_of_two() -> None:
@@ -223,8 +244,8 @@ def test_region_crops_have_their_own_lane_of_two() -> None:
     assert FIGURE_CROPS_IN_VIEW == 2
     assert set(_pixels(out)) == {*pages, crops[1], crops[2]}
     text = _block_text(out)
-    assert "zoomed regions of units 1 have left your context" in text
-    assert f"at most {FIGURE_CROPS_IN_VIEW} zoomed regions are in view at once" in text
+    assert "the zoomed region of unit 1 has left your context" in text
+    assert f"at most {FIGURE_CROPS_IN_VIEW} zoomed regions stay in view at once" in text
 
 
 # ---------------------------------------------------------------------------
@@ -237,8 +258,10 @@ def test_retired_figures_leave_a_visible_placeholder() -> None:
     out = _tail([], [_ref(p) for p in range(1, 9)])
     text = _block_text(out)
     # 1、2 两页退役,按文档折叠成一行、编号压成区间;3 仍在窗口里。
-    assert "the page images for units 1-2 have left your context" in text
-    assert f"at most {FIGURE_PAGES_IN_VIEW} pages are in view at once" in text
+    assert "units 1-2 have left your context" in text
+    assert (
+        f"at most {FIGURE_PAGES_IN_VIEW} pages of the document you are reading stay in view at once"
+    ) in text
     assert "read_page" in text
 
 
@@ -604,13 +627,13 @@ def test_a_retired_page_says_which_path_to_pass_back() -> None:
         documents=_documents("uploads/a.pptx", "uploads/b.pdf"),
     )
     text = _block_text(out)
-    assert '文档 "uploads/a.pptx":the page images for units 1-2 have left your context' in text
+    assert '[Document "uploads/a.pptx": units 1-2 have left your context' in text
     assert '"uploads/b.pdf" 第 1 页' in text
 
 
 def test_without_a_recorded_path_the_placeholder_says_so() -> None:
     text = _block_text(_tail([], [_ref(p) for p in range(1, 9)]))
-    assert "路径没记下来" in text
+    assert "[A document (path not recorded): " in text
 
 
 def test_a_path_that_does_not_hash_to_the_key_is_not_shown() -> None:
@@ -620,7 +643,7 @@ def test_a_path_that_does_not_hash_to_the_key_is_not_shown() -> None:
     }
     text = _block_text(_tail([], [_ref(p) for p in range(1, 9)], documents=forged))
     assert "别的文件" not in text
-    assert "路径没记下来" in text
+    assert "[A document (path not recorded): " in text
 
 
 def test_placeholders_grow_with_documents_not_with_pages() -> None:
@@ -892,7 +915,7 @@ async def test_the_path_read_page_recorded_reaches_later_prompts_and_runs() -> N
             config=_config(),
         )
         fourth = _block_text(llm.seen_prompts[3])
-        assert '文档 "a.pptx":the page images for units 1 have left your context' in fourth
+        assert '[Document "a.pptx": unit 1 has left your context' in fourth
 
         llm2 = _RecordingLLM()
         graph2 = GraphRunner(checkpointer=cp).compile(
@@ -902,9 +925,7 @@ async def test_the_path_read_page_recorded_reaches_later_prompts_and_runs() -> N
             {"messages": [HumanMessage(content="继续")], "step_count": 0, "max_steps": 4},
             config=_config(),
         )
-        assert '文档 "a.pptx":the page images for units 1 have left' in _block_text(
-            llm2.seen_prompts[0]
-        )
+        assert '[Document "a.pptx": unit 1 has left' in _block_text(llm2.seen_prompts[0])
 
 
 # ---------------------------------------------------------------------------

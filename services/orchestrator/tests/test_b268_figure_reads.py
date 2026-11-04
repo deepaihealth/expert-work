@@ -21,18 +21,22 @@ from langchain_core.runnables import RunnableConfig
 from expert_work.persistence import RENDERED_FIGURE_PAGE_STEM, RENDERED_FIGURE_UNIT_PREFIX
 from expert_work.runtime.checkpointer import make_checkpointer
 from orchestrator import GraphRunner, ToolContext, ToolRegistry, build_react_graph
+from orchestrator.graph_builder.builder import _build_tool_context
 from orchestrator.state import _merge_figure_reads
 from orchestrator.tools._guards import LOOP_TRIP_META_KEY
 from orchestrator.tools.figure_reads import (
+    FIGURE_CROPS_PER_DOCUMENT,
     FIGURE_PAGES_IN_VIEW,
     FIGURE_READS_PER_ITEM,
+    Box,
     FigureRead,
+    ReadPlan,
     ledger_entries,
+    plan_reads,
     read_notice,
-    read_refusal,
 )
 from orchestrator.tools.read_page import ReadPageTool, document_sha
-from orchestrator.tools.registry import TOOL_ALLOWED_STATE_KEYS
+from orchestrator.tools.registry import TOOL_ALLOWED_STATE_KEYS, TURN_ROOT_RUN_KEY
 from orchestrator.tools.sandbox import EgressContext, RecordingSandboxRuntime, SandboxOutcome
 from orchestrator.tools.skill_seed import sanitize_agent_key
 from orchestrator.tools.workspace_paths import WorkspaceView
@@ -52,7 +56,11 @@ def _ledger(*reads: FigureRead, run: UUID = _RUN, doc: str = _DOC, pages: int | 
 
 
 def _page(n: int) -> FigureRead:
-    return FigureRead(unit=n, page=n)
+    return FigureRead(unit=n)
+
+
+def _plan(ledger: list, units: list[int], region: Box | None = None) -> ReadPlan:
+    return plan_reads(ledger, run_id=_RUN, doc_sha=_DOC, units=units, region=region)
 
 
 # ---------------------------------------------------------------------------
@@ -60,57 +68,88 @@ def _page(n: int) -> FigureRead:
 # ---------------------------------------------------------------------------
 
 
-def test_the_fourth_read_of_one_page_is_refused_and_the_third_is_not() -> None:
+def test_the_fourth_read_of_one_unit_is_refused_and_the_third_is_not() -> None:
     assert FIGURE_READS_PER_ITEM == 3
-    two = _ledger(_page(1), _page(1))
-    three = _ledger(_page(1), _page(1), _page(1))
-    assert read_refusal(two, run_id=_RUN, doc_sha=_DOC, units=[1], region=None) is None
-    refusal = read_refusal(three, run_id=_RUN, doc_sha=_DOC, units=[1], region=None)
-    assert refusal is not None
-    assert "Page 1 has already been read 3 times in this task" in refusal
-    assert "not rendered again" in refusal
-    assert "say in your answer what is missing" in refusal
+    assert _plan(_ledger(_page(1), _page(1)), [1]) == ReadPlan((1,))
+    plan = _plan(_ledger(_page(1), _page(1), _page(1)), [1])
+    assert plan.units == ()
+    assert plan.refused is not None
+    assert plan.refused.startswith("Not rendered: unit 1 - already read 3 times in this task.")
+    assert "say in your answer what is missing" in plan.refused
 
 
-def test_reads_from_another_run_do_not_count() -> None:
-    """Point 7 — a later turn (a new run) may read the same page normally again."""
+def test_only_the_units_over_the_cap_are_refused() -> None:
+    """Review M3 — the other requested units are still rendered; a note names the refused one."""
+    plan = _plan(_ledger(_page(2), _page(2), _page(2)), [1, 2, 3])
+    assert plan.units == (1, 3)
+    assert plan.refused is not None and plan.refused.startswith("Not rendered: unit 2 - ")
+
+
+def test_reads_from_another_turn_do_not_count() -> None:
+    """Point 7 — a later turn may read the same unit normally again."""
     earlier = _ledger(_page(1), _page(1), _page(1), run=uuid4())
-    assert read_refusal(earlier, run_id=_RUN, doc_sha=_DOC, units=[1], region=None) is None
+    assert _plan(earlier, [1]) == ReadPlan((1,))
 
 
 def test_a_region_is_counted_apart_from_its_whole_page() -> None:
     box = (0, 0, 500, 500)
-    crops = _ledger(*(FigureRead(unit=1, page=1, region=box) for _ in range(3)))
-    assert read_refusal(crops, run_id=_RUN, doc_sha=_DOC, units=[1], region=None) is None
-    refusal = read_refusal(crops, run_id=_RUN, doc_sha=_DOC, units=[1], region=box)
-    assert refusal is not None and "Region [0, 0, 500, 500] of page 1 has" in refusal
+    crops = _ledger(*(FigureRead(unit=1, region=box) for _ in range(3)))
+    assert _plan(crops, [1]) == ReadPlan((1,))
+    plan = _plan(crops, [1], box)
+    assert plan.units == ()
+    assert plan.refused is not None
+    assert "Not rendered: the region [0, 0, 500, 500] of unit 1 - already read 3" in plan.refused
 
 
-def test_a_document_rendered_more_than_twice_its_pages_plus_three_is_refused() -> None:
-    """Two pages → at most 2 x 2 + 3 = 7 renders in the run, whatever the pages."""
-    reads = [_page(1), _page(2)] * 3 + [FigureRead(unit=1, page=1, region=(0, 0, 9, 9))]
-    ledger = _ledger(*reads, pages=2)
-    assert len(ledger) == 7
-    refusal = read_refusal(ledger, run_id=_RUN, doc_sha=_DOC, units=[2], region=(1, 1, 5, 5))
-    assert refusal is not None
-    assert "This document has already been rendered 7 times in this task" in refusal
-    six = _ledger(*reads[:6], pages=2)
-    assert read_refusal(six, run_id=_RUN, doc_sha=_DOC, units=[2], region=(1, 1, 5, 5)) is None
+def test_a_documents_whole_pages_stop_at_twice_its_pages_plus_three() -> None:
+    """Two pages → at most 2 x 2 + 3 = 7 whole-page renders in the turn; crops do not count."""
+    crops = [FigureRead(unit=1, region=(0, 0, 9 + i, 9)) for i in range(5)]
+    six = _ledger(*([_page(1), _page(2)] * 3), *crops, pages=2)
+    assert _plan(six, [3]) == ReadPlan((3,))
+    plan = _plan(six, [3, 4])
+    assert plan.units == (3,)
+    assert plan.refused is not None
+    assert (
+        "Not rendered: unit 4 - this document's pages were already rendered 6 times in this "
+        "task, the most allowed for its 2 pages."
+    ) in plan.refused
 
 
-def test_without_a_page_count_only_the_per_page_rule_applies() -> None:
+def test_a_one_page_scan_can_be_zoomed_several_times() -> None:
+    """Review M3 — whole page + 4 zooms must not end the run (B-266 region zoom)."""
+    zooms = [FigureRead(unit=1, region=(0, 100 * i, 1000, 100 * i + 100)) for i in range(4)]
+    ledger = _ledger(_page(1), *zooms, pages=1)
+    assert _plan(ledger, [1], (0, 500, 1000, 600)) == ReadPlan((1,))
+    assert _plan(ledger, [1]) == ReadPlan((1,))
+
+
+def test_zoomed_regions_have_their_own_budget_per_document() -> None:
+    assert FIGURE_CROPS_PER_DOCUMENT == 12
+    zooms = [FigureRead(unit=1, region=(0, i, 1000, i + 50)) for i in range(12)]
+    ledger = _ledger(*zooms, pages=1)
+    plan = _plan(ledger, [1], (0, 900, 1000, 950))
+    assert plan.units == ()
+    assert plan.refused is not None
+    assert "12 zoomed regions of this document were already rendered in this task" in (plan.refused)
+    assert _plan(ledger[:11], [1], (0, 900, 1000, 950)) == ReadPlan((1,))
+    # whole-page renders do not use up the zoom budget
+    pages = _ledger(*[_page(p) for p in range(1, 13)], pages=None)
+    assert _plan(pages, [1], (0, 900, 1000, 950)) == ReadPlan((1,))
+
+
+def test_without_a_page_count_only_the_per_unit_rule_applies() -> None:
     ledger = _ledger(*[_page(p) for p in range(1, 10)], pages=None)
-    assert read_refusal(ledger, run_id=_RUN, doc_sha=_DOC, units=[10], region=None) is None
+    assert _plan(ledger, [10]) == ReadPlan((10,))
 
 
 def test_a_malformed_ledger_entry_is_ignored() -> None:
     """``figure_reads`` is a tool-writable channel: junk never trips the breaker."""
     junk: list[object] = [
         42,
-        {"run": str(_RUN), "doc": _DOC, "unit": "1", "page": 1},
-        {"run": str(_RUN), "doc": _DOC, "unit": True, "page": 1},
+        {"run": str(_RUN), "doc": _DOC, "unit": "1"},
+        {"run": str(_RUN), "doc": _DOC, "unit": True},
     ] * 3
-    assert read_refusal(junk, run_id=_RUN, doc_sha=_DOC, units=[1], region=None) is None
+    assert _plan(junk, [1]) == ReadPlan((1,))
 
 
 # ---------------------------------------------------------------------------
@@ -122,23 +161,32 @@ def test_a_re_read_gets_a_receipt_naming_the_read_count_and_what_is_in_view() ->
     ledger = _ledger(_page(1), _page(2), _page(3), _page(4), _page(1))
     notice = read_notice(ledger, run_id=_RUN, doc_sha=_DOC, reads=[_page(1)], pages=4)
     assert notice is not None
-    assert "You already viewed page 1 in this task (read #3)." in notice
-    assert "Pages 1-4 of this document are all in view now; no need to fetch them again." in (
+    assert "You already viewed unit 1 in this task (read #3)." in notice
+    assert "Units 1-4 of this document are all in view now; no need to fetch them again." in (
         notice
     )
     assert "write_file" in notice
     assert "numbers noted in your thinking are not kept to the next step" in notice
 
 
+def test_the_receipt_counts_by_unit_not_by_page() -> None:
+    """Review L5 — docx units are figure entries: two entries on one page are two units."""
+    ledger = _ledger(FigureRead(unit=7), FigureRead(unit=8))
+    notice = read_notice(ledger, run_id=_RUN, doc_sha=_DOC, reads=[FigureRead(unit=8)])
+    assert notice is not None
+    assert "You already viewed unit 8 in this task (read #2)." in notice
+    assert "Units 7-8 of this document" in notice
+
+
 def test_a_first_read_gets_no_receipt() -> None:
     assert read_notice([], run_id=_RUN, doc_sha=_DOC, reads=[_page(1)], pages=4) is None
 
 
-def test_in_view_pages_are_capped_at_the_window() -> None:
+def test_in_view_units_are_capped_at_the_window() -> None:
     ledger = _ledger(*[_page(p) for p in range(1, 9)], pages=8)
     notice = read_notice(ledger, run_id=_RUN, doc_sha=_DOC, reads=[_page(8)], pages=8)
     assert FIGURE_PAGES_IN_VIEW == 6
-    assert notice is not None and "Pages 3-8 of this document" in notice
+    assert notice is not None and "Units 3-8 of this document" in notice
 
 
 def test_a_document_over_the_cap_gets_a_heads_up_on_its_first_read_only() -> None:
@@ -216,13 +264,19 @@ class _Renders(RecordingSandboxRuntime):
         return SandboxOutcome(stdout=json.dumps(envelope), stderr="", exit_code=0, timed_out=False)
 
 
-def _ctx(ledger: Sequence[Mapping[str, Any]] = ()) -> ToolContext:
+def _ctx(
+    ledger: Sequence[Mapping[str, Any]] = (),
+    *,
+    run_id: UUID = _RUN,
+    turn_root_run_id: UUID | None = None,
+) -> ToolContext:
     return ToolContext(
         tenant_id=_TENANT,
         user_id=_USER,
-        run_id=_RUN,
+        run_id=run_id,
         agent_key=_AGENT_KEY,
         figure_reads=tuple(ledger),
+        turn_root_run_id=turn_root_run_id,
     )
 
 
@@ -248,7 +302,10 @@ async def test_read_page_refuses_the_fourth_read_without_rendering() -> None:
     tool = ReadPageTool(client=runtime, figure_delivery="inline")
     ledger = ledger_entries(_RUN, _doc_sha("a.pdf"), [_page(1)] * 3, 4)
     result = await tool.call({"path": "a.pdf", "units": [1]}, ctx=_ctx(ledger))
-    assert "Page 1 has already been read 3 times" in result.content
+    # Review L3 — the instruction is platform text (notice), outside the untrusted-data fence.
+    assert result.content == "Nothing was rendered."
+    assert result.notice is not None
+    assert result.notice.startswith("Not rendered: unit 1 - already read 3 times")
     assert runtime.execs == []
     assert result.meta.get(LOOP_TRIP_META_KEY) is True
     assert "figure_reads" not in result.state_updates
@@ -259,7 +316,32 @@ async def test_read_page_attaches_the_receipt_to_a_re_read() -> None:
     ledger = ledger_entries(_RUN, _doc_sha("a.pdf"), [_page(1), _page(2)], None)
     result = await tool.call({"path": "a.pdf", "units": [2]}, ctx=_ctx(ledger))
     assert result.notice is not None
-    assert "You already viewed page 2 in this task (read #2)." in result.notice
+    assert "You already viewed unit 2 in this task (read #2)." in result.notice
+
+
+async def test_read_page_renders_the_units_under_the_cap_and_notes_the_others() -> None:
+    runtime = _Renders()
+    tool = ReadPageTool(client=runtime, figure_delivery="inline")
+    ledger = ledger_entries(_RUN, _doc_sha("a.pdf"), [_page(2)] * 3, None)
+    result = await tool.call({"path": "a.pdf", "units": [1, 2, 3]}, ctx=_ctx(ledger))
+    assert _snippet_params(runtime.execs[0][1])["units"] == [1, 3]
+    assert result.notice is not None and result.notice.startswith("Not rendered: unit 2 - ")
+    assert LOOP_TRIP_META_KEY not in result.meta  # something was rendered: not a loop trip
+    assert [e["unit"] for e in result.state_updates["figure_reads"]] == [1, 3]
+
+
+async def test_an_approval_continuation_keeps_the_turns_counts() -> None:
+    """Review L1 — the continuation segment has a new run_id; the ledger is keyed by the turn."""
+    root, continuation = uuid4(), uuid4()
+    runtime = _Renders()
+    tool = ReadPageTool(client=runtime, figure_delivery="inline")
+    ledger = ledger_entries(root, _doc_sha("a.pdf"), [_page(1)] * 3, None)
+    ctx = _ctx(ledger, run_id=continuation, turn_root_run_id=root)
+    refused = await tool.call({"path": "a.pdf", "units": [1]}, ctx=ctx)
+    assert runtime.execs == []
+    assert refused.meta.get(LOOP_TRIP_META_KEY) is True
+    rendered = await tool.call({"path": "a.pdf", "units": [2]}, ctx=ctx)
+    assert {e["run"] for e in rendered.state_updates["figure_reads"]} == {str(root)}
 
 
 async def test_read_page_gives_the_heads_up_for_a_long_document() -> None:
@@ -317,13 +399,22 @@ async def test_two_refusals_end_the_run_with_a_wrap_up() -> None:
         )
     messages: list[BaseMessage] = final["messages"]
     refusals = [
-        m for m in messages if isinstance(m, ToolMessage) and "already been read" in str(m.content)
+        m
+        for m in messages
+        if isinstance(m, ToolMessage) and "Nothing was rendered" in str(m.content)
     ]
     assert len(runtime.execs) == 3
     assert len(refusals) == 2
     assert final["loop_trip_count"] == 2
     # Reads 1-3 rendered, 4-5 refused, then the tool-less wrap-up turn: 6 LLM calls, not 9.
     assert llm.calls == 6
+
+
+def test_the_tool_context_reads_the_turns_root_run() -> None:
+    root = uuid4()
+    ctx = _build_tool_context({"configurable": {TURN_ROOT_RUN_KEY: str(root)}})
+    assert ctx.turn_root_run_id == root
+    assert _build_tool_context({"configurable": {TURN_ROOT_RUN_KEY: "x"}}).turn_root_run_id is None
 
 
 @pytest.mark.parametrize("delivery", ["inline", "ask_image"])
