@@ -2157,7 +2157,8 @@ describe("PlaygroundTab", () => {
       };
       listSessionsMock.mockResolvedValue([past]);
       getMessagesMock.mockResolvedValue([
-        { role: "user", content: "q1\n\n[file attached: uploads/r.pdf]" },
+        // the same upload sent twice in files[] stages one tag
+        { role: "user", content: "q1\n\n[file attached: uploads/r.pdf]\n[file attached: uploads/r.pdf]" },
         { role: "assistant", content: "a1" },
       ]);
       listThreadRunsMock.mockResolvedValue([
