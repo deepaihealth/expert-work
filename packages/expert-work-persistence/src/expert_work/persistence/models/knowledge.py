@@ -98,6 +98,12 @@ class KnowledgeBaseRow(Base):
     api_access_enabled: Mapped[bool] = mapped_column(
         Boolean, nullable=False, server_default=text("false")
     )
+    #: B-267 (migration ``0182``): the base profile generated from its documents
+    #: (summary, topics, typical questions, document types) plus the per-base
+    #: probe calibration. NULL until generated.
+    profile: Mapped[dict[str, Any] | None] = mapped_column(
+        JSONB(none_as_null=True), nullable=True
+    )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         nullable=False,
