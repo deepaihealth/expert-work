@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import pytest
 
-from orchestrator.tools.question_scope import is_whole_image_question
+from orchestrator.tools.question_scope import is_count_question, is_whole_image_question
 
 WHOLE = [
     # E1 synthetic whole-image questions
@@ -61,6 +61,20 @@ WHOLE = [
     "Which month has the maximum rainfall?",
     "What was the most common diagnosis?",
     "What is the mean of the readings?",
+    # review round 2 (LOW): generic shapes added
+    "Rank the departments by revenue.",
+    "What is the ranking of the teams?",
+    "这些数值的中位数是多少?",
+    "排第一的是谁?",
+    "列出所有异常项",
+    "What is the sum?",
+    "这些读数的均值是多少?",
+    # round 3: rate markers and "number of" keep these whole
+    "平均每天几次?",
+    "How many patients per day in total?",
+    "一共有几次就诊记录?",
+    "每个科室一共几个病人?",
+    "What is the number of visits?",
 ]
 
 LOOKUP = [
@@ -107,6 +121,16 @@ LOOKUP = [
     "Total amount due",
     "minimum payment due",
     "What was the heart rate at 10 min?",
+    "sum insured",
+    "收缩压均值是多少",
+    # round 3: a per-unit rate is a printed dose / rate; "number of the <noun>" is a field
+    "How many mg per tablet",
+    "每天最多吃几次",
+    "每次吃几粒?",
+    "How many tablets a day?",
+    "How many drops in each eye?",
+    "number of the prescription",
+    "What is the number of this invoice?",
 ]
 
 
@@ -130,3 +154,22 @@ def test_full_width_punctuation_is_folded_before_matching() -> None:
 def test_an_empty_question_is_not_whole() -> None:
     assert not is_whole_image_question("")
     assert not is_whole_image_question("   ")
+
+
+@pytest.mark.parametrize(
+    ("question", "count"),
+    [
+        ("How many rows are marked pending?", True),
+        ("这段聊天里客户一共报了几次血压?", True),
+        ("这份清单一共有多少项?", True),
+        ("What is the count of pending rows?", True),
+        ("What is the number of rows marked pending?", True),
+        ("表中指标值最高的是哪个姓名?", False),
+        ("What is the sum of the amounts?", False),
+        ("What is the total?", False),
+        ("platelet count?", False),
+    ],
+)
+def test_counting_questions_are_recognised(question: str, count: bool) -> None:
+    """Review round 2 M-B —— on a counting question each band is expected to see only part."""
+    assert is_count_question(question) is count

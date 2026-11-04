@@ -766,26 +766,46 @@ def _answer_gives(answer: str, reply: TileReply) -> bool:
     return _flat(reply.value) in _flat(answer)
 
 
+def _labelled_field(found: Sequence[TileResult]) -> TileResult | None:
+    """横条读到的、像「一个印着名字的字段」的那个值:恰好一条带字段名,或相邻两条在重叠处看到
+    同一行(R2)且至少一条带字段名。别的情形(没有字段名、隔开的几条、三条以上)都不算。"""
+    labelled = [r for r in found if r.reply is not None and r.reply.label]
+    if not labelled or not _one_row_seen_twice(found):
+        return None
+    return labelled[0]
+
+
 def decide_whole_question(
-    results: Sequence[TileResult], *, full_answer: str | None, full_error: str | None
+    results: Sequence[TileResult],
+    *,
+    full_answer: str | None,
+    full_error: str | None,
+    count_question: bool,
 ) -> AutoDecision:
-    """B-273 V1 —— 整体类问题(``question_scope``):以整张读为准,横条只用来标不确定。
+    """B-273 V1 —— 整体类问题(``question_scope``):以整张读为准,横条只用来提示一句。
 
     词表会把个别查值问题(名称里带「平均」「count」的测量项)误判成整体类问题;横条照样并行读
-    (与切条那条路同样的开销),于是误判只花措辞、不丢准确率:横条给出**一个**前后一致的值、而
-    整张读的回答里没有这个值 → 用整张读的回答、标不确定、附上横条的读数。横条之间互相冲突(各数
-    到自己那一截)正是整体类问题在横条上的样子,不标。整张读失败 → 照常走 :func:`decide_auto`。
+    (与切条那条路同样的开销)。但整体类问题上「一条横条报了自己那一截的数」是常态(E1:111 次里
+    45 次),所以只在下面三条同时成立时提示:不是计数类问题;横条给出**一个**前后一致的值、而且
+    是带字段名的那种(:func:`_labelled_field`);整张读的回答里没有这个值。提示的措辞中立 ——
+    不说哪一个更可能对,只说横条只看到一部分、要查印着的值就放大那个字段。整张读失败 → 照常走
+    :func:`decide_auto`。
     """
     if full_answer is None:
         return decide_auto(results, full_answer=full_answer, full_error=full_error)
     verdict = aggregate_tiles(results)
-    found = [r.reply for r in results if r.reply is not None and r.reply.status == "found"]
-    if verdict.outcome == "single" and not any(_answer_gives(full_answer, r) for r in found):
+    found = [r for r in results if r.reply is not None and r.reply.status == "found"]
+    field = _labelled_field(found) if verdict.outcome == "single" and not count_question else None
+    if (
+        field is not None
+        and field.reply is not None
+        and not _answer_gives(full_answer, field.reply)
+    ):
         content = (
-            f"{full_answer}\n\n(region='auto': read whole because the question looks like it is "
-            "about the whole image, but the answer is uncertain - the bands read a different "
-            "value, which is the answer if the question asks for one printed value. Band "
-            f"readings: {verdict.content})"
+            f"{full_answer}\n\n(region='auto': whole-image reading: the answer above. A band "
+            f"(which sees only part of the image) read field '{field.reply.label}' as "
+            f"{_display(field)} at region={list(field.tile.box)}. If the question asks for a "
+            "value printed in the image, check that field with a region zoom.)"
         )
         return AutoDecision("whole_question", "bands_disagree", content, verdict.outcome)
     content = (

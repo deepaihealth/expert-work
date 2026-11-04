@@ -101,18 +101,29 @@ def test_a_region_is_counted_apart_from_its_whole_page() -> None:
     assert "Not rendered: the region [0, 0, 500, 500] of unit 1 - already read 3" in plan.refused
 
 
-def test_a_documents_whole_pages_stop_at_twice_its_pages_plus_three() -> None:
-    """Two pages → at most 2 x 2 + 3 = 7 whole-page renders in the turn; crops do not count."""
+def test_a_first_read_is_never_refused_by_the_document_cap() -> None:
+    """Review round 2 M-A —— a 1-page docx whose figure map lists many figures: every figure's
+    first read must render (``pages`` is the converted PDF's page count, not the units)."""
+    ledger = _ledger(*[_page(u) for u in (3, 7, 12, 15, 20, 24)], pages=1)
+    assert _plan(ledger, [30, 33]) == ReadPlan((30, 33))
+
+
+def test_re_reads_stop_at_one_per_unit_read_plus_three() -> None:
+    """Six units read once, nine re-reads used (6 + 3): the next re-read is refused, a new
+    unit is not; crops do not count."""
+    first = [_page(u) for u in range(1, 7)]
+    again = [_page(u) for u in (1, 2, 3, 4, 5, 6, 1, 2, 3)]
     crops = [FigureRead(unit=1, region=(0, 0, 9 + i, 9)) for i in range(5)]
-    six = _ledger(*([_page(1), _page(2)] * 3), *crops, pages=2)
-    assert _plan(six, [3]) == ReadPlan((3,))
-    plan = _plan(six, [3, 4])
-    assert plan.units == (3,)
+    ledger = _ledger(*first, *again, *crops, pages=2)
+    plan = _plan(ledger, [4, 7])
+    assert plan.units == (7,)
     assert plan.refused is not None
-    assert (
-        "Not rendered: unit 4 - this document's pages were already rendered 6 times in this "
-        "task, the most allowed for its 2 pages."
-    ) in plan.refused
+    assert plan.refused.startswith(
+        "Not rendered: unit 4 - this document was already re-read 9 times in this task, the "
+        "most allowed after reading 6 of its units (one re-read per unit read, plus 3)."
+    )
+    assert _plan(ledger[:-6], [4]) == ReadPlan((4,))  # 8 re-reads so far: one more is allowed
+    assert _plan(ledger[:-6], [7, 4]) == ReadPlan((7, 4))  # a first read does not use the budget
 
 
 def test_a_one_page_scan_can_be_zoomed_several_times() -> None:

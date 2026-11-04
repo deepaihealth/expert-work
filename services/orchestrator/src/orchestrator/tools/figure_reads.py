@@ -10,12 +10,12 @@
   ``viewed_figures`` 跨轮累积,下一轮的正常重看不能被上一轮的次数挡住 —— 通道的 reducer
   (``state._merge_figure_reads``)只留最新那一轮的条目,别的轮的条目读的时候也不算。
 * 同一 ``(文档, 编号, 局部)`` 本轮已渲 :data:`FIGURE_READS_PER_ITEM` 次,再读就不渲;同一文档
-  的整页本轮渲染次数到 ``2 x 页数 + 3`` 不再渲;局部图另有每份文档
+  的整页**重看**到「读过的编号数 + 3」次不再渲(第一次读从不拒);局部图另有每份文档
   :data:`FIGURE_CROPS_PER_DOCUMENT` 张的预算(B-266 的放大局部要能用)。一次调用里只拒超了的
   编号,其余照渲;**整次都没渲**才计入防循环次数(``LOOP_TRIP_META_KEY``),
   ``DEFAULT_LOOP_TRIPS_PER_RUN`` 次后 run 收尾。依据:正常 run 每页最多重看 1 次,E2 里最后
   核对才到第 3 次。
-* 页数取自渲染片段回的 ``pages``(``pdfinfo``,拿不到就没有);没有页数就不按整页总数拒。
+* 页数取自渲染片段回的 ``pages``(``pdfinfo``,拿不到就没有),只用于超上限预告。
 * 给模型的话一律用 ``read_page`` 参数的叫法 ``unit``(docx 的 unit 是图清单编号,不是页号)。
 """
 
@@ -34,9 +34,10 @@ FIGURE_OTHER_PAGES_IN_VIEW: Final = 3
 FIGURE_CROPS_IN_VIEW: Final = 2
 #: 同一 ``(文档, 编号, 局部)`` 本轮最多渲几次;再读就拒绝。
 FIGURE_READS_PER_ITEM: Final = 3
-#: 同一文档本轮整页渲染次数上限 = ``页数 x _DOC_RENDERS_PER_PAGE + _DOC_RENDERS_SLACK``。
-_DOC_RENDERS_PER_PAGE: Final = 2
-_DOC_RENDERS_SLACK: Final = 3
+#: 同一文档本轮整页**重看**的上限 = 本轮读过的不同编号数 + ``_REREAD_SLACK``(第一次读一个编号
+#: 从不因为这条被拒)。按编号数而不按 PDF 页数:docx 的编号是图清单条目,一页 docx 可以有十几处图。
+#: 4 页 PDF 全读一遍时 = 4 + 7 次重看 = 11 次渲染,与方案的 ``2 x 页数 + 3`` 一致。
+_REREAD_SLACK: Final = 3
 #: 同一文档本轮局部图上限。12 = 一页密集文档按横条扫一遍(``region="auto"`` 最多 8 条)再加
 #: 4 张定点放大;一页扫描件「整页 + 4 张局部」远在其内。E2 里轮流挤整页的那两次是 16 / 17 张。
 FIGURE_CROPS_PER_DOCUMENT: Final = 12
@@ -158,20 +159,22 @@ def _times(entries: Sequence[_Entry], read: FigureRead) -> int:
 
 def _plan_pages(entries: Sequence[_Entry], units: Sequence[int]) -> ReadPlan:
     whole = [e for e in entries if e.read.region is None]
-    pages = _known_pages(entries)
-    left = (
-        None if pages is None else _DOC_RENDERS_PER_PAGE * pages + _DOC_RENDERS_SLACK - len(whole)
-    )
+    read_units = {e.read.unit for e in whole}
+    rereads = len(whole) - len(read_units)
+    budget = len(read_units) + _REREAD_SLACK
     allowed: list[int] = []
     repeated: list[int] = []
     over: list[int] = []
+    planned = rereads
     for unit in units:
-        if _times(whole, FigureRead(unit)) >= FIGURE_READS_PER_ITEM:
+        times = _times(whole, FigureRead(unit))
+        if times >= FIGURE_READS_PER_ITEM:
             repeated.append(unit)
-        elif left is not None and len(allowed) >= left:
+        elif times and planned >= budget:
             over.append(unit)
         else:
             allowed.append(unit)
+            planned += 1 if times else 0
     notes: list[str] = []
     if repeated:
         notes.append(
@@ -180,8 +183,9 @@ def _plan_pages(entries: Sequence[_Entry], units: Sequence[int]) -> ReadPlan:
         )
     if over:
         notes.append(
-            f"Not rendered: {_units(over)} - this document's pages were already rendered "
-            f"{len(whole)} times in this task, the most allowed for its {pages} pages."
+            f"Not rendered: {_units(over)} - this document was already re-read {rereads} times "
+            f"in this task, the most allowed after reading {len(read_units)} of its units (one "
+            f"re-read per unit read, plus {_REREAD_SLACK})."
         )
     return ReadPlan(tuple(allowed), " ".join([*notes, _REFUSAL_TAIL]) if notes else None)
 

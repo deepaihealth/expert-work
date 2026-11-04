@@ -71,7 +71,7 @@ from orchestrator.tools.figure_lookup import (
     resolve_rendered_figure,
 )
 from orchestrator.tools.file_ops import _require_path
-from orchestrator.tools.question_scope import is_whole_image_question
+from orchestrator.tools.question_scope import is_count_question, is_whole_image_question
 from orchestrator.tools.read_page import (
     RENDER_DPI,
     RegionCrop,
@@ -604,9 +604,16 @@ class AskImageTool:
                 raise first
             msg = "ask_image region='auto' could not look at this image at all"
             raise RuntimeError(msg)
-        # B-273 V1 —— 整体类问题以整张读为准,横条只用来标不确定(见 decide_whole_question)。
-        decide = decide_whole_question if is_whole_image_question(question) else decide_auto
-        decision = decide(results, full_answer=full_answer, full_error=full_error)
+        # B-273 V1 —— 整体类问题以整张读为准,横条只用来提示一句(见 decide_whole_question)。
+        if is_whole_image_question(question):
+            decision = decide_whole_question(
+                results,
+                full_answer=full_answer,
+                full_error=full_error,
+                count_question=is_count_question(question),
+            )
+        else:
+            decision = decide_auto(results, full_answer=full_answer, full_error=full_error)
         ask_image_region_auto_total.labels(path=decision.path, reason=decision.reason).inc()
         meta.update(
             {
