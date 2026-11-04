@@ -48,6 +48,7 @@ from control_plane.api._authz import (
 )
 from control_plane.api._quota_admission import check_admission
 from control_plane.api._run_event_stream import build_event_producer, make_run_probe
+from control_plane.api._run_progress import run_info_fields
 from control_plane.api._run_usage import make_usage_loader
 from control_plane.api._session_title import title_from_text
 from control_plane.api._user_scope import (
@@ -90,6 +91,7 @@ from control_plane.thread_queue import (
     Admission,
     ThreadQueueFullError,
     admit,
+    ahead_fields,
     queued_turn_stream,
 )
 from control_plane.transcript import extract_turns, read_messages
@@ -1470,6 +1472,11 @@ async def spawn_run(
                 "thread_id": str(thread_id),
                 "status": "queued",
             }
+            # B-269 —— 前面还有没结束的轮时才带(空闲会话的 202 与幂等重放同形)。
+            if queued_behind is not None:
+                content["ahead"] = queued_behind.ahead
+                if queued_behind.head is not None:
+                    content.update(ahead_fields(queued_behind.head))
             if envelope:
                 content = {"success": True, "data": content, "error": None}
             return JSONResponse(status_code=202, content=content)
@@ -1587,6 +1594,7 @@ async def spawn_run(
                 owner=runtime.run_manager.instance_id,
                 lease_ttl_s=runtime.run_manager.lease_ttl_s,
                 ahead=queued_behind.ahead,
+                ahead_run=queued_behind.head,
                 launch=_launch,
                 is_disconnected=request.is_disconnected,
                 cancel_on_disconnect=on_disconnect is DisconnectMode.CANCEL,
@@ -1963,6 +1971,7 @@ def build_runs_router() -> APIRouter:
         token_usage: Annotated[TokenUsageStore, Depends(_get_token_usage_store)],
         memory_jobs: Annotated[MemoryWritebackJobStore, Depends(_get_memory_writeback_jobs)],
         audit: Annotated[AuditLogger, Depends(_get_audit)],
+        events: Annotated[RunEventStore | None, Depends(_get_run_event_store)],
         # W2 read scope — a concrete id lets a system_admin drill into a
         # foreign tenant's run from the tenant switcher; "*" is meaningless
         # (a run belongs to one tenant).
@@ -2057,6 +2066,12 @@ def build_runs_router() -> APIRouter:
             # 控制台的轨迹从这里拼「后台记忆写回」那一行。本接口 ``console_only``,
             # API Key 平面看不到。
             memory_job = await memory_jobs.get_by_run(tenant_id=target_tenant, run_id=run_id)
+            # B-269 / B-270 —— 开始时刻、心跳、排在谁后面、进度(只认 durable 行)。
+            run_fields = (
+                (await run_info_fields(runs=runs, events=events, rows=[persisted]))[run_id]
+                if persisted is not None
+                else {}
+            )
         return JSONResponse(
             content={
                 "run_id": str(run_id),
@@ -2094,6 +2109,7 @@ def build_runs_router() -> APIRouter:
                     if persisted is not None and persisted.finished_at is not None
                     else None
                 ),
+                **run_fields,
             }
         )
 
@@ -2336,6 +2352,7 @@ def build_runs_router() -> APIRouter:
         runs: Annotated[RunStore, Depends(_get_run_store)],
         token_usage: Annotated[TokenUsageStore, Depends(_get_token_usage_store)],
         audit: Annotated[AuditLogger, Depends(_get_audit)],
+        events: Annotated[RunEventStore | None, Depends(_get_run_event_store)],
         tenant_id: Annotated[UUID | None, Query()] = None,
     ) -> JSONResponse:
         """Playground history reconstruction — the thread's runs, oldest-first.
@@ -2395,6 +2412,14 @@ def build_runs_router() -> APIRouter:
             except Exception:
                 logger.warning("thread_runs.tokens_failed", exc_info=True)
                 by_trace = {}
+            # B-269 / B-270 —— same isolation as tokens: a failure blanks these
+            # fields only, never the run list.
+            run_fields: dict[UUID, dict[str, Any]] = {}
+            try:
+                async with applied_scope(scope):
+                    run_fields = await run_info_fields(runs=runs, events=events, rows=rows)
+            except Exception:
+                logger.warning("thread_runs.progress_failed", exc_info=True)
             out = [
                 {
                     "run_id": str(r.run_id),
@@ -2427,6 +2452,7 @@ def build_runs_router() -> APIRouter:
                     "tokens": _tokens_to_dict(
                         by_trace.get(r.trace_id) if r.trace_id is not None else None
                     ),
+                    **run_fields.get(r.run_id, {}),
                 }
                 for r in rows
             ]
@@ -2893,6 +2919,7 @@ def build_runs_list_router() -> APIRouter:
         threads: Annotated[ThreadMetaStore, Depends(_get_thread_repo)],
         token_usage: Annotated[TokenUsageStore, Depends(_get_token_usage_store)],
         audit: Annotated[AuditLogger, Depends(_get_audit)],
+        events: Annotated[RunEventStore | None, Depends(_get_run_event_store)],
         status: Annotated[RunStatus | None, Query()] = None,
         agent_name: Annotated[str | None, Query(min_length=1)] = None,
         agent_version: Annotated[str | None, Query(min_length=1)] = None,
@@ -3004,14 +3031,19 @@ def build_runs_list_router() -> APIRouter:
                 if trace_ids
                 else {}
             )
+            # B-269 / B-270 —— 一个会话一次排队查询、整页一次进度聚合。
+            run_fields = await run_info_fields(runs=runs, events=events, rows=items)
 
         items_json = [
-            _run_to_dict(
-                i,
-                agent_name=agents_by_thread[i.thread_id][0],
-                agent_version=agents_by_thread[i.thread_id][1],
-                tokens=tokens_by_trace.get(i.trace_id) if i.trace_id else None,
-            )
+            {
+                **_run_to_dict(
+                    i,
+                    agent_name=agents_by_thread[i.thread_id][0],
+                    agent_version=agents_by_thread[i.thread_id][1],
+                    tokens=tokens_by_trace.get(i.trace_id) if i.trace_id else None,
+                ),
+                **run_fields[i.run_id],
+            }
             for i in items
         ]
 

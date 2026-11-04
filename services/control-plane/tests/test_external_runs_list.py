@@ -434,6 +434,12 @@ async def test_response_shape_is_a_whitelist(ctx: _Ctx) -> None:
             "completed",
             "exit_reason",
             "unresolved_failures",
+            # B-269 / B-270 —— 这一行是还在排队的 run:开始时刻(没开始 = null)、
+            # 心跳、排在谁后面、进度。终态行只多 ``started_at``(另有测试钉住)。
+            "started_at",
+            "heartbeat_at",
+            "queued_behind",
+            "progress",
         }
 
 

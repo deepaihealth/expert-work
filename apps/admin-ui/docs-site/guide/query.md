@@ -302,12 +302,35 @@ GET /v1/agents/{agent_code}/runs
 | `completed` | boolean \| null | 这次 run 有没有把要做的事做成，与 [3.4 的 `end`](./sse-events#end) 里的同名字段相同。`null` 表示没有记录，多见于失败、被取消、还没结束的 run 与平台升级前的历史 run，不要当成 `false` |
 | `exit_reason` | string \| null | 这次 run 从哪个出口结束，`null` 的含义与 `completed` 相同。取值：`text_response`（助手自然说完）/ `max_steps`（步数用完）/ `no_progress`（反复原地打转）/ `token_budget`（token 预算用完）/ `approval_pending`（停在人工审批处）/ `approval_rejected`（审批被拒绝）；遇到不认识的取值时按「没有正常完成」处理 |
 | `unresolved_failures` | array \| null | 因为工具失败没做成时，是哪些工具。元素结构与 [3.4 的 `end`](./sse-events#end) 里的同名字段相同（`{tool, kind}`，最多 20 个）；`[]` 表示没有。`null` 表示没有记录，按「不清楚」处理，平台升级前的历史 run 可能 `completed` 有值而这里是 `null` |
+| `started_at` | string（ISO 8601） \| null | 开始执行的时间。还没开始执行，或者是平台升级前的历史 run 时为 `null`；执行中途改由另一个服务端实例接手时不变 |
+| `heartbeat_at` | string（ISO 8601） \| null | 只在还没有进入最终状态的 run 上出现：执行这次 run 的服务端实例最近一次确认自己仍在执行的时间；还没开始执行时为 `null` |
+| `queued_behind` | object \| null | 只在 `status` 为 `queued` 的 run 上出现：同一段会话里挡在它前面的那一轮，`{run_id, status, started_at}`，字段含义与 [`queued` 事件](./sse-events#queued) 的 `ahead_run_id`、`ahead_status`、`ahead_started_at` 相同。为 `null` 有两种情况：前面已经没有没结束的 run、这一轮即将开始执行；或者挡在前面的是同一会话里另一个用户（例如管理员在后台）发起的 run，这时不列出它的信息。`queued` 事件与 202 响应里的 `ahead_*` 不做这层过滤 |
+| `progress` | object | 只在还没有进入最终状态的 run 上出现：执行进度，字段见下文 |
 
 `status` 说的是这次 run 怎么结束的，`completed` 说的是要做的事做成了没有，`unresolved_failures` 说的是因为工具失败没做成时，是哪些工具。步数用完的 run 是 `status` 为 `incomplete`、`completed` 为 `false`，读法见 [3.4 的 `end`](./sse-events#end)。没有记录时，这三个字段在 `end` 事件里不出现，在这里是 `null`。
 
 这三个字段不一定同时有记录：平台升级前结束的历史 run 可能 `completed` 与 `exit_reason` 有值，`unresolved_failures` 却是 `null`。这时不清楚是哪些工具失败，不要当成 `[]`，也不要据此认为没有工具失败。
 
 停在人工审批处的 run 因同一会话发起新一轮而变为 `interrupted` 时，不是 `null`，而是保留 `completed` 为 `false`、`exit_reason` 为 `approval_pending`，见 [4.2 决策之前发起新一轮](./run-control#决策之前发起新一轮)。
+
+#### progress 的字段
+
+`progress` 由服务端按这次 run 已经记录的事件算出，只有计数和名称，不含对话内容、工具参数或工具结果。每次查询都重新计算，轮询这个接口即可看到进度变化。
+
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| `elapsed_s` | integer \| null | 从开始执行到这次查询经过的秒数；还没开始执行时为 `null` |
+| `step` | integer | Agent 已经走到第几步，每次思考并决定下一步算一步；还没有走完第一步时为 `0` |
+| `tool_calls` | integer | 到目前为止已经拿到结果的工具调用次数，不含子任务内部的工具调用 |
+| `active_workers` | integer | 正在执行的子任务个数 |
+| `current` | object \| null | 最近完成的一步，`{node, tool}`；还没有完成任何一步时为 `null`。两个字段的取值见下文 |
+| `last_event_at` | string（ISO 8601） \| null | 服务端最近一次记录这次 run 的事件的时间；还没有事件时为 `null` |
+| `plan_done` | integer | 只在这次 run 有计划时出现：最新一份计划里已完成的步骤数 |
+| `plan_total` | integer | 只在这次 run 有计划时出现：最新一份计划的步骤总数 |
+
+`current.node` 是最近完成的那一步的类别，开放取值，当前常见：`agent`（Agent 思考并决定下一步）/ `tools`（执行工具）；遇到未知值时按「平台的准备或收尾步骤」显示。`current.tool` 是那一步发起的最后一个工具调用的工具名，这个工具通常正在执行；那一步没有发起工具调用时为 `null`。
+
+`heartbeat_at` 持续更新、`last_event_at` 长时间不变，通常说明当前这一步耗时较长，例如一次运行时间较长的工具调用。两者都长时间不变时，执行这次 run 的服务端实例可能已经失联，平台会自动改由另一个实例接手。
 
 ### 示例
 
@@ -338,7 +361,59 @@ curl "https://<your-domain>/v1/agents/{agent_code}/runs?user_id=u-123&limit=20" 
         ],
         "completed": true,
         "exit_reason": "text_response",
-        "unresolved_failures": []
+        "unresolved_failures": [],
+        "started_at": "2026-08-12T10:00:00+00:00"
+      },
+      {
+        "run_id": "5b1d2e7a-8c3f-4a90-b6e4-1f0a9d2c7e58",
+        "session_id": "9f2c1a44-6d3b-4f18-9a70-2b5c8e1d0c37",
+        "status": "running",
+        "created_at": "2026-08-12T10:05:00+00:00",
+        "finished_at": null,
+        "error": null,
+        "artifacts": null,
+        "completed": null,
+        "exit_reason": null,
+        "unresolved_failures": null,
+        "started_at": "2026-08-12T10:05:01+00:00",
+        "heartbeat_at": "2026-08-12T10:17:31+00:00",
+        "progress": {
+          "elapsed_s": 754,
+          "step": 12,
+          "tool_calls": 30,
+          "active_workers": 2,
+          "current": { "node": "agent", "tool": "web_search" },
+          "last_event_at": "2026-08-12T10:17:20+00:00",
+          "plan_done": 2,
+          "plan_total": 5
+        }
+      },
+      {
+        "run_id": "c4a7e2b9-1d58-4f36-8e0c-7b29a5f1d603",
+        "session_id": "9f2c1a44-6d3b-4f18-9a70-2b5c8e1d0c37",
+        "status": "queued",
+        "created_at": "2026-08-12T10:10:00+00:00",
+        "finished_at": null,
+        "error": null,
+        "artifacts": null,
+        "completed": null,
+        "exit_reason": null,
+        "unresolved_failures": null,
+        "started_at": null,
+        "heartbeat_at": null,
+        "queued_behind": {
+          "run_id": "5b1d2e7a-8c3f-4a90-b6e4-1f0a9d2c7e58",
+          "status": "running",
+          "started_at": "2026-08-12T10:05:01+00:00"
+        },
+        "progress": {
+          "elapsed_s": null,
+          "step": 0,
+          "tool_calls": 0,
+          "active_workers": 0,
+          "current": null,
+          "last_event_at": null
+        }
       }
     ],
     "limit": 20,

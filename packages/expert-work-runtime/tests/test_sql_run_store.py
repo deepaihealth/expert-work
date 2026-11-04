@@ -1190,3 +1190,29 @@ async def test_thread_queue_sql(
 ) -> None:
     for scenario in thread_queue_scenarios:
         await scenario(run_store)
+
+
+@pytest.mark.asyncio
+async def test_started_at_sql(
+    run_store: SqlRunStore,
+    started_at_contract: Callable[[RunStore], Awaitable[None]],
+) -> None:
+    """B-269 —— 与内存版同一份契约:第一次进 RUNNING 写、之后不覆盖。"""
+    await started_at_contract(run_store)
+
+
+@pytest.mark.asyncio
+async def test_progress_for_runs_sql(
+    run_store: SqlRunStore,
+    run_event_store: SqlRunEventStore,
+    progress_contract: Callable[..., Awaitable[None]],
+) -> None:
+    """B-270 —— 与内存版同一份契约:一条聚合查询算出的计数逐项同义。"""
+    tenant_id = uuid4()
+    run_ids = tuple(uuid4() for _ in range(6))
+    for run_id in run_ids:
+        await run_store.create(_info(run_id=run_id, tenant_id=tenant_id))
+    await progress_contract(run_event_store, run_ids=run_ids, tenant_id=tenant_id)
+    # 租户过滤写在查询里,不靠 RLS(运行期连接是超级用户,RLS 不生效):
+    # 别的租户拿同一批 run id 查不到任何东西。
+    assert await run_event_store.progress_for_runs(list(run_ids), tenant_id=uuid4()) == {}
