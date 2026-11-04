@@ -306,6 +306,10 @@ class RunInfo:
     superseded_by_run_id: UUID | None = None
     #: P-1 —— 这一轮是对哪个旧 run 的重新生成 / 编辑重发;``None`` = 普通轮。
     regenerated_from_run_id: UUID | None = None
+    #: B-269 —— 第一次进 RUNNING 的时刻(``set_status`` / ``claim_queued`` 写
+    #: ``COALESCE(started_at, …)``:孤儿接管、审批续跑都不覆盖)。``None`` = 还没
+    #: 开始执行,或这一列上线前的老 run(不回填)。
+    started_at: datetime | None = None
 
 
 @dataclass(frozen=True, slots=True)

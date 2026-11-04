@@ -155,8 +155,28 @@ sequenceDiagram
 
 同一段会话里的各轮**依次执行，不会同时执行**。上一轮还在执行或还在排队时再发一轮，平台照常受理，这一轮排在后面，前面的都结束后自动开始：
 
-- `stream` 模式：连接立即建立，先收到一个 [`queued`](./sse-events#queued) 事件，`data.ahead` 是前面还有几轮没结束；排队期间照常每 15 秒一行心跳；轮到它时照常从 `metadata` 开始，直到 `end`。
-- `queue` 模式：照旧立即返回 202，`status` 为 `queued`，前面的都结束后才开始执行。
+- `stream` 模式：连接立即建立，先收到一个 [`queued`](./sse-events#queued) 事件，`data.ahead` 是前面还有几轮没结束，`ahead_run_id`、`ahead_status`、`ahead_started_at` 说明挡在前面的是哪一轮、从什么时候开始执行；排队期间照常每 15 秒一行心跳；轮到它时照常从 `metadata` 开始，直到 `end`。
+- `queue` 模式：照旧立即返回 202，`status` 为 `queued`，前面的都结束后才开始执行。响应体另外带 `ahead` 与上面同样三个字段，示例见下。
+
+```json [响应 202]
+{
+  "success": true,
+  "data": {
+    "run_id": "7c9e6679-7425-40de-944b-e07fc1f90ae7",
+    "thread_id": "3f2b8a1e-0c4d-4b7a-9e21-5d6f7a8b9c0d",
+    "status": "queued",
+    "ahead": 1,
+    "ahead_run_id": "5b1d2e7a-8c3f-4a90-b6e4-1f0a9d2c7e58",
+    "ahead_status": "running",
+    "ahead_started_at": "2026-11-04T10:00:00+00:00"
+  },
+  "error": null
+}
+```
+
+会话空闲时 202 的响应体只有 `run_id`、`thread_id`、`status` 三个字段。
+
+排队期间要查看前面那一轮执行了多久、进行到哪一步，读 [5.4 run 列表](./query#_5-4-run-列表)：排队中的 run 带 `queued_behind`，还在执行的 run 带 `started_at` 与 `progress`。
 
 几条边界：
 

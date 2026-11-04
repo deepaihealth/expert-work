@@ -20,6 +20,18 @@ import type { ApprovalItem } from "../../../api/approvals";
 import type { Turn } from "../../turn/types";
 import type { LiveStep } from "../../../pages/agent_detail/playground/useTokenStream";
 
+// B-269 / B-270 —— a running turn with a run id mounts the answer bubble's
+// progress poller (``useRunProgress``): no TenantScopeProvider here and no
+// network — the run read never resolves, so the bubble keeps its plain text.
+vi.mock("../../../tenant/TenantScopeContext", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../../../tenant/TenantScopeContext")>()),
+  useTenantScope: () => ({ scope: "home", setScope: () => {}, apiTenantScope: undefined }),
+}));
+vi.mock("../../../api/runs", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../../../api/runs")>()),
+  getRun: vi.fn(() => new Promise(() => {})),
+}));
+
 function ev(event: string, data: unknown): SseEvent {
   return { id: null, event, data, rawData: "", receivedAt: "" };
 }

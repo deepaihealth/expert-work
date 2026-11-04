@@ -1190,3 +1190,25 @@ async def test_thread_queue_sql(
 ) -> None:
     for scenario in thread_queue_scenarios:
         await scenario(run_store)
+
+
+@pytest.mark.asyncio
+async def test_started_at_sql(
+    run_store: SqlRunStore,
+    started_at_contract: Callable[[RunStore], Awaitable[None]],
+) -> None:
+    """B-269 —— 与内存版同一份契约:第一次进 RUNNING 写、之后不覆盖。"""
+    await started_at_contract(run_store)
+
+
+@pytest.mark.asyncio
+async def test_progress_for_runs_sql(
+    run_store: SqlRunStore,
+    run_event_store: SqlRunEventStore,
+    progress_contract: Callable[..., Awaitable[None]],
+) -> None:
+    """B-270 —— 与内存版同一份契约:一条聚合查询算出的计数逐项同义。"""
+    run_ids = (uuid4(), uuid4(), uuid4())
+    for run_id in run_ids:
+        await run_store.create(_info(run_id=run_id, tenant_id=uuid4()))
+    await progress_contract(run_event_store, run_ids=run_ids)

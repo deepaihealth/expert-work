@@ -760,6 +760,12 @@ class InMemoryRunStore(RunStore):
             row,
             status=status,
             updated_at=updated_at,
+            # B-269 —— 与 SQL 店同义:第一次进 RUNNING 才写。
+            started_at=(
+                updated_at
+                if status is RunStatus.RUNNING and row.started_at is None
+                else row.started_at
+            ),
             error=error if error is not None else row.error,
             finished_at=finished_at if finished_at is not None else row.finished_at,
             # 谓词与 SQL 店 byte-同义:None 不碰既有清单(非终局转换)。
@@ -1205,6 +1211,7 @@ class InMemoryRunStore(RunStore):
             claimed_by=new_owner,
             lease_until=lease_until,
             heartbeat_at=heartbeat_at,
+            started_at=row.started_at if row.started_at is not None else heartbeat_at,
         )
         self._rows[run_id] = claimed
         return claimed
@@ -1277,6 +1284,7 @@ def _row_to_dto(row: AgentRunRow) -> RunInfo:
         agent_spec_sha256=row.agent_spec_sha256,
         superseded_by_run_id=row.superseded_by_run_id,
         regenerated_from_run_id=row.regenerated_from_run_id,
+        started_at=row.started_at,
     )
 
 
@@ -1348,6 +1356,7 @@ class SqlRunStore(RunStore):
                     agent_spec_sha256=info.agent_spec_sha256,
                     superseded_by_run_id=info.superseded_by_run_id,
                     regenerated_from_run_id=info.regenerated_from_run_id,
+                    started_at=info.started_at,
                 )
             )
             try:
@@ -1379,6 +1388,9 @@ class SqlRunStore(RunStore):
         guard_claimed_by: str | None = None,
     ) -> bool:
         values: dict[str, Any] = {"status": status.value, "updated_at": updated_at}
+        if status is RunStatus.RUNNING:
+            # B-269 —— 第一次进 RUNNING 才写;孤儿接管后重跑、审批续跑都不覆盖。
+            values["started_at"] = func.coalesce(AgentRunRow.started_at, updated_at)
         if error is not None:
             values["error"] = error
         if finished_at is not None:
@@ -1987,6 +1999,7 @@ class SqlRunStore(RunStore):
                     claimed_by=new_owner,
                     lease_until=lease_until,
                     heartbeat_at=heartbeat_at,
+                    started_at=func.coalesce(AgentRunRow.started_at, heartbeat_at),
                 )
                 .returning(AgentRunRow)
             )

@@ -1923,6 +1923,13 @@ export interface TranslationKeys {
     transcript_label: string;
     turn_running: string;
     turn_queued: string;
+    turn_queued_behind_minutes: string;
+    turn_queued_behind_under_minute: string;
+    progress_elapsed_minutes: string;
+    progress_elapsed_under_minute: string;
+    progress_step: string;
+    progress_tool_calls: string;
+    progress_workers: string;
     cancel_queued: string;
     thread_queue_full: string;
     turn_no_text: string;
@@ -5782,6 +5789,13 @@ const en: TranslationKeys = {
     transcript_label: "Conversation",
     turn_running: "Running…",
     turn_queued: "Queued — starts when the previous turn finishes",
+    turn_queued_behind_minutes: "Queued — the previous turn has been running for {{n}} min",
+    turn_queued_behind_under_minute: "Queued — the previous turn has been running for under a minute",
+    progress_elapsed_minutes: "Running for {{n}} min",
+    progress_elapsed_under_minute: "Running for under a minute",
+    progress_step: "step {{n}}",
+    progress_tool_calls: "{{n}} tool calls",
+    progress_workers: "{{n}} subtasks running",
     cancel_queued: "Cancel",
     thread_queue_full: "This conversation's queue is full. Wait for a turn to finish or cancel one, then send again.",
     turn_no_text: "(no text answer)",

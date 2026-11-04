@@ -25,6 +25,7 @@ import {
   FullTextTrigger,
   type FullTextState,
 } from "../turn/FullTextModal";
+import { QueuedLabel, RunningProgressLine } from "./RunProgressNote";
 import type { ConsoleTurn } from "./types";
 
 const { Text } = Typography;
@@ -40,6 +41,8 @@ export interface AnswerBubbleProps {
   onDownloadArtifact: (name: string, version?: number) => Promise<void>;
   /** B-139 —— 排队中这一轮的「取消排队」;不传 = 不出按钮(只读视图)。 */
   onCancelQueued?: () => void;
+  /** B-269 / B-270 —— 有它(且这一轮有 run id)才去读排队 / 进度信息。 */
+  threadId?: string | null;
 }
 
 export function AnswerBubble({
@@ -48,6 +51,7 @@ export function AnswerBubble({
   liveText,
   onDownloadArtifact,
   onCancelQueued,
+  threadId = null,
 }: AnswerBubbleProps) {
   const { t } = useTranslation();
   const status = turn.turn.status;
@@ -110,7 +114,7 @@ export function AnswerBubble({
           style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}
           data-testid="console-turn-queued"
         >
-          <Text style={{ fontSize: 13 }}>{t("playground.turn_queued")}</Text>
+          <QueuedLabel turn={turn} threadId={threadId} />
           {onCancelQueued && (
             <Button size="small" onClick={onCancelQueued} data-testid="console-cancel-queued">
               {t("playground.cancel_queued")}
@@ -214,6 +218,10 @@ export function AnswerBubble({
           {t("playground.turn_no_text")}
         </Text>
       ) : null}
+
+      {status === "running" && !turn.queued && threadId && turn.runId && (
+        <RunningProgressLine threadId={threadId} runId={turn.runId} />
+      )}
 
       {artifacts.length > 0 && (
         <div

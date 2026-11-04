@@ -99,6 +99,28 @@ export interface MemoryWritebackResult {
   exec_ms: number | null;
 }
 
+/** B-270 —— 非终态 run 的进度(只有计数与节点 / 工具名,不含内容)。 */
+export interface RunProgress {
+  /** 从开始执行算起的秒数;还没开始执行 = ``null``。 */
+  elapsed_s: number | null;
+  step: number;
+  tool_calls: number;
+  active_workers: number;
+  current: { node: string; tool: string | null } | null;
+  last_event_at: string | null;
+  /** 这一轮有计划时才有。 */
+  plan_done?: number;
+  plan_total?: number;
+}
+
+/** B-269 —— 排队中的 run 排在谁后面。 */
+export interface QueuedBehind {
+  run_id: string;
+  status: string;
+  /** 那一轮开始执行的时刻;还没开始 = ``null``。 */
+  started_at: string | null;
+}
+
 export interface RunDetail {
   run_id: string;
   thread_id: string;
@@ -132,6 +154,14 @@ export interface RunDetail {
   exit_reason?: string | null;
   /** B-226 ⑥ — why not done: ``[{tool, kind}]``; ``null`` / absent = no record. */
   unresolved_failures?: UnresolvedFailure[] | null;
+  /** B-269 —— 开始执行的时刻(``null`` = 还没开始 / 老 run);老后端没有。 */
+  started_at?: string | null;
+  /** B-269 —— 非终态才有:执行者最后一次续约。 */
+  heartbeat_at?: string | null;
+  /** B-269 —— ``queued`` 才有;前面没人 = ``null``。 */
+  queued_behind?: QueuedBehind | null;
+  /** B-270 —— 非终态才有。 */
+  progress?: RunProgress;
 }
 
 /** Raw (no envelope) fetch — runs.py historically returns the run

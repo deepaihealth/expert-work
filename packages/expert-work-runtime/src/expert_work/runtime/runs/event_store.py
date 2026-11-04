@@ -33,7 +33,9 @@ from datetime import UTC, datetime
 from typing import Any
 from uuid import UUID
 
-from sqlalchemy import delete, func, select
+from sqlalchemy import bindparam, delete, func, select, text
+from sqlalchemy.dialects.postgresql import ARRAY
+from sqlalchemy.dialects.postgresql import UUID as PG_UUID
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from expert_work.persistence.models.run_event import RunEventRow
@@ -61,6 +63,38 @@ class RunEventRecord:
     #: format so the client parser doesn't distinguish live vs replay).
     created_at_ms: int
     created_at: datetime
+
+
+@dataclass(frozen=True, slots=True)
+class RunProgressCounts:
+    """B-270 —— one run's progress, aggregated from its persisted frames.
+
+    Counts and node / tool names only, never content (no message text, no
+    arguments, no tool results, no plan wording). Definitions, identical in
+    both stores:
+
+    * ``step`` — the largest ``updates.agent.step_count``; ``None`` = no agent
+      step persisted yet.
+    * ``tool_calls`` — tool results so far: ``type == "tool"`` messages in
+      ``updates.tools`` frames.
+    * ``active_workers`` — distinct ``worker`` ids with a ``start`` frame minus
+      those with an ``end`` frame, floored at 0.
+    * ``current_node`` / ``current_tool`` — the latest ``updates`` frame: its node
+      (the smallest key) and the last tool call its last message requested
+      (``None`` when it requested none).
+    * ``last_event_at`` — the newest frame of any kind.
+    * ``plan_done`` / ``plan_total`` — the latest ``plan`` frame's ``completed``
+      steps / all steps; ``None`` = no plan frame in this run.
+    """
+
+    step: int | None
+    tool_calls: int
+    active_workers: int
+    current_node: str | None
+    current_tool: str | None
+    last_event_at: datetime
+    plan_done: int | None
+    plan_total: int | None
 
 
 class RunEventStore(abc.ABC):
@@ -135,6 +169,17 @@ class RunEventStore(abc.ABC):
         Tenant scoping is enforced by RLS on the underlying table (the
         policy joins ``agent_run.tenant_id = current_setting('app.tenant_id')``),
         so a cross-tenant probe returns an empty list rather than raising.
+        """
+
+    @abc.abstractmethod
+    async def progress_for_runs(self, run_ids: Sequence[UUID]) -> dict[UUID, RunProgressCounts]:
+        """B-270 —— :class:`RunProgressCounts` for each run in ``run_ids``.
+
+        One aggregate per call (the SQL store reads ``run_event`` by its
+        ``(run_id, seq)`` primary key in a single statement), so a run list
+        computes every row's progress without N+1. A run with no persisted
+        frame is absent from the result; empty input → ``{}``. Tenant scoping
+        rides on RLS, as for :meth:`list`.
         """
 
     @abc.abstractmethod
@@ -222,11 +267,78 @@ class InMemoryRunEventStore(RunEventStore):
         filtered.sort(key=lambda r: r.seq)
         return filtered[:clamped]
 
+    async def progress_for_runs(self, run_ids: Sequence[UUID]) -> dict[UUID, RunProgressCounts]:
+        # 口径与 :class:`SqlRunEventStore` 的那条聚合逐项同义(共用契约钉住)。
+        out: dict[UUID, RunProgressCounts] = {}
+        for rid in dict.fromkeys(run_ids):
+            rows = self._events.get(rid)
+            if rows:
+                out[rid] = _progress_of(sorted(rows, key=lambda r: r.seq))
+        return out
+
     async def delete_for_runs(self, *, run_ids: Sequence[UUID]) -> int:
         removed = 0
         for rid in run_ids:
             removed += len(self._events.pop(rid, []))
         return removed
+
+
+#: B-270 —— one statement for every run in ``:ids``. ``agg`` scans each run's
+#: frames once through the ``(run_id, seq)`` primary key; the two LATERALs then
+#: fetch the latest ``updates`` / ``plan`` frame by that same key. Only counts and
+#: node / tool names leave the database — never message, argument or plan text.
+#: Same definitions as :func:`_progress_of` (the in-memory twin).
+_PROGRESS_SQL = text(
+    """
+    WITH agg AS (
+        SELECT
+            e.run_id,
+            max(e.created_at) AS last_event_at,
+            max(((e.data -> 'agent' ->> 'step_count')::numeric)::int) FILTER (
+                WHERE e.event_name = 'updates'
+                AND jsonb_typeof(e.data -> 'agent' -> 'step_count') = 'number'
+            ) AS step,
+            coalesce(sum(jsonb_array_length(jsonb_path_query_array(
+                e.data, '$.tools.messages[*] ? (@.type == "tool")'
+            ))) FILTER (WHERE e.event_name = 'updates'), 0) AS tool_calls,
+            count(DISTINCT e.data ->> 'worker_id') FILTER (
+                WHERE e.event_name = 'worker' AND e.data ->> 'kind' = 'start'
+            ) AS workers_started,
+            count(DISTINCT e.data ->> 'worker_id') FILTER (
+                WHERE e.event_name = 'worker' AND e.data ->> 'kind' = 'end'
+            ) AS workers_ended,
+            max(e.seq) FILTER (
+                WHERE e.event_name = 'updates'
+                AND jsonb_typeof(e.data) = 'object'
+                AND e.data <> '{}'::jsonb
+            ) AS updates_seq,
+            max(e.seq) FILTER (WHERE e.event_name = 'plan') AS plan_seq
+        FROM run_event e
+        WHERE e.run_id = ANY(:ids)
+        GROUP BY e.run_id
+    )
+    SELECT
+        agg.run_id, agg.last_event_at, agg.step, agg.tool_calls,
+        agg.workers_started, agg.workers_ended,
+        cur.node AS current_node,
+        cur.data -> cur.node -> 'messages' -> -1 -> 'tool_calls' -> -1 ->> 'name'
+            AS current_tool,
+        CASE WHEN jsonb_typeof(pl.data -> 'steps') = 'array' THEN jsonb_array_length(
+            jsonb_path_query_array(pl.data, '$.steps[*] ? (@.status == "completed")')
+        ) END AS plan_done,
+        CASE WHEN jsonb_typeof(pl.data -> 'steps') = 'array'
+            THEN jsonb_array_length(pl.data -> 'steps') END AS plan_total
+    FROM agg
+    LEFT JOIN LATERAL (
+        SELECT u.data, (SELECT min(k) FROM jsonb_object_keys(u.data) AS k) AS node
+        FROM run_event u
+        WHERE u.run_id = agg.run_id AND u.seq = agg.updates_seq
+    ) cur ON true
+    LEFT JOIN LATERAL (
+        SELECT p.data FROM run_event p WHERE p.run_id = agg.run_id AND p.seq = agg.plan_seq
+    ) pl ON true
+    """
+)
 
 
 class SqlRunEventStore(RunEventStore):
@@ -301,6 +413,28 @@ class SqlRunEventStore(RunEventStore):
             rows = (await session.execute(stmt)).scalars().all()
         return [_row_to_record(r) for r in rows]
 
+    async def progress_for_runs(self, run_ids: Sequence[UUID]) -> dict[UUID, RunProgressCounts]:
+        if not run_ids:
+            return {}
+        stmt = _PROGRESS_SQL.bindparams(
+            bindparam("ids", value=list(dict.fromkeys(run_ids)), type_=ARRAY(PG_UUID(as_uuid=True)))
+        )
+        async with self._sf() as session:
+            rows = (await session.execute(stmt)).mappings().all()
+        return {
+            row["run_id"]: RunProgressCounts(
+                step=row["step"],
+                tool_calls=int(row["tool_calls"]),
+                active_workers=max(0, int(row["workers_started"]) - int(row["workers_ended"])),
+                current_node=row["current_node"],
+                current_tool=row["current_tool"],
+                last_event_at=row["last_event_at"],
+                plan_done=row["plan_done"],
+                plan_total=row["plan_total"],
+            )
+            for row in rows
+        }
+
     async def delete_for_runs(self, *, run_ids: Sequence[UUID]) -> int:
         if not run_ids:
             return 0
@@ -318,6 +452,76 @@ class SqlRunEventStore(RunEventStore):
         )
         async with self._sf() as session:
             return int((await session.execute(stmt)).scalar_one())
+
+
+def _int_or_none(value: Any) -> int | None:
+    return value if isinstance(value, int) and not isinstance(value, bool) else None
+
+
+def _last(value: Any) -> Any:
+    return value[-1] if isinstance(value, list) and value else None
+
+
+def _requested_tool(node_value: Any) -> str | None:
+    """The last tool call the node's last message requested (SQL:
+    ``data -> node -> 'messages' -> -1 -> 'tool_calls' -> -1 ->> 'name'``)."""
+    message = _last(node_value.get("messages")) if isinstance(node_value, dict) else None
+    call = _last(message.get("tool_calls")) if isinstance(message, dict) else None
+    name = call.get("name") if isinstance(call, dict) else None
+    return name if isinstance(name, str) else None
+
+
+def _tool_results(data: Any) -> int:
+    tools = data.get("tools") if isinstance(data, dict) else None
+    messages = tools.get("messages") if isinstance(tools, dict) else None
+    if not isinstance(messages, list):
+        return 0
+    return sum(1 for m in messages if isinstance(m, dict) and m.get("type") == "tool")
+
+
+def _plan_counts(data: Any) -> tuple[int | None, int | None]:
+    steps = data.get("steps") if isinstance(data, dict) else None
+    if not isinstance(steps, list):
+        return None, None
+    done = sum(1 for s in steps if isinstance(s, dict) and s.get("status") == "completed")
+    return done, len(steps)
+
+
+def _progress_of(records: Sequence[RunEventRecord]) -> RunProgressCounts:
+    """In-memory twin of the SQL aggregate; ``records`` are one run's, by seq."""
+    step: int | None = None
+    tool_calls = 0
+    started: set[Any] = set()
+    ended: set[Any] = set()
+    latest_updates: dict[str, Any] | None = None
+    plan: tuple[int | None, int | None] = (None, None)
+    for r in records:
+        data = r.data
+        if r.event_name == "updates" and isinstance(data, dict):
+            agent = data.get("agent")
+            count = _int_or_none(agent.get("step_count")) if isinstance(agent, dict) else None
+            if count is not None:
+                step = count if step is None else max(step, count)
+            tool_calls += _tool_results(data)
+            if data:
+                latest_updates = data
+        elif r.event_name == "worker" and isinstance(data, dict):
+            kind, worker_id = data.get("kind"), data.get("worker_id")
+            if worker_id is not None and kind in ("start", "end"):
+                (started if kind == "start" else ended).add(worker_id)
+        elif r.event_name == "plan":
+            plan = _plan_counts(data)
+    node = min(latest_updates) if latest_updates else None
+    return RunProgressCounts(
+        step=step,
+        tool_calls=tool_calls,
+        active_workers=max(0, len(started) - len(ended)),
+        current_node=node,
+        current_tool=_requested_tool(latest_updates[node]) if latest_updates and node else None,
+        last_event_at=max(r.created_at for r in records),
+        plan_done=plan[0],
+        plan_total=plan[1],
+    )
 
 
 def _row_to_record(row: RunEventRow) -> RunEventRecord:

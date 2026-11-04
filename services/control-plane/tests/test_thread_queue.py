@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 from collections.abc import AsyncIterator
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from typing import Any
 from uuid import UUID, uuid4
@@ -17,6 +18,7 @@ from control_plane.thread_queue import (
     MAX_QUEUED_PER_THREAD,
     ThreadQueueFullError,
     admit,
+    ahead_fields,
     queued_turn_stream,
 )
 from expert_work.runtime.runs import DisconnectMode, InMemoryRunStore, RunInfo, RunStatus
@@ -86,6 +88,52 @@ async def test_admit_refuses_when_the_queue_is_full() -> None:
         await admit(store, thread_id=thread, tenant_id=tenant)
 
 
+@pytest.mark.asyncio
+async def test_admit_names_the_turn_in_progress_as_the_head() -> None:
+    """B-269 —— 领头 = 第一个在跑 / 待启动的,哪怕更早还有一条排队行。"""
+    store = InMemoryRunStore()
+    tenant, thread = uuid4(), uuid4()
+    waiting = _row(tenant=tenant, thread=thread, status=RunStatus.QUEUED, minutes=0)
+    running = replace(
+        _row(tenant=tenant, thread=thread, status=RunStatus.RUNNING, minutes=1),
+        started_at=datetime(2030, 1, 1, 8, 0, tzinfo=UTC),
+    )
+    for r in (waiting, running):
+        await store.create(r)
+
+    admission = await admit(store, thread_id=thread, tenant_id=tenant)
+
+    assert admission.head is not None and admission.head.run_id == running.run_id
+    assert ahead_fields(admission.head) == {
+        "ahead_run_id": str(running.run_id),
+        "ahead_status": "running",
+        "ahead_started_at": "2030-01-01T08:00:00+00:00",
+    }
+
+
+@pytest.mark.asyncio
+async def test_admit_head_falls_back_to_the_earliest_waiting_turn() -> None:
+    store = InMemoryRunStore()
+    tenant, thread = uuid4(), uuid4()
+    first = _row(tenant=tenant, thread=thread, status=RunStatus.QUEUED, minutes=0)
+    second = _row(tenant=tenant, thread=thread, status=RunStatus.QUEUED, minutes=1)
+    for r in (second, first):
+        await store.create(r)
+
+    admission = await admit(store, thread_id=thread, tenant_id=tenant)
+
+    assert admission.head is not None and admission.head.run_id == first.run_id
+    assert ahead_fields(admission.head)["ahead_started_at"] is None
+
+
+@pytest.mark.asyncio
+async def test_admit_idle_thread_has_no_head() -> None:
+    store = InMemoryRunStore()
+    tenant, thread = uuid4(), uuid4()
+    await store.create(_row(tenant=tenant, thread=thread, status=RunStatus.SUCCESS, minutes=0))
+    assert (await admit(store, thread_id=thread, tenant_id=tenant)).head is None
+
+
 # --- queued_turn_stream ------------------------------------------------------
 
 
@@ -95,8 +143,9 @@ class _Harness:
     def __init__(self) -> None:
         self.store = InMemoryRunStore()
         self.tenant, self.thread = uuid4(), uuid4()
-        self.leader = _row(
-            tenant=self.tenant, thread=self.thread, status=RunStatus.RUNNING, minutes=0
+        self.leader = replace(
+            _row(tenant=self.tenant, thread=self.thread, status=RunStatus.RUNNING, minutes=0),
+            started_at=datetime(2030, 1, 1, 8, 0, tzinfo=UTC),
         )
         self.follower = _row(
             tenant=self.tenant, thread=self.thread, status=RunStatus.QUEUED, minutes=1, owner=_ME
@@ -140,6 +189,7 @@ class _Harness:
             owner=_ME,
             lease_ttl_s=30,
             ahead=1,
+            ahead_run=self.leader,
             launch=self.launch,
             is_disconnected=self.is_disconnected,
             cancel_on_disconnect=cancel_on_disconnect,
@@ -173,7 +223,12 @@ async def test_waits_for_the_leader_then_runs_here() -> None:
     frames = [f async for f in h.stream(sleep=sleep)]  # type: ignore[arg-type]
 
     assert frames[0].startswith(b"event: queued\n")
-    assert b'"ahead":1' in frames[0]
+    queued = json.loads(frames[0].split(b"data: ", 1)[1])
+    assert queued["ahead"] == 1
+    # B-269 —— 前面是谁、开始多久了。
+    assert queued["ahead_run_id"] == str(h.leader.run_id)
+    assert queued["ahead_status"] == "running"
+    assert queued["ahead_started_at"] == "2030-01-01T08:00:00+00:00"
     assert frames[-2:] == [b"event: metadata\n\n", b"event: end\n\n"]
     assert len(h.launched) == 1
     assert sleeps == 2  # 上一轮没结束之前一直没开跑

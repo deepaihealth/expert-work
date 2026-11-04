@@ -253,6 +253,7 @@ export function TurnBlock(props: TurnBlockProps): JSX.Element {
         liveText={liveText}
         onDownloadArtifact={onDownloadArtifact}
         onCancelQueued={onCancelQueued ? () => onCancelQueued(turn) : undefined}
+        threadId={threadId}
       />
 
       {/* BUG-13(修订)— 本轮产出的计划快照,长在产生它的那一轮里。

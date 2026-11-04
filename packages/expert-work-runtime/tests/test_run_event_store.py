@@ -224,3 +224,11 @@ async def test_list_event_names_filter_in_memory(
     """断言体在 ``conftest`` 的契约里,与 SQL 版共用一份 —— 见那个文件的
     docstring:两边各写各的断言正是谓词分歧漏网的原因。"""
     await event_names_filter_contract(InMemoryRunEventStore(), run_id=uuid4())
+
+
+@pytest.mark.asyncio
+async def test_progress_for_runs_in_memory(
+    progress_contract: Callable[..., Awaitable[None]],
+) -> None:
+    """B-270 —— 断言体在 ``conftest`` 的契约里,与 SQL 版共用一份。"""
+    await progress_contract(InMemoryRunEventStore(), run_ids=(uuid4(), uuid4(), uuid4()))
