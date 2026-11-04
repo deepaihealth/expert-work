@@ -304,7 +304,7 @@ GET /v1/agents/{agent_code}/runs
 | `unresolved_failures` | array \| null | 因为工具失败没做成时，是哪些工具。元素结构与 [3.4 的 `end`](./sse-events#end) 里的同名字段相同（`{tool, kind}`，最多 20 个）；`[]` 表示没有。`null` 表示没有记录，按「不清楚」处理，平台升级前的历史 run 可能 `completed` 有值而这里是 `null` |
 | `started_at` | string（ISO 8601） \| null | 开始执行的时间。还没开始执行，或者是平台升级前的历史 run 时为 `null`；执行中途改由另一个服务端实例接手时不变 |
 | `heartbeat_at` | string（ISO 8601） \| null | 只在还没有进入最终状态的 run 上出现：执行这次 run 的服务端实例最近一次确认自己仍在执行的时间；还没开始执行时为 `null` |
-| `queued_behind` | object \| null | 只在 `status` 为 `queued` 的 run 上出现：同一段会话里挡在它前面的那一轮，`{run_id, status, started_at}`，含义与 [`queued` 事件](./sse-events#queued) 的 `ahead_run_id`、`ahead_status`、`ahead_started_at` 相同。前面已经没有没结束的 run、这一轮即将开始执行时为 `null` |
+| `queued_behind` | object \| null | 只在 `status` 为 `queued` 的 run 上出现：同一段会话里挡在它前面的那一轮，`{run_id, status, started_at}`，字段含义与 [`queued` 事件](./sse-events#queued) 的 `ahead_run_id`、`ahead_status`、`ahead_started_at` 相同。为 `null` 有两种情况：前面已经没有没结束的 run、这一轮即将开始执行；或者挡在前面的是同一会话里另一个用户（例如管理员在后台）发起的 run，这时不列出它的信息。`queued` 事件与 202 响应里的 `ahead_*` 不做这层过滤 |
 | `progress` | object | 只在还没有进入最终状态的 run 上出现：执行进度，字段见下文 |
 
 `status` 说的是这次 run 怎么结束的，`completed` 说的是要做的事做成了没有，`unresolved_failures` 说的是因为工具失败没做成时，是哪些工具。步数用完的 run 是 `status` 为 `incomplete`、`completed` 为 `false`，读法见 [3.4 的 `end`](./sse-events#end)。没有记录时，这三个字段在 `end` 事件里不出现，在这里是 `null`。
