@@ -50,6 +50,7 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from expert_work.persistence.artifact import ArtifactStore
+from expert_work.persistence.audit_log import AuditLogStore
 from expert_work.persistence.image_upload import ImageUploadStore
 from expert_work.persistence.knowledge import KnowledgeRetrievalLogStore
 from expert_work.persistence.memory import MemoryStore
@@ -58,13 +59,11 @@ from expert_work.persistence.tenant_user import TenantUserStore
 from expert_work.persistence.thread_meta import ThreadMetaStore
 from expert_work.persistence.user_upload import UserUploadStore
 from expert_work.persistence.workspace import UserWorkspaceStore
-from expert_work.persistence.workspace.layout import WORKSPACE_UPLOADS_DIR
 from expert_work.protocol import (
     ArtifactVersion,
     AuditAction,
     AuditEntry,
     AuditResult,
-    UserUpload,
 )
 from expert_work.runtime.audit import AuditLogger
 from expert_work.runtime.runs.store import RunStore
@@ -81,11 +80,7 @@ from retention_cleanup_job.orphan_threads import (
     sweep_orphan_tool_results,
 )
 from retention_cleanup_job.report import CleanupReport
-from retention_cleanup_job.workspace_files import (
-    UnsafeWorkspacePathError,
-    remove_upload_file,
-    upload_relpath,
-)
+from retention_cleanup_job.uploads import UploadSweep
 
 logger = logging.getLogger(__name__)
 
@@ -157,6 +152,7 @@ class RetentionCleanupJob:
         run_store: RunStore | None = None,
         workspace_root: str | None = None,
         audit_logger: AuditLogger | None = None,
+        audit_log_store: AuditLogStore | None = None,
     ) -> None:
         if batch_size <= 0:
             msg = "batch_size must be positive"
@@ -223,6 +219,8 @@ class RetentionCleanupJob:
         self._run_store = run_store
         self._workspace_root = workspace_root
         self._audit_logger = audit_logger
+        #: B-271 —— 只读:给没有 sha256 的老上传行从 ``DOCUMENT_UPLOAD`` 审计行补 sha256。
+        self._audit_log_store = audit_log_store
 
     async def run_once(self) -> CleanupReport:
         """Run the retention passes once and return a tally.
@@ -242,6 +240,13 @@ class RetentionCleanupJob:
         """
         started = time.monotonic()
         with _bypass_rls():
+            # B-271 —— 上传 pass 排在审计删除之前:老上传行要从登记时的 ``DOCUMENT_UPLOAD``
+            # 审计行补 sha256,而那条审计与上传同一天满默认 90 天,先删审计就读不到了。
+            (
+                uploads_expired,
+                upload_files_removed,
+                upload_files_unsafe,
+            ) = await self._sweep_uploads()
             audit_deleted, audit_by_tenant = await self._delete_audit_log()
             audit_skipped = await self._count_unacked_past_retention()
             event_deleted = await self._delete_event_log()
@@ -261,7 +266,6 @@ class RetentionCleanupJob:
             ) = await self._sweep_artifact_versions()
             artifact_soft, artifact_hard = await self._sweep_artifacts()
             orphan_artifact_copies_removed = await self._sweep_orphan_artifact_copies()
-            uploads_expired, upload_files_removed = await self._sweep_uploads()
             thread_dirs_removed = await self._sweep_orphan_thread_dirs()
             tool_result_dirs_removed = await self._sweep_orphan_tool_results()
             memory_hard_deleted = await self._sweep_memory()
@@ -285,6 +289,7 @@ class RetentionCleanupJob:
             orphan_artifact_copies_removed=orphan_artifact_copies_removed,
             uploads_expired=uploads_expired,
             upload_files_removed=upload_files_removed,
+            upload_files_unsafe=upload_files_unsafe,
             thread_dirs_removed=thread_dirs_removed,
             tool_result_dirs_removed=tool_result_dirs_removed,
             memory_hard_deleted=memory_hard_deleted,
@@ -560,107 +565,43 @@ class RetentionCleanupJob:
         hard_count = await self._artifact_store.hard_delete(artifact_ids=hard_ids)
         return soft_count, hard_count
 
-    async def _sweep_uploads(self) -> tuple[int, int]:
-        """留存链 —— 上传 90 天。
+    async def _sweep_uploads(self) -> tuple[int, int, int]:
+        """留存链 —— 上传 90 天;规则本体在 :class:`retention_cleanup_job.uploads.UploadSweep`
+        (B-271:按会话当前的 agent / 布局删真实位置上的文件,引用检查、改动保护、不安全路径)。
 
-        ``user_upload.created_at < now - upload_retention_days`` 且未软删的行:
-        ``ref`` 是会话 ``/workspace`` 相对路径(``uploads/<file>``,文档类)→ 按那条会话**当前**的
-        agent 与布局删真实位置上的文件(B-271,见 :meth:`_release_upload_file`);
-        图片类的 ``ref`` 是 ``expert_work://image/…`` 对象存储 URI,字节归
-        ``image_upload`` 自己的 90 天 pass,这里不碰。两类都标 ``deleted_at``
-        (对外 GET 从此 404,复用既有语义)。文件删不掉 → 行不标,明天再试。
+        ``user_upload.created_at < now - upload_retention_days`` 且未软删的行,文档类删文件、
+        两类都标 ``deleted_at``(对外 GET 从此 404,复用既有语义)。只管有登记行的上传:控制台
+        上传与跨会话引用复制(copy-on-attach)不建 ``user_upload`` 行,这里永远看不到它们
+        (B-271 不改,另立)。
 
-        只管有登记行的上传:控制台上传与跨会话引用复制(copy-on-attach)不建 ``user_upload``
-        行,这里永远看不到它们(B-271 不改,另立)。
-
-        Returns ``(rows_marked, files_removed)``。No-op when :class:`UserUploadStore`,
-        :class:`ThreadMetaStore` or ``workspace_root`` is missing —— 没有会话就算不出文件在哪,
-        只标行不删文件等于留下永久孤儿。
+        Returns ``(rows_marked, files_removed, files_unsafe)``。No-op when
+        :class:`UserUploadStore`, :class:`ThreadMetaStore` or ``workspace_root`` is missing ——
+        没有会话就算不出文件在哪,只标行不删文件等于留下永久孤儿。这一 pass 整体失败(列行 /
+        预取会话出错)只记日志,后面的 pass 照跑。
         """
         if (
             self._user_upload_store is None
             or self._thread_store is None
             or self._workspace_root is None
         ):
-            return 0, 0
+            return 0, 0, 0
         now = datetime.now(UTC)
         cutoff = now - timedelta(days=self._upload_retention_days)
-        expired = await self._user_upload_store.list_expired(before=cutoff, limit=self._batch_size)
-        marked = files_removed = 0
-        for row in expired:
-            # 两种 ``ref`` 形态,两种字节归属(见 protocol.UserUpload.ref):
-            # * 文档类:会话相对路径 ``uploads/<file>`` —— 字节在 NAS,这里
-            #   unlink;删不掉就整行跳过(不标),明天再试,绝不留孤儿文件。
-            # * 图片类:``expert_work://image/…`` 对象存储 URI —— 字节在 OSS,
-            #   归 ``image_upload`` 自己的 90 天 pass(需要 OSS 凭据),这里不碰;
-            #   行照样标 ``deleted_at``,对外 GET 与文档类同一天起 404。
-            if row.ref.startswith(f"{WORKSPACE_UPLOADS_DIR}/"):
-                try:
-                    removed = await self._release_upload_file(row, cutoff=cutoff)
-                except (OSError, UnsafeWorkspacePathError):
-                    logger.exception("retention.upload_file_unlink_failed upload_id=%s", row.id)
-                    continue
-                files_removed += int(removed)
-            if await self._user_upload_store.soft_delete(
-                upload_id=row.id, tenant_id=row.tenant_id, now=now
-            ):
-                marked += 1
-        return marked, files_removed
-
-    async def _release_upload_file(self, row: UserUpload, *, cutoff: datetime) -> bool:
-        """B-271 —— 删一条到期文档上传的文件;返回是否真的删了。下面三种情况不删文件,
-        行照样软删(对用户的到期语义不变):
-
-        * 会话不在了 —— 算不出路径;对话视图的目录随会话 purge 走。
-        * 还有别的没到期、没删的行解析到同一个文件(老视图同一 agent 的各对话共用
-          ``uploads/``,同名同内容复用)。
-        * 文件与登记时不一致(大小,或有 sha256 时内容):上传后在会话里被改写过,已不是
-          这条行登记的那份。
-        """
-        assert self._thread_store is not None  # noqa: S101 —— _sweep_uploads 已判
-        assert self._workspace_root is not None  # noqa: S101
-        meta = await self._thread_store.get(row.thread_id, tenant_id=row.tenant_id)
-        if meta is None:
-            logger.info("retention.upload_thread_gone upload_id=%s", row.id)
-            return False
-        relpath = upload_relpath(row.ref, meta)
-        if await self._upload_path_still_referenced(row, relpath, cutoff=cutoff):
-            logger.info("retention.upload_file_still_referenced upload_id=%s", row.id)
-            return False
-        outcome = await asyncio.to_thread(
-            remove_upload_file,
-            self._workspace_root,
-            row.tenant_id,
-            row.user_id,
-            relpath,
-            size_bytes=row.size_bytes,
-            sha256=row.sha256,
+        sweep = UploadSweep(
+            uploads=self._user_upload_store,
+            threads=self._thread_store,
+            root=self._workspace_root,
+            audit=self._audit_log_store,
         )
-        if outcome == "changed":
-            logger.info("retention.upload_file_changed_kept upload_id=%s", row.id)
-        return outcome == "removed"
-
-    async def _upload_path_still_referenced(
-        self, row: UserUpload, relpath: str, *, cutoff: datetime
-    ) -> bool:
-        """别的没到期、没删的登记行按**它自己**会话的布局解析到 ``relpath`` 吗。
-
-        ``ref`` 恒是 ``uploads/<一段名字>``,不同 ``ref`` 拼不出同一个路径,所以候选只需
-        同租户、同用户、同 ``ref`` 的行;同 ``ref`` 但落在别处(另一条是对话视图)的不算。
-        会话已不在的候选行解析不出路径,不算。
-        """
-        assert self._user_upload_store is not None  # noqa: S101
-        assert self._thread_store is not None  # noqa: S101
-        candidates = await self._user_upload_store.list_active_by_ref(
-            tenant_id=row.tenant_id, user_id=row.user_id, ref=row.ref
-        )
-        for other in candidates:
-            if other.id == row.id or other.created_at < cutoff:
-                continue
-            meta = await self._thread_store.get(other.thread_id, tenant_id=other.tenant_id)
-            if meta is not None and upload_relpath(other.ref, meta) == relpath:
-                return True
-        return False
+        try:
+            expired = await self._user_upload_store.list_expired(
+                before=cutoff, limit=self._batch_size
+            )
+            tally = await sweep.run(expired, cutoff=cutoff, now=now)
+        except Exception:
+            logger.exception("retention.upload_sweep_failed")
+            return 0, 0, 0
+        return tally.marked, tally.files_removed, tally.files_unsafe
 
     async def _sweep_orphan_thread_dirs(self) -> int:
         """留存链 B-27 —— 孤儿 ``threads/<thread_id>/`` 目录;规则本体在

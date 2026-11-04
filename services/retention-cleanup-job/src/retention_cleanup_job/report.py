@@ -31,6 +31,9 @@ class CleanupReport:
     # 留存链 —— 上传 90 天。
     uploads_expired: int = 0
     upload_files_removed: int = 0
+    #: B-271 —— 路径形状不安全(某段是软链 / 不是目录、叶子不是普通文件)而没删文件的到期行;
+    #: 行照样软删。非 0 就该有人去看那个工作区。
+    upload_files_unsafe: int = 0
     # 留存链 B-27 —— 孤儿 threads/<id>/ 目录。
     thread_dirs_removed: int = 0
     #: B-50 spec §4.2 —— 孤儿 ``.tool_results/<run_id>/``。此前从没被清过

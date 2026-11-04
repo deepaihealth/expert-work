@@ -21,6 +21,7 @@ job 只删 (a) 登记过的产物文件 (b) ``uploads/`` 下登记过的文件 (
 
 from __future__ import annotations
 
+import errno
 import hashlib
 import logging
 import os
@@ -199,8 +200,21 @@ def unlink_registered_file(root: str, tenant_id: UUID, user_id: UUID, relpath: s
     return True
 
 
-#: :func:`remove_upload_file` 的结果:删了 / 本来就不在 / 与登记时不一致所以没删。
-UploadFileOutcome = Literal["removed", "missing", "changed"]
+#: :func:`open_upload_file` / :meth:`OpenedUpload.unlink` 的结果:还在(已打开)/ 删了 /
+#: 本来就不在 / 与登记时不一致或打开后被换掉所以没删。
+UploadFileOutcome = Literal["present", "removed", "missing", "changed"]
+
+#: 逐段打开目录:不跟软链(``O_NOFOLLOW`` 只管最后一段,所以必须一段一段开)。
+_DIR_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+#: 叶子:不跟软链;``O_NONBLOCK`` 让被换成 FIFO 的叶子不会把整个作业卡死在 ``open`` 上。
+_LEAF_FLAGS = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK
+#: ``O_NOFOLLOW`` 碰到软链(Linux / macOS 是 ``ELOOP``,BSD 系有的回 ``EMLINK``)、
+#: ``O_DIRECTORY`` 碰到非目录(``ENOTDIR``)—— 都是「这条路径的形状不对」,不是暂时故障。
+_UNSAFE_ERRNOS = frozenset({errno.ELOOP, errno.EMLINK, errno.ENOTDIR})
+
+
+class _PathMissingError(Exception):
+    """路径上某一段不在 —— 文件本来就没了。"""
 
 
 def upload_relpath(ref: str, meta: ThreadMeta) -> str:
@@ -220,18 +234,79 @@ def upload_relpath(ref: str, meta: ThreadMeta) -> str:
     return f"{prefix}/{ref}"
 
 
-def _same_as_registered(target: Path, size_bytes: int, sha256: str | None) -> bool:
-    """文件还是登记时那一份吗:大小相等,登记行有 sha256 时内容哈希也相等(老行只比大小)。"""
-    fd = os.open(target, os.O_RDONLY | os.O_NOFOLLOW)
-    with os.fdopen(fd, "rb") as fh:
-        if os.fstat(fh.fileno()).st_size != size_bytes:
-            return False
-        if sha256 is None:
-            return True
+def _open_child(parent_fd: int, name: str, flags: int) -> int:
+    """在已打开的目录 ``parent_fd`` 里打开一项(不按路径字符串重新解析)。"""
+    try:
+        return os.open(name, flags, dir_fd=parent_fd)
+    except FileNotFoundError as exc:
+        raise _PathMissingError from exc
+    except OSError as exc:
+        if exc.errno in _UNSAFE_ERRNOS:
+            raise UnsafeWorkspacePathError(f"upload path has an unsafe segment: {name!r}") from exc
+        raise
+
+
+def _close_all(fds: list[int]) -> None:
+    for fd in fds:
+        os.close(fd)
+
+
+def _open_parent_chain(root: str, dirs: list[str]) -> list[int]:
+    """从 ``root``(启动时校验过不是软链)起逐段打开 ``dirs``,回全部 fd(最后一个是叶子的父目录)。
+    哪一段不在 → :class:`_PathMissingError`;是软链 / 不是目录 → :class:`UnsafeWorkspacePathError`。
+    出错时已打开的 fd 全部关掉。"""
+    fds = [os.open(Path(root).resolve(), os.O_RDONLY | os.O_DIRECTORY)]
+    try:
+        for part in dirs:
+            fds.append(_open_child(fds[-1], part, _DIR_FLAGS))
+    except BaseException:
+        _close_all(fds)
+        raise
+    return fds
+
+
+def _same_as_registered(leaf_fd: int, size_bytes: int, sha256: str | None) -> bool:
+    """打开的那个文件还是登记时那一份吗:大小相等,登记行有 sha256 时内容哈希也相等(老行只比大小)。"""
+    if os.fstat(leaf_fd).st_size != size_bytes:
+        return False
+    if sha256 is None:
+        return True
+    with os.fdopen(os.dup(leaf_fd), "rb") as fh:
         return hashlib.file_digest(fh, "sha256").hexdigest() == sha256
 
 
-def remove_upload_file(
+@dataclass
+class OpenedUpload:
+    """:func:`open_upload_file` 的结果。``outcome == "present"`` 时持有叶子的父目录 fd 与叶子 fd,
+    调用方要么 :meth:`unlink`,要么不删;两种都必须 :meth:`close`。"""
+
+    outcome: UploadFileOutcome
+    parent_fd: int = -1
+    leaf_fd: int = -1
+    name: str = ""
+
+    def unlink(self) -> UploadFileOutcome:
+        """在**已打开的父目录**里删这个名字,前提是它仍是打开、核对过的那个文件
+        (``(st_dev, st_ino)`` 相同)—— 核对之后名字被换成别的文件(会话里的模型写得到)就不删。"""
+        opened = os.fstat(self.leaf_fd)
+        try:
+            current = os.stat(self.name, dir_fd=self.parent_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            return "missing"
+        if (current.st_dev, current.st_ino) != (opened.st_dev, opened.st_ino):
+            return "changed"
+        try:
+            os.unlink(self.name, dir_fd=self.parent_fd)
+        except FileNotFoundError:
+            return "missing"
+        return "removed"
+
+    def close(self) -> None:
+        _close_all([fd for fd in (self.leaf_fd, self.parent_fd) if fd >= 0])
+        self.leaf_fd = self.parent_fd = -1
+
+
+def open_upload_file(
     root: str,
     tenant_id: UUID,
     user_id: UUID,
@@ -239,35 +314,44 @@ def remove_upload_file(
     *,
     size_bytes: int,
     sha256: str | None,
-) -> UploadFileOutcome:
-    """删掉一条到期上传指向的普通文件(B-271)。``relpath`` 来自 :func:`upload_relpath`。
+) -> OpenedUpload:
+    """打开一条到期上传指向的文件并核对(B-271)。``relpath`` 来自 :func:`upload_relpath`。
 
-    从用户根起**逐段** ``lstat``(同 :func:`remove_tool_result_dir`):对话的 ``work/`` 是模型
-    写得到的地方,任何一段是软链 / 不是目录、或叶子不是普通文件 →
-    :class:`UnsafeWorkspacePathError`(调用方保留登记行)。哪一段不在 → ``"missing"``。
-    大小或内容与登记时不一致(上传后在会话里被改写过)→ ``"changed"``,不删。
+    从 ``root`` 起**用目录 fd 逐段**打开 ``{tenant}/{user}/…``(``openat`` + ``O_NOFOLLOW``),
+    之后的核对与删除都在这些已打开的 fd 上做,不再按路径字符串重新解析 —— 对话的 ``work/`` 是
+    模型写得到的地方,检查之后把某一段换成指向别的用户目录的软链也改不了删的是哪个文件。
+    任何一段是软链 / 不是目录、叶子不是普通文件(含 FIFO,``O_NONBLOCK`` 打开不阻塞)→
+    :class:`UnsafeWorkspacePathError`。哪一段不在 → ``"missing"``。大小或内容与登记时
+    不一致 → ``"changed"``。都对 → ``"present"``,调用方 :meth:`OpenedUpload.unlink` / ``close``。
     """
     parts = PurePosixPath(relpath).parts
     if not parts or relpath.startswith("/") or "\0" in relpath or ".." in parts:
         raise UnsafeWorkspacePathError(f"not a relative workspace path: {relpath!r}")
-    _ensure_plain_dirs(root, tenant_id, user_id)
-    target = user_root(root, tenant_id, user_id)
-    for index, part in enumerate(parts):
-        target = target / part
-        try:
-            st = os.lstat(target)
-        except FileNotFoundError:
-            return "missing"
-        wanted = stat.S_ISREG if index == len(parts) - 1 else stat.S_ISDIR
-        if stat.S_ISLNK(st.st_mode) or not wanted(st.st_mode):
-            raise UnsafeWorkspacePathError(f"upload path has an unsafe segment: {part!r}")
-    if not _same_as_registered(target, size_bytes, sha256):
-        return "changed"
+    dirs = [str(tenant_id), str(user_id), *parts[:-1]]
     try:
-        os.unlink(target)
-    except FileNotFoundError:
-        return "missing"
-    return "removed"
+        fds = _open_parent_chain(root, dirs)
+    except _PathMissingError:
+        return OpenedUpload("missing")
+    try:
+        leaf_fd = _open_child(fds[-1], parts[-1], _LEAF_FLAGS)
+    except _PathMissingError:
+        _close_all(fds)
+        return OpenedUpload("missing")
+    except BaseException:
+        _close_all(fds)
+        raise
+    opened = OpenedUpload("present", parent_fd=fds.pop(), leaf_fd=leaf_fd, name=parts[-1])
+    _close_all(fds)
+    try:
+        if not stat.S_ISREG(os.fstat(leaf_fd).st_mode):
+            raise UnsafeWorkspacePathError(f"upload is not a regular file: {parts[-1]!r}")
+        if not _same_as_registered(leaf_fd, size_bytes, sha256):
+            opened.close()
+            return OpenedUpload("changed")
+    except BaseException:
+        opened.close()
+        raise
+    return opened
 
 
 def agent_subtree(user_dir: Path, agent_key: str) -> Path:
@@ -539,6 +623,7 @@ def iter_tool_result_dirs(root: str) -> Iterator[ToolResultDir]:
 __all__ = [
     "DELETED_DIR",
     "THREADS_DIR",
+    "OpenedUpload",
     "ThreadDir",
     "ToolResultDir",
     "UnsafeWorkspacePathError",
@@ -546,9 +631,9 @@ __all__ = [
     "deleted_marker",
     "iter_thread_dirs",
     "iter_tool_result_dirs",
+    "open_upload_file",
     "remove_thread_dir",
     "remove_tool_result_dir",
-    "remove_upload_file",
     "unlink_registered_file",
     "upload_relpath",
     "user_root",

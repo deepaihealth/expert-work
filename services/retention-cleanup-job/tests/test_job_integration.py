@@ -1112,3 +1112,92 @@ async def test_knowledge_retrieval_log_retention_deletes_rows_past_30_days(
         assert report.knowledge_retrieval_logs_deleted >= 5
     finally:
         await worker_engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_a_legacy_upload_reads_its_audit_sha256_before_the_audit_pass_deletes_it(
+    db_fixture: tuple[AsyncEngine, AsyncEngine, str], tmp_path: Path
+) -> None:
+    """B-271 review L1 —— 没有 sha256 的老上传行从登记时的 ``DOCUMENT_UPLOAD`` 审计行补 sha256。
+    那条审计与上传同一天满 90 天(已备份确认 → 这一轮的审计 pass 会删它),所以上传 pass 必须
+    排在审计删除之前:这里文件同大小但内容被改过,读到审计的 sha256 才知道不能删。"""
+    from expert_work.persistence import SqlThreadMetaStore, SqlUserUploadStore
+    from retention_cleanup_job.main import build_session_factory
+
+    app_engine, worker_engine, sync_admin = db_fixture
+    try:
+        tenant, user = uuid4(), uuid4()
+        _seed_tenant_config(sync_admin, tenant_id=tenant, audit_days=90, event_days=30)
+        sf = build_session_factory(worker_engine)
+        threads = SqlThreadMetaStore(sf)
+        uploads = SqlUserUploadStore(sf)
+        meta = await threads.create(
+            thread_id=uuid4(), tenant_id=tenant, created_by="u", user_id=user, agent_name="bot"
+        )
+        original = b"%PDF-1.4 report"
+        row = await uploads.insert(
+            upload_id=uuid4(),
+            tenant_id=tenant,
+            user_id=user,
+            thread_id=meta.thread_id,
+            kind="document",
+            ref="uploads/report.pdf",
+            mime_type="application/pdf",
+            size_bytes=len(original),
+            filename="report.pdf",
+        )
+        audit = await SqlAuditLogStore(create_async_session_factory(app_engine)).append(
+            AuditEntry(
+                tenant_id=tenant,
+                actor_type="user",
+                actor_id="ext",
+                action=AuditAction.DOCUMENT_UPLOAD,
+                resource_type="user_workspace",
+                resource_id="uploads/report.pdf",
+                result=AuditResult.SUCCESS,
+                details={
+                    "thread_id": str(meta.thread_id),
+                    "workspace_path": "uploads/report.pdf",
+                    "file_size_bytes": len(original),
+                    "sha256": hashlib.sha256(original).hexdigest(),
+                },
+            )
+        )
+        uploaded_at = datetime.now(tz=UTC) - timedelta(days=100)
+        admin = create_engine(sync_admin, isolation_level="AUTOCOMMIT")
+        try:
+            with admin.connect() as conn:
+                conn.execute(
+                    text("UPDATE user_upload SET created_at = :t WHERE id = :u"),
+                    {"t": uploaded_at, "u": row.id},
+                )
+                conn.execute(
+                    text(
+                        "UPDATE audit_log SET occurred_at = :t, backup_acked = true, "
+                        "backup_acked_at = now() WHERE id = :id"
+                    ),
+                    {"t": uploaded_at - timedelta(seconds=1), "id": audit.id},
+                )
+        finally:
+            admin.dispose()
+        edited = (
+            tmp_path / str(tenant) / str(user) / thread_workspace_path("uploads/report.pdf", meta)
+        )
+        edited.parent.mkdir(parents=True)
+        edited.write_bytes(b"%PDF-1.4 REPORT")  # same size, other bytes
+
+        report = await RetentionCleanupJob(
+            db_session_factory=sf,
+            user_upload_store=uploads,
+            thread_store=threads,
+            workspace_root=str(tmp_path),
+            audit_log_store=SqlAuditLogStore(sf),
+        ).run_once()
+
+        assert edited.read_bytes() == b"%PDF-1.4 REPORT"
+        assert (report.uploads_expired, report.upload_files_removed) == (1, 0)
+        # The audit row really was past retention and went in the same run.
+        assert report.audit_deleted_by_tenant == {str(tenant): 1}
+    finally:
+        await app_engine.dispose()
+        await worker_engine.dispose()

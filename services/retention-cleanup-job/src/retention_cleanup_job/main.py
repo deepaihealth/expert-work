@@ -176,8 +176,9 @@ async def _amain() -> None:
         user_upload_store = SqlUserUploadStore(session_factory)
         thread_store = SqlThreadMetaStore(session_factory)
         run_store = SqlRunStore(session_factory)
+        audit_log_store = SqlAuditLogStore(session_factory)
         audit_logger = AuditLogger(
-            store=SqlAuditLogStore(session_factory),
+            store=audit_log_store,
             redactor=DefaultSecretRedactor(),
             fallback=InMemoryAuditFallbackQueue(),
         )
@@ -209,6 +210,7 @@ async def _amain() -> None:
             run_store=run_store,
             workspace_root=workspace_root,
             audit_logger=audit_logger,
+            audit_log_store=audit_log_store,
         )
         logger.info("retention_cleanup_job.start batch=%d", settings.batch_size)
         report = await job.run_once()
@@ -218,7 +220,8 @@ async def _amain() -> None:
             "artifact_soft=%d artifact_hard=%d "
             "artifact_versions_deleted=%d artifact_files_removed=%d artifacts_expired=%d "
             "orphan_artifact_copies_removed=%d "
-            "uploads_expired=%d upload_files_removed=%d thread_dirs_removed=%d "
+            "uploads_expired=%d upload_files_removed=%d upload_files_unsafe=%d "
+            "thread_dirs_removed=%d "
             "memory_hard_deleted=%d workspaces_hard_deleted=%d "
             "workspaces_pending_archive=%d tenant_users_hard_deleted=%d "
             "sandbox_egress_audit=%d memory_writeback_jobs=%d knowledge_tasks=%d "
@@ -238,6 +241,7 @@ async def _amain() -> None:
             report.orphan_artifact_copies_removed,
             report.uploads_expired,
             report.upload_files_removed,
+            report.upload_files_unsafe,
             report.thread_dirs_removed,
             report.memory_hard_deleted,
             report.workspaces_hard_deleted,
