@@ -2148,6 +2148,49 @@ describe("PlaygroundTab", () => {
       expect(streamRunMock).not.toHaveBeenCalled();
     });
 
+    it("B-274 — a history turn's retry stages the turn's attachments again, not just its text", async () => {
+      const user = userEvent.setup();
+      createSessionMock.mockResolvedValue(sampleThread);
+      const past: ThreadMeta = {
+        ...sampleThread,
+        thread_id: "aaaaaaaa-0000-0000-0000-000000000010",
+      };
+      listSessionsMock.mockResolvedValue([past]);
+      getMessagesMock.mockResolvedValue([
+        { role: "user", content: "q1\n\n[file attached: uploads/r.pdf]" },
+        { role: "assistant", content: "a1" },
+      ]);
+      listThreadRunsMock.mockResolvedValue([
+        { runId: "r1", status: "success", isResume: false, supersededBy: null, regeneratedFrom: null, createdAt: "t1", finishedAt: null, error: null, tokens: null },
+      ]);
+      streamRunEventsMock.mockReturnValue(
+        makeStream([
+          {
+            id: "u1",
+            event: "updates",
+            data: {
+              agent: { messages: [{ type: "ai", content: "replayed answer" }] },
+            },
+            rawData: "",
+            receivedAt: "t1",
+          },
+          { id: "e1", event: "end", data: "ok", rawData: "ok", receivedAt: "t2" },
+        ]),
+      );
+
+      renderPg();
+      await screen.findByTestId("playground-input");
+      await resumeFromSidebar(user, past.thread_id);
+      await findInTranscript("replayed answer");
+
+      await user.click(screen.getByTestId("playground-turn-retry"));
+
+      expect(screen.getByTestId("playground-input")).toHaveValue("q1");
+      const staged = screen.getAllByTestId("playground-attachment");
+      expect(staged.map((el) => el.textContent)).toEqual(["r.pdf"]);
+      expect(streamRunMock).not.toHaveBeenCalled();
+    });
+
     it("falls back to the flat history block when message/run counts don't line up", async () => {
       const user = userEvent.setup();
       createSessionMock.mockResolvedValue(sampleThread);

@@ -529,6 +529,7 @@ export function ConversationDetail() {
         run_id: runId,
         thread_id: threadId ?? null,
         input: turn.input,
+        attachments: turn.attachments,
         source,
         exported_at: new Date().toISOString(),
         events,

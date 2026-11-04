@@ -22,6 +22,20 @@ describe("buildConsoleTurns", () => {
     expect(out[1]).toMatchObject({ runId: "r2", loadState: "pending", turn: { status: "error", error: "timeout", events: [] }, fallbackLines: [{ text: "partial", channel: "final" }] });
     expect(out[2]).toMatchObject({ runId: "r3", loadState: "done", timing: { ttftMs: 500 }, tokens: null });
   });
+  it("B-274 — a history turn shows the platform's attachment lines as attachments, not as typed text", () => {
+    const out = buildConsoleTurns({
+      historyTurns: [
+        { key: "h1", input: "read this\n\n[file attached: uploads/r.pdf]", fallbackLines: [], runId: "r1", status: "success", tokens: null, createdAt: null, finishedAt: null, runError: null, supersededBy: null, tombstone: false, platformLines: [] },
+      ],
+      historyLoads: {},
+      liveTurns: [],
+      timings: {},
+    });
+    expect(out[0].turn.input).toBe("read this");
+    expect(out[0].turn.attachments).toEqual([
+      { id: "history-attachment-0", name: "r.pdf", kind: "document", value: "uploads/r.pdf" },
+    ]);
+  });
   it("B-226 ⑥ — a history turn carries its run row's completion (before any replay); a live turn has none", () => {
     const out = buildConsoleTurns({
       historyTurns: [

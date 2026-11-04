@@ -15,6 +15,7 @@ import type { SseEvent } from "../../api/sessions";
 import { NON_TERMINAL_RUN_STATUSES } from "../../api/runs";
 import { promptInputsOf } from "../../api/trajectory_rows";
 import { approvalItemFromEvent } from "../turn/approval_item";
+import { splitAttachmentMarkers } from "../turn/attachment_markers";
 
 // 终审 F8 — buildConsoleTurns 在直播期间每个非 token 帧都整表重建,无帧的
 // 老 run(resume/审批续跑/pre-BUG-16)会全量扫几千条事件找 system_prompt。
@@ -108,14 +109,16 @@ export function buildConsoleTurns(args: {
       (args.synthesizeApprovals ?? false) && h.status === "paused" && isLastTurn
         ? lastApprovalFrom(load.events)
         : null;
+    // B-274 — the platform's attachment lines become tags, not typed text.
+    const { text: input, attachments } = splitAttachmentMarkers(h.input);
     out.push({
       key: h.key,
       seq,
       source: "history",
       turn: {
         id: h.key,
-        input: h.input,
-        attachments: [],
+        input,
+        attachments,
         // BUG-16 — 历史轮的 jinja 入参从回放的 system_prompt 帧还原
         // (live 轮在 useRunEngine 派发时就带;老 run 无帧数据 → undefined)。
         inputs: cachedPromptInputsOf(load.events) ?? undefined,
