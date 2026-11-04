@@ -161,10 +161,16 @@ class EstimateModels(BaseModel):
     recognition: str | None = None
     fallback: str | None = None
     figure: str | None = None
+    #: B-267 —— the auxiliary model the base profile is refreshed with (``None``:
+    #: no profile counted). Joins the fingerprint only when set, so estimates
+    #: made without it keep the fingerprint they had.
+    profile: str | None = None
 
     def fingerprint(self) -> str:
         models = (self.embedding, self.recognition, self.fallback, self.figure)
         joined = "|".join(model or "" for model in models)
+        if self.profile is not None:
+            joined += f"|profile={self.profile}"
         return hashlib.sha256(joined.encode("utf-8")).hexdigest()[:16]
 
 

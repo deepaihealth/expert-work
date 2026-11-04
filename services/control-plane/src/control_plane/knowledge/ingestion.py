@@ -81,7 +81,7 @@ from control_plane.knowledge.parsing import (
 )
 from control_plane.knowledge.passages import replay_manual_changes
 from control_plane.knowledge.pricing import price_spend
-from control_plane.knowledge.profile import schedule_after_ingest
+from control_plane.knowledge.profile import schedule_after_ingest, schedule_recalibration
 from control_plane.knowledge.recognition.figure_pipeline import FigureDescriber
 from control_plane.knowledge.recognition.ingest_parse import (
     LocalParse,
@@ -1435,8 +1435,9 @@ class KnowledgeIngestionRunner:
     ) -> None:
         self._store = store
         self._embedder = embedder
-        #: B-267 —— the platform switch ``kb_first_routing``: a finished
-        #: re-index asks for the base's probe calibration again.
+        #: B-267 —— the platform switch ``kb_first_routing``: a ready document
+        #: whose confirmed estimate counted the profile asks for its refresh,
+        #: a finished re-index for the base's probe calibration.
         self._profile_refresh = profile_refresh
         self._recognizer = recognizer
         self._usage = usage
@@ -1649,7 +1650,7 @@ class KnowledgeIngestionRunner:
                     "knowledge.ingest_ready document=%s chunks=%d", document_id, chunk_count
                 )
                 # B-267 —— its confirmed estimate counted the base profile: refresh it.
-                await schedule_after_ingest(self._store, claim)
+                await schedule_after_ingest(self._store, claim, enabled=self._profile_refresh)
         except asyncio.CancelledError:
             if not lost.is_set():
                 raise
@@ -1797,9 +1798,13 @@ class KnowledgeIngestionRunner:
                 )
                 logger.info("knowledge.reindex_ready kb=%s", kb_id)
                 if self._profile_refresh:
-                    # B-267 —— new vectors: the probe threshold is redone.
-                    await self._store.mark_profile_refresh(
-                        tenant_id=tenant_id, kb_id=kb_id, now=datetime.now(UTC), calibrate_only=True
+                    # B-267 —— the probe threshold follows the vectors' model
+                    # (asked again only when the stored one is for another).
+                    await schedule_recalibration(
+                        self._store,
+                        tenant_id=tenant_id,
+                        kb_id=kb_id,
+                        model_key=f"{embedding_provider}/{embedding_model}",
                     )
         finally:
             await self._store.clear_reindex(tenant_id=tenant_id, kb_id=kb_id)

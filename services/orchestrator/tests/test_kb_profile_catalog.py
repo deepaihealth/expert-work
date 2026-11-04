@@ -77,7 +77,13 @@ async def _with_base(
         claims = await store.claim_profile_refreshes(now=_NOW + PROFILE_DEBOUNCE, limit=50)
         [claim] = [c for c in claims if c.kb_id == base.id]
         await store.finish_profile_refresh(
-            tenant_id=tenant, kb_id=base.id, marks=claim.marks, profile=profile, calibration=None
+            tenant_id=tenant,
+            kb_id=base.id,
+            holder=claim.holder,
+            marks=claim.marks,
+            profile=profile,
+            calibration=None,
+            now=_NOW,
         )
 
 
@@ -224,7 +230,13 @@ async def test_a_new_profile_changes_the_fingerprint_only_with_the_switch_on() -
     await store.mark_profile_refresh(tenant_id=tenant, kb_id=base.id, now=_NOW)
     [claim] = await store.claim_profile_refreshes(now=_NOW + PROFILE_DEBOUNCE, limit=1)
     await store.finish_profile_refresh(
-        tenant_id=tenant, kb_id=base.id, marks=claim.marks, profile=_profile(), calibration=None
+        tenant_id=tenant,
+        kb_id=base.id,
+        holder=claim.holder,
+        marks=claim.marks,
+        profile=_profile(),
+        calibration=None,
+        now=_NOW,
     )
     on_after = await catalog_fingerprint(
         store, tenant_id=tenant, refs=("books",), single_base=True, profiles=True
@@ -232,3 +244,20 @@ async def test_a_new_profile_changes_the_fingerprint_only_with_the_switch_on() -
     assert on_before != on_after
     off = await catalog_fingerprint(store, tenant_id=tenant, refs=("books",))
     assert off is None
+
+
+@pytest.mark.asyncio
+async def test_a_stale_profile_is_not_shown() -> None:
+    """A document deleted or switched off: its content must not keep showing
+    through the profile's topics until a new profile is generated."""
+    store, tenant = InMemoryKnowledgeStore(), uuid4()
+    await _with_base(store, tenant, "books", profile=_profile(), documents=2)
+    [base] = await store.list_bases(tenant_id=tenant)
+    document = (await store.list_documents(tenant_id=tenant, kb_id=base.id))[0]
+    await store.delete_document(tenant_id=tenant, document_id=document.id)
+    catalog = await load_knowledge_catalog(
+        store, tenant_id=tenant, refs=("books",), single_base=True, profiles=True
+    )
+    assert catalog is not None
+    assert "<profile>" not in catalog.render()
+    assert PROFILE_CATALOG_RULE not in catalog.render()

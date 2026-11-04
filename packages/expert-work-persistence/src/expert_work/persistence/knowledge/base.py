@@ -424,8 +424,10 @@ class KnowledgeStore(abc.ABC):
     async def claim_profile_refreshes(self, *, now: datetime, limit: int) -> list[ProfileClaim]:
         """Lease up to ``limit`` due refreshes across every tenant
         (:func:`~expert_work.persistence.knowledge.profiles.claimable`: due,
-        and no document of the base ``pending`` / ``processing`` unless the
-        first change waited too long). Caller bypasses row security."""
+        attempts left, and no document of the base ``pending`` / ``processing``
+        unless the first change waited too long), each to a new holder.
+        Refreshes whose attempts are used up are dropped on the way. Caller
+        bypasses row security."""
 
     @abc.abstractmethod
     async def finish_profile_refresh(
@@ -433,26 +435,35 @@ class KnowledgeStore(abc.ABC):
         *,
         tenant_id: UUID,
         kb_id: UUID,
+        holder: str,
         marks: int,
         profile: KnowledgeProfile | None,
         calibration: ProbeCalibration | None,
+        now: datetime,
+        retry_calibration: bool = False,
     ) -> None:
         """Store what a refresh produced (``None``: keep the stored part) and
-        clear the refresh unless newer changes asked again."""
+        clear the refresh unless newer changes asked again — only while
+        ``holder`` still holds it
+        (:func:`~expert_work.persistence.knowledge.profiles.finished`)."""
 
     @abc.abstractmethod
-    async def fail_profile_refresh(self, *, tenant_id: UUID, kb_id: UUID, now: datetime) -> None:
+    async def fail_profile_refresh(
+        self, *, tenant_id: UUID, kb_id: UUID, holder: str, now: datetime
+    ) -> None:
         """A refresh failed: keep the stored profile, retry later or give up
         (:func:`~expert_work.persistence.knowledge.profiles.failed`)."""
 
     @abc.abstractmethod
     async def profile_digest(
-        self, *, tenant_id: UUID, kb_id: UUID, max_documents: int, max_headings: int
+        self, *, tenant_id: UUID, kb_id: UUID, max_titles: int, detailed: int, max_headings: int
     ) -> ProfileDigest:
-        """The ready documents' :class:`DocumentDigest` (oldest first, at most
-        ``max_documents``; each with at most ``max_headings`` distinct section
-        headings and the first :data:`PROFILE_OPENING_CHARS` characters of its
-        first chunk) and the base's ready-document count."""
+        """The base's ready documents, newest first, at most ``max_titles`` of
+        them; the ``detailed`` ones sampled across that list
+        (:func:`~expert_work.persistence.knowledge.profiles.sample_positions`)
+        also carry up to ``max_headings`` distinct section headings (from their
+        first chunks) and the start of their first chunk. Plus the base's
+        ready-document count."""
 
     @abc.abstractmethod
     async def delete_base(self, *, tenant_id: UUID, kb_id: UUID) -> bool:
@@ -752,7 +763,8 @@ class KnowledgeStore(abc.ABC):
     async def delete_document(self, *, tenant_id: UUID, document_id: UUID) -> bool:
         """Delete a document and cascade its chunks, page records,
         recognition cache and passage revisions. ``False`` if no document
-        matched."""
+        matched. B-267: a document that had passages marks its base's profile
+        stale in the same transaction (:func:`profiles.staled`)."""
 
     @abc.abstractmethod
     async def set_document_pages(
@@ -874,7 +886,9 @@ class KnowledgeStore(abc.ABC):
         its chunks (and their own switches) and its place in every listing;
         recall leaves it out (:meth:`search`). Returns the ids that are this
         base's documents, in the order asked, each once — another base's,
-        another tenant's and unknown ids are skipped."""
+        another tenant's and unknown ids are skipped. B-267: switching off a
+        document that has passages marks the base's profile stale in the same
+        transaction (:func:`profiles.staled`)."""
 
     @abc.abstractmethod
     async def count_stale_documents(self, *, tenant_id: UUID, kb_id: UUID, params_hash: str) -> int:

@@ -12,7 +12,7 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Mapping, Sequence
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from copy import deepcopy
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -44,6 +44,8 @@ from orchestrator.tools import KnowledgeRetriever
 from orchestrator.tools.knowledge_probe import (
     MIN_SHARED_TERMS,
     MIN_TERM_CHARS,
+    PROBE_CONCURRENCY,
+    PROBE_MAX_BASES,
     KnowledgeProbe,
     ProbeOutcome,
     is_small_talk,
@@ -202,6 +204,8 @@ async def _base(
         await store.finish_profile_refresh(
             tenant_id=tenant,
             kb_id=base.id,
+            holder=claim.holder,
+            now=_NOW,
             marks=claim.marks,
             profile=None,
             calibration=calibration,
@@ -209,11 +213,20 @@ async def _base(
     return base.id
 
 
+async def _live() -> str | None:
+    return "acme/embed-1"
+
+
 def _probe(
-    store: InMemoryKnowledgeStore, refs: tuple[str, ...], embedder: FakeEmbedder | None = None
+    store: InMemoryKnowledgeStore,
+    refs: tuple[str, ...],
+    embedder: FakeEmbedder | None = None,
+    live: Callable[[], Awaitable[str | None]] | None = _live,
 ) -> KnowledgeProbe:
     return KnowledgeProbe(
-        retriever=KnowledgeRetriever(store=store, embedder=embedder or _Embedder()), refs=refs
+        retriever=KnowledgeRetriever(store=store, embedder=embedder or _Embedder()),
+        refs=refs,
+        live_model=live,
     )
 
 
@@ -292,6 +305,55 @@ async def test_a_calibration_under_another_model_is_not_used() -> None:
     )
     assert embedder.calls == 0
     assert outcome.reason == "miss"
+
+
+async def _other() -> str | None:
+    return "acme/embed-2"
+
+
+@pytest.mark.parametrize("live", [_other, None], ids=["platform-switched", "unknown"])
+async def test_the_query_model_must_be_the_calibrated_one(
+    live: Callable[[], Awaitable[str | None]] | None,
+) -> None:
+    """The platform switched models and the base is not re-indexed yet (or the
+    current model is unknown): a query vector now would not compare."""
+    store, tenant = InMemoryKnowledgeStore(), uuid4()
+    await _base(store, tenant, "books", ["unrelated"], threshold=0.1)
+    embedder = _Embedder(_cos(0.99))
+    outcome = await _probe(store, ("books",), embedder, live).run(
+        tenant_id=tenant, messages=_turn("zzz qqq vvv")
+    )
+    assert embedder.calls == 0
+    assert outcome.reason == "miss"
+
+
+class _Counting(InMemoryKnowledgeStore):
+    """Counts keyword searches and the most running at once."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.running = self.peak = self.calls = 0
+
+    async def keyword_search_scored(self, **kwargs: Any) -> list[ScoredChunk]:
+        self.calls += 1
+        self.running += 1
+        self.peak = max(self.peak, self.running)
+        await asyncio.sleep(0.01)
+        self.running -= 1
+        return []
+
+
+async def test_bases_are_probed_a_few_at_a_time_and_at_most_the_catalogs() -> None:
+    store, tenant = _Counting(), uuid4()
+    names = [f"kb{i}" for i in range(PROBE_MAX_BASES + 5)]
+    for name in names:
+        await store.create_base(tenant_id=tenant, name=name)
+    outcome = await _probe(store, tuple(names)).run(
+        tenant_id=tenant, messages=_turn("大国食养谁写的")
+    )
+    assert outcome.reason == "miss"
+    assert store.calls == PROBE_MAX_BASES == 20
+    assert store.peak == PROBE_CONCURRENCY == 4
 
 
 async def test_thresholds_are_per_base() -> None:

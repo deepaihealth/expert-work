@@ -199,6 +199,7 @@ class IngestEstimator:
             recognition=recognition.primary if recognition is not None and reads else None,
             fallback=recognition.fallback if recognition is not None and reads else None,
             figure=figure_model if figure_count is not None and figure_count.kept else None,
+            profile=self._profile_model,
         )
         items = tuple(lines.items)
         return IngestEstimate(

@@ -17,7 +17,7 @@ from __future__ import annotations
 
 import json
 import logging
-from collections.abc import Sequence
+from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
@@ -240,6 +240,10 @@ class ToolEnv:
     #: 条目写 ``config.fixture: <名字>`` 时从这里读 ``<名字>.json``;``None`` 时选了
     #: 夹具就是构建期配置错误,绝不悄悄退回真搜索。
     web_search_fixtures_dir: str | None = None
+    #: B-267 第 3 步 —— 当前平台嵌入模型 ``provider/model``(控制面读平台配置)。每轮探测只在
+    #: 库的校准、库向量的模型、此刻查询用的模型三者一致时才用向量这一路;``None``(没接线)=
+    #: 只用关键词。进程内字段,不是 manifest 字段。
+    embedding_model_key: Callable[[], Awaitable[str | None]] | None = None
 
 
 async def build_tool_registry(

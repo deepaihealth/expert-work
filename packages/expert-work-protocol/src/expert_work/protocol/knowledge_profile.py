@@ -95,8 +95,12 @@ class KnowledgeProfile(GeneratedProfile):
     documents and by which model (``provider/model``) it was made."""
 
     generated_at: datetime
+    #: How many documents the digest the profile was made from represented.
     source_doc_count: int = Field(ge=0)
     model: str
+    #: sha256 of the rendered digest: an unchanged digest is not sent again
+    #: (no spend, the profile — and the prompts that carry it — stay as they are).
+    digest_sha256: str | None = None
 
 
 class ProbeCalibration(BaseModel):
@@ -126,6 +130,9 @@ class ProfileRefresh(BaseModel):
     marks: int = Field(default=1, ge=1)
     attempts: int = Field(default=0, ge=0)
     calibrate_only: bool = False
+    #: The claim holding it (a fencing token): only that claim may finish or
+    #: fail it, so a worker whose lease ran out cannot overwrite a newer result.
+    holder: str | None = None
 
 
 class KnowledgeProfileRecord(BaseModel):
@@ -136,9 +143,17 @@ class KnowledgeProfileRecord(BaseModel):
     profile: KnowledgeProfile | None = None
     calibration: ProbeCalibration | None = None
     refresh: ProfileRefresh | None = None
+    #: Set when a document the profile may describe was deleted or switched
+    #: off: the catalog stops showing the profile until a new one is generated
+    #: (deleted content must not keep showing through its topics).
+    stale_since: datetime | None = None
 
     def is_empty(self) -> bool:
         return self.profile is None and self.calibration is None and self.refresh is None
+
+    def shown_profile(self) -> KnowledgeProfile | None:
+        """The profile the catalog may show — none while stale."""
+        return self.profile if self.stale_since is None else None
 
 
 def parse_profile_record(raw: Any) -> KnowledgeProfileRecord | None:

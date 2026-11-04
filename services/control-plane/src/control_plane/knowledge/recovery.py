@@ -40,7 +40,7 @@ from control_plane.knowledge.ingestion import (
     start_paid_ingest,
 )
 from control_plane.knowledge.parsed_size import DocumentTooLargeError, Hold, reserve_raw_bytes
-from control_plane.knowledge.profile import ProfileRefresher, schedule_after_ingest
+from control_plane.knowledge.profile import schedule_after_ingest
 from control_plane.knowledge.recognition.figure_pipeline import FigureDescriber
 from control_plane.knowledge.recognition.figure_storage import delete_figures_quietly
 from control_plane.knowledge.recognition.recognizer import DocumentRecognizer
@@ -105,7 +105,7 @@ class KnowledgeIngestRecoveryWorker:
         estimator: IngestEstimator | None = None,
         audit: AuditLogger | None = None,
         object_store: ObjectStore | None = None,
-        profiles: ProfileRefresher | None = None,
+        profile_refresh: bool = False,
     ) -> None:
         if interval_s <= 0:
             msg = "interval_s must be positive"
@@ -132,9 +132,9 @@ class KnowledgeIngestRecoveryWorker:
         self.local = local if local is not None else LocalIngests()
         #: B-222 PR-2 —— audits each estimate withdrawn on its deadline.
         self._audit = audit
-        #: B-267 —— runs due base-profile refreshes each pass (``None``: the
-        #: platform switch ``kb_first_routing`` is off — nothing runs).
-        self._profiles = profiles
+        #: B-267 —— the platform switch ``kb_first_routing``: a ready document
+        #: whose confirmed estimate counted the profile asks for its refresh.
+        self._profile_refresh = profile_refresh
         self._task: asyncio.Task[None] | None = None
         self._stop = asyncio.Event()
 
@@ -184,7 +184,6 @@ class KnowledgeIngestRecoveryWorker:
             current_tenant_id_var.reset(token_tenant)
             bypass_rls_var.reset(token_bypass)
         await self._expire_estimates()
-        await self._refresh_profiles()
 
         drives: list[tuple[ClaimedIngestion, asyncio.Task[bool]]] = []
         try:
@@ -216,21 +215,6 @@ class KnowledgeIngestRecoveryWorker:
             elif outcome:
                 settled += 1
         return settled
-
-    async def _refresh_profiles(self) -> None:
-        """B-267 —— run the due base-profile refreshes (claimed across tenants,
-        so row security is bypassed for the pass). A failure is logged and
-        never stops the ingest recovery."""
-        if self._profiles is None:
-            return
-        token_bypass = bypass_rls_var.set(True)
-        try:
-            await self._profiles.run_due()
-        except Exception:
-            _cycle_errors.inc()
-            logger.exception("knowledge.recovery.profile_refresh_failed")
-        finally:
-            bypass_rls_var.reset(token_bypass)
 
     async def _expire_estimates(self) -> None:
         """B-222 PR-2 (§6.5) —— withdraw the estimates nobody confirmed by their
@@ -443,7 +427,7 @@ class KnowledgeIngestRecoveryWorker:
             # This claim's chunks are in place and READY, in one transaction.
             written = ready = True
             # B-267 —— its confirmed estimate counted the base profile: refresh it.
-            await schedule_after_ingest(self._store, claim)
+            await schedule_after_ingest(self._store, claim, enabled=self._profile_refresh)
         except Exception as exc:
             if isinstance(exc, StaleIngestionError) and not isinstance(exc, ModelsCheckFailedError):
                 # 重传 / 已被别的认领收尾 —— 本次驱动的结果作废,什么都不写。

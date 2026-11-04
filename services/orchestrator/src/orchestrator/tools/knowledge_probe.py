@@ -21,9 +21,11 @@ corpora score differently):
 
 * vector: a passage scoring above the base's own calibration
   (``knowledge_base.profile.calibration``: the 90th percentile of the top score
-  generic, content-free queries reach in that base, under the embedding model
-  that produced its vectors). No calibration for the base's current model →
-  the vector side is not used for it (and no query is embedded for it).
+  generic, content-free queries reach in that base). Only when that
+  calibration, the base's vectors and the query embedded now are the same
+  model (the platform's current one, ``ToolEnv.embedding_model_key``);
+  otherwise — or with no calibration yet — the vector side is not used for
+  the base, and no query is embedded for it.
 * keyword: among the base's top keyword hits (``keyword_search_scored``,
   ranked by BM25-idf coverage over the base's own passages), a passage that
   holds an identifier the message names (a product / patent / document code),
@@ -44,7 +46,7 @@ import asyncio
 import logging
 import time
 import unicodedata
-from collections.abc import Sequence
+from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass
 from typing import Final, Literal
 from uuid import UUID
@@ -64,11 +66,15 @@ from expert_work.persistence.knowledge.text_search import (
 from expert_work.protocol import KnowledgeBase, KnowledgeChunk
 from orchestrator.graph_builder.platform_context import strip_platform_context
 from orchestrator.tools.knowledge import KnowledgeRetriever
+from orchestrator.tools.knowledge_catalog import MAX_CATALOG_BASES
 
 logger = logging.getLogger(__name__)
 
 #: Passages each path recalls per base.
 PROBE_TOP_K: Final = 3
+#: Bases probed at most (the catalog lists as many) and at the same time.
+PROBE_MAX_BASES: Final = MAX_CATALOG_BASES
+PROBE_CONCURRENCY: Final = 4
 #: The whole probe (every base, both paths, the query embedding) gets this long.
 PROBE_TIMEOUT_S: Final = 1.5
 #: A keyword hit without an identifier needs this many distinct content words
@@ -308,14 +314,17 @@ def probe_line(hits: Sequence[tuple[str, int]]) -> str | None:
     )
 
 
-def calibrated_threshold(base: KnowledgeBase) -> float | None:
-    """The base's vector threshold — only under the embedding model its
-    vectors (and its calibration) were made with."""
+def calibrated_threshold(base: KnowledgeBase, live_model: str | None) -> float | None:
+    """The base's vector threshold — only when its calibration, its vectors
+    and the query embedded now (``live_model``, the platform's current
+    ``provider/model``) are all the same model; otherwise the scores do not
+    compare and the vector side is not used."""
     record = base.profile
     calibration = record.calibration if record is not None else None
     if calibration is None or not base.embedding_provider or not base.embedding_model:
         return None
-    if calibration.embedding_model != f"{base.embedding_provider}/{base.embedding_model}":
+    stamped = f"{base.embedding_provider}/{base.embedding_model}"
+    if not (calibration.embedding_model == stamped == live_model):
         return None
     return calibration.vector_threshold
 
@@ -328,6 +337,9 @@ class KnowledgeProbe:
 
     retriever: KnowledgeRetriever
     refs: tuple[str, ...]
+    #: The platform's current embedding model (``ToolEnv.embedding_model_key``);
+    #: ``None``: unknown, so keywords only.
+    live_model: Callable[[], Awaitable[str | None]] | None = None
     timeout_s: float = PROBE_TIMEOUT_S
 
     async def run(self, *, tenant_id: UUID, messages: Sequence[BaseMessage]) -> ProbeOutcome:
@@ -340,8 +352,13 @@ class KnowledgeProbe:
         if is_small_talk(latest):
             return self._done(ProbeOutcome(reason="small_talk"))
         query = turn_query(messages) or latest
+        # Segmenting loads jieba's dictionary on first use (about a second,
+        # blocking): done in a thread, outside the time budget.
+        terms = await asyncio.to_thread(build_kb_keyword_query, query)
         try:
-            hits = await asyncio.wait_for(self._hits(tenant_id, query), timeout=self.timeout_s)
+            hits = await asyncio.wait_for(
+                self._hits(tenant_id, query, terms), timeout=self.timeout_s
+            )
         except TimeoutError:
             return self._done(ProbeOutcome(reason="timeout", elapsed_ms=_ms(started)))
         except Exception:
@@ -370,39 +387,57 @@ class KnowledgeProbe:
         )
         return outcome
 
-    async def _hits(self, tenant_id: UUID, query: str) -> list[tuple[str, int]] | None:
+    async def _hits(
+        self, tenant_id: UUID, query: str, terms: KbKeywordQuery | None
+    ) -> list[tuple[str, int]] | None:
         """``(handle, related passages)`` of each base with any — ``None``
-        when no bound base exists."""
+        when no bound base exists. At most :data:`PROBE_MAX_BASES` bases (the
+        catalog's), :data:`PROBE_CONCURRENCY` at a time."""
         by_name = {b.name: b for b in await self.retriever.store.list_bases(tenant_id=tenant_id)}
         bases = [
             (f"K{position}", by_name[ref])
             for position, ref in enumerate(self.refs, 1)
             if ref in by_name
-        ]
+        ][:PROBE_MAX_BASES]
         if not bases:
             return None
+        live = await self.live_model() if self.live_model is not None else None
+        thresholds = [calibrated_threshold(base, live) for _handle, base in bases]
         vector: tuple[float, ...] | None = None
-        if any(calibrated_threshold(base) is not None for _handle, base in bases):
+        if any(threshold is not None for threshold in thresholds):
             vector = await self.retriever.query_vector(query, tenant_id)
+        gate = asyncio.Semaphore(PROBE_CONCURRENCY)
+
+        async def related(base: KnowledgeBase, threshold: float | None) -> int:
+            async with gate:
+                return await self._related(tenant_id, base, query, terms, vector, threshold)
+
         counts = await asyncio.gather(
-            *(self._related(tenant_id, base, query, vector) for _handle, base in bases)
+            *(
+                related(base, threshold)
+                for (_handle, base), threshold in zip(bases, thresholds, strict=True)
+            )
         )
         return [
             (handle, count) for (handle, _base), count in zip(bases, counts, strict=True) if count
         ]
 
     async def _related(
-        self, tenant_id: UUID, base: KnowledgeBase, query: str, vector: tuple[float, ...] | None
+        self,
+        tenant_id: UUID,
+        base: KnowledgeBase,
+        query: str,
+        terms: KbKeywordQuery | None,
+        vector: tuple[float, ...] | None,
+        threshold: float | None,
     ) -> int:
         store = self.retriever.store
         related: set[UUID] = set()
-        terms = build_kb_keyword_query(query)
         if terms is not None:
             keyword = await store.keyword_search_scored(
                 tenant_id=tenant_id, kb_ids=[base.id], query=query, limit=PROBE_TOP_K
             )
             related.update(hit.chunk.id for hit in keyword if keyword_related(terms, hit.chunk))
-        threshold = calibrated_threshold(base)
         if vector is not None and threshold is not None:
             nearest = await store.search_scored(
                 tenant_id=tenant_id, kb_ids=[base.id], query_embedding=vector, limit=PROBE_TOP_K

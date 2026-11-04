@@ -11,10 +11,12 @@ from __future__ import annotations
 from collections import defaultdict
 from collections.abc import Callable
 from datetime import datetime
+from typing import Any
 from uuid import UUID
 
-from sqlalchemy import func, select
+from sqlalchemy import DateTime, String, and_, case, cast, func, literal, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+from sqlalchemy.sql.elements import ColumnElement
 
 from expert_work.persistence.knowledge import profiles
 from expert_work.persistence.knowledge.profiles import ProfileClaim, ProfileDigest
@@ -28,13 +30,31 @@ from expert_work.protocol.knowledge_profile import (
     parse_profile_record,
 )
 
-#: How many bases one claim pass looks at (due or not): refreshes are rare and
-#: the table is small, so the pass reads the rows that carry a refresh at all.
+#: Due refreshes one claim pass reads (earliest due first).
 _CLAIM_SCAN_LIMIT = 200
 _INGESTING = (DocumentStatus.PENDING.value, DocumentStatus.PROCESSING.value)
-#: Only a document's first chunks are read for its headings and opening: a
-#: digest keeps a handful of headings, and a long document's rows are many.
-_DIGEST_CHUNK_SCAN = 400
+#: The shape pydantic writes a ``due_at`` in; anything else is never cast (a
+#: cast of a malformed value would fail the whole claim query).
+_ISO_TIMESTAMP = r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?(Z|[+-]\d{2}:\d{2})$"
+
+
+def _due_at() -> ColumnElement[Any]:
+    raw = KnowledgeBaseRow.profile["refresh"]["due_at"].astext
+    return case((raw.op("~")(literal(_ISO_TIMESTAMP, String)), cast(raw, DateTime(timezone=True))))
+
+
+async def mark_profile_stale(
+    session: AsyncSession, tenant_id: UUID, kb_id: UUID, now: datetime
+) -> None:
+    """B-267 —— inside the caller's transaction: the base's profile no longer
+    shows (a document it may describe left the base). Locks the base row
+    after the caller's document rows — the order every writer here uses."""
+    row = await SqlProfiles._locked_base(session, tenant_id, kb_id)
+    if row is None:
+        return
+    record = profiles.staled(parse_profile_record(row.profile), now=now)
+    if record is not None:
+        row.profile = dump_profile_record(record)
 
 
 class SqlProfiles:
@@ -79,13 +99,14 @@ class SqlProfiles:
         )
 
     async def claim_profile_refreshes(self, *, now: datetime, limit: int) -> list[ProfileClaim]:
+        due = _due_at()
         async with self._sf() as session:
             rows = (
                 (
                     await session.execute(
                         select(KnowledgeBaseRow)
-                        .where(KnowledgeBaseRow.profile.has_key("refresh"))
-                        .order_by(KnowledgeBaseRow.created_at.asc())
+                        .where(and_(due.is_not(None), due <= now))
+                        .order_by(due)
                         .limit(_CLAIM_SCAN_LIMIT)
                         .with_for_update(skip_locked=True)
                     )
@@ -98,23 +119,9 @@ class SqlProfiles:
             for row in rows:
                 if len(claims) >= limit:
                     break
-                record = parse_profile_record(row.profile)
-                if record is None or not profiles.claimable(
-                    record, now=now, ingesting=row.id in ingesting
-                ):
-                    continue
-                held = profiles.claimed(record, now=now)
-                row.profile = dump_profile_record(held)
-                assert held.refresh is not None  # noqa: S101 - claimed keeps the refresh
-                claims.append(
-                    ProfileClaim(
-                        tenant_id=row.tenant_id,
-                        kb_id=row.id,
-                        marks=held.refresh.marks,
-                        attempts=held.refresh.attempts,
-                        calibrate_only=held.refresh.calibrate_only,
-                    )
-                )
+                claim = _claim_row(row, now=now, ingesting=row.id in ingesting)
+                if claim is not None:
+                    claims.append(claim)
             await session.commit()
         return claims
 
@@ -137,25 +144,36 @@ class SqlProfiles:
         *,
         tenant_id: UUID,
         kb_id: UUID,
+        holder: str,
         marks: int,
         profile: KnowledgeProfile | None,
         calibration: ProbeCalibration | None,
+        now: datetime,
+        retry_calibration: bool = False,
     ) -> None:
         await self._rewrite_profile(
             tenant_id,
             kb_id,
             lambda record: profiles.finished(
-                record, marks=marks, profile=profile, calibration=calibration
+                record,
+                holder=holder,
+                marks=marks,
+                profile=profile,
+                calibration=calibration,
+                now=now,
+                retry_calibration=retry_calibration,
             ),
         )
 
-    async def fail_profile_refresh(self, *, tenant_id: UUID, kb_id: UUID, now: datetime) -> None:
+    async def fail_profile_refresh(
+        self, *, tenant_id: UUID, kb_id: UUID, holder: str, now: datetime
+    ) -> None:
         await self._rewrite_profile(
-            tenant_id, kb_id, lambda record: profiles.failed(record, now=now)
+            tenant_id, kb_id, lambda record: profiles.failed(record, holder=holder, now=now)
         )
 
     async def profile_digest(
-        self, *, tenant_id: UUID, kb_id: UUID, max_documents: int, max_headings: int
+        self, *, tenant_id: UUID, kb_id: UUID, max_titles: int, detailed: int, max_headings: int
     ) -> ProfileDigest:
         in_base = (
             KnowledgeDocumentRow.tenant_id == tenant_id,
@@ -177,46 +195,98 @@ class SqlProfiles:
                         KnowledgeDocumentRow.filename,
                     )
                     .where(*in_base)
-                    .order_by(KnowledgeDocumentRow.created_at.asc(), KnowledgeDocumentRow.filename)
-                    .limit(max_documents)
+                    .order_by(KnowledgeDocumentRow.created_at.desc(), KnowledgeDocumentRow.filename)
+                    .limit(max_titles)
                 )
             ).all()
-            chunks = await self._digest_chunks(session, tenant_id, [doc.id for doc in docs])
+            sampled = [docs[i].id for i in profiles.sample_positions(len(docs), detailed)]
+            headings = await self._digest_headings(session, tenant_id, sampled)
+            openings = await self._digest_openings(session, tenant_id, sampled)
+        detail = set(sampled)
         digests = tuple(
             profiles.document_digest(
                 doc.title or doc.filename,
-                [path for _index, path, _text in chunks[doc.id]],
-                chunks[doc.id][0][2] if chunks[doc.id] else None,
+                headings[doc.id],
+                openings.get(doc.id),
                 max_headings=max_headings,
             )
+            if doc.id in detail
+            else profiles.DocumentDigest(title=doc.title or doc.filename)
             for doc in docs
         )
         return ProfileDigest(documents=digests, ready_documents=int(total))
 
     @staticmethod
-    async def _digest_chunks(
+    async def _digest_headings(
         session: AsyncSession, tenant_id: UUID, document_ids: list[UUID]
-    ) -> defaultdict[UUID, list[tuple[int, list[str] | None, str]]]:
-        """Each document's enabled chunks in order: index, heading path and
-        the start of the text (only the first chunk's is used)."""
-        out: defaultdict[UUID, list[tuple[int, list[str] | None, str]]] = defaultdict(list)
+    ) -> defaultdict[UUID, list[list[str] | None]]:
+        """Each sampled document's distinct heading paths among its first
+        :data:`profiles.PROFILE_HEADING_SCAN` chunks, in order of appearance."""
+        out: defaultdict[UUID, list[list[str] | None]] = defaultdict(list)
         if not document_ids:
             return out
+        first = func.min(KnowledgeChunkRow.chunk_index)
+        rows = await session.execute(
+            select(KnowledgeChunkRow.document_id, KnowledgeChunkRow.heading_path)
+            .where(
+                KnowledgeChunkRow.tenant_id == tenant_id,
+                KnowledgeChunkRow.document_id.in_(document_ids),
+                KnowledgeChunkRow.enabled.is_(True),
+                KnowledgeChunkRow.heading_path.is_not(None),
+                KnowledgeChunkRow.chunk_index < profiles.PROFILE_HEADING_SCAN,
+            )
+            .group_by(KnowledgeChunkRow.document_id, KnowledgeChunkRow.heading_path)
+            .order_by(KnowledgeChunkRow.document_id, first)
+        )
+        for document_id, path in rows.all():
+            out[document_id].append(path)
+        return out
+
+    @staticmethod
+    async def _digest_openings(
+        session: AsyncSession, tenant_id: UUID, document_ids: list[UUID]
+    ) -> dict[UUID, str]:
+        """The start of each sampled document's first enabled chunk only."""
+        if not document_ids:
+            return {}
         rows = await session.execute(
             select(
                 KnowledgeChunkRow.document_id,
-                KnowledgeChunkRow.chunk_index,
-                KnowledgeChunkRow.heading_path,
                 func.substr(KnowledgeChunkRow.content, 1, profiles.PROFILE_OPENING_CHARS * 2),
             )
             .where(
                 KnowledgeChunkRow.tenant_id == tenant_id,
                 KnowledgeChunkRow.document_id.in_(document_ids),
                 KnowledgeChunkRow.enabled.is_(True),
-                KnowledgeChunkRow.chunk_index < _DIGEST_CHUNK_SCAN,
             )
+            .distinct(KnowledgeChunkRow.document_id)
             .order_by(KnowledgeChunkRow.document_id, KnowledgeChunkRow.chunk_index)
         )
-        for document_id, index, path, text in rows.all():
-            out[document_id].append((index, path, text))
-        return out
+        return dict(rows.tuples().all())
+
+
+def _claim_row(row: KnowledgeBaseRow, *, now: datetime, ingesting: bool) -> ProfileClaim | None:
+    """Claim one locked row, or clean it: an unreadable record loses its
+    refresh (it would sit in every claim pass), a used-up refresh is dropped."""
+    record = parse_profile_record(row.profile)
+    if record is None:
+        raw = dict(row.profile or {})
+        raw.pop("refresh", None)
+        row.profile = raw or None
+        return None
+    if profiles.exhausted(record):
+        row.profile = dump_profile_record(profiles.dropped(record))
+        return None
+    if not profiles.claimable(record, now=now, ingesting=ingesting):
+        return None
+    held = profiles.claimed(record, now=now)
+    row.profile = dump_profile_record(held)
+    assert held.refresh is not None and held.refresh.holder is not None  # noqa: S101
+    return ProfileClaim(
+        tenant_id=row.tenant_id,
+        kb_id=row.id,
+        marks=held.refresh.marks,
+        attempts=held.refresh.attempts,
+        calibrate_only=held.refresh.calibrate_only,
+        holder=held.refresh.holder,
+    )

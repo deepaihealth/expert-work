@@ -274,7 +274,12 @@ async def load_knowledge_catalog(
         for position, base in found
     )
     if profiles:
-        entries = _with_profiles(entries, [base for _position, base in found], counts)
+        # Only the listed bases spend the profile budget.
+        listed = [base for _position, base in found][:MAX_CATALOG_BASES]
+        entries = (
+            _with_profiles(entries[:MAX_CATALOG_BASES], listed, counts)
+            + entries[MAX_CATALOG_BASES:]
+        )
     return KnowledgeCatalog(
         entries=entries[:MAX_CATALOG_BASES],
         omitted=max(0, len(entries) - MAX_CATALOG_BASES),
@@ -286,12 +291,13 @@ def _with_profiles(
     entries: tuple[CatalogEntry, ...], bases: Sequence[KnowledgeBase], counts: Mapping[UUID, int]
 ) -> tuple[CatalogEntry, ...]:
     """``entries`` with their bases' profiles, in order, while the total stays
-    within :data:`MAX_PROFILE_CHARS` (a base without documents shows none)."""
+    within :data:`MAX_PROFILE_CHARS` (a base without documents, or whose
+    profile is stale — a document deleted or switched off — shows none)."""
     out: list[CatalogEntry] = []
     budget = MAX_PROFILE_CHARS
     for entry, base in zip(entries, bases, strict=True):
         record = base.profile
-        profile = record.profile if record is not None else None
+        profile = record.shown_profile() if record is not None else None
         if profile is None or counts.get(base.id, 0) == 0:
             out.append(entry)
             continue

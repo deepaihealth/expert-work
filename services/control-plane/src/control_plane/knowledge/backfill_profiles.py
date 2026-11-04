@@ -11,7 +11,12 @@ dry-run total to the user before applying (B-222: every spend is confirmed).
 Run inside a control-plane pod (its settings and database)::
 
     python -m control_plane.knowledge.backfill_profiles            # dry-run
-    python -m control_plane.knowledge.backfill_profiles --apply
+    python -m control_plane.knowledge.backfill_profiles --apply --expected-total 1.23
+
+``--tenant`` / ``--kb`` narrow both modes to one tenant / one base; ``--apply``
+recomputes the plan and refuses when its total is above ``--expected-total``
+(the dry-run total the user confirmed) or anything is unpriced. Bases whose
+profile was marked stale (a document deleted or switched off) are listed too.
 
 ``--apply`` refuses when the platform switch ``kb_first_routing`` is off:
 nothing would run the refreshes.
@@ -31,12 +36,14 @@ from uuid import UUID
 from control_plane.knowledge.chunking import count_tokens
 from control_plane.knowledge.pricing import PriceSource, price_tokens, split_model_key
 from control_plane.knowledge.profile import (
-    PROFILE_MAX_DOCUMENTS,
+    PROFILE_DETAILED_DOCUMENTS,
     PROFILE_MAX_HEADINGS,
+    PROFILE_MAX_TITLES,
     PROFILE_OUTPUT_TOKENS_MAX,
     AuxModelChoice,
     calibration_tokens,
     profile_prompt,
+    render_digest,
 )
 from expert_work.persistence import KnowledgeStore
 from expert_work.persistence.knowledge.profiles import PROFILE_DEBOUNCE
@@ -93,26 +100,42 @@ async def _priced(
     )
 
 
+def _wanted(base: KnowledgeBase, tenant_id: UUID | None, kb_id: UUID | None) -> bool:
+    """In the filters, and without a profile that is shown (none, or stale)."""
+    if tenant_id is not None and base.tenant_id != tenant_id:
+        return False
+    if kb_id is not None and base.id != kb_id:
+        return False
+    return base.profile is None or base.profile.shown_profile() is None
+
+
 async def plan_backfill(
-    store: KnowledgeStore, prices: PriceSource | None, *, aux: AuxModelChoice
+    store: KnowledgeStore,
+    prices: PriceSource | None,
+    *,
+    aux: AuxModelChoice,
+    tenant_id: UUID | None = None,
+    kb_id: UUID | None = None,
 ) -> list[BaseBackfill]:
-    """Every base without a generated profile, with what one would cost (the
-    prompt counted on its real digest; the answer at its upper bound). Caller
-    bypasses row security (all tenants)."""
+    """Every base (within the filters) without a profile it shows — none yet,
+    or stale — with what one would cost (the prompt counted on its real
+    digest; the answer at its cap). Caller bypasses row security."""
     plan: list[BaseBackfill] = []
     async for base in _all_bases(store):
-        if base.profile is not None and base.profile.profile is not None:
+        if not _wanted(base, tenant_id, kb_id):
             continue
         digest = await store.profile_digest(
             tenant_id=base.tenant_id,
             kb_id=base.id,
-            max_documents=PROFILE_MAX_DOCUMENTS,
+            max_titles=PROFILE_MAX_TITLES,
+            detailed=PROFILE_DETAILED_DOCUMENTS,
             max_headings=PROFILE_MAX_HEADINGS,
         )
-        if not digest.documents:
+        rendered = render_digest(digest)
+        if not rendered.represented:
             plan.append(BaseBackfill(base.tenant_id, base.id, 0, 0, 0, 0, 0))
             continue
-        input_tokens = count_tokens(profile_prompt(digest))
+        input_tokens = count_tokens(profile_prompt(rendered))
         embedding = (
             f"{base.embedding_provider}/{base.embedding_model}"
             if base.embedding_provider and base.embedding_model
@@ -125,7 +148,7 @@ async def plan_backfill(
             BaseBackfill(
                 tenant_id=base.tenant_id,
                 kb_id=base.id,
-                documents=digest.ready_documents,
+                documents=rendered.represented,
                 input_tokens=input_tokens,
                 output_tokens=PROFILE_OUTPUT_TOKENS_MAX,
                 calibration_tokens=calibration,
@@ -152,6 +175,18 @@ async def apply_backfill(
         ):
             asked += 1
     return asked
+
+
+def total_micros(plan: list[BaseBackfill]) -> int:
+    """What the planned refreshes cost in all (priced ones)."""
+    return sum(entry.micros for entry in plan if entry.documents and entry.micros is not None)
+
+
+def within_expected(plan: list[BaseBackfill], expected_cny: float) -> bool:
+    """``--apply`` only when the recomputed total is not above what the user
+    was shown (and confirmed) — and nothing is unpriced, which would hide spend."""
+    unpriced = any(entry.documents and entry.micros is None for entry in plan)
+    return not unpriced and total_micros(plan) <= round(expected_cny * 1_000_000)
 
 
 def summary(plan: list[BaseBackfill]) -> str:
@@ -182,6 +217,9 @@ async def _amain(args: argparse.Namespace) -> int:  # pragma: no cover - needs a
     if args.apply and not settings.kb_first_routing:
         print("ERROR: kb_first_routing is off — no worker would run the refreshes")
         return 2
+    if args.apply and args.expected_total is None:
+        print("ERROR: --apply needs --expected-total (the dry-run total the user confirmed)")
+        return 2
     engine = create_async_engine_from_config(
         DatabaseConfig(dsn=args.dsn or settings.db_dsn, pgbouncer_mode=settings.db_pgbouncer_mode)
     )
@@ -194,10 +232,13 @@ async def _amain(args: argparse.Namespace) -> int:  # pragma: no cover - needs a
             model=settings.memory_consolidator_default_aux_model,
         )
         async with bypass_rls_session():
-            plan = await plan_backfill(store, prices, aux=aux)
+            plan = await plan_backfill(store, prices, aux=aux, tenant_id=args.tenant, kb_id=args.kb)
             for entry in plan:
                 print(entry.line())
             print(summary(plan))
+            if args.apply and not within_expected(plan, args.expected_total):
+                print("ERROR: the total is above --expected-total (or unpriced); nothing asked")
+                return 3
             if args.apply:
                 print(f"asked={await apply_backfill(store, plan)}")
             else:
@@ -211,6 +252,14 @@ def main() -> None:  # pragma: no cover - CLI entry
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--apply", action="store_true", help="ask for the refreshes")
     parser.add_argument("--dsn", default=None, help="override the DB DSN")
+    parser.add_argument("--tenant", type=UUID, default=None, help="only this tenant's bases")
+    parser.add_argument("--kb", type=UUID, default=None, help="only this base")
+    parser.add_argument(
+        "--expected-total",
+        type=float,
+        default=None,
+        help="--apply refuses when the recomputed total (CNY) is above this",
+    )
     raise SystemExit(asyncio.run(_amain(parser.parse_args())))
 
 

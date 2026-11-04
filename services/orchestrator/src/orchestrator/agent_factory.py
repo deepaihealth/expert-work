@@ -2020,7 +2020,9 @@ def _knowledge_probe(spec: AgentSpec, env: ToolEnv) -> KnowledgeProbe | None:
     ):
         return None
     return KnowledgeProbe(
-        retriever=env.knowledge_retriever, refs=tuple(knowledge.knowledge_base_refs)
+        retriever=env.knowledge_retriever,
+        refs=tuple(knowledge.knowledge_base_refs),
+        live_model=env.embedding_model_key,
     )
 
 

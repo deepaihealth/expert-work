@@ -9,7 +9,13 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from uuid import UUID, uuid4
 
-from control_plane.knowledge.backfill_profiles import apply_backfill, plan_backfill, summary
+from control_plane.knowledge.backfill_profiles import (
+    apply_backfill,
+    plan_backfill,
+    summary,
+    total_micros,
+    within_expected,
+)
 from control_plane.knowledge.chunking import count_tokens
 from control_plane.knowledge.pricing import Rate
 from control_plane.knowledge.profile import (
@@ -17,6 +23,7 @@ from control_plane.knowledge.profile import (
     AuxModelChoice,
     calibration_tokens,
     profile_prompt,
+    render_digest,
 )
 from expert_work.persistence import InMemoryKnowledgeStore
 from expert_work.persistence.embedding import EMBEDDING_DIM
@@ -38,6 +45,25 @@ class _Prices:
             ("acme", "chat-1"): Rate(2_000_000, 8_000_000),
             ("acme", "embed-1"): Rate(500_000, 0),
         }.get((provider, model))
+
+
+async def _ready(store: InMemoryKnowledgeStore, tenant: UUID, kb_id: UUID, filename: str) -> None:
+    document = await store.upsert_document(
+        tenant_id=tenant, kb_id=kb_id, filename=filename, content=b"x"
+    )
+    chunk = KnowledgeChunk(
+        id=uuid4(),
+        tenant_id=tenant,
+        kb_id=kb_id,
+        document_id=document.id,
+        chunk_index=0,
+        content=_SECRET_TEXT,
+        embedding=(1.0,) + (0.0,) * (EMBEDDING_DIM - 1),
+    )
+    await store.replace_chunks(tenant_id=tenant, document_id=document.id, chunks=[chunk])
+    await store.set_document_status(
+        tenant_id=tenant, document_id=document.id, status=DocumentStatus.READY, chunk_count=1
+    )
 
 
 async def _base(store: InMemoryKnowledgeStore, *, documents: int, name: str) -> tuple[UUID, UUID]:
@@ -71,9 +97,9 @@ async def test_dry_run_prints_ids_and_numbers_only() -> None:
     plan = await plan_backfill(store, _Prices(), aux=_AUX)
     [entry] = plan
     digest = await store.profile_digest(
-        tenant_id=tenant, kb_id=kb_id, max_documents=200, max_headings=5
+        tenant_id=tenant, kb_id=kb_id, max_titles=400, detailed=24, max_headings=3
     )
-    input_tokens = count_tokens(profile_prompt(digest))
+    input_tokens = count_tokens(profile_prompt(render_digest(digest)))
     expected = (input_tokens * 2_000_000 + PROFILE_OUTPUT_TOKENS_MAX * 8_000_000) // 1_000_000
     expected += calibration_tokens() * 500_000 // 1_000_000
     assert (entry.documents, entry.input_tokens, entry.micros) == (2, input_tokens, expected)
@@ -94,12 +120,52 @@ async def test_bases_with_a_profile_are_left_out_and_empty_ones_skipped() -> Non
         summary="s", generated_at=_NOW, source_doc_count=1, model="acme/chat-1"
     )
     await store.finish_profile_refresh(
-        tenant_id=tenant, kb_id=kb_id, marks=claim.marks, profile=profile, calibration=None
+        tenant_id=tenant,
+        kb_id=kb_id,
+        holder=claim.holder,
+        marks=claim.marks,
+        profile=profile,
+        calibration=None,
+        now=_NOW,
     )
     await _base(store, documents=0, name="b")
     plan = await plan_backfill(store, _Prices(), aux=_AUX)
     assert [entry.documents for entry in plan] == [0]
     assert summary(plan).startswith("bases=0 skipped_empty=1 ")
+    # A stale profile (a document deleted) is listed again.
+    [document] = await store.list_documents(tenant_id=tenant, kb_id=kb_id)
+    await _ready(store, tenant, kb_id, "extra.md")
+    await store.delete_document(tenant_id=tenant, document_id=document.id)
+    plan = await plan_backfill(store, _Prices(), aux=_AUX)
+    assert sorted(entry.documents for entry in plan) == [0, 1]
+
+
+async def test_filters_narrow_to_a_tenant_or_a_base() -> None:
+    store = InMemoryKnowledgeStore()
+    tenant_a, kb_a = await _base(store, documents=1, name="a")
+    tenant_b, kb_b = await _base(store, documents=1, name="b")
+    assert [
+        e.kb_id for e in await plan_backfill(store, _Prices(), aux=_AUX, tenant_id=tenant_b)
+    ] == [kb_b]
+    assert [e.kb_id for e in await plan_backfill(store, _Prices(), aux=_AUX, kb_id=kb_a)] == [kb_a]
+    assert tenant_a != tenant_b
+
+
+async def test_apply_is_refused_above_the_confirmed_total() -> None:
+    store = InMemoryKnowledgeStore()
+    await _base(store, documents=1, name="a")
+    plan = await plan_backfill(store, _Prices(), aux=_AUX)
+    shown = total_micros(plan) / 1_000_000
+    assert within_expected(plan, shown)
+    assert not within_expected(plan, shown - 0.0001)
+
+    @dataclass
+    class _None:
+        async def rate(self, *, provider: str, model: str) -> Rate | None:
+            return None
+
+    unpriced = await plan_backfill(store, _None(), aux=_AUX)
+    assert not within_expected(unpriced, 1000.0)
 
 
 async def test_apply_asks_for_refreshes_due_at_once() -> None:

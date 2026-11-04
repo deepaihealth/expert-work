@@ -2195,6 +2195,7 @@ def build_tool_env(
     workspace_quota: SeedQuotaGate | None = None,
     kb_first_routing: bool = False,
     web_search_fixtures_dir: str | None = None,
+    embedding_model_key: Callable[[], Awaitable[str | None]] | None = None,
 ) -> ToolEnv:
     """Assemble the M0 :class:`ToolEnv`.
 
@@ -2235,6 +2236,8 @@ def build_tool_env(
         # B-267 —— 平台总开关与 web_search 夹具目录(都来自 Settings)。
         kb_first_routing=kb_first_routing,
         web_search_fixtures_dir=web_search_fixtures_dir,
+        # B-267 第 3 步 —— 每轮探测核对「此刻的嵌入模型」用。
+        embedding_model_key=embedding_model_key,
     )
 
 
@@ -2432,3 +2435,15 @@ def make_agent_runtime(
         ),
         run_event_store=run_event_store,
     )
+
+
+async def live_embedding_key(config: PlatformEmbeddingConfigService) -> str | None:
+    """B-267 —— the platform's current embedding model as ``provider/model``
+    (``None``: not configured, or the config could not be read — the per-turn
+    probe then uses keywords only)."""
+    try:
+        current = await config.effective_embedding_config()
+    except Exception:
+        logger.warning("knowledge.probe_embedding_config_unavailable", exc_info=True)
+        return None
+    return f"{current[0]}/{current[1]}" if current is not None else None

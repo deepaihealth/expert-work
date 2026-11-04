@@ -451,21 +451,16 @@ class InMemoryKnowledgeStore(InMemoryEstimates, KnowledgeStore):
         for base in list(self._bases):
             if len(claims) >= limit:
                 break
+            if profiles.exhausted(base.profile):
+                assert base.profile is not None  # noqa: S101 - exhausted implies a record
+                self._set_profile(base, profiles.dropped(base.profile))
+                continue
             if not profiles.claimable(base.profile, now=now, ingesting=base.id in ingesting):
                 continue
             assert base.profile is not None  # noqa: S101 - claimable implies a record
             record = profiles.claimed(base.profile, now=now)
             self._set_profile(base, record)
-            assert record.refresh is not None  # noqa: S101 - claimed keeps the refresh
-            claims.append(
-                ProfileClaim(
-                    tenant_id=base.tenant_id,
-                    kb_id=base.id,
-                    marks=record.refresh.marks,
-                    attempts=record.refresh.attempts,
-                    calibrate_only=record.refresh.calibrate_only,
-                )
-            )
+            claims.append(_claim_of(base, record))
         return claims
 
     async def finish_profile_refresh(
@@ -473,41 +468,71 @@ class InMemoryKnowledgeStore(InMemoryEstimates, KnowledgeStore):
         *,
         tenant_id: UUID,
         kb_id: UUID,
+        holder: str,
         marks: int,
         profile: KnowledgeProfile | None,
         calibration: ProbeCalibration | None,
+        now: datetime,
+        retry_calibration: bool = False,
     ) -> None:
         base = self._base(tenant_id, kb_id)
         if base is not None:
             record = profiles.finished(
-                base.profile, marks=marks, profile=profile, calibration=calibration
+                base.profile,
+                holder=holder,
+                marks=marks,
+                profile=profile,
+                calibration=calibration,
+                now=now,
+                retry_calibration=retry_calibration,
             )
             self._set_profile(base, record)
 
-    async def fail_profile_refresh(self, *, tenant_id: UUID, kb_id: UUID, now: datetime) -> None:
+    async def fail_profile_refresh(
+        self, *, tenant_id: UUID, kb_id: UUID, holder: str, now: datetime
+    ) -> None:
         base = self._base(tenant_id, kb_id)
         if base is not None:
-            self._set_profile(base, profiles.failed(base.profile, now=now))
+            self._set_profile(base, profiles.failed(base.profile, holder=holder, now=now))
+
+    def _stale_profile(self, tenant_id: UUID, kb_id: UUID) -> None:
+        """B-267 —— a document with passages left the base (deleted or off)."""
+        base = self._base(tenant_id, kb_id)
+        if base is not None:
+            record = profiles.staled(base.profile, now=datetime.now(UTC))
+            if record is not None:
+                self._set_profile(base, record)
 
     async def profile_digest(
-        self, *, tenant_id: UUID, kb_id: UUID, max_documents: int, max_headings: int
+        self, *, tenant_id: UUID, kb_id: UUID, max_titles: int, detailed: int, max_headings: int
     ) -> ProfileDigest:
         docs = [
             d
             for d in self._documents
             if d.tenant_id == tenant_id and d.kb_id == kb_id and d.enabled and d.chunk_count > 0
         ]
-        docs.sort(key=lambda d: (d.created_at or datetime.min.replace(tzinfo=UTC), d.filename))
+        docs.sort(key=lambda d: d.filename)
+        docs.sort(key=lambda d: d.created_at or datetime.min.replace(tzinfo=UTC), reverse=True)
+        listed = docs[:max_titles]
+        sampled = set(profiles.sample_positions(len(listed), detailed))
         digests = []
-        for doc in docs[:max_documents]:
+        for position, doc in enumerate(listed):
+            title = doc.title or doc.filename
+            if position not in sampled:
+                digests.append(profiles.DocumentDigest(title=title))
+                continue
             chunks = sorted(
                 (c for c in self._chunks if c.document_id == doc.id and c.enabled),
                 key=lambda c: c.chunk_index,
             )
             digests.append(
                 profiles.document_digest(
-                    doc.title or doc.filename,
-                    [c.heading_path for c in chunks],
+                    title,
+                    [
+                        c.heading_path
+                        for c in chunks
+                        if c.chunk_index < profiles.PROFILE_HEADING_SCAN
+                    ],
                     chunks[0].content if chunks else None,
                     max_headings=max_headings,
                 )
@@ -981,6 +1006,8 @@ class InMemoryKnowledgeStore(InMemoryEstimates, KnowledgeStore):
         self._documents.remove(document)
         self._chunks = [c for c in self._chunks if c.document_id != document_id]
         self._drop_document_state({document_id})
+        if document.chunk_count > 0:
+            self._stale_profile(tenant_id, document.kb_id)
         return True
 
     def _drop_document_state(self, document_ids: set[UUID]) -> None:
@@ -1122,6 +1149,7 @@ class InMemoryKnowledgeStore(InMemoryEstimates, KnowledgeStore):
         wanted = set(document_ids)
         done: set[UUID] = set()
         now = datetime.now(UTC)
+        switched_off = False
         for index, document in enumerate(self._documents):
             if (
                 document.tenant_id == tenant_id
@@ -1132,6 +1160,10 @@ class InMemoryKnowledgeStore(InMemoryEstimates, KnowledgeStore):
                     update={"enabled": enabled, "updated_at": now}
                 )
                 done.add(document.id)
+                if not enabled and document.chunk_count > 0:
+                    switched_off = True
+        if switched_off:
+            self._stale_profile(tenant_id, kb_id)
         return [document_id for document_id in dict.fromkeys(document_ids) if document_id in done]
 
     async def count_stale_documents(self, *, tenant_id: UUID, kb_id: UUID, params_hash: str) -> int:
@@ -1858,3 +1890,15 @@ def _fence_in(
     document: KnowledgeDocument, generation: int, statuses: Collection[DocumentStatus]
 ) -> bool:
     return document.status in statuses and document.ingest_generation == generation
+
+
+def _claim_of(base: KnowledgeBase, record: KnowledgeProfileRecord) -> ProfileClaim:
+    assert record.refresh is not None and record.refresh.holder is not None  # noqa: S101
+    return ProfileClaim(
+        tenant_id=base.tenant_id,
+        kb_id=base.id,
+        marks=record.refresh.marks,
+        attempts=record.refresh.attempts,
+        calibrate_only=record.refresh.calibrate_only,
+        holder=record.refresh.holder,
+    )

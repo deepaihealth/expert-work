@@ -98,6 +98,7 @@ class LLMRouterAuxModelAdapter:
         model: str | None,
         tenant_id: UUID,
         output_schema: StructuredOutputSpec | None = None,
+        max_tokens: int | None = None,
     ) -> ConsolidatorLLMReply:
         # Lazy import — ``orchestrator`` depends on control-plane in
         # some test paths via subagent runtime, and importing
@@ -132,6 +133,9 @@ class LLMRouterAuxModelAdapter:
             # Consolidator does not declare its own fallback chain; the
             # default model is what the manifest opted into.
             fallback=[],
+            # B-267 —— a caller that bounds the answer (the base profile's
+            # estimate holds only under its cap); ``None`` = vendor default.
+            max_tokens=max_tokens,
         )
         # 二期 PR2 T3 — hand the router a tenant-scoped caching store so its
         # internal vault read (agent_factory.py:1956) becomes a cache hit.
