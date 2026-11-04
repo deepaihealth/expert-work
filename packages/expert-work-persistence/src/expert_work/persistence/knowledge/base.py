@@ -72,9 +72,6 @@ from expert_work.persistence.knowledge.passages import (
 
 # B-267 —— base-profile refresh types both stores share, re-exported.
 from expert_work.persistence.knowledge.profiles import (
-    DocumentDigest as DocumentDigest,
-)
-from expert_work.persistence.knowledge.profiles import (
     ProfileClaim as ProfileClaim,
 )
 from expert_work.persistence.knowledge.profiles import (

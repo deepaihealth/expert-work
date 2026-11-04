@@ -321,4 +321,4 @@ class ProfileRefreshWorker:
             try:
                 await asyncio.wait_for(self._stop.wait(), timeout=self._interval_s)
             except TimeoutError:
-                pass
+                pass  # interval elapsed without a stop request: run the next pass
