@@ -1872,10 +1872,10 @@ oauth2 目录项本来就不在平台池里:不再碰平台池;`enabled` 切换�
 
 **怎么进**:测试环境控制台(system_admin,平台租户)建临时智能体 `acc-b265`(主模型 glm-5.3,看图模型 `doubao-seed-2-1-pro-260628` 不设思考档位);用 B-257 探针的合成走势图(零租户内容)。**花费**:约 ¥0.5。
 
-- [ ] **85.1 深入看带「低」**:让智能体对走势图调用一次 `ask_image`(depth=deep)。判据:Langfuse 这次看图调用的请求参数里有 `reasoning_effort: low`;答案正确(7、9、10 月超标,8→9 月升 0.8)。**没修好时**:请求里是 `medium`。
-- [ ] **85.2 显式配置优先**:把看图模型思考档位设为「中」再看一次。判据:请求里 `reasoning_effort: medium`。
-- [ ] **85.3 快速看不受影响**:同一智能体不带 depth 看一次。判据:请求里是关思考(`thinking: {type: disabled}`),没有 `reasoning_effort`。
-- [ ] **85.4 收尾**:删 `acc-b265`。
+- [x] **85.1 深入看带「低」**:让智能体对走势图调用一次 `ask_image`(depth=deep)。判据:Langfuse 这次看图调用的请求参数里有 `reasoning_effort: low`;答案正确(7、9、10 月超标,8→9 月升 0.8)。**没修好时**:请求里是 `medium`。 **11-03 测试 `b164af88e` 过**:Langfuse 看图调用 `reasoning_effort: low`;答案对(7、9、10 月超标,8→9 月升 0.8),18 秒
+- [x] **85.2 显式配置优先**:把看图模型思考档位设为「中」再看一次。判据:请求里 `reasoning_effort: medium`。 **11-03 测试 `b164af88e` 过**:看图模型档位设「中」后请求里 `reasoning_effort: medium`,49 秒,答案对
+- [x] **85.3 快速看不受影响**:同一智能体不带 depth 看一次。判据:请求里是关思考(`thinking: {type: disabled}`),没有 `reasoning_effort`。 **11-03 测试 `b164af88e` 过**:不带 depth:`thinking.type: disabled`、没有 `reasoning_effort`,思考 token 0,答案对
+- [x] **85.4 收尾**:删 `acc-b265`。 **11-03 测试 `b164af88e` 过**:`acc-b265` 已删(204,再查 404)
 
 ## §86 上传 / 输入 / 工具结果按对话分开 + 老对话自动迁移(B-262 P1 + P3)
 
@@ -1885,17 +1885,17 @@ oauth2 目录项本来就不在平台池里:不再碰平台池;`enabled` 切换�
 
 **怎么进**:测试环境控制台(system_admin,平台租户)建临时智能体 `acc-b262a`、`acc-b262b`(glm-5.3,看图模型照平台默认);对外接口用平台租户临时 API key,`user_id` 用 `u-b262p`。合成文件(零租户内容,同 §84 做法):`/tmp/b262p-a.pdf` / `b262p-b.pdf` 两份不同的一页 PDF(印 `CUSTOMER-A` / `CUSTOMER-B`)。NAS 用 control-plane pod 只读 `ls`;数据库只读连接。**花费**:约 ¥3。
 
-- [ ] **86.1 上传落在本对话**:`acc-b262a` 会话 A 上传 `b262p-a.pdf`(对外接口)。判据:NAS 上文件在 `agents/<key>/threads/<A>/work/uploads/`,agent 根 `uploads/` 没有新文件;run 里 `[file attached: uploads/…]` 路径形状与以前相同;`GET …/uploads/<upload_id>` 下载到 A 的字节。**没修好时**:落在 agent 根。
-- [ ] **86.2 别的对话看不到**:同一 agent 会话 B 让智能体逐字执行 `ls -la /workspace/uploads /agent/uploads; echo x > /agent/uploads/t`。判据:`/workspace/uploads` 没有 A 的文件;`/agent/uploads` 为空;写入报只读错误。再让它 `list_dir`/`search_files` 查 `/agent`:不出现 `uploads` / `inputs` / `.tool_results`。
-- [ ] **86.3 渲染页与看图按对话**:A 里 `read_page(path="uploads/<A 的名字>", units=[1])`。判据:NAS 页在 `threads/<A>/work/.tool_results/<run>/figures/…`。B 里让模型手写 `ask_image(image_ref="expert_work://workspace/<t>/<u>/agents/<key>/threads/<A>/work/.tool_results/…")`,再写一次中间加 `//` 的同一 ref。判据:两次都被拒(「another conversation」/「canonical」),拿不到 A 的页。
-- [ ] **86.4 注入变量预拉缓存按对话**:给 `acc-b262a` 声明一个 URL 类型输入变量(用 §44 的公开测试图片地址),A、B 各跑一次。判据:`inputs/cache/` 在各自 `threads/<conv>/work/` 下各一份;agent 根 `inputs/cache` 无新文件。
-- [ ] **86.5 引用别的会话的上传会复制**:在会话 B 发 run,`files` 带 A 的 `upload_id`。判据:B 的 `work/uploads/` 出现同名(或带 `-<8 位>`)文件、内容是 A 的;审计新增一行 `document:upload`,`details.copied_from_upload_id` = A 的 id、`thread_id` = B;模型读到 `CUSTOMER-A`。再用 `acc-b262b` 的会话 C 引用同一 id:同样复制进 C。
-- [ ] **86.6 复制的拒绝情形**:(a) 在 A 里让智能体把那份上传改写成不同长度,再在 B 引用 → 409 `UPLOAD_CHANGED`;(b) 删除会话 A(会话删除接口)后再在 B 引用 → 404 `UPLOAD_SESSION_DELETED`;(c) 删除会话后 NAS 上 `threads/<A>/` 已不在(含上传)。
-- [ ] **86.7 老对话迁移(情形 a)**:发布前在旧镜像上用 `acc-b262a` 开一段会话 O(老布局),上传 `b262p-b.pdf`、`read_page` 渲一页、让智能体写 `/workspace/notes/o.txt`;发布后在 O 发新一轮。判据:只读查 `thread_meta.workspace_layout` = `conversation`;NAS `threads/<O>/work/uploads/` 有 B 的文件、`.tool_results/<O 的旧 run>/` 已复制、`threads/<O>/.platform-migrated` 存在;这一轮 Langfuse 输入里有一次 `[workspace notice]`,下一轮没有;模型能读 `/agent/notes/o.txt`(开场复制后 `/workspace/notes/o.txt` 也在);日志 `platform_migration outcome=migrated`。
-- [ ] **86.8 已是对话视图的老会话(情形 b)**:发布前在旧镜像上开对话视图会话 P(B-236 之后的默认)并上传一份。判据:发布后 P 的新一轮 `outcome=copied_only`,上传出现在 `threads/<P>/work/uploads/`,布局本来就是 `conversation`,没有说明。
-- [ ] **86.9 续跑不迁移**:另开一段老布局会话 Q,发布前让它停在一个审批上;发布后批准。判据:这次续跑仍是老视图(`thread_meta` 仍 `agent_root`、日志没有迁移行);Q 的下一个新 run 才迁移。没碰上审批场景:记「未触发」,单测覆盖。
-- [ ] **86.10 计数**:`expert_work_platform_migration_total` 各 outcome 有数,`failed` 为 0(非 0 看 warning 行的错误类型)。
-- [ ] **86.11 收尾**:删 `acc-b262a`、`acc-b262b`;`u-b262p` 走 `POST /v1/users/<id>:purge`。
+- [x] **86.1 上传落在本对话**:`acc-b262a` 会话 A 上传 `b262p-a.pdf`(对外接口)。判据:NAS 上文件在 `agents/<key>/threads/<A>/work/uploads/`,agent 根 `uploads/` 没有新文件;run 里 `[file attached: uploads/…]` 路径形状与以前相同;`GET …/uploads/<upload_id>` 下载到 A 的字节。**没修好时**:落在 agent 根。 **11-03 测试 `b164af88e` 过**:上传落在 `threads/<A>/work/uploads/`,agent 根 `uploads/` 没有新文件(mtime 不变);消息里是 `[file attached: uploads/b262p-a.pdf]`;下载 200、sha 一致
+- [x] **86.2 别的对话看不到**:同一 agent 会话 B 让智能体逐字执行 `ls -la /workspace/uploads /agent/uploads; echo x > /agent/uploads/t`。判据:`/workspace/uploads` 没有 A 的文件;`/agent/uploads` 为空;写入报只读错误。再让它 `list_dir`/`search_files` 查 `/agent`:不出现 `uploads` / `inputs` / `.tool_results`。 **11-03 测试 `b164af88e` 过**:B 的 `/workspace/uploads` 只有自己的文件,`/agent/uploads` 为空、写入报 `Read-only file system`;`list_dir /agent` 只列出 `notes/`,`search_files` 在 `/agent` 下找 pdf 无结果
+- [x] **86.3 渲染页与看图按对话**:A 里 `read_page(path="uploads/<A 的名字>", units=[1])`。判据:NAS 页在 `threads/<A>/work/.tool_results/<run>/figures/…`。B 里让模型手写 `ask_image(image_ref="expert_work://workspace/<t>/<u>/agents/<key>/threads/<A>/work/.tool_results/…")`,再写一次中间加 `//` 的同一 ref。判据:两次都被拒(「another conversation」/「canonical」),拿不到 A 的页。 **11-03 测试 `b164af88e` 过**:页在 `threads/<A>/work/.tool_results/<run>/figures/…`;B 手写 ref 被拒 `ToolBlockedError: … another conversation's directory`,加 `//` 的被拒 `… must be canonical`
+- [x] **86.4 注入变量预拉缓存按对话**:给 `acc-b262a` 声明一个 URL 类型输入变量(用 §44 的公开测试图片地址),A、B 各跑一次。判据:`inputs/cache/` 在各自 `threads/<conv>/work/` 下各一份;agent 根 `inputs/cache` 无新文件。 **11-03 测试 `b164af88e` 过**:**偏差**:`acc-b262a` 不出网(`egress: none`)预拉不到,另建 `acc-b262c`(`egress: proxy`、jinja 变量 `img` 取一张公开 png)。两段会话各在自己的 `threads/<conv>/work/inputs/cache/` 下一份,agent 根 `inputs/` 为空
+- [x] **86.5 引用别的会话的上传会复制**:在会话 B 发 run,`files` 带 A 的 `upload_id`。判据:B 的 `work/uploads/` 出现同名(或带 `-<8 位>`)文件、内容是 A 的;审计新增一行 `document:upload`,`details.copied_from_upload_id` = A 的 id、`thread_id` = B;模型读到 `CUSTOMER-A`。再用 `acc-b262b` 的会话 C 引用同一 id:同样复制进 C。 **11-03 测试 `b164af88e` 过**:B 引用 A 的上传:B 的 `work/uploads/` 出现 `b262p-a.pdf`,审计 `document:upload` 带 `copied_from_upload_id` = A、`thread_id` = B,模型读到 `CUSTOMER-A`;`acc-b262b` 的会话 C 同样复制进 C
+- [x] **86.6 复制的拒绝情形**:(a) 在 A 里让智能体把那份上传改写成不同长度,再在 B 引用 → 409 `UPLOAD_CHANGED`;(b) 删除会话 A(会话删除接口)后再在 B 引用 → 404 `UPLOAD_SESSION_DELETED`;(c) 删除会话后 NAS 上 `threads/<A>/` 已不在(含上传)。 **11-03 测试 `b164af88e` 过**:(a) A 里追加字节(585→597)后新会话引用 → 409 `UPLOAD_CHANGED`;(b) `:purge` 会话 A 后引用 → 404 `UPLOAD_SESSION_DELETED`;(c) NAS 上 `threads/<A>/` 已不在
+- [x] **86.7 老对话迁移(情形 a)**:发布前在旧镜像上用 `acc-b262a` 开一段会话 O(老布局),上传 `b262p-b.pdf`、`read_page` 渲一页、让智能体写 `/workspace/notes/o.txt`;发布后在 O 发新一轮。判据:只读查 `thread_meta.workspace_layout` = `conversation`;NAS `threads/<O>/work/uploads/` 有 B 的文件、`.tool_results/<O 的旧 run>/` 已复制、`threads/<O>/.platform-migrated` 存在;这一轮 Langfuse 输入里有一次 `[workspace notice]`,下一轮没有;模型能读 `/agent/notes/o.txt`(开场复制后 `/workspace/notes/o.txt` 也在);日志 `platform_migration outcome=migrated`。 **11-03 测试 `b164af88e` 过**:发布前经用户批准把会话 O 在第一轮前标成 `agent_root`(UPDATE 1),旧镜像上传、渲一页、写 `notes/o.txt`;发布后新一轮:`workspace_layout = conversation`,`threads/<O>/work/uploads/` 有 B 的文件、`.tool_results/<O 的旧 run>/` 已复制、`.platform-migrated` 在;`platform_migration.done outcome=migrated uploads_copied=1 runs_copied=1`;这一轮两次模型调用的输入里各有一次 `[workspace notice]`,下一轮 0 次;`/agent/notes/o.txt` 与 `/workspace/notes/o.txt` 都读得到;`/agent/uploads` 为空
+- [x] **86.8 已是对话视图的老会话(情形 b)**:发布前在旧镜像上开对话视图会话 P(B-236 之后的默认)并上传一份。判据:发布后 P 的新一轮 `outcome=copied_only`,上传出现在 `threads/<P>/work/uploads/`,布局本来就是 `conversation`,没有说明。 **11-03 测试 `b164af88e` 过**:旧镜像上的对话视图会话 P(上传 + 一轮;旧版本里 P 的 `/workspace/uploads` 能看到 O 的文件)发布后新一轮 `outcome=copied_only uploads_copied=1`,`threads/<P>/work/uploads/` 只有 P 自己的文件,输入里没有说明
+- [x] **86.9 续跑不迁移**:另开一段老布局会话 Q,发布前让它停在一个审批上;发布后批准。判据:这次续跑仍是老视图(`thread_meta` 仍 `agent_root`、日志没有迁移行);Q 的下一个新 run 才迁移。没碰上审批场景:记「未触发」,单测覆盖。 **11-03 测试 `b164af88e` 过**:发布前经用户批准把会话 Q 标成 `agent_root`(UPDATE 1),旧镜像上停在 `save_artifact` 审批;发布后批准 → 续跑 `is_resume=true` 成功,`thread_meta` 仍 `agent_root`、没有迁移日志、没有标记;Q 的下一个新 run `outcome=migrated`,布局变 `conversation`
+- [x] **86.10 计数**:`expert_work_platform_migration_total` 各 outcome 有数,`failed` 为 0(非 0 看 warning 行的错误类型)。 **11-03 测试 `b164af88e` 过**:两个副本计数:`migrated` 2、`copied_only` 10、`skipped` 11,没有 `failed`
+- [x] **86.11 收尾**:删 `acc-b262a`、`acc-b262b`;`u-b262p` 走 `POST /v1/users/<id>:purge`。 **11-03 测试 `b164af88e` 过**:`acc-b262a/b/c` 已删;`u-b262p` purge 200(`threads_purged` 8、`workspace_marked_deleted=true`);Q(控制台会话)单独 `:purge`;临时 API key 吊销、服务账号删除
 
 **上生产前**:通知深护智康 —— 更新记录「引用别的会话的上传会复制进本会话」(附件名可能带 `-<8 位>`,原会话已删除时报 `UPLOAD_SESSION_DELETED`,文件被改过时报 `UPLOAD_CHANGED`);生产老会话全部是老布局,发布后每段会话第一次新提问时迁移(先在生产只读统计老布局活跃会话数与 `agents/*/uploads`、`.tool_results` 总量,命令随发布单给出)。
 
@@ -1905,13 +1905,13 @@ oauth2 目录项本来就不在平台池里:不再碰平台池;`enabled` 切换�
 
 **怎么进**:测试环境控制台(system_admin,平台租户)建临时智能体 `acc-b266`(主模型 glm-5.3,看图模型 `doubao-seed-2-1-pro-260628`);Path A 另建 `acc-b266a`(主模型选一个能看图的模型)。用看图测量的合成图(零租户内容,`scratchpad/vlm-measure/img_dense/`、`img_gen/`):8 页密集化验单转 PDF 上传,另传 1 张模拟手机拍摄的报告照片、1 张图表、1 张长截图。**花费**:约 ¥3。
 
-- [ ] **87.1 自动放大读小字**:对 8 页化验单各问 3 个小字段(题目与标准答案用测量时的 `items_dense.json`),要求智能体用 `ask_image(path=…, unit=…, region="auto")`。判据:24 题准确率 ≥ 85%;`meta.auto` 为 `bands`;不含目标的条 `status` 不是 `found`(看 `meta.bands`);每次调用 `vl_usage` 计了 N+1 次。**没修好时**:整页答,准确率接近 10%。
-- [ ] **87.2 小图不切 + 问整体走整图**:图表问一个具体数值、一个「哪个月最高」。判据:`meta.auto = gated`,两题都对。长截图问「一共几条」:判据:答案来自整图(`full_fallback` 或 `gated`),不是某一条的局部数。
-- [ ] **87.3 照片**:手机照片问 2 个小字段。判据:至少 1 个读对;读不准时结果标「不确定」,没有编出的数。
-- [ ] **87.4 指定区域 + 文档格式**:同一页用 `region=[…]` 指定一块(取 87.1 某条的框),docx、pptx 各一页同样做一次。判据:裁剪图在本对话 `.tool_results/<run>/crops/` 下、名字带 `-d<dpi>`,页面渲染正常(真 pdftoppm / soffice)。
-- [ ] **87.5 Path A**:`acc-b266a` 用 `read_page(path=…, units=[1], region=[…])`。判据:局部图内联给主模型,下一轮仍在(`viewed_figures`),长边 ≤ 4000 像素。
-- [ ] **87.6 上传照片转正提质**:上传一张带 EXIF Orientation=6 的合成 JPEG(竖拍)。判据:对象存储里的图是竖的、没有 EXIF;JPEG 质量约 92。上传 8000×8000 PNG:413 `UPLOAD_TOO_LARGE`;上传 8000×8000 JPEG(6400 万像素):成功,存下的是 4000×4000。
-- [ ] **87.7 别的对话的图拒绝**:在会话 B 里让智能体用会话 A 上传图片的 `expert_work://image/…` ref 调 `ask_image`(带和不带 `region`)。判据:都被拒,没有写出裁剪图。
-- [ ] **87.8 收尾**:删 `acc-b266`、`acc-b266a`。
+- [x] **87.1 自动放大读小字**:对 8 页化验单各问 3 个小字段(题目与标准答案用测量时的 `items_dense.json`),要求智能体用 `ask_image(path=…, unit=…, region="auto")`。判据:24 题准确率 ≥ 85%;`meta.auto` 为 `bands`;不含目标的条 `status` 不是 `found`(看 `meta.bands`);每次调用 `vl_usage` 计了 N+1 次。**没修好时**:整页答,准确率接近 10%。 **11-03 测试 `b164af88e` 过**:24 题对 23(95.8%);23 次 `meta.auto=bands`、1 次 `full_fallback`(那一题 6 条都没找到,整页答错,结果带「不确定」说明,但主模型答复没转述这个不确定);每次 6 条、300 dpi,`vl_calls`=7(N+1),token_usage 与 Langfuse 都是 7 行;不含目标的条没有 `found`。单看整页约对 6/24
+- [x] **87.2 小图不切 + 问整体走整图**:图表问一个具体数值、一个「哪个月最高」。判据:`meta.auto = gated`,两题都对。长截图问「一共几条」:判据:答案来自整图(`full_fallback` 或 `gated`),不是某一条的局部数。 **11-03 测试 `b164af88e` 过**:图表 3.8 MP:两题 `gated/small_image`、`vl_calls=1`,都对;长截图(1080×6000)问「几次」:`full_fallback/conflict`,答案 10 来自整图、对。**风险**:5 条里 4 条对计数题回了 `found`(各报局部数),这次靠「冲突走整图」兜住,条上数字碰巧一致就会错 → B-273
+- [x] **87.3 照片**:手机照片问 2 个小字段。判据:至少 1 个读对;读不准时结果标「不确定」,没有编出的数。 **11-03 测试 `b164af88e` 过**:照片 3000×4000(8 条):一题 8 条都没找到 → 整图 3.7 带「不确定」,智能体答复写了不确定;另一题条上读 7.8 对(整图读成 7.83)。没有编出的数
+- [x] **87.4 指定区域 + 文档格式**:同一页用 `region=[…]` 指定一块(取 87.1 某条的框),docx、pptx 各一页同样做一次。判据:裁剪图在本对话 `.tool_results/<run>/crops/` 下、名字带 `-d<dpi>`,页面渲染正常(真 pdftoppm / soffice)。 **11-03 测试 `b164af88e` 过**:PDF / docx / pptx 各一块,裁剪图在本对话 `.tool_results/<run>/crops/`、名字带 `-d287` / `-d179` / `-d173`,渲染正常。**偏差**:glm-5.3 主模型把 `region` 数组写成字符串,3/3 被 schema 拒(`$.region (anyOf)`)→ B-272;临时把 `acc-b266` 主模型换成 deepseek-v4-pro 后通过。docx 的 unit 是 read_document 图清单里的编号,不是页码(合成 docx 带一张图);meta 的 pixels 比文件宽多 1 像素(2374 vs 2373),不影响
+- [x] **87.5 Path A**:`acc-b266a` 用 `read_page(path=…, units=[1], region=[…])`。判据:局部图内联给主模型,下一轮仍在(`viewed_figures`),长边 ≤ 4000 像素。 **11-03 测试 `b164af88e` 过**:主模型能看图的 `acc-b266a`(manifest 须写 `model.supports_vision: true`,平台不按目录推断):`read_page(units=[1], region=…)` 287 dpi、2374×629,答对;下一轮不调工具直接答对,输入里带这张局部图(`viewed_figures`)
+- [x] **87.6 上传照片转正提质**:上传一张带 EXIF Orientation=6 的合成 JPEG(竖拍)。判据:对象存储里的图是竖的、没有 EXIF;JPEG 质量约 92。上传 8000×8000 PNG:413 `UPLOAD_TOO_LARGE`;上传 8000×8000 JPEG(6400 万像素):成功,存下的是 4000×4000。 **11-03 测试 `b164af88e` 过**:EXIF Orientation=6 的 1600×1200 JPEG → 下载为 1200×1600、方向正确、无 EXIF、量化表 = 质量 92;8000×8000 PNG → 413 `UPLOAD_TOO_LARGE`;8000×8000 JPEG → 201、存 4000×4000、质量 92
+- [x] **87.7 别的对话的图拒绝**:在会话 B 里让智能体用会话 A 上传图片的 `expert_work://image/…` ref 调 `ask_image`(带和不带 `region`)。判据:都被拒,没有写出裁剪图。 **11-03 测试 `b164af88e` 过**:会话 B 用会话 A 的 `expert_work://image/…` 调 `ask_image`(不带 / `auto` / 指定框)三次都被拒 `ToolBlockedError: … uploaded in another conversation`;两边都没有裁剪图
+- [x] **87.8 收尾**:删 `acc-b266`、`acc-b266a`。 **11-03 测试 `b164af88e` 过**:`acc-b266`、`acc-b266a` 已删;临时服务账号删除;`u-b266` purge 200(NAS 文件由后台作业异步清理)
 
 **上生产前**:更新记录「上传图片按拍摄方向转正、画质提高,新增像素上限」随发布改日期。
