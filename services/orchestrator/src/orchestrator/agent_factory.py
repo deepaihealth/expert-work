@@ -153,6 +153,7 @@ from orchestrator.tools.arg_bindings import manifest_bindings
 from orchestrator.tools.file_ops import SandboxWorkspaceWriter
 from orchestrator.tools.knowledge import Reranker
 from orchestrator.tools.knowledge_catalog import CATALOG_UNAVAILABLE, load_knowledge_catalog
+from orchestrator.tools.knowledge_probe import KnowledgeProbe
 from orchestrator.tools.manage_task import ManageTaskTool
 from orchestrator.tools.nas_workspace_store import NasWorkspaceStore
 from orchestrator.tools.overflow import tool_output_budget_enabled
@@ -1394,6 +1395,8 @@ async def build_agent(
         output_schema=output_schema_spec,
         # B-105 —— 截断报错文案里的上限与计数器标签,按实际应答的模型(路由盖的章)。
         output_cap_resolver=served_output_cap(spec.spec.model),
+        # B-267 第 3 步 —— 每轮轻量探测(开关开、绑了知识库、没关 ``knowledge.probe``)。
+        knowledge_probe=_knowledge_probe(spec, env),
     )
     compiled = GraphRunner(checkpointer=checkpointer).compile(graph)
     base_prompt = spec.spec.system_prompt.template
@@ -2002,6 +2005,25 @@ COMPLETION_CONTRACT_CLAUSE = """<completion-contract>
 </completion-contract>"""
 
 
+def _knowledge_probe(spec: AgentSpec, env: ToolEnv) -> KnowledgeProbe | None:
+    """B-267 step 3 — the per-turn probe of an agent binding knowledge bases,
+    with the platform switch ``ToolEnv.kb_first_routing`` on and the manifest's
+    ``knowledge.probe`` not turned off; ``None`` otherwise (nothing is probed).
+    It uses this build's retriever, whose query embedding is metered like
+    ``knowledge_search``'s."""
+    knowledge = spec.spec.knowledge
+    if (
+        not env.kb_first_routing
+        or knowledge is None
+        or not knowledge.probe
+        or env.knowledge_retriever is None
+    ):
+        return None
+    return KnowledgeProbe(
+        retriever=env.knowledge_retriever, refs=tuple(knowledge.knowledge_base_refs)
+    )
+
+
 async def _knowledge_catalog(
     spec: AgentSpec, env: ToolEnv, tenant_id: Any
 ) -> tuple[str | None, str | None]:
@@ -2025,8 +2047,10 @@ async def _knowledge_catalog(
             env.knowledge_retriever.store,
             tenant_id=tenant_id,
             refs=knowledge.knowledge_base_refs,
-            # B-267 — the platform switch also lists a lone base.
+            # B-267 — the platform switch also lists a lone base, and shows
+            # each base's generated profile.
             single_base=env.kb_first_routing,
+            profiles=env.kb_first_routing,
         )
     except Exception:
         logger.warning(

@@ -173,6 +173,10 @@ WEB_SEARCH_KNOWLEDGE_FIRST_RULE = (
 )
 
 
+#: B-267 —— what the fixture backend may add to a result's meta.
+_FIXTURE_META_KEYS = ("fixture", "fixture_entry", "fixture_miss")
+
+
 @dataclass
 class WebSearchTool:
     """Tavily-backed web search tool exposed to the LLM as ``web_search``.
@@ -236,7 +240,13 @@ class WebSearchTool:
         # meta (trace / event stream), never into the text the model reads.
         fixture = raw.get("fixture")
         if isinstance(fixture, Mapping):
-            return replace(result, meta={**result.meta, **fixture})
+            # Only the fixture's own keys, and never over the tool's.
+            extra = {
+                key: fixture[key]
+                for key in _FIXTURE_META_KEYS
+                if key in fixture and key not in result.meta
+            }
+            return replace(result, meta={**result.meta, **extra})
         return result
 
     # ------------------------------------------------------------------

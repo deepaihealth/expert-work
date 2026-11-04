@@ -677,6 +677,16 @@ class KnowledgeSpec(BaseModel):
         min_length=1,
         description="names of tenant knowledge bases this agent may search",
     )
+    #: B-267 step 3 —— the per-turn knowledge probe (platform switch
+    #: ``kb_first_routing``): on by default, ``false`` only narrows (this agent's
+    #: turns are not probed). Leaving it out keeps the manifest as it was.
+    probe: bool = Field(
+        default=True,
+        description=(
+            "probe the bound knowledge bases with each user message and, on a hit, tell "
+            "the model to search them first (default true; false turns it off)"
+        ),
+    )
 
     @model_validator(mode="after")
     def _check_refs(self) -> KnowledgeSpec:

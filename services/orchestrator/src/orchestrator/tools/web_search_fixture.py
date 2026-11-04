@@ -170,11 +170,13 @@ class FixtureWebSearchClient:
 def load_web_search_fixture(fixtures_dir: str | None, name: object) -> FixtureWebSearchClient:
     """The client for fixture ``name`` in ``fixtures_dir``.
 
-    :raises WebSearchFixtureError: no directory configured, ``name`` is not a
-        plain file name, the file is missing (or resolves outside the
-        directory) or does not parse as a fixture.
+    :raises WebSearchFixtureError: no directory configured (an empty or
+        relative path counts as none: it would resolve against the process's
+        working directory), ``name`` is not a plain file name, the file is
+        missing (or resolves outside the directory), cannot be read, or does
+        not parse as a fixture.
     """
-    if fixtures_dir is None:
+    if not fixtures_dir or not Path(fixtures_dir).is_absolute():
         msg = "web_search 'fixture' is not available in this deployment (no fixtures configured)"
         raise WebSearchFixtureError(msg)
     if not isinstance(name, str) or not _NAME.fullmatch(name):
@@ -193,7 +195,14 @@ def load_web_search_fixture(fixtures_dir: str | None, name: object) -> FixtureWe
 
 def _parse(name: str, path: Path) -> tuple[FixtureEntry, ...]:
     try:
-        parsed = _File.model_validate_json(path.read_bytes())
+        body = path.read_bytes()
+    except OSError as exc:
+        # A build error (the manifest is refused), not a server error — and the
+        # platform's path is not echoed back to the manifest's author.
+        msg = f"web_search fixture {name!r} cannot be read"
+        raise WebSearchFixtureError(msg) from exc
+    try:
+        parsed = _File.model_validate_json(body)
     except ValidationError as exc:
         first = exc.errors()[0]
         where = ".".join(str(part) for part in first["loc"]) or "file"

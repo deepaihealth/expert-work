@@ -172,6 +172,7 @@ from control_plane.knowledge.estimate import IngestEstimator
 from control_plane.knowledge.ingestion import KnowledgeIngestionRunner, configure_parse_pool
 from control_plane.knowledge.parsed_size import configure_parsed_size, configure_raw_bytes
 from control_plane.knowledge.pricing import RateCardPrices
+from control_plane.knowledge.profile import AuxModelChoice, ProfileRefresher
 from control_plane.knowledge.recognition.figure_pipeline import (
     FigureDescriber,
     default_figure_client,
@@ -2233,11 +2234,42 @@ def create_app(
                     _app.state.knowledge_figure_reconciler = figure_reconciler
                 # B-222 PR-2 — ingests are estimated (no model called) with the
                 # same models, and what they cost priced, by the rate card.
+                # B-267 —— base profiles (platform switch ``kb_first_routing``):
+                # one call of the platform's auxiliary model per base refresh,
+                # billed to the tenant like the ingest and shown in the estimate
+                # the user confirms; the probe calibration rides along. Off: no
+                # estimate line, no refresh, nothing spent.
+                profile_aux = AuxModelChoice(
+                    provider=resolved_settings.memory_consolidator_default_aux_provider,
+                    model=resolved_settings.memory_consolidator_default_aux_model,
+                )
+                profile_refresher = (
+                    ProfileRefresher(
+                        store=resolved_knowledge_store,
+                        aux=make_llm_router_aux_model(
+                            resolver=credentials_resolver,
+                            secret_store=resolved_secret_store,
+                            default_provider=resolved_settings.memory_consolidator_default_aux_provider,
+                            default_model=profile_aux.model,
+                            secret_cache=credential_value_cache,
+                            rate_limiter_factory=llm_rate_limiter_factory,
+                        ),
+                        aux_model=profile_aux,
+                        embedder=embedder,
+                        embedding_config=(
+                            resolved_platform_embedding_config_service.effective_embedding_config
+                        ),
+                        usage=ingest_usage,
+                    )
+                    if resolved_settings.kb_first_routing
+                    else None
+                )
                 knowledge_estimator = IngestEstimator(
                     store=resolved_knowledge_store,
                     settings=resolved_platform_recognition_config_service,
                     recognizer=document_recognizer,
                     prices=RateCardPrices(resolved_model_rate_card_store),
+                    profile_model=profile_aux.key if profile_refresher is not None else None,
                 )
                 knowledge_runner = KnowledgeIngestionRunner(
                     store=resolved_knowledge_store,
@@ -2249,6 +2281,7 @@ def create_app(
                     usage=ingest_usage,
                     figures=figure_describer,
                     estimator=knowledge_estimator,
+                    profile_refresh=profile_refresher is not None,
                 )
                 _app.state.knowledge_ingestion_runner = knowledge_runner
                 # Stream KB — durable crash recovery for ingestion: claims stuck
@@ -2273,6 +2306,7 @@ def create_app(
                         # figures removed.
                         audit=resolved_audit,
                         object_store=getattr(_app.state, "object_store", None),
+                        profiles=profile_refresher,
                     )
                     knowledge_recovery_worker.start()
                     _app.state.knowledge_recovery_worker = knowledge_recovery_worker

@@ -300,3 +300,50 @@ async def test_real_search_meta_is_unchanged() -> None:
     real = WebSearchTool(client=RecordingTavilyClient(results=[_DEW]))
     got = await real.call({"query": "dew"}, ctx=_ctx())
     assert got.meta == {"truncated": False, "n_results": 1}
+
+
+# --------------------------------------------------------------------------- review follow-ups
+
+
+@pytest.mark.parametrize("configured", ["", "relative/fixtures", "."], ids=["empty", "rel", "dot"])
+def test_an_empty_or_relative_directory_counts_as_none(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, configured: str
+) -> None:
+    """Never resolved against the process's working directory."""
+    (tmp_path / "relative" / "fixtures").mkdir(parents=True)
+    _write(tmp_path / "relative" / "fixtures")
+    _write(tmp_path)
+    monkeypatch.chdir(tmp_path)
+    with pytest.raises(WebSearchFixtureError, match="not available in this deployment"):
+        load_web_search_fixture(configured, "demo")
+
+
+def test_an_unreadable_file_is_a_fixture_error_without_the_path(tmp_path: Path) -> None:
+    (tmp_path / "demo.json").mkdir()  # resolves inside the directory, read fails
+    (tmp_path / "demo.json" / "x").write_text("{}")
+    path = tmp_path / "demo.json"
+    with pytest.raises(WebSearchFixtureError) as caught:
+        from orchestrator.tools import web_search_fixture
+
+        web_search_fixture._parse("demo", path)
+    assert str(caught.value) == "web_search fixture 'demo' cannot be read"
+    assert str(tmp_path) not in str(caught.value)
+
+
+@pytest.mark.asyncio
+async def test_a_client_cannot_overwrite_the_tools_own_meta() -> None:
+    class _Overreaching(RecordingTavilyClient):
+        async def search(self, **kwargs: Any) -> dict[str, Any]:
+            raw = dict(await super().search(**kwargs))
+            raw["fixture"] = {
+                "truncated": True,
+                "n_results": 99,
+                "fixture": "demo",
+                "other": "x",
+            }
+            return raw
+
+    got = await WebSearchTool(client=_Overreaching(results=[_DEW])).call(
+        {"query": "dew"}, ctx=_ctx()
+    )
+    assert got.meta == {"truncated": False, "n_results": 1, "fixture": "demo"}

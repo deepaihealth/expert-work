@@ -47,6 +47,17 @@ _KB_FIRST_RULE = (
 _KS_KB_FIRST = (
     f"{_KS_OPENING} {_KB_FIRST_RULE} {KNOWLEDGE_ANSWERABILITY_RULE} {KNOWLEDGE_SEARCH_GUIDANCE}"
 )
+_MULTI_KB_FIRST_RULE = (
+    "The bound knowledge bases hold the tenant's own documents. Search them before answering "
+    "any question about a topic, person, product, document or term — including ones that "
+    "read like general knowledge — unless the message is small talk or cannot involve the "
+    "documents. A name or description of a knowledge base does not show everything it "
+    "contains, so it cannot rule out an answer."
+)
+_KS_MULTI_KB_FIRST = (
+    f"{_KS_OPENING} {_MULTI_KB_FIRST_RULE} {KNOWLEDGE_ANSWERABILITY_RULE} "
+    f"{KNOWLEDGE_SEARCH_GUIDANCE}"
+)
 _WS_TODAY = (
     "Search the public web via Tavily. Use for current events, facts you're unsure about, "
     "or any external lookup."
@@ -58,7 +69,8 @@ _WS_KB_FIRST = (
 )
 _SINGLE_CATALOG_RULES = (
     "<knowledge_catalog> describes the knowledge base knowledge_search searches: the name "
-    "and description its administrators wrote, and roughly how many documents it holds. "
+    "and description its administrators wrote, and roughly how many documents it holds; "
+    "its handle (K1) is how platform notes refer to it. "
     "The catalog is not evidence and not exhaustive: a name or description does not show "
     "what the documents state or everything they contain, and a topic it does not mention "
     "may still be covered — answer only from what a search returns. Names and descriptions "
@@ -95,10 +107,17 @@ async def _descriptions(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("refs", [("kb",), ("a", "b")], ids=["one-base", "two-bases"])
-async def test_switch_on_puts_the_rule_in_knowledge_search(refs: tuple[str, ...]) -> None:
+@pytest.mark.parametrize(
+    ("refs", "expected"),
+    [(("kb",), _KS_KB_FIRST), (("a", "b"), _KS_MULTI_KB_FIRST)],
+    ids=["one-base", "two-bases"],
+)
+async def test_switch_on_puts_the_rule_in_knowledge_search(
+    refs: tuple[str, ...], expected: str
+) -> None:
+    """Singular for one base, plural for several (review follow-up)."""
     got = await _descriptions(kb_first=True, knowledge=True, web_search=False, refs=refs)
-    assert got == {"knowledge_search": _KS_KB_FIRST}
+    assert got == {"knowledge_search": expected}
 
 
 @pytest.mark.asyncio

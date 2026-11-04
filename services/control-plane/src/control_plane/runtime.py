@@ -282,12 +282,14 @@ async def knowledge_catalog_fingerprint(
     store: KnowledgeStore | None, spec: AgentSpec, *, tenant_id: UUID, single_base: bool = False
 ) -> str | None:
     """B-175 P4 — the build cache key's knowledge-catalog slot for ``spec``:
-    ``None`` when no store is wired or the spec binds fewer than two bases (the
-    store is not read then), else :func:`catalog_fingerprint`.
+    ``None`` when no store is wired or the spec binds fewer than two bases —
+    one, with ``single_base`` — (the store is not read then), else
+    :func:`catalog_fingerprint`.
 
     B-267 — ``single_base`` must be the build's ``ToolEnv.kb_first_routing``
-    (the switch lists a lone base too); a mismatch would leave every such build
-    uncached (:func:`catalog_build_cacheable`).
+    (the switch lists a lone base too, and shows the bases' profiles); a
+    mismatch would leave every such build uncached
+    (:func:`catalog_build_cacheable`).
 
     It reads the spec as the caller holds it, before the builder merges a
     template's ``extends``: a fork that inherits its ``knowledge`` block from
@@ -297,7 +299,11 @@ async def knowledge_catalog_fingerprint(
     if store is None or knowledge is None:
         return None
     return await catalog_fingerprint(
-        store, tenant_id=tenant_id, refs=knowledge.knowledge_base_refs, single_base=single_base
+        store,
+        tenant_id=tenant_id,
+        refs=knowledge.knowledge_base_refs,
+        single_base=single_base,
+        profiles=single_base,
     )
 
 

@@ -37,7 +37,11 @@ from expert_work.protocol import (
     chunk_retrieval_text,
 )
 from orchestrator.tools.error_classifier import GuidedToolError
-from orchestrator.tools.knowledge_catalog import select_bases, with_bases_parameter
+from orchestrator.tools.knowledge_catalog import (
+    MIN_CATALOG_BASES,
+    select_bases,
+    with_bases_parameter,
+)
 from orchestrator.tools.knowledge_dedup import (
     drop_copied_children,
     passage_key,
@@ -142,6 +146,14 @@ KNOWLEDGE_FIRST_RULE = (
     "any question about a topic, person, product, document or term — including ones that "
     "read like general knowledge — unless the message is small talk or cannot involve the "
     "documents. A name or description of the knowledge base does not show everything it "
+    "contains, so it cannot rule out an answer."
+)
+#: The same rule for an agent binding two or more bases.
+MULTI_KNOWLEDGE_FIRST_RULE = (
+    "The bound knowledge bases hold the tenant's own documents. Search them before answering "
+    "any question about a topic, person, product, document or term — including ones that "
+    "read like general knowledge — unless the message is small talk or cannot involve the "
+    "documents. A name or description of a knowledge base does not show everything it "
     "contains, so it cannot rule out an answer."
 )
 #: B-175 wave 2 PR3 — what the model is told about a knowledge result. Results
@@ -713,6 +725,12 @@ class KnowledgeRetriever:
             )
             return exc
 
+    async def query_vector(self, query: str, tenant_id: UUID) -> tuple[float, ...] | None:
+        """B-267 —— ``query`` embedded exactly as a search embeds it (the
+        per-turn probe compares it with the same vectors); ``None`` when the
+        embedding vendor failed."""
+        return await self._embed_query(query, tenant_id)
+
     async def _embed_query(self, query: str, tenant_id: UUID) -> tuple[float, ...] | None:
         """The query's vector — ``None`` when the embedding vendor failed (B-206
         K-8): the search then runs on keywords alone and says so, logged here
@@ -1063,7 +1081,12 @@ class KnowledgeSearchTool:
 
     @property
     def _base_spec(self) -> ToolSpec:
-        first = f" {KNOWLEDGE_FIRST_RULE}" if self.knowledge_first else ""
+        rule = (
+            MULTI_KNOWLEDGE_FIRST_RULE
+            if len(self.knowledge_base_refs) >= MIN_CATALOG_BASES
+            else KNOWLEDGE_FIRST_RULE
+        )
+        first = f" {rule}" if self.knowledge_first else ""
         return ToolSpec(
             name="knowledge_search",
             description=(

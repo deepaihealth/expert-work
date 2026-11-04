@@ -69,6 +69,17 @@ from expert_work.persistence.knowledge.passages import (
 from expert_work.persistence.knowledge.passages import (
     SwitchOffRecord as SwitchOffRecord,
 )
+
+# B-267 —— base-profile refresh types both stores share, re-exported.
+from expert_work.persistence.knowledge.profiles import (
+    DocumentDigest as DocumentDigest,
+)
+from expert_work.persistence.knowledge.profiles import (
+    ProfileClaim as ProfileClaim,
+)
+from expert_work.persistence.knowledge.profiles import (
+    ProfileDigest as ProfileDigest,
+)
 from expert_work.protocol import (
     DEFAULT_CHUNK_MAX_TOKENS,
     DEFAULT_CHUNK_OVERLAP_TOKENS,
@@ -86,6 +97,7 @@ from expert_work.protocol import (
     ScoredChunk,
 )
 from expert_work.protocol.knowledge_estimate import EstimateOrigin, IngestEstimate
+from expert_work.protocol.knowledge_profile import KnowledgeProfile, ProbeCalibration
 
 
 class _Unset:
@@ -396,6 +408,51 @@ class KnowledgeStore(abc.ABC):
     @abc.abstractmethod
     async def clear_reindex(self, *, tenant_id: UUID, kb_id: UUID) -> None:
         """Clear ``reindex_requested_at`` once a re-index completes."""
+
+    # -- B-267 base profile ---------------------------------------------------
+    # The transitions themselves live in ``profiles`` (shared by both stores).
+
+    @abc.abstractmethod
+    async def mark_profile_refresh(
+        self, *, tenant_id: UUID, kb_id: UUID, now: datetime, calibrate_only: bool = False
+    ) -> bool:
+        """Ask for a debounced profile refresh of the base
+        (:func:`~expert_work.persistence.knowledge.profiles.marked`); ``False``
+        if no base matched."""
+
+    @abc.abstractmethod
+    async def claim_profile_refreshes(self, *, now: datetime, limit: int) -> list[ProfileClaim]:
+        """Lease up to ``limit`` due refreshes across every tenant
+        (:func:`~expert_work.persistence.knowledge.profiles.claimable`: due,
+        and no document of the base ``pending`` / ``processing`` unless the
+        first change waited too long). Caller bypasses row security."""
+
+    @abc.abstractmethod
+    async def finish_profile_refresh(
+        self,
+        *,
+        tenant_id: UUID,
+        kb_id: UUID,
+        marks: int,
+        profile: KnowledgeProfile | None,
+        calibration: ProbeCalibration | None,
+    ) -> None:
+        """Store what a refresh produced (``None``: keep the stored part) and
+        clear the refresh unless newer changes asked again."""
+
+    @abc.abstractmethod
+    async def fail_profile_refresh(self, *, tenant_id: UUID, kb_id: UUID, now: datetime) -> None:
+        """A refresh failed: keep the stored profile, retry later or give up
+        (:func:`~expert_work.persistence.knowledge.profiles.failed`)."""
+
+    @abc.abstractmethod
+    async def profile_digest(
+        self, *, tenant_id: UUID, kb_id: UUID, max_documents: int, max_headings: int
+    ) -> ProfileDigest:
+        """The ready documents' :class:`DocumentDigest` (oldest first, at most
+        ``max_documents``; each with at most ``max_headings`` distinct section
+        headings and the first :data:`PROFILE_OPENING_CHARS` characters of its
+        first chunk) and the base's ready-document count."""
 
     @abc.abstractmethod
     async def delete_base(self, *, tenant_id: UUID, kb_id: UUID) -> bool:

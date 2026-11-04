@@ -230,6 +230,12 @@ from orchestrator.tools.error_classifier import (
 )
 from orchestrator.tools.figure_lookup import figure_run_ids
 from orchestrator.tools.find_tools import promotion_events
+from orchestrator.tools.knowledge_probe import (
+    KnowledgeProbe,
+    ProbeOutcome,
+    latest_user_text,
+    record_follow_up,
+)
 from orchestrator.tools.mcp import parse_mcp_tool_name
 from orchestrator.tools.mutation_classifier import classify as classify_mutation
 from orchestrator.tools.mutation_classifier import resource_space as mutation_resource_space
@@ -620,6 +626,9 @@ def build_react_graph(
     # 文案里的上限与计数器标签(按路由盖的章认出备用接管)。不接线(单测 / 子图)= 照常
     # 判截断,标签为空、文案里的上限写「厂商默认值」。
     output_cap_resolver: ServedOutputCap | None = None,
+    # B-267 第 3 步 —— 每轮轻量探测(平台开关 ``kb_first_routing`` 开、绑了知识库、智能体
+    # 没关 ``knowledge.probe``)。``None``(默认)= 不探测, 提示词与之前逐字相同。
+    knowledge_probe: KnowledgeProbe | None = None,
 ) -> StateGraph[AgentState, None, AgentState, AgentState]:
     """Assemble the ReAct ``StateGraph`` and return it uncompiled.
 
@@ -1156,6 +1165,18 @@ def build_react_graph(
                 step_count=step_count, max_steps=max_steps, registers=saves_artifacts
             )
         )
+        # B-267 第 3 步 —— 轮首(最新一条用户消息之后还没有回答 / 工具调用)拿用户消息在
+        # 绑定的库里各做一次轻量检索;命中只加一行平台段(句柄 + 段数, 零租户内容), 没命中
+        # 什么都不加。超时 / 出错静默跳过(计数器 + 日志)。
+        probe_outcome = (
+            await _run_knowledge_probe(knowledge_probe, state["messages"], tenant_id, token)
+            if knowledge_probe is not None
+            and tenant_id is not None
+            and latest_user_text(state["messages"]) is not None
+            else None
+        )
+        if probe_outcome is not None and probe_outcome.line is not None:
+            messages = _append_tail_human_message(messages, probe_outcome.line)
         # B-262 P3 —— 控制面在这一轮开始前把老对话迁到了对话视图:每一步都把一次性说明并进平台段
         # (只进提示词视图),这一轮之后的 run 没有这个键;委派子代不看(``_child_config`` 不传,
         # 这里再挡一道)。
@@ -1381,6 +1402,9 @@ def build_react_graph(
         # separately, inside ``_finalize_structured_response``.
         if token_budget is not None:
             token_budget.add(usage_total(getattr(response, "usage_metadata", None)))
+        # B-267 —— 探测过的这一步, 模型接着有没有去查知识库(观察探测有没有用)。
+        if probe_outcome is not None and probe_outcome.reason in ("hit", "miss"):
+            record_follow_up(probe_outcome, response)
 
         # Budget-exhausted turn must terminate: no tools were bound so the model
         # shouldn't emit tool_calls, but strip any it returns anyway (defends
@@ -2545,6 +2569,23 @@ WORKSPACE_MIGRATION_NOTE = (
     "/agent/. This conversation's uploads, inputs and tool results are still under "
     "/workspace/."
 )
+
+
+async def _run_knowledge_probe(
+    probe: KnowledgeProbe,
+    history: Sequence[BaseMessage],
+    tenant_id: UUID,
+    token: CancellationToken,
+) -> ProbeOutcome:
+    """B-267 —— one probe under its own span (outcome, bases hit, passages,
+    elapsed); cancellable with the run."""
+    with expert_work_span(ExpertWorkComponent.ORCHESTRATOR, "knowledge_probe") as span:
+        outcome = await token.run_cancellable(probe.run(tenant_id=tenant_id, messages=history))
+        span.set_attribute("outcome", outcome.reason)
+        span.set_attribute("bases_hit", len(outcome.hits))
+        span.set_attribute("passages", sum(count for _handle, count in outcome.hits))
+        span.set_attribute("elapsed_ms", outcome.elapsed_ms)
+    return outcome
 
 
 def _append_tail_human_message(messages: list[BaseMessage], block: str) -> list[BaseMessage]:

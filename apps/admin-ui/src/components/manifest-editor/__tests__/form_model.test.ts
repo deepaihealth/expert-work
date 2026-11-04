@@ -6,7 +6,9 @@ import {
   readApprovalTools,
   readDescription,
   readDynamicWorkersOn,
+  readKnowledgeProbe,
   readKnowledgeRefs,
+  setKnowledgeProbe,
   readWorkerModel,
   readMemoryOn,
   readSkills,
@@ -932,6 +934,21 @@ describe("knowledge (RAG knowledge_base_refs)", () => {
     const withRefs = setKnowledgeRefs(seed, ["hr"]);
     const cleared = setKnowledgeRefs(withRefs, []);
     expect(cleared.spec?.knowledge).toBeUndefined();
+  });
+
+  it("B-267 —— the probe is on unless the manifest says probe: false", () => {
+    const m = setKnowledgeRefs(seed, ["hr"]);
+    expect(readKnowledgeProbe(m)).toBe(true);
+    const off = setKnowledgeProbe(m, false);
+    expect(off.spec?.knowledge).toEqual({ knowledge_base_refs: ["hr"], probe: false });
+    expect(readKnowledgeProbe(off)).toBe(false);
+    const on = setKnowledgeProbe(off, true);
+    expect(on.spec?.knowledge).toEqual({ knowledge_base_refs: ["hr"] });
+  });
+
+  it("B-267 —— clearing the refs drops the probe switch too (no invalid block)", () => {
+    const off = setKnowledgeProbe(setKnowledgeRefs(seed, ["hr"]), false);
+    expect(setKnowledgeRefs(off, []).spec?.knowledge).toBeUndefined();
   });
 });
 

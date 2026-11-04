@@ -619,16 +619,16 @@ export async function listChunks(
 
 /** One billed line of an estimate (amounts in micro-yuan). */
 export interface EstimateItem {
-  kind: "embedding" | "recognition" | "figure";
+  kind: "embedding" | "recognition" | "figure" | "profile" | "profile_calibration";
   units: number;
-  unit: "chunks" | "pages" | "figures";
+  unit: "chunks" | "pages" | "figures" | "bases" | "queries";
   /** Of ``units``, those read / embedded before and not billed again. */
   reused_units: number;
   model: string | null;
   input_tokens: number;
   output_tokens: number;
   micros: number;
-  basis: "local_count" | "catalog_average" | "default_average";
+  basis: "local_count" | "catalog_average" | "default_average" | "upper_bound";
   /** ``false``: the model has no price — not billed (``micros`` 0). */
   priced: boolean;
 }

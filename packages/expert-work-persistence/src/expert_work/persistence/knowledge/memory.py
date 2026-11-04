@@ -10,6 +10,7 @@ from datetime import UTC, datetime, timedelta
 from typing import Any
 from uuid import UUID, uuid4
 
+from expert_work.persistence.knowledge import profiles
 from expert_work.persistence.knowledge.base import (
     ALL_TENANTS_BASES_LIMIT,
     PAGE_OCR_PAGE,
@@ -23,6 +24,8 @@ from expert_work.persistence.knowledge.base import (
     KnowledgeStore,
     ParseCacheEntry,
     ParseCacheKind,
+    ProfileClaim,
+    ProfileDigest,
     _Unset,
     is_page_index,
 )
@@ -76,6 +79,11 @@ from expert_work.protocol import (
     RetrievalMethod,
     ScoredChunk,
     chunk_retrieval_text,
+)
+from expert_work.protocol.knowledge_profile import (
+    KnowledgeProfile,
+    KnowledgeProfileRecord,
+    ProbeCalibration,
 )
 
 
@@ -413,6 +421,98 @@ class InMemoryKnowledgeStore(InMemoryEstimates, KnowledgeStore):
 
     async def clear_reindex(self, *, tenant_id: UUID, kb_id: UUID) -> None:
         await self._patch_base(tenant_id, kb_id, {"reindex_requested_at": None})
+
+    # -- B-267 base profile --------------------------------------------------
+
+    def _base(self, tenant_id: UUID, kb_id: UUID) -> KnowledgeBase | None:
+        return next((b for b in self._bases if b.tenant_id == tenant_id and b.id == kb_id), None)
+
+    def _set_profile(self, base: KnowledgeBase, record: KnowledgeProfileRecord | None) -> None:
+        stored = None if record is None or record.is_empty() else record
+        self._bases[self._bases.index(base)] = base.model_copy(update={"profile": stored})
+
+    async def mark_profile_refresh(
+        self, *, tenant_id: UUID, kb_id: UUID, now: datetime, calibrate_only: bool = False
+    ) -> bool:
+        base = self._base(tenant_id, kb_id)
+        if base is None:
+            return False
+        record = profiles.marked(base.profile, now=now, calibrate_only=calibrate_only)
+        self._set_profile(base, record)
+        return True
+
+    async def claim_profile_refreshes(self, *, now: datetime, limit: int) -> list[ProfileClaim]:
+        ingesting = {
+            d.kb_id
+            for d in self._documents
+            if d.status in (DocumentStatus.PENDING, DocumentStatus.PROCESSING)
+        }
+        claims: list[ProfileClaim] = []
+        for base in list(self._bases):
+            if len(claims) >= limit:
+                break
+            if not profiles.claimable(base.profile, now=now, ingesting=base.id in ingesting):
+                continue
+            assert base.profile is not None  # noqa: S101 - claimable implies a record
+            record = profiles.claimed(base.profile, now=now)
+            self._set_profile(base, record)
+            assert record.refresh is not None  # noqa: S101 - claimed keeps the refresh
+            claims.append(
+                ProfileClaim(
+                    tenant_id=base.tenant_id,
+                    kb_id=base.id,
+                    marks=record.refresh.marks,
+                    attempts=record.refresh.attempts,
+                    calibrate_only=record.refresh.calibrate_only,
+                )
+            )
+        return claims
+
+    async def finish_profile_refresh(
+        self,
+        *,
+        tenant_id: UUID,
+        kb_id: UUID,
+        marks: int,
+        profile: KnowledgeProfile | None,
+        calibration: ProbeCalibration | None,
+    ) -> None:
+        base = self._base(tenant_id, kb_id)
+        if base is not None:
+            record = profiles.finished(
+                base.profile, marks=marks, profile=profile, calibration=calibration
+            )
+            self._set_profile(base, record)
+
+    async def fail_profile_refresh(self, *, tenant_id: UUID, kb_id: UUID, now: datetime) -> None:
+        base = self._base(tenant_id, kb_id)
+        if base is not None:
+            self._set_profile(base, profiles.failed(base.profile, now=now))
+
+    async def profile_digest(
+        self, *, tenant_id: UUID, kb_id: UUID, max_documents: int, max_headings: int
+    ) -> ProfileDigest:
+        docs = [
+            d
+            for d in self._documents
+            if d.tenant_id == tenant_id and d.kb_id == kb_id and d.enabled and d.chunk_count > 0
+        ]
+        docs.sort(key=lambda d: (d.created_at or datetime.min.replace(tzinfo=UTC), d.filename))
+        digests = []
+        for doc in docs[:max_documents]:
+            chunks = sorted(
+                (c for c in self._chunks if c.document_id == doc.id and c.enabled),
+                key=lambda c: c.chunk_index,
+            )
+            digests.append(
+                profiles.document_digest(
+                    doc.title or doc.filename,
+                    [c.heading_path for c in chunks],
+                    chunks[0].content if chunks else None,
+                    max_headings=max_headings,
+                )
+            )
+        return ProfileDigest(documents=tuple(digests), ready_documents=len(docs))
 
     async def _patch_base(self, tenant_id: UUID, kb_id: UUID, update: dict[str, object]) -> bool:
         base = next((b for b in self._bases if b.tenant_id == tenant_id and b.id == kb_id), None)
