@@ -447,6 +447,16 @@ export function PlaygroundTab({ detail }: PlaygroundTabProps) {
     (turn: Turn) => {
       if (running) return;
       setInput(turn.input);
+      // B-274 — the attachments lifted out of the history input ride along,
+      // or the re-send would lose the files the text no longer mentions.
+      // Replaces what is staged, like the input box: retry reproduces that
+      // turn. Same file twice → one tag (the staging id is ``kind:value``).
+      if (turn.attachments.length > 0) {
+        const staged = new Map(
+          turn.attachments.map((a) => [`${a.kind}:${a.value}`, { ...a, id: `${a.kind}:${a.value}` }]),
+        );
+        setAttachments([...staged.values()]);
+      }
       // 终审 F3 — 整表替换而非合并:重试要复现「当年那次」的变量组合,
       // 当前面板里多出来的键不能捎带进去;老 run 无帧数据则不动现值。
       if (turn.inputs && Object.keys(turn.inputs).length > 0) {
@@ -489,6 +499,7 @@ export function PlaygroundTab({ detail }: PlaygroundTabProps) {
         run_id: runId,
         thread_id: threadId,
         input: turn.input,
+        attachments: turn.attachments,
         source,
         exported_at: new Date().toISOString(),
         events,
