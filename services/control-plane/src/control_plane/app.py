@@ -29,6 +29,7 @@ from collections.abc import AsyncIterator
 from contextlib import AsyncExitStack, asynccontextmanager
 from dataclasses import dataclass, replace
 from datetime import timedelta
+from functools import partial
 from pathlib import Path
 from uuid import UUID
 
@@ -135,7 +136,7 @@ from control_plane.auth import (
     MTLSVerifier,
     build_mtls_verifier,
 )
-from control_plane.aux_model_adapter import make_llm_router_aux_model
+from control_plane.aux_model_adapter import LLMRouterAuxModelAdapter, make_llm_router_aux_model
 from control_plane.catalog_seed import CatalogSeedError, load_catalog_seed, seed_catalog
 from control_plane.credential_value_cache import CredentialValueCache
 from control_plane.curation_worker import CurationWorker
@@ -172,6 +173,8 @@ from control_plane.knowledge.estimate import IngestEstimator
 from control_plane.knowledge.ingestion import KnowledgeIngestionRunner, configure_parse_pool
 from control_plane.knowledge.parsed_size import configure_parsed_size, configure_raw_bytes
 from control_plane.knowledge.pricing import RateCardPrices
+from control_plane.knowledge.profile import AuxModelChoice
+from control_plane.knowledge.profile_refresh import ProfileRefresher, ProfileRefreshWorker
 from control_plane.knowledge.recognition.figure_pipeline import (
     FigureDescriber,
     default_figure_client,
@@ -263,6 +266,7 @@ from control_plane.runtime import (
     build_sandbox_runtime,
     build_tool_env,
     build_workspace_store,
+    live_embedding_key,
     make_agent_builder,
     make_agent_runtime,
     make_image_resolver,
@@ -1886,6 +1890,13 @@ def create_app(
                         else None
                     ),
                     workspace_quota=resolved_workspace_quota,
+                    # B-267 —— 「先查知识库」总开关 + web_search 固定结果夹具目录。
+                    kb_first_routing=resolved_settings.kb_first_routing,
+                    web_search_fixtures_dir=resolved_settings.web_search_fixtures_dir,
+                    # B-267 —— 每轮探测只在校准、库向量、此刻查询同一个嵌入模型时用向量。
+                    embedding_model_key=partial(
+                        live_embedding_key, resolved_platform_embedding_config_service
+                    ),
                 )
                 # Stream HX-7 — resolve the Langfuse client once: the
                 # SDK adapter when the deployment configures an instance,
@@ -2140,6 +2151,8 @@ def create_app(
                 # B-175 P4 — the knowledge catalog's fingerprint joins the build
                 # cache key; read from the store the builds read it from.
                 resolved_agent_runtime.knowledge_store = resolved_knowledge_store
+                # B-267 —— 同一个开关决定单个库有没有目录,缓存键要与构建读得一致。
+                resolved_agent_runtime.kb_first_routing = resolved_settings.kb_first_routing
                 # Stream T (PR B) — these background workers (ingestion runner,
                 # DLQ worker, consolidator) are ALWAYS started. ``embedder`` is a
                 # ``DynamicResolvingEmbedder`` that resolves the live platform
@@ -2228,11 +2241,44 @@ def create_app(
                     _app.state.knowledge_figure_reconciler = figure_reconciler
                 # B-222 PR-2 — ingests are estimated (no model called) with the
                 # same models, and what they cost priced, by the rate card.
+                # B-267 —— base profiles (platform switch ``kb_first_routing``):
+                # one call of the platform's auxiliary model per base refresh,
+                # billed to the tenant like the ingest and shown in the estimate
+                # the user confirms; the probe calibration rides along. Off: no
+                # estimate line, no refresh, nothing spent.
+                profile_aux = AuxModelChoice(
+                    provider=resolved_settings.memory_consolidator_default_aux_provider,
+                    model=resolved_settings.memory_consolidator_default_aux_model,
+                )
+                profile_refresher = (
+                    ProfileRefresher(
+                        store=resolved_knowledge_store,
+                        # The adapter itself (not the consolidator protocol):
+                        # the profile call passes an output cap.
+                        aux=LLMRouterAuxModelAdapter(
+                            resolver=credentials_resolver,
+                            secret_store=resolved_secret_store,
+                            default_provider=resolved_settings.memory_consolidator_default_aux_provider,
+                            default_model=profile_aux.model,
+                            secret_cache=credential_value_cache,
+                            rate_limiter_factory=llm_rate_limiter_factory,
+                        ),
+                        aux_model=profile_aux,
+                        embedder=embedder,
+                        embedding_config=(
+                            resolved_platform_embedding_config_service.effective_embedding_config
+                        ),
+                        usage=ingest_usage,
+                    )
+                    if resolved_settings.kb_first_routing
+                    else None
+                )
                 knowledge_estimator = IngestEstimator(
                     store=resolved_knowledge_store,
                     settings=resolved_platform_recognition_config_service,
                     recognizer=document_recognizer,
                     prices=RateCardPrices(resolved_model_rate_card_store),
+                    profile_model=profile_aux.key if profile_refresher is not None else None,
                 )
                 knowledge_runner = KnowledgeIngestionRunner(
                     store=resolved_knowledge_store,
@@ -2244,6 +2290,7 @@ def create_app(
                     usage=ingest_usage,
                     figures=figure_describer,
                     estimator=knowledge_estimator,
+                    profile_refresh=profile_refresher is not None,
                 )
                 _app.state.knowledge_ingestion_runner = knowledge_runner
                 # Stream KB — durable crash recovery for ingestion: claims stuck
@@ -2268,9 +2315,21 @@ def create_app(
                         # figures removed.
                         audit=resolved_audit,
                         object_store=getattr(_app.state, "object_store", None),
+                        profile_refresh=profile_refresher is not None,
                     )
                     knowledge_recovery_worker.start()
                     _app.state.knowledge_recovery_worker = knowledge_recovery_worker
+                # B-267 —— base-profile refreshes run in their own loop (switch on).
+                if (
+                    profile_refresher is not None
+                    and resolved_settings.enable_knowledge_recovery_worker
+                ):
+                    profile_refresh_worker = ProfileRefreshWorker(
+                        refresher=profile_refresher,
+                        interval_s=resolved_settings.knowledge_recovery_interval_s,
+                    )
+                    profile_refresh_worker.start()
+                    _app.state.knowledge_profile_refresh_worker = profile_refresh_worker
             if reaper is not None:
                 reaper.start()
             if scheduler is not None:
@@ -2708,6 +2767,11 @@ def create_app(
                 )
                 if knowledge_recovery is not None:
                     await knowledge_recovery.stop()
+                profile_refresh_running: ProfileRefreshWorker | None = getattr(
+                    _app.state, "knowledge_profile_refresh_worker", None
+                )
+                if profile_refresh_running is not None:
+                    await profile_refresh_running.stop()
                 figure_reconciler_running: FigureReconciler | None = getattr(
                     _app.state, "knowledge_figure_reconciler", None
                 )
@@ -2817,6 +2881,8 @@ def create_app(
     # The ingestion recovery worker is built + started in the lifespan; this is
     # the pre-lifespan default so ``getattr`` lookups are well-defined.
     app.state.knowledge_recovery_worker = None
+    # B-267 —— the base-profile refresh loop (lifespan, switch on).
+    app.state.knowledge_profile_refresh_worker = None
     app.state.sandbox_runtime = resolved_sandbox_runtime
     app.state.workspace_store = resolved_workspace_store
     app.state.artifact_snapshots = resolved_artifact_snapshots

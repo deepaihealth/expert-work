@@ -5,13 +5,18 @@
  * apart. Emits the FULL merged manifest via the form_model writers.
  */
 import { useEffect, useState, type CSSProperties, type ReactNode } from "react";
-import { Select, Typography } from "antd";
+import { Select, Switch, Typography } from "antd";
 import { useTranslation } from "react-i18next";
 
 import { listBases, type KnowledgeBase } from "../../api/knowledge";
 import { concreteTenantScope, useTenantScope } from "../../tenant/TenantScopeContext";
 import { FieldHelp } from "../FieldHelp";
-import { readKnowledgeRefs, setKnowledgeRefs } from "./form_model";
+import {
+  readKnowledgeProbe,
+  readKnowledgeRefs,
+  setKnowledgeProbe,
+  setKnowledgeRefs,
+} from "./form_model";
 
 const { Text } = Typography;
 
@@ -79,6 +84,24 @@ export function KnowledgePicker({ formData, onChange }: KnowledgePickerProps) {
           onChange={(v: string[]) => onChange(setKnowledgeRefs(formData, v))}
         />
       </div>
+      {knowledgeRefs.length > 0 && (
+        <div
+          data-testid="af-knowledge-probe"
+          style={{ display: "flex", alignItems: "center", gap: 8, marginTop: 12 }}
+        >
+          <Switch
+            size="small"
+            checked={readKnowledgeProbe(formData)}
+            aria-label={t("agent_form.knowledge_probe_label")}
+            onChange={(on: boolean) => onChange(setKnowledgeProbe(formData, on))}
+          />
+          <span>{t("agent_form.knowledge_probe_label")}</span>
+          <FieldHelp
+            text={t("agent_form.knowledge_probe_help")}
+            testId="af-knowledge-probe"
+          />
+        </div>
+      )}
     </section>
   );
 }

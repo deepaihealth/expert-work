@@ -233,6 +233,8 @@ async def test_upload_image_without_session_creates_one(ctx: _Ctx) -> None:
     # able to trust ``parse_image_ref(row.ref)`` without a mismatch ever
     # producing the old bare ``{"detail": "image ref not found"}`` shape.
     assert parse_image_ref(user_upload_row.ref).thread_id == user_upload_row.thread_id
+    # B-271 —— 登记行记下落地字节(去 EXIF 之后)的 sha256,与 ``image_upload`` 那行同一个值。
+    assert user_upload_row.sha256 == rows[0].sha256
 
 
 @pytest.mark.asyncio
@@ -326,6 +328,8 @@ async def test_upload_document_succeeds_for_an_api_key_caller(ctx: _Ctx) -> None
     # 关系(按登记行的会话)把 ref 还原成存储路径的,两边任何一侧漂了都会 404。
     assert written_path == f"{conv_dir}/work/{user_upload_row.ref}"
     assert user_upload_row.user_id == end_user.id
+    # B-271 —— 登记行记下落地字节的 sha256:留存作业删文件前用它确认文件没被改过。
+    assert user_upload_row.sha256 == hashlib.sha256(b"hello").hexdigest()
 
 
 @pytest.mark.asyncio

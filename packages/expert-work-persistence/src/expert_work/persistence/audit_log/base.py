@@ -15,6 +15,7 @@ self-audit on read.
 from __future__ import annotations
 
 import abc
+from collections.abc import Collection
 from datetime import datetime
 from uuid import UUID
 
@@ -56,6 +57,19 @@ class AuditLogStore(abc.ABC):
     ) -> list[AuditEntry]:
         """B-262 P3 —— 这个会话的成功 ``document:upload`` 审计行(``details.thread_id``),
         ``since`` 起,按发生先后。老对话迁移按它找控制台上传(那些上传没有登记行)。"""
+
+    @abc.abstractmethod
+    async def list_document_uploads_for_threads(
+        self,
+        *,
+        tenant_id: UUID,
+        thread_ids: Collection[UUID],
+        since: datetime,
+        until: datetime,
+    ) -> list[AuditEntry]:
+        """B-271 —— 一批会话的成功 ``document:upload`` 审计行(``details.thread_id`` 在
+        ``thread_ids`` 里,``since <= occurred_at <= until``),按发生先后。留存作业按它给没有
+        sha256 的老上传行找登记时的 sha256 —— 一个租户一次读,不逐行查。"""
 
     @abc.abstractmethod
     async def query(self, query: AuditQuery) -> AuditPage:

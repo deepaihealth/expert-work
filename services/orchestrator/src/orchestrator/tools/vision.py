@@ -71,6 +71,7 @@ from orchestrator.tools.figure_lookup import (
     resolve_rendered_figure,
 )
 from orchestrator.tools.file_ops import _require_path
+from orchestrator.tools.question_scope import is_count_question, is_whole_image_question
 from orchestrator.tools.read_page import (
     RENDER_DPI,
     RegionCrop,
@@ -102,6 +103,7 @@ from orchestrator.tools.tile_reading import (
     RAW_META_CHARS,
     TileResult,
     decide_auto,
+    decide_whole_question,
     parse_tile_reply,
     tile_meta,
     tile_question,
@@ -166,8 +168,9 @@ vision_deep_default_fallback_total = expert_work_counter(
 ask_image_region_auto_total = expert_work_counter(
     "expert_work_ask_image_region_auto_total",
     "ask_image region='auto' looks by the path taken: bands (a band value was used), "
-    "full_fallback (the parallel whole-image answer was used) or gated (the image was small "
-    "enough to read whole), with the reason (B-266).",
+    "full_fallback (the parallel whole-image answer was used), gated (the image was small "
+    "enough to read whole) or whole_question (B-273: a whole-image question, answered from the "
+    "whole image), with the reason (B-266).",
     ("path", "reason"),
 )
 
@@ -529,8 +532,9 @@ class AskImageTool:
            整张快看一次(``gated``);
         2. 否则切 :func:`band_count` 条整宽横条,每条回一小段 JSON;**同时**并行一次整张快看
            (原问题、不加 JSON 要求),两者都计入在飞名额与记账;
-        3. 最终答案见 :func:`~orchestrator.tools.tile_reading.decide_auto`。横条与整张读全失败
-           才报错,与整页看失败同一种错误。
+        3. 最终答案见 :func:`~orchestrator.tools.tile_reading.decide_auto`;B-273 —— 问题像整体类
+           问题(计数 / 合计 / 最高最低 ...)时见 ``decide_whole_question``(以整张读为准)。
+           横条与整张读全失败才报错,与整页看失败同一种错误。
         """
         pixels, size, document = await self._zoom_pixels(located)
         meta: dict[str, Any] = {"region": AUTO_REGION, "depth": "quick", "auto_pixels": pixels}
@@ -600,7 +604,16 @@ class AskImageTool:
                 raise first
             msg = "ask_image region='auto' could not look at this image at all"
             raise RuntimeError(msg)
-        decision = decide_auto(results, full_answer=full_answer, full_error=full_error)
+        # B-273 V1 —— 整体类问题以整张读为准,横条只用来提示一句(见 decide_whole_question)。
+        if is_whole_image_question(question):
+            decision = decide_whole_question(
+                results,
+                full_answer=full_answer,
+                full_error=full_error,
+                count_question=is_count_question(question),
+            )
+        else:
+            decision = decide_auto(results, full_answer=full_answer, full_error=full_error)
         ask_image_region_auto_total.labels(path=decision.path, reason=decision.reason).inc()
         meta.update(
             {

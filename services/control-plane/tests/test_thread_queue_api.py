@@ -9,6 +9,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from uuid import UUID
 
 import httpx
@@ -64,7 +65,11 @@ async def test_a_turn_sent_while_the_session_is_busy_waits_then_runs(
     assert resp.status_code == 200, resp.text
     events = _events(resp.text)
     assert events[0] == "queued"
-    assert '"ahead":1' in resp.text.split("\n\n", 1)[0]
+    queued = json.loads(resp.text.split("\n\n", 1)[0].split("data: ", 1)[1])
+    assert queued["ahead"] == 1
+    # B-269 —— 前面挡着的是 leader;受理那一刻它还在排队、没开始执行。
+    assert queued["ahead_run_id"] == str(leader)
+    assert (queued["ahead_status"], queued["ahead_started_at"]) == ("queued", None)
     assert events[1] == "metadata"
     assert events[-1] == "end"
     follower = UUID(resp.headers["x-expert-work-run-id"])
@@ -76,6 +81,25 @@ async def test_a_turn_sent_while_the_session_is_busy_waits_then_runs(
     snapshot = await s.snapshot(thread)
     answers = [m.content for m in snapshot.values["messages"] if isinstance(m, AIMessage)]
     assert answers[-2:] == ["leader", "follower"]
+
+
+@pytest.mark.parametrize("script", [_SCRIPT])
+@pytest.mark.asyncio
+async def test_a_queue_mode_turn_behind_a_busy_session_names_the_head(
+    s: _Stack,  # noqa: F811 -- pytest fixture injection, not a redefinition
+) -> None:
+    """B-269 —— 队列模式 202:前面有没结束的轮时带上 ``ahead`` 与领头那一轮;
+    会话空闲时 202 一个字段都不多(与幂等重放的 202 同形)。"""
+    thread, _, _ = await s.start()
+    _, leader, idle_resp = await s.start(thread, mode="queue")
+    assert set(idle_resp.json()["data"]) == {"run_id", "thread_id", "status"}
+
+    _, _, busy_resp = await s.start(thread, mode="queue")
+
+    data = busy_resp.json()["data"]
+    assert data["ahead"] == 1
+    assert data["ahead_run_id"] == str(leader)
+    assert (data["ahead_status"], data["ahead_started_at"]) == ("queued", None)
 
 
 @pytest.mark.parametrize("script", [_SCRIPT])

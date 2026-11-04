@@ -641,6 +641,14 @@ class RunStore(abc.ABC):
         进程内存版(``RunManager.has_inflight``)两样都看不到。"""
 
     @abc.abstractmethod
+    async def list_inflight_by_threads(
+        self, *, thread_ids: Sequence[UUID], tenant_id: UUID
+    ) -> dict[UUID, list[RunInfo]]:
+        """B-269 —— :meth:`list_inflight_by_thread` for several threads in one read
+        (a run-list page). Each value is ordered as there; a thread with no busy
+        run is absent; empty input → ``{}``."""
+
+    @abc.abstractmethod
     async def renew_queued_reservation(
         self, *, run_id: UUID, owner: str, lease_until: datetime, now: datetime
     ) -> bool:
@@ -760,6 +768,12 @@ class InMemoryRunStore(RunStore):
             row,
             status=status,
             updated_at=updated_at,
+            # B-269 —— 与 SQL 店同义:第一次进 RUNNING 才写。
+            started_at=(
+                updated_at
+                if status is RunStatus.RUNNING and row.started_at is None
+                else row.started_at
+            ),
             error=error if error is not None else row.error,
             finished_at=finished_at if finished_at is not None else row.finished_at,
             # 谓词与 SQL 店 byte-同义:None 不碰既有清单(非终局转换)。
@@ -1168,6 +1182,23 @@ class InMemoryRunStore(RunStore):
         rows.sort(key=lambda r: (r.created_at, r.run_id))
         return rows
 
+    async def list_inflight_by_threads(
+        self, *, thread_ids: Sequence[UUID], tenant_id: UUID
+    ) -> dict[UUID, list[RunInfo]]:
+        wanted = set(thread_ids)
+        rows = [
+            r
+            for r in self._rows.values()
+            if r.thread_id in wanted
+            and r.tenant_id == tenant_id
+            and r.status in THREAD_BUSY_STATUSES
+        ]
+        rows.sort(key=lambda r: (r.created_at, r.run_id))
+        out: dict[UUID, list[RunInfo]] = {}
+        for r in rows:
+            out.setdefault(r.thread_id, []).append(r)
+        return out
+
     async def renew_queued_reservation(
         self, *, run_id: UUID, owner: str, lease_until: datetime, now: datetime
     ) -> bool:
@@ -1205,6 +1236,7 @@ class InMemoryRunStore(RunStore):
             claimed_by=new_owner,
             lease_until=lease_until,
             heartbeat_at=heartbeat_at,
+            started_at=row.started_at if row.started_at is not None else heartbeat_at,
         )
         self._rows[run_id] = claimed
         return claimed
@@ -1277,6 +1309,7 @@ def _row_to_dto(row: AgentRunRow) -> RunInfo:
         agent_spec_sha256=row.agent_spec_sha256,
         superseded_by_run_id=row.superseded_by_run_id,
         regenerated_from_run_id=row.regenerated_from_run_id,
+        started_at=row.started_at,
     )
 
 
@@ -1348,6 +1381,7 @@ class SqlRunStore(RunStore):
                     agent_spec_sha256=info.agent_spec_sha256,
                     superseded_by_run_id=info.superseded_by_run_id,
                     regenerated_from_run_id=info.regenerated_from_run_id,
+                    started_at=info.started_at,
                 )
             )
             try:
@@ -1379,6 +1413,10 @@ class SqlRunStore(RunStore):
         guard_claimed_by: str | None = None,
     ) -> bool:
         values: dict[str, Any] = {"status": status.value, "updated_at": updated_at}
+        if status is RunStatus.RUNNING:
+            # B-269 —— 第一次进 RUNNING 才写;孤儿接管后重跑不覆盖(审批续跑是新的
+            # run id,有它自己的开始时刻)。
+            values["started_at"] = func.coalesce(AgentRunRow.started_at, updated_at)
         if error is not None:
             values["error"] = error
         if finished_at is not None:
@@ -1987,6 +2025,7 @@ class SqlRunStore(RunStore):
                     claimed_by=new_owner,
                     lease_until=lease_until,
                     heartbeat_at=heartbeat_at,
+                    started_at=func.coalesce(AgentRunRow.started_at, heartbeat_at),
                 )
                 .returning(AgentRunRow)
             )
@@ -2007,6 +2046,27 @@ class SqlRunStore(RunStore):
         async with self._sf() as session:
             rows = (await session.execute(stmt)).scalars().all()
         return [_row_to_dto(r) for r in rows]
+
+    async def list_inflight_by_threads(
+        self, *, thread_ids: Sequence[UUID], tenant_id: UUID
+    ) -> dict[UUID, list[RunInfo]]:
+        if not thread_ids:
+            return {}
+        stmt = (
+            select(AgentRunRow)
+            .where(
+                AgentRunRow.thread_id.in_(list(dict.fromkeys(thread_ids))),
+                AgentRunRow.tenant_id == tenant_id,
+                AgentRunRow.status.in_(_BUSY_VALUES),
+            )
+            .order_by(AgentRunRow.created_at.asc(), AgentRunRow.id.asc())
+        )
+        async with self._sf() as session:
+            rows = (await session.execute(stmt)).scalars().all()
+        out: dict[UUID, list[RunInfo]] = {}
+        for row in rows:
+            out.setdefault(row.thread_id, []).append(_row_to_dto(row))
+        return out
 
     async def renew_queued_reservation(
         self, *, run_id: UUID, owner: str, lease_until: datetime, now: datetime

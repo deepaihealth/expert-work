@@ -115,3 +115,6 @@ data:
   # what resolves. The HMAC key the sandbox side mints egress tokens with
   # is EXPERT_WORK_SANDBOX_EGRESS_TOKEN_SECRET in control-plane-secrets.
   EXPERT_WORK_WEB_SEARCH_SEARXNG_BASE_URL: "http://searxng:8080"
+  # B-267 —— web_search 固定结果替身的夹具目录(web-search-fixtures-patch.yaml 挂载)。
+  # 只有 manifest 里写了 `config.fixture` 的智能体才用它,其余照常走 SearXNG。
+  EXPERT_WORK_WEB_SEARCH_FIXTURES_DIR: "/etc/expert-work/web-search-fixtures"

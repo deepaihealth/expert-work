@@ -206,6 +206,7 @@ from orchestrator.tools._budget import DELEGATION_GATE_KEY
 from orchestrator.tools._guards import (
     DEFAULT_LOOP_TRIPS_PER_RUN,
     GUARD_SINK_KEY,
+    LOOP_TRIP_META_KEY,
     TOKEN_BUDGET_KEY,
     TokenBudget,
     build_guard_frame,
@@ -230,6 +231,12 @@ from orchestrator.tools.error_classifier import (
 )
 from orchestrator.tools.figure_lookup import figure_run_ids
 from orchestrator.tools.find_tools import promotion_events
+from orchestrator.tools.knowledge_probe import (
+    KnowledgeProbe,
+    ProbeOutcome,
+    latest_user_text,
+    record_follow_up,
+)
 from orchestrator.tools.mcp import parse_mcp_tool_name
 from orchestrator.tools.mutation_classifier import classify as classify_mutation
 from orchestrator.tools.mutation_classifier import resource_space as mutation_resource_space
@@ -247,6 +254,7 @@ from orchestrator.tools.overflow import (
 from orchestrator.tools.registry import (
     FIGURE_RUN_IDS_KEY,
     TOOL_ALLOWED_STATE_KEYS,
+    TURN_ROOT_RUN_KEY,
     WORKSPACE_MIGRATED_KEY,
     Tool,
     ToolContext,
@@ -335,6 +343,14 @@ _tool_call_total = expert_work_counter(
     "expert_work_tool_call_total",
     "Tool dispatches by tool name and outcome (ok / error / blocked).",
     ("tool", "outcome"),
+)
+#: B-272 — calls rescued by restoring a JSON-stringified top-level array /
+#: object argument (``"region": "[0,0,100,100]"``) after schema validation
+#: failed. Same ``tool`` label normalisation as ``_tool_call_total``.
+_tool_args_coerced_total = expert_work_counter(
+    "expert_work_tool_args_coerced_total",
+    "Tool calls dispatched after restoring a JSON-stringified array/object argument (B-272).",
+    ("tool",),
 )
 _tool_latency_seconds = expert_work_histogram(
     "expert_work_tool_latency_seconds",
@@ -620,6 +636,9 @@ def build_react_graph(
     # 文案里的上限与计数器标签(按路由盖的章认出备用接管)。不接线(单测 / 子图)= 照常
     # 判截断,标签为空、文案里的上限写「厂商默认值」。
     output_cap_resolver: ServedOutputCap | None = None,
+    # B-267 第 3 步 —— 每轮轻量探测(平台开关 ``kb_first_routing`` 开、绑了知识库、智能体
+    # 没关 ``knowledge.probe``)。``None``(默认)= 不探测, 提示词与之前逐字相同。
+    knowledge_probe: KnowledgeProbe | None = None,
 ) -> StateGraph[AgentState, None, AgentState, AgentState]:
     """Assemble the ReAct ``StateGraph`` and return it uncompiled.
 
@@ -928,7 +947,8 @@ def build_react_graph(
         # rounds — so the orchestrator can write a clean RUN_FAILED
         # audit row.
         # B-64 Task 7 回修第 3 轮 —— 渲染页段在**压缩判定之前**造好:它挂在压缩之后,
-        # 压缩器看不见它,而它带着 ≤3 张图(每张按 ``IMAGE_BLOCK_TOKEN_COST`` 计)加
+        # 压缩器看不见它,而它带着 ≤6 张整页 + ≤2 张局部图(B-268;每张按
+        # ``IMAGE_BLOCK_TOKEN_COST`` 计)加
         # 一段占位文字。把它作为 ``reserved`` 交给压缩器 —— 只计入估算、不进被总结的
         # 那段(压缩器去总结或丢掉它都是错的)。身份与工作区快照同一个来源:本次 run 的
         # config。每轮重建、不落检查点。
@@ -1156,6 +1176,18 @@ def build_react_graph(
                 step_count=step_count, max_steps=max_steps, registers=saves_artifacts
             )
         )
+        # B-267 第 3 步 —— 轮首(最新一条用户消息之后还没有回答 / 工具调用)拿用户消息在
+        # 绑定的库里各做一次轻量检索;命中只加一行平台段(句柄 + 段数, 零租户内容), 没命中
+        # 什么都不加。超时 / 出错静默跳过(计数器 + 日志)。
+        probe_outcome = (
+            await _run_knowledge_probe(knowledge_probe, state["messages"], tenant_id, token)
+            if knowledge_probe is not None
+            and tenant_id is not None
+            and latest_user_text(state["messages"]) is not None
+            else None
+        )
+        if probe_outcome is not None and probe_outcome.line is not None:
+            messages = _append_tail_human_message(messages, probe_outcome.line)
         # B-262 P3 —— 控制面在这一轮开始前把老对话迁到了对话视图:每一步都把一次性说明并进平台段
         # (只进提示词视图),这一轮之后的 run 没有这个键;委派子代不看(``_child_config`` 不传,
         # 这里再挡一道)。
@@ -1381,6 +1413,9 @@ def build_react_graph(
         # separately, inside ``_finalize_structured_response``.
         if token_budget is not None:
             token_budget.add(usage_total(getattr(response, "usage_metadata", None)))
+        # B-267 —— 探测过的这一步, 模型接着有没有去查知识库(观察探测有没有用)。
+        if probe_outcome is not None and probe_outcome.reason in ("hit", "miss"):
+            record_follow_up(probe_outcome, response)
 
         # Budget-exhausted turn must terminate: no tools were bound so the model
         # shouldn't emit tool_calls, but strip any it returns anyway (defends
@@ -1976,6 +2011,7 @@ def build_react_graph(
             turn_documents=state.get("turn_documents"),
             turn_image_refs=state.get("turn_image_refs"),
             viewed_figures=state.get("viewed_figures"),
+            figure_reads=state.get("figure_reads"),
         )
         # Stream TE-2 — per-tool-call audit sink (may be None on the dev /
         # unit-test path; ``_dispatch_tool`` treats the emit as best-effort).
@@ -2091,10 +2127,13 @@ def build_react_graph(
         batch_outcomes: list[tuple[tuple[str, str], ClassifiedToolError | None]] = []
         # B-163 — total chars of the advisories attached in this batch (gauge).
         advisory_chars = 0
+        # B-268 —— 平台拒绝的重复读取(``read_page`` 熔断)计进本 run 的防循环次数。
+        refused_reads = 0
         for idx in range(len(tool_calls)):
             tool_message, tool_state, refund_inc, classified = results[idx]
             message_pos = len(new_messages)
             new_messages.append(tool_message)
+            refused_reads += _is_refused_repeat(tool_message)
             for key, value in tool_state.items():
                 if key not in TOOL_ALLOWED_STATE_KEYS:
                     continue
@@ -2196,6 +2235,11 @@ def build_react_graph(
         }
         if used_stamps:
             result_dict["promoted_tool_last_used"] = used_stamps
+        # B-268 —— 与 loop-detection 拦下同一本账:第 N 次(``DEFAULT_LOOP_TRIPS_PER_RUN``)
+        # 后 ``agent_node`` 走无进展收尾。只在有拒绝时写,没有时 state 形状不变。
+        # 一批里几次并行拒绝只算一次(同 loop-detection 每步至多一次)。
+        if refused_reads:
+            result_dict["loop_trip_count"] = int(state.get("loop_trip_count", 0)) + 1
         # 层 1 — persist the nudge dedupe key only when a nudge actually fired;
         # the absent case leaves the channel (and no-spawn_worker builds'
         # state shape) untouched.
@@ -2545,6 +2589,23 @@ WORKSPACE_MIGRATION_NOTE = (
     "/agent/. This conversation's uploads, inputs and tool results are still under "
     "/workspace/."
 )
+
+
+async def _run_knowledge_probe(
+    probe: KnowledgeProbe,
+    history: Sequence[BaseMessage],
+    tenant_id: UUID,
+    token: CancellationToken,
+) -> ProbeOutcome:
+    """B-267 —— one probe under its own span (outcome, bases hit, passages,
+    elapsed); cancellable with the run."""
+    with expert_work_span(ExpertWorkComponent.ORCHESTRATOR, "knowledge_probe") as span:
+        outcome = await token.run_cancellable(probe.run(tenant_id=tenant_id, messages=history))
+        span.set_attribute("outcome", outcome.reason)
+        span.set_attribute("bases_hit", len(outcome.hits))
+        span.set_attribute("passages", sum(count for _handle, count in outcome.hits))
+        span.set_attribute("elapsed_ms", outcome.elapsed_ms)
+    return outcome
 
 
 def _append_tail_human_message(messages: list[BaseMessage], block: str) -> list[BaseMessage]:
@@ -4395,6 +4456,7 @@ def _build_tool_context(
     turn_documents: list[str] | None = None,
     turn_image_refs: list[str] | None = None,
     viewed_figures: list[str] | None = None,
+    figure_reads: list[dict[str, Any]] | None = None,
 ) -> ToolContext:
     """Lift tenant / user binding out of ``config["configurable"]`` into
     a :class:`ToolContext`. Missing values fall through as ``None`` —
@@ -4493,7 +4555,15 @@ def _build_tool_context(
         workspace_thread_id=view_fields["workspace_thread_id"],
         child_run=configurable.get("child_run") is True,
         figure_run_ids=figure_run_ids(_string_list(viewed_figures)) | inherited_runs,
+        figure_reads=tuple(figure_reads) if isinstance(figure_reads, list) else (),
+        turn_root_run_id=_parse_uuid(configurable.get(TURN_ROOT_RUN_KEY)),
     )
+
+
+def _is_refused_repeat(message: BaseMessage) -> bool:
+    """B-268 —— 这条工具结果是不是平台拒绝的重复读取(``meta`` 带 ``LOOP_TRIP_META_KEY``)。"""
+    artifact = getattr(message, "artifact", None)
+    return isinstance(artifact, Mapping) and artifact.get(LOOP_TRIP_META_KEY) is True
 
 
 def _string_list(raw: object) -> tuple[str, ...]:
@@ -4534,20 +4604,71 @@ def _validate_tool_args(tool: Tool, args: Mapping[str, Any]) -> str | None:
     and on any ``additionalProperties: false`` server (the zod / MCP TS SDK
     default) a correctly configured binding could never dispatch at all.
     """
-    schema = tool.spec.dispatch_parameters or tool.spec.parameters
-    if not schema:
+    validator = _tool_schema_validator(tool)
+    if validator is None:
         return None
-    validator_cls = Draft202012Validator
-    try:
-        validator_cls.check_schema(schema)
-    except SchemaError:
-        return None
-    errors = sorted(validator_cls(schema).iter_errors(args), key=lambda e: list(e.absolute_path))
+    errors = sorted(validator.iter_errors(args), key=lambda e: list(e.absolute_path))
     if not errors:
         return None
     # Name path + failed keyword only — never echo the offending value.
     parts = [_describe_schema_error(e) for e in errors[:5]]
     return "arguments failed schema validation: " + "; ".join(parts)
+
+
+def _tool_schema_validator(tool: Tool) -> Draft202012Validator | None:
+    """The validator for the schema the callee enforces; ``None`` = skip validation.
+
+    No schema, or a malformed one (the tool's own bug), never blocks dispatch.
+    """
+    schema = tool.spec.dispatch_parameters or tool.spec.parameters
+    if not schema:
+        return None
+    try:
+        Draft202012Validator.check_schema(schema)
+    except SchemaError:
+        return None
+    return Draft202012Validator(schema)
+
+
+#: B-272 —— 超过这么长的字符串不去 ``json.loads``(只是为了让还原的开销有界)。
+_RESTORE_MAX_CHARS = 1_000_000
+
+
+def _restore_stringified_args(tool: Tool, args: Mapping[str, Any]) -> dict[str, Any] | None:
+    """B-272 — a copy of ``args`` with JSON-stringified arrays / objects restored.
+
+    Only called after validation has already failed. Some models (glm-5.3)
+    write an array argument as a string (``"region": "[0,0,100,100]"``). For
+    each failing path's TOP-LEVEL key whose value is a string that
+    ``json.loads`` to a list / dict, the parsed value replaces it in a copy;
+    the copy is then re-validated as a whole against the SAME schema. Returns
+    the copy only when it is fully valid, else ``None`` so the caller reports
+    the original error. No recursion, and the schema the model sees is
+    unchanged. The caller's ``args`` are never mutated, so the trajectory and
+    the audit row keep the model's original (pre-restore) arguments.
+    """
+    validator = _tool_schema_validator(tool)
+    if validator is None:
+        return None
+    copy = dict(args)
+    restored = False
+    for error in validator.iter_errors(args):
+        key = error.absolute_path[0] if error.absolute_path else None
+        if not isinstance(key, str) or not isinstance(copy.get(key), str):
+            continue
+        value = copy[key]
+        if len(value) > _RESTORE_MAX_CHARS:
+            continue
+        try:
+            parsed = json.loads(value)
+        except (ValueError, RecursionError):  # deep nesting → the normal [invalid args] path
+            continue
+        if isinstance(parsed, list | dict):
+            copy[key] = parsed
+            restored = True
+    if not restored or next(validator.iter_errors(copy), None) is not None:
+        return None
+    return copy
 
 
 def _describe_schema_error(error: ValidationError) -> str:
@@ -4583,6 +4704,13 @@ async def _invoke_tool(
     # B2 — 让工具知道自己服务的 tool_call id(worker 帧挂前端工具卡用)。
     ctx = replace(ctx, tool_call_id=call_id)
     schema_error = _validate_tool_args(tool, args)
+    if schema_error is not None:
+        # B-272 — rescue JSON-stringified array / object arguments. The callee
+        # gets the restored copy; ``args`` as recorded upstream stays original.
+        restored = _restore_stringified_args(tool, args)
+        if restored is not None:
+            _tool_args_coerced_total.labels(tool=_metric_tool_label(tool.spec.name)).inc()
+            args, schema_error = restored, None
     if schema_error is not None:
         return (
             ToolMessage(

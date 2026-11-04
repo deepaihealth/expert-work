@@ -210,3 +210,60 @@ async def test_document_uploads_for_thread_is_targeted() -> None:
         tenant_id=tenant, thread_id=thread, since=datetime.now(UTC) + timedelta(minutes=1)
     )
     assert later == []
+
+
+@pytest.mark.asyncio
+async def test_document_uploads_for_threads_is_one_batched_window_read() -> None:
+    """B-271 —— 留存作业给一批老上传行找登记时的 sha256:本租户、``document:upload``、成功的、
+    ``details.thread_id`` 在这批会话里、``occurred_at`` 落在 ``[since, until]``,按发生先后。"""
+    store = InMemoryAuditLogStore()
+    tenant, first_thread, second_thread = uuid4(), uuid4(), uuid4()
+
+    async def _put(
+        thread: object,
+        *,
+        tenant_id: object = tenant,
+        action: AuditAction = AuditAction.DOCUMENT_UPLOAD,
+        result: AuditResult = AuditResult.SUCCESS,
+    ) -> int | None:
+        entry = await store.append(
+            _entry(
+                tenant_id=tenant_id,
+                action=action,
+                result=result,
+                details={"thread_id": str(thread)},
+            )
+        )
+        return entry.id
+
+    a = await _put(first_thread)
+    b = await _put(second_thread)
+    await _put(uuid4())
+    await _put(first_thread, tenant_id=uuid4())
+    await _put(first_thread, action=AuditAction.MANIFEST_WRITE)
+    await _put(first_thread, result=AuditResult.DENIED)
+    now = datetime.now(UTC)
+
+    got = await store.list_document_uploads_for_threads(
+        tenant_id=tenant,
+        thread_ids=[first_thread, second_thread],
+        since=now - timedelta(minutes=1),
+        until=now + timedelta(minutes=1),
+    )
+    assert [e.id for e in got] == [a, b]
+    for since, until in (
+        (now + timedelta(minutes=1), now + timedelta(minutes=2)),
+        (now - timedelta(minutes=2), now - timedelta(minutes=1)),
+    ):
+        assert (
+            await store.list_document_uploads_for_threads(
+                tenant_id=tenant, thread_ids=[first_thread], since=since, until=until
+            )
+            == []
+        )
+    assert (
+        await store.list_document_uploads_for_threads(
+            tenant_id=tenant, thread_ids=[], since=now - timedelta(minutes=1), until=now
+        )
+        == []
+    )

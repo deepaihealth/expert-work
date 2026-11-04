@@ -113,6 +113,7 @@ from orchestrator.tools._guards import GUARD_SINK_KEY, TOKEN_BUDGET_KEY, TokenBu
 from orchestrator.tools._worker_events import WORKER_EVENT_SINK_KEY
 from orchestrator.tools.agent_file_versions import AgentFileVersionStore, dispatch_observation
 from orchestrator.tools.artifact import ARTIFACT_RECORDER_KEY, ArtifactRecorder
+from orchestrator.tools.registry import TURN_ROOT_RUN_KEY
 from orchestrator.tools.spawn_worker import WorkerSpawnBudget
 from orchestrator.trajectory import (
     TrajectoryOutcome,
@@ -485,6 +486,12 @@ async def run_agent(
             **(
                 {"inputs_run_id": str(inputs_run_id)}
                 if prompt_inputs and inputs_run_id is not None and inputs_run_id != run_id
+                else {}
+            ),
+            # B-268 —— 续跑段按这一轮记 ``read_page`` 的读取账(有没有 inputs 都写)。
+            **(
+                {TURN_ROOT_RUN_KEY: str(inputs_run_id)}
+                if inputs_run_id is not None and inputs_run_id != run_id
                 else {}
             ),
         },

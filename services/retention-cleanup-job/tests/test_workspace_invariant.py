@@ -4,7 +4,8 @@
 (a) 登记过的产物文件(``artifact_version.path_in_workspace``,满 90 天的版本;B-235 起
     同一路径还有别的版本在用时不删),以及这一版登记时留在用户根旁边的副本
     (``{tenant}/.artifact-versions/{user}/{version_id}``)
-(b) ``uploads/`` 下登记过的文件(``user_upload.ref``,满 90 天)
+(b) 登记过的上传文件(``user_upload.ref``,满 90 天;B-271 起按会话当前的 agent / 布局落到
+    ``agents/<key>/[threads/<会话>/work/]uploads/`` 下 —— 用户根的 ``uploads/`` 不是上传的位置)
 (c) 孤儿 ``threads/<thread_id>/``(thread 行不存在)
 —— 根目录任何其它文件/目录(``style/``、MEMORY.md、未登记文件、非 UUID 名的
 threads 子目录、已软删用户的整棵树)永不触碰。
@@ -28,6 +29,7 @@ from uuid import UUID, uuid4
 
 import pytest
 
+from control_plane.api._workspace_shared import thread_workspace_path
 from expert_work.persistence import (
     InMemoryArtifactStore,
     InMemoryAuditLogStore,
@@ -129,6 +131,7 @@ async def _register_upload(
     user: UUID,
     ref: str,
     created_at: datetime,
+    thread_id: UUID,
     kind: str = "document",
 ) -> UUID:
     upload_id = uuid4()
@@ -136,7 +139,7 @@ async def _register_upload(
         upload_id=upload_id,
         tenant_id=tenant,
         user_id=user,
-        thread_id=uuid4(),
+        thread_id=thread_id,
         kind=kind,  # type: ignore[arg-type]
         ref=ref,
         mime_type="application/octet-stream",
@@ -162,6 +165,8 @@ class _World:
         self.user = uuid4()
         self.deleted_user = uuid4()
         self.live_thread = uuid4()
+        #: B-271 —— 上传所在的会话:绑了 agent 的老视图,文件在 ``agents/<key>/uploads/``。
+        self.upload_thread = uuid4()
         self.orphan_thread = uuid4()
         self.deleted_user_orphan_thread = uuid4()
         self.ids: dict[str, UUID] = {}
@@ -264,11 +269,28 @@ async def world(tmp_path: Path) -> Iterator[_World]:
         _write(root, t, u, rel)
 
     # ---- registered uploads ---------------------------------------------
+    await w.threads.create(
+        thread_id=w.upload_thread, tenant_id=t, created_by="u", user_id=u, agent_name="bot"
+    )
+    upload_meta = w.threads._rows[w.upload_thread].model_copy(
+        update={"workspace_layout": "agent_root"}
+    )
+    w.threads._rows[w.upload_thread] = upload_meta
     w.ids["upload_old"] = await _register_upload(
-        w.uploads, tenant=t, user=u, ref="uploads/old.pdf", created_at=_OLD
+        w.uploads,
+        tenant=t,
+        user=u,
+        ref="uploads/old.pdf",
+        created_at=_OLD,
+        thread_id=w.upload_thread,
     )
     w.ids["upload_new"] = await _register_upload(
-        w.uploads, tenant=t, user=u, ref="uploads/new.pdf", created_at=_FRESH
+        w.uploads,
+        tenant=t,
+        user=u,
+        ref="uploads/new.pdf",
+        created_at=_FRESH,
+        thread_id=w.upload_thread,
     )
     # image-kind upload: the ref is an object-store URI, no workspace file.
     w.ids["upload_image"] = await _register_upload(
@@ -277,10 +299,13 @@ async def world(tmp_path: Path) -> Iterator[_World]:
         user=u,
         ref="expert_work://image/abc",
         created_at=_OLD,
+        thread_id=w.upload_thread,
         kind="image",
     )
-    for rel in ("uploads/old.pdf", "uploads/new.pdf", "uploads/stray.pdf"):
-        _write(root, t, u, rel)
+    for ref in ("uploads/old.pdf", "uploads/new.pdf", "uploads/stray.pdf"):
+        _write(root, t, u, thread_workspace_path(ref, upload_meta))
+    # 用户根的 ``uploads/old.pdf``:B-271 之前作业删的位置,不是这条登记行的文件。
+    _write(root, t, u, "uploads/old.pdf")
 
     # ---- threads ----------------------------------------------------------
     await w.threads.create(thread_id=w.live_thread, tenant_id=t, created_by="u", user_id=u)
@@ -349,7 +374,7 @@ async def test_run_once_touches_only_the_three_registered_shapes(world: _World) 
         prefix + "report.pptx",
         prefix + "summary_v1.md",
         prefix + "高血压21天随访/day1.md",
-        prefix + "uploads/old.pdf",
+        prefix + thread_workspace_path("uploads/old.pdf", w.threads._rows[w.upload_thread]),
         prefix + f"threads/{w.orphan_thread}",
         prefix + f"threads/{w.orphan_thread}/MEMORY.md",
         prefix + f"threads/{w.orphan_thread}/PLAN.md",

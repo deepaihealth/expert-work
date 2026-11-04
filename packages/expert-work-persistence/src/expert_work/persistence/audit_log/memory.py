@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Iterable
+from collections.abc import Collection, Iterable
 from datetime import UTC, datetime
 from uuid import UUID
 
@@ -54,6 +54,27 @@ class InMemoryAuditLogStore(AuditLogStore):
             and r.result == AuditResult.SUCCESS
             and (r.details or {}).get("thread_id") == str(thread_id)
             and (since is None or (r.occurred_at is not None and r.occurred_at >= since))
+        ]
+        return sorted(rows, key=lambda r: r.id or 0)
+
+    async def list_document_uploads_for_threads(
+        self,
+        *,
+        tenant_id: UUID,
+        thread_ids: Collection[UUID],
+        since: datetime,
+        until: datetime,
+    ) -> list[AuditEntry]:
+        wanted = {str(t) for t in thread_ids}
+        rows = [
+            r
+            for r in self._rows.values()
+            if r.tenant_id == tenant_id
+            and r.action == AuditAction.DOCUMENT_UPLOAD
+            and r.result == AuditResult.SUCCESS
+            and (r.details or {}).get("thread_id") in wanted
+            and r.occurred_at is not None
+            and since <= r.occurred_at <= until
         ]
         return sorted(rows, key=lambda r: r.id or 0)
 
