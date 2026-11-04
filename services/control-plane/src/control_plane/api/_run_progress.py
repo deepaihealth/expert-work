@@ -5,13 +5,17 @@
 * ``started_at`` —— 恒给(还没开始执行 / 老 run = ``null``);非终态再给 ``heartbeat_at``。
 * ``queued_behind`` —— 只在 ``queued`` 行上:同会话里排在它前面、挡着它的那一轮
   (:func:`control_plane.thread_queue.head_run` 同一条规则),没有 = ``null``。
-  每个会话一次 ``list_inflight_by_thread``,不按行查。
-* ``progress`` —— 只在非终态行上,整页一次 :meth:`RunEventStore.progress_for_runs`。
-  只有计数与节点 / 工具名,不含任何内容。
+  整页按租户一次 ``list_inflight_by_threads``,不按行也不按会话查。
+* ``progress`` —— 只在非终态行上,整页按租户一次
+  :meth:`RunEventStore.progress_for_runs`。只有计数与节点 / 工具名,不含任何内容。
+
+后两项各自读库;读失败(超时 / 库抖动)只让那一项从这一页里缺席并记日志,不连累
+列表本身,也不连累另一项和行上自带的时间字段。
 """
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Sequence
 from datetime import UTC, datetime
 from typing import Any
@@ -21,6 +25,8 @@ from control_plane.thread_queue import head_run, head_summary
 from expert_work.runtime.runs import RunEventStore, RunInfo, RunStatus, RunStore
 from expert_work.runtime.runs.event_store import RunProgressCounts
 from expert_work.runtime.runs.schemas import TERMINAL_RUN_STATUSES
+
+logger = logging.getLogger(__name__)
 
 
 def _iso(value: datetime | None) -> str | None:
@@ -35,24 +41,40 @@ def timing_fields(run: RunInfo) -> dict[str, Any]:
     return out
 
 
-def queued_behind_in(busy: Sequence[RunInfo], run: RunInfo) -> dict[str, Any] | None:
-    """``busy`` = 这一行所在会话的忙 run(按 ``(created_at, id)`` 从早到晚)。"""
+def queued_behind_in(
+    busy: Sequence[RunInfo], run: RunInfo, *, same_user: bool = False
+) -> dict[str, Any] | None:
+    """``busy`` = 这一行所在会话的忙 run(按 ``(created_at, id)`` 从早到晚)。
+
+    ``same_user`` —— 对外平面只说调用方这个终端用户自己的 run:挡在前面的是别人的
+    就给 ``None``,不把别人的 run id 交出去。"""
     key = (run.created_at, run.run_id)
     head = head_run([b for b in busy if (b.created_at, b.run_id) < key])
-    return head_summary(head) if head is not None else None
+    if head is None or (same_user and head.user_id != run.user_id):
+        return None
+    return head_summary(head)
+
+
+def _by_tenant(rows: Sequence[RunInfo]) -> dict[UUID, list[RunInfo]]:
+    out: dict[UUID, list[RunInfo]] = {}
+    for run in rows:
+        out.setdefault(run.tenant_id, []).append(run)
+    return out
 
 
 async def queued_behind_by_run(
-    store: RunStore, rows: Sequence[RunInfo]
+    store: RunStore, rows: Sequence[RunInfo], *, same_user: bool = False
 ) -> dict[UUID, dict[str, Any] | None]:
-    """每条 ``queued`` 行排在谁后面;每个会话只读一次库。"""
-    queued = [r for r in rows if r.status is RunStatus.QUEUED]
+    """每条 ``queued`` 行排在谁后面;整页每个租户读一次库。"""
     out: dict[UUID, dict[str, Any] | None] = {}
-    for tenant_id, thread_id in dict.fromkeys((r.tenant_id, r.thread_id) for r in queued):
-        busy = await store.list_inflight_by_thread(thread_id=thread_id, tenant_id=tenant_id)
+    for tenant_id, queued in _by_tenant([r for r in rows if r.status is RunStatus.QUEUED]).items():
+        busy = await store.list_inflight_by_threads(
+            thread_ids=[r.thread_id for r in queued], tenant_id=tenant_id
+        )
         for run in queued:
-            if (run.tenant_id, run.thread_id) == (tenant_id, thread_id):
-                out[run.run_id] = queued_behind_in(busy, run)
+            out[run.run_id] = queued_behind_in(
+                busy.get(run.thread_id, []), run, same_user=same_user
+            )
     return out
 
 
@@ -88,17 +110,35 @@ async def progress_by_run(
     live = [r for r in rows if r.status not in TERMINAL_RUN_STATUSES]
     if not live:
         return {}
-    counts = await events.progress_for_runs([r.run_id for r in live]) if events else {}
+    counts: dict[UUID, RunProgressCounts] = {}
+    if events is not None:
+        for tenant_id, runs in _by_tenant(live).items():
+            counts.update(
+                await events.progress_for_runs([r.run_id for r in runs], tenant_id=tenant_id)
+            )
     now = datetime.now(UTC)
     return {r.run_id: progress_dict(r, counts.get(r.run_id), now=now) for r in live}
 
 
 async def run_info_fields(
-    *, runs: RunStore, events: RunEventStore | None, rows: Sequence[RunInfo]
+    *,
+    runs: RunStore,
+    events: RunEventStore | None,
+    rows: Sequence[RunInfo],
+    same_user: bool = False,
 ) -> dict[UUID, dict[str, Any]]:
-    """每行要并进响应的 B-269 / B-270 字段(键只在该出现时出现)。"""
-    behind = await queued_behind_by_run(runs, rows)
-    progress = await progress_by_run(events, rows)
+    """每行要并进响应的 B-269 / B-270 字段(键只在该出现时出现)。读库失败的那一项
+    在这一页缺席(见模块说明),不抛。"""
+    behind: dict[UUID, dict[str, Any] | None] = {}
+    try:
+        behind = await queued_behind_by_run(runs, rows, same_user=same_user)
+    except Exception:
+        logger.warning("run_progress.queued_behind_failed", exc_info=True)
+    progress: dict[UUID, dict[str, Any]] = {}
+    try:
+        progress = await progress_by_run(events, rows)
+    except Exception:
+        logger.warning("run_progress.progress_failed", exc_info=True)
     out: dict[UUID, dict[str, Any]] = {}
     for run in rows:
         fields = timing_fields(run)

@@ -43,6 +43,16 @@ def test_the_first_waiting_turn_is_behind_nobody() -> None:
     }
 
 
+def test_same_user_only_hides_another_users_head() -> None:
+    head = _run(RunStatus.RUNNING, 0, started_at=_T0)
+    waiting = replace(_run(RunStatus.QUEUED, 1), user_id=uuid4())
+    busy = [head, waiting]
+    assert queued_behind_in(busy, waiting)["run_id"] == str(head.run_id)  # type: ignore[index]
+    assert queued_behind_in(busy, waiting, same_user=True) is None
+    mine = replace(waiting, user_id=head.user_id)
+    assert queued_behind_in([head, mine], mine, same_user=True) is not None
+
+
 def test_a_later_running_turn_does_not_block_an_earlier_waiting_one() -> None:
     waiting, later = _run(RunStatus.QUEUED, 0), _run(RunStatus.RUNNING, 1, started_at=_T0)
     assert queued_behind_in([waiting, later], waiting) is None

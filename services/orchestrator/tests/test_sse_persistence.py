@@ -304,7 +304,9 @@ async def test_store_append_failure_does_not_block_sse() -> None:
         ) -> Sequence[RunEventRecord]:
             return []
 
-        async def progress_for_runs(self, run_ids: Sequence[UUID]) -> dict[UUID, Any]:
+        async def progress_for_runs(
+            self, run_ids: Sequence[UUID], *, tenant_id: UUID
+        ) -> dict[UUID, Any]:
             return {}
 
         async def delete_for_runs(self, *, run_ids: Sequence[UUID]) -> int:

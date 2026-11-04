@@ -41,7 +41,7 @@ export interface AnswerBubbleProps {
   onDownloadArtifact: (name: string, version?: number) => Promise<void>;
   /** B-139 —— 排队中这一轮的「取消排队」;不传 = 不出按钮(只读视图)。 */
   onCancelQueued?: () => void;
-  /** B-269 / B-270 —— 有它(且这一轮有 run id)才去读排队 / 进度信息。 */
+  /** B-269 —— 有它(且这一轮有 run id)排队气泡才去读最新的排队信息。 */
   threadId?: string | null;
 }
 
@@ -219,8 +219,8 @@ export function AnswerBubble({
         </Text>
       ) : null}
 
-      {status === "running" && !turn.queued && threadId && turn.runId && (
-        <RunningProgressLine threadId={threadId} runId={turn.runId} />
+      {status === "running" && !turn.queued && (
+        <RunningProgressLine events={turn.turn.events} />
       )}
 
       {artifacts.length > 0 && (

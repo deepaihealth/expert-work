@@ -476,7 +476,10 @@ def build_external_runs_router() -> APIRouter:
         )
         # B-269 / B-270 —— 开始时刻、心跳、排在谁后面、进度;一个会话一次、整页一次。
         run_fields = await run_info_fields(
-            runs=runs, events=getattr(request.app.state, "run_event_store", None), rows=rows
+            runs=runs,
+            events=getattr(request.app.state, "run_event_store", None),
+            rows=rows,
+            same_user=True,
         )
         return JSONResponse(
             {

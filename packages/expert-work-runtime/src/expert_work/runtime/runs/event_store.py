@@ -77,11 +77,13 @@ class RunProgressCounts:
       step persisted yet.
     * ``tool_calls`` — tool results so far: ``type == "tool"`` messages in
       ``updates.tools`` frames.
-    * ``active_workers`` — distinct ``worker`` ids with a ``start`` frame minus
-      those with an ``end`` frame, floored at 0.
-    * ``current_node`` / ``current_tool`` — the latest ``updates`` frame: its node
-      (the smallest key) and the last tool call its last message requested
-      (``None`` when it requested none).
+    * ``active_workers`` — ``worker`` ids (strings) with a ``start`` frame and no
+      ``end`` frame, counting only frames after the latest ``metadata`` frame.
+      Every execution attempt (first start, orphan reclaim, hand-off) publishes
+      ``metadata`` first; workers of an earlier attempt never send ``end``.
+    * ``current_node`` / ``current_tool`` — the latest non-empty ``updates``
+      frame: its node (the smallest key, by code point) and the last tool call
+      that node's last message requested (``None`` when it requested none).
     * ``last_event_at`` — the newest frame of any kind.
     * ``plan_done`` / ``plan_total`` — the latest ``plan`` frame's ``completed``
       steps / all steps; ``None`` = no plan frame in this run.
@@ -172,14 +174,18 @@ class RunEventStore(abc.ABC):
         """
 
     @abc.abstractmethod
-    async def progress_for_runs(self, run_ids: Sequence[UUID]) -> dict[UUID, RunProgressCounts]:
-        """B-270 —— :class:`RunProgressCounts` for each run in ``run_ids``.
+    async def progress_for_runs(
+        self, run_ids: Sequence[UUID], *, tenant_id: UUID
+    ) -> dict[UUID, RunProgressCounts]:
+        """B-270 —— :class:`RunProgressCounts` for each of ``tenant_id``'s runs
+        in ``run_ids``.
 
         One aggregate per call (the SQL store reads ``run_event`` by its
         ``(run_id, seq)`` primary key in a single statement), so a run list
         computes every row's progress without N+1. A run with no persisted
-        frame is absent from the result; empty input → ``{}``. Tenant scoping
-        rides on RLS, as for :meth:`list`.
+        frame — or not ``tenant_id``'s — is absent from the result; empty input
+        → ``{}``. The SQL store filters by ``agent_run.tenant_id`` itself rather
+        than relying on RLS (the runtime connection bypasses it).
         """
 
     @abc.abstractmethod
@@ -267,8 +273,13 @@ class InMemoryRunEventStore(RunEventStore):
         filtered.sort(key=lambda r: r.seq)
         return filtered[:clamped]
 
-    async def progress_for_runs(self, run_ids: Sequence[UUID]) -> dict[UUID, RunProgressCounts]:
+    async def progress_for_runs(
+        self, run_ids: Sequence[UUID], *, tenant_id: UUID
+    ) -> dict[UUID, RunProgressCounts]:
         # 口径与 :class:`SqlRunEventStore` 的那条聚合逐项同义(共用契约钉住)。
+        # 内存店的帧不带租户(``run_event`` 本身也没有这一列),``tenant_id``
+        # 的过滤只在 SQL 店上有意义(那边的测试单独钉住)。
+        del tenant_id
         out: dict[UUID, RunProgressCounts] = {}
         for rid in dict.fromkeys(run_ids):
             rows = self._events.get(rid)
@@ -283,62 +294,101 @@ class InMemoryRunEventStore(RunEventStore):
         return removed
 
 
-#: B-270 —— one statement for every run in ``:ids``. ``agg`` scans each run's
-#: frames once through the ``(run_id, seq)`` primary key; the two LATERALs then
-#: fetch the latest ``updates`` / ``plan`` frame by that same key. Only counts and
-#: node / tool names leave the database — never message, argument or plan text.
-#: Same definitions as :func:`_progress_of` (the in-memory twin).
+#: B-270 —— one statement for every run in ``:ids`` that belongs to ``:tenant_id``
+#: (filtered here, not by RLS — the runtime connection bypasses it).
+#:
+#: Cost: ``updates`` frames carry whole tool results (tens to hundreds of KB, out
+#: of line in TOAST), and every separate expression over ``e.data`` de-TOASTs the
+#: frame again. ``ev`` therefore reads each frame **once** — one
+#: ``jsonb_path_query(… '$.keyvalue()' …)`` call per ``updates`` row splits it into
+#: its nodes in memory, and everything else is computed from those in-memory
+#: values — and keeps only small scalars; it is ``MATERIALIZED`` so the three
+#: readers below share that one pass. The scan itself goes through the
+#: ``(run_id, seq)`` primary key, as do the two latest-frame lookups. Only counts
+#: and node / tool names leave the database. Same definitions as
+#: :func:`_progress_of` (the in-memory twin).
 _PROGRESS_SQL = text(
     """
-    WITH agg AS (
+    WITH ev AS MATERIALIZED (
         SELECT
-            e.run_id,
-            max(e.created_at) AS last_event_at,
-            max(((e.data -> 'agent' ->> 'step_count')::numeric)::int) FILTER (
-                WHERE e.event_name = 'updates'
-                AND jsonb_typeof(e.data -> 'agent' -> 'step_count') = 'number'
-            ) AS step,
-            coalesce(sum(jsonb_array_length(jsonb_path_query_array(
-                e.data, '$.tools.messages[*] ? (@.type == "tool")'
-            ))) FILTER (WHERE e.event_name = 'updates'), 0) AS tool_calls,
-            count(DISTINCT e.data ->> 'worker_id') FILTER (
-                WHERE e.event_name = 'worker' AND e.data ->> 'kind' = 'start'
-            ) AS workers_started,
-            count(DISTINCT e.data ->> 'worker_id') FILTER (
-                WHERE e.event_name = 'worker' AND e.data ->> 'kind' = 'end'
-            ) AS workers_ended,
-            max(e.seq) FILTER (
-                WHERE e.event_name = 'updates'
-                AND jsonb_typeof(e.data) = 'object'
-                AND e.data <> '{}'::jsonb
-            ) AS updates_seq,
-            max(e.seq) FILTER (WHERE e.event_name = 'plan') AS plan_seq
+            e.run_id, e.seq, e.event_name, e.created_at,
+            u.step, u.tool_results, u.node, u.tool,
+            -- ``CASE`` short-circuits: only worker frames are read here.
+            CASE WHEN e.event_name = 'worker' AND jsonb_typeof(e.data) = 'object'
+                THEN e.data - 'data' END AS worker_head
         FROM run_event e
-        WHERE e.run_id = ANY(:ids)
-        GROUP BY e.run_id
+        JOIN agent_run r ON r.id = e.run_id
+        CROSS JOIN LATERAL (
+            SELECT
+                max(((n.value ->> 'step_count')::numeric)::int) FILTER (
+                    WHERE n.key = 'agent' AND jsonb_typeof(n.value -> 'step_count') = 'number'
+                ) AS step,
+                coalesce(sum(jsonb_array_length(jsonb_path_query_array(
+                    n.value, '$.messages[*] ? (@.type == "tool")'
+                ))) FILTER (WHERE n.key = 'tools'), 0) AS tool_results,
+                min(n.key COLLATE "C") AS node,
+                (array_agg(
+                    n.value -> 'messages' -> -1 -> 'tool_calls' -> -1 ->> 'name'
+                    ORDER BY n.key COLLATE "C"
+                ))[1] AS tool
+            FROM jsonb_path_query(
+                CASE WHEN e.event_name = 'updates' THEN e.data END,
+                'strict $.keyvalue()', '{}', true
+            ) AS kv
+            CROSS JOIN LATERAL (SELECT kv ->> 'key' AS key, kv -> 'value' AS value) AS n
+        ) u
+        WHERE e.run_id = ANY(:ids) AND r.id = ANY(:ids) AND r.tenant_id = :tenant_id
+    ),
+    attempt AS (
+        SELECT run_id, max(seq) FILTER (WHERE event_name = 'metadata') AS metadata_seq
+        FROM ev GROUP BY run_id
+    ),
+    live_workers AS (
+        SELECT ev.run_id, count(*) AS n FROM (
+            SELECT ev.run_id, ev.worker_head ->> 'worker_id' AS worker_id
+            FROM ev JOIN attempt a ON a.run_id = ev.run_id
+            WHERE jsonb_typeof(ev.worker_head -> 'worker_id') = 'string'
+                AND ev.worker_head ->> 'kind' IN ('start', 'end')
+                AND ev.seq > coalesce(a.metadata_seq, -1)
+            GROUP BY ev.run_id, ev.worker_head ->> 'worker_id'
+            HAVING bool_or(ev.worker_head ->> 'kind' = 'start')
+                AND NOT bool_or(ev.worker_head ->> 'kind' = 'end')
+        ) ev GROUP BY ev.run_id
+    ),
+    agg AS (
+        SELECT
+            run_id,
+            max(created_at) AS last_event_at,
+            max(step) AS step,
+            sum(tool_results) AS tool_calls,
+            (array_agg(node ORDER BY seq DESC) FILTER (WHERE node IS NOT NULL))[1]
+                AS current_node,
+            (array_agg(tool ORDER BY seq DESC) FILTER (WHERE node IS NOT NULL))[1]
+                AS current_tool,
+            max(seq) FILTER (WHERE event_name = 'plan') AS plan_seq
+        FROM ev GROUP BY run_id
     )
     SELECT
         agg.run_id, agg.last_event_at, agg.step, agg.tool_calls,
-        agg.workers_started, agg.workers_ended,
-        cur.node AS current_node,
-        cur.data -> cur.node -> 'messages' -> -1 -> 'tool_calls' -> -1 ->> 'name'
-            AS current_tool,
+        agg.current_node, agg.current_tool,
+        coalesce(lw.n, 0) AS active_workers,
         CASE WHEN jsonb_typeof(pl.data -> 'steps') = 'array' THEN jsonb_array_length(
             jsonb_path_query_array(pl.data, '$.steps[*] ? (@.status == "completed")')
         ) END AS plan_done,
         CASE WHEN jsonb_typeof(pl.data -> 'steps') = 'array'
             THEN jsonb_array_length(pl.data -> 'steps') END AS plan_total
     FROM agg
-    LEFT JOIN LATERAL (
-        SELECT u.data, (SELECT min(k) FROM jsonb_object_keys(u.data) AS k) AS node
-        FROM run_event u
-        WHERE u.run_id = agg.run_id AND u.seq = agg.updates_seq
-    ) cur ON true
+    LEFT JOIN live_workers lw ON lw.run_id = agg.run_id
     LEFT JOIN LATERAL (
         SELECT p.data FROM run_event p WHERE p.run_id = agg.run_id AND p.seq = agg.plan_seq
     ) pl ON true
     """
 )
+
+#: B-270 —— the aggregate's own ceiling, ``SET LOCAL`` so it ends with the
+#: transaction. A run read that hits it fails its progress fields only (the API
+#: layer isolates the error), never the request.
+PROGRESS_STATEMENT_TIMEOUT = "2s"
 
 
 class SqlRunEventStore(RunEventStore):
@@ -413,19 +463,27 @@ class SqlRunEventStore(RunEventStore):
             rows = (await session.execute(stmt)).scalars().all()
         return [_row_to_record(r) for r in rows]
 
-    async def progress_for_runs(self, run_ids: Sequence[UUID]) -> dict[UUID, RunProgressCounts]:
+    async def progress_for_runs(
+        self, run_ids: Sequence[UUID], *, tenant_id: UUID
+    ) -> dict[UUID, RunProgressCounts]:
         if not run_ids:
             return {}
         stmt = _PROGRESS_SQL.bindparams(
-            bindparam("ids", value=list(dict.fromkeys(run_ids)), type_=ARRAY(PG_UUID(as_uuid=True)))
+            bindparam(
+                "ids", value=list(dict.fromkeys(run_ids)), type_=ARRAY(PG_UUID(as_uuid=True))
+            ),
+            bindparam("tenant_id", value=tenant_id, type_=PG_UUID(as_uuid=True)),
         )
-        async with self._sf() as session:
+        async with self._sf() as session, session.begin():
+            await session.execute(
+                text(f"SET LOCAL statement_timeout = '{PROGRESS_STATEMENT_TIMEOUT}'")
+            )
             rows = (await session.execute(stmt)).mappings().all()
         return {
             row["run_id"]: RunProgressCounts(
                 step=row["step"],
                 tool_calls=int(row["tool_calls"]),
-                active_workers=max(0, int(row["workers_started"]) - int(row["workers_ended"])),
+                active_workers=int(row["active_workers"]),
                 current_node=row["current_node"],
                 current_tool=row["current_tool"],
                 last_event_at=row["last_event_at"],
@@ -487,12 +545,25 @@ def _plan_counts(data: Any) -> tuple[int | None, int | None]:
     return done, len(steps)
 
 
+def _active_workers(records: Sequence[RunEventRecord]) -> int:
+    """Workers started and not ended since the latest ``metadata`` frame."""
+    attempt = max((r.seq for r in records if r.event_name == "metadata"), default=-1)
+    started: set[str] = set()
+    ended: set[str] = set()
+    for r in records:
+        data = r.data
+        if r.seq <= attempt or r.event_name != "worker" or not isinstance(data, dict):
+            continue
+        worker_id, kind = data.get("worker_id"), data.get("kind")
+        if isinstance(worker_id, str) and kind in ("start", "end"):
+            (started if kind == "start" else ended).add(worker_id)
+    return len(started - ended)
+
+
 def _progress_of(records: Sequence[RunEventRecord]) -> RunProgressCounts:
     """In-memory twin of the SQL aggregate; ``records`` are one run's, by seq."""
     step: int | None = None
     tool_calls = 0
-    started: set[Any] = set()
-    ended: set[Any] = set()
     latest_updates: dict[str, Any] | None = None
     plan: tuple[int | None, int | None] = (None, None)
     for r in records:
@@ -505,17 +576,13 @@ def _progress_of(records: Sequence[RunEventRecord]) -> RunProgressCounts:
             tool_calls += _tool_results(data)
             if data:
                 latest_updates = data
-        elif r.event_name == "worker" and isinstance(data, dict):
-            kind, worker_id = data.get("kind"), data.get("worker_id")
-            if worker_id is not None and kind in ("start", "end"):
-                (started if kind == "start" else ended).add(worker_id)
         elif r.event_name == "plan":
             plan = _plan_counts(data)
     node = min(latest_updates) if latest_updates else None
     return RunProgressCounts(
         step=step,
         tool_calls=tool_calls,
-        active_workers=max(0, len(started) - len(ended)),
+        active_workers=_active_workers(records),
         current_node=node,
         current_tool=_requested_tool(latest_updates[node]) if latest_updates and node else None,
         last_event_at=max(r.created_at for r in records),

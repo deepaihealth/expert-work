@@ -1,72 +1,76 @@
 /**
- * B-269 / B-270 —— 一轮还在跑 / 在排队时,定时读 run 详情里的 ``progress`` 与
- * ``queued_behind``(服务端从落库帧聚合,跨副本一致)。同一个定时器也推进 ``nowMs``,
- * 让「已进行 N 分钟」跟着走。读失败就保留上一次的值:气泡退回原文案,不报错。
+ * B-269 / B-270 —— 气泡上的进度用到的两个计时:
+ *
+ * * ``useNow`` —— 让「已进行 N 分钟」跟着走;页面不可见时停。
+ * * ``useQueuedBehind`` —— 排队中的一轮定时读 run 详情的 ``queued_behind``(排队帧只是
+ *   受理那一刻的快照)。只在页面可见、且看的是自己租户时读:切到别的租户时每次读都会
+ *   记一条租户切换审计,轮询会刷屏,这时只用排队帧。读失败就保留上一次的值。
+ *
+ * 运行中的一轮不读库:它的事件流就在手里(``progressFromEvents``)。
  */
 import { useEffect, useState } from "react";
 
-import { getRun, type QueuedBehind, type RunProgress } from "../../api/runs";
-import { concreteTenantScope, useTenantScope } from "../../tenant/TenantScopeContext";
+import { getRun, type QueuedBehind } from "../../api/runs";
 
-export const RUN_PROGRESS_POLL_MS = 15_000;
+export const QUEUED_POLL_MS = 30_000;
 
-export interface RunProgressState {
-  progress: RunProgress | null;
-  queuedBehind: QueuedBehind | null;
-  nowMs: number;
+function documentVisible(): boolean {
+  return typeof document === "undefined" || document.visibilityState === "visible";
 }
 
-interface Fetched {
-  runId: string;
-  progress: RunProgress | null;
-  queuedBehind: QueuedBehind | null;
-}
-
-export function useRunProgress(threadId: string, runId: string): RunProgressState {
-  const { apiTenantScope } = useTenantScope();
-  const [fetched, setFetched] = useState<Fetched | null>(null);
-  const [nowMs, setNowMs] = useState(() => Date.now());
-
+/** 页面(浏览器标签)当前是否可见。 */
+export function useDocumentVisible(): boolean {
+  const [visible, setVisible] = useState(documentVisible);
   useEffect(() => {
+    const onChange = () => setVisible(documentVisible());
+    document.addEventListener("visibilitychange", onChange);
+    return () => document.removeEventListener("visibilitychange", onChange);
+  }, []);
+  return visible;
+}
+
+/** 每 ``intervalMs`` 推进一次「现在」;``enabled`` 为 false 时停(重新打开时立刻补一拍)。 */
+export function useNow(intervalMs: number, enabled: boolean): number {
+  const [nowMs, setNowMs] = useState(() => Date.now());
+  useEffect(() => {
+    if (!enabled) return;
+    setNowMs(Date.now());
+    const timer = setInterval(() => setNowMs(Date.now()), intervalMs);
+    return () => clearInterval(timer);
+  }, [intervalMs, enabled]);
+  return nowMs;
+}
+
+interface Polled {
+  runId: string;
+  queuedBehind: QueuedBehind | null;
+}
+
+/** ``undefined`` = 还没读到(调用方用排队帧);``null`` = 前面已经没人了。 */
+export function useQueuedBehind(
+  threadId: string,
+  runId: string,
+  enabled: boolean,
+): QueuedBehind | null | undefined {
+  const [polled, setPolled] = useState<Polled | null>(null);
+  useEffect(() => {
+    if (!enabled) return;
     let cancelled = false;
     const tick = () => {
-      setNowMs(Date.now());
-      getRun(threadId, runId, concreteTenantScope(apiTenantScope))
+      getRun(threadId, runId)
         .then((detail) => {
-          if (cancelled) return;
-          setFetched({
-            runId,
-            progress: detail.progress ?? null,
-            queuedBehind: detail.queued_behind ?? null,
-          });
+          if (!cancelled) setPolled({ runId, queuedBehind: detail.queued_behind ?? null });
         })
         .catch(() => {
-          // Best-effort: the bubble keeps its plain text until the next tick.
+          // Best-effort: keep the last value (or the queued frame) until the next tick.
         });
     };
     tick();
-    const timer = setInterval(tick, RUN_PROGRESS_POLL_MS);
+    const timer = setInterval(tick, QUEUED_POLL_MS);
     return () => {
       cancelled = true;
       clearInterval(timer);
     };
-  }, [threadId, runId, apiTenantScope]);
-
-  // 换了一轮(同一个气泡复用)时,上一轮读到的值不算数。
-  const current = fetched !== null && fetched.runId === runId ? fetched : null;
-  return {
-    progress: current?.progress ?? null,
-    queuedBehind: current?.queuedBehind ?? null,
-    nowMs,
-  };
-}
-
-/** 只推进「现在」(live 排队轮:领头那一轮的开始时刻在排队帧里,不用读库)。 */
-export function useNow(intervalMs: number): number {
-  const [nowMs, setNowMs] = useState(() => Date.now());
-  useEffect(() => {
-    const timer = setInterval(() => setNowMs(Date.now()), intervalMs);
-    return () => clearInterval(timer);
-  }, [intervalMs]);
-  return nowMs;
+  }, [threadId, runId, enabled]);
+  return polled !== null && polled.runId === runId ? polled.queuedBehind : undefined;
 }

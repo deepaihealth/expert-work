@@ -6,9 +6,10 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from typing import Any
-from uuid import UUID
+from uuid import UUID, uuid4
 
 import pytest
 
@@ -93,7 +94,8 @@ async def test_run_list_carries_start_heartbeat_queue_and_progress(
             )
         ]
     )
-    inflight = _Counting(store, "list_inflight_by_thread")
+    inflight = _Counting(store, "list_inflight_by_threads")
+    per_thread = _Counting(store, "list_inflight_by_thread")
     progress = _Counting(ctx.app.state.run_event_store, "progress_for_runs")
 
     resp = await ctx.client.get(_URL, params={"user_id": "cust-77"}, headers=ctx.headers)
@@ -132,5 +134,76 @@ async def test_run_list_carries_start_heartbeat_queue_and_progress(
     assert done["started_at"] == started.isoformat()
     assert not {"heartbeat_at", "queued_behind", "progress"} & set(done)
 
-    # 一个会话一次 ``list_inflight_by_thread``,整页一次进度聚合。
-    assert (inflight.calls, progress.calls) == (1, 1)
+    # 整页一次排队查询(按租户分批)、一次进度聚合,不按行也不按会话。
+    assert (inflight.calls, per_thread.calls, progress.calls) == (1, 0, 1)
+
+
+@pytest.mark.asyncio
+async def test_a_progress_failure_keeps_the_list_and_the_row_fields(
+    ctx: _Ctx,  # noqa: F811 -- pytest fixture injection, not a redefinition
+) -> None:
+    """进度聚合失败(超时 / 库抖动)只丢 ``progress``,列表照常返回,行上自带的
+    ``started_at`` / ``heartbeat_at`` 照给;排队信息另算,不受牵连。"""
+    await ctx.seed_agent()
+    leader = await _queue(ctx)
+    follower = await _queue(ctx, leader["thread_id"])
+
+    async def boom(*_: Any, **__: Any) -> Any:
+        raise TimeoutError("statement timeout")
+
+    ctx.app.state.run_event_store.progress_for_runs = boom
+
+    resp = await ctx.client.get(_URL, params={"user_id": "cust-77"}, headers=ctx.headers)
+
+    assert resp.status_code == 200, resp.text
+    rows = {r["run_id"]: r for r in resp.json()["data"]["runs"]}
+    for row in rows.values():
+        assert "progress" not in row
+        assert (row["started_at"], row["heartbeat_at"]) == (None, None)
+    assert rows[follower["run_id"]]["queued_behind"]["run_id"] == leader["run_id"]
+
+
+@pytest.mark.asyncio
+async def test_a_queue_lookup_failure_keeps_the_list(
+    ctx: _Ctx,  # noqa: F811 -- pytest fixture injection, not a redefinition
+) -> None:
+    await ctx.seed_agent()
+    leader = await _queue(ctx)
+    follower = await _queue(ctx, leader["thread_id"])
+
+    async def boom(*_: Any, **__: Any) -> Any:
+        raise TimeoutError("statement timeout")
+
+    ctx.run_store.list_inflight_by_threads = boom  # type: ignore[method-assign]
+
+    resp = await ctx.client.get(_URL, params={"user_id": "cust-77"}, headers=ctx.headers)
+
+    assert resp.status_code == 200, resp.text
+    row = {r["run_id"]: r for r in resp.json()["data"]["runs"]}[follower["run_id"]]
+    assert "queued_behind" not in row
+    assert row["progress"]["step"] == 0
+
+
+@pytest.mark.asyncio
+async def test_queued_behind_never_names_another_users_run(
+    ctx: _Ctx,  # noqa: F811 -- pytest fixture injection, not a redefinition
+) -> None:
+    """对外列表只说自己这个终端用户的 run:挡在前面的是别人的,给 ``null``。"""
+    await ctx.seed_agent()
+    mine = await _queue(ctx)
+    head = await ctx.run_store.get(run_id=UUID(mine["run_id"]), tenant_id=ctx.tenant_id)
+    assert head is not None
+    stranger = replace(
+        head,
+        run_id=uuid4(),
+        user_id=uuid4(),
+        status=RunStatus.RUNNING,
+        created_at=head.created_at - timedelta(minutes=1),
+        idempotency_key=None,
+    )
+    await ctx.run_store.create(stranger)
+
+    resp = await ctx.client.get(_URL, params={"user_id": "cust-77"}, headers=ctx.headers)
+
+    row = {r["run_id"]: r for r in resp.json()["data"]["runs"]}[mine["run_id"]]
+    assert row["queued_behind"] is None

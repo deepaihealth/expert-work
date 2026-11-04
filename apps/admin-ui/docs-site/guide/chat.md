@@ -176,7 +176,7 @@ sequenceDiagram
 
 会话空闲时 202 的响应体只有 `run_id`、`thread_id`、`status` 三个字段。
 
-排队期间要查看前面那一轮执行了多久、进行到哪一步，读 [5.4 run 列表](./query#_5-4-run-列表)：排队中的 run 带 `queued_behind`，还在执行的 run 带 `started_at` 与 `progress`。
+排队期间要查看前面那一轮已经进行了多久、进行到哪一步，读 [5.4 run 列表](./query#_5-4-run-列表)：排队中的 run 带 `queued_behind`，还在执行的 run 带 `started_at` 与 `progress`。
 
 几条边界：
 
@@ -719,6 +719,8 @@ key 与 run 的绑定关系永久保留，没有过期时间，不会因为时�
 返回与首次请求同形状的 202 响应，`data.run_id` 与首次一致。`data.status` 与首次不同：首次请求恒为 `queued`，重复请求返回的是原 run 当时的真实状态，可能是 [5.4 run 列表](./query#_5-4-run-列表) 那九个值里的任意一个（例如已经执行完成的 `success`）。
 
 **因此轮询的判断条件应当是「状态不是最终状态」，不是「状态等于 `queued`」。**
+
+重复请求的 202 不带 `ahead` 以及 `ahead_run_id`、`ahead_status`、`ahead_started_at`，即使原 run 仍在排队。要知道它排在谁后面，查 [5.4 run 列表](./query#_5-4-run-列表) 里这次 run 的 `queued_behind`。
 
 ```bash [请求]
 curl -X POST https://<your-domain>/v1/agents/{agent_code}/runs \

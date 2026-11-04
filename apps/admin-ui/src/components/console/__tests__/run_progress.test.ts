@@ -3,7 +3,13 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
 import i18n from "../../../i18n";
 import type { SseEvent } from "../../../api/sessions";
-import { aheadStartedAtOf, progressLine, queuedText } from "../run_progress";
+import {
+  aheadStartedAtOf,
+  progressFromEvents,
+  progressLine,
+  queuedRunIdOf,
+  queuedText,
+} from "../run_progress";
 
 let priorLang: string;
 beforeAll(async () => {
@@ -16,8 +22,8 @@ afterAll(async () => {
 
 const t = i18n.t.bind(i18n);
 
-function frame(event: string, data: unknown): SseEvent {
-  return { id: null, event, data, rawData: JSON.stringify(data), receivedAt: "" };
+function frame(event: string, data: unknown, id: string | null = null): SseEvent {
+  return { id, event, data, rawData: JSON.stringify(data), receivedAt: "" };
 }
 
 const base = {
@@ -67,5 +73,50 @@ describe("aheadStartedAtOf", () => {
   it("is null without a queued frame or when the head has not started", () => {
     expect(aheadStartedAtOf([])).toBeNull();
     expect(aheadStartedAtOf([frame("queued", { ahead: 1, ahead_started_at: null })])).toBeNull();
+  });
+});
+
+describe("queuedRunIdOf", () => {
+  it("reads this turn's run id off the queued frame", () => {
+    expect(queuedRunIdOf([frame("queued", { run_id: "r-9", ahead: 1 })])).toBe("r-9");
+    expect(queuedRunIdOf([])).toBeNull();
+  });
+});
+
+describe("progressFromEvents", () => {
+  const started = Date.parse("2026-11-04T08:00:00Z");
+  const tool = (name: string) => ({ type: "tool", name, content: "x" });
+
+  it("counts steps, tool results and running subtasks the way the server does", () => {
+    const events = [
+      frame("metadata", { run_id: "r" }, `${started}-0`),
+      frame("updates", { agent: { messages: [], step_count: 1 } }, `${started + 1}-1`),
+      frame("updates", { tools: { messages: [tool("a"), { type: "human" }, tool("b")] } }),
+      frame("worker", { worker_id: "w1", kind: "start" }),
+      frame("worker", { worker_id: "w2", kind: "start" }),
+      frame("worker", { worker_id: "w1", kind: "end" }),
+      frame("updates", { agent: { messages: [], step_count: 2 } }),
+    ];
+    const p = progressFromEvents(events, started + 754_000);
+    expect(p).not.toBeNull();
+    expect([p?.elapsed_s, p?.step, p?.tool_calls, p?.active_workers]).toEqual([754, 2, 2, 1]);
+  });
+
+  it("forgets subtasks of an earlier attempt and ignores an end without a start", () => {
+    const events = [
+      frame("metadata", { run_id: "r" }, `${started}-0`),
+      frame("worker", { worker_id: "wA", kind: "start" }),
+      frame("metadata", { run_id: "r" }, `${started + 60_000}-2`),
+      frame("worker", { worker_id: "wB", kind: "start" }),
+      frame("worker", { worker_id: "wC", kind: "end" }),
+    ];
+    const p = progressFromEvents(events, started + 120_000);
+    expect(p?.active_workers).toBe(1);
+    // 已进行时间从第一次开始执行算起,接管不清零。
+    expect(p?.elapsed_s).toBe(120);
+  });
+
+  it("is null before the run has started", () => {
+    expect(progressFromEvents([frame("queued", { ahead: 1 })], started)).toBeNull();
   });
 });

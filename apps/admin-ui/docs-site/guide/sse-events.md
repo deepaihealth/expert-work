@@ -143,7 +143,7 @@ function seqOf(id) {
 
 | 事件 | 出现时机 | 客户端处理 |
 |---|---|---|
-| [`queued`](#queued) | 会话上一轮还没结束、这一轮排在后面时，一次，在 `metadata` 之前 | 显示「排队中」，以及前面那一轮已经执行了多久 |
+| [`queued`](#queued) | 会话上一轮还没结束、这一轮排在后面时，一次，在 `metadata` 之前 | 显示「排队中」，以及前面那一轮已经进行了多久 |
 | [`metadata`](#metadata) | run 开始时，一次 | 保存 `run_id` 和会话 id，重连和下一轮对话都要用 |
 | [`token`](#token) | 模型逐字生成时，多次 | 作为打字机预览显示，不作为状态依据 |
 | [`updates`](#updates) | 每个步骤完成时，一次 | 用它重建对话内容与工具调用的显示 |
@@ -212,7 +212,9 @@ data: {"run_id":"7c9e6679-7425-40de-944b-e07fc1f90ae7","thread_id":"3f2b8a1e-0c4
 
 #### 客户端怎么处理
 
-`ahead_started_at` 有值时显示「排队中，上一轮已执行 N 分钟」，N 由当前时间减去 `ahead_started_at` 得出；为 `null` 时显示「排队中，上一轮结束后开始」。可以同时提供取消（[4.1 取消 run](./run-control#_4-1-取消-run)）。
+`ahead_started_at` 有值时显示「排队中，上一轮已进行 N 分钟」，N 由当前时间减去 `ahead_started_at` 得出；为 `null` 时显示「排队中，上一轮结束后开始」。可以同时提供取消（[4.1 取消 run](./run-control#_4-1-取消-run)）。
+
+`ahead`、`ahead_run_id`、`ahead_status`、`ahead_started_at` 是这一轮受理时的情况，之后不会更新：前面那一轮结束、下一轮开始执行时，不会再发一次 `queued`。要显示最新情况，定期查 [5.4 run 列表](./query#_5-4-run-列表) 里这一轮的 `queued_behind`。
 
 排队期间想知道前面那一轮进行到哪一步，查 [5.4 run 列表](./query#_5-4-run-列表) 里那个 run 的 `progress`。之后可能先来几行心跳，轮到这一轮时照常收到 `metadata`。排队中的这一轮被取消时，流以 `status` 为 `interrupted` 的 `end` 收尾，不会有 `metadata`。
 
