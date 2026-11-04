@@ -394,6 +394,10 @@ async def test_vision_gap_line_only_when_workers_see_images_and_this_agent_canno
     whose workers' model is multimodal gets the line."""
     gap = await _spawn_description(_vision_variant(main_vision=False, worker_vision=True))
     assert VISION_GAP_SENTENCE in gap
+    # Review M2/M3: overrides "single-point work: do it yourself" and B-122's
+    # "if a worker fails … do that part yourself" for reading it cannot do.
+    assert "even a single one" in VISION_GAP_SENTENCE
+    assert "spawn another worker for the remaining images or pages" in VISION_GAP_SENTENCE
     for parent in (
         _vision_variant(main_vision=True, worker_vision=True),
         _vision_variant(main_vision=False, worker_vision=False),
@@ -415,6 +419,28 @@ async def test_read_page_learns_the_vision_gap_only_when_spawn_worker_is_registe
     reg = await _gap_registry(off)
     assert reg.get("spawn_worker") is None
     assert reg.get("read_page").workers_view_pages is False
+
+
+@pytest.mark.asyncio
+async def test_no_vision_gap_when_spawn_worker_is_not_registered() -> None:
+    """Review L4 —— depth cap and an unwired worker builder drop spawn_worker, so
+    neither tool may mention it."""
+    from unittest.mock import MagicMock
+
+    parent = _vision_variant(main_vision=False, worker_vision=True)
+    for env, depth in (
+        (ToolEnv(worker_build_fn=_fake_wbf, sandbox_runtime=MagicMock()), MAX_SUBAGENT_DEPTH),
+        (ToolEnv(worker_build_fn=None, sandbox_runtime=MagicMock()), 0),
+    ):
+        reg = await build_tool_registry(
+            [],
+            tool_env=env,
+            parent_spec=parent,
+            dynamic_workers=parent.spec.dynamic_workers,
+            subagent_depth=depth,
+        )
+        assert reg.get("spawn_worker") is None
+        assert reg.get("read_page").workers_view_pages is False
 
 
 def test_spec_description_carries_delegation_contract_four_elements() -> None:

@@ -1443,10 +1443,11 @@ def _delivery_sentence(
 
 
 #: B-276 —— the refusal for an agent that cannot see images while its workers can.
-WORKERS_VIEW_PAGES_REFUSAL: Final = (
-    "Not rendered: {path}. You cannot see images, but your workers can — "
-    "delegate reading these pages to a worker with spawn_worker (name the file "
-    "and the pages in the task). Do not install OCR or render pages yourself."
+#: The reason is platform text, so it goes in ``notice`` (outside the untrusted
+#: fence, stated as facts) — inside ``content`` a spotlight agent reads it as data.
+WORKERS_VIEW_PAGES_NOTICE: Final = (
+    "This agent's model cannot see images; workers started with spawn_worker "
+    "can render and read these pages (name the file and the pages in the task)."
 )
 
 
@@ -1579,7 +1580,7 @@ class ReadPageTool:
             return ToolResult(content=rejection)
         delivery = self.figure_delivery
         if delivery == "none" and self.workers_view_pages:
-            return ToolResult(content=WORKERS_VIEW_PAGES_REFUSAL.format(path=raw))
+            return ToolResult(content=f"Not rendered: {raw}.", notice=WORKERS_VIEW_PAGES_NOTICE)
         if delivery == "none":
             # 回修第 3 轮 —— 看不了图、也没有 ask_image 时不进沙箱:渲出来也没人看,
             # 白跑一次 soffice + pdftoppm。**仍然注册** read_page,不是撤掉它 ——

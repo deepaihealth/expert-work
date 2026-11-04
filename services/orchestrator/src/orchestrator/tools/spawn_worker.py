@@ -140,9 +140,10 @@ class WorkerBuildFn(Protocol):
 #: B-276 — shown only when the workers can see images and this agent cannot.
 VISION_GAP_SENTENCE: Final = (
     "Workers can see images and rendered document pages; you cannot. Delegate "
-    "anything that needs reading an image or a page, and take what the worker "
-    "read as the reading — do not install OCR or render pages yourself to "
-    "re-read it."
+    "anything that needs reading an image or a page — even a single one — and "
+    "take what the worker read as the reading; do not install OCR or render "
+    "pages yourself to re-read it. If a worker fails partway, spawn another "
+    "worker for the remaining images or pages instead of reading them yourself."
 )
 
 

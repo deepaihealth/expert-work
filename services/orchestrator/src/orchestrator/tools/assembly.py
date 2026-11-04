@@ -626,12 +626,11 @@ def _register_spawn_worker(
     ``subagents``, a missing builder is **not** an error — the feature is
     default-on but optional, so an unwired deployment simply runs without it.
     """
-    if dynamic_workers is not None and not dynamic_workers.enabled:
+    if not _spawn_worker_registrable(env, parent_spec, dynamic_workers, subagent_depth):
+        if subagent_depth >= MAX_SUBAGENT_DEPTH:
+            logger.warning("tools.spawn_worker_depth_cap depth=%d not_registered", subagent_depth)
         return
-    if env.worker_build_fn is None or parent_spec is None:
-        return
-    if subagent_depth >= MAX_SUBAGENT_DEPTH:
-        logger.warning("tools.spawn_worker_depth_cap depth=%d not_registered", subagent_depth)
+    if parent_spec is None or env.worker_build_fn is None:  # narrowed by the gate above
         return
     build_fn = env.worker_build_fn
     child_depth = subagent_depth + 1
@@ -657,20 +656,32 @@ def _register_spawn_worker(
     )
 
 
+def _spawn_worker_registrable(
+    env: ToolEnv,
+    parent_spec: AgentSpec | None,
+    dynamic_workers: DynamicWorkersSpec | None,
+    subagent_depth: int,
+) -> bool:
+    """The one set of gates for ``spawn_worker`` (B-276: read_page's refusal
+    must never point to a spawn_worker that is not there)."""
+    if dynamic_workers is not None and not dynamic_workers.enabled:
+        return False
+    if env.worker_build_fn is None or parent_spec is None:
+        return False
+    return subagent_depth < MAX_SUBAGENT_DEPTH
+
+
 def _spawn_worker_vision_gap(
     env: ToolEnv,
     parent_spec: AgentSpec | None,
     dynamic_workers: DynamicWorkersSpec | None,
     subagent_depth: int,
 ) -> bool:
-    """B-276 —— ``spawn_worker`` will be registered (same gates as
-    :func:`_register_spawn_worker`) and its workers can see images this agent
-    cannot."""
-    if dynamic_workers is not None and not dynamic_workers.enabled:
-        return False
-    if env.worker_build_fn is None or parent_spec is None:
-        return False
-    if subagent_depth >= MAX_SUBAGENT_DEPTH:
+    """B-276 —— ``spawn_worker`` will be registered and its workers can see
+    images this agent cannot."""
+    if parent_spec is None or not _spawn_worker_registrable(
+        env, parent_spec, dynamic_workers, subagent_depth
+    ):
         return False
     return _workers_see_what_parent_cannot(parent_spec, dynamic_workers)
 

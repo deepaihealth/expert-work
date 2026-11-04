@@ -2744,9 +2744,10 @@ async def test_read_page_points_to_workers_when_they_can_see_the_page() -> None:
         client=runtime, figure_delivery="none", workers_view_pages=True
     ).call({"path": "d.pptx", "units": [3]}, ctx=ctx)
     assert runtime.execs == []
-    assert "spawn_worker" in result.content
-    assert "Do not install OCR" in result.content
-    assert "d.pptx" in result.content
+    assert result.content == "Not rendered: d.pptx."
+    # 理由是平台文字:放 notice(不可信围栏之外),不放 content。
+    assert result.notice is not None and "spawn_worker" in result.notice
+    assert "spawn_worker" not in result.content
     assert "viewed_figures" not in result.state_updates
 
 
