@@ -150,6 +150,7 @@ def claimed(
             "due_at": now + lease,
             "attempts": record.refresh.attempts + 1,
             "holder": uuid4().hex,
+            "stale_seen": record.stale_marks,
         }
     )
     return record.model_copy(update={"refresh": refresh})
@@ -195,11 +196,15 @@ def finished(
         refresh = ProfileRefresh(
             due_at=now + PROFILE_RETRY_AFTER, dirty_since=now, calibrate_only=True
         )
+    # A new profile un-stales only if nothing was deleted or switched off since
+    # the claim: such a document may be in the digest it was made from.
+    clean = profile is not None and pending.stale_seen == record.stale_marks
     return KnowledgeProfileRecord(
         profile=profile if profile is not None else record.profile,
         calibration=calibration if calibration is not None else record.calibration,
         refresh=refresh,
-        stale_since=None if profile is not None else record.stale_since,
+        stale_since=None if clean else record.stale_since,
+        stale_marks=record.stale_marks,
     )
 
 
@@ -226,12 +231,20 @@ def failed(
 def staled(
     record: KnowledgeProfileRecord | None, *, now: datetime
 ) -> KnowledgeProfileRecord | None:
-    """``record`` with its profile marked stale (a document it may describe was
-    deleted or switched off); ``None`` when there is nothing to mark (no
-    profile, or already stale) — the caller then writes nothing."""
-    if record is None or record.profile is None or record.stale_since is not None:
+    """``record`` marked stale: a document its profile — or the profile a
+    refresh in flight is making — may describe was deleted or switched off.
+    Every mark counts (:attr:`stale_marks`), already stale or not; ``None``
+    when there is nothing to mark (no profile and no refresh held) — the
+    caller then writes nothing."""
+    held = record is not None and record.refresh is not None and record.refresh.holder is not None
+    if record is None or (record.profile is None and not held):
         return None
-    return record.model_copy(update={"stale_since": now})
+    return record.model_copy(
+        update={
+            "stale_since": record.stale_since or now,
+            "stale_marks": record.stale_marks + 1,
+        }
+    )
 
 
 def document_digest(

@@ -14,7 +14,7 @@ from datetime import datetime
 from typing import Any
 from uuid import UUID
 
-from sqlalchemy import DateTime, String, and_, case, cast, func, literal, select
+from sqlalchemy import DateTime, String, and_, case, cast, func, literal, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from sqlalchemy.sql.elements import ColumnElement
 
@@ -30,11 +30,13 @@ from expert_work.protocol.knowledge_profile import (
     parse_profile_record,
 )
 
-#: Due refreshes one claim pass reads (earliest due first).
+#: Refreshes one claim pass reads: unreadable ones (cleaned) first, then the
+#: due ones, earliest first.
 _CLAIM_SCAN_LIMIT = 200
 _INGESTING = (DocumentStatus.PENDING.value, DocumentStatus.PROCESSING.value)
 #: The shape pydantic writes a ``due_at`` in; anything else is never cast (a
-#: cast of a malformed value would fail the whole claim query).
+#: cast of a malformed value would fail the whole claim query) — such a row is
+#: read as unreadable and cleaned, so it cannot sit in every pass.
 _ISO_TIMESTAMP = r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?(Z|[+-]\d{2}:\d{2})$"
 
 
@@ -105,8 +107,13 @@ class SqlProfiles:
                 (
                     await session.execute(
                         select(KnowledgeBaseRow)
-                        .where(and_(due.is_not(None), due <= now))
-                        .order_by(due)
+                        .where(
+                            and_(
+                                KnowledgeBaseRow.profile.has_key("refresh"),
+                                or_(due.is_(None), due <= now),
+                            )
+                        )
+                        .order_by(due.asc().nulls_first())
                         .limit(_CLAIM_SCAN_LIMIT)
                         .with_for_update(skip_locked=True)
                     )
@@ -258,6 +265,7 @@ class SqlProfiles:
                 KnowledgeChunkRow.tenant_id == tenant_id,
                 KnowledgeChunkRow.document_id.in_(document_ids),
                 KnowledgeChunkRow.enabled.is_(True),
+                KnowledgeChunkRow.chunk_index < profiles.PROFILE_HEADING_SCAN,
             )
             .distinct(KnowledgeChunkRow.document_id)
             .order_by(KnowledgeChunkRow.document_id, KnowledgeChunkRow.chunk_index)

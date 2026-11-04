@@ -2320,7 +2320,10 @@ def create_app(
                     knowledge_recovery_worker.start()
                     _app.state.knowledge_recovery_worker = knowledge_recovery_worker
                 # B-267 —— base-profile refreshes run in their own loop (switch on).
-                if profile_refresher is not None:
+                if (
+                    profile_refresher is not None
+                    and resolved_settings.enable_knowledge_recovery_worker
+                ):
                     profile_refresh_worker = ProfileRefreshWorker(
                         refresher=profile_refresher,
                         interval_s=resolved_settings.knowledge_recovery_interval_s,

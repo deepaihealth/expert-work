@@ -2503,6 +2503,16 @@ class SqlKnowledgeStore(SqlEstimates, SqlProfiles, KnowledgeStore):
         if not document_ids:
             return []
         async with self._sf() as session:
+            switching_off = (
+                await session.execute(
+                    select(KnowledgeDocumentRow.id).where(
+                        *_documents_where(tenant_id, kb_id),
+                        KnowledgeDocumentRow.id.in_(list(dict.fromkeys(document_ids))),
+                        KnowledgeDocumentRow.enabled.is_(True),
+                        KnowledgeDocumentRow.chunk_count > 0,
+                    )
+                )
+            ).first()
             changed = (
                 await session.execute(
                     update(KnowledgeDocumentRow)
@@ -2511,11 +2521,12 @@ class SqlKnowledgeStore(SqlEstimates, SqlProfiles, KnowledgeStore):
                         KnowledgeDocumentRow.id.in_(list(dict.fromkeys(document_ids))),
                     )
                     .values(enabled=enabled, updated_at=datetime.now(UTC))
-                    .returning(KnowledgeDocumentRow.id, KnowledgeDocumentRow.chunk_count)
+                    .returning(KnowledgeDocumentRow.id)
                 )
             ).all()
             done = {row.id for row in changed}
-            if not enabled and any(row.chunk_count > 0 for row in changed):
+            # Only a document that was on and had passages changes what shows.
+            if not enabled and switching_off is not None:
                 # B-267 —— switched-off content must not keep showing through the profile.
                 await mark_profile_stale(session, tenant_id, kb_id, datetime.now(UTC))
             await session.commit()

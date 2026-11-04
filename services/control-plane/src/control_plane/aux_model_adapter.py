@@ -99,6 +99,7 @@ class LLMRouterAuxModelAdapter:
         tenant_id: UUID,
         output_schema: StructuredOutputSpec | None = None,
         max_tokens: int | None = None,
+        thinking_off: bool = False,
     ) -> ConsolidatorLLMReply:
         # Lazy import — ``orchestrator`` depends on control-plane in
         # some test paths via subagent runtime, and importing
@@ -136,6 +137,11 @@ class LLMRouterAuxModelAdapter:
             # B-267 —— a caller that bounds the answer (the base profile's
             # estimate holds only under its cap); ``None`` = vendor default.
             max_tokens=max_tokens,
+            # ... and turns thinking off where the model has a switch, so
+            # reasoning tokens do not run past that bound.
+            thinking_enabled=False
+            if thinking_off and _has_thinking_switch(provider, model_name)
+            else None,
         )
         # 二期 PR2 T3 — hand the router a tenant-scoped caching store so its
         # internal vault read (agent_factory.py:1956) becomes a cache hit.
@@ -164,6 +170,15 @@ class LLMRouterAuxModelAdapter:
             output_tokens=int(usage.get("output_tokens", 0) or 0),
             parsed=parsed_raw if isinstance(parsed_raw, dict) else None,
         )
+
+
+def _has_thinking_switch(provider: str, model: str) -> bool:
+    """The model catalog declares a thinking switch for it (setting
+    ``thinking_enabled`` on any other model fails the build)."""
+    from expert_work.protocol import catalog_entry
+
+    entry = catalog_entry(provider, model)
+    return entry is not None and entry.thinking is not None
 
 
 def _coerce_text(content: object) -> str:

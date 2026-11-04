@@ -72,13 +72,21 @@ class _Aux:
     text: str = field(default_factory=lambda: json.dumps(_ANSWER, ensure_ascii=False))
     prompts: list[str] = field(default_factory=list)
     caps: list[int | None] = field(default_factory=list)
+    thinking_off: list[bool] = field(default_factory=list)
     seen: list[tuple[bool, UUID | None]] = field(default_factory=list)
 
     async def __call__(
-        self, *, prompt: str, model: str | None, tenant_id: UUID, max_tokens: int | None = None
+        self,
+        *,
+        prompt: str,
+        model: str | None,
+        tenant_id: UUID,
+        max_tokens: int | None = None,
+        thinking_off: bool = False,
     ) -> ConsolidatorLLMReply:
         self.prompts.append(prompt)
         self.caps.append(max_tokens)
+        self.thinking_off.append(thinking_off)
         self.seen.append((bypass_rls_var.get(), current_tenant_id_var.get()))
         return ConsolidatorLLMReply(
             text=self.text, model=model or "", input_tokens=1200, output_tokens=90
@@ -235,6 +243,7 @@ async def test_one_capped_call_over_the_digest_validated_and_billed() -> None:
     assert prompt.startswith(PROFILE_INSTRUCTIONS)
     assert "- Title: 条款0\n  Headings: 第一章\n  Opening: 免赔额说明" in prompt
     assert aux.caps == [PROFILE_OUTPUT_TOKENS_MAX]
+    assert aux.thinking_off == [True]
     [row] = await usage.list_for_tenant(tenant_id=_TENANT, limit=10)
     assert (row.provider, row.model, row.input_tokens, row.output_tokens) == (
         "acme",
@@ -445,3 +454,22 @@ async def test_no_calibration_when_the_vectors_are_not_the_live_model() -> None:
 def test_calibration_queries_are_platform_text() -> None:
     assert len(CALIBRATION_QUERIES) >= 10
     assert len(set(CALIBRATION_QUERIES)) == len(CALIBRATION_QUERIES)
+
+
+async def test_stopping_lets_a_refresh_in_flight_finish() -> None:
+    class _Slow(_Aux):
+        async def __call__(self, **kwargs: Any) -> ConsolidatorLLMReply:
+            reply = await super().__call__(**kwargs)  # records the call first
+            await asyncio.sleep(0.2)
+            return reply
+
+    store, aux = InMemoryKnowledgeStore(), _Slow()
+    base = await _base(store)
+    await store.mark_profile_refresh(tenant_id=_TENANT, kb_id=base.id, now=_NOW - PROFILE_DEBOUNCE)
+    worker = ProfileRefreshWorker(refresher=_refresher(store, aux), interval_s=30)
+    worker.start()
+    while not aux.prompts:
+        await asyncio.sleep(0.01)
+    await worker.stop(grace_s=5)
+    record = await _record(store)
+    assert record.profile is not None and record.refresh is None

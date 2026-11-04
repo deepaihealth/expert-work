@@ -60,6 +60,8 @@ logger = logging.getLogger(__name__)
 #: inside the claim's lease, so a slow vendor cannot outlive the claim.
 PROFILE_CALL_TIMEOUT_S: Final = 180.0
 CALIBRATION_TIMEOUT_S: Final = 120.0
+#: How long shutdown waits for a refresh in flight.
+STOP_GRACE_S: Final = 20.0
 assert PROFILE_CALL_TIMEOUT_S + CALIBRATION_TIMEOUT_S < PROFILE_LEASE.total_seconds()  # noqa: S101
 
 _refreshes = expert_work_counter(
@@ -74,7 +76,13 @@ class ProfileAuxModel(Protocol):
     """One plain call of the auxiliary model, with an output cap."""
 
     async def __call__(
-        self, *, prompt: str, model: str | None, tenant_id: UUID, max_tokens: int | None = None
+        self,
+        *,
+        prompt: str,
+        model: str | None,
+        tenant_id: UUID,
+        max_tokens: int | None = None,
+        thinking_off: bool = False,
     ) -> ConsolidatorLLMReply: ...
 
 
@@ -171,12 +179,15 @@ class ProfileRefresher:
         if stored is not None and stored.digest_sha256 == rendered.sha256:
             _refreshes.labels(outcome="unchanged").inc()
             return stored
+        # A call cut off by the timeout may still be billed by the vendor; the
+        # adapter returns no usage for it, so nothing can be recorded then.
         reply = await asyncio.wait_for(
             self.aux(
                 prompt=profile_prompt(rendered),
                 model=self.aux_model.model,
                 tenant_id=base.tenant_id,
                 max_tokens=PROFILE_OUTPUT_TOKENS_MAX,
+                thinking_off=True,
             ),
             PROFILE_CALL_TIMEOUT_S,
         )
@@ -264,15 +275,20 @@ class ProfileRefreshWorker:
         self._stop.clear()
         self._task = asyncio.create_task(self._loop(), name="knowledge-profile-refresh")
 
-    async def stop(self) -> None:
+    async def stop(self, *, grace_s: float = STOP_GRACE_S) -> None:
+        """Stop the loop; a refresh in flight gets ``grace_s`` to finish (a
+        claim cancelled at shutdown counts as an attempt — one is left)."""
         if self._task is None:
             return
         self._stop.set()
-        self._task.cancel()
         try:
-            await self._task
-        except (asyncio.CancelledError, Exception):  # noqa: S110 - shutting down
-            pass
+            await asyncio.wait_for(asyncio.shield(self._task), timeout=grace_s)
+        except (TimeoutError, asyncio.CancelledError, Exception):
+            self._task.cancel()
+            try:
+                await self._task
+            except (asyncio.CancelledError, Exception):  # noqa: S110 - shutting down
+                pass
         finally:
             self._task = None
 

@@ -521,18 +521,21 @@ class InMemoryKnowledgeStore(InMemoryEstimates, KnowledgeStore):
             if position not in sampled:
                 digests.append(profiles.DocumentDigest(title=title))
                 continue
+            # Only the document's first chunks are read (the SQL store's bound).
             chunks = sorted(
-                (c for c in self._chunks if c.document_id == doc.id and c.enabled),
+                (
+                    c
+                    for c in self._chunks
+                    if c.document_id == doc.id
+                    and c.enabled
+                    and c.chunk_index < profiles.PROFILE_HEADING_SCAN
+                ),
                 key=lambda c: c.chunk_index,
             )
             digests.append(
                 profiles.document_digest(
                     title,
-                    [
-                        c.heading_path
-                        for c in chunks
-                        if c.chunk_index < profiles.PROFILE_HEADING_SCAN
-                    ],
+                    [c.heading_path for c in chunks],
                     chunks[0].content if chunks else None,
                     max_headings=max_headings,
                 )
@@ -1160,7 +1163,7 @@ class InMemoryKnowledgeStore(InMemoryEstimates, KnowledgeStore):
                     update={"enabled": enabled, "updated_at": now}
                 )
                 done.add(document.id)
-                if not enabled and document.chunk_count > 0:
+                if not enabled and document.enabled and document.chunk_count > 0:
                     switched_off = True
         if switched_off:
             self._stale_profile(tenant_id, kb_id)

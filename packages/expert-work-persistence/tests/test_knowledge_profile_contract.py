@@ -390,6 +390,41 @@ async def test_a_new_profile_clears_stale_a_calibration_does_not(store: Knowledg
     assert record.shown_profile() == _profile("two")  # type: ignore[attr-defined]
 
 
+@pytest.mark.parametrize("first", [True, False], ids=["first-profile", "replacing"])
+async def test_a_document_deleted_during_a_refresh_keeps_the_new_profile_hidden(
+    store: KnowledgeStore, first: bool
+) -> None:
+    """The refresh may have read the deleted document: its profile is stored
+    but not shown, and nothing is spent again on its own."""
+    tenant, kb_id = await _base(store)
+    document_id = await _ready_document(store, tenant, kb_id, "a.md", [((), "x")])
+    if not first:
+        await _with_profile(store, tenant, kb_id, "old")
+    await store.mark_profile_refresh(tenant_id=tenant, kb_id=kb_id, now=T0)
+    [claim] = await store.claim_profile_refreshes(now=T0 + PROFILE_DEBOUNCE, limit=5)
+    await store.delete_document(tenant_id=tenant, document_id=document_id)
+    await _finish(store, tenant, kb_id, claim, profile=_profile("read-the-deleted"))
+    record = await _record(store, tenant)
+    assert record.profile == _profile("read-the-deleted")  # type: ignore[attr-defined]
+    assert record.shown_profile() is None  # type: ignore[attr-defined]
+    assert record.refresh is None  # type: ignore[attr-defined]
+
+
+async def test_switching_off_a_document_already_off_changes_nothing(
+    store: KnowledgeStore,
+) -> None:
+    tenant, kb_id = await _base(store)
+    document_id = await _ready_document(store, tenant, kb_id, "a.md", [((), "x")])
+    await store.set_documents_enabled(
+        tenant_id=tenant, kb_id=kb_id, document_ids=[document_id], enabled=False
+    )
+    await _with_profile(store, tenant, kb_id, "one")
+    await store.set_documents_enabled(
+        tenant_id=tenant, kb_id=kb_id, document_ids=[document_id], enabled=False
+    )
+    assert (await _record(store, tenant)).shown_profile() == _profile("one")  # type: ignore[attr-defined]
+
+
 async def test_no_profile_nothing_to_stale(store: KnowledgeStore) -> None:
     tenant, kb_id = await _base(store)
     document_id = await _ready_document(store, tenant, kb_id, "a.md", [((), "x")])
@@ -454,6 +489,32 @@ async def test_headings_come_from_the_first_chunks_only(store: KnowledgeStore) -
     assert digest.documents[0].headings == ()
 
 
+async def test_the_opening_comes_from_the_first_chunks_only(store: KnowledgeStore) -> None:
+    """A document whose only enabled passage lies past the first chunks: no
+    opening is read (the scan is bounded)."""
+    tenant, kb_id = await _base(store)
+    document = await store.upsert_document(
+        tenant_id=tenant, kb_id=kb_id, filename="late.md", content=b"x"
+    )
+    chunk = KnowledgeChunk(
+        id=uuid4(),
+        tenant_id=tenant,
+        kb_id=kb_id,
+        document_id=document.id,
+        chunk_index=PROFILE_HEADING_SCAN,
+        content="far down",
+        embedding=(1.0,) + (0.0,) * (EMBEDDING_DIM - 1),
+    )
+    await store.replace_chunks(tenant_id=tenant, document_id=document.id, chunks=[chunk])
+    await store.set_document_status(
+        tenant_id=tenant, document_id=document.id, status=DocumentStatus.READY, chunk_count=1
+    )
+    digest = await store.profile_digest(
+        tenant_id=tenant, kb_id=kb_id, max_titles=5, detailed=5, max_headings=5
+    )
+    assert (digest.documents[0].title, digest.documents[0].opening) == ("late", "")
+
+
 def test_sample_positions_are_spread_and_stable() -> None:
     assert sample_positions(3, 5) == [0, 1, 2]
     assert sample_positions(10, 3) == [0, 4, 9] or sample_positions(10, 3) == [0, 5, 9]
@@ -504,3 +565,33 @@ async def test_an_unreadable_record_is_cleaned_not_claimed(
                 )
             ).scalar_one()
         assert raw == {"keep": 1}
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("due_at", ["garbage", "2026-11-04T09:00:00"], ids=["malformed", "naive"])
+async def test_an_unreadable_due_time_is_cleaned(
+    postgres_container: PostgresContainer, due_at: str
+) -> None:
+    async with _sql_store(postgres_container) as sql_store:
+        tenant, kb_id = await _base(sql_store)
+        due = await _base(sql_store)
+        await sql_store.mark_profile_refresh(tenant_id=tenant, kb_id=kb_id, now=T0)
+        await sql_store.mark_profile_refresh(tenant_id=due[0], kb_id=due[1], now=T0)
+        async with sql_store._sf() as session:
+            await session.execute(
+                text(
+                    "UPDATE knowledge_base SET profile = jsonb_set(profile, "
+                    "'{refresh,due_at}', to_jsonb(CAST(:due AS text))) WHERE id = :id"
+                ),
+                {"id": kb_id, "due": due_at},
+            )
+            await session.commit()
+        claims = await sql_store.claim_profile_refreshes(now=T0 + PROFILE_DEBOUNCE, limit=5)
+        assert [claim.kb_id for claim in claims] == [due[1]]
+        async with sql_store._sf() as session:
+            raw = (
+                await session.execute(
+                    text("SELECT profile FROM knowledge_base WHERE id = :id"), {"id": kb_id}
+                )
+            ).scalar_one()
+        assert raw is None

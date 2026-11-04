@@ -133,6 +133,19 @@ class ProfileRefresh(BaseModel):
     #: The claim holding it (a fencing token): only that claim may finish or
     #: fail it, so a worker whose lease ran out cannot overwrite a newer result.
     holder: str | None = None
+    #: :attr:`KnowledgeProfileRecord.stale_marks` when it was claimed: a
+    #: document deleted or switched off after that may be in the digest the
+    #: refresh read, so its profile must stay hidden.
+    stale_seen: int | None = None
+
+    @field_validator("due_at", "dirty_since")
+    @classmethod
+    def _aware(cls, value: datetime) -> datetime:
+        """A naive timestamp cannot be compared or claimed: unreadable."""
+        if value.tzinfo is None:
+            msg = "timestamps must carry a time zone"
+            raise ValueError(msg)
+        return value
 
 
 class KnowledgeProfileRecord(BaseModel):
@@ -147,6 +160,9 @@ class KnowledgeProfileRecord(BaseModel):
     #: off: the catalog stops showing the profile until a new one is generated
     #: (deleted content must not keep showing through its topics).
     stale_since: datetime | None = None
+    #: How many times it was marked stale — compared with what a refresh saw
+    #: when it was claimed (:attr:`ProfileRefresh.stale_seen`), not by clock.
+    stale_marks: int = Field(default=0, ge=0)
 
     def is_empty(self) -> bool:
         return self.profile is None and self.calibration is None and self.refresh is None
@@ -172,4 +188,7 @@ def dump_profile_record(record: KnowledgeProfileRecord | None) -> dict[str, Any]
     """What the column stores (``None`` for an empty record)."""
     if record is None or record.is_empty():
         return None
-    return record.model_dump(mode="json", exclude_none=True)
+    data = record.model_dump(mode="json", exclude_none=True)
+    if not data.get("stale_marks"):
+        data.pop("stale_marks", None)
+    return data
