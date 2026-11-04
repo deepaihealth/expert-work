@@ -42,7 +42,7 @@ or a Kubernetes CronJob. Settings via `EXPERT_WORK_RETENTION_*` env (see
 | 规则 | 删什么 | 不删什么 |
 |---|---|---|
 | B-28 产物版本 | `artifact_version.created_at` 满 90 天:`path_in_workspace` 那一个文件 + 版本行;版本清空的 `artifact` 行标 `deleted_at`(`ARTIFACT_EXPIRED` 审计) | 同名产物的新版本;文件所在目录;删不掉的文件对应的行(明天再试) |
-| 上传 | `user_upload.created_at` 满 90 天:`uploads/<file>` + 标 `deleted_at` | 图片类 `expert_work://image/…` 的字节(归 `image_upload` 自己的 pass) |
+| 上传 | `user_upload.created_at` 满 90 天:按会话**当前**的 agent / 布局算出的 `agents/<key>/[threads/<会话>/work/]uploads/<file>`(B-271)+ 标 `deleted_at` | 图片类 `expert_work://image/…` 的字节(归 `image_upload` 自己的 pass);会话已不在的行的文件;还有没到期的行指着的文件;大小 / sha256 与登记时不符的文件(这三种行照样标 `deleted_at`);路径上有软链的(行留着明天再试);没有登记行的控制台上传与引用复制 |
 | B-27 threads/ | `threads/<thread_id>/` 且 `thread_meta` 行不存在 | 行还在的目录(**不按时间删活会话**);非 UUID 名的子目录;已软删用户的整棵树 |
 | X-4 ② 已删工作区 | 软删且已归档满 90 天的 `user_workspace` 行 + 该用户的 artifact / artifact_version / user_upload 行(`WORKSPACE_HARD_DELETE` 审计) | OSS 归档对象(桶生命周期到期);`.deleted/<user>` 标记 |
 

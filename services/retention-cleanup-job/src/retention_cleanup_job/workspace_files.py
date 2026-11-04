@@ -21,6 +21,7 @@ job 只删 (a) 登记过的产物文件 (b) ``uploads/`` 下登记过的文件 (
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import os
 import re
@@ -29,9 +30,12 @@ import stat
 from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
+from typing import Literal
 from uuid import UUID
 
 from expert_work.persistence import WORKSPACE_AGENTS_DIR
+from expert_work.protocol import ThreadMeta
+from expert_work.protocol.agent_key import sanitize_agent_key
 
 logger = logging.getLogger(__name__)
 
@@ -193,6 +197,77 @@ def unlink_registered_file(root: str, tenant_id: UUID, user_id: UUID, relpath: s
     except FileNotFoundError:
         return False
     return True
+
+
+#: :func:`remove_upload_file` 的结果:删了 / 本来就不在 / 与登记时不一致所以没删。
+UploadFileOutcome = Literal["removed", "missing", "changed"]
+
+
+def upload_relpath(ref: str, meta: ThreadMeta) -> str:
+    """一条上传登记行的 ``ref``(会话 ``/workspace`` 相对的 ``uploads/<名字>``)按会话 ``meta``
+    **当前**的 agent 与布局落成用户根相对路径(B-271)。
+
+    与 ``control_plane.api._workspace_shared.thread_workspace_path`` 同一拼法 —— 上传端点写、
+    下载端点读都走那一个。作业不 import control-plane(理由同模块头),parity 由
+    ``tests/test_upload_retention.py`` 钉住:没绑 agent → ``ref`` 本身;老视图 →
+    ``agents/<key>/<ref>``;对话视图 → ``agents/<key>/threads/<会话>/work/<ref>``。
+    """
+    if not meta.agent_name:
+        return ref
+    prefix = f"{WORKSPACE_AGENTS_DIR}/{sanitize_agent_key(meta.agent_name)}"
+    if meta.workspace_layout == "conversation":
+        prefix = f"{prefix}/{THREADS_DIR}/{meta.thread_id}/{CONVERSATION_WORK_DIR}"
+    return f"{prefix}/{ref}"
+
+
+def _same_as_registered(target: Path, size_bytes: int, sha256: str | None) -> bool:
+    """文件还是登记时那一份吗:大小相等,登记行有 sha256 时内容哈希也相等(老行只比大小)。"""
+    fd = os.open(target, os.O_RDONLY | os.O_NOFOLLOW)
+    with os.fdopen(fd, "rb") as fh:
+        if os.fstat(fh.fileno()).st_size != size_bytes:
+            return False
+        if sha256 is None:
+            return True
+        return hashlib.file_digest(fh, "sha256").hexdigest() == sha256
+
+
+def remove_upload_file(
+    root: str,
+    tenant_id: UUID,
+    user_id: UUID,
+    relpath: str,
+    *,
+    size_bytes: int,
+    sha256: str | None,
+) -> UploadFileOutcome:
+    """删掉一条到期上传指向的普通文件(B-271)。``relpath`` 来自 :func:`upload_relpath`。
+
+    从用户根起**逐段** ``lstat``(同 :func:`remove_tool_result_dir`):对话的 ``work/`` 是模型
+    写得到的地方,任何一段是软链 / 不是目录、或叶子不是普通文件 →
+    :class:`UnsafeWorkspacePathError`(调用方保留登记行)。哪一段不在 → ``"missing"``。
+    大小或内容与登记时不一致(上传后在会话里被改写过)→ ``"changed"``,不删。
+    """
+    parts = PurePosixPath(relpath).parts
+    if not parts or relpath.startswith("/") or "\0" in relpath or ".." in parts:
+        raise UnsafeWorkspacePathError(f"not a relative workspace path: {relpath!r}")
+    _ensure_plain_dirs(root, tenant_id, user_id)
+    target = user_root(root, tenant_id, user_id)
+    for index, part in enumerate(parts):
+        target = target / part
+        try:
+            st = os.lstat(target)
+        except FileNotFoundError:
+            return "missing"
+        wanted = stat.S_ISREG if index == len(parts) - 1 else stat.S_ISDIR
+        if stat.S_ISLNK(st.st_mode) or not wanted(st.st_mode):
+            raise UnsafeWorkspacePathError(f"upload path has an unsafe segment: {part!r}")
+    if not _same_as_registered(target, size_bytes, sha256):
+        return "changed"
+    try:
+        os.unlink(target)
+    except FileNotFoundError:
+        return "missing"
+    return "removed"
 
 
 def agent_subtree(user_dir: Path, agent_key: str) -> Path:
@@ -467,12 +542,15 @@ __all__ = [
     "ThreadDir",
     "ToolResultDir",
     "UnsafeWorkspacePathError",
+    "UploadFileOutcome",
     "deleted_marker",
     "iter_thread_dirs",
     "iter_tool_result_dirs",
     "remove_thread_dir",
     "remove_tool_result_dir",
+    "remove_upload_file",
     "unlink_registered_file",
+    "upload_relpath",
     "user_root",
     "validate_workspace_root",
 ]

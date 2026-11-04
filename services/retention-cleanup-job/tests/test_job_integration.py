@@ -16,6 +16,7 @@ The test app role is granted both ``audit_writer`` (for seeding) and
 
 from __future__ import annotations
 
+import hashlib
 import os
 import time
 from collections.abc import Iterator
@@ -31,6 +32,7 @@ from sqlalchemy import create_engine, text
 from sqlalchemy.ext.asyncio import AsyncEngine
 from testcontainers.postgres import PostgresContainer
 
+from control_plane.api._workspace_shared import thread_workspace_path
 from expert_work.persistence import (
     DatabaseConfig,
     SqlAuditLogStore,
@@ -668,31 +670,45 @@ async def test_workspace_rules_end_to_end_against_postgres(
         style = _write(user, "style/rules.md")
         memory_md = _write(user, "MEMORY.md")
 
-        # ---- uploads: old (goes) + fresh (stays) ----------------------------
-        old_upload = await uploads.insert(
-            upload_id=uuid4(),
-            tenant_id=tenant,
-            user_id=user,
-            thread_id=uuid4(),
-            kind="document",
-            ref="uploads/old.pdf",
-            mime_type="application/pdf",
-            size_bytes=1,
-            filename="old.pdf",
+        # ---- uploads (B-271): files at the REAL locations, per the thread's layout ----
+        # A conversation-view thread: old (goes) + fresh (stays) in its own ``work/uploads/``.
+        conv_thread = await threads.create(
+            thread_id=uuid4(), tenant_id=tenant, created_by="u", user_id=user, agent_name="bot"
         )
-        fresh_upload = await uploads.insert(
-            upload_id=uuid4(),
-            tenant_id=tenant,
-            user_id=user,
-            thread_id=uuid4(),
-            kind="document",
-            ref="uploads/new.pdf",
-            mime_type="application/pdf",
-            size_bytes=1,
-            filename="new.pdf",
-        )
-        old_upload_file = _write(user, "uploads/old.pdf")
-        fresh_upload_file = _write(user, "uploads/new.pdf")
+        # Two old-view threads of the same agent share ``agents/<key>/uploads/``: the old
+        # row's file is still the fresh row's file → stays.
+        shared_threads = [
+            await threads.create(
+                thread_id=uuid4(), tenant_id=tenant, created_by="u", user_id=user, agent_name="bot"
+            )
+            for _ in range(2)
+        ]
+
+        async def _upload(thread_id: UUID, ref: str) -> UUID:
+            row = await uploads.insert(
+                upload_id=uuid4(),
+                tenant_id=tenant,
+                user_id=user,
+                thread_id=thread_id,
+                kind="document",
+                ref=ref,
+                mime_type="application/pdf",
+                size_bytes=1,
+                filename=ref.rsplit("/", 1)[-1],
+                sha256=hashlib.sha256(b"x").hexdigest(),
+            )
+            return row.id
+
+        old_upload = await _upload(conv_thread.thread_id, "uploads/old.pdf")
+        fresh_upload = await _upload(conv_thread.thread_id, "uploads/new.pdf")
+        shared_old = await _upload(shared_threads[0].thread_id, "uploads/shared.pdf")
+        shared_fresh = await _upload(shared_threads[1].thread_id, "uploads/shared.pdf")
+        agent_root_meta = shared_threads[0].model_copy(update={"workspace_layout": "agent_root"})
+        old_upload_file = _write(user, thread_workspace_path("uploads/old.pdf", conv_thread))
+        fresh_upload_file = _write(user, thread_workspace_path("uploads/new.pdf", conv_thread))
+        shared_file = _write(user, thread_workspace_path("uploads/shared.pdf", agent_root_meta))
+        assert "/work/uploads/" in str(old_upload_file)
+        assert "/work/" not in str(shared_file)
 
         # ---- threads: live row (dir stays) + orphan dir (goes) --------------
         live_thread, orphan_thread = uuid4(), uuid4()
@@ -730,13 +746,22 @@ async def test_workspace_rules_end_to_end_against_postgres(
                     ),
                     {"v": old_v.id},
                 )
-                conn.execute(
-                    text(
-                        "UPDATE user_upload SET created_at = now() - interval '100 days' "
-                        "WHERE id = :u"
-                    ),
-                    {"u": old_upload.id},
-                )
+                for upload_id in (old_upload, shared_old):
+                    conn.execute(
+                        text(
+                            "UPDATE user_upload SET created_at = now() - interval '100 days' "
+                            "WHERE id = :u"
+                        ),
+                        {"u": upload_id},
+                    )
+                for thread in shared_threads:
+                    conn.execute(
+                        text(
+                            "UPDATE thread_meta SET workspace_layout = 'agent_root' "
+                            "WHERE thread_id = :t"
+                        ),
+                        {"t": thread.thread_id},
+                    )
         finally:
             admin.dispose()
 
@@ -762,6 +787,7 @@ async def test_workspace_rules_end_to_end_against_postgres(
         assert not orphan_dir.exists()
         assert fresh_file.exists()
         assert fresh_upload_file.exists()
+        assert shared_file.exists()
         assert style.exists() and memory_md.exists()
         assert (live_dir / "MEMORY.md").exists()
 
@@ -777,10 +803,20 @@ async def test_workspace_rules_end_to_end_against_postgres(
         }
         assert by_name["report.pptx"].deleted_at is not None
         assert by_name["plan.json"].deleted_at is None
-        old_row = await uploads.get(upload_id=old_upload.id, tenant_id=tenant)
-        fresh_row = await uploads.get(upload_id=fresh_upload.id, tenant_id=tenant)
-        assert old_row is not None and old_row.deleted_at is not None
-        assert fresh_row is not None and fresh_row.deleted_at is None
+        upload_rows = {
+            name: await uploads.get(upload_id=upload_id, tenant_id=tenant)
+            for name, upload_id in {
+                "old": old_upload,
+                "fresh": fresh_upload,
+                "shared_old": shared_old,
+                "shared_fresh": shared_fresh,
+            }.items()
+        }
+        assert {
+            name: row is not None and row.deleted_at is not None
+            for name, row in upload_rows.items()
+        } == {"old": True, "fresh": False, "shared_old": True, "shared_fresh": False}
+        assert (report.uploads_expired, report.upload_files_removed) == (2, 1)
         assert await workspaces.get(tenant_id=tenant, user_id=purged_user) is None
         assert (
             await artifacts.list_for_user(

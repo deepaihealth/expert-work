@@ -281,3 +281,53 @@ async def test_list_documents_for_thread(sql_store: SqlStoreFixture) -> None:
         assert [r.id for r in rows] == [first, second]
     finally:
         await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_sha256_round_trips_and_list_active_by_ref(sql_store: SqlStoreFixture) -> None:
+    """B-271 —— 与内存实现同一谓词:``sha256`` 落库读回(老调用点 ``None``);
+    ``list_active_by_ref`` 只认同租户、同用户、同 ``ref``、没删的行。"""
+    from datetime import UTC, datetime
+
+    store, engine = sql_store
+    try:
+        tenant, user = uuid4(), uuid4()
+
+        async def _put(
+            *,
+            tenant_id: UUID = tenant,
+            user_id: UUID = user,
+            ref: str = "uploads/a.pdf",
+            sha256: str | None = None,
+        ) -> UUID:
+            uid = uuid4()
+            await store.insert(
+                upload_id=uid,
+                tenant_id=tenant_id,
+                user_id=user_id,
+                thread_id=uuid4(),
+                kind="document",
+                ref=ref,
+                mime_type="application/pdf",
+                size_bytes=3,
+                filename="a.pdf",
+                sha256=sha256,
+            )
+            return uid
+
+        first = await _put(sha256="cd" * 32)
+        second = await _put()
+        await _put(ref="uploads/b.pdf")
+        await _put(user_id=uuid4())
+        await _put(tenant_id=uuid4())
+        gone = await _put()
+        await store.soft_delete(upload_id=gone, tenant_id=tenant, now=datetime.now(UTC))
+
+        hashed = await store.get(upload_id=first, tenant_id=tenant)
+        legacy = await store.get(upload_id=second, tenant_id=tenant)
+        assert hashed is not None and hashed.sha256 == "cd" * 32
+        assert legacy is not None and legacy.sha256 is None
+        rows = await store.list_active_by_ref(tenant_id=tenant, user_id=user, ref="uploads/a.pdf")
+        assert sorted(r.id for r in rows) == sorted([first, second])
+    finally:
+        await engine.dispose()

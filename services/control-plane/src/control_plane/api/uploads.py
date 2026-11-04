@@ -354,6 +354,8 @@ class DocumentUploadResult:
 
     path: str
     size_bytes: int
+    #: B-271 —— 落地字节的 sha256(十六进制),写进 ``user_upload.sha256``。
+    sha256: str
     #: B-262 —— 同名同内容的文件已经在了,这次没写,``path`` 指向那个已有文件。
     reused: bool = False
 
@@ -559,7 +561,7 @@ async def _land_and_account(
             )
         except Exception:
             logger.warning("upload.quota_accounting_failed", exc_info=True)
-    return DocumentUploadResult(path=landed, size_bytes=len(raw), reused=reused)
+    return DocumentUploadResult(path=landed, size_bytes=len(raw), sha256=sha256_hex, reused=reused)
 
 
 def _get_object_store(request: Request) -> ObjectStore | None:

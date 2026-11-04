@@ -54,6 +54,8 @@ class UserUpload(BaseModel):
     filename: str
     created_at: datetime
     deleted_at: datetime | None = None
+    #: B-271 —— 落地字节的 sha256(十六进制),上传时写入;列加上之前的老行为 ``None``。
+    sha256: str | None = None
 
 
 def render_upload_id(upload_id: UUID) -> str:
