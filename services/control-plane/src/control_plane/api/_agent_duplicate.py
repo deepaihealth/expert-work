@@ -34,7 +34,7 @@ async def duplicate_agent_response(
                 "error": {
                     "code": AGENT_PURGING,
                     "message": "this agent name is being purged; retry once the purge finishes",
-                    "details": {"name": name},
+                    "details": {"name": name, "version": version, "status": "purging"},
                 },
             },
         )

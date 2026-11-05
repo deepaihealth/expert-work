@@ -356,15 +356,31 @@ async def test_a_purging_name_cannot_be_restored_or_recreated(ctx: _Ctx) -> None
 
     restore = await ctx.client.post(f"/v1/agents/{_NAME}/1.0.0/restore")
     assert restore.status_code == 409
+    assert restore.json()["success"] is False
     assert restore.json()["error"]["code"] == "AGENT_PURGING"
-    for manifest in (_YAML, _YAML_V2):
+    assert restore.json()["error"]["details"] == {
+        "name": _NAME,
+        "version": "1.0.0",
+        "status": "purging",
+    }
+    for manifest, version in ((_YAML, "1.0.0"), (_YAML_V2, "2.0.0")):
         create = await ctx.client.post("/v1/agents", json={"manifest_yaml": manifest})
         assert create.status_code == 409, create.text
         assert create.json()["error"]["code"] == "AGENT_PURGING"
+        assert create.json()["error"]["details"] == {
+            "name": _NAME,
+            "version": version,
+            "status": "purging",
+        }
     detail = await ctx.client.get(f"/v1/agents/{_NAME}/1.0.0")
     assert detail.json()["data"]["record"]["status"] == "purging"
     listed = await ctx.client.get("/v1/agents", params={"status": "deleted"})
     assert [r["name"] for r in listed.json()["data"]["items"]] == [_NAME]
+    only_purging = await ctx.client.get("/v1/agents", params={"status": "purging"})
+    assert only_purging.status_code == 200, only_purging.text
+    assert [r["status"] for r in only_purging.json()["data"]["items"]] == ["purging"]
+    only_active = await ctx.client.get("/v1/agents", params={"status": "active"})
+    assert only_active.json()["data"]["items"] == []
     # A re-run of the purge is still allowed and finishes it.
     finish = await _purge(ctx.client)
     assert finish.status_code == 200  # type: ignore[attr-defined]

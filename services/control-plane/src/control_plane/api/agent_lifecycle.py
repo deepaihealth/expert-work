@@ -185,7 +185,10 @@ def build_agent_lifecycle_router() -> APIRouter:
             )
             if now is not None and now.status is AgentSpecStatus.PURGING:
                 return _error(
-                    AGENT_PURGING, "this agent is being purged and cannot be restored", 409
+                    AGENT_PURGING,
+                    "this agent is being purged and cannot be restored",
+                    409,
+                    {"name": name, "version": version, "status": "purging"},
                 )
             return _error(AGENT_NOT_DELETED, "this agent version is not deleted", 409)
         await _invalidate_agent_build_cache(request, tenant_id)
