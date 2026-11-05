@@ -67,6 +67,7 @@ from control_plane.api.uploads import (
     LandingAccount,
     copy_document_into_thread,
     is_safe_document_upload_id,
+    note_upload_used,
     original_document_name,
 )
 from control_plane.audit import emit
@@ -445,6 +446,8 @@ async def resolve_external_files(
             original = original_document_name(ref, row.sha256)
             if original is not None:
                 original_names[ref] = original
+        # B-63 —— 记在**登记行**上(跨会话时就是源会话那一行):保留期按最后一次使用算。
+        await note_upload_used(uploads_store, row)
     if len(image_refs) > MAX_RUN_IMAGE_REFS:
         raise ExternalScopeError(
             "TOO_MANY_IMAGE_REFS",

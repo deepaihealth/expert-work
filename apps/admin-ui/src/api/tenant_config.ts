@@ -39,6 +39,11 @@ export interface TenantConfigRecord {
   mcp_servers: Record<string, unknown>[];
   audit_retention_days: number;
   event_log_retention_days: number;
+  /** B-63 — upload / artifact retention in days, counted from LAST USE
+   *  (upload time, last re-attach / download, last run in its conversation —
+   *  whichever is latest). Range [1, 365]; ``null`` = platform default (90). */
+  upload_retention_days: number | null;
+  artifact_retention_days: number | null;
   /** Sprint #4 (Mini-ADR U-28) — Curator thresholds.
    *  ``skill_stale_days`` default 30, range [1, 365].
    *  ``skill_archive_days`` default 90, range [2, 730], and must be
@@ -73,6 +78,9 @@ export interface TenantConfigPatchBody {
   mcp_servers?: Record<string, unknown>[];
   audit_retention_days?: number;
   event_log_retention_days?: number;
+  /** B-63 — ``null`` resets to the platform default; omit the key to leave it. */
+  upload_retention_days?: number | null;
+  artifact_retention_days?: number | null;
   skill_stale_days?: number;
   skill_archive_days?: number;
   skill_evolution_enabled?: boolean;

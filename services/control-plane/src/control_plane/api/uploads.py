@@ -22,6 +22,7 @@ import re
 import zipfile
 from collections.abc import Mapping
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from pathlib import PurePosixPath
 from typing import Annotated, Any, Final
 from uuid import UUID, uuid4
@@ -50,6 +51,7 @@ from expert_work.common.observability import current_trace_id_hex
 from expert_work.persistence import WORKSPACE_UPLOADS_DIR
 from expert_work.persistence.image_upload import ImageUploadStore
 from expert_work.persistence.tenant_user import TenantUserStore
+from expert_work.persistence.user_upload import UserUploadStore
 from expert_work.protocol import (
     AuditAction,
     AuditResult,
@@ -227,6 +229,18 @@ async def _land_document_bytes(
         return candidate, False
     msg = f"no free upload name for {workspace_path!r}"
     raise SandboxSupervisorError(msg)
+
+
+async def note_upload_used(uploads: UserUploadStore, upload: UserUpload) -> None:
+    """B-63 —— 记一次「用到了这份附件」(重新附加到 run / 对外下载):保留期从最后一次使用算起。
+
+    存储层每行每天最多真写一次。记不上只打 warning、不影响这次请求:少记一次的后果是这份附件
+    按上一次使用的时间到期,不会更早于改动之前(按上传时间)的到期日。
+    """
+    try:
+        await uploads.touch(upload_id=upload.id, tenant_id=upload.tenant_id, now=datetime.now(UTC))
+    except Exception:
+        logger.warning("upload.touch_failed upload_id=%s", upload.id, exc_info=True)
 
 
 async def copy_document_into_thread(

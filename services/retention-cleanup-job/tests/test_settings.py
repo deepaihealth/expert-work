@@ -78,3 +78,48 @@ def test_knowledge_retrieval_log_retention_rejects_zero(monkeypatch: pytest.Monk
     monkeypatch.setenv("EXPERT_WORK_RETENTION_KNOWLEDGE_RETRIEVAL_LOG_RETENTION_DAYS", "0")
     with pytest.raises(ValueError, match="knowledge_retrieval_log_retention_days"):
         RetentionCleanupSettings(_env_file=None)  # type: ignore[call-arg]
+
+
+# ------------------------------------------------ B-63
+
+
+@pytest.mark.parametrize(
+    "env_key",
+    [
+        "EXPERT_WORK_RETENTION_UPLOAD_RETENTION_DAYS",
+        "EXPERT_WORK_RETENTION_ARTIFACT_RETENTION_DAYS",
+    ],
+)
+def test_file_retention_above_one_year_is_clamped_not_refused(
+    monkeypatch: pytest.MonkeyPatch, env_key: str
+) -> None:
+    """B-63 —— 上限 365。已经配了更大值的部署不能因此每晚拒跑:夹到 365,记下原值给 main 打
+    warning。"""
+    monkeypatch.setenv(env_key, "3650")
+    settings = RetentionCleanupSettings(_env_file=None)  # type: ignore[call-arg]
+    field = env_key.removeprefix("EXPERT_WORK_RETENTION_").lower()
+    assert getattr(settings, field) == 365
+    assert settings.clamped_retention == {field: 3650}
+
+
+def test_file_retention_within_a_year_is_used_as_is(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("EXPERT_WORK_RETENTION_UPLOAD_RETENTION_DAYS", "365")
+    monkeypatch.setenv("EXPERT_WORK_RETENTION_ARTIFACT_RETENTION_DAYS", "30")
+    settings = RetentionCleanupSettings(_env_file=None)  # type: ignore[call-arg]
+    assert (settings.upload_retention_days, settings.artifact_retention_days) == (365, 30)
+    assert settings.clamped_retention == {}
+
+
+def test_clamped_retention_is_logged_as_a_warning(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    from retention_cleanup_job.main import warn_clamped_retention
+
+    monkeypatch.setenv("EXPERT_WORK_RETENTION_UPLOAD_RETENTION_DAYS", "400")
+    settings = RetentionCleanupSettings(_env_file=None)  # type: ignore[call-arg]
+    with caplog.at_level("WARNING", logger="retention_cleanup_job.main"):
+        warn_clamped_retention(settings)
+    assert (
+        "retention.retention_days_clamped field=upload_retention_days configured=400 used=365"
+        in (caplog.text)
+    )

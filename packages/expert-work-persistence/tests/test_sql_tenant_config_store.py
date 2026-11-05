@@ -315,6 +315,47 @@ async def test_memory_predictive_review_enabled_default_and_patch(
         await engine.dispose()
 
 
+@pytest.mark.asyncio
+async def test_file_retention_days_set_keep_and_reset_to_the_platform_default(
+    tenant_config_store: tuple[SqlTenantConfigStore, AsyncEngine],
+) -> None:
+    """B-63 —— 与内存实现同义:默认 ``None``;不带键的 patch 不动;显式 ``null`` 改回平台默认。"""
+    store, engine = tenant_config_store
+    try:
+        tenant = uuid4()
+        current_tenant_id_var.set(tenant)
+        created = await store.create(tenant_id=tenant, display_name="Acme", actor_id="bootstrap")
+        assert (created.upload_retention_days, created.artifact_retention_days) == (None, None)
+
+        set_ = await store.upsert(
+            tenant_id=tenant,
+            patch=TenantConfigPatch(upload_retention_days=30, artifact_retention_days=180),
+            actor_id="ops",
+        )
+        assert (set_.upload_retention_days, set_.artifact_retention_days) == (30, 180)
+        kept = await store.upsert(
+            tenant_id=tenant, patch=TenantConfigPatch(display_name="Acme 2"), actor_id="ops"
+        )
+        assert (kept.upload_retention_days, kept.artifact_retention_days) == (30, 180)
+        await store.upsert(
+            tenant_id=tenant, patch=TenantConfigPatch(upload_retention_days=None), actor_id="ops"
+        )
+        fetched = await store.get(tenant_id=tenant)
+        assert fetched is not None
+        assert (fetched.upload_retention_days, fetched.artifact_retention_days) == (None, 180)
+
+        fresh = uuid4()
+        current_tenant_id_var.set(fresh)
+        first = await store.upsert(
+            tenant_id=fresh,
+            patch=TenantConfigPatch(display_name="New", artifact_retention_days=7),
+            actor_id="ops",
+        )
+        assert first.artifact_retention_days == 7
+    finally:
+        await engine.dispose()
+
+
 # ---------------------------------------------------------------------------
 # BUG-1(2026-08-24)mcp_allowlist 原子 add/remove(语义见 base.py;in-memory
 # 对应用例在 test_in_memory_tenant_config_store.py,两后端行为必须同义)。

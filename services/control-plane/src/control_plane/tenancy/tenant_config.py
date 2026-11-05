@@ -143,8 +143,14 @@ class TenantConfigService:
                 resource_id=str(tenant_id),
                 trace_id=current_trace_id_hex(),
                 details={
+                    # B-63 —— 保留期字段显式传 ``null``(改回平台默认)也是一次改动。
                     "fields": sorted(
-                        k for k, v in patch.model_dump(exclude_unset=True).items() if v is not None
+                        {
+                            k
+                            for k, v in patch.model_dump(exclude_unset=True).items()
+                            if v is not None
+                        }
+                        | set(patch.retention_updates())
                     ),
                 },
             )

@@ -273,3 +273,35 @@ async def test_add_on_missing_tenant_raises_not_found() -> None:
         await store.add_mcp_allowlist_name(tenant_id=uuid4(), name="x", actor_id="op")
     with pytest.raises(TenantConfigNotFoundError):
         await store.remove_mcp_allowlist_name(tenant_id=uuid4(), name="x", actor_id="op")
+
+
+@pytest.mark.asyncio
+async def test_file_retention_days_set_keep_and_reset_to_the_platform_default() -> None:
+    """B-63 —— 附件 / 产物保留期:默认 ``None``(平台默认);设了之后不带这个键的 patch 不动它;
+    显式 ``null`` 改回平台默认。首次 upsert 也认。"""
+    store = InMemoryTenantConfigStore()
+    tid = uuid4()
+    created = await store.create(tenant_id=tid, display_name="Acme", actor_id="sys")
+    assert (created.upload_retention_days, created.artifact_retention_days) == (None, None)
+
+    set_ = await store.upsert(
+        tenant_id=tid,
+        patch=TenantConfigPatch(upload_retention_days=30, artifact_retention_days=180),
+        actor_id="ops",
+    )
+    assert (set_.upload_retention_days, set_.artifact_retention_days) == (30, 180)
+    kept = await store.upsert(
+        tenant_id=tid, patch=TenantConfigPatch(display_name="Acme 2"), actor_id="ops"
+    )
+    assert (kept.upload_retention_days, kept.artifact_retention_days) == (30, 180)
+    reset = await store.upsert(
+        tenant_id=tid, patch=TenantConfigPatch(upload_retention_days=None), actor_id="ops"
+    )
+    assert (reset.upload_retention_days, reset.artifact_retention_days) == (None, 180)
+
+    first = await store.upsert(
+        tenant_id=uuid4(),
+        patch=TenantConfigPatch(display_name="New", upload_retention_days=7),
+        actor_id="ops",
+    )
+    assert first.upload_retention_days == 7

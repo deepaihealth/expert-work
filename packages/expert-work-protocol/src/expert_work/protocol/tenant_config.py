@@ -29,6 +29,8 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 from expert_work.protocol.provider_catalog import Tool
 
 __all__ = [
+    "FILE_RETENTION_MAX_DAYS",
+    "FILE_RETENTION_MIN_DAYS",
     "CredentialsMode",
     "MemoryRecallMode",
     "TenantConfigPatch",
@@ -80,6 +82,13 @@ class TenantPlan(StrEnum):
 
 _RETENTION_MIN_DAYS = 1
 _RETENTION_MAX_DAYS = 3650
+
+# B-63 —— 附件与产物的保留期(按最后一次使用算起)。租户可在这个范围里改;``None`` =
+# 跟随平台默认(留存作业的 ``EXPERT_WORK_RETENTION_UPLOAD_RETENTION_DAYS`` /
+# ``..._ARTIFACT_RETENTION_DAYS``,默认 90)。上限一年:没有「永不清理」这一档。
+# 迁移 0183 的 CHECK 与这里同一范围。
+FILE_RETENTION_MIN_DAYS = 1
+FILE_RETENTION_MAX_DAYS = 365
 
 # Capability Uplift Sprint #4 — Mini-ADR U-28.
 # Curator threshold bounds. Defaults 30 / 90 derive from external
@@ -148,6 +157,13 @@ class TenantConfigRecord(BaseModel):
     audit_retention_days: int = Field(default=90, ge=_RETENTION_MIN_DAYS, le=_RETENTION_MAX_DAYS)
     event_log_retention_days: int = Field(
         default=30, ge=_RETENTION_MIN_DAYS, le=_RETENTION_MAX_DAYS
+    )
+    # B-63 —— 附件 / 产物保留期(天,按最后一次使用算起)。``None`` = 平台默认(90)。
+    upload_retention_days: int | None = Field(
+        default=None, ge=FILE_RETENTION_MIN_DAYS, le=FILE_RETENTION_MAX_DAYS
+    )
+    artifact_retention_days: int | None = Field(
+        default=None, ge=FILE_RETENTION_MIN_DAYS, le=FILE_RETENTION_MAX_DAYS
     )
     # Capability Uplift Sprint #1 — Mini-ADR U-2.
     trigger_fire_scan_mode: TriggerFireScanMode = "warn"
@@ -257,6 +273,14 @@ class TenantConfigPatch(BaseModel):
     event_log_retention_days: int | None = Field(
         default=None, ge=_RETENTION_MIN_DAYS, le=_RETENTION_MAX_DAYS
     )
+    # B-63 —— 附件 / 产物保留期。与其它字段不同,这两个字段**显式传 ``null``** 表示改回
+    # 平台默认(清掉租户自己的值);不传这个键才是「不改」。见 :meth:`retention_updates`。
+    upload_retention_days: int | None = Field(
+        default=None, ge=FILE_RETENTION_MIN_DAYS, le=FILE_RETENTION_MAX_DAYS
+    )
+    artifact_retention_days: int | None = Field(
+        default=None, ge=FILE_RETENTION_MIN_DAYS, le=FILE_RETENTION_MAX_DAYS
+    )
     # Capability Uplift Sprint #1 — Mini-ADR U-2.
     trigger_fire_scan_mode: TriggerFireScanMode | None = None
     # Capability Uplift Sprint #6 — Mini-ADR U-5.
@@ -306,3 +330,12 @@ class TenantConfigPatch(BaseModel):
     # SE-16 (SE-A45) — implicit-candidate judge sample rate. None = leave
     # unchanged.
     skill_evolution_judge_sample_pct: int | None = Field(default=None, ge=0, le=100)
+
+    def retention_updates(self) -> dict[str, int | None]:
+        """B-63 —— 这个 patch 对两个保留期字段的改动:键在 ``model_fields_set`` 里才算(显式
+        ``null`` → ``None`` = 改回平台默认);没传的键不出现。"""
+        return {
+            name: getattr(self, name)
+            for name in ("upload_retention_days", "artifact_retention_days")
+            if name in self.model_fields_set
+        }

@@ -193,6 +193,25 @@ describe("SettingsTenantConfig", () => {
     );
   });
 
+  it("shows file retention days or the platform default (B-63)", async () => {
+    installAdapter([
+      {
+        match: (u) => u.endsWith("/config"),
+        respond: () => ({
+          success: true,
+          data: { ...configRow, upload_retention_days: 30, artifact_retention_days: null },
+          error: null,
+        }),
+      },
+    ]);
+    renderConfig();
+    await waitFor(() => expect(screen.getByText("Acme")).toBeInTheDocument());
+    expect(screen.getByTestId("tenant-config-upload-retention-days")).toHaveTextContent("30");
+    expect(screen.getByTestId("tenant-config-artifact-retention-days")).toHaveTextContent(
+      "Platform default",
+    );
+  });
+
   it("Edit button reveals the JSON editor + dirty detection", async () => {
     installAdapter([
       {

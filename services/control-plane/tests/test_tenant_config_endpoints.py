@@ -343,6 +343,38 @@ async def test_put_emits_tenant_config_write_audit(
     assert "plan" in fields
 
 
+@pytest.mark.asyncio
+async def test_put_sets_and_resets_file_retention_days(
+    tc_client: AsyncClient, audit_store: InMemoryAuditLogStore
+) -> None:
+    """B-63 —— 附件 / 产物保留期经同一个 PUT 设置(1-365);显式 ``null`` 改回平台默认,
+    这次改动也进审计的 ``fields``。"""
+    headers = {"Authorization": f"Bearer {_admin_token()}"}
+    url = f"/v1/tenants/{_TENANT}/config"
+    put = await tc_client.put(
+        url,
+        headers=headers,
+        json={"display_name": "ACME", "upload_retention_days": 30, "artifact_retention_days": 365},
+    )
+    assert put.status_code == 200, put.text
+    data = put.json()["data"]
+    assert (data["upload_retention_days"], data["artifact_retention_days"]) == (30, 365)
+
+    for bad in (0, 366):
+        rejected = await tc_client.put(url, headers=headers, json={"upload_retention_days": bad})
+        assert rejected.status_code == 422, bad
+
+    reset = await tc_client.put(url, headers=headers, json={"upload_retention_days": None})
+    assert reset.status_code == 200, reset.text
+    got = (await tc_client.get(url, headers=headers)).json()["data"]
+    assert (got["upload_retention_days"], got["artifact_retention_days"]) == (None, 365)
+    page = await audit_store.query(
+        AuditQuery(tenant_id=_TENANT, action=AuditAction.TENANT_CONFIG_WRITE)
+    )
+    writes = [entry.details.get("fields") for entry in page.entries]
+    assert ["upload_retention_days"] in writes, writes
+
+
 # ---------------------------------------------------------------------------
 # PR-E3a — PUT must drop the tenant's built agents (locally + via the bus)
 # ---------------------------------------------------------------------------

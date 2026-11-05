@@ -97,6 +97,8 @@ class InMemoryTenantConfigStore(TenantConfigStore):
                     row_kwargs["audit_retention_days"] = patch.audit_retention_days
                 if patch.event_log_retention_days is not None:
                     row_kwargs["event_log_retention_days"] = patch.event_log_retention_days
+                # B-63 —— 显式 ``null`` 也算(= 平台默认),见 ``retention_updates``。
+                row_kwargs.update(patch.retention_updates())
                 if patch.trigger_fire_scan_mode is not None:
                     row_kwargs["trigger_fire_scan_mode"] = patch.trigger_fire_scan_mode
                 if patch.memory_recall_mode is not None:
@@ -189,6 +191,8 @@ class InMemoryTenantConfigStore(TenantConfigStore):
                         }.items()
                         if v is not None
                     }
+                    # B-63 —— 显式 ``null`` = 改回平台默认;没传的键不动。
+                    | patch.retention_updates()
                     | {"updated_at": now, "updated_by": actor_id},
                 )
                 # Re-validate the merged row to catch the cross-field

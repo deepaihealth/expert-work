@@ -49,6 +49,8 @@ def _row_to_record(row: TenantConfigRow) -> TenantConfigRecord:
         mcp_servers=[dict(x) for x in row.mcp_servers],
         audit_retention_days=row.audit_retention_days,
         event_log_retention_days=row.event_log_retention_days,
+        upload_retention_days=row.upload_retention_days,
+        artifact_retention_days=row.artifact_retention_days,
         trigger_fire_scan_mode=cast(TriggerFireScanMode, row.trigger_fire_scan_mode),
         memory_recall_mode=cast(MemoryRecallMode, row.memory_recall_mode),
         skill_stale_days=row.skill_stale_days,
@@ -158,6 +160,8 @@ class SqlTenantConfigStore(TenantConfigStore):
                     values["audit_retention_days"] = patch.audit_retention_days
                 if patch.event_log_retention_days is not None:
                     values["event_log_retention_days"] = patch.event_log_retention_days
+                # B-63 —— 显式 ``null`` 也算(= 平台默认),见 ``retention_updates``。
+                values.update(patch.retention_updates())
                 if patch.trigger_fire_scan_mode is not None:
                     values["trigger_fire_scan_mode"] = patch.trigger_fire_scan_mode
                 if patch.memory_recall_mode is not None:
@@ -246,6 +250,9 @@ class SqlTenantConfigStore(TenantConfigStore):
                 existing.audit_retention_days = patch.audit_retention_days
             if patch.event_log_retention_days is not None:
                 existing.event_log_retention_days = patch.event_log_retention_days
+            # B-63 —— 显式 ``null`` = 改回平台默认;没传的键不动。
+            for name, days in patch.retention_updates().items():
+                setattr(existing, name, days)
             if patch.trigger_fire_scan_mode is not None:
                 existing.trigger_fire_scan_mode = patch.trigger_fire_scan_mode
             if patch.memory_recall_mode is not None:

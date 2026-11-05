@@ -75,6 +75,9 @@ function recordToPatchJson(record: TenantConfigRecord): string {
     mcp_servers: record.mcp_servers,
     audit_retention_days: record.audit_retention_days,
     event_log_retention_days: record.event_log_retention_days,
+    // B-63 — ``null`` = platform default; sending it back keeps it that way.
+    upload_retention_days: record.upload_retention_days,
+    artifact_retention_days: record.artifact_retention_days,
     // Sprint #4 (Mini-ADR U-28) — Curator thresholds round-trip
     // through the same JSON-edit surface as the rest of tenant_config.
     skill_stale_days: record.skill_stale_days,
@@ -284,6 +287,16 @@ export function SettingsTenantConfig() {
             <dd style={{ margin: 0 }}>{record.audit_retention_days}</dd>
             <dt style={{ color: "var(--ew-text-tertiary)" }}>{t("settings_ops.event_log_retention_days")}</dt>
             <dd style={{ margin: 0 }}>{record.event_log_retention_days}</dd>
+            {/* B-63 — upload / artifact retention, counted from last use. Edit via
+                the JSON editor; ``null`` = platform default. */}
+            <dt style={{ color: "var(--ew-text-tertiary)" }}>{t("settings_ops.upload_retention_days")}</dt>
+            <dd style={{ margin: 0 }} data-testid="tenant-config-upload-retention-days">
+              {record.upload_retention_days ?? t("settings_ops.file_retention_default")}
+            </dd>
+            <dt style={{ color: "var(--ew-text-tertiary)" }}>{t("settings_ops.artifact_retention_days")}</dt>
+            <dd style={{ margin: 0 }} data-testid="tenant-config-artifact-retention-days">
+              {record.artifact_retention_days ?? t("settings_ops.file_retention_default")}
+            </dd>
             {/* Stream C.6 — per-tenant rate limit. Read-only here; edit via the
                 JSON editor: "rate_limit_override": {"requests_per_minute": N}. */}
             <dt style={{ color: "var(--ew-text-tertiary)" }}>{t("settings_ops.rate_limit_override")}</dt>
