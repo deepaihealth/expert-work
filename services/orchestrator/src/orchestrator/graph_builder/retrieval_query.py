@@ -76,8 +76,8 @@ _MEASURE_WORDS: Final = "个些两几款种位份条项家本篇段张"
 #: third-person pronouns count except inside "其他" (other); "以上"
 #: (the above) not after a number or an age / price unit.
 _ZH_MARKERS: Final = re.compile(
-    rf"(?:^|(?<=[\s,.!?;:\u3002\uff01\uff1f\uff0c\uff1b\uff1a]))[这那](?![周月年天])"
-    rf"|这(?:个(?!月)|[{_MEASURE_WORDS[1:]}])"
+    rf"(?:^|(?<=[\s,.!?;:\u3002\uff01\uff1f\uff0c\uff1b\uff1a]))[这那](?![周月年天]|个月|个星期|个礼拜)"
+    rf"|这(?:个(?!月|星期|礼拜)|[{_MEASURE_WORDS[1:]}])"
     rf"|那(?:[{_MEASURE_WORDS}]|里|边|天|次|时)"
     r"|(?<!其)[他她它]"
     r"|其中|上面|上述|上文|前面|前者|后者|刚才|刚刚|上次|上一|另一|当时|提到|你说的|您说的"
@@ -101,9 +101,13 @@ _TOPIC_SWITCH: Final = re.compile(
     r"unrelated)\b",
     re.IGNORECASE,
 )
-#: An identifier: a run of letters / digits (with . _ / -) holding a digit, at
-#: least four long -- an order number, a product or document code.
+#: An identifier: a run of letters / digits (with . _ / -) at least four long that
+#: mixes letters and digits (a product or document code), or a long digit run
+#: (:data:`_ID_MIN_DIGITS`, an order or record number). A year, a dose
+#: ("500mg") or a reading ("128/82") is not one: it asks about the subject before.
 _IDENTIFIER: Final = re.compile(r"[A-Za-z0-9][A-Za-z0-9._/-]{3,}")
+_QUANTITY: Final = re.compile(r"[0-9]+(?:\.[0-9]+)?[A-Za-z]{1,3}")
+_ID_MIN_DIGITS: Final = 6
 
 #: Greetings, thanks, acknowledgements (normalised: lower-case, letters / digits
 #: / CJK only). Platform text, Chinese and English. The KB probe skips them too.
@@ -155,6 +159,13 @@ SMALL_TALK: Final = frozenset(
     }
 )
 
+#: Closers that only round off small talk ("ok, that's it then").
+_SMALL_TALK_TAILS: Final = frozenset(
+    {"那就这样吧", "那就这样", "就这样吧", "就这样", "吧", "啊", "呀"}
+)
+#: Longer than this (normalised) is never only small talk.
+_SMALL_TALK_MAX_CHARS: Final = 24
+
 Trigger = Literal["none", "short", "reference"]
 
 
@@ -192,6 +203,25 @@ def normalised(text: str) -> str:
     return "".join(ch for ch in unicodedata.normalize("NFKC", text).lower() if ch.isalnum())
 
 
+def is_small_talk_text(text: str) -> bool:
+    """Only greetings, thanks and acknowledgements -- one of :data:`SMALL_TALK`
+    or several run together ("ok thanks", "fine, that's it then")."""
+    flat = normalised(text)
+    if not flat or len(flat) > _SMALL_TALK_MAX_CHARS:
+        return False
+    pieces = SMALL_TALK | _SMALL_TALK_TAILS
+    # covered[i]: flat[:i] splits into pieces.
+    covered = [True] + [False] * len(flat)
+    for end in range(1, len(flat) + 1):
+        covered[end] = any(covered[start] and flat[start:end] in pieces for start in range(end))
+    return covered[-1]
+
+
+def strip_reference_markers(text: str) -> str:
+    """``text`` without its reference / ordinal markers: the words it names itself."""
+    return _EN_MARKERS.sub(" ", _ZH_MARKERS.sub(" ", text))
+
+
 def user_text(message: BaseMessage) -> str:
     """What the user wrote: the platform section and the spotlight fence off."""
     return unspotlight(strip_platform_context(message_text(message.content))).strip()
@@ -221,13 +251,21 @@ def _has_marker(text: str) -> bool:
     return bool(_ZH_MARKERS.search(text) or _EN_MARKERS.search(text))
 
 
+def _is_identifier(token: str) -> bool:
+    digits = sum(ch.isdigit() for ch in token)
+    letters = any(ch.isalpha() for ch in token)
+    if letters:
+        return digits > 0 and not _QUANTITY.fullmatch(token)
+    return digits >= _ID_MIN_DIGITS
+
+
 def _names_identifier(text: str) -> bool:
-    return any(any(ch.isdigit() for ch in m) for m in _IDENTIFIER.findall(text))
+    return any(_is_identifier(token) for token in _IDENTIFIER.findall(text))
 
 
 def trigger_of(text: str) -> Trigger:
     """Whether a message needs the conversation to be understood on its own."""
-    if normalised(text) in SMALL_TALK or _TOPIC_SWITCH.search(text):
+    if is_small_talk_text(text) or _TOPIC_SWITCH.search(text):
         return "none"
     marker = _has_marker(text)
     if not marker and _names_identifier(text):

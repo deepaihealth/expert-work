@@ -202,6 +202,31 @@ def test_an_identifier_alone_carries_nothing(message: str) -> None:
     assert query.text == message
 
 
+@pytest.mark.parametrize("message", ["2024年的呢", "500mg可以吗", "那 2.5kg 的呢", "128/82 正常吗"])
+def test_a_number_or_a_quantity_is_not_an_identifier(message: str) -> None:
+    """A year, a dose or a reading asks about the previous turn's subject."""
+    query = build_retrieval_query(_turns("这款药的说明书", "每日两次, 每次 250mg", message))
+    assert query is not None
+    assert query.augmented
+
+
+def test_this_month_at_the_start_is_not_a_reference() -> None:
+    message = "这个月体重掉了三公斤是不是血糖控制得不好呢请帮我分析一下"
+    assert len(message) > FOLLOW_UP_MAX_CHARS
+    query = build_retrieval_query(_turns("推荐一款早餐食品", "燕麦片甲", message))
+    assert query is not None
+    assert query.trigger == "none"
+
+
+@pytest.mark.parametrize(
+    "message", ["好的谢谢", "好的\uff0c那就这样吧", "嗯嗯好的", "OK thanks", "谢谢你, 再见"]
+)
+def test_small_talk_combinations_carry_nothing(message: str) -> None:
+    query = build_retrieval_query(_turns("推荐一款早餐食品", "燕麦片甲", message))
+    assert query is not None
+    assert not query.augmented
+
+
 def test_the_keyword_side_puts_the_current_message_first() -> None:
     query = build_retrieval_query(_turns("张三的血压", "张三血压正常", "他的血糖呢"))
     assert query is not None

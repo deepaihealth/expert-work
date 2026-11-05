@@ -47,7 +47,7 @@ import asyncio
 import logging
 import time
 from collections.abc import Awaitable, Callable, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Final, Literal
 from uuid import UUID
 
@@ -64,11 +64,12 @@ from expert_work.persistence.knowledge.text_search import (
 )
 from expert_work.protocol import KnowledgeBase, KnowledgeChunk
 from orchestrator.graph_builder.retrieval_query import (
-    SMALL_TALK,
     RetrievalQuery,
     build_retrieval_query,
+    is_small_talk_text,
     log_retrieval_query,
     normalised,
+    strip_reference_markers,
     user_text,
 )
 from orchestrator.tools.knowledge import KnowledgeRetriever
@@ -172,6 +173,35 @@ _FUNCTION_WORDS: Final = frozenset(
         "need",
     }
 )
+#: Generic asks of a follow-up ("tell me more", "anything else", "which of the
+#: two"): they name no subject, so they never anchor a keyword hit.
+_FOLLOW_UP_WORDS: Final = frozenset(
+    {
+        "详细",
+        "具体",
+        "说说",
+        "讲讲",
+        "介绍",
+        "展开",
+        "一下",
+        "还有",
+        "别的",
+        "其他",
+        "其它",
+        "两个",
+        "几个",
+        "tell",
+        "more",
+        "one",
+        "ones",
+        "detail",
+        "details",
+        "else",
+        "other",
+        "another",
+        "explain",
+    }
+)
 #: Messages shorter than this (letters / digits / CJK, after stripping) are not probed.
 PROBE_MIN_CHARS: Final = 2
 
@@ -202,10 +232,9 @@ class ProbeOutcome:
 
 
 def is_small_talk(text: str) -> bool:
-    """A greeting, thanks or acknowledgement (:data:`SMALL_TALK`) — or too short to
-    be about anything."""
-    flat = normalised(text)
-    return len(flat) < PROBE_MIN_CHARS or flat in SMALL_TALK
+    """Greetings, thanks or acknowledgements (``retrieval_query.SMALL_TALK``, alone
+    or run together) — or too short to be about anything."""
+    return len(normalised(text)) < PROBE_MIN_CHARS or is_small_talk_text(text)
 
 
 def _fresh_turn(messages: Sequence[BaseMessage]) -> list[int] | None:
@@ -313,10 +342,16 @@ class KnowledgeProbe:
             # Segmenting loads jieba's dictionary on first use (about a second,
             # blocking): done in a thread, outside the time budget.
             terms = await asyncio.to_thread(build_kb_keyword_query, keyword_query)
-            # With context carried along, a keyword hit must also share a word of
-            # the message itself: the context alone is the previous topic.
+            # With context carried along, a keyword hit must also share a word the
+            # message names itself: the context alone is the previous topic. A
+            # message of references and generic asks only ("the second one?",
+            # "tell me more") names nothing — then the context decides.
             anchor = (
-                await asyncio.to_thread(build_kb_keyword_query, built.current)
+                _anchor(
+                    await asyncio.to_thread(
+                        build_kb_keyword_query, strip_reference_markers(built.current)
+                    )
+                )
                 if built is not None and built.augmented
                 else None
             )
@@ -431,6 +466,23 @@ def _holds_run(tokens: Sequence[str], run: Sequence[str]) -> bool:
     return width > 0 and any(
         list(tokens[i : i + width]) == list(run) for i in range(len(tokens) - width + 1)
     )
+
+
+def _anchor(own: KbKeywordQuery | None) -> KbKeywordQuery | None:
+    """The message's own words to anchor a keyword hit on — ``None`` when it names
+    nothing beyond references, function words and generic asks."""
+    if own is None:
+        return None
+    terms = tuple(
+        term
+        for term in own.terms
+        if len(term) >= MIN_TERM_CHARS
+        and term not in _FUNCTION_WORDS
+        and term not in _FOLLOW_UP_WORDS
+    )
+    if not terms and not own.phrases:
+        return None
+    return replace(own, terms=terms)
 
 
 def _holds_phrase(tokens: Sequence[str], phrase: str) -> bool:

@@ -398,6 +398,32 @@ async def test_a_passage_on_the_follow_up_in_context_is_related() -> None:
     assert outcome.reason == "hit"
 
 
+@pytest.mark.parametrize(
+    "follow_up",
+    [
+        "那他还写过什么",
+        "第二个呢",
+        "详细说说",
+        "上面说的那个怎么用",
+        "这两个哪个好",
+        "还有别的吗",
+        "tell me more about the second one",
+    ],
+)
+async def test_a_pure_reference_follow_up_is_related_through_the_context(follow_up: str) -> None:
+    """A follow-up whose own words are only references, ordinals or generic
+    asks ("tell me more") names nothing to anchor on: the context decides."""
+    store, tenant = InMemoryKnowledgeStore(), uuid4()
+    await _base(store, tenant, "books", ["《大国食养》作者李明, 另著《四季食疗》《节气饮食》"])
+    messages: list[BaseMessage] = [
+        HumanMessage(content="大国食养谁写的"),
+        AIMessage(content="《大国食养》的作者是李明"),
+        HumanMessage(content=follow_up),
+    ]
+    outcome = await _probe(store, ("books",)).run(tenant_id=tenant, messages=messages)
+    assert outcome.reason == "hit"
+
+
 def test_the_keyword_rule_constants() -> None:
     """Pinned so a change is a reviewed decision."""
     assert (MIN_SHARED_TERMS, MIN_TERM_CHARS) == (2, 2)
