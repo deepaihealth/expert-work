@@ -147,7 +147,8 @@ async def test_purge_name_drops_versions_and_revisions_so_the_name_can_be_recrea
     await store.update_status(
         tenant_id=t2, name=_X, version="1.0.0", status=AgentSpecStatus.DELETED
     )
-    assert await store.count_revisions_for_name(tenant_id=t1, name=_X) == 3
+    got_1 = await store.count_revisions_for_name(tenant_id=t1, name=_X)
+    assert got_1 == 3
 
     await store.update_status(
         tenant_id=t1, name=_X, version="1.0.0", status=AgentSpecStatus.DELETED
@@ -155,14 +156,18 @@ async def test_purge_name_drops_versions_and_revisions_so_the_name_can_be_recrea
     with pytest.raises(AgentSpecPurgeBlockedError) as blocked:
         await store.purge_name(tenant_id=t1, name=_X)
     assert blocked.value.active_versions == ["2.0.0"]
-    assert await store.get(tenant_id=t1, name=_X, version="1.0.0", include_deleted=True) is not None
+    got_2 = await store.get(tenant_id=t1, name=_X, version="1.0.0", include_deleted=True)
+    assert got_2 is not None
 
     await store.update_status(
         tenant_id=t1, name=_X, version="2.0.0", status=AgentSpecStatus.DELETED
     )
-    assert await store.purge_name(tenant_id=t1, name=_X) == (2, 3)
-    assert await store.purge_name(tenant_id=t1, name=_X) == (0, 0)  # re-run
-    assert await store.count_revisions_for_name(tenant_id=t1, name=_X) == 0
+    got_3 = await store.purge_name(tenant_id=t1, name=_X)
+    assert got_3 == (2, 3)
+    got_4 = await store.purge_name(tenant_id=t1, name=_X)
+    assert got_4 == (0, 0)  # re-run
+    got_5 = await store.count_revisions_for_name(tenant_id=t1, name=_X)
+    assert got_5 == 0
 
     # The point of B-278: the same name and version can be created again.
     again = await store.create(tenant_id=t1, spec=_spec(), spec_sha256="c" * 64, created_by="u")
@@ -170,9 +175,12 @@ async def test_purge_name_drops_versions_and_revisions_so_the_name_can_be_recrea
     with pytest.raises(DuplicateAgentSpecError):
         await store.create(tenant_id=t1, spec=_spec(), spec_sha256="c" * 64, created_by="u")
     # Another agent and the same name in another tenant are untouched.
-    assert await store.get(tenant_id=t1, name=_Y, version="1.0.0") is not None
-    assert await store.get(tenant_id=t2, name=_X, version="1.0.0", include_deleted=True) is not None
-    assert await store.count_revisions_for_name(tenant_id=t2, name=_X) == 1
+    got_6 = await store.get(tenant_id=t1, name=_Y, version="1.0.0")
+    assert got_6 is not None
+    got_7 = await store.get(tenant_id=t2, name=_X, version="1.0.0", include_deleted=True)
+    assert got_7 is not None
+    got_8 = await store.count_revisions_for_name(tenant_id=t2, name=_X)
+    assert got_8 == 1
 
 
 @pytest.mark.asyncio
@@ -180,11 +188,13 @@ async def test_restore_only_flips_a_deleted_row(sf: SF) -> None:
     store = SqlAgentSpecStore(sf)
     t1 = uuid4()
     await store.create(tenant_id=t1, spec=_spec(), spec_sha256="a" * 64, created_by="u")
-    assert await store.restore(tenant_id=t1, name=_X, version="1.0.0") is None  # not deleted
+    got_9 = await store.restore(tenant_id=t1, name=_X, version="1.0.0")
+    assert got_9 is None  # not deleted
     await store.update_status(
         tenant_id=t1, name=_X, version="1.0.0", status=AgentSpecStatus.DELETED
     )
-    assert await store.restore(tenant_id=uuid4(), name=_X, version="1.0.0") is None  # cross-tenant
+    got_10 = await store.restore(tenant_id=uuid4(), name=_X, version="1.0.0")
+    assert got_10 is None  # cross-tenant
     restored = await store.restore(tenant_id=t1, name=_X, version="1.0.0")
     assert restored is not None and restored.status is AgentSpecStatus.ACTIVE
 
@@ -200,11 +210,16 @@ async def test_agent_disable_delete_is_scoped(sf: SF) -> None:
         await store.set_disabled(
             tenant_id=tenant, agent_name=name, disabled=True, reason="r", disabled_by="u"
         )
-    assert await store.delete(tenant_id=t1, agent_name=_X) is True
-    assert await store.delete(tenant_id=t1, agent_name=_X) is False
-    assert await store.get(tenant_id=t1, agent_name=_X) is None
-    assert await store.get(tenant_id=t1, agent_name=_Y) is not None
-    assert await store.get(tenant_id=t2, agent_name=_X) is not None
+    got_11 = await store.delete(tenant_id=t1, agent_name=_X)
+    assert got_11 is True
+    got_12 = await store.delete(tenant_id=t1, agent_name=_X)
+    assert got_12 is False
+    got_13 = await store.get(tenant_id=t1, agent_name=_X)
+    assert got_13 is None
+    got_14 = await store.get(tenant_id=t1, agent_name=_Y)
+    assert got_14 is not None
+    got_15 = await store.get(tenant_id=t2, agent_name=_X)
+    assert got_15 is not None
 
 
 def _vec() -> tuple[float, ...]:
@@ -236,12 +251,16 @@ async def test_memory_for_agent_keeps_shared_and_other_tenant(sf: SF) -> None:
             _item(t2, _X, "x elsewhere"),
         ]
     )
-    assert await store.count_for_agent(tenant_id=t1, agent_name=_X) == 2
-    assert await store.delete_for_agent(tenant_id=t1, agent_name=_X) == 2
-    assert await store.count_for_agent(tenant_id=t1, agent_name=_X) == 0
+    got_16 = await store.count_for_agent(tenant_id=t1, agent_name=_X)
+    assert got_16 == 2
+    got_17 = await store.delete_for_agent(tenant_id=t1, agent_name=_X)
+    assert got_17 == 2
+    got_18 = await store.count_for_agent(tenant_id=t1, agent_name=_X)
+    assert got_18 == 0
     left = await store.list_for_user(tenant_id=t1, user_id=user)
     assert sorted(m.content for m in left) == ["shared fact", "y"]
-    assert await store.count_for_agent(tenant_id=t2, agent_name=_X) == 1
+    got_19 = await store.count_for_agent(tenant_id=t2, agent_name=_X)
+    assert got_19 == 1
 
 
 @pytest.mark.asyncio
@@ -337,18 +356,28 @@ async def test_writeback_jobs_quality_curation_instances_secret_for_agent(sf: SF
         (allowlist.count_for_agent, allowlist.delete_for_agent, 2),
     )
     for count, delete, expected in pairs:
-        assert await count(tenant_id=t1, agent_name=_X) == expected
-        assert await delete(tenant_id=t1, agent_name=_X) == expected
-        assert await count(tenant_id=t1, agent_name=_X) == 0
-        assert await count(tenant_id=t1, agent_name=_Y) == 1
-        assert await count(tenant_id=t2, agent_name=_X) == 1
-    assert await instances.count_for_agent(tenant_id=t1, agent_code=_X) == 2
-    assert await instances.delete_for_agent(tenant_id=t1, agent_code=_X) == 2
-    assert await instances.count_for_agent(tenant_id=t1, agent_code=_Y) == 1
-    assert await instances.count_for_agent(tenant_id=t2, agent_code=_X) == 1
+        got_20 = await count(tenant_id=t1, agent_name=_X)
+        assert got_20 == expected
+        got_21 = await delete(tenant_id=t1, agent_name=_X)
+        assert got_21 == expected
+        got_22 = await count(tenant_id=t1, agent_name=_X)
+        assert got_22 == 0
+        got_23 = await count(tenant_id=t1, agent_name=_Y)
+        assert got_23 == 1
+        got_24 = await count(tenant_id=t2, agent_name=_X)
+        assert got_24 == 1
+    got_25 = await instances.count_for_agent(tenant_id=t1, agent_code=_X)
+    assert got_25 == 2
+    got_26 = await instances.delete_for_agent(tenant_id=t1, agent_code=_X)
+    assert got_26 == 2
+    got_27 = await instances.count_for_agent(tenant_id=t1, agent_code=_Y)
+    assert got_27 == 1
+    got_28 = await instances.count_for_agent(tenant_id=t2, agent_code=_X)
+    assert got_28 == 1
     # Candidates went first, so the agent's datasets (RESTRICT FK) can go now.
     for d in await datasets.list_by_agent(tenant_id=t1, agent_name=_X):
-        assert await datasets.delete(dataset_id=d.id, tenant_id=t1) is True
+        got_29 = await datasets.delete(dataset_id=d.id, tenant_id=t1)
+        assert got_29 is True
 
 
 @pytest.mark.asyncio
@@ -357,9 +386,12 @@ async def test_tenant_default_agent_cleared_only_when_it_is_the_agent(sf: SF) ->
     t1 = uuid4()
     await store.create(tenant_id=t1, display_name="t", actor_id="u")
     await store.upsert(tenant_id=t1, patch=TenantConfigPatch(default_agent_name=_X), actor_id="u")
-    assert await store.clear_default_agent_name(tenant_id=t1, agent_name=_Y) is False
-    assert await store.clear_default_agent_name(tenant_id=uuid4(), agent_name=_X) is False
-    assert await store.clear_default_agent_name(tenant_id=t1, agent_name=_X) is True
+    got_30 = await store.clear_default_agent_name(tenant_id=t1, agent_name=_Y)
+    assert got_30 is False
+    got_31 = await store.clear_default_agent_name(tenant_id=uuid4(), agent_name=_X)
+    assert got_31 is False
+    got_32 = await store.clear_default_agent_name(tenant_id=t1, agent_name=_X)
+    assert got_32 is True
     record = await store.get(tenant_id=t1)
     assert record is not None and record.default_agent_name is None
 
@@ -397,12 +429,18 @@ async def test_artifacts_for_agent_key_every_user_only_this_key(sf: SF) -> None:
     assert len(versions) == 3
     assert {v.user_id for v in versions} == {u1, u2}
     assert all(v.snapshot_key for v in versions)
-    assert await store.count_for_agent(tenant_id=t1, agent_key=key) == 2
-    assert await store.delete_all_for_agent(tenant_id=t1, agent_key=key) == 2
-    assert await store.list_versions_for_agent(tenant_id=t1, agent_key=key) == []
-    assert await store.count_for_agent(tenant_id=t1, agent_key=other) == 1
-    assert len(await store.list_versions_for_agent(tenant_id=t1, agent_key=other)) == 1
-    assert await store.count_for_agent(tenant_id=t2, agent_key=key) == 1
+    got_33 = await store.count_for_agent(tenant_id=t1, agent_key=key)
+    assert got_33 == 2
+    got_34 = await store.delete_all_for_agent(tenant_id=t1, agent_key=key)
+    assert got_34 == 2
+    got_35 = await store.list_versions_for_agent(tenant_id=t1, agent_key=key)
+    assert got_35 == []
+    got_36 = await store.count_for_agent(tenant_id=t1, agent_key=other)
+    assert got_36 == 1
+    got_37 = await store.list_versions_for_agent(tenant_id=t1, agent_key=other)
+    assert len(got_37) == 1
+    got_38 = await store.count_for_agent(tenant_id=t2, agent_key=key)
+    assert got_38 == 1
     with pytest.raises(ValueError, match="non-empty"):
         await store.count_for_agent(tenant_id=t1, agent_key="")
 
@@ -483,30 +521,49 @@ async def test_thread_scoped_counts_match_deletes(sf: SF) -> None:
             )
         )
 
-    assert len(await images.list_for_threads(tenant_id=t1, thread_ids=mine)) == 2
-    assert await images.delete_for_threads(tenant_id=t1, thread_ids=mine) == 2
-    assert len(await images.list_for_threads(tenant_id=t1, thread_ids=[other])) == 1
-    assert len(await images.list_for_threads(tenant_id=t2, thread_ids=mine)) == 1
+    got_39 = await images.list_for_threads(tenant_id=t1, thread_ids=mine)
+    assert len(got_39) == 2
+    got_40 = await images.delete_for_threads(tenant_id=t1, thread_ids=mine)
+    assert got_40 == 2
+    got_41 = await images.list_for_threads(tenant_id=t1, thread_ids=[other])
+    assert len(got_41) == 1
+    got_42 = await images.list_for_threads(tenant_id=t2, thread_ids=mine)
+    assert len(got_42) == 1
 
     for store in (dlq, uploads):
-        assert await store.count_for_threads(tenant_id=t1, thread_ids=mine) == 2
-        assert await store.delete_for_threads(tenant_id=t1, thread_ids=mine) == 2
-        assert await store.count_for_threads(tenant_id=t1, thread_ids=mine) == 0
-        assert await store.count_for_threads(tenant_id=t1, thread_ids=[other]) == 1
-        assert await store.count_for_threads(tenant_id=t2, thread_ids=mine) == 1
+        got_43 = await store.count_for_threads(tenant_id=t1, thread_ids=mine)
+        assert got_43 == 2
+        got_44 = await store.delete_for_threads(tenant_id=t1, thread_ids=mine)
+        assert got_44 == 2
+        got_45 = await store.count_for_threads(tenant_id=t1, thread_ids=mine)
+        assert got_45 == 0
+        got_46 = await store.count_for_threads(tenant_id=t1, thread_ids=[other])
+        assert got_46 == 1
+        got_47 = await store.count_for_threads(tenant_id=t2, thread_ids=mine)
+        assert got_47 == 1
 
-    assert await approvals.count_for_threads(tenant_id=t1, thread_ids=mine) == 2
-    assert await approvals.delete_for_threads(thread_ids=mine, tenant_id=t1) == 2
-    assert await feedback.count_for_threads(tenant_id=t1, thread_ids=mine) == 2
-    assert await feedback.delete_for_threads(tenant_id=t1, thread_ids=mine) == 2
-    assert await logs.count_for_threads(tenant_id=t1, thread_ids=mine) == 2
-    assert await logs.delete_for_threads(tenant_id=t1, thread_ids=mine) == 2
+    got_48 = await approvals.count_for_threads(tenant_id=t1, thread_ids=mine)
+    assert got_48 == 2
+    got_49 = await approvals.delete_for_threads(thread_ids=mine, tenant_id=t1)
+    assert got_49 == 2
+    got_50 = await feedback.count_for_threads(tenant_id=t1, thread_ids=mine)
+    assert got_50 == 2
+    got_51 = await feedback.delete_for_threads(tenant_id=t1, thread_ids=mine)
+    assert got_51 == 2
+    got_52 = await logs.count_for_threads(tenant_id=t1, thread_ids=mine)
+    assert got_52 == 2
+    got_53 = await logs.delete_for_threads(tenant_id=t1, thread_ids=mine)
+    assert got_53 == 2
     for counter in (approvals, feedback, logs):
-        assert await counter.count_for_threads(tenant_id=t1, thread_ids=[other]) == 1
-        assert await counter.count_for_threads(tenant_id=t2, thread_ids=mine) == 1
+        got_54 = await counter.count_for_threads(tenant_id=t1, thread_ids=[other])
+        assert got_54 == 1
+        got_55 = await counter.count_for_threads(tenant_id=t2, thread_ids=mine)
+        assert got_55 == 1
     # Empty id list: nothing counted, nothing deleted.
-    assert await uploads.count_for_threads(tenant_id=t1, thread_ids=[]) == 0
-    assert await uploads.delete_for_threads(tenant_id=t1, thread_ids=[]) == 0
+    got_56 = await uploads.count_for_threads(tenant_id=t1, thread_ids=[])
+    assert got_56 == 0
+    got_57 = await uploads.delete_for_threads(tenant_id=t1, thread_ids=[])
+    assert got_57 == 0
 
 
 @pytest.mark.asyncio
@@ -526,7 +583,11 @@ async def test_webhook_delivery_count_for_endpoints(sf: SF) -> None:
                 updated_at=_NOW,
             )
         )
-    assert await store.count_for_endpoints(endpoint_ids=[mine], tenant_id=t1) == 2
-    assert await store.delete_for_endpoints(endpoint_ids=[mine], tenant_id=t1) == 2
-    assert await store.count_for_endpoints(endpoint_ids=[mine, other], tenant_id=t1) == 1
-    assert await store.count_for_endpoints(endpoint_ids=[mine], tenant_id=t2) == 1
+    got_58 = await store.count_for_endpoints(endpoint_ids=[mine], tenant_id=t1)
+    assert got_58 == 2
+    got_59 = await store.delete_for_endpoints(endpoint_ids=[mine], tenant_id=t1)
+    assert got_59 == 2
+    got_60 = await store.count_for_endpoints(endpoint_ids=[mine, other], tenant_id=t1)
+    assert got_60 == 1
+    got_61 = await store.count_for_endpoints(endpoint_ids=[mine], tenant_id=t2)
+    assert got_61 == 1

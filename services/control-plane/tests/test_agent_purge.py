@@ -524,11 +524,16 @@ async def test_purge_leaves_the_sibling_agent_and_the_other_tenant_intact() -> N
 
     await purge_agent(world.deps(), tenant_id=world.t1, name=_X)
 
-    assert await _counts(world, world.t1, _Y) == sibling_before
-    assert await _counts(world, world.t2, _X) == other_tenant_before
-    assert await world.disable.get(tenant_id=world.t2, agent_name=_X) is not None
-    assert await world.disable.get(tenant_id=world.t1, agent_name=_Y) is not None
-    assert len(await world.specs.list_by_tenant(tenant_id=world.t2, name=_X)) == 2
+    got_1 = await _counts(world, world.t1, _Y)
+    assert got_1 == sibling_before
+    got_2 = await _counts(world, world.t2, _X)
+    assert got_2 == other_tenant_before
+    got_3 = await world.disable.get(tenant_id=world.t2, agent_name=_X)
+    assert got_3 is not None
+    got_4 = await world.disable.get(tenant_id=world.t1, agent_name=_Y)
+    assert got_4 is not None
+    got_5 = await world.specs.list_by_tenant(tenant_id=world.t2, name=_X)
+    assert len(got_5) == 2
 
 
 @pytest.mark.asyncio
@@ -538,10 +543,13 @@ async def test_purge_clears_the_kill_switch_default_agent_and_the_versions() -> 
     summary = await purge_agent(world.deps(), tenant_id=world.t1, name=_X)
 
     assert summary.agent_spec_deleted
-    assert await world.specs.list_by_tenant(tenant_id=world.t1, name=_X) == []
-    assert await world.specs.count_revisions_for_name(tenant_id=world.t1, name=_X) == 0
+    got_6 = await world.specs.list_by_tenant(tenant_id=world.t1, name=_X)
+    assert got_6 == []
+    got_7 = await world.specs.count_revisions_for_name(tenant_id=world.t1, name=_X)
+    assert got_7 == 0
     # A new agent created under the same name must not start out disabled.
-    assert await world.disable.get(tenant_id=world.t1, agent_name=_X) is None
+    got_8 = await world.disable.get(tenant_id=world.t1, agent_name=_X)
+    assert got_8 is None
     assert summary.default_agent_cleared is True
     config = await world.config.get(tenant_id=world.t1)
     assert config is not None and config.default_agent_name is None
@@ -606,11 +614,13 @@ async def test_a_failed_step_keeps_the_versions_so_a_rerun_finishes() -> None:
     assert summary.failures == {"agent_instance": "OSError"}  # type only, never the message
     assert "s3cret" not in repr(summary.as_dict())
     assert not summary.ok and "agent_spec" in summary.skipped
-    assert len(await world.specs.list_by_tenant(tenant_id=world.t1, name=_X)) == 2
+    got_9 = await world.specs.list_by_tenant(tenant_id=world.t1, name=_X)
+    assert len(got_9) == 2
 
     rerun = await purge_agent(world.deps(), tenant_id=world.t1, name=_X)
     assert rerun.ok
-    assert await world.specs.list_by_tenant(tenant_id=world.t1, name=_X) == []
+    got_10 = await world.specs.list_by_tenant(tenant_id=world.t1, name=_X)
+    assert got_10 == []
 
 
 @pytest.mark.asyncio
@@ -640,7 +650,8 @@ async def test_blockers_list_live_versions_and_live_referrers() -> None:
     assert blockers.referenced_by == ["parent@1.0.0"]
     assert blockers.blocked
     # The other tenant's same name is not blocked by this tenant's parent.
-    assert not (await find_blockers(world.specs, tenant_id=world.t2, name=_X)).blocked
+    got_11 = await find_blockers(world.specs, tenant_id=world.t2, name=_X)
+    assert not got_11.blocked
 
 
 @pytest.mark.asyncio
@@ -705,7 +716,9 @@ async def test_store_restore_only_flips_a_deleted_version() -> None:
     when a restore races a second restore or a purge."""
     world, _ = await _world()
 
-    assert await world.specs.restore(tenant_id=world.t1, name=_Y, version="1.0.0") is None
+    got_12 = await world.specs.restore(tenant_id=world.t1, name=_Y, version="1.0.0")
+    assert got_12 is None
     restored = await world.specs.restore(tenant_id=world.t1, name=_X, version="1.0.0")
     assert restored is not None and restored.status is AgentSpecStatus.ACTIVE
-    assert await world.specs.restore(tenant_id=world.t1, name=_X, version="1.0.0") is None
+    got_13 = await world.specs.restore(tenant_id=world.t1, name=_X, version="1.0.0")
+    assert got_13 is None

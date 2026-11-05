@@ -296,7 +296,8 @@ async def test_create_over_a_deleted_same_name_returns_409_deleted(b5_client: As
     """B-278 —— re-creating a deleted name gets its own 409 code, so the console
     can offer restore / purge instead of a dead-end "already exists"."""
     await b5_client.post("/v1/agents", json={"manifest_yaml": _VALID_YAML})
-    assert (await b5_client.delete("/v1/agents/code-reviewer/1.0.0")).status_code == 204
+    got_1 = await b5_client.delete("/v1/agents/code-reviewer/1.0.0")
+    assert got_1.status_code == 204
 
     response = await b5_client.post("/v1/agents", json={"manifest_yaml": _VALID_YAML})
 

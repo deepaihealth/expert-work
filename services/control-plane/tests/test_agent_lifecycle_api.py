@@ -113,9 +113,11 @@ async def ctx() -> AsyncIterator[_Ctx]:
 
 
 async def _create_and_delete(client: AsyncClient, manifest: str = _YAML) -> None:
-    assert (await client.post("/v1/agents", json={"manifest_yaml": manifest})).status_code == 201
+    got_1 = await client.post("/v1/agents", json={"manifest_yaml": manifest})
+    assert got_1.status_code == 201
     version = "2.0.0" if manifest is _YAML_V2 else "1.0.0"
-    assert (await client.delete(f"/v1/agents/{_NAME}/{version}")).status_code == 204
+    got_2 = await client.delete(f"/v1/agents/{_NAME}/{version}")
+    assert got_2.status_code == 204
 
 
 async def _purge(client: AsyncClient, confirm: str = _NAME) -> object:
@@ -142,13 +144,17 @@ async def test_purge_then_recreate_the_same_name_returns_201(ctx: _Ctx) -> None:
 
 @pytest.mark.asyncio
 async def test_the_kill_switch_does_not_survive_the_purge(ctx: _Ctx) -> None:
-    assert (await ctx.client.post("/v1/agents", json={"manifest_yaml": _YAML})).status_code == 201
+    got_3 = await ctx.client.post("/v1/agents", json={"manifest_yaml": _YAML})
+    assert got_3.status_code == 201
     disabled = await ctx.client.post(f"/v1/agents/{_NAME}/disable", json={"reason": "stop"})
     assert disabled.status_code == 200, disabled.text
-    assert (await ctx.client.delete(f"/v1/agents/{_NAME}/1.0.0")).status_code == 204
+    got_4 = await ctx.client.delete(f"/v1/agents/{_NAME}/1.0.0")
+    assert got_4.status_code == 204
 
-    assert (await _purge(ctx.client)).status_code == 200  # type: ignore[attr-defined]
-    assert (await ctx.client.post("/v1/agents", json={"manifest_yaml": _YAML})).status_code == 201
+    got_5 = await _purge(ctx.client)
+    assert got_5.status_code == 200  # type: ignore[attr-defined]
+    got_6 = await ctx.client.post("/v1/agents", json={"manifest_yaml": _YAML})
+    assert got_6.status_code == 201
 
     detail = await ctx.client.get(f"/v1/agents/{_NAME}/1.0.0")
     assert detail.json()["data"]["disabled"] is False
@@ -157,9 +163,8 @@ async def test_the_kill_switch_does_not_survive_the_purge(ctx: _Ctx) -> None:
 @pytest.mark.asyncio
 async def test_purge_is_refused_while_any_version_is_live(ctx: _Ctx) -> None:
     await _create_and_delete(ctx.client)
-    assert (
-        await ctx.client.post("/v1/agents", json={"manifest_yaml": _YAML_V2})
-    ).status_code == 201
+    v2 = await ctx.client.post("/v1/agents", json={"manifest_yaml": _YAML_V2})
+    assert v2.status_code == 201
 
     resp = await _purge(ctx.client)
 
@@ -201,7 +206,8 @@ async def test_confirm_name_must_match_exactly(ctx: _Ctx) -> None:
 
     assert resp.status_code == 422  # type: ignore[attr-defined]
     assert resp.json()["error"]["code"] == "CONFIRM_NAME_MISMATCH"  # type: ignore[attr-defined]
-    assert (await ctx.client.get(f"/v1/agents/{_NAME}/1.0.0")).status_code == 200
+    got_7 = await ctx.client.get(f"/v1/agents/{_NAME}/1.0.0")
+    assert got_7.status_code == 200
 
 
 @pytest.mark.asyncio
@@ -219,9 +225,11 @@ async def test_usage_and_audit_rows_are_kept(ctx: _Ctx) -> None:
     )
     await _create_and_delete(ctx.client)
 
-    assert (await _purge(ctx.client)).status_code == 200  # type: ignore[attr-defined]
+    got_8 = await _purge(ctx.client)
+    assert got_8.status_code == 200  # type: ignore[attr-defined]
 
-    assert len(await usage.list_for_tenant(tenant_id=ctx.tenant_id, agent_name=_NAME)) == 1
+    got_9 = await usage.list_for_tenant(tenant_id=ctx.tenant_id, agent_name=_NAME)
+    assert len(got_9) == 1
     page = await ctx.audit.query(AuditQuery(tenant_id=ctx.tenant_id, limit=1000))
     actions = {e.action for e in page.entries}
     assert {AuditAction.MANIFEST_WRITE, AuditAction.MANIFEST_DELETE} <= actions
@@ -231,7 +239,8 @@ async def test_usage_and_audit_rows_are_kept(ctx: _Ctx) -> None:
 
 @pytest.mark.asyncio
 async def test_restore_keeps_triggers_off_and_says_how_many(ctx: _Ctx) -> None:
-    assert (await ctx.client.post("/v1/agents", json={"manifest_yaml": _YAML})).status_code == 201
+    got_10 = await ctx.client.post("/v1/agents", json={"manifest_yaml": _YAML})
+    assert got_10.status_code == 201
     now = datetime.now(UTC)
     trigger = TriggerRecord(
         id=uuid4(),
@@ -248,7 +257,8 @@ async def test_restore_keeps_triggers_off_and_says_how_many(ctx: _Ctx) -> None:
     )
     triggers = ctx.app.state.trigger_store  # type: ignore[attr-defined]
     await triggers.create(trigger)
-    assert (await ctx.client.delete(f"/v1/agents/{_NAME}/1.0.0")).status_code == 204
+    got_11 = await ctx.client.delete(f"/v1/agents/{_NAME}/1.0.0")
+    assert got_11.status_code == 204
 
     resp = await ctx.client.post(f"/v1/agents/{_NAME}/1.0.0/restore")
 
@@ -291,11 +301,16 @@ async def test_only_admins_and_only_their_own_tenant(ctx: _Ctx) -> None:
     await _create_and_delete(ctx.client)
 
     for client, status in ((ctx.viewer, 403), (ctx.stranger, 404)):
-        assert (await client.post(f"/v1/agents/{_NAME}/1.0.0/restore")).status_code == status
-        assert (await client.get(f"/v1/agents/{_NAME}/1.0.0/purge-preview")).status_code == status
-        assert (await _purge(client)).status_code == status  # type: ignore[attr-defined]
-    assert (await ctx.client.get(f"/v1/agents/{_NAME}/1.0.0")).status_code == 200
-    assert (await ctx.client.post("/v1/agents/no-such/1.0.0/restore")).status_code == 404
+        got_12 = await client.post(f"/v1/agents/{_NAME}/1.0.0/restore")
+        assert got_12.status_code == status
+        got_13 = await client.get(f"/v1/agents/{_NAME}/1.0.0/purge-preview")
+        assert got_13.status_code == status
+        got_14 = await _purge(client)
+        assert got_14.status_code == status  # type: ignore[attr-defined]
+    got_15 = await ctx.client.get(f"/v1/agents/{_NAME}/1.0.0")
+    assert got_15.status_code == 200
+    got_16 = await ctx.client.post("/v1/agents/no-such/1.0.0/restore")
+    assert got_16.status_code == 404
 
 
 def test_the_purge_deps_are_wired_from_app_state() -> None:
