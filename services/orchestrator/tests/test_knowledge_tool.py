@@ -1833,18 +1833,7 @@ async def test_a_search_query_goes_through_embed_query_when_the_embedder_has_one
 
 
 def test_the_tool_description_states_the_answerability_rule() -> None:
-    description = _tool(InMemoryKnowledgeStore()).spec.description
-    assert KNOWLEDGE_ANSWERABILITY_RULE in description
-    # B-206 track D — the rule covers what knowledge_read shows too, not only
-    # search results, and names where an inferred answer comes from.
-    for phrase in (
-        "knowledge_read shows more of a document",
-        "If no text you have read states the specific fact asked",
-        "neighbouring passages",
-        "what the text states about other items",
-        "general knowledge",
-    ):
-        assert phrase in KNOWLEDGE_ANSWERABILITY_RULE, phrase
+    assert KNOWLEDGE_ANSWERABILITY_RULE in _tool(InMemoryKnowledgeStore()).spec.description
 
 
 def test_the_tool_description_states_how_to_search_and_conclude() -> None:

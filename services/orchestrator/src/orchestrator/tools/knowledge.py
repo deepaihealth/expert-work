@@ -166,16 +166,10 @@ MULTI_KNOWLEDGE_FIRST_RULE = (
 #: tool, so an agent with no knowledge base never sees it. The rule itself sits in
 #: the tool description; the text appended to results states facts rather than
 #: commands (B-163: command-voiced out-of-band text trips injection defenses).
-#: B-206 track D: the rule's subject is everything read, so a page read with
-#: ``knowledge_read`` falls under it as much as a search result does, and it
-#: names the places an inferred answer is taken from.
 KNOWLEDGE_ANSWERABILITY_RULE = (
-    "Search results are the closest passages and knowledge_read shows more of a document; "
-    "neither is a confirmed answer: rely only on what the text explicitly states about the "
-    "exact thing asked. If no text you have read states the specific fact asked, say the "
-    "knowledge base does not state it instead of inferring or guessing it — not from "
-    "neighbouring passages, from what the text states about other items, or from general "
-    "knowledge."
+    "Results are the closest passages, not confirmed answers: rely only on what they "
+    "explicitly state, and if none states the specific fact asked, say the knowledge "
+    "base does not state it instead of inferring or guessing it."
 )
 #: B-206 K-6 — how to search, in the tool description only (so, like the rule
 #: above, an agent with no knowledge base never sees it). Searching more widely is
