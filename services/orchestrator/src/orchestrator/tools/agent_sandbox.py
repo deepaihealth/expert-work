@@ -119,6 +119,7 @@ from typing import Any, Protocol
 from uuid import UUID, uuid4
 
 from expert_work.common.egress_token import mint_egress_token
+from expert_work.common.observability import expert_work_counter
 from expert_work.persistence import SANDBOX_SKILLS_ROOT
 from expert_work.persistence.sandbox_instance_store import (
     SANDBOX_LAYOUT_AGENT_CONV_PLATFORM,
@@ -162,6 +163,18 @@ class WorkspaceQuotaGate(Protocol):
 
 
 logger = logging.getLogger(__name__)
+
+#: X-14 P3 / B-87 —— 每一次 ``create()`` 的结局。``failed`` 与写进 ``sandbox_instance`` 的
+#: ``destroy_reason='create_failed'`` 是同一个时刻(:meth:`AgentSandboxClient._create_and_track`),
+#: 告警 ``ExpertWorkSandboxCreateFailureRate`` 用两者之比。两个取值在导入时就建好:健康的
+#: 副本也有一条平的 0,``increase()`` 才不会是空向量。
+SANDBOX_CREATES = expert_work_counter(
+    "expert_work_sandbox_create_total",
+    "Sandbox create() attempts by outcome (ok / failed).",
+    ("outcome",),
+)
+for _outcome in ("ok", "failed"):
+    SANDBOX_CREATES.labels(outcome=_outcome)
 
 
 def _utc_now() -> datetime:
@@ -1274,10 +1287,13 @@ class AgentSandboxClient:
         ``set_container_id`` 回填)也要走同一套清理,见 :meth:`acquire`。
         """
         try:
-            return await self._create(tenant_id=tenant_id, sandbox_id=sandbox_id, user_id=user_id)
+            sbx = await self._create(tenant_id=tenant_id, sandbox_id=sandbox_id, user_id=user_id)
         except Exception:
+            SANDBOX_CREATES.labels(outcome="failed").inc()
             await self._unwind_slot(sandbox_id=sandbox_id, reason="create_failed")
             raise
+        SANDBOX_CREATES.labels(outcome="ok").inc()
+        return sbx
 
     async def _unwind_slot(self, *, sandbox_id: UUID, reason: str) -> None:
         """清掉这次 acquire 自己插下的那一行(顺带让出它占着的 CAS 槽位)。

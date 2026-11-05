@@ -109,3 +109,68 @@ tests:
       - eval_time: 40m
         alertname: ExpertWorkLangfuseDeliveryFailing
         exp_alerts: []
+
+  # ExpertWorkSandboxCreateFailureRate (X-14 P3 / B-87). Half the creates on
+  # one replica fail for an hour; the other replica is idle (flat 0) → fires.
+  - interval: 1m
+    name: sandbox create failure alert fires on a sustained failure share
+    input_series:
+      - series: 'expert_work_sandbox_create_total{outcome="failed",instance="cp-0"}'
+        values: "0+1x60"
+      - series: 'expert_work_sandbox_create_total{outcome="ok",instance="cp-0"}'
+        values: "0+1x60"
+      - series: 'expert_work_sandbox_create_total{outcome="failed",instance="cp-1"}'
+        values: "0x60"
+      - series: 'expert_work_sandbox_create_total{outcome="ok",instance="cp-1"}'
+        values: "0x60"
+    alert_rule_test:
+      - eval_time: 60m
+        alertname: ExpertWorkSandboxCreateFailureRate
+        exp_alerts:
+          - exp_labels:
+              severity: P2
+            exp_annotations:
+              summary: "Sandbox create failures elevated"
+              description: "50% of sandbox creates failed in the last 1h — sandbox tools (exec_python / bash) fail for the users who hit them. Check the control-plane log for 'sandbox create failed' and the SandboxSet in namespace default."
+              runbook_url: "https://github.com/deepaihealth/expert-work/blob/main/docs/runbooks/sandbox.md"
+
+  # A quiet cluster: the only create in the hour failed (100%), but one
+  # failure is below the floor — no alert.
+  - interval: 1m
+    name: sandbox create failure alert ignores a lone failure
+    input_series:
+      - series: 'expert_work_sandbox_create_total{outcome="failed",instance="cp-0"}'
+        values: "0x30 1x30"
+      - series: 'expert_work_sandbox_create_total{outcome="ok",instance="cp-0"}'
+        values: "0x60"
+    alert_rule_test:
+      - eval_time: 60m
+        alertname: ExpertWorkSandboxCreateFailureRate
+        exp_alerts: []
+
+  # Plenty of failures in absolute terms, but under 10% of a busy hour.
+  - interval: 1m
+    name: sandbox create failure alert stays silent under the share threshold
+    input_series:
+      - series: 'expert_work_sandbox_create_total{outcome="failed",instance="cp-0"}'
+        values: "0+1x60"
+      - series: 'expert_work_sandbox_create_total{outcome="ok",instance="cp-0"}'
+        values: "0+20x60"
+    alert_rule_test:
+      - eval_time: 60m
+        alertname: ExpertWorkSandboxCreateFailureRate
+        exp_alerts: []
+
+  # Healthy replicas export both outcomes at a flat 0 — no division blow-up,
+  # no alert.
+  - interval: 1m
+    name: sandbox create failure alert stays silent on pre-initialised zero series
+    input_series:
+      - series: 'expert_work_sandbox_create_total{outcome="failed",instance="cp-0"}'
+        values: "0x60"
+      - series: 'expert_work_sandbox_create_total{outcome="ok",instance="cp-0"}'
+        values: "0x60"
+    alert_rule_test:
+      - eval_time: 60m
+        alertname: ExpertWorkSandboxCreateFailureRate
+        exp_alerts: []

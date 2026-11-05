@@ -16,7 +16,12 @@ as the release verdict:
    bytes contain the expected deterministic line.
 
 Any red step = the release is NOT good (``rollback.sh`` guidance is printed
-by the caller, ``release.sh`` stage 6).
+by the caller, ``release.sh`` stage 6). The verdict line names which kind of
+red it is (B-87 ②): ``no sandbox`` (a sandbox tool could not even get a
+sandbox — the pool / ACS side, see :func:`sandbox_acquire_failures`), ``run
+did not finish`` (no ``end`` frame in time), or ``wrong result`` (the run
+finished but the chain did not deliver). Before, all three read as one FAIL
+and telling them apart meant digging through logs.
 
 Inputs are environment variables only — the API key must never appear in
 argv (visible in ``ps`` / the k8s exec audit trail) or in any log line:
@@ -38,8 +43,10 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import re
 import sys
 import time
+from collections.abc import Iterator
 from typing import Any
 
 import httpx
@@ -107,6 +114,94 @@ def parse_end_frame(lines: list[str]) -> dict[str, Any] | None:
     return None
 
 
+#: Error text the sandbox **acquire** path raises
+#: (``orchestrator/tools/agent_sandbox.py`` + ``SandboxClaimTimeoutError`` in
+#: ``orchestrator/tools/sandbox.py``), as the tools node renders it into the tool
+#: message: ``[tool error] <ExceptionType>: <message>``. ``sandbox exec failed``
+#: is deliberately absent — that run HAD a sandbox; the exec inside it broke.
+#: ``test_canary.py`` pins every entry to the source so a reworded message
+#: cannot silently turn "no sandbox" back into a plain FAIL.
+SANDBOX_ACQUIRE_MARKERS: tuple[str, ...] = (
+    "SandboxClaimTimeoutError",
+    "sandbox create failed",
+    "sandbox post-create setup failed",
+    "sandbox warm-session claim failed",
+    "sandbox row creation failed",
+    "sandbox quota lookup failed",
+    "sandbox quota exceeded",
+    "sandbox attach failed",
+)
+
+#: Tool results reach the stream datamarked (docs-site sse-events.md「工具结果文本的
+#: 还原」): ``«UNTRUSTED nonce=…»`` fences, and every whitespace run becomes
+#: U+2581 + a space. Undo both before matching.
+_UNTRUSTED_FENCE = re.compile(r"«/?UNTRUSTED nonce=[^»]*»")
+
+#: Verdict categories (B-87 ②), printed on the ``RESULT: FAIL`` line.
+FAIL_NO_SANDBOX = "no sandbox"
+FAIL_NOT_FINISHED = "run did not finish"
+FAIL_WRONG_RESULT = "wrong result"
+
+
+def _unwrap_tool_text(text: str) -> str:
+    return _UNTRUSTED_FENCE.sub("", text).replace("\u2581", "")
+
+
+def _updates_payloads(lines: list[str]) -> Iterator[dict[str, Any]]:
+    """Each ``updates`` frame's ``data`` object, in stream order."""
+    for i, line in enumerate(lines):
+        if line.strip() != "event: updates":
+            continue
+        for follow in lines[i + 1 : i + 4]:
+            if follow.startswith("data: "):
+                try:
+                    payload = json.loads(follow[len("data: ") :])
+                except json.JSONDecodeError:
+                    break
+                if isinstance(payload, dict):
+                    yield payload
+                break
+
+
+def sandbox_acquire_failures(lines: list[str]) -> list[str]:
+    """Tool calls in the stream that failed because no sandbox could be had.
+
+    One ``"<tool>: <error text>"`` entry per failed tool message (``type ==
+    "tool"``, ``status == "error"``) whose text carries a
+    :data:`SANDBOX_ACQUIRE_MARKERS` entry.
+    """
+    found: list[str] = []
+    for payload in _updates_payloads(lines):
+        for step in payload.values():
+            messages = step.get("messages") if isinstance(step, dict) else None
+            if not isinstance(messages, list):
+                continue
+            for msg in messages:
+                if not isinstance(msg, dict) or msg.get("type") != "tool":
+                    continue
+                content = msg.get("content")
+                if msg.get("status") != "error" or not isinstance(content, str):
+                    continue
+                text = " ".join(_unwrap_tool_text(content).split())
+                if any(marker in text for marker in SANDBOX_ACQUIRE_MARKERS):
+                    found.append(f"{msg.get('name')}: {text[:200]}")
+    return found
+
+
+def failure_kind(*, finished: bool, sandbox_failures: list[str]) -> str:
+    """Which kind of red a failed canary is (B-87 ②).
+
+    No sandbox wins over the other two: a run that could not get a sandbox
+    either gives up (wrong result) or keeps retrying into the deadline (did
+    not finish), and in both cases the sandbox is what an operator must look at.
+    """
+    if sandbox_failures:
+        return FAIL_NO_SANDBOX
+    if not finished:
+        return FAIL_NOT_FINISHED
+    return FAIL_WRONG_RESULT
+
+
 def pick_artifact(
     artifacts: list[Any], preferred_name: str = CANARY_ARTIFACT_NAME
 ) -> dict[str, Any] | None:
@@ -157,6 +252,9 @@ async def _amain() -> int:
     download_status: int | None = None
     body: bytes = b""
     timed_out = False
+    # Outside the timeout block: a run that hit the deadline still left the
+    # frames it did send, and those are what tells "no sandbox" apart.
+    lines: list[str] = []
     try:
         async with asyncio.timeout(deadline_s):
             async with httpx.AsyncClient(
@@ -167,7 +265,6 @@ async def _amain() -> int:
                 # the overall wall clock is the ``asyncio.timeout`` above.
                 timeout=httpx.Timeout(30.0, read=None),
             ) as client:
-                lines: list[str] = []
                 async with client.stream(
                     "POST",
                     f"/v1/agents/{agent_code}/runs",
@@ -218,13 +315,19 @@ async def _amain() -> int:
     for label, ok in checks.items():
         print(f"  [{'PASS' if ok else 'FAIL'}] {label}")
     all_ok = all(checks.values())
-    print(
-        "\nRESULT:",
-        "PASS — real run + artifact chain verified."
-        if all_ok
-        else "FAIL — the release is NOT good.",
+    if all_ok:
+        print("\nRESULT: PASS — real run + artifact chain verified.")
+        return 0
+    sandbox_failures = sandbox_acquire_failures(lines)
+    kind = failure_kind(
+        finished=end_payload is not None and not timed_out, sandbox_failures=sandbox_failures
     )
-    return 0 if all_ok else 1
+    if sandbox_failures:
+        print("\ncould not get a sandbox:")
+        for failure in sandbox_failures:
+            print(f"  {failure}")
+    print(f"\nRESULT: FAIL ({kind}) — the release is NOT good.")
+    return 1
 
 
 def main() -> int:

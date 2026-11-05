@@ -68,6 +68,7 @@ from uuid import UUID, uuid4
 import httpcore
 import pytest
 from e2b import CommandExitException, TimeoutException
+from prometheus_client import REGISTRY
 
 from expert_work.common.egress_token import verify_egress_token
 from expert_work.persistence import SANDBOX_AGENTS_ROOT, SANDBOX_SKILLS_ROOT
@@ -517,6 +518,28 @@ async def test_ephemeral_create_failure_clears_the_row() -> None:
     # 只看 rows 为空不够——store 从一开始就是空的,这个断言碰巧也会通过
     # (不能证明清理代码真的跑了)。必须证明 mark_destroyed 真的被调用过。
     assert [reason for _, reason in store.mark_destroyed_calls] == ["create_failed"]
+
+
+def _sandbox_creates(outcome: str) -> float:
+    value = REGISTRY.get_sample_value("expert_work_sandbox_create_total", {"outcome": outcome})
+    assert value is not None, "both outcomes are pre-initialised at import"
+    return value
+
+
+@pytest.mark.asyncio
+async def test_create_outcomes_are_counted_for_the_failure_rate_alert() -> None:
+    """X-14 P3 / B-87 —— ``ExpertWorkSandboxCreateFailureRate`` divides failed by
+    all creates; a failed create must count as ``failed`` at the same moment
+    the row is stamped ``create_failed``, a good one as ``ok``."""
+    failed_before, ok_before = _sandbox_creates("failed"), _sandbox_creates("ok")
+    with pytest.raises(SandboxSupervisorError):
+        await make_client(FakeSdk(create_fails=True), FakeInstanceStore()).acquire(
+            tenant_id=uuid4(), thread_id="t1"
+        )
+    await make_client(FakeSdk(), FakeInstanceStore()).acquire(tenant_id=uuid4(), thread_id="t2")
+
+    assert _sandbox_creates("failed") - failed_before == 1
+    assert _sandbox_creates("ok") - ok_before == 1
 
 
 @pytest.mark.asyncio

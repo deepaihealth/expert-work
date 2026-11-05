@@ -29,6 +29,16 @@ spec:
           image: crpi-sgadimluo7wm655m.cn-hangzhou.personal.cr.aliyuncs.com/expert-work/control-plane:latest
           command: ["alembic", "-c", "/app/alembic/alembic.ini", "upgrade", "head"]
           env:
+            # B-228 — a DDL statement waits at most 5s for its lock. Without
+            # it, a migration stuck behind a long transaction queues every
+            # later query on that table behind itself (an outage, not a slow
+            # release). On timeout the whole alembic transaction rolls back,
+            # the Job retries (backoffLimit), and release.sh stops before any
+            # Deployment changes. libpq reads PGOPTIONS; the migration uses
+            # the sync driver. Used by hand for the 2026-11-04 test + prod
+            # releases before it moved here.
+            - name: PGOPTIONS
+              value: "-c lock_timeout=5s"
             - name: EXPERT_WORK_DB_URL
               valueFrom:
                 secretKeyRef:

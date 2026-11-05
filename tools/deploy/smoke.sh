@@ -466,6 +466,54 @@ else
     done <<< "${aux_check}"
 fi
 
+# B-87 ① —— 建沙箱失败在平台侧没有任何主动信号。2026-09-19 为 B-55 去数时才发现
+# ``destroy_reason='create_failed'`` 占 sandbox_instance 的 18.8%(99/528),当天 87%,
+# 而没有告警、没有指标、发布闸门也不看它。这里每次发布报一次最近 24h 的占比。
+# warn-only,理由同 B-57:这是趋势不是故障,且 24h 窗口里大半是上一版跑出来的,
+# 不该叫人回滚一个健康的发布;它要的是有人去看沙箱池。
+#
+# 纯函数,test_smoke_sandbox_create_failed.py 直接驱动:$1 失败行数  $2 总行数
+# (空 = 没查到)。占比 ≥ 5% 才 WARN —— 一天十几台的量下 1 台失败就够格。
+sandbox_create_failed_verdict() {
+    local failed="$1" total="$2" pct
+    if ! [[ "${failed}" =~ ^[0-9]+$ && "${total}" =~ ^[0-9]+$ ]]; then
+        echo "WARN sandbox create failures: 在 ${POD:-control-plane pod} 里没查出结果(表结构 / Settings 变了?)"
+        return 0
+    fi
+    if ((total == 0)); then
+        echo "OK   sandbox create failures (24h): 没有建过沙箱"
+        return 0
+    fi
+    pct="$(awk -v f="${failed}" -v t="${total}" 'BEGIN { printf "%.1f", 100 * f / t }')"
+    if ((failed > 0 && failed * 100 >= total * 5)); then
+        echo "WARN sandbox create failures (24h): ${failed}/${total} (${pct}%) 的沙箱没建起来(destroy_reason=create_failed)。"
+        echo "     按失败时间看 control-plane 日志里的 'sandbox create failed',再看"
+        echo "     kubectl -n default get sandboxset expert-work-sandbox 与 ACS 事件。"
+    else
+        echo "OK   sandbox create failures (24h): ${failed}/${total} (${pct}%)"
+    fi
+}
+
+echo "== sandbox create failures (B-87, warn-only) =="
+create_counts="$(kubectl -n expert-work exec "${POD}" -- python -c '
+import asyncio
+from sqlalchemy import text
+from sqlalchemy.ext.asyncio import create_async_engine
+from control_plane.settings import Settings
+async def main():
+    e = create_async_engine(Settings().db_dsn)
+    async with e.connect() as c:
+        row = (await c.execute(text(
+            "SELECT count(*) FILTER (WHERE destroy_reason = :reason), count(*) "
+            "FROM sandbox_instance WHERE created_at > now() - make_interval(hours => 24)"
+        ), {"reason": "create_failed"})).one()
+    await e.dispose()
+    print(row[0], row[1])
+asyncio.run(main())
+' 2>/dev/null || true)"
+read -r create_failed create_total <<<"${create_counts}" || true
+sandbox_create_failed_verdict "${create_failed:-}" "${create_total:-}"
+
 # Same Ready+not-Terminating filter as the POD pick above — probing a
 # Terminating pod's IP is a phantom failure, not a finding.
 POD_ROWS="$(kubectl -n expert-work get pods -l app.kubernetes.io/name=control-plane \

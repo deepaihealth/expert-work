@@ -83,6 +83,30 @@ groups:
           description: "{{ $value }} Langfuse delivery failure(s) at stage {{ $labels.stage }} in the last 15m — traces for these LLM calls are missing from Langfuse."
           runbook_url: "https://github.com/deepaihealth/expert-work/blob/main/docs/runbooks/langfuse.md"
 
+      # P2 — sandboxes failing to get created (X-14 P3 / B-87). 2026-09-19:
+      # destroy_reason='create_failed' was 18.8% of sandbox_instance (87% that
+      # day) and nothing said a word; the only red was a CI contract suite
+      # everyone read as "test cluster flaky again". Fed by the control-plane's
+      # expert_work_sandbox_create_total (both outcomes pre-initialised to 0),
+      # summed over replicas. The "> 2" floor keeps a lone failure on a quiet
+      # cluster from firing: increase() extrapolates, so "> 2" ~ "3 or more".
+      - alert: ExpertWorkSandboxCreateFailureRate
+        expr: |
+          (
+            sum(increase(expert_work_sandbox_create_total{outcome="failed"}[1h]))
+            /
+            clamp_min(sum(increase(expert_work_sandbox_create_total[1h])), 1)
+          ) >= 0.1
+          and
+          sum(increase(expert_work_sandbox_create_total{outcome="failed"}[1h])) > 2
+        for: 0m
+        labels:
+          severity: P2
+        annotations:
+          summary: "Sandbox create failures elevated"
+          description: "{{ $value | humanizePercentage }} of sandbox creates failed in the last 1h — sandbox tools (exec_python / bash) fail for the users who hit them. Check the control-plane log for 'sandbox create failed' and the SandboxSet in namespace default."
+          runbook_url: "https://github.com/deepaihealth/expert-work/blob/main/docs/runbooks/sandbox.md"
+
   # Stream M — M0→M1 Gate-watch group.
   #
   # These alerts fire when 30-day Gate Exit Criteria thresholds
