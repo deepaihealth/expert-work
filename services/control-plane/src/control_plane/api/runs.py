@@ -121,7 +121,6 @@ from expert_work.persistence.workspace.upload_names import original_name_note
 from expert_work.protocol import (
     AgentSpec,
     AgentSpecRecord,
-    AgentSpecStatus,
     ApprovalStatus,
     AuditAction,
     AuditResult,
@@ -979,7 +978,7 @@ async def resolve_approval_decision(
             status_code=404,
             detail=f"agent {meta.agent_name}@{meta.agent_version} not found",
         )
-    elif spec_record.status is AgentSpecStatus.DELETED:
+    elif spec_record.status.gone:
         agent_gone = HTTPException(
             status_code=410,
             detail={
@@ -1887,7 +1886,7 @@ def build_runs_router() -> APIRouter:
                 status_code=404,
                 detail=f"agent {meta.agent_name}@{meta.agent_version} not found",
             )
-        if record.status is AgentSpecStatus.DELETED:
+        if record.status.gone:
             raise HTTPException(
                 status_code=410,
                 detail={

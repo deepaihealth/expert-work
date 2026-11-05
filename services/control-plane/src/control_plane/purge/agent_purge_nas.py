@@ -10,6 +10,10 @@ disk:
 * ``{root}/{tenant}/.agent-file-versions/<user>/<key>/`` — its ``/agent``
   file history (B-236), next to the user root.
 
+:func:`has_symlink` tells the purge to skip (and count) a path whose
+components include a symlink — a model can create one inside its own
+workspace, and the store's ``O_NOFOLLOW`` delete would refuse it forever.
+
 Only ``lstat`` is used here (nothing is followed or opened as a path to
 delete): the deletes themselves go through the stores' ``openat`` /
 ``O_NOFOLLOW`` chains. ``tenant_id`` is a UUID, ``agent_key`` has passed
@@ -79,3 +83,25 @@ async def archived_users(root: str, tenant_id: UUID, users: set[UUID]) -> set[UU
         return {u for u in users if os.path.lexists(deleted / str(u))}
 
     return await asyncio.to_thread(_check)
+
+
+def _symlink_on(user_root: Path, relpath: str) -> bool:
+    current = user_root
+    for part in (p for p in relpath.split("/") if p):
+        current = current / part
+        try:
+            if stat.S_ISLNK(os.lstat(current).st_mode):
+                return True
+        except FileNotFoundError:
+            return False
+        except OSError:
+            return False
+    return False
+
+
+async def has_symlink(root: str, tenant_id: UUID, user_id: UUID, relpath: str) -> bool:
+    """Whether any component of ``relpath`` under ``{root}/{tenant}/{user}`` is a
+    symlink. Only ``lstat`` — nothing is followed. ``relpath`` is built by the purge
+    from fixed names, UUIDs and a checked ``agent_key``."""
+    user_root = Path(root) / str(tenant_id) / str(user_id)
+    return await asyncio.to_thread(_symlink_on, user_root, relpath)

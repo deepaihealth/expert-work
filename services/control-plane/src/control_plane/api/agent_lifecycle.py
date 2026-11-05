@@ -3,14 +3,17 @@
 三个端点都只给控制台、都按删除权限(``manifest:delete``,租户管理员)判:
 
 * ``POST /v1/agents/{name}/{version}/restore`` —— 把这一个已删除的版本恢复成可用;对话、
-  记忆原样都在。删除时被一起停掉的定时任务**不会**自动打开,响应里给出还停着几个。
+  记忆原样都在。删除时被一起停掉的定时任务**不会**自动打开,响应里给出还停着几个。名字
+  正在 / 曾经彻底删除到一半(``purging``)→ 409 ``AGENT_PURGING``。
 * ``GET /v1/agents/{name}/{version}/purge-preview`` —— 彻底删除前,各类数据各有几条、
   什么在拦着(还有没删除的版本 / 被别的智能体当子智能体引用)。
 * ``POST /v1/agents/{name}/{version}/purge`` —— 彻底删除整个名字(全部版本 + 数据),
-  请求体 ``{"confirm_name": "<名字>"}`` 必须与名字完全一致。
+  请求体 ``{"confirm_name": "<名字>"}`` 必须与名字完全一致。只有版本行真的删掉了才回
+  200 成功;最后被拦 → 409 ``AGENT_PURGE_BLOCKED``;有数据没删掉 → 500
+  ``AGENT_PURGE_INCOMPLETE``(名字停在 ``purging``,再点一次接着删)。
 
-后两个路径里的 ``version`` 只用来定位这一行做权限判断,操作对象是整个名字。路由放在单独
-的模块里,``agents.py`` 只改了读已删除版本与 409 两处。
+后两个路径里的 ``version`` 只用来定位这一行,操作对象是整个名字,所以**每一版**都要有删除
+权限。路由放在单独的模块里,``agents.py`` 只改了读已删除版本与 409 两处。
 """
 
 from __future__ import annotations
@@ -23,6 +26,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict, Field
 
+from control_plane.api._agent_duplicate import AGENT_PURGING
 from control_plane.api._authz import console_only, ensure_resource_access, manifest_record_attrs
 from control_plane.api._external import reject_nul_path_params
 from control_plane.api.agents import _invalidate_agent_build_cache
@@ -36,7 +40,7 @@ from control_plane.purge.agent_purge import (
 )
 from control_plane.tenancy.tenant_config import ServiceBackedTenantConfigStore
 from expert_work.common.observability import current_trace_id_hex
-from expert_work.persistence.agent_spec import AgentSpecStore
+from expert_work.persistence.agent_spec import AgentSpecPurgeBlockedError, AgentSpecStore
 from expert_work.protocol import AgentSpecRecord, AgentSpecStatus, AuditAction, AuditResult
 from expert_work.runtime.audit.logger import AuditLogger
 from orchestrator.tools.nas_workspace_store import NasWorkspaceStore
@@ -45,9 +49,12 @@ logger = logging.getLogger("expert_work.control_plane.api.agent_lifecycle")
 
 AGENT_NOT_DELETED = "AGENT_NOT_DELETED"
 AGENT_PURGE_BLOCKED = "AGENT_PURGE_BLOCKED"
+#: 部分数据没删掉(失败只记异常类型):名字停在 ``purging``,再点一次彻底删除接着删。
+AGENT_PURGE_INCOMPLETE = "AGENT_PURGE_INCOMPLETE"
 CONFIRM_NAME_MISMATCH = "CONFIRM_NAME_MISMATCH"
 
 _CONSOLE_ONLY = [Depends(console_only())]
+_NAME_PAGE = 500
 
 
 class AgentPurgeRequest(BaseModel):
@@ -118,7 +125,7 @@ def _error(code: str, message: str, status_code: int, details: object = None) ->
 async def _load_for_delete(
     request: Request, repo: AgentSpecStore, *, name: str, version: str
 ) -> AgentSpecRecord:
-    """这一行(含已删除的)+ 删除权限。租户只取自登录态,没有跨租户参数。"""
+    """这一行(含已删除的)+ 它的删除权限。租户只取自登录态,没有跨租户参数。"""
     record = await repo.get(
         tenant_id=request.state.tenant_id, name=name, version=version, include_deleted=True
     )
@@ -128,6 +135,26 @@ async def _load_for_delete(
         request, resource="manifest", action="delete", attrs=manifest_record_attrs(record)
     )
     return record
+
+
+async def _load_name_for_delete(
+    request: Request, repo: AgentSpecStore, *, name: str, version: str
+) -> None:
+    """彻底删除动的是整个名字:路径上那一版要在,**每一版**都要有删除权限(带条件的授权
+    可能只允许其中几版)。"""
+    await _load_for_delete(request, repo, name=name, version=version)
+    offset = 0
+    while True:
+        page = await repo.list_by_tenant(
+            tenant_id=request.state.tenant_id, name=name, limit=_NAME_PAGE, offset=offset
+        )
+        for record in page:
+            await ensure_resource_access(
+                request, resource="manifest", action="delete", attrs=manifest_record_attrs(record)
+            )
+        if len(page) < _NAME_PAGE:
+            return
+        offset += _NAME_PAGE
 
 
 def build_agent_lifecycle_router() -> APIRouter:
@@ -151,7 +178,15 @@ def build_agent_lifecycle_router() -> APIRouter:
         if record.status is AgentSpecStatus.DELETED:
             restored = await repo.restore(tenant_id=tenant_id, name=name, version=version)
         if restored is None:
-            # 没删除的版本「恢复」是调用方搞错了状态,不是无害的空操作:明确 409。
+            # 条件更新没命中:要么正在 / 曾经彻底删除到一半(``purging``,只能再点彻底删除),
+            # 要么根本没删除(调用方搞错了状态,不是无害的空操作)。重读一次分清楚。
+            now = await repo.get(
+                tenant_id=tenant_id, name=name, version=version, include_deleted=True
+            )
+            if now is not None and now.status is AgentSpecStatus.PURGING:
+                return _error(
+                    AGENT_PURGING, "this agent is being purged and cannot be restored", 409
+                )
             return _error(AGENT_NOT_DELETED, "this agent version is not deleted", 409)
         await _invalidate_agent_build_cache(request, tenant_id)
         triggers = await request.app.state.trigger_store.list_by_tenant(
@@ -189,7 +224,7 @@ def build_agent_lifecycle_router() -> APIRouter:
         request: Request,
         repo: Annotated[AgentSpecStore, Depends(_get_repo)],
     ) -> JSONResponse:
-        await _load_for_delete(request, repo, name=name, version=version)
+        await _load_name_for_delete(request, repo, name=name, version=version)
         preview = await preview_agent_purge(
             build_agent_purge_deps(request), tenant_id=request.state.tenant_id, name=name
         )
@@ -207,15 +242,12 @@ def build_agent_lifecycle_router() -> APIRouter:
         tenant_id: UUID = request.state.tenant_id
         actor_id: str = request.state.actor_id
         trace_id = current_trace_id_hex()
-        await _load_for_delete(request, repo, name=name, version=version)
+        await _load_name_for_delete(request, repo, name=name, version=version)
         if payload.confirm_name != name:
             return _error(CONFIRM_NAME_MISMATCH, "confirm_name does not match the agent name", 422)
-        blockers = await find_blockers(repo, tenant_id=tenant_id, name=name)
-        if blockers.blocked:
-            details: dict[str, object] = {
-                "active_versions": blockers.active_versions,
-                "referenced_by": blockers.referenced_by,
-            }
+
+        async def _blocked(active: list[str], referrers: list[str]) -> JSONResponse:
+            details: dict[str, object] = {"active_versions": active, "referenced_by": referrers}
             await emit(
                 audit,
                 tenant_id=tenant_id,
@@ -235,7 +267,16 @@ def build_agent_lifecycle_router() -> APIRouter:
                 details,
             )
 
-        summary = await purge_agent(build_agent_purge_deps(request), tenant_id=tenant_id, name=name)
+        blockers = await find_blockers(repo, tenant_id=tenant_id, name=name)
+        if blockers.blocked:
+            return await _blocked(blockers.active_versions, blockers.referenced_by)
+        try:
+            summary = await purge_agent(
+                build_agent_purge_deps(request), tenant_id=tenant_id, name=name
+            )
+        except AgentSpecPurgeBlockedError as exc:
+            # 预检之后有人恢复 / 新建了一版:标记没打上,什么都没删。
+            return await _blocked(exc.active_versions, exc.referenced_by)
 
         # 构建缓存与停用开关缓存:本副本立刻失效,其它副本走失效总线。
         await _invalidate_agent_build_cache(request, tenant_id)
@@ -245,6 +286,9 @@ def build_agent_lifecycle_router() -> APIRouter:
         bus = getattr(request.app.state, "invalidation_bus", None)
         if bus is not None:
             await bus.publish(InvalidationEvent(kind="agent_disable", tenant_id=str(tenant_id)))
+            if summary.default_agent_cleared:
+                # 同 tenant_config 接口的写:其它副本的配置缓存也立刻失效。
+                await bus.publish(InvalidationEvent(kind="tenant_config", tenant_id=str(tenant_id)))
         await emit(
             audit,
             tenant_id=tenant_id,
@@ -257,6 +301,22 @@ def build_agent_lifecycle_router() -> APIRouter:
             trace_id=trace_id,
             details=summary.as_dict(),
         )
-        return JSONResponse({"success": True, "data": summary.as_dict(), "error": None})
+        if summary.agent_spec_deleted:
+            return JSONResponse({"success": True, "data": summary.as_dict(), "error": None})
+        if summary.blocked is not None:
+            # 数据删完了,最后删版本行时被拦下(有在用的智能体刚把它配成子智能体)。名字停在
+            # ``purging``,去掉引用后再点一次即可。
+            return _error(
+                AGENT_PURGE_BLOCKED,
+                "another agent started using it as a subagent; remove that and purge again",
+                409,
+                {**summary.blocked, "summary": summary.as_dict()},
+            )
+        return _error(
+            AGENT_PURGE_INCOMPLETE,
+            "some data could not be deleted; the agent stays in purging, purge again to finish",
+            500,
+            summary.as_dict(),
+        )
 
     return router

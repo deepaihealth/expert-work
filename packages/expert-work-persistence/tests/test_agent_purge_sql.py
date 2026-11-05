@@ -41,6 +41,7 @@ from expert_work.persistence import (
 from expert_work.persistence.agent_instance.sql import SqlAgentInstanceStore
 from expert_work.persistence.agent_spec import (
     AgentSpecPurgeBlockedError,
+    AgentSpecPurgingError,
     DuplicateAgentSpecError,
     SqlAgentSpecStore,
 )
@@ -52,7 +53,7 @@ from expert_work.persistence.knowledge import RetrievalLogEntry
 from expert_work.persistence.knowledge.retrieval_log import SqlKnowledgeRetrievalLogStore
 from expert_work.persistence.memory.dlq import SqlMemoryWritebackDLQ
 from expert_work.persistence.memory.writeback_job import SqlMemoryWritebackJobStore
-from expert_work.persistence.models import SecretAllowlistRow
+from expert_work.persistence.models import AgentSpecRevisionRow, SecretAllowlistRow
 from expert_work.persistence.secret_allowlist import SqlAgentSecretAllowlistStore
 from expert_work.protocol import (
     AgentSpec,
@@ -94,11 +95,20 @@ _BASE_SPEC: dict[str, Any] = {
 SF = async_sessionmaker[AsyncSession]
 
 
-def _spec(name: str = _X, version: str = "1.0.0", prompt: str = "you are a reviewer") -> AgentSpec:
+def _spec(
+    name: str = _X,
+    version: str = "1.0.0",
+    prompt: str = "you are a reviewer",
+    subagent_of: str | None = None,
+) -> AgentSpec:
     doc = deepcopy(_BASE_SPEC)
     doc["metadata"]["name"] = name
     doc["metadata"]["version"] = version
     doc["spec"]["system_prompt"]["template"] = prompt
+    if subagent_of is not None:
+        doc["spec"]["subagents"] = [
+            {"name": "helper", "agent_ref": subagent_of, "description": "delegate"}
+        ]
     return AgentSpec.model_validate(doc)
 
 
@@ -591,3 +601,101 @@ async def test_webhook_delivery_count_for_endpoints(sf: SF) -> None:
     assert got_60 == 1
     got_61 = await store.count_for_endpoints(endpoint_ids=[mine], tenant_id=t2)
     assert got_61 == 1
+
+
+# --------------------------------------------------------------------------- purging marker
+
+
+@pytest.mark.asyncio
+async def test_begin_purge_marks_every_version_and_freezes_the_name(sf: SF) -> None:
+    store = SqlAgentSpecStore(sf)
+    t1, t2 = uuid4(), uuid4()
+    for tenant in (t1, t2):
+        for version in ("1.0.0", "2.0.0"):
+            await store.create(
+                tenant_id=tenant, spec=_spec(version=version), spec_sha256="a" * 64, created_by="u"
+            )
+    await store.update_status(
+        tenant_id=t1, name=_X, version="1.0.0", status=AgentSpecStatus.DELETED
+    )
+
+    with pytest.raises(AgentSpecPurgeBlockedError) as blocked:
+        await store.begin_purge(tenant_id=t1, name=_X)
+    assert blocked.value.active_versions == ["2.0.0"]
+    untouched = await store.get(tenant_id=t1, name=_X, version="1.0.0", include_deleted=True)
+    assert untouched is not None and untouched.status is AgentSpecStatus.DELETED
+
+    await store.update_status(
+        tenant_id=t1, name=_X, version="2.0.0", status=AgentSpecStatus.DELETED
+    )
+    marked = await store.begin_purge(tenant_id=t1, name=_X)
+    assert marked == ["1.0.0", "2.0.0"]
+    rerun = await store.begin_purge(tenant_id=t1, name=_X)  # a re-run accepts purging
+    assert rerun == ["1.0.0", "2.0.0"]
+
+    # Frozen: no restore, no new version, hidden from live reads, shown as "deleted".
+    restored = await store.restore(tenant_id=t1, name=_X, version="1.0.0")
+    assert restored is None
+    with pytest.raises(AgentSpecPurgingError):
+        await store.create(
+            tenant_id=t1, spec=_spec(version="3.0.0"), spec_sha256="a" * 64, created_by="u"
+        )
+    live = await store.get(tenant_id=t1, name=_X, version="1.0.0")
+    assert live is None
+    deleted_view = await store.list_by_tenant(tenant_id=t1, status=AgentSpecStatus.DELETED)
+    assert {(r.version, r.status) for r in deleted_view} == {
+        ("1.0.0", AgentSpecStatus.PURGING),
+        ("2.0.0", AgentSpecStatus.PURGING),
+    }
+    # The other tenant's same name is untouched and still writable.
+    other = await store.list_by_tenant(tenant_id=t2, name=_X)
+    assert {r.status for r in other} == {AgentSpecStatus.ACTIVE}
+    await store.create(
+        tenant_id=t2, spec=_spec(version="3.0.0"), spec_sha256="a" * 64, created_by="u"
+    )
+
+
+@pytest.mark.asyncio
+async def test_purge_name_rechecks_referrers_and_only_drops_its_versions_revisions(
+    sf: SF,
+) -> None:
+    store = SqlAgentSpecStore(sf)
+    t1 = uuid4()
+    await store.create(tenant_id=t1, spec=_spec(), spec_sha256="a" * 64, created_by="u")
+    await store.update_status(
+        tenant_id=t1, name=_X, version="1.0.0", status=AgentSpecStatus.DELETED
+    )
+    await store.begin_purge(tenant_id=t1, name=_X)
+    await store.create(
+        tenant_id=t1,
+        spec=_spec(name="parent", subagent_of=f"{_X}@1.0.0"),
+        spec_sha256="a" * 64,
+        created_by="u",
+    )
+    # A stray revision row of a version that has no agent_spec row (not locked).
+    async with sf() as session:
+        await session.execute(
+            insert(AgentSpecRevisionRow).values(
+                tenant_id=t1,
+                agent_name=_X,
+                agent_version="9.9.9",
+                revision=1,
+                spec_json={},
+                spec_sha256="z" * 64,
+                actor_id="u",
+                created_at=_NOW,
+            )
+        )
+        await session.commit()
+
+    with pytest.raises(AgentSpecPurgeBlockedError) as blocked:
+        await store.purge_name(tenant_id=t1, name=_X)
+    assert blocked.value.referenced_by == ["parent@1.0.0"]
+
+    await store.update_status(
+        tenant_id=t1, name="parent", version="1.0.0", status=AgentSpecStatus.DELETED
+    )
+    removed = await store.purge_name(tenant_id=t1, name=_X)
+    assert removed == (1, 1)
+    stray = await store.count_revisions_for_name(tenant_id=t1, name=_X)
+    assert stray == 1  # only the locked versions' history went

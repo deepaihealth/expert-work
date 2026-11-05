@@ -5,16 +5,18 @@ from __future__ import annotations
 from datetime import UTC, datetime
 from uuid import UUID
 
-from sqlalchemy import delete, func, select, update
+from sqlalchemy import ColumnElement, delete, func, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from sqlalchemy.orm import aliased
 
 from expert_work.persistence.agent_spec.base import (
     AgentSpecPurgeBlockedError,
+    AgentSpecPurgingError,
     AgentSpecStore,
     AgentSpecUpdateResult,
     DuplicateAgentSpecError,
+    subagent_names,
 )
 from expert_work.persistence.models import AgentSpecRevisionRow, AgentSpecRow
 from expert_work.persistence.stored_spec import load_stored_spec
@@ -25,6 +27,16 @@ from expert_work.protocol import (
     AgentSpecRevisionRecord,
     AgentSpecStatus,
 )
+
+#: B-278 —— 「已删除」的两种状态:软删(``deleted``)与彻底删除进行中(``purging``)。
+_GONE = (AgentSpecStatus.DELETED.value, AgentSpecStatus.PURGING.value)
+
+
+def _status_clause(status: AgentSpecStatus) -> ColumnElement[bool]:
+    """筛「已删除」时把还没删完的(``purging``)也算上。"""
+    if status is AgentSpecStatus.DELETED:
+        return AgentSpecRow.status.in_(_GONE)
+    return AgentSpecRow.status == status.value
 
 
 def _row_to_record(row: AgentSpecRow) -> AgentSpecRecord:
@@ -106,6 +118,27 @@ class SqlAgentSpecStore(AgentSpecStore):
             updated_at=now,
         )
         async with self._sf() as session:
+            # B-278 —— 锁住这个名字已有的版本行再看有没有在彻底删除:``begin_purge`` 也先锁
+            # 这些行,两边谁先拿到锁另一边就等,等完看到的是对方提交后的状态。
+            statuses = (
+                (
+                    await session.execute(
+                        select(AgentSpecRow.status)
+                        .where(
+                            AgentSpecRow.tenant_id == tenant_id,
+                            AgentSpecRow.name == spec.metadata.name,
+                        )
+                        .with_for_update()
+                    )
+                )
+                .scalars()
+                .all()
+            )
+            if AgentSpecStatus.PURGING.value in statuses:
+                await session.rollback()
+                raise AgentSpecPurgingError(
+                    tenant_id=tenant_id, name=spec.metadata.name, version=spec.metadata.version
+                )
             session.add(row)
             # Stream HX-5 — revision 1 lands in the same transaction.
             session.add(
@@ -145,7 +178,7 @@ class SqlAgentSpecStore(AgentSpecStore):
             AgentSpecRow.version == version,
         )
         if not include_deleted:
-            stmt = stmt.where(AgentSpecRow.status != AgentSpecStatus.DELETED.value)
+            stmt = stmt.where(AgentSpecRow.status.notin_(_GONE))
         async with self._sf() as session:
             row = (await session.execute(stmt)).scalar_one_or_none()
         return _row_to_record(row) if row is not None else None
@@ -161,7 +194,7 @@ class SqlAgentSpecStore(AgentSpecStore):
     ) -> list[AgentSpecRecord]:
         stmt = select(AgentSpecRow).where(AgentSpecRow.tenant_id == tenant_id)
         if status is not None:
-            stmt = stmt.where(AgentSpecRow.status == status.value)
+            stmt = stmt.where(_status_clause(status))
         if name is not None:
             stmt = stmt.where(AgentSpecRow.name == name)
         stmt = stmt.order_by(AgentSpecRow.created_at.desc()).limit(limit).offset(offset)
@@ -212,7 +245,7 @@ class SqlAgentSpecStore(AgentSpecStore):
         # have ``bypass_rls_var=True`` or RLS filters everything out.
         stmt = select(AgentSpecRow)
         if status is not None:
-            stmt = stmt.where(AgentSpecRow.status == status.value)
+            stmt = stmt.where(_status_clause(status))
         if name is not None:
             stmt = stmt.where(AgentSpecRow.name == name)
         stmt = stmt.order_by(AgentSpecRow.created_at.desc()).limit(limit).offset(offset)
@@ -245,7 +278,7 @@ class SqlAgentSpecStore(AgentSpecStore):
                         AgentSpecRow.tenant_id == tenant_id,
                         AgentSpecRow.name == name,
                         AgentSpecRow.version == version,
-                        AgentSpecRow.status != AgentSpecStatus.DELETED.value,
+                        AgentSpecRow.status.notin_(_GONE),
                     )
                     .with_for_update()
                 )
@@ -304,7 +337,7 @@ class SqlAgentSpecStore(AgentSpecStore):
                     AgentSpecRow.tenant_id == tenant_id,
                     AgentSpecRow.name == name,
                     AgentSpecRow.version == version,
-                    AgentSpecRow.status != AgentSpecStatus.DELETED.value,
+                    AgentSpecRow.status.notin_(_GONE),
                 )
                 .with_for_update()
             )
@@ -511,36 +544,109 @@ class SqlAgentSpecStore(AgentSpecStore):
         async with self._sf() as session:
             return int((await session.execute(stmt)).scalar_one())
 
-    async def purge_name(self, *, tenant_id: UUID, name: str) -> tuple[int, int]:
-        async with self._sf() as session:
-            # 锁住这个名字的全部版本行,再判「是不是都已删除」:判完到删之间没人能把
-            # 某一版恢复回来(恢复是同一行上的 UPDATE,会等这把锁)。
-            rows = (
-                (
-                    await session.execute(
-                        select(AgentSpecRow.version, AgentSpecRow.status)
-                        .where(AgentSpecRow.tenant_id == tenant_id, AgentSpecRow.name == name)
-                        .with_for_update()
-                    )
+    @staticmethod
+    async def _lock_versions(
+        session: AsyncSession, tenant_id: UUID, name: str
+    ) -> list[tuple[str, str]]:
+        return list(
+            (
+                await session.execute(
+                    select(AgentSpecRow.version, AgentSpecRow.status)
+                    .where(AgentSpecRow.tenant_id == tenant_id, AgentSpecRow.name == name)
+                    .with_for_update()
                 )
-                .tuples()
-                .all()
             )
-            active = sorted(v for v, st in rows if st != AgentSpecStatus.DELETED.value)
+            .tuples()
+            .all()
+        )
+
+    @staticmethod
+    async def _referrers(session: AsyncSession, tenant_id: UUID, name: str) -> list[str]:
+        """Live agents of the tenant whose live spec or draft lists ``name`` as a subagent."""
+        rows = (
+            await session.execute(
+                select(
+                    AgentSpecRow.name,
+                    AgentSpecRow.version,
+                    AgentSpecRow.spec_json,
+                    AgentSpecRow.draft_spec_json,
+                ).where(
+                    AgentSpecRow.tenant_id == tenant_id,
+                    AgentSpecRow.name != name,
+                    AgentSpecRow.status.notin_(_GONE),
+                )
+            )
+        ).all()
+        return sorted(
+            f"{r.name}@{r.version}"
+            for r in rows
+            if name in subagent_names(r.spec_json) | subagent_names(r.draft_spec_json)
+        )
+
+    async def begin_purge(self, *, tenant_id: UUID, name: str) -> list[str]:
+        async with self._sf() as session:
+            rows = await self._lock_versions(session, tenant_id, name)
+            active = sorted(v for v, st in rows if st not in _GONE)
             if active:
                 await session.rollback()
                 raise AgentSpecPurgeBlockedError(name=name, active_versions=active)
+            await session.execute(
+                update(AgentSpecRow)
+                .where(
+                    AgentSpecRow.tenant_id == tenant_id,
+                    AgentSpecRow.name == name,
+                    AgentSpecRow.status.in_(_GONE),
+                )
+                .values(status=AgentSpecStatus.PURGING.value, updated_at=datetime.now(UTC))
+            )
+            # 读已提交:这条新语句看得到上面加锁之后别人提交的新版本(``create`` 在我们
+            # 拿锁之前就锁过行的情形),有就整个撤回。
+            late = (
+                (
+                    await session.execute(
+                        select(AgentSpecRow.version).where(
+                            AgentSpecRow.tenant_id == tenant_id,
+                            AgentSpecRow.name == name,
+                            AgentSpecRow.status != AgentSpecStatus.PURGING.value,
+                        )
+                    )
+                )
+                .scalars()
+                .all()
+            )
+            if late:
+                await session.rollback()
+                raise AgentSpecPurgeBlockedError(name=name, active_versions=sorted(late))
+            await session.commit()
+        return sorted(v for v, _ in rows)
+
+    async def purge_name(self, *, tenant_id: UUID, name: str) -> tuple[int, int]:
+        async with self._sf() as session:
+            rows = await self._lock_versions(session, tenant_id, name)
+            active = sorted(v for v, st in rows if st not in _GONE)
+            referrers = await self._referrers(session, tenant_id, name)
+            if active or referrers:
+                await session.rollback()
+                raise AgentSpecPurgeBlockedError(
+                    name=name, active_versions=active, referenced_by=referrers
+                )
+            versions = [v for v, _ in rows]
+            if not versions:
+                await session.rollback()
+                return 0, 0
             revisions = await session.execute(
                 delete(AgentSpecRevisionRow).where(
                     AgentSpecRevisionRow.tenant_id == tenant_id,
                     AgentSpecRevisionRow.agent_name == name,
+                    AgentSpecRevisionRow.agent_version.in_(versions),
                 )
             )
             specs = await session.execute(
                 delete(AgentSpecRow).where(
                     AgentSpecRow.tenant_id == tenant_id,
                     AgentSpecRow.name == name,
-                    AgentSpecRow.status == AgentSpecStatus.DELETED.value,
+                    AgentSpecRow.version.in_(versions),
+                    AgentSpecRow.status.in_(_GONE),
                 )
             )
             await session.commit()

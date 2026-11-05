@@ -21,21 +21,35 @@
 OSS 上的轨迹 / 事件归档走既有生命周期,不在这里删。
 
 和 ``purge_user`` 同一套规矩:逐步执行、每步失败只记**异常类型**(不记 ``str(exc)``)、可以
-重跑。多出来的一条:只要有一步失败(或对话数到顶),``agent_spec`` 行就**不删** —— 名字还
-在「已删除」列表里,管理员可以再点一次把剩下的清完;全部成功才删版本行,名字从此可以重建。
+重跑。另外三条:
+
+* 开始时把整个名字的所有版本翻成 ``purging``(:meth:`AgentSpecStore.begin_purge`,持久的
+  「正在彻底删除」标记):这期间不能恢复、不能新建同名版本,删到一半失败也停在这个状态,
+  不会出现「版本恢复了、数据却没了」。
+* 先删子、子删成功才删父(见 ``agent_purge_steps``),重跑永远找得到剩下的东西。
+* 只要有一步失败(或对话数到顶),``agent_spec`` 行就**不删**:名字留在「已删除」里(状态
+  ``purging``),管理员再点一次把剩下的清完;全部成功才在同一个事务里再查一遍「没有在用的
+  版本、没有在用的智能体引用它」,然后删版本行,名字从此可以重建。
 """
 
 from __future__ import annotations
 
 import logging
-from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from uuid import UUID
 
 from control_plane.purge.agent_purge_nas import archived_users, scan_agent_dirs
+from control_plane.purge.agent_purge_steps import (
+    purge_artifacts,
+    purge_conversations,
+    purge_eval_data,
+    purge_nas,
+    purge_triggers_and_webhooks,
+    run,
+    skip,
+)
 from control_plane.runtime import AgentRuntime
 from expert_work.persistence import (
-    WORKSPACE_AGENTS_DIR,
     ApprovalStore,
     ArtifactStore,
     TriggerRunStore,
@@ -45,7 +59,7 @@ from expert_work.persistence import (
 )
 from expert_work.persistence.agent_disable import AgentDisableStore
 from expert_work.persistence.agent_instance import AgentInstanceStore
-from expert_work.persistence.agent_spec import AgentSpecStore
+from expert_work.persistence.agent_spec import AgentSpecPurgeBlockedError, AgentSpecStore
 from expert_work.persistence.curation import CurationCandidateStore, EvalDatasetStore
 from expert_work.persistence.feedback_store import FeedbackStore
 from expert_work.persistence.image_upload import ImageUploadStore
@@ -57,16 +71,14 @@ from expert_work.persistence.secret_allowlist import AgentSecretAllowlistStore
 from expert_work.persistence.tenant_config import TenantConfigStore
 from expert_work.persistence.thread_meta import ThreadMetaStore
 from expert_work.persistence.user_upload import UserUploadStore
-from expert_work.protocol import AgentSpecStatus, parse_agent_ref
+from expert_work.protocol import parse_agent_ref
 from expert_work.protocol.agent_key import require_safe_key, sanitize_agent_key
 from expert_work.runtime.runs import RunStore
 from expert_work.runtime.runs.schemas import ThreadRunAggregate
 from expert_work.runtime.storage import ObjectStore
-from orchestrator.context.workspace_projection import thread_projection_prefix
 from orchestrator.tools import WorkspaceStore
 from orchestrator.tools.agent_file_versions import AgentFileVersionStore
 from orchestrator.tools.artifact_snapshots import ArtifactSnapshotStore
-from orchestrator.tools.overflow import OVERFLOW_DIR
 
 logger = logging.getLogger("expert_work.control_plane.purge.agent")
 
@@ -75,7 +87,6 @@ _THREAD_PAGE = 500
 _MAX_THREADS = 20_000
 _SPEC_PAGE = 500
 _INSTANCE_PAGE = 500
-_LOG_STEP = "knowledge_retrieval_log"
 
 #: 保留的表(对账 / 审计 / 租户资产),预览里原样列给管理员看。
 KEPT_TABLES: tuple[str, ...] = (
@@ -88,6 +99,10 @@ KEPT_TABLES: tuple[str, ...] = (
     "skill",
     "skill_run_usage",
     "skill_promote_request",
+    # 事件流表:控制面没有接它的 store(``EventLogStore.delete_by_thread`` 注明只给测试 /
+    # 开发用,生产账号没有 DELETE 权限),``purge_session`` / ``purge_user`` 也不删;到期由
+    # 事件归档 + 留存作业按时间清。
+    "event_log",
 )
 
 
@@ -144,7 +159,7 @@ class AgentPurgeBlockers:
 
 
 @dataclass
-class _Footprint:
+class Footprint:
     """删之前先把要删的东西点一遍(删的过程中会改变列表,不能边删边翻页)。"""
 
     thread_users: dict[UUID, UUID | None] = field(default_factory=dict)
@@ -180,6 +195,11 @@ class AgentPurgeSummary:
     image_blobs_removed: int = 0
     image_blobs_failed: int = 0
     image_blobs_skipped: int = 0
+    #: NAS 路径上有符号链接(模型在自己工作区里建的)而跳过的次数 —— 不算失败。
+    nas_symlinks_skipped: int = 0
+    #: 最后删版本行时又被拦下(有版本在用 / 有在用的智能体引用它):``{active_versions,
+    #: referenced_by}``;API 据此回 409。
+    blocked: dict[str, list[str]] | None = None
     #: 版本行真的删掉了 = 名字可以重建。
     agent_spec_deleted: bool = False
 
@@ -202,6 +222,8 @@ class AgentPurgeSummary:
             "image_blobs_removed": self.image_blobs_removed,
             "image_blobs_failed": self.image_blobs_failed,
             "image_blobs_skipped": self.image_blobs_skipped,
+            "nas_symlinks_skipped": self.nas_symlinks_skipped,
+            "blocked": dict(self.blocked) if self.blocked is not None else None,
             "agent_spec_deleted": self.agent_spec_deleted,
             "kept": list(KEPT_TABLES),
             "ok": self.ok,
@@ -228,10 +250,10 @@ async def find_blockers(specs: AgentSpecStore, *, tenant_id: UUID, name: str) ->
         for rec in page:
             if rec.name == name:
                 versions.append(rec.version)
-                if rec.status is not AgentSpecStatus.DELETED:
+                if not rec.status.gone:
                     active.append(rec.version)
                 continue
-            if rec.status is AgentSpecStatus.DELETED:
+            if rec.status.gone:
                 continue
             specs_to_check = [rec.spec] + ([rec.draft.spec] if rec.draft is not None else [])
             for spec in specs_to_check:
@@ -246,8 +268,8 @@ async def find_blockers(specs: AgentSpecStore, *, tenant_id: UUID, name: str) ->
     )
 
 
-async def _gather(deps: AgentPurgeDeps, *, tenant_id: UUID, name: str, key: str) -> _Footprint:
-    fp = _Footprint()
+async def _gather(deps: AgentPurgeDeps, *, tenant_id: UUID, name: str, key: str) -> Footprint:
+    fp = Footprint()
     offset = 0
     while len(fp.thread_users) < _MAX_THREADS:
         page = await deps.threads.list_by_tenant(
@@ -383,364 +405,92 @@ async def preview_agent_purge(
     }
 
 
-async def _step[T](summary: AgentPurgeSummary, name: str, coro: Awaitable[T], *, default: T) -> T:
-    """一步失败只记异常**类型**(理由见 ``user_purge._step``:消息里可能带 DSN / 路径)。"""
-    try:
-        return await coro
-    except Exception as exc:  # best-effort: never abort the purge
-        logger.warning("purge_agent.step_failed step=%s", name, exc_info=True)
-        summary.failures.setdefault(name, type(exc).__name__)
-        return default
-
-
-def _fail(summary: AgentPurgeSummary, name: str, exc: Exception) -> None:
-    logger.warning("purge_agent.step_failed step=%s error=%s", name, type(exc).__name__)
-    summary.failures.setdefault(name, type(exc).__name__)
-
-
-def _add(summary: AgentPurgeSummary, table: str, n: int) -> None:
-    summary.deleted[table] = summary.deleted.get(table, 0) + n
-
-
-async def _purge_one_thread(
-    deps: AgentPurgeDeps,
-    summary: AgentPurgeSummary,
-    *,
-    tenant_id: UUID,
-    thread_id: UUID,
-    user_id: UUID | None,
-) -> None:
-    """``purge_session`` 的同款步骤,外加老布局的工作区目录(新布局在 ``agents/<key>/`` 下,
-    随整棵子树删)。检索记录删不掉,这条对话就整条不动,等重跑。"""
-    try:
-        _add(
-            summary,
-            _LOG_STEP,
-            await deps.retrieval_logs.delete_for_threads(
-                tenant_id=tenant_id, thread_ids=[thread_id]
-            ),
-        )
-    except Exception as exc:
-        _fail(summary, _LOG_STEP, exc)
-        return
-    adelete = getattr(deps.runtime.durable_checkpointer, "adelete_thread", None)
-    if adelete is not None:
-        try:
-            await adelete(str(thread_id))
-        except Exception as exc:
-            _fail(summary, "checkpoint", exc)
-    run_ids: list[UUID] = []
-    try:
-        runs = await deps.runs.list_by_thread(thread_id=thread_id, tenant_id=tenant_id)
-        run_ids = [r.run_id for r in runs]
-        _add(
-            summary,
-            "agent_run",
-            await deps.runtime.run_manager.delete_by_thread(thread_id, tenant_id=tenant_id),
-        )
-    except Exception as exc:
-        _fail(summary, "agent_run", exc)
-    try:
-        if await deps.threads.delete(thread_id, tenant_id=tenant_id):
-            _add(summary, "thread_meta", 1)
-    except Exception as exc:
-        _fail(summary, "thread_meta", exc)
-    if user_id is not None and deps.workspace_store is not None:
-        legacy = [thread_projection_prefix(thread_id).rstrip("/")]
-        legacy += [f"{OVERFLOW_DIR}/{run_id}" for run_id in run_ids]
-        for path in legacy:
-            try:
-                await deps.workspace_store.delete_tree(
-                    tenant_id=tenant_id, user_id=user_id, path=path
-                )
-            except Exception as exc:
-                _fail(summary, "threads_dir", exc)
-    # 同 ``purge_session``:还在跑的 run 可能在两遍之间又记了一条检索。
-    try:
-        _add(
-            summary,
-            _LOG_STEP,
-            await deps.retrieval_logs.delete_for_threads(
-                tenant_id=tenant_id, thread_ids=[thread_id]
-            ),
-        )
-    except Exception as exc:
-        logger.warning("purge_agent.retrieval_logs_late_failed error=%s", type(exc).__name__)
-
-
-async def _purge_conversations(
-    deps: AgentPurgeDeps, summary: AgentPurgeSummary, fp: _Footprint, *, tenant_id: UUID
-) -> None:
-    threads = fp.thread_ids
-    # 挂在对话上的子表先删(对话删到一半失败时,不留「对话没了、子表还在」的半截)。
-    _add(
-        summary,
-        "feedback",
-        await _step(
-            summary,
-            "feedback",
-            deps.feedback.delete_for_threads(tenant_id=tenant_id, thread_ids=threads),
-            default=0,
-        ),
-    )
-    _add(
-        summary,
-        "agent_approval",
-        await _step(
-            summary,
-            "agent_approval",
-            deps.approvals.delete_for_threads(thread_ids=threads, tenant_id=tenant_id),
-            default=0,
-        ),
-    )
-    _add(
-        summary,
-        "memory_writeback_dlq",
-        await _step(
-            summary,
-            "memory_writeback_dlq",
-            deps.memory_dlq.delete_for_threads(tenant_id=tenant_id, thread_ids=threads),
-            default=0,
-        ),
-    )
-    _add(
-        summary,
-        "user_upload",
-        await _step(
-            summary,
-            "user_upload",
-            deps.user_uploads.delete_for_threads(tenant_id=tenant_id, thread_ids=threads),
-            default=0,
-        ),
-    )
-    await _step(
-        summary, "image_upload", _purge_images(deps, summary, tenant_id, threads), default=None
-    )
-    for thread_id, user_id in fp.thread_users.items():
-        await _purge_one_thread(
-            deps, summary, tenant_id=tenant_id, thread_id=thread_id, user_id=user_id
-        )
-
-
-async def _purge_images(
-    deps: AgentPurgeDeps, summary: AgentPurgeSummary, tenant_id: UUID, threads: list[UUID]
-) -> None:
-    """先删对象存储里的图、再删行(同 ``purge_user._purge_images``:
-    孤儿键有留存作业兜,卡住的行没人兜)。"""
-    rows = await deps.image_uploads.list_for_threads(tenant_id=tenant_id, thread_ids=threads)
-    if deps.object_store is None:
-        summary.image_blobs_skipped += len(rows)
-    else:
-        for row in rows:
-            try:
-                await deps.object_store.delete(row.object_key)
-                summary.image_blobs_removed += 1
-            except Exception:
-                summary.image_blobs_failed += 1
-                logger.warning("purge_agent.image_blob_failed", exc_info=True)
-    _add(
-        summary,
-        "image_upload",
-        await deps.image_uploads.delete_for_threads(tenant_id=tenant_id, thread_ids=threads),
-    )
-
-
-async def _purge_artifacts(
-    deps: AgentPurgeDeps, summary: AgentPurgeSummary, fp: _Footprint, *, tenant_id: UUID, key: str
-) -> None:
-    # B-235 —— 先删副本再删登记行(同 ``purge_user``)。
-    if deps.artifact_snapshots is not None:
-        removed = 0
-        for user_id, snapshot_key in fp.snapshots:
-            try:
-                if await deps.artifact_snapshots.delete(
-                    tenant_id=tenant_id, user_id=user_id, snapshot_key=snapshot_key
-                ):
-                    removed += 1
-            except Exception as exc:
-                _fail(summary, "artifact_snapshot", exc)
-        _add(summary, "artifact_snapshot", removed)
-    _add(
-        summary,
-        "artifact",
-        await _step(
-            summary,
-            "artifact",
-            deps.artifacts.delete_all_for_agent(tenant_id=tenant_id, agent_key=key),
-            default=0,
-        ),
-    )
-
-
-async def _purge_by_ids(
-    summary: AgentPurgeSummary,
-    table: str,
-    ids: list[UUID],
-    delete_one: Callable[[UUID], Awaitable[bool]],
-) -> None:
-    """逐行删(这几类每个智能体只有几条到几十条,复用 store 现成的按 id 删)。"""
-    removed = 0
-    for row_id in ids:
-        try:
-            if await delete_one(row_id):
-                removed += 1
-        except Exception as exc:
-            _fail(summary, table, exc)
-    _add(summary, table, removed)
-
-
-async def _purge_nas(
-    deps: AgentPurgeDeps, summary: AgentPurgeSummary, fp: _Footprint, *, tenant_id: UUID, key: str
-) -> None:
-    summary.nas_users = len(fp.nas_users)
-    if fp.archived_users:
-        summary.skipped.append("nas_archived_users")
-    for user_id in sorted(fp.nas_users):
-        if deps.workspace_store is not None:
-            try:
-                await deps.workspace_store.delete_tree(
-                    tenant_id=tenant_id, user_id=user_id, path=f"{WORKSPACE_AGENTS_DIR}/{key}"
-                )
-            except Exception as exc:
-                _fail(summary, "agent_workspace", exc)
-        if deps.agent_file_versions is not None:
-            try:
-                _add(
-                    summary,
-                    "agent_file_version",
-                    await deps.agent_file_versions.delete_for_agent(
-                        tenant_id=tenant_id, user_id=user_id, agent_key=key
-                    ),
-                )
-            except Exception as exc:
-                _fail(summary, "agent_file_version", exc)
-
-
 async def purge_agent(deps: AgentPurgeDeps, *, tenant_id: UUID, name: str) -> AgentPurgeSummary:
-    """彻底删除 ``name`` 的全部版本与数据。调用方先用 :func:`find_blockers` 拦住不能删的
-    (这里在删版本行的同一个事务里还会再判一次「是不是都已删除」)。"""
+    """彻底删除 ``name`` 的全部版本与数据。
+
+    先把所有版本标成 ``purging``:有在用的版本就抛 :class:`AgentSpecPurgeBlockedError`,
+    此时什么都还没删。调用方(API)事先用 :func:`find_blockers` 给出完整的 409 说明。"""
     key = agent_key_for(name)
-    summary = AgentPurgeSummary(tenant_id=tenant_id, name=name, agent_key=key)
+    versions = await deps.agent_specs.begin_purge(tenant_id=tenant_id, name=name)
+    summary = AgentPurgeSummary(tenant_id=tenant_id, name=name, agent_key=key, versions=versions)
     fp = await _gather(deps, tenant_id=tenant_id, name=name, key=key)
     summary.threads_capped = fp.threads_capped
-    summary.versions = (
-        await find_blockers(deps.agent_specs, tenant_id=tenant_id, name=name)
-    ).versions
 
-    # B-168 —— 后台写回任务先删(worker 写之前查任务行,行没了它就放弃),再删对话与记忆。
-    _add(
+    # NAS 先删:某个用户的目录删不掉,能找回他的数据库行(对话、产物、实例绑定)这次都留着。
+    nas_ok = await purge_nas(deps, summary, fp, tenant_id=tenant_id, key=key)
+
+    # B-168 —— 后台写回任务先删(worker 写记忆前查任务行,行没了它就放弃),删成功才删记忆。
+    if await run(
         summary,
         "memory_writeback_job",
-        await _step(
-            summary,
-            "memory_writeback_job",
-            deps.memory_writeback_jobs.delete_for_agent(tenant_id=tenant_id, agent_name=name),
-            default=0,
-        ),
-    )
-    await _purge_conversations(deps, summary, fp, tenant_id=tenant_id)
-    _add(
-        summary,
-        "memory_item",
-        await _step(
+        deps.memory_writeback_jobs.delete_for_agent(tenant_id=tenant_id, agent_name=name),
+    ):
+        await run(
             summary,
             "memory_item",
             deps.memory.delete_for_agent(tenant_id=tenant_id, agent_name=name),
-            default=0,
-        ),
-    )
-    await _purge_artifacts(deps, summary, fp, tenant_id=tenant_id, key=key)
+        )
+    else:
+        skip(summary, "memory_item")
 
-    async def _delete_trigger(trigger_id: UUID) -> bool:
-        return await deps.triggers.delete(trigger_id=trigger_id, tenant_id=tenant_id)
-
-    async def _delete_endpoint(endpoint_id: UUID) -> bool:
-        return await deps.webhook_endpoints.delete(endpoint_id=endpoint_id, tenant_id=tenant_id)
-
-    async def _delete_dataset(dataset_id: UUID) -> bool:
-        return await deps.eval_datasets.delete(dataset_id=dataset_id, tenant_id=tenant_id)
-
-    await _purge_by_ids(summary, "agent_trigger", fp.trigger_ids, _delete_trigger)
-    _add(
-        summary,
-        "trigger_run",
-        await _step(
+    if nas_ok:
+        await purge_conversations(deps, summary, fp, tenant_id=tenant_id)
+        await purge_artifacts(deps, summary, fp, tenant_id=tenant_id, key=key)
+        await run(
             summary,
-            "trigger_run",
-            deps.trigger_runs.delete_for_triggers(trigger_ids=fp.trigger_ids, tenant_id=tenant_id),
-            default=0,
-        ),
-    )
-    await _purge_by_ids(summary, "webhook_endpoint", fp.endpoint_ids, _delete_endpoint)
-    _add(
-        summary,
-        "webhook_delivery",
-        await _step(
-            summary,
-            "webhook_delivery",
-            deps.webhook_deliveries.delete_for_endpoints(
-                endpoint_ids=fp.endpoint_ids, tenant_id=tenant_id
-            ),
-            default=0,
-        ),
-    )
-    for table, coro in (
-        (
             "agent_instance",
             deps.agent_instances.delete_for_agent(tenant_id=tenant_id, agent_code=name),
-        ),
-        (
-            "quality_score",
-            deps.quality_scores.delete_for_agent(tenant_id=tenant_id, agent_name=name),
-        ),
-        (
-            "quality_drift_alert",
-            deps.drift_alerts.delete_for_agent(tenant_id=tenant_id, agent_name=name),
-        ),
-        # 候选先于评测集:promoted 的候选经 RESTRICT 外键指着评测集。
-        (
-            "curation_candidate",
-            deps.curation_candidates.delete_for_agent(tenant_id=tenant_id, agent_name=name),
-        ),
-    ):
-        _add(summary, table, await _step(summary, table, coro, default=0))
-    await _purge_by_ids(summary, "eval_dataset", fp.eval_dataset_ids, _delete_dataset)
-    _add(
+        )
+    else:
+        for anchor in ("thread_meta", "artifact", "agent_instance"):
+            skip(summary, anchor)
+    await purge_triggers_and_webhooks(deps, summary, fp, tenant_id=tenant_id)
+    await run(
+        summary,
+        "quality_score",
+        deps.quality_scores.delete_for_agent(tenant_id=tenant_id, agent_name=name),
+    )
+    await run(
+        summary,
+        "quality_drift_alert",
+        deps.drift_alerts.delete_for_agent(tenant_id=tenant_id, agent_name=name),
+    )
+    await purge_eval_data(deps, summary, fp, tenant_id=tenant_id, name=name)
+    await run(
         summary,
         "secret_allowlist",
-        await _step(
-            summary,
-            "secret_allowlist",
-            deps.secret_allowlist.delete_for_agent(tenant_id=tenant_id, agent_name=name),
-            default=0,
-        ),
+        deps.secret_allowlist.delete_for_agent(tenant_id=tenant_id, agent_name=name),
     )
-    summary.default_agent_cleared = await _step(
-        summary,
-        "tenant_config",
-        deps.tenant_config.clear_default_agent_name(tenant_id=tenant_id, agent_name=name),
-        default=False,
-    )
-    await _purge_nas(deps, summary, fp, tenant_id=tenant_id, key=key)
-    if await _step(
-        summary,
-        "agent_disable",
-        deps.agent_disable.delete(tenant_id=tenant_id, agent_name=name),
-        default=False,
-    ):
-        _add(summary, "agent_disable", 1)
+    try:
+        summary.default_agent_cleared = await deps.tenant_config.clear_default_agent_name(
+            tenant_id=tenant_id, agent_name=name
+        )
+    except Exception as exc:
+        summary.failures.setdefault("tenant_config", type(exc).__name__)
+    try:
+        if await deps.agent_disable.delete(tenant_id=tenant_id, agent_name=name):
+            summary.deleted["agent_disable"] = 1
+    except Exception as exc:
+        summary.failures.setdefault("agent_disable", type(exc).__name__)
 
     if summary.failures or fp.threads_capped:
-        # 有没删干净的,版本行留着:名字还在「已删除」里,重跑一次接着删。
-        summary.skipped.append("agent_spec")
+        # 有没删干净的:版本行留着(状态 ``purging``),重跑接着删。
+        skip(summary, "agent_spec")
         return summary
     try:
-        # 同一个事务里锁住版本行再判一次:预检之后有人恢复了某一版 → AgentSpecPurgeBlockedError。
+        # 同一个事务里锁住版本行,再查一遍在用的版本与引用方,然后删版本行与修订历史。
         specs, revisions = await deps.agent_specs.purge_name(tenant_id=tenant_id, name=name)
-    except Exception as exc:
-        _fail(summary, "agent_spec", exc)
+    except AgentSpecPurgeBlockedError as exc:
+        summary.blocked = {
+            "active_versions": exc.active_versions,
+            "referenced_by": exc.referenced_by,
+        }
+        skip(summary, "agent_spec")
         return summary
-    _add(summary, "agent_spec", specs)
-    _add(summary, "agent_spec_revision", revisions)
+    except Exception as exc:
+        summary.failures.setdefault("agent_spec", type(exc).__name__)
+        return summary
+    summary.deleted["agent_spec"] = specs
+    summary.deleted["agent_spec_revision"] = revisions
     summary.agent_spec_deleted = True
     return summary

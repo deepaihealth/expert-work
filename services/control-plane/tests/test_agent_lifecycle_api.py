@@ -331,3 +331,174 @@ def test_the_purge_deps_are_wired_from_app_state() -> None:
     assert deps.drift_alerts is state.quality_drift_alert_store
     assert deps.agent_file_versions is getattr(state, "agent_file_versions", None)
     assert deps.artifact_snapshots is getattr(state, "artifact_snapshots", None)
+
+
+# --------------------------------------------------------------------------- B-278 review
+
+
+class _Bus:
+    def __init__(self) -> None:
+        self.events: list[tuple[str, str | None]] = []
+
+    async def publish(self, event: object) -> None:
+        self.events.append((getattr(event, "kind", ""), getattr(event, "tenant_id", None)))
+
+
+@pytest.mark.asyncio
+async def test_a_purging_name_cannot_be_restored_or_recreated(ctx: _Ctx) -> None:
+    await _create_and_delete(ctx.client)
+    repo = ctx.app.state.agent_spec_repo  # type: ignore[attr-defined]
+    await repo.begin_purge(tenant_id=ctx.tenant_id, name=_NAME)
+
+    restore = await ctx.client.post(f"/v1/agents/{_NAME}/1.0.0/restore")
+    assert restore.status_code == 409
+    assert restore.json()["error"]["code"] == "AGENT_PURGING"
+    for manifest in (_YAML, _YAML_V2):
+        create = await ctx.client.post("/v1/agents", json={"manifest_yaml": manifest})
+        assert create.status_code == 409, create.text
+        assert create.json()["error"]["code"] == "AGENT_PURGING"
+    detail = await ctx.client.get(f"/v1/agents/{_NAME}/1.0.0")
+    assert detail.json()["data"]["record"]["status"] == "purging"
+    listed = await ctx.client.get("/v1/agents", params={"status": "deleted"})
+    assert [r["name"] for r in listed.json()["data"]["items"]] == [_NAME]
+    # A re-run of the purge is still allowed and finishes it.
+    finish = await _purge(ctx.client)
+    assert finish.status_code == 200  # type: ignore[attr-defined]
+
+
+@pytest.mark.asyncio
+async def test_every_version_needs_delete_permission(
+    ctx: _Ctx, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from fastapi import HTTPException
+
+    import control_plane.api.agent_lifecycle as lifecycle
+
+    await _create_and_delete(ctx.client)
+    v2 = await ctx.client.post("/v1/agents", json={"manifest_yaml": _YAML_V2})
+    assert v2.status_code == 201
+    deleted_v2 = await ctx.client.delete(f"/v1/agents/{_NAME}/2.0.0")
+    assert deleted_v2.status_code == 204
+    real = lifecycle.ensure_resource_access  # type: ignore[attr-defined]
+
+    async def _not_someone_elses(
+        request: object, *, resource: str, action: str, attrs: object
+    ) -> None:
+        if action == "delete" and getattr(attrs, "owner_id", None) == "someone-else":
+            raise HTTPException(status_code=403, detail="not yours")
+        await real(request, resource=resource, action=action, attrs=attrs)  # type: ignore[arg-type]
+
+    repo = ctx.app.state.agent_spec_repo  # type: ignore[attr-defined]
+    record = await repo.get(
+        tenant_id=ctx.tenant_id, name=_NAME, version="2.0.0", include_deleted=True
+    )
+    repo._rows[(ctx.tenant_id, _NAME, "2.0.0")] = record.model_copy(
+        update={"created_by": "someone-else"}
+    )
+    monkeypatch.setattr(lifecycle, "ensure_resource_access", _not_someone_elses)
+
+    preview = await ctx.client.get(f"/v1/agents/{_NAME}/1.0.0/purge-preview")
+    purge = await _purge(ctx.client)
+
+    assert preview.status_code == 403
+    assert purge.status_code == 403  # type: ignore[attr-defined]
+    left = await repo.list_by_tenant(tenant_id=ctx.tenant_id, name=_NAME)
+    assert {r.status.value for r in left} == {"deleted"}
+
+
+@pytest.mark.asyncio
+async def test_an_incomplete_purge_is_not_reported_as_success(
+    ctx: _Ctx, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    await _create_and_delete(ctx.client)
+    scores = ctx.app.state.quality_score_store  # type: ignore[attr-defined]
+    calls = [0]
+    original = scores.delete_for_agent
+
+    async def _flaky(*, tenant_id: UUID, agent_name: str) -> int:
+        calls[0] += 1
+        if calls[0] == 1:
+            raise OSError(5, "connect failed: postgresql://u:s3cret@db/x")
+        return int(await original(tenant_id=tenant_id, agent_name=agent_name))
+
+    monkeypatch.setattr(scores, "delete_for_agent", _flaky)
+
+    first = await _purge(ctx.client)
+
+    assert first.status_code == 500  # type: ignore[attr-defined]
+    body = first.json()  # type: ignore[attr-defined]
+    assert body["success"] is False
+    assert body["error"]["code"] == "AGENT_PURGE_INCOMPLETE"
+    assert body["error"]["details"]["failures"] == {"quality_score": "OSError"}
+    assert "s3cret" not in first.text  # type: ignore[attr-defined]
+    detail = await ctx.client.get(f"/v1/agents/{_NAME}/1.0.0")
+    assert detail.json()["data"]["record"]["status"] == "purging"
+    second = await _purge(ctx.client)
+    assert second.status_code == 200  # type: ignore[attr-defined]
+    assert second.json()["data"]["ok"] is True  # type: ignore[attr-defined]
+
+
+@pytest.mark.asyncio
+async def test_blocked_at_mark_or_at_final_delete_is_409(
+    ctx: _Ctx, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import control_plane.api.agent_lifecycle as lifecycle
+    from control_plane.purge.agent_purge import AgentPurgeBlockers
+
+    async def _nothing_blocks(*_args: object, **_kwargs: object) -> AgentPurgeBlockers:
+        return AgentPurgeBlockers(versions=[], active_versions=[], referenced_by=[])
+
+    monkeypatch.setattr(lifecycle, "find_blockers", _nothing_blocks)
+    await _create_and_delete(ctx.client)
+    live = await ctx.client.post("/v1/agents", json={"manifest_yaml": _YAML_V2})
+    assert live.status_code == 201
+    # A live version slipped past the pre-check: begin_purge refuses, nothing is deleted.
+    at_mark = await _purge(ctx.client)
+    assert at_mark.status_code == 409  # type: ignore[attr-defined]
+    mark_error = at_mark.json()["error"]  # type: ignore[attr-defined]
+    assert mark_error["details"]["active_versions"] == ["2.0.0"]
+    detail = await ctx.client.get(f"/v1/agents/{_NAME}/1.0.0")
+    assert detail.json()["data"]["record"]["status"] == "deleted"
+
+    gone = await ctx.client.delete(f"/v1/agents/{_NAME}/2.0.0")
+    assert gone.status_code == 204
+    loader = ctx.app.state.manifest_loader  # type: ignore[attr-defined]
+    parent = loader.load_from_string(
+        _YAML.replace("name: code-reviewer", "name: parent").replace(
+            "  tenant_config: {}",
+            "  tenant_config: {}\n  subagents:\n"
+            "    - name: reviewer\n"
+            "      agent_ref: code-reviewer@1.0.0\n"
+            "      description: delegate reviews",
+        )
+    )
+    await ctx.app.state.agent_spec_repo.create(  # type: ignore[attr-defined]
+        tenant_id=ctx.tenant_id, spec=parent, spec_sha256="a" * 64, created_by="u"
+    )
+    # A referrer slipped past the pre-check: the final transaction refuses.
+    at_end = await _purge(ctx.client)
+    assert at_end.status_code == 409  # type: ignore[attr-defined]
+    error = at_end.json()["error"]  # type: ignore[attr-defined]
+    assert error["code"] == "AGENT_PURGE_BLOCKED"
+    assert error["details"]["referenced_by"] == ["parent@1.0.0"]
+    assert error["details"]["summary"]["agent_spec_deleted"] is False
+
+
+@pytest.mark.asyncio
+async def test_clearing_the_default_agent_is_broadcast(ctx: _Ctx) -> None:
+    from expert_work.protocol import TenantConfigPatch
+
+    bus = _Bus()
+    ctx.app.state.invalidation_bus = bus  # type: ignore[attr-defined]
+    service = ctx.app.state.tenant_config_service  # type: ignore[attr-defined]
+    await service.store.create(tenant_id=ctx.tenant_id, display_name="t", actor_id="u")
+    await service.upsert(
+        tenant_id=ctx.tenant_id, patch=TenantConfigPatch(default_agent_name=_NAME), actor_id="u"
+    )
+    await _create_and_delete(ctx.client)
+
+    resp = await _purge(ctx.client)
+
+    assert resp.status_code == 200  # type: ignore[attr-defined]
+    assert resp.json()["data"]["default_agent_cleared"] is True  # type: ignore[attr-defined]
+    assert ("tenant_config", str(ctx.tenant_id)) in bus.events

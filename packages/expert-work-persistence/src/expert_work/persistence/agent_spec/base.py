@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import abc
+from collections.abc import Mapping
 from dataclasses import dataclass
+from typing import Any
 from uuid import UUID
 
 from expert_work.protocol import (
@@ -42,15 +44,48 @@ class DuplicateAgentSpecError(Exception):
         self.version = version
 
 
-class AgentSpecPurgeBlockedError(Exception):
-    """B-278 —— :meth:`AgentSpecStore.purge_name` found a version that is not
-    soft-deleted (checked under the row lock, right before the delete). The
-    API layer maps it to ``HTTP 409``."""
+class AgentSpecPurgingError(DuplicateAgentSpecError):
+    """B-278 —— the name is being purged (some version is ``purging``): no new
+    version may be created under it until the purge finishes. A subclass of
+    :class:`DuplicateAgentSpecError` so every create / fork call site that already
+    maps "this name+version is taken" to 409 covers it; the API tells the two apart
+    and answers ``AGENT_PURGING``."""
 
-    def __init__(self, *, name: str, active_versions: list[str]) -> None:
-        super().__init__(f"agent {name!r} still has live versions: {active_versions}")
+
+class AgentSpecPurgeBlockedError(Exception):
+    """B-278 —— the purge cannot go on: a version of the name is live (not
+    ``deleted`` / ``purging``), or a live agent of the tenant lists it as a
+    subagent. Raised by :meth:`AgentSpecStore.begin_purge` /
+    :meth:`AgentSpecStore.purge_name` under the row lock; the API answers
+    409 ``AGENT_PURGE_BLOCKED``."""
+
+    def __init__(
+        self, *, name: str, active_versions: list[str], referenced_by: list[str] | None = None
+    ) -> None:
+        super().__init__(
+            f"agent {name!r} cannot be purged: live versions {active_versions}, "
+            f"referenced by {referenced_by or []}"
+        )
         self.name = name
         self.active_versions = active_versions
+        self.referenced_by = referenced_by or []
+
+
+def subagent_names(spec_json: Mapping[str, Any] | None) -> set[str]:
+    """Names this stored manifest delegates to (``spec.subagents[].agent_ref``).
+
+    Reads the persisted JSON as-is (no model validation) so a malformed sibling
+    row can never make a purge check crash; an unparsable ref is ignored."""
+    if not spec_json:
+        return set()
+    body = spec_json.get("spec")
+    subs = body.get("subagents") if isinstance(body, Mapping) else None
+    names: set[str] = set()
+    for sub in subs if isinstance(subs, list) else []:
+        ref = sub.get("agent_ref") if isinstance(sub, Mapping) else None
+        if isinstance(ref, str) and ref.count("@") == 1:
+            names.add(ref.split("@", 1)[0])
+    return names
 
 
 class AgentSpecStore(abc.ABC):
@@ -71,7 +106,9 @@ class AgentSpecStore(abc.ABC):
         created_by: str,
     ) -> AgentSpecRecord:
         """Insert a new ``ACTIVE`` row; raises :class:`DuplicateAgentSpecError`
-        if ``(tenant_id, name, version)`` already exists."""
+        if ``(tenant_id, name, version)`` already exists, and its subclass
+        :class:`AgentSpecPurgingError` if any version of the name is being
+        purged (checked under the name's row locks, B-278)."""
 
     @abc.abstractmethod
     async def get(
@@ -82,7 +119,8 @@ class AgentSpecStore(abc.ABC):
         version: str,
         include_deleted: bool = False,
     ) -> AgentSpecRecord | None:
-        """Fetch one row; defaults skip soft-deleted entries."""
+        """Fetch one row; defaults skip soft-deleted entries (``deleted`` and,
+        B-278, ``purging``)."""
 
     @abc.abstractmethod
     async def list_by_tenant(
@@ -94,7 +132,9 @@ class AgentSpecStore(abc.ABC):
         limit: int = 100,
         offset: int = 0,
     ) -> list[AgentSpecRecord]:
-        """Paginated list, newest first."""
+        """Paginated list, newest first. B-278 —— ``status=DELETED`` also
+        matches ``PURGING`` rows (the console's "deleted" filter shows a name
+        whose purge has not finished)."""
 
     @abc.abstractmethod
     async def list_distinct_active_by_tenant(
@@ -275,12 +315,24 @@ class AgentSpecStore(abc.ABC):
         """How many ``agent_spec_revision`` rows every version of ``name`` has."""
 
     @abc.abstractmethod
-    async def purge_name(self, *, tenant_id: UUID, name: str) -> tuple[int, int]:
-        """Hard-delete every version row of ``name`` and all their revisions.
+    async def begin_purge(self, *, tenant_id: UUID, name: str) -> list[str]:
+        """Mark every version of ``name`` ``PURGING`` — the persistent "a purge
+        is under way" marker. Only if every version is ``DELETED`` or already
+        ``PURGING`` (a re-run); otherwise nothing changes and
+        :class:`AgentSpecPurgeBlockedError` is raised. One transaction, rows
+        locked, re-checked after the update so a version created concurrently
+        cannot slip past. While marked, :meth:`restore` changes nothing and
+        :meth:`create` raises :class:`AgentSpecPurgingError`. Returns the
+        versions marked (``[]`` when the name has no rows)."""
 
-        One transaction: the version rows are locked, and if any of them is not
-        ``DELETED`` nothing is deleted and :class:`AgentSpecPurgeBlockedError`
-        is raised. Returns ``(version rows, revision rows)`` removed — ``(0, 0)``
-        when the name is already gone (a re-run). Revisions go too because
-        their ``(tenant, agent_name, agent_version, revision)`` unique key would
-        otherwise make re-creating the same name fail."""
+    @abc.abstractmethod
+    async def purge_name(self, *, tenant_id: UUID, name: str) -> tuple[int, int]:
+        """Hard-delete every version row of ``name`` and their revisions.
+
+        One transaction: the version rows are locked; if any of them is live,
+        or a live agent of the tenant lists ``name`` as a subagent, nothing is
+        deleted and :class:`AgentSpecPurgeBlockedError` is raised. Only the
+        locked versions' revisions go. Returns ``(version rows, revision rows)``
+        removed — ``(0, 0)`` when the name is already gone (a re-run).
+        Revisions go too because their ``(tenant, agent_name, agent_version,
+        revision)`` unique key would otherwise make re-creating the name fail."""

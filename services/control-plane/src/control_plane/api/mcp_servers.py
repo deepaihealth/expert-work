@@ -39,7 +39,6 @@ from expert_work.persistence import (
 from expert_work.persistence.tenant_mcp_server import ALL_TENANTS_SERVERS_LIMIT
 from expert_work.protocol import (
     AgentSpecRecord,
-    AgentSpecStatus,
     AuditAction,
     McpServerAuthType,
     McpServerProbeStatus,
@@ -1276,7 +1275,7 @@ def build_mcp_servers_router() -> APIRouter:
                     break
                 specs.extend(page)
                 offset += len(page)
-            active_specs = [s for s in specs if s.status is not AgentSpecStatus.DELETED]
+            active_specs = [s for s in specs if not s.status.gone]
             # AgentSpecRecord.spec is an AgentSpec object — convert to dict (once
             # per spec) for the helpers below, which read raw manifest dicts.
             dumped = [(s.name, s.spec.model_dump(mode="json")) for s in active_specs]

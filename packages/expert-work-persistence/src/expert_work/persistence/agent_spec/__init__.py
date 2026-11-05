@@ -2,18 +2,22 @@
 
 from expert_work.persistence.agent_spec.base import (
     AgentSpecPurgeBlockedError,
+    AgentSpecPurgingError,
     AgentSpecStore,
     AgentSpecUpdateResult,
     DuplicateAgentSpecError,
+    subagent_names,
 )
 from expert_work.persistence.agent_spec.memory import InMemoryAgentSpecStore
 from expert_work.persistence.agent_spec.sql import SqlAgentSpecStore
 
 __all__ = [
     "AgentSpecPurgeBlockedError",
+    "AgentSpecPurgingError",
     "AgentSpecStore",
     "AgentSpecUpdateResult",
     "DuplicateAgentSpecError",
     "InMemoryAgentSpecStore",
     "SqlAgentSpecStore",
+    "subagent_names",
 ]
