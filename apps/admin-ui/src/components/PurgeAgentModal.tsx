@@ -8,9 +8,11 @@
  * outright; otherwise the admin types the name verbatim to arm it — same
  * type-to-confirm gate as ``DeleteAgentModal``.
  *
- * The purge runs synchronously and step-wise on the server. ``ok=false`` is a
- * partial run: the name stays in the deleted list and clicking again finishes
- * it, so the modal stays open, lists the failed steps and re-arms.
+ * The purge runs synchronously and step-wise on the server. A partial run
+ * (``409 AGENT_PURGE_INCOMPLETE`` with the summary in ``error.details``; a 200
+ * with ``ok=false`` is still accepted as a fallback) leaves the name
+ * ``purging`` and clicking again finishes it, so the modal stays open, lists
+ * the failed steps and re-arms as 「再点一次继续清理」.
  */
 import { useCallback, useEffect, useState } from "react";
 import { Alert, App, Input, Modal, Skeleton, Space, Tag, Typography } from "antd";
@@ -19,6 +21,8 @@ import { useTranslation } from "react-i18next";
 import { ApiError, errMessage } from "../api/client";
 import {
   AGENT_PURGE_BLOCKED,
+  AGENT_PURGE_INCOMPLETE,
+  AGENT_PURGING,
   getAgentPurgePreview,
   purgeAgent,
   type AgentPurgeBlocking,
@@ -73,6 +77,16 @@ function readBlocking(err: ApiError): AgentPurgeBlocking | null {
   const refs = err.details?.referenced_by;
   if (!Array.isArray(active) || !Array.isArray(refs)) return null;
   return { active_versions: active.map(String), referenced_by: refs.map(String) };
+}
+
+/** ``AGENT_PURGE_INCOMPLETE`` carries the purge summary in ``error.details``;
+ *  its ``failures`` is step → exception type. */
+function readFailures(err: ApiError): Record<string, string> {
+  const failures = err.details?.failures;
+  if (typeof failures !== "object" || failures === null || Array.isArray(failures)) return {};
+  return Object.fromEntries(
+    Object.entries(failures as Record<string, unknown>).map(([step, type]) => [step, String(type)]),
+  );
 }
 
 interface PurgeAgentModalProps {
@@ -134,8 +148,14 @@ export function PurgeAgentModal({ open, name, version, onClose, onPurged }: Purg
         onPurged();
         return;
       }
+      // Fallback: an older backend answered a partial run with 200 + ok=false.
       setFailedSteps(summary.failures);
     } catch (err) {
+      if (err instanceof ApiError && err.code === AGENT_PURGE_INCOMPLETE) {
+        // Partial run: the summary rides in error.details; click again to finish.
+        setFailedSteps(readFailures(err));
+        return;
+      }
       if (err instanceof ApiError && err.code === AGENT_PURGE_BLOCKED) {
         // Something changed since the preview — show the server's reasons.
         const blocking = readBlocking(err);
@@ -143,6 +163,11 @@ export function PurgeAgentModal({ open, name, version, onClose, onPurged }: Purg
           setPreview((p) => (p === null ? p : { ...p, blocking }));
           return;
         }
+      }
+      if (err instanceof ApiError && err.code === AGENT_PURGING) {
+        // Another purge of this name is still running.
+        setPurgeError(t("agent_lifecycle.purge_in_progress"));
+        return;
       }
       setPurgeError(t("agent_lifecycle.purge_failed", { error: errMessage(err) }));
     } finally {
@@ -155,7 +180,9 @@ export function PurgeAgentModal({ open, name, version, onClose, onPurged }: Purg
       open={open}
       onCancel={close}
       onOk={() => void onConfirm()}
-      okText={t("agent_lifecycle.purge")}
+      okText={
+        failedSteps !== null ? t("agent_lifecycle.purge_continue") : t("agent_lifecycle.purge")
+      }
       cancelText={t("common.cancel")}
       okButtonProps={{
         danger: true,

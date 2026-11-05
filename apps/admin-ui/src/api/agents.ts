@@ -279,6 +279,10 @@ export const MANIFEST_DUPLICATE_DELETED = "MANIFEST_DUPLICATE_DELETED";
 /** B-278 — purge refused: a version is still live, or another agent uses it as
  *  a subagent. ``ApiError.details`` = {@link AgentPurgeBlocking}. */
 export const AGENT_PURGE_BLOCKED = "AGENT_PURGE_BLOCKED";
+/** B-278 — purge ran but some steps failed; ``ApiError.details`` is the full
+ *  summary (``deleted`` / ``failures`` / ``skipped`` …). Running it again
+ *  finishes the job. */
+export const AGENT_PURGE_INCOMPLETE = "AGENT_PURGE_INCOMPLETE";
 
 /** B-278 — create / fork / restore hit a name whose purge hasn't finished. */
 export const AGENT_PURGING = "AGENT_PURGING";
@@ -388,7 +392,9 @@ export interface AgentPurgeSummary {
 /** POST /v1/agents/{name}/{version}/purge — B-278. Permanently removes the
  *  whole name (every version + its data; usage / billing / audit kept).
  *  ``confirm_name`` must equal the name exactly (422 ``CONFIRM_NAME_MISMATCH``);
- *  409 {@link AGENT_PURGE_BLOCKED} when something still holds it. */
+ *  409 {@link AGENT_PURGE_BLOCKED} when something still holds it; 409
+ *  {@link AGENT_PURGE_INCOMPLETE} (summary in ``details``) when some steps
+ *  failed; 409 {@link AGENT_PURGING} when another purge of the name runs. */
 export async function purgeAgent(
   name: string,
   version: string,

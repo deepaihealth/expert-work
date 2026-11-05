@@ -141,7 +141,52 @@ describe("PurgeAgentModal", () => {
     expect(await screen.findByText("Purged code-reviewer")).toBeInTheDocument();
   });
 
-  it("ok=false: names the failed steps, stays open and lets the admin click again", async () => {
+  it("409 AGENT_PURGE_INCOMPLETE: names the failed steps, offers 「再点一次继续清理」", async () => {
+    const user = userEvent.setup();
+    vi.mocked(getAgentPurgePreview).mockResolvedValue(preview());
+    vi.mocked(purgeAgent)
+      .mockRejectedValueOnce(
+        new ApiError("some purge steps failed", "AGENT_PURGE_INCOMPLETE", 409, {
+          ...summary({ ok: false, agent_spec_deleted: false }),
+          failures: { nas: "PermissionError", artifacts: "OSError" },
+          skipped: ["agent_spec", "nas_quarantined"],
+        }),
+      )
+      .mockResolvedValueOnce(summary());
+    renderModal();
+
+    await user.type(await screen.findByTestId("purge-agent-confirm-input"), "code-reviewer");
+    await user.click(screen.getByTestId("purge-agent-confirm-ok"));
+
+    const partial = await screen.findByTestId("purge-agent-partial");
+    expect(partial).toHaveTextContent("nas (PermissionError), artifacts (OSError)");
+    expect(onPurged).not.toHaveBeenCalled();
+    expect(screen.queryByTestId("purge-agent-error")).toBeNull();
+    const again = screen.getByTestId("purge-agent-confirm-ok");
+    expect(again).toHaveTextContent("Continue cleanup");
+    expect(again).toBeEnabled();
+
+    await user.click(again);
+    await waitFor(() => expect(onPurged).toHaveBeenCalledTimes(1));
+    expect(purgeAgent).toHaveBeenCalledTimes(2);
+  });
+
+  it("409 AGENT_PURGING: says another purge of the name is running", async () => {
+    const user = userEvent.setup();
+    vi.mocked(getAgentPurgePreview).mockResolvedValue(preview());
+    vi.mocked(purgeAgent).mockRejectedValue(new ApiError("purging", "AGENT_PURGING", 409));
+    renderModal();
+
+    await user.type(await screen.findByTestId("purge-agent-confirm-input"), "code-reviewer");
+    await user.click(screen.getByTestId("purge-agent-confirm-ok"));
+
+    expect(await screen.findByTestId("purge-agent-error")).toHaveTextContent(
+      "being purged right now",
+    );
+    expect(onPurged).not.toHaveBeenCalled();
+  });
+
+  it("fallback 200 ok=false: names the failed steps, stays open and lets the admin click again", async () => {
     const user = userEvent.setup();
     vi.mocked(getAgentPurgePreview).mockResolvedValue(preview());
     vi.mocked(purgeAgent)
@@ -156,7 +201,7 @@ describe("PurgeAgentModal", () => {
 
     const partial = await screen.findByTestId("purge-agent-partial");
     expect(partial).toHaveTextContent("artifacts (OSError)");
-    expect(partial).toHaveTextContent("Click Purge again to finish");
+    expect(partial).toHaveTextContent("to finish");
     expect(onPurged).not.toHaveBeenCalled();
     expect(screen.getByTestId("purge-agent-confirm-ok")).toBeEnabled();
 

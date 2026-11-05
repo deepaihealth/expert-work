@@ -269,6 +269,8 @@ export interface TranslationKeys {
     purge_ok: string;
     purge_partial_title: string;
     purge_partial_body: string;
+    purge_continue: string;
+    purge_in_progress: string;
     purge_failed: string;
     duplicate_deleted: string;
     duplicate_deleted_link: string;
@@ -4040,7 +4042,10 @@ const en: TranslationKeys = {
       "A very large agent may time out. If it times out or stops halfway, click Purge again — what's already removed isn't removed twice.",
     purge_ok: "Purged {{name}}",
     purge_partial_title: "Some data is still there",
-    purge_partial_body: "These steps didn't finish: {{steps}}. Click Purge again to finish.",
+    purge_partial_body:
+      "These steps didn't finish: {{steps}}. Click “Continue cleanup” to finish.",
+    purge_continue: "Continue cleanup",
+    purge_in_progress: "This agent is being purged right now. Please try again later.",
     purge_failed: "Purge failed: {{error}}. You can try again.",
     duplicate_deleted:
       "A deleted agent with the same name exists. You can restore it, or purge it and then create a new one.",
