@@ -265,8 +265,9 @@ class RetentionCleanupJob:
                 artifact_versions_deleted,
                 artifact_files_removed,
                 artifacts_expired,
-            ) = await self._sweep_artifact_versions()
-            artifact_soft, artifact_hard = await self._sweep_artifacts()
+                artifact_soft,
+                artifact_hard,
+            ) = await self._sweep_artifact_passes()
             orphan_artifact_copies_removed = await self._sweep_orphan_artifact_copies()
             purged = await self._sweep_purged_agents()
             thread_dirs_removed = await self._sweep_orphan_thread_dirs()
@@ -440,6 +441,23 @@ class RetentionCleanupJob:
                 },
             )
         return hard, len(pending)
+
+    async def _sweep_artifact_passes(self) -> tuple[int, int, int, int, int]:
+        """B-63 —— 产物两条 pass(版本 → 逻辑产物)。按最后使用算的查询更重,撞上
+        ``statement_timeout`` 之类时与上传 pass 一样:记日志、记进 ``failed_passes``(进程以非 0
+        退出),后面的线程目录 / 记忆 / 工作区清理照跑。版本 pass 失败时不跑逻辑产物 pass(它
+        假定版本 pass 已经跑完)。
+
+        Returns ``(versions_deleted, files_removed, artifacts_expired, soft, hard)``。
+        """
+        try:
+            versions_deleted, files_removed, expired = await self._sweep_artifact_versions()
+            soft, hard = await self._sweep_artifacts()
+        except Exception:
+            logger.exception("retention.artifact_sweep_failed")
+            self._failed_passes.append("artifacts")
+            return 0, 0, 0, 0, 0
+        return versions_deleted, files_removed, expired, soft, hard
 
     async def _sweep_artifact_versions(self) -> tuple[int, int, int]:
         """留存链 B-28 —— 产物按**版本**到期。

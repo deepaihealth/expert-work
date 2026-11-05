@@ -7,11 +7,10 @@ from datetime import UTC, datetime
 from typing import Any
 from uuid import UUID, uuid4
 
-from sqlalchemy import ColumnElement, case, cast, delete, func, or_, select, text, update
+from sqlalchemy import CTE, ColumnElement, and_, case, cast, delete, func, or_, select, text, update
 from sqlalchemy.dialects.postgresql import UUID as PG_UUID
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
-from sqlalchemy.orm import InstrumentedAttribute, aliased
 
 from expert_work.persistence.artifact.base import ArtifactStore, ExpiredArtifactVersion
 from expert_work.persistence.bulk_delete import count_where
@@ -25,56 +24,104 @@ from expert_work.persistence.rls import require_rls_bypass
 from expert_work.persistence.user_upload.base import TOUCH_INTERVAL
 from expert_work.protocol import Artifact, ArtifactKind, ArtifactVersion
 
-#: ``created_in_thread`` 存的是 run id(TEXT;没有 run 时是 ``"save-artifact"`` 之类的回落常量)。
-#: 只有长得像 UUID 的才 cast 去按主键找 run —— cast 一个回落常量会让整条查询报错(迁移 0154
-#: 踩过),而反过来把 ``agent_run.id`` 转成 text 去比又用不上主键索引。
+#: ``created_in_thread`` 里长得像 UUID 的才当 run id(见 :func:`_clocks`)。反过来把
+#: ``agent_run.id`` 转成 text 去比用不上主键索引。
 _UUID_PATTERN = "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
 
 
-def _version_clock(v: type[ArtifactVersionRow]) -> ColumnElement[datetime]:
-    """B-63 —— 一版自己的「最后使用」:``greatest(created_at, last_used_at, 登记它的会话最后
-    一次 run)``。会话 = ``created_in_thread`` 那个 run 的 ``thread_id``;run 行已被清掉、或
-    存的是回落常量时这一项为空,``greatest`` 跳过它。"""
-    source_run = aliased(AgentRunRow)
-    thread_run = aliased(AgentRunRow)
+def _clocks() -> tuple[CTE, CTE]:
+    """B-63 —— 每个版本与每个产物的「最后使用」,用 CTE **一次**算完(不再每行一个相关子查询)。
+
+    * 一版自己的 = ``greatest(created_at, last_used_at, 登记它的会话最后一次 run)``。
+      ``created_in_thread`` 存的是 run id(TEXT;没有 run 时是 ``"save-artifact"`` 之类的回落
+      常量),只有长得像 UUID 的才 cast 去按主键找那个 run —— cast 回落常量会让整条查询报错
+      (迁移 0154 踩过);run → 会话、会话 → 最后一次 run 都只认**同租户**的 run。会话的最后
+      一次 run 先收拢出涉及到的会话,再对这些会话的 ``agent_run`` 聚合一遍。
+    * 产物的 = 它各版本时钟里最晚的那个。
+
+    返回 ``(version_clock, artifact_clock)``:前者每版一行 ``(id, artifact_id, tenant_id,
+    version, clock)``,后者每个有版本的产物一行 ``(artifact_id, clock)``。
+    """
+    v = ArtifactVersionRow
     run_id = case(
         (v.created_in_thread.regexp_match(_UUID_PATTERN), cast(v.created_in_thread, PG_UUID)),
         else_=None,
     )
-    last_run = (
-        select(func.max(thread_run.created_at))
-        .select_from(source_run)
+    versions = select(
+        v.id,
+        v.artifact_id,
+        v.tenant_id,
+        v.version,
+        v.created_at,
+        v.last_used_at,
+        run_id.label("run_id"),
+    ).cte("artifact_version_runs")
+    source = (
+        select(AgentRunRow.id.label("run_id"), AgentRunRow.tenant_id, AgentRunRow.thread_id)
         .join(
-            thread_run,
-            (thread_run.thread_id == source_run.thread_id)
-            & (thread_run.tenant_id == source_run.tenant_id),
+            versions,
+            and_(
+                AgentRunRow.id == versions.c.run_id, AgentRunRow.tenant_id == versions.c.tenant_id
+            ),
         )
-        .where(source_run.id == run_id, source_run.tenant_id == v.tenant_id)
-        .scalar_subquery()
+        .distinct()
+        .cte("artifact_source_runs")
     )
-    return func.greatest(v.created_at, v.last_used_at, last_run)
-
-
-def _artifact_clock() -> ColumnElement[datetime]:
-    """B-63 —— 产物行(以及它的最新版)的「最后使用」:各版本时钟里最晚的那个;一个版本都
-    没有时退回 ``updated_at``。关联外层查询里的 :class:`ArtifactRow`。"""
-    v = aliased(ArtifactVersionRow)
-    newest = (
-        select(func.max(_version_clock(v))).where(v.artifact_id == ArtifactRow.id).scalar_subquery()
+    threads = select(source.c.tenant_id, source.c.thread_id).distinct().cte("artifact_threads")
+    last_run = (
+        select(
+            AgentRunRow.tenant_id,
+            AgentRunRow.thread_id,
+            func.max(AgentRunRow.created_at).label("at"),
+        )
+        .join(
+            threads,
+            and_(
+                AgentRunRow.thread_id == threads.c.thread_id,
+                AgentRunRow.tenant_id == threads.c.tenant_id,
+            ),
+        )
+        .group_by(AgentRunRow.tenant_id, AgentRunRow.thread_id)
+        .cte("artifact_thread_last_run")
     )
-    return func.coalesce(newest, ArtifactRow.updated_at)
-
-
-def _retention_days(
-    tenant_id: InstrumentedAttribute[UUID], default_days: int
-) -> ColumnElement[int]:
-    """租户的 ``artifact_retention_days``,没设(或没有配置行)用 ``default_days``。"""
-    tenant_days = (
-        select(TenantConfigRow.artifact_retention_days)
-        .where(TenantConfigRow.tenant_id == tenant_id)
-        .scalar_subquery()
+    version_clock = (
+        select(
+            versions.c.id,
+            versions.c.artifact_id,
+            versions.c.tenant_id,
+            versions.c.version,
+            func.greatest(versions.c.created_at, versions.c.last_used_at, last_run.c.at).label(
+                "clock"
+            ),
+        )
+        .select_from(versions)
+        .outerjoin(
+            source,
+            and_(
+                source.c.run_id == versions.c.run_id,
+                source.c.tenant_id == versions.c.tenant_id,
+            ),
+        )
+        .outerjoin(
+            last_run,
+            and_(
+                last_run.c.thread_id == source.c.thread_id,
+                last_run.c.tenant_id == source.c.tenant_id,
+            ),
+        )
+        .cte("artifact_version_clock")
     )
-    return func.coalesce(tenant_days, default_days)
+    artifact_clock = (
+        select(version_clock.c.artifact_id, func.max(version_clock.c.clock).label("clock"))
+        .group_by(version_clock.c.artifact_id)
+        .cte("artifact_clock")
+    )
+    return version_clock, artifact_clock
+
+
+def _retention_days(default_days: int) -> ColumnElement[int]:
+    """租户的 ``artifact_retention_days``,没设(或没有配置行,外连接为空)用 ``default_days``。"""
+    return func.coalesce(TenantConfigRow.artifact_retention_days, default_days)
 
 
 def _row_to_artifact(row: ArtifactRow) -> Artifact:
@@ -444,18 +491,25 @@ class SqlArtifactStore(ArtifactStore):
         default_days: int,
         limit: int = 1000,
     ) -> list[Artifact]:
-        expires_at = (
-            _artifact_clock()
-            + func.make_interval(0, 0, 0, _retention_days(ArtifactRow.tenant_id, default_days))
-        ).label("expires_at")
-        inner = (
-            select(ArtifactRow.id, expires_at).where(ArtifactRow.deleted_at.is_(None)).subquery()
+        _version_clock, artifact_clock = _clocks()
+        clock = func.coalesce(artifact_clock.c.clock, ArtifactRow.updated_at)
+        expiry = (
+            select(
+                ArtifactRow.id,
+                (clock + func.make_interval(0, 0, 0, _retention_days(default_days))).label(
+                    "expires_at"
+                ),
+            )
+            .outerjoin(artifact_clock, artifact_clock.c.artifact_id == ArtifactRow.id)
+            .outerjoin(TenantConfigRow, TenantConfigRow.tenant_id == ArtifactRow.tenant_id)
+            .where(ArtifactRow.deleted_at.is_(None))
+            .subquery("artifact_expiry")
         )
         stmt = (
             select(ArtifactRow)
-            .join(inner, inner.c.id == ArtifactRow.id)
-            .where(inner.c.expires_at < now)
-            .order_by(inner.c.expires_at.asc(), ArtifactRow.id.asc())
+            .join(expiry, expiry.c.id == ArtifactRow.id)
+            .where(expiry.c.expires_at < now)
+            .order_by(expiry.c.expires_at.asc(), ArtifactRow.id.asc())
             .limit(limit)
         )
         async with self._sf() as session:
@@ -530,32 +584,36 @@ class SqlArtifactStore(ArtifactStore):
         default_days: int,
         limit: int = 1000,
     ) -> list[ExpiredArtifactVersion]:
-        v = ArtifactVersionRow
-        days = _retention_days(v.tenant_id, default_days)
+        version_clock, artifact_clock = _clocks()
+        days = _retention_days(default_days)
         # 最新版用产物的时钟(各版本里最晚的):最新版不会先于旧版本被清掉,产物也恰好在
-        # 最新版到期时离开列表(:meth:`list_active_past_retention` 同一个表达式)。父行不在
-        # (没有外键的孤儿版本)时按这一版自己的时钟。``CASE`` 只对最新版求产物时钟。
+        # 最新版到期时离开列表(:meth:`list_active_past_retention` 用的是同一个产物时钟)。
+        # 父行不在(没有外键的孤儿版本)时按这一版自己的时钟。
         clock = case(
-            (v.version == ArtifactRow.latest_version, _artifact_clock()),
-            else_=_version_clock(v),
+            (version_clock.c.version == ArtifactRow.latest_version, artifact_clock.c.clock),
+            else_=version_clock.c.clock,
         )
-        inner = (
+        expiry = (
             select(
-                v.id,
+                version_clock.c.id,
                 (clock + func.make_interval(0, 0, 0, days)).label("expires_at"),
                 days.label("days"),
             )
-            .outerjoin(ArtifactRow, ArtifactRow.id == v.artifact_id)
-            .subquery()
+            .select_from(version_clock)
+            .outerjoin(ArtifactRow, ArtifactRow.id == version_clock.c.artifact_id)
+            .outerjoin(artifact_clock, artifact_clock.c.artifact_id == version_clock.c.artifact_id)
+            .outerjoin(TenantConfigRow, TenantConfigRow.tenant_id == version_clock.c.tenant_id)
+            .subquery("artifact_version_expiry")
         )
         # 同一到期时刻的版本按 ``artifact_id, version`` 定序 —— 老版本先于新版本,跨 store
         # 实现同义;用 ``id``(uuid4)做 tiebreak 则同一产物两个版本谁先谁后是随机的
         # (CI 实测:三跑两红)。
+        v = ArtifactVersionRow
         stmt = (
-            select(v, inner.c.days)
-            .join(inner, inner.c.id == v.id)
-            .where(inner.c.expires_at < now)
-            .order_by(inner.c.expires_at.asc(), v.artifact_id.asc(), v.version.asc())
+            select(v, expiry.c.days)
+            .join(expiry, expiry.c.id == v.id)
+            .where(expiry.c.expires_at < now)
+            .order_by(expiry.c.expires_at.asc(), v.artifact_id.asc(), v.version.asc())
             .limit(limit)
         )
         async with self._sf() as session:
@@ -565,12 +623,13 @@ class SqlArtifactStore(ArtifactStore):
             for row, d in rows
         ]
 
-    async def touch_version(self, *, version_id: UUID, now: datetime) -> bool:
+    async def touch_version(self, *, version_id: UUID, tenant_id: UUID, now: datetime) -> bool:
         async with self._sf() as session:
             result = await session.execute(
                 update(ArtifactVersionRow)
                 .where(
                     ArtifactVersionRow.id == version_id,
+                    ArtifactVersionRow.tenant_id == tenant_id,
                     or_(
                         ArtifactVersionRow.last_used_at.is_(None),
                         ArtifactVersionRow.last_used_at < now - TOUCH_INTERVAL,

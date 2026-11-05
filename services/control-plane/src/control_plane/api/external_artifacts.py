@@ -347,6 +347,7 @@ def build_external_artifacts_router() -> APIRouter:
                 snapshots=snapshots,
                 workspace_store=workspace_store,
                 artifacts=store,
+                record_use=True,
             )
         except WorkspacePermissionError:
             # 元数据行在、内容读不动是权限问题(服务端配置),不是「不存在」——

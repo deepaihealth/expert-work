@@ -831,6 +831,8 @@ def build_sessions_router() -> APIRouter:
                     snapshots=snapshots,
                     workspace_store=workspace_store,
                     artifacts=artifacts,
+                    # B-63 —— 平台运维跨租户查看不算这个租户在用。
+                    record_use=scope.tenant_id == request.state.principal.tenant_id,
                 )
         except WorkspacePermissionError as exc:
             # 元数据行存在,内容读不动是权限问题(服务端配置),不是"这个 artifact

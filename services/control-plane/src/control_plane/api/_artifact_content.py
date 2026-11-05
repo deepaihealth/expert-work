@@ -30,7 +30,8 @@ B 的那条产物上(B 有 v2 就下发 B 的 v2,没有就 404)。今天建会�
 「500 权限 / 413 太大 / 404 不在」翻译照用,**不**退回去读工作区里的当前文件。
 
 **记一次使用**(B-63):字节读到之后记这一版的 ``last_used_at``(每版每天最多写一次),三个
-下载端点都经过这里。产物的保留期从最后一次使用算起。
+下载端点都经过这里。产物的保留期从最后一次使用算起。平台运维跨租户查看(系统管理员切到别的
+租户)不是这个租户在用,调用方传 ``record_use=False``,不记。
 """
 
 from __future__ import annotations
@@ -103,8 +104,10 @@ async def read_version_bytes(
     snapshots: ArtifactSnapshotStore | None,
     workspace_store: WorkspaceStore,
     artifacts: ArtifactStore,
+    record_use: bool,
 ) -> bytes:
-    """读一版的字节:有副本读副本,B-235 之前的版本读工作区路径;读到了记一次使用(B-63)。"""
+    """读一版的字节:有副本读副本,B-235 之前的版本读工作区路径;读到了且 ``record_use`` 时记
+    一次使用(B-63)。"""
     if version.snapshot_key is not None:
         if snapshots is None:
             msg = "artifact snapshot store is not configured"
@@ -116,7 +119,8 @@ async def read_version_bytes(
         data = await workspace_store.read_file(
             tenant_id=tenant_id, user_id=user_id, path=version.path_in_workspace
         )
-    await _note_version_used(artifacts, version)
+    if record_use:
+        await _note_version_used(artifacts, version)
     return data
 
 
@@ -124,6 +128,8 @@ async def _note_version_used(artifacts: ArtifactStore, version: ArtifactVersion)
     """B-63 —— 记不上只打 warning、不影响这次下载:少记一次的后果是这一版按上一次使用的
     时间到期,不会早于改动之前(按登记时间)的到期日。"""
     try:
-        await artifacts.touch_version(version_id=version.id, now=datetime.now(UTC))
+        await artifacts.touch_version(
+            version_id=version.id, tenant_id=version.tenant_id, now=datetime.now(UTC)
+        )
     except Exception:
         logger.warning("artifact.touch_failed version=%s", version.id, exc_info=True)

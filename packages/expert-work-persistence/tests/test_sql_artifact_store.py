@@ -820,11 +820,60 @@ async def test_touch_version_writes_at_most_once_a_day(sql_store: SqlStoreFixtur
             created_in_thread="t",
         )
         now = datetime.now(UTC)
-        assert await store.touch_version(version_id=v.id, now=now) is True
-        assert await store.touch_version(version_id=v.id, now=now + timedelta(hours=23)) is False
+        t = v.tenant_id
+        assert await store.touch_version(version_id=v.id, tenant_id=uuid4(), now=now) is False
+        assert await store.touch_version(version_id=v.id, tenant_id=t, now=now) is True
+        later = now + timedelta(hours=23)
+        assert await store.touch_version(version_id=v.id, tenant_id=t, now=later) is False
         (row,) = await store.list_versions_by_artifact(artifact_id=v.artifact_id)
         assert row.last_used_at == now
-        assert await store.touch_version(version_id=v.id, now=now + timedelta(days=1, minutes=1))
-        assert await store.touch_version(version_id=uuid4(), now=now) is False
+        next_day = now + timedelta(days=1, minutes=1)
+        assert await store.touch_version(version_id=v.id, tenant_id=t, now=next_day)
+        assert await store.touch_version(version_id=uuid4(), tenant_id=t, now=now) is False
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_a_sub_agent_version_lives_on_the_parent_runs_conversation(
+    sql_store: SqlStoreFixture,
+) -> None:
+    """B-63 —— 子代的 run id 从不落 ``agent_run``:按它登记的版本没有会话时钟,200 天前登记就
+    到期;按父 run id 登记(``save_artifact`` 现在的写法)就跟着会话最近的 run 续命。"""
+    store, engine = sql_store
+    try:
+        clock = _ArtifactClock(store, engine)
+        tenant, thread, parent_run = uuid4(), uuid4(), uuid4()
+        await clock.run(run_id=parent_run, tenant_id=tenant, thread_id=thread, days_ago=200)
+        await clock.run(run_id=uuid4(), tenant_id=tenant, thread_id=thread, days_ago=3)
+        on_child = await clock.versions(
+            tenant_id=tenant, name="child.md", ages_days=[200], created_in_thread=str(uuid4())
+        )
+        on_parent = await clock.versions(
+            tenant_id=tenant, name="parent.md", ages_days=[200], created_in_thread=str(parent_run)
+        )
+
+        assert await clock.expired({on_child, on_parent}) == {(on_child, 1)}
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_a_run_of_another_tenant_never_keeps_a_version(
+    sql_store: SqlStoreFixture,
+) -> None:
+    """run → 会话这一跳只认同租户:``created_in_thread`` 指向别的租户的 run(那个会话最近还在
+    跑)不算。"""
+    store, engine = sql_store
+    try:
+        clock = _ArtifactClock(store, engine)
+        tenant, other = uuid4(), uuid4()
+        foreign_run, foreign_thread = uuid4(), uuid4()
+        await clock.run(run_id=foreign_run, tenant_id=other, thread_id=foreign_thread, days_ago=1)
+        version = await clock.versions(
+            tenant_id=tenant, name="x.md", ages_days=[200], created_in_thread=str(foreign_run)
+        )
+
+        assert await clock.expired({version}) == {(version, 1)}
     finally:
         await engine.dispose()

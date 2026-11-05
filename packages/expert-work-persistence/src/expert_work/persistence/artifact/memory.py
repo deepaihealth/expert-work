@@ -358,9 +358,9 @@ class InMemoryArtifactStore(ArtifactStore):
             ExpiredArtifactVersion(version=v, retention_days=default_days) for _, v in due[:limit]
         ]
 
-    async def touch_version(self, *, version_id: UUID, now: datetime) -> bool:
+    async def touch_version(self, *, version_id: UUID, tenant_id: UUID, now: datetime) -> bool:
         for index, v in enumerate(self._versions):
-            if v.id != version_id:
+            if v.id != version_id or v.tenant_id != tenant_id:
                 continue
             if v.last_used_at is not None and v.last_used_at >= now - TOUCH_INTERVAL:
                 return False

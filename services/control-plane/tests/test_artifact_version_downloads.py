@@ -615,3 +615,29 @@ async def test_external_expired_version_keeps_the_code_and_says_why(
     assert "retention period" in expired.json()["error"]["message"]  # type: ignore[attr-defined]
     assert never_kept.json()["error"]["code"] == "ARTIFACT_VERSION_MISMATCH"  # type: ignore[attr-defined]
     assert "retention" not in never_kept.json()["error"]["message"]  # type: ignore[attr-defined]
+
+
+@pytest.mark.asyncio
+async def test_a_platform_admin_drilling_into_a_tenant_is_not_a_use(
+    console: tuple[_World, UUID],
+) -> None:
+    """B-63 —— 平台运维跨租户下载(系统管理员切到别的租户)不算这个租户的使用,不续命;
+    租户自己的人下载才算。"""
+    from tests.auth_fixtures import grant_system_admin
+
+    world, user_id = console
+    await _save(world, user_id=user_id, agent_key="a-1", content=b"AAA")
+    artifact_id = await _console_artifact_id(world.client)
+    admin = await grant_system_admin(world.client)
+
+    drill_in = await world.client.get(
+        "/v1/artifacts/download",
+        params={"artifact_id": artifact_id, "tenant_id": str(_TENANT), "user_id": str(user_id)},
+        headers=admin,
+    )
+
+    assert drill_in.status_code == 200, drill_in.text
+    assert [v.last_used_at for v in _versions(world)] == [None]
+    own = await world.client.get("/v1/artifacts/download", params={"artifact_id": artifact_id})
+    assert own.status_code == 200, own.text
+    assert [v.last_used_at is not None for v in _versions(world)] == [True]

@@ -325,9 +325,9 @@ class ArtifactStore(abc.ABC):
         """
 
     @abc.abstractmethod
-    async def touch_version(self, *, version_id: UUID, now: datetime) -> bool:
-        """B-63 —— 记一次下载:``last_used_at = now``,只在上次记的时间为空或早于
-        ``now - TOUCH_INTERVAL`` 时才写(每版每天最多一次)。``True`` = 真的写了。"""
+    async def touch_version(self, *, version_id: UUID, tenant_id: UUID, now: datetime) -> bool:
+        """B-63 —— 记一次下载:``last_used_at = now``,只在这一版属于 ``tenant_id``、且上次记的
+        时间为空或早于 ``now - TOUCH_INTERVAL`` 时才写(每版每天最多一次)。``True`` = 真的写了。"""
 
     @abc.abstractmethod
     async def list_versions_by_artifact(self, *, artifact_id: UUID) -> list[ArtifactVersion]:

@@ -711,11 +711,14 @@ async def test_touch_version_writes_at_most_once_a_day() -> None:
     a = await _seed_versions(store, name="t.md", ages_days=[5])
     version = (await store.list_versions_by_artifact(artifact_id=a))[0]
     now = datetime.now(UTC)
+    t = version.tenant_id
 
-    assert await store.touch_version(version_id=version.id, now=now) is True
-    assert await store.touch_version(version_id=version.id, now=now + timedelta(hours=23)) is False
+    assert await store.touch_version(version_id=version.id, tenant_id=uuid4(), now=now) is False
+    assert await store.touch_version(version_id=version.id, tenant_id=t, now=now) is True
+    later = now + timedelta(hours=23)
+    assert await store.touch_version(version_id=version.id, tenant_id=t, now=later) is False
     after = (await store.list_versions_by_artifact(artifact_id=a))[0]
     assert after.last_used_at == now
     next_day = now + timedelta(days=1, minutes=1)
-    assert await store.touch_version(version_id=version.id, now=next_day) is True
-    assert await store.touch_version(version_id=uuid4(), now=next_day) is False
+    assert await store.touch_version(version_id=version.id, tenant_id=t, now=next_day) is True
+    assert await store.touch_version(version_id=uuid4(), tenant_id=t, now=next_day) is False
