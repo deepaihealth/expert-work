@@ -372,3 +372,27 @@ def conversation_work_prefix(view: WorkspaceView) -> str:
     if not view.per_conversation:
         return ""
     return f"{THREADS_DIR}/{view.conv_id}/{CONVERSATION_WORK_DIR}/"
+
+
+def display_name(name: str) -> str:
+    """B-243 —— 文件名 / 路径写进给模型看的文本之前过这一道, 保证它能按 UTF-8 编码。
+
+    宿主列目录(``os.listdir`` / ``os.fwalk``)按 ``surrogateescape`` 解码:沙箱里造出的
+    非 UTF-8 字节(``touch $'bad\\xff.txt'``)成了孤立代理 ``\\udcff``, 原样放进提示词或工具
+    结果, 整条模型请求在序列化 JSON 那一步就 ``UnicodeEncodeError``。这里把每个坏字节写成
+    ``\\xNN``(``bad\\xff.txt``), 其余字符原样 —— 正是 bash ``$'...'`` 的写法, 模型照抄进
+    bash 就能找到这个文件。
+
+    **只用于显示**:``read_file`` 之类收到的 ``bad\\xff.txt`` 是字面反斜杠, 打不开原文件
+    (平台不做显示名 → 真实名的反查)。
+    """
+    if not any("\ud800" <= ch <= "\udfff" for ch in name):
+        return name
+    return "".join(_escape_surrogate(ch) if "\ud800" <= ch <= "\udfff" else ch for ch in name)
+
+
+def _escape_surrogate(ch: str) -> str:
+    code = ord(ch)
+    if 0xDC80 <= code <= 0xDCFF:  # surrogateescape 编进来的那个原始字节
+        return f"\\x{code - 0xDC00:02x}"
+    return f"\\u{code:04x}"

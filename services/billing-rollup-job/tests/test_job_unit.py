@@ -449,3 +449,124 @@ async def test_excludes_rows_outside_month(tenants, usage, rates, ledger) -> Non
     rows = await ledger.list_for_tenant(tenant_id=tenant, month=MONTH)
     assert len(rows) == 1
     assert rows[0].input_tokens == 100  # July row excluded
+
+
+# ---------------------------------------------------------------------------
+# (g) B-185 — prompt-cache tokens are billed once, per the provider's usage shape
+# ---------------------------------------------------------------------------
+
+
+async def _add_cache_rate(
+    rates: InMemoryModelRateCardStore,
+    *,
+    provider: str,
+    model: str,
+    input_per_mtok: int,
+    cache_read_per_mtok: int,
+    cache_creation_per_mtok: int = 0,
+) -> None:
+    await rates.create(
+        upsert=ModelRateCardUpsert(
+            provider=provider,
+            model=model,
+            input_per_mtok_micros=input_per_mtok,
+            output_per_mtok_micros=0,
+            cache_read_per_mtok_micros=cache_read_per_mtok,
+            cache_creation_per_mtok_micros=cache_creation_per_mtok,
+        ),
+        actor_id="test",
+    )
+
+
+@pytest.mark.asyncio
+async def test_openai_shape_input_includes_cache_hits_billed_once(
+    tenants, usage, rates, ledger
+) -> None:
+    # OpenAI-compatible vendors report prompt_tokens INCLUDING
+    # prompt_tokens_details.cached_tokens, and the usage writer stores them as
+    # input_tokens / cache_read_tokens as-is. The real row behind B-185:
+    # input 12,302 of which 10,240 were cache hits.
+    tenant = await _add_tenant(tenants, plan=TenantPlan.PRO)
+    await _add_usage(
+        usage,
+        tenant_id=tenant,
+        model="qwen3.6-plus",
+        provider="qwen",
+        observed_at=datetime(2026, 6, 10, tzinfo=UTC),
+        input_tokens=12_302,
+        cache_read_tokens=10_240,
+    )
+    await _add_cache_rate(
+        rates,
+        provider="qwen",
+        model="qwen3.6-plus",
+        input_per_mtok=2_000_000,
+        cache_read_per_mtok=400_000,
+    )
+    await _job(tenants, usage, rates, ledger).run_once(month=MONTH)
+    rows = await ledger.list_for_tenant(tenant_id=tenant, month=MONTH)
+    # (12,302 - 10,240) * 2 + 10,240 * 0.4 = 4,124 + 4,096 = 8,220 micro-元
+    # (the double-counting formula gave 12,302 * 2 + 4,096 = 28,700).
+    assert rows[0].base_cost_micros == 8_220
+    # The ledger still records the raw token counts.
+    assert rows[0].input_tokens == 12_302
+    assert rows[0].cache_read_tokens == 10_240
+
+
+@pytest.mark.asyncio
+async def test_openai_shape_cache_exceeding_input_never_goes_negative(
+    tenants, usage, rates, ledger
+) -> None:
+    # Same clamp as the console's cost.ts: max(0, input - cache_read).
+    tenant = await _add_tenant(tenants, plan=TenantPlan.PRO)
+    await _add_usage(
+        usage,
+        tenant_id=tenant,
+        model="qwen3.6-plus",
+        provider="qwen",
+        observed_at=datetime(2026, 6, 10, tzinfo=UTC),
+        input_tokens=100,
+        cache_read_tokens=1_000,
+    )
+    await _add_cache_rate(
+        rates,
+        provider="qwen",
+        model="qwen3.6-plus",
+        input_per_mtok=2_000_000,
+        cache_read_per_mtok=400_000,
+    )
+    await _job(tenants, usage, rates, ledger).run_once(month=MONTH)
+    rows = await ledger.list_for_tenant(tenant_id=tenant, month=MONTH)
+    assert rows[0].base_cost_micros == 400  # 1,000 * 0.4; uncached part clamps to 0
+
+
+@pytest.mark.asyncio
+async def test_anthropic_shape_input_excludes_cache_so_nothing_is_subtracted(
+    tenants, usage, rates, ledger
+) -> None:
+    # Anthropic's usage.input_tokens EXCLUDES cache_read_input_tokens and
+    # cache_creation_input_tokens (the platform adapter stores them verbatim),
+    # so all three are separate, additive buckets.
+    tenant = await _add_tenant(tenants, plan=TenantPlan.PRO)
+    await _add_usage(
+        usage,
+        tenant_id=tenant,
+        model="claude-opus-4-8",
+        provider="anthropic",
+        observed_at=datetime(2026, 6, 10, tzinfo=UTC),
+        input_tokens=2_062,
+        cache_read_tokens=10_240,
+        cache_creation_tokens=1_000,
+    )
+    await _add_cache_rate(
+        rates,
+        provider="anthropic",
+        model="claude-opus-4-8",
+        input_per_mtok=3_000_000,
+        cache_read_per_mtok=300_000,
+        cache_creation_per_mtok=3_750_000,
+    )
+    await _job(tenants, usage, rates, ledger).run_once(month=MONTH)
+    rows = await ledger.list_for_tenant(tenant_id=tenant, month=MONTH)
+    # 2,062 * 3 + 10,240 * 0.3 + 1,000 * 3.75 = 6,186 + 3,072 + 3,750 = 13,008
+    assert rows[0].base_cost_micros == 13_008

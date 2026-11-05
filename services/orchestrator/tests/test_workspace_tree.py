@@ -238,3 +238,57 @@ async def test_block_never_reads_file_contents() -> None:
         store, tenant_id=_TENANT, user_id=_USER, view=WorkspaceView(agent_key="k")
     )
     assert "render_plan.py" in block
+
+
+# ---------------------------------------------------------------------------
+# B-243 —— 非 UTF-8 文件名
+# ---------------------------------------------------------------------------
+
+#: 沙箱里 ``touch $'bad\xff.txt'`` 造出来的名字。宿主 ``os.fwalk`` / ``os.listdir`` 按
+#: ``surrogateescape`` 解码, 那个字节成了孤立代理 ``\udcff`` —— UTF-8 编不出来, 整条模型
+#: 请求在 httpx 序列化 JSON 那一步就炸。
+_NON_UTF8_NAME = "bad\udcff.txt"
+
+
+def test_non_utf8_name_is_what_the_listing_actually_yields() -> None:
+    import os
+
+    assert os.fsdecode(b"bad\xff.txt") == _NON_UTF8_NAME
+
+
+def test_block_with_a_non_utf8_name_still_encodes_as_utf8() -> None:
+    block = render_workspace_block(
+        [_entry(_NON_UTF8_NAME), _entry("out\udcfe/report.md"), _entry("style/plan.md")]
+    )
+    block.encode("utf-8")  # 修之前: UnicodeEncodeError (surrogates not allowed)
+    # 坏字节照 bash ``$'...'`` 的写法显示, 其余部分原样 —— 模型认得出是哪个文件。
+    assert "bad\\xff.txt" in block
+    assert "out\\xfe/" in block
+    assert "style/plan.md" not in block and "plan.md" in block  # 正常名字逐字不变
+
+
+def test_conversation_block_with_non_utf8_names_still_encodes_as_utf8() -> None:
+    from orchestrator.tools.workspace_tree import render_conversation_block
+
+    copied = "d\udcfe/a.md"
+    block = render_conversation_block(
+        [_entry(_NON_UTF8_NAME), _entry(copied)],
+        [_entry(copied), _entry("\udcff名.md")],
+        pristine=frozenset({copied}),
+        manifest=frozenset({copied}),
+        seed_skipped=["big\udcff"],
+    )
+    block.encode("utf-8")
+    assert "bad\\xff.txt" in block
+    assert "unchanged copy of /agent/d\\xfe/" in block
+    assert "\\xff名.md" in block
+    assert "/agent/big\\xff/" in block
+
+
+def test_display_name_escapes_only_surrogates() -> None:
+    from orchestrator.tools.workspace_paths import display_name
+
+    assert display_name("张女士_报告.md") == "张女士_报告.md"  # 合法 UTF-8 逐字不变
+    assert display_name("a\udce4\udcb8b") == "a\\xe4\\xb8b"  # 截断的多字节序列:逐字节
+    assert display_name("x\ud800") == "x\\ud800"  # 不是 surrogateescape 来的代理也编得出
+    display_name("a\udce4\udcb8b\ud800").encode("utf-8")
