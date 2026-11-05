@@ -261,6 +261,43 @@ async def test_claimed_run_carries_document_names_into_graph_input(
 
 
 @pytest.mark.asyncio
+async def test_claimed_run_carries_original_document_names_into_graph_input(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """B-275 —— 换过名的附件,原名随 ``enqueued_input`` 存下、出队时读回来:queue 模式下
+    模型看到的那一行与流式一字不差(这段回读有静默丢附件的前科)。"""
+    spawns: list[dict] = []
+
+    async def _fake_run_agent(**kw):
+        spawns.append(kw)
+
+    monkeypatch.setattr(worker_module, "run_agent", _fake_run_agent)
+
+    store = InMemoryRunStore()
+    runtime = _FakeRuntime(store)
+    run_id, tenant, thread = uuid4(), uuid4(), uuid4()
+    await runtime.run_manager.enqueue(
+        run_id=run_id,
+        thread_id=thread,
+        tenant_id=tenant,
+        enqueued_input={
+            "input": "q",
+            "image_refs": [],
+            "untrusted_content": [],
+            "document_names": ["uploads/report-1a2b3c4d.pdf"],
+            "document_original_names": {"uploads/report-1a2b3c4d.pdf": "report.pdf"},
+        },
+    )
+
+    assert await _worker(store, runtime).run_once() == 1
+    await asyncio.sleep(0)
+    content = spawns[0]["graph_input"]["messages"][1].content
+    assert content == (
+        "q\n\n[file attached: uploads/report-1a2b3c4d.pdf (original name: report.pdf)]"
+    )
+
+
+@pytest.mark.asyncio
 async def test_claimed_run_passes_prompt_inputs_to_run_agent(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

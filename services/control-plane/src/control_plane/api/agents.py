@@ -66,6 +66,7 @@ from control_plane.api.uploads import (
     LandingAccount,
     copy_document_into_thread,
     is_safe_document_upload_id,
+    original_document_name,
 )
 from control_plane.audit import emit
 from control_plane.auth.abac import ResourceAttrs
@@ -391,8 +392,8 @@ async def resolve_external_files(
     uploads_store: UserUploadStore,
     threads: ThreadMetaStore,
     copier: LandingAccount,
-) -> tuple[list[str], list[str]]:
-    """``files[]`` → 内部 ``(image_refs, document_names)``(对外附件模型统一)。
+) -> tuple[list[str], list[str], dict[str, str]]:
+    """``files[]`` → 内部 ``(image_refs, document_names, 原名表)``(对外附件模型统一)。
 
     对外附件模型统一(spec 2026-08-17,Task 3)—— ``files[]`` 的每一条只带一个
     ``upload_id``,按 :class:`UserUploadStore` 查表分流成内部 ``image_refs`` /
@@ -418,9 +419,13 @@ async def resolve_external_files(
     会话自己的目录复制进本会话的 ``uploads/``(:func:`~control_plane.api.uploads.
     copy_document_into_thread`,像一次上传一样记账与审计),``document_names`` 里写实际落地的
     名字。登记行的会话已经不在(purge 不删登记行):404 ``UPLOAD_SESSION_DELETED``。
+
+    B-275 —— 第三项:落地时换过名(同名不同内容,``<原名>-<内容 sha256 前 8 位>``)的
+    document → 原名,让 ``[file attached: …]`` 那一行把原名也告诉模型;没换过名的不进表。
     """
     image_refs: list[str] = []
     document_names: list[str] = []
+    original_names: dict[str, str] = {}
     for item in files:
         uid = parse_upload_id(item.upload_id)
         if uid is None:
@@ -449,13 +454,16 @@ async def resolve_external_files(
                     copier=copier,
                 )
             document_names.append(ref)
+            original = original_document_name(ref, row.sha256)
+            if original is not None:
+                original_names[ref] = original
     if len(image_refs) > MAX_RUN_IMAGE_REFS:
         raise ExternalScopeError(
             "TOO_MANY_IMAGE_REFS",
             f"files[] 里的图片不能超过 {MAX_RUN_IMAGE_REFS} 张",
             422,
         )
-    return image_refs, document_names
+    return image_refs, document_names, original_names
 
 
 #: B-262 review —— 跨会话复制附件特有的两种失败;其余状态码沿用上传端点那张表。
@@ -1794,7 +1802,7 @@ def build_agents_router() -> APIRouter:
         # ``:edit`` 端点复用,所以住在模块级而不是这个函数体里。
         uploads_store: UserUploadStore = request.app.state.user_upload_store
         try:
-            image_refs, document_names = await resolve_external_files(
+            image_refs, document_names, original_names = await resolve_external_files(
                 files=payload.files,
                 tenant_id=tenant_id,
                 end_user_id=end_user_id,
@@ -1826,6 +1834,7 @@ def build_agents_router() -> APIRouter:
             untrusted_content=payload.untrusted_content,
             inputs=payload.inputs,
             document_names=document_names,
+            document_original_names=original_names,
         )
         try:
             return await spawn_run(

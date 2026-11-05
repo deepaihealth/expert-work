@@ -147,6 +147,28 @@ def _tagged_name(workspace_path: str, ext: str, tag: str) -> str:
     return f"{workspace_path[: len(workspace_path) - len(ext)]}-{tag}{ext}"
 
 
+def original_document_name(ref: str, sha256_hex: str | None) -> str | None:
+    """B-275 —— :func:`_tagged_name` 的反函数:换过名的上传(``uploads/report-3f9a1c2b.pdf``)
+    回它本来的名字(叶子 ``report.pdf``);没换过名、认不出,回 ``None``。
+
+    只认「后缀 = 这份内容 sha256 的前 8 位」:用户自己起的名字里碰巧有 8 位十六进制
+    (``report-deadbeef.pdf``)不是平台换的,不能当成换过名。没记 sha256 的老登记行(B-271
+    之前)一律 ``None``,不猜。随机后缀(内容后缀那个名字也被占了,实际碰不到)认不出,同样
+    ``None`` —— 那一行就照旧只写实际名。
+    """
+    if not sha256_hex:
+        return None
+    leaf = ref.rsplit("/", 1)[-1]
+    marker = f"-{sha256_hex[:_NAME_TAG_HEX_LEN]}"
+    at = leaf.rfind(marker)
+    if at <= 0:
+        return None
+    ext = leaf[at + len(marker) :]
+    if ext and ext != PurePosixPath(leaf).suffix:
+        return None
+    return f"{leaf[:at]}{ext}"
+
+
 async def _same_bytes(
     workspace_store: WorkspaceStore, *, tenant_id: UUID, user_id: UUID, path: str, raw: bytes
 ) -> bool:

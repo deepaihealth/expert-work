@@ -56,7 +56,8 @@ Webhook 端点（一个接收地址加上它订阅的事件类型）只能由租
 | 事件 | 出现时机 | `event_id` 的格式 |
 |---|---|---|
 | `run.completed` | run 以 `success` 或 `incomplete` 结束 | `run:{run_id}` |
-| `run.failed` | run 以其余最终状态结束：`error`、`interrupted`，以及停在人工审批处的 `paused` | `run:{run_id}` |
+| `run.paused` | run 停在人工审批处等待决策，`status` 为 `paused` | `run:{run_id}` |
+| `run.failed` | run 以 `error` 或 `interrupted` 结束 | `run:{run_id}` |
 | `approval.requested` | 出现一条等待人工决策的审批 | `approval:{approval_id}` |
 | `artifact.saved` | Agent 登记了一个产物，或者给已有产物登记了新版本 | `artifact:{artifact_id}:v{version}` |
 | `skill_promote.requested` | Agent 申请把自己的一个技能共享给整个租户，等待租户管理员审核 | `skill_promote:{request_id}` |
@@ -64,10 +65,10 @@ Webhook 端点（一个接收地址加上它订阅的事件类型）只能由租
 
 端点只会收到它订阅的事件类型。平台后续可能新增事件类型，已有端点的订阅不会因此改变。
 
-::: warning `run.failed` 也包括等待审批的 run
-`run.failed` 覆盖 `success` 与 `incomplete` 之外的全部最终状态，其中包括 `paused`：run 停在人工审批处等待决策，并没有失败。
+::: warning 等待审批的 run 只发 `run.paused`
+run 停在人工审批处时，平台发 `run.paused`，不发 `run.failed`。只订阅 `run.failed` 的端点收不到暂停的通知，平台也不会给已有端点自动加上 `run.paused`。
 
-只凭事件名把这一轮标成失败，会把等待审批的对话误报成失败。先读 `payload` 里的 `status`，见 [11.5](#run-completed-与-run-failed)。
+需要得知 run 在等待审批的，在端点的事件类型里加上 `run.paused` 或 `approval.requested`，见 [11.5](#run-paused)。
 :::
 
 ::: warning `run.completed` 不代表要做的事已经做成
@@ -78,8 +79,8 @@ Webhook 端点（一个接收地址加上它订阅的事件类型）只能由租
 
 各事件的发送规则：
 
-- `run.completed` 与 `run.failed`：每个 run 只发一次，`status` 是平台生成这条通知时的状态。`paused` 的 run 之后因同一会话发起新一轮而变为 `interrupted` 时，不会再发通知（见 [4.2 决策之前发起新一轮](./run-control#决策之前发起新一轮)）；审批决策之后的续跑使用新的 `run_id`，它结束时另发一条。
-- 这两个事件覆盖租户内（或端点限定的那个 Agent 上）的全部 run，包括不是由这个调用方发起的 run，例如管理控制台里的调试对话。收到不认识的 `run_id` 时直接返回 2xx 并忽略。
+- `run.completed`、`run.paused` 与 `run.failed`：每个端点对同一个 run 最多收到其中一条，`status` 是平台生成这条通知时的状态。端点收到过某个 run 的 `run.paused` 之后，这个 run 因同一会话发起新一轮而变为 `interrupted` 时，不会再发通知（见 [4.2 决策之前发起新一轮](./run-control#决策之前发起新一轮)）；没有订阅 `run.paused` 的端点，这时收到一条 `status` 为 `interrupted` 的 `run.failed`。审批决策之后的续跑使用新的 `run_id`，它结束时另发一条。
+- 这三个事件覆盖租户内（或端点限定的那个 Agent 上）的全部 run，包括不是由这个调用方发起的 run，例如管理控制台里的调试对话。收到不认识的 `run_id` 时直接返回 2xx 并忽略。
 - `approval.requested`：只针对平台检查时仍在等待决策的审批。审批在发起后十几秒内就被决定时，可能不会产生这条通知。
 - `artifact.saved`：只发给没有限定智能体范围的端点。平台检查时只看每个产物的最新版本，两次检查之间连续登记的多个版本只通知最后一个。
 
@@ -148,7 +149,7 @@ Webhook 端点（一个接收地址加上它订阅的事件类型）只能由租
 |---|---|---|
 | `run_id` | string（UUID） | 这次 run 的标识 |
 | `thread_id` | string（UUID） | 这次 run 所属的会话，与对外接口里的 `session_id` 同值 |
-| `status` | string | run 的最终状态，取值与 [5.4 run 列表](./query#status-的取值) 的 `status` 相同。`run.completed` 只带 `success` 或 `incomplete`，`run.failed` 带其余最终状态 |
+| `status` | string | run 的最终状态，取值与 [5.4 run 列表](./query#status-的取值) 的 `status` 相同。`run.completed` 只带 `success` 或 `incomplete`，`run.failed` 带其余最终状态（`error`、`interrupted`）；`paused` 只出现在 [`run.paused`](#run-paused) 里 |
 | `completed` | boolean \| null | 要做的事有没有做成，与 5.4 run 列表的同名字段相同。`null` 表示没有记录，多见于失败、被取消的 run，不要当成 `false` |
 | `exit_reason` | string \| null | run 从哪个出口结束，取值与 5.4 run 列表的同名字段相同。`null` 的含义与 `completed` 相同 |
 | `unresolved_failures` | array \| null | 到 run 结束时仍未解决的工具失败，最多 20 条，元素结构见下表。`[]` 表示没有；`null` 表示没有记录，多见于失败、被取消的 run，以及这次变更之前结束的 run（这时 `completed` 可能有值），按「不清楚」处理，不要当成 `[]` |
@@ -164,12 +165,16 @@ Webhook 端点（一个接收地址加上它订阅的事件类型）只能由租
 
 元素里只有工具名和失败类型，不含调用参数、文件路径或工具输出。它适合展示给排查问题的内部人员，不建议直接展示给终端用户。
 
-下面是一个停在人工审批处的 run 发出的 `run.failed`。它没有失败，等待的审批见同一会话的 `approval.requested`。
+### `run.paused`
+
+run 停在人工审批处、等待决策时发出。它不表示失败：等待的审批见同一会话的 `approval.requested`，下达决策见 [4.2 审批决策](./run-control#_4-2-审批决策)。
+
+`payload` 的字段与 [`run.completed` 与 `run.failed`](#run-completed-与-run-failed) 相同，`status` 为 `paused`，`completed` 为 `false`，`exit_reason` 为 `approval_pending`。
 
 ```json [请求体]
 {
   "event_id": "run:67262572-5470-41a4-800d-592762ec679d",
-  "event_type": "run.failed",
+  "event_type": "run.paused",
   "occurred_at": "2026-10-28T06:31:52.104233+00:00",
   "payload": {
     "completed": false,
@@ -443,7 +448,7 @@ X-Expert-Work-Signature-256: sha256=4b6f5bb6a3bc54b2baafd33dbf2ffdbdee6d8a969d2b
 
 新建端点、给端点增加事件类型、停用后重新启用时，平台会把最近一批已经发生、而这个端点还没收到过的同类事件也发过来：
 
-- `run.completed` 与 `run.failed`：最近结束的一批 run。
+- `run.completed`、`run.paused` 与 `run.failed`：最近结束或暂停的一批 run。
 - `approval.requested`：仍在等待决策的审批。
 - `skill_promote.requested`：仍在等待审核的共享申请。
 - `artifact.saved`：每个现存产物的最新版本。
@@ -455,7 +460,7 @@ X-Expert-Work-Signature-256: sha256=4b6f5bb6a3bc54b2baafd33dbf2ffdbdee6d8a969d2b
 平台按批并发发送通知，同一租户同时最多 4 个请求，到达顺序不代表事件的发生顺序：
 
 - 重试的通知会晚于之后才发生的事件到达。
-- 同一次暂停产生的 `approval.requested` 与 `run.failed` 先后不定。
+- 同一次暂停产生的 `approval.requested` 与 `run.paused` 先后不定。
 - `occurred_at` 也不能用来排序：同一批生成的通知，这个时间相同。
 
 需要某个 run 的最新状态时，查 [5.4 run 列表](./query#_5-4-run-列表)，不要根据通知的到达顺序推断。
@@ -472,7 +477,7 @@ X-Expert-Work-Signature-256: sha256=4b6f5bb6a3bc54b2baafd33dbf2ffdbdee6d8a969d2b
 
 通知只作提示，原因有四点：它比 `end` 晚到；它可能重复到达；重试用尽之后它会丢失；它的 `status` 是生成通知时的状态，之后的变化不会再通知。
 
-收到 `run.completed` 或 `run.failed` 之后，建议这样取结果：
+收到 `run.completed`、`run.paused` 或 `run.failed` 之后，建议这样取结果：
 
 1. 校验签名，按 `event_id` 去重。
 2. 按 `run_id` 在调用方自己的记录里找到发起这次 run 时用的 `agent_code` 与 `user_id`。找不到时说明这个 run 不是这个调用方发起的，忽略即可。

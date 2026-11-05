@@ -119,6 +119,7 @@ def _backoff_seconds(next_attempt: int) -> int:
 _EVENT_TITLES: dict[str, str] = {
     "run.completed": "运行完成",
     "run.failed": "运行失败",
+    "run.paused": "运行已暂停\N{FULLWIDTH COMMA}等待审批",
     "approval.requested": "审批待处理",
     "artifact.saved": "产物已保存",
     "skill_promote.requested": "技能晋升申请待审",
@@ -128,6 +129,22 @@ _EVENT_TITLES: dict[str, str] = {
 #: B-226 ⑥ — the ``run.completed`` title when the run finished without getting
 #: the work done: the console's orange-tag wording ("finished, not completed").
 _RUN_NOT_DONE_TITLE = "已结束\N{FULLWIDTH COMMA}未完成"
+
+
+def _run_event_type(status: RunStatus) -> WebhookEventType:
+    """The webhook event a run's terminal ``status`` fires.
+
+    B-230 —— a run stopped at a human approval (``PAUSED``) is waiting, not
+    failed: it gets its own ``run.paused`` rather than riding ``run.failed``
+    (integrators treated that as a failure). Endpoints subscribed to
+    ``run.failed`` only stop hearing about pauses — subscription is the
+    endpoint's own list, there is no "all events" mode to widen.
+    """
+    if status is RunStatus.SUCCESS:
+        return "run.completed"
+    if status is RunStatus.PAUSED:
+        return "run.paused"
+    return "run.failed"
 
 
 def _im_title(row: WebhookDeliveryRecord) -> str:
@@ -364,11 +381,9 @@ class WebhookDeliveryWorker:
         agent_cache: dict[UUID, str | None] = {}
         enqueued = 0
 
-        # run.completed / run.failed — one scan per terminal status.
+        # run.completed / run.paused / run.failed — one scan per terminal status.
         for status in TERMINAL_RUN_STATUSES:
-            event_type: WebhookEventType = (
-                "run.completed" if status is RunStatus.SUCCESS else "run.failed"
-            )
+            event_type = _run_event_type(status)
             with _bypass_rls():
                 runs = await self._runs.list_all_tenants(status=status, limit=self._scan_limit)
             for run in runs:
@@ -390,8 +405,10 @@ class WebhookDeliveryWorker:
                         # every existing subscriber), with ``status: incomplete``.
                         "status": external_run_status(run.status, run.exit_reason),
                         # None = no record (usually error / interrupted); a
-                        # paused run voided by a new turn is run.failed /
-                        # interrupted but keeps false / approval_pending.
+                        # paused run voided by a new turn is interrupted but
+                        # keeps false / approval_pending. An endpoint that got
+                        # its run.paused never hears of that (same event_id);
+                        # one subscribed to run.failed only gets it then.
                         "completed": run.completed,
                         "exit_reason": run.exit_reason,
                         # Why not done: ``[{tool, kind}]``; None = no record.

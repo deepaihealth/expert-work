@@ -44,4 +44,6 @@ def graph_input_from_enqueued(built: Any, payload: dict[str, Any], run_id: UUID)
         inputs=payload.get("inputs") or {},
         run_id=run_id,
         document_names=list(payload.get("document_names") or []),
+        # B-275 —— 入队早于本字段的 run 没有这个键:照旧只写实际名。
+        document_original_names=dict(payload.get("document_original_names") or {}),
     )

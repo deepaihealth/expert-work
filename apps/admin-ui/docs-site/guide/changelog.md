@@ -22,6 +22,43 @@
 
 ## 12.2 变更记录
 
+### 等待审批的 run 改发 `run.paused` 通知
+
+| 项目 | 内容 |
+|---|---|
+| 日期 | 待发布 |
+| 摘要 | run 停在人工审批处时，Webhook 改发新事件 `run.paused`，不再发 `run.failed`。`run.failed` 只对应 `error` 与 `interrupted` |
+| 影响范围 | 订阅 `run.failed` 的 Webhook 端点与接收端，见 [11.3 事件一览](./webhooks#_11-3-事件一览) 与 [11.5 的 `run.paused`](./webhooks#run-paused) |
+| 调用方的改动 | 需要得知审批暂停的，请租户管理员在端点的事件类型里加上 `run.paused`，接收端按事件类型处理它。平台不会给已有端点自动加上这个事件 |
+
+#### 行为变化
+
+| 位置 | 以前 | 以后 |
+|---|---|---|
+| 停在人工审批处的 run | 发 `run.failed`，`payload` 的 `status` 为 `paused` | 发 `run.paused`，`payload` 的字段不变，`status` 仍为 `paused`。只发给订阅了 `run.paused` 的端点 |
+| 只订阅 `run.failed` 的端点 | 收到暂停的 run | 收不到暂停的 run。这个 run 之后因同一会话发起新一轮而作废时，收到一条 `status` 为 `interrupted` 的 `run.failed` |
+| 管理控制台的 Webhook 页面 | — | 事件类型可以选 `run.paused` |
+| IM 机器人格式的标题 | 运行失败 | 运行已暂停，等待审批 |
+
+已经按 `payload.status` 区分 `paused` 的接收端，加上 `run.paused` 订阅之后，原来的处理逻辑可以照常使用。
+
+### 换过名的文档告知 Agent 时附上原文件名
+
+| 项目 | 内容 |
+|---|---|
+| 日期 | 待发布 |
+| 摘要 | 同名、内容不同而换名保存的文档，平台在本轮消息里告知 Agent 实际文件名的同时，附上换名之前的文件名。Agent 给交付件起名时可以沿用原文件名，不再带上 `-<8 位字符>` 后缀 |
+| 影响范围 | 上传同名文档、或在 `files[]` 里引用别的会话上传的文档的调用方，见 [2.6 带图片和文档](./chat#第二步-在对话中携带)；读取 [5.3 历史消息](./query#_5-3-历史消息) 原文的调用方 |
+| 调用方的改动 | 一般不需要改动。为了交付件的名字自行去掉 `-<8 位字符>` 后缀的，可以评估是否保留这段处理。解析用户消息原文里附件行的，要认下面的新格式 |
+
+#### 行为变化
+
+| 位置 | 以前 | 以后 |
+|---|---|---|
+| 本轮消息里换过名的文档那一行 | `[file attached: uploads/report-3f9a1c2b.pdf]` | `[file attached: uploads/report-3f9a1c2b.pdf (original name: report.pdf)]` |
+| 本轮消息里没有换过名的文档那一行 | `[file attached: uploads/report.pdf]` | 不变 |
+| 发布之前的历史消息 | — | 不变，仍是以前的格式 |
+
 ### 排队与执行中的 run 新增开始时间和进度
 
 | 项目 | 内容 |

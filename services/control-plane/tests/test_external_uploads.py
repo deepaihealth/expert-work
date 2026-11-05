@@ -605,7 +605,7 @@ async def test_same_name_uploads_from_two_sessions_each_land_in_their_own_conver
         assert resp.content == raw
         assert name in resp.headers["content-disposition"]
 
-    _images, document_names = await resolve_external_files(
+    _images, document_names, originals = await resolve_external_files(
         files=[ExternalFileRef(upload_id=third["upload_id"])],
         tenant_id=ctx.tenant_id,
         end_user_id=rows[2].user_id,
@@ -615,10 +615,16 @@ async def test_same_name_uploads_from_two_sessions_each_land_in_their_own_conver
         copier=_copier(ctx),
     )
     assert document_names == [f"uploads/{renamed}"]
+    # B-275 —— 模型还要知道它原来叫什么(对接方按附件名给交付件起名)。
+    assert originals == {f"uploads/{renamed}": "report.pdf"}
     message = _build_human_message(
-        input_text="看一下", image_refs=[], supports_vision=False, document_names=document_names
+        input_text="看一下",
+        image_refs=[],
+        supports_vision=False,
+        document_names=document_names,
+        document_original_names=originals,
     )
-    assert f"[file attached: uploads/{renamed}]" in message.content
+    assert f"[file attached: uploads/{renamed} (original name: report.pdf)]" in message.content
 
 
 @pytest.mark.asyncio
@@ -676,7 +682,7 @@ async def _attach(ctx: _Ctx, upload: dict[str, Any], *, into: str) -> list[str]:
     from control_plane.api.agents import ExternalFileRef, resolve_external_files
 
     row = await _upload_row(ctx, upload)
-    _images, names = await resolve_external_files(
+    _images, names, _originals = await resolve_external_files(
         files=[ExternalFileRef(upload_id=upload["upload_id"])],
         tenant_id=ctx.tenant_id,
         end_user_id=row.user_id,
@@ -740,6 +746,62 @@ async def test_an_upload_from_another_session_of_the_same_agent_is_copied_in(ctx
     # 本会话自己的上传:照旧,不复制。
     assert await _attach(ctx, b, into=b["session_id"]) == ["uploads/report.pdf"]
     assert len(ctx.workspace_store.workspace_writes) == writes
+
+
+@pytest.mark.asyncio
+async def test_a_copy_renamed_on_landing_keeps_its_original_name(ctx: _Ctx) -> None:
+    """B-275 —— 复制进本会话时撞名换了名的件,原名照样随本轮附件走;本会话自己没换过名的件
+    不进「实际名 → 原名」表(那一行与以前逐字相同)。"""
+    from control_plane.api.agents import ExternalFileRef, resolve_external_files
+
+    await ctx.seed_agent()
+    a = await _upload_document(ctx, b"%PDF-1.4 A")
+    b = await _upload_document(ctx, b"%PDF-1.4 B")  # 会话 B 里已有一份不同内容的 report.pdf
+
+    async def _resolve(upload: dict[str, Any]) -> tuple[list[str], dict[str, str]]:
+        row = await _upload_row(ctx, upload)
+        _images, names, originals = await resolve_external_files(
+            files=[ExternalFileRef(upload_id=upload["upload_id"])],
+            tenant_id=ctx.tenant_id,
+            end_user_id=row.user_id,
+            thread_id=UUID(b["session_id"]),
+            uploads_store=ctx.app.state.user_upload_store,
+            threads=ctx.app.state.thread_meta_repo,
+            copier=_copier(ctx),
+        )
+        return names, originals
+
+    tag = hashlib.sha256(b"%PDF-1.4 A").hexdigest()[:8]
+    assert await _resolve(a) == (
+        [f"uploads/report-{tag}.pdf"],
+        {f"uploads/report-{tag}.pdf": "report.pdf"},
+    )
+    assert await _resolve(b) == (["uploads/report.pdf"], {})
+
+
+@pytest.mark.parametrize(
+    ("ref", "sha", "original"),
+    [
+        ("uploads/report-3f9a1c2b.pdf", "3f9a1c2b" + "0" * 56, "report.pdf"),
+        ("uploads/报告-3f9a1c2b.pdf", "3f9a1c2b" + "0" * 56, "报告.pdf"),
+        ("uploads/v1.2-3f9a1c2b.pdf", "3f9a1c2b" + "0" * 56, "v1.2.pdf"),
+        ("uploads/report-3f9a1c2b", "3f9a1c2b" + "0" * 56, "report"),
+        # 没换过名。
+        ("uploads/report.pdf", "3f9a1c2b" + "0" * 56, None),
+        # 名字里碰巧有 8 位十六进制,但不是这份内容的:用户自己起的名字,不是平台换的。
+        ("uploads/report-deadbeef.pdf", "3f9a1c2b" + "0" * 56, None),
+        # 登记行没有 sha256(B-271 之前的行):认不出,不猜。
+        ("uploads/report-3f9a1c2b.pdf", None, None),
+        # 只有后缀、没有原名。
+        ("uploads/-3f9a1c2b.pdf", "3f9a1c2b" + "0" * 56, None),
+    ],
+)
+def test_original_document_name_inverts_the_rename(
+    ref: str, sha: str | None, original: str | None
+) -> None:
+    from control_plane.api.uploads import original_document_name
+
+    assert original_document_name(ref, sha) == original
 
 
 @pytest.mark.asyncio

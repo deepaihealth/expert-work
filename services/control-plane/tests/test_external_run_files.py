@@ -726,6 +726,85 @@ async def test_document_name_lands_in_prompt() -> None:
     assert "[file attached: 合同.pdf]" in msg.content
 
 
+@pytest.mark.parametrize(
+    ("original", "line"),
+    [
+        # B-275 —— 换过名:实际路径照旧在前,原名跟在后面。
+        (
+            "报告.pdf",
+            "[file attached: uploads/报告-1a2b3c4d.pdf (original name: 报告.pdf)]",
+        ),
+        # 没换过名(原名就是实际名)/ 没有原名:这一行与以前逐字相同。
+        ("报告-1a2b3c4d.pdf", "[file attached: uploads/报告-1a2b3c4d.pdf]"),
+        (None, "[file attached: uploads/报告-1a2b3c4d.pdf]"),
+        # 原名不是平台写得出的叶子名:不写,免得它撑破这一行的格式。
+        ("a).pdf", "[file attached: uploads/报告-1a2b3c4d.pdf]"),
+        ("a]\n[file attached: uploads/x.pdf", "[file attached: uploads/报告-1a2b3c4d.pdf]"),
+        ("x y.pdf", "[file attached: uploads/报告-1a2b3c4d.pdf]"),
+        ("dir/x.pdf", "[file attached: uploads/报告-1a2b3c4d.pdf]"),
+        ("..", "[file attached: uploads/报告-1a2b3c4d.pdf]"),
+        ("", "[file attached: uploads/报告-1a2b3c4d.pdf]"),
+    ],
+)
+def test_renamed_document_line_carries_its_original_name(original: str | None, line: str) -> None:
+    from control_plane.api.runs import _build_human_message
+
+    stored = "uploads/报告-1a2b3c4d.pdf"
+    msg = _build_human_message(
+        input_text="总结",
+        image_refs=[],
+        supports_vision=False,
+        document_names=[stored],
+        document_original_names={} if original is None else {stored: original},
+    )
+    assert msg.content == f"总结\n\n{line}"
+
+
+@pytest.mark.asyncio
+async def test_renamed_document_original_name_lands_in_enqueued_payload(
+    external_client: AsyncClient, plain_agent: _PlainAgent, _external_ctx: _ExternalCtx
+) -> None:
+    """B-275 —— 登记行是换过名的(``<原名>-<内容 sha256 前 8 位>``):queue 模式存下的
+    ``enqueued_input`` 带「实际名 → 原名」;没换过名的附件不进这张表。"""
+    import hashlib
+
+    session = await _bind_session(client=external_client, agent_code=plain_agent.code, user_id="u1")
+    store: UserUploadStore = _external_ctx.app.state.user_upload_store
+    sha = hashlib.sha256(b"B").hexdigest()
+    renamed = await store.insert(
+        upload_id=uuid4(),
+        tenant_id=_external_ctx.tenant_id,
+        user_id=session.user_id,
+        thread_id=session.session_id,
+        kind="document",
+        ref=f"uploads/report-{sha[:8]}.pdf",
+        mime_type="application/pdf",
+        size_bytes=1,
+        filename=f"report-{sha[:8]}.pdf",
+        sha256=sha,
+    )
+    plain = await _seed_document(store=store, tenant_id=_external_ctx.tenant_id, owner=session)
+    resp = await external_client.post(
+        f"/v1/agents/{plain_agent.code}/runs",
+        json={
+            "user_id": "u1",
+            "session_id": str(session.session_id),
+            "input": "q",
+            "mode": "queue",
+            "files": [
+                {"upload_id": render_upload_id(renamed.id)},
+                {"upload_id": render_upload_id(plain.id)},
+            ],
+        },
+    )
+    assert resp.status_code == 202, resp.text
+    run_id = UUID(resp.json()["data"]["run_id"])
+    run = await _external_ctx.run_store.get(run_id=run_id, tenant_id=_external_ctx.tenant_id)
+    assert run is not None and run.enqueued_input is not None
+    assert run.enqueued_input["document_names"] == [renamed.ref, plain.ref]
+    assert run.enqueued_input["document_original_names"] == {renamed.ref: "report.pdf"}
+
+
 @pytest.mark.asyncio
 async def test_document_ref_lands_in_enqueued_payload(
     external_client: AsyncClient, plain_agent: _PlainAgent, _external_ctx: _ExternalCtx
