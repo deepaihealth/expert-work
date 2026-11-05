@@ -6,11 +6,12 @@ from datetime import UTC, datetime
 from uuid import UUID
 
 from sqlalchemy import ColumnElement, delete, func, select, update
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy.exc import DBAPIError, IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from sqlalchemy.orm import aliased
 
 from expert_work.persistence.agent_spec.base import (
+    AgentSpecBusyError,
     AgentSpecPurgeBlockedError,
     AgentSpecPurgingError,
     AgentSpecStore,
@@ -30,6 +31,17 @@ from expert_work.protocol import (
 
 #: B-278 —— 「已删除」的两种状态:软删(``deleted``)与彻底删除进行中(``purging``)。
 _GONE = (AgentSpecStatus.DELETED.value, AgentSpecStatus.PURGING.value)
+
+
+#: Postgres ``deadlock_detected``.
+_DEADLOCK = "40P01"
+
+
+def _busy_if_deadlock(exc: DBAPIError, *, name: str) -> AgentSpecBusyError | None:
+    """A deadlock on the name's row locks is a retryable conflict, not a 500."""
+    if getattr(exc.orig, "sqlstate", None) == _DEADLOCK:
+        return AgentSpecBusyError(name=name)
+    return None
 
 
 def _status_clause(status: AgentSpecStatus) -> ColumnElement[bool]:
@@ -96,7 +108,45 @@ class SqlAgentSpecStore(AgentSpecStore):
     def __init__(self, session_factory: async_sessionmaker[AsyncSession]) -> None:
         self._sf = session_factory
 
+    # B-278 —— 这三个方法都锁同一个名字的版本行;撞上死锁是可重试的冲突(409),不是 500。
+
     async def create(
+        self,
+        *,
+        tenant_id: UUID,
+        spec: AgentSpec,
+        spec_sha256: str,
+        created_by: str,
+    ) -> AgentSpecRecord:
+        try:
+            return await self._create(
+                tenant_id=tenant_id, spec=spec, spec_sha256=spec_sha256, created_by=created_by
+            )
+        except DBAPIError as exc:
+            busy = _busy_if_deadlock(exc, name=spec.metadata.name)
+            if busy is None:
+                raise
+            raise busy from exc
+
+    async def begin_purge(self, *, tenant_id: UUID, name: str) -> list[str]:
+        try:
+            return await self._begin_purge(tenant_id=tenant_id, name=name)
+        except DBAPIError as exc:
+            busy = _busy_if_deadlock(exc, name=name)
+            if busy is None:
+                raise
+            raise busy from exc
+
+    async def purge_name(self, *, tenant_id: UUID, name: str) -> tuple[int, int]:
+        try:
+            return await self._purge_name(tenant_id=tenant_id, name=name)
+        except DBAPIError as exc:
+            busy = _busy_if_deadlock(exc, name=name)
+            if busy is None:
+                raise
+            raise busy from exc
+
+    async def _create(
         self,
         *,
         tenant_id: UUID,
@@ -128,6 +178,8 @@ class SqlAgentSpecStore(AgentSpecStore):
                             AgentSpecRow.tenant_id == tenant_id,
                             AgentSpecRow.name == spec.metadata.name,
                         )
+                        # 两边都按版本号顺序加锁:同名的并发写不会互相等成死锁。
+                        .order_by(AgentSpecRow.version)
                         .with_for_update()
                     )
                 )
@@ -498,6 +550,7 @@ class SqlAgentSpecStore(AgentSpecStore):
                 AgentSpecRow.tenant_id == tenant_id,
                 AgentSpecRow.name == name,
                 AgentSpecRow.version == version,
+                AgentSpecRow.status.notin_(_GONE),
             )
             .values(status=status.value, updated_at=datetime.now(UTC))
             .returning(AgentSpecRow)
@@ -553,6 +606,7 @@ class SqlAgentSpecStore(AgentSpecStore):
                 await session.execute(
                     select(AgentSpecRow.version, AgentSpecRow.status)
                     .where(AgentSpecRow.tenant_id == tenant_id, AgentSpecRow.name == name)
+                    .order_by(AgentSpecRow.version)
                     .with_for_update()
                 )
             )
@@ -583,7 +637,7 @@ class SqlAgentSpecStore(AgentSpecStore):
             if name in subagent_names(r.spec_json) | subagent_names(r.draft_spec_json)
         )
 
-    async def begin_purge(self, *, tenant_id: UUID, name: str) -> list[str]:
+    async def _begin_purge(self, *, tenant_id: UUID, name: str) -> list[str]:
         async with self._sf() as session:
             rows = await self._lock_versions(session, tenant_id, name)
             active = sorted(v for v, st in rows if st not in _GONE)
@@ -620,7 +674,7 @@ class SqlAgentSpecStore(AgentSpecStore):
             await session.commit()
         return sorted(v for v, _ in rows)
 
-    async def purge_name(self, *, tenant_id: UUID, name: str) -> tuple[int, int]:
+    async def _purge_name(self, *, tenant_id: UUID, name: str) -> tuple[int, int]:
         async with self._sf() as session:
             rows = await self._lock_versions(session, tenant_id, name)
             active = sorted(v for v, st in rows if st not in _GONE)

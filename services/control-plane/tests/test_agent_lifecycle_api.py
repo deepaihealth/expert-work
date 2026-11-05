@@ -443,7 +443,7 @@ async def test_an_incomplete_purge_is_not_reported_as_success(
 
     first = await _purge(ctx.client)
 
-    assert first.status_code == 500  # type: ignore[attr-defined]
+    assert first.status_code == 409  # type: ignore[attr-defined]
     body = first.json()  # type: ignore[attr-defined]
     assert body["success"] is False
     assert body["error"]["code"] == "AGENT_PURGE_INCOMPLETE"
@@ -519,3 +519,27 @@ async def test_clearing_the_default_agent_is_broadcast(ctx: _Ctx) -> None:
     assert resp.status_code == 200  # type: ignore[attr-defined]
     assert resp.json()["data"]["default_agent_cleared"] is True  # type: ignore[attr-defined]
     assert ("tenant_config", str(ctx.tenant_id)) in bus.events
+
+
+@pytest.mark.asyncio
+async def test_a_lock_conflict_is_409_busy(ctx: _Ctx, monkeypatch: pytest.MonkeyPatch) -> None:
+    from expert_work.persistence.agent_spec import AgentSpecBusyError
+
+    await _create_and_delete(ctx.client)
+    repo = ctx.app.state.agent_spec_repo  # type: ignore[attr-defined]
+
+    async def _deadlocked(*, tenant_id: UUID, name: str) -> list[str]:
+        raise AgentSpecBusyError(name=name)
+
+    monkeypatch.setattr(repo, "begin_purge", _deadlocked)
+    purge = await _purge(ctx.client)
+    assert purge.status_code == 409  # type: ignore[attr-defined]
+    assert purge.json()["error"]["code"] == "AGENT_BUSY"  # type: ignore[attr-defined]
+
+    async def _deadlocked_create(**_kwargs: object) -> object:
+        raise AgentSpecBusyError(name=_NAME)
+
+    monkeypatch.setattr(repo, "create", _deadlocked_create)
+    create = await ctx.client.post("/v1/agents", json={"manifest_yaml": _YAML_V2})
+    assert create.status_code == 409, create.text
+    assert create.json()["error"]["code"] == "AGENT_BUSY"

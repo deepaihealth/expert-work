@@ -18,6 +18,8 @@ MANIFEST_DUPLICATE = "MANIFEST_DUPLICATE"
 MANIFEST_DUPLICATE_DELETED = "MANIFEST_DUPLICATE_DELETED"
 #: B-278 —— 这个名字正在彻底删除(有版本处于 ``purging``):不能新建、不能恢复。
 AGENT_PURGING = "AGENT_PURGING"
+#: B-278 —— 同名的另一个写操作正好撞上(行锁死锁),可重试。
+AGENT_BUSY = "AGENT_BUSY"
 
 
 async def duplicate_agent_response(
@@ -39,7 +41,21 @@ async def duplicate_agent_response(
             },
         )
     existing = next((r for r in versions if r.version == version), None)
-    if existing is not None and existing.status is AgentSpecStatus.DELETED:
+    if existing is None:
+        # 报了「已存在」却查不到这一版:是同名并发写撞上了(``AgentSpecBusyError``),重试即可。
+        return JSONResponse(
+            status_code=409,
+            content={
+                "success": False,
+                "data": None,
+                "error": {
+                    "code": AGENT_BUSY,
+                    "message": "this agent name is being changed concurrently; retry",
+                    "details": {"name": name, "version": version},
+                },
+            },
+        )
+    if existing.status is AgentSpecStatus.DELETED:
         return JSONResponse(
             status_code=409,
             content={

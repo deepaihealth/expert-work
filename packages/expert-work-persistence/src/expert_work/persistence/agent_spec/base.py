@@ -52,6 +52,19 @@ class AgentSpecPurgingError(DuplicateAgentSpecError):
     and answers ``AGENT_PURGING``."""
 
 
+class AgentSpecBusyError(DuplicateAgentSpecError):
+    """B-278 —— two writers on the same name collided (Postgres deadlock on the
+    name's row locks). Retryable; the API answers 409 ``AGENT_BUSY``. A
+    :class:`DuplicateAgentSpecError` subclass so create / fork's existing 409
+    path covers it."""
+
+    def __init__(self, *, name: str, tenant_id: UUID | None = None, version: str = "") -> None:
+        Exception.__init__(self, f"agent {name!r} is being changed concurrently; retry")
+        self.tenant_id = tenant_id  # type: ignore[assignment]
+        self.name = name
+        self.version = version
+
+
 class AgentSpecPurgeBlockedError(Exception):
     """B-278 —— the purge cannot go on: a version of the name is live (not
     ``deleted`` / ``purging``), or a live agent of the tenant lists it as a
@@ -291,7 +304,9 @@ class AgentSpecStore(abc.ABC):
         status: AgentSpecStatus,
     ) -> AgentSpecRecord | None:
         """Update status. Returns the updated record, or ``None`` if no
-        row matched. Used by the soft-delete path and the deprecate UI."""
+        row matched. Used by the soft-delete path and the deprecate UI.
+        B-278 —— a ``deleted`` / ``purging`` row is never changed here (a stale
+        delete must not flip ``purging`` back to ``deleted``): ``None``."""
 
     # --- B-278 恢复 / 彻底删除 ---------------------------------------------
 

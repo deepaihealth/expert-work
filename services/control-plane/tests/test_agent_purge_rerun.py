@@ -283,3 +283,19 @@ async def test_a_symlinked_agents_dir_is_skipped_not_failed(tmp_path: Path) -> N
     assert "nas_symlink" in summary.skipped
     assert summary.nas_symlinks_skipped == 1
     assert keep.exists()
+
+
+@pytest.mark.asyncio
+async def test_a_stale_delete_cannot_reopen_a_purging_name() -> None:
+    world, _ = await _world()
+    _fail_once(world.scores, "delete_for_agent")
+    first = await purge_agent(world.deps(), tenant_id=world.t1, name=_X)
+    assert not first.ok
+
+    stale = await world.specs.update_status(
+        tenant_id=world.t1, name=_X, version="1.0.0", status=AgentSpecStatus.DELETED
+    )
+
+    assert stale is None
+    status = await _status(world)
+    assert status == {AgentSpecStatus.PURGING}

@@ -344,7 +344,7 @@ class InMemoryAgentSpecStore(AgentSpecStore):
         async with self._lock:
             key = (tenant_id, name, version)
             existing = self._rows.get(key)
-            if existing is None:
+            if existing is None or existing.status.gone:
                 return None
             replaced = existing.model_copy(update={"status": status, "updated_at": _now()})
             self._rows[key] = replaced

@@ -40,6 +40,7 @@ from expert_work.persistence import (
 )
 from expert_work.persistence.agent_instance.sql import SqlAgentInstanceStore
 from expert_work.persistence.agent_spec import (
+    AgentSpecBusyError,
     AgentSpecPurgeBlockedError,
     AgentSpecPurgingError,
     DuplicateAgentSpecError,
@@ -699,3 +700,40 @@ async def test_purge_name_rechecks_referrers_and_only_drops_its_versions_revisio
     assert removed == (1, 1)
     stray = await store.count_revisions_for_name(tenant_id=t1, name=_X)
     assert stray == 1  # only the locked versions' history went
+
+
+@pytest.mark.asyncio
+async def test_update_status_never_touches_a_gone_row(sf: SF) -> None:
+    """A stale delete (or any status write) must not flip ``purging`` back to
+    ``deleted`` — that would reopen restore on a half-purged agent."""
+    store = SqlAgentSpecStore(sf)
+    t1 = uuid4()
+    await store.create(tenant_id=t1, spec=_spec(), spec_sha256="a" * 64, created_by="u")
+    await store.update_status(
+        tenant_id=t1, name=_X, version="1.0.0", status=AgentSpecStatus.DELETED
+    )
+    await store.begin_purge(tenant_id=t1, name=_X)
+
+    stale = await store.update_status(
+        tenant_id=t1, name=_X, version="1.0.0", status=AgentSpecStatus.DELETED
+    )
+
+    assert stale is None
+    row = await store.get(tenant_id=t1, name=_X, version="1.0.0", include_deleted=True)
+    assert row is not None and row.status is AgentSpecStatus.PURGING
+
+
+def test_a_deadlock_is_reported_as_busy() -> None:
+    from sqlalchemy.exc import DBAPIError
+
+    from expert_work.persistence.agent_spec.sql import _busy_if_deadlock
+
+    class _OrigError(Exception):
+        sqlstate = "40P01"
+
+    deadlock = DBAPIError("stmt", {}, _OrigError("deadlock detected"))
+    other = DBAPIError("stmt", {}, Exception("boom"))
+
+    busy = _busy_if_deadlock(deadlock, name=_X)
+    assert isinstance(busy, AgentSpecBusyError)
+    assert _busy_if_deadlock(other, name=_X) is None

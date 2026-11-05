@@ -9,8 +9,9 @@
   什么在拦着(还有没删除的版本 / 被别的智能体当子智能体引用)。
 * ``POST /v1/agents/{name}/{version}/purge`` —— 彻底删除整个名字(全部版本 + 数据),
   请求体 ``{"confirm_name": "<名字>"}`` 必须与名字完全一致。只有版本行真的删掉了才回
-  200 成功;最后被拦 → 409 ``AGENT_PURGE_BLOCKED``;有数据没删掉 → 500
-  ``AGENT_PURGE_INCOMPLETE``(名字停在 ``purging``,再点一次接着删)。
+  200 成功;最后被拦 → 409 ``AGENT_PURGE_BLOCKED``;有数据没删掉 → 409
+  ``AGENT_PURGE_INCOMPLETE``(名字停在 ``purging``,再点一次接着删);同名并发写撞上 → 409
+  ``AGENT_BUSY``。
 
 后两个路径里的 ``version`` 只用来定位这一行,操作对象是整个名字,所以**每一版**都要有删除
 权限。路由放在单独的模块里,``agents.py`` 只改了读已删除版本与 409 两处。
@@ -26,7 +27,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict, Field
 
-from control_plane.api._agent_duplicate import AGENT_PURGING
+from control_plane.api._agent_duplicate import AGENT_BUSY, AGENT_PURGING
 from control_plane.api._authz import console_only, ensure_resource_access, manifest_record_attrs
 from control_plane.api._external import reject_nul_path_params
 from control_plane.api.agents import _invalidate_agent_build_cache
@@ -40,7 +41,11 @@ from control_plane.purge.agent_purge import (
 )
 from control_plane.tenancy.tenant_config import ServiceBackedTenantConfigStore
 from expert_work.common.observability import current_trace_id_hex
-from expert_work.persistence.agent_spec import AgentSpecPurgeBlockedError, AgentSpecStore
+from expert_work.persistence.agent_spec import (
+    AgentSpecBusyError,
+    AgentSpecPurgeBlockedError,
+    AgentSpecStore,
+)
 from expert_work.protocol import AgentSpecRecord, AgentSpecStatus, AuditAction, AuditResult
 from expert_work.runtime.audit.logger import AuditLogger
 from orchestrator.tools.nas_workspace_store import NasWorkspaceStore
@@ -280,6 +285,9 @@ def build_agent_lifecycle_router() -> APIRouter:
         except AgentSpecPurgeBlockedError as exc:
             # 预检之后有人恢复 / 新建了一版:标记没打上,什么都没删。
             return await _blocked(exc.active_versions, exc.referenced_by)
+        except AgentSpecBusyError:
+            # 同名的另一个写操作正好撞上(行锁死锁):什么都没删,稍后重试。
+            return _error(AGENT_BUSY, "this agent is being changed concurrently; retry", 409)
 
         # 构建缓存与停用开关缓存:本副本立刻失效,其它副本走失效总线。
         await _invalidate_agent_build_cache(request, tenant_id)
@@ -315,10 +323,12 @@ def build_agent_lifecycle_router() -> APIRouter:
                 409,
                 {**summary.blocked, "summary": summary.as_dict()},
             )
+        # 409 而不是 500:这是「还没删完、可以重试」的业务状态,不是服务故障(500 会触发网关告警 /
+        # 自动重试)。``details`` 是完整汇总,控制台据此列出失败的步骤并给「再试一次」。
         return _error(
             AGENT_PURGE_INCOMPLETE,
             "some data could not be deleted; the agent stays in purging, purge again to finish",
-            500,
+            409,
             summary.as_dict(),
         )
 
