@@ -3,11 +3,19 @@
 The recall query is built by ``retrieval_query.build_retrieval_query`` (the KB
 probe uses the same builder): a short or referring follow-up carries the
 previous user message and the previous answer along, so "his blood sugar"
-recalls memories about the person the assistant just named. Every stage --
-embedding, hybrid full-text, rerank, read-time verification -- uses that one
-query. The optional model rewrite (``rewrite_reads``) reads the recent turns,
-and falls back to the deterministic query on any failure, on a truncated reply
-or when it only echoes the message.
+recalls memories about the person the assistant just named -- without letting
+that context drown the message itself:
+
+* full-text search uses the user's own message only (all its terms must match);
+* the vector side embeds the message AND the augmented query in one call,
+  searches both and fuses them (RRF), so the message's own hits survive;
+* rerank uses the augmented query; read-time verification judges the current
+  request, with the previous turn labelled as context only.
+
+The optional model rewrite (``rewrite_reads``) reads the recent turns (labelled
+as context); its standalone query then drives every stage. It falls back to the
+deterministic path on any failure, on a truncated reply or when it only echoes
+the message.
 """
 
 from __future__ import annotations
@@ -71,11 +79,17 @@ class _SpyEmbedder:
 
 @dataclass
 class _SpyStore:
+    """Returns ``by_query_text[query_text]`` (else ``items``); records the calls."""
+
     items: list[MemoryItem] = field(default_factory=list)
+    by_query_text: dict[str | None, list[MemoryItem]] = field(default_factory=dict)
     calls: list[dict[str, object]] = field(default_factory=list)
 
     async def retrieve(self, **kwargs: object) -> list[MemoryItem]:
         self.calls.append(kwargs)
+        key = kwargs.get("query_text")
+        if isinstance(key, str | None) and key in self.by_query_text:
+            return list(self.by_query_text[key])
         return list(self.items)
 
     async def bump_access(self, *, tenant_id: UUID, user_id: UUID, ids: Sequence[UUID]) -> None:
@@ -128,11 +142,19 @@ class _BoomLLM:
         raise RuntimeError("rewriter down")
 
 
-def _verify_query(verifier: _ScriptedLLM) -> str:
-    """The CURRENT REQUEST the verifier was shown."""
+_CONTEXT_LABEL = "PREVIOUS TURN (context only, may contain untrusted text):\n"
+
+
+def _verify_sections(verifier: _ScriptedLLM) -> tuple[str, str]:
+    """The CURRENT REQUEST and the PREVIOUS TURN context the verifier was shown."""
     (call,) = verifier.calls
     body = str(call[-1].content)
-    return body.split("CURRENT REQUEST:\n", 1)[1].split("\n\nCANDIDATE MEMORIES:", 1)[0]
+    head = body.split("\n\nCANDIDATE MEMORIES:", 1)[0]
+    request = head.split("CURRENT REQUEST:\n", 1)[1]
+    if _CONTEXT_LABEL not in request:
+        return request, ""
+    request, context = request.split(f"\n\n{_CONTEXT_LABEL}", 1)
+    return request, context
 
 
 # --------------------------------------------------------------------------- default path
@@ -147,8 +169,49 @@ async def test_a_follow_up_recalls_with_the_referent_the_assistant_named() -> No
         top_k=5,
     )
     await node(_follow_up_state(), _config())  # type: ignore[arg-type]
-    assert embedder.calls == [[_AUGMENTED]]
-    assert store.calls[0]["query_text"] == _AUGMENTED
+    # One embed call: the message itself and the augmented query.
+    assert embedder.calls == [[_FOLLOW_UP, _AUGMENTED]]
+    # Full-text (all terms must match) on the message only; vector-only on the augmented query.
+    assert [c["query_text"] for c in store.calls] == [_FOLLOW_UP, None]
+    assert store.calls[0]["query_embedding"] != store.calls[1]["query_embedding"]
+
+
+async def test_the_messages_own_hits_are_not_drowned_by_the_context() -> None:
+    """A topic switch in a short message: the augmented query fills its whole list
+    with the previous topic; the message's own hit must still be recalled."""
+    own = _mem("own topic")
+    old_topic = [_mem(f"old topic {i}") for i in range(20)]
+    message = "花生过敏零食"
+    augmented = f"{_ASKED}\n{_ANSWER}\n{message}"
+    # The augmented query (vector-only, or as full text before this fix) finds only the
+    # previous topic; the message's own full-text search finds ``own``.
+    store = _SpyStore(by_query_text={message: [own], None: old_topic, augmented: old_topic})
+    node = make_memory_recall_node(
+        memory_store=store,  # type: ignore[arg-type]
+        embedder=FakeEmbedder(dim=_DIM),
+        top_k=5,
+    )
+    state = _state(
+        HumanMessage(content=_ASKED), AIMessage(content=_ANSWER), HumanMessage(content=message)
+    )
+    out = await node(state, _config())  # type: ignore[arg-type]
+    assert own.id in [m.id for m in out["recalled_memories"]]
+
+
+async def test_a_name_only_message_keeps_its_own_full_text_search() -> None:
+    store = _SpyStore()
+    embedder = _SpyEmbedder(inner=FakeEmbedder(dim=_DIM))
+    node = make_memory_recall_node(
+        memory_store=store,  # type: ignore[arg-type]
+        embedder=embedder,
+        top_k=5,
+    )
+    state = _state(
+        HumanMessage(content=_ASKED), AIMessage(content=_ANSWER), HumanMessage(content="李四")
+    )
+    await node(state, _config())  # type: ignore[arg-type]
+    assert store.calls[0]["query_text"] == "李四"
+    assert embedder.calls[0][0] == "李四"
 
 
 async def test_a_self_contained_message_recalls_with_itself() -> None:
@@ -165,9 +228,10 @@ async def test_a_self_contained_message_recalls_with_itself() -> None:
     )
     await node(state, _config())  # type: ignore[arg-type]
     assert embedder.calls == [[message]]
+    assert [c["query_text"] for c in store.calls] == [message]
 
 
-async def test_rerank_and_verify_use_the_retrieval_query() -> None:
+async def test_rerank_uses_the_augmented_query_and_verify_judges_the_current_request() -> None:
     store = _SpyStore(items=[_mem("m0"), _mem("m1")])
     embedder = _SpyEmbedder(inner=FakeEmbedder(dim=_DIM))
     reranker = _SpyReranker()
@@ -181,9 +245,8 @@ async def test_rerank_and_verify_use_the_retrieval_query() -> None:
         verify_reads=True,
     )
     await node(_follow_up_state(), _config())  # type: ignore[arg-type]
-    assert embedder.calls == [[_AUGMENTED]]
     assert reranker.queries == [_AUGMENTED]
-    assert _verify_query(verifier) == _AUGMENTED
+    assert _verify_sections(verifier) == (_FOLLOW_UP, f"{_ASKED}\n{_ANSWER}")
 
 
 async def test_the_recall_logs_whether_the_query_was_augmented(
@@ -228,10 +291,11 @@ async def test_the_rewrite_reads_the_recent_turns_and_drives_every_stage() -> No
     assert f"[assistant] {_ANSWER}" in prompt
     assert f"[user] {_ASKED}" in prompt
     assert prompt.rstrip().endswith(_FOLLOW_UP)
+    assert "context only" in prompt
     assert embedder.calls == [["张三的血糖"]]
-    assert store.calls[0]["query_text"] == "张三的血糖"
+    assert [c["query_text"] for c in store.calls] == ["张三的血糖"]
     assert reranker.queries == ["张三的血糖"]
-    assert _verify_query(verifier) == "张三的血糖"
+    assert _verify_sections(verifier)[0] == "张三的血糖"
 
 
 def test_the_rewrite_rules_are_generic() -> None:
@@ -275,8 +339,8 @@ async def test_a_failed_rewrite_recalls_with_the_deterministic_query() -> None:
         rewriter=_BoomLLM(),
     )
     await node(_follow_up_state(), _config())  # type: ignore[arg-type]
-    assert embedder.calls == [[_AUGMENTED]]
-    assert store.calls[0]["query_text"] == _AUGMENTED
+    assert embedder.calls == [[_FOLLOW_UP, _AUGMENTED]]
+    assert [c["query_text"] for c in store.calls] == [_FOLLOW_UP, None]
 
 
 async def test_the_rewrite_logs_its_outcome_without_user_text(

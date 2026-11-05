@@ -140,11 +140,79 @@ def test_a_long_self_contained_message_is_unchanged(message: str) -> None:
 def test_a_very_long_message_is_unchanged_even_with_a_marker() -> None:
     """A paste or a detailed request names its own subject; carrying the last
     turn along would only drown it."""
-    message = "这份材料请帮我总结一下要点。" + "背景说明" * REFERENCE_MAX_CHARS
+    message = "这份材料请帮我总结一下要点\u3002" + "背景说明" * REFERENCE_MAX_CHARS
     query = build_retrieval_query(_turns("上一个问题", "上一个回答", message))
     assert query is not None
     assert query.text == message
     assert not query.augmented
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        # Words that are not references: which / other / before / should / this week.
+        "有哪些适合糖尿病人吃的低糖水果, 请帮我列举一下并说明理由",
+        "哪种运动方式最适合五十岁以上的高血压患者长期坚持",
+        "之前体检血糖偏高现在应该注意什么饮食问题呢",
+        "其他还有什么运动适合高血压人群呢请详细说说",
+        "这周开始我想每天快走半小时, 有什么需要注意的",
+        "血糖高的人早餐应该怎么吃才比较合理呢请给建议",
+        "What is the recommended daily salt intake for adults with hypertension?",
+        "Is it safe to take ibuprofen together with blood pressure medication?",
+    ],
+)
+def test_a_standalone_question_is_not_taken_for_a_follow_up(message: str) -> None:
+    assert len(message) > FOLLOW_UP_MAX_CHARS
+    query = build_retrieval_query(_turns("推荐一款早餐食品", "燕麦片甲", message))
+    assert query is not None
+    assert query.trigger == "none"
+    assert query.text == message
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "那我们换个话题\uff0c最近睡眠不好怎么办",
+        "另外我想问一下体检要空腹吗",
+        "换个话题",
+        "By the way, how much water should I drink?",
+        "Different question: is coffee bad for sleep?",
+    ],
+)
+def test_a_topic_switch_carries_nothing(message: str) -> None:
+    query = build_retrieval_query(_turns("推荐一款早餐食品", "燕麦片甲", message))
+    assert query is not None
+    assert not query.augmented
+    assert query.text == message
+
+
+@pytest.mark.parametrize("message", ["好的", "谢谢!", "继续", "OK", "thanks"])
+def test_small_talk_carries_nothing(message: str) -> None:
+    query = build_retrieval_query(_turns("推荐一款早餐食品", "燕麦片甲", message))
+    assert query is not None
+    assert not query.augmented
+
+
+@pytest.mark.parametrize("message", ["A20261105-8841", "订单 202611058841", "QXA-N7"])
+def test_an_identifier_alone_carries_nothing(message: str) -> None:
+    """An id names its own subject; the previous turn would only dilute it."""
+    query = build_retrieval_query(_turns("推荐一款早餐食品", "燕麦片甲", message))
+    assert query is not None
+    assert not query.augmented
+    assert query.text == message
+
+
+def test_the_keyword_side_puts_the_current_message_first() -> None:
+    query = build_retrieval_query(_turns("张三的血压", "张三血压正常", "他的血糖呢"))
+    assert query is not None
+    assert query.context == "张三的血压\n张三血压正常"
+    assert query.text == "张三的血压\n张三血压正常\n他的血糖呢"
+    assert query.keyword_text == "他的血糖呢\n张三的血压\n张三血压正常"
+    plain = build_retrieval_query(
+        _turns("x", "y", "请帮我制定一份适合二型糖尿病患者的一周早餐食谱")
+    )
+    assert plain is not None
+    assert plain.keyword_text == plain.text == plain.current
 
 
 def test_the_first_message_has_nothing_to_carry() -> None:

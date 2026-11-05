@@ -2,28 +2,33 @@
 
 Both run before the model has said anything this turn, so the only query they
 have is what the user wrote. A follow-up often names nothing a retriever can
-match -- a pronoun ("his blood sugar", "is it waterproof"), a demonstrative
-("this one", "those two"), a pointer into the last answer ("the second item
-above"), a time ("that day") or plain ellipsis ("and the price?"). The referent
-is in the conversation: in the previous user message or, often, only in the
-assistant's previous answer.
+match -- a pronoun ("his blood sugar"), a demonstrative ("this one", "those
+two"), a pointer into the last answer ("the second item above"), a time ("that
+day") or plain ellipsis ("and the price?"). The referent is in the
+conversation: in the previous user message or, often, only in the assistant's
+previous answer.
 
 :func:`build_retrieval_query` -- deterministic, no model call -- carries that
 context along when the message is short (:data:`FOLLOW_UP_MAX_CHARS`) or holds a
-reference / ellipsis marker and is not long (:data:`REFERENCE_MAX_CHARS`):
+reference / ellipsis marker and is not long (:data:`REFERENCE_MAX_CHARS`). It
+carries nothing for small talk, an explicit topic switch, or a message that
+names an identifier (an order number, a product code) and refers to nothing.
 
-    <previous user message, its end> \\n <previous answer, head and tail> \\n <this message>
+The context never replaces the message, and the callers keep the message's own
+weight: keyword / full-text search puts the message first
+(:attr:`RetrievalQuery.keyword_text`; the memory recall's full-text side uses
+the message alone), and the memory recall searches the message and the
+augmented query side by side.
 
 Bounds (characters):
 
 * previous user message: its last :data:`USER_CONTEXT_CHARS` -- the question of
-  a long message is at its end (the same bound the KB probe used since B-267);
+  a long message is at its end (the bound the KB probe used since B-267);
 * previous answer: its first :data:`ASSISTANT_HEAD_CHARS` and last
   :data:`ASSISTANT_TAIL_CHARS` -- an answer names its subject and opens its list
   first, and a closing line is often an offer or a clarifying question;
-* the context is at most about 500 characters, a few times a typical follow-up:
-  enough to name the referent, small enough that the KB probe stays inside its
-  time budget and the query still leans on what was just asked.
+* the context is at most about 500 characters: enough to name the referent,
+  small enough for the KB probe's time budget.
 
 A long message is left alone even with a marker: a paste or a detailed request
 names its own subject, and carrying the last turn along would only dilute it.
@@ -36,6 +41,7 @@ from __future__ import annotations
 
 import logging
 import re
+import unicodedata
 from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Final, Literal
@@ -48,7 +54,8 @@ from orchestrator.graph_builder.platform_context import strip_platform_context
 
 logger = logging.getLogger(__name__)
 
-#: A message this short carries the context along whatever it says.
+#: A message this short carries the context along unless it is small talk, a
+#: topic switch or an identifier.
 FOLLOW_UP_MAX_CHARS: Final = 20
 #: A message with a reference marker carries it along up to this length.
 REFERENCE_MAX_CHARS: Final = 200
@@ -61,21 +68,91 @@ HISTORY_MESSAGE_HEAD_CHARS: Final = 400
 HISTORY_MESSAGE_TAIL_CHARS: Final = 200
 
 _ELLIPSIS: Final = "…"
+_ZH_DIGITS: Final = "一二三四五六七八九十两"
+_MEASURE_WORDS: Final = "个些两几款种位份条项家本篇段张"
 
-#: Chinese demonstratives, pronouns, pointers into what was said before and
-#: ordinals of a list item. "该" ("that / the said") is not counted inside
-#: the common words for "should" and similar.
+#: Chinese markers. "这" / "那" (this / that) count at the start of a
+#: sentence or bound to a measure word, not in "this week / month / year"; the
+#: third-person pronouns count except inside "其他" (other); "以上"
+#: (the above) not after a number or an age / price unit.
 _ZH_MARKERS: Final = re.compile(
-    "这|那|它|他|她|(?<![应活本])该|其中|上面|上述|上文|以上|前面|前者|后者|刚才|刚刚|之前|"
-    "上次|上一|另一|另外|当时|哪个|哪些|哪一|哪种|哪款|哪位|提到|"
-    "第[一二三四五六七八九十两0-9]+[条个项点种款位家本篇段行张次]"
+    rf"(?:^|(?<=[\s,.!?;:\u3002\uff01\uff1f\uff0c\uff1b\uff1a]))[这那](?![周月年天])"
+    rf"|这(?:个(?!月)|[{_MEASURE_WORDS[1:]}])"
+    rf"|那(?:[{_MEASURE_WORDS}]|里|边|天|次|时)"
+    r"|(?<!其)[他她它]"
+    r"|其中|上面|上述|上文|前面|前者|后者|刚才|刚刚|上次|上一|另一|当时|提到|你说的|您说的"
+    r"|(?<![0-9一二三四五六七八九十百千万岁元斤克])以上"
+    rf"|第[{_ZH_DIGITS}0-9]+[{_MEASURE_WORDS}点次行章]"
 )
+#: English markers: pointers into what was said, not the generic it / that / they.
 _EN_MARKERS: Final = re.compile(
-    r"\b(?:it|its|this|that|these|those|they|them|their|he|him|his|she|her|another|"
-    r"above|previous|earlier|former|latter|same|what about|how about|which one|"
-    r"the (?:first|second|third|fourth|fifth|last|other)|"
-    r"(?:first|second|third|fourth|fifth|last|other) one)\b",
+    r"\b(?:the other|this one|that one|these two|those two|which one|what about|how about|"
+    r"the former|the latter|you mentioned|"
+    r"the (?:first|second|third|fourth|fifth|last)|"
+    r"(?:first|second|third|fourth|fifth|last|other) one|"
+    r"he|him|his|she|her|hers)\b",
     re.IGNORECASE,
+)
+#: An explicit topic switch: the previous turn is not what this message is about.
+_TOPIC_SWITCH: Final = re.compile(
+    r"换个话题|换一个话题|换话题|说点别的|聊点别的|问个别的|另外我想|另外问|另外想|"
+    r"另一个问题|新问题|"
+    r"\b(?:by the way|btw|different question|another question|change the subject|new topic|"
+    r"unrelated)\b",
+    re.IGNORECASE,
+)
+#: An identifier: a run of letters / digits (with . _ / -) holding a digit, at
+#: least four long -- an order number, a product or document code.
+_IDENTIFIER: Final = re.compile(r"[A-Za-z0-9][A-Za-z0-9._/-]{3,}")
+
+#: Greetings, thanks, acknowledgements (normalised: lower-case, letters / digits
+#: / CJK only). Platform text, Chinese and English. The KB probe skips them too.
+SMALL_TALK: Final = frozenset(
+    {
+        "你好",
+        "您好",
+        "你好啊",
+        "嗨",
+        "哈喽",
+        "在吗",
+        "在不在",
+        "谢谢",
+        "谢谢你",
+        "多谢",
+        "感谢",
+        "好的",
+        "好",
+        "嗯",
+        "嗯嗯",
+        "收到",
+        "明白",
+        "知道了",
+        "继续",
+        "继续吧",
+        "ok",
+        "okay",
+        "再见",
+        "拜拜",
+        "早上好",
+        "晚上好",
+        "下午好",
+        "你是谁",
+        "你叫什么",
+        "你能做什么",
+        "hi",
+        "hello",
+        "hey",
+        "thanks",
+        "thankyou",
+        "thx",
+        "bye",
+        "goodbye",
+        "goodmorning",
+        "whoareyou",
+        "whatcanyoudo",
+        "continue",
+        "goon",
+    }
 )
 
 Trigger = Literal["none", "short", "reference"]
@@ -83,18 +160,36 @@ Trigger = Literal["none", "short", "reference"]
 
 @dataclass(frozen=True)
 class RetrievalQuery:
-    """The query (:attr:`text`), what the user wrote this turn (:attr:`current`),
-    why context was considered (:attr:`trigger`) and how much was carried along
-    (:attr:`context_chars`, 0: none)."""
+    """What the user wrote this turn (:attr:`current`), why context was
+    considered (:attr:`trigger`) and the context carried along (:attr:`context`,
+    empty: none)."""
 
-    text: str
     current: str
     trigger: Trigger
-    context_chars: int = 0
+    context: str = ""
 
     @property
     def augmented(self) -> bool:
-        return self.context_chars > 0
+        return bool(self.context)
+
+    @property
+    def context_chars(self) -> int:
+        return len(self.context)
+
+    @property
+    def text(self) -> str:
+        """Context, then the message: the augmented query (vector side)."""
+        return f"{self.context}\n{self.current}" if self.context else self.current
+
+    @property
+    def keyword_text(self) -> str:
+        """The message, then the context: keyword queries keep their first terms."""
+        return f"{self.current}\n{self.context}" if self.context else self.current
+
+
+def normalised(text: str) -> str:
+    """Lower-case, letters / digits / CJK only (spaces and punctuation gone)."""
+    return "".join(ch for ch in unicodedata.normalize("NFKC", text).lower() if ch.isalnum())
 
 
 def user_text(message: BaseMessage) -> str:
@@ -122,11 +217,24 @@ def _excerpt(text: str, head: int, tail: int) -> str:
     return f"{text[:head]}{_ELLIPSIS}{text[-tail:]}"
 
 
+def _has_marker(text: str) -> bool:
+    return bool(_ZH_MARKERS.search(text) or _EN_MARKERS.search(text))
+
+
+def _names_identifier(text: str) -> bool:
+    return any(any(ch.isdigit() for ch in m) for m in _IDENTIFIER.findall(text))
+
+
 def trigger_of(text: str) -> Trigger:
     """Whether a message needs the conversation to be understood on its own."""
+    if normalised(text) in SMALL_TALK or _TOPIC_SWITCH.search(text):
+        return "none"
+    marker = _has_marker(text)
+    if not marker and _names_identifier(text):
+        return "none"
     if len(text) <= FOLLOW_UP_MAX_CHARS:
         return "short"
-    if len(text) <= REFERENCE_MAX_CHARS and (_ZH_MARKERS.search(text) or _EN_MARKERS.search(text)):
+    if len(text) <= REFERENCE_MAX_CHARS and marker:
         return "reference"
     return "none"
 
@@ -151,7 +259,7 @@ def build_retrieval_query(messages: Sequence[BaseMessage]) -> RetrievalQuery | N
         return None
     trigger = trigger_of(current)
     if trigger == "none":
-        return RetrievalQuery(text=current, current=current, trigger=trigger)
+        return RetrievalQuery(current=current, trigger=trigger)
     previous_at = users[-2] if len(users) > 1 else -1
     parts: list[str] = []
     if previous_at >= 0:
@@ -161,15 +269,7 @@ def build_retrieval_query(messages: Sequence[BaseMessage]) -> RetrievalQuery | N
     answer = _last_answer(messages, previous_at + 1, users[-1])
     if answer:
         parts.append(_excerpt(answer, ASSISTANT_HEAD_CHARS, ASSISTANT_TAIL_CHARS))
-    if not parts:
-        return RetrievalQuery(text=current, current=current, trigger=trigger)
-    context = "\n".join(parts)
-    return RetrievalQuery(
-        text=f"{context}\n{current}",
-        current=current,
-        trigger=trigger,
-        context_chars=len(context),
-    )
+    return RetrievalQuery(current=current, trigger=trigger, context="\n".join(parts))
 
 
 def recent_history(messages: Sequence[BaseMessage], *, turns: int = HISTORY_TURNS) -> str:

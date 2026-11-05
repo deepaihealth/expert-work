@@ -46,7 +46,6 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
-import unicodedata
 from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass
 from typing import Final, Literal
@@ -65,8 +64,11 @@ from expert_work.persistence.knowledge.text_search import (
 )
 from expert_work.protocol import KnowledgeBase, KnowledgeChunk
 from orchestrator.graph_builder.retrieval_query import (
+    SMALL_TALK,
+    RetrievalQuery,
     build_retrieval_query,
     log_retrieval_query,
+    normalised,
     user_text,
 )
 from orchestrator.tools.knowledge import KnowledgeRetriever
@@ -173,51 +175,6 @@ _FUNCTION_WORDS: Final = frozenset(
 #: Messages shorter than this (letters / digits / CJK, after stripping) are not probed.
 PROBE_MIN_CHARS: Final = 2
 
-#: Greetings, thanks and acknowledgements (normalised: lower-case, no
-#: punctuation or spaces). Platform text, Chinese and English.
-SMALL_TALK: Final = frozenset(
-    {
-        "你好",
-        "您好",
-        "你好啊",
-        "嗨",
-        "哈喽",
-        "在吗",
-        "在不在",
-        "谢谢",
-        "谢谢你",
-        "多谢",
-        "感谢",
-        "好的",
-        "好",
-        "嗯",
-        "嗯嗯",
-        "收到",
-        "明白",
-        "知道了",
-        "ok",
-        "okay",
-        "再见",
-        "拜拜",
-        "早上好",
-        "晚上好",
-        "下午好",
-        "你是谁",
-        "你叫什么",
-        "你能做什么",
-        "hi",
-        "hello",
-        "hey",
-        "thanks",
-        "thankyou",
-        "thx",
-        "bye",
-        "goodbye",
-        "goodmorning",
-        "whoareyou",
-        "whatcanyoudo",
-    }
-)
 
 ProbeReason = Literal["hit", "miss", "small_talk", "not_turn_start", "no_bases", "timeout", "error"]
 
@@ -244,14 +201,10 @@ class ProbeOutcome:
     elapsed_ms: int = 0
 
 
-def _normalised(text: str) -> str:
-    """Lower-case, letters / digits / CJK only (spaces and punctuation gone)."""
-    return "".join(ch for ch in unicodedata.normalize("NFKC", text).lower() if ch.isalnum())
-
-
 def is_small_talk(text: str) -> bool:
-    """A greeting, thanks or acknowledgement — or too short to be about anything."""
-    flat = _normalised(text)
+    """A greeting, thanks or acknowledgement (:data:`SMALL_TALK`) — or too short to
+    be about anything."""
+    flat = normalised(text)
     return len(flat) < PROBE_MIN_CHARS or flat in SMALL_TALK
 
 
@@ -275,18 +228,20 @@ def latest_user_text(messages: Sequence[BaseMessage]) -> str | None:
     return user_text(messages[users[-1]]) if users is not None else None
 
 
-def turn_query(messages: Sequence[BaseMessage]) -> str | None:
-    """The probe's query, or ``None`` when this is not the first step of a
-    fresh user turn: the memory recall's query (:func:`build_retrieval_query`)
-    — a short or referring follow-up carries the previous user message and the
-    previous answer along, bounded."""
+def _turn_retrieval_query(messages: Sequence[BaseMessage]) -> RetrievalQuery | None:
     if _fresh_turn(messages) is None:
         return None
-    query = build_retrieval_query(messages)
-    if query is None:
-        return None
-    log_retrieval_query("knowledge_probe", query)
-    return query.text
+    return build_retrieval_query(messages)
+
+
+def turn_query(messages: Sequence[BaseMessage]) -> str | None:
+    """The probe's (vector) query, or ``None`` when this is not the first step of
+    a fresh user turn: the memory recall's query (:func:`build_retrieval_query`)
+    — a short or referring follow-up carries the previous user message and the
+    previous answer along, bounded. The keyword side reads the same text with
+    the message first (:attr:`RetrievalQuery.keyword_text`)."""
+    query = _turn_retrieval_query(messages)
+    return query.text if query is not None else None
 
 
 def probe_line(hits: Sequence[tuple[str, int]]) -> str | None:
@@ -348,12 +303,26 @@ class KnowledgeProbe:
         if is_small_talk(latest):
             return self._done(ProbeOutcome(reason="small_talk"))
         try:
-            query = (turn_query(messages) or latest)[-PROBE_MAX_QUERY_CHARS:]
+            built = _turn_retrieval_query(messages)
+            if built is not None:
+                log_retrieval_query("knowledge_probe", built)
+            # The keyword query keeps its first terms only (``KB_QUERY_MAX_TERMS``):
+            # the message goes first so the context cannot push its words out.
+            keyword_query = (built.keyword_text if built else latest)[-PROBE_MAX_QUERY_CHARS:]
+            vector_query = (built.text if built else latest)[-PROBE_MAX_QUERY_CHARS:]
             # Segmenting loads jieba's dictionary on first use (about a second,
             # blocking): done in a thread, outside the time budget.
-            terms = await asyncio.to_thread(build_kb_keyword_query, query)
+            terms = await asyncio.to_thread(build_kb_keyword_query, keyword_query)
+            # With context carried along, a keyword hit must also share a word of
+            # the message itself: the context alone is the previous topic.
+            anchor = (
+                await asyncio.to_thread(build_kb_keyword_query, built.current)
+                if built is not None and built.augmented
+                else None
+            )
             hits = await asyncio.wait_for(
-                self._hits(tenant_id, query, terms), timeout=self.timeout_s
+                self._hits(tenant_id, keyword_query, vector_query, terms, anchor),
+                timeout=self.timeout_s,
             )
         except TimeoutError:
             return self._done(ProbeOutcome(reason="timeout", elapsed_ms=_ms(started)))
@@ -384,7 +353,12 @@ class KnowledgeProbe:
         return outcome
 
     async def _hits(
-        self, tenant_id: UUID, query: str, terms: KbKeywordQuery | None
+        self,
+        tenant_id: UUID,
+        keyword_query: str,
+        vector_query: str,
+        terms: KbKeywordQuery | None,
+        anchor: KbKeywordQuery | None,
     ) -> list[tuple[str, int]] | None:
         """``(handle, related passages)`` of each base with any — ``None``
         when no bound base exists. At most :data:`PROBE_MAX_BASES` bases (the
@@ -401,12 +375,14 @@ class KnowledgeProbe:
         thresholds = [calibrated_threshold(base, live) for _handle, base in bases]
         vector: tuple[float, ...] | None = None
         if any(threshold is not None for threshold in thresholds):
-            vector = await self.retriever.query_vector(query, tenant_id)
+            vector = await self.retriever.query_vector(vector_query, tenant_id)
         gate = asyncio.Semaphore(PROBE_CONCURRENCY)
 
         async def related(base: KnowledgeBase, threshold: float | None) -> int:
             async with gate:
-                return await self._related(tenant_id, base, query, terms, vector, threshold)
+                return await self._related(
+                    tenant_id, base, keyword_query, terms, anchor, vector, threshold
+                )
 
         counts = await asyncio.gather(
             *(
@@ -424,6 +400,7 @@ class KnowledgeProbe:
         base: KnowledgeBase,
         query: str,
         terms: KbKeywordQuery | None,
+        anchor: KbKeywordQuery | None,
         vector: tuple[float, ...] | None,
         threshold: float | None,
     ) -> int:
@@ -433,7 +410,9 @@ class KnowledgeProbe:
             keyword = await store.keyword_search_scored(
                 tenant_id=tenant_id, kb_ids=[base.id], query=query, limit=PROBE_TOP_K
             )
-            related.update(hit.chunk.id for hit in keyword if keyword_related(terms, hit.chunk))
+            related.update(
+                hit.chunk.id for hit in keyword if keyword_related(terms, hit.chunk, anchor)
+            )
         if vector is not None and threshold is not None:
             nearest = await store.search_scored(
                 tenant_id=tenant_id, kb_ids=[base.id], query_embedding=vector, limit=PROBE_TOP_K
@@ -454,20 +433,35 @@ def _holds_run(tokens: Sequence[str], run: Sequence[str]) -> bool:
     )
 
 
-def keyword_related(query: KbKeywordQuery, chunk: KnowledgeChunk) -> bool:
-    """Whether ``chunk`` holds an identifier the query names, or at least
-    :data:`MIN_SHARED_TERMS` of its content words."""
-    tokens = _tokens(chunk.retrieval_text)
-    for phrase in query.phrases:
-        if _holds_run(tokens, [t for t in phrase.split() if is_searchable_token(t)]):
-            return True
-    present = set(tokens)
-    shared = {
+def _holds_phrase(tokens: Sequence[str], phrase: str) -> bool:
+    return _holds_run(tokens, [t for t in phrase.split() if is_searchable_token(t)])
+
+
+def _content_terms(query: KbKeywordQuery, present: set[str]) -> set[str]:
+    return {
         term
         for term in query.terms
         if len(term) >= MIN_TERM_CHARS and term not in _FUNCTION_WORDS and term in present
     }
-    return len(shared) >= MIN_SHARED_TERMS
+
+
+def keyword_related(
+    query: KbKeywordQuery, chunk: KnowledgeChunk, anchor: KbKeywordQuery | None = None
+) -> bool:
+    """Whether ``chunk`` holds an identifier the query names, or at least
+    :data:`MIN_SHARED_TERMS` of its content words. With an ``anchor`` (the
+    user's own message, when the query also carries the previous turn) the
+    chunk must besides share one of the anchor's identifiers or content words."""
+    tokens = _tokens(chunk.retrieval_text)
+    present = set(tokens)
+    if anchor is not None and not (
+        any(_holds_phrase(tokens, phrase) for phrase in anchor.phrases)
+        or _content_terms(anchor, present)
+    ):
+        return False
+    if any(_holds_phrase(tokens, phrase) for phrase in query.phrases):
+        return True
+    return len(_content_terms(query, present)) >= MIN_SHARED_TERMS
 
 
 def _ms(started: float) -> int:
