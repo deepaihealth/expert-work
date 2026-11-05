@@ -773,7 +773,9 @@ class Settings(BaseSettings):
     quality_monitor_batch_size: int = Field(default=200, gt=0)
     #: Judge model + provider (platform-credentialed, Haiku-tier for cost).
     quality_judge_provider: str = Field(default="anthropic")
-    quality_judge_model: str = Field(default="claude-haiku-4-5-20251001")
+    #: B-112 —— the catalog name (the dated ``-20251001`` id is not in the catalog,
+    #: so neither capability gates nor the rate card applied to it).
+    quality_judge_model: str = Field(default="claude-haiku-4-5")
     #: RT-5 PR-2 (RT-ADR-24/25) — quality-drift detector. Started alongside the
     #: sampler (same ``enable_quality_monitor`` gate): it reads the quality
     #: series and raises a ``quality.drift`` webhook when an agent's recent mean

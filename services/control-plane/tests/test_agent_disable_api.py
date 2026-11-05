@@ -51,7 +51,7 @@ spec:
   tenant_config: {}
   model:
     provider: anthropic
-    name: claude-sonnet-4-5
+    name: claude-sonnet-4-6
   system_prompt:
     template: "you are support"
   sandbox:

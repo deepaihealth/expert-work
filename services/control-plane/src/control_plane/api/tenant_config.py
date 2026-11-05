@@ -22,6 +22,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 
 from control_plane.api._authz import console_only, require
 from control_plane.invalidation_bus import InvalidationEvent
+from control_plane.manifest_model_names import iter_manifest_models
 from control_plane.ratelimit import parse_rate_limit_override
 from control_plane.tenancy import TenantConfigNotConfiguredError, TenantConfigService
 from control_plane.tenant_scope import (
@@ -100,27 +101,15 @@ async def _credentials_catalog(
 def _providers_referenced_by(
     record: AgentSpecRecord, *, embedding_provider: Provider
 ) -> set[Provider]:
-    """Providers a single agent transitively references — primary model +
-    its fallback chain, vision model + fallbacks, and
-    ``memory_consolidation.aux_model``.
+    """Providers a single agent transitively references — every model field,
+    fallbacks included (the walk shared with the B-112 model-name check).
 
     Mini-ADR O-12 — long-term memory uses the platform ``embedding_provider``
     (a platform-infra provider, not declared in any manifest model field), so
     an agent declaring ``memory.long_term`` references it too. Rerank is NOT
     included — a missing rerank credential degrades gracefully (Mini-ADR O-9)."""
     agent_spec = record.spec
-    used: set[Provider] = set()
-    stack = [agent_spec.spec.model]
-    if agent_spec.spec.vision is not None:
-        stack.append(agent_spec.spec.vision.model)
-        stack.extend(agent_spec.spec.vision.fallbacks)
-    consolidation = agent_spec.spec.policies.memory_consolidation
-    if consolidation.aux_model is not None:
-        stack.append(consolidation.aux_model)
-    while stack:
-        current = stack.pop()
-        used.add(current.provider)
-        stack.extend(current.fallback)
+    used: set[Provider] = {model.provider for _, model in iter_manifest_models(agent_spec)}
     memory = agent_spec.spec.memory
     if memory is not None and memory.long_term is not None:
         used.add(embedding_provider)

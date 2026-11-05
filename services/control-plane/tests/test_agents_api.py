@@ -44,7 +44,7 @@ spec:
   tenant_config: {}
   model:
     provider: anthropic
-    name: claude-sonnet-4-5
+    name: claude-sonnet-4-6
   system_prompt:
     template: "you are a reviewer"
   sandbox:
@@ -1141,6 +1141,75 @@ async def test_a_fixed_param_the_tool_does_not_declare_yet_gets_its_own_warning(
         "until it does and the agent is rebuilt: records/fetch_record (detail_level)"
     ) in warning
     assert "(project_code, detail_level)" not in warning
+
+
+# B-112 —— 模型名写错:以前构建放行,第一个 run 才被厂商 404(4xx 不切备用)。
+_TYPO_QWEN_YAML = _VALID_YAML.replace(
+    "provider: anthropic\n    name: claude-sonnet-4-6",
+    "provider: qwen\n    name: qwen3.6-pluss",
+)
+_SELF_HOSTED_YAML = _VALID_YAML.replace(
+    "provider: anthropic\n    name: claude-sonnet-4-6",
+    "provider: self-hosted\n    name: my-private-llm\n    base_url: http://llm.internal:8000",
+)
+
+
+@pytest.mark.asyncio
+async def test_create_rejects_a_model_name_outside_the_catalog(
+    b5_app_client: tuple[object, AsyncClient],
+) -> None:
+    """构建器这里故意永远成功:拦下它的必须是名字校验本身。"""
+    app, client = b5_app_client
+    app.state.agent_runtime.agent_builder = _ok_builder  # type: ignore[attr-defined]
+    assert "qwen3.6-pluss" in _TYPO_QWEN_YAML
+
+    resp = await client.post("/v1/agents", json={"manifest_yaml": _TYPO_QWEN_YAML})
+    assert resp.status_code == 422, resp.text
+    error = resp.json()["error"]
+    assert error["code"] == "MANIFEST_UNBUILDABLE"
+    assert "spec.model.name" in error["message"]
+    assert "'qwen3.6-pluss'" in error["message"]
+
+    listed = await client.get("/v1/agents")
+    assert all(i["name"] != "code-reviewer" for i in listed.json()["data"]["items"])
+
+
+@pytest.mark.asyncio
+async def test_a_self_hosted_model_name_is_not_checked_against_the_catalog(
+    b5_app_client: tuple[object, AsyncClient],
+) -> None:
+    """自部署服务的模型名是租户自己起的,目录里本来就没有。"""
+    app, client = b5_app_client
+    app.state.agent_runtime.agent_builder = _ok_builder  # type: ignore[attr-defined]
+    assert "my-private-llm" in _SELF_HOSTED_YAML
+
+    resp = await client.post("/v1/agents", json={"manifest_yaml": _SELF_HOSTED_YAML})
+    assert resp.status_code == 201, resp.text
+
+
+@pytest.mark.asyncio
+async def test_draft_reports_and_publish_refuses_an_off_catalog_model_name(
+    b5_app_client: tuple[object, AsyncClient],
+) -> None:
+    app, client = b5_app_client
+    app.state.agent_runtime.agent_builder = _ok_builder  # type: ignore[attr-defined]
+    live_sha = await _create(client)
+
+    saved = await client.put(
+        "/v1/agents/code-reviewer/1.0.0/draft",
+        json={"manifest_yaml": _TYPO_QWEN_YAML},
+        headers={"If-Match": live_sha},
+    )
+    assert saved.status_code == 200, saved.text
+    assert "'qwen3.6-pluss'" in saved.json()["data"]["build_error"]
+
+    published = await client.post(
+        "/v1/agents/code-reviewer/1.0.0/publish", headers={"If-Match": live_sha}
+    )
+    assert published.status_code == 422, published.text
+    assert "spec.model.name" in published.json()["error"]["message"]
+    detail = (await client.get("/v1/agents/code-reviewer/1.0.0")).json()["data"]["record"]
+    assert detail["spec_sha256"] == live_sha
 
 
 @pytest.mark.asyncio

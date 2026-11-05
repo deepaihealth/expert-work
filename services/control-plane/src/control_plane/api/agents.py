@@ -81,6 +81,7 @@ from control_plane.manifest import (
     ManifestSyntaxError,
     ManifestValidationError,
 )
+from control_plane.manifest_model_names import iter_manifest_models, off_catalog_models_error
 from control_plane.quota.base import QuotaService
 from control_plane.run_cancel import cancel_run_two_level
 from control_plane.runtime import AgentRuntime
@@ -256,25 +257,11 @@ def _collect_manifest_providers(spec: AgentSpec) -> set[Provider]:
     """Stream O Mini-ADR O-4 — collect every provider this manifest
     transitively references for the publish-time whitelist gate.
 
-    Mirrors :func:`control_plane.api.tenant_config._providers_referenced_by`
-    but operates on a single :class:`AgentSpec` rather than an iterable
-    of stored records. Includes the primary model + its fallback chain,
-    vision model + its fallbacks, and the memory_consolidation aux
-    model (Sprint #7).
+    Every model field the manifest has, fallbacks included — the same walk
+    as the B-112 model-name check (routing rules and dynamic workers used to
+    be missed here).
     """
-    referenced: set[Provider] = set()
-    stack = [spec.spec.model]
-    if spec.spec.vision is not None:
-        stack.append(spec.spec.vision.model)
-        stack.extend(spec.spec.vision.fallbacks)
-    consolidation = spec.spec.policies.memory_consolidation
-    if consolidation.aux_model is not None:
-        stack.append(consolidation.aux_model)
-    while stack:
-        current = stack.pop()
-        referenced.add(current.provider)  # type: ignore[arg-type]
-        stack.extend(current.fallback)
-    return referenced
+    return {model.provider for _, model in iter_manifest_models(spec)}
 
 
 def _envelope_error(code: str, message: str, status_code: int) -> JSONResponse:
@@ -1060,6 +1047,14 @@ async def _check_buildable(
     able to reach a known-good revision, and a gate there would hold the door
     shut from the inside.
     """
+    # B-112 —— a misspelled model name builds fine and dies on the first run
+    # (vendor 4xx, no fallback). Static, so it needs no runtime.
+    off_catalog = off_catalog_models_error(spec)
+    if off_catalog is not None:
+        record_manifest_build_check(outcome="rejected")
+        return _BuildCheck(
+            rejected=_envelope_error("MANIFEST_UNBUILDABLE", off_catalog, 422), error=off_catalog
+        )
     runtime = getattr(request.app.state, "agent_runtime", None)
     if runtime is None:
         # Router built without a runtime (a few test setups). Counted, not

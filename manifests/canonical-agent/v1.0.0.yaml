@@ -39,7 +39,7 @@ spec:
 
   model:
     provider: anthropic
-    name: claude-sonnet-4-5
+    name: claude-sonnet-4-6
     # No api_key_ref — the agent build resolves the anthropic key from the
     # platform-configured credential (Stream Q): an admin pastes it once in
     # /settings/platform and every agent on that provider uses it. A manifest
@@ -52,7 +52,7 @@ spec:
     supports_vision: true
     fallback:
       - provider: anthropic
-        name: claude-haiku-4-5-20251001
+        name: claude-haiku-4-5
         supports_vision: true
 
   system_prompt:

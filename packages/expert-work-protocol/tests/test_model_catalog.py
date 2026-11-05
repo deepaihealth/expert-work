@@ -46,6 +46,19 @@ def test_deepseek_legacy_aliases_deprecated_but_resolvable() -> None:
         assert entry is not None and entry.deprecated is True and entry.vision is False
 
 
+@pytest.mark.parametrize(
+    ("provider", "name"),
+    [("kimi", "kimi-k2.5"), ("doubao", "doubao-seed-2.0-pro"), ("doubao", "doubao-seed-2.0-lite")],
+)
+def test_b112_names_that_404_with_the_platform_key_are_deprecated(provider: str, name: str) -> None:
+    # B-105 T0 (2026-09-24): these three returned 404 when called with the
+    # platform key. Off the dropdown, but still resolvable so a manifest that
+    # already names one keeps saving and building.
+    assert name not in {e.name for e in models_for_provider(provider)}
+    entry = catalog_entry(provider, name)
+    assert entry is not None and entry.deprecated is True
+
+
 def test_deepseek_flash_capability_bits() -> None:
     """deepseek-flash = DeepSeek-V4.1-Flash (vendor docs 2026-10; probe
     2026-10-16): 1M context, thinking on by default with reasoning_effort,
