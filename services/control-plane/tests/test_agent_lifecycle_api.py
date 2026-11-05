@@ -18,7 +18,7 @@ from uuid import UUID, uuid4
 import pytest
 from httpx import ASGITransport, AsyncClient
 
-from control_plane.api.agent_lifecycle import build_agent_purge_deps
+import control_plane.api.agent_lifecycle as lifecycle
 from control_plane.app import create_app
 from control_plane.audit import build_default_audit_logger
 from control_plane.settings import Settings
@@ -326,7 +326,7 @@ def test_the_purge_deps_are_wired_from_app_state() -> None:
         jwt_verifier=build_test_jwt_verifier(),
     )
     state = app.state
-    deps = build_agent_purge_deps(SimpleNamespace(app=app))  # type: ignore[arg-type]
+    deps = lifecycle.build_agent_purge_deps(SimpleNamespace(app=app))  # type: ignore[arg-type]
 
     assert deps.secret_allowlist is state.secret_allowlist_store
     assert deps.agent_disable is state.agent_disable_repo
@@ -391,8 +391,6 @@ async def test_every_version_needs_delete_permission(
     ctx: _Ctx, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     from fastapi import HTTPException
-
-    import control_plane.api.agent_lifecycle as lifecycle
 
     await _create_and_delete(ctx.client)
     v2 = await ctx.client.post("/v1/agents", json={"manifest_yaml": _YAML_V2})
@@ -462,7 +460,6 @@ async def test_an_incomplete_purge_is_not_reported_as_success(
 async def test_blocked_at_mark_or_at_final_delete_is_409(
     ctx: _Ctx, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    import control_plane.api.agent_lifecycle as lifecycle
     from control_plane.purge.agent_purge import AgentPurgeBlockers
 
     async def _nothing_blocks(*_args: object, **_kwargs: object) -> AgentPurgeBlockers:
