@@ -178,8 +178,9 @@ def test_the_answer_is_the_last_text_answer_not_a_tool_call() -> None:
 def test_hidden_superseded_and_placeholder_messages_are_skipped() -> None:
     messages: list[BaseMessage] = [
         HumanMessage(content="张三的血压"),
-        AIMessage(content="旧回答 李四", additional_kwargs={SUPERSEDED_BY: "run-2"}),
         AIMessage(content="张三血压正常"),
+        # the latest answer, but replaced by a later run
+        AIMessage(content="旧回答 李四", additional_kwargs={SUPERSEDED_BY: "run-2"}),
         HumanMessage(content="他的血糖呢"),
         HumanMessage(content="[本轮输入] x", additional_kwargs={HIDE_FROM_UI: True}),
     ]
