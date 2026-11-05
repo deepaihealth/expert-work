@@ -196,6 +196,10 @@ async def test_purge_is_refused_while_another_agent_delegates_to_it(ctx: _Ctx) -
 
     assert resp.status_code == 409  # type: ignore[attr-defined]
     assert resp.json()["error"]["details"]["referenced_by"] == ["parent@1.0.0"]  # type: ignore[attr-defined]
+    # Refused up front: nothing was touched (not even the purging marker).
+    assert "summary" not in resp.json()["error"]["details"]  # type: ignore[attr-defined]
+    detail = await ctx.client.get(f"/v1/agents/{_NAME}/1.0.0")
+    assert detail.json()["data"]["record"]["status"] == "deleted"
 
 
 @pytest.mark.asyncio
