@@ -7,6 +7,7 @@ from uuid import UUID, uuid4
 import pytest
 
 from control_plane.api._artifact_content import (
+    VersionExpired,
     VersionNotRetained,
     VersionUnknown,
     choose_version,
@@ -51,3 +52,18 @@ def test_same_artifact_rules() -> None:
         choose_version(latest=latest, requested=1, pinned=_v(art, 1, copy=False))
     with pytest.raises(VersionUnknown):
         choose_version(latest=latest, requested=9, pinned=None)
+
+
+def test_a_missing_version_below_the_latest_has_expired() -> None:
+    """B-63 —— 版本号从 1 连续分配,单独删掉某一版的只有留存作业:比最新版小、却没有版本行的
+    那一版是超过保留期被清掉的;比最新版大的是从没有过。"""
+    art = uuid4()
+    latest = _v(art, 3)
+    with pytest.raises(VersionExpired) as caught:
+        choose_version(latest=latest, requested=2, pinned=None)
+    assert (caught.value.requested, caught.value.latest) == (2, 3)
+    with pytest.raises(VersionExpired):
+        choose_version(latest=latest, requested=1, pinned=None)
+    for never in (4, 0, -1):
+        with pytest.raises(VersionUnknown):
+            choose_version(latest=latest, requested=never, pinned=None)

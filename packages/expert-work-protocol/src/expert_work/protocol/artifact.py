@@ -50,6 +50,10 @@ class ArtifactVersion(BaseModel):
     #: ``None`` = B-235 之前登记的版本:没有副本,内容只能从 ``path_in_workspace`` 读,
     #: 而那个文件可能已被后来的同名登记覆盖。
     snapshot_key: str | None = None
+    #: B-63 —— 最后一次被下载的时间(三个下载端点都记,每版每天最多记一次);列加上之前
+    #: 没被下载过的为 ``None``。保留期从这一版的登记时间 / 这个时间 / 登记它的会话最后
+    #: 一次 run 三者最晚的那个算起。
+    last_used_at: datetime | None = None
 
 
 class Artifact(BaseModel):

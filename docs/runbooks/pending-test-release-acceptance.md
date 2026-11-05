@@ -1959,3 +1959,17 @@ oauth2 目录项本来就不在平台池里:不再碰平台池;`enabled` 切换�
 - [ ] **90.4 租户覆盖**:控制台「租户配置」JSON 里把平台租户的 `upload_retention_days` 设为 30。判据:保存时弹「确认改小保留期」(内容含「改小后最早今晚就会清理更多文件，且不可恢复」),取消则不改,确认后读视图显示 30(另一项显示「平台默认」);设 6 或 366 时保存失败(422);用 API 直接 PUT 30→10 不带 `confirm_retention_decrease=true` 回 409 `RETENTION_DECREASE_NOT_CONFIRMED`、值不变
 - [ ] **90.5 跑作业**:手动触发留存作业。判据:`c1`、`c4` 的行 `deleted_at` 有值、文件已删(`c4` 是因为租户改成了 30 天);`c2`、`c3` 行与文件都在、对外下载 200;作业日志 `uploads_expired` ≥ 2、退出码 0;另一个租户(若有自建测试租户则在其下放一条 40 天前的行)不受 30 天影响
 - [ ] **90.6 收尾**:租户配置里 `upload_retention_days` 设回 `null`(读视图显示「平台默认」,审计 `TENANT_CONFIG_WRITE` 的 `fields` 里有它);删本节建的会话、上传与 probe job;吊销临时 key
+
+## §91 产物按最后使用到期 + 已清理版本的 409 说清原因(B-63 PR2)
+
+**背景**:依赖 §90(同一次发布)。产物版本的「最后使用」= 登记时间 / `artifact_version.last_used_at`(三个下载端点下载成功时记,每版每天最多一次)/ 登记它的会话最后一次 run(`created_in_thread` 存的是 run id,经 `agent_run` 找到会话)三者最晚的;**最新版与产物行**用整条产物最晚的那个,所以只要有一版还在用,最新版与列表里的产物就都在;保留期 = `tenant_config.artifact_retention_days`(为空用 90)。迁移 `0184_b63_artifact_last_used` 加一列(可空)。已清理的旧版本:对外仍是 409 `ARTIFACT_VERSION_MISMATCH`,`message` 写明 `removed after its retention period`;控制台 / 会话面是 409 `detail.code = ARTIFACT_VERSION_EXPIRED`(B-235 之前没单独保留的那种改为 `ARTIFACT_VERSION_NOT_RETAINED`),对话页提示「这一版已超过保留期被清理」并给「下载最新版」。
+
+**怎么进**:同 §90。造过期行要用户逐次批准、只改本节自建的行(按 id);造完手动触发留存作业(`kubectl create job --from=cronjob/retention-cleanup b63-probe-<n>`)。**花费**:约 ¥2(几轮让智能体登记产物的短对话)。
+
+- [ ] **91.1 迁移**:发布后只读查 `alembic_version` = `0184_b63_artifact_last_used`;`artifact_version.last_used_at` 存在且可空
+- [ ] **91.2 记使用**:让智能体在会话 A 登记 `probe.md` 两版(v1、v2)。分别用对外下载、控制台产物页、对话页各下载一次 v1。判据:只读查 v1 的 `last_used_at` 有值,v2 仍为空;当天再下载一次 `last_used_at` 不变
+- [ ] **91.3 造过期行(用户批准后改库)**:① 会话 B 登记 `keep.md` v1、v2:两版 `created_at` 改 200 / 120 天前,会话 B 的 run 改 150 天前,v1 的 `last_used_at` 改 10 天前 —— 两版都应留、产物仍在列表;② 会话 C 登记 `mixed.md` v1、v2:`created_at` 200 / 120 天前,C 的 run 改 150 天前,v2 的 `last_used_at` 改 10 天前 —— v1 应删、v2 与产物留;③ 会话 D 登记 `gone.md` v1、v2:`created_at` 200 / 120 天前,D 的 run 改 150 天前,不设使用 —— 两版连文件与副本都删、产物离开列表;④ 会话 E 登记 `ran.md` v1:`created_at` 200 天前,E 里今天再发一轮 —— 应留(会话最近有 run)
+- [ ] **91.4 跑作业**:手动触发留存作业。判据:与 91.3 每条一致(文件、副本、版本行、列表);`audit_log` 的 `artifact:expired` 只出现 `mixed.md` 与 `gone.md`,`details.retention_days` = 90、`details.clock` = `last_use`;退出码 0
+- [ ] **91.5 已清理版本的提示**:对外 `GET …/artifacts/download?name=mixed.md&version=1` → 409 `ARTIFACT_VERSION_MISMATCH`,`message` 含 `removed after its retention period`;`version=9` → 409,`message` 是「has no version」那句。对话页 / 调试台点 `mixed.md` 第 1 版的产物按钮 → 弹窗「这一版已超过保留期被清理」+「下载最新版」(点了下到 v2);B-235 之前登记的老版本(若测试环境还有)仍提示「内容没有单独保留」
+- [ ] **91.6 租户覆盖**:租户配置设 `artifact_retention_days = 30`,新造一个只有一版、`created_at` 40 天前、会话 run 也 40 天前的产物,跑作业 → 被清,审计 `retention_days` = 30;再设回 `null`
+- [ ] **91.7 收尾**:删本节建的会话、产物与 probe job;租户配置恢复;吊销临时 key

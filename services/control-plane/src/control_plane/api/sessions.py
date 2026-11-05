@@ -32,6 +32,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from control_plane.api._artifact_content import (
     VERSION_HEADER,
+    VersionExpired,
     VersionNotRetained,
     VersionUnknown,
     choose_version,
@@ -745,8 +746,9 @@ def build_sessions_router() -> APIRouter:
         B-235 —— ``version`` 给了就下那一版(对话页 / 调试台每一轮带上这一轮登记的
         版本号),不给是最新版;内容读登记时的副本(选版规则见
         :mod:`control_plane.api._artifact_content`)。B-235 之前登记、已不是最新的
-        一版 → 409:前端据此提示「这一版内容没有单独保留」并给出「下载最新版」,
-        绝不拿最新版冒充。未知版本 → 404。
+        一版 → 409 ``ARTIFACT_VERSION_NOT_RETAINED``:前端据此提示「这一版内容没有单独保留」并
+        给出「下载最新版」,绝不拿最新版冒充。B-63 —— 超过保留期被清掉的一版 → 409
+        ``ARTIFACT_VERSION_EXPIRED``(提示「这一版已超过保留期被清理」)。未知版本 → 404。
         """
         scope = await ensure_single_tenant_scope(
             request.state.principal,
@@ -794,22 +796,42 @@ def build_sessions_router() -> APIRouter:
             chosen = choose_version(latest=latest, requested=version, pinned=pinned)
         except VersionUnknown as exc:
             raise HTTPException(status_code=404, detail="artifact version not found") from exc
+        except VersionExpired as exc:
+            # B-63 —— 与「B-235 之前登记、没有单独保留」同为 409,用 ``code`` 区分:前端据此
+            # 提示「这一版已超过保留期被清理」,两种都给「下载最新版」。
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "ARTIFACT_VERSION_EXPIRED",
+                    "message": (
+                        f"version {exc.requested} of this artifact was removed after its "
+                        f"retention period; the latest is {exc.latest}"
+                    ),
+                },
+            ) from exc
         except VersionNotRetained as exc:
             raise HTTPException(
                 status_code=409,
-                detail=(
-                    f"version {exc.requested} of this artifact was registered before per-version "
-                    f"copies existed and its content was not kept; the latest is {exc.latest}"
-                ),
+                detail={
+                    "code": "ARTIFACT_VERSION_NOT_RETAINED",
+                    "message": (
+                        f"version {exc.requested} of this artifact was registered before "
+                        f"per-version copies existed and its content was not kept; the latest "
+                        f"is {exc.latest}"
+                    ),
+                },
             ) from exc
         try:
-            data = await read_version_bytes(
-                chosen,
-                tenant_id=target_tenant,
-                user_id=meta.user_id,
-                snapshots=snapshots,
-                workspace_store=workspace_store,
-            )
+            # B-63 —— 读到之后记一次使用(写 ``artifact_version``),所以在目标租户的范围里读。
+            async with applied_scope(scope):
+                data = await read_version_bytes(
+                    chosen,
+                    tenant_id=target_tenant,
+                    user_id=meta.user_id,
+                    snapshots=snapshots,
+                    workspace_store=workspace_store,
+                    artifacts=artifacts,
+                )
         except WorkspacePermissionError as exc:
             # 元数据行存在,内容读不动是权限问题(服务端配置),不是"这个 artifact
             # 不存在"——同六处 workspace 端点的坑,必须排在下面的

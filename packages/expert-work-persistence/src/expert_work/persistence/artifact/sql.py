@@ -7,15 +7,74 @@ from datetime import UTC, datetime
 from typing import Any
 from uuid import UUID, uuid4
 
-from sqlalchemy import delete, select, text, update
+from sqlalchemy import ColumnElement, case, cast, delete, func, or_, select, text, update
+from sqlalchemy.dialects.postgresql import UUID as PG_UUID
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+from sqlalchemy.orm import InstrumentedAttribute, aliased
 
-from expert_work.persistence.artifact.base import ArtifactStore
+from expert_work.persistence.artifact.base import ArtifactStore, ExpiredArtifactVersion
 from expert_work.persistence.bulk_delete import count_where
-from expert_work.persistence.models import ArtifactRow, ArtifactVersionRow
+from expert_work.persistence.models import (
+    AgentRunRow,
+    ArtifactRow,
+    ArtifactVersionRow,
+    TenantConfigRow,
+)
 from expert_work.persistence.rls import require_rls_bypass
+from expert_work.persistence.user_upload.base import TOUCH_INTERVAL
 from expert_work.protocol import Artifact, ArtifactKind, ArtifactVersion
+
+#: ``created_in_thread`` 存的是 run id(TEXT;没有 run 时是 ``"save-artifact"`` 之类的回落常量)。
+#: 只有长得像 UUID 的才 cast 去按主键找 run —— cast 一个回落常量会让整条查询报错(迁移 0154
+#: 踩过),而反过来把 ``agent_run.id`` 转成 text 去比又用不上主键索引。
+_UUID_PATTERN = "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
+
+
+def _version_clock(v: type[ArtifactVersionRow]) -> ColumnElement[datetime]:
+    """B-63 —— 一版自己的「最后使用」:``greatest(created_at, last_used_at, 登记它的会话最后
+    一次 run)``。会话 = ``created_in_thread`` 那个 run 的 ``thread_id``;run 行已被清掉、或
+    存的是回落常量时这一项为空,``greatest`` 跳过它。"""
+    source_run = aliased(AgentRunRow)
+    thread_run = aliased(AgentRunRow)
+    run_id = case(
+        (v.created_in_thread.regexp_match(_UUID_PATTERN), cast(v.created_in_thread, PG_UUID)),
+        else_=None,
+    )
+    last_run = (
+        select(func.max(thread_run.created_at))
+        .select_from(source_run)
+        .join(
+            thread_run,
+            (thread_run.thread_id == source_run.thread_id)
+            & (thread_run.tenant_id == source_run.tenant_id),
+        )
+        .where(source_run.id == run_id, source_run.tenant_id == v.tenant_id)
+        .scalar_subquery()
+    )
+    return func.greatest(v.created_at, v.last_used_at, last_run)
+
+
+def _artifact_clock() -> ColumnElement[datetime]:
+    """B-63 —— 产物行(以及它的最新版)的「最后使用」:各版本时钟里最晚的那个;一个版本都
+    没有时退回 ``updated_at``。关联外层查询里的 :class:`ArtifactRow`。"""
+    v = aliased(ArtifactVersionRow)
+    newest = (
+        select(func.max(_version_clock(v))).where(v.artifact_id == ArtifactRow.id).scalar_subquery()
+    )
+    return func.coalesce(newest, ArtifactRow.updated_at)
+
+
+def _retention_days(
+    tenant_id: InstrumentedAttribute[UUID], default_days: int
+) -> ColumnElement[int]:
+    """租户的 ``artifact_retention_days``,没设(或没有配置行)用 ``default_days``。"""
+    tenant_days = (
+        select(TenantConfigRow.artifact_retention_days)
+        .where(TenantConfigRow.tenant_id == tenant_id)
+        .scalar_subquery()
+    )
+    return func.coalesce(tenant_days, default_days)
 
 
 def _row_to_artifact(row: ArtifactRow) -> Artifact:
@@ -47,6 +106,7 @@ def _row_to_version(row: ArtifactVersionRow) -> ArtifactVersion:
         created_in_thread=row.created_in_thread,
         created_at=row.created_at,
         snapshot_key=row.snapshot_key,
+        last_used_at=row.last_used_at,
     )
 
 
@@ -380,13 +440,22 @@ class SqlArtifactStore(ArtifactStore):
     async def list_active_past_retention(
         self,
         *,
-        before: datetime,
+        now: datetime,
+        default_days: int,
         limit: int = 1000,
     ) -> list[Artifact]:
+        expires_at = (
+            _artifact_clock()
+            + func.make_interval(0, 0, 0, _retention_days(ArtifactRow.tenant_id, default_days))
+        ).label("expires_at")
+        inner = (
+            select(ArtifactRow.id, expires_at).where(ArtifactRow.deleted_at.is_(None)).subquery()
+        )
         stmt = (
             select(ArtifactRow)
-            .where(ArtifactRow.deleted_at.is_(None), ArtifactRow.updated_at < before)
-            .order_by(ArtifactRow.updated_at.asc())
+            .join(inner, inner.c.id == ArtifactRow.id)
+            .where(inner.c.expires_at < now)
+            .order_by(inner.c.expires_at.asc(), ArtifactRow.id.asc())
             .limit(limit)
         )
         async with self._sf() as session:
@@ -457,26 +526,60 @@ class SqlArtifactStore(ArtifactStore):
     async def list_versions_expired(
         self,
         *,
-        before: datetime,
+        now: datetime,
+        default_days: int,
         limit: int = 1000,
-    ) -> list[ArtifactVersion]:
-        # 同一 ``created_at`` 的版本(同一事务里连登记几版、时钟粒度内的批量)按
-        # ``artifact_id, version`` 定序 —— 老版本先于新版本,跨 store 实现同义;
-        # 用 ``id``(uuid4)做 tiebreak 则同一产物两个版本谁先谁后是随机的
+    ) -> list[ExpiredArtifactVersion]:
+        v = ArtifactVersionRow
+        days = _retention_days(v.tenant_id, default_days)
+        # 最新版用产物的时钟(各版本里最晚的):最新版不会先于旧版本被清掉,产物也恰好在
+        # 最新版到期时离开列表(:meth:`list_active_past_retention` 同一个表达式)。父行不在
+        # (没有外键的孤儿版本)时按这一版自己的时钟。``CASE`` 只对最新版求产物时钟。
+        clock = case(
+            (v.version == ArtifactRow.latest_version, _artifact_clock()),
+            else_=_version_clock(v),
+        )
+        inner = (
+            select(
+                v.id,
+                (clock + func.make_interval(0, 0, 0, days)).label("expires_at"),
+                days.label("days"),
+            )
+            .outerjoin(ArtifactRow, ArtifactRow.id == v.artifact_id)
+            .subquery()
+        )
+        # 同一到期时刻的版本按 ``artifact_id, version`` 定序 —— 老版本先于新版本,跨 store
+        # 实现同义;用 ``id``(uuid4)做 tiebreak 则同一产物两个版本谁先谁后是随机的
         # (CI 实测:三跑两红)。
         stmt = (
-            select(ArtifactVersionRow)
-            .where(ArtifactVersionRow.created_at < before)
-            .order_by(
-                ArtifactVersionRow.created_at.asc(),
-                ArtifactVersionRow.artifact_id.asc(),
-                ArtifactVersionRow.version.asc(),
-            )
+            select(v, inner.c.days)
+            .join(inner, inner.c.id == v.id)
+            .where(inner.c.expires_at < now)
+            .order_by(inner.c.expires_at.asc(), v.artifact_id.asc(), v.version.asc())
             .limit(limit)
         )
         async with self._sf() as session:
-            rows = (await session.execute(stmt)).scalars().all()
-        return [_row_to_version(row) for row in rows]
+            rows = (await session.execute(stmt)).all()
+        return [
+            ExpiredArtifactVersion(version=_row_to_version(row), retention_days=int(d))
+            for row, d in rows
+        ]
+
+    async def touch_version(self, *, version_id: UUID, now: datetime) -> bool:
+        async with self._sf() as session:
+            result = await session.execute(
+                update(ArtifactVersionRow)
+                .where(
+                    ArtifactVersionRow.id == version_id,
+                    or_(
+                        ArtifactVersionRow.last_used_at.is_(None),
+                        ArtifactVersionRow.last_used_at < now - TOUCH_INTERVAL,
+                    ),
+                )
+                .values(last_used_at=now)
+            )
+            await session.commit()
+        return int(getattr(result, "rowcount", 0) or 0) > 0
 
     async def list_versions_by_artifact(self, *, artifact_id: UUID) -> list[ArtifactVersion]:
         stmt = (

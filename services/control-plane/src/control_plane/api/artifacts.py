@@ -38,6 +38,7 @@ from pydantic import BaseModel, ConfigDict
 
 from control_plane.api._artifact_content import (
     VERSION_HEADER,
+    VersionExpired,
     VersionNotRetained,
     VersionUnknown,
     choose_version,
@@ -251,13 +252,30 @@ def build_artifacts_router() -> APIRouter:
             chosen = choose_version(latest=latest, requested=version, pinned=pinned)
         except VersionUnknown as exc:
             raise HTTPException(status_code=404, detail="artifact version not found") from exc
+        except VersionExpired as exc:
+            # B-63 —— 与「B-235 之前登记、没有单独保留」同为 409,用 ``code`` 区分:前端据此
+            # 提示「这一版已超过保留期被清理」,两种都给「下载最新版」。
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "ARTIFACT_VERSION_EXPIRED",
+                    "message": (
+                        f"version {exc.requested} of this artifact was removed after its "
+                        f"retention period; the latest is {exc.latest}"
+                    ),
+                },
+            ) from exc
         except VersionNotRetained as exc:
             raise HTTPException(
                 status_code=409,
-                detail=(
-                    f"version {exc.requested} of this artifact was registered before per-version "
-                    f"copies existed and its content was not kept; the latest is {exc.latest}"
-                ),
+                detail={
+                    "code": "ARTIFACT_VERSION_NOT_RETAINED",
+                    "message": (
+                        f"version {exc.requested} of this artifact was registered before "
+                        f"per-version copies existed and its content was not kept; the latest "
+                        f"is {exc.latest}"
+                    ),
+                },
             ) from exc
         # Mini-ADR J-25 (J.9-step2) — quota admission. ``cost=1`` deducts
         # from QPS + ``ARTIFACT_DOWNLOAD_COUNT_30D`` (only the
@@ -282,13 +300,16 @@ def build_artifacts_router() -> APIRouter:
                 detail="artifact download unavailable: no sandbox supervisor configured",
             )
         try:
-            data = await read_version_bytes(
-                chosen,
-                tenant_id=target_tenant,
-                user_id=target_user_id,
-                snapshots=snapshots,
-                workspace_store=workspace_store,
-            )
+            # B-63 —— 读到之后记一次使用(写 ``artifact_version``),所以在目标租户的范围里读。
+            async with applied_scope(scope):
+                data = await read_version_bytes(
+                    chosen,
+                    tenant_id=target_tenant,
+                    user_id=target_user_id,
+                    snapshots=snapshots,
+                    workspace_store=workspace_store,
+                    artifacts=store,
+                )
         except WorkspacePermissionError as exc:
             # 元数据行存在,内容读不动是权限问题(服务端配置),不是"这个 artifact
             # 不存在"——"gone / unreadable" 不能再合并成一个 404(同六处

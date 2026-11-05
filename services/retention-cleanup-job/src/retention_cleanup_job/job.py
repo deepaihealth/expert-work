@@ -21,7 +21,8 @@ NOLOGIN BYPASSRLS with the minimum delete grants).
 留存链 PR2(波 3 线 R,用户 2026-09-09 拍板:产物 90 天、上传 90 天、已删工作区
 库行 90 天销账)在这之上加了三条碰 NAS 工作区的规则 + 一条不变式:
 
-* B-28 ``_sweep_artifact_versions`` —— ``artifact_version.created_at`` 满 90 天:
+* B-28 ``_sweep_artifact_versions`` —— 版本按最后使用(B-63:登记时间 / ``last_used_at`` /
+  登记它的会话最后一次 run 最晚的那个;最新版用整条产物最晚的那个)满租户保留期(默认 90 天):
   删 NAS 文件 + 删版本行;版本清空的 ``artifact`` 行标过期(复用 ``deleted_at``)。
 * 上传 ``_sweep_uploads`` —— 最后使用(B-63:``created_at`` / ``last_used_at`` / 会话最后一次
   run 最晚的那个)满租户保留期(默认 90 天):按会话当前的 agent / 布局
@@ -441,9 +442,13 @@ class RetentionCleanupJob:
         return hard, len(pending)
 
     async def _sweep_artifact_versions(self) -> tuple[int, int, int]:
-        """留存链 B-28 —— 产物按**版本** 90 天。
+        """留存链 B-28 —— 产物按**版本**到期。
 
-        ``artifact_version.created_at < now - artifact_retention_days`` 的版本:
+        B-63 —— 按**最后使用**:一版自己的时钟是 ``greatest(created_at, last_used_at, 登记它的
+        会话最后一次 run)``,最新版用整条产物最晚的那个时钟(所以最新版不会先于旧版本被清,
+        产物离开列表的那一刻正是最新版到期的那一刻);保留期是租户的
+        ``tenant_config.artifact_retention_days``,没设用 ``artifact_retention_days``。谓词在
+        :meth:`ArtifactStore.list_versions_expired`。到期的版本:
         删它登记时留的副本(B-235)+ NAS 文件(``path_in_workspace``,只 unlink 那一个
         普通文件;**同一路径还有别的版本在用时不删**,见
         :func:`~retention_cleanup_job.artifact_copies.release_version_files`)+ 删版本行;
@@ -461,13 +466,14 @@ class RetentionCleanupJob:
         if self._artifact_store is None or self._workspace_root is None:
             return 0, 0, 0
         now = datetime.now(UTC)
-        cutoff = now - timedelta(days=self._artifact_retention_days)
         expired = await self._artifact_store.list_versions_expired(
-            before=cutoff, limit=self._batch_size
+            now=now, default_days=self._artifact_retention_days, limit=self._batch_size
         )
         by_artifact: dict[UUID, list[ArtifactVersion]] = {}
-        for version in expired:
-            by_artifact.setdefault(version.artifact_id, []).append(version)
+        retention_days: dict[UUID, int] = {}
+        for entry in expired:
+            by_artifact.setdefault(entry.version.artifact_id, []).append(entry.version)
+            retention_days[entry.version.artifact_id] = entry.retention_days
         versions_deleted = files_removed = artifacts_expired = 0
         for artifact_id, versions in by_artifact.items():
             deletable, removed_here = await release_version_files(
@@ -487,7 +493,9 @@ class RetentionCleanupJob:
                 "versions_deleted": sorted(v.version for v in versions if v.id in deletable),
                 "files_removed": removed_here,
                 "artifact_expired": expired_now,
-                "retention_days": self._artifact_retention_days,
+                # B-63 —— 这个租户实际生效的天数(按最后使用算起)。
+                "retention_days": retention_days[artifact_id],
+                "clock": "last_use",
             }
             if not expired_now:
                 # 审计要能自解释:没标过期是因为还有版本(正常,含本轮删不掉
@@ -515,8 +523,11 @@ class RetentionCleanupJob:
     async def _sweep_artifacts(self) -> tuple[int, int]:
         """Mini-ADR J-25 (J.9-step1) — two-stage artifact lifecycle sweep.
 
-        Stage 1: active rows past ``artifact_retention_days`` → soft-delete
-        (sets ``deleted_at``). Stage 2: soft-deleted rows past
+        Stage 1: active rows past their retention window → soft-delete
+        (sets ``deleted_at``). B-63: the window counts from **last use** — the same
+        clock and tenant days as the latest version in
+        :meth:`_sweep_artifact_versions` (which runs first), so a row leaves the list
+        exactly when its latest version expires. Stage 2: soft-deleted rows past
         ``artifact_hard_delete_grace_days`` → hard-delete (row +
         version rows).
 
@@ -531,13 +542,21 @@ class RetentionCleanupJob:
         if self._artifact_store is None:
             return 0, 0
         now = datetime.now(UTC)
-        # Stage 1 — soft-delete active rows past retention.
-        soft_cutoff = now - timedelta(days=self._artifact_retention_days)
+        # Stage 1 — soft-delete active rows past retention (B-63: last use).
         active = await self._artifact_store.list_active_past_retention(
-            before=soft_cutoff, limit=self._batch_size
+            now=now, default_days=self._artifact_retention_days, limit=self._batch_size
         )
         soft_count = 0
         for row in active:
+            # B-63 —— 版本 pass(先跑)已经把这条产物到期的版本连文件清掉、清空的行也标了过期;
+            # 还剩版本行 = 某个文件今天删不掉(明天再试)或这一批没轮到。那时产物留在列表里、
+            # 与剩下的版本一起,不出现「列表里没了、版本还在」。没配工作区根时版本 pass 不跑,
+            # 照旧按时钟软删。
+            if (
+                self._workspace_root is not None
+                and await self._artifact_store.list_versions_by_artifact(artifact_id=row.id)
+            ):
+                continue
             ok = await self._artifact_store.soft_delete(
                 tenant_id=row.tenant_id,
                 user_id=row.user_id,

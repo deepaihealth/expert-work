@@ -590,3 +590,44 @@ async def test_old_orphan_dir_with_one_fresh_file_is_kept(world: _World) -> None
 
     assert (old_dir / "TODO.md").exists()
     assert report.thread_dirs_removed == 0
+
+
+# ------------------------------------------------------------ B-63 (last use)
+
+
+@pytest.mark.asyncio
+async def test_a_recently_downloaded_old_version_keeps_the_artifact_whole(world: _World) -> None:
+    """B-63 —— v1 200 天前登记、10 天前还被下载过;v2(最新)120 天前登记、没人下载过。v1 自己
+    没到期;v2 是最新版,按整条产物最晚的时钟也没到期:两个版本、两份文件、列表里的产物都在。"""
+    w = world
+    t, u = w.tenant, w.user
+    artifact_id = await _register_version(
+        w.artifacts,
+        tenant=t,
+        user=u,
+        name="kept.md",
+        path="kept_v1.md",
+        created_at=datetime.now(UTC) - timedelta(days=200),
+    )
+    await _register_version(
+        w.artifacts,
+        tenant=t,
+        user=u,
+        name="kept.md",
+        path="kept.md",
+        created_at=datetime.now(UTC) - timedelta(days=120),
+    )
+    used_at = datetime.now(UTC) - timedelta(days=10)
+    w.artifacts._versions = [
+        v.model_copy(update={"last_used_at": used_at})
+        if v.artifact_id == artifact_id and v.version == 1
+        else v
+        for v in w.artifacts._versions
+    ]
+    files = [_write(w.root, t, u, rel) for rel in ("kept_v1.md", "kept.md")]
+
+    await w.job().run_once()
+
+    versions = await w.artifacts.list_versions(tenant_id=t, user_id=u, artifact_id=artifact_id)
+    assert versions is not None and [v.version for v in versions] == [2, 1]
+    assert all(f.exists() for f in files)

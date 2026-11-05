@@ -1322,6 +1322,166 @@ async def test_uploads_expire_by_last_use_and_tenant_days_against_postgres(
 
 
 @pytest.mark.asyncio
+async def test_artifacts_expire_by_last_use_and_tenant_days_against_postgres(
+    db_fixture: tuple[AsyncEngine, AsyncEngine, str], tmp_path: Path
+) -> None:
+    """B-63 —— 产物两条 pass 走真库:版本按自己的最后使用(登记 / 下载 / 登记它的会话最后一次
+    run),最新版与产物行按整条产物最晚的那个;租户保留期覆盖默认。产物从列表消失与版本被清
+    同时发生,不会一边在一边不在。"""
+    from expert_work.persistence import SqlArtifactStore
+    from expert_work.runtime.audit import (
+        AuditLogger,
+        DefaultSecretRedactor,
+        InMemoryAuditFallbackQueue,
+    )
+    from retention_cleanup_job.main import build_session_factory
+
+    _app_engine, worker_engine, sync_admin = db_fixture
+    try:
+        sf = build_session_factory(worker_engine)
+        artifacts = SqlArtifactStore(sf)
+        short_tenant, plain_tenant, user = uuid4(), uuid4(), uuid4()
+        _seed_tenant_config(sync_admin, tenant_id=short_tenant, audit_days=90, event_days=30)
+        ran_run, ran_thread = uuid4(), uuid4()
+        files: dict[str, Path] = {}
+        versions: dict[str, UUID] = {}
+
+        async def _save(tenant: UUID, name: str, n: int, *, run: str = "save-artifact") -> UUID:
+            path = f"{name}.v{n}"
+            v = await artifacts.save_version(
+                tenant_id=tenant,
+                user_id=user,
+                agent_key=_AGENT_KEY,
+                name=name,
+                kind="document",
+                path_in_workspace=path,
+                created_in_thread=run,
+            )
+            target = tmp_path / str(tenant) / str(user) / path
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(b"x")
+            files[path] = target
+            versions[path] = v.id
+            return v.artifact_id
+
+        s_idle = await _save(short_tenant, "s-idle", 1)  # 40d → gone (tenant: 30d)
+        s_ran = await _save(short_tenant, "s-ran", 1, run=str(ran_run))  # 200d, run 10d → kept
+        p_mixed = await _save(plain_tenant, "p-mixed", 1)  # 200d, unused → gone
+        await _save(plain_tenant, "p-mixed", 2)  # latest: 120d, downloaded 10d ago → kept
+        p_40 = await _save(plain_tenant, "p-40", 1)  # 40d → kept (default 90)
+        p_old = await _save(plain_tenant, "p-old", 1)  # 200d → gone
+        await _save(plain_tenant, "p-old", 2)  # 120d → gone with the row
+
+        ages = {
+            "s-idle.v1": 40,
+            "s-ran.v1": 200,
+            "p-mixed.v1": 200,
+            "p-mixed.v2": 120,
+            "p-40.v1": 40,
+            "p-old.v1": 200,
+            "p-old.v2": 120,
+        }
+        admin = create_engine(sync_admin, isolation_level="AUTOCOMMIT")
+        try:
+            with admin.connect() as conn:
+                conn.execute(
+                    text(
+                        "UPDATE tenant_config SET artifact_retention_days = 30 WHERE tenant_id = :t"
+                    ),
+                    {"t": str(short_tenant)},
+                )
+                for path, days in ages.items():
+                    conn.execute(
+                        text(
+                            "UPDATE artifact_version SET created_at = now() - "
+                            "make_interval(days => :d) WHERE id = :v"
+                        ),
+                        {"d": days, "v": str(versions[path])},
+                    )
+                conn.execute(
+                    text(
+                        "UPDATE artifact SET updated_at = now() - interval '200 days' "
+                        "WHERE tenant_id IN (:a, :b)"
+                    ),
+                    {"a": str(short_tenant), "b": str(plain_tenant)},
+                )
+                conn.execute(
+                    text(
+                        "UPDATE artifact_version SET last_used_at = now() - interval '10 days' "
+                        "WHERE id = :v"
+                    ),
+                    {"v": str(versions["p-mixed.v2"])},
+                )
+                for run_id, days in ((ran_run, 200), (uuid4(), 10)):
+                    conn.execute(
+                        text(
+                            "INSERT INTO agent_run (id, tenant_id, thread_id, status, "
+                            " on_disconnect, created_at, updated_at) VALUES (:r, :t, :th, "
+                            " 'success', 'continue', now() - make_interval(days => :d), now())"
+                        ),
+                        {
+                            "r": str(run_id),
+                            "t": str(short_tenant),
+                            "th": str(ran_thread),
+                            "d": days,
+                        },
+                    )
+        finally:
+            admin.dispose()
+
+        audit_store = SqlAuditLogStore(sf)
+        job = RetentionCleanupJob(
+            db_session_factory=sf,
+            artifact_store=artifacts,
+            artifact_retention_days=90,
+            workspace_root=str(tmp_path),
+            audit_logger=AuditLogger(
+                store=audit_store,
+                redactor=DefaultSecretRedactor(),
+                fallback=InMemoryAuditFallbackQueue(),
+            ),
+        )
+        await job.run_once()
+
+        gone = {path for path, f in files.items() if not f.exists()}
+        assert gone == {"s-idle.v1", "p-mixed.v1", "p-old.v1", "p-old.v2"}
+
+        async def _state(tenant: UUID, artifact_id: UUID) -> tuple[bool, list[int]]:
+            rows = await artifacts.list_for_user(
+                tenant_id=tenant, user_id=user, agent_key=_AGENT_KEY, include_deleted=True
+            )
+            row = next(r for r in rows if r.id == artifact_id)
+            left = await artifacts.list_versions_by_artifact(artifact_id=artifact_id)
+            return row.deleted_at is None, sorted(v.version for v in left)
+
+        assert await _state(short_tenant, s_idle) == (False, [])
+        assert await _state(short_tenant, s_ran) == (True, [1])
+        assert await _state(plain_tenant, p_mixed) == (True, [2])
+        assert await _state(plain_tenant, p_40) == (True, [1])
+        assert await _state(plain_tenant, p_old) == (False, [])
+
+        admin = create_engine(sync_admin, isolation_level="AUTOCOMMIT")
+        try:
+            with admin.connect() as conn:
+                rows = conn.execute(
+                    text(
+                        "SELECT resource_id, details->>'retention_days' FROM audit_log "
+                        "WHERE action = 'artifact:expired' AND tenant_id IN (:a, :b)"
+                    ),
+                    {"a": str(short_tenant), "b": str(plain_tenant)},
+                ).all()
+        finally:
+            admin.dispose()
+        assert {(r[0], r[1]) for r in rows} == {
+            (str(s_idle), "30"),
+            (str(p_mixed), "90"),
+            (str(p_old), "90"),
+        }
+    finally:
+        await worker_engine.dispose()
+
+
+@pytest.mark.asyncio
 async def test_a_first_failure_right_after_a_tenant_lowers_its_days_is_retried(
     db_fixture: tuple[AsyncEngine, AsyncEngine, str],
     tmp_path: Path,
