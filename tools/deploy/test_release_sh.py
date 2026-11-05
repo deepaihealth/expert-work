@@ -18,6 +18,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import pytest
+import yaml
 
 _RELEASE_SH = Path(__file__).resolve().parent / "release.sh"
 
@@ -34,6 +35,25 @@ _KUBECTL_STUB = r"""#!/usr/bin/env bash
 printf 'kubectl %s\n' "$*" >>"${STUB_CALLS}"
 fail() { echo "stub kubectl: simulated failure ($1)" >&2; exit 1; }
 case " $* " in
+    *" get job migrate "*)
+        # B-228 — the migrate Job's true conditions. STUB_MIGRATE=Failed for a
+        # broken / lock-timed-out migration; default: it completed.
+        [[ "${STUB_FAIL:-}" == "get-job" ]] && fail get-job
+        echo "${STUB_MIGRATE:-Complete}"
+        ;;
+    *" logs job/migrate "*) echo "ERROR: canceling statement due to lock timeout" ;;
+    *" get pods -l job-name=migrate "*) echo "migrate-abcde   0/1   Error   0" ;;
+    *" get deploy/"*)
+        # The --images guard reads each untouched image off the cluster;
+        # STUB_LIVE_<NAME> overrides, default = what the overlay pins.
+        name="$*"; name="${name#*get deploy/}"; name="${name%% *}"
+        case "${name}" in
+            control-plane) tag="${STUB_LIVE_CONTROL_PLANE:-aaaa1111}" ;;
+            admin-ui) tag="${STUB_LIVE_ADMIN_UI:-aaaa1111-test}" ;;
+            credential-proxy) tag="${STUB_LIVE_CREDENTIAL_PROXY:-aaaa1111}" ;;
+        esac
+        printf 'registry.example/expert-work/%s:%s' "${name}" "${tag}"
+        ;;
     *" get deploy -o name "*)
         [[ "${STUB_FAIL:-}" == "get-deploy" ]] && fail get-deploy
         [[ "${STUB_EMPTY_DEPLOYS:-}" == "1" ]] && exit 0
@@ -79,7 +99,13 @@ case " $* " in
             echo closed
         fi >"${STUB_CANARY_STDIN_FILE:-/dev/null}"
         if [[ "${STUB_FAIL:-}" == "canary" ]]; then
-            echo "RESULT: FAIL — the release is NOT good."
+            echo "RESULT: FAIL (wrong result) — the release is NOT good."
+            exit 1
+        fi
+        if [[ "${STUB_FAIL:-}" == "canary-no-sandbox" ]]; then
+            echo "could not get a sandbox:"
+            echo "  exec_python: [tool error] SandboxSupervisorError: sandbox create failed: boom"
+            echo "RESULT: FAIL (no sandbox) — the release is NOT good."
             exit 1
         fi
         [[ "${STUB_CANARY_SILENT:-}" == "1" ]] && exit 0
@@ -374,6 +400,144 @@ def test_unseeded_canary_is_a_warning_not_a_failure(harness: Harness) -> None:
     assert "RELEASE FAILED" not in r.stderr
     assert "exec -i" not in harness.calls()
     assert f"Release {NEW_TAG} done" in r.stdout
+
+
+def test_canary_without_a_sandbox_says_so_and_keeps_the_rollback_advice(
+    harness: Harness,
+) -> None:
+    """B-87 ② — "could not get a sandbox" is told apart from "ran and got it
+    wrong", but it can still be this release (the e2b incident was), so the
+    rollback command stays."""
+    r = harness.run(STUB_FAIL="canary-no-sandbox")
+    assert r.returncode != 0
+    assert "RESULT: FAIL (no sandbox)" in r.stdout
+    assert "The canary could not get a sandbox" in r.stderr
+    assert "kubectl -n default get sandboxset expert-work-sandbox" in r.stderr
+    assert f"tools/deploy/rollback.sh test {PREV_TAG}" in r.stderr
+
+
+def test_wrong_result_canary_does_not_blame_the_sandbox(harness: Harness) -> None:
+    r = harness.run(STUB_FAIL="canary")
+    assert "CANARY FAILED" in r.stderr
+    assert "could not get a sandbox" not in r.stderr
+
+
+# --------------------------------------------------------------------------- B-228 migrate first
+
+
+def _call_index(calls: list[str], needle: str) -> int:
+    hits = [i for i, line in enumerate(calls) if needle in line]
+    assert hits, f"no call containing {needle!r} in:\n" + "\n".join(calls)
+    return hits[0]
+
+
+def test_migration_completes_before_the_deployments_are_applied(harness: Harness) -> None:
+    """B-228 — the Job used to go out in the same ``apply -k`` as the
+    Deployments, so new pods could start before the columns they read existed."""
+    r = harness.run()
+    assert r.returncode == 0, r.stderr
+    calls = harness.calls().splitlines()
+    overlay = str(harness.overlay.parent)
+    migrate_only = _call_index(
+        calls, f"kubectl apply -k {overlay} -l app.kubernetes.io/name=migrate"
+    )
+    waited = _call_index(calls, "kubectl -n expert-work get job migrate")
+    full = [i for i, line in enumerate(calls) if line == f"kubectl apply -k {overlay}"]
+    assert len(full) == 1, calls
+    rollout = _call_index(calls, "rollout status")
+    assert _call_index(calls, "delete job migrate") < migrate_only < waited < full[0] < rollout
+
+
+def test_dry_run_prints_the_migrate_first_order_and_touches_nothing(harness: Harness) -> None:
+    r = harness.run("--dry-run")
+    assert r.returncode == 0, r.stderr
+    out = r.stdout
+    overlay = str(harness.overlay.parent)
+    migrate = out.index(f"DRY-RUN> kubectl apply -k {overlay} -l app.kubernetes.io/name=migrate")
+    wait = out.index("DRY-RUN> wait until job/migrate is Complete")
+    full = out.index(f"DRY-RUN> kubectl apply -k {overlay}\n")
+    assert migrate < wait < full
+    assert "kubectl" not in harness.calls()
+
+
+def test_failed_migration_stops_before_any_deployment_is_applied(harness: Harness) -> None:
+    r = harness.run(STUB_MIGRATE="FailureTarget Failed")
+    assert r.returncode != 0
+    assert "RELEASE FAILED at stage 3 migrate" in r.stderr
+    calls = harness.calls().splitlines()
+    overlay = str(harness.overlay.parent)
+    assert f"kubectl apply -k {overlay}" not in calls, "Deployments must not be applied"
+    assert "rollout status" not in harness.calls()
+    assert "smoke.sh" not in harness.calls()
+    # What it saw, and that nothing needs rolling back.
+    assert "canceling statement due to lock timeout" in r.stderr
+    assert "migrate-abcde" in r.stderr
+    assert "the Deployments were NOT applied" in r.stderr
+    assert "rollback.sh" not in r.stderr
+
+
+def test_migrate_transport_failure_also_says_nothing_was_applied(harness: Harness) -> None:
+    """A kubectl failure while polling dies in set -e, still in stage 3
+    migrate — the EXIT trap must not print rollback commands for a cluster
+    whose Deployments were never touched."""
+    r = harness.run(STUB_FAIL="get-job")
+    assert r.returncode != 0
+    assert "RELEASE FAILED at stage 3 migrate" in r.stderr
+    assert "nothing to roll back" in r.stderr
+    assert "rollback.sh" not in r.stderr
+    assert f"kubectl apply -k {harness.overlay.parent}" not in harness.calls().splitlines()
+
+
+def test_migrate_job_selector_matches_only_the_job() -> None:
+    """``apply -l app.kubernetes.io/name=migrate`` must pick the Job and
+    nothing else out of the rendered overlay — and the Job must carry the
+    lock timeout the 11-04 releases set by hand."""
+    base = Path(__file__).resolve().parents[2] / "infra" / "k8s" / "base"
+    labelled = []
+    for path in sorted(base.rglob("*.yaml")):
+        for doc in yaml.safe_load_all(path.read_text(encoding="utf-8")):
+            if not isinstance(doc, dict) or "kind" not in doc:
+                continue
+            labels = (doc.get("metadata") or {}).get("labels") or {}
+            if labels.get("app.kubernetes.io/name") == "migrate":
+                labelled.append((doc["kind"], doc["metadata"]["name"]))
+    assert labelled == [("Job", "migrate")]
+    job = yaml.safe_load((base / "control-plane" / "migrate-job.yaml").read_text(encoding="utf-8"))
+    env = job["spec"]["template"]["spec"]["containers"][0]["env"]
+    assert {"name": "PGOPTIONS", "value": "-c lock_timeout=5s"} in env
+
+
+# --------------------------------------------------------------------------- --images guard
+
+
+def test_subset_release_refuses_when_the_cluster_is_ahead_of_the_overlay(
+    harness: Harness,
+) -> None:
+    """2026-09-30: admin-ui was live on a newer tag than the overlay (record PR
+    unmerged); a ``--images control-plane,credential-proxy`` release applied
+    the whole overlay and silently rolled admin-ui back, smoke green."""
+    r = harness.run(
+        "--images", "control-plane,credential-proxy", STUB_LIVE_ADMIN_UI="cccc3333-test"
+    )
+    assert r.returncode != 0
+    assert "admin-ui: cluster runs cccc3333-test, overlay pins aaaa1111-test" in r.stderr
+    assert "Nothing was built or applied" in r.stderr
+    assert "build-push.sh" not in harness.calls()
+    assert "kubectl apply" not in harness.calls()
+
+
+def test_subset_release_proceeds_when_the_overlay_matches(harness: Harness) -> None:
+    r = harness.run("--images", "control-plane,credential-proxy")
+    assert r.returncode == 0, r.stderr
+    assert "get deploy/admin-ui" in harness.calls()
+    # Only the image left out is checked.
+    assert "get deploy/control-plane" not in harness.calls()
+
+
+def test_full_release_skips_the_subset_guard(harness: Harness) -> None:
+    r = harness.run(STUB_LIVE_ADMIN_UI="cccc3333-test")
+    assert r.returncode == 0, r.stderr
+    assert "get deploy/" not in harness.calls()
 
 
 # --------------------------------------------------------------------------- X-14 P5 previous tag

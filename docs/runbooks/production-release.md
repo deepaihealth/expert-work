@@ -292,8 +292,14 @@ canonical-agent-e2e-test.md 是全量 SOP,以下是最小闭环):
 
 ### 2.0 发布前先清点「release.sh 不覆盖的动作」
 
-`release.sh prod` 只做四件事:**建推三个镜像 → 钉 overlay newTag →
-`apply -k`(含 migrate Job = `alembic upgrade head`)→ rollout + smoke**。
+`release.sh prod` 只做这几件事:**建推三个镜像 → 钉 overlay newTag →
+先单独下发 migrate Job(`alembic upgrade head`,带 `lock_timeout=5s`)并等它 Complete →
+`apply -k` 整份 overlay → rollout + smoke + 金丝雀**。迁移失败就停在 stage 3 migrate,
+Deployment 一个都没动(B-228;此前 10-29 / 11-04 两次都是手工先跑迁移,现在不用了)。
+
+**这一版动了沙箱链路(e2b / kruise / supervisor 依赖,或沙箱镜像)的,清点时必须写进执行单:
+在测试集群跑一次 [deployment.md](./deployment.md) §11.1 的 contract-run,零 skip 全过才发**(X-14 P4)。CI 的契约套件跑不到 NAS 那两条,e2b 事故就是
+「评审漏钉版 + CI 假件全绿 + smoke 只探 HTTP」三层一起漏过去的。
 
 它**不做**的事每一版都不一样,而那些恰恰是漏了最疼的 —— 手工 apply 的集群对象、
 NAS 上的数据搬迁、真栈验证探针。下面这节是本节的**唯一**入口:先清点,把结果写成
@@ -350,6 +356,19 @@ tools/deploy/release.sh prod            # 确认 'prod';或 --yes 走脚本
 写上一版 tag** —— X-14 P5,回滚一键可查)、smoke 全绿 + 阶段 6 金丝雀绿后才
 算完(金丝雀未 seed 会 WARNING 跳过 —— 先按 §1.6.7 补 seed)。
 发布窗口:migrate 是 expand-only 约定(向后兼容一版,deployment.md §10)。
+
+stage 3 migrate 红了(B-228):脚本会打出 Job 的 pod 和日志尾巴,此时线上仍是上一版代码,
+**不用回滚**。日志里是 `canceling statement due to lock timeout` = 有长事务占着表,等它结束再发;
+别的错 = 迁移本身有问题,修了再发。再发之前先 `git restore` 本次被改的 overlay 文件
+(否则下一次读到的「上一版 tag」是这次失败的 tag),并换一个新 tag。
+
+`--images` 只发部分镜像时,没选中的镜像仍按 overlay 里的 newTag 下发。集群跑的比 overlay
+新(记录 PR 还没合)时,脚本会在建镜像之前就拒绝并列出不一致的镜像 —— 换到 overlay 与集群一致的
+工作树再发。
+
+smoke 有一行 `sandbox create failures (24h)`(B-87,warn-only):最近 24 小时建沙箱失败的占比,
+≥ 5% 打 WARN。它不挡发布,但看到了要去查沙箱池。金丝雀失败时会写明是哪一类:
+`no sandbox`(拿不到沙箱)、`run did not finish`、`wrong result`。
 
 已完成的一次性动作(留档,**不要再做**):P-1 重新生成上线的 `0153` 验证、B-50 工作区存量搬迁
 (`0154` 前置 + `workspace-agent-scoping-migration.md`)—— 都随班车 1(2026-09-16)做完,

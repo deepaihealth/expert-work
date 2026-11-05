@@ -1,6 +1,8 @@
 # 生产发布执行单 2026-11-04(2026-11-04 19:10 已执行,结果见 production-release.md 历次表):`5a1600934` → `${REL}`(测试记录 PR 合入后的 origin/main;代码 = 测试 `e6c1041a7`)
 
 > 拍板(11-04):① 今晚发 ② 迁移 0181 + 0182 **单独先跑**,等 migrate Job 完成再滚 Deployment(B-228 的临时做法;`release.sh` 本身没改,它仍然把 Job 和 Deployment 一起下发,见 `tools/deploy/release.sh:384-390`)③ 生产命令全部由你执行 ④ 评测不在生产跑。
+>
+> **之后的发布不要照抄 1.2 / 2.1**(11-05 补记):B-228 已改进 `release.sh` —— stage 3 先单独下发 migrate Job、等它 Complete 再 `apply -k`,`lock_timeout=5s` 也写进了 `infra/k8s/base/control-plane/migrate-job.yaml`。本单保留原样作为当晚的记录。
 > 每段做完把输出贴给我,我对照判据说能不能进下一段;对不上就停。
 > 拍板(11-04,用户「同意」):B-242 P2(进程互不可见)与 B-261(待命沙箱 envd 无 token)**都不挡本版**,生产现状即如此、本版不加重,按 ROADMAP 后续排期。
 > 本版第一次把 **B-236(每个对话独立工作目录)** 带上生产,所以必须**先换沙箱镜像、回收在用沙箱,再发代码**。
