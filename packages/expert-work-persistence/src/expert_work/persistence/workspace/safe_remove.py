@@ -124,7 +124,7 @@ def _lift_children(top: int, name: str, info: os.stat_result) -> None:
     try:
         os.rmdir(name, dir_fd=top)
     except FileNotFoundError:
-        pass
+        pass  # already gone (removed concurrently): that is the goal
 
 
 def _flatten_remove(dfd: int, name: str) -> None:
@@ -170,7 +170,7 @@ def _flatten_remove(dfd: int, name: str) -> None:
     try:
         os.rmdir(name, dir_fd=dfd)
     except FileNotFoundError:
-        pass
+        pass  # already gone (removed concurrently): that is the goal
 
 
 def _present(dfd: int, name: str) -> bool:
@@ -190,7 +190,7 @@ def remove_tree_at(dfd: int, name: str) -> bool:
         try:
             _flatten_remove(dfd, name)
         except FileNotFoundError:
-            pass
+            pass  # vanished mid-way; the lstat check below decides success
         except Exception as exc:  # anything unexpected falls back to quarantine
             logger.info(
                 "safe_remove.remove_incomplete error=%s errno=%s",
@@ -239,7 +239,7 @@ def _ensure_dir(dfd: int, name: str) -> int:
     try:
         os.mkdir(name, 0o700, dir_fd=dfd)
     except FileExistsError:
-        pass
+        pass  # already there: reuse it (opened with O_NOFOLLOW below)
     return os.open(name, _DIR_FLAGS, dir_fd=dfd)
 
 
