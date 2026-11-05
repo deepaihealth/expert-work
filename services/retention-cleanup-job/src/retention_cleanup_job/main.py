@@ -122,6 +122,60 @@ def exit_code(report: CleanupReport) -> int:
     return EXIT_PASS_FAILED if report.failed_passes else 0
 
 
+def log_done(report: CleanupReport) -> None:
+    """The one ``retention_cleanup_job.done`` line ops (and the runbooks) read."""
+    logger.info(
+        "retention_cleanup_job.done audit=%d audit_skipped_unacked=%d "
+        "event=%d jwt=%d image_rows=%d image_keys_ok=%d image_keys_failed=%d "
+        "artifact_soft=%d artifact_hard=%d "
+        "artifact_versions_deleted=%d artifact_files_removed=%d artifacts_expired=%d "
+        "orphan_artifact_copies_removed=%d "
+        "purged_agent_dirs_removed=%d purged_agent_dirs_failed=%d "
+        "uploads_expired=%d upload_files_removed=%d upload_files_unsafe=%d "
+        "upload_rows_failed=%d upload_rows_abandoned=%d upload_rows_held=%d "
+        "upload_owners_unavailable=%d "
+        "thread_dirs_removed=%d "
+        "memory_hard_deleted=%d workspaces_hard_deleted=%d "
+        "workspaces_pending_archive=%d tenant_users_hard_deleted=%d "
+        "sandbox_egress_audit=%d memory_writeback_jobs=%d knowledge_tasks=%d "
+        "knowledge_revisions=%d knowledge_retrieval_logs=%d failed_passes=%s duration=%.2fs",
+        report.audit_deleted,
+        report.audit_skipped_unacked,
+        report.event_deleted,
+        report.jwt_blacklist_deleted,
+        report.image_uploads_hard_deleted,
+        report.image_object_keys_removed,
+        report.image_object_keys_failed,
+        report.artifacts_soft_deleted,
+        report.artifacts_hard_deleted,
+        report.artifact_versions_deleted,
+        report.artifact_files_removed,
+        report.artifacts_expired,
+        report.orphan_artifact_copies_removed,
+        report.purged_agent_dirs_removed,
+        report.purged_agent_dirs_failed,
+        report.uploads_expired,
+        report.upload_files_removed,
+        report.upload_files_unsafe,
+        report.upload_rows_failed,
+        report.upload_rows_abandoned,
+        report.upload_rows_held,
+        report.upload_owners_unavailable,
+        report.thread_dirs_removed,
+        report.memory_hard_deleted,
+        report.workspaces_hard_deleted,
+        report.workspaces_pending_archive,
+        report.tenant_users_hard_deleted,
+        report.sandbox_egress_audit_deleted,
+        report.memory_writeback_jobs_deleted,
+        report.knowledge_tasks_deleted,
+        report.knowledge_revisions_deleted,
+        report.knowledge_retrieval_logs_deleted,
+        ",".join(report.failed_passes) or "-",
+        report.duration_seconds,
+    )
+
+
 async def _amain() -> int:
     settings = RetentionCleanupSettings()
     configure_logging(settings)
@@ -226,53 +280,7 @@ async def _amain() -> int:
         )
         logger.info("retention_cleanup_job.start batch=%d", settings.batch_size)
         report = await job.run_once()
-        logger.info(
-            "retention_cleanup_job.done audit=%d audit_skipped_unacked=%d "
-            "event=%d jwt=%d image_rows=%d image_keys_ok=%d image_keys_failed=%d "
-            "artifact_soft=%d artifact_hard=%d "
-            "artifact_versions_deleted=%d artifact_files_removed=%d artifacts_expired=%d "
-            "orphan_artifact_copies_removed=%d "
-            "uploads_expired=%d upload_files_removed=%d upload_files_unsafe=%d "
-            "upload_rows_failed=%d upload_rows_abandoned=%d upload_rows_held=%d "
-            "upload_owners_unavailable=%d "
-            "thread_dirs_removed=%d "
-            "memory_hard_deleted=%d workspaces_hard_deleted=%d "
-            "workspaces_pending_archive=%d tenant_users_hard_deleted=%d "
-            "sandbox_egress_audit=%d memory_writeback_jobs=%d knowledge_tasks=%d "
-            "knowledge_revisions=%d knowledge_retrieval_logs=%d failed_passes=%s duration=%.2fs",
-            report.audit_deleted,
-            report.audit_skipped_unacked,
-            report.event_deleted,
-            report.jwt_blacklist_deleted,
-            report.image_uploads_hard_deleted,
-            report.image_object_keys_removed,
-            report.image_object_keys_failed,
-            report.artifacts_soft_deleted,
-            report.artifacts_hard_deleted,
-            report.artifact_versions_deleted,
-            report.artifact_files_removed,
-            report.artifacts_expired,
-            report.orphan_artifact_copies_removed,
-            report.uploads_expired,
-            report.upload_files_removed,
-            report.upload_files_unsafe,
-            report.upload_rows_failed,
-            report.upload_rows_abandoned,
-            report.upload_rows_held,
-            report.upload_owners_unavailable,
-            report.thread_dirs_removed,
-            report.memory_hard_deleted,
-            report.workspaces_hard_deleted,
-            report.workspaces_pending_archive,
-            report.tenant_users_hard_deleted,
-            report.sandbox_egress_audit_deleted,
-            report.memory_writeback_jobs_deleted,
-            report.knowledge_tasks_deleted,
-            report.knowledge_revisions_deleted,
-            report.knowledge_retrieval_logs_deleted,
-            ",".join(report.failed_passes) or "-",
-            report.duration_seconds,
-        )
+        log_done(report)
         if report.audit_skipped_unacked > 0:
             logger.warning(
                 "retention.skipped_unacked count=%d — D.1c backup worker may be lagging",

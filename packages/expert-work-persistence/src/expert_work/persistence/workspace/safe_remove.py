@@ -206,7 +206,11 @@ def _open_dir_chain(root: str, parts: list[str]) -> tuple[int | None, str]:
     """从 NAS 根一段一段 ``O_NOFOLLOW`` 打开到 ``parts`` 的最后一段。
 
     返回 ``(fd, outcome)``:``fd`` 为 ``None`` 时 ``outcome`` 是 :data:`ABSENT` /
-    :data:`SKIPPED_SYMLINK`。打不开(权限)时先给我们拥有的那一级补属主位再试。"""
+    :data:`SKIPPED_SYMLINK`。
+
+    途经的每一级目录都先补属主 ``rwx``(只加不减、不经链接;已经有了就什么都不做):模型能把
+    ``/workspace/agents``(或 ``threads/``、``.tool_results/``)``chmod 555``,那一级照样打得开,
+    但在它下面删 / 改名都会 ``EACCES``。"""
     fd = os.open(Path(root), os.O_RDONLY | os.O_DIRECTORY)
     for part in parts:
         try:
@@ -220,15 +224,9 @@ def _open_dir_chain(root: str, parts: list[str]) -> tuple[int | None, str]:
         if not stat.S_ISDIR(info.st_mode):
             os.close(fd)
             return None, ABSENT
+        add_owner_bits(fd, part, info)
         try:
             child = os.open(part, _DIR_FLAGS, dir_fd=fd)
-        except PermissionError:
-            add_owner_bits(fd, part, info)
-            try:
-                child = os.open(part, _DIR_FLAGS, dir_fd=fd)
-            except BaseException:
-                os.close(fd)
-                raise
         except BaseException:
             os.close(fd)
             raise
@@ -266,11 +264,20 @@ def _quarantine(root: str, tenant_id: UUID, owner_id: UUID, src_dfd: int, name: 
     return parked
 
 
-def remove_entry(root: str, parts: list[str], name: str, *, tenant_id: UUID, owner_id: UUID) -> str:
+def remove_entry(
+    root: str,
+    parts: list[str],
+    name: str,
+    *,
+    tenant_id: UUID,
+    owner_id: UUID,
+    quarantine: bool = True,
+) -> str:
     """``rm -rf {root}/{parts…}/{name}``,按本模块开头说的规矩。
 
     ``parts`` 以租户 id 开头、都是固定名字 / UUID;``name`` 是 UUID 或校验过的 ``agent_key``。
-    返回结果常量之一;删不掉也挪不走时抛 :class:`NasEntryStuckError`。"""
+    返回结果常量之一;删不掉也挪不走(或 ``quarantine=False`` 时删不掉)抛
+    :class:`NasEntryStuckError`。``quarantine=False`` 用于删隔离区本身。"""
     fd, outcome = _open_dir_chain(root, parts)
     if fd is None:
         return outcome
@@ -287,6 +294,8 @@ def remove_entry(root: str, parts: list[str], name: str, *, tenant_id: UUID, own
             return REMOVED
         if remove_tree_at(fd, name):
             return REMOVED
+        if not quarantine:
+            raise NasEntryStuckError(errno.EACCES, "cannot remove (quarantine disabled)")
         try:
             parked = _quarantine(root, tenant_id, owner_id, fd, name)
         except OSError as exc:
@@ -308,11 +317,10 @@ def _parked_at(name: str) -> int | None:
     """``{原名}-{秒}-{8 位 hex}`` 里的秒;形状不对 → ``None``(不认识的不删)。"""
     head, _, rand = name.rpartition("-")
     stem, _, ts = head.rpartition("-")
-    if not stem or len(rand) != 8 or not ts.isdigit():
+    # ``isascii``: ``str.isdigit`` also accepts e.g. superscript digits, which ``int`` rejects.
+    if not stem or len(rand) != 8 or not (ts.isascii() and ts.isdigit()):
         return None
-    try:
-        int(rand, 16)
-    except ValueError:
+    if not all(c in "0123456789abcdef" for c in rand):
         return None
     return int(ts)
 
@@ -330,38 +338,87 @@ def sweep_quarantine(root: str, *, older_than: float) -> tuple[int, int]:
         logger.warning("safe_remove.sweep_scan_failed")
         return 0, 0
     for tenant in tenants:
-        fd, _ = _open_dir_chain(root, [tenant, PURGED_AGENTS_DIR])
+        try:
+            fd, _ = _open_dir_chain(root, [tenant, PURGED_AGENTS_DIR])
+        except OSError as exc:
+            logger.warning(
+                "safe_remove.sweep_tenant_unavailable tenant_id=%s error=%s",
+                tenant,
+                type(exc).__name__,
+            )
+            failed += 1
+            continue
         if fd is None:
             continue
         try:
             for owner in [n for n in os.listdir(fd) if _is_uuid(n)]:
-                try:
-                    info = os.lstat(owner, dir_fd=fd)
-                    if not stat.S_ISDIR(info.st_mode):
-                        continue
-                    ofd = os.open(owner, _DIR_FLAGS, dir_fd=fd)
-                except OSError:
-                    continue
-                try:
-                    for entry in os.listdir(ofd):
-                        parked = _parked_at(entry)
-                        if parked is None or parked >= older_than:
-                            continue
-                        einfo = os.lstat(entry, dir_fd=ofd)
-                        if stat.S_ISLNK(einfo.st_mode) or not stat.S_ISDIR(einfo.st_mode):
-                            os.unlink(entry, dir_fd=ofd)
-                            removed += 1
-                        elif remove_tree_at(ofd, entry):
-                            removed += 1
-                        else:
-                            failed += 1
-                finally:
-                    os.close(ofd)
-        except OSError:
-            logger.warning("safe_remove.sweep_failed tenant_id=%s", tenant)
+                r, f = _sweep_owner(fd, tenant, owner, older_than)
+                removed += r
+                failed += f
+        except OSError as exc:
+            logger.warning(
+                "safe_remove.sweep_failed tenant_id=%s error=%s", tenant, type(exc).__name__
+            )
             failed += 1
         finally:
             os.close(fd)
+    return removed, failed
+
+
+def _sweep_owner(fd: int, tenant: str, owner: str, older_than: float) -> tuple[int, int]:
+    """One ``.purged-agents/{owner}`` directory: each entry handled (and failing) on its own."""
+    removed = failed = 0
+    try:
+        info = os.lstat(owner, dir_fd=fd)
+        if not stat.S_ISDIR(info.st_mode):
+            return 0, 0
+        add_owner_bits(fd, owner, info)
+        ofd = os.open(owner, _DIR_FLAGS, dir_fd=fd)
+    except OSError as exc:
+        logger.warning(
+            "safe_remove.sweep_owner_unavailable tenant_id=%s owner_id=%s error=%s",
+            tenant,
+            owner,
+            type(exc).__name__,
+        )
+        return 0, 1
+    try:
+        for entry in os.listdir(ofd):
+            parked = _parked_at(entry)
+            if parked is None or parked >= older_than:
+                continue
+            try:
+                einfo = os.lstat(entry, dir_fd=ofd)
+                if stat.S_ISLNK(einfo.st_mode) or not stat.S_ISDIR(einfo.st_mode):
+                    os.unlink(entry, dir_fd=ofd)
+                    ok = True
+                else:
+                    ok = remove_tree_at(ofd, entry)
+            except FileNotFoundError:
+                ok = True
+            except OSError as exc:
+                logger.info("safe_remove.sweep_entry_error error=%s", type(exc).__name__)
+                ok = False
+            if ok:
+                removed += 1
+            else:
+                failed += 1
+                logger.warning(
+                    "safe_remove.sweep_entry_failed tenant_id=%s owner_id=%s entry=%s",
+                    tenant,
+                    owner,
+                    entry,
+                )
+    except OSError as exc:
+        logger.warning(
+            "safe_remove.sweep_owner_failed tenant_id=%s owner_id=%s error=%s",
+            tenant,
+            owner,
+            type(exc).__name__,
+        )
+        failed += 1
+    finally:
+        os.close(ofd)
     return removed, failed
 
 

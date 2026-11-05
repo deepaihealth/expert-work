@@ -64,3 +64,48 @@ async def test_an_entry_that_will_not_go_is_counted_and_flagged(
     assert (sweep.removed, sweep.failed) == (0, 1)
     assert "purged_agents" in job._failed_passes
     assert stuck.exists()
+
+
+@pytest.mark.asyncio
+async def test_run_once_reports_the_holding_area_counts(tmp_path: Path) -> None:
+    _park(tmp_path, age_s=8 * 24 * 3600)
+    job = _job(tmp_path)
+
+    async def _zero() -> int:
+        return 0
+
+    async def _audit_log() -> tuple[int, dict[str, int]]:
+        return 0, {}
+
+    for name in (
+        "_count_unacked_past_retention",
+        "_delete_event_log",
+        "_delete_sandbox_egress_audit",
+        "_delete_finished_memory_writeback_jobs",
+        "_delete_finished_knowledge_tasks",
+        "_delete_orphaned_knowledge_revisions",
+        "_delete_expired_knowledge_retrieval_logs",
+        "_delete_expired_jwt_blacklist",
+        "_sweep_memory",
+    ):
+        setattr(job, name, _zero)
+    job._delete_audit_log = _audit_log  # type: ignore[method-assign]
+
+    report = await job.run_once()
+
+    assert report.purged_agent_dirs_removed == 1
+    assert report.purged_agent_dirs_failed == 0
+
+
+def test_the_done_line_carries_the_holding_area_counts(caplog: pytest.LogCaptureFixture) -> None:
+    from retention_cleanup_job.main import log_done
+    from retention_cleanup_job.report import CleanupReport
+
+    with caplog.at_level("INFO"):
+        log_done(CleanupReport(purged_agent_dirs_removed=3, purged_agent_dirs_failed=2))
+
+    line = next(
+        r.getMessage() for r in caplog.records if "retention_cleanup_job.done" in r.getMessage()
+    )
+    assert "purged_agent_dirs_removed=3" in line
+    assert "purged_agent_dirs_failed=2" in line

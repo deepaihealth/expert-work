@@ -141,12 +141,19 @@ uid 的文件)会被改名挪进用户根旁边的隔离区:
 - 彻底删除的汇总(审计 `manifest:purge` 的 details、接口返回)里 `nas_quarantined` 是挪进来的个数。
 
 **谁清理**:留存作业(`retention-cleanup-job`,`retention_cleanup_job.purged_agents`)每天按名字里的
-时间删掉满 7 天的条目,报告字段 `purged_agent_dirs_removed` / `purged_agent_dirs_failed`;有删不掉的,
-`failed_passes` 带 `purged_agents`、作业以非 0 退出。
+时间删掉满 7 天的条目。作业结束的那行日志 `retention_cleanup_job.done … purged_agent_dirs_removed=N
+purged_agent_dirs_failed=M … failed_passes=…` 带这两个计数;有删不掉的,`failed_passes` 带
+`purged_agents`、作业以非 0 退出,并且每个删不掉的条目各有一行
+`safe_remove.sweep_entry_failed tenant_id=… owner_id=… entry=…`(整个租户 / 用户目录打不开时是
+`safe_remove.sweep_tenant_unavailable` / `safe_remove.sweep_owner_unavailable`)。一个条目失败不影响
+其它条目;名字形状不对的条目(不是 `{原名}-{秒}-{8 位 hex}`)不碰、不计数。
 
-**删不掉时**:`purged_agent_dirs_failed` 连续非 0 → 登上 NAS 挂载点看对应条目的属主
-(`ls -ln`),多半是别的 uid 的文件,用该 uid 或 root 删掉即可;不要动名字不符合
-`{原名}-{秒}-{随机}` 形状的东西(作业本身也不碰)。
+清除用户(成员页「清除」)时,这个用户的 `.purged-agents/{user_id}` 整个随之删掉
+(`purge_user` 汇总里的 `deleted.purged_agents`),不等 7 天。
+
+**删不掉时**:按 `safe_remove.sweep_entry_failed` 那行的 `tenant_id` / `owner_id` / `entry` 登上 NAS
+挂载点看 `{根}/{tenant_id}/.purged-agents/{owner_id}/{entry}` 的属主(`ls -ln`),多半是别的 uid 的
+文件,用该 uid 或 root 删掉即可。
 
 **智能体卡在 `purging`**:汇总 `failures` 里有 `agent_workspace` / `agent_file_version`、
 `nas_failed_users` 非 0 = 有用户的目录既删不掉也挪不进隔离区(例:隔离区父目录不可写、跨设备)。

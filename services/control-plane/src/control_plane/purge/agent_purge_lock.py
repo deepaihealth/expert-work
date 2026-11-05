@@ -6,10 +6,11 @@
 不排队。
 
 锁是 ``pg_try_advisory_xact_lock``(与 ``_tenant_resource_lock`` 同一种):一个专用会话开着
-事务把它拿住,删完 ``rollback`` 释放;进程死了连接一断锁就没了。删除可能跑好几分钟,
-所以这个事务把 ``idle_in_transaction_session_timeout`` 放宽到 30 分钟(超过就让库掐掉,
-不会永远占着)。没有数据库(单进程内存栈)时退化成进程内的一个集合 —— 只有一个进程,
-不存在跨副本的竞争。
+事务把它拿住,删完 ``rollback`` 释放;进程死了连接一断锁就没了。删除可能跑很久,而这个会话
+一直空着 —— 所以这个事务关掉 ``idle_in_transaction_session_timeout``(``= 0``):要是让库按
+空闲超时掐掉会话,锁就悄悄丢了,第二个删除能同时进来。释放(``rollback``)失败只记日志、
+绝不往外抛:删除的结果(汇总、审计、缓存失效)比释放一把已经没了的锁重要。没有数据库
+(单进程内存栈)时退化成进程内的一个集合 —— 只有一个进程,不存在跨副本的竞争。
 """
 
 from __future__ import annotations
@@ -26,8 +27,6 @@ from control_plane.advisory_locks import AGENT_PURGE_LOCK_CLASSID
 
 logger = logging.getLogger("expert_work.control_plane.purge.agent")
 
-#: 锁事务允许空闲多久(毫秒):删除本身在别的会话上跑,这个会话一直空着。
-_LOCK_TXN_IDLE_MS = 30 * 60 * 1000
 
 #: 单进程栈(没有数据库)里正在删除的名字。
 _LOCAL: set[tuple[UUID, str]] = set()
@@ -51,10 +50,10 @@ async def agent_purge_lock(
             _LOCAL.discard(key)
         return
 
-    async with session_factory() as session:
-        await session.execute(
-            text(f"SET LOCAL idle_in_transaction_session_timeout = {_LOCK_TXN_IDLE_MS}")
-        )
+    session = session_factory()
+    try:
+        # 0 = 不按空闲掐:删除在别的会话上跑,这个会话一直空着;进程死了连接自己会断。
+        await session.execute(text("SET LOCAL idle_in_transaction_session_timeout = 0"))
         got = bool(
             (
                 await session.execute(
@@ -63,13 +62,29 @@ async def agent_purge_lock(
                 )
             ).scalar_one()
         )
-        try:
-            if not got:
-                logger.info("agent_purge_lock.contended tenant_id=%s", tenant_id)
-            yield got
-        finally:
-            # rollback ends the transaction → releases the xact advisory lock.
-            await session.rollback()
+    except BaseException:
+        await _release(session)
+        raise
+    try:
+        if not got:
+            logger.info("agent_purge_lock.contended tenant_id=%s", tenant_id)
+        yield got
+    finally:
+        await _release(session)
+
+
+async def _release(session: AsyncSession) -> None:
+    """``rollback`` ends the transaction → releases the xact advisory lock; then close.
+    A dead connection (killed session, network) has nothing left to release — never
+    let that replace the purge's own outcome (summary, audit, cache invalidation)."""
+    try:
+        await session.rollback()
+    except Exception as exc:
+        logger.warning("agent_purge_lock.release_failed error=%s", type(exc).__name__)
+    try:
+        await session.close()
+    except Exception as exc:
+        logger.warning("agent_purge_lock.close_failed error=%s", type(exc).__name__)
 
 
 __all__ = ["agent_purge_lock"]

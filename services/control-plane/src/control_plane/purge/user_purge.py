@@ -37,6 +37,7 @@ table EXCEPT ``mcp_oauth_connection``, which is keyed by the user's
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from collections.abc import Awaitable
 from dataclasses import dataclass, field
@@ -62,6 +63,8 @@ from expert_work.persistence.trigger import TriggerRunStore, TriggerStore
 from expert_work.persistence.user_upload import UserUploadStore
 from expert_work.persistence.webhook import WebhookDeliveryStore, WebhookEndpointStore
 from expert_work.persistence.workspace.dlq import VolumeBackupDLQ
+from expert_work.persistence.workspace.layout import PURGED_AGENTS_DIR
+from expert_work.persistence.workspace.safe_remove import ABSENT, REMOVED, remove_entry
 from expert_work.protocol import AuditAction, AuditResult
 from expert_work.runtime.audit.logger import AuditLogger
 from expert_work.runtime.runs import RunStore
@@ -134,6 +137,9 @@ class PurgeUserDeps:
     #: B-236 第三层 —— ``/agent`` 文件的历史版本(住在用户根旁边,工作区那步删不到)。
     #: ``None`` = 这个部署不留版本。
     agent_file_versions: AgentFileVersionStore | None = None
+    #: B-278 —— NAS 根(只有 NAS 后端有):删掉这个用户在彻底删除智能体时留在隔离区
+    #: ``{tenant}/.purged-agents/{user}`` 里的目录,别等留存作业的 7 天。
+    workspace_root: str | None = None
 
 
 @dataclass
@@ -610,6 +616,24 @@ async def purge_user(
             deps.agent_file_versions.delete_all_for_user(tenant_id=tenant_id, user_id=user_id),
             default=0,
         )
+
+    # B-278 —— 这个用户在「彻底删除智能体」时被挪进隔离区的目录(删不动的残留),一起删掉。
+    if deps.workspace_root is not None:
+        removed = await _step(
+            summary,
+            "purged_agents",
+            asyncio.to_thread(
+                remove_entry,
+                deps.workspace_root,
+                [str(tenant_id), PURGED_AGENTS_DIR],
+                str(user_id),
+                tenant_id=tenant_id,
+                owner_id=user_id,
+                quarantine=False,
+            ),
+            default=ABSENT,
+        )
+        summary.deleted["purged_agents"] = 1 if removed == REMOVED else 0
 
     # 5) Identity — soft-deactivate the tenant_user row (kept, recoverable).
     summary.deactivated = await _step(
