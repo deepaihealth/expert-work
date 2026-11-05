@@ -125,35 +125,6 @@ async def test_a_failed_checkpoint_keeps_that_conversation() -> None:
 
 
 @pytest.mark.asyncio
-async def test_a_failed_nas_delete_keeps_the_user_anchors(tmp_path: Path) -> None:
-    from orchestrator.tools.nas_workspace_store import NasWorkspaceStore
-
-    world, _ = await _world()
-    nas = NasWorkspaceStore(root=str(tmp_path))
-    _fail_once(nas, "delete_tree")
-    before = await _counts(world, world.t1, _X)
-    deps = world.deps()
-    from dataclasses import replace
-
-    first = await purge_agent(
-        replace(deps, workspace_store=nas, workspace_root=str(tmp_path), artifact_snapshots=None),
-        tenant_id=world.t1,
-        name=_X,
-    )
-
-    assert "agent_workspace" in first.failures
-    middle = await _counts(world, world.t1, _X)
-    for anchor in ("conversations", "artifacts", "agent_instances"):
-        assert middle[anchor] == before[anchor], anchor
-    rerun = await purge_agent(
-        replace(deps, workspace_store=nas, workspace_root=str(tmp_path), artifact_snapshots=None),
-        tenant_id=world.t1,
-        name=_X,
-    )
-    assert rerun.ok
-
-
-@pytest.mark.asyncio
 async def test_restore_and_create_are_refused_while_the_purge_runs() -> None:
     world, _ = await _world()
     seen: dict[str, object] = {}

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Collection
 from datetime import UTC, datetime
 from uuid import UUID
 
@@ -120,10 +121,13 @@ class SqlAgentInstanceStore(AgentInstanceStore):
             AgentInstanceRow.agent_code == agent_code,
         )
 
-    async def delete_for_agent(self, *, tenant_id: UUID, agent_code: str) -> int:
+    async def delete_for_agent(
+        self, *, tenant_id: UUID, agent_code: str, keep_users: Collection[UUID] = ()
+    ) -> int:
         return await delete_where(
             self._sf,
             AgentInstanceRow,
             AgentInstanceRow.tenant_id == tenant_id,
             AgentInstanceRow.agent_code == agent_code,
+            AgentInstanceRow.user_id.notin_(list(keep_users)),
         )

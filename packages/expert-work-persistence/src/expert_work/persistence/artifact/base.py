@@ -8,7 +8,7 @@ Implementations:
 from __future__ import annotations
 
 import abc
-from collections.abc import Sequence
+from collections.abc import Collection, Sequence
 from datetime import datetime
 from uuid import UUID
 
@@ -369,7 +369,11 @@ class ArtifactStore(abc.ABC):
         """``artifact`` rows ``delete_all_for_agent`` would remove (purge preview)."""
 
     @abc.abstractmethod
-    async def delete_all_for_agent(self, *, tenant_id: UUID, agent_key: str) -> int:
+    async def delete_all_for_agent(
+        self, *, tenant_id: UUID, agent_key: str, keep_users: Collection[UUID] = ()
+    ) -> int:
         """Hard-delete the agent's artifacts (every user, active AND
         soft-deleted) and their version rows; returns the ``artifact`` rows
-        removed. Tenant-scoped; ``agent_key`` must be non-empty."""
+        removed. Tenant-scoped; ``agent_key`` must be non-empty. ``keep_users``
+        are left alone (their NAS folder could not be removed yet — the rows
+        are how a re-run finds them)."""

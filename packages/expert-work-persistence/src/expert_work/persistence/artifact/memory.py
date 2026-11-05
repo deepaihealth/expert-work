@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Collection, Sequence
 from datetime import UTC, datetime
 from uuid import UUID, uuid4
 
@@ -393,8 +393,15 @@ class InMemoryArtifactStore(ArtifactStore):
     async def count_for_agent(self, *, tenant_id: UUID, agent_key: str) -> int:
         return len(self._agent_ids(tenant_id, agent_key))
 
-    async def delete_all_for_agent(self, *, tenant_id: UUID, agent_key: str) -> int:
-        ids = self._agent_ids(tenant_id, agent_key)
+    async def delete_all_for_agent(
+        self, *, tenant_id: UUID, agent_key: str, keep_users: Collection[UUID] = ()
+    ) -> int:
+        keep = set(keep_users)
+        ids = {
+            aid
+            for aid in self._agent_ids(tenant_id, agent_key)
+            if self._artifacts[aid].user_id not in keep
+        }
         self._versions = [
             v for v in self._versions if not (v.tenant_id == tenant_id and v.artifact_id in ids)
         ]

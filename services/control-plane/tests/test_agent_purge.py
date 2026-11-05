@@ -10,6 +10,7 @@ failed step keeps the ``agent_spec`` rows so a re-run can finish.
 
 from __future__ import annotations
 
+from collections.abc import Collection
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -602,7 +603,9 @@ async def test_a_failed_step_keeps_the_versions_so_a_rerun_finishes() -> None:
     world, _ = await _world()
 
     class _Broken(InMemoryAgentInstanceStore):
-        async def delete_for_agent(self, *, tenant_id: UUID, agent_code: str) -> int:
+        async def delete_for_agent(
+            self, *, tenant_id: UUID, agent_code: str, keep_users: Collection[UUID] = ()
+        ) -> int:
             raise OSError(5, "connect failed: postgresql://u:s3cret@db/x")
 
     broken = _Broken()

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Collection
 from datetime import UTC, datetime
 from uuid import UUID, uuid4
 
@@ -89,12 +90,15 @@ class InMemoryAgentInstanceStore(AgentInstanceStore):
                 if r.tenant_id == tenant_id and r.agent_code == agent_code
             )
 
-    async def delete_for_agent(self, *, tenant_id: UUID, agent_code: str) -> int:
+    async def delete_for_agent(
+        self, *, tenant_id: UUID, agent_code: str, keep_users: Collection[UUID] = ()
+    ) -> int:
+        keep = set(keep_users)
         async with self._lock:
             victims = [
                 key
                 for key, r in self._rows.items()
-                if r.tenant_id == tenant_id and r.agent_code == agent_code
+                if r.tenant_id == tenant_id and r.agent_code == agent_code and r.user_id not in keep
             ]
             for key in victims:
                 del self._rows[key]

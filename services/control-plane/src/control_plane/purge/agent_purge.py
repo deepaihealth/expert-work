@@ -266,8 +266,9 @@ async def purge_agent(deps: AgentPurgeDeps, *, tenant_id: UUID, name: str) -> Ag
     fp = await _gather(deps, tenant_id=tenant_id, name=name, key=key)
     summary.threads_capped = fp.threads_capped
 
-    # NAS 先删:某个用户的目录删不掉,能找回他的数据库行(对话、产物、实例绑定)这次都留着。
-    nas_ok = await purge_nas(deps, summary, fp, tenant_id=tenant_id, key=key)
+    # NAS 先删:某个用户的目录实在删不掉(补权限、改名都不行),只留这个用户能找回他的
+    # 数据库行(对话、产物、实例绑定),别的用户照删。
+    keep_users = await purge_nas(deps, summary, fp, tenant_id=tenant_id, key=key)
 
     # B-168 —— 后台写回任务先删(worker 写记忆前查任务行,行没了它就放弃),删成功才删记忆。
     if await run(
@@ -283,17 +284,17 @@ async def purge_agent(deps: AgentPurgeDeps, *, tenant_id: UUID, name: str) -> Ag
     else:
         skip(summary, "memory_item")
 
-    if nas_ok:
-        await purge_conversations(deps, summary, fp, tenant_id=tenant_id)
-        await purge_artifacts(deps, summary, fp, tenant_id=tenant_id, key=key)
-        await run(
-            summary,
-            "agent_instance",
-            deps.agent_instances.delete_for_agent(tenant_id=tenant_id, agent_code=name),
-        )
-    else:
-        for anchor in ("thread_meta", "artifact", "agent_instance"):
-            skip(summary, anchor)
+    await purge_conversations(deps, summary, fp, tenant_id=tenant_id, keep_users=keep_users)
+    await purge_artifacts(deps, summary, fp, tenant_id=tenant_id, key=key, keep_users=keep_users)
+    if keep_users:
+        skip(summary, "agent_instance")
+    await run(
+        summary,
+        "agent_instance",
+        deps.agent_instances.delete_for_agent(
+            tenant_id=tenant_id, agent_code=name, keep_users=keep_users
+        ),
+    )
     await purge_triggers_and_webhooks(deps, summary, fp, tenant_id=tenant_id)
     await run(
         summary,

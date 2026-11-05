@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Collection, Sequence
 from datetime import UTC, datetime
 from typing import Any
 from uuid import UUID, uuid4
@@ -581,8 +581,11 @@ class SqlArtifactStore(ArtifactStore):
             ArtifactRow.agent_key == agent_key,
         )
 
-    async def delete_all_for_agent(self, *, tenant_id: UUID, agent_key: str) -> int:
-        ids = self._agent_artifact_ids(tenant_id, agent_key)
+    async def delete_all_for_agent(
+        self, *, tenant_id: UUID, agent_key: str, keep_users: Collection[UUID] = ()
+    ) -> int:
+        keep = list(keep_users)
+        ids = self._agent_artifact_ids(tenant_id, agent_key).where(ArtifactRow.user_id.notin_(keep))
         async with self._sf() as session:
             # Versions first — ``artifact_id`` is a bare UUID column, no cascade.
             await session.execute(
@@ -595,6 +598,7 @@ class SqlArtifactStore(ArtifactStore):
                 delete(ArtifactRow).where(
                     ArtifactRow.tenant_id == tenant_id,
                     ArtifactRow.agent_key == agent_key,
+                    ArtifactRow.user_id.notin_(keep),
                 )
             )
             await session.commit()

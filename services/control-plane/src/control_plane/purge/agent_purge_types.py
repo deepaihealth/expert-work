@@ -147,6 +147,12 @@ class AgentPurgeSummary:
     image_blobs_skipped: int = 0
     #: NAS 路径上有符号链接(模型在自己工作区里建的)而跳过的次数 —— 不算失败。
     nas_symlinks_skipped: int = 0
+    #: 目标本身就是符号链接:删的是链接本身,不跟过去。
+    nas_symlinks_unlinked: int = 0
+    #: 补了属主权限仍删不掉、改名挪到 ``.purged-<名>-…`` 的目录数(留给运维清理)。
+    nas_quarantined: int = 0
+    #: 删不掉也挪不走的用户数 —— 只有这种情况名字会停在 ``purging``(``failures`` 里有记录)。
+    nas_failed_users: int = 0
     #: 最后删版本行时又被拦下(有版本在用 / 有在用的智能体引用它):``{active_versions,
     #: referenced_by}``;API 据此回 409。
     blocked: dict[str, list[str]] | None = None
@@ -173,6 +179,9 @@ class AgentPurgeSummary:
             "image_blobs_failed": self.image_blobs_failed,
             "image_blobs_skipped": self.image_blobs_skipped,
             "nas_symlinks_skipped": self.nas_symlinks_skipped,
+            "nas_symlinks_unlinked": self.nas_symlinks_unlinked,
+            "nas_quarantined": self.nas_quarantined,
+            "nas_failed_users": self.nas_failed_users,
             "blocked": dict(self.blocked) if self.blocked is not None else None,
             "agent_spec_deleted": self.agent_spec_deleted,
             "kept": list(KEPT_TABLES),
