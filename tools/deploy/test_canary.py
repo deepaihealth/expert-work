@@ -11,7 +11,6 @@ import json
 from pathlib import Path
 from typing import Any
 
-import canary
 import httpx
 import pytest
 from canary import (
@@ -25,6 +24,7 @@ from canary import (
     download_params,
     expected_line,
     failure_kind,
+    main,
     parse_end_frame,
     pick_artifact,
     sandbox_acquire_failures,
@@ -231,7 +231,7 @@ def _sse(*frames: list[str]) -> bytes:
 def _run_canary(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], stream: bytes
 ) -> tuple[int, str]:
-    """``canary.main()`` against a canned SSE stream (artifact download → 404)."""
+    """``main()`` against a canned SSE stream (artifact download → 404)."""
 
     def handler(request: httpx.Request) -> httpx.Response:
         if request.method == "POST":
@@ -243,9 +243,10 @@ def _run_canary(
     def client_with_mock_transport(**kwargs: Any) -> httpx.AsyncClient:
         return real_client(transport=httpx.MockTransport(handler), **kwargs)
 
-    monkeypatch.setattr(canary.httpx, "AsyncClient", client_with_mock_transport)
+    # canary.py calls ``httpx.AsyncClient`` off the module, so patching it there reaches it.
+    monkeypatch.setattr(httpx, "AsyncClient", client_with_mock_transport)
     monkeypatch.setenv("EXPERT_WORK_CANARY_API_KEY", "test-key")
-    rc = canary.main()
+    rc = main()
     return rc, capsys.readouterr().out
 
 
