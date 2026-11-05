@@ -29,6 +29,10 @@ from expert_work.common.spotlight import spotlight_untrusted
 from expert_work.persistence import InMemoryKnowledgeStore
 from expert_work.persistence.embedding import EMBEDDING_DIM
 from expert_work.persistence.knowledge.profiles import PROFILE_DEBOUNCE
+from expert_work.persistence.knowledge.text_search import (
+    KbKeywordQuery,
+    build_kb_keyword_query,
+)
 from expert_work.protocol import (
     AgentSpec,
     DocumentStatus,
@@ -39,6 +43,7 @@ from expert_work.protocol import (
 from expert_work.protocol.knowledge_profile import ProbeCalibration
 from orchestrator import ToolEnv
 from orchestrator.agent_factory import _knowledge_probe
+from orchestrator.graph_builder.retrieval_query import build_retrieval_query
 from orchestrator.llm import FakeEmbedder
 from orchestrator.tools import KnowledgeRetriever, knowledge_probe
 from orchestrator.tools.knowledge_probe import (
@@ -93,10 +98,24 @@ def test_a_fresh_turn_probes_the_latest_user_message() -> None:
     messages = [
         HumanMessage(content="大国食养这本书讲了什么内容呢请详细说"),
         AIMessage(content="…"),
-        HumanMessage(content="那么作者在书中是如何具体描述二十四节气与日常饮食之间的关系的"),
+        HumanMessage(content="请介绍一下二十四节气与日常饮食之间的关系以及每个节气的饮食建议"),
         HumanMessage(content="[本轮输入] x", additional_kwargs={HIDE_FROM_UI: True}),
     ]
-    assert turn_query(messages) == "那么作者在书中是如何具体描述二十四节气与日常饮食之间的关系的"
+    assert turn_query(messages) == "请介绍一下二十四节气与日常饮食之间的关系以及每个节气的饮食建议"
+
+
+def test_a_referring_follow_up_carries_the_previous_message_whatever_its_length() -> None:
+    """'The author ... in the book' names neither: the book is the one asked about
+    before. Until 11-05 only a message of 20 characters or fewer carried it."""
+    messages = [
+        HumanMessage(content="大国食养这本书讲了什么内容呢请详细说"),
+        AIMessage(content="…"),
+        HumanMessage(content="那么作者在书中是如何具体描述二十四节气与日常饮食之间的关系的"),
+    ]
+    assert turn_query(messages) == (
+        "大国食养这本书讲了什么内容呢请详细说\n"
+        "那么作者在书中是如何具体描述二十四节气与日常饮食之间的关系的"
+    )
 
 
 def test_a_short_follow_up_carries_the_previous_message() -> None:
@@ -106,6 +125,39 @@ def test_a_short_follow_up_carries_the_previous_message() -> None:
         HumanMessage(content="那他还写过什么"),
     ]
     assert turn_query(messages) == "大国食养谁写的\n那他还写过什么"
+
+
+@pytest.mark.parametrize(
+    ("asked", "answer", "follow_up", "referent"),
+    [
+        ("推荐一款适合早餐的食品", "可以试试燕麦片甲, 低糖高纤维", "这个保质期多久", "燕麦片甲"),
+        ("Which laptop is lighter?", "The Zeta Z2 weighs 1.1 kg.", "what about its battery?", "Z2"),
+    ],
+    ids=["zh", "en"],
+)
+def test_a_follow_up_carries_the_referent_only_the_assistant_named(
+    asked: str, answer: str, follow_up: str, referent: str
+) -> None:
+    messages = [
+        HumanMessage(content=asked),
+        AIMessage(content=answer),
+        HumanMessage(content=follow_up),
+    ]
+    query = turn_query(messages)
+    assert query is not None
+    assert referent in query
+    assert query.endswith(follow_up)
+
+
+def test_the_probe_and_memory_recall_build_the_same_query() -> None:
+    messages = [
+        HumanMessage(content="帮我看看这周的血压记录"),
+        AIMessage(content="张三本周血压平均 128/82"),
+        HumanMessage(content="他的血糖呢"),
+    ]
+    built = build_retrieval_query(messages)
+    assert built is not None
+    assert turn_query(messages) == built.text
 
 
 @pytest.mark.parametrize(
@@ -275,6 +327,101 @@ async def test_english_function_words_do_not_count() -> None:
         tenant_id=tenant, messages=_turn("time limit of the form")
     )
     assert (miss.reason, hit.reason) == ("miss", "hit")
+
+
+# A realistic previous answer (well over 64 distinct terms in its head + tail).
+_LONG_ANSWER = (
+    "高血压患者的日常饮食建议如下: 第一, 控制食盐摄入, 每天不超过五克, 少吃腌制食品, 咸菜, "
+    "腊肉和各类加工肉制品; 第二, 多吃新鲜蔬菜水果, 比如菠菜, 芹菜, 西兰花, 香蕉, 橙子, "
+    "这些食物富含钾元素, 有助于平衡体内钠钾比例; 第三, 选择全谷物作为主食, 例如燕麦, 糙米, "
+    "荞麦和玉米, 替代精白米面; 第四, 优质蛋白优先选择鱼类, 禽肉, 豆制品和低脂牛奶, 减少红肉; "
+    "第五, 烹调方式以蒸煮炖拌为主, 少用油炸煎烤, 食用油每天控制在二十五克以内; 第六, 戒烟限酒, "
+    "男性每日酒精不超过二十五克, 女性减半; 第七, 保持规律作息与适量运动, 每周至少五天快走或游泳, "
+    "每次三十分钟以上; 第八, 定期家庭自测血压并记录, 复诊时带给医生参考调整用药方案。"
+)
+
+
+async def test_the_current_message_terms_survive_a_long_previous_answer(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The keyword query keeps at most 64 terms in first-seen order: context put
+    first pushed the follow-up's own words out."""
+    assert len(_LONG_ANSWER) >= 300
+    real = build_kb_keyword_query
+    seen: list[str] = []
+
+    def _spy(query: str) -> KbKeywordQuery | None:
+        seen.append(query)
+        return real(query)
+
+    monkeypatch.setattr(knowledge_probe, "build_kb_keyword_query", _spy)
+    store, tenant = InMemoryKnowledgeStore(), uuid4()
+    await _base(store, tenant, "health", ["咖啡因对血压的短期影响"])
+    messages: list[BaseMessage] = [
+        HumanMessage(content="高血压饮食要注意什么"),
+        AIMessage(content=_LONG_ANSWER),
+        HumanMessage(content="那喝咖啡会不会影响"),
+    ]
+    await _probe(store, ("health",)).run(tenant_id=tenant, messages=messages)
+    own = real("那喝咖啡会不会影响")
+    assert own is not None and own.terms
+    assert seen
+    for query in seen:
+        built = real(query)
+        assert built is not None
+        assert set(own.terms) <= set(built.terms)
+
+
+async def test_a_passage_only_on_the_previous_topic_is_not_related() -> None:
+    """A short new question after a KB answer: the context's words alone must
+    not make the previous topic's passage count."""
+    store, tenant = InMemoryKnowledgeStore(), uuid4()
+    await _base(store, tenant, "food", ["燕麦片甲 低糖高纤维 适合糖尿病人的早餐推荐"])
+    messages: list[BaseMessage] = [
+        HumanMessage(content="推荐一款适合糖尿病人的早餐"),
+        AIMessage(content="推荐燕麦片甲, 低糖高纤维, 适合糖尿病人早餐"),
+        HumanMessage(content="我对花生过敏有什么零食"),
+    ]
+    outcome = await _probe(store, ("food",)).run(tenant_id=tenant, messages=messages)
+    assert outcome.reason == "miss"
+
+
+async def test_a_passage_on_the_follow_up_in_context_is_related() -> None:
+    store, tenant = InMemoryKnowledgeStore(), uuid4()
+    await _base(store, tenant, "food", ["燕麦片甲的保质期为十二个月"])
+    messages: list[BaseMessage] = [
+        HumanMessage(content="推荐一款早餐食品"),
+        AIMessage(content="推荐燕麦片甲, 低糖高纤维"),
+        HumanMessage(content="这个保质期多久"),
+    ]
+    outcome = await _probe(store, ("food",)).run(tenant_id=tenant, messages=messages)
+    assert outcome.reason == "hit"
+
+
+@pytest.mark.parametrize(
+    "follow_up",
+    [
+        "那他还写过什么",
+        "第二个呢",
+        "详细说说",
+        "上面说的那个怎么用",
+        "这两个哪个好",
+        "还有别的吗",
+        "tell me more about the second one",
+    ],
+)
+async def test_a_pure_reference_follow_up_is_related_through_the_context(follow_up: str) -> None:
+    """A follow-up whose own words are only references, ordinals or generic
+    asks ("tell me more") names nothing to anchor on: the context decides."""
+    store, tenant = InMemoryKnowledgeStore(), uuid4()
+    await _base(store, tenant, "books", ["《大国食养》作者李明, 另著《四季食疗》《节气饮食》"])
+    messages: list[BaseMessage] = [
+        HumanMessage(content="大国食养谁写的"),
+        AIMessage(content="《大国食养》的作者是李明"),
+        HumanMessage(content=follow_up),
+    ]
+    outcome = await _probe(store, ("books",)).run(tenant_id=tenant, messages=messages)
+    assert outcome.reason == "hit"
 
 
 def test_the_keyword_rule_constants() -> None:
