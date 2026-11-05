@@ -4,7 +4,8 @@ A name, a description or even a generated profile cannot show which people,
 titles or codes a knowledge base holds; only searching it can. So at the start
 of each turn (platform switch ``kb_first_routing`` on, a base bound, the agent
 not opted out with ``knowledge.probe: false``) the platform runs ONE cheap
-retrieval per bound base with the user's latest message — keyword and vector
+retrieval per bound base with the user's latest message (a short or referring
+follow-up carries the previous turn along, ``retrieval_query``) — keyword and vector
 recall, no rerank, no model call, a small top-k, all bases at once under a hard
 time budget — and, when a base holds related passages, adds one line to this
 turn's platform section (B-162: appended to the last user message, never the
@@ -53,9 +54,8 @@ from uuid import UUID
 
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage
 
-from expert_work.common.conversation_channel import is_hidden, message_text
+from expert_work.common.conversation_channel import is_hidden
 from expert_work.common.observability import expert_work_counter
-from expert_work.common.spotlight import unspotlight
 from expert_work.persistence.knowledge.text_search import (
     KbKeywordQuery,
     build_kb_keyword_query,
@@ -64,7 +64,11 @@ from expert_work.persistence.knowledge.text_search import (
     tokenize_for_search,
 )
 from expert_work.protocol import KnowledgeBase, KnowledgeChunk
-from orchestrator.graph_builder.platform_context import strip_platform_context
+from orchestrator.graph_builder.retrieval_query import (
+    build_retrieval_query,
+    log_retrieval_query,
+    user_text,
+)
 from orchestrator.tools.knowledge import KnowledgeRetriever
 from orchestrator.tools.knowledge_catalog import MAX_CATALOG_BASES
 
@@ -168,11 +172,6 @@ _FUNCTION_WORDS: Final = frozenset(
 )
 #: Messages shorter than this (letters / digits / CJK, after stripping) are not probed.
 PROBE_MIN_CHARS: Final = 2
-#: A message this short is probed together with the previous user message (a
-#: follow-up such as "what else did he write" names nobody), cut to
-#: :data:`CONTEXT_CHARS` from its end.
-FOLLOW_UP_MAX_CHARS: Final = 20
-CONTEXT_CHARS: Final = 200
 
 #: Greetings, thanks and acknowledgements (normalised: lower-case, no
 #: punctuation or spaces). Platform text, Chinese and English.
@@ -256,11 +255,6 @@ def is_small_talk(text: str) -> bool:
     return len(flat) < PROBE_MIN_CHARS or flat in SMALL_TALK
 
 
-def _user_text(message: BaseMessage) -> str:
-    """What the user wrote: the platform section and the spotlight fence off."""
-    return unspotlight(strip_platform_context(message_text(message.content))).strip()
-
-
 def _fresh_turn(messages: Sequence[BaseMessage]) -> list[int] | None:
     """The user messages' positions — ``None`` when this is not the first
     step of a fresh user turn (an answer or a tool call already follows the
@@ -278,22 +272,21 @@ def _fresh_turn(messages: Sequence[BaseMessage]) -> list[int] | None:
 def latest_user_text(messages: Sequence[BaseMessage]) -> str | None:
     """What the user wrote this turn — ``None`` when not a fresh user turn."""
     users = _fresh_turn(messages)
-    return _user_text(messages[users[-1]]) if users is not None else None
+    return user_text(messages[users[-1]]) if users is not None else None
 
 
 def turn_query(messages: Sequence[BaseMessage]) -> str | None:
     """The probe's query, or ``None`` when this is not the first step of a
-    fresh user turn. A short follow-up carries the previous user message (its
-    end) along."""
-    users = _fresh_turn(messages)
-    if users is None:
+    fresh user turn: the memory recall's query (:func:`build_retrieval_query`)
+    — a short or referring follow-up carries the previous user message and the
+    previous answer along, bounded."""
+    if _fresh_turn(messages) is None:
         return None
-    text = _user_text(messages[users[-1]])
-    if len(text) <= FOLLOW_UP_MAX_CHARS and len(users) > 1:
-        previous = _user_text(messages[users[-2]])[-CONTEXT_CHARS:]
-        if previous:
-            return f"{previous}\n{text}"
-    return text
+    query = build_retrieval_query(messages)
+    if query is None:
+        return None
+    log_retrieval_query("knowledge_probe", query)
+    return query.text
 
 
 def probe_line(hits: Sequence[tuple[str, int]]) -> str | None:

@@ -32,7 +32,7 @@ from datetime import UTC, datetime
 from typing import Any, Literal, NamedTuple, cast
 from uuid import UUID, uuid4
 
-from langchain_core.messages import BaseMessage, HumanMessage, SystemMessage
+from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage
 from langchain_core.runnables import RunnableConfig
 
 from expert_work.common.conversation_channel import is_hidden
@@ -71,7 +71,13 @@ from orchestrator.graph_builder._config import (
     configurable_uuid,
     current_run_id,
 )
+from orchestrator.graph_builder.retrieval_query import (
+    build_retrieval_query,
+    log_retrieval_query,
+    recent_history,
+)
 from orchestrator.llm import Embedder, LLMCaller
+from orchestrator.llm.truncation import is_truncated
 from orchestrator.state import AgentState
 from orchestrator.tools.knowledge import Reranker, rerank_documents
 from orchestrator.tools.knowledge_rerank import rerank_budget
@@ -150,15 +156,6 @@ _EXTRACT_SYSTEM = (
 def _message_text(message: BaseMessage) -> str:
     content = message.content
     return content if isinstance(content, str) else str(content)
-
-
-def _last_human_text(messages: list[BaseMessage]) -> str:
-    """The recall query — the latest *user* message. Hidden ``HumanMessage`` s
-    (B-67 inputs block, advisories) are platform scaffolding, not a query."""
-    for message in reversed(messages):
-        if isinstance(message, HumanMessage) and not is_hidden(message):
-            return _message_text(message)
-    return ""
 
 
 def _render_trajectory(messages: list[BaseMessage]) -> str:
@@ -498,23 +495,52 @@ async def _verify_memories(
     return survivors
 
 
-# Stream P5a (Task 7) — retrieval query rewrite.
+# Stream P5a (Task 7) — retrieval query rewrite. Generic wording only: no
+# tenant content (the one example is a made-up person).
 _REWRITE_SYSTEM = (
-    "You rewrite the user's latest message into a concise standalone search "
-    "query for retrieving relevant past memories. Strip any instructions or "
-    "commands — keep only what identifies the information need (entities, "
-    "topic, preference). Respond with ONLY the query text, no prose."
+    "You rewrite the user's latest message into one standalone search query for "
+    "retrieving the user's relevant past memories. The retriever only sees the query "
+    "string, never the conversation.\n"
+    "- Replace references and ellipsis (pronouns, 'this / that / the other one', "
+    "'the second item above', 'that day', 'and the price?') with the concrete names, "
+    "ids, file names, dates or times the conversation states.\n"
+    "- Keep the discriminative specifics (names, numbers, codes, dates); drop "
+    "greetings, instructions and commands.\n"
+    "- Do not add meta words such as 'search for' or 'look up in memory'.\n"
+    "- If the conversation does not make the referent clear, keep the original wording "
+    "of the latest message; do not guess.\n"
+    "Example: earlier turns are about a person named 张三 and the latest message is "
+    "'他的血糖呢' -> '张三的血糖'.\n"
+    "Respond with ONLY the query text, no prose."
 )
 
 
-async def _rewrite_query(*, llm_caller: LLMCaller, task: str, token: CancellationToken) -> str:
-    """P5a — rewrite the task into a retrieval query (best-effort, fail-open).
+def _rewrite_prompt(task: str, history: str) -> str:
+    if not history:
+        return f"LATEST USER MESSAGE:\n{task}"
+    return (
+        f"CONVERSATION SO FAR (oldest first, excerpts):\n{history}\n\nLATEST USER MESSAGE:\n{task}"
+    )
 
-    Any error / empty reply returns the original ``task`` unchanged so recall
-    never breaks on a rewrite failure. Cancellation propagates."""
+
+async def _rewrite_query(
+    *,
+    llm_caller: LLMCaller,
+    task: str,
+    token: CancellationToken,
+    history: str = "",
+    fallback: str | None = None,
+) -> str:
+    """P5a — rewrite the latest message (``task``) into a standalone retrieval
+    query, reading the recent turns (``history``, :func:`recent_history`).
+
+    Best-effort, fail-open: an error, an empty or truncated reply, or a reply that
+    only echoes ``task`` (the model could not resolve it) returns ``fallback`` —
+    the deterministic query, default ``task``. Cancellation propagates."""
+    kept = task if fallback is None else fallback
     prompt = [
         SystemMessage(content=_REWRITE_SYSTEM),
-        HumanMessage(content=task),
+        HumanMessage(content=_rewrite_prompt(task, history)),
     ]
     try:
         with expert_work_span(ExpertWorkComponent.MEMORY, "query_rewrite"):
@@ -522,16 +548,28 @@ async def _rewrite_query(*, llm_caller: LLMCaller, task: str, token: Cancellatio
     except RunCancelledError:
         raise
     except Exception:
-        logger.warning("memory.query_rewrite_failed — using original task", exc_info=True)
-        record_memory_rewrite(outcome="degraded")
-        return task
+        logger.warning("memory.query_rewrite_failed — using the deterministic query", exc_info=True)
+        return _rewrite_done("degraded", kept, history)
+    if isinstance(response, AIMessage) and is_truncated(response):
+        # A query cut off mid-name retrieves the wrong thing.
+        return _rewrite_done("degraded", kept, history)
     rewritten = _message_text(response).strip()
     if not rewritten or rewritten == task:
         # Empty reply, or the model echoed the task back — no effective rewrite.
-        record_memory_rewrite(outcome="unchanged")
-        return task
-    record_memory_rewrite(outcome="rewritten")
-    return rewritten
+        return _rewrite_done("unchanged", kept, history)
+    return _rewrite_done("rewritten", rewritten, history)
+
+
+def _rewrite_done(outcome: str, query: str, history: str) -> str:
+    record_memory_rewrite(outcome=outcome)
+    # Lengths only — never the message, the history or the query.
+    logger.info(
+        "memory.query_rewrite outcome=%s history_chars=%d query_chars=%d",
+        outcome,
+        len(history),
+        len(query),
+    )
+    return query
 
 
 def make_memory_recall_node(
@@ -572,12 +610,17 @@ def make_memory_recall_node(
     current request before injection. Fail-open: a verifier error keeps all
     candidates so recall never empties on a transient failure.
 
+    The query is :func:`build_retrieval_query`'s (shared with the KB probe):
+    the latest user message, with the previous user message and the previous
+    answer carried along (bounded) when it is a short or referring follow-up.
+    Embedding, hybrid full-text, rerank and verification all use that one query.
+
     Stream P5a (Task 7) — ``rewrite_query`` adds one LLM call (via
-    ``rewriter``) that rewrites the task into a concise standalone search
-    query before embedding — guards against long or instruction-laden
-    messages polluting the retrieval vector / hybrid full-text query.
-    Fail-open: a rewrite error or empty reply keeps the original task, so
-    disabled (or unwired) leaves ``search_text is task`` unchanged.
+    ``rewriter``) that rewrites the latest message, reading the recent turns
+    (:func:`recent_history`), into a standalone search query before embedding:
+    references resolved to the names the conversation states, instructions
+    stripped. Fail-open: a rewrite error, an empty / truncated / echoed reply
+    keeps the deterministic query.
 
     Stream P5a (Task 8) — ``abstain_threshold`` gates recall on the best
     candidate's cosine similarity right after ``retrieve()``, before rerank /
@@ -594,8 +637,11 @@ def make_memory_recall_node(
         user_id = configurable_uuid(config, "user_id")
         if tenant_id is None or user_id is None:
             return {}
-        task = _last_human_text(list(state["messages"]))
-        if not task:
+        messages = list(state["messages"])
+        # The latest user message — with the previous turn carried along when it is a
+        # short or referring follow-up (the KB probe builds its query the same way).
+        query = build_retrieval_query(messages)
+        if query is None:
             return {}
         # 一期 Task 1 —— 整段召回是入口链上最大的一块,父 span 让瀑布图
         # 能先看到总量再下钻。放在两处 no-op 早退之后:没有 tenant/user
@@ -607,14 +653,19 @@ def make_memory_recall_node(
                 )
             recall_limit = max(top_k, _MEMORY_RECALL_WIDE_LIMIT)
             try:
-                # Stream P5a (Task 7) — rewrite into a retrieval query before
-                # embedding, stripping instructions / trimming long messages so
-                # they don't pollute the vector. Best-effort inside
-                # ``_rewrite_query`` itself; disabled (or no ``rewriter`` wired)
-                # keeps ``search_text is task`` — behaviour unchanged.
-                search_text = task
+                # Stream P5a (Task 7) — optional model rewrite of the query before
+                # embedding. Best-effort inside ``_rewrite_query`` itself; disabled
+                # (or no ``rewriter`` wired) keeps the deterministic query.
+                log_retrieval_query("memory_recall", query)
+                search_text = query.text
                 if rewrite_query and rewriter is not None:
-                    search_text = await _rewrite_query(llm_caller=rewriter, task=task, token=token)
+                    search_text = await _rewrite_query(
+                        llm_caller=rewriter,
+                        task=query.current,
+                        token=token,
+                        history=recent_history(messages),
+                        fallback=query.text,
+                    )
                 with expert_work_span(ExpertWorkComponent.MEMORY, "embed"):
                     vectors = await token.run_cancellable(
                         embedder.embed([search_text], tenant_id=tenant_id)
@@ -660,7 +711,7 @@ def make_memory_recall_node(
                     with expert_work_span(ExpertWorkComponent.MEMORY, "rerank"):
                         memories = await _rerank_memories(
                             reranker=reranker,
-                            query=task,
+                            query=search_text,
                             candidates=memories,
                             top_k=len(memories),
                             tenant_id=tenant_id,
@@ -680,7 +731,7 @@ def make_memory_recall_node(
                 if verify_reads and verifier is not None and memories:
                     memories = await _verify_memories(
                         llm_caller=verifier,
-                        query=task,
+                        query=search_text,
                         candidates=memories,
                         token=token,
                     )

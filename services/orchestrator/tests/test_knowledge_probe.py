@@ -39,6 +39,7 @@ from expert_work.protocol import (
 from expert_work.protocol.knowledge_profile import ProbeCalibration
 from orchestrator import ToolEnv
 from orchestrator.agent_factory import _knowledge_probe
+from orchestrator.graph_builder.retrieval_query import build_retrieval_query
 from orchestrator.llm import FakeEmbedder
 from orchestrator.tools import KnowledgeRetriever, knowledge_probe
 from orchestrator.tools.knowledge_probe import (
@@ -93,10 +94,24 @@ def test_a_fresh_turn_probes_the_latest_user_message() -> None:
     messages = [
         HumanMessage(content="大国食养这本书讲了什么内容呢请详细说"),
         AIMessage(content="…"),
-        HumanMessage(content="那么作者在书中是如何具体描述二十四节气与日常饮食之间的关系的"),
+        HumanMessage(content="请介绍一下二十四节气与日常饮食之间的关系以及每个节气的饮食建议"),
         HumanMessage(content="[本轮输入] x", additional_kwargs={HIDE_FROM_UI: True}),
     ]
-    assert turn_query(messages) == "那么作者在书中是如何具体描述二十四节气与日常饮食之间的关系的"
+    assert turn_query(messages) == "请介绍一下二十四节气与日常饮食之间的关系以及每个节气的饮食建议"
+
+
+def test_a_referring_follow_up_carries_the_previous_message_whatever_its_length() -> None:
+    """'The author ... in the book' names neither: the book is the one asked about
+    before. Until 11-05 only a message of 20 characters or fewer carried it."""
+    messages = [
+        HumanMessage(content="大国食养这本书讲了什么内容呢请详细说"),
+        AIMessage(content="…"),
+        HumanMessage(content="那么作者在书中是如何具体描述二十四节气与日常饮食之间的关系的"),
+    ]
+    assert turn_query(messages) == (
+        "大国食养这本书讲了什么内容呢请详细说\n"
+        "那么作者在书中是如何具体描述二十四节气与日常饮食之间的关系的"
+    )
 
 
 def test_a_short_follow_up_carries_the_previous_message() -> None:
@@ -106,6 +121,39 @@ def test_a_short_follow_up_carries_the_previous_message() -> None:
         HumanMessage(content="那他还写过什么"),
     ]
     assert turn_query(messages) == "大国食养谁写的\n那他还写过什么"
+
+
+@pytest.mark.parametrize(
+    ("asked", "answer", "follow_up", "referent"),
+    [
+        ("推荐一款适合早餐的食品", "可以试试燕麦片甲, 低糖高纤维", "这个保质期多久", "燕麦片甲"),
+        ("Which laptop is lighter?", "The Zeta Z2 weighs 1.1 kg.", "what about its battery?", "Z2"),
+    ],
+    ids=["zh", "en"],
+)
+def test_a_follow_up_carries_the_referent_only_the_assistant_named(
+    asked: str, answer: str, follow_up: str, referent: str
+) -> None:
+    messages = [
+        HumanMessage(content=asked),
+        AIMessage(content=answer),
+        HumanMessage(content=follow_up),
+    ]
+    query = turn_query(messages)
+    assert query is not None
+    assert referent in query
+    assert query.endswith(follow_up)
+
+
+def test_the_probe_and_memory_recall_build_the_same_query() -> None:
+    messages = [
+        HumanMessage(content="帮我看看这周的血压记录"),
+        AIMessage(content="张三本周血压平均 128/82"),
+        HumanMessage(content="他的血糖呢"),
+    ]
+    built = build_retrieval_query(messages)
+    assert built is not None
+    assert turn_query(messages) == built.text
 
 
 @pytest.mark.parametrize(
