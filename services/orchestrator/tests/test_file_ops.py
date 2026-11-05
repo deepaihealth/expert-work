@@ -1715,3 +1715,30 @@ async def test_search_files_renders_a_non_utf8_name_as_encodable_text() -> None:
     )
     result.content.encode("utf-8")
     assert "out/bad\\xff.txt  (3 bytes)" in result.content
+
+
+async def test_non_utf8_name_on_a_real_filesystem(tmp_path: Path) -> None:
+    """真落盘走一遍 ``NasWorkspaceStore``:名字确实以 ``\\udcff`` 的形态出来, 渲染后能编码。
+
+    同时钉住**往回**那一半的现状:显示名 ``bad\\xff.txt`` 是字面反斜杠, ``read_file`` 用它
+    打不开原文件(平台不做显示名 → 真实名的反查);模型要用这个文件得走 bash ``$'bad\\xff.txt'``。
+    """
+    from orchestrator.tools.nas_workspace_store import NasWorkspaceStore
+
+    ctx = _ctx()
+    user_root = tmp_path / str(ctx.tenant_id) / str(ctx.user_id)
+    user_root.mkdir(parents=True)
+    try:
+        with open(os.fsencode(user_root) + b"/bad\xff.txt", "wb") as fh:
+            fh.write(b"abc")
+    except OSError as exc:  # macOS APFS 拒绝非 UTF-8 文件名
+        pytest.skip(f"filesystem refuses a non-UTF-8 name: {exc}")
+    store = NasWorkspaceStore(root=str(tmp_path))
+
+    listing = await ListDirTool(store=store).call({"path": "."}, ctx=ctx)
+    assert listing.meta["entries"][0]["name"] == "bad\udcff.txt"
+    listing.content.encode("utf-8")
+    assert "bad\\xff.txt  (3 bytes)" in listing.content
+
+    with pytest.raises(FileOpError, match="not_found"):
+        await ReadFileTool(store=store).call({"path": "bad\\xff.txt"}, ctx=ctx)
