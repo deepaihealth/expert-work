@@ -244,10 +244,16 @@ async def _tool_meta(
 async def test_the_tool_reports_a_paused_threshold() -> None:
     store, tenant = await _store(["a", "b"], threshold=0.9)
     meta = await _tool_meta(store, tenant, _ModelReranker({"a": 0.5}, model=_OTHER))
-    assert meta == {"hits": 2, "status": "ok", "rerank_threshold_paused": True}
+    assert meta == {
+        "hits": 2,
+        "status": "ok",
+        "args": {"query": "q"},
+        "refs": ["D1#0", "D1#1"],
+        "rerank_threshold_paused": True,
+    }
 
 
 async def test_the_tool_reports_a_threshold_that_turned_everything_down() -> None:
     store, tenant = await _store(["a", "b"], threshold=0.7)
     meta = await _tool_meta(store, tenant, _ModelReranker({"a": 0.2, "b": 0.1}))
-    assert meta == {"hits": 0, "status": "below_threshold"}
+    assert meta == {"hits": 0, "status": "below_threshold", "args": {"query": "q"}}

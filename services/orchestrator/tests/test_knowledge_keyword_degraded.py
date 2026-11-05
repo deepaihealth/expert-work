@@ -253,6 +253,7 @@ async def test_results_from_other_bases_name_the_unsearched_base_inside_the_fenc
     assert "not supported by the knowledge bases that were searched" in result.notice
     assert "says nothing about whether the information exists" in result.notice
     assert json.dumps([_HOSTILE_NAME], ensure_ascii=False) in result.content
+    assert result.meta["unsearched"] == 1
 
 
 class _PerBaseFailingStore(InMemoryKnowledgeStore):

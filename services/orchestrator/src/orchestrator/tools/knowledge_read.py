@@ -78,7 +78,7 @@ _DESCRIPTION = (
     "heading (one heading, or a path like A > B). find returns the passages that contain "
     "every word given, in any order, ignoring case, with one passage on each side. A result "
     "starts with the document's details. Passages already returned in full in this task do "
-    "not need to be read again."
+    "not need to be read again, unless they now show only as a compressed reference."
 )
 _PARAMETERS: dict[str, Any] = {
     "type": "object",

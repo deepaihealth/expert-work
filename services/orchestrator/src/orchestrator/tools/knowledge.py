@@ -39,6 +39,7 @@ from expert_work.protocol import (
 from orchestrator.tools.error_classifier import GuidedToolError
 from orchestrator.tools.knowledge_catalog import (
     MIN_CATALOG_BASES,
+    base_handles,
     select_bases,
     with_bases_parameter,
 )
@@ -1142,8 +1143,19 @@ class KnowledgeSearchTool:
             msg = "none of this agent's knowledge bases exists: " + ", ".join(base_names)
             raise GuidedToolError(msg, advice=_NO_BASES_ADVICE)
         meta: dict[str, Any] = {"hits": len(outcome.results), "status": outcome.status}
+        # B-206 track D — what an old result's reference line names
+        # (:mod:`orchestrator.context.knowledge_reference`): the arguments the
+        # search ran with, its bases by handle (never a name: tenant text).
+        searched: dict[str, Any] = {"query": query}
+        if args.get("limit") is not None:
+            searched["limit"] = limit
+        if narrowed:
+            searched["bases"] = base_handles(self.knowledge_base_refs, base_names)
+        meta["args"] = searched
         if narrowed:
             meta["bases"] = list(base_names)
+        if outcome.unsearched_bases:
+            meta["unsearched"] = len(outcome.unsearched_bases)
         if outcome.rerank_degraded:
             meta["rerank_degraded"] = True
         if outcome.embedding_degraded:
@@ -1180,6 +1192,14 @@ class KnowledgeSearchTool:
                 notice=no_hits_notice,
             )
         laid_out = _lay_out_results(outcome.results)
+        # The references of the passages shown (lower ones dropped for the text
+        # budget are not); a passage with no document number would be named by its
+        # file name, so it is only counted.
+        shown = outcome.results[: laid_out.shown]
+        meta["refs"] = [f"D{r.doc_seq}#{r.chunk_index}" for r in shown if r.doc_seq is not None]
+        unnumbered = sum(1 for r in shown if r.doc_seq is None)
+        if unnumbered:
+            meta["unnumbered"] = unnumbered
         content = laid_out.text
         cut = ""
         if laid_out.truncated:

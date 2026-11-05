@@ -470,6 +470,115 @@ _KB_TEXTS: dict[str, dict[str, str]] = {
 }
 KB_DOCS = {base: list(docs) for base, docs in _KB_TEXTS.items()}
 
+# B-206 track D (k06 / k07): the base eval-kb-prune binds, alone. One fictional
+# multi-model manual: a chapter of numeric specs per model, so one search returns
+# several thousand characters and an earlier turn's search is worth pruning.
+# k06 asks a field of VT-330 that its turn-1 passage holds; k07 asks the noise
+# level, which the manual states for VT-220 and VT-440 only, never for VT-330.
+# Every number a check reads appears once in the manual (test_behavior_kb_prune).
+KB_MANUAL_BASE = "b140-kb-manual"
+KB_MANUAL_DESCRIPTION = "VT 系列便携储能电源各型号的技术参数与存放保养说明(合成数据)"
+KB_MANUAL_DOC = "vt-series-manual.md"
+
+#: model: (capacity Wh, AC W, peak W, AC full charge min, solar W, kg, cycles, noise dB)
+_VT_SPECS: dict[str, tuple[int, int, int, int, int, str, int, int | None]] = {
+    "VT-110": (288, 300, 600, 74, 120, "3.9", 2050, None),
+    "VT-220": (614, 800, 1520, 112, 260, "7.4", 2600, 41),
+    "VT-330": (1036, 1250, 2380, 137, 520, "12.7", 3150, None),
+    "VT-440": (1572, 1800, 3260, 163, 780, "18.6", 3480, 47),
+    "VT-550": (2048, 2200, 4150, 191, 1050, "23.2", 3720, None),
+    "VT-660": (2516, 2600, 4780, 228, 1300, "27.9", 3960, None),
+    "VT-770": (3072, 3300, 5900, 254, 1600, "33.5", 4310, None),
+    "VT-880": (3584, 3900, 6850, 289, 2100, "39.8", 4670, None),
+}
+#: model: (what it is for, closing note)
+_VT_TEXTS: dict[str, tuple[str, str]] = {
+    "VT-110": (
+        "入门机型,机身最轻,适合短途出行时给手机、相机和小风扇供电",
+        "机身侧面带折叠提手,单手即可拎起;不建议带动电热水壶这类大功率电器。",
+    ),
+    "VT-220": (
+        "露营机型,面向周末露营,能同时带动车载冰箱与照明",
+        "风扇在输出功率较低时自动降速;满载时的运行噪音是这一型号最常被问到的参数。",
+    ),
+    "VT-330": (
+        "中容量机型,面向自驾露营与家庭应急备电",
+        "支持边充边放;家庭备电时可接入冰箱、路由器和照明,停电后无缝切换供电。",
+    ),
+    "VT-440": (
+        "大容量机型,适合房车长途旅行和小型工地临时用电",
+        "机身底部带两个万向轮;满载连续运行时散热风扇转速较高,建议放在通风处。",
+    ),
+    "VT-550": (
+        "双电池包机型,可以加装扩展电池延长供电时间",
+        "每加装一块扩展电池,容量增加一倍;扩展电池需要单独购买,与主机同时充电。",
+    ),
+    "VT-660": (
+        "户外作业机型,外壳经过防尘防溅处理",
+        "外壳四角加装橡胶护角,适合在粉尘较多的环境里使用,但不能浸水或淋雨作业。",
+    ),
+    "VT-770": (
+        "家庭储能机型,可以与家用配电箱联动作为备用电源",
+        "需要由具备资质的电工完成与配电箱的接线;联动后停电时自动接管指定回路。",
+    ),
+    "VT-880": (
+        "旗舰机型,适合小型商铺与活动现场的长时间供电",
+        "支持两台并机输出,并机后持续输出功率翻倍;并机线需要使用原厂配件。",
+    ),
+}
+
+
+def _vt_size(wh: int) -> str:
+    """Length x width x height in millimetres, growing with the capacity."""
+    return f"{240 + wh // 16} \u00d7 {150 + wh // 40} \u00d7 {180 + wh // 22} 毫米"
+
+
+def _vt_car_input(wh: int) -> int:
+    return 96 if wh < 1000 else 192
+
+
+def _vt_chapter(model: str) -> str:
+    wh, ac, peak, full, solar, kg, cycles, noise = _VT_SPECS[model]
+    use, note = _VT_TEXTS[model]
+    lines = [
+        f"## {model}\n",
+        f"{model} 是 VT 系列的{use}。",
+        f"- 电池容量:{wh} Wh(磷酸铁锂电芯)",
+        f"- 交流持续输出功率:{ac} W,峰值功率:{peak} W",
+        f"- 交流满充时间:{full} 分钟",
+        f"- 太阳能输入上限:{solar} W",
+        f"- 净重:{kg} kg",
+        f"- 循环寿命:{cycles} 次(容量保持在初始容量的八成以上)",
+        f"- 外形尺寸:{_vt_size(wh)}",
+        f"- 输出接口:交流插座 {2 + ac // 1000} 个,USB-C 接口 {2 + wh // 1500} 个,"
+        "USB-A 接口 2 个,车充输出口 1 个",
+        f"- 车充输入:{_vt_car_input(wh)} W,可在行车时边开边充",
+        "- 低温保护:电芯温度低于零度时暂停充电,回升后自动恢复",
+        "- 显示屏:实时显示剩余电量、输入输出功率与预计剩余使用时间",
+    ]
+    if noise is not None:
+        lines.append(f"- 运行噪音:满载时约 {noise} 分贝(距机身一米处测量)")
+    lines.append(f"\n{note}\n")
+    return "\n".join(lines) + "\n"
+
+
+def _vt_manual() -> str:
+    return (
+        "# VT 系列便携储能电源使用手册(合成数据)\n\n"
+        "本手册汇总 VT 系列各型号的技术参数,以及通用的存放保养和安全说明。"
+        "各型号的参数以本手册为准,未列出的参数请以产品铭牌为准。\n\n"
+        + "".join(_vt_chapter(model) for model in _VT_SPECS)
+        + "## 存放与保养\n\n"
+        "长期不用时,先把电量充到六成左右再存放,不要满电或空电存放。"
+        "存放期间每隔三个月检查一次电量,低于三成时补电到六成。"
+        "存放环境应干燥通风,避免阳光直射,远离热源与易燃物。"
+        "表面脏污用干布擦拭,不要用水冲洗或使用含酒精的清洁剂。\n\n"
+        "## 充电与安全须知\n\n"
+        "请使用随机附带的充电线缆;太阳能板接入前确认开路电压在机身标注的输入范围内。"
+        "充电时不要覆盖散热孔,机身明显发热、鼓包或有异味时立即停止使用并联系售后。"
+        "不要自行拆开机身更换电芯,电芯更换须由授权服务网点完成。\n"
+    )
+
 
 def build() -> dict[str, str | bytes]:
     return {
@@ -499,6 +608,7 @@ def build() -> dict[str, str | bytes]:
             for base, docs in _KB_TEXTS.items()
             for doc, text in docs.items()
         },
+        f"kb/{KB_MANUAL_BASE}/{KB_MANUAL_DOC}": _vt_manual(),
     }
 
 

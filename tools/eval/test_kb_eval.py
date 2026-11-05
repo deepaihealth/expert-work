@@ -1777,7 +1777,9 @@ async def test_context_hit_follows_the_tools_own_limit_and_rendering(
         knowledge,
         "_lay_out_results",
         lambda results: LaidOut(
-            "\n".join(f"[{r.filename}#{r.chunk_index}]" for r in results), truncated=False
+            "\n".join(f"[{r.filename}#{r.chunk_index}]" for r in results),
+            truncated=False,
+            shown=len(results),
         ),
     )
     assert (await _context_rows(3))[0].score.context_hit == 0.0

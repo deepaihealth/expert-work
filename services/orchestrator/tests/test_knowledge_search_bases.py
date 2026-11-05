@@ -118,6 +118,20 @@ async def test_a_chosen_base_returns_only_its_passages() -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("bases", "handles"), [(["b"], ["K2"]), (["K3", "a"], ["K1", "K3"]), (["k2"], ["K2"])]
+)
+async def test_meta_records_the_chosen_bases_by_handle(bases: Any, handles: list[str]) -> None:
+    """B-206 track D — the reference line of an old search names its bases;
+    base names are tenant text, so they are recorded as handles even when the
+    model passed names."""
+    store, tenant = await _seed(["a", "b", "c"])
+    tool, _ = _tool(store, ("a", "b", "c"))
+    _content, meta = await _call(tool, tenant, bases=bases)
+    assert meta["args"] == {"query": "policy", "bases": handles}
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("args", [{}, {"bases": []}, {"bases": None}, {"bases": ["  "]}])
 async def test_no_bases_searches_every_base(args: dict[str, Any]) -> None:
     store, tenant = await _seed(["a", "b"])
@@ -126,6 +140,7 @@ async def test_no_bases_searches_every_base(args: dict[str, Any]) -> None:
     assert retriever.searched == [("a", "b")]
     assert "[D1#0] a.md" in content and "[D2#0] b.md" in content
     assert "bases" not in meta
+    assert meta["args"] == {"query": "policy"}
 
 
 @pytest.mark.asyncio
