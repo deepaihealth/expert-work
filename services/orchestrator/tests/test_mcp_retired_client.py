@@ -129,8 +129,7 @@ async def _retired_client(timeout_s: float = 5.0) -> _CountingClient:
 
 async def _drained(client: _CountingClient) -> None:
     """Wait for the background close of a drained session (B-248)."""
-    if client._drain_close is not None:
-        await client._drain_close
+    await asyncio.gather(*client._drain_closes)
 
 
 def _live_owner_tasks() -> list[asyncio.Task[Any]]:

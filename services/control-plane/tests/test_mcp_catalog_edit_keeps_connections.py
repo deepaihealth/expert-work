@@ -87,8 +87,7 @@ async def _start_gated_call(client: Any, tool: Any) -> tuple[_GatedSession, asyn
 
 async def _drained(client: _FakeTransportClient) -> None:
     """Wait for the background close of a session parked by ``retire``."""
-    if client._drain_close is not None:
-        await asyncio.gather(client._drain_close)
+    await asyncio.gather(*client._drain_closes)
 
 
 def _live(client: _FakeTransportClient) -> bool:
