@@ -1693,3 +1693,25 @@ def test_search_files_spec_tells_the_model_how_it_differs_from_list_dir() -> Non
     assert spec.resolved_side_effect == "read_only"
     # 分工写进描述里 —— 描述是给模型读的, 不写清楚它就会拿 list_dir 当搜索用。
     assert "list_dir" in spec.description
+
+
+# ---------------------------------------------------------------------------
+# B-243 —— 非 UTF-8 文件名(宿主 ``os.listdir`` 解出孤立代理 ``\udcff``)
+# ---------------------------------------------------------------------------
+
+
+async def test_list_dir_renders_a_non_utf8_name_as_encodable_text() -> None:
+    store = _store({"bad\udcff.txt": b"abc", "ok.txt": b"x"})
+    result = await ListDirTool(store=store).call({"path": "."}, ctx=_ctx())
+    result.content.encode("utf-8")  # 修之前: UnicodeEncodeError, 整条模型请求发不出去
+    assert "bad\\xff.txt  (3 bytes)" in result.content
+    assert "ok.txt  (1 bytes)" in result.content
+
+
+async def test_search_files_renders_a_non_utf8_name_as_encodable_text() -> None:
+    store = _store({f"agents/{_AGENT_KEY}/out/bad\udcff.txt": b"abc"})
+    result = await SearchFilesTool(store=store).call(
+        {"name_glob": "*.txt"}, ctx=_ctx(agent_key=_AGENT_KEY)
+    )
+    result.content.encode("utf-8")
+    assert "out/bad\\xff.txt  (3 bytes)" in result.content

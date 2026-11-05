@@ -83,6 +83,7 @@ from orchestrator.tools.workspace_paths import (
     ResolvedPath,
     WorkspaceView,
     agent_relative,
+    display_name,
     resolve_workspace_path,
 )
 from orchestrator.tools.workspace_scope import store_scope
@@ -1262,7 +1263,7 @@ def _format_search(found: WorkspaceSearchResult) -> str:
     "就这些了", 而那正是 B-84 要治的误判形态。B-236 review 10 —— 有目录太深没搜(``too_deep``)
     单独一行说,零命中时也说:那时的「没找到」不等于「没有」。
     """
-    lines = [f"{entry.path}  ({entry.size} bytes)" for entry in found.entries]
+    lines = [f"{display_name(entry.path)}  ({entry.size} bytes)" for entry in found.entries]
     if not lines:
         lines.append("(no matching files)")
     if found.truncated:
@@ -1576,7 +1577,7 @@ def _format_entries(rel: str, entries: list[Mapping[str, Any]], *, truncated: bo
         marker = "/" if entry.get("is_dir") else ""
         size = entry.get("size")
         suffix = "" if size is None else f"  ({size} bytes)"
-        lines.append(f"{entry.get('name')}{marker}{suffix}")
+        lines.append(f"{display_name(str(entry.get('name')))}{marker}{suffix}")
     if truncated:
         lines.append(f"... (truncated at {len(entries)} entries)")
     return "\n".join(lines)

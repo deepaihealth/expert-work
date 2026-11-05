@@ -71,7 +71,7 @@ from orchestrator.tools.nas_workspace_store import (
     parse_seed_manifest,
 )
 from orchestrator.tools.sandbox_image_contract import AGENT_VIEW, EXEC_VIEW
-from orchestrator.tools.workspace_paths import THREADS_DIR, WorkspaceView
+from orchestrator.tools.workspace_paths import THREADS_DIR, WorkspaceView, display_name
 from orchestrator.tools.workspace_scope import agent_scope, store_scope
 from orchestrator.tools.workspace_store import WorkspaceFileEntry, WorkspaceStore
 
@@ -203,7 +203,7 @@ def _dir_line(name: str, entries: Sequence[WorkspaceFileEntry]) -> str:
     day = _day_text(_latest(entries))
     tail = f"   最近改 {day}" if day else ""
     return (
-        f"{_INDENT_DIR}{name:<{_NAME_WIDTH}}"
+        f"{_INDENT_DIR}{display_name(name):<{_NAME_WIDTH}}"
         f"{_count_text(len(entries)):>{_COUNT_WIDTH}}"
         f"{_size_text(total):>{_SIZE_WIDTH}}{tail}"
     ).rstrip()
@@ -212,8 +212,9 @@ def _dir_line(name: str, entries: Sequence[WorkspaceFileEntry]) -> str:
 def _file_line(entry: WorkspaceFileEntry) -> str:
     day = _day_text(entry.mtime)
     tail = f"    {day}" if day else ""
+    name = display_name(_basename(entry.path))
     return (
-        f"{_INDENT_FILE}{_basename(entry.path):<{_NAME_WIDTH - len(_INDENT_FILE) + 2}}"
+        f"{_INDENT_FILE}{name:<{_NAME_WIDTH - len(_INDENT_FILE) + 2}}"
         f"{_size_text(entry.size):>{_SIZE_WIDTH}}{tail}"
     ).rstrip()
 
@@ -317,7 +318,7 @@ _MAX_SKIPPED_NAME_CHARS = 60
 
 def _safe_name(name: str) -> str:
     """控制字符(含换行)转义成 ``\\xNN``,过长截断 —— 名字是数据,不能在块里另起一行。"""
-    cleaned = "".join(ch if ch.isprintable() else f"\\x{ord(ch):02x}" for ch in name)
+    cleaned = "".join(ch if ch.isprintable() else f"\\x{ord(ch):02x}" for ch in display_name(name))
     if len(cleaned) > _MAX_SKIPPED_NAME_CHARS:
         cleaned = cleaned[: _MAX_SKIPPED_NAME_CHARS - 1] + "…"
     return cleaned
@@ -371,9 +372,9 @@ def render_conversation_block(
     conv_tree, used = _render_tree(own, max_expanded=max_expanded)
     agent_tree, _ = _render_tree(agent, max_expanded=max(max_expanded - used, 0))
     copy_lines = [
-        f"{_INDENT_DIR}{name + '/':<{_NAME_WIDTH}}"
-        f"unchanged copy of {AGENT_VIEW}/{name}/ (as of this conversation's start)"
-        for name in sorted(copies)
+        f"{_INDENT_DIR}{shown + '/':<{_NAME_WIDTH}}"
+        f"unchanged copy of {AGENT_VIEW}/{shown}/ (as of this conversation's start)"
+        for shown in map(display_name, sorted(copies))
     ]
     skipped = _skipped_line(seed_skipped, quota=seed_quota_blocked, unnamed=seed_skipped_more)
     conv_body = "\n".join(part for part in (conv_tree, *copy_lines, skipped) if part)
