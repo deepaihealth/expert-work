@@ -456,7 +456,8 @@ def _lenient_client_session_cls() -> Any:
 class _SessionExitStack(contextlib.AsyncExitStack):
     """The owner task's exit stack. B-177 — ``end_server_session`` tells the
     transport whether closing should also end the session on the server (the
-    StreamableHTTP ``DELETE``); a replaced (stale) session is closed without it."""
+    StreamableHTTP ``DELETE``); a session superseded by a new one is closed
+    without it. An explicit close / retire of the current session still sends it."""
 
     end_server_session: bool = True
 
@@ -480,10 +481,11 @@ class _OwnedSession:
     error type) when the transport ended on its own, e.g. a POST hit a reset
     connection and crashed the SDK's task group: the SDK then never answers the
     requests still waiting on it, so callers watch ``died`` instead of waiting
-    out ``timeout_s``. ``stale`` marks a session being replaced while its
+    out ``timeout_s``. ``stale`` marks a session to be replaced while its
     transport is still up (a request timed out on it — it may be half-open — or
-    the server answered 404): it is drained, then closed without ending the
-    server-side session, so a tool the server is still running is not aborted.
+    the server answered 404). Once a new session supersedes it, it is drained,
+    then closed without ending the server-side session, so a tool the server is
+    still running is not aborted.
     """
 
     def __init__(
@@ -506,6 +508,9 @@ class _OwnedSession:
 
     def mark_stale(self) -> None:
         self.stale = True
+
+    def superseded(self) -> None:
+        """A new session replaced this one: close it without the ``DELETE``."""
         self._exit_stack.end_server_session = False
 
     async def __aexit__(self, *_exc: object) -> None:
@@ -1065,6 +1070,7 @@ class _RemoteMCPClientBase:
                 self.config.transport,
             )
             if drain and isinstance(old, _OwnedSession):
+                old.superseded()
                 self._drain_or_close(old)
 
     def _raise_if_reconnect_just_failed(self, failed_session: Any, queued_at: float) -> None:
@@ -1307,7 +1313,9 @@ class StreamableHttpMCPClient(_RemoteMCPClientBase):
             )
             raise RuntimeError(msg)
         # Runs before the transport exits (LIFO) — where the SDK would send it.
-        stack.push_async_callback(_end_server_session, stack, terminate, http_client)
+        stack.push_async_callback(
+            _end_server_session, stack, terminate, http_client, self.config.name
+        )
         return read, write
 
 
@@ -1315,9 +1323,16 @@ async def _end_server_session(
     stack: contextlib.AsyncExitStack,
     terminate: Callable[[Any], Awaitable[None]],
     http_client: Any,
+    server: str,
 ) -> None:
-    if getattr(stack, "end_server_session", True):
+    if not getattr(stack, "end_server_session", True):
+        return
+    try:
         await terminate(http_client)
+    except Exception as exc:
+        # The owner task would only log this at debug level; a silent stop of
+        # every DELETE (e.g. an SDK signature change) must be visible.
+        logger.warning("mcp.session_terminate_failed server=%s err=%s", server, _error_kind(exc))
 
 
 def _render_content_blocks(blocks: Sequence[Any]) -> str:

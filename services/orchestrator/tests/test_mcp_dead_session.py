@@ -649,10 +649,14 @@ class _FakeHttpTransport:
         return self.session_id
 
     async def terminate_session(self, client: Any) -> None:
+        if _HTTP_FAULTS.get("terminate") is not None:
+            raise _HTTP_FAULTS["terminate"]
         self.deletes += 1
 
 
 _HTTP_TRANSPORTS: list[_FakeHttpTransport] = []
+#: ``"open"``: the next transports fail to connect; ``"terminate"``: DELETE raises.
+_HTTP_FAULTS: dict[str, BaseException] = {}
 
 
 @contextlib.asynccontextmanager
@@ -660,6 +664,8 @@ async def _fake_streamable_http_client(
     url: str, *, http_client: Any = None, terminate_on_close: bool = True
 ) -> AsyncIterator[tuple[Any, Any, Any]]:
     """The SDK helper's contract over memory streams to an in-process server."""
+    if _HTTP_FAULTS.get("open") is not None:
+        raise _HTTP_FAULTS["open"]
     transport = _FakeHttpTransport()
     _HTTP_TRANSPORTS.append(transport)
     c2s_send, c2s_recv = anyio.create_memory_object_stream[Any](16)
@@ -677,6 +683,23 @@ async def _fake_streamable_http_client(
         s2c_recv.close()
 
 
+def _http_client(monkeypatch: pytest.MonkeyPatch) -> mcp_mod.StreamableHttpMCPClient:
+    """The production StreamableHTTP client over the in-memory SDK stand-in."""
+    import mcp.client.streamable_http as sdk_http
+
+    _HTTP_TRANSPORTS.clear()
+    _HTTP_FAULTS.clear()
+    monkeypatch.setattr(sdk_http, "streamable_http_client", _fake_streamable_http_client)
+    return mcp_mod.StreamableHttpMCPClient(
+        config=mcp_mod.MCPServerConfig(
+            name="deep-ai-health-mcp",
+            transport="streamable_http",
+            url="http://peer.test/mcp",
+            timeout_s=0.3,
+        )
+    )
+
+
 @pytest.mark.timeout(30)
 @pytest.mark.parametrize("replaced_by", ["timeout", "session_terminated"])
 async def test_replaced_session_is_closed_without_ending_it_on_the_server(
@@ -685,18 +708,7 @@ async def test_replaced_session_is_closed_without_ending_it_on_the_server(
     """Review: after a timeout the server may still be running that tool; a
     DELETE on the replaced session could abort it. Only an explicit close ends
     the server-side session, as before."""
-    import mcp.client.streamable_http as sdk_http
-
-    _HTTP_TRANSPORTS.clear()
-    monkeypatch.setattr(sdk_http, "streamable_http_client", _fake_streamable_http_client)
-    client = mcp_mod.StreamableHttpMCPClient(
-        config=mcp_mod.MCPServerConfig(
-            name="deep-ai-health-mcp",
-            transport="streamable_http",
-            url="http://peer.test/mcp",
-            timeout_s=0.3,
-        )
-    )
+    client = _http_client(monkeypatch)
     await client.start()
     if replaced_by == "timeout":
         with pytest.raises(mcp_mod.MCPCallTimeoutError):
@@ -712,3 +724,65 @@ async def test_replaced_session_is_closed_without_ending_it_on_the_server(
     assert old.deletes == 0  # replaced: closed, the server-side session left alone
     await client.close()
     assert new.deletes == 1  # an explicit close still ends it
+
+
+@pytest.mark.timeout(30)
+@pytest.mark.parametrize("release", ["close", "retire"])
+async def test_explicit_release_of_a_stale_current_session_still_ends_it(
+    monkeypatch: pytest.MonkeyPatch, release: str
+) -> None:
+    """A request timed out and the rebuild failed: the stale session is still
+    the current one. Closing / retiring it is an explicit release, not a
+    replacement, so the server-side session is ended as before."""
+    client = _http_client(monkeypatch)
+    await client.start()
+    _HTTP_FAULTS["open"] = ConnectionError("peer down")
+    with pytest.raises(mcp_mod.MCPCallTimeoutError):
+        await client.call_tool("gated", {"key": "slow"})
+    assert client._rebuild is not None
+    await asyncio.wait_for(client._rebuild, timeout=5)  # failed: still stale and current
+    assert _broken(client)
+
+    await getattr(client, release)()
+
+    (only,) = _HTTP_TRANSPORTS
+    assert only.deletes == 1
+
+
+@pytest.mark.timeout(30)
+async def test_a_failing_server_session_end_is_logged_and_close_completes(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    client = _http_client(monkeypatch)
+    await client.start()
+    _HTTP_FAULTS["terminate"] = TypeError("terminate_session() takes 1 positional argument")
+
+    with caplog.at_level(logging.WARNING, logger=mcp_mod.logger.name):
+        await asyncio.wait_for(client.close(), timeout=5)
+
+    assert _messages(caplog, "mcp.session_terminate_failed") == [
+        "mcp.session_terminate_failed server=deep-ai-health-mcp err=TypeError"
+    ]
+
+
+async def test_sdk_transport_still_offers_the_session_end_we_call() -> None:
+    """Contract with the mcp SDK (re-verify on upgrade): the session-id callback
+    the transport yields is bound to the transport, and its
+    ``terminate_session(httpx.AsyncClient)`` sends the session DELETE."""
+    import httpx
+    from mcp.client.streamable_http import StreamableHTTPTransport
+
+    seen: list[tuple[str, str | None]] = []
+
+    def _handler(request: httpx.Request) -> httpx.Response:
+        seen.append((request.method, request.headers.get("mcp-session-id")))
+        return httpx.Response(200)
+
+    transport = StreamableHTTPTransport("http://peer.test/mcp")
+    transport.session_id = "sess-1"  # type: ignore[assignment]  # set by initialize normally
+    bound = getattr(transport.get_session_id, "__self__", None)  # the lookup mcp.py does
+    assert bound is transport
+    async with httpx.AsyncClient(transport=httpx.MockTransport(_handler)) as http_client:
+        await bound.terminate_session(http_client)
+
+    assert seen == [("DELETE", "sess-1")]
