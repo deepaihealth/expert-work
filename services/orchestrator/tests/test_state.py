@@ -24,7 +24,7 @@ def test_required_keys_present() -> None:
     B-126 ``context_summary``, B-168 ``written_memory_count`` / ``memory_writeback_failed`` /
     ``memory_writeback_queued``, B-226 ``step_budget_warned`` / ``loop_trip_count``
     (B-226 drops ``no_progress_streak``: the no-progress stop counts trips per run),
-    B-236 ``seed_skipped_dirs`` / ``seed_quota_blocked``。
+    B-236 ``seed_skipped_dirs`` / ``seed_quota_blocked``,B-275 ``turn_document_original_names``。
 
     ``turn_*`` 放在 state 而不是 config,是为了让检查点在
     ``graph_input=None`` 的续跑(审批 / orphan 复活)里替我们保住它们。"""
@@ -34,6 +34,7 @@ def test_required_keys_present() -> None:
         "step_count",
         "max_steps",
         "turn_documents",
+        "turn_document_original_names",
         "turn_image_refs",
         "plan",
         "reflections",

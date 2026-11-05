@@ -57,6 +57,7 @@
 |---|---|---|
 | 本轮消息里换过名的文档那一行 | `[file attached: uploads/report-3f9a1c2b.pdf]` | `[file attached: uploads/report-3f9a1c2b.pdf (original name: report.pdf)]` |
 | 本轮消息里没有换过名的文档那一行 | `[file attached: uploads/report.pdf]` | 不变 |
+| Agent 交给子任务（worker）的附件清单 | 只有实际文件名 | 换过名的文档同样附上原文件名 |
 | 发布之前的历史消息 | — | 不变，仍是以前的格式 |
 
 ### 排队与执行中的 run 新增开始时间和进度

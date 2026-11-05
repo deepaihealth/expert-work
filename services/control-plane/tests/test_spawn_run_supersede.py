@@ -92,6 +92,7 @@ def test_replay_graph_input_fresh_ids_new_stamp_no_attachment_keys() -> None:
     assert out["step_count"] == 0 and out["max_steps"] == 5
     # 故意省略:检查点里此刻的值就是被取代轮自己写的那一份 = 同一批附件。
     assert "turn_documents" not in out and "turn_image_refs" not in out
+    assert "turn_document_original_names" not in out
 
 
 class _SpawnCtx:

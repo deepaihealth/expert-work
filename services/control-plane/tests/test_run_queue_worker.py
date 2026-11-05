@@ -295,6 +295,10 @@ async def test_claimed_run_carries_original_document_names_into_graph_input(
     assert content == (
         "q\n\n[file attached: uploads/report-1a2b3c4d.pdf (original name: report.pdf)]"
     )
+    # 委派出去的子代看不到上面那一行:原名表与附件清单一起进 state。
+    assert spawns[0]["graph_input"]["turn_document_original_names"] == {
+        "uploads/report-1a2b3c4d.pdf": "report.pdf"
+    }
 
 
 @pytest.mark.asyncio
@@ -607,6 +611,8 @@ async def test_queued_run_without_attachments_leaves_the_key_out(
     # 空列表而非省略 —— 理由同 streaming 侧那条。
     assert spawns[0]["graph_input"]["turn_documents"] == []
     assert spawns[0]["graph_input"]["turn_image_refs"] == []
+    # B-275 —— 原名表同理:每轮都写,省略会让上一轮的表留在检查点里。
+    assert spawns[0]["graph_input"]["turn_document_original_names"] == {}
 
 
 @pytest.mark.asyncio

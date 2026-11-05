@@ -57,3 +57,28 @@ def test_turn_documents_drops_non_string_entries() -> None:
 def test_turn_documents_ignores_a_non_list_value() -> None:
     ctx = _build_tool_context({"configurable": {}}, turn_documents="uploads/a.docx")  # type: ignore[arg-type]
     assert ctx.turn_documents == ()
+
+
+def test_turn_document_original_names_lifted_from_state() -> None:
+    """B-275 —— 原名表与附件清单同走 state;只留本轮附件的、键值都是非空字符串的条目
+    (这个值一路从 HTTP 载荷传下来,不是进程内对象)。"""
+    ctx = _build_tool_context(
+        {"configurable": {}},
+        turn_documents=["uploads/a-1a2b3c4d.pdf", "uploads/b.docx"],
+        turn_document_original_names={
+            "uploads/a-1a2b3c4d.pdf": "a.pdf",
+            "uploads/not-this-turn.pdf": "x.pdf",
+            "uploads/b.docx": 7,  # type: ignore[dict-item]
+        },
+    )
+    assert dict(ctx.turn_document_original_names) == {"uploads/a-1a2b3c4d.pdf": "a.pdf"}
+
+
+def test_turn_document_original_names_default_empty() -> None:
+    assert dict(_build_tool_context({"configurable": {}}).turn_document_original_names) == {}
+    ctx = _build_tool_context(
+        {"configurable": {}},
+        turn_documents=["uploads/a.pdf"],
+        turn_document_original_names=["uploads/a.pdf"],  # type: ignore[arg-type]
+    )
+    assert dict(ctx.turn_document_original_names) == {}

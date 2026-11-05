@@ -57,7 +57,6 @@ from control_plane.api._user_scope import (
     resolve_caller_user_id,
 )
 from control_plane.api.trace_facade import fetch_and_normalize, fetch_span_raw
-from control_plane.api.uploads import is_safe_document_upload_id
 from control_plane.approval_void import (
     close_previous_turn,
     void_decided_approval,
@@ -105,7 +104,7 @@ from expert_work.common.observability import (
     expert_work_histogram,
 )
 from expert_work.common.spotlight import spotlight_untrusted
-from expert_work.persistence import WORKSPACE_UPLOADS_DIR, ApprovalStore
+from expert_work.persistence import ApprovalStore
 from expert_work.persistence.agent_spec import AgentSpecStore
 from expert_work.persistence.memory import MemoryWritebackJob, MemoryWritebackJobStore
 from expert_work.persistence.rls import current_user_id_var
@@ -118,6 +117,7 @@ from expert_work.persistence.token_usage_store import (
     TokenUsageStore,
 )
 from expert_work.persistence.workspace import UserWorkspaceStore
+from expert_work.persistence.workspace.upload_names import original_name_note
 from expert_work.protocol import (
     AgentSpec,
     AgentSpecRecord,
@@ -457,18 +457,12 @@ def _file_attached_line(name: str, original: str | None) -> str:
     ``[file attached: uploads/报告-1a2b3c4d.pdf (original name: 报告.pdf)]``, so an
     agent that names its deliverable after the attachment does not carry the
     suffix into it. The original is written only when it differs and is a leaf
-    the platform could have written itself (``_SAFE_STEM_RE``'s set: no space,
-    slash, bracket, parenthesis or newline), so the line parses one way only;
-    otherwise the line is exactly the pre-B-275 one.
+    the platform could have written itself (no space, slash, bracket,
+    parenthesis or newline), so the line parses one way only; otherwise the
+    line is exactly the pre-B-275 one. Delegated children get the same note
+    from the same helper (:func:`original_name_note`).
     """
-    leaf = name.rsplit("/", 1)[-1]
-    if (
-        original is None
-        or original == leaf
-        or not is_safe_document_upload_id(f"{WORKSPACE_UPLOADS_DIR}/{original}")
-    ):
-        return f"[file attached: {name}]"
-    return f"[file attached: {name} (original name: {original})]"
+    return f"[file attached: {name}{original_name_note(name, original)}]"
 
 
 def _build_human_message(
@@ -602,6 +596,8 @@ def build_run_graph_input(
         # **每一轮都写,哪怕是空的**:对话是长线程,省略这两个键时 LangGraph
         # 保留检查点里的旧值,上一轮的附件会漏进这一轮的子代。
         "turn_documents": list(document_names or []),
+        # B-275 —— 换过名的附件的原名,子代种子里的清单也要带上。同样每轮都写。
+        "turn_document_original_names": dict(document_original_names or {}),
         "turn_image_refs": list(image_refs),
         # 审批三件套只属于一轮,每一轮都清零(班车 2)—— 省略时检查点里上一轮
         # 停在审批上留下的 pending_approval 会让本轮的门控调用跳过审批门。
@@ -640,9 +636,9 @@ def replay_graph_input(
     ``expert_work_run_id`` 由 ``stamp_message`` 覆盖为本轮;被取代标记(调用方
     传进来的若是打标后的副本)一并剥掉。
 
-    **故意不写** ``turn_documents`` / ``turn_image_refs``:``build_run_graph_input``
-    每轮都写这两个键是为了不让上一轮附件漏进这一轮;重新生成要的恰恰是「同一批
-    附件」,而检查点里此刻的值就是被取代轮自己写的那一份 —— 省略键 = 沿用。
+    **故意不写** ``turn_documents`` / ``turn_image_refs`` / ``turn_document_original_names``:
+    ``build_run_graph_input`` 每轮都写这几个键是为了不让上一轮附件漏进这一轮;
+    重新生成要的恰恰是「同一批附件」,而检查点里此刻的值就是被取代轮自己写的那一份 —— 省略键 = 沿用。
     """
     now = datetime.now(UTC)
     fresh: list[BaseMessage] = []

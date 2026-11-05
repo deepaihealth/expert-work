@@ -243,6 +243,9 @@ class AgentState(TypedDict):
     #: 对话是长线程,省略这个键时 LangGraph 保留检查点里的旧值,上一轮的附件
     #: 会漏进这一轮的子代。
     turn_documents: NotRequired[list[str]]
+    #: B-275 —— ``turn_documents`` 里换过名的那几条 → 原名(叶子)。子代种子里的附件清单
+    #: 据此带上原名(主 run 的 ``[file attached: …]`` 那一行已经带了)。同样每轮都设。
+    turn_document_original_names: NotRequired[dict[str, str]]
     turn_image_refs: NotRequired[list[str]]
     plan: NotRequired[Plan | None]
     reflections: NotRequired[Annotated[list[Reflection], add]]
