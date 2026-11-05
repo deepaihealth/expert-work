@@ -35,7 +35,14 @@ import {
 import { Ban, Bot, CircleCheck, Network, ShieldOff } from "lucide-react";
 import { useTranslation } from "react-i18next";
 
-import { disableAgent, enableAgent, getAgent, type AgentDetailResponse } from "../api/agents";
+import {
+  AGENT_STATUS_PURGING,
+  disableAgent,
+  enableAgent,
+  getAgent,
+  isDeletedStatus,
+  type AgentDetailResponse,
+} from "../api/agents";
 import { ApiError } from "../api/client";
 import { PageHeader } from "../components/PageHeader";
 import { readSecurity } from "../components/manifest-editor/form_model";
@@ -43,6 +50,7 @@ import { ReadonlyTooltip } from "../components/ReadonlyTooltip";
 import { concreteTenantScope, useTenantScope } from "../tenant/TenantScopeContext";
 import { useIsTenantSwitched } from "../tenant/useIsTenantSwitched";
 import { ConversationsTab } from "./agent_detail/ConversationsTab";
+import { DeletedAgentBanner } from "./agent_detail/DeletedAgentBanner";
 import { UsersTab } from "./agent_detail/UsersTab";
 import { HistoryTab } from "./agent_detail/HistoryTab";
 import { ManifestTab } from "./agent_detail/ManifestTab";
@@ -57,6 +65,7 @@ const STATUS_COLOR: Record<string, string> = {
   draft: "warning",
   archived: "default",
   deleted: "error",
+  purging: "error",
 };
 
 /** Stream RT-4 (RT-ADR-16) — the agent-level kill switch. Disabling rejects
@@ -272,6 +281,10 @@ export function AgentDetail() {
   }
 
   const record = detail.record;
+  // B-278 — a deleted (or half-purged) version opens read-only: no kill switch,
+  // no save / publish / rollback, no playground runs; restore / purge live in
+  // the banner.
+  const isDeleted = isDeletedStatus(record.status);
 
   return (
     <div data-testid="agent-detail-root">
@@ -280,11 +293,13 @@ export function AgentDetail() {
         icon={<Bot size={20} strokeWidth={1.5} />}
         backTo={{ label: t("nav.agents"), to: "/agents" }}
         actions={
-          <AgentKillSwitch
-            name={record.name}
-            disabled={detail.disabled ?? false}
-            onChanged={refresh}
-          />
+          isDeleted ? undefined : (
+            <AgentKillSwitch
+              name={record.name}
+              disabled={detail.disabled ?? false}
+              onChanged={refresh}
+            />
+          )
         }
         subtitle={
           <Space size={12} align="center" wrap>
@@ -314,6 +329,15 @@ export function AgentDetail() {
         }
       />
 
+      {isDeleted && (
+        <DeletedAgentBanner
+          name={record.name}
+          version={record.version}
+          purging={record.status === AGENT_STATUS_PURGING}
+          onRestored={refresh}
+        />
+      )}
+
       <Tabs
         activeKey={activeTab}
         onChange={(k) =>
@@ -332,9 +356,22 @@ export function AgentDetail() {
       />
 
       {activeTab === "overview" && <OverviewTab detail={detail} />}
-      {activeTab === "manifest" && <ManifestTab detail={detail} onSaved={refreshQuietly} />}
-      {activeTab === "history" && <HistoryTab detail={detail} onRolledBack={refresh} />}
-      {activeTab === "playground" && <PlaygroundTab detail={detail} />}
+      {activeTab === "manifest" && (
+        <ManifestTab detail={detail} onSaved={refreshQuietly} readOnly={isDeleted} />
+      )}
+      {activeTab === "history" && (
+        <HistoryTab detail={detail} onRolledBack={refresh} readOnly={isDeleted} />
+      )}
+      {activeTab === "playground" &&
+        (isDeleted ? (
+          <Empty
+            description={t("agent_lifecycle.playground_deleted")}
+            style={{ marginTop: 64 }}
+            data-testid="agent-playground-deleted"
+          />
+        ) : (
+          <PlaygroundTab detail={detail} />
+        ))}
       {activeTab === "users" && <UsersTab detail={detail} />}
       {activeTab === "conversations" && <ConversationsTab detail={detail} />}
       {activeTab === "skills" && <SkillsTab detail={detail} />}

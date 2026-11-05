@@ -19,7 +19,13 @@ import { useNavigate } from "react-router-dom";
 
 import { ApiError } from "../api/client";
 import { getPlatformEmbeddingStatus } from "../api/platform_embedding_config";
-import { createAgent, type AgentDetailResponse } from "../api/agents";
+import {
+  createAgent,
+  duplicateDeletedTarget,
+  type AgentDetailResponse,
+  type DuplicateDeletedTarget,
+} from "../api/agents";
+import { DuplicateDeletedNotice } from "./DuplicateDeletedNotice";
 import { ManifestEditor } from "./manifest-editor";
 import { BASE_MANIFEST_YAML, buildDefaultManifest } from "./manifest-editor/defaults";
 import { loadModelCatalog } from "./manifest-editor/catalog";
@@ -46,6 +52,8 @@ export function CreateAgentModal({ open, onClose, onCreated }: CreateAgentModalP
   const [initialYaml, setInitialYaml] = useState<string>(BASE_MANIFEST_YAML);
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  // B-278 — the name+version clashed with a deleted / mid-purge agent.
+  const [duplicateDeleted, setDuplicateDeleted] = useState<DuplicateDeletedTarget | null>(null);
   const [embeddingConfigured, setEmbeddingConfigured] = useState<boolean | null>(null);
 
   useEffect(() => {
@@ -80,6 +88,7 @@ export function CreateAgentModal({ open, onClose, onCreated }: CreateAgentModalP
     setBuffer(BASE_MANIFEST_YAML);
     setInitialYaml(BASE_MANIFEST_YAML);
     setError(null);
+    setDuplicateDeleted(null);
     setSubmitting(false);
   }, []);
 
@@ -91,11 +100,17 @@ export function CreateAgentModal({ open, onClose, onCreated }: CreateAgentModalP
   const handleSubmit = useCallback(async () => {
     setSubmitting(true);
     setError(null);
+    setDuplicateDeleted(null);
     try {
       const created = await createAgent({ manifest_yaml: buffer });
       onCreated(created);
       reset();
     } catch (err) {
+      const deleted = duplicateDeletedTarget(err);
+      if (deleted !== null) {
+        setDuplicateDeleted(deleted);
+        return;
+      }
       const message =
         err instanceof ApiError
           ? `${err.code}: ${err.message}`
@@ -153,6 +168,10 @@ export function CreateAgentModal({ open, onClose, onCreated }: CreateAgentModalP
         <Text type="secondary" style={{ fontSize: 12, display: "block", marginBottom: 8 }}>
           {t("create_agent.hint")}
         </Text>
+
+      {duplicateDeleted !== null && (
+        <DuplicateDeletedNotice target={duplicateDeleted} onNavigate={handleCancel} />
+      )}
 
       {error !== null && (
         <Alert

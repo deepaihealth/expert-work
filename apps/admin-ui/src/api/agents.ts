@@ -5,7 +5,15 @@
  * callers can pass ``"*"`` for the cross-tenant aggregate; the
  * ``cross_tenant`` flag on the response tells the UI which mode it got.
  */
-import { apiClient, getJson, postJson, putJson, withTenantScope, type TenantScope } from "./client";
+import {
+  ApiError,
+  apiClient,
+  getJson,
+  postJson,
+  putJson,
+  withTenantScope,
+  type TenantScope,
+} from "./client";
 
 export interface AgentRecord {
   id: string;
@@ -245,8 +253,9 @@ export async function publishAgentDraft(
 
 /** POST /v1/agents — create a new agent from raw YAML. The backend
  *  derives ``name + version`` from the manifest's ``metadata`` block.
- *  409 ``MANIFEST_DUPLICATE`` on collision; 422 with envelope code on
- *  Pydantic / template validation errors. */
+ *  409 ``MANIFEST_DUPLICATE`` on collision with a live version, 409
+ *  {@link MANIFEST_DUPLICATE_DELETED} when the clashing version is deleted
+ *  (B-278); 422 with envelope code on Pydantic / template validation errors. */
 export async function createAgent(
   payload: ManifestPayload,
 ): Promise<AgentDetailResponse> {
@@ -256,11 +265,138 @@ export async function createAgent(
 /** DELETE /v1/agents/{name}/{version} — soft delete: flips this exact
  *  version's status to ``DELETED`` (204, no body). Requires
  *  ``manifest:delete``. Scoped to one version — other versions of ``name``
- *  are untouched (unlike disable/enable, which cover the whole name) — and
- *  there is no undelete endpoint. */
+ *  are untouched (unlike disable/enable, which cover the whole name). B-278:
+ *  reversible with {@link restoreAgent}; {@link purgeAgent} removes it for good. */
 export async function deleteAgent(name: string, version: string): Promise<void> {
   await apiClient.delete(
     `/v1/agents/${encodeURIComponent(name)}/${encodeURIComponent(version)}`,
+  );
+}
+
+/** B-278 — create / template-fork hit a **deleted** agent with the same name +
+ *  version. ``ApiError.details`` carries ``{name, version, status: "deleted"}``. */
+export const MANIFEST_DUPLICATE_DELETED = "MANIFEST_DUPLICATE_DELETED";
+/** B-278 — purge refused: a version is still live, or another agent uses it as
+ *  a subagent. ``ApiError.details`` = {@link AgentPurgeBlocking}. */
+export const AGENT_PURGE_BLOCKED = "AGENT_PURGE_BLOCKED";
+
+/** B-278 — create / fork / restore hit a name whose purge hasn't finished. */
+export const AGENT_PURGING = "AGENT_PURGING";
+
+/** B-278 — ``purging``: a purge started on this name but hasn't finished (a
+ *  partial run leaves every version here). Like ``deleted`` it is hidden from
+ *  everyday views and read-only; unlike ``deleted`` it can't be restored — the
+ *  only way out is running the purge again. */
+export const AGENT_STATUS_PURGING = "purging";
+
+/** Deleted or mid-purge — what the console treats as "not a working agent"
+ *  (hidden by default, read-only detail page). */
+export function isDeletedStatus(status: string): boolean {
+  return status === "deleted" || status === AGENT_STATUS_PURGING;
+}
+
+/** Why a create / fork collided with a deleted or mid-purge agent, plus which
+ *  agent when the server says (the link to its detail page needs both). */
+export interface DuplicateDeletedTarget {
+  kind: "deleted" | "purging";
+  name: string | null;
+  version: string | null;
+}
+
+/** The deleted / mid-purge agent a create / fork collided with, or ``null``
+ *  when ``err`` is anything else. */
+export function duplicateDeletedTarget(err: unknown): DuplicateDeletedTarget | null {
+  if (!(err instanceof ApiError)) return null;
+  let kind: DuplicateDeletedTarget["kind"] | null = null;
+  if (err.code === MANIFEST_DUPLICATE_DELETED) kind = "deleted";
+  else if (err.code === AGENT_PURGING) kind = "purging";
+  if (kind === null) return null;
+  const name = err.details?.name;
+  const version = err.details?.version;
+  return {
+    kind,
+    name: typeof name === "string" ? name : null,
+    version: typeof version === "string" ? version : null,
+  };
+}
+
+export interface AgentRestoreResult {
+  name: string;
+  version: string;
+  status: "active";
+  /** Triggers of this name+version that are still disabled — restore never
+   *  re-enables them. */
+  triggers_disabled: number;
+}
+
+/** POST /v1/agents/{name}/{version}/restore — B-278. Brings one deleted
+ *  version back (conversations / memories were never removed). 409
+ *  ``AGENT_NOT_DELETED`` when it isn't deleted. Requires ``manifest:delete``. */
+export async function restoreAgent(name: string, version: string): Promise<AgentRestoreResult> {
+  return postJson<AgentRestoreResult>(
+    `/v1/agents/${encodeURIComponent(name)}/${encodeURIComponent(version)}/restore`,
+    {},
+  );
+}
+
+export interface AgentPurgeBlocking {
+  /** Versions of the name that are not deleted yet. */
+  active_versions: string[];
+  /** Other agents that use this one as a subagent, as ``"name@version"``. */
+  referenced_by: string[];
+}
+
+export interface AgentPurgePreview {
+  name: string;
+  agent_key: string;
+  /** Every version of the name — purge removes all of them. */
+  versions: string[];
+  blocking: AgentPurgeBlocking;
+  /** The tenant's default agent is this name and will be cleared. */
+  default_agent_cleared: boolean;
+  /** Too many conversations for one pass — counts may be partial. */
+  threads_capped: boolean;
+  counts: Record<string, number>;
+  kept: string[];
+}
+
+/** GET /v1/agents/{name}/{version}/purge-preview — B-278. ``version`` only
+ *  locates the row for the permission check; the preview covers the whole name. */
+export async function getAgentPurgePreview(
+  name: string,
+  version: string,
+): Promise<AgentPurgePreview> {
+  return getJson<AgentPurgePreview>(
+    `/v1/agents/${encodeURIComponent(name)}/${encodeURIComponent(version)}/purge-preview`,
+  );
+}
+
+export interface AgentPurgeSummary {
+  name: string;
+  versions: string[];
+  deleted: Record<string, number>;
+  /** step → exception type, for the steps that failed. */
+  failures: Record<string, string>;
+  skipped: string[];
+  agent_spec_deleted: boolean;
+  default_agent_cleared: boolean;
+  /** ``false`` = partial: the name stays in the deleted list; running the
+   *  purge again finishes it. */
+  ok: boolean;
+}
+
+/** POST /v1/agents/{name}/{version}/purge — B-278. Permanently removes the
+ *  whole name (every version + its data; usage / billing / audit kept).
+ *  ``confirm_name`` must equal the name exactly (422 ``CONFIRM_NAME_MISMATCH``);
+ *  409 {@link AGENT_PURGE_BLOCKED} when something still holds it. */
+export async function purgeAgent(
+  name: string,
+  version: string,
+  confirmName: string,
+): Promise<AgentPurgeSummary> {
+  return postJson<AgentPurgeSummary>(
+    `/v1/agents/${encodeURIComponent(name)}/${encodeURIComponent(version)}/purge`,
+    { confirm_name: confirmName },
   );
 }
 

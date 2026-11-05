@@ -106,6 +106,68 @@ describe("CreateAgentModal", () => {
     await user.click(screen.getByTestId("create-agent-submit"));
     const alert = await screen.findByTestId("create-agent-error");
     expect(alert).toHaveTextContent("MANIFEST_DUPLICATE");
+    expect(screen.queryByTestId("duplicate-deleted-notice")).toBeNull();
+  });
+
+  // B-278 — the clash is with a DELETED agent: say it can be restored / purged
+  // and link to it, instead of a raw error code.
+  it("on MANIFEST_DUPLICATE_DELETED offers restore / purge with a link to the agent", async () => {
+    const user = userEvent.setup();
+    vi.spyOn(agentsSdk, "createAgent").mockRejectedValue(
+      new ApiError("a deleted agent with this name and version exists", "MANIFEST_DUPLICATE_DELETED", 409, {
+        name: "my-agent",
+        version: "1.0.0",
+        status: "deleted",
+      }),
+    );
+    render(<CreateAgentModal open onClose={onClose} onCreated={onCreated} />);
+    await screen.findByTestId("manifest-editor-create");
+    await user.click(screen.getByTestId("create-agent-submit"));
+
+    const notice = await screen.findByTestId("duplicate-deleted-notice");
+    expect(notice).toHaveTextContent(
+      "A deleted agent with the same name exists. You can restore it, or purge it and then create a new one.",
+    );
+    expect(screen.queryByTestId("create-agent-error")).toBeNull();
+    await user.click(screen.getByTestId("duplicate-deleted-link"));
+    expect(onClose).toHaveBeenCalled();
+    expect(mockNavigate).toHaveBeenCalledWith("/agents/my-agent/1.0.0/overview");
+  });
+
+  it("on AGENT_PURGING says a same-name purge is still running, with the link", async () => {
+    const user = userEvent.setup();
+    vi.spyOn(agentsSdk, "createAgent").mockRejectedValue(
+      new ApiError("purge in progress", "AGENT_PURGING", 409, {
+        name: "my-agent",
+        version: "1.0.0",
+        status: "purging",
+      }),
+    );
+    render(<CreateAgentModal open onClose={onClose} onCreated={onCreated} />);
+    await screen.findByTestId("manifest-editor-create");
+    await user.click(screen.getByTestId("create-agent-submit"));
+
+    const notice = await screen.findByTestId("duplicate-deleted-notice");
+    expect(notice).toHaveTextContent(
+      "An agent with the same name is being purged. Please try again later.",
+    );
+    expect(screen.getByTestId("duplicate-deleted-link")).toBeInTheDocument();
+    expect(screen.queryByTestId("create-agent-error")).toBeNull();
+  });
+
+  it("still explains AGENT_PURGING without a link when the server names no agent", async () => {
+    const user = userEvent.setup();
+    vi.spyOn(agentsSdk, "createAgent").mockRejectedValue(
+      new ApiError("purge in progress", "AGENT_PURGING", 409),
+    );
+    render(<CreateAgentModal open onClose={onClose} onCreated={onCreated} />);
+    await screen.findByTestId("manifest-editor-create");
+    await user.click(screen.getByTestId("create-agent-submit"));
+
+    expect(await screen.findByTestId("duplicate-deleted-notice")).toHaveTextContent(
+      "being purged",
+    );
+    expect(screen.queryByTestId("duplicate-deleted-link")).toBeNull();
   });
 
   it("seeds the editor with the first configured provider's model", async () => {

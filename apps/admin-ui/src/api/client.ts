@@ -87,6 +87,10 @@ export function setUnauthorizedHandler(handler: (() => void) | null): void {
   unauthorizedHandler = handler;
 }
 
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
 function readDetail(detail: unknown, key: "code" | "message"): string | undefined {
   if (typeof detail === "object" && detail !== null && key in detail) {
     const value = (detail as Record<string, unknown>)[key];
@@ -115,7 +119,20 @@ export function createClient(baseURL = ""): AxiosInstance {
         if (status === 401 && unauthorizedHandler !== null && getStoredToken() !== null) {
           unauthorizedHandler();
         }
-        const detail = (error.response?.data as { detail?: unknown } | undefined)?.detail;
+        const body = error.response?.data as { detail?: unknown; error?: unknown } | undefined;
+        const detail = body?.detail;
+        if (detail === undefined && isRecord(body?.error)) {
+          // B-278 —— 控制台路由也有 4xx 走 ``{success, data, error}`` 信封
+          // (``_envelope_error``:MANIFEST_DUPLICATE[_DELETED] / MANIFEST_STALE_WRITE /
+          // AGENT_PURGE_BLOCKED …);没有 ``detail`` 时读信封,错误码才到得了页面。
+          const envelopeError = body.error;
+          throw new ApiError(
+            readDetail(envelopeError, "message") ?? error.message,
+            readDetail(envelopeError, "code") ?? `HTTP_${status}`,
+            status,
+            isRecord(envelopeError.details) ? envelopeError.details : undefined,
+          );
+        }
         const code = readDetail(detail, "code") ?? `HTTP_${status}`;
         const message = readDetail(detail, "message") ?? error.message;
         const details =

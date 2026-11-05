@@ -167,6 +167,53 @@ describe("AgentsList", () => {
     await screen.findByText("customer-support-bot");
     expect(screen.queryByText("retired-bot")).toBeNull();
   });
+
+  // B-278 — a half-purged name (``purging``) is deleted for everyday purposes.
+  it("the default view also hides half-purged (purging) rows", async () => {
+    const purgingRow = { ...sampleRow, name: "half-gone-bot", status: "purging" };
+    listAgentsMock.mockResolvedValue({
+      items: [sampleRow, purgingRow],
+      total: 2,
+      cross_tenant: false,
+    });
+    renderAgentsList();
+    await screen.findByText("customer-support-bot");
+    expect(screen.queryByText("half-gone-bot")).toBeNull();
+  });
+
+  // B-278 — the 「已删除」 filter lists deleted AND purging rows (one server
+  // query per status), the purging one labelled as unfinished; clicking a
+  // deleted row opens its (now readable) detail page.
+  it("the deleted filter lists deleted + purging rows and opens their detail page", async () => {
+    const user = userEvent.setup();
+    const deletedRow = { ...sampleRow, id: "d1", name: "retired-bot", status: "deleted" };
+    const purgingRow = { ...sampleRow, id: "p1", name: "half-gone-bot", status: "purging" };
+    listAgentsMock.mockImplementation(async (params) => {
+      const items =
+        params?.status === "deleted"
+          ? [deletedRow]
+          : params?.status === "purging"
+            ? [purgingRow]
+            : [sampleRow];
+      return { items, total: items.length, cross_tenant: false };
+    });
+    renderAgentsList();
+    await screen.findByText("customer-support-bot");
+    fireEvent.mouseDown(
+      screen.getByTestId("agents-status-filter").querySelector(".ant-select-selector") as Element,
+    );
+    await user.click(await screen.findByTitle(i18n.t("agents_page.status_deleted")));
+
+    expect(await screen.findByText("retired-bot")).toBeInTheDocument();
+    expect(screen.getByText("half-gone-bot")).toBeInTheDocument();
+    expect(screen.queryByText("customer-support-bot")).toBeNull();
+    expect(listAgentsMock).toHaveBeenCalledWith(expect.objectContaining({ status: "deleted" }));
+    expect(listAgentsMock).toHaveBeenCalledWith(expect.objectContaining({ status: "purging" }));
+    expect(screen.getByText(i18n.t("agents_page.status_purging"))).toBeInTheDocument();
+
+    fireEvent.click(screen.getByText("retired-bot"));
+    expect(screen.getByTestId("loc")).toHaveTextContent("/agents/retired-bot/3.4.2/overview");
+  });
 });
 
 // ① 所有者列 UUID → 成员名(display_name,空则 email);未命中(服务账号名 /
@@ -282,11 +329,13 @@ describe("AgentsList row actions", () => {
   it("a deleted row's menu offers only the run history action", async () => {
     const user = userEvent.setup();
     const deletedRow = { ...sampleRow, status: "deleted" };
-    listAgentsMock.mockResolvedValue({
-      items: [deletedRow],
-      total: 1,
+    // B-278 — the "deleted" filter asks for ``deleted`` and ``purging``
+    // separately; only the first holds this row.
+    listAgentsMock.mockImplementation(async (params) => ({
+      items: params?.status === "purging" ? [] : [deletedRow],
+      total: params?.status === "purging" ? 0 : 1,
       cross_tenant: false,
-    });
+    }));
     renderAgentsList();
     // The default view hides deleted rows — switch the status filter to
     // "deleted" to surface it (mirrors how a user reaches such a row).
