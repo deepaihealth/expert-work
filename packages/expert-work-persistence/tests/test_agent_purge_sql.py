@@ -81,7 +81,7 @@ _BASE_SPEC: dict[str, Any] = {
     "metadata": {"name": _X, "version": "1.0.0", "tenant": "t"},
     "spec": {
         "tenant_config": {},
-        "model": {"provider": "anthropic", "name": "claude-sonnet-4-5"},
+        "model": {"provider": "anthropic", "name": "claude-sonnet-4-6"},
         "system_prompt": {"template": "you are a reviewer"},
         "sandbox": {
             "resources": {"cpu": "1.0", "memory": "1Gi"},

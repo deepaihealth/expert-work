@@ -119,7 +119,7 @@ def _spec(name: str, version: str = "1.0.0", subagent_of: str | None = None) -> 
         "metadata": {"name": name, "version": version, "tenant": "t"},
         "spec": {
             "tenant_config": {},
-            "model": {"provider": "anthropic", "name": "claude-sonnet-4-5"},
+            "model": {"provider": "anthropic", "name": "claude-sonnet-4-6"},
             "system_prompt": {"template": "you help"},
             "sandbox": {
                 "resources": {"cpu": "1.0", "memory": "1Gi"},
