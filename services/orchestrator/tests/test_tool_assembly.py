@@ -412,6 +412,41 @@ async def test_ask_image_gets_the_workspace_store_for_its_short_form() -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("declared", [True, False], ids=["declared", "base-capability"])
+async def test_ask_image_renders_missing_pages_with_this_agents_read_page(declared: bool) -> None:
+    """B-251 —— 按页看时没渲染就代调 ``read_page``:接的必须是注册表里那一个实例(同一套
+    沙箱、种子文件与图交付方式),显式声明与基础能力两条注册路径都要接上。"""
+    env = ToolEnv(
+        sandbox_runtime=RecordingSandboxRuntime(),
+        artifact_store=InMemoryArtifactStore(),
+        workspace_store=RecordingWorkspaceStore(),
+        image_resolver=InMemoryImageResolver(),
+    )
+    registry = await build_tool_registry(
+        [BuiltinToolSpec(name="read_page")] if declared else [],
+        tool_env=env,
+        vision=_vision_spec(),
+        vl_caller=_stub_vl_caller,
+    )
+    tool = registry.get("ask_image")
+    assert isinstance(tool, AskImageTool)
+    assert tool.page_renderer is registry.get("read_page")
+    assert isinstance(tool.page_renderer, ReadPageTool)
+
+
+@pytest.mark.asyncio
+async def test_ask_image_without_read_page_does_not_render() -> None:
+    env = ToolEnv(image_resolver=InMemoryImageResolver(), workspace_store=RecordingWorkspaceStore())
+    registry = await build_tool_registry(
+        [], tool_env=env, vision=_vision_spec(), vl_caller=_stub_vl_caller
+    )
+    tool = registry.get("ask_image")
+    assert isinstance(tool, AskImageTool)
+    assert registry.get("read_page") is None
+    assert tool.page_renderer is None
+
+
+@pytest.mark.asyncio
 async def test_vision_block_without_image_resolver_raises() -> None:
     with pytest.raises(AgentFactoryError, match="image resolver"):
         await build_tool_registry(
@@ -802,6 +837,22 @@ async def test_file_op_write_tools_receive_workspace_lock() -> None:
     assert isinstance(edit_tool, EditFileTool)
     assert write_tool.workspace_lock is lock
     assert edit_tool.workspace_lock is lock
+
+
+async def test_sandbox_exec_tools_receive_workspace_lock() -> None:
+    # B-249 —— exec_python 与 bash 一样接到控制面注入的那把写锁(漏接 = 默认的空锁)。
+    lock = RecordingWorkspaceLock()
+    env = ToolEnv(sandbox_runtime=RecordingSandboxRuntime(), workspace_lock=lock)
+    registry = await build_tool_registry(
+        [BuiltinToolSpec(name="exec_python"), BuiltinToolSpec(name="bash")],
+        tool_env=env,
+    )
+    exec_tool = registry.get("exec_python")
+    bash_tool = registry.get("bash")
+    assert isinstance(exec_tool, ExecPythonTool)
+    assert isinstance(bash_tool, BashTool)
+    assert exec_tool.workspace_lock is lock
+    assert bash_tool.workspace_lock is lock
 
 
 async def test_file_op_without_supervisor_raises() -> None:

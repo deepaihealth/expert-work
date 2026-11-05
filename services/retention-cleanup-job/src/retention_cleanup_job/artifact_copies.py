@@ -28,7 +28,11 @@ from dataclasses import dataclass
 from pathlib import Path
 from uuid import UUID
 
-from expert_work.persistence import ARTIFACT_SNAPSHOT_DIR, artifact_snapshot_dir
+from expert_work.persistence import (
+    ARTIFACT_SNAPSHOT_DIR,
+    agent_file_versions_dir,
+    artifact_snapshot_dir,
+)
 from expert_work.persistence.artifact import ArtifactStore
 from expert_work.protocol import ArtifactVersion
 from retention_cleanup_job.workspace_files import (
@@ -97,6 +101,18 @@ def remove_user_copies(root: str, tenant_id: UUID, user_id: UUID) -> int:
     if user_dir is None:
         return 0
     count = sum(1 for _ in os.scandir(user_dir))
+    shutil.rmtree(user_dir)
+    return count
+
+
+def remove_user_agent_file_versions(root: str, tenant_id: UUID, user_id: UUID) -> int:
+    """B-236 —— 删一个用户的 ``/agent`` 文件历史版本目录(与副本同一个位置理由:住在用户根
+    旁边,工作区归档 / rmtree 碰不到);返回删掉的文件数。任何一级是链接 → 抛,不存在 → 0。"""
+    user_dir = agent_file_versions_dir(str(Path(root).resolve()), tenant_id, user_id)
+    for level in (user_dir.parent.parent, user_dir.parent, user_dir):
+        if not _plain_dir(level):
+            return 0
+    count = sum(len(files) for _base, _dirs, files in os.walk(user_dir))
     shutil.rmtree(user_dir)
     return count
 

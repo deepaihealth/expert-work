@@ -32,6 +32,18 @@ deliberate differences the technique alone doesn't cover:
 The lock is taken on a *raw* (non-RLS) session: it never reads a
 tenant-scoped table, so it needs no tenant role / RLS context. Tenant
 isolation comes from the ``{tenant}:{user}`` key itself.
+
+B-236 follow-up — a new-layout conversation (its own ``/workspace``) passes
+``conversation_id`` and is locked on ``{tenant}:{user}:conv:{conversation}``
+instead, in the same classid / two-arg key space; old-layout conversations
+pass ``None`` and keep ``{tenant}:{user}``. ``write_file`` / ``edit_file`` into
+the agent's shared area also pass ``agent_key`` and take
+``{tenant}:{user}:agent:{agent_key}`` second, in the same transaction. The two string shapes never
+coincide; ``hashtext`` is 32-bit, so distinct keys can collide, which only
+makes two unrelated writers wait for each other (as it already could) — it
+never lets two holders of the *same* key in at once. The RT-6
+``last_write_at`` bump stays per ``(tenant, user)`` — ``user_workspace`` has no
+conversation column and the drift check reads it per user.
 """
 
 from __future__ import annotations
@@ -45,7 +57,7 @@ from uuid import UUID
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from control_plane.advisory_locks import WORKSPACE_LOCK_CLASSID
+from control_plane.advisory_locks import CONVERSATION_SEED_LOCK_CLASSID, WORKSPACE_LOCK_CLASSID
 
 logger = logging.getLogger(__name__)
 
@@ -65,7 +77,14 @@ class PgWorkspaceLock:
     session_factory: async_sessionmaker[AsyncSession]
 
     @asynccontextmanager
-    async def acquire(self, *, tenant_id: UUID | None, user_id: UUID | None) -> AsyncIterator[None]:
+    async def acquire(
+        self,
+        *,
+        tenant_id: UUID | None,
+        user_id: UUID | None,
+        conversation_id: UUID | None = None,
+        agent_key: str | None = None,
+    ) -> AsyncIterator[None]:
         # An ephemeral workspace (no user binding) is a per-sandbox tmpfs, not
         # a shared volume, so it needs no cross-replica lock. A call with no
         # tenant binding is rejected downstream before any write; skip+log so a
@@ -75,6 +94,9 @@ class PgWorkspaceLock:
             yield
             return
         key = f"{tenant_id}:{user_id}"
+        if conversation_id is not None:
+            # B-236 —— 新布局的对话只写自己的目录,按对话锁;同一用户的别的对话不再排队。
+            key = f"{key}:conv:{conversation_id}"
         async with self.session_factory() as session, session.begin():
             # SET LOCAL is txn-scoped and auto-reverted — safe under PgBouncer
             # transaction mode (a SET SESSION would leak to the next pooled txn).
@@ -86,6 +108,17 @@ class PgWorkspaceLock:
                 text("SELECT pg_advisory_xact_lock(:classid, hashtext(:k))"),
                 {"classid": WORKSPACE_LOCK_CLASSID, "k": key},
             )
+            if agent_key:
+                # agent 共用区(/agent 等):只有 write_file / edit_file 传,只持一次写文件
+                # (含拿沙箱,冷启动时十几秒);bash 不传 —— 它写 /agent 跨对话仍是后写者胜
+                # (产品已接受)。总在上面那把之后拿、同一个事务里放,没有人反着拿,不会死锁。
+                await session.execute(
+                    text("SELECT pg_advisory_xact_lock(:classid, hashtext(:k))"),
+                    {
+                        "classid": WORKSPACE_LOCK_CLASSID,
+                        "k": f"{tenant_id}:{user_id}:agent:{agent_key}",
+                    },
+                )
             yield
         # RT-6 Tier B (RT-ADR-20) — a write-capable tool completed under the lock
         # (a raise would have skipped this and rolled the lock txn back). Record
@@ -123,3 +156,30 @@ class PgWorkspaceLock:
                 user_id,
                 exc_info=True,
             )
+
+
+@dataclass
+class PgConversationSeedLock:
+    """B-236 —— 对话开场复制按对话互斥(``{tenant}:{conv}``),跨副本。
+
+    同一个对话的两个 run 同时开始时只让一个去复制;另一个拿到锁后看到标记,什么都不做。
+    与 :class:`PgWorkspaceLock` 同一种做法(事务级 advisory lock、``SET LOCAL`` 把超时抬到
+    复制时长之上),但是另一个 classid、另一个键 —— 不挡同一用户别的对话的写。
+
+    Structurally satisfies ``orchestrator.tools.locks.KeyedLock``."""
+
+    #: A *raw* (non-RLS) sessionmaker — the lock touches no tenant tables.
+    session_factory: async_sessionmaker[AsyncSession]
+
+    @asynccontextmanager
+    async def acquire(self, *, key: str) -> AsyncIterator[None]:
+        async with self.session_factory() as session, session.begin():
+            await session.execute(
+                text(f"SET LOCAL idle_in_transaction_session_timeout = {_LOCK_TXN_TIMEOUT_MS}")
+            )
+            await session.execute(text(f"SET LOCAL statement_timeout = {_LOCK_TXN_TIMEOUT_MS}"))
+            await session.execute(
+                text("SELECT pg_advisory_xact_lock(:classid, hashtext(:k))"),
+                {"classid": CONVERSATION_SEED_LOCK_CLASSID, "k": key},
+            )
+            yield

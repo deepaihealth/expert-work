@@ -22,6 +22,7 @@ from uuid import UUID
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from expert_work.protocol.knowledge_estimate import IngestActual, IngestEstimate
+from expert_work.protocol.knowledge_profile import KnowledgeProfileRecord
 
 #: Default per-base chunking parameters (token-counted). A base may
 #: override them at creation to tune chunk granularity to its content.
@@ -402,6 +403,10 @@ class KnowledgeBase(BaseModel):
     api_access_enabled: bool = Field(
         default=False, description="whether the open API may read this base"
     )
+    #: B-267 (migration ``0182``) —— the generated profile, the per-turn probe's
+    #: calibration and a pending refresh (``None``: nothing stored). Platform
+    #: state, not an API field: ``_base_dict`` does not list it.
+    profile: KnowledgeProfileRecord | None = None
     created_at: datetime | None = None
     updated_at: datetime | None = None
 

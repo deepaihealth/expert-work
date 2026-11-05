@@ -677,6 +677,32 @@ class KnowledgeSpec(BaseModel):
         min_length=1,
         description="names of tenant knowledge bases this agent may search",
     )
+    #: B-267 step 3 —— the per-turn knowledge probe (platform switch
+    #: ``kb_first_routing``): on by default, ``false`` only narrows (this agent's
+    #: turns are not probed). Leaving it out keeps the manifest as it was.
+    probe: bool = Field(
+        default=True,
+        description=(
+            "probe the bound knowledge bases with each user message and, on a hit, tell "
+            "the model to search them first (default true; false turns it off)"
+        ),
+    )
+
+    @model_serializer(mode="wrap")
+    # Unannotated on purpose, like ``MCPToolSpec._omit_empty_arg_bindings``: an
+    # annotation collapses the serialization-mode JSON Schema.
+    def _omit_default_probe(  # type: ignore[no-untyped-def]
+        self, handler: SerializerFunctionWrapHandler
+    ):
+        """B-267 —— ``probe`` is stored only when turned off. Saving materialises
+        defaults (``model_dump``): without this every knowledge agent saved after
+        the release would carry ``probe: true``, which an older image's
+        ``extra="forbid"`` rejects on rollback; and every such manifest's
+        ``compute_spec_sha256`` would change (the ``run`` ↔ revision join)."""
+        data: dict[str, Any] = handler(self)
+        if self.probe:
+            data.pop("probe", None)
+        return data
 
     @model_validator(mode="after")
     def _check_refs(self) -> KnowledgeSpec:

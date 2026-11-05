@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
-import { render, screen, waitFor } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import "../../../i18n";
 
 import { KnowledgePicker } from "../KnowledgePicker";
@@ -57,6 +57,27 @@ describe("KnowledgePicker", () => {
     } finally {
       scopeRef.current = undefined;
     }
+  });
+
+  it("B-267 —— the probe switch shows only with a base bound", () => {
+    render(<KnowledgePicker formData={SEED} onChange={vi.fn()} />);
+    expect(screen.queryByTestId("af-knowledge-probe")).not.toBeInTheDocument();
+  });
+
+  it("B-267 —— turning the probe off writes probe: false", () => {
+    const onChange = vi.fn();
+    const seeded: AgentManifest = {
+      ...SEED,
+      spec: { knowledge: { knowledge_base_refs: ["hr"] } },
+    };
+    render(<KnowledgePicker formData={seeded} onChange={onChange} />);
+    const toggle = within(screen.getByTestId("af-knowledge-probe")).getByRole("switch");
+    expect(toggle).toBeChecked();
+    fireEvent.click(toggle);
+    expect(onChange).toHaveBeenCalledWith({
+      ...seeded,
+      spec: { knowledge: { knowledge_base_refs: ["hr"], probe: false } },
+    });
   });
 
   it("reflects the selected refs (supports multiple bases)", async () => {

@@ -26,6 +26,7 @@ def _row_to_dto(row: UserUploadRow) -> UserUpload:
         filename=row.filename,
         created_at=row.created_at,
         deleted_at=row.deleted_at,
+        sha256=row.sha256,
     )
 
 
@@ -47,6 +48,7 @@ class SqlUserUploadStore(UserUploadStore):
         mime_type: str,
         size_bytes: int,
         filename: str,
+        sha256: str | None = None,
     ) -> UserUpload:
         now = datetime.now(UTC)
         async with self._sf() as session:
@@ -62,6 +64,7 @@ class SqlUserUploadStore(UserUploadStore):
                 filename=filename,
                 created_at=now,
                 deleted_at=None,
+                sha256=sha256,
             )
             session.add(row)
             await session.commit()
@@ -80,12 +83,42 @@ class SqlUserUploadStore(UserUploadStore):
             ).scalar_one_or_none()
         return _row_to_dto(row) if row is not None else None
 
+    async def list_documents_for_thread(
+        self, *, tenant_id: UUID, thread_id: UUID
+    ) -> list[UserUpload]:
+        stmt = (
+            select(UserUploadRow)
+            .where(
+                UserUploadRow.tenant_id == tenant_id,
+                UserUploadRow.thread_id == thread_id,
+                UserUploadRow.kind == "document",
+                UserUploadRow.deleted_at.is_(None),
+            )
+            .order_by(UserUploadRow.created_at.asc(), UserUploadRow.id.asc())
+        )
+        async with self._sf() as session:
+            rows = (await session.execute(stmt)).scalars().all()
+        return [_row_to_dto(row) for row in rows]
+
     async def list_expired(self, *, before: datetime, limit: int = 1000) -> list[UserUpload]:
         stmt = (
             select(UserUploadRow)
             .where(UserUploadRow.deleted_at.is_(None), UserUploadRow.created_at < before)
             .order_by(UserUploadRow.created_at.asc(), UserUploadRow.id.asc())
             .limit(limit)
+        )
+        async with self._sf() as session:
+            rows = (await session.execute(stmt)).scalars().all()
+        return [_row_to_dto(row) for row in rows]
+
+    async def list_active_by_ref(
+        self, *, tenant_id: UUID, user_id: UUID, ref: str
+    ) -> list[UserUpload]:
+        stmt = select(UserUploadRow).where(
+            UserUploadRow.tenant_id == tenant_id,
+            UserUploadRow.user_id == user_id,
+            UserUploadRow.ref == ref,
+            UserUploadRow.deleted_at.is_(None),
         )
         async with self._sf() as session:
             rows = (await session.execute(stmt)).scalars().all()

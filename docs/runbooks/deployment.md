@@ -215,6 +215,7 @@ python tools/deploy/rollback.py --to-tag v1.2.2  # 兜底路径
 - [ ] Grafana SLO 大盘([slo.md](./slo.md))有数据;Langfuse 有 trace。
 - [ ] 起一个 canonical agent 跑通最小对话(Gate 验收见 [canonical-agent-e2e-test.md](./canonical-agent-e2e-test.md))。
 - [ ] **改动触及工作区权限 / NAS / 沙箱 exec 时**:在集群内跑一次 agent_sandbox 契约档(下一节),CI 那两条跳过的用例只有这里跑得到。
+- [ ] **动了沙箱链路依赖时同样必跑下一节**(X-14 P4):`e2b` 版本、OpenKruise / agent-sandbox 组件、sandbox-supervisor、沙箱镜像(`infra/sandbox-image/`、`sandboxset.yaml` 钉的 tag)任何一个变了都算。来源是 e2b 事故:评审漏了钉版、CI 契约套件用的是假件全绿、smoke 只探 HTTP,三层一起漏过。
 
 ### 11.1 集群内补跑 agent_sandbox 契约档(CI 跑不全的那两条)
 

@@ -128,7 +128,11 @@ def build_delegation_policy_prompt(*, spec: AgentSpec, tools: Sequence[ToolBrief
         "3. Every worker task must be fully self-contained: the worker sees "
         "none of the conversation, so the task text must carry all context, "
         "inputs, and the expected output shape.\n"
-        "4. Spot-check workers' results before relying on them.\n"
+        # B-276 — same wording as the platform's worker-report guidance: a bare
+        # "spot-check" pulled a main agent into redoing its workers' reading.
+        "4. Check workers' results with quick checks (the files they list, "
+        "numbers that should add up) before relying on them; do not redo their "
+        "work — if a key result looks wrong, delegate a re-check of that item.\n"
         "5. One concrete example sentence of a good delegation in this "
         "agent's own domain.\n"
         "\n"

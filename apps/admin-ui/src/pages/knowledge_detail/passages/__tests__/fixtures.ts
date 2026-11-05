@@ -48,6 +48,7 @@ export function revision(extra: Partial<PassageRevision> = {}): PassageRevision 
     content: "Sample paragraph one.\n\nSample paragraph two.",
     heading_path: ["Chapter 1", "Section 1.1"],
     edited_by: null,
+    edited_by_name: null,
     created_at: "2026-10-27T01:00:00Z",
     orphaned_at: null,
     switch_off_lost: false,

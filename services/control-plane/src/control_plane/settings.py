@@ -189,6 +189,20 @@ class Settings(BaseSettings):
     #: Reached over the internal network only; never expose SearXNG publicly.
     web_search_searxng_base_url: str | None = None
 
+    #: B-267 —— 测试用的 ``web_search`` 固定结果替身:平台持有的夹具目录(目录里的
+    #: ``<名字>.json``)。智能体在 manifest 的 ``web_search`` 条目写
+    #: ``config.fixture: <名字>`` 选一个;结果完全确定、不出网,工具名 / 说明 / 结果
+    #: 格式与真搜索相同。只在测试环境配:不配(``None``)时选了夹具就是构建期配置
+    #: 错误,绝不悄悄退回真搜索。见 ``orchestrator.tools.web_search_fixture``。
+    web_search_fixtures_dir: str | None = None
+
+    #: B-267 —— 平台总开关「绑了知识库先查知识库」(默认开)。开:``knowledge_search``
+    #: 说明加先查规则、同时有 ``web_search`` 时它的说明加一句、只绑 1 个库也展示目录;
+    #: 第 2 步(知识库画像进目录)、第 3 步(每轮轻量探测)同样只在开时生效。关 = 上面
+    #: 这些全不生效,模型看到的与 B-267 之前逐字相同 —— 用于在同一镜像上跑基线,
+    #: 也是上线后的应急回退。启动时读一次,改了要重启(进程内构建缓存随之清空)。
+    kb_first_routing: bool = True
+
     #: Path to a JSON file listing the platform's MCP servers —
     #: ``[{"name", "command": [...], "env": {...}}]`` (STREAM-E-DESIGN
     #: Mini-ADR E-17). The orchestrator launches one subprocess per
@@ -759,7 +773,9 @@ class Settings(BaseSettings):
     quality_monitor_batch_size: int = Field(default=200, gt=0)
     #: Judge model + provider (platform-credentialed, Haiku-tier for cost).
     quality_judge_provider: str = Field(default="anthropic")
-    quality_judge_model: str = Field(default="claude-haiku-4-5-20251001")
+    #: B-112 —— the catalog name (the dated ``-20251001`` id is not in the catalog,
+    #: so neither capability gates nor the rate card applied to it).
+    quality_judge_model: str = Field(default="claude-haiku-4-5")
     #: RT-5 PR-2 (RT-ADR-24/25) — quality-drift detector. Started alongside the
     #: sampler (same ``enable_quality_monitor`` gate): it reads the quality
     #: series and raises a ``quality.drift`` webhook when an agent's recent mean

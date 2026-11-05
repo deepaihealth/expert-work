@@ -357,12 +357,16 @@ async def test_seed_files_land_under_the_sandbox_skills_root(expert_work: _Harne
     (spec § 四)。
     """
     content = b"SEED_CONTENT"
-    seed_files = [SeedFile(path="seeded.txt", content_b64=base64.b64encode(content).decode())]
+    # B-242 —— exec 的视图里 /opt/skills 只剩本 agent 那一格(只读),种子照生产的形状落在
+    # <agent_key>/ 底下,exec 也带上这个 agent。
+    seed_files = [SeedFile(path="a/seeded.txt", content_b64=base64.b64encode(content).decode())]
     acquired = await expert_work.supervisor.acquire(
         AcquireRequest(tenant_id=uuid4(), thread_id="t-seed", seed_files=seed_files)
     )
     result = await expert_work.supervisor.exec(
-        acquired.sandbox_id, code=f"print(open('{SANDBOX_SKILLS_ROOT}/seeded.txt').read())"
+        acquired.sandbox_id,
+        code=f"print(open('{SANDBOX_SKILLS_ROOT}/a/seeded.txt').read())",
+        agent_root="/mnt/workspace/agents/a",
     )
     await expert_work.supervisor.release(acquired.sandbox_id)
 
@@ -524,6 +528,197 @@ async def test_exec_agent_root_is_bound_as_workspace_and_hides_the_rest(
         assert root.stdout.strip() == "A"
     finally:
         await expert_work.supervisor.destroy(sid, reason="b60-acceptance")
+
+
+# ---------------------------------------------------------------------------
+# B-236 — per-conversation /workspace + the shared /agent view, acceptance under
+# the real image and OCI runtime (plan tests 2-5). The script logic is also
+# proven on a real kernel in orchestrator tests/test_exec_view_kernel.py; this is
+# where they are proven through the supervisor + runner path.
+# ---------------------------------------------------------------------------
+
+_B236_ROOT = "/mnt/workspace/agents/a"
+_B236_PROBE = (
+    "import os, json\n"
+    "c = os.environ['EW_CONV']\n"
+    "here = os.stat('.')\n"
+    "work = os.stat(f'/agent/threads/{c}/work')\n"
+    "open('x.txt', 'w').write('conv')\n"
+    "open('/agent/y.txt', 'w').write('agent')\n"
+    "os.makedirs('/workspace/inputs/r1', exist_ok=True)\n"
+    "open('/workspace/inputs/r1/i.json', 'w').write('{}')\n"
+    "print(json.dumps({'cwd': os.getcwd(), 'same': [here.st_dev, here.st_ino] == "
+    "[work.st_dev, work.st_ino], 'threads': sorted(os.listdir('/agent/threads')), "
+    "'upload': os.path.exists('/workspace/uploads/u.txt'), "
+    "'agent_uploads': os.listdir('/agent/uploads'), "
+    "'anchor': open('/agent/style/s.md').read(), 'style_here': os.path.exists('style')}))\n"
+)
+
+
+@pytest.mark.asyncio
+async def test_exec_conversation_view_binds_its_own_dir_and_the_agent_root(
+    expert_work: _Harness,
+) -> None:
+    import json
+
+    tenant, user = uuid4(), uuid4()
+    response = await expert_work.supervisor.acquire(
+        AcquireRequest(tenant_id=tenant, thread_id="b236", user_id=user)
+    )
+    sid = response.sandbox_id
+    conv, other = uuid4(), uuid4()
+    try:
+        setup = await expert_work.supervisor.exec(
+            sid,
+            code="import os\n"
+            "os.makedirs('/workspace/agents/a/uploads', exist_ok=True)\n"
+            "open('/workspace/agents/a/uploads/u.txt', 'w').write('up')\n"
+            "os.makedirs('/workspace/agents/a/style', exist_ok=True)\n"
+            "open('/workspace/agents/a/style/s.md', 'w').write('anchor')\n"
+            f"os.makedirs('/workspace/agents/a/threads/{other}/work', exist_ok=True)\n"
+            f"open('/workspace/agents/a/threads/{other}/work/secret.txt', 'w').write('B')\n",
+        )
+        assert setup.exit_code == 0, setup.stderr
+        probe = await expert_work.supervisor.exec(
+            sid,
+            code=f"import os; os.environ['EW_CONV'] = {str(conv)!r}\n" + _B236_PROBE,
+            agent_root=_B236_ROOT,
+            conv_id=conv,
+            thread_id=conv,
+        )
+        assert probe.exit_code == 0, probe.stderr
+        seen = json.loads(probe.stdout.strip().splitlines()[-1])
+        # B-236 —— agent 根的基础目录不挂进 /workspace(开场时由控制面在宿主侧复制进本对话
+        # 的 work/,这里没走那一步);经 /agent 照常读得到。B-262 —— agent 根的 uploads/
+        # (老视图对话的件)不进对话视图,/agent 下那一份被盖住。
+        assert seen == {
+            "cwd": "/workspace",
+            "same": True,
+            "threads": [str(conv)],
+            "upload": False,
+            "agent_uploads": [],
+            "anchor": "anchor",
+            "style_here": False,
+        }
+        check = await expert_work.supervisor.exec(
+            sid,
+            code="import os\n"
+            "r = '/workspace/agents/a'\n"
+            f"print(open(f'{{r}}/threads/{conv}/work/x.txt').read(), open(f'{{r}}/y.txt').read(),"
+            " os.path.exists(f'{r}/x.txt'),"
+            f" open(f'{{r}}/threads/{conv}/work/inputs/r1/i.json').read(),"
+            " os.path.exists(f'{r}/inputs/r1/i.json'), open(f'{r}/style/s.md').read())",
+        )
+        assert check.stdout.split() == ["conv", "agent", "False", "{}", "False", "anchor"], (
+            check.stderr
+        )
+    finally:
+        await expert_work.supervisor.destroy(sid, reason="b236-acceptance")
+
+
+@pytest.mark.asyncio
+async def test_exec_legacy_view(expert_work: _Harness) -> None:
+    """老视图:``/workspace`` 与 ``/agent`` 是同一个目录(比 inode),``threads/`` 只剩本线程
+    那一格(发布后新开的对话的工作目录老对话看不到)。"""
+    response = await expert_work.supervisor.acquire(
+        AcquireRequest(tenant_id=uuid4(), thread_id="b236-legacy", user_id=uuid4())
+    )
+    sid = response.sandbox_id
+    own, other = uuid4(), uuid4()
+    try:
+        await expert_work.supervisor.exec(
+            sid,
+            code="import os\n"
+            f"os.makedirs('/workspace/agents/a/threads/{other}/work', exist_ok=True)\n"
+            f"open('/workspace/agents/a/threads/{other}/work/secret.txt', 'w').write('B')\n",
+        )
+        legacy = await expert_work.supervisor.exec(
+            sid,
+            code="import os; a, w = os.stat('/agent'), os.stat('/workspace'); "
+            "print((a.st_dev, a.st_ino) == (w.st_dev, w.st_ino), "
+            "os.listdir('threads'), os.listdir('/agent/threads'))",
+            agent_root=_B236_ROOT,
+            thread_id=own,
+        )
+        assert legacy.stdout.strip() == f"True ['{own}'] ['{own}']", legacy.stderr
+    finally:
+        await expert_work.supervisor.destroy(sid, reason="b236-acceptance")
+
+
+@pytest.mark.asyncio
+async def test_exec_payload_cannot_unmount_the_covers(expert_work: _Harness) -> None:
+    """载荷跑在嵌套的 user namespace 里:``umount`` 覆盖层、自己 ``unshare -m`` 再卸,都失败。"""
+    response = await expert_work.supervisor.acquire(
+        AcquireRequest(tenant_id=uuid4(), thread_id="b236-locked", user_id=uuid4())
+    )
+    sid = response.sandbox_id
+    conv = uuid4()
+    try:
+        probe = await expert_work.supervisor.exec(
+            sid,
+            code="import subprocess\n"
+            "def fails(cmd):\n"
+            "    return subprocess.run(cmd, capture_output=True).returncode != 0\n"
+            "print(fails(['umount', '/agent/threads']), fails(['umount', '/mnt/workspace']), "
+            "fails(['unshare', '-m', 'sh', '-c', 'umount /mnt/workspace']))",
+            agent_root=_B236_ROOT,
+            conv_id=conv,
+            thread_id=conv,
+        )
+        assert probe.exit_code == 0, probe.stderr
+        assert probe.stdout.strip() == "True True True"
+    finally:
+        await expert_work.supervisor.destroy(sid, reason="b236-acceptance")
+
+
+@pytest.mark.asyncio
+async def test_exec_planted_symlinks_are_refused(expert_work: _Harness) -> None:
+    """agent 根下被换成符号链接的 ``uploads``(B-262:对话视图里要盖住的那个)→ 跳过(exec
+    照跑,看不到别的对话);本对话的 ``work`` → 98 退出(不跟着链接进别的对话)。"""
+    response = await expert_work.supervisor.acquire(
+        AcquireRequest(tenant_id=uuid4(), thread_id="b236-symlink", user_id=uuid4())
+    )
+    sid = response.sandbox_id
+    conv, other = uuid4(), uuid4()
+    try:
+        plant = await expert_work.supervisor.exec(
+            sid,
+            code="import os\n"
+            "r = '/workspace/agents/a'\n"
+            f"os.makedirs(f'{{r}}/threads/{other}/work', exist_ok=True)\n"
+            f"open(f'{{r}}/threads/{other}/work/secret.txt', 'w').write('B')\n"
+            "os.symlink('threads', f'{r}/uploads')\n",
+        )
+        assert plant.exit_code == 0, plant.stderr
+        skipped = await expert_work.supervisor.exec(
+            sid,
+            code=f"import os; print(os.path.exists('/agent/uploads/{other}/work/secret.txt'))",
+            agent_root=_B236_ROOT,
+            conv_id=conv,
+            thread_id=conv,
+        )
+        assert skipped.exit_code == 0, skipped.stderr
+        assert skipped.stdout.strip() == "False"
+        assert "uploads is not a plain directory" in skipped.stderr
+        swap = await expert_work.supervisor.exec(
+            sid,
+            code="import os\n"
+            f"w = '/workspace/agents/a/threads/{conv}/work'\n"
+            "os.rename(w, w + '.old')\n"
+            f"os.symlink('../{other}/work', w)\n",
+        )
+        assert swap.exit_code == 0, swap.stderr
+        refused = await expert_work.supervisor.exec(
+            sid,
+            code="print(open('secret.txt').read())",
+            agent_root=_B236_ROOT,
+            conv_id=conv,
+            thread_id=conv,
+        )
+        assert refused.exit_code == 98, refused.stderr
+        assert "B" not in refused.stdout
+    finally:
+        await expert_work.supervisor.destroy(sid, reason="b236-acceptance")
 
 
 # ---------------------------------------------------------------------------

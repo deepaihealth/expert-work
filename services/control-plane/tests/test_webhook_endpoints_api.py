@@ -115,6 +115,21 @@ async def test_create_rejects_unknown_event_type(client: AsyncClient) -> None:
 
 
 @pytest.mark.asyncio
+async def test_create_accepts_run_paused(client: AsyncClient) -> None:
+    """B-230 —— a pause is its own event; endpoints must be able to subscribe."""
+    resp = await client.post(
+        "/v1/webhook-endpoints",
+        json={
+            "name": "pauses",
+            "url": "https://h.example.com/pauses",
+            "event_types": ["run.failed", "run.paused"],
+        },
+    )
+    assert resp.status_code == 201
+    assert resp.json()["event_types"] == ["run.failed", "run.paused"]
+
+
+@pytest.mark.asyncio
 async def test_create_accepts_skill_promote_requested(client: AsyncClient) -> None:
     """SE-16 PR-8 — the new event type is subscribable."""
     resp = await client.post(

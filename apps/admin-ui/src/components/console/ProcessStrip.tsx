@@ -28,6 +28,9 @@ export interface ProcessStripProps {
   /** 本轮全部模型调用(`modelCallsOf`)—— 标题的「模型调用 N 次」与时长都按它算,
    *  不按 `rows` 里的 think 行(没写思考的步骤不出 think 行,B-202)。 */
   modelCalls: readonly ModelCall[];
+  /** 本轮每个 `tools` 节点帧的墙钟(`toolNodeMsOf`)—— 工具时长按批取墙钟,
+   *  并发调用不重复计(B-255)。 */
+  toolNodeMs: ReadonlyMap<number, number>;
   running: boolean;
   /** 已展开详情的行 id 集合 + 切换(TurnBlock 持有,行详情跟着轮走)。 */
   expandedRowIds: ReadonlySet<string>;
@@ -45,6 +48,7 @@ const AUTO_VISIBLE_ROWS = 3;
 export function ProcessStrip({
   rows,
   modelCalls,
+  toolNodeMs,
   running,
   expandedRowIds,
   onToggleRow,
@@ -56,8 +60,8 @@ export function ProcessStrip({
   /** `null` = 跟随 `running` 自动;点过头部之后固定成用户选的那个。 */
   const [open, setOpen] = useState<boolean | null>(null);
   const summary = useMemo(
-    () => summarizeProcess(rows.map((r) => r.row), modelCalls),
-    [rows, modelCalls],
+    () => summarizeProcess(rows.map((r) => r.row), modelCalls, toolNodeMs),
+    [rows, modelCalls, toolNodeMs],
   );
 
   if (rows.length === 0) return null;
@@ -68,6 +72,18 @@ export function ProcessStrip({
   const visible = isOpen ? (tailOnly ? rows.slice(-AUTO_VISIBLE_ROWS) : rows) : [];
   // 失败尾段由本组件单独渲染成红字,所以摘要按 `failed: 0` 取。
   const headline = processHeadline({ ...summary, failed: 0 }, t);
+  const failedText =
+    summary.failedMs !== null && summary.failedMs > 0
+      ? t("console.process_failed_time", { n: summary.failed, d: fmtDuration(summary.failedMs) })
+      : t("console.process_failed", { n: summary.failed });
+  const split =
+    summary.modelMs !== null && summary.toolMs !== null
+      ? t(summary.otherMs > 0 ? "console.process_time_split_other" : "console.process_time_split", {
+          model: fmtDuration(summary.modelMs),
+          tools: fmtDuration(summary.toolMs),
+          other: fmtDuration(summary.otherMs),
+        })
+      : null;
 
   return (
     <div className="ew-process">
@@ -83,17 +99,28 @@ export function ProcessStrip({
         </span>
         {/* 截断成省略号后 hover 有全文 —— 「工具 17 次(…)」被拦腰截断时
             不用展开也能看清工具分布(2026-08-26 用户反馈)。 */}
-        <span className="ew-process__headline" title={headline}>
+        <span
+          className="ew-process__headline"
+          title={summary.failed > 0 ? `${headline} · ${failedText}` : headline}
+        >
           {headline}
           {summary.failed > 0 && (
             <>
               {" · "}
-              <span className="ew-process__failed">
-                {t("console.process_failed", { n: summary.failed })}
-              </span>
+              <span className="ew-process__failed">{failedText}</span>
             </>
           )}
         </span>
+        {/* B-254 —— 慢在哪一眼看出来:模型思考、工具,还是失败重试(失败那段在红字里)。 */}
+        {split !== null && (
+          <span
+            className="ew-process__split"
+            data-testid="console-process-time-split"
+            title={`${split} — ${t("console.process_time_split_tip")}`}
+          >
+            {split}
+          </span>
+        )}
         {summary.durationMs !== null && (
           <span className="ew-process__duration">{fmtDuration(summary.durationMs)}</span>
         )}

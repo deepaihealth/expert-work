@@ -85,6 +85,21 @@ export function modelCallsOf(
   return calls;
 }
 
+/** B-255 —— 本轮每个 `tools` 节点 updates 帧的 `_duration_ms`(那一批工具调用的
+ *  墙钟),按帧在 `events` 里的下标;与 `session_stats.ts` `nodeDurations` 同一个数。
+ *  过程条拿工具行的 `eventIndexes` 来查,并发的调用共用一帧、只算一次。 */
+export function toolNodeMsOf(events: readonly SseEvent[]): Map<number, number> {
+  const out = new Map<number, number>();
+  events.forEach((e, i) => {
+    if (e.event !== "updates" || e.data === null || typeof e.data !== "object") return;
+    const tools = (e.data as Record<string, unknown>).tools;
+    if (tools === null || typeof tools !== "object") return;
+    const d = (tools as Record<string, unknown>)._duration_ms;
+    if (typeof d === "number" && Number.isFinite(d)) out.set(i, d);
+  });
+  return out;
+}
+
 /** 一个未落帧步里每个「已报名字、还没结果」的工具调用一条行 —— 中栏紧凑投影
  *  与账本投影共用(两处的工具行完全同形,只有 agent 步的投影不同)。 */
 function liveToolRows(step: number, live: LiveStep): ToolRow[] {

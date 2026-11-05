@@ -43,23 +43,12 @@ _CALL_SITES: dict[tuple[str, str], tuple[bool, str]] = {
     ("file_ops.py", "WriteFileTool.call"): (True, "写:agent 根,永不回落"),
     ("file_ops.py", "EditFileTool.call"): (True, "写:agent 根,永不回落"),
     ("read_document.py", "ReadDocumentTool.call"): (True, "读:agent 根,不回落(PR6 摘掉)"),
-    ("file_ops.py", "SandboxWorkspaceWriter.write"): (
-        False,
-        "状态投影(threads/<tid>/PLAN.md)—— **有意暂缓到 PR5**。"
-        "control_plane/api/sessions.py 的 B-27 留存链按用户根下的 threads/<thread_id>/ "
-        "删目录;写入先搬走、删除侧要到 PR5(Task 12)才跟上,中间每个被清理的会话都会 "
-        "留下永远删不掉的投影文件。两边必须同一个 PR 改。",
-    ),
-    ("file_ops.py", "SandboxWorkspaceReader.read"): (
-        False,
-        "状态回读 —— 与 SandboxWorkspaceWriter 成对,必须同进同退:"
-        "一边搬一边不搬 = 写进 agent 根、从用户根读,回读恒空。",
-    ),
-    ("file_ops.py", "SandboxWorkspaceWriter.read"): (
-        False,
-        "B-188 改写根目录旧投影之前的回读 —— 与 SandboxWorkspaceWriter.write 同一个调用形状、"
-        "同一个根,必须同进同退:读一处、写另一处,就会照着别处的内容改写这里的文件。",
-    ),
+    # B-236 —— 平台自己写 / 读的三处一律显式按 ``/agent``(agent 根)寻址:对话视图里
+    # ``/workspace`` 是 ``threads/<conv>/work``,按它写投影会落进对话目录里一个嵌套的
+    # ``threads/<conv>/PLAN.md``;``/agent`` 在两种视图里都是 agent 根。
+    ("file_ops.py", "SandboxWorkspaceWriter.write"): (True, "状态投影:/agent,两种视图同一处"),
+    ("file_ops.py", "SandboxWorkspaceReader.read"): (True, "状态回读:与投影同进同退"),
+    ("file_ops.py", "SandboxWorkspaceWriter.read"): (True, "B-188 旧投影回读:与投影同进同退"),
 }
 
 
@@ -122,14 +111,3 @@ def test_call_site_scope_matches_its_registration(
     agent_scoped, reason = expected
     assert reason.strip(), f"{site} 登记了却没写理由"
     assert _discover()[site] is agent_scoped
-
-
-def test_user_root_exceptions_carry_a_real_reason() -> None:
-    """留在用户根的每一条都要说清**为什么**,而不是「暂时没改」。
-
-    这几条是 PR5 的待办清单:搬迁脚本落地时逐条翻过来。
-    """
-    exceptions = {k: v[1] for k, v in _CALL_SITES.items() if not v[0]}
-    assert exceptions, "一条例外都没有的话这条测试该删,而不是空过"
-    for site, reason in exceptions.items():
-        assert len(reason) > 40, f"{site} 的理由太短,说不清就是没想清"

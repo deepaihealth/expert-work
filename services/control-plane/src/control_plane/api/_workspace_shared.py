@@ -33,7 +33,7 @@ import logging
 from pathlib import PurePosixPath
 from uuid import UUID
 
-from fastapi import HTTPException
+from fastapi import HTTPException, Request
 from fastapi.responses import Response
 
 from control_plane.api._artifact_mime import content_disposition_header, infer_content_type
@@ -46,9 +46,27 @@ from orchestrator.tools import (
     WorkspacePermissionError,
     WorkspaceStore,
 )
-from orchestrator.tools.workspace_paths import AGENTS_DIR
+from orchestrator.tools.workspace_paths import AGENTS_DIR, CONVERSATION_WORK_DIR, THREADS_DIR
 
 logger = logging.getLogger("expert_work.control_plane.workspace")
+
+
+async def drop_file_versions(
+    request: Request, *, tenant_id: UUID, user_id: UUID, path: str
+) -> None:
+    """B-236 review 7 —— 删文件接口删掉 ``path``(用户根相对)之后,连它的历史版本一起删。
+
+    尽力而为:版本存储没接(非 NAS 部署)就跳过;删失败只记日志(异常类型),文件本身已经删了,
+    接口照常回成功 —— 剩下的版本在源文件不见满 30 天时由运行结束的观察删掉。
+    """
+    versions = getattr(request.app.state, "agent_file_versions", None)
+    if versions is None:
+        return
+    try:
+        await versions.delete_for_path(tenant_id=tenant_id, user_id=user_id, path=path)
+    except Exception as exc:
+        logger.warning("workspace.drop_file_versions_failed error=%s", type(exc).__name__)
+
 
 #: 路径校验失败的固定文案。导出成常量是因为对外平面在**加 agent 前缀之前**
 #: 自己跑一次校验(``_external_agent_scope.external_storage_path``),两处必须
@@ -75,6 +93,36 @@ def workspace_agent_path(rel: str, *, agent_key: str) -> str:
     if not agent_key:
         return rel
     return f"{AGENTS_DIR}/{agent_key}/{rel}"
+
+
+def conversation_workspace_path(rel: str, *, agent_key: str, conv_id: UUID | None) -> str:
+    """B-262 —— 一个会话 ``/workspace`` 相对的路径(``uploads/<名字>`` 这类)→ 用户根下的
+    存储路径。
+
+    ``conv_id`` 非 ``None``(对话视图的会话,且绑了 agent)时是本对话的
+    ``agents/<key>/threads/<conv>/work/<rel>``;否则(老视图 / 没绑 agent)与
+    :func:`workspace_agent_path` 一样落 agent 根(或用户根)。
+    """
+    if conv_id is None or not agent_key:
+        return workspace_agent_path(rel, agent_key=agent_key)
+    return workspace_agent_path(
+        f"{THREADS_DIR}/{conv_id}/{CONVERSATION_WORK_DIR}/{rel}", agent_key=agent_key
+    )
+
+
+def thread_conversation_id(meta: ThreadMeta) -> UUID | None:
+    """B-262 —— 这个会话有没有自己的 ``/workspace``:对话视图且绑了 agent → 会话 id;否则
+    ``None``(``/workspace`` 是 agent 根或用户根)。与 exec 视图同一个判据。"""
+    if meta.workspace_layout != "conversation" or not thread_agent_key(meta):
+        return None
+    return meta.thread_id
+
+
+def thread_workspace_path(rel: str, meta: ThreadMeta) -> str:
+    """B-262 —— 会话 ``meta`` 的 ``/workspace`` 相对路径 → 用户根下的存储路径(按它自己的布局)。"""
+    return conversation_workspace_path(
+        rel, agent_key=thread_agent_key(meta), conv_id=thread_conversation_id(meta)
+    )
 
 
 def thread_agent_key(meta: ThreadMeta) -> str:

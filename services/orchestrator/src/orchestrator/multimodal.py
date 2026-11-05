@@ -31,7 +31,12 @@ from uuid import UUID
 from expert_work.persistence import (
     RENDERED_FIGURE_PAGE_STEM,
     RENDERED_FIGURE_UNIT_PREFIX,
+    is_rendered_crop_rel,
     is_rendered_figure_rel,
+)
+from expert_work.persistence.workspace.layout import (
+    WORKSPACE_CONVERSATION_WORK_DIR,
+    WORKSPACE_THREADS_DIR,
 )
 from expert_work.protocol.multimodal import (
     IMAGE_REF_PREFIX,
@@ -57,6 +62,9 @@ _MEDIA_TYPE_BY_EXT: Final[dict[str, str]] = {
     ".webp": "image/webp",
     ".gif": "image/gif",
 }
+
+#: B-250 —— 工作区里能直接交给看图模型的文件扩展名(小写、带点),即上表的键。
+WORKSPACE_IMAGE_EXTENSIONS: Final[frozenset[str]] = frozenset(_MEDIA_TYPE_BY_EXT)
 
 #: B-64 —— per-file read cap for :class:`NasWorkspaceImageResolver`. Mirrors
 #: ``orchestrator.tools.nas_workspace_store._MAX_READ_BYTES`` /
@@ -482,9 +490,39 @@ def is_cacheable_image_ref(ref: str) -> bool:
     if not ref.startswith(WORKSPACE_REF_PREFIX):
         return True
     parsed = parse_workspace_image_ref(ref)
-    skip = 2 if parsed.agent_key is not None else 0
-    tail = "/".join(PurePosixPath(parsed.rel).parts[skip:])
-    return is_rendered_figure_rel(tail)
+    tail = "/".join(_figure_tail_parts(parsed))
+    # B-266 —— 「放大局部」的裁图同样由源内容哈希 + 框派生(``is_rendered_crop_rel``),同理可缓存。
+    return is_rendered_figure_rel(tail) or is_rendered_crop_rel(tail)
+
+
+#: B-262 —— 对话视图的渲染页落在本对话的 ``threads/<conv>/work/`` 下:``agents/<key>/`` 之后
+#: 再剥这三段(只认这一种形状,与 ``layout._head_after_container`` 同一口径)。
+_CONVERSATION_WORK_SEGMENTS = 3
+
+
+def _figure_tail_parts(parsed: WorkspaceImageRef) -> tuple[str, ...]:
+    """ref 的 ``rel`` 按**分段数**剥掉作用域前缀之后的部分:绑了 agent 剥 ``agents/<key>``
+    两段;其后是 ``threads/<uuid>/work`` 时再剥三段(B-262)。"""
+    parts = PurePosixPath(parsed.rel).parts
+    if parsed.agent_key is None:
+        return parts
+    parts = parts[2:]
+    head = parts[:_CONVERSATION_WORK_SEGMENTS]
+    if (
+        len(parts) > _CONVERSATION_WORK_SEGMENTS
+        and head[0] == WORKSPACE_THREADS_DIR
+        and _is_canonical_uuid(head[1])
+        and head[2] == WORKSPACE_CONVERSATION_WORK_DIR
+    ):
+        return parts[_CONVERSATION_WORK_SEGMENTS:]
+    return parts
+
+
+def _is_canonical_uuid(raw: str) -> bool:
+    try:
+        return str(UUID(raw)) == raw
+    except ValueError:
+        return False
 
 
 @dataclass(frozen=True)
@@ -506,6 +544,8 @@ class RenderedFigureRef:
     unit: int
     #: 真实 PDF 页号,取自文件名 ``page-NN.jpg``(pdftoppm 按总页数补零,几位都认)。
     page: int
+    #: B-266 —— 这是那一页的「放大局部」裁图时,裁的框(0-1000 坐标);整页渲染是 ``None``。
+    region: tuple[int, int, int, int] | None = None
 
 
 def parse_rendered_figure_ref(ref: str) -> RenderedFigureRef | None:
@@ -524,13 +564,21 @@ def parse_rendered_figure_ref(ref: str) -> RenderedFigureRef | None:
         parsed = parse_workspace_image_ref(ref)
     except ValueError:
         return None
-    skip = 2 if parsed.agent_key is not None else 0
-    parts = PurePosixPath(parsed.rel).parts[skip:]
-    if not is_rendered_figure_rel("/".join(parts)):
+    parts = _figure_tail_parts(parsed)
+    tail = "/".join(parts)
+    region: tuple[int, int, int, int] | None = None
+    if is_rendered_figure_rel(tail):
+        # 形状已经过了上面那道正则,下面四段的位置与格式都是它保证的。
+        doc_sha, render_sha, unit_dir, name = parts[-4:]
+        page = int(PurePosixPath(name).stem.removeprefix(f"{RENDERED_FIGURE_PAGE_STEM}-"))
+    elif is_rendered_crop_rel(tail) and parts[-2].startswith(RENDERED_FIGURE_UNIT_PREFIX):
+        # B-266 —— 文档页的局部裁图:``page-<N>-<x1>-<y1>-<x2>-<y2>-d<dpi>.jpg``(形状已过正则)。
+        doc_sha, render_sha, unit_dir, name = parts[-4:]
+        fields = PurePosixPath(name).stem.split("-")
+        numbers = [int(v) for v in fields[1:6]]
+        page, region = numbers[0], (numbers[1], numbers[2], numbers[3], numbers[4])
+    else:
         return None
-    # 形状已经过了上面那道正则,下面四段的位置与格式都是它保证的。
-    doc_sha, render_sha, unit_dir, name = parts[-4:]
-    page = int(PurePosixPath(name).stem.removeprefix(f"{RENDERED_FIGURE_PAGE_STEM}-"))
     unit = int(unit_dir.removeprefix(RENDERED_FIGURE_UNIT_PREFIX))
     return RenderedFigureRef(
         workspace=parsed,
@@ -539,6 +587,7 @@ def parse_rendered_figure_ref(ref: str) -> RenderedFigureRef | None:
         unit_dir=unit_dir,
         unit=unit,
         page=page,
+        region=region,
     )
 
 

@@ -32,14 +32,20 @@ from expert_work.runtime.runs import InMemoryRunStore, RunManager, RunStatus
 
 
 class _FakeThreads:
-    def __init__(self, *, has_agent: bool = True) -> None:
+    def __init__(self, *, has_agent: bool = True, layout: str = "conversation") -> None:
         self._has_agent = has_agent
+        self._layout = layout
 
     async def get(self, _thread_id, *, tenant_id):
         del tenant_id
         if not self._has_agent:
             return SimpleNamespace(agent_name=None, agent_version=None, user_id=None)
-        return SimpleNamespace(agent_name="a", agent_version="1.0.0", user_id=None)
+        return SimpleNamespace(
+            agent_name="a",
+            agent_version="1.0.0",
+            user_id=None,
+            workspace_layout=self._layout,
+        )
 
 
 _SPEC = AgentSpec.model_validate(
@@ -84,6 +90,8 @@ class _FakeRuntime:
         self.skill_run_usage_recorder = None
         self.trajectory_recorder = None
         self.thread_stats_recorder = None
+        self.agent_file_versions = None
+        self.platform_migration = None
 
     async def get_agent(self, **_kw):
         return SimpleNamespace(
@@ -250,6 +258,47 @@ async def test_claimed_run_carries_document_names_into_graph_input(
     assert len(spawns) == 1
     human_message_content = spawns[0]["graph_input"]["messages"][1].content
     assert "[file attached: uploads/report.pdf]" in human_message_content
+
+
+@pytest.mark.asyncio
+async def test_claimed_run_carries_original_document_names_into_graph_input(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """B-275 —— 换过名的附件,原名随 ``enqueued_input`` 存下、出队时读回来:queue 模式下
+    模型看到的那一行与流式一字不差(这段回读有静默丢附件的前科)。"""
+    spawns: list[dict] = []
+
+    async def _fake_run_agent(**kw):
+        spawns.append(kw)
+
+    monkeypatch.setattr(worker_module, "run_agent", _fake_run_agent)
+
+    store = InMemoryRunStore()
+    runtime = _FakeRuntime(store)
+    run_id, tenant, thread = uuid4(), uuid4(), uuid4()
+    await runtime.run_manager.enqueue(
+        run_id=run_id,
+        thread_id=thread,
+        tenant_id=tenant,
+        enqueued_input={
+            "input": "q",
+            "image_refs": [],
+            "untrusted_content": [],
+            "document_names": ["uploads/report-1a2b3c4d.pdf"],
+            "document_original_names": {"uploads/report-1a2b3c4d.pdf": "report.pdf"},
+        },
+    )
+
+    assert await _worker(store, runtime).run_once() == 1
+    await asyncio.sleep(0)
+    content = spawns[0]["graph_input"]["messages"][1].content
+    assert content == (
+        "q\n\n[file attached: uploads/report-1a2b3c4d.pdf (original name: report.pdf)]"
+    )
+    # 委派出去的子代看不到上面那一行:原名表与附件清单一起进 state。
+    assert spawns[0]["graph_input"]["turn_document_original_names"] == {
+        "uploads/report-1a2b3c4d.pdf": "report.pdf"
+    }
 
 
 @pytest.mark.asyncio
@@ -562,6 +611,8 @@ async def test_queued_run_without_attachments_leaves_the_key_out(
     # 空列表而非省略 —— 理由同 streaming 侧那条。
     assert spawns[0]["graph_input"]["turn_documents"] == []
     assert spawns[0]["graph_input"]["turn_image_refs"] == []
+    # B-275 —— 原名表同理:每轮都写,省略会让上一轮的表留在检查点里。
+    assert spawns[0]["graph_input"]["turn_document_original_names"] == {}
 
 
 @pytest.mark.asyncio
@@ -684,3 +735,46 @@ async def test_worker_does_not_start_a_turn_while_an_earlier_one_runs(
     assert first_row is not None and first_row.status is RunStatus.RUNNING
     assert second_row is not None and second_row.status is RunStatus.QUEUED
     assert await worker.run_once() == 0
+
+
+@pytest.mark.asyncio
+async def test_a_queued_run_migrates_an_old_conversation_before_it_starts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """B-262 P3 —— 排队的新 run 开跑之前先迁老对话:迁成了就按对话视图跑、带一次性说明的键。"""
+    from control_plane.platform_migration import PreparedWorkspace
+    from orchestrator.tools.registry import WORKSPACE_LAYOUT_KEY, WORKSPACE_MIGRATED_KEY
+
+    spawns: list[dict] = []
+    calls: list[dict] = []
+
+    async def _fake_run_agent(**kw):
+        spawns.append(kw)
+
+    class _Migration:
+        async def prepare(self, **kw):
+            calls.append(kw)
+            return PreparedWorkspace("conversation", migrated=True)
+
+    monkeypatch.setattr(worker_module, "run_agent", _fake_run_agent)
+    store = InMemoryRunStore()
+    runtime = _FakeRuntime(store)
+    runtime.platform_migration = _Migration()
+    run_id, tenant, thread = uuid4(), uuid4(), uuid4()
+    await runtime.run_manager.enqueue(
+        run_id=run_id,
+        thread_id=thread,
+        tenant_id=tenant,
+        enqueued_input={"input": "hi", "image_refs": [], "untrusted_content": []},
+    )
+
+    threads = _FakeThreads(layout="agent_root")
+    assert await _worker(store, runtime, threads=threads).run_once() == 1
+    await asyncio.sleep(0)
+
+    assert [(c["thread_id"], c["tenant_id"], c["workspace_layout"]) for c in calls] == [
+        (thread, tenant, "agent_root")
+    ]
+    configurable = spawns[0]["config"]["configurable"]
+    assert configurable[WORKSPACE_LAYOUT_KEY] == "conversation"
+    assert configurable[WORKSPACE_MIGRATED_KEY] is True

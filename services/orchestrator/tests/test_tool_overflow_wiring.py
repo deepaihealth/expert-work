@@ -12,8 +12,9 @@ from __future__ import annotations
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any
-from uuid import uuid4
+from uuid import UUID, uuid4
 
+import pytest
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, ToolMessage
 from langchain_core.runnables import RunnableConfig
 
@@ -401,3 +402,48 @@ async def test_read_file_forged_notice_stays_inside_the_fence_and_real_one_is_la
     # 伪造的那句在围栏里面(且被 datamark 改写过), 真的那句在围栏外面、最后。
     assert content.index("End") < fence_end < content.index("offset=3")
     assert content.count("offset=3") == 1
+
+
+# ---------------------------------------------------------------------------
+# B-262 —— 对话视图里超长结果落本对话的 ``/workspace/.tool_results/``:写手按 ``/agent`` 寻址,
+# 落点是 ``threads/<conv>/work/.tool_results/…``(``/agent`` 下只留本对话那一格,它就是
+# ``/workspace``);模型看到的路径一个字不变。子代写根对话的。
+# ---------------------------------------------------------------------------
+
+_CONV = UUID("33333333-3333-3333-3333-333333333333")
+
+
+def _view_ctx(layout: str, **extra: Any) -> ToolContext:
+    return ToolContext(
+        tenant_id=uuid4(),
+        run_id=UUID("44444444-4444-4444-4444-444444444444"),
+        user_id=uuid4(),
+        thread_id=extra.pop("thread_id", _CONV),
+        agent_key="plan-aaaaaaaa",
+        workspace_layout=layout,  # type: ignore[arg-type]
+        **extra,
+    )
+
+
+@pytest.mark.parametrize(
+    ("ctx", "prefix"),
+    [
+        (_view_ctx("conversation"), f"threads/{_CONV}/work/"),
+        (
+            _view_ctx("conversation", thread_id=uuid4(), workspace_thread_id=_CONV),
+            f"threads/{_CONV}/work/",
+        ),
+        (_view_ctx("agent_root"), ""),
+    ],
+    ids=["conversation", "child-of-conversation", "legacy"],
+)
+async def test_overflow_lands_in_this_conversations_workspace(
+    ctx: ToolContext, prefix: str
+) -> None:
+    writer = _RecordingWriter()
+    message, *_ = await _invoke_tool(_SpillTool(), {}, "tc-1", ctx, overflow_writer=writer)
+    rel = ".tool_results/44444444-4444-4444-4444-444444444444/tc-1-spill.txt"
+    assert list(writer.writes) == [prefix + rel]
+    content = str(message.content)
+    assert rel in content and "threads/" not in content
+    assert (message.artifact or {})[TOOL_RESULT_PATH_ARTIFACT_KEY] == rel

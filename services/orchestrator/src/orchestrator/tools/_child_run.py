@@ -34,6 +34,7 @@ from langchain_core.runnables import RunnableConfig
 
 from expert_work.common.observability import expert_work_counter
 from expert_work.persistence.token_usage_store import NON_BILLABLE_USAGE_KINDS
+from expert_work.persistence.workspace.upload_names import original_name_note
 from expert_work.protocol import MAX_RESULT_EXCERPT_CHARS, SubAgentInvocation, SubagentStatus
 from expert_work.runtime.cancellation import (
     CANCELLATION_TOKEN_KEY,
@@ -59,7 +60,13 @@ from orchestrator.tools._worker_events import (
     build_worker_update_frame,
 )
 from orchestrator.tools.artifact import ARTIFACT_RECORDER_KEY, ArtifactRecorder
-from orchestrator.tools.registry import ToolContext, ToolResult
+from orchestrator.tools.registry import (
+    FIGURE_RUN_IDS_KEY,
+    WORKSPACE_LAYOUT_KEY,
+    WORKSPACE_THREAD_ID_KEY,
+    ToolContext,
+    ToolResult,
+)
 from orchestrator.trajectory import (
     TrajectoryOutcome,
     TrajectoryRecord,
@@ -129,6 +136,7 @@ def build_seed_content(
     task: str,
     *,
     documents: Sequence[str] = (),
+    document_original_names: Mapping[str, str] | None = None,
     image_refs: Sequence[str] = (),
     supports_vision: bool = False,
     can_ask_image: bool = False,
@@ -162,7 +170,11 @@ def build_seed_content(
     """
     text = task
     if documents:
-        listed = "\n".join(f"- {ref}" for ref in documents)
+        # B-275 —— 换过名的附件在路径后面带原名,与主 run 的 ``[file attached: …]`` 同一形式。
+        originals = document_original_names or {}
+        listed = "\n".join(
+            f"- {ref}{original_name_note(ref, originals.get(ref))}" for ref in documents
+        )
         text += (
             "\n\n[attachments] The user attached these files to the current turn — "
             "workspace paths, readable as-is:\n"
@@ -227,6 +239,7 @@ async def run_child_to_result(
     seed = build_seed_content(
         task,
         documents=ctx.turn_documents,
+        document_original_names=ctx.turn_document_original_names,
         image_refs=ctx.turn_image_refs,
         supports_vision=child.supports_vision,
         can_ask_image=child_can_ask_image(child),
@@ -244,6 +257,7 @@ async def run_child_to_result(
         # 附件继续往下传:孙代同样不继承对话,而它干的还是同一轮用户交办的活 ——
         # 断在这里等于深一层就退回原来的猜。走 state 通道,与本 run 同一机制。
         "turn_documents": list(ctx.turn_documents),
+        "turn_document_original_names": dict(ctx.turn_document_original_names),
         "turn_image_refs": list(ctx.turn_image_refs),
     }
 
@@ -992,6 +1006,22 @@ def _child_config(ctx: ToolContext, *, sub_thread_id: UUID, sub_run_id: UUID) ->
     inputs_run_id = ctx.inputs_run_id or ctx.run_id
     if inputs_run_id is not None:
         configurable["inputs_run_id"] = str(inputs_run_id)
+    # B-236 —— 同理透传父的工作区布局与**根对话**的 id:子代每次都有新的子线程 id,
+    # 按它分目录的话 worker 写的文件落进一个父看不见的 ``threads/<子线程>/work/``。
+    # 孙代沿用父自己已经带着的那个(还是最上面那个对话)。
+    # 传的是父**实际生效**的视图,不是原样的字段:父的布局是 ``conversation`` 却没有对话
+    # (没绑 agent / 没有线程 id)时它实际看到的是老视图,子代必须看到同一个。
+    configurable[WORKSPACE_LAYOUT_KEY] = (
+        "conversation" if ctx.workspace_view.per_conversation else "agent_root"
+    )
+    workspace_thread_id = ctx.workspace_thread_id or ctx.thread_id
+    if workspace_thread_id is not None:
+        configurable[WORKSPACE_THREAD_ID_KEY] = str(workspace_thread_id)
+    # B-262 —— 子代的检查点是新的,没有父对话的 ``viewed_figures``;把父对话渲染过页的 run
+    # (连同父这一个 run)传下去,子代 ``ask_image`` 才找得到父刚渲好的页,又不会去看别的对话的。
+    figure_runs = set(ctx.figure_run_ids) | ({ctx.run_id} if ctx.run_id is not None else set())
+    if figure_runs:
+        configurable[FIGURE_RUN_IDS_KEY] = sorted(str(run) for run in figure_runs)
     # B-61 §5.3 —— 同一个理由,绑定面:透传**父的** ``prompt_inputs``。子代跑的是
     # 同一个 ``tools_node``,config 里没有这一项时 ``apply_arg_bindings`` 对每个被绑
     # 参数走「本轮没给值 → 把它删掉」那条分支;而该参数已经从子代的 schema 里剥掉、

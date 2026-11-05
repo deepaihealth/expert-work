@@ -81,6 +81,7 @@ from langgraph.graph import END, START, StateGraph
 from opentelemetry.trace import Status, StatusCode
 
 from expert_work.common.conversation_channel import (
+    AGENT_NOTES_BLOCK_MARK,
     HIDE_FROM_UI,
     INPUTS_BLOCK_MARK,
     WORKSPACE_BLOCK_MARK,
@@ -205,6 +206,7 @@ from orchestrator.tools._budget import DELEGATION_GATE_KEY
 from orchestrator.tools._guards import (
     DEFAULT_LOOP_TRIPS_PER_RUN,
     GUARD_SINK_KEY,
+    LOOP_TRIP_META_KEY,
     TOKEN_BUDGET_KEY,
     TokenBudget,
     build_guard_frame,
@@ -227,7 +229,14 @@ from orchestrator.tools.error_classifier import (
     classify_tool_error,
     render_recovery_advisory,
 )
+from orchestrator.tools.figure_lookup import figure_run_ids
 from orchestrator.tools.find_tools import promotion_events
+from orchestrator.tools.knowledge_probe import (
+    KnowledgeProbe,
+    ProbeOutcome,
+    latest_user_text,
+    record_follow_up,
+)
 from orchestrator.tools.mcp import parse_mcp_tool_name
 from orchestrator.tools.mutation_classifier import classify as classify_mutation
 from orchestrator.tools.mutation_classifier import resource_space as mutation_resource_space
@@ -243,16 +252,21 @@ from orchestrator.tools.overflow import (
     render_overflow_footer,
 )
 from orchestrator.tools.registry import (
+    FIGURE_RUN_IDS_KEY,
     TOOL_ALLOWED_STATE_KEYS,
+    TURN_ROOT_RUN_KEY,
+    WORKSPACE_MIGRATED_KEY,
     Tool,
     ToolContext,
     ToolNotFoundError,
     ToolRegistry,
     ToolResult,
     ToolSpec,
+    workspace_view_fields,
 )
 from orchestrator.tools.scheduling import MAX_TOOL_WORKERS, plan_stages
 from orchestrator.tools.spawn_worker import SPAWN_WORKER_TOOL_NAME
+from orchestrator.tools.workspace_paths import WorkspaceView, conversation_work_prefix
 from orchestrator.tools.workspace_store import WorkspaceStore
 from orchestrator.tools.workspace_tree import workspace_prompt_block
 from orchestrator.usage_metering import without_served_by
@@ -329,6 +343,14 @@ _tool_call_total = expert_work_counter(
     "expert_work_tool_call_total",
     "Tool dispatches by tool name and outcome (ok / error / blocked).",
     ("tool", "outcome"),
+)
+#: B-272 — calls rescued by restoring a JSON-stringified top-level array /
+#: object argument (``"region": "[0,0,100,100]"``) after schema validation
+#: failed. Same ``tool`` label normalisation as ``_tool_call_total``.
+_tool_args_coerced_total = expert_work_counter(
+    "expert_work_tool_args_coerced_total",
+    "Tool calls dispatched after restoring a JSON-stringified array/object argument (B-272).",
+    ("tool",),
 )
 _tool_latency_seconds = expert_work_histogram(
     "expert_work_tool_latency_seconds",
@@ -506,6 +528,11 @@ def build_react_graph(
     workspace_ingest_node: MemoryNode | None = None,
     # B-61 — run-start inputs.json materialize + in-sandbox prefetch.
     inputs_node: MemoryNode | None = None,
+    # B-236 —— run-start copy of the agent's base directories into this conversation's
+    # /workspace (once per conversation; ``conversation_seed``).
+    conversation_seed_node: MemoryNode | None = None,
+    # B-236 第三层 —— 对话第一次 run 开场时读一次 /agent/AGENT_NOTES.md(``agent_notes``)。
+    agent_notes_node: MemoryNode | None = None,
     # B-67 §七 —— 本 agent 声明为 ``trusted`` 的变量名。手抄守卫的提示只对这些变量写出
     # 链接名与模型抄的那串(那条合成消息不过 spotlight 围栏);默认空 = 一律不写。
     trusted_input_names: frozenset[str] = frozenset(),
@@ -609,6 +636,9 @@ def build_react_graph(
     # 文案里的上限与计数器标签(按路由盖的章认出备用接管)。不接线(单测 / 子图)= 照常
     # 判截断,标签为空、文案里的上限写「厂商默认值」。
     output_cap_resolver: ServedOutputCap | None = None,
+    # B-267 第 3 步 —— 每轮轻量探测(平台开关 ``kb_first_routing`` 开、绑了知识库、智能体
+    # 没关 ``knowledge.probe``)。``None``(默认)= 不探测, 提示词与之前逐字相同。
+    knowledge_probe: KnowledgeProbe | None = None,
 ) -> StateGraph[AgentState, None, AgentState, AgentState]:
     """Assemble the ReAct ``StateGraph`` and return it uncompiled.
 
@@ -756,6 +786,9 @@ def build_react_graph(
         # 不去重的话 coalesce 会把 N 份拼成一条,前缀缓存每轮在上一份末尾断开。
         # 放在一切上下文闸之前,让它们按真实大小估算。检查点不动(CM-C4)。
         messages = keep_latest_system_prompt(messages)
+        # B-236 —— 开场注入的记忆索引段(落在第一轮)。下面的滑窗 / 压缩可能把它挤出提示词
+        # 视图,那之后放回原件(:func:`_keep_agent_notes_block`)。
+        notes_block = _latest_agent_notes_block(messages)
         # Stream CM-12 — mechanical tool-result prune: the cheapest, least-lossy
         # gate, run FIRST. When over threshold it collapses OLD tool results
         # (beyond the most-recent N) to 1-line references — lossless for
@@ -914,12 +947,14 @@ def build_react_graph(
         # rounds — so the orchestrator can write a clean RUN_FAILED
         # audit row.
         # B-64 Task 7 回修第 3 轮 —— 渲染页段在**压缩判定之前**造好:它挂在压缩之后,
-        # 压缩器看不见它,而它带着 ≤3 张图(每张按 ``IMAGE_BLOCK_TOKEN_COST`` 计)加
+        # 压缩器看不见它,而它带着 ≤6 张整页 + ≤2 张局部图(B-268;每张按
+        # ``IMAGE_BLOCK_TOKEN_COST`` 计)加
         # 一段占位文字。把它作为 ``reserved`` 交给压缩器 —— 只计入估算、不进被总结的
         # 那段(压缩器去总结或丢掉它都是错的)。身份与工作区快照同一个来源:本次 run 的
         # config。每轮重建、不落检查点。
-        figure_agent_key_raw = configurable.get("agent_key")
-        figure_agent_key = figure_agent_key_raw if isinstance(figure_agent_key_raw, str) else ""
+        # B-236 —— 本轮的工作区视图(布局 / 对话)与工具那一侧同一个来源:
+        # ``_build_tool_context`` 读 config。渲染页段与工作区快照都用它。
+        turn_view = _build_tool_context(config).workspace_view
         figure_viewed = state.get("viewed_figures") or []
         figure_documents = state.get("figure_documents") or {}
         figure_tenant = _parse_uuid(configurable.get("tenant_id"))
@@ -933,7 +968,7 @@ def build_react_graph(
                 documents=figure_documents,
                 tenant_id=figure_tenant,
                 user_id=figure_user,
-                agent_key=figure_agent_key,
+                view=turn_view,
             )
             if supports_vision and figure_viewed and workspace_store is not None
             else None
@@ -944,7 +979,7 @@ def build_react_graph(
             supports_vision=supports_vision,
             tenant_id=figure_tenant,
             user_id=figure_user,
-            agent_key=figure_agent_key,
+            view=turn_view,
             freshness=figure_fresh,
         )
         reserved: tuple[BaseMessage, ...] = (figure_block,) if figure_block is not None else ()
@@ -1060,6 +1095,8 @@ def build_react_graph(
                 logger.info(
                     "tools.promotion_demoted count=%d step=%d", len(demoted_tools), step_count
                 )
+        # B-236 —— 滑窗或压缩把记忆索引段挤出了提示词视图就放回原件。
+        messages = _keep_agent_notes_block(notes_block, messages)
         configurable = config.get("configurable") or {}
         tenant_id = _parse_uuid(configurable.get("tenant_id"))
         # Stream Agent-Templates (M1-5a) — the end-user this run is for, threaded
@@ -1089,14 +1126,16 @@ def build_react_graph(
         #
         # 身份一律从**本次 run 的** config 取, 与 ``read_file`` / ``list_dir`` 同一个
         # 来源(``_build_tool_context`` 读的也是这三个键)。
-        agent_key_raw = configurable.get("agent_key")
         if workspace_store is not None and tenant_id is not None and user_id is not None:
             messages = await _workspace_block_tail(
                 messages,
                 workspace_store,
                 tenant_id=tenant_id,
                 user_id=user_id,
-                agent_key=agent_key_raw if isinstance(agent_key_raw, str) else "",
+                view=turn_view,
+                seed_skipped=state.get("seed_skipped_dirs") or (),
+                seed_quota_blocked=bool(state.get("seed_quota_blocked")),
+                seed_skipped_more=int(state.get("seed_skipped_more") or 0),
             )
         # B-64 —— 渲染页段(Path A)挂到尾部。块在压缩判定之前就造好了(见那里的
         # 注释);这里与上面工作区快照同一个位置。**无条件调用**:没有块时也要把
@@ -1137,6 +1176,23 @@ def build_react_graph(
                 step_count=step_count, max_steps=max_steps, registers=saves_artifacts
             )
         )
+        # B-267 第 3 步 —— 轮首(最新一条用户消息之后还没有回答 / 工具调用)拿用户消息在
+        # 绑定的库里各做一次轻量检索;命中只加一行平台段(句柄 + 段数, 零租户内容), 没命中
+        # 什么都不加。超时 / 出错静默跳过(计数器 + 日志)。
+        probe_outcome = (
+            await _run_knowledge_probe(knowledge_probe, state["messages"], tenant_id, token)
+            if knowledge_probe is not None
+            and tenant_id is not None
+            and latest_user_text(state["messages"]) is not None
+            else None
+        )
+        if probe_outcome is not None and probe_outcome.line is not None:
+            messages = _append_tail_human_message(messages, probe_outcome.line)
+        # B-262 P3 —— 控制面在这一轮开始前把老对话迁到了对话视图:每一步都把一次性说明并进平台段
+        # (只进提示词视图),这一轮之后的 run 没有这个键;委派子代不看(``_child_config`` 不传,
+        # 这里再挡一道)。
+        if configurable.get(WORKSPACE_MIGRATED_KEY) is True and not configurable.get("child_run"):
+            messages = _append_tail_human_message(messages, WORKSPACE_MIGRATION_NOTE)
         # 两条都有时步数预警在前(B-226 ②)。
         if step_notice is not None:
             messages = _append_tail_human_message(messages, step_notice)
@@ -1357,6 +1413,9 @@ def build_react_graph(
         # separately, inside ``_finalize_structured_response``.
         if token_budget is not None:
             token_budget.add(usage_total(getattr(response, "usage_metadata", None)))
+        # B-267 —— 探测过的这一步, 模型接着有没有去查知识库(观察探测有没有用)。
+        if probe_outcome is not None and probe_outcome.reason in ("hit", "miss"):
+            record_follow_up(probe_outcome, response)
 
         # Budget-exhausted turn must terminate: no tools were bound so the model
         # shouldn't emit tool_calls, but strip any it returns anyway (defends
@@ -1950,7 +2009,10 @@ def build_react_graph(
             config,
             plan=state.get("plan"),
             turn_documents=state.get("turn_documents"),
+            turn_document_original_names=state.get("turn_document_original_names"),
             turn_image_refs=state.get("turn_image_refs"),
+            viewed_figures=state.get("viewed_figures"),
+            figure_reads=state.get("figure_reads"),
         )
         # Stream TE-2 — per-tool-call audit sink (may be None on the dev /
         # unit-test path; ``_dispatch_tool`` treats the emit as best-effort).
@@ -2066,10 +2128,13 @@ def build_react_graph(
         batch_outcomes: list[tuple[tuple[str, str], ClassifiedToolError | None]] = []
         # B-163 — total chars of the advisories attached in this batch (gauge).
         advisory_chars = 0
+        # B-268 —— 平台拒绝的重复读取(``read_page`` 熔断)计进本 run 的防循环次数。
+        refused_reads = 0
         for idx in range(len(tool_calls)):
             tool_message, tool_state, refund_inc, classified = results[idx]
             message_pos = len(new_messages)
             new_messages.append(tool_message)
+            refused_reads += _is_refused_repeat(tool_message)
             for key, value in tool_state.items():
                 if key not in TOOL_ALLOWED_STATE_KEYS:
                     continue
@@ -2171,6 +2236,11 @@ def build_react_graph(
         }
         if used_stamps:
             result_dict["promoted_tool_last_used"] = used_stamps
+        # B-268 —— 与 loop-detection 拦下同一本账:第 N 次(``DEFAULT_LOOP_TRIPS_PER_RUN``)
+        # 后 ``agent_node`` 走无进展收尾。只在有拒绝时写,没有时 state 形状不变。
+        # 一批里几次并行拒绝只算一次(同 loop-detection 每步至多一次)。
+        if refused_reads:
+            result_dict["loop_trip_count"] = int(state.get("loop_trip_count", 0)) + 1
         # 层 1 — persist the nudge dedupe key only when a nudge actually fired;
         # the absent case leaves the channel (and no-spawn_worker builds'
         # state shape) untouched.
@@ -2290,6 +2360,17 @@ def build_react_graph(
         plan_tail = "workspace_ingest"
     if plan_tail is not None:
         tails.append(plan_tail)
+    # B-236 —— 开场复制自成一支:写集(本对话的 work/ 与 ``seed_skipped_dirs``)与上面两支
+    # 都不相交;agent 等它做完再开始,第一轮的 /workspace 里就有基础目录的副本。
+    if conversation_seed_node is not None:
+        graph.add_node("conversation_seed", conversation_seed_node)  # type: ignore[arg-type]
+        graph.add_edge(START, "conversation_seed")
+        tails.append("conversation_seed")
+    # B-236 第三层 —— 记忆索引注入同样自成一支(只写 ``messages``,追加在本轮输入之后)。
+    if agent_notes_node is not None:
+        graph.add_node("agent_notes", agent_notes_node)  # type: ignore[arg-type]
+        graph.add_edge(START, "agent_notes")
+        tails.append("agent_notes")
     if not tails:
         tails.append(START)
     if len(tails) > 1:
@@ -2502,6 +2583,32 @@ def _after_reflect(state: AgentState) -> Literal["agent", "__end__"]:
     return "__end__"
 
 
+#: B-262 P3 —— 老对话迁到对话视图的那一轮,平台段里的一次性说明。平台文字,不含任何租户内容。
+WORKSPACE_MIGRATION_NOTE = (
+    "[workspace notice] The workspace of this conversation is now per conversation. "
+    "Files that were under /workspace in earlier turns are now at the same paths under "
+    "/agent/. This conversation's uploads, inputs and tool results are still under "
+    "/workspace/."
+)
+
+
+async def _run_knowledge_probe(
+    probe: KnowledgeProbe,
+    history: Sequence[BaseMessage],
+    tenant_id: UUID,
+    token: CancellationToken,
+) -> ProbeOutcome:
+    """B-267 —— one probe under its own span (outcome, bases hit, passages,
+    elapsed); cancellable with the run."""
+    with expert_work_span(ExpertWorkComponent.ORCHESTRATOR, "knowledge_probe") as span:
+        outcome = await token.run_cancellable(probe.run(tenant_id=tenant_id, messages=history))
+        span.set_attribute("outcome", outcome.reason)
+        span.set_attribute("bases_hit", len(outcome.hits))
+        span.set_attribute("passages", sum(count for _handle, count in outcome.hits))
+        span.set_attribute("elapsed_ms", outcome.elapsed_ms)
+    return outcome
+
+
 def _append_tail_human_message(messages: list[BaseMessage], block: str) -> list[BaseMessage]:
     """Stream L.L1 — append per-turn dynamic context as a tail
     ``HumanMessage`` so the leading ``SystemMessage`` stays byte-stable
@@ -2540,6 +2647,36 @@ def _keep_latest_inputs_block(
     """
     block = _latest_inputs_block(before)
     if block is None or any(m is block for m in after):
+        return list(after)
+    return [*after, block]
+
+
+def _latest_agent_notes_block(messages: Sequence[BaseMessage]) -> BaseMessage | None:
+    """B-236 —— 提示词视图里的记忆索引段(第一轮开场时注入的那条)。"""
+    for msg in reversed(messages):
+        if isinstance(msg, HumanMessage) and (msg.additional_kwargs or {}).get(
+            AGENT_NOTES_BLOCK_MARK
+        ):
+            return msg
+    return None
+
+
+def _keep_agent_notes_block(
+    block: BaseMessage | None, after: Sequence[BaseMessage]
+) -> list[BaseMessage]:
+    """B-236 —— 滑窗 / 压缩之后,记忆索引段若被挤出提示词视图就放回去(按标记认)。
+
+    与 :func:`_keep_latest_inputs_block` 同一位置口径(隐藏 HumanMessage 挂尾部,不开新一轮,
+    也不会插进 tool_call ↔ tool_result 之间)。它只在第一轮注入一次、之后不重读,被摘要掉就
+    再也回不来 —— 而「这个 agent 记得什么」正是长对话后段最需要的。只改这一次的提示词视图,
+    检查点不动(CM-C4)。
+
+    review 7 —— 按 :data:`AGENT_NOTES_BLOCK_MARK` 认,不按 identity:中间的
+    ``escape_forged_recovery_advisories`` 遇到正文里的 ``<recovery-advisory>`` 字样会换成一份
+    转义过的**副本**,按 identity 找不到它,每一步就多挂一份原件。放回去的原件之后照样过那一道
+    转义(``with_recovery_advisories``)。
+    """
+    if block is None or any((m.additional_kwargs or {}).get(AGENT_NOTES_BLOCK_MARK) for m in after):
         return list(after)
     return [*after, block]
 
@@ -2585,7 +2722,10 @@ async def _workspace_block_tail(
     *,
     tenant_id: UUID,
     user_id: UUID,
-    agent_key: str,
+    view: WorkspaceView,
+    seed_skipped: Sequence[str] = (),
+    seed_quota_blocked: bool = False,
+    seed_skipped_more: int = 0,
 ) -> list[BaseMessage]:
     """B-84 PR-2 —— 重取一份工作区快照, 挂到提示词尾部;更早的那几段一并剔掉。
 
@@ -2612,7 +2752,13 @@ async def _workspace_block_tail(
     """
     kept = _without_workspace_blocks(messages)
     block = await workspace_prompt_block(
-        store, tenant_id=tenant_id, user_id=user_id, agent_key=agent_key
+        store,
+        tenant_id=tenant_id,
+        user_id=user_id,
+        view=view,
+        seed_skipped=seed_skipped,
+        seed_quota_blocked=seed_quota_blocked,
+        seed_skipped_more=seed_skipped_more,
     )
     if not block:
         return kept
@@ -2648,13 +2794,19 @@ def _inject_plan(messages: list[BaseMessage], plan: Plan) -> list[BaseMessage]:
 _MEMORY_TRUNCATION_MARKER = " [... truncated: memory injection token budget]"
 
 
-def _truncate_to_tokens(text: str, max_tokens: int, count: Callable[[str], int]) -> str:
+def _truncate_to_tokens(
+    text: str,
+    max_tokens: int,
+    count: Callable[[str], int],
+    marker: str = _MEMORY_TRUNCATION_MARKER,
+) -> str:
     """RT-2 PR-2 — cut ``text`` down to roughly ``max_tokens`` per ``count``.
 
     Proportional shrink with a bounded refinement loop: the estimator is
     a heuristic (tiktoken or chars//4), so exact-token precision is not
     the contract — the budget is approximate by design, and the marker's
-    own few tokens ride on top.
+    own few tokens ride on top. B-236 —— ``marker`` lets the agent-notes block
+    name the file to read for the rest.
     """
     keep = len(text)
     for _ in range(6):
@@ -2667,7 +2819,7 @@ def _truncate_to_tokens(text: str, max_tokens: int, count: Callable[[str], int])
         if keep <= 0:
             keep = 0
             break
-    return text[:keep] + _MEMORY_TRUNCATION_MARKER
+    return text[:keep] + marker
 
 
 def _render_memory_lines(
@@ -4303,7 +4455,10 @@ def _build_tool_context(
     *,
     plan: Plan | None = None,
     turn_documents: list[str] | None = None,
+    turn_document_original_names: Mapping[str, str] | None = None,
     turn_image_refs: list[str] | None = None,
+    viewed_figures: list[str] | None = None,
+    figure_reads: list[dict[str, Any]] | None = None,
 ) -> ToolContext:
     """Lift tenant / user binding out of ``config["configurable"]`` into
     a :class:`ToolContext`. Missing values fall through as ``None`` —
@@ -4356,10 +4511,21 @@ def _build_tool_context(
     # 仍然逐项清洗:这两个通道的值一路从 HTTP 载荷传下来,不是进程内对象。
     docs = _string_list(turn_documents)
     images = _string_list(turn_image_refs)
-    # 工作区分层 —— 本次调用的 agent 身份。``configurable`` 是不可信输入
-    # (一路从 HTTP 载荷传下来),非字符串一律当没有,回落空串。
-    agent_key_raw = configurable.get("agent_key")
-    agent_key = agent_key_raw if isinstance(agent_key_raw, str) else ""
+    # B-275 —— 原名表同理:只留本轮附件的、键值都是非空字符串的条目。
+    raw_originals = turn_document_original_names
+    originals = (
+        {
+            k: v
+            for k, v in raw_originals.items()
+            if isinstance(k, str) and k in docs and isinstance(v, str) and v
+        }
+        if isinstance(raw_originals, Mapping)
+        else {}
+    )
+    # 工作区分层 —— 本次调用的 agent 身份与 B-236 的视图(布局 / 本对话 / 根对话),与
+    # 平台自己的 exec(PLAN.md 回读)同一个取法。``configurable`` 是不可信输入,非字符串
+    # 一律当没有,回落空串;不认识的布局一律当老视图。
+    view_fields = workspace_view_fields(configurable)
     # B-61 §4.4 —— 子代要指向**父** run 的 inputs.json(``_child_config`` 写进来
     # 的);审批续跑段要指向这一轮首段的(``run_agent`` 写进来的)。新开一轮的
     # 主 run 没有这一项,回落 ``None`` = 用自己的 run_id。
@@ -4368,6 +4534,15 @@ def _build_tool_context(
     # config 里没有这一项,它的被绑参数就会被静默摘掉)。主 run 的填值不走这里。
     raw_prompt_inputs = configurable.get(PROMPT_INPUTS_KEY)
     prompt_inputs = raw_prompt_inputs if isinstance(raw_prompt_inputs, Mapping) else None
+    # B-262 —— 本对话渲染过页的 run:检查点里的 ``viewed_figures``(按对话存),子代再并上
+    # ``_child_config`` 传下来的父那一份。``configurable`` 不可信,逐项解析,坏的丢掉。
+    inherited_runs = {
+        parsed
+        for parsed in (
+            _parse_uuid(raw) for raw in _string_list(configurable.get(FIGURE_RUN_IDS_KEY))
+        )
+        if parsed is not None
+    }
     return ToolContext(
         tenant_id=tenant_id,
         run_id=run_id,
@@ -4385,11 +4560,24 @@ def _build_tool_context(
         guard_sink=guard_raw if callable(guard_raw) else None,
         artifact_recorder=artifact_recorder,
         turn_documents=docs,
+        turn_document_original_names=originals,
         turn_image_refs=images,
-        agent_key=agent_key,
+        agent_key=view_fields["agent_key"],
         inputs_run_id=inputs_run_id,
         prompt_inputs=prompt_inputs,
+        workspace_layout=view_fields["workspace_layout"],
+        workspace_thread_id=view_fields["workspace_thread_id"],
+        child_run=configurable.get("child_run") is True,
+        figure_run_ids=figure_run_ids(_string_list(viewed_figures)) | inherited_runs,
+        figure_reads=tuple(figure_reads) if isinstance(figure_reads, list) else (),
+        turn_root_run_id=_parse_uuid(configurable.get(TURN_ROOT_RUN_KEY)),
     )
+
+
+def _is_refused_repeat(message: BaseMessage) -> bool:
+    """B-268 —— 这条工具结果是不是平台拒绝的重复读取(``meta`` 带 ``LOOP_TRIP_META_KEY``)。"""
+    artifact = getattr(message, "artifact", None)
+    return isinstance(artifact, Mapping) and artifact.get(LOOP_TRIP_META_KEY) is True
 
 
 def _string_list(raw: object) -> tuple[str, ...]:
@@ -4430,20 +4618,71 @@ def _validate_tool_args(tool: Tool, args: Mapping[str, Any]) -> str | None:
     and on any ``additionalProperties: false`` server (the zod / MCP TS SDK
     default) a correctly configured binding could never dispatch at all.
     """
-    schema = tool.spec.dispatch_parameters or tool.spec.parameters
-    if not schema:
+    validator = _tool_schema_validator(tool)
+    if validator is None:
         return None
-    validator_cls = Draft202012Validator
-    try:
-        validator_cls.check_schema(schema)
-    except SchemaError:
-        return None
-    errors = sorted(validator_cls(schema).iter_errors(args), key=lambda e: list(e.absolute_path))
+    errors = sorted(validator.iter_errors(args), key=lambda e: list(e.absolute_path))
     if not errors:
         return None
     # Name path + failed keyword only — never echo the offending value.
     parts = [_describe_schema_error(e) for e in errors[:5]]
     return "arguments failed schema validation: " + "; ".join(parts)
+
+
+def _tool_schema_validator(tool: Tool) -> Draft202012Validator | None:
+    """The validator for the schema the callee enforces; ``None`` = skip validation.
+
+    No schema, or a malformed one (the tool's own bug), never blocks dispatch.
+    """
+    schema = tool.spec.dispatch_parameters or tool.spec.parameters
+    if not schema:
+        return None
+    try:
+        Draft202012Validator.check_schema(schema)
+    except SchemaError:
+        return None
+    return Draft202012Validator(schema)
+
+
+#: B-272 —— 超过这么长的字符串不去 ``json.loads``(只是为了让还原的开销有界)。
+_RESTORE_MAX_CHARS = 1_000_000
+
+
+def _restore_stringified_args(tool: Tool, args: Mapping[str, Any]) -> dict[str, Any] | None:
+    """B-272 — a copy of ``args`` with JSON-stringified arrays / objects restored.
+
+    Only called after validation has already failed. Some models (glm-5.3)
+    write an array argument as a string (``"region": "[0,0,100,100]"``). For
+    each failing path's TOP-LEVEL key whose value is a string that
+    ``json.loads`` to a list / dict, the parsed value replaces it in a copy;
+    the copy is then re-validated as a whole against the SAME schema. Returns
+    the copy only when it is fully valid, else ``None`` so the caller reports
+    the original error. No recursion, and the schema the model sees is
+    unchanged. The caller's ``args`` are never mutated, so the trajectory and
+    the audit row keep the model's original (pre-restore) arguments.
+    """
+    validator = _tool_schema_validator(tool)
+    if validator is None:
+        return None
+    copy = dict(args)
+    restored = False
+    for error in validator.iter_errors(args):
+        key = error.absolute_path[0] if error.absolute_path else None
+        if not isinstance(key, str) or not isinstance(copy.get(key), str):
+            continue
+        value = copy[key]
+        if len(value) > _RESTORE_MAX_CHARS:
+            continue
+        try:
+            parsed = json.loads(value)
+        except (ValueError, RecursionError):  # deep nesting → the normal [invalid args] path
+            continue
+        if isinstance(parsed, list | dict):
+            copy[key] = parsed
+            restored = True
+    if not restored or next(validator.iter_errors(copy), None) is not None:
+        return None
+    return copy
 
 
 def _describe_schema_error(error: ValidationError) -> str:
@@ -4479,6 +4718,13 @@ async def _invoke_tool(
     # B2 — 让工具知道自己服务的 tool_call id(worker 帧挂前端工具卡用)。
     ctx = replace(ctx, tool_call_id=call_id)
     schema_error = _validate_tool_args(tool, args)
+    if schema_error is not None:
+        # B-272 — rescue JSON-stringified array / object arguments. The callee
+        # gets the restored copy; ``args`` as recorded upstream stays original.
+        restored = _restore_stringified_args(tool, args)
+        if restored is not None:
+            _tool_args_coerced_total.labels(tool=_metric_tool_label(tool.spec.name)).inc()
+            args, schema_error = restored, None
     if schema_error is not None:
         return (
             ToolMessage(
@@ -4633,7 +4879,12 @@ async def _externalize_tool_overflow(
 
     rel = overflow_rel_path(run_id=ctx.run_id, call_id=call_id, tool_name=tool.spec.name)
     try:
-        await writer.write(rel=rel, content=clamp_overflow(source))
+        # B-262 —— ``rel`` 相对本对话的 ``/workspace``(模型据此回读);写手按 ``/agent`` 寻址,
+        # 对话视图里要落进本对话那一格(子代落根对话的)。
+        await writer.write(
+            rel=conversation_work_prefix(ctx.workspace_view) + rel,
+            content=clamp_overflow(source),
+        )
     except (asyncio.CancelledError, RunCancelledError):
         raise
     except Exception as exc:

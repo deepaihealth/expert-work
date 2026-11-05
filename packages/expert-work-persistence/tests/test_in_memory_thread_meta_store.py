@@ -412,3 +412,11 @@ async def test_list_agent_names_for_user_includes_archived_threads() -> None:
     await store.update_status(thread_id, ThreadStatus.ARCHIVED, tenant_id=tenant)
 
     assert await store.list_agent_names_for_user(tenant_id=tenant, user_id=user) == ["archived"]
+
+
+@pytest.mark.asyncio
+async def test_create_writes_the_conversation_layout_explicitly() -> None:
+    """B-236 —— 与 SQL 实现同一个口径:新建的会话一律是对话视图(库默认值是老视图)。"""
+    store = InMemoryThreadMetaStore()
+    meta = await store.create(thread_id=uuid4(), tenant_id=uuid4(), created_by="u")
+    assert meta.workspace_layout == "conversation"

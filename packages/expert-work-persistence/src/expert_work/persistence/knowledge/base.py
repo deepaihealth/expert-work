@@ -18,7 +18,7 @@ from collections.abc import Collection, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import PurePosixPath
-from typing import Any, Final, Literal
+from typing import Any, Final, Literal, TypeGuard
 from uuid import UUID
 
 # B-222 PR-2 — estimate types both stores share, re-exported.
@@ -49,6 +49,9 @@ from expert_work.persistence.knowledge.passages import (
     DisabledReason as DisabledReason,
 )
 from expert_work.persistence.knowledge.passages import (
+    DiscardedEdits as DiscardedEdits,
+)
+from expert_work.persistence.knowledge.passages import (
     ManualPassage as ManualPassage,
 )
 from expert_work.persistence.knowledge.passages import (
@@ -65,6 +68,14 @@ from expert_work.persistence.knowledge.passages import (
 )
 from expert_work.persistence.knowledge.passages import (
     SwitchOffRecord as SwitchOffRecord,
+)
+
+# B-267 —— base-profile refresh types both stores share, re-exported.
+from expert_work.persistence.knowledge.profiles import (
+    ProfileClaim as ProfileClaim,
+)
+from expert_work.persistence.knowledge.profiles import (
+    ProfileDigest as ProfileDigest,
 )
 from expert_work.protocol import (
     DEFAULT_CHUNK_MAX_TOKENS,
@@ -83,6 +94,7 @@ from expert_work.protocol import (
     ScoredChunk,
 )
 from expert_work.protocol.knowledge_estimate import EstimateOrigin, IngestEstimate
+from expert_work.protocol.knowledge_profile import KnowledgeProfile, ProbeCalibration
 
 
 class _Unset:
@@ -197,6 +209,20 @@ CancelOutcome = Literal[
 #: raw reading (PR-1); a figure's description / text (PR-2); the semantic
 #: chunker's topic-shift decisions for one embedding model (B-215).
 ParseCacheKind = Literal["page_ocr", "figure_desc", "figure_ocr", "semantic_break"]
+
+#: B-238 —— what a ``page_ocr`` reading also records: the 0-based page it was
+#: read from, the sha256 of the document bytes that page was rendered from, and
+#: who read it how (model, request and render parameters: the cache key less the
+#: image) — :meth:`KnowledgeStore.cached_page_indexes`; readings cached before
+#: B-238 record none of them.
+PAGE_OCR_PAGE = "page"
+PAGE_OCR_SOURCE = "source_sha256"
+PAGE_OCR_READER = "reader"
+
+
+def is_page_index(value: object) -> TypeGuard[int]:
+    """A recorded ``page_ocr`` page: a 0-based page index."""
+    return isinstance(value, int) and not isinstance(value, bool) and value >= 0
 
 
 @dataclass(frozen=True)
@@ -379,6 +405,62 @@ class KnowledgeStore(abc.ABC):
     @abc.abstractmethod
     async def clear_reindex(self, *, tenant_id: UUID, kb_id: UUID) -> None:
         """Clear ``reindex_requested_at`` once a re-index completes."""
+
+    # -- B-267 base profile ---------------------------------------------------
+    # The transitions themselves live in ``profiles`` (shared by both stores).
+
+    @abc.abstractmethod
+    async def mark_profile_refresh(
+        self, *, tenant_id: UUID, kb_id: UUID, now: datetime, calibrate_only: bool = False
+    ) -> bool:
+        """Ask for a debounced profile refresh of the base
+        (:func:`~expert_work.persistence.knowledge.profiles.marked`); ``False``
+        if no base matched."""
+
+    @abc.abstractmethod
+    async def claim_profile_refreshes(self, *, now: datetime, limit: int) -> list[ProfileClaim]:
+        """Lease up to ``limit`` due refreshes across every tenant
+        (:func:`~expert_work.persistence.knowledge.profiles.claimable`: due,
+        attempts left, and no document of the base ``pending`` / ``processing``
+        unless the first change waited too long), each to a new holder.
+        Refreshes whose attempts are used up are dropped on the way. Caller
+        bypasses row security."""
+
+    @abc.abstractmethod
+    async def finish_profile_refresh(
+        self,
+        *,
+        tenant_id: UUID,
+        kb_id: UUID,
+        holder: str,
+        marks: int,
+        profile: KnowledgeProfile | None,
+        calibration: ProbeCalibration | None,
+        now: datetime,
+        retry_calibration: bool = False,
+    ) -> None:
+        """Store what a refresh produced (``None``: keep the stored part) and
+        clear the refresh unless newer changes asked again — only while
+        ``holder`` still holds it
+        (:func:`~expert_work.persistence.knowledge.profiles.finished`)."""
+
+    @abc.abstractmethod
+    async def fail_profile_refresh(
+        self, *, tenant_id: UUID, kb_id: UUID, holder: str, now: datetime
+    ) -> None:
+        """A refresh failed: keep the stored profile, retry later or give up
+        (:func:`~expert_work.persistence.knowledge.profiles.failed`)."""
+
+    @abc.abstractmethod
+    async def profile_digest(
+        self, *, tenant_id: UUID, kb_id: UUID, max_titles: int, detailed: int, max_headings: int
+    ) -> ProfileDigest:
+        """The base's ready documents, newest first, at most ``max_titles`` of
+        them; the ``detailed`` ones sampled across that list
+        (:func:`~expert_work.persistence.knowledge.profiles.sample_positions`)
+        also carry up to ``max_headings`` distinct section headings (from their
+        first chunks) and the start of their first chunk. Plus the base's
+        ready-document count."""
 
     @abc.abstractmethod
     async def delete_base(self, *, tenant_id: UUID, kb_id: UUID) -> bool:
@@ -678,7 +760,8 @@ class KnowledgeStore(abc.ABC):
     async def delete_document(self, *, tenant_id: UUID, document_id: UUID) -> bool:
         """Delete a document and cascade its chunks, page records,
         recognition cache and passage revisions. ``False`` if no document
-        matched."""
+        matched. B-267: a document that had passages marks its base's profile
+        stale in the same transaction (:func:`profiles.staled`)."""
 
     @abc.abstractmethod
     async def set_document_pages(
@@ -774,6 +857,22 @@ class KnowledgeStore(abc.ABC):
         when the current rules reject it, and the fresh one must then stand,
         or every later ingest would pay for it again."""
 
+    @abc.abstractmethod
+    async def cached_page_indexes(
+        self,
+        *,
+        tenant_id: UUID,
+        document_id: UUID,
+        source_sha256: str,
+        readers: Sequence[str],
+    ) -> set[int]:
+        """The 0-based pages of the document's cached ``page_ocr`` readings
+        rendered from the bytes ``source_sha256`` and read as one of
+        ``readers`` records (B-238 —— the estimate's pages read before, e.g. by
+        a cancelled ingest: it renders no page, so it cannot match cache
+        keys). A reading that does not record them (cached before B-238) is
+        left out."""
+
     # -- maintenance (B-175 P3-PR2) -------------------------------------------
 
     @abc.abstractmethod
@@ -784,7 +883,9 @@ class KnowledgeStore(abc.ABC):
         its chunks (and their own switches) and its place in every listing;
         recall leaves it out (:meth:`search`). Returns the ids that are this
         base's documents, in the order asked, each once — another base's,
-        another tenant's and unknown ids are skipped."""
+        another tenant's and unknown ids are skipped. B-267: switching off a
+        document that has passages marks the base's profile stale in the same
+        transaction (:func:`profiles.staled`)."""
 
     @abc.abstractmethod
     async def count_stale_documents(self, *, tenant_id: UUID, kb_id: UUID, params_hash: str) -> int:
@@ -929,11 +1030,14 @@ class KnowledgeStore(abc.ABC):
         retention job (30 days after ``orphaned_at``)."""
 
     @abc.abstractmethod
-    async def discard_unapplied_revisions(self, *, tenant_id: UUID, document_id: UUID) -> int:
+    async def discard_unapplied_revisions(
+        self, *, tenant_id: UUID, document_id: UUID
+    ) -> DiscardedEdits:
         """Delete what :meth:`list_unapplied_revisions` lists: the whole
         history of every passage that is gone, the revisions above the
         current one of a passage still there, and the switch-off records no
-        passage holds the text of. Returns the rows deleted."""
+        passage holds the text of. Returns how many entries that listing had
+        and how many revision rows went (B-241)."""
 
     @abc.abstractmethod
     async def count_review_items(

@@ -103,7 +103,8 @@ def conflicts(a: _ScheduledCall, b: _ScheduledCall) -> bool:
     # delegation gets its own ``thread_id`` / checkpoint, so multiple
     # sibling sub-agents can run via ``asyncio.gather``. (They share the
     # per-(tenant, user) sandbox session and workspace; writes there
-    # serialize on the user-level workspace lock.) This
+    # serialize on the workspace lock — per conversation on the new layout,
+    # per user on the old one.) This
     # is checked *before* the empty-paths rule below — a SubAgentTool
     # has no declared paths but is explicitly safe.
     a_par = a.spec is not None and a.spec.is_parallel_safe

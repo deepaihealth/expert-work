@@ -41,8 +41,10 @@
   color: var(--ew-text-tertiary);
 }
 
+/* B-254 —— 按自身宽度起步(不是 flex: 1 的 0),这样空间不够时收缩权重才起作用:
+ * 时长拆分(权重 100)先缩,标题与它末尾的红色「N 次失败」后缩。 */
 .ew-process__headline {
-  flex: 1;
+  flex: 1 1 auto;
   min-width: 0;
   overflow: hidden;
   white-space: nowrap;
@@ -51,6 +53,17 @@
 
 .ew-process__failed {
   color: var(--ew-text-danger);
+}
+
+/* B-254 —— 时长拆分:窄屏时最先让出位置(收缩权重 100),全文在 title 里。 */
+.ew-process__split {
+  flex: 0 100 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--ew-text-tertiary);
+  font-size: 11px;
 }
 
 .ew-process__duration {

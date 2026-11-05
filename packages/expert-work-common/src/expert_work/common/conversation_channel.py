@@ -59,6 +59,12 @@ WORKSPACE_BLOCK_MARK = "expert_work_workspace_block"
 #: ``graph_builder.figure_block.figure_block_message``)。
 FIGURE_BLOCK_MARK = "expert_work_figure_block"
 
+#: B-236 —— 对话第一次 run 开场时读进来的 agent 记忆索引(``/agent/AGENT_NOTES.md``,
+#: ``graph_builder.agent_notes``)。它同时带 :data:`HIDE_FROM_UI`,**落检查点**(只在第一轮
+#: 写一次,之后的轮次不重读)。它的规矩又是另一条:不过期也不 dedup —— 压缩或滑窗把它挤
+#: 出提示词视图时,``graph_builder`` 把原件放回去(与「本轮输入」段放回的做法相同)。
+AGENT_NOTES_BLOCK_MARK = "expert_work_agent_notes_block"
+
 #: 定时任务投递的助手消息标记(``trigger_delivery.inject_delivery``)。它
 #: **自己开一个段落** —— 否则它会被接到用户上一个真实提问的段尾,把那一段
 #: 的 ``final`` 抢走。
@@ -241,6 +247,7 @@ def visible_turns(
 
 
 __all__ = [
+    "AGENT_NOTES_BLOCK_MARK",
     "CHANNEL_COMMENTARY",
     "CHANNEL_FINAL",
     "FIGURE_BLOCK_MARK",

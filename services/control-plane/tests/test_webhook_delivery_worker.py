@@ -24,6 +24,7 @@ from expert_work.protocol import (
     WebhookDeliveryRecord,
     WebhookDeliveryStatus,
     WebhookEndpointRecord,
+    WebhookEventType,
 )
 from expert_work.runtime.runs import InMemoryRunStore, RunInfo, RunStatus
 from expert_work.runtime.runs.schemas import DisconnectMode
@@ -400,6 +401,7 @@ async def _enqueue_fixture(
     completed: bool | None = None,
     exit_reason: str | None = None,
     unresolved_failures: list[dict[str, str]] | None = None,
+    event_types: tuple[WebhookEventType, ...] = ("run.completed", "run.failed"),
 ):
     """Seed a terminal run + its thread + one endpoint; return the worker
     and stores so a test can call ``enqueue_once`` and inspect the queue."""
@@ -442,7 +444,7 @@ async def _enqueue_fixture(
             tenant_id=tenant,
             name="ops",
             url="https://hooks.example.com/x",
-            event_types=("run.completed", "run.failed"),
+            event_types=event_types,
             agent_name=endpoint_agent,
             secret_ref="webhook-endpoint/x",
             enabled=True,
@@ -524,6 +526,80 @@ async def test_run_event_payload_carries_completed_and_exit_reason(
     assert row.payload["completed"] is completed
     assert row.payload["exit_reason"] == exit_reason
     assert row.payload["unresolved_failures"] == failures
+
+
+_ALL_RUN_EVENTS: tuple[WebhookEventType, ...] = ("run.completed", "run.failed", "run.paused")
+
+
+@pytest.mark.asyncio
+async def test_paused_run_emits_run_paused_not_run_failed() -> None:
+    """B-230 —— a run stopped at an approval is not a failure: it fires
+    ``run.paused`` (payload ``status: paused``), never ``run.failed``."""
+    worker, deliveries, _tenant, run_id = await _enqueue_fixture(
+        endpoint_agent=None,
+        thread_agent="reporter",
+        status=RunStatus.PAUSED,
+        completed=False,
+        exit_reason="approval_pending",
+        unresolved_failures=[],
+        event_types=_ALL_RUN_EVENTS,
+    )
+    assert await worker.enqueue_once() == 1
+    (row,) = [r async for r in _aiter(deliveries)]
+    assert row.event_type == "run.paused"
+    assert row.event_id == f"run:{run_id}"
+    assert row.payload["status"] == "paused"
+    assert row.payload["exit_reason"] == "approval_pending"
+
+
+@pytest.mark.asyncio
+async def test_run_failed_subscriber_no_longer_gets_pauses() -> None:
+    """B-230 —— an endpoint subscribed to ``run.failed`` only (the old way to
+    hear about pauses) stops receiving them, and is not silently subscribed to
+    ``run.paused`` either: the filter is the endpoint's own list."""
+    worker, deliveries, _tenant, _run_id = await _enqueue_fixture(
+        endpoint_agent=None,
+        thread_agent="reporter",
+        status=RunStatus.PAUSED,
+        completed=False,
+        exit_reason="approval_pending",
+        event_types=("run.completed", "run.failed"),
+    )
+    assert await worker.enqueue_once() == 0
+    assert [r async for r in _aiter(deliveries)] == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("event_types", "expected"),
+    [
+        # Subscribed to run.paused: the pause already took ``run:{id}``, so the
+        # later ``interrupted`` is not sent (one terminal notification per run).
+        (_ALL_RUN_EVENTS, [("run.paused", "paused")]),
+        # Not subscribed to run.paused: the pause was never sent, so the run's
+        # real end (voided by a new turn → interrupted) arrives as run.failed.
+        (("run.completed", "run.failed"), [("run.failed", "interrupted")]),
+    ],
+)
+async def test_paused_then_voided_run(
+    event_types: tuple[WebhookEventType, ...], expected: list[tuple[str, str]]
+) -> None:
+    worker, deliveries, tenant, run_id = await _enqueue_fixture(
+        endpoint_agent=None,
+        thread_agent="reporter",
+        status=RunStatus.PAUSED,
+        completed=False,
+        exit_reason="approval_pending",
+        event_types=event_types,
+    )
+    await worker.enqueue_once()
+    voided = await worker._runs.set_status(
+        run_id=run_id, tenant_id=tenant, status=RunStatus.INTERRUPTED, updated_at=_NOW
+    )
+    assert voided
+    await worker.enqueue_once()
+    rows = [r async for r in _aiter(deliveries)]
+    assert [(r.event_type, r.payload["status"]) for r in rows] == expected
 
 
 @pytest.mark.asyncio
@@ -760,6 +836,12 @@ def test_im_text_spells_bools_like_the_json_payload() -> None:
         ("run.completed", {"status": "success", "completed": True}, "运行完成"),
         ("run.completed", {"status": "success", "completed": None}, "运行完成"),
         ("run.failed", {"status": "error", "completed": None}, "运行失败"),
+        # B-230 —— a pause is its own event with its own title, not 运行失败.
+        (
+            "run.paused",
+            {"status": "paused", "completed": False},
+            "运行已暂停\N{FULLWIDTH COMMA}等待审批",
+        ),
     ],
 )
 def test_im_title_reads_finished_not_completed_when_the_work_was_not_done(

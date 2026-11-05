@@ -76,12 +76,12 @@
 
 ## 6. 个人默认样式
 
-用户明确说「以后都这样」，才把某个键写进个人默认文件 `report-style/personal.json`（只存这些明确要求长期
+用户明确说「以后都这样」，才把某个键写进个人默认文件 `/agent/report-style/personal.json`（只存这些明确要求长期
 生效的键），维护方式：
 
 ```
 python $EXPERT_WORK_SKILLS_DIR/health-plan-report/scripts/resolve_style.py \
-  --merge-into report-style/personal.json --set 键=值 --unset 不要的键
+  --merge-into /agent/report-style/personal.json --set 键=值 --unset 不要的键
 ```
 
 文件里保存的是用户当时说的原话值（如「深蓝」），不是换算后的十六进制色号；渲染时仍会照常规做值校验与换算。

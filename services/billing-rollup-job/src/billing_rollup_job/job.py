@@ -121,6 +121,31 @@ def _tenant_scope(tenant_id: UUID) -> Iterator[None]:
 # ---------------------------------------------------------------------------
 
 
+#: Providers whose ``input_tokens`` EXCLUDE the prompt-cache counters. Anthropic
+#: reports ``cache_read_input_tokens`` / ``cache_creation_input_tokens`` beside
+#: ``input_tokens`` and the platform adapter stores all three verbatim. Every other
+#: (OpenAI-compatible) adapter stores ``prompt_tokens`` — which already contains
+#: ``prompt_tokens_details.cached_tokens`` — as ``input_tokens`` (those adapters
+#: record no cache writes today; any they did would sit inside ``prompt_tokens``
+#: too). Same split as ``expert_work.runtime.middleware.token_usage._prompt_tokens``
+#: (B-142), which takes a non-Anthropic call's whole prompt to be ``input_tokens``.
+_INPUT_EXCLUDES_CACHE_PROVIDERS = frozenset({"anthropic"})
+
+
+def _uncached_input_tokens(
+    provider: str, input_tokens: int, cache_creation_tokens: int, cache_read_tokens: int
+) -> int:
+    """B-185 — the input tokens to bill at the full input price.
+
+    Cache hits / writes are billed at their own prices, so for providers whose
+    ``input_tokens`` already contains them they are taken out first (clamped at 0,
+    like the console's ``cost.ts``) — otherwise they would be billed twice.
+    """
+    if provider in _INPUT_EXCLUDES_CACHE_PROVIDERS:
+        return input_tokens
+    return max(0, input_tokens - cache_read_tokens - cache_creation_tokens)
+
+
 def month_bounds(month: date) -> tuple[datetime, datetime]:
     """Return ``(month_start, next_month_start)`` as tz-aware UTC datetimes.
 
@@ -300,8 +325,11 @@ class BillingRollupJob:
             priced_rows += 1
             # Prices are micro-元 / 百万 tokens; divide once at the end to reach
             # the ledger's per-token micro-元 (floor, matching apply_markup).
+            uncached_input = _uncached_input_tokens(
+                provider, row.input_tokens, row.cache_creation_tokens, row.cache_read_tokens
+            )
             base_micros = (
-                row.input_tokens * rate.input_per_mtok_micros
+                uncached_input * rate.input_per_mtok_micros
                 + row.output_tokens * rate.output_per_mtok_micros
                 + row.cache_creation_tokens * rate.cache_creation_per_mtok_micros
                 + row.cache_read_tokens * rate.cache_read_per_mtok_micros

@@ -13,7 +13,7 @@ import { Button, Card, Space, Switch, Tag, Tooltip, Typography } from "antd";
 import { History, Pencil } from "lucide-react";
 import { useTranslation } from "react-i18next";
 
-import type { Passage } from "../../../api/knowledge_maintenance";
+import type { Passage, PassageRevision } from "../../../api/knowledge_maintenance";
 import { ReadonlyTooltip } from "../../../components/ReadonlyTooltip";
 import { ChunkContent } from "../ChunkContent";
 import { HeadingPath } from "../HeadingPath";
@@ -43,6 +43,19 @@ export function usePassageLabel(): (passage: Passage) => string {
     t(passage.kind === "parent" ? "knowledge_page.parent_label" : "knowledge_page.chunk_label", {
       index: passage.chunk_index,
     });
+}
+
+/** 「某某 修改」 for a revision someone edited — B-241: the account name, with
+ *  the raw user id on hover; the id itself when no name is known. */
+export function EditedBy({ record }: { record: PassageRevision }): ReactElement {
+  const { t } = useTranslation();
+  const who = t("kb_maintenance.history_by", { who: record.edited_by_name ?? record.edited_by });
+  if (!record.edited_by_name) return <>{who}</>;
+  return (
+    <Tooltip title={record.edited_by}>
+      <span data-testid="kb-revision-editor">{who}</span>
+    </Tooltip>
+  );
 }
 
 /** Wraps a write control: the read-only hint wins, then the busy hint. */

@@ -36,7 +36,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Any
 
-from orchestrator.tools.locks import NullWorkspaceLock, WorkspaceLock
+from orchestrator.tools.locks import NullWorkspaceLock, WorkspaceLock, write_lock_conversation
 from orchestrator.tools.registry import ToolContext, ToolResult, ToolSpec
 from orchestrator.tools.sandbox import (
     DEFAULT_OUTPUT_CHAR_CAP,
@@ -46,6 +46,7 @@ from orchestrator.tools.sandbox import (
     run_in_sandbox,
 )
 from orchestrator.tools.sandbox_image_contract import preinstalled_note
+from orchestrator.tools.workspace_paths import EXEC_WORKSPACE_NOTE
 
 #: ``acquire`` thread label when the run has no id (ad-hoc call).
 _FALLBACK_THREAD_ID = "bash"
@@ -91,9 +92,8 @@ class BashTool:
                 "Run a shell command in the agent's sandboxed workspace and "
                 "return its stdout / stderr / exit code. Use for git, grep, "
                 "file manipulation, format conversion, or anything not covered "
-                "by a dedicated tool. Runs in /workspace, which is your "
-                "agent's own directory; other agents' files are not visible "
-                "there. NOTE: this is an irreversible action — it runs "
+                f"by a dedicated tool. {EXEC_WORKSPACE_NOTE} NOTE: this is an irreversible "
+                "action — it runs "
                 "serially and may require human approval before executing. "
                 "本轮如果有输入变量，它们在 $EXPERT_WORK_INPUTS 指向的 JSON 文件里"  # noqa: RUF001 — verbatim spec text (B-61 task-4-brief)
                 "（含 URL、编码、本地文件路径）；本轮没有输入变量时这个文件不存在，"  # noqa: RUF001
@@ -142,7 +142,12 @@ class BashTool:
         # bash serialises against write_file (and other bash) across replicas.
         # The lock scopes to the run's user — the durable workspace that may be
         # shared across replicas; a user-less (ephemeral) run needs no lock.
-        async with self.workspace_lock.acquire(tenant_id=ctx.tenant_id, user_id=ctx.user_id):
+        # B-236: a new-layout conversation narrows it to its own directory.
+        async with self.workspace_lock.acquire(
+            tenant_id=ctx.tenant_id,
+            user_id=ctx.user_id,
+            conversation_id=write_lock_conversation(ctx.workspace_view),
+        ):
             outcome = await run_in_sandbox(
                 self.client,
                 code=_build_wrapper(command),

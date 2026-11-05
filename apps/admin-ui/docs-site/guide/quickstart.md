@@ -84,7 +84,7 @@ data: {"status":"success","run_id":"..."}
 | `status` | 含义 |
 |---|---|
 | `success` | 这一轮跑完了，没有出错。要做的事有没有做成，看同一个事件里的 `completed` |
-| `incomplete` | 被平台的一道限制叫停（步数或 token 预算用完，或者反复原地打转），要做的事没有做完 |
+| `incomplete` | 被平台的一道限制叫停（步数或 token 预算用完，或者反复原地打转），要做的事没有做完。这一轮仍算正常结束，webhook 发的仍是 `run.completed` |
 | `paused` | 停在人工审批处等待调用方决策，不是失败，处理方式见 [4.2 审批决策](./run-control#_4-2-审批决策) |
 | `interrupted` | 被取消或中断 |
 | `error` | 失败，超时也归这一档 |

@@ -21,6 +21,7 @@ import io
 import json
 import os
 import re
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 from uuid import UUID, uuid4
@@ -42,6 +43,7 @@ from orchestrator.tools import (
 from orchestrator.tools.error_classifier import classify_tool_error
 from orchestrator.tools.file_ops import (
     _EDIT_MAIN,
+    SandboxWorkspaceReader,
     SandboxWorkspaceWriter,
     build_artifact_locate_wrapper,
     build_edit_wrapper,
@@ -1399,6 +1401,8 @@ class _SequenceRuntime(RecordingSandboxRuntime):
         run_id: UUID | None = None,
         has_skills: bool = False,
         egress: EgressContext | None = None,
+        conv_id: UUID | None = None,
+        workspace_thread_id: UUID | None = None,
     ) -> SandboxOutcome:
         self.execs.append((sandbox_id, code))
         self.exec_agent_keys.append(agent_key)
@@ -1552,14 +1556,24 @@ async def test_bare_shared_segment_is_plain_when_unbound() -> None:
     assert store.workspace_reads[-1][2] == "shared/x.md"
 
 
-async def test_projection_writer_targets_the_exec_view() -> None:
-    """B-60 —— 投影(``threads/<tid>/PLAN.md``)随视图落进 agent 目录:绑了 agent 的进程
-    里根本没有用户根可写。删除侧 ``sessions.py`` 与留存 job 早已两处都删
-    (``agents/<key>/threads/…`` 与用户根 ``threads/…``),不需要跟着改。"""
+async def test_projection_writer_targets_the_agent_view() -> None:
+    """B-60 —— 投影(``threads/<tid>/PLAN.md``)落进 agent 目录:绑了 agent 的进程里根本
+    没有用户根可写。删除侧 ``sessions.py`` 与留存 job 早已两处都删
+    (``agents/<key>/threads/…`` 与用户根 ``threads/…``),不需要跟着改。
+
+    B-236 —— 按 ``/agent`` 寻址,不按 ``/workspace``:对话视图里 ``/workspace`` 是
+    ``threads/<conv>/work``,按它写就落成 ``threads/<conv>/work/threads/<conv>/PLAN.md``。"""
     client = _client(json.dumps({"ok": True, "size": 2}))
-    writer = SandboxWorkspaceWriter(client=client, ctx=_ctx(agent_key="plan-aaaaaaaa"))
-    await writer.write(rel="threads/t1/PLAN.md", content="x")
-    assert _VIEW_WS in client.execs[-1][1]
+    ctx = replace(
+        _ctx(agent_key="plan-aaaaaaaa"),
+        workspace_layout="conversation",
+        thread_id=UUID("11111111-2222-3333-4444-555555555555"),
+    )
+    writer = SandboxWorkspaceWriter(client=client, ctx=ctx)
+    await writer.write(rel="threads/11111111-2222-3333-4444-555555555555/PLAN.md", content="x")
+    assert '"ws": "/agent"' in client.execs[-1][1]
+    await SandboxWorkspaceReader(client=client, ctx=ctx).read("PLAN.md")
+    assert '"ws": "/agent"' in client.execs[-1][1]
 
 
 # ---------------------------------------------------------------------------
@@ -1679,3 +1693,52 @@ def test_search_files_spec_tells_the_model_how_it_differs_from_list_dir() -> Non
     assert spec.resolved_side_effect == "read_only"
     # 分工写进描述里 —— 描述是给模型读的, 不写清楚它就会拿 list_dir 当搜索用。
     assert "list_dir" in spec.description
+
+
+# ---------------------------------------------------------------------------
+# B-243 —— 非 UTF-8 文件名(宿主 ``os.listdir`` 解出孤立代理 ``\udcff``)
+# ---------------------------------------------------------------------------
+
+
+async def test_list_dir_renders_a_non_utf8_name_as_encodable_text() -> None:
+    store = _store({"bad\udcff.txt": b"abc", "ok.txt": b"x"})
+    result = await ListDirTool(store=store).call({"path": "."}, ctx=_ctx())
+    result.content.encode("utf-8")  # 修之前: UnicodeEncodeError, 整条模型请求发不出去
+    assert "bad\\xff.txt  (3 bytes)" in result.content
+    assert "ok.txt  (1 bytes)" in result.content
+
+
+async def test_search_files_renders_a_non_utf8_name_as_encodable_text() -> None:
+    store = _store({f"agents/{_AGENT_KEY}/out/bad\udcff.txt": b"abc"})
+    result = await SearchFilesTool(store=store).call(
+        {"name_glob": "*.txt"}, ctx=_ctx(agent_key=_AGENT_KEY)
+    )
+    result.content.encode("utf-8")
+    assert "out/bad\\xff.txt  (3 bytes)" in result.content
+
+
+async def test_non_utf8_name_on_a_real_filesystem(tmp_path: Path) -> None:
+    """真落盘走一遍 ``NasWorkspaceStore``:名字确实以 ``\\udcff`` 的形态出来, 渲染后能编码。
+
+    同时钉住**往回**那一半的现状:显示名 ``bad\\xff.txt`` 是字面反斜杠, ``read_file`` 用它
+    打不开原文件(平台不做显示名 → 真实名的反查);模型要用这个文件得走 bash ``$'bad\\xff.txt'``。
+    """
+    from orchestrator.tools.nas_workspace_store import NasWorkspaceStore
+
+    ctx = _ctx()
+    user_root = tmp_path / str(ctx.tenant_id) / str(ctx.user_id)
+    user_root.mkdir(parents=True)
+    try:
+        with open(os.fsencode(user_root) + b"/bad\xff.txt", "wb") as fh:
+            fh.write(b"abc")
+    except OSError as exc:  # macOS APFS 拒绝非 UTF-8 文件名
+        pytest.skip(f"filesystem refuses a non-UTF-8 name: {exc}")
+    store = NasWorkspaceStore(root=str(tmp_path))
+
+    listing = await ListDirTool(store=store).call({"path": "."}, ctx=ctx)
+    assert listing.meta["entries"][0]["name"] == "bad\udcff.txt"
+    listing.content.encode("utf-8")
+    assert "bad\\xff.txt  (3 bytes)" in listing.content
+
+    with pytest.raises(FileOpError, match="not_found"):
+        await ReadFileTool(store=store).call({"path": "bad\\xff.txt"}, ctx=ctx)

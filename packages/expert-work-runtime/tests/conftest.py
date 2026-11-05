@@ -21,6 +21,7 @@ import subprocess
 from collections.abc import Awaitable, Callable, Iterator
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from typing import Any
 from uuid import UUID, uuid4
 
 import pytest
@@ -28,6 +29,7 @@ from testcontainers.compose import DockerCompose
 
 from expert_work.runtime.runs import (
     DisconnectMode,
+    RunEventRecord,
     RunEventStore,
     RunInfo,
     RunStatus,
@@ -416,7 +418,32 @@ async def reservation_renew_and_release(store: RunStore) -> None:
     )
 
 
+async def inflight_by_threads_batches_the_per_thread_read(store: RunStore) -> None:
+    """B-269 —— 一页 run 列表一次读出多个会话的忙 run:每个会话的结果与
+    :meth:`RunStore.list_inflight_by_thread` 逐条相同,别的租户的不出现。"""
+    tenant, a, b, idle = uuid4(), uuid4(), uuid4(), uuid4()
+    rows = [
+        _row(tenant_id=tenant, thread_id=a, status=RunStatus.QUEUED, at=timedelta(1)),
+        _row(tenant_id=tenant, thread_id=a, status=RunStatus.RUNNING, at=timedelta(0)),
+        _row(tenant_id=tenant, thread_id=b, status=RunStatus.PENDING, at=timedelta(0)),
+        _row(tenant_id=tenant, thread_id=b, status=RunStatus.SUCCESS, at=timedelta(1)),
+        _row(tenant_id=tenant, thread_id=idle, status=RunStatus.SUCCESS, at=timedelta(0)),
+        _row(tenant_id=uuid4(), thread_id=a, status=RunStatus.RUNNING, at=timedelta(0)),
+    ]
+    for r in rows:
+        await store.create(r)
+
+    got = await store.list_inflight_by_threads(thread_ids=[a, b, idle], tenant_id=tenant)
+
+    for thread in (a, b, idle):
+        single = await store.list_inflight_by_thread(thread_id=thread, tenant_id=tenant)
+        assert [r.run_id for r in got.get(thread, [])] == [r.run_id for r in single]
+    assert idle not in got
+    assert await store.list_inflight_by_threads(thread_ids=[], tenant_id=tenant) == {}
+
+
 _THREAD_QUEUE_SCENARIOS = (
+    inflight_by_threads_batches_the_per_thread_read,
     inflight_lists_only_busy_runs_of_the_thread,
     follower_waits_for_every_earlier_busy_run,
     other_threads_do_not_block,
@@ -432,3 +459,229 @@ def thread_queue_scenarios() -> tuple[Callable[[RunStore], Awaitable[None]], ...
     """B-139 —— 「忙 / 轮到没有 / 预订有效没有」的契约场景,两个实现共用:
     两份实现的谓词必须逐字同义, 否则内存版全绿、线上 SQL 放两轮并跑。"""
     return _THREAD_QUEUE_SCENARIOS
+
+
+# --- B-269 —— ``agent_run.started_at``:内存版与 SQL 版共用 ---------------------
+
+
+async def _assert_started_at(store: RunStore) -> None:
+    """``started_at`` 只在**第一次**进 RUNNING 时写:``set_status`` 与
+    ``claim_queued`` 两条路径都写,之后的 RUNNING(孤儿接管后重跑)、心跳、接管、
+    终局都不覆盖。审批续跑是新的 run id,有它自己的 ``started_at``。"""
+    tenant = uuid4()
+    run = _row(tenant_id=tenant, thread_id=uuid4(), status=RunStatus.PENDING, at=timedelta(0))
+    await store.create(run)
+    got = await store.get(run_id=run.run_id, tenant_id=tenant)
+    assert got is not None and got.started_at is None
+
+    t1 = _TQ_T0 + timedelta(minutes=1)
+    await store.set_status(
+        run_id=run.run_id, tenant_id=tenant, status=RunStatus.PENDING, updated_at=t1
+    )
+    got = await store.get(run_id=run.run_id, tenant_id=tenant)
+    assert got is not None and got.started_at is None
+
+    await store.set_status(
+        run_id=run.run_id, tenant_id=tenant, status=RunStatus.RUNNING, updated_at=t1
+    )
+    # 租约另取一个时刻:``started_at`` 若在 ``claim`` 里写,下面的断言分得出来。
+    await store.claim(
+        run_id=run.run_id,
+        tenant_id=tenant,
+        claimed_by="replica-a",
+        lease_until=t1 + _TQ_LEASE,
+        heartbeat_at=t1 + timedelta(seconds=10),
+    )
+    later = t1 + timedelta(minutes=5)
+    assert await store.reclaim(
+        run_id=run.run_id,
+        new_owner="replica-b",
+        lease_until=later + _TQ_LEASE,
+        heartbeat_at=later,
+        now=later,
+    )
+    await store.set_status(
+        run_id=run.run_id, tenant_id=tenant, status=RunStatus.RUNNING, updated_at=later
+    )
+    await store.set_status(
+        run_id=run.run_id,
+        tenant_id=tenant,
+        status=RunStatus.SUCCESS,
+        updated_at=later,
+        finished_at=later,
+    )
+    got = await store.get(run_id=run.run_id, tenant_id=tenant)
+    assert got is not None and got.started_at == t1
+
+    queued = _row(tenant_id=tenant, thread_id=uuid4(), status=RunStatus.QUEUED, at=timedelta(0))
+    await store.create(queued)
+    claimed = await _claim(store, queued.run_id, owner="w", now=later)
+    assert claimed is not None and claimed.started_at == later
+    await store.set_status(
+        run_id=queued.run_id,
+        tenant_id=tenant,
+        status=RunStatus.RUNNING,
+        updated_at=later + timedelta(seconds=1),
+    )
+    got = await store.get(run_id=queued.run_id, tenant_id=tenant)
+    assert got is not None and got.started_at == later
+
+
+@pytest.fixture
+def started_at_contract() -> Callable[[RunStore], Awaitable[None]]:
+    """B-269 —— ``started_at`` 的写入规则,两个实现共用。"""
+    return _assert_started_at
+
+
+# --- B-270 —— 进度聚合 ``RunEventStore.progress_for_runs``:两个实现共用 ----------
+
+#: 帧的落库时刻(毫秒),远离其它测试。
+_PG_T0_MS = 1_900_000_000_000
+
+
+def _ai(*tools: str) -> dict[str, Any]:
+    return {
+        "type": "ai",
+        "content": "private answer text",
+        "tool_calls": [{"name": t, "args": {"q": "secret"}, "id": f"c-{t}"} for t in tools],
+    }
+
+
+def _tool(name: str) -> dict[str, Any]:
+    return {"type": "tool", "name": name, "content": "secret result", "tool_call_id": f"c-{name}"}
+
+
+def _frames(run_id: UUID, frames: list[tuple[str, Any]]) -> list[RunEventRecord]:
+    return [
+        make_event_record(
+            run_id=run_id, seq=i, event_name=name, data=data, created_at_ms=_PG_T0_MS + i * 1000
+        )
+        for i, (name, data) in enumerate(frames)
+    ]
+
+
+def _worker(worker_id: str, kind: str, **data: Any) -> dict[str, Any]:
+    return {"worker_id": worker_id, "kind": kind, "depth": 1, "data": data}
+
+
+def _plan(*statuses: str) -> dict[str, Any]:
+    return {
+        "goal": "private goal",
+        "steps": [{"id": str(i), "description": "d", "status": s} for i, s in enumerate(statuses)],
+    }
+
+
+async def _assert_progress(
+    store: RunEventStore, *, run_ids: tuple[UUID, ...], tenant_id: UUID
+) -> None:
+    """一个 run 的进度 = 它落库的帧聚合出来的计数,不含任何内容。
+
+    调用方给 6 个 ``run_id``,负责让它们在自己的后端上合法且都属于 ``tenant_id``
+    (SQL 侧先建 ``agent_run`` 行)。
+    """
+    # 第三个 run 一帧都不落:它必须从结果里缺席。
+    busy, early, _silent, handoff, multi, upper = run_ids
+    await store.append_batch(
+        _frames(
+            busy,
+            [
+                ("metadata", {"run_id": str(busy)}),
+                ("plan", _plan("pending", "pending")),
+                ("updates", {"agent": {"messages": [_ai("web_search")], "step_count": 1}}),
+                # 工具节点里夹带的非工具消息(看图回填)不算一次工具调用。
+                (
+                    "updates",
+                    {
+                        "tools": {
+                            "messages": [_tool("web_search"), {"type": "human", "content": "x"}]
+                        }
+                    },
+                ),
+                ("worker", _worker("w1", "start")),
+                ("worker", _worker("w2", "start")),
+                # 子任务自己的步数不是主线的步数。
+                ("worker", _worker("w1", "update", step_count=99, node="agent")),
+                ("worker", _worker("w1", "end", outcome="success")),
+                ("plan", _plan("completed", "in_progress", "pending")),
+                (
+                    "updates",
+                    {"agent": {"messages": [_ai("read_file", "spawn_worker")], "step_count": 2}},
+                ),
+                ("updates", {"tools": {"messages": [_tool("read_file"), _tool("spawn_worker")]}}),
+                (
+                    "updates",
+                    {"agent": {"messages": [_ai("list_files", "write_file")], "step_count": 3}},
+                ),
+                ("guard", {"kind": "tripped"}),
+            ],
+        )
+        + _frames(
+            early,
+            [
+                ("updates", {"agent": {"messages": [_ai("web_search")], "step_count": 1}}),
+                ("updates", {"tools": {"messages": [_tool("web_search")]}}),
+            ],
+        )
+        # 接管 / 重跑:每次执行先发 ``metadata``。上一次执行里开了没收的子任务不再算;
+        # 只有 ``end`` 没有 ``start`` 的子任务(``start`` 掉帧)也不抵消在跑的那个。
+        + _frames(
+            handoff,
+            [
+                ("metadata", {"run_id": str(handoff)}),
+                ("worker", _worker("wA", "start")),
+                ("metadata", {"run_id": str(handoff)}),
+                ("worker", _worker("wB", "start")),
+                ("worker", _worker("wC", "end", outcome="success")),
+            ],
+        )
+        # 一帧里多个节点:当前步骤取最小的键;最新一帧是空对象时不算。
+        + _frames(
+            multi,
+            [
+                (
+                    "updates",
+                    {
+                        "tools": {"messages": [_tool("web_search")]},
+                        "agent": {"messages": [_ai("read_file", "write_file")], "step_count": 4},
+                    },
+                ),
+                ("updates", {}),
+            ],
+        )
+        # 键按码位比较(大写在小写之前),与数据库的区域排序规则无关。
+        + _frames(
+            upper,
+            [("updates", {"agent": {"messages": [_ai("web_search")]}, "Zeta": {"messages": []}})],
+        )
+    )
+
+    got = await store.progress_for_runs(list(run_ids), tenant_id=tenant_id)
+
+    assert set(got) == {busy, early, handoff, multi, upper}, "no frames = absent, not zero-filled"
+    b = got[busy]
+    assert b.step == 3
+    assert b.tool_calls == 3
+    assert b.active_workers == 1
+    assert (b.current_node, b.current_tool) == ("agent", "write_file")
+    assert (b.plan_done, b.plan_total) == (1, 3)
+    assert b.last_event_at == datetime.fromtimestamp((_PG_T0_MS + 12_000) / 1000, tz=UTC)
+    e = got[early]
+    assert (e.step, e.tool_calls, e.active_workers) == (1, 1, 0)
+    assert (e.current_node, e.current_tool) == ("tools", None)
+    assert (e.plan_done, e.plan_total) == (None, None)
+    h = got[handoff]
+    assert (h.active_workers, h.step, h.current_node) == (1, None, None)
+    m = got[multi]
+    assert (m.step, m.tool_calls) == (4, 1)
+    assert (m.current_node, m.current_tool) == ("agent", "write_file")
+    assert (got[upper].current_node, got[upper].current_tool) == ("Zeta", None)
+
+    # 进度里没有任何内容:正文、参数、工具结果、计划文字一个字都不出现。
+    assert "secret" not in repr(got) and "private" not in repr(got)
+    assert await store.progress_for_runs([], tenant_id=tenant_id) == {}
+
+
+@pytest.fixture
+def progress_contract() -> Callable[..., Awaitable[None]]:
+    """B-270 —— ``progress_for_runs`` 的聚合口径,两个实现共用。"""
+    return _assert_progress

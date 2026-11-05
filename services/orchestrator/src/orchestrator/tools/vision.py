@@ -19,10 +19,13 @@ See ``docs/streams/STREAM-J-DESIGN.md`` § 13.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import logging
 import time
+import weakref
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from pathlib import PurePosixPath
 from typing import TYPE_CHECKING, Any, Literal, Protocol
 from uuid import UUID
 
@@ -30,8 +33,16 @@ from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, System
 
 from expert_work.common.observability import ExpertWorkComponent, expert_work_span
 from expert_work.common.observability.metrics import expert_work_counter
+from expert_work.persistence import (
+    RENDERED_CROP_DIR,
+    RENDERED_FIGURE_SHA_HEX_LEN,
+    WORKSPACE_OVERFLOW_DIR,
+    region_crop_stem,
+)
 from expert_work.protocol.multimodal import (
     WORKSPACE_REF_PREFIX,
+    ImageRef,
+    WorkspaceImageRef,
     parse_image_ref,
     parse_workspace_image_ref,
 )
@@ -45,6 +56,7 @@ from orchestrator.llm.truncation import (
     output_truncated_total,
 )
 from orchestrator.multimodal import (
+    WORKSPACE_IMAGE_EXTENSIONS,
     ImageResolver,
     image_ref_block,
     is_missing_file,
@@ -53,9 +65,56 @@ from orchestrator.multimodal import (
 )
 from orchestrator.tools._guards import usage_total
 from orchestrator.tools.error_classifier import GuidedTimeoutError, GuidedToolError
-from orchestrator.tools.figure_lookup import resolve_rendered_figure
+from orchestrator.tools.figure_lookup import (
+    FigureNotRenderedError,
+    _ScopeLister,
+    resolve_rendered_figure,
+)
 from orchestrator.tools.file_ops import _require_path
+from orchestrator.tools.question_scope import is_count_question, is_whole_image_question
+from orchestrator.tools.read_page import (
+    RENDER_DPI,
+    RegionCrop,
+    RegionRender,
+    RegionStaleError,
+    figure_scope,
+    workspace_figure_ref,
+)
+from orchestrator.tools.region_zoom import (
+    AUTO_GATE_PIXELS,
+    AUTO_REGION,
+    DOCUMENT_ZOOM_DPI,
+    HOST_CROP_SLOTS,
+    LARGE_IMAGE_PIXELS,
+    REGION_HINT,
+    Box,
+    CroppedImage,
+    Region,
+    Tile,
+    band_axis,
+    crop_image,
+    crop_output_size,
+    image_size,
+    parse_region,
+    plan_bands,
+)
 from orchestrator.tools.registry import ToolBlockedError, ToolContext, ToolResult, ToolSpec
+from orchestrator.tools.tile_reading import (
+    RAW_META_CHARS,
+    TileResult,
+    decide_auto,
+    decide_whole_question,
+    parse_tile_reply,
+    tile_meta,
+    tile_question,
+)
+from orchestrator.tools.workspace_paths import (
+    PLATFORM_DIRS,
+    agent_relative,
+    conversation_work_prefix,
+    resolve_workspace_path,
+)
+from orchestrator.tools.workspace_scope import SCOPE_USER_ROOT, scoped_path
 from orchestrator.tools.workspace_store import WorkspaceStore
 
 if TYPE_CHECKING:
@@ -78,12 +137,75 @@ _SYSTEM_PROMPT = (
 #: 所以这里在工具层再加一道整体上限。
 ASK_IMAGE_TIMEOUT_S = 120.0
 
+#: B-257 —— 有单独的快看路由时,deep 最多等这么久就改用快看(B-252 的退路)。测试环境
+#: 30 天:quick p95 15 s、最长 28 s;deep 中位 43 s、p90 107 s,约 23 % 等满 120 s。
+#: 没有快看路由(deep 超时没有退路)时 deep 仍用 :data:`ASK_IMAGE_TIMEOUT_S`。
+ASK_IMAGE_DEEP_TIMEOUT_S = 60.0
+
+#: B-252 —— deep 超时后自动用快看再看一次的次数。
+ask_image_deep_retry_total = expert_work_counter(
+    "expert_work_ask_image_deep_timeout_quick_retry_total",
+    "ask_image calls whose depth='deep' look timed out and were retried once with the "
+    "quick look (B-252).",
+)
+
 #: B-105 —— 快看的「关思考」参数被厂商拒(4xx)、退回正常看图的次数。``model`` 是看图主模型名。
 vision_quick_fallback_total = expert_work_counter(
     "expert_work_vision_quick_fallback_total",
     "ask_image quick looks rejected by the vendor and retried with the configured thinking.",
     ("model",),
 )
+
+#: B-257 —— deep 路由带的平台默认思考档位被厂商拒(4xx)、改用配置原样的路由再看的次数。
+vision_deep_default_fallback_total = expert_work_counter(
+    "expert_work_vision_deep_default_fallback_total",
+    "ask_image deep looks whose platform-default thinking depth (B-257) was rejected by the "
+    "vendor and retried with the configuration as written.",
+    ("model",),
+)
+
+#: B-266 —— ``region="auto"`` 走了哪条路(横条 / 退回整张读 / 门槛挡回)与原因。
+ask_image_region_auto_total = expert_work_counter(
+    "expert_work_ask_image_region_auto_total",
+    "ask_image region='auto' looks by the path taken: bands (a band value was used), "
+    "full_fallback (the parallel whole-image answer was used), gated (the image was small "
+    "enough to read whole) or whole_question (B-273: a whole-image question, answered from the "
+    "whole image), with the reason (B-266).",
+    ("path", "reason"),
+)
+
+#: B-266 review —— 进程内同时在飞的「切块」看图调用上限。8 个并行 ``ask_image`` 各切 6 块
+#: 就是 48 个调用;超出的块排队,排队时间算在单次调用的上限里(等不到就按超时记)。
+MAX_TILE_CALLS_IN_FLIGHT = 12
+_TILE_SLOTS: weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, asyncio.Semaphore] = (
+    weakref.WeakKeyDictionary()
+)
+
+
+#: B-266 review round 2 g —— 宿主裁图的进程内名额(:data:`HOST_CROP_SLOTS`),在**进线程之前**
+#: 用 ``asyncio.Semaphore`` 拿:线程池里的线程从不阻塞着等。信号量绑定在创建它的循环上,按循环各一个。
+_HOST_CROP_GATES: weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, asyncio.Semaphore] = (
+    weakref.WeakKeyDictionary()
+)
+
+
+async def _crop_in_thread(data: bytes, boxes: Sequence[Box]) -> list[CroppedImage]:
+    loop = asyncio.get_running_loop()
+    gate = _HOST_CROP_GATES.get(loop)
+    if gate is None:
+        gate = _HOST_CROP_GATES[loop] = asyncio.Semaphore(HOST_CROP_SLOTS)
+    async with gate:
+        return await asyncio.to_thread(crop_image, data, boxes)
+
+
+def _tile_slots() -> asyncio.Semaphore:
+    """本事件循环的切块调用闸(信号量绑定在创建它的循环上,所以按循环各一个)。"""
+    loop = asyncio.get_running_loop()
+    slots = _TILE_SLOTS.get(loop)
+    if slots is None:
+        slots = _TILE_SLOTS[loop] = asyncio.Semaphore(MAX_TILE_CALLS_IN_FLIGHT)
+    return slots
+
 
 AskImageDepth = Literal["quick", "deep"]
 _DEPTHS: tuple[AskImageDepth, ...] = ("quick", "deep")
@@ -96,12 +218,70 @@ _DEPTH_DESCRIPTION = (
 )
 
 
+_REGION_DESCRIPTION = (
+    "Optional: look at part of the image at higher resolution. 'auto' = read one specific "
+    "small printed value, name or date in a large, dense image (always a quick look; depth "
+    "is ignored; small images are simply read whole); not for counting, comparisons or "
+    "questions about the whole image. [x1, y1, x2, y2] = one box on a 0-1000 scale "
+    "(0 <= x1 < x2 <= 1000, 0 <= y1 < y2 <= 1000, at least 1% of the image)."
+)
+
+
 class VLUsageMeter(Protocol):
     """B-64 Task 9 —— 一次 VL 调用的记账回调(实现见 ``orchestrator.usage_metering``)。"""
 
     async def __call__(
         self, response: AIMessage, *, tenant_id: UUID, user_id: UUID | None
     ) -> None: ...
+
+
+class PageRenderer(Protocol):
+    """B-251 —— 代模型渲一页用的 ``read_page``(就是注册表里那个工具实例)。"""
+
+    async def call(self, args: Mapping[str, Any], *, ctx: ToolContext) -> ToolResult:
+        """渲 ``args["path"]`` 的 ``args["units"]``,与模型自己调 ``read_page`` 同一个入口。"""
+
+    async def render_regions(
+        self,
+        *,
+        path: str,
+        figure_ref: str,
+        boxes: Sequence[Box],
+        ctx: ToolContext,
+        bands: bool = False,
+    ) -> RegionRender:
+        """B-266 —— 这一页(``figure_ref`` 是它的整页渲染)按 ``boxes`` 各渲一张高分辨率局部。"""
+
+
+class _AskImageTimeoutError(GuidedTimeoutError):
+    """本层限时触发的超时;``by_run_deadline`` 为真表示是 run 的剩余时间用完了。"""
+
+    def __init__(
+        self, message: str, *, advice: str, by_run_deadline: bool, waited_s: float = 0.0
+    ) -> None:
+        super().__init__(message, advice=advice)
+        self.by_run_deadline = by_run_deadline
+        #: B-257 —— 这次实际等了多久(秒),改用快看时写进回答开头。
+        self.waited_s = waited_s
+
+
+@dataclass(frozen=True)
+class _Look:
+    """一次看图的结果:回答、实际用的 depth(deep 超时会改成 quick)、VL 用量。"""
+
+    answer: str
+    depth: AskImageDepth
+    deep_timed_out: bool = False
+    usage: dict[str, Any] | None = None
+
+
+@dataclass(frozen=True)
+class _Located:
+    """``_image_ref_from_args`` 的结果:要看的 ref、它从哪来、代调 ``read_page`` 带回的 state。"""
+
+    ref: str
+    resolved_from: dict[str, Any] | None = None
+    state_updates: Mapping[str, Any] | None = None
 
 
 @dataclass(frozen=True)
@@ -128,13 +308,28 @@ class AskImageTool:
     #: 最低档」发送。``None`` = 与 ``vl_caller`` 相同(整条链上没有可关的思考),
     #: quick 与 deep 走同一条路由。
     quick_vl_caller: LLMCaller | None = None
+    #: B-257 —— 配置原样(不补平台默认档位)的路由:默认档位被厂商拒时、以及快看被拒时
+    #: 退回它。``None`` = 默认档位什么都没改,与 ``vl_caller`` 相同。
+    plain_vl_caller: LLMCaller | None = None
     #: B-64 Task 10 —— 单次 VL 调用的整体上限;只有测试会改它。
     timeout_s: float = ASK_IMAGE_TIMEOUT_S
+    #: B-257 —— 有快看路由时 deep 的上限(不超过 ``timeout_s``);只有测试会改它。
+    deep_timeout_s: float = ASK_IMAGE_DEEP_TIMEOUT_S
     #: B-105 —— 看图主模型名,只用作快看退回计数器的标签。
     vl_model_name: str = ""
     #: B-105 —— 看图模型(含备用树)的截断标签 / 上限解析器:实际应答的是谁、它的输出上限。
     #: ``None`` = 没接(测试),截断标签记 ``vl_model_name``、上限按厂商默认报。
     output_cap_resolver: ServedOutputCap | None = None
+    #: B-251 —— 按页看时那一页没渲染 / 已过期,用它先渲一次再看。``None`` = 这个 agent
+    #: 没有 ``read_page``:照旧报错,让模型自己去渲。
+    page_renderer: PageRenderer | None = None
+    #: B-251 回修 —— 同一 run 同一文档的代渲染排队。``ask_image`` 是只读工具,调度器会并行
+    #: 跑;两次同时渲同一份文档会在同一个渲染目录里互删(read_page 自己靠「非只读 + 同路径」
+    #: 串行,代调绕开了它)。锁只在有人等时存活(弱引用),进程内即可:一个 run 的工具调用
+    #: 都在同一个进程里。
+    _render_locks: weakref.WeakValueDictionary[tuple[object, str], asyncio.Lock] = field(
+        default_factory=weakref.WeakValueDictionary, compare=False, repr=False
+    )
 
     @property
     def spec(self) -> ToolSpec:
@@ -173,7 +368,7 @@ class AskImageTool:
                 "required": ["image_ref", "question"],
             },
             # Stream L.L6 — VL LLM call against an immutable image
-            # reference. Pure read.
+            # reference; this variant has no ``region``, so it writes nothing.
             is_read_only=True,
         )
 
@@ -181,7 +376,9 @@ class AskImageTool:
         if ctx.tenant_id is None:
             msg = "ask_image requires a tenant binding"
             raise ToolBlockedError(msg)
-        ref_str, resolved_from = await self._image_ref_from_args(args, ctx=ctx)
+        region = self._require_region(args)
+        located = await self._image_ref_from_args(args, ctx=ctx)
+        ref_str, resolved_from = located.ref, located.resolved_from
         question = _require_string(args, "question")
         depth = _require_depth(args)
         # B-64 —— 工作区 ref(平台渲出来的文档页)与上传 ref 走两套互相独立的
@@ -217,68 +414,473 @@ class AskImageTool:
             if workspace_ref.agent_key != (ctx.agent_key or None):
                 msg = "ask_image image_ref agent scope does not match the run agent"
                 raise ToolBlockedError(msg)
+            _refuse_other_conversation(workspace_ref.rel, ctx)
         else:
             tenant_of_ref = parse_image_ref(ref_str).tenant_id  # raises ValueError on malformed
         if tenant_of_ref != ctx.tenant_id:
             msg = "ask_image image_ref tenant does not match the run tenant"
             raise ToolBlockedError(msg)
+        if not ref_str.startswith(WORKSPACE_REF_PREFIX):
+            _refuse_another_conversations_upload(parse_image_ref(ref_str), ctx)
         if ref_str.startswith(WORKSPACE_REF_PREFIX):
+            _refuse_another_conversations_run(parse_workspace_image_ref(ref_str), ctx)
             await self._require_readable_workspace_image(ref_str)
+        # B-266 —— 安全检查都对**原图**做完了;``region`` 只是在本对话自己的目录里多裁一张。
+        meta: dict[str, Any] = {"image_ref": ref_str}
+        if resolved_from is not None:
+            meta["resolved_from"] = resolved_from
+        if region == AUTO_REGION:
+            answer, auto_meta = await self._look_auto(
+                located, question, requested_depth=depth, ctx=ctx
+            )
+            meta.update(auto_meta)
+            return ToolResult(content=answer, meta=meta, state_updates=located.state_updates or {})
+        look_ref = ref_str
+        if region is not None:
+            crop = (await self._crops(located, [region], ctx=ctx)).crops[0]
+            look_ref = crop.ref
+            meta["region"] = list(region)
+            meta["crop"] = {
+                "dpi": crop.dpi,
+                "pixels": [crop.width, crop.height],
+                "reused": crop.reused,
+            }
+        look = await self._look(look_ref, question, depth=depth, ctx=ctx)
+        answer = look.answer
+        if region is None and look.depth == "quick" and await self._wants_region_hint(located):
+            answer = f"{answer}\n\n{REGION_HINT}"
+        # Surface VL provenance in the ToolMessage artifact (event stream /
+        # audit): the image ref plus the VL call's token usage — otherwise the
+        # separate VL round-trip's cost is invisible (the tool only returns text).
+        meta["depth"] = look.depth
+        if look.deep_timed_out:
+            meta["deep_timed_out"] = True
+        if look.usage:
+            meta["vl_usage"] = look.usage
+        return ToolResult(content=answer, meta=meta, state_updates=located.state_updates or {})
+
+    async def _look(
+        self, ref_str: str, question: str, *, depth: AskImageDepth, ctx: ToolContext
+    ) -> _Look:
+        """一次看图:``depth`` 路由 + deep 超时改快看(B-252)+ 扣池 / 记账 + 截断判定。"""
         # Round-trip the image through the VL model. The provider adapter
         # resolves the ``image_ref`` content block to bytes via the same
         # shared resolver threaded into the VL caller (PR3 + PR4 + PR6).
-        messages = [
-            SystemMessage(content=_SYSTEM_PROMPT),
-            HumanMessage(
-                content=[
-                    {"type": "text", "text": question},
-                    image_ref_block(ref_str),
-                ]
-            ),
-        ]
-        if depth == "quick" and self.quick_vl_caller is not None:
+        messages = _messages(ref_str, question)
+        deep_timed_out, waited_s = False, 0.0
+        try:
+            response = await self._ask(messages, depth=depth, ctx=ctx)
+        except _AskImageTimeoutError as exc:
+            # B-252 —— deep 超时、run 还有时间、有单独的快看路由:用快看再看一次,而不是把
+            # 「换 quick 再试」留给模型 —— 那要多一轮模型思考(10-31 那次一轮就是几十秒到
+            # 几分钟)。没有单独的快看路由时两条是同一条,再调一次就是原样重试,不做。
+            if depth != "deep" or exc.by_run_deadline or self.quick_vl_caller is None:
+                raise
+            logger.info("ask_image.deep_timeout_quick_retry")
+            ask_image_deep_retry_total.inc()
+            deep_timed_out, depth, waited_s = True, "quick", exc.waited_s
             try:
-                with expert_work_span(ExpertWorkComponent.ORCHESTRATOR, "vision"):
-                    response = await self._call_with_limit(
-                        self.quick_vl_caller, messages, depth=depth, ctx=ctx
-                    )
-            except LLMClientError as exc:
-                if not _quick_rejected(exc):
-                    raise
-                # B-105 —— 关思考的参数被这家拒了(目录没实调过的新模型最常见):退回 Agent
-                # 原本的看图配置再看一次,而不是让看图整个失败。
-                vision_quick_fallback_total.labels(model=self.vl_model_name).inc()
-                logger.warning("ask_image.quick_rejected_fallback err=%s", type(exc).__name__)
-                with expert_work_span(ExpertWorkComponent.ORCHESTRATOR, "vision"):
-                    response = await self._call_with_limit(
-                        self.vl_caller, messages, depth=depth, ctx=ctx
-                    )
-        else:
-            with expert_work_span(ExpertWorkComponent.ORCHESTRATOR, "vision"):
-                response = await self._call_with_limit(
-                    self.vl_caller, messages, depth=depth, ctx=ctx
+                response = await self._ask(messages, depth=depth, ctx=ctx, deep_fallback=False)
+            except LLMClientError as rejected:
+                # 快看被厂商拒:平时退回正常看图,这里正常看图刚超时,不再原样等一整个窗口。
+                # 报错不再建议「先换快看」—— 快看刚被拒。
+                msg = (
+                    f"ask_image timed out ({exc.waited_s:.0f} seconds) with depth='deep', and "
+                    "the quick look was rejected by the vision model's vendor, so there is no "
+                    "answer from the vision model."
                 )
-        # B-64 Task 9 —— VL 的开销与主模型同样算数:先扣全树共享 token 池(B3),再落
-        # ``token_usage``。与 agent 节点处理主模型那次调用同序;VL 调用抛错 / 被取消时
-        # 两样都不做,也与主模型一致。
-        if ctx.token_budget is not None:
-            ctx.token_budget.add(usage_total(response.usage_metadata))
-        if self.usage_meter is not None:
-            await self.usage_meter(response, tenant_id=ctx.tenant_id, user_id=ctx.user_id)
+                raise _AskImageTimeoutError(
+                    msg,
+                    advice=_DEEP_AND_QUICK_FAILED_ADVICE,
+                    by_run_deadline=False,
+                    waited_s=exc.waited_s,
+                ) from rejected
+        await self._meter(response, ctx=ctx)
         # B-105 —— 截断成空回答(思考吃满上限)不当成「看图模型没说话」:上面已照常扣池 / 记账,
         # 这里计数后给模型一个说清原因的工具错误,别让它原样再问一遍。
         if is_unusable_truncation(response):
             self._raise_truncated(response)
         answer = _stringify(response.content) or "[VL model returned no text]"
-        # Surface VL provenance in the ToolMessage artifact (event stream /
-        # audit): the image ref plus the VL call's token usage — otherwise the
-        # separate VL round-trip's cost is invisible (the tool only returns text).
-        meta: dict[str, Any] = {"image_ref": ref_str, "depth": depth}
-        if resolved_from is not None:
-            meta["resolved_from"] = resolved_from
-        if response.usage_metadata:
-            meta["vl_usage"] = dict(response.usage_metadata)
-        return ToolResult(content=answer, meta=meta)
+        if deep_timed_out:
+            answer = (
+                f"(depth='deep' timed out after {waited_s:.0f} seconds, so this is the "
+                "quick look's answer — it may miss fine detail.)\n" + answer
+            )
+        usage = dict(response.usage_metadata) if response.usage_metadata else None
+        return _Look(answer=answer, depth=depth, deep_timed_out=deep_timed_out, usage=usage)
+
+    async def _meter(self, response: AIMessage, *, ctx: ToolContext) -> None:
+        """B-64 Task 9 —— VL 的开销与主模型同样算数:先扣全树共享 token 池(B3),再落
+        ``token_usage``。与 agent 节点处理主模型那次调用同序;VL 调用抛错 / 被取消时
+        两样都不做,也与主模型一致。B-266:``region="auto"`` 的每一块各记一次。"""
+        if ctx.token_budget is not None:
+            ctx.token_budget.add(usage_total(response.usage_metadata))
+        if self.usage_meter is not None and ctx.tenant_id is not None:
+            await self.usage_meter(response, tenant_id=ctx.tenant_id, user_id=ctx.user_id)
+
+    async def _look_auto(
+        self,
+        located: _Located,
+        question: str,
+        *,
+        requested_depth: AskImageDepth,
+        ctx: ToolContext,
+    ) -> tuple[str, dict[str, Any]]:
+        """B-266 ``region="auto"``(11-03 验证过的重设计)。一律快看(``depth`` 忽略、meta 注明)。
+
+        1. 门槛:图(文档页按 :data:`DOCUMENT_ZOOM_DPI` 算)不到 :data:`AUTO_GATE_PIXELS` → 不切,
+           整张快看一次(``gated``);
+        2. 否则切 :func:`band_count` 条整宽横条,每条回一小段 JSON;**同时**并行一次整张快看
+           (原问题、不加 JSON 要求),两者都计入在飞名额与记账;
+        3. 最终答案见 :func:`~orchestrator.tools.tile_reading.decide_auto`;B-273 —— 问题像整体类
+           问题(计数 / 合计 / 最高最低 ...)时见 ``decide_whole_question``(以整张读为准)。
+           横条与整张读全失败才报错,与整页看失败同一种错误。
+        """
+        pixels, size, document = await self._zoom_pixels(located)
+        meta: dict[str, Any] = {"region": AUTO_REGION, "depth": "quick", "auto_pixels": pixels}
+        if requested_depth != "quick":
+            meta["depth_ignored"] = requested_depth
+        if pixels is not None and pixels < AUTO_GATE_PIXELS:
+            look = await self._look(located.ref, question, depth="quick", ctx=ctx)
+            ask_image_region_auto_total.labels(path="gated", reason="small_image").inc()
+            meta.update({"auto": "gated", "auto_reason": "small_image", "vl_calls": 1})
+            if look.usage:
+                meta["vl_usage"] = look.usage
+            content = (
+                f"{look.answer}\n\n(region='auto': the image is small enough "
+                f"({pixels / 1_000_000:.1f} MP) to read whole, so it was read whole.)"
+            )
+            return content, meta
+        bands = plan_bands(size or (1, 1), pixels or 0)
+        try:
+            rendered = await self._crops(
+                located, [band.box for band in bands], ctx=ctx, bands=document
+            )
+        except RegionStaleError:
+            # 文档在整页渲染之后改过:整张读看的也是那张过期的页,不能拿来回答 —— 与指定框一样报错。
+            raise
+        except Exception as exc:
+            # review round 2 d —— 横条渲不出来(渲染失败、图解不开……):仍整张读一次,明说不确定;
+            # 整张读也失败才报错。
+            return await self._auto_without_bands(located, question, exc, meta=meta, ctx=ctx)
+        crop_by_box = {crop.box: crop for crop in rendered.crops}
+        render_failed = dict(rendered.failed)
+        looked = [band for band in bands if band.box in crop_by_box]
+        prompt = tile_question(question, band_axis(bands))
+        full_call = self._ask_tile(_messages(located.ref, question), ctx=ctx)
+        outcomes = await asyncio.gather(
+            full_call,
+            *(
+                self._ask_tile(_messages(crop_by_box[band.box].ref, prompt), ctx=ctx)
+                for band in looked
+            ),
+            return_exceptions=True,
+        )
+        full_outcome, band_outcomes = outcomes[0], outcomes[1:]
+        by_label: dict[str, TileResult] = {}
+        crop_meta: dict[str, dict[str, Any]] = {}
+        usages: list[Mapping[str, Any]] = []
+        errors: list[Exception] = []
+        for band, outcome in zip(looked, band_outcomes, strict=True):
+            result, error = await self._tile_result(band, outcome, ctx=ctx)
+            by_label[band.label] = result
+            if error is not None:
+                errors.append(error)
+            if isinstance(outcome, AIMessage) and outcome.usage_metadata:
+                usages.append(outcome.usage_metadata)
+            crop = crop_by_box[band.box]
+            crop_meta[band.label] = {"dpi": crop.dpi, "pixels": [crop.width, crop.height]}
+        for band in bands:
+            if band.label not in by_label:
+                why = render_failed.get(band.box, "not rendered")
+                by_label[band.label] = TileResult(tile=band, reply=None, error=why)
+        results = [by_label[band.label] for band in bands]
+        full_answer, full_error, full_exc = await self._full_result(full_outcome, ctx=ctx)
+        if isinstance(full_outcome, AIMessage) and full_outcome.usage_metadata:
+            usages.append(full_outcome.usage_metadata)
+        if full_answer is None and all(result.reply is None for result in results):
+            first = errors[0] if errors else full_exc
+            if first is not None:
+                raise first
+            msg = "ask_image region='auto' could not look at this image at all"
+            raise RuntimeError(msg)
+        # B-273 V1 —— 整体类问题以整张读为准,横条只用来提示一句(见 decide_whole_question)。
+        if is_whole_image_question(question):
+            decision = decide_whole_question(
+                results,
+                full_answer=full_answer,
+                full_error=full_error,
+                count_question=is_count_question(question),
+            )
+        else:
+            decision = decide_auto(results, full_answer=full_answer, full_error=full_error)
+        ask_image_region_auto_total.labels(path=decision.path, reason=decision.reason).inc()
+        meta.update(
+            {
+                "auto": decision.path,
+                "auto_reason": decision.reason,
+                "aggregate": decision.bands,
+                "bands": [
+                    {**tile_meta(result), **crop_meta.get(result.tile.label, {})}
+                    for result in results
+                ],
+                "full": {"answer": full_answer[:RAW_META_CHARS]}
+                if full_answer is not None
+                else {"error": full_error},
+                "vl_calls": len(looked) + 1,
+            }
+        )
+        if usages:
+            meta["vl_usage"] = _sum_usage(usages)
+        return decision.content, meta
+
+    async def _full_result(
+        self, outcome: AIMessage | BaseException, *, ctx: ToolContext
+    ) -> tuple[str | None, str | None, Exception | None]:
+        """并行那次整张快看的结果:``(回答, 失败原因, 异常)``;成功的这里记账。"""
+        if isinstance(outcome, BaseException) and not isinstance(outcome, Exception):
+            raise outcome  # 取消等:照常往上走
+        if isinstance(outcome, Exception):
+            reason = "timed out" if isinstance(outcome, TimeoutError) else type(outcome).__name__
+            return None, reason, outcome
+        await self._meter(outcome, ctx=ctx)
+        if is_unusable_truncation(outcome):
+            try:
+                self._raise_truncated(outcome)
+            except GuidedToolError as exc:
+                return None, "truncated", exc
+        text = _stringify(outcome.content).strip()
+        if not text:
+            return None, "no text", None
+        return text, None, None
+
+    async def _auto_without_bands(
+        self,
+        located: _Located,
+        question: str,
+        error: Exception,
+        *,
+        meta: dict[str, Any],
+        ctx: ToolContext,
+    ) -> tuple[str, dict[str, Any]]:
+        """横条准备不出来时:整张快看一次,标不确定并说原因;这一次也失败就报它(原因链上挂横条的错)。"""
+        try:
+            look = await self._look(located.ref, question, depth="quick", ctx=ctx)
+        except Exception as full_error:
+            raise full_error from error
+        ask_image_region_auto_total.labels(path="full_fallback", reason="bands_unavailable").inc()
+        # 异常的文字可能带 NAS 路径之类:给模型与 meta 的只有类型和一句固定的话,细节只进日志。
+        logger.warning(
+            "ask_image.auto_bands_unavailable err=%s", type(error).__name__, exc_info=error
+        )
+        reason = f"{type(error).__name__}: the region render failed"
+        meta.update(
+            {
+                "auto": "full_fallback",
+                "auto_reason": "bands_unavailable",
+                "bands_error": type(error).__name__,
+                "vl_calls": 1,
+            }
+        )
+        if look.usage:
+            meta["vl_usage"] = look.usage
+        content = (
+            f"{look.answer}\n\n(region='auto': whole-image reading; small print may be unreliable "
+            f"- the bands could not be prepared ({reason}). Re-ask with an explicit region, or say "
+            "the value is uncertain.)"
+        )
+        return content, meta
+
+    async def _zoom_pixels(
+        self, located: _Located
+    ) -> tuple[int | None, tuple[int, int] | None, bool]:
+        """``region="auto"`` 门槛用的像素数、图的(转正后)尺寸,以及这是不是一张文档页。
+
+        图片:转正后的原像素。文档页(``path`` + ``unit``):按 :data:`DOCUMENT_ZOOM_DPI` 放大
+        之后的页面像素 —— 已有的整页渲染是 100 dpi,乘 (300/100)^2;尺寸给 100 dpi 的(只用来
+        看宽高比)。读不出尺寸就是 ``None``。"""
+        source = located.resolved_from or {}
+        document = (
+            isinstance(source.get("path"), str)
+            and source.get("unit") is not None
+            and self.page_renderer is not None
+        )
+        try:
+            size = image_size((await self.image_resolver.resolve(located.ref)).data)
+        except Exception:
+            logger.debug("ask_image.zoom_pixels_unknown", exc_info=True)
+            return None, None, document
+        if size is None:
+            return None, None, document
+        scale = (DOCUMENT_ZOOM_DPI / RENDER_DPI) ** 2 if document else 1
+        return round(size[0] * size[1] * scale), size, document
+
+    async def _ask_tile(self, messages: Sequence[BaseMessage], *, ctx: ToolContext) -> AIMessage:
+        """一块的快看:先排进 :data:`MAX_TILE_CALLS_IN_FLIGHT` 个名额里,排队不超过单次调用的上限
+        (也不超过 run 的剩余时间)。"""
+        slots = _tile_slots()
+        wait_s = self.timeout_s
+        if ctx.deadline_at is not None:
+            wait_s = min(wait_s, ctx.deadline_at - time.monotonic())
+        try:
+            async with asyncio.timeout(max(wait_s, 0.0)):
+                await slots.acquire()
+        except TimeoutError as exc:
+            msg = f"ask_image waited {wait_s:.0f} seconds for a free vision slot and gave up."
+            raise _AskImageTimeoutError(
+                msg, advice=_TIMEOUT_ADVICE, by_run_deadline=False, waited_s=wait_s
+            ) from exc
+        try:
+            return await self._ask(messages, depth="quick", ctx=ctx)
+        finally:
+            slots.release()
+
+    async def _tile_result(
+        self, tile: Tile, outcome: AIMessage | BaseException, *, ctx: ToolContext
+    ) -> tuple[TileResult, Exception | None]:
+        """一块的调用结果 → :class:`TileResult`;成功的这里记账,失败的带回异常。"""
+        if isinstance(outcome, BaseException) and not isinstance(outcome, Exception):
+            raise outcome  # 取消等:照常往上走
+        if isinstance(outcome, Exception):
+            reason = "timed out" if isinstance(outcome, TimeoutError) else type(outcome).__name__
+            return TileResult(tile=tile, reply=None, error=reason), outcome
+        await self._meter(outcome, ctx=ctx)
+        if is_unusable_truncation(outcome):
+            try:
+                self._raise_truncated(outcome)
+            except GuidedToolError as exc:
+                return TileResult(tile=tile, reply=None, error="truncated"), exc
+        text = _stringify(outcome.content).strip()
+        if not text:
+            return TileResult(tile=tile, reply=None, error="no text"), None
+        return TileResult(tile=tile, reply=parse_tile_reply(text)), None
+
+    async def _crops(
+        self,
+        located: _Located,
+        boxes: Sequence[Box],
+        *,
+        ctx: ToolContext,
+        bands: bool = False,
+    ) -> RegionRender:
+        """B-266 —— 按 ``boxes`` 裁出局部:文档页(``path`` + ``unit``)在沙箱里按区域高分辨率渲,
+        别的图(上传图、工作区图片)在宿主按原像素裁。都落本对话 ``.tool_results/<run>/crops/``。"""
+        source = located.resolved_from or {}
+        path, unit = source.get("path"), source.get("unit")
+        if isinstance(path, str) and unit is not None:
+            if self.page_renderer is None:
+                msg = "ask_image 'region' on a document page needs this agent's read_page tool"
+                raise ToolBlockedError(msg)
+            async with self._render_lock((ctx.run_id, path)):
+                return await self.page_renderer.render_regions(
+                    path=path, figure_ref=located.ref, boxes=boxes, ctx=ctx, bands=bands
+                )
+        return await self._crop_image(located.ref, boxes, ctx=ctx)
+
+    async def _crop_image(
+        self, ref_str: str, boxes: Sequence[Box], *, ctx: ToolContext
+    ) -> RegionRender:
+        """宿主侧裁图:字节经同一个 resolver 拿(上传图来自对象存储),原像素裁,写进本对话
+        ``.tool_results/<run>/crops/<源图哈希>/<框>.jpg``;同一张图同一个框已经裁过就直接用。"""
+        store = self.workspace_store
+        if store is None or ctx.tenant_id is None or ctx.user_id is None or ctx.run_id is None:
+            msg = "ask_image 'region' needs a workspace and a tenant, user and run binding"
+            raise ToolBlockedError(msg)
+        data = (await self.image_resolver.resolve(ref_str)).data
+        source_sha = hashlib.sha256(data).hexdigest()[:RENDERED_FIGURE_SHA_HEX_LEN]
+        view = ctx.workspace_view
+        scope = figure_scope(view)
+        out_dir = scoped_path(
+            scope,
+            f"{conversation_work_prefix(view)}{WORKSPACE_OVERFLOW_DIR}/{ctx.run_id}/"
+            f"{RENDERED_CROP_DIR}/{source_sha}",
+        )
+        names = {region_crop_stem(box) + ".jpg" for box in boxes}
+        lister = _ScopeLister(
+            store=store, tenant_id=ctx.tenant_id, user_id=ctx.user_id, scope=SCOPE_USER_ROOT
+        )
+        crops: list[RegionCrop] = []
+        # 并行的两次 ask_image 看同一张图(常见:同一张化验单问两个值)会写同一批文件:排队,
+        # 后来的直接复用 —— 不排队时两边同时写同一个名字,NAS 的写入会互相踩掉。
+        async with self._render_lock((ctx.run_id, out_dir)):
+            existing = await lister.entries_if_present(out_dir)
+            reusable = {n for n in names if n in existing and not existing[n].is_dir}
+            todo = [box for box in boxes if region_crop_stem(box) + ".jpg" not in reusable]
+            pieces = dict(zip(todo, await _crop_in_thread(data, todo), strict=True)) if todo else {}
+            size = image_size(data) if reusable else None
+            for box in boxes:
+                rel = f"{out_dir}/{region_crop_stem(box)}.jpg"
+                piece = pieces.get(box)
+                if piece is not None:
+                    await store.write_file(
+                        tenant_id=ctx.tenant_id, user_id=ctx.user_id, path=rel, data=piece.data
+                    )
+                    width, height = piece.width, piece.height
+                else:
+                    width, height = crop_output_size(box, size or (0, 0))
+                ref = workspace_figure_ref(ctx.tenant_id, ctx.user_id, rel)
+                crops.append(
+                    RegionCrop(box=box, ref=ref, width=width, height=height, reused=piece is None)
+                )
+        return RegionRender(crops=tuple(crops))
+
+    def _render_lock(self, key: tuple[object, str]) -> asyncio.Lock:
+        """同一 run 同一文档的代渲染 / 渲局部排队(见 ``_render_locks``)。"""
+        lock = self._render_locks.get(key)
+        if lock is None:
+            lock = self._render_locks[key] = asyncio.Lock()
+        return lock
+
+    async def _wants_region_hint(self, located: _Located) -> bool:
+        """B-266 —— 整页快看之后,只有 ``region="auto"`` 不会被门槛挡回来的图才提示它。
+
+        只在 ``region`` 可用(接了工作区)时提示。尺寸只读文件头;读不出来就不提示
+        (这条路只决定加不加一句话,不许让看图失败)。"""
+        if self.workspace_store is None:
+            return False
+        figure = parse_rendered_figure_ref(located.ref)
+        if figure is not None and figure.region is not None:
+            return False
+        pixels, _size, _document = await self._zoom_pixels(located)
+        return pixels is not None and pixels >= LARGE_IMAGE_PIXELS
+
+    async def _ask(
+        self,
+        messages: Sequence[BaseMessage],
+        *,
+        depth: AskImageDepth,
+        ctx: ToolContext,
+        deep_fallback: bool = True,
+    ) -> AIMessage:
+        """按 ``depth`` 选路由调一次看图模型。``deep_fallback=False``:快看被拒时不退回正常看图。"""
+        if depth == "quick" and self.quick_vl_caller is not None:
+            try:
+                with expert_work_span(ExpertWorkComponent.ORCHESTRATOR, "vision"):
+                    return await self._call_with_limit(
+                        self.quick_vl_caller, messages, depth=depth, ctx=ctx
+                    )
+            except LLMClientError as exc:
+                if not _quick_rejected(exc) or not deep_fallback:
+                    raise
+                # B-105 —— 关思考的参数被这家拒了(目录没实调过的新模型最常见):退回 Agent
+                # 原本的看图配置再看一次,而不是让看图整个失败。B-257:是配置原样那条路由,
+                # 不带平台默认档位 —— 没实调过的厂商可能连默认档位也拒。
+                vision_quick_fallback_total.labels(model=self.vl_model_name).inc()
+                logger.warning("ask_image.quick_rejected_fallback err=%s", type(exc).__name__)
+                plain = self.plain_vl_caller or self.vl_caller
+                with expert_work_span(ExpertWorkComponent.ORCHESTRATOR, "vision"):
+                    return await self._call_with_limit(plain, messages, depth=depth, ctx=ctx)
+        try:
+            with expert_work_span(ExpertWorkComponent.ORCHESTRATOR, "vision"):
+                return await self._call_with_limit(self.vl_caller, messages, depth=depth, ctx=ctx)
+        except LLMClientError as exc:
+            if self.plain_vl_caller is None or not _quick_rejected(exc):
+                raise
+            # B-257 —— 平台默认档位被这家拒了:用配置原样的路由再看一次(同 B-105 的判法)。
+            vision_deep_default_fallback_total.labels(model=self.vl_model_name).inc()
+            logger.warning("ask_image.deep_default_rejected_fallback err=%s", type(exc).__name__)
+        with expert_work_span(ExpertWorkComponent.ORCHESTRATOR, "vision"):
+            return await self._call_with_limit(self.plain_vl_caller, messages, depth=depth, ctx=ctx)
 
     def _raise_truncated(self, response: AIMessage) -> None:
         if self.output_cap_resolver is not None:
@@ -312,6 +914,9 @@ class AskImageTool:
         所以调用方不扣池也不记账(与 Task 9「失败不记账」一致)。
         """
         limit_s = self.timeout_s
+        if depth == "deep" and self.quick_vl_caller is not None:
+            # B-257 —— deep 超时有快看兜底(B-252),不必等满整体上限。
+            limit_s = min(self.deep_timeout_s, limit_s)
         by_run_deadline = False
         if ctx.deadline_at is not None:
             remaining_s = ctx.deadline_at - time.monotonic()
@@ -319,7 +924,7 @@ class AskImageTool:
                 limit_s, by_run_deadline = remaining_s, True
         if limit_s <= 0:
             msg = "ask_image was not run: this run has no time left before its deadline."
-            raise GuidedTimeoutError(msg, advice=_NO_TIME_LEFT_ADVICE)
+            raise _AskImageTimeoutError(msg, advice=_NO_TIME_LEFT_ADVICE, by_run_deadline=True)
         limit = asyncio.timeout(limit_s)
         try:
             async with limit:
@@ -330,17 +935,27 @@ class AskImageTool:
                 raise
             advice = _NO_TIME_LEFT_ADVICE if by_run_deadline else _TIMEOUT_ADVICE
             message = _timeout_message(limit_s, depth, by_run_deadline)
-            raise GuidedTimeoutError(message, advice=advice) from exc
+            raise _AskImageTimeoutError(
+                message, advice=advice, by_run_deadline=by_run_deadline, waited_s=limit_s
+            ) from exc
 
-    async def _image_ref_from_args(
-        self, args: Mapping[str, Any], *, ctx: ToolContext
-    ) -> tuple[str, dict[str, Any] | None]:
-        """两种用法二选一,返回 ``(image_ref, resolved_from)``。
+    def _require_region(self, args: Mapping[str, Any]) -> Region | None:
+        """B-266 —— ``region``:要往本对话目录里写裁图,只有接了工作区的那一版才有。"""
+        if not _given(args, "region"):
+            return None
+        if self.workspace_store is None:
+            msg = "ask_image here does not accept 'region'"
+            raise ValueError(msg)
+        return parse_region(args.get("region"), tool="ask_image")
+
+    async def _image_ref_from_args(self, args: Mapping[str, Any], *, ctx: ToolContext) -> _Located:
+        """三种用法,返回要看的 ref 与它的来历。
 
         B-64 Task 8 —— ``path`` + ``unit`` 只负责**找到** ref;找到之后回到调用方,
         走 ``image_ref`` 那条路的全部校验(tenant / user / agent_key 三项、
-        :meth:`_require_readable_workspace_image`),不为短形态另写一套。
-        ``resolved_from`` 只在短形态下非 ``None``,记进 meta 便于真栈比对。
+        :meth:`_require_readable_workspace_image`),不为短形态另写一套。B-250 的
+        「``path`` 指向一张图」同样只是换算出工作区 ref,校验仍走那一条路。
+        ``resolved_from`` 只在后两种用法下非 ``None``,记进 meta 便于真栈比对。
         """
         has_ref = _given(args, "image_ref")
         has_path = _given(args, "path")
@@ -349,42 +964,90 @@ class AskImageTool:
             if has_path or has_unit:
                 msg = "ask_image here only accepts 'image_ref'; 'path' / 'unit' are not available"
                 raise ValueError(msg)
-            return _require_string(args, "image_ref"), None
+            return _Located(_require_string(args, "image_ref"))
         if has_ref and (has_path or has_unit):
             msg = (
-                "ask_image takes either 'image_ref' or 'path' + 'unit', not both — "
-                "for a document page you rendered with read_page, pass only 'path' + 'unit'"
+                "ask_image takes either 'image_ref' or 'path' (+ 'unit'), not both — "
+                "for a document page or an image file in the workspace, pass only 'path'"
             )
             raise ValueError(msg)
         if has_ref:
-            return _require_string(args, "image_ref"), None
+            raw = _require_string(args, "image_ref")
+            # B-250 —— 10-31 那次模型把工作区里的 ``work/x.png`` 填进了 ``image_ref``;
+            # 不是平台 ref、又是图片路径,就当 ``path`` 处理,省一轮「参数不对」。
+            if not raw.startswith("expert_work://") and _is_image_path(raw):
+                return await self._workspace_image(raw, ctx=ctx)
+            return _Located(raw)
+        if has_path and not has_unit and _is_image_path(args.get("path")):
+            return await self._workspace_image(args["path"], ctx=ctx)
         if not has_path and not has_unit:
             msg = (
-                "ask_image needs either 'image_ref' (an uploaded image) or 'path' + 'unit' "
-                "(a document page you rendered with read_page)"
+                "ask_image needs either 'image_ref' (an uploaded image), 'path' (an image "
+                "file in the workspace) or 'path' + 'unit' (a document page)"
             )
             raise ValueError(msg)
         if not (has_path and has_unit):
             msg = (
-                "ask_image 'path' and 'unit' go together: 'path' is the document path you "
-                "gave read_page, 'unit' is the page number you rendered"
+                "ask_image 'path' and 'unit' go together for a document: 'path' is the "
+                "document path, 'unit' the page number (an image file — "
+                f"{'/'.join(sorted(WORKSPACE_IMAGE_EXTENSIONS))} — needs only 'path')"
             )
             raise ValueError(msg)
         unit = _require_unit(args)
-        path = _require_path(args, tool="ask_image", agent_key=ctx.agent_key)
+        path = _require_path(args, tool="ask_image", view=ctx.workspace_view).path
         if ctx.tenant_id is None or ctx.user_id is None:
             msg = "ask_image 'path' + 'unit' requires a tenant and user binding"
             raise ToolBlockedError(msg)
-        ref = await resolve_rendered_figure(
-            self.workspace_store,
-            tenant_id=ctx.tenant_id,
-            user_id=ctx.user_id,
-            agent_key=ctx.agent_key,
-            path=path,
-            unit=unit,
-            run_id=ctx.run_id,
-        )
-        return ref, {"path": path, "unit": unit}
+        store, tenant_id, user_id = self.workspace_store, ctx.tenant_id, ctx.user_id
+
+        async def find() -> str:
+            return await resolve_rendered_figure(
+                store,
+                tenant_id=tenant_id,
+                user_id=user_id,
+                view=ctx.workspace_view,
+                path=path,
+                unit=unit,
+                run_id=ctx.run_id,
+                conversation_run_ids=ctx.figure_run_ids,
+            )
+
+        try:
+            ref = await find()
+        except FigureNotRenderedError:
+            if self.page_renderer is None:
+                raise
+            # B-251 —— 文档在、这一页没渲染或已过期:代模型调一次 read_page(同一个工具
+            # 实例、同一套沙箱)再找。它回来的 state 原样带回去,与模型自己调一样。
+            async with self._render_lock((ctx.run_id, path)):
+                try:  # 排队时别人可能已经渲好了
+                    return _Located(await find(), {"path": path, "unit": unit})
+                except FigureNotRenderedError:
+                    pass
+                rendered = await self.page_renderer.call({"path": path, "units": [unit]}, ctx=ctx)
+                try:
+                    ref = await find()
+                except FigureNotRenderedError as exc:
+                    msg = f"ask_image 先调了 read_page 渲染这一页,没有成功:{rendered.content}"
+                    raise FigureNotRenderedError(msg) from exc
+            return _Located(
+                ref,
+                {"path": path, "unit": unit, "auto_rendered": True},
+                rendered.state_updates,
+            )
+        return _Located(ref, {"path": path, "unit": unit})
+
+    async def _workspace_image(self, raw_path: Any, *, ctx: ToolContext) -> _Located:
+        """B-250 —— 工作区里的一张图 → 工作区 ref。路径按本 run 的视图解析(与文件工具同一套
+        越界 / 保留目录校验),换算成用户根相对路径;读不读得到交给 :meth:`call` 里那道检查。"""
+        path = _require_path({"path": raw_path}, tool="ask_image", view=ctx.workspace_view).path
+        if ctx.tenant_id is None or ctx.user_id is None:
+            msg = "ask_image 'path' requires a tenant and user binding"
+            raise ToolBlockedError(msg)
+        view = ctx.workspace_view
+        target = resolve_workspace_path(path, view=view, tool="ask_image")
+        rel = scoped_path(figure_scope(view), agent_relative(target, view))
+        return _Located(workspace_figure_ref(ctx.tenant_id, ctx.user_id, rel), {"path": path})
 
     async def _require_readable_workspace_image(self, ref_str: str) -> None:
         """B-64 Task 7 回修第 2 轮 —— 工作区图读不出来就让**这一次工具调用**显式失败。
@@ -425,16 +1088,24 @@ def _spec_with_short_form() -> ToolSpec:
         name="ask_image",
         description=(
             "Ask a vision model a specific question about an image. Point at the image "
-            "in exactly one of two ways: (1) a document page you rendered with read_page "
-            "— pass 'path' (the same document path you gave read_page) and 'unit' (the "
-            "page number you rendered; for .docx the figure number read_page used). "
-            "Prefer this for document pages: do not copy long references by hand. "
-            "(2) 'image_ref' — an ``expert_work://image/...`` reference attached to the "
-            "user message, for images the user uploaded. Ask narrow, specific questions; "
+            "in exactly one of three ways: (1) an image file in the workspace (png, jpg, "
+            "jpeg, webp, gif — e.g. a crop you saved) — pass only 'path'; no need to put it "
+            "into a PDF first. (2) a document page — pass 'path' (the document path) and "
+            "'unit' (the page number; for .docx the figure number read_page used); if that "
+            "page has not been rendered yet it is rendered for you. Do not copy long "
+            "references by hand. (3) 'image_ref' — an ``expert_work://image/...`` reference "
+            "attached to the user message, for images the user uploaded. Ask narrow, "
+            "specific questions; "
             "call ask_image repeatedly with sharper follow-ups if the first answer is too "
-            "vague — the image stays accessible. By default it is a quick look (good for "
-            "reading text, recognising content, finding numbers); pass depth='deep' only "
-            "for questions that need reasoning, such as a chart's trend or a complex layout."
+            "vague — the image stays accessible. Looking at the whole image is the default. "
+            "Use region='auto' only to read one specific small printed value, name or date in "
+            "a large, dense page or photo; never use it for counting, comparisons, trends, "
+            "'which is highest' or any question about the whole picture. If its result says it "
+            "is uncertain, re-ask with an explicit region or tell the user the value is "
+            "uncertain. When you already know where something is (e.g. the vision model told "
+            "you), pass region=[x1, y1, x2, y2] on a 0-1000 scale to look at just that part. "
+            "Pass depth='deep' only when the text is readable and the answer still needs "
+            "reasoning, such as a chart's trend or a complex layout."
         ),
         parameters={
             "type": "object",
@@ -442,16 +1113,16 @@ def _spec_with_short_form() -> ToolSpec:
                 "path": {
                     "type": "string",
                     "description": (
-                        "Document page form: the document path exactly as you passed it "
-                        "to read_page. Use together with 'unit'."
+                        "An image file in the workspace (alone), or a document path "
+                        "(together with 'unit')."
                     ),
                 },
                 "unit": {
                     "type": "integer",
                     "minimum": 1,
                     "description": (
-                        "Document page form: one of the 'units' you passed to read_page "
-                        "(page/slide number; for .docx the figure number)."
+                        "Document page form only: the page/slide number (for .docx the "
+                        "figure number read_page listed)."
                     ),
                 },
                 "image_ref": {
@@ -470,10 +1141,25 @@ def _spec_with_short_form() -> ToolSpec:
                     "enum": list(_DEPTHS),
                     "description": _DEPTH_DESCRIPTION,
                 },
+                "region": {
+                    "anyOf": [
+                        {"type": "string", "enum": [AUTO_REGION]},
+                        {
+                            "type": "array",
+                            "items": {"type": "integer", "minimum": 0, "maximum": 1000},
+                            "minItems": 4,
+                            "maxItems": 4,
+                        },
+                    ],
+                    "description": _REGION_DESCRIPTION,
+                },
             },
             "required": ["question"],
         },
-        # Stream L.L6 — VL LLM call against an immutable image reference. Pure read.
+        # Stream L.L6 —— 对源图只读。B-266 的 ``region`` 会往本 run 自己的
+        # ``.tool_results/<run>/crops/`` 写裁图:文件名由源内容哈希 + 框决定、写同样的字节,
+        # 文档页的局部在 ``(run, path)`` 锁里渲,图片的裁图在 ``(run, 裁图目录)`` 锁里写;
+        # 不改任何别人读的东西,所以调度上仍按只读处理。
         is_read_only=True,
     )
 
@@ -487,6 +1173,11 @@ _TIMEOUT_ADVICE = (
 )
 _NO_TIME_LEFT_ADVICE = (
     "This run has no time left. Do not call ask_image again; finish with what you already have."
+)
+#: B-257 —— deep 超时、改用的快看又被厂商拒:两条路都走过了,不再建议换 quick。
+_DEEP_AND_QUICK_FAILED_ADVICE = (
+    "Do not repeat the identical call. Retry only with a narrower, more specific question; "
+    "otherwise continue without this image answer."
 )
 #: B-105 —— 看图模型截断:原样再问只会再截一次(上限没变)。
 _TRUNCATED_ADVICE = (
@@ -523,6 +1214,78 @@ def _require_depth(args: Mapping[str, Any]) -> AskImageDepth:
             return depth
     msg = f"ask_image 'depth' must be one of {list(_DEPTHS)}, got {raw!r}"
     raise ValueError(msg)
+
+
+def _is_image_path(raw: object) -> bool:
+    """B-250 —— 一个字符串路径,扩展名是看图模型认的图片格式。"""
+    if not isinstance(raw, str) or not raw.strip():
+        return False
+    name = raw.rsplit("/", 1)[-1]
+    stem, dot, suffix = name.rpartition(".")
+    return bool(dot and stem) and f".{suffix.lower()}" in WORKSPACE_IMAGE_EXTENSIONS
+
+
+def _refuse_other_conversation(rel: str, ctx: ToolContext) -> None:
+    """B-236 —— 工作区 ref 落在 ``agents/<key>/threads/<id>/`` 底下时,``<id>`` 必须是本对话。
+
+    路径形态(``path``)走 ``resolve_workspace_path``,本来就到不了别的对话;这里补的是模型
+    手写 ``expert_work://workspace/...`` 的那条路(审查回修:B-236 之前就能这样写)。B-262
+    review —— 分段与读侧同一个算法(``PurePosixPath``;``rel`` 已由解析器保证是规范写法)。"""
+    parts = PurePosixPath(rel).parts
+    if len(parts) >= 4 and parts[0] == "agents" and parts[2] == "threads":
+        own = ctx.workspace_view.own_thread
+        if own is None or parts[3] != str(own):
+            msg = "ask_image image_ref points into another conversation's directory"
+            raise ToolBlockedError(msg)
+
+
+def _refuse_another_conversations_upload(ref: ImageRef, ctx: ToolContext) -> None:
+    """B-266 review —— 上传图 ref 里带着上传时的会话(``thread_id``):只认本对话的。
+
+    以前只比租户:同租户里换一条别的会话的上传 ref 就能看(带 ``region`` 时还会把它的像素
+    裁进本对话的工作区)。本对话 = ``ctx.thread_id``;委派出去的子代另认根对话
+    (``ctx.workspace_thread_id``)—— 父这一轮的图会原样交给子代。合法来源都是本会话的:
+    控制台 / 对外接口建 run 时都要求 ref 的 thread 就是本会话(``runs._validate_image_refs``、
+    ``agents.resolve_external_files``),``:edit`` / 重新生成也在同一会话里。
+
+    run 没绑会话(两个都是 ``None``,只有单测 / 合成评测)时无从比较,照旧放行。"""
+    own = {thread for thread in (ctx.thread_id, ctx.workspace_thread_id) if thread is not None}
+    if own and ref.thread_id not in own:
+        msg = (
+            "ask_image image_ref is an image uploaded in another conversation; only this "
+            "conversation's images can be read"
+        )
+        raise ToolBlockedError(msg)
+
+
+def _refuse_another_conversations_run(ref: WorkspaceImageRef, ctx: ToolContext) -> None:
+    """B-262 —— ref 落在 agent 根(没绑 agent 时是用户根)的平台目录下时:
+
+    * ``.tool_results/<run>/``:``<run>`` 必须是本对话的 —— ``ctx.figure_run_ids``(本对话渲染
+      过页的 run,子代含父链)或本 run。两种视图都是(迁移过来的老对话要用自己 run 的页)。
+    * 对话视图里 ``uploads/`` / ``inputs/``(含预拉缓存)一律拒:exec 视图里它们被盖住,那是
+      老视图对话的件。老视图里它们就是本对话的 ``/workspace``,照旧放行。
+
+    那一层是同一 agent 各对话共用的,模型手写的 ref 原来能读到别的对话的件。本对话
+    ``threads/<conv>/work/`` 下的由 :func:`_refuse_other_conversation` 管,这里不碰。"""
+    parts = PurePosixPath(ref.rel).parts[2 if ref.agent_key is not None else 0 :]
+    if not parts or parts[0] not in PLATFORM_DIRS:
+        return
+    if parts[0] == WORKSPACE_OVERFLOW_DIR:
+        own = set(ctx.figure_run_ids) | ({ctx.run_id} if ctx.run_id is not None else set())
+        try:
+            run = UUID(parts[1]) if len(parts) > 1 else None
+        except ValueError:
+            run = None
+        if run is not None and run in own:
+            return
+    elif not ctx.workspace_view.per_conversation:
+        return
+    msg = (
+        "ask_image image_ref points into another conversation's files; only this "
+        f"conversation's own files can be read ({parts[0]}/ under the agent directory is not)"
+    )
+    raise ToolBlockedError(msg)
 
 
 def _given(args: Mapping[str, Any], key: str) -> bool:
@@ -577,3 +1340,22 @@ def _stringify(content: Any) -> str:
                     parts.append(text)
         return "".join(parts)
     return ""
+
+
+def _messages(ref_str: str, text: str) -> list[BaseMessage]:
+    """一次看图的消息:系统提示 + ``[问题, 图]``。"""
+    return [
+        SystemMessage(content=_SYSTEM_PROMPT),
+        HumanMessage(content=[{"type": "text", "text": text}, image_ref_block(ref_str)]),
+    ]
+
+
+def _sum_usage(usages: Sequence[Mapping[str, Any]]) -> dict[str, int]:
+    """几次 VL 调用的用量相加(只加三个总数;明细各块自己的回执里有)。"""
+    total: dict[str, int] = {}
+    for usage in usages:
+        for key in ("input_tokens", "output_tokens", "total_tokens"):
+            value = usage.get(key)
+            if isinstance(value, int):
+                total[key] = total.get(key, 0) + value
+    return total

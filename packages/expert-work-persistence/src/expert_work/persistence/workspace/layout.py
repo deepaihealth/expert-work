@@ -37,7 +37,8 @@ WORKSPACE_SKILLS_DIR = "skills"
 WORKSPACE_UPLOADS_DIR = "uploads"
 
 #: 注入变量的落点(B-61):``inputs/<run_id>/inputs.json`` 是本轮声明变量的文档,
-#: ``inputs/cache/<sha256(url)[:32]><ext>`` 是按 agent 共享的内容寻址预拉缓存。
+#: ``inputs/cache/<sha256(url)[:32]><ext>`` 是内容寻址的预拉缓存(B-262 起对话视图里在本对话
+#: ``threads/<conv>/work/inputs/`` 下,按对话;老视图仍在 agent 根)。
 #:
 #: 两者都是**平台自己派生的机械产物**,不是 agent 产出:文档由 run 启动时的 inputs
 #: 节点写,缓存条目是平台代模型下载的副本(重下即得)。所以它和 ``uploads`` /
@@ -77,6 +78,19 @@ def artifact_snapshot_dir(root: str, tenant_id: UUID, user_id: UUID) -> Path:
     只负责拼出路径;打开它时要不要防 symlink 是调用方的事(都走 ``O_NOFOLLOW``)。
     """
     return Path(root) / str(tenant_id) / ARTIFACT_SNAPSHOT_DIR / str(user_id)
+
+
+#: B-236 第三层 —— ``/agent`` 里文件的历史版本(运行结束时看到改过的就留一份,每个文件留最近
+#: 20 份)。与 :data:`ARTIFACT_SNAPSHOT_DIR` 同一个位置理由:放在用户根**旁边**,
+#: ``{root}/{tenant_id}/.agent-file-versions/{user_id}/{agent_key}/…``,沙箱只挂
+#: ``{tenant_id}/{user_id}``,agent 跑的代码改不了、删不了自己的历史。control-plane 写,
+#: 清除用户与留存作业删,都经 :func:`agent_file_versions_dir` 拼。
+AGENT_FILE_VERSIONS_DIR = ".agent-file-versions"
+
+
+def agent_file_versions_dir(root: str, tenant_id: UUID, user_id: UUID) -> Path:
+    """一个用户的 agent 文件版本目录:``{root}/{tenant_id}/.agent-file-versions/{user_id}``。"""
+    return Path(root) / str(tenant_id) / AGENT_FILE_VERSIONS_DIR / str(user_id)
 
 
 #: Sandbox-local seed root for an agent's activated skill files (sandbox
@@ -169,6 +183,55 @@ def is_rendered_figure_rel(rel: str) -> bool:
     return _RENDERED_FIGURE_RE.match(rel) is not None
 
 
+#: B-266 —— 「放大局部」裁出来的图落在 ``.tool_results/<run_id>/crops/`` 下,两种形状:
+#:
+#: * 文档页的局部(沙箱按区域高分辨率渲):
+#:   ``crops/<doc-sha>/<render-sha>/_u<unit>/page-<N>-<x1>-<y1>-<x2>-<y2>-d<dpi>.jpg``
+#:   —— 前三段与渲染页同义(Path A 按它排槽、找回文档、核对新鲜度),文件名是真实页号 + 框 +
+#:   实际渲染的 dpi(同一个框按不同 dpi 渲出的是两张图,不许互相复用);
+#: * 图片的局部(宿主按原像素裁):``crops/<src-sha>/<x1>-<y1>-<x2>-<y2>.jpg``,
+#:   ``<src-sha>`` 是源图字节的哈希。
+#:
+#: 两种都由「源内容哈希 + 框」唯一决定(分辨率是这两样的确定函数),所以与渲染页一样可缓存。
+#: 框是 0-1000 的整数坐标。
+RENDERED_CROP_DIR = "crops"
+_BOX_PATTERN = "[0-9]{1,4}-[0-9]{1,4}-[0-9]{1,4}-[0-9]{1,4}"
+_RENDERED_CROP_RE = re.compile(
+    "^"
+    + re.escape(WORKSPACE_OVERFLOW_DIR)
+    + "/"
+    + _UUID_PATTERN
+    + "/"
+    + re.escape(RENDERED_CROP_DIR)
+    + "/"
+    + _SHA_PATTERN
+    + "/(?:"
+    + _SHA_PATTERN
+    + "/"
+    + re.escape(RENDERED_FIGURE_UNIT_PREFIX)
+    + "[1-9][0-9]*/"
+    + re.escape(RENDERED_FIGURE_PAGE_STEM)
+    + "-[0-9]+-"
+    + _BOX_PATTERN
+    + "-d[1-9][0-9]{0,3}|"
+    + _BOX_PATTERN
+    + r")\.jpg\Z"
+)
+
+
+def region_crop_stem(box: tuple[int, int, int, int]) -> str:
+    """框在裁图文件名里的写法 ``<x1>-<y1>-<x2>-<y2>`` —— 写的人(``tools.region_zoom``)与
+    读的人(``multimodal.parse_rendered_figure_ref``)都经这里。"""
+    return "-".join(str(v) for v in box)
+
+
+def is_rendered_crop_rel(rel: str) -> bool:
+    """``rel``(剥掉作用域前缀后)是不是一张「放大局部」裁图的落点(见 :data:`RENDERED_CROP_DIR`)。
+
+    与 :func:`is_rendered_figure_rel` 同样严:判错成 ``False`` 只是少缓存一次。"""
+    return _RENDERED_CROP_RE.match(rel) is not None
+
+
 #: Workspace prefixes that hold machinery / inputs rather than agent output —
 #: hidden from the "agent products" browse view. Add a new reserved namespace
 #: here (and use the matching constant where it is written) and every browse
@@ -203,18 +266,43 @@ WORKSPACE_DELETE_PROTECTED_PREFIXES: frozenset[str] = frozenset(
 _CONTAINERS: dict[str, int] = {WORKSPACE_AGENTS_DIR: 2, WORKSPACE_SHARED_DIR: 1}
 
 
+#: B-236 —— 一个对话自己的 ``/workspace`` 在 agent 根下的位置:
+#: ``threads/<conv uuid>/work/``。exec 在里面为平台目录(``uploads/`` 等)建的空挂载桩
+#: 不是 agent 产出,所以它也算一层**位置**容器,与 ``agents/<key>/`` 一样先剥掉再看首段。
+WORKSPACE_THREADS_DIR = "threads"
+WORKSPACE_CONVERSATION_WORK_DIR = "work"
+#: B-236 —— 对话开场复制做完的标记 ``threads/<conv>/.seeded``(``conversation_seed`` 写)。平台
+#: 状态不是产出:浏览列表不列它。
+WORKSPACE_SEED_MARKER = ".seeded"
+#: B-262 P3 —— 老对话的平台文件(本对话的上传、工具结果)迁进本对话 ``work/`` 做完的标记
+#: ``threads/<conv>/.platform-migrated``(``platform_migration`` 写)。平台状态,浏览列表不列它。
+WORKSPACE_PLATFORM_MIGRATED_MARKER = ".platform-migrated"
+_UUID_RE = re.compile(_UUID_PATTERN)
+
+
 def _head_after_container(relpath: str) -> str:
     """The first path segment once a known container prefix is stripped.
 
     ``""`` for an empty path. See :func:`is_reserved_workspace_path` for why
     only known containers are stripped and only one segment is examined.
+    B-236 —— after ``agents/<key>/``, a conversation's
+    ``threads/<uuid>/work/`` is stripped too (only that exact shape).
     """
     parts = tuple(p for p in relpath.strip().split("/") if p)
     if not parts:
         return ""
-    skip = _CONTAINERS.get(parts[0])
+    container = parts[0]
+    skip = _CONTAINERS.get(container)
     if skip is not None and len(parts) > skip:
         parts = parts[skip:]
+        if (
+            container == WORKSPACE_AGENTS_DIR
+            and parts[0] == WORKSPACE_THREADS_DIR
+            and len(parts) > 3
+            and _UUID_RE.fullmatch(parts[1])
+            and parts[2] == WORKSPACE_CONVERSATION_WORK_DIR
+        ):
+            parts = parts[3:]
     return parts[0]
 
 

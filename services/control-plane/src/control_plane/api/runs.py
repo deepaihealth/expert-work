@@ -26,7 +26,7 @@ import asyncio
 import json
 import logging
 import time
-from collections.abc import AsyncIterator, Sequence
+from collections.abc import AsyncIterator, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Annotated, Any, Final, Literal
@@ -48,6 +48,7 @@ from control_plane.api._authz import (
 )
 from control_plane.api._quota_admission import check_admission
 from control_plane.api._run_event_stream import build_event_producer, make_run_probe
+from control_plane.api._run_progress import run_info_fields
 from control_plane.api._run_usage import make_usage_loader
 from control_plane.api._session_title import title_from_text
 from control_plane.api._user_scope import (
@@ -64,6 +65,7 @@ from control_plane.approval_void import (
 from control_plane.audit import emit
 from control_plane.inputs_block import block_stats, build_inputs_block, inputs_block_message
 from control_plane.kill_switch import run_block_reason
+from control_plane.platform_migration import prepare_run_workspace
 from control_plane.prompt_render import (
     PromptRenderError,
     bound_variable_names,
@@ -89,6 +91,7 @@ from control_plane.thread_queue import (
     Admission,
     ThreadQueueFullError,
     admit,
+    ahead_fields,
     queued_turn_stream,
 )
 from control_plane.transcript import extract_turns, read_messages
@@ -114,6 +117,7 @@ from expert_work.persistence.token_usage_store import (
     TokenUsageStore,
 )
 from expert_work.persistence.workspace import UserWorkspaceStore
+from expert_work.persistence.workspace.upload_names import original_name_note
 from expert_work.protocol import (
     AgentSpec,
     AgentSpecRecord,
@@ -150,6 +154,11 @@ from orchestrator import (
 from orchestrator.multimodal import image_ref_block
 from orchestrator.sse import end_frame_data, format_sse
 from orchestrator.stream_items import STREAM_FORMAT_LEGACY
+from orchestrator.tools.registry import (
+    WORKSPACE_LAYOUT_KEY,
+    WORKSPACE_MIGRATED_KEY,
+    WorkspaceLayout,
+)
 
 logger = logging.getLogger("expert_work.control_plane.runs")
 
@@ -302,6 +311,11 @@ class RunRequest(BaseModel):
     #: ``_safe_document_name_or_422`` 净化的纯文件名。拼进 ``_build_human_message``
     #: 的 ``[file attached: <name>]`` 提示行,与图片引用各自独立。
     document_names: list[str] = Field(default_factory=list, max_length=64)
+    #: B-275 —— ``document_names`` 里换过名的那几条(B-262:同名不同内容存成
+    #: ``<原名>-<8 位>``)→ 它们原来的名字(叶子)。``[file attached: …]`` 那一行据此把原名
+    #: 也告诉模型;不在表里的照旧只写实际名。值不是平台写得出的叶子名时那一行不写原名
+    #: (:func:`_file_attached_line`),所以这里不必再拦。
+    document_original_names: dict[str, str] = Field(default_factory=dict, max_length=64)
     #: Stream PI-1c — structured untrusted input. A business system passes
     #: the data to act on (a ticket / email / document) here instead of
     #: concatenating it into ``input``, so expert_work knows which span is
@@ -434,6 +448,23 @@ def _fence_untrusted(blocks: list[str], *, spotlight_nonce: str | None) -> str:
     return "\n\n".join(fenced)
 
 
+def _file_attached_line(name: str, original: str | None) -> str:
+    """One ``[file attached: …]`` line — the shape admin-ui ``attachment_markers.ts``
+    (B-274) lifts back out of history turns; change both together.
+
+    B-275 —— a document stored under a new name (B-262: same name, different
+    content → ``<stem>-<8 hex><ext>``) also names its original:
+    ``[file attached: uploads/报告-1a2b3c4d.pdf (original name: 报告.pdf)]``, so an
+    agent that names its deliverable after the attachment does not carry the
+    suffix into it. The original is written only when it differs and is a leaf
+    the platform could have written itself (no space, slash, bracket,
+    parenthesis or newline), so the line parses one way only; otherwise the
+    line is exactly the pre-B-275 one. Delegated children get the same note
+    from the same helper (:func:`original_name_note`).
+    """
+    return f"[file attached: {name}{original_name_note(name, original)}]"
+
+
 def _build_human_message(
     *,
     input_text: str | None,
@@ -442,6 +473,7 @@ def _build_human_message(
     untrusted_content: list[str] | None = None,
     spotlight_nonce: str | None = None,
     document_names: list[str] | None = None,
+    document_original_names: Mapping[str, str] | None = None,
 ) -> HumanMessage:
     """Assemble the ``HumanMessage`` for a J.6 multimodal run input.
 
@@ -473,7 +505,10 @@ def _build_human_message(
         if untrusted_content
         else ""
     )
-    doc_mentions = "\n".join(f"[file attached: {name}]" for name in (document_names or []))
+    originals = document_original_names or {}
+    doc_mentions = "\n".join(
+        _file_attached_line(name, originals.get(name)) for name in (document_names or [])
+    )
     if not image_refs:
         parts = [p for p in (text, doc_mentions, untrusted) if p]
         return HumanMessage(content="\n\n".join(parts))
@@ -501,6 +536,7 @@ def build_run_graph_input(
     inputs: dict[str, Any] | None = None,
     run_id: UUID | None = None,
     document_names: list[str] | None = None,
+    document_original_names: Mapping[str, str] | None = None,
 ) -> dict[str, Any]:
     """Assemble the graph input for a run from a built agent + user input.
 
@@ -527,6 +563,7 @@ def build_run_graph_input(
         untrusted_content=untrusted_content,
         spotlight_nonce=built.spotlight_nonce,
         document_names=document_names,
+        document_original_names=document_original_names,
     )
     now = datetime.now(UTC)
     if run_id is not None:
@@ -559,6 +596,8 @@ def build_run_graph_input(
         # **每一轮都写,哪怕是空的**:对话是长线程,省略这两个键时 LangGraph
         # 保留检查点里的旧值,上一轮的附件会漏进这一轮的子代。
         "turn_documents": list(document_names or []),
+        # B-275 —— 换过名的附件的原名,子代种子里的清单也要带上。同样每轮都写。
+        "turn_document_original_names": dict(document_original_names or {}),
         "turn_image_refs": list(image_refs),
         # 审批三件套只属于一轮,每一轮都清零(班车 2)—— 省略时检查点里上一轮
         # 停在审批上留下的 pending_approval 会让本轮的门控调用跳过审批门。
@@ -597,9 +636,9 @@ def replay_graph_input(
     ``expert_work_run_id`` 由 ``stamp_message`` 覆盖为本轮;被取代标记(调用方
     传进来的若是打标后的副本)一并剥掉。
 
-    **故意不写** ``turn_documents`` / ``turn_image_refs``:``build_run_graph_input``
-    每轮都写这两个键是为了不让上一轮附件漏进这一轮;重新生成要的恰恰是「同一批
-    附件」,而检查点里此刻的值就是被取代轮自己写的那一份 —— 省略键 = 沿用。
+    **故意不写** ``turn_documents`` / ``turn_image_refs`` / ``turn_document_original_names``:
+    ``build_run_graph_input`` 每轮都写这几个键是为了不让上一轮附件漏进这一轮;
+    重新生成要的恰恰是「同一批附件」,而检查点里此刻的值就是被取代轮自己写的那一份 —— 省略键 = 沿用。
     """
     now = datetime.now(UTC)
     fresh: list[BaseMessage] = []
@@ -1120,6 +1159,8 @@ async def resolve_approval_decision(
     # 工作区分层 —— agent 身份。续跑段与被续的那一段是同一个 agent 的同一轮活,
     # 漏了这里 = 审批通过之后的后半程写去了用户根,前半程写的在 agent 子树里。
     config["configurable"]["agent_key"] = sanitize_agent_key(spec_record.spec.metadata.name)
+    # B-236 —— 同理,布局取这条对话自己的:续跑段的 /workspace 与批准前同一个目录。
+    config["configurable"][WORKSPACE_LAYOUT_KEY] = meta.workspace_layout
     worker = asyncio.create_task(
         run_agent(
             bridge=runtime.stream_bridge,
@@ -1138,6 +1179,7 @@ async def resolve_approval_decision(
             trajectory_enabled=built.trajectory_recording,
             # P2 块 2 — run 终局重算 thread_meta.message_count。
             thread_stats_recorder=runtime.thread_stats_recorder,
+            agent_file_versions=runtime.agent_file_versions,
             token_budget=built.token_budget,
             worker_spawn_budget=await runtime.new_worker_spawn_budget(
                 requested_max_concurrent=built.worker_max_concurrent,
@@ -1172,6 +1214,7 @@ async def spawn_run(
     oauth_subject: str,
     payload: RunRequest,
     trace_id: str,
+    workspace_layout: WorkspaceLayout,
     extra_headers: dict[str, str] | None = None,
     on_behalf_of: str | None = None,
     idempotency_key: str | None = None,
@@ -1190,7 +1233,9 @@ async def spawn_run(
     to — the long-term-memory RLS, the workspace volume, and per-user token
     accounting all key on it (the caller for a normal session run; the minted
     end-user for an on-behalf-of external run). ``oauth_subject`` keys the per-user
-    OAuth MCP pool. ``on_behalf_of`` records the end-user when a machine principal
+    OAuth MCP pool. ``workspace_layout`` (B-236) is the thread row's sandbox view, passed
+    by the caller from the ``thread_meta`` row it has already loaded (no second query
+    here). ``on_behalf_of`` records the end-user when a machine principal
     acts for one.
 
     ``idempotency_key`` / ``request_digest`` (External-API-v1 P2-a Task 13, Task
@@ -1400,6 +1445,7 @@ async def spawn_run(
                 "untrusted_content": payload.untrusted_content,
                 "inputs": payload.inputs,
                 "document_names": payload.document_names,
+                "document_original_names": payload.document_original_names,
             }
             if payload.use_draft:
                 # 草稿只在这条请求里构建过;后台队列按线上版本重建会跑错版本,
@@ -1431,6 +1477,7 @@ async def spawn_run(
                 "untrusted_content": payload.untrusted_content,
                 "inputs": payload.inputs,
                 "document_names": payload.document_names,
+                "document_original_names": payload.document_original_names,
             }
             if replay_messages is not None:
                 # ``:regenerate`` —— 旧轮原件序列化过 JSONB 列,worker 那边
@@ -1458,6 +1505,11 @@ async def spawn_run(
                 "thread_id": str(thread_id),
                 "status": "queued",
             }
+            # B-269 —— 前面还有没结束的轮时才带(空闲会话的 202 与幂等重放同形)。
+            if queued_behind is not None:
+                content["ahead"] = queued_behind.ahead
+                if queued_behind.head is not None:
+                    content.update(ahead_fields(queued_behind.head))
             if envelope:
                 content = {"success": True, "data": content, "error": None}
             return JSONResponse(status_code=202, content=content)
@@ -1492,6 +1544,7 @@ async def spawn_run(
             payload=payload,
             replay_messages=replay_messages,
             inputs=inputs,
+            workspace_layout=workspace_layout,
         )
 
     headers = {
@@ -1574,6 +1627,7 @@ async def spawn_run(
                 owner=runtime.run_manager.instance_id,
                 lease_ttl_s=runtime.run_manager.lease_ttl_s,
                 ahead=queued_behind.ahead,
+                ahead_run=queued_behind.head,
                 launch=_launch,
                 is_disconnected=request.is_disconnected,
                 cancel_on_disconnect=on_disconnect is DisconnectMode.CANCEL,
@@ -1608,6 +1662,7 @@ async def _start_run(
     payload: RunRequest,
     replay_messages: tuple[BaseMessage, ...] | None,
     inputs: dict[str, Any] | None,
+    workspace_layout: WorkspaceLayout,
 ) -> None:
     """建好输入与配置、起 ``run_agent``。B-139 抽出来:立即执行与排队轮到后执行
     走同一份,``deadline_at`` 从**真正开跑**那一刻算。"""
@@ -1634,6 +1689,7 @@ async def _start_run(
             inputs=payload.inputs,
             run_id=run_id,
             document_names=payload.document_names,
+            document_original_names=payload.document_original_names,
         )
     configurable: dict[str, Any] = {
         "thread_id": str(thread_id),
@@ -1649,6 +1705,19 @@ async def _start_run(
     configurable["oauth_user_id"] = oauth_subject
     # 工作区分层 —— agent 身份。与 /opt/skills/<agent_key> 同一个值。
     configurable["agent_key"] = sanitize_agent_key(record_spec.metadata.name)
+    # B-236 —— 这条对话的 /workspace 布局(thread_meta;发布前已开的对话是老视图)。
+    # B-262 P3 —— 起新 run 之前先把老对话的平台文件迁进对话目录(做过的不再做):迁成了这一轮
+    # 就按对话视图跑,并给模型一句一次性说明。失败照原布局跑,下一次再试。
+    prepared = await prepare_run_workspace(
+        runtime.platform_migration,
+        thread_id=thread_id,
+        tenant_id=tenant_id,
+        workspace_layout=workspace_layout,
+    )
+    workspace_layout = prepared.workspace_layout
+    configurable[WORKSPACE_LAYOUT_KEY] = workspace_layout
+    if prepared.migrated:
+        configurable[WORKSPACE_MIGRATED_KEY] = True
     if built.run_deadline_s > 0:
         configurable["deadline_at"] = time.monotonic() + float(built.run_deadline_s)
     if payload.use_draft:
@@ -1679,6 +1748,7 @@ async def _start_run(
             trajectory_enabled=built.trajectory_recording,
             # P2 块 2 — run 终局重算 thread_meta.message_count。
             thread_stats_recorder=runtime.thread_stats_recorder,
+            agent_file_versions=runtime.agent_file_versions,
             token_budget=built.token_budget,
             worker_spawn_budget=await runtime.new_worker_spawn_budget(
                 requested_max_concurrent=built.worker_max_concurrent,
@@ -1916,6 +1986,7 @@ def build_runs_router() -> APIRouter:
             oauth_subject=request.state.principal.subject_id,
             payload=payload,
             trace_id=trace_id,
+            workspace_layout=meta.workspace_layout,
         )
 
     @router.get(
@@ -1934,6 +2005,7 @@ def build_runs_router() -> APIRouter:
         token_usage: Annotated[TokenUsageStore, Depends(_get_token_usage_store)],
         memory_jobs: Annotated[MemoryWritebackJobStore, Depends(_get_memory_writeback_jobs)],
         audit: Annotated[AuditLogger, Depends(_get_audit)],
+        events: Annotated[RunEventStore | None, Depends(_get_run_event_store)],
         # W2 read scope — a concrete id lets a system_admin drill into a
         # foreign tenant's run from the tenant switcher; "*" is meaningless
         # (a run belongs to one tenant).
@@ -2028,6 +2100,12 @@ def build_runs_router() -> APIRouter:
             # 控制台的轨迹从这里拼「后台记忆写回」那一行。本接口 ``console_only``,
             # API Key 平面看不到。
             memory_job = await memory_jobs.get_by_run(tenant_id=target_tenant, run_id=run_id)
+            # B-269 / B-270 —— 开始时刻、心跳、排在谁后面、进度(只认 durable 行)。
+            run_fields = (
+                (await run_info_fields(runs=runs, events=events, rows=[persisted]))[run_id]
+                if persisted is not None
+                else {}
+            )
         return JSONResponse(
             content={
                 "run_id": str(run_id),
@@ -2065,6 +2143,7 @@ def build_runs_router() -> APIRouter:
                     if persisted is not None and persisted.finished_at is not None
                     else None
                 ),
+                **run_fields,
             }
         )
 
@@ -2307,6 +2386,7 @@ def build_runs_router() -> APIRouter:
         runs: Annotated[RunStore, Depends(_get_run_store)],
         token_usage: Annotated[TokenUsageStore, Depends(_get_token_usage_store)],
         audit: Annotated[AuditLogger, Depends(_get_audit)],
+        events: Annotated[RunEventStore | None, Depends(_get_run_event_store)],
         tenant_id: Annotated[UUID | None, Query()] = None,
     ) -> JSONResponse:
         """Playground history reconstruction — the thread's runs, oldest-first.
@@ -2366,6 +2446,14 @@ def build_runs_router() -> APIRouter:
             except Exception:
                 logger.warning("thread_runs.tokens_failed", exc_info=True)
                 by_trace = {}
+            # B-269 / B-270 —— same isolation as tokens: a failure blanks these
+            # fields only, never the run list.
+            run_fields: dict[UUID, dict[str, Any]] = {}
+            try:
+                async with applied_scope(scope):
+                    run_fields = await run_info_fields(runs=runs, events=events, rows=rows)
+            except Exception:
+                logger.warning("thread_runs.progress_failed", exc_info=True)
             out = [
                 {
                     "run_id": str(r.run_id),
@@ -2398,6 +2486,7 @@ def build_runs_router() -> APIRouter:
                     "tokens": _tokens_to_dict(
                         by_trace.get(r.trace_id) if r.trace_id is not None else None
                     ),
+                    **run_fields.get(r.run_id, {}),
                 }
                 for r in rows
             ]
@@ -2864,6 +2953,7 @@ def build_runs_list_router() -> APIRouter:
         threads: Annotated[ThreadMetaStore, Depends(_get_thread_repo)],
         token_usage: Annotated[TokenUsageStore, Depends(_get_token_usage_store)],
         audit: Annotated[AuditLogger, Depends(_get_audit)],
+        events: Annotated[RunEventStore | None, Depends(_get_run_event_store)],
         status: Annotated[RunStatus | None, Query()] = None,
         agent_name: Annotated[str | None, Query(min_length=1)] = None,
         agent_version: Annotated[str | None, Query(min_length=1)] = None,
@@ -2975,14 +3065,19 @@ def build_runs_list_router() -> APIRouter:
                 if trace_ids
                 else {}
             )
+            # B-269 / B-270 —— 一个会话一次排队查询、整页一次进度聚合。
+            run_fields = await run_info_fields(runs=runs, events=events, rows=items)
 
         items_json = [
-            _run_to_dict(
-                i,
-                agent_name=agents_by_thread[i.thread_id][0],
-                agent_version=agents_by_thread[i.thread_id][1],
-                tokens=tokens_by_trace.get(i.trace_id) if i.trace_id else None,
-            )
+            {
+                **_run_to_dict(
+                    i,
+                    agent_name=agents_by_thread[i.thread_id][0],
+                    agent_version=agents_by_thread[i.thread_id][1],
+                    tokens=tokens_by_trace.get(i.trace_id) if i.trace_id else None,
+                ),
+                **run_fields[i.run_id],
+            }
             for i in items
         ]
 

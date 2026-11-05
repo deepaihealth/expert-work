@@ -74,6 +74,21 @@ describe("PassageHistory", () => {
     expect(order).toEqual(["kb-passage-revision-2", "kb-passage-revision-1"]);
   });
 
+  it("names the author by account with the user id on hover (B-241)", async () => {
+    const [parent] = fixturePassages();
+    vi.spyOn(sdk, "listPassageRevisions").mockResolvedValue([
+      HISTORY[0],
+      { ...HISTORY[1], edited_by_name: "Bea" },
+    ]);
+    renderHistory(parent);
+
+    const second = await screen.findByTestId("kb-passage-revision-2");
+    expect(second).toHaveTextContent("Bea 修改");
+    expect(second).not.toHaveTextContent("user-a");
+    await userEvent.hover(within(second).getByTestId("kb-revision-editor"));
+    expect(await screen.findByRole("tooltip")).toHaveTextContent("user-a");
+  });
+
   it("restores an older revision against the revision the passage was read at", async () => {
     const [parent] = fixturePassages();
     const restored = { ...parent, content: "Original.", revision: 3, edited: false };

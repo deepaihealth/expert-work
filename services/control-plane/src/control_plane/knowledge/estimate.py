@@ -11,6 +11,7 @@ descriptions. Nothing here calls a model or names a vendor.
 
 from __future__ import annotations
 
+import asyncio
 import math
 from dataclasses import dataclass
 from datetime import datetime
@@ -30,10 +31,16 @@ from control_plane.knowledge.estimate_counts import (
 )
 from control_plane.knowledge.parsing import FIGURE_OFFICE_EXTENSIONS, is_plain_text_file
 from control_plane.knowledge.pricing import PriceSource, price_tokens, split_model_key
+from control_plane.knowledge.profile import (
+    CALIBRATION_QUERIES,
+    calibration_tokens,
+    profile_token_bounds,
+)
 from control_plane.knowledge.recognition.ingest_parse import LocalParse
 from control_plane.knowledge.recognition.recognizer import (
     DocumentRecognizer,
     RecognitionSettingsSource,
+    source_digest,
 )
 from expert_work.persistence import KnowledgeStore
 from expert_work.persistence.knowledge.base import ClaimedIngestion
@@ -101,6 +108,8 @@ class _Recognition:
     fallback: str | None
     max_pages: int
     configured: bool
+    #: B-238 —— how the usable models read the pages (:meth:`RecognitionPlan.page_readers`).
+    readers: tuple[str, ...] = ()
 
 
 @dataclass
@@ -125,11 +134,16 @@ class IngestEstimator:
         settings: RecognitionSettingsSource | None = None,
         recognizer: DocumentRecognizer | None = None,
         prices: PriceSource | None = None,
+        profile_model: str | None = None,
     ) -> None:
         self._store = store
         self._settings = settings
         self._recognizer = recognizer
         self._prices = prices
+        #: B-267 —— the platform auxiliary model (``provider/model``) the base
+        #: profile is refreshed with once the document is in; ``None`` (the
+        #: platform switch ``kb_first_routing`` off): no profile, no line.
+        self._profile_model = profile_model
 
     @property
     def prices(self) -> PriceSource | None:
@@ -153,11 +167,7 @@ class IngestEstimator:
         )
         scanned = local.kind == "pdf" and local.analysis is not None and local.analysis.ocr_pages
         recognition = await self._recognition(claim) if scanned else None
-        pages = (
-            await self._pages(claim, local, recognition, bytes_unchanged)
-            if recognition is not None
-            else None
-        )
+        pages = await self._pages(claim, local, recognition) if recognition is not None else None
         figure_model, figure_count = await self._figures_of(claim, local, bytes_unchanged)
         embedding = await count_embedding(
             self._store,
@@ -178,6 +188,7 @@ class IngestEstimator:
         await self._embedding_line(
             lines, embedding, embedding_model, page_text + figure_text, claim.chunk_max_tokens
         )
+        await self._profile_lines(lines, embedding_model)
         if any(item.basis is EstimateBasis.DEFAULT_AVERAGE for item in lines.items):
             lines.notes.add(EstimateNote.DEFAULT_AVERAGE)
         if any(not item.priced for item in lines.items):
@@ -188,6 +199,7 @@ class IngestEstimator:
             recognition=recognition.primary if recognition is not None and reads else None,
             fallback=recognition.fallback if recognition is not None and reads else None,
             figure=figure_model if figure_count is not None and figure_count.kept else None,
+            profile=self._profile_model,
         )
         items = tuple(lines.items)
         return IngestEstimate(
@@ -252,23 +264,23 @@ class IngestEstimator:
         claim: ClaimedIngestion,
         local: LocalParse,
         recognition: _Recognition,
-        bytes_unchanged: bool,
     ) -> PageCount | None:
         if local.analysis is None:
             return None
-        previous = (
-            await self._store.list_document_pages(
-                tenant_id=claim.tenant_id, document_id=claim.document_id
+        # B-238 / B-256 —— 已读页的识别在文档缓存里(主 / 兜底模型的都算),只认记了页码、
+        # 来源正是这份字节、读法与这次入库相同的识别:入库也只复用这些(按缓存键查),
+        # 上次入库的逐页记录不看(换了模型 / 提示词版本时它们全部要重新收费)。
+        cached = (
+            await self._store.cached_page_indexes(
+                tenant_id=claim.tenant_id,
+                document_id=claim.document_id,
+                source_sha256=await asyncio.to_thread(source_digest, claim.content),
+                readers=recognition.readers,
             )
-            if bytes_unchanged
-            else None
+            if recognition.readers and claim.content is not None
+            else set()
         )
-        return count_pages(
-            local.analysis,
-            max_pages=recognition.max_pages,
-            previous=previous or [],
-            bytes_unchanged=bytes_unchanged,
-        )
+        return count_pages(local.analysis, max_pages=recognition.max_pages, cached=cached)
 
     async def _recognition(self, claim: ClaimedIngestion) -> _Recognition:
         if self._recognizer is None:
@@ -280,6 +292,7 @@ class IngestEstimator:
             fallback=usable[1] if len(usable) > 1 else None,
             max_pages=plan.max_pages,
             configured=bool(plan.engines),
+            readers=plan.page_readers(),
         )
 
     async def _figures_of(
@@ -421,6 +434,40 @@ class IngestEstimator:
                 basis=EstimateBasis.LOCAL_COUNT if ratio.from_catalog else _basis(ratio),
             )
         )
+
+    async def _profile_lines(self, lines: _Lines, embedding_model: str | None) -> None:
+        """B-267 —— the base profile's one call (at most its bounds) and the
+        probe calibration's generic queries, embedded like a search query.
+        One refresh per base after a batch, counted on every document."""
+        if self._profile_model is None:
+            return
+        input_bound, output_bound = profile_token_bounds()
+        lines.items.append(
+            await self._item(
+                EstimateKind.PROFILE,
+                EstimateUnit.BASES,
+                units=1,
+                reused=0,
+                model=self._profile_model,
+                input_tokens=input_bound,
+                output_tokens=output_bound,
+                basis=EstimateBasis.UPPER_BOUND,
+            )
+        )
+        ratio = _caps_average(embedding_model, "embed_tokens_per_local_token")
+        lines.items.append(
+            await self._item(
+                EstimateKind.PROFILE_CALIBRATION,
+                EstimateUnit.QUERIES,
+                units=len(CALIBRATION_QUERIES),
+                reused=0,
+                model=embedding_model,
+                input_tokens=math.ceil(calibration_tokens() * ratio.value),
+                output_tokens=0,
+                basis=EstimateBasis.LOCAL_COUNT if ratio.from_catalog else _basis(ratio),
+            )
+        )
+        lines.notes.add(EstimateNote.PROFILE_ONCE_PER_BASE)
 
     async def _item(
         self,

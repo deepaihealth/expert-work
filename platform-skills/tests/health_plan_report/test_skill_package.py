@@ -166,3 +166,20 @@ def test_every_doc_reaches_the_agent_whole(root):
     docs = [root / "SKILL.md", *sorted((root / "reference").glob("*.md"))]
     over = {d.name: n for d in docs if (n := len(d.read_text(encoding="utf-8"))) > DOC_CHAR_CEILING}
     assert len(docs) >= 4 and not over, over
+
+
+_PERSONAL_DEFAULT = "report-style/personal.json"
+
+
+def test_personal_default_lives_under_the_agent_root(root):
+    """B-236 —— 每个对话的 ``/workspace`` 是它自己的目录(开场带着 agent 各目录的副本),
+    相对路径的个人默认只改进本对话那份副本、以后的对话读不到。文档里每一处都必须是
+    ``/agent/`` 下的绝对路径。"""
+    docs = [root / "SKILL.md", *sorted((root / "reference").glob("*.md"))]
+    seen = 0
+    for doc in docs:
+        text = doc.read_text(encoding="utf-8")
+        for m in re.finditer(re.escape(_PERSONAL_DEFAULT), text):
+            seen += 1
+            assert text[max(0, m.start() - 7) : m.start()] == "/agent/", (doc.name, m.start())
+    assert seen >= 4

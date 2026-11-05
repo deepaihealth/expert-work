@@ -12,6 +12,7 @@ pin the new admission contract.
 from __future__ import annotations
 
 import json
+import time
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from uuid import UUID, uuid4
@@ -76,7 +77,7 @@ spec:
   tenant_config: {}
   model:
     provider: anthropic
-    name: claude-sonnet-4-5
+    name: claude-sonnet-4-6
   system_prompt:
     template: "x"
   sandbox:
@@ -191,7 +192,7 @@ async def test_create_session_denied_when_quota_exhausted(
     admission_client: AsyncClient,
     audit_store: InMemoryAuditLogStore,
 ) -> None:
-    _, quota_store = app_factory
+    app, quota_store = app_factory
     # Tight QPS: burst=1 → first call consumes, second is denied.
     await quota_store.upsert(
         tenant_id=_TENANT,
@@ -203,6 +204,10 @@ async def test_create_session_denied_when_quota_exhausted(
         ),
         updated_by="test",
     )
+    # Freeze the bucket clock: at 1 QPS a busy CI runner that takes > 1 s between
+    # the two calls would refill the token and let the second one through.
+    frozen = time.monotonic()
+    app.state.quota_service._monotonic = lambda: frozen
 
     first = await admission_client.post(
         "/v1/sessions",

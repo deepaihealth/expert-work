@@ -33,6 +33,7 @@ class InMemoryUserUploadStore(UserUploadStore):
         mime_type: str,
         size_bytes: int,
         filename: str,
+        sha256: str | None = None,
     ) -> UserUpload:
         row = UserUpload(
             id=upload_id,
@@ -46,6 +47,7 @@ class InMemoryUserUploadStore(UserUploadStore):
             filename=filename,
             created_at=datetime.now(UTC),
             deleted_at=None,
+            sha256=sha256,
         )
         self._rows[(tenant_id, upload_id)] = row
         return row
@@ -53,10 +55,36 @@ class InMemoryUserUploadStore(UserUploadStore):
     async def get(self, *, upload_id: UUID, tenant_id: UUID) -> UserUpload | None:
         return self._rows.get((tenant_id, upload_id))
 
+    async def list_documents_for_thread(
+        self, *, tenant_id: UUID, thread_id: UUID
+    ) -> list[UserUpload]:
+        rows = [
+            r
+            for r in self._rows.values()
+            if r.tenant_id == tenant_id
+            and r.thread_id == thread_id
+            and r.kind == "document"
+            and r.deleted_at is None
+        ]
+        rows.sort(key=lambda r: (r.created_at, str(r.id)))
+        return rows
+
     async def list_expired(self, *, before: datetime, limit: int = 1000) -> list[UserUpload]:
         rows = [r for r in self._rows.values() if r.deleted_at is None and r.created_at < before]
         rows.sort(key=lambda r: (r.created_at, str(r.id)))
         return rows[:limit]
+
+    async def list_active_by_ref(
+        self, *, tenant_id: UUID, user_id: UUID, ref: str
+    ) -> list[UserUpload]:
+        return [
+            r
+            for r in self._rows.values()
+            if r.tenant_id == tenant_id
+            and r.user_id == user_id
+            and r.ref == ref
+            and r.deleted_at is None
+        ]
 
     async def soft_delete(self, *, upload_id: UUID, tenant_id: UUID, now: datetime) -> bool:
         row = self._rows.get((tenant_id, upload_id))

@@ -29,6 +29,7 @@ from collections.abc import AsyncIterator
 from contextlib import AsyncExitStack, asynccontextmanager
 from dataclasses import dataclass, replace
 from datetime import timedelta
+from functools import partial
 from pathlib import Path
 from uuid import UUID
 
@@ -135,7 +136,7 @@ from control_plane.auth import (
     MTLSVerifier,
     build_mtls_verifier,
 )
-from control_plane.aux_model_adapter import make_llm_router_aux_model
+from control_plane.aux_model_adapter import LLMRouterAuxModelAdapter, make_llm_router_aux_model
 from control_plane.catalog_seed import CatalogSeedError, load_catalog_seed, seed_catalog
 from control_plane.credential_value_cache import CredentialValueCache
 from control_plane.curation_worker import CurationWorker
@@ -172,6 +173,8 @@ from control_plane.knowledge.estimate import IngestEstimator
 from control_plane.knowledge.ingestion import KnowledgeIngestionRunner, configure_parse_pool
 from control_plane.knowledge.parsed_size import configure_parsed_size, configure_raw_bytes
 from control_plane.knowledge.pricing import RateCardPrices
+from control_plane.knowledge.profile import AuxModelChoice
+from control_plane.knowledge.profile_refresh import ProfileRefresher, ProfileRefreshWorker
 from control_plane.knowledge.recognition.figure_pipeline import (
     FigureDescriber,
     default_figure_client,
@@ -229,6 +232,7 @@ from control_plane.platform_dynamic_worker_config import (
 from control_plane.platform_embedding_config import PlatformEmbeddingConfigService
 from control_plane.platform_judge_config import PlatformJudgeConfigService
 from control_plane.platform_mcp_pool import PlatformMcpPoolService
+from control_plane.platform_migration import PlatformMigration
 from control_plane.platform_quality_config import PlatformQualityConfigService
 from control_plane.platform_recognition_config import PlatformRecognitionConfigService
 from control_plane.platform_secrets import PlatformSecretsService
@@ -255,12 +259,14 @@ from control_plane.runtime import (
     ResolvingProviderKeys,
     _build_mcp_client,
     _resolve_template_extends,
+    build_agent_file_version_store,
     build_artifact_snapshot_store,
     build_mcp_pool,
     build_middleware_env,
     build_sandbox_runtime,
     build_tool_env,
     build_workspace_store,
+    live_embedding_key,
     make_agent_builder,
     make_agent_runtime,
     make_image_resolver,
@@ -294,7 +300,7 @@ from control_plane.transcript_mirror_sweep import TranscriptMirrorSweep
 from control_plane.user_mcp_oauth_pool import UserMcpOAuthPoolService
 from control_plane.webhook_delivery_worker import WebhookDeliveryWorker
 from control_plane.workspace_janitor import WorkspaceJanitorWorker
-from control_plane.workspace_lock import PgWorkspaceLock
+from control_plane.workspace_lock import PgConversationSeedLock, PgWorkspaceLock
 from control_plane.workspace_quota import WorkspaceQuotaService
 from expert_work.common.credentials import CredentialsResolver
 from expert_work.common.health import DefaultHealthProvider
@@ -590,6 +596,8 @@ from orchestrator.tools import (
     HTTPSupervisorRuntime,
     SupervisorWorkspaceStore,
 )
+from orchestrator.tools.locks import ProcessKeyedLock
+from orchestrator.tools.nas_workspace_store import NasWorkspaceStore
 from orchestrator.trajectory import TrajectoryReader
 
 __all__ = ["create_app"]
@@ -866,6 +874,10 @@ def create_app(
     # control-plane(只有它能 import ``transcript.extract_turns``,对外消息
     # 端点的同一口径),orchestrator 那侧只有 Protocol,这里注入。
     resolved_agent_runtime.thread_stats_recorder = ThreadStatsRecorderImpl(threads=resolved_threads)
+    # B-236 第三层 —— /agent 文件的版本放在 NAS 上用户根旁边;只有 NAS 后端有。
+    resolved_agent_runtime.agent_file_versions = build_agent_file_version_store(
+        resolved_workspace_store
+    )
     # Late-bound PII resolver: lets the audit logger reference
     # tenant_config without forcing it to exist yet (D.2 cycle break).
     pii_resolver = TenantConfigPiiResolver()
@@ -1495,6 +1507,25 @@ def create_app(
                 # endpoint can read a thread's checkpoint directly (no agent
                 # rebuild). Same instance bound into ``agent_builder`` below.
                 resolved_agent_runtime.durable_checkpointer = checkpointer
+                # B-262 P3 —— 老对话在下一次新 run 开始前迁到对话视图。宿主侧复制,只有 NAS
+                # 工作区有;锁与开场复制同一个 classid、同一个键(按对话)。
+                if isinstance(resolved_workspace_store, NasWorkspaceStore):
+                    resolved_agent_runtime.platform_migration = PlatformMigration(
+                        workspace_store=resolved_workspace_store,
+                        lock=(
+                            PgConversationSeedLock(create_async_session_factory(sql_stores.engine))
+                            if sql_stores is not None
+                            else ProcessKeyedLock()
+                        ),
+                        threads=resolved_threads,
+                        uploads=resolved_user_upload_store,
+                        # 落库的 run 表(不是 RunManager 的进程内登记:重启 / 别的副本起的
+                        # run 不在那里)。没有落库(无库部署)就不搬 .tool_results(滤不掉
+                        # 别的会话的 run)。
+                        runs=resolved_agent_runtime.run_manager.store,
+                        audit_store=sql_stores.audit_log if sql_stores is not None else None,
+                        checkpointer=checkpointer,
+                    )
                 # Stream O Mini-ADR O-9/O-10 — one CredentialsResolver over
                 # the effective (legacy-derived) catalog. The web_search /
                 # embedder / reranker callers and the consolidator aux model
@@ -1582,6 +1613,10 @@ def create_app(
                     store=resolved_tenant_mcp_server_store,
                     secret_store=resolved_secret_store,
                     client_factory=_tenant_mcp_client_factory,
+                    # B-248 — a pool retired by its TTL takes the builds
+                    # holding its clients with it (local: each replica's pool
+                    # has its own clock, so nothing is broadcast).
+                    on_expire=resolved_agent_runtime.invalidate_tenant,
                 )
                 stack.push_async_callback(tenant_mcp_pool_service.close_all)
                 _app.state.tenant_mcp_pool_service = tenant_mcp_pool_service
@@ -1596,6 +1631,7 @@ def create_app(
                 platform_mcp_pool_service = PlatformMcpPoolService(
                     store=resolved_mcp_connector_catalog_store,
                     client_factory=_tenant_mcp_client_factory,
+                    on_expire=resolved_agent_runtime.invalidate_all,  # B-248, as above
                 )
                 stack.push_async_callback(platform_mcp_pool_service.close_all)
                 _app.state.platform_mcp_pool_service = platform_mcp_pool_service
@@ -1661,6 +1697,7 @@ def create_app(
                     catalog_store=resolved_mcp_connector_catalog_store,
                     client_factory=_tenant_mcp_client_factory,
                     refresher=mcp_oauth_refresher,
+                    on_expire=resolved_agent_runtime.invalidate_user,  # B-248, as above
                 )
                 stack.push_async_callback(user_mcp_oauth_pool_service.close_all)
                 _app.state.user_mcp_oauth_pool_service = user_mcp_oauth_pool_service
@@ -1845,6 +1882,20 @@ def create_app(
                         PgWorkspaceLock(create_async_session_factory(sql_stores.engine))
                         if sql_stores is not None
                         else None
+                    ),
+                    # B-236 —— 对话开场复制按对话互斥(独立 classid,不是上面那把按用户的锁)。
+                    conversation_seed_lock=(
+                        PgConversationSeedLock(create_async_session_factory(sql_stores.engine))
+                        if sql_stores is not None
+                        else None
+                    ),
+                    workspace_quota=resolved_workspace_quota,
+                    # B-267 —— 「先查知识库」总开关 + web_search 固定结果夹具目录。
+                    kb_first_routing=resolved_settings.kb_first_routing,
+                    web_search_fixtures_dir=resolved_settings.web_search_fixtures_dir,
+                    # B-267 —— 每轮探测只在校准、库向量、此刻查询同一个嵌入模型时用向量。
+                    embedding_model_key=partial(
+                        live_embedding_key, resolved_platform_embedding_config_service
                     ),
                 )
                 # Stream HX-7 — resolve the Langfuse client once: the
@@ -2100,6 +2151,8 @@ def create_app(
                 # B-175 P4 — the knowledge catalog's fingerprint joins the build
                 # cache key; read from the store the builds read it from.
                 resolved_agent_runtime.knowledge_store = resolved_knowledge_store
+                # B-267 —— 同一个开关决定单个库有没有目录,缓存键要与构建读得一致。
+                resolved_agent_runtime.kb_first_routing = resolved_settings.kb_first_routing
                 # Stream T (PR B) — these background workers (ingestion runner,
                 # DLQ worker, consolidator) are ALWAYS started. ``embedder`` is a
                 # ``DynamicResolvingEmbedder`` that resolves the live platform
@@ -2188,11 +2241,44 @@ def create_app(
                     _app.state.knowledge_figure_reconciler = figure_reconciler
                 # B-222 PR-2 — ingests are estimated (no model called) with the
                 # same models, and what they cost priced, by the rate card.
+                # B-267 —— base profiles (platform switch ``kb_first_routing``):
+                # one call of the platform's auxiliary model per base refresh,
+                # billed to the tenant like the ingest and shown in the estimate
+                # the user confirms; the probe calibration rides along. Off: no
+                # estimate line, no refresh, nothing spent.
+                profile_aux = AuxModelChoice(
+                    provider=resolved_settings.memory_consolidator_default_aux_provider,
+                    model=resolved_settings.memory_consolidator_default_aux_model,
+                )
+                profile_refresher = (
+                    ProfileRefresher(
+                        store=resolved_knowledge_store,
+                        # The adapter itself (not the consolidator protocol):
+                        # the profile call passes an output cap.
+                        aux=LLMRouterAuxModelAdapter(
+                            resolver=credentials_resolver,
+                            secret_store=resolved_secret_store,
+                            default_provider=resolved_settings.memory_consolidator_default_aux_provider,
+                            default_model=profile_aux.model,
+                            secret_cache=credential_value_cache,
+                            rate_limiter_factory=llm_rate_limiter_factory,
+                        ),
+                        aux_model=profile_aux,
+                        embedder=embedder,
+                        embedding_config=(
+                            resolved_platform_embedding_config_service.effective_embedding_config
+                        ),
+                        usage=ingest_usage,
+                    )
+                    if resolved_settings.kb_first_routing
+                    else None
+                )
                 knowledge_estimator = IngestEstimator(
                     store=resolved_knowledge_store,
                     settings=resolved_platform_recognition_config_service,
                     recognizer=document_recognizer,
                     prices=RateCardPrices(resolved_model_rate_card_store),
+                    profile_model=profile_aux.key if profile_refresher is not None else None,
                 )
                 knowledge_runner = KnowledgeIngestionRunner(
                     store=resolved_knowledge_store,
@@ -2204,6 +2290,7 @@ def create_app(
                     usage=ingest_usage,
                     figures=figure_describer,
                     estimator=knowledge_estimator,
+                    profile_refresh=profile_refresher is not None,
                 )
                 _app.state.knowledge_ingestion_runner = knowledge_runner
                 # Stream KB — durable crash recovery for ingestion: claims stuck
@@ -2228,9 +2315,21 @@ def create_app(
                         # figures removed.
                         audit=resolved_audit,
                         object_store=getattr(_app.state, "object_store", None),
+                        profile_refresh=profile_refresher is not None,
                     )
                     knowledge_recovery_worker.start()
                     _app.state.knowledge_recovery_worker = knowledge_recovery_worker
+                # B-267 —— base-profile refreshes run in their own loop (switch on).
+                if (
+                    profile_refresher is not None
+                    and resolved_settings.enable_knowledge_recovery_worker
+                ):
+                    profile_refresh_worker = ProfileRefreshWorker(
+                        refresher=profile_refresher,
+                        interval_s=resolved_settings.knowledge_recovery_interval_s,
+                    )
+                    profile_refresh_worker.start()
+                    _app.state.knowledge_profile_refresh_worker = profile_refresh_worker
             if reaper is not None:
                 reaper.start()
             if scheduler is not None:
@@ -2668,6 +2767,11 @@ def create_app(
                 )
                 if knowledge_recovery is not None:
                     await knowledge_recovery.stop()
+                profile_refresh_running: ProfileRefreshWorker | None = getattr(
+                    _app.state, "knowledge_profile_refresh_worker", None
+                )
+                if profile_refresh_running is not None:
+                    await profile_refresh_running.stop()
                 figure_reconciler_running: FigureReconciler | None = getattr(
                     _app.state, "knowledge_figure_reconciler", None
                 )
@@ -2777,9 +2881,13 @@ def create_app(
     # The ingestion recovery worker is built + started in the lifespan; this is
     # the pre-lifespan default so ``getattr`` lookups are well-defined.
     app.state.knowledge_recovery_worker = None
+    # B-267 —— the base-profile refresh loop (lifespan, switch on).
+    app.state.knowledge_profile_refresh_worker = None
     app.state.sandbox_runtime = resolved_sandbox_runtime
     app.state.workspace_store = resolved_workspace_store
     app.state.artifact_snapshots = resolved_artifact_snapshots
+    # B-236 第三层 —— 清除用户时连同 /agent 文件的历史版本一起删(``purge_user``)。
+    app.state.agent_file_versions = resolved_agent_runtime.agent_file_versions
     app.state.audit_logger = resolved_audit
     app.state.manifest_loader = resolved_loader
     app.state.jwt_verifier = resolved_verifier

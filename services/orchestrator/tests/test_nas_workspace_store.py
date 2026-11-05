@@ -13,6 +13,7 @@ mock 掉文件系统就等于没测。行为契约对照 ``sandbox_supervisor.su
 
 from __future__ import annotations
 
+import errno
 import os
 import stat
 from dataclasses import dataclass, field
@@ -32,8 +33,10 @@ from orchestrator.tools.sandbox import (
     RecordingSandboxRuntime,
     SandboxSupervisorError,
     WorkspaceFileTooLargeError,
+    WorkspacePathEscapeError,
     WorkspacePermissionError,
 )
+from orchestrator.tools.workspace_scope import agent_scope
 from orchestrator.tools.workspace_store import WorkspaceStore
 
 
@@ -486,16 +489,15 @@ async def test_list_files_reports_permission_denied_for_a_single_unstattable_ent
     tenant_id, user_id = uuid4(), uuid4()
     store = _store(tmp_path)
     await store.write_file(tenant_id=tenant_id, user_id=user_id, path="a.txt", data=b"x")
-    user_root = tmp_path / str(tenant_id) / str(user_id)
-    target = user_root / "a.txt"
-    real_lstat = Path.lstat
+    real_lstat = os.lstat
 
-    def _fake_lstat(self: Path, *args: Any, **kwargs: Any) -> os.stat_result:
-        if self == target:
+    def _fake_lstat(path: Any, *args: Any, **kwargs: Any) -> os.stat_result:
+        # list_files lstats each entry by name relative to the walk's dir fd.
+        if path == "a.txt" and kwargs.get("dir_fd") is not None:
             raise PermissionError(13, "Permission denied")
-        return real_lstat(self, *args, **kwargs)
+        return real_lstat(path, *args, **kwargs)
 
-    monkeypatch.setattr(Path, "lstat", _fake_lstat)
+    monkeypatch.setattr(os, "lstat", _fake_lstat)
 
     with pytest.raises(WorkspacePermissionError) as excinfo:
         await store.list_files(tenant_id=tenant_id, user_id=user_id)
@@ -556,6 +558,152 @@ async def test_an_agent_written_marker_filename_does_not_soft_delete_anything(
     assert not (tmp_path / str(tenant_id) / DELETED_DIR).exists()
     # 同理,删它也不再被拒 —— 它就是个名字奇怪的普通文件。
     await store.delete_file(tenant_id=tenant_id, user_id=user_id, path=".ew-workspace-deleted")
+
+
+async def test_list_files_does_not_follow_a_directory_swapped_for_a_symlink_mid_walk(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A payload can keep swapping a directory in its own workspace for a symlink.
+
+    The swap lands after the walk has decided ``zz`` is a real directory and before
+    it lists ``zz``. A path-based walk then re-resolves ``.../zz`` and follows the
+    symlink. With the symlink pointing at ``../..``-style targets, that is the whole
+    NAS volume, so other tenants' file names show up in this user's listing (the
+    per-turn workspace block, the external ``/v1`` listing, the console). The swap
+    is simulated deterministically, at the moment the walk asks to list ``zz``.
+    """
+    tenant_id, user_id = uuid4(), uuid4()
+    store = _store(tmp_path)
+    await store.write_file(tenant_id=tenant_id, user_id=user_id, path="zz/mine.txt", data=b"x")
+    other_tenant = tmp_path / "other-tenant"
+    other_tenant.mkdir()
+    (other_tenant / "other-tenant-secret.txt").write_text("y")
+    zz = tmp_path / str(tenant_id) / str(user_id) / "zz"
+    zz_ino = zz.stat().st_ino
+    real_scandir = os.scandir
+    swapped: list[bool] = []
+
+    def _scandir_then_swap(arg: Any = ".") -> Any:
+        # A fd-pinned walk hands over the fd it already opened (and checked); a
+        # path-based walk hands over the name, which still resolves to ``zz``.
+        target = os.fstat(arg) if isinstance(arg, int) else os.stat(arg)
+        if not swapped and target.st_ino == zz_ino:
+            swapped.append(True)
+            _swap_dir_for_symlink(zz, other_tenant)
+        return real_scandir(arg)
+
+    monkeypatch.setattr(os, "scandir", _scandir_then_swap)
+
+    files = await store.list_files(tenant_id=tenant_id, user_id=user_id)
+
+    assert swapped, "the swap never happened, so this test proved nothing"
+    assert not any("other-tenant-secret" in f.path for f in files), [f.path for f in files]
+
+
+async def test_list_files_does_not_follow_a_directory_swapped_between_lstat_and_open(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The other half of the race: the swap lands right after the walk ``lstat``-ed ``zz``
+    (a real directory then) and before it opens it. Only the inode comparison after the
+    open catches this one; a walk that follows symlinks or skips the comparison lists
+    the other tenant's files.
+    """
+    tenant_id, user_id = uuid4(), uuid4()
+    store = _store(tmp_path)
+    await store.write_file(tenant_id=tenant_id, user_id=user_id, path="zz/mine.txt", data=b"x")
+    other_tenant = tmp_path / "other-tenant"
+    other_tenant.mkdir()
+    (other_tenant / "other-tenant-secret.txt").write_text("y")
+    zz = tmp_path / str(tenant_id) / str(user_id) / "zz"
+    real_stat = os.stat
+    swapped: list[bool] = []
+
+    def _stat_then_swap(path: Any, *args: Any, **kwargs: Any) -> os.stat_result:
+        result = real_stat(path, *args, **kwargs)
+        if (
+            not swapped
+            and path == "zz"
+            and kwargs.get("dir_fd") is not None
+            and kwargs.get("follow_symlinks") is False
+        ):
+            swapped.append(True)
+            _swap_dir_for_symlink(zz, other_tenant)
+        return result
+
+    monkeypatch.setattr(os, "stat", _stat_then_swap)
+
+    files = await store.list_files(tenant_id=tenant_id, user_id=user_id)
+
+    assert swapped, "the swap never happened, so this test proved nothing"
+    assert not any("other-tenant-secret" in f.path for f in files), [f.path for f in files]
+
+
+async def test_list_files_refuses_a_scope_root_that_is_a_symlink(tmp_path: Path) -> None:
+    """A payload with the whole user root as its workspace (an unbound agent) can replace
+    ``agents/<key>`` with a symlink. Listing that agent's scope must not follow it: the old
+    path-based walk listed whatever it pointed at, with no race needed.
+    """
+    tenant_id, user_id = uuid4(), uuid4()
+    store = _store(tmp_path)
+    await store.write_file(
+        tenant_id=tenant_id, user_id=user_id, path="agents/k1/mine.txt", data=b"x"
+    )
+    other_tenant = tmp_path / "other-tenant"
+    other_tenant.mkdir()
+    (other_tenant / "other-tenant-secret.txt").write_text("y")
+    _swap_dir_for_symlink(tmp_path / str(tenant_id) / str(user_id) / "agents" / "k1", other_tenant)
+
+    with pytest.raises(WorkspacePathEscapeError):
+        await store.list_files(tenant_id=tenant_id, user_id=user_id, scope=agent_scope("k1"))
+    files = await store.list_files(tenant_id=tenant_id, user_id=user_id)
+    assert not any("other-tenant-secret" in f.path for f in files), [f.path for f in files]
+
+
+async def test_list_files_reports_a_directory_vanishing_mid_walk_as_a_listing_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """On NFS a directory removed while it is being listed fails with ESTALE. Callers only
+    handle ``SandboxSupervisorError`` (and its permission subclass); a bare ``OSError`` would
+    surface as an unhandled 500 on the console and ``/v1`` listings.
+    """
+    tenant_id, user_id = uuid4(), uuid4()
+    store = _store(tmp_path)
+    await store.write_file(tenant_id=tenant_id, user_id=user_id, path="sub/a.txt", data=b"x")
+    sub_ino = (tmp_path / str(tenant_id) / str(user_id) / "sub").stat().st_ino
+    real_scandir = os.scandir
+
+    def _stale_scandir(arg: Any = ".") -> Any:
+        if isinstance(arg, int) and os.fstat(arg).st_ino == sub_ino:
+            raise OSError(errno.ESTALE, os.strerror(errno.ESTALE))
+        return real_scandir(arg)
+
+    monkeypatch.setattr(os, "scandir", _stale_scandir)
+
+    with pytest.raises(SandboxSupervisorError) as excinfo:
+        await store.list_files(tenant_id=tenant_id, user_id=user_id)
+    assert str(tmp_path) not in str(excinfo.value)
+
+
+async def test_search_files_reports_a_directory_vanishing_mid_walk_as_a_search_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Same ESTALE shape as the list_files test above, through ``search_files``."""
+    tenant_id, user_id = uuid4(), uuid4()
+    store = _store(tmp_path)
+    await store.write_file(tenant_id=tenant_id, user_id=user_id, path="sub/a.txt", data=b"x")
+    sub_ino = (tmp_path / str(tenant_id) / str(user_id) / "sub").stat().st_ino
+    real_scandir = os.scandir
+
+    def _stale_scandir(arg: Any = ".") -> Any:
+        if isinstance(arg, int) and os.fstat(arg).st_ino == sub_ino:
+            raise OSError(errno.ESTALE, os.strerror(errno.ESTALE))
+        return real_scandir(arg)
+
+    monkeypatch.setattr(os, "scandir", _stale_scandir)
+
+    with pytest.raises(SandboxSupervisorError) as excinfo:
+        await store.search_files(tenant_id=tenant_id, user_id=user_id, name_glob="*")
+    assert str(tmp_path) not in str(excinfo.value)
 
 
 async def test_list_files_does_not_hide_a_file_named_like_the_legacy_marker(
@@ -691,9 +839,8 @@ async def test_user_root_mkdir_permission_failure_is_a_workspace_permission_erro
 # ---------------------------------- 复审 C-1:用户根**自己**(不是子目录/子树)不可穿透
 #
 # 这是 read_file/write_file/delete_file 三个方法在 _open_parent_dir_fd 里共用的入口
-# (list_files 走独立的 os.stat/os.walk,从不调用这个方法——上一版这里写"四个方法"
-# 是错的,list_files 那条测试补在这里纯粹是为了四个方法在这个形状上对称覆盖,不是
-# 因为它真的经过这段代码,见复审 N-4)——落到这里之前 create=False 的
+# (list_files 改成 fd 遍历之后也从 _open_user_root_fd 起步, 见下面那条 list_files
+# 测试)——落到这里之前 create=False 的
 # read_file/delete_file 完全没碰过上面的 mkdir 分支,是它们第一次、也是唯一一次触
 # 到 user_root。之前这句只接 `except OSError`,把 PermissionError 也收成
 # _WorkspacePathNotFoundError:read/write 端点翻 404("文件不存在",而它其实读不
@@ -772,17 +919,10 @@ async def test_delete_file_reports_permission_denied_when_user_root_itself_is_un
 async def test_list_files_reports_permission_denied_when_user_root_itself_is_unreadable(
     tmp_path: Path,
 ) -> None:
-    """复审 N-4,纠正上一版这里的错误说法—— list_files **不是**靠独立的
-    ``os.stat(user_root)`` 分支答对这条。``os.stat`` 只需要祖先目录的搜索
-    权限,对**目标自己**的权限位从不敏感——``user_root`` 是 ``0o000`` 时
-    ``os.stat(user_root)`` 照样成功(实测坐实),is-dir 检查那半句压根不会
-    抛。真正命中的是 ``os.walk`` 对 ``user_root`` 自己的首次 scandir——这一
-    步才需要目标目录本身的搜索权限,失败会喂给 ``onerror=_on_walk_error``,
-    与 ``test_list_files_reports_permission_denied_for_unreadable_subtree``
-    是**同一个**机制,只是这条在 walk 的第 0 层(根自己)触发,那条在第 1
-    层(``sub`` 子目录)触发。留着两条是为了跟本节其它三个方法
-    (read/write/delete)在"用户根自己不可穿透"这个形状上对称覆盖,不是因
-    为 list_files 这里真的走了一条独立代码路径。
+    """``os.stat(user_root)`` 只需要祖先目录的搜索权限, ``user_root`` 是
+    ``0o000`` 时照样成功, is-dir 检查那半句不会抛。真正命中的是随后按 fd 打开
+    作用域起点(``_open_user_root_fd``, 与本节其它三个方法同一个入口)——这一
+    步需要目标目录本身的权限。
     """
     tenant_id, user_id = uuid4(), uuid4()
     store = _store(tmp_path)

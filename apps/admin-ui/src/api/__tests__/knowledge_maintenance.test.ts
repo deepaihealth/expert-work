@@ -121,8 +121,8 @@ describe("knowledge maintenance SDK — requests", () => {
     ]);
   });
 
-  it("discards unapplied edits and answers how many rows went", async () => {
-    const calls = captureAdapter({ discarded: 2 });
+  it("discards unapplied edits and answers how many entries went (not revision rows)", async () => {
+    const calls = captureAdapter({ discarded: 2, revisions_deleted: 9 });
     expect(await discardUnappliedEdits("kb 1", "d1")).toBe(2);
     expect(calls[0]).toMatchObject({ method: "DELETE", url: `${DOC}/unapplied-edits` });
   });

@@ -296,6 +296,8 @@ class ExternalClient:
         return resp.content
 
     async def read_workspace_file(self, agent: str, user_id: str, path: str) -> bytes | None:
+        """``path`` 相对 agent 根(对话里写的文件在 ``threads/<会话 id>/work/`` 底下,由调用方
+        拼好,见 ``behavior_runner.read_session_file``)。"""
         resp = await self._http.get(
             f"/v1/agents/{agent}/workspace/file", params={"user_id": user_id, "path": path}
         )

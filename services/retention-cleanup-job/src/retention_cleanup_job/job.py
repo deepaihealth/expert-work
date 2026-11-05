@@ -23,8 +23,8 @@ NOLOGIN BYPASSRLS with the minimum delete grants).
 
 * B-28 ``_sweep_artifact_versions`` —— ``artifact_version.created_at`` 满 90 天:
   删 NAS 文件 + 删版本行;版本清空的 ``artifact`` 行标过期(复用 ``deleted_at``)。
-* 上传 ``_sweep_uploads`` —— ``user_upload.created_at`` 满 90 天:删 ``uploads/<file>``
-  + 标 ``deleted_at``。
+* 上传 ``_sweep_uploads`` —— ``user_upload.created_at`` 满 90 天:按会话当前的 agent / 布局
+  删 ``[agents/<key>/][threads/<会话>/work/]uploads/<file>``(B-271)+ 标 ``deleted_at``。
 * B-27 ``_sweep_orphan_thread_dirs`` —— ``threads/<thread_id>/`` 的 thread 行不存在
   → 删目录。**不按时间删活会话的目录**。
 * X-4 ② ``_sweep_workspaces`` —— 软删且已归档满 90 天的 ``user_workspace`` 行连
@@ -50,6 +50,7 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from expert_work.persistence.artifact import ArtifactStore
+from expert_work.persistence.audit_log import AuditLogStore
 from expert_work.persistence.image_upload import ImageUploadStore
 from expert_work.persistence.knowledge import KnowledgeRetrievalLogStore
 from expert_work.persistence.memory import MemoryStore
@@ -58,7 +59,6 @@ from expert_work.persistence.tenant_user import TenantUserStore
 from expert_work.persistence.thread_meta import ThreadMetaStore
 from expert_work.persistence.user_upload import UserUploadStore
 from expert_work.persistence.workspace import UserWorkspaceStore
-from expert_work.persistence.workspace.layout import WORKSPACE_UPLOADS_DIR
 from expert_work.protocol import (
     ArtifactVersion,
     AuditAction,
@@ -70,6 +70,7 @@ from expert_work.runtime.runs.store import RunStore
 from expert_work.runtime.storage import ObjectStore
 from retention_cleanup_job.artifact_copies import (
     release_version_files,
+    remove_user_agent_file_versions,
     remove_user_copies,
     sweep_orphan_copies,
 )
@@ -79,10 +80,7 @@ from retention_cleanup_job.orphan_threads import (
     sweep_orphan_tool_results,
 )
 from retention_cleanup_job.report import CleanupReport
-from retention_cleanup_job.workspace_files import (
-    UnsafeWorkspacePathError,
-    unlink_registered_file,
-)
+from retention_cleanup_job.uploads import UploadSweep, UploadSweepTally
 
 logger = logging.getLogger(__name__)
 
@@ -154,6 +152,7 @@ class RetentionCleanupJob:
         run_store: RunStore | None = None,
         workspace_root: str | None = None,
         audit_logger: AuditLogger | None = None,
+        audit_log_store: AuditLogStore | None = None,
     ) -> None:
         if batch_size <= 0:
             msg = "batch_size must be positive"
@@ -220,6 +219,10 @@ class RetentionCleanupJob:
         self._run_store = run_store
         self._workspace_root = workspace_root
         self._audit_logger = audit_logger
+        #: B-271 —— 只读:给没有 sha256 的老上传行从 ``DOCUMENT_UPLOAD`` 审计行补 sha256。
+        self._audit_log_store = audit_log_store
+        #: 吞掉异常继续跑的 pass 失败时记在这里(``run_once`` 开头清空),进 ``CleanupReport``。
+        self._failed_passes: list[str] = []
 
     async def run_once(self) -> CleanupReport:
         """Run the retention passes once and return a tally.
@@ -239,6 +242,10 @@ class RetentionCleanupJob:
         """
         started = time.monotonic()
         with _bypass_rls():
+            # B-271 —— 上传 pass 排在审计删除之前:老上传行要从登记时的 ``DOCUMENT_UPLOAD``
+            # 审计行补 sha256,而那条审计与上传同一天满默认 90 天,先删审计就读不到了。
+            self._failed_passes = []
+            uploads = await self._sweep_uploads()
             audit_deleted, audit_by_tenant = await self._delete_audit_log()
             audit_skipped = await self._count_unacked_past_retention()
             event_deleted = await self._delete_event_log()
@@ -258,7 +265,6 @@ class RetentionCleanupJob:
             ) = await self._sweep_artifact_versions()
             artifact_soft, artifact_hard = await self._sweep_artifacts()
             orphan_artifact_copies_removed = await self._sweep_orphan_artifact_copies()
-            uploads_expired, upload_files_removed = await self._sweep_uploads()
             thread_dirs_removed = await self._sweep_orphan_thread_dirs()
             tool_result_dirs_removed = await self._sweep_orphan_tool_results()
             memory_hard_deleted = await self._sweep_memory()
@@ -280,8 +286,14 @@ class RetentionCleanupJob:
             artifact_files_removed=artifact_files_removed,
             artifacts_expired=artifacts_expired,
             orphan_artifact_copies_removed=orphan_artifact_copies_removed,
-            uploads_expired=uploads_expired,
-            upload_files_removed=upload_files_removed,
+            uploads_expired=uploads.marked,
+            upload_files_removed=uploads.files_removed,
+            upload_files_unsafe=uploads.files_unsafe,
+            upload_rows_failed=uploads.rows_failed,
+            upload_rows_abandoned=uploads.rows_abandoned,
+            upload_rows_held=uploads.rows_held,
+            upload_owners_unavailable=uploads.owners_unavailable,
+            failed_passes=tuple(self._failed_passes),
             thread_dirs_removed=thread_dirs_removed,
             tool_result_dirs_removed=tool_result_dirs_removed,
             memory_hard_deleted=memory_hard_deleted,
@@ -373,7 +385,7 @@ class RetentionCleanupJob:
                 dependents_failed.append("artifact")
                 logger.exception("retention.workspace_dependents_failed store=artifact")
             # B-235 —— 产物各版本的副本住在用户根旁边,工作区归档 / rmtree 碰不到,这里删。
-            copies_removed = 0
+            copies_removed = versions_removed = 0
             if self._workspace_root is not None:
                 try:
                     copies_removed = await asyncio.to_thread(
@@ -382,6 +394,19 @@ class RetentionCleanupJob:
                 except Exception:
                     dependents_failed.append("artifact_copy")
                     logger.exception("retention.workspace_dependents_failed store=artifact_copy")
+                # B-236 —— /agent 文件的历史版本同样住在用户根旁边。
+                try:
+                    versions_removed = await asyncio.to_thread(
+                        remove_user_agent_file_versions,
+                        self._workspace_root,
+                        ws.tenant_id,
+                        ws.user_id,
+                    )
+                except Exception:
+                    dependents_failed.append("agent_file_version")
+                    logger.exception(
+                        "retention.workspace_dependents_failed store=agent_file_version"
+                    )
             try:
                 if self._user_upload_store is not None:
                     uploads_deleted = await self._user_upload_store.delete_all_for_user(
@@ -402,6 +427,7 @@ class RetentionCleanupJob:
                     "archive_object": "left to bucket lifecycle",
                     "artifacts_deleted": artifacts_deleted,
                     "artifact_copies_removed": copies_removed,
+                    "agent_file_versions_removed": versions_removed,
                     "uploads_deleted": uploads_deleted,
                     "dependents_failed": dependents_failed,
                 },
@@ -543,49 +569,48 @@ class RetentionCleanupJob:
         hard_count = await self._artifact_store.hard_delete(artifact_ids=hard_ids)
         return soft_count, hard_count
 
-    async def _sweep_uploads(self) -> tuple[int, int]:
-        """留存链 —— 上传 90 天。
+    async def _sweep_uploads(self) -> UploadSweepTally:
+        """留存链 —— 上传 90 天;规则本体在 :class:`retention_cleanup_job.uploads.UploadSweep`
+        (B-271:按会话当前的 agent / 布局删真实位置上的文件,引用检查、改动保护、不安全路径)。
 
-        ``user_upload.created_at < now - upload_retention_days`` 且未软删的行:
-        ``ref`` 是工作区相对路径(``uploads/<file>``,文档类)→ unlink 那个文件;
-        图片类的 ``ref`` 是 ``expert_work://image/…`` 对象存储 URI,字节归
-        ``image_upload`` 自己的 90 天 pass,这里不碰。两类都标 ``deleted_at``
-        (对外 GET 从此 404,复用既有语义)。文件删不掉 → 行不标,明天再试。
+        ``user_upload.created_at < now - upload_retention_days`` 且未软删的行,文档类删文件、
+        两类都标 ``deleted_at``(对外 GET 从此 404,复用既有语义)。只管有登记行的上传:控制台
+        上传与跨会话引用复制(copy-on-attach)不建 ``user_upload`` 行,这里永远看不到它们
+        (B-271 不改,另立)。
 
-        Returns ``(rows_marked, files_removed)``。No-op when
-        :class:`UserUploadStore` or ``workspace_root`` is missing.
+        Returns the :class:`UploadSweepTally`。No-op when :class:`UserUploadStore`,
+        :class:`ThreadMetaStore` or ``workspace_root`` is missing —— 没有会话就算不出文件在哪,
+        只标行不删文件等于留下永久孤儿。这一 pass 整体失败(列行 / 预取会话出错 / 工作区根打不开)
+        记日志、记进 ``failed_passes``(进程最后以非 0 退出),后面的 pass 照跑。
         """
-        if self._user_upload_store is None or self._workspace_root is None:
-            return 0, 0
+        if (
+            self._user_upload_store is None
+            or self._thread_store is None
+            or self._workspace_root is None
+        ):
+            return UploadSweepTally()
         now = datetime.now(UTC)
         cutoff = now - timedelta(days=self._upload_retention_days)
-        expired = await self._user_upload_store.list_expired(before=cutoff, limit=self._batch_size)
-        marked = files_removed = 0
-        for row in expired:
-            # 两种 ``ref`` 形态,两种字节归属(见 protocol.UserUpload.ref):
-            # * 文档类:工作区相对路径 ``uploads/<file>`` —— 字节在 NAS,这里
-            #   unlink;删不掉就整行跳过(不标),明天再试,绝不留孤儿文件。
-            # * 图片类:``expert_work://image/…`` 对象存储 URI —— 字节在 OSS,
-            #   归 ``image_upload`` 自己的 90 天 pass(需要 OSS 凭据),这里不碰;
-            #   行照样标 ``deleted_at``,对外 GET 与文档类同一天起 404。
-            if row.ref.startswith(f"{WORKSPACE_UPLOADS_DIR}/"):
-                try:
-                    removed = await asyncio.to_thread(
-                        unlink_registered_file,
-                        self._workspace_root,
-                        row.tenant_id,
-                        row.user_id,
-                        row.ref,
-                    )
-                except (OSError, UnsafeWorkspacePathError):
-                    logger.exception("retention.upload_file_unlink_failed upload_id=%s", row.id)
-                    continue
-                files_removed += int(removed)
-            if await self._user_upload_store.soft_delete(
-                upload_id=row.id, tenant_id=row.tenant_id, now=now
-            ):
-                marked += 1
-        return marked, files_removed
+        sweep = UploadSweep(
+            uploads=self._user_upload_store,
+            threads=self._thread_store,
+            root=self._workspace_root,
+            audit=self._audit_log_store,
+        )
+        try:
+            expired = await self._user_upload_store.list_expired(
+                before=cutoff, limit=self._batch_size
+            )
+            tally = await sweep.run(expired, cutoff=cutoff, now=now)
+        except Exception:
+            logger.exception("retention.upload_sweep_failed")
+            self._failed_passes.append("uploads")
+            return sweep.tally  # 中止之前已经做了的照样计数
+        if tally.needs_attention:
+            # 有行被放弃(过期太久还在失败)、被熔断拦下,或有用户的目录打不开:进程以非 0
+            # 退出,让人去看。
+            self._failed_passes.append("uploads")
+        return tally
 
     async def _sweep_orphan_thread_dirs(self) -> int:
         """留存链 B-27 —— 孤儿 ``threads/<thread_id>/`` 目录;规则本体在
@@ -615,6 +640,7 @@ class RetentionCleanupJob:
             return await sweep_orphan_copies(self._workspace_root, self._artifact_store)
         except Exception:
             logger.exception("retention.orphan_artifact_copies_failed")
+            self._failed_passes.append("orphan_artifact_copies")
             return 0
 
     async def _audit(

@@ -143,16 +143,16 @@ def _ungated_rules_for(profile: dict, name: str) -> list[dict]:
     ]
 
 
-def test_unshare_is_allowed_only_for_user_and_mount_namespaces() -> None:
-    # B-60 —— 只放 CLONE_NEWUSER|CLONE_NEWNS(mask 掉这两位后其余必须为 0);pid/net/ipc/
-    # uts/cgroup namespace 仍然拒。
+def test_unshare_is_allowed_only_for_user_mount_and_ipc_namespaces() -> None:
+    # B-60 —— 只放 CLONE_NEWUSER|CLONE_NEWNS(mask 掉这两位后其余必须为 0);B-242 —— 再加
+    # CLONE_NEWIPC(每次 exec 自己的 IPC namespace);pid/net/uts/cgroup namespace 仍然拒。
     rules = _ungated_rules_for(_load_pinned(), "unshare")
     assert len(rules) == 1
     assert rules[0]["names"] == ["unshare"]
     assert rules[0]["args"] == [
-        {"index": 0, "value": 4026400767, "valueTwo": 0, "op": "SCMP_CMP_MASKED_EQ"}
+        {"index": 0, "value": 3892183039, "valueTwo": 0, "op": "SCMP_CMP_MASKED_EQ"}
     ]
-    assert 4026400767 == 0xFFFFFFFF & ~(0x00020000 | 0x10000000)  # ~(NEWNS | NEWUSER)
+    assert 3892183039 == 0xFFFFFFFF & ~(0x00020000 | 0x10000000 | 0x08000000)  # NEWNS|USER|IPC
 
 
 def test_mount_and_the_new_mount_api_are_allowed_without_caps() -> None:

@@ -267,6 +267,14 @@ class ThreadMetaStore(abc.ABC):
         """
 
     @abc.abstractmethod
+    async def promote_workspace_layout(self, thread_id: UUID, *, tenant_id: UUID) -> bool:
+        """B-262 P3 —— 把老对话的 ``workspace_layout`` 从 ``agent_root`` 翻成 ``conversation``。
+
+        比较再交换(只在当前是 ``agent_root`` 时改);真改了才返回 ``True``。两个副本同时迁同一
+        个对话,只有一个拿到 ``True``。
+        """
+
+    @abc.abstractmethod
     async def check_access(self, thread_id: UUID, tenant_id: UUID) -> bool:
         """``True`` iff the thread exists and belongs to ``tenant_id``."""
 

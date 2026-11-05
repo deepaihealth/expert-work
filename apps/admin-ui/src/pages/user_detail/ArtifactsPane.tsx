@@ -38,6 +38,9 @@ import {
   type ArtifactVersion,
 } from "../../api/artifacts";
 import { ApiError } from "../../api/client";
+import { ReadonlyTooltip } from "../../components/ReadonlyTooltip";
+import { concreteTenantScope, useTenantScope } from "../../tenant/TenantScopeContext";
+import { useIsTenantSwitched } from "../../tenant/useIsTenantSwitched";
 
 const { Text } = Typography;
 
@@ -54,6 +57,11 @@ function errMessage(err: unknown): string {
 export function ArtifactsPane({ userId }: { userId: string }) {
   const { t } = useTranslation();
   const { message } = App.useApp();
+  // B-239 —— 用户详情是单租户语义:读带切入的具体租户(同 UserDetail 其余分页);
+  // 删除 / 改类型的接口不收租户,切入态一律置灰。
+  const { apiTenantScope } = useTenantScope();
+  const tenantScope = concreteTenantScope(apiTenantScope);
+  const isTenantSwitched = useIsTenantSwitched();
   const [data, setData] = useState<ArtifactList | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -67,13 +75,13 @@ export function ArtifactsPane({ userId }: { userId: string }) {
     setLoading(true);
     setError(null);
     try {
-      setData(await listArtifacts({ userId }));
+      setData(await listArtifacts({ userId, tenantScope }));
     } catch (err) {
       setError(errMessage(err));
     } finally {
       setLoading(false);
     }
-  }, [userId]);
+  }, [userId, tenantScope]);
 
   useEffect(() => {
     void refresh();
@@ -85,14 +93,14 @@ export function ArtifactsPane({ userId }: { userId: string }) {
     async (artifactId: string, name: string) => {
       setBusyName(artifactId);
       try {
-        await downloadArtifact(artifactId, name, userId);
+        await downloadArtifact(artifactId, name, userId, tenantScope);
       } catch (err) {
         message.error(t("artifacts_page.download_failed", { detail: errMessage(err) }));
       } finally {
         setBusyName(null);
       }
     },
-    [t, message, userId],
+    [t, message, userId, tenantScope],
   );
 
   const handleDelete = useCallback(
@@ -134,7 +142,7 @@ export function ArtifactsPane({ userId }: { userId: string }) {
       setVersionsArtifactId(artifactId);
       setVersionsLoading(true);
       try {
-        const result = await listArtifactVersions(artifactId, userId);
+        const result = await listArtifactVersions(artifactId, userId, tenantScope);
         setVersions(result.versions);
       } catch (err) {
         message.error(errMessage(err));
@@ -143,7 +151,7 @@ export function ArtifactsPane({ userId }: { userId: string }) {
         setVersionsLoading(false);
       }
     },
-    [message, userId],
+    [message, userId, tenantScope],
   );
 
   // B-235 —— 逐版下载。留了副本的版本都能单独下;逐版留存上线前登记的只有最新那一版
@@ -155,14 +163,14 @@ export function ArtifactsPane({ userId }: { userId: string }) {
       if (versionsArtifactId === null || versionsFor === null) return;
       setBusyVersion(version);
       try {
-        await downloadArtifact(versionsArtifactId, versionsFor, userId, undefined, version);
+        await downloadArtifact(versionsArtifactId, versionsFor, userId, tenantScope, version);
       } catch (err) {
         message.error(t("artifacts_page.download_failed", { detail: errMessage(err) }));
       } finally {
         setBusyVersion(null);
       }
     },
-    [versionsArtifactId, versionsFor, userId, message, t],
+    [versionsArtifactId, versionsFor, userId, tenantScope, message, t],
   );
 
   const columns: TableColumnsType<ArtifactListItem> = useMemo(
@@ -179,16 +187,18 @@ export function ArtifactsPane({ userId }: { userId: string }) {
         key: "kind",
         width: 160,
         render: (kind: ArtifactKind, record) => (
-          <Select<ArtifactKind>
-            value={kind}
-            size="small"
-            style={{ width: 130 }}
-            aria-label={t("artifacts_page.col_kind")}
-            disabled={busyName === record.id}
-            onChange={(next) => void handleKindChange(record, next)}
-            options={KIND_OPTIONS.map((k) => ({ value: k, label: k }))}
-            data-testid={`artifact-kind-${record.name}`}
-          />
+          <ReadonlyTooltip on={isTenantSwitched}>
+            <Select<ArtifactKind>
+              value={kind}
+              size="small"
+              style={{ width: 130 }}
+              aria-label={t("artifacts_page.col_kind")}
+              disabled={isTenantSwitched || busyName === record.id}
+              onChange={(next) => void handleKindChange(record, next)}
+              options={KIND_OPTIONS.map((k) => ({ value: k, label: k }))}
+              data-testid={`artifact-kind-${record.name}`}
+            />
+          </ReadonlyTooltip>
         ),
       },
       {
@@ -221,28 +231,32 @@ export function ArtifactsPane({ userId }: { userId: string }) {
             >
               {t("artifacts_page.versions")}
             </Button>
-            <Popconfirm
-              title={t("artifacts_page.delete_confirm_title", { name: record.name })}
-              description={t("artifacts_page.delete_confirm_body")}
-              onConfirm={() => void handleDelete(record.id, record.name)}
-              okText={t("artifacts_page.delete")}
-              okButtonProps={{ danger: true }}
-            >
-              <Button
-                size="small"
-                danger
-                icon={<Trash2 size={13} strokeWidth={1.5} />}
-                loading={busyName === record.id}
-                data-testid={`artifact-delete-${record.name}`}
+            <ReadonlyTooltip on={isTenantSwitched}>
+              <Popconfirm
+                title={t("artifacts_page.delete_confirm_title", { name: record.name })}
+                description={t("artifacts_page.delete_confirm_body")}
+                onConfirm={() => void handleDelete(record.id, record.name)}
+                okText={t("artifacts_page.delete")}
+                okButtonProps={{ danger: true }}
+                disabled={isTenantSwitched}
               >
-                {t("artifacts_page.delete")}
-              </Button>
-            </Popconfirm>
+                <Button
+                  size="small"
+                  danger
+                  icon={<Trash2 size={13} strokeWidth={1.5} />}
+                  loading={busyName === record.id}
+                  disabled={isTenantSwitched}
+                  data-testid={`artifact-delete-${record.name}`}
+                >
+                  {t("artifacts_page.delete")}
+                </Button>
+              </Popconfirm>
+            </ReadonlyTooltip>
           </Space>
         ),
       },
     ],
-    [t, busyName, handleDownload, handleDelete, handleKindChange, openVersions],
+    [t, busyName, isTenantSwitched, handleDownload, handleDelete, handleKindChange, openVersions],
   );
 
   const versionColumns: TableColumnsType<ArtifactVersion> = useMemo(

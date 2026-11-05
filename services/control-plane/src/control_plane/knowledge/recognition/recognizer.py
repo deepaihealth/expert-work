@@ -55,9 +55,18 @@ from control_plane.knowledge.recognition.figure_markup import (
     region_placeholder,
     resolve_figures,
 )
-from control_plane.knowledge.recognition.pages import render_params
+from control_plane.knowledge.recognition.pages import RENDERER_VERSION, render_params
 from control_plane.knowledge.stale import StaleIngestionError
-from expert_work.persistence.knowledge.base import KnowledgeStore, ParseCacheEntry, ParseCacheKind
+from expert_work.common.observability import expert_work_counter
+from expert_work.persistence.knowledge.base import (
+    PAGE_OCR_PAGE,
+    PAGE_OCR_READER,
+    PAGE_OCR_SOURCE,
+    KnowledgeStore,
+    ParseCacheEntry,
+    ParseCacheKind,
+    is_page_index,
+)
 from expert_work.protocol import OcrCaps, PageStatus, catalog_entry
 from orchestrator.agent_factory import thinking_off_request_fields
 
@@ -98,6 +107,16 @@ ERROR_CLASSES = frozenset(
         "bad_output",
         *_CALL_ERROR_CLASSES.values(),
     }
+)
+
+#: B-237 —— 换兜底模型才识别成的图(扫描页 / 图中文字),按前面的模型为什么没用上计:
+#: 调用错误类(``vendor_*``;限流 / 超时等再细分,见 :func:`_call_reason`)、
+#: ``bad_output_<reading_failure 代码>``、模型用不了(``credential_missing`` /
+#: ``model_unsupported``)。
+_fallbacks = expert_work_counter(
+    "expert_work_knowledge_recognition_fallback_total",
+    "Images recognized by a later model, by why an earlier model's reading was not used.",
+    ["reason"],
 )
 
 
@@ -268,6 +287,25 @@ class RecognitionPlan:
         reasons = [f"{e.choice.key}: {e.unavailable}" for e in self.engines if e.unavailable]
         return "; ".join(reasons) or ERROR_NOT_CONFIGURED
 
+    def page_readers(self) -> tuple[str, ...]:
+        """B-238 —— how the usable models read this plan's scanned pages: the
+        ``reader`` a cached page reading records (:func:`reader_digest`)."""
+        render = render_params(self.max_pixels)
+        return tuple(
+            reader_digest(engine.choice.key, engine.cache_tag, render)
+            for engine in self.engines
+            if engine.client is not None
+        )
+
+
+@dataclass(frozen=True)
+class _PageSource:
+    """B-238 —— the document bytes (:func:`source_digest`) and rendering the
+    scanned pages being read come from."""
+
+    sha256: str
+    render: str
+
 
 def default_client(
     http: httpx.AsyncClient | None = None,
@@ -329,6 +367,34 @@ def cache_key(image: bytes, engine_key: str, cache_tag: str, render: str) -> str
     """``knowledge_parse_cache.cache_key`` (B-209 §5.5), within one document."""
     digest = hashlib.sha256(image).hexdigest()
     return hashlib.sha256(f"{digest}|{engine_key}|{cache_tag}|{render}".encode()).hexdigest()
+
+
+def reader_digest(engine_key: str, cache_tag: str, render: str) -> str:
+    """B-238 —— a cache key less the image: the model, its request parameters
+    and the rendering; B-256 —— and the renderer's version (a new one may draw
+    other bytes: the cache keys miss while the rest of the digest still matches)."""
+    # The estimate trusts this digest: a change to ``_accept`` / ``reading_failure`` or to
+    # the renderer's own code that changes outcomes must bump OCR_PROMPT_VERSION / the
+    # render params.
+    return hashlib.sha256(
+        f"{engine_key}|{cache_tag}|{render}|{RENDERER_VERSION}".encode()
+    ).hexdigest()
+
+
+def _page_tags(index: int, engine: _Engine, source: _PageSource) -> dict[str, object]:
+    """B-238 —— what a scanned page's cached reading records: its page, the
+    bytes it was rendered from and how it was read."""
+    return {
+        PAGE_OCR_PAGE: index,
+        PAGE_OCR_SOURCE: source.sha256,
+        PAGE_OCR_READER: reader_digest(engine.choice.key, engine.cache_tag, source.render),
+    }
+
+
+def source_digest(raw: bytes) -> str:
+    """B-238 —— the document bytes scanned pages are rendered from, as a
+    cached page reading records them (the estimate counts by it)."""
+    return hashlib.sha256(raw).hexdigest()
 
 
 class ModelLimits:
@@ -429,13 +495,17 @@ class DocumentRecognizer:
         render: str,
         kind: ParseCacheKind = _CACHE_KIND,
         checkpoint: CallCheckpoint | None = None,
+        source_sha256: str | None = None,
     ) -> dict[int, PageOutcome]:
         """Recognize the given pages (index → JPEG bytes). One page going
         wrong never leaves the others' paid calls running unattended: an
         unexpected error is that page's ``internal_error``. ``kind`` is the
         cache row kind (``figure_ocr``: the text inside a document's figure).
         ``checkpoint`` is passed before each model call (B-222); its refusal
-        is raised once the calls under way are done."""
+        is raised once the calls under way are done. ``source_sha256``
+        (:func:`source_digest` of the document the pages were rendered from):
+        each ``page_ocr`` reading cached records it, its page and its reader
+        (B-238)."""
         keys = {
             index: [
                 cache_key(image, engine.choice.key, engine.cache_tag, render)
@@ -446,10 +516,24 @@ class DocumentRecognizer:
         cached = await self._cached(
             tenant_id, document_id, kind, [key for row in keys.values() for key in row]
         )
+        source = (
+            _PageSource(source_sha256, render)
+            if kind == "page_ocr" and source_sha256 is not None
+            else None
+        )
         results = await asyncio.gather(
             *(
                 self._guarded_page(
-                    tenant_id, document_id, plan, image, keys[index], cached, kind, checkpoint
+                    tenant_id,
+                    document_id,
+                    index,
+                    plan,
+                    image,
+                    keys[index],
+                    cached,
+                    kind,
+                    checkpoint,
+                    source,
                 )
                 for index, image in images.items()
             )
@@ -467,6 +551,7 @@ class DocumentRecognizer:
         render: PageRenderer,
         before_batch: BatchGuard | None = None,
         max_chars: int | None = None,
+        source_sha256: str | None = None,
     ) -> dict[int, PageOutcome]:
         """Recognize one document's scanned pages (0-based indexes, in page
         order) up to the per-document cap — the rest are ``over_limit``.
@@ -475,6 +560,7 @@ class DocumentRecognizer:
         before each batch and raises to stop a worker that lost the document.
         Once the pages read hold ``max_chars`` characters, the remaining pages
         are not read (nor paid for): they are ``document_text_limit``.
+        ``source_sha256``: see :meth:`recognize`.
 
         No model configured at all: every page is ``pending``, nothing is
         rendered. Models configured but none usable (no key, account down):
@@ -515,6 +601,7 @@ class DocumentRecognizer:
                     plan=plan,
                     images=dict(zip(indexes, images, strict=True)),
                     render=params,
+                    source_sha256=source_sha256,
                 )
                 outcomes.update(batch)
                 read += sum(
@@ -542,16 +629,27 @@ class DocumentRecognizer:
         self,
         tenant_id: UUID,
         document_id: UUID,
+        index: int,
         plan: RecognitionPlan,
         image: bytes,
         keys: Sequence[str],
         cached: Mapping[str, ParseCacheEntry],
         kind: ParseCacheKind,
         checkpoint: CallCheckpoint | None,
+        source: _PageSource | None,
     ) -> PageOutcome:
         try:
             return await self._page(
-                tenant_id, document_id, plan, image, keys, cached, kind, checkpoint
+                tenant_id,
+                document_id,
+                index,
+                plan,
+                image,
+                keys,
+                cached,
+                kind,
+                checkpoint,
+                source,
             )
         except Exception as exc:
             if checkpoint is not None and exc is checkpoint.refusal:
@@ -564,12 +662,14 @@ class DocumentRecognizer:
         self,
         tenant_id: UUID,
         document_id: UUID,
+        index: int,
         plan: RecognitionPlan,
         image: bytes,
         keys: Sequence[str],
         cached: Mapping[str, ParseCacheEntry],
         kind: ParseCacheKind,
         checkpoint: CallCheckpoint | None,
+        source: _PageSource | None,
     ) -> PageOutcome:
         for engine, key in zip(plan.engines, keys, strict=True):
             hit = cached.get(key)
@@ -581,6 +681,10 @@ class DocumentRecognizer:
                 _accept, _reading_from_cache(hit), image
             )
             if failure is None:
+                if source is not None:
+                    await self._tag(
+                        tenant_id, document_id, kind, key, hit, _page_tags(index, engine, source)
+                    )
                 return PageOutcome(
                     status=PageStatus.RECOGNIZED,
                     text=text,
@@ -590,10 +694,12 @@ class DocumentRecognizer:
                     regions=regions,
                 )
         errors: list[str] = []
+        skipped: list[tuple[str, str]] = []  # B-237 —— (模型, 没用上的原因)
         unavailable_only = True
         for engine, key in zip(plan.engines, keys, strict=True):
             if engine.client is None:
                 errors.append(f"{engine.choice.key}: {engine.unavailable}")
+                skipped.append((engine.choice.key, engine.unavailable or ERROR_NOT_CONFIGURED))
                 continue
             slot = self._limit(engine)
             try:
@@ -605,15 +711,21 @@ class DocumentRecognizer:
                 )
             except RecognitionCallError as exc:
                 logger.warning(
-                    "knowledge.recognition_call_failed model=%s kind=%s detail=%s",
+                    "knowledge.recognition_call_failed model=%s kind=%s cause=%s document=%s "
+                    "reading=%s index=%s detail=%s",
                     engine.choice.key,
                     exc.kind,
+                    exc.cause,
+                    document_id,
+                    kind,
+                    index,
                     exc,
                 )
                 await self._bill(
                     tenant_id, engine.choice, exc.input_tokens, exc.output_tokens, reported=True
                 )
                 errors.append(f"{engine.choice.key}: {_CALL_ERROR_CLASSES[exc.kind]}")
+                skipped.append((engine.choice.key, _call_reason(exc)))
                 # Out of retries on load / 5xx, or no usable account: the vendor
                 # is unavailable — the page waits. A rejected request is a failure.
                 unavailable_only = unavailable_only and (exc.unavailable or exc.retryable)
@@ -628,9 +740,14 @@ class DocumentRecognizer:
             text, failure, regions = await asyncio.to_thread(_accept, reading, image)
             if failure is not None:
                 errors.append(f"{engine.choice.key}: bad_output({failure})")
+                skipped.append((engine.choice.key, f"bad_output_{failure}"))
                 unavailable_only = False
                 continue
-            await self._remember(tenant_id, document_id, kind, key, engine.choice, reading)
+            # B-238 —— 扫描页的识别记下页码、来源字节与读法,估算按它数「已识别的页」。
+            tags = _page_tags(index, engine, source) if source is not None else {}
+            await self._remember(tenant_id, document_id, kind, key, engine.choice, reading, tags)
+            if skipped:
+                _note_fallback(document_id, kind, index, engine.choice, skipped)
             return PageOutcome(
                 status=PageStatus.RECOGNIZED,
                 text=text,
@@ -667,6 +784,42 @@ class DocumentRecognizer:
             output_tokens=output_tokens,
         )
 
+    async def _tag(
+        self,
+        tenant_id: UUID,
+        document_id: UUID,
+        kind: ParseCacheKind,
+        key: str,
+        hit: ParseCacheEntry,
+        tags: Mapping[str, object],
+    ) -> None:
+        """B-256 —— a scanned page taken from the cache records its page, bytes
+        and reader too, when the reading does not yet (cached before B-238, of
+        other bytes with the same page image, before the reader digest changed):
+        otherwise every later estimate bills it although the ingest reuses it.
+        The key it was found under already encodes the model, request and
+        rendering, so the tags are right by construction. Best effort."""
+        current = hit.result
+        if is_page_index(current.get(PAGE_OCR_PAGE)) and all(
+            current.get(name) == tags[name] for name in (PAGE_OCR_SOURCE, PAGE_OCR_READER)
+        ):
+            # Tagged already. A page index of its own is kept: two identical page images
+            # share one reading, and rewriting it each ingest would only move it back and forth.
+            return
+        try:
+            await self._store.put_parse_cache(
+                tenant_id=tenant_id,
+                document_id=document_id,
+                kind=kind,
+                key=key,
+                model=hit.model,
+                result={**current, **tags},
+            )
+        except Exception:
+            logger.warning(
+                "knowledge.recognition_cache_tag_failed document=%s", document_id, exc_info=True
+            )
+
     async def _remember(
         self,
         tenant_id: UUID,
@@ -675,6 +828,7 @@ class DocumentRecognizer:
         key: str,
         choice: ModelChoice,
         reading: Reading,
+        tags: Mapping[str, object],
     ) -> None:
         try:
             await self._store.put_parse_cache(
@@ -688,10 +842,41 @@ class DocumentRecognizer:
                     "finish_reason": reading.finish_reason,
                     "layout_chars": reading.layout_chars,
                     "layout_size": list(reading.layout_size) if reading.layout_size else None,
+                    **tags,
                 },
             )
         except Exception:
             logger.warning("knowledge.recognition_cache_write_failed", exc_info=True)
+
+
+def _call_reason(exc: RecognitionCallError) -> str:
+    """B-237 —— the call's error class, and which ``busy`` it was when known
+    (``vendor_unavailable_rate_limited`` …): a bounded set."""
+    error_class = _CALL_ERROR_CLASSES[exc.kind]
+    return f"{error_class}_{exc.cause}" if exc.cause is not None else error_class
+
+
+def _note_fallback(
+    document_id: UUID,
+    kind: ParseCacheKind,
+    index: int,
+    used: ModelChoice,
+    skipped: Sequence[tuple[str, str]],
+) -> None:
+    """B-237 —— one line and a count per image a later model read: which
+    model did, and why each earlier one's reading was not used (ids and
+    reason classes only — no text). ``index``: the 0-based page (``page_ocr``)
+    or the figure's number (``figure_ocr``)."""
+    for _, reason in skipped:
+        _fallbacks.labels(reason=reason).inc()
+    logger.info(
+        "knowledge.recognition_fallback document=%s reading=%s index=%s model=%s reasons=%s",
+        document_id,
+        kind,
+        index,
+        used.key,
+        "; ".join(f"{model}: {reason}" for model, reason in skipped),
+    )
 
 
 def _reading_from_cache(entry: ParseCacheEntry) -> Reading:

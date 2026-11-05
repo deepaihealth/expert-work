@@ -99,6 +99,11 @@ _MAX_RESPONSE_BYTES = 4 * 1024 * 1024
 #:   "rejected"     —— 其余 4xx:厂商拒了这次请求(换模型才可能好);
 #:   "bad_response" —— 回包形状不对(没有 md_results / choices)、或大得离谱。
 CallErrorKind = Literal["auth", "quota", "busy", "rejected", "bad_response"]
+#: B-237 —— which ``busy`` it was (server logs and metrics only): 429 限流 /
+#: 408 / 5xx / 客户端超时 / 连接错误 / 回包不是 JSON。
+CallErrorCause = Literal[
+    "rate_limited", "request_timeout", "server_error", "timeout", "transport", "not_json"
+]
 
 
 class RecognitionCallError(Exception):
@@ -106,19 +111,22 @@ class RecognitionCallError(Exception):
     server logs only). ``retryable``: try the same call again. ``unavailable``:
     the model cannot be used right now — the page waits for 「补识别」. A
     response that was parsed but failed its shape check still carries the
-    ``usage`` the vendor billed for (``input_tokens`` / ``output_tokens``)."""
+    ``usage`` the vendor billed for (``input_tokens`` / ``output_tokens``).
+    ``cause``: which ``busy`` it was (B-237; ``None`` for the other kinds)."""
 
     def __init__(
         self,
         message: str,
         *,
         kind: CallErrorKind,
+        cause: CallErrorCause | None = None,
         input_tokens: int = 0,
         output_tokens: int = 0,
         usage_reported: bool = False,
     ) -> None:
         super().__init__(message)
         self.kind: CallErrorKind = kind
+        self.cause: CallErrorCause | None = cause
         self.input_tokens = input_tokens
         self.output_tokens = output_tokens
         self.usage_reported = usage_reported
@@ -174,7 +182,12 @@ async def _post(
             async with httpx.AsyncClient(timeout=_TIMEOUT_S) as client:
                 response = await client.post(url, json=body, headers=headers)
     except httpx.HTTPError as exc:  # timeouts + transport errors
-        raise RecognitionCallError(f"{type(exc).__name__}: {exc}", kind="busy") from exc
+        cause: CallErrorCause = (
+            "timeout" if isinstance(exc, httpx.TimeoutException) else "transport"
+        )
+        raise RecognitionCallError(
+            f"{type(exc).__name__}: {exc}", kind="busy", cause=cause
+        ) from exc
     if response.is_error:
         raise _status_error(response)
     if len(response.content) > _MAX_RESPONSE_BYTES:
@@ -183,9 +196,10 @@ async def _post(
     try:
         data = response.json()
     except ValueError as exc:
-        raise RecognitionCallError("response is not JSON", kind="busy") from exc
+        raise RecognitionCallError("response is not JSON", kind="busy", cause="not_json") from exc
     if not isinstance(data, dict):
-        raise RecognitionCallError("response is not a JSON object", kind="busy")
+        msg = "response is not a JSON object"
+        raise RecognitionCallError(msg, kind="busy", cause="not_json")
     return data
 
 
@@ -200,9 +214,11 @@ def _status_error(response: httpx.Response) -> RecognitionCallError:
         # Zhipu 429 codes that are account state, not load (shared with B-206 rerank).
         if _vendor_error_code(response) in GLM_ACCOUNT_429_CODES:
             return RecognitionCallError(message, kind="quota")
-        return RecognitionCallError(message, kind="busy")
-    if status == 408 or status >= 500:
-        return RecognitionCallError(message, kind="busy")
+        return RecognitionCallError(message, kind="busy", cause="rate_limited")
+    if status == 408:
+        return RecognitionCallError(message, kind="busy", cause="request_timeout")
+    if status >= 500:
+        return RecognitionCallError(message, kind="busy", cause="server_error")
     return RecognitionCallError(message, kind="rejected")
 
 

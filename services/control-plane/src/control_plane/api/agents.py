@@ -61,7 +61,13 @@ from control_plane.api.runs import (
     check_run_inputs_bound,
     spawn_run,
 )
-from control_plane.api.uploads import is_safe_document_upload_id
+from control_plane.api.uploads import (
+    UPLOAD_ERROR_CODES,
+    LandingAccount,
+    copy_document_into_thread,
+    is_safe_document_upload_id,
+    original_document_name,
+)
 from control_plane.audit import emit
 from control_plane.auth.abac import ResourceAttrs
 from control_plane.delegation_policy import (
@@ -76,6 +82,7 @@ from control_plane.manifest import (
     ManifestSyntaxError,
     ManifestValidationError,
 )
+from control_plane.manifest_model_names import iter_manifest_models, off_catalog_models_error
 from control_plane.quota.base import QuotaService
 from control_plane.run_cancel import cancel_run_two_level
 from control_plane.runtime import AgentRuntime
@@ -118,6 +125,7 @@ from expert_work.protocol import (
     Principal,
     Provider,
     TenantPlan,
+    UserUpload,
     parse_upload_id,
     tier_satisfies,
 )
@@ -134,7 +142,7 @@ from expert_work.runtime.runs import (
 from expert_work.runtime.stream_bridge import StreamBridge
 from orchestrator import AgentFactoryError, PlatformNotConfiguredError
 from orchestrator.stream_items import STREAM_FORMAT_ITEMS, STREAM_FORMAT_LEGACY
-from orchestrator.tools.registry import UnmatchedArgBinding
+from orchestrator.tools.registry import UnmatchedArgBinding, WorkspaceLayout
 
 logger = logging.getLogger("expert_work.control_plane.agents")
 
@@ -250,25 +258,11 @@ def _collect_manifest_providers(spec: AgentSpec) -> set[Provider]:
     """Stream O Mini-ADR O-4 — collect every provider this manifest
     transitively references for the publish-time whitelist gate.
 
-    Mirrors :func:`control_plane.api.tenant_config._providers_referenced_by`
-    but operates on a single :class:`AgentSpec` rather than an iterable
-    of stored records. Includes the primary model + its fallback chain,
-    vision model + its fallbacks, and the memory_consolidation aux
-    model (Sprint #7).
+    Every model field the manifest has, fallbacks included — the same walk
+    as the B-112 model-name check (routing rules and dynamic workers used to
+    be missed here).
     """
-    referenced: set[Provider] = set()
-    stack = [spec.spec.model]
-    if spec.spec.vision is not None:
-        stack.append(spec.spec.vision.model)
-        stack.extend(spec.spec.vision.fallbacks)
-    consolidation = spec.spec.policies.memory_consolidation
-    if consolidation.aux_model is not None:
-        stack.append(consolidation.aux_model)
-    while stack:
-        current = stack.pop()
-        referenced.add(current.provider)  # type: ignore[arg-type]
-        stack.extend(current.fallback)
-    return referenced
+    return {model.provider for _, model in iter_manifest_models(spec)}
 
 
 def _envelope_error(code: str, message: str, status_code: int) -> JSONResponse:
@@ -383,8 +377,10 @@ async def resolve_external_files(
     end_user_id: UUID,
     thread_id: UUID,
     uploads_store: UserUploadStore,
-) -> tuple[list[str], list[str]]:
-    """``files[]`` → 内部 ``(image_refs, document_names)``(对外附件模型统一)。
+    threads: ThreadMetaStore,
+    copier: LandingAccount,
+) -> tuple[list[str], list[str], dict[str, str]]:
+    """``files[]`` → 内部 ``(image_refs, document_names, 原名表)``(对外附件模型统一)。
 
     对外附件模型统一(spec 2026-08-17,Task 3)—— ``files[]`` 的每一条只带一个
     ``upload_id``,按 :class:`UserUploadStore` 查表分流成内部 ``image_refs`` /
@@ -405,9 +401,18 @@ async def resolve_external_files(
     P-1:从 ``run_agent_for_user`` 抽出,``:edit`` 端点复用同一份查表分流;语义一字
     不改。抛 :class:`ExternalScopeError` 或 :class:`HTTPException`,由端点各自渲染成
     对外信封。
+
+    B-262 P1 §3 —— document 行属于**别的会话**(同一 agent 或另一个 agent)时,把文件从那条
+    会话自己的目录复制进本会话的 ``uploads/``(:func:`~control_plane.api.uploads.
+    copy_document_into_thread`,像一次上传一样记账与审计),``document_names`` 里写实际落地的
+    名字。登记行的会话已经不在(purge 不删登记行):404 ``UPLOAD_SESSION_DELETED``。
+
+    B-275 —— 第三项:落地时换过名(同名不同内容,``<原名>-<内容 sha256 前 8 位>``)的
+    document → 原名,让 ``[file attached: …]`` 那一行把原名也告诉模型;没换过名的不进表。
     """
     image_refs: list[str] = []
     document_names: list[str] = []
+    original_names: dict[str, str] = {}
     for item in files:
         uid = parse_upload_id(item.upload_id)
         if uid is None:
@@ -424,14 +429,72 @@ async def resolve_external_files(
                 raise ExternalScopeError("UPLOAD_NOT_FOUND", "upload not found", 404)
             image_refs.append(row.ref)
         else:
-            document_names.append(_safe_document_name_or_422(row.ref))
+            ref = _safe_document_name_or_422(row.ref)
+            if row.thread_id != thread_id:
+                ref = await _copy_into_this_session(
+                    row,
+                    ref,
+                    tenant_id=tenant_id,
+                    end_user_id=end_user_id,
+                    thread_id=thread_id,
+                    threads=threads,
+                    copier=copier,
+                )
+            document_names.append(ref)
+            original = original_document_name(ref, row.sha256)
+            if original is not None:
+                original_names[ref] = original
     if len(image_refs) > MAX_RUN_IMAGE_REFS:
         raise ExternalScopeError(
             "TOO_MANY_IMAGE_REFS",
             f"files[] 里的图片不能超过 {MAX_RUN_IMAGE_REFS} 张",
             422,
         )
-    return image_refs, document_names
+    return image_refs, document_names, original_names
+
+
+#: B-262 review —— 跨会话复制附件特有的两种失败;其余状态码沿用上传端点那张表。
+_COPY_ERROR_CODES: dict[int, str] = {404: "UPLOAD_NOT_FOUND", 409: "UPLOAD_CHANGED"}
+
+
+async def _copy_into_this_session(
+    row: UserUpload,
+    ref: str,
+    *,
+    tenant_id: UUID,
+    end_user_id: UUID,
+    thread_id: UUID,
+    threads: ThreadMetaStore,
+    copier: LandingAccount,
+) -> str:
+    """B-262 P1 §3 —— 别的会话的上传复制进本会话;失败翻成对外错误(码同上传端点)。"""
+    target = await threads.get(thread_id, tenant_id=tenant_id)
+    if target is None:
+        raise ExternalScopeError("UPLOAD_NOT_FOUND", "upload not found", 404)
+    source = await threads.get(row.thread_id, tenant_id=tenant_id)
+    if source is None:
+        # 不论本会话是哪种视图都拒(review 2):P1 起 ``uploads/<名字>`` 只在它自己那段会话的
+        # ``work/`` 里唯一,按本 agent 根解析同名文件可能挂上别的客户的件。
+        raise ExternalScopeError(
+            "UPLOAD_SESSION_DELETED",
+            "the session this upload was made in has been deleted; upload the file again",
+            404,
+        )
+    try:
+        return await copy_document_into_thread(
+            copier,
+            tenant_id=tenant_id,
+            user_id=end_user_id,
+            upload=row,
+            ref=ref,
+            source=source,
+            target=target,
+        )
+    except HTTPException as exc:
+        code = _COPY_ERROR_CODES.get(exc.status_code) or UPLOAD_ERROR_CODES.get(
+            exc.status_code, "UPLOAD_ERROR"
+        )
+        raise ExternalScopeError(code, str(exc.detail), exc.status_code) from exc
 
 
 def external_run_bounds_error(
@@ -620,10 +683,12 @@ async def _resolve_session(
     instances: AgentInstanceStore,
     disable_service: AgentDisableService,
     first_input: str | None = None,
-) -> tuple[AgentSpecRecord, UUID, UUID]:
+) -> tuple[AgentSpecRecord, UUID, UUID, WorkspaceLayout]:
     """Resolve agent_code → active record, mint the end-user, create / continue
     the session thread, and touch the per-user instance binding. Returns
-    ``(record, thread_id, end_user_id)``. Raises :class:`_SessionError`.
+    ``(record, thread_id, end_user_id, workspace_layout)`` — the last is the
+    thread row's B-236 sandbox view, read from the row this already loads or
+    creates (no extra query). Raises :class:`_SessionError`.
 
     Shared by the external session-bind and run endpoints (M1-5b).
 
@@ -705,9 +770,10 @@ async def _resolve_session(
             raise _SessionError("SESSION_NOT_FOUND", "session not found for this user / agent", 404)
         thread_id = session_id
         needs_title = meta.title is None
+        workspace_layout = meta.workspace_layout
     else:
         thread_id = uuid4()
-        await threads.create(
+        created = await threads.create(
             thread_id=thread_id,
             tenant_id=tenant_id,
             created_by=actor_id,
@@ -715,6 +781,7 @@ async def _resolve_session(
             agent_name=agent_code,
             agent_version=record.version,
         )
+        workspace_layout = created.workspace_layout
         needs_title = True
 
     if needs_title and first_input:
@@ -726,7 +793,7 @@ async def _resolve_session(
                 logger.warning("external_session.auto_title_failed", exc_info=True)
 
     await instances.touch(tenant_id=tenant_id, agent_code=agent_code, user_id=end_user_id)
-    return record, thread_id, end_user_id
+    return record, thread_id, end_user_id, workspace_layout
 
 
 class BindSessionRequest(BaseModel):
@@ -988,6 +1055,14 @@ async def _check_buildable(
     able to reach a known-good revision, and a gate there would hold the door
     shut from the inside.
     """
+    # B-112 —— a misspelled model name builds fine and dies on the first run
+    # (vendor 4xx, no fallback). Static, so it needs no runtime.
+    off_catalog = off_catalog_models_error(spec)
+    if off_catalog is not None:
+        record_manifest_build_check(outcome="rejected")
+        return _BuildCheck(
+            rejected=_envelope_error("MANIFEST_UNBUILDABLE", off_catalog, 422), error=off_catalog
+        )
     runtime = getattr(request.app.state, "agent_runtime", None)
     if runtime is None:
         # Router built without a runtime (a few test setups). Counted, not
@@ -1548,7 +1623,7 @@ def build_agents_router() -> APIRouter:
         actor_id = request.state.actor_id
         trace_id = current_trace_id_hex()
         try:
-            record, thread_id, end_user_id = await _resolve_session(
+            record, thread_id, end_user_id, _layout = await _resolve_session(
                 tenant_id=tenant_id,
                 agent_code=agent_code,
                 actor_id=actor_id,
@@ -1675,7 +1750,7 @@ def build_agents_router() -> APIRouter:
                 )
 
         try:
-            record, thread_id, end_user_id = await _resolve_session(
+            record, thread_id, end_user_id, workspace_layout = await _resolve_session(
                 tenant_id=tenant_id,
                 agent_code=agent_code,
                 actor_id=actor_id,
@@ -1722,12 +1797,14 @@ def build_agents_router() -> APIRouter:
         # ``:edit`` 端点复用,所以住在模块级而不是这个函数体里。
         uploads_store: UserUploadStore = request.app.state.user_upload_store
         try:
-            image_refs, document_names = await resolve_external_files(
+            image_refs, document_names, original_names = await resolve_external_files(
                 files=payload.files,
                 tenant_id=tenant_id,
                 end_user_id=end_user_id,
                 thread_id=thread_id,
                 uploads_store=uploads_store,
+                threads=threads,
+                copier=LandingAccount.from_request(request),
             )
         except ExternalScopeError as exc:
             return _envelope_error(exc.code, exc.message, exc.status_code)
@@ -1752,6 +1829,7 @@ def build_agents_router() -> APIRouter:
             untrusted_content=payload.untrusted_content,
             inputs=payload.inputs,
             document_names=document_names,
+            document_original_names=original_names,
         )
         try:
             return await spawn_run(
@@ -1770,6 +1848,7 @@ def build_agents_router() -> APIRouter:
                 oauth_subject=str(end_user_id),
                 payload=run_payload,
                 trace_id=trace_id,
+                workspace_layout=workspace_layout,
                 extra_headers={"X-Expert-Work-Session-Id": str(thread_id)},
                 on_behalf_of=str(end_user_id),
                 idempotency_key=key,

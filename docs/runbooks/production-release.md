@@ -8,8 +8,8 @@
 
 | | |
 |---|---|
-| 生产现在钉的版本 | **`94dc73ba`**(班车 2,2026-10-12 上线,记录 #1795) |
-| 下一班 | 未定。**必须带上 B-217 生产切换**(沙箱独立安全组;安全组 10-25 已建、规则已核):`release.sh prod` 之后手工 `kubectl apply -k infra/k8s/sandbox-prod` + 回收沙箱池 + smoke 两行 OK + 探测,步骤与理由见 `docs/design/sandbox-network-isolation-acs.md` §7 —— 2.0 清点时写进执行单。**`sandbox-prod` 不能在旧代码上 apply**(该目录补丁头注) |
+| 生产现在钉的版本 | **`91e8daf02`**(2026-11-04 晚上线:B-236..B-276,迁移 0181 + 0182 先单独跑,沙箱镜像 `daf63cb1 → f2ee1b4a`,执行单 [`2026-11-04-prod-release-checklist.md`](./2026-11-04-prod-release-checklist.md);沙箱池 11-03 起临时在集群安全组,见 ROADMAP B-217)。上一版 `5a1600934`(2026-10-30 晚热修上线:MCP 连接池到期改为「退役」不再直接关,#1979;上一版 `0db5633d3` 同日上线:`list_files` 按 fd 遍历,#1975;再上一版 `7e6b7679e` 为 2026-10-29 上线,同窗口 PostgreSQL 16 → 17、沙箱镜像 `daf63cb1`、B-217 沙箱独立安全组,执行单 [`2026-10-29-prod-release-checklist.md`](./2026-10-29-prod-release-checklist.md)) |
+| 下一班 | 未定。候选:B-236(每个对话独立工作目录,要先钉带 `/agent` 的沙箱镜像再发代码)、B-228(发版脚本先等迁移跑完)。 |
 
 历次生产发布(执行单都在本目录,发完归档):
 
@@ -19,6 +19,10 @@
 | 2026-09-08 | `ad79ba28` | 首管理员凭据重发 | #1426 |
 | 2026-09-16 | `5775fbf3` | 班车 1:三段式(B1 `ca225258` → B-50 工作区搬迁 → B2) | [`2026-09-14-prod-release-checklist.md`](./2026-09-14-prod-release-checklist.md)、#1567 |
 | 2026-10-12 | `94dc73ba` | 班车 2(原定 09-24 → 09-28 → 10-08,并入 B-84 本波 / B-64 / B-106 / B-102~104 / B-105 及其后合入) | [`2026-09-24-prod-release-checklist.md`](./2026-09-24-prod-release-checklist.md) |
+| 2026-10-29 | `7e6b7679e` | PostgreSQL 16 → 17(B-207)+ 10-12 之后主干(知识库波 1、B-226 如实收尾、B-235 产物每版另存、B-209 / B-212 等)+ 沙箱镜像 `d8a32812 → daf63cb1` + B-217 沙箱独立安全组;B-236 不在本班 | [`2026-10-29-prod-release-checklist.md`](./2026-10-29-prod-release-checklist.md) |
+| 2026-10-30 | `0db5633d3` | 热修 #1975:工作区 `list_files` 改为按 fd 遍历(`os.fwalk`),堵住软链抢时间差列出其它租户文件名的口子;只改 control-plane 代码,无迁移、不动沙箱和配置。冒烟 PASS、金丝雀 PASS;pod 内比对新旧遍历,生产 25 个用户全部一致(测试 3,463 个全部一致) | 本表 |
+| 2026-10-30 | `5a1600934` | 热修 #1979:MCP 连接池 30 分钟到期时不再直接关掉旧连接,改为「退役」—— 缓存的智能体和正在跑的运行拿着旧连接时临时开一次性连接把调用做完;删除 / 停用服务、断开授权、关机仍立刻切断(含已退役的)。起因:当天 17:35~17:50 一个租户 6 次运行的 MCP 调用全部报 "not started"。只换 control-plane + credential-proxy(后者代码未变,smoke 要求两者 tag 一致),无迁移。冒烟 PASS、金丝雀 PASS;pod 内用同一脚本在两个平台 MCP 服务上验证「到期后旧连接照常可用、失效后立刻切断」(旧版本上同一脚本复现生产报错) | 本表 |
+| 2026-11-04 | `91e8daf02` | 10-30 之后主干:B-236 / B-244 / B-245 每个对话独立工作目录(迁移 0181)、B-242 P0+P1、B-262 P0/P1/P3 同名上传不覆盖与按对话分开(老对话下次 run 时迁移)、B-249、B-248 / B-259 / B-260 MCP 池收尾、B-237..B-241 / B-255 / B-256 知识库估价与控制台修正、B-250..B-254 / B-257 / B-263 / B-265 / B-266 看图、B-267..B-273 批次(迁移 0182)、B-274 历史轮附件标签、B-276 主模型不再重做看图子代的工作。顺序:只读盘点 → 迁移专用镜像 `91e8daf02-migrate` → 沙箱镜像 `daf63cb1 → f2ee1b4a`(JSON patch 只换镜像,安全组保持摘除)+ 回收 + 金丝雀 PASS(旧代码 + 新镜像)→ migrate Job 单独跑(B-228 临时做法,`lock_timeout=5s`,0180 → 0182)→ `release.sh prod`。smoke PASS(预期 WARN:沙箱钉子落后 1 提交、沙箱无安全组),金丝雀 PASS;发后点检 6 类报错计数全 0、新列 4、新对话布局 `conversation`。盘点:运行中 0、长事务 0、待迁老对话约 146、上传无到期行、生产无知识库(B-267 画像不适用)、进度聚合最大 run 4.9 ms。上一版:control-plane / credential-proxy `5a1600934`、admin-ui `0db5633d3-prod` | [`2026-11-04-prod-release-checklist.md`](./2026-11-04-prod-release-checklist.md) |
 
 首发改期时间线(留档):原定 08-26 → 08-24 改 08-30 → 08-29 延期 → 08-31 定 09-10 → 实际 09-07 上线。
 旧记录里的星期标注不可信,以日期为准。
@@ -288,8 +292,14 @@ canonical-agent-e2e-test.md 是全量 SOP,以下是最小闭环):
 
 ### 2.0 发布前先清点「release.sh 不覆盖的动作」
 
-`release.sh prod` 只做四件事:**建推三个镜像 → 钉 overlay newTag →
-`apply -k`(含 migrate Job = `alembic upgrade head`)→ rollout + smoke**。
+`release.sh prod` 只做这几件事:**建推三个镜像 → 钉 overlay newTag →
+先单独下发 migrate Job(`alembic upgrade head`,带 `lock_timeout=5s`)并等它 Complete →
+`apply -k` 整份 overlay → rollout + smoke + 金丝雀**。迁移失败就停在 stage 3 migrate,
+Deployment 一个都没动(B-228;此前 10-29 / 11-04 两次都是手工先跑迁移,现在不用了)。
+
+**这一版动了沙箱链路(e2b / kruise / supervisor 依赖,或沙箱镜像)的,清点时必须写进执行单:
+在测试集群跑一次 [deployment.md](./deployment.md) §11.1 的 contract-run,零 skip 全过才发**(X-14 P4)。CI 的契约套件跑不到 NAS 那两条,e2b 事故就是
+「评审漏钉版 + CI 假件全绿 + smoke 只探 HTTP」三层一起漏过去的。
 
 它**不做**的事每一版都不一样,而那些恰恰是漏了最疼的 —— 手工 apply 的集群对象、
 NAS 上的数据搬迁、真栈验证探针。下面这节是本节的**唯一**入口:先清点,把结果写成
@@ -347,6 +357,19 @@ tools/deploy/release.sh prod            # 确认 'prod';或 --yes 走脚本
 算完(金丝雀未 seed 会 WARNING 跳过 —— 先按 §1.6.7 补 seed)。
 发布窗口:migrate 是 expand-only 约定(向后兼容一版,deployment.md §10)。
 
+stage 3 migrate 红了(B-228):脚本会打出 Job 的 pod 和日志尾巴,此时线上仍是上一版代码,
+**不用回滚**。日志里是 `canceling statement due to lock timeout` = 有长事务占着表,等它结束再发;
+别的错 = 迁移本身有问题,修了再发。再发之前先 `git restore` 本次被改的 overlay 文件
+(否则下一次读到的「上一版 tag」是这次失败的 tag),并换一个新 tag。
+
+`--images` 只发部分镜像时,没选中的镜像仍按 overlay 里的 newTag 下发。集群跑的比 overlay
+新(记录 PR 还没合)时,脚本会在建镜像之前就拒绝并列出不一致的镜像 —— 换到 overlay 与集群一致的
+工作树再发。
+
+smoke 有一行 `sandbox create failures (24h)`(B-87,warn-only):最近 24 小时建沙箱失败的占比,
+≥ 5% 打 WARN。它不挡发布,但看到了要去查沙箱池。金丝雀失败时会写明是哪一类:
+`no sandbox`(拿不到沙箱)、`run did not finish`、`wrong result`。
+
 已完成的一次性动作(留档,**不要再做**):P-1 重新生成上线的 `0153` 验证、B-50 工作区存量搬迁
 (`0154` 前置 + `workspace-agent-scoping-migration.md`)—— 都随班车 1(2026-09-16)做完,
 过程见 [`2026-09-14-prod-release-checklist.md`](./2026-09-14-prod-release-checklist.md)。
@@ -359,6 +382,18 @@ tools/deploy/rollback.sh prod <上一版 tag>     # 秒级 set image,无确认�
 ```
 
 带破坏性迁移的版本回滚需要人(rollback.sh 头注);回滚后同样补记录 PR。
+
+**B-267 起(智能体 `knowledge.probe: false`)**:回滚到 B-267 之前的镜像不会让这些智能体起不来
+(存库的 manifest 走宽容读回 `load_stored_spec`,不认识的键剔掉),但回滚期间**保存过**的智能体
+会把这个关闭开关永久丢掉、升回来后重新被探测。回滚前后各跑一次只读清单比对(只打 id):
+
+```sh
+kubectl -n expert-work exec -it <control-plane-pod> -- python -m control_plane.knowledge.probe_opt_outs
+```
+
+回滚前列出、升回来后不见了的行,在配置页把「每条消息先探测知识库」重新关掉。
+
+**B-267 起(入库费用预估)**:新镜像算出的预估多了「画像」等新类别,旧镜像读不懂,回滚后这些待确认文档不显示预估、不能确认(不报错);回滚后对这些文档重新预估即可,已确认未开始的会自动重新预估。
 
 ## 4. 已接受风险与延后项(首发)
 

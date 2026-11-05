@@ -170,3 +170,100 @@ async def test_query_pagination_via_cursor() -> None:
     )
     assert [e.id for e in page_three.entries] == [1]
     assert page_three.next_cursor is None
+
+
+@pytest.mark.asyncio
+async def test_document_uploads_for_thread_is_targeted() -> None:
+    """B-262 P3 review 3 —— 迁移按会话找它的上传审计:本租户、``document:upload``、成功的、
+    ``details.thread_id`` 是这个会话、不早于 ``since``,按发生先后。"""
+    store = InMemoryAuditLogStore()
+    tenant, thread = uuid4(), uuid4()
+    mine: dict[str, object] = {"thread_id": str(thread), "workspace_path": "uploads/a.pdf"}
+
+    first = await store.append(
+        _entry(tenant_id=tenant, action=AuditAction.DOCUMENT_UPLOAD, details=mine)
+    )
+    second = await store.append(
+        _entry(tenant_id=tenant, action=AuditAction.DOCUMENT_UPLOAD, details=mine)
+    )
+    await store.append(
+        _entry(
+            tenant_id=tenant,
+            action=AuditAction.DOCUMENT_UPLOAD,
+            details={"thread_id": str(uuid4())},
+        )
+    )
+    await store.append(_entry(tenant_id=uuid4(), action=AuditAction.DOCUMENT_UPLOAD, details=mine))
+    await store.append(_entry(tenant_id=tenant, action=AuditAction.MANIFEST_WRITE, details=mine))
+    await store.append(
+        _entry(
+            tenant_id=tenant,
+            action=AuditAction.DOCUMENT_UPLOAD,
+            details=mine,
+            result=AuditResult.DENIED,
+        )
+    )
+
+    got = await store.list_document_uploads_for_thread(tenant_id=tenant, thread_id=thread)
+    assert [e.id for e in got] == [first.id, second.id]
+    later = await store.list_document_uploads_for_thread(
+        tenant_id=tenant, thread_id=thread, since=datetime.now(UTC) + timedelta(minutes=1)
+    )
+    assert later == []
+
+
+@pytest.mark.asyncio
+async def test_document_uploads_for_threads_is_one_batched_window_read() -> None:
+    """B-271 —— 留存作业给一批老上传行找登记时的 sha256:本租户、``document:upload``、成功的、
+    ``details.thread_id`` 在这批会话里、``occurred_at`` 落在 ``[since, until]``,按发生先后。"""
+    store = InMemoryAuditLogStore()
+    tenant, first_thread, second_thread = uuid4(), uuid4(), uuid4()
+
+    async def _put(
+        thread: object,
+        *,
+        tenant_id: object = tenant,
+        action: AuditAction = AuditAction.DOCUMENT_UPLOAD,
+        result: AuditResult = AuditResult.SUCCESS,
+    ) -> int | None:
+        entry = await store.append(
+            _entry(
+                tenant_id=tenant_id,
+                action=action,
+                result=result,
+                details={"thread_id": str(thread)},
+            )
+        )
+        return entry.id
+
+    a = await _put(first_thread)
+    b = await _put(second_thread)
+    await _put(uuid4())
+    await _put(first_thread, tenant_id=uuid4())
+    await _put(first_thread, action=AuditAction.MANIFEST_WRITE)
+    await _put(first_thread, result=AuditResult.DENIED)
+    now = datetime.now(UTC)
+
+    got = await store.list_document_uploads_for_threads(
+        tenant_id=tenant,
+        thread_ids=[first_thread, second_thread],
+        since=now - timedelta(minutes=1),
+        until=now + timedelta(minutes=1),
+    )
+    assert [e.id for e in got] == [a, b]
+    for since, until in (
+        (now + timedelta(minutes=1), now + timedelta(minutes=2)),
+        (now - timedelta(minutes=2), now - timedelta(minutes=1)),
+    ):
+        assert (
+            await store.list_document_uploads_for_threads(
+                tenant_id=tenant, thread_ids=[first_thread], since=since, until=until
+            )
+            == []
+        )
+    assert (
+        await store.list_document_uploads_for_threads(
+            tenant_id=tenant, thread_ids=[], since=now - timedelta(minutes=1), until=now
+        )
+        == []
+    )

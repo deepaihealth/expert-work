@@ -55,6 +55,15 @@ def test_every_kind_the_proxy_subscribes_to_is_one_control_plane_publishes() -> 
     assert SECRET_VALUE_KINDS <= KINDS, sorted(SECRET_VALUE_KINDS - KINDS)
 
 
+def test_the_per_server_mcp_kinds_reach_the_proxy() -> None:
+    """B-259 — MCP token / header re-pastes now ride the per-server kinds (the
+    whole-pool ``platform_mcp`` / ``tenant_mcp`` are only sent by old pods), so
+    the proxy must evict on them too."""
+    per_server = {k for k in KINDS if k.endswith(("_mcp_server_changed", "_mcp_server_removed"))}
+    assert len(per_server) == 4
+    assert per_server <= SECRET_VALUE_KINDS, sorted(per_server - SECRET_VALUE_KINDS)
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("kind", sorted(SECRET_VALUE_KINDS))
 async def test_a_real_publish_parses_on_the_proxy_side(kind: str) -> None:

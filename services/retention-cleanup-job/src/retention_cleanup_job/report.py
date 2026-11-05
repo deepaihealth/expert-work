@@ -31,6 +31,17 @@ class CleanupReport:
     # 留存链 —— 上传 90 天。
     uploads_expired: int = 0
     upload_files_removed: int = 0
+    #: B-271 —— 路径形状不安全(某段是软链 / 不是目录、叶子不是普通文件)而没删文件的到期行;
+    #: 行照样软删。非 0 就该有人去看那个工作区。
+    upload_files_unsafe: int = 0
+    #: B-271 —— 暂时性失败、这一轮跳过的上传行(明天再试)。
+    upload_rows_failed: int = 0
+    #: B-271 —— 过了到期日 7 天还在失败、不再等的上传行:行已软删,文件没动。
+    upload_rows_abandoned: int = 0
+    #: B-271 —— 要放弃的行涉及的用户太多(像环境问题),熔断拦下、这一轮没标的行。
+    upload_rows_held: int = 0
+    #: B-271 —— ``{tenant}`` / ``{user}`` 目录打不开的用户数(他们这一轮的上传行跳过、不标)。
+    upload_owners_unavailable: int = 0
     # 留存链 B-27 —— 孤儿 threads/<id>/ 目录。
     thread_dirs_removed: int = 0
     #: B-50 spec §4.2 —— 孤儿 ``.tool_results/<run_id>/``。此前从没被清过
@@ -56,6 +67,9 @@ class CleanupReport:
     duration_seconds: float = 0.0
     # Per-tenant breakdown of audit deletes (for observability).
     audit_deleted_by_tenant: dict[str, int] = field(default_factory=dict)
+    #: B-271 —— 吞掉异常继续跑的 pass 里失败了的(``"uploads"`` / ``"orphan_artifact_copies"``)。
+    #: 非空时进程以 :data:`retention_cleanup_job.main.EXIT_PASS_FAILED` 退出,CronJob 显示失败。
+    failed_passes: tuple[str, ...] = ()
 
 
 __all__ = ["CleanupReport"]

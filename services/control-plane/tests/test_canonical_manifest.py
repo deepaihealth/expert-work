@@ -55,3 +55,12 @@ def test_canonical_manifest_relies_on_platform_key() -> None:
         model = stack.pop()
         assert model.api_key_ref is None
         stack.extend(model.fallback)
+
+
+def test_canonical_manifest_names_catalog_models_only() -> None:
+    """B-112 —— the platform's own reference agent must pass the save-time
+    model-name check it is registered through."""
+    from control_plane.manifest_model_names import off_catalog_models_error
+
+    spec = ManifestLoader().load_from_path(_CANONICAL)
+    assert off_catalog_models_error(spec) is None

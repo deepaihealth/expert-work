@@ -34,6 +34,7 @@ from langchain_core.runnables import RunnableConfig
 from control_plane.agent_disable_status import AgentDisableService
 from control_plane.api._enqueued_input import graph_input_from_enqueued
 from control_plane.approval_void import close_previous_turn
+from control_plane.platform_migration import prepare_run_workspace
 from control_plane.run_trace import bind_exec_spec, bind_exec_trace
 from control_plane.runtime import AgentRuntime
 from control_plane.tenant_status import TenantStatusService
@@ -54,6 +55,7 @@ from expert_work.protocol.agent_key import sanitize_agent_key
 from expert_work.runtime.audit.logger import AuditLogger
 from expert_work.runtime.runs import RunInfo, RunStatus, RunStore
 from orchestrator import LLM_CACHE_BYPASS_KEY, AgentFactoryError, run_agent
+from orchestrator.tools.registry import WORKSPACE_LAYOUT_KEY, WORKSPACE_MIGRATED_KEY
 
 logger = logging.getLogger("expert_work.control_plane.run_queue_worker")
 
@@ -374,6 +376,17 @@ class RunQueueWorker:
                 configurable["user_id"] = str(run.user_id)
             # 工作区分层 —— agent 身份。与 /opt/skills/<agent_key> 同一个值。
             configurable["agent_key"] = sanitize_agent_key(record.spec.metadata.name)
+            # B-236 —— 这条对话的 /workspace 布局(thread_meta)。B-262 P3 —— 排队的新 run 开跑
+            # 之前同样先迁老对话(与 ``api/runs._start_run`` 同一个入口函数)。
+            prepared = await prepare_run_workspace(
+                self._runtime.platform_migration,
+                thread_id=run.thread_id,
+                tenant_id=run.tenant_id,
+                workspace_layout=meta.workspace_layout,
+            )
+            configurable[WORKSPACE_LAYOUT_KEY] = prepared.workspace_layout
+            if prepared.migrated:
+                configurable[WORKSPACE_MIGRATED_KEY] = True
             if built.run_deadline_s > 0:
                 configurable["deadline_at"] = time.monotonic() + float(built.run_deadline_s)
             if replay:
@@ -401,6 +414,7 @@ class RunQueueWorker:
                     trajectory_enabled=built.trajectory_recording,
                     # P2 块 2 — run 终局重算 thread_meta.message_count。
                     thread_stats_recorder=self._runtime.thread_stats_recorder,
+                    agent_file_versions=self._runtime.agent_file_versions,
                     token_budget=built.token_budget,
                     worker_spawn_budget=await self._runtime.new_worker_spawn_budget(
                         requested_max_concurrent=built.worker_max_concurrent,

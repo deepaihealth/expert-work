@@ -32,6 +32,7 @@ from orchestrator.tools.sandbox import (
     WorkspacePermissionError,
 )
 from orchestrator.tools.vision import AskImageTool
+from orchestrator.tools.workspace_paths import WorkspaceView
 from orchestrator.tools.workspace_store import RecordingWorkspaceStore, WorkspaceFileEntry
 
 from .test_read_page import _install_office_stubs, _run_render, _snippet_params
@@ -71,10 +72,22 @@ class _AnyRefResolver:
         return ResolvedImage(media_type="image/jpeg", data=b"JPG")
 
 
+#: B-262 —— 手写 ref 指向 ``.tool_results/<run>/`` 时,``<run>`` 得是本对话的
+#: (``figure_run_ids`` 或本 run);下面几条用例的页都放在这个 run 底下。
+_REF_RUN = UUID("99999999-9999-4999-8999-999999999999")
+_OWN_RUNS = frozenset({_REF_RUN})
+
+
 def _ctx(
-    tenant_id: UUID | None = _TENANT, *, user_id: UUID | None = None, agent_key: str = ""
+    tenant_id: UUID | None = _TENANT,
+    *,
+    user_id: UUID | None = None,
+    agent_key: str = "",
+    figure_run_ids: frozenset[UUID] = frozenset(),
 ) -> ToolContext:
-    return ToolContext(tenant_id=tenant_id, user_id=user_id, agent_key=agent_key)
+    return ToolContext(
+        tenant_id=tenant_id, user_id=user_id, agent_key=agent_key, figure_run_ids=figure_run_ids
+    )
 
 
 @pytest.mark.asyncio
@@ -197,11 +210,13 @@ async def test_ask_image_accepts_a_workspace_ref() -> None:
     vl = _FakeVLCaller(response=AIMessage(content="曲线从 6.1 降到 5.5"))
     # Task 7 回修第 2 轮起工具会先解析一次工作区 ref,文件得「在」。
     tool = AskImageTool(vl_caller=vl, image_resolver=_AnyRefResolver())
-    ref = f"expert_work://workspace/{tenant}/{user}/.tool_results/r1/figures/abc/page-03.jpg"
+    ref = (
+        f"expert_work://workspace/{tenant}/{user}/.tool_results/{_REF_RUN}/figures/abc/page-03.jpg"
+    )
 
     result = await tool.call(
         {"image_ref": ref, "question": "走势如何"},
-        ctx=_ctx(tenant_id=tenant, user_id=user),
+        ctx=_ctx(tenant_id=tenant, user_id=user, figure_run_ids=_OWN_RUNS),
     )
 
     assert "5.5" in result.content
@@ -249,12 +264,17 @@ async def test_ask_image_accepts_a_ref_matching_the_run_own_agent_scope() -> Non
     tool = AskImageTool(vl_caller=vl, image_resolver=_AnyRefResolver())
     ref = (
         f"expert_work://workspace/{tenant}/{user}/agents/pf-probe-33086dc0"
-        "/.tool_results/r1/figures/abc/page-03.jpg"
+        f"/.tool_results/{_REF_RUN}/figures/abc/page-03.jpg"
     )
 
     result = await tool.call(
         {"image_ref": ref, "question": "?"},
-        ctx=_ctx(tenant_id=tenant, user_id=user, agent_key="pf-probe-33086dc0"),
+        ctx=_ctx(
+            tenant_id=tenant,
+            user_id=user,
+            agent_key="pf-probe-33086dc0",
+            figure_run_ids=_OWN_RUNS,
+        ),
     )
 
     assert result.content == "ok"
@@ -291,7 +311,8 @@ async def test_ask_image_rejects_an_agent_scoped_ref_from_an_unbound_run() -> No
     )
     with pytest.raises(ToolBlockedError, match="does not match the run agent"):
         await tool.call(
-            {"image_ref": ref, "question": "?"}, ctx=_ctx(tenant_id=tenant, user_id=user)
+            {"image_ref": ref, "question": "?"},
+            ctx=_ctx(tenant_id=tenant, user_id=user, figure_run_ids=_OWN_RUNS),
         )
 
 
@@ -301,7 +322,7 @@ async def test_ask_image_rejects_an_agent_scoped_ref_from_an_unbound_run() -> No
 
 
 def _page_rel(page: int = 3) -> str:
-    return f".tool_results/{uuid4()}/figures/{'a' * 16}/{'b' * 16}/_u{page}/page-{page:02d}.jpg"
+    return f".tool_results/{_REF_RUN}/figures/{'a' * 16}/{'b' * 16}/_u{page}/page-{page:02d}.jpg"
 
 
 @pytest.mark.anyio
@@ -319,7 +340,8 @@ async def test_ask_image_fails_explicitly_on_a_deleted_workspace_image(tmp_path:
 
     with pytest.raises(FileNotFoundError) as info:
         await tool.call(
-            {"image_ref": ref, "question": "走势如何"}, ctx=_ctx(tenant_id=tenant, user_id=user)
+            {"image_ref": ref, "question": "走势如何"},
+            ctx=_ctx(tenant_id=tenant, user_id=user, figure_run_ids=_OWN_RUNS),
         )
 
     assert "第 3 页" in str(info.value)
@@ -346,7 +368,8 @@ async def test_ask_image_calls_an_unreachable_image_unreadable_not_missing(tmp_p
 
     with pytest.raises(RuntimeError) as info:
         await tool.call(
-            {"image_ref": ref, "question": "?"}, ctx=_ctx(tenant_id=tenant, user_id=user)
+            {"image_ref": ref, "question": "?"},
+            ctx=_ctx(tenant_id=tenant, user_id=user, figure_run_ids=_OWN_RUNS),
         )
 
     assert not isinstance(info.value, FileNotFoundError)
@@ -367,7 +390,8 @@ async def test_ask_image_on_a_deployment_without_workspace_says_unreadable() -> 
 
     with pytest.raises(RuntimeError) as info:
         await tool.call(
-            {"image_ref": ref, "question": "?"}, ctx=_ctx(tenant_id=tenant, user_id=user)
+            {"image_ref": ref, "question": "?"},
+            ctx=_ctx(tenant_id=tenant, user_id=user, figure_run_ids=_OWN_RUNS),
         )
 
     assert "读不了" in str(info.value)
@@ -397,13 +421,15 @@ _AGENT = "pf-probe-33086dc0"
 _DOC = "uploads/report.pdf"
 _OLD_RUN = "ffffffff-ffff-4fff-bfff-ffffffffffff"
 _NEW_RUN = "00000000-0000-4000-8000-000000000000"
+#: B-262 —— 本对话渲染过页的 run。短形态只在这些 run(与本 run)的目录里找。
+_CONV_RUNS = frozenset({UUID(_OLD_RUN), UUID(_NEW_RUN)})
 
 
 def _figure_rel(
     *, run: str = _NEW_RUN, render: str = "b" * 16, unit: int = 10, agent_key: str = _AGENT
 ) -> str:
     """一张 ``read_page`` 渲染页的**作用域相对**落点(形状与片段产出一致)。"""
-    doc_sha = document_sha(_DOC, agent_key=agent_key)
+    doc_sha = document_sha(_DOC, view=WorkspaceView(agent_key=agent_key))
     assert doc_sha is not None
     return f".tool_results/{run}/figures/{doc_sha}/{render}/_u{unit}/page-{unit:02d}.jpg"
 
@@ -445,11 +471,13 @@ async def test_ask_image_short_form_resolves_the_rendered_page(tmp_path: Path) -
 
     result = await _short_form_tool(tmp_path, vl).call(
         {"path": _DOC, "unit": 10, "question": "图里是什么"},
-        ctx=_ctx(tenant_id=tenant, user_id=user, agent_key=_AGENT),
+        ctx=_ctx(tenant_id=tenant, user_id=user, agent_key=_AGENT, figure_run_ids=_CONV_RUNS),
     )
 
     expected = workspace_figure_ref(tenant, user, f"agents/{_AGENT}/{rel}")
     assert _sent_ref(vl) == expected
+    # B-266 —— 这里的「渲染页」只是几个字节、读不出尺寸,所以不加 region='auto' 的提示
+    # (提示与 auto 的门槛同一个判据;有真页的用例在 test_b266_region_zoom)。
     assert result.content == "血糖曲线"
     assert result.meta["image_ref"] == expected
     assert result.meta["resolved_from"] == {"path": _DOC, "unit": 10}
@@ -473,7 +501,7 @@ async def test_ask_image_short_form_works_on_the_in_memory_store() -> None:
 
     await tool.call(
         {"path": _DOC, "unit": 10, "question": "?"},
-        ctx=_ctx(tenant_id=tenant, user_id=user, agent_key=_AGENT),
+        ctx=_ctx(tenant_id=tenant, user_id=user, agent_key=_AGENT, figure_run_ids=_CONV_RUNS),
     )
 
     assert _sent_ref(vl) == workspace_figure_ref(tenant, user, f"agents/{_AGENT}/{rel}")
@@ -493,7 +521,7 @@ async def test_ask_image_short_form_picks_the_newest_render(tmp_path: Path) -> N
 
     await _short_form_tool(tmp_path, vl).call(
         {"path": _DOC, "unit": 10, "question": "?"},
-        ctx=_ctx(tenant_id=tenant, user_id=user, agent_key=_AGENT),
+        ctx=_ctx(tenant_id=tenant, user_id=user, agent_key=_AGENT, figure_run_ids=_CONV_RUNS),
     )
 
     assert _sent_ref(vl) == workspace_figure_ref(tenant, user, f"agents/{_AGENT}/{new}")
@@ -512,7 +540,7 @@ async def test_ask_image_short_form_refuses_a_render_older_than_the_document(
     with pytest.raises(FileNotFoundError) as info:
         await _short_form_tool(tmp_path, vl).call(
             {"path": _DOC, "unit": 10, "question": "?"},
-            ctx=_ctx(tenant_id=tenant, user_id=user, agent_key=_AGENT),
+            ctx=_ctx(tenant_id=tenant, user_id=user, agent_key=_AGENT, figure_run_ids=_CONV_RUNS),
         )
 
     assert "改过" in str(info.value)
@@ -531,7 +559,7 @@ async def test_ask_image_short_form_without_a_render_says_call_read_page(tmp_pat
     with pytest.raises(FileNotFoundError) as info:
         await _short_form_tool(tmp_path, vl).call(
             {"path": _DOC, "unit": 10, "question": "?"},
-            ctx=_ctx(tenant_id=tenant, user_id=user, agent_key=_AGENT),
+            ctx=_ctx(tenant_id=tenant, user_id=user, agent_key=_AGENT, figure_run_ids=_CONV_RUNS),
         )
 
     assert "还没渲染" in str(info.value)
@@ -555,7 +583,7 @@ async def test_ask_image_short_form_only_searches_the_run_own_scope(tmp_path: Pa
     with pytest.raises(FileNotFoundError, match="还没渲染"):
         await _short_form_tool(tmp_path, vl).call(
             {"path": _DOC, "unit": 10, "question": "?"},
-            ctx=_ctx(tenant_id=tenant, user_id=user, agent_key=_AGENT),
+            ctx=_ctx(tenant_id=tenant, user_id=user, agent_key=_AGENT, figure_run_ids=_CONV_RUNS),
         )
 
     assert vl.calls == []
@@ -597,7 +625,8 @@ async def test_ask_image_without_a_workspace_store_has_no_short_form() -> None:
         await tool.call({"path": _DOC, "unit": 10, "question": "?"}, ctx=_ctx(user_id=uuid4()))
 
 
-def test_ask_image_with_a_workspace_store_offers_both_forms() -> None:
+def test_ask_image_with_a_workspace_store_offers_all_three_forms() -> None:
+    """B-250 / B-251 —— 工作区图片只给 ``path``;文档页没渲染会自动渲染,不再要求先调 read_page。"""
     spec = AskImageTool(
         vl_caller=_FakeVLCaller(),
         image_resolver=_resolver(),
@@ -605,7 +634,9 @@ def test_ask_image_with_a_workspace_store_offers_both_forms() -> None:
     ).spec
     assert {"path", "unit", "image_ref", "question"} <= set(spec.parameters["properties"])
     assert spec.parameters["required"] == ["question"]
-    assert "Prefer this for document pages" in spec.description
+    assert "an image file in the workspace" in spec.description
+    assert "rendered for you" in spec.description
+    assert "Do not copy long references by hand" in spec.description
 
 
 @pytest.mark.anyio
@@ -733,7 +764,7 @@ async def test_ask_image_short_form_skips_a_candidate_without_mtime() -> None:
 
     await tool.call(
         {"path": _DOC, "unit": 10, "question": "?"},
-        ctx=_ctx(tenant_id=tenant, user_id=user, agent_key=_AGENT),
+        ctx=_ctx(tenant_id=tenant, user_id=user, agent_key=_AGENT, figure_run_ids=_CONV_RUNS),
     )
 
     assert _sent_ref(vl) == workspace_figure_ref(tenant, user, f"agents/{_AGENT}/{good}")
@@ -749,7 +780,9 @@ async def test_ask_image_short_form_with_no_usable_candidate_says_render_again()
     with pytest.raises(FileNotFoundError) as info:
         await tool.call(
             {"path": _DOC, "unit": 10, "question": "?"},
-            ctx=_ctx(tenant_id=uuid4(), user_id=uuid4(), agent_key=_AGENT),
+            ctx=_ctx(
+                tenant_id=uuid4(), user_id=uuid4(), agent_key=_AGENT, figure_run_ids=_CONV_RUNS
+            ),
         )
 
     assert "读不出来" in str(info.value)
@@ -782,6 +815,8 @@ class _LocalRenderRuntime(RecordingSandboxRuntime):
         run_id: UUID | None = None,
         has_skills: bool = False,
         egress: EgressContext | None = None,
+        conv_id: UUID | None = None,
+        workspace_thread_id: UUID | None = None,
     ) -> SandboxOutcome:
         await super().exec(
             sandbox_id=sandbox_id,

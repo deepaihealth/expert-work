@@ -222,6 +222,61 @@ async def test_transport_errors_are_retryable() -> None:
     assert caught.value.retryable
 
 
+@pytest.mark.parametrize(
+    ("status", "body", "cause"),
+    [
+        (429, {}, "rate_limited"),
+        (429, {"error": {"code": "1302", "message": "并发数过高"}}, "rate_limited"),
+        (408, {}, "request_timeout"),
+        (500, {}, "server_error"),
+        (503, {}, "server_error"),
+        (429, {"error": {"code": "1113", "message": "您的账户已欠费"}}, None),
+        (401, {}, None),
+        (400, {}, None),
+    ],
+)
+async def test_a_busy_error_says_which_busy_it_was(
+    status: int, body: dict[str, Any], cause: str | None
+) -> None:
+    # B-237: rate limit vs timeout vs server error, for the logs and metrics.
+    async with _http(lambda _: httpx.Response(status, json=body)) as http:
+        client = LayoutParsingClient(url="https://x/lp", api_key="k", model="glm-ocr", http=http)
+        with pytest.raises(RecognitionCallError) as caught:
+            await client.read(_IMAGE)
+    assert caught.value.cause == cause
+
+
+@pytest.mark.parametrize(
+    ("error", "cause"),
+    [
+        (httpx.ConnectTimeout("timed out"), "timeout"),
+        (httpx.ReadTimeout("timed out"), "timeout"),
+        (httpx.ConnectError("refused"), "transport"),
+        (httpx.RemoteProtocolError("closed"), "transport"),
+    ],
+)
+async def test_transport_errors_say_timeout_or_transport(
+    error: httpx.TransportError, cause: str
+) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise error
+
+    async with _http(handler) as http:
+        client = ChatVlmClient(url="https://x/c", api_key="k", model="m", http=http)
+        with pytest.raises(RecognitionCallError) as caught:
+            await client.read(_IMAGE)
+    assert (caught.value.kind, caught.value.cause) == ("busy", cause)
+
+
+@pytest.mark.parametrize("reply", [b"<html>502</html>", b"[1, 2]"])
+async def test_a_reply_that_is_not_a_json_object_is_not_json(reply: bytes) -> None:
+    async with _http(lambda _: httpx.Response(200, content=reply)) as http:
+        client = ChatVlmClient(url="https://x/c", api_key="k", model="m", http=http)
+        with pytest.raises(RecognitionCallError) as caught:
+            await client.read(_IMAGE)
+    assert (caught.value.kind, caught.value.cause) == ("busy", "not_json")
+
+
 class _Scripted:
     """A client failing with the scripted errors before answering."""
 

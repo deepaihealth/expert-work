@@ -65,7 +65,9 @@
    `sandbox image cache` 一行是 WARN,属正常;一直 WARN 再按下文排查。
 
 4. **验证**:CI 的「Contract suite against the real E2B test cluster」连的就是这个集群,
-   最近一次 main 全绿即为验证;要单独验证可本地跑契约测试的 e2b 侧。
+   但它跑不到 NAS 那两条用例。**换了沙箱镜像就在测试集群跑一次
+   [deployment.md](./deployment.md) §11.1 的 contract-run,零 skip 全过才往生产换**
+   (X-14 P4;e2b / kruise / supervisor 依赖变了同样要跑)。
 
 5. **记账**:sandboxset.yaml 的 tag 改动随 `chore(deploy)` 记录 PR 提交
    （与 overlay newTag 同 PR,先例 #1074/#1075）。

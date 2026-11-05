@@ -112,6 +112,20 @@ def _merge_viewed_figures(left: list[str], right: list[str]) -> list[str]:
     return [ref for ref in left if ref not in moved] + fresh
 
 
+def _merge_figure_reads(
+    left: list[dict[str, Any]], right: list[dict[str, Any]]
+) -> list[dict[str, Any]]:
+    """B-268 —— ``read_page`` 的读取账按 run 计:追加本批,只留本批那个 run 的旧条目。
+
+    主代的检查点跨轮累积,别的 run 的条目读的一侧本来就不算(``tools.figure_reads``),
+    这里顺手丢掉,账不随会话变长。空批不动(没有 run 可比)。
+    """
+    if not right:
+        return left
+    runs = {entry.get("run") for entry in right if isinstance(entry, dict)}
+    return [e for e in left if isinstance(e, dict) and e.get("run") in runs] + list(right)
+
+
 def _merge_figure_documents(left: dict[str, str], right: dict[str, str]) -> dict[str, str]:
     """B-64 Task 7 回修第 3 轮 —— ``<doc-sha>`` → 路径,跨轮合并,后写的赢。
 
@@ -229,6 +243,9 @@ class AgentState(TypedDict):
     #: 对话是长线程,省略这个键时 LangGraph 保留检查点里的旧值,上一轮的附件
     #: 会漏进这一轮的子代。
     turn_documents: NotRequired[list[str]]
+    #: B-275 —— ``turn_documents`` 里换过名的那几条 → 原名(叶子)。子代种子里的附件清单
+    #: 据此带上原名(主 run 的 ``[file attached: …]`` 那一行已经带了)。同样每轮都设。
+    turn_document_original_names: NotRequired[dict[str, str]]
     turn_image_refs: NotRequired[list[str]]
     plan: NotRequired[Plan | None]
     reflections: NotRequired[Annotated[list[Reflection], add]]
@@ -366,6 +383,19 @@ class AgentState(TypedDict):
     #: 而不是靠历史里的回执:压缩会把回执总结掉,state 不受影响。跨 run 累积,同
     #: ``viewed_figures``。
     figure_documents: NotRequired[Annotated[dict[str, str], _merge_figure_documents]]
+    #: B-268 —— ``read_page`` 本 run 每次渲染一条(``tools.figure_reads.ledger_entries``):
+    #: 重看回执、超上限预告、熔断都按它算。只留最新那个 run 的条目(见 :func:`_merge_figure_reads`)。
+    figure_reads: NotRequired[Annotated[list[dict[str, Any]], _merge_figure_reads]]
     #: B-126 —— L2 滚动摘要写回检查点:``{"through_id": <消息 id>, "text": <整段摘要>}``。
     #: 下一次压缩时被覆盖的历史未变就直接复用,不再每步重写(spec §3.7)。默认覆盖 reducer。
     context_summary: NotRequired[dict[str, str] | None]
+    #: B-236 —— 对话开场复制时超出上限、整个没复制的 agent 根目录名(``conversation_seed``
+    #: 节点只在复制那一次写)。工作区快照段每轮据此告诉模型它们只在 ``/agent/<目录>/``。
+    #: 默认覆盖 reducer;之后的 run 不写,值随检查点留着。
+    seed_skipped_dirs: NotRequired[list[str]]
+    #: B-236 review 7 —— 开场复制因用户工作区配额满了整个没做(``seed_skipped_dirs`` 里是本该
+    #: 复制的目录)。快照段据此换一句说明。
+    seed_quota_blocked: NotRequired[bool]
+    #: B-236 review 10 —— ``seed_skipped_dirs`` 之外还有几个目录没复制(名字只记前
+    #: ``MAX_REPORTED_DIRS`` 个)。快照段写成「… and N more」。
+    seed_skipped_more: NotRequired[int]

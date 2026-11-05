@@ -27,7 +27,7 @@ import {
   type UnappliedEdits,
 } from "../../../api/knowledge_maintenance";
 import { HeadingPath } from "../HeadingPath";
-import { PassageCard, WriteGate } from "./PassageCard";
+import { EditedBy, PassageCard, WriteGate } from "./PassageCard";
 import { usePassageSwitch } from "./usePassageSwitch";
 
 const { Paragraph, Text } = Typography;
@@ -70,7 +70,12 @@ function UnappliedRow({ record }: { record: PassageRevision }): ReactElement {
                   at: new Date(record.orphaned_at).toLocaleString(),
                 })
               : t("kb_maintenance.review_still_there")}
-            {record.edited_by ? ` · ${t("kb_maintenance.history_by", { who: record.edited_by })}` : ""}
+            {record.edited_by ? (
+              <>
+                {" · "}
+                <EditedBy record={record} />
+              </>
+            ) : null}
           </Text>
         </Space>
       }
@@ -212,8 +217,10 @@ export function ReviewPanel({
     setConfirming(null);
     setDiscarding(true);
     try {
-      await discardUnappliedEdits(baseName, documentId);
-      message.success(t("kb_maintenance.review_discarded"));
+      const n = await discardUnappliedEdits(baseName, documentId);
+      // B-241 —— 确认之后别人先丢弃了:服务端回 0,不报「已丢弃 0 条」。
+      if (n === 0) message.info(t("kb_maintenance.review_discard_nothing"));
+      else message.success(t("kb_maintenance.review_discarded", { n }));
       onChanged();
     } catch (err) {
       message.error(errMessage(err));

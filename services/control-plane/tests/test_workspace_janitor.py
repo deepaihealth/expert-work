@@ -763,6 +763,57 @@ async def test_sweep_does_not_traverse_a_symlinked_intermediate_segment(tmp_path
     assert (stats.reclaim_files_removed, stats.reclaim_dirs_removed) == (1, 0)
 
 
+@pytest.mark.asyncio
+async def test_sweep_also_reclaims_inputs_in_each_conversations_work_dir(tmp_path: Path) -> None:
+    """B-262 P1 —— 对话视图的 ``inputs/``(含预拉缓存)在 ``threads/<conv>/work/`` 下;长期对话
+    不清会一直涨。同一套 TTL,同一套判据;名字不是 UUID 的 ``threads/`` 子目录不进。"""
+    tenant, user = uuid4(), uuid4()
+    agent = _agent_dir(tmp_path, tenant, user)
+    inputs = agent / "threads" / str(uuid4()) / "work" / "inputs"
+    cache = inputs / "cache"
+    cache.mkdir(parents=True)
+    stale_entry, fresh_entry = cache / f"{'a' * 32}.png", cache / f"{'b' * 32}.png"
+    for entry in (stale_entry, fresh_entry):
+        entry.write_bytes(b"x")
+    _age(stale_entry, seconds=_TTL_S["inputs_cache"] + 60)
+    _age(fresh_entry, seconds=_TTL_S["inputs_cache"] - 3600)
+    stale_run = inputs / str(uuid4())
+    stale_run.mkdir()
+    (stale_run / "inputs.json").write_text("{}")
+    _age(stale_run, seconds=_TTL_S["inputs_run_dir"] + 60)
+    odd = agent / "threads" / "not-a-conversation" / "work" / "inputs" / str(uuid4())
+    odd.mkdir(parents=True)
+    _age(odd, seconds=_TTL_S["inputs_run_dir"] * 4)
+
+    worker, _, _ = _build(tmp_path)
+    stats = await worker.run_once()
+    assert (stats.reclaim_files_removed, stats.reclaim_dirs_removed) == (1, 1)
+    assert not stale_entry.exists() and fresh_entry.exists() and not stale_run.exists()
+    assert odd.is_dir()
+
+
+@pytest.mark.asyncio
+async def test_sweep_does_not_follow_a_symlinked_conversation_dir(tmp_path: Path) -> None:
+    """``threads/<conv>`` 或 ``work`` 被换成软链(载荷写得进 ``/agent/threads/<本对话>``):不跟。"""
+    tenant = uuid4()
+    victim_inputs = tmp_path / "victim" / "work" / "inputs"
+    victim_run = victim_inputs / str(uuid4())
+    victim_run.mkdir(parents=True)
+    _age(victim_run, seconds=_TTL_S["inputs_run_dir"] * 4)
+
+    threads = _agent_dir(tmp_path, tenant, uuid4()) / "threads"
+    threads.mkdir()
+    (threads / str(uuid4())).symlink_to(victim_inputs.parent.parent)
+    conv = _agent_dir(tmp_path, tenant, uuid4(), key="other") / "threads" / str(uuid4())
+    conv.mkdir(parents=True)
+    (conv / "work").symlink_to(victim_inputs.parent)
+
+    worker, _, _ = _build(tmp_path)
+    stats = await worker.run_once()
+    assert victim_run.is_dir()
+    assert (stats.reclaim_files_removed, stats.reclaim_dirs_removed) == (0, 0)
+
+
 def test_every_policy_has_an_explicit_target_entry() -> None:
     """策略表与落点表必须逐条对上 —— 「暂时没有落点」要显式写 ``None``。
 

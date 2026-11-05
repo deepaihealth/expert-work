@@ -220,6 +220,37 @@ describe("WebhooksList", () => {
     expect(screen.getByTestId("webhook-secret-value").textContent).toBe("ew_whsec_abc123");
   });
 
+  it("offers run.paused as its own event type (B-230)", async () => {
+    let postBody: unknown = null;
+    installAdapter([
+      {
+        match: (u, m) => u === "/v1/webhook-endpoints" && m === "get",
+        respond: () => ({ items: [], total: 0, cross_tenant: false }),
+      },
+      {
+        match: (u, m) => u === "/v1/webhook-endpoints" && m === "post",
+        respond: ({ data }) => {
+          postBody = JSON.parse(data as string);
+          return { ...endpointRow, event_types: ["run.paused"], secret: "s" };
+        },
+        status: 201,
+      },
+    ]);
+    const user = userEvent.setup();
+    renderWebhooks();
+    await waitFor(() => expect(screen.getByTestId("webhooks-create-btn")).toBeInTheDocument());
+    await user.click(screen.getByTestId("webhooks-create-btn"));
+    await user.type(screen.getByTestId("webhook-name-input"), "pauses");
+    await user.type(screen.getByTestId("webhook-url-input"), "https://h.example.com/p");
+    const combobox = within(screen.getByTestId("webhook-events-select")).getByRole("combobox");
+    fireEvent.mouseDown(combobox);
+    await user.click(await screen.findByTitle("run.paused"));
+    await user.click(screen.getByRole("button", { name: /^Create$/ }));
+    await waitFor(() =>
+      expect((postBody as Record<string, unknown>).event_types).toEqual(["run.paused"]),
+    );
+  });
+
   it("enabled toggle PATCHes the endpoint", async () => {
     let patchBody: unknown = null;
     installAdapter([

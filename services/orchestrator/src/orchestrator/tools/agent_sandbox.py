@@ -106,6 +106,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import hashlib
 import json
 import logging
 import os
@@ -118,13 +119,14 @@ from typing import Any, Protocol
 from uuid import UUID, uuid4
 
 from expert_work.common.egress_token import mint_egress_token
+from expert_work.common.observability import expert_work_counter
 from expert_work.persistence import SANDBOX_SKILLS_ROOT
 from expert_work.persistence.sandbox_instance_store import (
-    SANDBOX_LAYOUT_AGENT_NS,
+    SANDBOX_LAYOUT_AGENT_CONV_PLATFORM,
     SandboxClaimContendedError,
 )
 from orchestrator.tools.e2b_patch import _ensure_e2b_patched
-from orchestrator.tools.exec_view import build_exec_command
+from orchestrator.tools.exec_view import EXEC_SCRIPT_DIR, EXEC_SHELL_ENV, build_exec_command
 from orchestrator.tools.nas_workspace_store import workspace_deleted_marker, workspace_user_root
 from orchestrator.tools.sandbox import (
     EgressContext,
@@ -161,6 +163,18 @@ class WorkspaceQuotaGate(Protocol):
 
 
 logger = logging.getLogger(__name__)
+
+#: X-14 P3 / B-87 —— 每一次 ``create()`` 的结局。``failed`` 与写进 ``sandbox_instance`` 的
+#: ``destroy_reason='create_failed'`` 是同一个时刻(:meth:`AgentSandboxClient._create_and_track`),
+#: 告警 ``ExpertWorkSandboxCreateFailureRate`` 用两者之比。两个取值在导入时就建好:健康的
+#: 副本也有一条平的 0,``increase()`` 才不会是空向量。
+SANDBOX_CREATES = expert_work_counter(
+    "expert_work_sandbox_create_total",
+    "Sandbox create() attempts by outcome (ok / failed).",
+    ("outcome",),
+)
+for _outcome in ("ok", "failed"):
+    SANDBOX_CREATES.labels(outcome=_outcome)
 
 
 def _utc_now() -> datetime:
@@ -417,8 +431,11 @@ class AgentSandboxClient:
     workspace_root: str | None = None
     #: B-60 —— 本进程给热会话铺的沙箱内布局;写进每一行,``acquire`` 拿到不同值的热会话
     #: 就 ``layout_mismatch`` 重建。PR-C 起本进程铺的就是 ``agent-ns``——exec 命令串
-    #: 已经翻成命名空间版本(见 :meth:`exec`),``user-root`` 是 PR-B 的过渡值。
-    layout: str = SANDBOX_LAYOUT_AGENT_NS
+    #: 已经翻成命名空间版本(见 :meth:`exec`),``user-root`` 是 PR-B 的过渡值。B-236 起是
+    #: ``agent-conv``:新镜像带 ``/agent`` 挂载点,``agent-ns`` 的热会话(老镜像)重建。B-242 起
+    #: 是 ``agent-conv-local``:上线前的热会话里可能有老视图的后台进程,一律重建。B-262 起是
+    #: ``agent-conv-platform``:对话视图的平台目录不再 bind agent 根,老脚本起的后台进程一律重建。
+    layout: str = SANDBOX_LAYOUT_AGENT_CONV_PLATFORM
     #: 沙箱迁移波 3 —— 可选工作区配额闸。None(默认)= 无闸,行为与波 2
     #: 完全一致(本地 compose / 未配 NAS 的部署)。control-plane 在 app.py
     #: 里 post-assign(照 resolved_workspace_store.http 的先例),不走
@@ -1270,10 +1287,13 @@ class AgentSandboxClient:
         ``set_container_id`` 回填)也要走同一套清理,见 :meth:`acquire`。
         """
         try:
-            return await self._create(tenant_id=tenant_id, sandbox_id=sandbox_id, user_id=user_id)
+            sbx = await self._create(tenant_id=tenant_id, sandbox_id=sandbox_id, user_id=user_id)
         except Exception:
+            SANDBOX_CREATES.labels(outcome="failed").inc()
             await self._unwind_slot(sandbox_id=sandbox_id, reason="create_failed")
             raise
+        SANDBOX_CREATES.labels(outcome="ok").inc()
+        return sbx
 
     async def _unwind_slot(self, *, sandbox_id: UUID, reason: str) -> None:
         """清掉这次 acquire 自己插下的那一行(顺带让出它占着的 CAS 槽位)。
@@ -1521,6 +1541,8 @@ class AgentSandboxClient:
         run_id: UUID | None = None,
         has_skills: bool = False,
         egress: EgressContext | None = None,
+        conv_id: UUID | None = None,
+        workspace_thread_id: UUID | None = None,
     ) -> SandboxOutcome:
         """波 1 Task 8(spec § 6.1 四契约点)。契约源头是
         ``infra/sandbox-image/runner.py:28-72``——本地 docker 沙箱里的
@@ -1653,21 +1675,31 @@ class AgentSandboxClient:
         sbx = await self._attach(sandbox_id, touch_last_used=True)
         timeout_exc, exit_exc = self._sdk_exceptions()
 
-        script = f"/tmp/ew-exec-{uuid4().hex}.py"  # noqa: S108 — sandbox container tmpfs, not host; name has 128 bits of random entropy
+        script = f"ew-exec-{uuid4().hex}.py"
         started = _monotonic()
         envs = exec_envs(agent_key, run_id=run_id, has_skills=has_skills)
         envs.update(self._exec_egress_env(sandbox_id=sandbox_id, egress=egress))
+        # B-242 —— 外层 bash -l 不读 $HOME 下写得进的 profile;放最后,谁也盖不掉。
+        envs.update(EXEC_SHELL_ENV)
         try:
-            await sbx.files.write(script, code, user=SANDBOX_EXEC_USER)
+            data = code.encode("utf-8")
+            await sbx.files.write(f"{EXEC_SCRIPT_DIR}/{script}", data, user=SANDBOX_EXEC_USER)
             # B-60 —— 命令串由 exec_view.build_exec_command 生成:umask 077,再在自己的
             # user+mount ns 里把 agent 目录 bind 成 /workspace(spec §4.3)。cwd= 传挂载点
-            # 只是因为 E2B 执行前校验它存在;进 ns 之后脚本自己 cd /workspace。
+            # 只是因为 E2B 执行前校验它存在;进 ns 之后脚本自己 cd /workspace。B-242 —— 代码
+            # 文件带上 sha256,挂载阶段读出、删掉、核对后放进本次 exec 独有的只读 tmpfs。
             result = await sbx.commands.run(
-                build_exec_command(agent_key, script),
+                build_exec_command(
+                    agent_key,
+                    script,
+                    hashlib.sha256(data).hexdigest(),
+                    conv_id=conv_id,
+                    thread_id=workspace_thread_id,
+                ),
                 user=SANDBOX_EXEC_USER,
                 timeout=effective,
                 cwd=NAS_MOUNT,
-                envs=envs or None,
+                envs=envs,
             )
         except timeout_exc:
             return SandboxOutcome(stdout="", stderr="", exit_code=-1, timed_out=True)

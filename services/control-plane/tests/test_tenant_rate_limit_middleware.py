@@ -229,7 +229,9 @@ async def test_tenant_override_tightens_limit(audit_store: InMemoryAuditLogStore
     """Stream C.6 — a per-tenant rate_limit_override caps a wide-open limiter.
 
     Default tenant tier is wide (10k), but the seeded tenant config overrides to
-    burst=1, so the second request in quick succession is 429'd.
+    burst=1, so the second request in quick succession is 429'd. 1 request per
+    minute, not per second: a busy CI runner can take over a second between the
+    two calls and refill the token.
     """
     from expert_work.persistence.tenant_config import InMemoryTenantConfigStore
     from expert_work.protocol.tenant_config import TenantConfigPatch
@@ -239,7 +241,7 @@ async def test_tenant_override_tightens_limit(audit_store: InMemoryAuditLogStore
         tenant_id=_TENANT,
         patch=TenantConfigPatch(
             display_name="T",
-            rate_limit_override={"requests_per_minute": 60, "burst": 1},
+            rate_limit_override={"requests_per_minute": 1, "burst": 1},
         ),
         actor_id="seed",
     )

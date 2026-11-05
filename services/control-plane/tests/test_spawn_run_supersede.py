@@ -92,6 +92,7 @@ def test_replay_graph_input_fresh_ids_new_stamp_no_attachment_keys() -> None:
     assert out["step_count"] == 0 and out["max_steps"] == 5
     # 故意省略:检查点里此刻的值就是被取代轮自己写的那一份 = 同一批附件。
     assert "turn_documents" not in out and "turn_image_refs" not in out
+    assert "turn_document_original_names" not in out
 
 
 class _SpawnCtx:
@@ -144,6 +145,7 @@ class _SpawnCtx:
             oauth_subject="sa-test",
             payload=RunRequest(input="U", mode=mode, use_draft=use_draft),
             trace_id="0" * 32,
+            workspace_layout="conversation",
             supersede=supersede,
         )
 
@@ -252,7 +254,8 @@ async def test_spawn_run_propagates_supersede_error_without_creating_a_row(
 async def test_spawn_run_without_supersede_keeps_the_original_enqueued_input(
     spawn_ctx: _SpawnCtx,
 ) -> None:
-    """``supersede=None`` 是原路径:不取锁、不重放,``enqueued_input`` 五个键照旧。"""
+    """``supersede=None`` 是原路径:不取锁、不重放,``enqueued_input`` 六个键照旧
+    (B-275 加了 ``document_original_names``)。"""
     resp = await spawn_ctx.spawn(mode="queue", supersede=None)
     assert resp.status_code == 202
     rows = await spawn_ctx.run_store.list_by_thread(
@@ -266,6 +269,7 @@ async def test_spawn_run_without_supersede_keeps_the_original_enqueued_input(
         "untrusted_content",
         "inputs",
         "document_names",
+        "document_original_names",
     }
 
 

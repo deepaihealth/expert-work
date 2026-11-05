@@ -271,7 +271,7 @@ def _kb_spec(name: str, refs: list[str]) -> AgentSpec:
 
 
 async def _kb_child_builder(
-    kb_store: InMemoryKnowledgeStore, refs: list[str], **kwargs: Any
+    kb_store: InMemoryKnowledgeStore, refs: list[str], *, kb_first: bool = False, **kwargs: Any
 ) -> tuple[Any, UUID]:
     """A child builder whose env carries a retriever over ``kb_store``, and a
     tenant holding a ``researcher`` sub-agent bound to ``refs``."""
@@ -288,7 +288,8 @@ async def _kb_child_builder(
         secret_store=InMemorySecretStore(),
         checkpointer=InMemorySaver(),
         base_tool_env=ToolEnv(
-            knowledge_retriever=KnowledgeRetriever(store=kb_store, embedder=FakeEmbedder())
+            knowledge_retriever=KnowledgeRetriever(store=kb_store, embedder=FakeEmbedder()),
+            kb_first_routing=kb_first,
         ),
         **kwargs,
     )
@@ -307,7 +308,12 @@ def catalog_build_calls(monkeypatch: pytest.MonkeyPatch) -> list[dict[str, Any]]
         retriever = kwargs["tool_env"].knowledge_retriever
         refs = spec.spec.knowledge.knowledge_base_refs if spec.spec.knowledge else []
         fingerprint = (
-            await catalog_fingerprint(retriever.store, tenant_id=kwargs["tenant_id"], refs=refs)
+            await catalog_fingerprint(
+                retriever.store,
+                tenant_id=kwargs["tenant_id"],
+                refs=refs,
+                single_base=kwargs["tool_env"].kb_first_routing,
+            )
             if retriever is not None
             else None
         )
@@ -384,6 +390,28 @@ async def test_child_rebuilds_when_its_knowledge_catalog_changed(
     assert len(catalog_build_calls) == 1
     await kb.update_base(tenant_id=tenant, kb_id=base_a.id, description="edited")
     await _delegate()
+    await _delegate()
+    assert len(catalog_build_calls) == 2
+
+
+@pytest.mark.asyncio
+async def test_child_single_base_catalog_is_keyed_with_the_switch(
+    catalog_build_calls: list[dict[str, Any]],
+) -> None:
+    """B-267 — with ``kb_first_routing`` on a child bound to one base freezes its
+    catalog; the child key reads it the same way, so the build is cached and an
+    edited description still reaches the next delegation."""
+    kb = InMemoryKnowledgeStore()
+    builder, tenant = await _kb_child_builder(kb, ["a"], kb_first=True)
+    base = await kb.create_base(tenant_id=tenant, name="a", description="first")
+
+    async def _delegate() -> None:
+        await builder(tenant_id=tenant, name="researcher", version="1.0.0", depth=1)
+
+    await _delegate()
+    await _delegate()
+    assert len(catalog_build_calls) == 1
+    await kb.update_base(tenant_id=tenant, kb_id=base.id, description="edited")
     await _delegate()
     assert len(catalog_build_calls) == 2
 

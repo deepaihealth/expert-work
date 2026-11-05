@@ -30,6 +30,12 @@ NAS_MOUNT = "/mnt/workspace"
 #: 每次 exec 的命名空间里看到的根(B-60):命令串里 bind 的目标、提示词与工具描述的
 #: 锚、文件工具的 ``ws``。绑了 agent 就是它自己的目录,没绑就是整个用户根。
 EXEC_VIEW = "/workspace"
+#: B-236 —— 每次 exec 的命名空间里 agent 根的视图:同一个 agent 的所有对话共用(长期
+#: 模板、风格锚、辅助脚本)。绑了 agent 且按对话分目录时 :data:`EXEC_VIEW` 是本对话
+#: 自己的目录(``agents/<key>/threads/<conv>/work``),这里是 ``agents/<key>`` 本身;
+#: 老视图(发布前已开的对话)两者是同一个目录。镜像里建好的空目录(``Dockerfile``),
+#: 没有它 exec 以 97 退出,不回落。
+AGENT_VIEW = "/agent"
 
 #: 沙箱镜像里 ``HOME``/``MPLCONFIGDIR`` 的落点(沙箱迁移波 2 Task 9,
 #: 2026-08-07)。此前 ``HOME`` 就是 :data:`NAS_MOUNT`;波 2 起该路径由

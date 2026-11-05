@@ -47,6 +47,7 @@ class InMemoryThreadMetaStore(ThreadMetaStore):
             agent_name=agent_name,
             agent_version=agent_version,
             message_count=0,
+            workspace_layout="conversation",
             created_at=now,
             updated_at=now,
         )
@@ -288,6 +289,15 @@ class InMemoryThreadMetaStore(ThreadMetaStore):
             return False
         self._rows[thread_id] = row.model_copy(
             update={"message_count": count, "updated_at": datetime.now(UTC)}
+        )
+        return True
+
+    async def promote_workspace_layout(self, thread_id: UUID, *, tenant_id: UUID) -> bool:
+        row = self._rows.get(thread_id)
+        if row is None or row.tenant_id != tenant_id or row.workspace_layout != "agent_root":
+            return False
+        self._rows[thread_id] = row.model_copy(
+            update={"workspace_layout": "conversation", "updated_at": datetime.now(UTC)}
         )
         return True
 

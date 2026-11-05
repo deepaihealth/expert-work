@@ -468,7 +468,7 @@ async def test_save_artifact_stats_the_explicit_path_not_the_name() -> None:
 
 @pytest.mark.asyncio
 async def test_save_artifact_refuses_the_reserved_shared_segment() -> None:
-    with pytest.raises(ValueError, match="reserved"):
+    with pytest.raises(ValueError, match="read-only shared area"):
         await SaveArtifactTool(
             snapshots=_snapshots(), store=InMemoryArtifactStore(), client=_sandbox()
         ).call({"name": "x", "path": "shared/x.md"}, ctx=_ctx(agent_key="me-aaaaaaaa"))
@@ -514,7 +514,7 @@ async def test_save_artifact_folds_absolute_paths_like_the_file_tools(
 
 @pytest.mark.asyncio
 async def test_save_artifact_rejects_another_agents_tree() -> None:
-    with pytest.raises(ValueError, match="reserved agents/ tree"):
+    with pytest.raises(ValueError, match="reserved layout segment"):
         await SaveArtifactTool(
             snapshots=_snapshots(), store=InMemoryArtifactStore(), client=_sandbox()
         ).call(

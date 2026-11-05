@@ -644,3 +644,22 @@ async def test_get_workspace_limit_follows_tenant_quota(
     )
     resp = await client.get("/v1/workspace")
     assert resp.json()["data"]["limit_bytes"] == 123_456_789
+
+
+@pytest.mark.asyncio
+async def test_delete_file_also_drops_its_versions(
+    setup: tuple[AsyncClient, RecordingWorkspaceStore, UUID],
+) -> None:
+    """B-236 review 8 —— 删文件接口删掉文件之后,连它在 /agent 的历史版本一起删。"""
+    client, _supervisor, user_id = setup
+    deleted: list[tuple[UUID, UUID, str]] = []
+
+    class _Versions:
+        async def delete_for_path(self, *, tenant_id: UUID, user_id: UUID, path: str) -> int:
+            deleted.append((tenant_id, user_id, path))
+            return 1
+
+    client._transport.app.state.agent_file_versions = _Versions()  # type: ignore[attr-defined]
+    resp = await client.delete("/v1/workspace/file", params={"path": "agents/k/tpl/t.md"})
+    assert resp.status_code == 200, resp.text
+    assert deleted == [(_TENANT, user_id, "agents/k/tpl/t.md")]

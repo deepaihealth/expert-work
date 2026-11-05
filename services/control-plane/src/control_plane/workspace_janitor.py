@@ -57,7 +57,9 @@ from expert_work.persistence.rls import (
 from expert_work.persistence.workspace import UserWorkspaceStore
 from expert_work.persistence.workspace.layout import (
     WORKSPACE_AGENTS_DIR,
+    WORKSPACE_CONVERSATION_WORK_DIR,
     WORKSPACE_INPUTS_DIR,
+    WORKSPACE_THREADS_DIR,
     WORKSPACE_UPLOADS_DIR,
 )
 from expert_work.runtime.storage import ObjectStore
@@ -432,6 +434,101 @@ def _reclaim_target(
     return files, dirs
 
 
+def _reclaim_base(base_fd: int, *, scope: _ReclaimScope, now: float) -> dict[str, tuple[int, int]]:
+    """在一个**已经打开**的平台目录宿主(agent 根,或 B-262 起某个对话的 ``work/``)里按
+    :data:`_POLICIES` 逐条回收,返回 ``{label: (文件数, 目录数)}``。"""
+    tally = {policy.label: (0, 0) for policy in _POLICIES}
+    for policy in _POLICIES:
+        target = _TARGETS[policy.label]
+        if target is None:
+            # 还没有落点的策略(``artifacts``),见 _TARGETS 上方注释。
+            # 注意这与 ``enabled=False`` 的 ``uploads`` **不对称**:
+            # uploads 有落点,于是照样逐 agent 下降 + 全量 scandir,
+            # 只为对每个条目求一个恒假的谓词(「关着的策略也要走到判
+            # 定」是 brief 的明确要求,B-63 拨开关那天才不是新代码);
+            # 而没有落点的这条连下降都做不了。代价:上传件多的用户,
+            # 每轮白扫一遍 uploads/。拨开关时这笔开销就变成了实际工作。
+            continue
+        try:
+            files, dirs = _reclaim_target(base_fd, policy, target, now, scope)
+        except FileNotFoundError:
+            continue  # 这里没有这一层目录(常态)
+        except OSError:
+            # 软链(ELOOP/ENOTDIR)、权限、ESTALE —— 都只跳过这一条
+            logger.warning(
+                "workspace_janitor.reclaim_base_unusable tenant=%s user=%s agent=%s policy=%s",
+                scope.tenant_id,
+                scope.user_id,
+                scope.agent_key,
+                policy.label,
+            )
+            continue
+        if files or dirs:
+            logger.info(
+                "workspace_janitor.reclaimed tenant=%s user=%s agent=%s policy=%s files=%d dirs=%d",
+                scope.tenant_id,
+                scope.user_id,
+                scope.agent_key,
+                policy.label,
+                files,
+                dirs,
+            )
+        tally[policy.label] = (files, dirs)
+    return tally
+
+
+def _merge(
+    tally: dict[str, tuple[int, int]], more: dict[str, tuple[int, int]]
+) -> dict[str, tuple[int, int]]:
+    return {
+        label: (files + more.get(label, (0, 0))[0], dirs + more.get(label, (0, 0))[1])
+        for label, (files, dirs) in tally.items()
+    }
+
+
+def _reclaim_conversations(
+    agent_fd: int, *, scope: _ReclaimScope, now: float
+) -> dict[str, tuple[int, int]]:
+    """B-262 P1 —— 对话视图的平台目录在 ``threads/<conv>/work/`` 下,逐个对话同样回收。
+
+    ``threads`` / 对话目录 / ``work`` 三段都走 :func:`_open_dir`(载荷写得进本对话那一格,
+    能把 ``work`` 换成软链);对话目录名只认规范 UUID。单个对话失败 log + 继续。
+    """
+    tally = {policy.label: (0, 0) for policy in _POLICIES}
+    try:
+        with _open_dir(WORKSPACE_THREADS_DIR, parent=agent_fd) as threads_fd:
+            with os.scandir(threads_fd) as entries:
+                convs = sorted(
+                    e.name for e in entries if _is_plain_dir(e) and _is_uuid_name(e.name)
+                )
+            for conv in convs:
+                try:
+                    with (
+                        _open_dir(conv, parent=threads_fd) as conv_fd,
+                        _open_dir(WORKSPACE_CONVERSATION_WORK_DIR, parent=conv_fd) as work_fd,
+                    ):
+                        tally = _merge(tally, _reclaim_base(work_fd, scope=scope, now=now))
+                except FileNotFoundError:
+                    continue  # 这个对话还没有 work/
+                except OSError:
+                    logger.warning(
+                        "workspace_janitor.reclaim_conversation_failed tenant=%s user=%s agent=%s",
+                        scope.tenant_id,
+                        scope.user_id,
+                        scope.agent_key,
+                    )
+    except FileNotFoundError:
+        return tally  # 这个 agent 还没有对话视图的对话
+    except OSError:
+        logger.warning(
+            "workspace_janitor.reclaim_conversations_unusable tenant=%s user=%s agent=%s",
+            scope.tenant_id,
+            scope.user_id,
+            scope.agent_key,
+        )
+    return tally
+
+
 def _reclaim_user(
     user_dir: Path, *, tenant_id: UUID, user_id: UUID, now: float
 ) -> dict[str, tuple[int, int]]:
@@ -439,7 +536,8 @@ def _reclaim_user(
 
     ``agents/`` 下是 agent key(**不是 UUID**),复用不了 ``_list_uuid_dirs``;而且整条
     下降链必须走 :func:`_open_dir`,不能把路径字符串交给 ``scandir``。单个 agent 失败
-    log + 继续 —— 一个 ESTALE 不该带走这一轮其余的 agent。
+    log + 继续 —— 一个 ESTALE 不该带走这一轮其余的 agent。B-262 起每个 agent 根之外,
+    还回收它各对话 ``threads/<conv>/work/`` 下的同名目录(:func:`_reclaim_conversations`)。
 
     删成功就地记一条 ``(tenant, user, agent, policy)`` 粒度的日志:这是一条**不可逆**
     的删除路径,事后要答得出「谁的哪个 agent、按哪条策略、丢了几个」。**只记标识与计
@@ -455,45 +553,10 @@ def _reclaim_user(
                 scope = _ReclaimScope(tenant_id=tenant_id, user_id=user_id, agent_key=agent_key)
                 try:
                     with _open_dir(agent_key, parent=agents_fd) as agent_fd:
-                        for policy in _POLICIES:
-                            target = _TARGETS[policy.label]
-                            if target is None:
-                                # 还没有落点的策略(``artifacts``),见 _TARGETS 上方注释。
-                                # 注意这与 ``enabled=False`` 的 ``uploads`` **不对称**:
-                                # uploads 有落点,于是照样逐 agent 下降 + 全量 scandir,
-                                # 只为对每个条目求一个恒假的谓词(「关着的策略也要走到判
-                                # 定」是 brief 的明确要求,B-63 拨开关那天才不是新代码);
-                                # 而没有落点的这条连下降都做不了。代价:上传件多的用户,
-                                # 每轮白扫一遍 uploads/。拨开关时这笔开销就变成了实际工作。
-                                continue
-                            try:
-                                files, dirs = _reclaim_target(agent_fd, policy, target, now, scope)
-                            except FileNotFoundError:
-                                continue  # 这个 agent 没有这一层目录(常态)
-                            except OSError:
-                                # 软链(ELOOP/ENOTDIR)、权限、ESTALE —— 都只跳过这一条
-                                logger.warning(
-                                    "workspace_janitor.reclaim_base_unusable "
-                                    "tenant=%s user=%s agent=%s policy=%s",
-                                    tenant_id,
-                                    user_id,
-                                    agent_key,
-                                    policy.label,
-                                )
-                                continue
-                            if files or dirs:
-                                logger.info(
-                                    "workspace_janitor.reclaimed "
-                                    "tenant=%s user=%s agent=%s policy=%s files=%d dirs=%d",
-                                    tenant_id,
-                                    user_id,
-                                    agent_key,
-                                    policy.label,
-                                    files,
-                                    dirs,
-                                )
-                            had_files, had_dirs = tally[policy.label]
-                            tally[policy.label] = (had_files + files, had_dirs + dirs)
+                        tally = _merge(tally, _reclaim_base(agent_fd, scope=scope, now=now))
+                        tally = _merge(
+                            tally, _reclaim_conversations(agent_fd, scope=scope, now=now)
+                        )
                 except OSError:
                     logger.warning(
                         "workspace_janitor.reclaim_agent_failed tenant=%s user=%s agent=%s",

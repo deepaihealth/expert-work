@@ -30,7 +30,13 @@ from expert_work.persistence.workspace.dlq import (
     VolumeOpKind as VolumeOpKind,
 )
 from expert_work.persistence.workspace.layout import (
+    AGENT_FILE_VERSIONS_DIR as AGENT_FILE_VERSIONS_DIR,
+)
+from expert_work.persistence.workspace.layout import (
     ARTIFACT_SNAPSHOT_DIR as ARTIFACT_SNAPSHOT_DIR,
+)
+from expert_work.persistence.workspace.layout import (
+    RENDERED_CROP_DIR as RENDERED_CROP_DIR,
 )
 from expert_work.persistence.workspace.layout import (
     RENDERED_FIGURE_DIR as RENDERED_FIGURE_DIR,
@@ -75,16 +81,25 @@ from expert_work.persistence.workspace.layout import (
     WORKSPACE_UPLOADS_DIR as WORKSPACE_UPLOADS_DIR,
 )
 from expert_work.persistence.workspace.layout import (
+    agent_file_versions_dir as agent_file_versions_dir,
+)
+from expert_work.persistence.workspace.layout import (
     artifact_snapshot_dir as artifact_snapshot_dir,
 )
 from expert_work.persistence.workspace.layout import (
     is_delete_protected_workspace_path as is_delete_protected_workspace_path,
 )
 from expert_work.persistence.workspace.layout import (
+    is_rendered_crop_rel as is_rendered_crop_rel,
+)
+from expert_work.persistence.workspace.layout import (
     is_rendered_figure_rel as is_rendered_figure_rel,
 )
 from expert_work.persistence.workspace.layout import (
     is_reserved_workspace_path as is_reserved_workspace_path,
+)
+from expert_work.persistence.workspace.layout import (
+    region_crop_stem as region_crop_stem,
 )
 from expert_work.persistence.workspace.memory import (
     InMemoryUserWorkspaceStore as InMemoryUserWorkspaceStore,
@@ -94,7 +109,9 @@ from expert_work.persistence.workspace.sql import (
 )
 
 __all__ = [
+    "AGENT_FILE_VERSIONS_DIR",
     "ARTIFACT_SNAPSHOT_DIR",
+    "RENDERED_CROP_DIR",
     "RENDERED_FIGURE_DIR",
     "RENDERED_FIGURE_PAGE_STEM",
     "RENDERED_FIGURE_SHA_HEX_LEN",
@@ -118,9 +135,12 @@ __all__ = [
     "VolumeDLQRow",
     "VolumeOpKind",
     "WorkspaceNotFoundError",
+    "agent_file_versions_dir",
     "artifact_snapshot_dir",
     "is_delete_protected_workspace_path",
+    "is_rendered_crop_rel",
     "is_rendered_figure_rel",
     "is_reserved_workspace_path",
+    "region_crop_stem",
     "workspace_volume_name",
 ]

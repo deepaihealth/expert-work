@@ -56,6 +56,7 @@ from expert_work.persistence import (
     create_async_session_factory,
 )
 from expert_work.persistence.knowledge.base import (
+    DiscardedEdits,
     KnowledgeStore,
     ManualPassage,
     Passage,
@@ -420,7 +421,9 @@ async def test_a_lost_switch_off_with_no_text_left_is_listed_for_review(
         True,
     )
     assert (lost.revision, lost.orphaned_at is not None) == (0, True)
-    assert await doc.store.discard_unapplied_revisions(**doc.scope) == 1
+    assert await doc.store.discard_unapplied_revisions(**doc.scope) == DiscardedEdits(
+        entries=1, revisions=1
+    )
     assert await doc.store.list_unapplied_revisions(**doc.scope) == []
     assert await doc.store.list_switch_offs(**doc.scope) == []
 
@@ -445,7 +448,8 @@ async def test_a_record_discarded_while_an_ingest_runs_stays_gone(
         records = await read(**kwargs)
         if not seen:
             seen.extend(records)
-            assert await doc.store.discard_unapplied_revisions(**doc.scope) == 1
+            discarded = await doc.store.discard_unapplied_revisions(**doc.scope)
+            assert discarded == DiscardedEdits(entries=1, revisions=1)
         return records
 
     doc.store.list_switch_offs = list_then_discard  # type: ignore[method-assign]

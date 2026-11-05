@@ -20,22 +20,29 @@ import io
 import logging
 import re
 import zipfile
+from collections.abc import Mapping
 from dataclasses import dataclass
-from typing import Annotated, Final
+from pathlib import PurePosixPath
+from typing import Annotated, Any, Final
 from uuid import UUID, uuid4
 
 from fastapi import APIRouter, Depends, File, HTTPException, Request, UploadFile
 from fastapi.responses import JSONResponse, Response
 
 from control_plane.api._authz import console_only, require, require_key_scope
-from control_plane.api._image_sanitize import ImageSanitizeError, strip_exif
+from control_plane.api._image_sanitize import ImageSanitizeError, ImageTooLargeError, strip_exif
 from control_plane.api._quota_admission import check_admission
 from control_plane.api._user_scope import (
     caller_owns_thread,
     get_user_repo,
     resolve_caller_user_id,
 )
-from control_plane.api._workspace_shared import thread_agent_key, workspace_agent_path
+from control_plane.api._workspace_shared import (
+    conversation_workspace_path,
+    thread_agent_key,
+    thread_conversation_id,
+    thread_workspace_path,
+)
 from control_plane.audit import emit as audit_emit
 from control_plane.quota.base import QuotaService
 from control_plane.settings import Settings
@@ -43,12 +50,26 @@ from expert_work.common.observability import current_trace_id_hex
 from expert_work.persistence import WORKSPACE_UPLOADS_DIR
 from expert_work.persistence.image_upload import ImageUploadStore
 from expert_work.persistence.tenant_user import TenantUserStore
-from expert_work.protocol import AuditAction, AuditResult, QuotaDimension
+from expert_work.protocol import (
+    AuditAction,
+    AuditResult,
+    QuotaDimension,
+    ThreadMeta,
+    UserUpload,
+    render_upload_id,
+)
 from expert_work.protocol.multimodal import ImageRef
 from expert_work.runtime.audit.logger import AuditLogger
 from expert_work.runtime.storage import ObjectStore
 from orchestrator.tools import SandboxSupervisorError, WorkspacePermissionError, WorkspaceStore
-from orchestrator.tools.sandbox import WorkspaceQuotaExceededError
+from orchestrator.tools.nas_workspace_store import _WorkspacePathNotFoundError
+from orchestrator.tools.sandbox import (
+    WorkspaceFileExistsError,
+    WorkspaceFileNotFoundError,
+    WorkspaceFileTooLargeError,
+    WorkspaceNotAFileError,
+    WorkspaceQuotaExceededError,
+)
 
 logger = logging.getLogger("expert_work.control_plane.uploads")
 
@@ -90,6 +111,9 @@ _UPLOAD_DIR: Final[str] = WORKSPACE_UPLOADS_DIR
 #: outside ``\w`` and collapse to ``_``. The previous ASCII-only set is a
 #: strict subset, so every historically issued ``upload_id`` still validates.
 _SAFE_STEM_RE: Final[re.Pattern[str]] = re.compile(r"[^\w.-]+")
+#: B-262 —— 单个文件名的字节上限(NAME_MAX)与换名后缀(``-`` + 最长 12 位随机)要留的字节。
+_MAX_LEAF_BYTES: Final[int] = 255
+_RENAME_SUFFIX_BYTES: Final[int] = 13
 
 
 def _safe_workspace_name(filename: str, ext: str) -> str:
@@ -102,7 +126,193 @@ def _safe_workspace_name(filename: str, ext: str) -> str:
     stem = _SAFE_STEM_RE.sub("_", filename.rsplit("/", 1)[-1].rsplit(".", 1)[0]).strip("._")
     if not stem:
         stem = uuid4().hex
-    return f"{_UPLOAD_DIR}/{stem[:120]}{ext}"
+    # B-262 —— 再按 UTF-8 字节截:文件名上限 255 字节,换名要加 ``-<12 位>``。中文一字 3 字节,
+    # 只按 120 字截的话,换名后超长、报错 502 而不是换名。截在字符边界上(``ignore`` 丢半个字)。
+    max_bytes = _MAX_LEAF_BYTES - _RENAME_SUFFIX_BYTES - len(ext.encode())
+    stem = stem[:120].encode()[:max_bytes].decode("utf-8", "ignore")
+    return f"{_UPLOAD_DIR}/{stem}{ext}"
+
+
+#: B-262 —— 同名不同内容时,新名字的后缀取内容 sha256 的前几位(``report-3f9a1c2b.pdf``)。
+#: 取内容而不是序号:同一份资料再传一次落到同一个名字上(复用),模型也看得出这是另一份。
+_NAME_TAG_HEX_LEN: Final[int] = 8
+#: 内容后缀那个名字也被别的内容占了(32 位前缀撞上,实际碰不到)之后,再试几个随机后缀。
+_RANDOM_NAME_ATTEMPTS: Final[int] = 3
+
+
+def _tagged_name(workspace_path: str, ext: str, tag: str) -> str:
+    """``uploads/report.pdf`` + ``3f9a1c2b`` → ``uploads/report-3f9a1c2b.pdf``(B-262)。
+
+    后缀只含 ``[0-9a-f]`` 与 ``-``,结果仍是 :func:`is_safe_document_upload_id` 认的形状。"""
+    return f"{workspace_path[: len(workspace_path) - len(ext)]}-{tag}{ext}"
+
+
+def original_document_name(ref: str, sha256_hex: str | None) -> str | None:
+    """B-275 —— :func:`_tagged_name` 的反函数:换过名的上传(``uploads/report-3f9a1c2b.pdf``)
+    回它本来的名字(叶子 ``report.pdf``);没换过名、认不出,回 ``None``。
+
+    只认「后缀 = 这份内容 sha256 的前 8 位」:用户自己起的名字里碰巧有 8 位十六进制
+    (``report-deadbeef.pdf``)不是平台换的,不能当成换过名。没记 sha256 的老登记行(B-271
+    之前)一律 ``None``,不猜。随机后缀(内容后缀那个名字也被占了,实际碰不到)认不出,同样
+    ``None`` —— 那一行就照旧只写实际名。
+    """
+    if not sha256_hex:
+        return None
+    leaf = ref.rsplit("/", 1)[-1]
+    marker = f"-{sha256_hex[:_NAME_TAG_HEX_LEN]}"
+    at = leaf.rfind(marker)
+    if at <= 0:
+        return None
+    ext = leaf[at + len(marker) :]
+    if ext and ext != PurePosixPath(leaf).suffix:
+        return None
+    return f"{leaf[:at]}{ext}"
+
+
+async def _same_bytes(
+    workspace_store: WorkspaceStore, *, tenant_id: UUID, user_id: UUID, path: str, raw: bytes
+) -> bool:
+    """名字上已有的那个文件,内容是不是逐字节等于 ``raw``(B-262)。
+
+    读不出来(太大、是目录、刚被删)一律当「不同」,换下一个名字;读不动(权限)是服务端
+    配置问题,原样抛给调用方翻 500。"""
+    try:
+        existing = await workspace_store.read_file(
+            tenant_id=tenant_id, user_id=user_id, path=path, max_bytes=len(raw)
+        )
+    except WorkspacePermissionError:
+        raise
+    except SandboxSupervisorError:
+        return False
+    return existing == raw
+
+
+async def _land_document_bytes(
+    workspace_store: WorkspaceStore,
+    *,
+    tenant_id: UUID,
+    user_id: UUID,
+    agent_key: str,
+    conv_id: UUID | None,
+    workspace_path: str,
+    ext: str,
+    raw: bytes,
+    sha256_hex: str,
+) -> tuple[str, bool]:
+    """B-262 —— 把上传落到一个**不覆盖任何已有文件**的名字上,回 ``(实际名字, 是否复用)``。
+
+    老视图里同一智能体的所有对话共用 ``uploads/``(对接方一个用户下跑很多终端客户),原来同名
+    上传直接覆盖 —— 客户 B 的 ``report.pdf`` 顶掉客户 A 的。P1 起对话视图的会话落本对话自己的
+    ``uploads/``(``conv_id``),同一对话里的同名规则不变。现在按顺序试:原名 →
+    ``<原名>-<内容 sha256 前 8 位>`` → 几个随机后缀。每个名字都用 ``create_file``(不存在
+    才建,原子),所以两个同名上传同时到也只有一个拿到原名。名字被占时比一下内容:
+    逐字节相同就复用那个文件(同一份资料重复上传,不多存一份、不重复记配额)。
+    """
+    candidates = [workspace_path, _tagged_name(workspace_path, ext, sha256_hex[:_NAME_TAG_HEX_LEN])]
+    candidates += [
+        _tagged_name(workspace_path, ext, uuid4().hex[:12]) for _ in range(_RANDOM_NAME_ATTEMPTS)
+    ]
+    for candidate in candidates:
+        stored = conversation_workspace_path(candidate, agent_key=agent_key, conv_id=conv_id)
+        try:
+            await workspace_store.create_file(
+                tenant_id=tenant_id, user_id=user_id, path=stored, data=raw
+            )
+        except WorkspaceFileExistsError:
+            if await _same_bytes(
+                workspace_store, tenant_id=tenant_id, user_id=user_id, path=stored, raw=raw
+            ):
+                return candidate, True
+            continue
+        return candidate, False
+    msg = f"no free upload name for {workspace_path!r}"
+    raise SandboxSupervisorError(msg)
+
+
+async def copy_document_into_thread(
+    account: LandingAccount,
+    *,
+    tenant_id: UUID,
+    user_id: UUID,
+    upload: UserUpload,
+    ref: str,
+    source: ThreadMeta,
+    target: ThreadMeta,
+) -> str:
+    """B-262 P1 §3 —— 会话 ``source`` 的上传 ``ref``(``uploads/<名字>``)挂到会话 ``target``
+    的 run 上:复制进 ``target`` 自己的 ``uploads/``,回实际落地的名字(同 P0 的同名规则:同内容
+    复用、不同内容加 ``-<sha8>``)。两条会话的那个位置本来就是同一个文件(都是同一 agent 的老
+    视图)时不复制,原样回 ``ref``。
+
+    源按 ``source`` 自己的 agent 与布局定位,不按 ``target`` 的目录找同名文件。
+
+    B-262 review —— 像一次上传一样记账(:func:`_land_and_account`:配额闸、写了才记字节、
+    给 ``target`` 记一条 ``DOCUMENT_UPLOAD`` 审计,``copied_from_upload_id`` 是登记行的
+    ``upl_`` id);不新建登记行。源文件大小与登记行对不上(源对话里被改写过)就拒,不悄悄复制
+    改过的内容(只比大小:登记行与审计都不便宜地给出 sha256)。
+
+    失败抛 ``HTTPException``,状态码同上传端点(503 / 429 / 500 / 502);另有源文件不在 404、
+    源被改过 409(读按登记的大小 + 1 封顶,读超了也算改过)。
+    """
+    store = account.workspace_store
+    if store is None:
+        raise HTTPException(status_code=503, detail="document upload unavailable: no sandbox")
+    source_path = thread_workspace_path(ref, source)
+    if source_path == thread_workspace_path(ref, target):
+        return ref
+    changed = HTTPException(
+        status_code=409,
+        detail=(
+            "the uploaded file was changed in its session after it was uploaded; upload it again"
+        ),
+    )
+    try:
+        # 按登记的大小 + 1 封顶读:变大 / 被换掉的源不整个读进内存再比(review 2)。
+        raw = await store.read_file(
+            tenant_id=tenant_id,
+            user_id=user_id,
+            path=source_path,
+            max_bytes=upload.size_bytes + 1,
+        )
+    except (WorkspaceFileNotFoundError, WorkspaceNotAFileError, _WorkspacePathNotFoundError) as exc:
+        raise HTTPException(status_code=404, detail="upload content not found") from exc
+    except WorkspaceFileTooLargeError as exc:
+        # 上传时就过了大小上限,读超了只能是之后被改大了。
+        raise changed from exc
+    except WorkspacePermissionError as exc:
+        logger.warning("upload.copy_read_permission_denied", exc_info=True)
+        raise HTTPException(status_code=500, detail="workspace read failed") from exc
+    except SandboxSupervisorError as exc:
+        logger.warning("upload.copy_read_failed", exc_info=True)
+        raise HTTPException(status_code=502, detail="workspace read failed") from exc
+    if len(raw) != upload.size_bytes:
+        raise changed
+    result = await _land_and_account(
+        account,
+        tenant_id=tenant_id,
+        user_id=user_id,
+        thread_id=target.thread_id,
+        agent_key=thread_agent_key(target),
+        conv_id=thread_conversation_id(target),
+        workspace_path=ref,
+        ext=PurePosixPath(ref).suffix,
+        raw=raw,
+        content_type=upload.mime_type,
+        extra_details={"copied_from_upload_id": render_upload_id(upload.id)},
+    )
+    return result.path
+
+
+#: 上传失败(``HTTPException`` 的状态码)→ 对外信封的 ``code``。对外上传端点与跨会话复制附件
+#: (B-262)共用这一张表:同一种失败对接方看到的是同一个码。
+UPLOAD_ERROR_CODES: Final[dict[int, str]] = {
+    400: "INVALID_UPLOAD",
+    413: "UPLOAD_TOO_LARGE",
+    429: "QUOTA_EXCEEDED",
+    500: "UPLOAD_FAILED",
+    502: "UPLOAD_FAILED",
+    503: "UPLOAD_UNAVAILABLE",
+}
 
 
 def is_safe_document_upload_id(value: str) -> bool:
@@ -166,6 +376,10 @@ class DocumentUploadResult:
 
     path: str
     size_bytes: int
+    #: B-271 —— 落地字节的 sha256(十六进制),写进 ``user_upload.sha256``。
+    sha256: str
+    #: B-262 —— 同名同内容的文件已经在了,这次没写,``path`` 指向那个已有文件。
+    reused: bool = False
 
 
 async def _handle_document_upload(
@@ -178,6 +392,7 @@ async def _handle_document_upload(
     caller_user_id: UUID | None,
     thread_id: UUID,
     agent_key: str,
+    conv_id: UUID | None,
     settings: Settings,
     workspace_store: WorkspaceStore | None,
     audit: AuditLogger,
@@ -215,13 +430,78 @@ async def _handle_document_upload(
         raise HTTPException(status_code=400, detail="uploaded file is empty")
     _reject_zip_bomb(raw, ext)
 
-    quota_service = getattr(request.app.state, "workspace_quota_service", None)
+    return await _land_and_account(
+        LandingAccount(
+            workspace_store=workspace_store,
+            audit=audit,
+            actor_id=getattr(request.state, "actor_id", "anonymous"),
+            quota_service=getattr(request.app.state, "workspace_quota_service", None),
+        ),
+        tenant_id=tenant_id,
+        user_id=caller_user_id,
+        thread_id=thread_id,
+        agent_key=agent_key,
+        conv_id=conv_id,
+        workspace_path=_safe_workspace_name(filename, ext),
+        ext=ext,
+        raw=raw,
+        content_type=content_type,
+    )
+
+
+@dataclass(frozen=True)
+class LandingAccount:
+    """B-262 review —— 落一份文档进工作区时记账要用的东西:工作区、审计、配额。
+
+    上传端点与跨会话复制附件(:func:`copy_document_into_thread`)共用 :func:`_land_and_account`,
+    配额闸、记账、``DOCUMENT_UPLOAD`` 审计行只写一份。``quota_service`` 未接线(非 NAS
+    部署)为 ``None``。
+    """
+
+    workspace_store: WorkspaceStore | None
+    audit: AuditLogger
+    actor_id: str
+    quota_service: Any = None
+
+    @classmethod
+    def from_request(cls, request: Request) -> LandingAccount:
+        state = request.app.state
+        return cls(
+            workspace_store=getattr(state, "workspace_store", None),
+            audit=state.audit_logger,
+            actor_id=getattr(request.state, "actor_id", "anonymous"),
+            quota_service=getattr(state, "workspace_quota_service", None),
+        )
+
+
+async def _land_and_account(
+    account: LandingAccount,
+    *,
+    tenant_id: UUID,
+    user_id: UUID,
+    thread_id: UUID,
+    agent_key: str,
+    conv_id: UUID | None,
+    workspace_path: str,
+    ext: str,
+    raw: bytes,
+    content_type: str,
+    extra_details: Mapping[str, Any] | None = None,
+) -> DocumentUploadResult:
+    """配额闸 → 落盘(不覆盖,见 :func:`_land_document_bytes`)→ 审计 → 记账。
+
+    失败抛 ``HTTPException``:没有工作区 503、写完会超配额 429、写权限 500、其余写失败 502
+    (同上传端点)。
+    """
+    if account.workspace_store is None:
+        raise HTTPException(status_code=503, detail="document upload unavailable: no sandbox")
+    quota_service = account.quota_service
     if quota_service is not None:
         try:
             # 闸 B(spec § 3.3):写完会超就拦(+incoming >)。与闸 A 的
             # >= 谓词刻意不同 —— 上传知道 incoming 大小,acquire 不知道。
             await quota_service.check_upload(
-                tenant_id=tenant_id, user_id=caller_user_id, incoming_bytes=len(raw)
+                tenant_id=tenant_id, user_id=user_id, incoming_bytes=len(raw)
             )
         except WorkspaceQuotaExceededError as exc:
             # 固定文案不插值异常对象(本文件既有约定);429 与 supervisor 时代的
@@ -232,20 +512,29 @@ async def _handle_document_upload(
                 detail="workspace is full — delete files to free space",
             ) from exc
 
-    # ``workspace_path`` 是**对 agent 相对**的 ``uploads/<name>``——它同时是
-    # 回给调用方的 ``upload_id``,也是 run 里 ``read_document`` 收到的参数,
-    # 两处都在 agent 根下解析(PR3),所以这个值不带前缀。
+    # ``workspace_path`` 是**对会话 ``/workspace`` 相对**的 ``uploads/<name>``——它同时是
+    # 回给调用方的 ``upload_id``,也是 run 里 ``read_document`` 收到的参数,两处都相对
+    # 这个会话的 ``/workspace`` 解析(老视图是 agent 根,B-262 起对话视图是本对话的
+    # ``work/``,由 ``conv_id`` 决定),所以这个值不带前缀。
     #
     # 落盘要投影:``workspace_store`` 是按 ``(tenant, user)`` 开的,不知道
     # agent。不投影的话新上传永远落扁平根,而 run 去 agent 根下找——今天靠
     # 迁移期读回落兜着,Task 14 摘掉回落就断(B-50 补漏)。
-    workspace_path = _safe_workspace_name(filename, ext)
+    #
+    # B-262 —— 名字不一定是用户给的那个:同名已被别的内容占了就换名(见
+    # ``_land_document_bytes``)。下面回给调用方、写审计、进 run 的一律是实际落盘的名字。
+    sha256_hex = hashlib.sha256(raw).hexdigest()
     try:
-        await workspace_store.write_file(
+        landed, reused = await _land_document_bytes(
+            account.workspace_store,
             tenant_id=tenant_id,
-            user_id=caller_user_id,
-            path=workspace_agent_path(workspace_path, agent_key=agent_key),
-            data=raw,
+            user_id=user_id,
+            agent_key=agent_key,
+            conv_id=conv_id,
+            workspace_path=workspace_path,
+            ext=ext,
+            raw=raw,
+            sha256_hex=sha256_hex,
         )
     except WorkspacePermissionError as exc:
         # 权限失败是服务端配置问题(共享 uid 没配上/存量目录属主没迁移/mode 不
@@ -263,38 +552,38 @@ async def _handle_document_upload(
         logger.warning("upload.write_failed", exc_info=True)
         raise HTTPException(status_code=502, detail="workspace write failed") from exc
 
-    actor_id: str = getattr(request.state, "actor_id", "anonymous")
-    sha256_hex = hashlib.sha256(raw).hexdigest()
     await audit_emit(
-        audit,
+        account.audit,
         tenant_id=tenant_id,
-        actor_id=actor_id,
+        actor_id=account.actor_id,
         action=AuditAction.DOCUMENT_UPLOAD,
         resource_type="user_workspace",
-        resource_id=workspace_path,
+        resource_id=landed,
         result=AuditResult.SUCCESS,
         trace_id=current_trace_id_hex(),
         details={
             "thread_id": str(thread_id),
-            "workspace_path": workspace_path,
+            "workspace_path": landed,
             "file_size_bytes": len(raw),
             "mime_type": content_type,
             "sha256": sha256_hex,
+            "reused_existing": reused,
+            **dict(extra_details or {}),
         },
     )
-    if quota_service is not None:
-        # 记账第 1 层(spec § 3.2):增量入账,便宜且即时。同名覆盖上传会
-        # 重复计数 —— 已知偏差,janitor 全量扫兜正,不做减法补偿。写已成功、
+    if quota_service is not None and not reused:
+        # 记账第 1 层(spec § 3.2):增量入账,便宜且即时。B-262 起上传不再覆盖
+        # 同名文件;复用已有文件时没写字节,不记账。写已成功、
         # audit 已记 SUCCESS,记账是 best-effort(与 service 侧 refresh 的取舍
         # 一致):失败不该把整个请求打成 500——客户端分不清"上传失败"还是
         # "记账打嗝",重试还会造重复文件。
         try:
             await quota_service.note_written(
-                tenant_id=tenant_id, user_id=caller_user_id, delta_bytes=len(raw)
+                tenant_id=tenant_id, user_id=user_id, delta_bytes=len(raw)
             )
         except Exception:
             logger.warning("upload.quota_accounting_failed", exc_info=True)
-    return DocumentUploadResult(path=workspace_path, size_bytes=len(raw))
+    return DocumentUploadResult(path=landed, size_bytes=len(raw), sha256=sha256_hex, reused=reused)
 
 
 def _get_object_store(request: Request) -> ObjectStore | None:
@@ -377,7 +666,11 @@ async def _prepare_image_upload(
     # + gets sha256'd for the audit row — every consumer sees the
     # same metadata-free bytes.
     try:
-        raw = strip_exif(raw, mime_type=content_type)
+        raw = strip_exif(raw, mime_type=content_type, max_bytes=max_bytes)
+    except ImageTooLargeError as exc:
+        # B-263:像素数超上限(解压炸弹 / 超大海报扫描)与超字节上限同属「太大」,同一个 413;
+        # 重编码后降质量仍超字节上限的也在这里(B-266 review)。
+        raise HTTPException(status_code=413, detail=str(exc)) from exc
     except ImageSanitizeError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -537,6 +830,7 @@ def build_uploads_router() -> APIRouter:
                 caller_user_id=caller_user_id,
                 thread_id=thread_id,
                 agent_key=thread_agent_key(meta),
+                conv_id=thread_conversation_id(meta),
                 settings=settings,
                 workspace_store=workspace_store,
                 audit=audit,

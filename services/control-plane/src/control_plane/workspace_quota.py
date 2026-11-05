@@ -46,6 +46,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from uuid import UUID
 
+from expert_work.persistence import agent_file_versions_dir
 from expert_work.persistence.quota import TenantQuotaStore
 from expert_work.persistence.workspace import UserWorkspaceStore
 from expert_work.protocol.quota import DEFAULT_WORKSPACE_BYTES_PER_USER, QuotaDimension
@@ -125,8 +126,11 @@ class WorkspaceQuotaService:
         if ws.deleted_at is not None:
             return
         root = workspace_user_root(self._workspace_root, tenant_id, user_id)
+        # B-236 review 7 —— /agent 文件的历史版本住在用户根旁边(沙箱够不着),同样是这个用户
+        # 占的空间,一起算进配额。
+        versions = agent_file_versions_dir(self._workspace_root, tenant_id, user_id)
 
-        def _du() -> int:
+        def _du(root: Path) -> int:
             total = 0
             stack = [root]
             while stack:
@@ -154,7 +158,7 @@ class WorkspaceQuotaService:
                     continue
             return total
 
-        size = await asyncio.to_thread(_du)
+        size = await asyncio.to_thread(lambda: _du(root) + _du(versions))
         await self._user_workspaces.update_size(workspace_id=ws.id, size_bytes=size)
 
     def refresh_soon(self, *, tenant_id: UUID, user_id: UUID) -> None:

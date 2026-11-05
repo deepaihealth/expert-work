@@ -871,6 +871,8 @@ export interface TranslationKeys {
     estimate_item_embedding: string;
     estimate_item_recognition: string;
     estimate_item_figure: string;
+    estimate_item_profile: string;
+    estimate_item_profile_calibration: string;
     estimate_reused_chunks_one: string;
     estimate_reused_chunks_other: string;
     estimate_reused_pages_one: string;
@@ -886,6 +888,7 @@ export interface TranslationKeys {
     estimate_note_text_limit_may_stop_early: string;
     estimate_note_batch_repeats_counted: string;
     estimate_note_figure_extra_calls_not_counted: string;
+    estimate_note_profile_once_per_base: string;
     estimate_footnote: string;
     estimate_duplicate_tag: string;
     estimate_duplicate_of: string;
@@ -1565,6 +1568,8 @@ export interface TranslationKeys {
     knowledge_hint: string;
     knowledge_placeholder: string;
     knowledge_chunk_label: string;
+    knowledge_probe_label: string;
+    knowledge_probe_help: string;
     section_skills: string;
     section_skills_help: string;
     skills_hint: string;
@@ -1773,6 +1778,10 @@ export interface TranslationKeys {
     process_tools_detailed: string;
     process_other: string;
     process_failed: string;
+    process_failed_time: string;
+    process_time_split: string;
+    process_time_split_other: string;
+    process_time_split_tip: string;
     process_empty: string;
     process_more: string;
     process_skills: string;
@@ -1919,6 +1928,13 @@ export interface TranslationKeys {
     transcript_label: string;
     turn_running: string;
     turn_queued: string;
+    turn_queued_behind_minutes: string;
+    turn_queued_behind_under_minute: string;
+    progress_elapsed_minutes: string;
+    progress_elapsed_under_minute: string;
+    progress_step: string;
+    progress_tool_calls: string;
+    progress_workers: string;
     cancel_queued: string;
     thread_queue_full: string;
     turn_no_text: string;
@@ -4214,7 +4230,7 @@ const en: TranslationKeys = {
     review_discard: "Discard all",
     review_discard_confirm_title: "Discard these {{n}} items that were not put back?",
     review_discard_confirm_body: "Their revision history is deleted and cannot be restored.",
-    review_discarded: "Discarded the items that were not put back.",
+    review_discarded: "Discarded {{n}} items that were not put back.",
     review_discard_nothing:
       "Nothing is left to discard (it may have been handled meanwhile). The list was refreshed.",
     needs_admin: "Needs a tenant admin: this deletes data.",
@@ -4610,6 +4626,8 @@ const en: TranslationKeys = {
     estimate_item_embedding: "Embedding: {{units}} chunks · {{tokens}} tokens{{reused}} — {{amount}}",
     estimate_item_recognition: "Scanned-page recognition ({{model}}): {{units}} pages{{reused}} — {{amount}}",
     estimate_item_figure: "Picture descriptions ({{model}}): {{units}} pictures{{reused}} — {{amount}}",
+    estimate_item_profile: "Knowledge base profile ({{model}}): one refresh, up to {{tokens}} tokens — {{amount}}",
+    estimate_item_profile_calibration: "Search probe calibration ({{model}}): {{units}} generic queries · {{tokens}} tokens — {{amount}}",
     estimate_reused_chunks_one: " ({{count}} already embedded, not billed again)",
     estimate_reused_chunks_other: " ({{count}} already embedded, not billed again)",
     estimate_reused_pages_one: " ({{count}} recognized last time, not billed again)",
@@ -4625,6 +4643,7 @@ const en: TranslationKeys = {
     estimate_note_text_limit_may_stop_early: "Recognition stops at the document's text limit; the estimate counts every page.",
     estimate_note_batch_repeats_counted: "A logo repeated across this batch is counted in each document.",
     estimate_note_figure_extra_calls_not_counted: "Each picture is counted as one description; charts and text-heavy pictures may cost more.",
+    estimate_note_profile_once_per_base: "The knowledge base profile is refreshed once per knowledge base after this batch is in, yet every document's estimate counts it (may over-estimate).",
     estimate_footnote: "Chunks, pages and pictures are counted from the local parse; tokens are converted from a local tokenizer and recognition / descriptions use average usage. Billing follows the vendor's reported usage; the actual cost shows here once the ingest is over.",
     estimate_duplicate_tag: "Duplicate",
     estimate_duplicate_of: "Same content as D{{seq}} \"{{name}}\" — not ingested unless you choose to",
@@ -5252,7 +5271,7 @@ const en: TranslationKeys = {
       "The main model can't see images. Configure a vision model to let it read images and figures in documents.",
     vision_clear: "Clear (no image understanding)",
     section_vision_help:
-      "Shown only when the main model is text-only.\nThe vision model answers image-related questions; the main model coordinates.\nLeave empty = the agent can't see images.\nExample: qwen-vl-max",
+      "Shown only when the main model is text-only.\nThe vision model answers image-related questions; the main model coordinates.\nLeave empty = the agent can't see images.\nImage questions default to a quick look (thinking off or its lowest tier); a deep look uses low depth when the vision model's reasoning depth is not set (on models that have one).\nExample: qwen-vl-max",
     section_fallback: "Fallback models",
     section_fallback_help:
       "If the main model fails or times out, the run switches to the fallback models in order instead of failing.\nNone configured = the agent only uses its main model.\nTip: pick fallbacks from different vendors so one vendor's outage doesn't take down the whole chain.",
@@ -5398,6 +5417,8 @@ const en: TranslationKeys = {
     knowledge_hint: "Knowledge bases this agent may search.",
     knowledge_placeholder: "Select or type knowledge base names",
     knowledge_chunk_label: "chunk {{max}}/overlap {{overlap}}",
+    knowledge_probe_label: "Check the knowledge bases for each message",
+    knowledge_probe_help: "Before each reply the platform runs a quick search of the bound knowledge bases with the user's message; when they hold related passages, the model is told to search them first. Turn off only for agents that should not be steered to their knowledge bases.",
     section_skills: "Skills",
     section_skills_help:
       "Skill packages (instructions + scripts) attached to the agent.\nPick from your tenant's and the platform's skills.\nExample: pptx-builder, sql-analyst",
@@ -5626,6 +5647,11 @@ const en: TranslationKeys = {
     process_tools_detailed: "Tools ×{{n}} ({{breakdown}})",
     process_other: "{{n}} other steps",
     process_failed: "{{n}} failed",
+    process_failed_time: "{{n}} failed ({{d}})",
+    process_time_split: "model {{model}} · tools {{tools}}",
+    process_time_split_other: "model {{model}} · tools {{tools}} · other {{other}}",
+    process_time_split_tip:
+      "each step's own time added up; tool calls that ran in parallel in one step count once, as that step's actual time",
     process_empty: "No steps",
     process_more: "{{n}} more steps…",
     process_skills: "Skills",
@@ -5773,6 +5799,13 @@ const en: TranslationKeys = {
     transcript_label: "Conversation",
     turn_running: "Running…",
     turn_queued: "Queued — starts when the previous turn finishes",
+    turn_queued_behind_minutes: "Queued — the previous turn has been running for {{n}} min",
+    turn_queued_behind_under_minute: "Queued — the previous turn has been running for under a minute",
+    progress_elapsed_minutes: "Running for {{n}} min",
+    progress_elapsed_under_minute: "Running for under a minute",
+    progress_step: "step {{n}}",
+    progress_tool_calls: "{{n}} tool calls",
+    progress_workers: "{{n}} subtasks running",
     cancel_queued: "Cancel",
     thread_queue_full: "This conversation's queue is full. Wait for a turn to finish or cancel one, then send again.",
     turn_no_text: "(no text answer)",

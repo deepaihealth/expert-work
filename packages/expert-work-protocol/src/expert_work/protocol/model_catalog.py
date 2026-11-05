@@ -508,6 +508,9 @@ MODEL_CATALOG: dict[Provider, tuple[ModelEntry, ...]] = {
         ),
         ModelEntry(
             name="kimi-k2.5",
+            # B-112 —— B-105 T0(2026-09-24)用平台 key 直调回 404:下架,但留着可解析,
+            # 已经写了它的 manifest 照样能存、能建。改名要先实调。
+            deprecated=True,
             vision=True,
             context_window=256_000,
             thinking="toggle",
@@ -884,6 +887,9 @@ MODEL_CATALOG: dict[Provider, tuple[ModelEntry, ...]] = {
         ),
         ModelEntry(
             name="doubao-seed-2.0-pro",
+            # B-112 —— B-105 T0(2026-09-24)用平台 key 直调回 404:下架,但留着可解析,
+            # 已经写了它的 manifest 照样能存、能建。改名要先实调。
+            deprecated=True,
             vision=True,
             context_window=256_000,
             thinking="effort",
@@ -893,6 +899,9 @@ MODEL_CATALOG: dict[Provider, tuple[ModelEntry, ...]] = {
         ),
         ModelEntry(
             name="doubao-seed-2.0-lite",
+            # B-112 —— B-105 T0(2026-09-24)用平台 key 直调回 404:下架,但留着可解析,
+            # 已经写了它的 manifest 照样能存、能建。改名要先实调。
+            deprecated=True,
             vision=True,
             context_window=256_000,
             thinking="effort",

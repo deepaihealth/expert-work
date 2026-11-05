@@ -38,7 +38,7 @@ from orchestrator.graph_builder._config import (
 from orchestrator.graph_builder.memory import MemoryNode
 from orchestrator.state import AgentState
 from orchestrator.tools.file_ops import SandboxWorkspaceReader
-from orchestrator.tools.registry import ToolContext
+from orchestrator.tools.registry import ToolContext, workspace_view_fields
 from orchestrator.tools.sandbox import SandboxRuntime
 
 logger = logging.getLogger(__name__)
@@ -125,11 +125,15 @@ def make_workspace_ingest_node(*, client: SandboxRuntime) -> MemoryNode:
             _cm_ingest_total.labels(outcome="skipped_no_thread").inc()
             return {}
         with expert_work_span(ExpertWorkComponent.ORCHESTRATOR, "workspace_ingest"):
+            # B-236 —— 回读要在本对话的视图里做:``/agent/threads/`` 只留本线程那一格,
+            # 不带 agent 身份与线程 id 的 exec 看到的是一个被整个盖住的 ``threads/``,
+            # PLAN.md 读成「不存在」,用户的改动被静默丢掉。
             ctx = ToolContext(
                 tenant_id=tenant_id,
                 run_id=configurable_uuid(config, "run_id"),
                 user_id=configurable_uuid(config, "user_id"),
                 cancellation_token=token,
+                **workspace_view_fields(configurable),
             )
             reader = SandboxWorkspaceReader(client=client, ctx=ctx)
             current = state.get("plan")

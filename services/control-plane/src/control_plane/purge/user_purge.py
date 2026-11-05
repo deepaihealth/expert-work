@@ -68,6 +68,7 @@ from expert_work.runtime.runs import RunStore
 from expert_work.runtime.runs.store import MAX_LIST_LIMIT
 from expert_work.runtime.storage import ObjectStore
 from orchestrator.tools import WorkspaceStore
+from orchestrator.tools.agent_file_versions import AgentFileVersionStore
 from orchestrator.tools.artifact_snapshots import ArtifactSnapshotStore
 
 logger = logging.getLogger("expert_work.control_plane.purge.user")
@@ -130,6 +131,9 @@ class PurgeUserDeps:
     #: B-235 —— 产物各版本登记时留下的字节副本。``None`` = 这个部署没有工作区,也就
     #: 不会有副本。
     artifact_snapshots: ArtifactSnapshotStore | None = None
+    #: B-236 第三层 —— ``/agent`` 文件的历史版本(住在用户根旁边,工作区那步删不到)。
+    #: ``None`` = 这个部署不留版本。
+    agent_file_versions: AgentFileVersionStore | None = None
 
 
 @dataclass
@@ -474,6 +478,13 @@ async def purge_user(
             deps.artifact_snapshots.delete_all_for_user(tenant_id=tenant_id, user_id=user_id),
             default=0,
         )
+    if deps.agent_file_versions is not None:
+        summary.deleted["agent_file_version"] = await _step(
+            summary,
+            "agent_file_version",
+            deps.agent_file_versions.delete_all_for_user(tenant_id=tenant_id, user_id=user_id),
+            default=0,
+        )
     summary.deleted["artifact"] = await _step(
         summary,
         "artifact",
@@ -585,6 +596,20 @@ async def purge_user(
         summary.workspace_marked_deleted = "workspace" not in summary.failures
     else:
         summary.failures["workspace"] = "no supervisor client wired"
+    # B-236 review 11/13 —— 软删标记落下之后再删一遍 ``/agent`` 文件的版本:上面第一遍删完到标记落下
+    # 之间结束的 run,它的观察看不到标记,会把 ``.agent-file-versions/{user}`` 又建回来。这一遍之后
+    # 还在写的观察,最后一次写之后会再看一次标记、看到就自己删掉(``agent_file_versions._housekeep``
+    # 的 ``finally``)—— 前提是它在同一个挂载上看得到标记;跨副本的 NFS 属性缓存可能晚几秒,兜底是
+    # 留存作业按用户删整个版本目录。
+    if deps.agent_file_versions is not None:
+        summary.deleted["agent_file_version"] = summary.deleted.get(
+            "agent_file_version", 0
+        ) + await _step(
+            summary,
+            "agent_file_version_after_mark",
+            deps.agent_file_versions.delete_all_for_user(tenant_id=tenant_id, user_id=user_id),
+            default=0,
+        )
 
     # 5) Identity — soft-deactivate the tenant_user row (kept, recoverable).
     summary.deactivated = await _step(

@@ -40,6 +40,9 @@ dependencies = [
     # 2.2 — runtime validation of tool_call args against ToolSpec.parameters
     # (the JSON Schema bound to the LLM) before dispatch.
     "jsonschema>=4.20,<5",
+    # B-266 — ask_image region crops of uploaded / workspace images (host side,
+    # native pixels). Same range as control-plane, which already ships it.
+    "pillow>=12.0,<14",
     # 波 1 —— ACS Agent Sandbox 接入。官方配方钉 <2.25.0(2.25 起的
     # breaking change 与 Agent Sandbox 的组件版本矩阵不兼容),见
     # docs/superpowers/specs/2026-08-03-sandbox-migration-design.md § 八.5

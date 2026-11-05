@@ -8,8 +8,10 @@
 **不在宿主复刻沙箱片段的 ``_render_sha``**(那是片段里对文档字节 + dpi 求的哈希,
 宿主再写一份就是两份算法,迟早漂移)。换成两步:
 
-1. 在**本 agent 作用域**里找 ``.tool_results/*/figures/<doc-sha>/*/_u<unit>/`` 下
-   形状合法的渲染页,取修改时间最新的那一张;
+1. 在**本对话的 run**(B-262,见 :func:`figure_run_ids`)的
+   ``.tool_results/<run>/figures/<doc-sha>/*/_u<unit>/`` 下找形状合法的渲染页,取修改时间
+   最新的那一张。B-262 P1 起对话视图先找本对话 ``work/`` 下的 ``.tool_results``(新渲染都落
+   那里),再找 agent 根下的(迁移过来的老对话自己的 run);老视图只有 agent 根那一处;
 2. **新鲜度闸**:文档自己的修改时间晚于那张渲染 → 不采用,显式失败,让模型重渲。
 
 闸的道理:渲染发生在文档最后一次修改**之后**,渲的就是当前内容。两个方向都会错:
@@ -24,8 +26,9 @@
 **只用** :meth:`WorkspaceStore.list_dir`,而且只往列表里**确认是目录**的条目里走:
 NAS 实现对不存在的目录抛内部异常、内存替身回空列表,两者对「不存在」的说法不同;
 只走确认过的条目,两者的答案就一样(「SQL↔内存 store 谓词必同义」的同一条规矩)。
-有两处**不经确认**直接列(作用域根本身;本 run 自己的目录,见
-:func:`_own_run_candidates`),那两处把 NAS 的「不存在」接住、当空处理 —— 只接
+有三处**不经确认**直接列(作用域根本身;本 run 自己的目录,见
+:func:`_own_run_candidates`;B-262 起本对话其余 run 的目录,见
+:func:`_other_run_candidates`),那三处把 NAS 的「不存在」接住、当空处理 —— 只接
 「不存在」,越界与权限错误照样抛。
 ``list_dir`` 用 ``lstat``,符号链接不会被当成目录走进去。
 
@@ -35,6 +38,7 @@ NAS 实现对不存在的目录抛内部异常、内存替身回空列表,两者
 from __future__ import annotations
 
 import logging
+from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import PurePosixPath
@@ -47,16 +51,18 @@ from expert_work.persistence import (
     WORKSPACE_OVERFLOW_DIR,
     is_rendered_figure_rel,
 )
+from orchestrator.multimodal import parse_rendered_figure_ref
 from orchestrator.tools.nas_workspace_store import _WorkspacePathNotFoundError
 from orchestrator.tools.read_page import (
     _DEFAULT_UNIT_LABEL,
     _UNIT_LABELS,
-    document_sha,
+    figure_scope,
+    render_source,
     workspace_figure_ref,
 )
 from orchestrator.tools.sandbox import WorkspaceFileNotFoundError
-from orchestrator.tools.workspace_paths import resolve_scope
-from orchestrator.tools.workspace_scope import SCOPE_USER_ROOT, scoped_path, store_scope
+from orchestrator.tools.workspace_paths import WorkspaceView
+from orchestrator.tools.workspace_scope import SCOPE_USER_ROOT, conversation_scope, scoped_path
 from orchestrator.tools.workspace_store import WorkspaceDirEntry, WorkspaceStore
 
 logger = logging.getLogger(__name__)
@@ -68,6 +74,26 @@ logger = logging.getLogger(__name__)
 #: * ``"missing"``:文档已不在工作区里;
 #: * ``"unknown"``:核对不了(读不出修改时间、列目录失败、路径没记下来)。
 FigureFreshness = Literal["fresh", "stale", "missing", "unknown"]
+
+
+def figure_run_ids(refs: Iterable[str]) -> frozenset[UUID]:
+    """B-262 —— 一组渲染页 ref(检查点里的 ``viewed_figures``)各自落在哪个 run 的目录。
+
+    渲染页落在 agent 级的 ``.tool_results/<run>/figures/…``,同一智能体所有对话共用;
+    ``<doc-sha>`` 只认路径,两个对话里同名的上传算出来是同一个。检查点是按对话存的,
+    这里记下的 run 就是**本对话**渲染过页的全部 run。形状不对的 ref 跳过。
+    """
+    found: set[UUID] = set()
+    for ref in refs:
+        parsed = parse_rendered_figure_ref(ref)
+        if parsed is None:
+            continue
+        # 形状已过 ``is_rendered_figure_rel``:倒数第 6 段就是 run 目录名(UUID)。
+        try:
+            found.add(UUID(PurePosixPath(parsed.workspace.rel).parts[-6]))
+        except (IndexError, ValueError):
+            continue
+    return frozenset(found)
 
 
 def render_is_stale(document_mtime: datetime, render_mtime: datetime) -> bool:
@@ -85,6 +111,8 @@ class _Rendered:
     #: 作用域相对路径,形状已过 ``is_rendered_figure_rel``。
     rel: str
     mtime: datetime | None
+    #: B-262 —— ``rel`` 相对的那个作用域(本对话目录或 agent 根),拼 ref 用。
+    scope: str
 
 
 @dataclass(frozen=True)
@@ -146,15 +174,23 @@ class _ScopeLister:
         return found
 
 
+class FigureNotRenderedError(FileNotFoundError):
+    """B-251 —— 文档在,但这一页没有能用的渲染(没渲过 / 读不出来 / 比文档旧)。
+
+    与「文档本身不在」分开:这一种重新渲染一次就能好,``ask_image`` 会代模型调
+    ``read_page``;文档不在时渲染也没用,仍是普通的 ``FileNotFoundError``。"""
+
+
 async def resolve_rendered_figure(
     store: WorkspaceStore,
     *,
     tenant_id: UUID,
     user_id: UUID,
-    agent_key: str,
+    view: WorkspaceView,
     path: str,
     unit: int,
     run_id: UUID | None = None,
+    conversation_run_ids: Iterable[UUID] = (),
 ) -> str:
     """``path`` 第 ``unit`` 页(docx 为第 ``unit`` 处)最新一次渲染的工作区 ref。
 
@@ -162,15 +198,27 @@ async def resolve_rendered_figure(
     ``<doc-sha>`` 用的同一个输入。解析不了抛 ``ValueError``;文档不在、没渲过、
     渲完文档又改过,都抛 ``FileNotFoundError``(文字说清下一步);工作区后端不报
     修改时间、闸没法判,抛 ``RuntimeError``。``run_id`` 是当前 run,它自己的目录
-    先查(见 :func:`_rendered_candidates`)。
+    先查(见 :func:`_own_run_candidates`)。
+
+    B-262 —— 别的 run 只看 ``conversation_run_ids``(本对话渲染过页的 run,见
+    :func:`figure_run_ids`),不再扫 ``.tool_results`` 下全部 run:那里是同一智能体所有
+    对话共用的,另一个对话在同名文档上渲的页会被当成本对话的。
     """
-    doc_sha = document_sha(path, agent_key=agent_key)
-    if doc_sha is None:
+    try:
+        doc_sha, rel = render_source(path, view=view)
+    except ValueError as exc:
         msg = f"ask_image 的 path 解析不了:{path!r} —— 填调用 read_page 时用的那条文档路径。"
-        raise ValueError(msg)
-    ws, rel = resolve_scope(path, agent_key=agent_key, tool="read_page")
-    scope = store_scope(ws, agent_key=agent_key)
+        raise ValueError(msg) from exc
+    # B-236 —— 与 read_page 同一个落点口径:源文档按相对 agent 根的位置找。B-262 —— 渲染页
+    # 在对话视图里先找本对话 ``work/.tool_results/``,再找 agent 根的(只看本对话自己的 run)。
+    scope = figure_scope(view)
     lister = _ScopeLister(store=store, tenant_id=tenant_id, user_id=user_id, scope=scope)
+    page_listers = [lister]
+    if view.per_conversation and view.conv_id is not None:
+        own_scope = conversation_scope(view.agent_key, view.conv_id)
+        page_listers.insert(
+            0, _ScopeLister(store=store, tenant_id=tenant_id, user_id=user_id, scope=own_scope)
+        )
     label = _UNIT_LABELS.get(PurePosixPath(path).suffix.lower().lstrip("."), _DEFAULT_UNIT_LABEL)
     document = await lister.entry_at(PurePosixPath(rel).parts)
     if document is None or document.is_dir:
@@ -187,19 +235,24 @@ async def resolve_rendered_figure(
         raise RuntimeError(msg)
     # 终审 #6 —— 本 run 自己的目录里有一张过得了闸的,就不再扫全部 run:别的 run 的
     # 渲染要么更旧,要么同样得过这道闸,换不来更对的答案,只多花 O(run 数) 次列目录。
-    own = await _own_run_candidates(lister, doc_sha=doc_sha, unit=unit, run_id=run_id)
+    own: list[_Rendered] = []
+    for page_lister in page_listers:
+        own += await _own_run_candidates(page_lister, doc_sha=doc_sha, unit=unit, run_id=run_id)
     own_newest = _newest(own)
     if own_newest is not None and not render_is_stale(document.mtime, own_newest[0]):
-        return workspace_figure_ref(tenant_id, user_id, scoped_path(scope, own_newest[1].rel))
-    candidates = own + await _other_run_candidates(
-        lister, doc_sha=doc_sha, unit=unit, run_id=run_id
-    )
+        return _figure_ref(tenant_id, user_id, own_newest[1])
+    others: list[_Rendered] = []
+    for page_lister in page_listers:
+        others += await _other_run_candidates(
+            page_lister, doc_sha=doc_sha, unit=unit, run_id=run_id, run_ids=conversation_run_ids
+        )
+    candidates = own + others
     if not candidates:
         msg = (
             f"{path} 的第 {unit} {label}还没渲染 —— "
             f"请先调用 read_page(path={path!r}, units=[{unit}]),再调用 ask_image。"
         )
-        raise FileNotFoundError(msg)
+        raise FigureNotRenderedError(msg)
     # 终审 #7 —— 读不出修改时间的候选(lstat 撞上留存清理、坏符号链接)只丢掉它自己,
     # 不拖垮整次查找;一张都用不了时才失败,并说对原因。
     newest = _newest(candidates)
@@ -208,7 +261,7 @@ async def resolve_rendered_figure(
             f"{path} 第 {unit} {label}的渲染页读不出来(可能正被清理)—— "
             f"请重新调用 read_page(path={path!r}, units=[{unit}]),再调用 ask_image。"
         )
-        raise FileNotFoundError(msg)
+        raise FigureNotRenderedError(msg)
     newest_mtime, newest_page = newest
     if render_is_stale(document.mtime, newest_mtime):
         msg = (
@@ -216,8 +269,12 @@ async def resolve_rendered_figure(
             f"请先重新调用 read_page(path={path!r}, units=[{unit}]) 渲染第 {unit} {label},"
             "再调用 ask_image。"
         )
-        raise FileNotFoundError(msg)
-    return workspace_figure_ref(tenant_id, user_id, scoped_path(scope, newest_page.rel))
+        raise FigureNotRenderedError(msg)
+    return _figure_ref(tenant_id, user_id, newest_page)
+
+
+def _figure_ref(tenant_id: UUID, user_id: UUID, page: _Rendered) -> str:
+    return workspace_figure_ref(tenant_id, user_id, scoped_path(page.scope, page.rel))
 
 
 def _newest(candidates: list[_Rendered]) -> tuple[datetime, _Rendered] | None:
@@ -243,16 +300,20 @@ async def _own_run_candidates(
 
 
 async def _other_run_candidates(
-    lister: _ScopeLister, *, doc_sha: str, unit: int, run_id: UUID | None
+    lister: _ScopeLister,
+    *,
+    doc_sha: str,
+    unit: int,
+    run_id: UUID | None,
+    run_ids: Iterable[UUID],
 ) -> list[_Rendered]:
-    """其余 run 按 ``.tool_results`` 的列表扫(截掉的只是更早的 run)。"""
-    own = str(run_id) if run_id is not None else None
+    """B-262 —— 本对话的其余 run,逐个直接查各自的目录(不列 ``.tool_results``)。
+
+    目录已被留存清理删掉的 run 当空。"""
     found: list[_Rendered] = []
-    if not await lister.has_dir("", WORKSPACE_OVERFLOW_DIR):
-        return found
-    for name in await lister.subdirs(WORKSPACE_OVERFLOW_DIR):
-        run_dir = f"{WORKSPACE_OVERFLOW_DIR}/{name}"
-        if name == own or not await lister.has_dir(run_dir, RENDERED_FIGURE_DIR):
+    for other in sorted(set(run_ids) - {run_id}, key=str):
+        run_dir = f"{WORKSPACE_OVERFLOW_DIR}/{other}"
+        if RENDERED_FIGURE_DIR not in await _subdir_names(lister, run_dir):
             continue
         found.extend(await _run_pages(lister, run_dir, doc_sha=doc_sha, unit=unit))
     return found
@@ -284,7 +345,7 @@ async def _unit_pages(lister: _ScopeLister, doc_dir: str, *, unit: int) -> list[
         for name, entry in (await lister.entries(unit_dir)).items():
             rel = f"{unit_dir}/{name}"
             if not entry.is_dir and is_rendered_figure_rel(rel):
-                pages.append(_Rendered(rel=rel, mtime=entry.mtime))
+                pages.append(_Rendered(rel=rel, mtime=entry.mtime, scope=lister.scope))
     return pages
 
 
@@ -293,7 +354,7 @@ async def rendered_page_freshness(
     *,
     tenant_id: UUID,
     user_id: UUID,
-    agent_key: str,
+    view: WorkspaceView,
     path: str,
     render_rel: str,
 ) -> FigureFreshness:
@@ -306,8 +367,8 @@ async def rendered_page_freshness(
     悄悄当成「新鲜」—— 一律回 ``"unknown"``,由调用方换成可见文字。
     """
     try:
-        ws, rel = resolve_scope(path, agent_key=agent_key, tool="read_page")
-        doc_rel = scoped_path(store_scope(ws, agent_key=agent_key), rel)
+        _doc_sha, rel = render_source(path, view=view)
+        doc_rel = scoped_path(figure_scope(view), rel)
         lister = _ScopeLister(
             store=store, tenant_id=tenant_id, user_id=user_id, scope=SCOPE_USER_ROOT
         )

@@ -40,6 +40,7 @@ bare ``{"detail": ...}`` shape.
 
 from __future__ import annotations
 
+import hashlib
 import logging
 from typing import Annotated
 from uuid import UUID, uuid4
@@ -60,9 +61,10 @@ from control_plane.api._external import (
 from control_plane.api._external_agent_scope import agent_key_for_code
 from control_plane.api._quota_admission import check_admission
 from control_plane.api._user_scope import get_user_repo
-from control_plane.api._workspace_shared import thread_agent_key, workspace_agent_path
+from control_plane.api._workspace_shared import thread_workspace_path
 from control_plane.api.agents import _resolve_session, _SessionError
 from control_plane.api.uploads import (
+    UPLOAD_ERROR_CODES,
     _handle_document_upload,
     _land_image_upload,
     _prepare_image_upload,
@@ -89,14 +91,7 @@ logger = logging.getLogger("expert_work.control_plane.external_uploads")
 #: ``_decision_error_envelope`` — every external endpoint owns translating
 #: its internal ``HTTPException``s into the ``{success, data, error}``
 #: contract rather than letting FastAPI's bare ``{"detail": ...}`` leak.
-_UPLOAD_ERROR_CODES: dict[int, str] = {
-    400: "INVALID_UPLOAD",
-    413: "UPLOAD_TOO_LARGE",
-    429: "QUOTA_EXCEEDED",
-    500: "UPLOAD_FAILED",
-    502: "UPLOAD_FAILED",
-    503: "UPLOAD_UNAVAILABLE",
-}
+_UPLOAD_ERROR_CODES = UPLOAD_ERROR_CODES
 
 
 def _upload_error_envelope(exc: HTTPException) -> JSONResponse:
@@ -227,7 +222,7 @@ def build_external_uploads_router() -> APIRouter:
 
         if session_id is None:
             try:
-                _record, thread_id, end_user_id = await _resolve_session(
+                _record, thread_id, end_user_id, layout = await _resolve_session(
                     tenant_id=tenant_id,
                     agent_code=agent_code,
                     actor_id=actor_id,
@@ -284,6 +279,7 @@ def build_external_uploads_router() -> APIRouter:
             assert meta.user_id is not None  # noqa: S101
             thread_id = meta.thread_id
             end_user_id = meta.user_id
+            layout = meta.workspace_layout
 
         try:
             if not file.filename:
@@ -308,6 +304,9 @@ def build_external_uploads_router() -> APIRouter:
                     # ``spec.metadata.name``,也就是新会话写进 ``agent_name``
                     # 的值;另一支 ``load_owned_session`` 已经断言过相等。
                     agent_key=agent_key_for_code(agent_code),
+                    # B-262 —— 对话视图的会话落本对话自己的 ``uploads/``(这个接口总绑着
+                    # agent),老视图照旧落 agent 根。
+                    conv_id=thread_id if layout == "conversation" else None,
                     settings=settings,
                     workspace_store=workspace_store,
                     audit=audit,
@@ -322,6 +321,7 @@ def build_external_uploads_router() -> APIRouter:
                     mime_type=content_type,
                     size_bytes=doc_result.size_bytes,
                     filename=doc_result.path.rsplit("/", 1)[-1],
+                    sha256=doc_result.sha256,
                 )
                 return JSONResponse(
                     status_code=201,
@@ -379,6 +379,8 @@ def build_external_uploads_router() -> APIRouter:
                 mime_type=content_type,
                 size_bytes=len(raw),
                 filename=f"{image_ref.image_id}{image_ref.ext}",
+                # B-271 —— 同 ``image_upload.sha256``:``raw`` 就是落进对象存储的那份字节。
+                sha256=hashlib.sha256(raw).hexdigest(),
             )
             return JSONResponse(
                 status_code=201,
@@ -462,14 +464,15 @@ def build_external_uploads_router() -> APIRouter:
                     "UPLOAD_CONTENT_UNAVAILABLE", "upload content unavailable", 503
                 )
             try:
-                # ``row.ref`` 是 agent 相对的 ``uploads/<name>``(它同时是回给
+                # ``row.ref`` 是会话 ``/workspace`` 相对的 ``uploads/<name>``(它同时是回给
                 # 对接方的 ``upload_id``,**不能**改成带前缀的值:
                 # ``is_safe_document_upload_id`` 要求 ``uploads/`` 开头,而且
-                # 他们缓存过的 id 会全废)。投影只发生在调 store 这一刻。
+                # 他们缓存过的 id 会全废)。投影只发生在调 store 这一刻,按登记行那条会话
+                # 自己的布局(B-262:对话视图在本对话的 ``work/`` 下)。
                 data = await workspace_store.read_file(
                     tenant_id=tenant_id,
                     user_id=end_user_id,
-                    path=workspace_agent_path(row.ref, agent_key=thread_agent_key(owning_thread)),
+                    path=thread_workspace_path(row.ref, owning_thread),
                 )
             except WorkspacePermissionError:
                 # 元数据行在、内容读不动是权限问题(服务端配置),不是「不存在」

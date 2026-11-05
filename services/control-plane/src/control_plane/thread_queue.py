@@ -19,7 +19,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
-from collections.abc import AsyncIterator, Awaitable, Callable, Coroutine
+from collections.abc import AsyncIterator, Awaitable, Callable, Coroutine, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Any
@@ -70,13 +70,38 @@ class ThreadQueueFullError(Exception):
 
 @dataclass(frozen=True)
 class Admission:
-    """接单判断。``ahead`` = 前面还有几轮没结束(含正在跑的那一轮)。"""
+    """接单判断。``ahead`` = 前面还有几轮没结束(含正在跑的那一轮);``head`` =
+    领头的那一轮(见 :func:`head_run`),会话空闲时 ``None``。"""
 
     ahead: int
+    head: RunInfo | None = None
 
     @property
     def busy(self) -> bool:
         return self.ahead > 0
+
+
+def head_run(busy: Sequence[RunInfo]) -> RunInfo | None:
+    """B-269 —— 排在前面、挡着后来者的那一轮:``busy``(按 ``(created_at, id)``
+    从早到晚)里第一个在跑 / 待启动的,没有就是最早的那一条排队行。"""
+    for run in busy:
+        if run.status in (RunStatus.RUNNING, RunStatus.PENDING):
+            return run
+    return busy[0] if busy else None
+
+
+def head_summary(head: RunInfo) -> dict[str, Any]:
+    """B-269 —— 领头那一轮的三个字段:id、状态、开始执行的时刻(还没开始 = ``None``)。"""
+    return {
+        "run_id": str(head.run_id),
+        "status": head.status.value,
+        "started_at": head.started_at.isoformat() if head.started_at is not None else None,
+    }
+
+
+def ahead_fields(head: RunInfo) -> dict[str, Any]:
+    """``queued`` 帧与队列模式 202 上的同一份信息,字段名带 ``ahead_`` 前缀。"""
+    return {f"ahead_{key}": value for key, value in head_summary(head).items()}
 
 
 async def admit(store: RunStore, *, thread_id: UUID, tenant_id: UUID) -> Admission:
@@ -86,7 +111,7 @@ async def admit(store: RunStore, *, thread_id: UUID, tenant_id: UUID) -> Admissi
     waiting = sum(1 for r in busy if r.status is RunStatus.QUEUED)
     if waiting >= MAX_QUEUED_PER_THREAD:
         raise ThreadQueueFullError
-    return Admission(ahead=len(busy))
+    return Admission(ahead=len(busy), head=head_run(busy))
 
 
 async def queued_turn_stream(
@@ -98,6 +123,7 @@ async def queued_turn_stream(
     owner: str,
     lease_ttl_s: float,
     ahead: int,
+    ahead_run: RunInfo | None = None,
     launch: Callable[[RunInfo], Awaitable[AsyncIterator[bytes]]],
     is_disconnected: Callable[[], Awaitable[bool]],
     cancel_on_disconnect: bool,
@@ -108,7 +134,8 @@ async def queued_turn_stream(
 ) -> AsyncIterator[bytes]:
     """排在后面的那一轮的 SSE。
 
-    1. 先发一帧 ``queued``(``ahead`` = 前面几轮)。
+    1. 先发一帧 ``queued``(``ahead`` = 前面几轮;B-269 —— 有 ``ahead_run`` 时再带
+       上它的 id / 状态 / 开始时刻,见 :func:`ahead_fields`)。
     2. 每 ``poll_interval_s`` 试领一次(:meth:`RunStore.claim_queued` 的条件 =
        同会话没有更早的忙 run;预订者自己可领)。领到 → ``launch`` 起这一轮并
        返回它的 ``sse_consumer`` 帧流,之后原样转发。
@@ -119,9 +146,10 @@ async def queued_turn_stream(
     没等到执行就断开:``cancel_on_disconnect``(控制台「断开即取消」)→ 取消
     这一轮;否则(对外「断开继续跑」)→ 放掉预订,后台队列立刻能接手。
     """
-    yield format_sse(
-        QUEUED_EVENT, {"run_id": str(run_id), "thread_id": str(thread_id), "ahead": ahead}
-    )
+    queued: dict[str, Any] = {"run_id": str(run_id), "thread_id": str(thread_id), "ahead": ahead}
+    if ahead_run is not None:
+        queued.update(ahead_fields(ahead_run))
+    yield format_sse(QUEUED_EVENT, queued)
     launched = False
     last_renew = last_write = time.monotonic()
     try:

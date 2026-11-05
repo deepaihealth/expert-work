@@ -29,20 +29,26 @@ from langchain_core.messages import BaseMessage, HumanMessage
 from expert_work.common.conversation_channel import FIGURE_BLOCK_MARK, HIDE_FROM_UI
 from orchestrator.multimodal import image_ref_block, parse_rendered_figure_ref
 from orchestrator.tools.figure_lookup import FigureFreshness, rendered_page_freshness
+from orchestrator.tools.figure_reads import (
+    FIGURE_CROPS_IN_VIEW,
+    FIGURE_OTHER_PAGES_IN_VIEW,
+    FIGURE_PAGES_IN_VIEW,
+)
 from orchestrator.tools.read_page import document_sha
+from orchestrator.tools.workspace_paths import WorkspaceView
 from orchestrator.tools.workspace_store import WorkspaceStore
 
 logger = logging.getLogger(__name__)
 
-#: 带像素进提示词的**槽**数上限。超出的退役成可见占位文字。
+#: 带像素进提示词的窗口(B-268,:func:`_live_slots`):整页一条道、局部图一条道,超出的
+#: 退役成可见占位文字。上限在 :mod:`orchestrator.tools.figure_reads`(``read_page`` 的回执
+#: 要说同一个数)。
 #:
-#: 两份参考实现独立撞上同一个数 —— hermes ``_MAX_KEEP_TOOL_IMAGES = 3``、
-#: openclaw ``keepLastAssistants: 3``。这是引用,不是本仓实测:我们没有数据说明
-#: 3 对我们的模型/页型是否合适。
+#: 原来是一个 3 槽的「最近优先」窗口(借自 hermes / openclaw,没测过)。E2 评测(11-03)里
+#: 它让 4 页 / 6 页文档按「最早那页退出 → 重看」严格轮转,3 张局部图还会把整页全挤掉。
 #:
-#: 一个「槽」是一个 ``(<doc-sha>, _u<n>)``,不是一条 ref —— 同一页的新旧两版只占
+#: 一个「槽」是一个 ``(<doc-sha>, _u<n>, 局部框)``,不是一条 ref —— 同一页的新旧两版只占
 #: 一个槽(见 :func:`_figure_slots`)。
-FIGURE_KEEP_RECENT = 3
 
 _FIGURE_BLOCK_HEADING = "# 你取来的文档页(这一轮可见)\n"
 
@@ -63,10 +69,20 @@ class _Figure:
     page: int
     #: 这张渲染页的**用户根相对**路径(``agents/<key>/`` 前缀在内)—— 核对新鲜度时要 stat 它。
     rel: str
+    #: B-266 —— ``read_page(region=…)`` 的局部图:裁的框(0-1000)。整页是 ``None``。
+    region: tuple[int, int, int, int] | None = None
 
     @property
-    def slot(self) -> tuple[str, int]:
-        return (self.doc_sha, self.unit)
+    def slot(self) -> tuple[str, int, tuple[int, int, int, int] | None]:
+        # 同一页的局部图与整页、不同框的局部图各占一个槽。
+        return (self.doc_sha, self.unit, self.region)
+
+    @property
+    def label(self) -> str:
+        """文字段里这一张怎么称呼:``第 N 页``,局部图再带上框。"""
+        if self.region is None:
+            return f"第 {self.page} 页"
+        return f"第 {self.page} 页的局部 {list(self.region)}"
 
 
 def _own_figure(
@@ -108,6 +124,7 @@ def _own_figure(
         render_sha=figure.render_sha,
         page=figure.page,
         rel=parsed.rel,
+        region=figure.region,
     )
 
 
@@ -133,8 +150,8 @@ def _figure_slots(figures: Sequence[_Figure]) -> list[tuple[_Figure, list[_Figur
     return slots
 
 
-def _unit_ranges(units: Sequence[int]) -> str:
-    """``[1, 2, 3, 7, 9, 10]`` → ``"1-3、7、9-10"``(先去重排序)。"""
+def _unit_ranges(units: Sequence[int], *, sep: str = "、") -> str:
+    """``[1, 2, 3, 7, 9, 10]`` → ``"1-3、7、9-10"``(先去重排序;英文行用 ``sep=", "``)。"""
     ordered = sorted(set(units))
     runs: list[tuple[int, int]] = []
     for unit in ordered:
@@ -142,10 +159,12 @@ def _unit_ranges(units: Sequence[int]) -> str:
             runs[-1] = (runs[-1][0], unit)
         else:
             runs.append((unit, unit))
-    return "、".join(str(a) if a == b else f"{a}-{b}" for a, b in runs)
+    return sep.join(str(a) if a == b else f"{a}-{b}" for a, b in runs)
 
 
-def _document_path(doc_sha: str, documents: Mapping[str, object], agent_key: str) -> str | None:
+def _document_path(
+    doc_sha: str, documents: Mapping[str, object], view: WorkspaceView
+) -> str | None:
     """``<doc-sha>`` 对应的、模型能再传给 ``read_page`` 的路径;对不上就 ``None``。
 
     ``figure_documents`` 是工具可写的通道,所以不直接采信:用 ``read_page`` 自己那对
@@ -153,7 +172,7 @@ def _document_path(doc_sha: str, documents: Mapping[str, object], agent_key: str
     「用你当初传的那个路径」—— 宁可少说,不说错。
     """
     path = documents.get(doc_sha)
-    if not isinstance(path, str) or document_sha(path, agent_key=agent_key) != doc_sha:
+    if not isinstance(path, str) or document_sha(path, view=view) != doc_sha:
         return None
     return path
 
@@ -172,11 +191,45 @@ def _quote_path(path: str) -> str:
     )
 
 
+def _units_have(units: Sequence[int]) -> str:
+    """``unit 1 has`` / ``units 1-2, 4 have`` —— 英文退役行的主语。"""
+    ranges = _unit_ranges(units, sep=", ")
+    return f"unit {ranges} has" if len(set(units)) == 1 else f"units {ranges} have"
+
+
+def _retired_line(label: str, pages: Sequence[int], crops: Sequence[int], *, reading: bool) -> str:
+    """B-268 第 4 点 —— 一份文档的退役提示,整行英文:说上限、不点名下一个该取哪页(旧提示
+    「需要重看就调用 read_page,units 填…」被模型直接当成轮流重看的理由)。"""
+    parts: list[str] = []
+    if pages and reading:
+        parts.append(
+            f"{_units_have(pages)} left your context: at most {FIGURE_PAGES_IN_VIEW} pages of "
+            "the document you are reading stay in view at once"
+        )
+    elif pages:
+        parts.append(
+            f"{_units_have(pages)} left your context: only the document you are reading keeps "
+            f"up to {FIGURE_PAGES_IN_VIEW} pages in view, other documents "
+            f"{FIGURE_OTHER_PAGES_IN_VIEW} pages at most"
+        )
+    if crops:
+        parts.append(
+            f"the zoomed region{'s' if len(set(crops)) > 1 else ''} of {_units_have(crops)} "
+            f"left your context: at most {FIGURE_CROPS_IN_VIEW} zoomed regions stay in view at "
+            "once"
+        )
+    return (
+        f"[{label}: " + "; ".join(parts) + ". What you already wrote in your replies or in "
+        "files is still valid — do not re-read pages in turn just to check them side by side. "
+        "Call read_page for a unit only if you are actually missing a specific number from it.]"
+    )
+
+
 def _placeholder_lines(
     slots: Sequence[tuple[_Figure, list[_Figure]]],
-    live_from: int,
+    live: set[tuple[str, int, tuple[int, int, int, int] | None]],
     documents: Mapping[str, object],
-    agent_key: str,
+    view: WorkspaceView,
 ) -> list[str]:
     """退役与旧版本的可见文字 —— **按文档折叠**,每份文档一行、路径只写一次。
 
@@ -187,30 +240,39 @@ def _placeholder_lines(
     它随「读过的文档」增长,不再随「看过的页次」增长。
     """
     retired: dict[str, list[int]] = {}
+    retired_crops: dict[str, list[int]] = {}
     old_versions: dict[str, list[int]] = {}
-    for i, (current, older) in enumerate(slots):
-        if i < live_from:
-            retired.setdefault(current.doc_sha, []).append(current.unit)
+    for current, older in slots:
+        if current.slot not in live:
+            lane = retired if current.region is None else retired_crops
+            lane.setdefault(current.doc_sha, []).append(current.unit)
         if older:
             old_versions.setdefault(current.doc_sha, []).append(current.unit)
+    reading = slots[-1][0].doc_sha if slots else ""
     lines: list[str] = []
-    for doc_sha in dict.fromkeys([*retired, *old_versions]):
-        path = _document_path(doc_sha, documents, agent_key)
-        # 回修第 4 轮 —— 路径每份文档只写一次:两件事并进同一行。
-        label = f"文档 {_quote_path(path)}" if path is not None else "一份文档(路径没记下来)"
-        path_hint = "这个路径" if path is not None else "你当初调用 read_page 时传的那个路径"
-        parts: list[str] = []
-        if doc_sha in retired:
-            parts.append(
-                f"编号 {_unit_ranges(retired[doc_sha])} 的图已退出上下文"
-                f"(需要重看就调用 read_page,path 填{path_hint},units 填要看的编号)"
+    for doc_sha in dict.fromkeys([*retired, *retired_crops, *old_versions]):
+        path = _document_path(doc_sha, documents, view)
+        # B-268 review L6 —— 退役提示自成一行、整行英文;旧版本那一行照旧(中文)。
+        if doc_sha in retired or doc_sha in retired_crops:
+            label = (
+                f"Document {_quote_path(path)}"
+                if path is not None
+                else ("A document (path not recorded)")
+            )
+            lines.append(
+                _retired_line(
+                    label,
+                    retired.get(doc_sha, []),
+                    retired_crops.get(doc_sha, []),
+                    reading=doc_sha == reading,
+                )
             )
         if doc_sha in old_versions:
-            parts.append(
-                f"编号 {_unit_ranges(old_versions[doc_sha])} 有旧版本(文档之后被改过),"
-                "旧版本不再展示,以新版本为准"
+            label = f"文档 {_quote_path(path)}" if path is not None else "一份文档(路径没记下来)"
+            lines.append(
+                f"[{label}:编号 {_unit_ranges(old_versions[doc_sha])} 有旧版本(文档之后被改过),"
+                "旧版本不再展示,以新版本为准。]"
             )
-        lines.append(f"[{label}:" + ";".join(parts) + "。]")
     return lines
 
 
@@ -230,7 +292,7 @@ _WITHHELD_REASONS: dict[FigureFreshness, str] = {
 def _withheld_lines(
     withheld: Sequence[tuple[_Figure, FigureFreshness]],
     documents: Mapping[str, object],
-    agent_key: str,
+    view: WorkspaceView,
 ) -> list[str]:
     """终审 #1 —— 窗口里没附图的页,按 (文档, 原因) 折成一行,写明路径与编号怎么拿回来。"""
     grouped: dict[tuple[str, FigureFreshness], list[int]] = {}
@@ -238,7 +300,7 @@ def _withheld_lines(
         grouped.setdefault((figure.doc_sha, freshness), []).append(figure.unit)
     lines: list[str] = []
     for (doc_sha, freshness), units in grouped.items():
-        path = _document_path(doc_sha, documents, agent_key)
+        path = _document_path(doc_sha, documents, view)
         label = f"文档{_bracket_path(path)}" if path is not None else "一份文档(路径没记下来)"
         path_hint = (
             _bracket_path(path) if path is not None else "你当初调用 read_page 时传的那个路径"
@@ -252,13 +314,41 @@ def _withheld_lines(
     return lines
 
 
+def _live_slots(
+    slots: Sequence[tuple[_Figure, list[_Figure]]],
+) -> set[tuple[str, int, tuple[int, int, int, int] | None]]:
+    """B-268 —— 这一轮带像素的槽。
+
+    * 整页一条道:**正在读的那份文档**(最近一次 ``read_page`` 的那份,整页或局部都算)的整页
+      按最近优先放 :data:`FIGURE_PAGES_IN_VIEW` 页;别的文档的整页只分旧窗口
+      (:data:`FIGURE_OTHER_PAGES_IN_VIEW` 页)里它没占用的位置,同样最近优先;
+    * 局部图一条道,上限 :data:`FIGURE_CROPS_IN_VIEW`,最近优先,只挤局部图、不挤整页。
+    """
+    if not slots:
+        return set()
+    newest_first = [current for current, _ in reversed(slots)]
+    reading = newest_first[0].doc_sha
+    pages = [f for f in newest_first if f.region is None]
+    mine = [f for f in pages if f.doc_sha == reading][:FIGURE_PAGES_IN_VIEW]
+    others = [f for f in pages if f.doc_sha != reading]
+    crops = [f for f in newest_first if f.region is not None]
+    kept = (
+        mine
+        + others[: max(0, FIGURE_OTHER_PAGES_IN_VIEW - len(mine))]
+        + crops[:FIGURE_CROPS_IN_VIEW]
+    )
+    return {f.slot for f in kept}
+
+
 def _window(
-    viewed: Sequence[object], *, tenant_id: UUID | None, user_id: UUID | None, agent_key: str
-) -> tuple[list[tuple[_Figure, list[_Figure]]], int]:
-    """通过三项比对的 ref 按槽归并,外加窗口起点 —— 建块与核对新鲜度看的是同一个窗口。"""
+    viewed: Sequence[object], *, tenant_id: UUID | None, user_id: UUID | None, view: WorkspaceView
+) -> tuple[
+    list[tuple[_Figure, list[_Figure]]], set[tuple[str, int, tuple[int, int, int, int] | None]]
+]:
+    """通过三项比对的 ref 按槽归并,外加窗口里的槽 —— 建块与核对新鲜度看的是同一个窗口。"""
     figures: list[_Figure] = []
     for ref in viewed:
-        fig = _own_figure(ref, tenant_id=tenant_id, user_id=user_id, agent_key=agent_key)
+        fig = _own_figure(ref, tenant_id=tenant_id, user_id=user_id, agent_key=view.agent_key)
         if fig is not None:
             figures.append(fig)
     if len(figures) != len(viewed):
@@ -268,7 +358,7 @@ def _window(
             len(viewed),
         )
     slots = _figure_slots(figures)
-    return slots, max(len(slots) - FIGURE_KEEP_RECENT, 0)
+    return slots, _live_slots(slots)
 
 
 async def figure_freshness(
@@ -278,19 +368,19 @@ async def figure_freshness(
     documents: Mapping[str, object],
     tenant_id: UUID | None,
     user_id: UUID | None,
-    agent_key: str,
+    view: WorkspaceView,
 ) -> dict[str, FigureFreshness]:
-    """终审 #1 —— 窗口里每一张(至多 :data:`FIGURE_KEEP_RECENT` 张)的新鲜度,按 ref 索引。
+    """终审 #1 —— 窗口里每一张(见 :func:`_live_slots`)的新鲜度,按 ref 索引。
 
     判据是 ``figure_lookup`` 那一条(:func:`~orchestrator.tools.figure_lookup.render_is_stale`),
     不在这里写第二份。路径没记下来(旧会话)时核对不了 → ``"unknown"``。
     """
     if tenant_id is None or user_id is None:
         return {}
-    slots, live_from = _window(viewed, tenant_id=tenant_id, user_id=user_id, agent_key=agent_key)
+    slots, in_view = _window(viewed, tenant_id=tenant_id, user_id=user_id, view=view)
     result: dict[str, FigureFreshness] = {}
-    for current, _older in slots[live_from:]:
-        path = _document_path(current.doc_sha, documents, agent_key)
+    for current in (current for current, _older in slots if current.slot in in_view):
+        path = _document_path(current.doc_sha, documents, view)
         if path is None:
             result[current.ref] = "unknown"
             continue
@@ -298,7 +388,7 @@ async def figure_freshness(
             store,
             tenant_id=tenant_id,
             user_id=user_id,
-            agent_key=agent_key,
+            view=view,
             path=path,
             render_rel=current.rel,
         )
@@ -319,7 +409,7 @@ def figure_block_message(
     supports_vision: bool,
     tenant_id: UUID | None,
     user_id: UUID | None,
-    agent_key: str,
+    view: WorkspaceView,
     freshness: Mapping[str, FigureFreshness] | None = None,
 ) -> HumanMessage | None:
     """造这一轮的渲染页段;没有可挂的就 ``None``。
@@ -330,8 +420,8 @@ def figure_block_message(
     的页顶着当前路径的名字给模型看。``None`` = 调用方没有工作区存储、没法核对(单测;
     没接 NAS 的部署,那里工作区 ref 本来就解析不了),行为与之前相同。
 
-    **退役是替换不是删除。** 超窗的页换成可见文字,模型看得见这里原来有图、也看得见
-    怎么拿回来(路径 + 编号再调 ``read_page``:同一 run 里重读拿到逐字相同的 ref,
+    **退役是替换不是删除。** 超窗的页换成可见文字,模型看得见这里原来有图;确实缺数字时
+    再调 ``read_page`` 拿回来(B-268 起提示不点名该取哪页:同一 run 里重读拿到逐字相同的 ref,
     ``_merge_viewed_figures`` 把它挪到队尾,它就回到窗口里)。同一页的旧版本同理,
     可见地标成旧版本,不静默丢。
 
@@ -348,24 +438,24 @@ def figure_block_message(
     """
     if not supports_vision or not viewed:
         return None
-    slots, live_from = _window(viewed, tenant_id=tenant_id, user_id=user_id, agent_key=agent_key)
+    slots, in_view = _window(viewed, tenant_id=tenant_id, user_id=user_id, view=view)
     if not slots:
         return None
-    lines = _placeholder_lines(slots, live_from, documents, agent_key)
+    lines = _placeholder_lines(slots, in_view, documents, view)
     # 回修第 4 轮 —— 窗口里的几张按文档归到一起(文档之间按首次出现排,文档内保持
     # 原次序),路径每份文档只写一次;图片块按同一次序挂,文字与图一一对应。
-    in_window = [current for current, _ in slots[live_from:]]
+    in_window = [current for current, _ in slots if current.slot in in_view]
     if freshness is not None:
         withheld = [(f, freshness.get(f.ref, "unknown")) for f in in_window]
         withheld = [(f, state) for f, state in withheld if state != "fresh"]
-        lines.extend(_withheld_lines(withheld, documents, agent_key))
+        lines.extend(_withheld_lines(withheld, documents, view))
         in_window = [f for f in in_window if freshness.get(f.ref) == "fresh"]
     doc_order = list(dict.fromkeys(f.doc_sha for f in in_window))
     live = sorted(in_window, key=lambda f: doc_order.index(f.doc_sha))
     groups: list[str] = []
     for doc_sha in doc_order:
-        path = _document_path(doc_sha, documents, agent_key)
-        pages = "、".join(f"第 {f.page} 页" for f in live if f.doc_sha == doc_sha)
+        path = _document_path(doc_sha, documents, view)
+        pages = "、".join(f.label for f in live if f.doc_sha == doc_sha)
         groups.append(f"{_quote_path(path)} {pages}" if path is not None else pages)
     if live:
         lines.append(f"下面依次附上 {len(live)} 张:" + ";".join(groups) + "。")
@@ -401,7 +491,7 @@ def figure_block_tail(
     supports_vision: bool,
     tenant_id: UUID | None,
     user_id: UUID | None,
-    agent_key: str,
+    view: WorkspaceView,
     freshness: Mapping[str, FigureFreshness] | None = None,
 ) -> list[BaseMessage]:
     """:func:`figure_block_message` + :func:`with_figure_block` 一步做完(测试用这个入口)。"""
@@ -411,7 +501,7 @@ def figure_block_tail(
         supports_vision=supports_vision,
         tenant_id=tenant_id,
         user_id=user_id,
-        agent_key=agent_key,
+        view=view,
         freshness=freshness,
     )
     return with_figure_block(messages, block)

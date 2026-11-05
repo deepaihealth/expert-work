@@ -41,6 +41,7 @@ from control_plane.api._idempotency import (
 )
 from control_plane.api._quota_admission import check_admission
 from control_plane.api._run_event_stream import EXTERNAL_HIDDEN_EVENTS
+from control_plane.api._run_progress import run_info_fields
 from control_plane.api._run_usage import make_usage_loader
 from control_plane.api._user_scope import get_user_repo
 from control_plane.api.agents import (
@@ -51,6 +52,7 @@ from control_plane.api.agents import (
     resolve_external_files,
 )
 from control_plane.api.runs import MAX_RUN_INPUT_CHARS, RunRequest, SupersedeRequest, spawn_run
+from control_plane.api.uploads import LandingAccount
 from control_plane.run_cancel import cancel_run_two_level
 from control_plane.supersede import SupersedeError
 from expert_work.common.observability import current_trace_id_hex
@@ -285,12 +287,14 @@ async def _supersede_and_run(
 
     if isinstance(payload, ExternalEditRequest):
         try:
-            image_refs, document_names = await resolve_external_files(
+            image_refs, document_names, original_names = await resolve_external_files(
                 files=payload.files,
                 tenant_id=tenant_id,
                 end_user_id=end_user_id,
                 thread_id=meta.thread_id,
                 uploads_store=state.user_upload_store,
+                threads=threads,
+                copier=LandingAccount.from_request(request),
             )
         except ExternalScopeError as exc:
             return external_error(exc)
@@ -313,6 +317,7 @@ async def _supersede_and_run(
             untrusted_content=payload.untrusted_content,
             inputs=payload.inputs,
             document_names=document_names,
+            document_original_names=original_names,
         )
     else:
         # ``:regenerate`` —— 图输入由 ``spawn_run`` 从 ``supersede_run`` 交回的
@@ -336,6 +341,7 @@ async def _supersede_and_run(
             effective_user_id=end_user_id,
             oauth_subject=str(end_user_id),
             payload=run_payload,
+            workspace_layout=meta.workspace_layout,
             trace_id=trace_id,
             extra_headers={"X-Expert-Work-Session-Id": str(meta.thread_id)},
             on_behalf_of=str(end_user_id),
@@ -469,6 +475,13 @@ def build_external_runs_router() -> APIRouter:
             limit=limit,
             offset=offset,
         )
+        # B-269 / B-270 —— 开始时刻、心跳、排在谁后面、进度;一个会话一次、整页一次。
+        run_fields = await run_info_fields(
+            runs=runs,
+            events=getattr(request.app.state, "run_event_store", None),
+            rows=rows,
+            same_user=True,
+        )
         return JSONResponse(
             {
                 "success": True,
@@ -501,6 +514,7 @@ def build_external_runs_router() -> APIRouter:
                             "exit_reason": r.exit_reason,
                             # B-226 ⑥ —— why not done: ``[{tool, kind}]``, null = no record.
                             "unresolved_failures": r.unresolved_failures,
+                            **run_fields[r.run_id],
                         }
                         for r in rows
                     ],

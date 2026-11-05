@@ -161,6 +161,17 @@ class ReviewCounts:
     unapplied: int = 0
 
 
+@dataclass(frozen=True)
+class DiscardedEdits:
+    """B-241 —— what ``discard_unapplied_revisions`` deleted: ``entries`` — the
+    items ``list_unapplied_revisions`` listed (what the console counts and asks
+    about); ``revisions`` — the revision rows deleted (a gone passage's whole
+    history is one entry, often several rows)."""
+
+    entries: int = 0
+    revisions: int = 0
+
+
 class PassageConflictError(Exception):
     """A passage write refused (the API answers 409): ``revision_conflict``
     (the passage changed since the caller read it; ``current`` is how it

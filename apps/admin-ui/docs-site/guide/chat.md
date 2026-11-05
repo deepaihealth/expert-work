@@ -155,8 +155,28 @@ sequenceDiagram
 
 同一段会话里的各轮**依次执行，不会同时执行**。上一轮还在执行或还在排队时再发一轮，平台照常受理，这一轮排在后面，前面的都结束后自动开始：
 
-- `stream` 模式：连接立即建立，先收到一个 [`queued`](./sse-events#queued) 事件，`data.ahead` 是前面还有几轮没结束；排队期间照常每 15 秒一行心跳；轮到它时照常从 `metadata` 开始，直到 `end`。
-- `queue` 模式：照旧立即返回 202，`status` 为 `queued`，前面的都结束后才开始执行。
+- `stream` 模式：连接立即建立，先收到一个 [`queued`](./sse-events#queued) 事件，`data.ahead` 是前面还有几轮没结束，`ahead_run_id`、`ahead_status`、`ahead_started_at` 说明挡在前面的是哪一轮、从什么时候开始执行；排队期间照常每 15 秒一行心跳；轮到它时照常从 `metadata` 开始，直到 `end`。
+- `queue` 模式：照旧立即返回 202，`status` 为 `queued`，前面的都结束后才开始执行。响应体另外带 `ahead` 与上面同样三个字段，示例见下。
+
+```json [响应 202]
+{
+  "success": true,
+  "data": {
+    "run_id": "7c9e6679-7425-40de-944b-e07fc1f90ae7",
+    "thread_id": "3f2b8a1e-0c4d-4b7a-9e21-5d6f7a8b9c0d",
+    "status": "queued",
+    "ahead": 1,
+    "ahead_run_id": "5b1d2e7a-8c3f-4a90-b6e4-1f0a9d2c7e58",
+    "ahead_status": "running",
+    "ahead_started_at": "2026-11-04T10:00:00+00:00"
+  },
+  "error": null
+}
+```
+
+会话空闲时 202 的响应体只有 `run_id`、`thread_id`、`status` 三个字段。
+
+排队期间要查看前面那一轮已经进行了多久、进行到哪一步，读 [5.4 run 列表](./query#_5-4-run-列表)：排队中的 run 带 `queued_behind`，还在执行的 run 带 `started_at` 与 `progress`。
 
 几条边界：
 
@@ -275,7 +295,7 @@ Content-Type: multipart/form-data
 | 文档 | `application/pdf`、`application/vnd.openxmlformats-officedocument.wordprocessingml.document`（.docx）、`application/vnd.openxmlformats-officedocument.spreadsheetml.sheet`（.xlsx）、`application/vnd.openxmlformats-officedocument.presentationml.presentation`（.pptx）、`text/plain`、`text/markdown`、`text/csv` | 25 MiB |
 | 图片 | `image/png`、`image/jpeg`、`image/webp`、`image/gif` | 10 MiB |
 
-两条大小上限以实际部署的配置为准。超出上限返回 413 `UPLOAD_TOO_LARGE`，见 [8.9](./errors#_8-9-413-超过大小上限)。
+两条大小上限以实际部署的配置为准，超出返回 413 `UPLOAD_TOO_LARGE`，见 [8.9](./errors#_8-9-413-超过大小上限)。图片另有像素上限 6000 万（宽乘高）：超过上限但不到约 1.79 亿像素的 JPEG 由服务端按比例缩小后保存，其余超限图片返回同一个 413。服务端会重新编码图片（转正、去掉元数据）；重新编码后超过字节上限的 JPEG / WebP 会降低质量再存，仍超过字节上限（或 PNG / GIF 重新编码后超过）时也返回同一个 413。
 
 #### 上传文档
 
@@ -300,11 +320,13 @@ curl -X POST https://<your-domain>/v1/agents/{agent_code}/uploads \
 }
 ```
 
-文档类附件按文件名保存到这个 `user_id` 的工作区。同一个 `user_id` 再次上传同名文件时，上一次的内容被覆盖，此后两个 `upload_id` 下载到的都是最后一次上传的内容。
+文档类附件按文件名保存到这个 `user_id` 的工作区，已经保存过的文件不会被覆盖：
 
-- 覆盖只发生在同一个 `user_id` 的工作区内，不同 `user_id` 之间互不影响。
-- 需要同时保留两份内容时，上传前先修改文件名，例如加上时间戳。
-- 图片类附件不进入工作区，不会互相覆盖。
+- 保存位置已有同名、内容不同的文件时，新文件换一个名字保存：在原文件名后面加上 `-` 和 8 位字符，例如 `report-3f9a1c2b.pdf`。两个 `upload_id` 各自下载到自己那一份。
+- 同名且内容完全相同时，不再另存一份，新的 `upload_id` 与之前的指向同一份内容。
+- 换过名的文件，下载时 `Content-Disposition` 里的文件名、Agent 读取时用的文件名，都是换过之后的名字。
+- 换过名的文件，平台在本轮消息里告知 Agent 实际文件名的同时附上原文件名，Agent 给交付件起名时可以沿用原文件名，见 [第二步 在对话中携带](#第二步-在对话中携带)。
+- 不同 `user_id` 的工作区互不影响。图片类附件不进入工作区，不涉及同名问题。
 
 #### 上传图片
 
@@ -339,7 +361,7 @@ curl -X POST https://<your-domain>/v1/agents/{agent_code}/uploads \
 |---|---|---|
 | `upload_id` | string | 这份附件的标识，形如 `upl_<uuid>`。原样存下来，原样回传 |
 | `session_id` | UUID | 这份附件绑定的会话。请求里传了 `session_id` 时是传入的那个值，没传时是这次新建的那一段 |
-| `type` | string | 这份附件的类别。取值：`document`（文档，内容保存到这个终端用户的工作区，Agent 执行时能读到它）/ `image`（图片，内容由平台单独保存，拍摄参数等 EXIF 信息已被移除） |
+| `type` | string | 这份附件的类别。取值：`document`（文档，内容保存到这个终端用户的工作区，Agent 执行时能读到它）/ `image`（图片，内容由平台单独保存。保存前按拍摄方向转正、移除拍摄参数等 EXIF 信息，GIF 动图只保留第一帧） |
 | `mime` | string | 服务端记下来的 `Content-Type`，取值见上文「允许的文件类型」 |
 | `size` | integer | 这份附件的字节数，非负整数，不超过对应类别的大小上限 |
 
@@ -363,7 +385,23 @@ curl -X POST https://<your-domain>/v1/agents/{agent_code}/runs \
 
 请求体里的 `session_id` 用的是上一步上传响应返回的那个值，原因见下文 [图片与 run 必须属于同一段会话](#图片与-run-必须属于同一段会话)。
 
-列在 `files[]` 里的文档，平台会把它的文件名附在本轮消息里告知 Agent；文档内容本身在这个终端用户的工作区里，Agent 按文件名读取。
+列在 `files[]` 里的文档，平台会把它的文件名附在本轮消息里告知 Agent；文档内容本身在这个终端用户的工作区里，Agent 按文件名读取。每份文档占一行，附在这一轮消息正文的后面：
+
+| 文档 | 本轮消息里的一行 |
+|---|---|
+| 没有换过名 | `[file attached: uploads/report.pdf]` |
+| 同名、内容不同而换过名 | `[file attached: uploads/report-3f9a1c2b.pdf (original name: report.pdf)]` |
+
+`original name` 是换名之前的文件名，只在换过名时出现。文件名里只有字母（含中文）、数字、下划线、`.` 与 `-`，上传时其余字符已替换为 `_`。[5.3 历史消息](./query#_5-3-历史消息) 等接口返回的用户消息原文里也有这几行。
+
+#### 引用别的会话上传的文档
+
+`files[]` 里的文档可以是在别的会话里上传的，包括同一个 `user_id` 在另一个 Agent 的会话里上传的。发起对话或编辑重发时，平台先把这份文档复制到本次会话，再开始这一轮。复制的规则与 [上传文档](#上传文档) 相同：本次会话已有同名、内容不同的文件时，复制过来的文件换一个名字保存，例如 `report-3f9a1c2b.pdf`；同名且内容相同时，直接使用已有的那一份。
+
+- 本轮消息里告知 Agent 的是复制后的文件名，可能带 `-` 和 8 位字符的后缀；带后缀时同时附上原文件名，格式同上。
+- `upload_id` 不变，下载接口下载到的仍是上传时的那一份。
+- 复制按一次上传计入这个终端用户的工作区容量。容量已满、保存失败时返回的错误码与上传文档时相同，见 [8.11](./errors#_8-11-429-请求过于频繁或配额用尽) 与 [8.12](./errors#_8-12-500-服务端内部错误)。
+- 上传这份文档的那段会话已被删除时，返回 404 `UPLOAD_SESSION_DELETED`；这份文档上传之后在原会话里被改动过时，返回 409 `UPLOAD_CHANGED`。两种情况都需要重新上传这份文档。
 
 `files` 最多 64 项是请求体字段层面的合计上限，图片和文档一起计算。图片另有一条更严的限制：单次 run 处理的图片数量上限默认为 8 张，超出时返回只有 `detail` 字段的 422 响应，读不到 `error.code`，完整规则见 [8.10](./errors#_8-10-422-请求参数不合法)。需要处理更多图片时，拆成多次对话。
 
@@ -689,6 +727,8 @@ key 与 run 的绑定关系永久保留，没有过期时间，不会因为时�
 返回与首次请求同形状的 202 响应，`data.run_id` 与首次一致。`data.status` 与首次不同：首次请求恒为 `queued`，重复请求返回的是原 run 当时的真实状态，可能是 [5.4 run 列表](./query#_5-4-run-列表) 那九个值里的任意一个（例如已经执行完成的 `success`）。
 
 **因此轮询的判断条件应当是「状态不是最终状态」，不是「状态等于 `queued`」。**
+
+重复请求的 202 不带 `ahead` 以及 `ahead_run_id`、`ahead_status`、`ahead_started_at`，即使原 run 仍在排队。要知道它排在谁后面，查 [5.4 run 列表](./query#_5-4-run-列表) 里这次 run 的 `queued_behind`。
 
 ```bash [请求]
 curl -X POST https://<your-domain>/v1/agents/{agent_code}/runs \

@@ -34,6 +34,7 @@ from control_plane.platform_dynamic_worker_config import PlatformDynamicWorkerCo
 from control_plane.platform_embedding_config import PlatformEmbeddingConfigService
 from control_plane.platform_judge_config import PlatformJudgeConfigService
 from control_plane.platform_mcp_pool import PlatformMcpPoolProvider
+from control_plane.platform_migration import PlatformMigration
 from control_plane.platform_tool_budget_config import PlatformToolBudgetConfigService
 from control_plane.rerank_vendors import callable_rerank_api, instruction_kwargs, vendor_reranker
 from control_plane.settings import Settings
@@ -141,14 +142,20 @@ from orchestrator.tools import (
     WorkspaceLock,
     WorkspaceStore,
 )
+from orchestrator.tools.agent_file_versions import (
+    AgentFileVersionStore,
+    NasAgentFileVersionStore,
+)
 from orchestrator.tools.artifact_snapshots import (
     ArtifactSnapshotStore,
     InMemoryArtifactSnapshotStore,
     NasArtifactSnapshotStore,
 )
+from orchestrator.tools.conversation_seed import SeedQuotaGate
 from orchestrator.tools.knowledge_catalog import catalog_fingerprint
 from orchestrator.tools.knowledge_log import LoggedKnowledgeRetriever, RetrievalLogSink
 from orchestrator.tools.knowledge_rerank import RerankOutcome, RerankRanking
+from orchestrator.tools.locks import KeyedLock, ProcessKeyedLock
 from orchestrator.trajectory.recorder import TrajectoryRecorder
 from orchestrator.usage_metering import (
     MeteredLLMCaller,
@@ -223,6 +230,46 @@ logger = logging.getLogger(__name__)
 # The cached value carries its ``expires_at`` (二期 PR2 T4).
 _CacheKey = tuple[UUID, str, str, str, str | None, str | None]
 
+# B-260 —— 构建开始后、结束前若落了一次失效(全局 / 租户 / 用户),这次构建可能拿着
+# 已被关掉的 MCP 客户端;它只返回不入缓存并重建,最多这么多次。三个池子同款闸是 5 次,
+# 这里每次是一整次智能体构建(秒级),3 次够覆盖连着两次失效;第 3 次仍撞上就把这次
+# 构建不入缓存地交出去(下一次调用会重建),不无限重试。主智能体与子智能体缓存共用。
+MAX_AGENT_BUILD_ATTEMPTS = 3
+
+
+@dataclass
+class BuildGenerations:
+    """B-260 —— 智能体构建缓存的失效代次,与三个 MCP 池子同一套闸。
+
+    竞态:构建先拿到池子客户端,失效随后关掉它们并清缓存,构建再把 BuiltAgent 写回
+    缓存 → 整个 TTL(30 分钟)里每次 run 都报 ``StreamableHttpMCPClient … not started``。
+    失效时按范围 +1;构建前 :meth:`snapshot`,入缓存前再比一次,变了就不入缓存。
+    主智能体(``AgentRuntime``)与子智能体(``make_child_agent_builder``)各持一份。
+    """
+
+    _all: int = 0
+    _tenant: dict[UUID, int] = field(default_factory=dict)
+    _user: dict[tuple[UUID, str], int] = field(default_factory=dict)
+
+    def bump_all(self) -> None:
+        # 全局 +1 后,之前记下的快照都已比不上;顺手清空两张表,别让它们随租户 / 用户只增不减。
+        self._all += 1
+        self._tenant.clear()
+        self._user.clear()
+
+    def bump_tenant(self, tenant_id: UUID) -> None:
+        self._tenant[tenant_id] = self._tenant.get(tenant_id, 0) + 1
+
+    def bump_user(self, tenant_id: UUID, user_id: str) -> None:
+        key = (tenant_id, user_id)
+        self._user[key] = self._user.get(key, 0) + 1
+
+    def snapshot(self, tenant_id: UUID, user_id: str | None) -> tuple[int, int, int]:
+        """(全局, 该租户, 该租户下该用户) 的代次;``user_id`` 为空时用户级恒为 0。"""
+        user_gen = self._user.get((tenant_id, user_id), 0) if user_id is not None else 0
+        return (self._all, self._tenant.get(tenant_id, 0), user_gen)
+
+
 # Stream Agent-Templates (M1-3) — resolves a platform template ``(name, version)``
 # (``version`` may be ``"latest"``) to its base ``AgentSpec``, or ``None`` if the
 # template is absent. Bound in the app lifespan to the platform-template store
@@ -232,11 +279,17 @@ PlatformTemplateResolver = Callable[[str, str], Awaitable[AgentSpec | None]]
 
 
 async def knowledge_catalog_fingerprint(
-    store: KnowledgeStore | None, spec: AgentSpec, *, tenant_id: UUID
+    store: KnowledgeStore | None, spec: AgentSpec, *, tenant_id: UUID, single_base: bool = False
 ) -> str | None:
     """B-175 P4 — the build cache key's knowledge-catalog slot for ``spec``:
-    ``None`` when no store is wired or the spec binds fewer than two bases (the
-    store is not read then), else :func:`catalog_fingerprint`.
+    ``None`` when no store is wired or the spec binds fewer than two bases —
+    one, with ``single_base`` — (the store is not read then), else
+    :func:`catalog_fingerprint`.
+
+    B-267 — ``single_base`` must be the build's ``ToolEnv.kb_first_routing``
+    (the switch lists a lone base too, and shows the bases' profiles); a
+    mismatch would leave every such build uncached
+    (:func:`catalog_build_cacheable`).
 
     It reads the spec as the caller holds it, before the builder merges a
     template's ``extends``: a fork that inherits its ``knowledge`` block from
@@ -245,7 +298,13 @@ async def knowledge_catalog_fingerprint(
     knowledge = spec.spec.knowledge
     if store is None or knowledge is None:
         return None
-    return await catalog_fingerprint(store, tenant_id=tenant_id, refs=knowledge.knowledge_base_refs)
+    return await catalog_fingerprint(
+        store,
+        tenant_id=tenant_id,
+        refs=knowledge.knowledge_base_refs,
+        single_base=single_base,
+        profiles=single_base,
+    )
 
 
 def catalog_build_cacheable(keyed: str | None, built: BuiltAgent, *, checked: bool) -> bool:
@@ -295,6 +354,10 @@ class AgentRuntime:
     #: cache key's catalog fingerprint (see ``_CacheKey``). ``None`` leaves the
     #: slot empty: a catalog edit then waits for the TTL.
     knowledge_store: KnowledgeStore | None = None
+    #: B-267 —— 平台总开关 ``Settings.kb_first_routing``(``app.py`` 与构建用的
+    #: ``ToolEnv.kb_first_routing`` 取同一个设置)。开时只绑 1 个库的智能体也有目录,
+    #: 缓存键的目录槽据此去读;``False``(测试 / 未接线)= 与开关关闭相同。
+    kb_first_routing: bool = False
     #: Stream SE (SE-7d-3b-ii) — emits ``skill_run_usage`` at each run's terminal
     #: hook (one row per distilled skill bound), feeding the rollback monitor.
     #: ``None`` disables emission (the monitor then stays a safe no-op).
@@ -308,6 +371,12 @@ class AgentRuntime:
     #: ``app.py`` 注入 :class:`~control_plane.thread_stats.ThreadStatsRecorderImpl`;
     #: ``None``(测试 / 未接线)让计数保持 ``NULL``,不影响 run。
     thread_stats_recorder: ThreadStatsRecorder | None = None
+    #: B-236 第三层 —— run 终局观察 ``/agent``,改过的文件各留一份版本(NAS 才有;``app.py``
+    #: 注入)。``None``(没接 NAS / 测试)= 不留版本,不影响 run。
+    agent_file_versions: AgentFileVersionStore | None = None
+    #: B-262 P3 —— 老对话在下一次新 run 开始前迁到对话视图(NAS 才有;``app.py`` 注入)。
+    #: ``None``(没接 NAS / 测试)= 不迁,run 照会话的布局跑。
+    platform_migration: PlatformMigration | None = None
     #: 1.3 Orchestrator-Worker — per-run dynamic-worker spawn bounds. Set in
     #: the app lifespan from platform settings. ``enabled=False`` makes
     #: :meth:`new_worker_spawn_budget` return ``None`` (no per-run caps; the
@@ -366,6 +435,9 @@ class AgentRuntime:
     _user_invalidation_hooks: list[Callable[[UUID, str], None]] = field(
         default_factory=list, repr=False
     )
+    #: B-260 —— 失效代次:``invalidate_*`` 按范围 +1,``get_agent`` 构建前记下、
+    #: 入缓存前比对(见 :class:`BuildGenerations`)。
+    _generations: BuildGenerations = field(default_factory=BuildGenerations, repr=False)
 
     async def new_worker_spawn_budget(
         self,
@@ -461,7 +533,45 @@ class AgentRuntime:
         argument), so hashing it here needs nothing from the call sites and
         cannot be forgotten at one of them.
         """
+        for attempt in range(MAX_AGENT_BUILD_ATTEMPTS):
+            last_attempt = attempt == MAX_AGENT_BUILD_ATTEMPTS - 1
+            # B-260 —— 代次记在定键之前:定键到入缓存之间落的失效都比得出来。池子都是
+            # 先出缓存、运行时后 +1,构建拿到的客户端若被关掉,代次必在这之后 +1。
+            # 别挪到 ``_cache_key`` 之后:那样定键时取池与记代次之间的失效就比不出来了。
+            generations = self._generations.snapshot(tenant_id, user_id)
+            key, key_pool = await self._cache_key(tenant_id, name, version, spec, user_id)
+            cached = self._cached(key)
+            if cached is not None:
+                return cached
+            if self._generations.snapshot(tenant_id, user_id) != generations and not last_attempt:
+                # 定键期间就失效了(多是取用户池时 OAuth 刷新令牌):重新定键,不白构建。
+                continue
+            built = await self.agent_builder(spec, tenant_id=tenant_id, user_id=user_id)
+            same_pool = await self._user_pool_unchanged(tenant_id, user_id, key_pool)
+            # 比对与写缓存之间没有 await,失效插不进来。失效先于知识目录判断:撞上失效
+            # 的构建不能因为目录不符就直接交出去。
+            if not same_pool or self._generations.snapshot(tenant_id, user_id) != generations:
+                logger.info(
+                    "control_plane.build_not_cached reason=invalidated_mid_build attempt=%d",
+                    attempt + 1,
+                )
+                if last_attempt:
+                    # B-260 —— 次次都撞上失效:交出最后一次构建(不入缓存),下一次调用会重建。
+                    return built
+                continue
+            keyed_catalog = self.knowledge_store is not None and spec.spec.knowledge is not None
+            if catalog_build_cacheable(key[-1], built, checked=keyed_catalog):
+                self._store(key, built)
+            return built
+        raise RuntimeError("get_agent: retry loop exited without returning")  # pragma: no cover
+
+    async def _cache_key(
+        self, tenant_id: UUID, name: str, version: str, spec: AgentSpec, user_id: str | None
+    ) -> tuple[_CacheKey, MCPServerPool | None]:
+        """The content-addressed cache key (see ``_CacheKey``) for one build, and the
+        user OAuth pool the key was decided from (``None`` without user / provider)."""
         oauth_subject: str | None = None
+        user_pool: MCPServerPool | None = None
         if user_id is not None and self.user_oauth_pool_provider is not None:
             user_pool = await self.user_oauth_pool_provider(tenant_id, user_id)
             if user_pool.names():
@@ -472,26 +582,50 @@ class AgentRuntime:
             version,
             compute_spec_sha256(spec),
             oauth_subject,
-            await knowledge_catalog_fingerprint(self.knowledge_store, spec, tenant_id=tenant_id),
+            await knowledge_catalog_fingerprint(
+                self.knowledge_store,
+                spec,
+                tenant_id=tenant_id,
+                single_base=self.kb_first_routing,
+            ),
         )
+        return key, user_pool
+
+    async def _user_pool_unchanged(
+        self, tenant_id: UUID, user_id: str | None, key_pool: MCPServerPool | None
+    ) -> bool:
+        """B-260 —— 构建挂的用户池是不是定键时那一个。
+
+        构建自己再取一次用户池。定键时池是空的(共享键、同租户所有人共用)而构建取到了
+        刚连上的池,入缓存就把这个用户的授权工具发给了同租户所有人,``invalidate_user``
+        也清不到共享键。池子出缓存后只会建新对象,所以构建后再取仍是定键那个对象 ⇒
+        构建挂的就是它。
+        """
+        if key_pool is None or user_id is None or self.user_oauth_pool_provider is None:
+            return True
+        return await self.user_oauth_pool_provider(tenant_id, user_id) is key_pool
+
+    def _cached(self, key: _CacheKey) -> BuiltAgent | None:
+        """A live cache entry for ``key`` (refreshing its LRU slot), else ``None``."""
         cached = self._cache.get(key)
-        if cached is not None:
-            built, expires_at = cached
-            if self._clock() < expires_at:
-                self._cache.move_to_end(key)
-                return built
-            # Expired — drop and treat as a miss. Pure abandonment: the
-            # BuiltAgent may hold live MCP connections (MCPServerPool) still
-            # in use by an in-flight run, so never close() here; dropping the
-            # reference leaves cleanup to GC, matching invalidate_* behavior.
-            # No hook fan-out: hooks broadcast config changes, and natural
-            # expiry is not one (二期 PR2 T4).
-            del self._cache[key]
-            self._publish_cache_size()
-        built = await self.agent_builder(spec, tenant_id=tenant_id, user_id=user_id)
-        keyed_catalog = self.knowledge_store is not None and spec.spec.knowledge is not None
-        if not catalog_build_cacheable(key[-1], built, checked=keyed_catalog):
+        if cached is None:
+            return None
+        built, expires_at = cached
+        if self._clock() < expires_at:
+            self._cache.move_to_end(key)
             return built
+        # Expired — drop and treat as a miss. Pure abandonment: the
+        # BuiltAgent may hold live MCP connections (MCPServerPool) still
+        # in use by an in-flight run, so never close() here; dropping the
+        # reference leaves cleanup to GC, matching invalidate_* behavior.
+        # No hook fan-out: hooks broadcast config changes, and natural
+        # expiry is not one (二期 PR2 T4).
+        del self._cache[key]
+        self._publish_cache_size()
+        return None
+
+    def _store(self, key: _CacheKey, built: BuiltAgent) -> None:
+        """Cache ``built`` under ``key`` with a fresh TTL, LRU-bounded."""
         self._cache[key] = (built, self._clock() + self.cache_ttl_s)
         self._cache.move_to_end(key)
         while len(self._cache) > self.cache_max_size:
@@ -499,7 +633,6 @@ class AgentRuntime:
             # rationale as the expiry branch above).
             self._cache.popitem(last=False)
         self._publish_cache_size()
-        return built
 
     def _publish_cache_size(self) -> None:
         """Refresh the runtime-scope built-agent cache size gauge (二期 PR2 T4)."""
@@ -542,6 +675,7 @@ class AgentRuntime:
         against the refreshed pool. Registered clear-all hooks (e.g. the
         sub-agent builder cache) are fanned out too.
         """
+        self._generations.bump_all()  # B-260 —— 进行中的构建一律不入缓存
         self._cache.clear()
         self._publish_cache_size()
         for hook in self._invalidate_all_hooks:
@@ -557,6 +691,8 @@ class AgentRuntime:
         every key shape. Registered hooks (e.g. the sub-agent builder cache) are
         fanned out too.
         """
+        # B-260 —— 该租户进行中的构建不入缓存
+        self._generations.bump_tenant(tenant_id)
         for key in [k for k in self._cache if k[0] == tenant_id]:
             del self._cache[key]
         self._publish_cache_size()
@@ -575,6 +711,8 @@ class AgentRuntime:
         Registered user hooks (the sub-agent builder cache, 二期 PR2 T2) are
         fanned out too.
         """
+        # B-260 —— 该用户进行中的构建不入缓存(含按共享键构建、但带着这个 user_id 的)
+        self._generations.bump_user(tenant_id, user_id)
         for key in [k for k in self._cache if k[0] == tenant_id and k[4] == user_id]:
             del self._cache[key]
         self._publish_cache_size()
@@ -2031,6 +2169,16 @@ def build_artifact_snapshot_store(
     return None
 
 
+def build_agent_file_version_store(
+    workspace_store: WorkspaceStore | None,
+) -> AgentFileVersionStore | None:
+    """B-236 第三层 —— ``/agent`` 文件的版本存储,只有 NAS 后端有(放在用户根旁边、沙箱挂不到
+    的地方);别的后端 ``None`` = 不留版本。传进来的必须是工作区端点用的同一个实例。"""
+    if isinstance(workspace_store, NasWorkspaceStore):
+        return NasAgentFileVersionStore(workspace=workspace_store)
+    return None
+
+
 def build_tool_env(
     tenant_config_service: TenantConfigService,
     *,
@@ -2043,6 +2191,11 @@ def build_tool_env(
     workspace_lock: WorkspaceLock | None = None,
     workspace_store: WorkspaceStore | None = None,
     artifact_snapshots: ArtifactSnapshotStore | None = None,
+    conversation_seed_lock: KeyedLock | None = None,
+    workspace_quota: SeedQuotaGate | None = None,
+    kb_first_routing: bool = False,
+    web_search_fixtures_dir: str | None = None,
+    embedding_model_key: Callable[[], Awaitable[str | None]] | None = None,
 ) -> ToolEnv:
     """Assemble the M0 :class:`ToolEnv`.
 
@@ -2076,6 +2229,15 @@ def build_tool_env(
         workspace_lock=workspace_lock or NullWorkspaceLock(),
         workspace_store=workspace_store,
         artifact_snapshots=artifact_snapshots,
+        # B-236 —— 对话开场复制按对话互斥;没给(单测 / 无库)就是进程内的锁。
+        conversation_seed_lock=conversation_seed_lock or ProcessKeyedLock(),
+        # B-236 review 7 —— 开场复制前问的配额闸(与上传同一道)。
+        workspace_quota=workspace_quota,
+        # B-267 —— 平台总开关与 web_search 夹具目录(都来自 Settings)。
+        kb_first_routing=kb_first_routing,
+        web_search_fixtures_dir=web_search_fixtures_dir,
+        # B-267 第 3 步 —— 每轮探测核对「此刻的嵌入模型」用。
+        embedding_model_key=embedding_model_key,
     )
 
 
@@ -2273,3 +2435,15 @@ def make_agent_runtime(
         ),
         run_event_store=run_event_store,
     )
+
+
+async def live_embedding_key(config: PlatformEmbeddingConfigService) -> str | None:
+    """B-267 —— the platform's current embedding model as ``provider/model``
+    (``None``: not configured, or the config could not be read — the per-turn
+    probe then uses keywords only)."""
+    try:
+        current = await config.effective_embedding_config()
+    except Exception:
+        logger.warning("knowledge.probe_embedding_config_unavailable", exc_info=True)
+        return None
+    return f"{current[0]}/{current[1]}" if current is not None else None

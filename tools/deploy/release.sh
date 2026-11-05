@@ -18,7 +18,9 @@
 #      consulting the registry, so every release must mint fresh tags —
 #      never re-push an existing one)
 #   3. delete the immutable migrate Job (apply would reject the image
-#      change otherwise), then `kubectl apply -k` the overlay
+#      change otherwise), apply ONLY that Job from the overlay and wait for
+#      it to complete; a failed migration stops the release here, before any
+#      Deployment changed (B-228). Then `kubectl apply -k` the whole overlay
 #   4. wait for every Deployment rollout
 #   5. run smoke.sh
 #
@@ -275,6 +277,12 @@ on_exit() {
         return
     fi
     case "${stage}" in
+        "3 migrate")
+            # B-228 — the Deployments are applied only after the migration
+            # completed, so a red stage 3 migrate left the old pods alone.
+            echo "No Deployment was applied — the cluster still runs the previous images;" >&2
+            echo "nothing to roll back." >&2
+            ;;
         3* | 4* | 5* | 6*)
             echo "The cluster may already run the new images — roll back with:" >&2
             rollback_commands >&2
@@ -287,6 +295,40 @@ prev_cp_tag="$(current_new_tag "${ACR}/control-plane")"
 prev_ui_tag="$(current_new_tag "${ACR}/admin-ui")"
 prev_proxy_tag="$(current_new_tag "${ACR}/credential-proxy")"
 readonly prev_cp_tag prev_ui_tag prev_proxy_tag
+
+export KUBECONFIG="${KUBECONFIG_PATH}"
+
+# --images only chooses what to BUILD and re-pin; stage 3 still applies the
+# whole overlay, so every image left out lands at whatever newTag this
+# worktree's overlay holds. When the cluster is ahead of that (a release
+# whose record PR is not merged yet), the subset release silently rolls the
+# other images back — 2026-09-30, admin-ui twice, smoke green both times.
+# Refuse before the build instead: the overlay must match the cluster for
+# every image this release does not touch.
+if [[ "${images}" != "control-plane,admin-ui,credential-proxy" && "${dry_run}" -eq 0 ]]; then
+    drift=()
+    for name in control-plane admin-ui credential-proxy; do
+        [[ ",${images}," == *",${name},"* ]] && continue
+        case "${name}" in
+            control-plane) pinned="${prev_cp_tag}" ;;
+            admin-ui) pinned="${prev_ui_tag}" ;;
+            credential-proxy) pinned="${prev_proxy_tag}" ;;
+        esac
+        live="$(kubectl -n expert-work get "deploy/${name}" \
+            -o jsonpath="{.spec.template.spec.containers[?(@.name==\"${name}\")].image}")"
+        if [[ "${live##*:}" != "${pinned}" ]]; then
+            drift+=("  ${name}: cluster runs ${live##*:}, overlay pins ${pinned}")
+        fi
+    done
+    if [[ ${#drift[@]} -gt 0 ]]; then
+        echo "--images ${images} would also re-apply the images it leaves out, and the overlay" >&2
+        echo "does not match the cluster for:" >&2
+        printf '%s\n' "${drift[@]}" >&2
+        echo "Release from a worktree whose overlay matches (e.g. the unmerged record PR's" >&2
+        echo "branch), or fix those newTags first. Nothing was built or applied." >&2
+        exit 1
+    fi
+fi
 
 # B-56 — a rollout that runs out of time is not the same thing as a failed
 # release, and the script used to print only "roll back with:" for both.
@@ -378,16 +420,77 @@ if [[ ",${images}," == *",credential-proxy,"* ]]; then
     set_new_tag "${ACR}/credential-proxy" "${tag}"
 fi
 
-# --------------------------------------------------------- 3. migrate+apply
-stage="3 migrate+apply"
-export KUBECONFIG="${KUBECONFIG_PATH}"
+# ------------------------------------------------------- 3. migrate, alone
+# B-228 — the migrate Job used to go out in the same `apply -k` as the
+# Deployments, and only afterwards did the script wait for it. New pods that
+# came up before the migration finished read columns that did not exist yet
+# (0158 / 0178 / 0181 / 0182 all add columns) and failed every request that
+# touched them; the 10-29 and 11-04 prod releases ran the Job by hand first.
+# Now the Job alone goes first (the label selector picks exactly that one
+# object out of the rendered overlay — the namespace and its Secret already
+# exist on every provisioned cluster), and the Deployments follow only once
+# it reports Complete. The Job sets a lock timeout itself (base
+# migrate-job.yaml), so a DDL stuck behind a long transaction fails here
+# instead of queueing every query on that table behind it.
+stage="3 migrate"
+readonly MIGRATE_TIMEOUT_S=300
+migrate_failed_help() {
+    echo >&2
+    echo "---- migrate Job did not complete ($1) ----" >&2
+    kubectl -n expert-work get pods -l job-name=migrate -o wide >&2 || true
+    kubectl -n expert-work logs job/migrate --tail=40 >&2 || true
+    cat >&2 <<EOF
+
+The migration did not finish, and the Deployments were NOT applied: the
+cluster still runs the previous release. Migrations run as one alembic
+transaction: a Job that Failed left the schema unchanged; one still running
+may yet commit (expand-only, so the previous pods work with either schema).
+  * 'canceling statement due to lock timeout' in the log -> a long transaction
+    holds the table. Wait for it to end, then release again.
+  * anything else -> a broken migration; fix it in a new commit.
+Before releasing again, restore the overlay file this run edited
+(git restore ${OVERLAY#"${REPO_ROOT}/"}/kustomization.yaml) so the next run
+reads the real previous tags, and use a fresh --tag (repo convention: never
+re-push an existing tag).
+EOF
+}
 run kubectl -n expert-work delete job migrate --ignore-not-found
+run kubectl apply -k "${OVERLAY}" -l app.kubernetes.io/name=migrate
+if [[ "${dry_run}" -eq 0 ]]; then
+    # Poll instead of `kubectl wait --for=condition=complete`: that waits out
+    # the whole timeout on a Job that already Failed. A plain assignment so
+    # a kubectl transport failure trips set -e (still stage 3 migrate).
+    migrate_deadline=$((SECONDS + MIGRATE_TIMEOUT_S))
+    while :; do
+        migrate_conditions="$(kubectl -n expert-work get job migrate \
+            -o jsonpath='{.status.conditions[?(@.status=="True")].type}')"
+        if [[ " ${migrate_conditions} " == *" Complete "* ]]; then
+            echo "==> migrate Job complete"
+            break
+        fi
+        if [[ " ${migrate_conditions} " == *" Failed "* ]]; then
+            migrate_failed_help "Job Failed"
+            advice_printed=1
+            exit 1
+        fi
+        if ((SECONDS >= migrate_deadline)); then
+            migrate_failed_help "still running after ${MIGRATE_TIMEOUT_S}s"
+            advice_printed=1
+            exit 1
+        fi
+        sleep 5
+    done
+else
+    echo "DRY-RUN> wait until job/migrate is Complete (stop the release if it Failed)"
+fi
+
+# ------------------------------------------------------ 3. apply the rest
+stage="3 apply"
 run kubectl apply -k "${OVERLAY}"
 
 # ------------------------------------------------------------- 4. rollouts
 stage="4 rollout"
 if [[ "${dry_run}" -eq 0 ]]; then
-    kubectl -n expert-work wait --for=condition=complete job/migrate --timeout=300s
     # A plain assignment, not `for d in $(kubectl ...)`: errexit ignores a
     # failing substitution in a for-list, so a kubectl hiccup here used to
     # wait for ZERO rollouts and hand smoke the still-healthy OLD pods —
@@ -412,7 +515,7 @@ if [[ "${dry_run}" -eq 0 ]]; then
         exit 1
     fi
 else
-    echo "DRY-RUN> wait job/migrate + rollout status (all deployments)"
+    echo "DRY-RUN> rollout status (all deployments)"
 fi
 
 # ---------------------------------------------------------------- 5. smoke
@@ -497,10 +600,21 @@ exec(compile(base64.b64decode('${canary_src}').decode(), 'canary.py', 'exec'))" 
     set -e
     canary_verdict=0
     grep -q '^RESULT: PASS' "${canary_log}" && canary_verdict=1
+    canary_no_sandbox=0
+    grep -q '^RESULT: FAIL (no sandbox)' "${canary_log}" && canary_no_sandbox=1
     rm -f "${canary_log}"
     if [[ "${canary_rc}" -ne 0 || "${canary_verdict}" -ne 1 ]]; then
         if [[ "${canary_rc}" -eq 0 ]]; then
             echo "canary exited 0 but printed no 'RESULT: PASS' verdict — its output was cut off." >&2
+        fi
+        # B-87 ② — "could not get a sandbox" is not "ran and got it wrong".
+        # It can still be this release (the e2b incident broke sandbox
+        # creation from a dependency bump), so the rollback advice stays.
+        if [[ "${canary_no_sandbox}" -eq 1 ]]; then
+            echo "The canary could not get a sandbox (errors listed above). Before rolling back," >&2
+            echo "look at the sandbox pool: kubectl -n default get sandboxset expert-work-sandbox" >&2
+            echo "and smoke's 'sandbox create failures' line — the pool may have been failing" >&2
+            echo "before this release too." >&2
         fi
         # The rollback command itself comes from the EXIT trap (stage 6).
         echo "CANARY FAILED — the release is NOT good." >&2

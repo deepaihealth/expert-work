@@ -18,6 +18,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from collections.abc import Awaitable, Callable, Mapping
 from concurrent.futures.process import BrokenProcessPool
@@ -66,6 +67,7 @@ from control_plane.knowledge.recognition.recognizer import (
     ERROR_NOT_CONFIGURED,
     DocumentRecognizer,
     PageOutcome,
+    source_digest,
 )
 from expert_work.persistence import KnowledgeStore
 from expert_work.persistence.knowledge.base import UNSET
@@ -286,6 +288,7 @@ async def _recognize(
         render=render,
         before_batch=job.recognizing,
         max_chars=limit,
+        source_sha256=await asyncio.to_thread(source_digest, job.raw),
     )
     return cap_recognized_text(outcomes, limit)
 

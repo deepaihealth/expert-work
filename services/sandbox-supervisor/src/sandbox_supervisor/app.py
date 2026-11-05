@@ -343,6 +343,8 @@ def _register_routes(app: FastAPI) -> None:
             timeout_s=body.timeout_s,
             envs=body.envs or None,
             agent_root=body.agent_root,
+            conv_id=body.conv_id,
+            thread_id=body.thread_id,
         )
         return ExecResponse(
             stdout=result.stdout,

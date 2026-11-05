@@ -17,7 +17,7 @@ from __future__ import annotations
 
 import json
 import logging
-from collections.abc import Sequence
+from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
@@ -43,6 +43,7 @@ from orchestrator.tools.arg_bindings import bindings_by_tool
 from orchestrator.tools.artifact import ListArtifactsTool, SaveArtifactTool
 from orchestrator.tools.artifact_snapshots import ArtifactSnapshotStore
 from orchestrator.tools.bash import BashTool
+from orchestrator.tools.conversation_seed import SeedQuotaGate
 from orchestrator.tools.file_ops import (
     EditFileTool,
     ListDirTool,
@@ -54,7 +55,12 @@ from orchestrator.tools.find_tools import FindToolsTool
 from orchestrator.tools.http import AllowlistProvider, DenylistProvider, HTTPTool
 from orchestrator.tools.knowledge import KnowledgeRetriever, KnowledgeSearchTool
 from orchestrator.tools.knowledge_read import KnowledgeReadTool
-from orchestrator.tools.locks import NullWorkspaceLock, WorkspaceLock
+from orchestrator.tools.locks import (
+    KeyedLock,
+    NullWorkspaceLock,
+    ProcessKeyedLock,
+    WorkspaceLock,
+)
 from orchestrator.tools.mcp import MCPServerPool, register_mcp_tools
 from orchestrator.tools.read_document import ReadDocumentTool
 from orchestrator.tools.read_page import FigureDelivery, ReadPageTool
@@ -65,6 +71,7 @@ from orchestrator.tools.spawn_worker import SpawnWorkerTool, WorkerBuildFn
 from orchestrator.tools.subagent import MAX_SUBAGENT_DEPTH, ChildAgentBuilder, SubAgentTool
 from orchestrator.tools.vision import AskImageTool, VLUsageMeter
 from orchestrator.tools.web_search import DEFAULT_MAX_RESULTS, TavilyClient, WebSearchTool
+from orchestrator.tools.web_search_fixture import WebSearchFixtureError, load_web_search_fixture
 from orchestrator.tools.worker_policy import READ_ONLY_HTTP_METHODS, WORKER_DENIED_BUILTINS
 from orchestrator.tools.workspace_store import WorkspaceStore
 from orchestrator.trajectory import TrajectoryRecorder
@@ -205,16 +212,38 @@ class ToolEnv:
     #: records via the orchestrator's SSE worker.
     trajectory_recorder: TrajectoryRecorder | None = None
     #: Stream TE-8 — cross-replica per-workspace write lock held around
-    #: ``write_file`` / ``bash`` writes. Defaults to the no-op
+    #: ``write_file`` / ``bash`` writes, and ``exec_python`` on the new layout only
+    #: (B-249). Defaults to the no-op
     #: :class:`NullWorkspaceLock` (single process / tests); the control plane
     #: injects a Postgres advisory-lock implementation in production.
     workspace_lock: WorkspaceLock = field(default_factory=NullWorkspaceLock)
+    #: B-236 —— 对话开场复制(``conversation_seed``)按对话互斥的锁。默认是进程内的;
+    #: 控制面注入 Postgres advisory-lock 实现(独立 classid,不是上面那把按用户的写锁)。
+    conversation_seed_lock: KeyedLock = field(default_factory=ProcessKeyedLock)
+    #: B-236 review 7 —— 开场复制前问的用户工作区配额闸(控制面的 ``WorkspaceQuotaService``,
+    #: 与上传同一道)。``None`` = 这个部署没有配额闸,照旧复制。
+    workspace_quota: SeedQuotaGate | None = None
     #: B-122 —— 这是一次动态子智能体(worker)构建。控制面在 ``make_worker_build_fn``
     #: 里置 True(孙级复用同一个 env,自动带上);主 Agent、静态子 Agent 恒为 False。
     #: 为 True 时:不注册 ``WORKER_DENIED_BUILTINS``(含基础能力 ``save_artifact``)、
     #: MCP 只注册标了只读的、http 只放行读方法、不做「绑定落空」判定。
     #: 进程内字段,**不是** manifest 字段(extra="forbid" 的回滚坑)。
     worker_policy: bool = False
+    #: B-267 —— 平台总开关「先查知识库」(控制面 ``Settings.kb_first_routing``,
+    #: ``EXPERT_WORK_KB_FIRST_ROUTING``,平台默认开)。只对绑了知识库的构建生效:
+    #: ``knowledge_search`` / ``web_search`` 说明加规则、单个库也出目录;后续第 2 步
+    #: (画像进目录)、第 3 步(每轮探测)也读它。这里默认 False = 没接线(单测 / 旧调用方)
+    #: 时与开关关闭完全一样;控制面恒按设置传入。进程内字段,不是 manifest 字段。
+    kb_first_routing: bool = False
+    #: B-267 —— ``web_search`` 固定结果替身的夹具目录(控制面
+    #: ``Settings.web_search_fixtures_dir``,只在测试环境配)。manifest 的 ``web_search``
+    #: 条目写 ``config.fixture: <名字>`` 时从这里读 ``<名字>.json``;``None`` 时选了
+    #: 夹具就是构建期配置错误,绝不悄悄退回真搜索。
+    web_search_fixtures_dir: str | None = None
+    #: B-267 第 3 步 —— 当前平台嵌入模型 ``provider/model``(控制面读平台配置)。每轮探测只在
+    #: 库的校准、库向量的模型、此刻查询用的模型三者一致时才用向量这一路;``None``(没接线)=
+    #: 只用关键词。进程内字段,不是 manifest 字段。
+    embedding_model_key: Callable[[], Awaitable[str | None]] | None = None
 
 
 async def build_tool_registry(
@@ -230,6 +259,7 @@ async def build_tool_registry(
     vision: VisionSpec | None = None,
     vl_caller: LLMCaller | None = None,
     quick_vl_caller: LLMCaller | None = None,
+    plain_vl_caller: LLMCaller | None = None,
     vl_usage_meter: VLUsageMeter | None = None,
     context_window: int | None = None,
     supports_vision: bool = False,
@@ -255,6 +285,9 @@ async def build_tool_registry(
     records each VL call into ``token_usage``; ``None`` records nothing.
     ``quick_vl_caller`` (B-64 Task 10) is the thinking-off VL router behind
     ``ask_image``'s default ``depth="quick"``; ``None`` = same as ``vl_caller``.
+    ``plain_vl_caller`` (B-257) is the VL router as configured, without the
+    platform-default thinking depth ``vl_caller`` may carry; ``None`` = same as
+    ``vl_caller``.
 
     ``supports_vision`` (B-64) is the main model's native image input
     (manifest ``model.supports_vision``). Together with ``vision`` it decides
@@ -273,6 +306,8 @@ async def build_tool_registry(
     """
     registry = ToolRegistry()
     figure_delivery = _figure_delivery(supports_vision=supports_vision, vision=vision)
+    # B-276 —— 主模型看不了图、worker 能看:spawn_worker 说明与 read_page 的拒绝都要说出来。
+    vision_gap = _spawn_worker_vision_gap(tool_env, parent_spec, dynamic_workers, subagent_depth)
     # B-61 §5.4(评审 I-3)—— 参数绑定先**跨条目**并成一张表,再发给每一条 mcp
     # 条目。一份 manifest 可以有多个 ``mcp`` 条目(协议层合法、也有测试),而每一条
     # 都会把它选中的服务器整个再注册一遍。按条目各发各的,后注册那一条就会用「我
@@ -286,12 +321,20 @@ async def build_tool_registry(
         if isinstance(entry, MCPToolSpec)
         for binding in entry.arg_bindings
     ]
+    # B-267 —— 绑了知识库且平台开关开着:``web_search`` 说明加「先查知识库」那句。
+    knowledge_first = tool_env.kb_first_routing and knowledge is not None
     for entry in tool_specs:
         if isinstance(entry, BuiltinToolSpec):
             if tool_env.worker_policy and entry.name in WORKER_DENIED_BUILTINS:
                 continue
             _register_builtin(
-                registry, entry, tool_env, skill_seed_files, figure_delivery=figure_delivery
+                registry,
+                entry,
+                tool_env,
+                skill_seed_files,
+                figure_delivery=figure_delivery,
+                knowledge_first=knowledge_first,
+                workers_view_pages=vision_gap,
             )
         elif isinstance(entry, HTTPToolSpec):
             _register_http(registry, tool_env)
@@ -340,12 +383,20 @@ async def build_tool_registry(
                     binding.server, binding.tool, params, reason="name_collision"
                 )
     _register_base_capabilities(
-        registry, tool_env, skill_seed_files, figure_delivery=figure_delivery
+        registry,
+        tool_env,
+        skill_seed_files,
+        figure_delivery=figure_delivery,
+        workers_view_pages=vision_gap,
     )
     _register_subagents(registry, subagents, tool_env, subagent_depth)
-    _register_spawn_worker(registry, tool_env, parent_spec, dynamic_workers, subagent_depth)
+    _register_spawn_worker(
+        registry, tool_env, parent_spec, dynamic_workers, subagent_depth, vision_gap=vision_gap
+    )
     _register_knowledge_search(registry, knowledge, tool_env)
-    _register_ask_image(registry, vision, tool_env, vl_caller, quick_vl_caller, vl_usage_meter)
+    _register_ask_image(
+        registry, vision, tool_env, vl_caller, quick_vl_caller, plain_vl_caller, vl_usage_meter
+    )
     # Stream HX-12 (Mini-ADR HX-I3) — small-pool escape hatch: when the
     # whole deferred pool fits comfortably in context, defer is pure
     # overhead (a find_tools round-trip per capability); activate it all.
@@ -435,7 +486,11 @@ def _register_knowledge_search(
         )
     refs = tuple(knowledge.knowledge_base_refs)
     registry.register(
-        KnowledgeSearchTool(retriever=env.knowledge_retriever, knowledge_base_refs=refs)
+        KnowledgeSearchTool(
+            retriever=env.knowledge_retriever,
+            knowledge_base_refs=refs,
+            knowledge_first=env.kb_first_routing,
+        )
     )
     registry.register(
         KnowledgeReadTool(store=env.knowledge_retriever.store, knowledge_base_refs=refs)
@@ -472,6 +527,7 @@ def _register_ask_image(
     env: ToolEnv,
     vl_caller: LLMCaller | None,
     quick_vl_caller: LLMCaller | None,
+    plain_vl_caller: LLMCaller | None,
     vl_usage_meter: VLUsageMeter | None,
 ) -> None:
     """Register the ``ask_image`` tool when the manifest declares a
@@ -492,6 +548,7 @@ def _register_ask_image(
         )
     # B-64 Task 8 —— 带上工作区存储,``ask_image`` 才有 ``path`` + ``unit`` 短形态;
     # 没接时它只收 ``image_ref``,描述里也不提短形态。
+    read_page = registry.get("read_page")
     registry.register(
         AskImageTool(
             vl_caller=vl_caller,
@@ -499,8 +556,13 @@ def _register_ask_image(
             workspace_store=env.workspace_store,
             usage_meter=vl_usage_meter,
             quick_vl_caller=quick_vl_caller,
+            plain_vl_caller=plain_vl_caller,
             vl_model_name=vision.model.name,
             output_cap_resolver=served_output_cap(vision.model),
+            # B-251 —— 按页看时那一页没渲染,用这个 agent 自己的 read_page 先渲一次。
+            # read_page 是基础能力,先于这里注册;没有它(没接沙箱)就保持旧行为。
+            # B-266 —— 它也负责渲文档页的局部(``render_regions``)。
+            page_renderer=read_page if isinstance(read_page, ReadPageTool) else None,
         )
     )
 
@@ -551,6 +613,8 @@ def _register_spawn_worker(
     parent_spec: AgentSpec | None,
     dynamic_workers: DynamicWorkersSpec | None,
     subagent_depth: int,
+    *,
+    vision_gap: bool = False,
 ) -> None:
     """Register the ``spawn_worker`` tool — 1.3 dynamic Orchestrator-Worker.
 
@@ -562,12 +626,11 @@ def _register_spawn_worker(
     ``subagents``, a missing builder is **not** an error — the feature is
     default-on but optional, so an unwired deployment simply runs without it.
     """
-    if dynamic_workers is not None and not dynamic_workers.enabled:
+    if not _spawn_worker_registrable(env, parent_spec, dynamic_workers, subagent_depth):
+        if subagent_depth >= MAX_SUBAGENT_DEPTH:
+            logger.warning("tools.spawn_worker_depth_cap depth=%d not_registered", subagent_depth)
         return
-    if env.worker_build_fn is None or parent_spec is None:
-        return
-    if subagent_depth >= MAX_SUBAGENT_DEPTH:
-        logger.warning("tools.spawn_worker_depth_cap depth=%d not_registered", subagent_depth)
+    if parent_spec is None or env.worker_build_fn is None:  # narrowed by the gate above
         return
     build_fn = env.worker_build_fn
     child_depth = subagent_depth + 1
@@ -588,8 +651,56 @@ def _register_spawn_worker(
             builder=_builder,
             child_depth=child_depth,
             trajectory_recorder=env.trajectory_recorder,
+            vision_gap=vision_gap,
         )
     )
+
+
+def _spawn_worker_registrable(
+    env: ToolEnv,
+    parent_spec: AgentSpec | None,
+    dynamic_workers: DynamicWorkersSpec | None,
+    subagent_depth: int,
+) -> bool:
+    """The one set of gates for ``spawn_worker`` (B-276: read_page's refusal
+    must never point to a spawn_worker that is not there)."""
+    if dynamic_workers is not None and not dynamic_workers.enabled:
+        return False
+    if env.worker_build_fn is None or parent_spec is None:
+        return False
+    return subagent_depth < MAX_SUBAGENT_DEPTH
+
+
+def _spawn_worker_vision_gap(
+    env: ToolEnv,
+    parent_spec: AgentSpec | None,
+    dynamic_workers: DynamicWorkersSpec | None,
+    subagent_depth: int,
+) -> bool:
+    """B-276 —— ``spawn_worker`` will be registered and its workers can see
+    images this agent cannot."""
+    if parent_spec is None or not _spawn_worker_registrable(
+        env, parent_spec, dynamic_workers, subagent_depth
+    ):
+        return False
+    return _workers_see_what_parent_cannot(parent_spec, dynamic_workers)
+
+
+def _workers_see_what_parent_cannot(
+    parent_spec: AgentSpec, dynamic_workers: DynamicWorkersSpec | None
+) -> bool:
+    """B-276 — the parent has no way to look at images (not multimodal, no
+    ``vision`` block → no ``ask_image``) while the workers' model is multimodal
+    (``dynamic_workers.model`` overrides the parent's model for workers)."""
+    parent_model = parent_spec.spec.model
+    if parent_model.supports_vision or parent_spec.spec.vision is not None:
+        return False
+    worker_model = (
+        dynamic_workers.model
+        if dynamic_workers is not None and dynamic_workers.model is not None
+        else parent_model
+    )
+    return worker_model.supports_vision
 
 
 def _register_builtin(
@@ -599,13 +710,15 @@ def _register_builtin(
     skill_seed_files: tuple[tuple[str, bytes], ...],
     *,
     figure_delivery: FigureDelivery = "none",
+    knowledge_first: bool = False,
+    workers_view_pages: bool = False,
 ) -> None:
     if entry.name not in KNOWN_BUILTINS:
         raise AgentFactoryError(
             f"unknown builtin tool {entry.name!r} (known: {sorted(KNOWN_BUILTINS)})"
         )
     if entry.name == "web_search":
-        _register_web_search(registry, entry, env)
+        _register_web_search(registry, entry, env, knowledge_first=knowledge_first)
     elif entry.name == "exec_python":
         _register_exec_python(registry, env, skill_seed_files)
     elif entry.name == "bash":
@@ -615,7 +728,9 @@ def _register_builtin(
     elif entry.name == "read_document":
         _register_read_document(registry, env, skill_seed_files)
     elif entry.name == "read_page":
-        _register_read_page(registry, env, skill_seed_files, figure_delivery)
+        _register_read_page(
+            registry, env, skill_seed_files, figure_delivery, workers_view_pages=workers_view_pages
+        )
     elif entry.name == "save_artifact":
         # 登记前要 stat 工作区里那个文件,所以和 read_file/write_file 一样需要
         # 沙箱执行通道;没有它就没有「文件」这个概念,登记只会造出死产物。
@@ -689,6 +804,7 @@ def _register_base_capabilities(
     skill_seed_files: tuple[tuple[str, bytes], ...],
     *,
     figure_delivery: FigureDelivery = "none",
+    workers_view_pages: bool = False,
 ) -> None:
     """Register the Tier 1 base capabilities the manifest did not declare.
 
@@ -730,17 +846,39 @@ def _register_base_capabilities(
             env,
             skill_seed_files,
             figure_delivery=figure_delivery,
+            workers_view_pages=workers_view_pages,
         )
 
 
-def _register_web_search(registry: ToolRegistry, entry: BuiltinToolSpec, env: ToolEnv) -> None:
+def _register_web_search(
+    registry: ToolRegistry, entry: BuiltinToolSpec, env: ToolEnv, *, knowledge_first: bool = False
+) -> None:
+    client = _web_search_client(entry, env)
+    max_results = int(entry.config.get("max_results", DEFAULT_MAX_RESULTS))
+    registry.register(
+        WebSearchTool(
+            client=client,
+            default_max_results=max_results,
+            knowledge_first=knowledge_first,
+        )
+    )
+
+
+def _web_search_client(entry: BuiltinToolSpec, env: ToolEnv) -> TavilyClient:
+    """The backend of a ``web_search`` entry: B-267's fixed-result fixture when the
+    entry picks one (``config.fixture``) — a fixture that cannot be loaded is a
+    build error, never a fall back to real search — else the platform's client."""
+    if "fixture" in entry.config:
+        try:
+            return load_web_search_fixture(env.web_search_fixtures_dir, entry.config["fixture"])
+        except WebSearchFixtureError as exc:
+            raise AgentFactoryError(str(exc)) from exc
     if env.web_search_client is None:
         raise AgentFactoryError(
             "builtin 'web_search' declared but no Tavily client is "
             "configured (ToolEnv.web_search_client)"
         )
-    max_results = int(entry.config.get("max_results", DEFAULT_MAX_RESULTS))
-    registry.register(WebSearchTool(client=env.web_search_client, default_max_results=max_results))
+    return env.web_search_client
 
 
 def _register_exec_python(
@@ -756,6 +894,7 @@ def _register_exec_python(
     registry.register(
         ExecPythonTool(
             client=env.sandbox_runtime,
+            workspace_lock=env.workspace_lock,
             skill_seed_files=skill_seed_files,
         )
     )
@@ -852,6 +991,8 @@ def _register_read_page(
     env: ToolEnv,
     skill_seed_files: tuple[tuple[str, bytes], ...],
     figure_delivery: FigureDelivery,
+    *,
+    workers_view_pages: bool = False,
 ) -> None:
     # B-64 —— read_page rides the same warm sandbox runtime exec channel as
     # read_document (soffice / pdftoppm run inside the per-user sandbox).
@@ -865,6 +1006,9 @@ def _register_read_page(
             client=env.sandbox_runtime,
             skill_seed_files=skill_seed_files,
             figure_delivery=figure_delivery,
+            workers_view_pages=workers_view_pages,
+            # B-266 —— 渲局部(read_page / ask_image 的 region)要读整页渲染的像素尺寸。
+            image_resolver=env.image_resolver,
         )
     )
 

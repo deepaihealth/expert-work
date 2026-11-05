@@ -58,6 +58,10 @@ export interface PassageRevision {
   heading_path: string[];
   /** ``null``: the text the file gave (revision 1 of an ingested passage). */
   edited_by: string | null;
+  /** B-241 — the editor's display name (member name, else user display name;
+   *  your own login email for your own edits; never a coworker's email);
+   *  ``null`` when none is known: show ``edited_by``. */
+  edited_by_name: string | null;
   created_at: string | null;
   /** Since when a re-ingest left it without a passage; ``null`` otherwise. */
   orphaned_at: string | null;
@@ -208,12 +212,14 @@ export async function getUnappliedEdits(
   return response.data;
 }
 
-/** Delete the unapplied edits' history (``manifest:delete``). */
+/** Delete the unapplied edits' history (``manifest:delete``). Answers how
+ *  many entries went — the unit the confirm counts (B-241; the response's
+ *  ``revisions_deleted`` is the revision rows behind them). */
 export async function discardUnappliedEdits(
   baseName: string,
   documentId: string,
 ): Promise<number> {
-  const response = await apiClient.delete<{ discarded: number }>(
+  const response = await apiClient.delete<{ discarded: number; revisions_deleted: number }>(
     `${documentPath(baseName, documentId)}/unapplied-edits`,
   );
   return response.data.discarded;

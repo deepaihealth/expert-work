@@ -815,3 +815,51 @@ async def test_scope_user_drops_agents_with_no_live_code(
         params={"user_id": "孤儿树用户", "scope": "user"},
     )
     assert [f["path"] for f in resp.json()["data"]["files"]] == ["live.md"]
+
+
+@pytest.mark.asyncio
+async def test_conversation_files_carry_their_session_id(
+    external_client, _ctx: _Ctx, two_agents: _SeededTwoAgents
+) -> None:
+    """B-236 —— 新对话的文件在 ``threads/<会话 id>/work/`` 里:path 多这一段,另带
+    ``session_id``;老文件的 path 与字段不变(``session_id`` 为 ``null``),下载照旧。
+
+    ``session_id`` 只在那确实是**本租户、本用户、本 agent** 的会话时才给:路径里长得像
+    UUID 的目录名(会话已删、别的 agent 的会话 id、随手起的名字)一律 ``null``。"""
+    threads = _ctx.app.state.thread_meta_repo  # type: ignore[attr-defined]
+    conv, b_conv, foreign, gone = uuid4(), uuid4(), uuid4(), uuid4()
+    for thread_id, code, owner in (
+        (conv, _AGENT_A, two_agents.internal_user_id),
+        (b_conv, _AGENT_B, two_agents.internal_user_id),
+        (foreign, _AGENT_A, uuid4()),  # 同一个 agent,另一个终端用户的会话
+    ):
+        await threads.create(
+            thread_id=thread_id,
+            tenant_id=_TENANT_ID,
+            created_by="x",
+            user_id=owner,
+            agent_name=code,
+        )
+    for thread_id in (conv, b_conv, foreign, gone):
+        two_agents.store.files[f"agents/{_KEY_A}/threads/{thread_id}/work/report.md"] = b"r"
+    resp = await external_client.get(
+        f"/v1/agents/{_AGENT_A}/workspace/files", params={"user_id": two_agents.user_id}
+    )
+    files = {f["path"]: f for f in resp.json()["data"]["files"]}
+    assert files[f"threads/{conv}/work/report.md"] == {
+        "path": f"threads/{conv}/work/report.md",
+        "size": 1,
+        "agent_code": _AGENT_A,
+        "session_id": str(conv),
+    }
+    assert files[f"threads/{b_conv}/work/report.md"]["session_id"] is None
+    assert files[f"threads/{foreign}/work/report.md"]["session_id"] is None
+    assert files[f"threads/{gone}/work/report.md"]["session_id"] is None
+    assert files["客户案例/x.md"]["session_id"] is None
+    assert files["客户案例/x.md"]["agent_code"] == _AGENT_A
+    download = await external_client.get(
+        f"/v1/agents/{_AGENT_A}/workspace/file",
+        params={"user_id": two_agents.user_id, "path": f"threads/{conv}/work/report.md"},
+    )
+    assert download.status_code == 200
+    assert download.content == b"r"

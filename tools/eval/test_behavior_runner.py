@@ -43,9 +43,14 @@ def _turn(index: int, **kw: Any) -> TurnRecord:
 
 
 class FakeClient:
-    def __init__(self, failures: list[Exception] | None = None) -> None:
+    def __init__(
+        self,
+        failures: list[Exception] | None = None,
+        workspace: dict[str, bytes] | None = None,
+    ) -> None:
         self.failures = list(failures or [])
         self.calls: list[tuple[str, Any]] = []
+        self.workspace = dict(workspace or {})
 
     async def upload(
         self, agent: str, user_id: str, filename: str, data: bytes, session_id: str | None
@@ -75,7 +80,8 @@ class FakeClient:
         return "好".encode()
 
     async def read_workspace_file(self, agent: str, user_id: str, path: str) -> bytes | None:
-        return None
+        self.calls.append(("read_workspace_file", path))
+        return self.workspace.get(path)
 
     async def archive(self, agent: str, user_id: str, session_id: str) -> None:
         self.calls.append(("archive", session_id))
@@ -467,3 +473,16 @@ def test_required_no_artifact_or_indeterminate() -> None:
     other = _run_record(_turn(1, artifacts=[{"name": "notes.md", "version": 1}]))
     assert runner.indeterminate_reason(case, other) is None
     assert runner.indeterminate_reason(_case(), saved) is None
+
+
+@pytest.mark.asyncio
+async def test_workspace_files_are_read_from_the_session_work_dir_first() -> None:
+    """B-236 —— 新会话的相对路径落在 ``threads/<会话 id>/work/``;读不到再按 agent 根读
+    (B-236 之前的部署)。"""
+    conv = FakeClient(workspace={"threads/s1/work/results.md": b"conv", "results.md": b"root"})
+    assert await runner.read_session_file(conv, "a", "u", "s1", "results.md") == b"conv"
+    legacy = FakeClient(workspace={"results.md": b"root"})
+    assert await runner.read_session_file(legacy, "a", "u", "s1", "results.md") == b"root"
+    assert [c[1] for c in legacy.calls] == ["threads/s1/work/results.md", "results.md"]
+    assert await runner.read_session_file(legacy, "a", "u", None, "results.md") == b"root"
+    assert await runner.read_session_file(FakeClient(), "a", "u", "s1", "x.md") is None

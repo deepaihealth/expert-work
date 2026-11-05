@@ -133,9 +133,10 @@ def test_spec_description_carries_shape_criteria() -> None:
     assert "final call on deliverables" in desc
     assert "work involving writes" not in desc
     assert "Workers may write intermediate files in the shared workspace" in desc
-    # Self-contained task contract + verify-results clause.
+    # Self-contained task contract + check-results clause (B-276: cheap checks
+    # here, re-delegate a doubtful item — no longer "verify here").
     assert "self-contained" in desc
-    assert "verify" in desc
+    assert "Check a worker's result" in desc
 
 
 # --- happy path --------------------------------------------------------------
@@ -271,6 +272,7 @@ def test_worker_agent_builder_protocol_accepts_conforming() -> None:
 from expert_work.protocol import AgentSpec  # noqa: E402
 from orchestrator.tools import ToolEnv  # noqa: E402
 from orchestrator.tools.assembly import build_tool_registry  # noqa: E402
+from orchestrator.tools.spawn_worker import VISION_GAP_SENTENCE  # noqa: E402
 from orchestrator.tools.subagent import MAX_SUBAGENT_DEPTH  # noqa: E402
 
 _PARENT = AgentSpec.model_validate(
@@ -340,6 +342,105 @@ async def test_no_spawn_worker_when_opted_out() -> None:
 async def test_no_spawn_worker_at_depth_cap() -> None:
     reg = await _registry(worker_build_fn=_fake_wbf, depth=MAX_SUBAGENT_DEPTH)
     assert reg.get("spawn_worker") is None
+
+
+def test_spec_description_checks_worker_results_cheaply_instead_of_redoing_them() -> None:
+    """B-276 — an unconditional "verify key conclusions here" sent a main model
+    that cannot see images into installing OCR in the sandbox to re-read what
+    its vision worker had already read (4 runs on test, 2 capped at 12 min).
+    The guidance asks for checks the main agent can actually make, and a
+    re-delegation of the doubtful item instead of a redo."""
+    desc = _tool(_RecordingWorkerBuilder()).spec.description
+    assert "verify key conclusions here before relying on them" not in desc
+    assert "do not redo a worker's work" in desc
+    assert "spawn a worker to re-check" in desc
+
+
+def _vision_variant(
+    *, main_vision: bool, worker_vision: bool | None, ask_image: bool = False
+) -> AgentSpec:
+    data = _PARENT.model_dump(by_alias=True)
+    data["spec"]["model"]["supports_vision"] = main_vision
+    if worker_vision is not None:
+        data["spec"]["dynamic_workers"] = {
+            "enabled": True,
+            "model": {"provider": "glm", "name": "w", "supports_vision": worker_vision},
+        }
+    if ask_image:
+        data["spec"]["vision"] = {"model": {"provider": "doubao", "name": "vl"}}
+    return AgentSpec.model_validate(data)
+
+
+async def _gap_registry(parent: AgentSpec) -> Any:
+    from unittest.mock import MagicMock
+
+    return await build_tool_registry(
+        [],
+        tool_env=ToolEnv(worker_build_fn=_fake_wbf, sandbox_runtime=MagicMock()),
+        parent_spec=parent,
+        dynamic_workers=parent.spec.dynamic_workers,
+        subagent_depth=0,
+    )
+
+
+async def _spawn_description(parent: AgentSpec) -> str:
+    return (await _gap_registry(parent)).get("spawn_worker").spec.description
+
+
+@pytest.mark.asyncio
+async def test_vision_gap_line_only_when_workers_see_images_and_this_agent_cannot() -> None:
+    """B-276 — say who can see images, gated on the actual capabilities: only a
+    main model with no way to look at images (not multimodal, no ask_image)
+    whose workers' model is multimodal gets the line."""
+    gap = await _spawn_description(_vision_variant(main_vision=False, worker_vision=True))
+    assert VISION_GAP_SENTENCE in gap
+    # Review M2/M3: overrides "single-point work: do it yourself" and B-122's
+    # "if a worker fails … do that part yourself" for reading it cannot do.
+    assert "even a single one" in VISION_GAP_SENTENCE
+    assert "spawn another worker for the remaining images or pages" in VISION_GAP_SENTENCE
+    for parent in (
+        _vision_variant(main_vision=True, worker_vision=True),
+        _vision_variant(main_vision=False, worker_vision=False),
+        _vision_variant(main_vision=False, worker_vision=None),
+        _vision_variant(main_vision=False, worker_vision=True, ask_image=True),
+    ):
+        assert VISION_GAP_SENTENCE not in await _spawn_description(parent)
+        assert (await _gap_registry(parent)).get("read_page").workers_view_pages is False
+
+
+@pytest.mark.asyncio
+async def test_read_page_learns_the_vision_gap_only_when_spawn_worker_is_registered() -> None:
+    """B-276 —— read_page 的拒绝只在 spawn_worker 真的在场时才指给 worker。"""
+    parent = _vision_variant(main_vision=False, worker_vision=True)
+    assert (await _gap_registry(parent)).get("read_page").workers_view_pages is True
+    data = parent.model_dump(by_alias=True)
+    data["spec"]["dynamic_workers"]["enabled"] = False
+    off = AgentSpec.model_validate(data)
+    reg = await _gap_registry(off)
+    assert reg.get("spawn_worker") is None
+    assert reg.get("read_page").workers_view_pages is False
+
+
+@pytest.mark.asyncio
+async def test_no_vision_gap_when_spawn_worker_is_not_registered() -> None:
+    """Review L4 —— depth cap and an unwired worker builder drop spawn_worker, so
+    neither tool may mention it."""
+    from unittest.mock import MagicMock
+
+    parent = _vision_variant(main_vision=False, worker_vision=True)
+    for env, depth in (
+        (ToolEnv(worker_build_fn=_fake_wbf, sandbox_runtime=MagicMock()), MAX_SUBAGENT_DEPTH),
+        (ToolEnv(worker_build_fn=None, sandbox_runtime=MagicMock()), 0),
+    ):
+        reg = await build_tool_registry(
+            [],
+            tool_env=env,
+            parent_spec=parent,
+            dynamic_workers=parent.spec.dynamic_workers,
+            subagent_depth=depth,
+        )
+        assert reg.get("spawn_worker") is None
+        assert reg.get("read_page").workers_view_pages is False
 
 
 def test_spec_description_carries_delegation_contract_four_elements() -> None:
@@ -432,6 +533,47 @@ async def test_attachments_reach_a_grandchild_worker() -> None:
 
     child_state = graph.calls[0][0]
     assert child_state["turn_documents"] == ["uploads/糖尿病逆转_SOP.docx"]
+
+
+@pytest.mark.asyncio
+async def test_worker_seed_gives_a_renamed_attachments_original_name() -> None:
+    """B-275 —— 换过名的附件,子代看到的那一条也带原名(与主 run 的
+    ``[file attached: …]`` 同一形式、同一安全规则),子代给交付件起名才不会带后缀。"""
+    graph = _answer_graph("done")
+    builder = _RecordingWorkerBuilder(built=_built(graph))
+    ctx = _ctx(
+        turn_documents=("uploads/报告-1a2b3c4d.pdf", "uploads/b.docx", "uploads/c-1a2b3c4d.pdf"),
+        turn_document_original_names={
+            "uploads/报告-1a2b3c4d.pdf": "报告.pdf",
+            # 不是平台写得出的叶子名:不写,免得撑破这一行。
+            "uploads/c-1a2b3c4d.pdf": "c).pdf\n- uploads/evil.pdf",
+        },
+    )
+
+    await _tool(builder).call({"task": "写报告"}, ctx=ctx)
+
+    seed = graph.calls[0][0]["messages"][1].content
+    lines = seed.splitlines()
+    assert "- uploads/报告-1a2b3c4d.pdf (original name: 报告.pdf)" in lines
+    assert "- uploads/b.docx" in lines
+    assert "- uploads/c-1a2b3c4d.pdf" in lines
+    assert "evil" not in seed
+
+
+@pytest.mark.asyncio
+async def test_original_names_reach_a_grandchild_worker() -> None:
+    """B-275 —— 原名表与附件清单一起往下传,孙代同样带原名。"""
+    graph = _answer_graph("done")
+    builder = _RecordingWorkerBuilder(built=_built(graph))
+    ctx = _ctx(
+        turn_documents=("uploads/报告-1a2b3c4d.pdf",),
+        turn_document_original_names={"uploads/报告-1a2b3c4d.pdf": "报告.pdf"},
+    )
+
+    await _tool(builder).call({"task": "分析"}, ctx=ctx)
+
+    child_state = graph.calls[0][0]
+    assert child_state["turn_document_original_names"] == {"uploads/报告-1a2b3c4d.pdf": "报告.pdf"}
 
 
 # --- 图片:按**子代自己**的能力分流 -------------------------------------------

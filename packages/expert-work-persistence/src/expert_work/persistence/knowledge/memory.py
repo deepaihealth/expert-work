@@ -10,8 +10,12 @@ from datetime import UTC, datetime, timedelta
 from typing import Any
 from uuid import UUID, uuid4
 
+from expert_work.persistence.knowledge import profiles
 from expert_work.persistence.knowledge.base import (
     ALL_TENANTS_BASES_LIMIT,
+    PAGE_OCR_PAGE,
+    PAGE_OCR_READER,
+    PAGE_OCR_SOURCE,
     UNSET,
     CancelOutcome,
     ClaimedIngestion,
@@ -20,7 +24,10 @@ from expert_work.persistence.knowledge.base import (
     KnowledgeStore,
     ParseCacheEntry,
     ParseCacheKind,
+    ProfileClaim,
+    ProfileDigest,
     _Unset,
+    is_page_index,
 )
 from expert_work.persistence.knowledge.estimates import WAITING_STATUSES, reindex_fence_statuses
 from expert_work.persistence.knowledge.memory_estimates import HeldSnapshot, InMemoryEstimates
@@ -28,6 +35,7 @@ from expert_work.persistence.knowledge.passages import (
     SWITCH_OFF_REVISION,
     ChunkVector,
     DisabledReason,
+    DiscardedEdits,
     ManualPassage,
     Passage,
     PassageChild,
@@ -71,6 +79,11 @@ from expert_work.protocol import (
     RetrievalMethod,
     ScoredChunk,
     chunk_retrieval_text,
+)
+from expert_work.protocol.knowledge_profile import (
+    KnowledgeProfile,
+    KnowledgeProfileRecord,
+    ProbeCalibration,
 )
 
 
@@ -408,6 +421,126 @@ class InMemoryKnowledgeStore(InMemoryEstimates, KnowledgeStore):
 
     async def clear_reindex(self, *, tenant_id: UUID, kb_id: UUID) -> None:
         await self._patch_base(tenant_id, kb_id, {"reindex_requested_at": None})
+
+    # -- B-267 base profile --------------------------------------------------
+
+    def _base(self, tenant_id: UUID, kb_id: UUID) -> KnowledgeBase | None:
+        return next((b for b in self._bases if b.tenant_id == tenant_id and b.id == kb_id), None)
+
+    def _set_profile(self, base: KnowledgeBase, record: KnowledgeProfileRecord | None) -> None:
+        stored = None if record is None or record.is_empty() else record
+        self._bases[self._bases.index(base)] = base.model_copy(update={"profile": stored})
+
+    async def mark_profile_refresh(
+        self, *, tenant_id: UUID, kb_id: UUID, now: datetime, calibrate_only: bool = False
+    ) -> bool:
+        base = self._base(tenant_id, kb_id)
+        if base is None:
+            return False
+        record = profiles.marked(base.profile, now=now, calibrate_only=calibrate_only)
+        self._set_profile(base, record)
+        return True
+
+    async def claim_profile_refreshes(self, *, now: datetime, limit: int) -> list[ProfileClaim]:
+        ingesting = {
+            d.kb_id
+            for d in self._documents
+            if d.status in (DocumentStatus.PENDING, DocumentStatus.PROCESSING)
+        }
+        claims: list[ProfileClaim] = []
+        for base in list(self._bases):
+            if len(claims) >= limit:
+                break
+            if profiles.exhausted(base.profile):
+                assert base.profile is not None  # noqa: S101 - exhausted implies a record
+                self._set_profile(base, profiles.dropped(base.profile))
+                continue
+            if not profiles.claimable(base.profile, now=now, ingesting=base.id in ingesting):
+                continue
+            assert base.profile is not None  # noqa: S101 - claimable implies a record
+            record = profiles.claimed(base.profile, now=now)
+            self._set_profile(base, record)
+            claims.append(_claim_of(base, record))
+        return claims
+
+    async def finish_profile_refresh(
+        self,
+        *,
+        tenant_id: UUID,
+        kb_id: UUID,
+        holder: str,
+        marks: int,
+        profile: KnowledgeProfile | None,
+        calibration: ProbeCalibration | None,
+        now: datetime,
+        retry_calibration: bool = False,
+    ) -> None:
+        base = self._base(tenant_id, kb_id)
+        if base is not None:
+            record = profiles.finished(
+                base.profile,
+                holder=holder,
+                marks=marks,
+                profile=profile,
+                calibration=calibration,
+                now=now,
+                retry_calibration=retry_calibration,
+            )
+            self._set_profile(base, record)
+
+    async def fail_profile_refresh(
+        self, *, tenant_id: UUID, kb_id: UUID, holder: str, now: datetime
+    ) -> None:
+        base = self._base(tenant_id, kb_id)
+        if base is not None:
+            self._set_profile(base, profiles.failed(base.profile, holder=holder, now=now))
+
+    def _stale_profile(self, tenant_id: UUID, kb_id: UUID) -> None:
+        """B-267 —— a document with passages left the base (deleted or off)."""
+        base = self._base(tenant_id, kb_id)
+        if base is not None:
+            record = profiles.staled(base.profile, now=datetime.now(UTC))
+            if record is not None:
+                self._set_profile(base, record)
+
+    async def profile_digest(
+        self, *, tenant_id: UUID, kb_id: UUID, max_titles: int, detailed: int, max_headings: int
+    ) -> ProfileDigest:
+        docs = [
+            d
+            for d in self._documents
+            if d.tenant_id == tenant_id and d.kb_id == kb_id and d.enabled and d.chunk_count > 0
+        ]
+        docs.sort(key=lambda d: d.filename)
+        docs.sort(key=lambda d: d.created_at or datetime.min.replace(tzinfo=UTC), reverse=True)
+        listed = docs[:max_titles]
+        sampled = set(profiles.sample_positions(len(listed), detailed))
+        digests = []
+        for position, doc in enumerate(listed):
+            title = doc.title or doc.filename
+            if position not in sampled:
+                digests.append(profiles.DocumentDigest(title=title))
+                continue
+            # Only the document's first chunks are read (the SQL store's bound).
+            chunks = sorted(
+                (
+                    c
+                    for c in self._chunks
+                    if c.document_id == doc.id
+                    and c.enabled
+                    and c.chunk_index < profiles.PROFILE_HEADING_SCAN
+                ),
+                key=lambda c: c.chunk_index,
+            )
+            digests.append(
+                profiles.document_digest(
+                    title,
+                    [c.heading_path for c in chunks],
+                    chunks[0].content if chunks else None,
+                    max_headings=max_headings,
+                )
+            )
+        return ProfileDigest(documents=tuple(digests), ready_documents=len(docs))
 
     async def _patch_base(self, tenant_id: UUID, kb_id: UUID, update: dict[str, object]) -> bool:
         base = next((b for b in self._bases if b.tenant_id == tenant_id and b.id == kb_id), None)
@@ -876,6 +1009,8 @@ class InMemoryKnowledgeStore(InMemoryEstimates, KnowledgeStore):
         self._documents.remove(document)
         self._chunks = [c for c in self._chunks if c.document_id != document_id]
         self._drop_document_state({document_id})
+        if document.chunk_count > 0:
+            self._stale_profile(tenant_id, document.kb_id)
         return True
 
     def _drop_document_state(self, document_ids: set[UUID]) -> None:
@@ -991,6 +1126,24 @@ class InMemoryKnowledgeStore(InMemoryEstimates, KnowledgeStore):
             model=model, result=dict(result)
         )
 
+    async def cached_page_indexes(
+        self,
+        *,
+        tenant_id: UUID,
+        document_id: UUID,
+        source_sha256: str,
+        readers: Sequence[str],
+    ) -> set[int]:
+        wanted = set(readers)
+        return {
+            entry.result[PAGE_OCR_PAGE]
+            for (tenant, document, kind, _), entry in self._parse_cache.items()
+            if (tenant, document, kind) == (tenant_id, document_id, "page_ocr")
+            and entry.result.get(PAGE_OCR_READER) in wanted
+            and entry.result.get(PAGE_OCR_SOURCE) == source_sha256
+            and is_page_index(entry.result.get(PAGE_OCR_PAGE))
+        }
+
     # -- maintenance (B-175 P3-PR2) -------------------------------------------
 
     async def set_documents_enabled(
@@ -999,6 +1152,7 @@ class InMemoryKnowledgeStore(InMemoryEstimates, KnowledgeStore):
         wanted = set(document_ids)
         done: set[UUID] = set()
         now = datetime.now(UTC)
+        switched_off = False
         for index, document in enumerate(self._documents):
             if (
                 document.tenant_id == tenant_id
@@ -1009,6 +1163,10 @@ class InMemoryKnowledgeStore(InMemoryEstimates, KnowledgeStore):
                     update={"enabled": enabled, "updated_at": now}
                 )
                 done.add(document.id)
+                if not enabled and document.enabled and document.chunk_count > 0:
+                    switched_off = True
+        if switched_off:
+            self._stale_profile(tenant_id, kb_id)
         return [document_id for document_id in dict.fromkeys(document_ids) if document_id in done]
 
     async def count_stale_documents(self, *, tenant_id: UUID, kb_id: UUID, params_hash: str) -> int:
@@ -1196,7 +1354,9 @@ class InMemoryKnowledgeStore(InMemoryEstimates, KnowledgeStore):
         current = {p.row.id: p.row.revision for p in self._passages(tenant_id, document_id)}
         return unapplied_revisions(histories, current, self._records(tenant_id, document_id))
 
-    async def discard_unapplied_revisions(self, *, tenant_id: UUID, document_id: UUID) -> int:
+    async def discard_unapplied_revisions(
+        self, *, tenant_id: UUID, document_id: UUID
+    ) -> DiscardedEdits:
         unapplied = await self.list_unapplied_revisions(
             tenant_id=tenant_id, document_id=document_id
         )
@@ -1222,9 +1382,9 @@ class InMemoryKnowledgeStore(InMemoryEstimates, KnowledgeStore):
             for entry in self._switch_offs
             if not (entry[:2] == mine and entry[2].passage_id in records)
         ]
-        discarded = len(self._revisions) - len(kept) + len(self._switch_offs) - len(kept_records)
+        rows = len(self._revisions) - len(kept) + len(self._switch_offs) - len(kept_records)
         self._revisions, self._switch_offs = kept, kept_records
-        return discarded
+        return DiscardedEdits(entries=len(unapplied), revisions=rows)
 
     async def count_review_items(
         self, *, tenant_id: UUID, document_ids: Sequence[UUID]
@@ -1733,3 +1893,15 @@ def _fence_in(
     document: KnowledgeDocument, generation: int, statuses: Collection[DocumentStatus]
 ) -> bool:
     return document.status in statuses and document.ingest_generation == generation
+
+
+def _claim_of(base: KnowledgeBase, record: KnowledgeProfileRecord) -> ProfileClaim:
+    assert record.refresh is not None and record.refresh.holder is not None  # noqa: S101
+    return ProfileClaim(
+        tenant_id=base.tenant_id,
+        kb_id=base.id,
+        marks=record.refresh.marks,
+        attempts=record.refresh.attempts,
+        calibrate_only=record.refresh.calibrate_only,
+        holder=record.refresh.holder,
+    )

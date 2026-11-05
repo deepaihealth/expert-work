@@ -39,6 +39,7 @@ from expert_work.persistence import (
 from expert_work.persistence.embedding import EMBEDDING_DIM
 from expert_work.persistence.knowledge.base import (
     ChunkVector,
+    DiscardedEdits,
     KnowledgeStore,
     Passage,
     PassageChild,
@@ -1144,8 +1145,9 @@ async def test_a_reingest_marks_the_histories_it_leaves_behind(store: KnowledgeS
     (unapplied,) = await store.list_unapplied_revisions(tenant_id=t, document_id=d)
     assert unapplied.passage_id == p.first.id and unapplied.orphaned_at is not None
 
+    # B-241 —— one entry (the gone passage), its two revision rows.
     discarded = await store.discard_unapplied_revisions(tenant_id=t, document_id=d)
-    assert discarded == 2
+    assert discarded == DiscardedEdits(entries=1, revisions=2)
     assert await store.list_unapplied_revisions(tenant_id=t, document_id=d) == []
     assert (
         await store.list_passage_revisions(tenant_id=t, document_id=d, passage_id=p.first.id) == []
@@ -1154,7 +1156,9 @@ async def test_a_reingest_marks_the_histories_it_leaves_behind(store: KnowledgeS
         len(await store.list_passage_revisions(tenant_id=t, document_id=d, passage_id=p.lone.id))
         == 2
     )
-    assert await store.discard_unapplied_revisions(tenant_id=uuid4(), document_id=d) == 0
+    assert await store.discard_unapplied_revisions(
+        tenant_id=uuid4(), document_id=d
+    ) == DiscardedEdits(entries=0, revisions=0)
 
 
 # -- finding a passage again ----------------------------------------------------------
@@ -1281,7 +1285,10 @@ async def test_switch_off_records_are_kept_apart_from_text_history(
     again = {r.passage_id: r for r in await store.list_switch_offs(**scope)}
     assert (again[p.lone.id].orphaned_at, again[p.first.id].orphaned_at) == (since, None)
 
-    assert await store.discard_unapplied_revisions(**scope) == 3  # the edit's 2 + the record
+    # Two entries (the edit, the record); the edit's 2 rows + the record.
+    assert await store.discard_unapplied_revisions(**scope) == DiscardedEdits(
+        entries=2, revisions=3
+    )
     assert [r.passage_id for r in await store.list_switch_offs(**scope)] == [p.first.id]
 
 
@@ -1301,7 +1308,8 @@ async def test_a_record_discarded_during_an_ingest_stays_discarded(
     assert await store.replace_chunks(**scope, chunks=chunks, switch_offs=[first])
 
     (read,) = await store.list_switch_offs(**scope)  # an ingest reads it ...
-    assert await store.discard_unapplied_revisions(**scope) == 1  # ... it is discarded ...
+    discarded = await store.discard_unapplied_revisions(**scope)  # ... it is discarded ...
+    assert discarded == DiscardedEdits(entries=1, revisions=1)
     made = SwitchOffRecord(p.first.id, "苹果 适合", (), placed=False, new=True)
     again = replace(first, new=False)  # ... and the ingest writes back what it read
     assert await store.replace_chunks(**scope, chunks=chunks, switch_offs=[again, made])

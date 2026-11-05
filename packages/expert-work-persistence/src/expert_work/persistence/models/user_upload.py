@@ -38,6 +38,9 @@ class UserUploadRow(Base):
         server_default=text("now()"),
     )
     deleted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    #: B-271 (migration ``0182``): hex sha256 of the stored bytes, written at
+    #: upload. NULL for rows created before the column existed.
+    sha256: Mapped[str | None] = mapped_column(Text, nullable=True)
 
     __table_args__ = (
         CheckConstraint("kind IN ('image','document')", name="user_upload_kind_enum"),

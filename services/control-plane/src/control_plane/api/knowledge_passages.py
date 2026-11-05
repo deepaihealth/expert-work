@@ -15,6 +15,10 @@ itself. All under ``/bases/{name}/documents/{document_id}``:
   put back, and the passages it switched off by inheritance; ``DELETE``
   discards the former (``manifest:delete``: it deletes history).
 
+A revision carries ``edited_by`` (the editor's subject id) and
+``edited_by_name`` (B-241: their display name in the base's tenant — never a
+coworker's email, the reader may lack ``user:read`` — or ``null``).
+
 New text is cut by the base's chunk rules and only the chunks whose text
 changed are embedded (billed to the tenant like an ingest). Refusals: 409
 ``revision_conflict`` (with the passage as it stands), 409 ``document_busy``
@@ -25,6 +29,7 @@ the W3 tenant scope; writes are audited on the document.
 
 from __future__ import annotations
 
+from collections.abc import Mapping, Sequence
 from typing import Annotated, Any, Literal
 from uuid import UUID
 
@@ -33,6 +38,7 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
 from control_plane.api._authz import console_only, require
+from control_plane.api._user_scope import get_user_repo
 from control_plane.api.knowledge import (
     _audit_write,
     _get_audit,
@@ -61,6 +67,8 @@ from expert_work.persistence.knowledge.base import (
     PassageRevision,
 )
 from expert_work.persistence.knowledge.passages import PassageConflictError
+from expert_work.persistence.tenant_member import TenantMemberStore
+from expert_work.persistence.tenant_user import TenantUserStore
 from expert_work.protocol import (
     AuditAction,
     ChunkType,
@@ -68,6 +76,7 @@ from expert_work.protocol import (
     KnowledgeBase,
     KnowledgeChunk,
     KnowledgeDocument,
+    Principal,
     chunk_retrieval_text,
     knowledge_document_title,
 )
@@ -150,13 +159,62 @@ def _passage_dict(passage: Passage) -> dict[str, Any]:
     }
 
 
-def _revision_dict(record: PassageRevision) -> dict[str, Any]:
+def _get_member_repo(request: Request) -> TenantMemberStore | None:
+    return getattr(request.app.state, "tenant_member_repo", None)
+
+
+async def _account_name(
+    users: TenantUserStore, members: TenantMemberStore | None, tenant_id: UUID, subject_id: str
+) -> str | None:
+    """B-241 —— 一个作者的显示名:成员的 display_name → ``tenant_user.display_name``
+    (成员行几乎都有名字,tenant_user 几乎都没有)。不回落到成员邮箱:只有
+    ``manifest:read`` 的 viewer / operator 不该借此读到同事邮箱。"""
+    user = await users.get_by_subject(
+        tenant_id=tenant_id, subject_type="user", subject_id=subject_id
+    )
+    if user is None:
+        return None
+    member = (
+        await members.get_by_subject_id(tenant_id=tenant_id, subject_id=user.id)
+        if members is not None
+        else None
+    )
+    if member is not None and member.display_name:
+        return member.display_name
+    return user.display_name
+
+
+async def _editor_names(
+    users: TenantUserStore,
+    members: TenantMemberStore | None,
+    tenant_id: UUID,
+    records: Sequence[PassageRevision],
+    caller: Principal,
+) -> dict[str, str]:
+    """B-241 —— 修订作者的账号名,每个作者查一次(不按修订逐条查)。查不到的不在
+    结果里(界面退回显示编号)。"""
+    names: dict[str, str] = {}
+    for subject_id in dict.fromkeys(r.edited_by for r in records if r.edited_by):
+        name = await _account_name(users, members, tenant_id, subject_id)
+        if not name and subject_id == caller.subject_id:
+            # 没有显示名(如系统管理员:没有成员行、tenant_user 也没名字)时,看自己的
+            # 修改用自己的登录邮箱。已知限制:别的系统管理员的修改仍显示编号(平台没存
+            # 他们的名字)。
+            name = caller.email
+        if name:
+            names[subject_id] = name
+    return names
+
+
+def _revision_dict(record: PassageRevision, names: Mapping[str, str]) -> dict[str, Any]:
     return {
         "passage_id": str(record.passage_id),
         "revision": record.revision,
         "content": record.content,
         "heading_path": list(record.heading_path),
         "edited_by": record.edited_by,
+        # B-241 —— 账号名(显示用);查不到为 null。
+        "edited_by_name": names.get(record.edited_by) if record.edited_by else None,
         "created_at": _iso(record.created_at),
         # When a re-ingest left the passage out; deleted 30 days on.
         "orphaned_at": _iso(record.orphaned_at),
@@ -471,6 +529,8 @@ def build_knowledge_passages_router() -> APIRouter:
         request: Request,
         store: Annotated[KnowledgeStore, Depends(_get_knowledge_store)],
         audit: Annotated[AuditLogger, Depends(_get_audit)],
+        users: Annotated[TenantUserStore, Depends(get_user_repo)],
+        members: Annotated[TenantMemberStore | None, Depends(_get_member_repo)],
         tenant_id: Annotated[UUID | Literal["*"] | None, Query()] = None,
     ) -> JSONResponse:
         """The passage's history, oldest first — also for a passage a
@@ -489,7 +549,10 @@ def build_knowledge_passages_router() -> APIRouter:
             history = await store.list_passage_revisions(
                 tenant_id=scope.tenant_id, document_id=document_id, passage_id=passage_id
             )
-        return JSONResponse(content={"revisions": [_revision_dict(r) for r in history]})
+            names = await _editor_names(
+                users, members, scope.tenant_id, history, request.state.principal
+            )
+        return JSONResponse(content={"revisions": [_revision_dict(r, names) for r in history]})
 
     @router.post(
         f"{root}/passages/{{passage_id}}/restore",
@@ -558,6 +621,8 @@ def build_knowledge_passages_router() -> APIRouter:
         request: Request,
         store: Annotated[KnowledgeStore, Depends(_get_knowledge_store)],
         audit: Annotated[AuditLogger, Depends(_get_audit)],
+        users: Annotated[TenantUserStore, Depends(get_user_repo)],
+        members: Annotated[TenantMemberStore | None, Depends(_get_member_repo)],
         tenant_id: Annotated[UUID | Literal["*"] | None, Query()] = None,
     ) -> JSONResponse:
         """What a re-ingest left for a person to review: ``unapplied`` — manual
@@ -584,9 +649,12 @@ def build_knowledge_passages_router() -> APIRouter:
             inherited = await store.list_passages(
                 tenant_id=scope.tenant_id, document_id=document_id, disabled_reason="inherited"
             )
+            names = await _editor_names(
+                users, members, scope.tenant_id, unapplied, request.state.principal
+            )
         return JSONResponse(
             content={
-                "unapplied": [_revision_dict(r) for r in unapplied],
+                "unapplied": [_revision_dict(r, names) for r in unapplied],
                 "inherited": [_passage_dict(p) for p in inherited],
             }
         )
@@ -605,7 +673,9 @@ def build_knowledge_passages_router() -> APIRouter:
     ) -> JSONResponse:
         """Discard the unapplied edits and lost switch-offs — their revision
         history is deleted, so ``manifest:delete`` (otherwise the retention
-        job does it 30 days after a re-ingest left them behind)."""
+        job does it 30 days after a re-ingest left them behind). Answers
+        ``discarded`` — the entries ``GET`` listed (what the console counts) —
+        and ``revisions_deleted``, the revision rows that went (B-241)."""
         tenant_id: UUID = request.state.tenant_id
         base = await _require_base(store, tenant_id, name)
         await _require_document(store, tenant_id, base, document_id)
@@ -618,8 +688,14 @@ def build_knowledge_passages_router() -> APIRouter:
             action=AuditAction.KNOWLEDGE_PASSAGE_DISCARD_UNAPPLIED,
             resource_type="knowledge_document",
             resource_id=str(document_id),
-            details={"kb": base.name, "discarded": discarded},
+            details={
+                "kb": base.name,
+                "discarded": discarded.entries,
+                "revisions_deleted": discarded.revisions,
+            },
         )
-        return JSONResponse(content={"discarded": discarded})
+        return JSONResponse(
+            content={"discarded": discarded.entries, "revisions_deleted": discarded.revisions}
+        )
 
     return router
