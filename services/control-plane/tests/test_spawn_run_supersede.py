@@ -253,7 +253,8 @@ async def test_spawn_run_propagates_supersede_error_without_creating_a_row(
 async def test_spawn_run_without_supersede_keeps_the_original_enqueued_input(
     spawn_ctx: _SpawnCtx,
 ) -> None:
-    """``supersede=None`` 是原路径:不取锁、不重放,``enqueued_input`` 五个键照旧。"""
+    """``supersede=None`` 是原路径:不取锁、不重放,``enqueued_input`` 六个键照旧
+    (B-275 加了 ``document_original_names``)。"""
     resp = await spawn_ctx.spawn(mode="queue", supersede=None)
     assert resp.status_code == 202
     rows = await spawn_ctx.run_store.list_by_thread(
@@ -267,6 +268,7 @@ async def test_spawn_run_without_supersede_keeps_the_original_enqueued_input(
         "untrusted_content",
         "inputs",
         "document_names",
+        "document_original_names",
     }
 
 
