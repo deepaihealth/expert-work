@@ -58,11 +58,9 @@ class AgentSpecBusyError(DuplicateAgentSpecError):
     :class:`DuplicateAgentSpecError` subclass so create / fork's existing 409
     path covers it."""
 
-    def __init__(self, *, name: str, tenant_id: UUID | None = None, version: str = "") -> None:
-        Exception.__init__(self, f"agent {name!r} is being changed concurrently; retry")
-        self.tenant_id = tenant_id  # type: ignore[assignment]
-        self.name = name
-        self.version = version
+    def __init__(self, *, tenant_id: UUID, name: str, version: str = "") -> None:
+        super().__init__(tenant_id=tenant_id, name=name, version=version)
+        self.args = (f"agent {name!r} is being changed concurrently; retry",)
 
 
 class AgentSpecPurgeBlockedError(Exception):

@@ -113,8 +113,10 @@ def _add_owner_bits(dfd: int, name: str, info: os.stat_result) -> None:
     if mode & 0o700 != 0o700:
         try:
             os.chmod(name, mode | 0o700, dir_fd=dfd)
-        except OSError:
-            pass
+        except OSError as exc:
+            # Not ours (another uid) or a read-only mount: leave it; rmtree then fails
+            # and the entry is quarantined by rename instead.
+            logger.info("purge_agent.nas_chmod_refused error=%s", type(exc).__name__)
 
 
 def _open_dir(dfd: int, name: str) -> int | None:
@@ -151,8 +153,10 @@ def _make_removable(dfd: int, name: str) -> None:
     try:
         for child in os.listdir(fd):
             _make_removable(fd, child)
-    except OSError:
-        pass
+    except OSError as exc:
+        # Best-effort walk: whatever stays unlistable makes rmtree fail, and the
+        # caller falls back to the quarantine rename.
+        logger.info("purge_agent.nas_walk_incomplete error=%s", type(exc).__name__)
     finally:
         os.close(fd)
 

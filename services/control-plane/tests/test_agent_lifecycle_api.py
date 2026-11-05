@@ -529,7 +529,7 @@ async def test_a_lock_conflict_is_409_busy(ctx: _Ctx, monkeypatch: pytest.Monkey
     repo = ctx.app.state.agent_spec_repo  # type: ignore[attr-defined]
 
     async def _deadlocked(*, tenant_id: UUID, name: str) -> list[str]:
-        raise AgentSpecBusyError(name=name)
+        raise AgentSpecBusyError(tenant_id=tenant_id, name=name)
 
     monkeypatch.setattr(repo, "begin_purge", _deadlocked)
     purge = await _purge(ctx.client)
@@ -537,7 +537,7 @@ async def test_a_lock_conflict_is_409_busy(ctx: _Ctx, monkeypatch: pytest.Monkey
     assert purge.json()["error"]["code"] == "AGENT_BUSY"  # type: ignore[attr-defined]
 
     async def _deadlocked_create(**_kwargs: object) -> object:
-        raise AgentSpecBusyError(name=_NAME)
+        raise AgentSpecBusyError(tenant_id=ctx.tenant_id, name=_NAME, version="2.0.0")
 
     monkeypatch.setattr(repo, "create", _deadlocked_create)
     create = await ctx.client.post("/v1/agents", json={"manifest_yaml": _YAML_V2})

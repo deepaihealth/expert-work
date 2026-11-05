@@ -734,6 +734,6 @@ def test_a_deadlock_is_reported_as_busy() -> None:
     deadlock = DBAPIError("stmt", {}, _OrigError("deadlock detected"))
     other = DBAPIError("stmt", {}, Exception("boom"))
 
-    busy = _busy_if_deadlock(deadlock, name=_X)
+    busy = _busy_if_deadlock(deadlock, tenant_id=uuid4(), name=_X)
     assert isinstance(busy, AgentSpecBusyError)
-    assert _busy_if_deadlock(other, name=_X) is None
+    assert _busy_if_deadlock(other, tenant_id=uuid4(), name=_X) is None

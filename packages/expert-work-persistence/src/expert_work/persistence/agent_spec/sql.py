@@ -37,10 +37,12 @@ _GONE = (AgentSpecStatus.DELETED.value, AgentSpecStatus.PURGING.value)
 _DEADLOCK = "40P01"
 
 
-def _busy_if_deadlock(exc: DBAPIError, *, name: str) -> AgentSpecBusyError | None:
+def _busy_if_deadlock(
+    exc: DBAPIError, *, tenant_id: UUID, name: str, version: str = ""
+) -> AgentSpecBusyError | None:
     """A deadlock on the name's row locks is a retryable conflict, not a 500."""
     if getattr(exc.orig, "sqlstate", None) == _DEADLOCK:
-        return AgentSpecBusyError(name=name)
+        return AgentSpecBusyError(tenant_id=tenant_id, name=name, version=version)
     return None
 
 
@@ -123,7 +125,9 @@ class SqlAgentSpecStore(AgentSpecStore):
                 tenant_id=tenant_id, spec=spec, spec_sha256=spec_sha256, created_by=created_by
             )
         except DBAPIError as exc:
-            busy = _busy_if_deadlock(exc, name=spec.metadata.name)
+            busy = _busy_if_deadlock(
+                exc, tenant_id=tenant_id, name=spec.metadata.name, version=spec.metadata.version
+            )
             if busy is None:
                 raise
             raise busy from exc
@@ -132,7 +136,7 @@ class SqlAgentSpecStore(AgentSpecStore):
         try:
             return await self._begin_purge(tenant_id=tenant_id, name=name)
         except DBAPIError as exc:
-            busy = _busy_if_deadlock(exc, name=name)
+            busy = _busy_if_deadlock(exc, tenant_id=tenant_id, name=name)
             if busy is None:
                 raise
             raise busy from exc
@@ -141,7 +145,7 @@ class SqlAgentSpecStore(AgentSpecStore):
         try:
             return await self._purge_name(tenant_id=tenant_id, name=name)
         except DBAPIError as exc:
-            busy = _busy_if_deadlock(exc, name=name)
+            busy = _busy_if_deadlock(exc, tenant_id=tenant_id, name=name)
             if busy is None:
                 raise
             raise busy from exc
