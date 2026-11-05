@@ -67,6 +67,8 @@ def _clocks() -> tuple[CTE, CTE]:
         .distinct()
         .cte("artifact_source_runs")
     )
+    # 租户条件在 run 这一跳与下面 join 回版本时各有一份,是纵深防御:任何一份单独都足以挡住
+    # 别的租户的 run(去掉其中一份测试仍绿,两份都去掉才红)。
     threads = select(source.c.tenant_id, source.c.thread_id).distinct().cte("artifact_threads")
     last_run = (
         select(

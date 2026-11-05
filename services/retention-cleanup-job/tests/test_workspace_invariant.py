@@ -631,3 +631,32 @@ async def test_a_recently_downloaded_old_version_keeps_the_artifact_whole(world:
     versions = await w.artifacts.list_versions(tenant_id=t, user_id=u, artifact_id=artifact_id)
     assert versions is not None and [v.version for v in versions] == [2, 1]
     assert all(f.exists() for f in files)
+
+
+@pytest.mark.asyncio
+async def test_a_failing_artifact_pass_still_reports_what_it_already_deleted(
+    world: _World, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """B-63 —— 版本 pass 处理到第二个产物时出错:第一个产物已经删掉的版本与文件照样进报告,
+    pass 记失败,后面的 pass 照跑。"""
+    w = world
+    before = len(w.artifacts._versions)
+    real_mark = w.artifacts.mark_expired_if_versionless
+    calls: list[int] = []
+
+    async def _mark_then_fail(**kwargs: Any) -> bool:
+        calls.append(1)
+        if len(calls) > 1:
+            raise RuntimeError("canceling statement due to statement timeout")
+        return await real_mark(**kwargs)
+
+    monkeypatch.setattr(w.artifacts, "mark_expired_if_versionless", _mark_then_fail)
+
+    report = await w.job().run_once()
+
+    deleted = before - len(w.artifacts._versions)
+    assert deleted >= 1
+    assert report.artifact_versions_deleted == deleted
+    assert report.artifact_files_removed >= 1
+    assert "artifacts" in report.failed_passes
+    assert report.thread_dirs_removed >= 1  # a later pass still ran

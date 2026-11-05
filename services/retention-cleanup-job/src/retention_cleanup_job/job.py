@@ -45,6 +45,7 @@ import logging
 import time
 from collections.abc import Iterator
 from contextlib import contextmanager
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from uuid import UUID
 
@@ -89,6 +90,18 @@ logger = logging.getLogger(__name__)
 
 #: 审计行的 actor —— 与 control-plane 的 sweep 同款写法(``actor_type="system"``)。
 _ACTOR_ID = "retention_cleanup_job"
+
+
+@dataclass
+class _ArtifactTally:
+    """B-63 —— 产物两条 pass 边做边记的计数;pass 中途失败时报告里仍是已经做了的部分
+    (与上传 pass 的 ``UploadSweepTally`` 同一个做法)。"""
+
+    versions_deleted: int = 0
+    files_removed: int = 0
+    artifacts_expired: int = 0
+    soft_deleted: int = 0
+    hard_deleted: int = 0
 
 
 # The cleanup runs against a DB connection that's already authenticated
@@ -226,6 +239,8 @@ class RetentionCleanupJob:
         self._audit_log_store = audit_log_store
         #: 吞掉异常继续跑的 pass 失败时记在这里(``run_once`` 开头清空),进 ``CleanupReport``。
         self._failed_passes: list[str] = []
+        #: B-63 —— 产物两条 pass 的计数(``_sweep_artifact_passes`` 开头清零)。
+        self._artifact_tally = _ArtifactTally()
 
     async def run_once(self) -> CleanupReport:
         """Run the retention passes once and return a tally.
@@ -446,18 +461,32 @@ class RetentionCleanupJob:
         """B-63 —— 产物两条 pass(版本 → 逻辑产物)。按最后使用算的查询更重,撞上
         ``statement_timeout`` 之类时与上传 pass 一样:记日志、记进 ``failed_passes``(进程以非 0
         退出),后面的线程目录 / 记忆 / 工作区清理照跑。版本 pass 失败时不跑逻辑产物 pass(它
-        假定版本 pass 已经跑完)。
+        假定版本 pass 已经跑完)。两条 pass 边做边记,中途失败时返回的是已经做了的部分。
 
         Returns ``(versions_deleted, files_removed, artifacts_expired, soft, hard)``。
         """
+        tally = self._artifact_tally = _ArtifactTally()
         try:
-            versions_deleted, files_removed, expired = await self._sweep_artifact_versions()
-            soft, hard = await self._sweep_artifacts()
+            await self._sweep_artifact_versions()
+            await self._sweep_artifacts()
         except Exception:
-            logger.exception("retention.artifact_sweep_failed")
+            logger.exception(
+                "retention.artifact_sweep_failed versions_deleted=%d files_removed=%d "
+                "artifacts_expired=%d soft=%d hard=%d (partial)",
+                tally.versions_deleted,
+                tally.files_removed,
+                tally.artifacts_expired,
+                tally.soft_deleted,
+                tally.hard_deleted,
+            )
             self._failed_passes.append("artifacts")
-            return 0, 0, 0, 0, 0
-        return versions_deleted, files_removed, expired, soft, hard
+        return (
+            tally.versions_deleted,
+            tally.files_removed,
+            tally.artifacts_expired,
+            tally.soft_deleted,
+            tally.hard_deleted,
+        )
 
     async def _sweep_artifact_versions(self) -> tuple[int, int, int]:
         """留存链 B-28 —— 产物按**版本**到期。
@@ -502,10 +531,13 @@ class RetentionCleanupJob:
             deleted = await self._artifact_store.delete_versions(version_ids=deletable)
             versions_deleted += deleted
             files_removed += removed_here
+            self._artifact_tally.versions_deleted += deleted
+            self._artifact_tally.files_removed += removed_here
             expired_now = await self._artifact_store.mark_expired_if_versionless(
                 artifact_id=artifact_id, now=now
             )
             artifacts_expired += int(expired_now)
+            self._artifact_tally.artifacts_expired += int(expired_now)
             details: dict[str, object] = {
                 "user_id": str(versions[0].user_id),
                 "versions_deleted": sorted(v.version for v in versions if v.id in deletable),
@@ -587,6 +619,7 @@ class RetentionCleanupJob:
             )
             if ok:
                 soft_count += 1
+                self._artifact_tally.soft_deleted += 1
         # Stage 2 — hard-delete soft-deleted rows past the grace window.
         hard_cutoff = now - timedelta(days=self._artifact_hard_delete_grace_days)
         expired = await self._artifact_store.list_expired(
@@ -610,6 +643,7 @@ class RetentionCleanupJob:
         if not hard_ids:
             return soft_count, 0
         hard_count = await self._artifact_store.hard_delete(artifact_ids=hard_ids)
+        self._artifact_tally.hard_deleted += hard_count
         return soft_count, hard_count
 
     async def _sweep_uploads(self) -> UploadSweepTally:
