@@ -13,6 +13,7 @@ from expert_work.persistence.platform_quality_config import (
     InMemoryPlatformQualityConfigStore,
     PlatformQualityConfigRow,
 )
+from expert_work.protocol.model_catalog import catalog_entry
 
 
 def _settings(*, enable: bool = True) -> Settings:
@@ -67,6 +68,14 @@ def test_ui_toggle_off_disables_even_with_deploy_gate_on() -> None:
     assert cfg.enabled is False
 
 
+def test_default_judge_model_is_a_catalog_model() -> None:
+    # B-112 —— the fallback judge used to be the dated ``claude-haiku-4-5-20251001``,
+    # which is not in the model catalog (the entry is ``claude-haiku-4-5``): the
+    # catalog's capability bits and the rate card never applied to it.
+    settings = _settings()
+    assert catalog_entry(settings.quality_judge_provider, settings.quality_judge_model) is not None
+
+
 def test_null_field_falls_back_per_field() -> None:
     # A partial row (a knob left null) falls back to the env default for that
     # field only — the rest of the row still wins.
@@ -90,7 +99,7 @@ def test_null_field_falls_back_per_field() -> None:
     assert cfg.enabled is True
     assert cfg.sampling_rate_pct == 5  # fell back
     assert cfg.judge_provider == "qwen"  # row won
-    assert cfg.judge_model == "claude-haiku-4-5-20251001"  # fell back
+    assert cfg.judge_model == "claude-haiku-4-5"  # fell back
 
 
 @pytest.mark.asyncio
