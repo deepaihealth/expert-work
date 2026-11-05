@@ -737,3 +737,40 @@ def test_a_deadlock_is_reported_as_busy() -> None:
     busy = _busy_if_deadlock(deadlock, tenant_id=uuid4(), name=_X)
     assert isinstance(busy, AgentSpecBusyError)
     assert _busy_if_deadlock(other, tenant_id=uuid4(), name=_X) is None
+
+
+@pytest.mark.asyncio
+async def test_every_name_lock_takes_rows_in_version_order(sf: SF) -> None:
+    """create / begin_purge / purge_name lock the same rows; taking them in the same
+    order is what keeps two writers on one name from deadlocking each other."""
+    from sqlalchemy import event
+
+    store = SqlAgentSpecStore(sf)
+    t1 = uuid4()
+    for version in ("2.0.0", "1.0.0"):
+        await store.create(
+            tenant_id=t1, spec=_spec(version=version), spec_sha256="a" * 64, created_by="u"
+        )
+    engine = sf.kw["bind"]
+    seen: list[str] = []
+
+    def _capture(_conn: object, _cursor: object, statement: str, *_args: object) -> None:
+        if "FOR UPDATE" in statement and "agent_spec" in statement:
+            seen.append(" ".join(statement.split()))
+
+    event.listen(engine.sync_engine, "before_cursor_execute", _capture)
+    try:
+        await store.create(
+            tenant_id=t1, spec=_spec(version="3.0.0"), spec_sha256="a" * 64, created_by="u"
+        )
+        for version in ("1.0.0", "2.0.0", "3.0.0"):
+            await store.update_status(
+                tenant_id=t1, name=_X, version=version, status=AgentSpecStatus.DELETED
+            )
+        await store.begin_purge(tenant_id=t1, name=_X)
+        await store.purge_name(tenant_id=t1, name=_X)
+    finally:
+        event.remove(engine.sync_engine, "before_cursor_execute", _capture)
+
+    assert len(seen) == 3, seen  # create, begin_purge, purge_name
+    assert all("ORDER BY agent_spec.version" in s for s in seen), seen

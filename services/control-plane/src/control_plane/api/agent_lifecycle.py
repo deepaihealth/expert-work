@@ -10,8 +10,8 @@
 * ``POST /v1/agents/{name}/{version}/purge`` —— 彻底删除整个名字(全部版本 + 数据),
   请求体 ``{"confirm_name": "<名字>"}`` 必须与名字完全一致。只有版本行真的删掉了才回
   200 成功;最后被拦 → 409 ``AGENT_PURGE_BLOCKED``;有数据没删掉 → 409
-  ``AGENT_PURGE_INCOMPLETE``(名字停在 ``purging``,再点一次接着删);同名并发写撞上 → 409
-  ``AGENT_BUSY``。
+  ``AGENT_PURGE_INCOMPLETE``(名字停在 ``purging``,再点一次接着删);同名的另一个彻底删除
+  正在跑、或同名并发写撞上 → 409 ``AGENT_BUSY``。
 
 后两个路径里的 ``version`` 只用来定位这一行,操作对象是整个名字,所以**每一版**都要有删除
 权限。路由放在单独的模块里,``agents.py`` 只改了读已删除版本与 409 两处。
@@ -39,6 +39,7 @@ from control_plane.purge.agent_purge import (
     preview_agent_purge,
     purge_agent,
 )
+from control_plane.purge.agent_purge_lock import agent_purge_lock
 from control_plane.tenancy.tenant_config import ServiceBackedTenantConfigStore
 from expert_work.common.observability import current_trace_id_hex
 from expert_work.persistence.agent_spec import (
@@ -279,9 +280,17 @@ def build_agent_lifecycle_router() -> APIRouter:
         if blockers.blocked:
             return await _blocked(blockers.active_versions, blockers.referenced_by)
         try:
-            summary = await purge_agent(
-                build_agent_purge_deps(request), tenant_id=tenant_id, name=name
-            )
+            # 同名同时只跑一个彻底删除(跨副本);另一个正在跑 → 409,什么都不做。
+            async with agent_purge_lock(
+                getattr(request.app.state, "session_factory", None), tenant_id, name
+            ) as got:
+                if not got:
+                    return _error(
+                        AGENT_BUSY, "another purge of this agent is running; retry later", 409
+                    )
+                summary = await purge_agent(
+                    build_agent_purge_deps(request), tenant_id=tenant_id, name=name
+                )
         except AgentSpecPurgeBlockedError as exc:
             # 预检之后有人恢复 / 新建了一版:标记没打上,什么都没删。
             return await _blocked(exc.active_versions, exc.referenced_by)

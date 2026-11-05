@@ -36,6 +36,9 @@ from expert_work.persistence.workspace.layout import (
     ARTIFACT_SNAPSHOT_DIR as ARTIFACT_SNAPSHOT_DIR,
 )
 from expert_work.persistence.workspace.layout import (
+    PURGED_AGENTS_DIR as PURGED_AGENTS_DIR,
+)
+from expert_work.persistence.workspace.layout import (
     RENDERED_CROP_DIR as RENDERED_CROP_DIR,
 )
 from expert_work.persistence.workspace.layout import (
@@ -99,6 +102,9 @@ from expert_work.persistence.workspace.layout import (
     is_reserved_workspace_path as is_reserved_workspace_path,
 )
 from expert_work.persistence.workspace.layout import (
+    purged_agents_dir as purged_agents_dir,
+)
+from expert_work.persistence.workspace.layout import (
     region_crop_stem as region_crop_stem,
 )
 from expert_work.persistence.workspace.memory import (
@@ -111,6 +117,7 @@ from expert_work.persistence.workspace.sql import (
 __all__ = [
     "AGENT_FILE_VERSIONS_DIR",
     "ARTIFACT_SNAPSHOT_DIR",
+    "PURGED_AGENTS_DIR",
     "RENDERED_CROP_DIR",
     "RENDERED_FIGURE_DIR",
     "RENDERED_FIGURE_PAGE_STEM",
@@ -141,6 +148,7 @@ __all__ = [
     "is_rendered_crop_rel",
     "is_rendered_figure_rel",
     "is_reserved_workspace_path",
+    "purged_agents_dir",
     "region_crop_stem",
     "workspace_volume_name",
 ]

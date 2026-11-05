@@ -53,6 +53,7 @@ from expert_work.persistence import (
     create_async_session_factory,
 )
 from expert_work.persistence.agent_spec import (
+    AgentSpecBusyError,
     AgentSpecStore,
     DuplicateAgentSpecError,
     SqlAgentSpecStore,
@@ -277,16 +278,28 @@ async def seed_canary(
             minted = generated.plaintext
 
         agent_created = False
-        try:
-            await specs.create(
-                tenant_id=tenant_id,
-                spec=spec,
-                spec_sha256=compute_spec_sha256(spec),
-                created_by=_SEED_ACTOR,
-            )
-            agent_created = True
-        except DuplicateAgentSpecError:
-            logger.info("canary agent already registered: %s@%s", agent_code, CANARY_AGENT_VERSION)
+        for attempt in range(2):
+            try:
+                await specs.create(
+                    tenant_id=tenant_id,
+                    spec=spec,
+                    spec_sha256=compute_spec_sha256(spec),
+                    created_by=_SEED_ACTOR,
+                )
+                agent_created = True
+            except AgentSpecBusyError as exc:
+                # B-278 —— 同名的另一个写操作撞上(行锁死锁):不是「已经注册过」,重试一次。
+                logger.warning("canary agent create collided (attempt %d), retrying", attempt + 1)
+                if attempt == 1:
+                    raise SeedCanaryError(
+                        f"canary agent {agent_code!r} is being changed concurrently; retry"
+                    ) from exc
+                continue
+            except DuplicateAgentSpecError:
+                logger.info(
+                    "canary agent already registered: %s@%s", agent_code, CANARY_AGENT_VERSION
+                )
+            break
 
     return SeedCanaryResult(
         service_account_id=sa.id,

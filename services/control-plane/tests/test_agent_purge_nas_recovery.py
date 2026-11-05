@@ -1,29 +1,32 @@
 """B-278 review —— a NAS folder the purge cannot simply ``rm -rf`` must not leave the
-name stuck in ``purging`` forever.
+name stuck in ``purging`` forever, and must never be reported removed while it is
+still on disk.
 
-The model can ``chmod 000`` a directory in its own workspace, leave files another
-uid owns, or put a symlink where the purge expects a directory. The purge first
-gives directories it owns back their owner bits, then deletes; a symlink at the
-end of the path is unlinked, never followed; a folder that still will not go is
-renamed out of the way (``.purged-<name>-…``, counted as ``nas_quarantined``) so
-a future same-name agent cannot inherit it. Only a folder that can be neither
-removed nor renamed is a failure — and it holds back only that user's rows.
+The model can ``chmod 000`` a directory in its own workspace, build a very deep
+tree, leave files another uid owns, or put a symlink where the purge expects a
+directory; a janitor or a second purge can delete entries under our feet. The
+removal (``expert_work.persistence.workspace.safe_remove``) adds owner bits back on
+directories we own (never through a link), removes iteratively, verifies with
+``lstat``, unlinks a symlink target / skips a symlink on the way, and parks what
+still will not go in ``{tenant}/.purged-agents/{user}/`` outside the user root.
+Only an entry that can be neither removed nor parked is a failure — and it holds
+back only that user's rows.
 """
 
 from __future__ import annotations
 
 import os
-import shutil
 import stat
 from dataclasses import replace
 from pathlib import Path
 from typing import Any
-from uuid import UUID
+from uuid import UUID, uuid4
 
 import pytest
 
-from control_plane.purge import agent_purge_nas
 from control_plane.purge.agent_purge import agent_key_for, purge_agent
+from expert_work.persistence import purged_agents_dir
+from expert_work.persistence.workspace import safe_remove
 from orchestrator.tools.agent_file_versions import NasAgentFileVersionStore
 from orchestrator.tools.nas_workspace_store import NasWorkspaceStore
 from tests.test_agent_purge import _X, _counts, _World, _world
@@ -68,30 +71,40 @@ async def test_a_chmod_000_directory_is_made_removable_and_deleted(tmp_path: Pat
     assert summary.nas_quarantined == 0
 
 
+def _parent_inode(root: Path, tenant: UUID, user: UUID) -> int:
+    return os.lstat(_agent_dir(root, tenant, user).parent).st_ino
+
+
 @pytest.mark.asyncio
-async def test_a_folder_that_will_not_go_is_quarantined_and_the_purge_finishes(
+async def test_a_folder_that_will_not_go_is_parked_outside_the_user_root(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     world, _ = await _world()
     user = (await _users(world))[0]
     target = _agent_dir(tmp_path, world.t1, user)
     (target / "f").mkdir(parents=True)
-    real_rmtree = shutil.rmtree
+    (target / "f" / "data.txt").write_text("x" * 100)
+    real = safe_remove.remove_tree_at
 
-    def _foreign_owned(path: Any, *args: Any, **kwargs: Any) -> None:
-        if path == agent_key_for(_X):
-            raise PermissionError(1, "Operation not permitted")
-        real_rmtree(path, *args, **kwargs)
+    def _foreign_owned(dfd: int, name: str) -> bool:
+        return False if name == agent_key_for(_X) else real(dfd, name)
 
-    monkeypatch.setattr(shutil, "rmtree", _foreign_owned)
+    monkeypatch.setattr(safe_remove, "remove_tree_at", _foreign_owned)
 
     summary = await _nas_purge(world, tmp_path)
 
     assert summary.ok, summary.as_dict()
     assert summary.nas_quarantined == 1
     assert not target.exists()
-    parked = [p.name for p in target.parent.iterdir()]
-    assert len(parked) == 1 and parked[0].startswith(f".purged-{agent_key_for(_X)}-")
+    assert sorted(p.name for p in target.parent.iterdir()) == []  # nothing left in the root
+    holding = purged_agents_dir(str(tmp_path), world.t1, user)
+    parked = [p.name for p in holding.iterdir()]
+    assert len(parked) == 1 and parked[0].startswith(f"{agent_key_for(_X)}-")
+    # Invisible to the workspace browser (and so to the user-root quota walk).
+    listing = await NasWorkspaceStore(root=str(tmp_path)).list_files(
+        tenant_id=world.t1, user_id=user
+    )
+    assert not any("data.txt" in e.path for e in listing)
 
 
 @pytest.mark.asyncio
@@ -102,29 +115,23 @@ async def test_an_unrecoverable_folder_holds_back_only_that_user(
     stuck, other = await _users(world)
     (_agent_dir(tmp_path, world.t1, stuck) / "f").mkdir(parents=True)
     (_agent_dir(tmp_path, world.t1, other) / "f").mkdir(parents=True)
-    real_rmtree = shutil.rmtree
-    real_rename = os.rename
-    stuck_parent = os.lstat(_agent_dir(tmp_path, world.t1, stuck).parent).st_ino
+    stuck_parent = _parent_inode(tmp_path, world.t1, stuck)
+    real_remove = safe_remove.remove_tree_at
 
-    def _stuck(fd: int) -> bool:
-        return os.fstat(fd).st_ino == stuck_parent
+    def _no_remove(dfd: int, name: str) -> bool:
+        if os.fstat(dfd).st_ino == stuck_parent:
+            return False
+        return real_remove(dfd, name)
 
-    def _no_rmtree(path: Any, *args: Any, dir_fd: int | None = None, **kwargs: Any) -> None:
-        if dir_fd is not None and _stuck(dir_fd):
-            raise PermissionError(1, "Operation not permitted")
-        real_rmtree(path, *args, dir_fd=dir_fd, **kwargs)
+    def _no_park(root: str, tenant_id: UUID, owner_id: UUID, src_dfd: int, name: str) -> str:
+        raise PermissionError(1, "Operation not permitted")
 
-    def _no_rename(src: Any, dst: Any, *, src_dir_fd: int | None = None, **kwargs: Any) -> None:
-        if src_dir_fd is not None and _stuck(src_dir_fd):
-            raise PermissionError(1, "Operation not permitted")
-        real_rename(src, dst, src_dir_fd=src_dir_fd, **kwargs)
-
-    monkeypatch.setattr(shutil, "rmtree", _no_rmtree)
-    monkeypatch.setattr(os, "rename", _no_rename)
+    monkeypatch.setattr(safe_remove, "remove_tree_at", _no_remove)
+    monkeypatch.setattr(safe_remove, "_quarantine", _no_park)
 
     summary = await _nas_purge(world, tmp_path)
 
-    assert summary.failures == {"agent_workspace": "PermissionError"}
+    assert summary.failures == {"agent_workspace": "NasEntryStuckError"}
     assert summary.nas_failed_users == 1
     assert not summary.agent_spec_deleted  # visible, and the name waits for a re-run
     assert not _agent_dir(tmp_path, world.t1, other).exists()
@@ -138,6 +145,96 @@ async def test_an_unrecoverable_folder_holds_back_only_that_user(
     assert rerun.ok, rerun.as_dict()
     after = await _counts(world, world.t1, _X)
     assert all(v == 0 for v in after.values()), after
+
+
+def test_a_tree_still_on_disk_is_never_reported_removed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Whatever the delete did, success is decided by ``lstat`` afterwards."""
+    tenant, user = uuid4(), uuid4()
+    target = tmp_path / str(tenant) / str(user) / "agents" / "k-1"
+    (target / "a").mkdir(parents=True)
+
+    def _did_nothing(dfd: int, name: str) -> None:
+        return None
+
+    monkeypatch.setattr(safe_remove, "_flatten_remove", _did_nothing)
+
+    outcome = safe_remove.remove_entry(
+        str(tmp_path), [str(tenant), str(user), "agents"], "k-1", tenant_id=tenant, owner_id=user
+    )
+
+    assert outcome == safe_remove.QUARANTINED
+    assert not target.exists()
+
+
+def test_entries_vanishing_mid_delete_still_end_removed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A janitor / second purge deleting under our feet: ENOENT on a child is fine,
+    and the tree must really be gone (reviewer repro: a/b/c left behind)."""
+    tenant, user = uuid4(), uuid4()
+    base = tmp_path / str(tenant) / str(user) / "agents" / "k-1"
+    for d in ("a", "b", "c"):
+        (base / d).mkdir(parents=True)
+        (base / d / "f.txt").write_text("x")
+    real_unlink = os.unlink
+    raced = [False]
+
+    def _racing_unlink(name: Any, *args: Any, **kwargs: Any) -> None:
+        if not raced[0]:
+            raced[0] = True
+            real_unlink(name, *args, **kwargs)  # someone else got there first
+        real_unlink(name, *args, **kwargs)
+
+    monkeypatch.setattr(os, "unlink", _racing_unlink)
+
+    outcome = safe_remove.remove_entry(
+        str(tmp_path), [str(tenant), str(user), "agents"], "k-1", tenant_id=tenant, owner_id=user
+    )
+
+    assert raced[0]
+    assert outcome == safe_remove.REMOVED
+    assert not os.path.lexists(base)
+
+
+def test_a_very_deep_tree_is_removed_without_recursion(tmp_path: Path) -> None:
+    tenant, user = uuid4(), uuid4()
+    agents = tmp_path / str(tenant) / str(user) / "agents"
+    agents.mkdir(parents=True)
+    fd = os.open(agents, os.O_RDONLY | os.O_DIRECTORY)
+    os.mkdir("k-1", dir_fd=fd)
+    cur = os.open("k-1", os.O_RDONLY | os.O_DIRECTORY, dir_fd=fd)
+    os.close(fd)
+    for _ in range(1_100):  # deeper than the recursion limit, and than PATH_MAX allows
+        os.mkdir("d", dir_fd=cur)
+        nxt = os.open("d", os.O_RDONLY | os.O_DIRECTORY, dir_fd=cur)
+        os.close(cur)
+        cur = nxt
+    os.close(cur)
+
+    outcome = safe_remove.remove_entry(
+        str(tmp_path), [str(tenant), str(user), "agents"], "k-1", tenant_id=tenant, owner_id=user
+    )
+
+    assert outcome == safe_remove.REMOVED
+    assert not (agents / "k-1").exists()
+
+
+def test_quarantine_sweep_removes_only_entries_older_than_the_cutoff(tmp_path: Path) -> None:
+    tenant, user = uuid4(), uuid4()
+    holding = purged_agents_dir(str(tmp_path), tenant, user)
+    holding.mkdir(parents=True)
+    old = holding / f"k-1-1000-{'a' * 8}"
+    new = holding / f"k-1-2000-{'b' * 8}"
+    stranger = holding / "not-ours"
+    for d in (old, new, stranger):
+        (d / "x").mkdir(parents=True)
+
+    removed, failed = safe_remove.sweep_quarantine(str(tmp_path), older_than=1_500)
+
+    assert (removed, failed) == (1, 0)
+    assert not old.exists() and new.exists() and stranger.exists()
 
 
 @pytest.mark.asyncio
@@ -210,7 +307,25 @@ def test_owner_bits_are_only_added_never_removed(tmp_path: Path) -> None:
     d.chmod(0o055)
     fd = os.open(tmp_path, os.O_RDONLY | os.O_DIRECTORY)
     try:
-        agent_purge_nas._make_removable(fd, "d")
+        changed = safe_remove.add_owner_bits(fd, "d", os.lstat(d))
     finally:
         os.close(fd)
+    assert changed
     assert stat.S_IMODE(os.lstat(d).st_mode) == 0o755
+
+
+def test_owner_bits_never_reach_through_a_swapped_in_symlink(tmp_path: Path) -> None:
+    """lstat said "directory", then the name became a link: nothing outside changes."""
+    target = tmp_path / "outside"
+    target.mkdir()
+    target.chmod(0o500)
+    seen_as_dir = os.lstat(target)
+    (tmp_path / "swapped").symlink_to(target, target_is_directory=True)
+    fd = os.open(tmp_path, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        safe_remove.add_owner_bits(fd, "swapped", seen_as_dir)
+    finally:
+        os.close(fd)
+    mode = stat.S_IMODE(os.lstat(target).st_mode)
+    target.chmod(0o700)
+    assert mode == 0o500

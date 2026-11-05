@@ -149,7 +149,8 @@ class AgentPurgeSummary:
     nas_symlinks_skipped: int = 0
     #: 目标本身就是符号链接:删的是链接本身,不跟过去。
     nas_symlinks_unlinked: int = 0
-    #: 补了属主权限仍删不掉、改名挪到 ``.purged-<名>-…`` 的目录数(留给运维清理)。
+    #: 补了属主权限仍删不掉、挪进用户根旁边隔离区 ``{tenant}/.purged-agents/{user}/`` 的目录数
+    #: (留存作业满 7 天删掉)。
     nas_quarantined: int = 0
     #: 删不掉也挪不走的用户数 —— 只有这种情况名字会停在 ``purging``(``failures`` 里有记录)。
     nas_failed_users: int = 0

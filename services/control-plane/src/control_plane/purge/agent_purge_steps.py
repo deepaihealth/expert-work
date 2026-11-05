@@ -88,7 +88,11 @@ async def _delete_tree(
                 )
             return True
         outcome = await remove_nas_entry(
-            root, [str(tenant_id), str(user_id), *parent.split("/")], name
+            root,
+            [str(tenant_id), str(user_id), *parent.split("/")],
+            name,
+            tenant_id=tenant_id,
+            owner_id=user_id,
         )
     except Exception as exc:
         fail(summary, step, exc)
@@ -129,7 +133,11 @@ async def _delete_file_versions(
             return False
     try:
         outcome = await remove_nas_entry(
-            root, [str(tenant_id), AGENT_FILE_VERSIONS_DIR, str(user_id)], key
+            root,
+            [str(tenant_id), AGENT_FILE_VERSIONS_DIR, str(user_id)],
+            key,
+            tenant_id=tenant_id,
+            owner_id=user_id,
         )
     except Exception as exc:
         fail(summary, "agent_file_version", exc)
