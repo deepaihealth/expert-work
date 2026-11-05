@@ -42,8 +42,8 @@ or a Kubernetes CronJob. Settings via `EXPERT_WORK_RETENTION_*` env (see
 B-63 起**上传按最后使用到期**:`greatest(created_at, last_used_at, 会话最后一次 run)` 加上
 租户的 `tenant_config.upload_retention_days`(为空用 `EXPERT_WORK_RETENTION_UPLOAD_RETENTION_DAYS`,
 默认 90)。`last_used_at` 在对外接口重新附加(登记行;跨会话就是源会话那一行)与对外下载时记,
-每行每天最多一次,且只在 run 被接受之后记。「过期 7 天还失败就放弃」从 `max(到期, tenant_config.updated_at)` 算(租户刚改小天数时不会第一次失败就放弃)。租户可设 7–365 天,改小要显式确认。产物 / 上传两个 env 窗口上限 365,超过的夹到 365 并打
-`retention.retention_days_clamped` warning(不拒跑)。
+每行每天最多一次,且只在 run 被接受之后记。「过期 7 天还失败就放弃」从 `max(到期, tenant_config.updated_at)` 算(租户刚改小天数时不会第一次失败就放弃),最多推迟 30 天;已过到期 7 天仍在失败的行计 `upload_rows_failing_overdue` 并让作业非 0 退出。租户可设 7–365 天,改小要显式确认。产物 / 上传两个 env 窗口限 7–365,超出的夹回范围并打
+`retention.retention_days_clamped` warning(不拒跑);默认 90 必须与协议的 `FILE_RETENTION_DEFAULT_DAYS` 一致。
 
 | 规则 | 删什么 | 不删什么 |
 |---|---|---|

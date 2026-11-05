@@ -618,3 +618,29 @@ async def test_a_run_in_another_tenant_with_the_same_thread_id_does_not_count(
         assert await world.expired_ids({upload}) == {upload}
     finally:
         await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_config_edits_defer_the_give_up_window_by_at_most_thirty_days(
+    sql_store: SqlStoreFixture,
+) -> None:
+    """B-63 —— 租户配置每改一次(MCP 白名单、显示名……)``updated_at`` 都会刷新;不封顶的话,
+    长期失败的行永远等不到放弃。``give_up_from`` 最晚是 ``expires_at + 30 天``。"""
+    from datetime import UTC, datetime, timedelta
+
+    store, engine = sql_store
+    try:
+        world = _LastUse(store, engine)
+        tenant = uuid4()
+        await world.tenant_days(tenant, 30)  # updated_at = now (edited long after expiry)
+        upload = await world.upload(tenant_id=tenant, age_days=100)  # expired 70 days ago
+
+        rows = {
+            e.upload.id: e
+            for e in await store.list_expired(now=datetime.now(UTC), default_days=90)
+            if e.upload.id == upload
+        }
+        row = rows[upload]
+        assert row.give_up_from == row.expires_at + timedelta(days=30)
+    finally:
+        await engine.dispose()

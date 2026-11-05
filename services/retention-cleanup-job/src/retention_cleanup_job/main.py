@@ -112,12 +112,12 @@ def configure_logging(settings: RetentionCleanupSettings, *, stream: IO[str] | N
 
 
 def warn_clamped_retention(settings: RetentionCleanupSettings) -> None:
-    """B-63 —— 产物 / 上传保留期配得超过一年的,settings 已夹到 365;这里在日志装好之后逐条
-    打 warning,让人知道实际用的不是配的那个数。"""
+    """B-63 —— 产物 / 上传保留期配得超出 7-365 的,settings 已夹回范围;这里在日志装好之后
+    逐条打 warning,让人知道实际用的不是配的那个数。"""
     for name, configured in settings.clamped_retention.items():
         logger.warning(
             "retention.retention_days_clamped field=%s configured=%d used=%d "
-            "— the maximum is one year",
+            "— the allowed range is 7-365 days",
             name,
             configured,
             getattr(settings, name),
@@ -146,7 +146,7 @@ def log_done(report: CleanupReport) -> None:
         "purged_agent_dirs_removed=%d purged_agent_dirs_failed=%d "
         "uploads_expired=%d upload_files_removed=%d upload_files_unsafe=%d "
         "upload_rows_failed=%d upload_rows_abandoned=%d upload_rows_held=%d "
-        "upload_owners_unavailable=%d "
+        "upload_owners_unavailable=%d upload_rows_failing_overdue=%d "
         "thread_dirs_removed=%d "
         "memory_hard_deleted=%d workspaces_hard_deleted=%d "
         "workspaces_pending_archive=%d tenant_users_hard_deleted=%d "
@@ -174,6 +174,7 @@ def log_done(report: CleanupReport) -> None:
         report.upload_rows_abandoned,
         report.upload_rows_held,
         report.upload_owners_unavailable,
+        report.upload_rows_failing_overdue,
         report.thread_dirs_removed,
         report.memory_hard_deleted,
         report.workspaces_hard_deleted,

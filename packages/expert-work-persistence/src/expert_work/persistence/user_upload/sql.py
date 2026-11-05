@@ -12,6 +12,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from expert_work.persistence.bulk_delete import count_in_chunks, delete_in_chunks
 from expert_work.persistence.models import AgentRunRow, TenantConfigRow, UserUploadRow
 from expert_work.persistence.user_upload.base import (
+    GIVE_UP_DEFER_CAP,
     TOUCH_INTERVAL,
     ExpiredUpload,
     UserUploadStore,
@@ -27,9 +28,10 @@ def _expiry(default_days: int, *candidates: ColumnElement[bool]) -> Subquery:
     * 会话最后一次 run 用 CTE **一次**算出:先取候选行涉及的 ``(tenant_id, thread_id)``,再对这些
       会话的 ``agent_run`` 按会话聚合一遍(走 ``ix_agent_run_thread_id``),然后 join 回来 ——
       不再每行一个相关子查询;同一会话里的多条上传共用一次聚合。只认**同租户**的 run。
-    * ``give_up_from`` = ``greatest(到期, tenant_config.updated_at)``:租户刚把天数改小时,到期日
-      一下子落到很久以前,「过了到期日 7 天还在失败就放弃」要从这次改动算起,不能第一次暂时失败就
-      放弃。用配置行的 ``updated_at``(任何改动都会刷新它)是偏保守的近似:只会让放弃来得更晚。
+    * ``give_up_from`` = ``least(greatest(到期, tenant_config.updated_at), 到期 + 30 天)``:租户刚把
+      天数改小时,到期日一下子落到很久以前,「过了到期日 7 天还在失败就放弃」要从这次改动算起,不能
+      第一次暂时失败就放弃。配置行的 ``updated_at`` 任何改动都会刷新,所以最多只推迟
+      :data:`GIVE_UP_DEFER_CAP`,否则每周改一次配置就能让一条删不掉的行永远不放弃。
     """
     cand = (
         select(
@@ -58,6 +60,8 @@ def _expiry(default_days: int, *candidates: ColumnElement[bool]) -> Subquery:
         )
         .group_by(AgentRunRow.tenant_id, AgentRunRow.thread_id)
         .cte("upload_thread_last_run")
+        # 租户条件在这里和下面 join 回候选行时各有一份,两份是纵深防御:任何一份单独都足以
+        # 挡住别的租户的 run(去掉其中一份测试仍绿,两份都去掉才红)。
     )
     days = func.coalesce(TenantConfigRow.upload_retention_days, default_days)
     expires_at = func.greatest(
@@ -67,7 +71,10 @@ def _expiry(default_days: int, *candidates: ColumnElement[bool]) -> Subquery:
         select(
             cand.c.id,
             expires_at.label("expires_at"),
-            func.greatest(expires_at, TenantConfigRow.updated_at).label("give_up_from"),
+            func.least(
+                func.greatest(expires_at, TenantConfigRow.updated_at),
+                expires_at + GIVE_UP_DEFER_CAP,
+            ).label("give_up_from"),
         )
         .select_from(cand)
         .outerjoin(

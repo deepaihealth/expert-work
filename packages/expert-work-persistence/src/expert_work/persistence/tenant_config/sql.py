@@ -13,6 +13,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from expert_work.persistence.models import TenantConfigRow
 from expert_work.persistence.tenant_config.base import (
+    RetentionDecreaseNotConfirmedError,
     TenantConfigAlreadyExistsError,
     TenantConfigNotFoundError,
     TenantConfigStore,
@@ -127,9 +128,23 @@ class SqlTenantConfigStore(TenantConfigStore):
         tenant_id: UUID,
         patch: TenantConfigPatch,
         actor_id: str,
+        reject_unconfirmed_decrease: bool = False,
     ) -> TenantConfigRecord:
         async with self._sf() as session:
-            existing = await session.get(TenantConfigRow, tenant_id)
+            # B-63 —— 锁住这一行再读:「改小要确认」的比较与写入在同一个事务里,并发的另一次
+            # 改动要么已经提交(这里读到的是它的值),要么排在后面。
+            existing = (
+                await session.execute(
+                    select(TenantConfigRow)
+                    .where(TenantConfigRow.tenant_id == tenant_id)
+                    .with_for_update()
+                )
+            ).scalar_one_or_none()
+            if reject_unconfirmed_decrease:
+                current = _row_to_record(existing) if existing is not None else None
+                decreases = patch.retention_decreases(current)
+                if decreases:
+                    raise RetentionDecreaseNotConfirmedError(decreases)
             if existing is None:
                 if patch.display_name is None:
                     msg = (

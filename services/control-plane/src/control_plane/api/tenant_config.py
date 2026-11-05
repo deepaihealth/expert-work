@@ -32,13 +32,12 @@ from control_plane.tenant_scope import (
 )
 from expert_work.common.observability import current_trace_id_hex
 from expert_work.persistence.agent_spec import AgentSpecStore
+from expert_work.persistence.tenant_config.base import RetentionDecreaseNotConfirmedError
 from expert_work.protocol import (
-    FILE_RETENTION_DEFAULT_DAYS,
     AgentSpecRecord,
     Principal,
     Provider,
     TenantConfigPatch,
-    TenantConfigRecord,
     Tool,
 )
 from expert_work.runtime.audit.logger import AuditLogger
@@ -151,21 +150,6 @@ def _tool_usage_counts(specs: Iterable[AgentSpecRecord]) -> dict[Tool, int]:
     return counts
 
 
-def retention_decreases(
-    current: TenantConfigRecord | None, patch: TenantConfigPatch
-) -> list[dict[str, object]]:
-    """B-63 —— 这个 patch 把哪些保留期改小了:``[{field, from, to}]``(按生效值比,没设 = 平台
-    默认 :data:`FILE_RETENTION_DEFAULT_DAYS`)。调大、不变、改回默认但默认更大,都不算。"""
-    out: list[dict[str, object]] = []
-    for name, new in patch.retention_updates().items():
-        old = getattr(current, name) if current is not None else None
-        old_days = old if old is not None else FILE_RETENTION_DEFAULT_DAYS
-        new_days = new if new is not None else FILE_RETENTION_DEFAULT_DAYS
-        if new_days < old_days:
-            out.append({"field": name, "from": old_days, "to": new_days})
-    return out
-
-
 def build_tenant_config_router() -> APIRouter:
     router = APIRouter(
         prefix="/v1/tenants", tags=["tenant_config"], dependencies=[Depends(console_only())]
@@ -235,34 +219,33 @@ def build_tenant_config_router() -> APIRouter:
                         "message": str(exc),
                     },
                 ) from exc
-        # B-63 —— 改小附件 / 产物保留期最早当晚就会多清文件、不可恢复:必须显式带
-        # ``?confirm_retention_decrease=true``,否则 409、什么都不改。现值从 store 读(不走
-        # 60 秒的缓存),没有配置行 = 平台默认。
-        if not confirm_retention_decrease and payload.retention_updates():
-            async with applied_scope(scope):
-                current = await svc.store.get(tenant_id=scope.tenant_id)
-            decreases = retention_decreases(current, payload)
-            if decreases:
-                raise HTTPException(
-                    status_code=409,
-                    detail={
-                        "code": "RETENTION_DECREASE_NOT_CONFIRMED",
-                        "message": (
-                            "lowering a file retention period deletes more files as soon as "
-                            "tonight and cannot be undone; resend with "
-                            "?confirm_retention_decrease=true"
-                        ),
-                        "fields": decreases,
-                    },
-                )
         # Stream Y-1 — LLM credentials are platform-exclusive. ``credentials_mode``
         # is a ``Literal["platform"]``, so Pydantic rejects any other value in the
         # request body with 422 before reaching this handler; no switch gate needed.
+        # B-63 —— 改小附件 / 产物保留期最早当晚就会多清文件、不可恢复:必须显式带
+        # ``?confirm_retention_decrease=true``,否则 409、什么都不改。比较在 store 的写事务里、
+        # 锁住那一行之后做(并发的另一次改动漏不过去),没有配置行 = 平台默认。
         try:
             async with applied_scope(scope):
                 record = await svc.upsert(
-                    tenant_id=scope.tenant_id, patch=payload, actor_id=principal.subject_id
+                    tenant_id=scope.tenant_id,
+                    patch=payload,
+                    actor_id=principal.subject_id,
+                    reject_unconfirmed_decrease=not confirm_retention_decrease,
                 )
+        except RetentionDecreaseNotConfirmedError as exc:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "RETENTION_DECREASE_NOT_CONFIRMED",
+                    "message": (
+                        "lowering a file retention period deletes more files as soon as "
+                        "tonight and cannot be undone; resend with "
+                        "?confirm_retention_decrease=true"
+                    ),
+                    "fields": exc.decreases,
+                },
+            ) from exc
         except ValueError as exc:
             raise HTTPException(
                 status_code=422,

@@ -427,6 +427,17 @@ async def test_lowering_retention_days_needs_an_explicit_confirmation(
     to_default = await tc_client.put(url, headers=headers, json={"upload_retention_days": None})
     assert to_default.status_code == 200, to_default.text  # 60 → default 90 is a raise
 
+    # 120 → 平台默认 90 是改小:不确认 409,值不变。
+    raised = await tc_client.put(url, headers=headers, json={"upload_retention_days": 120})
+    assert raised.status_code == 200, raised.text
+    reset = await tc_client.put(url, headers=headers, json={"upload_retention_days": None})
+    assert reset.status_code == 409, reset.text
+    assert reset.json()["detail"]["fields"] == [
+        {"field": "upload_retention_days", "from": 120, "to": 90}
+    ]
+    got = (await tc_client.get(url, headers=headers)).json()["data"]
+    assert got["upload_retention_days"] == 120
+
 
 # ---------------------------------------------------------------------------
 # PR-E3a — PUT must drop the tenant's built agents (locally + via the bus)

@@ -123,3 +123,21 @@ def test_clamped_retention_is_logged_as_a_warning(
         "retention.retention_days_clamped field=upload_retention_days configured=400 used=365"
         in (caplog.text)
     )
+
+
+@pytest.mark.parametrize(
+    "env_key",
+    [
+        "EXPERT_WORK_RETENTION_UPLOAD_RETENTION_DAYS",
+        "EXPERT_WORK_RETENTION_ARTIFACT_RETENTION_DAYS",
+    ],
+)
+def test_file_retention_below_a_week_is_raised_to_seven_not_refused(
+    monkeypatch: pytest.MonkeyPatch, env_key: str
+) -> None:
+    """B-63 —— 与租户可设的范围一致(7-365)。低于 7 天的配置抬到 7(只会多留),记下原值。"""
+    monkeypatch.setenv(env_key, "3")
+    settings = RetentionCleanupSettings(_env_file=None)  # type: ignore[call-arg]
+    field = env_key.removeprefix("EXPERT_WORK_RETENTION_").lower()
+    assert getattr(settings, field) == 7
+    assert settings.clamped_retention == {field: 3}

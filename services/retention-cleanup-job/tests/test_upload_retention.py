@@ -1300,3 +1300,36 @@ async def test_giving_up_counts_from_the_last_use_expiry_not_the_upload_time(
     assert (_counts(tally), tally.rows_failed, tally.rows_abandoned) == ((0, 0, 0), 1, 0)
     assert real.exists()
     assert not await world.deleted(upload)
+
+
+@pytest.mark.asyncio
+async def test_a_deferred_row_still_failing_a_week_past_expiry_needs_attention(
+    world: _World, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """B-63 —— 放弃被租户配置改动推迟(``give_up_from`` 晚于到期日)时,行这一轮照样重试;但它
+    已经过了到期日 7 天还在失败 —— 记 ``rows_failing_overdue``,pass 记失败(进程非 0 退出,
+    告警会响),不能静悄悄地一天天拖下去。"""
+    from expert_work.persistence.user_upload import ExpiredUpload
+
+    meta = await world.thread(layout="conversation")
+    world.place(meta)
+    upload_id = await world.register(
+        meta.thread_id, created_at=datetime.now(UTC) - timedelta(days=100)
+    )
+    row = await world.uploads.get(upload_id=upload_id, tenant_id=world.tenant)
+    assert row is not None
+    expired_at = datetime.now(UTC) - timedelta(days=10)
+
+    async def _deferred(**_kwargs: object) -> list[ExpiredUpload]:
+        return [ExpiredUpload(upload=row, expires_at=expired_at, give_up_from=datetime.now(UTC))]
+
+    monkeypatch.setattr(world.uploads, "list_expired", _deferred)
+    _fail_reading_with(monkeypatch, errno.EIO)
+    job = world.job()
+
+    tally = await job._sweep_uploads()
+
+    assert (tally.rows_failed, tally.rows_abandoned, tally.rows_failing_overdue) == (1, 0, 1)
+    assert tally.needs_attention
+    assert job._failed_passes == ["uploads"]
+    assert not await world.deleted(upload_id)

@@ -298,6 +298,7 @@ class RetentionCleanupJob:
             upload_rows_abandoned=uploads.rows_abandoned,
             upload_rows_held=uploads.rows_held,
             upload_owners_unavailable=uploads.owners_unavailable,
+            upload_rows_failing_overdue=uploads.rows_failing_overdue,
             failed_passes=tuple(self._failed_passes),
             thread_dirs_removed=thread_dirs_removed,
             tool_result_dirs_removed=tool_result_dirs_removed,

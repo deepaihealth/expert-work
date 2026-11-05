@@ -7,6 +7,7 @@ from datetime import UTC, datetime
 from uuid import UUID
 
 from expert_work.persistence.tenant_config.base import (
+    RetentionDecreaseNotConfirmedError,
     TenantConfigAlreadyExistsError,
     TenantConfigNotFoundError,
     TenantConfigStore,
@@ -65,10 +66,15 @@ class InMemoryTenantConfigStore(TenantConfigStore):
         tenant_id: UUID,
         patch: TenantConfigPatch,
         actor_id: str,
+        reject_unconfirmed_decrease: bool = False,
     ) -> TenantConfigRecord:
         now = _now()
         async with self._lock:
             existing = self._rows.get(tenant_id)
+            if reject_unconfirmed_decrease:
+                decreases = patch.retention_decreases(existing)
+                if decreases:
+                    raise RetentionDecreaseNotConfirmedError(decreases)
             if existing is None:
                 if patch.display_name is None:
                     msg = (

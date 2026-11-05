@@ -91,7 +91,8 @@ _RETENTION_MAX_DAYS = 3650
 FILE_RETENTION_MIN_DAYS = 7
 FILE_RETENTION_MAX_DAYS = 365
 #: 平台默认天数(租户没设时)。控制面判「这次是不是改小」时拿它当没设那一档的值;
-#: 留存作业实际用的是自己的环境变量(默认同样 90)。
+#: 留存作业实际用的是自己的环境变量 ``EXPERT_WORK_RETENTION_{UPLOAD,ARTIFACT}_RETENTION_DAYS``,
+#: **两者必须一致**(作业那边的默认值同样是 90,见 ``retention_cleanup_job/settings.py``)。
 FILE_RETENTION_DEFAULT_DAYS = 90
 
 # Capability Uplift Sprint #4 — Mini-ADR U-28.
@@ -334,6 +335,19 @@ class TenantConfigPatch(BaseModel):
     # SE-16 (SE-A45) — implicit-candidate judge sample rate. None = leave
     # unchanged.
     skill_evolution_judge_sample_pct: int | None = Field(default=None, ge=0, le=100)
+
+    def retention_decreases(self, current: TenantConfigRecord | None) -> list[dict[str, object]]:
+        """B-63 —— 这个 patch 相对 ``current`` 把哪些保留期改小了:``[{field, from, to}]``(按生效值
+        比,没设 = :data:`FILE_RETENTION_DEFAULT_DAYS`)。调大、不变、改回默认但默认更大,都不算。
+        ``current`` 为 ``None`` = 还没有配置行(两项都是默认)。"""
+        out: list[dict[str, object]] = []
+        for name, new in self.retention_updates().items():
+            old = getattr(current, name) if current is not None else None
+            old_days = old if old is not None else FILE_RETENTION_DEFAULT_DAYS
+            new_days = new if new is not None else FILE_RETENTION_DEFAULT_DAYS
+            if new_days < old_days:
+                out.append({"field": name, "from": old_days, "to": new_days})
+        return out
 
     def retention_updates(self) -> dict[str, int | None]:
         """B-63 —— 这个 patch 对两个保留期字段的改动:键在 ``model_fields_set`` 里才算(显式

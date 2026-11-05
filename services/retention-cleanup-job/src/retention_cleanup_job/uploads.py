@@ -137,11 +137,20 @@ class UploadSweepTally:
     owners_unavailable: int = 0
     #: 因为属主目录打不开而跳过的行。
     rows_owner_skipped: int = 0
+    #: B-63 —— 这一轮暂时失败、而且已经过了到期日 :data:`_GIVE_UP_AFTER` 的行(放弃被租户配置
+    #: 改动推迟着,所以还在重试)。计在 ``rows_failed`` 里,另外单独数,好让人去看。
+    rows_failing_overdue: int = 0
 
     @property
     def needs_attention(self) -> bool:
-        """有行被放弃、被熔断拦下,或有用户的目录打不开 —— 调用方把这个 pass 记成失败,让人去看。"""
-        return self.rows_abandoned > 0 or self.rows_held > 0 or self.owners_unavailable > 0
+        """有行被放弃、被熔断拦下、有用户的目录打不开,或有行过了到期日 7 天还在失败 —— 调用方把
+        这个 pass 记成失败(进程非 0 退出、告警会响),让人去看。"""
+        return (
+            self.rows_abandoned > 0
+            or self.rows_held > 0
+            or self.owners_unavailable > 0
+            or self.rows_failing_overdue > 0
+        )
 
 
 def _chunks(ids: Iterable[UUID]) -> Iterator[list[UUID]]:
@@ -209,6 +218,8 @@ class UploadSweep:
                 if entry.give_up_from >= now - _GIVE_UP_AFTER:
                     _note_failure(failures, row, exc)
                     tally.rows_failed += 1
+                    if entry.expires_at < now - _GIVE_UP_AFTER:
+                        tally.rows_failing_overdue += 1
                 else:
                     logger.warning(
                         "retention.upload_row_abandoning upload_id=%s error=%s",

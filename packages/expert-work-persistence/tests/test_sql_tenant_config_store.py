@@ -475,3 +475,59 @@ async def test_add_blocks_on_row_lock_then_merges(
         assert sorted(fetched.mcp_allowlist) == ["amap", "deep"]
     finally:
         await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_an_unconfirmed_decrease_is_judged_against_the_locked_row(
+    tenant_config_store: tuple[SqlTenantConfigStore, AsyncEngine],
+) -> None:
+    """B-63 —— 「改小要确认」的比较必须与写入在同一个事务、锁住那一行之后做。否则:另一个
+    事务把 30 调到 365 还没提交时,这边读到 30、判「60 不算改小」,等对面提交后照样把 365
+    写成 60。这里先占住行锁把值改成 365,再发一个不确认的「改成 60」,然后提交 —— 它必须
+    看到 365 并拒绝。"""
+    import asyncio
+
+    from expert_work.persistence.tenant_config.base import RetentionDecreaseNotConfirmedError
+
+    store, engine = tenant_config_store
+    try:
+        tenant = uuid4()
+        current_tenant_id_var.set(tenant)
+        await store.create(tenant_id=tenant, display_name="Acme", actor_id="bootstrap")
+        await store.upsert(
+            tenant_id=tenant,
+            patch=TenantConfigPatch(upload_retention_days=30),
+            actor_id="ops",
+        )
+        async with engine.connect() as holder:
+            tx = await holder.begin()
+            await holder.execute(
+                text("SELECT set_config('app.tenant_id', :t, true)"), {"t": str(tenant)}
+            )
+            await holder.execute(
+                text("SELECT 1 FROM tenant_config WHERE tenant_id = :t FOR UPDATE"),
+                {"t": tenant},
+            )
+            await holder.execute(
+                text("UPDATE tenant_config SET upload_retention_days = 365 WHERE tenant_id = :t"),
+                {"t": tenant},
+            )
+            lower = asyncio.create_task(
+                store.upsert(
+                    tenant_id=tenant,
+                    patch=TenantConfigPatch(upload_retention_days=60),
+                    actor_id="ops",
+                    reject_unconfirmed_decrease=True,
+                )
+            )
+            await asyncio.sleep(0.5)
+            assert not lower.done()  # waiting for the row lock
+            await tx.commit()
+
+        with pytest.raises(RetentionDecreaseNotConfirmedError) as caught:
+            await lower
+        assert caught.value.decreases == [{"field": "upload_retention_days", "from": 365, "to": 60}]
+        fetched = await store.get(tenant_id=tenant)
+        assert fetched is not None and fetched.upload_retention_days == 365
+    finally:
+        await engine.dispose()

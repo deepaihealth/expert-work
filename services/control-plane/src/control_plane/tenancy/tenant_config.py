@@ -124,9 +124,17 @@ class TenantConfigService:
         tenant_id: UUID,
         patch: TenantConfigPatch,
         actor_id: str,
+        reject_unconfirmed_decrease: bool = False,
     ) -> TenantConfigRecord:
-        """Insert or merge, invalidate the cache, audit the write."""
-        record = await self._store.upsert(tenant_id=tenant_id, patch=patch, actor_id=actor_id)
+        """Insert or merge, invalidate the cache, audit the write.
+
+        B-63 —— ``reject_unconfirmed_decrease`` 原样交给 store(比较在 store 的写事务里做)。"""
+        record = await self._store.upsert(
+            tenant_id=tenant_id,
+            patch=patch,
+            actor_id=actor_id,
+            reject_unconfirmed_decrease=reject_unconfirmed_decrease,
+        )
         # Prime the cache with the fresh row so the very next ``get``
         # is a hit (saves one round trip on read-after-write).
         self._cache[tenant_id] = _CacheEntry(
@@ -263,9 +271,19 @@ class ServiceBackedTenantConfigStore(TenantConfigStore):
             return None
 
     async def upsert(
-        self, *, tenant_id: UUID, patch: TenantConfigPatch, actor_id: str
+        self,
+        *,
+        tenant_id: UUID,
+        patch: TenantConfigPatch,
+        actor_id: str,
+        reject_unconfirmed_decrease: bool = False,
     ) -> TenantConfigRecord:
-        return await self._service.upsert(tenant_id=tenant_id, patch=patch, actor_id=actor_id)
+        return await self._service.upsert(
+            tenant_id=tenant_id,
+            patch=patch,
+            actor_id=actor_id,
+            reject_unconfirmed_decrease=reject_unconfirmed_decrease,
+        )
 
     # ── 以下三个方法 recall 路径用不到,但基类是 ABC,必须逐个委托底层
     # store,不留 NotImplementedError。────────────────────────────────

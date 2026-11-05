@@ -24,6 +24,11 @@ from expert_work.protocol import UserUpload, UserUploadKind
 #: 已经早于一天前才真的 UPDATE。保留期按天算,一天的精度足够。
 TOUCH_INTERVAL = timedelta(days=1)
 
+#: B-63 —— 租户配置改动最多把「过期 7 天还失败就放弃」的起点往后推这么久。``tenant_config``
+#: 的任何写入(MCP 白名单、显示名、状态……)都会刷新 ``updated_at``,不封顶的话一条一直删不掉的
+#: 行可以被每周一次的配置改动永远推迟下去。
+GIVE_UP_DEFER_CAP = timedelta(days=30)
+
 
 @dataclass(frozen=True)
 class ExpiredUpload:
@@ -32,8 +37,9 @@ class ExpiredUpload:
     「最后使用」= ``created_at`` / ``last_used_at`` / 所在会话最后一次 run 的 ``created_at``
     三者中最晚的;保留期 = 租户的 ``tenant_config.upload_retention_days``,没设就用平台默认。
     ``give_up_from`` 是「过了到期日 7 天还在失败就放弃」那个窗口的起点:``max(expires_at,
-    租户配置最后一次改动)`` —— 租户刚把天数改小时到期日会一下子落到很久以前,窗口从这次改动
-    算起,第一次暂时失败不会直接放弃。没有租户配置的(内存实现)就是 ``expires_at``。
+    租户配置最后一次改动)``,但最晚 ``expires_at + GIVE_UP_DEFER_CAP`` —— 租户刚把天数改小时
+    到期日会一下子落到很久以前,窗口从这次改动算起,第一次暂时失败不会直接放弃;封顶是因为
+    配置的任何改动都会刷新那个时间。没有租户配置的(内存实现)就是 ``expires_at``。
     """
 
     upload: UserUpload
