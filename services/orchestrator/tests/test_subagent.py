@@ -1006,3 +1006,23 @@ async def test_static_subagent_seed_also_carries_this_turns_attachments() -> Non
     seed = graph.calls[0][0]["messages"][1].content
     assert "uploads/材料.docx" in seed
     assert seed.startswith("分析资料内容")
+
+
+@pytest.mark.asyncio
+async def test_static_subagent_seed_gives_a_renamed_attachments_original_name() -> None:
+    """B-275 —— 静态子 Agent 走同一条路,换过名的附件同样带原名。"""
+    graph = _FakeGraph(
+        result={"messages": [HumanMessage(content="task"), AIMessage(content="done")]}
+    )
+    tool = SubAgentTool(
+        subagent=_SUB, builder=_RecordingBuilder(built=_built(graph)), child_depth=2
+    )
+    ctx = _ctx(
+        turn_documents=("uploads/材料-1a2b3c4d.docx",),
+        turn_document_original_names={"uploads/材料-1a2b3c4d.docx": "材料.docx"},
+    )
+
+    await tool.call({"task": "分析资料内容"}, ctx=ctx)
+
+    seed = graph.calls[0][0]["messages"][1].content
+    assert "- uploads/材料-1a2b3c4d.docx (original name: 材料.docx)" in seed.splitlines()

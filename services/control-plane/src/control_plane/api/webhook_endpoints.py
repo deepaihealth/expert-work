@@ -56,6 +56,7 @@ _EVENT_TYPES: frozenset[str] = frozenset(
     (
         "run.completed",
         "run.failed",
+        "run.paused",
         "approval.requested",
         "artifact.saved",
         "skill_promote.requested",

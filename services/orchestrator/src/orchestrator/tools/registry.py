@@ -361,6 +361,10 @@ class ToolContext:
     #: 空元组 = 本轮没有文档,或走的是不带新一轮输入的路径(审批续跑 / orphan
     #: 复活 / 触发器)——那些路径本来就没有"本轮用户附件"。
     turn_documents: tuple[str, ...] = ()
+    #: B-275 —— ``turn_documents`` 里换过名(同名不同内容存成 ``<原名>-<8 位>``)的那几条
+    #: → 原名。子代种子的清单在实际路径后面接上原名,形式与安全规则同主 run 的
+    #: ``[file attached: …]``(``expert_work.persistence.workspace.upload_names``)。
+    turn_document_original_names: Mapping[str, str] = field(default_factory=dict)
     #: 本轮用户上传图片的 ``expert_work://image/...`` 引用,按上传顺序。
     #:
     #: 与文档分开,因为送达子代的机制由**子代自己的模型**决定,而不是父的

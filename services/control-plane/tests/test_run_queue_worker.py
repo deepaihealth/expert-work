@@ -261,6 +261,47 @@ async def test_claimed_run_carries_document_names_into_graph_input(
 
 
 @pytest.mark.asyncio
+async def test_claimed_run_carries_original_document_names_into_graph_input(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """B-275 —— 换过名的附件,原名随 ``enqueued_input`` 存下、出队时读回来:queue 模式下
+    模型看到的那一行与流式一字不差(这段回读有静默丢附件的前科)。"""
+    spawns: list[dict] = []
+
+    async def _fake_run_agent(**kw):
+        spawns.append(kw)
+
+    monkeypatch.setattr(worker_module, "run_agent", _fake_run_agent)
+
+    store = InMemoryRunStore()
+    runtime = _FakeRuntime(store)
+    run_id, tenant, thread = uuid4(), uuid4(), uuid4()
+    await runtime.run_manager.enqueue(
+        run_id=run_id,
+        thread_id=thread,
+        tenant_id=tenant,
+        enqueued_input={
+            "input": "q",
+            "image_refs": [],
+            "untrusted_content": [],
+            "document_names": ["uploads/report-1a2b3c4d.pdf"],
+            "document_original_names": {"uploads/report-1a2b3c4d.pdf": "report.pdf"},
+        },
+    )
+
+    assert await _worker(store, runtime).run_once() == 1
+    await asyncio.sleep(0)
+    content = spawns[0]["graph_input"]["messages"][1].content
+    assert content == (
+        "q\n\n[file attached: uploads/report-1a2b3c4d.pdf (original name: report.pdf)]"
+    )
+    # 委派出去的子代看不到上面那一行:原名表与附件清单一起进 state。
+    assert spawns[0]["graph_input"]["turn_document_original_names"] == {
+        "uploads/report-1a2b3c4d.pdf": "report.pdf"
+    }
+
+
+@pytest.mark.asyncio
 async def test_claimed_run_passes_prompt_inputs_to_run_agent(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -570,6 +611,8 @@ async def test_queued_run_without_attachments_leaves_the_key_out(
     # 空列表而非省略 —— 理由同 streaming 侧那条。
     assert spawns[0]["graph_input"]["turn_documents"] == []
     assert spawns[0]["graph_input"]["turn_image_refs"] == []
+    # B-275 —— 原名表同理:每轮都写,省略会让上一轮的表留在检查点里。
+    assert spawns[0]["graph_input"]["turn_document_original_names"] == {}
 
 
 @pytest.mark.asyncio

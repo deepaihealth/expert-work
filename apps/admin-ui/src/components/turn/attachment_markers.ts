@@ -7,7 +7,10 @@
  *
  * - control-plane ``_build_human_message``: ``text``, then a blank line,
  *   ``[image attached: expert_work://image/…]`` lines, a blank line,
- *   ``[file attached: uploads/<leaf>]`` lines, then the untrusted block. On a
+ *   ``[file attached: uploads/<leaf>]`` lines, then the untrusted block. A
+ *   document stored under a new name (B-262: same name, different content)
+ *   also carries its original name, ``[file attached: uploads/<leaf>
+ *   (original name: <leaf>)]`` (B-275); the chip shows that name. On a
  *   vision model the text and the trailer are separate content blocks that
  *   ``message_text`` joins with no separator, so the first file line (or the
  *   untrusted opener) arrives glued to the end of the text.
@@ -25,11 +28,17 @@ import en from "../../i18n/locales/en";
 import zhCN from "../../i18n/locales/zh-CN";
 import type { Attachment } from "./types";
 
-/** ``uploads/<leaf>``, leaf from ``_SAFE_STEM_RE``'s set (Python ``\w`` is Unicode). */
-const DOC_VALUE = String.raw`uploads/[\p{L}\p{M}\p{N}_.\-]+`;
+/** A leaf from ``_SAFE_STEM_RE``'s set (Python ``\w`` is Unicode): no space,
+ *  slash, bracket or parenthesis, so the file line parses one way only. */
+const LEAF = String.raw`[\p{L}\p{M}\p{N}_.\-]+`;
+/** ``uploads/<leaf>``. */
+const DOC_VALUE = `uploads/${LEAF}`;
 const DOC_VALUE_RE = new RegExp(`^${DOC_VALUE}$`, "u");
-const FILE_LINE = new RegExp(String.raw`^\[file attached: (${DOC_VALUE})\]$`, "u");
-const FILE_GLUED = new RegExp(String.raw`\[file attached: (${DOC_VALUE})\]$`, "u");
+/** control-plane ``file_attached_line``: the stored path, then (B-275) the
+ *  original name when the upload was stored under a new one. */
+const FILE_MARKER = String.raw`\[file attached: (${DOC_VALUE})(?: \(original name: (${LEAF})\))?\]`;
+const FILE_LINE = new RegExp(`^${FILE_MARKER}$`, "u");
+const FILE_GLUED = new RegExp(`${FILE_MARKER}$`, "u");
 const IMAGE_LINE = /^\[image attached: (expert_work:\/\/image\/[^\]\s]+)\]$/;
 /** Plain marker (spotlighting off) and spotlight fence that open an untrusted block. */
 const UNTRUSTED_OPENERS = ["[untrusted content]\n", "«UNTRUSTED nonce="];
@@ -40,13 +49,18 @@ export interface SplitInput {
   attachments: Attachment[];
 }
 
-type Found = Pick<Attachment, "kind" | "value">;
+/** ``name`` = the original name a renamed upload's line carries (B-275). */
+type Found = Pick<Attachment, "kind" | "value"> & { name?: string };
+
+function fileFound(match: RegExpExecArray): Found {
+  return { kind: "document", value: match[1], name: match[2] };
+}
 
 function markerOf(line: string): Found | null {
   const image = IMAGE_LINE.exec(line);
   if (image) return { kind: "image", value: image[1] };
   const file = FILE_LINE.exec(line);
-  return file ? { kind: "document", value: file[1] } : null;
+  return file ? fileFound(file) : null;
 }
 
 /** The playground note paragraph at the very start → its documents. */
@@ -78,7 +92,7 @@ function trailingMentions(region: string): { text: string; found: Found[] } {
   if (last >= 0) {
     const glued = FILE_GLUED.exec(lines[last]);
     if (glued && glued.index > 0) {
-      found.unshift({ kind: "document", value: glued[1] });
+      found.unshift(fileFound(glued));
       kept[last] = lines[last].slice(0, glued.index);
     }
   }
@@ -98,9 +112,9 @@ export function splitAttachmentMarkers(input: string): SplitInput {
   const found = [...(note?.found ?? []), ...tail.found];
   if (found.length === 0) return { text: input, attachments: [] };
 
-  const attachments = found.map(({ kind, value }, i) => ({
+  const attachments = found.map(({ kind, value, name }, i) => ({
     id: `history-attachment-${i}`,
-    name: value.split("/").pop() || value,
+    name: name ?? (value.split("/").pop() || value),
     kind,
     value,
   }));

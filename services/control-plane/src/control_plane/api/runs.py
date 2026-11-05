@@ -26,7 +26,7 @@ import asyncio
 import json
 import logging
 import time
-from collections.abc import AsyncIterator, Sequence
+from collections.abc import AsyncIterator, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Annotated, Any, Final, Literal
@@ -117,6 +117,7 @@ from expert_work.persistence.token_usage_store import (
     TokenUsageStore,
 )
 from expert_work.persistence.workspace import UserWorkspaceStore
+from expert_work.persistence.workspace.upload_names import original_name_note
 from expert_work.protocol import (
     AgentSpec,
     AgentSpecRecord,
@@ -310,6 +311,11 @@ class RunRequest(BaseModel):
     #: ``_safe_document_name_or_422`` 净化的纯文件名。拼进 ``_build_human_message``
     #: 的 ``[file attached: <name>]`` 提示行,与图片引用各自独立。
     document_names: list[str] = Field(default_factory=list, max_length=64)
+    #: B-275 —— ``document_names`` 里换过名的那几条(B-262:同名不同内容存成
+    #: ``<原名>-<8 位>``)→ 它们原来的名字(叶子)。``[file attached: …]`` 那一行据此把原名
+    #: 也告诉模型;不在表里的照旧只写实际名。值不是平台写得出的叶子名时那一行不写原名
+    #: (:func:`_file_attached_line`),所以这里不必再拦。
+    document_original_names: dict[str, str] = Field(default_factory=dict, max_length=64)
     #: Stream PI-1c — structured untrusted input. A business system passes
     #: the data to act on (a ticket / email / document) here instead of
     #: concatenating it into ``input``, so expert_work knows which span is
@@ -442,6 +448,23 @@ def _fence_untrusted(blocks: list[str], *, spotlight_nonce: str | None) -> str:
     return "\n\n".join(fenced)
 
 
+def _file_attached_line(name: str, original: str | None) -> str:
+    """One ``[file attached: …]`` line — the shape admin-ui ``attachment_markers.ts``
+    (B-274) lifts back out of history turns; change both together.
+
+    B-275 —— a document stored under a new name (B-262: same name, different
+    content → ``<stem>-<8 hex><ext>``) also names its original:
+    ``[file attached: uploads/报告-1a2b3c4d.pdf (original name: 报告.pdf)]``, so an
+    agent that names its deliverable after the attachment does not carry the
+    suffix into it. The original is written only when it differs and is a leaf
+    the platform could have written itself (no space, slash, bracket,
+    parenthesis or newline), so the line parses one way only; otherwise the
+    line is exactly the pre-B-275 one. Delegated children get the same note
+    from the same helper (:func:`original_name_note`).
+    """
+    return f"[file attached: {name}{original_name_note(name, original)}]"
+
+
 def _build_human_message(
     *,
     input_text: str | None,
@@ -450,6 +473,7 @@ def _build_human_message(
     untrusted_content: list[str] | None = None,
     spotlight_nonce: str | None = None,
     document_names: list[str] | None = None,
+    document_original_names: Mapping[str, str] | None = None,
 ) -> HumanMessage:
     """Assemble the ``HumanMessage`` for a J.6 multimodal run input.
 
@@ -481,7 +505,10 @@ def _build_human_message(
         if untrusted_content
         else ""
     )
-    doc_mentions = "\n".join(f"[file attached: {name}]" for name in (document_names or []))
+    originals = document_original_names or {}
+    doc_mentions = "\n".join(
+        _file_attached_line(name, originals.get(name)) for name in (document_names or [])
+    )
     if not image_refs:
         parts = [p for p in (text, doc_mentions, untrusted) if p]
         return HumanMessage(content="\n\n".join(parts))
@@ -509,6 +536,7 @@ def build_run_graph_input(
     inputs: dict[str, Any] | None = None,
     run_id: UUID | None = None,
     document_names: list[str] | None = None,
+    document_original_names: Mapping[str, str] | None = None,
 ) -> dict[str, Any]:
     """Assemble the graph input for a run from a built agent + user input.
 
@@ -535,6 +563,7 @@ def build_run_graph_input(
         untrusted_content=untrusted_content,
         spotlight_nonce=built.spotlight_nonce,
         document_names=document_names,
+        document_original_names=document_original_names,
     )
     now = datetime.now(UTC)
     if run_id is not None:
@@ -567,6 +596,8 @@ def build_run_graph_input(
         # **每一轮都写,哪怕是空的**:对话是长线程,省略这两个键时 LangGraph
         # 保留检查点里的旧值,上一轮的附件会漏进这一轮的子代。
         "turn_documents": list(document_names or []),
+        # B-275 —— 换过名的附件的原名,子代种子里的清单也要带上。同样每轮都写。
+        "turn_document_original_names": dict(document_original_names or {}),
         "turn_image_refs": list(image_refs),
         # 审批三件套只属于一轮,每一轮都清零(班车 2)—— 省略时检查点里上一轮
         # 停在审批上留下的 pending_approval 会让本轮的门控调用跳过审批门。
@@ -605,9 +636,9 @@ def replay_graph_input(
     ``expert_work_run_id`` 由 ``stamp_message`` 覆盖为本轮;被取代标记(调用方
     传进来的若是打标后的副本)一并剥掉。
 
-    **故意不写** ``turn_documents`` / ``turn_image_refs``:``build_run_graph_input``
-    每轮都写这两个键是为了不让上一轮附件漏进这一轮;重新生成要的恰恰是「同一批
-    附件」,而检查点里此刻的值就是被取代轮自己写的那一份 —— 省略键 = 沿用。
+    **故意不写** ``turn_documents`` / ``turn_image_refs`` / ``turn_document_original_names``:
+    ``build_run_graph_input`` 每轮都写这几个键是为了不让上一轮附件漏进这一轮;
+    重新生成要的恰恰是「同一批附件」,而检查点里此刻的值就是被取代轮自己写的那一份 —— 省略键 = 沿用。
     """
     now = datetime.now(UTC)
     fresh: list[BaseMessage] = []
@@ -1414,6 +1445,7 @@ async def spawn_run(
                 "untrusted_content": payload.untrusted_content,
                 "inputs": payload.inputs,
                 "document_names": payload.document_names,
+                "document_original_names": payload.document_original_names,
             }
             if payload.use_draft:
                 # 草稿只在这条请求里构建过;后台队列按线上版本重建会跑错版本,
@@ -1445,6 +1477,7 @@ async def spawn_run(
                 "untrusted_content": payload.untrusted_content,
                 "inputs": payload.inputs,
                 "document_names": payload.document_names,
+                "document_original_names": payload.document_original_names,
             }
             if replay_messages is not None:
                 # ``:regenerate`` —— 旧轮原件序列化过 JSONB 列,worker 那边
@@ -1656,6 +1689,7 @@ async def _start_run(
             inputs=payload.inputs,
             run_id=run_id,
             document_names=payload.document_names,
+            document_original_names=payload.document_original_names,
         )
     configurable: dict[str, Any] = {
         "thread_id": str(thread_id),

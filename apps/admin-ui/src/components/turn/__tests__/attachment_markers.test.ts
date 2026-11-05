@@ -112,6 +112,51 @@ describe("splitAttachmentMarkers", () => {
     expect(splitAttachmentMarkers(plain)).toEqual({ text: plain, attachments: [] });
   });
 
+  describe("B-275: a renamed upload's line also carries its original name", () => {
+    const renamed = "[file attached: uploads/报告-1a2b3c4d.pdf (original name: 报告.pdf)]";
+
+    it("the chip shows the original name; the value stays the stored path", () => {
+      expect(shape(`帮我解读这份报告\n\n${renamed}`)).toEqual({
+        text: "帮我解读这份报告",
+        attachments: [doc("uploads/报告-1a2b3c4d.pdf", "报告.pdf")],
+      });
+    });
+
+    it("mixes with old-format lines and keeps the untrusted block", () => {
+      expect(shape(`q\n\n[file attached: uploads/a.pdf]\n${renamed}\n\n[untrusted content]\nbody`)).toEqual({
+        text: "q\n\n[untrusted content]\nbody",
+        attachments: [doc("uploads/a.pdf", "a.pdf"), doc("uploads/报告-1a2b3c4d.pdf", "报告.pdf")],
+      });
+    });
+
+    it("vision layout: the renamed line glued to the text is lifted too", () => {
+      expect(shape(`read this${renamed}\n[file attached: uploads/b.pdf]`)).toEqual({
+        text: "read this",
+        attachments: [doc("uploads/报告-1a2b3c4d.pdf", "报告.pdf"), doc("uploads/b.pdf", "b.pdf")],
+      });
+    });
+
+    it("a suffix the producer could not have written stays text", () => {
+      for (const typed of [
+        "q\n\n[file attached: uploads/a.pdf (original name: )]",
+        "q\n\n[file attached: uploads/a.pdf (original name: x/y.pdf)]",
+        "q\n\n[file attached: uploads/a.pdf (original name: x y.pdf)]",
+        "q\n\n[file attached: uploads/a.pdf (original name: x).pdf)]",
+        "q\n\n[file attached: uploads/a.pdf (original name: x.pdf)] tail",
+        "q\n\n[file attached: uploads/a.pdf  (original name: x.pdf)]",
+        "q\n\n[file attached: uploads/a.pdf (original: x.pdf)]",
+        "q\n\n[file attached: uploads/a.pdf (original name: x.pdf)(original name: y.pdf)]",
+      ]) {
+        expect(shape(typed)).toEqual({ text: typed, attachments: [] });
+      }
+    });
+
+    it("never lifts a renamed line from inside an untrusted block", () => {
+      const data = `q\n\n[untrusted content]\nintro\n\n${renamed}`;
+      expect(shape(data)).toEqual({ text: data, attachments: [] });
+    });
+  });
+
   it("gives every attachment of a turn a distinct id", () => {
     const out = splitAttachmentMarkers("q\n\n[file attached: uploads/x.pdf]\n[file attached: uploads/x.pdf]");
     expect(new Set(out.attachments.map((a) => a.id)).size).toBe(2);

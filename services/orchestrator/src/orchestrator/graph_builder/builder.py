@@ -2009,6 +2009,7 @@ def build_react_graph(
             config,
             plan=state.get("plan"),
             turn_documents=state.get("turn_documents"),
+            turn_document_original_names=state.get("turn_document_original_names"),
             turn_image_refs=state.get("turn_image_refs"),
             viewed_figures=state.get("viewed_figures"),
             figure_reads=state.get("figure_reads"),
@@ -4454,6 +4455,7 @@ def _build_tool_context(
     *,
     plan: Plan | None = None,
     turn_documents: list[str] | None = None,
+    turn_document_original_names: Mapping[str, str] | None = None,
     turn_image_refs: list[str] | None = None,
     viewed_figures: list[str] | None = None,
     figure_reads: list[dict[str, Any]] | None = None,
@@ -4509,6 +4511,17 @@ def _build_tool_context(
     # 仍然逐项清洗:这两个通道的值一路从 HTTP 载荷传下来,不是进程内对象。
     docs = _string_list(turn_documents)
     images = _string_list(turn_image_refs)
+    # B-275 —— 原名表同理:只留本轮附件的、键值都是非空字符串的条目。
+    raw_originals = turn_document_original_names
+    originals = (
+        {
+            k: v
+            for k, v in raw_originals.items()
+            if isinstance(k, str) and k in docs and isinstance(v, str) and v
+        }
+        if isinstance(raw_originals, Mapping)
+        else {}
+    )
     # 工作区分层 —— 本次调用的 agent 身份与 B-236 的视图(布局 / 本对话 / 根对话),与
     # 平台自己的 exec(PLAN.md 回读)同一个取法。``configurable`` 是不可信输入,非字符串
     # 一律当没有,回落空串;不认识的布局一律当老视图。
@@ -4547,6 +4560,7 @@ def _build_tool_context(
         guard_sink=guard_raw if callable(guard_raw) else None,
         artifact_recorder=artifact_recorder,
         turn_documents=docs,
+        turn_document_original_names=originals,
         turn_image_refs=images,
         agent_key=view_fields["agent_key"],
         inputs_run_id=inputs_run_id,

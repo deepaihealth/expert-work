@@ -287,7 +287,7 @@ async def _supersede_and_run(
 
     if isinstance(payload, ExternalEditRequest):
         try:
-            image_refs, document_names = await resolve_external_files(
+            image_refs, document_names, original_names = await resolve_external_files(
                 files=payload.files,
                 tenant_id=tenant_id,
                 end_user_id=end_user_id,
@@ -317,6 +317,7 @@ async def _supersede_and_run(
             untrusted_content=payload.untrusted_content,
             inputs=payload.inputs,
             document_names=document_names,
+            document_original_names=original_names,
         )
     else:
         # ``:regenerate`` —— 图输入由 ``spawn_run`` 从 ``supersede_run`` 交回的

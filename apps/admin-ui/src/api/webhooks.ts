@@ -14,6 +14,7 @@ import { apiClient, withTenantScope, type TenantScope } from "./client";
 export type WebhookEventType =
   | "run.completed"
   | "run.failed"
+  | "run.paused"
   | "approval.requested"
   | "artifact.saved"
   | "skill_promote.requested"
@@ -22,6 +23,7 @@ export type WebhookEventType =
 export const WEBHOOK_EVENT_TYPES: readonly WebhookEventType[] = [
   "run.completed",
   "run.failed",
+  "run.paused",
   "approval.requested",
   "artifact.saved",
   "skill_promote.requested",

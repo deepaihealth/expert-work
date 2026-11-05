@@ -34,6 +34,7 @@ from langchain_core.runnables import RunnableConfig
 
 from expert_work.common.observability import expert_work_counter
 from expert_work.persistence.token_usage_store import NON_BILLABLE_USAGE_KINDS
+from expert_work.persistence.workspace.upload_names import original_name_note
 from expert_work.protocol import MAX_RESULT_EXCERPT_CHARS, SubAgentInvocation, SubagentStatus
 from expert_work.runtime.cancellation import (
     CANCELLATION_TOKEN_KEY,
@@ -135,6 +136,7 @@ def build_seed_content(
     task: str,
     *,
     documents: Sequence[str] = (),
+    document_original_names: Mapping[str, str] | None = None,
     image_refs: Sequence[str] = (),
     supports_vision: bool = False,
     can_ask_image: bool = False,
@@ -168,7 +170,11 @@ def build_seed_content(
     """
     text = task
     if documents:
-        listed = "\n".join(f"- {ref}" for ref in documents)
+        # B-275 —— 换过名的附件在路径后面带原名,与主 run 的 ``[file attached: …]`` 同一形式。
+        originals = document_original_names or {}
+        listed = "\n".join(
+            f"- {ref}{original_name_note(ref, originals.get(ref))}" for ref in documents
+        )
         text += (
             "\n\n[attachments] The user attached these files to the current turn — "
             "workspace paths, readable as-is:\n"
@@ -233,6 +239,7 @@ async def run_child_to_result(
     seed = build_seed_content(
         task,
         documents=ctx.turn_documents,
+        document_original_names=ctx.turn_document_original_names,
         image_refs=ctx.turn_image_refs,
         supports_vision=child.supports_vision,
         can_ask_image=child_can_ask_image(child),
@@ -250,6 +257,7 @@ async def run_child_to_result(
         # 附件继续往下传:孙代同样不继承对话,而它干的还是同一轮用户交办的活 ——
         # 断在这里等于深一层就退回原来的猜。走 state 通道,与本 run 同一机制。
         "turn_documents": list(ctx.turn_documents),
+        "turn_document_original_names": dict(ctx.turn_document_original_names),
         "turn_image_refs": list(ctx.turn_image_refs),
     }
 

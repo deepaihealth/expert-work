@@ -34,6 +34,9 @@ __all__ = [
 WebhookEventType = Literal[
     "run.completed",
     "run.failed",
+    # B-230 —— a run stopped at a human approval (``status: paused``). Not a
+    # failure, so it no longer rides ``run.failed``; endpoints opt in to it.
+    "run.paused",
     "approval.requested",
     "artifact.saved",
     # SE-16 PR-8 — a pending skill visibility-promote request awaits review
