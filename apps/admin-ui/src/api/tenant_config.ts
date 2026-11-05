@@ -41,7 +41,7 @@ export interface TenantConfigRecord {
   event_log_retention_days: number;
   /** B-63 — upload / artifact retention in days, counted from LAST USE
    *  (upload time, last re-attach / download, last run in its conversation —
-   *  whichever is latest). Range [1, 365]; ``null`` = platform default (90). */
+   *  whichever is latest). Range [7, 365]; ``null`` = platform default (90). */
   upload_retention_days: number | null;
   artifact_retention_days: number | null;
   /** Sprint #4 (Mini-ADR U-28) — Curator thresholds.
@@ -111,13 +111,37 @@ export async function getTenantConfig(tenantId: string): Promise<TenantConfigRec
   );
 }
 
+/** B-63 — the platform default the backend compares against when a
+ *  retention field is unset (``null``). */
+export const FILE_RETENTION_DEFAULT_DAYS = 90;
+
+/** B-63 — which file retention fields this patch lowers (effective days,
+ *  unset = platform default). Lowering needs an explicit confirmation: the
+ *  backend answers 409 ``RETENTION_DECREASE_NOT_CONFIRMED`` otherwise. */
+export function retentionDecreases(
+  record: TenantConfigRecord,
+  patch: TenantConfigPatchBody,
+): { field: string; from: number; to: number }[] {
+  const fields = ["upload_retention_days", "artifact_retention_days"] as const;
+  const out: { field: string; from: number; to: number }[] = [];
+  for (const field of fields) {
+    if (!(field in patch)) continue;
+    const from = record[field] ?? FILE_RETENTION_DEFAULT_DAYS;
+    const to = patch[field] ?? FILE_RETENTION_DEFAULT_DAYS;
+    if (to < from) out.push({ field, from, to });
+  }
+  return out;
+}
+
 export async function upsertTenantConfig(
   tenantId: string,
   body: TenantConfigPatchBody,
+  options: { confirmRetentionDecrease?: boolean } = {},
 ): Promise<TenantConfigRecord> {
   return putJson<TenantConfigRecord>(
     `/v1/tenants/${encodeURIComponent(tenantId)}/config`,
     body,
+    options.confirmRetentionDecrease ? { params: { confirm_retention_decrease: true } } : undefined,
   );
 }
 

@@ -5,7 +5,7 @@
   expires an upload when ``greatest(created_at, last_used_at, last run of its
   conversation)`` is older than the retention window.
 * ``tenant_config.upload_retention_days`` / ``artifact_retention_days`` — per-tenant
-  windows (1-365 days). NULL → the retention job's platform default (90).
+  windows (7-365 days). NULL → the retention job's platform default (90).
 
 **Expand-only.** All three columns are nullable with no default and no backfill;
 old code never names them. An image rollback needs no downgrade (the downgrade
@@ -42,7 +42,7 @@ def upgrade() -> None:
     for column, constraint in _RANGES:
         op.add_column("tenant_config", sa.Column(column, sa.Integer(), nullable=True))
         op.create_check_constraint(
-            constraint, "tenant_config", f"{column} IS NULL OR {column} BETWEEN 1 AND 365"
+            constraint, "tenant_config", f"{column} IS NULL OR {column} BETWEEN 7 AND 365"
         )
 
 

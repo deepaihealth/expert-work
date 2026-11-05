@@ -18,7 +18,7 @@ from collections.abc import Iterable
 from typing import Annotated
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
 
 from control_plane.api._authz import console_only, require
 from control_plane.invalidation_bus import InvalidationEvent
@@ -33,10 +33,12 @@ from control_plane.tenant_scope import (
 from expert_work.common.observability import current_trace_id_hex
 from expert_work.persistence.agent_spec import AgentSpecStore
 from expert_work.protocol import (
+    FILE_RETENTION_DEFAULT_DAYS,
     AgentSpecRecord,
     Principal,
     Provider,
     TenantConfigPatch,
+    TenantConfigRecord,
     Tool,
 )
 from expert_work.runtime.audit.logger import AuditLogger
@@ -149,6 +151,21 @@ def _tool_usage_counts(specs: Iterable[AgentSpecRecord]) -> dict[Tool, int]:
     return counts
 
 
+def retention_decreases(
+    current: TenantConfigRecord | None, patch: TenantConfigPatch
+) -> list[dict[str, object]]:
+    """B-63 —— 这个 patch 把哪些保留期改小了:``[{field, from, to}]``(按生效值比,没设 = 平台
+    默认 :data:`FILE_RETENTION_DEFAULT_DAYS`)。调大、不变、改回默认但默认更大,都不算。"""
+    out: list[dict[str, object]] = []
+    for name, new in patch.retention_updates().items():
+        old = getattr(current, name) if current is not None else None
+        old_days = old if old is not None else FILE_RETENTION_DEFAULT_DAYS
+        new_days = new if new is not None else FILE_RETENTION_DEFAULT_DAYS
+        if new_days < old_days:
+            out.append({"field": name, "from": old_days, "to": new_days})
+    return out
+
+
 def build_tenant_config_router() -> APIRouter:
     router = APIRouter(
         prefix="/v1/tenants", tags=["tenant_config"], dependencies=[Depends(console_only())]
@@ -194,6 +211,7 @@ def build_tenant_config_router() -> APIRouter:
         svc: Annotated[TenantConfigService, Depends(_get_service)],
         audit: Annotated[AuditLogger, Depends(_get_audit)],
         request: Request,
+        confirm_retention_decrease: Annotated[bool, Query()] = False,
     ) -> dict[str, object]:
         scope = await ensure_single_tenant_scope(
             principal,
@@ -217,6 +235,26 @@ def build_tenant_config_router() -> APIRouter:
                         "message": str(exc),
                     },
                 ) from exc
+        # B-63 —— 改小附件 / 产物保留期最早当晚就会多清文件、不可恢复:必须显式带
+        # ``?confirm_retention_decrease=true``,否则 409、什么都不改。现值从 store 读(不走
+        # 60 秒的缓存),没有配置行 = 平台默认。
+        if not confirm_retention_decrease and payload.retention_updates():
+            async with applied_scope(scope):
+                current = await svc.store.get(tenant_id=scope.tenant_id)
+            decreases = retention_decreases(current, payload)
+            if decreases:
+                raise HTTPException(
+                    status_code=409,
+                    detail={
+                        "code": "RETENTION_DECREASE_NOT_CONFIRMED",
+                        "message": (
+                            "lowering a file retention period deletes more files as soon as "
+                            "tonight and cannot be undone; resend with "
+                            "?confirm_retention_decrease=true"
+                        ),
+                        "fields": decreases,
+                    },
+                )
         # Stream Y-1 — LLM credentials are platform-exclusive. ``credentials_mode``
         # is a ``Literal["platform"]``, so Pydantic rejects any other value in the
         # request body with 422 before reaching this handler; no switch gate needed.

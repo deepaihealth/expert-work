@@ -938,3 +938,72 @@ async def test_untrusted_content_block_at_exactly_8192_is_not_422(
     )
     assert resp.status_code != 422, resp.text
     assert resp.status_code == 202, resp.text
+
+
+# ---------------------------------------------------------------------------
+# B-63 —— 保留期按最后一次使用算:``files[]`` 里的附件在 run 被接受之后才记一次使用;请求
+# 被拒(某个附件不对、超限……)时一个都不记。
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_an_accepted_run_marks_its_files_used(
+    external_client: AsyncClient, plain_agent: _PlainAgent, _external_ctx: _ExternalCtx
+) -> None:
+    session = await _bind_session(client=external_client, agent_code=plain_agent.code, user_id="u1")
+    store: UserUploadStore = _external_ctx.app.state.user_upload_store
+    doc = await _seed_document(store=store, tenant_id=_external_ctx.tenant_id, owner=session)
+
+    resp = await external_client.post(
+        f"/v1/agents/{plain_agent.code}/runs",
+        json={
+            "user_id": "u1",
+            "session_id": str(session.session_id),
+            "input": "总结这份文件",
+            "mode": "queue",
+            "files": [{"upload_id": render_upload_id(doc.id)}],
+        },
+    )
+
+    assert resp.status_code == 202, resp.text
+    row = await store.get(upload_id=doc.id, tenant_id=_external_ctx.tenant_id)
+    assert row is not None and row.last_used_at is not None
+
+
+@pytest.mark.asyncio
+async def test_a_rejected_run_marks_none_of_its_files_used(
+    external_client: AsyncClient, plain_agent: _PlainAgent, _external_ctx: _ExternalCtx
+) -> None:
+    session = await _bind_session(client=external_client, agent_code=plain_agent.code, user_id="u1")
+    store: UserUploadStore = _external_ctx.app.state.user_upload_store
+    doc = await _seed_document(store=store, tenant_id=_external_ctx.tenant_id, owner=session)
+
+    bad_file = await external_client.post(
+        f"/v1/agents/{plain_agent.code}/runs",
+        json={
+            "user_id": "u1",
+            "session_id": str(session.session_id),
+            "input": "x",
+            "mode": "queue",
+            "files": [
+                {"upload_id": render_upload_id(doc.id)},
+                {"upload_id": render_upload_id(uuid4())},
+            ],
+        },
+    )
+    too_long = await external_client.post(
+        f"/v1/agents/{plain_agent.code}/runs",
+        json={
+            "user_id": "u1",
+            "session_id": str(session.session_id),
+            "input": "x",
+            "mode": "queue",
+            "files": [{"upload_id": render_upload_id(doc.id)}],
+            "untrusted_content": ["x" * 9000],
+        },
+    )
+
+    assert bad_file.status_code == 404, bad_file.text
+    assert too_long.status_code == 422, too_long.text
+    row = await store.get(upload_id=doc.id, tenant_id=_external_ctx.tenant_id)
+    assert row is not None and row.last_used_at is None

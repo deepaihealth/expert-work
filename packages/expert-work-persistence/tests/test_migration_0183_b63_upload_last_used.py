@@ -3,7 +3,7 @@
 ``user_upload.last_used_at`` and ``tenant_config.upload_retention_days`` /
 ``artifact_retention_days``: added nullable with no default, so existing rows read
 NULL (= platform default) and an old pod's insert (which never names them) still
-works. The two tenant columns are bounded 1-365. Runs in its own database inside the
+works. The two tenant columns are bounded 7-365. Runs in its own database inside the
 container (the shared one is upgraded / downgraded by other tests).
 """
 
@@ -101,8 +101,8 @@ def test_tenant_retention_days_are_bounded_to_one_year(fresh_db: str, column: st
             "VALUES ('00000000-0000-0000-0000-0000000000b6', 't', 'test')"
         )
         update = sql.SQL("UPDATE tenant_config SET {} = %s").format(sql.Identifier(column))
-        for ok in (None, 1, 365):
+        for ok in (None, 7, 365):
             conn.execute(update, (ok,))
-        for bad in (0, 366):
+        for bad in (0, 6, 366):
             with pytest.raises(psycopg.errors.CheckViolation):
                 conn.execute(update, (bad,))

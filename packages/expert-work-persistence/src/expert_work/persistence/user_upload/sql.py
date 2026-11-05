@@ -6,7 +6,7 @@ from collections.abc import Sequence
 from datetime import UTC, datetime
 from uuid import UUID
 
-from sqlalchemy import ColumnElement, delete, func, or_, select, update
+from sqlalchemy import ColumnElement, Subquery, and_, delete, func, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from expert_work.persistence.bulk_delete import count_in_chunks, delete_in_chunks
@@ -19,29 +19,67 @@ from expert_work.persistence.user_upload.base import (
 from expert_work.protocol import UserUpload, UserUploadKind
 
 
-def _expires_at(default_days: int) -> ColumnElement[datetime]:
-    """B-63 —— 一行上传的到期时刻:``greatest(created_at, last_used_at, 会话最后一次 run)``
-    加上租户的保留期(没设用 ``default_days``)。
+def _expiry(default_days: int, *candidates: ColumnElement[bool]) -> Subquery:
+    """B-63 —— 候选行(没删、再加 ``candidates`` 条件)各自的到期时刻与「放弃」窗口的起点。
 
-    ``greatest`` 跳过 NULL(没用过、会话没有 run)。会话最后一次 run 走 ``ix_agent_run_thread_id``,
-    与 ``thread_meta`` 列表按最后活动排序同一个口径;租户的保留期是 ``tenant_config`` 主键查找。
+    * 到期 = ``greatest(created_at, last_used_at, 会话最后一次 run)`` + 租户保留期(没设用
+      ``default_days``)。``greatest`` 跳过 NULL(没用过、会话没有 run)。
+    * 会话最后一次 run 用 CTE **一次**算出:先取候选行涉及的 ``(tenant_id, thread_id)``,再对这些
+      会话的 ``agent_run`` 按会话聚合一遍(走 ``ix_agent_run_thread_id``),然后 join 回来 ——
+      不再每行一个相关子查询;同一会话里的多条上传共用一次聚合。只认**同租户**的 run。
+    * ``give_up_from`` = ``greatest(到期, tenant_config.updated_at)``:租户刚把天数改小时,到期日
+      一下子落到很久以前,「过了到期日 7 天还在失败就放弃」要从这次改动算起,不能第一次暂时失败就
+      放弃。用配置行的 ``updated_at``(任何改动都会刷新它)是偏保守的近似:只会让放弃来得更晚。
     """
-    last_run = (
-        select(func.max(AgentRunRow.created_at))
-        .where(
-            AgentRunRow.thread_id == UserUploadRow.thread_id,
-            AgentRunRow.tenant_id == UserUploadRow.tenant_id,
+    cand = (
+        select(
+            UserUploadRow.id,
+            UserUploadRow.tenant_id,
+            UserUploadRow.thread_id,
+            UserUploadRow.created_at,
+            UserUploadRow.last_used_at,
         )
-        .scalar_subquery()
+        .where(UserUploadRow.deleted_at.is_(None), *candidates)
+        .cte("upload_candidates")
     )
-    tenant_days = (
-        select(TenantConfigRow.upload_retention_days)
-        .where(TenantConfigRow.tenant_id == UserUploadRow.tenant_id)
-        .scalar_subquery()
+    threads = select(cand.c.tenant_id, cand.c.thread_id).distinct().cte("upload_threads")
+    last_run = (
+        select(
+            AgentRunRow.tenant_id,
+            AgentRunRow.thread_id,
+            func.max(AgentRunRow.created_at).label("at"),
+        )
+        .join(
+            threads,
+            and_(
+                AgentRunRow.thread_id == threads.c.thread_id,
+                AgentRunRow.tenant_id == threads.c.tenant_id,
+            ),
+        )
+        .group_by(AgentRunRow.tenant_id, AgentRunRow.thread_id)
+        .cte("upload_thread_last_run")
     )
-    last_active = func.greatest(UserUploadRow.created_at, UserUploadRow.last_used_at, last_run)
-    days = func.coalesce(tenant_days, default_days)
-    return last_active + func.make_interval(0, 0, 0, days)
+    days = func.coalesce(TenantConfigRow.upload_retention_days, default_days)
+    expires_at = func.greatest(
+        cand.c.created_at, cand.c.last_used_at, last_run.c.at
+    ) + func.make_interval(0, 0, 0, days)
+    return (
+        select(
+            cand.c.id,
+            expires_at.label("expires_at"),
+            func.greatest(expires_at, TenantConfigRow.updated_at).label("give_up_from"),
+        )
+        .select_from(cand)
+        .outerjoin(
+            last_run,
+            and_(
+                last_run.c.thread_id == cand.c.thread_id,
+                last_run.c.tenant_id == cand.c.tenant_id,
+            ),
+        )
+        .outerjoin(TenantConfigRow, TenantConfigRow.tenant_id == cand.c.tenant_id)
+        .subquery("upload_expiry")
+    )
 
 
 def _row_to_dto(row: UserUploadRow) -> UserUpload:
@@ -135,22 +173,20 @@ class SqlUserUploadStore(UserUploadStore):
     async def list_expired(
         self, *, now: datetime, default_days: int, limit: int = 1000
     ) -> list[ExpiredUpload]:
-        expires_at = _expires_at(default_days).label("expires_at")
-        inner = (
-            select(UserUploadRow.id, expires_at)
-            .where(UserUploadRow.deleted_at.is_(None))
-            .subquery()
-        )
+        expiry = _expiry(default_days)
         stmt = (
-            select(UserUploadRow, inner.c.expires_at)
-            .join(inner, inner.c.id == UserUploadRow.id)
-            .where(inner.c.expires_at < now)
-            .order_by(inner.c.expires_at.asc(), UserUploadRow.id.asc())
+            select(UserUploadRow, expiry.c.expires_at, expiry.c.give_up_from)
+            .join(expiry, expiry.c.id == UserUploadRow.id)
+            .where(expiry.c.expires_at < now)
+            .order_by(expiry.c.expires_at.asc(), UserUploadRow.id.asc())
             .limit(limit)
         )
         async with self._sf() as session:
             rows = (await session.execute(stmt)).all()
-        return [ExpiredUpload(upload=_row_to_dto(row), expires_at=at) for row, at in rows]
+        return [
+            ExpiredUpload(upload=_row_to_dto(row), expires_at=at, give_up_from=give_up)
+            for row, at, give_up in rows
+        ]
 
     async def list_unexpired_by_ref(
         self,
@@ -161,12 +197,16 @@ class SqlUserUploadStore(UserUploadStore):
         now: datetime,
         default_days: int,
     ) -> list[UserUpload]:
-        stmt = select(UserUploadRow).where(
+        expiry = _expiry(
+            default_days,
             UserUploadRow.tenant_id == tenant_id,
             UserUploadRow.user_id == user_id,
             UserUploadRow.ref == ref,
-            UserUploadRow.deleted_at.is_(None),
-            _expires_at(default_days) >= now,
+        )
+        stmt = (
+            select(UserUploadRow)
+            .join(expiry, expiry.c.id == UserUploadRow.id)
+            .where(expiry.c.expires_at >= now)
         )
         async with self._sf() as session:
             rows = (await session.execute(stmt)).scalars().all()

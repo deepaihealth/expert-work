@@ -1083,18 +1083,16 @@ async def test_the_source_read_is_bounded_by_the_recorded_size(
 
 
 @pytest.mark.asyncio
-async def test_reattaching_an_upload_from_another_session_marks_the_source_row_used(
-    ctx: _Ctx,
-) -> None:
+async def test_resolving_files_alone_does_not_mark_them_used(ctx: _Ctx) -> None:
+    """B-63 —— 解析 ``files[]`` 时还不知道这一轮会不会被接受(后面还有批量校验、排队上限……):
+    记使用放在 run 被接受之后(见 ``test_external_run_files.py``),这里不记。"""
     await ctx.seed_agent()
     a = await _upload_document(ctx, b"%PDF-1.4 A")
     b = await _upload_document(ctx, b"%PDF-1.4 B")
-    assert (await _upload_row(ctx, a)).last_used_at is None
 
     await _attach(ctx, a, into=b["session_id"])
 
-    assert (await _upload_row(ctx, a)).last_used_at is not None
-    assert (await _upload_row(ctx, b)).last_used_at is None
+    assert (await _upload_row(ctx, a)).last_used_at is None
 
 
 @pytest.mark.asyncio

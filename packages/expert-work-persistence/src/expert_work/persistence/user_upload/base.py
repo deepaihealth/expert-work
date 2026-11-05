@@ -31,11 +31,14 @@ class ExpiredUpload:
 
     「最后使用」= ``created_at`` / ``last_used_at`` / 所在会话最后一次 run 的 ``created_at``
     三者中最晚的;保留期 = 租户的 ``tenant_config.upload_retention_days``,没设就用平台默认。
-    留存作业拿 ``expires_at`` 判「过了到期日多久还在失败」。
+    ``give_up_from`` 是「过了到期日 7 天还在失败就放弃」那个窗口的起点:``max(expires_at,
+    租户配置最后一次改动)`` —— 租户刚把天数改小时到期日会一下子落到很久以前,窗口从这次改动
+    算起,第一次暂时失败不会直接放弃。没有租户配置的(内存实现)就是 ``expires_at``。
     """
 
     upload: UserUpload
     expires_at: datetime
+    give_up_from: datetime
 
 
 class UserUploadStore(abc.ABC):

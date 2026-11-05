@@ -32,6 +32,7 @@ import { ApiError } from "../api/client";
 import { PageHeader } from "../components/PageHeader";
 import {
   getTenantConfig,
+  retentionDecreases,
   upsertTenantConfig,
   type TenantConfigPatchBody,
   type TenantConfigRecord,
@@ -101,7 +102,7 @@ function formatRateLimitOverride(ov: Record<string, unknown>): string {
 
 export function SettingsTenantConfig() {
   const { t } = useTranslation();
-  const { message } = App.useApp();
+  const { message, modal } = App.useApp();
   const { scope, apiTenantScope } = useTenantScope();
   const auth = useAuth();
   const homeTenantId = auth.identity?.homeTenantId ?? null;
@@ -174,21 +175,47 @@ export function SettingsTenantConfig() {
     setEditing(false);
   }, [pristineJson]);
 
+  const save = useCallback(
+    async (confirmRetentionDecrease: boolean) => {
+      if (effectiveTenantId === null) return;
+      if (!parseResult.ok) return;
+      setSubmitting(true);
+      try {
+        const updated = await upsertTenantConfig(effectiveTenantId, parseResult.value, {
+          confirmRetentionDecrease,
+        });
+        setRecord(updated);
+        setEditing(false);
+        message.success(t("settings_ops.config_saved"));
+      } catch (err) {
+        message.error(err instanceof Error ? err.message : "failed");
+      } finally {
+        setSubmitting(false);
+      }
+    },
+    [effectiveTenantId, parseResult, message, t],
+  );
+
+  // B-63 — lowering a file retention period deletes more files as soon as
+  // tonight and cannot be undone: ask first, then send the explicit flag.
   const onSave = useCallback(async () => {
-    if (effectiveTenantId === null) return;
-    if (!parseResult.ok) return;
-    setSubmitting(true);
-    try {
-      const updated = await upsertTenantConfig(effectiveTenantId, parseResult.value);
-      setRecord(updated);
-      setEditing(false);
-      message.success(t("settings_ops.config_saved"));
-    } catch (err) {
-      message.error(err instanceof Error ? err.message : "failed");
-    } finally {
-      setSubmitting(false);
+    if (record === null || !parseResult.ok) return;
+    const lowered = retentionDecreases(record, parseResult.value);
+    if (lowered.length === 0) {
+      await save(false);
+      return;
     }
-  }, [effectiveTenantId, parseResult, message, t]);
+    modal.confirm({
+      title: t("settings_ops.retention_decrease_title"),
+      content: t("settings_ops.retention_decrease_body", {
+        changes: lowered.map((d) => `${t(`settings_ops.${d.field}`)}: ${d.from} → ${d.to}`).join("; "),
+      }),
+      okText: t("settings_ops.retention_decrease_ok"),
+      okButtonProps: { danger: true },
+      cancelText: t("common.cancel"),
+      onOk: () => save(true),
+    });
+  }, [record, parseResult, save, modal, t]);
 
   return (
     <div data-testid="config-root">

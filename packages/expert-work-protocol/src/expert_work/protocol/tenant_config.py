@@ -29,6 +29,7 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 from expert_work.protocol.provider_catalog import Tool
 
 __all__ = [
+    "FILE_RETENTION_DEFAULT_DAYS",
     "FILE_RETENTION_MAX_DAYS",
     "FILE_RETENTION_MIN_DAYS",
     "CredentialsMode",
@@ -85,10 +86,13 @@ _RETENTION_MAX_DAYS = 3650
 
 # B-63 —— 附件与产物的保留期(按最后一次使用算起)。租户可在这个范围里改;``None`` =
 # 跟随平台默认(留存作业的 ``EXPERT_WORK_RETENTION_UPLOAD_RETENTION_DAYS`` /
-# ``..._ARTIFACT_RETENTION_DAYS``,默认 90)。上限一年:没有「永不清理」这一档。
-# 迁移 0183 的 CHECK 与这里同一范围。
-FILE_RETENTION_MIN_DAYS = 1
+# ``..._ARTIFACT_RETENTION_DAYS``,默认 90)。上限一年:没有「永不清理」这一档;下限一周
+# (用户拍板:再短就是误操作的量级)。迁移 0183 的 CHECK 与这里同一范围。
+FILE_RETENTION_MIN_DAYS = 7
 FILE_RETENTION_MAX_DAYS = 365
+#: 平台默认天数(租户没设时)。控制面判「这次是不是改小」时拿它当没设那一档的值;
+#: 留存作业实际用的是自己的环境变量(默认同样 90)。
+FILE_RETENTION_DEFAULT_DAYS = 90
 
 # Capability Uplift Sprint #4 — Mini-ADR U-28.
 # Curator threshold bounds. Defaults 30 / 90 derive from external

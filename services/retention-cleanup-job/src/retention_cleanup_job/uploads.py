@@ -66,7 +66,9 @@ logger = logging.getLogger(__name__)
 _AUDIT_BEFORE = timedelta(minutes=10)
 _AUDIT_AFTER = timedelta(minutes=1)
 
-#: 过了到期日还连着暂时性失败这么久,就不再等:行软删,文件不动(计数)。
+#: 过了到期日还连着暂时性失败这么久,就不再等:行软删,文件不动(计数)。B-63 —— 从
+#: ``ExpiredUpload.give_up_from`` 算(到期日与租户配置最后一次改动里较晚的那个),租户刚把天数
+#: 改小时不会第一次失败就放弃。
 _GIVE_UP_AFTER = timedelta(days=7)
 #: 一次绑定多少个 id(``IN (...)`` 每个元素一个绑定参数,Postgres 上限 32767)。
 _IN_CHUNK = 5000
@@ -204,7 +206,7 @@ class UploadSweep:
             except WorkspaceOwnerUnavailableError:
                 self._owner_unavailable(row)
             except Exception as exc:
-                if entry.expires_at >= now - _GIVE_UP_AFTER:
+                if entry.give_up_from >= now - _GIVE_UP_AFTER:
                     _note_failure(failures, row, exc)
                     tally.rows_failed += 1
                 else:

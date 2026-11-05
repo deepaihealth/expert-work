@@ -553,3 +553,68 @@ async def test_touch_writes_at_most_once_a_day(sql_store: SqlStoreFixture) -> No
         assert await store.touch(upload_id=upload, tenant_id=tenant, now=later) is False
     finally:
         await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_the_give_up_window_starts_no_earlier_than_the_tenant_config_change(
+    sql_store: SqlStoreFixture,
+) -> None:
+    """B-63 —— 租户刚把天数改小,到期日一下子落到很久以前;「过了到期日 7 天还失败就放弃」要从
+    ``max(到期日, tenant_config 最后一次改动)`` 算,否则第一次暂时失败就直接放弃。"""
+    from datetime import UTC, datetime, timedelta
+
+    from sqlalchemy import text
+
+    store, engine = sql_store
+    try:
+        world = _LastUse(store, engine)
+        lowered, plain = uuid4(), uuid4()
+        await world.tenant_days(lowered, 30)  # tenant_config.updated_at = now
+        lowered_row = await world.upload(tenant_id=lowered, age_days=60)
+        plain_row = await world.upload(tenant_id=plain, age_days=120)
+        async with engine.begin() as conn:
+            changed = (
+                await conn.execute(
+                    text("SELECT updated_at FROM tenant_config WHERE tenant_id = :t"),
+                    {"t": lowered},
+                )
+            ).scalar_one()
+
+        rows = {
+            e.upload.id: e
+            for e in await store.list_expired(now=datetime.now(UTC), default_days=90)
+            if e.upload.id in {lowered_row, plain_row}
+        }
+        assert rows[lowered_row].expires_at < datetime.now(UTC) - timedelta(days=29)
+        assert rows[lowered_row].give_up_from == changed
+        assert rows[plain_row].give_up_from == rows[plain_row].expires_at
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_a_run_in_another_tenant_with_the_same_thread_id_does_not_count(
+    sql_store: SqlStoreFixture,
+) -> None:
+    """B-63 —— 会话最后一次 run 只认同租户的 run(thread id 是 UUID,撞上的只有造出来的数据,
+    但 join 条件里的 ``tenant_id`` 要有人咬住)。"""
+    from sqlalchemy import text
+
+    store, engine = sql_store
+    try:
+        world = _LastUse(store, engine)
+        tenant = uuid4()
+        upload = await world.upload(tenant_id=tenant, age_days=200)
+        async with engine.begin() as conn:
+            await conn.execute(
+                text(
+                    "INSERT INTO agent_run (id, tenant_id, thread_id, status, on_disconnect, "
+                    " created_at, updated_at) SELECT :r, :other, thread_id, 'success', "
+                    " 'continue', now(), now() FROM user_upload WHERE id = :i"
+                ),
+                {"r": uuid4(), "other": uuid4(), "i": upload},
+            )
+
+        assert await world.expired_ids({upload}) == {upload}
+    finally:
+        await engine.dispose()

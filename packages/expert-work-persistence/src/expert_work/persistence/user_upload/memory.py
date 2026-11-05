@@ -85,7 +85,11 @@ class InMemoryUserUploadStore(UserUploadStore):
         self, *, now: datetime, default_days: int, limit: int = 1000
     ) -> list[ExpiredUpload]:
         due = [
-            ExpiredUpload(upload=r, expires_at=_expires_at(r, default_days))
+            ExpiredUpload(
+                upload=r,
+                expires_at=_expires_at(r, default_days),
+                give_up_from=_expires_at(r, default_days),
+            )
             for r in self._rows.values()
             if r.deleted_at is None
         ]
