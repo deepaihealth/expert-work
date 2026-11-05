@@ -625,6 +625,58 @@ def test_tool_text_states_the_two_views_once_and_never_the_old_alias() -> None:
             assert claim not in text, (tool.spec.name, claim)
 
 
+@pytest.mark.parametrize("layout", ["conversation", "agent_root"])
+@pytest.mark.parametrize("path", [".", AGENT_VIEW])
+async def test_list_dir_of_a_scope_root_that_does_not_exist_yet_is_empty(
+    tmp_path: Path, layout: str, path: str
+) -> None:
+    """B-196 edge —— agent 从没写过文件(老视图), 或开场复制那一步失败了, 作用域的根目录还
+    不存在:那是「空的」, 不是「找不到」。之前只有对话视图的 ``list_dir(".")`` 这么处理。"""
+    from orchestrator.tools import ListDirTool
+
+    store = NasWorkspaceStore(root=str(tmp_path))
+    result = await ListDirTool(store=store).call({"path": path}, ctx=_ctx(_C1, layout=layout))
+    assert result.content.endswith(": (empty)")
+    assert result.meta["n_entries"] == 0
+
+
+@pytest.mark.parametrize("layout", ["conversation", "agent_root"])
+@pytest.mark.parametrize("path", ["nope", f"{AGENT_VIEW}/nope"])
+async def test_list_dir_of_a_missing_sub_path_is_still_not_found(
+    tmp_path: Path, layout: str, path: str
+) -> None:
+    """只有作用域的根算空;模型自己写的子路径不存在照旧报「找不到」(根不在时今天的措辞是
+    ``io_error (workspace path not found: …)``,根在时是 ``not_found``,两种都照旧)。"""
+    from orchestrator.tools import ListDirTool
+
+    store = NasWorkspaceStore(root=str(tmp_path))
+    with pytest.raises(FileOpError, match=r"not.found"):
+        await ListDirTool(store=store).call({"path": path}, ctx=_ctx(_C1, layout=layout))
+
+
+@pytest.mark.parametrize("layout", ["conversation", "agent_root"])
+async def test_search_files_when_no_scope_root_exists_yet_finds_nothing(
+    tmp_path: Path, layout: str
+) -> None:
+    """B-196 edge —— 同上, ``search_files`` 搜一个还不存在的作用域根 = 没有匹配。"""
+    store = NasWorkspaceStore(root=str(tmp_path))
+    result = await SearchFilesTool(store=store).call(
+        {"name_glob": "*"}, ctx=_ctx(_C1, layout=layout)
+    )
+    assert result.content == "(no matching files)"
+    assert result.meta["n_results"] == 0
+
+
+async def test_search_files_still_searches_agent_when_only_the_conversation_dir_is_missing(
+    tmp_path: Path,
+) -> None:
+    (_agent_root(tmp_path) / "style").mkdir(parents=True)
+    (_agent_root(tmp_path) / "style" / "a.md").write_text("x")
+    store = NasWorkspaceStore(root=str(tmp_path))
+    result = await SearchFilesTool(store=store).call({"name_glob": "*.md"}, ctx=_ctx(_C1))
+    assert result.meta["paths"] == [f"{AGENT_VIEW}/style/a.md"]
+
+
 def test_children_inherit_the_parents_effective_view_not_its_raw_layout() -> None:
     """父的布局写着 ``conversation`` 却没有对话(没有线程 id)时,父实际是老视图 ——
     子代必须是同一个,不能拿到一个父自己都没有的对话视图。"""

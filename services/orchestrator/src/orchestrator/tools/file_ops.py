@@ -1116,9 +1116,11 @@ class ListDirTool:
                 max_entries=_MAX_LIST_ENTRIES,
             )
         except MISSING_DIR_ERRORS as exc:
-            if target.kind != "conversation" or rel != ".":
+            if rel != ".":
                 _raise_for_store_error(exc, tool="list_dir")
             # B-236 —— 新对话的目录要等第一次 exec 才建出来;它的根是空的,不是「不存在」。
+            # B-196 edge —— 任何作用域的根同理:从没写过文件的 agent(老视图)、开场复制失败时
+            # 的 ``/agent``。模型自己写的子路径不存在照旧报错。
             listing = WorkspaceDirListing(entries=(), truncated=False)
         except SandboxSupervisorError as exc:
             _raise_for_store_error(exc, tool="list_dir")
@@ -1214,10 +1216,10 @@ class SearchFilesTool:
                     content=content,
                     max_results=self.max_results - len(hits),
                 )
-            except MISSING_DIR_ERRORS as exc:
-                if prefix or not ctx.workspace_view.per_conversation:
-                    _raise_for_store_error(exc, tool="search_files")
-                continue  # 新对话的目录还没建出来 = 里面什么都没有
+            except MISSING_DIR_ERRORS:
+                # 作用域的根还没建出来 = 里面什么都没有(新对话的目录;B-196 edge —— 从没写过
+                # 文件的 agent、开场复制失败时的 ``/agent``)。search 没有 path 参数, 搜的总是根。
+                continue
             except SandboxSupervisorError as exc:
                 _raise_for_store_error(exc, tool="search_files")
             hits.extend(replace(e, path=f"{prefix}{e.path}") for e in found.entries)
