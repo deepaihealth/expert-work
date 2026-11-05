@@ -42,6 +42,17 @@ class DuplicateAgentSpecError(Exception):
         self.version = version
 
 
+class AgentSpecPurgeBlockedError(Exception):
+    """B-278 —— :meth:`AgentSpecStore.purge_name` found a version that is not
+    soft-deleted (checked under the row lock, right before the delete). The
+    API layer maps it to ``HTTP 409``."""
+
+    def __init__(self, *, name: str, active_versions: list[str]) -> None:
+        super().__init__(f"agent {name!r} still has live versions: {active_versions}")
+        self.name = name
+        self.active_versions = active_versions
+
+
 class AgentSpecStore(abc.ABC):
     """Per-tenant manifest registry.
 
@@ -241,3 +252,35 @@ class AgentSpecStore(abc.ABC):
     ) -> AgentSpecRecord | None:
         """Update status. Returns the updated record, or ``None`` if no
         row matched. Used by the soft-delete path and the deprecate UI."""
+
+    # --- B-278 恢复 / 彻底删除 ---------------------------------------------
+
+    @abc.abstractmethod
+    async def restore(
+        self,
+        *,
+        tenant_id: UUID,
+        name: str,
+        version: str,
+    ) -> AgentSpecRecord | None:
+        """Flip one soft-deleted version back to ``ACTIVE``.
+
+        Conditional: only a row whose status is ``DELETED`` changes. Returns
+        the restored record, or ``None`` when no deleted row matched (unknown,
+        cross-tenant, or not deleted — the caller tells those apart with
+        :meth:`get` ``include_deleted=True``)."""
+
+    @abc.abstractmethod
+    async def count_revisions_for_name(self, *, tenant_id: UUID, name: str) -> int:
+        """How many ``agent_spec_revision`` rows every version of ``name`` has."""
+
+    @abc.abstractmethod
+    async def purge_name(self, *, tenant_id: UUID, name: str) -> tuple[int, int]:
+        """Hard-delete every version row of ``name`` and all their revisions.
+
+        One transaction: the version rows are locked, and if any of them is not
+        ``DELETED`` nothing is deleted and :class:`AgentSpecPurgeBlockedError`
+        is raised. Returns ``(version rows, revision rows)`` removed — ``(0, 0)``
+        when the name is already gone (a re-run). Revisions go too because
+        their ``(tenant, agent_name, agent_version, revision)`` unique key would
+        otherwise make re-creating the same name fail."""

@@ -9,6 +9,7 @@ from uuid import UUID
 from sqlalchemy import delete, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from expert_work.persistence.bulk_delete import CHUNK, delete_in_chunks
 from expert_work.persistence.image_upload.base import ImageUploadStore
 from expert_work.persistence.models import ImageUploadRow
 from expert_work.protocol import ImageUpload
@@ -187,3 +188,34 @@ class SqlImageUploadStore(ImageUploadStore):
                 .all()
             )
         return [_row_to_dto(r) for r in rows]
+
+    async def list_for_threads(
+        self, *, tenant_id: UUID, thread_ids: Sequence[UUID]
+    ) -> list[ImageUpload]:
+        ids = list(thread_ids)
+        rows: list[ImageUploadRow] = []
+        async with self._sf() as session:
+            for i in range(0, len(ids), CHUNK):
+                rows.extend(
+                    (
+                        await session.execute(
+                            select(ImageUploadRow).where(
+                                ImageUploadRow.tenant_id == tenant_id,
+                                ImageUploadRow.thread_id.in_(ids[i : i + CHUNK]),
+                            )
+                        )
+                    )
+                    .scalars()
+                    .all()
+                )
+        rows.sort(key=lambda r: r.created_at)
+        return [_row_to_dto(r) for r in rows]
+
+    async def delete_for_threads(self, *, tenant_id: UUID, thread_ids: Sequence[UUID]) -> int:
+        return await delete_in_chunks(
+            self._sf,
+            ImageUploadRow,
+            ImageUploadRow.thread_id,
+            list(thread_ids),
+            ImageUploadRow.tenant_id == tenant_id,
+        )

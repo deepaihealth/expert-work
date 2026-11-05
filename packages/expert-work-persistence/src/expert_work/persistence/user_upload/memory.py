@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from datetime import UTC, datetime
 from uuid import UUID
 
@@ -99,6 +100,23 @@ class InMemoryUserUploadStore(UserUploadStore):
             for key, r in self._rows.items()
             if r.tenant_id == tenant_id and r.user_id == user_id
         ]
+        for key in victims:
+            del self._rows[key]
+        return len(victims)
+
+    def _thread_keys(self, tenant_id: UUID, thread_ids: Sequence[UUID]) -> list[tuple[UUID, UUID]]:
+        wanted = set(thread_ids)
+        return [
+            key
+            for key, r in self._rows.items()
+            if r.tenant_id == tenant_id and r.thread_id in wanted
+        ]
+
+    async def count_for_threads(self, *, tenant_id: UUID, thread_ids: Sequence[UUID]) -> int:
+        return len(self._thread_keys(tenant_id, thread_ids))
+
+    async def delete_for_threads(self, *, tenant_id: UUID, thread_ids: Sequence[UUID]) -> int:
+        victims = self._thread_keys(tenant_id, thread_ids)
         for key in victims:
             del self._rows[key]
         return len(victims)

@@ -6,7 +6,7 @@ from datetime import UTC, datetime
 from typing import cast
 from uuid import UUID
 
-from sqlalchemy import select
+from sqlalchemy import select, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
@@ -377,3 +377,17 @@ class SqlTenantConfigStore(TenantConfigStore):
             )
             rows = result.scalars().all()
         return [_row_to_record(r) for r in rows]
+
+    async def clear_default_agent_name(self, *, tenant_id: UUID, agent_name: str) -> bool:
+        stmt = (
+            update(TenantConfigRow)
+            .where(
+                TenantConfigRow.tenant_id == tenant_id,
+                TenantConfigRow.default_agent_name == agent_name,
+            )
+            .values(default_agent_name=None, updated_at=_utc_now())
+        )
+        async with self._sf() as session:
+            result = await session.execute(stmt)
+            await session.commit()
+        return int(getattr(result, "rowcount", 0) or 0) > 0

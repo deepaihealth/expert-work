@@ -82,3 +82,20 @@ class InMemoryQualityDriftAlertStore(QualityDriftAlertStore):
         rows.sort(key=lambda r: r.id or 0)
         rows.sort(key=lambda r: r.detected_at or datetime.min.replace(tzinfo=UTC), reverse=True)
         return rows[:limit]
+
+    async def count_for_agent(self, *, tenant_id: UUID, agent_name: str) -> int:
+        async with self._lock:
+            return sum(
+                1 for r in self._alerts if r.tenant_id == tenant_id and r.agent_name == agent_name
+            )
+
+    async def delete_for_agent(self, *, tenant_id: UUID, agent_name: str) -> int:
+        async with self._lock:
+            kept = [
+                r
+                for r in self._alerts
+                if not (r.tenant_id == tenant_id and r.agent_name == agent_name)
+            ]
+            removed = len(self._alerts) - len(kept)
+            self._alerts = kept
+            return removed

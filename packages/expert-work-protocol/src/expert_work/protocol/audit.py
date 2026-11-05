@@ -37,6 +37,11 @@ class AuditAction(StrEnum):
     MANIFEST_DELETE = "manifest:delete"
     MANIFEST_SIGN = "manifest:sign"
     MANIFEST_PUBLISH = "manifest:publish"
+    # B-278 —— a soft-deleted agent version brought back (RESTORE), and an
+    # agent name irreversibly purged with its data (PURGE; details carry the
+    # per-table counts + failed step types). resource_type = "manifest".
+    MANIFEST_RESTORE = "manifest:restore"
+    MANIFEST_PURGE = "manifest:purge"
     # session
     SESSION_READ = "session:read"
     SESSION_WRITE = "session:write"

@@ -202,11 +202,11 @@ class SqlTriggerStore(TriggerStore):
 
     async def disable_for_agent(
         self, *, agent_name: str, agent_version: str, tenant_id: UUID
-    ) -> int:
+    ) -> list[UUID]:
         """Deletion hygiene PR4 §B — agent soft-delete cascade.
 
         Predicates: ``enabled == true AND agent_name == AND agent_version ==
-        AND tenant_id ==``; sets ``enabled=false``; returns rows changed.
+        AND tenant_id ==``; sets ``enabled=false``; returns the changed ids.
         """
         stmt = (
             sa_update(AgentTriggerRow)
@@ -217,11 +217,12 @@ class SqlTriggerStore(TriggerStore):
                 AgentTriggerRow.enabled.is_(True),
             )
             .values(enabled=False, updated_at=func.now())
+            .returning(AgentTriggerRow.id)
         )
         async with self._sf() as session:
-            result = await session.execute(stmt)
+            ids = list((await session.execute(stmt)).scalars().all())
             await session.commit()
-        return int(getattr(result, "rowcount", 0) or 0)
+        return ids
 
     async def claim_cron_fire(
         self,

@@ -44,6 +44,7 @@ from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 from control_plane.advisory_locks import MEMORY_WRITEBACK_CLAIM_LOCK_CLASSID
 from control_plane.agent_disable_status import AgentDisableService
 from control_plane.api import (
+    build_agent_lifecycle_router,
     build_agent_schema_router,
     build_agent_templates_router,
     build_agent_users_router,
@@ -489,6 +490,11 @@ from expert_work.persistence.sandbox_egress_audit import (
     SqlSandboxEgressAuditStore,
 )
 from expert_work.persistence.sandbox_instance_store import SqlSandboxInstanceStore
+from expert_work.persistence.secret_allowlist import (
+    AgentSecretAllowlistStore,
+    InMemoryAgentSecretAllowlistStore,
+    SqlAgentSecretAllowlistStore,
+)
 from expert_work.persistence.skill import (
     InMemorySkillStore,
     SkillStore,
@@ -810,6 +816,12 @@ def create_app(
         SqlSandboxEgressAuditStore(sql_stores.session_factory)
         if sql_stores
         else InMemorySandboxEgressAuditStore()
+    )
+    # B-278 —— 彻底删除智能体时连它的 secret_allowlist 行一起删(表归 credential-proxy 读写)。
+    resolved_secret_allowlist: AgentSecretAllowlistStore = (
+        SqlAgentSecretAllowlistStore(sql_stores.session_factory)
+        if sql_stores
+        else InMemoryAgentSecretAllowlistStore()
     )
     # 波 1 Task 7 — the agent_sandbox branch needs a warm-session CAS store;
     # only a real SQL session factory can back it durably (sandbox_instance
@@ -2844,6 +2856,7 @@ def create_app(
     app.state.quality_drift_alert_store = resolved_quality_drift_alert
     app.state.quality_config_service = quality_config_service
     app.state.sandbox_egress_audit_store = resolved_egress_audit_store
+    app.state.secret_allowlist_store = resolved_secret_allowlist
     app.state.knowledge_store = resolved_knowledge_store
     app.state.knowledge_retrieval_log_store = resolved_retrieval_log_store
     app.state.image_upload_store = resolved_image_upload_store
@@ -3061,6 +3074,8 @@ def create_app(
     app.include_router(build_external_artifacts_router())
 
     app.include_router(build_agents_router())
+    # B-278 —— 恢复 / 彻底删除(三段路径,和上面的两段 {name}/{version} 不冲突)。
+    app.include_router(build_agent_lifecycle_router())
     app.include_router(build_sessions_router())
     app.include_router(build_runs_router())
     app.include_router(build_plan_router())

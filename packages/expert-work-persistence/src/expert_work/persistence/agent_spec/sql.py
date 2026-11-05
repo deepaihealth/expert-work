@@ -5,12 +5,13 @@ from __future__ import annotations
 from datetime import UTC, datetime
 from uuid import UUID
 
-from sqlalchemy import func, select, update
+from sqlalchemy import delete, func, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from sqlalchemy.orm import aliased
 
 from expert_work.persistence.agent_spec.base import (
+    AgentSpecPurgeBlockedError,
     AgentSpecStore,
     AgentSpecUpdateResult,
     DuplicateAgentSpecError,
@@ -473,3 +474,77 @@ class SqlAgentSpecStore(AgentSpecStore):
             await session.commit()
             row = result.scalar_one_or_none()
         return _row_to_record(row) if row is not None else None
+
+    async def restore(
+        self,
+        *,
+        tenant_id: UUID,
+        name: str,
+        version: str,
+    ) -> AgentSpecRecord | None:
+        stmt = (
+            update(AgentSpecRow)
+            .where(
+                AgentSpecRow.tenant_id == tenant_id,
+                AgentSpecRow.name == name,
+                AgentSpecRow.version == version,
+                AgentSpecRow.status == AgentSpecStatus.DELETED.value,
+            )
+            .values(status=AgentSpecStatus.ACTIVE.value, updated_at=datetime.now(UTC))
+            .returning(AgentSpecRow)
+        )
+        async with self._sf() as session:
+            result = await session.execute(stmt)
+            await session.commit()
+            row = result.scalar_one_or_none()
+        return _row_to_record(row) if row is not None else None
+
+    async def count_revisions_for_name(self, *, tenant_id: UUID, name: str) -> int:
+        stmt = (
+            select(func.count())
+            .select_from(AgentSpecRevisionRow)
+            .where(
+                AgentSpecRevisionRow.tenant_id == tenant_id,
+                AgentSpecRevisionRow.agent_name == name,
+            )
+        )
+        async with self._sf() as session:
+            return int((await session.execute(stmt)).scalar_one())
+
+    async def purge_name(self, *, tenant_id: UUID, name: str) -> tuple[int, int]:
+        async with self._sf() as session:
+            # 锁住这个名字的全部版本行,再判「是不是都已删除」:判完到删之间没人能把
+            # 某一版恢复回来(恢复是同一行上的 UPDATE,会等这把锁)。
+            rows = (
+                (
+                    await session.execute(
+                        select(AgentSpecRow.version, AgentSpecRow.status)
+                        .where(AgentSpecRow.tenant_id == tenant_id, AgentSpecRow.name == name)
+                        .with_for_update()
+                    )
+                )
+                .tuples()
+                .all()
+            )
+            active = sorted(v for v, st in rows if st != AgentSpecStatus.DELETED.value)
+            if active:
+                await session.rollback()
+                raise AgentSpecPurgeBlockedError(name=name, active_versions=active)
+            revisions = await session.execute(
+                delete(AgentSpecRevisionRow).where(
+                    AgentSpecRevisionRow.tenant_id == tenant_id,
+                    AgentSpecRevisionRow.agent_name == name,
+                )
+            )
+            specs = await session.execute(
+                delete(AgentSpecRow).where(
+                    AgentSpecRow.tenant_id == tenant_id,
+                    AgentSpecRow.name == name,
+                    AgentSpecRow.status == AgentSpecStatus.DELETED.value,
+                )
+            )
+            await session.commit()
+        return (
+            int(getattr(specs, "rowcount", 0) or 0),
+            int(getattr(revisions, "rowcount", 0) or 0),
+        )

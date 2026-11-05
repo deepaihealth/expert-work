@@ -353,3 +353,23 @@ class ArtifactStore(abc.ABC):
         ``(tenant_id, user_id)`` predicate never touches another tenant's or
         user's artifacts. Workspace file bytes are removed separately by the
         workspace soft-delete + archive path."""
+
+    # --- B-278 彻底删除智能体 ---------------------------------------------
+
+    @abc.abstractmethod
+    async def list_versions_for_agent(
+        self, *, tenant_id: UUID, agent_key: str
+    ) -> list[ArtifactVersion]:
+        """Every version row of the agent's artifacts — every user, active AND
+        soft-deleted parents (the purge deletes each version's byte copy first).
+        ``agent_key`` must be non-empty: ``""`` is "owner unknown", not an agent."""
+
+    @abc.abstractmethod
+    async def count_for_agent(self, *, tenant_id: UUID, agent_key: str) -> int:
+        """``artifact`` rows ``delete_all_for_agent`` would remove (purge preview)."""
+
+    @abc.abstractmethod
+    async def delete_all_for_agent(self, *, tenant_id: UUID, agent_key: str) -> int:
+        """Hard-delete the agent's artifacts (every user, active AND
+        soft-deleted) and their version rows; returns the ``artifact`` rows
+        removed. Tenant-scoped; ``agent_key`` must be non-empty."""

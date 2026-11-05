@@ -670,3 +670,14 @@ class InMemoryMemoryStore(MemoryStore):
             "lands the interface + status='archived' retrieve filter."
         )
         raise NotImplementedError(msg)
+
+    async def count_for_agent(self, *, tenant_id: UUID, agent_name: str) -> int:
+        return sum(1 for r in self._rows if r.tenant_id == tenant_id and r.agent_name == agent_name)
+
+    async def delete_for_agent(self, *, tenant_id: UUID, agent_name: str) -> int:
+        kept = [
+            r for r in self._rows if not (r.tenant_id == tenant_id and r.agent_name == agent_name)
+        ]
+        removed = len(self._rows) - len(kept)
+        self._rows = kept
+        return removed

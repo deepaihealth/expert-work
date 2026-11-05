@@ -7,6 +7,7 @@ from datetime import UTC, datetime
 from uuid import UUID, uuid4
 
 from expert_work.persistence.agent_spec.base import (
+    AgentSpecPurgeBlockedError,
     AgentSpecStore,
     AgentSpecUpdateResult,
     DuplicateAgentSpecError,
@@ -331,3 +332,45 @@ class InMemoryAgentSpecStore(AgentSpecStore):
             replaced = existing.model_copy(update={"status": status, "updated_at": _now()})
             self._rows[key] = replaced
             return replaced
+
+    async def restore(
+        self,
+        *,
+        tenant_id: UUID,
+        name: str,
+        version: str,
+    ) -> AgentSpecRecord | None:
+        async with self._lock:
+            key = (tenant_id, name, version)
+            existing = self._rows.get(key)
+            if existing is None or existing.status is not AgentSpecStatus.DELETED:
+                return None
+            restored = existing.model_copy(
+                update={"status": AgentSpecStatus.ACTIVE, "updated_at": _now()}
+            )
+            self._rows[key] = restored
+            return restored
+
+    async def count_revisions_for_name(self, *, tenant_id: UUID, name: str) -> int:
+        async with self._lock:
+            return sum(
+                len(history)
+                for (row_tenant, row_name, _), history in self._revisions.items()
+                if row_tenant == tenant_id and row_name == name
+            )
+
+    async def purge_name(self, *, tenant_id: UUID, name: str) -> tuple[int, int]:
+        async with self._lock:
+            keys = [k for k in self._rows if k[0] == tenant_id and k[1] == name]
+            active = sorted(
+                k[2] for k in keys if self._rows[k].status is not AgentSpecStatus.DELETED
+            )
+            if active:
+                raise AgentSpecPurgeBlockedError(name=name, active_versions=active)
+            revision_keys = [k for k in self._revisions if k[0] == tenant_id and k[1] == name]
+            revisions = sum(len(self._revisions[k]) for k in revision_keys)
+            for k in keys:
+                del self._rows[k]
+            for k in revision_keys:
+                del self._revisions[k]
+            return len(keys), revisions

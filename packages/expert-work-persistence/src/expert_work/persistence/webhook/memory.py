@@ -143,6 +143,12 @@ class InMemoryWebhookDeliveryStore(WebhookDeliveryStore):
             del self._rows[did]
         return len(victims)
 
+    async def count_for_endpoints(self, *, endpoint_ids: Sequence[UUID], tenant_id: UUID) -> int:
+        wanted = set(endpoint_ids)
+        return sum(
+            1 for r in self._rows.values() if r.endpoint_id in wanted and r.tenant_id == tenant_id
+        )
+
     async def list_ready(
         self, *, before: datetime, limit: int = 1000
     ) -> list[WebhookDeliveryRecord]:

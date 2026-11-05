@@ -13,6 +13,7 @@ forgotten WHERE clause cannot cross-leak.
 from __future__ import annotations
 
 import abc
+from collections.abc import Sequence
 from datetime import datetime
 from uuid import UUID
 
@@ -96,3 +97,12 @@ class UserUploadStore(abc.ABC):
         Tenant- AND user-scoped — the ``(tenant_id, user_id)`` predicate
         never touches another tenant's or user's rows. Returns the count
         deleted (0 when none / re-purge)."""
+
+    @abc.abstractmethod
+    async def count_for_threads(self, *, tenant_id: UUID, thread_ids: Sequence[UUID]) -> int:
+        """B-278 —— rows ``delete_for_threads`` would remove (agent purge preview)."""
+
+    @abc.abstractmethod
+    async def delete_for_threads(self, *, tenant_id: UUID, thread_ids: Sequence[UUID]) -> int:
+        """B-278 —— hard-delete the upload registry rows of these conversations;
+        tenant-scoped, returns the count deleted."""

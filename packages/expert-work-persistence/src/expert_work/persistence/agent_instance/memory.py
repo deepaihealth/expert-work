@@ -80,3 +80,22 @@ class InMemoryAgentInstanceStore(AgentInstanceStore):
             ]
         rows.sort(key=lambda r: r.last_active_at, reverse=True)
         return rows[offset : offset + limit]
+
+    async def count_for_agent(self, *, tenant_id: UUID, agent_code: str) -> int:
+        async with self._lock:
+            return sum(
+                1
+                for r in self._rows.values()
+                if r.tenant_id == tenant_id and r.agent_code == agent_code
+            )
+
+    async def delete_for_agent(self, *, tenant_id: UUID, agent_code: str) -> int:
+        async with self._lock:
+            victims = [
+                key
+                for key, r in self._rows.items()
+                if r.tenant_id == tenant_id and r.agent_code == agent_code
+            ]
+            for key in victims:
+                del self._rows[key]
+            return len(victims)

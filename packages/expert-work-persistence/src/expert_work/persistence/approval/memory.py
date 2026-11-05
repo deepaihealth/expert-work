@@ -175,3 +175,9 @@ class InMemoryApprovalStore(ApprovalStore):
         for run_id in victims:
             del self._rows[run_id]
         return len(victims)
+
+    async def count_for_threads(self, *, tenant_id: UUID, thread_ids: Sequence[UUID]) -> int:
+        wanted = set(thread_ids)
+        return sum(
+            1 for r in self._rows.values() if r.tenant_id == tenant_id and r.thread_id in wanted
+        )

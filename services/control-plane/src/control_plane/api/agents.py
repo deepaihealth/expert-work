@@ -24,6 +24,7 @@ from fastapi.responses import JSONResponse, Response, StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 
 from control_plane.agent_disable_status import AgentDisableService
+from control_plane.api._agent_duplicate import duplicate_agent_response
 from control_plane.api._authz import (
     console_only,
     ensure_resource_access,
@@ -1412,10 +1413,8 @@ def build_agents_router() -> APIRouter:
                 reason="duplicate",
                 trace_id=trace_id,
             )
-            return _envelope_error(
-                "MANIFEST_DUPLICATE",
-                "an agent with this name and version already exists",
-                409,
+            return await duplicate_agent_response(
+                repo, tenant_id=tenant_id, name=spec.metadata.name, version=spec.metadata.version
             )
 
         await emit(
@@ -1576,10 +1575,11 @@ def build_agents_router() -> APIRouter:
                 tenant_id=tenant_id, spec=fork_spec, spec_sha256=sha, created_by=actor_id
             )
         except DuplicateAgentSpecError:
-            return _envelope_error(
-                "MANIFEST_DUPLICATE",
-                "an agent with this name and version already exists",
-                409,
+            return await duplicate_agent_response(
+                repo,
+                tenant_id=tenant_id,
+                name=fork_spec.metadata.name,
+                version=fork_spec.metadata.version,
             )
 
         await emit(
@@ -2002,7 +2002,11 @@ def build_agents_router() -> APIRouter:
         )
         target_tenant = scope.tenant_id
         async with applied_scope(scope):
-            record = await repo.get(tenant_id=target_tenant, name=name, version=version)
+            # B-278 —— 已删除的版本也读得到(``record.status == "deleted"``),详情页据此只读 +
+            # 恢复 / 彻底删除。
+            record = await repo.get(
+                tenant_id=target_tenant, name=name, version=version, include_deleted=True
+            )
         if record is None:
             raise HTTPException(status_code=404, detail="agent not found")
         # Stream 8.5 — instance-level RBAC + ABAC (conditioned bindings may
@@ -2374,7 +2378,9 @@ def build_agents_router() -> APIRouter:
         )
         target_tenant = scope.tenant_id
         async with applied_scope(scope):
-            record = await repo.get(tenant_id=target_tenant, name=name, version=version)
+            record = await repo.get(
+                tenant_id=target_tenant, name=name, version=version, include_deleted=True
+            )
         if record is None:
             raise HTTPException(status_code=404, detail="agent not found")
         await ensure_resource_access(
@@ -2537,7 +2543,9 @@ def build_agents_router() -> APIRouter:
         async with applied_scope(scope):
             # 404 for an unknown manifest, [] for a known one with a short
             # history window — the UI distinguishes the two.
-            record = await repo.get(tenant_id=target_tenant, name=name, version=version)
+            record = await repo.get(
+                tenant_id=target_tenant, name=name, version=version, include_deleted=True
+            )
             if record is None:
                 raise HTTPException(status_code=404, detail="agent not found")
             revisions = await repo.list_revisions(
@@ -2742,7 +2750,7 @@ def build_agents_router() -> APIRouter:
             details["runs_cancel_failed"] = True
         details["runs_cancelled"] = cancelled
 
-        disabled = 0
+        disabled: list[UUID] = []
         try:
             disabled = await triggers.disable_for_agent(
                 agent_name=name, agent_version=version, tenant_id=tenant_id
@@ -2750,7 +2758,9 @@ def build_agents_router() -> APIRouter:
         except Exception:
             logger.warning("agent_delete.triggers_disable_failed", exc_info=True)
             details["triggers_disable_failed"] = True
-        details["triggers_disabled"] = disabled
+        details["triggers_disabled"] = len(disabled)
+        # B-278 —— 记下这次删除(而不是人)关掉的是哪几个,日后恢复时有据可查;恢复本身不自动打开。
+        details["disabled_trigger_ids"] = [str(t) for t in disabled]
 
         await emit(
             audit,

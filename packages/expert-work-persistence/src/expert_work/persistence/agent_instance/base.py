@@ -48,3 +48,13 @@ class AgentInstanceStore(abc.ABC):
         deleted (0 when none / re-purge). Tenant- AND user-scoped — the
         ``(tenant_id, user_id)`` predicate never touches another tenant's or
         user's bindings."""
+
+    @abc.abstractmethod
+    async def count_for_agent(self, *, tenant_id: UUID, agent_code: str) -> int:
+        """B-278 —— how many end-users are bound to ``agent_code`` (purge preview)."""
+
+    @abc.abstractmethod
+    async def delete_for_agent(self, *, tenant_id: UUID, agent_code: str) -> int:
+        """B-278 —— hard-delete every binding to ``agent_code`` (agent purge).
+
+        Tenant-scoped; returns the rows removed (0 on a re-run)."""

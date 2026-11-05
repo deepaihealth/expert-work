@@ -10,6 +10,7 @@ from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from expert_work.persistence.agent_disable.base import AgentDisableStore
+from expert_work.persistence.bulk_delete import delete_where
 from expert_work.persistence.models import AgentDisableRow
 from expert_work.protocol import AgentDisableRecord
 
@@ -95,3 +96,12 @@ class SqlAgentDisableStore(AgentDisableStore):
         async with self._sf() as session:
             rows = (await session.execute(stmt)).scalars().all()
         return set(rows)
+
+    async def delete(self, *, tenant_id: UUID, agent_name: str) -> bool:
+        removed = await delete_where(
+            self._sf,
+            AgentDisableRow,
+            AgentDisableRow.tenant_id == tenant_id,
+            AgentDisableRow.agent_name == agent_name,
+        )
+        return removed > 0

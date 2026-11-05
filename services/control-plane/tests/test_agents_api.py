@@ -281,9 +281,29 @@ async def test_delete_soft_removes(b5_client: AsyncClient) -> None:
     # raised "Response content longer than Content-Length" after replying.
     assert response.content == b""
 
-    # GET no longer returns the row (soft-deleted rows are hidden).
+    # B-278 —— the detail read still returns the row (the list's "deleted" filter
+    # links here), marked deleted, so the page can offer restore / purge.
     follow_up = await b5_client.get("/v1/agents/code-reviewer/1.0.0")
-    assert follow_up.status_code == 404
+    assert follow_up.status_code == 200, follow_up.text
+    assert follow_up.json()["data"]["record"]["status"] == "deleted"
+    revisions = await b5_client.get("/v1/agents/code-reviewer/1.0.0/revisions")
+    assert revisions.status_code == 200, revisions.text
+    assert [r["revision"] for r in revisions.json()["data"]["items"]] == [1]
+
+
+@pytest.mark.asyncio
+async def test_create_over_a_deleted_same_name_returns_409_deleted(b5_client: AsyncClient) -> None:
+    """B-278 —— re-creating a deleted name gets its own 409 code, so the console
+    can offer restore / purge instead of a dead-end "already exists"."""
+    await b5_client.post("/v1/agents", json={"manifest_yaml": _VALID_YAML})
+    assert (await b5_client.delete("/v1/agents/code-reviewer/1.0.0")).status_code == 204
+
+    response = await b5_client.post("/v1/agents", json={"manifest_yaml": _VALID_YAML})
+
+    assert response.status_code == 409
+    error = response.json()["error"]
+    assert error["code"] == "MANIFEST_DUPLICATE_DELETED"
+    assert error["details"] == {"name": "code-reviewer", "version": "1.0.0", "status": "deleted"}
 
 
 @pytest.mark.asyncio
@@ -681,6 +701,8 @@ async def test_delete_disables_only_this_versions_triggers(cascade_ctx: _Cascade
 
     details = await _manifest_delete_details(cascade_ctx)
     assert details["triggers_disabled"] == 1
+    # B-278 —— which triggers the delete (not a person) turned off, for a later restore.
+    assert details["disabled_trigger_ids"] == [str(target.id)]
     assert details["runs_cancelled"] == 0
     assert "triggers_disable_failed" not in details
     assert "runs_cancel_failed" not in details
