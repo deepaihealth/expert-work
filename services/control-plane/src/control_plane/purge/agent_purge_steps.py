@@ -18,16 +18,13 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Awaitable, Callable
-from typing import TYPE_CHECKING
 from uuid import UUID
 
 from control_plane.purge.agent_purge_nas import has_symlink
+from control_plane.purge.agent_purge_types import AgentPurgeDeps, AgentPurgeSummary, Footprint
 from expert_work.persistence import WORKSPACE_AGENTS_DIR
 from orchestrator.context.workspace_projection import thread_projection_prefix
 from orchestrator.tools.overflow import OVERFLOW_DIR
-
-if TYPE_CHECKING:
-    from control_plane.purge.agent_purge import AgentPurgeDeps, AgentPurgeSummary, Footprint
 
 logger = logging.getLogger("expert_work.control_plane.purge.agent")
 
