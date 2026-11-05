@@ -30,7 +30,7 @@ from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any, Literal
 
-from control_plane.mcp_kept_clients import KeptClient, KeptMcpClients, reusable
+from control_plane.mcp_kept_clients import KeptClient, KeptMcpClients
 from control_plane.mcp_retired_clients import (
     RetiredMcpClients,
     close_retired,
@@ -95,11 +95,6 @@ class _ToolFilteringClient:
         # working; a transport without ``retire`` is closed instead.
         retire = getattr(self.inner, "retire", None)
         await (retire() if retire is not None else self.inner.close())
-
-    @property
-    def session_broken(self) -> bool:
-        # B-177 — the pool checks it before reusing a kept client.
-        return bool(getattr(self.inner, "session_broken", False))
 
 
 def _record_to_config(record: McpConnectorCatalogRecord) -> MCPServerConfig:
@@ -319,7 +314,9 @@ class PlatformMcpPoolService:
             if not _is_shared_server(record):
                 continue
             fingerprint = connection_fingerprint(record)
-            kept = reusable(record.name, carried.get(record.name), fingerprint)
+            kept = carried.get(record.name)
+            if kept is not None and kept.fingerprint != fingerprint:
+                kept = None
             try:
                 if kept is not None:
                     # B-259 —— 连接配置没变:复用暂存的长连接,不重连。

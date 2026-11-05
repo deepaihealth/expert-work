@@ -21,7 +21,7 @@ from collections.abc import Awaitable, Callable
 from typing import Literal
 from uuid import UUID
 
-from control_plane.mcp_kept_clients import KeptClient, KeptMcpClients, reusable
+from control_plane.mcp_kept_clients import KeptClient, KeptMcpClients
 from control_plane.mcp_retired_clients import (
     RetiredMcpClients,
     close_retired,
@@ -253,7 +253,9 @@ class TenantMcpPoolService:
             if not record.enabled:
                 continue
             fingerprint = connection_fingerprint(record)
-            kept = reusable(record.name, carried.get(record.name), fingerprint)
+            kept = carried.get(record.name)
+            if kept is not None and kept.fingerprint != fingerprint:
+                kept = None
             try:
                 if kept is not None:
                     # B-259 —— 连接配置没变:复用暂存的长连接,不重连。

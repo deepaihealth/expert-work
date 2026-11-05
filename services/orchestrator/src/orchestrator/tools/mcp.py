@@ -146,11 +146,22 @@ class MCPServerUnhealthyError(RuntimeError):
 
 
 class MCPSessionBrokenError(ConnectionError):
-    """B-177 — the session's transport died while a request was waiting on it.
+    """B-177 — the session's transport died while a request was waiting on it
+    (or a reconnect just failed).
 
-    The request may already have reached the server, so it is never resent;
-    the next call reconnects first.
+    The request may already have reached the server, so a ``call_tool`` is
+    never resent; the next call reconnects first.
     """
+
+
+@dataclass(frozen=True)
+class _ReconnectFailure:
+    """B-177 — when and how the last reconnect of ``session`` failed."""
+
+    at: float
+    session: Any
+    kind: str
+    timed_out: bool
 
 
 class MCPOAuthNotImplementedError(NotImplementedError):
@@ -442,6 +453,14 @@ def _lenient_client_session_cls() -> Any:
     return LenientClientSession
 
 
+class _SessionExitStack(contextlib.AsyncExitStack):
+    """The owner task's exit stack. B-177 — ``end_server_session`` tells the
+    transport whether closing should also end the session on the server (the
+    StreamableHTTP ``DELETE``); a replaced (stale) session is closed without it."""
+
+    end_server_session: bool = True
+
+
 class _OwnedSession:
     """Handle for a session whose transport lives in its own owner task.
 
@@ -461,15 +480,22 @@ class _OwnedSession:
     error type) when the transport ended on its own, e.g. a POST hit a reset
     connection and crashed the SDK's task group: the SDK then never answers the
     requests still waiting on it, so callers watch ``died`` instead of waiting
-    out ``timeout_s``. ``stale`` marks a session a request timed out on (it may
-    be half-open).
+    out ``timeout_s``. ``stale`` marks a session being replaced while its
+    transport is still up (a request timed out on it — it may be half-open — or
+    the server answered 404): it is drained, then closed without ending the
+    server-side session, so a tool the server is still running is not aborted.
     """
 
     def __init__(
-        self, task: asyncio.Task[None], stop: asyncio.Event, died: asyncio.Future[str]
+        self,
+        task: asyncio.Task[None],
+        stop: asyncio.Event,
+        died: asyncio.Future[str],
+        exit_stack: _SessionExitStack,
     ) -> None:
         self._task = task
         self._stop = stop
+        self._exit_stack = exit_stack
         self.died = died
         self.stale = False
 
@@ -477,6 +503,10 @@ class _OwnedSession:
     def broken(self) -> bool:
         """The next request must not go out on this session (B-177)."""
         return self.stale or self.died.done()
+
+    def mark_stale(self) -> None:
+        self.stale = True
+        self._exit_stack.end_server_session = False
 
     async def __aexit__(self, *_exc: object) -> None:
         self._stop.set()
@@ -495,7 +525,7 @@ def _error_kind(exc: BaseException) -> str:
 #: 404 on a POST: the server no longer knows the session (it restarted, or the
 #: session expired) and, per the MCP spec, did NOT process the request.
 _SESSION_TERMINATED_MESSAGE = "Session terminated"
-_SESSION_TERMINATED_CODES = frozenset({32600, -32600})  # SDK sends +32600
+_SESSION_TERMINATED_CODE = 32600  # sic: the SDK sends +32600
 
 
 def _is_session_terminated(exc: BaseException) -> bool:
@@ -504,7 +534,7 @@ def _is_session_terminated(exc: BaseException) -> bool:
     return (
         isinstance(exc, McpError)
         and exc.error.message == _SESSION_TERMINATED_MESSAGE
-        and exc.error.code in _SESSION_TERMINATED_CODES
+        and exc.error.code == _SESSION_TERMINATED_CODE
     )
 
 
@@ -536,10 +566,11 @@ async def _open_owned_session(
     ready: asyncio.Future[Any] = loop.create_future()
     died: asyncio.Future[str] = loop.create_future()
     stop = asyncio.Event()
+    exit_stack = _SessionExitStack()
 
     async def _own() -> None:
         try:
-            async with contextlib.AsyncExitStack() as stack:
+            async with exit_stack as stack:
                 session = await open_in_stack(stack)
                 if ready.done():  # opener was cancelled meanwhile
                     return
@@ -549,8 +580,9 @@ async def _open_owned_session(
             if not ready.done():
                 ready.set_exception(exc)
                 return
-            if not stop.is_set() and not died.done():
+            if not stop.is_set() and not isinstance(exc, asyncio.CancelledError):
                 # B-177 — nobody asked it to stop: the transport died under it.
+                # (Cancelled = the loop is shutting down, not a dead peer.)
                 died.set_result(_error_kind(exc))
             if isinstance(exc, asyncio.CancelledError):
                 raise
@@ -569,7 +601,7 @@ async def _open_owned_session(
         with contextlib.suppress(asyncio.CancelledError):
             await asyncio.gather(task, return_exceptions=True)
         raise
-    return _OwnedSession(task, stop, died), session
+    return _OwnedSession(task, stop, died, exit_stack), session
 
 
 @dataclass
@@ -778,6 +810,9 @@ class _RemoteMCPClientBase:
     _drain_closes: set[asyncio.Task[None]] = field(default_factory=set, init=False, repr=False)
     #: B-177 — the background reconnect started after a request timed out.
     _rebuild: asyncio.Task[None] | None = field(default=None, init=False, repr=False)
+    #: B-177 — the last failed reconnect: callers that queued behind it on the
+    #: restart lock fail with it instead of each dialing the unresponsive peer.
+    _reconnect_failure: _ReconnectFailure | None = field(default=None, init=False, repr=False)
 
     def __post_init__(self) -> None:
         self._breaker = MCPCircuitBreaker(server=self.config.name)
@@ -829,17 +864,6 @@ class _RemoteMCPClientBase:
             self.config.transport,
             died.result(),
         )
-
-    @property
-    def session_broken(self) -> bool:
-        """B-177 — the long-lived session is known dead or suspect: the next
-        call reconnects before sending. Pools check it before handing a kept
-        client to a new build."""
-        if self._session is None:
-            return False  # not started / retired / closed: nothing to reuse
-        stack = self._stack
-        # ``_stack`` is None only after a failed reconnect left the dead session.
-        return stack is None or (isinstance(stack, _OwnedSession) and stack.broken)
 
     def _not_started(self) -> RuntimeError:
         return RuntimeError(f"{type(self).__name__} {self.config.name!r} not started")
@@ -958,7 +982,7 @@ class _RemoteMCPClientBase:
             return
         if self._closed or self._retired or self._session is not session:
             return  # parked / replaced / released session: nothing to rebuild
-        stack.stale = True
+        stack.mark_stale()
         if self._rebuild is not None and not self._rebuild.done():
             return
         logger.warning(
@@ -997,9 +1021,11 @@ class _RemoteMCPClientBase:
         up) is replaced first and drained after, so the other calls still
         running on it are not torn down under them.
         """
+        queued_at = asyncio.get_running_loop().time()
         async with self._restart_lock:
             if self._session is not failed_session:
                 return  # another caller already restarted (or close() ran)
+            self._raise_if_reconnect_just_failed(failed_session, queued_at)
             old = self._stack
             drain = isinstance(old, _OwnedSession) and old.stale and not old.died.done()
             if not drain:
@@ -1013,7 +1039,16 @@ class _RemoteMCPClientBase:
                         logger.debug(
                             "mcp.restart_close_error server=%s err=%s", self.config.name, exc
                         )
-            stack, session = await self._open_session_bounded()
+            try:
+                stack, session = await self._open_session_bounded()
+            except Exception as exc:
+                self._reconnect_failure = _ReconnectFailure(
+                    at=asyncio.get_running_loop().time(),
+                    session=failed_session,
+                    kind=_error_kind(exc),
+                    timed_out=isinstance(exc, TimeoutError),
+                )
+                raise
             if self._closed:
                 # B-248 — close() landed during the reconnect: a hard stop
                 # wins, the fresh session never serves.
@@ -1032,6 +1067,21 @@ class _RemoteMCPClientBase:
             if drain and isinstance(old, _OwnedSession):
                 self._drain_or_close(old)
 
+    def _raise_if_reconnect_just_failed(self, failed_session: Any, queued_at: float) -> None:
+        """B-177 — a reconnect of this same session failed while this caller
+        waited for the lock: fail now with that outcome rather than dial the
+        unresponsive peer again (N queued callers used to take N x timeout_s)."""
+        failure = self._reconnect_failure
+        if failure is None or failure.session is not failed_session or failure.at < queued_at:
+            return
+        msg = (
+            f"mcp server {self.config.name!r}: reconnect failed moments ago "
+            f"({failure.kind}); not retried"
+        )
+        if failure.timed_out:
+            raise MCPCallTimeoutError(msg)
+        raise MCPSessionBrokenError(msg)
+
     async def _request(self, op: Callable[[Any], Awaitable[Any]], *, idempotent: bool) -> Any:
         """Run ``op(session)`` on the long-lived session — or on a one-shot one
         once retired (pool TTL expiry). Every path is bounded by ``timeout_s``:
@@ -1040,7 +1090,7 @@ class _RemoteMCPClientBase:
 
         Resent once on a fresh session only when the server cannot have run
         it: send-phase stream death (BUG-17), an HTTP 404 "Session terminated"
-        (B-177), or — for idempotent ``op`` — any stream death.
+        (B-177), or — for idempotent ``op`` — any stream / transport death.
         """
         if self._retired:
             return await self._one_shot(op)
@@ -1062,13 +1112,17 @@ class _RemoteMCPClientBase:
                 # request — the tool may already have run, so those are never
                 # resent (unless ``op`` is idempotent).
                 return await self._on_fresh_session(session, op)
-            except anyio.BrokenResourceError:
+            except (anyio.BrokenResourceError, MCPSessionBrokenError):
                 if not idempotent:
                     raise
                 return await self._on_fresh_session(session, op)
             except Exception as exc:
                 if not _is_session_terminated(exc):
                     raise
+                if owned is not None:
+                    # The transport is up, only this session is gone on the
+                    # server: replace it and let calls still on it finish.
+                    owned.mark_stale()
                 logger.warning(
                     "mcp.session_terminated_resend server=%s transport=%s",
                     self.config.name,
@@ -1091,6 +1145,8 @@ class _RemoteMCPClientBase:
     async def list_tools(self) -> Sequence[MCPToolDef]:
         try:
             result = await self._request(lambda session: session.list_tools(), idempotent=True)
+        except MCPCallTimeoutError:
+            raise  # a (re)connect timeout: its own message says what timed out
         except TimeoutError as exc:
             msg = f"mcp list_tools timed out after {self.config.timeout_s}s on {self.config.name!r}"
             raise MCPCallTimeoutError(msg) from exc
@@ -1122,6 +1178,8 @@ class _RemoteMCPClientBase:
         except TimeoutError as exc:
             self._breaker.record_failure()
             record_mcp_call(transport=transport, server=server, result="timeout")
+            if isinstance(exc, MCPCallTimeoutError):
+                raise  # a (re)connect timeout: its own message says what timed out
             msg = f"mcp call timed out after {self.config.timeout_s}s on {server!r}:{name!r}"
             raise MCPCallTimeoutError(msg) from exc
         except Exception:
@@ -1212,9 +1270,13 @@ class StreamableHttpMCPClient(_RemoteMCPClientBase):
     spelling is deprecated). Headers / timeout are configured on a
     dedicated :class:`httpx.AsyncClient` so the SDK helper sees them
     through its single ``http_client`` parameter. The SDK yields
-    ``(read, write, get_session_id)``; we drop the session callback
-    because the orchestrator doesn't (yet) surface it — M1 may use it
-    for resumption.
+    ``(read, write, get_session_id)``; the callback is only used to reach
+    the transport's ``terminate_session`` (B-177, see below).
+
+    B-177 — ending the server-side session (HTTP ``DELETE``) on close is done
+    here rather than by the SDK, so it can be skipped for a replaced (stale)
+    session: the server may still be running a tool whose request timed out
+    on it, and a ``DELETE`` could abort it.
     """
 
     async def _open_streams(self, stack: contextlib.AsyncExitStack) -> tuple[Any, Any]:
@@ -1230,13 +1292,32 @@ class StreamableHttpMCPClient(_RemoteMCPClientBase):
                 timeout=self.config.timeout_s,
             )
         )
-        read, write, _get_session_id = await stack.enter_async_context(
+        read, write, get_session_id = await stack.enter_async_context(
             streamable_http_client(
                 url=self.config.url,
                 http_client=http_client,
+                terminate_on_close=False,
             )
         )
+        terminate = getattr(getattr(get_session_id, "__self__", None), "terminate_session", None)
+        if terminate is None:
+            msg = (
+                "mcp SDK StreamableHTTP transport no longer exposes terminate_session "
+                "via get_session_id — re-verify the B-177 close path against this SDK."
+            )
+            raise RuntimeError(msg)
+        # Runs before the transport exits (LIFO) — where the SDK would send it.
+        stack.push_async_callback(_end_server_session, stack, terminate, http_client)
         return read, write
+
+
+async def _end_server_session(
+    stack: contextlib.AsyncExitStack,
+    terminate: Callable[[Any], Awaitable[None]],
+    http_client: Any,
+) -> None:
+    if getattr(stack, "end_server_session", True):
+        await terminate(http_client)
 
 
 def _render_content_blocks(blocks: Sequence[Any]) -> str:

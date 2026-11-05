@@ -203,6 +203,12 @@ async def _drained(client: _FlakyClient) -> None:
     await asyncio.gather(*client._drain_closes)
 
 
+def _broken(client: mcp_mod._RemoteMCPClientBase) -> bool:
+    """The next call will reconnect before sending."""
+    stack = client._stack
+    return isinstance(stack, mcp_mod._OwnedSession) and stack.broken
+
+
 def _messages(caplog: pytest.LogCaptureFixture, name: str) -> list[str]:
     return [r.getMessage() for r in caplog.records if name in r.getMessage()]
 
@@ -234,7 +240,7 @@ async def test_transport_death_fails_the_waiting_call_at_once(
     assert _GATED_CALLS == ["a"]  # not resent
     assert spy.events == ["failure"]
     assert mcp_calls == ["transport_err"]
-    assert client.session_broken is True
+    assert _broken(client)
     broken = _messages(caplog, "mcp.session_marked_broken")
     assert broken == [
         "mcp.session_marked_broken server=deep-ai-health-mcp "
@@ -262,7 +268,7 @@ async def test_next_call_after_transport_death_reconnects_before_sending(
     assert result.content == "x"
     assert dead.calls == 1  # only "a": nothing more went out on the dead session
     assert (client.opens, client.closes) == (2, 1)
-    assert client.session_broken is False
+    assert not _broken(client)
     assert len(_messages(caplog, "mcp.session_restarted")) == 1
     await client.close()
 
@@ -339,19 +345,107 @@ async def test_session_terminated_again_after_reconnect_is_not_retried_twice(
 
 
 @pytest.mark.timeout(30)
-async def test_other_server_errors_are_not_resent() -> None:
-    """Only the 404 marker proves the server skipped the request."""
+@pytest.mark.parametrize(
+    ("code", "message"),
+    [(-32603, "Internal error"), (-32600, "Session terminated")],
+    ids=["internal-error", "negative-code"],
+)
+async def test_other_server_errors_are_not_resent(code: int, message: str) -> None:
+    """Only the SDK's exact 404 marker (+32600) proves the server skipped the
+    request; anything else may have run on the server."""
     client = _client()
     await client.start()
-    failing = _Forgotten(code=-32603, message="Internal error")
+    failing = _Forgotten(code=code, message=message)
     client._session = failing
 
-    with pytest.raises(McpError, match="Internal error"):
+    with pytest.raises(McpError, match=message):
         await client.call_tool("echo", {"text": "x"})
 
     assert failing.calls == 1
     assert client.opens == 1
     await client.close()
+
+
+class _ForgetsEcho:
+    """The live session, except that ``echo`` meets an HTTP 404."""
+
+    def __init__(self, inner: Any) -> None:
+        self.inner = inner
+
+    async def call_tool(self, name: str, args: dict[str, Any]) -> Any:
+        if name == "echo":
+            raise McpError(ErrorData(code=32600, message="Session terminated"))
+        return await self.inner.call_tool(name, args)
+
+    async def list_tools(self) -> Any:
+        return await self.inner.list_tools()
+
+
+@pytest.mark.timeout(30)
+async def test_session_terminated_lets_another_call_in_flight_finish() -> None:
+    """Review: the 404 reconnect used to tear the shared session down under a
+    call still running on it — the server ran ``B`` but the client reported a
+    timeout. The old session now drains first."""
+    client = _client(timeout_s=2.0)
+    await client.start()
+    running = await _started_gated_call(client, "B")
+    client._session = _ForgetsEcho(client._session)
+
+    result = await client.call_tool("echo", {"text": "a"})
+    assert result.content == "a"
+    assert (client.opens, client.closes) == (2, 0)  # old one parked for "B"
+
+    _GATES["B"].set()
+    assert (await asyncio.wait_for(running, timeout=5)).content == "opened B"
+    await _drained(client)
+    assert (client.opens, client.closes) == (2, 1)
+    await client.close()
+
+
+@pytest.mark.timeout(30)
+async def test_list_tools_retries_once_when_the_transport_dies_under_it() -> None:
+    """list_tools is read-only: unlike call_tool, a transport death mid-request
+    is retried once on a fresh session."""
+    client = _client()
+    await client.start()
+    live = client._session
+    entered = asyncio.Event()
+
+    class _Unanswered:
+        async def list_tools(self) -> Any:
+            entered.set()
+            await asyncio.Event().wait()  # the response never arrives
+
+    client._session = _Unanswered()
+    listing = asyncio.create_task(client.list_tools())
+    await entered.wait()
+    client.peer_resets[0].set()
+
+    tools = await asyncio.wait_for(listing, timeout=5)
+    assert sorted(t.name for t in tools) == ["echo", "gated"]
+    assert client.opens == 2
+    assert client._session is not live
+    await client.close()
+
+
+@pytest.mark.timeout(30)
+async def test_owner_cancelled_at_shutdown_is_not_reported_as_broken(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Loop shutdown cancels the owner task: not a dead peer, no WARNING."""
+    client = _client()
+    await client.start()
+    stack = client._stack
+    assert isinstance(stack, mcp_mod._OwnedSession)
+
+    with caplog.at_level(logging.WARNING, logger=mcp_mod.logger.name):
+        stack._task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await stack._task
+        await asyncio.sleep(0)
+
+    assert _messages(caplog, "mcp.session_marked_broken") == []
+    assert not stack.died.done()
 
 
 # ---------------------------------------------------------------------------
@@ -377,7 +471,7 @@ async def test_timeout_rebuilds_the_session_in_the_background_without_resending(
     assert mcp_calls == ["timeout"]
     assert client.opens == 2
     assert client._session is not old
-    assert client.session_broken is False
+    assert not _broken(client)
     await _drained(client)
     assert client.closes == 1  # the stale session was closed
     assert _messages(caplog, "mcp.session_rebuild_scheduled") == [
@@ -400,7 +494,7 @@ async def test_next_call_after_a_timeout_never_goes_out_on_the_stale_session() -
     client._session = stale
     with pytest.raises(mcp_mod.MCPCallTimeoutError):
         await client.call_tool("gated", {"key": "a"})
-    assert client.session_broken is True
+    assert _broken(client)
     client.open_gate = asyncio.Event()  # the rebuild's handshake is held
 
     nxt = asyncio.create_task(client.call_tool("echo", {"text": "next"}))
@@ -464,6 +558,42 @@ async def test_close_during_a_background_rebuild_is_a_hard_stop() -> None:
         await client.call_tool("echo", {"text": "x"})
 
 
+@pytest.mark.timeout(60)
+async def test_callers_queued_behind_a_failed_reconnect_fail_together(
+    mcp_calls: list[str],
+) -> None:
+    """Review: the peer stopped answering. Callers queued behind the
+    background rebuild used to each dial it again in turn (6 callers →
+    6 x timeout_s, 8 connects); now the rebuild's failure is theirs too."""
+    client = _client(timeout_s=0.5)
+    await client.start()
+    client._breaker = _SpyBreaker()  # type: ignore[assignment]  # isolate from the breaker
+    client.mode = "silent"  # from now on the peer never answers ``initialize``
+    with pytest.raises(mcp_mod.MCPCallTimeoutError):
+        await client.call_tool("gated", {"key": "a"})  # → background rebuild
+
+    results = await asyncio.wait_for(
+        asyncio.gather(
+            *(client.call_tool("echo", {"text": str(i)}) for i in range(6)),
+            return_exceptions=True,
+        ),
+        timeout=10,
+    )
+
+    assert [type(r).__name__ for r in results] == ["MCPCallTimeoutError"] * 6
+    # Exactly one dial (the background rebuild, or a caller that got the lock
+    # before it ran); everyone queued behind it fails with its outcome.
+    assert client.opens == 2
+    assert sum("reconnect failed moments ago" in str(r) for r in results) >= 5
+    assert mcp_calls == ["timeout"] * 7
+
+    client.mode = "serve"  # a later caller tries again and heals
+    result = await asyncio.wait_for(client.call_tool("echo", {"text": "later"}), timeout=5)
+    assert result.content == "later"
+    assert client.opens == 3
+    await client.close()
+
+
 # ---------------------------------------------------------------------------
 # ③ connect / reconnect are bounded by timeout_s
 # ---------------------------------------------------------------------------
@@ -501,3 +631,84 @@ async def test_reconnect_against_a_silent_server_is_bounded_and_retried_later() 
     assert client.opens == 3
     await client.close()
     assert client.opens == client.closes
+
+
+# ---------------------------------------------------------------------------
+# a replaced session is closed without ending it on the server (no DELETE)
+# ---------------------------------------------------------------------------
+
+
+class _FakeHttpTransport:
+    """Stands in for the SDK's ``StreamableHTTPTransport``: records DELETEs."""
+
+    def __init__(self) -> None:
+        self.session_id = f"sess-{len(_HTTP_TRANSPORTS)}"
+        self.deletes = 0
+
+    def get_session_id(self) -> str | None:
+        return self.session_id
+
+    async def terminate_session(self, client: Any) -> None:
+        self.deletes += 1
+
+
+_HTTP_TRANSPORTS: list[_FakeHttpTransport] = []
+
+
+@contextlib.asynccontextmanager
+async def _fake_streamable_http_client(
+    url: str, *, http_client: Any = None, terminate_on_close: bool = True
+) -> AsyncIterator[tuple[Any, Any, Any]]:
+    """The SDK helper's contract over memory streams to an in-process server."""
+    transport = _FakeHttpTransport()
+    _HTTP_TRANSPORTS.append(transport)
+    c2s_send, c2s_recv = anyio.create_memory_object_stream[Any](16)
+    s2c_send, s2c_recv = anyio.create_memory_object_stream[Any](16)
+    low = _fastmcp()._mcp_server
+    task = asyncio.create_task(low.run(c2s_recv, s2c_send, low.create_initialization_options()))
+    _SERVER_TASKS.add(task)
+    task.add_done_callback(_SERVER_TASKS.discard)
+    try:
+        yield s2c_recv, c2s_send, transport.get_session_id
+    finally:
+        if terminate_on_close:
+            await transport.terminate_session(http_client)
+        c2s_send.close()
+        s2c_recv.close()
+
+
+@pytest.mark.timeout(30)
+@pytest.mark.parametrize("replaced_by", ["timeout", "session_terminated"])
+async def test_replaced_session_is_closed_without_ending_it_on_the_server(
+    monkeypatch: pytest.MonkeyPatch, replaced_by: str
+) -> None:
+    """Review: after a timeout the server may still be running that tool; a
+    DELETE on the replaced session could abort it. Only an explicit close ends
+    the server-side session, as before."""
+    import mcp.client.streamable_http as sdk_http
+
+    _HTTP_TRANSPORTS.clear()
+    monkeypatch.setattr(sdk_http, "streamable_http_client", _fake_streamable_http_client)
+    client = mcp_mod.StreamableHttpMCPClient(
+        config=mcp_mod.MCPServerConfig(
+            name="deep-ai-health-mcp",
+            transport="streamable_http",
+            url="http://peer.test/mcp",
+            timeout_s=0.3,
+        )
+    )
+    await client.start()
+    if replaced_by == "timeout":
+        with pytest.raises(mcp_mod.MCPCallTimeoutError):
+            await client.call_tool("gated", {"key": "slow"})
+        assert client._rebuild is not None
+        await asyncio.wait_for(client._rebuild, timeout=5)
+    else:
+        client._session = _ForgetsEcho(client._session)
+        assert (await client.call_tool("echo", {"text": "x"})).content == "x"
+    await asyncio.gather(*client._drain_closes)
+    old, new = _HTTP_TRANSPORTS
+
+    assert old.deletes == 0  # replaced: closed, the server-side session left alone
+    await client.close()
+    assert new.deletes == 1  # an explicit close still ends it
