@@ -12,10 +12,13 @@
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Hashable, Mapping
 from dataclasses import dataclass
 
 from orchestrator.tools.mcp import MCPClient
+
+logger = logging.getLogger("expert_work.control_plane.mcp_kept_clients")
 
 
 @dataclass(frozen=True)
@@ -25,6 +28,17 @@ class KeptClient:
     client: MCPClient
     fingerprint: object
     born_at: float
+
+
+def reusable(name: str, kept: KeptClient | None, fingerprint: object) -> KeptClient | None:
+    """这一项能复用的暂存客户端;``None`` = 新建一个(连接配置变了,或 B-177:它的长连接
+    已知断了 / 可疑 —— 别把它交给新构建)。没复用的暂存客户端照旧在下一次缓存时退役。"""
+    if kept is None or kept.fingerprint != fingerprint:
+        return None
+    if getattr(kept.client, "session_broken", False):
+        logger.warning("mcp_pool.kept_client_broken_not_reused server=%s", name)
+        return None
+    return kept
 
 
 class KeptMcpClients[K: Hashable]:

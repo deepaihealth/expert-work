@@ -15,6 +15,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import time
 from collections.abc import AsyncIterator
 from types import SimpleNamespace
@@ -87,8 +88,7 @@ async def _start_gated_call(client: Any, tool: Any) -> tuple[_GatedSession, asyn
 
 async def _drained(client: _FakeTransportClient) -> None:
     """Wait for the background close of a session parked by ``retire``."""
-    if client._drain_close is not None:
-        await asyncio.gather(client._drain_close)
+    await asyncio.gather(*client._drain_closes)
 
 
 def _live(client: _FakeTransportClient) -> bool:
@@ -380,6 +380,30 @@ async def test_a_kept_client_whose_config_changed_is_not_reused() -> None:
     assert rebuilt.get("other") is not other
     assert rebuilt.get("other").config.url == _NEW_URL  # type: ignore[union-attr]
     assert other._retired and not other._closed  # type: ignore[union-attr]
+
+
+@pytest.mark.asyncio
+async def test_a_kept_client_whose_session_broke_is_not_reused(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """B-177 — ``other``'s long-lived session is known dead (a reconnect after
+    its transport died failed and left no live session): the next build gets
+    a fresh client, and the broken one is retired for the runs still on it."""
+    svc, _store, _ids = await _platform()
+    pool = await svc.get_or_build()
+    other = pool.get("other")
+    other._stack = None  # type: ignore[union-attr]
+    assert other.session_broken  # type: ignore[union-attr]
+
+    await svc.server_changed("deep")
+    with caplog.at_level(logging.WARNING):
+        rebuilt = await svc.get_or_build()
+
+    assert rebuilt.get("other") is not other
+    assert other._retired and not other._closed  # type: ignore[union-attr]
+    assert [r.getMessage() for r in caplog.records if "kept_client_broken" in r.getMessage()] == [
+        "mcp_pool.kept_client_broken_not_reused server=other"
+    ]
 
 
 @pytest.mark.asyncio
@@ -705,3 +729,17 @@ async def test_tenant_reuse_does_not_stretch_the_ttl_backstop() -> None:
 
     assert third is not second
     assert linear._retired  # type: ignore[union-attr]
+
+
+@pytest.mark.asyncio
+async def test_tenant_kept_client_whose_session_broke_is_not_reused() -> None:
+    """B-177 — same rule for the tenant pool."""
+    svc, tid = await _tenant_pool({"t": 0.0})
+    linear = (await svc.get_or_build(tid)).get("linear")
+    linear._stack = None  # type: ignore[union-attr]
+
+    await svc.server_changed(tid, "github")
+    rebuilt = await svc.get_or_build(tid)
+
+    assert rebuilt.get("linear") is not linear
+    assert linear._retired and not linear._closed  # type: ignore[union-attr]
