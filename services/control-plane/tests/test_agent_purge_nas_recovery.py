@@ -198,6 +198,29 @@ def test_entries_vanishing_mid_delete_still_end_removed(
     assert not os.path.lexists(base)
 
 
+def test_a_vanished_child_does_not_abort_the_delete_pass(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """ENOENT on a child is tolerated inside one pass (not only by the retry)."""
+    base = tmp_path / "k-1"
+    for d in ("a", "b"):
+        (base / d).mkdir(parents=True)
+        (base / d / "f.txt").write_text("x")
+    real_unlink = os.unlink
+
+    def _already_gone(name: Any, *args: Any, **kwargs: Any) -> None:
+        real_unlink(name, *args, **kwargs)
+        real_unlink(name, *args, **kwargs)  # the second call is what a racing deleter causes
+
+    monkeypatch.setattr(os, "unlink", _already_gone)
+    fd = os.open(tmp_path, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        safe_remove._flatten_remove(fd, "k-1")  # must not raise
+    finally:
+        os.close(fd)
+    assert not os.path.lexists(base)
+
+
 def test_a_very_deep_tree_is_removed_without_recursion(tmp_path: Path) -> None:
     tenant, user = uuid4(), uuid4()
     agents = tmp_path / str(tenant) / str(user) / "agents"
@@ -328,4 +351,24 @@ def test_owner_bits_never_reach_through_a_swapped_in_symlink(tmp_path: Path) -> 
         os.close(fd)
     mode = stat.S_IMODE(os.lstat(target).st_mode)
     target.chmod(0o700)
+    assert mode == 0o500
+
+
+def test_owner_bits_never_land_on_a_swapped_in_directory(tmp_path: Path) -> None:
+    """lstat saw one directory, then another one was renamed into its place."""
+    (tmp_path / "seen").mkdir()
+    (tmp_path / "seen").chmod(0o500)  # lacks owner write: add_owner_bits would act on it
+    seen = os.lstat(tmp_path / "seen")
+    (tmp_path / "seen").rename(tmp_path / "moved-away")
+    other = tmp_path / "seen"
+    other.mkdir()
+    other.chmod(0o500)
+    fd = os.open(tmp_path, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        changed = safe_remove.add_owner_bits(fd, "seen", seen)
+    finally:
+        os.close(fd)
+    mode = stat.S_IMODE(os.lstat(other).st_mode)
+    other.chmod(0o700)
+    assert not changed
     assert mode == 0o500

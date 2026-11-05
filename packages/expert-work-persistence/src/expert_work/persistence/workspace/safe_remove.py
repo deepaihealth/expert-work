@@ -75,9 +75,18 @@ def add_owner_bits(dfd: int, name: str, expected: os.stat_result) -> bool:
             return False
         finally:
             os.close(pfd)
+    # Non-Linux (macOS test hosts): no ``O_PATH``. Re-check identity, then change the
+    # entry itself without following a link (``AT_SYMLINK_NOFOLLOW``). Production
+    # (Linux) always takes the ``O_PATH`` path above.
     if os.chmod not in os.supports_follow_symlinks:  # pragma: no cover - not Linux, not macOS
         return False
     try:
+        now = os.lstat(name, dir_fd=dfd)
+        if not stat.S_ISDIR(now.st_mode) or (now.st_dev, now.st_ino) != (
+            expected.st_dev,
+            expected.st_ino,
+        ):
+            return False
         os.chmod(name, mode | 0o700, dir_fd=dfd, follow_symlinks=False)
     except OSError:
         return False
