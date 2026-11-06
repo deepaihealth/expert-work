@@ -313,6 +313,61 @@ def remove_entry(
         os.close(fd)
 
 
+def quarantine_entry(
+    root: str, parts: list[str], name: str, *, tenant_id: UUID, owner_id: UUID
+) -> tuple[str, str | None]:
+    """B-282 —— 把 ``{root}/{parts…}/{name}`` 整个**改名**挪进隔离区(一次 ``rename``,不删)。
+
+    返回 ``(结果, 隔离区里的新名字)``:挪走了是 ``(QUARANTINED, 新名字)``;不在是
+    ``(ABSENT, None)``;路径中途有符号链接是 ``(SKIPPED_SYMLINK, None)``。挪不动抛
+    :class:`NasEntryStuckError`。之后按原路径再写的东西落进一个新目录,不会被删;挪走的那棵树
+    由 :func:`sweep_quarantine` 满 7 天删掉,在那之前可以用 :func:`restore_quarantined` 挪回。"""
+    fd, outcome = _open_dir_chain(root, parts)
+    if fd is None:
+        return outcome, None
+    try:
+        try:
+            os.lstat(name, dir_fd=fd)
+        except FileNotFoundError:
+            return ABSENT, None
+        try:
+            parked = _quarantine(root, tenant_id, owner_id, fd, name)
+        except OSError as exc:
+            raise NasEntryStuckError(
+                exc.errno or errno.EIO, f"cannot quarantine: {type(exc).__name__}"
+            ) from exc
+        return QUARANTINED, parked
+    finally:
+        os.close(fd)
+
+
+def restore_quarantined(
+    root: str, parts: list[str], name: str, *, tenant_id: UUID, owner_id: UUID, parked: str
+) -> bool:
+    """把 :func:`quarantine_entry` 挪走的 ``parked`` 挪回 ``{parts…}/{name}``。原名已经又有东西了
+    (比如别人按原路径新建了目录)就不挪、回 ``False``:不覆盖。"""
+    fd, _outcome = _open_dir_chain(root, parts)
+    if fd is None:
+        return False
+    try:
+        try:
+            os.lstat(name, dir_fd=fd)
+        except FileNotFoundError:
+            pass
+        else:
+            return False
+        owner, _ = _open_dir_chain(root, [str(tenant_id), PURGED_AGENTS_DIR, str(owner_id)])
+        if owner is None:
+            return False
+        try:
+            os.rename(parked, name, src_dir_fd=owner, dst_dir_fd=fd)
+        finally:
+            os.close(owner)
+        return True
+    finally:
+        os.close(fd)
+
+
 def _parked_at(name: str) -> int | None:
     """``{原名}-{秒}-{8 位 hex}`` 里的秒;形状不对 → ``None``(不认识的不删)。"""
     head, _, rand = name.rpartition("-")
@@ -437,7 +492,9 @@ __all__ = [
     "UNLINKED",
     "NasEntryStuckError",
     "add_owner_bits",
+    "quarantine_entry",
     "remove_entry",
     "remove_tree_at",
+    "restore_quarantined",
     "sweep_quarantine",
 ]

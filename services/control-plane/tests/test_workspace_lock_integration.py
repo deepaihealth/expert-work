@@ -224,6 +224,32 @@ async def test_conversation_seed_lock_serialises_one_conversation_only(
     assert order[:2] in (["A-enter", "C-enter"], ["C-enter", "A-enter"])
 
 
+async def test_landings_share_the_conversation_lock_but_exclude_its_exclusive_holder(
+    engine: AsyncEngine,
+) -> None:
+    """B-282 —— 两份上传落盘(共享)同时进行;排他的持有者(开场复制 / 留存作业清目录)与落盘
+    互相等。"""
+    lock = PgConversationSeedLock(create_async_session_factory(engine))
+    key = f"{uuid4()}:{uuid4()}"
+    order: list[str] = []
+
+    async def landing(name: str) -> None:
+        async with lock.acquire_shared(key=key):
+            order.append(f"{name}-enter")
+            await asyncio.sleep(_HOLD_S)
+            order.append(f"{name}-exit")
+
+    async def exclusive() -> None:
+        await asyncio.sleep(_HOLD_S / 4)
+        async with lock.acquire(key=key):
+            order.append("X-enter")
+            order.append("X-exit")
+
+    await asyncio.gather(landing("A"), landing("B"), exclusive())
+    assert sorted(order[:2]) == ["A-enter", "B-enter"]  # shared holders overlap
+    assert order[-2:] == ["X-enter", "X-exit"]  # the exclusive one waited for both
+
+
 async def test_conversation_seed_lock_does_not_hold_the_users_write_lock(
     engine: AsyncEngine,
 ) -> None:

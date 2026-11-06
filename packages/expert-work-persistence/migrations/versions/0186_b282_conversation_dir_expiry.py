@@ -8,8 +8,12 @@
   conversation's work directory. A later run makes the conversation eligible
   again; until then the job skips it (so the nightly batch is not eaten by
   conversations it already cleaned).
+* ``thread_meta.workspace_clean_attempted_at`` — when the job last listed the
+  conversation but did not clean it (activity found under the lock, a failure, an
+  artifact still reading from it). The next batch puts such conversations after
+  the ones never tried, so the same un-cleanable ones cannot fill every batch.
 
-**Expand-only.** Both columns are nullable with no default and no backfill; old
+**Expand-only.** All three columns are nullable with no default and no backfill; old
 code never names them. An image rollback needs no downgrade (the downgrade
 drops them).
 
@@ -43,9 +47,14 @@ def upgrade() -> None:
     op.add_column(
         "thread_meta", sa.Column("workspace_cleaned_at", sa.DateTime(timezone=True), nullable=True)
     )
+    op.add_column(
+        "thread_meta",
+        sa.Column("workspace_clean_attempted_at", sa.DateTime(timezone=True), nullable=True),
+    )
 
 
 def downgrade() -> None:
+    op.drop_column("thread_meta", "workspace_clean_attempted_at")
     op.drop_column("thread_meta", "workspace_cleaned_at")
     op.drop_constraint(_CONSTRAINT, "tenant_config", type_="check")
     op.drop_column("tenant_config", _COLUMN)

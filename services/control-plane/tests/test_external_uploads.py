@@ -15,6 +15,7 @@ plane's ``{success, data, error}`` envelope (not FastAPI's bare ``detail``).
 from __future__ import annotations
 
 import base64
+import dataclasses
 import hashlib
 import re
 from collections.abc import AsyncIterator
@@ -1420,3 +1421,81 @@ async def test_a_failing_image_touch_does_not_fail_the_download(
     assert resp.status_code == 200, resp.text
     assert resp.headers["content-type"] == "image/png"
     assert "image.touch_failed" in caplog.text
+
+
+# ---------------------------------------------------------------------------
+# B-282 —— 上传落盘(含跨会话复制附件)持着这段会话落盘锁的共享形式,留存作业清闲置会话目录
+# 时拿排他的那种:落盘要么整个在清理再查之前(审计已写),要么在目录挪走之后。
+# ---------------------------------------------------------------------------
+
+
+class _RecordingLandingLock:
+    def __init__(self) -> None:
+        self.held: str | None = None
+        self.keys: list[str] = []
+
+    def acquire_shared(self, *, key: str) -> Any:
+        from contextlib import asynccontextmanager
+
+        @asynccontextmanager
+        async def _cm() -> AsyncIterator[None]:
+            self.keys.append(key)
+            self.held = key
+            try:
+                yield
+            finally:
+                self.held = None
+
+        return _cm()
+
+
+@pytest.mark.asyncio
+async def test_landing_a_document_holds_the_conversations_landing_lock(
+    ctx: _Ctx, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from control_plane.api import uploads as uploads_module
+
+    await ctx.seed_agent()
+    lock = _RecordingLandingLock()
+    ctx.app.state.conversation_landing_lock = lock
+    seen: list[tuple[str, str | None]] = []
+    real_land = uploads_module._land_document_bytes
+    real_emit = uploads_module.audit_emit
+
+    async def _land(*args: Any, **kwargs: Any) -> Any:
+        seen.append(("write", lock.held))
+        return await real_land(*args, **kwargs)
+
+    async def _emit(*args: Any, **kwargs: Any) -> Any:
+        seen.append(("audit", lock.held))
+        return await real_emit(*args, **kwargs)
+
+    monkeypatch.setattr(uploads_module, "_land_document_bytes", _land)
+    monkeypatch.setattr(uploads_module, "audit_emit", _emit)
+
+    a = await _upload_document(ctx, b"%PDF-1.4 A")
+    b = await _upload_document(ctx, b"%PDF-1.4 B")
+    copier = dataclasses.replace(_copier(ctx), landing_lock=lock)
+    from control_plane.api.agents import ExternalFileRef, resolve_external_files
+
+    row = await _upload_row(ctx, a)
+    await resolve_external_files(
+        files=[ExternalFileRef(upload_id=a["upload_id"])],
+        tenant_id=ctx.tenant_id,
+        end_user_id=row.user_id,
+        thread_id=UUID(b["session_id"]),
+        uploads_store=ctx.app.state.user_upload_store,
+        threads=ctx.app.state.thread_meta_repo,
+        copier=copier,
+    )
+
+    expected = [f"{ctx.tenant_id}:{a['session_id']}", f"{ctx.tenant_id}:{b['session_id']}"]
+    assert lock.keys == [*expected, expected[1]]  # two uploads, then the copy into B
+    assert seen == [
+        ("write", expected[0]),
+        ("audit", expected[0]),
+        ("write", expected[1]),
+        ("audit", expected[1]),
+        ("write", expected[1]),
+        ("audit", expected[1]),
+    ]

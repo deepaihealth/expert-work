@@ -389,14 +389,14 @@ async def test_a_failure_is_isolated_counted_and_needs_attention(
         stuck_dir = world.place(stuck)
         fine = await world.conversation(age_days=200)
         fine_dir = world.place(fine)
-        real = conversation_dirs.remove_entry
+        real = conversation_dirs.quarantine_entry
 
-        def _remove(root: str, parts: list[str], name: str, **kwargs: object) -> str:
+        def _park(root: str, parts: list[str], name: str, **kwargs: object) -> object:
             if name == str(stuck):
-                raise NasEntryStuckError(13, "cannot remove or quarantine")
+                raise NasEntryStuckError(13, "cannot quarantine")
             return real(root, parts, name, **kwargs)  # type: ignore[arg-type]
 
-        monkeypatch.setattr(conversation_dirs, "remove_entry", _remove)
+        monkeypatch.setattr(conversation_dirs, "quarantine_entry", _park)
 
         report = await world.job().run_once()
 
@@ -859,20 +859,24 @@ async def test_a_run_created_while_deleting_is_counted_and_not_stamped(
 
     try:
         conv = await world.conversation(age_days=200)
-        world.place(conv)
-        real = conversation_dirs._remove_files
+        conv_dir = world.place(conv)
+        real = conversation_dirs._park
 
-        def _remove(*args: object, **kwargs: object) -> object:
+        def _park(*args: object, **kwargs: object) -> object:
             out = real(*args, **kwargs)  # type: ignore[arg-type]
+            assert not conv_dir.exists()  # moved away ...
             world.run(conv, age_days=0, status="queued")
             return out
 
-        monkeypatch.setattr(conversation_dirs, "_remove_files", _remove)
+        monkeypatch.setattr(conversation_dirs, "_park", _park)
 
         report = await world.job().run_once()
 
         assert report.conversation_dirs_raced == 1
         assert world.cleaned_at(conv) is None
+        # ... and put back: the run that started meanwhile finds its directory where it was.
+        assert (conv_dir / "work" / "report" / "draft.md").read_text() == "draft"
+        assert _quarantined(world) == []
     finally:
         await world.engine.dispose()
 
@@ -981,6 +985,207 @@ async def test_an_upload_landing_after_listing_keeps_the_dir(
         monkeypatch.setattr(conversation_dirs, "list_idle_conversations", _list)
 
         report = await world.job().run_once()
+
+        assert conv_dir.exists()
+        assert report.conversation_dirs_skipped_active == 1
+    finally:
+        await world.engine.dispose()
+
+
+def _quarantined(world: _World, tenant: UUID | None = None) -> list[str]:
+    """``{tenant}/.purged-agents/{user}/`` 里挪进来的条目名。"""
+    holding = world.root / str(tenant or world.tenant) / ".purged-agents" / str(world.user)
+    return sorted(p.name for p in holding.iterdir()) if holding.is_dir() else []
+
+
+@pytest.mark.asyncio
+async def test_the_directory_is_moved_to_quarantine_and_later_writes_survive(
+    world: _World,
+) -> None:
+    """M1 —— 持锁只做改名:目录整个挪进沙箱挂不到的隔离区(满 7 天由隔离区那一条删,在那之前能
+    挪回),之后按原路径写的东西落进新目录,不会被这一轮删掉。"""
+    try:
+        conv = await world.conversation(age_days=200)
+        run = world.run(conv, age_days=120)
+        world.tool_results(run)
+        conv_dir = world.place(conv)
+
+        report = await world.job().run_once()
+
+        assert not conv_dir.exists()
+        parked = _quarantined(world)
+        assert len(parked) == 2
+        assert any(p.startswith(f"{conv}-") for p in parked)
+        assert any(p.startswith(f"{run}-") for p in parked)
+        moved = next(
+            world.root / str(world.tenant) / ".purged-agents" / str(world.user) / p
+            for p in parked
+            if p.startswith(str(conv))
+        )
+        assert (moved / "work" / "report" / "draft.md").read_text() == "draft"
+        assert (report.conversation_dirs_removed, report.conversation_tool_results_removed) == (
+            1,
+            1,
+        )
+
+        (conv_dir / "work").mkdir(parents=True)
+        (conv_dir / "work" / "late.md").write_text("late")
+        await world.job().run_once()
+        assert (conv_dir / "work" / "late.md").read_text() == "late"
+    finally:
+        await world.engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_an_upload_landing_holds_the_lock_the_sweep_waits_for(world: _World) -> None:
+    """M1 —— 上传落盘拿同一把锁的共享形式;落盘进行中,清理在锁外等着。"""
+    import asyncio
+
+    import psycopg
+
+    try:
+        conv = await world.conversation(age_days=200)
+        conv_dir = world.place(conv)
+        dsn = world.admin_dsn.replace("postgresql+psycopg://", "postgresql://", 1)
+        with psycopg.connect(dsn) as holder:
+            holder.execute(
+                "SELECT pg_advisory_xact_lock_shared(%s, hashtext(%s))",
+                (8624, f"{world.tenant}:{conv}"),
+            )
+            with pytest.raises(TimeoutError):
+                await asyncio.wait_for(world.job().run_once(), timeout=3)
+            assert conv_dir.exists()
+            holder.rollback()
+
+        await world.job().run_once()
+        assert not conv_dir.exists()
+    finally:
+        await world.engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_a_live_upload_row_keeps_the_dir_until_the_upload_itself_expires(
+    world: _World,
+) -> None:
+    """M2 —— 租户上传保留 365 天、会话目录 90 天:登记行还活着(下载读的就是这段会话
+    ``work/uploads/`` 里的文件),目录不清;B-63 让登记行到期(标 ``deleted_at``)之后才清。"""
+    try:
+        world.sql(
+            "INSERT INTO tenant_config (tenant_id, display_name, updated_by, "
+            " upload_retention_days) VALUES (:t, 't', 'test', 365)",
+            t=world.tenant,
+        )
+        conv = await world.conversation(age_days=200)
+        world.run(conv, age_days=200)
+        conv_dir = world.place(conv)
+        _upload(world, conv, created_days=200, used_days=200)
+
+        first = await world.job().run_once()
+
+        assert conv_dir.exists()
+        assert first.conversation_dirs_removed == 0
+        assert first.conversation_dirs_skipped_active == 0  # not even listed
+
+        world.sql("UPDATE user_upload SET deleted_at = now() WHERE thread_id = :t", t=conv)
+        await world.job().run_once()
+
+        assert not conv_dir.exists()
+    finally:
+        await world.engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_a_soft_deleted_tenant_user_does_not_take_a_batch_slot(world: _World) -> None:
+    """M4 —— 已软删的用户(``tenant_user.deleted_at``)在查询里就排除,永远不占批。"""
+    try:
+        gone = await world.conversation(age_days=300)
+        gone_dir = world.place(gone)
+        world.sql(
+            "INSERT INTO tenant_user (id, tenant_id, subject_type, subject_id, deleted_at) "
+            "VALUES (:u, :t, 'user', 'gone', now())",
+            u=world.user,
+            t=world.tenant,
+        )
+        other_user = uuid4()
+        live = await world.conversation(age_days=200)
+        world.sql("UPDATE thread_meta SET user_id = :u WHERE thread_id = :t", u=other_user, t=live)
+        live_dir = world.root / str(world.tenant) / str(other_user) / "agents" / _KEY / "threads"
+        (live_dir / str(live) / "work").mkdir(parents=True)
+
+        report = await world.job(conversation_workspace_batch_size=1).run_once()
+
+        assert gone_dir.exists()
+        assert not (live_dir / str(live)).exists()
+        assert report.conversation_dirs_removed == 1
+        assert report.conversation_dirs_skipped_owner_deleted == 0
+    finally:
+        await world.engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_a_conversation_that_cannot_be_cleaned_goes_to_the_back_of_the_queue(
+    world: _World, caplog: pytest.LogCaptureFixture
+) -> None:
+    """M4 —— 列到了却清不了(这里:审计里有近期上传)的会话记一笔尝试时间,下一轮排到没试过的
+    后面;整批大半没清时打 warning。"""
+    from expert_work.persistence import SqlAuditLogStore
+
+    try:
+        stuck = await world.conversation(age_days=300)
+        world.run(stuck, age_days=250)
+        stuck_dir = world.place(stuck)
+        await _upload_audit(world, stuck, age_days=5)
+        later = await world.conversation(age_days=200)
+        later_dir = world.place(later)
+        job_kwargs: dict[str, object] = {
+            "audit_log_store": SqlAuditLogStore(world.sf),
+            "conversation_workspace_batch_size": 1,
+        }
+
+        with caplog.at_level("WARNING"):
+            first = await world.job(**job_kwargs).run_once()
+
+        assert (first.conversation_dirs_skipped_active, first.conversation_dirs_removed) == (1, 0)
+        assert later_dir.exists()
+        assert world.sql(
+            "SELECT workspace_clean_attempted_at IS NOT NULL, workspace_cleaned_at IS NULL "
+            "FROM thread_meta WHERE thread_id = :t",
+            t=stuck,
+        ) == [(True, True)]
+        assert "retention.conversation_dirs_mostly_skipped skipped=1 batch=1" in caplog.text
+
+        second = await world.job(**job_kwargs).run_once()
+
+        assert second.conversation_dirs_removed == 1
+        assert not later_dir.exists() and stuck_dir.exists()
+    finally:
+        await world.engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_an_audited_upload_after_the_pass_started_keeps_the_dir(
+    world: _World, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """L3 —— 持锁再查看审计看到「现在」,不是这一轮开始的时刻:开跑之后才落的上传也算。
+    (这一轮的「开始」拨早一小时,上传审计记在真实的现在。)"""
+    from datetime import timedelta
+
+    from expert_work.persistence import SqlAuditLogStore
+    from retention_cleanup_job import conversation_dirs
+
+    try:
+        conv = await world.conversation(age_days=200)
+        world.run(conv, age_days=100)
+        conv_dir = world.place(conv)
+        await _upload_audit(world, conv, age_days=0)
+        real = conversation_dirs.ConversationDirSweep.run
+
+        async def _run(self: object, *, now: object) -> object:
+            return await real(self, now=now - timedelta(hours=1))  # type: ignore[arg-type, operator]
+
+        monkeypatch.setattr(conversation_dirs.ConversationDirSweep, "run", _run)
+
+        report = await world.job(audit_log_store=SqlAuditLogStore(world.sf)).run_once()
 
         assert conv_dir.exists()
         assert report.conversation_dirs_skipped_active == 1

@@ -46,6 +46,11 @@ class ThreadMetaRow(Base):
     workspace_cleaned_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
+    #: B-282 —— 留存作业上一次列到这段会话却没清(再查有活动、删失败……)的时间。下一轮按它把
+    #: 清不了的会话排到后面。只有留存作业写它。
+    workspace_clean_attempted_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         nullable=False,

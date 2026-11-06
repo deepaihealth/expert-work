@@ -29,6 +29,7 @@ _BEFORE = "0185_b283_image_last_used"
 _COLUMNS = (
     ("tenant_config", "conversation_workspace_retention_days"),
     ("thread_meta", "workspace_cleaned_at"),
+    ("thread_meta", "workspace_clean_attempted_at"),
 )
 
 
