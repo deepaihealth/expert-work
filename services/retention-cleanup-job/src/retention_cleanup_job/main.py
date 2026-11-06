@@ -160,6 +160,10 @@ def log_done(report: CleanupReport) -> None:
         "uploads_expired=%d upload_files_removed=%d upload_files_unsafe=%d "
         "upload_rows_failed=%d upload_rows_abandoned=%d upload_rows_held=%d "
         "upload_owners_unavailable=%d upload_rows_failing_overdue=%d "
+        "conversation_dirs_removed=%d conversation_tool_results_removed=%d "
+        "conversation_dirs_skipped_active=%d conversation_dirs_skipped_artifact=%d "
+        "conversation_dirs_skipped_unsafe=%d conversation_dirs_skipped_owner_deleted=%d "
+        "conversation_dirs_failed=%d "
         "thread_dirs_removed=%d "
         "memory_hard_deleted=%d workspaces_hard_deleted=%d "
         "workspaces_pending_archive=%d tenant_users_hard_deleted=%d "
@@ -194,6 +198,13 @@ def log_done(report: CleanupReport) -> None:
         report.upload_rows_held,
         report.upload_owners_unavailable,
         report.upload_rows_failing_overdue,
+        report.conversation_dirs_removed,
+        report.conversation_tool_results_removed,
+        report.conversation_dirs_skipped_active,
+        report.conversation_dirs_skipped_artifact,
+        report.conversation_dirs_skipped_unsafe,
+        report.conversation_dirs_skipped_owner_deleted,
+        report.conversation_dirs_failed,
         report.thread_dirs_removed,
         report.memory_hard_deleted,
         report.workspaces_hard_deleted,
@@ -306,6 +317,8 @@ async def _amain() -> int:
             knowledge_retrieval_log_retention_days=settings.knowledge_retrieval_log_retention_days,
             user_upload_store=user_upload_store,
             upload_retention_days=settings.upload_retention_days,
+            conversation_workspace_retention_days=(settings.conversation_workspace_retention_days),
+            conversation_workspace_batch_size=settings.conversation_workspace_batch_size,
             thread_store=thread_store,
             run_store=run_store,
             workspace_root=workspace_root,

@@ -2416,6 +2416,7 @@ const zhCN: TranslationKeys = {
     event_log_retention_days: "事件日志保留（天）",
     upload_retention_days: "附件保留（天，从最后一次使用算起）",
     artifact_retention_days: "产物保留（天，从最后一次使用算起）",
+    conversation_workspace_retention_days: "对话工作目录保留（天，从最后一次对话算起）",
     file_retention_default: "平台默认",
     retention_decrease_title: "确认改小保留期",
     retention_decrease_body: "{{changes}}。改小后最早今晚就会清理更多文件，且不可恢复。",

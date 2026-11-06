@@ -267,6 +267,39 @@ describe("SettingsTenantConfig", () => {
       expect(puts[0].params).toBeUndefined();
       expect(screen.queryByText(/改小后最早今晚|irreversible/)).toBeNull();
     });
+
+    it("asks before lowering the conversation work directory days too (B-282)", async () => {
+      const puts: { params: unknown; body: unknown }[] = [];
+      installCapturingAdapter(puts);
+
+      const user = await editAndSave('{"conversation_workspace_retention_days":30}');
+
+      expect(
+        await screen.findByText(/对话工作目录保留|Conversation work directory retention/),
+      ).toBeInTheDocument();
+      expect(puts).toHaveLength(0);
+      await user.click(screen.getByRole("button", { name: /确认改小|Lower it/ }));
+      await waitFor(() => expect(puts).toHaveLength(1));
+      expect(puts[0].params).toEqual({ confirm_retention_decrease: true });
+    });
+  });
+
+  it("shows the conversation work directory days or the platform default (B-282)", async () => {
+    installAdapter([
+      {
+        match: (u) => u.endsWith("/config"),
+        respond: () => ({
+          success: true,
+          data: { ...configRow, conversation_workspace_retention_days: 180 },
+          error: null,
+        }),
+      },
+    ]);
+    renderConfig();
+    await waitFor(() => expect(screen.getByText("Acme")).toBeInTheDocument());
+    expect(
+      screen.getByTestId("tenant-config-conversation-workspace-retention-days"),
+    ).toHaveTextContent("180");
   });
 
   it("Edit button reveals the JSON editor + dirty detection", async () => {

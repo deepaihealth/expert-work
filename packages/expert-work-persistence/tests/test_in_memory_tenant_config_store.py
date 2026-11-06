@@ -339,3 +339,42 @@ async def test_an_unconfirmed_decrease_is_rejected_inside_the_store() -> None:
         tenant_id=tid, patch=TenantConfigPatch(artifact_retention_days=30), actor_id="ops"
     )
     assert lowered.artifact_retention_days == 30
+
+
+@pytest.mark.asyncio
+async def test_conversation_workspace_retention_days_set_keep_reset_and_confirm() -> None:
+    """B-282 —— 对话工作目录保留期与附件 / 产物同一套:默认 ``None``;不带键不动;显式 ``null``
+    改回平台默认;没确认的改小在存储层就拒。"""
+    from expert_work.persistence.tenant_config.base import RetentionDecreaseNotConfirmedError
+
+    store = InMemoryTenantConfigStore()
+    tid = uuid4()
+    created = await store.create(tenant_id=tid, display_name="Acme", actor_id="sys")
+    assert created.conversation_workspace_retention_days is None
+
+    set_ = await store.upsert(
+        tenant_id=tid,
+        patch=TenantConfigPatch(conversation_workspace_retention_days=180),
+        actor_id="ops",
+    )
+    assert set_.conversation_workspace_retention_days == 180
+    kept = await store.upsert(
+        tenant_id=tid, patch=TenantConfigPatch(display_name="Acme 2"), actor_id="ops"
+    )
+    assert kept.conversation_workspace_retention_days == 180
+    with pytest.raises(RetentionDecreaseNotConfirmedError) as caught:
+        await store.upsert(
+            tenant_id=tid,
+            patch=TenantConfigPatch(conversation_workspace_retention_days=30),
+            actor_id="ops",
+            reject_unconfirmed_decrease=True,
+        )
+    assert caught.value.decreases == [
+        {"field": "conversation_workspace_retention_days", "from": 180, "to": 30}
+    ]
+    reset = await store.upsert(
+        tenant_id=tid,
+        patch=TenantConfigPatch(conversation_workspace_retention_days=None),
+        actor_id="ops",
+    )
+    assert reset.conversation_workspace_retention_days is None

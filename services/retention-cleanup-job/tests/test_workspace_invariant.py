@@ -44,6 +44,7 @@ from expert_work.runtime.audit import (
     DefaultSecretRedactor,
     InMemoryAuditFallbackQueue,
 )
+from retention_cleanup_job.conversation_dirs import ConversationDirTally
 from retention_cleanup_job.job import RetentionCleanupJob
 from retention_cleanup_job.workspace_files import deleted_marker
 
@@ -74,6 +75,12 @@ def _stub_sql_passes(job: RetentionCleanupJob) -> None:
     job._delete_finished_knowledge_tasks = _zero  # type: ignore[method-assign]
     job._delete_orphaned_knowledge_revisions = _zero  # type: ignore[method-assign]
     job._delete_expired_jwt_blacklist = _zero  # type: ignore[method-assign]
+
+    async def _conversations() -> ConversationDirTally:
+        # B-282 —— 闲置会话目录这条 pass 选会话靠 Postgres(``test_conversation_dirs.py`` 管它)。
+        return ConversationDirTally()
+
+    job._sweep_conversation_dirs = _conversations  # type: ignore[method-assign]
 
 
 def _write(root: Path, tenant: UUID, user: UUID, rel: str) -> Path:

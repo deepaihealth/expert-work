@@ -37,6 +37,7 @@ from retention_cleanup_job import job as job_module
 from retention_cleanup_job import main as main_module
 from retention_cleanup_job import uploads as uploads_module
 from retention_cleanup_job import workspace_files
+from retention_cleanup_job.conversation_dirs import ConversationDirTally
 from retention_cleanup_job.job import RetentionCleanupJob
 from retention_cleanup_job.main import EXIT_PASS_FAILED, exit_code
 from retention_cleanup_job.uploads import UploadSweepTally
@@ -776,6 +777,12 @@ def _stub_sql_passes(job: RetentionCleanupJob) -> None:
     job._delete_finished_knowledge_tasks = _zero  # type: ignore[method-assign]
     job._delete_orphaned_knowledge_revisions = _zero  # type: ignore[method-assign]
     job._delete_expired_jwt_blacklist = _jwt  # type: ignore[method-assign]
+
+    async def _conversations() -> ConversationDirTally:
+        # B-282 —— 闲置会话目录这条 pass 选会话靠 Postgres(``test_conversation_dirs.py`` 管它)。
+        return ConversationDirTally()
+
+    job._sweep_conversation_dirs = _conversations  # type: ignore[method-assign]
 
 
 @pytest.mark.asyncio

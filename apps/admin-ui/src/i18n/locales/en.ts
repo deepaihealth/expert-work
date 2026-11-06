@@ -2297,6 +2297,8 @@ export interface TranslationKeys {
     // B-63 — upload / artifact retention, counted from last use.
     upload_retention_days: string;
     artifact_retention_days: string;
+    // B-282 — conversation work directories, counted from the last run.
+    conversation_workspace_retention_days: string;
     file_retention_default: string;
     retention_decrease_title: string;
     retention_decrease_body: string;
@@ -6291,6 +6293,8 @@ const en: TranslationKeys = {
     event_log_retention_days: "Event log retention (days)",
     upload_retention_days: "Upload retention (days since last use)",
     artifact_retention_days: "Artifact retention (days since last use)",
+    conversation_workspace_retention_days:
+      "Conversation work directory retention (days since the last run)",
     file_retention_default: "Platform default",
     retention_decrease_title: "Lower the retention period?",
     retention_decrease_body:

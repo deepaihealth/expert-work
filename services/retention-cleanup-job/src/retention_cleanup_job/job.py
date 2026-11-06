@@ -28,14 +28,19 @@ NOLOGIN BYPASSRLS with the minimum delete grants).
   run 最晚的那个)满租户保留期(默认 90 天):按会话当前的 agent / 布局
   删 ``[agents/<key>/][threads/<会话>/work/]uploads/<file>``(B-271)+ 标 ``deleted_at``。
 * B-27 ``_sweep_orphan_thread_dirs`` —— ``threads/<thread_id>/`` 的 thread 行不存在
-  → 删目录。**不按时间删活会话的目录**。
+  → 删目录。**不按时间删活会话的目录** —— 活会话按**闲置**清是下面那一条。
+* B-282 ``_sweep_conversation_dirs`` —— 会话最后一次 run 之后满租户保留期(默认 90 天)、
+  没有未结束的 run:删对话视图会话的 ``threads/<会话>/`` 与各 run 的 ``.tool_results/<run>/``,
+  库里的行不动(:mod:`retention_cleanup_job.conversation_dirs`)。
 * X-4 ② ``_sweep_workspaces`` —— 软删且已归档满 90 天的 ``user_workspace`` 行连
   从属行硬删;OSS 归档对象**不主动删**(桶生命周期到期)。
 
 不变式(``tests/test_workspace_invariant.py``):对活着的工作区,job 只删 (a) 登记
-过的产物文件 (b) ``uploads/`` 下登记过的文件 (c) 孤儿 ``threads/<id>/``;根目录
-其它任何文件/目录(``style/``、MEMORY.md、未登记文件)永不触碰。碰文件的入口
-只有 :mod:`retention_cleanup_job.workspace_files` 那两个函数。
+过的产物文件 (b) ``uploads/`` 下登记过的文件 (c) 孤儿 ``threads/<id>/`` (d) B-282 闲置满保留期
+的会话自己的 ``threads/<会话>/`` 与它的 run 的 ``.tool_results/<run>/``;agent 根其它任何
+文件/目录(``style/``、MEMORY.md、未登记文件)永不触碰。(d) 走
+:func:`expert_work.persistence.workspace.safe_remove.remove_entry`,其余入口在
+:mod:`retention_cleanup_job.workspace_files`。
 """
 
 from __future__ import annotations
@@ -76,6 +81,10 @@ from retention_cleanup_job.artifact_copies import (
     remove_user_agent_file_versions,
     remove_user_copies,
     sweep_orphan_copies,
+)
+from retention_cleanup_job.conversation_dirs import (
+    ConversationDirSweep,
+    ConversationDirTally,
 )
 from retention_cleanup_job.knowledge_revisions import delete_orphaned_revisions
 from retention_cleanup_job.orphan_threads import (
@@ -164,6 +173,8 @@ class RetentionCleanupJob:
         knowledge_retrieval_log_retention_days: int = 30,
         user_upload_store: UserUploadStore | None = None,
         upload_retention_days: int = 90,
+        conversation_workspace_retention_days: int = 90,
+        conversation_workspace_batch_size: int = 500,
         thread_store: ThreadMetaStore | None = None,
         run_store: RunStore | None = None,
         workspace_root: str | None = None,
@@ -206,6 +217,12 @@ class RetentionCleanupJob:
         if upload_retention_days < 1:
             msg = "upload_retention_days must be >= 1"
             raise ValueError(msg)
+        if conversation_workspace_retention_days < 1:
+            msg = "conversation_workspace_retention_days must be >= 1"
+            raise ValueError(msg)
+        if conversation_workspace_batch_size < 1:
+            msg = "conversation_workspace_batch_size must be >= 1"
+            raise ValueError(msg)
         self._sf = db_session_factory
         self._batch_size = batch_size
         self._image_upload_store = image_upload_store
@@ -227,6 +244,8 @@ class RetentionCleanupJob:
         self._knowledge_retrieval_log_retention_days = knowledge_retrieval_log_retention_days
         self._user_upload_store = user_upload_store
         self._upload_retention_days = upload_retention_days
+        self._conversation_workspace_retention_days = conversation_workspace_retention_days
+        self._conversation_workspace_batch_size = conversation_workspace_batch_size
         self._thread_store = thread_store
         self._run_store = run_store
         self._workspace_root = workspace_root
@@ -279,6 +298,9 @@ class RetentionCleanupJob:
                 artifact_soft,
                 artifact_hard,
             ) = await self._sweep_artifact_passes()
+            # B-282 —— 闲置会话的工作目录;排在产物两条 pass 之后(先让到期的产物版本走掉,
+            # 产物保护看的是这之后还在的最新版)。
+            conversations = await self._sweep_conversation_dirs()
             orphan_artifact_copies_removed = await self._sweep_orphan_artifact_copies()
             purged = await self._sweep_purged_agents()
             trajectories = await self._sweep_trajectories()
@@ -319,6 +341,13 @@ class RetentionCleanupJob:
             upload_rows_held=uploads.rows_held,
             upload_owners_unavailable=uploads.owners_unavailable,
             upload_rows_failing_overdue=uploads.rows_failing_overdue,
+            conversation_dirs_removed=conversations.removed,
+            conversation_tool_results_removed=conversations.tool_results_removed,
+            conversation_dirs_skipped_active=conversations.skipped_active,
+            conversation_dirs_skipped_artifact=conversations.skipped_artifact,
+            conversation_dirs_skipped_unsafe=conversations.skipped_unsafe,
+            conversation_dirs_skipped_owner_deleted=conversations.skipped_owner_deleted,
+            conversation_dirs_failed=conversations.failed,
             failed_passes=tuple(self._failed_passes),
             thread_dirs_removed=thread_dirs_removed,
             tool_result_dirs_removed=tool_result_dirs_removed,
@@ -693,6 +722,32 @@ class RetentionCleanupJob:
             # 有行被放弃(过期太久还在失败)、被熔断拦下,或有用户的目录打不开:进程以非 0
             # 退出,让人去看。
             self._failed_passes.append("uploads")
+        return tally
+
+    async def _sweep_conversation_dirs(self) -> ConversationDirTally:
+        """B-282 —— 闲置满租户保留期(``tenant_config.conversation_workspace_retention_days``,
+        没设用 ``conversation_workspace_retention_days``)的会话:删它的 ``threads/<会话>/`` 与各 run
+        的 ``.tool_results/<run>/``,库里的行不动。规则本体在
+        :mod:`retention_cleanup_job.conversation_dirs`。没配 ``workspace_root`` 不跑。
+
+        整条 pass 出错(列会话的查询)或有会话删失败:记日志、记进 ``failed_passes``(进程以
+        非 0 退出),已经做了的照样计数,后面的 pass 照跑。"""
+        if self._workspace_root is None:
+            return ConversationDirTally()
+        sweep = ConversationDirSweep(
+            sf=self._sf,
+            root=self._workspace_root,
+            default_days=self._conversation_workspace_retention_days,
+            batch_size=self._conversation_workspace_batch_size,
+        )
+        try:
+            tally = await sweep.run(now=datetime.now(UTC))
+        except Exception:
+            logger.exception("retention.conversation_dirs_failed")
+            self._failed_passes.append("conversation_dirs")
+            return sweep.tally
+        if tally.needs_attention:
+            self._failed_passes.append("conversation_dirs")
         return tally
 
     async def _sweep_purged_agents(self) -> PurgedAgentsSweep:
