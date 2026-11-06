@@ -1,5 +1,5 @@
 """B-281 —— 迁移后留在 agent 根的上传原件:一次性清理的谓词(:func:`plan`)与文件那一半
-(:func:`release`)。
+(:func:`verify` / :func:`unlink_verified`)。
 
 文件一律用 control-plane 自己的 ``thread_workspace_path`` 摆:老视图 = agent 根的原件,对话视图 =
 迁移复制出来的副本,都在真实位置上。真库那一半见 ``test_legacy_originals_integration.py``。
@@ -23,8 +23,10 @@ from retention_cleanup_job.legacy_originals import (
     LegacyOriginalsTally,
     LiveUpload,
     Original,
+    Verified,
     plan,
-    release,
+    unlink_verified,
+    verify,
 )
 
 _BODY = b"%PDF-1.4 customer report"
@@ -120,10 +122,25 @@ class _World:
 
     def release(self, *, unlink: bool) -> list[tuple[str, int]]:
         originals, _ = self.plan()
-        return [release(str(self.root), o, unlink=unlink) for o in originals]
+        return [_release(str(self.root), o, unlink=unlink) for o in originals]
 
 
 Tally = LegacyOriginalsTally
+
+
+def _release(root: str, original: Original, *, unlink: bool) -> tuple[str, int]:
+    """The file half the way the cleanup runs it: verify, then (``unlink``) delete on the same
+    open handles."""
+    checked = verify(root, original)
+    if not isinstance(checked, Verified):
+        return checked, 0
+    try:
+        if not unlink:
+            return "deletable", checked.size
+        outcome = unlink_verified(checked)
+        return outcome, checked.size if outcome == "deleted" else 0
+    finally:
+        checked.opened.close()
 
 
 @pytest.fixture
@@ -407,3 +424,22 @@ def test_the_summary_line_names_no_file_tenant_or_user() -> None:
     line = tally.line(apply=False)
     assert line.startswith("legacy_originals mode=dry-run checked=3 deletable=1 deleted=0 bytes=24")
     assert "report" not in line and "uploads" not in line
+
+
+async def test_an_original_replaced_after_verification_is_not_deleted(world: _World) -> None:
+    """The unlink happens on the handles opened during verification and only if the name still
+    points at that inode: a file swapped in meanwhile (by a sandbox in an old-view conversation)
+    stays."""
+    _meta, original, _ = await _migrated(world)
+    [candidate], _ = world.plan()
+    checked = verify(str(world.root), candidate)
+    assert isinstance(checked, Verified)
+    try:
+        replacement = original.with_name("swap.tmp")
+        replacement.write_bytes(b"someone else's file")
+        replacement.replace(original)
+
+        assert unlink_verified(checked) == "original_differs"
+    finally:
+        checked.opened.close()
+    assert original.read_bytes() == b"someone else's file"

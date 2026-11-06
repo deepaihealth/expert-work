@@ -1,4 +1,4 @@
-"""B-281 —— 一次性清理:老对话迁移之后留在 agent 根的上传原件。
+"""B-281 —— 清理老对话迁移之后留在 agent 根的上传原件(一次性命令 + 迁移完成时)。
 
 ``python -m retention_cleanup_job.legacy_originals``(默认只数不删)/ ``… --apply``(删)。
 
@@ -19,12 +19,22 @@ B-262 P3 起,老对话下一次 run 之前把本对话的上传**复制**进 ``t
 4. 每一条引用(都在对话视图的会话里)的副本都在、是普通文件,内容与原件逐字节相同(sha256);
    引用自己记了大小 / sha256 的,也必须与原件相同 —— 包括还没迁移的对话视图会话(B-262 P1 之前开的,
    上传还只在 agent 根):它没有副本,原件留着;
-5. 原件是普通文件(路径上任何一段是软链都不碰)。
+5. 原件是普通文件(路径上任何一段是软链都不碰);
+6. 同租户、同 agent、属于这个用户或没有用户的会话里,一个老视图会话都不剩 —— 老视图的
+   ``/workspace`` 就是 agent 根,``uploads/`` 下每个文件它都看得到、都可能用着(B-262 之前 ``files[]``
+   直接传名字,没有副本、审计、登记行;审批续跑、孤儿复活、延后的迁移、控制台工作区文件页也还在
+   老视图里);
+7. 没有产物版本登记的就是这个文件而又没留副本(``snapshot_key IS NULL``,B-235 之前):下载那一版
+   读的就是它。
 
 也就是说删掉的只是一份**逐字节重复**的文件,每个还可能用到它的会话手里都有一份相同的。文件操作
 全部用 :func:`~retention_cleanup_job.workspace_files.open_upload_file`(从 NAS 根逐段 ``openat`` +
-``O_NOFOLLOW``,核对与删除在同一组 fd 上做,删之前再比一次 inode);``--apply`` 时每删一个之前
-再查一次登记表(期间新登记的同名上传 → 不删)。
+``O_NOFOLLOW``,核对与删除在同一组 fd 上做,删之前再比一次 inode);``--apply`` 时核对通过之后、
+删之前再查一次库(登记表、第 6、7 条,不用缓存),然后在核对时打开的那组 fd 上删。
+
+两个入口:一次性命令清存量;:func:`release_migrated_originals` 在每个对话迁移完之后(由
+``control_plane.platform_migration`` 在后台调)对那个 (租户, 用户, agent) 跑同一套谓词 —— 有了第 6
+条,实际是那个 agent 最后一个老视图会话迁完时把已迁移的原件一并清掉。
 
 输出只有计数与字节数,不打文件名、租户、用户。
 """
@@ -33,28 +43,33 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import contextlib
 import hashlib
 import logging
 import os
 import sys
-from collections.abc import Iterable, Iterator, Mapping, Sequence
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field, fields
 from typing import Any, Literal
 from uuid import UUID
 
-from sqlalchemy import Row, Select, select
+from sqlalchemy import Row, Select, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from expert_work.persistence import (
+    ArtifactVersionRow,
     AuditLogRow,
     DatabaseConfig,
     SqlThreadMetaStore,
+    ThreadMetaRow,
     UserUploadRow,
     create_async_engine_from_config,
 )
+from expert_work.persistence.rls import current_tenant_id_var
 from expert_work.persistence.thread_meta import ThreadMetaStore
 from expert_work.persistence.workspace.layout import WORKSPACE_UPLOADS_DIR
 from expert_work.protocol import AuditAction, AuditResult, ThreadMeta
+from expert_work.protocol.agent_key import sanitize_agent_key
 from retention_cleanup_job.job import _bypass_rls
 from retention_cleanup_job.main import (
     EXIT_PASS_FAILED,
@@ -73,6 +88,7 @@ from retention_cleanup_job.workspace_files import (
 )
 
 logger = logging.getLogger(__name__)
+
 
 #: 一次 ``IN (...)`` 绑多少个 id。
 _CHUNK = 5000
@@ -140,6 +156,11 @@ class Original:
     row_ids: frozenset[UUID]
     copies: tuple[Copy, ...]
 
+    @property
+    def agent_key(self) -> str:
+        """``agents/<key>/uploads/<名字>`` 里的 ``<key>``。"""
+        return self.relpath.split("/")[1]
+
 
 @dataclass
 class LegacyOriginalsTally:
@@ -152,6 +173,8 @@ class LegacyOriginalsTally:
     bytes: int = 0
     no_original: int = 0
     kept_old_view_row: int = 0
+    kept_old_view_conversation: int = 0
+    kept_artifact_version: int = 0
     kept_unregistered_upload: int = 0
     kept_session_gone: int = 0
     kept_copy_missing: int = 0
@@ -280,95 +303,228 @@ def _copies_hold(root: str, original: Original, digest: str) -> Outcome | None:
     return None
 
 
-def release(root: str, original: Original, *, unlink: bool) -> tuple[Outcome, int]:
-    """第 4、5 条,满足且 ``unlink`` 时删原件。回 (结论, 原件字节数)。路径不可用 → ``"unsafe"``;
-    暂时性 I/O 错误与工作区根 / 属主目录打不开原样抛。"""
-    size = original.size_bytes
+@dataclass
+class Verified:
+    """:func:`verify` 核对通过的原件:叶子与父目录的 fd 还开着,:func:`unlink_verified` 在这同一组
+    fd 上删(再比一次 inode);不删也必须 ``opened.close()``。"""
+
+    opened: OpenedUpload
+    size: int
+
+
+def verify(root: str, original: Original) -> Verified | Outcome:
+    """第 4、5 条(文件那一半):原件是普通文件、每条引用的副本都在且与它同内容。通过 → 开着的
+    :class:`Verified`;否则结论。路径不可用 → ``"unsafe"``;暂时性 I/O 错误与工作区根 / 属主目录
+    打不开原样抛(已打开的 fd 都关掉)。"""
     try:
         opened = open_upload_file(
             root,
             original.tenant_id,
             original.user_id,
             original.relpath,
-            size_bytes=size,
+            size_bytes=original.size_bytes,
             sha256=None,
         )
     except UnsafeWorkspacePathError:
-        return "unsafe", 0
+        return "unsafe"
     if opened.outcome == "missing":
-        return "no_original", 0
+        return "no_original"
     if opened.outcome == "changed":
-        return "original_differs", 0
+        return "original_differs"
     try:
         blocked = _copies_hold(root, original, _digest(opened))
-        if blocked is not None:
-            return blocked, 0
-        if not unlink:
-            return "deletable", size
-        outcome = opened.unlink()
     except UnsafeWorkspacePathError:
-        return "unsafe", 0
-    finally:
         opened.close()
+        return "unsafe"
+    except BaseException:
+        opened.close()
+        raise
+    if blocked is not None:
+        opened.close()
+        return blocked
+    return Verified(opened, original.size_bytes)
+
+
+def unlink_verified(verified: Verified) -> Outcome:
+    """删 :func:`verify` 打开的那个文件(名字仍指着同一个 inode 才删)。不关 fd(调用方关)。"""
+    try:
+        outcome = verified.opened.unlink()
+    except UnsafeWorkspacePathError:
+        return "unsafe"
     if outcome == "removed":
-        return "deleted", size
+        return "deleted"
     # 核对之后名字被换成了别的文件(``changed``)或已经不在了:都不算删了。
-    return ("no_original" if outcome == "missing" else "original_differs"), 0
+    return "no_original" if outcome == "missing" else "original_differs"
 
 
-_KEPT: dict[Outcome, str] = {
+_KEPT: dict[str, str] = {
     "no_original": "no_original",
     "original_differs": "kept_original_differs",
     "copy_missing": "kept_copy_missing",
     "copy_changed": "kept_copy_changed",
     "unsafe": "kept_unsafe",
+    "kept_old_view_conversation": "kept_old_view_conversation",
+    "kept_artifact_version": "kept_artifact_version",
+    "kept_changed_during_run": "kept_changed_during_run",
 }
+
+
+async def _in_thread[T](fn: Callable[..., T], *args: Any) -> T:
+    """在线程里跑 ``fn``;本协程被取消(迁移那一刻在后台跑,进程退出时会被取消)时**等线程跑完**
+    再往外抛,并关掉它可能刚打开的 fd —— 不能在线程还拿着父目录 fd 删文件的时候把 fd 关了(号会被
+    复用,``unlink(dir_fd=…)`` 就可能落到别的目录上)。"""
+    work = asyncio.ensure_future(asyncio.to_thread(fn, *args))
+    try:
+        return await asyncio.shield(work)
+    except asyncio.CancelledError:
+        with contextlib.suppress(BaseException):
+            result = await work
+            if isinstance(result, Verified):
+                result.opened.close()
+        raise
+
+
+@dataclass(frozen=True)
+class Scope:
+    """只看一个 (租户, 用户, agent) —— 迁移那一刻用(:func:`release_migrated_originals`)。"""
+
+    tenant_id: UUID
+    user_id: UUID
+    agent_name: str
 
 
 @dataclass
 class LegacyOriginalsCleanup:
-    """查库 → :func:`plan` → 逐个 :func:`release`。``apply=False`` 只数。"""
+    """查库 → :func:`plan` → 逐个:老视图会话 / 产物版本(第 6、7 条)→ :func:`verify` → 再查一次库
+    → :func:`unlink_verified`。``apply=False`` 只数。``scope`` 收窄到一个 (租户, 用户, agent);
+    ``max_originals`` 封顶这一轮处理的原件数。"""
 
     session_factory: async_sessionmaker[AsyncSession]
     threads: ThreadMetaStore
     root: str
     apply: bool = False
+    scope: Scope | None = None
+    max_originals: int | None = None
     tally: LegacyOriginalsTally = field(default_factory=LegacyOriginalsTally)
+    _old_view_cache: dict[tuple[UUID, UUID, str], bool] = field(default_factory=dict)
 
     async def run(self) -> LegacyOriginalsTally:
+        scope = self.scope
+        if scope is not None and await self._old_view_remains(
+            scope.tenant_id, scope.user_id, sanitize_agent_key(scope.agent_name)
+        ):
+            return self.tally  # 这个 agent 还有老视图会话:它的原件一个都不能删,不必再查
         rows = await self._live_uploads()
         audits = await self._audited_uploads({r.tenant_id for r in rows})
         metas = await self._metas(
             [(r.tenant_id, r.thread_id) for r in rows]
             + [(a.tenant_id, a.thread_id) for a in audits]
         )
-        for original in plan(rows, audits, metas, self.tally):
+        originals = plan(rows, audits, metas, self.tally)
+        if scope is not None:
+            key = sanitize_agent_key(scope.agent_name)
+            originals = [o for o in originals if o.agent_key == key]
+        for original in originals[: self.max_originals]:
             await self._one(original)
         return self.tally
 
+    def _count(self, outcome: str, size: int = 0) -> None:
+        name = outcome if outcome in ("deletable", "deleted") else _KEPT[outcome]
+        setattr(self.tally, name, getattr(self.tally, name) + 1)
+        if outcome in ("deletable", "deleted"):
+            self.tally.bytes += size
+
     async def _one(self, original: Original) -> None:
-        tally = self.tally
         try:
-            if self.apply and not await self._still_a_candidate(original):
-                tally.kept_changed_during_run += 1
+            kept = await self._kept_by_database(original, cached=True)
+            if kept is not None:
+                self._count(kept)
                 return
-            outcome, size = await asyncio.to_thread(release, self.root, original, unlink=self.apply)
+            checked = await _in_thread(verify, self.root, original)
+            if not isinstance(checked, Verified):
+                self._count(checked)
+                return
+            try:
+                outcome = await self._finish(original, checked)
+            finally:
+                checked.opened.close()
         except WorkspaceRootUnavailableError:
             raise
         except (WorkspaceOwnerUnavailableError, OSError) as exc:
-            tally.failed += 1
+            self.tally.failed += 1
             logger.warning("legacy_originals.failed error=%s", type(exc).__name__)
             return
-        if outcome in ("deletable", "deleted"):
-            setattr(tally, outcome, getattr(tally, outcome) + 1)
-            tally.bytes += size
-        else:
-            setattr(tally, _KEPT[outcome], getattr(tally, _KEPT[outcome]) + 1)
+        self._count(outcome, checked.size)
+
+    async def _finish(self, original: Original, verified: Verified) -> str:
+        """核对通过之后:只数 → ``deletable``;删 → 紧挨着删之前再查一次库(登记表、老视图会话、
+        产物版本,都不用缓存),都还成立才在核对时打开的那组 fd 上删。"""
+        if not self.apply:
+            return "deletable"
+        if not await self._still_a_candidate(original):
+            return "kept_changed_during_run"
+        if await self._kept_by_database(original, cached=False) is not None:
+            return "kept_changed_during_run"
+        return await _in_thread(unlink_verified, verified)
+
+    async def _kept_by_database(self, original: Original, *, cached: bool) -> str | None:
+        """第 6、7 条:还有老视图会话看得到 agent 根 / 有没留副本的产物版本指着这个文件。"""
+        if await self._old_view_remains(
+            original.tenant_id, original.user_id, original.agent_key, cached=cached
+        ):
+            return "kept_old_view_conversation"
+        if await self._snapshotless_artifact(original):
+            return "kept_artifact_version"
+        return None
+
+    async def _old_view_remains(
+        self, tenant_id: UUID, user_id: UUID, agent_key: str, *, cached: bool = True
+    ) -> bool:
+        """同租户、同 agent、属于这个用户或没有用户的会话里,还有老视图(``agent_root``)的吗。老视图
+        的 ``/workspace`` 就是 agent 根,``uploads/`` 下每个文件它都看得到、都可能用着(B-262 之前
+        ``files[]`` 直接传名字,审批续跑 / 孤儿复活 / 延后的迁移也都还跑在老视图里)。
+
+        会话只会从老视图翻到对话视图、不会翻回去,新会话一律是对话视图,所以「没有了」是单调的,
+        一轮里可以缓存;删之前那次照样不用缓存再查。"""
+        key = (tenant_id, user_id, agent_key)
+        if cached and key in self._old_view_cache:
+            return self._old_view_cache[key]
+        stmt = (
+            select(ThreadMetaRow.agent_name)
+            .where(
+                ThreadMetaRow.tenant_id == tenant_id,
+                ThreadMetaRow.workspace_layout == "agent_root",
+                ThreadMetaRow.agent_name.is_not(None),
+                or_(ThreadMetaRow.user_id == user_id, ThreadMetaRow.user_id.is_(None)),
+            )
+            .distinct()
+        )
+        async with self.session_factory() as session:
+            names = (await session.execute(stmt)).scalars().all()
+        remains = any(sanitize_agent_key(n) == agent_key for n in names if n)
+        self._old_view_cache[key] = remains
+        return remains
+
+    async def _snapshotless_artifact(self, original: Original) -> bool:
+        """有产物版本登记的就是这个文件、而且没留副本(B-235 之前):下载那一版读的就是它。"""
+        stmt = (
+            select(ArtifactVersionRow.id)
+            .where(
+                ArtifactVersionRow.tenant_id == original.tenant_id,
+                ArtifactVersionRow.user_id == original.user_id,
+                ArtifactVersionRow.path_in_workspace == original.relpath,
+                ArtifactVersionRow.snapshot_key.is_(None),
+            )
+            .limit(1)
+        )
+        async with self.session_factory() as session:
+            return (await session.execute(stmt)).first() is not None
 
     async def _still_a_candidate(self, original: Original) -> bool:
         """删之前再查一次登记表:同租户同用户同 ``ref`` 的没删行重新分组,这份原件还得是候选,而且
         登记行正好是核对过副本的那些(期间新传 / 新复制进来的同名文件 → 这一轮不删)。审计不再查:
-        B-281 起新的控制台上传与复制都建登记行,审计那一侧只剩历史。"""
+        B-281 起落进对话目录的控制台上传与复制都建登记行,落进 agent 根的只发生在老视图会话里
+        (第 6 条挡住),审计那一侧只剩历史。"""
         async with self.session_factory() as session:
             result = await session.execute(
                 _live_uploads_stmt().where(
@@ -384,12 +540,19 @@ class LegacyOriginalsCleanup:
         return len(again) == 1 and again[0].row_ids == original.row_ids
 
     async def _live_uploads(self) -> list[LiveUpload]:
+        stmt = _live_uploads_stmt()
+        if self.scope is not None:
+            stmt = stmt.where(
+                UserUploadRow.tenant_id == self.scope.tenant_id,
+                UserUploadRow.user_id == self.scope.user_id,
+            )
         async with self.session_factory() as session:
-            result = await session.execute(_live_uploads_stmt())
+            result = await session.execute(stmt)
             return [_to_live(r) for r in result.all()]
 
     async def _audited_uploads(self, tenants: set[UUID]) -> list[AuditedUpload]:
-        """这些租户全部成功的 ``DOCUMENT_UPLOAD`` 审计行(不按时间收窄:老对话的上传多早都算)。"""
+        """这些租户全部成功的 ``DOCUMENT_UPLOAD`` 审计行(不按时间收窄:老对话的上传多早都算)。
+        ``scope`` 时只取这个 agent 的会话(任何用户)的审计。"""
         if not tenants:
             return []
         stmt = select(AuditLogRow.tenant_id, AuditLogRow.details).where(
@@ -398,8 +561,29 @@ class LegacyOriginalsCleanup:
             AuditLogRow.result == AuditResult.SUCCESS.value,
         )
         async with self.session_factory() as session:
-            result = await session.execute(stmt)
-            return [a for t, d in result.all() if (a := _audited(t, d)) is not None]
+            if self.scope is None:
+                result = await session.execute(stmt)
+                return [a for t, d in result.all() if (a := _audited(t, d)) is not None]
+            thread_ids = (
+                (
+                    await session.execute(
+                        select(ThreadMetaRow.thread_id).where(
+                            ThreadMetaRow.tenant_id == self.scope.tenant_id,
+                            ThreadMetaRow.agent_name == self.scope.agent_name,
+                        )
+                    )
+                )
+                .scalars()
+                .all()
+            )
+            out: list[AuditedUpload] = []
+            for chunk in _chunks(thread_ids):
+                wanted = [str(t) for t in chunk]
+                result = await session.execute(
+                    stmt.where(AuditLogRow.details["thread_id"].astext.in_(wanted))
+                )
+                out += [a for t, d in result.all() if (a := _audited(t, d)) is not None]
+            return out
 
     async def _metas(self, keys: Iterable[_ThreadKey]) -> dict[_ThreadKey, ThreadMeta | None]:
         by_tenant: dict[UUID, set[UUID]] = {}
@@ -412,6 +596,40 @@ class LegacyOriginalsCleanup:
                 for thread_id in chunk:
                     out[(tenant_id, thread_id)] = found.get(thread_id)
         return out
+
+
+#: 迁移那一刻每次最多处理多少份原件 —— 只在一个 (租户, 用户, agent) 的最后一个老视图会话迁完时
+#: 才有活干;剩下的下一次迁移 / 一次性命令再来。
+MIGRATION_MAX_ORIGINALS = 500
+
+
+async def release_migrated_originals(
+    session_factory: async_sessionmaker[AsyncSession],
+    threads: ThreadMetaStore,
+    root: str,
+    *,
+    tenant_id: UUID,
+    user_id: UUID,
+    agent_name: str,
+    max_originals: int = MIGRATION_MAX_ORIGINALS,
+) -> LegacyOriginalsTally:
+    """B-281 —— 一个对话迁移完之后(``control_plane.platform_migration``),对这个 (租户, 用户,
+    agent) 的原件跑同一套谓词并删掉符合的。还有老视图会话就一条查询返回(第 6 条);所以实际上是
+    最后一个老视图会话迁完的那一次,把这个 agent 下已迁移、副本逐字节相同的原件一并清掉。
+
+    调用方负责「不影响 run」:在后台跑、吞掉异常只记类型。这里只设租户上下文(RLS)。"""
+    token = current_tenant_id_var.set(tenant_id)
+    try:
+        return await LegacyOriginalsCleanup(
+            session_factory=session_factory,
+            threads=threads,
+            root=root,
+            apply=True,
+            scope=Scope(tenant_id=tenant_id, user_id=user_id, agent_name=agent_name),
+            max_originals=max_originals,
+        ).run()
+    finally:
+        current_tenant_id_var.reset(token)
 
 
 def _audited(tenant_id: UUID, details: Mapping[str, Any] | None) -> AuditedUpload | None:

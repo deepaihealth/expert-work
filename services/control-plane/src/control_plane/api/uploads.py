@@ -284,10 +284,11 @@ async def copy_document_into_thread(
     ``upl_`` id)。源文件大小与登记行对不上(源对话里被改写过)就拒,不悄悄复制改过的内容(只比
     大小:登记行与审计都不便宜地给出 sha256)。
 
-    B-281 —— 落进 ``target`` 的那份在 ``target`` 名下建一条登记行(:func:`register_document_upload`),
-    留存作业才管得到它。``target`` 已经有一条没删的行指着同一个文件(同名同 sha256 —— 同一份再
-    挂一次)就不再加:这一轮 run 本身就把 ``target`` 的「最后使用」往后推了。新行的 id 不回给
-    对接方,他们照旧用源那一行的 ``upl_`` id。
+    B-281 —— 落进 ``target`` 自己对话目录的那份在 ``target`` 名下建一条登记行
+    (:func:`register_document_upload`),留存作业才管得到它;落进共享根(老视图 / 没绑 agent)的不建
+    (:func:`landing_is_registrable`)。``target`` 已经有一条没删的行指着同一个文件(同名同 sha256 ——
+    同一份再挂一次)就不再加:这一轮 run 本身就把 ``target`` 的「最后使用」往后推了。新行的 id
+    不回给对接方,他们照旧用源那一行的 ``upl_`` id。
 
     失败抛 ``HTTPException``,状态码同上传端点(503 / 429 / 500 / 502);另有源文件不在 404、
     源被改过 409(读按登记的大小 + 1 封顶,读超了也算改过)。
@@ -338,7 +339,7 @@ async def copy_document_into_thread(
         content_type=upload.mime_type,
         extra_details={"copied_from_upload_id": render_upload_id(upload.id)},
     )
-    if not await _already_registered(
+    if landing_is_registrable(target) and not await _already_registered(
         uploads, tenant_id=tenant_id, user_id=user_id, thread_id=target.thread_id, landed=result
     ):
         await register_document_upload(
@@ -350,6 +351,14 @@ async def copy_document_into_thread(
             mime_type=upload.mime_type,
         )
     return result.path
+
+
+def landing_is_registrable(meta: ThreadMeta) -> bool:
+    """B-281 —— 控制台上传 / 跨会话复制落进 ``meta`` 这个会话时要不要建登记行:只有落进它自己的
+    对话目录(``threads/<会话>/work/``)才建。老视图(agent 根)和没绑 agent(用户根)是共享的根,
+    别的会话也看得到;留存作业的引用检查只认登记行,在那里登记,到期时会删掉别的会话还在用的文件。
+    (对外上传端点在老视图会话里本来就登记,B-281 不改。)"""
+    return thread_conversation_id(meta) is not None
 
 
 async def _already_registered(
@@ -936,15 +945,19 @@ def build_uploads_router() -> APIRouter:
             # B-281 —— 同对外上传建登记行,留存作业才管得到它。行记在落盘的那个工作区(调用者
             # 自己的)名下;``caller_user_id`` 为空的请求上面已经 400 了。控制台响应不回
             # ``upl_`` id(形状不变);对外接口的 ``user_id`` 带 ``ext:`` 前缀,摸不到这些行。
+            # 只登记落进本对话自己目录的:落在共享根(老视图的 agent 根 / 没绑 agent 的用户根)的
+            # 文件别的会话也看得到、可能用着,留存作业的引用检查只认登记行,登记了到期就会删掉
+            # 别人还在用的文件 —— 那里照旧不登记(:func:`landing_is_registrable`)。
             assert caller_user_id is not None  # noqa: S101
-            await register_document_upload(
-                uploads,
-                tenant_id=tenant_id,
-                user_id=caller_user_id,
-                thread_id=thread_id,
-                landed=result,
-                mime_type=content_type,
-            )
+            if landing_is_registrable(meta):
+                await register_document_upload(
+                    uploads,
+                    tenant_id=tenant_id,
+                    user_id=caller_user_id,
+                    thread_id=thread_id,
+                    landed=result,
+                    mime_type=content_type,
+                )
             return JSONResponse(
                 status_code=201,
                 content={"path": result.path, "kind": "document"},

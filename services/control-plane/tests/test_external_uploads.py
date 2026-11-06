@@ -1063,6 +1063,22 @@ async def test_a_copy_onto_the_same_file_in_an_old_view_session_adds_no_row(ctx:
 
 
 @pytest.mark.asyncio
+async def test_a_copy_into_an_old_view_session_is_not_registered(ctx: _Ctx) -> None:
+    """B-281 review F4 —— 复制进老视图会话落在 agent 共用的 ``uploads/``(共享根):不登记。"""
+    await ctx.seed_agent()
+    key = agent_key_for_code("support-bot")
+    a = await _upload_document(ctx, b"%PDF-1.4 A")
+    old = await _upload_document(ctx, b"%PDF-1.4 old")
+    _old_layout(ctx, old["session_id"])
+    rows = await _upload_row_count(ctx)
+
+    names = await _attach(ctx, a, into=old["session_id"])
+
+    assert ctx.workspace_store.created_files[f"agents/{key}/{names[0]}"] == b"%PDF-1.4 A"
+    assert await _upload_row_count(ctx) == rows
+
+
+@pytest.mark.asyncio
 async def test_console_uploads_are_invisible_to_the_external_plane(ctx: _Ctx) -> None:
     """B-281 —— 控制台上传的登记行记在控制台用户名下;对外接口的 ``user_id`` 一律带 ``ext:``
     前缀,即使对接方传的 ``user_id`` 与控制台用户的登录名逐字相同,也摸不到这些行:下载、

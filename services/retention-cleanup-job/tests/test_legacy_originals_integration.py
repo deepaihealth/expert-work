@@ -7,9 +7,12 @@
 
 from __future__ import annotations
 
+import asyncio
+import functools
 import hashlib
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Awaitable, Callable
 from pathlib import Path
+from typing import Any
 from uuid import UUID, uuid4
 
 import pytest
@@ -22,12 +25,14 @@ from testcontainers.postgres import PostgresContainer
 from control_plane.api._workspace_shared import thread_workspace_path
 from expert_work.persistence import (
     DatabaseConfig,
+    SqlArtifactStore,
     SqlAuditLogStore,
     SqlThreadMetaStore,
     SqlUserUploadStore,
     create_async_engine_from_config,
 )
 from expert_work.protocol import AuditAction, AuditEntry, AuditResult, ThreadMeta
+from expert_work.protocol.agent_key import sanitize_agent_key
 from retention_cleanup_job import legacy_originals
 from retention_cleanup_job.legacy_originals import LegacyOriginalsCleanup
 from retention_cleanup_job.main import build_session_factory
@@ -66,7 +71,7 @@ class _Db:
             admin.dispose()
 
     async def thread(
-        self, tenant: UUID, user: UUID, *, old_view: bool = False, agent: str = "bot"
+        self, tenant: UUID, user: UUID | None, *, old_view: bool = False, agent: str = "bot"
     ) -> ThreadMeta:
         meta = await self.threads.create(
             thread_id=uuid4(), tenant_id=tenant, created_by="u", user_id=user, agent_name=agent
@@ -128,6 +133,65 @@ class _Db:
             )
         )
 
+    async def old_view_upload(
+        self, tenant: UUID, user: UUID, meta: ThreadMeta, ref: str, *, register: bool
+    ) -> Path:
+        """An upload into an old-view conversation: the file in the agent root + its audit row (as
+        every upload has), + a registry row when ``register`` (external upload; console uploads
+        before B-281 had none). Content is unique per name."""
+        data = _BODY + ref.rsplit("/", 1)[-1].encode()
+        path = self.write(tenant, user, ref, meta, data)
+        sha = hashlib.sha256(data).hexdigest()
+        await self.audit.append(
+            AuditEntry(
+                tenant_id=tenant,
+                actor_type="user",
+                actor_id="u",
+                action=AuditAction.DOCUMENT_UPLOAD,
+                resource_type="user_workspace",
+                resource_id=ref,
+                result=AuditResult.SUCCESS,
+                details={
+                    "thread_id": str(meta.thread_id),
+                    "workspace_path": ref,
+                    "file_size_bytes": len(data),
+                    "sha256": sha,
+                },
+            )
+        )
+        if register:
+            await self.uploads.insert(
+                upload_id=uuid4(),
+                tenant_id=tenant,
+                user_id=user,
+                thread_id=meta.thread_id,
+                kind="document",
+                ref=ref,
+                mime_type="application/pdf",
+                size_bytes=len(data),
+                filename=ref.rsplit("/", 1)[-1],
+                sha256=sha,
+            )
+        return path
+
+    async def artifact(
+        self, tenant: UUID, user: UUID, path: Path, *, snapshot_key: str | None
+    ) -> None:
+        """An artifact version registered on that very workspace file."""
+        await SqlArtifactStore(self.sf).save_version(
+            tenant_id=tenant,
+            user_id=user,
+            agent_key=sanitize_agent_key("bot"),
+            name=path.name,
+            kind="document",
+            path_in_workspace=str(path.relative_to(self.root / str(tenant) / str(user))),
+            created_in_thread="t",
+            snapshot_key=snapshot_key,
+            # A copy kept since B-235 carries its digest (check constraint).
+            size_bytes=path.stat().st_size if snapshot_key else None,
+            sha256=hashlib.sha256(path.read_bytes()).hexdigest() if snapshot_key else None,
+        )
+
     def cleanup(self, *, apply: bool) -> LegacyOriginalsCleanup:
         return LegacyOriginalsCleanup(
             session_factory=self.sf,
@@ -166,10 +230,12 @@ async def test_dry_run_counts_then_apply_deletes_only_migrated_duplicates(db: _D
     # Goes: migrated duplicates, in two tenants (the run is cross-tenant).
     gone_a, copy_a = await db.migrated(tenant, user, "uploads/a.pdf")
     gone_t2, copy_t2 = await db.migrated(other_tenant, other_user, "uploads/a.pdf")
-    # Stays: an old-view conversation still registers the same name.
-    kept_row, _ = await db.migrated(tenant, user, "uploads/b.pdf")
-    old = await db.thread(tenant, user, old_view=True)
-    await db.register(tenant, user, old.thread_id, "uploads/b.pdf")
+    # Stays: an old-view conversation still registers the same name (another user, so that
+    # user's other originals are kept by the old-view rule, not this tenant user's).
+    row_user = uuid4()
+    kept_row, _ = await db.migrated(tenant, row_user, "uploads/b.pdf")
+    old = await db.thread(tenant, row_user, old_view=True)
+    await db.register(tenant, row_user, old.thread_id, "uploads/b.pdf")
     # Stays: an old-view conversation's console upload (audit only) names it — another user's
     # conversation of the same agent counts too (the bytes land in the uploader's workspace).
     kept_console, _ = await db.migrated(tenant, user, "uploads/c.pdf")
@@ -228,23 +294,245 @@ async def test_dry_run_counts_then_apply_deletes_only_migrated_duplicates(db: _D
     assert (again.deleted, again.no_original) == (0, 3)
 
 
+@pytest.fixture
+def change_before_delete(monkeypatch: pytest.MonkeyPatch) -> Any:
+    """Run ``change`` after an original passed every check and was verified, right before the
+    re-check that precedes the unlink — what a concurrent writer can do in that window."""
+
+    def install(change: Callable[[], Awaitable[None]]) -> None:
+        real = LegacyOriginalsCleanup._finish
+
+        async def finish(self: LegacyOriginalsCleanup, original: Any, verified: Any) -> str:
+            await change()
+            return await real(self, original, verified)
+
+        monkeypatch.setattr(LegacyOriginalsCleanup, "_finish", finish)
+
+    return install
+
+
 @pytest.mark.asyncio
-async def test_apply_rechecks_the_registry_right_before_deleting(db: _Db) -> None:
-    """A same-name upload registered in an old-view conversation after the plan was made (B-281:
-    console uploads and copies register now) keeps the original."""
+async def test_apply_rechecks_the_registry_right_before_deleting(
+    db: _Db, change_before_delete: Any
+) -> None:
+    """A same-name upload registered in an old-view conversation meanwhile keeps the original."""
     tenant, user = uuid4(), uuid4()
     original, _ = await db.migrated(tenant, user, "uploads/a.pdf")
-    cleanup = db.cleanup(apply=True)
-    rows = await cleanup._live_uploads()
-    metas = await cleanup._metas((r.tenant_id, r.thread_id) for r in rows)
-    [candidate] = legacy_originals.plan(rows, [], metas, cleanup.tally)
 
-    old = await db.thread(tenant, user, old_view=True)
-    await db.register(tenant, user, old.thread_id, "uploads/a.pdf")
-    await cleanup._one(candidate)
+    async def change() -> None:
+        # The old view's own row (not the conversation): caught by the registry re-check.
+        old = await db.thread(tenant, uuid4(), old_view=True)
+        await db.register(tenant, user, old.thread_id, "uploads/a.pdf")
 
-    assert (cleanup.tally.kept_changed_during_run, cleanup.tally.deleted) == (1, 0)
+    change_before_delete(change)
+    tally = await db.cleanup(apply=True).run()
+
+    assert (tally.kept_changed_during_run, tally.deleted) == (1, 0)
     assert original.exists()
+
+
+@pytest.mark.asyncio
+async def test_apply_rechecks_which_rows_point_at_it(db: _Db, change_before_delete: Any) -> None:
+    """A new conversation-view row of the same name (with its own identical copy) registered
+    meanwhile: still a candidate, but not the rows whose copies were verified — not this round."""
+    tenant, user = uuid4(), uuid4()
+    original, _ = await db.migrated(tenant, user, "uploads/a.pdf")
+
+    async def change() -> None:
+        newer = await db.thread(tenant, user)
+        db.write(tenant, user, "uploads/a.pdf", newer, _BODY)
+        await db.register(tenant, user, newer.thread_id, "uploads/a.pdf")
+
+    change_before_delete(change)
+    tally = await db.cleanup(apply=True).run()
+
+    assert (tally.kept_changed_during_run, tally.deleted) == (1, 0)
+    assert original.exists()
+
+
+@pytest.mark.asyncio
+async def test_apply_rechecks_old_view_conversations_right_before_deleting(
+    db: _Db, change_before_delete: Any
+) -> None:
+    """The per-agent old-view check is cached within a run; the one right before the unlink is
+    not."""
+    tenant, user = uuid4(), uuid4()
+    original, _ = await db.migrated(tenant, user, "uploads/a.pdf")
+
+    async def change() -> None:
+        await db.thread(tenant, None, old_view=True)
+
+    change_before_delete(change)
+    tally = await db.cleanup(apply=True).run()
+
+    assert (tally.kept_changed_during_run, tally.deleted) == (1, 0)
+    assert original.exists()
+
+
+@pytest.mark.asyncio
+async def test_apply_rechecks_artifact_versions_right_before_deleting(
+    db: _Db, change_before_delete: Any
+) -> None:
+    tenant, user = uuid4(), uuid4()
+    original, _ = await db.migrated(tenant, user, "uploads/a.pdf")
+
+    async def change() -> None:
+        await db.artifact(tenant, user, original, snapshot_key=None)
+
+    change_before_delete(change)
+    tally = await db.cleanup(apply=True).run()
+
+    assert (tally.kept_changed_during_run, tally.deleted) == (1, 0)
+    assert original.exists()
+
+
+@pytest.mark.asyncio
+async def test_old_view_conversations_and_snapshotless_artifacts_keep_originals(db: _Db) -> None:
+    """Review F1 / F3: an old-view conversation of the same agent whose user is the workspace owner
+    or nobody sees all of ``agents/<key>/uploads/`` (no row / audit / copy needed) → keep every
+    original of that agent; one of another user (another workspace) doesn't. An artifact version
+    without its own copy (before B-235) reads the file → keep."""
+    tenant = uuid4()
+    owner_old, null_old, other_old, other_agent_old = uuid4(), uuid4(), uuid4(), uuid4()
+    artifact_user, snapshotted_user = uuid4(), uuid4()
+
+    kept_owner, _ = await db.migrated(tenant, owner_old, "uploads/a.pdf")
+    await db.thread(tenant, owner_old, old_view=True)
+    kept_null, _ = await db.migrated(tenant, null_old, "uploads/a.pdf")
+    await db.thread(tenant, None, old_view=True)  # shared by every user of the tenant's agent
+    gone_other, _ = await db.migrated(tenant, other_old, "uploads/b.pdf")
+    await db.thread(uuid4(), other_old, old_view=True)  # another tenant
+    gone_other_agent, _ = await db.migrated(tenant, other_agent_old, "uploads/c.pdf")
+    await db.thread(tenant, other_agent_old, old_view=True, agent="other-bot")
+    kept_artifact, _ = await db.migrated(tenant, artifact_user, "uploads/d.pdf")
+    await db.artifact(tenant, artifact_user, kept_artifact, snapshot_key=None)
+    gone_snapshotted, _ = await db.migrated(tenant, snapshotted_user, "uploads/e.pdf")
+    await db.artifact(tenant, snapshotted_user, gone_snapshotted, snapshot_key="snap/e.pdf")
+
+    tally = await db.cleanup(apply=True).run()
+
+    # The NULL-user old-view thread keeps the originals of *every* user of that agent in the
+    # tenant (its /workspace is the agent root of whoever runs it).
+    assert (tally.kept_old_view_conversation, tally.kept_artifact_version) == (6, 0)
+    assert tally.deleted == 0
+
+    db.sql("DELETE FROM thread_meta WHERE user_id IS NULL AND tenant_id = :t", t=tenant)
+    tally = await db.cleanup(apply=True).run()
+
+    assert (tally.kept_old_view_conversation, tally.kept_artifact_version) == (1, 1)
+    assert tally.deleted == 4
+    assert kept_owner.exists() and kept_artifact.exists()
+    assert not kept_null.exists() and not gone_other.exists()
+    assert not gone_other_agent.exists() and not gone_snapshotted.exists()
+
+
+@pytest.mark.asyncio
+async def test_migration_releases_originals_once_the_last_old_view_conversation_moves(
+    db: _Db,
+) -> None:
+    """User decision (a): at the end of a successful conversation migration, the same predicate runs
+    for that (tenant, user, agent) in the background. While another old-view conversation of the
+    agent remains nothing goes; when the last one migrates, every migrated original with an
+    identical copy goes — but not an audit-only one (decision b) nor one an artifact version without
+    its own copy reads."""
+    from control_plane.platform_migration import PlatformMigration, prepare_run_workspace
+    from orchestrator.tools.locks import ProcessKeyedLock
+    from orchestrator.tools.nas_workspace_store import NasWorkspaceStore
+    from retention_cleanup_job.legacy_originals import release_migrated_originals
+
+    tenant, user = uuid4(), uuid4()
+    db.root.mkdir(parents=True, exist_ok=True)
+    x = await db.thread(tenant, user, old_view=True)
+    y = await db.thread(tenant, user, old_view=True)
+    x_pdf = await db.old_view_upload(tenant, user, x, "uploads/x.pdf", register=True)
+    y_pdf = await db.old_view_upload(tenant, user, y, "uploads/y.pdf", register=True)
+    console_only = await db.old_view_upload(tenant, user, x, "uploads/z.pdf", register=False)
+    read_by_artifact = await db.old_view_upload(tenant, user, x, "uploads/w.pdf", register=True)
+    await db.artifact(tenant, user, read_by_artifact, snapshot_key=None)
+    migration = PlatformMigration(
+        workspace_store=NasWorkspaceStore(root=str(db.root)),
+        lock=ProcessKeyedLock(),
+        threads=db.threads,
+        uploads=db.uploads,
+        runs=None,
+        audit_store=db.audit,
+        release_originals=functools.partial(
+            release_migrated_originals, db.sf, db.threads, str(db.root)
+        ),
+    )
+
+    async def migrate(meta: ThreadMeta) -> None:
+        prepared = await prepare_run_workspace(
+            migration,
+            thread_id=meta.thread_id,
+            tenant_id=tenant,
+            workspace_layout="agent_root",
+        )
+        assert prepared.migrated is True
+        await asyncio.gather(*migration._background)
+
+    await migrate(x)
+    assert x_pdf.exists() and y_pdf.exists()  # y is still in the old view
+
+    await migrate(y)
+    assert not x_pdf.exists() and not y_pdf.exists()
+    assert console_only.exists() and read_by_artifact.exists()
+    for meta, name in ((x, "x.pdf"), (y, "y.pdf"), (x, "z.pdf"), (x, "w.pdf")):
+        conv = meta.model_copy(update={"workspace_layout": "conversation"})
+        copy = db.root / str(tenant) / str(user) / thread_workspace_path(f"uploads/{name}", conv)
+        assert copy.read_bytes() == _BODY + name.encode()
+
+
+@pytest.mark.asyncio
+async def test_the_migration_time_release_is_bounded(db: _Db) -> None:
+    from retention_cleanup_job.legacy_originals import release_migrated_originals
+
+    tenant, user = uuid4(), uuid4()
+    first, _ = await db.migrated(tenant, user, "uploads/a.pdf")
+    second, _ = await db.migrated(tenant, user, "uploads/b.pdf")
+
+    tally = await release_migrated_originals(
+        db.sf,
+        db.threads,
+        str(db.root),
+        tenant_id=tenant,
+        user_id=user,
+        agent_name="bot",
+        max_originals=1,
+    )
+
+    assert tally.deleted == 1
+    assert first.exists() != second.exists()
+
+
+@pytest.mark.asyncio
+async def test_a_failing_release_does_not_fail_the_migration(db: _Db) -> None:
+    from control_plane.platform_migration import PlatformMigration, prepare_run_workspace
+    from orchestrator.tools.locks import ProcessKeyedLock
+    from orchestrator.tools.nas_workspace_store import NasWorkspaceStore
+
+    tenant, user = uuid4(), uuid4()
+    db.root.mkdir(parents=True, exist_ok=True)
+    x = await db.thread(tenant, user, old_view=True)
+    await db.old_view_upload(tenant, user, x, "uploads/x.pdf", register=True)
+
+    async def broken(**_: Any) -> Any:
+        raise RuntimeError("boom")
+
+    migration = PlatformMigration(
+        workspace_store=NasWorkspaceStore(root=str(db.root)),
+        lock=ProcessKeyedLock(),
+        threads=db.threads,
+        uploads=db.uploads,
+        runs=None,
+        audit_store=db.audit,
+        release_originals=broken,
+    )
+    prepared = await prepare_run_workspace(
+        migration, thread_id=x.thread_id, tenant_id=tenant, workspace_layout="agent_root"
+    )
+    assert prepared.migrated is True
+    await asyncio.gather(*migration._background)  # the failure is logged, not raised
 
 
 @pytest.mark.asyncio
