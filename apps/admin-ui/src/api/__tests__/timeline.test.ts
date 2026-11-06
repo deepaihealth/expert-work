@@ -267,6 +267,28 @@ describe("parseTimeline", () => {
     expect(steps[1].cacheReadTokens).toBeUndefined();
   });
 
+  it("agent step carries the cache-write count (B-279 — priced per call; undefined when the vendor omits it)", () => {
+    const items = parseTimeline([
+      upd("agent", {
+        step_count: 1,
+        messages: [{
+          type: "ai", content: "答",
+          usage_metadata: {
+            input_tokens: 300, output_tokens: 20, total_tokens: 320,
+            input_token_details: { cache_read: 9000, cache_creation: 2048 },
+          },
+        }],
+      }, "t1"),
+      upd("agent", {
+        step_count: 2,
+        messages: [{ type: "ai", content: "再答", usage_metadata: { input_tokens: 10, output_tokens: 2 } }],
+      }, "t2"),
+    ]);
+    const steps = items.filter((i): i is AgentStep => i.kind === "agent");
+    expect(steps[0].cacheCreationTokens).toBe(2048);
+    expect(steps[1].cacheCreationTokens).toBeUndefined();
+  });
+
   it("reads additional_kwargs.first_token_ms into AgentStep.firstTokenMs (undefined when absent)", () => {
     const withTtft = parseTimeline([
       upd("agent", { step_count: 1, messages: [{ type: "ai", content: "a", additional_kwargs: { first_token_ms: 812 }, usage_metadata: {} }] }, "t1"),

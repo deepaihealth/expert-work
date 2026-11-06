@@ -143,11 +143,13 @@ function workerEndFrame(
   };
 }
 
+// B-279 —— 主 Agent 卡原来写的是 anthropic,但期望值按「输入含缓存」厂商的公式(先扣
+// 缓存命中)算;那正是 B-279 修掉的少算。厂商改成 deepseek,用例本意不变。
 const AGENT_CARD = {
   id: "rc-a",
   tenant_id: null,
-  provider: "anthropic",
-  model: "claude-x",
+  provider: "deepseek",
+  model: "deepseek-chat",
   input_per_mtok_micros: 3_000_000,
   output_per_mtok_micros: 15_000_000,
   cache_creation_per_mtok_micros: 0,
@@ -164,15 +166,15 @@ const WORKER_CARD = {
   cache_read_per_mtok_micros: 50_000,
 };
 const BOOK: RateBook = {
-  agentKey: rateKey("anthropic", "claude-x"),
+  agentKey: rateKey("deepseek", "deepseek-chat"),
   byModel: new Map([
-    [rateKey("anthropic", "claude-x"), AGENT_CARD],
+    [rateKey("deepseek", "deepseek-chat"), AGENT_CARD],
     [rateKey("zhipu", "glm-5.3"), WORKER_CARD],
   ]),
 };
 const AGENT_ONLY: RateBook = {
-  agentKey: rateKey("anthropic", "claude-x"),
-  byModel: new Map([[rateKey("anthropic", "claude-x"), AGENT_CARD]]),
+  agentKey: rateKey("deepseek", "deepseek-chat"),
+  byModel: new Map([[rateKey("deepseek", "deepseek-chat"), AGENT_CARD]]),
 };
 
 describe("computeSessionStats — cost by (provider, model)", () => {
@@ -188,7 +190,7 @@ describe("computeSessionStats — cost by (provider, model)", () => {
 
   it("matches the old single-card total exactly when the worker shares the agent's model", () => {
     const s = computeSessionStats(
-      [live([aiStep(1, 1, { in: 1_000_000, out: 100_000, cacheRead: 400_000 }), workerEndFrame({ in: 2_000_000, out: 50_000 }, { provider: "anthropic", model: "claude-x" })])],
+      [live([aiStep(1, 1, { in: 1_000_000, out: 100_000, cacheRead: 400_000 }), workerEndFrame({ in: 2_000_000, out: 50_000 }, { provider: "deepseek", model: "deepseek-chat" })])],
       AGENT_ONLY,
     );
     const legacy = (Math.max(0, 3_000_000 - 400_000) * 3_000_000 + 400_000 * 300_000 + 150_000 * 15_000_000) / 1e12;
@@ -205,10 +207,10 @@ describe("computeSessionStats — cost by (provider, model)", () => {
   });
 
   it("prices an unloaded history turn's persisted usage_by_model per model, and its bare rollup at the agent's card", () => {
-    const rollup = { input_tokens: 3_000_000, output_tokens: 150_000, cache_creation_tokens: 0, cache_read_tokens: 400_000, total_tokens: 3_150_000, llm_calls: 2, models: ["claude-x", "glm-5.3"] };
+    const rollup = { input_tokens: 3_000_000, output_tokens: 150_000, cache_creation_tokens: 0, cache_read_tokens: 400_000, total_tokens: 3_150_000, llm_calls: 2, models: ["deepseek-chat", "glm-5.3"] };
     const split = computeSessionStats(
       [{ events: [], loaded: false, status: "done", timing: null, tokens: { ...rollup, usage_by_model: [
-        { provider: "anthropic", model: "claude-x", input_tokens: 1_000_000, output_tokens: 100_000, cache_creation_tokens: 0, cache_read_tokens: 400_000, total_tokens: 1_100_000, llm_calls: 1 },
+        { provider: "deepseek", model: "deepseek-chat", input_tokens: 1_000_000, output_tokens: 100_000, cache_creation_tokens: 0, cache_read_tokens: 400_000, total_tokens: 1_100_000, llm_calls: 1 },
         { provider: "zhipu", model: "glm-5.3", input_tokens: 2_000_000, output_tokens: 50_000, cache_creation_tokens: 0, cache_read_tokens: 0, total_tokens: 2_050_000, llm_calls: 1 },
       ] } }],
       BOOK,
@@ -229,6 +231,32 @@ describe("computeSessionStats — cost by (provider, model)", () => {
       AGENT_ONLY,
     );
     expect(s.costCny).toBeNull();
+  });
+});
+
+describe("computeSessionStats — Anthropic 缓存口径(B-279)", () => {
+  // 每百万 token:输入 3 元 / 缓存命中 0.3 元 / 缓存写入 3.75 元 / 输出 15 元。
+  const CLAUDE_CARD = {
+    id: "rc-c", tenant_id: null, provider: "anthropic", model: "claude-x",
+    input_per_mtok_micros: 3_000_000, output_per_mtok_micros: 15_000_000,
+    cache_creation_per_mtok_micros: 3_750_000, cache_read_per_mtok_micros: 300_000,
+  };
+  const CLAUDE_BOOK: RateBook = {
+    agentKey: rateKey("anthropic", "claude-x"),
+    byModel: new Map([[rateKey("anthropic", "claude-x"), CLAUDE_CARD]]),
+  };
+
+  it("prices an unloaded history turn's Anthropic rollup without taking the cache out of input", () => {
+    // token_usage 落库的 Anthropic 行:输入 10k 不含缓存,另有命中 90k、写入 20k、输出 1k。
+    // 10k×3 + 90k×0.3 + 20k×3.75 + 1k×15 = 147000 → ¥0.147
+    const s = computeSessionStats(
+      [{ events: [], loaded: false, status: "done", timing: null, tokens: {
+        input_tokens: 10_000, output_tokens: 1_000, cache_creation_tokens: 20_000, cache_read_tokens: 90_000,
+        total_tokens: 11_000, llm_calls: 1, models: ["claude-x"],
+      } }],
+      CLAUDE_BOOK,
+    );
+    expect(s.costCny).toBeCloseTo(0.147, 12);
   });
 });
 

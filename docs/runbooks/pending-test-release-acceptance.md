@@ -1991,3 +1991,15 @@ oauth2 目录项本来就不在平台池里:不再碰平台池;`enabled` 切换�
 - [ ] **92.11 隔离区清理(B-278)**:如 92.9 留下了隔离区条目,把条目名里的时间改到 8 天前(或等 7 天),手动触发一次留存作业。判据:完成日志里 `purged_agent_dirs_removed` ≥ 1、`purged_agent_dirs_failed=0`,条目已删。
 - [ ] **92.12 多轮指代召回(#2030)**:给一个开了长期记忆的智能体先写入「《大国食养》作者李明,另著《四季食疗》」这类记忆(另起对话聊到),新对话里问「大国食养谁写的」,再追问「那他还写过什么」「第二个呢」,最后说「好的谢谢」。判据:追问能召回同一条记忆(调试台记忆召回里能看到);「好的谢谢」不触发带上文的召回;换话题(「我对花生过敏有什么零食」)不带上一话题的记忆。
 - [ ] **92.13 收尾**:删本节建的智能体、对话、上传、webhook 接收端与订阅、临时 key。
+
+## §93 控制台成本按厂商区分缓存口径(B-279)
+
+**背景**:控制台(调试台 / 对话页的整轮成本、会话统计、「计时」页每步成本)原来对所有厂商都按「输入 − 缓存命中」算输入费,且不算缓存写入费。Anthropic 的 `input_tokens` 本来就不含缓存读写(三个数分开报),于是被少算。现与月度计费(billing-rollup-job `_uncached_input_tokens`,B-185)同口径:Anthropic 输入不扣缓存;其它厂商输入扣掉缓存命中与写入;缓存写入按价目表「缓存写入价」另算。纯前端改动,无迁移。
+
+**前提**:要有一个 Anthropic 模型的凭据(平台或租户级)和它的价目表行(含缓存写入价)。10-04 记录两个环境都没有 Anthropic 平台凭据——发前先查;仍没有就 93.1 记「不可判(无凭据)」,只跑 93.2,别为它临时开凭据(花钱,要用户批准)。**花费**:Anthropic 两轮约 ¥1;deepseek 一轮约 ¥0.1。
+
+**判据公式**(与计费作业一致,每百万 token 单价取价目表):Anthropic 一次调用 = `input×输入价 + cache_read×命中价 + cache_creation×写入价 + output×输出价`;其它厂商 = `max(0, input − cache_read − cache_creation)×输入价 + 后三项同上`。账本数取只读 SQL:`select provider, model, input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens from token_usage where trace_id = (select trace_id from agent_run where id = '<run id>')`。
+
+- [ ] **93.1 Anthropic 有缓存的轮(需凭据)**:system_admin 在调试台给临时智能体 `acc-b279`(主模型 Anthropic,系统提示词写长一些,超过缓存最小长度)连发两轮。判据:第二轮的 `token_usage` 行 `cache_read_tokens` > 0 且 `input_tokens` 远小于它(确认是 Anthropic 口径);控制台该轮成本 = 按上式对该 run 全部 `token_usage` 行求和(显示到 4 位小数,差 ≤ ¥0.0001);「计时」页每步成本之和等于整轮成本;同一 run 在 Langfuse 里的 input / cache 读写 token 数与 `token_usage` 一致(Langfuse 的美元成本口径不同,不比金额)。改前同一轮会明显偏低(命中大于输入时输入费变 0)
+- [ ] **93.2 其它厂商不变**:同样操作换 deepseek 主模型跑两轮。判据:控制台成本 = 上式「其它厂商」求和;与改前版本(若还有改前截图 / 记录)同一轮数字一致
+- [ ] **93.3 收尾**:删 `acc-b279` 及其对话

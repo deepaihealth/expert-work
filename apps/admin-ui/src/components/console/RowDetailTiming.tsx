@@ -83,7 +83,12 @@ export function RowDetailTiming(props: RowDetailTimingProps) {
   // (拿不到 trace 时整行都是「—」)。
   const sseCostCny = metered
     ? costCnyOfMainLineCall(
-        { input: row.inputTokens, output: row.outputTokens, cacheRead: row.cacheReadTokens ?? 0 },
+        {
+          input: row.inputTokens,
+          output: row.outputTokens,
+          cacheRead: row.cacheReadTokens ?? 0,
+          cacheCreation: row.cacheCreationTokens ?? 0,
+        },
         rateBook,
       )
     : null;

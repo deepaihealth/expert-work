@@ -35,7 +35,7 @@ interface RowBase {
   /** 帧 id 里的服务端毫秒(≈ 该单元结束时刻;Timing tab SSE 列用):agent / aux / marker 行取 `item.serverMs`,tool / plan(update_plan)行取 `entry.serverMs`;subagent / user / assistant 为 null。 */
   serverMs: number | null;
 }
-export type ThinkRow = RowBase & { kind: "think"; text: string; content: string | null; model: string | null; inputTokens: number; outputTokens: number; reasoningTokens?: number; cacheReadTokens?: number; finishReason: string | null };
+export type ThinkRow = RowBase & { kind: "think"; text: string; content: string | null; model: string | null; inputTokens: number; outputTokens: number; reasoningTokens?: number; cacheReadTokens?: number; cacheCreationTokens?: number; finishReason: string | null };
 export type ToolRow = RowBase & { kind: "tool"; entry: ToolCallEntry };
 export type SubagentRow = RowBase & { kind: "subagent"; worker: WorkerTimeline; parentEntryId: string };
 export type PlanRow = RowBase & {
@@ -73,7 +73,7 @@ export type AssistantRow = RowBase & {
   reasoning: string;
   model: string | null;
   inputTokens: number; outputTokens: number;
-  reasoningTokens?: number; cacheReadTokens?: number;
+  reasoningTokens?: number; cacheReadTokens?: number; cacheCreationTokens?: number;
   /** 该步首 token 毫秒(`AgentStep.firstTokenMs`);没有就是 undefined。 */
   firstTokenMs?: number;
   finishReason: string | null;
@@ -154,6 +154,7 @@ function rowsOf(events: readonly SseEvent[], opts: { projection: Projection }): 
             text: item.content ?? "", reasoning: item.reasoning ?? "", model: item.model,
             inputTokens: item.inputTokens, outputTokens: item.outputTokens,
             reasoningTokens: item.reasoningTokens, cacheReadTokens: item.cacheReadTokens,
+            cacheCreationTokens: item.cacheCreationTokens,
             firstTokenMs: item.firstTokenMs,
             finishReason: item.finishReason, toolCallCount: item.tools.length,
             toolCalls: item.tools.map((entry) => ({ name: entry.toolName, args: entry.args })),
@@ -166,6 +167,7 @@ function rowsOf(events: readonly SseEvent[], opts: { projection: Projection }): 
             text: item.reasoning ?? "", content: item.content, model: item.model,
             inputTokens: item.inputTokens, outputTokens: item.outputTokens,
             reasoningTokens: item.reasoningTokens, cacheReadTokens: item.cacheReadTokens,
+            cacheCreationTokens: item.cacheCreationTokens,
             finishReason: item.finishReason,
             status: item.hasError ? "error" : "ok", durationMs: item.durationMs,
             eventIndexes: idx(item), serverMs: item.serverMs ?? null,
