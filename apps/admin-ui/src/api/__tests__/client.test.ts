@@ -229,3 +229,27 @@ describe("401 unauthorized handler", () => {
     expect(handler).not.toHaveBeenCalled();
   });
 });
+
+// B-63 —— 下载类请求(responseType: "blob")出错时响应体是 Blob:JSON 错误体要解开,
+// 下载失败才带得上后端的错误码(产物「超过保留期」与「没有单独保留」靠 detail.code 区分)。
+describe("blob error bodies (B-63)", () => {
+  it("reads code and message out of a JSON error body that arrived as a Blob", async () => {
+    const body = new Blob(
+      [JSON.stringify({ detail: { code: "ARTIFACT_VERSION_EXPIRED", message: "expired" } })],
+      { type: "application/json" },
+    );
+    await expect(
+      createClient().get("/v1/sessions/t/workspace/artifacts/a/download", {
+        responseType: "blob",
+        adapter: rejectWithData(409, body),
+      }),
+    ).rejects.toMatchObject({ status: 409, code: "ARTIFACT_VERSION_EXPIRED", message: "expired" });
+  });
+
+  it("leaves a non-JSON blob alone", async () => {
+    const body = new Blob(["<html>bad gateway</html>"], { type: "text/html" });
+    await expect(
+      createClient().get("/x", { responseType: "blob", adapter: rejectWithData(502, body) }),
+    ).rejects.toMatchObject({ status: 502, code: "HTTP_502" });
+  });
+});

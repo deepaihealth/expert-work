@@ -354,6 +354,13 @@ async def test_list_active_past_retention_picks_stale_active_only() -> None:
     stale = artifacts[0]
     backdated = stale.model_copy(update={"updated_at": datetime.now(UTC) - timedelta(days=100)})
     store._artifacts[stale.id] = backdated
+    # B-63 —— the row's clock is its versions' last use: backdate the version too.
+    store._versions = [
+        x.model_copy(update={"created_at": datetime.now(UTC) - timedelta(days=100)})
+        if x.id == v.id
+        else x
+        for x in store._versions
+    ]
     # Also create a fresh active row.
     await store.save_version(
         tenant_id=tenant_id,
@@ -364,8 +371,7 @@ async def test_list_active_past_retention_picks_stale_active_only() -> None:
         path_in_workspace="fresh.md",
         created_in_thread="t-new",
     )
-    cutoff = datetime.now(UTC) - timedelta(days=90)
-    rows = await store.list_active_past_retention(before=cutoff)
+    rows = await store.list_active_past_retention(now=datetime.now(UTC), default_days=90)
     assert [a.name for a in rows] == ["stale.md"]
     assert v.version == 1  # unchanged sanity
 
@@ -583,13 +589,14 @@ async def test_list_versions_expired_is_per_version_oldest_first() -> None:
     store = InMemoryArtifactStore()
     a = await _seed_versions(store, name="a.md", ages_days=[120, 100, 5])
     b = await _seed_versions(store, name="b.md", ages_days=[3])
-    cutoff = datetime.now(UTC) - timedelta(days=90)
+    now = datetime.now(UTC)
 
-    expired = await store.list_versions_expired(before=cutoff)
+    expired = await store.list_versions_expired(now=now, default_days=90)
 
-    assert [(v.artifact_id, v.version) for v in expired] == [(a, 1), (a, 2)]
-    assert b not in {v.artifact_id for v in expired}
-    assert await store.list_versions_expired(before=cutoff, limit=1) == expired[:1]
+    assert [(e.version.artifact_id, e.version.version) for e in expired] == [(a, 1), (a, 2)]
+    assert b not in {e.version.artifact_id for e in expired}
+    assert {e.retention_days for e in expired} == {90}
+    assert await store.list_versions_expired(now=now, default_days=90, limit=1) == expired[:1]
 
 
 @pytest.mark.asyncio
@@ -637,8 +644,81 @@ async def test_list_versions_expired_orders_same_timestamp_by_version() -> None:
         v.model_copy(update={"id": reversed_ids[v.version - 1], "created_at": same_ts})
         for v in store._versions
     ]
-    cutoff = datetime.now(UTC) - timedelta(days=90)
+    expired = await store.list_versions_expired(now=datetime.now(UTC), default_days=90)
 
-    expired = await store.list_versions_expired(before=cutoff)
+    assert [(e.version.artifact_id, e.version.version) for e in expired] == [
+        (a, 1),
+        (a, 2),
+        (a, 3),
+    ]
 
-    assert [(v.artifact_id, v.version) for v in expired] == [(a, 1), (a, 2), (a, 3)]
+
+# ---------------------------------------------------------------------------
+# B-63 —— 按最后使用到期:旧版本按自己的时钟,最新版与产物行按产物的时钟(各版本最晚的)
+# ---------------------------------------------------------------------------
+
+
+def _used(store: InMemoryArtifactStore, artifact_id: UUID, version: int, days_ago: int) -> None:
+    at = datetime.now(UTC) - timedelta(days=days_ago)
+    store._versions = [
+        x.model_copy(update={"last_used_at": at})
+        if x.artifact_id == artifact_id and x.version == version
+        else x
+        for x in store._versions
+    ]
+
+
+@pytest.mark.asyncio
+async def test_a_recently_used_old_version_keeps_itself_and_the_latest() -> None:
+    """v1 200 天前登记、10 天前还下载过;v2(最新)120 天前登记、没人用过。v1 自己没到期;
+    v2 是最新版,按整条产物最晚的时钟(v1 的使用)也没到期;产物行同样没到期。"""
+    store = InMemoryArtifactStore()
+    a = await _seed_versions(store, name="kept.md", ages_days=[200, 120])
+    _used(store, a, 1, days_ago=10)
+    now = datetime.now(UTC)
+
+    assert await store.list_versions_expired(now=now, default_days=90) == []
+    assert await store.list_active_past_retention(now=now, default_days=90) == []
+
+
+@pytest.mark.asyncio
+async def test_an_unused_old_version_expires_while_a_used_latest_keeps_the_row() -> None:
+    store = InMemoryArtifactStore()
+    a = await _seed_versions(store, name="mixed.md", ages_days=[200, 120])
+    _used(store, a, 2, days_ago=10)
+    now = datetime.now(UTC)
+
+    expired = await store.list_versions_expired(now=now, default_days=90)
+    assert [(e.version.artifact_id, e.version.version) for e in expired] == [(a, 1)]
+    assert await store.list_active_past_retention(now=now, default_days=90) == []
+
+
+@pytest.mark.asyncio
+async def test_the_row_and_its_latest_version_expire_together() -> None:
+    store = InMemoryArtifactStore()
+    a = await _seed_versions(store, name="gone.md", ages_days=[200, 120])
+    _used(store, a, 1, days_ago=95)
+    now = datetime.now(UTC)
+
+    expired = await store.list_versions_expired(now=now, default_days=90)
+    assert [(e.version.artifact_id, e.version.version) for e in expired] == [(a, 1), (a, 2)]
+    assert [r.id for r in await store.list_active_past_retention(now=now, default_days=90)] == [a]
+
+
+@pytest.mark.asyncio
+async def test_touch_version_writes_at_most_once_a_day() -> None:
+    store = InMemoryArtifactStore()
+    a = await _seed_versions(store, name="t.md", ages_days=[5])
+    version = (await store.list_versions_by_artifact(artifact_id=a))[0]
+    now = datetime.now(UTC)
+    t = version.tenant_id
+
+    assert await store.touch_version(version_id=version.id, tenant_id=uuid4(), now=now) is False
+    assert await store.touch_version(version_id=version.id, tenant_id=t, now=now) is True
+    later = now + timedelta(hours=23)
+    assert await store.touch_version(version_id=version.id, tenant_id=t, now=later) is False
+    after = (await store.list_versions_by_artifact(artifact_id=a))[0]
+    assert after.last_used_at == now
+    next_day = now + timedelta(days=1, minutes=1)
+    assert await store.touch_version(version_id=version.id, tenant_id=t, now=next_day) is True
+    assert await store.touch_version(version_id=uuid4(), tenant_id=t, now=next_day) is False

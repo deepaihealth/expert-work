@@ -345,11 +345,18 @@ async def test_sweep_artifacts_soft_deletes_stale_active_rows() -> None:
         path_in_workspace="stale.md",
         created_in_thread="t-1",
     )
-    # Backdate ``updated_at`` to before the retention horizon.
+    # Backdate ``updated_at`` to before the retention horizon — and (B-63) its
+    # version, since a row's clock is its versions' last use.
     stale = (await artifacts.list_for_user(tenant_id=tenant, user_id=user, agent_key=_AGENT_KEY))[0]
     artifacts._artifacts[stale.id] = stale.model_copy(
         update={"updated_at": datetime.now(UTC) - timedelta(days=120)}
     )
+    artifacts._versions = [
+        v.model_copy(update={"created_at": datetime.now(UTC) - timedelta(days=120)})
+        if v.artifact_id == stale.id
+        else v
+        for v in artifacts._versions
+    ]
     # And a fresh row that must survive.
     await artifacts.save_version(
         tenant_id=tenant,

@@ -1098,6 +1098,7 @@ const zhCN: TranslationKeys = {
     version_not_kept_title: "{{name}} 的第 {{version}} 版下载不了",
     version_not_kept_body:
       "这一版登记在「每个版本单独留存」上线之前，内容没有单独保留；之后同名产物又登记过新版本。可以改为下载最新版。",
+    version_expired_body: "这一版已超过保留期被清理。可以改为下载最新版。",
     download_latest: "下载最新版",
     ver_col_download: "下载",
     ver_not_kept: "内容未保留",

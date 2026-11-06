@@ -3,15 +3,22 @@
 from __future__ import annotations
 
 from collections.abc import Collection, Sequence
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from uuid import UUID, uuid4
 
-from expert_work.persistence.artifact.base import ArtifactStore
+from expert_work.persistence.artifact.base import ArtifactStore, ExpiredArtifactVersion
+from expert_work.persistence.user_upload.base import TOUCH_INTERVAL
 from expert_work.protocol import Artifact, ArtifactKind, ArtifactVersion
 
 #: Aware sentinel so artifacts with no ``updated_at`` sort last without
 #: a naive-vs-aware datetime comparison error.
 _MIN_AWARE = datetime.min.replace(tzinfo=UTC)
+
+
+def _version_clock(v: ArtifactVersion) -> datetime:
+    """B-63 —— 与 SQL 实现同一个时钟,但内存里没有 run:``created_at`` / ``last_used_at``
+    最晚的那个(会话最后一次 run、租户保留期由 SQL 集成测试覆盖)。"""
+    return max(t for t in (v.created_at or _MIN_AWARE, v.last_used_at) if t is not None)
 
 
 class InMemoryArtifactStore(ArtifactStore):
@@ -268,19 +275,25 @@ class InMemoryArtifactStore(ArtifactStore):
         rows.sort(key=lambda a: a.deleted_at or _MIN_AWARE)
         return rows[:limit]
 
+    def _artifact_clock(self, artifact: Artifact) -> datetime:
+        clocks = [_version_clock(v) for v in self._versions if v.artifact_id == artifact.id]
+        return max(clocks) if clocks else (artifact.updated_at or _MIN_AWARE)
+
     async def list_active_past_retention(
         self,
         *,
-        before: datetime,
+        now: datetime,
+        default_days: int,
         limit: int = 1000,
     ) -> list[Artifact]:
-        rows = [
-            a
+        window = timedelta(days=default_days)
+        due = [
+            (self._artifact_clock(a) + window, a)
             for a in self._artifacts.values()
-            if a.deleted_at is None and (a.updated_at or _MIN_AWARE) < before
+            if a.deleted_at is None
         ]
-        rows.sort(key=lambda a: a.updated_at or _MIN_AWARE)
-        return rows[:limit]
+        rows = sorted(((at, a) for at, a in due if at < now), key=lambda p: (p[0], str(p[1].id)))
+        return [a for _, a in rows[:limit]]
 
     async def update_kind(
         self,
@@ -324,13 +337,36 @@ class InMemoryArtifactStore(ArtifactStore):
     async def list_versions_expired(
         self,
         *,
-        before: datetime,
+        now: datetime,
+        default_days: int,
         limit: int = 1000,
-    ) -> list[ArtifactVersion]:
-        rows = [v for v in self._versions if v.created_at is not None and v.created_at < before]
-        # Same tiebreak as the SQL store: ``created_at, artifact_id, version``.
-        rows.sort(key=lambda v: (v.created_at or _MIN_AWARE, str(v.artifact_id), v.version))
-        return rows[:limit]
+    ) -> list[ExpiredArtifactVersion]:
+        window = timedelta(days=default_days)
+        due: list[tuple[datetime, ArtifactVersion]] = []
+        for v in self._versions:
+            parent = self._artifacts.get(v.artifact_id)
+            # 最新版用产物的时钟(各版本里最晚的),同 SQL 实现。
+            if parent is not None and v.version == parent.latest_version:
+                clock = self._artifact_clock(parent)
+            else:
+                clock = _version_clock(v)
+            if clock + window < now:
+                due.append((clock + window, v))
+        # Same tiebreak as the SQL store: ``expires_at, artifact_id, version``.
+        due.sort(key=lambda p: (p[0], str(p[1].artifact_id), p[1].version))
+        return [
+            ExpiredArtifactVersion(version=v, retention_days=default_days) for _, v in due[:limit]
+        ]
+
+    async def touch_version(self, *, version_id: UUID, tenant_id: UUID, now: datetime) -> bool:
+        for index, v in enumerate(self._versions):
+            if v.id != version_id or v.tenant_id != tenant_id:
+                continue
+            if v.last_used_at is not None and v.last_used_at >= now - TOUCH_INTERVAL:
+                return False
+            self._versions[index] = v.model_copy(update={"last_used_at": now})
+            return True
+        return False
 
     async def list_versions_by_artifact(self, *, artifact_id: UUID) -> list[ArtifactVersion]:
         rows = [v for v in self._versions if v.artifact_id == artifact_id]

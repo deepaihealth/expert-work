@@ -9,10 +9,26 @@ from __future__ import annotations
 
 import abc
 from collections.abc import Collection, Sequence
+from dataclasses import dataclass
 from datetime import datetime
 from uuid import UUID
 
 from expert_work.protocol import Artifact, ArtifactKind, ArtifactVersion
+
+
+@dataclass(frozen=True)
+class ExpiredArtifactVersion:
+    """B-63 —— 一个到期的产物版本,带它所属租户实际生效的保留期(审计里写这个数)。
+
+    **最后使用的时钟**:一版自己的 = ``greatest(created_at, last_used_at, 登记它的会话
+    最后一次 run)``(``created_in_thread`` 存的是 run id,经 ``agent_run`` 找到会话)。
+    产物行与它的**最新版**用产物的时钟 = 各版本时钟里最晚的那个 —— 所以最新版不会先于
+    旧版本被清掉(否则产物还在列表里却下载不了),产物从列表里消失的那一刻正是最新版
+    到期的那一刻。保留期 = 租户的 ``tenant_config.artifact_retention_days``,没设用平台默认。
+    """
+
+    version: ArtifactVersion
+    retention_days: int
 
 
 class ArtifactStore(abc.ABC):
@@ -237,14 +253,19 @@ class ArtifactStore(abc.ABC):
     async def list_active_past_retention(
         self,
         *,
-        before: datetime,
+        now: datetime,
+        default_days: int,
         limit: int = 1000,
     ) -> list[Artifact]:
-        """Active rows whose ``updated_at < before`` — past their retention window.
+        """Active rows past their retention window — B-63: counted from **last use**.
 
-        The retention sweep calls this with ``now - retention_days``
-        and soft-deletes each returned row, kicking off the hard-delete
-        countdown.
+        A row is past retention when its clock (the latest of its versions' clocks, see
+        :class:`ExpiredArtifactVersion`; ``updated_at`` when it has no version) plus the
+        tenant's ``artifact_retention_days`` (``default_days`` when unset) is before
+        ``now`` — the very moment its latest version expires in
+        :meth:`list_versions_expired`. The retention sweep soft-deletes each returned
+        row, kicking off the hard-delete countdown. The in-memory backend has no runs
+        and no tenant config: ``created_at`` / ``last_used_at`` and ``default_days``.
         """
 
     @abc.abstractmethod
@@ -291,16 +312,22 @@ class ArtifactStore(abc.ABC):
     async def list_versions_expired(
         self,
         *,
-        before: datetime,
+        now: datetime,
+        default_days: int,
         limit: int = 1000,
-    ) -> list[ArtifactVersion]:
-        """留存链 B-28 —— 跨租户列出 ``created_at < before`` 的版本行,最老在前。
+    ) -> list[ExpiredArtifactVersion]:
+        """留存链 B-28 / B-63 —— 跨租户列出按**最后使用**已经到期的版本行,最早到期的在前。
 
-        Caller MUST be inside an RLS bypass scope (the retention job's
-        ``_bypass_rls``). 按版本而不是按逻辑产物判:同名产物有多个版本时,
-        老版本先到期、新版本留着。父 ``artifact`` 行是否软删不影响 —— 版本
-        行到期就是到期。
+        时钟见 :class:`ExpiredArtifactVersion`:旧版本按自己的时钟,最新版按产物的时钟。
+        只会比按 ``created_at`` 算留得更久。Caller MUST be inside an RLS bypass scope
+        (the retention job's ``_bypass_rls``). 按版本判:同名产物有多个版本时,没人用的
+        老版本先到期、新版本留着。父 ``artifact`` 行是否软删不影响 —— 版本行到期就是到期。
         """
+
+    @abc.abstractmethod
+    async def touch_version(self, *, version_id: UUID, tenant_id: UUID, now: datetime) -> bool:
+        """B-63 —— 记一次下载:``last_used_at = now``,只在这一版属于 ``tenant_id``、且上次记的
+        时间为空或早于 ``now - TOUCH_INTERVAL`` 时才写(每版每天最多一次)。``True`` = 真的写了。"""
 
     @abc.abstractmethod
     async def list_versions_by_artifact(self, *, artifact_id: UUID) -> list[ArtifactVersion]:

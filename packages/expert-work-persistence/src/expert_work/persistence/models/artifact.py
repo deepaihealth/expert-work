@@ -110,6 +110,9 @@ class ArtifactVersionRow(Base):
     #: B-235 —— 这一版字节的副本键(迁移 ``0180``)。NULL = B-235 之前登记的版本,
     #: 内容只能从 ``path_in_workspace`` 读。
     snapshot_key: Mapped[str | None] = mapped_column(Text, nullable=True)
+    #: B-63 (migration ``0184``) —— 最后一次被下载的时间,每版每天最多记一次。NULL = 列加上
+    #: 之后没被下载过。
+    last_used_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
     __table_args__ = (
         UniqueConstraint("artifact_id", "version", name="artifact_version_identity_uniq"),

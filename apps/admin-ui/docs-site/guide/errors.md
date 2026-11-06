@@ -225,7 +225,7 @@
 
 **审批决策**（`POST /v1/agents/{agent_code}/runs/{run_id}:decide`）：`APPROVAL_CONFLICT` 表示这条审批已经被决定过，包括重复提交、并发提交中落败的一方，以及同一会话里发起新一轮之后失效的审批，不要重复提交决策；`SESSION_NOT_BOUND` 表示这个 run 所在的会话没有绑定 Agent，联系租户管理员。两个错误码的完整触发条件见 [4.2 审批决策](./run-control#_4-2-审批决策)。
 
-**产物下载**（`GET /v1/agents/{agent_code}/artifacts/download`）：`ARTIFACT_VERSION_MISMATCH` 表示请求带的 `version` 取不到内容。每个版本登记时都会单独保留一份内容，带 `version` 就能下载那一版；取不到只有两种情况：这个版本号不存在，包括超过保留期已被清理的；或者这个版本登记于「每个版本单独保留内容」上线之前、且已不是最新版本，它的内容当时被同名的新版本覆盖了。重试无效；改用最新版重新下载，或按业务异常处理。见 [5.7 下载产物](./query#_5-7-产物)。
+**产物下载**（`GET /v1/agents/{agent_code}/artifacts/download`）：`ARTIFACT_VERSION_MISMATCH` 表示请求带的 `version` 取不到内容。每个版本登记时都会单独保留一份内容，带 `version` 就能下载那一版；取不到有三种情况：这个版本号不存在；这个版本超过保留期已被清理，`error.message` 里写明 `removed after its retention period`（见 [5.7 产物的保留期](./query#产物的保留期)）；或者这个版本登记于「每个版本单独保留内容」上线之前、且已不是最新版本，它的内容当时被同名的新版本覆盖了。重试无效；改用最新版重新下载，或按业务异常处理。见 [5.7 下载产物](./query#_5-7-产物)。
 
 **重新生成与编辑重发**（`POST /v1/agents/{agent_code}/runs/{run_id}:regenerate` 与 `…:edit`）：`THREAD_BUSY` 表示这段会话有一轮正在执行或排队，等它结束、或先用取消 run 停掉它再试；`RUN_AWAITING_APPROVAL` 表示目标那一轮正等待审批决策，先做决策（[4.2 审批决策](./run-control#_4-2-审批决策)），再对续跑后的那一轮操作；`RUN_ALREADY_SUPERSEDED` 表示目标那一轮已经被重新生成过，改对最新的那一轮操作。三个错误码原样重试都无效。
 

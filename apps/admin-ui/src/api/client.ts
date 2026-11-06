@@ -99,6 +99,20 @@ function readDetail(detail: unknown, key: "code" | "message"): string | undefine
   return undefined;
 }
 
+/** B-63 —— 下载类请求(``responseType: "blob"``)出错时,响应体也是 Blob,``detail`` 读不到,
+ *  错误码只剩 ``HTTP_<status>``。JSON 的错误体在这里解开,下载失败也带得上后端的错误码与原因
+ *  (产物「超过保留期」与「没有单独保留」两种 409 靠 ``detail.code`` 区分)。解不开就原样返回。 */
+async function readErrorBody(data: unknown): Promise<unknown> {
+  if (typeof Blob === "undefined" || !(data instanceof Blob) || !data.type.includes("json")) {
+    return data;
+  }
+  try {
+    return JSON.parse(await data.text()) as unknown;
+  } catch {
+    return data;
+  }
+}
+
 export function createClient(baseURL = ""): AxiosInstance {
   const client = axios.create({ baseURL });
   client.interceptors.request.use((config) => {
@@ -111,7 +125,7 @@ export function createClient(baseURL = ""): AxiosInstance {
   });
   client.interceptors.response.use(
     (response) => response,
-    (error: unknown) => {
+    async (error: unknown) => {
       if (axios.isAxiosError(error)) {
         const status = error.response?.status ?? 0;
         // 401 = 会话过期(后端 401 只表示认证失败,授权失败是 403)——
@@ -119,7 +133,11 @@ export function createClient(baseURL = ""): AxiosInstance {
         if (status === 401 && unauthorizedHandler !== null && getStoredToken() !== null) {
           unauthorizedHandler();
         }
-        const body = error.response?.data as { detail?: unknown; error?: unknown } | undefined;
+        // B-63 —— blob 下载的错误体要先读出来(readErrorBody);之后同时认 FastAPI ``detail``
+        // 与 B-278 的 ``{success, data, error}`` 信封。
+        const body = (await readErrorBody(error.response?.data)) as
+          | { detail?: unknown; error?: unknown }
+          | undefined;
         const detail = body?.detail;
         if (detail === undefined && isRecord(body?.error)) {
           // B-278 —— 控制台路由也有 4xx 走 ``{success, data, error}`` 信封

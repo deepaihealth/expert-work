@@ -1333,3 +1333,33 @@ async def test_a_deferred_row_still_failing_a_week_past_expiry_needs_attention(
     assert tally.needs_attention
     assert job._failed_passes == ["uploads"]
     assert not await world.deleted(upload_id)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("method", ["list_versions_expired", "list_active_past_retention"])
+async def test_a_failing_artifact_pass_is_reported_and_the_later_passes_still_run(
+    world: _World, method: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """B-63 —— 产物两条 pass 的查询变重了(按最后使用算),撞上 ``statement_timeout`` 之类时
+    只记这一 pass 失败(进程以非 0 退出),后面的 pass 照跑。"""
+    artifacts = InMemoryArtifactStore()
+
+    async def _down(**_kwargs: object) -> object:
+        raise RuntimeError("canceling statement due to statement timeout")
+
+    monkeypatch.setattr(artifacts, method, _down)
+    job = world.job(artifact_store=artifacts)
+    _stub_sql_passes(job)
+    later: list[str] = []
+
+    async def _orphans() -> int:
+        later.append("orphan_thread_dirs")
+        return 0
+
+    monkeypatch.setattr(job, "_sweep_orphan_thread_dirs", _orphans)
+
+    report = await job.run_once()
+
+    assert report.failed_passes == ("artifacts",)
+    assert later == ["orphan_thread_dirs"]
+    assert exit_code(report) == EXIT_PASS_FAILED
