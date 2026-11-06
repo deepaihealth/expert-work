@@ -53,11 +53,18 @@ interface Tokens {
  *  (B-185) and runtime ``token_usage._prompt_tokens`` (B-142). */
 const INPUT_EXCLUDES_CACHE_PROVIDERS: ReadonlySet<string> = new Set(["anthropic"]);
 
+/** Whether ``provider``'s input count leaves the cache reads / writes out
+ *  (B-279). ``null`` = unknown → the OpenAI-compatible rule, like runtime
+ *  ``_prompt_tokens``. */
+export function inputExcludesCache(provider: string | null): boolean {
+  return provider !== null && INPUT_EXCLUDES_CACHE_PROVIDERS.has(provider);
+}
+
 /** The input tokens to price at the full input rate — billing-rollup-job
  *  ``_uncached_input_tokens``: cache hits / writes have their own prices, so
  *  where ``input`` already contains them they come out first (clamped at 0). */
 function uncachedInputTokens(provider: string, t: Tokens): number {
-  if (INPUT_EXCLUDES_CACHE_PROVIDERS.has(provider)) return t.input;
+  if (inputExcludesCache(provider)) return t.input;
   return Math.max(0, t.input - t.cacheRead - t.cacheCreation);
 }
 

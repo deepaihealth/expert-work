@@ -1300,6 +1300,58 @@ describe("PlaygroundTab", () => {
     expect(listRateCardsMock).not.toHaveBeenCalled();
   });
 
+  // B-279 —— 状态栏的缓存命中率按智能体自己的厂商算:Anthropic 的 input 不含缓存,
+  // 分母是 input + 命中 + 写入。非 admin 也有这一项(不靠价目表拿厂商)。
+  it("cache-hit chip uses the agent's provider rule — Anthropic main line, non-admin", async () => {
+    const user = userEvent.setup();
+    const claudeDetail: AgentDetailResponse = {
+      record: {
+        ...sampleDetail.record,
+        spec: {
+          apiVersion: "expert_work.io/v1",
+          kind: "Agent",
+          metadata: { name: "demo-agent", version: "1.0.0", tenant: "acme" },
+          spec: { model: { provider: "anthropic", name: "claude-x" } },
+        },
+      },
+    };
+    createSessionMock.mockResolvedValue(sampleThread);
+    streamRunMock.mockReturnValue(
+      makeStream([
+        { id: "m", event: "metadata", data: { run_id: "r-1" }, rawData: "", receivedAt: "2026-05-25T00:00:01Z" },
+        {
+          id: "u",
+          event: "updates",
+          data: {
+            agent: {
+              step_count: 1,
+              messages: [
+                {
+                  type: "ai",
+                  content: "hi",
+                  usage_metadata: {
+                    input_tokens: 1000,
+                    output_tokens: 10,
+                    total_tokens: 1010,
+                    input_token_details: { cache_read: 9000, cache_creation: 2000 },
+                  },
+                },
+              ],
+            },
+          },
+          rawData: "",
+          receivedAt: "2026-05-25T00:00:02Z",
+        },
+        { id: "e", event: "end", data: "ok", rawData: "ok", receivedAt: "2026-05-25T00:00:03Z" },
+      ]),
+    );
+    renderPg(claudeDetail);
+    await user.type(await screen.findByTestId("playground-input"), "q");
+    await user.click(screen.getByTestId("playground-run"));
+    // 9000 / (1000 + 9000 + 2000) = 75%(旧算法 9000 / 1000 = 900%)
+    expect(await screen.findByTestId("console-stat-cache")).toHaveTextContent("75%");
+  });
+
   // §八.4 — 脚注一行式:cost lives in the meta tooltip;§八.6 — 「查看运行」
   // 搬到右栏头部,这里连同断言(console-inspect-run-link)。
   it("shows per-turn cost (tooltip) + step count in the one-line footer", async () => {

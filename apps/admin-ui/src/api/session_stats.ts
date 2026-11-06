@@ -9,10 +9,10 @@
  */
 import type { TurnTiming } from "../components/console/types";
 import type { TurnStatus } from "../components/turn/types";
-import { costCnyOfBuckets, type RateBook } from "./cost";
+import { costCnyOfBuckets, inputExcludesCache, type RateBook } from "./cost";
 import type { RunTokens } from "./runs";
 import type { SseEvent } from "./sessions";
-import { summarizeTurn, type UsageBucket } from "./turn_summary";
+import { summarizeTurn, type TurnUsage, type UsageBucket } from "./turn_summary";
 
 export interface StatsTurnInput {
   events: readonly SseEvent[];
@@ -73,7 +73,6 @@ interface TurnContribution {
   toolMs: number;
   inputTokens: number;
   outputTokens: number;
-  cacheReadTokens: number;
   /** B-42 — the turn's usage split by ``(provider, model)`` for pricing. */
   buckets: readonly UsageBucket[];
 }
@@ -158,16 +157,45 @@ function contributionOf(events: readonly SseEvent[]): TurnContribution {
     toolMs,
     inputTokens: summary.usage?.inputTokens ?? 0,
     outputTokens: summary.usage?.outputTokens ?? 0,
-    cacheReadTokens: summary.usage?.cacheReadTokens ?? 0,
     buckets: summary.usageByModel,
   };
   CONTRIBUTION_CACHE.set(events, contribution);
   return contribution;
 }
 
+/** The prompt a call actually sent — runtime ``token_usage._prompt_tokens``
+ *  (B-142): Anthropic reports cache reads / writes beside ``input``, every
+ *  other provider inside it. The cache-hit rate's denominator (B-279). */
+function promptTokensOf(provider: string | null, u: TurnUsage): number {
+  return inputExcludesCache(provider)
+    ? u.inputTokens + u.cacheCreationTokens + u.cacheReadTokens
+    : u.inputTokens;
+}
+
+/** Σ cache read ÷ Σ prompt over every bucket, each bucket under its own
+ *  provider (an unattributed one under the agent's — same fallback as
+ *  ``cost.ts`` ``keyOf``). 0-100 rounded; ``null`` when nothing was sent. */
+function cacheHitPctOf(
+  buckets: readonly UsageBucket[],
+  agentProvider: string | null,
+): number | null {
+  let read = 0;
+  let prompt = 0;
+  for (const b of buckets) {
+    const provider = b.provider !== null && b.model !== null ? b.provider : agentProvider;
+    read += b.usage.cacheReadTokens;
+    prompt += promptTokensOf(provider, b.usage);
+  }
+  return prompt > 0 ? Math.round((read / prompt) * 100) : null;
+}
+
+/** ``agentProvider`` — the agent's own ``spec.model.provider``: main-line
+ *  usage names no provider, and the cache-hit rate needs one (B-279).
+ *  ``null`` = unknown → the OpenAI-compatible rule. */
 export function computeSessionStats(
   turns: readonly StatsTurnInput[],
   rateBook: RateBook | null,
+  agentProvider: string | null,
 ): SessionStats {
   let turnsCount = 0;
   let steps = 0;
@@ -175,7 +203,6 @@ export function computeSessionStats(
   let toolMs = 0;
   let inputTokens = 0;
   let outputTokens = 0;
-  let cacheReadTokens = 0;
   let partial = false;
   const ttfts: number[] = [];
   let tokSum = 0;
@@ -187,7 +214,6 @@ export function computeSessionStats(
   for (const t of turns) {
     let turnInput = 0;
     let turnOutput = 0;
-    let turnCacheRead = 0;
     buckets.push(...bucketsOfTurn(t));
 
     if (t.loaded) {
@@ -197,7 +223,6 @@ export function computeSessionStats(
       steps += c.stepCount;
       turnInput = c.inputTokens;
       turnOutput = c.outputTokens;
-      turnCacheRead = c.cacheReadTokens;
       // 终审 F6 — a cancelled-before-first-step turn has stepCount 0 but is
       // still a turn: without this the 轮数 visibly drops by 1 the moment the
       // interrupted turn's lazy load lands (unloaded turns count at line
@@ -208,7 +233,6 @@ export function computeSessionStats(
       if (t.tokens) {
         turnInput = t.tokens.input_tokens;
         turnOutput = t.tokens.output_tokens;
-        turnCacheRead = t.tokens.cache_read_tokens;
       } else {
         partial = true;
       }
@@ -217,7 +241,6 @@ export function computeSessionStats(
 
     inputTokens += turnInput;
     outputTokens += turnOutput;
-    cacheReadTokens += turnCacheRead;
 
     if (t.timing !== null && t.timing.ttftMs !== null) ttfts.push(t.timing.ttftMs);
     if (
@@ -233,7 +256,7 @@ export function computeSessionStats(
 
   const ttftAvgMs = ttfts.length > 0 ? ttfts.reduce((a, b) => a + b, 0) / ttfts.length : null;
   const tokPerSec = secSum > 0 ? Math.round((tokSum / secSum) * 10) / 10 : null;
-  const cacheHitPct = inputTokens > 0 ? Math.round((cacheReadTokens / inputTokens) * 100) : null;
+  const cacheHitPct = cacheHitPctOf(buckets, agentProvider);
   const costCny = costCnyOfBuckets(buckets, rateBook);
 
   return {

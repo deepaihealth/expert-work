@@ -2000,6 +2000,6 @@ oauth2 目录项本来就不在平台池里:不再碰平台池;`enabled` 切换�
 
 **判据公式**(与计费作业一致,每百万 token 单价取价目表):Anthropic 一次调用 = `input×输入价 + cache_read×命中价 + cache_creation×写入价 + output×输出价`;其它厂商 = `max(0, input − cache_read − cache_creation)×输入价 + 后三项同上`。账本数取只读 SQL:`select provider, model, input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens from token_usage where trace_id = (select trace_id from agent_run where id = '<run id>')`。
 
-- [ ] **93.1 Anthropic 有缓存的轮(需凭据)**:system_admin 在调试台给临时智能体 `acc-b279`(主模型 Anthropic,系统提示词写长一些,超过缓存最小长度)连发两轮。判据:第二轮的 `token_usage` 行 `cache_read_tokens` > 0 且 `input_tokens` 远小于它(确认是 Anthropic 口径);控制台该轮成本 = 按上式对该 run 全部 `token_usage` 行求和(显示到 4 位小数,差 ≤ ¥0.0001);「计时」页每步成本之和等于整轮成本;同一 run 在 Langfuse 里的 input / cache 读写 token 数与 `token_usage` 一致(Langfuse 的美元成本口径不同,不比金额)。改前同一轮会明显偏低(命中大于输入时输入费变 0)
+- [ ] **93.1 Anthropic 有缓存的轮(需凭据)**:system_admin 在调试台给临时智能体 `acc-b279`(主模型 Anthropic,系统提示词写长一些,超过缓存最小长度)连发两轮。判据:第二轮的 `token_usage` 行 `cache_read_tokens` > 0 且 `input_tokens` 远小于它(确认是 Anthropic 口径);控制台该轮成本 = 按上式对该 run 全部 `token_usage` 行求和(显示到 4 位小数,差 ≤ ¥0.0001);「计时」页每步成本之和等于整轮成本;同一 run 在 Langfuse 里的 input / cache 读写 token 数与 `token_usage` 一致(Langfuse 的美元成本口径不同,不比金额)。改前同一轮会明显偏低(命中大于输入时输入费变 0);状态栏「缓存命中」= Σ cache_read ÷ Σ(input + cache_read + cache_creation),不超过 100%(改前是 命中 ÷ input,会出现几百 %)。**已知限制**:对话详情页对非 system_admin 不读智能体 manifest(B-202 的设计),拿不到主线厂商,命中率仍按旧口径
 - [ ] **93.2 其它厂商不变**:同样操作换 deepseek 主模型跑两轮。判据:控制台成本 = 上式「其它厂商」求和;与改前版本(若还有改前截图 / 记录)同一轮数字一致
 - [ ] **93.3 收尾**:删 `acc-b279` 及其对话
