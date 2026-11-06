@@ -20,6 +20,9 @@ dependencies = [
     "langgraph-checkpoint-postgres>=3.1.1",
     # Stream A.5 — S3-compatible object storage (MinIO / Aliyun OSS / AWS S3).
     "aiobotocore>=2.13.0",
+    # B-286 —— AES-256-GCM for the ``sql_encrypted`` SecretStore (moved here from
+    # control-plane so the retention job resolves the same object-store key refs).
+    "cryptography>=50.0.0,<51",
     # Stream HX-1 — real token estimation (o200k_base) for the context
     # gates; same version constraint as control-plane's chunking use.
     "tiktoken>=0.8,<1",

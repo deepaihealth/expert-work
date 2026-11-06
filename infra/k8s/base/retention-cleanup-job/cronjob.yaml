@@ -14,13 +14,18 @@
 # 与 control-plane / credential-proxy 同 tag、同发布,不再有「手工钉死」的第三个坑
 # (2026-09-07 credential-proxy 的教训)。
 #
-# 配置:job 的 settings 前缀是 EXPERT_WORK_RETENTION_*,extra="ignore" —— envFrom
-# 把 control-plane 的整套 configmap / secrets 挂进来,它只认里面显式映射的那条
-# DSN(下面 env:),其余键全部忽略。对象存储后端保持 job 默认的 `memory`:
-# 首部署不给它 OSS 凭据(control-plane 的 AK/SK 是 secret:// 引用,要经
-# sql_encrypted 金库解析,job 不走那条链),于是 image_upload 的 blob 回收与
-# 旧的「删归档 key」两条 pass 是 no-op —— 留存链 PR2 起,job 对 OSS 归档对象
-# **不主动删**,靠桶生命周期到期。
+# 配置:job 自己的 settings 前缀是 EXPERT_WORK_RETENTION_*,extra="ignore" —— envFrom
+# 把 control-plane 的整套 configmap / secrets 挂进来,DSN 用下面 env: 显式映射的那条。
+# 对象存储(B-286):job 读与 control-plane **同一套** EXPERT_WORK_OBJECT_STORE_*
+# (configmap)和 EXPERT_WORK_SECRET_STORE_BACKEND / EXPERT_WORK_SECRET_ENCRYPTION_KEY
+# (configmap / control-plane-secrets),用同一份代码经 sql_encrypted 金库把
+# secret:// 引用解成 AK/SK(同一个 DSN,读得到 encrypted_secret 表)——所以这里不需要
+# 额外的 env / secret。此前 job 只认 EXPERT_WORK_RETENTION_OBJECT_STORE_*、默认
+# `memory`,image_upload 的 blob 回收在测试 / 生产从没跑过。解不出来(KEK 缺 / 不对、
+# 密钥行不在、配置不全)不崩:日志 `retention.object_store … available=false error=<类型>`,
+# 图片 pass 跳过(行不动)并记 failed_passes → 退出码 3。显式设了
+# EXPERT_WORK_RETENTION_OBJECT_STORE_BACKEND 的照旧走 job 自己那套(明文 AK/SK,本地用)。
+# 留存链 PR2 起,job 对 OSS 工作区归档对象**不主动删**,靠桶生命周期到期。
 #
 # 并发:concurrencyPolicy Forbid —— 上一次还没跑完就跳过这一次;每条清理规则
 # 自身幂等,重跑无副作用。多副本 control-plane 与本 job 之间没有互斥需求:

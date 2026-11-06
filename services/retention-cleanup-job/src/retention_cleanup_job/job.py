@@ -147,6 +147,7 @@ class RetentionCleanupJob:
         batch_size: int = 10000,
         image_upload_store: ImageUploadStore | None = None,
         object_store: ObjectStore | None = None,
+        object_store_unavailable: str | None = None,
         artifact_store: ArtifactStore | None = None,
         artifact_retention_days: int = 90,
         artifact_hard_delete_grace_days: int = 60,
@@ -210,6 +211,9 @@ class RetentionCleanupJob:
         self._batch_size = batch_size
         self._image_upload_store = image_upload_store
         self._object_store = object_store
+        #: B-286 —— 对象存储配了却用不了(引用解不出 / 建不起来)的原因(异常类型);图片 pass
+        #: 记跳过并进 ``failed_passes``,不让整个作业崩。
+        self._object_store_unavailable = object_store_unavailable
         self._artifact_store = artifact_store
         self._artifact_retention_days = artifact_retention_days
         self._artifact_hard_delete_grace_days = artifact_hard_delete_grace_days
@@ -827,7 +831,17 @@ class RetentionCleanupJob:
 
         Returns ``(rows_deleted, keys_removed, keys_failed)``. Returns
         ``(0, 0, 0)`` when either store is missing (unit-test path).
+
+        B-286 —— 对象存储配了却用不了(``object_store_unavailable``):行一条都不动(删了行、字节
+        却删不掉,就成了永远没人认领的字节),记 ``failed_passes``,进程以非 0 退出。
         """
+        if self._object_store_unavailable is not None:
+            logger.error(
+                "retention.images_skipped reason=object_store_unavailable error=%s",
+                self._object_store_unavailable,
+            )
+            self._failed_passes.append("images")
+            return 0, 0, 0
         if self._image_upload_store is None or self._object_store is None:
             return 0, 0, 0
         expired = await self._image_upload_store.list_reapable(

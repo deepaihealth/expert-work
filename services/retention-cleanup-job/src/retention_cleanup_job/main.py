@@ -38,9 +38,13 @@ from expert_work.runtime.audit import (
     InMemoryAuditFallbackQueue,
 )
 from expert_work.runtime.runs.store import SqlRunStore
-from expert_work.runtime.storage import make_object_store
-from expert_work.runtime.storage.factory import S3CompatibleConfig
 from retention_cleanup_job.job import RetentionCleanupJob
+from retention_cleanup_job.object_store import (
+    SharedStorageSettings,
+    enter_object_store,
+    log_plan,
+    plan_object_store,
+)
 from retention_cleanup_job.report import CleanupReport
 from retention_cleanup_job.settings import RetentionCleanupSettings
 from retention_cleanup_job.workspace_files import validate_workspace_root
@@ -224,33 +228,15 @@ async def _amain() -> int:
         # Mini-ADR J-32 (J.6.补强-3b) — the image pass needs both a
         # registry + the object store. ``memory`` backend skips the
         # pass (in-memory bytes vanish per process anyway).
-        image_store: SqlImageUploadStore | None = None
-        object_store = None
-        if settings.object_store_backend == "s3-compatible":
-            if (
-                not settings.object_store_endpoint_url
-                or not settings.object_store_access_key
-                or not settings.object_store_secret_key
-            ):
-                msg = (
-                    "object_store_backend=s3-compatible requires endpoint_url + "
-                    "access_key + secret_key"
-                )
-                raise ValueError(msg)
-            object_store = await stack.enter_async_context(
-                make_object_store(
-                    settings.object_store_backend,
-                    S3CompatibleConfig(
-                        endpoint_url=settings.object_store_endpoint_url,
-                        region=settings.object_store_region,
-                        bucket=settings.object_store_bucket,
-                        access_key=settings.object_store_access_key,
-                        secret_key=settings.object_store_secret_key,
-                        addressing_style=settings.object_store_addressing_style,
-                    ),
-                )
-            )
-            image_store = SqlImageUploadStore(session_factory)
+        #
+        # B-286 —— 与 control-plane 同一个对象存储(``EXPERT_WORK_OBJECT_STORE_*`` + 同一个
+        # SecretStore 解 ``secret://`` 引用)。解不出来不崩:图片 pass 记跳过、进失败清单。
+        plan = await plan_object_store(settings, SharedStorageSettings(), session_factory)
+        object_store, plan = await enter_object_store(stack, plan)
+        log_plan(plan)
+        image_store = (
+            SqlImageUploadStore(session_factory) if plan.backend == "s3-compatible" else None
+        )
 
         # Mini-ADR J-25 (J.9-step1) — artifact lifecycle sweep wires the
         # SqlArtifactStore in unconditionally; the artifact pass is
@@ -288,6 +274,7 @@ async def _amain() -> int:
             batch_size=settings.batch_size,
             image_upload_store=image_store,
             object_store=object_store,
+            object_store_unavailable=(plan.error or "unavailable") if plan.unavailable else None,
             artifact_store=artifact_store,
             artifact_retention_days=settings.artifact_retention_days,
             artifact_hard_delete_grace_days=settings.artifact_hard_delete_grace_days,

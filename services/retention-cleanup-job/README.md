@@ -59,6 +59,13 @@ B-283 起**图片(`image_upload`,对象存储里的字节)也按最后使用到�
 | B-27 threads/ | `threads/<thread_id>/` 且 `thread_meta` 行不存在 | 行还在的目录(**不按时间删活会话**);非 UUID 名的子目录;已软删用户的整棵树 |
 | X-4 ② 已删工作区 | 软删且已归档满 90 天的 `user_workspace` 行 + 该用户的 artifact / artifact_version / user_upload 行(`WORKSPACE_HARD_DELETE` 审计) | OSS 归档对象(桶生命周期到期);`.deleted/<user>` 标记 |
 
+**图片字节与对象存储(B-286)**:`image_upload` 的 pass 删对象存储里的图片字节,用与 control-plane
+同一套 `EXPERT_WORK_OBJECT_STORE_*` 与 SecretStore(测试 / 生产是 `sql_encrypted`:`EXPERT_WORK_SECRET_ENCRYPTION_KEY`
++ `encrypted_secret` 表)解 `secret://` 引用,代码与 control-plane 共用(`expert_work.runtime.storage.config` /
+`expert_work.runtime.secret_store.sql_encrypted`)。每轮一行 `retention.object_store backend=… source=… available=…`;
+解不出来不崩:图片 pass 跳过(行不动)并进 `failed_passes`,退出码 3。显式设了
+`EXPERT_WORK_RETENTION_OBJECT_STORE_BACKEND` 的照旧用作业自己那套(明文 AK/SK,本地用)。
+
 **不变式**(`tests/test_workspace_invariant.py`):对活着的工作区,job 只删
 (a) 登记过的产物文件 (b) `uploads/` 下登记过的文件 (c) 孤儿 `threads/<id>/`;
 根目录任何其它文件/目录 —— `style/`、`MEMORY.md`、未登记文件 —— 永不触碰。

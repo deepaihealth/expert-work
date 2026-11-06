@@ -2104,3 +2104,19 @@ oauth2 目录项本来就不在平台池里:不再碰平台池;`enabled` 切换�
 - [ ] **99.5 留存补扫存量(B-286 同批上线后才能验;B-286 没上不算过,记「阻塞:待 B-286」)**:跑留存作业前,只读预数整个 `trajectories/` 前缀(作业扫的是所有租户,不只平台租户)下的对象,**只打印数字**(脚本读对象只为看 `metadata` 里有没有某个键,不打印任何内容 / 键名 / id):① 总数;② 到期的(键里的日期早于今天减该租户 `upload_retention_days`,没设按 90);以下两类都**不含**到期的:③ 老的平铺子智能体键 —— 平铺键 `…/{日期}/{线程}.jsonl`、`thread_meta` 里没有这个线程,且对象第一行 JSON 的 `metadata` 里有 `child_depth`(只有子智能体的 run 写这一项;对话本身的 run 只可能写 `retried`);④ 已删对话的键 —— 所属对话在 `thread_meta` 里没有的其余键(平铺键里 `metadata` 不带 `child_depth` 的,加上 `…/{日期}/{对话}/{子线程}.jsonl` 里对话不在的)。**别用 `agent_run` 去分 ③ / ④**:彻底删除连 run 行一起删,删掉的对话在 `agent_run` 里同样查不到,会全被算进 ③。命令随发布单给出。跑一次。判据:完成日志 `trajectories_skipped=False`(为 `True` 即不过 —— 说明作业没连上对象存储,「计数为 0、没报错」不能当通过)、`trajectories_failed=0`、退出码 0;没封顶(`trajectories_capped=False`)时 `trajectories_scanned` = ①、`trajectories_expired` = ②、`trajectory_orphans_removed` = ③+④;②+③+④ 超过 `batch_size` 时 `trajectories_capped=True`、`trajectories_expired + trajectory_orphans_removed` = `batch_size`,第二天接着删;还在的会话的对象都在。**上生产前**先在生产只读统计同样四个数(只数字),写进发布单(第一次跑会删掉所有已删对话留下的轨迹和全部老的平铺子智能体轨迹)。
 - [ ] **99.6 技能演化**:单测覆盖(`test_skill_evidence_provider.py`:删掉的对话的轨迹不进蒸馏证据、不进回放、取够了就不再往下查),真栈记「单测覆盖」。
 - [ ] **99.7 收尾**:删本节建的会话、用户与 probe job。
+
+## §100 留存作业用上 control-plane 的对象存储(B-286)
+
+**背景**:留存作业(CronJob `retention-cleanup`)此前只认 `EXPERT_WORK_RETENTION_OBJECT_STORE_*`(默认 `memory`、要明文 AK/SK),而 envFrom 带进来的是 control-plane 那套 `EXPERT_WORK_OBJECT_STORE_*`:AK/SK 是 `secret://` 引用,只有 control-plane 经 `sql_encrypted` 金库解得出来。于是 `image_upload` 的图片字节回收在测试 / 生产**从没跑过**(行到期被删、OSS 里的字节一直留着)。本次作业用同一套配置和同一份代码解引用:`resolve_object_store_config` 移到 `expert_work.runtime.storage.config`,`SqlEncryptedSecretStore` 移到 `expert_work.runtime.secret_store.sql_encrypted`(control-plane 原路径照旧可 import,行为不变)。每轮日志一行 `retention.object_store backend=… source=shared available=…`。解不出来(KEK 缺 / 不对、密钥行不在、配置不全、客户端建不起来)**不崩**:这一行 `available=false error=<异常类型>`,图片 pass 跳过(行不动)并记 `failed_passes=images`,其余 pass 照跑,退出码 3(告警会响)。显式设了 `EXPERT_WORK_RETENTION_OBJECT_STORE_BACKEND` 的照旧走作业自己那套(明文 AK/SK,本地用)。**§95(B-283)依赖本节**:它的到期删除要碰对象存储,本节没过,§95 里删字节的判据都不成立。
+
+**运维要做的**:无。作业与 control-plane 同一个镜像、同一个 DSN(同一个库角色,读得到 `encrypted_secret`)、envFrom 同一份 `control-plane-config` / `control-plane-secrets`(里面已有 `EXPERT_WORK_OBJECT_STORE_*`、`EXPERT_WORK_SECRET_STORE_BACKEND=sql_encrypted`、`EXPERT_WORK_SECRET_ENCRYPTION_KEY`),不加 env / secret / 授权,k8s 只改了 `cronjob.yaml` 的头注释。集群里没有 NetworkPolicy,作业 Pod 访问 OSS 内网端点与 control-plane 相同。
+
+**回滚注意**:回滚后作业退回 `memory`,图片字节回收又停(行照样按 90 天删)—— 与本次之前相同,无副作用。
+
+**怎么进**:测试环境控制台(system_admin,平台租户);库只读查询;`kubectl` 只读 + 手动起 job。**花费**:≈0(上传一张图,不跑对话也行)。
+
+- [ ] **100.1 作业认出对象存储**:发布后手动起一次:`kubectl -n expert-work create job --from=cronjob/retention-cleanup b286-probe-1`,等完成,看日志。判据:有且只有一行 `retention.object_store backend=s3-compatible source=shared available=true bucket=expert-work-test`;`retention_cleanup_job.done … failed_passes=-`(或只有与本节无关的项);退出码 0;日志里没有 AK / SK / `secret://`。**没修好时**:没有这一行,或 `available=false`,或 `image_keys_ok` 永远是 0。
+- [ ] **100.2 到期图片的字节真的删了**:在控制台(调试台)给任一会话上传一张图片,响应里的 `image_ref` 带图片 id;只读查 `SELECT id, object_key, created_at, deleted_at FROM image_upload WHERE id = '<图片 id>'` 记下 `object_key`,在阿里云 OSS 控制台(`expert-work-test` 桶 → 文件管理,按 `object_key` 前缀搜)确认对象在。然后让它到期,二选一:① 控制台删掉这张图(`DELETE /v1/uploads/<图片 id>`,软删的行下一轮不论年龄都回收)—— 不改库,优先用;② §95(B-283)合入后:测试租户的图片保留期设 7 天,用户批准后把这一行 `created_at` 改到 8 天前。再起一次 job(`b286-probe-2`)。判据:日志 `image_rows≥1 image_keys_ok≥1 image_keys_failed=0`;`image_upload` 里这一行没了;OSS 控制台里这个对象**不在了**(`image_keys_ok` 只说明删除请求成功,对象本来不在也会成功,所以要看桶);退出码 0。
+- [ ] **100.3 收尾**:删 probe job;若用了 ②,租户图片保留期设回原值。
+
+**生产(用户执行,随发布之后)**:不需要手动操作。发布后第一晚(03:23)的作业日志看两行:`retention.object_store … available=true bucket=expert-work-prod` 与 `retention_cleanup_job.done … image_keys_failed=0`;第一晚会把此前积压的到期图片字节一次清掉(每轮上限 `EXPERT_WORK_RETENTION_BATCH_SIZE`,默认 10000 行,多的后几晚接着清)。若出现 `available=false error=…`,把那一行贴回来(只有异常类型,不含密钥)。

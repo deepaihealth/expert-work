@@ -133,6 +133,11 @@ class RetentionCleanupSettings(BaseSettings):
     # (default) skips the image pass — useful for unit-tested local cron
     # ticks and for envs that haven't deployed J.6 yet. ``s3-compatible``
     # points at the same MinIO / OSS / S3 bucket the control-plane writes.
+    #
+    # B-286 —— these are an **override** now: only when
+    # ``EXPERT_WORK_RETENTION_OBJECT_STORE_BACKEND`` is set explicitly. Otherwise the job
+    # uses the control plane's own ``EXPERT_WORK_OBJECT_STORE_*`` + secret store
+    # (:mod:`retention_cleanup_job.object_store`).
     object_store_backend: Literal["memory", "s3-compatible"] = "memory"
     object_store_endpoint_url: str | None = None
     object_store_region: str = "us-east-1"
