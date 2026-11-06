@@ -313,6 +313,9 @@ class RetentionCleanupJob:
             trajectories_expired=trajectories.expired_removed,
             trajectory_orphans_removed=trajectories.orphans_removed,
             trajectories_failed=trajectories.failed,
+            trajectories_scanned=trajectories.scanned,
+            trajectories_capped=trajectories.capped,
+            trajectories_skipped=trajectories.skipped,
             uploads_expired=uploads.marked,
             upload_files_removed=uploads.files_removed,
             upload_files_unsafe=uploads.files_unsafe,
@@ -716,9 +719,13 @@ class RetentionCleanupJob:
     async def _sweep_trajectories(self) -> TrajectorySweepTally:
         """B-285 —— 对象存储里的轨迹对象:到期(租户 ``upload_retention_days``)与孤儿(对话行已
         不在);规则本体在 :mod:`retention_cleanup_job.trajectories`。没接对象存储或
-        ``ThreadMetaStore`` 时不跑;列不出 / 删不掉进 ``failed_passes``。"""
+        ``ThreadMetaStore`` 时不跑,但**不静默**:warning + ``skipped``(完成日志里看得出
+        「没跑」与「跑了、没东西可删」的区别 —— 部署环境在 B-286 之前就是这样);列不出 / 删不掉
+        进 ``failed_passes``。"""
         if self._object_store is None or self._thread_store is None:
-            return TrajectorySweepTally()
+            reason = "no_object_store" if self._object_store is None else "no_thread_store"
+            logger.warning("retention.trajectories_skipped reason=%s", reason)
+            return TrajectorySweepTally(skipped=True)
         try:
             async with self._sf() as session:
                 rows = (

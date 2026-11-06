@@ -55,8 +55,9 @@ from control_plane.purge.image_blobs import ImageTally, delete_images
 from control_plane.purge.trajectories import (
     TrajectoriesNotDeletedError,
     TrajectoryStore,
+    conversation_days,
     delete_conversation_trajectories,
-    run_days,
+    delete_late_trajectories,
 )
 from control_plane.runtime import AgentRuntime
 from expert_work.persistence.agent_instance.base import AgentInstanceStore
@@ -104,6 +105,9 @@ _LOG_STEP = "knowledge_retrieval_log"
 #: :func:`_purge_threads`; any of them failed → the threads stay for a re-run.
 #: B-285 —— ``deleted`` / ``failures`` key of the per-thread trajectory step.
 _TRAJECTORY_STEP = "trajectory"
+#: B-285 —— conversations whose trajectory dates could not be derived (no runs,
+#: no thread timestamps).
+_UNDATABLE = "trajectory_undatable"
 _THREAD_CHILD_STEPS = ("feedback", "quality_score", "curation_candidate_delete", "agent_approval")
 
 
@@ -366,10 +370,17 @@ async def _purge_threads(
         # before the runs go; if any cannot go, the thread is kept for a re-run.
         try:
             runs = await deps.runs.list_by_thread(thread_id=thread_id, tenant_id=tenant_id)
+            meta = None if runs else await deps.threads.get(thread_id, tenant_id=tenant_id)
+            dated = conversation_days(runs, meta)
+            if dated.undatable:
+                # No runs and no thread timestamps: nothing could be dated — count
+                # it visibly instead of reporting a clean delete.
+                summary.deleted[_UNDATABLE] = summary.deleted.get(_UNDATABLE, 0) + 1
+                logger.warning("purge_user.trajectory_undatable")
             summary.deleted[_TRAJECTORY_STEP] = summary.deleted.get(
                 _TRAJECTORY_STEP, 0
             ) + await delete_conversation_trajectories(
-                deps.trajectories, tenant_id=tenant_id, thread_id=thread_id, days=run_days(runs)
+                deps.trajectories, tenant_id=tenant_id, thread_id=thread_id, days=dated.days
             )
         except Exception as exc:
             logger.warning("purge_user.trajectories_failed error=%s", type(exc).__name__)
@@ -409,6 +420,15 @@ async def _purge_threads(
             logger.warning("purge_user.retrieval_logs_failed error=%s", type(exc).__name__)
         else:
             summary.deleted[_LOG_STEP] = summary.deleted.get(_LOG_STEP, 0) + late
+        # B-285 —— the same for a trajectory that run writes now (today's keys).
+        summary.deleted[_TRAJECTORY_STEP] = summary.deleted.get(
+            _TRAJECTORY_STEP, 0
+        ) + await delete_late_trajectories(
+            deps.trajectories,
+            tenant_id=tenant_id,
+            thread_id=thread_id,
+            log_event="purge_user.trajectories_late_failed",
+        )
 
 
 async def _purge_retrieval_logs(

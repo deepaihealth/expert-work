@@ -145,6 +145,7 @@ def log_done(report: CleanupReport) -> None:
         "orphan_artifact_copies_removed=%d "
         "purged_agent_dirs_removed=%d purged_agent_dirs_failed=%d "
         "trajectories_expired=%d trajectory_orphans_removed=%d trajectories_failed=%d "
+        "trajectories_scanned=%d trajectories_capped=%s trajectories_skipped=%s "
         "uploads_expired=%d upload_files_removed=%d upload_files_unsafe=%d "
         "upload_rows_failed=%d upload_rows_abandoned=%d upload_rows_held=%d "
         "upload_owners_unavailable=%d upload_rows_failing_overdue=%d "
@@ -171,6 +172,9 @@ def log_done(report: CleanupReport) -> None:
         report.trajectories_expired,
         report.trajectory_orphans_removed,
         report.trajectories_failed,
+        report.trajectories_scanned,
+        report.trajectories_capped,
+        report.trajectories_skipped,
         report.uploads_expired,
         report.upload_files_removed,
         report.upload_files_unsafe,

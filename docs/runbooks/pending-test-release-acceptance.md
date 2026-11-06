@@ -2065,13 +2065,13 @@ oauth2 目录项本来就不在平台池里:不再碰平台池;`enabled` 切换�
 
 > §95–§98 由别的条目占用(各自分支);都追加在文件末尾,合并时按编号排好即可。依赖 §94(B-280,同一条栈)。
 >
-> **留存那一条依赖 B-286**(`fix/b286-retention-job-object-store`):部署环境里留存作业的对象存储目前是 `memory`(解析不了控制面的 vault 引用),作业里所有对象存储 pass 都是空跑,本节新加的轨迹 pass 也一样(走的是作业既有的对象存储依赖,与图片 pass 同一个)。B-286 上线之前 99.5 只能验到「计数为 0、不报错」;99.1–99.4(控制面里的删除,控制面有真凭据)不受影响。
+> **B-286 是本节的发布前提**(`fix/b286-retention-job-object-store`):部署环境里留存作业的对象存储目前是 `memory`(解析不了控制面的 vault 引用),作业里所有对象存储 pass 都不跑 —— 本节新加的轨迹 pass 走的是作业既有的对象存储依赖(与图片 pass 同一个),没有它时完成日志写 `trajectories_skipped=True` 并打 warning `retention.trajectories_skipped reason=no_object_store`。B-285 必须与 B-286 同批发,否则删除之后才收尾的 run 写的轨迹、本修复之前删掉的对话留下的轨迹、老的平铺子智能体轨迹都**没有任何东西删**。99.1–99.4(控制面里的删除,控制面有真凭据)不依赖 B-286。
 
 **背景**:每个结束的 run 在对象存储里写一个轨迹对象 `trajectories/{租户}/{结果}/{YYYY}/{MM}/{DD}/{对话}.jsonl`,内容是整段对话(给评测候选与技能自动演化用)。此前**没有任何东西删它们**:删对话 / 删用户 / 彻底删除智能体都不删,留存不删,仓库里也没有桶生命周期;技能演化会按租户列出这些对象去蒸馏、回放第一句用户话,删掉的对话照样进模型。现在:
 
-- 三处彻底删除在删 run 行**之前**,按每个 run 的时间推出日期(`created_at` 到 `finished_at`,没收尾的用 `updated_at`,两头各放 1 小时),每天的四种结果各列一次 `…/{日期}/{对话}` 前缀(正好是这条对话自己的对象和它名下子智能体的对象),逐个删。删不掉:删对话回 503、对话留着;删智能体算失败(409 `AGENT_PURGE_INCOMPLETE`);删用户进 `failures.trajectory`、该对话留着。删对话还在删完对话行后,再扫一遍「今天」(还在收尾的 run 此刻写的那一份)。
+- 三处彻底删除在删 run 行**之前**,按每个 run 的时间推出日期(`created_at` 到 `finished_at`,没收尾的用 `updated_at`,两头各放 1 小时;没有 run 行的对话按对话行自己的 `created_at` 到 `updated_at`;两样都没有的记 `trajectory_undatable`,不当删干净了)。每天的四种结果各一个单元、并发(最多 8 个):对话自己的键是确定的,**直接删**(不存在的键删除也算成功,所以响应里的数是「清掉的键」,不是「之前确实存在的对象」);只列 `…/{日期}/{对话}/`(它名下子智能体的对象)并逐个删。删不掉:删对话回 503、对话留着;删智能体算失败(409 `AGENT_PURGE_INCOMPLETE`);删用户进 `failures.trajectory`、该对话留着。三处都在删完对话行后,再扫一遍「今天」(还在收尾的 run 此刻写的那一份),失败只记日志。
 - 子智能体的轨迹键改成 `…/{日期}/{所属对话}/{子线程}.jsonl`(原来平铺在 `{子线程}.jsonl`,找不到所属对话)。
-- 留存作业新加一条:到期(对象日期早于今天减租户 `upload_retention_days`,没设用平台默认 90)与孤儿(所属对话的 `thread_meta` 行已不在,包括本修复之前删掉的对话、之前平铺的子智能体对象)都删;一轮最多 `batch_size` 个;删不掉记失败(进程非 0 退出)。完成日志多三项 `trajectories_expired` / `trajectory_orphans_removed` / `trajectories_failed`。
+- 留存作业新加一条:到期(对象日期早于今天减租户 `upload_retention_days`,没设用平台默认 90)与孤儿(所属对话的 `thread_meta` 行已不在,包括本修复之前删掉的对话、之前平铺的子智能体对象)都删。按页列,删成功 `batch_size` 个就停止往下列(剩下的第二天接着删,info 日志 `retention.trajectories_capped`);删失败不占这个额度,另有 50 次失败上限,到了就停、这一轮记失败(进程非 0 退出)。键的识别是严格的(只认这套代码自己能写出来的形状),认不出的不动。完成日志多六项:`trajectories_expired` / `trajectory_orphans_removed` / `trajectories_failed` / `trajectories_scanned` / `trajectories_capped` / `trajectories_skipped`。
 - 技能演化按结果列出的轨迹只用对话还在的。
 
 **事件归档不处理**:`event_log` 冷归档(`event-log-archive-job`)归档的是 `event_log` 表,生产上没有任何代码写这张表(B-278 已核),归档里没有对话内容。
@@ -2079,9 +2079,9 @@ oauth2 目录项本来就不在平台池里:不再碰平台池;`enabled` 切换�
 **怎么进**:测试环境控制台(system_admin,平台租户)建临时智能体 `acc-b285`(带一个子智能体,任务里让主智能体委派一次);对象存储运维侧只读列桶(`trajectories/<平台租户>/`);数据库只读连接。留存作业手动触发 `kubectl create job --from=cronjob/retention-cleanup b285-probe-<n>`。**花费**:约 ¥1。
 
 - [ ] **99.1 写入**:`acc-b285` 开会话 A、B,各跑一轮(A 里触发一次委派)。判据:桶里有 `trajectories/<租户>/success/<今天>/<A>.jsonl`、`…/<B>.jsonl`,以及 `…/<今天>/<A>/<子线程>.jsonl`(子智能体那份在 A 名下);**没修好时**:子智能体那份平铺在 `<今天>/<子线程>.jsonl`。
-- [ ] **99.2 删对话**:控制台彻底删除会话 A。判据:200,响应 `trajectories` = 2;桶里 A 的两份都不在,B 的在。
-- [ ] **99.3 删用户**:对外接口用临时用户 `u-b285` 在 `acc-b285` 开会话 C 跑一轮,然后 `POST /v1/users/<id>:purge`。判据:200,`deleted.trajectory` ≥ 1,`failures` 为空;桶里 C 的那份不在。
+- [ ] **99.2 删对话**:控制台彻底删除会话 A。判据:200,`trajectory_undatable` = 0,`trajectories` ≥ 1(数的是清掉的键:每天 4 个自己的键 + 子智能体对象数);桶里 A 的两份都不在,B 的在。
+- [ ] **99.3 删用户**:对外接口用临时用户 `u-b285` 在 `acc-b285` 开会话 C 跑一轮,然后 `POST /v1/users/<id>:purge`。判据:200,`deleted.trajectory` ≥ 1,没有 `deleted.trajectory_undatable`,`failures` 为空;桶里 C 的那份不在。
 - [ ] **99.4 彻底删除智能体**:删除并彻底删除 `acc-b285`。判据:200;桶里 B 的那份不在。
-- [ ] **99.5 留存补扫存量(要 B-286 同批上线;没上就记「待 B-286」,只验日志里三项计数存在且为 0、退出码 0)**:跑留存作业前,只读数一下 `trajectories/<平台租户>/` 下对象总数与其中「所属对话已不在」的个数(列桶 + 只读查 `thread_meta`,命令随发布单给出);跑一次。判据:完成日志 `trajectory_orphans_removed` 与预数的孤儿数一致(超过 `batch_size` 时等于 `batch_size`,第二天接着删)、`trajectories_failed=0`、退出码 0;还在的会话的对象都在。**上生产前**先在生产只读统计同样两个数,写进发布单(第一次跑会删掉所有已删对话留下的轨迹)。
-- [ ] **99.6 技能演化**:单测覆盖(`test_skill_evidence_provider.py`:删掉的对话的轨迹不进蒸馏证据、不进回放),真栈记「单测覆盖」。
+- [ ] **99.5 留存补扫存量(B-286 同批上线后才能验;B-286 没上不算过,记「阻塞:待 B-286」)**:跑留存作业前,只读预数 `trajectories/<平台租户>/` 下的对象,**只打印数字**,分三类:① 总数;② 老的平铺子智能体键(键是 `…/{日期}/{线程}.jsonl` 而该线程从来不是任何对话 —— 在 `agent_run` 里查不到以它为 `thread_id` 的 run);③ 已删对话的键(`thread_meta` 里没有、但 `agent_run` / 审计里查得到它是对话)。命令随发布单给出。跑一次。判据:完成日志 `trajectories_skipped=False`(为 `True` 即不过 —— 说明作业没连上对象存储,「计数为 0、没报错」不能当通过)、`trajectories_scanned` ≥ ① 或 `trajectories_capped=True`、`trajectory_orphans_removed` = ②+③(超过 `batch_size` 时等于 `batch_size` 且 `trajectories_capped=True`,第二天接着删)、`trajectories_failed=0`、退出码 0;还在的会话的对象都在。**上生产前**先在生产只读统计同样三个数(只数字),写进发布单(第一次跑会删掉所有已删对话留下的轨迹和全部老的平铺子智能体轨迹)。
+- [ ] **99.6 技能演化**:单测覆盖(`test_skill_evidence_provider.py`:删掉的对话的轨迹不进蒸馏证据、不进回放、取够了就不再往下查),真栈记「单测覆盖」。
 - [ ] **99.7 收尾**:删本节建的会话、用户与 probe job。

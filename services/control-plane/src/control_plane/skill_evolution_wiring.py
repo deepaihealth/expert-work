@@ -597,7 +597,9 @@ class _DualSourceHeldOutProvider:
             threads=self.thread_store,
             prefix=self.reader.prefix,
         ):
-            if key == candidate.trajectory_key or len(tasks) >= limit:
+            if len(tasks) >= limit:
+                break
+            if key == candidate.trajectory_key:
                 continue
             traj = await self.reader.read(key)
             if traj is None:

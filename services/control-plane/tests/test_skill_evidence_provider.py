@@ -206,3 +206,55 @@ def test_the_worker_assembly_hands_the_thread_store_to_both_readers() -> None:
     processor: Any = worker._processor
     assert processor.evidence_provider.thread_store is threads
     assert processor.held_out_provider.thread_store is threads
+
+
+@pytest.mark.asyncio
+async def test_replay_tasks_stop_looking_once_it_has_enough() -> None:
+    """Medium-3 —— once ``limit`` tasks are in hand the key walk stops: no more
+    conversation lookups (one per 100 keys) for keys it will never use."""
+    from control_plane.skill_evolution_wiring import _DualSourceHeldOutProvider
+    from expert_work.persistence import InMemoryEvalDatasetStore, InMemoryThreadMetaStore
+
+    tenant = uuid4()
+    object_store = InMemoryObjectStore()
+    recorder = TrajectoryRecorder(object_store=object_store)
+    reader = TrajectoryReader(object_store=object_store)
+    threads = InMemoryThreadMetaStore()
+    for _ in range(250):
+        thread = uuid4()
+        await threads.create(
+            thread_id=thread,
+            tenant_id=tenant,
+            created_by="t",
+            user_id=uuid4(),
+            agent_name="assistant",
+            agent_version="1",
+        )
+        await recorder.record(
+            TrajectoryRecord(
+                thread_id=thread,
+                tenant_id=tenant,
+                outcome="success",
+                messages=[HumanMessage(content="a task"), AIMessage(content="ok")],
+                finished_at=_NOW,
+            )
+        )
+    lookups = 0
+    real_get_many = threads.get_many
+
+    async def _counting(thread_ids: Any, *, tenant_id: UUID) -> Any:
+        nonlocal lookups
+        lookups += 1
+        return await real_get_many(thread_ids, tenant_id=tenant_id)
+
+    threads.get_many = _counting  # type: ignore[method-assign]
+    candidate = _candidate(
+        tenant=tenant, thread=uuid4(), key="not-listed", signal="failed_outcome", outcome="failed"
+    )
+
+    tasks = await _DualSourceHeldOutProvider(
+        InMemoryEvalDatasetStore(), reader, thread_store=threads
+    )._trajectory_tasks(candidate, limit=2)
+
+    assert len(tasks) == 2
+    assert lookups == 1

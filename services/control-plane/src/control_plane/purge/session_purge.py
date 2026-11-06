@@ -30,8 +30,8 @@ from control_plane.purge.image_blobs import ImageTally, delete_images
 from control_plane.purge.trajectories import (
     TrajectoriesNotDeletedError,
     TrajectoryStore,
+    conversation_days,
     delete_conversation_trajectories,
-    run_days,
     today,
 )
 from expert_work.persistence.curation import CurationCandidateStore
@@ -40,6 +40,7 @@ from expert_work.persistence.image_upload import ImageUploadStore
 from expert_work.persistence.memory import MemoryWritebackDLQ
 from expert_work.persistence.quality_score import QualityScoreStore
 from expert_work.persistence.user_upload import UserUploadStore
+from expert_work.protocol import ThreadMeta
 from expert_work.runtime.runs import RunStore
 from expert_work.runtime.storage import ObjectStore
 
@@ -49,11 +50,11 @@ logger = logging.getLogger("expert_work.control_plane.purge.session")
 KINDS: tuple[str, ...] = (
     "feedback",
     "quality_scores",
+    "trajectories",
     "curation_candidates",
     "memory_writeback_dlq",
     "user_uploads",
     "image_uploads",
-    "trajectories",
 )
 
 
@@ -85,6 +86,9 @@ class ThreadChildrenResult:
     #: 字节删不掉、行留着的图片(对象存储拒绝 —— 无权限、对象锁 —— 时每次重试都会卡在这里,
     #: 运维据此介入)。
     image_rows_kept: int = 0
+    #: B-285 —— 1 = 这条对话没有 run 行、对话行也没有时间:推不出轨迹的日期,一个都没看
+    #: (不当作删干净了,照实给出来)。
+    trajectory_undatable: int = 0
 
     def as_details(self) -> dict[str, object]:
         """``purge_session`` 响应 / 审计里的字段:每类删了几行,失败的加 ``<类>_delete_failed``。"""
@@ -93,6 +97,7 @@ class ThreadChildrenResult:
         details["image_blobs_failed"] = self.image_blobs_failed
         details["image_blobs_skipped"] = self.image_blobs_skipped
         details["image_rows_kept"] = self.image_rows_kept
+        details["trajectory_undatable"] = self.trajectory_undatable
         for kind in self.failures:
             details[f"{kind}_delete_failed"] = True
         return details
@@ -124,15 +129,25 @@ async def _purge_images(
 
 
 async def _purge_trajectories(
-    stores: SessionPurgeStores, result: ThreadChildrenResult, *, tenant_id: UUID, thread_id: UUID
+    stores: SessionPurgeStores,
+    result: ThreadChildrenResult,
+    *,
+    tenant_id: UUID,
+    thread_id: UUID,
+    meta: ThreadMeta | None,
 ) -> int:
-    """B-285 —— 这条对话(连同它名下子智能体)的轨迹对象,日期按它的 run 推。"""
+    """B-285 —— 这条对话(连同它名下子智能体)的轨迹对象,日期按它的 run 推;没有 run 行
+    的按对话行自己的时间推。"""
     if stores.trajectories is None or stores.runs is None:
         return 0
     runs = await stores.runs.list_by_thread(thread_id=thread_id, tenant_id=tenant_id)
+    dated = conversation_days(runs, meta)
+    if dated.undatable:
+        result.trajectory_undatable = 1
+        logger.warning("session_purge.trajectory_undatable")
     try:
         return await delete_conversation_trajectories(
-            stores.trajectories, tenant_id=tenant_id, thread_id=thread_id, days=run_days(runs)
+            stores.trajectories, tenant_id=tenant_id, thread_id=thread_id, days=dated.days
         )
     except TrajectoriesNotDeletedError as exc:
         # 部分失败也照实记下删了几个(成功时由调用方用返回值记)。
@@ -141,7 +156,11 @@ async def _purge_trajectories(
 
 
 async def purge_thread_children(
-    stores: SessionPurgeStores, *, tenant_id: UUID, thread_id: UUID
+    stores: SessionPurgeStores,
+    *,
+    tenant_id: UUID,
+    thread_id: UUID,
+    meta: ThreadMeta | None = None,
 ) -> ThreadChildrenResult:
     """删 ``thread_id`` 名下的 :data:`KINDS`。不抛异常:失败记在 ``failures`` 里。"""
     result = ThreadChildrenResult()
@@ -155,6 +174,12 @@ async def purge_thread_children(
         (
             "quality_scores",
             lambda: stores.quality_scores.delete_for_threads(tenant_id=tenant_id, thread_ids=ids),
+        ),
+        (
+            "trajectories",
+            lambda: _purge_trajectories(
+                stores, result, tenant_id=tenant_id, thread_id=thread_id, meta=meta
+            ),
         ),
         (
             "curation_candidates",
@@ -175,10 +200,6 @@ async def purge_thread_children(
         (
             "image_uploads",
             lambda: _purge_images(stores, result, tenant_id=tenant_id, thread_id=thread_id),
-        ),
-        (
-            "trajectories",
-            lambda: _purge_trajectories(stores, result, tenant_id=tenant_id, thread_id=thread_id),
         ),
     )
     for kind, step in steps:

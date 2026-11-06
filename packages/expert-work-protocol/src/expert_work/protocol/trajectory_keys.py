@@ -16,7 +16,8 @@
 
 子智能体的 run 跑在一个新的 ``thread``(没有 ``thread_meta`` 行)上;B-285 起它的键带上
 所属对话(``conversation`` = 最上层那条对话),删对话时按对话的前缀找得到。之前写的子智能
-体轨迹是平铺的 ``{thread}.jsonl``,找不到所属对话 —— 留存作业把它们当孤儿删掉。
+体轨迹是平铺的 ``{thread}.jsonl``,找不到所属对话 —— 留存作业把它们当孤儿删掉(要等 B-286 让
+留存作业连上真对象存储)。
 """
 
 from __future__ import annotations
@@ -53,8 +54,9 @@ TRAJECTORY_OUTCOMES: Final[tuple[str, ...]] = ("success", "failed", "max_steps",
 KEY_DATE_SKEW: Final = timedelta(hours=1)
 
 #: A run's trajectory date range is clamped to this many days (newest kept). A
-#: run lasts minutes (deadline); a range longer than this means bad timestamps,
-#: and whatever falls outside is left to the retention job's orphan pass.
+#: run lasts minutes (deadline); a range longer than this means bad timestamps.
+#: Whatever falls outside is only caught by the retention job's orphan pass, which
+#: needs B-286 (the job reaching the real object store) — until then, nothing.
 MAX_RUN_DAYS: Final = 8
 
 
@@ -135,21 +137,37 @@ class ParsedTrajectoryKey:
 def parse_trajectory_key(
     key: str, *, prefix: str = TRAJECTORY_PREFIX
 ) -> ParsedTrajectoryKey | None:
-    """Parse a key built by :func:`trajectory_key`; ``None`` for anything else."""
+    """Parse a key built by :func:`trajectory_key`; ``None`` for anything else.
+
+    Strict on purpose — the retention job deletes what this recognises, so a key
+    that :func:`trajectory_key` could not have produced (upper-case or brace-wrapped
+    UUIDs, one-digit months, a 5-digit year …) is never recognised."""
     head = f"{prefix}/"
     if not key.startswith(head) or not key.endswith(".jsonl"):
         return None
     parts = key[len(head) : -len(".jsonl")].split("/")
     if len(parts) not in (6, 7):
         return None
+    year, month, day_of_month = parts[2], parts[3], parts[4]
+    if not (
+        len(year) == 4
+        and len(month) == 2
+        and len(day_of_month) == 2
+        and (year + month + day_of_month).isdigit()
+        and (year + month + day_of_month).isascii()
+    ):
+        return None
+    outcome = parts[1]
+    if outcome not in TRAJECTORY_OUTCOMES:
+        return None
+    uuid_parts = [parts[0], *parts[5:]]
     try:
         tenant_id = UUID(parts[0])
-        outcome = parts[1]
-        day = date(int(parts[2]), int(parts[3]), int(parts[4]))
+        day = date(int(year), int(month), int(day_of_month))
         ids = [UUID(p) for p in parts[5:]]
     except ValueError:
         return None
-    if outcome not in TRAJECTORY_OUTCOMES:
+    if any(str(UUID(p)) != p for p in uuid_parts):
         return None
     if len(ids) == 2:
         return ParsedTrajectoryKey(tenant_id, outcome, day, ids[0], ids[1], is_child=True)

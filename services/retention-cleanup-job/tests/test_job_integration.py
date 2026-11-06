@@ -1717,6 +1717,9 @@ async def test_trajectory_objects_expire_by_the_tenants_upload_days_and_orphans_
         report = await job.run_once()
 
         assert (report.trajectories_expired, report.trajectory_orphans_removed) == (1, 1)
+        assert report.trajectories_scanned == 4
+        assert not report.trajectories_capped
+        assert not report.trajectories_skipped
         assert report.trajectories_failed == 0
         assert "trajectories" not in report.failed_passes
         left = await store.list_prefix("trajectories/")

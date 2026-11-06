@@ -1190,8 +1190,10 @@ def build_sessions_router() -> APIRouter:
         kinds above: dated from the runs, deleted before the runs go. A run still
         executing is not stopped: the rows it may write after the first pass
         (retrieval logs, feedback, quality score, writeback DLQ, today's
-        trajectory) get one best-effort second pass after the thread row; the
-        retention job's orphan pass is the backstop for anything later.
+        trajectory) get one best-effort second pass after the thread row. A
+        trajectory written even later is only caught by the retention job's
+        orphan pass, which runs only once B-286 lets the job reach the real
+        object store — until then nothing catches it.
         """
         meta = await _load_owned_session(thread_id, request, threads, users)
         tenant_id: UUID = request.state.tenant_id
@@ -1234,7 +1236,7 @@ def build_sessions_router() -> APIRouter:
         # B-280 —— 按 thread_id 存的子数据。有一类没删干净:后面什么都不删、对话行留着,重跑时
         # 还找得到这条对话(每类都可重跑);已经删掉的那部分照实记进审计。
         children = await purge_thread_children(
-            child_stores, tenant_id=tenant_id, thread_id=thread_id
+            child_stores, tenant_id=tenant_id, thread_id=thread_id, meta=meta
         )
         deleted.update(children.as_details())
         if children.failures:

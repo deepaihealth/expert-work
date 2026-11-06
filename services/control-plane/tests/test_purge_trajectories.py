@@ -9,8 +9,10 @@
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import AsyncIterator
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
+from types import SimpleNamespace
 from uuid import UUID, uuid4
 
 import pytest
@@ -20,10 +22,13 @@ from httpx import ASGITransport, AsyncClient
 from control_plane.app import create_app
 from control_plane.audit import build_default_audit_logger
 from control_plane.purge.trajectories import (
+    CONCURRENCY,
     TrajectoriesNotDeletedError,
     TrajectoryStore,
+    conversation_days,
     delete_conversation_trajectories,
     run_days,
+    today,
 )
 from control_plane.settings import DEFAULT_DEV_TENANT_ID, Settings
 from expert_work.persistence.audit_log import InMemoryAuditLogStore
@@ -120,12 +125,17 @@ async def test_only_this_conversations_objects_and_its_sub_agents_go() -> None:
         await _put(store, other_tenant, mine, at=_DAY1),
     ]
 
+    days = run_days(runs)
     removed = await delete_conversation_trajectories(
-        TrajectoryStore(store), tenant_id=tenant, thread_id=mine, days=run_days(runs)
+        TrajectoryStore(store), tenant_id=tenant, thread_id=mine, days=days
     )
 
-    assert removed == len(doomed)
+    # Own keys are cleared directly (absent ones too), sub-agents' as listed:
+    # 3 days x 4 outcomes + 1 sub-agent object.
+    assert len(days) == 3
+    assert removed == 3 * 4 + 1
     assert sorted(await _left(store)) == sorted(kept)
+    assert not set(doomed) & set(await _left(store))
 
 
 def test_an_unfinished_run_is_dated_by_its_last_update() -> None:
@@ -153,21 +163,88 @@ async def test_a_failure_is_raised_after_the_rest_went_and_a_rerun_finishes() ->
     store.bad = first
     days = run_days([_run(tenant, mine, at=_DAY1)])
 
-    with pytest.raises(TrajectoriesNotDeletedError):
+    with pytest.raises(TrajectoriesNotDeletedError) as info:
         await delete_conversation_trajectories(
             TrajectoryStore(store), tenant_id=tenant, thread_id=mine, days=days
         )
     assert await _left(store) == [first]
     assert second not in await _left(store)
+    # The 3 own keys of that day that did clear are counted, the failed one is not.
+    assert info.value.removed == 3
 
     store.bad = None
     assert (
         await delete_conversation_trajectories(
             TrajectoryStore(store), tenant_id=tenant, thread_id=mine, days=days
         )
-        == 1
+        == 4
     )
     assert await _left(store) == []
+
+
+class _Recording(InMemoryObjectStore):
+    """Records LIST prefixes and the most deletes in flight at once."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.listed: list[str] = []
+        self.in_flight = 0
+        self.peak = 0
+
+    async def list_prefix(self, prefix: str) -> list[str]:
+        self.listed.append(prefix)
+        return await super().list_prefix(prefix)
+
+    async def delete(self, key: str) -> None:
+        self.in_flight += 1
+        self.peak = max(self.peak, self.in_flight)
+        await asyncio.sleep(0.005)
+        self.in_flight -= 1
+        await super().delete(key)
+
+
+@pytest.mark.asyncio
+async def test_own_keys_are_deleted_without_listing_only_sub_agent_prefixes_are_listed() -> None:
+    store = _Recording()
+    tenant, mine = uuid4(), uuid4()
+    own = await _put(store, tenant, mine, at=_DAY1, outcome="max_steps")
+    days = run_days([_run(tenant, mine, at=_DAY1)])
+
+    await delete_conversation_trajectories(
+        TrajectoryStore(store), tenant_id=tenant, thread_id=mine, days=days
+    )
+
+    listed = list(store.listed)
+    assert len(listed) == 4 * len(days)
+    assert all(p.endswith(f"/{mine}/") for p in listed)
+    assert own not in await _left(store)
+
+
+@pytest.mark.asyncio
+async def test_units_run_concurrently_but_bounded() -> None:
+    store = _Recording()
+    tenant, mine = uuid4(), uuid4()
+    days = [date(2026, 10, d) for d in range(1, 11)]  # 40 (day, outcome) units
+
+    await delete_conversation_trajectories(
+        TrajectoryStore(store), tenant_id=tenant, thread_id=mine, days=days
+    )
+
+    assert 1 < store.peak <= CONCURRENCY
+
+
+def test_a_conversation_without_runs_is_dated_by_its_own_row() -> None:
+    created = datetime(2026, 11, 2, 9, 0, tzinfo=UTC)
+    meta = SimpleNamespace(created_at=created, updated_at=created + timedelta(days=1))
+    dated = conversation_days([], meta)
+    assert not dated.undatable
+    assert [d.day for d in dated.days] == [2, 3]
+    assert conversation_days([], SimpleNamespace(created_at=None, updated_at=None)).undatable
+    assert conversation_days([], None).undatable
+    # Runs win over the row.
+    assert conversation_days([_run(uuid4(), uuid4(), at=_DAY1)], meta).days == run_days(
+        [_run(uuid4(), uuid4(), at=_DAY1)]
+    )
 
 
 @pytest.mark.asyncio
@@ -238,7 +315,9 @@ async def test_session_purge_deletes_the_conversations_trajectories(client: Asyn
     resp = await client.post(f"/v1/sessions/{doomed}:purge")
 
     assert resp.status_code == 200, resp.text
-    assert resp.json()["data"]["trajectories"] == 2
+    days = run_days([_run(_TENANT, doomed, at=at)])
+    late = today()
+    assert resp.json()["data"]["trajectories"] == 4 * len(days) + 1 + 4 * len(late)
     assert sorted(await _left(_objects(_app(client)))) == sorted(sibling_keys)
     assert (await client.get(f"/v1/sessions/{sibling}")).status_code == 200
 
@@ -267,7 +346,8 @@ async def test_a_trajectory_written_while_purging_goes_too(
 ) -> None:
     """A run still finishing (the purge does not stop runs) writes its trajectory
     now; the second pass after the thread row takes today's."""
-    doomed, _ = await _conversation(client, at=datetime.now(UTC) - timedelta(days=3))
+    at = datetime.now(UTC) - timedelta(days=3)
+    doomed, _ = await _conversation(client, at=at)
     app = _app(client)
     store = _objects(app)
     real_delete = app.state.thread_meta_repo.delete
@@ -281,8 +361,27 @@ async def test_a_trajectory_written_while_purging_goes_too(
     resp = await client.post(f"/v1/sessions/{doomed}:purge")
 
     assert resp.status_code == 200, resp.text
-    assert resp.json()["data"]["trajectories"] == 3
+    days = run_days([_run(_TENANT, doomed, at=at)])
+    assert resp.json()["data"]["trajectories"] == 4 * len(days) + 1 + 4 * len(today())
     assert await _left(store) == []
+
+
+@pytest.mark.asyncio
+async def test_a_conversation_without_run_rows_still_loses_its_trajectories(
+    client: AsyncClient,
+) -> None:
+    """Medium-4 —— no run rows (e.g. removed by an older partial purge): the days
+    come from the conversation row itself, not "nothing to do"."""
+    resp = await client.post("/v1/sessions", json={"agent_name": _AGENT, "agent_version": "1.0.0"})
+    thread = UUID(resp.json()["data"]["thread_id"])
+    store = _objects(_app(client))
+    key = await _put(store, _TENANT, thread, at=datetime.now(UTC))
+
+    purged = await client.post(f"/v1/sessions/{thread}:purge")
+
+    assert purged.status_code == 200, purged.text
+    assert purged.json()["data"]["trajectory_undatable"] == 0
+    assert key not in await _left(store)
 
 
 def test_the_agent_purge_wires_the_trajectory_store() -> None:

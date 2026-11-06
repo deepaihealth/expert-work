@@ -53,6 +53,16 @@ def test_conversation_and_child_keys_and_their_parse() -> None:
         f"trajectories/{_T}/success/2026/11/06/not-a-uuid.jsonl",
         f"trajectories/{_T}/success/2026/11/06/{_C}.json",
         f"trajectories/{_T}/success/2026/11/06/{_C}/{_S}/{_S}.jsonl",
+        # Low-3 —— only what ``trajectory_key`` itself could have written.
+        f"trajectories/{str(_T).upper()}/success/2026/11/06/{_C}.jsonl",
+        f"trajectories/{_T}/success/2026/11/06/{str(_C).upper()}.jsonl",
+        f"trajectories/{_T}/success/2026/11/06/{{{_C}}}.jsonl",
+        f"trajectories/{_T}/success/2026/11/06/{_C.hex}.jsonl",
+        f"trajectories/{_T}/success/2026/11/6/{_C}.jsonl",
+        f"trajectories/{_T}/success/2026/1/06/{_C}.jsonl",
+        f"trajectories/{_T}/success/02026/11/06/{_C}.jsonl",
+        f"trajectories/{_T}/success/\uff12\uff10\uff12\uff16/11/06/{_C}.jsonl",  # full-width
+        f"trajectories/{_T}/success/2026/11/+6/{_C}.jsonl",
     ],
 )
 def test_other_keys_are_not_recognised(key: str) -> None:

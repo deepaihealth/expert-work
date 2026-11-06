@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+from collections.abc import AsyncIterator
 from datetime import UTC, datetime, timedelta
 from uuid import UUID, uuid4
 
@@ -137,3 +138,124 @@ def test_the_done_line_carries_the_counters(caplog: pytest.LogCaptureFixture) ->
     assert "trajectories_expired=4" in line
     assert "trajectory_orphans_removed=2" in line
     assert "trajectories_failed=1" in line
+
+
+class _Paged(InMemoryObjectStore):
+    """Lists in pages of 2 and counts how many pages were handed out."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.pages = 0
+
+    async def iter_prefix_modified(
+        self, prefix: str, page_size: int = 2
+    ) -> AsyncIterator[list[tuple[str, datetime]]]:
+        listed = await self.list_prefix_modified(prefix)
+        for start in range(0, len(listed), 2):
+            self.pages += 1
+            yield listed[start : start + 2]
+
+
+@pytest.mark.asyncio
+async def test_listing_is_paged_and_stops_once_the_budget_is_spent(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    store, threads = _Paged(), InMemoryThreadMetaStore()
+    tenant = uuid4()
+    for _ in range(10):  # 10 orphans -> 5 pages
+        await _put(store, tenant, uuid4(), days_ago=1)
+
+    with caplog.at_level(logging.INFO):
+        tally = await sweep_trajectories(
+            store=store, threads=threads, retention_days={}, default_days=90, now=_NOW, limit=3
+        )
+
+    assert tally.orphans_removed == 3
+    assert tally.capped
+    assert any("retention.trajectories_capped" in r.getMessage() for r in caplog.records)
+    assert store.pages == 2  # budget spent inside page 2: page 3 is never listed
+    assert tally.scanned == 4
+
+
+class _FirstDeletesFail(InMemoryObjectStore):
+    def __init__(self, failing: int) -> None:
+        super().__init__()
+        self.failing = failing
+
+    async def delete(self, key: str) -> None:
+        if self.failing > 0:
+            self.failing -= 1
+            raise TimeoutError("oss")
+        await super().delete(key)
+
+
+@pytest.mark.asyncio
+async def test_failed_deletes_do_not_use_up_the_budget() -> None:
+    store, threads = _FirstDeletesFail(failing=2), InMemoryThreadMetaStore()
+    tenant = uuid4()
+    for _ in range(6):
+        await _put(store, tenant, uuid4(), days_ago=1)
+
+    tally = await sweep_trajectories(
+        store=store, threads=threads, retention_days={}, default_days=90, now=_NOW, limit=3
+    )
+
+    assert (tally.failed, tally.orphans_removed) == (2, 3)
+    assert tally.needs_attention
+    assert not tally.aborted
+
+
+@pytest.mark.asyncio
+async def test_too_many_failures_stop_the_pass() -> None:
+    store, threads = _DeleteFails(), InMemoryThreadMetaStore()
+    tenant = uuid4()
+    for _ in range(10):
+        await _put(store, tenant, uuid4(), days_ago=1)
+
+    tally = await sweep_trajectories(
+        store=store,
+        threads=threads,
+        retention_days={},
+        default_days=90,
+        now=_NOW,
+        limit=100,
+        max_failures=3,
+    )
+
+    assert tally.failed == 3
+    assert tally.aborted
+    assert tally.needs_attention
+
+
+@pytest.mark.asyncio
+async def test_a_job_without_an_object_store_says_it_skipped(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    from retention_cleanup_job.job import RetentionCleanupJob
+
+    job = RetentionCleanupJob(
+        db_session_factory=None,  # type: ignore[arg-type]  # never reached on this path
+        object_store=None,
+        thread_store=InMemoryThreadMetaStore(),
+    )
+    with caplog.at_level(logging.WARNING):
+        tally = await job._sweep_trajectories()
+
+    assert tally.skipped
+    assert any(
+        "retention.trajectories_skipped reason=no_object_store" in r.getMessage()
+        for r in caplog.records
+    )
+
+
+def test_the_done_line_tells_skipped_and_capped_apart(caplog: pytest.LogCaptureFixture) -> None:
+    from retention_cleanup_job.main import log_done
+
+    with caplog.at_level(logging.INFO):
+        log_done(CleanupReport(trajectories_scanned=7, trajectories_capped=True))
+        log_done(CleanupReport(trajectories_skipped=True))
+    lines = [
+        r.getMessage() for r in caplog.records if "retention_cleanup_job.done" in r.getMessage()
+    ]
+    assert "trajectories_scanned=7 trajectories_capped=True trajectories_skipped=False" in lines[0]
+    assert "trajectories_scanned=0 trajectories_capped=False trajectories_skipped=True" in lines[1]
