@@ -814,7 +814,9 @@ class RetentionCleanupJob:
         **any already-soft-deleted row regardless of age** (a user
         delete means the blob should leave at the next sweep, not at the
         original retention horizon). Removes the object-store key for
-        each, then hard-deletes the row.
+        each, then hard-deletes **only the rows whose key is gone** (a key
+        that was already absent counts as gone: ``ObjectStore.delete`` is
+        idempotent on S3 / OSS / MinIO and in memory).
 
         B-283 —— 按**最后使用**到期:``greatest(created_at, last_used_at, 会话最后一次 run)``
         加上租户的 ``tenant_config.upload_retention_days``(图片也是附件;没设用
@@ -823,11 +825,11 @@ class RetentionCleanupJob:
         会话还在用的图不再按上传时间被删;删掉之后会话里再引用它,适配器换成一句文字
         (``orchestrator.multimodal.resolve_message_images``),那一轮照常跑。
 
-        Object-store failures don't block row hard-delete: an orphaned
-        key is a far smaller correctness problem than a stuck row
-        whose key never goes away (the bytes are billed against
-        ``IMAGE_STORAGE_BYTES``). The failure count lands in the report
-        so SRE can investigate without the sweep stalling.
+        B-286 —— 字节删不掉的行**留着**,下一轮再删(同 control-plane 彻底删除的
+        ``purge/image_blobs.py``):没有任何作业按键扫桶里的孤儿图片,行一没,字节就永远留在
+        桶里。这一轮有键删不掉 → 一行汇总日志(条数 + 异常类型,不打键、不逐条打堆栈),
+        ``images`` 进 ``failed_passes``,进程以非 0 退出。永远删不掉的行会每轮重试(没有
+        「放弃」上限:放弃就只能删行、丢字节,正是这里要避免的),靠失败的 pass 让人去看。
 
         Returns ``(rows_deleted, keys_removed, keys_failed)``. Returns
         ``(0, 0, 0)`` when either store is missing (unit-test path).
@@ -851,22 +853,28 @@ class RetentionCleanupJob:
         )
         if not expired:
             return 0, 0, 0
-        keys_ok = 0
-        keys_failed = 0
+        gone: list[UUID] = []
+        errors: dict[str, int] = {}
         for row in expired:
             try:
                 await self._object_store.delete(row.object_key)
-                keys_ok += 1
-            except Exception:
-                keys_failed += 1
-                logger.exception(
-                    "retention.image_object_delete_failed key=%s",
-                    row.object_key,
-                )
-        rows = await self._image_upload_store.hard_delete(
-            image_ids=[r.id for r in expired],
-        )
-        return rows, keys_ok, keys_failed
+            except Exception as exc:
+                name = type(exc).__name__
+                errors[name] = errors.get(name, 0) + 1
+                continue
+            gone.append(row.id)
+        keys_failed = len(expired) - len(gone)
+        if keys_failed:
+            logger.error(
+                "retention.image_object_delete_failed keys_failed=%d keys_ok=%d errors=%s "
+                "— their rows are kept for the next run",
+                keys_failed,
+                len(gone),
+                ",".join(f"{name}:{count}" for name, count in sorted(errors.items())),
+            )
+            self._failed_passes.append("images")
+        rows = await self._image_upload_store.hard_delete(image_ids=gone) if gone else 0
+        return rows, len(gone), keys_failed
 
     # ------------------------------------------------------------------
     # Per-table helpers (private). Each opens its own session + txn,
