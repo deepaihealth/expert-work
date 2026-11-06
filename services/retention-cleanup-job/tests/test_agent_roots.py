@@ -747,19 +747,20 @@ async def test_a_file_touched_after_t_between_judging_and_unlinking_is_kept(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("post_t", ["top", "child"])
 async def test_a_subtree_walk_stops_at_the_first_entry_not_before_t(
-    world: _World, monkeypatch: pytest.MonkeyPatch
+    world: _World, monkeypatch: pytest.MonkeyPatch, post_t: str
 ) -> None:
-    """L4 —— 判「全在 T 之前」碰到第一项不早于 ``T`` 的就停:这里目录自己就在 T 之后,一项都不用
-    再看,项数上限碰不到,不算「判不了」。"""
+    """L4 —— 判「全在 T 之前」碰到第一项不早于 ``T`` 的就停,不必走完整棵树:这里第一项(目录自己 /
+    它唯一的子目录)就在 T 之后,后面的项数会超上限,停得早就碰不到上限、不算「判不了」。"""
     from retention_cleanup_job import agent_roots
 
     try:
-        busy = world.put("busy/a.md", age_days=100).parent
-        world.put("busy/b.md", age_days=100)
+        busy = world.put("busy/a/x.md", age_days=100).parent.parent
+        world.put("busy/a/y.md", age_days=100)
         later = time.time() + 3 * _LATER * _DAY
-        os.utime(busy, (later, later))
-        monkeypatch.setattr(agent_roots, "MAX_SUBTREE_ENTRIES", 1)
+        os.utime(busy if post_t == "top" else busy / "a", (later, later))
+        monkeypatch.setattr(agent_roots, "MAX_SUBTREE_ENTRIES", 0 if post_t == "top" else 2)
 
         report = await world.job(agent_root_cutover=_FUTURE_T).run_once()
 

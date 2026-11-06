@@ -222,3 +222,15 @@ def test_a_path_that_does_not_match_its_dir_name_is_unknown(world: _World) -> No
 
     assert file_dir.is_dir()
     assert not (file_dir / "missing").exists()
+
+
+def test_a_deleted_source_whose_name_has_edge_spaces_still_ages_out(world: _World) -> None:
+    """M3 —— 反过来:源文件真不见了,首尾带空格的路径照样按原样查出「不见」,满 30 天删掉历史
+    (不会因为路径被改动而永远「不知道」)。"""
+    world.source("kept.md")  # the agent root itself is there
+    file_dir = world.versions(" gone.md ")
+    world.marker(file_dir, first_days_ago=31, last_days_ago=1)
+
+    world.sweep()
+
+    assert not file_dir.exists()
