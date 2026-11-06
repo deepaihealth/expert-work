@@ -12,7 +12,9 @@ dependencies = [
     "expert-work-common",
     "expert-work-persistence",
     "expert-work-protocol",
-    "expert-work-runtime",
+    # ``sql-encrypted``: the encrypted-secret vault (control_plane.encrypted_secret_store
+    # re-exports it from the runtime package, B-286).
+    "expert-work-runtime[sql-encrypted]",
     # In-process monolith (STREAM-E-DESIGN § 2.6): the control-plane runs
     # the orchestrator as a library — agent graphs execute as background
     # asyncio tasks in this process, not a separate service.

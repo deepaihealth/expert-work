@@ -62,6 +62,20 @@ B-283 起**图片(`image_upload`,对象存储里的字节)也按最后使用到�
 | B-27 threads/ | `threads/<thread_id>/` 且 `thread_meta` 行不存在 | 行还在的目录(**不按时间删活会话**);非 UUID 名的子目录;已软删用户的整棵树 |
 | X-4 ② 已删工作区 | 软删且已归档满 90 天的 `user_workspace` 行 + 该用户的 artifact / artifact_version / user_upload 行(`WORKSPACE_HARD_DELETE` 审计) | OSS 归档对象(桶生命周期到期);`.deleted/<user>` 标记 |
 
+**图片字节与对象存储(B-286)**:`image_upload` 的 pass 删对象存储里的图片字节,用与 control-plane
+同一套 `EXPERT_WORK_OBJECT_STORE_*` 与 SecretStore(测试 / 生产是 `sql_encrypted`:`EXPERT_WORK_SECRET_ENCRYPTION_KEY`
++ `encrypted_secret` 表)解 `secret://` 引用,代码与 control-plane 共用(`expert_work.runtime.storage.config` /
+`expert_work.runtime.secret_store.sql_encrypted`)。每轮一行 `retention.object_store backend=… source=… available=…`;
+解不出来(含共享配置取值不合法)不崩:图片 pass 跳过(行不动)并进 `failed_passes`,退出码 3。个别图片
+字节删不掉时只删字节已经没了的行(键本来不在算删掉),删不掉的行留到下一轮,一行汇总日志
+`retention.image_object_delete_failed keys_failed=… errors=<异常类型:条数>`,`images` 进 `failed_passes`;
+没有「放弃」上限(放弃只能删行丢字节)。显式设了 `EXPERT_WORK_RETENTION_OBJECT_STORE_BACKEND` 的照旧用
+作业自己那套(明文 AK/SK,本地用);只设了别的 `EXPERT_WORK_RETENTION_OBJECT_STORE_*` 而没设 `…_BACKEND`
+时它们不生效,日志 `retention.object_store_override_ignored vars=…` 列出变量名(不打值)。
+
+退出码 3 **没有告警**:Prometheus 只抓 control-plane,没有 kube-state-metrics / Job 失败规则,SLS 里也没配
+告警;只能看 Job 状态与日志。
+
 **不变式**(`tests/test_workspace_invariant.py`):对活着的工作区,job 只删
 (a) 登记过的产物文件 (b) `uploads/` 下登记过的文件 (c) 孤儿 `threads/<id>/`
 (d) B-282 闲置满保留期的会话自己的 `threads/<会话>/` 与它的 run 的 `.tool_results/<run>/`;

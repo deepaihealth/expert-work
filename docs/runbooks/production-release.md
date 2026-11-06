@@ -409,6 +409,7 @@ kubectl -n expert-work exec -it <control-plane-pod> -- python -m control_plane.k
   第二套审批超时已删、B-45 RLS sessionmaker 已接)。放行依据是 09-17 测试环境
   造数据实删 37/37(test 一周的日志删除数全 0,验不出东西),记录在
   `base/retention-cleanup-job/kustomization.yaml` 头注。image_upload 那条 pass
-  两环境都是 no-op(job 不持有 OSS 凭据)。billing-rollup-job /
+  两环境都是 no-op(job 不持有 OSS 凭据)—— B-286 起 job 与 control-plane 用同一个对象存储,
+  这条 pass 真的删行和字节(叠在 B-283 上,同一次发布,见 pending-test-release-acceptance §100)。billing-rollup-job /
   event-log-archive-job / audit-backup-worker 仍是**只有代码没有部署物**
   (infra/k8s 零 CronJob),test 也没跑,首发保持一致。

@@ -1046,7 +1046,7 @@ dependencies = [
     { name = "expert-work-persistence" },
     { name = "expert-work-protocol" },
     { name = "expert-work-retention-cleanup-job" },
-    { name = "expert-work-runtime" },
+    { name = "expert-work-runtime", extra = ["sql-encrypted"] },
     { name = "fastapi" },
     { name = "httpx" },
     { name = "jinja2" },
@@ -1079,7 +1079,7 @@ requires-dist = [
     { name = "expert-work-persistence", editable = "packages/expert-work-persistence" },
     { name = "expert-work-protocol", editable = "packages/expert-work-protocol" },
     { name = "expert-work-retention-cleanup-job", editable = "services/retention-cleanup-job" },
-    { name = "expert-work-runtime", editable = "packages/expert-work-runtime" },
+    { name = "expert-work-runtime", extras = ["sql-encrypted"], editable = "packages/expert-work-runtime" },
     { name = "fastapi", specifier = ">=0.142.1,<1" },
     { name = "httpx", specifier = ">=0.27,<1" },
     { name = "jinja2", specifier = ">=3.1,<4" },
@@ -1251,6 +1251,7 @@ dependencies = [
     { name = "expert-work-common" },
     { name = "expert-work-persistence" },
     { name = "expert-work-protocol" },
+    { name = "expert-work-runtime", extra = ["sql-encrypted"] },
     { name = "pydantic" },
     { name = "pydantic-settings" },
     { name = "sqlalchemy", extra = ["asyncio"] },
@@ -1262,6 +1263,7 @@ requires-dist = [
     { name = "expert-work-common", editable = "packages/expert-work-common" },
     { name = "expert-work-persistence", editable = "packages/expert-work-persistence" },
     { name = "expert-work-protocol", editable = "packages/expert-work-protocol" },
+    { name = "expert-work-runtime", extras = ["sql-encrypted"], editable = "packages/expert-work-runtime" },
     { name = "pydantic", specifier = ">=2.9,<3" },
     { name = "pydantic-settings", specifier = ">=2.5,<3" },
     { name = "sqlalchemy", extras = ["asyncio"], specifier = ">=2.0.30,<3" },
@@ -1283,9 +1285,15 @@ dependencies = [
     { name = "tiktoken" },
 ]
 
+[package.optional-dependencies]
+sql-encrypted = [
+    { name = "cryptography" },
+]
+
 [package.metadata]
 requires-dist = [
     { name = "aiobotocore", specifier = ">=2.13.0" },
+    { name = "cryptography", marker = "extra == 'sql-encrypted'", specifier = ">=50.0.0,<51" },
     { name = "expert-work-persistence", editable = "packages/expert-work-persistence" },
     { name = "expert-work-protocol", editable = "packages/expert-work-protocol" },
     { name = "langfuse", specifier = ">=3,<5" },
@@ -1295,6 +1303,7 @@ requires-dist = [
     { name = "sqlalchemy", extras = ["asyncio"], specifier = ">=2.0.30,<3" },
     { name = "tiktoken", specifier = ">=0.8,<1" },
 ]
+provides-extras = ["sql-encrypted"]
 
 [[package]]
 name = "expert-work-sandbox-supervisor"

@@ -9,8 +9,9 @@
 # 09-17 改为造数据实删:合成探针租户(不碰任何真实租户)下,每类规则造「刚过期」与
 # 「差一点才过期」两份(审计 / 事件 / 出网审计 / jwt / 产物五形态 / 上传三形态 /
 # 孤儿 threads 与 .tool_results / 记忆 / 成员 / 已删工作区三形态 + 从属行),手动
-# 触发一次,计数与逐行核对 37/37 全过,之后清理干净。图片那条 pass 两环境都不跑
-# (job 不持有 OSS 凭据,见 cronjob.yaml 头注)。
+# 触发一次,计数与逐行核对 37/37 全过,之后清理干净。那次图片那条 pass 两环境都不跑
+# (job 当时不持有 OSS 凭据);B-286 起 job 与 control-plane 用同一个对象存储,图片 pass
+# 真的删行和字节,见 cronjob.yaml 头注。
 #
 # 同 base 的 namespace / part-of 标签:kustomize 的 namespace 与 commonLabels
 # 不会跨 kustomization 继承,所以在这里重申一遍。

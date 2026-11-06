@@ -47,7 +47,8 @@ import logging
 import sys
 import threading
 import time
-from collections.abc import Iterator
+from collections.abc import AsyncIterator, Iterator
+from contextlib import asynccontextmanager
 from contextvars import ContextVar
 from types import FrameType
 from typing import Final
@@ -68,6 +69,7 @@ __all__ = [
     "RLS_USER_GUC_NAME",
     "RlsBypassRequiredError",
     "build_rls_sessionmaker",
+    "bypass_rls_session",
     "bypass_rls_var",
     "current_tenant_id_var",
     "current_user_id_var",
@@ -120,6 +122,24 @@ class RlsBypassRequiredError(RuntimeError):
     queries refuse to run without the declaration, and the orphan-copy sweep also
     asks the database (``ArtifactStore.bypasses_row_security``) before deleting.
     """
+
+
+@asynccontextmanager
+async def bypass_rls_session() -> AsyncIterator[None]:
+    """Async context manager flipping ``bypass_rls_var=True`` (and clearing the tenant) for the
+    body; resets both on exit so nested calls inherit cleanly.
+
+    The one definition (B-286): ``control_plane.tenant_scope`` re-exports it for HTTP endpoints
+    that have just resolved to ``CrossTenant``; platform-scope stores outside the control plane
+    (``expert_work.runtime.secret_store.sql_encrypted``) use it directly.
+    """
+    bypass = bypass_rls_var.set(True)
+    tenant = current_tenant_id_var.set(None)
+    try:
+        yield
+    finally:
+        current_tenant_id_var.reset(tenant)
+        bypass_rls_var.reset(bypass)
 
 
 def require_rls_bypass(operation: str) -> None:

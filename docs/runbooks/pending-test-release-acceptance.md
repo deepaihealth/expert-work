@@ -2216,3 +2216,30 @@ asyncio.run(main())
 - [ ] **99.5 留存补扫存量(B-286 同批上线后才能验;B-286 没上不算过,记「阻塞:待 B-286」)**:跑留存作业前,只读预数整个 `trajectories/` 前缀(作业扫的是所有租户,不只平台租户)下的对象,**只打印数字**(脚本读对象只为看 `metadata` 里有没有某个键,不打印任何内容 / 键名 / id):① 总数;② 到期的(键里的日期早于今天减该租户 `upload_retention_days`,没设按 90);以下两类都**不含**到期的:③ 老的平铺子智能体键 —— 平铺键 `…/{日期}/{线程}.jsonl`、`thread_meta` 里没有这个线程,且对象第一行 JSON 的 `metadata` 里有 `child_depth`(只有子智能体的 run 写这一项;对话本身的 run 只可能写 `retried`);④ 已删对话的键 —— 所属对话在 `thread_meta` 里没有的其余键(平铺键里 `metadata` 不带 `child_depth` 的,加上 `…/{日期}/{对话}/{子线程}.jsonl` 里对话不在的)。**别用 `agent_run` 去分 ③ / ④**:彻底删除连 run 行一起删,删掉的对话在 `agent_run` 里同样查不到,会全被算进 ③。命令随发布单给出。跑一次。判据:完成日志 `trajectories_skipped=False`(为 `True` 即不过 —— 说明作业没连上对象存储,「计数为 0、没报错」不能当通过)、`trajectories_failed=0`、退出码 0;没封顶(`trajectories_capped=False`)时 `trajectories_scanned` = ①、`trajectories_expired` = ②、`trajectory_orphans_removed` = ③+④;②+③+④ 超过 `batch_size` 时 `trajectories_capped=True`、`trajectories_expired + trajectory_orphans_removed` = `batch_size`,第二天接着删;还在的会话的对象都在。**上生产前**先在生产只读统计同样四个数(只数字),写进发布单(第一次跑会删掉所有已删对话留下的轨迹和全部老的平铺子智能体轨迹)。
 - [ ] **99.6 技能演化**:单测覆盖(`test_skill_evidence_provider.py`:删掉的对话的轨迹不进蒸馏证据、不进回放、取够了就不再往下查),真栈记「单测覆盖」。
 - [ ] **99.7 收尾**:删本节建的会话、用户与 probe job。
+
+## §100 留存作业用上 control-plane 的对象存储(B-286)
+
+**叠在 B-283 上(硬前提)**:本 PR 的分支基于 B-283(`feat/b283-image-last-use`,§95),PR 的 base 是 B-283 的分支,B-283 合入 main 之后本 PR 再改 base 到 main 合入;不会单独发。原因:本节上线后,作业第一次真的删图片字节;没有 B-283 时,会话里引用的图片字节一旦被删,之后**这个会话的每一轮**都会因 `ObjectNotFoundError` 失败。B-283 让多模态适配器遇到已删的图片换成一句文字、那一轮照常跑(计数 `expert_work_upload_images_degraded_total`)。图片 pass 的到期谓词(最后使用 + 租户 `upload_retention_days`)来自 B-283;本节只改用哪个对象存储、以及字节删不掉时行怎么处理。
+
+**背景**:留存作业(CronJob `retention-cleanup`)此前只认 `EXPERT_WORK_RETENTION_OBJECT_STORE_*`(默认 `memory`、要明文 AK/SK),而 envFrom 带进来的是 control-plane 那套 `EXPERT_WORK_OBJECT_STORE_*`:AK/SK 是 `secret://` 引用,只有 control-plane 经 `sql_encrypted` 金库解得出来。于是作业一直跑在 `memory` 上,`image_upload` 那条 pass 在测试 / 生产**是 no-op:到期的行没删,OSS 里的字节也没删**。积压的是「行 + 字节」两样。本次作业用同一套配置和同一份代码解引用:`resolve_object_store_config` 移到 `expert_work.runtime.storage.config`,`SqlEncryptedSecretStore` 移到 `expert_work.runtime.secret_store.sql_encrypted`(control-plane 原路径照旧可 import,行为不变)。每轮日志一行 `retention.object_store backend=… source=shared available=…`。
+
+- 解不出来(KEK 缺 / 不对、密钥行不在、配置不全或取值不合法、客户端建不起来)**不崩**:这一行 `available=false error=<异常类型>`,图片 pass 跳过(行不动)并记 `failed_passes=images`,其余 pass 照跑,退出码 3。
+- 个别图片字节删不掉(无权限、对象锁、限流):**只删字节已经没了的行**(键本来就不在也算删掉 —— S3 / OSS / MinIO 的 DeleteObject 对不存在的键返回成功),删不掉的行留到下一轮;一行汇总日志 `retention.image_object_delete_failed keys_failed=… keys_ok=… errors=<异常类型:条数>`(不打键、不逐条打堆栈),`images` 进 `failed_passes`,退出码 3。此前是行照删、字节留在桶里永远没人认领。没有「放弃」上限:永远删不掉的行每晚重试(放弃只能删行丢字节,正是要避免的)。
+- 显式设了 `EXPERT_WORK_RETENTION_OBJECT_STORE_BACKEND` 的照旧走作业自己那套(明文 AK/SK,本地用);只设了别的 `EXPERT_WORK_RETENTION_OBJECT_STORE_*` 没设 `…_BACKEND` 时它们不生效,日志 `retention.object_store_override_ignored vars=…` 只列变量名。
+
+**退出码 3 不会触发任何告警**:仓库里 Prometheus 只抓 control-plane,没有 kube-state-metrics,也没有 Job 失败的告警规则;日志进阿里云 SLS,但没配 SLS 告警;smoke 不看留存作业。失败只体现在 Job 状态(Failed)和日志里。
+
+**运维要做的**:发布本身无操作。作业与 control-plane 同一个镜像、同一个 DSN(同一个库角色,读得到 `encrypted_secret`)、envFrom 同一份 `control-plane-config` / `control-plane-secrets`(里面已有 `EXPERT_WORK_OBJECT_STORE_*`、`EXPERT_WORK_SECRET_STORE_BACKEND=sql_encrypted`、`EXPERT_WORK_SECRET_ENCRYPTION_KEY`),不加 env / secret / 授权,k8s 只改了 `cronjob.yaml` / `kustomization.yaml` 的头注释。集群里没有 NetworkPolicy,作业 Pod 访问 OSS 内网端点与 control-plane 相同。**建议(运维项,不在本 PR 内,要用户批准再建)**:在 SLS 上给留存作业的日志加两条告警 —— `retention.object_store` 且 `available=false`;`retention.passes_failed`(任一 pass 失败,也覆盖 B-63 的上传 pass)。没有它们,作业失败只能靠人看 Job 状态。
+
+**回滚注意**:回滚后作业退回 `memory`,图片 pass 又变回 no-op —— 行和字节都不动(与本次之前相同,无副作用);本次已删掉的行和字节不会回来。
+
+**怎么进**:测试环境控制台(system_admin,平台租户);库只读查询;`kubectl` 只读 + 手动起 job。**花费**:约 ¥0.2(一轮带图对话 + 一轮不带图)。
+
+- [ ] **100.0 前提**:本 PR 叠在 B-283 上,发布提交天然包含 B-283;发前仍核一次:`git merge-base --is-ancestor <B-283 合入提交> <发布提交>` 为真,且 §95.1 的迁移已到位。不满足就**不要**做 100.2,也不要发生产。
+- [ ] **100.1 作业认出对象存储**:发布后手动起一次:`kubectl -n expert-work create job --from=cronjob/retention-cleanup b286-probe-1`,等完成,看日志。判据:有且只有一行 `retention.object_store backend=s3-compatible source=shared available=true bucket=expert-work-test`;`retention_cleanup_job.done … failed_passes=-`(或只有与本节无关的项);没有 `retention.image_object_delete_failed`;退出码 0;日志里没有 AK / SK / `secret://`。**没修好时**:没有这一行,或 `available=false`,或 `image_keys_ok` 永远是 0。
+- [ ] **100.2 到期图片的字节真的删了**:在控制台(调试台)新开一个会话,上传一张图片并带着它发一轮(「这张图里有什么」),run 正常完成;响应里的 `image_ref` 带图片 id。只读查 `SELECT id, object_key, created_at, deleted_at FROM image_upload WHERE id = '<图片 id>'` 记下 `object_key`,在阿里云 OSS 控制台(`expert-work-test` 桶 → 文件管理,按 `object_key` 前缀搜)确认对象在。然后让它到期,二选一:① 控制台删掉这张图(`DELETE /v1/uploads/<图片 id>`,软删的行下一轮不论年龄都回收)—— 不改库,优先用;② 测试租户的附件保留期设 7 天(B-283 起图片与附件同一个天数),用户批准后把这一行的 `created_at`、`last_used_at`(有值时)与该会话全部 run 的 `created_at` 都改到 8 天前(到期 = 三者最晚 + 天数,见 §95)。再起一次 job(`b286-probe-2`)。判据:日志 `image_rows≥1 image_keys_ok≥1 image_keys_failed=0`;`image_upload` 里这一行没了;OSS 控制台里这个对象**不在了**(`image_keys_ok` 只说明删除请求成功,对象本来不在也会成功,所以要看桶);退出码 0。
+- [ ] **100.3 字节删掉后同一会话还能继续**:在 100.2 那个会话里再发一轮纯文字(「刚才那张图是什么颜色」)。判据:run 正常完成(不是 failed),回复里说明图片已不可用之类;control-plane 日志里这一轮没有 `ObjectNotFoundError` 的 Traceback;Prometheus `expert_work_upload_images_degraded_total` 增加 ≥ 1。**没带 B-283 时**:这一轮失败,报 `ObjectNotFoundError` —— 这时停止发布。
+- [ ] **100.4 删除失败时行留着**:真栈不造故障(要改桶策略 / 对象锁),由单测覆盖(`services/retention-cleanup-job/tests/test_job_unit.py::test_delete_expired_images_keeps_rows_whose_bytes_were_not_deleted`:一个键删不掉 → 那一行留着、其余行删掉、`failed_passes=images`、一行汇总日志不含键)。记「单测覆盖」。
+- [ ] **100.5 收尾**:删 probe job;若用了 ②,租户附件保留期设回原值;删 100.2 的会话。
+
+**生产(用户执行,随发布之后)**:先确认 100.0(生产发布包含 B-283;两者同一次发布)。发布后第一晚(03:23)的作业日志看两行:`retention.object_store … available=true bucket=expert-work-prod` 与 `retention_cleanup_job.done … image_keys_failed=0`;第一晚会把此前积压的到期图片(行和字节)一次清掉(每轮上限 `EXPERT_WORK_RETENTION_BATCH_SIZE`,默认 10000 行,多的后几晚接着清)。若出现 `available=false error=…` 或 `retention.image_object_delete_failed`,把那一行贴回来(只有计数与异常类型,不含密钥、不含对象键)。第二天看一眼 Prometheus `expert_work_upload_images_degraded_total`:有增长说明有会话引用了被清掉的图片且照常继续了;同时 control-plane 日志里不应出现图片相关的 `ObjectNotFoundError`。
