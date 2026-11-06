@@ -1359,3 +1359,25 @@ async def test_one_item_failing_to_move_back_does_not_stop_the_others(
         assert world.cleaned_at(conv) is None
     finally:
         await world.engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_an_audited_upload_stamped_by_a_db_clock_ahead_of_the_pod_keeps_the_dir(
+    world: _World,
+) -> None:
+    """L-1 —— ``occurred_at`` 是库的 ``now()``;库的时钟比这个 pod 快时,那条审计照样算(不拿 pod 的
+    「现在」当上界)。"""
+    from expert_work.persistence import SqlAuditLogStore
+
+    try:
+        conv = await world.conversation(age_days=200)
+        world.run(conv, age_days=100)
+        conv_dir = world.place(conv)
+        await _upload_audit(world, conv, age_days=-1 / 24)  # the DB clock is an hour ahead
+
+        report = await world.job(audit_log_store=SqlAuditLogStore(world.sf)).run_once()
+
+        assert conv_dir.exists()
+        assert report.conversation_dirs_skipped_active == 1
+    finally:
+        await world.engine.dispose()
