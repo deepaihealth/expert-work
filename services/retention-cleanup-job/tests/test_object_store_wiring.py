@@ -70,8 +70,7 @@ def _secrets_file(tmp_path: Path, *, with_secret: bool = True) -> Path:
 async def _plan() -> ObjectStorePlan:
     return await plan_object_store(
         RetentionCleanupSettings(),
-        SharedStorageSettings(),
-        lambda: None,  # type: ignore[arg-type,return-value]
+        lambda: None,  # type: ignore[arg-type]
     )
 
 
@@ -109,6 +108,20 @@ async def test_the_shared_control_plane_settings_drive_the_object_store(
         _ACCESS,
         _SECRET,
     )
+
+
+async def test_the_plan_repr_leaves_out_the_keys(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The plan (and the S3 config inside it) can end up in a log line or a traceback."""
+    _shared_env(monkeypatch, _secrets_file(tmp_path))
+
+    plan = await _plan()
+
+    assert plan.config is not None
+    assert "expert-work-test" in repr(plan)
+    assert _ACCESS not in repr(plan)
+    assert _SECRET not in repr(plan)
 
 
 async def test_nothing_configured_means_the_memory_backend() -> None:
@@ -196,6 +209,58 @@ async def test_an_incomplete_retention_override_is_unavailable(
     plan = await _plan()
 
     assert (plan.unavailable, plan.error) == (True, "incomplete_config")
+
+
+async def test_a_bad_shared_value_is_unavailable_not_a_crash(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Low-2 —— a value the shared settings reject used to raise out of ``main`` before any pass
+    ran; now only the image pass is skipped."""
+    _shared_env(monkeypatch, _secrets_file(tmp_path))
+    monkeypatch.setenv("EXPERT_WORK_OBJECT_STORE_ADDRESSING_STYLE", "sideways")
+    with pytest.raises(ValueError):
+        SharedStorageSettings()
+
+    plan = await _plan()
+
+    assert (plan.backend, plan.unavailable, plan.error) == (
+        "s3-compatible",
+        True,
+        "ValidationError",
+    )
+
+
+async def test_override_values_without_the_backend_are_named_in_a_warning(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Low-6 —— ``EXPERT_WORK_RETENTION_OBJECT_STORE_*`` only applies with ``…_BACKEND`` set;
+    without it they are ignored, so say which ones (names only, never the values)."""
+    monkeypatch.setenv("EXPERT_WORK_RETENTION_OBJECT_STORE_ENDPOINT_URL", "http://minio:9000")
+    monkeypatch.setenv("EXPERT_WORK_RETENTION_OBJECT_STORE_SECRET_KEY", "minio-sk-value")
+    caplog.set_level(logging.WARNING, logger="retention_cleanup_job.object_store")
+
+    plan = await _plan()
+
+    assert (plan.backend, plan.source) == ("memory", "shared")
+    warnings = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+    assert len(warnings) == 1
+    assert warnings[0].startswith(
+        "retention.object_store_override_ignored vars="
+        "EXPERT_WORK_RETENTION_OBJECT_STORE_ENDPOINT_URL,"
+        "EXPERT_WORK_RETENTION_OBJECT_STORE_SECRET_KEY "
+    )
+    assert "minio-sk-value" not in warnings[0]
+    assert "minio:9000" not in warnings[0]
+
+
+async def test_no_override_warning_when_nothing_is_set(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level(logging.WARNING, logger="retention_cleanup_job.object_store")
+
+    await _plan()
+
+    assert caplog.records == []
 
 
 # ---------------------------------------------------------------------------
@@ -288,13 +353,19 @@ async def _old_image(images: InMemoryImageUploadStore) -> tuple[Any, Any]:
 
 async def test_an_unavailable_store_skips_the_image_pass_and_fails_the_run() -> None:
     """Deleting the rows without the bytes would orphan the bytes forever: keep the rows, report
-    the pass as failed (exit code 3 → alert), let every other pass run."""
+    the pass as failed (exit code 3), let every other pass run.
+
+    A working store is wired on purpose: with ``object_store=None`` the pass returns early on its
+    own and the row-kept assertion could not go red. Here only the ``unavailable`` marker stands
+    between the row and its deletion."""
     images = InMemoryImageUploadStore()
+    store = InMemoryObjectStore()
     image_id, tenant = await _old_image(images)
+    await store.put("tenants/x/uploads/old.png", b"OLD", content_type="image/png")
     job = RetentionCleanupJob(
         db_session_factory=lambda: None,  # type: ignore[arg-type]
         image_upload_store=images,
-        object_store=None,
+        object_store=store,
         object_store_unavailable="SecretNotFoundError",
         image_retention_days=90,
     )
@@ -302,6 +373,7 @@ async def test_an_unavailable_store_skips_the_image_pass_and_fails_the_run() -> 
     assert await job._delete_expired_images() == (0, 0, 0)
     assert job._failed_passes == ["images"]
     assert await images.get(image_id=image_id, tenant_id=tenant) is not None
+    assert await store.get("tenants/x/uploads/old.png") == b"OLD"
 
 
 async def test_an_available_store_still_reaps_images() -> None:

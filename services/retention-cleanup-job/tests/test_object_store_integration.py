@@ -20,7 +20,7 @@ from expert_work.persistence import DatabaseConfig, create_async_engine_from_con
 from expert_work.runtime.secret_store.sql_encrypted import SqlEncryptedSecretStore
 from retention_cleanup_job import main as main_module
 from retention_cleanup_job.main import EXIT_PASS_FAILED, build_session_factory
-from retention_cleanup_job.object_store import SharedStorageSettings, plan_object_store
+from retention_cleanup_job.object_store import plan_object_store
 from retention_cleanup_job.settings import RetentionCleanupSettings
 
 pytestmark = pytest.mark.integration
@@ -94,7 +94,7 @@ async def test_the_job_decrypts_the_control_planes_object_store_keys(
     await _seed_secrets(sf)
     _shared_env(monkeypatch)
 
-    plan = await plan_object_store(RetentionCleanupSettings(), SharedStorageSettings(), sf)
+    plan = await plan_object_store(RetentionCleanupSettings(), sf)
 
     assert (plan.source, plan.unavailable) == ("shared", False)
     assert plan.config is not None
@@ -108,7 +108,7 @@ async def test_a_wrong_key_is_unavailable_not_a_crash(
     await _seed_secrets(sf)
     _shared_env(monkeypatch, kek=base64.b64encode(b"x" * 32).decode())
 
-    plan = await plan_object_store(RetentionCleanupSettings(), SharedStorageSettings(), sf)
+    plan = await plan_object_store(RetentionCleanupSettings(), sf)
 
     assert (plan.unavailable, plan.error) == (True, "SecretStoreError")
 
@@ -121,7 +121,7 @@ async def test_the_whole_job_runs_and_fails_loudly_when_keys_are_missing(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     """No secrets in the vault: every other pass still runs, the image pass is skipped, the
-    process exits 3 (the CronJob shows failed → alert); the backend is logged once."""
+    process exits 3 (the Job shows Failed — no alert is wired to it); the backend is logged once."""
     _shared_env(monkeypatch)
     monkeypatch.setenv("EXPERT_WORK_RETENTION_DB_DSN", _async_dsn(postgres_container))
     monkeypatch.setattr(main_module, "configure_logging", lambda *_a, **_k: None)
@@ -164,3 +164,33 @@ async def test_the_whole_job_uses_the_resolved_store(
     ]
     assert all(_SECRET not in m and _ACCESS not in m for m in messages)
     assert code == 0
+
+
+@pytest.mark.asyncio
+async def test_a_bad_shared_value_still_runs_every_other_pass(
+    sf: async_sessionmaker[AsyncSession],
+    postgres_container: PostgresContainer,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A value the shared settings reject (here the addressing style) skips only the image pass:
+    the job still reaches ``done`` and exits 3 instead of dying before the first pass."""
+    await _seed_secrets(sf)
+    _shared_env(monkeypatch)
+    monkeypatch.setenv("EXPERT_WORK_OBJECT_STORE_ADDRESSING_STYLE", "sideways")
+    monkeypatch.setenv("EXPERT_WORK_RETENTION_DB_DSN", _async_dsn(postgres_container))
+    monkeypatch.setattr(main_module, "configure_logging", lambda *_a, **_k: None)
+    caplog.set_level(logging.INFO)
+
+    code = await main_module._amain()
+
+    messages = [r.getMessage() for r in caplog.records]
+    assert [m for m in messages if m.startswith("retention.object_store ")] == [
+        "retention.object_store backend=s3-compatible source=shared available=false "
+        "error=ValidationError — image bytes are not deleted this run"
+    ]
+    assert any(
+        m.startswith("retention_cleanup_job.done ") and "failed_passes=images" in m
+        for m in messages
+    )
+    assert code == EXIT_PASS_FAILED

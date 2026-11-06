@@ -14,13 +14,18 @@ control-plane 经它的 SecretStore(测试 / 生产是 ``sql_encrypted``:库里 
 ``EXPERT_WORK_RETENTION_OBJECT_STORE_BACKEND`` **显式设了**的,照旧走作业自己那套(明文
 ``EXPERT_WORK_RETENTION_OBJECT_STORE_ACCESS_KEY`` / ``…_SECRET_KEY``),留给本地 / 单独部署。
 
-解不出来(KEK 缺 / 不对、密钥行不在、库读不了、配置不全)**不让作业崩**:只记异常类型,依赖对象
-存储的 pass 记成跳过并进 ``failed_passes``(进程退出码 3,告警会响),其余 pass 照跑。
+解不出来(KEK 缺 / 不对、密钥行不在、库读不了、配置不全或取值不合法)**不让作业崩**:只记异常类型,
+依赖对象存储的 pass 记成跳过并进 ``failed_passes``(进程退出码 3),其余 pass 照跑。
+
+**没有告警会响**:仓库里的 Prometheus 只抓 control-plane,没有 kube-state-metrics,也没有 Job 失败
+的告警规则;日志进阿里云 SLS,但仓库里没有对应的 SLS 告警。失败只体现在 Job 状态(Failed)和日志
+(``retention.object_store … available=false``、``retention.passes_failed``)里,要有人去看。
 """
 
 from __future__ import annotations
 
 import logging
+from collections.abc import Callable
 from contextlib import AsyncExitStack
 from dataclasses import dataclass, replace
 from typing import Literal
@@ -73,6 +78,7 @@ class ObjectStorePlan:
 
     backend: ObjectStoreBackend
     source: Literal["shared", "retention_override"]
+    #: 里面有明文 AK/SK;``S3CompatibleConfig`` 的 ``repr`` 不带它们(B-286)。
     config: S3CompatibleConfig | None = None
     error: str | None = None
 
@@ -95,14 +101,35 @@ def build_secret_store(
     return make_secret_store(shared.secret_store_backend, env_file=shared.secret_store_env_file)
 
 
+#: ``EXPERT_WORK_RETENTION_OBJECT_STORE_*`` 里只有设了 ``…_BACKEND`` 才生效的那几项。
+_OVERRIDE_FIELDS = (
+    "object_store_endpoint_url",
+    "object_store_region",
+    "object_store_bucket",
+    "object_store_access_key",
+    "object_store_secret_key",
+    "object_store_addressing_style",
+)
+
+
 async def plan_object_store(
     settings: RetentionCleanupSettings,
-    shared: SharedStorageSettings,
     session_factory: async_sessionmaker[AsyncSession],
+    *,
+    load_shared: Callable[[], SharedStorageSettings] = SharedStorageSettings,
 ) -> ObjectStorePlan:
-    """决定并解析这一轮的对象存储。永不抛:解不出来的回 ``unavailable`` 的 plan。"""
+    """决定并解析这一轮的对象存储。永不抛:解不出来的回 ``unavailable`` 的 plan。
+
+    共享配置(``EXPERT_WORK_OBJECT_STORE_*`` 等)也在这里读:取值不合法(``ValidationError``)
+    同样只让图片 pass 跳过,不让整个作业在第一条 DELETE 之前就退出。"""
     if "object_store_backend" in settings.model_fields_set:
         return _retention_override(settings)
+    _warn_ignored_override(settings)
+    try:
+        shared = load_shared()
+    except Exception as exc:
+        # 不知道它本来要不要 s3:按「配了但用不了」处理,行不动、pass 记失败。
+        return ObjectStorePlan(backend="s3-compatible", source="shared", error=type(exc).__name__)
     if shared.object_store_backend != "s3-compatible":
         return ObjectStorePlan(backend="memory", source="shared")
     try:
@@ -119,6 +146,23 @@ async def plan_object_store(
     except Exception as exc:
         return ObjectStorePlan(backend="s3-compatible", source="shared", error=type(exc).__name__)
     return ObjectStorePlan(backend="s3-compatible", source="shared", config=config)
+
+
+def _warn_ignored_override(settings: RetentionCleanupSettings) -> None:
+    """设了 ``EXPERT_WORK_RETENTION_OBJECT_STORE_*`` 却没设 ``…_BACKEND``:它们不生效,说一声
+    (只打变量名,不打值)。"""
+    ignored = [
+        f"EXPERT_WORK_RETENTION_{name.upper()}"
+        for name in _OVERRIDE_FIELDS
+        if name in settings.model_fields_set
+    ]
+    if ignored:
+        logger.warning(
+            "retention.object_store_override_ignored vars=%s — set "
+            "EXPERT_WORK_RETENTION_OBJECT_STORE_BACKEND for them to apply; using the control "
+            "plane's EXPERT_WORK_OBJECT_STORE_* instead",
+            ",".join(ignored),
+        )
 
 
 def _retention_override(settings: RetentionCleanupSettings) -> ObjectStorePlan:

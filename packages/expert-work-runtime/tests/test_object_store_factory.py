@@ -154,3 +154,20 @@ async def test_s3_backend_wires_path_addressing_for_minio(
     boto_config = fake_session.captured_kwargs["config"]
     assert isinstance(boto_config, BotoConfig)
     assert boto_config.s3 == {"addressing_style": "path"}
+
+
+def test_config_repr_leaves_out_the_keys() -> None:
+    """B-286 —— the config travels through logs / tracebacks; its repr must not carry AK / SK."""
+    config = S3CompatibleConfig(
+        endpoint_url="https://oss.example.internal",
+        region="cn-hangzhou",
+        bucket="expert-work-test",
+        access_key="AK-must-not-appear",
+        secret_key="SK-must-not-appear",
+    )
+
+    text = repr(config)
+
+    assert "expert-work-test" in text
+    assert "AK-must-not-appear" not in text
+    assert "SK-must-not-appear" not in text

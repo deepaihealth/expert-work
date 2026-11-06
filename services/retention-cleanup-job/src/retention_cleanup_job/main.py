@@ -40,7 +40,6 @@ from expert_work.runtime.audit import (
 from expert_work.runtime.runs.store import SqlRunStore
 from retention_cleanup_job.job import RetentionCleanupJob
 from retention_cleanup_job.object_store import (
-    SharedStorageSettings,
     enter_object_store,
     log_plan,
     plan_object_store,
@@ -231,7 +230,7 @@ async def _amain() -> int:
         #
         # B-286 —— 与 control-plane 同一个对象存储(``EXPERT_WORK_OBJECT_STORE_*`` + 同一个
         # SecretStore 解 ``secret://`` 引用)。解不出来不崩:图片 pass 记跳过、进失败清单。
-        plan = await plan_object_store(settings, SharedStorageSettings(), session_factory)
+        plan = await plan_object_store(settings, session_factory)
         object_store, plan = await enter_object_store(stack, plan)
         log_plan(plan)
         image_store = (
