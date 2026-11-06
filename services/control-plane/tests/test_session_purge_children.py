@@ -327,10 +327,15 @@ async def test_a_kind_that_cannot_go_keeps_the_conversation_and_a_retry_finishes
 
 @pytest.mark.asyncio
 async def test_image_bytes_that_will_not_go_keep_their_row(
-    client: AsyncClient, monkeypatch: pytest.MonkeyPatch
+    client: AsyncClient,
+    audit_store: InMemoryAuditLogStore,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     """No job looks for image bytes without a row, so a row whose bytes could not
-    be deleted stays (with the conversation) until a retry deletes both."""
+    be deleted stays (with the conversation) until a retry deletes both. Bytes
+    that can never go (access denied, object lock) would 503 every time, so the
+    audit row counts the kept rows and a warning names their ids (ids only)."""
     app = _app(client)
     doomed = await _create(client)
     mine = await _seed(app, doomed)
@@ -339,8 +344,18 @@ async def test_image_bytes_that_will_not_go_keep_their_row(
         raise TimeoutError("oss")
 
     monkeypatch.setattr(app.state.object_store, "delete", _boom)
-    failed = await client.post(f"/v1/sessions/{doomed}:purge")
+    with caplog.at_level("WARNING", logger="expert_work.control_plane.purge.session"):
+        failed = await client.post(f"/v1/sessions/{doomed}:purge")
     assert failed.status_code == 503, failed.text
+    page = await audit_store.query(AuditQuery(tenant_id=_TENANT))
+    entry = next(
+        r for r in page.entries if r.resource_id == str(doomed) and r.details.get("op") == "purge"
+    )
+    assert entry.details["image_rows_kept"] == 1
+    kept = [r for r in caplog.records if "image_rows_kept" in r.getMessage()]
+    assert len(kept) == 1
+    assert str(mine.image_id) in kept[0].getMessage()
+    assert mine.object_key not in kept[0].getMessage()
     left = await _remaining(app, doomed, mine)
     assert (left["image_uploads"], left["image_blob"]) == (1, 1)
     assert (await client.get(f"/v1/sessions/{doomed}")).status_code == 200
@@ -351,3 +366,76 @@ async def test_image_bytes_that_will_not_go_keep_their_row(
     data = retried.json()["data"]
     assert (data["image_uploads"], data["image_blobs_removed"]) == (1, 1)
     assert await _remaining(app, doomed, mine) == _ALL_ZERO
+
+
+@pytest.mark.asyncio
+async def test_rows_written_while_the_conversation_goes_are_deleted_too(
+    client: AsyncClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A run still executing is not stopped: between the first pass and the
+    thread row it can write feedback, a judge verdict, a writeback DLQ row. One
+    more pass after the thread row takes them (counted)."""
+    app = _app(client)
+    doomed = await _create(client)
+    mine = await _seed(app, doomed)
+    real_delete = app.state.thread_meta_repo.delete
+    late_run = uuid4()
+
+    async def _late_rows_then_delete(thread_id: UUID, *, tenant_id: UUID) -> bool:
+        await app.state.feedback_store.insert(
+            FeedbackRecord(tenant_id=_TENANT, thread_id=thread_id, rating="up", actor_id="late")
+        )
+        await app.state.quality_score_store.insert(
+            QualityScoreRecord(
+                tenant_id=_TENANT,
+                agent_name=_AGENT,
+                agent_version="1.0.0",
+                run_id=late_run,
+                thread_id=thread_id,
+                overall=4,
+                dimensions={},
+                rationale="r",
+                judge_model="m",
+            )
+        )
+        await app.state.memory_writeback_dlq.enqueue(
+            tenant_id=_TENANT,
+            user_id=_USER,
+            source_thread_id=str(thread_id),
+            extracted=[("fact", "late")],
+            error="e",
+        )
+        removed: bool = await real_delete(thread_id, tenant_id=tenant_id)
+        return removed
+
+    monkeypatch.setattr(app.state.thread_meta_repo, "delete", _late_rows_then_delete)
+    resp = await client.post(f"/v1/sessions/{doomed}:purge")
+    assert resp.status_code == 200, resp.text
+    data = resp.json()["data"]
+    assert (data["feedback"], data["quality_scores"], data["memory_writeback_dlq"]) == (2, 2, 2)
+    assert await _remaining(app, doomed, mine) == _ALL_ZERO
+    assert not await app.state.quality_score_store.exists(tenant_id=_TENANT, run_id=late_run)
+
+
+@pytest.mark.asyncio
+async def test_a_failing_second_pass_does_not_fail_the_purge(
+    client: AsyncClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    app = _app(client)
+    doomed = await _create(client)
+    await _seed(app, doomed)
+    calls: list[int] = []
+    real = app.state.feedback_store.delete_for_threads
+
+    async def _second_call_fails(*, tenant_id: UUID, thread_ids: object) -> int:
+        calls.append(1)
+        if len(calls) == 2:
+            raise ConnectionError("db blip")
+        removed: int = await real(tenant_id=tenant_id, thread_ids=thread_ids)
+        return removed
+
+    monkeypatch.setattr(app.state.feedback_store, "delete_for_threads", _second_call_fails)
+    resp = await client.post(f"/v1/sessions/{doomed}:purge")
+    assert resp.status_code == 200, resp.text
+    assert len(calls) == 2
+    assert resp.json()["data"]["feedback"] == 1

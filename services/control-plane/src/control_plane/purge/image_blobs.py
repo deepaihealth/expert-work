@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from uuid import UUID
 
 from expert_work.persistence.image_upload import ImageUploadStore
@@ -32,6 +32,8 @@ class ImageTally:
     blobs_failed: int = 0
     #: 没接对象存储:行照删(字节无从删起)。
     blobs_skipped: int = 0
+    #: 字节没删掉、行留着的图片 id(只是 id,不含对象键)。
+    kept_ids: list[UUID] = field(default_factory=list)
 
 
 async def delete_images(
@@ -54,6 +56,7 @@ async def delete_images(
                 await object_store.delete(row.object_key)
             except Exception as exc:
                 tally.blobs_failed += 1
+                tally.kept_ids.append(row.id)
                 logger.warning("purge.image_blob_failed error=%s", type(exc).__name__)
                 continue
             tally.blobs_removed += 1

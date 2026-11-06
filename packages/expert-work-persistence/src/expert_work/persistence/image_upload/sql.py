@@ -144,14 +144,18 @@ class SqlImageUploadStore(ImageUploadStore):
         return [_row_to_dto(r) for r in rows]
 
     async def hard_delete(self, *, image_ids: Sequence[UUID]) -> int:
-        if not image_ids:
-            return 0
-        async with self._sf() as session:
-            result = await session.execute(
-                delete(ImageUploadRow).where(ImageUploadRow.id.in_(list(image_ids)))
-            )
-            await session.commit()
-            return int(getattr(result, "rowcount", 0) or 0)
+        # ``IN`` lists in chunks: asyncpg caps one statement at 32,767 bind
+        # parameters, and an agent purge passes every image of the agent.
+        ids = list(image_ids)
+        removed = 0
+        for i in range(0, len(ids), CHUNK):
+            async with self._sf() as session:
+                result = await session.execute(
+                    delete(ImageUploadRow).where(ImageUploadRow.id.in_(ids[i : i + CHUNK]))
+                )
+                await session.commit()
+            removed += int(getattr(result, "rowcount", 0) or 0)
+        return removed
 
     async def delete_all_for_user(self, *, tenant_id: UUID, user_id: UUID) -> int:
         async with self._sf() as session:

@@ -55,7 +55,11 @@ from control_plane.api._workspace_shared import (
     workspace_agent_path,
 )
 from control_plane.audit import emit
-from control_plane.purge.session_purge import SessionPurgeStores, purge_thread_children
+from control_plane.purge.session_purge import (
+    SessionPurgeStores,
+    purge_late_children,
+    purge_thread_children,
+)
 from control_plane.quota.base import QuotaService
 from control_plane.runtime import AgentRuntime
 from control_plane.tenant_scope import (
@@ -1175,8 +1179,13 @@ def build_sessions_router() -> APIRouter:
         may use the same file; the conversation-layout ``work/uploads/`` goes
         with ``threads/<id>/``), memories extracted from the conversation (the
         user's, shared across conversations), its registered artifacts (B-236:
-        deleting a conversation keeps them), and the billing / audit rows
-        (``token_usage``, ``audit_log`` …; the agent purge keeps those too).
+        deleting a conversation keeps them), the billing / audit rows
+        (``token_usage``, ``audit_log`` …; the agent purge keeps those too), and
+        — not yet, a separate item — the run trajectory and event archive files
+        in object storage (the curation candidate that points at a trajectory
+        does go). A run still executing is not stopped: the rows it may write
+        after the first pass (retrieval logs, feedback, quality score, writeback
+        DLQ) get one best-effort second pass after the thread row.
         """
         meta = await _load_owned_session(thread_id, request, threads, users)
         tenant_id: UUID = request.state.tenant_id
@@ -1284,6 +1293,12 @@ def build_sessions_router() -> APIRouter:
             deleted["retrieval_logs"] = logs_deleted
         except Exception as exc:  # best-effort: retention removes a straggler
             logger.warning("session_purge.retrieval_logs_failed error=%s", type(exc).__name__)
+        # B-280 —— the same second pass for the other rows a still-running run can
+        # write (feedback, judge verdict, writeback DLQ); failures only logged.
+        late = await purge_late_children(child_stores, tenant_id=tenant_id, thread_id=thread_id)
+        for kind, count in late.items():
+            previous = deleted.get(kind, 0)
+            deleted[kind] = (previous if isinstance(previous, int) else 0) + count
         # 留存链 B-27 —— the thread's projected-state directory
         # (``threads/<thread_id>/``: MEMORY.md / PLAN.md / TODO.md) goes with the
         # thread. After the row delete on purpose: once the row is gone the

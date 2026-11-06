@@ -59,7 +59,7 @@ async def _assert_rerun_finishes(world: _World, threads: list[UUID]) -> None:
         ("approvals", "delete_for_threads", "thread_meta"),
         ("feedback", "delete_for_threads", "thread_meta"),
         ("dlq", "delete_for_threads", "thread_meta"),
-        ("uploads", "delete_for_threads", "thread_meta"),
+        ("uploads", "tombstone_for_threads", "thread_meta"),
         ("trigger_runs", "delete_for_triggers", "agent_trigger"),
         ("deliveries", "delete_for_endpoints", "webhook_endpoint"),
         ("snapshots", "delete", "artifact"),

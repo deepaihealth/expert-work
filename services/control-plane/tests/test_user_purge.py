@@ -862,8 +862,9 @@ class _FailingFeedbackStore(InMemoryFeedbackStore):
 @pytest.mark.asyncio
 async def test_purge_user_approval_cleanup_failure_recorded_and_does_not_abort() -> None:
     """``approvals.delete_for_threads`` raising —— failure is recorded under
-    ``agent_approval`` and the rest of ``_purge_threads`` (thread-row
-    deletion, which runs later in the SAME function) still completes.
+    ``agent_approval`` and the purge goes on; the thread rows are kept
+    (B-280: child before parent — the approval / feedback rows are found by
+    thread id only, so a re-run needs the threads to find them).
 
     Guards the inner try/except around the approval cleanup in
     ``_purge_threads`` (distinct from ``purge_user``'s outer per-step
@@ -977,10 +978,11 @@ async def test_purge_user_approval_cleanup_failure_recorded_and_does_not_abort()
     rendered = str(summary.as_dict())
     assert _FailingApprovalStore.SECRET_IN_MESSAGE not in rendered
     assert _FailingFeedbackStore.SECRET_IN_MESSAGE not in rendered
-    # The rest of _purge_threads — which runs AFTER the approval-cleanup
-    # block, in the same function — still executed: the thread row itself
-    # was purged despite the approval-cleanup exception.
-    assert summary.threads_purged == 1
+    # B-280 —— the thread rows stay so a re-run can still find the approval
+    # and feedback rows (they are keyed by thread only).
+    assert summary.threads_purged == 0
+    assert "threads" in summary.skipped
+    assert await threads.get(t_a, tenant_id=t1) is not None
     # purge_user's outer per-step wrapper never saw an exception either — the
     # "threads" step (the whole _purge_threads coroutine) is not itself
     # recorded as failed.

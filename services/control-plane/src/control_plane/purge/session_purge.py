@@ -68,6 +68,9 @@ class ThreadChildrenResult:
     image_blobs_removed: int = 0
     image_blobs_failed: int = 0
     image_blobs_skipped: int = 0
+    #: 字节删不掉、行留着的图片(对象存储拒绝 —— 无权限、对象锁 —— 时每次重试都会卡在这里,
+    #: 运维据此介入)。
+    image_rows_kept: int = 0
 
     def as_details(self) -> dict[str, object]:
         """``purge_session`` 响应 / 审计里的字段:每类删了几行,失败的加 ``<类>_delete_failed``。"""
@@ -75,6 +78,7 @@ class ThreadChildrenResult:
         details["image_blobs_removed"] = self.image_blobs_removed
         details["image_blobs_failed"] = self.image_blobs_failed
         details["image_blobs_skipped"] = self.image_blobs_skipped
+        details["image_rows_kept"] = self.image_rows_kept
         for kind in self.failures:
             details[f"{kind}_delete_failed"] = True
         return details
@@ -93,6 +97,15 @@ async def _purge_images(
         result.image_blobs_skipped += tally.blobs_skipped
         # 部分失败也照实记下删了几行(成功时由调用方用返回值记)。
         result.deleted["image_uploads"] = tally.rows_deleted
+        result.image_rows_kept = len(tally.kept_ids)
+        if tally.kept_ids:
+            # 只记 id(不记对象键):字节一直删不掉时,对话会一直 503,运维按 id 去查。
+            logger.warning(
+                "session_purge.image_rows_kept thread_id=%s count=%d image_ids=%s",
+                thread_id,
+                len(tally.kept_ids),
+                ",".join(str(i) for i in tally.kept_ids),
+            )
     return tally.rows_deleted
 
 
@@ -140,3 +153,39 @@ async def purge_thread_children(
             logger.warning("session_purge.step_failed step=%s error=%s", kind, type(exc).__name__)
             result.failures[kind] = type(exc).__name__
     return result
+
+
+#: 对话行删掉之后再扫一遍的几类(还在跑的 run 在两遍之间可能又写了一行)。
+LATE_KINDS: tuple[str, ...] = ("feedback", "quality_scores", "memory_writeback_dlq")
+
+
+async def purge_late_children(
+    stores: SessionPurgeStores, *, tenant_id: UUID, thread_id: UUID
+) -> dict[str, int]:
+    """对话行删掉之后,反馈 / 质量评分 / 写回失败队列再删一遍(同检索记录的第二遍):删除
+    不会停掉还在跑的 run,它在第一遍之后还可能写一行。尽力而为:失败只记日志(类型),
+    这一行之后由留存作业兜。返回每类这一遍删掉的条数。"""
+    ids = [thread_id]
+    steps: tuple[tuple[str, Callable[[], Awaitable[int]]], ...] = (
+        (
+            "feedback",
+            lambda: stores.feedback.delete_for_threads(tenant_id=tenant_id, thread_ids=ids),
+        ),
+        (
+            "quality_scores",
+            lambda: stores.quality_scores.delete_for_threads(tenant_id=tenant_id, thread_ids=ids),
+        ),
+        (
+            "memory_writeback_dlq",
+            lambda: stores.memory_dlq.delete_for_threads(tenant_id=tenant_id, thread_ids=ids),
+        ),
+    )
+    counts: dict[str, int] = {}
+    for kind, step in steps:
+        try:
+            counts[kind] = await step()
+        except Exception as exc:  # best-effort: the first pass already ran
+            logger.warning(
+                "session_purge.late_pass_failed step=%s error=%s", kind, type(exc).__name__
+            )
+    return counts

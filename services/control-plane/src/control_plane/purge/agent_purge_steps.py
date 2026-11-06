@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Awaitable, Callable
+from datetime import UTC, datetime
 from uuid import UUID
 
 from control_plane.purge.agent_purge_nas import (
@@ -298,7 +299,11 @@ async def purge_conversations(
         ),
         (
             "user_upload",
-            deps.user_uploads.delete_for_threads(tenant_id=tenant_id, thread_ids=threads),
+            # B-280 —— 文档行留成墓碑:别的智能体的对话再引用这个 upload_id 仍回
+            # UPLOAD_SESSION_DELETED(对外已公布);图片行与到期行删掉。
+            deps.user_uploads.tombstone_for_threads(
+                tenant_id=tenant_id, thread_ids=threads, now=datetime.now(UTC)
+            ),
         ),
         ("image_upload", _purge_images(deps, summary, tenant_id, threads)),
     ):

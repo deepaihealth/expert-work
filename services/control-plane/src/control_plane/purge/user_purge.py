@@ -94,6 +94,9 @@ _MAX_THREADS = 20_000
 #: ``failures`` key, and while it has failed the run-deleting and
 #: run-anonymising steps are skipped.
 _LOG_STEP = "knowledge_retrieval_log"
+#: B-280 —— ``failures`` keys of the thread-keyed child steps in
+#: :func:`_purge_threads`; any of them failed → the threads stay for a re-run.
+_THREAD_CHILD_STEPS = ("feedback", "quality_score", "curation_candidate_delete", "agent_approval")
 
 
 @dataclass(frozen=True)
@@ -276,7 +279,8 @@ async def _purge_threads(
     # below: if a thread's delete fails partway through, we don't want to be
     # left with "the thread is gone but its feedback rows survive" — cascading
     # the comments first means a failed thread purge still leaves a consistent
-    # (feedback-free) state to retry.
+    # (feedback-free) state to retry. (And if the feedback delete itself fails,
+    # the threads stay — see ``_THREAD_CHILD_STEPS`` below.)
     try:
         summary.deleted["feedback"] = await deps.feedback.delete_for_threads(
             tenant_id=tenant_id, thread_ids=thread_ids
@@ -320,6 +324,15 @@ async def _purge_threads(
         logger.warning("purge_user.approvals_failed", exc_info=True)
         # Type only, never str(exc) — see _step's docstring.
         summary.failures["agent_approval"] = type(exc).__name__
+
+    # B-280 —— child before parent (as ``agent_purge_steps.purge_conversations``):
+    # these rows are found by thread id only (``quality_score`` has no user
+    # column, curation candidates get anonymised further down), so deleting the
+    # threads now would leave them with nothing to find them by. Keep the
+    # threads; a re-run deletes the leftovers, then the threads.
+    if any(step in summary.failures for step in _THREAD_CHILD_STEPS):
+        summary.skipped.append("threads")
+        return
 
     checkpointer = deps.runtime.durable_checkpointer
     adelete = getattr(checkpointer, "adelete_thread", None)

@@ -100,7 +100,9 @@ class ImageUploadStore(abc.ABC):
     async def hard_delete(self, *, image_ids: Sequence[UUID]) -> int:
         """Remove rows from the table; caller must have already cleared
         the corresponding object-store keys. Returns the count of rows
-        actually deleted (idempotent — already-removed ids contribute 0)."""
+        actually deleted (idempotent — already-removed ids contribute 0).
+        Any number of ids: the SQL store splits them into bounded ``IN``
+        lists (B-280 — an agent purge passes every image of the agent)."""
 
     @abc.abstractmethod
     async def delete_all_for_user(self, *, tenant_id: UUID, user_id: UUID) -> int:

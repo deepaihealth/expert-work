@@ -151,9 +151,12 @@ class _Broken:
 
 
 @pytest.mark.asyncio
-async def test_a_failure_is_recorded_by_type_and_the_rest_still_runs(
+async def test_a_failed_child_keeps_the_conversation_and_a_rerun_finishes(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """Quality scores have no user column and candidates get anonymised later:
+    once the conversation row is gone nothing finds them again. So a failure
+    keeps the conversation (``skipped`` has ``threads``) and a re-run finishes."""
     world = _World()
     await world.seed()
     secret = "postgres://u:hunter2@db/x"
@@ -165,8 +168,35 @@ async def test_a_failure_is_recorded_by_type_and_the_rest_still_runs(
     assert summary.failures["quality_score"] == "RuntimeError"
     assert summary.failures["curation_candidate_delete"] == "RuntimeError"
     assert secret not in str(summary.as_dict())
-    # Best-effort like feedback: the conversation itself still goes.
-    assert summary.threads_purged == 1
+    assert not summary.ok
+    assert "threads" in summary.skipped
+    assert summary.threads_purged == 0
+    assert await world.threads.get(world.a_thread, tenant_id=world.tenant) is not None
+
+    monkeypatch.undo()
+    rerun = await _purge_a(world, world.deps())
+    assert rerun.ok, rerun.as_dict()
+    assert rerun.threads_purged == 1
+    assert await world.threads.get(world.a_thread, tenant_id=world.tenant) is None
+    assert not await world.scores.exists(tenant_id=world.tenant, run_id=world.a_score.run_id)
+    assert await world.candidates.get(candidate_id=world.a_cand.id, tenant_id=world.tenant) is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failing", ["quality_score", "curation_candidate_delete"])
+async def test_one_failed_child_alone_keeps_the_conversation(
+    monkeypatch: pytest.MonkeyPatch, failing: str
+) -> None:
+    world = _World()
+    await world.seed()
+    store = world.scores if failing == "quality_score" else world.candidates
+    monkeypatch.setattr(store, "delete_for_threads", _Broken("x"))
+
+    summary = await _purge_a(world, world.deps())
+
+    assert set(summary.failures) == {failing}
+    assert "threads" in summary.skipped
+    assert await world.threads.get(world.a_thread, tenant_id=world.tenant) is not None
 
 
 def _image_world() -> tuple[UUID, UUID, InMemoryImageUploadStore]:

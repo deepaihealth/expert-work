@@ -918,6 +918,20 @@ async def test_a_purged_sessions_upload_still_says_session_deleted(ctx: _Ctx) ->
         )
     assert (img_info.value.code, img_info.value.status_code) == ("UPLOAD_NOT_FOUND", 404)
 
+    # Another end user holding the tombstoned id learns nothing: the owner check
+    # comes before the tombstone check, so it is plain UPLOAD_NOT_FOUND.
+    with pytest.raises(ExternalScopeError) as other_user:
+        await resolve_external_files(
+            files=[ExternalFileRef(upload_id=a["upload_id"])],
+            tenant_id=ctx.tenant_id,
+            end_user_id=uuid4(),
+            thread_id=UUID(b["session_id"]),
+            uploads_store=ctx.app.state.user_upload_store,
+            threads=ctx.app.state.thread_meta_repo,
+            copier=_copier(ctx),
+        )
+    assert (other_user.value.code, other_user.value.status_code) == ("UPLOAD_NOT_FOUND", 404)
+
 
 # ---------------------------------------------------------------------------
 # B-262 review —— 跨会话复制要像上传一样记账(配额 + 审计),出错按上传端点的码回;
