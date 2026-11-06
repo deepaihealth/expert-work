@@ -967,7 +967,8 @@ async def _human_content(
         logger.warning("anthropic_adapter.image_dropped_no_resolver count=%d", len(image_refs))
         return text
     blocks: list[dict[str, Any]] = [{"type": "text", "text": text}]
-    # B-64 Task 7 —— 工作区图读不出来时 ``resolve_message_images`` 给一段文字顶替。
+    # B-64 Task 7 / B-283 —— 工作区图读不出来、上传图的字节不在了时
+    # ``resolve_message_images`` 给一段文字顶替。
     for item in await resolve_message_images(image_refs, resolver):
         if isinstance(item, str):
             blocks.append({"type": "text", "text": item})

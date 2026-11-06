@@ -46,6 +46,10 @@ class RetentionCleanupSettings(BaseSettings):
     # ``created_at < now() - image_retention_days`` get their object
     # store key removed + the row hard-deleted. M0 has no per-tenant
     # override; tenants needing longer retention set the env var.
+    #
+    # B-283: images expire by LAST USE (created_at / last download / last run
+    # of the conversation) plus the tenant's ``tenant_config.upload_retention_days``
+    # (images are uploads); this is the default for tenants that leave it unset.
     image_retention_days: int = Field(default=90, ge=1, le=3650)
 
     # --------------------------------------------------- artifact retention (Mini-ADR J-25)

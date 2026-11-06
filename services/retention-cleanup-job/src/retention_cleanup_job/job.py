@@ -811,12 +811,17 @@ class RetentionCleanupJob:
     async def _delete_expired_images(self) -> tuple[int, int, int]:
         """Remove image rows past their retention window + their bytes.
 
-        Mini-ADR J-32 — finds the reapable ``image_upload`` rows: those
-        whose ``created_at`` is older than ``now - image_retention_days``,
-        plus **any already-soft-deleted row regardless of age** (a user
+        Mini-ADR J-32 — finds the reapable ``image_upload`` rows, plus
+        **any already-soft-deleted row regardless of age** (a user
         delete means the blob should leave at the next sweep, not at the
         original retention horizon). Removes the object-store key for
         each, then hard-deletes the row.
+
+        B-283 —— 按**最后使用**到期:``greatest(created_at, last_used_at, 会话最后一次 run)``
+        加上租户的 ``tenant_config.upload_retention_days``(图片也是上传;没设用
+        ``image_retention_days``,默认 90)早于现在(谓词在 :meth:`ImageUploadStore.list_reapable`)。
+        会话还在用的图不再按上传时间被删;删掉之后会话里再引用它,适配器换成一句文字
+        (``orchestrator.multimodal.resolve_message_images``),那一轮照常跑。
 
         Object-store failures don't block row hard-delete: an orphaned
         key is a far smaller correctness problem than a stuck row
@@ -829,9 +834,9 @@ class RetentionCleanupJob:
         """
         if self._image_upload_store is None or self._object_store is None:
             return 0, 0, 0
-        cutoff = datetime.now(UTC) - timedelta(days=self._image_retention_days)
         expired = await self._image_upload_store.list_reapable(
-            before=cutoff,
+            now=datetime.now(UTC),
+            default_days=self._image_retention_days,
             limit=self._batch_size,
         )
         if not expired:

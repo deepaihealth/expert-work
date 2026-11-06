@@ -37,6 +37,9 @@ class ImageUploadRow(Base):
         server_default=text("now()"),
     )
     deleted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    #: B-283 (migration ``0185``) —— 最后一次被下载的时间,每张每天最多记一次。NULL = 列加上
+    #: 之后没被下载过。
+    last_used_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
     __table_args__ = (
         CheckConstraint("size_bytes >= 0", name="image_upload_size_nonneg"),

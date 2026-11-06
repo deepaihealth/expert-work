@@ -6,13 +6,70 @@ from collections.abc import Sequence
 from datetime import UTC, datetime
 from uuid import UUID
 
-from sqlalchemy import delete, or_, select, update
+from sqlalchemy import Select, and_, delete, func, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from expert_work.persistence.bulk_delete import CHUNK, delete_in_chunks
 from expert_work.persistence.image_upload.base import ImageUploadStore
-from expert_work.persistence.models import ImageUploadRow
+from expert_work.persistence.models import AgentRunRow, ImageUploadRow, TenantConfigRow
+from expert_work.persistence.user_upload.base import TOUCH_INTERVAL
 from expert_work.protocol import ImageUpload
+
+
+def _expired_ids(now: datetime, default_days: int) -> Select[tuple[UUID]]:
+    """B-283 —— 没删、按**最后使用**已经到期的图片 id。
+
+    到期 = ``greatest(created_at, last_used_at, 会话最后一次 run)`` + 租户的
+    ``upload_retention_days``(没设用 ``default_days``)。与 B-63 上传同一个写法:会话最后一次
+    run 用 CTE **一次**算出(先取候选行涉及的 ``(tenant_id, thread_id)``,再对这些会话的
+    ``agent_run`` 按会话聚合),只认**同租户**的 run —— 租户条件在聚合与 join 回来时各有一份,
+    两份是纵深防御。``greatest`` 跳过 NULL(没下载过、会话没有 run)。
+    """
+    cand = (
+        select(
+            ImageUploadRow.id,
+            ImageUploadRow.tenant_id,
+            ImageUploadRow.thread_id,
+            ImageUploadRow.created_at,
+            ImageUploadRow.last_used_at,
+        )
+        .where(ImageUploadRow.deleted_at.is_(None))
+        .cte("image_candidates")
+    )
+    threads = select(cand.c.tenant_id, cand.c.thread_id).distinct().cte("image_threads")
+    last_run = (
+        select(
+            AgentRunRow.tenant_id,
+            AgentRunRow.thread_id,
+            func.max(AgentRunRow.created_at).label("at"),
+        )
+        .join(
+            threads,
+            and_(
+                AgentRunRow.thread_id == threads.c.thread_id,
+                AgentRunRow.tenant_id == threads.c.tenant_id,
+            ),
+        )
+        .group_by(AgentRunRow.tenant_id, AgentRunRow.thread_id)
+        .cte("image_thread_last_run")
+    )
+    days = func.coalesce(TenantConfigRow.upload_retention_days, default_days)
+    expires_at = func.greatest(
+        cand.c.created_at, cand.c.last_used_at, last_run.c.at
+    ) + func.make_interval(0, 0, 0, days)
+    return (
+        select(cand.c.id)
+        .select_from(cand)
+        .outerjoin(
+            last_run,
+            and_(
+                last_run.c.thread_id == cand.c.thread_id,
+                last_run.c.tenant_id == cand.c.tenant_id,
+            ),
+        )
+        .outerjoin(TenantConfigRow, TenantConfigRow.tenant_id == cand.c.tenant_id)
+        .where(expires_at < now)
+    )
 
 
 def _row_to_dto(row: ImageUploadRow) -> ImageUpload:
@@ -27,6 +84,7 @@ def _row_to_dto(row: ImageUploadRow) -> ImageUpload:
         sha256=row.sha256,
         created_at=row.created_at,
         deleted_at=row.deleted_at,
+        last_used_at=row.last_used_at,
     )
 
 
@@ -120,7 +178,8 @@ class SqlImageUploadStore(ImageUploadStore):
     async def list_reapable(
         self,
         *,
-        before: datetime,
+        now: datetime,
+        default_days: int,
         limit: int = 1000,
     ) -> list[ImageUpload]:
         async with self._sf() as session:
@@ -130,8 +189,8 @@ class SqlImageUploadStore(ImageUploadStore):
                         select(ImageUploadRow)
                         .where(
                             or_(
-                                ImageUploadRow.created_at < before,
                                 ImageUploadRow.deleted_at.is_not(None),
+                                ImageUploadRow.id.in_(_expired_ids(now, default_days)),
                             )
                         )
                         .order_by(ImageUploadRow.created_at.asc())
@@ -142,6 +201,24 @@ class SqlImageUploadStore(ImageUploadStore):
                 .all()
             )
         return [_row_to_dto(r) for r in rows]
+
+    async def touch(self, *, image_id: UUID, tenant_id: UUID, now: datetime) -> bool:
+        async with self._sf() as session:
+            result = await session.execute(
+                update(ImageUploadRow)
+                .where(
+                    ImageUploadRow.id == image_id,
+                    ImageUploadRow.tenant_id == tenant_id,
+                    ImageUploadRow.deleted_at.is_(None),
+                    or_(
+                        ImageUploadRow.last_used_at.is_(None),
+                        ImageUploadRow.last_used_at < now - TOUCH_INTERVAL,
+                    ),
+                )
+                .values(last_used_at=now)
+            )
+            await session.commit()
+        return int(getattr(result, "rowcount", 0) or 0) > 0
 
     async def hard_delete(self, *, image_ids: Sequence[UUID]) -> int:
         # ``IN`` lists in chunks: asyncpg caps one statement at 32,767 bind

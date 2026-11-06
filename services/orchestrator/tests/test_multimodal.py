@@ -19,10 +19,11 @@ from expert_work.persistence import (
     WORKSPACE_OVERFLOW_DIR,
 )
 from expert_work.protocol.multimodal import ImageRef, parse_image_ref, parse_workspace_image_ref
-from expert_work.runtime.storage import InMemoryObjectStore, ObjectNotFoundError
+from expert_work.runtime.storage import InMemoryObjectStore, ObjectNotFoundError, ObjectStoreError
 from orchestrator.multimodal import (
     _MAX_WORKSPACE_IMAGE_BYTES,
     IMAGE_REF_BLOCK_TYPE,
+    UPLOAD_IMAGE_GONE_TEXT,
     CachingImageResolver,
     DispatchingImageResolver,
     ImageResolver,
@@ -715,3 +716,64 @@ async def test_only_a_missing_file_is_called_cleaned_up(tmp_path: Path) -> None:
     assert isinstance(escaping, str)
     assert "第 4 页" in escaping and "读不了" in escaping
     assert "已被清理" not in escaping and "需要的话重新调用 read_page" not in escaping
+
+
+# ---------------------------------------------------------------------------
+# B-283 —— 上传图的字节不在了(过了保留期被清理)时降级成文字,不让整次调用失败
+# ---------------------------------------------------------------------------
+
+
+def _upload_resolver(store: InMemoryObjectStore) -> ImageResolver:
+    """生产同款的套法:缓存 → 按 scheme 分发 → 对象存储。"""
+    return CachingImageResolver(
+        inner=DispatchingImageResolver(uploads=ObjectStoreImageResolver(store=store))
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_gone_upload_image_degrades_to_text_in_its_place(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    gone, kept = _image_ref(), _image_ref()
+    store = InMemoryObjectStore()
+    await store.put(kept.storage_key, _DATA)
+
+    with caplog.at_level("WARNING"):
+        out = await resolve_message_images([gone.to_uri(), kept.to_uri()], _upload_resolver(store))
+
+    assert out[0] == UPLOAD_IMAGE_GONE_TEXT
+    assert isinstance(out[1], ResolvedImage) and out[1].data == _DATA
+    # 日志只带图片 id,租户 / 会话 id 不进日志。
+    assert f"image_id={gone.image_id}" in caplog.text
+    assert str(gone.tenant_id) not in caplog.text
+    assert str(gone.thread_id) not in caplog.text
+
+
+class _UnavailableObjectStore(InMemoryObjectStore):
+    """对象还在,只是这一刻读不动(存储侧 5xx / 凭据)。"""
+
+    async def get(self, key: str) -> bytes:
+        msg = f"get failed: {key!r}: 503"
+        raise ObjectStoreError(msg)
+
+
+@pytest.mark.asyncio
+async def test_an_upload_image_the_store_cannot_serve_right_now_still_raises() -> None:
+    """只有「不在了」才降级:暂时读不动照旧抛,不把一次故障永久写成「图已不存在」。"""
+    ref = _image_ref()
+
+    with pytest.raises(ObjectStoreError) as info:
+        await resolve_message_images([ref.to_uri()], _upload_resolver(_UnavailableObjectStore()))
+
+    assert not isinstance(info.value, ObjectNotFoundError)
+
+
+@pytest.mark.asyncio
+async def test_the_gone_image_text_carries_no_tenant_content() -> None:
+    """平台文字:不带 ref、文件名或任何租户内容。"""
+    ref = _image_ref()
+    (text,) = await resolve_message_images([ref.to_uri()], _upload_resolver(InMemoryObjectStore()))
+
+    assert text == UPLOAD_IMAGE_GONE_TEXT
+    for part in (str(ref.tenant_id), str(ref.thread_id), str(ref.image_id), "expert_work://"):
+        assert part not in UPLOAD_IMAGE_GONE_TEXT
