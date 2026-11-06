@@ -1828,6 +1828,14 @@ async def test_images_expire_by_last_use_and_tenant_upload_days_against_postgres
         sf = build_session_factory(worker_engine)
         images = SqlImageUploadStore(sf)
         objects = InMemoryObjectStore()
+        # The integration DB is shared across tests: reap whatever earlier tests
+        # left reapable first, so the counts below are this test's rows only.
+        await RetentionCleanupJob(
+            db_session_factory=sf,
+            image_upload_store=images,
+            object_store=objects,
+            upload_retention_days=90,
+        ).run_once()
         short_tenant, plain_tenant = uuid4(), uuid4()
         _seed_tenant_config(sync_admin, tenant_id=short_tenant, audit_days=90, event_days=30)
 
