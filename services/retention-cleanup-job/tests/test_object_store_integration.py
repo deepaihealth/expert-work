@@ -149,11 +149,24 @@ async def test_the_whole_job_uses_the_resolved_store(
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
+    from expert_work.runtime.storage.s3_compatible import S3CompatibleObjectStore
+    from retention_cleanup_job import job as job_module
+    from retention_cleanup_job.trajectories import TrajectorySweepTally
+
     await _seed_secrets(sf)
     _shared_env(monkeypatch)
     monkeypatch.setenv("EXPERT_WORK_RETENTION_DB_DSN", _async_dsn(postgres_container))
     monkeypatch.setattr(main_module, "configure_logging", lambda *_a, **_k: None)
     caplog.set_level(logging.INFO)
+    # B-285 的轨迹那一条每轮都要列桶;这里的端点是假的、连不上,所以只记下它拿到的是哪个对象存储
+    # (也就证明这一条用的是解出来的那个),不真的去列。
+    handed: list[object] = []
+
+    async def _trajectories(*, store: object, **_kwargs: object) -> TrajectorySweepTally:
+        handed.append(store)
+        return TrajectorySweepTally()
+
+    monkeypatch.setattr(job_module, "sweep_trajectories", _trajectories)
 
     code = await main_module._amain()
 
@@ -163,6 +176,8 @@ async def test_the_whole_job_uses_the_resolved_store(
         "bucket=expert-work-test"
     ]
     assert all(_SECRET not in m and _ACCESS not in m for m in messages)
+    assert len(handed) == 1 and isinstance(handed[0], S3CompatibleObjectStore)
+    assert handed[0]._bucket == "expert-work-test"
     assert code == 0
 
 
