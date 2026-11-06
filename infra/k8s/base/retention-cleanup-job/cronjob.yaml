@@ -21,10 +21,15 @@
 # (configmap / control-plane-secrets),用同一份代码经 sql_encrypted 金库把
 # secret:// 引用解成 AK/SK(同一个 DSN,读得到 encrypted_secret 表)——所以这里不需要
 # 额外的 env / secret。此前 job 只认 EXPERT_WORK_RETENTION_OBJECT_STORE_*、默认
-# `memory`,image_upload 的 blob 回收在测试 / 生产从没跑过。解不出来(KEK 缺 / 不对、
-# 密钥行不在、配置不全)不崩:日志 `retention.object_store … available=false error=<类型>`,
-# 图片 pass 跳过(行不动)并记 failed_passes → 退出码 3。显式设了
-# EXPERT_WORK_RETENTION_OBJECT_STORE_BACKEND 的照旧走 job 自己那套(明文 AK/SK,本地用)。
+# `memory`,image_upload 那条 pass 在测试 / 生产是 no-op(行和字节都没删过)。解不出来
+# (KEK 缺 / 不对、密钥行不在、配置不全或取值不合法)不崩:日志
+# `retention.object_store … available=false error=<类型>`,图片 pass 跳过(行不动)并记
+# failed_passes → 退出码 3;个别图片字节删不掉时,那几行留到下一轮,同样记 failed_passes。
+# 显式设了 EXPERT_WORK_RETENTION_OBJECT_STORE_BACKEND 的照旧走 job 自己那套(明文 AK/SK,本地用)。
+#
+# 失败**没有告警**:Prometheus 只抓 control-plane(没有 kube-state-metrics、没有 Job 失败规则),
+# 日志进 SLS 但没配 SLS 告警。退出码 3 只体现在 Job 状态(Failed)和日志
+# (`retention.object_store … available=false`、`retention.passes_failed`)里,要人去看。
 # 留存链 PR2 起,job 对 OSS 工作区归档对象**不主动删**,靠桶生命周期到期。
 #
 # 并发:concurrencyPolicy Forbid —— 上一次还没跑完就跳过这一次;每条清理规则
