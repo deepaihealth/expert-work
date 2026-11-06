@@ -327,9 +327,12 @@ def quarantine_entry(
         return outcome, None
     try:
         try:
-            os.lstat(name, dir_fd=fd)
+            info = os.lstat(name, dir_fd=fd)
         except FileNotFoundError:
             return ABSENT, None
+        if stat.S_ISDIR(info.st_mode):
+            # 跨父目录改名要改写它自己的 ``..``:目录本身得可写(模型能 ``chmod 555`` 它)。
+            add_owner_bits(fd, name, info)
         try:
             parked = _quarantine(root, tenant_id, owner_id, fd, name)
         except OSError as exc:
@@ -360,6 +363,9 @@ def restore_quarantined(
         if owner is None:
             return False
         try:
+            info = os.lstat(parked, dir_fd=owner)
+            if stat.S_ISDIR(info.st_mode):
+                add_owner_bits(owner, parked, info)  # 同上:挪回也要改写 ``..``
             os.rename(parked, name, src_dir_fd=owner, dst_dir_fd=fd)
         finally:
             os.close(owner)

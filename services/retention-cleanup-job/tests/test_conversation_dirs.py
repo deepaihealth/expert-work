@@ -1219,3 +1219,143 @@ async def test_an_old_live_upload_row_appearing_after_listing_keeps_the_dir(
         assert report.conversation_dirs_skipped_active == 1
     finally:
         await world.engine.dispose()
+
+
+def _activity_calls(monkeypatch: pytest.MonkeyPatch, fn: object) -> None:
+    """把 ``_activity_now`` 换成 ``fn(real_result, call_number)``。"""
+    from retention_cleanup_job import conversation_dirs
+
+    real = conversation_dirs._activity_now
+    calls = {"n": 0}
+
+    async def _wrapped(session: object, conv: object) -> object:
+        calls["n"] += 1
+        return fn(await real(session, conv), calls["n"])  # type: ignore[operator, arg-type]
+
+    monkeypatch.setattr(conversation_dirs, "_activity_now", _wrapped)
+
+
+@pytest.mark.asyncio
+async def test_an_error_after_moving_puts_everything_back(
+    world: _World, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """L-2 —— 挪走之后任何一步出错(这里:第二次查):已经挪走的挪回原处,错误照样计 ``failed``。"""
+    try:
+        conv = await world.conversation(age_days=200)
+        run = world.run(conv, age_days=150)
+        results = world.tool_results(run)
+        conv_dir = world.place(conv)
+
+        def _boom(found: object, n: int) -> object:
+            if n == 2:
+                raise RuntimeError("db went away")
+            return found
+
+        _activity_calls(monkeypatch, _boom)
+
+        report = await world.job().run_once()
+
+        assert (conv_dir / "work" / "report" / "draft.md").read_text() == "draft"
+        assert (results / "out.txt").read_text() == "overflow"
+        assert _quarantined(world) == []
+        assert report.conversation_dirs_failed == 1
+        assert world.cleaned_at(conv) is None
+    finally:
+        await world.engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_a_move_failing_halfway_puts_back_what_was_already_moved(
+    world: _World, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """L-2 —— ``_park`` 一个一个挪:挪到第二个出错时,第一个(会话目录)已经挪走,也挪回原处。"""
+    from expert_work.persistence.workspace.safe_remove import NasEntryStuckError
+    from retention_cleanup_job import conversation_dirs
+
+    try:
+        conv = await world.conversation(age_days=200)
+        run = world.run(conv, age_days=150)
+        world.tool_results(run)
+        conv_dir = world.place(conv)
+        real = conversation_dirs.quarantine_entry
+
+        def _park(root: str, parts: list[str], name: str, **kwargs: object) -> object:
+            if name == str(run):
+                raise NasEntryStuckError(13, "cannot quarantine")
+            return real(root, parts, name, **kwargs)  # type: ignore[arg-type]
+
+        monkeypatch.setattr(conversation_dirs, "quarantine_entry", _park)
+
+        report = await world.job().run_once()
+
+        assert (conv_dir / "work" / "report" / "draft.md").read_text() == "draft"
+        assert _quarantined(world) == []
+        assert report.conversation_dirs_failed == 1
+    finally:
+        await world.engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_run_ids_in_a_different_order_are_not_a_race(
+    world: _World, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """L-3 —— 两次查到同样的 run、行顺序不同,不是「期间起了 run」。"""
+    import dataclasses
+
+    try:
+        conv = await world.conversation(age_days=200)
+        for _ in range(3):
+            world.run(conv, age_days=150)
+        conv_dir = world.place(conv)
+
+        def _reorder(found: object, n: int) -> object:
+            ids = found.run_ids  # type: ignore[attr-defined]
+            ordered = sorted(ids, reverse=n == 2)
+            return dataclasses.replace(found, run_ids=type(ids)(ordered))  # type: ignore[type-var]
+
+        _activity_calls(monkeypatch, _reorder)
+
+        report = await world.job().run_once()
+
+        assert not conv_dir.exists()
+        assert (report.conversation_dirs_removed, report.conversation_dirs_raced) == (1, 0)
+    finally:
+        await world.engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_one_item_failing_to_move_back_does_not_stop_the_others(
+    world: _World, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """L-4 —— 挪回时一项出错:别的照样挪回;这一次记 ``raced`` 也记 ``failed``。"""
+    from retention_cleanup_job import conversation_dirs
+
+    try:
+        conv = await world.conversation(age_days=200)
+        run = world.run(conv, age_days=150)
+        results = world.tool_results(run)
+        conv_dir = world.place(conv)
+        real_restore = conversation_dirs.restore_quarantined
+
+        def _restore(root: str, parts: list[str], name: str, **kwargs: object) -> bool:
+            if name == str(conv):
+                raise PermissionError(13, "nope")
+            return real_restore(root, parts, name, **kwargs)  # type: ignore[arg-type]
+
+        def _new_run(found: object, n: int) -> object:
+            if n == 1:
+                world.run(conv, age_days=0, status="queued")  # appears before the second check
+            return found
+
+        monkeypatch.setattr(conversation_dirs, "restore_quarantined", _restore)
+        _activity_calls(monkeypatch, _new_run)
+
+        report = await world.job().run_once()
+
+        assert (results / "out.txt").read_text() == "overflow"  # the second item went back
+        assert not conv_dir.exists()  # the first one stays in quarantine (logged)
+        assert len(_quarantined(world)) == 1
+        assert (report.conversation_dirs_raced, report.conversation_dirs_failed) == (1, 1)
+        assert world.cleaned_at(conv) is None
+    finally:
+        await world.engine.dispose()

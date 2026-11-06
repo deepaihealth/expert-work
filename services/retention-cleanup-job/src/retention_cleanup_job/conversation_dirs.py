@@ -6,7 +6,7 @@ B-236 起每个会话有自己的 ``agents/<key>/threads/<会话>/``:``work/``(�
 
 * 最后活动 = ``greatest(会话 created_at, 会话最后一次 run, 会话里没删的文档上传最后一次被用
   (``greatest(created_at, last_used_at)``))``,都只认同租户的行;持锁再查时另看这段会话到期线
-  之后(到现在为止)有没有成功的 ``DOCUMENT_UPLOAD`` 审计(B-281 之前的控制台上传与跨会话复制
+  之后有没有成功的 ``DOCUMENT_UPLOAD`` 审计(B-281 之前的控制台上传与跨会话复制
   只有审计)。早于 ``now - 租户的 tenant_config.conversation_workspace_retention_days``(没设用
   平台默认 90)。
 * **还有没删的文档上传登记行就不动**:``upl_`` 下载读的是这段会话 ``work/uploads/`` 里的文件,
@@ -28,7 +28,7 @@ B-236 起每个会话有自己的 ``agents/<key>/threads/<会话>/``:``work/``(�
   agent 根,没绑 agent 的在用户根);里面有下载要读的产物文件的 run 目录不动
   (``tool_results_skipped_artifact``)。
 * **库里的行一律不动**:会话、历史、产物登记都留着。清完在 ``thread_meta.workspace_cleaned_at``
-  记一笔,之后不再列它;会话又有了新 run / 上传(最后活动晚于这一笔)才重新算闲置。
+  记一笔,之后不再列它;会话又有了新 run(最后活动晚于这一笔)才重新算闲置。
 
 **产物保护。** B-235 之前登记、至今仍是最新版的产物版本没有副本,下载时读的是工作区里那个
 文件。会话目录里有这种文件的,**整个会话这一轮不动**(计 ``skipped_artifact``);等那条产物按
@@ -51,7 +51,7 @@ import asyncio
 import logging
 import os
 from dataclasses import dataclass
-from datetime import UTC, datetime, timedelta
+from datetime import datetime, timedelta
 from pathlib import Path
 from uuid import UUID
 
@@ -144,28 +144,20 @@ class ConversationDirTally:
 def _idle_query(now: datetime, default_days: int, limit: int) -> Select[tuple[object, ...]]:
     """闲置到期、没有未结束 run、清过之后有过新活动(或从没清过)的会话,有产物保护的排在最后。
 
-    **活动** = ``greatest(会话 created_at, 会话最后一次 run, 会话里没删的文档上传最后一次被用)``
-    (上传的「被用」= ``greatest(created_at, last_used_at)``:新传了附件但还没跑、或这份附件被别的
-    会话引用 / 被下载,B-63 让它的登记行续命,文件也得留着)。都只认同租户的行;run 与上传各用一个
-    只对候选会话聚合一次的 CTE(走 ``ix_agent_run_thread_id`` / ``ix_user_upload_tenant_thread``)。
-    控制台上传在 B-281 之前没有登记行,只有 ``DOCUMENT_UPLOAD`` 审计 —— 那一项在持锁再查时看
-    (:meth:`ConversationDirSweep._still_idle`),不在这条查询里扫审计表。
+    **活动** = ``greatest(会话 created_at, 会话最后一次 run)``,只认同租户的行;run 用一个只对候选
+    会话聚合一次的 CTE(走 ``ix_agent_run_thread_id``)。**有没删的文档上传登记行的会话根本不进
+    候选**(M2),所以上传的「最后一次被用」在这里不用算 —— 登记行都到期之后它们已经不算活动;
+    持锁再查(:meth:`ConversationDirSweep._still_idle`)照样看登记行,并另看
+    ``DOCUMENT_UPLOAD`` 审计(B-281 之前的控制台上传与跨会话复制只有审计),不在这条查询里扫审计表。
 
     候选先粗筛:按 ``created_at``(保留期最短 :data:`FILE_RETENTION_MIN_DAYS` 天,更新的不可能
-    到期),并且「从没清过,或清过之后有过 run / 上传」—— 清完没再动过的会话不进候选。
+    到期),并且「从没清过,或清过之后有过 run」—— 清完没再动过的会话不进候选。
     """
     earliest = min(default_days, FILE_RETENTION_MIN_DAYS)
     run_after_clean = exists().where(
         AgentRunRow.tenant_id == ThreadMetaRow.tenant_id,
         AgentRunRow.thread_id == ThreadMetaRow.thread_id,
         AgentRunRow.created_at > ThreadMetaRow.workspace_cleaned_at,
-    )
-    upload_after_clean = exists().where(
-        UserUploadRow.tenant_id == ThreadMetaRow.tenant_id,
-        UserUploadRow.thread_id == ThreadMetaRow.thread_id,
-        UserUploadRow.deleted_at.is_(None),
-        func.greatest(UserUploadRow.created_at, UserUploadRow.last_used_at)
-        > ThreadMetaRow.workspace_cleaned_at,
     )
     # M2 —— 还有没删的文档上传登记行:下载读的是这段会话的 ``work/uploads/``,目录一清,登记行
     # 还在(租户上传保留期可以比会话的长)却 404。上传自己到期归 B-63;到期之后才轮到这里。
@@ -200,7 +192,6 @@ def _idle_query(now: datetime, default_days: int, limit: int) -> Select[tuple[ob
             or_(
                 ThreadMetaRow.workspace_cleaned_at.is_(None),
                 run_after_clean,
-                upload_after_clean,
             ),
         )
         .cte("conv_candidates")
@@ -222,26 +213,7 @@ def _idle_query(now: datetime, default_days: int, limit: int) -> Select[tuple[ob
         .group_by(AgentRunRow.tenant_id, AgentRunRow.thread_id)
         .cte("conv_runs")
     )
-    uploads = (
-        select(
-            UserUploadRow.tenant_id,
-            UserUploadRow.thread_id,
-            func.max(func.greatest(UserUploadRow.created_at, UserUploadRow.last_used_at)).label(
-                "at"
-            ),
-        )
-        .join(
-            cand,
-            and_(
-                UserUploadRow.thread_id == cand.c.thread_id,
-                UserUploadRow.tenant_id == cand.c.tenant_id,
-            ),
-        )
-        .where(UserUploadRow.deleted_at.is_(None), UserUploadRow.kind == "document")
-        .group_by(UserUploadRow.tenant_id, UserUploadRow.thread_id)
-        .cte("conv_uploads")
-    )
-    last_activity = func.greatest(cand.c.created_at, runs.c.at, uploads.c.at)
+    last_activity = func.greatest(cand.c.created_at, runs.c.at)
     days = func.coalesce(TenantConfigRow.conversation_workspace_retention_days, default_days)
     # 产物路径是用户根相对的 ``agents/<key>/threads/<会话>/work/…``;会话 id 是 UUID,含
     # ``/threads/<会话>/`` 这一段就是这段会话目录里的文件(不用拼 agent key)。
@@ -269,10 +241,6 @@ def _idle_query(now: datetime, default_days: int, limit: int) -> Select[tuple[ob
         .outerjoin(
             runs,
             and_(runs.c.thread_id == cand.c.thread_id, runs.c.tenant_id == cand.c.tenant_id),
-        )
-        .outerjoin(
-            uploads,
-            and_(uploads.c.thread_id == cand.c.thread_id, uploads.c.tenant_id == cand.c.tenant_id),
         )
         .outerjoin(TenantConfigRow, TenantConfigRow.tenant_id == cand.c.tenant_id)
         .where(
@@ -319,7 +287,8 @@ async def list_idle_conversations(
 class _Now:
     """持锁时这段会话的样子。"""
 
-    run_ids: list[UUID]
+    #: 集合:两次查的行顺序不保证一样,比较时只看有哪些 run。
+    run_ids: frozenset[UUID]
     active: bool
     #: 还有没删的文档上传登记行(M2:有就不清)。
     live_upload: bool
@@ -350,7 +319,7 @@ async def _activity_now(session: AsyncSession, conv: IdleConversation) -> _Now:
     ).one()
     stamps = [at for _id, _status, at in runs] + ([upload_at] if upload_at is not None else [])
     return _Now(
-        run_ids=[run_id for run_id, _status, _at in runs],
+        run_ids=frozenset(run_id for run_id, _status, _at in runs),
         active=any(status in ACTIVE_RUN_STATUSES for _id, status, _at in runs),
         live_upload=live > 0,
         last_activity=max(stamps, default=None),
@@ -393,11 +362,16 @@ class _Parked:
 
 
 def _park(
-    root: str, conv: IdleConversation, agent_key: str, run_ids: list[UUID]
-) -> tuple[list[_Parked], bool]:
+    root: str,
+    conv: IdleConversation,
+    agent_key: str,
+    run_ids: list[UUID],
+    parked: list[_Parked],
+) -> bool:
     """同步(``asyncio.to_thread``):把会话目录(对话视图)与各 run 的 ``.tool_results/<run>/``
-    **改名**挪进隔离区 ``{tenant}/.purged-agents/{user}/``(沙箱挂不到;满 7 天由隔离区那一条
-    删)。返回挪走的项,与路径中途是否碰到符号链接。"""
+    一个一个**改名**挪进隔离区 ``{tenant}/.purged-agents/{user}/``(沙箱挂不到;满 7 天由隔离区
+    那一条删)。挪走一个就记进调用方给的 ``parked`` —— 中途抛错时调用方照样知道哪些已经挪走、
+    能挪回去。返回路径中途是否碰到符号链接。"""
     base = [str(conv.tenant_id), str(conv.user_id)]
     if agent_key:
         base += [WORKSPACE_AGENTS_DIR, agent_key]
@@ -405,7 +379,6 @@ def _park(
     if conv.layout == "conversation" and agent_key:
         targets.append(([*base, THREADS_DIR], str(conv.thread_id)))
     targets += [([*base, TOOL_RESULTS_DIR], str(run_id)) for run_id in run_ids]
-    parked: list[_Parked] = []
     unsafe = False
     for parts, name in targets:
         outcome, new_name = quarantine_entry(
@@ -414,18 +387,38 @@ def _park(
         unsafe = unsafe or outcome == SKIPPED_SYMLINK
         if outcome == QUARANTINED and new_name is not None:
             parked.append(_Parked(parts, name, new_name))
-    return parked, unsafe
+    return unsafe
 
 
-def _unpark(root: str, conv: IdleConversation, parked: list[_Parked]) -> list[_Parked]:
-    """同步:把 :func:`_park` 挪走的挪回原处;返回挪不回去的(原名又有了东西)。"""
-    return [
-        p
-        for p in parked
-        if not restore_quarantined(
-            root, p.parts, p.name, tenant_id=conv.tenant_id, owner_id=conv.user_id, parked=p.parked
-        )
-    ]
+def _unpark(
+    root: str, conv: IdleConversation, parked: list[_Parked]
+) -> tuple[list[_Parked], list[_Parked]]:
+    """同步:把 :func:`_park` 挪走的一个一个挪回原处。返回 ``(原名又有了东西、没挪的, 挪的时候
+    出错的)`` —— 每一项单独 ``try``,一项出错不挡后面的。"""
+    occupied: list[_Parked] = []
+    errored: list[_Parked] = []
+    for p in parked:
+        try:
+            restored = restore_quarantined(
+                root,
+                p.parts,
+                p.name,
+                tenant_id=conv.tenant_id,
+                owner_id=conv.user_id,
+                parked=p.parked,
+            )
+        except OSError as exc:
+            errored.append(p)
+            logger.warning(
+                "retention.conversation_dir_unpark_failed thread_id=%s parked=%s error=%s",
+                conv.thread_id,
+                p.parked,
+                type(exc).__name__,
+            )
+            continue
+        if not restored:
+            occupied.append(p)
+    return occupied, errored
 
 
 def _owner_deleted(root: str, conv: IdleConversation) -> bool:
@@ -512,52 +505,71 @@ class ConversationDirSweep:
         # ``CONVERSATION_SEED_LOCK_CLASSID``)。上传落盘(``_land_and_account``,含跨会话复制附件)
         # 拿同一把锁的共享形式:持锁期间没有落盘在进行,之前落的都已经有登记行 / 审计。持锁只做
         # 再查 + 几次 ``rename`` + 记一笔,不在锁里删(大目录删很久,会超事务空闲超时把锁丢掉)。
-        async with self._sf() as session, session.begin():
-            await session.execute(
-                text(f"SET LOCAL idle_in_transaction_session_timeout = {_LOCK_TXN_TIMEOUT_MS}")
-            )
-            await session.execute(text(f"SET LOCAL statement_timeout = {_LOCK_TXN_TIMEOUT_MS}"))
-            await session.execute(
-                text("SELECT pg_advisory_xact_lock(:classid, hashtext(:k))"),
-                {
-                    "classid": CONVERSATION_SEED_LOCK_CLASSID,
-                    "k": f"{conv.tenant_id}:{conv.thread_id}",
-                },
-            )
-            before = await _activity_now(session, conv)
-            if not await self._still_idle(conv, before, cutoff):
-                tally.skipped_active += 1
-                return False
-            protected_runs = await _protected_runs(session, conv)
-            run_ids = [r for r in before.run_ids if str(r) not in protected_runs]
-            tally.tool_results_skipped_artifact += len(before.run_ids) - len(run_ids)
-            agent_key = sanitize_agent_key(conv.agent_name) if conv.agent_name else ""
-            parked, unsafe = await asyncio.to_thread(_park, self._root, conv, agent_key, run_ids)
-            if unsafe:
-                tally.skipped_unsafe += 1
-                logger.warning("retention.conversation_dir_unsafe thread_id=%s", conv.thread_id)
-            after = await _activity_now(session, conv)
-            if after != before:
-                # 起 run 不拿这把锁:再查之后、改名之前它可能刚建好行,开场复制时看到的还是旧
-                # 目录里的标记。挪回原处(原名已被新目录占了的留在隔离区,7 天内可手工挪回),
-                # 不记清理时间,等它再闲置。
-                stuck = await asyncio.to_thread(_unpark, self._root, conv, parked)
-                tally.raced += 1
+        parked: list[_Parked] = []
+        try:
+            async with self._sf() as session, session.begin():
+                await session.execute(
+                    text(f"SET LOCAL idle_in_transaction_session_timeout = {_LOCK_TXN_TIMEOUT_MS}")
+                )
+                await session.execute(text(f"SET LOCAL statement_timeout = {_LOCK_TXN_TIMEOUT_MS}"))
+                await session.execute(
+                    text("SELECT pg_advisory_xact_lock(:classid, hashtext(:k))"),
+                    {
+                        "classid": CONVERSATION_SEED_LOCK_CLASSID,
+                        "k": f"{conv.tenant_id}:{conv.thread_id}",
+                    },
+                )
+                before = await _activity_now(session, conv)
+                if not await self._still_idle(conv, before, cutoff):
+                    tally.skipped_active += 1
+                    return False
+                protected_runs = await _protected_runs(session, conv)
+                run_ids = sorted(r for r in before.run_ids if str(r) not in protected_runs)
+                tally.tool_results_skipped_artifact += len(before.run_ids) - len(run_ids)
+                agent_key = sanitize_agent_key(conv.agent_name) if conv.agent_name else ""
+                unsafe = await asyncio.to_thread(
+                    _park, self._root, conv, agent_key, run_ids, parked
+                )
+                if unsafe:
+                    tally.skipped_unsafe += 1
+                    logger.warning("retention.conversation_dir_unsafe thread_id=%s", conv.thread_id)
+                after = await _activity_now(session, conv)
+                if after != before:
+                    # 起 run 不拿这把锁:再查之后、改名之前它可能刚建好行,开场复制时看到的还是
+                    # 旧目录里的标记。挪回原处(原名已被新目录占了的留在隔离区,7 天内可手工挪回),
+                    # 不记清理时间,等它再闲置。
+                    occupied, errored = await asyncio.to_thread(_unpark, self._root, conv, parked)
+                    parked = []
+                    tally.raced += 1
+                    tally.failed += int(bool(errored))
+                    logger.warning(
+                        "retention.conversation_dir_raced thread_id=%s left_in_quarantine=%s",
+                        conv.thread_id,
+                        ",".join(p.parked for p in [*occupied, *errored]) or "-",
+                    )
+                    return False
+                await session.execute(
+                    update(ThreadMetaRow)
+                    .where(
+                        ThreadMetaRow.tenant_id == conv.tenant_id,
+                        ThreadMetaRow.thread_id == conv.thread_id,
+                    )
+                    # ``updated_at`` 原样写回:这一笔不是会话本身的变化,会话列表按它排序。
+                    .values(workspace_cleaned_at=now, updated_at=ThreadMetaRow.updated_at)
+                )
+        except Exception:
+            # 挪走之后任何一步出错(第二次查、记一笔、提交,或 ``_park`` 挪到一半):已经挪走的挪回
+            # 原处,挪不回的打出名字(隔离区里 7 天内可手工挪回),再把错误往上抛(计 ``failed``)。
+            if parked:
+                occupied, errored = await asyncio.to_thread(_unpark, self._root, conv, parked)
                 logger.warning(
-                    "retention.conversation_dir_raced thread_id=%s left_in_quarantine=%s",
+                    "retention.conversation_dir_unparked_after_error thread_id=%s "
+                    "moved_back=%d left_in_quarantine=%s",
                     conv.thread_id,
-                    ",".join(p.parked for p in stuck) or "-",
+                    len(parked) - len(occupied) - len(errored),
+                    ",".join(p.parked for p in [*occupied, *errored]) or "-",
                 )
-                return False
-            await session.execute(
-                update(ThreadMetaRow)
-                .where(
-                    ThreadMetaRow.tenant_id == conv.tenant_id,
-                    ThreadMetaRow.thread_id == conv.thread_id,
-                )
-                # ``updated_at`` 原样写回:这一笔不是会话本身的变化,会话列表按它排序。
-                .values(workspace_cleaned_at=now, updated_at=ThreadMetaRow.updated_at)
-            )
+            raise
         # 提交了(锁也放了)才算数;挪走的那几棵树留在隔离区,满 7 天删。
         thread_dir = str(conv.thread_id)
         tally.removed += sum(1 for p in parked if p.name == thread_dir)
@@ -567,7 +579,7 @@ class ConversationDirSweep:
 
     async def _still_idle(self, conv: IdleConversation, current: _Now, cutoff: datetime) -> bool:
         """持锁再查:没有没结束的 run、没有没删的文档上传登记行、run / 上传都早于到期线、到期线
-        之后(到现在为止)没有成功的上传审计。"""
+        之后没有成功的上传审计。"""
         if (
             current.active
             or current.live_upload
@@ -576,11 +588,10 @@ class ConversationDirSweep:
             return False
         if self._audit is None:
             return True
+        # 不设上界:``occurred_at`` 是库的 ``now()``,拿这个 pod 的时钟当上界,
+        # 会漏掉落在两边时钟差里的那一条。
         audited = await self._audit.list_document_uploads_for_threads(
-            tenant_id=conv.tenant_id,
-            thread_ids=[conv.thread_id],
-            since=cutoff,
-            until=datetime.now(UTC),
+            tenant_id=conv.tenant_id, thread_ids=[conv.thread_id], since=cutoff
         )
         return not audited
 

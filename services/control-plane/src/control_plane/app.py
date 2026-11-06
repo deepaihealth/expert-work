@@ -2919,6 +2919,9 @@ def create_app(
         if sql_stores is not None
         else None
     )
+    if sql_stores is not None and app.state.conversation_landing_lock is None:
+        # 有库却没有落盘锁:留存作业清闲置会话目录时,同时落盘的上传可能被一起挪走。
+        logger.warning("control_plane.conversation_landing_lock_missing")
     app.state.artifact_snapshots = resolved_artifact_snapshots
     # B-236 第三层 —— 清除用户时连同 /agent 文件的历史版本一起删(``purge_user``)。
     app.state.agent_file_versions = resolved_agent_runtime.agent_file_versions
