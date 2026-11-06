@@ -23,8 +23,6 @@ from __future__ import annotations
 import base64
 import binascii
 import os
-from collections.abc import AsyncIterator
-from contextlib import asynccontextmanager
 from uuid import uuid4
 
 from cryptography.exceptions import InvalidTag
@@ -33,7 +31,7 @@ from sqlalchemy import delete, select, update
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from expert_work.persistence.models import EncryptedSecretRow
-from expert_work.persistence.rls import bypass_rls_var, current_tenant_id_var
+from expert_work.persistence.rls import bypass_rls_session
 from expert_work.runtime.secret_store.base import SecretNotFoundError, SecretStoreError
 
 #: The single env-sourced KEK version tag stamped on rows it encrypts. A real
@@ -43,19 +41,6 @@ ENV_KEK_VERSION = "env-v1"
 
 _NONCE_BYTES = 12
 _KEK_BYTES = 32
-
-
-@asynccontextmanager
-async def bypass_rls_session() -> AsyncIterator[None]:
-    """Platform rows (``tenant_id IS NULL``) have no tenant scope: flip ``bypass_rls_var`` for the
-    body (same contract as ``control_plane.tenant_scope.bypass_rls_session``)."""
-    bypass = bypass_rls_var.set(True)
-    tenant = current_tenant_id_var.set(None)
-    try:
-        yield
-    finally:
-        current_tenant_id_var.reset(tenant)
-        bypass_rls_var.reset(bypass)
 
 
 def build_kek_from_b64(value: str) -> bytes:

@@ -13,8 +13,9 @@ dependencies = [
     "expert-work-persistence",
     "expert-work-protocol",
     # B-286 —— object store + secret-store ref resolution shared with control-plane
-    # (main.py already imported expert_work.runtime for the audit logger / storage).
-    "expert-work-runtime",
+    # (main.py already imported expert_work.runtime for the audit logger / storage);
+    # ``sql-encrypted`` brings cryptography for the ``sql_encrypted`` vault.
+    "expert-work-runtime[sql-encrypted]",
     "pydantic>=2.9,<3",
     "pydantic-settings>=2.5,<3",
     "sqlalchemy[asyncio]>=2.0.30,<3",
