@@ -27,8 +27,92 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
+  # docs-site/ is its own VitePress package (own package.json and lockfile,
+  # nothing imported from the app). A PR that only touches it needs the docs
+  # build + link check, not typecheck / vitest / vite / Storybook / Playwright.
+  # The split is judged on the whole PR diff (base...head). Any case that
+  # cannot be judged (push to main, no base, diff failure, this workflow
+  # changed) runs everything: the failure direction must be "ran more", never
+  # "silently skipped". None of these jobs is a required check on main, so a
+  # skipped job never blocks a merge.
+  changes:
+    name: admin-ui (detect changes)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      app: ${{ steps.filter.outputs.app }}
+      docs: ${{ steps.filter.outputs.docs }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Classify changed files
+        id: filter
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          all() { echo "app=true" >> "$GITHUB_OUTPUT"; echo "docs=true" >> "$GITHUB_OUTPUT"; }
+          if [ "${{ github.event_name }}" != "pull_request" ] || [ -z "${BASE_SHA}" ]; then
+            echo "not a PR / no base: run everything"; all; exit 0
+          fi
+          # Read from a file, not a pipe: ``grep -q`` exiting early can SIGPIPE
+          # the writer and, under pipefail, flip a match into "no match".
+          if ! git diff --name-only "${BASE_SHA}...${HEAD_SHA}" > "${RUNNER_TEMP}/changed.txt"; then
+            echo "diff failed: run everything"; all; exit 0
+          fi
+          cat "${RUNNER_TEMP}/changed.txt"
+          if grep -qx '.github/workflows/admin-ui-ci.yml' "${RUNNER_TEMP}/changed.txt"; then
+            echo "workflow changed: run everything"; all; exit 0
+          fi
+          app=false; docs=false
+          if grep -E '^apps/admin-ui/' "${RUNNER_TEMP}/changed.txt" | grep -vE '^apps/admin-ui/docs-site/' > "${RUNNER_TEMP}/app.txt"; then app=true; fi
+          if grep -qE '^apps/admin-ui/docs-site/' "${RUNNER_TEMP}/changed.txt"; then docs=true; fi
+          echo "app=${app} docs=${docs}"
+          echo "app=${app}" >> "$GITHUB_OUTPUT"
+          echo "docs=${docs}" >> "$GITHUB_OUTPUT"
+
+  docs-site:
+    name: admin-ui (docs-site build + links)
+    needs: changes
+    if: needs.changes.outputs.docs == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    defaults:
+      run:
+        working-directory: apps/admin-ui/docs-site
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v6
+        with:
+          version: 10.14.0
+
+      - name: Setup Node
+        uses: actions/setup-node@v7
+        with:
+          node-version: "22"
+          cache: pnpm
+          cache-dependency-path: apps/admin-ui/docs-site/pnpm-lock.yaml
+
+      - name: Install
+        run: pnpm install --frozen-lockfile
+
+      - name: Build docs-site
+        run: pnpm build
+
+      # 构建通过不代表链接是活的:VitePress 不校验锚点,写错的 #anchor 会静默
+      # 变成一个跳不动的链接。这一步在构建产物上把站内链接全走一遍。
+      - name: Check docs-site links
+        run: python3 scripts/check_links.py
+
   admin-ui:
     name: admin-ui (typecheck + test + build)
+    needs: changes
+    if: needs.changes.outputs.app == 'true'
     runs-on: ubuntu-latest
     # Green runs take 9.4-9.6 min (vitest alone ~7.5), so 10 cancelled
     # passing runs right after the docs-site build finished.
@@ -63,16 +147,10 @@ jobs:
       - name: Build (vite)
         run: pnpm build
 
-      - name: Build docs-site
-        run: cd docs-site && pnpm install --frozen-lockfile && pnpm build
-
-      # 构建通过不代表链接是活的:VitePress 不校验锚点,写错的 #anchor 会静默
-      # 变成一个跳不动的链接。这一步在构建产物上把站内链接全走一遍。
-      - name: Check docs-site links
-        run: cd docs-site && python3 scripts/check_links.py
-
   storybook-build:
     name: admin-ui (storybook build)
+    needs: changes
+    if: needs.changes.outputs.app == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     defaults:
@@ -109,6 +187,8 @@ jobs:
 
   e2e:
     name: admin-ui (Playwright + axe)
+    needs: changes
+    if: needs.changes.outputs.app == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 15
     defaults:
