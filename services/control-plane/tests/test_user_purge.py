@@ -32,6 +32,7 @@ from expert_work.persistence import (
     InMemoryEvalDatasetStore,
     InMemoryMcpOAuthConnectionStore,
     InMemoryMemoryStore,
+    InMemoryQualityScoreStore,
     InMemoryTenantUserStore,
     InMemoryThreadMetaStore,
     InMemoryTriggerRunStore,
@@ -313,6 +314,7 @@ async def test_purge_user_cascade_isolates_other_user_and_tenant_and_is_idempote
         skills=skills,
         eval_datasets=eval_datasets,
         curation_candidates=curation,
+        quality_scores=InMemoryQualityScoreStore(),
         retrieval_logs=InMemoryKnowledgeRetrievalLogStore(),
         tenant_users=users,
         audit=build_default_audit_logger(audit_store),
@@ -465,6 +467,7 @@ async def test_purge_user_image_blobs_skipped_without_object_store() -> None:
         skills=skills,
         eval_datasets=eval_datasets,
         curation_candidates=curation,
+        quality_scores=InMemoryQualityScoreStore(),
         retrieval_logs=InMemoryKnowledgeRetrievalLogStore(),
         tenant_users=users,
         audit=build_default_audit_logger(audit_store),
@@ -577,6 +580,7 @@ async def test_purge_user_deletes_user_upload_rows() -> None:
         skills=skills,
         eval_datasets=eval_datasets,
         curation_candidates=curation,
+        quality_scores=InMemoryQualityScoreStore(),
         retrieval_logs=InMemoryKnowledgeRetrievalLogStore(),
         tenant_users=users,
         audit=build_default_audit_logger(audit_store),
@@ -598,10 +602,9 @@ async def test_purge_user_deletes_user_upload_rows() -> None:
 class _FailingObjectStore(InMemoryObjectStore):
     """``delete`` always raises; every other op behaves like the real in-memory store.
 
-    Used to drive the ``_purge_images`` best-effort branch: a blob-delete
-    failure must be counted in ``image_blobs_failed`` and must NOT block the
-    row deletion that follows (``delete_all_for_user``) or fail the
-    ``image_upload`` purge step.
+    Used to drive the ``_purge_images`` failure branch: a blob-delete failure
+    is counted in ``image_blobs_failed``, keeps that image's row and fails the
+    ``image_upload`` step (B-280) so a re-run deletes both.
     """
 
     async def delete(self, key: str) -> None:
@@ -609,14 +612,14 @@ class _FailingObjectStore(InMemoryObjectStore):
 
 
 @pytest.mark.asyncio
-async def test_purge_user_image_blob_delete_failure_still_deletes_rows() -> None:
-    """Blob delete raising for every image: rows are still hard-deleted.
+async def test_purge_user_image_blob_delete_failure_keeps_rows_for_a_rerun() -> None:
+    """Blob delete raising for every image: the rows stay and the step fails.
 
-    Deletion-hygiene purge (Task 8) — ``_purge_images`` treats a blob-store
-    failure as best-effort: it's counted in ``image_blobs_failed`` but must
-    not prevent ``delete_all_for_user`` from running, and must not count as a
-    step failure (an orphaned object-store key is recoverable by the
-    retention sweep; a stuck ``image_upload`` row is not).
+    B-280 — nothing sweeps object storage for keys without a row (the
+    retention job reaps ``image_upload`` rows), so deleting a row whose bytes
+    are still there would leave them in the bucket for good. The row stays,
+    ``failures["image_upload"]`` says why, and a re-run with the store back
+    deletes bytes and rows. (Before B-280 the rows went regardless.)
     """
     t1 = uuid4()
     threads = InMemoryThreadMetaStore()
@@ -685,6 +688,7 @@ async def test_purge_user_image_blob_delete_failure_still_deletes_rows() -> None
         skills=skills,
         eval_datasets=eval_datasets,
         curation_candidates=curation,
+        quality_scores=InMemoryQualityScoreStore(),
         retrieval_logs=InMemoryKnowledgeRetrievalLogStore(),
         tenant_users=users,
         audit=build_default_audit_logger(audit_store),
@@ -698,8 +702,22 @@ async def test_purge_user_image_blob_delete_failure_still_deletes_rows() -> None
     assert summary.image_blobs_failed == len(image_ids)
     assert summary.image_blobs_removed == 0
     assert summary.image_blobs_skipped == 0
-    assert summary.deleted["image_upload"] == len(image_ids)
-    assert "image_upload" not in summary.failures
+    assert summary.deleted["image_upload"] == 0
+    assert summary.failures["image_upload"] == "ImageBytesNotDeletedError"
+    left = await image_uploads.list_for_user(tenant_id=t1, user_id=a.id)
+    assert sorted(r.id for r in left) == sorted(image_ids)
+
+    working = InMemoryObjectStore()
+    rerun = await purge_user(
+        tenant_id=t1,
+        user_id=a.id,
+        subject_id="subj-a",
+        deps=replace(deps, object_store=working),
+        actor_id="admin",
+    )
+    assert "image_upload" not in rerun.failures
+    assert rerun.deleted["image_upload"] == len(image_ids)
+    assert rerun.image_blobs_removed == len(image_ids)
     assert await image_uploads.list_for_user(tenant_id=t1, user_id=a.id) == []
 
 
@@ -787,6 +805,7 @@ async def test_purge_user_deletes_null_user_approvals_on_user_threads() -> None:
         skills=skills,
         eval_datasets=eval_datasets,
         curation_candidates=curation,
+        quality_scores=InMemoryQualityScoreStore(),
         retrieval_logs=InMemoryKnowledgeRetrievalLogStore(),
         tenant_users=users,
         audit=build_default_audit_logger(audit_store),
@@ -931,6 +950,7 @@ async def test_purge_user_approval_cleanup_failure_recorded_and_does_not_abort()
         skills=skills,
         eval_datasets=eval_datasets,
         curation_candidates=curation,
+        quality_scores=InMemoryQualityScoreStore(),
         retrieval_logs=InMemoryKnowledgeRetrievalLogStore(),
         tenant_users=users,
         audit=build_default_audit_logger(audit_store),
@@ -1168,6 +1188,7 @@ def _deps_with(
         skills=InMemorySkillStore(),
         eval_datasets=InMemoryEvalDatasetStore(),
         curation_candidates=InMemoryCurationCandidateStore(),
+        quality_scores=InMemoryQualityScoreStore(),
         retrieval_logs=retrieval_logs,
         tenant_users=users,
         audit=build_default_audit_logger(InMemoryAuditLogStore()),

@@ -129,6 +129,7 @@ from expert_work.protocol import (
     Provider,
     TenantPlan,
     UserUpload,
+    is_session_deleted_tombstone,
     parse_upload_id,
     tier_satisfies,
 )
@@ -408,7 +409,9 @@ async def resolve_external_files(
     B-262 P1 §3 —— document 行属于**别的会话**(同一 agent 或另一个 agent)时,把文件从那条
     会话自己的目录复制进本会话的 ``uploads/``(:func:`~control_plane.api.uploads.
     copy_document_into_thread`,像一次上传一样记账与审计),``document_names`` 里写实际落地的
-    名字。登记行的会话已经不在(purge 不删登记行):404 ``UPLOAD_SESSION_DELETED``。
+    名字。登记行的会话已经不在:404 ``UPLOAD_SESSION_DELETED``(B-280 起会话彻底删除时 document
+    登记行留成墓碑,这里先认出墓碑回同一个码;图片行与已到期的行随会话删掉,仍是
+    ``UPLOAD_NOT_FOUND``,与删除前一致)。
 
     B-275 —— 第三项:落地时换过名(同名不同内容,``<原名>-<内容 sha256 前 8 位>``)的
     document → 原名,让 ``[file attached: …]`` 那一行把原名也告诉模型;没换过名的不进表。
@@ -425,7 +428,12 @@ async def resolve_external_files(
                 422,
             )
         row = await uploads_store.get(upload_id=uid, tenant_id=tenant_id)
-        if row is None or row.user_id != end_user_id or row.deleted_at is not None:
+        if row is None or row.user_id != end_user_id:
+            raise ExternalScopeError("UPLOAD_NOT_FOUND", "upload not found", 404)
+        if is_session_deleted_tombstone(row):
+            # B-280 —— 会话被彻底删除后登记行留成墓碑,同下面「源会话已经不在」那条。
+            raise ExternalScopeError("UPLOAD_SESSION_DELETED", _UPLOAD_SESSION_DELETED_MESSAGE, 404)
+        if row.deleted_at is not None:
             raise ExternalScopeError("UPLOAD_NOT_FOUND", "upload not found", 404)
         if row.kind == "image":
             if row.thread_id != thread_id:
@@ -458,6 +466,9 @@ async def resolve_external_files(
 
 #: B-262 review —— 跨会话复制附件特有的两种失败;其余状态码沿用上传端点那张表。
 _COPY_ERROR_CODES: dict[int, str] = {404: "UPLOAD_NOT_FOUND", 409: "UPLOAD_CHANGED"}
+_UPLOAD_SESSION_DELETED_MESSAGE = (
+    "the session this upload was made in has been deleted; upload the file again"
+)
 
 
 async def _copy_into_this_session(
@@ -478,11 +489,7 @@ async def _copy_into_this_session(
     if source is None:
         # 不论本会话是哪种视图都拒(review 2):P1 起 ``uploads/<名字>`` 只在它自己那段会话的
         # ``work/`` 里唯一,按本 agent 根解析同名文件可能挂上别的客户的件。
-        raise ExternalScopeError(
-            "UPLOAD_SESSION_DELETED",
-            "the session this upload was made in has been deleted; upload the file again",
-            404,
-        )
+        raise ExternalScopeError("UPLOAD_SESSION_DELETED", _UPLOAD_SESSION_DELETED_MESSAGE, 404)
     try:
         return await copy_document_into_thread(
             copier,

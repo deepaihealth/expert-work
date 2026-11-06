@@ -16,7 +16,7 @@ from __future__ import annotations
 
 from collections.abc import Iterator
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from uuid import UUID, uuid4
 
@@ -38,7 +38,12 @@ from expert_work.persistence import (
 from expert_work.persistence.feedback_store import DbFeedbackStore, FeedbackRecord
 from expert_work.persistence.image_upload.sql import SqlImageUploadStore
 from expert_work.persistence.memory.dlq import SqlMemoryWritebackDLQ
-from expert_work.protocol import CurationCandidateRecord, QualityScoreRecord
+from expert_work.persistence.models import UserUploadRow
+from expert_work.protocol import (
+    CurationCandidateRecord,
+    QualityScoreRecord,
+    is_session_deleted_tombstone,
+)
 from expert_work.runtime.storage import InMemoryObjectStore
 
 pytestmark = pytest.mark.integration
@@ -87,11 +92,12 @@ class _Seeded:
     run_id: UUID
     candidate_id: UUID
     object_key: str
+    upload_id: UUID
 
 
 async def _seed(s: SessionPurgeStores, tenant_id: UUID, thread_id: UUID, user: UUID) -> _Seeded:
     assert isinstance(s.object_store, InMemoryObjectStore)
-    run_id, candidate_id, image_id = uuid4(), uuid4(), uuid4()
+    run_id, candidate_id, image_id, upload_id = uuid4(), uuid4(), uuid4(), uuid4()
     object_key = f"{tenant_id}/uploads/{thread_id}/{image_id}.png"
     await s.feedback.insert(
         FeedbackRecord(tenant_id=tenant_id, thread_id=thread_id, rating="down", actor_id="a")
@@ -130,7 +136,7 @@ async def _seed(s: SessionPurgeStores, tenant_id: UUID, thread_id: UUID, user: U
         error="e",
     )
     await s.user_uploads.insert(
-        upload_id=uuid4(),
+        upload_id=upload_id,
         tenant_id=tenant_id,
         user_id=user,
         thread_id=thread_id,
@@ -151,12 +157,13 @@ async def _seed(s: SessionPurgeStores, tenant_id: UUID, thread_id: UUID, user: U
         mime_type="image/png",
         sha256="x",
     )
-    return _Seeded(tenant_id, thread_id, run_id, candidate_id, object_key)
+    return _Seeded(tenant_id, thread_id, run_id, candidate_id, object_key, upload_id)
 
 
 async def _remaining(s: SessionPurgeStores, seeded: _Seeded) -> dict[str, int]:
     assert s.object_store is not None
     t, ids = seeded.tenant_id, [seeded.thread_id]
+    upload = await s.user_uploads.get(upload_id=seeded.upload_id, tenant_id=t)
     return {
         "feedback": await s.feedback.count_for_threads(tenant_id=t, thread_ids=ids),
         "quality_scores": int(await s.quality_scores.exists(tenant_id=t, run_id=seeded.run_id)),
@@ -165,7 +172,8 @@ async def _remaining(s: SessionPurgeStores, seeded: _Seeded) -> dict[str, int]:
             is not None
         ),
         "memory_writeback_dlq": await s.memory_dlq.count_for_threads(tenant_id=t, thread_ids=ids),
-        "user_uploads": await s.user_uploads.count_for_threads(tenant_id=t, thread_ids=ids),
+        # A tombstone (B-280) is not a live upload: it keeps no name, ref or bytes.
+        "user_uploads": int(upload is not None and not is_session_deleted_tombstone(upload)),
         "image_uploads": len(await s.image_uploads.list_for_threads(tenant_id=t, thread_ids=ids)),
         "image_blob": len(await s.object_store.list_prefix(seeded.object_key)),
     }
@@ -231,7 +239,9 @@ async def test_a_failed_kind_leaves_only_itself_and_a_rerun_finishes(
     s = _stores(sf, InMemoryObjectStore())
     tenant, user, doomed = uuid4(), uuid4(), uuid4()
     mine = await _seed(s, tenant, doomed, user)
-    method = "list_for_threads" if kind == "image_uploads" else "delete_for_threads"
+    method = {"image_uploads": "list_for_threads", "user_uploads": "tombstone_for_threads"}.get(
+        kind, "delete_for_threads"
+    )
 
     async def _boom(**_kw: object) -> int:
         raise ConnectionError("db blip")
@@ -283,3 +293,92 @@ async def test_a_row_whose_bytes_did_not_go_is_kept(
     assert rerun.failures == {}
     assert await s.image_uploads.list_for_threads(tenant_id=tenant, thread_ids=[doomed]) == []
     assert await objects.list_prefix(second_image.object_key) == []
+
+
+#: Columns a tombstone keeps: what the external lookup needs to answer
+#: ``UPLOAD_SESSION_DELETED`` to the same end user (id, tenant, user, thread,
+#: kind) plus ``created_at`` / ``deleted_at``. Every other column is scrubbed to
+#: the value below — the four NOT NULL text / size columns to empty / 0.
+_TOMBSTONE_KEEPS = {"id", "tenant_id", "user_id", "thread_id", "kind", "created_at"}
+_TOMBSTONE_SCRUBS: dict[str, object] = {
+    "ref": "",
+    "filename": "",
+    "mime_type": "",
+    "size_bytes": 0,
+    "sha256": None,
+    "last_used_at": None,
+}
+
+
+async def _raw(sf: SF, upload_id: UUID) -> dict[str, object] | None:
+    async with sf() as session:
+        row = await session.get(UserUploadRow, upload_id)
+        if row is None:
+            return None
+        return {c.key: getattr(row, c.key) for c in UserUploadRow.__mapper__.column_attrs}
+
+
+@pytest.mark.asyncio
+async def test_a_tombstone_keeps_only_what_the_lookup_needs(sf: SF) -> None:
+    uploads = SqlUserUploadStore(sf)
+    tenant, user, doomed, sibling = uuid4(), uuid4(), uuid4(), uuid4()
+    doc, image, expired, kept = uuid4(), uuid4(), uuid4(), uuid4()
+    for upload_id, thread, kind in (
+        (doc, doomed, "document"),
+        (image, doomed, "image"),
+        (expired, doomed, "document"),
+        (kept, sibling, "document"),
+    ):
+        await uploads.insert(
+            upload_id=upload_id,
+            tenant_id=tenant,
+            user_id=user,
+            thread_id=thread,
+            kind=kind,  # type: ignore[arg-type]
+            ref="uploads/客户A-体检.pdf"
+            if kind == "document"
+            else f"expert_work://image/{uuid4()}",
+            mime_type="application/pdf",
+            size_bytes=1234,
+            filename="客户A-体检.pdf",
+            sha256="ab" * 32,
+        )
+    await uploads.touch(upload_id=doc, tenant_id=tenant, now=_NOW)
+    await uploads.soft_delete(upload_id=expired, tenant_id=tenant, now=_NOW)
+    before = await _raw(sf, doc)
+    assert before is not None
+    assert set(before) == _TOMBSTONE_KEEPS | set(_TOMBSTONE_SCRUBS) | {"deleted_at"}, (
+        "user_upload grew a column: decide whether a tombstone keeps or scrubs it"
+    )
+
+    handled = await uploads.tombstone_for_threads(tenant_id=tenant, thread_ids=[doomed], now=_NOW)
+
+    assert handled == 3
+    after = await _raw(sf, doc)
+    assert after is not None
+    for column in _TOMBSTONE_KEEPS:
+        assert after[column] == before[column], column
+    for column, scrubbed in _TOMBSTONE_SCRUBS.items():
+        assert after[column] == scrubbed, column
+    assert after["deleted_at"] == _NOW
+    tombstone = await uploads.get(upload_id=doc, tenant_id=tenant)
+    assert tombstone is not None and is_session_deleted_tombstone(tombstone)
+    # Image rows and already-expired rows answered UPLOAD_NOT_FOUND before; gone now.
+    assert await _raw(sf, image) is None
+    assert await _raw(sf, expired) is None
+    # Another conversation's upload is untouched.
+    sibling_row = await _raw(sf, kept)
+    assert sibling_row is not None and sibling_row["filename"] == "客户A-体检.pdf"
+
+    # B-63 retention never sees a tombstone: not expired, not a reference holder.
+    far = _NOW + timedelta(days=3650)
+    expired = await uploads.list_expired(now=far, default_days=1)
+    assert doc not in {e.upload.id for e in expired}
+    by_ref = await uploads.list_unexpired_by_ref(
+        tenant_id=tenant, user_id=user, ref="", now=_NOW, default_days=3650
+    )
+    assert by_ref == []
+
+    # Re-run: the tombstone stays as it is.
+    assert await uploads.tombstone_for_threads(tenant_id=tenant, thread_ids=[doomed], now=_NOW) == 0
+    assert await _raw(sf, doc) == after

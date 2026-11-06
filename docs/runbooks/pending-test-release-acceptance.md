@@ -2008,7 +2008,7 @@ oauth2 目录项本来就不在平台池里:不再碰平台池;`enabled` 切换�
 
 > §93 由 B-279 占用(另一个分支);两边都追加在文件末尾,合并时按编号排好即可。
 
-**背景**:控制台 / 会话面 `POST /v1/sessions/{id}:purge` 原来删检索记录、记忆写回任务、checkpoint、run(连 `run_event`)、审批、对话行(`thread_message` 级联)和 NAS 上的对话目录,**漏了**按 `thread_id` 存的几类。现在在写回任务之后、checkpoint 之前多删六类:`feedback`、`quality_score`、`curation_candidate`(含已采纳进评测集的;评测集本身不动)、`memory_writeback_dlq`(按 `source_thread_id`)、`user_upload`、`image_upload` 连对象存储里的图片(`{租户}/uploads/{会话}/{图片 id}.{扩展名}`)。这六类任一类删不掉:后面什么都不删、**对话行留着**、回 503,审计记一条 `result=error`、`reason=purge_incomplete`(带已删条数与 `<类>_delete_failed`),再点一次删完;图片字节没删掉的那几行留着(没有作业按键扫孤儿图片)。**保留**:`token_usage` / 计费 / `audit_log`(对账)、登记过的产物(用户拍板:删对话不删产物)、长期记忆(`memory_item`)、老布局 agent 共用的 `agents/<key>/uploads/` 里的文件(别的对话可能在用同一个文件;对话布局的 `threads/<会话>/work/uploads/` 本来就随对话目录删)。对外接口 `DELETE /v1/agents/{code}/sessions/{id}` 只是归档,不受影响。**对外可见的变化**:在别的会话 `files[]` 里引用「已被 purge 的会话」上传的文档,原来回 404 `UPLOAD_SESSION_DELETED`,现在登记行随会话删了,回 404 `UPLOAD_NOT_FOUND`(处理方式相同:重新上传)—— 是否接受、要不要改对外文档与通知对接方,上线前由用户定。
+**背景**:控制台 / 会话面 `POST /v1/sessions/{id}:purge` 原来删检索记录、记忆写回任务、checkpoint、run(连 `run_event`)、审批、对话行(`thread_message` 级联)和 NAS 上的对话目录,**漏了**按 `thread_id` 存的几类。现在在写回任务之后、checkpoint 之前多处理六类:删 `feedback`、`quality_score`、`curation_candidate`(含已采纳进评测集的;评测集本身不动)、`memory_writeback_dlq`(按 `source_thread_id`)、`image_upload` 连对象存储里的图片(`{租户}/uploads/{会话}/{图片 id}.{扩展名}`);`user_upload` 的文档行**留成墓碑**(只留 id / 租户 / 用户 / 会话 / `kind` / `created_at`,`ref` / `filename` / `mime_type` 清成空串、`size_bytes` 0、`sha256` / `last_used_at` 置空、`deleted_at` 有值),图片行与已到期的行直接删。这六类任一类删不掉:后面什么都不删、**对话行留着**、回 503,审计记一条 `result=error`、`reason=purge_incomplete`(带已删条数与 `<类>_delete_failed`),再点一次删完;图片字节没删掉的那几行留着(没有作业按键扫孤儿图片)—— 同一条规矩也改进了删智能体(B-278,算失败 → 409 `AGENT_PURGE_INCOMPLETE`)和删用户(`failures.image_upload`),原来那两处字节删不掉照样删行。删用户另外补删该用户各条对话上的 `quality_score` 与 `curation_candidate`(候选里有用户自己的 👎 评论)。**保留**:`token_usage` / 计费 / `audit_log`(对账)、登记过的产物(用户拍板:删对话不删产物)、长期记忆(`memory_item`)、老布局 agent 共用的 `agents/<key>/uploads/` 里的文件(别的对话可能在用同一个文件;对话布局的 `threads/<会话>/work/uploads/` 本来就随对话目录删)。对外接口 `DELETE /v1/agents/{code}/sessions/{id}` 只是归档,不受影响。**对外不变**(用户 11-06 拍板保留错误码):在别的会话 `files[]` 里引用「已被 purge 的会话」上传的文档仍回 404 `UPLOAD_SESSION_DELETED`(认墓碑);图片的 `upload_id` 仍回 404 `UPLOAD_NOT_FOUND`;下载仍 404 `UPLOAD_NOT_FOUND`。
 
 **怎么进**:测试环境控制台(system_admin,平台租户)建临时智能体 `acc-b280`;对外接口用平台租户临时 API key,`user_id` 用 `u-b280`。数据库只读连接;对象存储运维侧只读列桶;NAS 用 control-plane pod 只读 `ls`。质量评分要抽样命中:先在平台「质量监控」设置里记下抽样比例,临时调到 100%(事后调回)。合成文件(零租户内容):`/tmp/b280.pdf`(一页 PDF)、`/tmp/b280.png`(小图)。**花费**:约 ¥1(四轮短对话 + 质量评审)。
 
@@ -2019,7 +2019,8 @@ oauth2 目录项本来就不在平台池里:不再碰平台池;`enabled` 切换�
   UNION ALL SELECT 'quality_score', count(*) FROM quality_score WHERE thread_id = :t
   UNION ALL SELECT 'curation_candidate', count(*) FROM curation_candidate WHERE thread_id = :t
   UNION ALL SELECT 'memory_writeback_dlq', count(*) FROM memory_writeback_dlq WHERE source_thread_id = :t::text
-  UNION ALL SELECT 'user_upload', count(*) FROM user_upload WHERE thread_id = :t
+  UNION ALL SELECT 'user_upload_live', count(*) FROM user_upload WHERE thread_id = :t AND ref <> ''
+  UNION ALL SELECT 'user_upload_tombstone', count(*) FROM user_upload WHERE thread_id = :t AND ref = '' AND kind = 'document' AND deleted_at IS NOT NULL AND filename = '' AND mime_type = '' AND size_bytes = 0 AND sha256 IS NULL AND last_used_at IS NULL
   UNION ALL SELECT 'image_upload', count(*) FROM image_upload WHERE thread_id = :t
   UNION ALL SELECT 'knowledge_retrieval_log', count(*) FROM knowledge_retrieval_log WHERE thread_id = :t
   UNION ALL SELECT 'agent_run', count(*) FROM agent_run WHERE thread_id = :t
@@ -2027,8 +2028,9 @@ oauth2 目录项本来就不在平台池里:不再碰平台池;`enabled` 切换�
   UNION ALL SELECT 'thread_meta', count(*) FROM thread_meta WHERE thread_id = :t;
   ```
 
-  同时记下 A、B 图片的 `image_upload.object_key`。判据:A、B 的 `feedback` / `quality_score` / `curation_candidate` / `user_upload` / `image_upload` 都 ≥ 1(哪一类是 0 先补造,不然这一类等于没验)。
-- [ ] **94.2 删会话 A**:控制台对话页删除会话 A(彻底删除)。判据:200;响应里 `feedback`、`quality_scores`、`curation_candidates`、`user_uploads`、`image_uploads`、`image_blobs_removed` 与 94.1 的条数一致,`image_blobs_failed` = 0,没有任何 `*_delete_failed`;再跑 94.1 的 SQL:A 的每一行都是 0;**B 的每一行与 94.1 记的一样**;对象存储里 A 的图片键已不存在、B 的还在;NAS 上 `agents/<key>/threads/<A>/` 已不在、`threads/<B>/` 还在;审计 `SESSION_WRITE` 有 `details.op = purge`、`meta_removed = true` 的一行。**没修好时**:A 的前五类条数不变、图片键还在。
-- [ ] **94.3 引用已删会话的上传**:在会话 B 发一轮,`files[]` 带 A 的 pdf `upload_id`。判据:404 `UPLOAD_NOT_FOUND`(原来是 `UPLOAD_SESSION_DELETED`,见背景;若用户决定保留旧错误码,这条判据随之改)。
+  同时记下 A、B 图片的 `image_upload.object_key`。判据:A、B 的 `feedback` / `quality_score` / `curation_candidate` / `user_upload_live` / `image_upload` 都 ≥ 1(`user_upload_live` 应是 2:pdf 与 png 各一行;哪一类是 0 先补造,不然这一类等于没验),`user_upload_tombstone` 都是 0。
+- [ ] **94.2 删会话 A**:控制台对话页删除会话 A(彻底删除)。判据:200;响应里 `feedback`、`quality_scores`、`curation_candidates`、`user_uploads`、`image_uploads`、`image_blobs_removed` 与 94.1 的条数一致,`image_blobs_failed` = 0,没有任何 `*_delete_failed`;再跑 94.1 的 SQL:A 除 `user_upload_tombstone` = 1(pdf 那一行,所有被清的列都已清空)外每一行都是 0;**B 的每一行与 94.1 记的一样**;对象存储里 A 的图片键已不存在、B 的还在;NAS 上 `agents/<key>/threads/<A>/` 已不在、`threads/<B>/` 还在;审计 `SESSION_WRITE` 有 `details.op = purge`、`meta_removed = true` 的一行。**没修好时**:A 的前五类条数不变、图片键还在。
+- [ ] **94.3 引用已删会话的上传**:在会话 B 发一轮,`files[]` 带 A 的 pdf `upload_id`;再发一轮带 A 的 png `upload_id`;再 `GET …/uploads/<A 的 pdf upload_id>?user_id=u-b280`。判据:依次 404 `UPLOAD_SESSION_DELETED`、404 `UPLOAD_NOT_FOUND`、404 `UPLOAD_NOT_FOUND`(与 B-280 之前一致)。
 - [ ] **94.4 失败时对话留着**:真栈不造故障(要停库或对象存储),由单测覆盖(`test_session_purge_children.py`:六类任一类失败 → 503、对话还在、别的类已删、重试删完;图片字节删不掉 → 行留着)。记「单测覆盖」。
-- [ ] **94.5 收尾**:质量抽样比例调回 94.1 记下的值;删会话 B 与临时智能体 `acc-b280`(彻底删除);`u-b280` 走 `POST /v1/users/<id>:purge`;吊销临时 key
+- [ ] **94.5 删用户带走质量评分与候选**:在会话 B 还在时,对 `u-b280` 走 `POST /v1/users/<id>:purge`。判据:200,`deleted.quality_score`、`deleted.curation_candidate` ≥ 1,`failures` 为空;94.1 的 SQL 对 B:`quality_score` / `curation_candidate` / `image_upload` 都是 0,对象存储里 B 的图片键已不存在。
+- [ ] **94.6 收尾**:质量抽样比例调回 94.1 记下的值;删临时智能体 `acc-b280`(彻底删除);吊销临时 key

@@ -1163,8 +1163,10 @@ def build_sessions_router() -> APIRouter:
         orphans the metadata.
 
         B-280 — the rows keyed by the thread itself (feedback, quality scores,
-        curation candidates, memory-writeback DLQ, upload registry rows, image
-        rows + their object-store bytes; see ``purge.session_purge``) go right
+        curation candidates, memory-writeback DLQ, image rows + their
+        object-store bytes; upload registry rows — documents are kept as
+        scrubbed tombstones so a later reference from another conversation
+        still answers ``UPLOAD_SESSION_DELETED``; see ``purge.session_purge``) go right
         after the writeback jobs. Unlike the steps below, if any of them fails
         nothing further is deleted and the thread row is KEPT — it is the only
         way a retry finds the conversation — and the request answers 503 (the

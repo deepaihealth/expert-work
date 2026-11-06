@@ -270,3 +270,30 @@ async def test_a_stale_delete_cannot_reopen_a_purging_name() -> None:
     assert stale is None
     status = await _status(world)
     assert status == {AgentSpecStatus.PURGING}
+
+
+@pytest.mark.asyncio
+async def test_an_image_whose_bytes_stayed_keeps_its_row_and_its_conversations() -> None:
+    """B-280 —— nothing sweeps object storage for keys without a row, so an image
+    whose bytes could not be deleted keeps its row; the step fails, the batch's
+    conversations stay (the name stays ``purging``) and a re-run deletes both."""
+    world, threads = await _world()
+    before = await _counts(world, world.t1, _X)
+    assert before["images"] == 2
+    _fail_once(world.objects, "delete")
+
+    first = await purge_agent(world.deps(), tenant_id=world.t1, name=_X)
+
+    assert first.failures["image_upload"] == "ImageBytesNotDeletedError"
+    assert (first.image_blobs_removed, first.image_blobs_failed) == (1, 1)
+    assert first.deleted["image_upload"] == 1
+    assert "thread_meta" in first.skipped
+    assert await _status(world) == {AgentSpecStatus.PURGING}
+    middle = await _counts(world, world.t1, _X)
+    assert middle["images"] == 1
+    assert middle["conversations"] == before["conversations"]
+    (left,) = await world.images.list_for_threads(tenant_id=world.t1, thread_ids=threads)
+    assert await world.objects.list_prefix(left.object_key) == [left.object_key]
+
+    await _assert_rerun_finishes(world, threads)
+    assert await world.objects.list_prefix(left.object_key) == []

@@ -86,7 +86,7 @@ class AgentPurgeDeps:
     curation_candidates: CurationCandidateStore
     secret_allowlist: AgentSecretAllowlistStore
     tenant_config: TenantConfigStore
-    #: ``None`` = 没接对象存储;图片行照删,对象键留给留存作业。
+    #: ``None`` = 没接对象存储;图片行照删(字节无从删起,计 ``image_blobs_skipped``)。
     object_store: ObjectStore | None = None
     #: ``None`` = 这个部署没有工作区。
     workspace_store: WorkspaceStore | None = None

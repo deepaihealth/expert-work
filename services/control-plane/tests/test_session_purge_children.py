@@ -1,6 +1,7 @@
 """B-280 —— 删除单个对话(``POST /v1/sessions/{id}:purge``)把按对话存的子数据一起删掉。
 
-反馈、质量评分、评测候选样本、记忆写回失败队列、上传登记、图片(连对象存储里的字节)。
+反馈、质量评分、评测候选样本、记忆写回失败队列、图片(连对象存储里的字节)删掉;上传登记行
+留成清空了内容的墓碑(对外引用仍回 ``UPLOAD_SESSION_DELETED``,见 ``test_external_uploads.py``)。
 每类都种两行:要删的这条对话一行,同一个智能体、同一个用户的另一条对话一行 —— 只有前者
 没了。某一类删不掉:对话本身留着、返回 503,重跑把剩下的删完。
 """
@@ -26,6 +27,7 @@ from expert_work.protocol import (
     AuditResult,
     CurationCandidateRecord,
     QualityScoreRecord,
+    is_session_deleted_tombstone,
 )
 from expert_work.runtime.storage import InMemoryObjectStore
 from tests.auth_fixtures import (
@@ -183,6 +185,7 @@ async def _remaining(app: FastAPI, thread_id: UUID, seeded: _Seeded) -> dict[str
     s = app.state
     ids = [thread_id]
     blob = 1 if seeded.object_key in await s.object_store.list_prefix(seeded.object_key) else 0
+    upload = await s.user_upload_store.get(upload_id=seeded.upload_id, tenant_id=_TENANT)
     return {
         "feedback": await s.feedback_store.count_for_threads(tenant_id=_TENANT, thread_ids=ids),
         "quality_scores": int(
@@ -197,9 +200,8 @@ async def _remaining(app: FastAPI, thread_id: UUID, seeded: _Seeded) -> dict[str
         "memory_writeback_dlq": await s.memory_writeback_dlq.count_for_threads(
             tenant_id=_TENANT, thread_ids=ids
         ),
-        "user_uploads": await s.user_upload_store.count_for_threads(
-            tenant_id=_TENANT, thread_ids=ids
-        ),
+        # A tombstone (B-280) is not a live upload: it keeps no name, ref or bytes.
+        "user_uploads": int(upload is not None and not is_session_deleted_tombstone(upload)),
         "image_uploads": len(
             await s.image_upload_store.list_for_threads(tenant_id=_TENANT, thread_ids=ids)
         ),
@@ -257,6 +259,11 @@ async def test_purge_deletes_each_thread_keyed_kind_and_spares_a_sibling(
     assert details["feedback"] == 1
     assert details["image_uploads"] == 1
 
+    tombstone = await app.state.user_upload_store.get(upload_id=mine.upload_id, tenant_id=_TENANT)
+    assert tombstone is not None
+    assert is_session_deleted_tombstone(tombstone)
+    assert (tombstone.filename, tombstone.mime_type, tombstone.size_bytes) == ("", "", 0)
+
 
 #: (kind, app.state store attribute, method that fails)
 _FAILING = [
@@ -264,7 +271,7 @@ _FAILING = [
     ("quality_scores", "quality_score_store", "delete_for_threads"),
     ("curation_candidates", "curation_candidate_store", "delete_for_threads"),
     ("memory_writeback_dlq", "memory_writeback_dlq", "delete_for_threads"),
-    ("user_uploads", "user_upload_store", "delete_for_threads"),
+    ("user_uploads", "user_upload_store", "tombstone_for_threads"),
     ("image_uploads", "image_upload_store", "list_for_threads"),
 ]
 

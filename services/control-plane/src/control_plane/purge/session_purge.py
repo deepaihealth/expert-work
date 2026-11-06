@@ -2,7 +2,7 @@
 
 这些行都不经 ``thread_meta`` 找(各自带 ``thread_id``),所以对话行删了它们也不会跟着走:
 
-* 反馈、记忆写回失败队列、上传登记、图片 —— 与 B-278 删智能体时按「对话集合」删的是同一批
+* 反馈、记忆写回失败队列、图片 —— 与 B-278 删智能体时按「对话集合」删的是同一批
   store 方法(``agent_purge_steps.purge_conversations``);
 * 质量评分、评测候选样本 —— B-278 按智能体整批删,单个对话按对话删(B-280 新加的 store
   方法)。候选样本被采纳进评测集的,评测集本身(租户整理过的资产)不动,同 ``purge_user``。
@@ -11,9 +11,11 @@
 带连接串 / 路径,理由见 ``user_purge._step``)。任一类没删干净,调用方就**不删对话行**——
 对话行是重跑时找到这条对话的唯一入口(先删子、子删成功才删父)。
 
-图片比 B-278 / ``purge_user`` 严一点:对象存储里的字节没删掉的那几行**留着**(那两处照删行)。
-没有任何作业按键扫对象存储里的孤儿图片(留存作业只按 ``image_upload`` 行删),行没了字节就
-永远留在桶里;行留着,重跑或留存作业到期都还能删它。
+上传登记行不删而是留成墓碑(:meth:`UserUploadStore.tombstone_for_threads`):别的会话再引用
+它时仍回对外已公布的 404 ``UPLOAD_SESSION_DELETED``;内容与身份字段全部清掉。
+
+图片:对象存储里的字节没删掉的那几行留着(:mod:`control_plane.purge.image_blobs`,三处彻底
+删除共用)。
 """
 
 from __future__ import annotations
@@ -21,8 +23,10 @@ from __future__ import annotations
 import logging
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from uuid import UUID
 
+from control_plane.purge.image_blobs import ImageTally, delete_images
 from expert_work.persistence.curation import CurationCandidateStore
 from expert_work.persistence.feedback_store import FeedbackStore
 from expert_work.persistence.image_upload import ImageUploadStore
@@ -42,10 +46,6 @@ KINDS: tuple[str, ...] = (
     "user_uploads",
     "image_uploads",
 )
-
-
-class ImageBytesNotDeletedError(Exception):
-    """对象存储里有图片字节没删掉;那几行留着,等重跑。"""
 
 
 @dataclass(frozen=True)
@@ -83,30 +83,17 @@ class ThreadChildrenResult:
 async def _purge_images(
     stores: SessionPurgeStores, result: ThreadChildrenResult, *, tenant_id: UUID, thread_id: UUID
 ) -> int:
-    """先删字节,只删字节已经没了的行;有字节没删掉 → 抛 :class:`ImageBytesNotDeletedError`
-    (已删的行数先记下)。"""
     rows = await stores.image_uploads.list_for_threads(tenant_id=tenant_id, thread_ids=[thread_id])
-    if stores.object_store is None:
-        result.image_blobs_skipped += len(rows)
-        return await stores.image_uploads.delete_for_threads(
-            tenant_id=tenant_id, thread_ids=[thread_id]
-        )
-    gone: list[UUID] = []
-    for row in rows:
-        try:
-            await stores.object_store.delete(row.object_key)
-        except Exception as exc:
-            result.image_blobs_failed += 1
-            logger.warning("session_purge.image_blob_failed error=%s", type(exc).__name__)
-            continue
-        result.image_blobs_removed += 1
-        gone.append(row.id)
-    # ``list_for_threads`` 是按租户查的,这些 id 都属于本租户。
-    removed = await stores.image_uploads.hard_delete(image_ids=gone)
-    if len(gone) < len(rows):
-        result.deleted["image_uploads"] = removed
-        raise ImageBytesNotDeletedError
-    return removed
+    tally = ImageTally()
+    try:
+        await delete_images(stores.image_uploads, stores.object_store, rows, tally)
+    finally:
+        result.image_blobs_removed += tally.blobs_removed
+        result.image_blobs_failed += tally.blobs_failed
+        result.image_blobs_skipped += tally.blobs_skipped
+        # 部分失败也照实记下删了几行(成功时由调用方用返回值记)。
+        result.deleted["image_uploads"] = tally.rows_deleted
+    return tally.rows_deleted
 
 
 async def purge_thread_children(
@@ -137,7 +124,9 @@ async def purge_thread_children(
         ),
         (
             "user_uploads",
-            lambda: stores.user_uploads.delete_for_threads(tenant_id=tenant_id, thread_ids=ids),
+            lambda: stores.user_uploads.tombstone_for_threads(
+                tenant_id=tenant_id, thread_ids=ids, now=datetime.now(UTC)
+            ),
         ),
         (
             "image_uploads",

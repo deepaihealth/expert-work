@@ -12,7 +12,8 @@
   + ``webhook_delivery``、``secret_allowlist``;``tenant_config.default_agent_name`` 置空。
 * 按它的对话集合关联的:``knowledge_retrieval_log``(最先,删不掉就整条对话不动)、
   ``agent_run`` + ``run_event``、``agent_approval``、``feedback``、``memory_writeback_dlq``、
-  ``image_upload``(先删对象存储里的图)、``user_upload``、LangGraph checkpoint。
+  ``image_upload``(先删对象存储里的图;图删不掉的那几行留着、算失败,重跑接着删)、
+  ``user_upload``、LangGraph checkpoint。
 * NAS:每个用户的 ``agents/<key>/`` 整棵、老布局的 ``threads/<id>/`` 与
   ``.tool_results/<run>/``、``.agent-file-versions/<user>/<key>/``。
 
