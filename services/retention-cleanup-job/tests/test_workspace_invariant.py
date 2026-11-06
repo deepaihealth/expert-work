@@ -648,18 +648,22 @@ async def test_a_failing_artifact_pass_still_reports_what_it_already_deleted(
     pass 记失败,后面的 pass 照跑。"""
     w = world
     before = len(w.artifacts._versions)
-    real_mark = w.artifacts.mark_expired_if_versionless
-    calls: list[int] = []
+    job = w.job()
 
-    async def _mark_then_fail(**kwargs: Any) -> bool:
-        calls.append(1)
-        if len(calls) > 1:
+    # Artifacts are processed in (created_at, artifact_id) order and the ids are
+    # random, so "fail on the second artifact" sometimes failed before any
+    # artifact that owns a workspace file was handled (files_removed 0, flaky).
+    # Fail at the first mark after a workspace file has been removed instead:
+    # by then versions and files are both already deleted and must be reported.
+    async def _fail_once_files_are_gone(**kwargs: Any) -> bool:
+        if job._artifact_tally.files_removed >= 1:
             raise RuntimeError("canceling statement due to statement timeout")
         return await real_mark(**kwargs)
 
-    monkeypatch.setattr(w.artifacts, "mark_expired_if_versionless", _mark_then_fail)
+    real_mark = w.artifacts.mark_expired_if_versionless
+    monkeypatch.setattr(w.artifacts, "mark_expired_if_versionless", _fail_once_files_are_gone)
 
-    report = await w.job().run_once()
+    report = await job.run_once()
 
     deleted = before - len(w.artifacts._versions)
     assert deleted >= 1
