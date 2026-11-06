@@ -615,7 +615,8 @@ def _scan_roots(root: str) -> Iterator[tuple[UUID, UUID, str, Path]]:
     与每个 ``agents/<key>/``。
 
     **``shared/`` 不在内,而且不能在。** 它装的是搬迁时反推不出归属的 legacy,
-    是新的「不许碰」区:那批文件按定义查不到登记行,扫进来就等于按 mtime 删
+    是「不许按文件碰」的区(B-284 起只有 :func:`retention_cleanup_job.agent_roots.sweep_shared`
+    在运维设定的日期之后整个删掉它):那批文件按定义查不到登记行,扫进来就等于按 mtime 删
     ——正是这个模块的不变式要挡的形状。``_uuid_dirs`` 只认 UUID 名,``shared``
     天然落不进来,但这条注释要留着:有人日后把枚举改成「用户根下所有目录」时,
     ``shared/threads/<uuid>/``(搬迁确实会造出这个形状)就会被扫到。

@@ -877,3 +877,41 @@ async def test_a_run_of_another_tenant_never_keeps_a_version(
         assert await clock.expired({version}) == {(version, 1)}
     finally:
         await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_snapshotted_digests_filters_by_user_prefix_and_copy_in_sql(
+    sql_store: SqlStoreFixture,
+) -> None:
+    """B-284 —— 只回这个用户、路径以前缀开头(``_`` 是字面量,不是 LIKE 通配)、有副本的版本。"""
+    store, engine = sql_store
+    try:
+        tenant, user, other = uuid4(), uuid4(), uuid4()
+        for who, name, path, digest in (
+            (user, "a1", "agents/p_k/a.md", "a" * 64),
+            (user, "a1", "agents/p_k/a.md", "b" * 64),
+            (user, "old", "agents/p_k/old.md", None),
+            (user, "wild", "agents/pxk/wild.md", "c" * 64),  # would match LIKE 'agents/p_k/%'
+            (other, "theirs", "agents/p_k/theirs.md", "d" * 64),
+        ):
+            await store.save_version(
+                tenant_id=tenant,
+                user_id=who,
+                agent_key=_AGENT_KEY,
+                name=name,
+                kind="document",
+                path_in_workspace=path,
+                created_in_thread="t",
+                version_id=uuid4(),
+                snapshot_key=None if digest is None else f"snap/{digest}",
+                size_bytes=None if digest is None else 1,
+                sha256=digest,
+            )
+
+        found = await store.snapshotted_digests(
+            tenant_id=tenant, user_id=user, path_prefix="agents/p_k/"
+        )
+
+        assert found == {"agents/p_k/a.md": {"a" * 64, "b" * 64}}
+    finally:
+        await engine.dispose()

@@ -392,6 +392,14 @@ class ArtifactStore(abc.ABC):
         ``agent_key`` must be non-empty: ``""`` is "owner unknown", not an agent."""
 
     @abc.abstractmethod
+    async def snapshotted_digests(
+        self, *, tenant_id: UUID, user_id: UUID, path_prefix: str
+    ) -> dict[str, set[str]]:
+        """B-284 —— 这个用户 ``path_in_workspace`` 以 ``path_prefix`` 开头、**有副本**
+        (``snapshot_key`` 与 ``sha256`` 都有)的版本:``{路径: 这些版本的 sha256}``。不论父行是否软删
+        (副本跟着版本行走)。``/agent`` 文件版本据此只在「这份内容已经有产物副本」时不另留。"""
+
+    @abc.abstractmethod
     async def count_for_agent(self, *, tenant_id: UUID, agent_key: str) -> int:
         """``artifact`` rows ``delete_all_for_agent`` would remove (purge preview)."""
 

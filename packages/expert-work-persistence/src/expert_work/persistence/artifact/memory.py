@@ -426,6 +426,21 @@ class InMemoryArtifactStore(ArtifactStore):
         ids = self._agent_ids(tenant_id, agent_key)
         return [v for v in self._versions if v.tenant_id == tenant_id and v.artifact_id in ids]
 
+    async def snapshotted_digests(
+        self, *, tenant_id: UUID, user_id: UUID, path_prefix: str
+    ) -> dict[str, set[str]]:
+        out: dict[str, set[str]] = {}
+        for v in self._versions:
+            if (
+                v.tenant_id == tenant_id
+                and v.user_id == user_id
+                and v.snapshot_key is not None
+                and v.sha256 is not None
+                and v.path_in_workspace.startswith(path_prefix)
+            ):
+                out.setdefault(v.path_in_workspace, set()).add(v.sha256)
+        return out
+
     async def count_for_agent(self, *, tenant_id: UUID, agent_key: str) -> int:
         return len(self._agent_ids(tenant_id, agent_key))
 

@@ -37,8 +37,11 @@ NOLOGIN BYPASSRLS with the minimum delete grants).
 
 不变式(``tests/test_workspace_invariant.py``):对活着的工作区,job 只删 (a) 登记
 过的产物文件 (b) ``uploads/`` 下登记过的文件 (c) 孤儿 ``threads/<id>/`` (d) B-282 闲置满保留期
-的会话自己的 ``threads/<会话>/`` 与它的 run 的 ``.tool_results/<run>/``;agent 根其它任何
-文件/目录(``style/``、MEMORY.md、未登记文件)永不触碰。(d) 走
+的会话自己的 ``threads/<会话>/`` 与它的 run 的 ``.tool_results/<run>/`` (e) B-284 切换时刻 ``T``
+之前写下、之后没再改过的 agent 根存量(:mod:`retention_cleanup_job.agent_roots`)与过了运维日期的
+``shared/``;``T`` 之后改过的 agent 根文件/目录(``style/``、未登记文件)永不按时间触碰,长期记忆
+文件(``AGENT_NOTES.md`` / ``MEMORY.md`` / ``PLAN.md`` / ``TODO.md``)与点开头的名字永不触碰;
+删的子目录先挪进隔离区 ``{tenant}/.purged-agents/{user}/``,满 7 天删。(d) 走
 :func:`expert_work.persistence.workspace.safe_remove.remove_entry`,其余入口在
 :mod:`retention_cleanup_job.workspace_files`。
 """
@@ -76,6 +79,17 @@ from expert_work.protocol import (
 from expert_work.runtime.audit import AuditLogger
 from expert_work.runtime.runs.store import RunStore
 from expert_work.runtime.storage import ObjectStore
+from retention_cleanup_job.agent_file_versions import (
+    VersionSweepTally,
+    sweep_agent_file_versions,
+)
+from retention_cleanup_job.agent_roots import (
+    AgentRootTally,
+    parse_cutover,
+    parse_shared_delete_after,
+    sweep_agent_roots,
+    sweep_shared,
+)
 from retention_cleanup_job.artifact_copies import (
     release_version_files,
     remove_user_agent_file_versions,
@@ -175,6 +189,8 @@ class RetentionCleanupJob:
         upload_retention_days: int = 90,
         conversation_workspace_retention_days: int = 90,
         conversation_workspace_batch_size: int = 500,
+        shared_delete_after: str | None = None,
+        agent_root_cutover: str | None = None,
         thread_store: ThreadMetaStore | None = None,
         run_store: RunStore | None = None,
         workspace_root: str | None = None,
@@ -246,6 +262,8 @@ class RetentionCleanupJob:
         self._upload_retention_days = upload_retention_days
         self._conversation_workspace_retention_days = conversation_workspace_retention_days
         self._conversation_workspace_batch_size = conversation_workspace_batch_size
+        self._shared_delete_after = shared_delete_after
+        self._agent_root_cutover = agent_root_cutover
         self._thread_store = thread_store
         self._run_store = run_store
         self._workspace_root = workspace_root
@@ -301,6 +319,9 @@ class RetentionCleanupJob:
             # B-282 —— 闲置会话的工作目录;排在产物两条 pass 之后(先让到期的产物版本走掉,
             # 产物保护看的是这之后还在的最新版)。
             conversations = await self._sweep_conversation_dirs()
+            # B-284 —— agent 根的 B-236 之前存量、冻结的 shared/、/agent 文件的历史版本。
+            agent_roots = await self._sweep_agent_roots()
+            file_versions = await self._sweep_agent_file_versions()
             orphan_artifact_copies_removed = await self._sweep_orphan_artifact_copies()
             purged = await self._sweep_purged_agents()
             trajectories = await self._sweep_trajectories()
@@ -352,6 +373,16 @@ class RetentionCleanupJob:
                 conversations.tool_results_skipped_artifact
             ),
             conversation_dirs_raced=conversations.raced,
+            agent_root_files_removed=agent_roots.files_removed,
+            agent_root_dirs_removed=agent_roots.dirs_removed,
+            shared_dirs_removed=agent_roots.shared_removed,
+            agent_root_failed=agent_roots.failed,
+            agent_root_skipped_unknown=agent_roots.skipped_unknown,
+            agent_root_skipped_symlinks=agent_roots.skipped_symlinks,
+            agent_root_skipped_changed=agent_roots.skipped_changed,
+            agent_file_version_dirs_dropped=file_versions.dirs_dropped,
+            agent_file_versions_capped=file_versions.versions_capped,
+            agent_file_versions_failed=file_versions.failed,
             failed_passes=tuple(self._failed_passes),
             thread_dirs_removed=thread_dirs_removed,
             tool_result_dirs_removed=tool_result_dirs_removed,
@@ -753,6 +784,74 @@ class RetentionCleanupJob:
             return sweep.tally
         if tally.needs_attention:
             self._failed_passes.append("conversation_dirs")
+        return tally
+
+    async def _sweep_agent_roots(self) -> AgentRootTally:
+        """B-284 —— agent 根下 B-236 之前留下的顶层文件 / 模板子目录(按租户的
+        ``artifact_retention_days``,没设用 ``artifact_retention_days``),与过了运维设定日期的
+        ``shared/``;规则本体在 :mod:`retention_cleanup_job.agent_roots`。没配 ``workspace_root``
+        不跑。出错或有一项删失败:记进 ``failed_passes``(退出码 3),已经做了的照样计数。"""
+        tally = AgentRootTally()
+        if self._workspace_root is None:
+            return tally
+        cutover, cutover_problem = parse_cutover(self._agent_root_cutover)
+        shared_after, shared_problem = parse_shared_delete_after(self._shared_delete_after)
+        # 每一轮都把两道闸当前的样子打出来:运维一眼看得到它们开没开、开在哪天。
+        logger.info(
+            "retention.agent_roots_gate cutover=%s shared_delete_after=%s",
+            cutover.isoformat() if cutover else "off",
+            shared_after.date().isoformat() if shared_after else "off",
+        )
+        for env, raw, problem in (
+            ("AGENT_ROOT_CUTOVER", self._agent_root_cutover, cutover_problem),
+            ("SHARED_DELETE_AFTER", self._shared_delete_after, shared_problem),
+        ):
+            if problem is not None:
+                # 写错的配置不让整个作业停:只关掉这一步,记失败让人去看。
+                logger.error(
+                    "retention.config_invalid env=EXPERT_WORK_RETENTION_%s value=%r problem=%s",
+                    env,
+                    raw,
+                    problem,
+                )
+                tally.failed += 1
+        try:
+            if cutover is not None:
+                await sweep_agent_roots(
+                    self._sf,
+                    self._workspace_root,
+                    cutover=cutover,
+                    default_days=self._artifact_retention_days,
+                    tally=tally,
+                )
+            await asyncio.to_thread(
+                sweep_shared,
+                self._workspace_root,
+                delete_after=shared_after,
+                now=datetime.now(UTC),
+                tally=tally,
+            )
+        except Exception:
+            logger.exception("retention.agent_roots_failed")
+            self._failed_passes.append("agent_roots")
+            return tally
+        if tally.needs_attention:
+            self._failed_passes.append("agent_roots")
+        return tally
+
+    async def _sweep_agent_file_versions(self) -> VersionSweepTally:
+        """B-284 —— ``/agent`` 文件历史版本:源文件不见满 30 天的版本目录、每个文件最新 3 份之外
+        满 90 天的版本;规则本体在 :mod:`retention_cleanup_job.agent_file_versions`。"""
+        if self._workspace_root is None:
+            return VersionSweepTally()
+        try:
+            tally = await asyncio.to_thread(sweep_agent_file_versions, self._workspace_root)
+        except Exception:
+            logger.exception("retention.agent_file_versions_failed")
+            self._failed_passes.append("agent_file_versions")
+            return VersionSweepTally()
+        if tally.needs_attention:
+            self._failed_passes.append("agent_file_versions")
         return tally
 
     async def _sweep_purged_agents(self) -> PurgedAgentsSweep:

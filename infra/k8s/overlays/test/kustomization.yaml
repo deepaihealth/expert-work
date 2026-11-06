@@ -94,3 +94,4 @@ patches:
 - path: langfuse-configmap-patch.yaml
 - path: langfuse-ingress-patch.yaml
 - path: web-search-fixtures-patch.yaml
+- path: retention-cleanup-patch.yaml
