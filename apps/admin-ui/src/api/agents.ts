@@ -286,6 +286,10 @@ export const AGENT_PURGE_INCOMPLETE = "AGENT_PURGE_INCOMPLETE";
 
 /** B-278 — create / fork / restore hit a name whose purge hasn't finished. */
 export const AGENT_PURGING = "AGENT_PURGING";
+/** B-278 — another purge of the same name is running (one per name across
+ *  replicas), or another write on the name collided; nothing was done —
+ *  retry later. */
+export const AGENT_BUSY = "AGENT_BUSY";
 
 /** B-278 — ``purging``: a purge started on this name but hasn't finished (a
  *  partial run leaves every version here). Like ``deleted`` it is hidden from
@@ -384,8 +388,20 @@ export interface AgentPurgeSummary {
   skipped: string[];
   agent_spec_deleted: boolean;
   default_agent_cleared: boolean;
-  /** ``false`` = partial: the name stays in the deleted list; running the
-   *  purge again finishes it. */
+  /** NAS outcomes — the backend asks for each to be shown when non-zero:
+   *  a folder that couldn't be deleted was moved to a holding area (removed
+   *  after 7 days); the agent folder was itself a symlink (link removed,
+   *  target untouched); a symlink on the way was left alone; users whose
+   *  folder could be neither removed nor moved (their data kept, the name
+   *  stays ``purging``). */
+  nas_quarantined?: number;
+  nas_symlinks_unlinked?: number;
+  nas_symlinks_skipped?: number;
+  nas_failed_users?: number;
+  /** ``false`` = partial: the name stays ``purging``; running the purge again
+   *  finishes it. (The current backend answers a partial run with 409
+   *  {@link AGENT_PURGE_INCOMPLETE} instead; a 200 with ``ok:false`` is only
+   *  handled as a fallback.) */
   ok: boolean;
 }
 
@@ -394,7 +410,7 @@ export interface AgentPurgeSummary {
  *  ``confirm_name`` must equal the name exactly (422 ``CONFIRM_NAME_MISMATCH``);
  *  409 {@link AGENT_PURGE_BLOCKED} when something still holds it; 409
  *  {@link AGENT_PURGE_INCOMPLETE} (summary in ``details``) when some steps
- *  failed; 409 {@link AGENT_PURGING} when another purge of the name runs. */
+ *  failed; 409 {@link AGENT_BUSY} when another purge of the name runs. */
 export async function purgeAgent(
   name: string,
   version: string,

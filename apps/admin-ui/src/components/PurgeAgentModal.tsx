@@ -21,8 +21,8 @@ import { useTranslation } from "react-i18next";
 import { ApiError, errMessage } from "../api/client";
 import {
   AGENT_PURGE_BLOCKED,
+  AGENT_BUSY,
   AGENT_PURGE_INCOMPLETE,
-  AGENT_PURGING,
   getAgentPurgePreview,
   purgeAgent,
   type AgentPurgeBlocking,
@@ -79,6 +79,23 @@ function readBlocking(err: ApiError): AgentPurgeBlocking | null {
   return { active_versions: active.map(String), referenced_by: refs.map(String) };
 }
 
+/** NAS outcome counters on a purge summary, in display order. The backend
+ *  contract (#2026): show each to the admin when non-zero. */
+const NAS_FIELDS = [
+  "nas_quarantined",
+  "nas_symlinks_unlinked",
+  "nas_symlinks_skipped",
+  "nas_failed_users",
+] as const;
+
+/** The non-zero NAS counters of a purge summary (200 body or the details of a
+ *  409 ``AGENT_PURGE_INCOMPLETE``), as ``[field, count]``. */
+function nasNotes(summary: Record<string, unknown> | undefined): Array<[string, number]> {
+  if (summary === undefined) return [];
+  return NAS_FIELDS.map((f) => [f, summary[f]] as [string, unknown])
+    .filter((e): e is [string, number] => typeof e[1] === "number" && e[1] > 0);
+}
+
 /** ``AGENT_PURGE_INCOMPLETE`` carries the purge summary in ``error.details``;
  *  its ``failures`` is step → exception type. */
 function readFailures(err: ApiError): Record<string, string> {
@@ -100,12 +117,13 @@ interface PurgeAgentModalProps {
 
 export function PurgeAgentModal({ open, name, version, onClose, onPurged }: PurgeAgentModalProps) {
   const { t } = useTranslation();
-  const { message } = App.useApp();
+  const { message, modal } = App.useApp();
   const [preview, setPreview] = useState<AgentPurgePreview | null>(null);
   const [previewError, setPreviewError] = useState<string | null>(null);
   const [confirmText, setConfirmText] = useState("");
   const [busy, setBusy] = useState(false);
   const [failedSteps, setFailedSteps] = useState<Record<string, string> | null>(null);
+  const [partialNas, setPartialNas] = useState<Array<[string, number]>>([]);
   const [purgeError, setPurgeError] = useState<string | null>(null);
 
   useEffect(() => {
@@ -115,6 +133,7 @@ export function PurgeAgentModal({ open, name, version, onClose, onPurged }: Purg
     setPreviewError(null);
     setConfirmText("");
     setFailedSteps(null);
+    setPartialNas([]);
     setPurgeError(null);
     getAgentPurgePreview(name, version).then(
       (p) => {
@@ -140,20 +159,31 @@ export function PurgeAgentModal({ open, name, version, onClose, onPurged }: Purg
     if (!armed) return;
     setBusy(true);
     setFailedSteps(null);
+    setPartialNas([]);
     setPurgeError(null);
     try {
       const summary = await purgeAgent(name, version, confirmText);
+      const nas = nasNotes(summary as unknown as Record<string, unknown>);
       if (summary.ok) {
         message.success(t("agent_lifecycle.purge_ok", { name }));
+        if (nas.length > 0) {
+          // Done, but the admin should know what happened on the NAS.
+          modal.info({
+            title: t("agent_lifecycle.purge_ok", { name }),
+            content: <NasNotes notes={nas} />,
+          });
+        }
         onPurged();
         return;
       }
       // Fallback: an older backend answered a partial run with 200 + ok=false.
       setFailedSteps(summary.failures);
+      setPartialNas(nas);
     } catch (err) {
       if (err instanceof ApiError && err.code === AGENT_PURGE_INCOMPLETE) {
         // Partial run: the summary rides in error.details; click again to finish.
         setFailedSteps(readFailures(err));
+        setPartialNas(nasNotes(err.details));
         return;
       }
       if (err instanceof ApiError && err.code === AGENT_PURGE_BLOCKED) {
@@ -164,16 +194,17 @@ export function PurgeAgentModal({ open, name, version, onClose, onPurged }: Purg
           return;
         }
       }
-      if (err instanceof ApiError && err.code === AGENT_PURGING) {
-        // Another purge of this name is still running.
-        setPurgeError(t("agent_lifecycle.purge_in_progress"));
+      if (err instanceof ApiError && err.code === AGENT_BUSY) {
+        // Another purge of this name is running (or a write on it collided);
+        // nothing was deleted — retry later, the button stays usable.
+        setPurgeError(t("agent_lifecycle.purge_busy"));
         return;
       }
       setPurgeError(t("agent_lifecycle.purge_failed", { error: errMessage(err) }));
     } finally {
       setBusy(false);
     }
-  }, [armed, name, version, confirmText, message, t, onPurged]);
+  }, [armed, name, version, confirmText, message, modal, t, onPurged]);
 
   return (
     <Modal
@@ -224,11 +255,21 @@ export function PurgeAgentModal({ open, name, version, onClose, onPurged }: Purg
             type="warning"
             showIcon
             message={t("agent_lifecycle.purge_partial_title")}
-            description={t("agent_lifecycle.purge_partial_body", {
-              steps: Object.entries(failedSteps)
-                .map(([step, type]) => `${step} (${type})`)
-                .join(", "),
-            })}
+            description={
+              <>
+                {Object.keys(failedSteps).length > 0 && (
+                  <div>
+                    {t("agent_lifecycle.purge_partial_body", {
+                      steps: Object.entries(failedSteps)
+                        .map(([step, type]) => `${step} (${type})`)
+                        .join(", "),
+                    })}
+                  </div>
+                )}
+                <NasNotes notes={partialNas} />
+                <div>{t("agent_lifecycle.purge_partial_retry")}</div>
+              </>
+            }
             style={{ marginTop: 12 }}
             data-testid="purge-agent-partial"
           />
@@ -244,6 +285,19 @@ export function PurgeAgentModal({ open, name, version, onClose, onPurged }: Purg
         )}
       </div>
     </Modal>
+  );
+}
+
+/** One plain-language line per non-zero NAS counter. */
+function NasNotes({ notes }: { notes: Array<[string, number]> }) {
+  const { t } = useTranslation();
+  if (notes.length === 0) return null;
+  return (
+    <ul style={{ margin: "4px 0", paddingLeft: 18 }} data-testid="purge-agent-nas-notes">
+      {notes.map(([field, count]) => (
+        <li key={field}>{t(`agent_lifecycle.nas.${field}`, { count })}</li>
+      ))}
+    </ul>
   );
 }
 

@@ -53,7 +53,6 @@ import {
   getAgent,
   disableAgent,
   enableAgent,
-  AGENT_STATUS_PURGING,
   isDeletedStatus,
   type AgentRecord,
   type AgentList,
@@ -283,31 +282,17 @@ export function AgentsList() {
   // everything incl. deleted. Both fetch without a server-side status
   // param (the backend filter is single-status only) — "default" drops
   // deleted rows client-side below. B-278: a half-purged name (``purging``)
-  // counts as deleted — hidden by "default", and "deleted" asks the server for
-  // both statuses (two single-status queries, merged).
+  // counts as deleted — hidden by "default"; the server's ``status=deleted``
+  // already returns both ``deleted`` and ``purging`` rows.
   const [statusFilter, setStatusFilter] = useState<string>("default");
 
   const refresh = useCallback(async () => {
     setLoading(true);
     setError(null);
-    const name = nameFilter.trim() || undefined;
     try {
-      if (statusFilter === "deleted") {
-        const [deleted, purging] = await Promise.all(
-          ["deleted", AGENT_STATUS_PURGING].map((status) =>
-            listAgents({ tenantScope: apiTenantScope, name, status }),
-          ),
-        );
-        setData({
-          items: [...purging.items, ...deleted.items],
-          total: deleted.total + purging.total,
-          cross_tenant: deleted.cross_tenant,
-        });
-        return;
-      }
       const result = await listAgents({
         tenantScope: apiTenantScope,
-        name,
+        name: nameFilter.trim() || undefined,
         status:
           statusFilter === "default" || statusFilter === "all" ? undefined : statusFilter,
       });

@@ -269,8 +269,15 @@ export interface TranslationKeys {
     purge_ok: string;
     purge_partial_title: string;
     purge_partial_body: string;
+    purge_partial_retry: string;
     purge_continue: string;
-    purge_in_progress: string;
+    purge_busy: string;
+    nas: {
+      nas_quarantined: string;
+      nas_symlinks_unlinked: string;
+      nas_symlinks_skipped: string;
+      nas_failed_users: string;
+    };
     purge_failed: string;
     duplicate_deleted: string;
     duplicate_deleted_link: string;
@@ -4042,10 +4049,20 @@ const en: TranslationKeys = {
       "A very large agent may time out. If it times out or stops halfway, click Purge again — what's already removed isn't removed twice.",
     purge_ok: "Purged {{name}}",
     purge_partial_title: "Some data is still there",
-    purge_partial_body:
-      "These steps didn't finish: {{steps}}. Click “Continue cleanup” to finish.",
+    purge_partial_body: "These steps didn't finish: {{steps}}.",
+    purge_partial_retry: "Click “Continue cleanup” to finish.",
     purge_continue: "Continue cleanup",
-    purge_in_progress: "This agent is being purged right now. Please try again later.",
+    purge_busy:
+      "Another purge of this agent is in progress, so nothing was deleted this time. Please try again later.",
+    nas: {
+      nas_quarantined:
+        "{{count}} workspace folder(s) couldn't be deleted and were moved to a holding area; they are removed after 7 days.",
+      nas_symlinks_unlinked:
+        "{{count}} workspace folder(s) were symlinks: the link was removed, its target untouched.",
+      nas_symlinks_skipped: "{{count}} symlink(s) on the way were skipped, not followed.",
+      nas_failed_users:
+        "{{count}} user(s)' workspace folder could be neither deleted nor moved; their conversations and artifacts are kept and the agent stays “purging”.",
+    },
     purge_failed: "Purge failed: {{error}}. You can try again.",
     duplicate_deleted:
       "A deleted agent with the same name exists. You can restore it, or purge it and then create a new one.",

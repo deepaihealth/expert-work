@@ -171,19 +171,93 @@ describe("PurgeAgentModal", () => {
     expect(purgeAgent).toHaveBeenCalledTimes(2);
   });
 
-  it("409 AGENT_PURGING: says another purge of the name is running", async () => {
+  it("409 AGENT_BUSY: another purge is running — says so, stays open, can retry", async () => {
     const user = userEvent.setup();
     vi.mocked(getAgentPurgePreview).mockResolvedValue(preview());
-    vi.mocked(purgeAgent).mockRejectedValue(new ApiError("purging", "AGENT_PURGING", 409));
+    vi.mocked(purgeAgent)
+      .mockRejectedValueOnce(
+        new ApiError("another purge of this agent is running; retry later", "AGENT_BUSY", 409),
+      )
+      .mockResolvedValueOnce(summary());
     renderModal();
 
     await user.type(await screen.findByTestId("purge-agent-confirm-input"), "code-reviewer");
     await user.click(screen.getByTestId("purge-agent-confirm-ok"));
 
     expect(await screen.findByTestId("purge-agent-error")).toHaveTextContent(
-      "being purged right now",
+      "Another purge of this agent is in progress, so nothing was deleted this time.",
     );
+    expect(screen.queryByTestId("purge-agent-partial")).toBeNull();
     expect(onPurged).not.toHaveBeenCalled();
+    expect(onClose).not.toHaveBeenCalled();
+    const ok = screen.getByTestId("purge-agent-confirm-ok");
+    expect(ok).toHaveTextContent("Purge");
+    expect(ok).toBeEnabled();
+
+    await user.click(ok);
+    await waitFor(() => expect(onPurged).toHaveBeenCalledTimes(1));
+  });
+
+  it("409 AGENT_PURGE_INCOMPLETE: shows the non-zero NAS outcomes from the summary", async () => {
+    const user = userEvent.setup();
+    vi.mocked(getAgentPurgePreview).mockResolvedValue(preview());
+    vi.mocked(purgeAgent).mockRejectedValue(
+      new ApiError("some data could not be deleted", "AGENT_PURGE_INCOMPLETE", 409, {
+        ...summary({ ok: false, agent_spec_deleted: false }),
+        failures: {},
+        nas_failed_users: 1,
+        nas_quarantined: 0,
+        nas_symlinks_unlinked: 0,
+        nas_symlinks_skipped: 2,
+      }),
+    );
+    renderModal();
+
+    await user.type(await screen.findByTestId("purge-agent-confirm-input"), "code-reviewer");
+    await user.click(screen.getByTestId("purge-agent-confirm-ok"));
+
+    const notes = await screen.findByTestId("purge-agent-nas-notes");
+    expect(notes).toHaveTextContent("1 user(s)' workspace folder could be neither deleted nor moved");
+    expect(notes).toHaveTextContent("2 symlink(s) on the way were skipped");
+    expect(notes).not.toHaveTextContent("holding area");
+    expect(notes).not.toHaveTextContent("the link was removed");
+    // No failed step, so no empty "These steps didn't finish:" line.
+    expect(screen.getByTestId("purge-agent-partial")).not.toHaveTextContent("These steps");
+    expect(screen.getByTestId("purge-agent-confirm-ok")).toHaveTextContent("Continue cleanup");
+  });
+
+  it("a clean purge with NAS outcomes tells the admin what happened on the NAS", async () => {
+    const user = userEvent.setup();
+    vi.mocked(getAgentPurgePreview).mockResolvedValue(preview());
+    vi.mocked(purgeAgent).mockResolvedValue({ ...summary(), nas_quarantined: 2 });
+    renderModal();
+
+    await user.type(await screen.findByTestId("purge-agent-confirm-input"), "code-reviewer");
+    await user.click(screen.getByTestId("purge-agent-confirm-ok"));
+
+    await waitFor(() => expect(onPurged).toHaveBeenCalledTimes(1));
+    expect(await screen.findByTestId("purge-agent-nas-notes")).toHaveTextContent(
+      "2 workspace folder(s) couldn't be deleted and were moved to a holding area",
+    );
+  });
+
+  it("a clean purge without NAS outcomes shows no NAS dialog", async () => {
+    const user = userEvent.setup();
+    vi.mocked(getAgentPurgePreview).mockResolvedValue(preview());
+    vi.mocked(purgeAgent).mockResolvedValue({
+      ...summary(),
+      nas_quarantined: 0,
+      nas_symlinks_unlinked: 0,
+      nas_symlinks_skipped: 0,
+      nas_failed_users: 0,
+    });
+    renderModal();
+
+    await user.type(await screen.findByTestId("purge-agent-confirm-input"), "code-reviewer");
+    await user.click(screen.getByTestId("purge-agent-confirm-ok"));
+
+    await waitFor(() => expect(onPurged).toHaveBeenCalledTimes(1));
+    expect(screen.queryByTestId("purge-agent-nas-notes")).toBeNull();
   });
 
   it("fallback 200 ok=false: names the failed steps, stays open and lets the admin click again", async () => {

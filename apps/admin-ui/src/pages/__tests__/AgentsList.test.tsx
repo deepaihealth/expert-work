@@ -181,20 +181,15 @@ describe("AgentsList", () => {
     expect(screen.queryByText("half-gone-bot")).toBeNull();
   });
 
-  // B-278 — the 「已删除」 filter lists deleted AND purging rows (one server
-  // query per status), the purging one labelled as unfinished; clicking a
-  // deleted row opens its (now readable) detail page.
+  // B-278 — the 「已删除」 filter asks the server for ``status=deleted``, which
+  // returns deleted AND purging rows; the purging one is labelled as
+  // unfinished; clicking a deleted row opens its (now readable) detail page.
   it("the deleted filter lists deleted + purging rows and opens their detail page", async () => {
     const user = userEvent.setup();
     const deletedRow = { ...sampleRow, id: "d1", name: "retired-bot", status: "deleted" };
     const purgingRow = { ...sampleRow, id: "p1", name: "half-gone-bot", status: "purging" };
     listAgentsMock.mockImplementation(async (params) => {
-      const items =
-        params?.status === "deleted"
-          ? [deletedRow]
-          : params?.status === "purging"
-            ? [purgingRow]
-            : [sampleRow];
+      const items = params?.status === "deleted" ? [deletedRow, purgingRow] : [sampleRow];
       return { items, total: items.length, cross_tenant: false };
     });
     renderAgentsList();
@@ -208,7 +203,10 @@ describe("AgentsList", () => {
     expect(screen.getByText("half-gone-bot")).toBeInTheDocument();
     expect(screen.queryByText("customer-support-bot")).toBeNull();
     expect(listAgentsMock).toHaveBeenCalledWith(expect.objectContaining({ status: "deleted" }));
-    expect(listAgentsMock).toHaveBeenCalledWith(expect.objectContaining({ status: "purging" }));
+    // One query: a separate ``status=purging`` call would list those rows twice.
+    expect(listAgentsMock).not.toHaveBeenCalledWith(
+      expect.objectContaining({ status: "purging" }),
+    );
     expect(screen.getByText(i18n.t("agents_page.status_purging"))).toBeInTheDocument();
 
     fireEvent.click(screen.getByText("retired-bot"));
@@ -329,13 +327,11 @@ describe("AgentsList row actions", () => {
   it("a deleted row's menu offers only the run history action", async () => {
     const user = userEvent.setup();
     const deletedRow = { ...sampleRow, status: "deleted" };
-    // B-278 — the "deleted" filter asks for ``deleted`` and ``purging``
-    // separately; only the first holds this row.
-    listAgentsMock.mockImplementation(async (params) => ({
-      items: params?.status === "purging" ? [] : [deletedRow],
-      total: params?.status === "purging" ? 0 : 1,
+    listAgentsMock.mockResolvedValue({
+      items: [deletedRow],
+      total: 1,
       cross_tenant: false,
-    }));
+    });
     renderAgentsList();
     // The default view hides deleted rows — switch the status filter to
     // "deleted" to surface it (mirrors how a user reaches such a row).
