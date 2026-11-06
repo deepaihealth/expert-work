@@ -55,7 +55,11 @@ from expert_work.protocol.agent_key import sanitize_agent_key
 from expert_work.runtime.audit.logger import AuditLogger
 from expert_work.runtime.runs import RunInfo, RunStatus, RunStore
 from orchestrator import LLM_CACHE_BYPASS_KEY, AgentFactoryError, run_agent
-from orchestrator.tools.registry import WORKSPACE_LAYOUT_KEY, WORKSPACE_MIGRATED_KEY
+from orchestrator.tools.registry import (
+    WORKSPACE_CLEANED_KEY,
+    WORKSPACE_LAYOUT_KEY,
+    WORKSPACE_MIGRATED_KEY,
+)
 
 logger = logging.getLogger("expert_work.control_plane.run_queue_worker")
 
@@ -387,6 +391,8 @@ class RunQueueWorker:
             configurable[WORKSPACE_LAYOUT_KEY] = prepared.workspace_layout
             if prepared.migrated:
                 configurable[WORKSPACE_MIGRATED_KEY] = True
+            if prepared.cleaned:
+                configurable[WORKSPACE_CLEANED_KEY] = True
             if built.run_deadline_s > 0:
                 configurable["deadline_at"] = time.monotonic() + float(built.run_deadline_s)
             if replay:

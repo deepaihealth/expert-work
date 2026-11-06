@@ -58,6 +58,18 @@ class CleanupReport:
     upload_owners_unavailable: int = 0
     #: B-63 —— 过了到期日 7 天还在暂时失败、因租户配置改动推迟放弃而仍在重试的上传行。
     upload_rows_failing_overdue: int = 0
+    #: B-282 —— 闲置会话的工作目录:删掉的会话目录、agent 根下的 ``.tool_results/<run>/``,
+    #: 这一轮因为有没结束的 run / 产物保护 / 路径有符号链接 / 用户已软删而没删的,与删失败的
+    #: (非 0 时 ``failed_passes`` 带 ``conversation_dirs``)。
+    conversation_dirs_removed: int = 0
+    conversation_tool_results_removed: int = 0
+    conversation_dirs_skipped_active: int = 0
+    conversation_dirs_skipped_artifact: int = 0
+    conversation_dirs_skipped_unsafe: int = 0
+    conversation_dirs_skipped_owner_deleted: int = 0
+    conversation_dirs_failed: int = 0
+    conversation_tool_results_skipped_artifact: int = 0
+    conversation_dirs_raced: int = 0
     # 留存链 B-27 —— 孤儿 threads/<id>/ 目录。
     thread_dirs_removed: int = 0
     #: B-50 spec §4.2 —— 孤儿 ``.tool_results/<run_id>/``。此前从没被清过

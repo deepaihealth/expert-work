@@ -531,3 +531,35 @@ async def test_an_unconfirmed_decrease_is_judged_against_the_locked_row(
         assert fetched is not None and fetched.upload_retention_days == 365
     finally:
         await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_conversation_workspace_retention_days_round_trip(
+    tenant_config_store: tuple[SqlTenantConfigStore, AsyncEngine],
+) -> None:
+    """B-282 —— 新列在真库上存取:设值、不带键不动、显式 ``null`` 改回平台默认。"""
+    store, engine = tenant_config_store
+    try:
+        tenant = uuid4()
+        current_tenant_id_var.set(tenant)
+        created = await store.create(tenant_id=tenant, display_name="Acme", actor_id="bootstrap")
+        assert created.conversation_workspace_retention_days is None
+        await store.upsert(
+            tenant_id=tenant,
+            patch=TenantConfigPatch(conversation_workspace_retention_days=200),
+            actor_id="ops",
+        )
+        await store.upsert(
+            tenant_id=tenant, patch=TenantConfigPatch(display_name="Acme 2"), actor_id="ops"
+        )
+        fetched = await store.get(tenant_id=tenant)
+        assert fetched is not None and fetched.conversation_workspace_retention_days == 200
+        await store.upsert(
+            tenant_id=tenant,
+            patch=TenantConfigPatch(conversation_workspace_retention_days=None),
+            actor_id="ops",
+        )
+        fetched = await store.get(tenant_id=tenant)
+        assert fetched is not None and fetched.conversation_workspace_retention_days is None
+    finally:
+        await engine.dispose()

@@ -614,3 +614,48 @@ async def test_put_without_override_field_publishes_no_rate_limit_event(
     assert put.status_code == 200
     assert spy_overrides.calls == []
     assert [e.kind for e in spy_bus.events] == ["tenant_config"]
+
+
+@pytest.mark.asyncio
+async def test_conversation_workspace_retention_days_via_put_and_get(
+    tc_client: AsyncClient,
+) -> None:
+    """B-282 —— 对话工作目录保留期走同一个 PUT:7-365;调大直接生效;改小不带
+    ``confirm_retention_decrease=true`` 是 409、值不变;GET 读得到。"""
+    headers = {"Authorization": f"Bearer {_admin_token()}"}
+    url = f"/v1/tenants/{_TENANT}/config"
+    put = await tc_client.put(
+        url,
+        headers=headers,
+        json={"display_name": "ACME", "conversation_workspace_retention_days": 120},
+    )
+    assert put.status_code == 200, put.text
+    assert put.json()["data"]["conversation_workspace_retention_days"] == 120
+    for bad in (6, 366):
+        rejected = await tc_client.put(
+            url,
+            headers=headers,
+            params={"confirm_retention_decrease": "true"},
+            json={"conversation_workspace_retention_days": bad},
+        )
+        assert rejected.status_code == 422, bad
+
+    lowered = await tc_client.put(
+        url, headers=headers, json={"conversation_workspace_retention_days": 30}
+    )
+    assert lowered.status_code == 409, lowered.text
+    assert lowered.json()["detail"]["fields"] == [
+        {"field": "conversation_workspace_retention_days", "from": 120, "to": 30}
+    ]
+    got = (await tc_client.get(url, headers=headers)).json()["data"]
+    assert got["conversation_workspace_retention_days"] == 120
+
+    confirmed = await tc_client.put(
+        url,
+        headers=headers,
+        params={"confirm_retention_decrease": "true"},
+        json={"conversation_workspace_retention_days": 30},
+    )
+    assert confirmed.status_code == 200, confirmed.text
+    got = (await tc_client.get(url, headers=headers)).json()["data"]
+    assert got["conversation_workspace_retention_days"] == 30

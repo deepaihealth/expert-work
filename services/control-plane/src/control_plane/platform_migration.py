@@ -42,6 +42,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import dataclasses
 import logging
 from collections.abc import Sequence
 from dataclasses import dataclass, field
@@ -115,6 +116,8 @@ class PreparedWorkspace:
 
     workspace_layout: WorkspaceLayout
     migrated: bool = False
+    #: B-282 —— 留存作业在上一轮之后清过这段会话的工作目录:这一轮给模型一句一次性说明。
+    cleaned: bool = False
 
 
 class OriginalsReleaser(Protocol):
@@ -445,6 +448,13 @@ async def prepare_run_workspace(
     就原样用会话的布局。"""
     if migration is None:
         return PreparedWorkspace(workspace_layout)
-    return await migration.prepare(
+    prepared = await migration.prepare(
         thread_id=thread_id, tenant_id=tenant_id, workspace_layout=workspace_layout
     )
+    try:
+        cleaned = await migration.threads.consume_workspace_cleaned(thread_id, tenant_id=tenant_id)
+    except Exception:
+        # 一句说明而已:查不到就不说,不挡 run。
+        logger.warning("workspace_cleaned.consume_failed thread_id=%s", thread_id, exc_info=True)
+        cleaned = False
+    return dataclasses.replace(prepared, cleaned=cleaned) if cleaned else prepared

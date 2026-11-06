@@ -154,6 +154,7 @@ from orchestrator.multimodal import image_ref_block
 from orchestrator.sse import end_frame_data, format_sse
 from orchestrator.stream_items import STREAM_FORMAT_LEGACY
 from orchestrator.tools.registry import (
+    WORKSPACE_CLEANED_KEY,
     WORKSPACE_LAYOUT_KEY,
     WORKSPACE_MIGRATED_KEY,
     WorkspaceLayout,
@@ -1717,6 +1718,8 @@ async def _start_run(
     configurable[WORKSPACE_LAYOUT_KEY] = workspace_layout
     if prepared.migrated:
         configurable[WORKSPACE_MIGRATED_KEY] = True
+    if prepared.cleaned:
+        configurable[WORKSPACE_CLEANED_KEY] = True
     if built.run_deadline_s > 0:
         configurable["deadline_at"] = time.monotonic() + float(built.run_deadline_s)
     if payload.use_draft:

@@ -52,6 +52,7 @@ def _row_to_record(row: TenantConfigRow) -> TenantConfigRecord:
         event_log_retention_days=row.event_log_retention_days,
         upload_retention_days=row.upload_retention_days,
         artifact_retention_days=row.artifact_retention_days,
+        conversation_workspace_retention_days=row.conversation_workspace_retention_days,
         trigger_fire_scan_mode=cast(TriggerFireScanMode, row.trigger_fire_scan_mode),
         memory_recall_mode=cast(MemoryRecallMode, row.memory_recall_mode),
         skill_stale_days=row.skill_stale_days,

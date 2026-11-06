@@ -255,6 +255,7 @@ from orchestrator.tools.registry import (
     FIGURE_RUN_IDS_KEY,
     TOOL_ALLOWED_STATE_KEYS,
     TURN_ROOT_RUN_KEY,
+    WORKSPACE_CLEANED_KEY,
     WORKSPACE_MIGRATED_KEY,
     Tool,
     ToolContext,
@@ -1193,6 +1194,9 @@ def build_react_graph(
         # 这里再挡一道)。
         if configurable.get(WORKSPACE_MIGRATED_KEY) is True and not configurable.get("child_run"):
             messages = _append_tail_human_message(messages, WORKSPACE_MIGRATION_NOTE)
+        # B-282 —— 留存作业清掉了这段会话闲置的工作目录:同样一次性、只进提示词视图。
+        if configurable.get(WORKSPACE_CLEANED_KEY) is True and not configurable.get("child_run"):
+            messages = _append_tail_human_message(messages, WORKSPACE_CLEANED_NOTE)
         # 两条都有时步数预警在前(B-226 ②)。
         if step_notice is not None:
             messages = _append_tail_human_message(messages, step_notice)
@@ -2584,6 +2588,13 @@ def _after_reflect(state: AgentState) -> Literal["agent", "__end__"]:
 
 
 #: B-262 P3 —— 老对话迁到对话视图的那一轮,平台段里的一次性说明。平台文字,不含任何租户内容。
+WORKSPACE_CLEANED_NOTE = (
+    "[workspace notice] This conversation was idle past the retention period, so the "
+    "files it had written under /workspace were cleaned up. Files saved as artifacts are "
+    "not affected. /workspace has been prepared again as at the start of a conversation; "
+    "if an earlier file is needed, ask the user to upload it again."
+)
+
 WORKSPACE_MIGRATION_NOTE = (
     "[workspace notice] The workspace of this conversation is now per conversation. "
     "Files that were under /workspace in earlier turns are now at the same paths under "

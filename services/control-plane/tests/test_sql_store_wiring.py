@@ -119,3 +119,25 @@ async def test_injected_repo_overrides_sql_backend() -> None:
         assert isinstance(app.state.thread_meta_repo, SqlThreadMetaStore)
     finally:
         await app.state.db_engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_sql_backend_wires_the_conversation_landing_lock() -> None:
+    """B-282 —— 有库时上传落盘拿开场复制那把 advisory lock 的共享形式;没库(内存)时不加锁。"""
+    from control_plane.workspace_lock import PgConversationSeedLock
+
+    app = create_app(
+        settings=_sql_settings(),
+        jwt_verifier=build_test_jwt_verifier(),
+        enable_reaper=False,
+    )
+    try:
+        assert isinstance(app.state.conversation_landing_lock, PgConversationSeedLock)
+    finally:
+        await app.state.db_engine.dispose()
+    memory = create_app(
+        settings=Settings(store_backend="memory"),
+        jwt_verifier=build_test_jwt_verifier(),
+        enable_reaper=False,
+    )
+    assert memory.state.conversation_landing_lock is None

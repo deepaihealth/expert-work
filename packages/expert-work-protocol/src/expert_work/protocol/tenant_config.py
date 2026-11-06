@@ -30,6 +30,7 @@ from expert_work.protocol.provider_catalog import Tool
 
 __all__ = [
     "FILE_RETENTION_DEFAULT_DAYS",
+    "FILE_RETENTION_FIELDS",
     "FILE_RETENTION_MAX_DAYS",
     "FILE_RETENTION_MIN_DAYS",
     "CredentialsMode",
@@ -94,6 +95,12 @@ FILE_RETENTION_MAX_DAYS = 365
 #: 留存作业实际用的是自己的环境变量 ``EXPERT_WORK_RETENTION_{UPLOAD,ARTIFACT}_RETENTION_DAYS``,
 #: **两者必须一致**(作业那边的默认值同样是 90,见 ``retention_cleanup_job/settings.py``)。
 FILE_RETENTION_DEFAULT_DAYS = 90
+#: 按租户可调、「显式 ``null`` = 平台默认」、改小要确认的保留期字段。B-282 加了对话工作目录那一项。
+FILE_RETENTION_FIELDS: tuple[str, ...] = (
+    "upload_retention_days",
+    "artifact_retention_days",
+    "conversation_workspace_retention_days",
+)
 
 # Capability Uplift Sprint #4 — Mini-ADR U-28.
 # Curator threshold bounds. Defaults 30 / 90 derive from external
@@ -168,6 +175,11 @@ class TenantConfigRecord(BaseModel):
         default=None, ge=FILE_RETENTION_MIN_DAYS, le=FILE_RETENTION_MAX_DAYS
     )
     artifact_retention_days: int | None = Field(
+        default=None, ge=FILE_RETENTION_MIN_DAYS, le=FILE_RETENTION_MAX_DAYS
+    )
+    # B-282 —— 对话工作目录(``agents/<key>/threads/<会话>/``)闲置多少天后清掉(天,从会话最后
+    # 一次 run 算起)。``None`` = 平台默认(90)。范围与上面两个相同。
+    conversation_workspace_retention_days: int | None = Field(
         default=None, ge=FILE_RETENTION_MIN_DAYS, le=FILE_RETENTION_MAX_DAYS
     )
     # Capability Uplift Sprint #1 — Mini-ADR U-2.
@@ -286,6 +298,10 @@ class TenantConfigPatch(BaseModel):
     artifact_retention_days: int | None = Field(
         default=None, ge=FILE_RETENTION_MIN_DAYS, le=FILE_RETENTION_MAX_DAYS
     )
+    # B-282 —— 对话工作目录闲置保留期;与上面两个同样「显式 ``null`` = 改回平台默认」。
+    conversation_workspace_retention_days: int | None = Field(
+        default=None, ge=FILE_RETENTION_MIN_DAYS, le=FILE_RETENTION_MAX_DAYS
+    )
     # Capability Uplift Sprint #1 — Mini-ADR U-2.
     trigger_fire_scan_mode: TriggerFireScanMode | None = None
     # Capability Uplift Sprint #6 — Mini-ADR U-5.
@@ -350,10 +366,10 @@ class TenantConfigPatch(BaseModel):
         return out
 
     def retention_updates(self) -> dict[str, int | None]:
-        """B-63 —— 这个 patch 对两个保留期字段的改动:键在 ``model_fields_set`` 里才算(显式
-        ``null`` → ``None`` = 改回平台默认);没传的键不出现。"""
+        """B-63 —— 这个 patch 对保留期字段(:data:`FILE_RETENTION_FIELDS`)的改动:键在
+        ``model_fields_set`` 里才算(显式 ``null`` → ``None`` = 改回平台默认);没传的键不出现。"""
         return {
             name: getattr(self, name)
-            for name in ("upload_retention_days", "artifact_retention_days")
+            for name in FILE_RETENTION_FIELDS
             if name in self.model_fields_set
         }

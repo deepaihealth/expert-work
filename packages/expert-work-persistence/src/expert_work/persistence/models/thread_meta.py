@@ -40,6 +40,17 @@ class ThreadMetaRow(Base):
     # 发布前的行与滚动发布期间老 pod 建的行都是老视图;新代码在唯一的建行处
     # (``SqlThreadMetaStore.create``)显式写 ``conversation``。
     workspace_layout: Mapped[str] = mapped_column(Text, nullable=False, server_default="agent_root")
+    #: B-282 (migration 0186) —— 留存作业最后一次把这个会话的工作目录(对话目录、它的
+    #: ``.tool_results/<run>``)清掉的时间。NULL = 没清过。会话之后又有 run 的,按新的闲置
+    #: 时间再清一次。只有留存作业写它,不进 ``ThreadMeta``。
+    workspace_cleaned_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    #: B-282 —— 留存作业上一次列到这段会话却没清(再查有活动、删失败……)的时间。下一轮按它把
+    #: 清不了的会话排到后面。只有留存作业写它。
+    workspace_clean_attempted_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         nullable=False,

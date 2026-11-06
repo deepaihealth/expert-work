@@ -587,3 +587,29 @@ async def test_no_release_when_the_migration_failed(world: _World) -> None:
     assert prepared.migrated is False
     await asyncio.gather(*world.migration._background)
     assert releaser.calls == []
+
+
+async def test_the_first_run_after_a_workspace_cleanup_gets_the_note_once(world: _World) -> None:
+    """B-282 —— 留存作业清过这段会话闲置的工作目录:下一轮起 run 时说一次,再下一轮不说。"""
+    tid = await world.thread()
+    world.threads.mark_workspace_cleaned(tid)
+
+    first = await world.prepare(tid)
+    second = await world.prepare(tid)
+
+    assert (first.cleaned, second.cleaned) == (True, False)
+
+
+async def test_a_failing_cleanup_lookup_does_not_block_the_run(
+    world: _World, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    tid = await world.thread()
+
+    async def _down(*_a: object, **_k: object) -> bool:
+        raise RuntimeError("db down")
+
+    monkeypatch.setattr(world.threads, "consume_workspace_cleaned", _down)
+
+    prepared = await world.prepare(tid)
+
+    assert prepared.cleaned is False

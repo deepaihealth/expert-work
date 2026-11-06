@@ -79,6 +79,7 @@ function recordToPatchJson(record: TenantConfigRecord): string {
     // B-63 — ``null`` = platform default; sending it back keeps it that way.
     upload_retention_days: record.upload_retention_days,
     artifact_retention_days: record.artifact_retention_days,
+    conversation_workspace_retention_days: record.conversation_workspace_retention_days,
     // Sprint #4 (Mini-ADR U-28) — Curator thresholds round-trip
     // through the same JSON-edit surface as the rest of tenant_config.
     skill_stale_days: record.skill_stale_days,
@@ -323,6 +324,15 @@ export function SettingsTenantConfig() {
             <dt style={{ color: "var(--ew-text-tertiary)" }}>{t("settings_ops.artifact_retention_days")}</dt>
             <dd style={{ margin: 0 }} data-testid="tenant-config-artifact-retention-days">
               {record.artifact_retention_days ?? t("settings_ops.file_retention_default")}
+            </dd>
+            {/* B-282 — idle conversations lose their work directory after this many
+                days; ``null`` = platform default. */}
+            <dt style={{ color: "var(--ew-text-tertiary)" }}>
+              {t("settings_ops.conversation_workspace_retention_days")}
+            </dt>
+            <dd style={{ margin: 0 }} data-testid="tenant-config-conversation-workspace-retention-days">
+              {record.conversation_workspace_retention_days ??
+                t("settings_ops.file_retention_default")}
             </dd>
             {/* Stream C.6 — per-tenant rate limit. Read-only here; edit via the
                 JSON editor: "rate_limit_override": {"requests_per_minute": N}. */}

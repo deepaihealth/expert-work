@@ -39,6 +39,9 @@ WORKSPACE_THREAD_ID_KEY = "workspace_thread_id"
 #: platform_migration``):这一轮的平台段给模型一句一次性说明。只有起新 run 的入口写它;
 #: ``_child_config`` 不往子代传。
 WORKSPACE_MIGRATED_KEY = "workspace_migrated"
+#: B-282 —— 留存作业在上一轮之后清掉了这段会话闲置的工作目录:这一轮的平台段给模型一句一次性
+#: 说明。只有起新 run 的入口写它;``_child_config`` 不往子代传。
+WORKSPACE_CLEANED_KEY = "workspace_cleaned"
 #: B-262 —— ``_child_run._child_config`` 给子代写父对话渲染过页的 run(见
 #: :attr:`ToolContext.figure_run_ids`)。
 FIGURE_RUN_IDS_KEY = "figure_run_ids"

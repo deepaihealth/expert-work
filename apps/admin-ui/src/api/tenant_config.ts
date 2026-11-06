@@ -44,6 +44,9 @@ export interface TenantConfigRecord {
    *  whichever is latest). Range [7, 365]; ``null`` = platform default (90). */
   upload_retention_days: number | null;
   artifact_retention_days: number | null;
+  /** B-282 — days a conversation's work directory survives after its last run.
+   *  Range [7, 365]; ``null`` = platform default (90). */
+  conversation_workspace_retention_days: number | null;
   /** Sprint #4 (Mini-ADR U-28) — Curator thresholds.
    *  ``skill_stale_days`` default 30, range [1, 365].
    *  ``skill_archive_days`` default 90, range [2, 730], and must be
@@ -81,6 +84,7 @@ export interface TenantConfigPatchBody {
   /** B-63 — ``null`` resets to the platform default; omit the key to leave it. */
   upload_retention_days?: number | null;
   artifact_retention_days?: number | null;
+  conversation_workspace_retention_days?: number | null;
   skill_stale_days?: number;
   skill_archive_days?: number;
   skill_evolution_enabled?: boolean;
@@ -122,7 +126,11 @@ export function retentionDecreases(
   record: TenantConfigRecord,
   patch: TenantConfigPatchBody,
 ): { field: string; from: number; to: number }[] {
-  const fields = ["upload_retention_days", "artifact_retention_days"] as const;
+  const fields = [
+    "upload_retention_days",
+    "artifact_retention_days",
+    "conversation_workspace_retention_days",
+  ] as const;
   const out: { field: string; from: number; to: number }[] = [];
   for (const field of fields) {
     if (!(field in patch)) continue;

@@ -183,3 +183,22 @@ class PgConversationSeedLock:
                 {"classid": CONVERSATION_SEED_LOCK_CLASSID, "k": key},
             )
             yield
+
+    @asynccontextmanager
+    async def acquire_shared(self, *, key: str) -> AsyncIterator[None]:
+        """B-282 —— 同一把锁的**共享**形式,给上传落盘用(``api.uploads._land_and_account``)。
+
+        落盘之间互不挡;留存作业清闲置会话目录时拿排他的那一种(``retention_cleanup_job.
+        conversation_dirs``):持着时落盘在这里等,落盘进行中它在那边等 —— 一份落盘要么在它再查
+        之前做完(登记行 / 审计已经写好,再查看得到、会话不清),要么在目录挪走之后才写(落进新
+        目录)。"""
+        async with self.session_factory() as session, session.begin():
+            await session.execute(
+                text(f"SET LOCAL idle_in_transaction_session_timeout = {_LOCK_TXN_TIMEOUT_MS}")
+            )
+            await session.execute(text(f"SET LOCAL statement_timeout = {_LOCK_TXN_TIMEOUT_MS}"))
+            await session.execute(
+                text("SELECT pg_advisory_xact_lock_shared(:classid, hashtext(:k))"),
+                {"classid": CONVERSATION_SEED_LOCK_CLASSID, "k": key},
+            )
+            yield

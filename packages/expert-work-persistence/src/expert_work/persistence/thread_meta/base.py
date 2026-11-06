@@ -275,6 +275,13 @@ class ThreadMetaStore(abc.ABC):
         """
 
     @abc.abstractmethod
+    async def consume_workspace_cleaned(self, thread_id: UUID, *, tenant_id: UUID) -> bool:
+        """B-282 —— 留存作业清过这段会话的工作目录(``workspace_cleaned_at`` 有值)就把它清回空、
+        返回 ``True``:起新 run 的入口据此给模型一句一次性说明。比较再交换,只有一个调用方拿到
+        ``True``;``updated_at`` 不动(这一笔不是会话本身的变化)。清回空之后这段会话照常按新的
+        闲置时间再算到期。"""
+
+    @abc.abstractmethod
     async def check_access(self, thread_id: UUID, tenant_id: UUID) -> bool:
         """``True`` iff the thread exists and belongs to ``tenant_id``."""
 

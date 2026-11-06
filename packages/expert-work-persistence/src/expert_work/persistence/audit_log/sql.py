@@ -131,7 +131,7 @@ class SqlAuditLogStore(AuditLogStore):
         tenant_id: UUID,
         thread_ids: Collection[UUID],
         since: datetime,
-        until: datetime,
+        until: datetime | None = None,
     ) -> list[AuditEntry]:
         # 同 ``list_document_uploads_for_thread``:``audit_log_action_idx`` 收住租户、动作、
         # 时间窗,``details->>'thread_id'`` 在那批行上过滤。
@@ -145,11 +145,12 @@ class SqlAuditLogStore(AuditLogStore):
                 AuditLogRow.action == AuditAction.DOCUMENT_UPLOAD.value,
                 AuditLogRow.result == AuditResult.SUCCESS.value,
                 AuditLogRow.occurred_at >= since,
-                AuditLogRow.occurred_at <= until,
                 AuditLogRow.details["thread_id"].astext.in_(wanted),
             )
             .order_by(AuditLogRow.id.asc())
         )
+        if until is not None:
+            stmt = stmt.where(AuditLogRow.occurred_at <= until)
         async with self._sf() as session:
             rows = list((await session.execute(stmt)).scalars().all())
         return [_row_to_entry(r) for r in rows]

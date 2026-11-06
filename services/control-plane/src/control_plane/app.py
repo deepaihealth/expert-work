@@ -2913,6 +2913,15 @@ def create_app(
     app.state.knowledge_profile_refresh_worker = None
     app.state.sandbox_runtime = resolved_sandbox_runtime
     app.state.workspace_store = resolved_workspace_store
+    # B-282 —— 上传落盘按会话拿开场复制锁的共享形式(留存作业清闲置会话目录时拿排他的那种)。
+    app.state.conversation_landing_lock = (
+        PgConversationSeedLock(create_async_session_factory(sql_stores.engine))
+        if sql_stores is not None
+        else None
+    )
+    if sql_stores is not None and app.state.conversation_landing_lock is None:
+        # 有库却没有落盘锁:留存作业清闲置会话目录时,同时落盘的上传可能被一起挪走。
+        logger.warning("control_plane.conversation_landing_lock_missing")
     app.state.artifact_snapshots = resolved_artifact_snapshots
     # B-236 第三层 —— 清除用户时连同 /agent 文件的历史版本一起删(``purge_user``)。
     app.state.agent_file_versions = resolved_agent_runtime.agent_file_versions

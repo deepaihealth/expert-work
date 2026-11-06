@@ -21,6 +21,7 @@ import logging
 import re
 import zipfile
 from collections.abc import Mapping, Sequence
+from contextlib import AbstractAsyncContextManager, nullcontext
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import PurePosixPath
@@ -550,6 +551,7 @@ async def _handle_document_upload(
             audit=audit,
             actor_id=getattr(request.state, "actor_id", "anonymous"),
             quota_service=getattr(request.app.state, "workspace_quota_service", None),
+            landing_lock=getattr(request.app.state, "conversation_landing_lock", None),
         ),
         tenant_id=tenant_id,
         user_id=caller_user_id,
@@ -576,6 +578,9 @@ class LandingAccount:
     audit: AuditLogger
     actor_id: str
     quota_service: Any = None
+    #: B-282 —— 按会话的落盘锁(``PgConversationSeedLock``,用它的 ``acquire_shared``);
+    #: 没接线(无库部署)为 ``None``,不加锁。
+    landing_lock: Any = None
 
     @classmethod
     def from_request(cls, request: Request) -> LandingAccount:
@@ -585,7 +590,18 @@ class LandingAccount:
             audit=state.audit_logger,
             actor_id=getattr(request.state, "actor_id", "anonymous"),
             quota_service=getattr(state, "workspace_quota_service", None),
+            landing_lock=getattr(state, "conversation_landing_lock", None),
         )
+
+
+def _landing_lock(
+    account: LandingAccount, *, tenant_id: UUID, thread_id: UUID
+) -> AbstractAsyncContextManager[None]:
+    lock = account.landing_lock
+    if lock is None:
+        return nullcontext()
+    cm: AbstractAsyncContextManager[None] = lock.acquire_shared(key=f"{tenant_id}:{thread_id}")
+    return cm
 
 
 async def _land_and_account(
@@ -609,82 +625,85 @@ async def _land_and_account(
     """
     if account.workspace_store is None:
         raise HTTPException(status_code=503, detail="document upload unavailable: no sandbox")
-    quota_service = account.quota_service
-    if quota_service is not None:
+    # B-282 —— 落盘到审计写完都持着这段会话落盘锁的共享形式:留存作业清闲置会话目录时拿排他
+    # 的那一种,两者不交叉(见 ``PgConversationSeedLock.acquire_shared``)。
+    async with _landing_lock(account, tenant_id=tenant_id, thread_id=thread_id):
+        quota_service = account.quota_service
+        if quota_service is not None:
+            try:
+                # 闸 B(spec § 3.3):写完会超就拦(+incoming >)。与闸 A 的
+                # >= 谓词刻意不同 —— 上传知道 incoming 大小,acquire 不知道。
+                await quota_service.check_upload(
+                    tenant_id=tenant_id, user_id=user_id, incoming_bytes=len(raw)
+                )
+            except WorkspaceQuotaExceededError as exc:
+                # 固定文案不插值异常对象(本文件既有约定);429 与 supervisor 时代的
+                # quota 语义一致。给用户留了自救路:删文件永远放行。
+                logger.warning("upload.workspace_quota_exceeded")
+                raise HTTPException(
+                    status_code=429,
+                    detail="workspace is full — delete files to free space",
+                ) from exc
+
+        # ``workspace_path`` 是**对会话 ``/workspace`` 相对**的 ``uploads/<name>``——它同时是
+        # 回给调用方的 ``upload_id``,也是 run 里 ``read_document`` 收到的参数,两处都相对
+        # 这个会话的 ``/workspace`` 解析(老视图是 agent 根,B-262 起对话视图是本对话的
+        # ``work/``,由 ``conv_id`` 决定),所以这个值不带前缀。
+        #
+        # 落盘要投影:``workspace_store`` 是按 ``(tenant, user)`` 开的,不知道
+        # agent。不投影的话新上传永远落扁平根,而 run 去 agent 根下找——今天靠
+        # 迁移期读回落兜着,Task 14 摘掉回落就断(B-50 补漏)。
+        #
+        # B-262 —— 名字不一定是用户给的那个:同名已被别的内容占了就换名(见
+        # ``_land_document_bytes``)。下面回给调用方、写审计、进 run 的一律是实际落盘的名字。
+        sha256_hex = hashlib.sha256(raw).hexdigest()
         try:
-            # 闸 B(spec § 3.3):写完会超就拦(+incoming >)。与闸 A 的
-            # >= 谓词刻意不同 —— 上传知道 incoming 大小,acquire 不知道。
-            await quota_service.check_upload(
-                tenant_id=tenant_id, user_id=user_id, incoming_bytes=len(raw)
+            landed, reused = await _land_document_bytes(
+                account.workspace_store,
+                tenant_id=tenant_id,
+                user_id=user_id,
+                agent_key=agent_key,
+                conv_id=conv_id,
+                workspace_path=workspace_path,
+                ext=ext,
+                raw=raw,
+                sha256_hex=sha256_hex,
             )
-        except WorkspaceQuotaExceededError as exc:
-            # 固定文案不插值异常对象(本文件既有约定);429 与 supervisor 时代的
-            # quota 语义一致。给用户留了自救路:删文件永远放行。
-            logger.warning("upload.workspace_quota_exceeded")
-            raise HTTPException(
-                status_code=429,
-                detail="workspace is full — delete files to free space",
-            ) from exc
+        except WorkspacePermissionError as exc:
+            # 权限失败是服务端配置问题(共享 uid 没配上/存量目录属主没迁移/mode 不
+            # 对),不是笼统的"上游写失败"——必须排在下面的 SandboxSupervisorError
+            # 之前(它的子类,顺序反了这一分支永远走不到,同六处 workspace 端点的
+            # 坑)。500(而非下面的 502)与那六处的约定一致:服务端配置问题不该被
+            # 当成"上游 502"。detail 是固定文案,不插值异常对象:store 的消息里带
+            # 工作区相对路径,Task A 已经把它从绝对路径/uid/mode 里 scrub 掉了,但
+            # 这里原样 f"...: {exc}" 会把 store 消息原封不动地 echo 回响应体,等于
+            # 白 scrub。
+            logger.warning("upload.write_permission_denied", exc_info=True)
+            raise HTTPException(status_code=500, detail="workspace write failed") from exc
+        except SandboxSupervisorError as exc:
+            # 同上——固定文案,不插值异常对象;诊断细节只进下面这条结构化日志。
+            logger.warning("upload.write_failed", exc_info=True)
+            raise HTTPException(status_code=502, detail="workspace write failed") from exc
 
-    # ``workspace_path`` 是**对会话 ``/workspace`` 相对**的 ``uploads/<name>``——它同时是
-    # 回给调用方的 ``upload_id``,也是 run 里 ``read_document`` 收到的参数,两处都相对
-    # 这个会话的 ``/workspace`` 解析(老视图是 agent 根,B-262 起对话视图是本对话的
-    # ``work/``,由 ``conv_id`` 决定),所以这个值不带前缀。
-    #
-    # 落盘要投影:``workspace_store`` 是按 ``(tenant, user)`` 开的,不知道
-    # agent。不投影的话新上传永远落扁平根,而 run 去 agent 根下找——今天靠
-    # 迁移期读回落兜着,Task 14 摘掉回落就断(B-50 补漏)。
-    #
-    # B-262 —— 名字不一定是用户给的那个:同名已被别的内容占了就换名(见
-    # ``_land_document_bytes``)。下面回给调用方、写审计、进 run 的一律是实际落盘的名字。
-    sha256_hex = hashlib.sha256(raw).hexdigest()
-    try:
-        landed, reused = await _land_document_bytes(
-            account.workspace_store,
+        await audit_emit(
+            account.audit,
             tenant_id=tenant_id,
-            user_id=user_id,
-            agent_key=agent_key,
-            conv_id=conv_id,
-            workspace_path=workspace_path,
-            ext=ext,
-            raw=raw,
-            sha256_hex=sha256_hex,
+            actor_id=account.actor_id,
+            action=AuditAction.DOCUMENT_UPLOAD,
+            resource_type="user_workspace",
+            resource_id=landed,
+            result=AuditResult.SUCCESS,
+            trace_id=current_trace_id_hex(),
+            details={
+                "thread_id": str(thread_id),
+                "workspace_path": landed,
+                "file_size_bytes": len(raw),
+                "mime_type": content_type,
+                "sha256": sha256_hex,
+                "reused_existing": reused,
+                **dict(extra_details or {}),
+            },
         )
-    except WorkspacePermissionError as exc:
-        # 权限失败是服务端配置问题(共享 uid 没配上/存量目录属主没迁移/mode 不
-        # 对),不是笼统的"上游写失败"——必须排在下面的 SandboxSupervisorError
-        # 之前(它的子类,顺序反了这一分支永远走不到,同六处 workspace 端点的
-        # 坑)。500(而非下面的 502)与那六处的约定一致:服务端配置问题不该被
-        # 当成"上游 502"。detail 是固定文案,不插值异常对象:store 的消息里带
-        # 工作区相对路径,Task A 已经把它从绝对路径/uid/mode 里 scrub 掉了,但
-        # 这里原样 f"...: {exc}" 会把 store 消息原封不动地 echo 回响应体,等于
-        # 白 scrub。
-        logger.warning("upload.write_permission_denied", exc_info=True)
-        raise HTTPException(status_code=500, detail="workspace write failed") from exc
-    except SandboxSupervisorError as exc:
-        # 同上——固定文案,不插值异常对象;诊断细节只进下面这条结构化日志。
-        logger.warning("upload.write_failed", exc_info=True)
-        raise HTTPException(status_code=502, detail="workspace write failed") from exc
-
-    await audit_emit(
-        account.audit,
-        tenant_id=tenant_id,
-        actor_id=account.actor_id,
-        action=AuditAction.DOCUMENT_UPLOAD,
-        resource_type="user_workspace",
-        resource_id=landed,
-        result=AuditResult.SUCCESS,
-        trace_id=current_trace_id_hex(),
-        details={
-            "thread_id": str(thread_id),
-            "workspace_path": landed,
-            "file_size_bytes": len(raw),
-            "mime_type": content_type,
-            "sha256": sha256_hex,
-            "reused_existing": reused,
-            **dict(extra_details or {}),
-        },
-    )
     if quota_service is not None and not reused:
         # 记账第 1 层(spec § 3.2):增量入账,便宜且即时。B-262 起上传不再覆盖
         # 同名文件;复用已有文件时没写字节,不记账。写已成功、

@@ -88,6 +88,7 @@ def test_knowledge_retrieval_log_retention_rejects_zero(monkeypatch: pytest.Monk
     [
         "EXPERT_WORK_RETENTION_UPLOAD_RETENTION_DAYS",
         "EXPERT_WORK_RETENTION_ARTIFACT_RETENTION_DAYS",
+        "EXPERT_WORK_RETENTION_CONVERSATION_WORKSPACE_RETENTION_DAYS",
     ],
 )
 def test_file_retention_above_one_year_is_clamped_not_refused(
@@ -130,6 +131,7 @@ def test_clamped_retention_is_logged_as_a_warning(
     [
         "EXPERT_WORK_RETENTION_UPLOAD_RETENTION_DAYS",
         "EXPERT_WORK_RETENTION_ARTIFACT_RETENTION_DAYS",
+        "EXPERT_WORK_RETENTION_CONVERSATION_WORKSPACE_RETENTION_DAYS",
     ],
 )
 def test_file_retention_below_a_week_is_raised_to_seven_not_refused(
@@ -160,3 +162,12 @@ def test_the_retired_image_retention_env_is_ignored_with_a_warning(
     warn_retired_image_retention(RetentionCleanupSettings(_env_file=None))  # type: ignore[call-arg]
     assert "image_retention_days_ignored" not in caplog.text
     assert unset.image_retention_days == 180
+
+
+def test_conversation_workspace_defaults_to_90_days_and_500_per_run() -> None:
+    """B-282 —— 平台默认 90 天(与协议的 ``FILE_RETENTION_DEFAULT_DAYS`` 一致),每轮 500 段。"""
+    from expert_work.protocol import FILE_RETENTION_DEFAULT_DAYS
+
+    settings = RetentionCleanupSettings(_env_file=None)  # type: ignore[call-arg]
+    assert settings.conversation_workspace_retention_days == FILE_RETENTION_DEFAULT_DAYS
+    assert settings.conversation_workspace_batch_size == 500
