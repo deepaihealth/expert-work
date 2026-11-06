@@ -1,5 +1,9 @@
 """B-271 —— 上传 90 天这一条规则的本体(:meth:`RetentionCleanupJob._sweep_uploads` 调它)。
 
+B-63 起「到期」按**最后使用**算:``created_at`` / ``last_used_at`` / 会话最后一次 run 三者最晚的
+那个,加上租户的保留期(``tenant_config.upload_retention_days``,没设用平台默认);谓词在
+:meth:`UserUploadStore.list_expired`,这里只处理它列出来的行。
+
 每条到期的文档类行:按登记行那条会话**当前**的 agent 与布局算出真实路径
 (:func:`~retention_cleanup_job.workspace_files.upload_relpath`),核对后删文件;行一律软删
 (对用户的到期语义不变)。下面几种情况**不删文件**,行照样软删:
@@ -7,8 +11,9 @@
 * 会话不在了 —— 算不出路径。对话视图的目录随会话 purge 走;**老视图的文件在 agent 共用的
   ``agents/<key>/uploads/`` 里,purge 不删它,这里也不删,留在那里**(无从判断还有没有别的
   会话在用)。
-* 还有别的没到期、没删的行按它自己会话的布局解析到同一个文件(老视图同一 agent 的各对话共用
-  ``uploads/``,同名同内容复用)。删之前再查一次,收窄与同内容重传插行之间的竞态。
+* 还有别的没到期(同一个最后使用时钟)、没删的行按它自己会话的布局解析到同一个文件(老视图
+  同一 agent 的各对话共用 ``uploads/``,同名同内容复用)。删之前再查一次,收窄与同内容重传
+  插行之间的竞态。
 * 文件与登记时不一致(大小;有 sha256 时还比内容)—— 上传后在会话里被改写过。没有 sha256 的
   老行,先按同一会话、同名、同大小、时间贴着登记行的 ``DOCUMENT_UPLOAD`` 审计行补 sha256
   (唯一一个值才用),找不到就只比大小。
@@ -43,7 +48,7 @@ from uuid import UUID
 
 from expert_work.persistence.audit_log import AuditLogStore
 from expert_work.persistence.thread_meta import ThreadMetaStore
-from expert_work.persistence.user_upload import UserUploadStore
+from expert_work.persistence.user_upload import ExpiredUpload, UserUploadStore
 from expert_work.persistence.workspace.layout import WORKSPACE_UPLOADS_DIR
 from expert_work.protocol import ThreadMeta, UserUpload
 from retention_cleanup_job.workspace_files import (
@@ -61,7 +66,9 @@ logger = logging.getLogger(__name__)
 _AUDIT_BEFORE = timedelta(minutes=10)
 _AUDIT_AFTER = timedelta(minutes=1)
 
-#: 过了到期日还连着暂时性失败这么久,就不再等:行软删,文件不动(计数)。
+#: 过了到期日还连着暂时性失败这么久,就不再等:行软删,文件不动(计数)。B-63 —— 从
+#: ``ExpiredUpload.give_up_from`` 算(到期日与租户配置最后一次改动里较晚的那个),租户刚把天数
+#: 改小时不会第一次失败就放弃。
 _GIVE_UP_AFTER = timedelta(days=7)
 #: 一次绑定多少个 id(``IN (...)`` 每个元素一个绑定参数,Postgres 上限 32767)。
 _IN_CHUNK = 5000
@@ -130,11 +137,20 @@ class UploadSweepTally:
     owners_unavailable: int = 0
     #: 因为属主目录打不开而跳过的行。
     rows_owner_skipped: int = 0
+    #: B-63 —— 这一轮暂时失败、而且已经过了到期日 :data:`_GIVE_UP_AFTER` 的行(放弃被租户配置
+    #: 改动推迟着,所以还在重试)。计在 ``rows_failed`` 里,另外单独数,好让人去看。
+    rows_failing_overdue: int = 0
 
     @property
     def needs_attention(self) -> bool:
-        """有行被放弃、被熔断拦下,或有用户的目录打不开 —— 调用方把这个 pass 记成失败,让人去看。"""
-        return self.rows_abandoned > 0 or self.rows_held > 0 or self.owners_unavailable > 0
+        """有行被放弃、被熔断拦下、有用户的目录打不开,或有行过了到期日 7 天还在失败 —— 调用方把
+        这个 pass 记成失败(进程非 0 退出、告警会响),让人去看。"""
+        return (
+            self.rows_abandoned > 0
+            or self.rows_held > 0
+            or self.owners_unavailable > 0
+            or self.rows_failing_overdue > 0
+        )
 
 
 def _chunks(ids: Iterable[UUID]) -> Iterator[list[UUID]]:
@@ -158,9 +174,12 @@ class UploadSweep:
         uploads: UserUploadStore,
         threads: ThreadMetaStore,
         root: str,
+        default_days: int,
         audit: AuditLogStore | None = None,
     ) -> None:
         self._uploads = uploads
+        #: 租户没设 ``upload_retention_days`` 时的保留期;引用检查判「没到期」用同一个时钟。
+        self._default_days = default_days
         self._threads = threads
         self._root = root
         self._audit = audit
@@ -169,10 +188,8 @@ class UploadSweep:
         self.tally = UploadSweepTally()
         self._bad_owners: set[_OwnerKey] = set()
 
-    async def run(
-        self, expired: list[UserUpload], *, cutoff: datetime, now: datetime
-    ) -> UploadSweepTally:
-        docs = [r for r in expired if _is_document(r)]
+    async def run(self, expired: list[ExpiredUpload], *, now: datetime) -> UploadSweepTally:
+        docs = [e.upload for e in expired if _is_document(e.upload)]
         await self._load_threads((r.tenant_id, r.thread_id) for r in docs)
         try:
             audited = await self._audited_sha256s([r for r in docs if r.sha256 is None])
@@ -183,12 +200,13 @@ class UploadSweep:
         tally = self.tally
         giving_up: list[tuple[UserUpload, _GiveUp]] = []
         failures: dict[str, _FailureClass] = {}
-        for row in expired:
+        for entry in expired:
+            row = entry.upload
             if (row.tenant_id, row.user_id) in self._bad_owners and _is_document(row):
                 tally.rows_owner_skipped += 1
                 continue
             try:
-                if await self._release(row, audited.get(row.id, row.sha256), cutoff, tally):
+                if await self._release(row, audited.get(row.id, row.sha256), now, tally):
                     await self._mark(row, now, tally)
                 else:
                     giving_up.append((row, "unsafe"))
@@ -197,9 +215,11 @@ class UploadSweep:
             except WorkspaceOwnerUnavailableError:
                 self._owner_unavailable(row)
             except Exception as exc:
-                if row.created_at >= cutoff - _GIVE_UP_AFTER:
+                if entry.give_up_from >= now - _GIVE_UP_AFTER:
                     _note_failure(failures, row, exc)
                     tally.rows_failed += 1
+                    if entry.expires_at < now - _GIVE_UP_AFTER:
+                        tally.rows_failing_overdue += 1
                 else:
                     logger.warning(
                         "retention.upload_row_abandoning upload_id=%s error=%s",
@@ -230,14 +250,14 @@ class UploadSweep:
             raise WorkspaceRootUnavailableError(msg)
 
     async def _release(
-        self, row: UserUpload, sha256: str | None, cutoff: datetime, tally: UploadSweepTally
+        self, row: UserUpload, sha256: str | None, now: datetime, tally: UploadSweepTally
     ) -> bool:
         """文件那一半。``True`` → 照常到期(文件删了 / 不该删 / 本来不在);``False`` → 路径不可用,
         进「放弃」清单,等全批看完再由熔断决定标不标。"""
         if not _is_document(row):
             return True
         try:
-            removed = await self._release_file(row, sha256, cutoff)
+            removed = await self._release_file(row, sha256, now)
         except UnsafeWorkspacePathError:
             logger.warning("retention.upload_path_unusable upload_id=%s", row.id)
             return False
@@ -281,13 +301,13 @@ class UploadSweep:
                 )
                 tally.rows_failed += 1
 
-    async def _release_file(self, row: UserUpload, sha256: str | None, cutoff: datetime) -> bool:
+    async def _release_file(self, row: UserUpload, sha256: str | None, now: datetime) -> bool:
         meta = self._metas.get((row.tenant_id, row.thread_id))
         if meta is None:
             logger.info("retention.upload_thread_gone upload_id=%s", row.id)
             return False
         relpath = upload_relpath(row.ref, meta)
-        if await self._still_referenced(row, relpath, cutoff):
+        if await self._still_referenced(row, relpath, now):
             return False
         opened = await asyncio.to_thread(
             open_upload_file,
@@ -304,7 +324,7 @@ class UploadSweep:
                     logger.info("retention.upload_file_changed_kept upload_id=%s", row.id)
                 return False
             # 核对之后、删之前再查一次:同内容重传刚插的行要能留住文件。
-            if await self._still_referenced(row, relpath, cutoff):
+            if await self._still_referenced(row, relpath, now):
                 return False
             outcome = await asyncio.to_thread(opened.unlink)
         finally:
@@ -313,8 +333,9 @@ class UploadSweep:
             logger.info("retention.upload_file_replaced_kept upload_id=%s", row.id)
         return outcome == "removed"
 
-    async def _still_referenced(self, row: UserUpload, relpath: str, cutoff: datetime) -> bool:
-        """别的没到期、没删的登记行按**它自己**会话的布局解析到 ``relpath`` 吗。
+    async def _still_referenced(self, row: UserUpload, relpath: str, now: datetime) -> bool:
+        """别的没到期(B-63:同一个最后使用时钟)、没删的登记行按**它自己**会话的布局解析到
+        ``relpath`` 吗。
 
         ``ref`` 恒是 ``uploads/<一段名字>``,不同 ``ref`` 拼不出同一个路径,所以候选只需同租户、
         同用户、同 ``ref`` 的行;同 ``ref`` 但落在别处(另一条是对话视图)的不算,会话已不在的
@@ -322,10 +343,14 @@ class UploadSweep:
         """
         candidates = [
             other
-            for other in await self._uploads.list_active_by_ref(
-                tenant_id=row.tenant_id, user_id=row.user_id, ref=row.ref
+            for other in await self._uploads.list_unexpired_by_ref(
+                tenant_id=row.tenant_id,
+                user_id=row.user_id,
+                ref=row.ref,
+                now=now,
+                default_days=self._default_days,
             )
-            if other.id != row.id and other.created_at >= cutoff
+            if other.id != row.id
         ]
         await self._load_threads((c.tenant_id, c.thread_id) for c in candidates)
         for other in candidates:

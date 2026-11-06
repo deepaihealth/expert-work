@@ -30,7 +30,7 @@
 | [`TENANT_SUSPENDED`](#_8-5-403-权限不足或被阻断) | 403 | 全部端点 | 租户已被暂停。联系租户管理员 |
 | [`AGENT_NOT_FOUND`](#_8-6-404-目标不存在) | 404 | 发起对话 / 提前获取 session_id / 上传附件 / 审批决策 | `agent_code` 在本租户下没有已发布的版本。核对 `agent_code` 的拼写与发布状态 |
 | [`SESSION_NOT_FOUND`](#_8-6-404-目标不存在) | 404 | 发起对话 / 提前获取 session_id / 上传附件 / 历史消息 / 重命名会话 / 归档会话 / run 列表 | `session_id` 不存在，或不属于这个 `user_id` 与 `agent_code`。核对三者是否匹配 |
-| [`UPLOAD_NOT_FOUND`](#_8-6-404-目标不存在) | 404 | 发起对话 / 附件下载 | 附件不存在、不属于这个 `user_id`、已被删除，或内容已被回收。核对 `upload_id` 与 `user_id`，图片还要核对 `session_id` |
+| [`UPLOAD_NOT_FOUND`](#_8-6-404-目标不存在) | 404 | 发起对话 / 附件下载 | 附件不存在、不属于这个 `user_id`、已被删除、超过保留期已被清理，或内容已被回收。核对 `upload_id` 与 `user_id`，图片还要核对 `session_id`；超过保留期的需要重新上传 |
 | [`UPLOAD_SESSION_DELETED`](#_8-6-404-目标不存在) | 404 | 发起对话 / 编辑重发 | `files[]` 里的文档是在别的会话里上传的，那段会话已被删除。重新上传这份文档 |
 | [`WORKSPACE_FILE_FAILED`](#_8-6-404-目标不存在) | 404 | 工作区文件下载 | `user_id` 未被识别，或该路径下没有文件。核对 `user_id` 与 `path` |
 | [`RUN_NOT_FOUND`](./run-control#_4-1-取消-run) | 404 | 取消 run / 审批决策 / 事件接口 / 打分 / 重新生成 / 编辑重发 / run 用量 | `run_id` 不存在，或不属于这个 `user_id` 与 `agent_code`。核对三者是否匹配，不要当作「run 尚未创建」重试 |
@@ -198,7 +198,7 @@
 
 `UPLOAD_NOT_FOUND`：附件没有找到。两个入口会返回它——发起对话请求体 `files[]` 里的 `upload_id`，以及附件下载接口 `GET /v1/agents/{agent_code}/uploads/{upload_id}` 的路径参数。具体触发条件按入口有区别：
 
-- 两个入口都会触发：`upload_id` 查不到；查到了但不属于这个 `user_id`；附件已被删除。
+- 两个入口都会触发：`upload_id` 查不到；查到了但不属于这个 `user_id`；附件已被删除，或超过保留期已被清理（见 [2.6 附件的保留期](./chat#附件的保留期)）。
 - 只有发起对话会触发：`files[]` 里的图片还要求属于本次请求最终绑定的那段会话（`session_id`），不属于同样返回这个 404。附件下载接口没有 `session_id` 参数，不做这项检查；文档类附件也没有这条限制。
 - 只有附件下载会触发：附件的记录还在、也确实属于这个 `user_id`，但内容已经被回收，`error.message` 为 `"upload content not found"`，错误码与状态码不变。
 - 发起对话引用别的会话上传的文档时，原会话里已经找不到这份文件，`error.message` 同样为 `"upload content not found"`。

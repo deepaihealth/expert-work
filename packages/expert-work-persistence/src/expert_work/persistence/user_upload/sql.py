@@ -6,13 +6,87 @@ from collections.abc import Sequence
 from datetime import UTC, datetime
 from uuid import UUID
 
-from sqlalchemy import delete, select, update
+from sqlalchemy import ColumnElement, Subquery, and_, delete, func, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from expert_work.persistence.bulk_delete import count_in_chunks, delete_in_chunks
-from expert_work.persistence.models import UserUploadRow
-from expert_work.persistence.user_upload.base import UserUploadStore
+from expert_work.persistence.models import AgentRunRow, TenantConfigRow, UserUploadRow
+from expert_work.persistence.user_upload.base import (
+    GIVE_UP_DEFER_CAP,
+    TOUCH_INTERVAL,
+    ExpiredUpload,
+    UserUploadStore,
+)
 from expert_work.protocol import UserUpload, UserUploadKind
+
+
+def _expiry(default_days: int, *candidates: ColumnElement[bool]) -> Subquery:
+    """B-63 —— 候选行(没删、再加 ``candidates`` 条件)各自的到期时刻与「放弃」窗口的起点。
+
+    * 到期 = ``greatest(created_at, last_used_at, 会话最后一次 run)`` + 租户保留期(没设用
+      ``default_days``)。``greatest`` 跳过 NULL(没用过、会话没有 run)。
+    * 会话最后一次 run 用 CTE **一次**算出:先取候选行涉及的 ``(tenant_id, thread_id)``,再对这些
+      会话的 ``agent_run`` 按会话聚合一遍(走 ``ix_agent_run_thread_id``),然后 join 回来 ——
+      不再每行一个相关子查询;同一会话里的多条上传共用一次聚合。只认**同租户**的 run。
+    * ``give_up_from`` = ``least(greatest(到期, tenant_config.updated_at), 到期 + 30 天)``:租户刚把
+      天数改小时,到期日一下子落到很久以前,「过了到期日 7 天还在失败就放弃」要从这次改动算起,不能
+      第一次暂时失败就放弃。配置行的 ``updated_at`` 任何改动都会刷新,所以最多只推迟
+      :data:`GIVE_UP_DEFER_CAP`,否则每周改一次配置就能让一条删不掉的行永远不放弃。
+    """
+    cand = (
+        select(
+            UserUploadRow.id,
+            UserUploadRow.tenant_id,
+            UserUploadRow.thread_id,
+            UserUploadRow.created_at,
+            UserUploadRow.last_used_at,
+        )
+        .where(UserUploadRow.deleted_at.is_(None), *candidates)
+        .cte("upload_candidates")
+    )
+    threads = select(cand.c.tenant_id, cand.c.thread_id).distinct().cte("upload_threads")
+    last_run = (
+        select(
+            AgentRunRow.tenant_id,
+            AgentRunRow.thread_id,
+            func.max(AgentRunRow.created_at).label("at"),
+        )
+        .join(
+            threads,
+            and_(
+                AgentRunRow.thread_id == threads.c.thread_id,
+                AgentRunRow.tenant_id == threads.c.tenant_id,
+            ),
+        )
+        .group_by(AgentRunRow.tenant_id, AgentRunRow.thread_id)
+        .cte("upload_thread_last_run")
+        # 租户条件在这里和下面 join 回候选行时各有一份,两份是纵深防御:任何一份单独都足以
+        # 挡住别的租户的 run(去掉其中一份测试仍绿,两份都去掉才红)。
+    )
+    days = func.coalesce(TenantConfigRow.upload_retention_days, default_days)
+    expires_at = func.greatest(
+        cand.c.created_at, cand.c.last_used_at, last_run.c.at
+    ) + func.make_interval(0, 0, 0, days)
+    return (
+        select(
+            cand.c.id,
+            expires_at.label("expires_at"),
+            func.least(
+                func.greatest(expires_at, TenantConfigRow.updated_at),
+                expires_at + GIVE_UP_DEFER_CAP,
+            ).label("give_up_from"),
+        )
+        .select_from(cand)
+        .outerjoin(
+            last_run,
+            and_(
+                last_run.c.thread_id == cand.c.thread_id,
+                last_run.c.tenant_id == cand.c.tenant_id,
+            ),
+        )
+        .outerjoin(TenantConfigRow, TenantConfigRow.tenant_id == cand.c.tenant_id)
+        .subquery("upload_expiry")
+    )
 
 
 def _row_to_dto(row: UserUploadRow) -> UserUpload:
@@ -29,6 +103,7 @@ def _row_to_dto(row: UserUploadRow) -> UserUpload:
         created_at=row.created_at,
         deleted_at=row.deleted_at,
         sha256=row.sha256,
+        last_used_at=row.last_used_at,
     )
 
 
@@ -102,29 +177,65 @@ class SqlUserUploadStore(UserUploadStore):
             rows = (await session.execute(stmt)).scalars().all()
         return [_row_to_dto(row) for row in rows]
 
-    async def list_expired(self, *, before: datetime, limit: int = 1000) -> list[UserUpload]:
+    async def list_expired(
+        self, *, now: datetime, default_days: int, limit: int = 1000
+    ) -> list[ExpiredUpload]:
+        expiry = _expiry(default_days)
+        stmt = (
+            select(UserUploadRow, expiry.c.expires_at, expiry.c.give_up_from)
+            .join(expiry, expiry.c.id == UserUploadRow.id)
+            .where(expiry.c.expires_at < now)
+            .order_by(expiry.c.expires_at.asc(), UserUploadRow.id.asc())
+            .limit(limit)
+        )
+        async with self._sf() as session:
+            rows = (await session.execute(stmt)).all()
+        return [
+            ExpiredUpload(upload=_row_to_dto(row), expires_at=at, give_up_from=give_up)
+            for row, at, give_up in rows
+        ]
+
+    async def list_unexpired_by_ref(
+        self,
+        *,
+        tenant_id: UUID,
+        user_id: UUID,
+        ref: str,
+        now: datetime,
+        default_days: int,
+    ) -> list[UserUpload]:
+        expiry = _expiry(
+            default_days,
+            UserUploadRow.tenant_id == tenant_id,
+            UserUploadRow.user_id == user_id,
+            UserUploadRow.ref == ref,
+        )
         stmt = (
             select(UserUploadRow)
-            .where(UserUploadRow.deleted_at.is_(None), UserUploadRow.created_at < before)
-            .order_by(UserUploadRow.created_at.asc(), UserUploadRow.id.asc())
-            .limit(limit)
+            .join(expiry, expiry.c.id == UserUploadRow.id)
+            .where(expiry.c.expires_at >= now)
         )
         async with self._sf() as session:
             rows = (await session.execute(stmt)).scalars().all()
         return [_row_to_dto(row) for row in rows]
 
-    async def list_active_by_ref(
-        self, *, tenant_id: UUID, user_id: UUID, ref: str
-    ) -> list[UserUpload]:
-        stmt = select(UserUploadRow).where(
-            UserUploadRow.tenant_id == tenant_id,
-            UserUploadRow.user_id == user_id,
-            UserUploadRow.ref == ref,
-            UserUploadRow.deleted_at.is_(None),
-        )
+    async def touch(self, *, upload_id: UUID, tenant_id: UUID, now: datetime) -> bool:
         async with self._sf() as session:
-            rows = (await session.execute(stmt)).scalars().all()
-        return [_row_to_dto(row) for row in rows]
+            result = await session.execute(
+                update(UserUploadRow)
+                .where(
+                    UserUploadRow.id == upload_id,
+                    UserUploadRow.tenant_id == tenant_id,
+                    UserUploadRow.deleted_at.is_(None),
+                    or_(
+                        UserUploadRow.last_used_at.is_(None),
+                        UserUploadRow.last_used_at < now - TOUCH_INTERVAL,
+                    ),
+                )
+                .values(last_used_at=now)
+            )
+            await session.commit()
+        return int(getattr(result, "rowcount", 0) or 0) > 0
 
     async def soft_delete(self, *, upload_id: UUID, tenant_id: UUID, now: datetime) -> bool:
         async with self._sf() as session:

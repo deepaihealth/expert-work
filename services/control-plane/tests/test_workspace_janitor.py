@@ -591,17 +591,14 @@ async def test_reclaim_lands_in_the_same_cycle_size_accounting(tmp_path: Path) -
 
 
 @pytest.mark.asyncio
-async def test_disabled_policies_delete_nothing(tmp_path: Path) -> None:
-    """uploads / 产物的条目本批是关着的:造出超期的 uploads 文件,扫完必须还在。
-
-    这条挡的是「以后有人顺手把 enabled 改成 True 就上线了」—— 那两条删的是用户
-    数据,需要产品定 N、需要发布前告知、还要有对外删除端点当自救出口(B-63)。
-    """
+async def test_uploads_are_never_reclaimed_by_the_janitor(tmp_path: Path) -> None:
+    """B-63 —— 上传件归 retention-cleanup-job 按登记行与最后使用时间清:这里只看 mtime,
+    收它会绕过那边的内容核对与引用检查。造一个 mtime 一年前的上传文件,扫完必须还在。"""
     tenant, user = uuid4(), uuid4()
     upload = _agent_dir(tmp_path, tenant, user) / "uploads" / "合同.docx"
     upload.parent.mkdir(parents=True)
     upload.write_bytes(b"x" * 10)
-    _age(upload, seconds=_TTL_S["uploads"] + 86400)
+    _age(upload, seconds=365 * 86400)
 
     worker, _, _ = _build(tmp_path)
     stats = await worker.run_once()
@@ -815,13 +812,14 @@ async def test_sweep_does_not_follow_a_symlinked_conversation_dir(tmp_path: Path
 
 
 def test_every_policy_has_an_explicit_target_entry() -> None:
-    """策略表与落点表必须逐条对上 —— 「暂时没有落点」要显式写 ``None``。
+    """策略表与落点表必须逐条对上。
 
-    漏配不会报错,只会让那条策略拨开 ``enabled`` 之后一声不吭地什么都不收
+    漏配不会报错,只会让那条策略一声不吭地什么都不收
     (实现里另有一条导入期的硬检查,这条测试是它的可读版本)。
     """
     assert {policy.label for policy in _POLICIES} == set(_TARGETS)
-    assert _TARGETS["artifacts"] is None  # 产物还没有落点,B-63 定义完再补
+    # B-63 —— 上传件与产物归 retention-cleanup-job,janitor 只有 inputs 两条。
+    assert set(_TARGETS) == {"inputs_cache", "inputs_run_dir"}
 
 
 @pytest.mark.asyncio

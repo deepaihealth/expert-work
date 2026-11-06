@@ -20,10 +20,11 @@ import io
 import logging
 import re
 import zipfile
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from pathlib import PurePosixPath
-from typing import Annotated, Any, Final
+from typing import Annotated, Any, Final, Protocol
 from uuid import UUID, uuid4
 
 from fastapi import APIRouter, Depends, File, HTTPException, Request, UploadFile
@@ -50,12 +51,14 @@ from expert_work.common.observability import current_trace_id_hex
 from expert_work.persistence import WORKSPACE_UPLOADS_DIR
 from expert_work.persistence.image_upload import ImageUploadStore
 from expert_work.persistence.tenant_user import TenantUserStore
+from expert_work.persistence.user_upload import UserUploadStore
 from expert_work.protocol import (
     AuditAction,
     AuditResult,
     QuotaDimension,
     ThreadMeta,
     UserUpload,
+    parse_upload_id,
     render_upload_id,
 )
 from expert_work.protocol.multimodal import ImageRef
@@ -227,6 +230,35 @@ async def _land_document_bytes(
         return candidate, False
     msg = f"no free upload name for {workspace_path!r}"
     raise SandboxSupervisorError(msg)
+
+
+class ExternalFileRefLike(Protocol):
+    """``files[]`` 的一项(:class:`control_plane.api.agents.ExternalFileRef`)。"""
+
+    @property
+    def upload_id(self) -> str: ...
+
+
+async def note_uploads_used(
+    uploads: UserUploadStore, *, tenant_id: UUID, upload_ids: Sequence[UUID]
+) -> None:
+    """B-63 —— 记一次「用到了这些附件」(run 被接受之后的 ``files[]`` / 对外下载成功):保留期
+    从最后一次使用算起。
+
+    存储层每行每天最多真写一次。记不上只打 warning、不影响这次请求:少记一次的后果是这份附件
+    按上一次使用的时间到期,不会更早于改动之前(按上传时间)的到期日。
+    """
+    now = datetime.now(UTC)
+    for upload_id in upload_ids:
+        try:
+            await uploads.touch(upload_id=upload_id, tenant_id=tenant_id, now=now)
+        except Exception:
+            logger.warning("upload.touch_failed upload_id=%s", upload_id, exc_info=True)
+
+
+def file_upload_ids(files: Sequence[ExternalFileRefLike]) -> list[UUID]:
+    """``files[]`` 里能解析的 ``upload_id``(run 被接受时它们都已经校验过)。"""
+    return [uid for item in files if (uid := parse_upload_id(item.upload_id)) is not None]
 
 
 async def copy_document_into_thread(

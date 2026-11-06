@@ -8,8 +8,13 @@ from __future__ import annotations
 
 from typing import Literal
 
-from pydantic import Field
+from pydantic import Field, PrivateAttr, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+from expert_work.protocol import FILE_RETENTION_MAX_DAYS, FILE_RETENTION_MIN_DAYS
+
+#: B-63 —— 这两个窗口与租户可设的范围一致:7-365 天(上限从 3650 降到一年)。
+_FILE_RETENTION_FIELDS = ("artifact_retention_days", "upload_retention_days")
 
 
 class RetentionCleanupSettings(BaseSettings):
@@ -50,7 +55,12 @@ class RetentionCleanupSettings(BaseSettings):
     # M0 defaults match the J-25 spec (90 days active → soft → 60 days
     # → hard). Workspace files are *not* removed here; J.15 volume
     # lifecycle owns the bytes.
-    artifact_retention_days: int = Field(default=90, ge=1, le=3650)
+    #
+    # B-63: platform default for tenants whose ``tenant_config.artifact_retention_days``
+    # is NULL. Range 7-365 (outside it is clamped with a warning, see
+    # ``_clamp_file_retention``). MUST equal ``expert_work.protocol.FILE_RETENTION_DEFAULT_DAYS``
+    # (the control plane's "is this a decrease" baseline) — both are 90.
+    artifact_retention_days: int = Field(default=90, ge=1)
     artifact_hard_delete_grace_days: int = Field(default=60, ge=1, le=3650)
 
     # --------------------------------------------------- deletion hygiene PR1 (Task 7)
@@ -104,7 +114,12 @@ class RetentionCleanupSettings(BaseSettings):
     # 产物版本复用上面的 ``artifact_retention_days``,已删工作区复用
     # ``workspace_archive_retention_days``;上传是新旋钮。三个都是 job 级默认,
     # test / prod overlay 不另设。
-    upload_retention_days: int = Field(default=90, ge=1, le=3650)
+    #
+    # B-63:按**最后使用**算(created_at / last_used_at / 会话最后一次 run 最晚的那个),
+    # 这是 ``tenant_config.upload_retention_days`` 为空时的平台默认。范围 7-365,超出的
+    # 夹回范围并打 warning(``_clamp_file_retention``)。**必须与协议里的
+    # ``FILE_RETENTION_DEFAULT_DAYS`` 一致**(控制面判「改小」的基准),两边都是 90。
+    upload_retention_days: int = Field(default=90, ge=1)
     # NAS 工作区根 —— 与 control-plane 的 EXPERT_WORK_WORKSPACE_NAS_ROOT 同一个挂载
     # 点(CronJob 挂同一个 PVC)。``None`` → 三条碰文件的规则(产物版本 / 上传文件 /
     # 孤儿 threads 目录)整体跳过并打 warning:只删行不删文件会留下永远没人认领
@@ -126,3 +141,25 @@ class RetentionCleanupSettings(BaseSettings):
     #: OSS rejects path-style addressing (``SecondLevelDomainForbidden``)
     #: and does not reliably resolve ``"auto"`` to virtual-hosted style.
     object_store_addressing_style: Literal["path", "virtual", "auto"] = "path"
+
+    #: B-63 —— 被夹回 7-365 的配置 ``{字段: 原值}``;``main`` 装好日志之后逐条打 warning
+    #: (构造 settings 时日志还没装上)。
+    _clamped: dict[str, int] = PrivateAttr(default_factory=dict)
+
+    @model_validator(mode="after")
+    def _clamp_file_retention(self) -> RetentionCleanupSettings:
+        """B-63 —— 产物 / 上传保留期 7-365 天。超出范围的配置**不拒跑**(那会让每晚的清理整个
+        停掉):夹回范围并记下来,由 ``main`` 打 warning。仓库里的 overlay 都没设这两个键(用默认
+        90)。"""
+        for name in _FILE_RETENTION_FIELDS:
+            configured = getattr(self, name)
+            clamped = min(max(configured, FILE_RETENTION_MIN_DAYS), FILE_RETENTION_MAX_DAYS)
+            if clamped != configured:
+                self._clamped[name] = configured
+                setattr(self, name, clamped)
+        return self
+
+    @property
+    def clamped_retention(self) -> dict[str, int]:
+        """被夹回 7-365 的字段与它们原来配的值(没有就是空)。"""
+        return dict(self._clamped)

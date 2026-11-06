@@ -273,3 +273,69 @@ async def test_add_on_missing_tenant_raises_not_found() -> None:
         await store.add_mcp_allowlist_name(tenant_id=uuid4(), name="x", actor_id="op")
     with pytest.raises(TenantConfigNotFoundError):
         await store.remove_mcp_allowlist_name(tenant_id=uuid4(), name="x", actor_id="op")
+
+
+@pytest.mark.asyncio
+async def test_file_retention_days_set_keep_and_reset_to_the_platform_default() -> None:
+    """B-63 —— 附件 / 产物保留期:默认 ``None``(平台默认);设了之后不带这个键的 patch 不动它;
+    显式 ``null`` 改回平台默认。首次 upsert 也认。"""
+    store = InMemoryTenantConfigStore()
+    tid = uuid4()
+    created = await store.create(tenant_id=tid, display_name="Acme", actor_id="sys")
+    assert (created.upload_retention_days, created.artifact_retention_days) == (None, None)
+
+    set_ = await store.upsert(
+        tenant_id=tid,
+        patch=TenantConfigPatch(upload_retention_days=30, artifact_retention_days=180),
+        actor_id="ops",
+    )
+    assert (set_.upload_retention_days, set_.artifact_retention_days) == (30, 180)
+    kept = await store.upsert(
+        tenant_id=tid, patch=TenantConfigPatch(display_name="Acme 2"), actor_id="ops"
+    )
+    assert (kept.upload_retention_days, kept.artifact_retention_days) == (30, 180)
+    reset = await store.upsert(
+        tenant_id=tid, patch=TenantConfigPatch(upload_retention_days=None), actor_id="ops"
+    )
+    assert (reset.upload_retention_days, reset.artifact_retention_days) == (None, 180)
+
+    first = await store.upsert(
+        tenant_id=uuid4(),
+        patch=TenantConfigPatch(display_name="New", upload_retention_days=7),
+        actor_id="ops",
+    )
+    assert first.upload_retention_days == 7
+
+
+@pytest.mark.asyncio
+async def test_an_unconfirmed_decrease_is_rejected_inside_the_store() -> None:
+    """B-63 —— 与 SQL 实现同义:``reject_unconfirmed_decrease=True`` 时改小抛
+    :class:`RetentionDecreaseNotConfirmedError`、什么都不改;调大照常;不传这个参数不检查。"""
+    from expert_work.persistence.tenant_config.base import RetentionDecreaseNotConfirmedError
+
+    store = InMemoryTenantConfigStore()
+    tid = uuid4()
+    await store.create(tenant_id=tid, display_name="Acme", actor_id="sys")
+
+    with pytest.raises(RetentionDecreaseNotConfirmedError) as caught:
+        await store.upsert(
+            tenant_id=tid,
+            patch=TenantConfigPatch(artifact_retention_days=30),
+            actor_id="ops",
+            reject_unconfirmed_decrease=True,
+        )
+    assert caught.value.decreases == [{"field": "artifact_retention_days", "from": 90, "to": 30}]
+    got = await store.get(tenant_id=tid)
+    assert got is not None and got.artifact_retention_days is None
+
+    raised = await store.upsert(
+        tenant_id=tid,
+        patch=TenantConfigPatch(artifact_retention_days=120),
+        actor_id="ops",
+        reject_unconfirmed_decrease=True,
+    )
+    assert raised.artifact_retention_days == 120
+    lowered = await store.upsert(
+        tenant_id=tid, patch=TenantConfigPatch(artifact_retention_days=30), actor_id="ops"
+    )
+    assert lowered.artifact_retention_days == 30

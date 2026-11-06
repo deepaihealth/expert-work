@@ -343,6 +343,102 @@ async def test_put_emits_tenant_config_write_audit(
     assert "plan" in fields
 
 
+@pytest.mark.asyncio
+async def test_put_sets_and_resets_file_retention_days(
+    tc_client: AsyncClient, audit_store: InMemoryAuditLogStore
+) -> None:
+    """B-63 —— 附件 / 产物保留期经同一个 PUT 设置(7-365);显式 ``null`` 改回平台默认,
+    这次改动也进审计的 ``fields``。调大不用确认。"""
+    headers = {"Authorization": f"Bearer {_admin_token()}"}
+    url = f"/v1/tenants/{_TENANT}/config"
+    put = await tc_client.put(
+        url,
+        headers=headers,
+        json={"display_name": "ACME", "upload_retention_days": 120, "artifact_retention_days": 365},
+    )
+    assert put.status_code == 200, put.text
+    data = put.json()["data"]
+    assert (data["upload_retention_days"], data["artifact_retention_days"]) == (120, 365)
+
+    for bad in (0, 6, 366):
+        rejected = await tc_client.put(
+            url,
+            headers=headers,
+            params={"confirm_retention_decrease": "true"},
+            json={"upload_retention_days": bad},
+        )
+        assert rejected.status_code == 422, bad
+
+    # 120 → 平台默认 90 是改小:要确认。
+    reset = await tc_client.put(
+        url,
+        headers=headers,
+        params={"confirm_retention_decrease": "true"},
+        json={"upload_retention_days": None},
+    )
+    assert reset.status_code == 200, reset.text
+    got = (await tc_client.get(url, headers=headers)).json()["data"]
+    assert (got["upload_retention_days"], got["artifact_retention_days"]) == (None, 365)
+    page = await audit_store.query(
+        AuditQuery(tenant_id=_TENANT, action=AuditAction.TENANT_CONFIG_WRITE)
+    )
+    writes = [entry.details.get("fields") for entry in page.entries]
+    assert ["upload_retention_days"] in writes, writes
+
+
+@pytest.mark.asyncio
+async def test_lowering_retention_days_needs_an_explicit_confirmation(
+    tc_client: AsyncClient,
+) -> None:
+    """B-63 —— 改小保留期最早当晚就会多清文件、不可恢复:不带
+    ``confirm_retention_decrease=true`` 的改小一律 409,什么都不改;带上才生效。没设(平台默认
+    90)改成 30 也算改小;调大、不变、改别的字段都不用确认。"""
+    headers = {"Authorization": f"Bearer {_admin_token()}"}
+    url = f"/v1/tenants/{_TENANT}/config"
+    first = await tc_client.put(url, headers=headers, json={"display_name": "ACME"})
+    assert first.status_code == 200, first.text
+
+    lowered = await tc_client.put(url, headers=headers, json={"upload_retention_days": 30})
+    assert lowered.status_code == 409, lowered.text
+    detail = lowered.json()["detail"]
+    assert detail["code"] == "RETENTION_DECREASE_NOT_CONFIRMED"
+    assert detail["fields"] == [{"field": "upload_retention_days", "from": 90, "to": 30}]
+    got = (await tc_client.get(url, headers=headers)).json()["data"]
+    assert got["upload_retention_days"] is None  # nothing changed
+
+    confirmed = await tc_client.put(
+        url,
+        headers=headers,
+        params={"confirm_retention_decrease": "true"},
+        json={"upload_retention_days": 30},
+    )
+    assert confirmed.status_code == 200, confirmed.text
+    assert confirmed.json()["data"]["upload_retention_days"] == 30
+
+    for body in (
+        {"upload_retention_days": 60},  # raise
+        {"upload_retention_days": 60},  # unchanged
+        {"artifact_retention_days": 90},  # same as the platform default
+        {"display_name": "ACME 2"},
+    ):
+        ok = await tc_client.put(url, headers=headers, json=body)
+        assert ok.status_code == 200, (body, ok.text)
+
+    to_default = await tc_client.put(url, headers=headers, json={"upload_retention_days": None})
+    assert to_default.status_code == 200, to_default.text  # 60 → default 90 is a raise
+
+    # 120 → 平台默认 90 是改小:不确认 409,值不变。
+    raised = await tc_client.put(url, headers=headers, json={"upload_retention_days": 120})
+    assert raised.status_code == 200, raised.text
+    reset = await tc_client.put(url, headers=headers, json={"upload_retention_days": None})
+    assert reset.status_code == 409, reset.text
+    assert reset.json()["detail"]["fields"] == [
+        {"field": "upload_retention_days", "from": 120, "to": 90}
+    ]
+    got = (await tc_client.get(url, headers=headers)).json()["data"]
+    assert got["upload_retention_days"] == 120
+
+
 # ---------------------------------------------------------------------------
 # PR-E3a — PUT must drop the tenant's built agents (locally + via the bus)
 # ---------------------------------------------------------------------------

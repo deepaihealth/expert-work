@@ -18,7 +18,7 @@ from collections.abc import Iterable
 from typing import Annotated
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
 
 from control_plane.api._authz import console_only, require
 from control_plane.invalidation_bus import InvalidationEvent
@@ -32,6 +32,7 @@ from control_plane.tenant_scope import (
 )
 from expert_work.common.observability import current_trace_id_hex
 from expert_work.persistence.agent_spec import AgentSpecStore
+from expert_work.persistence.tenant_config.base import RetentionDecreaseNotConfirmedError
 from expert_work.protocol import (
     AgentSpecRecord,
     Principal,
@@ -194,6 +195,7 @@ def build_tenant_config_router() -> APIRouter:
         svc: Annotated[TenantConfigService, Depends(_get_service)],
         audit: Annotated[AuditLogger, Depends(_get_audit)],
         request: Request,
+        confirm_retention_decrease: Annotated[bool, Query()] = False,
     ) -> dict[str, object]:
         scope = await ensure_single_tenant_scope(
             principal,
@@ -220,11 +222,30 @@ def build_tenant_config_router() -> APIRouter:
         # Stream Y-1 — LLM credentials are platform-exclusive. ``credentials_mode``
         # is a ``Literal["platform"]``, so Pydantic rejects any other value in the
         # request body with 422 before reaching this handler; no switch gate needed.
+        # B-63 —— 改小附件 / 产物保留期最早当晚就会多清文件、不可恢复:必须显式带
+        # ``?confirm_retention_decrease=true``,否则 409、什么都不改。比较在 store 的写事务里、
+        # 锁住那一行之后做(并发的另一次改动漏不过去),没有配置行 = 平台默认。
         try:
             async with applied_scope(scope):
                 record = await svc.upsert(
-                    tenant_id=scope.tenant_id, patch=payload, actor_id=principal.subject_id
+                    tenant_id=scope.tenant_id,
+                    patch=payload,
+                    actor_id=principal.subject_id,
+                    reject_unconfirmed_decrease=not confirm_retention_decrease,
                 )
+        except RetentionDecreaseNotConfirmedError as exc:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "RETENTION_DECREASE_NOT_CONFIRMED",
+                    "message": (
+                        "lowering a file retention period deletes more files as soon as "
+                        "tonight and cannot be undone; resend with "
+                        "?confirm_retention_decrease=true"
+                    ),
+                    "fields": exc.decreases,
+                },
+            ) from exc
         except ValueError as exc:
             raise HTTPException(
                 status_code=422,

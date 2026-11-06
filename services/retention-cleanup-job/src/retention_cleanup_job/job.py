@@ -23,7 +23,8 @@ NOLOGIN BYPASSRLS with the minimum delete grants).
 
 * B-28 ``_sweep_artifact_versions`` —— ``artifact_version.created_at`` 满 90 天:
   删 NAS 文件 + 删版本行;版本清空的 ``artifact`` 行标过期(复用 ``deleted_at``)。
-* 上传 ``_sweep_uploads`` —— ``user_upload.created_at`` 满 90 天:按会话当前的 agent / 布局
+* 上传 ``_sweep_uploads`` —— 最后使用(B-63:``created_at`` / ``last_used_at`` / 会话最后一次
+  run 最晚的那个)满租户保留期(默认 90 天):按会话当前的 agent / 布局
   删 ``[agents/<key>/][threads/<会话>/work/]uploads/<file>``(B-271)+ 标 ``deleted_at``。
 * B-27 ``_sweep_orphan_thread_dirs`` —— ``threads/<thread_id>/`` 的 thread 行不存在
   → 删目录。**不按时间删活会话的目录**。
@@ -297,6 +298,7 @@ class RetentionCleanupJob:
             upload_rows_abandoned=uploads.rows_abandoned,
             upload_rows_held=uploads.rows_held,
             upload_owners_unavailable=uploads.owners_unavailable,
+            upload_rows_failing_overdue=uploads.rows_failing_overdue,
             failed_passes=tuple(self._failed_passes),
             thread_dirs_removed=thread_dirs_removed,
             tool_result_dirs_removed=tool_result_dirs_removed,
@@ -577,7 +579,9 @@ class RetentionCleanupJob:
         """留存链 —— 上传 90 天;规则本体在 :class:`retention_cleanup_job.uploads.UploadSweep`
         (B-271:按会话当前的 agent / 布局删真实位置上的文件,引用检查、改动保护、不安全路径)。
 
-        ``user_upload.created_at < now - upload_retention_days`` 且未软删的行,文档类删文件、
+        B-63 —— 按**最后使用**到期:``greatest(created_at, last_used_at, 会话最后一次 run)`` 加上
+        租户的 ``tenant_config.upload_retention_days``(没设用 ``upload_retention_days``)早于现在、
+        且未软删的行(谓词在 :meth:`UserUploadStore.list_expired`),文档类删文件、
         两类都标 ``deleted_at``(对外 GET 从此 404,复用既有语义)。只管有登记行的上传:控制台
         上传与跨会话引用复制(copy-on-attach)不建 ``user_upload`` 行,这里永远看不到它们
         (B-271 不改,另立)。
@@ -594,18 +598,18 @@ class RetentionCleanupJob:
         ):
             return UploadSweepTally()
         now = datetime.now(UTC)
-        cutoff = now - timedelta(days=self._upload_retention_days)
         sweep = UploadSweep(
             uploads=self._user_upload_store,
             threads=self._thread_store,
             root=self._workspace_root,
+            default_days=self._upload_retention_days,
             audit=self._audit_log_store,
         )
         try:
             expired = await self._user_upload_store.list_expired(
-                before=cutoff, limit=self._batch_size
+                now=now, default_days=self._upload_retention_days, limit=self._batch_size
             )
-            tally = await sweep.run(expired, cutoff=cutoff, now=now)
+            tally = await sweep.run(expired, now=now)
         except Exception:
             logger.exception("retention.upload_sweep_failed")
             self._failed_passes.append("uploads")

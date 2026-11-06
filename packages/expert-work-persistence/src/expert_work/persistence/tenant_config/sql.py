@@ -13,6 +13,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from expert_work.persistence.models import TenantConfigRow
 from expert_work.persistence.tenant_config.base import (
+    RetentionDecreaseNotConfirmedError,
     TenantConfigAlreadyExistsError,
     TenantConfigNotFoundError,
     TenantConfigStore,
@@ -49,6 +50,8 @@ def _row_to_record(row: TenantConfigRow) -> TenantConfigRecord:
         mcp_servers=[dict(x) for x in row.mcp_servers],
         audit_retention_days=row.audit_retention_days,
         event_log_retention_days=row.event_log_retention_days,
+        upload_retention_days=row.upload_retention_days,
+        artifact_retention_days=row.artifact_retention_days,
         trigger_fire_scan_mode=cast(TriggerFireScanMode, row.trigger_fire_scan_mode),
         memory_recall_mode=cast(MemoryRecallMode, row.memory_recall_mode),
         skill_stale_days=row.skill_stale_days,
@@ -125,9 +128,23 @@ class SqlTenantConfigStore(TenantConfigStore):
         tenant_id: UUID,
         patch: TenantConfigPatch,
         actor_id: str,
+        reject_unconfirmed_decrease: bool = False,
     ) -> TenantConfigRecord:
         async with self._sf() as session:
-            existing = await session.get(TenantConfigRow, tenant_id)
+            # B-63 —— 锁住这一行再读:「改小要确认」的比较与写入在同一个事务里,并发的另一次
+            # 改动要么已经提交(这里读到的是它的值),要么排在后面。
+            existing = (
+                await session.execute(
+                    select(TenantConfigRow)
+                    .where(TenantConfigRow.tenant_id == tenant_id)
+                    .with_for_update()
+                )
+            ).scalar_one_or_none()
+            if reject_unconfirmed_decrease:
+                current = _row_to_record(existing) if existing is not None else None
+                decreases = patch.retention_decreases(current)
+                if decreases:
+                    raise RetentionDecreaseNotConfirmedError(decreases)
             if existing is None:
                 if patch.display_name is None:
                     msg = (
@@ -158,6 +175,8 @@ class SqlTenantConfigStore(TenantConfigStore):
                     values["audit_retention_days"] = patch.audit_retention_days
                 if patch.event_log_retention_days is not None:
                     values["event_log_retention_days"] = patch.event_log_retention_days
+                # B-63 —— 显式 ``null`` 也算(= 平台默认),见 ``retention_updates``。
+                values.update(patch.retention_updates())
                 if patch.trigger_fire_scan_mode is not None:
                     values["trigger_fire_scan_mode"] = patch.trigger_fire_scan_mode
                 if patch.memory_recall_mode is not None:
@@ -246,6 +265,9 @@ class SqlTenantConfigStore(TenantConfigStore):
                 existing.audit_retention_days = patch.audit_retention_days
             if patch.event_log_retention_days is not None:
                 existing.event_log_retention_days = patch.event_log_retention_days
+            # B-63 —— 显式 ``null`` = 改回平台默认;没传的键不动。
+            for name, days in patch.retention_updates().items():
+                setattr(existing, name, days)
             if patch.trigger_fire_scan_mode is not None:
                 existing.trigger_fire_scan_mode = patch.trigger_fire_scan_mode
             if patch.memory_recall_mode is not None:

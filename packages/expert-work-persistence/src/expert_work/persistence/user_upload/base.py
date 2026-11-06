@@ -14,10 +14,37 @@ from __future__ import annotations
 
 import abc
 from collections.abc import Sequence
-from datetime import datetime
+from dataclasses import dataclass
+from datetime import datetime, timedelta
 from uuid import UUID
 
 from expert_work.protocol import UserUpload, UserUploadKind
+
+#: B-63 —— ``last_used_at`` 每行每天最多写一次:下载 / 重新附加是热路径,只在上次记的时间
+#: 已经早于一天前才真的 UPDATE。保留期按天算,一天的精度足够。
+TOUCH_INTERVAL = timedelta(days=1)
+
+#: B-63 —— 租户配置改动最多把「过期 7 天还失败就放弃」的起点往后推这么久。``tenant_config``
+#: 的任何写入(MCP 白名单、显示名、状态……)都会刷新 ``updated_at``,不封顶的话一条一直删不掉的
+#: 行可以被每周一次的配置改动永远推迟下去。
+GIVE_UP_DEFER_CAP = timedelta(days=30)
+
+
+@dataclass(frozen=True)
+class ExpiredUpload:
+    """B-63 —— 一条到期的上传,带它**什么时候**到期的(``最后使用 + 保留期``)。
+
+    「最后使用」= ``created_at`` / ``last_used_at`` / 所在会话最后一次 run 的 ``created_at``
+    三者中最晚的;保留期 = 租户的 ``tenant_config.upload_retention_days``,没设就用平台默认。
+    ``give_up_from`` 是「过了到期日 7 天还在失败就放弃」那个窗口的起点:``max(expires_at,
+    租户配置最后一次改动)``,但最晚 ``expires_at + GIVE_UP_DEFER_CAP`` —— 租户刚把天数改小时
+    到期日会一下子落到很久以前,窗口从这次改动算起,第一次暂时失败不会直接放弃;封顶是因为
+    配置的任何改动都会刷新那个时间。没有租户配置的(内存实现)就是 ``expires_at``。
+    """
+
+    upload: UserUpload
+    expires_at: datetime
+    give_up_from: datetime
 
 
 class UserUploadStore(abc.ABC):
@@ -67,19 +94,40 @@ class UserUploadStore(abc.ABC):
         的上传件。"""
 
     @abc.abstractmethod
-    async def list_expired(self, *, before: datetime, limit: int = 1000) -> list[UserUpload]:
-        """留存链(上传 90 天)—— 跨租户列出 ``deleted_at IS NULL AND created_at <
-        before`` 的行,最老在前。Caller MUST be inside an RLS bypass scope(the
-        retention job's ``_bypass_rls``)。Already soft-deleted rows are not
-        candidates — the sweep marks, it does not re-mark."""
+    async def list_expired(
+        self, *, now: datetime, default_days: int, limit: int = 1000
+    ) -> list[ExpiredUpload]:
+        """B-63 —— 跨租户列出没删(``deleted_at IS NULL``)、按**最后使用**已经到期的行,
+        最早到期的在前。
+
+        最后使用 = ``greatest(created_at, last_used_at, 所在会话最后一次 run 的
+        created_at)``;到期 = 最后使用 + 保留期 ``< now``,保留期取这一行租户的
+        ``tenant_config.upload_retention_days``,为空(或租户没有配置行)时用 ``default_days``。
+        只会比按 ``created_at`` 算留得更久,不会更短。
+
+        Caller MUST be inside an RLS bypass scope (the retention job's
+        ``_bypass_rls``)。The in-memory backend has no runs and no tenant config:
+        it uses ``created_at`` / ``last_used_at`` and ``default_days`` only."""
 
     @abc.abstractmethod
-    async def list_active_by_ref(
-        self, *, tenant_id: UUID, user_id: UUID, ref: str
+    async def list_unexpired_by_ref(
+        self,
+        *,
+        tenant_id: UUID,
+        user_id: UUID,
+        ref: str,
+        now: datetime,
+        default_days: int,
     ) -> list[UserUpload]:
-        """B-271 —— 同租户、同用户、同 ``ref``、没删(``deleted_at IS NULL``)的行,不论会话、
-        不论是否已到期。留存作业的引用检查用它找「还有谁可能指着同一个文件」(老视图同一 agent
-        的各对话共用 ``uploads/``,同名同内容复用让多行指向一个文件)。"""
+        """B-271 / B-63 —— 同租户、同用户、同 ``ref``、没删、按 :meth:`list_expired` 同一个
+        时钟**还没到期**的行,不论会话。留存作业的引用检查用它找「还有谁可能指着同一个文件」
+        (老视图同一 agent 的各对话共用 ``uploads/``,同名同内容复用让多行指向一个文件)。
+        已经到期、只是这一批没轮到的行不算引用。"""
+
+    @abc.abstractmethod
+    async def touch(self, *, upload_id: UUID, tenant_id: UUID, now: datetime) -> bool:
+        """B-63 —— 记一次使用:``last_used_at = now``,只在这一行没删、且上次记的时间为空或
+        早于 ``now - TOUCH_INTERVAL`` 时才写(每行每天最多一次)。``True`` = 真的写了。"""
 
     @abc.abstractmethod
     async def soft_delete(self, *, upload_id: UUID, tenant_id: UUID, now: datetime) -> bool:

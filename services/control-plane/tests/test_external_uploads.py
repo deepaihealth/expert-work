@@ -898,8 +898,9 @@ async def _document_audit_rows(ctx: _Ctx) -> list[Any]:
 async def _upload_row_count(ctx: _Ctx) -> int:
     from datetime import UTC, datetime, timedelta
 
+    # Every live row: its expiry (last use + 1 day) is before "two days from now".
     rows = await ctx.app.state.user_upload_store.list_expired(
-        before=datetime.now(UTC) + timedelta(days=1)
+        now=datetime.now(UTC) + timedelta(days=2), default_days=1
     )
     return len(rows)
 
@@ -1073,3 +1074,66 @@ async def test_the_source_read_is_bounded_by_the_recorded_size(
     monkeypatch.setattr(ctx.workspace_store, "read_file", spy)
     await _attach(ctx, a, into=b["session_id"])
     assert caps[0] == len(b"%PDF-1.4 A") + 1
+
+
+# ---------------------------------------------------------------------------
+# B-63 —— 保留期按最后一次使用算:重新附加(记在登记行上,跨会话就是源会话那一行)与对外
+# 下载都记一次 ``last_used_at``。
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_resolving_files_alone_does_not_mark_them_used(ctx: _Ctx) -> None:
+    """B-63 —— 解析 ``files[]`` 时还不知道这一轮会不会被接受(后面还有批量校验、排队上限……):
+    记使用放在 run 被接受之后(见 ``test_external_run_files.py``),这里不记。"""
+    await ctx.seed_agent()
+    a = await _upload_document(ctx, b"%PDF-1.4 A")
+    b = await _upload_document(ctx, b"%PDF-1.4 B")
+
+    await _attach(ctx, a, into=b["session_id"])
+
+    assert (await _upload_row(ctx, a)).last_used_at is None
+
+
+@pytest.mark.asyncio
+async def test_downloading_an_upload_marks_it_used(ctx: _Ctx) -> None:
+    await ctx.seed_agent()
+    up = await _upload_document(ctx, b"%PDF-1.4 dl")
+
+    refused = await ctx.client.get(
+        f"/v1/agents/support-bot/uploads/{up['upload_id']}",
+        params={"user_id": "someone-else"},
+        headers=ctx.headers,
+    )
+    assert refused.status_code == 404
+    assert (await _upload_row(ctx, up)).last_used_at is None  # a refused read is not a use
+
+    resp = await ctx.client.get(
+        f"/v1/agents/support-bot/uploads/{up['upload_id']}",
+        params={"user_id": "cust-77"},
+        headers=ctx.headers,
+    )
+    assert resp.status_code == 200, resp.text
+    assert (await _upload_row(ctx, up)).last_used_at is not None
+
+
+@pytest.mark.asyncio
+async def test_a_failing_touch_does_not_fail_the_download(
+    ctx: _Ctx, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    await ctx.seed_agent()
+    up = await _upload_document(ctx, b"%PDF-1.4 dl")
+
+    async def _down(**_kwargs: object) -> bool:
+        raise RuntimeError("db down")
+
+    monkeypatch.setattr(ctx.app.state.user_upload_store, "touch", _down)
+    with caplog.at_level("WARNING"):
+        resp = await ctx.client.get(
+            f"/v1/agents/support-bot/uploads/{up['upload_id']}",
+            params={"user_id": "cust-77"},
+            headers=ctx.headers,
+        )
+    assert resp.status_code == 200, resp.text
+    assert resp.content == b"%PDF-1.4 dl"
+    assert "upload.touch_failed" in caplog.text

@@ -68,6 +68,7 @@ from control_plane.api.uploads import (
     _handle_document_upload,
     _land_image_upload,
     _prepare_image_upload,
+    note_uploads_used,
 )
 from control_plane.quota.base import QuotaService
 from control_plane.settings import Settings
@@ -553,6 +554,8 @@ def build_external_uploads_router() -> APIRouter:
         # DISPOSITION side of ``infer_content_type``'s verdict is used —
         # the active-content-forces-attachment / unknown-forces-attachment
         # rule stays in force regardless of what MIME the upload declared.
+        # B-63 —— 内容真的读到了才算一次使用:保留期按最后一次使用算起。
+        await note_uploads_used(uploads, tenant_id=tenant_id, upload_ids=[row.id])
         return Response(content=data, media_type=row.mime_type, headers=headers)
 
     return router

@@ -3,11 +3,22 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from uuid import UUID
 
-from expert_work.persistence.user_upload.base import UserUploadStore
+from expert_work.persistence.user_upload.base import (
+    TOUCH_INTERVAL,
+    ExpiredUpload,
+    UserUploadStore,
+)
 from expert_work.protocol import UserUpload, UserUploadKind
+
+
+def _expires_at(row: UserUpload, default_days: int) -> datetime:
+    """B-63 —— 与 SQL 实现同一个时钟,但内存里没有 run 与租户配置:只看 ``created_at`` /
+    ``last_used_at`` 与 ``default_days``(会话最后一次 run、租户保留期由 SQL 集成测试覆盖)。"""
+    last_active = max(t for t in (row.created_at, row.last_used_at) if t is not None)
+    return last_active + timedelta(days=default_days)
 
 
 class InMemoryUserUploadStore(UserUploadStore):
@@ -70,13 +81,30 @@ class InMemoryUserUploadStore(UserUploadStore):
         rows.sort(key=lambda r: (r.created_at, str(r.id)))
         return rows
 
-    async def list_expired(self, *, before: datetime, limit: int = 1000) -> list[UserUpload]:
-        rows = [r for r in self._rows.values() if r.deleted_at is None and r.created_at < before]
-        rows.sort(key=lambda r: (r.created_at, str(r.id)))
-        return rows[:limit]
+    async def list_expired(
+        self, *, now: datetime, default_days: int, limit: int = 1000
+    ) -> list[ExpiredUpload]:
+        due = [
+            ExpiredUpload(
+                upload=r,
+                expires_at=_expires_at(r, default_days),
+                give_up_from=_expires_at(r, default_days),
+            )
+            for r in self._rows.values()
+            if r.deleted_at is None
+        ]
+        expired = [e for e in due if e.expires_at < now]
+        expired.sort(key=lambda e: (e.expires_at, str(e.upload.id)))
+        return expired[:limit]
 
-    async def list_active_by_ref(
-        self, *, tenant_id: UUID, user_id: UUID, ref: str
+    async def list_unexpired_by_ref(
+        self,
+        *,
+        tenant_id: UUID,
+        user_id: UUID,
+        ref: str,
+        now: datetime,
+        default_days: int,
     ) -> list[UserUpload]:
         return [
             r
@@ -85,7 +113,17 @@ class InMemoryUserUploadStore(UserUploadStore):
             and r.user_id == user_id
             and r.ref == ref
             and r.deleted_at is None
+            and _expires_at(r, default_days) >= now
         ]
+
+    async def touch(self, *, upload_id: UUID, tenant_id: UUID, now: datetime) -> bool:
+        row = self._rows.get((tenant_id, upload_id))
+        if row is None or row.deleted_at is not None:
+            return False
+        if row.last_used_at is not None and row.last_used_at >= now - TOUCH_INTERVAL:
+            return False
+        self._rows[(tenant_id, upload_id)] = row.model_copy(update={"last_used_at": now})
+        return True
 
     async def soft_delete(self, *, upload_id: UUID, tenant_id: UUID, now: datetime) -> bool:
         row = self._rows.get((tenant_id, upload_id))

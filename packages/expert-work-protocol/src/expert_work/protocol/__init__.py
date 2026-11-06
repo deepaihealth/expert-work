@@ -250,6 +250,9 @@ from expert_work.protocol.subagent import (
     SubagentStatus,
 )
 from expert_work.protocol.tenant_config import (
+    FILE_RETENTION_DEFAULT_DAYS,
+    FILE_RETENTION_MAX_DAYS,
+    FILE_RETENTION_MIN_DAYS,
     CredentialsMode,
     MemoryRecallMode,
     TenantConfigPatch,
@@ -313,6 +316,9 @@ __all__ = [
     "DEFAULT_WORKSPACE_BYTES_PER_USER",
     "DIMENSION_RESOURCE_KINDS",
     "FIELD_TIERS",
+    "FILE_RETENTION_DEFAULT_DAYS",
+    "FILE_RETENTION_MAX_DAYS",
+    "FILE_RETENTION_MIN_DAYS",
     "KB_DOCUMENT_TITLE_MAX_CHARS",
     "MAX_CHUNK_MAX_TOKENS",
     "MAX_RESULT_EXCERPT_CHARS",

@@ -1205,3 +1205,284 @@ async def test_a_legacy_upload_reads_its_audit_sha256_before_the_audit_pass_dele
     finally:
         await app_engine.dispose()
         await worker_engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_uploads_expire_by_last_use_and_tenant_days_against_postgres(
+    db_fixture: tuple[AsyncEngine, AsyncEngine, str], tmp_path: Path
+) -> None:
+    """B-63 —— 整个上传 pass 走真库:到期 = ``greatest(created_at, last_used_at, 会话最后一次
+    run)`` + 租户保留期(没设用平台默认 90)。只会留得更久:按上传时间早该删、但最近还在用的
+    行与文件都留着;另一个租户的设置不影响这个租户。"""
+    from expert_work.persistence import SqlThreadMetaStore, SqlUserUploadStore
+    from retention_cleanup_job.main import build_session_factory
+
+    _app_engine, worker_engine, sync_admin = db_fixture
+    try:
+        sf = build_session_factory(worker_engine)
+        threads = SqlThreadMetaStore(sf)
+        uploads = SqlUserUploadStore(sf)
+        short_tenant, plain_tenant, user = uuid4(), uuid4(), uuid4()
+        _seed_tenant_config(sync_admin, tenant_id=short_tenant, audit_days=90, event_days=30)
+
+        async def _upload(tenant: UUID, name: str) -> tuple[UUID, UUID, Path]:
+            meta = await threads.create(
+                thread_id=uuid4(), tenant_id=tenant, created_by="u", user_id=user, agent_name="bot"
+            )
+            ref = f"uploads/{name}"
+            row = await uploads.insert(
+                upload_id=uuid4(),
+                tenant_id=tenant,
+                user_id=user,
+                thread_id=meta.thread_id,
+                kind="document",
+                ref=ref,
+                mime_type="application/pdf",
+                size_bytes=1,
+                filename=name,
+                sha256=hashlib.sha256(b"x").hexdigest(),
+            )
+            path = tmp_path / str(tenant) / str(user) / thread_workspace_path(ref, meta)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(b"x")
+            return row.id, meta.thread_id, path
+
+        short_idle = await _upload(short_tenant, "short-idle.pdf")  # 40d, no run → gone (30d)
+        short_ran = await _upload(short_tenant, "short-ran.pdf")  # 200d, run 10d ago → kept
+        plain_40 = await _upload(plain_tenant, "plain-40.pdf")  # 40d → kept (default 90)
+        plain_used = await _upload(plain_tenant, "plain-used.pdf")  # 200d, used 5d ago → kept
+        plain_stale = await _upload(plain_tenant, "plain-stale.pdf")  # 200d, run 120d → gone
+
+        admin = create_engine(sync_admin, isolation_level="AUTOCOMMIT")
+        try:
+            with admin.connect() as conn:
+                conn.execute(
+                    text(
+                        "UPDATE tenant_config SET upload_retention_days = 30 WHERE tenant_id = :t"
+                    ),
+                    {"t": str(short_tenant)},
+                )
+                for (upload_id, _thread, _path), days in (
+                    (short_idle, 40),
+                    (short_ran, 200),
+                    (plain_40, 40),
+                    (plain_used, 200),
+                    (plain_stale, 200),
+                ):
+                    conn.execute(
+                        text(
+                            "UPDATE user_upload SET created_at = now() - make_interval(days => :d) "
+                            "WHERE id = :u"
+                        ),
+                        {"d": days, "u": upload_id},
+                    )
+                conn.execute(
+                    text(
+                        "UPDATE user_upload SET last_used_at = now() - interval '5 days' "
+                        "WHERE id = :u"
+                    ),
+                    {"u": plain_used[0]},
+                )
+                for tenant, (_upload_id, thread_id, _path), days in (
+                    (short_tenant, short_ran, 10),
+                    (plain_tenant, plain_stale, 120),
+                ):
+                    conn.execute(
+                        text(
+                            "INSERT INTO agent_run (id, tenant_id, thread_id, status, "
+                            " on_disconnect, created_at, updated_at) VALUES (:r, :t, :th, "
+                            " 'success', 'continue', now() - make_interval(days => :d), now())"
+                        ),
+                        {"r": str(uuid4()), "t": str(tenant), "th": str(thread_id), "d": days},
+                    )
+        finally:
+            admin.dispose()
+
+        job = RetentionCleanupJob(
+            db_session_factory=sf,
+            user_upload_store=uploads,
+            thread_store=threads,
+            workspace_root=str(tmp_path),
+            upload_retention_days=90,
+        )
+        await job.run_once()
+
+        async def _gone(entry: tuple[UUID, UUID, Path], tenant: UUID) -> tuple[bool, bool]:
+            row = await uploads.get(upload_id=entry[0], tenant_id=tenant)
+            assert row is not None
+            return row.deleted_at is not None, not entry[2].exists()
+
+        assert await _gone(short_idle, short_tenant) == (True, True)
+        assert await _gone(short_ran, short_tenant) == (False, False)
+        assert await _gone(plain_40, plain_tenant) == (False, False)
+        assert await _gone(plain_used, plain_tenant) == (False, False)
+        assert await _gone(plain_stale, plain_tenant) == (True, True)
+    finally:
+        await worker_engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_a_first_failure_right_after_a_tenant_lowers_its_days_is_retried(
+    db_fixture: tuple[AsyncEngine, AsyncEngine, str],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """B-63 —— 租户刚把天数从默认 90 改成 30:一条 60 天前上传的行,按新天数 30 天前就「到期」了。
+    这时删文件碰上暂时性 I/O 失败,应当明天再试,而不是当成「过了到期日 7 天还在失败」直接放弃
+    (行软删、文件留成孤儿)。"""
+    import errno
+    import os
+
+    from expert_work.persistence import SqlThreadMetaStore, SqlUserUploadStore
+    from retention_cleanup_job import workspace_files
+    from retention_cleanup_job.main import build_session_factory
+
+    _app_engine, worker_engine, sync_admin = db_fixture
+    try:
+        sf = build_session_factory(worker_engine)
+        threads = SqlThreadMetaStore(sf)
+        uploads = SqlUserUploadStore(sf)
+        tenant, user = uuid4(), uuid4()
+        _seed_tenant_config(sync_admin, tenant_id=tenant, audit_days=90, event_days=30)
+        meta = await threads.create(
+            thread_id=uuid4(), tenant_id=tenant, created_by="u", user_id=user, agent_name="bot"
+        )
+        row = await uploads.insert(
+            upload_id=uuid4(),
+            tenant_id=tenant,
+            user_id=user,
+            thread_id=meta.thread_id,
+            kind="document",
+            ref="uploads/lowered.pdf",
+            mime_type="application/pdf",
+            size_bytes=1,
+            filename="lowered.pdf",
+            sha256=hashlib.sha256(b"x").hexdigest(),
+        )
+        path = (
+            tmp_path / str(tenant) / str(user) / thread_workspace_path("uploads/lowered.pdf", meta)
+        )
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"x")
+        admin = create_engine(sync_admin, isolation_level="AUTOCOMMIT")
+        try:
+            with admin.connect() as conn:
+                conn.execute(
+                    text(
+                        "UPDATE user_upload SET created_at = now() - interval '60 days' "
+                        "WHERE id = :u"
+                    ),
+                    {"u": str(row.id)},
+                )
+                conn.execute(
+                    text(
+                        "UPDATE tenant_config SET upload_retention_days = 30, updated_at = now() "
+                        "WHERE tenant_id = :t"
+                    ),
+                    {"t": str(tenant)},
+                )
+        finally:
+            admin.dispose()
+
+        def _broken(*_args: object) -> bool:
+            raise OSError(errno.EIO, os.strerror(errno.EIO))
+
+        monkeypatch.setattr(workspace_files, "_same_as_registered", _broken)
+        job = RetentionCleanupJob(
+            db_session_factory=sf,
+            user_upload_store=uploads,
+            thread_store=threads,
+            workspace_root=str(tmp_path),
+            upload_retention_days=90,
+        )
+        report = await job.run_once()
+
+        after = await uploads.get(upload_id=row.id, tenant_id=tenant)
+        assert after is not None and after.deleted_at is None  # retried tomorrow
+        assert path.exists()
+        assert report.upload_rows_abandoned == 0
+        assert report.upload_rows_failed >= 1
+    finally:
+        await worker_engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_a_row_failing_long_past_expiry_is_given_up_despite_recent_config_edits(
+    db_fixture: tuple[AsyncEngine, AsyncEngine, str],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """B-63 —— 到期 70 天、租户配置今天刚改过:推迟放弃最多 30 天,早已用完 —— 这一轮的暂时性
+    失败就放弃(行软删、文件不动、记 ``rows_abandoned``,pass 记失败)。"""
+    import errno
+    import os
+
+    from expert_work.persistence import SqlThreadMetaStore, SqlUserUploadStore
+    from retention_cleanup_job import workspace_files
+    from retention_cleanup_job.main import build_session_factory
+
+    _app_engine, worker_engine, sync_admin = db_fixture
+    try:
+        sf = build_session_factory(worker_engine)
+        threads = SqlThreadMetaStore(sf)
+        uploads = SqlUserUploadStore(sf)
+        tenant, user = uuid4(), uuid4()
+        _seed_tenant_config(sync_admin, tenant_id=tenant, audit_days=90, event_days=30)
+        meta = await threads.create(
+            thread_id=uuid4(), tenant_id=tenant, created_by="u", user_id=user, agent_name="bot"
+        )
+        row = await uploads.insert(
+            upload_id=uuid4(),
+            tenant_id=tenant,
+            user_id=user,
+            thread_id=meta.thread_id,
+            kind="document",
+            ref="uploads/stuck.pdf",
+            mime_type="application/pdf",
+            size_bytes=1,
+            filename="stuck.pdf",
+            sha256=hashlib.sha256(b"x").hexdigest(),
+        )
+        path = tmp_path / str(tenant) / str(user) / thread_workspace_path("uploads/stuck.pdf", meta)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"x")
+        admin = create_engine(sync_admin, isolation_level="AUTOCOMMIT")
+        try:
+            with admin.connect() as conn:
+                conn.execute(
+                    text(
+                        "UPDATE user_upload SET created_at = now() - interval '100 days' "
+                        "WHERE id = :u"
+                    ),
+                    {"u": str(row.id)},
+                )
+                conn.execute(
+                    text(
+                        "UPDATE tenant_config SET upload_retention_days = 30, updated_at = now() "
+                        "WHERE tenant_id = :t"
+                    ),
+                    {"t": str(tenant)},
+                )
+        finally:
+            admin.dispose()
+
+        def _broken(*_args: object) -> bool:
+            raise OSError(errno.EIO, os.strerror(errno.EIO))
+
+        monkeypatch.setattr(workspace_files, "_same_as_registered", _broken)
+        job = RetentionCleanupJob(
+            db_session_factory=sf,
+            user_upload_store=uploads,
+            thread_store=threads,
+            workspace_root=str(tmp_path),
+            upload_retention_days=90,
+        )
+        report = await job.run_once()
+
+        after = await uploads.get(upload_id=row.id, tenant_id=tenant)
+        assert after is not None and after.deleted_at is not None  # given up
+        assert path.exists()
+        assert report.upload_rows_abandoned >= 1
+        assert "uploads" in report.failed_passes
+    finally:
+        await worker_engine.dispose()

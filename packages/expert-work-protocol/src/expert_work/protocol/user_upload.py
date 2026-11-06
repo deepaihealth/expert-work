@@ -56,6 +56,10 @@ class UserUpload(BaseModel):
     deleted_at: datetime | None = None
     #: B-271 —— 落地字节的 sha256(十六进制),上传时写入;列加上之前的老行为 ``None``。
     sha256: str | None = None
+    #: B-63 —— 最后一次被重新附加到 run、或经对外接口下载的时间(每行每天最多记一次);
+    #: 列加上之前没用过的行为 ``None``。保留期从 ``created_at`` / 这个时间 / 会话最后一次
+    #: run 三者中最晚的那个算起。
+    last_used_at: datetime | None = None
 
 
 def render_upload_id(upload_id: UUID) -> str:

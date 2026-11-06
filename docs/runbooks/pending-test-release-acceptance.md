@@ -1944,3 +1944,18 @@ oauth2 目录项本来就不在平台池里:不再碰平台池;`enabled` 切换�
 - [x] **89.4 用户自己写的不误伤**:发两条消息,一条中间单独一行写 `[file attached: config]`、下一行再写一句话,一条以 `请解释 [file attached: x]` 结尾。判据:都原样显示,不变成标签。 **11-04 测试 `72abce48b` 过**:单独成行的 `[file attached: config]` 与句尾 `请解释 [file attached: x]` 都原样显示
 - [x] **89.5 重试带上附件**:在调试台从侧栏打开 89.1 的对话,点那一轮的「重试」。判据:输入框回填提问原文,附件区出现同一个 PDF 标签;不会自动发出。 **11-04 测试 `72abce48b` 过**:调试台从侧栏打开会话点重试:输入框回填原文,附件区出现 `acc-a.pdf`,没有自动发出(运行数仍 1)
 - [x] **89.6 收尾**:删本节建的对话和上传。 **11-04 测试 `72abce48b` 过**:会话、临时智能体、对外用户已删,临时 key 吊销、服务账号删除
+
+## §90 附件按最后使用到期 + 租户可调保留期(B-63 PR1)
+
+**背景**:附件(`user_upload`)的 90 天改为从**最后使用**算起:`greatest(created_at, last_used_at, 会话最后一次 run)` + 租户 `tenant_config.upload_retention_days`(为空用平台默认 90)。`last_used_at` 在对外接口重新附加(登记行;跨会话就是源会话那一行)与对外下载成功时记,每行每天最多一次。迁移 `0183_b63_upload_last_used` 加三列(都可空):`user_upload.last_used_at`、`tenant_config.upload_retention_days` / `artifact_retention_days`(7–365;产物那一列 PR2 才生效)。改小要显式确认:接口不带 `?confirm_retention_decrease=true` 回 409 `RETENTION_DECREASE_NOT_CONFIRMED`,控制台弹确认框。「过期 7 天还失败就放弃」从 `max(到期日, tenant_config.updated_at)` 算,但最多推迟 30 天;因此仍在重试、而已过到期日 7 天的行计入 `upload_rows_failing_overdue`,作业以 3 退出(告警会响)。作业环境变量 `EXPERT_WORK_RETENTION_{UPLOAD,ARTIFACT}_RETENTION_DAYS` 同样限 7–365(超出夹回并打 warning),默认 90 必须与协议的 `FILE_RETENTION_DEFAULT_DAYS` 一致。janitor 里关着的 uploads / artifacts 两条规则已删。
+
+**回滚注意**:回滚镜像会恢复「按创建时间到期」(老代码不认 `last_used_at`),当晚就会清掉一批按新规则还该保留的附件 / 产物。**先暂停 retention-cleanup CronJob(`kubectl patch cronjob retention-cleanup -p '{"spec":{"suspend":true}}'`)再回滚,确认回滚后的行为可以接受后再恢复(`suspend: false`)**。迁移是只加列,回滚不需要 downgrade。
+
+**怎么进**:测试环境控制台(system_admin,平台租户);对外接口用平台租户临时 API key。测试数据都不满 90 天,所以要**造过期行**:只改本节自建的行(按 id),每次改库前用户批准;造完手动触发一次留存作业(`kubectl create job --from=cronjob/retention-cleanup b63-probe-<n>`),看日志与库。**花费**:约 ¥1(两轮短对话)。
+
+- [ ] **90.1 迁移**:发布后只读查 `alembic_version` = `0183_b63_upload_last_used`;三列存在且可空;`tenant_config` 有两条 `*_retention_range_ck` 约束
+- [ ] **90.2 记使用**:对外接口在会话 A 传 `probe-a.pdf`,在会话 B 传 `probe-b.pdf`;用会话 B 发一轮带 `files:[{upload_id: probe-a}]`;再对 `probe-b` 调一次下载。判据:只读查两行的 `last_used_at` 都有值(a 是因为被跨会话引用,b 是因为下载);当天再下载一次 `last_used_at` 不变
+- [ ] **90.3 造过期行(用户批准后改库)**:在一个新会话 C 里传 4 个文档并发一轮,然后按 id 改:① `c1`:`created_at` 改 100 天前,把会话 C 的全部 run 的 `created_at` 改 100 天前 —— 应删;② 新会话 D 里传 `c2` 并发一轮,只把 `c2` 的 `created_at` 改 200 天前、D 的 run 保持今天 —— 应留(会话最近有 run);③ 新会话 E 里传 `c3`,`created_at` 改 200 天前、E 的 run 改 100 天前、`last_used_at` 改 5 天前 —— 应留(最近用过);④ 新会话 F 里传 `c4`,`created_at` 与 F 的 run 都改 40 天前 —— 默认 90 天下应留
+- [ ] **90.4 租户覆盖**:控制台「租户配置」JSON 里把平台租户的 `upload_retention_days` 设为 30。判据:保存时弹「确认改小保留期」(内容含「改小后最早今晚就会清理更多文件，且不可恢复」),取消则不改,确认后读视图显示 30(另一项显示「平台默认」);设 6 或 366 时保存失败(422);用 API 直接 PUT 30→10 不带 `confirm_retention_decrease=true` 回 409 `RETENTION_DECREASE_NOT_CONFIRMED`、值不变
+- [ ] **90.5 跑作业**:手动触发留存作业。判据:`c1`、`c4` 的行 `deleted_at` 有值、文件已删(`c4` 是因为租户改成了 30 天);`c2`、`c3` 行与文件都在、对外下载 200;作业日志 `uploads_expired` ≥ 2、退出码 0;另一个租户(若有自建测试租户则在其下放一条 40 天前的行)不受 30 天影响
+- [ ] **90.6 收尾**:租户配置里 `upload_retention_days` 设回 `null`(读视图显示「平台默认」,审计 `TENANT_CONFIG_WRITE` 的 `fields` 里有它);删本节建的会话、上传与 probe job;吊销临时 key

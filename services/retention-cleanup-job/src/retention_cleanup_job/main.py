@@ -111,6 +111,19 @@ def configure_logging(settings: RetentionCleanupSettings, *, stream: IO[str] | N
     )
 
 
+def warn_clamped_retention(settings: RetentionCleanupSettings) -> None:
+    """B-63 —— 产物 / 上传保留期配得超出 7-365 的,settings 已夹回范围;这里在日志装好之后
+    逐条打 warning,让人知道实际用的不是配的那个数。"""
+    for name, configured in settings.clamped_retention.items():
+        logger.warning(
+            "retention.retention_days_clamped field=%s configured=%d used=%d "
+            "— the allowed range is 7-365 days",
+            name,
+            configured,
+            getattr(settings, name),
+        )
+
+
 #: B-271 —— 有 pass 失败(吞掉异常、其余 pass 照跑完)时进程的退出码,让 CronJob 显示失败。
 #: 与启动校验拒跑的 ``2`` 区分开。``backoffLimit: 1`` 会再起一个 pod 重跑一次:每个 pass 都
 #: 幂等,重跑只是多一份日志,不会多删东西。
@@ -133,7 +146,7 @@ def log_done(report: CleanupReport) -> None:
         "purged_agent_dirs_removed=%d purged_agent_dirs_failed=%d "
         "uploads_expired=%d upload_files_removed=%d upload_files_unsafe=%d "
         "upload_rows_failed=%d upload_rows_abandoned=%d upload_rows_held=%d "
-        "upload_owners_unavailable=%d "
+        "upload_owners_unavailable=%d upload_rows_failing_overdue=%d "
         "thread_dirs_removed=%d "
         "memory_hard_deleted=%d workspaces_hard_deleted=%d "
         "workspaces_pending_archive=%d tenant_users_hard_deleted=%d "
@@ -161,6 +174,7 @@ def log_done(report: CleanupReport) -> None:
         report.upload_rows_abandoned,
         report.upload_rows_held,
         report.upload_owners_unavailable,
+        report.upload_rows_failing_overdue,
         report.thread_dirs_removed,
         report.memory_hard_deleted,
         report.workspaces_hard_deleted,
@@ -179,6 +193,7 @@ def log_done(report: CleanupReport) -> None:
 async def _amain() -> int:
     settings = RetentionCleanupSettings()
     configure_logging(settings)
+    warn_clamped_retention(settings)
     # 连库之前先定工作区根:不合格就退出,一条 DELETE 都不发。
     workspace_root = resolve_workspace_root(settings, environ=os.environ)
 

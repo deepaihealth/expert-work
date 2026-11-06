@@ -2293,6 +2293,13 @@ export interface TranslationKeys {
     plan: string;
     audit_retention_days: string;
     event_log_retention_days: string;
+    // B-63 — upload / artifact retention, counted from last use.
+    upload_retention_days: string;
+    artifact_retention_days: string;
+    file_retention_default: string;
+    retention_decrease_title: string;
+    retention_decrease_body: string;
+    retention_decrease_ok: string;
     // Stream C.6 — per-tenant rate limit override.
     rate_limit_override: string;
     rate_limit_default: string;
@@ -6279,6 +6286,13 @@ const en: TranslationKeys = {
     plan: "Plan",
     audit_retention_days: "Audit retention (days)",
     event_log_retention_days: "Event log retention (days)",
+    upload_retention_days: "Upload retention (days since last use)",
+    artifact_retention_days: "Artifact retention (days since last use)",
+    file_retention_default: "Platform default",
+    retention_decrease_title: "Lower the retention period?",
+    retention_decrease_body:
+      "{{changes}}. Lowering it can delete more files as soon as tonight, and this is irreversible.",
+    retention_decrease_ok: "Lower it",
     rate_limit_override: "Per-tenant rate limit",
     rate_limit_default: "Platform default",
     skill_stale_days: "Skill stale threshold (days)",

@@ -60,7 +60,6 @@ from expert_work.persistence.workspace.layout import (
     WORKSPACE_CONVERSATION_WORK_DIR,
     WORKSPACE_INPUTS_DIR,
     WORKSPACE_THREADS_DIR,
-    WORKSPACE_UPLOADS_DIR,
 )
 from expert_work.runtime.storage import ObjectStore
 from orchestrator.tools.nas_workspace_store import DELETED_DIR, workspace_user_root
@@ -117,20 +116,14 @@ _INPUTS_TMP_NAME = "inputs.json.tmp"
 
 @dataclass(frozen=True)
 class _ReclaimPolicy:
-    """一条回收策略。``enabled=False`` 的条目本批不生效,代码路径仍然走到。"""
+    """一条回收策略(只有 inputs 两条,见 :data:`_POLICIES`)。"""
 
     label: str  # 指标与日志用
     ttl_s: float
-    enabled: bool
 
     def expired(self, mtime: float, now: float) -> bool:
-        """这个条目该收了吗。
-
-        ``enabled`` 判在**这里**、而不是在调用方用 ``if`` 跳掉整条策略:关着的
-        策略照样被扫、照样逐条走到判定,只是答案恒为「不收」。B-63 要开 uploads
-        与产物那两条时拨的是这个开关,不是补一段从没跑过的新代码。
-        """
-        return self.enabled and now - mtime >= self.ttl_s
+        """这个条目该收了吗。"""
+        return now - mtime >= self.ttl_s
 
 
 #: per-run 目录的 TTL —— **长而便宜的那一半**。
@@ -184,20 +177,14 @@ _CACHE_TTL_S = 7 * 24 * 3600
 #: ``inputs.json`` 的 ``value`` 里永远留着原始 URL,重下即可;而删掉 run 目录会让模型
 #: 一无所有,退回手抄长串。理由写在 :data:`_RUN_DIR_TTL_S` / :data:`_CACHE_TTL_S` 上。
 #:
-#: B-61 T12 本批只启用 inputs 两条;uploads 与产物的条目**先放在这里但关着**——
-#: 它们删的是用户数据,需要产品定 N、需要发布前告知、还要对外删除端点(B-62)当自救
-#: 出口,那是 B-63 的事。机制一次写好,B-63 落地时是把开关拨开 + 接 touch 点,不是重写。
-#:
-#: **B-63 拨开关前还欠一笔**:``uploads`` 的落点只覆盖三处之一(见 :data:`_TARGETS`),
-#: 拨开关之前得先补第二条遍历,否则它只收三分之一还不会说话。
-#: (另一笔已经清掉:``JanitorRunStats`` 的两个计数器原名 ``inputs_*``,拨开关那天会把
-#: 上传件的删除计进名字里写着 inputs 的字段,已改名成 ``reclaim_*``;它们仍是**所有策略
-#: 合计**,要按策略分开看的是 ``reclaim_summary`` 日志里的 ``by_policy=``。)
+#: **上传件与产物不归这里管**(B-63):它们的保留期由 retention-cleanup-job 按登记行与
+#: 「最后使用」时间判(``user_upload`` / ``artifact_version``),删之前核对内容、查还有没有
+#: 别的登记行指着同一个文件。这里只看 mtime、不查库,收它们会绕过那些保护,所以此前关着的
+#: 两条已经删掉。``JanitorRunStats`` 的 ``reclaim_*`` 是这两条 inputs 策略的合计,按策略
+#: 分开看的是 ``reclaim_summary`` 日志里的 ``by_policy=``。
 _POLICIES = (
-    _ReclaimPolicy(label="inputs_cache", ttl_s=_CACHE_TTL_S, enabled=True),
-    _ReclaimPolicy(label="inputs_run_dir", ttl_s=_RUN_DIR_TTL_S, enabled=True),
-    _ReclaimPolicy(label="uploads", ttl_s=90 * 24 * 3600, enabled=False),
-    _ReclaimPolicy(label="artifacts", ttl_s=90 * 24 * 3600, enabled=False),
+    _ReclaimPolicy(label="inputs_cache", ttl_s=_CACHE_TTL_S),
+    _ReclaimPolicy(label="inputs_run_dir", ttl_s=_RUN_DIR_TTL_S),
 )
 
 
@@ -224,39 +211,19 @@ class _ReclaimTarget:
     file_names: frozenset[str] | None
 
 
-#: 每条策略去哪儿收,键是 :attr:`_ReclaimPolicy.label`;``None`` = **还没有落点**。
-#: 两条关着的策略各自欠着一笔,拨开关之前都得先还:
-#:
-#: * ``uploads`` 这一条**只覆盖 ``agents/<key>/uploads/``**(B-50 搬迁之后的位置),
-#:   而上传件一共落在三处:① 这里;② **用户根的 ``uploads/``** —— ``api/
-#:   _workspace_shared.workspace_agent_path`` 在 ``agent_key`` 为空(会话没绑 agent /
-#:   机器线程)时**原样返回** ``rel``,是**今天仍在写**的路径;③ ``shared/uploads/``
-#:   —— 搬迁留下的 legacy(只读、不再写入),被
-#:   ``test_legacy_toplevel_and_shared_uploads_are_still_reserved`` 钉成合法位置。
-#:   ②③ **不在 ``agents/`` 下**,本 phase 的遍历(用户根 → ``agents/`` → agent key)
-#:   结构上就到不了 —— B-63 拨开这个开关要补的是**第二条遍历**,不是在这张表上多加
-#:   一行;不补就是个只收三分之一、自己不会说话的开关。
-#: * ``artifacts`` **显式写 None**(不是漏配):产物没有保留前缀 —— ``save_artifact``
-#:   只是把 agent 子树里任意位置的一个文件**登记成一行**(``tools/artifact.py``),
-#:   纯文件系统的清扫器认不出哪个文件是产物,``layout.py`` 的
-#:   ``WORKSPACE_RESERVED_PREFIXES`` 正是为此只列 machinery 与 uploads。「产物在哪」
-#:   要等 B-63 先定义(它的方案是让目录自描述)。
-#:
-#: 两条都一样:**开关拨开 ≠ 立刻生效**,先补落点/遍历,否则拨开也收不到东西。
-_TARGETS: dict[str, _ReclaimTarget | None] = {
+#: 每条策略去哪儿收,键是 :attr:`_ReclaimPolicy.label`。
+_TARGETS: dict[str, _ReclaimTarget] = {
     "inputs_cache": _ReclaimTarget(
         subdir=f"{_INPUTS_DIR}/{_INPUTS_CACHE_DIR}", uuid_dirs=False, file_names=None
     ),
     "inputs_run_dir": _ReclaimTarget(
         subdir=_INPUTS_DIR, uuid_dirs=True, file_names=frozenset({_INPUTS_TMP_NAME})
     ),
-    "uploads": _ReclaimTarget(subdir=WORKSPACE_UPLOADS_DIR, uuid_dirs=False, file_names=None),
-    "artifacts": None,
 }
 
 if {policy.label for policy in _POLICIES} != _TARGETS.keys():
     # 导入期就炸,不给「静默什么都不收」留位置:两张按 label 索引的表一旦对不上,
-    # 漏配的那条策略拨开 enabled 也是个哑开关,而没有任何运行期信号会提到它。
+    # 漏配的那条策略一声不吭地什么都不收,而没有任何运行期信号会提到它。
     # 用显式 raise 不用 assert —— assert 在 ``-O`` 下会被整段裁掉。
     raise RuntimeError("workspace_janitor: _POLICIES 与 _TARGETS 的 label 必须一一对应")
 
@@ -440,15 +407,6 @@ def _reclaim_base(base_fd: int, *, scope: _ReclaimScope, now: float) -> dict[str
     tally = {policy.label: (0, 0) for policy in _POLICIES}
     for policy in _POLICIES:
         target = _TARGETS[policy.label]
-        if target is None:
-            # 还没有落点的策略(``artifacts``),见 _TARGETS 上方注释。
-            # 注意这与 ``enabled=False`` 的 ``uploads`` **不对称**:
-            # uploads 有落点,于是照样逐 agent 下降 + 全量 scandir,
-            # 只为对每个条目求一个恒假的谓词(「关着的策略也要走到判
-            # 定」是 brief 的明确要求,B-63 拨开关那天才不是新代码);
-            # 而没有落点的这条连下降都做不了。代价:上传件多的用户,
-            # 每轮白扫一遍 uploads/。拨开关时这笔开销就变成了实际工作。
-            continue
         try:
             files, dirs = _reclaim_target(base_fd, policy, target, now, scope)
         except FileNotFoundError:

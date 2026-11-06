@@ -66,7 +66,9 @@ from control_plane.api.uploads import (
     UPLOAD_ERROR_CODES,
     LandingAccount,
     copy_document_into_thread,
+    file_upload_ids,
     is_safe_document_upload_id,
+    note_uploads_used,
     original_document_name,
 )
 from control_plane.audit import emit
@@ -1832,7 +1834,7 @@ def build_agents_router() -> APIRouter:
             document_original_names=original_names,
         )
         try:
-            return await spawn_run(
+            response = await spawn_run(
                 runtime=runtime,
                 audit=audit,
                 approvals=approvals,
@@ -1863,6 +1865,13 @@ def build_agents_router() -> APIRouter:
                 # 默认值留给它。完整理由见 ``spawn_run`` 的 docstring。
                 on_disconnect=DisconnectMode.CONTINUE,
             )
+            # B-63 —— run 被接受之后才记附件的使用(记在登记行上,跨会话时就是源会话那一行);
+            # 前面任何一步拒绝(某个附件不对、超限、排队满……)都不记。
+            if response.status_code < 400:
+                await note_uploads_used(
+                    uploads_store, tenant_id=tenant_id, upload_ids=file_upload_ids(payload.files)
+                )
+            return response
         except RunIdempotencyConflict:
             # P2-a Task 13 (queue) / Task 14 (stream) —— concurrent single
             # winner. Both requests missed each other in the
