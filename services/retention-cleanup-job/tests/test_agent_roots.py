@@ -784,7 +784,10 @@ async def test_a_file_replaced_by_a_new_inode_before_removal_is_kept(
         real = agent_roots._remove_file
 
         def _swap_then_remove(*args: object) -> str:
-            target.unlink()
+            # Keep the old inode alive under a dot-name (never swept): Linux
+            # filesystems hand a just-freed inode number straight back, so
+            # unlink + create could give the "new" file the same inode.
+            target.rename(target.with_name(".old.txt"))
             target.write_text("new")
             return real(*args)  # type: ignore[arg-type]
 
@@ -803,8 +806,6 @@ async def test_a_dir_replaced_by_a_new_inode_before_removal_is_kept(
     world: _World, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """L5 —— 子目录同样:判定之后被换成新目录,不挪进隔离区。"""
-    import shutil
-
     from retention_cleanup_job import agent_roots
 
     try:
@@ -815,7 +816,9 @@ async def test_a_dir_replaced_by_a_new_inode_before_removal_is_kept(
         real = agent_roots._remove_dir
 
         def _swap_then_remove(*args: object) -> str:
-            shutil.rmtree(tpl)
+            # Same as the file case: park the old dir under a dot-name so its
+            # inode number cannot be reused for the replacement.
+            tpl.rename(tpl.with_name(".old-tpl"))
             (tpl / "fresh.md").parent.mkdir()
             (tpl / "fresh.md").write_text("fresh")
             return real(*args)  # type: ignore[arg-type]
