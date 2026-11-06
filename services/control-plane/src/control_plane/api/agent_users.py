@@ -331,6 +331,7 @@ def _build_purge_deps(request: Request) -> PurgeUserDeps:
         skills=state.skill_store,
         eval_datasets=state.eval_dataset_store,
         curation_candidates=state.curation_candidate_store,
+        quality_scores=state.quality_score_store,
         retrieval_logs=state.knowledge_retrieval_log_store,
         tenant_users=state.tenant_user_repo,
         audit=state.audit_logger,

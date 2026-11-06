@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Sequence
 from datetime import UTC, datetime
 from uuid import UUID
 
@@ -126,6 +127,18 @@ class InMemoryQualityScoreStore(QualityScoreStore):
                 key
                 for key, r in self._by_run.items()
                 if r.tenant_id == tenant_id and r.agent_name == agent_name
+            ]
+            for key in victims:
+                del self._by_run[key]
+            return len(victims)
+
+    async def delete_for_threads(self, *, tenant_id: UUID, thread_ids: Sequence[UUID]) -> int:
+        wanted = set(thread_ids)
+        async with self._lock:
+            victims = [
+                key
+                for key, r in self._by_run.items()
+                if r.tenant_id == tenant_id and r.thread_id in wanted
             ]
             for key in victims:
                 del self._by_run[key]

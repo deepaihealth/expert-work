@@ -154,3 +154,17 @@ class UserUploadStore(abc.ABC):
     async def delete_for_threads(self, *, tenant_id: UUID, thread_ids: Sequence[UUID]) -> int:
         """B-278 —— hard-delete the upload registry rows of these conversations;
         tenant-scoped, returns the count deleted."""
+
+    @abc.abstractmethod
+    async def tombstone_for_threads(
+        self, *, tenant_id: UUID, thread_ids: Sequence[UUID], now: datetime
+    ) -> int:
+        """B-280 —— conversation purge. Live **document** rows of these
+        conversations become tombstones (see
+        :func:`expert_work.protocol.is_session_deleted_tombstone`: content and
+        identity columns scrubbed, ``deleted_at = now``) so a later reference
+        from another conversation still answers ``UPLOAD_SESSION_DELETED``.
+        Image rows and rows already soft-deleted (expired) are hard-deleted —
+        both answered ``UPLOAD_NOT_FOUND`` before the purge and still do.
+        Existing tombstones are left alone (re-runnable). Tenant-scoped;
+        returns the rows tombstoned + deleted."""

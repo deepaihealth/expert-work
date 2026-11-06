@@ -291,6 +291,7 @@ from expert_work.protocol.user_upload import (
     UPLOAD_ID_PREFIX,
     UserUpload,
     UserUploadKind,
+    is_session_deleted_tombstone,
     parse_upload_id,
     render_upload_id,
 )
@@ -547,6 +548,7 @@ __all__ = [
     "chunk_retrieval_text",
     "dimension_applies",
     "enforce_security_floor",
+    "is_session_deleted_tombstone",
     "knowledge_document_title",
     "models_for_provider",
     "parse_agent_ref",

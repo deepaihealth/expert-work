@@ -9,7 +9,7 @@ from uuid import UUID
 from sqlalchemy import ColumnElement, Subquery, and_, delete, func, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from expert_work.persistence.bulk_delete import count_in_chunks, delete_in_chunks
+from expert_work.persistence.bulk_delete import CHUNK, count_in_chunks, delete_in_chunks
 from expert_work.persistence.models import AgentRunRow, TenantConfigRow, UserUploadRow
 from expert_work.persistence.user_upload.base import (
     GIVE_UP_DEFER_CAP,
@@ -18,6 +18,7 @@ from expert_work.persistence.user_upload.base import (
     UserUploadStore,
 )
 from expert_work.protocol import UserUpload, UserUploadKind
+from expert_work.protocol.user_upload import SESSION_DELETED_TOMBSTONE_REF
 
 
 def _expiry(default_days: int, *candidates: ColumnElement[bool]) -> Subquery:
@@ -279,3 +280,49 @@ class SqlUserUploadStore(UserUploadStore):
             list(thread_ids),
             UserUploadRow.tenant_id == tenant_id,
         )
+
+    async def tombstone_for_threads(
+        self, *, tenant_id: UUID, thread_ids: Sequence[UUID], now: datetime
+    ) -> int:
+        ids = list(thread_ids)
+        handled = 0
+        for i in range(0, len(ids), CHUNK):
+            scope = (
+                UserUploadRow.tenant_id == tenant_id,
+                UserUploadRow.thread_id.in_(ids[i : i + CHUNK]),
+            )
+            async with self._sf() as session:
+                # Images and already-expired rows go; existing tombstones (empty ``ref``) stay.
+                gone = await session.execute(
+                    delete(UserUploadRow).where(
+                        *scope,
+                        or_(
+                            UserUploadRow.kind == "image",
+                            and_(
+                                UserUploadRow.deleted_at.is_not(None),
+                                UserUploadRow.ref != SESSION_DELETED_TOMBSTONE_REF,
+                            ),
+                        ),
+                    )
+                )
+                scrubbed = await session.execute(
+                    update(UserUploadRow)
+                    .where(
+                        *scope,
+                        UserUploadRow.kind == "document",
+                        UserUploadRow.deleted_at.is_(None),
+                    )
+                    .values(
+                        ref=SESSION_DELETED_TOMBSTONE_REF,
+                        filename="",
+                        mime_type="",
+                        size_bytes=0,
+                        sha256=None,
+                        last_used_at=None,
+                        deleted_at=now,
+                    )
+                )
+                await session.commit()
+            handled += int(getattr(gone, "rowcount", 0) or 0)
+            handled += int(getattr(scrubbed, "rowcount", 0) or 0)
+        return handled

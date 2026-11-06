@@ -10,7 +10,11 @@ billing / analytics:
   artifacts (+ versions, + each version's copy of its bytes — B-235), MCP OAuth
   connections, agent-instance bindings,
   approvals, triggers (+ their runs), webhook endpoints (+ their deliveries),
-  image uploads, volume-backup DLQ, the knowledge retrieval logs (B-175
+  image uploads (an image whose object-store bytes could not be deleted keeps
+  its row and fails the step, so a re-run finds it), volume-backup DLQ, the
+  quality scores and curation candidates of the user's conversations (B-280:
+  a candidate carries the user's own 👎 comment and points at the purged
+  conversation's trajectory), the knowledge retrieval logs (B-175
   P2-PR4: every search in the user's conversations whoever's run made it, their
   runs elsewhere, their own console tests — if that fails, the run-deleting and
   run-anonymising steps are ``skipped`` so a re-run can still find the rows),
@@ -19,7 +23,9 @@ billing / analytics:
   + ``sandbox_instance`` rows.
 * **ANONYMIZE** (KEEP the row, null the user link) — ``token_usage`` and
   ``agent_run`` (billing / analytics), ``skill`` actor columns (tenant IP),
-  ``eval_dataset.source_user_id`` and ``curation_candidate.user_id``.
+  ``eval_dataset.source_user_id`` and ``curation_candidate.user_id`` (the
+  candidates left after the per-conversation delete — ones on other users'
+  conversations).
 * **IDENTITY** — soft-deactivate the ``tenant_user`` row (``deleted_at``).
 
 Modelled on ``api/tenants.py:_bulk_cancel_tenant_runs`` (enumerate-then-act,
@@ -45,6 +51,7 @@ from datetime import UTC, datetime
 from uuid import UUID
 
 from control_plane.audit import emit
+from control_plane.purge.image_blobs import ImageTally, delete_images
 from control_plane.runtime import AgentRuntime
 from expert_work.persistence.agent_instance.base import AgentInstanceStore
 from expert_work.persistence.approval import ApprovalStore
@@ -55,6 +62,7 @@ from expert_work.persistence.image_upload import ImageUploadStore
 from expert_work.persistence.knowledge import KnowledgeRetrievalLogStore
 from expert_work.persistence.mcp_oauth_connection.base import McpOAuthConnectionStore
 from expert_work.persistence.memory import MemoryStore, MemoryWritebackDLQ, MemoryWritebackJobStore
+from expert_work.persistence.quality_score import QualityScoreStore
 from expert_work.persistence.skill import SkillStore
 from expert_work.persistence.tenant_user import TenantUserStore
 from expert_work.persistence.thread_meta import ThreadMetaStore
@@ -86,6 +94,9 @@ _MAX_THREADS = 20_000
 #: ``failures`` key, and while it has failed the run-deleting and
 #: run-anonymising steps are skipped.
 _LOG_STEP = "knowledge_retrieval_log"
+#: B-280 —— ``failures`` keys of the thread-keyed child steps in
+#: :func:`_purge_threads`; any of them failed → the threads stay for a re-run.
+_THREAD_CHILD_STEPS = ("feedback", "quality_score", "curation_candidate_delete", "agent_approval")
 
 
 @dataclass(frozen=True)
@@ -113,7 +124,7 @@ class PurgeUserDeps:
     feedback: FeedbackStore
     #: ``None`` when no object store is wired (e.g. some dev/test deployments)
     #: — the image-blob purge step then hard-deletes rows only and counts them
-    #: as skipped (the retention sweep reaps the orphaned keys later).
+    #: as skipped (there are no bytes it could delete).
     object_store: ObjectStore | None
     #: ``None`` in control-plane deployments — the volume-backup DLQ is a
     #: supervisor-owned store (like ``sandbox_instance``); wire it if present.
@@ -123,6 +134,9 @@ class PurgeUserDeps:
     skills: SkillStore
     eval_datasets: EvalDatasetStore
     curation_candidates: CurationCandidateStore
+    #: B-280 —— the judge's verdicts on the user's conversations (the rationale
+    #: quotes the exchange).
+    quality_scores: QualityScoreStore
     #: B-175 P2-PR4 — knowledge searches made in the user's runs (the question
     #: asked is the user's text).
     retrieval_logs: KnowledgeRetrievalLogStore
@@ -265,7 +279,8 @@ async def _purge_threads(
     # below: if a thread's delete fails partway through, we don't want to be
     # left with "the thread is gone but its feedback rows survive" — cascading
     # the comments first means a failed thread purge still leaves a consistent
-    # (feedback-free) state to retry.
+    # (feedback-free) state to retry. (And if the feedback delete itself fails,
+    # the threads stay — see ``_THREAD_CHILD_STEPS`` below.)
     try:
         summary.deleted["feedback"] = await deps.feedback.delete_for_threads(
             tenant_id=tenant_id, thread_ids=thread_ids
@@ -274,6 +289,29 @@ async def _purge_threads(
         logger.warning("purge_user.feedback_failed", exc_info=True)
         # Type only, never str(exc) — see _step's docstring.
         summary.failures["feedback"] = type(exc).__name__
+
+    # B-280 —— the judge's verdicts on these conversations, and the curation
+    # candidates flagged on them (the user's own 👎 comment + a pointer at the
+    # conversation's trajectory). Same best-effort shape as feedback; the
+    # candidates on other users' conversations are anonymised later.
+    for table, key, coro in (
+        (
+            "quality_score",
+            "quality_score",
+            deps.quality_scores.delete_for_threads(tenant_id=tenant_id, thread_ids=thread_ids),
+        ),
+        (
+            "curation_candidate",
+            "curation_candidate_delete",
+            deps.curation_candidates.delete_for_threads(tenant_id=tenant_id, thread_ids=thread_ids),
+        ),
+    ):
+        try:
+            summary.deleted[table] = await coro
+        except Exception as exc:
+            logger.warning("purge_user.step_failed step=%s error=%s", key, type(exc).__name__)
+            # Type only, never str(exc) — see _step's docstring.
+            summary.failures[key] = type(exc).__name__
 
     # Approvals are keyed by thread, not user — the only writer (orchestrator
     # sse.py pause flow) stamps user_id=None on every row, so the per-user
@@ -286,6 +324,15 @@ async def _purge_threads(
         logger.warning("purge_user.approvals_failed", exc_info=True)
         # Type only, never str(exc) — see _step's docstring.
         summary.failures["agent_approval"] = type(exc).__name__
+
+    # B-280 —— child before parent (as ``agent_purge_steps.purge_conversations``):
+    # these rows are found by thread id only (``quality_score`` has no user
+    # column, curation candidates get anonymised further down), so deleting the
+    # threads now would leave them with nothing to find them by. Keep the
+    # threads; a re-run deletes the leftovers, then the threads.
+    if any(step in summary.failures for step in _THREAD_CHILD_STEPS):
+        summary.skipped.append("threads")
+        return
 
     checkpointer = deps.runtime.durable_checkpointer
     adelete = getattr(checkpointer, "adelete_thread", None)
@@ -384,32 +431,37 @@ async def _purge_webhooks(
     )
 
 
+#: Image rows per pass; a full page means there may be more (every row of a
+#: page that raised nothing is gone, so the next page is new rows).
+_IMAGE_PAGE = 1000
+
+
 async def _purge_images(
     deps: PurgeUserDeps, summary: PurgeSummary, *, tenant_id: UUID, user_id: UUID
 ) -> None:
-    """Delete the user's image-upload object-store blobs, then their rows.
+    """Delete the user's image-upload object-store bytes, then the rows whose
+    bytes are gone (:mod:`control_plane.purge.image_blobs`).
 
-    Deletion-hygiene purge (Task 8) — ``list_for_user`` returns every row
-    (active AND soft-deleted, per its docstring) so a soft-deleted image's
-    blob is cleaned up too, not just the ones still visible in the UI.
-    Row deletion always runs (even with no ``object_store`` wired) — an
-    orphaned object-store key is recoverable by the retention sweep, a
-    stuck ``image_upload`` row is not.
+    ``list_for_user`` returns active AND soft-deleted rows, so a soft-deleted
+    image's bytes are cleaned up too. An image whose bytes could not be deleted
+    keeps its row and the step fails (``ImageBytesNotDeletedError``): nothing
+    sweeps object storage for keys without a row, so deleting the row first
+    would leave the bytes in the bucket for good — a re-run retries them.
     """
-    rows = await deps.image_uploads.list_for_user(tenant_id=tenant_id, user_id=user_id)
-    if deps.object_store is None:
-        summary.image_blobs_skipped = len(rows)
-    else:
-        for row in rows:
-            try:
-                await deps.object_store.delete(row.object_key)
-                summary.image_blobs_removed += 1
-            except Exception:  # best-effort: orphaned key beats a stuck purge
-                summary.image_blobs_failed += 1
-                logger.warning("purge_user.image_blob_failed", exc_info=True)
-    summary.deleted["image_upload"] = await deps.image_uploads.delete_all_for_user(
-        tenant_id=tenant_id, user_id=user_id
-    )
+    tally = ImageTally()
+    try:
+        while True:
+            rows = await deps.image_uploads.list_for_user(
+                tenant_id=tenant_id, user_id=user_id, limit=_IMAGE_PAGE
+            )
+            await delete_images(deps.image_uploads, deps.object_store, rows, tally)
+            if len(rows) < _IMAGE_PAGE:
+                break
+    finally:
+        summary.image_blobs_removed += tally.blobs_removed
+        summary.image_blobs_failed += tally.blobs_failed
+        summary.image_blobs_skipped += tally.blobs_skipped
+        summary.deleted["image_upload"] = tally.rows_deleted
 
 
 async def purge_user(

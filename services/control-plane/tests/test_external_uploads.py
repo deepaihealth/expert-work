@@ -864,6 +864,75 @@ async def test_an_upload_whose_session_is_gone_is_not_found(ctx: _Ctx) -> None:
     assert "deleted" in info.value.message
 
 
+@pytest.mark.asyncio
+async def test_a_purged_sessions_upload_still_says_session_deleted(ctx: _Ctx) -> None:
+    """B-280 —— 会话彻底删除(``:purge``)不再留下完整的登记行,document 行留成墓碑:对外
+    引用仍回已公布的 404 ``UPLOAD_SESSION_DELETED``;下载 404 ``UPLOAD_NOT_FOUND``(删除前
+    也是);同一会话里的图片行随会话删掉,引用回 ``UPLOAD_NOT_FOUND``(删除前也是)。"""
+    from control_plane.api._external import ExternalScopeError
+    from control_plane.api.agents import ExternalFileRef, resolve_external_files
+
+    await ctx.seed_agent()
+    a = await _upload_document(ctx, b"%PDF-1.4 A")
+    image = await ctx.client.post(
+        "/v1/agents/support-bot/uploads",
+        data={"user_id": "cust-77", "session_id": a["session_id"]},
+        files={"file": ("a.png", _PNG_BYTES, "image/png")},
+        headers=ctx.headers,
+    )
+    assert image.status_code == 201, image.text
+    b = await _upload_document(ctx, b"%PDF-1.4 B")
+    end_user = (await _upload_row(ctx, a)).user_id
+
+    console = {"Authorization": f"Bearer {make_test_jwt(tenant_id=ctx.tenant_id)}"}
+    purged = await ctx.client.post(f"/v1/sessions/{a['session_id']}:purge", headers=console)
+    assert purged.status_code == 200, purged.text
+
+    with pytest.raises(ExternalScopeError) as info:
+        await _attach(ctx, a, into=b["session_id"])
+    assert (info.value.code, info.value.status_code) == ("UPLOAD_SESSION_DELETED", 404)
+    assert "deleted" in info.value.message
+
+    tombstone = await _upload_row(ctx, a)
+    assert (tombstone.ref, tombstone.filename, tombstone.mime_type) == ("", "", "")
+    assert (tombstone.size_bytes, tombstone.sha256, tombstone.last_used_at) == (0, None, None)
+    assert tombstone.deleted_at is not None
+
+    download = await ctx.client.get(
+        f"/v1/agents/support-bot/uploads/{a['upload_id']}",
+        params={"user_id": "cust-77"},
+        headers=ctx.headers,
+    )
+    assert download.status_code == 404, download.text
+    assert download.json()["error"]["code"] == "UPLOAD_NOT_FOUND"
+
+    with pytest.raises(ExternalScopeError) as img_info:
+        await resolve_external_files(
+            files=[ExternalFileRef(upload_id=image.json()["data"]["upload_id"])],
+            tenant_id=ctx.tenant_id,
+            end_user_id=end_user,
+            thread_id=UUID(b["session_id"]),
+            uploads_store=ctx.app.state.user_upload_store,
+            threads=ctx.app.state.thread_meta_repo,
+            copier=_copier(ctx),
+        )
+    assert (img_info.value.code, img_info.value.status_code) == ("UPLOAD_NOT_FOUND", 404)
+
+    # Another end user holding the tombstoned id learns nothing: the owner check
+    # comes before the tombstone check, so it is plain UPLOAD_NOT_FOUND.
+    with pytest.raises(ExternalScopeError) as other_user:
+        await resolve_external_files(
+            files=[ExternalFileRef(upload_id=a["upload_id"])],
+            tenant_id=ctx.tenant_id,
+            end_user_id=uuid4(),
+            thread_id=UUID(b["session_id"]),
+            uploads_store=ctx.app.state.user_upload_store,
+            threads=ctx.app.state.thread_meta_repo,
+            copier=_copier(ctx),
+        )
+    assert (other_user.value.code, other_user.value.status_code) == ("UPLOAD_NOT_FOUND", 404)
+
+
 # ---------------------------------------------------------------------------
 # B-262 review —— 跨会话复制要像上传一样记账(配额 + 审计),出错按上传端点的码回;
 # 源会话已删、源文件被改过也要说清楚。

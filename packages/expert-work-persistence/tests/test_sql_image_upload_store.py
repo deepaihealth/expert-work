@@ -14,7 +14,7 @@ from uuid import uuid4
 import pytest
 from alembic import command
 from alembic.config import Config
-from sqlalchemy import text
+from sqlalchemy import insert, text
 from sqlalchemy.ext.asyncio import AsyncEngine
 from testcontainers.postgres import PostgresContainer
 
@@ -24,6 +24,7 @@ from expert_work.persistence import (
     create_async_engine_from_config,
     create_async_session_factory,
 )
+from expert_work.persistence.models import ImageUploadRow
 
 pytestmark = pytest.mark.integration
 
@@ -208,5 +209,54 @@ async def test_list_for_user_includes_soft_deleted_rows_and_scopes_by_tenant_and
         assert {r.id for r in rows} == {active_id, soft_deleted_id}
         # created_at ascending.
         assert [r.created_at for r in rows] == sorted(r.created_at for r in rows)
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_hard_delete_takes_more_ids_than_one_statement_can_bind(
+    sql_store: SqlStoreFixture,
+) -> None:
+    """B-280 —— an agent purge passes every image of the agent to ``hard_delete``;
+    asyncpg refuses a statement with more than 32,767 bind parameters, so the
+    ids go in bounded ``IN`` lists. Only the given ids go."""
+    store, engine = sql_store
+    try:
+        tenant, thread = uuid4(), uuid4()
+        many = 33_000
+        ids = [uuid4() for _ in range(many)]
+        async with engine.begin() as conn:
+            for start in range(0, many, 5_000):
+                await conn.execute(
+                    insert(ImageUploadRow),
+                    [
+                        {
+                            "id": image_id,
+                            "tenant_id": tenant,
+                            "user_id": None,
+                            "thread_id": thread,
+                            "object_key": f"{tenant}/uploads/{thread}/{image_id}.png",
+                            "size_bytes": 1,
+                            "mime_type": "image/png",
+                            "sha256": "x",
+                        }
+                        for image_id in ids[start : start + 5_000]
+                    ],
+                )
+        keep = uuid4()
+        await store.insert(
+            image_id=keep,
+            tenant_id=tenant,
+            thread_id=thread,
+            user_id=None,
+            object_key=f"{tenant}/uploads/{thread}/{keep}.png",
+            size_bytes=1,
+            mime_type="image/png",
+            sha256="x",
+        )
+
+        assert await store.hard_delete(image_ids=ids) == many
+        left = await store.list_for_threads(tenant_id=tenant, thread_ids=[thread])
+        assert [row.id for row in left] == [keep]
     finally:
         await engine.dispose()

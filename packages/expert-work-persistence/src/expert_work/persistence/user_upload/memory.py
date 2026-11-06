@@ -11,7 +11,8 @@ from expert_work.persistence.user_upload.base import (
     ExpiredUpload,
     UserUploadStore,
 )
-from expert_work.protocol import UserUpload, UserUploadKind
+from expert_work.protocol import UserUpload, UserUploadKind, is_session_deleted_tombstone
+from expert_work.protocol.user_upload import SESSION_DELETED_TOMBSTONE_REF
 
 
 def _expires_at(row: UserUpload, default_days: int) -> datetime:
@@ -158,3 +159,28 @@ class InMemoryUserUploadStore(UserUploadStore):
         for key in victims:
             del self._rows[key]
         return len(victims)
+
+    async def tombstone_for_threads(
+        self, *, tenant_id: UUID, thread_ids: Sequence[UUID], now: datetime
+    ) -> int:
+        handled = 0
+        for key in self._thread_keys(tenant_id, thread_ids):
+            row = self._rows[key]
+            if is_session_deleted_tombstone(row):
+                continue
+            handled += 1
+            if row.kind == "image" or row.deleted_at is not None:
+                del self._rows[key]
+                continue
+            self._rows[key] = row.model_copy(
+                update={
+                    "ref": SESSION_DELETED_TOMBSTONE_REF,
+                    "filename": "",
+                    "mime_type": "",
+                    "size_bytes": 0,
+                    "sha256": None,
+                    "last_used_at": None,
+                    "deleted_at": now,
+                }
+            )
+        return handled

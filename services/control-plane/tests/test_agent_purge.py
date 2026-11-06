@@ -69,6 +69,7 @@ from expert_work.protocol import (
     TriggerRunRecord,
     WebhookDeliveryRecord,
     WebhookEndpointRecord,
+    is_session_deleted_tombstone,
 )
 from expert_work.runtime.runs import (
     DisconnectMode,
@@ -596,6 +597,28 @@ async def test_blobs_and_byte_copies_go_with_the_rows() -> None:
     assert f"agents/{key}" in trees_paths
     assert any(p.startswith("threads/") for p in trees_paths)
     assert not any(agent_key_for(_Y) in p for p in trees_paths)
+
+
+@pytest.mark.asyncio
+async def test_its_conversations_document_uploads_become_tombstones() -> None:
+    """B-280 —— like the conversation purge: a document's registry row stays as a
+    scrubbed tombstone so a reference from another agent's conversation still
+    answers UPLOAD_SESSION_DELETED; the sibling agent and the other tenant keep
+    their rows as they were."""
+    world, threads = await _world()
+    doomed = set(threads)
+    before = dict(world.uploads._rows)
+
+    await purge_agent(world.deps(), tenant_id=world.t1, name=_X)
+
+    mine = [r for r in world.uploads._rows.values() if r.thread_id in doomed]
+    assert mine and len(mine) == len([r for r in before.values() if r.thread_id in doomed])
+    for row in mine:
+        assert is_session_deleted_tombstone(row), row
+        assert (row.filename, row.mime_type, row.size_bytes, row.sha256) == ("", "", 0, None)
+    for key, row in before.items():
+        if row.thread_id not in doomed:
+            assert world.uploads._rows[key] == row
 
 
 @pytest.mark.asyncio

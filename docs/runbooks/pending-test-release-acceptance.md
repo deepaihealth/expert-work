@@ -2003,3 +2003,34 @@ oauth2 目录项本来就不在平台池里:不再碰平台池;`enabled` 切换�
 - [ ] **93.1 Anthropic 有缓存的轮(需凭据)**:system_admin 在调试台给临时智能体 `acc-b279`(主模型 Anthropic,系统提示词写长一些,超过缓存最小长度)连发两轮。判据:第二轮的 `token_usage` 行 `cache_read_tokens` > 0 且 `input_tokens` 远小于它(确认是 Anthropic 口径);控制台该轮成本 = 按上式对该 run 全部 `token_usage` 行求和(显示到 4 位小数,差 ≤ ¥0.0001);「计时」页每步成本之和等于整轮成本;同一 run 在 Langfuse 里的 input / cache 读写 token 数与 `token_usage` 一致(Langfuse 的美元成本口径不同,不比金额)。改前同一轮会明显偏低(命中大于输入时输入费变 0);状态栏「缓存命中」= Σ cache_read ÷ Σ(input + cache_read + cache_creation),不超过 100%(改前是 命中 ÷ input,会出现几百 %)。**已知限制**:对话详情页对非 system_admin 不读智能体 manifest(B-202 的设计),拿不到主线厂商,命中率仍按旧口径
 - [ ] **93.2 其它厂商不变**:同样操作换 deepseek 主模型跑两轮。判据:控制台成本 = 上式「其它厂商」求和;与改前版本(若还有改前截图 / 记录)同一轮数字一致
 - [ ] **93.3 收尾**:删 `acc-b279` 及其对话
+
+## §94 删除单个对话把按对话存的数据一起删掉(B-280)
+
+> §93 由 B-279 占用(另一个分支);两边都追加在文件末尾,合并时按编号排好即可。
+
+**背景**:控制台 / 会话面 `POST /v1/sessions/{id}:purge` 原来删检索记录、记忆写回任务、checkpoint、run(连 `run_event`)、审批、对话行(`thread_message` 级联)和 NAS 上的对话目录,**漏了**按 `thread_id` 存的几类。现在在写回任务之后、checkpoint 之前多处理六类:删 `feedback`、`quality_score`、`curation_candidate`(含已采纳进评测集的;评测集本身不动)、`memory_writeback_dlq`(按 `source_thread_id`)、`image_upload` 连对象存储里的图片(`{租户}/uploads/{会话}/{图片 id}.{扩展名}`);`user_upload` 的文档行**留成墓碑**(只留 id / 租户 / 用户 / 会话 / `kind` / `created_at`,`ref` / `filename` / `mime_type` 清成空串、`size_bytes` 0、`sha256` / `last_used_at` 置空、`deleted_at` 有值),图片行与已到期的行直接删。这六类任一类删不掉:后面什么都不删、**对话行留着**、回 503,审计记一条 `result=error`、`reason=purge_incomplete`(带已删条数与 `<类>_delete_failed`),再点一次删完;图片字节没删掉的那几行留着(没有作业按键扫孤儿图片)—— 同一条规矩也改进了删智能体(B-278,算失败 → 409 `AGENT_PURGE_INCOMPLETE`)和删用户(`failures.image_upload`),原来那两处字节删不掉照样删行。删用户另外补删该用户各条对话上的 `quality_score` 与 `curation_candidate`(候选里有用户自己的 👎 评论);这几类(连同反馈、审批)任一删不掉,该用户的对话行就留着(`skipped` 含 `threads`),重跑删完。删智能体时对话里的上传文档也留成墓碑(别的智能体的对话再引用仍回 `UPLOAD_SESSION_DELETED`)。图片字节一直删不掉(无权限、对象锁)时删对话会一直 503:审计 `details.image_rows_kept` 给出条数,日志 `session_purge.image_rows_kept` 列出图片 id,运维据此处理。对话行删掉之后,反馈 / 质量评分 / 写回失败队列再删一遍(还在跑的 run 可能刚写了一行),失败只记日志。**仍不删**:对象存储里的 run 轨迹与事件归档文件(另立条目)。**保留**:`token_usage` / 计费 / `audit_log`(对账)、登记过的产物(用户拍板:删对话不删产物)、长期记忆(`memory_item`)、老布局 agent 共用的 `agents/<key>/uploads/` 里的文件(别的对话可能在用同一个文件;对话布局的 `threads/<会话>/work/uploads/` 本来就随对话目录删)。对外接口 `DELETE /v1/agents/{code}/sessions/{id}` 只是归档,不受影响。**对外不变**(用户 11-06 拍板保留错误码):在别的会话 `files[]` 里引用「已被 purge 的会话」上传的文档仍回 404 `UPLOAD_SESSION_DELETED`(认墓碑);图片的 `upload_id` 仍回 404 `UPLOAD_NOT_FOUND`;下载仍 404 `UPLOAD_NOT_FOUND`。
+
+**怎么进**:测试环境控制台(system_admin,平台租户)建临时智能体 `acc-b280`;对外接口用平台租户临时 API key,`user_id` 用 `u-b280`。数据库只读连接;对象存储运维侧只读列桶;NAS 用 control-plane pod 只读 `ls`。质量评分要抽样命中:先在平台「质量监控」设置里记下抽样比例,临时调到 100%(事后调回)。合成文件(零租户内容):`/tmp/b280.pdf`(一页 PDF)、`/tmp/b280.png`(小图)。**花费**:约 ¥1(四轮短对话 + 质量评审)。
+
+- [ ] **94.1 造数据**:同一个 `u-b280` 在 `acc-b280` 下开会话 A、B,各用对外接口上传 `b280.pdf` 与 `b280.png`,带 `files[]` 各发一轮;两个会话各点一次 👎 并写一句评论。等质量监控与评测候选扫描各跑过一轮(看日志或只读查到 A、B 的 `quality_score` / `curation_candidate` 行)。只读查下面这条 SQL,A、B 各自记一份「删之前」的条数(`memory_writeback_dlq` 在正常对话里通常是 0,不强造):
+
+  ```sql
+  SELECT 'feedback' k, count(*) FROM feedback WHERE thread_id = :t
+  UNION ALL SELECT 'quality_score', count(*) FROM quality_score WHERE thread_id = :t
+  UNION ALL SELECT 'curation_candidate', count(*) FROM curation_candidate WHERE thread_id = :t
+  UNION ALL SELECT 'memory_writeback_dlq', count(*) FROM memory_writeback_dlq WHERE source_thread_id = :t::text
+  UNION ALL SELECT 'user_upload_live', count(*) FROM user_upload WHERE thread_id = :t AND ref <> ''
+  UNION ALL SELECT 'user_upload_tombstone', count(*) FROM user_upload WHERE thread_id = :t AND ref = '' AND kind = 'document' AND deleted_at IS NOT NULL AND filename = '' AND mime_type = '' AND size_bytes = 0 AND sha256 IS NULL AND last_used_at IS NULL
+  UNION ALL SELECT 'image_upload', count(*) FROM image_upload WHERE thread_id = :t
+  UNION ALL SELECT 'knowledge_retrieval_log', count(*) FROM knowledge_retrieval_log WHERE thread_id = :t
+  UNION ALL SELECT 'agent_run', count(*) FROM agent_run WHERE thread_id = :t
+  UNION ALL SELECT 'agent_approval', count(*) FROM agent_approval WHERE thread_id = :t
+  UNION ALL SELECT 'thread_meta', count(*) FROM thread_meta WHERE thread_id = :t;
+  ```
+
+  同时记下 A、B 图片的 `image_upload.object_key`。判据:A、B 的 `feedback` / `quality_score` / `curation_candidate` / `user_upload_live` / `image_upload` 都 ≥ 1(`user_upload_live` 应是 2:pdf 与 png 各一行;哪一类是 0 先补造,不然这一类等于没验),`user_upload_tombstone` 都是 0。
+- [ ] **94.2 删会话 A**:控制台对话页删除会话 A(彻底删除)。判据:200;响应里 `feedback`、`quality_scores`、`curation_candidates`、`user_uploads`、`image_uploads`、`image_blobs_removed` 与 94.1 的条数一致,`image_blobs_failed` = 0,没有任何 `*_delete_failed`;再跑 94.1 的 SQL:A 除 `user_upload_tombstone` = 1(pdf 那一行,所有被清的列都已清空)外每一行都是 0;**B 的每一行与 94.1 记的一样**;对象存储里 A 的图片键已不存在、B 的还在;NAS 上 `agents/<key>/threads/<A>/` 已不在、`threads/<B>/` 还在;审计 `SESSION_WRITE` 有 `details.op = purge`、`meta_removed = true` 的一行。**没修好时**:A 的前五类条数不变、图片键还在。
+- [ ] **94.3 引用已删会话的上传**:在会话 B 发一轮,`files[]` 带 A 的 pdf `upload_id`;再发一轮带 A 的 png `upload_id`;再 `GET …/uploads/<A 的 pdf upload_id>?user_id=u-b280`。判据:依次 404 `UPLOAD_SESSION_DELETED`、404 `UPLOAD_NOT_FOUND`、404 `UPLOAD_NOT_FOUND`(与 B-280 之前一致)。
+- [ ] **94.4 失败时对话留着**:真栈不造故障(要停库或对象存储),由单测覆盖(`test_session_purge_children.py`:六类任一类失败 → 503、对话还在、别的类已删、重试删完;图片字节删不掉 → 行留着)。记「单测覆盖」。
+- [ ] **94.5 删用户带走质量评分与候选**:在会话 B 还在时,对 `u-b280` 走 `POST /v1/users/<id>:purge`。判据:200,`deleted.quality_score`、`deleted.curation_candidate` ≥ 1,`failures` 为空;94.1 的 SQL 对 B:`quality_score` / `curation_candidate` / `image_upload` 都是 0,对象存储里 B 的图片键已不存在。
+- [ ] **94.6 收尾**:质量抽样比例调回 94.1 记下的值;删临时智能体 `acc-b280`(彻底删除);吊销临时 key

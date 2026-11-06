@@ -4,8 +4,9 @@
 用户锚点)是重跑时找到子数据的唯一线索——子删失败还先删了父,重跑就找不到剩下的子数据,
 却会报「全部完成」。所以:
 
-* 对话:挂在对话上的批量子表(反馈 / 审批 / 写回失败队列 / 上传 / 图片)任一失败 → 这一批
-  对话一条都不删;单条对话的检索记录 / checkpoint / run / 老布局目录任一失败 → 这条对话不删。
+* 对话:挂在对话上的批量子表(反馈 / 审批 / 写回失败队列 / 上传 / 图片 —— 图片有字节没删掉
+  也算失败,那几行留着)任一失败 → 这一批对话一条都不删;单条对话的检索记录 / checkpoint /
+  run / 老布局目录任一失败 → 这条对话不删。
 * 定时任务先删运行记录、webhook 先删投递记录、产物先删字节副本、评测集先删候选样本,子失败
   就不删父。
 * NAS 上某个用户的 ``agents/<key>`` 删不掉(先补回属主权限再删,还不行就改名挪开)→ 只留
@@ -18,6 +19,7 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Awaitable, Callable
+from datetime import UTC, datetime
 from uuid import UUID
 
 from control_plane.purge.agent_purge_nas import (
@@ -27,6 +29,7 @@ from control_plane.purge.agent_purge_nas import (
     remove_nas_entry,
 )
 from control_plane.purge.agent_purge_types import AgentPurgeDeps, AgentPurgeSummary, Footprint
+from control_plane.purge.image_blobs import ImageBytesNotDeletedError, ImageTally, delete_images
 from expert_work.persistence import AGENT_FILE_VERSIONS_DIR, WORKSPACE_AGENTS_DIR
 from orchestrator.context.workspace_projection import THREADS_DIR
 from orchestrator.tools.overflow import OVERFLOW_DIR
@@ -179,20 +182,22 @@ async def purge_nas(
 async def _purge_images(
     deps: AgentPurgeDeps, summary: AgentPurgeSummary, tenant_id: UUID, threads: list[UUID]
 ) -> int:
-    """先删对象存储里的图、再删行(同 ``purge_user._purge_images``:
-    孤儿键有留存作业兜,卡住的行没人兜)。"""
+    """先删对象存储里的图、再删字节已经没了的行(:mod:`control_plane.purge.image_blobs`)。
+    有图没删掉:那几行留着、这一步算失败(这一批对话不删,名字停在 ``purging``,重跑接着删)
+    —— 没有作业按键扫孤儿图片,行先删了字节就永远留在桶里。"""
     rows = await deps.image_uploads.list_for_threads(tenant_id=tenant_id, thread_ids=threads)
-    if deps.object_store is None:
-        summary.image_blobs_skipped += len(rows)
-    else:
-        for row in rows:
-            try:
-                await deps.object_store.delete(row.object_key)
-                summary.image_blobs_removed += 1
-            except Exception:
-                summary.image_blobs_failed += 1
-                logger.warning("purge_agent.image_blob_failed", exc_info=True)
-    return await deps.image_uploads.delete_for_threads(tenant_id=tenant_id, thread_ids=threads)
+    tally = ImageTally()
+    try:
+        await delete_images(deps.image_uploads, deps.object_store, rows, tally)
+    except ImageBytesNotDeletedError:
+        # ``run`` 只在成功时记条数;部分失败时已删的行在这里记。
+        add(summary, "image_upload", tally.rows_deleted)
+        raise
+    finally:
+        summary.image_blobs_removed += tally.blobs_removed
+        summary.image_blobs_failed += tally.blobs_failed
+        summary.image_blobs_skipped += tally.blobs_skipped
+    return tally.rows_deleted
 
 
 async def _purge_one_thread(
@@ -294,7 +299,11 @@ async def purge_conversations(
         ),
         (
             "user_upload",
-            deps.user_uploads.delete_for_threads(tenant_id=tenant_id, thread_ids=threads),
+            # B-280 —— 文档行留成墓碑:别的智能体的对话再引用这个 upload_id 仍回
+            # UPLOAD_SESSION_DELETED(对外已公布);图片行与到期行删掉。
+            deps.user_uploads.tombstone_for_threads(
+                tenant_id=tenant_id, thread_ids=threads, now=datetime.now(UTC)
+            ),
         ),
         ("image_upload", _purge_images(deps, summary, tenant_id, threads)),
     ):
