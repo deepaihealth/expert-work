@@ -2034,3 +2034,25 @@ oauth2 目录项本来就不在平台池里:不再碰平台池;`enabled` 切换�
 - [ ] **94.4 失败时对话留着**:真栈不造故障(要停库或对象存储),由单测覆盖(`test_session_purge_children.py`:六类任一类失败 → 503、对话还在、别的类已删、重试删完;图片字节删不掉 → 行留着)。记「单测覆盖」。
 - [ ] **94.5 删用户带走质量评分与候选**:在会话 B 还在时,对 `u-b280` 走 `POST /v1/users/<id>:purge`。判据:200,`deleted.quality_score`、`deleted.curation_candidate` ≥ 1,`failures` 为空;94.1 的 SQL 对 B:`quality_score` / `curation_candidate` / `image_upload` 都是 0,对象存储里 B 的图片键已不存在。
 - [ ] **94.6 收尾**:质量抽样比例调回 94.1 记下的值;删临时智能体 `acc-b280`(彻底删除);吊销临时 key
+
+## §97 控制台上传 / 跨会话复制也建登记行 + 一次性清理迁移后留在 agent 根的原件(B-281)
+
+**背景**:B-63 的附件到期只认 `user_upload` 登记行。此前两种落盘不建行、永远不会到期:① 控制台上传文档(`POST /v1/sessions/{id}/uploads`,调试台 / 对话页);② 对外 run 的 `files[]` 引用别的会话的上传时复制进本会话的那一份。本次两处都建登记行,字段与对外上传同一个写法(会话、**文件落进的那个工作区**的用户、实际落盘名、大小、mime、sha256),留存作业的「按最后使用到期 / 删前核对 sha256 / 还有别的行指着同一个文件就不删」原样适用。复制进同一会话的同一份(同名同 sha256)只建一行。控制台响应不变(仍是 `{path, kind}`,不回 `upl_` id);对外接口的 `user_id` 一律带 `ext:` 前缀,摸不到控制台用户名下的行。**没有数据库迁移。**
+
+另:老对话迁移(B-262 P3)把上传**复制**进对话目录,agent 根下的原件从此没有登记行指着、永远删不到。新增一次性命令 `python -m retention_cleanup_job.legacy_originals`(默认只数不删,`--apply` 才删),候选只来自登记表(不扫目录),只删**逐字节重复**的原件:至少一条没删的登记行指着它;登记行与 `DOCUMENT_UPLOAD` 审计行(B-281 之前的控制台上传 / 复制只有审计)里没有一条在老视图会话、没有一条登记行的会话已不在;每条引用在自己对话目录里的副本都在且与原件 sha256 相同(还没迁移的对话视图会话没有副本 → 原件留着);原件和路径上每一段都不是软链。`--apply` 每删一个之前再查一次登记表。输出只有一行计数与字节数,不打文件名、租户、用户。**不进每日作业**(理由见 PR 正文)。
+
+**回滚注意**:回滚镜像后控制台上传 / 复制又不建行;已建的行留着,老代码的留存作业照样按它们到期,无害。已删掉的原件不能恢复,但删的只是逐字节重复(副本都核对过在)。
+
+**怎么进**:测试环境控制台(system_admin,平台租户);对外接口用平台租户临时 API key;库只读查询;清理命令在 control-plane pod 里跑(镜像自带 `retention_cleanup_job`,与留存 CronJob 同镜像、同 NAS 挂载、同 uid)。`kubectl exec` **不要带 `-i`**(stdin EOF 会吞输出);命令整段用单引号(zsh)。命令连库失败时**不要贴完整报错**(驱动报错可能带整条 DSN),只贴异常类型。**花费**:约 ¥1(两三轮短对话)。
+
+- [ ] **97.1 控制台上传建行**:调试台给任一智能体上传 `b281-a.pdf`,同一会话再传一次同一个文件。只读查 `SELECT id, kind, ref, filename, mime_type, size_bytes, sha256, user_id FROM user_upload WHERE thread_id = '<会话 id>' ORDER BY created_at`。判据:两行,`kind = document`,`ref` 都等于上传响应的 `path`,`sha256` 等于本地 `shasum -a 256 b281-a.pdf`,`user_id` 是自己的 `tenant_user.id`;NAS 上只有一个文件(第二次复用)。**没修好时**:零行。
+- [ ] **97.2 对外接口摸不到控制台的行**:取 97.1 第一行的 `id`,拼成 `upl_<id>`;用对外 key 调 `GET /v1/agents/<code>/uploads/upl_<id>?user_id=<你的控制台登录名>`,再在任一对外会话里带 `files:[{"upload_id":"upl_<id>"}]` 发一轮。判据:两次都是 404 `UPLOAD_NOT_FOUND`(不是 200、不是 500)。
+- [ ] **97.3 跨会话复制建行**:对外接口在会话 A 传 `b281-c.pdf`;会话 B 带 `files:[{upload_id: <A 的 upl_>}]` 发两轮。判据:只读查会话 B 的 `user_upload` 多出**一行**(第二轮不再加),`ref` 是 B 里实际落地的名字、`sha256` 与 A 那一行相同、`user_id` 与 A 相同;A 那一行不变;审计 `document:upload` 两条都带 `copied_from_upload_id`。
+- [ ] **97.4 到期照常(用户批准后改库)**:把 97.1 所在会话全部 run 的 `created_at`、以及 97.1 **第一行**的 `created_at` 改到 100 天前,手动触发留存作业(`kubectl -n expert-work create job --from=cronjob/retention-cleanup b281-probe-1`)。判据:第一行 `deleted_at` 有值,文件**还在**(第二行还没到期、指着同一个文件);再把第二行也改 100 天前、触发 `b281-probe-2` → 第二行 `deleted_at` 有值、文件已删;作业退出码 0。
+- [ ] **97.5 清理原件:只数不删(测试)**:
+  `kubectl -n expert-work exec deploy/control-plane -c control-plane -- sh -c 'EXPERT_WORK_RETENTION_DB_DSN="$EXPERT_WORK_DB_DSN" EXPERT_WORK_RETENTION_WORKSPACE_ROOT="$EXPERT_WORK_WORKSPACE_NAS_ROOT" python -m retention_cleanup_job.legacy_originals'`
+  判据:退出码 0;最后一行形如 `legacy_originals mode=dry-run checked=… deletable=… deleted=0 bytes=… no_original=… kept_…=… failed=0`,整段输出里没有文件名、租户 id、用户 id;NAS 上什么都没变。把整行贴回来(调查时测试上有 4 个这类原件,`deletable` 应 ≤ 4,其余计在 `kept_*` 里,逐项说明原因)。动手前先只读记下一个将被删的样本,用于 97.6 抽查:`SELECT u.id, u.thread_id FROM user_upload u JOIN thread_meta t USING (thread_id) WHERE u.deleted_at IS NULL AND t.workspace_layout = 'conversation' AND t.created_at < '<B-262 P1 发测试的日期>' LIMIT 5`(挑一条在 NAS 上 `agents/<key>/uploads/<名字>` 与 `agents/<key>/threads/<会话>/work/uploads/<名字>` 都在的)。
+- [ ] **97.6 清理原件:删(测试,用户批准后)**:同 97.5 的命令末尾加 ` --apply`。判据:`deleted` 等于 97.5 的 `deletable`(期间有人新上传同名文件时可少,计在 `kept_changed_during_run`),`failed=0`、退出码 0;再跑一次 97.5(不带 `--apply`):`deletable=0`,`no_original` 比 97.5 多出 `deleted` 个;97.5 记下的样本:agent 根那个原件没了,对话目录的副本还在,用对外接口下载它(或在控制台打开那条对话让智能体读这个附件)内容不变。
+- [ ] **97.7 收尾**:删本节建的会话、上传与 probe job;吊销临时 key。
+
+**生产(用户执行,随发布之后)**:发布完成、smoke 过之后,在生产集群执行 97.5 的同一条命令(只数不删),把输出的那一行贴回来;我们对一下各 `kept_*` 的原因后再决定是否执行 ` --apply`;执行完再跑一次只数不删,确认 `deletable=0`、`failed=0`。不需要改库、不需要停作业。

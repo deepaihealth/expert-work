@@ -289,6 +289,84 @@ async def test_upload_document_oversize_rejected() -> None:
 
 
 @pytest.mark.asyncio
+async def test_console_document_upload_is_registered_like_an_external_one() -> None:
+    """B-281 —— 控制台上传的文档也建 ``user_upload`` 登记行(同对外上传的字段与 sha256 语义),
+    留存作业按最后使用到期、删前核对 sha256、「还有别的行指着同一个文件就不删」才管得到它。
+    行记在**落盘的那个工作区**(调用者自己的)名下。"""
+    import hashlib
+
+    client, thread_id, store, app = await _doc_client()
+    raw = b"%PDF-1.4 console body"
+    async with client:
+        resp = await client.post(
+            f"/v1/sessions/{thread_id}/uploads",
+            files={"file": ("Q3 Report.pdf", raw, "application/pdf")},
+        )
+    assert resp.status_code == 201, resp.text
+    path = resp.json()["path"]
+    assert set(resp.json()) == {"path", "kind"}  # 响应形状不变,不把 upl_ id 回给控制台
+
+    caller = await app.state.tenant_user_repo.get_by_subject(  # type: ignore[attr-defined]
+        tenant_id=_TENANT, subject_type="user", subject_id="user-a"
+    )
+    rows = await app.state.user_upload_store.list_documents_for_thread(  # type: ignore[attr-defined]
+        tenant_id=_TENANT, thread_id=thread_id
+    )
+    assert [
+        (r.user_id, r.kind, r.ref, r.filename, r.mime_type, r.size_bytes, r.sha256) for r in rows
+    ] == [
+        (
+            caller.id,
+            "document",
+            path,
+            path.rsplit("/", 1)[-1],
+            "application/pdf",
+            len(raw),
+            hashlib.sha256(raw).hexdigest(),
+        )
+    ]
+    _tenant, written_user, written_path, _data = store.workspace_writes[0]  # type: ignore[attr-defined]
+    assert (written_user, written_path) == (caller.id, path)
+
+
+@pytest.mark.asyncio
+async def test_console_reupload_of_the_same_bytes_registers_again() -> None:
+    """同一份再传一次:文件复用(只写一次),登记行照样再建一条 —— 同对外上传,保留期从这次上传
+    算起。两行指着同一个文件,到期的那一行不会删掉另一行还在用的文件(留存作业的引用检查)。"""
+    client, thread_id, store, app = await _doc_client()
+    async with client:
+        for _ in range(2):
+            resp = await client.post(
+                f"/v1/sessions/{thread_id}/uploads",
+                files={"file": ("same.pdf", b"%PDF-1.4 same", "application/pdf")},
+            )
+            assert resp.status_code == 201, resp.text
+    rows = await app.state.user_upload_store.list_documents_for_thread(  # type: ignore[attr-defined]
+        tenant_id=_TENANT, thread_id=thread_id
+    )
+    assert [r.ref for r in rows] == ["uploads/same.pdf", "uploads/same.pdf"]
+    assert len(store.workspace_writes) == 1  # type: ignore[attr-defined]
+
+
+@pytest.mark.asyncio
+async def test_a_failed_console_document_upload_registers_nothing() -> None:
+    from orchestrator.tools import SandboxSupervisorError
+
+    client, thread_id, store, app = await _doc_client()
+    store.workspace_write_error = SandboxSupervisorError("supervisor unreachable")  # type: ignore[attr-defined]
+    async with client:
+        resp = await client.post(
+            f"/v1/sessions/{thread_id}/uploads",
+            files={"file": ("report.pdf", b"%PDF-1.4 body", "application/pdf")},
+        )
+    assert resp.status_code == 502, resp.text
+    rows = await app.state.user_upload_store.list_documents_for_thread(  # type: ignore[attr-defined]
+        tenant_id=_TENANT, thread_id=thread_id
+    )
+    assert rows == []
+
+
+@pytest.mark.asyncio
 async def test_upload_document_503_without_supervisor(setup: Setup) -> None:
     # The default ``setup`` app has no workspace_store wired → docs 503.
     client, thread_id, _ = setup

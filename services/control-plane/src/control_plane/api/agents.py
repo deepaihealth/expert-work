@@ -450,6 +450,7 @@ async def resolve_external_files(
                     thread_id=thread_id,
                     threads=threads,
                     copier=copier,
+                    uploads_store=uploads_store,
                 )
             document_names.append(ref)
             original = original_document_name(ref, row.sha256)
@@ -480,6 +481,7 @@ async def _copy_into_this_session(
     thread_id: UUID,
     threads: ThreadMetaStore,
     copier: LandingAccount,
+    uploads_store: UserUploadStore,
 ) -> str:
     """B-262 P1 §3 —— 别的会话的上传复制进本会话;失败翻成对外错误(码同上传端点)。"""
     target = await threads.get(thread_id, tenant_id=tenant_id)
@@ -493,6 +495,7 @@ async def _copy_into_this_session(
     try:
         return await copy_document_into_thread(
             copier,
+            uploads_store,
             tenant_id=tenant_id,
             user_id=end_user_id,
             upload=row,

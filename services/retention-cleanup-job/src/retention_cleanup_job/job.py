@@ -653,9 +653,10 @@ class RetentionCleanupJob:
         B-63 —— 按**最后使用**到期:``greatest(created_at, last_used_at, 会话最后一次 run)`` 加上
         租户的 ``tenant_config.upload_retention_days``(没设用 ``upload_retention_days``)早于现在、
         且未软删的行(谓词在 :meth:`UserUploadStore.list_expired`),文档类删文件、
-        两类都标 ``deleted_at``(对外 GET 从此 404,复用既有语义)。只管有登记行的上传:控制台
-        上传与跨会话引用复制(copy-on-attach)不建 ``user_upload`` 行,这里永远看不到它们
-        (B-271 不改,另立)。
+        两类都标 ``deleted_at``(对外 GET 从此 404,复用既有语义)。只管有登记行的上传:B-281 起
+        控制台上传与跨会话引用复制(copy-on-attach)也建 ``user_upload`` 行;B-281 之前的那些没有
+        登记行,这里看不到。老对话迁移后留在 agent 根的原件见
+        :mod:`retention_cleanup_job.legacy_originals`(一次性命令)。
 
         Returns the :class:`UploadSweepTally`。No-op when :class:`UserUploadStore`,
         :class:`ThreadMetaStore` or ``workspace_root`` is missing —— 没有会话就算不出文件在哪,

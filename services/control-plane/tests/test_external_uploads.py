@@ -1005,7 +1005,121 @@ async def test_a_copy_is_accounted_and_audited_like_an_upload(ctx: _Ctx) -> None
         (b["session_id"], names[0], sha, False, a["upload_id"]),
         (b["session_id"], names[0], sha, True, a["upload_id"]),
     ]
-    assert await _upload_row_count(ctx) == upload_rows  # 不新建登记行
+    # B-281 —— 复制进来的那份在本会话建一条登记行(到期才管得到它);同一份再挂一次复用文件,
+    # 不再加行(本会话这一轮 run 已经把它的「最后使用」往后推了)。
+    assert await _upload_row_count(ctx) == upload_rows + 1
+
+
+@pytest.mark.asyncio
+async def test_a_copy_is_registered_in_the_target_session(ctx: _Ctx) -> None:
+    """B-281 —— 跨会话复制落进本会话的那份,登记在本会话名下:字段同一次上传(落地名、大小、
+    mime、sha256),到期、改动核对、引用检查都按它算。源会话自己的登记行不动。"""
+    await ctx.seed_agent()
+    raw = b"%PDF-1.4 A"
+    a = await _upload_document(ctx, raw)
+    b = await _upload_document(ctx, b"%PDF-1.4 B")
+    source = await _upload_row(ctx, a)
+    before = await ctx.app.state.user_upload_store.list_documents_for_thread(
+        tenant_id=ctx.tenant_id, thread_id=UUID(b["session_id"])
+    )
+
+    names = await _attach(ctx, a, into=b["session_id"])
+    await _attach(ctx, a, into=b["session_id"])  # 再挂一次:复用,不加行
+
+    after = await ctx.app.state.user_upload_store.list_documents_for_thread(
+        tenant_id=ctx.tenant_id, thread_id=UUID(b["session_id"])
+    )
+    added = [r for r in after if r.id not in {x.id for x in before}]
+    assert [
+        (r.user_id, r.kind, r.ref, r.filename, r.mime_type, r.size_bytes, r.sha256) for r in added
+    ] == [
+        (
+            source.user_id,
+            "document",
+            names[0],
+            names[0].rsplit("/", 1)[-1],
+            "application/pdf",
+            len(raw),
+            hashlib.sha256(raw).hexdigest(),
+        )
+    ]
+    assert await _upload_row(ctx, a) == source
+
+
+@pytest.mark.asyncio
+async def test_a_copy_onto_the_same_file_in_an_old_view_session_adds_no_row(ctx: _Ctx) -> None:
+    """两条都是老视图:源与落点本来就是同一个文件,不复制,也不加行(源那一行已经登记着它)。"""
+    await ctx.seed_agent()
+    old = await _upload_document(ctx, b"%PDF-1.4 first")
+    _old_layout(ctx, old["session_id"])
+    in_root = await _upload_document(ctx, b"%PDF-1.4 old", session_id=old["session_id"])
+    other_old = await _upload_document(ctx, b"%PDF-1.4 x")
+    _old_layout(ctx, other_old["session_id"])
+    rows = await _upload_row_count(ctx)
+
+    await _attach(ctx, in_root, into=other_old["session_id"])
+
+    assert await _upload_row_count(ctx) == rows
+
+
+@pytest.mark.asyncio
+async def test_console_uploads_are_invisible_to_the_external_plane(ctx: _Ctx) -> None:
+    """B-281 —— 控制台上传的登记行记在控制台用户名下;对外接口的 ``user_id`` 一律带 ``ext:``
+    前缀,即使对接方传的 ``user_id`` 与控制台用户的登录名逐字相同,也摸不到这些行:下载、
+    ``files[]`` 都是不透明的 404。"""
+    from control_plane.api._external import ExternalScopeError
+    from control_plane.api.agents import ExternalFileRef, resolve_external_files
+    from expert_work.protocol import render_upload_id
+
+    await ctx.seed_agent()
+    # 对接方也有一个叫 ``console-alice`` 的用户,在同一个 agent 下有自己的会话。
+    ext = await _upload_document(ctx, b"%PDF-1.4 ext", user_id="console-alice")
+    ext_user = (await _upload_row(ctx, ext)).user_id
+
+    console_jwt = make_test_jwt(tenant_id=ctx.tenant_id, subject="console-alice")
+    console_headers = {"Authorization": f"Bearer {console_jwt}"}
+    console_user = await ctx.app.state.tenant_user_repo.resolve(
+        tenant_id=ctx.tenant_id, subject_type="user", subject_id="console-alice"
+    )
+    console_thread = uuid4()
+    await ctx.app.state.thread_meta_repo.create(
+        thread_id=console_thread,
+        tenant_id=ctx.tenant_id,
+        created_by="console-alice",
+        user_id=console_user.id,
+        agent_name="support-bot",
+    )
+    resp = await ctx.client.post(
+        f"/v1/sessions/{console_thread}/uploads",
+        files={"file": ("secret.pdf", b"%PDF-1.4 console", "application/pdf")},
+        headers=console_headers,
+    )
+    assert resp.status_code == 201, resp.text
+    [row] = await ctx.app.state.user_upload_store.list_documents_for_thread(
+        tenant_id=ctx.tenant_id, thread_id=console_thread
+    )
+    assert row.user_id != ext_user
+    upload_id = render_upload_id(row.id)
+
+    resp = await ctx.client.get(
+        f"/v1/agents/support-bot/uploads/{upload_id}",
+        params={"user_id": "console-alice"},
+        headers=ctx.headers,
+    )
+    assert resp.status_code == 404, resp.text
+    assert resp.json()["error"]["code"] == "UPLOAD_NOT_FOUND"
+
+    with pytest.raises(ExternalScopeError) as info:
+        await resolve_external_files(
+            files=[ExternalFileRef(upload_id=upload_id)],
+            tenant_id=ctx.tenant_id,
+            end_user_id=ext_user,
+            thread_id=UUID(ext["session_id"]),
+            uploads_store=ctx.app.state.user_upload_store,
+            threads=ctx.app.state.thread_meta_repo,
+            copier=_copier(ctx),
+        )
+    assert (info.value.code, info.value.status_code) == ("UPLOAD_NOT_FOUND", 404)
 
 
 @pytest.mark.asyncio

@@ -19,8 +19,8 @@ B-262 P1 起对话视图里 ``uploads/`` / ``inputs/`` / ``.tool_results/`` 是�
 **做什么**(review 3:要查库的都在拿锁之前查完;持锁只做「再看一次标记 + 复制」;每个进程同时
 迁移的对话有上限,等不到名额这一轮不迁):
 
-1. 本对话自己的上传(``user_upload`` 登记行 + 本会话的 ``DOCUMENT_UPLOAD`` 审计行;控制台
-   上传只有审计)从 ``agents/<k>/uploads/`` 复制进 ``work/uploads/``,按审计的 sha256 核对;
+1. 本对话自己的上传(``user_upload`` 登记行 + 本会话的 ``DOCUMENT_UPLOAD`` 审计行;B-281 之前的
+   控制台上传只有审计)从 ``agents/<k>/uploads/`` 复制进 ``work/uploads/``,按审计的 sha256 核对;
    对不上(P0 之前被别的客户同名覆盖)或没有 sha256(核对不了)不复制、也不挡迁移;读不了
    (I/O 错)算失败。上传不计入字节上限 —— 它们是这个对话自己的东西,不能因为大就留在 agent 根;
 2. 本对话 run 的 ``.tool_results/<run>/`` 复制进 ``work/.tool_results/``(run 取自 ``agent_run``
