@@ -23,6 +23,13 @@ from expert_work.protocol import ThreadMeta, ThreadStatus
 class InMemoryThreadMetaStore(ThreadMetaStore):
     def __init__(self) -> None:
         self._rows: dict[UUID, ThreadMeta] = {}
+        #: B-282 —— 留存作业清过工作目录的会话(``ThreadMeta`` 不带这一列;测试用
+        #: :meth:`mark_workspace_cleaned` 造)。
+        self._workspace_cleaned: set[UUID] = set()
+
+    def mark_workspace_cleaned(self, thread_id: UUID) -> None:
+        """测试用:像留存作业那样记一笔「工作目录清过了」。"""
+        self._workspace_cleaned.add(thread_id)
 
     async def create(
         self,
@@ -299,6 +306,13 @@ class InMemoryThreadMetaStore(ThreadMetaStore):
         self._rows[thread_id] = row.model_copy(
             update={"workspace_layout": "conversation", "updated_at": datetime.now(UTC)}
         )
+        return True
+
+    async def consume_workspace_cleaned(self, thread_id: UUID, *, tenant_id: UUID) -> bool:
+        row = self._rows.get(thread_id)
+        if row is None or row.tenant_id != tenant_id or thread_id not in self._workspace_cleaned:
+            return False
+        self._workspace_cleaned.discard(thread_id)
         return True
 
     async def check_access(self, thread_id: UUID, tenant_id: UUID) -> bool:

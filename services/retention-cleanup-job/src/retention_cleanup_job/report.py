@@ -68,6 +68,8 @@ class CleanupReport:
     conversation_dirs_skipped_unsafe: int = 0
     conversation_dirs_skipped_owner_deleted: int = 0
     conversation_dirs_failed: int = 0
+    conversation_tool_results_skipped_artifact: int = 0
+    conversation_dirs_raced: int = 0
     # 留存链 B-27 —— 孤儿 threads/<id>/ 目录。
     thread_dirs_removed: int = 0
     #: B-50 spec §4.2 —— 孤儿 ``.tool_results/<run_id>/``。此前从没被清过

@@ -348,6 +348,10 @@ class RetentionCleanupJob:
             conversation_dirs_skipped_unsafe=conversations.skipped_unsafe,
             conversation_dirs_skipped_owner_deleted=conversations.skipped_owner_deleted,
             conversation_dirs_failed=conversations.failed,
+            conversation_tool_results_skipped_artifact=(
+                conversations.tool_results_skipped_artifact
+            ),
+            conversation_dirs_raced=conversations.raced,
             failed_passes=tuple(self._failed_passes),
             thread_dirs_removed=thread_dirs_removed,
             tool_result_dirs_removed=tool_result_dirs_removed,
@@ -739,6 +743,7 @@ class RetentionCleanupJob:
             root=self._workspace_root,
             default_days=self._conversation_workspace_retention_days,
             batch_size=self._conversation_workspace_batch_size,
+            audit=self._audit_log_store,
         )
         try:
             tally = await sweep.run(now=datetime.now(UTC))

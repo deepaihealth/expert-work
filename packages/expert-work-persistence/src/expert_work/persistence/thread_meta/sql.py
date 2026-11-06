@@ -471,6 +471,21 @@ class SqlThreadMetaStore(ThreadMetaStore):
             await session.commit()
             return int(getattr(result, "rowcount", 0) or 0) > 0
 
+    async def consume_workspace_cleaned(self, thread_id: UUID, *, tenant_id: UUID) -> bool:
+        stmt = (
+            update(ThreadMetaRow)
+            .where(
+                ThreadMetaRow.thread_id == thread_id,
+                ThreadMetaRow.tenant_id == tenant_id,
+                ThreadMetaRow.workspace_cleaned_at.is_not(None),
+            )
+            .values(workspace_cleaned_at=None, updated_at=ThreadMetaRow.updated_at)
+        )
+        async with self._sf() as session:
+            result = await session.execute(stmt)
+            await session.commit()
+            return int(getattr(result, "rowcount", 0) or 0) > 0
+
     async def check_access(self, thread_id: UUID, tenant_id: UUID) -> bool:
         async with self._sf() as session:
             row = await session.get(ThreadMetaRow, thread_id)

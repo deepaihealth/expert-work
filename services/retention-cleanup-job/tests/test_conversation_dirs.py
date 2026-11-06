@@ -525,7 +525,7 @@ def test_the_done_line_carries_the_conversation_counts(caplog: pytest.LogCapture
 
 @pytest.mark.asyncio
 async def test_a_soft_deleted_users_tree_is_left_to_the_archive(world: _World) -> None:
-    """用户已软删(``{tenant}/.deleted/{user}``):整棵树归 janitor 归档,这里不动,记一笔不再列。"""
+    """用户已软删(``{tenant}/.deleted/{user}``):整棵树归 janitor 归档,这里不动、不记清理时间。"""
     try:
         conv = await world.conversation(age_days=200)
         conv_dir = world.place(conv)
@@ -537,7 +537,7 @@ async def test_a_soft_deleted_users_tree_is_left_to_the_archive(world: _World) -
 
         assert conv_dir.exists()
         assert report.conversation_dirs_skipped_owner_deleted == 1
-        assert world.cleaned_at(conv) is not None
+        assert world.cleaned_at(conv) is None  # not stamped: the user purge takes the rows
     finally:
         await world.engine.dispose()
 
@@ -605,5 +605,384 @@ async def test_conversations_with_an_unfinished_run_do_not_take_a_batch_slot(
         assert busy_dir.exists()
         assert not idle_dir.exists()
         assert (report.conversation_dirs_removed, report.conversation_dirs_skipped_active) == (1, 0)
+    finally:
+        await world.engine.dispose()
+
+
+# ---------------------------------------------------------------------------
+# B-282 review —— 上传也是活动、持开场复制锁、run 目录里的产物、排序、竞态
+# ---------------------------------------------------------------------------
+
+
+def _upload(
+    world: _World,
+    conv: UUID,
+    *,
+    created_days: float,
+    used_days: float | None = None,
+    kind: str = "document",
+    deleted: bool = False,
+) -> None:
+    world.sql(
+        "INSERT INTO user_upload (id, tenant_id, user_id, thread_id, kind, ref, mime_type, "
+        " size_bytes, filename, created_at, last_used_at, deleted_at) VALUES (:i, :t, :u, :c, "
+        " :k, 'uploads/a.pdf', 'application/pdf', 1, 'a.pdf', "
+        " now() - make_interval(secs => :cs), "
+        " CASE WHEN CAST(:us AS float) IS NULL THEN NULL "
+        "      ELSE now() - make_interval(secs => CAST(:us AS float)) END, "
+        " CASE WHEN :d THEN now() ELSE NULL END)",
+        i=uuid4(),
+        t=world.tenant,
+        u=world.user,
+        c=conv,
+        k=kind,
+        cs=created_days * 86400,
+        us=None if used_days is None else used_days * 86400,
+        d=deleted,
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_recent_or_recently_used_upload_keeps_an_idle_conversation(
+    world: _World,
+) -> None:
+    """新传了附件还没跑、或这份附件最近被别的会话引用 / 被下载(B-63 让登记行续命):会话目录里的
+    ``work/uploads/<文件>`` 也得留着。删掉的附件、图片附件不算。"""
+    try:
+        convs = {}
+        for name in ("fresh", "used", "deleted", "image"):
+            conv = await world.conversation(age_days=200)
+            world.run(conv, age_days=100)
+            convs[name] = (conv, world.place(conv))
+        _upload(world, convs["fresh"][0], created_days=5)
+        _upload(world, convs["used"][0], created_days=200, used_days=5)
+        _upload(world, convs["deleted"][0], created_days=5, deleted=True)
+        _upload(world, convs["image"][0], created_days=5, kind="image")
+
+        report = await world.job().run_once()
+
+        assert convs["fresh"][1].exists()
+        assert convs["used"][1].exists()
+        assert not convs["deleted"][1].exists()
+        assert not convs["image"][1].exists()
+        assert report.conversation_dirs_removed == 2
+    finally:
+        await world.engine.dispose()
+
+
+async def _upload_audit(world: _World, conv: UUID, *, age_days: float) -> None:
+    from expert_work.persistence import SqlAuditLogStore, create_async_session_factory
+    from expert_work.protocol import AuditAction, AuditEntry, AuditResult
+
+    entry = await SqlAuditLogStore(create_async_session_factory(world.engine)).append(
+        AuditEntry(
+            tenant_id=world.tenant,
+            actor_type="user",
+            actor_id="console",
+            action=AuditAction.DOCUMENT_UPLOAD,
+            resource_type="user_workspace",
+            resource_id="uploads/a.pdf",
+            result=AuditResult.SUCCESS,
+            details={"thread_id": str(conv), "workspace_path": "uploads/a.pdf"},
+        )
+    )
+    world.sql(
+        "UPDATE audit_log SET occurred_at = now() - make_interval(secs => :s) WHERE id = :i",
+        s=age_days * 86400,
+        i=entry.id,
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_console_upload_seen_only_in_the_audit_keeps_the_conversation(
+    world: _World,
+) -> None:
+    """B-281 之前的控制台上传(与跨会话复制)没有登记行,只有 ``DOCUMENT_UPLOAD`` 审计。"""
+    from expert_work.persistence import SqlAuditLogStore
+
+    try:
+        recent = await world.conversation(age_days=200)
+        world.run(recent, age_days=100)
+        recent_dir = world.place(recent)
+        await _upload_audit(world, recent, age_days=5)
+        old = await world.conversation(age_days=200)
+        world.run(old, age_days=100)
+        old_dir = world.place(old)
+        await _upload_audit(world, old, age_days=100)
+
+        report = await world.job(audit_log_store=SqlAuditLogStore(world.sf)).run_once()
+
+        assert recent_dir.exists()
+        assert not old_dir.exists()
+        assert report.conversation_dirs_skipped_active == 1
+    finally:
+        await world.engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_the_sweep_waits_for_the_conversation_seed_lock(world: _World) -> None:
+    """再查与删持开场复制那把锁:别人(开场复制)拿着它时不动这段会话。"""
+    import asyncio
+
+    import psycopg
+
+    try:
+        conv = await world.conversation(age_days=200)
+        conv_dir = world.place(conv)
+        dsn = world.admin_dsn.replace("postgresql+psycopg://", "postgresql://", 1)
+        with psycopg.connect(dsn) as holder:
+            holder.execute(
+                "SELECT pg_advisory_xact_lock(%s, hashtext(%s))",
+                (8624, f"{world.tenant}:{conv}"),
+            )
+            with pytest.raises(TimeoutError):
+                await asyncio.wait_for(world.job().run_once(), timeout=3)
+            assert conv_dir.exists()
+            holder.rollback()
+
+        await world.job().run_once()
+        assert not conv_dir.exists()
+    finally:
+        await world.engine.dispose()
+
+
+def test_the_lock_class_is_the_control_planes_seed_lock() -> None:
+    from control_plane.advisory_locks import CONVERSATION_SEED_LOCK_CLASSID
+    from retention_cleanup_job import conversation_dirs
+
+    assert conversation_dirs.CONVERSATION_SEED_LOCK_CLASSID == CONVERSATION_SEED_LOCK_CLASSID
+
+
+@pytest.mark.asyncio
+async def test_a_run_dir_holding_a_file_an_artifact_reads_is_kept(world: _World) -> None:
+    try:
+        conv = await world.conversation(age_days=200, layout="agent_root")
+        kept_run = world.run(conv, age_days=120)
+        gone_run = world.run(conv, age_days=110)
+        kept = world.tool_results(kept_run)
+        gone = world.tool_results(gone_run)
+        artifact = uuid4()
+        world.sql(
+            "INSERT INTO artifact (id, tenant_id, user_id, agent_key, name, kind, latest_version) "
+            "VALUES (:a, :t, :u, :k, 'page.md', 'document', 1)",
+            a=artifact,
+            t=world.tenant,
+            u=world.user,
+            k=_KEY,
+        )
+        world.sql(
+            "INSERT INTO artifact_version (id, artifact_id, tenant_id, user_id, version, "
+            " path_in_workspace, created_in_thread) VALUES (:i, :a, :t, :u, 1, :p, 'r')",
+            i=uuid4(),
+            a=artifact,
+            t=world.tenant,
+            u=world.user,
+            p=f"agents/{_KEY}/.tool_results/{kept_run}/out.txt",
+        )
+
+        report = await world.job().run_once()
+
+        assert kept.exists()
+        assert not gone.exists()
+        assert report.conversation_tool_results_skipped_artifact == 1
+    finally:
+        await world.engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_protected_conversations_are_listed_last(world: _World) -> None:
+    """产物保护的会话这一轮反正不删:排在最后,不占批次。"""
+    try:
+        protected = await world.conversation(age_days=300)
+        world.place(protected)
+        artifact = uuid4()
+        world.sql(
+            "INSERT INTO artifact (id, tenant_id, user_id, agent_key, name, kind, latest_version) "
+            "VALUES (:a, :t, :u, :k, 'x.md', 'document', 1)",
+            a=artifact,
+            t=world.tenant,
+            u=world.user,
+            k=_KEY,
+        )
+        world.sql(
+            "INSERT INTO artifact_version (id, artifact_id, tenant_id, user_id, version, "
+            " path_in_workspace, created_in_thread) VALUES (:i, :a, :t, :u, 1, :p, 'r')",
+            i=uuid4(),
+            a=artifact,
+            t=world.tenant,
+            u=world.user,
+            p=f"agents/{_KEY}/threads/{protected}/work/x.md",
+        )
+        newer = await world.conversation(age_days=150)
+        newer_dir = world.place(newer)
+
+        report = await world.job(conversation_workspace_batch_size=1).run_once()
+
+        assert not newer_dir.exists()
+        assert report.conversation_dirs_skipped_artifact == 0
+    finally:
+        await world.engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_a_run_that_started_and_finished_after_listing_keeps_the_dir(
+    world: _World, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from retention_cleanup_job import conversation_dirs
+
+    try:
+        conv = await world.conversation(age_days=200)
+        world.run(conv, age_days=100)
+        conv_dir = world.place(conv)
+        real = conversation_dirs.list_idle_conversations
+
+        async def _list(*args: object, **kwargs: object) -> list[object]:
+            listed = await real(*args, **kwargs)  # type: ignore[arg-type]
+            world.run(conv, age_days=0, status="success")
+            return listed  # type: ignore[return-value]
+
+        monkeypatch.setattr(conversation_dirs, "list_idle_conversations", _list)
+
+        report = await world.job().run_once()
+
+        assert conv_dir.exists()
+        assert report.conversation_dirs_skipped_active == 1
+    finally:
+        await world.engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_a_run_created_while_deleting_is_counted_and_not_stamped(
+    world: _World, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from retention_cleanup_job import conversation_dirs
+
+    try:
+        conv = await world.conversation(age_days=200)
+        world.place(conv)
+        real = conversation_dirs._remove_files
+
+        def _remove(*args: object, **kwargs: object) -> object:
+            out = real(*args, **kwargs)  # type: ignore[arg-type]
+            world.run(conv, age_days=0, status="queued")
+            return out
+
+        monkeypatch.setattr(conversation_dirs, "_remove_files", _remove)
+
+        report = await world.job().run_once()
+
+        assert report.conversation_dirs_raced == 1
+        assert world.cleaned_at(conv) is None
+    finally:
+        await world.engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_only_the_idle_conversations_own_things_go(world: _World) -> None:
+    """不变式(同 ``test_workspace_invariant`` 的口径):删一段闲置会话,只动它自己的
+    ``threads/<会话>/`` 与它的 run 的 ``.tool_results/<run>/``;别的会话、agent 根的记忆 / 模板 /
+    上传、别的 run 的结果都不动。"""
+    try:
+        idle = await world.conversation(age_days=200)
+        idle_run = world.run(idle, age_days=100)
+        world.place(idle)
+        world.tool_results(idle_run)
+        busy = await world.conversation(age_days=200)
+        world.run(busy, age_days=1)
+        world.place(busy)
+        other_run = world.tool_results(uuid4())
+        agent = world.user_dir() / "agents" / _KEY
+        for rel in ("style/s.md", "MEMORY.md", "AGENT_NOTES.md", "uploads/u.pdf"):
+            (agent / rel).parent.mkdir(parents=True, exist_ok=True)
+            (agent / rel).write_text(rel)
+        before = set(world.root.rglob("*"))
+
+        await world.job().run_once()
+
+        after = set(world.root.rglob("*"))
+        gone = before - after
+        idle_dir = world.conv_dir(idle)
+        idle_results = agent / ".tool_results" / str(idle_run)
+        assert gone and all(
+            p == idle_dir or idle_dir in p.parents or p == idle_results or idle_results in p.parents
+            for p in gone
+        )
+        assert other_run.exists()
+    finally:
+        await world.engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_the_cleanup_stamp_is_consumed_once_without_touching_updated_at(
+    world: _World,
+) -> None:
+    """B-282 —— 起新 run 的入口把清理标记清回空(拿到一次说明);``updated_at`` 不动,之后这段
+    会话按新的活动重新算闲置。"""
+    from expert_work.persistence import SqlThreadMetaStore
+
+    try:
+        conv = await world.conversation(age_days=200)
+        world.place(conv)
+        await world.job().run_once()
+        assert world.cleaned_at(conv) is not None
+        before = world.sql("SELECT updated_at FROM thread_meta WHERE thread_id = :t", t=conv)
+        threads = SqlThreadMetaStore(world.sf)
+
+        first = await threads.consume_workspace_cleaned(conv, tenant_id=world.tenant)
+        second = await threads.consume_workspace_cleaned(conv, tenant_id=world.tenant)
+        other_tenant = await threads.consume_workspace_cleaned(conv, tenant_id=uuid4())
+
+        assert (first, second, other_tenant) == (True, False, False)
+        assert world.cleaned_at(conv) is None
+        assert (
+            world.sql("SELECT updated_at FROM thread_meta WHERE thread_id = :t", t=conv) == before
+        )
+    finally:
+        await world.engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_a_conversation_with_a_recent_upload_does_not_take_a_batch_slot(
+    world: _World,
+) -> None:
+    try:
+        busy = await world.conversation(age_days=300)
+        world.run(busy, age_days=200)
+        _upload(world, busy, created_days=5)
+        busy_dir = world.place(busy)
+        idle = await world.conversation(age_days=150)
+        idle_dir = world.place(idle)
+
+        report = await world.job(conversation_workspace_batch_size=1).run_once()
+
+        assert busy_dir.exists() and not idle_dir.exists()
+        assert report.conversation_dirs_skipped_active == 0
+    finally:
+        await world.engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_an_upload_landing_after_listing_keeps_the_dir(
+    world: _World, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from retention_cleanup_job import conversation_dirs
+
+    try:
+        conv = await world.conversation(age_days=200)
+        world.run(conv, age_days=100)
+        conv_dir = world.place(conv)
+        real = conversation_dirs.list_idle_conversations
+
+        async def _list(*args: object, **kwargs: object) -> list[object]:
+            listed = await real(*args, **kwargs)  # type: ignore[arg-type]
+            _upload(world, conv, created_days=0)
+            return listed  # type: ignore[return-value]
+
+        monkeypatch.setattr(conversation_dirs, "list_idle_conversations", _list)
+
+        report = await world.job().run_once()
+
+        assert conv_dir.exists()
+        assert report.conversation_dirs_skipped_active == 1
     finally:
         await world.engine.dispose()

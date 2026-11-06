@@ -163,7 +163,8 @@ def log_done(report: CleanupReport) -> None:
         "conversation_dirs_removed=%d conversation_tool_results_removed=%d "
         "conversation_dirs_skipped_active=%d conversation_dirs_skipped_artifact=%d "
         "conversation_dirs_skipped_unsafe=%d conversation_dirs_skipped_owner_deleted=%d "
-        "conversation_dirs_failed=%d "
+        "conversation_dirs_failed=%d conversation_tool_results_skipped_artifact=%d "
+        "conversation_dirs_raced=%d "
         "thread_dirs_removed=%d "
         "memory_hard_deleted=%d workspaces_hard_deleted=%d "
         "workspaces_pending_archive=%d tenant_users_hard_deleted=%d "
@@ -205,6 +206,8 @@ def log_done(report: CleanupReport) -> None:
         report.conversation_dirs_skipped_unsafe,
         report.conversation_dirs_skipped_owner_deleted,
         report.conversation_dirs_failed,
+        report.conversation_tool_results_skipped_artifact,
+        report.conversation_dirs_raced,
         report.thread_dirs_removed,
         report.memory_hard_deleted,
         report.workspaces_hard_deleted,
