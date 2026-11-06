@@ -107,3 +107,10 @@ class TenantConfigStore(abc.ABC):
         Platform-level cross-tenant read behind ``GET /v1/tenants``
         (system_admin only). Paginated via ``limit``/``offset``.
         """
+
+    @abc.abstractmethod
+    async def clear_default_agent_name(self, *, tenant_id: UUID, agent_name: str) -> bool:
+        """B-278 —— set ``default_agent_name`` to NULL **only if** it is still
+        ``agent_name`` (the agent being purged). Conditional in one statement so
+        an admin's concurrent switch to another default is never undone.
+        Returns whether the row changed; no row / another default → ``False``."""

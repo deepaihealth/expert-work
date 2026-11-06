@@ -98,11 +98,11 @@ class InMemoryTriggerStore(TriggerStore):
 
     async def disable_for_agent(
         self, *, agent_name: str, agent_version: str, tenant_id: UUID
-    ) -> int:
+    ) -> list[UUID]:
         """Deletion hygiene PR4 §B — agent soft-delete cascade.
 
         Predicates: ``enabled == true AND agent_name == AND agent_version ==
-        AND tenant_id ==``; sets ``enabled=false``; returns rows changed.
+        AND tenant_id ==``; sets ``enabled=false``; returns the changed ids.
         Must stay semantically identical to ``SqlTriggerStore.disable_for_agent``.
         """
         victims = [
@@ -118,7 +118,7 @@ class InMemoryTriggerStore(TriggerStore):
             self._rows[tid] = self._rows[tid].model_copy(
                 update={"enabled": False, "updated_at": now}
             )
-        return len(victims)
+        return victims
 
     async def claim_cron_fire(
         self,

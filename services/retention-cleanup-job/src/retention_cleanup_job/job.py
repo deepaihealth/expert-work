@@ -79,6 +79,7 @@ from retention_cleanup_job.orphan_threads import (
     sweep_orphan_thread_dirs,
     sweep_orphan_tool_results,
 )
+from retention_cleanup_job.purged_agents import PurgedAgentsSweep, sweep_purged_agents
 from retention_cleanup_job.report import CleanupReport
 from retention_cleanup_job.uploads import UploadSweep, UploadSweepTally
 
@@ -265,6 +266,7 @@ class RetentionCleanupJob:
             ) = await self._sweep_artifact_versions()
             artifact_soft, artifact_hard = await self._sweep_artifacts()
             orphan_artifact_copies_removed = await self._sweep_orphan_artifact_copies()
+            purged = await self._sweep_purged_agents()
             thread_dirs_removed = await self._sweep_orphan_thread_dirs()
             tool_result_dirs_removed = await self._sweep_orphan_tool_results()
             memory_hard_deleted = await self._sweep_memory()
@@ -286,6 +288,8 @@ class RetentionCleanupJob:
             artifact_files_removed=artifact_files_removed,
             artifacts_expired=artifacts_expired,
             orphan_artifact_copies_removed=orphan_artifact_copies_removed,
+            purged_agent_dirs_removed=purged.removed,
+            purged_agent_dirs_failed=purged.failed,
             uploads_expired=uploads.marked,
             upload_files_removed=uploads.files_removed,
             upload_files_unsafe=uploads.files_unsafe,
@@ -611,6 +615,22 @@ class RetentionCleanupJob:
             # 退出,让人去看。
             self._failed_passes.append("uploads")
         return tally
+
+    async def _sweep_purged_agents(self) -> PurgedAgentsSweep:
+        """B-278 —— 隔离区(``{tenant}/.purged-agents``)满 7 天的条目;规则本体在
+        :mod:`retention_cleanup_job.purged_agents`。没配 ``workspace_root`` 时不跑;删不掉的
+        条目进 ``failed_passes``(进程以非 0 退出,让人去看)。"""
+        if self._workspace_root is None:
+            return PurgedAgentsSweep()
+        try:
+            sweep = await sweep_purged_agents(self._workspace_root)
+        except Exception:
+            logger.exception("retention.purged_agents_failed")
+            self._failed_passes.append("purged_agents")
+            return PurgedAgentsSweep()
+        if sweep.failed:
+            self._failed_passes.append("purged_agents")
+        return sweep
 
     async def _sweep_orphan_thread_dirs(self) -> int:
         """留存链 B-27 —— 孤儿 ``threads/<thread_id>/`` 目录;规则本体在

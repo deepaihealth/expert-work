@@ -56,3 +56,7 @@ class InMemoryAgentDisableStore(AgentDisableStore):
                 for (row_tenant, name), record in self._rows.items()
                 if row_tenant == tenant_id and record.disabled
             }
+
+    async def delete(self, *, tenant_id: UUID, agent_name: str) -> bool:
+        async with self._lock:
+            return self._rows.pop((tenant_id, agent_name), None) is not None

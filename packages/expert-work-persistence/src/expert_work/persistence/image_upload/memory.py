@@ -108,3 +108,24 @@ class InMemoryImageUploadStore(ImageUploadStore):
         rows = [r for r in self._rows.values() if r.tenant_id == tenant_id and r.user_id == user_id]
         rows.sort(key=lambda r: r.created_at)
         return rows[:limit]
+
+    async def list_for_threads(
+        self, *, tenant_id: UUID, thread_ids: Sequence[UUID]
+    ) -> list[ImageUpload]:
+        wanted = set(thread_ids)
+        rows = [
+            r for r in self._rows.values() if r.tenant_id == tenant_id and r.thread_id in wanted
+        ]
+        rows.sort(key=lambda r: r.created_at)
+        return rows
+
+    async def delete_for_threads(self, *, tenant_id: UUID, thread_ids: Sequence[UUID]) -> int:
+        wanted = set(thread_ids)
+        victims = [
+            image_id
+            for image_id, r in self._rows.items()
+            if r.tenant_id == tenant_id and r.thread_id in wanted
+        ]
+        for image_id in victims:
+            del self._rows[image_id]
+        return len(victims)

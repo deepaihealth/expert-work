@@ -129,3 +129,15 @@ class ImageUploadStore(abc.ABC):
         soft-deleted row too (its blob hasn't necessarily been reaped yet).
         Tenant- AND user-scoped, same isolation rule as
         :meth:`delete_all_for_user`. Sorted by ``created_at`` ascending."""
+
+    @abc.abstractmethod
+    async def list_for_threads(
+        self, *, tenant_id: UUID, thread_ids: Sequence[UUID]
+    ) -> list[ImageUpload]:
+        """B-278 —— every image of these conversations, active AND soft-deleted
+        (the purge needs each ``object_key`` to delete the blob first)."""
+
+    @abc.abstractmethod
+    async def delete_for_threads(self, *, tenant_id: UUID, thread_ids: Sequence[UUID]) -> int:
+        """B-278 —— hard-delete the image rows of these conversations;
+        tenant-scoped, returns the count deleted."""

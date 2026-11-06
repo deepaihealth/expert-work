@@ -170,6 +170,9 @@ class AgentFileVersionStore(Protocol):
     async def delete_for_path(self, *, tenant_id: UUID, user_id: UUID, path: str) -> int:
         """工作区删文件接口删掉 ``path``(用户根相对)时,连它的版本一起删;返回版本文件数。"""
 
+    async def delete_for_agent(self, *, tenant_id: UUID, user_id: UUID, agent_key: str) -> int:
+        """B-278 —— 彻底删除智能体:删这个用户在这个 agent 下的全部版本;返回版本文件数。"""
+
 
 @dataclass
 class _Scan:
@@ -1111,6 +1114,43 @@ class NasAgentFileVersionStore:
         return await asyncio.to_thread(
             _delete_path_versions, self.workspace.root, tenant_id, user_id, path
         )
+
+    async def delete_for_agent(self, *, tenant_id: UUID, user_id: UUID, agent_key: str) -> int:
+        require_safe_key(agent_key)
+        async with self.lock.acquire(key=f"{tenant_id}:{user_id}:{agent_key}"):
+            return await asyncio.to_thread(
+                _delete_agent_versions, self.workspace.root, tenant_id, user_id, agent_key
+            )
+
+
+def _delete_agent_versions(root: str, tenant_id: UUID, user_id: UUID, agent_key: str) -> int:
+    """``{root}/{tenant}/.agent-file-versions/{user}/{agent_key}`` 整个删掉(B-278)。
+
+    同 :func:`_delete_user_versions`:每级 ``O_NOFOLLOW`` 打开,最后一段 ``lstat`` 确认是目录
+    再 ``rmtree(dir_fd=...)``——被换成 symlink 的话宁可失败,也不跟过去删到别处。"""
+    try:
+        user_fd = _open_versions_root(root, tenant_id, user_id, create=False)
+    except FileNotFoundError:
+        return 0
+    try:
+        try:
+            info = os.lstat(agent_key, dir_fd=user_fd)
+        except FileNotFoundError:
+            return 0
+        if not stat.S_ISDIR(info.st_mode):
+            msg = f"agent file version entry is not a directory: {agent_key!r}"
+            raise WorkspacePathEscapeError(msg)
+        agent_fd = _openat_dir(user_fd, agent_key, create=False)
+        try:
+            count = 0
+            for _base, _dirs, files, _dfd in os.fwalk(dir_fd=agent_fd):
+                count += sum(1 for f in files if _VERSION_RE.match(f))
+        finally:
+            os.close(agent_fd)
+        shutil.rmtree(agent_key, dir_fd=user_fd)
+        return count
+    finally:
+        os.close(user_fd)
 
 
 def _delete_path_versions(root: str, tenant_id: UUID, user_id: UUID, path: str) -> int:

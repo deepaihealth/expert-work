@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Collection
 from datetime import UTC, datetime
 from uuid import UUID
 
@@ -10,6 +11,7 @@ from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from expert_work.persistence.agent_instance.base import AgentInstanceStore
+from expert_work.persistence.bulk_delete import count_where, delete_where
 from expert_work.persistence.models import AgentInstanceRow
 from expert_work.protocol import AgentInstanceRecord
 
@@ -110,3 +112,22 @@ class SqlAgentInstanceStore(AgentInstanceStore):
         async with self._sf() as session:
             rows = (await session.execute(stmt)).scalars().all()
         return [_row_to_record(r) for r in rows]
+
+    async def count_for_agent(self, *, tenant_id: UUID, agent_code: str) -> int:
+        return await count_where(
+            self._sf,
+            AgentInstanceRow,
+            AgentInstanceRow.tenant_id == tenant_id,
+            AgentInstanceRow.agent_code == agent_code,
+        )
+
+    async def delete_for_agent(
+        self, *, tenant_id: UUID, agent_code: str, keep_users: Collection[UUID] = ()
+    ) -> int:
+        return await delete_where(
+            self._sf,
+            AgentInstanceRow,
+            AgentInstanceRow.tenant_id == tenant_id,
+            AgentInstanceRow.agent_code == agent_code,
+            AgentInstanceRow.user_id.notin_(list(keep_users)),
+        )

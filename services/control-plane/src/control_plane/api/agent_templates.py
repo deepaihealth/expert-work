@@ -35,7 +35,6 @@ from expert_work.persistence import (
 from expert_work.persistence.agent_spec import AgentSpecStore
 from expert_work.protocol import (
     AgentSpec,
-    AgentSpecStatus,
     AuditAction,
     PlatformAgentTemplatePatch,
     PlatformAgentTemplateRecord,
@@ -128,7 +127,7 @@ async def _find_extends_dependents(
     while True:
         page = await agent_spec.list_all_tenants(limit=_DEPENDENT_PAGE_SIZE, offset=offset)
         for s in page:
-            if s.status is AgentSpecStatus.DELETED:
+            if s.status.gone:
                 continue
             ref = s.spec.spec.extends
             if ref is None:

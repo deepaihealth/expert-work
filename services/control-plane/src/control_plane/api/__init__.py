@@ -1,5 +1,6 @@
 """FastAPI routers for the Control Plane (Streams B + C)."""
 
+from control_plane.api.agent_lifecycle import build_agent_lifecycle_router
 from control_plane.api.agent_schema import build_agent_schema_router
 from control_plane.api.agent_templates import build_agent_templates_router
 from control_plane.api.agent_users import build_agent_users_router, build_tenant_users_router
@@ -87,6 +88,7 @@ from control_plane.api.webhook_endpoints import build_webhook_endpoints_router
 from control_plane.api.workspace import build_workspace_router
 
 __all__ = [
+    "build_agent_lifecycle_router",
     "build_agent_schema_router",
     "build_agent_templates_router",
     "build_agent_users_router",

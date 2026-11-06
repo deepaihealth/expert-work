@@ -30,6 +30,7 @@ from sqlalchemy import delete, func, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from sqlalchemy.sql.elements import ColumnElement
 
+from expert_work.persistence.bulk_delete import count_in_chunks
 from expert_work.persistence.models import KnowledgeRetrievalLogRow
 
 #: Who searched — the table's CHECK constraint lists the same three.
@@ -133,6 +134,10 @@ class KnowledgeRetrievalLogStore(abc.ABC):
         (conversation and user purge); returns how many."""
 
     @abc.abstractmethod
+    async def count_for_threads(self, *, tenant_id: UUID, thread_ids: Collection[UUID]) -> int:
+        """B-278 —— rows ``delete_for_threads`` would remove (agent purge preview)."""
+
+    @abc.abstractmethod
     async def delete_for_actor(self, *, tenant_id: UUID, actor_id: str) -> int:
         """Delete the console tests this employee ran (user purge); returns how many."""
 
@@ -192,6 +197,14 @@ class InMemoryKnowledgeRetrievalLogStore(KnowledgeRetrievalLogStore):
     async def delete_for_threads(self, *, tenant_id: UUID, thread_ids: Collection[UUID]) -> int:
         wanted = set(thread_ids)
         return self._delete(lambda row: row.tenant_id == tenant_id and row.thread_id in wanted)
+
+    async def count_for_threads(self, *, tenant_id: UUID, thread_ids: Collection[UUID]) -> int:
+        wanted = set(thread_ids)
+        return sum(
+            1
+            for row in self._rows.values()
+            if row.tenant_id == tenant_id and row.thread_id in wanted
+        )
 
     async def delete_for_actor(self, *, tenant_id: UUID, actor_id: str) -> int:
         return self._delete(lambda row: row.tenant_id == tenant_id and row.actor_id == actor_id)
@@ -358,6 +371,15 @@ class SqlKnowledgeRetrievalLogStore(KnowledgeRetrievalLogStore):
         return await self._delete(
             KnowledgeRetrievalLogRow.tenant_id == tenant_id,
             KnowledgeRetrievalLogRow.thread_id.in_(list(thread_ids)),
+        )
+
+    async def count_for_threads(self, *, tenant_id: UUID, thread_ids: Collection[UUID]) -> int:
+        return await count_in_chunks(
+            self._sf,
+            KnowledgeRetrievalLogRow,
+            KnowledgeRetrievalLogRow.thread_id,
+            list(thread_ids),
+            KnowledgeRetrievalLogRow.tenant_id == tenant_id,
         )
 
     async def delete_for_actor(self, *, tenant_id: UUID, actor_id: str) -> int:

@@ -313,3 +313,11 @@ class ServiceBackedTenantConfigStore(TenantConfigStore):
 
     async def list_all(self, *, limit: int = 50, offset: int = 0) -> list[TenantConfigRecord]:
         return await self._service.store.list_all(limit=limit, offset=offset)
+
+    async def clear_default_agent_name(self, *, tenant_id: UUID, agent_name: str) -> bool:
+        changed = await self._service.store.clear_default_agent_name(
+            tenant_id=tenant_id, agent_name=agent_name
+        )
+        # 同 ``set_status``:直写底层 store 绕过了 service 缓存,立刻失效。
+        self._service.invalidate(tenant_id)
+        return changed

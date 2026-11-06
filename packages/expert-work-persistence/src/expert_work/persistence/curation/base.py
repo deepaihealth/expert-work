@@ -239,3 +239,17 @@ class CurationCandidateStore(abc.ABC):
         user) is nulled. Returns the count updated. Tenant- AND user-scoped;
         ``tenant_id`` is NOT NULL on this table so the predicate is
         unambiguous."""
+
+    # --- B-278 彻底删除智能体 ---------------------------------------------
+
+    @abc.abstractmethod
+    async def count_for_agent(self, *, tenant_id: UUID, agent_name: str) -> int:
+        """B-278 —— rows ``delete_for_agent`` would remove (purge preview)."""
+
+    @abc.abstractmethod
+    async def delete_for_agent(self, *, tenant_id: UUID, agent_name: str) -> int:
+        """B-278 —— hard-delete every row whose ``agent_name`` is exactly this
+        name (agent purge). Tenant-scoped; returns the rows removed.
+
+        Must run before the agent's ``eval_dataset`` rows go: a promoted
+        candidate points at its dataset through a ``RESTRICT`` foreign key."""

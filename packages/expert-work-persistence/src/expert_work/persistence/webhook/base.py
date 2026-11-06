@@ -130,6 +130,10 @@ class WebhookDeliveryStore(abc.ABC):
         :meth:`WebhookEndpointStore.delete_all_for_user` (no FK cascade)."""
 
     @abc.abstractmethod
+    async def count_for_endpoints(self, *, endpoint_ids: Sequence[UUID], tenant_id: UUID) -> int:
+        """B-278 —— rows ``delete_for_endpoints`` would remove (agent purge preview)."""
+
+    @abc.abstractmethod
     async def list_ready(
         self, *, before: datetime, limit: int = 1000
     ) -> list[WebhookDeliveryRecord]:

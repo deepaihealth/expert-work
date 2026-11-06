@@ -12,6 +12,7 @@ from sqlalchemy import func, or_, select
 from sqlalchemy import update as sa_update
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from expert_work.persistence.bulk_delete import count_in_chunks
 from expert_work.persistence.models import WebhookDeliveryRow, WebhookEndpointRow
 from expert_work.persistence.webhook.base import WebhookDeliveryStore, WebhookEndpointStore
 from expert_work.protocol import (
@@ -314,6 +315,15 @@ class SqlWebhookDeliveryStore(WebhookDeliveryStore):
             result = await session.execute(stmt)
             await session.commit()
         return int(getattr(result, "rowcount", 0) or 0)
+
+    async def count_for_endpoints(self, *, endpoint_ids: Sequence[UUID], tenant_id: UUID) -> int:
+        return await count_in_chunks(
+            self._sf,
+            WebhookDeliveryRow,
+            WebhookDeliveryRow.endpoint_id,
+            list(endpoint_ids),
+            WebhookDeliveryRow.tenant_id == tenant_id,
+        )
 
     async def list_ready(
         self, *, before: datetime, limit: int = 1000

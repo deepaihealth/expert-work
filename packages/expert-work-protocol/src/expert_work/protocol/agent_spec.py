@@ -1879,6 +1879,15 @@ class AgentSpecStatus(StrEnum):
     ACTIVE = "active"
     DEPRECATED = "deprecated"
     DELETED = "deleted"
+    #: B-278 —— 彻底删除开始时整个名字的所有版本一起翻成这个状态,删完才删行。处于
+    #: 这个状态的名字不能恢复、不能新建同名版本(409 ``AGENT_PURGING``);删到一半失败
+    #: 会停在这里,只能再点一次彻底删除把剩下的清完。
+    PURGING = "purging"
+
+    @property
+    def gone(self) -> bool:
+        """``deleted`` or ``purging`` —— not runnable, hidden from live reads."""
+        return self in (AgentSpecStatus.DELETED, AgentSpecStatus.PURGING)
 
 
 class AgentSpecDraft(BaseModel):

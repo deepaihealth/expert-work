@@ -91,6 +91,11 @@ spec:
 """
 
 
+def _frozen_monotonic() -> float:
+    """A clock that never advances — no token-bucket refill during a test."""
+    return 1_000.0
+
+
 @pytest.fixture
 def audit_store() -> InMemoryAuditLogStore:
     return InMemoryAuditLogStore()
@@ -246,8 +251,14 @@ async def test_trigger_run_denied_when_quota_exhausted(
     app_factory: tuple[FastAPI, InMemoryTenantQuotaStore],
     admission_client: AsyncClient,
     audit_store: InMemoryAuditLogStore,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    _, quota_store = app_factory
+    app, quota_store = app_factory
+    # The QPS bucket refills 1 token/s of wall time: on a loaded CI worker more
+    # than a second can pass between these three calls and the "denied" run is
+    # admitted (seen as 200 != 429). Freeze the bucket's clock so the test checks
+    # admission, not the runner's speed — the bucket only ever spends.
+    monkeypatch.setattr(app.state.quota_service, "_monotonic", _frozen_monotonic)
     # Seed BEFORE any HTTP calls: the QuotaService caches resolved
     # quotas for 60s (subsystems/16 § 5.3) so seeding after the first
     # call would land outside the cache window.

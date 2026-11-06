@@ -83,3 +83,14 @@ class QualityScoreStore(abc.ABC):
         SQL aggregate (not a bounded ``list_scores``) so a wide baseline window
         is never silently truncated. ``mean`` is ``None`` when ``count`` is 0.
         """
+
+    # --- B-278 彻底删除智能体 ---------------------------------------------
+
+    @abc.abstractmethod
+    async def count_for_agent(self, *, tenant_id: UUID, agent_name: str) -> int:
+        """B-278 —— rows ``delete_for_agent`` would remove (purge preview)."""
+
+    @abc.abstractmethod
+    async def delete_for_agent(self, *, tenant_id: UUID, agent_name: str) -> int:
+        """B-278 —— hard-delete every row whose ``agent_name`` is exactly this
+        name (agent purge). Tenant-scoped; returns the rows removed."""

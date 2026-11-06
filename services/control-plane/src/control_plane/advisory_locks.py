@@ -65,6 +65,7 @@ from types import MappingProxyType
 from typing import Final
 
 __all__ = [
+    "AGENT_PURGE_LOCK_CLASSID",
     "CLASSID_BY_OWNER",
     "CONVERSATION_SEED_LOCK_CLASSID",
     "FIGURE_RECONCILE_LOCK_CLASSID",
@@ -136,6 +137,10 @@ FIGURE_RECONCILE_LOCK_CLASSID: Final[int] = 8623
 #: that one would hold every other write of the same user for the copy's duration.
 CONVERSATION_SEED_LOCK_CLASSID: Final[int] = 8624
 
+#: ``agent_purge_lock`` (B-278, ``purge.agent_purge_lock``) — one purge per agent name at
+#: a time across replicas, key ``"{tenant_id}:{agent_name}"``; held for the whole purge.
+AGENT_PURGE_LOCK_CLASSID: Final[int] = 8625
+
 #: Every registered classid, keyed by the owning module. The self-audit test
 #: asserts the values are unique *and* that every ``*_CLASSID`` constant above
 #: appears here.
@@ -153,5 +158,6 @@ CLASSID_BY_OWNER: Final[Mapping[str, int]] = MappingProxyType(
         "memory_writeback_job": MEMORY_WRITEBACK_CLAIM_LOCK_CLASSID,
         "figure_reconcile": FIGURE_RECONCILE_LOCK_CLASSID,
         "conversation_seed_lock": CONVERSATION_SEED_LOCK_CLASSID,
+        "agent_purge_lock": AGENT_PURGE_LOCK_CLASSID,
     }
 )

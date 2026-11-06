@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Collection, Sequence
 from datetime import UTC, datetime
 from uuid import UUID, uuid4
 
@@ -374,3 +374,37 @@ class InMemoryArtifactStore(ArtifactStore):
             v for v in self._versions if not (v.tenant_id == tenant_id and v.user_id == user_id)
         ]
         return len(victim_ids)
+
+    def _agent_ids(self, tenant_id: UUID, agent_key: str) -> set[UUID]:
+        if not agent_key:
+            raise ValueError("agent_key must be non-empty")
+        return {
+            aid
+            for aid, a in self._artifacts.items()
+            if a.tenant_id == tenant_id and a.agent_key == agent_key
+        }
+
+    async def list_versions_for_agent(
+        self, *, tenant_id: UUID, agent_key: str
+    ) -> list[ArtifactVersion]:
+        ids = self._agent_ids(tenant_id, agent_key)
+        return [v for v in self._versions if v.tenant_id == tenant_id and v.artifact_id in ids]
+
+    async def count_for_agent(self, *, tenant_id: UUID, agent_key: str) -> int:
+        return len(self._agent_ids(tenant_id, agent_key))
+
+    async def delete_all_for_agent(
+        self, *, tenant_id: UUID, agent_key: str, keep_users: Collection[UUID] = ()
+    ) -> int:
+        keep = set(keep_users)
+        ids = {
+            aid
+            for aid in self._agent_ids(tenant_id, agent_key)
+            if self._artifacts[aid].user_id not in keep
+        }
+        self._versions = [
+            v for v in self._versions if not (v.tenant_id == tenant_id and v.artifact_id in ids)
+        ]
+        for aid in ids:
+            del self._artifacts[aid]
+        return len(ids)

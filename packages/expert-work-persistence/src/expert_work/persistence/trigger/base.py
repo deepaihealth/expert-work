@@ -102,16 +102,18 @@ class TriggerStore(abc.ABC):
     @abc.abstractmethod
     async def disable_for_agent(
         self, *, agent_name: str, agent_version: str, tenant_id: UUID
-    ) -> int:
+    ) -> list[UUID]:
         """Bulk-disable one agent version's triggers — deletion hygiene PR4 §B
         (agent soft-delete cascade).
 
         Flips ``enabled=false`` on every row matching all four predicates:
         ``enabled == true AND agent_name == AND agent_version == AND
-        tenant_id ==``. Returns the number of rows changed — already-disabled
-        rows are not touched and not counted. Consumed by the ``delete_agent``
+        tenant_id ==``. Returns the ids of the rows changed — already-disabled
+        rows are not touched and not listed. Consumed by the ``delete_agent``
         endpoint so a soft-deleted agent's triggers stop firing instead of
-        zombie-looping forever.
+        zombie-looping forever; B-278 —— it records the ids in the delete audit
+        so a later restore knows which triggers the delete (not a person) turned
+        off.
         """
 
     @abc.abstractmethod

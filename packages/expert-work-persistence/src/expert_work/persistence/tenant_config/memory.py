@@ -257,3 +257,13 @@ class InMemoryTenantConfigStore(TenantConfigStore):
         async with self._lock:
             ordered = sorted(self._rows.values(), key=lambda r: r.created_at)
         return ordered[offset : offset + limit]
+
+    async def clear_default_agent_name(self, *, tenant_id: UUID, agent_name: str) -> bool:
+        async with self._lock:
+            existing = self._rows.get(tenant_id)
+            if existing is None or existing.default_agent_name != agent_name:
+                return False
+            self._rows[tenant_id] = existing.model_copy(
+                update={"default_agent_name": None, "updated_at": _now()}
+            )
+            return True

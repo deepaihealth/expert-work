@@ -28,6 +28,10 @@ class CleanupReport:
     artifacts_expired: int = 0
     # B-235 —— 找不到版本行的产物副本(登记失败 / 清除用户没删成)满 24 小时清掉。
     orphan_artifact_copies_removed: int = 0
+    #: B-278 —— 彻底删除智能体时挪进隔离区(``{tenant}/.purged-agents``)满 7 天删掉的条目,
+    #: 与删不掉的条目数(非 0 时 ``failed_passes`` 带 ``purged_agents``)。
+    purged_agent_dirs_removed: int = 0
+    purged_agent_dirs_failed: int = 0
     # 留存链 —— 上传 90 天。
     uploads_expired: int = 0
     upload_files_removed: int = 0

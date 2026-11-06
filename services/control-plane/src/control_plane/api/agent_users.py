@@ -337,7 +337,15 @@ def _build_purge_deps(request: Request) -> PurgeUserDeps:
         workspace_store=getattr(state, "workspace_store", None),
         artifact_snapshots=getattr(state, "artifact_snapshots", None),
         agent_file_versions=getattr(state, "agent_file_versions", None),
+        workspace_root=_nas_root(getattr(state, "workspace_store", None)),
     )
+
+
+def _nas_root(workspace_store: object) -> str | None:
+    """The NAS root when the workspace store is the NAS one (B-278 holding area)."""
+    from orchestrator.tools.nas_workspace_store import NasWorkspaceStore
+
+    return workspace_store.root if isinstance(workspace_store, NasWorkspaceStore) else None
 
 
 def build_tenant_users_router() -> APIRouter:

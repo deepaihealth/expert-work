@@ -111,3 +111,22 @@ class InMemoryQualityScoreStore(QualityScoreStore):
         if not overalls:
             return 0, None
         return len(overalls), sum(overalls) / len(overalls)
+
+    async def count_for_agent(self, *, tenant_id: UUID, agent_name: str) -> int:
+        async with self._lock:
+            return sum(
+                1
+                for r in self._by_run.values()
+                if r.tenant_id == tenant_id and r.agent_name == agent_name
+            )
+
+    async def delete_for_agent(self, *, tenant_id: UUID, agent_name: str) -> int:
+        async with self._lock:
+            victims = [
+                key
+                for key, r in self._by_run.items()
+                if r.tenant_id == tenant_id and r.agent_name == agent_name
+            ]
+            for key in victims:
+                del self._by_run[key]
+            return len(victims)

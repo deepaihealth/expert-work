@@ -226,6 +226,10 @@ _CONSOLE_ROUTES: frozenset[tuple[str, str]] = frozenset(
         ("GET", "/v1/agents/{name}/{version}/revisions"),
         ("GET", "/v1/agents/{name}/{version}/revisions/{revision}"),
         ("POST", "/v1/agents/{name}/{version}/revisions/{revision}/rollback"),
+        # B-278 —— 已删除智能体的恢复 / 彻底删除(console_only + manifest:delete)。
+        ("POST", "/v1/agents/{name}/{version}/restore"),
+        ("GET", "/v1/agents/{name}/{version}/purge-preview"),
+        ("POST", "/v1/agents/{name}/{version}/purge"),
         ("GET", "/v1/agents/{agent_name}/{agent_version}/users"),
         ("POST", "/v1/agents"),
         ("GET", "/v1/agents/templates"),

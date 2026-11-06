@@ -12,6 +12,7 @@ Two halves, mirroring the module:
 
 from __future__ import annotations
 
+from typing import Any
 from uuid import uuid4
 
 import pytest
@@ -26,9 +27,9 @@ from control_plane.seed_canary import (
     seed_canary,
 )
 from expert_work.persistence import InMemoryTenantConfigStore
-from expert_work.persistence.agent_spec import InMemoryAgentSpecStore
+from expert_work.persistence.agent_spec import AgentSpecBusyError, InMemoryAgentSpecStore
 from expert_work.persistence.auth import InMemoryApiKeyStore, InMemoryServiceAccountStore
-from expert_work.protocol import ApiKeyScope
+from expert_work.protocol import AgentSpecRecord, ApiKeyScope
 from expert_work.protocol.agent_spec import BuiltinToolSpec
 
 # --------------------------------------------------------------------------- manifest guard
@@ -192,3 +193,47 @@ async def test_seed_canary_rotate_key_mints_another() -> None:
         tenant_id=tenant_id, service_account_id=first.service_account_id
     )
     assert len(key_rows) == 2
+
+
+class _BusyOnce(InMemoryAgentSpecStore):
+    def __init__(self, times: int) -> None:
+        super().__init__()
+        self.busy_left = times
+
+    async def create(self, **kwargs: Any) -> AgentSpecRecord:
+        if self.busy_left:
+            self.busy_left -= 1
+            raise AgentSpecBusyError(tenant_id=kwargs["tenant_id"], name="canary")
+        return await super().create(**kwargs)
+
+
+async def test_seed_canary_retries_a_busy_create_instead_of_calling_it_registered() -> None:
+    tenants, accounts, keys, _ = _stores()
+    tenant_id = uuid4()
+    await tenants.create(tenant_id=tenant_id, display_name="t", actor_id="test")
+    specs = _BusyOnce(times=1)
+
+    result = await seed_canary(
+        tenants=tenants, accounts=accounts, keys=keys, specs=specs, tenant_id=tenant_id
+    )
+
+    assert result.agent_created is True
+    record = await specs.get(
+        tenant_id=tenant_id, name=DEFAULT_AGENT_CODE, version=CANARY_AGENT_VERSION
+    )
+    assert record is not None
+
+
+async def test_seed_canary_fails_loudly_when_still_busy() -> None:
+    tenants, accounts, keys, _ = _stores()
+    tenant_id = uuid4()
+    await tenants.create(tenant_id=tenant_id, display_name="t", actor_id="test")
+
+    with pytest.raises(SeedCanaryError, match="concurrently"):
+        await seed_canary(
+            tenants=tenants,
+            accounts=accounts,
+            keys=keys,
+            specs=_BusyOnce(times=2),
+            tenant_id=tenant_id,
+        )

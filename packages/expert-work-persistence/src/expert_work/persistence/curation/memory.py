@@ -231,3 +231,20 @@ class InMemoryCurationCandidateStore(CurationCandidateStore):
                 self._rows[cid] = r.model_copy(update={"user_id": None})
                 updated += 1
         return updated
+
+    async def count_for_agent(self, *, tenant_id: UUID, agent_name: str) -> int:
+        return sum(
+            1
+            for r in self._rows.values()
+            if r.tenant_id == tenant_id and r.agent_name == agent_name
+        )
+
+    async def delete_for_agent(self, *, tenant_id: UUID, agent_name: str) -> int:
+        victims = [
+            cid
+            for cid, r in self._rows.items()
+            if r.tenant_id == tenant_id and r.agent_name == agent_name
+        ]
+        for cid in victims:
+            del self._rows[cid]
+        return len(victims)

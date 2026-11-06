@@ -48,3 +48,14 @@ class QualityDriftAlertStore(abc.ABC):
         ``id`` tiebreak) — the W4 ``tenant_id=*`` aggregate. Caller MUST wrap
         the call in ``bypass_rls_session()`` / ``applied_scope(CrossTenant)``.
         """
+
+    # --- B-278 彻底删除智能体 ---------------------------------------------
+
+    @abc.abstractmethod
+    async def count_for_agent(self, *, tenant_id: UUID, agent_name: str) -> int:
+        """B-278 —— rows ``delete_for_agent`` would remove (purge preview)."""
+
+    @abc.abstractmethod
+    async def delete_for_agent(self, *, tenant_id: UUID, agent_name: str) -> int:
+        """B-278 —— hard-delete every row whose ``agent_name`` is exactly this
+        name (agent purge). Tenant-scoped; returns the rows removed."""

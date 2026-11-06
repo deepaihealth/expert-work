@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from datetime import UTC, datetime
 from uuid import UUID
 
 from sqlalchemy import delete, select, update
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from expert_work.persistence.bulk_delete import count_in_chunks, delete_in_chunks
 from expert_work.persistence.models import UserUploadRow
 from expert_work.persistence.user_upload.base import UserUploadStore
 from expert_work.protocol import UserUpload, UserUploadKind
@@ -148,3 +150,21 @@ class SqlUserUploadStore(UserUploadStore):
             )
             await session.commit()
             return int(getattr(result, "rowcount", 0) or 0)
+
+    async def count_for_threads(self, *, tenant_id: UUID, thread_ids: Sequence[UUID]) -> int:
+        return await count_in_chunks(
+            self._sf,
+            UserUploadRow,
+            UserUploadRow.thread_id,
+            list(thread_ids),
+            UserUploadRow.tenant_id == tenant_id,
+        )
+
+    async def delete_for_threads(self, *, tenant_id: UUID, thread_ids: Sequence[UUID]) -> int:
+        return await delete_in_chunks(
+            self._sf,
+            UserUploadRow,
+            UserUploadRow.thread_id,
+            list(thread_ids),
+            UserUploadRow.tenant_id == tenant_id,
+        )

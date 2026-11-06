@@ -9,6 +9,7 @@ from sqlalchemy import func, select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from expert_work.persistence.bulk_delete import count_where, delete_where
 from expert_work.persistence.models import QualityScoreRow
 from expert_work.persistence.quality_score.base import QualityScoreStore
 from expert_work.protocol import QualityScoreRecord
@@ -146,3 +147,19 @@ class SqlQualityScoreStore(QualityScoreStore):
         async with self._sf() as session:
             count, mean = (await session.execute(stmt)).one()
         return int(count), (float(mean) if mean is not None else None)
+
+    async def count_for_agent(self, *, tenant_id: UUID, agent_name: str) -> int:
+        return await count_where(
+            self._sf,
+            QualityScoreRow,
+            QualityScoreRow.tenant_id == tenant_id,
+            QualityScoreRow.agent_name == agent_name,
+        )
+
+    async def delete_for_agent(self, *, tenant_id: UUID, agent_name: str) -> int:
+        return await delete_where(
+            self._sf,
+            QualityScoreRow,
+            QualityScoreRow.tenant_id == tenant_id,
+            QualityScoreRow.agent_name == agent_name,
+        )

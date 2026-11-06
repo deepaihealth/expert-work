@@ -93,6 +93,19 @@ def agent_file_versions_dir(root: str, tenant_id: UUID, user_id: UUID) -> Path:
     return Path(root) / str(tenant_id) / AGENT_FILE_VERSIONS_DIR / str(user_id)
 
 
+#: B-278 —— 彻底删除智能体时删不掉的目录(别的 uid 的文件、补了权限也删不动)挪到这里:
+#: ``{root}/{tenant_id}/.purged-agents/{user_id}/{原名}-{unix 秒}-{随机}``。在用户根**旁边**
+#: (同 :data:`ARTIFACT_SNAPSHOT_DIR` 的位置理由):沙箱、工作区浏览、配额统计、janitor /
+#: 留存按 agent 目录的清理都看不到它,同名新智能体也继承不到;与用户根在同一个挂载上,
+#: 挪过去是一次 ``rename``。留存作业(``retention_cleanup_job.purged_agents``)满 7 天删掉。
+PURGED_AGENTS_DIR = ".purged-agents"
+
+
+def purged_agents_dir(root: str, tenant_id: UUID, user_id: UUID) -> Path:
+    """一个用户的隔离区:``{root}/{tenant_id}/.purged-agents/{user_id}``。"""
+    return Path(root) / str(tenant_id) / PURGED_AGENTS_DIR / str(user_id)
+
+
 #: Sandbox-local seed root for an agent's activated skill files (sandbox
 #: migration wave 2, spec § 四 — "技能方案"). Materialized at
 #: ``{SANDBOX_SKILLS_ROOT}/<agent_key>/<skill-name>/…`` on every sandbox

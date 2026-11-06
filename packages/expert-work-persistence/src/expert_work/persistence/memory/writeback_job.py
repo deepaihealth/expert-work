@@ -53,6 +53,7 @@ from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from sqlalchemy.orm import aliased
 
+from expert_work.persistence.bulk_delete import count_where, delete_where
 from expert_work.persistence.models import MemoryWritebackJobRow
 
 PENDING: Final = "pending"
@@ -226,6 +227,16 @@ class MemoryWritebackJobStore(abc.ABC):
     @abc.abstractmethod
     async def delete_for_thread(self, *, tenant_id: UUID, thread_id: UUID) -> int:
         """Purge a conversation's jobs (any status); returns the count deleted."""
+
+    @abc.abstractmethod
+    async def count_for_agent(self, *, tenant_id: UUID, agent_name: str) -> int:
+        """B-278 —— jobs ``delete_for_agent`` would remove (purge preview)."""
+
+    @abc.abstractmethod
+    async def delete_for_agent(self, *, tenant_id: UUID, agent_name: str) -> int:
+        """B-278 —— purge an agent's jobs (any status) BEFORE its memories: the
+        worker re-checks the job row before writing, so a job deleted first
+        cannot write a memory back after the purge."""
 
 
 # ---------------------------------------------------------------------------
@@ -440,6 +451,23 @@ class InMemoryMemoryWritebackJobStore(MemoryWritebackJobStore):
             jid
             for jid, j in self._rows.items()
             if j.tenant_id == tenant_id and j.thread_id == thread_id
+        ]
+        for jid in victims:
+            del self._rows[jid]
+        return len(victims)
+
+    async def count_for_agent(self, *, tenant_id: UUID, agent_name: str) -> int:
+        return sum(
+            1
+            for j in self._rows.values()
+            if j.tenant_id == tenant_id and j.agent_name == agent_name
+        )
+
+    async def delete_for_agent(self, *, tenant_id: UUID, agent_name: str) -> int:
+        victims = [
+            jid
+            for jid, j in self._rows.items()
+            if j.tenant_id == tenant_id and j.agent_name == agent_name
         ]
         for jid in victims:
             del self._rows[jid]
@@ -734,6 +762,16 @@ class SqlMemoryWritebackJobStore(MemoryWritebackJobStore):
             result = await session.execute(stmt)
             await session.commit()
         return int(getattr(result, "rowcount", 0) or 0)
+
+    async def count_for_agent(self, *, tenant_id: UUID, agent_name: str) -> int:
+        return await count_where(
+            self._sf, _Job, _Job.tenant_id == tenant_id, _Job.agent_name == agent_name
+        )
+
+    async def delete_for_agent(self, *, tenant_id: UUID, agent_name: str) -> int:
+        return await delete_where(
+            self._sf, _Job, _Job.tenant_id == tenant_id, _Job.agent_name == agent_name
+        )
 
 
 __all__ = [

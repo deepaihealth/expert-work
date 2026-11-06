@@ -186,3 +186,7 @@ class ApprovalStore(abc.ABC):
         owner connection is exempt, so the explicit ``(tenant_id,
         thread_id)`` predicate is the tenant guard here, not RLS.
         """
+
+    @abc.abstractmethod
+    async def count_for_threads(self, *, tenant_id: UUID, thread_ids: Sequence[UUID]) -> int:
+        """B-278 —— rows ``delete_for_threads`` would remove (agent purge preview)."""

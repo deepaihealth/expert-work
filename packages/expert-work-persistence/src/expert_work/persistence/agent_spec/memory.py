@@ -7,9 +7,12 @@ from datetime import UTC, datetime
 from uuid import UUID, uuid4
 
 from expert_work.persistence.agent_spec.base import (
+    AgentSpecPurgeBlockedError,
+    AgentSpecPurgingError,
     AgentSpecStore,
     AgentSpecUpdateResult,
     DuplicateAgentSpecError,
+    subagent_names,
 )
 from expert_work.protocol import (
     AgentSpec,
@@ -22,6 +25,15 @@ from expert_work.protocol import (
 
 def _now() -> datetime:
     return datetime.now(tz=UTC)
+
+
+def _status_matches(actual: AgentSpecStatus, wanted: AgentSpecStatus | None) -> bool:
+    """B-278 —— 筛「已删除」时把还没删完的(``purging``)也算上。"""
+    if wanted is None:
+        return True
+    if wanted is AgentSpecStatus.DELETED:
+        return actual.gone
+    return actual is wanted
 
 
 class InMemoryAgentSpecStore(AgentSpecStore):
@@ -67,6 +79,12 @@ class InMemoryAgentSpecStore(AgentSpecStore):
         version = spec.metadata.version
         async with self._lock:
             key = (tenant_id, name, version)
+            if any(
+                r.status is AgentSpecStatus.PURGING
+                for k, r in self._rows.items()
+                if k[0] == tenant_id and k[1] == name
+            ):
+                raise AgentSpecPurgingError(tenant_id=tenant_id, name=name, version=version)
             if key in self._rows:
                 raise DuplicateAgentSpecError(tenant_id=tenant_id, name=name, version=version)
             now = _now()
@@ -98,7 +116,7 @@ class InMemoryAgentSpecStore(AgentSpecStore):
             record = self._rows.get((tenant_id, name, version))
         if record is None:
             return None
-        if not include_deleted and record.status is AgentSpecStatus.DELETED:
+        if not include_deleted and record.status.gone:
             return None
         return record
 
@@ -116,7 +134,7 @@ class InMemoryAgentSpecStore(AgentSpecStore):
                 r
                 for r in self._rows.values()
                 if r.tenant_id == tenant_id
-                and (status is None or r.status is status)
+                and _status_matches(r.status, status)
                 and (name is None or r.name == name)
             ]
         matched.sort(key=lambda r: r.created_at, reverse=True)
@@ -166,7 +184,7 @@ class InMemoryAgentSpecStore(AgentSpecStore):
             matched = [
                 r
                 for r in self._rows.values()
-                if (status is None or r.status is status) and (name is None or r.name == name)
+                if _status_matches(r.status, status) and (name is None or r.name == name)
             ]
         matched.sort(key=lambda r: r.created_at, reverse=True)
         return matched[offset : offset + limit]
@@ -184,7 +202,7 @@ class InMemoryAgentSpecStore(AgentSpecStore):
         async with self._lock:
             key = (tenant_id, name, version)
             existing = self._rows.get(key)
-            if existing is None or existing.status is AgentSpecStatus.DELETED:
+            if existing is None or existing.status.gone:
                 return None
             prev_sha = existing.spec_sha256
             if prev_sha == spec_sha256:
@@ -206,7 +224,7 @@ class InMemoryAgentSpecStore(AgentSpecStore):
     def _live(self, key: tuple[UUID, str, str]) -> AgentSpecRecord | None:
         """非软删的行,谓词与 SQL 侧 ``_live_row`` 逐字同义。"""
         row = self._rows.get(key)
-        if row is None or row.status is AgentSpecStatus.DELETED:
+        if row is None or row.status.gone:
             return None
         return row
 
@@ -326,8 +344,78 @@ class InMemoryAgentSpecStore(AgentSpecStore):
         async with self._lock:
             key = (tenant_id, name, version)
             existing = self._rows.get(key)
-            if existing is None:
+            if existing is None or existing.status.gone:
                 return None
             replaced = existing.model_copy(update={"status": status, "updated_at": _now()})
             self._rows[key] = replaced
             return replaced
+
+    async def restore(
+        self,
+        *,
+        tenant_id: UUID,
+        name: str,
+        version: str,
+    ) -> AgentSpecRecord | None:
+        async with self._lock:
+            key = (tenant_id, name, version)
+            existing = self._rows.get(key)
+            if existing is None or existing.status is not AgentSpecStatus.DELETED:
+                return None
+            restored = existing.model_copy(
+                update={"status": AgentSpecStatus.ACTIVE, "updated_at": _now()}
+            )
+            self._rows[key] = restored
+            return restored
+
+    async def count_revisions_for_name(self, *, tenant_id: UUID, name: str) -> int:
+        async with self._lock:
+            return sum(
+                len(history)
+                for (row_tenant, row_name, _), history in self._revisions.items()
+                if row_tenant == tenant_id and row_name == name
+            )
+
+    def _blockers(self, tenant_id: UUID, name: str) -> tuple[list[str], list[str]]:
+        """(live versions of ``name``, live agents delegating to it) — under the lock."""
+        active: list[str] = []
+        referrers: list[str] = []
+        for (row_tenant, row_name, version), rec in self._rows.items():
+            if row_tenant != tenant_id:
+                continue
+            if row_name == name:
+                if not rec.status.gone:
+                    active.append(version)
+                continue
+            if rec.status.gone:
+                continue
+            docs = [rec.spec] + ([rec.draft.spec] if rec.draft is not None else [])
+            if any(name in subagent_names(d.model_dump(by_alias=True, mode="json")) for d in docs):
+                referrers.append(f"{row_name}@{version}")
+        return sorted(active), sorted(referrers)
+
+    async def begin_purge(self, *, tenant_id: UUID, name: str) -> list[str]:
+        async with self._lock:
+            active, _ = self._blockers(tenant_id, name)
+            if active:
+                raise AgentSpecPurgeBlockedError(name=name, active_versions=active)
+            keys = [k for k in self._rows if k[0] == tenant_id and k[1] == name]
+            for k in keys:
+                self._rows[k] = self._rows[k].model_copy(
+                    update={"status": AgentSpecStatus.PURGING, "updated_at": _now()}
+                )
+            return sorted(k[2] for k in keys)
+
+    async def purge_name(self, *, tenant_id: UUID, name: str) -> tuple[int, int]:
+        async with self._lock:
+            active, referrers = self._blockers(tenant_id, name)
+            if active or referrers:
+                raise AgentSpecPurgeBlockedError(
+                    name=name, active_versions=active, referenced_by=referrers
+                )
+            keys = [k for k in self._rows if k[0] == tenant_id and k[1] == name]
+            revisions = 0
+            for k in keys:
+                revisions += len(self._revisions.pop(k, []))
+                del self._rows[k]
+            return len(keys), revisions
