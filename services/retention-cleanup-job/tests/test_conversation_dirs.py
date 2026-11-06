@@ -1191,3 +1191,31 @@ async def test_an_audited_upload_after_the_pass_started_keeps_the_dir(
         assert report.conversation_dirs_skipped_active == 1
     finally:
         await world.engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_an_old_live_upload_row_appearing_after_listing_keeps_the_dir(
+    world: _World, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """M2 —— 持锁再查同样看没删的登记行(哪怕它的时间早就过了闲置线)。"""
+    from retention_cleanup_job import conversation_dirs
+
+    try:
+        conv = await world.conversation(age_days=200)
+        world.run(conv, age_days=150)
+        conv_dir = world.place(conv)
+        real = conversation_dirs.list_idle_conversations
+
+        async def _list(*args: object, **kwargs: object) -> list[object]:
+            listed = await real(*args, **kwargs)  # type: ignore[arg-type]
+            _upload(world, conv, created_days=180, used_days=180)
+            return listed  # type: ignore[return-value]
+
+        monkeypatch.setattr(conversation_dirs, "list_idle_conversations", _list)
+
+        report = await world.job().run_once()
+
+        assert conv_dir.exists()
+        assert report.conversation_dirs_skipped_active == 1
+    finally:
+        await world.engine.dispose()
