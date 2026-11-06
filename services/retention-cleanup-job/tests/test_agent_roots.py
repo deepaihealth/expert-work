@@ -407,18 +407,20 @@ async def test_a_dir_that_changes_while_held_is_put_back(
 
 
 @pytest.mark.asyncio
-async def test_a_legacy_hold_dir_is_moved_to_quarantine(world: _World) -> None:
-    """L1 —— 这条分支早先的版本在 ``/agent`` 里留下的 ``.retention-hold-*``(已经判过要删):挪进
-    沙箱看不到的隔离区,不再留在 ``/agent`` 里。"""
+async def test_a_user_dot_dir_named_like_the_old_hold_dirs_is_left_alone(world: _World) -> None:
+    """L-5 —— 点开头的名字永不碰,包括用户自己建的 ``.retention-hold-notes/``(这条分支早先版本的
+    改名前缀,那个版本从没在别处跑过,不需要兜底)。"""
     try:
-        left = world.put(".retention-hold-dead/a/b.md", age_days=100).parent.parent
+        idle = world.thread(age_days=300, layout="agent_root")
+        world.run(idle, age_days=100)
+        notes = world.put(".retention-hold-notes/a.md", age_days=100).parent
+        world.age(notes, 100)
 
         report = await world.job(agent_root_cutover=_FUTURE_T).run_once()
 
-        assert not left.exists()
-        parked = [p.name for p in world.quarantine().iterdir()]
-        assert len(parked) == 1 and parked[0].startswith(".retention-hold-dead-")
-        assert report.agent_root_dirs_removed == 1
+        assert (notes / "a.md").read_text() == ".retention-hold-notes/a.md"
+        assert list(world.quarantine().iterdir()) == []
+        assert report.agent_root_dirs_removed == 0
     finally:
         await world.engine.dispose()
 

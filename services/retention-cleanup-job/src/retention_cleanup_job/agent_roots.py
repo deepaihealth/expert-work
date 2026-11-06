@@ -23,9 +23,8 @@ B-236 之后新对话都写进自己的 ``threads/<会话>/work/``,agent 根(``a
   最晚的那一项里较晚的那个)满同样天数 → 按判定时的 inode **改名挪进隔离区**
   ``{tenant}/.purged-agents/{user}/<原名>-<秒>-<随机>``(沙箱挂不到;满 7 天由隔离区那一条删,在那
   之前可以挪回),在那里再走一遍这棵树确认还都早于 ``T``(目录自己的 ctime 是改名时的,按 mtime
-  看),不是就挪回原名(原名已被占就留在隔离区,计失败)。这条分支早先版本留在 agent 根里的
-  ``.retention-hold-*`` 同样挪进隔离区。
-* **永不碰**:点开头的名字(上面那种 ``.retention-hold-*`` 除外)、长期记忆文件(``AGENT_NOTES.md``、
+  看),不是就挪回原名(原名已被占就留在隔离区,计失败)。
+* **永不碰**:点开头的名字(包括用户自己建的 ``.retention-hold-*``)、长期记忆文件(``AGENT_NOTES.md``、
   老视图投影的 ``MEMORY.md`` / ``PLAN.md`` / ``TODO.md``)、平台目录(``threads`` / ``uploads`` /
   ``inputs`` / ``.tool_results`` / ``skills`` / ``shared`` / ``agents``)、符号链接、``T`` 之后改过的
   任何东西、登记成产物的文件(B-63 管)。
@@ -109,7 +108,6 @@ RESERVED_NAMES = frozenset(
 MAX_SUBTREE_ENTRIES = 5000
 #: ``shared/`` 删除日期不许早于这一天(这个功能写成的日子):更早的日期只可能是写错了。
 SHARED_DELETE_EARLIEST = date(2026, 11, 6)
-_HOLD_PREFIX = ".retention-hold-"
 _DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 
 _GONE = (REMOVED, UNLINKED, QUARANTINED)
@@ -317,34 +315,6 @@ def _remove_dir(
     raise OSError(msg)
 
 
-def _park_legacy_hold(
-    root: str, tenant: UUID, user: UUID, key: str, entry: os.DirEntry[str], tally: AgentRootTally
-) -> None:
-    """这条分支早先的版本在 agent 根里留下的 ``.retention-hold-*``(已经判过要删、没删完):挪进
-    隔离区(7 天后删,在那之前能挪回)。测试 / 生产都没跑过那个版本,这里只是兜底。"""
-    try:
-        info = entry.stat(follow_symlinks=False)
-        if not stat.S_ISDIR(info.st_mode):
-            return
-        outcome, _parked = quarantine_entry(
-            root,
-            _parts(tenant, user, key),
-            entry.name,
-            tenant_id=tenant,
-            owner_id=user,
-            expect=(info.st_dev, info.st_ino),
-        )
-        tally.dirs_removed += int(outcome == QUARANTINED)
-    except Exception as exc:
-        tally.failed += 1
-        logger.warning(
-            "retention.agent_root_entry_failed tenant=%s user=%s error=%s",
-            tenant,
-            user,
-            type(exc).__name__,
-        )
-
-
 def _sweep_agent_root(
     root: str,
     tenant: UUID,
@@ -367,9 +337,6 @@ def _sweep_agent_root(
         return
     for entry in entries:
         name = entry.name
-        if name.startswith(_HOLD_PREFIX):
-            _park_legacy_hold(root, tenant, user, key, entry, tally)
-            continue
         if name.startswith(".") or name in RESERVED_NAMES:
             continue
         try:
