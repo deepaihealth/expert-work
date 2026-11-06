@@ -34,6 +34,7 @@ from control_plane.api._authz import console_only, require
 from control_plane.api._user_scope import get_user_repo, resolve_target_user_id
 from control_plane.audit import emit
 from control_plane.purge import PurgeUserDeps, purge_user
+from control_plane.purge.trajectories import trajectory_store_for
 from control_plane.tenant_scope import (
     CrossTenant,
     SingleTenant,
@@ -339,6 +340,7 @@ def _build_purge_deps(request: Request) -> PurgeUserDeps:
         artifact_snapshots=getattr(state, "artifact_snapshots", None),
         agent_file_versions=getattr(state, "agent_file_versions", None),
         workspace_root=_nas_root(getattr(state, "workspace_store", None)),
+        trajectories=trajectory_store_for(state.agent_runtime),
     )
 
 

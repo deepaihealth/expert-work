@@ -60,6 +60,7 @@ from control_plane.purge.session_purge import (
     purge_late_children,
     purge_thread_children,
 )
+from control_plane.purge.trajectories import trajectory_store_for
 from control_plane.quota.base import QuotaService
 from control_plane.runtime import AgentRuntime
 from control_plane.tenant_scope import (
@@ -220,6 +221,8 @@ def _get_session_purge_stores(request: Request) -> SessionPurgeStores:
         user_uploads=state.user_upload_store,
         image_uploads=state.image_upload_store,
         object_store=getattr(state, "object_store", None),
+        runs=getattr(state, "run_store", None),
+        trajectories=trajectory_store_for(state.agent_runtime),
     )
 
 
@@ -1181,11 +1184,14 @@ def build_sessions_router() -> APIRouter:
         user's, shared across conversations), its registered artifacts (B-236:
         deleting a conversation keeps them), the billing / audit rows
         (``token_usage``, ``audit_log`` …; the agent purge keeps those too), and
-        — not yet, a separate item — the run trajectory and event archive files
-        in object storage (the curation candidate that points at a trajectory
-        does go). A run still executing is not stopped: the rows it may write
-        after the first pass (retrieval logs, feedback, quality score, writeback
-        DLQ) get one best-effort second pass after the thread row.
+        the ``event_log`` cold archive (nothing in production writes ``event_log``).
+        B-285 — the run trajectory objects in object storage (the whole
+        conversation, one per run, plus its sub-agents') are one of the child
+        kinds above: dated from the runs, deleted before the runs go. A run still
+        executing is not stopped: the rows it may write after the first pass
+        (retrieval logs, feedback, quality score, writeback DLQ, today's
+        trajectory) get one best-effort second pass after the thread row; the
+        retention job's orphan pass is the backstop for anything later.
         """
         meta = await _load_owned_session(thread_id, request, threads, users)
         tenant_id: UUID = request.state.tenant_id

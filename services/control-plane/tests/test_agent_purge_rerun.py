@@ -297,3 +297,53 @@ async def test_an_image_whose_bytes_stayed_keeps_its_row_and_its_conversations()
 
     await _assert_rerun_finishes(world, threads)
     assert await world.objects.list_prefix(left.object_key) == []
+
+
+@pytest.mark.asyncio
+async def test_its_conversations_trajectories_go_and_a_failure_keeps_them() -> None:
+    """B-285 —— each conversation's trajectory objects (and its sub-agents') go
+    before its runs; one that will not go keeps that conversation (``purging``,
+    409 incomplete) and a re-run finishes. The sibling agent's stay."""
+    from dataclasses import replace
+
+    from control_plane.purge.trajectories import TrajectoryStore
+    from expert_work.protocol.trajectory_keys import trajectory_key
+    from expert_work.runtime.storage import InMemoryObjectStore
+
+    world, threads = await _world()
+    store = InMemoryObjectStore()
+    keys: dict[UUID, list[str]] = {}
+    for thread in threads:
+        (run_info,) = await world.runs.list_by_thread(thread_id=thread, tenant_id=world.t1)
+        at = run_info.finished_at or run_info.updated_at
+        keys[thread] = [
+            trajectory_key(tenant_id=world.t1, outcome="success", at=at, thread_id=thread),
+            trajectory_key(
+                tenant_id=world.t1,
+                outcome="failed",
+                at=at,
+                thread_id=uuid4(),
+                conversation_id=thread,
+            ),
+        ]
+        for key in keys[thread]:
+            await store.put(key, b"{}")
+    stranger = trajectory_key(tenant_id=world.t1, outcome="success", at=_NOW, thread_id=uuid4())
+    await store.put(stranger, b"{}")
+    calls = _fail_once(store, "delete")
+
+    first = await purge_agent(
+        replace(world.deps(), trajectories=TrajectoryStore(store)), tenant_id=world.t1, name=_X
+    )
+
+    assert first.failures["trajectory"] == "TrajectoriesNotDeletedError"
+    assert "thread_meta" not in first.deleted or first.deleted["thread_meta"] < len(threads)
+    assert await _status(world) == {AgentSpecStatus.PURGING}
+    assert calls[0] >= 1
+
+    rerun = await purge_agent(
+        replace(world.deps(), trajectories=TrajectoryStore(store)), tenant_id=world.t1, name=_X
+    )
+    assert rerun.ok, rerun.as_dict()
+    assert await store.list_prefix("trajectories/") == [stranger]
+    assert first.deleted.get("trajectory", 0) + rerun.deleted["trajectory"] == 2 * len(threads)

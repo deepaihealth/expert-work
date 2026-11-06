@@ -1646,3 +1646,120 @@ async def test_a_row_failing_long_past_expiry_is_given_up_despite_recent_config_
         assert "uploads" in report.failed_passes
     finally:
         await worker_engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_trajectory_objects_expire_by_the_tenants_upload_days_and_orphans_go(
+    db_fixture: tuple[AsyncEngine, AsyncEngine, str],
+) -> None:
+    """B-285 —— on real Postgres: the tenant's ``upload_retention_days`` (read from
+    ``tenant_config``) bounds trajectory objects, ``thread_meta`` decides which
+    conversations still exist, and the counters reach the report."""
+    from expert_work.persistence import SqlThreadMetaStore
+    from expert_work.protocol.trajectory_keys import trajectory_key
+    from expert_work.runtime.storage import InMemoryObjectStore
+    from retention_cleanup_job.main import build_session_factory
+
+    app_engine, worker_engine, sync_admin = db_fixture
+    try:
+        tenant, other = uuid4(), uuid4()
+        admin = create_engine(sync_admin, isolation_level="AUTOCOMMIT")
+        try:
+            with admin.connect() as conn:
+                for t, days in ((tenant, 30), (other, None)):
+                    conn.execute(
+                        text(
+                            "INSERT INTO tenant_config (tenant_id, display_name, plan, "
+                            "audit_retention_days, event_log_retention_days, "
+                            "upload_retention_days, updated_by) "
+                            "VALUES (:t, 'acme', 'free', 90, 30, :u, 'test')"
+                        ),
+                        {"t": str(t), "u": days},
+                    )
+        finally:
+            admin.dispose()
+        sf = build_session_factory(worker_engine)
+        threads = SqlThreadMetaStore(sf)
+        live, live_other = uuid4(), uuid4()
+        for t, thread in ((tenant, live), (other, live_other)):
+            await threads.create(
+                thread_id=thread,
+                tenant_id=t,
+                created_by="t",
+                user_id=uuid4(),
+                agent_name="a",
+                agent_version="1",
+            )
+        now = datetime.now(UTC)
+        store = InMemoryObjectStore()
+
+        async def put(t: UUID, thread: UUID, days_ago: int) -> str:
+            key = trajectory_key(
+                tenant_id=t,
+                outcome="success",
+                at=now - timedelta(days=days_ago),
+                thread_id=thread,
+            )
+            await store.put(key, b"{}")
+            return key
+
+        expired = await put(tenant, live, 40)  # tenant keeps 30 days
+        kept = await put(tenant, live, 5)
+        kept_other = await put(other, live_other, 40)  # default 90
+        orphan = await put(tenant, uuid4(), 1)
+
+        job = RetentionCleanupJob(
+            db_session_factory=sf,
+            object_store=store,
+            thread_store=threads,
+            upload_retention_days=90,
+        )
+        report = await job.run_once()
+
+        assert (report.trajectories_expired, report.trajectory_orphans_removed) == (1, 1)
+        assert report.trajectories_failed == 0
+        assert "trajectories" not in report.failed_passes
+        left = await store.list_prefix("trajectories/")
+        assert sorted(left) == sorted([kept, kept_other])
+        assert expired not in left
+        assert orphan not in left
+    finally:
+        await app_engine.dispose()
+        await worker_engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_a_trajectory_that_will_not_go_fails_the_pass(
+    db_fixture: tuple[AsyncEngine, AsyncEngine, str],
+) -> None:
+    """B-285 —— a delete that fails is counted and the pass is reported failed
+    (process exits non-zero, the alert fires)."""
+    from expert_work.persistence import SqlThreadMetaStore
+    from expert_work.protocol.trajectory_keys import trajectory_key
+    from expert_work.runtime.storage import InMemoryObjectStore
+    from retention_cleanup_job.main import build_session_factory
+
+    class _DeleteFails(InMemoryObjectStore):
+        async def delete(self, key: str) -> None:
+            raise TimeoutError("oss")
+
+    app_engine, worker_engine, _sync_admin = db_fixture
+    try:
+        sf = build_session_factory(worker_engine)
+        store = _DeleteFails()
+        await store.put(
+            trajectory_key(
+                tenant_id=uuid4(), outcome="failed", at=datetime.now(UTC), thread_id=uuid4()
+            ),
+            b"{}",
+        )
+        job = RetentionCleanupJob(
+            db_session_factory=sf, object_store=store, thread_store=SqlThreadMetaStore(sf)
+        )
+        report = await job.run_once()
+
+        assert report.trajectories_failed == 1
+        assert "trajectories" in report.failed_passes
+    finally:
+        await app_engine.dispose()
+        await worker_engine.dispose()

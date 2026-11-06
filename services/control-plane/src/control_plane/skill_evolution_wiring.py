@@ -65,6 +65,7 @@ from expert_work.persistence import CurationCandidateStore, SkillStore
 from expert_work.persistence.agent_spec import AgentSpecStore
 from expert_work.persistence.curation import EvalDatasetStore
 from expert_work.persistence.feedback_store import FeedbackStore
+from expert_work.persistence.thread_meta import ThreadMetaStore
 from expert_work.persistence.token_usage_store import TokenUsageRecord, TokenUsageStore
 from expert_work.protocol import (
     AgentSpecStatus,
@@ -84,7 +85,7 @@ from orchestrator.evolution.graph_runner import GraphReplayTaskRunner
 # module is only imported lazily from the lifespan.
 from orchestrator.evolution.grounding import SignalTier
 from orchestrator.evolution.replay import ReplayRequest, ReplayRunner, ReplayTask
-from orchestrator.trajectory import TrajectoryReader
+from orchestrator.trajectory import TrajectoryReader, live_trajectory_keys
 
 __all__ = ["build_evolution_worker"]
 
@@ -426,6 +427,8 @@ class _TrajectoryEvidenceProvider:
     # keeps the legacy outcome-only sourcing.
     candidate_store: CurationCandidateStore | None = None
     feedback_store: FeedbackStore | None = None
+    #: B-285 —— 按结果列出的轨迹只用对话还在的(删掉的对话 / 用户的不进蒸馏)。
+    thread_store: ThreadMetaStore | None = None
 
     async def __call__(self, candidate: CurationCandidateRecord) -> SkillEvidence:
         successes: list[str] = []
@@ -502,7 +505,12 @@ class _TrajectoryEvidenceProvider:
     ) -> list[str]:
         keys = await self.reader.list_keys(tenant_id=candidate.tenant_id, outcome=outcome)  # type: ignore[arg-type]
         rendered: list[str] = []
-        for key in keys:
+        async for key in live_trajectory_keys(
+            keys,
+            tenant_id=candidate.tenant_id,
+            threads=self.thread_store,
+            prefix=self.reader.prefix,
+        ):
             if key == skip_key:
                 continue
             if len(rendered) >= limit:
@@ -561,6 +569,8 @@ def _golden_tasks(records: Sequence[EvalDatasetRecord]) -> list[ReplayTask]:
 class _DualSourceHeldOutProvider:
     eval_store: EvalDatasetStore
     reader: TrajectoryReader
+    #: B-285 —— 同上:只回放对话还在的轨迹里的第一句用户话。
+    thread_store: ThreadMetaStore | None = None
 
     async def __call__(self, candidate: CurationCandidateRecord) -> HeldOut:
         golden = await self.eval_store.list_by_agent(
@@ -581,7 +591,12 @@ class _DualSourceHeldOutProvider:
     ) -> list[ReplayTask]:
         keys = await self.reader.list_keys(tenant_id=candidate.tenant_id, outcome="success")
         tasks: list[ReplayTask] = []
-        for key in keys:
+        async for key in live_trajectory_keys(
+            keys,
+            tenant_id=candidate.tenant_id,
+            threads=self.thread_store,
+            prefix=self.reader.prefix,
+        ):
             if key == candidate.trajectory_key or len(tasks) >= limit:
                 continue
             traj = await self.reader.read(key)
@@ -723,6 +738,7 @@ def build_evolution_worker(
     token_usage_store: TokenUsageStore | None = None,
     embedder: ConsolidatorEmbedder | None = None,
     cache_invalidator: Callable[[UUID], None] | None = None,
+    thread_store: ThreadMetaStore | None = None,
 ) -> SkillEvolutionWorker:
     """Assemble the production skill-evolution worker (lifespan wiring).
 
@@ -757,8 +773,11 @@ def build_evolution_worker(
             trajectory_reader,
             candidate_store=candidate_store,
             feedback_store=feedback_store,
+            thread_store=thread_store,
         ),
-        held_out_provider=_DualSourceHeldOutProvider(eval_store, trajectory_reader),
+        held_out_provider=_DualSourceHeldOutProvider(
+            eval_store, trajectory_reader, thread_store=thread_store
+        ),
         replay_invoker=_GraphReplayInvoker(
             agent_spec_store=agent_spec_store,
             agent_builder=agent_builder,

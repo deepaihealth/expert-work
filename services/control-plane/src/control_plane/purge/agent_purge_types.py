@@ -9,6 +9,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from uuid import UUID
 
+from control_plane.purge.trajectories import TrajectoryStore
 from control_plane.runtime import AgentRuntime
 from expert_work.persistence import (
     ApprovalStore,
@@ -94,6 +95,8 @@ class AgentPurgeDeps:
     workspace_root: str | None = None
     artifact_snapshots: ArtifactSnapshotStore | None = None
     agent_file_versions: AgentFileVersionStore | None = None
+    #: B-285 —— run 路径写轨迹对象的地方(``runtime.trajectory_recorder``);``None`` = 不写。
+    trajectories: TrajectoryStore | None = None
 
 
 @dataclass(frozen=True)

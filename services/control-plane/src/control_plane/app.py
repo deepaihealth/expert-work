@@ -2534,6 +2534,8 @@ def create_app(
                     # the BuiltAgent cache must drop the tenant's entries.
                     # PR-E3a: the wrapper also broadcasts to peer replicas.
                     cache_invalidator=_invalidate_tenant_and_broadcast,
+                    # B-285 —— 列出来的轨迹只用对话还在的。
+                    thread_store=_app.state.thread_meta_repo,
                 )
                 skill_evolution_worker.start()
                 _app.state.skill_evolution_worker = skill_evolution_worker

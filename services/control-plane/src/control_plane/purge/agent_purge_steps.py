@@ -30,7 +30,13 @@ from control_plane.purge.agent_purge_nas import (
 )
 from control_plane.purge.agent_purge_types import AgentPurgeDeps, AgentPurgeSummary, Footprint
 from control_plane.purge.image_blobs import ImageBytesNotDeletedError, ImageTally, delete_images
+from control_plane.purge.trajectories import (
+    TrajectoriesNotDeletedError,
+    delete_conversation_trajectories,
+    run_days,
+)
 from expert_work.persistence import AGENT_FILE_VERSIONS_DIR, WORKSPACE_AGENTS_DIR
+from expert_work.runtime.runs import RunInfo
 from orchestrator.context.workspace_projection import THREADS_DIR
 from orchestrator.tools.overflow import OVERFLOW_DIR
 
@@ -200,6 +206,24 @@ async def _purge_images(
     return tally.rows_deleted
 
 
+async def _purge_trajectories(
+    deps: AgentPurgeDeps,
+    summary: AgentPurgeSummary,
+    *,
+    tenant_id: UUID,
+    thread_id: UUID,
+    runs: list[RunInfo],
+) -> int:
+    try:
+        return await delete_conversation_trajectories(
+            deps.trajectories, tenant_id=tenant_id, thread_id=thread_id, days=run_days(runs)
+        )
+    except TrajectoriesNotDeletedError as exc:
+        # ``run`` 只在成功时记条数;部分失败时已删的在这里记。
+        add(summary, "trajectory", exc.removed)
+        raise
+
+
 async def _purge_one_thread(
     deps: AgentPurgeDeps,
     summary: AgentPurgeSummary,
@@ -216,6 +240,18 @@ async def _purge_one_thread(
         deps.retrieval_logs.delete_for_threads(tenant_id=tenant_id, thread_ids=[thread_id]),
     ):
         return
+    # B-285 —— 轨迹对象的日期只能从 run 推,所以在删 run 之前;删不掉 → 这条对话留着。
+    try:
+        runs = await deps.runs.list_by_thread(thread_id=thread_id, tenant_id=tenant_id)
+    except Exception as exc:
+        fail(summary, "agent_run", exc)
+        return
+    if not await run(
+        summary,
+        "trajectory",
+        _purge_trajectories(deps, summary, tenant_id=tenant_id, thread_id=thread_id, runs=runs),
+    ):
+        return
     adelete = getattr(deps.runtime.durable_checkpointer, "adelete_thread", None)
     if adelete is not None:
         try:
@@ -224,7 +260,6 @@ async def _purge_one_thread(
             fail(summary, "checkpoint", exc)
             return
     try:
-        runs = await deps.runs.list_by_thread(thread_id=thread_id, tenant_id=tenant_id)
         add(
             summary,
             "agent_run",

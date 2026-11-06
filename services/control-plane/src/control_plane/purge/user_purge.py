@@ -52,6 +52,12 @@ from uuid import UUID
 
 from control_plane.audit import emit
 from control_plane.purge.image_blobs import ImageTally, delete_images
+from control_plane.purge.trajectories import (
+    TrajectoriesNotDeletedError,
+    TrajectoryStore,
+    delete_conversation_trajectories,
+    run_days,
+)
 from control_plane.runtime import AgentRuntime
 from expert_work.persistence.agent_instance.base import AgentInstanceStore
 from expert_work.persistence.approval import ApprovalStore
@@ -96,6 +102,8 @@ _MAX_THREADS = 20_000
 _LOG_STEP = "knowledge_retrieval_log"
 #: B-280 —— ``failures`` keys of the thread-keyed child steps in
 #: :func:`_purge_threads`; any of them failed → the threads stay for a re-run.
+#: B-285 —— ``deleted`` / ``failures`` key of the per-thread trajectory step.
+_TRAJECTORY_STEP = "trajectory"
 _THREAD_CHILD_STEPS = ("feedback", "quality_score", "curation_candidate_delete", "agent_approval")
 
 
@@ -154,6 +162,9 @@ class PurgeUserDeps:
     #: B-278 —— NAS 根(只有 NAS 后端有):删掉这个用户在彻底删除智能体时留在隔离区
     #: ``{tenant}/.purged-agents/{user}`` 里的目录,别等留存作业的 7 天。
     workspace_root: str | None = None
+    #: B-285 —— where the run path writes trajectory objects
+    #: (``runtime.trajectory_recorder``); ``None`` = this deployment writes none.
+    trajectories: TrajectoryStore | None = None
 
 
 @dataclass
@@ -350,6 +361,24 @@ async def _purge_threads(
             summary.failures[_LOG_STEP] = type(exc).__name__
             continue
         summary.deleted[_LOG_STEP] = summary.deleted.get(_LOG_STEP, 0) + removed
+        # B-285 —— the conversation's trajectory objects (the whole conversation,
+        # one per run, in object storage). Their date comes from the runs, so
+        # before the runs go; if any cannot go, the thread is kept for a re-run.
+        try:
+            runs = await deps.runs.list_by_thread(thread_id=thread_id, tenant_id=tenant_id)
+            summary.deleted[_TRAJECTORY_STEP] = summary.deleted.get(
+                _TRAJECTORY_STEP, 0
+            ) + await delete_conversation_trajectories(
+                deps.trajectories, tenant_id=tenant_id, thread_id=thread_id, days=run_days(runs)
+            )
+        except Exception as exc:
+            logger.warning("purge_user.trajectories_failed error=%s", type(exc).__name__)
+            summary.failures[_TRAJECTORY_STEP] = type(exc).__name__
+            if isinstance(exc, TrajectoriesNotDeletedError):
+                summary.deleted[_TRAJECTORY_STEP] = (
+                    summary.deleted.get(_TRAJECTORY_STEP, 0) + exc.removed
+                )
+            continue
         if adelete is not None:
             try:
                 await adelete(str(thread_id))

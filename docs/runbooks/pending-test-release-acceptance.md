@@ -2008,7 +2008,7 @@ oauth2 目录项本来就不在平台池里:不再碰平台池;`enabled` 切换�
 
 > §93 由 B-279 占用(另一个分支);两边都追加在文件末尾,合并时按编号排好即可。
 
-**背景**:控制台 / 会话面 `POST /v1/sessions/{id}:purge` 原来删检索记录、记忆写回任务、checkpoint、run(连 `run_event`)、审批、对话行(`thread_message` 级联)和 NAS 上的对话目录,**漏了**按 `thread_id` 存的几类。现在在写回任务之后、checkpoint 之前多处理六类:删 `feedback`、`quality_score`、`curation_candidate`(含已采纳进评测集的;评测集本身不动)、`memory_writeback_dlq`(按 `source_thread_id`)、`image_upload` 连对象存储里的图片(`{租户}/uploads/{会话}/{图片 id}.{扩展名}`);`user_upload` 的文档行**留成墓碑**(只留 id / 租户 / 用户 / 会话 / `kind` / `created_at`,`ref` / `filename` / `mime_type` 清成空串、`size_bytes` 0、`sha256` / `last_used_at` 置空、`deleted_at` 有值),图片行与已到期的行直接删。这六类任一类删不掉:后面什么都不删、**对话行留着**、回 503,审计记一条 `result=error`、`reason=purge_incomplete`(带已删条数与 `<类>_delete_failed`),再点一次删完;图片字节没删掉的那几行留着(没有作业按键扫孤儿图片)—— 同一条规矩也改进了删智能体(B-278,算失败 → 409 `AGENT_PURGE_INCOMPLETE`)和删用户(`failures.image_upload`),原来那两处字节删不掉照样删行。删用户另外补删该用户各条对话上的 `quality_score` 与 `curation_candidate`(候选里有用户自己的 👎 评论);这几类(连同反馈、审批)任一删不掉,该用户的对话行就留着(`skipped` 含 `threads`),重跑删完。删智能体时对话里的上传文档也留成墓碑(别的智能体的对话再引用仍回 `UPLOAD_SESSION_DELETED`)。图片字节一直删不掉(无权限、对象锁)时删对话会一直 503:审计 `details.image_rows_kept` 给出条数,日志 `session_purge.image_rows_kept` 列出图片 id,运维据此处理。对话行删掉之后,反馈 / 质量评分 / 写回失败队列再删一遍(还在跑的 run 可能刚写了一行),失败只记日志。**仍不删**:对象存储里的 run 轨迹与事件归档文件(另立条目)。**保留**:`token_usage` / 计费 / `audit_log`(对账)、登记过的产物(用户拍板:删对话不删产物)、长期记忆(`memory_item`)、老布局 agent 共用的 `agents/<key>/uploads/` 里的文件(别的对话可能在用同一个文件;对话布局的 `threads/<会话>/work/uploads/` 本来就随对话目录删)。对外接口 `DELETE /v1/agents/{code}/sessions/{id}` 只是归档,不受影响。**对外不变**(用户 11-06 拍板保留错误码):在别的会话 `files[]` 里引用「已被 purge 的会话」上传的文档仍回 404 `UPLOAD_SESSION_DELETED`(认墓碑);图片的 `upload_id` 仍回 404 `UPLOAD_NOT_FOUND`;下载仍 404 `UPLOAD_NOT_FOUND`。
+**背景**:控制台 / 会话面 `POST /v1/sessions/{id}:purge` 原来删检索记录、记忆写回任务、checkpoint、run(连 `run_event`)、审批、对话行(`thread_message` 级联)和 NAS 上的对话目录,**漏了**按 `thread_id` 存的几类。现在在写回任务之后、checkpoint 之前多处理六类:删 `feedback`、`quality_score`、`curation_candidate`(含已采纳进评测集的;评测集本身不动)、`memory_writeback_dlq`(按 `source_thread_id`)、`image_upload` 连对象存储里的图片(`{租户}/uploads/{会话}/{图片 id}.{扩展名}`);`user_upload` 的文档行**留成墓碑**(只留 id / 租户 / 用户 / 会话 / `kind` / `created_at`,`ref` / `filename` / `mime_type` 清成空串、`size_bytes` 0、`sha256` / `last_used_at` 置空、`deleted_at` 有值),图片行与已到期的行直接删。这六类任一类删不掉:后面什么都不删、**对话行留着**、回 503,审计记一条 `result=error`、`reason=purge_incomplete`(带已删条数与 `<类>_delete_failed`),再点一次删完;图片字节没删掉的那几行留着(没有作业按键扫孤儿图片)—— 同一条规矩也改进了删智能体(B-278,算失败 → 409 `AGENT_PURGE_INCOMPLETE`)和删用户(`failures.image_upload`),原来那两处字节删不掉照样删行。删用户另外补删该用户各条对话上的 `quality_score` 与 `curation_candidate`(候选里有用户自己的 👎 评论);这几类(连同反馈、审批)任一删不掉,该用户的对话行就留着(`skipped` 含 `threads`),重跑删完。删智能体时对话里的上传文档也留成墓碑(别的智能体的对话再引用仍回 `UPLOAD_SESSION_DELETED`)。图片字节一直删不掉(无权限、对象锁)时删对话会一直 503:审计 `details.image_rows_kept` 给出条数,日志 `session_purge.image_rows_kept` 列出图片 id,运维据此处理。对话行删掉之后,反馈 / 质量评分 / 写回失败队列再删一遍(还在跑的 run 可能刚写了一行),失败只记日志。对象存储里的 run 轨迹对象见 §99(B-285);`event_log` 冷归档里没有对话内容(生产上没有代码写 `event_log`)。**保留**:`token_usage` / 计费 / `audit_log`(对账)、登记过的产物(用户拍板:删对话不删产物)、长期记忆(`memory_item`)、老布局 agent 共用的 `agents/<key>/uploads/` 里的文件(别的对话可能在用同一个文件;对话布局的 `threads/<会话>/work/uploads/` 本来就随对话目录删)。对外接口 `DELETE /v1/agents/{code}/sessions/{id}` 只是归档,不受影响。**对外不变**(用户 11-06 拍板保留错误码):在别的会话 `files[]` 里引用「已被 purge 的会话」上传的文档仍回 404 `UPLOAD_SESSION_DELETED`(认墓碑);图片的 `upload_id` 仍回 404 `UPLOAD_NOT_FOUND`;下载仍 404 `UPLOAD_NOT_FOUND`。
 
 **怎么进**:测试环境控制台(system_admin,平台租户)建临时智能体 `acc-b280`;对外接口用平台租户临时 API key,`user_id` 用 `u-b280`。数据库只读连接;对象存储运维侧只读列桶;NAS 用 control-plane pod 只读 `ls`。质量评分要抽样命中:先在平台「质量监控」设置里记下抽样比例,临时调到 100%(事后调回)。合成文件(零租户内容):`/tmp/b280.pdf`(一页 PDF)、`/tmp/b280.png`(小图)。**花费**:约 ¥1(四轮短对话 + 质量评审)。
 
@@ -2060,3 +2060,28 @@ oauth2 目录项本来就不在平台池里:不再碰平台池;`enabled` 切换�
 - [ ] **97.9 收尾**:删本节建的会话、上传与 probe job;吊销临时 key。
 
 **生产(用户执行,随发布之后)**:发布完成、smoke 过之后,在生产集群执行 97.7 的同一条命令(只数不删),把输出的那一行贴回来;我们对一下各 `kept_*` 的原因后再决定是否执行 ` --apply`;执行完再跑一次只数不删,确认 `deletable=0`、`failed=0`。迁移时的清理随发布自动生效,不需要操作;可在 Prometheus 看 `expert_work_platform_migration_originals_total`。不需要改库、不需要停作业。
+
+## §99 彻底删除与留存带走对象存储里的轨迹对象(B-285)
+
+> §95–§98 由别的条目占用(各自分支);都追加在文件末尾,合并时按编号排好即可。依赖 §94(B-280,同一条栈)。
+>
+> **留存那一条依赖 B-286**(`fix/b286-retention-job-object-store`):部署环境里留存作业的对象存储目前是 `memory`(解析不了控制面的 vault 引用),作业里所有对象存储 pass 都是空跑,本节新加的轨迹 pass 也一样(走的是作业既有的对象存储依赖,与图片 pass 同一个)。B-286 上线之前 99.5 只能验到「计数为 0、不报错」;99.1–99.4(控制面里的删除,控制面有真凭据)不受影响。
+
+**背景**:每个结束的 run 在对象存储里写一个轨迹对象 `trajectories/{租户}/{结果}/{YYYY}/{MM}/{DD}/{对话}.jsonl`,内容是整段对话(给评测候选与技能自动演化用)。此前**没有任何东西删它们**:删对话 / 删用户 / 彻底删除智能体都不删,留存不删,仓库里也没有桶生命周期;技能演化会按租户列出这些对象去蒸馏、回放第一句用户话,删掉的对话照样进模型。现在:
+
+- 三处彻底删除在删 run 行**之前**,按每个 run 的时间推出日期(`created_at` 到 `finished_at`,没收尾的用 `updated_at`,两头各放 1 小时),每天的四种结果各列一次 `…/{日期}/{对话}` 前缀(正好是这条对话自己的对象和它名下子智能体的对象),逐个删。删不掉:删对话回 503、对话留着;删智能体算失败(409 `AGENT_PURGE_INCOMPLETE`);删用户进 `failures.trajectory`、该对话留着。删对话还在删完对话行后,再扫一遍「今天」(还在收尾的 run 此刻写的那一份)。
+- 子智能体的轨迹键改成 `…/{日期}/{所属对话}/{子线程}.jsonl`(原来平铺在 `{子线程}.jsonl`,找不到所属对话)。
+- 留存作业新加一条:到期(对象日期早于今天减租户 `upload_retention_days`,没设用平台默认 90)与孤儿(所属对话的 `thread_meta` 行已不在,包括本修复之前删掉的对话、之前平铺的子智能体对象)都删;一轮最多 `batch_size` 个;删不掉记失败(进程非 0 退出)。完成日志多三项 `trajectories_expired` / `trajectory_orphans_removed` / `trajectories_failed`。
+- 技能演化按结果列出的轨迹只用对话还在的。
+
+**事件归档不处理**:`event_log` 冷归档(`event-log-archive-job`)归档的是 `event_log` 表,生产上没有任何代码写这张表(B-278 已核),归档里没有对话内容。
+
+**怎么进**:测试环境控制台(system_admin,平台租户)建临时智能体 `acc-b285`(带一个子智能体,任务里让主智能体委派一次);对象存储运维侧只读列桶(`trajectories/<平台租户>/`);数据库只读连接。留存作业手动触发 `kubectl create job --from=cronjob/retention-cleanup b285-probe-<n>`。**花费**:约 ¥1。
+
+- [ ] **99.1 写入**:`acc-b285` 开会话 A、B,各跑一轮(A 里触发一次委派)。判据:桶里有 `trajectories/<租户>/success/<今天>/<A>.jsonl`、`…/<B>.jsonl`,以及 `…/<今天>/<A>/<子线程>.jsonl`(子智能体那份在 A 名下);**没修好时**:子智能体那份平铺在 `<今天>/<子线程>.jsonl`。
+- [ ] **99.2 删对话**:控制台彻底删除会话 A。判据:200,响应 `trajectories` = 2;桶里 A 的两份都不在,B 的在。
+- [ ] **99.3 删用户**:对外接口用临时用户 `u-b285` 在 `acc-b285` 开会话 C 跑一轮,然后 `POST /v1/users/<id>:purge`。判据:200,`deleted.trajectory` ≥ 1,`failures` 为空;桶里 C 的那份不在。
+- [ ] **99.4 彻底删除智能体**:删除并彻底删除 `acc-b285`。判据:200;桶里 B 的那份不在。
+- [ ] **99.5 留存补扫存量(要 B-286 同批上线;没上就记「待 B-286」,只验日志里三项计数存在且为 0、退出码 0)**:跑留存作业前,只读数一下 `trajectories/<平台租户>/` 下对象总数与其中「所属对话已不在」的个数(列桶 + 只读查 `thread_meta`,命令随发布单给出);跑一次。判据:完成日志 `trajectory_orphans_removed` 与预数的孤儿数一致(超过 `batch_size` 时等于 `batch_size`,第二天接着删)、`trajectories_failed=0`、退出码 0;还在的会话的对象都在。**上生产前**先在生产只读统计同样两个数,写进发布单(第一次跑会删掉所有已删对话留下的轨迹)。
+- [ ] **99.6 技能演化**:单测覆盖(`test_skill_evidence_provider.py`:删掉的对话的轨迹不进蒸馏证据、不进回放),真栈记「单测覆盖」。
+- [ ] **99.7 收尾**:删本节建的会话、用户与 probe job。
