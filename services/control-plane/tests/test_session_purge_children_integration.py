@@ -210,6 +210,8 @@ async def test_only_the_purged_conversations_rows_go(sf: SF) -> None:
         "memory_writeback_dlq": 1,
         "user_uploads": 1,
         "image_uploads": 1,
+        # B-285 —— no trajectory store wired here (``test_purge_trajectories.py``).
+        "trajectories": 0,
     }
     assert result.image_blobs_removed == 1
     assert await _remaining(s, mine) == _ZERO

@@ -84,6 +84,7 @@ from retention_cleanup_job.orphan_threads import (
 )
 from retention_cleanup_job.purged_agents import PurgedAgentsSweep, sweep_purged_agents
 from retention_cleanup_job.report import CleanupReport
+from retention_cleanup_job.trajectories import TrajectorySweepTally, sweep_trajectories
 from retention_cleanup_job.uploads import UploadSweep, UploadSweepTally
 
 logger = logging.getLogger(__name__)
@@ -285,6 +286,7 @@ class RetentionCleanupJob:
             ) = await self._sweep_artifact_passes()
             orphan_artifact_copies_removed = await self._sweep_orphan_artifact_copies()
             purged = await self._sweep_purged_agents()
+            trajectories = await self._sweep_trajectories()
             thread_dirs_removed = await self._sweep_orphan_thread_dirs()
             tool_result_dirs_removed = await self._sweep_orphan_tool_results()
             memory_hard_deleted = await self._sweep_memory()
@@ -308,6 +310,12 @@ class RetentionCleanupJob:
             orphan_artifact_copies_removed=orphan_artifact_copies_removed,
             purged_agent_dirs_removed=purged.removed,
             purged_agent_dirs_failed=purged.failed,
+            trajectories_expired=trajectories.expired_removed,
+            trajectory_orphans_removed=trajectories.orphans_removed,
+            trajectories_failed=trajectories.failed,
+            trajectories_scanned=trajectories.scanned,
+            trajectories_capped=trajectories.capped,
+            trajectories_skipped=trajectories.skipped,
             uploads_expired=uploads.marked,
             upload_files_removed=uploads.files_removed,
             upload_files_unsafe=uploads.files_unsafe,
@@ -706,6 +714,41 @@ class RetentionCleanupJob:
             return PurgedAgentsSweep()
         if sweep.failed:
             self._failed_passes.append("purged_agents")
+        return sweep
+
+    async def _sweep_trajectories(self) -> TrajectorySweepTally:
+        """B-285 —— 对象存储里的轨迹对象:到期(租户 ``upload_retention_days``)与孤儿(对话行已
+        不在);规则本体在 :mod:`retention_cleanup_job.trajectories`。没接对象存储或
+        ``ThreadMetaStore`` 时不跑,但**不静默**:warning + ``skipped``(完成日志里看得出
+        「没跑」与「跑了、没东西可删」的区别 —— 部署环境在 B-286 之前就是这样);列不出 / 删不掉
+        进 ``failed_passes``。"""
+        if self._object_store is None or self._thread_store is None:
+            reason = "no_object_store" if self._object_store is None else "no_thread_store"
+            logger.warning("retention.trajectories_skipped reason=%s", reason)
+            return TrajectorySweepTally(skipped=True)
+        try:
+            async with self._sf() as session:
+                rows = (
+                    await session.execute(
+                        text("SELECT tenant_id, upload_retention_days FROM tenant_config")
+                    )
+                ).all()
+            sweep = await sweep_trajectories(
+                store=self._object_store,
+                threads=self._thread_store,
+                retention_days={row[0]: row[1] for row in rows},
+                default_days=self._upload_retention_days,
+                now=datetime.now(UTC),
+                limit=self._batch_size,
+            )
+        except Exception:
+            logger.exception("retention.trajectories_failed")
+            self._failed_passes.append("trajectories")
+            return TrajectorySweepTally()
+        if sweep.needs_attention:
+            self._failed_passes.append("trajectories")
+        if sweep.unrecognised:
+            logger.warning("retention.trajectory_keys_unrecognised count=%d", sweep.unrecognised)
         return sweep
 
     async def _sweep_orphan_thread_dirs(self) -> int:

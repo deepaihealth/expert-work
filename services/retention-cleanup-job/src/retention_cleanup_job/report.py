@@ -32,6 +32,16 @@ class CleanupReport:
     #: 与删不掉的条目数(非 0 时 ``failed_passes`` 带 ``purged_agents``)。
     purged_agent_dirs_removed: int = 0
     purged_agent_dirs_failed: int = 0
+    #: B-285 —— 轨迹对象:到期删掉的、对话已不在而删掉的、删不掉的(非 0 时
+    #: ``failed_passes`` 带 ``trajectories``)。
+    trajectories_expired: int = 0
+    trajectory_orphans_removed: int = 0
+    trajectories_failed: int = 0
+    #: 列出来看过的键数;删除预算用完(剩下的明天删);这一轮没跑(没接对象存储 ——
+    #: B-286 之前的部署环境)。``skipped`` 与「跑了、没东西可删」靠它区分。
+    trajectories_scanned: int = 0
+    trajectories_capped: bool = False
+    trajectories_skipped: bool = False
     # 留存链 —— 上传 90 天。
     uploads_expired: int = 0
     upload_files_removed: int = 0

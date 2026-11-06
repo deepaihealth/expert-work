@@ -13,6 +13,7 @@
 * 按它的对话集合关联的:``knowledge_retrieval_log``(最先,删不掉就整条对话不动)、
   ``agent_run`` + ``run_event``、``agent_approval``、``feedback``、``memory_writeback_dlq``、
   ``image_upload``(先删对象存储里的图;图删不掉的那几行留着、算失败,重跑接着删)、
+  轨迹对象(B-285:对象存储里每个 run 一份整段对话,连同子智能体的)、
   ``user_upload``(B-280:文档行留成清空了内容的墓碑,别处再引用仍回
   ``UPLOAD_SESSION_DELETED``;图片行与到期行删掉)、LangGraph checkpoint。
 * NAS:每个用户的 ``agents/<key>/`` 整棵、老布局的 ``threads/<id>/`` 与
@@ -20,7 +21,7 @@
 
 保留(对账):``token_usage``、``tenant_billing_ledger``、``token_reservation``、
 ``audit_log``、``credential_proxy_audit``、``sandbox_egress_audit``、``skill`` 系列。
-OSS 上的轨迹 / 事件归档走既有生命周期,不在这里删。
+事件归档(``event_log`` 冷归档)不删:生产上没有任何代码写 ``event_log``,归档里没有对话内容。
 
 和 ``purge_user`` 同一套规矩:逐步执行、每步失败只记**异常类型**(不记 ``str(exc)``)、可以
 重跑。另外三条:

@@ -47,13 +47,14 @@ from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, System
 
 from expert_work.common.conversation_channel import is_hidden
 from expert_work.common.observability import expert_work_counter
+from expert_work.protocol.trajectory_keys import TRAJECTORY_PREFIX, trajectory_key
 from expert_work.runtime.storage import ObjectStore, ObjectStoreError
 
 logger = logging.getLogger(__name__)
 
 #: Default key prefix; can be overridden per-recorder. Bucket
 #: configuration lives in :class:`expert_work.runtime.storage.S3CompatibleConfig`.
-DEFAULT_PREFIX: str = "trajectories"
+DEFAULT_PREFIX: str = TRAJECTORY_PREFIX
 
 TrajectoryOutcome = Literal["success", "failed", "max_steps", "cancelled"]
 
@@ -91,6 +92,10 @@ class TrajectoryRecord:
     finished_at: datetime | None = None
     step_count: int | None = None
     metadata: dict[str, Any] = field(default_factory=dict)
+    #: B-285 —— set for a sub-agent run: the (top-level) conversation it ran
+    #: in. The key then lives under that conversation, so deleting the
+    #: conversation finds it (:mod:`expert_work.protocol.trajectory_keys`).
+    conversation_id: UUID | None = None
 
 
 def serialize_messages_sharegpt(messages: Sequence[BaseMessage]) -> list[dict[str, Any]]:
@@ -197,14 +202,13 @@ class TrajectoryRecorder:
         if record.outcome not in _VALID_OUTCOMES:
             msg = f"invalid outcome {record.outcome!r}; expected one of {sorted(_VALID_OUTCOMES)}"
             raise ValueError(msg)
-        ts = record.finished_at or datetime.now(UTC)
-        if ts.tzinfo is None:
-            ts = ts.replace(tzinfo=UTC)
-        else:
-            ts = ts.astimezone(UTC)
-        return (
-            f"{self.prefix}/{record.tenant_id}/{record.outcome}/"
-            f"{ts:%Y}/{ts:%m}/{ts:%d}/{record.thread_id}.jsonl"
+        return trajectory_key(
+            tenant_id=record.tenant_id,
+            outcome=record.outcome,
+            at=record.finished_at or datetime.now(UTC),
+            thread_id=record.thread_id,
+            conversation_id=record.conversation_id,
+            prefix=self.prefix,
         )
 
     async def record(self, record: TrajectoryRecord) -> None:
@@ -281,6 +285,8 @@ class TrajectoryRecorder:
             envelope["step_count"] = record.step_count
         if record.metadata:
             envelope["metadata"] = record.metadata
+        if record.conversation_id is not None:
+            envelope["conversation_id"] = str(record.conversation_id)
         # JSONL — one record per line; \n keeps loaders happy even on
         # the single-record file case (Hermes ``trajectory_samples.jsonl``
         # uses the same shape).

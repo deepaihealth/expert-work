@@ -40,6 +40,7 @@ from control_plane.purge.agent_purge import (
     purge_agent,
 )
 from control_plane.purge.agent_purge_lock import agent_purge_lock
+from control_plane.purge.trajectories import trajectory_store_for
 from control_plane.tenancy.tenant_config import ServiceBackedTenantConfigStore
 from expert_work.common.observability import current_trace_id_hex
 from expert_work.persistence.agent_spec import (
@@ -116,6 +117,7 @@ def build_agent_purge_deps(request: Request) -> AgentPurgeDeps:
         ),
         artifact_snapshots=getattr(state, "artifact_snapshots", None),
         agent_file_versions=getattr(state, "agent_file_versions", None),
+        trajectories=trajectory_store_for(state.agent_runtime),
     )
 
 

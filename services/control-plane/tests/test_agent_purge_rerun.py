@@ -297,3 +297,144 @@ async def test_an_image_whose_bytes_stayed_keeps_its_row_and_its_conversations()
 
     await _assert_rerun_finishes(world, threads)
     assert await world.objects.list_prefix(left.object_key) == []
+
+
+@pytest.mark.asyncio
+async def test_its_conversations_trajectories_go_and_a_failure_keeps_them(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """B-285 —— each conversation's trajectory objects (and its sub-agents') go
+    before its runs; one that will not go keeps that conversation (``purging``,
+    409 incomplete) and a re-run finishes. The sibling agent's stay."""
+    from dataclasses import replace
+
+    from control_plane.purge.trajectories import TrajectoryStore
+    from expert_work.protocol.trajectory_keys import trajectory_key
+    from expert_work.runtime.storage import InMemoryObjectStore
+
+    world, threads = await _world()
+    store = InMemoryObjectStore()
+    keys: dict[UUID, list[str]] = {}
+    for thread in threads:
+        (run_info,) = await world.runs.list_by_thread(thread_id=thread, tenant_id=world.t1)
+        at = run_info.finished_at or run_info.updated_at
+        keys[thread] = [
+            trajectory_key(tenant_id=world.t1, outcome="success", at=at, thread_id=thread),
+            trajectory_key(
+                tenant_id=world.t1,
+                outcome="failed",
+                at=at,
+                thread_id=uuid4(),
+                conversation_id=thread,
+            ),
+        ]
+        for key in keys[thread]:
+            await store.put(key, b"{}")
+    stranger = trajectory_key(tenant_id=world.t1, outcome="success", at=_NOW, thread_id=uuid4())
+    await store.put(stranger, b"{}")
+    calls = _fail_once(store, "delete")
+    # Counts below are exact: no late pass (that one is its own test).
+    monkeypatch.setattr("control_plane.purge.trajectories.today", lambda: [])
+
+    first = await purge_agent(
+        replace(world.deps(), trajectories=TrajectoryStore(store)), tenant_id=world.t1, name=_X
+    )
+
+    assert first.failures["trajectory"] == "TrajectoriesNotDeletedError"
+    assert "thread_meta" not in first.deleted or first.deleted["thread_meta"] < len(threads)
+    assert await _status(world) == {AgentSpecStatus.PURGING}
+    assert calls[0] >= 1
+
+    rerun = await purge_agent(
+        replace(world.deps(), trajectories=TrajectoryStore(store)), tenant_id=world.t1, name=_X
+    )
+    assert rerun.ok, rerun.as_dict()
+    assert await store.list_prefix("trajectories/") == [stranger]
+    # Keys cleared per conversation: 1 day x 4 own keys + 1 sub-agent object = 5.
+    # First run: the failing conversation's 4 that did clear + the other's 5.
+    assert first.deleted["trajectory"] == 4 + 5
+    # Re-run of the kept one: its 4 own keys again (the sub-agent object went the first time).
+    assert rerun.deleted["trajectory"] == 4
+
+
+@pytest.mark.asyncio
+async def test_a_conversation_without_runs_and_one_written_late_go_too(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Medium-4 / Low-1 —— a conversation with no run rows is dated by its own row;
+    a trajectory a still-running run writes after the thread row went is taken by
+    the second pass (today's keys)."""
+    from dataclasses import replace
+    from datetime import UTC, datetime, timedelta
+
+    from control_plane.purge.trajectories import TrajectoryStore
+    from expert_work.protocol.trajectory_keys import trajectory_key
+    from expert_work.runtime.storage import InMemoryObjectStore
+
+    world, threads = await _world()
+    no_runs, late = threads[0], threads[1]
+    await world.runs.delete_by_thread(thread_id=no_runs, tenant_id=world.t1)
+    meta = await world.threads.get(no_runs, tenant_id=world.t1)
+    assert meta is not None and meta.created_at is not None
+    # Backdated, so the late ``today()`` pass cannot be what finds this object:
+    # only the fallback to the row's own timestamps can.
+    then = datetime.now(UTC) - timedelta(days=5)
+    meta = meta.model_copy(update={"created_at": then, "updated_at": then})
+    world.threads._rows[no_runs] = meta
+    assert meta.created_at is not None
+    store = InMemoryObjectStore()
+    dated_by_row = trajectory_key(
+        tenant_id=world.t1, outcome="success", at=meta.created_at, thread_id=no_runs
+    )
+    await store.put(dated_by_row, b"{}")
+    real_delete = world.threads.delete
+    written_late: list[str] = []
+
+    async def _late_write_then_delete(thread_id: UUID, *, tenant_id: UUID) -> bool:
+        if thread_id == late:
+            key = trajectory_key(
+                tenant_id=tenant_id, outcome="cancelled", at=datetime.now(UTC), thread_id=late
+            )
+            await store.put(key, b"{}")
+            written_late.append(key)
+        removed: bool = await real_delete(thread_id, tenant_id=tenant_id)
+        return removed
+
+    monkeypatch.setattr(world.threads, "delete", _late_write_then_delete)
+    summary = await purge_agent(
+        replace(world.deps(), trajectories=TrajectoryStore(store)), tenant_id=world.t1, name=_X
+    )
+
+    assert summary.ok, summary.as_dict()
+    assert written_late
+    assert await store.list_prefix("trajectories/") == []
+    assert summary.deleted.get("trajectory_undatable", 0) == 0
+
+
+@pytest.mark.asyncio
+async def test_an_undatable_conversation_is_counted(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Medium-4 —— no run rows and no thread timestamps: counted as
+    ``trajectory_undatable``, never reported as a clean delete."""
+    from dataclasses import replace
+
+    from control_plane.purge.trajectories import TrajectoryStore
+    from expert_work.runtime.storage import InMemoryObjectStore
+
+    world, threads = await _world()
+    await world.runs.delete_by_thread(thread_id=threads[0], tenant_id=world.t1)
+    real_get = world.threads.get
+
+    async def _no_times(thread_id: UUID, *, tenant_id: UUID) -> object:
+        meta = await real_get(thread_id, tenant_id=tenant_id)
+        if meta is None:
+            return None
+        return meta.model_copy(update={"created_at": None, "updated_at": None})
+
+    monkeypatch.setattr(world.threads, "get", _no_times)
+    summary = await purge_agent(
+        replace(world.deps(), trajectories=TrajectoryStore(InMemoryObjectStore())),
+        tenant_id=world.t1,
+        name=_X,
+    )
+
+    assert summary.deleted["trajectory_undatable"] == 1

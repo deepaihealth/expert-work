@@ -350,6 +350,7 @@ async def run_child_to_result(
             step_count=partial_steps,
             recorder=trajectory_recorder,
             metadata=trajectory_metadata,
+            conversation_id=ctx.workspace_thread_id or ctx.thread_id,
         )
         if sink is not None:
             partial = _worker_usage(ledger, partial_msgs)
@@ -397,6 +398,7 @@ async def run_child_to_result(
             step_count=partial_steps,
             recorder=trajectory_recorder,
             metadata=trajectory_metadata,
+            conversation_id=ctx.workspace_thread_id or ctx.thread_id,
         )
         if sink is not None:
             partial = _worker_usage(ledger, partial_msgs)
@@ -524,6 +526,7 @@ async def run_child_to_result(
         step_count=step_count,
         recorder=trajectory_recorder,
         metadata=trajectory_metadata,
+        conversation_id=ctx.workspace_thread_id or ctx.thread_id,
     )
 
     meta: dict[str, Any] = {
@@ -863,11 +866,16 @@ def _dispatch_trajectory(
     step_count: int,
     recorder: TrajectoryRecorder | None,
     metadata: Mapping[str, Any],
+    conversation_id: UUID | None = None,
 ) -> None:
-    """Schedule a fire-and-forget L7 trajectory write for the child run."""
+    """Schedule a fire-and-forget L7 trajectory write for the child run.
+
+    ``conversation_id`` (B-285) files the object under the top-level
+    conversation so deleting that conversation deletes it too."""
     if recorder is None or tenant_id is None:
         return
     record = TrajectoryRecord(
+        conversation_id=conversation_id,
         thread_id=sub_thread_id,
         tenant_id=tenant_id,
         user_id=user_id,

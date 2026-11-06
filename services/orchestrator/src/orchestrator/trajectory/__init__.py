@@ -13,6 +13,9 @@ from orchestrator.trajectory.reader import (
 from orchestrator.trajectory.reader import (
     TrajectoryReader as TrajectoryReader,
 )
+from orchestrator.trajectory.reader import (
+    live_trajectory_keys as live_trajectory_keys,
+)
 from orchestrator.trajectory.recorder import (
     TrajectoryOutcome as TrajectoryOutcome,
 )
@@ -32,5 +35,6 @@ __all__ = [
     "TrajectoryReader",
     "TrajectoryRecord",
     "TrajectoryRecorder",
+    "live_trajectory_keys",
     "serialize_messages_sharegpt",
 ]
