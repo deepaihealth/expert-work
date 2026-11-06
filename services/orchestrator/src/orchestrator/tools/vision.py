@@ -64,6 +64,7 @@ from orchestrator.multimodal import (
     is_missing_file,
     parse_rendered_figure_ref,
     unreadable_workspace_image_text,
+    upload_image_id_for_log,
 )
 from orchestrator.tools._guards import usage_total
 from orchestrator.tools.error_classifier import GuidedTimeoutError, GuidedToolError
@@ -1103,8 +1104,13 @@ class AskImageTool:
             await self.image_resolver.resolve(ref_str)
         except ObjectNotFoundError as exc:
             raise FileNotFoundError(UPLOAD_IMAGE_GONE_TEXT) from exc
-        except Exception:
-            return
+        except Exception as exc:
+            # 只探「不在了」;别的失败留给后面真正读图的那一次报(那里会原样抛出)。
+            logger.debug(
+                "ask_image.upload_probe_failed image_id=%s error=%s",
+                upload_image_id_for_log(ref_str),
+                type(exc).__name__,
+            )
 
 
 def _spec_with_short_form() -> ToolSpec:

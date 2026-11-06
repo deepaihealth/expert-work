@@ -738,9 +738,13 @@ async def test_a_gone_upload_image_degrades_to_text_in_its_place(
     store = InMemoryObjectStore()
     await store.put(kept.storage_key, _DATA)
 
+    from orchestrator.multimodal import upload_images_degraded_total
+
+    before = upload_images_degraded_total._value.get()
     with caplog.at_level("WARNING"):
         out = await resolve_message_images([gone.to_uri(), kept.to_uri()], _upload_resolver(store))
 
+    assert upload_images_degraded_total._value.get() == before + 1
     assert out[0] == UPLOAD_IMAGE_GONE_TEXT
     assert isinstance(out[1], ResolvedImage) and out[1].data == _DATA
     # 日志只带图片 id,租户 / 会话 id 不进日志。

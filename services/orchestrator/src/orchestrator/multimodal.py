@@ -28,6 +28,7 @@ from pathlib import Path, PurePosixPath
 from typing import Final, Protocol, runtime_checkable
 from uuid import UUID
 
+from expert_work.common.observability import expert_work_counter
 from expert_work.persistence import (
     RENDERED_FIGURE_PAGE_STEM,
     RENDERED_FIGURE_UNIT_PREFIX,
@@ -48,6 +49,14 @@ from expert_work.protocol.multimodal import (
 from expert_work.runtime.storage.base import ObjectNotFoundError, ObjectStore
 
 logger = logging.getLogger(__name__)
+
+#: B-283 —— 上传图的字节不在了、换成提示文字的次数(没有标签:图片 id 只进日志)。
+upload_images_degraded_total = expert_work_counter(
+    "expert_work_upload_images_degraded_total",
+    "B-283 uploaded images whose bytes were gone (object store 404) and were replaced "
+    "by a text note when building a model request.",
+    (),
+)
 
 #: ``content`` block discriminator for an uploaded-image reference.
 IMAGE_REF_BLOCK_TYPE: Final = "image_ref"
@@ -669,6 +678,7 @@ async def resolve_message_images(
             try:
                 out.append(await resolver.resolve(ref))
             except ObjectNotFoundError:
+                upload_images_degraded_total.inc()
                 logger.warning(
                     "multimodal.upload_image_degraded image_id=%s", upload_image_id_for_log(ref)
                 )

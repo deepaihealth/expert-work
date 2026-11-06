@@ -47,8 +47,8 @@ B-63 起**上传按最后使用到期**:`greatest(created_at, last_used_at, 会�
 
 B-283 起**图片(`image_upload`,对象存储里的字节)也按最后使用到期**:同一个时钟
 `greatest(created_at, last_used_at, 会话最后一次 run)`,天数用同一个
-`tenant_config.upload_retention_days`(图片也是上传;为空用 `EXPERT_WORK_RETENTION_IMAGE_RETENTION_DAYS`,
-默认 90)。`last_used_at` 在对外下载图片成功时记(每张每天最多一次);会话里的使用(提问、`ask_image`、
+`tenant_config.upload_retention_days`(图片也是附件;为空用与附件同一个 `EXPERT_WORK_RETENTION_UPLOAD_RETENTION_DAYS`,
+默认 90,同样 7–365;老的 `EXPERT_WORK_RETENTION_IMAGE_RETENTION_DAYS` 不再生效,配着会打 warning)。`last_used_at` 在对外下载图片成功时记(每张每天最多一次);会话里的使用(提问、`ask_image`、
 对外 `files[]` 附图都要求是本会话的图)由「会话最后一次 run」覆盖。用户手动删过的图照旧下一轮就清。
 图被清掉之后,会话历史里还引用它的轮次不再失败:模型那一侧换成一句「图片已不存在」的文字。
 

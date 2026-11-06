@@ -897,3 +897,34 @@ async def test_ask_image_on_a_present_upload_image_still_asks_the_vl_model() -> 
 
     assert result.content == "一张收据"
     assert len(vl.calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_ask_image_with_a_transient_storage_error_still_fails_on_the_real_read() -> None:
+    """B-283 —— 预检只认「不在了」。对象存储暂时读不动:预检不报、也不把它说成「图已不存在」;
+    后面真正读图(VL 调用里的适配器)照旧抛出同一个错误。"""
+    from expert_work.runtime.storage import InMemoryObjectStore, ObjectStoreError
+    from orchestrator.multimodal import ObjectStoreImageResolver, resolve_message_images
+
+    class _Flaky(InMemoryObjectStore):
+        async def get(self, key: str) -> bytes:
+            raise ObjectStoreError("get failed: 503")
+
+    resolver = ObjectStoreImageResolver(store=_Flaky())
+
+    async def _vl(*, messages: Sequence[BaseMessage], tools: Sequence[Any]) -> AIMessage:
+        content = messages[-1].content
+        refs = [
+            b["ref"]
+            for b in content
+            if isinstance(b, dict) and b.get("type") == IMAGE_REF_BLOCK_TYPE
+        ]
+        await resolve_message_images(refs, resolver)  # what the provider adapter does
+        return AIMessage(content="unreachable")
+
+    tool = AskImageTool(vl_caller=_vl, image_resolver=resolver)
+
+    with pytest.raises(ObjectStoreError) as info:
+        await tool.call({"image_ref": _ref(), "question": "?"}, ctx=_ctx())
+
+    assert not isinstance(info.value, FileNotFoundError)

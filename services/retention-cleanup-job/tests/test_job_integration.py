@@ -1816,7 +1816,8 @@ async def test_images_expire_by_last_use_and_tenant_upload_days_against_postgres
     db_fixture: tuple[AsyncEngine, AsyncEngine, str],
 ) -> None:
     """B-283 —— 图片 pass 走真库:到期 = ``greatest(created_at, last_used_at, 会话最后一次 run)``
-    + 租户的 ``upload_retention_days``(没设用 ``image_retention_days``)。会话还在用的老图连行带
+    + 租户的 ``upload_retention_days``(没设用作业的 ``upload_retention_days``)。
+    会话还在用的老图连行带
     对象都留着;用户手动删过的照旧下一轮就清。"""
     from expert_work.persistence import SqlImageUploadStore
     from expert_work.runtime.storage import InMemoryObjectStore
@@ -1906,7 +1907,7 @@ async def test_images_expire_by_last_use_and_tenant_upload_days_against_postgres
             db_session_factory=sf,
             image_upload_store=images,
             object_store=objects,
-            image_retention_days=90,
+            upload_retention_days=90,
         )
         report = await job.run_once()
 

@@ -111,6 +111,17 @@ def configure_logging(settings: RetentionCleanupSettings, *, stream: IO[str] | N
     )
 
 
+def warn_retired_image_retention(settings: RetentionCleanupSettings) -> None:
+    """B-283 —— ``EXPERT_WORK_RETENTION_IMAGE_RETENTION_DAYS`` 不再生效:图片与附件同一个天数
+    (``upload_retention_days``)。还配着就说一声,免得以为它管用。"""
+    if settings.image_retention_days is not None:
+        logger.warning(
+            "retention.image_retention_days_ignored configured=%d used=upload_retention_days=%d",
+            settings.image_retention_days,
+            settings.upload_retention_days,
+        )
+
+
 def warn_clamped_retention(settings: RetentionCleanupSettings) -> None:
     """B-63 —— 产物 / 上传保留期配得超出 7-365 的,settings 已夹回范围;这里在日志装好之后
     逐条打 warning,让人知道实际用的不是配的那个数。"""
@@ -202,6 +213,7 @@ async def _amain() -> int:
     settings = RetentionCleanupSettings()
     configure_logging(settings)
     warn_clamped_retention(settings)
+    warn_retired_image_retention(settings)
     # 连库之前先定工作区根:不合格就退出,一条 DELETE 都不发。
     workspace_root = resolve_workspace_root(settings, environ=os.environ)
 
@@ -276,7 +288,6 @@ async def _amain() -> int:
             batch_size=settings.batch_size,
             image_upload_store=image_store,
             object_store=object_store,
-            image_retention_days=settings.image_retention_days,
             artifact_store=artifact_store,
             artifact_retention_days=settings.artifact_retention_days,
             artifact_hard_delete_grace_days=settings.artifact_hard_delete_grace_days,
