@@ -48,7 +48,7 @@ B-63 起**上传按最后使用到期**:`greatest(created_at, last_used_at, 会�
 | 规则 | 删什么 | 不删什么 |
 |---|---|---|
 | B-28 产物版本 | 最后使用满租户保留期(默认 90 天;B-63:一版自己的 = 登记 / `last_used_at`(三个下载端点记)/ 登记它的会话最后一次 run 最晚的那个,最新版与产物行 = 整条产物最晚的那个,所以产物离开列表与最新版被清同时发生;版本 pass 之后还剩版本行的产物不软删):`path_in_workspace` 那一个文件 + 版本行;版本清空的 `artifact` 行标 `deleted_at`(`ARTIFACT_EXPIRED` 审计) | 同名产物的新版本;文件所在目录;删不掉的文件对应的行(明天再试) |
-| 上传 | 最后使用(见上)满租户保留期(默认 90 天):按会话**当前**的 agent / 布局算出的 `agents/<key>/[threads/<会话>/work/]uploads/<file>`(B-271)+ 标 `deleted_at` | 图片类 `expert_work://image/…` 的字节(归 `image_upload` 自己的 pass);会话已不在的行的文件(对话视图的目录随会话 purge 走;**老视图的文件在 agent 共用的 `agents/<key>/uploads/` 里,purge 不删、这里也不删,留在那里**);还有没到期的行指着的文件;大小 / sha256 与登记时不符的文件(没有 sha256 的老行先从登记时的 `DOCUMENT_UPLOAD` 审计行补,补不到只比大小);路径不可用的(某段是软链 / 不是目录、叶子不是普通文件,或用户子树里除暂时性以外的任何 I/O 错误:`chmod 000`、套接字……,计入 `upload_files_unsafe`)—— 以上几种行照样标 `deleted_at`;暂时性 I/O 失败的行(明天再试,计入 `upload_rows_failed`;过了到期日 7 天还在失败就只标行、不动文件,计入 `upload_rows_abandoned`);「放弃」(路径不可用、过期太久)先看完全批再标:涉及超过 3 个用户就一条都不标(`upload_rows_held`,像环境问题);有行被放弃或被拦下,pass 记失败;某个用户的 `{tenant}` / `{user}` 目录打不开(不是不在;没绑 agent 的会话以整个用户根为 `/workspace`,模型 `chmod` 得到)时只跳过这个用户这一轮的行、pass 记失败(`upload_owners_unavailable`),超过 3 个用户或工作区根本身打不开时整个 pass 中止、行不动 —— 以上都进 `failed_passes`,进程退出码 3;没有登记行的控制台上传与引用复制 |
+| 上传 | 最后使用(见上)满租户保留期(默认 90 天):按会话**当前**的 agent / 布局算出的 `agents/<key>/[threads/<会话>/work/]uploads/<file>`(B-271)+ 标 `deleted_at` | 图片类 `expert_work://image/…` 的字节(归 `image_upload` 自己的 pass);会话已不在的行的文件(对话视图的目录随会话 purge 走;**老视图的文件在 agent 共用的 `agents/<key>/uploads/` 里,purge 不删、这里也不删,留在那里**);还有没到期的行指着的文件;大小 / sha256 与登记时不符的文件(没有 sha256 的老行先从登记时的 `DOCUMENT_UPLOAD` 审计行补,补不到只比大小);路径不可用的(某段是软链 / 不是目录、叶子不是普通文件,或用户子树里除暂时性以外的任何 I/O 错误:`chmod 000`、套接字……,计入 `upload_files_unsafe`)—— 以上几种行照样标 `deleted_at`;暂时性 I/O 失败的行(明天再试,计入 `upload_rows_failed`;过了到期日 7 天还在失败就只标行、不动文件,计入 `upload_rows_abandoned`);「放弃」(路径不可用、过期太久)先看完全批再标:涉及超过 3 个用户就一条都不标(`upload_rows_held`,像环境问题);有行被放弃或被拦下,pass 记失败;某个用户的 `{tenant}` / `{user}` 目录打不开(不是不在;没绑 agent 的会话以整个用户根为 `/workspace`,模型 `chmod` 得到)时只跳过这个用户这一轮的行、pass 记失败(`upload_owners_unavailable`),超过 3 个用户或工作区根本身打不开时整个 pass 中止、行不动 —— 以上都进 `failed_passes`,进程退出码 3;没有登记行的文件:B-281 之前的控制台上传与跨会话复制,以及 B-281 起落在共享根(老视图的 agent 根 / 没绑 agent 的用户根)的控制台上传与复制(落进对话自己目录的才登记);老对话迁移后留在 agent 根的原件不归这里,见下方 `legacy_originals` |
 | B-27 threads/ | `threads/<thread_id>/` 且 `thread_meta` 行不存在 | 行还在的目录(**不按时间删活会话**);非 UUID 名的子目录;已软删用户的整棵树 |
 | X-4 ② 已删工作区 | 软删且已归档满 90 天的 `user_workspace` 行 + 该用户的 artifact / artifact_version / user_upload 行(`WORKSPACE_HARD_DELETE` 审计) | OSS 归档对象(桶生命周期到期);`.deleted/<user>` 标记 |
 
@@ -56,6 +56,15 @@ B-63 起**上传按最后使用到期**:`greatest(created_at, last_used_at, 会�
 (a) 登记过的产物文件 (b) `uploads/` 下登记过的文件 (c) 孤儿 `threads/<id>/`;
 根目录任何其它文件/目录 —— `style/`、`MEMORY.md`、未登记文件 —— 永不触碰。
 碰文件的代码只有 `workspace_files.py` 的两个函数,没有任何「按时间扫目录删文件」。
+
+**B-281 —— 迁移后留在 agent 根的上传原件**(`legacy_originals.py`,不在每日作业里):老对话迁移
+(B-262 P3)把上传复制进对话目录,agent 根下的原件没有登记行再指着它。两个入口跑同一套谓词:
+control-plane 每个对话迁移成功后在后台对那个 (租户, 用户, agent) 跑一次(只要还有老视图会话就
+不删,所以实际是最后一个老视图会话迁完时清);存量用一次性命令
+`python -m retention_cleanup_job.legacy_originals`(默认只数,`--apply` 才删,只打计数)。只删逐字节
+重复的原件:有登记行指着、每条引用(登记行 + `DOCUMENT_UPLOAD` 审计)的副本都在且 sha256 相同、
+同 agent 同用户(或无用户)不剩老视图会话、没有无副本的产物版本读它、路径上没有软链;只有审计的
+原件不碰。谓词全文见模块头,验收见 runbook §97。
 
 会话 purge(`POST /v1/sessions/{id}:purge`)同步删 `threads/<id>/`;这里的
 孤儿扫描只兜钩子失败与存量。

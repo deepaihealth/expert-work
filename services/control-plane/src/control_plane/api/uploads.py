@@ -263,6 +263,7 @@ def file_upload_ids(files: Sequence[ExternalFileRefLike]) -> list[UUID]:
 
 async def copy_document_into_thread(
     account: LandingAccount,
+    uploads: UserUploadStore,
     *,
     tenant_id: UUID,
     user_id: UUID,
@@ -280,8 +281,14 @@ async def copy_document_into_thread(
 
     B-262 review —— 像一次上传一样记账(:func:`_land_and_account`:配额闸、写了才记字节、
     给 ``target`` 记一条 ``DOCUMENT_UPLOAD`` 审计,``copied_from_upload_id`` 是登记行的
-    ``upl_`` id);不新建登记行。源文件大小与登记行对不上(源对话里被改写过)就拒,不悄悄复制
-    改过的内容(只比大小:登记行与审计都不便宜地给出 sha256)。
+    ``upl_`` id)。源文件大小与登记行对不上(源对话里被改写过)就拒,不悄悄复制改过的内容(只比
+    大小:登记行与审计都不便宜地给出 sha256)。
+
+    B-281 —— 落进 ``target`` 自己对话目录的那份在 ``target`` 名下建一条登记行
+    (:func:`register_document_upload`),留存作业才管得到它;落进共享根(老视图 / 没绑 agent)的不建
+    (:func:`landing_is_registrable`)。``target`` 已经有一条没删的行指着同一个文件(同名同 sha256 ——
+    同一份再挂一次)就不再加:这一轮 run 本身就把 ``target`` 的「最后使用」往后推了。新行的 id
+    不回给对接方,他们照旧用源那一行的 ``upl_`` id。
 
     失败抛 ``HTTPException``,状态码同上传端点(503 / 429 / 500 / 502);另有源文件不在 404、
     源被改过 409(读按登记的大小 + 1 封顶,读超了也算改过)。
@@ -332,7 +339,41 @@ async def copy_document_into_thread(
         content_type=upload.mime_type,
         extra_details={"copied_from_upload_id": render_upload_id(upload.id)},
     )
+    if landing_is_registrable(target) and not await _already_registered(
+        uploads, tenant_id=tenant_id, user_id=user_id, thread_id=target.thread_id, landed=result
+    ):
+        await register_document_upload(
+            uploads,
+            tenant_id=tenant_id,
+            user_id=user_id,
+            thread_id=target.thread_id,
+            landed=result,
+            mime_type=upload.mime_type,
+        )
     return result.path
+
+
+def landing_is_registrable(meta: ThreadMeta) -> bool:
+    """B-281 —— 控制台上传 / 跨会话复制落进 ``meta`` 这个会话时要不要建登记行:只有落进它自己的
+    对话目录(``threads/<会话>/work/``)才建。老视图(agent 根)和没绑 agent(用户根)是共享的根,
+    别的会话也看得到;留存作业的引用检查只认登记行,在那里登记,到期时会删掉别的会话还在用的文件。
+    (对外上传端点在老视图会话里本来就登记,B-281 不改。)"""
+    return thread_conversation_id(meta) is not None
+
+
+async def _already_registered(
+    uploads: UserUploadStore,
+    *,
+    tenant_id: UUID,
+    user_id: UUID,
+    thread_id: UUID,
+    landed: DocumentUploadResult,
+) -> bool:
+    """``thread_id`` 已有一条没删的登记行指着 ``landed`` 这个文件(同一工作区、同名、同 sha256)。"""
+    return any(
+        row.user_id == user_id and row.ref == landed.path and row.sha256 == landed.sha256
+        for row in await uploads.list_documents_for_thread(tenant_id=tenant_id, thread_id=thread_id)
+    )
 
 
 #: 上传失败(``HTTPException`` 的状态码)→ 对外信封的 ``code``。对外上传端点与跨会话复制附件
@@ -412,6 +453,35 @@ class DocumentUploadResult:
     sha256: str
     #: B-262 —— 同名同内容的文件已经在了,这次没写,``path`` 指向那个已有文件。
     reused: bool = False
+
+
+async def register_document_upload(
+    uploads: UserUploadStore,
+    *,
+    tenant_id: UUID,
+    user_id: UUID,
+    thread_id: UUID,
+    landed: DocumentUploadResult,
+    mime_type: str,
+) -> UserUpload:
+    """一份落进工作区的文档建一条 ``user_upload`` 登记行 —— 对外上传、控制台上传(B-281)、跨会话
+    复制(B-281)共用这一个写法,字段不会各写各的。
+
+    ``user_id`` 是**文件落进的那个工作区**的主人(留存作业按它找文件);``ref`` 是实际落盘的名字
+    (可能换过名);``sha256`` 是落地字节的哈希,留存作业删文件前用它核对。没有登记行的文件留存
+    作业看不到,永远不会到期。"""
+    return await uploads.insert(
+        upload_id=uuid4(),
+        tenant_id=tenant_id,
+        user_id=user_id,
+        thread_id=thread_id,
+        kind="document",
+        ref=landed.path,
+        mime_type=mime_type,
+        size_bytes=landed.size_bytes,
+        filename=landed.path.rsplit("/", 1)[-1],
+        sha256=landed.sha256,
+    )
 
 
 async def _handle_document_upload(
@@ -648,6 +718,10 @@ def _get_workspace_store(request: Request) -> WorkspaceStore | None:
     return getattr(request.app.state, "workspace_store", None)
 
 
+def _get_user_upload_store(request: Request) -> UserUploadStore:
+    return request.app.state.user_upload_store  # type: ignore[no-any-return]
+
+
 async def _prepare_image_upload(
     *,
     file: UploadFile,
@@ -829,6 +903,7 @@ def build_uploads_router() -> APIRouter:
         audit: Annotated[AuditLogger, Depends(_get_audit)],
         images: Annotated[ImageUploadStore, Depends(_get_image_upload_store)],
         workspace_store: Annotated[WorkspaceStore | None, Depends(_get_workspace_store)],
+        uploads: Annotated[UserUploadStore, Depends(_get_user_upload_store)],
     ) -> JSONResponse:
         tenant_id: UUID = request.state.tenant_id
 
@@ -867,6 +942,22 @@ def build_uploads_router() -> APIRouter:
                 workspace_store=workspace_store,
                 audit=audit,
             )
+            # B-281 —— 同对外上传建登记行,留存作业才管得到它。行记在落盘的那个工作区(调用者
+            # 自己的)名下;``caller_user_id`` 为空的请求上面已经 400 了。控制台响应不回
+            # ``upl_`` id(形状不变);对外接口的 ``user_id`` 带 ``ext:`` 前缀,摸不到这些行。
+            # 只登记落进本对话自己目录的:落在共享根(老视图的 agent 根 / 没绑 agent 的用户根)的
+            # 文件别的会话也看得到、可能用着,留存作业的引用检查只认登记行,登记了到期就会删掉
+            # 别人还在用的文件 —— 那里照旧不登记(:func:`landing_is_registrable`)。
+            assert caller_user_id is not None  # noqa: S101
+            if landing_is_registrable(meta):
+                await register_document_upload(
+                    uploads,
+                    tenant_id=tenant_id,
+                    user_id=caller_user_id,
+                    thread_id=thread_id,
+                    landed=result,
+                    mime_type=content_type,
+                )
             return JSONResponse(
                 status_code=201,
                 content={"path": result.path, "kind": "document"},

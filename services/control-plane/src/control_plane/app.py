@@ -21,6 +21,7 @@ Wiring overview (see [STREAM-B-DESIGN § 2.2](../../../docs/streams/STREAM-B-DES
 from __future__ import annotations
 
 import asyncio
+import functools
 import http.cookiejar
 import logging
 import os
@@ -605,6 +606,7 @@ from orchestrator.tools import (
 from orchestrator.tools.locks import ProcessKeyedLock
 from orchestrator.tools.nas_workspace_store import NasWorkspaceStore
 from orchestrator.trajectory import TrajectoryReader
+from retention_cleanup_job.legacy_originals import release_migrated_originals
 
 __all__ = ["create_app"]
 
@@ -1537,6 +1539,17 @@ def create_app(
                         runs=resolved_agent_runtime.run_manager.store,
                         audit_store=sql_stores.audit_log if sql_stores is not None else None,
                         checkpointer=checkpointer,
+                        # B-281 —— 迁移完在后台清 agent 根里已迁移的上传原件;要查库,无库不清。
+                        release_originals=(
+                            functools.partial(
+                                release_migrated_originals,
+                                sql_stores.session_factory,
+                                resolved_threads,
+                                resolved_workspace_store.root,
+                            )
+                            if sql_stores is not None
+                            else None
+                        ),
                     )
                 # Stream O Mini-ADR O-9/O-10 — one CredentialsResolver over
                 # the effective (legacy-derived) catalog. The web_search /

@@ -69,6 +69,7 @@ from control_plane.api.uploads import (
     _land_image_upload,
     _prepare_image_upload,
     note_uploads_used,
+    register_document_upload,
 )
 from control_plane.quota.base import QuotaService
 from control_plane.settings import Settings
@@ -312,17 +313,13 @@ def build_external_uploads_router() -> APIRouter:
                     workspace_store=workspace_store,
                     audit=audit,
                 )
-                row = await uploads.insert(
-                    upload_id=uuid4(),
+                row = await register_document_upload(
+                    uploads,
                     tenant_id=tenant_id,
                     user_id=end_user_id,
                     thread_id=thread_id,
-                    kind="document",
-                    ref=doc_result.path,
+                    landed=doc_result,
                     mime_type=content_type,
-                    size_bytes=doc_result.size_bytes,
-                    filename=doc_result.path.rsplit("/", 1)[-1],
-                    sha256=doc_result.sha256,
                 )
                 return JSONResponse(
                     status_code=201,
@@ -444,9 +441,11 @@ def build_external_uploads_router() -> APIRouter:
         if row is None or row.user_id != end_user_id or row.deleted_at is not None:
             return _upload_download_error("UPLOAD_NOT_FOUND", "upload not found", 404)
         # B-50 PR4 —— 按 agent 收口。``user_upload`` 没有 ``agent_key`` 列,归属
-        # 沿 ``thread_id → thread_meta.agent_name`` 反查:这张表唯一的写入方是本
-        # 模块的 ``upload_for_user``,它走 ``_resolve_session``,那条路必然绑定
-        # agent,所以 ``agent_name`` 结构上总是有值(测试环境 51/51 实测可解)。
+        # 沿 ``thread_id → thread_meta.agent_name`` 反查:对外端点能摸到的行都是本
+        # 模块的 ``upload_for_user`` 或跨会话复制写的,它们走 ``_resolve_session``,那条路
+        # 必然绑定 agent,所以 ``agent_name`` 结构上总是有值(测试环境 51/51 实测可解)。
+        # B-281 起控制台上传也建行,但记在控制台用户名下(``user_id`` 不带 ``ext:``),
+        # 上面的 ``row.user_id != end_user_id`` 已经把它们挡在外面。
         #
         # 比的是 ``agent_name`` 与 ``agent_code`` 本身,不是两边各算一次
         # ``sanitize_agent_key`` —— ``_external.load_owned_thread`` 判会话归属用

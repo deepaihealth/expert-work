@@ -19,8 +19,8 @@ B-262 P1 起对话视图里 ``uploads/`` / ``inputs/`` / ``.tool_results/`` 是�
 **做什么**(review 3:要查库的都在拿锁之前查完;持锁只做「再看一次标记 + 复制」;每个进程同时
 迁移的对话有上限,等不到名额这一轮不迁):
 
-1. 本对话自己的上传(``user_upload`` 登记行 + 本会话的 ``DOCUMENT_UPLOAD`` 审计行;控制台
-   上传只有审计)从 ``agents/<k>/uploads/`` 复制进 ``work/uploads/``,按审计的 sha256 核对;
+1. 本对话自己的上传(``user_upload`` 登记行 + 本会话的 ``DOCUMENT_UPLOAD`` 审计行;B-281 之前的
+   控制台上传只有审计)从 ``agents/<k>/uploads/`` 复制进 ``work/uploads/``,按审计的 sha256 核对;
    对不上(P0 之前被别的客户同名覆盖)或没有 sha256(核对不了)不复制、也不挡迁移;读不了
    (I/O 错)算失败。上传不计入字节上限 —— 它们是这个对话自己的东西,不能因为大就留在 agent 根;
 2. 本对话 run 的 ``.tool_results/<run>/`` 复制进 ``work/.tool_results/``(run 取自 ``agent_run``
@@ -28,7 +28,9 @@ B-262 P1 起对话视图里 ``uploads/`` / ``inputs/`` / ``.tool_results/`` 是�
    字节上限的跳过;
 3. 情形 a:放锁之后比较再交换把布局翻成 ``conversation``(只有库里还是 ``agent_root`` 才翻,
    并发的另一份翻不翻都一样);
-4. 写标记 ``threads/<conv>/.platform-migrated``。
+4. 写标记 ``threads/<conv>/.platform-migrated``;
+5. (B-281)在后台清这个 (租户, 用户, agent) 在 agent 根下已迁移、副本逐字节相同的上传原件
+   (:mod:`retention_cleanup_job.legacy_originals`,只在不剩老视图会话时才删),不等它、不影响 run。
 
 情形 a 只看库里的布局、不看标记(模型写得到标记,不能让它把对话钉在老视图);标记只决定情形 b
 要不要再复制一遍。先翻后写标记:两步之间崩了,下一次 run 看到「对话视图、没有标记」,按情形 b
@@ -66,6 +68,7 @@ from orchestrator.tools.platform_migration import (
     write_migrated_marker,
 )
 from orchestrator.tools.registry import WorkspaceLayout
+from retention_cleanup_job.legacy_originals import LegacyOriginalsTally
 
 logger = logging.getLogger(__name__)
 
@@ -79,6 +82,12 @@ platform_migration_total = expert_work_counter(
 platform_migration_bytes_total = expert_work_counter(
     "expert_work_platform_migration_bytes_total",
     "B-262 P3 bytes copied into conversation directories by the platform-file migration.",
+)
+platform_migration_originals_total = expert_work_counter(
+    "expert_work_platform_migration_originals_total",
+    "B-281 agent-root upload originals removed after a conversation migration "
+    "(deleted = files removed; failed = cleanup passes that raised).",
+    ("outcome",),
 )
 platform_migration_files_total = expert_work_counter(
     "expert_work_platform_migration_files_total",
@@ -106,6 +115,14 @@ class PreparedWorkspace:
 
     workspace_layout: WorkspaceLayout
     migrated: bool = False
+
+
+class OriginalsReleaser(Protocol):
+    """``release_migrated_originals`` 绑好库、会话仓库与 NAS 根之后的样子。"""
+
+    async def __call__(
+        self, *, tenant_id: UUID, user_id: UUID, agent_name: str
+    ) -> LegacyOriginalsTally: ...
 
 
 class RunReader(Protocol):
@@ -152,7 +169,13 @@ class PlatformMigration:
     max_bytes: int = MAX_MIGRATION_BYTES
     max_concurrent: int = MAX_CONCURRENT_MIGRATIONS
     slot_wait_s: float = SLOT_WAIT_S
+    #: B-281 —— 迁移成功之后在后台清 agent 根里已迁移的上传原件
+    #: (:func:`retention_cleanup_job.legacy_originals.release_migrated_originals`)。没接库
+    #: (无库部署 / 单测)就不清。
+    release_originals: OriginalsReleaser | None = None
     _slots: asyncio.Semaphore = field(init=False, repr=False)
+    #: 后台清理任务的引用(不留引用会被 GC 掉);测试等它们跑完。
+    _background: set[asyncio.Task[None]] = field(default_factory=set, init=False, repr=False)
 
     def __post_init__(self) -> None:
         self._slots = asyncio.Semaphore(self.max_concurrent)
@@ -234,7 +257,34 @@ class PlatformMigration:
             report.runs_over_cap,
             report.skipped_entries,
         )
+        self._release_originals_later(plan)
         return PreparedWorkspace("conversation", migrated=flipped)
+
+    def _release_originals_later(self, plan: _Plan) -> None:
+        """B-281 —— 迁移成功之后,在后台对这个 (租户, 用户, agent) 跑「agent 根原件」的清理谓词并删
+        掉符合的(还有老视图会话就一条查询返回,所以实际只在最后一个老视图会话迁完时干活)。不等它:
+        run 照常开始;失败只记异常类型,计数一行,不带名字。"""
+        if self.release_originals is None or not plan.meta.agent_name:
+            return
+        task = asyncio.create_task(self._release_originals(plan, plan.meta.agent_name))
+        self._background.add(task)
+        task.add_done_callback(self._background.discard)
+
+    async def _release_originals(self, plan: _Plan, agent_name: str) -> None:
+        assert self.release_originals is not None  # noqa: S101
+        try:
+            tally = await self.release_originals(
+                tenant_id=plan.meta.tenant_id, user_id=plan.user_id, agent_name=agent_name
+            )
+        except Exception as exc:
+            platform_migration_originals_total.labels(outcome="failed").inc()
+            logger.warning(
+                "platform_migration.release_originals_failed error=%s", type(exc).__name__
+            )
+            return
+        platform_migration_originals_total.labels(outcome="deleted").inc(tally.deleted)
+        if tally.checked or tally.failed:
+            logger.info("platform_migration.release_originals %s", tally.line(apply=True))
 
     async def _layout(self, thread_id: UUID, tenant_id: UUID) -> WorkspaceLayout | None:
         meta = await self.threads.get(thread_id, tenant_id=tenant_id)

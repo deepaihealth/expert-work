@@ -10,6 +10,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
@@ -32,6 +33,7 @@ from expert_work.protocol.agent_key import sanitize_agent_key
 from orchestrator.tools.locks import ProcessKeyedLock
 from orchestrator.tools.nas_workspace_store import NasWorkspaceStore
 from orchestrator.tools.read_page import workspace_figure_ref
+from retention_cleanup_job.legacy_originals import LegacyOriginalsTally
 
 _AGENT = "support-bot"
 _KEY = sanitize_agent_key(_AGENT)
@@ -531,3 +533,57 @@ async def test_no_migration_object_means_the_threads_layout(world: _World) -> No
         None, thread_id=tid, tenant_id=world.tenant, workspace_layout="agent_root"
     )
     assert (prepared.workspace_layout, prepared.migrated) == ("agent_root", False)
+
+
+# ---------------------------------------------------------------------------
+# B-281 —— 迁移成功之后在后台清 agent 根的原件(谓词本体与真库见
+# ``services/retention-cleanup-job/tests/test_legacy_originals_integration.py``)
+# ---------------------------------------------------------------------------
+
+
+class _Releaser:
+    def __init__(self) -> None:
+        self.calls: list[tuple[UUID, UUID, str]] = []
+        self.gate = asyncio.Event()
+
+    async def __call__(self, *, tenant_id: UUID, user_id: UUID, agent_name: str) -> Any:
+        self.calls.append((tenant_id, user_id, agent_name))
+        await self.gate.wait()
+        return LegacyOriginalsTally(checked=1, deleted=1, bytes=4)
+
+
+async def test_originals_are_released_after_a_migration_without_holding_up_the_run(
+    world: _World,
+) -> None:
+    releaser = _Releaser()
+    world.migration.release_originals = releaser
+    tid = await world.thread()
+    await world.upload(tid, "a.pdf", b"AAAA")
+    world.put("uploads/a.pdf", b"AAAA")
+
+    # Returns while the release is still waiting on its gate (an inline await would time out).
+    prepared = await asyncio.wait_for(world.prepare(tid), timeout=5)
+
+    assert prepared.migrated is True
+    await asyncio.sleep(0)
+    assert releaser.calls == [(world.tenant, world.user, _AGENT)]
+    assert world.migration._background
+    releaser.gate.set()
+    await asyncio.gather(*world.migration._background)
+
+
+async def test_no_release_when_the_migration_failed(world: _World) -> None:
+    releaser = _Releaser()
+    releaser.gate.set()
+    world.migration.release_originals = releaser
+    tid = await world.thread()
+    await world.upload(tid, "a.pdf", b"AAAA")
+    world.put("uploads/a.pdf", b"AAAA")
+    world.work(tid).mkdir(parents=True)
+    (world.work(tid) / "uploads").symlink_to(world.root)
+
+    prepared = await world.prepare(tid)
+
+    assert prepared.migrated is False
+    await asyncio.gather(*world.migration._background)
+    assert releaser.calls == []
