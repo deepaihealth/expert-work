@@ -28,6 +28,8 @@ from retention_cleanup_job.object_store import (
 )
 from retention_cleanup_job.settings import RetentionCleanupSettings
 
+_LOGGER = "retention_cleanup_job.object_store"
+
 _ACCESS_REF = "secret://expert-work/platform/oss/access-key"
 _SECRET_REF = "secret://expert-work/platform/oss/secret-key"
 _ACCESS = "AKIA-test-access"
@@ -237,12 +239,14 @@ async def test_override_values_without_the_backend_are_named_in_a_warning(
     without it they are ignored, so say which ones (names only, never the values)."""
     monkeypatch.setenv("EXPERT_WORK_RETENTION_OBJECT_STORE_ENDPOINT_URL", "http://minio:9000")
     monkeypatch.setenv("EXPERT_WORK_RETENTION_OBJECT_STORE_SECRET_KEY", "minio-sk-value")
-    caplog.set_level(logging.WARNING, logger="retention_cleanup_job.object_store")
+    caplog.set_level(logging.WARNING, logger=_LOGGER)
 
     plan = await _plan()
 
     assert (plan.backend, plan.source) == ("memory", "shared")
-    warnings = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+    warnings = [
+        r.getMessage() for r in caplog.records if r.name == _LOGGER and r.levelno == logging.WARNING
+    ]
     assert len(warnings) == 1
     assert warnings[0].startswith(
         "retention.object_store_override_ignored vars="
@@ -256,7 +260,7 @@ async def test_override_values_without_the_backend_are_named_in_a_warning(
 async def test_no_override_warning_when_nothing_is_set(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    caplog.set_level(logging.WARNING, logger="retention_cleanup_job.object_store")
+    caplog.set_level(logging.WARNING, logger=_LOGGER)
 
     await _plan()
 
@@ -311,12 +315,13 @@ async def test_the_run_logs_the_backend_once_without_secrets(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
     _shared_env(monkeypatch, _secrets_file(tmp_path))
-    caplog.set_level(logging.INFO, logger="retention_cleanup_job.object_store")
+    caplog.set_level(logging.INFO, logger=_LOGGER)
 
     log_plan(await _plan())
     log_plan(ObjectStorePlan(backend="s3-compatible", source="shared", error="SecretNotFoundError"))
 
-    lines = [r.getMessage() for r in caplog.records]
+    # caplog sees every logger; the secret store factory logs at INFO too.
+    lines = [r.getMessage() for r in caplog.records if r.name == _LOGGER]
     assert lines[0].startswith(
         "retention.object_store backend=s3-compatible source=shared available=true"
     )
