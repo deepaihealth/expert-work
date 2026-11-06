@@ -400,16 +400,18 @@ async def test_ask_image_on_a_deployment_without_workspace_says_unreadable() -> 
 
 
 @pytest.mark.anyio
-async def test_ask_image_does_not_pre_resolve_an_upload_ref() -> None:
-    """回归钉:上传 ref 的行为不变 —— 工具这一层不解析它,直接交给 VL caller。"""
+async def test_ask_image_probes_an_upload_ref_once_then_asks_the_vl_caller() -> None:
+    """B-283 —— 上传 ref 在工具这一层先探一次(字节不在了就显式失败,见文件末尾那两条),
+    探到了照常交给 VL caller。生产里外层是缓存解析器,VL 那一次不会再读一遍对象存储。"""
     resolver = _AnyRefResolver()
     vl = _FakeVLCaller()
     tool = AskImageTool(vl_caller=vl, image_resolver=resolver)
+    ref = _ref()
 
-    result = await tool.call({"image_ref": _ref(), "question": "?"}, ctx=_ctx())
+    result = await tool.call({"image_ref": ref, "question": "?"}, ctx=_ctx())
 
     assert result.content == "ok"
-    assert resolver.resolved == []
+    assert resolver.resolved == [ref]
     assert len(vl.calls) == 1
 
 
@@ -855,3 +857,74 @@ async def test_ask_image_short_form_finds_exactly_what_read_page_rendered(
     await _short_form_tool(root, vl).call({"path": _DOC, "unit": 3, "question": "?"}, ctx=ctx)
 
     assert _sent_ref(vl) == refs[0]
+
+
+# ---------------------------------------------------------------------------
+# B-283 —— 上传图的字节不在了:ask_image 显式失败,VL 不被调用(否则 VL 看到的是降级文字,
+# 回一句「看不到图」,主模型会把它当成看图的结果)。
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_ask_image_on_an_upload_image_past_retention_fails_explicitly() -> None:
+    from expert_work.runtime.storage import InMemoryObjectStore
+    from orchestrator.multimodal import UPLOAD_IMAGE_GONE_TEXT, ObjectStoreImageResolver
+
+    vl = _FakeVLCaller()
+    tool = AskImageTool(
+        vl_caller=vl, image_resolver=ObjectStoreImageResolver(store=InMemoryObjectStore())
+    )
+
+    with pytest.raises(FileNotFoundError) as info:
+        await tool.call({"image_ref": _ref(), "question": "这是什么?"}, ctx=_ctx())
+
+    assert str(info.value) == UPLOAD_IMAGE_GONE_TEXT
+    assert vl.calls == []
+
+
+@pytest.mark.asyncio
+async def test_ask_image_on_a_present_upload_image_still_asks_the_vl_model() -> None:
+    from expert_work.runtime.storage import InMemoryObjectStore
+    from orchestrator.multimodal import ObjectStoreImageResolver
+
+    store = InMemoryObjectStore()
+    ref = ImageRef(tenant_id=_TENANT, thread_id=_THREAD, image_id=uuid4(), ext=".png")
+    await store.put(ref.storage_key, b"\x89PNG\r\n\x1a\nimg")
+    vl = _FakeVLCaller(response=AIMessage(content="一张收据"))
+    tool = AskImageTool(vl_caller=vl, image_resolver=ObjectStoreImageResolver(store=store))
+
+    result = await tool.call({"image_ref": ref.to_uri(), "question": "这是什么?"}, ctx=_ctx())
+
+    assert result.content == "一张收据"
+    assert len(vl.calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_ask_image_with_a_transient_storage_error_still_fails_on_the_real_read() -> None:
+    """B-283 —— 预检只认「不在了」。对象存储暂时读不动:预检不报、也不把它说成「图已不存在」;
+    后面真正读图(VL 调用里的适配器)照旧抛出同一个错误。"""
+    from expert_work.runtime.storage import InMemoryObjectStore, ObjectStoreError
+    from orchestrator.multimodal import ObjectStoreImageResolver, resolve_message_images
+
+    class _Flaky(InMemoryObjectStore):
+        async def get(self, key: str) -> bytes:
+            raise ObjectStoreError("get failed: 503")
+
+    resolver = ObjectStoreImageResolver(store=_Flaky())
+
+    async def _vl(*, messages: Sequence[BaseMessage], tools: Sequence[Any]) -> AIMessage:
+        content = messages[-1].content
+        refs = [
+            b["ref"]
+            for b in content
+            if isinstance(b, dict) and b.get("type") == IMAGE_REF_BLOCK_TYPE
+        ]
+        await resolve_message_images(refs, resolver)  # what the provider adapter does
+        return AIMessage(content="unreachable")
+
+    tool = AskImageTool(vl_caller=_vl, image_resolver=resolver)
+
+    with pytest.raises(ObjectStoreError) as info:
+        await tool.call({"image_ref": _ref(), "question": "?"}, ctx=_ctx())
+
+    assert not isinstance(info.value, FileNotFoundError)

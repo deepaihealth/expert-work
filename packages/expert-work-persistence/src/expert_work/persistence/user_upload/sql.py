@@ -6,11 +6,12 @@ from collections.abc import Sequence
 from datetime import UTC, datetime
 from uuid import UUID
 
-from sqlalchemy import ColumnElement, Subquery, and_, delete, func, or_, select, update
+from sqlalchemy import ColumnElement, Subquery, and_, delete, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from expert_work.persistence.bulk_delete import CHUNK, count_in_chunks, delete_in_chunks
-from expert_work.persistence.models import AgentRunRow, TenantConfigRow, UserUploadRow
+from expert_work.persistence.models import TenantConfigRow, UserUploadRow
+from expert_work.persistence.retention_clock import last_use_expiry
 from expert_work.persistence.user_upload.base import (
     GIVE_UP_DEFER_CAP,
     TOUCH_INTERVAL,
@@ -22,71 +23,15 @@ from expert_work.protocol.user_upload import SESSION_DELETED_TOMBSTONE_REF
 
 
 def _expiry(default_days: int, *candidates: ColumnElement[bool]) -> Subquery:
-    """B-63 —— 候选行(没删、再加 ``candidates`` 条件)各自的到期时刻与「放弃」窗口的起点。
-
-    * 到期 = ``greatest(created_at, last_used_at, 会话最后一次 run)`` + 租户保留期(没设用
-      ``default_days``)。``greatest`` 跳过 NULL(没用过、会话没有 run)。
-    * 会话最后一次 run 用 CTE **一次**算出:先取候选行涉及的 ``(tenant_id, thread_id)``,再对这些
-      会话的 ``agent_run`` 按会话聚合一遍(走 ``ix_agent_run_thread_id``),然后 join 回来 ——
-      不再每行一个相关子查询;同一会话里的多条上传共用一次聚合。只认**同租户**的 run。
-    * ``give_up_from`` = ``least(greatest(到期, tenant_config.updated_at), 到期 + 30 天)``:租户刚把
-      天数改小时,到期日一下子落到很久以前,「过了到期日 7 天还在失败就放弃」要从这次改动算起,不能
-      第一次暂时失败就放弃。配置行的 ``updated_at`` 任何改动都会刷新,所以最多只推迟
-      :data:`GIVE_UP_DEFER_CAP`,否则每周改一次配置就能让一条删不掉的行永远不放弃。
-    """
-    cand = (
-        select(
-            UserUploadRow.id,
-            UserUploadRow.tenant_id,
-            UserUploadRow.thread_id,
-            UserUploadRow.created_at,
-            UserUploadRow.last_used_at,
-        )
-        .where(UserUploadRow.deleted_at.is_(None), *candidates)
-        .cte("upload_candidates")
-    )
-    threads = select(cand.c.tenant_id, cand.c.thread_id).distinct().cte("upload_threads")
-    last_run = (
-        select(
-            AgentRunRow.tenant_id,
-            AgentRunRow.thread_id,
-            func.max(AgentRunRow.created_at).label("at"),
-        )
-        .join(
-            threads,
-            and_(
-                AgentRunRow.thread_id == threads.c.thread_id,
-                AgentRunRow.tenant_id == threads.c.tenant_id,
-            ),
-        )
-        .group_by(AgentRunRow.tenant_id, AgentRunRow.thread_id)
-        .cte("upload_thread_last_run")
-        # 租户条件在这里和下面 join 回候选行时各有一份,两份是纵深防御:任何一份单独都足以
-        # 挡住别的租户的 run(去掉其中一份测试仍绿,两份都去掉才红)。
-    )
-    days = func.coalesce(TenantConfigRow.upload_retention_days, default_days)
-    expires_at = func.greatest(
-        cand.c.created_at, cand.c.last_used_at, last_run.c.at
-    ) + func.make_interval(0, 0, 0, days)
-    return (
-        select(
-            cand.c.id,
-            expires_at.label("expires_at"),
-            func.least(
-                func.greatest(expires_at, TenantConfigRow.updated_at),
-                expires_at + GIVE_UP_DEFER_CAP,
-            ).label("give_up_from"),
-        )
-        .select_from(cand)
-        .outerjoin(
-            last_run,
-            and_(
-                last_run.c.thread_id == cand.c.thread_id,
-                last_run.c.tenant_id == cand.c.tenant_id,
-            ),
-        )
-        .outerjoin(TenantConfigRow, TenantConfigRow.tenant_id == cand.c.tenant_id)
-        .subquery("upload_expiry")
+    """B-63 —— 候选行(没删、再加 ``candidates`` 条件)各自的到期时刻与「放弃」窗口的起点;
+    时钟与图片共用 :func:`expert_work.persistence.retention_clock.last_use_expiry`。"""
+    return last_use_expiry(
+        UserUploadRow,
+        days_column=TenantConfigRow.upload_retention_days,
+        default_days=default_days,
+        give_up_cap=GIVE_UP_DEFER_CAP,
+        name="upload",
+        candidates=candidates,
     )
 
 

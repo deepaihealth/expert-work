@@ -256,6 +256,18 @@ async def note_uploads_used(
             logger.warning("upload.touch_failed upload_id=%s", upload_id, exc_info=True)
 
 
+async def note_image_used(images: ImageUploadStore, *, tenant_id: UUID, image_id: UUID) -> None:
+    """B-283 —— 图片的字节按 ``image_upload`` 那一行到期:对外下载成功时也在那一行记一次使用。
+
+    与 :func:`note_uploads_used` 同一个规矩:存储层每张每天最多真写一次,记不上只打 warning、
+    不影响这次下载(少记一次只是按上一次使用的时间到期)。会话里的使用(提问、``ask_image``、
+    ``files[]`` 附图都只认本会话的图)由「会话最后一次 run」覆盖,不在这里记。"""
+    try:
+        await images.touch(image_id=image_id, tenant_id=tenant_id, now=datetime.now(UTC))
+    except Exception:
+        logger.warning("image.touch_failed image_id=%s", image_id, exc_info=True)
+
+
 def file_upload_ids(files: Sequence[ExternalFileRefLike]) -> list[UUID]:
     """``files[]`` 里能解析的 ``upload_id``(run 被接受时它们都已经校验过)。"""
     return [uid for item in files if (uid := parse_upload_id(item.upload_id)) is not None]

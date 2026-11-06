@@ -3,10 +3,11 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from uuid import UUID
 
 from expert_work.persistence.image_upload.base import ImageUploadStore
+from expert_work.persistence.user_upload.base import TOUCH_INTERVAL
 from expert_work.protocol import ImageUpload
 
 
@@ -73,12 +74,28 @@ class InMemoryImageUploadStore(ImageUploadStore):
     async def list_reapable(
         self,
         *,
-        before: datetime,
+        now: datetime,
+        default_days: int,
         limit: int = 1000,
     ) -> list[ImageUpload]:
-        rows = [r for r in self._rows.values() if r.created_at < before or r.deleted_at is not None]
+        retention = timedelta(days=default_days)
+        rows = [
+            r
+            for r in self._rows.values()
+            if r.deleted_at is not None
+            or max(r.created_at, r.last_used_at or r.created_at) + retention < now
+        ]
         rows.sort(key=lambda r: r.created_at)
         return rows[:limit]
+
+    async def touch(self, *, image_id: UUID, tenant_id: UUID, now: datetime) -> bool:
+        row = self._rows.get(image_id)
+        if row is None or row.tenant_id != tenant_id or row.deleted_at is not None:
+            return False
+        if row.last_used_at is not None and row.last_used_at >= now - TOUCH_INTERVAL:
+            return False
+        self._rows[image_id] = row.model_copy(update={"last_used_at": now})
+        return True
 
     async def hard_delete(self, *, image_ids: Sequence[UUID]) -> int:
         removed = 0

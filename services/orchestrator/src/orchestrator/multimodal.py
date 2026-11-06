@@ -28,6 +28,7 @@ from pathlib import Path, PurePosixPath
 from typing import Final, Protocol, runtime_checkable
 from uuid import UUID
 
+from expert_work.common.observability import expert_work_counter
 from expert_work.persistence import (
     RENDERED_FIGURE_PAGE_STEM,
     RENDERED_FIGURE_UNIT_PREFIX,
@@ -45,9 +46,17 @@ from expert_work.protocol.multimodal import (
     parse_image_ref,
     parse_workspace_image_ref,
 )
-from expert_work.runtime.storage.base import ObjectStore
+from expert_work.runtime.storage.base import ObjectNotFoundError, ObjectStore
 
 logger = logging.getLogger(__name__)
+
+#: B-283 —— 上传图的字节不在了、换成提示文字的次数(没有标签:图片 id 只进日志)。
+upload_images_degraded_total = expert_work_counter(
+    "expert_work_upload_images_degraded_total",
+    "B-283 uploaded images whose bytes were gone (object store 404) and were replaced "
+    "by a text note when building a model request.",
+    (),
+)
 
 #: ``content`` block discriminator for an uploaded-image reference.
 IMAGE_REF_BLOCK_TYPE: Final = "image_ref"
@@ -608,6 +617,19 @@ def is_missing_file(error: BaseException) -> bool:
     return False
 
 
+#: B-283 —— 上传图的字节已经不在对象存储里(过了保留期被清理,或被删)时顶替那张图的文字。
+#: 平台文字,不含任何租户内容;适配器的降级与 ``ask_image`` 的显式错误用的是同一句。
+UPLOAD_IMAGE_GONE_TEXT: Final = "[图:用户上传的这张图片已不存在(可能已过保留期被清理),现在看不到]"
+
+
+def upload_image_id_for_log(ref: str) -> str:
+    """日志里只打上传图的 ``image_id``(租户 / 会话两个 id 不进日志);解析不了就是 ``-``。"""
+    try:
+        return str(parse_image_ref(ref).image_id)
+    except ValueError:
+        return "-"
+
+
 def unreadable_workspace_image_text(figure: RenderedFigureRef | None, error: BaseException) -> str:
     """工作区图读不出来时告诉模型的那句话 —— Path A 的降级文字与 ``ask_image`` 的
     显式错误用的是同一句(``orchestrator.tools.vision``)。
@@ -626,7 +648,7 @@ def unreadable_workspace_image_text(figure: RenderedFigureRef | None, error: Bas
 async def resolve_message_images(
     refs: Sequence[str], resolver: ImageResolver
 ) -> list[ResolvedImage | str]:
-    """按次序解析一条消息里的图;**工作区** ref 读不出来时换成一段可见文字。
+    """按次序解析一条消息里的图;**工作区** ref 读不出来、上传图的字节已不在时换成一段可见文字。
 
     两个 provider 适配器(``openai.py`` / ``anthropic.py``)都从这里拿结果,再各自
     映射成自己的 wire 形状 —— 「哪些失败降级、降级成什么」只写在这一处。返回值里
@@ -640,8 +662,12 @@ async def resolve_message_images(
     ref 还在 —— **这条会话从此每一轮都失败**。换成文字,模型看得见那里原来有张图、
     也知道怎么拿回来。
 
-    **上传图(``expert_work://image/...``)不降级**,失败行为与引入本函数之前逐字
-    相同:异常原样抛出。那条路径的失败语义不在 B-64 的范围里。
+    **上传图(``expert_work://image/...``)只在字节已经不在了时降级**(B-283):对象存储
+    报 :class:`~expert_work.runtime.storage.base.ObjectNotFoundError`(过了保留期被清理、或
+    被删)→ 换成 :data:`UPLOAD_IMAGE_GONE_TEXT`。理由同上:这条 ref 写在会话历史的用户消息
+    里,每一次模型调用都会重新解析,异常往上走 = 这条会话从此每一轮都失败。其余失败(对象
+    存储 5xx / 凭据 / 网络、ref 格式坏了)照旧原样抛出:那些是暂时的或部署问题,换成「图已
+    不存在」会把一次故障永久写进模型的回答里,而重试有机会成功。
 
     接的是 ``Exception``,不是 ``BaseException``:取消(``asyncio.CancelledError``)
     照常往上走。
@@ -649,7 +675,14 @@ async def resolve_message_images(
     out: list[ResolvedImage | str] = []
     for ref in refs:
         if not ref.startswith(WORKSPACE_REF_PREFIX):
-            out.append(await resolver.resolve(ref))
+            try:
+                out.append(await resolver.resolve(ref))
+            except ObjectNotFoundError:
+                upload_images_degraded_total.inc()
+                logger.warning(
+                    "multimodal.upload_image_degraded image_id=%s", upload_image_id_for_log(ref)
+                )
+                out.append(UPLOAD_IMAGE_GONE_TEXT)
             continue
         try:
             out.append(await resolver.resolve(ref))

@@ -147,7 +147,6 @@ class RetentionCleanupJob:
         batch_size: int = 10000,
         image_upload_store: ImageUploadStore | None = None,
         object_store: ObjectStore | None = None,
-        image_retention_days: int = 90,
         artifact_store: ArtifactStore | None = None,
         artifact_retention_days: int = 90,
         artifact_hard_delete_grace_days: int = 60,
@@ -173,9 +172,6 @@ class RetentionCleanupJob:
     ) -> None:
         if batch_size <= 0:
             msg = "batch_size must be positive"
-            raise ValueError(msg)
-        if image_retention_days < 1:
-            msg = "image_retention_days must be >= 1"
             raise ValueError(msg)
         if artifact_retention_days < 1:
             msg = "artifact_retention_days must be >= 1"
@@ -214,7 +210,6 @@ class RetentionCleanupJob:
         self._batch_size = batch_size
         self._image_upload_store = image_upload_store
         self._object_store = object_store
-        self._image_retention_days = image_retention_days
         self._artifact_store = artifact_store
         self._artifact_retention_days = artifact_retention_days
         self._artifact_hard_delete_grace_days = artifact_hard_delete_grace_days
@@ -811,12 +806,18 @@ class RetentionCleanupJob:
     async def _delete_expired_images(self) -> tuple[int, int, int]:
         """Remove image rows past their retention window + their bytes.
 
-        Mini-ADR J-32 — finds the reapable ``image_upload`` rows: those
-        whose ``created_at`` is older than ``now - image_retention_days``,
-        plus **any already-soft-deleted row regardless of age** (a user
+        Mini-ADR J-32 — finds the reapable ``image_upload`` rows, plus
+        **any already-soft-deleted row regardless of age** (a user
         delete means the blob should leave at the next sweep, not at the
         original retention horizon). Removes the object-store key for
         each, then hard-deletes the row.
+
+        B-283 —— 按**最后使用**到期:``greatest(created_at, last_used_at, 会话最后一次 run)``
+        加上租户的 ``tenant_config.upload_retention_days``(图片也是附件;没设用
+        ``upload_retention_days``,与附件同一个默认 90)早于现在
+        (谓词在 :meth:`ImageUploadStore.list_reapable`)。
+        会话还在用的图不再按上传时间被删;删掉之后会话里再引用它,适配器换成一句文字
+        (``orchestrator.multimodal.resolve_message_images``),那一轮照常跑。
 
         Object-store failures don't block row hard-delete: an orphaned
         key is a far smaller correctness problem than a stuck row
@@ -829,9 +830,9 @@ class RetentionCleanupJob:
         """
         if self._image_upload_store is None or self._object_store is None:
             return 0, 0, 0
-        cutoff = datetime.now(UTC) - timedelta(days=self._image_retention_days)
         expired = await self._image_upload_store.list_reapable(
-            before=cutoff,
+            now=datetime.now(UTC),
+            default_days=self._upload_retention_days,
             limit=self._batch_size,
         )
         if not expired:
@@ -956,8 +957,8 @@ class RetentionCleanupJob:
         """删掉过了保留期的沙箱出网审计行。
 
         ``ctid`` 子查询给 DELETE 限批(Postgres 不支持 ``DELETE ... LIMIT``),
-        与本文件其他几个 pass 同款。全局窗口、无 per-tenant 覆盖 —— 同
-        ``image_retention_days`` 的理由。表级 GRANT 见迁移 0143:这个 pass 以
+        与本文件其他几个 pass 同款。全局窗口、无 per-tenant 覆盖(运维 / 安全遥测,不是
+        租户的数据)。表级 GRANT 见迁移 0143:这个 pass 以
         ``retention_cleanup_worker`` 角色执行,少了那条授权就是 permission denied。
 
         Uses ``make_interval(days => :days)`` rather than

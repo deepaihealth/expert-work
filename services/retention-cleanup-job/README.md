@@ -45,6 +45,13 @@ B-63 起**上传按最后使用到期**:`greatest(created_at, last_used_at, 会�
 每行每天最多一次,且只在 run 被接受之后记。「过期 7 天还失败就放弃」从 `max(到期, tenant_config.updated_at)` 算(租户刚改小天数时不会第一次失败就放弃),最多推迟 30 天;已过到期 7 天仍在失败的行计 `upload_rows_failing_overdue` 并让作业非 0 退出。租户可设 7–365 天,改小要显式确认。产物 / 上传两个 env 窗口限 7–365,超出的夹回范围并打
 `retention.retention_days_clamped` warning(不拒跑);默认 90 必须与协议的 `FILE_RETENTION_DEFAULT_DAYS` 一致。
 
+B-283 起**图片(`image_upload`,对象存储里的字节)也按最后使用到期**:同一个时钟
+`greatest(created_at, last_used_at, 会话最后一次 run)`,天数用同一个
+`tenant_config.upload_retention_days`(图片也是附件;为空用与附件同一个 `EXPERT_WORK_RETENTION_UPLOAD_RETENTION_DAYS`,
+默认 90,同样 7–365;老的 `EXPERT_WORK_RETENTION_IMAGE_RETENTION_DAYS` 不再生效,配着会打 warning)。`last_used_at` 在对外下载图片成功时记(每张每天最多一次);会话里的使用(提问、`ask_image`、
+对外 `files[]` 附图都要求是本会话的图)由「会话最后一次 run」覆盖。用户手动删过的图照旧下一轮就清。
+图被清掉之后,会话历史里还引用它的轮次不再失败:模型那一侧换成一句「图片已不存在」的文字。
+
 | 规则 | 删什么 | 不删什么 |
 |---|---|---|
 | B-28 产物版本 | 最后使用满租户保留期(默认 90 天;B-63:一版自己的 = 登记 / `last_used_at`(三个下载端点记)/ 登记它的会话最后一次 run 最晚的那个,最新版与产物行 = 整条产物最晚的那个,所以产物离开列表与最新版被清同时发生;版本 pass 之后还剩版本行的产物不软删):`path_in_workspace` 那一个文件 + 版本行;版本清空的 `artifact` 行标 `deleted_at`(`ARTIFACT_EXPIRED` 审计) | 同名产物的新版本;文件所在目录;删不掉的文件对应的行(明天再试) |

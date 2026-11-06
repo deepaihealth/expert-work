@@ -139,11 +139,11 @@ async def test_retrieval_logs_past_retention_go_in_bounded_batches() -> None:
     assert await unwired._delete_expired_knowledge_retrieval_logs() == 0
 
 
-def test_job_rejects_non_positive_image_retention_days() -> None:
-    with pytest.raises(ValueError, match="image_retention_days"):
+def test_job_rejects_non_positive_upload_retention_days_for_images_too() -> None:
+    with pytest.raises(ValueError, match="upload_retention_days"):
         RetentionCleanupJob(
             db_session_factory=lambda: None,  # type: ignore[arg-type]
-            image_retention_days=0,
+            upload_retention_days=0,
         )
 
 
@@ -194,7 +194,7 @@ def test_job_rejects_non_positive_tenant_user_hard_delete_grace_days() -> None:
 
 @pytest.mark.asyncio
 async def test_delete_expired_images_purges_old_rows_and_object_keys() -> None:
-    """Rows older than ``image_retention_days`` get their object key
+    """Rows older than ``upload_retention_days`` (B-283: images share it) get their object key
     removed + are hard-deleted from the registry."""
     images = InMemoryImageUploadStore()
     object_store = InMemoryObjectStore()
@@ -238,7 +238,7 @@ async def test_delete_expired_images_purges_old_rows_and_object_keys() -> None:
         db_session_factory=lambda: None,  # type: ignore[arg-type]
         image_upload_store=images,
         object_store=object_store,
-        image_retention_days=90,
+        upload_retention_days=90,
     )
 
     rows, keys_ok, keys_failed = await job._delete_expired_images()
@@ -296,7 +296,7 @@ async def test_delete_expired_images_continues_on_object_store_failure() -> None
         db_session_factory=lambda: None,  # type: ignore[arg-type]
         image_upload_store=images,
         object_store=_FailingStore(),  # type: ignore[arg-type]
-        image_retention_days=90,
+        upload_retention_days=90,
     )
 
     rows, keys_ok, keys_failed = await job._delete_expired_images()
@@ -779,3 +779,35 @@ async def test_sweep_workspaces_hard_delete_failure_leaves_dependents_untouched(
     )
     assert await uploads.delete_all_for_user(tenant_id=tenant, user_id=user) == 1
     assert (await audit_store.query(AuditQuery(tenant_id=tenant))).entries == []
+
+
+@pytest.mark.asyncio
+async def test_images_use_the_upload_days_as_their_platform_default() -> None:
+    """B-283 —— 图片与附件同一个平台默认(``upload_retention_days``):租户没设时,两者在同一天到期。"""
+    images = InMemoryImageUploadStore()
+    store = InMemoryObjectStore()
+    tenant, image_id = uuid4(), uuid4()
+    await store.put("k", b"x", content_type="image/png")
+    await images.insert(
+        image_id=image_id,
+        tenant_id=tenant,
+        thread_id=uuid4(),
+        user_id=None,
+        object_key="k",
+        size_bytes=1,
+        mime_type="image/png",
+        sha256="x",
+    )
+    images._rows[image_id] = images._rows[image_id].model_copy(
+        update={"created_at": datetime.now(UTC) - timedelta(days=40)},
+    )
+    job = RetentionCleanupJob(
+        db_session_factory=lambda: None,  # type: ignore[arg-type]
+        image_upload_store=images,
+        object_store=store,
+        upload_retention_days=30,
+    )
+
+    rows, keys_ok, _failed = await job._delete_expired_images()
+
+    assert (rows, keys_ok) == (1, 1)

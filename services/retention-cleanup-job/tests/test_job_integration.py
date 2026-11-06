@@ -1809,3 +1809,126 @@ async def test_the_report_tells_a_skipped_pass_and_a_capped_one_apart(
     finally:
         await app_engine.dispose()
         await worker_engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_images_expire_by_last_use_and_tenant_upload_days_against_postgres(
+    db_fixture: tuple[AsyncEngine, AsyncEngine, str],
+) -> None:
+    """B-283 —— 图片 pass 走真库:到期 = ``greatest(created_at, last_used_at, 会话最后一次 run)``
+    + 租户的 ``upload_retention_days``(没设用作业的 ``upload_retention_days``)。
+    会话还在用的老图连行带
+    对象都留着;用户手动删过的照旧下一轮就清。"""
+    from expert_work.persistence import SqlImageUploadStore
+    from expert_work.runtime.storage import InMemoryObjectStore
+    from retention_cleanup_job.main import build_session_factory
+
+    _app_engine, worker_engine, sync_admin = db_fixture
+    try:
+        sf = build_session_factory(worker_engine)
+        images = SqlImageUploadStore(sf)
+        objects = InMemoryObjectStore()
+        # The integration DB is shared across tests: reap whatever earlier tests
+        # left reapable first, so the counts below are this test's rows only.
+        await RetentionCleanupJob(
+            db_session_factory=sf,
+            image_upload_store=images,
+            object_store=objects,
+            upload_retention_days=90,
+        ).run_once()
+        short_tenant, plain_tenant = uuid4(), uuid4()
+        _seed_tenant_config(sync_admin, tenant_id=short_tenant, audit_days=90, event_days=30)
+
+        async def _image(tenant: UUID, name: str) -> tuple[UUID, UUID, str]:
+            image_id, thread_id = uuid4(), uuid4()
+            key = f"tenants/{tenant}/images/{name}.png"
+            await objects.put(key, b"png", content_type="image/png")
+            await images.insert(
+                image_id=image_id,
+                tenant_id=tenant,
+                thread_id=thread_id,
+                user_id=None,
+                object_key=key,
+                size_bytes=3,
+                mime_type="image/png",
+                sha256="x",
+            )
+            return image_id, thread_id, key
+
+        short_idle = await _image(short_tenant, "short-idle")  # 40d, no run → gone (30d)
+        short_ran = await _image(short_tenant, "short-ran")  # 200d, run 10d ago → kept
+        plain_40 = await _image(plain_tenant, "plain-40")  # 40d → kept (default 90)
+        plain_used = await _image(plain_tenant, "plain-used")  # 200d, downloaded 5d ago → kept
+        plain_stale = await _image(plain_tenant, "plain-stale")  # 200d, run 120d → gone
+        plain_deleted = await _image(plain_tenant, "plain-deleted")  # 1d, soft-deleted → gone
+        await images.soft_delete(
+            image_id=plain_deleted[0], tenant_id=plain_tenant, now=datetime.now(UTC)
+        )
+
+        admin = create_engine(sync_admin, isolation_level="AUTOCOMMIT")
+        try:
+            with admin.connect() as conn:
+                conn.execute(
+                    text(
+                        "UPDATE tenant_config SET upload_retention_days = 30 WHERE tenant_id = :t"
+                    ),
+                    {"t": str(short_tenant)},
+                )
+                for (image_id, _thread, _key), days in (
+                    (short_idle, 40),
+                    (short_ran, 200),
+                    (plain_40, 40),
+                    (plain_used, 200),
+                    (plain_stale, 200),
+                    (plain_deleted, 1),
+                ):
+                    conn.execute(
+                        text(
+                            "UPDATE image_upload SET created_at = now() - make_interval(days => :d)"
+                            " WHERE id = :i"
+                        ),
+                        {"d": days, "i": image_id},
+                    )
+                conn.execute(
+                    text(
+                        "UPDATE image_upload SET last_used_at = now() - interval '5 days' "
+                        "WHERE id = :i"
+                    ),
+                    {"i": plain_used[0]},
+                )
+                for tenant, (_image_id, thread_id, _key), days in (
+                    (short_tenant, short_ran, 10),
+                    (plain_tenant, plain_stale, 120),
+                ):
+                    conn.execute(
+                        text(
+                            "INSERT INTO agent_run (id, tenant_id, thread_id, status, "
+                            " on_disconnect, created_at, updated_at) VALUES (:r, :t, :th, "
+                            " 'success', 'continue', now() - make_interval(days => :d), now())"
+                        ),
+                        {"r": str(uuid4()), "t": str(tenant), "th": str(thread_id), "d": days},
+                    )
+        finally:
+            admin.dispose()
+
+        job = RetentionCleanupJob(
+            db_session_factory=sf,
+            image_upload_store=images,
+            object_store=objects,
+            upload_retention_days=90,
+        )
+        report = await job.run_once()
+
+        async def _gone(entry: tuple[UUID, UUID, str], tenant: UUID) -> tuple[bool, bool]:
+            row = await images.get(image_id=entry[0], tenant_id=tenant)
+            return row is None, entry[2] not in await objects.list_prefix(entry[2])
+
+        assert await _gone(short_idle, short_tenant) == (True, True)
+        assert await _gone(short_ran, short_tenant) == (False, False)
+        assert await _gone(plain_40, plain_tenant) == (False, False)
+        assert await _gone(plain_used, plain_tenant) == (False, False)
+        assert await _gone(plain_stale, plain_tenant) == (True, True)
+        assert await _gone(plain_deleted, plain_tenant) == (True, True)
+        assert (report.image_uploads_hard_deleted, report.image_object_keys_removed) == (3, 3)
+    finally:
+        await worker_engine.dispose()

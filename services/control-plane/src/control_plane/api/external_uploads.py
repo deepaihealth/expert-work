@@ -68,6 +68,7 @@ from control_plane.api.uploads import (
     _handle_document_upload,
     _land_image_upload,
     _prepare_image_upload,
+    note_image_used,
     note_uploads_used,
     register_document_upload,
 )
@@ -533,6 +534,8 @@ def build_external_uploads_router() -> APIRouter:
                 return _upload_download_error(
                     "UPLOAD_CONTENT_UNAVAILABLE", "upload content unavailable", 500
                 )
+            # B-283 —— 字节真的读到了:图片自己的登记行也记一次使用(对象存储里的字节按它到期)。
+            await note_image_used(images, tenant_id=tenant_id, image_id=image_id)
             # Extension-based, like the document branch above: only the
             # DISPOSITION side is read here (see the Content-Type comment
             # below), and that verdict does not depend on the upload's kind.

@@ -1336,3 +1336,87 @@ async def test_a_failing_touch_does_not_fail_the_download(
     assert resp.status_code == 200, resp.text
     assert resp.content == b"%PDF-1.4 dl"
     assert "upload.touch_failed" in caplog.text
+
+
+# ---------------------------------------------------------------------------
+# B-283 —— 图片的字节按 ``image_upload`` 那一行到期:对外下载成功时那一行也记一次使用。
+# ---------------------------------------------------------------------------
+
+
+async def _upload_image(ctx: _Ctx) -> tuple[dict[str, Any], UUID]:
+    resp = await ctx.client.post(
+        "/v1/agents/support-bot/uploads",
+        data={"user_id": "cust-77"},
+        files={"file": ("a.png", _PNG_BYTES, "image/png")},
+        headers=ctx.headers,
+    )
+    assert resp.status_code == 201, resp.text
+    data: dict[str, Any] = resp.json()["data"]
+    image_id = parse_image_ref((await _upload_row(ctx, data)).ref).image_id
+    return data, image_id
+
+
+async def _image_last_used(ctx: _Ctx, image_id: UUID) -> Any:
+    row = await ctx.app.state.image_upload_store.get(image_id=image_id, tenant_id=ctx.tenant_id)
+    assert row is not None
+    return row.last_used_at
+
+
+@pytest.mark.asyncio
+async def test_downloading_an_image_marks_its_image_row_used(ctx: _Ctx) -> None:
+    await ctx.seed_agent()
+    up, image_id = await _upload_image(ctx)
+
+    refused = await ctx.client.get(
+        f"/v1/agents/support-bot/uploads/{up['upload_id']}",
+        params={"user_id": "someone-else"},
+        headers=ctx.headers,
+    )
+    assert refused.status_code == 404
+    assert await _image_last_used(ctx, image_id) is None  # a refused read is not a use
+
+    resp = await ctx.client.get(
+        f"/v1/agents/support-bot/uploads/{up['upload_id']}",
+        params={"user_id": "cust-77"},
+        headers=ctx.headers,
+    )
+    assert resp.status_code == 200, resp.text
+    assert await _image_last_used(ctx, image_id) is not None
+
+
+@pytest.mark.asyncio
+async def test_an_image_whose_bytes_are_gone_is_not_marked_used(ctx: _Ctx) -> None:
+    await ctx.seed_agent()
+    up, image_id = await _upload_image(ctx)
+    row = await ctx.app.state.image_upload_store.get(image_id=image_id, tenant_id=ctx.tenant_id)
+    await ctx.app.state.object_store.delete(row.object_key)
+
+    resp = await ctx.client.get(
+        f"/v1/agents/support-bot/uploads/{up['upload_id']}",
+        params={"user_id": "cust-77"},
+        headers=ctx.headers,
+    )
+    assert resp.status_code == 404
+    assert await _image_last_used(ctx, image_id) is None
+
+
+@pytest.mark.asyncio
+async def test_a_failing_image_touch_does_not_fail_the_download(
+    ctx: _Ctx, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    await ctx.seed_agent()
+    up, _image_id = await _upload_image(ctx)
+
+    async def _down(**_kwargs: object) -> bool:
+        raise RuntimeError("db down")
+
+    monkeypatch.setattr(ctx.app.state.image_upload_store, "touch", _down)
+    with caplog.at_level("WARNING"):
+        resp = await ctx.client.get(
+            f"/v1/agents/support-bot/uploads/{up['upload_id']}",
+            params={"user_id": "cust-77"},
+            headers=ctx.headers,
+        )
+    assert resp.status_code == 200, resp.text
+    assert resp.headers["content-type"] == "image/png"
+    assert "image.touch_failed" in caplog.text

@@ -81,20 +81,31 @@ class ImageUploadStore(abc.ABC):
     async def list_reapable(
         self,
         *,
-        before: datetime,
+        now: datetime,
+        default_days: int,
         limit: int = 1000,
     ) -> list[ImageUpload]:
-        """Rows the retention sweep may remove: ``created_at < before`` OR
-        ``deleted_at IS NOT NULL``.
+        """Rows the retention sweep may remove: past their **last use** OR
+        ``deleted_at IS NOT NULL``. Sorted by ``created_at`` ascending.
 
-        The retention sweep calls this with ``now - retention_days``.
-        Rows past the age horizon are eligible regardless of
-        ``deleted_at`` state (same as before); additionally, ANY
-        soft-deleted row is eligible even when it's too young to be
-        caught by the age predicate alone — a user's manual delete no
-        longer waits out the retention window before the next sweep
-        reaps it. Sorted by ``created_at`` ascending.
+        B-283 —— 最后使用 = ``greatest(created_at, last_used_at, 所在会话最后一次 run 的
+        created_at)``(只认同租户的 run);到期 = 最后使用 + 保留期 ``< now``,保留期取这张图
+        租户的 ``tenant_config.upload_retention_days``(图片也是上传),为空(或租户没有配置行)
+        时用 ``default_days``。同样的天数下只会比按 ``created_at`` 算留得更久,不会更短。
+
+        ANY soft-deleted row is eligible regardless of age — a user's manual
+        delete does not wait out the retention window.
+
+        Caller MUST be inside an RLS bypass scope (the retention job's
+        ``_bypass_rls``). The in-memory backend has no runs and no tenant
+        config: it uses ``created_at`` / ``last_used_at`` and ``default_days``.
         """
+
+    @abc.abstractmethod
+    async def touch(self, *, image_id: UUID, tenant_id: UUID, now: datetime) -> bool:
+        """B-283 —— 记一次使用:``last_used_at = now``,只在这一行属于 ``tenant_id``、没删、
+        且上次记的时间为空或早于 ``now - TOUCH_INTERVAL`` 时才写(每张每天最多一次)。
+        ``True`` = 真的写了。"""
 
     @abc.abstractmethod
     async def hard_delete(self, *, image_ids: Sequence[UUID]) -> int:

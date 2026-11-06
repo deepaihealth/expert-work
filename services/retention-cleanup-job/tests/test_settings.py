@@ -141,3 +141,22 @@ def test_file_retention_below_a_week_is_raised_to_seven_not_refused(
     field = env_key.removeprefix("EXPERT_WORK_RETENTION_").lower()
     assert getattr(settings, field) == 7
     assert settings.clamped_retention == {field: 3}
+
+
+def test_the_retired_image_retention_env_is_ignored_with_a_warning(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """B-283 —— 图片与附件同一个天数;还配着老的图片天数就打 warning,值不进作业。"""
+    from retention_cleanup_job.main import warn_retired_image_retention
+
+    monkeypatch.setenv("EXPERT_WORK_RETENTION_IMAGE_RETENTION_DAYS", "180")
+    settings = RetentionCleanupSettings(_env_file=None)  # type: ignore[call-arg]
+    with caplog.at_level("WARNING", logger="retention_cleanup_job.main"):
+        warn_retired_image_retention(settings)
+    assert "retention.image_retention_days_ignored configured=180" in caplog.text
+    unset = RetentionCleanupSettings(_env_file=None)  # type: ignore[call-arg]
+    caplog.clear()
+    monkeypatch.delenv("EXPERT_WORK_RETENTION_IMAGE_RETENTION_DAYS")
+    warn_retired_image_retention(RetentionCleanupSettings(_env_file=None))  # type: ignore[call-arg]
+    assert "image_retention_days_ignored" not in caplog.text
+    assert unset.image_retention_days == 180

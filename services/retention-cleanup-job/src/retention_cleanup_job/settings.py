@@ -42,11 +42,14 @@ class RetentionCleanupSettings(BaseSettings):
     batch_size: int = Field(default=10000, gt=0, le=1000000)
 
     # --------------------------------------------------- image retention (Mini-ADR J-32)
-    # Image lifecycle hard-delete window. Rows in ``image_upload`` with
-    # ``created_at < now() - image_retention_days`` get their object
-    # store key removed + the row hard-deleted. M0 has no per-tenant
-    # override; tenants needing longer retention set the env var.
-    image_retention_days: int = Field(default=90, ge=1, le=3650)
+    # (Was: a global ``created_at``-based hard-delete window for ``image_upload``.)
+    #
+    # B-283: RETIRED. Images expire by LAST USE on the same clock and the same days
+    # as uploads (``upload_retention_days`` / the tenant's
+    # ``tenant_config.upload_retention_days``), so an image's registry row and its
+    # bytes can never expire on different days. Still parsed only so ``main`` can
+    # warn that a configured value is ignored.
+    image_retention_days: int | None = None
 
     # --------------------------------------------------- artifact retention (Mini-ADR J-25)
     # Active artifact rows with ``updated_at < now() - artifact_retention_days``
