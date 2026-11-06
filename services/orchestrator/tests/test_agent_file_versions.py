@@ -252,7 +252,11 @@ async def test_an_agents_versions_are_capped_oldest_first(
     assert not any(v.startswith(("a.md0", "b.md0")) for vs in kept.values() for v in vs)
 
 
-async def test_versions_of_a_source_gone_for_thirty_days_are_dropped(tmp_path: Path) -> None:
+async def test_versions_of_a_source_gone_for_thirty_days_are_left_to_the_retention_job(
+    tmp_path: Path,
+) -> None:
+    """B-284 —— 观察只记 ``missing`` 标记;满 30 天的删除归留存作业
+    (``retention_cleanup_job.agent_file_versions``,闲着的 agent 也到期)。"""
     agent = _agent(tmp_path)
     keep = _put(agent / "tpl" / "keep.md", "k")
     gone = _put(agent / "tpl" / "gone.md", "g")
@@ -267,8 +271,9 @@ async def test_versions_of_a_source_gone_for_thirty_days_are_dropped(tmp_path: P
 
     report = await _observe(tmp_path)
 
-    assert report.dropped == 1
-    assert set(_history(tmp_path)) == {"tpl/keep.md"}
+    assert report.dropped == 0
+    assert set(_history(tmp_path)) == {"tpl/keep.md", "tpl/gone.md"}
+    assert len(list(_versions_root(tmp_path).rglob("missing"))) == 1
     assert keep.exists()
 
 
@@ -1154,8 +1159,9 @@ async def test_deleted_files_age_out_although_another_subtree_is_too_deep(
 
     report = await _observe(tmp_path)
 
-    assert report.dropped == 1
-    assert "gone.md" not in _history(tmp_path)
+    # B-284 —— 确认不见照样记得下(另一棵子树太深不挡);删归留存作业。
+    assert report.dropped == 0
+    assert len(list(_versions_root(tmp_path).rglob("missing"))) == 1
 
 
 async def test_the_index_is_observed_even_behind_the_entry_cap(tmp_path: Path) -> None:
@@ -1436,8 +1442,9 @@ async def test_files_under_a_deleted_dir_age_out(tmp_path: Path) -> None:
 
     report = await _observe(tmp_path)
 
-    assert report.dropped == 1
-    assert set(_history(tmp_path)) == {"keep.md"}
+    # B-284 —— 子目录整个删掉:下面的文件确认不见、标记还在;删归留存作业。
+    assert report.dropped == 0
+    assert len(list(_versions_root(tmp_path).rglob("missing"))) == 1
 
 
 async def test_a_missing_file_keeps_exactly_one_and_a_live_file_two(
@@ -1804,7 +1811,9 @@ async def test_a_torn_path_of_an_unchanged_file_is_repaired_in_place(tmp_path: P
     await _observe(tmp_path)
     _age_markers(tmp_path)
     report = await _observe(tmp_path)
-    assert report.dropped == 1
+    # B-284 —— 修好的 ``path`` 让它照常记成不见;删归留存作业。
+    assert report.dropped == 0
+    assert len(list(_versions_root(tmp_path).rglob("missing"))) == 1
 
 
 async def test_an_index_dir_with_a_broken_path_keeps_three(
@@ -2191,3 +2200,55 @@ async def test_a_path_read_error_still_clears_the_marker_of_a_seen_file(
 
     assert report.dropped == 0
     assert _markers(tmp_path) == []
+
+
+async def test_content_that_already_has_an_artifact_copy_is_not_versioned_again(
+    tmp_path: Path,
+) -> None:
+    """B-284 —— 读到的内容正好是某个产物版本的副本:不另留版本。登记之后又改过的内容照常留(没有
+    副本盖得住它);别的文件照旧。"""
+    import hashlib
+
+    from orchestrator.tools.agent_file_versions import NasAgentFileVersionStore
+    from orchestrator.tools.nas_workspace_store import NasWorkspaceStore
+
+    agent = _agent(tmp_path)
+    _put(agent / "report.docx", "artifact v1")
+    _put(agent / "tpl" / "t.md", "template")
+    snapshotted = {"report.docx": {hashlib.sha256(b"artifact v1").hexdigest()}}
+    asked: list[tuple[object, ...]] = []
+
+    async def _registered(tenant: UUID, user: UUID, key: str) -> dict[str, set[str]]:
+        asked.append((tenant, user, key))
+        return snapshotted
+
+    store = NasAgentFileVersionStore(
+        workspace=NasWorkspaceStore(root=str(tmp_path)), registered_paths=_registered
+    )
+    report = await store.observe(tenant_id=_TENANT, user_id=_USER, agent_key=_KEY)
+
+    assert set(_history(tmp_path)) == {"tpl/t.md"}
+    assert report.snapshotted == 1
+    assert asked == [(_TENANT, _USER, _KEY)]
+
+    _put(agent / "report.docx", "artifact v1, edited after save_artifact")
+    await store.observe(tenant_id=_TENANT, user_id=_USER, agent_key=_KEY)
+
+    assert "report.docx" in _history(tmp_path)
+
+
+async def test_a_failing_registered_paths_lookup_versions_everything(tmp_path: Path) -> None:
+    from orchestrator.tools.agent_file_versions import NasAgentFileVersionStore
+    from orchestrator.tools.nas_workspace_store import NasWorkspaceStore
+
+    _put(_agent(tmp_path) / "report.docx", "artifact")
+
+    async def _down(tenant: UUID, user: UUID, key: str) -> dict[str, set[str]]:
+        raise RuntimeError("db down")
+
+    store = NasAgentFileVersionStore(
+        workspace=NasWorkspaceStore(root=str(tmp_path)), registered_paths=_down
+    )
+    await store.observe(tenant_id=_TENANT, user_id=_USER, agent_key=_KEY)
+
+    assert set(_history(tmp_path)) == {"report.docx"}

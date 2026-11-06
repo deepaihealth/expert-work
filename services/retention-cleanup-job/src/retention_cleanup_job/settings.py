@@ -134,6 +134,16 @@ class RetentionCleanupSettings(BaseSettings):
     conversation_workspace_retention_days: int = Field(default=90, ge=1)
     # 一轮最多处理多少段闲置会话(每段几次 NAS 删除 + 两三条查询)。
     conversation_workspace_batch_size: int = Field(default=500, gt=0, le=100000)
+    # B-284 —— 冻结的 ``shared/``(B-50 搬迁时归属不明的 legacy)从这个时刻起整个删掉。
+    # 运维在发布那天设成「发布 + 30 天」;不设 / 空 = 永不删。只认 ``YYYY-MM-DD``(UTC 零点),
+    # 别的写法 / 数字 / 早于功能上线的日期 → 记错误、只跳过 shared/ 这一步(作业照跑);
+    # 原样存字符串,解析在 ``agent_roots.parse_shared_delete_after``。
+    shared_delete_after: str | None = None
+    # B-284 —— agent 根存量的切换时刻 T:这个环境 B-236 上线的时刻,带时区的 ISO 时间
+    # (测试 ``2026-10-30T23:48:00+08:00``,生产 ``2026-11-04T19:10:00+08:00``)。不设 = 那条
+    # 规则不跑;写错 → 记错误、那条规则不跑。解析在 ``agent_roots.parse_cutover``。值钉在
+    # ``infra/k8s/overlays/{test,prod}/retention-cleanup-patch.yaml``。
+    agent_root_cutover: str | None = None
     # NAS 工作区根 —— 与 control-plane 的 EXPERT_WORK_WORKSPACE_NAS_ROOT 同一个挂载
     # 点(CronJob 挂同一个 PVC)。``None`` → 三条碰文件的规则(产物版本 / 上传文件 /
     # 孤儿 threads 目录)整体跳过并打 warning:只删行不删文件会留下永远没人认领

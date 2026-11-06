@@ -37,6 +37,8 @@ from retention_cleanup_job import job as job_module
 from retention_cleanup_job import main as main_module
 from retention_cleanup_job import uploads as uploads_module
 from retention_cleanup_job import workspace_files
+from retention_cleanup_job.agent_file_versions import VersionSweepTally
+from retention_cleanup_job.agent_roots import AgentRootTally
 from retention_cleanup_job.conversation_dirs import ConversationDirTally
 from retention_cleanup_job.job import RetentionCleanupJob
 from retention_cleanup_job.main import EXIT_PASS_FAILED, exit_code
@@ -783,6 +785,17 @@ def _stub_sql_passes(job: RetentionCleanupJob) -> None:
         return ConversationDirTally()
 
     job._sweep_conversation_dirs = _conversations  # type: ignore[method-assign]
+
+    async def _agent_roots() -> AgentRootTally:
+        # B-284 —— agent 根存量要查 Postgres(``test_agent_roots.py`` 管它);版本区那条在
+        # ``test_agent_file_versions_sweep.py``。这里的用例只看上传 / 工作区规则。
+        return AgentRootTally()
+
+    async def _file_versions() -> VersionSweepTally:
+        return VersionSweepTally()
+
+    job._sweep_agent_roots = _agent_roots  # type: ignore[method-assign]
+    job._sweep_agent_file_versions = _file_versions  # type: ignore[method-assign]
 
 
 @pytest.mark.asyncio

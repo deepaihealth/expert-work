@@ -40,6 +40,9 @@ REMOVED = "removed"
 UNLINKED = "unlinked"
 SKIPPED_SYMLINK = "skipped_symlink"
 QUARANTINED = "quarantined"
+#: B-284 —— 调用方给了 ``expect``(判定时看到的 ``(st_dev, st_ino)``),到删的时候已不是同一个
+#: 东西了(被换掉 / 重建):什么都不删。
+CHANGED = "changed"
 
 _DIR_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
 _O_PATH: int | None = getattr(os, "O_PATH", None)
@@ -235,6 +238,11 @@ def _open_dir_chain(root: str, parts: list[str]) -> tuple[int | None, str]:
     return fd, REMOVED
 
 
+def open_dir_chain(root: str, parts: list[str]) -> tuple[int | None, str]:
+    """B-284 —— :func:`_open_dir_chain` 的公开名字(调用方自己负责关 fd)。"""
+    return _open_dir_chain(root, parts)
+
+
 def _ensure_dir(dfd: int, name: str) -> int:
     try:
         os.mkdir(name, 0o700, dir_fd=dfd)
@@ -272,8 +280,12 @@ def remove_entry(
     tenant_id: UUID,
     owner_id: UUID,
     quarantine: bool = True,
+    expect: tuple[int, int] | None = None,
 ) -> str:
     """``rm -rf {root}/{parts…}/{name}``,按本模块开头说的规矩。
+
+    B-284 —— ``expect`` 给了就先核对 ``name`` 还是那个 ``(st_dev, st_ino)``(``lstat``,不跟链接),
+    不是就回 :data:`CHANGED`、什么都不删:判定与删除之间它被换成了别的东西。
 
     ``parts`` 以租户 id 开头、都是固定名字 / UUID;``name`` 是 UUID 或校验过的 ``agent_key``。
     返回结果常量之一;删不掉也挪不走(或 ``quarantine=False`` 时删不掉)抛
@@ -286,6 +298,8 @@ def remove_entry(
             info = os.lstat(name, dir_fd=fd)
         except FileNotFoundError:
             return ABSENT
+        if expect is not None and (info.st_dev, info.st_ino) != expect:
+            return CHANGED
         if stat.S_ISLNK(info.st_mode):
             os.unlink(name, dir_fd=fd)
             return UNLINKED
@@ -492,12 +506,14 @@ def _is_uuid(name: str) -> bool:
 
 __all__ = [
     "ABSENT",
+    "CHANGED",
     "QUARANTINED",
     "REMOVED",
     "SKIPPED_SYMLINK",
     "UNLINKED",
     "NasEntryStuckError",
     "add_owner_bits",
+    "open_dir_chain",
     "quarantine_entry",
     "remove_entry",
     "remove_tree_at",

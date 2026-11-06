@@ -70,6 +70,20 @@ class CleanupReport:
     conversation_dirs_failed: int = 0
     conversation_tool_results_skipped_artifact: int = 0
     conversation_dirs_raced: int = 0
+    #: B-284 —— agent 根 B-236 之前的存量(顶层文件 / 模板子目录)、过期的 ``shared/``、
+    #: 删失败的项(非 0 时 ``failed_passes`` 带 ``agent_roots``)。
+    agent_root_files_removed: int = 0
+    agent_root_dirs_removed: int = 0
+    shared_dirs_removed: int = 0
+    agent_root_failed: int = 0
+    agent_root_skipped_unknown: int = 0
+    agent_root_skipped_symlinks: int = 0
+    agent_root_skipped_changed: int = 0
+    #: B-284 —— ``/agent`` 文件历史版本:源文件不见满 30 天整个删掉的版本目录、满 90 天删掉的
+    #: 老版本、出错的版本目录(非 0 时 ``failed_passes`` 带 ``agent_file_versions``)。
+    agent_file_version_dirs_dropped: int = 0
+    agent_file_versions_capped: int = 0
+    agent_file_versions_failed: int = 0
     # 留存链 B-27 —— 孤儿 threads/<id>/ 目录。
     thread_dirs_removed: int = 0
     #: B-50 spec §4.2 —— 孤儿 ``.tool_results/<run_id>/``。此前从没被清过

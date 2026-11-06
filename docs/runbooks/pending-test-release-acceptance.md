@@ -2101,6 +2101,96 @@ oauth2 目录项本来就不在平台池里:不再碰平台池;`enabled` 切换�
 
 **生产(用户执行,随发布之后)**:发布完成、smoke 过之后,在生产集群执行 97.7 的同一条命令(只数不删),把输出的那一行贴回来;我们对一下各 `kept_*` 的原因后再决定是否执行 ` --apply`;执行完再跑一次只数不删,确认 `deletable=0`、`failed=0`。迁移时的清理随发布自动生效,不需要操作;可在 Prometheus 看 `expert_work_platform_migration_originals_total`。不需要改库、不需要停作业。
 
+## §98 agent 根的存量、`/agent` 文件历史版本、冻结的 `shared/`(B-284)
+
+**背景**:B-236 之后新对话都写进自己的 `threads/<会话>/work/`;之前老视图对话直接写在 agent 根(`agents/<key>/`),那是一批固定存量,一直没人清。留存作业新增:
+
+- **切换时刻 `T` 钉在 overlay 里**:`EXPERT_WORK_RETENTION_AGENT_ROOT_CUTOVER`,带时区的 ISO 时间,填这个环境 B-236 上线的时刻,写在 `infra/k8s/overlays/{test,prod}/retention-cleanup-patch.yaml`(固定的历史事实,随发布一起下发,不再 `kubectl set env`):**测试 `2026-10-30T23:48:00+08:00`**(测试集群 B-236 镜像 `44b8260a3` 的 ReplicaSet 创建于 `2026-10-30T15:48:08Z` = 23:48:08 CST,取到分钟、比滚动开始早)、**生产 `2026-11-04T19:10:00+08:00`**(发布执行单 `2026-11-04-prod-release-checklist.md` 头上「19:10 已执行」的开始时刻,B-236 代码是之后 2.2 段才滚上去的)。**`T` 只能比真正上线早、不能晚**:晚了,上线到 `T` 之间有意放进 `/agent` 的东西会被当成存量删(23:51 就晚了 3 分钟,已改);早了只会少删。不设 = agent 根这条不跑;写错(纯数字、没时区、解析不了)= 这条不跑、记 `retention.config_invalid`、作业以 3 退出(别的 pass 照跑)。**不再从 `thread_meta` 现算**(清除最早的对话会让它往后挪、老对话被迁成新布局会让它往前挪)。每轮都打一行 `retention.agent_roots_gate cutover=… shared_delete_after=…`。`EXPERT_WORK_RETENTION_SHARED_DELETE_AFTER` 故意**不**进 overlay:它是发布当天(通知深护之后)才打开的闸,按 98.9 在 CronJob 上设。**注意:带着这个 overlay 发到测试 / 生产之后,当晚的 CronJob 就会按 `T` 真删存量**(测试:10-30 之前写下、满 90 天没动过的 agent 根文件;生产 09-07 才开荒,最早 12-06 才有满 90 天的)。
+- **「早于 `T`」与「满天数」都看 `max(mtime, ctime)`**:mtime 用户态随便设(`unzip` / `tar` / `cp -p` / `rsync -a` / `mv` / `touch -d`、开场复制本身也保留 mtime),ctime 改不了、只会往「更新」那边走。所以 `T` 之后放进 `/agent` 的老 mtime 文件不删;`T` 之前解压出来、带着几年前 mtime 的文件,从写下那天起满天数才删。
+- ① agent 根**顶层文件**:`max(mtime, ctime)` 早于 `T`、也早于「现在 - 租户的 `artifact_retention_days`(默认 90)」、没登记成产物 → 删(按判定时的 `(st_dev, st_ino)` 再核对一次,换过的计 `agent_root_skipped_changed`);② **子目录**:整棵树每一项(含目录自己)`max(mtime, ctime)` 都早于 `T`、没有产物文件、这个用户在这个 agent 下闲置(最后一次 run 与树里最晚的那一项较晚者)满同样天数 → 先改名 `.retention-hold-<随机>`、复查、再按 inode 删(复查不过改回原名,计 `agent_root_skipped_changed`);上一轮删到一半被杀留下的 `.retention-hold-*` 下一轮按同样判据删完(不成立就留着、日志 `retention.agent_root_hold_left`);③ 永不碰:点开头的名字(作业自己的 `.retention-hold-*` 除外)、`AGENT_NOTES.md` / `MEMORY.md` / `PLAN.md` / `TODO.md`、平台目录、符号链接(计 `agent_root_skipped_symlinks`)、`T` 之后改过的任何东西;子树超过 5,000 项判不了的计 `agent_root_skipped_unknown`、不删。
+- ④ `/agent` 文件历史版本:读到的内容正好已经是某个产物版本的副本(同路径、同 sha256、有副本)才不另留版本 —— 登记后又改过的、B-235 之前没副本的照常留;「源文件不见满 30 天整个删」挪到留存作业(闲着的 agent 也到期);每个文件最新 3 份之外、写下满 90 天的版本删;写到一半留下的 `.tmp-*` 满 1 小时删。
+- ⑤ `shared/`:`EXPERT_WORK_RETENTION_SHARED_DELETE_AFTER` 只认 `YYYY-MM-DD`(UTC 零点)且不早于 2026-11-06;到了就删每个用户根下的 `shared/`。不设 / 空 = 永不删;数字(`20261201` 不再被当成 unix 时间)、别的写法、更早的日期 = 只跳过 `shared/` 这一步、记 `retention.config_invalid`、作业以 3 退出(别的照跑)。沙箱挂载与 `shared:` 前缀在目录不在时本来就容忍,到期前照常能读;删除之后另拆。
+- agent 根 `.tool_results/<run>` 随会话闲置清理已在 B-282(§96)。
+
+**怎么进**:测试环境 `kubectl exec` 进 control-plane 看 NAS + 只读查库。probe job 改 env、改文件前用户逐次批准。**不要用 probe job 把 `T` 钉到将来 / 把 `SHARED_DELETE_AFTER` 设成今天来造数据**:probe job 扫的是整个 NAS,会删掉所有测试用户的存量与 `shared/`,不止本节自建的东西。删除规则用 98.2 的 pod 内探针验证:它只在 NAS 根下自建的 `.b284-probe/`(不是 UUID 名,作业与 janitor 都不看)里造文件,直接调 `sweep_agent_roots` / `sweep_shared`(可以传「现在」与 `T`),跑完把 `.b284-probe/` 整个删掉。probe job 只用于 98.1 / 98.7 那几种什么都不会删的配置。**花费**:约 ¥0.5(一两轮短对话)。
+
+给 probe job 临时改 env 的写法(`<n>` 每次换一个;`KEY-` 是去掉这个 env):
+
+```bash
+kubectl create job --from=cronjob/retention-cleanup b284-probe-<n> --dry-run=client -o yaml \
+  | kubectl set env --local -f - EXPERT_WORK_RETENTION_AGENT_ROOT_CUTOVER=20261201 -o yaml \
+  | kubectl apply -f -
+```
+
+- [ ] **98.1 闸门**:先确认发布带上了 overlay:`kubectl get cronjob retention-cleanup -o jsonpath='{.spec.jobTemplate.spec.template.spec.containers[0].env[?(@.name=="EXPERT_WORK_RETENTION_AGENT_ROOT_CUTOVER")].value}'` 输出 `2026-10-30T23:48:00+08:00`;当晚(或手动 `kubectl create job --from=cronjob/retention-cleanup b284-probe-1`)日志 `retention.agent_roots_gate cutover=2026-10-30T23:48:00+08:00 shared_delete_after=off`、`agent_root_failed=0`、退出码 0,记下 `agent_root_files_removed` / `agent_root_dirs_removed` / `agent_root_skipped_*`(测试环境 2026-08-08 之前没写过 agent 根的话都是 0,属预期),任意 agent 根下没有 `.retention-hold-*` 残留(`kubectl exec deploy/control-plane -- find /mnt/workspaces -maxdepth 5 -name '.retention-hold-*'` 没有输出)。再用上面的写法起两个 probe job:`EXPERT_WORK_RETENTION_AGENT_ROOT_CUTOVER-`(去掉)→ `cutover=off`、`agent_root_files_removed=0`、退出码 0;`EXPERT_WORK_RETENTION_AGENT_ROOT_CUTOVER=20261201` → `retention.config_invalid env=EXPERT_WORK_RETENTION_AGENT_ROOT_CUTOVER`、`agent_root_files_removed=0 agent_root_dirs_removed=0`、退出码 3
+- [ ] **98.2 删除规则(pod 内探针,只动 `.b284-probe/`)**:执行下面的命令(参数是测试的 B-236 时刻)。场景 A 在「现在 + 100 天」、`T` = 现在 + 200 天跑:`old.txt`(100 天)、`tpl/`(整棵 100 天、这个 agent 从没跑过)该删,`pre.txt`(40 天)、记忆文件、点开头的该留;场景 B 新放一个 mtime 拨到 200 天前的 `restored.md`,用测试的真实 `T` 跑 —— 它的 ctime 是现在、在 `T` 之后,该留;场景 C 是 `shared/` 的三种日期。判据(逐字):`A old.txt=gone tpl=gone pre.txt=kept AGENT_NOTES.md=kept MEMORY.md=kept .hidden=kept files 1 dirs 1 failed 0` / `B restored.md=kept files 0 failed 0` / `C 20261201:invalid 2099-01-01:kept <今天>:gone` / `cleaned True`。**没修好时**:只看 mtime 的版本 B 是 `restored.md=gone`;日期按数字解析的版本 C 第一项是 `gone`。(11-06 本机连真 Postgres、把 `Settings` 换成本地连接串原样跑过,输出同上。)
+
+```bash
+kubectl exec deploy/control-plane -- python -c '
+import asyncio, os, shutil, sys, time, uuid
+from datetime import UTC, datetime, timedelta
+from pathlib import Path
+from control_plane.settings import Settings
+from expert_work.persistence import DatabaseConfig, create_async_engine_from_config, create_async_session_factory
+from retention_cleanup_job.agent_roots import AgentRootTally, parse_shared_delete_after, sweep_agent_roots, sweep_shared
+B236 = datetime.fromisoformat(sys.argv[1])
+s = Settings()
+root = Path(s.workspace_nas_root) / ".b284-probe"
+user_root = root / str(uuid.uuid4()) / str(uuid.uuid4())
+agent = user_root / "agents" / "probe-agent"
+LATER = 100 * 86400
+def put(rel, age_days, at):
+    p = agent / rel
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(rel)
+    os.utime(p, (at - age_days * 86400,) * 2)
+    return p
+def state(names):
+    return " ".join(n + ("=kept" if os.path.lexists(agent / n) else "=gone") for n in names)
+async def sweep(sf, cutover, now):
+    t = AgentRootTally()
+    await sweep_agent_roots(sf, str(root), cutover=cutover, default_days=90, tally=t, now=now)
+    return t
+async def main():
+    engine = create_async_engine_from_config(DatabaseConfig(dsn=s.db_dsn, pgbouncer_mode=s.db_pgbouncer_mode))
+    sf = create_async_session_factory(engine)
+    try:
+        later = time.time() + LATER
+        for rel in ("old.txt", "AGENT_NOTES.md", "MEMORY.md", ".hidden", "tpl/a.md"):
+            put(rel, 100, later)
+        put("pre.txt", 40, later)
+        os.utime(agent / "tpl", (later - 100 * 86400,) * 2)
+        t = await sweep(sf, datetime.now(UTC) + timedelta(days=200), datetime.fromtimestamp(later, UTC))
+        print("A", state(["old.txt", "tpl", "pre.txt", "AGENT_NOTES.md", "MEMORY.md", ".hidden"]), "files", t.files_removed, "dirs", t.dirs_removed, "failed", t.failed)
+        put("restored.md", 200, time.time())
+        t = await sweep(sf, B236, datetime.fromtimestamp(later, UTC))
+        print("B", state(["restored.md"]), "files", t.files_removed, "failed", t.failed)
+        (user_root / "shared").mkdir()
+        out = []
+        for raw in ("20261201", "2099-01-01", datetime.now(UTC).date().isoformat()):
+            when, problem = parse_shared_delete_after(raw)
+            sweep_shared(str(root), delete_after=when, now=datetime.now(UTC), tally=AgentRootTally())
+            out.append(raw + ":" + ("invalid" if problem else "kept" if (user_root / "shared").exists() else "gone"))
+        print("C", " ".join(out))
+    finally:
+        await engine.dispose()
+        shutil.rmtree(root)
+        print("cleaned", not root.exists())
+asyncio.run(main())
+' 2026-10-30T23:48:00+08:00
+```
+
+- [ ] **98.3**(并入 98.1,CronJob 的真值随 overlay 下发)
+- [ ] **98.4 `T` 之后的老 mtime 不删(真 NAS)**:在一个测试用户的某个 agent 根下放 `restored.md` 并 `touch -d '200 days ago'`(用户批准),再触发一次作业 → `restored.md` 还在(ctime 是今天、在 `T` 之后)。删掉它
+- [ ] **98.5 版本:有副本的内容不另留**:在对话视图会话里让智能体往 `/agent/report.md` 写一份并登记成产物 → 版本区里没有这份内容的版本;再让它改一次 `report.md`(不登记)→ 版本区出现 `report.md` 的版本
+- [ ] **98.6 版本:不见满 30 天由作业删**:挑一个有版本的 `/agent` 文件,删掉源文件,跑一次作业 → 它的版本目录里出现 `missing`;把 `missing` 内容改成 31 天前的时间戳(mtime 保持今天,用户批准)再跑 → 版本目录已删,日志 `agent_file_version_dirs_dropped` ≥ 1
+- [ ] **98.7 版本:90 天封顶**:测试数据没有满 90 天的版本时跳过并注明;有的话判据是只剩最新 3 份 + 不满 90 天的
+- [ ] **98.8 `shared/` 的作业接线**:probe job 设 `SHARED_DELETE_AFTER=20261201` → 所有 `shared/` 还在、`retention.config_invalid env=EXPERT_WORK_RETENTION_SHARED_DELETE_AFTER`、退出码 3,agent 根那条照跑(gate 行 `cutover=2026-10-30T23:48:00+08:00`);设 `2099-01-01` → 还在、gate 行 `shared_delete_after=2099-01-01`、退出码 0。真删由 98.2 场景 C 验。另找一个用户根下没有 `shared/` 的测试用户(只读 `ls`),在他的会话里跑一轮带 `bash ls /workspace` 的对话:正常(没有 `shared` 挂载、不报错),`read_file('shared:x')` 回「不存在」
+- [ ] **98.9 生产发布单**:`EXPERT_WORK_RETENTION_AGENT_ROOT_CUTOVER=2026-11-04T19:10:00+08:00` 已在 prod overlay,随 `release.sh prod` 下发,不用手设(发完用 98.1 的 `jsonpath` 命令核一下)。发布当天、通知深护之后,给生产 CronJob 设 `kubectl set env cronjob/retention-cleanup EXPERT_WORK_RETENTION_SHARED_DELETE_AFTER=<发布日 + 30 天,YYYY-MM-DD>`(写进 `production-release.md`「下一班」;不进 git)。发完看第一晚的 `retention.agent_roots_gate` 那一行与 `agent_root_failed=0`。生产 2026-09-07 才开荒,第一批满 90 天的存量最早 12-06 才出现,在那之前 `agent_root_files_removed` / `agent_root_dirs_removed` 为 0 属预期
+- [ ] **98.10 收尾**:删本节造的文件与 probe job;`.b284-probe/` 不在;租户配置恢复
+
+**上生产前**:通知深护智康 —— 更新记录「Agent 级旧文件的清理」(行为变化,提前通知):B-236 之前写在 Agent 级(列表里 `session_id` 为 `null`)、之后没再改过的文件,顶层的满产物保留期、子目录在这个终端用户闲置满同样天数后删除,之后列表里没有、下载 404 `WORKSPACE_FILE_FAILED`;登记成产物的、B-236 之后改过的不按时间清理。更新记录随发布改日期。
+
 ## §99 彻底删除与留存带走对象存储里的轨迹对象(B-285)
 
 > §95–§98 由别的条目占用(各自分支);都追加在文件末尾,合并时按编号排好即可。依赖 §94(B-280,同一条栈)。

@@ -165,6 +165,10 @@ def log_done(report: CleanupReport) -> None:
         "conversation_dirs_skipped_unsafe=%d conversation_dirs_skipped_owner_deleted=%d "
         "conversation_dirs_failed=%d conversation_tool_results_skipped_artifact=%d "
         "conversation_dirs_raced=%d "
+        "agent_root_files_removed=%d agent_root_dirs_removed=%d shared_dirs_removed=%d "
+        "agent_root_failed=%d agent_root_skipped_unknown=%d agent_root_skipped_symlinks=%d "
+        "agent_root_skipped_changed=%d agent_file_version_dirs_dropped=%d "
+        "agent_file_versions_capped=%d agent_file_versions_failed=%d "
         "thread_dirs_removed=%d "
         "memory_hard_deleted=%d workspaces_hard_deleted=%d "
         "workspaces_pending_archive=%d tenant_users_hard_deleted=%d "
@@ -208,6 +212,16 @@ def log_done(report: CleanupReport) -> None:
         report.conversation_dirs_failed,
         report.conversation_tool_results_skipped_artifact,
         report.conversation_dirs_raced,
+        report.agent_root_files_removed,
+        report.agent_root_dirs_removed,
+        report.shared_dirs_removed,
+        report.agent_root_failed,
+        report.agent_root_skipped_unknown,
+        report.agent_root_skipped_symlinks,
+        report.agent_root_skipped_changed,
+        report.agent_file_version_dirs_dropped,
+        report.agent_file_versions_capped,
+        report.agent_file_versions_failed,
         report.thread_dirs_removed,
         report.memory_hard_deleted,
         report.workspaces_hard_deleted,
@@ -322,6 +336,8 @@ async def _amain() -> int:
             upload_retention_days=settings.upload_retention_days,
             conversation_workspace_retention_days=(settings.conversation_workspace_retention_days),
             conversation_workspace_batch_size=settings.conversation_workspace_batch_size,
+            shared_delete_after=settings.shared_delete_after,
+            agent_root_cutover=settings.agent_root_cutover,
             thread_store=thread_store,
             run_store=run_store,
             workspace_root=workspace_root,

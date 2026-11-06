@@ -1,0 +1,21 @@
+# B-284 —— 留存作业 agent 根存量清理的切换时刻 T(这个环境 B-236 上线的时刻)。
+# 固定的历史事实,不随发布改;不设 = 那一步什么都不做。写进 overlay 而不是
+# kubectl set env:手设的 env 会漂、重建 CronJob 时会丢。
+# 来源:测试集群 B-236 镜像 44b8260a3 的 ReplicaSet 创建于 2026-10-30T15:48:08Z(= 23:48:08 CST),向下取整到分钟:比滚动开始早,只会少删。
+# 规则与验收见 docs/runbooks/pending-test-release-acceptance.md §98。
+# EXPERT_WORK_RETENTION_SHARED_DELETE_AFTER 故意不在这里:那是发布当天(通知深护
+# 之后)才设的闸,见 §98.9 与 production-release.md「下一班」。
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: retention-cleanup
+spec:
+  jobTemplate:
+    spec:
+      template:
+        spec:
+          containers:
+            - name: retention-cleanup
+              env:
+                - name: EXPERT_WORK_RETENTION_AGENT_ROOT_CUTOVER
+                  value: "2026-10-30T23:48:00+08:00"

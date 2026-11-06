@@ -171,3 +171,32 @@ def test_conversation_workspace_defaults_to_90_days_and_500_per_run() -> None:
     settings = RetentionCleanupSettings(_env_file=None)  # type: ignore[call-arg]
     assert settings.conversation_workspace_retention_days == FILE_RETENTION_DEFAULT_DAYS
     assert settings.conversation_workspace_batch_size == 500
+
+
+def test_the_b284_gates_are_kept_raw_and_parsed_strictly(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """B-284 —— 两道闸原样存字符串(写错不让作业起不来),由 ``agent_roots`` 严格解析:日期只认
+    ``YYYY-MM-DD``(数字不当 unix 时间)、切换时刻必须带时区。"""
+    from datetime import UTC, datetime
+
+    from retention_cleanup_job.agent_roots import parse_cutover, parse_shared_delete_after
+
+    unset = RetentionCleanupSettings(_env_file=None)  # type: ignore[call-arg]
+    assert (unset.shared_delete_after, unset.agent_root_cutover) == (None, None)
+    monkeypatch.setenv("EXPERT_WORK_RETENTION_SHARED_DELETE_AFTER", "20261201")
+    monkeypatch.setenv("EXPERT_WORK_RETENTION_AGENT_ROOT_CUTOVER", "2026-10-30T23:48:00+08:00")
+    settings = RetentionCleanupSettings(_env_file=None)  # type: ignore[call-arg]
+    assert settings.shared_delete_after == "20261201"
+
+    assert parse_shared_delete_after("2026-12-06") == (datetime(2026, 12, 6, tzinfo=UTC), None)
+    assert parse_shared_delete_after("") == (None, None)
+    for bad in ("20261201", "2026/12/01", "2026-02-30", "2026-11-05", "1"):
+        when, problem = parse_shared_delete_after(bad)
+        assert when is None and problem is not None, bad
+    when, problem = parse_cutover(settings.agent_root_cutover)
+    assert problem is None and when is not None
+    assert when.astimezone(UTC) == datetime(2026, 10, 30, 15, 48, tzinfo=UTC)
+    for bad in ("1730303460", "2026-10-30T23:48:00", "not a time"):
+        when, problem = parse_cutover(bad)
+        assert when is None and problem is not None, bad

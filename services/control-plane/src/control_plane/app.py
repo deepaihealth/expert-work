@@ -889,8 +889,9 @@ def create_app(
     # 端点的同一口径),orchestrator 那侧只有 Protocol,这里注入。
     resolved_agent_runtime.thread_stats_recorder = ThreadStatsRecorderImpl(threads=resolved_threads)
     # B-236 第三层 —— /agent 文件的版本放在 NAS 上用户根旁边;只有 NAS 后端有。
+    # B-284 —— 登记成产物的文件不再留版本(每一版都有产物副本)。
     resolved_agent_runtime.agent_file_versions = build_agent_file_version_store(
-        resolved_workspace_store
+        resolved_workspace_store, resolved_artifact_store
     )
     # Late-bound PII resolver: lets the audit logger reference
     # tenant_config without forcing it to exist yet (D.2 cycle break).

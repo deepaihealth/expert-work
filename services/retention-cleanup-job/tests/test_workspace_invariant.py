@@ -82,6 +82,10 @@ def _stub_sql_passes(job: RetentionCleanupJob) -> None:
 
     job._sweep_conversation_dirs = _conversations  # type: ignore[method-assign]
 
+    # B-284 —— agent 根存量与 ``/agent`` 文件版本那两条**不打桩**:这里没设切换时刻 / ``shared/``
+    # 日期(部署的默认),它们必须什么都不碰,不变式的差集照样逐字成立。设了之后的不变式在
+    # ``test_agent_roots.py::test_only_the_pre_switch_stock_goes``。
+
 
 def _write(root: Path, tenant: UUID, user: UUID, rel: str) -> Path:
     target = root / str(tenant) / str(user) / rel

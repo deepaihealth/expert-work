@@ -735,6 +735,23 @@ class SqlArtifactStore(ArtifactStore):
             rows = (await session.execute(stmt)).scalars().all()
         return [_row_to_version(row) for row in rows]
 
+    async def snapshotted_digests(
+        self, *, tenant_id: UUID, user_id: UUID, path_prefix: str
+    ) -> dict[str, set[str]]:
+        stmt = select(ArtifactVersionRow.path_in_workspace, ArtifactVersionRow.sha256).where(
+            ArtifactVersionRow.tenant_id == tenant_id,
+            ArtifactVersionRow.user_id == user_id,
+            ArtifactVersionRow.snapshot_key.is_not(None),
+            ArtifactVersionRow.sha256.is_not(None),
+            ArtifactVersionRow.path_in_workspace.startswith(path_prefix, autoescape=True),
+        )
+        async with self._sf() as session:
+            rows = (await session.execute(stmt)).all()
+        out: dict[str, set[str]] = {}
+        for path, digest in rows:
+            out.setdefault(path, set()).add(digest)
+        return out
+
     async def count_for_agent(self, *, tenant_id: UUID, agent_key: str) -> int:
         if not agent_key:
             raise ValueError("agent_key must be non-empty")
