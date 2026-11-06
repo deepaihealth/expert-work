@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import os
 import time
 from pathlib import Path
@@ -35,14 +36,16 @@ class _World:
         path.write_text("src")
         return path
 
-    def versions(self, rel: str, count: int = 1, user: UUID | None = None) -> Path:
+    def versions(
+        self, rel: str, count: int = 1, user: UUID | None = None, dir_name: str | None = None
+    ) -> Path:
         file_dir = (
             self.root
             / str(self.tenant)
             / ".agent-file-versions"
             / str(user or self.user)
             / _KEY
-            / f"{abs(hash(rel)):032x}"[:32]
+            / (dir_name or hashlib.sha256(rel.encode()).hexdigest()[:32])
         )
         file_dir.mkdir(parents=True)
         (file_dir / "path").write_text(rel)
@@ -193,3 +196,29 @@ def test_leftover_tmp_files_are_removed_after_an_hour(world: _World) -> None:
     world.sweep(days_ahead=0.05)  # 72 minutes later
     assert not (file_dir / ".tmp-abc").exists()
     assert (file_dir / f"v{0:08d}-{'0' * 64}").exists()
+
+
+@pytest.mark.parametrize("rel", ["notes.md ", " notes.md", "tpl/ a .md "])
+def test_a_live_source_whose_name_has_edge_spaces_is_not_missing(world: _World, rel: str) -> None:
+    """M3 —— 文件名首尾的空格是合法的:``path`` 原样用,不 ``strip``;活文件不会被判成「不见」,
+    满 30 天也不删它的历史。"""
+    world.source(rel)
+    file_dir = world.versions(rel)
+
+    for day in (0, 31, 62):
+        world.sweep(days_ahead=day)
+
+    assert file_dir.is_dir()
+    assert not (file_dir / "missing").exists()
+
+
+def test_a_path_that_does_not_match_its_dir_name_is_unknown(world: _World) -> None:
+    """M3 —— ``path`` 与目录名(源路径 sha256 前 32 位)对不上(写了一半 / 坏了)= 不知道:不记标记、
+    不删,同 orchestrator 的 ``_valid_path``。"""
+    file_dir = world.versions("gone.md", dir_name="0" * 32)
+
+    for day in (0, 31, 62):
+        world.sweep(days_ahead=day)
+
+    assert file_dir.is_dir()
+    assert not (file_dir / "missing").exists()

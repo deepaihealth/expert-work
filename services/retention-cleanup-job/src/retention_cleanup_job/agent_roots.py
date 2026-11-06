@@ -5,25 +5,27 @@ B-236 之后新对话都写进自己的 ``threads/<会话>/work/``,agent 根(``a
 那是一批**固定的存量**。
 
 **切换时刻 ``T`` 钉死在配置里**(``EXPERT_WORK_RETENTION_AGENT_ROOT_CUTOVER``,带时区的 ISO 时间,
-每个环境填 B-236 上线的时刻;没设 = 整条不跑)。不从库里现算:清除最早的那段对话会让
-``min(created_at)`` 往后挪(多删),老对话被迁成对话视图(B-262 P3)又会让它往前挪(功能悄悄关掉)。
+每个环境填 B-236 上线的时刻,写在 overlay 里;没设 = 整条不跑;晚于现在 = 写错了,记
+``config_invalid``、不跑)。不从库里现算:清除最早的那段对话会让 ``min(created_at)`` 往后挪(多删),
+老对话被迁成对话视图(B-262 P3)又会让它往前挪(功能悄悄关掉)。
 
-**「早于 T」看 ``max(st_mtime, st_ctime)``。** mtime 用户态随便设(``unzip`` / ``tar`` / ``cp -p`` /
-``rsync -a`` / ``mv`` / ``touch -d``,开场复制自己也保留 mtime),T 之后放进 ``/agent`` 的文件完全
-可以带着老 mtime;ctime 用户态改不了,只会往「更新」那边走 —— 判错的方向是少删。
+**「早于 T」与「满天数」都看 ``max(st_mtime, st_ctime)``。** mtime 用户态随便设(``unzip`` /
+``tar`` / ``cp -p`` / ``rsync -a`` / ``mv`` / ``touch -d``,开场复制自己也保留 mtime),T 之后放进
+``/agent`` 的文件完全可以带着老 mtime;ctime 用户态改不了,只会往「更新」那边走 —— 判错的方向是少删。
 
 * **顶层文件**:``max(mtime, ctime)`` 早于 ``T``、也早于「现在 - 租户的 ``artifact_retention_days``
-  (默认 90)」、没有登记成产物(任何一版指着它)→ 删。天数同样看 ``max(mtime, ctime)``:``T`` 之前
-  解压出来、带着几年前 mtime 的文件,从写下那天起满天数才删,不是第一晚就删。删之前按判定时看到的
-  ``(st_dev, st_ino)`` 再核对一次(``remove_entry(expect=…)``)。
-* **子目录**:整棵树(含目录自己)每一项的 ``max(mtime, ctime)`` 都早于 ``T``、里面没有登记成产物的
-  文件、且这个用户在这个 agent 下闲置(最后一次 run 与这棵树最晚的 ``max(mtime, ctime)`` 里较晚的
-  那个)满同样天数 → 先改名成 ``.retention-hold-<随机>``(同一个目录里一次 ``rename``,之后沙箱按原名
-  找不到它),再走一遍这棵树确认还都早于 ``T``(改名只动目录自己的 ctime,它按 mtime 看),再按改名前
-  的 inode 删。复查不过就改回原名(原名已被占就留着改名后的样子,计失败)。上一轮删到一半被杀留下的
-  ``.retention-hold-*`` 下一轮按同样的判据删完(判据不成立就留着、打
-  ``retention.agent_root_hold_left``)。
-* **永不碰**:点开头的名字(作业自己的 ``.retention-hold-*`` 除外)、长期记忆文件(``AGENT_NOTES.md``、
+  (默认 90)」、没有登记成产物(任何一版指着它)→ 删。``T`` 之前解压出来、带着几年前 mtime 的
+  文件,从写下那天起满天数才删。删之前那一次 ``lstat`` 再核对:还是判定时那个 ``(st_dev, st_ino)``、
+  ``max(mtime, ctime)`` 还早于 ``T``(``remove_entry(expect=…, accept=…)``),不是就不删
+  (``skipped_changed``)。
+* **子目录**:整棵树(含目录自己)每一项的 ``max(mtime, ctime)`` 都早于 ``T``(碰到第一项不早于
+  ``T`` 的就停)、里面没有登记成产物的文件、且这个用户在这个 agent 下闲置(最后一次 run 与这棵树
+  最晚的那一项里较晚的那个)满同样天数 → 按判定时的 inode **改名挪进隔离区**
+  ``{tenant}/.purged-agents/{user}/<原名>-<秒>-<随机>``(沙箱挂不到;满 7 天由隔离区那一条删,在那
+  之前可以挪回),在那里再走一遍这棵树确认还都早于 ``T``(目录自己的 ctime 是改名时的,按 mtime
+  看),不是就挪回原名(原名已被占就留在隔离区,计失败)。这条分支早先版本留在 agent 根里的
+  ``.retention-hold-*`` 同样挪进隔离区。
+* **永不碰**:点开头的名字(上面那种 ``.retention-hold-*`` 除外)、长期记忆文件(``AGENT_NOTES.md``、
   老视图投影的 ``MEMORY.md`` / ``PLAN.md`` / ``TODO.md``)、平台目录(``threads`` / ``uploads`` /
   ``inputs`` / ``.tool_results`` / ``skills`` / ``shared`` / ``agents``)、符号链接、``T`` 之后改过的
   任何东西、登记成产物的文件(B-63 管)。
@@ -33,8 +35,8 @@ B-236 之后新对话都写进自己的 ``threads/<会话>/work/``,agent 根(``a
   记错误、只跳过 ``shared/`` 这一步(整个作业照跑)。沙箱挂载与 ``shared:`` 前缀在目录不在时本来就
   容忍(``exec_view`` 不挂、文件工具读不到),所以代码留到删除之后另拆:到期之前照常能读。
 
-删除一律走 :func:`~expert_work.persistence.workspace.safe_remove.remove_entry`(逐段 ``O_NOFOLLOW``,
-删不掉挪隔离区)。每一项单独 ``try``:失败计数(这条 pass 记失败),不影响别的。已软删的用户整棵跳过。
+路径一律逐段 ``O_NOFOLLOW`` 打开(:mod:`expert_work.persistence.workspace.safe_remove`)。每一项单独
+``try``:失败计数(这条 pass 记失败),不影响别的。已软删的用户整棵跳过。
 """
 
 from __future__ import annotations
@@ -48,12 +50,13 @@ from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import UTC, date, datetime
 from pathlib import Path
-from uuid import UUID, uuid4
+from uuid import UUID
 
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from expert_work.persistence import (
+    PURGED_AGENTS_DIR,
     WORKSPACE_AGENTS_DIR,
     WORKSPACE_INPUTS_DIR,
     WORKSPACE_OVERFLOW_DIR,
@@ -72,8 +75,9 @@ from expert_work.persistence.workspace.safe_remove import (
     QUARANTINED,
     REMOVED,
     UNLINKED,
-    open_dir_chain,
+    quarantine_entry,
     remove_entry,
+    restore_quarantined,
 )
 from expert_work.protocol.agent_key import sanitize_agent_key
 from retention_cleanup_job.workspace_files import (
@@ -231,14 +235,19 @@ def _touched(info: os.stat_result) -> float:
     return max(info.st_mtime, info.st_ctime)
 
 
-def _subtree_touched(path: Path, *, top_ctime: bool = True) -> float | None:
+def _subtree_touched(
+    path: Path, *, top_ctime: bool = True, stop_at: float | None = None
+) -> float | None:
     """整棵树(含它自己)最晚的 ``max(mtime, ctime)``;不跟链接;项数超过上限或读不了 → ``None``
-    (不知道)。``top_ctime=False``:目录自己只看 mtime(它的 ctime 是我们改名时的)。"""
+    (不知道)。``top_ctime=False``:目录自己只看 mtime(它的 ctime 是我们改名时的)。``stop_at``:
+    一碰到不早于它的项就停、回那一项的时刻(判「全在 T 之前」用不着走完整棵树)。"""
     try:
         top = os.lstat(path)
     except OSError:
         return None
     newest = _touched(top) if top_ctime else top.st_mtime
+    if stop_at is not None and newest >= stop_at:
+        return newest
     stack = [path]
     seen = 0
     while stack:
@@ -251,6 +260,8 @@ def _subtree_touched(path: Path, *, top_ctime: bool = True) -> float | None:
                         return None
                     info = entry.stat(follow_symlinks=False)
                     newest = max(newest, _touched(info))
+                    if stop_at is not None and newest >= stop_at:
+                        return newest
                     if stat.S_ISDIR(info.st_mode):
                         stack.append(Path(entry.path))
         except OSError:
@@ -263,8 +274,9 @@ def _parts(tenant: UUID, user: UUID, key: str) -> list[str]:
 
 
 def _remove_file(
-    root: str, tenant: UUID, user: UUID, key: str, name: str, info: os.stat_result
+    root: str, tenant: UUID, user: UUID, key: str, name: str, info: os.stat_result, cutover: float
 ) -> str:
+    """按判定时的 inode 删;删之前那一次 ``lstat`` 再要求 ``max(mtime, ctime)`` 还早于 ``T``。"""
     return remove_entry(
         root,
         _parts(tenant, user, key),
@@ -272,6 +284,7 @@ def _remove_file(
         tenant_id=tenant,
         owner_id=user,
         expect=(info.st_dev, info.st_ino),
+        accept=lambda now: _touched(now) < cutover,
     )
 
 
@@ -282,67 +295,38 @@ def _remove_dir(
     key: str,
     name: str,
     info: os.stat_result,
-    agent_dir: Path,
     cutover: float,
 ) -> str:
-    """改名 → 复查 → 按 inode 删(见模块头)。返回 ``remove_entry`` 的结果或 :data:`CHANGED`。"""
-    fd, _outcome = open_dir_chain(root, _parts(tenant, user, key))
-    if fd is None:
-        return CHANGED
-    hold = f"{_HOLD_PREFIX}{uuid4().hex}"
-    try:
-        now_info = os.lstat(name, dir_fd=fd)
-        if (now_info.st_dev, now_info.st_ino) != (info.st_dev, info.st_ino):
-            return CHANGED
-        os.rename(name, hold, src_dir_fd=fd, dst_dir_fd=fd)
-        newest = _subtree_touched(agent_dir / hold, top_ctime=False)
-        if newest is None or newest >= cutover:
-            try:
-                os.lstat(name, dir_fd=fd)
-            except FileNotFoundError:
-                os.rename(hold, name, src_dir_fd=fd, dst_dir_fd=fd)
-                return CHANGED
-            msg = f"{name!r} was recreated while held; left as {hold!r}"
-            raise OSError(msg)
-    finally:
-        os.close(fd)
-    return remove_entry(
-        root,
-        _parts(tenant, user, key),
-        hold,
-        tenant_id=tenant,
-        owner_id=user,
-        expect=(info.st_dev, info.st_ino),
+    """按判定时的 inode 改名挪进隔离区 → 在那里再走一遍这棵树(还都早于 ``T`` 吗)→ 不是就挪回原处。
+
+    隔离区 ``{tenant}/.purged-agents/{user}/`` 沙箱挂不到;留下的满 7 天由隔离区那一条删,在那之前能
+    挪回。返回 :data:`QUARANTINED` / :data:`CHANGED`(或 :func:`quarantine_entry` 的别的结果)。"""
+    parts = _parts(tenant, user, key)
+    outcome, parked = quarantine_entry(
+        root, parts, name, tenant_id=tenant, owner_id=user, expect=(info.st_dev, info.st_ino)
     )
+    if outcome != QUARANTINED or parked is None:
+        return outcome
+    held = Path(root) / str(tenant) / PURGED_AGENTS_DIR / str(user) / parked
+    newest = _subtree_touched(held, top_ctime=False, stop_at=cutover)
+    if newest is not None and newest < cutover:
+        return QUARANTINED
+    if restore_quarantined(root, parts, name, tenant_id=tenant, owner_id=user, parked=parked):
+        return CHANGED
+    msg = f"{name!r} was recreated while held; left in quarantine as {parked!r}"
+    raise OSError(msg)
 
 
-def _finish_hold(
-    root: str,
-    tenant: UUID,
-    user: UUID,
-    key: str,
-    entry: os.DirEntry[str],
-    ctx: _Context,
-    last_run: float,
-    horizon: float,
-    tally: AgentRootTally,
+def _park_legacy_hold(
+    root: str, tenant: UUID, user: UUID, key: str, entry: os.DirEntry[str], tally: AgentRootTally
 ) -> None:
-    """上一轮改了名、没删完就被杀掉留下的 ``.retention-hold-*``:同样的判据(目录自己只看 mtime,
-    它的 ctime 是我们改名时的)还成立就删完;不成立就留着、打日志让人去看(原名已不知道)。"""
+    """这条分支早先的版本在 agent 根里留下的 ``.retention-hold-*``(已经判过要删、没删完):挪进
+    隔离区(7 天后删,在那之前能挪回)。测试 / 生产都没跑过那个版本,这里只是兜底。"""
     try:
         info = entry.stat(follow_symlinks=False)
         if not stat.S_ISDIR(info.st_mode):
             return
-        newest = _subtree_touched(Path(entry.path), top_ctime=False)
-        if newest is None or newest >= ctx.cutover or max(newest, last_run) >= horizon:
-            logger.warning(
-                "retention.agent_root_hold_left tenant=%s user=%s name=%s",
-                tenant,
-                user,
-                entry.name,
-            )
-            return
-        outcome = remove_entry(
+        outcome, _parked = quarantine_entry(
             root,
             _parts(tenant, user, key),
             entry.name,
@@ -350,7 +334,7 @@ def _finish_hold(
             owner_id=user,
             expect=(info.st_dev, info.st_ino),
         )
-        tally.dirs_removed += int(outcome in _GONE)
+        tally.dirs_removed += int(outcome == QUARANTINED)
     except Exception as exc:
         tally.failed += 1
         logger.warning(
@@ -384,7 +368,7 @@ def _sweep_agent_root(
     for entry in entries:
         name = entry.name
         if name.startswith(_HOLD_PREFIX):
-            _finish_hold(root, tenant, user, key, entry, ctx, last_run, horizon, tally)
+            _park_legacy_hold(root, tenant, user, key, entry, tally)
             continue
         if name.startswith(".") or name in RESERVED_NAMES:
             continue
@@ -395,21 +379,19 @@ def _sweep_agent_root(
             elif stat.S_ISREG(info.st_mode):
                 touched = _touched(info)
                 if touched < ctx.cutover and touched < horizon and prefix + name not in registered:
-                    outcome = _remove_file(root, tenant, user, key, name, info)
+                    outcome = _remove_file(root, tenant, user, key, name, info, ctx.cutover)
                     tally.files_removed += int(outcome in _GONE)
                     tally.skipped_changed += int(outcome == CHANGED)
             elif stat.S_ISDIR(info.st_mode):
                 if any(p.startswith(f"{prefix}{name}/") for p in registered):
                     continue
-                newest = _subtree_touched(Path(entry.path))
+                newest = _subtree_touched(Path(entry.path), stop_at=ctx.cutover)
                 if newest is None:
                     tally.skipped_unknown += 1
                     continue
                 if newest < ctx.cutover and max(newest, last_run) < horizon:
-                    outcome = _remove_dir(
-                        root, tenant, user, key, name, info, agent_dir, ctx.cutover
-                    )
-                    tally.dirs_removed += int(outcome in _GONE)
+                    outcome = _remove_dir(root, tenant, user, key, name, info, ctx.cutover)
+                    tally.dirs_removed += int(outcome == QUARANTINED)
                     tally.skipped_changed += int(outcome == CHANGED)
         except Exception as exc:
             tally.failed += 1
@@ -438,10 +420,22 @@ async def sweep_agent_roots(
     tally: AgentRootTally,
     now: datetime | None = None,
 ) -> AgentRootTally:
-    """顶层文件与子目录两条规则,``cutover`` = 钉死的切换时刻 ``T``。"""
+    """顶层文件与子目录两条规则,``cutover`` = 钉死的切换时刻 ``T``。
+
+    L2 —— ``T`` 晚于现在只可能是写错了(切换时刻是过去的事;钉在将来等于把将来写进 ``/agent`` 的
+    东西都当存量):记 ``retention.config_invalid``、这一步不跑、记失败。"""
+    current = now or datetime.now(UTC)
+    if cutover > current:
+        logger.error(
+            "retention.config_invalid env=EXPERT_WORK_RETENTION_AGENT_ROOT_CUTOVER value=%r "
+            "problem=later than now",
+            cutover.isoformat(),
+        )
+        tally.failed += 1
+        return tally
     ctx = _Context(
         cutover=cutover.timestamp(),
-        now=(now or datetime.now(UTC)).timestamp(),
+        now=current.timestamp(),
         default_days=default_days,
         tenant_days=await _tenant_days(sf),
     )

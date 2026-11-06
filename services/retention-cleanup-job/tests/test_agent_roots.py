@@ -119,6 +119,12 @@ class _World:
             p=f"agents/{_KEY}/{rel}",
         )
 
+    def quarantine(self) -> Path:
+        """这个用户的隔离区 ``{tenant}/.purged-agents/{user}/``(没有就建一个空的,方便比较)。"""
+        path = self.root / str(self.tenant) / ".purged-agents" / str(self.user)
+        path.mkdir(parents=True, exist_ok=True)
+        return path
+
     def agent(self, tenant: UUID | None = None) -> Path:
         return self.root / str(tenant or self.tenant) / str(self.user) / "agents" / _KEY
 
@@ -193,9 +199,9 @@ def _iso(delta_days: float) -> str:
     return (datetime.now(UTC) + timedelta(days=delta_days)).isoformat()
 
 
-#: 测试里的文件都是刚建的(ctime = 现在),mtime 最晚拨到 ``_LATER`` 天之后:要它们都算「T 之前」,
-#: T 钉在比那还远的将来。
-_FUTURE_T = _iso(2 * _LATER)
+#: 测试里的文件都是刚建的(ctime = 现在),mtime 最晚拨到 ``_LATER`` 天之后差 5 天:要它们都算「T
+#: 之前」,T 钉在那之后、但不晚于 agent 根这一步的「现在」(L2:晚于现在的 T 是写错了)。
+_FUTURE_T = _iso(_LATER - 1 / 24)
 
 
 @pytest.mark.asyncio
@@ -321,12 +327,12 @@ async def test_the_days_count_from_when_a_file_was_written_not_from_a_copied_mti
         tree = world.put("extracted/a.md", age_days=1000).parent
         world.age(tree, 1000)
 
-        soon = await world.job(agent_root_cutover=_FUTURE_T, now=time.time() + 10 * _DAY).run_once()
+        soon = await world.job(agent_root_cutover=_iso(5), now=time.time() + 10 * _DAY).run_once()
 
         assert unzipped.exists() and tree.exists()
         assert (soon.agent_root_files_removed, soon.agent_root_dirs_removed) == (0, 0)
 
-        later = await world.job(agent_root_cutover=_FUTURE_T).run_once()  # ctime now 100 days old
+        later = await world.job(agent_root_cutover=_iso(5)).run_once()  # ctime now 100 days old
 
         assert not unzipped.exists() and not tree.exists()
         assert (later.agent_root_files_removed, later.agent_root_dirs_removed) == (1, 1)
@@ -356,7 +362,10 @@ async def test_template_dirs_from_before_the_switch_go_once_the_agent_is_idle(
         assert mixed.exists()
         assert with_artifact.exists()
         assert report.agent_root_dirs_removed == 1
-        assert not any(p.name.startswith(".retention-hold-") for p in world.agent().iterdir())
+        # L1 —— moved out of the sandbox-visible /agent into the 7-day quarantine, not deleted yet
+        assert [p.name.split("-")[0] for p in world.quarantine().iterdir()] == ["tpl"]
+        assert (next(world.quarantine().iterdir()) / "a" / "b.md").read_text() == "tpl/a/b.md"
+        assert not any(p.name.startswith(".") for p in world.agent().iterdir())
     finally:
         await world.engine.dispose()
 
@@ -376,9 +385,11 @@ async def test_a_dir_that_changes_while_held_is_put_back(
         real = agent_roots._subtree_touched
         calls: list[bool] = []
 
-        def _touched(path: Path, *, top_ctime: bool = True) -> float | None:
+        def _touched(
+            path: Path, *, top_ctime: bool = True, stop_at: float | None = None
+        ) -> float | None:
             calls.append(top_ctime)
-            found = real(path, top_ctime=top_ctime)
+            found = real(path, top_ctime=top_ctime, stop_at=stop_at)
             if found is None or top_ctime:
                 return found
             return time.time() + 3 * _LATER * _DAY  # the re-walk sees a post-T entry
@@ -390,34 +401,24 @@ async def test_a_dir_that_changes_while_held_is_put_back(
         assert calls == [True, False]
         assert tpl.exists() and (tpl / "t.md").exists()
         assert report.agent_root_skipped_changed == 1
-        assert not any(p.name.startswith(".retention-hold-") for p in world.agent().iterdir())
+        assert list(world.quarantine().iterdir()) == []
     finally:
         await world.engine.dispose()
 
 
 @pytest.mark.asyncio
-async def test_a_hold_dir_left_by_a_killed_run_is_finished_next_time(
-    world: _World, caplog: pytest.LogCaptureFixture
-) -> None:
-    """M2 —— 改了名、没删完作业就被杀:下一轮按同样的判据删完;判据不成立(里面有新近的东西)
-    就留着、打日志。"""
+async def test_a_legacy_hold_dir_is_moved_to_quarantine(world: _World) -> None:
+    """L1 —— 这条分支早先的版本在 ``/agent`` 里留下的 ``.retention-hold-*``(已经判过要删):挪进
+    沙箱看不到的隔离区,不再留在 ``/agent`` 里。"""
     try:
-        idle = world.thread(age_days=300, layout="agent_root")
-        world.run(idle, age_days=100)
         left = world.put(".retention-hold-dead/a/b.md", age_days=100).parent.parent
-        for path in (left / "a", left):
-            world.age(path, 100)
-        busy = world.put(".retention-hold-busy/n.md", age_days=5).parent
-        world.age(busy, 100)
 
-        with caplog.at_level("WARNING"):
-            report = await world.job(agent_root_cutover=_FUTURE_T).run_once()
+        report = await world.job(agent_root_cutover=_FUTURE_T).run_once()
 
         assert not left.exists()
-        assert busy.exists() and (busy / "n.md").exists()
+        parked = [p.name for p in world.quarantine().iterdir()]
+        assert len(parked) == 1 and parked[0].startswith(".retention-hold-dead-")
         assert report.agent_root_dirs_removed == 1
-        assert "retention.agent_root_hold_left" in caplog.text
-        assert ".retention-hold-busy" in caplog.text
     finally:
         await world.engine.dispose()
 
@@ -477,7 +478,11 @@ async def test_only_the_pre_switch_stock_goes(world: _World) -> None:
             f"{base}/{_KEY}/tpl/a.md",
             f"{base}/other-agent/stale.txt",
         }
-        assert after - before == set()
+        # the sub-directory went to the 7-day quarantine, outside every sandbox mount
+        held = f"{world.tenant}/.purged-agents/{world.user}"
+        added = after - before
+        (parked,) = (p for p in added if p.startswith(f"{held}/tpl-") and p.count("/") == 3)
+        assert added == {f"{world.tenant}/.purged-agents", held, parked, f"{parked}/a.md"}
         assert report.failed_passes == ()
     finally:
         await world.engine.dispose()
@@ -694,3 +699,130 @@ def test_remove_entry_refuses_a_name_that_is_no_longer_the_same_inode(tmp_path: 
         )
         == REMOVED
     )
+
+
+@pytest.mark.asyncio
+async def test_a_cutover_later_than_now_is_rejected(
+    world: _World, caplog: pytest.LogCaptureFixture
+) -> None:
+    """L2 —— 切换时刻是过去的事;晚于「现在」只可能是写错了:记 ``config_invalid``、不跑、记失败。"""
+    try:
+        old = world.put("old.txt", age_days=100)
+
+        with caplog.at_level("ERROR"):
+            report = await world.job(agent_root_cutover=_iso(_LATER + 1)).run_once()
+
+        assert old.exists()
+        assert report.agent_root_files_removed == 0
+        assert "agent_roots" in report.failed_passes
+        assert "problem=later than now" in caplog.text
+    finally:
+        await world.engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_a_file_touched_after_t_between_judging_and_unlinking_is_kept(
+    world: _World, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """L4 —— 删之前那一次 ``lstat`` 再要求 ``max(mtime, ctime)`` 还早于 ``T``(同一个 inode)。"""
+    from retention_cleanup_job import agent_roots
+
+    try:
+        target = world.put("old.txt", age_days=100)
+        real = agent_roots._remove_file
+
+        def _touch_then_remove(*args: object) -> str:
+            later = time.time() + 3 * _LATER * _DAY
+            os.utime(target, (later, later))  # written to "after T" in the meantime
+            return real(*args)  # type: ignore[arg-type]
+
+        monkeypatch.setattr(agent_roots, "_remove_file", _touch_then_remove)
+
+        report = await world.job(agent_root_cutover=_FUTURE_T).run_once()
+
+        assert target.exists()
+        assert report.agent_root_skipped_changed == 1
+    finally:
+        await world.engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_a_subtree_walk_stops_at_the_first_entry_not_before_t(
+    world: _World, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """L4 —— 判「全在 T 之前」碰到第一项不早于 ``T`` 的就停:这里目录自己就在 T 之后,一项都不用
+    再看,项数上限碰不到,不算「判不了」。"""
+    from retention_cleanup_job import agent_roots
+
+    try:
+        busy = world.put("busy/a.md", age_days=100).parent
+        world.put("busy/b.md", age_days=100)
+        later = time.time() + 3 * _LATER * _DAY
+        os.utime(busy, (later, later))
+        monkeypatch.setattr(agent_roots, "MAX_SUBTREE_ENTRIES", 1)
+
+        report = await world.job(agent_root_cutover=_FUTURE_T).run_once()
+
+        assert busy.exists()
+        assert (report.agent_root_skipped_unknown, report.agent_root_dirs_removed) == (0, 0)
+    finally:
+        await world.engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_a_file_replaced_by_a_new_inode_before_removal_is_kept(
+    world: _World, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """L5 —— 判定之后同名文件被换成了新的 inode:按判定时的 inode 核对,不删。"""
+    from retention_cleanup_job import agent_roots
+
+    try:
+        target = world.put("old.txt", age_days=100)
+        real = agent_roots._remove_file
+
+        def _swap_then_remove(*args: object) -> str:
+            target.unlink()
+            target.write_text("new")
+            return real(*args)  # type: ignore[arg-type]
+
+        monkeypatch.setattr(agent_roots, "_remove_file", _swap_then_remove)
+
+        report = await world.job(agent_root_cutover=_FUTURE_T).run_once()
+
+        assert target.read_text() == "new"
+        assert report.agent_root_skipped_changed == 1
+    finally:
+        await world.engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_a_dir_replaced_by_a_new_inode_before_removal_is_kept(
+    world: _World, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """L5 —— 子目录同样:判定之后被换成新目录,不挪进隔离区。"""
+    import shutil
+
+    from retention_cleanup_job import agent_roots
+
+    try:
+        idle = world.thread(age_days=300, layout="agent_root")
+        world.run(idle, age_days=100)
+        tpl = world.put("tpl/t.md", age_days=100).parent
+        world.age(tpl, 100)
+        real = agent_roots._remove_dir
+
+        def _swap_then_remove(*args: object) -> str:
+            shutil.rmtree(tpl)
+            (tpl / "fresh.md").parent.mkdir()
+            (tpl / "fresh.md").write_text("fresh")
+            return real(*args)  # type: ignore[arg-type]
+
+        monkeypatch.setattr(agent_roots, "_remove_dir", _swap_then_remove)
+
+        report = await world.job(agent_root_cutover=_FUTURE_T).run_once()
+
+        assert (tpl / "fresh.md").read_text() == "fresh"
+        assert report.agent_root_skipped_changed == 1
+        assert list(world.quarantine().iterdir()) == []
+    finally:
+        await world.engine.dispose()

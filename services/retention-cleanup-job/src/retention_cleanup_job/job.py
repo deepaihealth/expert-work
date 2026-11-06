@@ -40,8 +40,8 @@ NOLOGIN BYPASSRLS with the minimum delete grants).
 的会话自己的 ``threads/<会话>/`` 与它的 run 的 ``.tool_results/<run>/`` (e) B-284 切换时刻 ``T``
 之前写下、之后没再改过的 agent 根存量(:mod:`retention_cleanup_job.agent_roots`)与过了运维日期的
 ``shared/``;``T`` 之后改过的 agent 根文件/目录(``style/``、未登记文件)永不按时间触碰,长期记忆
-文件(``AGENT_NOTES.md`` / ``MEMORY.md`` / ``PLAN.md`` / ``TODO.md``)与点开头的名字(作业自己的
-``.retention-hold-*`` 除外)永不触碰。(d) 走
+文件(``AGENT_NOTES.md`` / ``MEMORY.md`` / ``PLAN.md`` / ``TODO.md``)与点开头的名字永不触碰;
+删的子目录先挪进隔离区 ``{tenant}/.purged-agents/{user}/``,满 7 天删。(d) 走
 :func:`expert_work.persistence.workspace.safe_remove.remove_entry`,其余入口在
 :mod:`retention_cleanup_job.workspace_files`。
 """

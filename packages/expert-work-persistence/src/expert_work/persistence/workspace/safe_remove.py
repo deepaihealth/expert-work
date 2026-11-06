@@ -27,6 +27,7 @@ import logging
 import os
 import stat
 import time
+from collections.abc import Callable
 from pathlib import Path
 from uuid import UUID, uuid4
 
@@ -281,11 +282,13 @@ def remove_entry(
     owner_id: UUID,
     quarantine: bool = True,
     expect: tuple[int, int] | None = None,
+    accept: Callable[[os.stat_result], bool] | None = None,
 ) -> str:
     """``rm -rf {root}/{parts…}/{name}``,按本模块开头说的规矩。
 
     B-284 —— ``expect`` 给了就先核对 ``name`` 还是那个 ``(st_dev, st_ino)``(``lstat``,不跟链接),
-    不是就回 :data:`CHANGED`、什么都不删:判定与删除之间它被换成了别的东西。
+    不是就回 :data:`CHANGED`、什么都不删:判定与删除之间它被换成了别的东西。``accept`` 给了就拿删之前
+    那一次 ``lstat`` 问它,回 ``False`` 同样是 :data:`CHANGED`(比如「还早于切换时刻吗」)。
 
     ``parts`` 以租户 id 开头、都是固定名字 / UUID;``name`` 是 UUID 或校验过的 ``agent_key``。
     返回结果常量之一;删不掉也挪不走(或 ``quarantine=False`` 时删不掉)抛
@@ -299,6 +302,8 @@ def remove_entry(
         except FileNotFoundError:
             return ABSENT
         if expect is not None and (info.st_dev, info.st_ino) != expect:
+            return CHANGED
+        if accept is not None and not accept(info):
             return CHANGED
         if stat.S_ISLNK(info.st_mode):
             os.unlink(name, dir_fd=fd)
@@ -328,14 +333,23 @@ def remove_entry(
 
 
 def quarantine_entry(
-    root: str, parts: list[str], name: str, *, tenant_id: UUID, owner_id: UUID
+    root: str,
+    parts: list[str],
+    name: str,
+    *,
+    tenant_id: UUID,
+    owner_id: UUID,
+    expect: tuple[int, int] | None = None,
 ) -> tuple[str, str | None]:
     """B-282 —— 把 ``{root}/{parts…}/{name}`` 整个**改名**挪进隔离区(一次 ``rename``,不删)。
 
     返回 ``(结果, 隔离区里的新名字)``:挪走了是 ``(QUARANTINED, 新名字)``;不在是
     ``(ABSENT, None)``;路径中途有符号链接是 ``(SKIPPED_SYMLINK, None)``。挪不动抛
     :class:`NasEntryStuckError`。之后按原路径再写的东西落进一个新目录,不会被删;挪走的那棵树
-    由 :func:`sweep_quarantine` 满 7 天删掉,在那之前可以用 :func:`restore_quarantined` 挪回。"""
+    由 :func:`sweep_quarantine` 满 7 天删掉,在那之前可以用 :func:`restore_quarantined` 挪回。
+
+    B-284 —— ``expect`` 同 :func:`remove_entry`:``name`` 已不是那个 ``(st_dev, st_ino)`` 就回
+    ``(CHANGED, None)``、不挪。"""
     fd, outcome = _open_dir_chain(root, parts)
     if fd is None:
         return outcome, None
@@ -344,6 +358,8 @@ def quarantine_entry(
             info = os.lstat(name, dir_fd=fd)
         except FileNotFoundError:
             return ABSENT, None
+        if expect is not None and (info.st_dev, info.st_ino) != expect:
+            return CHANGED, None
         if stat.S_ISDIR(info.st_mode):
             # 跨父目录改名要改写它自己的 ``..``:目录本身得可写(模型能 ``chmod 555`` 它)。
             add_owner_bits(fd, name, info)

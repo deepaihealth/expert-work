@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import contextlib
 import errno
+import hashlib
 import logging
 import math
 import os
@@ -78,6 +79,11 @@ class VersionSweepTally:
     @property
     def needs_attention(self) -> bool:
         return self.failed > 0
+
+
+def _key_of(rel: str) -> str:
+    """版本目录名 = 源路径 sha256 的前 32 位(同 orchestrator 的 ``_key_of``)。"""
+    return hashlib.sha256(rel.encode()).hexdigest()[:32]
 
 
 def _children(fd: int, pattern: re.Pattern[str]) -> list[str]:
@@ -203,8 +209,11 @@ def _one_file_dir(
     try:
         names = os.listdir(file_dir)
         found = _read_small(file_dir, _PATH_FILE)
-        rel = found[0].decode("utf-8", errors="replace").strip() if found is not None else ""
-        status = _source_status(root, tenant, user, key, rel) if rel else "unknown"
+        rel = found[0].decode("utf-8", errors="replace") if found is not None else ""
+        # 原样用(不 ``strip``:文件名首尾可以是空格);和目录名对不上(写了一半、坏了)就当「不知道」,
+        # 与 orchestrator 的 ``_valid_path`` 同一条规矩 —— 拿一条错的路径去查只会把活文件判成不见。
+        valid = bool(rel) and _key_of(rel) == name
+        status = _source_status(root, tenant, user, key, rel) if valid else "unknown"
         if status == "live":
             with contextlib.suppress(FileNotFoundError):
                 os.unlink(_MISSING_FILE, dir_fd=file_dir)
