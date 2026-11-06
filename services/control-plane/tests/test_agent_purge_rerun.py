@@ -365,7 +365,7 @@ async def test_a_conversation_without_runs_and_one_written_late_go_too(
     a trajectory a still-running run writes after the thread row went is taken by
     the second pass (today's keys)."""
     from dataclasses import replace
-    from datetime import UTC, datetime
+    from datetime import UTC, datetime, timedelta
 
     from control_plane.purge.trajectories import TrajectoryStore
     from expert_work.protocol.trajectory_keys import trajectory_key
@@ -376,6 +376,12 @@ async def test_a_conversation_without_runs_and_one_written_late_go_too(
     await world.runs.delete_by_thread(thread_id=no_runs, tenant_id=world.t1)
     meta = await world.threads.get(no_runs, tenant_id=world.t1)
     assert meta is not None and meta.created_at is not None
+    # Backdated, so the late ``today()`` pass cannot be what finds this object:
+    # only the fallback to the row's own timestamps can.
+    then = datetime.now(UTC) - timedelta(days=5)
+    meta = meta.model_copy(update={"created_at": then, "updated_at": then})
+    world.threads._rows[no_runs] = meta
+    assert meta.created_at is not None
     store = InMemoryObjectStore()
     dated_by_row = trajectory_key(
         tenant_id=world.t1, outcome="success", at=meta.created_at, thread_id=no_runs
@@ -403,7 +409,6 @@ async def test_a_conversation_without_runs_and_one_written_late_go_too(
     assert written_late
     assert await store.list_prefix("trajectories/") == []
     assert summary.deleted.get("trajectory_undatable", 0) == 0
-
 
 
 @pytest.mark.asyncio

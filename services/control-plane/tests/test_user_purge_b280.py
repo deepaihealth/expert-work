@@ -434,3 +434,37 @@ async def test_an_undatable_conversation_is_counted_and_a_late_write_goes(
     assert summary.deleted["trajectory_undatable"] == 1
     assert summary.deleted["trajectory"] >= 1
     assert await store.list_prefix("trajectories/") == []
+
+
+@pytest.mark.asyncio
+async def test_a_conversation_without_runs_is_dated_by_its_own_row(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Medium-4 —— no run rows: the days come from the thread row's own
+    ``created_at`` .. ``updated_at``. The row is backdated (and the late
+    ``today()`` pass switched off) so only that fallback can find the object."""
+    from datetime import timedelta
+
+    from control_plane.purge.trajectories import TrajectoryStore
+    from expert_work.protocol.trajectory_keys import trajectory_key
+
+    world = _World()
+    await world.seed()
+    then = datetime.now(UTC) - timedelta(days=5)
+    row = await world.threads.get(world.a_thread, tenant_id=world.tenant)
+    assert row is not None
+    world.threads._rows[world.a_thread] = row.model_copy(
+        update={"created_at": then, "updated_at": then}
+    )
+    store = InMemoryObjectStore()
+    key = trajectory_key(
+        tenant_id=world.tenant, outcome="success", at=then, thread_id=world.a_thread
+    )
+    await store.put(key, b"{}")
+    monkeypatch.setattr("control_plane.purge.trajectories.today", lambda: [])
+
+    summary = await _purge_a(world, replace(world.deps(), trajectories=TrajectoryStore(store)))
+
+    assert summary.failures == {}
+    assert "trajectory_undatable" not in summary.deleted
+    assert await store.list_prefix("trajectories/") == []

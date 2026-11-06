@@ -1766,3 +1766,46 @@ async def test_a_trajectory_that_will_not_go_fails_the_pass(
     finally:
         await app_engine.dispose()
         await worker_engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_the_report_tells_a_skipped_pass_and_a_capped_one_apart(
+    db_fixture: tuple[AsyncEngine, AsyncEngine, str],
+) -> None:
+    """B-285 High-1 / Low-4 —— through ``run_once``: no object store → the report
+    says ``trajectories_skipped`` (not "nothing to delete"); a budget spent →
+    ``trajectories_capped`` and the rest waits."""
+    from expert_work.persistence import SqlThreadMetaStore
+    from expert_work.protocol.trajectory_keys import trajectory_key
+    from expert_work.runtime.storage import InMemoryObjectStore
+    from retention_cleanup_job.main import build_session_factory
+
+    app_engine, worker_engine, _sync_admin = db_fixture
+    try:
+        sf = build_session_factory(worker_engine)
+        threads = SqlThreadMetaStore(sf)
+        skipped = await RetentionCleanupJob(
+            db_session_factory=sf, object_store=None, thread_store=threads
+        ).run_once()
+        assert skipped.trajectories_skipped
+        assert not skipped.trajectories_capped
+
+        store = InMemoryObjectStore()
+        tenant = uuid4()
+        for _ in range(3):
+            await store.put(
+                trajectory_key(
+                    tenant_id=tenant, outcome="success", at=datetime.now(UTC), thread_id=uuid4()
+                ),
+                b"{}",
+            )
+        capped = await RetentionCleanupJob(
+            db_session_factory=sf, object_store=store, thread_store=threads, batch_size=1
+        ).run_once()
+        assert not capped.trajectories_skipped
+        assert capped.trajectories_capped
+        assert capped.trajectory_orphans_removed == 1
+        assert len(await store.list_prefix("trajectories/")) == 2
+    finally:
+        await app_engine.dispose()
+        await worker_engine.dispose()

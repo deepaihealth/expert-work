@@ -401,3 +401,118 @@ def test_the_agent_purge_wires_the_trajectory_store() -> None:
     deps = build_agent_purge_deps(SimpleNamespace(app=app))  # type: ignore[arg-type]
     assert deps.trajectories is not None
     assert deps.trajectories.object_store is objects
+
+
+class _ChildListingFails(InMemoryObjectStore):
+    async def list_prefix(self, prefix: str) -> list[str]:
+        if not prefix.startswith("trajectories/"):
+            return await super().list_prefix(prefix)
+        raise TimeoutError("oss")
+
+
+@pytest.mark.asyncio
+async def test_a_sub_agent_listing_that_fails_is_a_failure() -> None:
+    """The own keys still clear, but sub-agent objects that could not even be
+    listed must not be reported as a clean delete."""
+    store = _ChildListingFails()
+    tenant, mine = uuid4(), uuid4()
+    days = run_days([_run(tenant, mine, at=_DAY1)])
+
+    with pytest.raises(TrajectoriesNotDeletedError) as info:
+        await delete_conversation_trajectories(
+            TrajectoryStore(store), tenant_id=tenant, thread_id=mine, days=days
+        )
+    assert info.value.removed == 4 * len(days)
+
+
+def _backdate(app: FastAPI, thread: UUID, at: datetime | None) -> None:
+    from expert_work.persistence import InMemoryThreadMetaStore
+
+    repo = app.state.thread_meta_repo
+    assert isinstance(repo, InMemoryThreadMetaStore)
+    repo._rows[thread] = repo._rows[thread].model_copy(update={"created_at": at, "updated_at": at})
+
+
+@pytest.mark.asyncio
+async def test_without_run_rows_the_conversations_own_row_dates_its_trajectories(
+    client: AsyncClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Medium-4 —— the row is backdated and the late ``today()`` pass is off, so
+    only the fallback to the thread row's own timestamps can find the object."""
+    resp = await client.post("/v1/sessions", json={"agent_name": _AGENT, "agent_version": "1.0.0"})
+    thread = UUID(resp.json()["data"]["thread_id"])
+    app = _app(client)
+    then = datetime.now(UTC) - timedelta(days=5)
+    _backdate(app, thread, then)
+    store = _objects(app)
+    key = await _put(store, _TENANT, thread, at=then)
+    monkeypatch.setattr("control_plane.purge.session_purge.today", lambda: [])
+
+    purged = await client.post(f"/v1/sessions/{thread}:purge")
+
+    assert purged.status_code == 200, purged.text
+    assert purged.json()["data"]["trajectory_undatable"] == 0
+    assert purged.json()["data"]["trajectories"] == 4
+    assert key not in await _left(store)
+
+
+@pytest.mark.asyncio
+async def test_an_undatable_conversation_is_reported(client: AsyncClient) -> None:
+    """Medium-4 —— no run rows and no timestamps on the row: nothing could be
+    dated, and the response says so instead of reporting a clean delete."""
+    resp = await client.post("/v1/sessions", json={"agent_name": _AGENT, "agent_version": "1.0.0"})
+    thread = UUID(resp.json()["data"]["thread_id"])
+    _backdate(_app(client), thread, None)
+
+    purged = await client.post(f"/v1/sessions/{thread}:purge")
+
+    assert purged.status_code == 200, purged.text
+    assert purged.json()["data"]["trajectory_undatable"] == 1
+
+
+class _CallOrder:
+    """Any store method: records ``(store, method)`` and returns 0."""
+
+    def __init__(self, name: str, calls: list[str]) -> None:
+        self._name, self._calls = name, calls
+
+    def __getattr__(self, method: str) -> object:
+        async def _call(*_a: object, **_kw: object) -> object:
+            self._calls.append(self._name)
+            return [] if method.startswith("list") else 0
+
+        return _call
+
+
+@pytest.mark.asyncio
+async def test_trajectories_go_before_curation_candidates() -> None:
+    """Low-6 —— the trajectories step runs before the curation candidates (which
+    point at a trajectory) are deleted."""
+    from control_plane.purge.session_purge import SessionPurgeStores, purge_thread_children
+
+    calls: list[str] = []
+    stores = SessionPurgeStores(
+        **{  # type: ignore[arg-type]
+            name: _CallOrder(name, calls)
+            for name in (
+                "feedback",
+                "quality_scores",
+                "curation_candidates",
+                "memory_dlq",
+                "user_uploads",
+                "image_uploads",
+            )
+        },
+        runs=_CallOrder("runs", calls),  # type: ignore[arg-type]
+        trajectories=TrajectoryStore(InMemoryObjectStore()),
+    )
+    meta = SimpleNamespace(created_at=_DAY1, updated_at=_DAY1)
+
+    await purge_thread_children(
+        stores,
+        tenant_id=uuid4(),
+        thread_id=uuid4(),
+        meta=meta,  # type: ignore[arg-type]
+    )
+
+    assert calls.index("runs") < calls.index("curation_candidates")
