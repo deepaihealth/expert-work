@@ -238,8 +238,8 @@ export function PlaygroundTab({ detail }: PlaygroundTabProps) {
     models: attributedModels,
   });
   const stats = useMemo(
-    () => computeSessionStats(statsInputs, rateBook),
-    [statsInputs, rateBook],
+    () => computeSessionStats(statsInputs, rateBook, agentModel?.provider ?? null),
+    [statsInputs, rateBook, agentModel],
   );
   const missing = missingRequired(promptVariables, varValues);
 

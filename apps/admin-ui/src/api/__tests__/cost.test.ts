@@ -42,7 +42,10 @@ function legacyCostCny(u: TurnUsage, rate: RateCardRecord): number {
   );
 }
 
-const AGENT = card("anthropic", "claude-sonnet-4-6", {
+// B-279 —— 这些 B-42 用例的主 Agent 卡原来写的是 anthropic,可期望值是按「输入含缓存」
+// 厂商的公式(先扣缓存命中)算的;那正是 B-279 修掉的少算。厂商改成输入含缓存的
+// deepseek,用例本意(按模型分卡计价)不变;Anthropic 的口径见文件末尾 B-279 一节。
+const AGENT = card("deepseek", "deepseek-chat", {
   input: 3_000_000,
   cacheRead: 300_000,
   output: 15_000_000,
@@ -86,7 +89,7 @@ describe("costCnyOfBuckets", () => {
     const worker = usage(3_200_000, 117_974, 900_000);
     const whole = usage(3_375_137, 123_111, 901_000);
     const cost = costCnyOfBuckets(
-      [unattributed(main), attributed("anthropic", "claude-sonnet-4-6", worker)],
+      [unattributed(main), attributed("deepseek", "deepseek-chat", worker)],
       book([AGENT]),
     );
     expect(cost).toBe(legacyCostCny(whole, AGENT));
@@ -118,17 +121,87 @@ describe("costCnyOfBuckets", () => {
 describe("costCnyOfMainLineCall (B-202)", () => {
   it("prices one main-line call at the agent's card — the same formula the turn total uses", () => {
     const u = usage(200_000, 10_000, 100_000);
-    expect(costCnyOfMainLineCall({ input: 200_000, output: 10_000, cacheRead: 100_000 }, book([AGENT]))).toBe(
+    expect(costCnyOfMainLineCall({ input: 200_000, output: 10_000, cacheRead: 100_000, cacheCreation: 0 }, book([AGENT]))).toBe(
       legacyCostCny(u, AGENT),
     );
     // A worker card in the book changes nothing: main-line usage is unattributed.
     expect(
-      costCnyOfMainLineCall({ input: 200_000, output: 10_000, cacheRead: 100_000 }, book([AGENT, WORKER])),
+      costCnyOfMainLineCall({ input: 200_000, output: 10_000, cacheRead: 100_000, cacheCreation: 0 }, book([AGENT, WORKER])),
     ).toBe(legacyCostCny(u, AGENT));
   });
 
   it("returns null without a rate book or without the agent's card", () => {
-    expect(costCnyOfMainLineCall({ input: 1, output: 1, cacheRead: 0 }, null)).toBeNull();
-    expect(costCnyOfMainLineCall({ input: 1, output: 1, cacheRead: 0 }, book([WORKER], null))).toBeNull();
+    expect(costCnyOfMainLineCall({ input: 1, output: 1, cacheRead: 0, cacheCreation: 0 }, null)).toBeNull();
+    expect(costCnyOfMainLineCall({ input: 1, output: 1, cacheRead: 0, cacheCreation: 0 }, book([WORKER], null))).toBeNull();
+  });
+});
+
+// B-279 —— 和月度计费(billing-rollup-job ``_uncached_input_tokens``,B-185)同一口径:
+// Anthropic 的 input_tokens 本来就不含缓存读写(三个数分开报),不能再扣;别的厂商
+// (OpenAI 兼容)的 input_tokens 已经包含缓存命中 / 写入,先扣掉再按各自单价算。
+// 缓存写入按「缓存写入价」计。期望值全是手算的字面量,不复用被测公式。
+describe("costCnyOfBuckets / costCnyOfMainLineCall — 按厂商区分缓存口径(B-279)", () => {
+  // 每百万 token:输入 3 元 / 缓存命中 0.3 元 / 缓存写入 3.75 元 / 输出 15 元。
+  const CLAUDE: RateCardRecord = {
+    ...card("anthropic", "claude-sonnet-4-6", { input: 3_000_000, cacheRead: 300_000, output: 15_000_000 }),
+    cache_creation_per_mtok_micros: 3_750_000,
+  };
+  // 每百万 token:输入 2 元 / 缓存命中 0.2 元 / 缓存写入 2.5 元 / 输出 8 元。
+  const DEEPSEEK: RateCardRecord = {
+    ...card("deepseek", "deepseek-chat", { input: 2_000_000, cacheRead: 200_000, output: 8_000_000 }),
+    cache_creation_per_mtok_micros: 2_500_000,
+  };
+  const withCache = (input: number, output: number, cacheRead: number, cacheCreation: number): TurnUsage => ({
+    ...usage(input, output, cacheRead),
+    cacheCreationTokens: cacheCreation,
+  });
+
+  it("Anthropic: input is NOT reduced by cache reads", () => {
+    // 输入 10k(不含缓存)+ 命中 90k + 输出 1k:
+    // 10k×3 + 90k×0.3 + 1k×15 = 30000 + 27000 + 15000 → ¥0.072
+    // (旧算法先扣命中:max(0, 10k − 90k) = 0 → ¥0.042,少算四成)
+    const cost = costCnyOfBuckets([unattributed(withCache(10_000, 1_000, 90_000, 0))], book([CLAUDE], CLAUDE));
+    expect(cost).toBeCloseTo(0.072, 12);
+  });
+
+  it("Anthropic: cache writes are priced at the cache-write rate, on top of input", () => {
+    // 输入 10k + 写入 20k + 输出 1k:10k×3 + 20k×3.75 + 1k×15 = 30000 + 75000 + 15000 → ¥0.12
+    const cost = costCnyOfBuckets([unattributed(withCache(10_000, 1_000, 0, 20_000))], book([CLAUDE], CLAUDE));
+    expect(cost).toBeCloseTo(0.12, 12);
+  });
+
+  it("non-Anthropic: input already contains the cache hits, so they come out first (unchanged)", () => {
+    // 输入 100k(其中 60k 命中)+ 输出 1k:(100k − 60k)×2 + 60k×0.2 + 1k×8 = 80000 + 12000 + 8000 → ¥0.1
+    const cost = costCnyOfBuckets([unattributed(withCache(100_000, 1_000, 60_000, 0))], book([DEEPSEEK], DEEPSEEK));
+    expect(cost).toBeCloseTo(0.1, 12);
+  });
+
+  it("non-Anthropic: a reported cache write also sits inside input — taken out, then priced at the write rate", () => {
+    // 输入 100k(含命中 60k、写入 10k):(100k − 60k − 10k)×2 + 60k×0.2 + 10k×2.5 + 1k×8
+    // = 60000 + 12000 + 25000 + 8000 → ¥0.105
+    const cost = costCnyOfBuckets([unattributed(withCache(100_000, 1_000, 60_000, 10_000))], book([DEEPSEEK], DEEPSEEK));
+    expect(cost).toBeCloseTo(0.105, 12);
+  });
+
+  it("mixed turn: Anthropic main line + DeepSeek worker — each bucket under its own provider's rule", () => {
+    // 主线(Anthropic):10k×3 + 90k×0.3 + 20k×3.75 + 1k×15 = 147000 → ¥0.147
+    // worker(DeepSeek):(100k − 60k)×2 + 60k×0.2 + 1k×8 = 100000 → ¥0.1
+    const cost = costCnyOfBuckets(
+      [
+        unattributed(withCache(10_000, 1_000, 90_000, 20_000)),
+        attributed("deepseek", "deepseek-chat", withCache(100_000, 1_000, 60_000, 0)),
+      ],
+      book([CLAUDE, DEEPSEEK], CLAUDE),
+    );
+    expect(cost).toBeCloseTo(0.247, 12);
+  });
+
+  it("one main-line call gets the same rule as the turn total", () => {
+    const tokens = { input: 10_000, output: 1_000, cacheRead: 90_000, cacheCreation: 20_000 };
+    // Anthropic 主 Agent:同上主线 → ¥0.147
+    expect(costCnyOfMainLineCall(tokens, book([CLAUDE], CLAUDE))).toBeCloseTo(0.147, 12);
+    // 同样的数放到 DeepSeek 主 Agent 上:max(0, 10k − 90k − 20k)×2 + 90k×0.2 + 20k×2.5 + 1k×8
+    // = 0 + 18000 + 50000 + 8000 → ¥0.076
+    expect(costCnyOfMainLineCall(tokens, book([DEEPSEEK], DEEPSEEK))).toBeCloseTo(0.076, 12);
   });
 });

@@ -253,6 +253,21 @@ describe("compactRowsOf", () => {
   });
 });
 
+describe("cache-write tokens on model-call rows (B-279)", () => {
+  const STEP = upd("agent", { step_count: 1, messages: [{
+    type: "ai", content: "答", response_metadata: { model_name: "claude-x" },
+    usage_metadata: { input_tokens: 300, output_tokens: 20, input_token_details: { cache_read: 9000, cache_creation: 2048 } },
+    additional_kwargs: { reasoning_content: "想" },
+  }] });
+
+  it("ledger assistant row and compact think row both carry cacheCreationTokens (the per-call cost reads it)", () => {
+    const assistant = ledgerRowsOf([STEP], INPUT).find((r): r is AssistantRow => r.kind === "assistant");
+    expect(assistant?.cacheCreationTokens).toBe(2048);
+    const think = compactRowsOf([STEP]).find((r) => r.kind === "think");
+    expect(think).toMatchObject({ kind: "think", cacheCreationTokens: 2048 });
+  });
+});
+
 describe("resolveGanttKey", () => {
   it("maps item-/tool-/worker- keys to row ids (planner merged into update_plan resolves through plannerSeq)", () => {
     const rows = ledgerRowsOf([

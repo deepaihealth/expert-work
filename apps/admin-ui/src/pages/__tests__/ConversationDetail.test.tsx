@@ -1470,6 +1470,46 @@ describe("B-202 成本按平台价目表(人民币)", () => {
     expect(screen.getByTestId("console-detail-timing").textContent).toContain("¥0.7500");
   });
 
+  // B-279 —— 缓存命中率按智能体自己的厂商算(manifest 里读到的 provider)。
+  it("system_admin:Anthropic 智能体的缓存命中率分母是 输入 + 命中 + 写入", async () => {
+    setStoredToken(jwt({ sub: "u", tenant_id: TENANT_ID, roles: ["system_admin"] }));
+    const cachedEvents: SseEvent[] = [
+      pricedEvents[0],
+      {
+        id: "1792481681000-2",
+        event: "updates",
+        data: {
+          agent: {
+            step_count: 1,
+            messages: [
+              {
+                type: "ai",
+                content: "Refund case opened",
+                usage_metadata: {
+                  input_tokens: 1_000, output_tokens: 10, total_tokens: 1_010,
+                  input_token_details: { cache_read: 9_000, cache_creation: 2_000 },
+                },
+              },
+            ],
+          },
+        },
+        rawData: "",
+        receivedAt: "",
+      },
+      pricedEvents[2],
+    ];
+    const { agentSpy } = arrange(cachedEvents);
+    agentSpy.mockResolvedValue({
+      record: {
+        ...AGENT_DETAIL.record,
+        spec: { apiVersion: "v1", kind: "Agent", spec: { model: { provider: "anthropic", name: "claude-x" } } },
+      },
+    });
+    renderPage();
+    // 9000 / (1000 + 9000 + 2000) = 75%(旧算法 900%)
+    await waitFor(() => expect(screen.getByTestId("console-stat-cache")).toHaveTextContent("75%"));
+  });
+
   it("非 system_admin:不读 manifest、不读价目表,成本照旧不显示", async () => {
     // 再带一个换了模型的子智能体:它的用量有模型归属,价目表一旦对非管理员放开
     // 就会为它发请求 —— 只靠「主线模型拿不到」挡不住。
