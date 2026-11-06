@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from datetime import datetime
 from uuid import UUID
 
@@ -244,6 +245,17 @@ class InMemoryCurationCandidateStore(CurationCandidateStore):
             cid
             for cid, r in self._rows.items()
             if r.tenant_id == tenant_id and r.agent_name == agent_name
+        ]
+        for cid in victims:
+            del self._rows[cid]
+        return len(victims)
+
+    async def delete_for_threads(self, *, tenant_id: UUID, thread_ids: Sequence[UUID]) -> int:
+        wanted = set(thread_ids)
+        victims = [
+            cid
+            for cid, r in self._rows.items()
+            if r.tenant_id == tenant_id and r.thread_id in wanted
         ]
         for cid in victims:
             del self._rows[cid]

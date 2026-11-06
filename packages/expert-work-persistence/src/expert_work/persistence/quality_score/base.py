@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import abc
+from collections.abc import Sequence
 from datetime import datetime
 from uuid import UUID
 
@@ -94,3 +95,10 @@ class QualityScoreStore(abc.ABC):
     async def delete_for_agent(self, *, tenant_id: UUID, agent_name: str) -> int:
         """B-278 —— hard-delete every row whose ``agent_name`` is exactly this
         name (agent purge). Tenant-scoped; returns the rows removed."""
+
+    # --- B-280 删除单个对话 -------------------------------------------------
+
+    @abc.abstractmethod
+    async def delete_for_threads(self, *, tenant_id: UUID, thread_ids: Sequence[UUID]) -> int:
+        """B-280 —— hard-delete the verdicts of these conversations (conversation
+        purge). Tenant-scoped; returns the rows removed."""

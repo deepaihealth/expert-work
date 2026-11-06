@@ -55,6 +55,7 @@ from control_plane.api._workspace_shared import (
     workspace_agent_path,
 )
 from control_plane.audit import emit
+from control_plane.purge.session_purge import SessionPurgeStores, purge_thread_children
 from control_plane.quota.base import QuotaService
 from control_plane.runtime import AgentRuntime
 from control_plane.tenant_scope import (
@@ -202,6 +203,20 @@ def _get_memory_writeback_jobs(request: Request) -> MemoryWritebackJobStore | No
 
 def _get_retrieval_logs(request: Request) -> KnowledgeRetrievalLogStore:
     return request.app.state.knowledge_retrieval_log_store  # type: ignore[no-any-return]
+
+
+def _get_session_purge_stores(request: Request) -> SessionPurgeStores:
+    # B-280 —— 按 ``thread_id`` 存的子数据(反馈、质量评分、评测候选、写回失败队列、上传、图片)。
+    state = request.app.state
+    return SessionPurgeStores(
+        feedback=state.feedback_store,
+        quality_scores=state.quality_score_store,
+        curation_candidates=state.curation_candidate_store,
+        memory_dlq=state.memory_writeback_dlq,
+        user_uploads=state.user_upload_store,
+        image_uploads=state.image_upload_store,
+        object_store=getattr(state, "object_store", None),
+    )
 
 
 def _get_audit(request: Request) -> AuditLogger:
@@ -1128,6 +1143,7 @@ def build_sessions_router() -> APIRouter:
             MemoryWritebackJobStore | None, Depends(_get_memory_writeback_jobs)
         ],
         retrieval_logs: Annotated[KnowledgeRetrievalLogStore, Depends(_get_retrieval_logs)],
+        child_stores: Annotated[SessionPurgeStores, Depends(_get_session_purge_stores)],
     ) -> JSONResponse:
         """Hard-delete — irreversibly purge the whole conversation.
 
@@ -1145,6 +1161,20 @@ def build_sessions_router() -> APIRouter:
         AND flagged in the audit details (``*_delete_failed``), not fatal,
         and the thread_meta row is deleted LAST so a partial failure never
         orphans the metadata.
+
+        B-280 — the rows keyed by the thread itself (feedback, quality scores,
+        curation candidates, memory-writeback DLQ, upload registry rows, image
+        rows + their object-store bytes; see ``purge.session_purge``) go right
+        after the writeback jobs. Unlike the steps below, if any of them fails
+        nothing further is deleted and the thread row is KEPT — it is the only
+        way a retry finds the conversation — and the request answers 503 (the
+        console treats any 2xx as "gone"). Not deleted: legacy-layout upload
+        files in the agent-shared ``agents/<key>/uploads/`` (other conversations
+        may use the same file; the conversation-layout ``work/uploads/`` goes
+        with ``threads/<id>/``), memories extracted from the conversation (the
+        user's, shared across conversations), its registered artifacts (B-236:
+        deleting a conversation keeps them), and the billing / audit rows
+        (``token_usage``, ``audit_log`` …; the agent purge keeps those too).
         """
         meta = await _load_owned_session(thread_id, request, threads, users)
         tenant_id: UUID = request.state.tenant_id
@@ -1183,6 +1213,31 @@ def build_sessions_router() -> APIRouter:
             except Exception:
                 logger.warning("session_purge.memory_writeback_jobs_failed", exc_info=True)
                 deleted["memory_writeback_jobs_delete_failed"] = True
+
+        # B-280 —— 按 thread_id 存的子数据。有一类没删干净:后面什么都不删、对话行留着,重跑时
+        # 还找得到这条对话(每类都可重跑);已经删掉的那部分照实记进审计。
+        children = await purge_thread_children(
+            child_stores, tenant_id=tenant_id, thread_id=thread_id
+        )
+        deleted.update(children.as_details())
+        if children.failures:
+            await emit(
+                audit,
+                tenant_id=tenant_id,
+                actor_id=request.state.actor_id,
+                action=AuditAction.SESSION_WRITE,
+                resource_type="session",
+                resource_id=str(thread_id),
+                result=AuditResult.ERROR,
+                reason="purge_incomplete",
+                trace_id=current_trace_id_hex(),
+                details={"op": "purge", "meta_removed": False, **deleted},
+            )
+            raise HTTPException(
+                status_code=503,
+                detail="some of the conversation's data could not be deleted; "
+                "the conversation was kept, retry",
+            )
 
         checkpointer = runtime.durable_checkpointer
         adelete = getattr(checkpointer, "adelete_thread", None)
