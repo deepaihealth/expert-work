@@ -367,7 +367,7 @@ async def test_an_unavailable_store_skips_the_image_pass_and_fails_the_run() -> 
         image_upload_store=images,
         object_store=store,
         object_store_unavailable="SecretNotFoundError",
-        image_retention_days=90,
+        upload_retention_days=90,
     )
 
     assert await job._delete_expired_images() == (0, 0, 0)
@@ -385,7 +385,7 @@ async def test_an_available_store_still_reaps_images() -> None:
         db_session_factory=lambda: None,  # type: ignore[arg-type]
         image_upload_store=images,
         object_store=store,
-        image_retention_days=90,
+        upload_retention_days=90,
     )
 
     assert await job._delete_expired_images() == (1, 1, 0)
