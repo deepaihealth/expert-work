@@ -168,6 +168,19 @@ describe("ManifestTab", () => {
     expect(screen.getByTestId("manifest-reset-btn")).not.toBeDisabled();
   });
 
+  // B-278 — a deleted version: the config is viewable, nothing can be written.
+  it("readOnly (deleted agent) hides save, publish and discard", async () => {
+    render(
+      <MemoryRouter>
+        <ManifestTab detail={withDraft()} onSaved={onSaved} readOnly />
+      </MemoryRouter>,
+    );
+    await screen.findByTestId("manifest-editor-edit");
+    expect(screen.queryByTestId("manifest-save-btn")).toBeNull();
+    expect(screen.queryByTestId("manifest-publish-btn")).toBeNull();
+    expect(screen.queryByTestId("manifest-discard-btn")).toBeNull();
+  });
+
   it("exposes the raw YAML escape-hatch toggle", async () => {
     renderTab();
     await screen.findByTestId("manifest-editor-edit");

@@ -230,6 +230,85 @@ export interface TranslationKeys {
     disable_failed: string;
     enable_failed: string;
   };
+  /** B-278 — deleted agent: read-only detail page, restore, purge, and the
+   *  create / fork collision with a deleted name. */
+  agent_lifecycle: {
+    deleted_banner_title: string;
+    deleted_banner_desc: string;
+    deleted_banner_desc_no_permission: string;
+    purging_banner_title: string;
+    purging_banner_desc: string;
+    purging_banner_desc_no_permission: string;
+    playground_deleted: string;
+    restore: string;
+    restore_confirm_title: string;
+    restore_confirm_body: string;
+    restore_ok: string;
+    restore_failed: string;
+    restore_triggers_title: string;
+    restore_triggers_body: string;
+    restore_triggers_cta: string;
+    restore_triggers_dismiss: string;
+    purge: string;
+    purge_title: string;
+    purge_loading: string;
+    purge_preview_failed: string;
+    purge_irreversible: string;
+    purge_versions: string;
+    purge_default_agent: string;
+    purge_counts_title: string;
+    purge_counts_none: string;
+    purge_counts_rest_zero: string;
+    purge_threads_capped: string;
+    purge_kept: string;
+    purge_blocked_title: string;
+    purge_blocked_active: string;
+    purge_blocked_referenced: string;
+    purge_type_to_confirm: string;
+    purge_timeout_hint: string;
+    purge_ok: string;
+    purge_partial_title: string;
+    purge_partial_body: string;
+    purge_partial_retry: string;
+    purge_continue: string;
+    purge_busy: string;
+    nas: {
+      nas_quarantined: string;
+      nas_symlinks_unlinked: string;
+      nas_symlinks_skipped: string;
+      nas_failed_users: string;
+    };
+    purge_failed: string;
+    duplicate_deleted: string;
+    duplicate_deleted_link: string;
+    duplicate_purging: string;
+    counts: {
+      conversations: string;
+      runs: string;
+      approvals: string;
+      feedback: string;
+      retrieval_logs: string;
+      memories: string;
+      memory_jobs: string;
+      memory_dlq: string;
+      artifacts: string;
+      artifact_versions: string;
+      triggers: string;
+      trigger_runs: string;
+      webhooks: string;
+      webhook_deliveries: string;
+      agent_instances: string;
+      quality_scores: string;
+      drift_alerts: string;
+      eval_datasets: string;
+      curation_candidates: string;
+      uploads: string;
+      images: string;
+      secret_allowlist: string;
+      revisions: string;
+      nas_users: string;
+    };
+  };
   history_tab: {
     title: string;
     select_hint: string;
@@ -3414,6 +3493,7 @@ export interface TranslationKeys {
     status_draft: string;
     status_archived: string;
     status_deleted: string;
+    status_purging: string;
     search_placeholder: string;
     filter_status: string;
     filter_status_default: string;
@@ -3921,6 +4001,100 @@ const en: TranslationKeys = {
     enable_ok: "Agent enabled.",
     disable_failed: "Failed to disable agent",
     enable_failed: "Failed to enable agent",
+  },
+  agent_lifecycle: {
+    deleted_banner_title: "This agent has been deleted",
+    deleted_banner_desc:
+      "This page is read-only. Its conversations and memories are still kept: restore it, or purge it to free the name for a new agent.",
+    deleted_banner_desc_no_permission:
+      "This page is read-only. Only a tenant admin can restore or purge it.",
+    purging_banner_title: "The last purge of this agent didn't finish",
+    purging_banner_desc:
+      "Click Purge again to finish the cleanup. It can no longer be restored, and the page is read-only.",
+    purging_banner_desc_no_permission:
+      "The page is read-only. A tenant admin needs to click Purge again to finish the cleanup.",
+    playground_deleted: "A deleted agent can't be run. Restore it to use the playground again.",
+    restore: "Restore",
+    restore_confirm_title: "Restore {{name}} v{{version}}?",
+    restore_confirm_body:
+      "It becomes usable again with its conversations and memories intact. Triggers stopped by the delete are not switched back on.",
+    restore_ok: "Restored {{name}} v{{version}}",
+    restore_failed: "Failed to restore: {{error}}",
+    restore_triggers_title: "Some triggers are still off",
+    restore_triggers_body:
+      "{{count}} scheduled task(s) (triggers) are still disabled. Turn them back on from the Triggers page.",
+    restore_triggers_cta: "Open Triggers",
+    restore_triggers_dismiss: "Got it",
+    purge: "Purge",
+    purge_title: "Purge {{name}}",
+    purge_loading: "Counting what will be removed…",
+    purge_preview_failed: "Couldn't count the data: {{error}}",
+    purge_irreversible:
+      "A purge can't be undone. Afterwards you can create a new agent with the same name.",
+    purge_versions: "Every version of this name will be removed:",
+    purge_default_agent:
+      "This is the tenant's default agent — the default-agent setting will be cleared.",
+    purge_counts_title: "Data removed with it:",
+    purge_counts_none: "No related data.",
+    purge_counts_rest_zero: "Everything else: 0.",
+    purge_threads_capped:
+      "There are more conversations than one pass handles, so the counts may be incomplete. If anything is left afterwards, click Purge again.",
+    purge_kept: "Kept: usage and billing records, audit logs.",
+    purge_blocked_title: "Can't purge yet",
+    purge_blocked_active: "Versions not deleted yet: {{versions}} (delete them first)",
+    purge_blocked_referenced:
+      "Used as a subagent by: {{refs}} (remove it from their config first)",
+    purge_type_to_confirm: "Type the agent name to confirm the purge:",
+    purge_timeout_hint:
+      "A very large agent may time out. If it times out or stops halfway, click Purge again — what's already removed isn't removed twice.",
+    purge_ok: "Purged {{name}}",
+    purge_partial_title: "Some data is still there",
+    purge_partial_body: "These steps didn't finish: {{steps}}.",
+    purge_partial_retry: "Click “Continue cleanup” to finish.",
+    purge_continue: "Continue cleanup",
+    purge_busy:
+      "Another purge of this agent is in progress, so nothing was deleted this time. Please try again later.",
+    nas: {
+      nas_quarantined:
+        "{{count}} workspace folder(s) couldn't be deleted and were moved to a holding area; they are removed after 7 days.",
+      nas_symlinks_unlinked:
+        "{{count}} workspace folder(s) were symlinks: the link was removed, its target untouched.",
+      nas_symlinks_skipped: "{{count}} symlink(s) on the way were skipped, not followed.",
+      nas_failed_users:
+        "{{count}} user(s)' workspace folder could be neither deleted nor moved; their conversations and artifacts are kept and the agent stays “purging”.",
+    },
+    purge_failed: "Purge failed: {{error}}. You can try again.",
+    duplicate_deleted:
+      "A deleted agent with the same name exists. You can restore it, or purge it and then create a new one.",
+    duplicate_deleted_link: "Open {{name}} v{{version}}",
+    duplicate_purging:
+      "An agent with the same name is being purged. Please try again later.",
+    counts: {
+      conversations: "Conversations",
+      runs: "Run records",
+      approvals: "Approvals",
+      feedback: "Feedback",
+      retrieval_logs: "Knowledge retrieval logs",
+      memories: "Memories",
+      memory_jobs: "Pending memory writes",
+      memory_dlq: "Failed memory writes",
+      artifacts: "Artifacts",
+      artifact_versions: "Artifact versions",
+      triggers: "Triggers",
+      trigger_runs: "Trigger runs",
+      webhooks: "Agent-only webhooks",
+      webhook_deliveries: "Webhook deliveries",
+      agent_instances: "User instances",
+      quality_scores: "Quality scores",
+      drift_alerts: "Quality alerts",
+      eval_datasets: "Eval datasets",
+      curation_candidates: "Eval samples",
+      uploads: "Uploaded files",
+      images: "Uploaded images",
+      secret_allowlist: "Secret grants",
+      revisions: "Config history entries",
+      nas_users: "Users with workspace files",
+    },
   },
   history_tab: {
     title: "Revision history",
@@ -7464,6 +7638,7 @@ const en: TranslationKeys = {
     status_draft: "draft",
     status_archived: "archived",
     status_deleted: "deleted",
+    status_purging: "purging (unfinished)",
     search_placeholder: "Search by name",
     filter_status: "Filter by status",
     filter_status_default: "Default (hides deleted)",
@@ -7475,9 +7650,10 @@ const en: TranslationKeys = {
     action_disable: "Disable",
     action_enable: "Enable",
     delete_title: "Delete agent",
-    delete_warning: "This deletes {{name}} v{{version}} — it cannot be undone from the UI.",
+    delete_warning:
+      "This deletes {{name}} v{{version}}. You can restore it later from its detail page.",
     delete_warning_desc:
-      "Marks it as deleted (soft delete); other versions of this agent are not affected.",
+      "Conversations, memories and other data are kept; its triggers are disabled and stay off after a restore until you re-enable them. Other versions of this agent are not affected. To remove the data too, purge it from the detail page after deleting.",
     delete_type_to_confirm: "Type the agent name to confirm deletion:",
     delete_success: "Deleted {{name}} v{{version}}",
     delete_failed: "Failed to delete agent: {{error}}",

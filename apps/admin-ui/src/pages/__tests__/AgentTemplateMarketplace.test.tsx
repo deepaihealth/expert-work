@@ -141,4 +141,50 @@ describe("AgentTemplateMarketplace page", () => {
       }),
     );
   });
+
+  // B-278 — forking onto a name held by a deleted agent: the real 409 envelope
+  // goes through the axios interceptor, and the modal explains restore / purge
+  // with a link to that agent instead of a raw error toast.
+  it("explains a clash with a deleted agent and links to it", async () => {
+    apiClient.defaults.adapter = (config) => {
+      if ((config.method ?? "").toLowerCase() === "post") {
+        const error = Object.assign(new Error("Request failed with status code 409"), {
+          isAxiosError: true,
+          config,
+          response: {
+            status: 409,
+            data: {
+              success: false,
+              data: null,
+              error: {
+                code: "MANIFEST_DUPLICATE_DELETED",
+                message: "a deleted agent with this name and version exists",
+                details: { name: "my-bot", version: "1.0.0", status: "deleted" },
+              },
+            },
+          },
+        });
+        return Promise.reject(error);
+      }
+      return Promise.resolve({
+        data: (config.url ?? "").endsWith("/agents/templates")
+          ? { success: true, data: [FREE_TEMPLATE], error: null }
+          : {},
+        status: 200,
+        statusText: "OK",
+        headers: {},
+        config,
+        request: {},
+      });
+    };
+    renderPage();
+    await waitFor(() => expect(screen.getByTestId("atm-fork-support-bot")).toBeInTheDocument());
+    fireEvent.click(screen.getByTestId("atm-fork-support-bot"));
+    fireEvent.change(await screen.findByTestId("atm-fork-name"), { target: { value: "my-bot" } });
+    fireEvent.click(screen.getAllByText("Fork").slice(-1)[0]);
+
+    const notice = await screen.findByTestId("duplicate-deleted-notice");
+    expect(notice).toHaveTextContent("A deleted agent with the same name exists");
+    expect(screen.getByTestId("duplicate-deleted-link")).toHaveTextContent("Open my-bot v1.0.0");
+  });
 });

@@ -26,7 +26,9 @@ import {
   type TemplateMarketEntry,
   type TemplateTier,
 } from "../api/agent-templates";
+import { duplicateDeletedTarget, type DuplicateDeletedTarget } from "../api/agents";
 import { ApiError } from "../api/client";
+import { DuplicateDeletedNotice } from "../components/DuplicateDeletedNotice";
 import { PageHeader } from "../components/PageHeader";
 
 const { Text, Paragraph } = Typography;
@@ -59,6 +61,9 @@ export function AgentTemplateMarketplace() {
   // The template a fork modal is currently open for (null = closed).
   const [forking, setForking] = useState<TemplateMarketEntry | null>(null);
   const [submitting, setSubmitting] = useState(false);
+  // B-278 — the chosen name clashed with a deleted / mid-purge agent; shown in
+  // the modal.
+  const [duplicateDeleted, setDuplicateDeleted] = useState<DuplicateDeletedTarget | null>(null);
 
   const refresh = useCallback(async () => {
     setLoading(true);
@@ -79,6 +84,7 @@ export function AgentTemplateMarketplace() {
   const openFork = useCallback(
     (entry: TemplateMarketEntry) => {
       form.setFieldsValue({ name: entry.name });
+      setDuplicateDeleted(null);
       setForking(entry);
     },
     [form],
@@ -88,6 +94,7 @@ export function AgentTemplateMarketplace() {
     async (values: ForkFormValues) => {
       if (!forking) return;
       setSubmitting(true);
+      setDuplicateDeleted(null);
       try {
         const result = await forkTemplate({
           template_name: forking.name,
@@ -101,7 +108,9 @@ export function AgentTemplateMarketplace() {
           `/agents/${encodeURIComponent(name)}/${encodeURIComponent(version)}/overview`,
         );
       } catch (err) {
-        message.error(errorMessage(err));
+        const deleted = duplicateDeletedTarget(err);
+        if (deleted !== null) setDuplicateDeleted(deleted);
+        else message.error(errorMessage(err));
       } finally {
         setSubmitting(false);
       }
@@ -236,6 +245,9 @@ export function AgentTemplateMarketplace() {
         onOk={() => form.submit()}
         destroyOnHidden
       >
+        {duplicateDeleted !== null && (
+          <DuplicateDeletedNotice target={duplicateDeleted} onNavigate={() => setForking(null)} />
+        )}
         <Form form={form} layout="vertical" onFinish={(v) => void submitFork(v)} requiredMark={false}>
           <Form.Item
             name="name"

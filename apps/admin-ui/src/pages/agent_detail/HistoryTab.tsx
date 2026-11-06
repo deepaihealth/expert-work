@@ -39,9 +39,11 @@ interface HistoryTabProps {
   /** Called after a successful rollback — parent refetches the record
    *  so the header SHA / updated_at reflect the new current state. */
   onRolledBack: () => void;
+  /** B-278 — a deleted version: history is viewable, rollback is hidden. */
+  readOnly?: boolean;
 }
 
-export function HistoryTab({ detail, onRolledBack }: HistoryTabProps) {
+export function HistoryTab({ detail, onRolledBack, readOnly = false }: HistoryTabProps) {
   const { t } = useTranslation();
   const { name, version } = detail.record;
   // Track C W2 — 切入态读透传:revision 读接口带 ?tenant_id=(组件内直取);
@@ -178,7 +180,7 @@ export function HistoryTab({ detail, onRolledBack }: HistoryTabProps) {
         key: "actions",
         width: 130,
         render: (_: unknown, row: RevisionSummary) =>
-          row.spec_sha256 === currentSha ? null : (
+          readOnly || row.spec_sha256 === currentSha ? null : (
             <ReadonlyTooltip on={isTenantSwitched}>
               <Popconfirm
                 title={t("history_tab.rollback_confirm_title", { revision: row.revision })}
@@ -201,7 +203,7 @@ export function HistoryTab({ detail, onRolledBack }: HistoryTabProps) {
           ),
       },
     ],
-    [t, currentSha, rollingBack, handleRollback, isTenantSwitched],
+    [t, currentSha, rollingBack, handleRollback, isTenantSwitched, readOnly],
   );
 
   return (
