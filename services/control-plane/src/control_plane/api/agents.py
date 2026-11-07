@@ -45,12 +45,12 @@ from control_plane.api._idempotency import (
     MAX_IDEMPOTENCY_KEY_LEN,
     request_digest,
 )
+from control_plane.api._new_session_undo import NewSessionUndo, discard_new_session
 from control_plane.api._quota_admission import check_admission
 from control_plane.api._run_event_stream import EXTERNAL_HIDDEN_EVENTS, make_run_probe
 from control_plane.api._run_usage import make_usage_loader
 from control_plane.api._session_title import title_from_text
 from control_plane.api._user_scope import get_user_repo
-from control_plane.api._workspace_shared import workspace_agent_path
 from control_plane.api.external_events import build_events_response
 from control_plane.api.runs import (
     MAX_RUN_IMAGE_REFS,
@@ -134,7 +134,6 @@ from expert_work.protocol import (
     parse_upload_id,
     tier_satisfies,
 )
-from expert_work.protocol.agent_key import sanitize_agent_key
 from expert_work.runtime.audit.logger import AuditLogger
 from expert_work.runtime.runs import (
     DisconnectMode,
@@ -147,9 +146,7 @@ from expert_work.runtime.runs import (
 )
 from expert_work.runtime.stream_bridge import StreamBridge
 from orchestrator import AgentFactoryError, PlatformNotConfiguredError
-from orchestrator.context.workspace_projection import thread_projection_prefix
 from orchestrator.stream_items import STREAM_FORMAT_ITEMS, STREAM_FORMAT_LEGACY
-from orchestrator.tools import WorkspaceStore
 from orchestrator.tools.registry import UnmatchedArgBinding, WorkspaceLayout
 
 logger = logging.getLogger("expert_work.control_plane.agents")
@@ -387,6 +384,7 @@ async def resolve_external_files(
     uploads_store: UserUploadStore,
     threads: ThreadMetaStore,
     copier: LandingAccount,
+    created_uploads: list[UUID] | None = None,
 ) -> tuple[list[str], list[str], dict[str, str]]:
     """``files[]`` → 内部 ``(image_refs, document_names, 原名表)``(对外附件模型统一)。
 
@@ -419,6 +417,9 @@ async def resolve_external_files(
 
     B-275 —— 第三项:落地时换过名(同名不同内容,``<原名>-<内容 sha256 前 8 位>``)的
     document → 原名,让 ``[file attached: …]`` 那一行把原名也告诉模型;没换过名的不进表。
+
+    B-293 —— ``created_uploads`` 收集跨会话复制在本会话里新建的登记行 id(中途抛错也已收集的
+    那部分)。
     """
     image_refs: list[str] = []
     document_names: list[str] = []
@@ -455,6 +456,7 @@ async def resolve_external_files(
                     threads=threads,
                     copier=copier,
                     uploads_store=uploads_store,
+                    created=created_uploads,
                 )
             document_names.append(ref)
             original = original_document_name(ref, row.sha256)
@@ -486,6 +488,7 @@ async def _copy_into_this_session(
     threads: ThreadMetaStore,
     copier: LandingAccount,
     uploads_store: UserUploadStore,
+    created: list[UUID] | None = None,
 ) -> str:
     """B-262 P1 §3 —— 别的会话的上传复制进本会话;失败翻成对外错误(码同上传端点)。"""
     target = await threads.get(thread_id, tenant_id=tenant_id)
@@ -506,6 +509,7 @@ async def _copy_into_this_session(
             ref=ref,
             source=source,
             target=target,
+            created=created,
         )
     except HTTPException as exc:
         code = _COPY_ERROR_CODES.get(exc.status_code) or UPLOAD_ERROR_CODES.get(
@@ -556,63 +560,6 @@ def external_run_bounds_error(
         f"inputs 序列化后总大小不能超过 {MAX_RUN_INPUT_TOTAL_BYTES} 字节",
         422,
     )
-
-
-async def _discard_new_session(
-    *,
-    tenant_id: UUID,
-    thread_id: UUID,
-    end_user_id: UUID,
-    agent_code: str,
-    workspace_layout: WorkspaceLayout,
-    landed_files: bool,
-    threads: ThreadMetaStore,
-    uploads_store: UserUploadStore,
-    workspace_store: WorkspaceStore | None,
-) -> None:
-    """B-293 —— 不带 ``session_id`` 的 run / 上传请求被拒(run 还没起、上传还没成功):撤掉本请求
-    刚建的会话。
-
-    不撤的话对接方每重试一次,这位用户的会话列表里就多一条空会话(测试环境 2026-11-06:
-    ``files[]`` 引用不存在的上传,404,空会话留下)。只给本请求自己建的会话用 —— 续一条已有
-    会话的请求被拒,那条会话原样不动。
-
-    ``_resolve_session`` 建会话只写 ``thread_meta`` 一行(标题也在这一行上)。``landed_files`` =
-    这个请求可能已经往新会话里落了东西:run 的 ``files[]`` 里别的会话的文档先复制进新会话
-    (``resolve_external_files``),第二条再被拒时副本已经落下;上传落盘失败时可能留下半份文件。
-    撤的是新会话名下的登记行(id 从没给过对接方,直接删,不留墓碑)和新会话自己的目录
-    (``agents/<key>/threads/<id>/``;老视图的会话落 agent 共用的 ``uploads/``,同 purge 不删)。
-
-    不撤:终端用户行与 ``agent_instance`` 绑定 —— 两者都按 ``user_id`` 幂等(重试不会多),
-    同一用户的并发请求共用它们,``POST .../sessions`` / 上传端点首次接触同样会铸。
-
-    尽力而为:每步失败只记异常类型,不改变给对接方的拒绝回包。会话行最后删;目录没删掉的
-    由留存作业的孤儿目录扫描兜(会话行不在 → 目录删)。
-    """
-    if landed_files:
-        try:
-            await uploads_store.delete_for_threads(tenant_id=tenant_id, thread_ids=[thread_id])
-        except Exception as exc:
-            logger.warning(
-                "external_run.discard_session_uploads_failed error=%s", type(exc).__name__
-            )
-        if workspace_layout == "conversation" and workspace_store is not None:
-            path = workspace_agent_path(
-                thread_projection_prefix(thread_id).rstrip("/"),
-                agent_key=sanitize_agent_key(agent_code),
-            )
-            try:
-                await workspace_store.delete_tree(
-                    tenant_id=tenant_id, user_id=end_user_id, path=path
-                )
-            except Exception as exc:
-                logger.warning(
-                    "external_run.discard_session_dir_failed error=%s", type(exc).__name__
-                )
-    try:
-        await threads.delete(thread_id, tenant_id=tenant_id)
-    except Exception as exc:
-        logger.warning("external_run.discard_session_failed error=%s", type(exc).__name__)
 
 
 class ForkTemplateRequest(BaseModel):
@@ -846,6 +793,8 @@ async def _resolve_session(
         needs_title = meta.title is None
         workspace_layout = meta.workspace_layout
     else:
+        # B-293 —— 新会话:绑定先于建会话,它出错时没有会话要撤(续会话的那一支照旧在末尾绑)。
+        await instances.touch(tenant_id=tenant_id, agent_code=agent_code, user_id=end_user_id)
         thread_id = uuid4()
         created = await threads.create(
             thread_id=thread_id,
@@ -866,7 +815,8 @@ async def _resolve_session(
             except Exception:
                 logger.warning("external_session.auto_title_failed", exc_info=True)
 
-    await instances.touch(tenant_id=tenant_id, agent_code=agent_code, user_id=end_user_id)
+    if session_id is not None:
+        await instances.touch(tenant_id=tenant_id, agent_code=agent_code, user_id=end_user_id)
     return record, thread_id, end_user_id, workspace_layout
 
 
@@ -1842,90 +1792,100 @@ def build_agents_router() -> APIRouter:
         uploads_store: UserUploadStore = request.app.state.user_upload_store
         copier = LandingAccount.from_request(request)
 
+        #: B-293 —— ``files[]`` 跨会话复制在新会话里登记的行(撤会话时算本请求自己的)。
+        own_upload_ids: list[UUID] = []
+
         async def _discard_if_new() -> None:
-            # B-293 —— 下面任何一步拒绝(还没起 run)时调:本请求自己建的会话不留。
+            # B-293 —— 下面任何一步拒绝(还没起 run)时调:本请求自己建的会话不留(有人在用就不撤,
+            # 见 ``_new_session_undo``)。
             if payload.session_id is None:
-                await _discard_new_session(
+                await discard_new_session(
+                    NewSessionUndo.from_request(request),
                     tenant_id=tenant_id,
                     thread_id=thread_id,
                     end_user_id=end_user_id,
                     agent_code=agent_code,
                     workspace_layout=workspace_layout,
                     landed_files=bool(payload.files),
-                    threads=threads,
-                    uploads_store=uploads_store,
-                    workspace_store=copier.workspace_store,
+                    own_upload_ids=own_upload_ids,
                 )
 
-        # Admission (Stream C.5b) — bucket the run against the agent.
-        denial = await check_admission(
-            quota=quota,
-            audit=audit,
-            tenant_id=tenant_id,
-            actor_id=actor_id,
-            agent=agent_code,
-            resource_kind="run",
-        )
-        if denial is not None:
-            await _discard_if_new()
-            return denial
-
-        # Build (cache-hit) the agent. The end-user has no OAuth subject of its
-        # own (minted, not a Keycloak login), so the OAuth pool keys on its id and
-        # resolves empty — the build stays shared.
+        # B-293 —— 建会话之后、起 run 之前的意外异常同样撤掉新会话,异常原样抛出。不包
+        # ``spawn_run``:它有一段在 run 行建好之后。
         try:
-            built = await runtime.get_agent(
+            # Admission (Stream C.5b) — bucket the run against the agent.
+            denial = await check_admission(
+                quota=quota,
+                audit=audit,
                 tenant_id=tenant_id,
-                name=agent_code,
-                version=record.version,
-                spec=record.spec,
-                user_id=str(end_user_id),
+                actor_id=actor_id,
+                agent=agent_code,
+                resource_kind="run",
             )
-        except AgentFactoryError as exc:
-            await _discard_if_new()
-            return _envelope_error("AGENT_BUILD_FAILED", f"agent cannot be built: {exc}", 422)
+            if denial is not None:
+                await _discard_if_new()
+                return denial
 
-        # 附件分流与上限预检的完整理由见 ``resolve_external_files`` /
-        # ``external_run_bounds_error`` 的 docstring —— 两段都被 P-1 的
-        # ``:edit`` 端点复用,所以住在模块级而不是这个函数体里。
-        try:
-            image_refs, document_names, original_names = await resolve_external_files(
-                files=payload.files,
-                tenant_id=tenant_id,
-                end_user_id=end_user_id,
-                thread_id=thread_id,
-                uploads_store=uploads_store,
-                threads=threads,
-                copier=copier,
+            # Build (cache-hit) the agent. The end-user has no OAuth subject of its
+            # own (minted, not a Keycloak login), so the OAuth pool keys on its id and
+            # resolves empty — the build stays shared.
+            try:
+                built = await runtime.get_agent(
+                    tenant_id=tenant_id,
+                    name=agent_code,
+                    version=record.version,
+                    spec=record.spec,
+                    user_id=str(end_user_id),
+                )
+            except AgentFactoryError as exc:
+                await _discard_if_new()
+                return _envelope_error("AGENT_BUILD_FAILED", f"agent cannot be built: {exc}", 422)
+
+            # 附件分流与上限预检的完整理由见 ``resolve_external_files`` /
+            # ``external_run_bounds_error`` 的 docstring —— 两段都被 P-1 的
+            # ``:edit`` 端点复用,所以住在模块级而不是这个函数体里。
+            try:
+                image_refs, document_names, original_names = await resolve_external_files(
+                    files=payload.files,
+                    tenant_id=tenant_id,
+                    end_user_id=end_user_id,
+                    thread_id=thread_id,
+                    uploads_store=uploads_store,
+                    threads=threads,
+                    copier=copier,
+                    created_uploads=own_upload_ids,
+                )
+            except ExternalScopeError as exc:
+                await _discard_if_new()
+                return _envelope_error(exc.code, exc.message, exc.status_code)
+            except HTTPException as exc:
+                await _discard_if_new()
+                detail = exc.detail if isinstance(exc.detail, dict) else {}
+                return _envelope_error(
+                    detail.get("code", "INVALID_FILE_REF"),
+                    detail.get("message", "invalid file reference"),
+                    exc.status_code,
+                )
+
+            bounds = external_run_bounds_error(
+                untrusted_content=payload.untrusted_content, inputs=payload.inputs
             )
-        except ExternalScopeError as exc:
-            await _discard_if_new()
-            return _envelope_error(exc.code, exc.message, exc.status_code)
-        except HTTPException as exc:
-            await _discard_if_new()
-            detail = exc.detail if isinstance(exc.detail, dict) else {}
-            return _envelope_error(
-                detail.get("code", "INVALID_FILE_REF"),
-                detail.get("message", "invalid file reference"),
-                exc.status_code,
+            if bounds is not None:
+                await _discard_if_new()
+                return bounds
+
+            run_payload = RunRequest(
+                input=payload.input,
+                mode=payload.mode,
+                image_refs=image_refs,
+                untrusted_content=payload.untrusted_content,
+                inputs=payload.inputs,
+                document_names=document_names,
+                document_original_names=original_names,
             )
-
-        bounds = external_run_bounds_error(
-            untrusted_content=payload.untrusted_content, inputs=payload.inputs
-        )
-        if bounds is not None:
+        except Exception:
             await _discard_if_new()
-            return bounds
-
-        run_payload = RunRequest(
-            input=payload.input,
-            mode=payload.mode,
-            image_refs=image_refs,
-            untrusted_content=payload.untrusted_content,
-            inputs=payload.inputs,
-            document_names=document_names,
-            document_original_names=original_names,
-        )
+            raise
         try:
             response = await spawn_run(
                 runtime=runtime,
@@ -1964,9 +1924,6 @@ def build_agents_router() -> APIRouter:
                 await note_uploads_used(
                     uploads_store, tenant_id=tenant_id, upload_ids=file_upload_ids(payload.files)
                 )
-            else:
-                # B-293 —— ``spawn_run`` 回 4xx 信封只在建 run 之前(会话排队满)。
-                await _discard_if_new()
             return response
         except HTTPException:
             # B-293 —— ``spawn_run`` 建 run 之前的同步校验(图片引用、``inputs`` 与 agent 声明

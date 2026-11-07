@@ -284,6 +284,7 @@ async def copy_document_into_thread(
     ref: str,
     source: ThreadMeta,
     target: ThreadMeta,
+    created: list[UUID] | None = None,
 ) -> str:
     """B-262 P1 §3 —— 会话 ``source`` 的上传 ``ref``(``uploads/<名字>``)挂到会话 ``target``
     的 run 上:复制进 ``target`` 自己的 ``uploads/``,回实际落地的名字(同 P0 的同名规则:同内容
@@ -305,6 +306,9 @@ async def copy_document_into_thread(
 
     失败抛 ``HTTPException``,状态码同上传端点(503 / 429 / 500 / 502);另有源文件不在 404、
     源被改过 409(读按登记的大小 + 1 封顶,读超了也算改过)。
+
+    B-293 —— ``created`` 非空时把这里新建的登记行 id 记进去:请求随后被拒、撤掉它刚建的会话时,
+    这些行算「本请求自己的」。
     """
     store = account.workspace_store
     if store is None:
@@ -355,7 +359,7 @@ async def copy_document_into_thread(
     if landing_is_registrable(target) and not await _already_registered(
         uploads, tenant_id=tenant_id, user_id=user_id, thread_id=target.thread_id, landed=result
     ):
-        await register_document_upload(
+        row = await register_document_upload(
             uploads,
             tenant_id=tenant_id,
             user_id=user_id,
@@ -363,6 +367,8 @@ async def copy_document_into_thread(
             landed=result,
             mime_type=upload.mime_type,
         )
+        if created is not None:
+            created.append(row.id)
     return result.path
 
 

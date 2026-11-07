@@ -59,10 +59,11 @@ from control_plane.api._external import (
     reject_nul_path_params,
 )
 from control_plane.api._external_agent_scope import agent_key_for_code
+from control_plane.api._new_session_undo import NewSessionUndo, discard_new_session
 from control_plane.api._quota_admission import check_admission
 from control_plane.api._user_scope import get_user_repo
 from control_plane.api._workspace_shared import thread_workspace_path
-from control_plane.api.agents import _discard_new_session, _resolve_session, _SessionError
+from control_plane.api.agents import _resolve_session, _SessionError
 from control_plane.api.uploads import (
     UPLOAD_ERROR_CODES,
     _handle_document_upload,
@@ -285,18 +286,17 @@ def build_external_uploads_router() -> APIRouter:
             layout = meta.workspace_layout
 
         async def _discard_if_new() -> None:
-            # B-293 —— 上传被拒时调:本请求自己建的会话(连同落盘失败可能留下的半份文件)不留。
+            # B-293 —— 上传被拒时调:本请求自己建的会话(连同落盘失败可能留下的半份文件)不留;
+            # 有人在用(别的请求拿它的 id 起了 run / 传了文件)就不撤,见 ``_new_session_undo``。
             if session_id is None:
-                await _discard_new_session(
+                await discard_new_session(
+                    NewSessionUndo.from_request(request),
                     tenant_id=tenant_id,
                     thread_id=thread_id,
                     end_user_id=end_user_id,
                     agent_code=agent_code,
                     workspace_layout=layout,
                     landed_files=True,
-                    threads=threads,
-                    uploads_store=uploads,
-                    workspace_store=workspace_store,
                 )
 
         try:
@@ -414,6 +414,10 @@ def build_external_uploads_router() -> APIRouter:
         except HTTPException as exc:
             await _discard_if_new()
             return _upload_error_envelope(exc)
+        except Exception:
+            # B-293 —— 意外异常(如文件落下之后登记出错)同样撤掉新会话,异常原样抛出。
+            await _discard_if_new()
+            raise
 
     @router.get(
         "/{agent_code}/uploads/{upload_id}",
