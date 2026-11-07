@@ -4,7 +4,11 @@ from __future__ import annotations
 
 import pytest
 
-from control_plane.platform_mcp_pool import McpClientFactory, PlatformMcpPoolService
+from control_plane.platform_mcp_pool import (
+    _FAILED_RETRY_S,
+    McpClientFactory,
+    PlatformMcpPoolService,
+)
 from expert_work.persistence import InMemoryMcpConnectorCatalogStore
 from expert_work.protocol import (
     McpConnectorAuthField,
@@ -17,6 +21,7 @@ from orchestrator.tools.mcp import (
     MCPToolDef,
     RecordingMCPClient,
 )
+from tests.test_tenant_mcp_pool import _flaky_factory, _ManualSleep
 
 
 def _factory_spy(configs: list[MCPServerConfig]) -> McpClientFactory:
@@ -194,3 +199,84 @@ async def test_ttl_backstop_rebuilds_expired_pool_and_reuses_fresh_one() -> None
     assert len(configs) == 2
     assert p1.names() == []  # the expired pool was closed (close_all clears clients)
     assert p2.names() == ["maps"]
+
+
+# B-292 —— 同租户池:连不上的目录项隔一段时间在后台重试,连着的不重连。
+
+
+async def _run_pending_retry(svc: PlatformMcpPoolService, sleeper: _ManualSleep) -> None:
+    (retry,) = svc._retry_tasks
+    sleeper.wake()
+    await retry
+
+
+@pytest.mark.asyncio
+async def test_failed_server_retried_after_backoff_reuses_healthy_and_evicts_builds() -> None:
+    store = InMemoryMcpConnectorCatalogStore()
+    await _add(store, name="a")
+    await _add(store, name="b")
+    calls: list[str] = []
+    down = {"b"}
+    expired: list[None] = []
+    sleeper = _ManualSleep()
+    svc = PlatformMcpPoolService(
+        store=store,
+        client_factory=_flaky_factory(calls, down),
+        on_expire=lambda: expired.append(None),
+        sleep=sleeper,
+    )
+    p1 = await svc.get_or_build()
+    assert p1.names() == ["a"]
+    a_client = p1.get("a")
+    await sleeper.sleeping(1)
+    assert sleeper.durations == [_FAILED_RETRY_S]
+    assert await svc.get_or_build() is p1  # inside the window: no redial
+    assert sorted(calls) == ["a", "b"]
+
+    down.clear()
+    await _run_pending_retry(svc, sleeper)
+
+    p2 = await svc.get_or_build()
+    assert sorted(p2.names()) == ["a", "b"]
+    assert sorted(calls) == ["a", "b", "b"]  # only the failed one redialed
+    assert p2.get("a") is a_client
+    assert isinstance(a_client, RecordingMCPClient) and not a_client.closed
+    assert expired == [None]  # every build evicted once (platform pool is process-global)
+    await sleeper.settle()
+    assert sleeper.durations == [_FAILED_RETRY_S]
+    await svc.close_all()
+
+
+@pytest.mark.asyncio
+async def test_still_failing_server_retried_once_per_window_without_evicting_builds() -> None:
+    store = InMemoryMcpConnectorCatalogStore()
+    await _add(store, name="a")
+    await _add(store, name="b")
+    calls: list[str] = []
+    expired: list[None] = []
+    sleeper = _ManualSleep()
+    svc = PlatformMcpPoolService(
+        store=store,
+        client_factory=_flaky_factory(calls, {"b"}),
+        on_expire=lambda: expired.append(None),
+        sleep=sleeper,
+    )
+    p1 = await svc.get_or_build()
+    a_client = p1.get("a")
+    await sleeper.sleeping(1)
+    await _run_pending_retry(svc, sleeper)
+
+    p2 = await svc.get_or_build()
+    assert p2.names() == ["a"]
+    assert sorted(calls) == ["a", "b", "b"]
+    assert p2.get("a") is a_client
+    assert isinstance(a_client, RecordingMCPClient) and not a_client.closed
+    assert expired == []
+    await sleeper.sleeping(2)
+    assert sleeper.durations == [_FAILED_RETRY_S, _FAILED_RETRY_S]
+    assert await svc.get_or_build() is p2
+    assert sorted(calls) == ["a", "b", "b"]
+
+    (pending,) = svc._retry_tasks
+    await svc.close_all()
+    assert pending.cancelled()

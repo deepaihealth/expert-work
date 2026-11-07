@@ -59,6 +59,9 @@ _MAX_BUILD_ATTEMPTS = 5
 # pool lives forever, so one lost bus event would be permanent staleness.
 _POOL_TTL_S = 1800.0
 
+# B-292 —— 构建时有连接没连上:等够这么久后的下一次取池重试一次(取值理由同租户池)。
+_FAILED_RETRY_S = 60.0
+
 
 def _utc_now() -> datetime:
     return datetime.now(tz=UTC)
@@ -106,6 +109,14 @@ class UserMcpOAuthPoolService:
         # ``connector_on``): a last-attempt build that read the catalog before
         # the switch must not serve them. Guarded by ``_locks_guard``.
         self._switched_off: set[str] = set()
+        # B-292 —— 缓存池缺了构建时没连上的连接:key -> 何时(单调时钟)可以重试。
+        # 用户池每次 run 定构建缓存键时都会取,所以到点后的那次取池就地重试,不用后台任务。
+        self._retry_at: dict[tuple[UUID, str], float] = {}
+
+    def _retry_due(self, key: tuple[UUID, str]) -> bool:
+        """B-292 —— 缓存池缺了没连上的连接,且已等够重试间隔。"""
+        retry_at = self._retry_at.get(key)
+        return retry_at is not None and self._monotonic_clock() >= retry_at
 
     async def _key_lock(self, key: tuple[UUID, str]) -> asyncio.Lock:
         async with self._locks_guard:
@@ -157,27 +168,36 @@ class UserMcpOAuthPoolService:
             lock = await self._key_lock(key)
             async with lock:
                 cached = self._pools.get(key)
+                # B-292 —— 重试缺连接的缓存池时:它还留在缓存里,连着的客户端从它原样
+                # 复用(不重连),只重拨缺的;新池进缓存时才替换它。
+                reuse: MCPServerPool | None = None
+                reuse_built_at = 0.0
                 if cached is not None:
                     cached_pool, built_at = cached
                     if self._monotonic_clock() - built_at < _POOL_TTL_S:
-                        return cached_pool
-                    # TTL backstop (PR-E3a): expired — drop like ``invalidate``
-                    # (the generation bump keeps any concurrent build from
-                    # caching stale data), then rebuild. Retire, not close:
-                    # cached agents and in-flight runs still hold these
-                    # clients and keep calling them on one-shot sessions.
-                    async with self._locks_guard:
-                        self._generation[key] = self._generation.get(key, 0) + 1
-                        self._pools.pop(key, None)
-                        self._retired.add_pool(key, cached_pool)
-                    try:
-                        await cached_pool.retire_all()
-                    except Exception:
-                        logger.warning("user_mcp_oauth_pool.expired_close_failed")
-                    self._notify_expired(key)
+                        if not self._retry_due(key):
+                            return cached_pool
+                        reuse, reuse_built_at = cached_pool, built_at
+                    else:
+                        # TTL backstop (PR-E3a): expired — drop like ``invalidate``
+                        # (the generation bump keeps any concurrent build from
+                        # caching stale data), then rebuild. Retire, not close:
+                        # cached agents and in-flight runs still hold these
+                        # clients and keep calling them on one-shot sessions.
+                        async with self._locks_guard:
+                            self._generation[key] = self._generation.get(key, 0) + 1
+                            self._pools.pop(key, None)
+                            self._retired.add_pool(key, cached_pool)
+                        try:
+                            await cached_pool.retire_all()
+                        except Exception:
+                            logger.warning("user_mcp_oauth_pool.expired_close_failed")
+                        self._notify_expired(key)
                 async with self._locks_guard:
                     gen = self._generation.get(key, 0)
                 pool = MCPServerPool()
+                fresh: list[MCPClient] = []
+                failed = False
                 skipped_off: set[str] = set()
                 records = await self._oauth_store.list_for_user(
                     tenant_id=tenant_id, user_id=user_id
@@ -194,6 +214,15 @@ class UserMcpOAuthPoolService:
                         # for every user (as for new connects), no refresh.
                         skipped_off.add(record.name)
                         continue
+                    reused = reuse.get(record.name) if reuse is not None else None
+                    if reused is not None:
+                        # B-292 —— 连着的原样复用:不重连,也不再走刷新(同继续用旧池)。
+                        try:
+                            await pool.add(record.name, reused)
+                        except MCPServerPoolLimitError:
+                            logger.warning("user_mcp_oauth_pool.server_cap_reached")
+                            break
+                        continue
                     usable = await self._resolve_usable(record)
                     if usable is None:
                         continue
@@ -203,6 +232,7 @@ class UserMcpOAuthPoolService:
                     try:
                         client = await self._client_factory(config)
                         await pool.add(record.name, client)
+                        fresh.append(client)
                     except MCPServerPoolLimitError:
                         try:
                             await client.close()
@@ -212,13 +242,29 @@ class UserMcpOAuthPoolService:
                         break
                     except Exception:
                         logger.warning("user_mcp_oauth_pool.server_build_failed")
+                        failed = True
                 switched_off: list[MCPClient] = []
+                dropped: list[MCPClient] | None = None
                 async with self._locks_guard:
                     if self._generation.get(key, 0) == gen:
-                        self._pools[key] = (pool, self._monotonic_clock())
+                        # B-292 —— 重试出的池沿用旧池的出生时间:TTL 兜底时限不被拉长。
+                        born = self._monotonic_clock() if reuse is None else reuse_built_at
+                        self._pools[key] = (pool, born)
                         self._skipped_off[key] = frozenset(skipped_off)
-                        return pool
-                    if last_attempt:
+                        if failed:
+                            self._retry_at[key] = self._monotonic_clock() + _FAILED_RETRY_S
+                        else:
+                            self._retry_at.pop(key, None)
+                        if reuse is None:
+                            return pool
+                        # 旧池里没被新池复用的(被上限挤掉):随旧池一起退役,别没人管。
+                        dropped = []
+                        for server in reuse.names():
+                            old = reuse.get(server)
+                            if old is not None and pool.get(server) is not old:
+                                self._retired.add(key, server, old)
+                                dropped.append(old)
+                    elif last_attempt:
                         # B-248 — no cache entry will ever close it: track it
                         # for invalidate / close_all, retire it below.
                         self._retired.add_pool(key, pool)
@@ -226,12 +272,28 @@ class UserMcpOAuthPoolService:
                             found = pool.get(server)
                             if server in self._switched_off and found is not None:
                                 switched_off.append(found)
+            if dropped is not None and reuse is not None:
+                # B-292 —— 重试出的池进了缓存。新连上了连接才清这个用户的构建,
+                # 让它们挂上新工具;还是连不上就不清(工具没变)。
+                await release_clients(retire=dropped)
+                if set(pool.names()) - set(reuse.names()):
+                    logger.info("user_mcp_oauth_pool.failed_server_recovered")
+                    self._notify_expired(key)
+                return pool
             if last_attempt:
                 # Outside the key lock (B-248). A connector switched off
                 # mid-build is stopped, the rest retired.
                 await release_clients(close=switched_off)
-                await retire_in_place(pool)
+                if reuse is None:
+                    await retire_in_place(pool)
+                else:
+                    # B-292 —— 复用来的客户端仍归旧池,只退役本次新拨的。
+                    await release_clients(retire=fresh)
                 return pool
+            if reuse is not None:
+                # B-292 —— 作废的重试只关本次新拨的:复用来的还在旧池里服务。
+                await release_clients(close=fresh)
+                continue
             try:
                 await pool.close_all()
             except Exception:

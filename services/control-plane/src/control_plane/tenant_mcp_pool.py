@@ -15,6 +15,7 @@ Decoupling: the orchestrator never imports this — the agent builder receives a
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import logging
 import time
 from collections.abc import Awaitable, Callable
@@ -29,6 +30,7 @@ from control_plane.mcp_retired_clients import (
     retire_in_place,
 )
 from expert_work.persistence import TenantMcpServerStore
+from expert_work.persistence.rls import current_tenant_id_var
 from expert_work.protocol import TenantMcpServerRecord
 from expert_work.runtime.secret_store import SecretStore
 from orchestrator.tools.mcp import (
@@ -47,6 +49,12 @@ _MAX_BUILD_ATTEMPTS = 5
 # built-agent cache TTL (AgentRuntime.cache_ttl_s = 1800s). Without it the
 # pool lives forever, so one lost bus event would be permanent staleness.
 _POOL_TTL_S = 1800.0
+
+# B-292 —— 构建时有服务没连上(多是对方正在重启、还没就绪):隔这么久在后台重试一次。
+# 60 秒:重启通常几十秒内就绪,工具缺失从最长 30 分钟(池 TTL)压到约 1 分钟;重试拨号
+# 持有该租户的锁,对端挂住时最长要等 timeout_s(默认 30 秒),间隔取 30 秒的话该租户的
+# 构建会有一半时间排在锁后面;一直连不上的服务也只是每副本每租户每分钟拨一次。
+_FAILED_RETRY_S = 60.0
 
 # Provider handed to the agent builder: tenant_id -> that tenant's remote pool.
 TenantMcpPoolProvider = Callable[[UUID], Awaitable[MCPServerPool]]
@@ -131,6 +139,7 @@ class TenantMcpPoolService:
         client_factory: McpClientFactory,
         clock: Callable[[], float] = time.monotonic,
         on_expire: Callable[[UUID], None] | None = None,
+        sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
     ) -> None:
         self._store = store
         self._secret_store = secret_store
@@ -152,6 +161,12 @@ class TenantMcpPoolService:
         # B-259 —— 缓存池成员的连接指纹;改一项时其它项暂存在这里给下次构建复用。
         # Guarded by ``_locks_guard``.
         self._kept: KeptMcpClients[UUID] = KeptMcpClients()
+        # B-292 —— 缓存池缺了构建时没连上的服务的租户,和排着的后台重试(每租户最多一个)。
+        # Guarded by ``_locks_guard``.
+        self._sleep = sleep  # injectable (tests)
+        self._degraded: set[UUID] = set()
+        self._retry_pending: set[UUID] = set()
+        self._retry_tasks: set[asyncio.Task[None]] = set()
 
     async def _tenant_lock(self, tenant_id: UUID) -> asyncio.Lock:
         async with self._locks_guard:
@@ -167,7 +182,8 @@ class TenantMcpPoolService:
         Uses a per-tenant lock so different tenants build in parallel while
         still deduplicating concurrent builds for the same tenant.  A server
         that fails to connect is skipped (logged, no tenant-derived values) so
-        one bad server cannot break the whole agent build.  When the server cap
+        one bad server cannot break the whole agent build; caching a pool that
+        lacks one schedules a background retry (B-292, ``_retry_failed``).  When the server cap
         is hit the just-opened client is closed before breaking — it was never
         added to the pool so ``pool.close_all`` cannot reach it.
 
@@ -209,7 +225,7 @@ class TenantMcpPoolService:
                 async with self._locks_guard:
                     gen = self._generation.get(tenant_id, 0)
                     carried = self._kept.peek(tenant_id)
-                pool, members, fresh = await self._build(tenant_id, carried)
+                pool, members, fresh, failed = await self._build(tenant_id, carried)
                 unused: list[MCPClient] = []
                 async with self._locks_guard:
                     cached_now = self._generation.get(tenant_id, 0) == gen
@@ -220,6 +236,11 @@ class TenantMcpPoolService:
                         # 复用的长连接按它最早的出生时间算 TTL,兜底时限不被拉长。
                         born = [m.born_at for m in members.values()]
                         self._pools[tenant_id] = (pool, min([*born, self._clock()]))
+                        if failed:
+                            self._degraded.add(tenant_id)
+                            self._schedule_retry(tenant_id)
+                        else:
+                            self._degraded.discard(tenant_id)
                     elif last_attempt:
                         # B-248 — no cache entry will ever close it: track it
                         # for invalidate / close_all, retire it below.
@@ -242,12 +263,14 @@ class TenantMcpPoolService:
 
     async def _build(
         self, tenant_id: UUID, carried: dict[str, KeptClient]
-    ) -> tuple[MCPServerPool, dict[str, KeptClient], list[MCPClient]]:
-        """Build the tenant's pool from the registry; returns it, its members
-        and the clients this call opened (as opposed to reused from ``carried``)."""
+    ) -> tuple[MCPServerPool, dict[str, KeptClient], list[MCPClient], bool]:
+        """Build the tenant's pool from the registry; returns it, its members,
+        the clients this call opened (as opposed to reused from ``carried``)
+        and whether any server failed to connect (B-292)."""
         pool = MCPServerPool()
         members: dict[str, KeptClient] = {}
         fresh: list[MCPClient] = []
+        failed = False
         records = await self._store.list_for_tenant(tenant_id=tenant_id)
         for record in records:
             if not record.enabled:
@@ -280,7 +303,42 @@ class TenantMcpPoolService:
                 break
             except Exception:
                 logger.warning("tenant_mcp_pool.server_build_failed")
-        return pool, members, fresh
+                failed = True
+        return pool, members, fresh, failed
+
+    def _schedule_retry(self, tenant_id: UUID) -> None:
+        """B-292 —— 排一次后台重试(已有排着的就不再排)。Caller holds ``_locks_guard``.
+        用空的上下文:不沾触发这次构建的请求的上下文(RLS / trace)。"""
+        if tenant_id in self._retry_pending:
+            return
+        self._retry_pending.add(tenant_id)
+        task = asyncio.create_task(self._retry_failed(tenant_id), context=contextvars.Context())
+        self._retry_tasks.add(task)
+        task.add_done_callback(self._retry_tasks.discard)
+
+    async def _retry_failed(self, tenant_id: UUID) -> None:
+        """B-292 —— 隔 ``_FAILED_RETRY_S`` 把缺服务的缓存池摘掉重建一次:连着的长连接
+        原样复用(B-259 暂存),只重拨缺的。新连上了服务才清构建(同 TTL / 改登记的
+        ``on_expire``),让它们挂上新工具;还是连不上就不清,新池再排下一次。
+        内置 agent 的构建只在构建缓存未命中时才取池,所以这里不能等请求来触发。"""
+        await self._sleep(_FAILED_RETRY_S)
+        async with self._locks_guard:
+            self._retry_pending.discard(tenant_id)
+            entry = self._pools.get(tenant_id)
+            if entry is None or tenant_id not in self._degraded:
+                return  # 已被摘掉 / 换成了完整的池:下一次构建自会处理
+            self._generation[tenant_id] = self._generation.get(tenant_id, 0) + 1
+            self._pools.pop(tenant_id)
+            self._kept.carry_all(tenant_id)
+        current_tenant_id_var.set(tenant_id)  # 后台任务:按这个租户读登记(RLS)
+        try:
+            pool = await self.get_or_build(tenant_id)
+        except Exception as exc:
+            logger.warning("tenant_mcp_pool.retry_failed err=%s", type(exc).__name__)
+            return
+        if set(pool.names()) - set(entry[0].names()):
+            logger.info("tenant_mcp_pool.failed_server_recovered")
+            self._notify_expired(tenant_id)
 
     def _notify_expired(self, tenant_id: UUID) -> None:
         """Run ``on_expire`` (build eviction); a failure never fails the caller."""
@@ -345,6 +403,11 @@ class TenantMcpPoolService:
             for tid in list(self._tenant_locks):
                 self._generation[tid] = self._generation.get(tid, 0) + 1
             self._tenant_locks.clear()
+            retries = list(self._retry_tasks)
+            self._retry_pending.clear()
+        for task in retries:
+            task.cancel()
+        await asyncio.gather(*retries, return_exceptions=True)
         for pool in pools:
             try:
                 await pool.close_all()

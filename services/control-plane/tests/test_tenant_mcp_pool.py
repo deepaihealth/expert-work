@@ -2,11 +2,16 @@
 
 from __future__ import annotations
 
+import asyncio
 from uuid import uuid4
 
 import pytest
 
-from control_plane.tenant_mcp_pool import McpClientFactory, TenantMcpPoolService
+from control_plane.tenant_mcp_pool import (
+    _FAILED_RETRY_S,
+    McpClientFactory,
+    TenantMcpPoolService,
+)
 from expert_work.persistence import InMemoryTenantMcpServerStore
 from orchestrator.tools.mcp import MCPServerConfig, MCPToolDef, RecordingMCPClient
 
@@ -219,3 +224,135 @@ async def test_ttl_backstop_rebuilds_expired_pool_and_reuses_fresh_one() -> None
     assert calls == ["github", "github"]
     assert p1.names() == []  # the expired pool was closed (close_all clears clients)
     assert p2.names() == ["github"]
+
+
+# ---------------------------------------------------------------------------
+# B-292 —— 某个服务连接失败:隔一段时间重试,不让缓存池把它的工具藏 30 分钟
+# ---------------------------------------------------------------------------
+
+
+class _ManualSleep:
+    """注入给池的 sleep:记下每次要睡多久,等测试放行。"""
+
+    def __init__(self) -> None:
+        self.durations: list[float] = []
+        self._gates: list[asyncio.Event] = []
+        self._entered = asyncio.Event()
+
+    async def __call__(self, seconds: float) -> None:
+        self.durations.append(seconds)
+        self._entered.set()
+        gate = asyncio.Event()
+        self._gates.append(gate)
+        await gate.wait()
+
+    async def sleeping(self, count: int) -> None:
+        """等到第 ``count`` 次 sleep 开始(后台重试是 create_task 起的,要让它跑起来)。"""
+        async with asyncio.timeout(1):
+            while len(self.durations) < count:
+                self._entered.clear()
+                await self._entered.wait()
+
+    async def settle(self) -> None:
+        """让已排的任务都跑到下一个挂起点(断言「没有再排」之前用)。"""
+        for _ in range(5):
+            await asyncio.sleep(0)
+
+    def wake(self) -> None:
+        self._gates[-1].set()
+
+
+def _flaky_factory(calls: list[str], down: set[str]) -> McpClientFactory:
+    """``down`` 里的服务连不上(还没就绪);其余正常。"""
+
+    async def _factory(config: MCPServerConfig) -> RecordingMCPClient:
+        calls.append(config.name)
+        if config.name in down:
+            raise ConnectionError("server not ready")
+        return RecordingMCPClient(tools=(MCPToolDef(name="t", description="", input_schema={}),))
+
+    return _factory
+
+
+async def _run_pending_retry(svc: TenantMcpPoolService, sleeper: _ManualSleep) -> None:
+    (retry,) = svc._retry_tasks
+    sleeper.wake()
+    await retry
+
+
+@pytest.mark.asyncio
+async def test_failed_server_retried_after_backoff_reuses_healthy_and_evicts_builds() -> None:
+    store = InMemoryTenantMcpServerStore()
+    tid = uuid4()
+    await _seed(store, tid, "a")
+    await _seed(store, tid, "b")
+    calls: list[str] = []
+    down = {"b"}
+    expired: list[object] = []
+    sleeper = _ManualSleep()
+    svc = TenantMcpPoolService(
+        store=store,
+        secret_store=None,
+        client_factory=_flaky_factory(calls, down),
+        on_expire=expired.append,
+        sleep=sleeper,
+    )
+    p1 = await svc.get_or_build(tid)
+    assert p1.names() == ["a"]
+    a_client = p1.get("a")
+    await sleeper.sleeping(1)
+    assert sleeper.durations == [_FAILED_RETRY_S]  # one retry scheduled
+    # Requests inside the backoff window serve the cached pool, no redial.
+    assert await svc.get_or_build(tid) is p1
+    assert calls == ["a", "b"]
+
+    down.clear()  # the server finished restarting
+    await _run_pending_retry(svc, sleeper)
+
+    p2 = await svc.get_or_build(tid)
+    assert p2.names() == ["a", "b"]
+    assert calls == ["a", "b", "b"]  # only the failed server was redialed
+    assert p2.get("a") is a_client  # healthy long-lived client reused …
+    assert isinstance(a_client, RecordingMCPClient) and not a_client.closed  # … not torn down
+    assert expired == [tid]  # builds made from the incomplete pool are evicted
+    await sleeper.settle()
+    assert sleeper.durations == [_FAILED_RETRY_S]  # complete pool: no further retry
+    await svc.close_all()
+
+
+@pytest.mark.asyncio
+async def test_still_failing_server_retried_once_per_window_without_evicting_builds() -> None:
+    store = InMemoryTenantMcpServerStore()
+    tid = uuid4()
+    await _seed(store, tid, "a")
+    await _seed(store, tid, "b")
+    calls: list[str] = []
+    expired: list[object] = []
+    sleeper = _ManualSleep()
+    svc = TenantMcpPoolService(
+        store=store,
+        secret_store=None,
+        client_factory=_flaky_factory(calls, {"b"}),
+        on_expire=expired.append,
+        sleep=sleeper,
+    )
+    p1 = await svc.get_or_build(tid)
+    a_client = p1.get("a")
+
+    await sleeper.sleeping(1)
+    await _run_pending_retry(svc, sleeper)
+
+    p2 = await svc.get_or_build(tid)
+    assert p2.names() == ["a"]
+    assert calls == ["a", "b", "b"]  # one redial of the failed server, healthy one untouched
+    assert p2.get("a") is a_client
+    assert isinstance(a_client, RecordingMCPClient) and not a_client.closed
+    assert expired == []  # nothing gained → cached builds stay
+    await sleeper.sleeping(2)
+    assert sleeper.durations == [_FAILED_RETRY_S, _FAILED_RETRY_S]  # next window scheduled
+    assert await svc.get_or_build(tid) is p2  # no redial per request
+    assert calls == ["a", "b", "b"]
+
+    (pending,) = svc._retry_tasks
+    await svc.close_all()
+    assert pending.cancelled()  # shutdown cancels the pending retry

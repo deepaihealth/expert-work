@@ -69,6 +69,13 @@ class KeptMcpClients[K: Hashable]:
             del self._carry[key]
         return hit
 
+    def carry_all(self, key: K) -> None:
+        """B-292 —— 缓存池摘掉只为重连没连上的项(调用方已摘):成员全部转进暂存,
+        下一次构建原样复用,只重拨缺的。"""
+        members = self._members.pop(key, {})
+        if members:
+            self._carry.setdefault(key, {}).update(members)
+
     def pop_key(self, key: K) -> list[MCPClient]:
         """整键失效:暂存的客户端交回给调用方硬停。"""
         self._members.pop(key, None)

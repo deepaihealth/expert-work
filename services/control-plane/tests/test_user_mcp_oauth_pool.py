@@ -8,7 +8,11 @@ from uuid import UUID, uuid4
 import pytest
 
 from control_plane.tenant_scope import bypass_rls_session
-from control_plane.user_mcp_oauth_pool import McpClientFactory, UserMcpOAuthPoolService
+from control_plane.user_mcp_oauth_pool import (
+    _FAILED_RETRY_S,
+    McpClientFactory,
+    UserMcpOAuthPoolService,
+)
 from expert_work.persistence import (
     InMemoryMcpConnectorCatalogStore,
     InMemoryMcpOAuthConnectionStore,
@@ -21,6 +25,7 @@ from expert_work.protocol import (
     McpOAuthConnectionRecord,
 )
 from orchestrator.tools.mcp import MCPServerConfig, MCPToolDef, RecordingMCPClient
+from tests.test_tenant_mcp_pool import _flaky_factory
 
 _NOW = datetime(2026, 6, 6, 12, 0, tzinfo=UTC)
 
@@ -373,3 +378,106 @@ async def test_ttl_backstop_rebuilds_expired_pool_and_reuses_fresh_one() -> None
     assert calls == ["linear", "linear"]
     assert p1.names() == []  # the expired pool was closed (close_all clears clients)
     assert p2.names() == ["linear"]
+
+
+# B-292 —— 某个连接没连上:等够间隔后的那次请求重试一次(用户池每次 run 都会取),
+# 连着的原样复用,新连上了才清这个用户的构建。
+
+
+async def _two_connections(
+    cat_store: InMemoryMcpConnectorCatalogStore,
+    oauth_store: InMemoryMcpOAuthConnectionStore,
+    tid: UUID,
+    uid: str,
+) -> None:
+    for name in ("linear", "notion"):
+        cat_id = await _seed_catalog(cat_store, name=name)
+        await _seed_connection(
+            oauth_store,
+            tenant_id=tid,
+            user_id=uid,
+            catalog_id=cat_id,
+            name=name,
+            expires_at=_NOW + timedelta(hours=1),
+        )
+
+
+def _flaky_svc(
+    oauth_store: InMemoryMcpOAuthConnectionStore,
+    cat_store: InMemoryMcpConnectorCatalogStore,
+    calls: list[str],
+    down: set[str],
+    now: dict[str, float],
+    expired: list[tuple[UUID, str]],
+) -> UserMcpOAuthPoolService:
+    return UserMcpOAuthPoolService(
+        oauth_store=oauth_store,
+        catalog_store=cat_store,
+        client_factory=_flaky_factory(calls, down),
+        clock=lambda: _NOW,
+        monotonic_clock=lambda: now["t"],
+        on_expire=lambda t, u: expired.append((t, u)),
+    )
+
+
+@pytest.mark.asyncio
+async def test_failed_connection_retried_after_backoff_reuses_healthy_and_evicts_builds() -> None:
+    cat_store = InMemoryMcpConnectorCatalogStore()
+    oauth_store = InMemoryMcpOAuthConnectionStore()
+    tid, uid = uuid4(), "user-1"
+    await _two_connections(cat_store, oauth_store, tid, uid)
+    calls: list[str] = []
+    down = {"notion"}
+    now = {"t": 0.0}
+    expired: list[tuple[UUID, str]] = []
+    svc = _flaky_svc(oauth_store, cat_store, calls, down, now, expired)
+
+    p1 = await svc.get_or_build(tid, uid)
+    assert p1.names() == ["linear"]
+    linear = p1.get("linear")
+    now["t"] = _FAILED_RETRY_S - 1
+    assert await svc.get_or_build(tid, uid) is p1  # inside the window: no redial
+    assert calls == ["linear", "notion"]
+
+    down.clear()
+    now["t"] = _FAILED_RETRY_S
+    p2 = await svc.get_or_build(tid, uid)
+    assert p2.names() == ["linear", "notion"]
+    assert calls == ["linear", "notion", "notion"]  # only the failed one redialed
+    assert p2.get("linear") is linear
+    assert isinstance(linear, RecordingMCPClient) and not linear.closed
+    assert expired == [(tid, uid)]  # that user's builds from the incomplete pool evicted
+
+    now["t"] = 1000.0
+    assert await svc.get_or_build(tid, uid) is p2  # complete pool: no more retries
+    now["t"] = 1801.0  # the retry did not extend the original TTL
+    assert await svc.get_or_build(tid, uid) is not p2
+
+
+@pytest.mark.asyncio
+async def test_still_failing_connection_retried_once_per_window_without_evicting_builds() -> None:
+    cat_store = InMemoryMcpConnectorCatalogStore()
+    oauth_store = InMemoryMcpOAuthConnectionStore()
+    tid, uid = uuid4(), "user-1"
+    await _two_connections(cat_store, oauth_store, tid, uid)
+    calls: list[str] = []
+    now = {"t": 0.0}
+    expired: list[tuple[UUID, str]] = []
+    svc = _flaky_svc(oauth_store, cat_store, calls, {"notion"}, now, expired)
+
+    p1 = await svc.get_or_build(tid, uid)
+    linear = p1.get("linear")
+    now["t"] = _FAILED_RETRY_S
+    p2 = await svc.get_or_build(tid, uid)
+    assert p2.names() == ["linear"]
+    assert calls == ["linear", "notion", "notion"]
+    assert p2.get("linear") is linear
+    assert isinstance(linear, RecordingMCPClient) and not linear.closed
+    assert expired == []  # nothing gained → builds stay
+
+    now["t"] = 2 * _FAILED_RETRY_S - 1  # next window not reached: no redial
+    assert await svc.get_or_build(tid, uid) is p2
+    assert calls == ["linear", "notion", "notion"]
+    now["t"] = 2 * _FAILED_RETRY_S
+    await svc.get_or_build(tid, uid)
+    assert calls == ["linear", "notion", "notion", "notion"]
