@@ -19,13 +19,16 @@ the preview / download, and nothing else:
   A document ``ref`` must be the one shape uploads produce
   (:func:`is_safe_document_upload_id`: ``uploads/<one safe leaf>``) and is resolved by
   the server in the thread owner's volume; the client never supplies a path. For a
-  conversation-view thread (B-262: ``threads/<id>/work/``) the leaf must also have a live
-  ``user_upload`` row of this thread — retention soft-deletes the row and may keep the
-  bytes a while, and the attachment is expired from that moment. An old-view thread
-  lands uploads in the agent root shared by that user's conversations with the agent,
-  where nothing is registered (B-281 deliberately does not register there): those are
-  served by path alone, so any upload in that shared root is reachable from any of
-  those conversations.
+  conversation-view thread (B-262: ``threads/<id>/work/``) the ``user_upload`` rows of
+  this thread for this name are consulted first: if there are rows and none is live, the
+  attachment is expired (retention soft-deletes the row and may keep the bytes a while).
+  If there is no row at all — console uploads and cross-conversation copies before B-281
+  were never registered, and prod has such conversations since 11-04 — the file is served
+  by path alone, which is still this thread's own directory. An old-view thread lands
+  uploads in the agent root shared by that user's conversations with the agent, where
+  nothing is registered (B-281 deliberately does not register there): those are served
+  by path alone, so any upload in that shared root is reachable from any of those
+  conversations.
 - **Gone.** Retention (B-63 / B-283 / B-286 / B-282) deletes rows and bytes; a deleted
   image, a reaped or soft-deleted row, missing bytes, or a ref that is not this
   conversation's all answer the same 410 ``ATTACHMENT_GONE`` so the page can say
@@ -193,17 +196,19 @@ async def _image_response(
     )
 
 
-async def _registered_in_conversation(
+async def _deregistered_in_conversation(
     ref: str, *, meta: ThreadMeta, scope: SingleTenant, uploads: UserUploadStore
 ) -> bool:
-    """Is ``ref`` a live ``user_upload`` row of this thread? (Rows are written for every
-    upload into a conversation's own directory: external uploads, and console uploads
-    and cross-conversation copies since B-281.)"""
+    """Was ``ref`` registered in this thread and every such row deleted since?
+
+    ``False`` both when a live row exists and when there is no row at all: rows are only
+    written for uploads into a conversation's own directory since B-281 (external uploads
+    always), so "never registered" is an old console upload, not an expired one."""
     async with applied_scope(scope):
-        rows = await uploads.list_documents_for_thread(
-            tenant_id=scope.tenant_id, thread_id=meta.thread_id
+        rows = await uploads.list_documents_for_thread_ref(
+            tenant_id=scope.tenant_id, thread_id=meta.thread_id, ref=ref
         )
-    return any(row.ref == ref for row in rows)
+    return bool(rows) and all(row.deleted_at is not None for row in rows)
 
 
 async def _document_response(
@@ -217,7 +222,7 @@ async def _document_response(
     if meta.user_id is None:
         # Machine / unowned thread — no per-user volume, so no uploads.
         _gone()
-    if thread_conversation_id(meta) is not None and not await _registered_in_conversation(
+    if thread_conversation_id(meta) is not None and await _deregistered_in_conversation(
         ref, meta=meta, scope=scope, uploads=uploads
     ):
         _gone()

@@ -140,6 +140,12 @@ class World:
         )
         return row.id  # type: ignore[no-any-return]
 
+    async def delete_upload(self, upload_id: UUID) -> None:
+        """Soft-delete a registry row the way retention / the external delete does."""
+        await self.app.state.user_upload_store.soft_delete(  # type: ignore[attr-defined]
+            upload_id=upload_id, tenant_id=_TENANT, now=datetime.now(UTC)
+        )
+
     async def put_document(self, ref: str, data: bytes) -> None:
         """A conversation-view upload: bytes in this thread's ``work/`` + its registry row."""
         self.workspace.workspace_file_contents[self.conversation_path(ref)] = data
@@ -402,31 +408,49 @@ async def test_missing_document_is_gone(world: World) -> None:
 
 
 @pytest.mark.asyncio
-async def test_conversation_document_without_a_live_registry_row_is_gone(world: World) -> None:
-    """L3 — retention / delete soft-deletes the row and may keep the bytes for a while;
-    the attachment is expired as soon as the row is."""
+async def test_unregistered_conversation_document_falls_back_to_the_path(world: World) -> None:
+    """Console uploads into a conversation before B-281 have no registry row at all (prod
+    has such conversations since 11-04): path-only — served when the bytes are there,
+    410 when they are not."""
     world.workspace.workspace_file_contents = {world.conversation_path("uploads/a.txt"): b"x"}
-    _gone(await world.get("uploads/a.txt"))  # bytes, no row at all
-    upload_id = await world.register_upload("uploads/a.txt")
-    assert (await world.get("uploads/a.txt")).status_code == 200
-    await world.app.state.user_upload_store.soft_delete(  # type: ignore[attr-defined]
-        upload_id=upload_id, tenant_id=_TENANT, now=datetime.now(UTC)
-    )
-    _gone(await world.get("uploads/a.txt"))
-    # Only the one read with a live row touched the store.
-    assert world.workspace.workspace_reads == [
-        (_TENANT, world.owner_id, world.conversation_path("uploads/a.txt"))
-    ]
+    resp = await world.get("uploads/a.txt")
+    assert resp.status_code == 200, resp.text
+    assert resp.content == b"x"
+    _gone(await world.get("uploads/missing.txt"))
 
 
 @pytest.mark.asyncio
-async def test_conversation_document_registered_to_another_thread_is_gone(world: World) -> None:
-    """L4 — the row must be this conversation's: the same stored name registered under
-    another thread does not vouch for a file in this one."""
+async def test_conversation_document_whose_rows_are_all_deleted_is_gone(world: World) -> None:
+    """L3 — retention / delete soft-deletes the row and may keep the bytes for a while;
+    once every row for this name in this conversation is deleted, it is expired — and the
+    bytes are not even read."""
     world.workspace.workspace_file_contents = {world.conversation_path("uploads/a.txt"): b"x"}
-    await world.register_upload("uploads/a.txt", thread_id=uuid4())
-    await world.register_upload("uploads/b.txt")
+    await world.delete_upload(await world.register_upload("uploads/a.txt"))
     _gone(await world.get("uploads/a.txt"))
+    assert world.workspace.workspace_reads == []
+
+
+@pytest.mark.asyncio
+async def test_conversation_document_with_a_live_row_is_served(world: World) -> None:
+    """One live row is enough — e.g. the name was uploaded again after an earlier row of
+    it was deleted."""
+    world.workspace.workspace_file_contents = {world.conversation_path("uploads/a.txt"): b"x"}
+    await world.delete_upload(await world.register_upload("uploads/a.txt"))
+    await world.register_upload("uploads/a.txt")
+    assert (await world.get("uploads/a.txt")).status_code == 200
+
+
+@pytest.mark.asyncio
+async def test_rows_of_other_threads_or_names_do_not_decide(world: World) -> None:
+    """L4 — only this thread's rows for this very name count. Deleted rows of the same name
+    in another thread, or of another name here, leave a file with no row of its own on
+    path-only (the path itself is server-built inside this thread's directory)."""
+    world.workspace.workspace_file_contents = {world.conversation_path("uploads/a.txt"): b"x"}
+    await world.delete_upload(await world.register_upload("uploads/a.txt", thread_id=uuid4()))
+    await world.delete_upload(await world.register_upload("uploads/b.txt"))
+    resp = await world.get("uploads/a.txt")
+    assert resp.status_code == 200, resp.text
+    assert resp.content == b"x"
 
 
 @pytest.mark.asyncio
@@ -560,6 +584,7 @@ async def test_owner_reading_their_own_attachment_is_not_a_data_view(world: Worl
 
 @pytest.mark.asyncio
 async def test_a_failed_read_leaves_no_data_view_row(world: World) -> None:
+    await world.put_document("uploads/other.txt", b"x")  # the store answers "not found"
     _gone(await world.get("uploads/a.txt", headers=_headers("colleague")))
     assert await world.views() == []
 
