@@ -187,6 +187,36 @@ async def test_a_pre_sha256_row_is_compared_by_content(world: _World) -> None:
     assert not original.exists()
 
 
+@pytest.mark.parametrize(
+    ("size_bytes", "sha256"),
+    [(len(_BODY), None), (None, hashlib.sha256(_BODY).hexdigest()), (None, None)],
+    ids=["audit-without-sha256", "audit-without-size", "audit-without-both"],
+)
+async def test_a_reference_missing_size_or_sha256_next_to_a_full_one(
+    world: _World, size_bytes: int | None, sha256: str | None
+) -> None:
+    """A registered upload and an older audit row of the same file (no sha256 / size, written
+    before those were recorded) name the same copy with ``None`` next to a value: grouping
+    them must not compare ``None`` with ``str`` / ``int`` (live test 97.7 crashed on 16 of
+    27 candidates)."""
+    meta, original, _ = await _migrated(world)
+    world.audits.append(
+        AuditedUpload(
+            tenant_id=meta.tenant_id,
+            thread_id=meta.thread_id,
+            ref=_REF,
+            size_bytes=size_bytes,
+            sha256=sha256,
+        )
+    )
+
+    originals, tally = world.plan()
+    assert tally.checked == 1
+    assert len(originals) == 1 and len(originals[0].copies) == 2
+    assert world.release(unlink=True) == [("deleted", len(_BODY))]
+    assert not original.exists()
+
+
 async def test_two_migrated_conversations_sharing_one_original(world: _World) -> None:
     """Two old conversations of one agent uploaded the same bytes under the same name (one file
     in the shared ``uploads/``); both migrated → the original goes once."""
