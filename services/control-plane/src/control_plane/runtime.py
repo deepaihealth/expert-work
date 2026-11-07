@@ -68,7 +68,11 @@ from expert_work.runtime.audit import DefaultSecretRedactor
 from expert_work.runtime.audit.logger import AuditLogger
 from expert_work.runtime.checkpointer import make_checkpoint_serde
 from expert_work.runtime.llm import InMemoryRedisCache, LLMResponseCache
-from expert_work.runtime.middleware import LangfuseClient, RecordingLangfuseClient
+from expert_work.runtime.middleware import (
+    BreakerRegistry,
+    LangfuseClient,
+    RecordingLangfuseClient,
+)
 from expert_work.runtime.runs import RunEventStore, RunManager, RunStore
 from expert_work.runtime.secret_store import SecretStore, parse_secret_ref
 from expert_work.runtime.skill_assets import ObjectStore as SkillAssetStore
@@ -2398,6 +2402,13 @@ def build_middleware_env(
     :class:`TokenUsageMiddleware` lands on the ``after_llm_call`` chain
     of every agent built from this env. ``app.py`` wires the SQL store;
     tests can leave it unset to keep the chain shape unchanged.
+
+    B-297 — one :class:`BreakerRegistry` per env, and ``app.py`` builds the env
+    once per process, so every agent / sub-agent / run / memory-writeback
+    router in this process shares breaker state per upstream (keyed by
+    ``provider:model[#idx]`` + credential/endpoint fingerprint). Per process,
+    not cross-replica: each replica learns an outage from its own first
+    failures.
     """
     secret_redactor = DefaultSecretRedactor()
 
@@ -2410,6 +2421,7 @@ def build_middleware_env(
             langfuse_client if langfuse_client is not None else RecordingLangfuseClient()
         ),
         redact_text=_redact_text,
+        breaker_registry=BreakerRegistry(),
         token_usage_store=token_usage_store,
     )
 

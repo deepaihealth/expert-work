@@ -47,6 +47,7 @@ from typing import Any, Protocol, runtime_checkable
 
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage
 
+from expert_work.common.context import get_current_run_id
 from expert_work.common.observability import expert_work_counter
 from expert_work.protocol import StructuredOutputSpec
 from expert_work.runtime.middleware import (
@@ -62,6 +63,17 @@ from expert_work.runtime.middleware import (
     LLMUnauthorizedError,
     MiddlewareChain,
     MiddlewareContext,
+    notify_first_progress,
+)
+from expert_work.runtime.tokens import TokenEstimator, default_estimator
+from orchestrator.llm.failover import (
+    StickyRouteStore,
+    default_sticky_store,
+    failover_reason,
+    fallback_first_token_timeout,
+    plan_walk,
+    record_failover,
+    remember_route,
 )
 from orchestrator.llm.oauth_provider import OAuthCapableProvider
 from orchestrator.llm.providers._streaming import (
@@ -177,6 +189,10 @@ class ProviderHandle:
     provider: LLMProvider
     key: str
     group: str = ""
+    #: B-297 — the E.4 circuit-breaker identity (``key`` + credential/endpoint
+    #: fingerprint, :func:`~orchestrator.llm.failover.breaker_key_for`); empty
+    #: → the breaker keys by ``key``. Metrics keep using ``key``.
+    breaker_key: str = ""
 
 
 # Stream Y-MK — key/account-level failures. The router advances to the next
@@ -384,6 +400,15 @@ _delta_sink: ContextVar[Callable[[LLMDelta], Awaitable[None]] | None] = ContextV
     "_llm_delta_sink", default=None
 )
 
+# B-297 — ``(has_fallback, has_alternative)`` of the provider attempt in flight
+# (see :class:`~orchestrator.llm.failover.WalkPlan`); set per attempt in
+# ``_dispatch``, copied into the E.4 payload in ``_invoke_once`` and read by
+# ``_invoke_provider`` for the first-token cap. ContextVar for the same reason
+# as ``_delta_sink``: no threading through the OAuth / validation call chain.
+_attempt_hints: ContextVar[tuple[bool, bool]] = ContextVar(
+    "_llm_attempt_hints", default=(False, False)
+)
+
 
 @dataclass
 class LLMRouter:
@@ -394,10 +419,11 @@ class LLMRouter:
     breaker, E.5 langfuse span recording, and any future
     around-LLM-call middleware run **per provider** (Mini-ADR E-13).
 
-    See module docstring for the full fallback semantics. The router is
-    stateless — all per-provider state (breaker counters, rate-limit
-    tokens) lives in middleware / inside :class:`LLMProvider` adapters
-    so swapping the router or wrapping it with retries is safe.
+    See module docstring for the full fallback semantics. The router instance
+    holds no per-call state — per-provider state (breaker counters, rate-limit
+    tokens) lives in middleware / inside :class:`LLMProvider` adapters, and the
+    B-297 per-run stickiness lives in :attr:`sticky_store` keyed by run_id, so
+    one cached router can serve concurrent runs.
     """
 
     providers: Sequence[ProviderHandle]
@@ -410,6 +436,14 @@ class LLMRouter:
     #: cap around ``complete()``. ``None``/``0`` disables the respective timer.
     first_token_timeout_s: float | None = field(default=None)
     idle_timeout_s: float | None = field(default=None)
+    #: B-297 — per-run stickiness memory (process-wide by default; keyed by
+    #: run_id + chain, so a cached router shared by concurrent runs is safe).
+    #: ``None`` disables stickiness.
+    sticky_store: StickyRouteStore | None = field(default_factory=default_sticky_store)
+    #: B-297 — prompt-size estimate for the first-token cap with a backup
+    #: (60 s / 120 s above 100k tokens). ``None`` → the process-wide shared
+    #: estimator the context gates already use (memoised per message text).
+    token_estimator: TokenEstimator | None = field(default=None)
 
     async def __call__(
         self,
@@ -446,13 +480,32 @@ class LLMRouter:
         #   * provider-level   → skip the rest of THIS group's sibling keys
         #     and jump to the next provider (a 5xx/network/timeout hits every
         #     sibling key identically, so trying them wastes wall-clock).
+        # B-297 — the walk starts at the group this run already failed over to
+        # (``plan_walk``), and each attempt tells E.4 whether a fallback remains.
+        groups = tuple(_group_of(h) for h in handles)
+        run_id = get_current_run_id()
+        store = self.sticky_store if run_id is not None else None
+        sticky = store.get(run_id, groups) if store is not None and run_id is not None else None
+        plan = plan_walk(groups, sticky)
+        if plan.start_group != groups[0]:
+            record_failover(groups[0], plan.start_group, "sticky")
+            logger.info(
+                "llm_router.sticky_start from_group=%s to_group=%s",
+                groups[0],
+                plan.start_group,
+            )
         last_exc: LLMError | None = None
-        n = len(handles)
-        i = 0
-        while i < n:
+        failed: tuple[str, str] | None = None  # (group, reason) of the last failure
+        pos = 0
+        while pos < len(plan.order):
+            i = plan.order[pos]
             handle = handles[i]
+            if failed is not None and failed[0] != groups[i]:
+                record_failover(failed[0], groups[i], failed[1])
+            failed = None
+            token = _attempt_hints.set((plan.has_fallback(pos), plan.has_alternative(pos)))
             try:
-                return await self._call_one(
+                response = await self._call_one(
                     handle, messages=messages, tools=tools, output_schema=output_schema
                 )
             except LLMOutputValidationError:
@@ -468,13 +521,14 @@ class LLMRouter:
                 raise
             except _KEY_LEVEL_ERRORS as exc:
                 last_exc = exc
+                failed = (groups[i], failover_reason(exc))
                 logger.warning(
                     "llm_router.key_failed idx=%d key=%s err=%s",
                     i,
                     handle.key,
                     type(exc).__name__,
                 )
-                i += 1
+                pos += 1
             except LLMClientError:
                 logger.warning(
                     "llm_router.client_error_no_fallback idx=%d key=%s",
@@ -484,16 +538,19 @@ class LLMRouter:
                 raise
             except LLMError as exc:
                 last_exc = exc
-                group = _group_of(handle)
+                failed = (groups[i], failover_reason(exc))
                 logger.warning(
                     "llm_router.provider_failed idx=%d key=%s err=%s",
                     i,
                     handle.key,
                     type(exc).__name__,
                 )
-                i += 1
-                while i < n and _group_of(handles[i]) == group:
-                    i += 1
+                pos = plan.next_group(pos)
+            else:
+                remember_route(store, run_id, plan, sticky, groups[i])
+                return response
+            finally:
+                _attempt_hints.reset(token)
 
         assert last_exc is not None  # noqa: S101 - loop invariant
         raise AllProvidersExhaustedError(last_exc)
@@ -620,8 +677,16 @@ class LLMRouter:
             assert isinstance(result, AIMessage)  # noqa: S101 - provider Protocol contract
             return result
 
+        has_fallback, has_alternative = _attempt_hints.get()
         payload: dict[str, Any] = {
             "provider_key": handle.key,
+            # B-297 — E.4 picks its retry budget by ``has_fallback`` (another
+            # group follows) and refuses an open breaker / skips 429 retries
+            # by ``has_alternative`` (any later handle, sibling keys included).
+            "has_fallback": has_fallback,
+            "has_alternative": has_alternative,
+            # B-297 — a half-open probe's lease never undercuts this.
+            "attempt_deadline_s": self._attempt_deadline_s(handle, messages, output_schema),
             "messages": list(messages),
             "tools": list(tools),
             # B-187 — read by the Langfuse middleware: the model this handle
@@ -632,6 +697,8 @@ class LLMRouter:
                 stream=_streams(handle.provider, output_schema),
             ),
         }
+        if handle.breaker_key:
+            payload["breaker_key"] = handle.breaker_key
         if output_schema is not None:
             # RT-1 — informational for observability middlewares; absent
             # on unstructured calls so the payload stays byte-identical.
@@ -687,6 +754,7 @@ class LLMRouter:
                 handle,
                 _stream(handle.provider, messages=messages, tools=tools, output_schema=None),
                 _provider_assembler(handle.provider),
+                first_token_timeout_s=self._attempt_deadline_s(handle, messages, output_schema),
             )
         result = await self._invoke_with_deadline(
             handle,
@@ -695,16 +763,38 @@ class LLMRouter:
         assert isinstance(result, AIMessage)  # noqa: S101
         return result
 
+    def _attempt_deadline_s(
+        self,
+        handle: ProviderHandle,
+        messages: Sequence[BaseMessage],
+        output_schema: StructuredOutputSpec | None,
+    ) -> float | None:
+        """The deadline one attempt runs under: time to first token when it
+        streams, the whole answer otherwise (``first_token_timeout_s``).
+
+        B-297 — a streaming attempt with a backup group is capped (60 s /
+        120 s for large prompts): don't wait out the long single-model
+        deadline on a primary that sends nothing."""
+        deadline = self.first_token_timeout_s
+        if _streams(handle.provider, output_schema) and _attempt_hints.get()[0]:
+            deadline = fallback_first_token_timeout(
+                deadline, messages, self.token_estimator or default_estimator()
+            )
+        return deadline
+
     async def _drive_stream(
         self,
         handle: ProviderHandle,
         stream: AsyncIterator[LLMDelta],
         assembler: StreamAssembler,
+        *,
+        first_token_timeout_s: float | None,
     ) -> AIMessage:
         """Consume a provider delta stream under the two-threshold policy.
 
         Phase 1 (until the first *progress* delta): bounded by
-        ``first_token_timeout_s``; a stall or error is retryable →
+        ``first_token_timeout_s`` (the router's, or the B-297 cap when a
+        backup exists); a stall or error is retryable →
         fallback. Phase 2 (after the first progress delta): bounded by
         ``idle_timeout_s``; a stall ends the turn with the partial
         output, stamped :data:`~orchestrator.llm.stall.STALLED_AFTER_S`
@@ -718,7 +808,7 @@ class LLMRouter:
         # Phase 1 — wait for the first progress delta.
         while not first_progress:
             try:
-                delta = await _next_delta(it, self.first_token_timeout_s)
+                delta = await _next_delta(it, first_token_timeout_s)
             except _StreamEnded:
                 return assembler.build()  # ended with no progress → empty answer
             except TimeoutError as exc:
@@ -726,17 +816,20 @@ class LLMRouter:
                 logger.warning(
                     "llm_router.first_token_timeout key=%s deadline_s=%s",
                     handle.key,
-                    self.first_token_timeout_s,
+                    first_token_timeout_s,
                 )
                 raise LLMStreamStaleError(
                     f"provider {handle.key!r} produced no token within "
-                    f"first_token_timeout_s={self.first_token_timeout_s}"
+                    f"first_token_timeout_s={first_token_timeout_s}"
                 ) from exc
             assembler.add(delta)
             if sink is not None:
                 await sink(delta)
             first_progress = delta.has_progress
             finished = finished or delta.finish_reason is not None
+        # B-297 — the upstream answers: resolves a half-open breaker probe now
+        # rather than after the whole generation.
+        await notify_first_progress()
 
         # Phase 2 — consume the rest under the idle timeout.
         while True:

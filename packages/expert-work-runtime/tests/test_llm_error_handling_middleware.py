@@ -74,8 +74,8 @@ class SequenceTerminal:
                 raise exc
 
 
-def _ctx(provider_key: str = "test-key") -> MiddlewareContext:
-    return MiddlewareContext(payload={"provider_key": provider_key})
+def _ctx(provider_key: str = "test-key", *, has_fallback: bool = False) -> MiddlewareContext:
+    return MiddlewareContext(payload={"provider_key": provider_key, "has_fallback": has_fallback})
 
 
 def _mw(
@@ -194,7 +194,8 @@ async def test_exhausted_retries_records_failure_and_raises() -> None:
         await mw(_ctx(), terminal)
     assert terminal.calls == 3  # 1 initial + 2 retries
     breaker = await mw.breaker_registry.get("test-key")
-    assert breaker.consecutive_failures == 1
+    # B-297 — every failed upstream attempt counts, not one per exhausted call.
+    assert breaker.consecutive_failures == 3
 
 
 @pytest.mark.asyncio
@@ -220,8 +221,10 @@ async def test_open_breaker_raises_immediately_without_call() -> None:
             await mw(_ctx(), terminal)
 
     probe = SequenceTerminal([None])
+    # B-297 — an OPEN breaker short-circuits only when the router has a
+    # fallback to move on to (a single-model chain still gets its attempt).
     with pytest.raises(CircuitOpenError) as excinfo:
-        await mw(_ctx(), probe)
+        await mw(_ctx(has_fallback=True), probe)
     assert excinfo.value.key == "test-key"
     assert probe.calls == 0, "terminal must not be invoked when breaker OPEN"
 
