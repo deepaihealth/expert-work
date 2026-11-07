@@ -56,6 +56,7 @@ from dataclasses import dataclass, field, replace
 from typing import Any, Literal, Protocol, runtime_checkable
 
 import anyio
+import httpx
 
 from expert_work.common.uplift_metrics import (
     record_mcp_call,
@@ -524,6 +525,38 @@ def _error_kind(exc: BaseException) -> str:
     while isinstance(exc, BaseExceptionGroup) and exc.exceptions:
         exc = exc.exceptions[0]
     return type(exc).__name__
+
+
+#: B-294 —— 「对端连不上 / 会话断了」这一类错误(不含编程错误、鉴权 4xx、取消)。
+_UNREACHABLE_ERRORS: tuple[type[BaseException], ...] = (
+    ConnectionError,  # 含 MCPSessionBrokenError
+    # 含 MCPCallTimeoutError。比 timeout_s 还慢的 list_tools 也归这一类:跳过,
+    # 且那条会话被标陈旧、后台重建(B-177)。
+    TimeoutError,
+    httpx.TransportError,
+    anyio.BrokenResourceError,
+    anyio.ClosedResourceError,
+)
+
+
+def is_mcp_server_unreachable(exc: BaseException) -> bool:
+    """B-294 —— ``exc`` 是不是「服务连不上 / 会话断了」。
+
+    SDK 的传输把 httpx 错误包在 TaskGroup 的 ``ExceptionGroup`` 里:一组里**每个**
+    叶子都是这一类才算,混着别的(编程错误)就不算。网关后面的服务没了时回的是
+    5xx(``HTTPStatusError``),也算;4xx(令牌失效等)不算。对端刚死时,SDK 的接收
+    循环收尾会先把挂着的请求失败成 ``McpError(CONNECTION_CLOSED)``(此刻传输还没报
+    死),也算;对端回的其它 ``McpError`` 不算。"""
+    from mcp.shared.exceptions import McpError
+    from mcp.types import CONNECTION_CLOSED
+
+    if isinstance(exc, BaseExceptionGroup):
+        return bool(exc.exceptions) and all(is_mcp_server_unreachable(e) for e in exc.exceptions)
+    if isinstance(exc, httpx.HTTPStatusError):
+        return exc.response.status_code >= 500
+    if isinstance(exc, McpError):
+        return exc.error.code == CONNECTION_CLOSED
+    return isinstance(exc, _UNREACHABLE_ERRORS)
 
 
 #: B-177 — the error the SDK's StreamableHTTP transport synthesises for an HTTP
@@ -1568,10 +1601,26 @@ async def register_mcp_tools(
       tool from THIS pass while another pass binds it just fine, so a single
       pass's leftovers are not evidence of anything (review N-1).
 
+    B-294 — a server that cannot be reached (:func:`is_mcp_server_unreachable`)
+    is skipped: nothing registered, the skip recorded on the ``registry``
+    (``note_skipped_mcp_server``) so the control plane caches this build only
+    briefly; the pooled client reconnects itself on the next build. Any other
+    error still propagates.
+
     Returns the namespaced names registered, useful for audit
     attribution at orchestrator startup.
     """
-    tools = await client.list_tools()
+    try:
+        tools = await client.list_tools()
+    except Exception as exc:
+        if not is_mcp_server_unreachable(exc):
+            raise
+        # 只记服务名和异常类型:异常文本里可能带 URL / 令牌。
+        logger.warning(
+            "mcp.server_unreachable_skipped server=%s err=%s", server_name, _error_kind(exc)
+        )
+        registry.note_skipped_mcp_server(server_name)
+        return []
     # 边注册边从这份副本里划掉匹配上的。**剩下的什么也不是** —— 兄弟 ``mcp``
     # 条目的 ``allow_tools`` 能把一个别处绑得好好的工具挡在这一趟之外,所以
     # 单趟的剩余项不构成「这台服务器没有这个工具」的证据(评审 N-1:按剩余项

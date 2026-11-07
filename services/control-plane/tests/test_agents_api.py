@@ -1166,6 +1166,37 @@ async def test_a_fixed_param_the_tool_does_not_declare_yet_gets_its_own_warning(
     assert "(project_code, detail_level)" not in warning
 
 
+@pytest.mark.asyncio
+async def test_a_server_unreachable_at_save_time_is_named_in_the_warning(
+    b5_app_client: tuple[object, AsyncClient],
+) -> None:
+    """B-294 —— 试建时某台 MCP 服务连不上,构建跳过它照常成功;保存照常,但要说出来:
+    它的工具和参数绑定这次都没核对。与落空绑定的告警并存。"""
+    app, client = b5_app_client
+
+    async def _built(spec, *, tenant_id=None, user_id=None):
+        return SimpleNamespace(
+            skipped_mcp_servers=("deepcare",),
+            unmatched_arg_bindings=(
+                UnmatchedArgBinding(
+                    server="records", tool="fetch", params=("pc",), reason="tool_missing"
+                ),
+            ),
+        )
+
+    app.state.agent_runtime.agent_builder = _built  # type: ignore[attr-defined]
+
+    resp = await client.post("/v1/agents", json={"manifest_yaml": _VALID_YAML})
+    assert resp.status_code == 201, resp.text
+    warning = resp.json()["data"]["build_warning"]
+    assert warning is not None
+    assert (
+        "MCP server(s) could not be reached during this save check, so their tools and "
+        "arg_bindings were not checked: deepcare"
+    ) in warning
+    assert "no such tool in the assembled catalog: records/fetch" in warning
+
+
 # B-112 —— 模型名写错:以前构建放行,第一个 run 才被厂商 404(4xx 不切备用)。
 _TYPO_QWEN_YAML = _VALID_YAML.replace(
     "provider: anthropic\n    name: claude-sonnet-4-6",

@@ -330,6 +330,26 @@ def catalog_build_cacheable(keyed: str | None, built: BuiltAgent, *, checked: bo
     return False
 
 
+#: B-294 —— 跳过了连不上的 MCP 服务的构建在缓存里只留这么久(秒;与 B-292 重拨同一节奏)。
+DEGRADED_BUILD_TTL_S = 60.0
+
+
+def build_cache_ttl_s(built: BuiltAgent, ttl_s: float) -> float:
+    """B-294 —— ``built`` 在构建缓存里留多久。跳过了连不上的 MCP 服务时只留
+    ``min(ttl_s, DEGRADED_BUILD_TTL_S)``:留满 ``ttl_s``,服务恢复后整个 TTL 里都没有它的
+    工具;一点不留,服务断着的时候每个 run / 每次委派都要重新构建、重拨一次。过期后下一次
+    构建重新 ``list_tools``,池里的客户端自己重连(B-177)。"""
+    if not built.skipped_mcp_servers:
+        return ttl_s
+    degraded = min(ttl_s, DEGRADED_BUILD_TTL_S)
+    logger.info(
+        "control_plane.build_cached_short reason=mcp_server_skipped count=%d ttl_s=%.0f",
+        len(built.skipped_mcp_servers),
+        degraded,
+    )
+    return degraded
+
+
 @dataclass
 class AgentRuntime:
     """The control-plane's in-process agent execution surface.
@@ -628,8 +648,9 @@ class AgentRuntime:
         return None
 
     def _store(self, key: _CacheKey, built: BuiltAgent) -> None:
-        """Cache ``built`` under ``key`` with a fresh TTL, LRU-bounded."""
-        self._cache[key] = (built, self._clock() + self.cache_ttl_s)
+        """Cache ``built`` under ``key`` with a fresh TTL, LRU-bounded.
+        B-294 —— 跳过了 MCP 服务的构建 TTL 更短(:func:`build_cache_ttl_s`)。"""
+        self._cache[key] = (built, self._clock() + build_cache_ttl_s(built, self.cache_ttl_s))
         self._cache.move_to_end(key)
         while len(self._cache) > self.cache_max_size:
             # LRU eviction — pure abandonment, no hook fan-out (same

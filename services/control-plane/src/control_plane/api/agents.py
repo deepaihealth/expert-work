@@ -1124,7 +1124,23 @@ async def _check_buildable(
         )
     record_manifest_build_check(outcome="ok")
     logger.info("manifest.build_check_ok ms=%.0f", (time.monotonic() - started) * 1000)
-    return _BuildCheck(warning=_unmatched_binding_warning(built))
+    warnings = [
+        w for w in (_skipped_mcp_server_warning(built), _unmatched_binding_warning(built)) if w
+    ]
+    return _BuildCheck(warning=" ".join(warnings) or None)
+
+
+def _skipped_mcp_server_warning(built: Any) -> str | None:
+    """B-294 —— 试建时连不上而被跳过的 MCP 服务:保存照常(对方临时不可达不该卡住保存),
+    但要说出来 —— 它的工具和参数绑定这次都没核对。``getattr`` 兜底同
+    :func:`_unmatched_binding_warning`。"""
+    skipped = getattr(built, "skipped_mcp_servers", ()) or ()
+    if not skipped:
+        return None
+    return (
+        "MCP server(s) could not be reached during this save check, so their tools and "
+        "arg_bindings were not checked: " + ", ".join(skipped) + "."
+    )
 
 
 def _unmatched_binding_warning(built: Any) -> str | None:
