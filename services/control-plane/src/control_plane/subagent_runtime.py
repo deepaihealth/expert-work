@@ -32,6 +32,7 @@ from control_plane.runtime import (
     make_mcp_allowlist_provider,
     make_provider_key_resolver,
     make_skill_resolver,
+    mcp_build_cacheable,
     resolve_defenses,
 )
 from control_plane.tenancy import TenantConfigService
@@ -462,7 +463,10 @@ def make_child_agent_builder(
                 child_tool_env.knowledge_retriever is not None
                 and record.spec.spec.knowledge is not None
             )
-            if catalog_build_cacheable(key[-1], built, checked=keyed_catalog):
+            # B-294 —— 跳过了连不上的 MCP 服务的构建同样只交出不缓存(``mcp_build_cacheable``)。
+            if catalog_build_cacheable(
+                key[-1], built, checked=keyed_catalog
+            ) and mcp_build_cacheable(built):
                 cache[key] = (built, clock() + cache_ttl_s)
                 cache.move_to_end(key)
                 while len(cache) > cache_max_size:

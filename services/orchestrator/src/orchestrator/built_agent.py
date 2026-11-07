@@ -117,3 +117,7 @@ class BuiltAgent:
     #: failed). The control-plane build caches compare it with their key's catalog
     #: slot and do not cache a build whose catalog differs from what was keyed.
     knowledge_catalog_fingerprint: str | None = None
+    #: B-294 —— 本次构建因连不上而跳过的 MCP 服务(``ToolRegistry.skipped_mcp_servers``)。
+    #: 非空时控制面的构建缓存不收这份:缓存了,服务恢复后整个 TTL 里还是没有它的工具;
+    #: 不缓存,下一次构建由池里的客户端自己重连(B-177),工具就回来了。
+    skipped_mcp_servers: tuple[str, ...] = ()

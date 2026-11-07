@@ -370,10 +370,14 @@ async def build_tool_registry(
             if u.reason == "params_absent"
             and set(u.params) == configured_args.get((u.server, u.tool), set())
         }
+        # B-294 —— 本次连不上而跳过的服务:它的绑定没落地不是「目录里没这个工具」。
+        skipped = set(registry.skipped_mcp_servers())
         for binding in all_arg_bindings:
             key = (binding.server, binding.tool)
             wire_name = landed.get(key)
             params = (*binding.args, *binding.fixed)
+            if wire_name is None and binding.server in skipped:
+                continue
             if wire_name is None:
                 registry.note_unmatched_arg_binding(
                     binding.server, binding.tool, params, reason="tool_missing"

@@ -45,6 +45,9 @@ _SPEC = AgentSpec.model_validate(_MANIFEST)
 class _Built:
     """Stand-in BuiltAgent: just remembers which build produced it."""
 
+    #: B-294 —— 构建缓存会看这一项;桩没跳过任何 MCP 服务。
+    skipped_mcp_servers: tuple[str, ...] = ()
+
     def __init__(self, n: int) -> None:
         self.n = n
 

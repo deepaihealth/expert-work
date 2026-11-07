@@ -480,6 +480,33 @@ async def test_build_agent_carries_the_manifest_arg_bindings() -> None:
 
 
 @pytest.mark.asyncio
+async def test_build_agent_skips_an_unreachable_mcp_server_and_says_so() -> None:
+    """B-294 —— 池里的服务连不上:构建照样成功(以前整个抛出、run 入口 500),
+    ``BuiltAgent.skipped_mcp_servers`` 报出它,控制面据此不缓存这次构建。"""
+
+    class _Down(RecordingMCPClient):
+        async def list_tools(self) -> Any:
+            raise ExceptionGroup("tg", [ConnectionRefusedError("refused")])
+
+    doc = deepcopy(_MINIMAL_SPEC)
+    doc["spec"]["tools"] = [{"type": "mcp"}]
+    pool = MCPServerPool()
+    await pool.add("deepcare", _Down())
+    await pool.add(
+        "ok", RecordingMCPClient(tools=(MCPToolDef(name="t1", description="t1", input_schema={}),))
+    )
+    async with make_checkpointer("memory") as cp:
+        built = await _build(
+            AgentSpec.model_validate(doc),
+            secret_store=_secret_store(),
+            checkpointer=cp,
+            tool_env=ToolEnv(mcp_pool=pool),
+        )
+    assert built.skipped_mcp_servers == ("deepcare",)
+    assert "mcp__ok__t1" in {entry.name for entry in built.tool_catalog}
+
+
+@pytest.mark.asyncio
 async def test_build_agent_max_steps_from_workflow() -> None:
     doc = deepcopy(_MINIMAL_SPEC)
     doc["spec"]["workflow"] = {"type": "react", "max_iterations": 5}

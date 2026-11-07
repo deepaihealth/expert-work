@@ -330,6 +330,18 @@ def catalog_build_cacheable(keyed: str | None, built: BuiltAgent, *, checked: bo
     return False
 
 
+def mcp_build_cacheable(built: BuiltAgent) -> bool:
+    """B-294 —— 构建跳过了连不上的 MCP 服务时只交出、不缓存。缓存了,服务恢复后整个
+    TTL 里这个智能体都没有它的工具;不缓存,下一次构建由池里的客户端自己重连(B-177)。"""
+    if not built.skipped_mcp_servers:
+        return True
+    logger.info(
+        "control_plane.build_not_cached reason=mcp_server_skipped count=%d",
+        len(built.skipped_mcp_servers),
+    )
+    return False
+
+
 @dataclass
 class AgentRuntime:
     """The control-plane's in-process agent execution surface.
@@ -563,7 +575,9 @@ class AgentRuntime:
                     return built
                 continue
             keyed_catalog = self.knowledge_store is not None and spec.spec.knowledge is not None
-            if catalog_build_cacheable(key[-1], built, checked=keyed_catalog):
+            if catalog_build_cacheable(
+                key[-1], built, checked=keyed_catalog
+            ) and mcp_build_cacheable(built):
                 self._store(key, built)
             return built
         raise RuntimeError("get_agent: retry loop exited without returning")  # pragma: no cover
