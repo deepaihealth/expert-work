@@ -370,10 +370,14 @@ async def build_tool_registry(
             if u.reason == "params_absent"
             and set(u.params) == configured_args.get((u.server, u.tool), set())
         }
+        # B-294 —— 本次连不上而跳过的服务:它的绑定没落地不是「目录里没这个工具」。
+        skipped = set(registry.skipped_mcp_servers())
         for binding in all_arg_bindings:
             key = (binding.server, binding.tool)
             wire_name = landed.get(key)
             params = (*binding.args, *binding.fixed)
+            if wire_name is None and binding.server in skipped:
+                continue
             if wire_name is None:
                 registry.note_unmatched_arg_binding(
                     binding.server, binding.tool, params, reason="tool_missing"
@@ -1073,6 +1077,10 @@ async def _register_mcp(
     allow = set(entry.allow_tools) or None
     server_select = set(entry.servers) or None  # None = no per-agent restriction
     registered_servers: set[str] = set()
+    # B-294 —— 前面的 ``mcp`` 条目这次构建已经跳过的服务不再拨(对端接了不回时每拨一次
+    # 就是一个 ``timeout_s``)。按名字在四个池里都跳过,所以名字照旧占着:同名的低优先级
+    # 服务不会在后面的条目里顶上来。
+    already_skipped = set(registry.skipped_mcp_servers())
     bindings_for = {
         server: bindings_by_tool(arg_bindings, server=server)
         for server in {binding.server for binding in arg_bindings}
@@ -1085,6 +1093,8 @@ async def _register_mcp(
             if server_allow is not None and server_name not in server_allow:
                 continue
             if server_select is not None and server_name not in server_select:
+                continue
+            if server_name in already_skipped:
                 continue
             client = env.mcp_pool.get(server_name)
             if client is None:  # pragma: no cover - name came from names()
@@ -1121,6 +1131,8 @@ async def _register_mcp(
                 continue
             if server_select is not None and server_name not in server_select:
                 continue
+            if server_name in already_skipped:
+                continue
             client = env.platform_mcp_pool.get(server_name)
             if client is None:  # pragma: no cover - name came from names()
                 continue
@@ -1146,6 +1158,8 @@ async def _register_mcp(
                 continue
             if server_select is not None and server_name not in server_select:
                 continue
+            if server_name in already_skipped:
+                continue
             client = env.tenant_mcp_pool.get(server_name)
             if client is None:  # pragma: no cover
                 continue
@@ -1169,6 +1183,8 @@ async def _register_mcp(
                 logger.info("user_mcp_oauth.server_shadowed")
                 continue
             if server_select is not None and server_name not in server_select:
+                continue
+            if server_name in already_skipped:
                 continue
             client = env.user_mcp_oauth_pool.get(server_name)
             if client is None:  # pragma: no cover

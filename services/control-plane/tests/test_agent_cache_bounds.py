@@ -86,7 +86,7 @@ def _make_runtime(
         spec: AgentSpec, *, tenant_id: UUID | None = None, user_id: str | None = None
     ) -> object:
         builds.append(spec.metadata.name)
-        return object()  # stand-in BuiltAgent
+        return BuiltAgent(graph=object(), system_prompt="", max_steps=1)  # type: ignore[arg-type]
 
     kwargs: dict[str, Any] = {}
     if clock is not None:
