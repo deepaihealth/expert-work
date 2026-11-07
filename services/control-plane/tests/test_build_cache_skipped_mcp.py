@@ -1,12 +1,13 @@
-"""B-294 —— 跳过了连不上的 MCP 服务的构建不进构建缓存。
+"""B-294 —— 跳过了连不上的 MCP 服务的构建在构建缓存里只留 60 秒。
 
 构建遇到连不上的 MCP 服务会跳过它、run 照常(``register_mcp_tools``)。这份「缺工具」
-的构建要是进了缓存,服务恢复后整个 TTL(30 分钟)里这个智能体还是没有那台服务的
-工具 —— 池里的客户端明明能自己重连(B-177),只是没人再去 ``list_tools``。所以它
-只交出、不缓存;下一次构建重新 ``list_tools``,服务回来了工具就回来了。
+的构建要是按正常 TTL(30 分钟)缓存,服务恢复后整个 TTL 里这个智能体都没有那台服务的
+工具 —— 池里的客户端明明能自己重连(B-177),只是没人再去 ``list_tools``;要是一点不
+缓存,服务断着的时候每个 run / 每次委派都要整套重新构建、重拨一次。所以它只留
+``DEGRADED_BUILD_TTL_S``(60 秒):窗口内复用,过了窗口重新构建,服务回来工具就回来。
 
 主智能体缓存(``AgentRuntime.get_agent``)和子智能体缓存(``make_child_agent_builder``)
-各有一份,两份都钉住。
+各有一份,两份都钉住;完整的构建照旧按正常 TTL。
 """
 
 from __future__ import annotations
@@ -18,6 +19,7 @@ import httpx
 import pytest
 from langgraph.checkpoint.memory import InMemorySaver
 
+from control_plane import runtime as runtime_mod
 from control_plane import subagent_runtime as subagent_mod
 from control_plane.runtime import AgentRuntime
 from control_plane.subagent_runtime import make_child_agent_builder
@@ -89,15 +91,39 @@ def _tools(built: BuiltAgent) -> set[str]:
     return {entry.name for entry in built.tool_catalog}
 
 
-async def test_the_tool_comes_back_once_the_server_does() -> None:
+class _Clock:
+    def __init__(self) -> None:
+        self.now = 1000.0
+
+    def __call__(self) -> float:
+        return self.now
+
+
+def test_degraded_ttl_is_short_and_never_longer_than_the_normal_one() -> None:
+    assert runtime_mod.DEGRADED_BUILD_TTL_S == 60.0
+    degraded = BuiltAgent(
+        graph=object(),  # type: ignore[arg-type]
+        system_prompt="",
+        max_steps=1,
+        skipped_mcp_servers=("peer",),
+    )
+    healthy = BuiltAgent(graph=object(), system_prompt="", max_steps=1)  # type: ignore[arg-type]
+    assert runtime_mod.build_cache_ttl_s(degraded, 1800.0) == 60.0
+    assert runtime_mod.build_cache_ttl_s(degraded, 30.0) == 30.0
+    assert runtime_mod.build_cache_ttl_s(healthy, 1800.0) == 1800.0
+
+
+async def test_the_tool_comes_back_within_the_short_window_after_the_server_does() -> None:
     peer = _Peer(tools=(MCPToolDef(name="echo", description="", input_schema={}),))
     pool = MCPServerPool()
     await pool.add("peer", peer)
     builder = _RegistryBuilder(ToolEnv(tenant_mcp_pool=pool))
+    clock = _Clock()
     rt = AgentRuntime(
         run_manager=RunManager(store=None),
         stream_bridge=InMemoryStreamBridge(),
         agent_builder=builder,
+        _clock=clock,
     )
     tenant = uuid4()
 
@@ -108,19 +134,27 @@ async def test_the_tool_comes_back_once_the_server_does() -> None:
     during = await _get()
     assert during.skipped_mcp_servers == ("peer",)
     assert "mcp__peer__echo" not in _tools(during)
-    assert len(rt._cache) == 0  # 缺工具的构建不入缓存
 
+    # 窗口内:复用缺工具的构建,不重新构建、不重拨(服务恢复了也一样)。
+    clock.now += 59
+    assert await _get() is during
     peer.down = False
+    assert await _get() is during
+    assert builder.calls == 1
+
+    # 过了窗口:重新构建,工具回来。
+    clock.now += 2
     after = await _get()
     assert builder.calls == 2
     assert "mcp__peer__echo" in _tools(after)
 
-    # 完整的构建照常入缓存:再取直接命中,不再构建。
+    # 完整的构建按正常 TTL 留着:过了 60 秒照样命中。
+    clock.now += rt.cache_ttl_s - 1
     assert await _get() is after
     assert builder.calls == 2
 
 
-async def test_the_child_build_cache_does_not_keep_a_build_that_skipped_a_server(
+async def test_the_child_build_cache_keeps_a_degraded_build_only_for_the_short_window(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     skipped: list[tuple[str, ...]] = [("peer",), ()]
@@ -140,18 +174,24 @@ async def test_the_child_build_cache_does_not_keep_a_build_that_skipped_a_server
     tenant = uuid4()
     store = InMemoryAgentSpecStore()
     await store.create(tenant_id=tenant, spec=_SPEC, spec_sha256="a" * 64, created_by="test")
+    clock = _Clock()
     builder = make_child_agent_builder(
         spec_store=store,
         secret_store=InMemorySecretStore(),  # type: ignore[arg-type]
         checkpointer=InMemorySaver(),
         base_tool_env=ToolEnv(),
+        clock=clock,
     )
 
     async def _delegate() -> str:
         built = await builder(tenant_id=tenant, name="researcher", version="1.0.0", depth=1)
         return built.system_prompt
 
-    assert await _delegate() == "b1"  # 跳过了服务:交出,不缓存
-    assert await _delegate() == "b2"  # 重建;完整的这份入缓存
+    assert await _delegate() == "b1"  # 跳过了服务
+    clock.now += 59
+    assert await _delegate() == "b1"  # 窗口内复用
+    clock.now += 2
+    assert await _delegate() == "b2"  # 过了窗口重建;完整的这份按正常 TTL
+    clock.now += 1800 - 1
     assert await _delegate() == "b2"
     assert calls == 2

@@ -2267,14 +2267,14 @@ asyncio.run(main())
 
 **背景**:智能体的远端 MCP 服务先连上、后掉线时,池里缓存的客户端还在;下一次构建(构建缓存未命中:改了智能体、构建过期、B-292 接回服务后清构建等)在 `register_mcp_tools` 里调 `list_tools()`,客户端重连也连不上,异常一路冒到 `run_agent_for_user` → `get_agent` → `build_tool_registry`,整轮 HTTP 500(11-07 测试 `fb03a0689` 实测:副本连上后关掉服务端,紧接着两轮都 500)。现在:
 
-- 只有「连不上 / 会话断了」这一类错误(`MCPSessionBrokenError` 等 `ConnectionError`、超时、httpx 传输错误、网关回的 5xx、anyio 流断;SDK 包在 `ExceptionGroup` 里的要求组里每一个都是这一类)跳过这台服务:这一轮没有它的工具、run 照常跑,warning 日志 `mcp.server_unreachable_skipped server=<名字> err=<异常类型>`(不打 URL / 令牌 / 异常文本)。别的错误(编程错误、401/403、取消)照旧抛出。四个池(运维文件池、平台共享目录、租户、用户 OAuth)走的是同一个函数。
-- 跳过了服务的构建**不进构建缓存**(主智能体与子智能体两份缓存都是),info 日志 `control_plane.build_not_cached reason=mcp_server_skipped`;下一轮重新构建、重新 `list_tools`,池里同一个客户端自己重连(B-177),服务回来了工具就回来,不用等池 TTL(1800 秒)或 B-292 的重拨(那条只管池构建时没连上的服务,这里客户端一直在池里)。
-- 代价:服务一直断着的时候,每一轮构建都会重拨它一次。对端拒绝连接 / 网关回 5xx 时很快;对端「接了不回」时每轮多等一个 `timeout_s`(修之前同样要等,而且等完 500)。
-- 平台服务掉线时名字照旧由平台占着,同名的租户服务不会顶上来;绑在掉线服务上的参数绑定不报「工具不存在」。
+- 只有「连不上 / 会话断了」这一类错误跳过这台服务:`MCPSessionBrokenError` 等 `ConnectionError`、超时(含比 `timeout_s` 还慢的 `list_tools`)、httpx 传输错误、网关回的 5xx、anyio 流断、SSE 对端刚死时 SDK 给挂着的请求的 `McpError(-32000 Connection closed)`;SDK 包在 `ExceptionGroup` 里的,要求组里每一个都是这一类。这一轮没有它的工具、run 照常跑,warning 日志 `mcp.server_unreachable_skipped server=<名字> err=<异常类型>`(不打 URL / 令牌 / 异常文本)。别的错误(编程错误、401/403、对端回的其它 `McpError`、取消)照旧抛出。四个池(运维文件池、平台共享目录、租户、用户 OAuth)走的是同一个函数。同一次构建里已经跳过的服务,后面的 `mcp` 条目不再拨。
+- 跳过了服务的构建在构建缓存里**只留 60 秒**(`DEGRADED_BUILD_TTL_S`,主智能体与子智能体两份缓存都是),info 日志 `control_plane.build_cached_short reason=mcp_server_skipped ttl_s=60`。60 秒内的 run 复用它(不重新构建、不重拨);过了 60 秒下一次构建重新 `list_tools`,池里同一个客户端自己重连(B-177),服务回来了工具就回来,不用等池 TTL(1800 秒)。B-292 的重拨不管这种情况(它只管池构建时没连上的服务,这里客户端一直在池里)。
+- 代价:服务一直断着的时候,每 60 秒(每个智能体、每个副本)重新构建一次、重拨一次。对端拒绝连接 / 网关回 5xx 时很快;对端「接了不回」时那一次构建多等一个 `timeout_s`(修之前每轮都等,而且等完 500)。
+- 平台服务掉线时名字照旧由平台占着,同名的租户服务不会顶上来;绑在掉线服务上的参数绑定不报「工具不存在」。保存时的试建碰上连不上的服务照常保存,`build_warning` 里多一句 `MCP server(s) could not be reached during this save check, so their tools and arg_bindings were not checked: <名字>`。
 
 **怎么进**:同 §101(测试控制台建临时 MCP 服务配置 + 临时智能体 `acc-b294` + 临时 API key;临时 MCP 服务端起在集群里,一个工具 `probe_echo`;run 固定打到同一副本,`kubectl exec` 进该 pod 走 localhost)。每轮用不同的提示词(避开回复缓存)。**花费**:几轮短对话,< ¥1。
 
-- [ ] **103.1 连上后断开,这一轮不 500**:服务端在线时先发一轮,确认调到 `probe_echo`(该副本已连上);关掉服务端;改一下 `acc-b294` 的提示词(只改智能体,**不改** MCP 配置,池不重建、坏客户端还在池里),同一副本再发一轮。判据:HTTP 200、run `success`,模型答没有这个工具 / 调不了;该 pod 日志有 `mcp.server_unreachable_skipped server=<服务名> err=<类型>` 与 `control_plane.build_not_cached reason=mcp_server_skipped`;这两行里没有 URL、令牌、异常文本。**没修好时**:HTTP 500(11-07 即如此)。
-- [ ] **103.2 还断着,每轮都照常**:不恢复服务端、不改任何配置,同一副本再发两轮。判据:两轮都 200 `success`,每轮各有一行 `mcp.server_unreachable_skipped`(构建没被缓存);记下这两轮的耗时,与服务端在线时的一轮比,多出的应在 1~2 秒内(拒绝连接很快)。**没修好时**:500。
-- [ ] **103.3 服务回来,下一轮工具就回来**:恢复服务端,**不改配置、不等**,同一副本马上再发一轮。判据:调到 `probe_echo`、调用成功、run `success`;日志有 `mcp.session_restarted`,没有 `mcp.server_unreachable_skipped`;再发一轮,日志里不再有 `build_not_cached`(完整的构建进了缓存)。**没修好时**:先是 500;只修跳过、不改缓存时,工具缺到构建缓存过期(30 分钟)。
+- [ ] **103.1 连上后断开,这一轮不 500**:服务端在线时先发一轮,确认调到 `probe_echo`(该副本已连上);关掉服务端;改一下 `acc-b294` 的提示词(只改智能体,**不改** MCP 配置,池不重建、坏客户端还在池里)。保存响应的 `build_warning` 里有 `could not be reached during this save check … <服务名>`(保存时的试建也跳过了它)。同一副本再发一轮。判据:HTTP 200、run `success`,模型答没有这个工具 / 调不了;该 pod 日志有 `mcp.server_unreachable_skipped server=<服务名> err=<类型>` 与 `control_plane.build_cached_short reason=mcp_server_skipped`;这两行里没有 URL、令牌、异常文本。**没修好时**:HTTP 500(11-07 即如此)。
+- [ ] **103.2 还断着,60 秒内复用、过了再试**:不恢复服务端、不改任何配置。103.1 那一轮之后 60 秒内同一副本再发一轮:200 `success`,日志里**没有**新的 `mcp.server_unreachable_skipped`(复用了缓存的构建,没重拨)。等到 103.1 那一轮之后 60 秒以上再发一轮:200 `success`,有一行新的 `mcp.server_unreachable_skipped`(重新构建、重拨了一次)。记下这一轮的耗时,与服务端在线时的一轮比,多出的应在 1~2 秒内(拒绝连接很快)。**没修好时**:500。
+- [ ] **103.3 服务回来,60 秒内工具回来**:恢复服务端,**不改配置**,记下恢复时刻。之后每 20 秒左右同一副本发一轮,直到调到 `probe_echo`。判据:最晚在上一次 `mcp.server_unreachable_skipped` 之后 60 秒(加一轮的间隔)调到 `probe_echo`、调用成功、run `success`;在此之前的轮次可以还没有这个工具(复用的是 60 秒内缓存的构建),但都是 200;调到之后的那次构建日志有 `mcp.session_restarted`、没有 `build_cached_short`;再过 60 秒以上发一轮仍调得到(完整的构建按正常 TTL 缓存)。**没修好时**:先是 500;只修跳过、构建按正常 TTL 缓存时,工具缺到构建缓存过期(30 分钟)。
 - [ ] **103.4 收尾**:删临时服务端、MCP 配置、智能体、key、会话与终端用户。

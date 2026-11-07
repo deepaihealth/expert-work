@@ -482,7 +482,7 @@ async def test_build_agent_carries_the_manifest_arg_bindings() -> None:
 @pytest.mark.asyncio
 async def test_build_agent_skips_an_unreachable_mcp_server_and_says_so() -> None:
     """B-294 —— 池里的服务连不上:构建照样成功(以前整个抛出、run 入口 500),
-    ``BuiltAgent.skipped_mcp_servers`` 报出它,控制面据此不缓存这次构建。"""
+    ``BuiltAgent.skipped_mcp_servers`` 报出它,控制面据此只短暂缓存这次构建。"""
 
     class _Down(RecordingMCPClient):
         async def list_tools(self) -> Any:

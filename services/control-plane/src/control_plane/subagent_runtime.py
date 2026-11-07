@@ -27,12 +27,12 @@ from control_plane.platform_tool_budget_config import PlatformToolBudgetConfigSe
 from control_plane.runtime import (
     MAX_AGENT_BUILD_ATTEMPTS,
     BuildGenerations,
+    build_cache_ttl_s,
     catalog_build_cacheable,
     knowledge_catalog_fingerprint,
     make_mcp_allowlist_provider,
     make_provider_key_resolver,
     make_skill_resolver,
-    mcp_build_cacheable,
     resolve_defenses,
 )
 from control_plane.tenancy import TenantConfigService
@@ -463,11 +463,9 @@ def make_child_agent_builder(
                 child_tool_env.knowledge_retriever is not None
                 and record.spec.spec.knowledge is not None
             )
-            # B-294 —— 跳过了连不上的 MCP 服务的构建同样只交出不缓存(``mcp_build_cacheable``)。
-            if catalog_build_cacheable(
-                key[-1], built, checked=keyed_catalog
-            ) and mcp_build_cacheable(built):
-                cache[key] = (built, clock() + cache_ttl_s)
+            if catalog_build_cacheable(key[-1], built, checked=keyed_catalog):
+                # B-294 —— 跳过了连不上的 MCP 服务的构建只留一小会(``build_cache_ttl_s``)。
+                cache[key] = (built, clock() + build_cache_ttl_s(built, cache_ttl_s))
                 cache.move_to_end(key)
                 while len(cache) > cache_max_size:
                     # LRU eviction — pure abandonment, no close (same rationale as

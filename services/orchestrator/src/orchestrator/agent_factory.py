@@ -1438,7 +1438,7 @@ async def build_agent(
         worker_max_concurrent=spec.spec.dynamic_workers.max_concurrent,
         worker_max_per_run=spec.spec.dynamic_workers.max_per_run,
         knowledge_catalog_fingerprint=knowledge_fingerprint,
-        # B-294 —— 连不上而跳过的 MCP 服务;非空时控制面不缓存这次构建。
+        # B-294 —— 连不上而跳过的 MCP 服务;非空时控制面只缓存这次构建 60 秒。
         skipped_mcp_servers=registry.skipped_mcp_servers(),
     )
 

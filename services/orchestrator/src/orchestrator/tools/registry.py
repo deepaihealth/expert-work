@@ -772,7 +772,7 @@ class ToolRegistry:
             self._skipped_mcp_servers.append(server)
 
     def skipped_mcp_servers(self) -> tuple[str, ...]:
-        """B-294 —— 本次构建因连不上而跳过的 MCP 服务;非空时这次构建不该进缓存。"""
+        """B-294 —— 本次构建因连不上而跳过的 MCP 服务;非空时这次构建只短暂缓存。"""
         return tuple(self._skipped_mcp_servers)
 
     def landed_arg_bindings(self) -> dict[tuple[str, str], str]:

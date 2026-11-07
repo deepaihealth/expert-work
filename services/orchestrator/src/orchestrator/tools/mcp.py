@@ -530,7 +530,9 @@ def _error_kind(exc: BaseException) -> str:
 #: B-294 —— 「对端连不上 / 会话断了」这一类错误(不含编程错误、鉴权 4xx、取消)。
 _UNREACHABLE_ERRORS: tuple[type[BaseException], ...] = (
     ConnectionError,  # 含 MCPSessionBrokenError
-    TimeoutError,  # 含 MCPCallTimeoutError
+    # 含 MCPCallTimeoutError。比 timeout_s 还慢的 list_tools 也归这一类:跳过,
+    # 且那条会话被标陈旧、后台重建(B-177)。
+    TimeoutError,
     httpx.TransportError,
     anyio.BrokenResourceError,
     anyio.ClosedResourceError,
@@ -542,11 +544,18 @@ def is_mcp_server_unreachable(exc: BaseException) -> bool:
 
     SDK 的传输把 httpx 错误包在 TaskGroup 的 ``ExceptionGroup`` 里:一组里**每个**
     叶子都是这一类才算,混着别的(编程错误)就不算。网关后面的服务没了时回的是
-    5xx(``HTTPStatusError``),也算;4xx(令牌失效等)不算。"""
+    5xx(``HTTPStatusError``),也算;4xx(令牌失效等)不算。对端刚死时,SDK 的接收
+    循环收尾会先把挂着的请求失败成 ``McpError(CONNECTION_CLOSED)``(此刻传输还没报
+    死),也算;对端回的其它 ``McpError`` 不算。"""
+    from mcp.shared.exceptions import McpError
+    from mcp.types import CONNECTION_CLOSED
+
     if isinstance(exc, BaseExceptionGroup):
         return bool(exc.exceptions) and all(is_mcp_server_unreachable(e) for e in exc.exceptions)
     if isinstance(exc, httpx.HTTPStatusError):
         return exc.response.status_code >= 500
+    if isinstance(exc, McpError):
+        return exc.error.code == CONNECTION_CLOSED
     return isinstance(exc, _UNREACHABLE_ERRORS)
 
 
@@ -1594,8 +1603,8 @@ async def register_mcp_tools(
 
     B-294 — a server that cannot be reached (:func:`is_mcp_server_unreachable`)
     is skipped: nothing registered, the skip recorded on the ``registry``
-    (``note_skipped_mcp_server``) so the control plane does not cache this
-    build; the pooled client reconnects itself on the next build. Any other
+    (``note_skipped_mcp_server``) so the control plane caches this build only
+    briefly; the pooled client reconnects itself on the next build. Any other
     error still propagates.
 
     Returns the namespaced names registered, useful for audit

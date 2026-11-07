@@ -6,7 +6,7 @@
 
 修法:只有「连不上 / 会话断了」这一类错误跳过这台服务(本次构建没有它的工具,
 run 照常),其它错误(编程错误、鉴权 4xx、取消)照旧抛出。跳过的服务记在 registry
-上(``skipped_mcp_servers``),控制面据此不缓存这次构建;服务恢复后下一次构建由
+上(``skipped_mcp_servers``),控制面据此只缓存这次构建 60 秒;过了窗口下一次构建由
 客户端自己重连(B-177),工具回来。
 """
 
@@ -22,6 +22,8 @@ import anyio
 import httpx
 import pytest
 from mcp.server.fastmcp import FastMCP
+from mcp.shared.exceptions import McpError
+from mcp.types import CONNECTION_CLOSED, INTERNAL_ERROR, ErrorData, JSONRPCRequest
 
 import orchestrator.tools.mcp as mcp_mod
 from expert_work.protocol import ArgBindingSpec, MCPToolSpec
@@ -51,14 +53,20 @@ def _status_error(code: int) -> httpx.HTTPStatusError:
 
 @dataclass
 class _DownClient(RecordingMCPClient):
-    """``list_tools`` 抛 ``error``(``None`` = 正常返回 ``tools``)。"""
+    """``list_tools`` 抛 ``error``(``None`` = 正常返回 ``tools``);``dials`` 数调用次数。"""
 
     error: BaseException | None = None
+    dials: int = 0
 
     async def list_tools(self) -> Any:
+        self.dials += 1
         if self.error is not None:
             raise self.error
         return await super().list_tools()
+
+
+def _mcp_error(code: int, message: str) -> McpError:
+    return McpError(ErrorData(code=code, message=message))
 
 
 def _tool(name: str) -> MCPToolDef:
@@ -110,6 +118,37 @@ async def test_two_mcp_entries_record_the_same_skipped_server_once() -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("pool_field", _POOLS)
+async def test_a_skipped_server_is_dialed_once_per_build(pool_field: str) -> None:
+    """一份 manifest 有几个 ``mcp`` 条目,每条都会把同一台服务器再注册一遍;对端「接了
+    不回」时每拨一次就是一个 ``timeout_s``。同一次构建里已经跳过的服务不再拨。"""
+    down = _DownClient(error=_connect_error())
+    up = RecordingMCPClient(tools=(_tool("a"), _tool("b")))
+    env = await _env(pool_field, {"down": down, "up": up})
+    registry = await build_tool_registry(
+        [MCPToolSpec(allow_tools=["a"]), MCPToolSpec(allow_tools=["b"]), MCPToolSpec()],
+        tool_env=env,
+    )
+    assert down.dials == 1
+    assert registry.get("mcp__up__a") is not None
+    assert registry.get("mcp__up__b") is not None
+
+
+@pytest.mark.asyncio
+async def test_a_dedup_skipped_platform_server_still_reserves_its_name() -> None:
+    """第二个条目跳过不拨时,名字照旧由平台占着(同名的租户服务不顶上来)。"""
+    platform = MCPServerPool()
+    await platform.add("shared", _DownClient(error=_connect_error()))
+    tenant = MCPServerPool()
+    await tenant.add("shared", RecordingMCPClient(tools=(_tool("from_tenant"),)))
+    registry = await build_tool_registry(
+        [MCPToolSpec(), MCPToolSpec()],
+        tool_env=ToolEnv(mcp_pool=platform, tenant_mcp_pool=tenant),
+    )
+    assert registry.get("mcp__shared__from_tenant") is None
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "error",
     [
@@ -126,6 +165,8 @@ async def test_two_mcp_entries_record_the_same_skipped_server_once() -> None:
         ConnectionResetError("peer reset"),
         ExceptionGroup("tg", [_status_error(502)]),
         ExceptionGroup("outer", [ExceptionGroup("tg", [_connect_error()])]),
+        # SSE 对端刚死时:SDK 的接收循环收尾,把挂着的请求一律失败成 -32000。
+        _mcp_error(CONNECTION_CLOSED, "Connection closed"),
     ],
     ids=lambda e: type(e).__name__,
 )
@@ -146,6 +187,8 @@ async def test_connection_style_errors_skip_the_server(error: BaseException) -> 
         _status_error(403),
         # 一组里只要混着一个不是连接错误的,就不是「连不上」:照旧抛。
         ExceptionGroup("tg", [_connect_error(), ValueError("a bug")]),
+        # 对端回的协议错误不是「连不上」。
+        _mcp_error(INTERNAL_ERROR, "server blew up"),
     ],
     ids=lambda e: type(e).__name__,
 )
@@ -300,5 +343,97 @@ async def test_a_real_client_recovers_on_the_next_build_once_the_server_is_back(
         assert after.skipped_mcp_servers() == ()
         assert client.opens == opens_while_down + 1
         assert pool.get("peer") is client
+    finally:
+        await client.close()
+
+
+# ---------------------------------------------------------------------------
+# 读流先断:SDK 接收循环收尾时把挂着的 list_tools 失败成 McpError(-32000)
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class _ReadCloseClient(mcp_mod._RemoteMCPClientBase):
+    """真 ``ClientSession`` ⇄ 转发泵 ⇄ 进程内 FastMCP。``close_reads=True`` 时,转发泵
+    收到 ``tools/list`` 不转给服务端,而是关掉客户端的读流 —— 与 SSE 对端被杀时一样:
+    读流先到头,接收循环的 ``finally`` 把挂着的请求失败成 ``CONNECTION_CLOSED``,
+    此刻传输的 task group 还没崩(``died`` 未决)。"""
+
+    _server: Any = field(default_factory=_fastmcp, init=False, repr=False)
+    close_reads: bool = field(default=False, init=False)
+    opens: int = field(default=0, init=False)
+
+    async def _open_streams(self, stack: contextlib.AsyncExitStack) -> tuple[Any, Any]:
+        self.opens += 1
+        to_client_send, to_client_recv = anyio.create_memory_object_stream[Any](16)
+        from_client_send, from_client_recv = anyio.create_memory_object_stream[Any](16)
+        to_server_send, to_server_recv = anyio.create_memory_object_stream[Any](16)
+        from_server_send, from_server_recv = anyio.create_memory_object_stream[Any](16)
+
+        async def _client_to_server() -> None:
+            async for message in from_client_recv:
+                root = message.message.root
+                if (
+                    self.close_reads
+                    and isinstance(root, JSONRPCRequest)
+                    and root.method == "tools/list"
+                ):
+                    to_client_send.close()
+                    continue
+                await to_server_send.send(message)
+
+        async def _server_to_client() -> None:
+            async for message in from_server_recv:
+                with contextlib.suppress(anyio.ClosedResourceError, anyio.BrokenResourceError):
+                    await to_client_send.send(message)
+
+        low = self._server._mcp_server
+        tg = await stack.enter_async_context(anyio.create_task_group())
+        tg.start_soon(
+            low.run, to_server_recv, from_server_send, low.create_initialization_options()
+        )
+        tg.start_soon(_client_to_server)
+        tg.start_soon(_server_to_client)
+        stack.callback(tg.cancel_scope.cancel)
+        return to_client_recv, from_client_send
+
+
+@pytest.mark.asyncio
+async def test_a_pending_list_tools_failed_by_a_closed_read_stream_skips_the_server() -> None:
+    client = _ReadCloseClient(
+        config=mcp_mod.MCPServerConfig(name="peer", transport="sse", url=_URL, timeout_s=5.0)
+    )
+    await client.start()
+    try:
+        pool = MCPServerPool()
+        await pool.add("peer", client)
+        env = ToolEnv(tenant_mcp_pool=pool)
+
+        client.close_reads = True
+        during = await build_tool_registry([MCPToolSpec()], tool_env=env)
+        assert during.get("mcp__peer__echo") is None
+        assert during.skipped_mcp_servers() == ("peer",)
+
+        # 接收循环收尾时也关了写流:下一次调用发不出去 → 换新会话(BUG-17),工具回来。
+        client.close_reads = False
+        after = await build_tool_registry([MCPToolSpec()], tool_env=env)
+        assert after.get("mcp__peer__echo") is not None
+        assert client.opens == 2
+    finally:
+        await client.close()
+
+
+@pytest.mark.asyncio
+async def test_the_read_close_double_raises_the_sdk_connection_closed_error() -> None:
+    """钉住上面那个替身真的复现了现场形态(不是别的异常碰巧被跳过)。"""
+    client = _ReadCloseClient(
+        config=mcp_mod.MCPServerConfig(name="peer", transport="sse", url=_URL, timeout_s=5.0)
+    )
+    await client.start()
+    try:
+        client.close_reads = True
+        with pytest.raises(McpError) as caught:
+            await client.list_tools()
+        assert caught.value.error.code == CONNECTION_CLOSED
     finally:
         await client.close()
