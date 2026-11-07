@@ -42,6 +42,12 @@ _CHECK_SECTION = re.compile(r"^## 检查成品\n(.*?)(?=^## )", re.S | re.M)
 _ASK_IMAGE_CALL = re.compile(r"ask_image\(([^)]*)\)")
 
 
+# pptx carries the designed-template fill workflow (B-295) on top of the original
+# sections; still far below the 11,000-char point where a doc reaches the agent cut to a
+# preview (see health_plan_report/test_skill_package.py DOC_CHAR_CEILING).
+_BODY_LIMIT = {"pptx": 7000}
+
+
 def _frontmatter(md: str) -> dict:
     _, fm, _ = md.split("---\n", 2)
     return yaml.safe_load(fm)
@@ -93,7 +99,8 @@ def test_frontmatter(unpacked_skills, name):
 def test_body_length_and_no_js_route(unpacked_skills, name):
     root = unpacked_skills / name
     body = (root / "SKILL.md").read_text(encoding="utf-8").split("---\n", 2)[2]
-    assert len(body) <= 6000, f"{name} body {len(body)} chars > 6000"
+    limit = _BODY_LIMIT.get(name, 6000)
+    assert len(body) <= limit, f"{name} body {len(body)} chars > {limit}"
     for f in [root / "SKILL.md", *sorted((root / "scripts").glob("*.py"))]:
         assert not _JS_ROUTE.search(f.read_text(encoding="utf-8")), f"JS route in {f}"
 
@@ -110,7 +117,8 @@ def test_every_referenced_script_exists_and_every_script_is_referenced(unpacked_
     present = {p.name for p in (root / "scripts").glob("*.py")}
     missing = referenced - present
     assert not missing, f"{name}: referenced but not packaged: {missing}"
-    helpers = {"_cli.py", "_office.py"}  # imported by other scripts, never called directly
+    # imported by other scripts, never called directly
+    helpers = {"_cli.py", "_office.py", "_pptx_text.py"}
     dead = present - referenced - helpers
     assert not dead, f"{name}: packaged but never mentioned in SKILL.md: {dead}"
 
