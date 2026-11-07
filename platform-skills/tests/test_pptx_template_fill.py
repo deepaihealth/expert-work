@@ -111,6 +111,9 @@ def test_inspect_font_sizes_autofit_and_wrap(scripts, deck):
     assert texts[roles["s3_nowrap"]].get("nowrap") is True
     # a box that grows with its text has no fixed capacity to report
     assert "cap" not in texts[roles["s3_resize"]] and texts[roles["s3_head"]]["cap"] == 19
+    # defaults are left out (see legend): plain text box, single paragraph
+    assert "kind" not in texts[roles["s3_head"]] and "paras" not in texts[roles["s3_head"]]
+    assert texts[roles["s1_title"]]["kind"] == "ph:ctrTitle#0"
     assert "nowrap" not in texts[roles["s3_head"]]
 
 
