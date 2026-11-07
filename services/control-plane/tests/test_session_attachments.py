@@ -855,14 +855,17 @@ async def test_non_owner_gets_this_conversations_version_not_a_later_one(world: 
 @pytest.mark.asyncio
 async def test_any_run_of_the_conversation_counts(world: World) -> None:
     """N1 — every run of the thread counts (a later turn, a resumed run); a sub-agent or
-    worker records its parent run's id, so its artifacts land here too."""
-    await _seed_run(world)
+    worker records its parent run's id, so its artifacts land here too. Saved in the
+    *first* run with later runs after it (an implementation checking only the latest run
+    fails), and one saved in the *last* run (one checking only the first run fails)."""
     await _save(world, created_in=str(await _seed_run(world)))
+    await _seed_run(world)
+    await _save(world, created_in=str(await _seed_run(world)), name="late.pdf")
     world.workspace.workspace_file = b"%PDF-1.4 artifact"
-    resp = await world.client.get(
-        _artifact_url(world.thread_id), headers=_headers("colleague", **_VIEWER)
-    )
-    assert resp.status_code == 200, resp.text
+    viewer = _headers("colleague", **_VIEWER)
+    for name in ("report.pdf", "late.pdf"):
+        resp = await world.client.get(_artifact_url(world.thread_id, name), headers=viewer)
+        assert resp.status_code == 200, (name, resp.text)
 
 
 @pytest.mark.parametrize(
