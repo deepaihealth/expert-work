@@ -266,16 +266,20 @@ def test_fill_paragraphs_levels_and_mixed_runs(scripts, deck, tmp_path):
             {"text": "要点一", "level": 0},
             {"text": "细节", "level": 1},
             "细节二",
-            "细节三",
+            {"text": "更深一层", "level": 2},
         ],
         roles["s3_mixed"]: ["新小标题", "新正文\n第二行"],
     }
     _, out = _fill(scripts, tmp_path, path, {"fill": spec})
     prs = pptx.Presentation(str(out))
     body = _shape_by_addr(prs, roles["s2_body"]).text_frame.paragraphs
-    assert [p.text for p in body] == ["要点一", "细节", "细节二", "细节三"]
-    # explicit levels honoured; extra paragraphs reuse the last old paragraph (level 1)
-    assert [p.level for p in body] == [0, 1, 1, 1]
+    assert [p.text for p in body] == ["要点一", "细节", "细节二", "更深一层"]
+    # explicit levels honoured (2 exists nowhere in the template); a paragraph without a
+    # level reuses old paragraph i's format (level 1)
+    assert [p.level for p in body] == [0, 1, 1, 2]
+    # and the new level picks up its own inherited size (master bodyStyle lvl3 = 24 pt)
+    sizes = _texts(_inspect(scripts, out))[roles["s2_body"]]["font_pt"]
+    assert sizes == [32, 28, 28, 24]
     mixed = _shape_by_addr(prs, roles["s3_mixed"]).text_frame.paragraphs
     assert [len(p.runs) for p in mixed] == [1, 2]
     first = mixed[0].runs[0].font
