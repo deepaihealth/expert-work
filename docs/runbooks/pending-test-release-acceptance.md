@@ -2309,8 +2309,10 @@ asyncio.run(main())
 
 **背景**:用户上传一份已经设计好的 10 页 PPT 当模板、要求按它出报告,一次运行 36 分钟,其中工具只占约 1.7 分钟:约 10 分钟是模型手写 6 个探查脚本摸模板结构(没用 `inspect_template.py`,它当时也只给形状名 / 类型),约 8 分钟首次填充,约 12 分钟是看图发现溢出后改一处、渲染一次地反复 5–6 轮。本次改平台 pptx 技能(只改技能包,不改镜像 / 后端):
 
-- `inspect_template.py 模板.pptx --texts`:每页列出所有带字的形状(含组合内、嵌套组合、表格单元格),带地址 `页:形状id[/组内id][@行,列]`、位置、预览、段数 / 文字段数、生效字号(沿继承链)、autofit / 换行、按当前字号约能放几个汉字;图表 / SmartArt / 图片列为 `locked`。不带 `--texts` 时原有 `layouts` / `slides[].shapes` 输出不变。
+- `inspect_template.py 模板.pptx --texts`:每页列出所有带字的形状(含组合内、嵌套组合、表格单元格),带地址 `页:形状id[/组内id][@行,列]`、位置、预览、段数、生效字号(沿继承链)、autofit / 换行、按当前字号约能放几个汉字;图表 / SmartArt / 图片列为 `locked`。不带 `--texts` 时原有 `layouts` / `slides[].shapes` 输出不变。
 - 新 `fill_template.py 模板.pptx spec.json 成品.pptx`:按地址换字,保留段落格式和首个文字段的字号 / 颜色 / 粗细,其它形状逐字节不动;可复制 / 调序页,删页必须显式 `drop_unlisted`;地址不存在或改不了时整份不保存并一次列出全部问题;输出估计溢出的地址(估算,标明误差)。
+- 复制页(`duplicate_slide.py` 与 `slides` 模式共用)连同页面背景(含背景图)、切换效果、隐藏 / 不显示母版图形等页级设置一起复制;删页 / 调序后分节跟着更新、被删的页从自定义放映里去掉,有页链接指向被删页时在 `warnings` 里提示。
+- 读不了的形状只在那一条上报 `error`,不影响整页;同页重复 id 标 `ambiguous`、拒绝填;竖排、隐藏形状有标记;估不了的列进 `overflow_unknown`,接近放满的标 `near`;`--texts` 为紧凑 JSON,大文件用 `--slides 1-8` 分批。
 - SKILL.md「套用模板」改为四步:inspect → 写 spec 填值 → 一次改完所有溢出 → 渲染全部改动页、问题记全后一次改完。
 
 **怎么进**:测试控制台(system_admin,平台租户)建一个临时智能体(只绑平台 pptx 技能 + 沙箱,模型用测试常用主模型,能看图),在调试台跑。**模板用通用合成件,不用任何客户文件**:本机生成 `uv run --no-sync python -c "import sys; sys.path.insert(0, 'platform-skills/tests/in_image'); import _pptx_fixtures as f; f.build_designed_deck('通用模板.pptx')"`(6 页:占位符版式页、自由文本框页含混排字号与三种 autofit、组合 / 嵌套组合页、表格页含合并格、图表 + SmartArt + 图片页)。**花费**:4 轮带 PPT 的对话(改前 / 改后各 1 轮套模板 + 新建回归各 1 轮),按测试模型价目约几元。
@@ -2320,6 +2322,7 @@ asyncio.run(main())
 - [ ] **106.0 改前基线**:导入前(测试上仍是旧 pptx 技能)用上面的提示词跑一轮。在 Run 详情 / 轨迹面板记四个数:**总耗时**、**模型调用次数**、**探查脚本数**(交付前为了弄清模板结构而写的 python-pptx / 解 XML 脚本次数,不含技能自带脚本)、**修复轮数**(首份成品之后「改 → 再生成」的次数)。产物要能打开、模板设计保留。
 - [ ] **106.1 导入新技能**:本机 `uv run --no-sync python platform-skills/build.py --only pptx`;按 `platform-skills/README.md`「发布」一节:`export KUBECONFIG=~/.kube/expert-work-test.yaml`、`kubectl config current-context` 确认是测试集群、取 control-plane `POD`,先 `uv run --no-sync python platform-skills/import_in_pod.py bundle --dry-run platform-skills/dist/pptx.skill | kubectl -n expert-work exec -i "$POD" -- python3 -`。判据:一行 `name=pptx`、`status="dry-run"`、`would_create_version` = 当前版本 + 1。再去掉 `--dry-run` 正式导入。判据:`status=201`、`created=true`,随后一行 `{"invalidation": "published", ...}`(若是 `skipped`,按 README 处理:滚动重启 control-plane 或等 30 分钟,**不要重跑导入**)。
 - [ ] **106.2 改后同题对比**:新开会话,同一模板、同一提示词再跑一轮,记同样四个数。判据:轨迹里依次出现 `inspect_template.py … --texts` 与 `fill_template.py`;探查脚本数 ≤ 1;修复轮数 ≤ 1(第 3 页『标题文字』那一行是 28 磅、约放 19 个字的单行框,新句子明显超长,应在 `fill_template.py` 的 `overflow` 里一次报出并在首轮改短,而不是看图后才发现);总耗时比 106.0 至少少 40%;成品打开后第 4 页组合、第 5 页表格、第 6 页图表仍在原位且颜色字号不变,第 6 页图表文字没被声称改过。把两轮四个数并排记在本条下。
+- [ ] **106.2b 复制页保留设计**:同一会话追加「第 3 页这个版式再复制一页,写『补充说明』」。判据:成品里两页背景、切换效果相同(PowerPoint 或渲染图对比),`fill_template.py` 输出 `slides` 里出现两次 3。**没修好时**:复制出的那页背景变成母版默认、切换效果丢失。
 - [ ] **106.3 新建回归**:同一智能体新会话发「做一份 3 页的项目周报 PPT:封面、进度表、一页数据图」(不给模板)。判据:按 SKILL.md「新建」骨架出成品、`save_artifact` 登记、能打开、中文不是方块;耗时与导入前同类请求相当(没有误走 `fill_template.py`)。
 - [ ] **106.4 收尾**:删临时智能体与会话;技能新版本保留(要回退见 `platform-skills/README.md` 回滚一节)。
 
