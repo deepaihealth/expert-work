@@ -40,7 +40,8 @@ from pptx.oxml.ns import qn
 LOCKED_KINDS = {"picture", "chart", "smartart", "ole", "graphic", "other", NO_TEXT_PLACEHOLDER}
 PREVIEW_CHARS = 20
 CELL_PREVIEW_CHARS = 12
-PAGE_BUDGET = 18_000  # chars per --texts output; tool output past ~20,000 is cut
+PAGE_BUDGET = 18_000  # chars per --texts output, below the cap with some room
+OUTPUT_CAP = 20_000  # the agent's tool output is cut around here
 LEGEND = (
     "texts: addr=fill_template.py 的地址(页:形状id[/组内id][@行,列]); box=[左,上,宽,高]厘米; "
     "kind 省略=文本框; text=开头预览(--full 看全文); paras=段数(1 段时省略); "
@@ -51,7 +52,7 @@ LEGEND = (
     "vertical=竖排; hidden=隐藏的形状; ambiguous=同页有重复 id, 这个地址填不了; "
     "error=这个形状读不了。表格 cells 逐行列出, null=被合并的格, col_chars=各列每行约几个汉字。"
     "locked: 文字改不了的形状(图表/SmartArt/图片/没有文字框的占位符等)。"
-    "more=还有页没列出, 用它给的 --slides 接着看; too_long=这几页单独就超长, 结尾会被截断, "
+    "more=还有页没列出, 用它给的 --slides 接着看; too_long=这几页单独就超长, 结尾可能被截断, "
     "去掉 --full 再看。"
 )
 
@@ -273,7 +274,8 @@ def main() -> None:
         picked.append(info)
         used += size
     # "more" / "too_long" go before "slides": an output cut at its end must keep them
-    too_long = [s["number"] for s in picked if len(_compact(s)) > PAGE_BUDGET]
+    head = len(_compact(out)) + len(',"too_long":[999],"slides":[]')
+    too_long = [s["number"] for s in picked if head + len(_compact(s)) > OUTPUT_CAP]
     if too_long:
         out["too_long"] = too_long
     out["slides"] = picked

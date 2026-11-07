@@ -229,3 +229,95 @@ def test_ignorable_prefix_bound_elsewhere_on_the_copy_is_not_carried(scripts):
     )
     dup._carry_ignorable(src_one, new_all)
     assert new_all._element.get(f"{{{MC}}}Ignorable") is None, "nothing left to ignore"
+
+
+def _dangling(prs) -> list[tuple[str, str]]:
+    """(part name, r: value) for every r: attribute in a slide or notes part whose
+    relationship does not exist in that part."""
+    bad = []
+    for slide in prs.slides:
+        places = [slide] + ([slide.notes_slide] if slide.has_notes_slide else [])
+        for obj in places:
+            for node in obj._element.iter():
+                for attr, val in node.attrib.items():
+                    if attr.startswith(f"{{{R_NS}}}") and val not in obj.part.rels:
+                        bad.append((str(obj.part.partname), val))
+    return bad
+
+
+def test_duplicated_slide_notes_keep_their_links(scripts, tmp_path):
+    """Notes copied with a duplicated slide bring the relationships their XML refers to:
+    a link to another slide is carried; a link back to "this slide" goes to the copy's
+    own slide (its back-reference), never to the source slide; nothing dangles."""
+
+    def hook(prs):
+        notes = prs.slides[0].notes_slide
+        notes.notes_text_frame.text = "到第二页"
+        own = notes.notes_text_frame.add_paragraph()
+        own.text = "回本页"
+        to_second = notes.part.relate_to(prs.slides[1].part, RT.SLIDE)
+        back = next(
+            r for r, rel in notes.part.rels.items() if rel.target_part is prs.slides[0].part
+        )
+        first_run = notes.notes_text_frame.paragraphs[0].runs[0]._r
+        first_run.get_or_add_rPr().append(parse_xml(_link_xml("hlinkClick", to_second)))
+        own.runs[0]._r.get_or_add_rPr().append(parse_xml(_link_xml("hlinkClick", back)))
+
+    path = tmp_path / "notes-links.pptx"
+    _titled_deck(path, 2, hook)
+    _, out = H.fill(scripts, tmp_path, path, {"slides": [1, 1, 2]})
+    prs = pptx.Presentation(str(out))
+    assert _dangling(prs) == []
+    copy_notes = prs.slides[1].notes_slide
+    assert copy_notes.notes_text_frame.text == "到第二页\n回本页"
+    links = copy_notes._element.findall(".//" + qn("a:hlinkClick"))
+    targets = [copy_notes.part.related_part(link.get(qn("r:id"))) for link in links]
+    assert targets == [prs.slides[2].part, prs.slides[1].part], "to slide 2; back to the copy"
+    slide_targets = [r.target_part for r in copy_notes.part.rels.values() if r.reltype == RT.SLIDE]
+    assert prs.slides[0].part not in slide_targets, "the copy's notes never point at the source"
+
+
+def test_duplicated_notes_drop_a_reference_the_source_cannot_resolve(scripts, tmp_path):
+    def hook(prs):
+        notes = prs.slides[0].notes_slide
+        notes.notes_text_frame.text = "坏链接"
+        run = notes.notes_text_frame.paragraphs[0].runs[0]._r
+        run.get_or_add_rPr().append(parse_xml(_link_xml("hlinkClick", "rId99")))
+
+    path = tmp_path / "bad-notes-link.pptx"
+    _titled_deck(path, 2, hook)
+    _, out = H.fill(scripts, tmp_path, path, {"slides": [1, 1, 2]})
+    copy_notes = pptx.Presentation(str(out)).slides[1].notes_slide
+    link = copy_notes._element.find(".//" + qn("a:hlinkClick"))
+    assert link is not None and link.get(qn("r:id")) is None
+    assert copy_notes.notes_text_frame.text == "坏链接"
+
+
+def test_too_long_only_when_the_real_cut_is_reached(scripts, tmp_path):
+    """A slide between the paging budget (~18k) and the real output cap (~20k) is not
+    cut, so it must not be flagged too_long."""
+
+    def build(length: int) -> Path:
+        def hook(prs):
+            for _ in range(40):
+                tb = prs.slides[0].shapes.add_textbox(Cm(1), Cm(1), Cm(4), Cm(2))
+                tb.text_frame.text = "字" * length
+
+        path = tmp_path / f"len{length}.pptx"
+        _titled_deck(path, 1, hook)
+        return path
+
+    lo, hi = 300, 600
+    for _ in range(12):  # bounded bisection for an output of 18.4k-19.6k chars
+        mid = (lo + hi) // 2
+        out = H.run(scripts, "inspect_template.py", build(mid), "--texts", "--full").stdout
+        if len(out) < 18_400:
+            lo = mid
+        elif len(out) > 19_600:
+            hi = mid
+        else:
+            break
+    else:
+        pytest.fail("could not size a slide between the budget and the cap")
+    res = json.loads(out)
+    assert "too_long" not in res and "more" not in res, len(out)

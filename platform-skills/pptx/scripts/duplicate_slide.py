@@ -65,8 +65,40 @@ def _copy_notes(src, new) -> bool:
     # Deep-copy the whole txBody (not just .text) to keep run-level formatting (bold,
     # bullets, multiple paragraphs, ...).
     dst_tx_body = dst_ph.text_frame._element
-    dst_tx_body.getparent().replace(dst_tx_body, copy.deepcopy(src_tx_body))
+    body = copy.deepcopy(src_tx_body)
+    _carry_notes_rels(src.notes_slide.part, new.notes_slide.part, body, src.part, new.part)
+    dst_tx_body.getparent().replace(dst_tx_body, body)
     return False
+
+
+def _carry_notes_rels(src_notes, new_notes, body, src_slide, new_slide) -> None:
+    """Give the copied notes text the relationships its r: references need (links, ...).
+
+    A reference to the source slide becomes one to the copy's own slide (the notes'
+    back-reference); the notes master and any other target are related as they were;
+    a reference the source itself cannot resolve is removed rather than left dangling.
+    """
+    rid_map: dict[str, str | None] = {}
+    for node in body.iter():
+        for attr, val in list(node.attrib.items()):
+            if not attr.startswith(f"{{{_R_NS}}}"):
+                continue
+            if val not in rid_map:
+                rid_map[val] = _carry_rel(src_notes, new_notes, val, src_slide, new_slide)
+            if rid_map[val] is None:
+                del node.attrib[attr]
+            else:
+                node.set(attr, rid_map[val])
+
+
+def _carry_rel(src_part, new_part, rid: str, src_slide, new_slide) -> str | None:
+    if rid not in src_part.rels:
+        return None
+    rel = src_part.rels[rid]
+    if rel.is_external:
+        return new_part.relate_to(rel.target_ref, rel.reltype, is_external=True)
+    target = new_slide if rel.target_part is src_slide else rel.target_part
+    return new_part.relate_to(target, rel.reltype)  # reuses an existing identical one
 
 
 def _remapped(el, rid_map: dict[str, str]):
