@@ -634,14 +634,55 @@ async def test_a_hanging_notice_publisher_cannot_hold_up_the_switch(
     import asyncio
 
     monkeypatch.setattr(failover_mod, "FAILOVER_NOTICE_TIMEOUT_S", 0)
-    never = asyncio.Event()
+    gate = asyncio.Event()
+    written: list[dict[str, Any]] = []
 
-    async def hangs(frame: dict[str, Any]) -> None:
-        await never.wait()
+    async def slow_store(frame: dict[str, Any]) -> None:
+        await gate.wait()
+        written.append(frame)
 
     primary, backup = _Scripted([LLMServerError("503")]), _Scripted(list(_ANSWER))
     router = _router((primary, "ds:flash", "ds:flash"), (backup, "qw:max", "qw:max"))
-    with failover_frames(1, hangs):
+    with failover_frames(1, slow_store):
         msg = await router(messages=[], tools=[])
 
+    # The switch went ahead without waiting for the write…
     assert msg.content == "ok"
+    assert written == []
+    # …and the write was not cancelled: it completes once the store catches up.
+    gate.set()
+    for _ in range(20):
+        if written and not failover_mod._pending_notices:
+            break
+        await asyncio.sleep(0)
+    assert [f["reason"] for f in written] == ["server_error"]
+    assert not failover_mod._pending_notices
+
+
+@pytest.mark.asyncio
+async def test_a_backup_that_streamed_visible_output_then_broke_is_the_outcome() -> None:
+    # The redo reached a backup that already showed text; its own failure is
+    # the honest result — not the primary's stale reasoning-only partial.
+    primary = _Scripted(list(_THINK_THEN_HANG))
+    backup = _Scripted([LLMDelta(content="backup half answer"), LLMServerError("boom")])
+    router = _router((primary, "ds:flash", "ds:flash"), (backup, "qw:max", "qw:max"))
+
+    with pytest.raises(LLMStreamInterruptedError) as info:
+        await router(messages=[], tools=[], on_delta=_Sink())
+
+    assert isinstance(info.value.partial, AIMessage)
+    assert info.value.partial.content == "backup half answer"
+
+
+@pytest.mark.asyncio
+async def test_a_named_tool_call_as_the_first_progress_delta_counts_as_visible() -> None:
+    # Phase 1 sees the preview too: a stream whose first progress delta is a
+    # named (unfinished) tool call, then silence, keeps the old behaviour.
+    primary = _Scripted([_UNFINISHED_CALL, _Hang])
+    backup = _Scripted(list(_ANSWER))
+    router = _router((primary, "ds:flash", "ds:flash"), (backup, "qw:max", "qw:max"))
+
+    msg = await router(messages=[], tools=[], on_delta=_Sink())
+
+    assert backup.calls == 0
+    assert stalled_without_answer(msg) == _IDLE

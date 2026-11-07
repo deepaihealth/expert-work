@@ -197,16 +197,43 @@ def failover_frames(
 async def announce_failover(from_group: str, to_group: str, reason: str) -> None:
     """A call moves from ``from_group`` to ``to_group``: count it and tell the
     run's listener, if any. The notice is best-effort — a failing publisher
-    is logged, never allowed to fail the call or block the switch."""
+    is logged, never allowed to fail the call or block the switch.
+
+    The wait is bounded (:data:`FAILOVER_NOTICE_TIMEOUT_S`) but the publish
+    itself is shielded: a slow event store finishes the write in the
+    background instead of being cancelled mid-write (which could burn a
+    sequence number, or persist a frame that never went out live)."""
     record_failover(from_group, to_group, reason)
     listener = _failover_listener.get()
     if listener is None:
         return
     notice = FailoverNotice(from_group=from_group, to_group=to_group, reason=reason)
+    task = asyncio.ensure_future(listener(notice))
+    _pending_notices.add(task)
+    task.add_done_callback(_notice_done)
     try:
-        await asyncio.wait_for(listener(notice), FAILOVER_NOTICE_TIMEOUT_S)
+        await asyncio.wait_for(asyncio.shield(task), FAILOVER_NOTICE_TIMEOUT_S)
+    except TimeoutError:
+        logger.warning(
+            "llm_router.failover_notice_slow timeout_s=%s (still publishing)",
+            FAILOVER_NOTICE_TIMEOUT_S,
+        )
     except Exception:
-        logger.warning("llm_router.failover_notice_failed", exc_info=True)
+        # The publisher's own failure: ``_notice_done`` logs it once.
+        return
+
+
+#: Notices still publishing after the bounded wait (strong refs until done).
+_pending_notices: set[asyncio.Future[None]] = set()
+
+
+def _notice_done(task: asyncio.Future[None]) -> None:
+    _pending_notices.discard(task)
+    if task.cancelled():
+        return
+    exc = task.exception()
+    if exc is not None:
+        logger.warning("llm_router.failover_notice_failed", exc_info=exc)
 
 
 async def discard_streamed_attempt(sink: object | None) -> None:

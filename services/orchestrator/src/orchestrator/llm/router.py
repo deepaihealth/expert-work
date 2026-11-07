@@ -468,12 +468,19 @@ class LLMRouter:
                     return await self._dispatch(
                         messages=messages, tools=tools, output_schema=output_schema
                     )
-                except LLMError:
-                    if not stalls:
-                        raise
+                except LLMError as exc:
                     # B-297 PR2 — the redo found no answer either: give the
-                    # caller what it would have got without the redo.
-                    logger.warning("llm_router.redo_failed_keeping_original_outcome")
+                    # caller what it would have got without the redo. Not when
+                    # a later group already streamed visible output and then
+                    # broke (LLMStreamInterruptedError): that failure is the
+                    # honest outcome.
+                    if not stalls or isinstance(exc, LLMStreamInterruptedError):
+                        raise
+                    logger.warning(
+                        "llm_router.redo_failed_keeping_original_outcome err=%s",
+                        type(exc).__name__,
+                        exc_info=True,
+                    )
                     return stalls[0].original_outcome()
         finally:
             _delta_sink.reset(sink_token)
