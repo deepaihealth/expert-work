@@ -370,6 +370,39 @@ def test_overflow_in_table_cell_and_nowrap(scripts, deck, tmp_path):
     assert by_addr[roles["s3_nowrap"]]["too_wide"] is True
 
 
+def test_overflow_estimate_uses_line_and_paragraph_spacing(scripts, deck, tmp_path):
+    path, roles = deck  # both boxes: two 18 pt lines at single spacing
+    two_lines = ["第一行", "第二行"]
+    spec = {roles["s3_spaced"]: two_lines, roles["s3_gap"]: two_lines, roles["s3_small"]: "短"}
+    report, _ = _fill(scripts, tmp_path, path, {"fill": spec})
+    by_addr = {o["addr"]: o for o in report["overflow"]}
+    assert set(by_addr) == {roles["s3_spaced"], roles["s3_gap"]}
+    assert (
+        by_addr[roles["s3_spaced"]]["need_lines"],
+        by_addr[roles["s3_spaced"]]["fit_lines"],
+    ) == (2, 1)
+
+
+def test_overflow_estimate_uses_stored_shrink_scale(scripts, deck, tmp_path):
+    path, roles = deck  # 8 x 2 cm at 20 pt x 70% = 14 pt: 15 chars x 2 lines fit
+    report, _ = _fill(scripts, tmp_path, path, {"fill": {roles["s3_shrink"]: "字" * 24}})
+    assert report["overflow"] == []
+
+
+def test_fill_drops_the_old_words_hyperlink(scripts, deck, tmp_path):
+    path, roles = deck
+    old = _shape_by_addr(pptx.Presentation(str(path)), roles["s6_caption"])
+    assert old.text_frame.paragraphs[0].runs[0].hyperlink.address
+    _, out = _fill(scripts, tmp_path, path, {"fill": {roles["s6_caption"]: "新图注"}})
+    run = (
+        _shape_by_addr(pptx.Presentation(str(out)), roles["s6_caption"])
+        .text_frame.paragraphs[0]
+        .runs[0]
+    )
+    assert run.text == "新图注" and run.hyperlink.address is None
+    assert run.font.size.pt == 10
+
+
 def test_slides_mode_duplicates_reorders_and_drops_only_when_asked(scripts, deck, tmp_path):
     path, roles = deck
     head = roles["s3_head"]

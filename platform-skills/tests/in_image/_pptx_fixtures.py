@@ -99,6 +99,13 @@ def build_designed_deck(path) -> dict[str, str]:
     resize.text_frame.auto_size = MSO_AUTO_SIZE.SHAPE_TO_FIT_TEXT
     nowrap = _textbox(s3, 26, 0.5, 5, 1, [[("单行", 12, False, None)]])
     nowrap.text_frame.word_wrap = False
+    # 10 x 2 cm, 18 pt: inner height 49.5 pt = two 21.6 pt lines at single spacing
+    spaced = _textbox(s3, 1, 13, 10, 2, [[("双倍行距", 18, False, None)]])
+    spaced.text_frame.auto_size = MSO_AUTO_SIZE.NONE
+    spaced.text_frame.paragraphs[0].line_spacing = 2.0
+    gap = _textbox(s3, 12, 13, 10, 2, [[("段前留白", 18, False, None)]])
+    gap.text_frame.auto_size = MSO_AUTO_SIZE.NONE
+    gap.text_frame.paragraphs[0].space_before = Pt(20)
     deco = s3.shapes.add_shape(MSO_SHAPE.RECTANGLE, Cm(0), Cm(12), Cm(33.8), Cm(0.5))
     deco.name = "装饰条"
     for role, shape in (
@@ -110,6 +117,8 @@ def build_designed_deck(path) -> dict[str, str]:
         ("s3_resize", resize),
         ("s3_nowrap", nowrap),
         ("s3_deco", deco),
+        ("s3_spaced", spaced),
+        ("s3_gap", gap),
     ):
         roles[role] = _addr(3, shape)
 
@@ -169,6 +178,7 @@ def build_designed_deck(path) -> dict[str, str]:
     buf.seek(0)
     pic = s6.shapes.add_picture(buf, Cm(12), Cm(1))
     caption = _textbox(s6, 1, 8, 10, 1, [[("图注", 10, False, None)]])
+    caption.text_frame.paragraphs[0].runs[0].hyperlink.address = "https://example.com/a"
     roles["s6_chart"], roles["s6_pic"] = _addr(6, chart), _addr(6, pic)
     roles["s6_smartart"], roles["s6_caption"] = "6:90", _addr(6, caption)
     prs.save(str(path))
