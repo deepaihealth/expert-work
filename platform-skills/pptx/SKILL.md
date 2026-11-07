@@ -43,7 +43,6 @@ SIZE_CAPTION = Pt(12)  # 4 级：图注、脚注
 
 
 def set_cn_font(run, cn: str = CN_FONT, en: str = EN_FONT) -> None:
-    """西文写 a:latin（font.name），中文写 a:ea——python-pptx 无公开 API，直接改 rPr。"""
     run.font.name = en
     rpr = run.font._element
     ea = rpr.find("{http://schemas.openxmlformats.org/drawingml/2006/main}ea")
@@ -66,12 +65,10 @@ prs = pptx.Presentation()
 prs.slide_width = Emu(12192000)
 prs.slide_height = Emu(6858000)
 
-# 封面
 cover = prs.slides.add_slide(prs.slide_layouts[0])
 set_run(cover.shapes.title.text_frame.paragraphs[0].add_run(), "示例汇报", SIZE_TITLE, bold=True)
 set_run(cover.placeholders[1].text_frame.paragraphs[0].add_run(), "骨架代码生成", SIZE_BODY)
 
-# 表格页
 table_slide = prs.slides.add_slide(prs.slide_layouts[5])
 set_run(table_slide.shapes.title.text_frame.paragraphs[0].add_run(), "进度一览", SIZE_HEADING, bold=True)
 left, top = Inches(1), Inches(2)
@@ -82,7 +79,6 @@ for c, text in enumerate(("项目", "负责人", "进度")):
 for c, text in enumerate(("示例任务", "张三", "进行中")):
     set_run(table.cell(1, c).text_frame.paragraphs[0].add_run(), text, SIZE_BODY)
 
-# 图表页（matplotlib 出图再插入）
 fig, ax = plt.subplots(figsize=(6, 3.2))
 ax.bar(["A", "B", "C"], [3, 5, 2])
 fig.tight_layout()
@@ -106,19 +102,33 @@ prs.save("骨架 示例.pptx")
 - 一页一个视觉焦点：要点纵向排列，不平铺塞满。
 - 内容多就拆页、不缩字号：字号只在四级常量里选。
 
-## 套用机构模板
+## 套用模板
 
-先看模板有哪些版式与占位符：
-`python $EXPERT_WORK_SKILLS_DIR/pptx/scripts/inspect_template.py 模板.pptx`
-输出 `layouts`（所有母版的版式：`master`/`index`/`name`/`placeholders`，占位符含 `idx`/`type`/
-`name`/位置）与 `slides`（已有页的母版、版式与形状）。选定版式后加页、按 `idx` 填值：
+用户给的 PPT 已经排好版时，在原文件上换字、保留设计；不要自己写脚本摸结构，不要重画。
 
-```python
-slide = prs.slides.add_slide(prs.slide_masters[0].slide_layouts[1])  # 两个下标取自上面输出
-slide.placeholders[0].text_frame.text = "标题文字"
-slide.placeholders[1].text_frame.text = "正文内容"
-# 图片占位符：slide.placeholders[idx].insert_picture("图.png")
-```
+1. 看结构：`python $EXPERT_WORK_SKILLS_DIR/pptx/scripts/inspect_template.py 模板.pptx --texts`。每页
+   `texts` 列出所有带字的形状（含组合内、表格单元格）：地址 `addr`、位置、文字预览、字号、`cap`（当前
+   字号约能放几个汉字）；`locked` 是改不了字的形状（图表、SmartArt、图片）。输出里有 `more` 时，
+   用它给的 `--slides …` 再跑一次，直到没有 `more`。
+2. 填值：写 spec.json，跑 `python $EXPERT_WORK_SKILLS_DIR/pptx/scripts/fill_template.py 模板.pptx
+   spec.json 成品.pptx`。地址照抄 `addr`：
+
+   ```json
+   {"fill": {"2:5": "标题", "3:4/7": ["第一段", {"text": "子项", "level": 1}], "4:9@2,1": "单元格"}}
+   ```
+
+   字符串里换行即分段；第 N 段沿用原第 N 段（多出的沿用最后一段）的段落格式和首个文字段的字号、颜色、
+   粗细。同一版式要重复几页或要删页时改用
+   `{"slides": [1, {"from": 3, "fill": {…}}, {"from": 3, "fill": {…}}], "drop_unlisted": true}`：按列表
+   顺序出页，同一页列两次即复制，没列的页只有写了 `drop_unlisted` 才删。地址不存在或改不了时整份不
+   保存，`results` 一次列出全部问题。
+3. 输出的 `overflow` 是估计放不下的地址（`need_lines` > `fit_lines`，按 `cap_chars` 删减）：只把它们
+   一次全部改短，改 spec 后从模板重跑；只有模板本身允许时才把那一处字号略调小。`near`（接近放满）
+   和 `overflow_unknown`（估不了）不用改，看图时重点看；`warnings` 要转告用户。
+4. 按「检查成品」把 `changed_pages` 全部渲染看完，问题记全后一次改完，不要改一处看一处。
+
+按版式加新页：不带 `--texts` 的输出有 `layouts`，`prs.slide_masters[master].slide_layouts[index]`
+加页、`slide.placeholders[idx]` 填字，图片占位符用 `slide.placeholders[idx].insert_picture("图.png")`。
 
 ## 删页 / 调序
 
@@ -140,8 +150,8 @@ ids.insert(0, ids[-1])  # 把最后一页挪到最前
 `python $EXPERT_WORK_SKILLS_DIR/pptx/scripts/duplicate_slide.py IN.pptx OUT.pptx --index N [--after M]`
 （页码从 1 开始；默认紧跟原页，`--after 0` = 放最前）。输出 `new_slide_number`、
 `shared_parts_warning`：图表 / SmartArt / 嵌入对象 / 嵌入文件这几类**共享同一个数据部件**，改一页会
-连带改另一页，出现告警要提醒用户；图片、视频、超链接各自独立、不受影响；演讲者备注各自拷贝、互不
-影响、不出现在告警里；`notes_format_lost` 为 `true` 说明备注只复制了纯文本、格式没保留（极少见）。
+连带改另一页，出现告警要提醒用户；图片、视频、超链接、演讲者备注各自独立；`notes_format_lost` 为
+`true` 说明备注只复制了纯文本。
 
 ## 嵌视频
 
@@ -181,9 +191,8 @@ PowerPoint 只记字体名，客户打开时用自己电脑的字体，没装就
 - 原生图表在 LibreOffice 预览里渲染效果可能和 PowerPoint 不一致 → 推荐 matplotlib 出图再 `add_picture`
   插入。
 - 只设 `font.name`，中文仍是默认字体 → 必须同时设 `a:ea`（见 `set_cn_font`）。
-- `inspect_template.py` 里某个占位符的 left/top/width/height 是 `null` → 继承链到头了，按“没有固定
-  位置”处理，不要当成 0。
+- `inspect_template.py` 的 `layouts` 里位置是 `null` → 没有固定位置，不要当成 0。
 
 ## 做不到
 
-动画效果、修改内嵌图表 / SmartArt 的底层数据、宏——如实告诉用户「这个做不到」，不要假装做了。
+动画效果、图表 / SmartArt 的数据与文字、图片里的文字、宏——如实告诉用户「这个做不到」，不要假装做了。
