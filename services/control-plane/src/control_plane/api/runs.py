@@ -1374,6 +1374,23 @@ async def spawn_run(
     queued_behind: Admission | None = None
     run_record: RunRecord | None = None
     async with supersede_thread_lock(state.session_factory, thread_id):
+        # B-293 —— 对外端点撤掉「请求自己建、随后被拒」的新会话时,在这同一把锁里确认没有 run
+        # 行再删会话行(``_new_session_undo``)。等锁的这一轮进来后重读会话行:已经被撤了就回
+        # 「会话不存在」,不在一条已删的会话上建 run。
+        if await state.thread_meta_repo.get(thread_id, tenant_id=tenant_id) is None:
+            if envelope:
+                return JSONResponse(
+                    status_code=404,
+                    content={
+                        "success": False,
+                        "data": None,
+                        "error": {
+                            "code": "SESSION_NOT_FOUND",
+                            "message": "session not found for this user / agent",
+                        },
+                    },
+                )
+            raise HTTPException(status_code=404, detail="session not found")
         replay_messages: tuple[BaseMessage, ...] | None = None
         regenerated_from: UUID | None = None
         if supersede is None and store is not None:

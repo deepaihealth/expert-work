@@ -352,3 +352,27 @@ async def test_list_unexpired_by_ref_matches_tenant_user_and_ref_only_live_rows(
         default_days=90,
     )
     assert sorted(r.id for r in rows) == sorted([first, second])
+
+
+@pytest.mark.asyncio
+async def test_hard_delete_removes_one_row_of_this_tenant() -> None:
+    store = InMemoryUserUploadStore()
+    tenant, upload_id, other_id = uuid4(), uuid4(), uuid4()
+    for uid in (upload_id, other_id):
+        await store.insert(
+            upload_id=uid,
+            tenant_id=tenant,
+            user_id=uuid4(),
+            thread_id=uuid4(),
+            kind="document",
+            ref="uploads/a.pdf",
+            mime_type="application/pdf",
+            size_bytes=1,
+            filename="a.pdf",
+        )
+
+    assert not await store.hard_delete(upload_id=upload_id, tenant_id=uuid4())
+    assert await store.hard_delete(upload_id=upload_id, tenant_id=tenant)
+    assert not await store.hard_delete(upload_id=upload_id, tenant_id=tenant)
+    assert await store.get(upload_id=upload_id, tenant_id=tenant) is None
+    assert await store.get(upload_id=other_id, tenant_id=tenant) is not None

@@ -133,6 +133,9 @@ class InMemoryUserUploadStore(UserUploadStore):
         self._rows[(tenant_id, upload_id)] = row.model_copy(update={"deleted_at": now})
         return True
 
+    async def hard_delete(self, *, upload_id: UUID, tenant_id: UUID) -> bool:
+        return self._rows.pop((tenant_id, upload_id), None) is not None
+
     async def delete_all_for_user(self, *, tenant_id: UUID, user_id: UUID) -> int:
         victims = [
             key

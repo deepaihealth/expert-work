@@ -325,3 +325,10 @@ class InMemoryThreadMetaStore(ThreadMetaStore):
             return False
         del self._rows[thread_id]
         return True
+
+    async def delete_unused(
+        self, thread_id: UUID, *, tenant_id: UUID, own_upload_ids: Collection[UUID] = ()
+    ) -> bool:
+        # 没有 run / 上传表可查(同 ``nonempty`` 在内存后端不生效);判断在调用方锁里。
+        del own_upload_ids
+        return await self.delete(thread_id, tenant_id=tenant_id)

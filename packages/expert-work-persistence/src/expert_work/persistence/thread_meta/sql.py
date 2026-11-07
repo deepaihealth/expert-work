@@ -25,6 +25,8 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from expert_work.persistence.like_escape import like_contains
 from expert_work.persistence.models import ThreadMetaRow
 from expert_work.persistence.models.agent_run import AgentRunRow
+from expert_work.persistence.models.image_upload import ImageUploadRow
+from expert_work.persistence.models.user_upload import UserUploadRow
 from expert_work.persistence.thread_meta.base import ThreadMetaStore, ThreadOrder
 from expert_work.protocol import ThreadMeta, ThreadStatus
 
@@ -495,6 +497,24 @@ class SqlThreadMetaStore(ThreadMetaStore):
         stmt = delete(ThreadMetaRow).where(
             ThreadMetaRow.thread_id == thread_id,
             ThreadMetaRow.tenant_id == tenant_id,
+        )
+        async with self._sf() as session:
+            result = await session.execute(stmt)
+            await session.commit()
+            return int(getattr(result, "rowcount", 0) or 0) > 0
+
+    async def delete_unused(
+        self, thread_id: UUID, *, tenant_id: UUID, own_upload_ids: Collection[UUID] = ()
+    ) -> bool:
+        others_uploads = exists().where(UserUploadRow.thread_id == thread_id)
+        if own_upload_ids:
+            others_uploads = others_uploads.where(UserUploadRow.id.not_in(list(own_upload_ids)))
+        stmt = delete(ThreadMetaRow).where(
+            ThreadMetaRow.thread_id == thread_id,
+            ThreadMetaRow.tenant_id == tenant_id,
+            ~exists().where(AgentRunRow.thread_id == thread_id),
+            ~exists().where(ImageUploadRow.thread_id == thread_id),
+            ~others_uploads,
         )
         async with self._sf() as session:
             result = await session.execute(stmt)

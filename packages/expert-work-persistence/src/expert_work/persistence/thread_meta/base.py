@@ -291,3 +291,15 @@ class ThreadMetaStore(abc.ABC):
 
         Test / admin only. Production retention is driven by Stream D.3 TTL job.
         """
+
+    @abc.abstractmethod
+    async def delete_unused(
+        self, thread_id: UUID, *, tenant_id: UUID, own_upload_ids: Collection[UUID] = ()
+    ) -> bool:
+        """B-293 —— 撤掉一个请求刚建、还没人用的会话:只在没有任何 ``agent_run`` 行、没有
+        ``image_upload`` 行、``user_upload`` 行全在 ``own_upload_ids`` 里(本请求自己登记的)时
+        删除。判断与删除是同一条语句;返回是否删掉了。
+
+        调用方在会话的接单锁里调(``supersede_thread_lock``)。内存实现不知道别的表,与
+        :meth:`delete` 一样直接删 —— 调用方锁里的检查是内存栈上唯一的那道判断。
+        """

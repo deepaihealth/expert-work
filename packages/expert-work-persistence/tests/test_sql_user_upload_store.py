@@ -81,6 +81,33 @@ async def test_insert_then_get_same_tenant(sql_store: SqlStoreFixture) -> None:
 
 
 @pytest.mark.asyncio
+async def test_hard_delete_removes_one_row_of_this_tenant(sql_store: SqlStoreFixture) -> None:
+    store, engine = sql_store
+    try:
+        tenant, upload_id, other_id = uuid4(), uuid4(), uuid4()
+        for uid in (upload_id, other_id):
+            await store.insert(
+                upload_id=uid,
+                tenant_id=tenant,
+                user_id=uuid4(),
+                thread_id=uuid4(),
+                kind="document",
+                ref="uploads/a.pdf",
+                mime_type="application/pdf",
+                size_bytes=1,
+                filename="a.pdf",
+            )
+
+        assert not await store.hard_delete(upload_id=upload_id, tenant_id=uuid4())
+        assert await store.hard_delete(upload_id=upload_id, tenant_id=tenant)
+        assert not await store.hard_delete(upload_id=upload_id, tenant_id=tenant)
+        assert await store.get(upload_id=upload_id, tenant_id=tenant) is None
+        assert await store.get(upload_id=other_id, tenant_id=tenant) is not None
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
 async def test_get_other_tenant_is_none(sql_store: SqlStoreFixture) -> None:
     store, engine = sql_store
     try:

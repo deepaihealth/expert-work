@@ -197,6 +197,16 @@ class SqlUserUploadStore(UserUploadStore):
             await session.commit()
         return int(getattr(result, "rowcount", 0) or 0) > 0
 
+    async def hard_delete(self, *, upload_id: UUID, tenant_id: UUID) -> bool:
+        async with self._sf() as session:
+            result = await session.execute(
+                delete(UserUploadRow).where(
+                    UserUploadRow.id == upload_id, UserUploadRow.tenant_id == tenant_id
+                )
+            )
+            await session.commit()
+        return int(getattr(result, "rowcount", 0) or 0) > 0
+
     async def delete_all_for_user(self, *, tenant_id: UUID, user_id: UUID) -> int:
         async with self._sf() as session:
             result = await session.execute(
