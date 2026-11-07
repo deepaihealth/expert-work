@@ -114,6 +114,9 @@ from expert_work.runtime.middleware.llm_error_handling import (
 from expert_work.runtime.middleware.llm_error_handling import (
     LLMUnauthorizedError as LLMUnauthorizedError,
 )
+from expert_work.runtime.middleware.llm_error_handling import (
+    notify_first_progress as notify_first_progress,
+)
 from expert_work.runtime.middleware.loop_detection import (
     DEFAULT_REMINDER_TEXT as DEFAULT_REMINDER_TEXT,
 )
@@ -199,5 +202,6 @@ __all__ = [
     "fingerprint_tool_calls",
     "make_langfuse_client",
     "normalize_args",
+    "notify_first_progress",
     "usage_tap",
 ]

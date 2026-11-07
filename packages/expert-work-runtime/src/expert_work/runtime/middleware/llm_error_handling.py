@@ -28,6 +28,7 @@ import logging
 import random
 import time
 from collections.abc import Awaitable, Callable
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 
 from expert_work.common.observability.metrics import expert_work_counter
@@ -40,6 +41,9 @@ from expert_work.runtime.middleware.circuit_breaker import (
 )
 from expert_work.runtime.middleware.circuit_breaker import (
     CircuitBreaker as CircuitBreaker,
+)
+from expert_work.runtime.middleware.circuit_breaker import (
+    Permit as Permit,
 )
 
 logger = logging.getLogger(__name__)
@@ -205,13 +209,33 @@ _breaker_open_total = expert_work_counter(
 )
 
 #: B-297 — failures that count toward the breaker but are never retried
-#: in place: a hung provider (first-token timeout) and a stream that died
-#: after its first token (committed to this provider; the router re-raises).
+#: in place: a dead account/key, a hung provider (first-token timeout) and a
+#: stream that died after its first token (committed to this provider; the
+#: router re-raises).
 _COUNTED_NOT_RETRIED: tuple[type[LLMError], ...] = (
     LLMKeyUnavailableError,
     LLMStreamStaleError,
     LLMStreamInterruptedError,
 )
+
+#: B-297 — set by the middleware around a half-open *probe* attempt; the router
+#: calls :func:`notify_first_progress` at the attempt's first progress delta so
+#: the probe resolves (breaker closes) as soon as the upstream answers instead
+#: of holding the probe slot for a whole generation. A ContextVar because the
+#: router's streaming driver runs inside ``call_next`` in the same task.
+_first_progress_hook: ContextVar[Callable[[], Awaitable[None]] | None] = ContextVar(
+    "expert_work_llm_first_progress_hook", default=None
+)
+
+
+async def notify_first_progress() -> None:
+    """The provider attempt in flight produced its first progress delta.
+
+    Called by the LLM router's streaming driver; a no-op unless the attempt is
+    a half-open breaker probe."""
+    hook = _first_progress_hook.get()
+    if hook is not None:
+        await hook()
 
 
 def _default_key_extractor(ctx: MiddlewareContext) -> str:
@@ -223,35 +247,55 @@ def _default_key_extractor(ctx: MiddlewareContext) -> str:
 
 
 @dataclass
+class _Attempt:
+    """Per-call bookkeeping of :meth:`LLMErrorHandlingMiddleware.__call__`."""
+
+    breaker: CircuitBreaker
+    provider_key: str
+    key: str
+    has_fallback: bool
+    has_alternative: bool
+    started: float
+    slept: float = 0.0
+
+
+@dataclass
 class LLMErrorHandlingMiddleware:
     """Wrap one provider attempt with in-place retry + the circuit breaker.
 
-    B-297 — the retry budget depends on whether the router still has another
-    provider group to fail over to (``ctx.payload["has_fallback"]``, absent =
-    ``False``):
+    B-297 — the router passes two hints in ``ctx.payload`` (both absent =
+    ``False``; ``has_alternative`` defaults to ``has_fallback``):
 
-    * **with a fallback** — at most ``fallback_max_retries`` (1) same-provider
-      retry after a short jittered backoff (≤ ``fallback_max_delay_s``), and
-      only while the whole provider attempt stays inside
-      ``fallback_budget_s`` (15 s; a retry is assumed to take as long as the
-      attempt that just failed). An OPEN breaker refuses at once
-      (:class:`CircuitOpenError` → the router moves on), and so does a
-      ``Retry-After`` longer than the remaining budget.
-    * **without a fallback** — the long-standing budget: ``max_retries`` (3)
-      retries, exponential ``base_delay_s * 2**n`` capped at ``max_delay_s``,
-      or ``min(Retry-After, max_delay_s)`` when the vendor sent one. The
-      breaker is still fed but does not short-circuit: refusing the only
-      model would turn a maybe-transient blip into a certain failure
-      (LiteLLM likewise never cools down a group's only deployment).
+    * ``has_alternative`` — *any* later handle in this call's walk (a sibling
+      key of the same provider, or another provider group). It decides the
+      **breaker short-circuit**: an OPEN breaker (or a probe already in flight)
+      raises :class:`CircuitOpenError` at once so the router moves on; and a
+      429 is not retried in place (another key / provider can serve now).
+      With no alternative at all, the breaker is fed but never refuses —
+      refusing the only option turns a maybe-transient blip into a certain
+      failure (LiteLLM likewise never cools down a group's only deployment).
+    * ``has_fallback`` — a *different provider group* follows. It decides the
+      **retry budget**: at most ``fallback_max_retries`` (1) same-provider retry
+      after a short jittered backoff (≤ ``fallback_max_delay_s``, 1 s), only
+      while the attempt stays inside ``fallback_budget_s`` (15 s; a retry is
+      assumed to take as long as the attempt that just failed); a
+      ``Retry-After`` longer than ``fallback_max_delay_s`` fails over at once
+      instead of waiting on the primary. Without a fallback (sibling keys alike
+      fail on a provider outage): ``max_retries`` (3) retries, exponential
+      ``base_delay_s * 2**n``; a ``Retry-After`` raises that wait (never lowers
+      it), each wait ≤ ``max_delay_s`` (30 s) and all waits of one call ≤
+      ``max_total_delay_s`` (60 s).
 
     Every failed upstream attempt counts toward the breaker (see
-    :mod:`.circuit_breaker`); a 4xx client error is neutral.
+    :mod:`.circuit_breaker`); a 4xx client error is neutral. A half-open probe
+    resolves at its first progress delta (:func:`notify_first_progress`).
     """
 
     breaker_registry: BreakerRegistry = field(default_factory=BreakerRegistry)
     max_retries: int = 3
     base_delay_s: float = 1.0
     max_delay_s: float = 30.0
+    max_total_delay_s: float = 60.0
     fallback_max_retries: int = 1
     fallback_base_delay_s: float = 0.5
     fallback_max_delay_s: float = 1.0
@@ -268,113 +312,145 @@ class LLMErrorHandlingMiddleware:
 
     async def __call__(self, ctx: MiddlewareContext, call_next: CallNext) -> None:
         key = self.key_extractor(ctx)
-        provider_key = str(ctx.payload.get("provider_key", "default"))
         has_fallback = bool(ctx.payload.get("has_fallback", False))
-        breaker = await self.breaker_registry.get(key)
-        started = self.clock()
-
+        call = _Attempt(
+            breaker=await self.breaker_registry.get(key),
+            provider_key=str(ctx.payload.get("provider_key", "default")),
+            key=key,
+            has_fallback=has_fallback,
+            has_alternative=bool(ctx.payload.get("has_alternative", has_fallback)),
+            started=self.clock(),
+        )
         last_exc: LLMError | None = None
         attempt = 0
         while True:
-            admission = await breaker.acquire()
-            if admission == "rejected" and has_fallback:
+            permit = await call.breaker.admit()
+            if permit.admission == "rejected" and call.has_alternative:
                 if last_exc is not None:
                     raise last_exc
                 raise CircuitOpenError(key)
-            probe = admission == "probe"
-            attempt_started = self.clock()
-            try:
-                await call_next(ctx)
-            except _COUNTED_NOT_RETRIED:
-                await self._record_failure(breaker, provider_key, key, probe=probe)
-                raise
-            except LLMClientError:
-                # 4xx: the request's fault, not the upstream's — neutral.
-                await breaker.release(probe=probe)
-                raise
-            except _RETRYABLE_ERRORS as exc:
-                last_exc = exc
-                opened = await self._record_failure(
-                    breaker, provider_key, key, probe=probe, retry_after_s=exc.retry_after_s
-                )
-                now = self.clock()
-                delay = self._retry_delay(
-                    exc,
-                    attempt,
-                    has_fallback=has_fallback,
-                    elapsed_s=now - started,
-                    last_attempt_s=now - attempt_started,
-                )
-                logger.warning(
-                    "llm_error_handling.retryable attempt=%d key=%s err=%s has_fallback=%s "
-                    "retry_in_s=%s",
-                    attempt + 1,
-                    provider_key,
-                    type(exc).__name__,
-                    has_fallback,
-                    "none" if delay is None else f"{delay:.2f}",
-                )
-                if delay is None or (opened and has_fallback):
-                    raise
-                await self.sleeper(delay)
-                attempt += 1
-                continue
-            except BaseException:
-                # Anything else (cancellation, adapter bug): not evidence
-                # about the upstream's health — free a probe slot and go.
-                await breaker.release(probe=probe)
-                raise
-            else:
-                await breaker.record_success(probe=probe)
+            last_exc = await self._attempt(call, permit, ctx, call_next, attempt)
+            if last_exc is None:
                 return
+            attempt += 1
+
+    async def _attempt(
+        self,
+        call: _Attempt,
+        permit: Permit,
+        ctx: MiddlewareContext,
+        call_next: CallNext,
+        attempt: int,
+    ) -> LLMError | None:
+        """One upstream attempt. ``None`` = succeeded; an error = retry after
+        the backoff already slept here; anything final is raised."""
+        breaker = call.breaker
+        resolved = False
+
+        async def _probe_answered() -> None:
+            nonlocal resolved
+            if not resolved:
+                resolved = True
+                await breaker.record_success(permit=permit)
+
+        token = _first_progress_hook.set(_probe_answered if permit.is_probe else None)
+        attempt_started = self.clock()
+        try:
+            await call_next(ctx)
+        except _COUNTED_NOT_RETRIED:
+            await self._record_failure(call, permit)
+            raise
+        except LLMClientError:
+            # 4xx: the request's fault, not the upstream's — neutral.
+            await breaker.release(permit=permit)
+            raise
+        except _RETRYABLE_ERRORS as exc:
+            opened = await self._record_failure(call, permit, retry_after_s=exc.retry_after_s)
+            now = self.clock()
+            delay = self._retry_delay(
+                exc,
+                attempt,
+                call,
+                elapsed_s=now - call.started,
+                last_attempt_s=now - attempt_started,
+            )
+            logger.warning(
+                "llm_error_handling.retryable attempt=%d key=%s err=%s has_fallback=%s "
+                "retry_in_s=%s",
+                attempt + 1,
+                call.provider_key,
+                type(exc).__name__,
+                call.has_fallback,
+                "none" if delay is None else f"{delay:.2f}",
+            )
+            if delay is None or (opened and call.has_alternative):
+                raise
+            call.slept += delay
+            await self.sleeper(delay)
+            return exc
+        except BaseException:
+            # Anything else (cancellation, adapter bug): not evidence about
+            # the upstream's health — free a probe slot and go.
+            await breaker.release(permit=permit)
+            raise
+        else:
+            if not resolved:
+                await breaker.record_success(permit=permit)
+            return None
+        finally:
+            _first_progress_hook.reset(token)
 
     def _retry_delay(
         self,
         exc: LLMError,
         attempt: int,
+        call: _Attempt,
         *,
-        has_fallback: bool,
         elapsed_s: float,
         last_attempt_s: float,
     ) -> float | None:
         """Seconds to wait before retry number ``attempt + 1``, or ``None``
-        to stop retrying and re-raise (→ the router fails over)."""
+        to stop retrying and re-raise (→ the router moves on)."""
         retry_after = exc.retry_after_s
-        if not has_fallback:
+        if isinstance(exc, LLMRateLimitError) and call.has_alternative:
+            # This key is throttled; another key / provider can serve now.
+            return None
+        if not call.has_fallback:
             if attempt >= self.max_retries:
                 return None
+            delay = float(self.base_delay_s * (2.0**attempt))
             if retry_after is not None:
-                return min(retry_after, self.max_delay_s)
-            return float(min(self.max_delay_s, self.base_delay_s * (2**attempt)))
+                delay = max(delay, retry_after)
+            delay = min(delay, self.max_delay_s)
+            if call.slept + delay > self.max_total_delay_s:
+                return None
+            return delay
         if attempt >= self.fallback_max_retries:
+            return None
+        if retry_after is not None and retry_after > self.fallback_max_delay_s:
+            # The vendor asks for longer than the fast path waits: let the
+            # backup serve instead of idling on the primary (LiteLLM).
             return None
         cap = min(self.fallback_max_delay_s, self.fallback_base_delay_s * (2.0**attempt))
         # "Equal jitter": half fixed, half random — never 0, never above cap.
         delay = cap * (0.5 + 0.5 * self.rand())
         if retry_after is not None:
             delay = max(delay, retry_after)
-        # A retry is assumed to take as long as the attempt that just failed;
-        # a Retry-After beyond the remaining budget fails over here too.
+        # A retry is assumed to take as long as the attempt that just failed.
         if elapsed_s + delay + last_attempt_s > self.fallback_budget_s:
             return None
         return delay
 
     async def _record_failure(
-        self,
-        breaker: CircuitBreaker,
-        provider_key: str,
-        key: str,
-        *,
-        probe: bool,
-        retry_after_s: float | None = None,
+        self, call: _Attempt, permit: Permit, *, retry_after_s: float | None = None
     ) -> bool:
-        opened = await breaker.record_failure(probe=probe, retry_after_s=retry_after_s)
+        opened = await call.breaker.record_failure(permit=permit, retry_after_s=retry_after_s)
         if opened:
-            _breaker_open_total.labels(provider_key=provider_key).inc()
+            _breaker_open_total.labels(provider_key=call.provider_key).inc()
             logger.warning(
                 "llm_breaker.open provider_key=%s breaker_key=%s consecutive_failures=%d",
-                provider_key,
-                key,
-                breaker.consecutive_failures,
+                call.provider_key,
+                call.key,
+                call.breaker.consecutive_failures,
             )
         return opened

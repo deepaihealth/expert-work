@@ -28,6 +28,8 @@ from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from uuid import UUID
 
+from langchain_core.messages import BaseMessage
+
 from expert_work.common.observability import expert_work_counter
 from expert_work.runtime.middleware import (
     CircuitOpenError,
@@ -39,6 +41,7 @@ from expert_work.runtime.middleware import (
     LLMStreamStaleError,
     LLMUnauthorizedError,
 )
+from expert_work.runtime.tokens import TokenEstimator, estimate_messages
 
 logger = logging.getLogger(__name__)
 
@@ -61,11 +64,40 @@ _REASONS: tuple[tuple[type[BaseException], str], ...] = (
     (LLMServerError, "server_error"),
 )
 
+#: First-token deadline while a backup provider group exists and the call
+#: streams. The timer restarts on every delta and reasoning deltas count as
+#: progress (``LLMDelta.has_progress``), so it only fires when the upstream
+#: sends nothing at all. Prior art: Claude Code gives up after 90 s idle;
+#: OpenClaw waits 120 s for cloud models and 60 s on its cron fallback path;
+#: hermes-agent scales 90-240 s with context size. A hung primary with a
+#: healthy backup should not cost the 180 s single-model floor.
+FALLBACK_FIRST_TOKEN_TIMEOUT_S = 60.0
+#: …for large prompts, whose prefill alone can take tens of seconds.
+FALLBACK_FIRST_TOKEN_TIMEOUT_LARGE_CONTEXT_S = 120.0
+#: Estimated prompt tokens above which the larger deadline applies.
+LARGE_CONTEXT_TOKENS = 100_000
+
 #: Idle lifetime of a run's sticky entry — refreshed on every read/write, so
 #: a long run keeps it; a finished run's entry ages out.
 STICKY_TTL_S = 2 * 3600.0
 #: Hard cap on remembered runs per process (LRU eviction beyond it).
 STICKY_MAX_ENTRIES = 4096
+
+
+def fallback_first_token_timeout(
+    configured: float | None,
+    messages: Sequence[BaseMessage],
+    estimator: TokenEstimator,
+) -> float | None:
+    """The first-token deadline of a *streaming* attempt that has a backup
+    group: ``configured`` capped at 60 s (120 s above 100k estimated prompt
+    tokens). ``None`` / ``0`` (deadline disabled in the manifest) is kept."""
+    if configured is None or configured <= 0:
+        return configured
+    cap = FALLBACK_FIRST_TOKEN_TIMEOUT_S
+    if estimate_messages(messages, estimator) > LARGE_CONTEXT_TOKENS:
+        cap = FALLBACK_FIRST_TOKEN_TIMEOUT_LARGE_CONTEXT_S
+    return min(configured, cap)
 
 
 def failover_reason(exc: BaseException) -> str:
@@ -124,6 +156,12 @@ class WalkPlan:
             return True
         group = self.group_at(pos)
         return any(self.group_at(q) != group for q in range(pos + 1, self.boundary))
+
+    def has_alternative(self, pos: int) -> bool:
+        """Whether *any* handle follows ``pos`` — a sibling key or another
+        group. The E.4 middleware refuses an OPEN breaker (and does not retry
+        a 429 in place) only when there is somewhere else to go."""
+        return pos + 1 < len(self.order)
 
     def next_group(self, pos: int) -> int:
         """First position after ``pos`` in a different group (skip siblings)."""

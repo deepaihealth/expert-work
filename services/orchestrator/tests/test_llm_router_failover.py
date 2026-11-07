@@ -57,7 +57,10 @@ class _Spy:
 
     async def __call__(self, ctx: MiddlewareContext, call_next: CallNext) -> None:
         self.seen.append(
-            {k: ctx.payload.get(k) for k in ("provider_key", "breaker_key", "has_fallback")}
+            {
+                k: ctx.payload.get(k)
+                for k in ("provider_key", "breaker_key", "has_fallback", "has_alternative")
+            }
         )
         await call_next(ctx)
 

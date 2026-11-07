@@ -2330,11 +2330,18 @@ asyncio.run(main())
 
 ## §107 主模型坏了几秒内转备用,一轮内不来回切,熔断真的会开(B-297 PR1)
 
-**背景**:11-07 测试环境主模型连续约 1 小时回 5xx,每一步先在同一厂商重试 4 次(约 55 秒)才转备用,下一步又从坏掉的主模型开始,熔断从来没开。现在:有备用组时同厂商最多重试 1 次(≤1 秒抖动退避、单厂商 15 秒预算);一轮里一旦由备用接手,后面的步骤直接从备用开始(新一轮回到主模型);每次失败的上游尝试都计入熔断,连续 3 次(或 60 秒内 ≥5 次尝试失败率 ≥50%)打开,冷却 30 秒、连续重开翻倍到 300 秒,半开只放一个探活;`Retry-After` 超出预算直接转备用。没有备用的单模型智能体保持原来的 3 次指数重试,熔断也不拦它。熔断状态每个 control-plane 进程一份(副本之间不共享),所以全部用例都要**固定打到同一个 pod**。
+**背景**:11-07 测试环境主模型连续约 1 小时回 5xx,每一步先在同一厂商重试 4 次(约 55 秒)才转备用,下一步又从坏掉的主模型开始,熔断从来没开。现在:
+
+- 后面还有别的模型组(备用)时:同厂商最多重试 1 次(≤1 秒抖动退避、单厂商 15 秒预算),`Retry-After` 超过 1 秒不等、直接转备用;流式调用的首 token 等待封顶 60 秒(估算上下文 >10 万 token 时 120 秒)。没有备用组(同一模型的其它 key 不算)时保持原来的 3 次指数重试和 180 秒首 token 下限。
+- 后面还有任何可试的(其它 key 也算)时:开着的熔断直接跳过、429 不原地重试;链路最后一个不被熔断拦。
+- 一轮里一旦由备用接手,后面的步骤直接从备用开始(新一轮回到主模型)。
+- 每次失败的上游尝试都计入熔断,连续 3 次(或 60 秒内 ≥5 次尝试失败率 ≥50%)打开,冷却 30 秒、连续重开翻倍到 300 秒;半开只放一个探活,探活 60 秒内既没增量也没结束算失败。
+
+熔断状态每个 control-plane 进程一份(副本之间不共享),所以全部用例都要**固定打到同一个 pod**,并按顺序做(次数判据依赖该 pod 上这几个桩模型此前没被调用过;做乱了就重启该 pod 或换新的模型名从头来)。
 
 **怎么进(只在测试环境)**:
 
-- **故障桩**:在测试命名空间起一个临时 pod `b297-stub`(用 control-plane 镜像,自带 Python;不要临时从 Docker Hub 拉)+ ClusterIP 服务,端口 8080。它对任何 POST 都按 `/tmp/mode` 回:`503`(默认,立刻回 503)或 `429`(回 429 + `retry-after: 40`),每个请求打一行带时刻的日志。脚本:
+- **故障桩**:在测试命名空间起一个临时 pod `b297-stub`(用 control-plane 镜像,自带 Python;不要临时从 Docker Hub 拉)+ ClusterIP 服务,端口 8080。它对任何 POST 按 `/tmp/mode` 回:`503`(默认,立刻回 503);`429`(回 429 + `retry-after: 40`);`hang`(收下请求、600 秒不回);`perkey`(Authorization 以 `k0` 结尾回 429、不带 retry-after,其余回 503)。每个请求打一行带时刻、模式和 key 末两位的日志。切模式:`kubectl exec b297-stub -- sh -c 'echo <模式> > /tmp/mode'`。脚本:
 
   ```python
   import http.server, os, time
@@ -2342,8 +2349,15 @@ asyncio.run(main())
       def do_POST(self):
           self.rfile.read(int(self.headers.get("content-length", 0)))
           mode = open("/tmp/mode").read().strip() if os.path.exists("/tmp/mode") else "503"
-          print(time.strftime("%H:%M:%S"), "POST", mode, flush=True)
-          self.send_response(429 if mode == "429" else 503)
+          key = self.headers.get("authorization", "")[-2:]
+          print(time.strftime("%H:%M:%S"), "POST", mode, "key", key, flush=True)
+          if mode == "hang":
+              time.sleep(600)
+              return
+          status = 503
+          if mode == "429" or (mode == "perkey" and key == "k0"):
+              status = 429
+          self.send_response(status)
           if mode == "429":
               self.send_header("retry-after", "40")
           self.send_header("content-type", "application/json")
@@ -2351,17 +2365,26 @@ asyncio.run(main())
           self.wfile.write(b'{"error":{"message":"stub"}}')
   http.server.ThreadingHTTPServer(("", 8080), H).serve_forever()
   ```
-- **临时智能体**(测试控制台):`acc-b297` 主模型 `provider: self-hosted`、`name: b297-stub`、`base_url: http://b297-stub.<命名空间>.svc:8080`,备用一个测试环境可用的便宜聊天模型;`acc-b297-ra` 同上但主模型 `name: b297-stub-ra`(独立的熔断键,给 107.5 用);`acc-b297-solo` 只有 `b297-stub`、没有备用。三个都关回复缓存或每轮换提示词。测试租户若解析不到 `self-hosted` 平台凭据,给本租户加一条 `self-hosted` 覆盖凭据(值随便填,桩不校验),收尾删掉。
+- **临时智能体**(测试控制台),`base_url` 都是 `http://b297-stub.<命名空间>.svc:8080`,`provider: self-hosted`:
+  - `acc-b297`:主模型 `name: b297-stub`,备用一个测试环境可用的便宜聊天模型;
+  - `acc-b297-ra`:同上,主模型 `name: b297-stub-ra`(独立熔断键,107.5 用);
+  - `acc-b297-hang`:同上,主模型 `name: b297-stub-hang`(107.6 用);
+  - `acc-b297-solo`:只有 `b297-stub`,没有备用;
+  - `acc-b297-keys`:只有 `name: b297-stub-keys`,没有备用(107.8 用,那时平台给 `self-hosted` 配两把 key)。
+  - **全部**:不写 `memory.long_term`(不开长期记忆)、`policies.context_compression.enabled: false`(不自动压缩)、不写 `routing` 规则、不开计划 / 反思;关回复缓存或每轮换提示词。否则记忆 / 压缩这些后台调用会默认用同一家模型(即桩),多出 POST、提前喂熔断,次数判据全乱。
+  - 测试租户若解析不到 `self-hosted` 平台凭据,给本租户加一条 `self-hosted` 覆盖凭据(值 `dummy-k0`,桩不校验),收尾删掉。
 - **提示词**要让模型至少调一次工具再回答(例:「先列一下工作区里的文件,再告诉我有几个」),保证一轮有 ≥2 次模型调用。
 - run 用对外 key 发,`kubectl exec` 进同一个 control-plane pod 走 localhost;看该 pod 的日志和 `/metrics`,另开一个终端 `kubectl logs -f` 桩。**花费**:十来轮短对话全由备用模型回答,< ¥1。
 
-- [ ] **107.1 第一步几秒内转备用**:桩 `503`。用例按顺序做、中间不要换 pod(次数判据依赖该 pod 上这两个桩模型此前没被调用过;做乱了就重启该 pod 或换新的模型名从头来)。`acc-b297` 发第 1 轮,记下 run 起止时刻。判据:这一轮的第一次模型调用,桩**正好收到 2 个** POST,间隔 ≤1 秒;pod 日志依次有 `llm_error_handling.retryable attempt=1 key=self-hosted:b297-stub … has_fallback=True retry_in_s=0.xx`、`attempt=2 … retry_in_s=none`、`llm_router.provider_failed`、`llm_router.sticky_set group=<备用 provider:model>`;从桩第一个 POST 到备用开始应答 ≤ 3 秒;run `success`,答案来自备用。**没修好时**:桩收到 4 个 POST,间隔 1 / 2 / 4 秒,这一步多花 7 秒以上(11-07 真实 5xx 时约 55 秒)。
+- [ ] **107.1 第一步几秒内转备用**:桩 `503`。`acc-b297` 发第 1 轮,记下 run 起止时刻。判据:这一轮的第一次模型调用,桩**正好收到 2 个** POST,间隔 ≤1 秒;pod 日志依次有 `llm_error_handling.retryable attempt=1 key=self-hosted:b297-stub … has_fallback=True retry_in_s=0.xx`、`attempt=2 … retry_in_s=none`、`llm_router.provider_failed`、`llm_router.sticky_set group=<备用 provider:model>`;从桩第一个 POST 到备用开始应答 ≤ 3 秒;run `success`,答案来自备用。**没修好时**:桩收到 4 个 POST,间隔 1 / 2 / 4 秒,这一步多花 7 秒以上(11-07 真实 5xx 时约 55 秒)。
 - [ ] **107.2 同一轮后面的步骤直接走备用**:看 107.1 那一轮。判据:第一步之后桩再没收到 POST;之后每次模型调用 pod 日志有 `llm_router.sticky_start from_group=self-hosted:b297-stub to_group=<备用>`;`/metrics` 的 `expert_work_llm_failover_total{from_group="self-hosted:b297-stub",reason="sticky"}` 比发之前多出「本轮模型调用次数 − 1」,`reason="server_error"` 多 1。**没修好时**:每一步桩都收到请求、每一步都慢。
-- [ ] **107.3 新一轮先试主模型,第 3 次失败开熔断,开了就不再打**:107.1 之后 30 秒内,`acc-b297` 发第 2 轮。判据:这一轮桩**只收到 1 个** POST(累计第 3 次失败 → 熔断打开、不再重试);pod 日志 `llm_breaker.open provider_key=self-hosted:b297-stub breaker_key=self-hosted:b297-stub@<12 位十六进制> consecutive_failures=3` 与 `circuit_breaker.open … cooldown_s=30.0`;`breaker_key` 里没有密钥、没有 `secret://` 字样;`expert_work_llm_breaker_open_total{provider_key="self-hosted:b297-stub"}` +1。紧接着(仍在 30 秒内)发第 3 轮:桩 **0 个** POST,日志 `llm_router.key_failed … err=CircuitOpenError`,`failover_total{reason="circuit_open"}` +1,run `success`。**没修好时**:熔断不开,每一轮都先打桩(且每次 4 个)。
+- [ ] **107.3 新一轮先试主模型,第 3 次失败开熔断,开了就不再打**:107.1 之后 30 秒内,`acc-b297` 发第 2 轮。判据:这一轮桩**只收到 1 个** POST(累计第 3 次失败 → 熔断打开、不再重试、也不先等退避);pod 日志 `llm_breaker.open provider_key=self-hosted:b297-stub breaker_key=self-hosted:b297-stub@<12 位十六进制> consecutive_failures=3` 与 `circuit_breaker.open … cooldown_s=30.0`;`breaker_key` 里没有密钥、没有 `secret://` 字样;`expert_work_llm_breaker_open_total{provider_key="self-hosted:b297-stub"}` +1。紧接着(仍在 30 秒内)发第 3 轮:桩 **0 个** POST,日志 `llm_router.key_failed … err=CircuitOpenError`,`failover_total{reason="circuit_open"}` +1,run `success`。**没修好时**:熔断不开,每一轮都先打桩(且每次 4 个)。
 - [ ] **107.4 冷却后只放一个探活,失败则冷却翻倍**:107.3 熔断打开 30 秒以上后,两个终端**同时**各发一轮 `acc-b297`。判据:桩**只收到 1 个** POST;日志 `circuit_breaker.probe` 一次、随后 `circuit_breaker.open … cooldown_s=60.0`;两轮都 `success`(另一轮直接 `CircuitOpenError` 转备用)。60 秒内再发一轮:桩 0 个 POST。**没修好时**:两轮都打到桩(半开谁都放行)。
-- [ ] **107.5 Retry-After 超出预算不等、直接转备用**:桩切 `429`(`kubectl exec b297-stub -- sh -c 'echo 429 > /tmp/mode'`)。`acc-b297-ra` 发一轮。判据:桩收到 1 个 POST,日志 `llm_error_handling.retryable … err=LLMRateLimitError has_fallback=True retry_in_s=none`,这一步 ≤ 3 秒转到备用,没有等 40 秒;再发两轮新的(每轮桩 1 个 POST,第 3 次失败开熔断),熔断日志 `cooldown_s=40.0`(Retry-After 比 30 秒长,按它)。**没修好时**:同厂商退避重试 3 次;熔断冷却仍是固定值。
-- [ ] **107.6 单模型智能体不比以前更脆**:桩切回 `503`。`acc-b297-solo` 发一轮(它和 `acc-b297` 主模型同一个熔断键,此时熔断是开的或半开)。判据:桩仍收到 **4 个** POST、间隔约 1 / 2 / 4 秒(没有备用时熔断不拦、重试预算不变),run 以模型错误结束。**判据红的情形**:桩 0 个或 1~2 个 POST(单模型智能体被熔断 / 快速预算拦掉了)。
-- [ ] **107.7 日志不带客户内容**:把 107.1–107.6 里出现的 `llm_error_handling.*`、`llm_router.*`、`llm_breaker.*`、`circuit_breaker.*` 日志行过一遍。判据:只有 provider:model、熔断键、错误类型、次数 / 秒数,没有提示词、回答、文件名、密钥或凭据引用原文。
-- [ ] **107.8 收尾**:删 `b297-stub` pod 与服务、三个临时智能体、临时 key、会话与终端用户;若加了 `self-hosted` 覆盖凭据一并删掉。
+- [ ] **107.5 Retry-After 长于 1 秒不等、直接转备用**:桩切 `429`。`acc-b297-ra` 发一轮。判据:桩收到 1 个 POST,日志 `llm_error_handling.retryable … err=LLMRateLimitError has_fallback=True retry_in_s=none`,这一步 ≤ 3 秒转到备用,没有等 40 秒;再发两轮新的(每轮桩 1 个 POST,第 3 次失败开熔断),熔断日志 `cooldown_s=40.0`(Retry-After 比 30 秒长,按它)。**没修好时**:同厂商退避重试;熔断冷却仍是固定值。
+- [ ] **107.6 主模型不回包,60 秒转备用(不是 180 秒)**:桩切 `hang`。`acc-b297-hang` 发一轮,记下桩收到 POST 的时刻和备用开始应答的时刻。判据:桩收到 1 个 POST;约 60 秒后 pod 日志 `llm_router.first_token_timeout key=self-hosted:b297-stub-hang deadline_s=60.0`,随即备用应答,run `success`;同一轮后面的步骤不再打桩(粘住备用)。**没修好时**:等满 180 秒才转备用。做完把桩切回 `503`(挂着的请求随 pod 删除结束)。
+- [ ] **107.7 单模型智能体不比以前更脆**:桩为 `503`。`acc-b297-solo` 发一轮(它和 `acc-b297` 主模型同一个熔断键,此时熔断是开的或半开)。判据:桩仍收到 **4 个** POST、间隔约 1 / 2 / 4 秒(链路最后一个不被熔断拦、重试预算不变),run 以模型错误结束。**判据红的情形**:桩 0 个或 1~2 个 POST(单模型智能体被熔断 / 快速预算拦掉了)。
+- [ ] **107.8 同一模型两把 key:第一把熔断后直接用第二把**:在测试平台给 `self-hosted` 配两把有序 key(值 `dummy-k0`、`dummy-k1`;若 107 开头加的是租户覆盖凭据,先删掉它,否则覆盖会顶替 key 列表),确认 `acc-b297-keys` 构建出 `self-hosted:b297-stub-keys#0` / `#1` 两个熔断键。桩切 `perkey`(k0 回 429,k1 回 503)。`acc-b297-keys` 连发 4 轮(每轮都会以模型错误结束,不花钱)。判据:第 1~3 轮每轮桩收到 k0 **1 个**(429 后面还有 k1,不原地重试、不等)+ k1 4 个(最后一个,完整预算);第 3 轮 k0 熔断打开(`llm_breaker.open provider_key=self-hosted:b297-stub-keys#0`);第 4 轮(第 3 轮结束后 30 秒内发)桩收到 k0 **0 个**、k1 照常,日志 `llm_router.key_failed idx=0 … err=CircuitOpenError`。**没修好时**:第 4 轮 k0 仍被打(熔断开着也不跳过)、且 429 在 k0 上原地退避重试。做完删掉这两把 key。
+- [ ] **107.9 日志不带客户内容**:把 107.1–107.8 里出现的 `llm_error_handling.*`、`llm_router.*`、`llm_breaker.*`、`circuit_breaker.*` 日志行过一遍。判据:只有 provider:model、熔断键、错误类型、次数 / 秒数,没有提示词、回答、文件名、密钥或凭据引用原文。
+- [ ] **107.10 收尾**:删 `b297-stub` pod 与服务、五个临时智能体、临时 key、会话与终端用户;删掉加过的 `self-hosted` 凭据(租户覆盖 / 平台两把 key)。
 
 **生产**:本条没有生产步骤(不在生产造故障)。

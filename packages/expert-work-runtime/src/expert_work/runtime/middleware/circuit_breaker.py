@@ -16,7 +16,14 @@ outage it never opened. This module follows the common industry defaults
   up to ``max_cooldown_s`` (300 s), back to 30 s after a successful probe;
   a vendor ``Retry-After`` longer than the cooldown stretches it (same cap);
 * **HALF_OPEN** admits exactly one in-flight probe; everyone else is
-  refused until the probe resolves.
+  refused until the probe resolves. The E.4 middleware resolves a streaming
+  probe at its first progress delta (the upstream answers — no need to hold
+  the slot for a whole generation); a probe that neither progresses nor ends
+  within ``probe_lease_s`` (60 s: hung upstream, deadline disabled) counts as
+  a failed probe and re-opens the breaker;
+* **any success closes** the breaker, also one observed while OPEN (a
+  single-model chain is let through an open breaker — its answer is fresh
+  evidence the upstream works).
 
 State is per process (one :class:`BreakerRegistry` per control-plane
 process, shared by every agent / sub-agent / run); replicas do not share it.
@@ -36,6 +43,7 @@ import threading
 import time
 from collections import deque
 from collections.abc import Callable
+from dataclasses import dataclass
 from typing import Literal
 
 logger = logging.getLogger(__name__)
@@ -51,14 +59,30 @@ DEFAULT_MIN_ATTEMPTS = 5
 DEFAULT_WINDOW_S = 60.0
 DEFAULT_COOLDOWN_S = 30.0
 DEFAULT_MAX_COOLDOWN_S = 300.0
+DEFAULT_PROBE_LEASE_S = 60.0
+
+
+@dataclass(frozen=True)
+class Permit:
+    """One admitted (or refused) attempt. ``probe_id`` identifies a half-open
+    probe, so the outcome of a probe whose lease already expired cannot
+    resolve — or free the slot of — the probe that replaced it."""
+
+    admission: Admission
+    probe_id: int = 0
+
+    @property
+    def is_probe(self) -> bool:
+        return self.admission == "probe"
 
 
 class CircuitBreaker:
     """Three-state breaker for one upstream (see module docstring).
 
-    Callers bracket every upstream attempt with :meth:`acquire` and exactly
+    Callers bracket every upstream attempt with :meth:`admit` and exactly
     one of :meth:`record_success` / :meth:`record_failure` / :meth:`release`,
-    passing ``probe=True`` when :meth:`acquire` returned ``"probe"``.
+    passing the :class:`Permit` back. (:meth:`acquire` and ``probe=True``
+    are the permit-less shorthand: "the probe currently in flight".)
     """
 
     def __init__(
@@ -70,6 +94,7 @@ class CircuitBreaker:
         window_s: float = DEFAULT_WINDOW_S,
         cooldown_s: float = DEFAULT_COOLDOWN_S,
         max_cooldown_s: float = DEFAULT_MAX_COOLDOWN_S,
+        probe_lease_s: float = DEFAULT_PROBE_LEASE_S,
         clock: Callable[[], float] | None = None,
     ) -> None:
         self._failure_threshold = failure_threshold
@@ -78,6 +103,7 @@ class CircuitBreaker:
         self._window_s = window_s
         self._cooldown_s = cooldown_s
         self._max_cooldown_s = max_cooldown_s
+        self._probe_lease_s = probe_lease_s
         self._clock = clock or time.monotonic
         self._lock = threading.Lock()
         self._state: BreakerState = "CLOSED"
@@ -86,6 +112,8 @@ class CircuitBreaker:
         self._open_until = 0.0
         self._open_streak = 0
         self._probe_in_flight = False
+        self._probe_id = 0
+        self._probe_started = 0.0
 
     # -- reads ---------------------------------------------------------------
 
@@ -101,44 +129,57 @@ class CircuitBreaker:
 
     # -- admission -----------------------------------------------------------
 
-    async def acquire(self) -> Admission:
+    async def admit(self) -> Permit:
         """Admit or refuse one upstream attempt."""
         with self._lock:
-            self._maybe_half_open(self._clock())
+            now = self._clock()
+            self._maybe_half_open(now)
             if self._state == "CLOSED":
-                return "allowed"
+                return Permit("allowed")
             if self._state == "HALF_OPEN" and not self._probe_in_flight:
                 self._probe_in_flight = True
+                self._probe_id += 1
+                self._probe_started = now
                 logger.info("circuit_breaker.probe")
-                return "probe"
-            return "rejected"
+                return Permit("probe", self._probe_id)
+            return Permit("rejected")
+
+    async def acquire(self) -> Admission:
+        """:meth:`admit` without the permit (tests / simple callers)."""
+        return (await self.admit()).admission
 
     # -- outcomes ------------------------------------------------------------
 
-    async def record_success(self, *, probe: bool = False) -> None:
+    async def record_success(self, *, probe: bool = False, permit: Permit | None = None) -> None:
+        """Count one success. Any success closes a non-CLOSED breaker — it is
+        fresh evidence the upstream answers (a probe, or a single-model caller
+        let through an open breaker)."""
         with self._lock:
             now = self._clock()
             self._consecutive_failures = 0
-            if probe:
+            if self._is_current_probe(probe, permit):
                 self._probe_in_flight = False
-            if probe or self._state == "HALF_OPEN":
+            if self._state != "CLOSED":
                 self._state = "CLOSED"
                 self._open_streak = 0
                 self._outcomes.clear()
                 logger.info("circuit_breaker.closed")
                 return
-            if self._state == "CLOSED":
-                self._push(now, ok=True)
+            self._push(now, ok=True)
 
     async def record_failure(
-        self, *, probe: bool = False, retry_after_s: float | None = None
+        self,
+        *,
+        probe: bool = False,
+        permit: Permit | None = None,
+        retry_after_s: float | None = None,
     ) -> bool:
         """Count one failed attempt. Returns ``True`` when this failure opened
         the breaker (callers emit the open metric / stop retrying)."""
         with self._lock:
             now = self._clock()
             self._consecutive_failures += 1
-            if probe:
+            if self._is_current_probe(probe, permit):
                 self._probe_in_flight = False
                 if self._state == "HALF_OPEN":
                     self._open(now, retry_after_s)
@@ -153,20 +194,35 @@ class CircuitBreaker:
                 return True
             return False
 
-    async def release(self, *, probe: bool) -> None:
+    async def release(self, *, probe: bool = False, permit: Permit | None = None) -> None:
         """Neutral outcome (4xx client error, cancellation): frees the probe
         slot without counting a success or a failure."""
-        if probe:
-            with self._lock:
+        with self._lock:
+            if self._is_current_probe(probe, permit):
                 self._probe_in_flight = False
 
     # -- internals (lock held) ----------------------------------------------
+
+    def _is_current_probe(self, probe: bool, permit: Permit | None) -> bool:
+        if permit is None:
+            return probe
+        return permit.is_probe and permit.probe_id == self._probe_id and self._probe_in_flight
 
     def _maybe_half_open(self, now: float) -> None:
         if self._state == "OPEN" and now >= self._open_until:
             self._state = "HALF_OPEN"
             self._probe_in_flight = False
             logger.info("circuit_breaker.half_open")
+        elif (
+            self._state == "HALF_OPEN"
+            and self._probe_in_flight
+            and now - self._probe_started >= self._probe_lease_s
+        ):
+            # The probe neither progressed nor finished within its lease:
+            # the upstream is not answering — a failed probe.
+            self._probe_in_flight = False
+            logger.warning("circuit_breaker.probe_lease_expired")
+            self._open(now, None)
 
     def _push(self, now: float, *, ok: bool) -> None:
         self._outcomes.append((now, ok))

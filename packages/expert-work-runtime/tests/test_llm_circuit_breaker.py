@@ -232,6 +232,81 @@ async def test_late_non_probe_failure_in_half_open_does_not_reopen() -> None:
     assert await breaker.check_state() == "CLOSED"
 
 
+@pytest.mark.asyncio
+async def test_success_seen_while_open_closes_and_resets_cooldown() -> None:
+    """A single-model caller passes an OPEN breaker; its success is real
+    evidence the upstream answers → close, and the streak restarts at 30 s."""
+    clock = FakeClock()
+    breaker = _breaker(clock)
+    await _fail(breaker, 3)
+    clock.advance(30.0)
+    assert await breaker.acquire() == "probe"
+    await breaker.record_failure(probe=True)  # streak 2 → would be 60 s next
+    assert await breaker.check_state() == "OPEN"
+    await breaker.record_success()
+    assert await breaker.check_state() == "CLOSED"
+    await _fail(breaker, 3)
+    clock.advance(30.0)
+    assert await breaker.acquire() == "probe", "cooldown must be back to 30 s"
+
+
+@pytest.mark.asyncio
+async def test_reentering_half_open_offers_a_fresh_probe() -> None:
+    """A probe still marked in flight when the breaker closed (a pass-through
+    success closed it) must not block the probe of the next half-open."""
+    clock = FakeClock()
+    breaker = _breaker(clock)
+    await _fail(breaker, 3)
+    clock.advance(30.0)
+    assert await breaker.acquire() == "probe"
+    await breaker.record_success()  # not the probe: the probe is still out
+    await _fail(breaker, 3)
+    clock.advance(30.0)
+    assert await breaker.acquire() == "probe"
+
+
+@pytest.mark.asyncio
+async def test_probe_lease_expiry_counts_as_failed_probe() -> None:
+    """A probe that neither progresses nor finishes within the lease (hung
+    upstream, deadline disabled) re-opens the breaker instead of holding the
+    slot forever."""
+    clock = FakeClock()
+    breaker = _breaker(clock)
+    await _fail(breaker, 3)
+    clock.advance(30.0)
+    assert await breaker.acquire() == "probe"
+    clock.advance(59.0)
+    assert await breaker.acquire() == "rejected"
+    clock.advance(1.0)
+    assert await breaker.acquire() == "rejected"  # lease expired → re-opened
+    assert await breaker.check_state() == "OPEN"
+    clock.advance(59.0)
+    assert await breaker.acquire() == "rejected"  # doubled cooldown: 60 s
+    clock.advance(1.0)
+    assert await breaker.acquire() == "probe"
+
+
+@pytest.mark.asyncio
+async def test_stale_probe_outcome_does_not_touch_the_new_probe() -> None:
+    clock = FakeClock()
+    breaker = _breaker(clock)
+    await _fail(breaker, 3)
+    clock.advance(30.0)
+    old = await breaker.admit()
+    assert old.is_probe
+    clock.advance(60.0)  # lease expires → re-open (60 s)
+    assert await breaker.acquire() == "rejected"
+    clock.advance(60.0)
+    new = await breaker.admit()
+    assert new.is_probe
+    await breaker.release(permit=old)
+    assert await breaker.acquire() == "rejected", "stale release freed the new probe's slot"
+    assert await breaker.record_failure(permit=old) is False
+    assert await breaker.check_state() == "HALF_OPEN"
+    await breaker.record_success(permit=new)
+    assert await breaker.check_state() == "CLOSED"
+
+
 # ---------------------------------------------------------------------------
 # Registry
 # ---------------------------------------------------------------------------
@@ -245,6 +320,18 @@ async def test_registry_returns_same_breaker_per_key() -> None:
     b = await registry.get("b")
     assert a1 is a2
     assert a1 is not b
+
+
+@pytest.mark.asyncio
+async def test_many_concurrent_callers_get_exactly_one_probe() -> None:
+    import asyncio
+
+    clock = FakeClock()
+    breaker = _breaker(clock)
+    await _fail(breaker, 3)
+    clock.advance(31.0)
+    results = await asyncio.gather(*[breaker.acquire() for _ in range(50)])
+    assert results.count("probe") == 1
 
 
 def test_registry_is_safe_across_threads_and_loops() -> None:

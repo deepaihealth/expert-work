@@ -11,6 +11,7 @@ Fake clock + recording sleeper (the sleeper advances the clock) — no real slee
 
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass, field
 
 import pytest
@@ -27,6 +28,7 @@ from expert_work.runtime.middleware import (
     LLMStreamInterruptedError,
     LLMStreamStaleError,
     MiddlewareContext,
+    notify_first_progress,
 )
 
 
@@ -159,6 +161,8 @@ async def test_without_fallback_open_breaker_does_not_block_the_only_model() -> 
     only = Terminal([None], clock)
     await mw(_ctx(has_fallback=False), only)
     assert only.calls == 1
+    # ... and its success is evidence the upstream answers: the breaker closes.
+    assert await breaker.check_state() == "CLOSED"
 
 
 @pytest.mark.asyncio
@@ -201,36 +205,114 @@ async def test_with_fallback_fast_failure_retry_then_success() -> None:
 
 
 @pytest.mark.asyncio
-async def test_retry_after_beyond_budget_with_fallback_fails_over_at_once() -> None:
+async def test_retry_after_longer_than_fast_backoff_fails_over_at_once() -> None:
+    """With a backup, a Retry-After above the fast-path max delay (1 s) is not
+    waited out on the primary — the backup serves now (LiteLLM behaviour)."""
     clock = FakeClock()
     sleeper = ClockSleeper(clock)
     mw = _mw(clock, sleeper)
-    terminal = Terminal([_err(LLMRateLimitError, 20.0), None], clock)
-    with pytest.raises(LLMRateLimitError):
+    terminal = Terminal([_err(LLMServerError, 3.0), None], clock)
+    with pytest.raises(LLMServerError):
         await mw(_ctx(has_fallback=True), terminal)
     assert terminal.calls == 1
     assert sleeper.sleeps == []
 
 
 @pytest.mark.asyncio
-async def test_retry_after_within_budget_with_fallback_is_honoured() -> None:
+async def test_short_retry_after_with_fallback_is_honoured() -> None:
     clock = FakeClock()
     sleeper = ClockSleeper(clock)
     mw = _mw(clock, sleeper)
-    terminal = Terminal([_err(LLMRateLimitError, 3.0), None], clock)
+    terminal = Terminal([_err(LLMServerError, 0.8), None], clock)
     await mw(_ctx(has_fallback=True), terminal)
     assert terminal.calls == 2
-    assert sleeper.sleeps == [3.0]
+    assert sleeper.sleeps == [0.8]
 
 
 @pytest.mark.asyncio
-async def test_retry_after_without_fallback_sleeps_min_of_it_and_max_delay() -> None:
+async def test_retry_after_without_fallback_capped_at_max_delay() -> None:
     clock = FakeClock()
     sleeper = ClockSleeper(clock)
     mw = _mw(clock, sleeper)
     terminal = Terminal([_err(LLMServerError, 45.0), _err(LLMServerError, 5.0), None], clock)
     await mw(_ctx(has_fallback=False), terminal)
     assert sleeper.sleeps == [30.0, 5.0]
+
+
+@pytest.mark.asyncio
+async def test_retry_after_without_fallback_never_below_exponential_floor() -> None:
+    """A tiny Retry-After does not shorten the single-model backoff."""
+    clock = FakeClock()
+    sleeper = ClockSleeper(clock)
+    mw = _mw(clock, sleeper)
+    seq: list[Exception | None] = [_err(LLMServerError, 0.1), _err(LLMServerError, 0.1), None]
+    await mw(_ctx(has_fallback=False), Terminal(seq, clock))
+    assert sleeper.sleeps == [1.0, 2.0]
+
+
+@pytest.mark.asyncio
+async def test_retry_after_without_fallback_total_wait_capped() -> None:
+    """Single-model chain: Retry-After waits stop once 60 s in total would pass."""
+    clock = FakeClock()
+    sleeper = ClockSleeper(clock)
+    mw = _mw(clock, sleeper)
+    terminal = Terminal([_err(LLMServerError, 25.0)] * 4, clock)
+    with pytest.raises(LLMServerError):
+        await mw(_ctx(has_fallback=False), terminal)
+    assert sleeper.sleeps == [25.0, 25.0]
+    assert terminal.calls == 3
+
+
+# ---------------------------------------------------------------------------
+# Sibling keys (Y-MK): another key of the same group is an alternative
+# ---------------------------------------------------------------------------
+
+
+def _sibling_ctx() -> MiddlewareContext:
+    return MiddlewareContext(
+        payload={"provider_key": "p:m#0", "has_fallback": False, "has_alternative": True}
+    )
+
+
+@pytest.mark.asyncio
+async def test_open_breaker_refused_when_only_a_sibling_key_remains() -> None:
+    clock = FakeClock()
+    sleeper = ClockSleeper(clock)
+    mw = _mw(clock, sleeper)
+    breaker = await mw.breaker_registry.get("p:m#0")
+    for _ in range(3):
+        await breaker.acquire()
+        await breaker.record_failure()
+    terminal = Terminal([None], clock)
+    with pytest.raises(CircuitOpenError):
+        await mw(_sibling_ctx(), terminal)
+    assert terminal.calls == 0
+
+
+@pytest.mark.parametrize("ctx_factory", [_sibling_ctx, lambda: _ctx(has_fallback=True)])
+@pytest.mark.asyncio
+async def test_rate_limit_not_retried_in_place_when_an_alternative_exists(
+    ctx_factory: object,
+) -> None:
+    clock = FakeClock()
+    sleeper = ClockSleeper(clock)
+    mw = _mw(clock, sleeper)
+    terminal = Terminal([LLMRateLimitError("429"), None], clock)
+    with pytest.raises(LLMRateLimitError):
+        await mw(ctx_factory(), terminal)  # type: ignore[operator]
+    assert terminal.calls == 1
+    assert sleeper.sleeps == []
+
+
+@pytest.mark.asyncio
+async def test_server_error_with_only_siblings_keeps_full_budget() -> None:
+    """A 5xx hits every sibling key alike, so siblings don't shorten the budget."""
+    clock = FakeClock()
+    sleeper = ClockSleeper(clock)
+    mw = _mw(clock, sleeper)
+    terminal = Terminal([LLMServerError(), LLMServerError(), None], clock)
+    await mw(_sibling_ctx(), terminal)
+    assert sleeper.sleeps == [1.0, 2.0]
 
 
 @pytest.mark.asyncio
@@ -262,11 +344,14 @@ async def test_each_failed_attempt_counts_toward_breaker() -> None:
         await mw(_ctx(has_fallback=True), Terminal([LLMServerError()] * 2, clock))
     breaker = await mw.breaker_registry.get("p:m")
     assert breaker.consecutive_failures == 2
-    # The next call's first failure is the 3rd consecutive → OPEN; no retry.
+    slept = list(sleeper.sleeps)
+    # The next call's first failure is the 3rd consecutive → OPEN; no retry,
+    # and no backoff sleep before giving up either.
     terminal = Terminal([LLMServerError()] * 2, clock)
     with pytest.raises(LLMServerError):
         await mw(_ctx(has_fallback=True), terminal)
     assert terminal.calls == 1
+    assert sleeper.sleeps == slept
     assert await breaker.check_state() == "OPEN"
     probe = Terminal([None], clock)
     with pytest.raises(CircuitOpenError):
@@ -374,3 +459,90 @@ async def test_breaker_open_metric_labelled_by_provider_key() -> None:
     with pytest.raises(LLMServerError):
         await mw(ctx, Terminal([LLMServerError()] * 4, clock))
     assert _value() == before + 1
+
+
+# ---------------------------------------------------------------------------
+# Half-open probe resolution
+# ---------------------------------------------------------------------------
+
+
+async def _open_then_half_open(mw: LLMErrorHandlingMiddleware, clock: FakeClock) -> None:
+    breaker = await mw.breaker_registry.get("p:m")
+    for _ in range(3):
+        await breaker.acquire()
+        await breaker.record_failure()
+    clock.now += 31.0
+
+
+@pytest.mark.parametrize("make_exc", [asyncio.CancelledError, lambda: RuntimeError("adapter bug")])
+@pytest.mark.asyncio
+async def test_probe_ending_without_an_llm_outcome_frees_the_slot(make_exc: object) -> None:
+    clock = FakeClock()
+    mw = _mw(clock, ClockSleeper(clock))
+    await _open_then_half_open(mw, clock)
+    breaker = await mw.breaker_registry.get("p:m")
+
+    async def _boom(_ctx: MiddlewareContext) -> None:
+        assert await breaker.acquire() == "rejected"  # we are the probe
+        raise make_exc()  # type: ignore[operator]
+
+    with pytest.raises((asyncio.CancelledError, RuntimeError)):
+        await mw(_ctx(has_fallback=True), _boom)
+    assert await breaker.acquire() == "probe"
+
+
+@pytest.mark.asyncio
+async def test_cancelled_hung_probe_frees_the_slot() -> None:
+    clock = FakeClock()
+    mw = _mw(clock, ClockSleeper(clock))
+    await _open_then_half_open(mw, clock)
+    breaker = await mw.breaker_registry.get("p:m")
+    started = asyncio.Event()
+
+    async def _hang(_ctx: MiddlewareContext) -> None:
+        started.set()
+        await asyncio.Event().wait()
+
+    task = asyncio.create_task(mw(_ctx(has_fallback=True), _hang))
+    await started.wait()
+    assert await breaker.acquire() == "rejected"
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert await breaker.acquire() == "probe"
+
+
+@pytest.mark.asyncio
+async def test_probe_resolves_at_first_progress_not_at_stream_end() -> None:
+    """The probe's first token proves the upstream answers: the breaker closes
+    then, not after a long generation; a later stream failure counts as an
+    ordinary failure."""
+    clock = FakeClock()
+    mw = _mw(clock, ClockSleeper(clock))
+    await _open_then_half_open(mw, clock)
+    breaker = await mw.breaker_registry.get("p:m")
+
+    async def _streams(_ctx: MiddlewareContext) -> None:
+        await notify_first_progress()
+        assert await breaker.check_state() == "CLOSED"
+        assert await breaker.acquire() == "allowed"
+        raise LLMStreamInterruptedError("died mid-generation")
+
+    with pytest.raises(LLMStreamInterruptedError):
+        await mw(_ctx(has_fallback=True), _streams)
+    assert await breaker.check_state() == "CLOSED"
+    assert breaker.consecutive_failures == 1
+
+
+@pytest.mark.asyncio
+async def test_first_progress_outside_a_probe_is_a_no_op() -> None:
+    clock = FakeClock()
+    mw = _mw(clock, ClockSleeper(clock))
+    await notify_first_progress()  # no middleware around: must not raise
+
+    async def _ok(_ctx: MiddlewareContext) -> None:
+        await notify_first_progress()
+
+    await mw(_ctx(has_fallback=True), _ok)
+    breaker = await mw.breaker_registry.get("p:m")
+    assert await breaker.check_state() == "CLOSED"
