@@ -283,6 +283,7 @@ def test_overflow_estimate_flags_long_text_only(scripts, deck, tmp_path):
     (item,) = report["overflow"]
     assert item["addr"] == roles["s3_small"] and item["need_lines"] > item["fit_lines"]
     assert item["cap_chars"] == 3 and item["chars"] == 15 and item["font_pt"] == 18
+    assert "near" not in item, "a real overflow is not merely near full"
     assert "估算" in report["overflow_note"]
 
 
@@ -402,6 +403,9 @@ def test_legacy_placeholder_type_without_known_base(scripts, tmp_path):
     prs.save(str(path))
     addr = f"1:{body.shape_id}"
     entry = _texts(_inspect(scripts, path))[addr]
+    legacy = _inspect(scripts, path, legacy=True)  # the old layouts output must not crash
+    layout_ph = next(ph for ph in legacy["layouts"][1]["placeholders"] if ph["idx"] == 1)
+    assert layout_ph["left"] is None and layout_ph["width"] is None
     assert entry["box"] is None and entry["cap"] is None and entry["text"] == "旧版占位符"
     report, out = _fill(scripts, tmp_path, path, {"fill": {addr: "新字"}})
     assert report["results"] == [{"page": 1, "addr": addr, "status": "ok"}]
