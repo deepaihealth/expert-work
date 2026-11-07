@@ -319,7 +319,9 @@ class HTTPOpenAIClient:
             # (402 / quota / billing → LLMKeyUnavailableError, router tries a
             # sibling key) from plain 429 rate-limits, malformed 4xx, and 5xx.
             # 401 stays an LLMUnauthorizedError for the L.L8 OAuth refresh path.
-            raise classify_http_error("openai", status, _truncate(response.text))
+            raise classify_http_error(
+                "openai", status, _truncate(response.text), headers=response.headers
+            )
 
         data = response.json()
         if not isinstance(data, Mapping):
@@ -366,7 +368,10 @@ class HTTPOpenAIClient:
                     if response.status_code >= 400:
                         await response.aread()
                         raise classify_http_error(
-                            "openai", response.status_code, _truncate(response.text)
+                            "openai",
+                            response.status_code,
+                            _truncate(response.text),
+                            headers=response.headers,
                         )
                     async for line in response.aiter_lines():
                         chunk = _parse_sse_line(line)

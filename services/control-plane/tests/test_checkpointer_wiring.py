@@ -174,6 +174,63 @@ def test_build_middleware_env_wires_cache_langfuse_and_redactor() -> None:
     assert env.redact_text is not None
 
 
+@pytest.mark.asyncio
+async def test_build_middleware_env_shares_one_breaker_registry_across_agents() -> None:
+    """B-297 — every agent built from the process env feeds one breaker per
+    upstream: three failures seen by agent A open it for agent B too."""
+    from expert_work.protocol import AgentSpec
+    from expert_work.runtime.middleware import (
+        CircuitOpenError,
+        LLMServerError,
+        MiddlewareContext,
+    )
+    from orchestrator import build_middleware_chains
+
+    env = build_middleware_env()
+    assert env.breaker_registry is not None
+
+    def _spec(name: str) -> AgentSpec:
+        return AgentSpec.model_validate(
+            {
+                "apiVersion": "expert_work.io/v1",
+                "kind": "Agent",
+                "metadata": {"name": name, "version": "1.0.0", "tenant": "t"},
+                "spec": {
+                    "tenant_config": {},
+                    "model": {"provider": "deepseek", "name": "deepseek-chat"},
+                    "system_prompt": {"template": "x"},
+                    "sandbox": {
+                        "resources": {"cpu": "1.0", "memory": "1Gi"},
+                        "network": {"egress": "proxy", "allowlist": []},
+                        "filesystem": {"readonly_root": True, "writable": ["/workspace"]},
+                    },
+                },
+            }
+        )
+
+    def _ctx() -> MiddlewareContext:
+        return MiddlewareContext(payload={"provider_key": "deepseek:m", "has_fallback": True})
+
+    async def _down(_ctx: MiddlewareContext) -> None:
+        raise LLMServerError("503")
+
+    calls = 0
+
+    async def _up(_ctx: MiddlewareContext) -> None:
+        nonlocal calls
+        calls += 1
+
+    chain_a = build_middleware_chains(_spec("agent-a"), env=env).around_llm_call
+    chain_b = build_middleware_chains(_spec("agent-b"), env=env).around_llm_call
+    assert chain_a is not None and chain_b is not None
+    for _ in range(2):
+        with pytest.raises(LLMServerError):
+            await chain_a.invoke(_ctx(), _down)
+    with pytest.raises(CircuitOpenError):
+        await chain_b.invoke(_ctx(), _up)
+    assert calls == 0
+
+
 def test_build_middleware_env_redact_text_masks_secrets() -> None:
     env = build_middleware_env()
     assert env.redact_text is not None

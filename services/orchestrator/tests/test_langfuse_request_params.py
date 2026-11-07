@@ -419,7 +419,8 @@ async def test_request_params_failure_never_fails_the_call(
         response = await router(messages=[HumanMessage(content="hi")], tools=[])
 
     assert response.content == "ok"
-    assert spy.keys == [{"provider_key", "messages", "tools"}]
+    # B-297 — ``has_fallback`` (E.4 retry budget hint) is always present.
+    assert spy.keys == [{"provider_key", "has_fallback", "messages", "tools"}]
     [span] = client.spans
     assert span.error is None
     assert span.model_parameters is None

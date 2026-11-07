@@ -361,7 +361,9 @@ class HTTPAnthropicClient:
             # (402 / quota / billing → LLMKeyUnavailableError, router tries a
             # sibling key) from plain 429 rate-limits, malformed 4xx, and 5xx.
             # 401 stays an LLMUnauthorizedError for the L.L8 OAuth refresh path.
-            raise classify_http_error("anthropic", status, _truncate(response.text))
+            raise classify_http_error(
+                "anthropic", status, _truncate(response.text), headers=response.headers
+            )
 
         data = response.json()
         if not isinstance(data, Mapping):
@@ -414,7 +416,10 @@ class HTTPAnthropicClient:
                     if response.status_code >= 400:
                         await response.aread()
                         raise classify_http_error(
-                            "anthropic", response.status_code, _truncate(response.text)
+                            "anthropic",
+                            response.status_code,
+                            _truncate(response.text),
+                            headers=response.headers,
                         )
                     async for line in response.aiter_lines():
                         event = _parse_anthropic_sse_line(line)
