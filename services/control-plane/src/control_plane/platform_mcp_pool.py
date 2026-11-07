@@ -61,7 +61,7 @@ _MAX_BUILD_ATTEMPTS = 5
 # pool lives forever, so one lost bus event would be permanent staleness.
 _POOL_TTL_S = 1800.0
 
-# B-292 —— 构建时有目录项没连上:第一次后台重试的间隔,之后翻倍(取值理由同租户池)。
+# B-292 —— 构建时有目录项没连上:第一次后台重试的间隔,之后每 120 秒(取值理由同租户池)。
 _FAILED_RETRY_S = 60.0
 
 # The platform pool has a single cache entry; its retired clients share one key.

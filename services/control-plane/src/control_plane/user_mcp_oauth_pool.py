@@ -25,7 +25,7 @@ import asyncio
 import contextvars
 import logging
 import time
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Mapping
 from datetime import UTC, datetime
 from uuid import UUID
 
@@ -39,6 +39,7 @@ from control_plane.mcp_retired_clients import (
 )
 from control_plane.tenant_scope import bypass_rls_session
 from expert_work.persistence import McpConnectorCatalogStore, McpOAuthConnectionStore
+from expert_work.persistence.rls import current_tenant_id_var
 from expert_work.protocol import McpConnectorCatalogRecord, McpOAuthConnectionRecord
 from orchestrator.tools.mcp import (
     MCPClient,
@@ -115,7 +116,7 @@ class UserMcpOAuthPoolService:
         # (每个 key 最多一个)。用户池每次 run 定构建缓存键时都会取,所以由到点后的那次
         # 取池来起重拨(没人用的用户不重拨);重拨在后台、锁外进行,不挡这次取池。
         # Guarded by ``_locks_guard``; ``_closed`` 之后不再起。
-        self._missing: dict[tuple[UUID, str], MissingServers[MCPServerConfig]] = {}
+        self._missing: dict[tuple[UUID, str], MissingServers[UUID]] = {}
         self._retry_at: dict[tuple[UUID, str], float] = {}
         self._retry_pending: set[tuple[UUID, str]] = set()
         self._retry_tasks: set[asyncio.Task[None]] = set()
@@ -163,6 +164,18 @@ class UserMcpOAuthPoolService:
             timeout_s=30.0,
         )
 
+    async def _usable_config(
+        self,
+        record: McpOAuthConnectionRecord,
+        entries: Mapping[UUID, McpConnectorCatalogRecord],
+    ) -> MCPServerConfig | None:
+        """Refresh-or-skip ``record`` and map it to its bearer config (``None`` =
+        unusable); the build and the B-292 retry share this."""
+        usable = await self._resolve_usable(record)
+        if usable is None:
+            return None
+        return self._record_to_config(usable, entries.get(usable.catalog_id))
+
     async def get_or_build(self, tenant_id: UUID, user_id: str) -> MCPServerPool:
         """Return the user's OAuth pool, building (and caching) on miss."""
         key = (tenant_id, user_id)
@@ -197,7 +210,7 @@ class UserMcpOAuthPoolService:
                 async with self._locks_guard:
                     gen = self._generation.get(key, 0)
                 pool = MCPServerPool()
-                failed: dict[str, MCPServerConfig] = {}
+                failed: dict[str, UUID] = {}
                 skipped_off: set[str] = set()
                 records = await self._oauth_store.list_for_user(
                     tenant_id=tenant_id, user_id=user_id
@@ -214,10 +227,7 @@ class UserMcpOAuthPoolService:
                         # for every user (as for new connects), no refresh.
                         skipped_off.add(record.name)
                         continue
-                    usable = await self._resolve_usable(record)
-                    if usable is None:
-                        continue
-                    config = self._record_to_config(usable, entries.get(usable.catalog_id))
+                    config = await self._usable_config(record, entries)
                     if config is None:
                         continue
                     try:
@@ -232,7 +242,7 @@ class UserMcpOAuthPoolService:
                         break
                     except Exception:
                         logger.warning("user_mcp_oauth_pool.server_build_failed")
-                        failed[record.name] = config
+                        failed[record.name] = record.id
                 switched_off: list[MCPClient] = []
                 async with self._locks_guard:
                     if self._generation.get(key, 0) == gen:
@@ -264,11 +274,11 @@ class UserMcpOAuthPoolService:
         self,
         key: tuple[UUID, str],
         pool: MCPServerPool,
-        failed: dict[str, MCPServerConfig],
+        failed: Mapping[str, UUID],
         delay: float,
     ) -> None:
-        """B-292 —— 记下缓存池 ``pool`` 缺的连接和下一次重拨的时间(没缺就清掉)。
-        Caller holds ``_locks_guard``."""
+        """B-292 —— 记下缓存池 ``pool`` 缺的连接(名字 -> 连接 id)和下一次重拨的时间
+        (没缺就清掉)。Caller holds ``_locks_guard``."""
         if failed:
             self._missing[key] = MissingServers(pool, failed, delay)
             self._retry_at[key] = self._monotonic_clock() + delay
@@ -286,7 +296,7 @@ class UserMcpOAuthPoolService:
         self._retry_tasks.add(task)
         task.add_done_callback(self._retry_tasks.discard)
 
-    def _current_missing(self, key: tuple[UUID, str]) -> MissingServers[MCPServerConfig] | None:
+    def _current_missing(self, key: tuple[UUID, str]) -> MissingServers[UUID] | None:
         """B-292 —— 记下的缺口还属于当前缓存池、且池没过 TTL 时返回它。
         Caller holds ``_locks_guard``."""
         missing = self._missing.get(key)
@@ -296,6 +306,43 @@ class UserMcpOAuthPoolService:
         if self._monotonic_clock() - entry[1] >= _POOL_TTL_S:
             return None
         return missing
+
+    async def _retry_configs(
+        self, key: tuple[UUID, str], missing: MissingServers[UUID]
+    ) -> dict[str, MCPServerConfig]:
+        """B-292 —— 重拨前像构建一样重新读这几条连接和它们的目录项:平台停用的这次
+        不拨、留着等重新打开(平台先写目录、再广播 ``connector_off``,所以读到的目录
+        就是准的;拨号期间才关的由 ``_swap_retried`` 拦);再过一遍刷新(过期的令牌先
+        换新,换不了 / 被撤销的这次不拨)。读不到就当这次没连上。"""
+        tenant_id, user_id = key
+        current_tenant_id_var.set(tenant_id)  # 后台任务:按这个租户读连接(RLS)
+        try:
+            wanted = set(missing.records.values())
+            records = [
+                r
+                for r in await self._oauth_store.list_for_user(tenant_id=tenant_id, user_id=user_id)
+                if r.id in wanted
+            ]
+            async with bypass_rls_session():
+                entries = await self._catalog_store.get_by_ids([r.catalog_id for r in records])
+        except Exception as exc:
+            logger.warning("user_mcp_oauth_pool.retry_read_failed err=%s", type(exc).__name__)
+            return {}
+        configs: dict[str, MCPServerConfig] = {}
+        for record in records:
+            entry = entries.get(record.catalog_id)
+            if entry is not None and not entry.enabled:
+                continue  # B-248 —— 平台停用了:不拨,重新打开后的下一次重拨再接上
+            try:
+                config = await self._usable_config(record, entries)
+            except Exception as exc:
+                logger.warning(
+                    "user_mcp_oauth_pool.retry_refresh_failed err=%s", type(exc).__name__
+                )
+                continue
+            if config is not None:
+                configs[record.name] = config
+        return configs
 
     async def _retry_failed(self, key: tuple[UUID, str]) -> None:
         """B-292 —— 重拨缓存池里缺的连接:锁外拨号、缓存池照常服务。连上了就在锁内
@@ -311,14 +358,14 @@ class UserMcpOAuthPoolService:
             opened: dict[str, MCPClient] = {}
             swapped: set[str] = set()
             try:
-                for name, config in missing.records.items():
+                for name, config in (await self._retry_configs(key, missing)).items():
                     try:
                         opened[name] = await self._client_factory(config)
                     except Exception:
                         logger.warning("user_mcp_oauth_pool.server_retry_failed")
                 await self._swap_retried(key, gen, missing, opened, swapped)
             finally:
-                # 没换进去的(池变了 / 到上限)和被取消时已拨出来的:关掉,别漏。
+                # 没换进去的(池变了 / 被关掉 / 到上限)和被取消时已拨出来的:关掉,别漏。
                 await release_clients(close=[c for n, c in opened.items() if n not in swapped])
         finally:
             self._retry_pending.discard(key)  # 同步一步,不用等锁
@@ -330,38 +377,43 @@ class UserMcpOAuthPoolService:
         self,
         key: tuple[UUID, str],
         gen: int,
-        missing: MissingServers[MCPServerConfig],
+        missing: MissingServers[UUID],
         opened: dict[str, MCPClient],
         swapped: set[str],
     ) -> None:
-        """B-292 —— 代次没变、缓存池还是记缺口时那一个,才用旧池成员 + ``opened`` 建新池
-        换进缓存(出生时间沿用旧池:TTL 不拉长;换进的名字记进 ``swapped``),再按退避
-        记下一次;否则什么都不动。"""
+        """B-292 —— 缓存池还是记缺口时那一个,才处理;否则什么都不动(换它的那一方
+        自有安排)。代次没变时用旧池成员 + ``opened`` 建新池换进缓存(出生时间沿用旧池:
+        TTL 不拉长;拨号期间被 ``connector_off`` 的不换;换进的名字记进 ``swapped``);
+        代次变了(``connector_on`` / ``connector_off`` 等)这次一个不换。最后按退避
+        记下一次——放弃的这次也要推后,不然下一次取池马上又拨。"""
         async with self._locks_guard:
-            entry = self._pools.get(key)
-            if self._generation.get(key, 0) != gen or entry is None:
-                return
             if self._current_missing(key) is not missing:
                 return
-            cached, built_at = entry
-            if opened:
+            cached, built_at = self._pools[key]
+            capped: set[str] = set()
+            if self._generation.get(key, 0) == gen and opened:
                 pool = MCPServerPool()
                 for name in cached.names():
                     client = cached.get(name)
                     if client is not None:
                         await pool.add(name, client)
                 for name, client in opened.items():
+                    if name in self._switched_off:
+                        continue  # B-248 —— 拨号期间被平台关掉了
                     try:
                         await pool.add(name, client)
                     except MCPServerPoolLimitError:
                         logger.warning("user_mcp_oauth_pool.server_cap_reached")
+                        capped.add(name)
                         continue
                     swapped.add(name)
                 if swapped:
                     cached = pool
                     self._pools[key] = (cached, built_at)
             # 连上了却到上限的也不再重拨:整池重建之前都塞不进去。
-            remaining = {n: c for n, c in missing.records.items() if n not in opened}
+            remaining = {
+                n: cid for n, cid in missing.records.items() if n not in swapped and n not in capped
+            }
             age = self._monotonic_clock() - built_at
             nxt = next_retry_delay(missing.delay, pool_age=age, ttl=_POOL_TTL_S)
             if remaining and nxt is not None:

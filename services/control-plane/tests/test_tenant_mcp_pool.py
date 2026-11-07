@@ -232,12 +232,14 @@ async def test_ttl_backstop_rebuilds_expired_pool_and_reuses_fresh_one() -> None
 
 
 class _ManualSleep:
-    """注入给池的 sleep:记下每次要睡多久,等测试放行。"""
+    """注入给池的 sleep:记下每次要睡多久,等测试放行;给了 ``now`` 就在放行时把
+    这个时钟往前拨 ``seconds``(退避链按真时间走到 TTL)。"""
 
-    def __init__(self) -> None:
+    def __init__(self, now: dict[str, float] | None = None) -> None:
         self.durations: list[float] = []
         self._gates: list[asyncio.Event] = []
         self._entered = asyncio.Event()
+        self._now = now
 
     async def __call__(self, seconds: float) -> None:
         self.durations.append(seconds)
@@ -245,6 +247,8 @@ class _ManualSleep:
         gate = asyncio.Event()
         self._gates.append(gate)
         await gate.wait()
+        if self._now is not None:
+            self._now["t"] += seconds
 
     async def sleeping(self, count: int) -> None:
         """等到第 ``count`` 次 sleep 开始(后台重试是 create_task 起的,要让它跑起来)。"""
@@ -303,9 +307,9 @@ class _Rig:
     def __init__(self, store: InMemoryTenantMcpServerStore, down: set[str]) -> None:
         self.tid = uuid4()
         self.dialer = _Dialer(down)
-        self.sleeper = _ManualSleep()
-        self.expired: list[UUID] = []
         self.now = {"t": 0.0}
+        self.sleeper = _ManualSleep(self.now)
+        self.expired: list[UUID] = []
         self.svc = TenantMcpPoolService(
             store=store,
             secret_store=None,
@@ -372,14 +376,15 @@ async def test_still_failing_server_backs_off_until_pool_ttl_without_evicting_bu
     rig = await _rig("a", "b", down={"b"})
     p1 = await rig.svc.get_or_build(rig.tid)
     await rig.sleeper.sleeping(1)
-    for _ in range(8):  # bounded: a chain that never ends must fail, not hang
+    for _ in range(20):  # bounded: a chain that never ends must fail, not hang
         if not rig.svc._retry_tasks:
             break
         await rig.wake_retry()
         await rig.sleeper.settle()
-    # Doubling backoff; the chain stops before it would outlive the pool's TTL.
-    assert rig.sleeper.durations == [60.0, 120.0, 240.0, 480.0, 960.0]
-    assert rig.dialer.calls == ["a", "b"] + ["b"] * 5
+    # 60 s, then every 120 s; the chain stops before it would outlive the pool's TTL
+    # (retries at 60, 180, …, 1740 s = 15 per pool lifetime).
+    assert rig.sleeper.durations == [60.0] + [120.0] * 14
+    assert rig.dialer.calls == ["a", "b"] + ["b"] * 15
     assert await rig.svc.get_or_build(rig.tid) is p1
     assert p1.names() == ["a"] and not rig.dialer.last("a").closed
     assert rig.expired == []  # nothing gained → cached builds stay

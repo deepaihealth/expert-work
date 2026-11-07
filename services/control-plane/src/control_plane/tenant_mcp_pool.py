@@ -50,7 +50,7 @@ _MAX_BUILD_ATTEMPTS = 5
 # pool lives forever, so one lost bus event would be permanent staleness.
 _POOL_TTL_S = 1800.0
 
-# B-292 —— 构建时有服务没连上:第一次后台重试的间隔(之后翻倍,见 mcp_failed_retry)。
+# B-292 —— 构建时有服务没连上:第一次后台重试的间隔(之后每 120 秒,见 mcp_failed_retry)。
 # 60 秒:重启通常几十秒内就绪,工具缺失从最长 30 分钟(池 TTL)压到约 1 分钟。重拨在
 # 所有锁外进行、缓存池照常服务,所以对端挂住(timeout_s 最长 300 秒)也不挡构建。
 _FAILED_RETRY_S = 60.0

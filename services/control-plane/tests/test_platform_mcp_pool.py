@@ -209,9 +209,9 @@ async def test_ttl_backstop_rebuilds_expired_pool_and_reuses_fresh_one() -> None
 class _PlatformRig:
     def __init__(self, store: InMemoryMcpConnectorCatalogStore, down: set[str]) -> None:
         self.dialer = _Dialer(down)
-        self.sleeper = _ManualSleep()
-        self.expired: list[None] = []
         self.now = {"t": 0.0}
+        self.sleeper = _ManualSleep(self.now)
+        self.expired: list[None] = []
         self.svc = PlatformMcpPoolService(
             store=store,
             client_factory=self.dialer,
@@ -277,13 +277,13 @@ async def test_still_failing_server_backs_off_until_pool_ttl_without_evicting_bu
     rig = await _platform_rig("a", "b", down={"b"})
     p1 = await rig.svc.get_or_build()
     await rig.sleeper.sleeping(1)
-    for _ in range(8):  # bounded: a chain that never ends must fail, not hang
+    for _ in range(20):  # bounded: a chain that never ends must fail, not hang
         if not rig.svc._retry_tasks:
             break
         await rig.wake_retry()
         await rig.sleeper.settle()
-    assert rig.sleeper.durations == [60.0, 120.0, 240.0, 480.0, 960.0]
-    assert sorted(rig.dialer.calls) == ["a"] + ["b"] * 6
+    assert rig.sleeper.durations == [60.0] + [120.0] * 14  # capped at 120 s, ends at TTL
+    assert sorted(rig.dialer.calls) == ["a"] + ["b"] * 16
     assert await rig.svc.get_or_build() is p1
     assert rig.expired == []
 
