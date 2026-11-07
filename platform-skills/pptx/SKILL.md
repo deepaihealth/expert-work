@@ -108,7 +108,8 @@ prs.save("骨架 示例.pptx")
 
 1. 看结构：`python $EXPERT_WORK_SKILLS_DIR/pptx/scripts/inspect_template.py 模板.pptx --texts`。每页
    `texts` 列出所有带字的形状（含组合内、表格单元格）：地址 `addr`、位置、文字预览、字号、`cap`（当前
-   字号约能放几个汉字）；`locked` 是改不了字的形状（图表、SmartArt、图片）。
+   字号约能放几个汉字）；`locked` 是改不了字的形状（图表、SmartArt、图片）。页数多（10 页以上）时加
+   `--slides 1-8` 分批看，输出太长会被截断。
 2. 填值：写 spec.json，跑 `python $EXPERT_WORK_SKILLS_DIR/pptx/scripts/fill_template.py 模板.pptx
    spec.json 成品.pptx`。地址照抄 `addr`：
 
@@ -122,11 +123,12 @@ prs.save("骨架 示例.pptx")
    顺序出页，同一页列两次即复制，没列的页只有写了 `drop_unlisted` 才删。地址不存在或改不了时整份不
    保存，`results` 一次列出全部问题。
 3. 输出的 `overflow` 是估计放不下的地址（`need_lines` > `fit_lines`，按 `cap_chars` 删减）：一次把它们
-   全部改短，改 spec 后从模板重跑；只有模板本身允许时才把那一处字号略调小。
+   全部改短，改 spec 后从模板重跑；只有模板本身允许时才把那一处字号略调小。带 `near` 的是接近放满、
+   `overflow_unknown` 是估不了，这两类看图时重点看；`warnings` 要转告用户。
 4. 按「检查成品」把 `changed_pages` 全部渲染看完，问题记全后一次改完，不要改一处看一处。
 
 按版式加新页：不带 `--texts` 的输出有 `layouts`，`prs.slide_masters[master].slide_layouts[index]`
-加页、`slide.placeholders[idx]` 填字。
+加页、`slide.placeholders[idx]` 填字，图片占位符用 `slide.placeholders[idx].insert_picture("图.png")`。
 
 ## 删页 / 调序
 

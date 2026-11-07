@@ -12,8 +12,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import pptx
 from _cli import emit_json, fail, resolve_io
 from pptx.opc.constants import RELATIONSHIP_TYPE as RT
+from pptx.oxml.ns import qn
 
 _R_NS = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
+_SLIDE_ATTRS = ("show", "showMasterSp", "showMasterPhAnim")
 # Relationships whose *data part* is not duplicated — the new slide's relationship points
 # at the very same part as the original, so editing one's data (chart series, SmartArt
 # text, embedded workbook, ...) silently edits the other's too. Speaker notes are NOT in
@@ -64,6 +66,47 @@ def _copy_notes(src, new) -> bool:
     return False
 
 
+def _remapped(el, rid_map: dict[str, str]):
+    clone = copy.deepcopy(el)
+    for node in clone.iter():
+        for attr, val in list(node.attrib.items()):
+            if attr.startswith(f"{{{_R_NS}}}") and val in rid_map:
+                node.set(attr, rid_map[val])
+    return clone
+
+
+def _copy_slide_level(src_el, new_el, rid_map: dict[str, str]) -> None:
+    """Everything of the slide besides its shapes: background (and the rest of cSld),
+    colour-map override, transition, timing, extensions, hidden / master-shape flags."""
+    for attr in _SLIDE_ATTRS:
+        if src_el.get(attr) is None:
+            new_el.attrib.pop(attr, None)
+        else:
+            new_el.set(attr, src_el.get(attr))
+    src_csld, new_csld = src_el.find(qn("p:cSld")), new_el.find(qn("p:cSld"))
+    if src_csld.get("name") is None:
+        new_csld.attrib.pop("name", None)
+    else:
+        new_csld.set("name", src_csld.get("name"))
+    tree = new_csld.find(qn("p:spTree"))
+    for child in list(new_csld):
+        if child is not tree:
+            new_csld.remove(child)
+    pos = 0
+    for child in src_csld:
+        if child.tag == qn("p:spTree"):
+            pos = list(new_csld).index(tree) + 1
+            continue
+        new_csld.insert(pos, _remapped(child, rid_map))
+        pos += 1
+    for child in list(new_el):
+        if child is not new_csld:
+            new_el.remove(child)
+    for child in src_el:
+        if child is not src_csld:
+            new_el.append(_remapped(child, rid_map))
+
+
 def duplicate(prs, index: int, after: int) -> tuple[int, list[str], bool]:
     src = prs.slides[index - 1]
     new = prs.slides.add_slide(src.slide_layout)
@@ -83,12 +126,8 @@ def duplicate(prs, index: int, after: int) -> tuple[int, list[str], bool]:
     for el in src.shapes._spTree.iterchildren():
         if el.tag.endswith("}nvGrpSpPr") or el.tag.endswith("}grpSpPr"):
             continue
-        clone = copy.deepcopy(el)
-        for node in clone.iter():
-            for attr, val in list(node.attrib.items()):
-                if attr.startswith(f"{{{_R_NS}}}") and val in rid_map:
-                    node.set(attr, rid_map[val])
-        new.shapes._spTree.append(clone)
+        new.shapes._spTree.append(_remapped(el, rid_map))
+    _copy_slide_level(src._element, new._element, rid_map)
     notes_format_lost = _copy_notes(src, new)
     ids = prs.slides._sldIdLst
     moved = ids[-1]

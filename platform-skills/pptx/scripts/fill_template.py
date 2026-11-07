@@ -1,6 +1,6 @@
 """Fill a designed .pptx: replace the text of addressed shapes, keep everything else.
 
-Addresses come from inspect_template.py (``texts[].addr``). Spec (JSON file), either
+Addresses come from inspect_template.py --texts (``texts[].addr``). Spec (JSON file), either
 
   {"fill": {"2:5": "标题", "3:4/7": ["第一段", "第二段"], "4:9@2,1": "单元格"}}
       every slide kept as is, in place;
@@ -9,14 +9,15 @@ Addresses come from inspect_template.py (``texts[].addr``). Spec (JSON file), ei
    "drop_unlisted": true}
       output = the listed source slides in this order; a slide listed twice is
       duplicated (addresses keep the source slide number); slides not listed are
-      deleted only with "drop_unlisted": true, otherwise it is an error.
+      deleted only with "drop_unlisted": true, otherwise it is an error. Sections
+      follow the new order; deleted slides leave custom shows (reported in warnings).
 
-A value is a string ("\\n" starts a new paragraph) or a list of paragraphs, each a string
-("\\n" inside = line break) or {"text": "...", "level": 0-8}. Paragraph i keeps the
-paragraph format of the old paragraph i (the last one when there are more) and the
-character format of its first run. Unknown / non-editable addresses: nothing is saved,
-exit 1, and every problem is reported at once. Overflow is an estimate, reported but
-not fatal.
+A value is a string ("\\n" starts a new paragraph, "\\v" breaks the line) or a list of
+paragraphs, each a string ("\\n" / "\\v" inside = line break) or {"text": "...",
+"level": 0-8}. Paragraph i keeps the paragraph format of the old paragraph i (the last
+one when there are more) and the character format of its first run. Unknown,
+ambiguous or non-editable addresses: nothing is saved, exit 1, every problem reported
+at once. Overflow is an estimate, reported but not fatal.
 """
 
 from __future__ import annotations
@@ -34,34 +35,59 @@ from _pptx_text import NewPara, estimate, parse_addr, replace_text, walk_slide
 from duplicate_slide import duplicate
 from pptx.oxml.ns import qn
 
+P14 = "http://schemas.microsoft.com/office/powerpoint/2010/main"
 OVERFLOW_NOTE = (
     "估算值:按字号、框尺寸、汉字 1 字宽 / 西文约半字宽、1.2 倍行距推算;"
     "中文较准,西文随字体约差 ±20%,"
-    "以渲染为准。autofit=resize 框会变高、可能压住下方内容;shrink 打开时字会被缩小;"
+    "以渲染为准。near=接近放满(≥90%),不一定溢出,渲染时重点看;"
+    "overflow_unknown=框的尺寸读不到,估不了,必须看图确认。"
+    "autofit=resize 框会变高、可能压住下方内容;shrink 打开时字会被缩小;"
     "表格单元格溢出时整行变高。"
 )
+_CONTROL = {chr(c) for c in range(32)} - {"\t", "\n", "\v"}
+
+
+class _DuplicateKeysError(ValueError):
+    pass
+
+
+def _no_duplicate_keys(pairs):
+    keys = [k for k, _ in pairs]
+    dups = sorted({k for k in keys if keys.count(k) > 1})
+    if dups:
+        raise _DuplicateKeysError(", ".join(dups))
+    return dict(pairs)
+
+
+def _text(raw: str, where: str, errors: list[str]) -> str:
+    bad = sorted({f"U+{ord(c):04X}" for c in raw if c in _CONTROL})
+    if bad:
+        errors.append(f"{where}: 含控制字符 {', '.join(bad)}, 删掉再跑")
+    return raw.replace("\v", "\n")
 
 
 def _paras(value, where: str, errors: list[str]) -> list[NewPara]:
     if isinstance(value, str):
-        return [NewPara(line) for line in value.split("\n")]
+        return [NewPara(_text(line, where, errors)) for line in value.split("\n")]
     if not isinstance(value, list) or not value:
         errors.append(f"{where}: 值必须是字符串或非空列表")
         return []
     out = []
     for k, item in enumerate(value):
+        level = item.get("level") if isinstance(item, dict) else None
         if isinstance(item, str):
-            out.append(NewPara(item))
+            out.append(NewPara(_text(item.replace("\n", "\v"), f"{where}[{k}]", errors)))
         elif (
             isinstance(item, dict)
             and isinstance(item.get("text"), str)
             and set(item) <= {"text", "level"}
-            and (item.get("level") is None or item.get("level") in range(9))
+            and (level is None or (type(level) is int and 0 <= level <= 8))
         ):
-            out.append(NewPara(item["text"], item.get("level")))
+            text = _text(item["text"].replace("\n", "\v"), f"{where}[{k}]", errors)
+            out.append(NewPara(text, level))
         else:
             errors.append(
-                f'{where}[{k}]: 段落要么是字符串, 要么是 {{"text": 字符串, "level": 0-8}}'
+                f'{where}[{k}]: 段落要么是字符串, 要么是 {{"text": 字符串, "level": 0-8 的整数}}'
             )
     return out
 
@@ -88,10 +114,8 @@ def _entries(spec, total: int, errors: list[str]) -> tuple[list[tuple[int, dict]
         return [], True
     entries = []
     for k, item in enumerate(spec["slides"]):
-        src = (
-            item if isinstance(item, int) else item.get("from") if isinstance(item, dict) else None
-        )
-        if not isinstance(src, int) or not 1 <= src <= total:
+        src = item if type(item) is int else item.get("from") if isinstance(item, dict) else None
+        if type(src) is not int or not 1 <= src <= total:
             errors.append(f"slides[{k}]: from 必须是 1..{total} 的页码")
             continue
         if isinstance(item, dict) and set(item) - {"from", "fill"}:
@@ -143,21 +167,117 @@ def _allocate(prs, entries) -> tuple[list, list[str]]:
 def _status(target) -> str:
     if target is None:
         return "not_found"
+    if target.ambiguous:
+        return "ambiguous_id"
+    if target.kind == "error":
+        return f"error: {target.error}"
     if target.merged:
         return "merged_cell"
-    return "ok" if target.tx_body is not None else f"locked:{target.kind}"
+    if target.tx_body is not None or target.kind == "cell":
+        return "ok"
+    return f"locked:{target.kind}"
 
 
-def _reorder(prs, slides, drop: bool) -> None:
+# ---------------------------------------------------------------- restructuring
+
+
+def _drop_from_custom_shows(prs, rids: set[str]) -> list[str]:
+    warnings = []
+    for show in prs.part._element.iter(qn("p:custShow")):
+        hits = [s for s in show.iter(qn("p:sld")) if s.get(qn("r:id")) in rids]
+        for s in hits:
+            s.getparent().remove(s)
+        if hits:
+            warnings.append(f"自定义放映「{show.get('name', '')}」里有被删掉的页, 已从放映中去掉")
+    return warnings
+
+
+def _rewrite_sections(prs, final_ids: list[str], source_ids: list[str]) -> list[str]:
+    """Sections keep their order; each holds the output slides whose source it held."""
+    sections = list(prs.part._element.iter(f"{{{P14}}}section"))
+    if not sections:
+        return []
+    home = {s.get("id"): n for n, sec in enumerate(sections) for s in sec.iter(f"{{{P14}}}sldId")}
+    members: list[list[str]] = [[] for _ in sections]
+    last = 0
+    for fid, sid in zip(final_ids, source_ids, strict=True):
+        last = home.get(sid, last)  # a slide outside every section joins its predecessor's
+        members[last].append(fid)
+    for sec, ids in zip(sections, members, strict=True):
+        lst = sec.find(f"{{{P14}}}sldIdLst")
+        if lst is None:
+            lst = sec.makeelement(f"{{{P14}}}sldIdLst", {})
+            sec.insert(0, lst)
+        for child in list(lst):
+            lst.remove(child)
+        for fid in ids:
+            lst.append(lst.makeelement(f"{{{P14}}}sldId", {"id": fid}))
+    if [i for ids in members for i in ids] != final_ids:
+        return ["调序后同一分节的页不再相邻, PowerPoint 打开时可能重排分节; 请检查分节或调整顺序"]
+    return []
+
+
+def _restructure(prs, slides, source_ids: list[str], drop: bool) -> list[str]:
     ids = prs.slides._sldIdLst
     by_part = {prs.part.related_part(sid.rId): sid for sid in ids}
     keep = [by_part[s.part] for s in slides]
+    dropped = [sid for sid in ids if sid not in keep] if drop else []
+    dropped_parts = {prs.part.related_part(sid.rId) for sid in dropped}
+    warnings = _drop_from_custom_shows(prs, {sid.rId for sid in dropped})
     for sid in list(ids):
         ids.remove(sid)
-        if drop and sid not in keep:
+        if sid in dropped:
             prs.part.drop_rel(sid.rId)
     for sid in keep:
         ids.append(sid)
+    warnings += _rewrite_sections(prs, [sid.get("id") for sid in keep], source_ids)
+    for page, slide in enumerate(slides, start=1):
+        if any(
+            not rel.is_external and rel.target_part in dropped_parts
+            for rel in slide.part.rels.values()
+        ):
+            warnings.append(f"第 {page} 页有链接指向被删掉的页, 那个链接已失效")
+    return warnings
+
+
+# ---------------------------------------------------------------- main
+
+
+def _load_spec(path: Path):
+    try:
+        return json.loads(path.read_text(encoding="utf-8"), object_pairs_hook=_no_duplicate_keys)
+    except _DuplicateKeysError as exc:
+        fail(f"spec 里有重复的键(后一个会悄悄覆盖前一个): {exc}")
+    except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+        fail(f"spec 不是合法 JSON: {exc}")
+
+
+def _fit_report(page, addr, target, paras) -> tuple[dict | None, bool]:
+    """-> (overflow / near item or None, estimate unknown?)."""
+    try:
+        fit = estimate(target)
+    except Exception:  # an unreadable value means "unknown", reported
+        fit = None
+    if fit is None:
+        return None, True
+    if not (fit.over or fit.near):
+        return None, False
+    item = {
+        "page": page,
+        "addr": addr,
+        "need_lines": fit.need_lines,
+        "fit_lines": fit.fit_lines,
+        "cap_chars": fit.cap_chars,
+        "chars": sum(len(p.text) for p in paras),
+        "font_pt": fit.font_pt,
+    }
+    if fit.near:
+        item["near"] = True
+    if target.autofit:
+        item["autofit"] = target.autofit
+    if fit.too_wide:
+        item["too_wide"] = True
+    return item, False
 
 
 def main() -> None:
@@ -170,15 +290,13 @@ def main() -> None:
     args = ap.parse_args()
     src, dst = resolve_io(args.input, args.output)
     spec_path, _ = resolve_io(args.spec, None)
-    try:
-        spec = json.loads(spec_path.read_text(encoding="utf-8"))
-    except (json.JSONDecodeError, UnicodeDecodeError) as exc:
-        fail(f"spec 不是合法 JSON: {exc}")
+    spec = _load_spec(spec_path)
     prs = pptx.Presentation(str(src))
     errors: list[str] = []
     entries, restructured = _entries(spec, len(prs.slides), errors)
     if errors:
         fail("spec 有误:\n" + "\n".join(errors))
+    orig_ids = [sid.get("id") for sid in prs.slides._sldIdLst]
     slides, shared_warnings = _allocate(prs, entries) if restructured else (list(prs.slides), [])
     default_style = prs.part._element.find(qn("p:defaultTextStyle"))
     plan, results = [], []
@@ -192,28 +310,21 @@ def main() -> None:
                 plan.append((page, addr, target, paras))
     if any(r["status"] != "ok" for r in results):
         emit_json({"saved": False, "results": results})
-        fail("有地址找不到或不能改字, 没有保存; 按 results 一次改完 spec 再跑")
-    overflow = []
+        fail("有地址找不到、有歧义或不能改字, 没有保存; 按 results 一次改完 spec 再跑")
+    overflow, unknown = [], []
     for page, addr, target, paras in plan:
+        if target.tx_body is None:  # a table cell that never had text
+            target.tx_body = target.el.get_or_add_txBody()
         replace_text(target.tx_body, paras)
-        fit = estimate(target)
-        if fit is not None and fit.over:
-            item = {
-                "page": page,
-                "addr": addr,
-                "need_lines": fit.need_lines,
-                "fit_lines": fit.fit_lines,
-                "cap_chars": fit.cap_chars,
-                "chars": sum(len(p.text) for p in paras),
-                "font_pt": fit.font_pt,
-            }
-            if target.autofit:
-                item["autofit"] = target.autofit
-            if fit.too_wide:
-                item["too_wide"] = True
+        item, is_unknown = _fit_report(page, addr, target, paras)
+        if item:
             overflow.append(item)
+        if is_unknown:
+            unknown.append(addr)
+    warnings = []
     if restructured:
-        _reorder(prs, slides, drop=spec.get("drop_unlisted") is True)
+        source_ids = [orig_ids[src_no - 1] for src_no, _ in entries]
+        warnings = _restructure(prs, slides, source_ids, drop=spec.get("drop_unlisted") is True)
     prs.save(str(dst))
     report = {
         "saved": True,
@@ -221,12 +332,15 @@ def main() -> None:
         "changed_pages": sorted({page for page, *_ in plan}),
         "results": results,
         "overflow": overflow,
+        "overflow_unknown": unknown,
     }
-    if overflow:
+    if overflow or unknown:
         report["overflow_note"] = OVERFLOW_NOTE
     if restructured:
         report["slides"] = [s for s, _ in entries]
         report["shared_parts_warning"] = shared_warnings
+    if warnings:
+        report["warnings"] = warnings
     emit_json(report)
 
 
