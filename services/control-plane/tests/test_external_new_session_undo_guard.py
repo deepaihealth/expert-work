@@ -360,7 +360,7 @@ class _RecordingWorkspaceQuota:
         self.written: list[tuple[UUID, UUID, int]] = []
 
     async def check_upload(self, *, tenant_id: UUID, user_id: UUID, incoming_bytes: int) -> None:
-        del tenant_id, user_id, incoming_bytes
+        """Always allows the upload."""
 
     async def note_written(self, *, tenant_id: UUID, user_id: UUID, delta_bytes: int) -> None:
         self.written.append((tenant_id, user_id, delta_bytes))
