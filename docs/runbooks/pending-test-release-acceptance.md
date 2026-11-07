@@ -2304,3 +2304,23 @@ asyncio.run(main())
 - [ ] **105.8 收尾**:删 105.1–105.6 的会话。
 
 **生产(随发布之后,用户执行)**:任找一个带图片 / PDF 附件的对话,在对话详情页点标签各一次,能预览、能下载即可;用一个非主人账号点一次,审计里看到 `user:data_view`。不需要额外配置。
+
+## §103 pptx 技能:套用已排好版的模板(B-295)
+
+**背景**:用户上传一份已经设计好的 10 页 PPT 当模板、要求按它出报告,一次运行 36 分钟,其中工具只占约 1.7 分钟:约 10 分钟是模型手写 6 个探查脚本摸模板结构(没用 `inspect_template.py`,它当时也只给形状名 / 类型),约 8 分钟首次填充,约 12 分钟是看图发现溢出后改一处、渲染一次地反复 5–6 轮。本次改平台 pptx 技能(只改技能包,不改镜像 / 后端):
+
+- `inspect_template.py 模板.pptx --texts`:每页列出所有带字的形状(含组合内、嵌套组合、表格单元格),带地址 `页:形状id[/组内id][@行,列]`、位置、预览、段数 / 文字段数、生效字号(沿继承链)、autofit / 换行、按当前字号约能放几个汉字;图表 / SmartArt / 图片列为 `locked`。不带 `--texts` 时原有 `layouts` / `slides[].shapes` 输出不变。
+- 新 `fill_template.py 模板.pptx spec.json 成品.pptx`:按地址换字,保留段落格式和首个文字段的字号 / 颜色 / 粗细,其它形状逐字节不动;可复制 / 调序页,删页必须显式 `drop_unlisted`;地址不存在或改不了时整份不保存并一次列出全部问题;输出估计溢出的地址(估算,标明误差)。
+- SKILL.md「套用模板」改为四步:inspect → 写 spec 填值 → 一次改完所有溢出 → 渲染全部改动页、问题记全后一次改完。
+
+**怎么进**:测试控制台(system_admin,平台租户)建一个临时智能体(只绑平台 pptx 技能 + 沙箱,模型用测试常用主模型,能看图),在调试台跑。**模板用通用合成件,不用任何客户文件**:本机生成 `uv run --no-sync python -c "import sys; sys.path.insert(0, 'platform-skills/tests/in_image'); import _pptx_fixtures as f; f.build_designed_deck('通用模板.pptx')"`(6 页:占位符版式页、自由文本框页含混排字号与三种 autofit、组合 / 嵌套组合页、表格页含合并格、图表 + SmartArt + 图片页)。**花费**:4 轮带 PPT 的对话(改前 / 改后各 1 轮套模板 + 新建回归各 1 轮),按测试模型价目约几元。
+
+**固定提示词(改前改后逐字相同)**:上传 `通用模板.pptx`,发:「请用附件这个模板做一份《第三季度工作回顾》PPT,保持模板原有设计,只替换文字:第 1 页标题『第三季度工作回顾』、副标题『部门例会 · 2026 年 10 月』;第 2 页要点:『完成三项重点任务』,下面两条细节『上线新版服务流程,处理时长缩短 20%』『完成年度预算中期复核』;第 3 页把写着『标题文字』的那一行改成『客户满意度持续提升:季度调研平均分 4.6,较上季度提高 0.3 分,投诉量下降 15%』,『小标题』改成『关键数据』;第 4 页两个组合里的字分别改成『流程优化』『成本控制』;第 5 页表格第 2 行改成『服务流程 / 张三 / 已完成』;最后检查有没有文字溢出、重叠,有就改好再交付。」
+
+- [ ] **103.0 改前基线**:导入前(测试上仍是旧 pptx 技能)用上面的提示词跑一轮。在 Run 详情 / 轨迹面板记四个数:**总耗时**、**模型调用次数**、**探查脚本数**(交付前为了弄清模板结构而写的 python-pptx / 解 XML 脚本次数,不含技能自带脚本)、**修复轮数**(首份成品之后「改 → 再生成」的次数)。产物要能打开、模板设计保留。
+- [ ] **103.1 导入新技能**:本机 `uv run --no-sync python platform-skills/build.py --only pptx`;按 `platform-skills/README.md`「发布」一节:`export KUBECONFIG=~/.kube/expert-work-test.yaml`、`kubectl config current-context` 确认是测试集群、取 control-plane `POD`,先 `uv run --no-sync python platform-skills/import_in_pod.py bundle --dry-run platform-skills/dist/pptx.skill | kubectl -n expert-work exec -i "$POD" -- python3 -`。判据:一行 `name=pptx`、`status="dry-run"`、`would_create_version` = 当前版本 + 1。再去掉 `--dry-run` 正式导入。判据:`status=201`、`created=true`,随后一行 `{"invalidation": "published", ...}`(若是 `skipped`,按 README 处理:滚动重启 control-plane 或等 30 分钟,**不要重跑导入**)。
+- [ ] **103.2 改后同题对比**:新开会话,同一模板、同一提示词再跑一轮,记同样四个数。判据:轨迹里依次出现 `inspect_template.py … --texts` 与 `fill_template.py`;探查脚本数 ≤ 1;修复轮数 ≤ 1(第 3 页『标题文字』那一行是 28 磅、约放 19 个字的单行框,新句子明显超长,应在 `fill_template.py` 的 `overflow` 里一次报出并在首轮改短,而不是看图后才发现);总耗时比 103.0 至少少 40%;成品打开后第 4 页组合、第 5 页表格、第 6 页图表仍在原位且颜色字号不变,第 6 页图表文字没被声称改过。把两轮四个数并排记在本条下。
+- [ ] **103.3 新建回归**:同一智能体新会话发「做一份 3 页的项目周报 PPT:封面、进度表、一页数据图」(不给模板)。判据:按 SKILL.md「新建」骨架出成品、`save_artifact` 登记、能打开、中文不是方块;耗时与导入前同类请求相当(没有误走 `fill_template.py`)。
+- [ ] **103.4 收尾**:删临时智能体与会话;技能新版本保留(要回退见 `platform-skills/README.md` 回滚一节)。
+
+**没修好时**:103.2 里模型仍先写多个 python-pptx / XML 脚本摸结构(≥ 2 个),或不调 `inspect_template.py --texts` / `fill_template.py`;或 `fill_template.py` 没报第 3 页溢出、要靠看图才发现;或修复轮数 ≥ 3;或总耗时没有明显下降;或成品里非目标形状被改动 / 模板设计丢失;或 103.3 新建出错、误用填模板脚本。出现任一条:不随下次发布带出,把对应轨迹(步骤与工具调用,不贴模板内容)贴回来。
