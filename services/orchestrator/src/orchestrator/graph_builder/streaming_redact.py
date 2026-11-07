@@ -219,9 +219,13 @@ class TokenSink:
     def __init__(self, *, step: int, publish: TokenPublish, dlp: bool, screen: bool) -> None:
         self._step = step
         self._publish = publish
+        self._dlp = dlp
+        self._screen = screen
         self._content = StreamingRedactor(dlp=dlp, screen=screen)
         self._reasoning = StreamingRedactor(dlp=dlp, screen=screen)
         self._announced: set[_AnnounceKey] = set()
+        #: Whether this attempt has published any reasoning text yet.
+        self._reasoning_sent = False
         #: ``time.monotonic()`` of the first non-empty delta; agent_node uses
         #: it to compute ``first_token_ms``.
         self.first_delta_at: float | None = None
@@ -234,6 +238,7 @@ class TokenSink:
             await self._publish({"step": self._step, "channel": "content", "text": safe})
         rsafe = self._reasoning.feed(delta.reasoning)
         if rsafe:
+            self._reasoning_sent = True
             await self._publish({"step": self._step, "channel": "reasoning", "text": rsafe})
         for tc in delta.tool_calls:
             if not tc.name:
@@ -252,6 +257,28 @@ class TokenSink:
                     "name": tc.name,
                 }
             )
+
+    async def discard_attempt(self) -> None:
+        """B-297 PR2 — the router abandoned this attempt (reasoning only, no
+        answer) and redoes the step on a backup model.
+
+        Token frames are not retractable and no new event type may reach the
+        external stream, so: the attempt's not-yet-released tails are dropped
+        (never published), tool-name dedup restarts, and — when reasoning was
+        already published — one paragraph break goes out on the reasoning
+        channel, so a client that concatenates the step's reasoning reads the
+        backup's thinking as a new paragraph instead of a mid-word splice. The
+        console resets the step's live view on the ``llm_failover`` frame that
+        follows; the authoritative ``updates`` frame carries only the backup's
+        reasoning.
+        """
+        sent = self._reasoning_sent
+        self._content = StreamingRedactor(dlp=self._dlp, screen=self._screen)
+        self._reasoning = StreamingRedactor(dlp=self._dlp, screen=self._screen)
+        self._announced = set()
+        self._reasoning_sent = False
+        if sent:
+            await self._publish({"step": self._step, "channel": "reasoning", "text": "\n\n"})
 
     async def flush(self) -> None:
         tail = self._content.flush()

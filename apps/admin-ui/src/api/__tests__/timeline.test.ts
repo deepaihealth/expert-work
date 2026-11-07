@@ -75,6 +75,22 @@ describe("parseTimeline", () => {
     expect(kinds).toEqual(["compaction", "retry", "end"]);
   });
 
+  it("renders an llm_failover frame as a short Chinese switch line (B-297)", () => {
+    const events = [
+      ev("llm_failover", { step: 3, from_model: "deepseek-flash", to_model: "qwen3.8-max", reason: "first_token_timeout" }, "t1"),
+      ev("llm_failover", { step: 4, from_model: "a", to_model: "b", reason: "reasoning_stall" }, "t2"),
+      ev("llm_failover", { step: 5, from_model: "a", to_model: "b", reason: "not-a-known-code" }, "t3"),
+    ];
+    const items = parseTimeline(events);
+    expect(items.map((i) => i.kind)).toEqual(["failover", "failover", "failover"]);
+    expect(items.map((i) => (i.kind === "failover" ? i.text : null))).toEqual([
+      "已切换到备用模型 qwen3.8-max（主模型 deepseek-flash 无响应）",
+      "已切换到备用模型 b（主模型 a 思考后停住）",
+      "已切换到备用模型 b（主模型 a 调用失败）",
+    ]);
+    expect(items.every((i) => i.kind === "failover" && i.tone === "warn")).toBe(true);
+  });
+
   it("assigns increasing seq in arrival order across types", () => {
     const events = [
       upd("memory_recall", { recalled_memories: [{ id: "m1", kind: "fact", content: "x", importance: 0.5, confidence: 0.5 }] }, "t1"),

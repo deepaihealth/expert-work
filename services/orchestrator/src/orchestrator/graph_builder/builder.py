@@ -148,6 +148,7 @@ from orchestrator.graph_builder._config import (
     compaction_sink_from_config,
     configurable_uuid,
     current_run_id,
+    failover_sink_from_config,
     token_sink_from_config,
 )
 from orchestrator.graph_builder.figure_block import (
@@ -186,6 +187,7 @@ from orchestrator.llm.empty_reply import (
     is_empty_reply,
     is_filtered,
 )
+from orchestrator.llm.failover import failover_frames
 from orchestrator.llm.stall import (
     STALLED_AFTER_S,
     StalledWithoutAnswerError,
@@ -1368,7 +1370,12 @@ def build_react_graph(
             # in-flight await rather than waiting it out (E.15).
             # 10.1 — one ``expert_work.orchestrator.llm_call`` child span per
             # provider call, attached under the session root span.
-            with expert_work_span(ExpertWorkComponent.ORCHESTRATOR, "llm_call"):
+            # B-297 PR2 — a switch to a backup model during this call shows up
+            # as a console-only ``llm_failover`` frame for this step.
+            with (
+                expert_work_span(ExpertWorkComponent.ORCHESTRATOR, "llm_call"),
+                failover_frames(step_count + 1, failover_sink_from_config(config)),
+            ):
                 if _token_sink is not None:
                     # Only pass ``on_delta`` when a sink is actually wired
                     # (子项目 2 streaming path) — omitting the kwarg otherwise

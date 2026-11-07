@@ -40,6 +40,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
 from contextvars import ContextVar
 from dataclasses import dataclass, field
@@ -68,11 +69,14 @@ from expert_work.runtime.middleware import (
 from expert_work.runtime.tokens import TokenEstimator, default_estimator
 from orchestrator.llm.failover import (
     StickyRouteStore,
+    announce_failover,
     default_sticky_store,
     failover_reason,
     fallback_first_token_timeout,
+    observe_first_progress,
     plan_walk,
     record_failover,
+    redo_reasoning_only,
     remember_route,
 )
 from orchestrator.llm.oauth_provider import OAuthCapableProvider
@@ -408,6 +412,9 @@ _delta_sink: ContextVar[Callable[[LLMDelta], Awaitable[None]] | None] = ContextV
 _attempt_hints: ContextVar[tuple[bool, bool]] = ContextVar(
     "_llm_attempt_hints", default=(False, False)
 )
+# B-297 PR2 — ``WalkPlan.can_redo_elsewhere`` of the attempt in flight: a
+# reasoning-only stall may be discarded and redone on the next group.
+_redo_elsewhere: ContextVar[bool] = ContextVar("_llm_redo_elsewhere", default=False)
 
 
 @dataclass
@@ -501,9 +508,10 @@ class LLMRouter:
             i = plan.order[pos]
             handle = handles[i]
             if failed is not None and failed[0] != groups[i]:
-                record_failover(failed[0], groups[i], failed[1])
+                await announce_failover(failed[0], groups[i], failed[1])
             failed = None
             token = _attempt_hints.set((plan.has_fallback(pos), plan.has_alternative(pos)))
+            redo_token = _redo_elsewhere.set(plan.can_redo_elsewhere(pos))
             try:
                 response = await self._call_one(
                     handle, messages=messages, tools=tools, output_schema=output_schema
@@ -551,6 +559,7 @@ class LLMRouter:
                 return response
             finally:
                 _attempt_hints.reset(token)
+                _redo_elsewhere.reset(redo_token)
 
         assert last_exc is not None  # noqa: S101 - loop invariant
         raise AllProvidersExhaustedError(last_exc)
@@ -804,6 +813,7 @@ class LLMRouter:
         sink = _delta_sink.get()
         first_progress = False
         finished = False
+        started = time.monotonic()
 
         # Phase 1 — wait for the first progress delta.
         while not first_progress:
@@ -829,6 +839,7 @@ class LLMRouter:
             finished = finished or delta.finish_reason is not None
         # B-297 — the upstream answers: resolves a half-open breaker probe now
         # rather than after the whole generation.
+        observe_first_progress(handle.key, time.monotonic() - started)
         await notify_first_progress()
 
         # Phase 2 — consume the rest under the idle timeout.
@@ -846,15 +857,23 @@ class LLMRouter:
                 partial = assembler.build(interrupted=True)
                 if finished or self.idle_timeout_s is None:
                     return partial
+                await redo_reasoning_only(
+                    handle.key, partial, sink, f"idle {self.idle_timeout_s}s", _redo_elsewhere.get()
+                )
                 # B-186 — the agent loop fails a reasoning-only partial;
                 # planner / reflection keep treating it as an empty reply.
                 metadata = {**partial.response_metadata, STALLED_AFTER_S: self.idle_timeout_s}
                 return partial.model_copy(update={"response_metadata": metadata})
             except LLMError as exc:
-                # Post-first-token hard error → terminal, no fallback.
+                # Post-first-token hard error → terminal, no fallback
+                # (unless only reasoning came out — B-297 PR2).
+                partial = assembler.build(interrupted=True)
+                await redo_reasoning_only(
+                    handle.key, partial, sink, type(exc).__name__, _redo_elsewhere.get()
+                )
                 raise LLMStreamInterruptedError(
                     f"provider {handle.key!r} stream failed after first token: {exc}",
-                    partial=assembler.build(interrupted=True),
+                    partial=partial,
                 ) from exc
             assembler.add(delta)
             if sink is not None:

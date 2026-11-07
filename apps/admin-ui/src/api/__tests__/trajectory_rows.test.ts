@@ -161,6 +161,20 @@ describe("compactRowsOf", () => {
     expect(rows[5]).toMatchObject({ kind: "error", text: "上游 502", status: "error" });
   });
 
+  it("B-297: an llm_failover frame becomes a warn marker row in both projections", () => {
+    const events = [
+      ev("llm_failover", { step: 1, from_model: "deepseek-flash", to_model: "qwen3.8-max", reason: "reasoning_stall" }),
+    ];
+    const expected = {
+      kind: "failover", status: "warn", eventIndexes: [0],
+      text: "已切换到备用模型 qwen3.8-max（主模型 deepseek-flash 思考后停住）",
+    };
+    expect(compactRowsOf(events)).toEqual([expect.objectContaining(expected)]);
+    expect(ledgerRowsOf(events, { text: "", attachmentNames: [], inputs: {} }).slice(1)).toEqual([
+      expect.objectContaining(expected),
+    ]);
+  });
+
   it("B-168: backend writeback frame carries only a count — row drawn even at 0, with its duration", () => {
     const rows = compactRowsOf([
       upd("memory_writeback", { written_memory_count: 0, _duration_ms: 3100 }),

@@ -727,3 +727,63 @@ def test_named_tool_call_chunk_always_carries_id(case: Any, events: list[dict[st
                 named += 1
                 assert tc.id, f"chunk 带 name={tc.name!r} 却没有 id: {tc}"
     assert named >= 1, "fixture 里必须至少出现一个带 name 的 tool-call chunk"
+
+
+# ---------------------------------------------------------------------------
+# B-297 PR2 — the router abandons a reasoning-only attempt (discard_attempt)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_discard_drops_held_tails_and_marks_a_new_reasoning_paragraph() -> None:
+    frames: list[dict] = []
+
+    async def pub(f: dict) -> None:
+        frames.append(f)
+
+    sink = TokenSink(step=3, publish=pub, dlp=True, screen=False)
+    discarded = "a" * 100 + "HELD-BACK-TAIL"
+    await sink(LLMDelta(reasoning=discarded))
+    await sink.discard_attempt()
+    await sink(LLMDelta(reasoning="backup thinks"))
+    await sink.flush()
+
+    reasoning = [f["text"] for f in frames if f["channel"] == "reasoning"]
+    assert all(f["step"] == 3 for f in frames)
+    # The discarded attempt's held-back tail is never released…
+    assert "HELD-BACK-TAIL" not in "".join(reasoning)
+    # …and the backup's thinking starts a new paragraph.
+    assert reasoning[-2:] == ["\n\n", "backup thinks"]
+
+
+@pytest.mark.asyncio
+async def test_discard_without_published_reasoning_emits_nothing() -> None:
+    frames: list[dict] = []
+
+    async def pub(f: dict) -> None:
+        frames.append(f)
+
+    sink = TokenSink(step=1, publish=pub, dlp=True, screen=False)
+    await sink(LLMDelta(reasoning="short"))  # still inside the hold window
+    await sink.discard_attempt()
+    await sink.flush()
+
+    assert frames == []
+
+
+@pytest.mark.asyncio
+async def test_discard_lets_the_backup_announce_its_tool_names() -> None:
+    from orchestrator.llm.providers._streaming import ToolCallChunk
+
+    frames: list[dict] = []
+
+    async def pub(f: dict) -> None:
+        frames.append(f)
+
+    sink = TokenSink(step=1, publish=pub, dlp=False, screen=False)
+    chunk = ToolCallChunk(index=0, id="c0", name="search_web", args_fragment='{"q":')
+    await sink(LLMDelta(tool_calls=(chunk,)))
+    await sink.discard_attempt()
+    await sink(LLMDelta(tool_calls=(chunk,)))
+
+    assert [f["name"] for f in frames if f["channel"] == "tool_args"] == ["search_web"] * 2

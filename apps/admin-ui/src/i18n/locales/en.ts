@@ -1793,6 +1793,7 @@ export interface TranslationKeys {
     traj_kind_approval: string;
     traj_kind_guard: string;
     traj_kind_gap: string;
+    traj_kind_failover: string;
     traj_status_running: string;
     traj_status_ok: string;
     traj_status_error: string;
@@ -1979,6 +1980,16 @@ export interface TranslationKeys {
     error_generic: string;
     compaction: string;
     retry: string;
+    llm_failover: string;
+    llm_failover_reason_first_token_timeout: string;
+    llm_failover_reason_reasoning_stall: string;
+    llm_failover_reason_server_error: string;
+    llm_failover_reason_network: string;
+    llm_failover_reason_rate_limit: string;
+    llm_failover_reason_circuit_open: string;
+    llm_failover_reason_key_unavailable: string;
+    llm_failover_reason_auth: string;
+    llm_failover_reason_other: string;
     guard_token_budget_warn: string;
     guard_token_budget_exhausted: string;
     guard_max_steps: string;
@@ -5776,6 +5787,7 @@ const en: TranslationKeys = {
     traj_kind_approval: "APPROVAL",
     traj_kind_guard: "GUARD",
     traj_kind_gap: "GAP",
+    traj_kind_failover: "FAILOVER",
     traj_status_running: "running",
     traj_status_ok: "done",
     traj_status_error: "failed",
@@ -5963,6 +5975,16 @@ const en: TranslationKeys = {
     error_generic: "Run error",
     compaction: "Compaction ×{{n}} · {{before}} → {{after}} tok",
     retry: "Retry #{{n}} · {{error}} · backing off {{backoff}}s",
+    llm_failover: "Switched to backup model {{to}} (primary {{from}}: {{why}})",
+    llm_failover_reason_first_token_timeout: "no response",
+    llm_failover_reason_reasoning_stall: "stalled after thinking",
+    llm_failover_reason_server_error: "server error",
+    llm_failover_reason_network: "network error",
+    llm_failover_reason_rate_limit: "rate limited",
+    llm_failover_reason_circuit_open: "paused after repeated failures",
+    llm_failover_reason_key_unavailable: "key unavailable",
+    llm_failover_reason_auth: "auth failed",
+    llm_failover_reason_other: "call failed",
     guard_token_budget_warn: "Token budget {{pct}}% used ({{spent}}/{{limit}})",
     guard_token_budget_exhausted: "Token budget exhausted ({{spent}}/{{limit}}) → wrap-up turn",
     guard_max_steps: "Step limit reached ({{steps}}/{{max}}) → wrap-up turn",

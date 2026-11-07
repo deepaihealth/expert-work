@@ -49,7 +49,7 @@ const LANE_OF_KIND: Record<Exclude<TrajectoryRow["kind"], "think">, LedgerLane> 
   user: 0, system: 0, memory: 0,
   assistant: 1, reflect: 1, compaction: 1,
   tool: 2, subagent: 2, plan: 2,
-  retry: 2, error: 2, approval: 2, guard: 2, gap: 2,
+  retry: 2, error: 2, approval: 2, guard: 2, gap: 2, failover: 2,
 };
 
 function laneOf(row: TrajectoryRow): LedgerLane {

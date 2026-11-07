@@ -35,6 +35,12 @@ CompactionEventSink = Callable[[dict[str, Any]], Awaitable[None]]
 #: ``token_sink_from_config`` and feeds it to a TokenSink.
 TOKEN_SINK_KEY = "token_event_sink"  # noqa: S105 — a config dict key name, not a credential
 
+#: B-297 PR2 — config key of the run's console-only ``llm_failover`` frame sink
+#: (an LLM call switched to a backup model). Injected by ``sse.run_agent`` like
+#: the token sink; ``agent_node`` binds it to its step via
+#: :func:`orchestrator.llm.failover.failover_frames`.
+FAILOVER_SINK_KEY = "llm_failover_event_sink"
+
 #: B-66 — ``config["configurable"][LLM_CACHE_BYPASS_KEY] is True`` 时,本 run 的每次 LLM
 #: 调用都跳过 E.13 响应缓存的**查找**(写入照常)。``:regenerate`` 的 run 带它:重放的
 #: [System, Human] 与原轮字节相同,不跳过就必然命中、把旧答案原样端回来。设置方是
@@ -134,4 +140,12 @@ def token_sink_from_config(config: RunnableConfig) -> TokenEventSink | None:
     """
     configurable = config.get("configurable") or {}
     sink = configurable.get(TOKEN_SINK_KEY)
+    return sink if callable(sink) else None
+
+
+def failover_sink_from_config(config: RunnableConfig) -> TokenEventSink | None:
+    """Lift the run's ``llm_failover`` frame sink out of ``config`` (B-297 PR2);
+    ``None`` when the driver wired none (the node then publishes no notice)."""
+    configurable = config.get("configurable") or {}
+    sink = configurable.get(FAILOVER_SINK_KEY)
     return sink if callable(sink) else None

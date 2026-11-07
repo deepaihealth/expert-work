@@ -60,7 +60,7 @@ export interface AuxNodeItem {
 export interface MarkerItem {
   /** ``gap``(P3 PR-1)= 这一段帧在**这条连接**上补不到了 —— 只在 live 分支出现;
    *  回放遇到落库空洞是静默跳过的,两条分支的缺口契约不同。 */
-  kind: "compaction" | "retry" | "error" | "approval" | "guard" | "end" | "gap";
+  kind: "compaction" | "retry" | "error" | "approval" | "guard" | "end" | "gap" | "failover";
   seq: number;
   receivedAt: string;
   serverMs?: number | null;
@@ -111,6 +111,23 @@ function textOf(v: unknown): string | null {
 function optInt(v: unknown): number | undefined {
   return typeof v === "number" && Number.isFinite(v) ? v : undefined;
 }
+/** B-297 PR2 — console-only run event: an agent step's LLM call switched to a
+ *  backup model. ``{step, from_model, to_model, reason}``; never reaches the
+ *  external API stream. */
+export const LLM_FAILOVER_EVENT = "llm_failover";
+/** Reason codes the backend sends (bounded vocabulary, B-297). */
+const FAILOVER_REASONS = new Set([
+  "first_token_timeout", "reasoning_stall", "server_error", "network", "rate_limit",
+  "circuit_open", "key_unavailable", "auth", "other",
+]);
+function failoverText(data: unknown): string {
+  const d = obj(data);
+  const reason = FAILOVER_REASONS.has(str(d.reason)) ? str(d.reason) : "other";
+  return i18n.t("console_runtime.llm_failover", {
+    to: str(d.to_model), from: str(d.from_model),
+    why: i18n.t(`console_runtime.llm_failover_reason_${reason}`),
+  });
+}
 function durationOf(ch: Record<string, unknown>): number | null {
   const v = ch._duration_ms;
   return typeof v === "number" && Number.isFinite(v) ? v : null;
@@ -157,6 +174,10 @@ export function parseTimeline(events: readonly SseEvent[]): TimelineItem[] {
         text: i18n.t("console_runtime.retry", {
           n: int(d.attempt), error: str(d.error_class), backoff: int(d.backoff_s),
         }) });
+      continue;
+    }
+    if (evt.event === LLM_FAILOVER_EVENT) {
+      push({ kind: "failover", receivedAt: at, tone: "warn", text: failoverText(evt.data) });
       continue;
     }
     if (evt.event === "error") {

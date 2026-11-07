@@ -4,12 +4,16 @@
 ``response_metadata`` 盖 :data:`STALLED_AFTER_S` 章(只在厂商还没发结束原因时盖:发了
 ``length`` 的归 B-105 截断管)。半截照旧交回 —— 规划 / 复盘把空回复当 fail-open,不能让它们
 跟着报错;只有主循环用 :func:`stalled_without_answer` 判出「只有思考」后让 run 可见地失败。
+
+B-297 PR2 —— 还有别的厂商组可用时,「只有思考」的半截不再交回:路由丢掉它,抛
+:class:`LLMReasoningStallError` 换下一组重做这一步(:func:`has_visible_output` 判「只有思考」)。
 """
 
 from __future__ import annotations
 
 from langchain_core.messages import AIMessage
 
+from expert_work.runtime.middleware import LLMStreamStaleError
 from orchestrator.llm.structured_output import _message_text
 
 #: 路由盖的章:值 = 触发的停顿秒数。
@@ -36,3 +40,23 @@ def stalled_without_answer(message: AIMessage) -> float | None:
     if _message_text(message).strip():
         return None
     return float(idle_s)
+
+
+def has_visible_output(message: AIMessage) -> bool:
+    """半截里有没有丢不得的东西:正文(去空白后非空),或会被执行的工具调用。
+
+    中断时组装器(``build(interrupted=True)``)已经把参数没写完整的工具调用剔掉了 ——
+    那种调用从来不会执行,所以不算;参数恰好已是完整 JSON 的会留下、会执行,算。
+    """
+    if message.tool_calls or message.invalid_tool_calls:
+        return True
+    return bool(_message_text(message).strip())
+
+
+class LLMReasoningStallError(LLMStreamStaleError):
+    """B-297 PR2 —— 流式输出只有思考就停住 / 出错,且后面还有别的厂商组。
+
+    路由丢掉这次的半截、换下一组重做这一步。继承 :class:`LLMStreamStaleError`:E.4 记一次失败
+    (熔断计数)、不原地重试;路由按厂商级失败跳到下一组。只在「没有可见输出 + 还有别的组」时
+    抛,其余情形保持原样(B-186 的半截 / ``LLMStreamInterruptedError``)。
+    """
