@@ -392,11 +392,19 @@ class _RecordingRefresher:
     def __init__(self) -> None:
         self.seen: list[str] = []
         self.unusable: set[str] = set()
+        self.gates: dict[str, asyncio.Event] = {}  # one-shot: hold this refresh mid-way
+        self.entered = asyncio.Event()
+        self.completed: list[str] = []  # refreshes that ran to the end (token persisted)
 
     async def ensure_fresh(
         self, record: McpOAuthConnectionRecord
     ) -> McpOAuthConnectionRecord | None:
         self.seen.append(record.name)
+        gate = self.gates.pop(record.name, None)
+        if gate is not None:
+            self.entered.set()  # e.g. the token endpoint has rotated the refresh token …
+            await gate.wait()  # … and the new one is not persisted yet
+        self.completed.append(record.name)
         return None if record.name in self.unusable else record
 
 
@@ -728,3 +736,30 @@ async def test_retry_rereads_the_catalog_even_without_the_bus_event() -> None:
     await rig.run_retry()
     assert rig.dialer.calls == ["linear", "notion"]
     assert await rig.get() is p1
+
+
+@pytest.mark.asyncio
+async def test_close_all_lets_an_in_flight_retry_refresh_finish() -> None:
+    """Shutdown cancels retries; a cancel landing after the token endpoint rotated the
+    refresh token but before the new one was persisted would lose it (the next refresh
+    then marks the connection revoked). The refresh runs to the end — and close_all
+    waits for it — while the dial that would follow is still cancelled."""
+    rig = await _user_rig("linear", "notion", down={"notion"})
+    await rig.get()
+    rig.dialer.down.clear()
+    gate = rig.refresher.gates["notion"] = asyncio.Event()
+    rig.now["t"] = _FAILED_RETRY_S
+    await rig.get()
+    async with asyncio.timeout(1):
+        await rig.refresher.entered.wait()  # the retry is mid-refresh
+    (retry,) = rig.svc._retry_tasks
+
+    closing = asyncio.create_task(rig.svc.close_all())
+    await rig.settle()
+    assert not closing.done()  # shutdown waits for the refresh to persist …
+    gate.set()
+    async with asyncio.timeout(1):
+        await closing
+    assert retry.cancelled()
+    assert rig.refresher.completed == ["linear", "notion", "notion"]  # … which completed
+    assert rig.dialer.calls == ["linear", "notion"]  # and nothing was dialed / attached after

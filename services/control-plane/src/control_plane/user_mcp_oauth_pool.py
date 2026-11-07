@@ -121,6 +121,8 @@ class UserMcpOAuthPoolService:
         self._retry_pending: set[tuple[UUID, str]] = set()
         self._retry_tasks: set[asyncio.Task[None]] = set()
         self._closed = False
+        # 重拨里正在跑的令牌刷新(不随重拨取消,close_all 等它们落完库)。
+        self._refreshing: set[asyncio.Future[MCPServerConfig | None]] = set()
 
     async def _key_lock(self, key: tuple[UUID, str]) -> asyncio.Lock:
         async with self._locks_guard:
@@ -333,8 +335,13 @@ class UserMcpOAuthPoolService:
             entry = entries.get(record.catalog_id)
             if entry is not None and not entry.enabled:
                 continue  # B-248 —— 平台停用了:不拨,重新打开后的下一次重拨再接上
+            # 刷新单独成任务、不随重拨被取消:令牌端点可能已轮换了 refresh token、
+            # 新的还没落库,半路掐掉就丢了(下次刷新判撤销)。close_all 会等它落完。
+            refresh = asyncio.ensure_future(self._usable_config(record, entries))
+            self._refreshing.add(refresh)
+            refresh.add_done_callback(self._refreshing.discard)
             try:
-                config = await self._usable_config(record, entries)
+                config = await asyncio.shield(refresh)
             except Exception as exc:
                 logger.warning(
                     "user_mcp_oauth_pool.retry_refresh_failed err=%s", type(exc).__name__
@@ -508,6 +515,8 @@ class UserMcpOAuthPoolService:
         for task in retries:
             task.cancel()
         await asyncio.gather(*retries, return_exceptions=True)
+        # B-292 —— 被取消的重拨留下的令牌刷新:等它把轮换后的 refresh token 落库。
+        await asyncio.gather(*list(self._refreshing), return_exceptions=True)
         for pool in pools:
             try:
                 await pool.close_all()
