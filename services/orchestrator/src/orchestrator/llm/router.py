@@ -69,14 +69,15 @@ from expert_work.runtime.middleware import (
 from expert_work.runtime.tokens import TokenEstimator, default_estimator
 from orchestrator.llm.failover import (
     StickyRouteStore,
+    StreamAttempt,
     announce_failover,
     default_sticky_store,
     failover_reason,
     fallback_first_token_timeout,
+    keep_first_stall,
     observe_first_progress,
     plan_walk,
     record_failover,
-    redo_reasoning_only,
     remember_route,
 )
 from orchestrator.llm.oauth_provider import OAuthCapableProvider
@@ -462,7 +463,18 @@ class LLMRouter:
     ) -> AIMessage:
         sink_token = _delta_sink.set(on_delta)
         try:
-            return await self._dispatch(messages=messages, tools=tools, output_schema=output_schema)
+            with keep_first_stall() as stalls:
+                try:
+                    return await self._dispatch(
+                        messages=messages, tools=tools, output_schema=output_schema
+                    )
+                except LLMError:
+                    if not stalls:
+                        raise
+                    # B-297 PR2 — the redo found no answer either: give the
+                    # caller what it would have got without the redo.
+                    logger.warning("llm_router.redo_failed_keeping_original_outcome")
+                    return stalls[0].original_outcome()
         finally:
             _delta_sink.reset(sink_token)
 
@@ -814,6 +826,7 @@ class LLMRouter:
         first_progress = False
         finished = False
         started = time.monotonic()
+        attempt = StreamAttempt(handle.key, sink, it, _redo_elsewhere.get())
 
         # Phase 1 — wait for the first progress delta.
         while not first_progress:
@@ -833,6 +846,7 @@ class LLMRouter:
                     f"first_token_timeout_s={first_token_timeout_s}"
                 ) from exc
             assembler.add(delta)
+            attempt.saw(delta)
             if sink is not None:
                 await sink(delta)
             first_progress = delta.has_progress
@@ -857,25 +871,26 @@ class LLMRouter:
                 partial = assembler.build(interrupted=True)
                 if finished or self.idle_timeout_s is None:
                     return partial
-                await redo_reasoning_only(
-                    handle.key, partial, sink, f"idle {self.idle_timeout_s}s", _redo_elsewhere.get()
-                )
                 # B-186 — the agent loop fails a reasoning-only partial;
                 # planner / reflection keep treating it as an empty reply.
                 metadata = {**partial.response_metadata, STALLED_AFTER_S: self.idle_timeout_s}
-                return partial.model_copy(update={"response_metadata": metadata})
+                stamped = partial.model_copy(update={"response_metadata": metadata})
+                # B-297 PR2 — unless it is reasoning only and a backup can redo it.
+                await attempt.redo_elsewhere(partial, f"idle {self.idle_timeout_s}s", stamped)
+                return stamped
             except LLMError as exc:
                 # Post-first-token hard error → terminal, no fallback
                 # (unless only reasoning came out — B-297 PR2).
                 partial = assembler.build(interrupted=True)
-                await redo_reasoning_only(
-                    handle.key, partial, sink, type(exc).__name__, _redo_elsewhere.get()
-                )
-                raise LLMStreamInterruptedError(
+                interrupted = LLMStreamInterruptedError(
                     f"provider {handle.key!r} stream failed after first token: {exc}",
                     partial=partial,
-                ) from exc
+                )
+                interrupted.__cause__ = exc
+                await attempt.redo_elsewhere(partial, type(exc).__name__, interrupted)
+                raise interrupted from exc
             assembler.add(delta)
+            attempt.saw(delta)
             if sink is not None:
                 await sink(delta)
             finished = finished or delta.finish_reason is not None

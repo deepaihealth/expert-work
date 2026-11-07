@@ -5975,7 +5975,7 @@ const en: TranslationKeys = {
     error_generic: "Run error",
     compaction: "Compaction ×{{n}} · {{before}} → {{after}} tok",
     retry: "Retry #{{n}} · {{error}} · backing off {{backoff}}s",
-    llm_failover: "Switched to backup model {{to}} (primary {{from}}: {{why}})",
+    llm_failover: "Switched from {{from}} to {{to}} ({{why}})",
     llm_failover_reason_first_token_timeout: "no response",
     llm_failover_reason_reasoning_stall: "stalled after thinking",
     llm_failover_reason_server_error: "server error",

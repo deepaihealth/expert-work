@@ -277,6 +277,9 @@ class TokenSink:
         self._reasoning = StreamingRedactor(dlp=self._dlp, screen=self._screen)
         self._announced = set()
         self._reasoning_sent = False
+        # ``first_token_ms`` then times the backup's first delta, not the
+        # abandoned attempt's.
+        self.first_delta_at = None
         if sent:
             await self._publish({"step": self._step, "channel": "reasoning", "text": "\n\n"})
 

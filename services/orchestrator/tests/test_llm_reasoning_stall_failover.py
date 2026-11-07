@@ -17,18 +17,22 @@ from typing import Any
 from uuid import UUID, uuid4
 
 import pytest
-from langchain_core.messages import AIMessage
+from langchain_core.messages import AIMessage, HumanMessage
 from prometheus_client import REGISTRY
 
 from expert_work.common.context import reset_current_run_id, set_current_run_id
 from expert_work.runtime.middleware import (
     BreakerRegistry,
+    LLMClientError,
     LLMErrorHandlingMiddleware,
     LLMServerError,
     LLMStreamInterruptedError,
     LLMStreamStaleError,
     MiddlewareChain,
 )
+from orchestrator.graph_builder.planner import make_planner_node
+from orchestrator.graph_builder.streaming_redact import TokenSink
+from orchestrator.llm import failover as failover_mod
 from orchestrator.llm import router as router_mod
 from orchestrator.llm.failover import (
     FailoverNotice,
@@ -78,6 +82,9 @@ class _Scripted:
         return OpenAIStreamAssembler()
 
 
+_UNFINISHED_CALL = LLMDelta(
+    tool_calls=(ToolCallChunk(index=0, id="c1", name="write_file", args_fragment='{"pa'),)
+)
 _THINK_THEN_HANG = [LLMDelta(reasoning="let me "), LLMDelta(reasoning="think"), _Hang]
 _ANSWER = [
     LLMDelta(reasoning="backup thinks"),
@@ -176,25 +183,55 @@ async def test_reasoning_only_error_after_first_token_is_redone_on_the_backup() 
 
 
 @pytest.mark.asyncio
-async def test_an_unfinished_tool_call_does_not_count_as_visible() -> None:
-    # Its arguments never completed: the interrupted partial drops it, so it
-    # could never run — discarding the attempt loses nothing.
-    primary = _Scripted(
-        [
-            LLMDelta(reasoning="plan"),
-            LLMDelta(content="\n "),
-            LLMDelta(
-                tool_calls=(ToolCallChunk(index=0, id="c1", name="search", args_fragment='{"q":'),)
-            ),
-            _Hang,
-        ]
-    )
+async def test_an_unfinished_tool_call_counts_as_visible() -> None:
+    # Its arguments never completed, so the interrupted partial drops it and
+    # it could never run — but its name already went out as a preview
+    # (tool_args token → items ``item.added``). Redoing would leave that card
+    # without a ``done`` forever, so keep today's behaviour.
+    primary = _Scripted([LLMDelta(reasoning="plan"), _UNFINISHED_CALL, _Hang])
+    backup = _Scripted(list(_ANSWER))
+    router = _router((primary, "ds:flash", "ds:flash"), (backup, "qw:max", "qw:max"))
+    sink = _Sink()
+
+    msg = await router(messages=[], tools=[], on_delta=sink)
+
+    assert msg.tool_calls == []
+    assert stalled_without_answer(msg) == _IDLE
+    assert (backup.calls, sink.discards) == (0, 0)
+
+
+@pytest.mark.asyncio
+async def test_an_unfinished_tool_call_then_error_stays_terminal() -> None:
+    primary = _Scripted([LLMDelta(reasoning="plan"), _UNFINISHED_CALL, LLMServerError("502")])
     backup = _Scripted(list(_ANSWER))
     router = _router((primary, "ds:flash", "ds:flash"), (backup, "qw:max", "qw:max"))
 
-    msg = await router(messages=[], tools=[])
+    with pytest.raises(LLMStreamInterruptedError):
+        await router(messages=[], tools=[])
 
-    assert msg.content == "ok"
+    assert backup.calls == 0
+
+
+@pytest.mark.asyncio
+async def test_a_previewed_tool_card_is_never_orphaned_by_a_redo() -> None:
+    # The reviewer's shape: the real TokenSink publishes the tool preview; the
+    # attempt must not be discarded, so no paragraph break / backup output
+    # follows the preview and the agent loop ends the step as before (B-186).
+    published: list[dict[str, Any]] = []
+
+    async def pub(frame: dict[str, Any]) -> None:
+        published.append(frame)
+
+    token_sink = TokenSink(step=1, publish=pub, dlp=False, screen=False)
+    primary = _Scripted([LLMDelta(reasoning="thinking"), _UNFINISHED_CALL, _Hang])
+    backup = _Scripted(list(_ANSWER))
+    router = _router((primary, "ds:flash", "ds:flash"), (backup, "qw:max", "qw:max"))
+
+    msg = await router(messages=[], tools=[], on_delta=token_sink)
+
+    assert stalled_without_answer(msg) == _IDLE
+    assert [f["channel"] for f in published] == ["reasoning", "tool_args"]
+    assert backup.calls == 0
 
 
 @pytest.mark.asyncio
@@ -344,7 +381,7 @@ def test_visible_output_is_text_or_a_runnable_tool_call() -> None:
 
 
 def test_reasoning_stall_is_a_counted_not_retried_failover_error() -> None:
-    exc = LLMReasoningStallError("x")
+    exc = LLMReasoningStallError("x", outcome=AIMessage(content=""))
     assert isinstance(exc, LLMStreamStaleError)
     assert not isinstance(exc, LLMServerError)  # E.4 would retry it in place
     assert failover_reason(exc) == "reasoning_stall"
@@ -490,3 +527,121 @@ async def test_no_first_progress_observation_on_a_first_token_timeout() -> None:
     await router(messages=[], tools=[])
 
     assert _first_progress(key) == (0.0, 0.0)
+
+
+# ---------------------------------------------------------------------------
+# The redo never leaves a caller worse off than not redoing
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("backup_fails_with", [LLMServerError("503"), LLMClientError("400")])
+async def test_when_the_redo_also_fails_the_original_partial_comes_back(
+    backup_fails_with: Exception,
+) -> None:
+    primary = _Scripted(list(_THINK_THEN_HANG))
+    backup = _Scripted([backup_fails_with])
+    router = _router((primary, "ds:flash", "ds:flash"), (backup, "qw:max", "qw:max"))
+
+    msg = await router(messages=[], tools=[])
+
+    assert backup.calls == 1
+    assert stalled_without_answer(msg) == _IDLE
+    assert msg.additional_kwargs.get("reasoning_content") == "let me think"
+
+
+@pytest.mark.asyncio
+async def test_when_the_redo_also_fails_the_original_interruption_is_raised() -> None:
+    primary = _Scripted([LLMDelta(reasoning="hmm"), LLMServerError("mid-stream 502")])
+    backup = _Scripted([LLMServerError("503")])
+    router = _router((primary, "ds:flash", "ds:flash"), (backup, "qw:max", "qw:max"))
+
+    with pytest.raises(LLMStreamInterruptedError) as info:
+        await router(messages=[], tools=[])
+
+    assert isinstance(info.value.partial, AIMessage)
+    assert info.value.partial.additional_kwargs.get("reasoning_content") == "hmm"
+    assert backup.calls == 1
+
+
+@pytest.mark.asyncio
+async def test_the_planner_still_fails_open_when_the_redo_fails() -> None:
+    primary = _Scripted(list(_THINK_THEN_HANG))
+    backup = _Scripted([LLMServerError("503")])
+    node = make_planner_node(
+        _router((primary, "ds:flash", "ds:flash"), (backup, "qw:max", "qw:max"))
+    )
+
+    update = await node({"messages": [HumanMessage(content="do X")]}, {})  # type: ignore[typeddict-item]
+
+    assert [step.description for step in update["plan"].steps] == ["do X"]
+
+
+# ---------------------------------------------------------------------------
+# Abandoned stream closed; notice publish bounded
+# ---------------------------------------------------------------------------
+
+
+class _ClosableStream:
+    """Async iterator double with ``aclose``: reasoning, then the idle timer."""
+
+    def __init__(self) -> None:
+        self.closed = False
+        self._items: list[Any] = [LLMDelta(reasoning="r"), _Hang]
+
+    def __aiter__(self) -> _ClosableStream:
+        return self
+
+    async def __anext__(self) -> LLMDelta:
+        item = self._items.pop(0)
+        if item is _Hang:
+            raise TimeoutError
+        assert isinstance(item, LLMDelta)
+        return item
+
+    async def aclose(self) -> None:
+        self.closed = True
+
+
+@dataclass
+class _ClosableProvider:
+    streams: list[_ClosableStream] = field(default_factory=list)
+
+    def stream(self, *, messages: Any, tools: Any, output_schema: Any = None) -> _ClosableStream:
+        del messages, tools, output_schema
+        self.streams.append(_ClosableStream())
+        return self.streams[-1]
+
+    def new_stream_assembler(self) -> OpenAIStreamAssembler:
+        return OpenAIStreamAssembler()
+
+
+@pytest.mark.asyncio
+async def test_the_abandoned_stream_is_closed() -> None:
+    primary = _ClosableProvider()
+    backup = _Scripted(list(_ANSWER))
+    router = _router((primary, "ds:flash", "ds:flash"), (backup, "qw:max", "qw:max"))  # type: ignore[arg-type]
+
+    await router(messages=[], tools=[])
+
+    assert [s.closed for s in primary.streams] == [True]
+
+
+@pytest.mark.asyncio
+async def test_a_hanging_notice_publisher_cannot_hold_up_the_switch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import asyncio
+
+    monkeypatch.setattr(failover_mod, "FAILOVER_NOTICE_TIMEOUT_S", 0)
+    never = asyncio.Event()
+
+    async def hangs(frame: dict[str, Any]) -> None:
+        await never.wait()
+
+    primary, backup = _Scripted([LLMServerError("503")]), _Scripted(list(_ANSWER))
+    router = _router((primary, "ds:flash", "ds:flash"), (backup, "qw:max", "qw:max"))
+    with failover_frames(1, hangs):
+        msg = await router(messages=[], tools=[])
+
+    assert msg.content == "ok"

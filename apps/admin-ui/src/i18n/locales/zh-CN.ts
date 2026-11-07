@@ -2089,7 +2089,7 @@ const zhCN: TranslationKeys = {
     error_generic: "运行错误",
     compaction: "压缩 {{n}} 遍 · {{before}} → {{after}} tok",
     retry: "重试 #{{n}} · {{error}} · 退避 {{backoff}}s",
-    llm_failover: "已切换到备用模型 {{to}}（主模型 {{from}} {{why}}）",
+    llm_failover: "已从 {{from}} 切换到 {{to}}（{{why}}）",
     llm_failover_reason_first_token_timeout: "无响应",
     llm_failover_reason_reasoning_stall: "思考后停住",
     llm_failover_reason_server_error: "服务出错",

@@ -43,10 +43,11 @@ def stalled_without_answer(message: AIMessage) -> float | None:
 
 
 def has_visible_output(message: AIMessage) -> bool:
-    """半截里有没有丢不得的东西:正文(去空白后非空),或会被执行的工具调用。
+    """半截里有没有丢不得的东西:正文(去空白后非空),或工具调用。
 
-    中断时组装器(``build(interrupted=True)``)已经把参数没写完整的工具调用剔掉了 ——
-    那种调用从来不会执行,所以不算;参数恰好已是完整 JSON 的会留下、会执行,算。
+    只看组装好的半截:中断时组装器(``build(interrupted=True)``)已把参数没写完整的工具调用
+    剔掉。那种调用虽然不会执行,但工具名已作为预览流出去了,所以路由判「能不能丢掉重做」时
+    另外看流里出没出现过带名字的工具调用(``failover.StreamAttempt``)。
     """
     if message.tool_calls or message.invalid_tool_calls:
         return True
@@ -59,4 +60,17 @@ class LLMReasoningStallError(LLMStreamStaleError):
     路由丢掉这次的半截、换下一组重做这一步。继承 :class:`LLMStreamStaleError`:E.4 记一次失败
     (熔断计数)、不原地重试;路由按厂商级失败跳到下一组。只在「没有可见输出 + 还有别的组」时
     抛,其余情形保持原样(B-186 的半截 / ``LLMStreamInterruptedError``)。
+
+    ``outcome`` 是不重做时本该得到的结果(盖章的半截,或 ``LLMStreamInterruptedError``):
+    后面的组也没能答完时,路由交回它 —— 调用方看到的与改之前完全一样。
     """
+
+    def __init__(self, message: str, *, outcome: AIMessage | BaseException) -> None:
+        super().__init__(message)
+        self.outcome = outcome
+
+    def original_outcome(self) -> AIMessage:
+        """不重做时的结果:返回盖章的半截,或抛出原来那个中断错误。"""
+        if isinstance(self.outcome, BaseException):
+            raise self.outcome
+        return self.outcome

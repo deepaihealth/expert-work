@@ -787,3 +787,17 @@ async def test_discard_lets_the_backup_announce_its_tool_names() -> None:
     await sink(LLMDelta(tool_calls=(chunk,)))
 
     assert [f["name"] for f in frames if f["channel"] == "tool_args"] == ["search_web"] * 2
+
+
+@pytest.mark.asyncio
+async def test_discard_restarts_the_first_token_clock() -> None:
+    async def pub(f: dict) -> None:
+        return None
+
+    sink = TokenSink(step=1, publish=pub, dlp=False, screen=False)
+    await sink(LLMDelta(reasoning="abandoned"))
+    assert sink.first_delta_at is not None
+    await sink.discard_attempt()
+    assert sink.first_delta_at is None
+    await sink(LLMDelta(reasoning="backup"))
+    assert sink.first_delta_at is not None

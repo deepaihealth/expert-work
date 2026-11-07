@@ -24,6 +24,7 @@ time-to-first-progress histogram that validates the first-token caps above.
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import logging
 import threading
@@ -50,6 +51,7 @@ from expert_work.runtime.middleware import (
     LLMUnauthorizedError,
 )
 from expert_work.runtime.tokens import TokenEstimator, estimate_messages
+from orchestrator.llm.providers._streaming import LLMDelta
 from orchestrator.llm.stall import LLMReasoningStallError, has_visible_output
 
 logger = logging.getLogger(__name__)
@@ -200,8 +202,9 @@ async def announce_failover(from_group: str, to_group: str, reason: str) -> None
     listener = _failover_listener.get()
     if listener is None:
         return
+    notice = FailoverNotice(from_group=from_group, to_group=to_group, reason=reason)
     try:
-        await listener(FailoverNotice(from_group=from_group, to_group=to_group, reason=reason))
+        await asyncio.wait_for(listener(notice), FAILOVER_NOTICE_TIMEOUT_S)
     except Exception:
         logger.warning("llm_router.failover_notice_failed", exc_info=True)
 
@@ -389,31 +392,89 @@ def remember_route(
     logger.info("llm_router.sticky_set group=%s", served)
 
 
-async def redo_reasoning_only(
-    provider_key: str,
-    partial: AIMessage,
-    sink: object | None,
-    cause: str,
-    can_redo: bool,
-) -> None:
-    """A streaming attempt stalled / failed after its first progress delta.
+#: Seconds a switch notice may take to publish before the switch goes ahead
+#: without it (a slow event store must not delay the failover).
+FAILOVER_NOTICE_TIMEOUT_S = 2.0
+#: Seconds to wait for an abandoned provider stream to close.
+ABANDONED_STREAM_CLOSE_TIMEOUT_S = 1.0
 
-    With nothing visible yet (:func:`~orchestrator.llm.stall.has_visible_output`)
-    and another group to walk to (``can_redo`` —
-    :meth:`WalkPlan.can_redo_elsewhere`): discard the attempt (the sink drops
-    its streamed reasoning) and raise :class:`LLMReasoningStallError` so the
-    router redoes the call on the next group. Otherwise return, and the caller
-    keeps today's behaviour (B-186 partial / ``LLMStreamInterruptedError``).
-    """
-    if not can_redo or has_visible_output(partial):
+#: Per router call (:func:`keep_first_stall`): the reasoning-only stalls that
+#: were redone elsewhere, so the call can fall back to the first one's
+#: original outcome when no later group answers either.
+_stalls: ContextVar[list[LLMReasoningStallError] | None] = ContextVar(
+    "_llm_reasoning_stalls", default=None
+)
+
+
+@contextmanager
+def keep_first_stall() -> Iterator[list[LLMReasoningStallError]]:
+    """Scope of one router call: collects the reasoning-only stalls redone
+    elsewhere. If the call then fails, the router returns the first stall's
+    :meth:`~LLMReasoningStallError.original_outcome` instead — so a redo
+    never leaves a caller (agent loop, planner, reflection, memory) worse off
+    than not redoing: it gets exactly what it got before B-297 PR2."""
+    stalls: list[LLMReasoningStallError] = []
+    token = _stalls.set(stalls)
+    try:
+        yield stalls
+    finally:
+        _stalls.reset(token)
+
+
+async def _close_quietly(stream: object) -> None:
+    aclose = getattr(stream, "aclose", None)
+    if aclose is None:
         return
-    logger.warning(
-        "llm_router.reasoning_only_stall key=%s cause=%s (redoing on the next group)",
-        provider_key,
-        cause,
-    )
-    await discard_streamed_attempt(sink)
-    raise LLMReasoningStallError(
-        f"provider {provider_key!r} stopped after reasoning only ({cause}); "
-        "redoing the step on the next provider group"
-    )
+    try:
+        await asyncio.wait_for(aclose(), ABANDONED_STREAM_CLOSE_TIMEOUT_S)
+    except Exception:
+        logger.warning("llm_router.abandoned_stream_close_failed", exc_info=True)
+
+
+class StreamAttempt:
+    """One streaming attempt the router may abandon after its first progress
+    delta (B-297 PR2).
+
+    ``saw`` is fed every delta; :meth:`redo_elsewhere` decides at a stall /
+    mid-stream error. Discardable = nothing visible was produced: no answer
+    text and no tool call — including an unfinished one, whose name was
+    already published as a preview (``tool_args`` token frame → items
+    ``item.added``) even though the interrupted partial drops it.
+    """
+
+    def __init__(self, provider_key: str, sink: object | None, stream: object, can_redo: bool):
+        self._provider_key = provider_key
+        self._sink = sink
+        self._stream = stream
+        self._can_redo = can_redo
+        self._tool_named = False
+
+    def saw(self, delta: LLMDelta) -> None:
+        if not self._tool_named and any(tc.name for tc in delta.tool_calls):
+            self._tool_named = True
+
+    async def redo_elsewhere(
+        self, partial: AIMessage, cause: str, outcome: AIMessage | BaseException
+    ) -> None:
+        """Abandon the attempt and raise :class:`LLMReasoningStallError` when it
+        produced reasoning only and another group can redo it (``can_redo`` —
+        :meth:`WalkPlan.can_redo_elsewhere`). Otherwise return; the caller then
+        produces ``outcome`` (B-186 partial / ``LLMStreamInterruptedError``)."""
+        if not self._can_redo or self._tool_named or has_visible_output(partial):
+            return
+        logger.warning(
+            "llm_router.reasoning_only_stall key=%s cause=%s (redoing on the next group)",
+            self._provider_key,
+            cause,
+        )
+        await discard_streamed_attempt(self._sink)
+        await _close_quietly(self._stream)
+        stall = LLMReasoningStallError(
+            f"provider {self._provider_key!r} stopped after reasoning only ({cause}); "
+            "redoing the step on the next provider group",
+            outcome=outcome,
+        )
+        stalls = _stalls.get()
+        if stalls is not None:
+            stalls.append(stall)
+        raise stall

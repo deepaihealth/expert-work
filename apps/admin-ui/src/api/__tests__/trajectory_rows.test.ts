@@ -167,7 +167,7 @@ describe("compactRowsOf", () => {
     ];
     const expected = {
       kind: "failover", status: "warn", eventIndexes: [0],
-      text: "已切换到备用模型 qwen3.8-max（主模型 deepseek-flash 思考后停住）",
+      text: "已从 deepseek-flash 切换到 qwen3.8-max（思考后停住）",
     };
     expect(compactRowsOf(events)).toEqual([expect.objectContaining(expected)]);
     expect(ledgerRowsOf(events, { text: "", attachmentNames: [], inputs: {} }).slice(1)).toEqual([

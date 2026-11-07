@@ -84,9 +84,9 @@ describe("parseTimeline", () => {
     const items = parseTimeline(events);
     expect(items.map((i) => i.kind)).toEqual(["failover", "failover", "failover"]);
     expect(items.map((i) => (i.kind === "failover" ? i.text : null))).toEqual([
-      "已切换到备用模型 qwen3.8-max（主模型 deepseek-flash 无响应）",
-      "已切换到备用模型 b（主模型 a 思考后停住）",
-      "已切换到备用模型 b（主模型 a 调用失败）",
+      "已从 deepseek-flash 切换到 qwen3.8-max（无响应）",
+      "已从 a 切换到 b（思考后停住）",
+      "已从 a 切换到 b（调用失败）",
     ]);
     expect(items.every((i) => i.kind === "failover" && i.tone === "warn")).toBe(true);
   });
