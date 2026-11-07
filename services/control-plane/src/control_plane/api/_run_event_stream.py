@@ -32,7 +32,7 @@ from expert_work.runtime.stream_bridge import (
     StreamBridge,
     is_end,
 )
-from orchestrator.sse import SYSTEM_PROMPT_EVENT, end_frame_data, format_sse
+from orchestrator.sse import LLM_FAILOVER_EVENT, SYSTEM_PROMPT_EVENT, end_frame_data, format_sse
 from orchestrator.stream_items import (
     STREAM_FORMAT_ITEMS,
     STREAM_FORMAT_LEGACY,
@@ -52,12 +52,13 @@ logger = logging.getLogger(__name__)
 #: 第一页就误判收尾,把后面的事件静默丢掉。要调只能连 store 上限一起调。
 EVENT_PAGE_LIMIT: int = _RUN_STORE_MAX_LIST_LIMIT
 
-#: 对外平面(API key)恒不可见的帧集合 —— 目前只有 ``system_prompt``
+#: 对外平面(API key)恒不可见的帧集合 —— ``system_prompt``
 #: (PR-A.3 §十.1 服务端合成的系统提示词全文,是控制台调试专用的可观测性
-#: 帧,不是产品输出)。与 ``orchestrator.sse.sse_consumer`` 的同名参数同源
+#: 帧,不是产品输出)与 ``llm_failover``(B-297 PR2,换用备用模型的控制台提示;
+#: 用户拍板不新增对外事件)。与 ``orchestrator.sse.sse_consumer`` 的同名参数同源
 #: 常量,两条对外调用路径(这个模块的回放/live-接合 + 那个模块的
 #: stream-mode SSE consumer)因此共享同一份"对外隐藏什么"的定义,不会分叉。
-EXTERNAL_HIDDEN_EVENTS: frozenset[str] = frozenset({SYSTEM_PROMPT_EVENT})
+EXTERNAL_HIDDEN_EVENTS: frozenset[str] = frozenset({SYSTEM_PROMPT_EVENT, LLM_FAILOVER_EVENT})
 
 #: ``RunStatus`` → 对外 ``end`` 帧的 status。词表与 ``sse.py`` 的
 #: ``_EXTERNAL_END_STATUS`` 同源(见 ``EXTERNAL_END_STATUSES``):

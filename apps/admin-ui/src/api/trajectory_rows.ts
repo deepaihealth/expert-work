@@ -53,7 +53,7 @@ export type MemoryRow = RowBase & {
   background?: MemoryWritebackResult;
 };
 export type ReflectRow = RowBase & { kind: "reflect"; verdict: "pass" | "revise"; detail: Record<string, unknown> };
-export type MarkerRow = RowBase & { kind: "compaction" | "retry" | "error" | "approval" | "guard" | "gap"; text: string };
+export type MarkerRow = RowBase & { kind: "compaction" | "retry" | "error" | "approval" | "guard" | "gap" | "failover"; text: string };
 export type CompactRow = ThinkRow | ToolRow | SubagentRow | PlanRow | MemoryRow | ReflectRow | MarkerRow;
 
 export type UserRow = RowBase & { kind: "user"; text: string; attachmentNames: string[]; inputs: Record<string, string> };

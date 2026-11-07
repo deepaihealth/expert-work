@@ -114,6 +114,7 @@ PUBLISHED_EVENTS: frozenset[str] = frozenset(
         "approval",
         "error",
         "token",
+        "llm_failover",
     }
 )
 
@@ -130,10 +131,10 @@ PASSTHROUGH_EVENTS: frozenset[str] = PUBLISHED_EVENTS - CONVERTED_EVENTS
 #: **这条连接**的状况,不是 run 的事件。
 CONNECTION_EVENTS: frozenset[str] = frozenset({"end", "gap", "truncated"})
 
-#: items 模式下第三方能在 wire 上看到的全部事件。``system_prompt`` 对外恒隐藏
-#: (``EXTERNAL_HIDDEN_EVENTS``),所以不在其中。
+#: items 模式下第三方能在 wire 上看到的全部事件。``system_prompt`` 与
+#: ``llm_failover``(B-297 PR2)对外恒隐藏(``EXTERNAL_HIDDEN_EVENTS``),所以不在其中。
 ITEMS_WIRE_EVENTS: frozenset[str] = (
-    (PASSTHROUGH_EVENTS - {"system_prompt"}) | ITEM_EVENTS | CONNECTION_EVENTS
+    (PASSTHROUGH_EVENTS - {"system_prompt", "llm_failover"}) | ITEM_EVENTS | CONNECTION_EVENTS
 )
 
 #: ``item.delta`` 的 ``field`` 取值。工具参数今天根本不流式,所以没有 ``args``

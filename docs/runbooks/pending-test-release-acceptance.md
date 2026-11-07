@@ -2388,3 +2388,74 @@ asyncio.run(main())
 - [ ] **107.10 收尾**:删 `b297-stub` pod 与服务、五个临时智能体、临时 key、会话与终端用户;删掉加过的 `self-hosted` 租户覆盖凭据;再核一次平台 `self-hosted` 凭据与 107.8 前置的记录一致。
 
 **生产**:本条没有生产步骤(不在生产造故障)。
+
+## §108 主模型只出了思考就卡住时换备用重做这一步;控制台显示「已从 X 切换到 Y」(B-297 PR2)
+
+**背景**:11-07 测试环境主模型故障期间,最后一步先流出一些思考、然后不再出字,45 秒后按 B-186 以「思考后停顿」报错结束 —— 已经出过增量就算绑定在这家,不转备用。现在:只出了思考(没有正文,也没流出过任何工具调用)且后面有备用模型组时,丢掉这次、在备用上重做这一步;已经出过正文或工具调用(哪怕参数没写完 —— 工具名已作为预览发出去了)、或没有备用组时行为不变;备用也没答上时,结果与不重做时一样。控制台轨迹多一行「已从 … 切换到 …」,对外不新增任何事件。
+
+**怎么进(只在测试环境)**:沿用 §107 的桩 pod `b297-stub` 与做法(固定打同一个 control-plane pod;§107 做完未收尾时可直接接着用;若已收尾,按 §107 重建桩和凭据)。
+
+- **桩加两个流式模式**:把 §107 脚本的 `do_POST` 换成下面这版(其余不变,重启桩)。`think-hang`:按 OpenAI 流式格式回 3 段 `reasoning_content` 后不再发、600 秒不断开;`text-hang`:3 段思考 + 1 段正文「半句」后同样挂住;`tool-hang`:3 段思考 + 一个工具调用的名字(`list_files`)和半截参数后同样挂住。其它模式照 §107。
+
+  ```python
+  import http.server, json, os, time
+  def chunk(delta):
+      body = {"id": "s", "object": "chat.completion.chunk", "model": "stub",
+              "choices": [{"index": 0, "delta": delta, "finish_reason": None}]}
+      return f"data: {json.dumps(body, ensure_ascii=False)}\n\n".encode()
+  class H(http.server.BaseHTTPRequestHandler):
+      def do_POST(self):
+          self.rfile.read(int(self.headers.get("content-length", 0)))
+          mode = open("/tmp/mode").read().strip() if os.path.exists("/tmp/mode") else "503"
+          key = self.headers.get("authorization", "")[-2:]
+          print(time.strftime("%H:%M:%S"), "POST", mode, "key", key, flush=True)
+          if mode in ("think-hang", "text-hang", "tool-hang"):
+              self.send_response(200)
+              self.send_header("content-type", "text/event-stream")
+              self.end_headers()  # HTTP/1.0:正文一直读到断开,不用分块
+              parts = [{"role": "assistant", "reasoning_content": "先想一想"},
+                       {"reasoning_content": "这一步要做什么"}, {"reasoning_content": "再看看"}]
+              if mode == "text-hang":
+                  parts.append({"content": "半句"})
+              if mode == "tool-hang":
+                  parts.append({"tool_calls": [{"index": 0, "id": "call_stub", "type": "function",
+                                                "function": {"name": "list_files", "arguments": '{"pa'}}]})
+              for d in parts:
+                  self.wfile.write(chunk(d))
+                  self.wfile.flush()
+                  time.sleep(0.5)
+              time.sleep(600)
+              return
+          if mode == "hang":
+              time.sleep(600)
+              return
+          status = 503
+          if mode == "429" or (mode == "perkey" and key == "k0"):
+              status = 429
+          self.send_response(status)
+          if mode == "429":
+              self.send_header("retry-after", "40")
+          self.send_header("content-type", "application/json")
+          self.end_headers()
+          self.wfile.write(b'{"error":{"message":"stub"}}')
+  http.server.ThreadingHTTPServer(("", 8080), H).serve_forever()
+  ```
+- **临时智能体**(写法、「全部」那条限制与 §107 相同;各用独立模型名,熔断键互不影响):
+  - `acc-b297-think`:主模型 `name: b297-stub-think`,备用同 §107;
+  - `acc-b297-text`:主模型 `name: b297-stub-text`,备用同 §107;
+  - `acc-b297-think-solo`:只有 `b297-stub-think-solo`,没有备用;
+  - `acc-b297-tool`:主模型 `name: b297-stub-tool`,备用同 §107(108.5 用)。
+  - `idle_timeout_s` 不写(默认 45 秒)。
+- 提示词同 §107(让模型先调一次工具再回答)。在**调试台**发(看实时视图),另用对外 key 按 `mode: "stream"` 再发一轮(看对外流),每轮 `curl -N` 存下对外 SSE 原文。看同一 pod 的日志和 `/metrics`。**花费**:几轮短对话由备用模型回答,< ¥1。
+
+- [ ] **108.1 只出思考就卡住 → 约 45 秒后在备用上重做,run 成功**:桩切 `think-hang`。调试台 `acc-b297-think` 发一轮,记下桩收到 POST 的时刻和备用开始出字的时刻。判据:桩收到 **1 个** POST;约 45 秒后 pod 日志依次有 `llm_router.idle_timeout key=self-hosted:b297-stub-think deadline_s=45.0`、`llm_router.reasoning_only_stall key=self-hosted:b297-stub-think cause=idle 45.0s`、`llm_router.provider_failed … err=LLMReasoningStallError`、`llm_router.sticky_set group=<备用>`;备用随即应答;run `success`,答案来自备用;同一轮后面的步骤不再打桩;`expert_work_llm_failover_total{from_group="self-hosted:b297-stub-think",reason="reasoning_stall"}` +1。**没修好时**:45 秒后 run 以「模型思考后停顿超过 45 秒…」报错结束,备用一次没被调用。
+- [ ] **108.2 控制台显示切换,实时视图丢掉被放弃的思考**:看 108.1 那一轮。判据:调试台实时视图里,桩那 3 段思考在切换时消失、换成备用模型的思考;轨迹 / 时间线在这一步有一行 FAILOVER「已从 b297-stub-think 切换到 <备用模型名>(思考后停住)」;刷新页面后从对话记录 / Run 详情重放,这一行仍在。**没修好时**:没有这一行;实时视图里桩的思考和备用的思考连在一起。
+- [ ] **108.3 对外流没有新事件类型**:对外 key 按 `mode: "stream"` 用 `acc-b297-think` 发一轮(此时熔断可能已累计,无所谓:桩被跳过时同样有切换,只是没有思考可丢),另取 108.1 那一轮的 run id 调 `GET /v1/agents/{agent_code}/runs/{run_id}/events?user_id=…` 回放(legacy 与 `stream_format=items` 各一次)。判据:三份 SSE 里出现的 `event:` 名都在既有集合内(legacy:`metadata`/`updates`/`token`/`plan`/`worker`/`guard`/`compaction`/`retry`/`approval`/`error`/`end`/`gap`/`truncated`;items:`item.added`/`item.delta`/`item.done` 加 `metadata`/`guard`/`compaction`/`retry`/`worker`/`end`/`gap`/`truncated`),**没有** `llm_failover`;实时那份的 token 帧里能看到桩的思考、一段 `"\n\n"`、再是备用的思考与回答(回放不含 token 帧)。**判据红的情形**:出现 `llm_failover` 或任何新事件名。
+- [ ] **108.4 已出正文 → 行为不变**:桩切 `text-hang`。调试台 `acc-b297-text` 发一轮。判据:桩收到 1 个 POST;约 45 秒后 `llm_router.idle_timeout key=self-hosted:b297-stub-text …`,**没有** `reasoning_only_stall`,备用**没被调用**,这一步以「半句」结束(run 照以前的方式往下走或结束);没有 FAILOVER 行。**判据红的情形**:备用被调用(已经给用户看过的正文被丢掉重做)。
+- [ ] **108.5 已流出工具名(参数没写完)→ 行为不变**:桩切 `tool-hang`。调试台 `acc-b297-tool` 发一轮,另用对外 key 按 `stream_format=items` 的 `mode: "stream"` 再发一轮。判据:桩每轮收到 1 个 POST;约 45 秒后 `llm_router.idle_timeout key=self-hosted:b297-stub-tool …`,**没有** `reasoning_only_stall`,备用**没被调用**,run 以「模型思考后停顿超过 45 秒…」报错结束(B-186 原样),没有 FAILOVER 行;对外流里 `list_files` 的工具卡之后没有备用模型的输出。**判据红的情形**:备用被调用 —— 对外流里会留下一张永远不收尾的工具卡。
+- [ ] **108.6 没有备用 → 行为不变**:桩切 `think-hang`。`acc-b297-think-solo` 发一轮。判据:约 45 秒后 run 以「模型思考后停顿超过 45 秒…」报错结束(B-186 原样),没有 `reasoning_only_stall`、没有 FAILOVER 行。
+- [ ] **108.7 首个增量耗时直方图**:在 §107 / §108 做完后读该 pod 的 `/metrics`。判据:有 `expert_work_llm_first_progress_seconds_bucket{provider_key="self-hosted:b297-stub-think",…}`(108.1 那次约 0.x 秒落在 `le="0.5"` / `le="1"`),备用模型的 `provider_key` 也有;§107.6 那个挂住的 `b297-stub-hang` **没有**这条直方图的样本(超时不记,只在 `expert_work_llm_stream_stale_total` 里)。**发测试后要读的**:跑一两天后按 `provider_key` 看真实模型的 p50 / p95 / p99(`histogram_quantile`),对照 PR1 的首 token 封顶(有备用时 60 秒、大上下文 120 秒):p99 明显低于 60 秒才说明封顶不会误伤正常请求;若大上下文请求的 p99 接近 60 秒,回来调封顶。
+- [ ] **108.8 日志与事件不带客户内容**:把本节出现的 `llm_router.*` 日志与库里这几轮的 `llm_failover` 事件行(`run_event` 表 `event_name='llm_failover'`)过一遍。判据:只有 provider:model / 模型名、原因码、步号、秒数,没有提示词、思考、回答。
+- [ ] **108.9 收尾**:删本节四个临时智能体及会话;桩与凭据按 §107.10 收尾。
+
+**生产**:本条没有生产步骤(不在生产造故障)。

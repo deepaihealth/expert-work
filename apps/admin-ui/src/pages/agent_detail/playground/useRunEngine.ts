@@ -25,6 +25,7 @@ import {
   type SseEvent,
   type ThreadMeta,
 } from "../../../api/sessions";
+import { LLM_FAILOVER_EVENT } from "../../../api/timeline";
 import { summarizeTurn } from "../../../api/turn_summary";
 import { isQueuedTurn, runIdOf } from "../../../components/console/console_turns";
 import { approvalItemFromEvent } from "../../../components/turn/ApprovalGate";
@@ -199,6 +200,8 @@ export function useRunEngine(args: {
           tokenStream.push(frame);
           return false;
         }
+        // B-297 PR2 —— 换模型提示:既进时间线,也让实时视图丢掉被放弃那次的思考。
+        if (frame.event === LLM_FAILOVER_EVENT) tokenStream.push(frame);
         frames.push(frame);
         // #5 — a dedicated ``approval`` event surfaces the gate
         // deterministically (no dependence on ``end`` or a post-stream poll).
@@ -312,6 +315,7 @@ export function useRunEngine(args: {
             tokenStream.push(frame);
             continue;
           }
+          if (frame.event === LLM_FAILOVER_EVENT) tokenStream.push(frame);
           frames.push(frame);
           setTurns((prev) =>
             prev.map((tn) =>

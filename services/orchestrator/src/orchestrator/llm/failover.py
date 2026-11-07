@@ -15,22 +15,31 @@ Three pieces the router composes:
   with bounded label values (groups are ``provider:model`` chain entries,
   reasons a fixed vocabulary), and :func:`breaker_key_for`, the breaker
   identity the E.4 middleware keys its shared circuit breakers by.
+
+PR2 adds the switch *notice* (:func:`announce_failover` → a console-only
+``llm_failover`` run event via :func:`failover_frames`), the discard signal for
+an abandoned reasoning-only attempt (:func:`discard_streamed_attempt`), and the
+time-to-first-progress histogram that validates the first-token caps above.
 """
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import logging
 import threading
 import time
 from collections import OrderedDict
-from collections.abc import Callable, Sequence
+from collections.abc import Awaitable, Callable, Iterator, Sequence
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass
+from typing import Any
 from uuid import UUID
 
-from langchain_core.messages import BaseMessage
+from langchain_core.messages import AIMessage, BaseMessage
 
-from expert_work.common.observability import expert_work_counter
+from expert_work.common.observability import expert_work_counter, expert_work_histogram
 from expert_work.runtime.middleware import (
     CircuitOpenError,
     LLMAuthError,
@@ -42,6 +51,8 @@ from expert_work.runtime.middleware import (
     LLMUnauthorizedError,
 )
 from expert_work.runtime.tokens import TokenEstimator, estimate_messages
+from orchestrator.llm.providers._streaming import LLMDelta
+from orchestrator.llm.stall import LLMReasoningStallError, has_visible_output
 
 logger = logging.getLogger(__name__)
 
@@ -52,9 +63,21 @@ _llm_failover_total = expert_work_counter(
     ("from_group", "to_group", "reason"),
 )
 
+#: PR2 — seconds from the start of a streaming attempt to its first progress
+#: delta (reasoning counts). Validates the first-token caps below: a timeout
+#: observes nothing (``expert_work_llm_stream_stale_total`` counts those).
+_llm_first_progress_seconds = expert_work_histogram(
+    "expert_work_llm_first_progress_seconds",
+    "Streaming LLM attempts: time to the first progress delta, reasoning included (B-297).",
+    ("provider_key",),
+    buckets=(0.5, 1, 2, 5, 10, 20, 30, 45, 60, 90, 120, 180),
+)
+
 #: Reason vocabulary (bounded label values), most specific class first.
 _REASONS: tuple[tuple[type[BaseException], str], ...] = (
     (CircuitOpenError, "circuit_open"),
+    # PR2 — a subclass of LLMStreamStaleError, so it must come before it.
+    (LLMReasoningStallError, "reasoning_stall"),
     (LLMKeyUnavailableError, "key_unavailable"),
     (LLMAuthError, "auth"),
     (LLMUnauthorizedError, "auth"),
@@ -111,6 +134,121 @@ def record_failover(from_group: str, to_group: str, reason: str) -> None:
     _llm_failover_total.labels(from_group=from_group, to_group=to_group, reason=reason).inc()
 
 
+def observe_first_progress(provider_key: str, elapsed_s: float) -> None:
+    _llm_first_progress_seconds.labels(provider_key=provider_key).observe(elapsed_s)
+
+
+@dataclass(frozen=True)
+class FailoverNotice:
+    """One actual switch of a call from one provider group to the next."""
+
+    from_group: str
+    to_group: str
+    reason: str
+
+    def frame(self, step: int) -> dict[str, Any]:
+        """The console-only ``llm_failover`` run-event payload: model names
+        (the ``model`` part of ``provider:model``), the reason code and the
+        agent step — nothing from the conversation."""
+        return {
+            "step": step,
+            "from_model": _model_of(self.from_group),
+            "to_model": _model_of(self.to_group),
+            "reason": self.reason,
+        }
+
+
+def _model_of(group: str) -> str:
+    return group.split(":", 1)[-1]
+
+
+FailoverListener = Callable[[FailoverNotice], Awaitable[None]]
+
+#: Set by the agent node around its LLM call (:func:`failover_frames`); a
+#: ContextVar for the same reason as the router's delta sink — no threading
+#: through the caller protocol. Other LLM calls (planner, reflection,
+#: memory) leave it unset and record only the metric.
+_failover_listener: ContextVar[FailoverListener | None] = ContextVar(
+    "_llm_failover_listener", default=None
+)
+
+
+@contextmanager
+def failover_frames(
+    step: int, publish: Callable[[dict[str, Any]], Awaitable[None]] | None
+) -> Iterator[None]:
+    """While active, every actual switch publishes ``FailoverNotice.frame(step)``
+    through ``publish`` (``None`` → nothing is published)."""
+    listener: FailoverListener | None = None
+    if publish is not None:
+        sink = publish
+
+        async def _publish(notice: FailoverNotice) -> None:
+            await sink(notice.frame(step))
+
+        listener = _publish
+    token = _failover_listener.set(listener)
+    try:
+        yield
+    finally:
+        _failover_listener.reset(token)
+
+
+async def announce_failover(from_group: str, to_group: str, reason: str) -> None:
+    """A call moves from ``from_group`` to ``to_group``: count it and tell the
+    run's listener, if any. The notice is best-effort — a failing publisher
+    is logged, never allowed to fail the call or block the switch.
+
+    The wait is bounded (:data:`FAILOVER_NOTICE_TIMEOUT_S`) but the publish
+    itself is shielded: a slow event store finishes the write in the
+    background instead of being cancelled mid-write (which could burn a
+    sequence number, or persist a frame that never went out live)."""
+    record_failover(from_group, to_group, reason)
+    listener = _failover_listener.get()
+    if listener is None:
+        return
+    notice = FailoverNotice(from_group=from_group, to_group=to_group, reason=reason)
+    task = asyncio.ensure_future(listener(notice))
+    _pending_notices.add(task)
+    task.add_done_callback(_notice_done)
+    try:
+        await asyncio.wait_for(asyncio.shield(task), FAILOVER_NOTICE_TIMEOUT_S)
+    except TimeoutError:
+        logger.warning(
+            "llm_router.failover_notice_slow timeout_s=%s (still publishing)",
+            FAILOVER_NOTICE_TIMEOUT_S,
+        )
+    except Exception:
+        # The publisher's own failure: ``_notice_done`` logs it once.
+        return
+
+
+#: Notices still publishing after the bounded wait (strong refs until done).
+_pending_notices: set[asyncio.Future[None]] = set()
+
+
+def _notice_done(task: asyncio.Future[None]) -> None:
+    _pending_notices.discard(task)
+    if task.cancelled():
+        return
+    exc = task.exception()
+    if exc is not None:
+        logger.warning("llm_router.failover_notice_failed", exc_info=exc)
+
+
+async def discard_streamed_attempt(sink: object | None) -> None:
+    """The router abandons a streaming attempt whose deltas already reached
+    ``sink``: tell a sink that supports it (``discard_attempt``) to drop that
+    attempt's buffered state before the backup's deltas arrive."""
+    discard = getattr(sink, "discard_attempt", None)
+    if discard is None:
+        return
+    try:
+        await discard()
+    except Exception:
+        logger.warning("llm_router.sink_discard_failed", exc_info=True)
+
+
 def breaker_key_for(handle_key: str, secret_ref: str, base_url: str | None) -> str:
     """Breaker identity for one handle: ``<provider:model[#idx]>@<fingerprint>``.
 
@@ -162,6 +300,13 @@ class WalkPlan:
         group. The E.4 middleware refuses an OPEN breaker (and does not retry
         a 429 in place) only when there is somewhere else to go."""
         return pos + 1 < len(self.order)
+
+    def can_redo_elsewhere(self, pos: int) -> bool:
+        """PR2 — whether a reasoning-only stall at ``pos`` may be redone on
+        another group: :meth:`has_fallback` semantics, and a different group
+        really is left to walk to (the last handle of a last-resort pass
+        has none)."""
+        return self.has_fallback(pos) and self.next_group(pos) < len(self.order)
 
     def next_group(self, pos: int) -> int:
         """First position after ``pos`` in a different group (skip siblings)."""
@@ -272,3 +417,91 @@ def remember_route(
         return
     store.set(run_id, plan.groups, served)
     logger.info("llm_router.sticky_set group=%s", served)
+
+
+#: Seconds a switch notice may take to publish before the switch goes ahead
+#: without it (a slow event store must not delay the failover).
+FAILOVER_NOTICE_TIMEOUT_S = 2.0
+#: Seconds to wait for an abandoned provider stream to close.
+ABANDONED_STREAM_CLOSE_TIMEOUT_S = 1.0
+
+#: Per router call (:func:`keep_first_stall`): the reasoning-only stalls that
+#: were redone elsewhere, so the call can fall back to the first one's
+#: original outcome when no later group answers either.
+_stalls: ContextVar[list[LLMReasoningStallError] | None] = ContextVar(
+    "_llm_reasoning_stalls", default=None
+)
+
+
+@contextmanager
+def keep_first_stall() -> Iterator[list[LLMReasoningStallError]]:
+    """Scope of one router call: collects the reasoning-only stalls redone
+    elsewhere. If the call then fails, the router returns the first stall's
+    :meth:`~LLMReasoningStallError.original_outcome` instead — so a redo
+    never leaves a caller (agent loop, planner, reflection, memory) worse off
+    than not redoing: it gets exactly what it got before B-297 PR2."""
+    stalls: list[LLMReasoningStallError] = []
+    token = _stalls.set(stalls)
+    try:
+        yield stalls
+    finally:
+        _stalls.reset(token)
+
+
+async def _close_quietly(stream: object) -> None:
+    aclose = getattr(stream, "aclose", None)
+    if aclose is None:
+        return
+    try:
+        await asyncio.wait_for(aclose(), ABANDONED_STREAM_CLOSE_TIMEOUT_S)
+    except Exception:
+        logger.warning("llm_router.abandoned_stream_close_failed", exc_info=True)
+
+
+class StreamAttempt:
+    """One streaming attempt the router may abandon after its first progress
+    delta (B-297 PR2).
+
+    ``saw`` is fed every delta; :meth:`redo_elsewhere` decides at a stall /
+    mid-stream error. Discardable = nothing visible was produced: no answer
+    text and no tool call — including an unfinished one, whose name was
+    already published as a preview (``tool_args`` token frame → items
+    ``item.added``) even though the interrupted partial drops it.
+    """
+
+    def __init__(self, provider_key: str, sink: object | None, stream: object, can_redo: bool):
+        self._provider_key = provider_key
+        self._sink = sink
+        self._stream = stream
+        self._can_redo = can_redo
+        self._tool_named = False
+
+    def saw(self, delta: LLMDelta) -> None:
+        if not self._tool_named and any(tc.name for tc in delta.tool_calls):
+            self._tool_named = True
+
+    async def redo_elsewhere(
+        self, partial: AIMessage, cause: str, outcome: AIMessage | BaseException
+    ) -> None:
+        """Abandon the attempt and raise :class:`LLMReasoningStallError` when it
+        produced reasoning only and another group can redo it (``can_redo`` —
+        :meth:`WalkPlan.can_redo_elsewhere`). Otherwise return; the caller then
+        produces ``outcome`` (B-186 partial / ``LLMStreamInterruptedError``)."""
+        if not self._can_redo or self._tool_named or has_visible_output(partial):
+            return
+        logger.warning(
+            "llm_router.reasoning_only_stall key=%s cause=%s (redoing on the next group)",
+            self._provider_key,
+            cause,
+        )
+        await discard_streamed_attempt(self._sink)
+        await _close_quietly(self._stream)
+        stall = LLMReasoningStallError(
+            f"provider {self._provider_key!r} stopped after reasoning only ({cause}); "
+            "redoing the step on the next provider group",
+            outcome=outcome,
+        )
+        stalls = _stalls.get()
+        if stalls is not None:
+            stalls.append(stall)
+        raise stall

@@ -15,6 +15,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 
 import type { SseEvent } from "../../../api/sessions";
+import { LLM_FAILOVER_EVENT } from "../../../api/timeline";
 
 /** One step's live, cross-channel token buffer. */
 export interface LiveStep {
@@ -49,7 +50,9 @@ export interface TokenStreamState {
 }
 
 export interface TokenStreamController extends TokenStreamState {
-  /** Feed one SSE frame; only `token` frames on a known channel mutate state. */
+  /** Feed one SSE frame; only `token` frames on a known channel mutate state —
+   *  plus `llm_failover` (B-297 PR2), which drops that step's buffered
+   *  (abandoned) attempt. */
   push: (frame: SseEvent) => void;
   /** Begin a new run: clear buffers + finalized flag, record the start time. */
   reset: () => void;
@@ -94,6 +97,15 @@ function parseToken(frame: SseEvent): ParsedToken | null {
     return { kind: "tool", step: rec.step, callId, name: rec.name };
   }
   return null;
+}
+
+/** ``llm_failover`` 帧(B-297 PR2,仅控制台)→ 换模型的那一步;别的帧 → null。 */
+function failoverStep(frame: SseEvent): number | null {
+  if (frame.event !== LLM_FAILOVER_EVENT) return null;
+  const d = frame.data;
+  if (d === null || typeof d !== "object") return null;
+  const step = (d as Record<string, unknown>).step;
+  return typeof step === "number" ? step : null;
 }
 
 const EMPTY: ReadonlyMap<number, LiveStep> = new Map();
@@ -161,6 +173,16 @@ export function useTokenStream(): TokenStreamController {
 
   const push = useCallback(
     (frame: SseEvent) => {
+      const switched = failoverStep(frame);
+      if (switched !== null) {
+        // B-297 PR2 —— 这一步的模型调用换到了备用模型:之前流进来的是被放弃的那次
+        // 尝试(只有思考),清掉,备用模型的输出从头接着流。
+        bufRef.current.delete(switched);
+        reasoningStartRef.current.delete(switched);
+        contentStartRef.current.delete(switched);
+        schedule();
+        return;
+      }
       const tok = parseToken(frame);
       if (tok === null) return;
       const now = Date.now();

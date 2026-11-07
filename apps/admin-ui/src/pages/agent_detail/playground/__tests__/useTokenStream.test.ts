@@ -42,6 +42,35 @@ function flushRaf(): void {
   cbs.forEach((cb) => cb(0));
 }
 
+function failoverFrame(step: number): SseEvent {
+  return {
+    id: null,
+    event: "llm_failover",
+    data: { step, from_model: "a", to_model: "b", reason: "reasoning_stall" },
+    rawData: "",
+    receivedAt: "t",
+  };
+}
+
+describe("useTokenStream — B-297 PR2 model switch", () => {
+  it("drops the abandoned attempt of that step only, then streams the backup", () => {
+    const { result } = renderHook(() => useTokenStream());
+    act(() => result.current.reset());
+    act(() => {
+      result.current.push(reasoningFrame(1, "earlier step"));
+      result.current.push(reasoningFrame(2, "abandoned thinking"));
+      result.current.push(toolFrame(2, "call_x", "search_web"));
+      result.current.push(reasoningFrame(2, "\n\n"));
+      result.current.push(failoverFrame(2));
+      result.current.push(reasoningFrame(2, "backup thinks"));
+    });
+    act(() => flushRaf());
+    expect(result.current.liveByStep.get(1)?.reasoning).toBe("earlier step");
+    expect(result.current.liveByStep.get(2)?.reasoning).toBe("backup thinks");
+    expect(result.current.liveByStep.get(2)?.toolNames.size).toBe(0);
+  });
+});
+
 describe("useTokenStream", () => {
   it("accumulates content tokens per step after a rAF flush", () => {
     const { result } = renderHook(() => useTokenStream());
