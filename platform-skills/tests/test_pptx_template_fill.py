@@ -109,6 +109,8 @@ def test_inspect_font_sizes_autofit_and_wrap(scripts, deck):
     assert texts[roles["s3_resize"]]["autofit"] == "resize"
     assert texts[roles["s3_head"]]["autofit"] == "off"
     assert texts[roles["s3_nowrap"]].get("nowrap") is True
+    # a box that grows with its text has no fixed capacity to report
+    assert "cap" not in texts[roles["s3_resize"]] and texts[roles["s3_head"]]["cap"] == 19
     assert "nowrap" not in texts[roles["s3_head"]]
 
 
@@ -132,7 +134,7 @@ def test_inspect_preview_truncation_and_full(scripts, deck, tmp_path):
     long_text = "很长的说明文字" * 10
     _, filled = _fill(scripts, tmp_path, path, {"fill": {roles["s3_mixed"]: long_text}})
     short = _texts(_inspect(scripts, filled))[roles["s3_mixed"]]["text"]
-    assert short == long_text[:30] + "…"
+    assert short == long_text[:20] + "…"
     full = _texts(_inspect(scripts, filled, "--full"))[roles["s3_mixed"]]["text"]
     assert full == long_text
 

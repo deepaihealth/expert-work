@@ -20,6 +20,7 @@ import pptx
 import pytest
 from lxml import etree
 from PIL import Image
+from pptx.enum.text import MSO_AUTO_SIZE
 from pptx.opc.constants import RELATIONSHIP_TYPE as RT
 from pptx.oxml import parse_xml
 from pptx.oxml.ns import qn
@@ -192,14 +193,23 @@ def test_sections_follow_drop_duplicate_and_order(scripts, tmp_path):
     assert "warnings" not in report
 
 
-def test_sections_warn_when_reorder_breaks_contiguity(scripts, tmp_path):
+def test_interleaving_reorder_splits_sections_into_runs(scripts, tmp_path):
     path = tmp_path / "sections.pptx"
-    _titled_deck(path, 3, lambda prs: _add_sections(prs, [("甲", [1, 2]), ("乙", [3])]))
-    report, out = H.fill(scripts, tmp_path, path, {"slides": [1, 3, 2]})
-    final = [sid.get("id") for sid in pptx.Presentation(str(out)).slides._sldIdLst]
-    flat = [i for _, ids in _sections(pptx.Presentation(str(out))) for i in ids]
-    assert sorted(flat) == sorted(final), "every slide still in exactly one section"
-    assert any("分节" in w for w in report["warnings"])
+    _titled_deck(path, 4, lambda prs: _add_sections(prs, [("甲", [1, 2]), ("乙", [3, 4])]))
+    before = [
+        sec.get("id")
+        for sec in pptx.Presentation(str(path)).part._element.iter(f"{{{P14}}}section")
+    ]
+    report, out = H.fill(scripts, tmp_path, path, {"slides": [1, 3, 2, 4]})
+    prs = pptx.Presentation(str(out))
+    final = [sid.get("id") for sid in prs.slides._sldIdLst]
+    sections = _sections(prs)
+    assert [name for name, _ in sections] == ["甲", "乙", "甲", "乙"]
+    assert [ids for _, ids in sections] == [[f] for f in final]
+    guids = [sec.get("id") for sec in prs.part._element.iter(f"{{{P14}}}section")]
+    assert guids[:2] == before and len(set(guids)) == 4
+    assert all(re.fullmatch(r"\{[0-9A-F]{8}(-[0-9A-F]{4}){3}-[0-9A-F]{12}\}", g) for g in guids)
+    assert "warnings" not in report
 
 
 def test_drop_removes_slide_from_custom_show_and_package(scripts, tmp_path):
@@ -228,6 +238,28 @@ def test_drop_removes_slide_from_custom_show_and_package(scripts, tmp_path):
     assert any("精简版" in w for w in report["warnings"])
 
 
+def _slide_parts(path) -> list[str]:
+    names = zipfile.ZipFile(path).namelist()
+    return sorted(n for n in names if re.fullmatch(r"ppt/slides/slide\d+\.xml", n))
+
+
+def test_drop_removes_shape_click_jump_to_the_dropped_slide(scripts, tmp_path):
+    path = tmp_path / "jump.pptx"
+
+    def jump(prs):
+        tb = prs.slides[0].shapes.add_textbox(Cm(1), Cm(4), Cm(6), Cm(1))
+        tb.text_frame.text = "跳转"
+        tb.click_action.target_slide = prs.slides[2]
+
+    _titled_deck(path, 3, jump)
+    report, out = H.fill(scripts, tmp_path, path, {"slides": [1, 2], "drop_unlisted": True})
+    assert _slide_parts(out) == ["ppt/slides/slide1.xml", "ppt/slides/slide2.xml"]
+    first = pptx.Presentation(str(out)).slides[0]
+    assert first._element.find(".//" + qn("a:hlinkClick")) is None
+    assert not [r for r in first.part.rels.values() if r.reltype.endswith("/slide")]
+    assert any("第 1 页" in w and "链接" in w for w in report["warnings"])
+
+
 def test_drop_warns_when_a_kept_slide_still_links_to_it(scripts, tmp_path):
     path = tmp_path / "link.pptx"
 
@@ -244,8 +276,11 @@ def test_drop_warns_when_a_kept_slide_still_links_to_it(scripts, tmp_path):
         )
 
     _titled_deck(path, 3, link)
-    report, _ = H.fill(scripts, tmp_path, path, {"slides": [1, 2], "drop_unlisted": True})
+    report, out = H.fill(scripts, tmp_path, path, {"slides": [1, 2], "drop_unlisted": True})
     assert any("第 1 页" in w and "链接" in w for w in report["warnings"])
+    assert _slide_parts(out) == ["ppt/slides/slide1.xml", "ppt/slides/slide2.xml"]
+    run = pptx.Presentation(str(out)).slides[0].shapes.title.text_frame.paragraphs[0].runs[0]
+    assert run._r.find(".//" + qn("a:hlinkClick")) is None
 
 
 # ------------------------------------------------------------------ M2 duplicate shape ids
@@ -311,9 +346,9 @@ def test_unusual_text_bodies_inspect_and_fill(scripts, tmp_path, mutate):
     addr = _one_box_deck(path)
     _edit(path, mutate)
     entry = H.texts(H.inspect(scripts, path))[addr]
-    assert "error" not in entry and isinstance(entry["cap"], int)
+    assert "error" not in entry
     report, out = H.fill(scripts, tmp_path, path, {"fill": {addr: "新的文字"}})
-    assert report["results"][0]["status"] == "ok"
+    assert report["results"][0]["status"] == "ok" and report["overflow_unknown"] == []
     assert H.shape_by_addr(pptx.Presentation(str(out)), addr).text_frame.text == "新的文字"
 
 
@@ -425,10 +460,11 @@ def test_non_latin_alphabets_wrap_by_word(text_mod, width):
 def test_near_full_box_is_reported(scripts, deck, tmp_path):
     path, roles = deck  # nested-group box: 2 lines of 14 pt use 95% of its height
     report, _ = H.fill(scripts, tmp_path, path, {"fill": {roles["s4_g_b"]: "字" * 30}})
-    (item,) = report["overflow"]
-    assert item["near"] is True and item["need_lines"] <= item["fit_lines"]
+    assert report["overflow"] == [], "near-full is not overflow"
+    (item,) = report["near"]
+    assert item["addr"] == roles["s4_g_b"] and item["need_lines"] <= item["fit_lines"]
     report, _ = H.fill(scripts, tmp_path, path, {"fill": {roles["s4_g_b"]: "字" * 10}})
-    assert report["overflow"] == []
+    assert report["overflow"] == [] and report["near"] == []
 
 
 def test_vertical_text_swaps_width_and_height(scripts, tmp_path):
@@ -477,6 +513,37 @@ def test_texts_output_fits_the_exec_output_cap(scripts, deck, tmp_path):
     assert len(H.run(scripts, "inspect_template.py", big, "--texts").stdout) < 20_000
 
 
+def _dense_deck(path) -> None:
+    prs = pptx.Presentation()
+    for s in range(6):
+        slide = prs.slides.add_slide(prs.slide_layouts[5])
+        slide.shapes.title.text = f"第{s + 1}页标题"
+        for b in range(40):
+            tb = slide.shapes.add_textbox(Cm(b % 8 * 4), Cm(3 + b // 8 * 3), Cm(4), Cm(2))
+            tb.text_frame.text = f"第{s + 1}页第{b + 1}条说明文字,内容较长需要截断"
+            tb.text_frame.auto_size = MSO_AUTO_SIZE.NONE
+            tb.text_frame.paragraphs[0].runs[0].font.size = Pt(12)
+    prs.save(str(path))
+
+
+def test_texts_pages_itself_under_the_output_cap(scripts, tmp_path):
+    path = tmp_path / "dense.pptx"
+    _dense_deck(path)
+    seen, flags, rounds = [], ["--texts"], 0
+    while True:
+        out = H.run(scripts, "inspect_template.py", path, *flags).stdout
+        assert len(out) < 20_000, len(out)
+        res = json.loads(out)
+        seen += [s["number"] for s in res["slides"]]
+        rounds += 1
+        if "more" not in res:
+            break
+        assert res["more"].startswith("--slides ")
+        flags = ["--texts", *res["more"].split()]
+    assert seen == [1, 2, 3, 4, 5, 6] and rounds > 1
+    assert all(len(s["texts"]) == 41 for s in [res["slides"][-1]])
+
+
 # ------------------------------------------------------------------ M5 spec validation
 
 
@@ -505,6 +572,17 @@ def test_fill_rejects_duplicate_json_keys(scripts, tmp_path):
     spec_path.write_text(f'{{"fill": {{"{addr}": "一", "{addr}": "二"}}}}', encoding="utf-8")
     proc = H.run(scripts, "fill_template.py", path, spec_path, tmp_path / "o.pptx", expect=1)
     assert "重复" in proc.stderr and addr in proc.stderr
+
+
+def test_carriage_returns_are_newlines(scripts, tmp_path):
+    path = tmp_path / "one.pptx"
+    addr = _one_box_deck(path)
+    _, out = H.fill(scripts, tmp_path, path, {"fill": {addr: "一\r\n二\r三"}})
+    paras = H.shape_by_addr(pptx.Presentation(str(out)), addr).text_frame.paragraphs
+    assert [p.text for p in paras] == ["一", "二", "三"]
+    _, out = H.fill(scripts, tmp_path, path, {"fill": {addr: ["上\r\n下"]}})
+    paras = H.shape_by_addr(pptx.Presentation(str(out)), addr).text_frame.paragraphs
+    assert len(paras) == 1 and paras[0]._p.findall(qn("a:br"))
 
 
 def test_vertical_tab_is_a_line_break(scripts, tmp_path):
@@ -593,3 +671,51 @@ def test_paragraph_alternate_content_is_removed(scripts, tmp_path):
     _, out = H.fill(scripts, tmp_path, path, {"fill": {addr: "新"}})
     el = H.shape_by_addr(pptx.Presentation(str(out)), addr)._element
     assert el.find(".//" + f"{{{MC}}}AlternateContent") is None
+
+
+# ------------------------------------------------------------------ round 2: mc:Ignorable
+
+
+def _alternate_content_deck(path, tmp_path) -> str:
+    """Slide 1 written the way PowerPoint does: p14 declared on the root, mc:Ignorable,
+    and the transition inside mc:AlternateContent."""
+    base = tmp_path / "mc-base.pptx"
+    addr = _one_box_deck(base)
+    with zipfile.ZipFile(base) as zin, zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as zout:
+        for item in zin.infolist():
+            data = zin.read(item.filename)
+            if item.filename == "ppt/slides/slide1.xml":
+                xml = data.decode()
+                xml = xml.replace(
+                    "<p:sld ",
+                    f'<p:sld xmlns:mc="{MC}" xmlns:p14="{P14}" mc:Ignorable="p14" ',
+                    1,
+                )
+                xml = xml.replace(
+                    "</p:sld>",
+                    '<mc:AlternateContent><mc:Choice Requires="p14">'
+                    '<p:transition spd="slow" p14:dur="2000"><p14:prism/></p:transition>'
+                    '</mc:Choice><mc:Fallback><p:transition spd="slow"><p:fade/></p:transition>'
+                    "</mc:Fallback></mc:AlternateContent></p:sld>",
+                )
+                data = xml.encode()
+            zout.writestr(item, data)
+    return addr
+
+
+def test_duplicate_keeps_ignorable_with_its_namespace(scripts, tmp_path):
+    path = tmp_path / "mc.pptx"
+    addr = _alternate_content_deck(path, tmp_path)
+    report, out = H.fill(
+        scripts, tmp_path, path, {"slides": [1, {"from": 1, "fill": {addr: "副本"}}]}
+    )
+    assert report["changed_pages"] == [2]
+    with zipfile.ZipFile(out) as z:
+        roots = [etree.fromstring(z.read(n)) for n in _slide_parts(out)]
+    for root in roots:
+        assert root.get(f"{{{MC}}}Ignorable") == "p14"
+        assert root.nsmap.get("p14") == P14, "the ignorable prefix is declared on the root"
+        assert root.find(f"{{{MC}}}AlternateContent") is not None
+    prs = pptx.Presentation(str(out))
+    texts = [H.shape_by_addr(prs, f"{n}:{addr.split(':')[1]}").text_frame.text for n in (1, 2)]
+    assert texts == ["hello", "副本"], "the duplicate's shapes are still the ones being filled"

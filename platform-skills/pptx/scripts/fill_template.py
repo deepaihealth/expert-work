@@ -23,8 +23,10 @@ at once. Overflow is an estimate, reported but not fatal.
 from __future__ import annotations
 
 import argparse
+import copy
 import json
 import sys
+import uuid
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -36,10 +38,12 @@ from duplicate_slide import duplicate
 from pptx.oxml.ns import qn
 
 P14 = "http://schemas.microsoft.com/office/powerpoint/2010/main"
+_R_NS = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
+_LINK_TAGS = (qn("a:hlinkClick"), qn("a:hlinkMouseOver"))
 OVERFLOW_NOTE = (
     "估算值:按字号、框尺寸、汉字 1 字宽 / 西文约半字宽、1.2 倍行距推算;"
     "中文较准,西文随字体约差 ±20%,"
-    "以渲染为准。near=接近放满(≥90%),不一定溢出,渲染时重点看;"
+    "以渲染为准。near 里是接近放满(≥90%)的框,不用改短,渲染时重点看;"
     "overflow_unknown=框的尺寸读不到,估不了,必须看图确认。"
     "autofit=resize 框会变高、可能压住下方内容;shrink 打开时字会被缩小;"
     "表格单元格溢出时整行变高。"
@@ -66,8 +70,13 @@ def _text(raw: str, where: str, errors: list[str]) -> str:
     return raw.replace("\v", "\n")
 
 
+def _eol(text: str) -> str:
+    return text.replace("\r\n", "\n").replace("\r", "\n")
+
+
 def _paras(value, where: str, errors: list[str]) -> list[NewPara]:
     if isinstance(value, str):
+        value = _eol(value)
         return [NewPara(_text(line, where, errors)) for line in value.split("\n")]
     if not isinstance(value, list) or not value:
         errors.append(f"{where}: 值必须是字符串或非空列表")
@@ -76,14 +85,14 @@ def _paras(value, where: str, errors: list[str]) -> list[NewPara]:
     for k, item in enumerate(value):
         level = item.get("level") if isinstance(item, dict) else None
         if isinstance(item, str):
-            out.append(NewPara(_text(item.replace("\n", "\v"), f"{where}[{k}]", errors)))
+            out.append(NewPara(_text(_eol(item).replace("\n", "\v"), f"{where}[{k}]", errors)))
         elif (
             isinstance(item, dict)
             and isinstance(item.get("text"), str)
             and set(item) <= {"text", "level"}
             and (level is None or (type(level) is int and 0 <= level <= 8))
         ):
-            text = _text(item["text"].replace("\n", "\v"), f"{where}[{k}]", errors)
+            text = _text(_eol(item["text"]).replace("\n", "\v"), f"{where}[{k}]", errors)
             out.append(NewPara(text, level))
         else:
             errors.append(
@@ -192,29 +201,74 @@ def _drop_from_custom_shows(prs, rids: set[str]) -> list[str]:
     return warnings
 
 
-def _rewrite_sections(prs, final_ids: list[str], source_ids: list[str]) -> list[str]:
-    """Sections keep their order; each holds the output slides whose source it held."""
-    sections = list(prs.part._element.iter(f"{{{P14}}}section"))
+def _members(section, ids: list[str]) -> None:
+    lst = section.find(f"{{{P14}}}sldIdLst")
+    if lst is None:
+        lst = section.makeelement(f"{{{P14}}}sldIdLst", {})
+        section.insert(0, lst)
+    for child in list(lst):
+        lst.remove(child)
+    for fid in ids:
+        lst.append(lst.makeelement(f"{{{P14}}}sldId", {"id": fid}))
+
+
+def _rewrite_sections(prs, final_ids: list[str], source_ids: list[str]) -> None:
+    """Each output slide stays in its source slide's section. Every unbroken run of one
+    section becomes a section of its own: the first run keeps the section, later runs
+    are copies with the same name and a new id (A[1] B[3] A[2] B[4])."""
+    section_list = next(prs.part._element.iter(f"{{{P14}}}sectionLst"), None)
+    sections = [] if section_list is None else list(section_list.iterchildren(f"{{{P14}}}section"))
     if not sections:
-        return []
+        return
     home = {s.get("id"): n for n, sec in enumerate(sections) for s in sec.iter(f"{{{P14}}}sldId")}
-    members: list[list[str]] = [[] for _ in sections]
-    last = 0
+    runs: list[tuple[int, list[str]]] = []
+    current = 0
     for fid, sid in zip(final_ids, source_ids, strict=True):
-        last = home.get(sid, last)  # a slide outside every section joins its predecessor's
-        members[last].append(fid)
-    for sec, ids in zip(sections, members, strict=True):
-        lst = sec.find(f"{{{P14}}}sldIdLst")
-        if lst is None:
-            lst = sec.makeelement(f"{{{P14}}}sldIdLst", {})
-            sec.insert(0, lst)
-        for child in list(lst):
-            lst.remove(child)
-        for fid in ids:
-            lst.append(lst.makeelement(f"{{{P14}}}sldId", {"id": fid}))
-    if [i for ids in members for i in ids] != final_ids:
-        return ["调序后同一分节的页不再相邻, PowerPoint 打开时可能重排分节; 请检查分节或调整顺序"]
-    return []
+        current = home.get(sid, current)  # a slide outside every section joins its predecessor's
+        if runs and runs[-1][0] == current:
+            runs[-1][1].append(fid)
+        else:
+            runs.append((current, [fid]))
+    used: set[int] = set()
+    rebuilt = []
+    for n, ids in runs:
+        section = sections[n]
+        if n in used:
+            section = copy.deepcopy(section)
+            section.set("id", "{" + str(uuid.uuid4()).upper() + "}")
+        used.add(n)
+        _members(section, ids)
+        rebuilt.append(section)
+    for n, section in enumerate(sections):  # sections left without slides stay, empty, last
+        if n not in used:
+            _members(section, [])
+            rebuilt.append(section)
+    for section in sections:
+        section_list.remove(section)
+    for section in rebuilt:
+        section_list.append(section)
+
+
+def _unlink(slide, dropped_parts) -> bool:
+    """Remove the slide's links (hlinkClick / hlinkMouseOver) to dropped slides and the
+    relationships behind them, so no dropped slide part is kept alive. -> any found?"""
+    found = False
+    for rid, rel in list(slide.part.rels.items()):
+        if rel.is_external or rel.target_part not in dropped_parts:
+            continue
+        found = True
+        for link in list(slide._element.iter(*_LINK_TAGS)):
+            if link.get(qn("r:id")) == rid:
+                link.getparent().remove(link)
+        still_used = any(
+            v == rid
+            for node in slide._element.iter()
+            for k, v in node.attrib.items()
+            if k.startswith(f"{{{_R_NS}}}")
+        )
+        if not still_used:
+            slide.part.drop_rel(rid)
+    return found
 
 
 def _restructure(prs, slides, source_ids: list[str], drop: bool) -> list[str]:
@@ -230,13 +284,10 @@ def _restructure(prs, slides, source_ids: list[str], drop: bool) -> list[str]:
             prs.part.drop_rel(sid.rId)
     for sid in keep:
         ids.append(sid)
-    warnings += _rewrite_sections(prs, [sid.get("id") for sid in keep], source_ids)
+    _rewrite_sections(prs, [sid.get("id") for sid in keep], source_ids)
     for page, slide in enumerate(slides, start=1):
-        if any(
-            not rel.is_external and rel.target_part in dropped_parts
-            for rel in slide.part.rels.values()
-        ):
-            warnings.append(f"第 {page} 页有链接指向被删掉的页, 那个链接已失效")
+        if _unlink(slide, dropped_parts):
+            warnings.append(f"第 {page} 页有链接指向被删掉的页, 已去掉这个链接")
     return warnings
 
 
@@ -252,16 +303,16 @@ def _load_spec(path: Path):
         fail(f"spec 不是合法 JSON: {exc}")
 
 
-def _fit_report(page, addr, target, paras) -> tuple[dict | None, bool]:
-    """-> (overflow / near item or None, estimate unknown?)."""
+def _fit_report(page, addr, target, paras) -> tuple[str | None, dict | None]:
+    """-> ("overflow" / "near" / "unknown" / None, item for the first two)."""
     try:
         fit = estimate(target)
     except Exception:  # an unreadable value means "unknown", reported
         fit = None
     if fit is None:
-        return None, True
+        return "unknown", None
     if not (fit.over or fit.near):
-        return None, False
+        return None, None
     item = {
         "page": page,
         "addr": addr,
@@ -271,13 +322,11 @@ def _fit_report(page, addr, target, paras) -> tuple[dict | None, bool]:
         "chars": sum(len(p.text) for p in paras),
         "font_pt": fit.font_pt,
     }
-    if fit.near:
-        item["near"] = True
     if target.autofit:
         item["autofit"] = target.autofit
     if fit.too_wide:
         item["too_wide"] = True
-    return item, False
+    return ("overflow" if fit.over else "near"), item
 
 
 def main() -> None:
@@ -311,16 +360,14 @@ def main() -> None:
     if any(r["status"] != "ok" for r in results):
         emit_json({"saved": False, "results": results})
         fail("有地址找不到、有歧义或不能改字, 没有保存; 按 results 一次改完 spec 再跑")
-    overflow, unknown = [], []
+    fits: dict[str, list] = {"overflow": [], "near": [], "unknown": []}
     for page, addr, target, paras in plan:
         if target.tx_body is None:  # a table cell that never had text
             target.tx_body = target.el.get_or_add_txBody()
         replace_text(target.tx_body, paras)
-        item, is_unknown = _fit_report(page, addr, target, paras)
-        if item:
-            overflow.append(item)
-        if is_unknown:
-            unknown.append(addr)
+        kind, item = _fit_report(page, addr, target, paras)
+        if kind:
+            fits[kind].append(item if item is not None else addr)
     warnings = []
     if restructured:
         source_ids = [orig_ids[src_no - 1] for src_no, _ in entries]
@@ -331,10 +378,11 @@ def main() -> None:
         "output": str(dst),
         "changed_pages": sorted({page for page, *_ in plan}),
         "results": results,
-        "overflow": overflow,
-        "overflow_unknown": unknown,
+        "overflow": fits["overflow"],
+        "near": fits["near"],
+        "overflow_unknown": fits["unknown"],
     }
-    if overflow or unknown:
+    if any(fits.values()):
         report["overflow_note"] = OVERFLOW_NOTE
     if restructured:
         report["slides"] = [s for s, _ in entries]

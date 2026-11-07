@@ -12,10 +12,12 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import pptx
 from _cli import emit_json, fail, resolve_io
 from pptx.opc.constants import RELATIONSHIP_TYPE as RT
+from pptx.oxml import parse_xml
 from pptx.oxml.ns import qn
 
 _R_NS = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
 _SLIDE_ATTRS = ("show", "showMasterSp", "showMasterPhAnim")
+_IGNORABLE = "{http://schemas.openxmlformats.org/markup-compatibility/2006}Ignorable"
 # Relationships whose *data part* is not duplicated — the new slide's relationship points
 # at the very same part as the original, so editing one's data (chart series, SmartArt
 # text, embedded workbook, ...) silently edits the other's too. Speaker notes are NOT in
@@ -107,6 +109,33 @@ def _copy_slide_level(src_el, new_el, rid_map: dict[str, str]) -> None:
             new_el.append(_remapped(child, rid_map))
 
 
+def _carry_ignorable(src, new) -> None:
+    """Copy mc:Ignorable with the namespace declarations it names onto the new root.
+
+    The prefixes it lists must be declared where the attribute sits; lxml cannot add a
+    declaration to an existing element, so the root is rebuilt and the children moved
+    across (moved, not copied: python-pptx's cached views of the shapes stay valid).
+    """
+    ignorable = src._element.get(_IGNORABLE)
+    if ignorable is None:
+        return
+    old = new._element
+    nsmap = dict(old.nsmap)
+    for prefix in ("mc", *ignorable.split()):
+        uri = src._element.nsmap.get(prefix)
+        if uri is not None:
+            nsmap.setdefault(prefix, uri)
+    decls = " ".join(f'xmlns:{k}="{v}"' if k else f'xmlns="{v}"' for k, v in nsmap.items())
+    root = parse_xml(f"<p:sld {decls}/>")
+    for name, value in old.attrib.items():
+        root.set(name, value)
+    root.set(_IGNORABLE, ignorable)
+    for child in list(old):
+        root.append(child)
+    new.part._element = root
+    new._element = root
+
+
 def duplicate(prs, index: int, after: int) -> tuple[int, list[str], bool]:
     src = prs.slides[index - 1]
     new = prs.slides.add_slide(src.slide_layout)
@@ -128,6 +157,7 @@ def duplicate(prs, index: int, after: int) -> tuple[int, list[str], bool]:
             continue
         new.shapes._spTree.append(_remapped(el, rid_map))
     _copy_slide_level(src._element, new._element, rid_map)
+    _carry_ignorable(src, new)
     notes_format_lost = _copy_notes(src, new)
     ids = prs.slides._sldIdLst
     moved = ids[-1]

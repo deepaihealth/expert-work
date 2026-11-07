@@ -7,7 +7,9 @@ several, so layouts are listed per master: entry ``{"master": m, "index": i, ...
 ``--texts`` lists instead, per existing slide, ``texts`` (every shape carrying text,
 groups and table cells included, addressed for fill_template.py) and ``locked`` (charts,
 SmartArt, pictures, ... whose text this tooling cannot edit), as compact JSON; the
-``legend`` key explains the fields. ``--slides 3,5-7`` limits either output to those slides.
+``legend`` key explains the fields. Output past ~18,000 chars stops at a whole slide
+and ends with ``"more": "--slides N-M"`` for the rest.
+``--slides 3,5-7`` limits either output to those slides.
 """
 
 from __future__ import annotations
@@ -36,13 +38,15 @@ from _pptx_text import (
 from pptx.oxml.ns import qn
 
 LOCKED_KINDS = {"picture", "chart", "smartart", "ole", "graphic", "other", NO_TEXT_PLACEHOLDER}
-PREVIEW_CHARS = 30
+PREVIEW_CHARS = 20
 CELL_PREVIEW_CHARS = 12
+PAGE_BUDGET = 18_000  # chars per --texts output; tool output past ~20,000 is cut
 LEGEND = (
     "texts: addr=fill_template.py 的地址(页:形状id[/组内id][@行,列]); box=[左,上,宽,高]厘米; "
     "kind 省略=文本框; text=开头预览(--full 看全文); paras=段数(1 段时省略); "
     "font_pt=字号(各段不同时逐段列出,"
-    f"null=文件里没写死); cap=按当前字号估计约能放的汉字数(西文约 x{LATIN_PER_CJK}); "
+    f"null=文件里没写死); cap=按当前字号估计约能放的汉字数(西文约 x{LATIN_PER_CJK}, "
+    "autofit=resize 的框会长高, 不给 cap); "
     "autofit: shrink=溢出时缩字 resize=框随文字变高 off=不调整; nowrap=不自动换行; "
     "vertical=竖排; hidden=隐藏的形状; ambiguous=同页有重复 id, 这个地址填不了; "
     "error=这个形状读不了。表格 cells 逐行列出, null=被合并的格, col_chars=各列每行约几个汉字。"
@@ -133,7 +137,8 @@ def _text_entry(t: Target, limit: int | None) -> dict:
     if paras != 1:
         entry["paras"] = paras
     entry["font_pt"] = _sizes(t)
-    entry["cap"] = _cap(t)
+    if t.autofit != "resize":  # a box that grows with its text has no fixed capacity
+        entry["cap"] = _cap(t)
     if t.autofit:
         scaled = t.autofit == "shrink" and t.scale < 1
         entry["autofit"] = f"shrink:{round(t.scale * 100)}%" if scaled else t.autofit
@@ -254,14 +259,35 @@ def main() -> None:
         )
         return
     default_style = prs.part._element.find(qn("p:defaultTextStyle"))
-    out = {
-        "slide_size": [prs.slide_width, prs.slide_height],
-        "legend": LEGEND,
-        "slides": [
-            _texts_slide(n, slides[n - 1], master_of, default_style, args.full) for n in numbers
-        ],
-    }
-    print(json.dumps(out, ensure_ascii=False, separators=(",", ":")))
+    out = {"slide_size": [prs.slide_width, prs.slide_height], "legend": LEGEND, "slides": []}
+    used = len(_compact(out)) + len(',"more":"--slides 999-999"')
+    for k, n in enumerate(numbers):
+        info = _texts_slide(n, slides[n - 1], master_of, default_style, args.full)
+        size = len(_compact(info)) + 1
+        if out["slides"] and used + size > PAGE_BUDGET:  # whole slides only, at least one
+            out["more"] = "--slides " + _ranges(numbers[k:])
+            break
+        out["slides"].append(info)
+        used += size
+    print(_compact(out))
+
+
+def _compact(obj) -> str:
+    return json.dumps(obj, ensure_ascii=False, separators=(",", ":"))
+
+
+def _ranges(numbers: list[int]) -> str:
+    """[3, 4, 5, 7] -> "3-5,7" (the --slides syntax)."""
+    parts: list[str] = []
+    start = prev = numbers[0]
+    for n in [*numbers[1:], None]:
+        if n is not None and n == prev + 1:
+            prev = n
+            continue
+        parts.append(str(start) if start == prev else f"{start}-{prev}")
+        if n is not None:
+            start = prev = n
+    return ",".join(parts)
 
 
 if __name__ == "__main__":
