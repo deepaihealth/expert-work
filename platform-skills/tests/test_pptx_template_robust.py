@@ -530,18 +530,20 @@ def test_texts_pages_itself_under_the_output_cap(scripts, tmp_path):
     path = tmp_path / "dense.pptx"
     _dense_deck(path)
     seen, flags, rounds = [], ["--texts"], 0
-    while True:
+    for _ in range(6):  # bounded: a "more" that never ends must fail, not hang
+        rounds += 1
         out = H.run(scripts, "inspect_template.py", path, *flags).stdout
         assert len(out) < 20_000, len(out)
         res = json.loads(out)
         seen += [s["number"] for s in res["slides"]]
-        rounds += 1
         if "more" not in res:
             break
         assert res["more"].startswith("--slides ")
         flags = ["--texts", *res["more"].split()]
+    else:
+        pytest.fail(f"still 'more' after 6 rounds; slides seen {seen}")
     assert seen == [1, 2, 3, 4, 5, 6] and rounds > 1
-    assert all(len(s["texts"]) == 41 for s in [res["slides"][-1]])
+    assert len(res["slides"][-1]["texts"]) == 41, "title + 40 boxes, nothing dropped"
 
 
 # ------------------------------------------------------------------ M5 spec validation
