@@ -20,6 +20,7 @@ import pptx
 import pytest
 from lxml import etree
 from PIL import Image
+from pptx.opc.constants import RELATIONSHIP_TYPE as RT
 from pptx.oxml import parse_xml
 from pptx.oxml.ns import qn
 from pptx.util import Cm, Pt
@@ -72,10 +73,18 @@ def _design_deck(path) -> str:
     slide = prs.slides.add_slide(prs.slide_layouts[6])
     tb = slide.shapes.add_textbox(Cm(1), Cm(1), Cm(10), Cm(2))
     tb.text_frame.text = "正文"
+    # push the image's rId past what the copy will number it, so an un-remapped r:embed
+    # dangles instead of matching by coincidence
+    spare = [
+        slide.part.relate_to(f"https://example.com/{n}", RT.HYPERLINK, is_external=True)
+        for n in range(3)
+    ]
     buf = io.BytesIO()
     Image.new("RGB", (32, 18), (20, 60, 120)).save(buf, "PNG")
     buf.seek(0)
     _, rid = slide.part.get_or_add_image_part(buf)
+    for spare_rid in spare:
+        slide.part.drop_rel(spare_rid)
     sld = slide._element
     sld.cSld.set("name", "设计页")
     sld.cSld.insert(
