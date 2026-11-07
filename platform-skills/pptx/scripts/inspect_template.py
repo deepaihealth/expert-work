@@ -112,10 +112,7 @@ def _sizes(t: Target) -> float | list | None:
 
 
 def _cap(t: Target) -> int | None:
-    try:  # an estimate failing on odd values must not lose the entry
-        fit = estimate(t)
-    except Exception:  # shown as cap null ("unknown")
-        return None
+    fit = estimate(t)
     return None if fit is None else fit.cap_chars
 
 
