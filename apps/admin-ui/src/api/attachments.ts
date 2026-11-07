@@ -9,12 +9,16 @@
  * only the types in :data:`PREVIEW_TYPES` are previewed, everything else is a
  * download.
  */
+import { filenameFromDisposition } from "./artifacts";
 import { ApiError, apiClient, withTenantScope, type TenantScope } from "./client";
 
 export interface AttachmentBytes {
   blob: Blob;
   /** The response ``Content-Type`` (lower-cased, parameters dropped). */
   contentType: string;
+  /** Save-as name from the server's ``Content-Disposition`` (the stored name), never
+   *  the chip label — that one comes from the message, which a third party writes. */
+  filename: string;
 }
 
 /** 410 ``ATTACHMENT_GONE`` — retention deleted it, or it was deleted. */
@@ -25,7 +29,9 @@ export function isAttachmentGone(err: unknown): boolean {
 export type PreviewKind = "image" | "pdf" | "text";
 
 /** Server content types the page renders in place, and how. A blob is only ever
- *  handed to ``<img>`` / ``<iframe>`` re-typed as one of these keys. */
+ *  handed to ``<img>`` / ``<iframe>`` re-typed as one of these keys. The server sends
+ *  txt / md / csv all as ``text/plain`` (``_artifact_mime``), so that is the one text
+ *  type here. */
 export const PREVIEW_TYPES: Readonly<Record<string, PreviewKind>> = {
   "image/png": "image",
   "image/jpeg": "image",
@@ -33,8 +39,6 @@ export const PREVIEW_TYPES: Readonly<Record<string, PreviewKind>> = {
   "image/webp": "image",
   "application/pdf": "pdf",
   "text/plain": "text",
-  "text/csv": "text",
-  "text/markdown": "text",
 };
 
 export function previewKindOf(contentType: string): PreviewKind | null {
@@ -50,9 +54,13 @@ export async function fetchSessionAttachment(
     `/v1/sessions/${encodeURIComponent(threadId)}/attachment`,
     { params: withTenantScope({ ref }, tenantScope), responseType: "blob" },
   );
-  const header = (response.headers as Record<string, string | undefined>)["content-type"];
-  const contentType = (header ?? "").split(";")[0].trim().toLowerCase();
-  return { blob: response.data, contentType };
+  const headers = response.headers as Record<string, string | undefined>;
+  const contentType = (headers["content-type"] ?? "").split(";")[0].trim().toLowerCase();
+  const filename = filenameFromDisposition(
+    headers["content-disposition"],
+    ref.split("/").pop() || "download",
+  );
+  return { blob: response.data, contentType, filename };
 }
 
 /** Save ``blob`` under ``filename`` (an anchor can't carry the Bearer token, so the

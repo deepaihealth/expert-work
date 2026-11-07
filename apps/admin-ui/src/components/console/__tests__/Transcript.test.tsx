@@ -167,7 +167,7 @@ describe("Transcript", () => {
   it("B-295 — history and live bubbles fetch their attachments from that thread and tenant", async () => {
     const fetchAttachment = vi
       .spyOn(attachmentsSdk, "fetchSessionAttachment")
-      .mockResolvedValue({ blob: new Blob(["x"]), contentType: "text/plain" });
+      .mockResolvedValue({ blob: new Blob(["x"]), contentType: "text/plain", filename: "notes.txt" });
     const doc = { id: "d", name: "notes.txt", kind: "document" as const, value: "uploads/notes.txt" };
     const turns = [
       makeTurn("h1", "history", 0, "run-h1", { attachments: [doc] }),

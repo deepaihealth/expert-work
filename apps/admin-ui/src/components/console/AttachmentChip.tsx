@@ -19,6 +19,7 @@ import {
   isAttachmentGone,
   previewKindOf,
   saveBlob,
+  type AttachmentBytes,
   type PreviewKind,
 } from "../../api/attachments";
 import { errMessage, type TenantScope } from "../../api/client";
@@ -42,7 +43,15 @@ type Loaded =
   | { state: "loading" }
   | { state: "gone" }
   | { state: "error"; message: string }
-  | { state: "ready"; blob: Blob; kind: PreviewKind | null; text?: string; truncated?: boolean };
+  | {
+      state: "ready";
+      blob: Blob;
+      /** Save-as name from the server's ``Content-Disposition``. */
+      filename: string;
+      kind: PreviewKind | null;
+      text?: string;
+      truncated?: boolean;
+    };
 
 function opensPreview(attachment: Attachment): boolean {
   if (attachment.kind === "image") return true;
@@ -51,11 +60,18 @@ function opensPreview(attachment: Attachment): boolean {
   return dot > 0 && PREVIEW_DOC_EXTS.has(leaf.slice(dot).toLowerCase());
 }
 
-async function readPreview(blob: Blob, contentType: string): Promise<Loaded> {
+async function readPreview({ blob, contentType, filename }: AttachmentBytes): Promise<Loaded> {
   const kind = previewKindOf(contentType);
-  if (kind !== "text") return { state: "ready", blob, kind };
+  if (kind !== "text") return { state: "ready", blob, filename, kind };
   const text = await blob.slice(0, TEXT_PREVIEW_MAX_BYTES).text();
-  return { state: "ready", blob, kind, text, truncated: blob.size > TEXT_PREVIEW_MAX_BYTES };
+  return {
+    state: "ready",
+    blob,
+    filename,
+    kind,
+    text,
+    truncated: blob.size > TEXT_PREVIEW_MAX_BYTES,
+  };
 }
 
 /** Image / PDF bytes re-typed as the whitelisted server type, behind an object URL
@@ -116,11 +132,11 @@ export function AttachmentChip({
       const fetched = await fetchSessionAttachment(threadId, attachment.value, tenantScope);
       if (mine !== request.current) return;
       if (!previewable) {
-        saveBlob(fetched.blob, attachment.name);
+        saveBlob(fetched.blob, fetched.filename);
         return;
       }
       setContentType(fetched.contentType);
-      next = await readPreview(fetched.blob, fetched.contentType);
+      next = await readPreview(fetched);
     } catch (err) {
       next = isAttachmentGone(err)
         ? { state: "gone" }
@@ -130,7 +146,7 @@ export function AttachmentChip({
     // A download-only chip that failed opens the same modal, so the failure is seen.
     setOpen(true);
     setLoaded(next);
-  }, [threadId, attachment.value, attachment.name, tenantScope, previewable]);
+  }, [threadId, attachment.value, tenantScope, previewable]);
 
   if (threadId === null) {
     return (
@@ -175,7 +191,7 @@ export function AttachmentChip({
           <Button
             icon={<Download size={14} strokeWidth={1.75} />}
             disabled={ready === null}
-            onClick={() => ready && saveBlob(ready.blob, attachment.name)}
+            onClick={() => ready && saveBlob(ready.blob, ready.filename)}
             data-testid="console-attachment-download"
           >
             {t("console.attachment_download")}
@@ -265,6 +281,11 @@ function PreviewBody({ loaded, url, name }: PreviewBodyProps): JSX.Element | nul
     );
   }
   if (loaded.kind === "pdf" && url !== null) {
+    // Accepted risk (B-295 review L5): the PDF renders in a same-origin blob: iframe with
+    // no ``sandbox`` — a sandboxed frame stops Chrome's built-in viewer from loading at
+    // all. The browser's PDF viewer does not run page script in this origin, the blob is
+    // re-typed to ``application/pdf`` (never HTML), and the server only labels bytes
+    // that start with ``%PDF-`` as PDF.
     return (
       <iframe
         data-testid="console-attachment-pdf"

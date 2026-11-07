@@ -26,8 +26,14 @@ const PDF: Attachment = { id: "a2", name: "报告.pdf", kind: "document", value:
 const TXT: Attachment = { id: "a3", name: "notes.txt", kind: "document", value: "uploads/notes.txt" };
 const DOCX: Attachment = { id: "a4", name: "合同.docx", kind: "document", value: "uploads/合同.docx" };
 
-function bytes(body: string, contentType: string): attachmentsSdk.AttachmentBytes {
-  return { blob: new Blob([body], { type: contentType }), contentType };
+/** ``filename`` = what the server's ``Content-Disposition`` names — deliberately
+ *  different from the chip labels below, which a third party can influence. */
+function bytes(
+  body: string,
+  contentType: string,
+  filename = "server-name.bin",
+): attachmentsSdk.AttachmentBytes {
+  return { blob: new Blob([body], { type: contentType }), contentType, filename };
 }
 
 beforeEach(() => {
@@ -54,7 +60,7 @@ async function openChip(name: string) {
 
 describe("AttachmentChip", () => {
   it("previews an image in a modal and downloads the fetched bytes", async () => {
-    const payload = bytes("png-bytes", "image/png");
+    const payload = bytes("png-bytes", "image/png", "1111.jpg");
     fetchAttachment.mockResolvedValue(payload);
     renderChip(IMAGE);
 
@@ -66,13 +72,18 @@ describe("AttachmentChip", () => {
     expect(createObjectURL.mock.calls[0][0].type).toBe("image/png");
 
     await userEvent.click(screen.getByTestId("console-attachment-download"));
-    expect(saveBlob).toHaveBeenCalledWith(payload.blob, IMAGE.name);
+    // Saved under the server's name, not the chip label.
+    expect(saveBlob).toHaveBeenCalledWith(payload.blob, "1111.jpg");
   });
 
   it("previews a PDF inline as an application/pdf blob", async () => {
     // The object URL's blob is re-typed to the whitelisted server type — whatever
     // type the fetched blob itself carried (here: an untyped one).
-    fetchAttachment.mockResolvedValue({ blob: new Blob(["%PDF-1.7"]), contentType: "application/pdf" });
+    fetchAttachment.mockResolvedValue({
+      blob: new Blob(["%PDF-1.7"]),
+      contentType: "application/pdf",
+      filename: "报告.pdf",
+    });
     renderChip(PDF);
 
     const modal = await openChip("报告");
@@ -120,7 +131,7 @@ describe("AttachmentChip", () => {
   });
 
   it("downloads an Office document directly, labelled as a download", async () => {
-    const payload = bytes("PK", "application/octet-stream");
+    const payload = bytes("PK", "application/octet-stream", "合同-3f9a1c2b.docx");
     fetchAttachment.mockResolvedValue(payload);
     renderChip(DOCX);
 
@@ -128,7 +139,9 @@ describe("AttachmentChip", () => {
     expect(chip).toHaveAccessibleName(/点击下载|click to download/);
     await userEvent.click(chip);
 
-    await waitFor(() => expect(saveBlob).toHaveBeenCalledWith(payload.blob, DOCX.name));
+    await waitFor(() =>
+      expect(saveBlob).toHaveBeenCalledWith(payload.blob, "合同-3f9a1c2b.docx"),
+    );
     expect(screen.queryByTestId("console-attachment-preview")).toBeNull();
   });
 

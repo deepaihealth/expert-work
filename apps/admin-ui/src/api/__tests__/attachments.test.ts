@@ -45,7 +45,15 @@ afterEach(() => {
 
 describe("fetchSessionAttachment", () => {
   it("asks for the chip's ref in that thread, with the tenant passthrough", async () => {
-    const calls = respondWith(200, { "content-type": "image/png" }, new Blob(["x"]));
+    const calls = respondWith(
+      200,
+      {
+        "content-type": "image/png",
+        "content-disposition":
+          "inline; filename=\"____.png\"; filename*=UTF-8''%E5%BE%AE%E4%BF%A1.png",
+      },
+      new Blob(["x"]),
+    );
     const ref = "expert_work://image/t/th/i.png";
 
     const got = await fetchSessionAttachment("th/1", ref, TENANT);
@@ -54,6 +62,8 @@ describe("fetchSessionAttachment", () => {
     expect(calls[0].params).toEqual({ ref, tenant_id: TENANT });
     expect(calls[0].responseType).toBe("blob");
     expect(got.contentType).toBe("image/png");
+    // The save-as name is the server's RFC 5987 ``filename*``, decoded.
+    expect(got.filename).toBe("微信.png");
   });
 
   it("omits tenant_id for the home tenant and normalises the content type", async () => {
@@ -63,6 +73,8 @@ describe("fetchSessionAttachment", () => {
 
     expect(calls[0].params).toEqual({ ref: "uploads/a.txt" });
     expect(got.contentType).toBe("text/plain");
+    // No Content-Disposition → the stored leaf of the ref.
+    expect(got.filename).toBe("a.txt");
   });
 
   it("a 410 is recognised as gone; other failures are not", async () => {
@@ -83,8 +95,16 @@ describe("previewKindOf", () => {
   it("previews only whitelisted server types", () => {
     expect(previewKindOf("image/jpeg")).toBe("image");
     expect(previewKindOf("application/pdf")).toBe("pdf");
-    expect(previewKindOf("text/csv")).toBe("text");
-    for (const unsafe of ["image/svg+xml", "text/html", "application/octet-stream", "constructor"]) {
+    expect(previewKindOf("text/plain")).toBe("text");
+    // The server sends md / csv as text/plain; nothing else is previewed.
+    for (const unsafe of [
+      "text/csv",
+      "text/markdown",
+      "image/svg+xml",
+      "text/html",
+      "application/octet-stream",
+      "constructor",
+    ]) {
       expect(previewKindOf(unsafe)).toBeNull();
     }
   });
