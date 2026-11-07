@@ -123,6 +123,23 @@ class SqlUserUploadStore(UserUploadStore):
             rows = (await session.execute(stmt)).scalars().all()
         return [_row_to_dto(row) for row in rows]
 
+    async def list_documents_for_thread_ref(
+        self, *, tenant_id: UUID, thread_id: UUID, ref: str
+    ) -> list[UserUpload]:
+        stmt = (
+            select(UserUploadRow)
+            .where(
+                UserUploadRow.tenant_id == tenant_id,
+                UserUploadRow.thread_id == thread_id,
+                UserUploadRow.kind == "document",
+                UserUploadRow.ref == ref,
+            )
+            .order_by(UserUploadRow.created_at.asc(), UserUploadRow.id.asc())
+        )
+        async with self._sf() as session:
+            rows = (await session.execute(stmt)).scalars().all()
+        return [_row_to_dto(row) for row in rows]
+
     async def list_expired(
         self, *, now: datetime, default_days: int, limit: int = 1000
     ) -> list[ExpiredUpload]:

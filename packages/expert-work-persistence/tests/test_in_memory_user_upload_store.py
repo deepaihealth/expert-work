@@ -376,3 +376,52 @@ async def test_hard_delete_removes_one_row_of_this_tenant() -> None:
     assert not await store.hard_delete(upload_id=upload_id, tenant_id=tenant)
     assert await store.get(upload_id=upload_id, tenant_id=tenant) is None
     assert await store.get(upload_id=other_id, tenant_id=tenant) is not None
+
+
+@pytest.mark.asyncio
+async def test_list_documents_for_thread_ref_includes_deleted_rows() -> None:
+    """B-295 —— 控制台附件预览要分清「登记过、已删」与「从没登记过」:本租户、本会话、文档类、
+    同 ``ref`` 的行,**含已删的**,按上传先后。"""
+    store = InMemoryUserUploadStore()
+    tenant, thread, user = uuid4(), uuid4(), uuid4()
+
+    async def _put(
+        *,
+        thread_id: UUID = thread,
+        tenant_id: UUID = tenant,
+        kind: str = "document",
+        ref: str = "uploads/a.pdf",
+    ) -> UUID:
+        uid = uuid4()
+        await store.insert(
+            upload_id=uid,
+            tenant_id=tenant_id,
+            user_id=user,
+            thread_id=thread_id,
+            kind=kind,  # type: ignore[arg-type]
+            ref=ref,
+            mime_type="application/pdf",
+            size_bytes=3,
+            filename="a.pdf",
+        )
+        return uid
+
+    live = await _put()
+    gone = await _put()
+    await store.soft_delete(upload_id=gone, tenant_id=tenant, now=datetime.now(UTC))
+    await _put(ref="uploads/b.pdf")
+    await _put(thread_id=uuid4())
+    await _put(tenant_id=uuid4())
+    await _put(kind="image")
+
+    rows = await store.list_documents_for_thread_ref(
+        tenant_id=tenant, thread_id=thread, ref="uploads/a.pdf"
+    )
+    assert [r.id for r in rows] == [live, gone]
+    assert [r.deleted_at is None for r in rows] == [True, False]
+    assert (
+        await store.list_documents_for_thread_ref(
+            tenant_id=tenant, thread_id=thread, ref="uploads/none.pdf"
+        )
+        == []
+    )

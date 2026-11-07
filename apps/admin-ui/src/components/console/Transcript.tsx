@@ -17,6 +17,7 @@ import { Empty } from "antd";
 import { useTranslation } from "react-i18next";
 
 import type { ApprovalItem } from "../../api/approvals";
+import type { TenantScope } from "../../api/client";
 import type { RateBook } from "../../api/cost";
 import type { HistoryMessage, SessionFeedbackItem } from "../../api/sessions";
 import type { FireNowResult } from "../../api/triggers";
@@ -52,6 +53,8 @@ export interface TranscriptProps {
   /** ③ 反馈 — Agent 配置 variables 的声明序,透传 ``TurnBlock.inputOrder``。
    *  Omitted → 零变化(入参保持后端 JSON 序)。 */
   inputOrder?: readonly string[];
+  /** B-295 — 透传 ``TurnBlock.tenantScope``(附件预览的 ``tenant_id``)。 */
+  tenantScope?: TenantScope;
   registerHistoryRow: (
     runId: string,
     threadId: string,
@@ -111,6 +114,7 @@ export function Transcript(props: TranscriptProps): JSX.Element {
     streamTurnKey,
     liveByStep,
     inputOrder,
+    tenantScope,
     registerHistoryRow,
     rateBook,
     isSystemAdmin,
@@ -235,6 +239,7 @@ export function Transcript(props: TranscriptProps): JSX.Element {
             onInspect={onInspectTurn}
             onInspectRow={onInspectRow}
             inputOrder={inputOrder}
+            tenantScope={tenantScope}
             rateBook={rateBook}
             isSystemAdmin={isSystemAdmin}
             readOnly={readOnly}
@@ -287,6 +292,7 @@ export function Transcript(props: TranscriptProps): JSX.Element {
           onInspectRow={onInspectRow}
           liveByStep={turn.key === streamTurnKey ? liveByStep : undefined}
           inputOrder={inputOrder}
+          tenantScope={tenantScope}
           rateBook={rateBook}
           isSystemAdmin={isSystemAdmin}
           readOnly={readOnly}

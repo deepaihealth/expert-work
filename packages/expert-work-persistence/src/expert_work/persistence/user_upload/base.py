@@ -94,6 +94,14 @@ class UserUploadStore(abc.ABC):
         的上传件。"""
 
     @abc.abstractmethod
+    async def list_documents_for_thread_ref(
+        self, *, tenant_id: UUID, thread_id: UUID, ref: str
+    ) -> list[UserUpload]:
+        """B-295 —— 这个会话里登记为 ``ref`` 的文档类行,**含已删的**,按上传先后。控制台附件
+        预览据此分清「登记过、都删了」(过期)与「从没登记过」(B-281 之前的控制台上传,按路径
+        给)。"""
+
+    @abc.abstractmethod
     async def list_expired(
         self, *, now: datetime, default_days: int, limit: int = 1000
     ) -> list[ExpiredUpload]:
