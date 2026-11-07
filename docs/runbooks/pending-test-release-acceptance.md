@@ -2262,3 +2262,24 @@ asyncio.run(main())
 - [x] **102.1 被拒不留会话**:新用户、不带 `session_id`,`files:[{"upload_id":"upl_<不存在>"}]` 发一轮;另一个新用户在上传端点传一个不支持的类型。判据:分别 404 `UPLOAD_NOT_FOUND`、400 `INVALID_UPLOAD`(与修复前相同);两人会话数都是 0、上传行 0。**没修好时**:各多一个空会话(11-06 §97.3 即如此)。 **11-07 测试 `fb03a0689` 过**
 - [x] **102.2 正常仍建一个**:新用户正常发一轮 → 200 `success`,会话数 1;同一用户再按 102.1 发一次被拒 → 404,会话数仍 1。 **11-07 测试 `fb03a0689` 过**
 - [x] **102.3 收尾**:删会话、清理终端用户。 **11-07 测试 `fb03a0689` 过**
+
+## §103 知识库关键词检索按 BM25 排序(B-206 K-9,路 B)
+
+**背景**:关键词路以前按「覆盖率」排(问题里的词命中了几个,稀有词权重高,`ts_rank` 只破平),不看词出现几次、不看段多长。现在按 BM25:同一个词多出现几次加分但递减(k1 = 1.2),短段比长段占便宜(b = 0.75),词的稀有度照旧按本次检索范围内的段现算(租户 + 所选库,停用的段 / 文档不算)。编号命中(+2.0)、整句原样命中(+1.5)两项加分保留,BM25 部分除以它的上限,落在 0~1 之间,所以 `keyword_score` 的量级不变:普通命中 < 1,带编号 ≥ 2。
+
+- 新增迁移 **0187**:`knowledge_chunk.keyword_token_count`(BM25 的段长 = 正文按关键词索引切出的词数,不含文档名;父段为 NULL),升级时从已存的关键词向量一次回填;新写入的段由写入侧算。
+- **不依赖 `pg_textsearch`**(路 A 没选:开发集上不比路 B 好、表格题退步,且它的词频统计跨所有租户)。测试 / 生产已装的插件不动,本次不建 bm25 索引;PG 16(CI)与 PG 17 同一套代码。
+- 降级:发布滚动期间旧版 pod 写的段没有段长(NULL),检索时按平均长度算,不报错;关键词路整体失败仍按 K-22 只用向量结果(行为不变)。
+
+**开发集(本机,免费,只跑关键词路)**:主集 mrr@10 0.924 → 0.918(逐题 +17 / −20,符号检验 p = 0.74)、前 10 名没有正确段 3.1% → 4.1%;真实问法集 0.470 → 0.482(+32 / −28,p = 0.70)、前 10 名没有正确段 32.2% → 29.6%;表格题(8 道)0.489 → 0.489。两集方向相反、都在噪声内 —— **是否合入等混合 + 重排的付费对比,用户定**。
+
+**怎么进**:测试环境控制台(system_admin,平台租户)建临时知识库 `acc-k9`,传三份小 markdown(内容见 103.3);库只读查询;命中测试走 `POST /v1/knowledge/bases/acc-k9/test`。**花费**:入库嵌入约 ¥0.01。
+
+- [ ] **103.1 迁移到位、存量已回填**:`SELECT version_num FROM alembic_version` 为 `0187_k9_keyword_token_count`;发布完成(所有 control-plane pod 都是新镜像)后只读查 `SELECT count(*) FILTER (WHERE content_tsv IS NOT NULL) AS rows, count(*) FILTER (WHERE content_tsv IS NOT NULL AND keyword_token_count IS NULL) AS missing, count(*) FILTER (WHERE chunk_type = 'parent' AND keyword_token_count IS NOT NULL) AS parent_with_length FROM knowledge_chunk`。判据:`missing` = 0(滚动期间旧 pod 写的段会是 NULL:有的话记下数字,它们按平均长度算、重新入库后补上,不算不过)、`parent_with_length` = 0。**没修好时**:列不存在,或 `missing` = `rows`。
+- [ ] **103.2 回填与写入侧一致**:只读查已有段里两种算法不一致的数:`SELECT count(*) FILTER (WHERE keyword_token_count <> (SELECT coalesce(sum(cardinality(positions)), 0) FROM unnest(ts_filter(content_tsv, '{d}')))) AS differ, max(abs(keyword_token_count - (SELECT coalesce(sum(cardinality(positions)), 0) FROM unnest(ts_filter(content_tsv, '{d}'))))) AS max_diff FROM knowledge_chunk WHERE content_tsv IS NOT NULL AND keyword_token_count IS NOT NULL`(回填的段两边按定义相等;这一查看的是 103.3 新写入的段)。判据:`differ` ≤ 段数的 0.1%、`max_diff` ≤ 1(开发集 45,775 段:不一致 < 0.05%,最多差 1 —— Postgres 的分词偶尔把 jieba 的一个词再拆开)。
+- [ ] **103.3 关键词检索按 BM25 排**:`acc-k9` 里三份文档,各只有一行(一份一段,免得切块时短节被合并):① `k9-a.md`:`苹果 沙拉 配方`;② `k9-b.md`:`苹果 沙拉` 后面接 40 个互不相同的无关词(如 `说明一 说明二 …`);③ `k9-c.md`:`品种 QXA-N7 的登记编号`。入库完成后命中测试 `{"query":"沙拉和苹果","method":"keyword","rerank":false,"top_k":5}`。判据:①排在②前面,两条 `keyword_score` 都在 0 到 1 之间且①更高;再查 `{"query":"QXA-N7","method":"keyword","rerank":false}`:③第一,`keyword_score` ≥ 2.0。**没修好时**:①②分数相同(都约 1.0,覆盖率满),顺序随读行顺序。
+- [ ] **103.4 有插件 / 没插件都一样**:测试库装着 `pg_textsearch`(`SELECT extversion FROM pg_extension WHERE extname = 'pg_textsearch'` 为 1.3.1),103.3 照常过;`SELECT count(*) FROM pg_indexes WHERE indexdef ILIKE '%USING bm25%'` 为 0(本次不建插件索引)。没插件的情形由 CI 集成测试(`pgvector:pg16`,不带插件)覆盖,记「集成测试覆盖」。
+- [ ] **103.5 没有段长的段照常排**:用户批准后对 `acc-k9` 段①执行 `UPDATE knowledge_chunk SET keyword_token_count = NULL WHERE kb_id = '<acc-k9 的 id>' AND content LIKE '%苹果 沙拉 配方%' AND chunk_type <> 'parent'`,重跑 103.3 第一条。判据:200、结果条数不变、段①的 `keyword_score` 仍在 0 到 1 之间(它按库里平均长度算)。**没修好时**:报错(500)或段①分数为 0 / 空。做完把这一段改回(或删库,见 103.6)。单测 `test_knowledge_bm25_length_sql.py::test_a_row_without_a_length_counts_as_the_average` 覆盖同一情形。
+- [ ] **103.6 收尾**:删 `acc-k9`。
+
+**生产(用户执行,随发布之后)**:只读跑 103.1 的查询(生产 10-29 时 0 个知识库,`rows` 可能为 0);有知识库时再在控制台对一个真实库做一次关键词命中测试,看 `keyword_score` 落在 0~1(带编号的 ≥ 2)。
