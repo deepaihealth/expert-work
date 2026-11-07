@@ -4,8 +4,11 @@
 起 run / 传文件。撤之前在会话的接单锁里确认:没有 run 行、没有别人的登记行;起 run 一侧
 (``spawn_run``)在同一把锁里重读会话行,会话已经被撤就回 404 ``SESSION_NOT_FOUND``。
 
-另外几条:撤的顺序(先会话行、再登记行、最后目录,目录删除有时限)、撤掉落下的文件后让
-工作区用量重算、建会话之后的意外异常也撤(异常原样抛出)。
+上传一侧在登记行写下之后,于同一把锁里重读会话行:会话已经被撤就删掉刚登记的行、回 404
+``SESSION_NOT_FOUND``,不回一个指向已删会话的 201。
+
+另外几条:撤的顺序(先会话行、再登记行、最后目录,目录删除有时限)、撤掉落下的文件后把记过的
+字节减回去、建会话之后的意外异常也撤(异常原样抛出)。
 """
 
 from __future__ import annotations
@@ -16,10 +19,13 @@ from typing import Any
 from uuid import UUID
 
 import pytest
+from fastapi.responses import JSONResponse
 
 from control_plane.api import _new_session_undo as undo_mod
 from control_plane.api import agents as agents_mod
 from control_plane.api import external_uploads as uploads_mod
+from control_plane.api import uploads as uploads_api
+from control_plane.api._external import ExternalScopeError, external_error
 from control_plane.api._external_agent_scope import agent_key_for_code
 from tests.new_session_fixtures import AGENT, PNG, Ctx, DenyQuota, new_session_ctx, unknown_file
 
@@ -47,9 +53,12 @@ async def _upload_doc(ctx: Ctx, raw: bytes, session_id: UUID | None = None) -> d
     return data
 
 
-def _during_admission(monkeypatch: pytest.MonkeyPatch, module: Any, action: Any) -> dict[str, Any]:
+def _during_admission(
+    monkeypatch: pytest.MonkeyPatch, module: Any, action: Any, *, deny: bool = False
+) -> dict[str, Any]:
     """``module.check_admission`` 第一次被调用时(也就是请求 A 已经建好新会话、还没被拒)先跑
-    ``action``(请求 B),再照常做配额判定。回一个字典,``action`` 的结果放在里面。"""
+    ``action``(请求 B),再照常做配额判定(``deny`` = 只把 A 这一次拒掉,B 照常放行)。回一个
+    字典,``action`` 的结果放在里面。"""
     real = module.check_admission
     seen: dict[str, Any] = {}
 
@@ -57,6 +66,8 @@ def _during_admission(monkeypatch: pytest.MonkeyPatch, module: Any, action: Any)
         if not seen:
             seen["started"] = True
             seen["result"] = await action()
+            if deny:
+                return JSONResponse(status_code=429, content={"success": False})
         return await real(**kwargs)
 
     monkeypatch.setattr(module, "check_admission", _admission)
@@ -138,6 +149,111 @@ async def test_a_file_uploaded_into_the_new_session_keeps_it_on_a_rejected_uploa
     )
     assert len(rows) == 1
     assert ctx.workspace_store.workspace_tree_deletes == []
+
+
+def _pause_image_registration(monkeypatch: pytest.MonkeyPatch) -> tuple[Any, Any]:
+    """B 的图片落进对象存储、``image_upload`` 行写下之后,登记 ``user_upload`` 之前停住:回
+    ``(落下了, 放行)`` 两个事件。"""
+    landed, release = asyncio.Event(), asyncio.Event()
+    real = uploads_api._land_image_upload
+
+    async def _land(**kwargs: Any) -> Any:
+        ref = await real(**kwargs)
+        landed.set()
+        await release.wait()
+        return ref
+
+    monkeypatch.setattr(uploads_mod, "_land_image_upload", _land)
+    return landed, release
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("a_rejected", ["run", "upload"])
+async def test_an_image_half_uploaded_into_the_new_session_keeps_it(
+    ctx: Ctx, monkeypatch: pytest.MonkeyPatch, a_rejected: str
+) -> None:
+    """A 被拒、撤会话的时候,B 往 S 里传的 PNG 只写了 ``image_upload`` 行、还没登记:只有图片行
+    这一条能告诉 A「有人在用」。S 留着,B 照常 201。"""
+    landed, release = _pause_image_registration(monkeypatch)
+    b: dict[str, Any] = {}
+
+    async def _b() -> UUID:
+        borrowed = await _only_session(ctx)
+        b["task"] = asyncio.create_task(
+            ctx.upload(name="a.png", raw=PNG, mime="image/png", session_id=borrowed)
+        )
+        await landed.wait()
+        return borrowed
+
+    if a_rejected == "run":
+        seen = _during_admission(monkeypatch, agents_mod, _b)
+        resp = await ctx.run(user_id="u1", files=[unknown_file()])
+        assert resp.status_code == 404, resp.text
+    else:
+        seen = _during_admission(monkeypatch, uploads_mod, _b, deny=True)
+        resp = await ctx.upload(name="a.png", raw=PNG, mime="image/png")
+        assert resp.status_code == 429, resp.text
+    release.set()
+    b_resp = await b["task"]
+
+    borrowed = seen["result"]
+    assert b_resp.status_code == 201, b_resp.text
+    assert b_resp.json()["data"]["session_id"] == str(borrowed)
+    assert await ctx.sessions() == [borrowed]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind", ["document", "image"])
+async def test_an_upload_whose_session_was_undone_meanwhile_is_404(
+    ctx: Ctx, monkeypatch: pytest.MonkeyPatch, kind: str
+) -> None:
+    """B 往 S 里传文件;文件落下之后、登记之前,A 把 S 撤了(这里:直接删会话行)。B 不能回一个
+    指向已删会话的 201:删掉刚登记的行,回与「会话不存在」逐字相同的 404。"""
+    bound = await ctx.client.post(f"/v1/agents/{AGENT}/sessions", json={"user_id": "u1"})
+    session_id = UUID(bound.json()["data"]["session_id"])
+    threads = ctx.app.state.thread_meta_repo
+
+    async def _undo_meanwhile() -> None:
+        await threads.delete(session_id, tenant_id=ctx.tenant_id)
+
+    if kind == "document":
+        real_register = uploads_api.register_document_upload
+
+        async def _register(*args: Any, **kwargs: Any) -> Any:
+            await _undo_meanwhile()
+            return await real_register(*args, **kwargs)
+
+        monkeypatch.setattr(uploads_mod, "register_document_upload", _register)
+        resp = await ctx.upload(
+            name="report.pdf", raw=b"%PDF-1.4 B", mime="application/pdf", session_id=session_id
+        )
+    else:
+        real_land = uploads_api._land_image_upload
+
+        async def _land(**kwargs: Any) -> Any:
+            ref = await real_land(**kwargs)
+            await _undo_meanwhile()
+            return ref
+
+        monkeypatch.setattr(uploads_mod, "_land_image_upload", _land)
+        resp = await ctx.upload(name="a.png", raw=PNG, mime="image/png", session_id=session_id)
+
+    assert resp.status_code == 404, resp.text
+    assert resp.content == _unknown_session_body()
+    assert ctx.app.state.user_upload_store._rows == {}
+    images = await ctx.app.state.image_upload_store.list_for_threads(
+        tenant_id=ctx.tenant_id, thread_ids=[session_id]
+    )
+    assert images == []
+
+
+def _unknown_session_body() -> bytes:
+    """上传端点对「会话不存在」今天回的字节(``load_owned_session`` → ``external_error``)。"""
+    return bytes(
+        external_error(
+            ExternalScopeError("SESSION_NOT_FOUND", "session not found for this user / agent", 404)
+        ).body
+    )
 
 
 @pytest.mark.asyncio
@@ -233,25 +349,26 @@ async def test_a_hanging_directory_delete_does_not_hold_the_rejection(
     assert await ctx.sessions() == [source]
 
 
+class _BoomError(RuntimeError):
+    pass
+
+
 class _RecordingWorkspaceQuota:
-    """结构上满足落盘记账用到的那几个方法;记下 ``refresh_soon``。"""
+    """结构上满足落盘记账用到的那几个方法;记下每一笔 ``note_written``。"""
 
     def __init__(self) -> None:
-        self.refreshed: list[tuple[UUID, UUID]] = []
+        self.written: list[tuple[UUID, UUID, int]] = []
 
     async def check_upload(self, *, tenant_id: UUID, user_id: UUID, incoming_bytes: int) -> None:
         del tenant_id, user_id, incoming_bytes
 
     async def note_written(self, *, tenant_id: UUID, user_id: UUID, delta_bytes: int) -> None:
-        del tenant_id, user_id, delta_bytes
-
-    def refresh_soon(self, *, tenant_id: UUID, user_id: UUID) -> None:
-        self.refreshed.append((tenant_id, user_id))
+        self.written.append((tenant_id, user_id, delta_bytes))
 
 
 @pytest.mark.asyncio
-async def test_undoing_landed_files_asks_for_a_usage_refresh(ctx: Ctx) -> None:
-    """复制进新会话时记过 ``note_written(+字节)``,撤的时候没有对应的减项:让用量重算。"""
+async def test_undoing_copied_files_takes_their_bytes_back(ctx: Ctx) -> None:
+    """复制进新会话时记过 ``note_written(+字节)``;撤掉之后记一笔同样大小的减项。"""
     quota = _RecordingWorkspaceQuota()
     ctx.app.state.workspace_quota_service = quota
 
@@ -259,11 +376,50 @@ async def test_undoing_landed_files_asks_for_a_usage_refresh(ctx: Ctx) -> None:
 
     assert resp.status_code == 404, resp.text
     owner = (await ctx.app.state.thread_meta_repo.get(source, tenant_id=ctx.tenant_id)).user_id
-    assert quota.refreshed == [(ctx.tenant_id, owner)]
+    size = len(b"%PDF-1.4 A")
+    # 源会话的那次上传 +,复制进新会话 +,撤掉 -。
+    assert quota.written == [(ctx.tenant_id, owner, d) for d in (size, size, -size)]
 
 
 @pytest.mark.asyncio
-async def test_a_rejection_without_landed_files_asks_for_no_refresh(ctx: Ctx) -> None:
+async def test_undoing_a_landed_upload_takes_its_bytes_back(
+    ctx: Ctx, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    quota = _RecordingWorkspaceQuota()
+    ctx.app.state.workspace_quota_service = quota
+
+    async def _raise(*_: Any, **__: Any) -> Any:
+        raise _BoomError("db down")
+
+    monkeypatch.setattr(uploads_mod, "register_document_upload", _raise)
+
+    with pytest.raises(_BoomError):
+        await ctx.upload(name="report.pdf", raw=b"%PDF-1.4 A", mime="application/pdf")
+
+    assert [d for _t, _u, d in quota.written] == [len(b"%PDF-1.4 A"), -len(b"%PDF-1.4 A")]
+
+
+@pytest.mark.asyncio
+async def test_bytes_are_not_taken_back_when_the_directory_stays(
+    ctx: Ctx, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """目录没删掉(超时 / 出错)时字节还在盘上:不减,留给重算与孤儿目录扫描。"""
+    quota = _RecordingWorkspaceQuota()
+    ctx.app.state.workspace_quota_service = quota
+
+    async def _fail(**_: Any) -> None:
+        raise OSError("nas")
+
+    monkeypatch.setattr(ctx.workspace_store, "delete_tree", _fail)
+
+    _source, resp = await _partial_copy_run(ctx)
+
+    assert resp.status_code == 404, resp.text
+    assert all(d > 0 for _t, _u, d in quota.written), quota.written
+
+
+@pytest.mark.asyncio
+async def test_a_rejection_without_landed_files_takes_nothing_back(ctx: Ctx) -> None:
     quota = _RecordingWorkspaceQuota()
     ctx.app.state.workspace_quota_service = quota
 
@@ -271,16 +427,12 @@ async def test_a_rejection_without_landed_files_asks_for_no_refresh(ctx: Ctx) ->
 
     assert resp.status_code == 422, resp.text
     assert await ctx.sessions() == []
-    assert quota.refreshed == []
+    assert quota.written == []
 
 
 # ---------------------------------------------------------------------------
 # 建会话之后的意外异常:撤掉新会话,异常原样抛出。
 # ---------------------------------------------------------------------------
-
-
-class _BoomError(RuntimeError):
-    pass
 
 
 @pytest.mark.asyncio

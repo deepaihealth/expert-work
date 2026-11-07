@@ -139,6 +139,11 @@ class UserUploadStore(abc.ABC):
         the whole "expired" state — no new column."""
 
     @abc.abstractmethod
+    async def hard_delete(self, *, upload_id: UUID, tenant_id: UUID) -> bool:
+        """B-293 —— 删掉一行(不留墓碑);``True`` = 删到了。只给「刚登记、id 还没回给对接方」
+        的行用:上传落地期间会话被撤,登记行随之撤回。"""
+
+    @abc.abstractmethod
     async def delete_all_for_user(self, *, tenant_id: UUID, user_id: UUID) -> int:
         """Phase 3a (purge_user) — hard-delete EVERY upload row for a user.
 

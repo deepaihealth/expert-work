@@ -12,8 +12,8 @@
 撤的顺序同会话彻底删除:会话行先删(之后剩下的目录由留存作业的孤儿目录扫描兜),再删本请求
 登记的行(id 从没给过对接方,直接删,不留墓碑),最后删会话自己的目录(``agents/<key>/threads/
 <id>/``;老视图的会话落 agent 共用的 ``uploads/``,同 purge 不删)—— 有时限:落盘出错那条路上
-沙箱本来就在出错,拒绝回包不能再被它拖住。落下过文件就让工作区用量重算(落盘时记过
-``note_written(+字节)``,这里没有对应的减项)。
+沙箱本来就在出错,拒绝回包不能再被它拖住。目录删掉了,就把本请求落盘时记过的
+``note_written(+字节)`` 减回去(``add_size`` 以 0 为下限);目录没删掉时字节还在盘上,不减。
 
 不撤:终端用户行与 ``agent_instance`` 绑定 —— 两者都按 ``user_id`` 幂等(重试不会多),同一用户的
 并发请求共用它们,``POST .../sessions`` 首次接触同样会铸。
@@ -87,11 +87,14 @@ async def discard_new_session(
     workspace_layout: WorkspaceLayout,
     landed_files: bool,
     own_upload_ids: Collection[UUID] = (),
+    landed_bytes: int = 0,
 ) -> None:
     """撤掉本请求建的会话 ``thread_id``;有人在用就不撤。
 
     ``landed_files`` = 这个请求可能往新会话里落过东西(run 的 ``files[]`` 跨会话复制;上传落盘)。
-    ``own_upload_ids`` = 本请求在新会话里登记的行(跨会话复制),不算「别人在用」。
+    ``own_upload_ids`` = 本请求在新会话里登记的行(跨会话复制),不算「别人在用」;它们的
+    ``size_bytes`` 就是复制时记过的字节。``landed_bytes`` = 另外落下、没有登记行的字节(上传
+    落盘之后登记出错)。
     """
     try:
         async with supersede_thread_lock(undo.session_factory, thread_id):
@@ -114,6 +117,8 @@ async def discard_new_session(
             end_user_id=end_user_id,
             agent_code=agent_code,
             workspace_layout=workspace_layout,
+            own_upload_ids=own_upload_ids,
+            landed_bytes=landed_bytes,
         )
 
 
@@ -138,8 +143,15 @@ async def _remove_landed(
     end_user_id: UUID,
     agent_code: str,
     workspace_layout: WorkspaceLayout,
+    own_upload_ids: Collection[UUID],
+    landed_bytes: int,
 ) -> None:
+    own = set(own_upload_ids)
     try:
+        rows = await undo.uploads.list_documents_for_thread(
+            tenant_id=tenant_id, thread_id=thread_id
+        )
+        landed_bytes += sum(row.size_bytes for row in rows if row.id in own)
         await undo.uploads.delete_for_threads(tenant_id=tenant_id, thread_ids=[thread_id])
     except Exception as exc:
         logger.warning("new_session.discard_uploads_failed error=%s", type(exc).__name__)
@@ -157,8 +169,11 @@ async def _remove_landed(
             )
         except Exception as exc:  # 含超时:会话行已经没了,留存作业的孤儿目录扫描兜
             logger.warning("new_session.discard_dir_failed error=%s", type(exc).__name__)
-    if undo.quota_service is not None:
-        try:
-            undo.quota_service.refresh_soon(tenant_id=tenant_id, user_id=end_user_id)
-        except Exception as exc:
-            logger.warning("new_session.discard_quota_refresh_failed error=%s", type(exc).__name__)
+            return
+        if landed_bytes > 0 and undo.quota_service is not None:
+            try:
+                await undo.quota_service.note_written(
+                    tenant_id=tenant_id, user_id=end_user_id, delta_bytes=-landed_bytes
+                )
+            except Exception as exc:
+                logger.warning("new_session.discard_quota_failed error=%s", type(exc).__name__)
