@@ -2311,8 +2311,8 @@ asyncio.run(main())
 
 - `inspect_template.py 模板.pptx --texts`:每页列出所有带字的形状(含组合内、嵌套组合、表格单元格),带地址 `页:形状id[/组内id][@行,列]`、位置、预览、段数、生效字号(沿继承链)、autofit / 换行、按当前字号约能放几个汉字;图表 / SmartArt / 图片列为 `locked`。不带 `--texts` 时原有 `layouts` / `slides[].shapes` 输出不变。
 - 新 `fill_template.py 模板.pptx spec.json 成品.pptx`:按地址换字,保留段落格式和首个文字段的字号 / 颜色 / 粗细,其它形状逐字节不动;可复制 / 调序页,删页必须显式 `drop_unlisted`;地址不存在或改不了时整份不保存并一次列出全部问题;输出估计溢出的地址(估算,标明误差)。
-- 复制页(`duplicate_slide.py` 与 `slides` 模式共用)连同页面背景(含背景图)、切换效果、隐藏 / 不显示母版图形等页级设置一起复制;删页 / 调序后分节跟着更新、被删的页从自定义放映里去掉,有页链接指向被删页时在 `warnings` 里提示。
-- 读不了的形状只在那一条上报 `error`,不影响整页;同页重复 id 标 `ambiguous`、拒绝填;竖排、隐藏形状有标记;估不了的列进 `overflow_unknown`,接近放满的标 `near`;`--texts` 为紧凑 JSON,大文件用 `--slides 1-8` 分批。
+- 复制页(`duplicate_slide.py` 与 `slides` 模式共用)连同页面背景(含背景图)、切换效果、隐藏 / 不显示母版图形等页级设置一起复制;删页 / 调序后分节跟着更新(调序把一节拆散时每段连续的页各成一节)、被删的页从自定义放映里去掉,留下的页上指向被删页的跳转链接连同关系一起去掉并在 `warnings` 里提示。
+- 读不了的形状只在那一条上报 `error`,不影响整页;同页重复 id 标 `ambiguous`、拒绝填;竖排、隐藏形状有标记;估不了的列进 `overflow_unknown`,接近放满的单列在 `near`(不用改短);`--texts` 为紧凑 JSON,超过约 18,000 字按整页截断并给出 `more`,照它的 `--slides` 接着看。
 - SKILL.md「套用模板」改为四步:inspect → 写 spec 填值 → 一次改完所有溢出 → 渲染全部改动页、问题记全后一次改完。
 
 **怎么进**:测试控制台(system_admin,平台租户)建一个临时智能体(只绑平台 pptx 技能 + 沙箱,模型用测试常用主模型,能看图),在调试台跑。**模板用通用合成件,不用任何客户文件**:本机生成 `uv run --no-sync python -c "import sys; sys.path.insert(0, 'platform-skills/tests/in_image'); import _pptx_fixtures as f; f.build_designed_deck('通用模板.pptx')"`(6 页:占位符版式页、自由文本框页含混排字号与三种 autofit、组合 / 嵌套组合页、表格页含合并格、图表 + SmartArt + 图片页)。**花费**:4 轮带 PPT 的对话(改前 / 改后各 1 轮套模板 + 新建回归各 1 轮),按测试模型价目约几元。
