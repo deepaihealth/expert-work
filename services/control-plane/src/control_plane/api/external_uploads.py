@@ -62,7 +62,7 @@ from control_plane.api._external_agent_scope import agent_key_for_code
 from control_plane.api._quota_admission import check_admission
 from control_plane.api._user_scope import get_user_repo
 from control_plane.api._workspace_shared import thread_workspace_path
-from control_plane.api.agents import _resolve_session, _SessionError
+from control_plane.api.agents import _discard_new_session, _resolve_session, _SessionError
 from control_plane.api.uploads import (
     UPLOAD_ERROR_CODES,
     _handle_document_upload,
@@ -284,6 +284,21 @@ def build_external_uploads_router() -> APIRouter:
             end_user_id = meta.user_id
             layout = meta.workspace_layout
 
+        async def _discard_if_new() -> None:
+            # B-293 —— 上传被拒时调:本请求自己建的会话(连同落盘失败可能留下的半份文件)不留。
+            if session_id is None:
+                await _discard_new_session(
+                    tenant_id=tenant_id,
+                    thread_id=thread_id,
+                    end_user_id=end_user_id,
+                    agent_code=agent_code,
+                    workspace_layout=layout,
+                    landed_files=True,
+                    threads=threads,
+                    uploads_store=uploads,
+                    workspace_store=workspace_store,
+                )
+
         try:
             if not file.filename:
                 raise HTTPException(status_code=400, detail="uploaded file has no filename")
@@ -354,6 +369,7 @@ def build_external_uploads_router() -> APIRouter:
                 cost_overrides={QuotaDimension.IMAGE_STORAGE_BYTES: len(raw)},
             )
             if denial is not None:
+                await _discard_if_new()
                 return denial
 
             image_ref = await _land_image_upload(
@@ -396,6 +412,7 @@ def build_external_uploads_router() -> APIRouter:
                 },
             )
         except HTTPException as exc:
+            await _discard_if_new()
             return _upload_error_envelope(exc)
 
     @router.get(

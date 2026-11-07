@@ -6,10 +6,14 @@
 (``_resolve_session``)、再做配额 / 构建 / ``files[]`` / 上限这些可能拒绝的检查。
 
 带 ``session_id`` 续一条已有会话的请求被拒时,那条会话原样留着。
+
+``POST /v1/agents/{code}/uploads`` 不带 ``session_id`` 时同样先建会话,再校验文件名 / 类型 /
+图片配额 / 落盘;被拒时同一个规矩。
 """
 
 from __future__ import annotations
 
+import base64
 from collections.abc import AsyncIterator
 from copy import deepcopy
 from dataclasses import dataclass
@@ -31,7 +35,13 @@ from control_plane.audit import build_default_audit_logger
 from control_plane.settings import Settings
 from expert_work.common.lifecycle import Lifecycle
 from expert_work.persistence.audit_log import InMemoryAuditLogStore
-from expert_work.protocol import AgentSpec, render_upload_id
+from expert_work.protocol import (
+    AgentSpec,
+    CheckResult,
+    QuotaDimension,
+    parse_upload_id,
+    render_upload_id,
+)
 from expert_work.runtime.runs import (
     DisconnectMode,
     InMemoryRunEventStore,
@@ -43,7 +53,7 @@ from expert_work.runtime.runs import (
 from expert_work.runtime.runs.store import MAX_LIST_LIMIT
 from expert_work.runtime.storage import InMemoryObjectStore
 from orchestrator import AgentFactoryError
-from orchestrator.tools import RecordingWorkspaceStore
+from orchestrator.tools import RecordingWorkspaceStore, SandboxSupervisorError
 from tests.agent_fixtures import stub_agent_runtime
 from tests.auth_fixtures import TEST_AUDIENCE, TEST_ISSUER, build_test_jwt_verifier, make_test_jwt
 
@@ -97,6 +107,22 @@ class _ConflictOnceRunStore(InMemoryRunStore):
         await super().create(info)
 
 
+def _multipart(data: dict[str, str], *, name: str, raw: bytes, mime: str) -> tuple[bytes, str]:
+    """手写 multipart:httpx 对空文件名干脆不写 ``filename``(服务端就当成普通表单字段、在进
+    端点之前 422),而客户端照样可以发 ``filename=""``(Starlette 收成文件名为空的上传)。"""
+    boundary = "b293-boundary"
+    head = "".join(
+        f'--{boundary}\r\nContent-Disposition: form-data; name="{key}"\r\n\r\n{value}\r\n'
+        for key, value in data.items()
+    )
+    file_head = (
+        f'--{boundary}\r\nContent-Disposition: form-data; name="file"; filename="{name}"\r\n'
+        f"Content-Type: {mime}\r\n\r\n"
+    )
+    body = (head + file_head).encode() + raw + f"\r\n--{boundary}--\r\n".encode()
+    return body, f"multipart/form-data; boundary={boundary}"
+
+
 @dataclass
 class _Ctx:
     app: Any
@@ -108,6 +134,15 @@ class _Ctx:
     async def run(self, **body: Any) -> Any:
         return await self.client.post(
             f"/v1/agents/{_AGENT}/runs", json={"input": "x", "mode": "queue"} | body
+        )
+
+    async def upload(
+        self, *, name: str, raw: bytes, mime: str, session_id: UUID | None = None
+    ) -> Any:
+        data = {"user_id": "u1"} | ({"session_id": str(session_id)} if session_id else {})
+        body, content_type = _multipart(data, name=name, raw=raw, mime=mime)
+        return await self.client.post(
+            f"/v1/agents/{_AGENT}/uploads", content=body, headers={"Content-Type": content_type}
         )
 
     async def sessions(self) -> list[UUID]:
@@ -226,15 +261,72 @@ async def test_a_build_failure_leaves_no_session(
     assert await ctx.sessions() == []
 
 
+_OVER_LIMIT = ["x" * 9000]
+
+
 @pytest.mark.asyncio
-async def test_an_over_limit_request_is_rejected_before_anything_is_written(ctx: _Ctx) -> None:
-    """上限预检不依赖会话,挪到建会话之前:连终端用户都不铸。"""
-    resp = await ctx.run(user_id="u1", untrusted_content=["x" * 9000])
+async def test_an_over_limit_request_leaves_no_session(ctx: _Ctx) -> None:
+    resp = await ctx.run(user_id="u1", untrusted_content=_OVER_LIMIT)
 
     assert resp.status_code == 422, resp.text
-    assert resp.json()["error"]["code"] == "UNTRUSTED_CONTENT_BLOCK_TOO_LONG"
+    assert resp.json() == {
+        "success": False,
+        "data": None,
+        "error": {
+            "code": "UNTRUSTED_CONTENT_BLOCK_TOO_LONG",
+            "message": "untrusted_content[0] 超过 8192 字符",
+        },
+    }
     assert await ctx.sessions() == []
-    assert not await ctx.has_user("u1")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("case", "status", "error"),
+    [
+        (
+            "unknown_agent",
+            404,
+            {"code": "AGENT_NOT_FOUND", "message": "no active agent 'nope' for this tenant"},
+        ),
+        (
+            "unknown_session",
+            404,
+            {"code": "SESSION_NOT_FOUND", "message": "session not found for this user / agent"},
+        ),
+        (
+            "disabled_agent",
+            403,
+            {"code": "AGENT_DISABLED", "message": f"agent {_AGENT!r} is disabled"},
+        ),
+    ],
+)
+async def test_an_over_limit_request_reports_session_errors_first(
+    ctx: _Ctx,
+    monkeypatch: pytest.MonkeyPatch,
+    case: str,
+    status: int,
+    error: dict[str, str],
+) -> None:
+    """先后不变:会话解析的拒绝先于上限预检(一个请求同时撞上两者,回包与改动前一样)。"""
+    agent, body = _AGENT, {"user_id": "u1", "untrusted_content": _OVER_LIMIT}
+    if case == "unknown_agent":
+        agent = "nope"
+    elif case == "unknown_session":
+        body["session_id"] = str(uuid4())
+    else:
+
+        async def _disabled(*_: Any) -> bool:
+            return True
+
+        monkeypatch.setattr(ctx.app.state.agent_disable_service, "is_disabled", _disabled)
+
+    resp = await ctx.client.post(
+        f"/v1/agents/{agent}/runs", json={"input": "x", "mode": "queue"} | body
+    )
+
+    assert resp.status_code == status, resp.text
+    assert resp.json() == {"success": False, "data": None, "error": error}
 
 
 @pytest.mark.asyncio
@@ -315,3 +407,127 @@ async def test_files_copied_in_before_the_rejection_go_with_the_session(ctx: _Ct
     assert (
         len(await uploads.list_documents_for_thread(tenant_id=ctx.tenant_id, thread_id=source)) == 1
     )
+
+
+# ---------------------------------------------------------------------------
+# ``POST /v1/agents/{code}/uploads`` —— 不带 ``session_id`` 时建的会话,被拒就撤掉。
+# ---------------------------------------------------------------------------
+
+_PNG = base64.b64decode(
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg=="
+)
+
+
+class _DenyQuota:
+    """结构上满足 ``QuotaService``;``check`` 一律拒(图片配额)。"""
+
+    async def check(self, req: object) -> CheckResult:
+        del req
+        return CheckResult(
+            allowed=False,
+            blocked_dimension=QuotaDimension.IMAGE_UPLOAD_COUNT_30D,
+            retry_after_s=1,
+        )
+
+
+def _reject_upload(ctx: _Ctx, case: str) -> tuple[str, bytes, str]:
+    """把 ``ctx`` 摆成 ``case`` 那种拒绝,回要上传的 ``(文件名, 字节, 类型)``。"""
+    if case == "quota":
+        ctx.app.state.quota_service = _DenyQuota()
+        return "a.png", _PNG, "image/png"
+    if case == "landing":
+        ctx.workspace_store.workspace_write_error = SandboxSupervisorError("boom")
+        return "report.pdf", b"%PDF-1.4 A", "application/pdf"
+    if case == "no_filename":
+        return "", b"%PDF-1.4 A", "application/pdf"
+    return "x.bin", b"\x00\x01", "application/octet-stream"
+
+
+_UPLOAD_REJECTIONS = [
+    ("no_filename", 400, "uploaded file has no filename"),
+    ("unsupported", 400, "unsupported content type: 'application/octet-stream'"),
+    ("quota", 429, None),
+    ("landing", 502, "workspace write failed"),
+]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("case", "status", "message"), _UPLOAD_REJECTIONS)
+async def test_a_rejected_upload_on_a_new_session_leaves_no_session(
+    ctx: _Ctx, case: str, status: int, message: str | None
+) -> None:
+    name, raw, mime = _reject_upload(ctx, case)
+
+    resp = await ctx.upload(name=name, raw=raw, mime=mime)
+
+    assert resp.status_code == status, resp.text
+    body = resp.json()
+    assert body["success"] is False and body["data"] is None
+    if message is not None:
+        assert body["error"]["message"] == message
+    assert await ctx.sessions() == []
+    # 内存登记表的全部行(登记表没有按租户列全部的接口)。
+    assert ctx.app.state.user_upload_store._rows == {}
+
+
+@pytest.mark.asyncio
+async def test_a_landing_error_on_a_new_session_removes_its_directory(ctx: _Ctx) -> None:
+    """落盘失败时目录里可能已经留下半份文件(NAS 上写了一半):新会话的目录随会话一起删。"""
+    name, raw, mime = _reject_upload(ctx, "landing")
+
+    resp = await ctx.upload(name=name, raw=raw, mime=mime)
+
+    assert resp.status_code == 502, resp.text
+    prefix = f"agents/{agent_key_for_code(_AGENT)}/threads/"
+    deleted = [p for _t, _u, p in ctx.workspace_store.workspace_tree_deletes]
+    assert len(deleted) == 1 and deleted[0].startswith(prefix), deleted
+    thread_id = UUID(deleted[0].removeprefix(prefix))
+    assert await ctx.app.state.thread_meta_repo.get(thread_id, tenant_id=ctx.tenant_id) is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("case", "status", "message"), _UPLOAD_REJECTIONS)
+async def test_a_rejected_upload_into_an_existing_session_keeps_it(
+    ctx: _Ctx, case: str, status: int, message: str | None
+) -> None:
+    del message
+    first = await ctx.upload(name="report.pdf", raw=b"%PDF-1.4 first", mime="application/pdf")
+    assert first.status_code == 201, first.text
+    session_id = UUID(first.json()["data"]["session_id"])
+    name, raw, mime = _reject_upload(ctx, case)
+
+    resp = await ctx.upload(name=name, raw=raw, mime=mime, session_id=session_id)
+
+    assert resp.status_code == status, resp.text
+    assert await ctx.sessions() == [session_id]
+    uploads = ctx.app.state.user_upload_store
+    assert (
+        len(await uploads.list_documents_for_thread(tenant_id=ctx.tenant_id, thread_id=session_id))
+        == 1
+    )
+    assert ctx.workspace_store.workspace_tree_deletes == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("name", "raw", "mime", "kind"),
+    [
+        ("report.pdf", b"%PDF-1.4 A", "application/pdf", "document"),
+        ("a.png", _PNG, "image/png", "image"),
+    ],
+)
+async def test_a_successful_upload_on_a_new_session_keeps_it(
+    ctx: _Ctx, name: str, raw: bytes, mime: str, kind: str
+) -> None:
+    resp = await ctx.upload(name=name, raw=raw, mime=mime)
+
+    assert resp.status_code == 201, resp.text
+    data = resp.json()["data"]
+    assert data["type"] == kind
+    session_id = UUID(data["session_id"])
+    assert await ctx.sessions() == [session_id]
+    upload_id = parse_upload_id(data["upload_id"])
+    assert upload_id is not None
+    row = await ctx.app.state.user_upload_store.get(upload_id=upload_id, tenant_id=ctx.tenant_id)
+    assert row is not None and row.thread_id == session_id
+    assert ctx.workspace_store.workspace_tree_deletes == []

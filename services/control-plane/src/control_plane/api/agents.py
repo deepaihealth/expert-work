@@ -565,20 +565,22 @@ async def _discard_new_session(
     end_user_id: UUID,
     agent_code: str,
     workspace_layout: WorkspaceLayout,
-    copied_files: bool,
+    landed_files: bool,
     threads: ThreadMetaStore,
     uploads_store: UserUploadStore,
     workspace_store: WorkspaceStore | None,
 ) -> None:
-    """B-293 —— 不带 ``session_id`` 的 run 请求在起 run 之前被拒:撤掉本请求刚建的会话。
+    """B-293 —— 不带 ``session_id`` 的 run / 上传请求被拒(run 还没起、上传还没成功):撤掉本请求
+    刚建的会话。
 
     不撤的话对接方每重试一次,这位用户的会话列表里就多一条空会话(测试环境 2026-11-06:
     ``files[]`` 引用不存在的上传,404,空会话留下)。只给本请求自己建的会话用 —— 续一条已有
     会话的请求被拒,那条会话原样不动。
 
-    ``_resolve_session`` 建会话只写 ``thread_meta`` 一行(标题也在这一行上)。``files[]`` 里别的
-    会话的文档会先复制进新会话(``resolve_external_files``),第二条再被拒时那些副本已经落下:
-    新会话名下的登记行(id 从没给过对接方,直接删,不留墓碑)和新会话自己的目录
+    ``_resolve_session`` 建会话只写 ``thread_meta`` 一行(标题也在这一行上)。``landed_files`` =
+    这个请求可能已经往新会话里落了东西:run 的 ``files[]`` 里别的会话的文档先复制进新会话
+    (``resolve_external_files``),第二条再被拒时副本已经落下;上传落盘失败时可能留下半份文件。
+    撤的是新会话名下的登记行(id 从没给过对接方,直接删,不留墓碑)和新会话自己的目录
     (``agents/<key>/threads/<id>/``;老视图的会话落 agent 共用的 ``uploads/``,同 purge 不删)。
 
     不撤:终端用户行与 ``agent_instance`` 绑定 —— 两者都按 ``user_id`` 幂等(重试不会多),
@@ -587,7 +589,7 @@ async def _discard_new_session(
     尽力而为:每步失败只记异常类型,不改变给对接方的拒绝回包。会话行最后删;目录没删掉的
     由留存作业的孤儿目录扫描兜(会话行不在 → 目录删)。
     """
-    if copied_files:
+    if landed_files:
         try:
             await uploads_store.delete_for_threads(tenant_id=tenant_id, thread_ids=[thread_id])
         except Exception as exc:
@@ -1820,13 +1822,6 @@ def build_agents_router() -> APIRouter:
                     stream_format=payload.stream_format,
                 )
 
-        # B-293 —— 上限预检只看请求体,放在建会话之前:被它拒的请求什么都不写。
-        bounds = external_run_bounds_error(
-            untrusted_content=payload.untrusted_content, inputs=payload.inputs
-        )
-        if bounds is not None:
-            return bounds
-
         try:
             record, thread_id, end_user_id, workspace_layout = await _resolve_session(
                 tenant_id=tenant_id,
@@ -1856,7 +1851,7 @@ def build_agents_router() -> APIRouter:
                     end_user_id=end_user_id,
                     agent_code=agent_code,
                     workspace_layout=workspace_layout,
-                    copied_files=bool(payload.files),
+                    landed_files=bool(payload.files),
                     threads=threads,
                     uploads_store=uploads_store,
                     workspace_store=copier.workspace_store,
@@ -1914,6 +1909,13 @@ def build_agents_router() -> APIRouter:
                 detail.get("message", "invalid file reference"),
                 exc.status_code,
             )
+
+        bounds = external_run_bounds_error(
+            untrusted_content=payload.untrusted_content, inputs=payload.inputs
+        )
+        if bounds is not None:
+            await _discard_if_new()
+            return bounds
 
         run_payload = RunRequest(
             input=payload.input,
