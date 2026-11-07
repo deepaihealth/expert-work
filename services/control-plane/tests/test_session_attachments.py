@@ -455,10 +455,14 @@ async def test_rows_of_other_threads_or_names_do_not_decide(world: World) -> Non
 
 @pytest.mark.asyncio
 async def test_legacy_layout_document_needs_no_registry_row(world: World) -> None:
-    """Old-view conversations land uploads in the shared agent root, which has no
-    registry rows (B-281 deliberately does not register there): path-only."""
+    """Old-view conversations land uploads in the shared agent root, which console uploads
+    do not register in (B-281): path-only. Registry rows are not consulted there at all —
+    even a deleted row of this thread for the name (an external upload) does not expire a
+    file the shared root still holds (decision 2026-11-07: legacy stays path-only)."""
     world.set_layout("agent_root")
     world.workspace.workspace_file_contents = {f"agents/{_KEY}/uploads/a.txt": b"x"}
+    assert (await world.get("uploads/a.txt")).status_code == 200
+    await world.delete_upload(await world.register_upload("uploads/a.txt"))
     assert (await world.get("uploads/a.txt")).status_code == 200
 
 
