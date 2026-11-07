@@ -16,6 +16,7 @@
 import { useCallback, useMemo, useState, type JSX } from "react";
 
 import type { ApprovalItem } from "../../api/approvals";
+import type { TenantScope } from "../../api/client";
 import { costCnyOfBuckets, type RateBook } from "../../api/cost";
 import type { ThreadPlan } from "../../api/plan";
 import type { SessionFeedbackItem } from "../../api/sessions";
@@ -53,6 +54,9 @@ export interface TurnBlockProps {
   /** ③ 反馈 — Agent 配置 variables 的声明序,透传 ``UserBubble.inputOrder``。
    *  Omitted → 保持后端 JSON 序(零变化)。 */
   inputOrder?: readonly string[];
+  /** B-295 — ``tenant_id`` passthrough for the user bubble's attachment preview
+   *  (system admin viewing another tenant). Omitted → home tenant. */
+  tenantScope?: TenantScope;
   /** BUG-13(修订)— 本轮产出的计划快照。省略 → 不渲染轮内计划卡
    *  (`runHrefOf` 同款 opt-in:调试台不传,零变化)。 */
   plan?: ThreadPlan | null;
@@ -121,6 +125,7 @@ export function TurnBlock(props: TurnBlockProps): JSX.Element {
     onInspectRow,
     liveByStep,
     inputOrder,
+    tenantScope,
     plan,
     rateBook,
     readOnly,
@@ -217,6 +222,8 @@ export function TurnBlock(props: TurnBlockProps): JSX.Element {
           attachments={turn.turn.attachments}
           inputs={turn.turn.inputs}
           inputOrder={inputOrder}
+          threadId={threadId}
+          tenantScope={tenantScope}
         />
       )}
 

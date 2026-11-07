@@ -807,6 +807,7 @@ export function ConversationDetail() {
                     exportingKey={exportingId}
                     onCancelQueuedHistory={canOperate ? handleCancelQueued : undefined}
                     onDownloadArtifact={handleDownloadArtifact}
+                    tenantScope={concreteTenantScope(apiTenantScope)}
                     runHrefOf={runHrefOf}
                     planOf={planOf}
                     feedbackOf={feedbackOf}

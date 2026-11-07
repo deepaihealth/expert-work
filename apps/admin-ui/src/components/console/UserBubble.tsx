@@ -8,11 +8,13 @@
  * only right-aligned user bubble that already existed. Too thin for its own
  * test file (see the Task 10 brief) — covered by Task 11's TurnBlock tests.
  */
-import { Tag, Typography } from "antd";
+import { Typography } from "antd";
 import { useTranslation } from "react-i18next";
 
+import type { TenantScope } from "../../api/client";
 import { CopyButton } from "../CopyButton";
 import type { Attachment } from "../turn/types";
+import { AttachmentChip } from "./AttachmentChip";
 
 const { Text } = Typography;
 
@@ -46,9 +48,21 @@ export interface UserBubbleProps {
   /** ③ 反馈 — Agent 配置 variables 的声明序。省略 → 保持后端 JSON 序
    *  (拿不到 manifest 的页面不传,零变化)。 */
   inputOrder?: readonly string[];
+  /** B-295 — the conversation this message belongs to; with it each attachment chip
+   *  previews / downloads its file. Omitted → plain labels (zero change). */
+  threadId?: string | null;
+  /** B-295 — ``tenant_id`` passthrough for the attachment fetch (system admin). */
+  tenantScope?: TenantScope;
 }
 
-export function UserBubble({ input, attachments, inputs, inputOrder }: UserBubbleProps) {
+export function UserBubble({
+  input,
+  attachments,
+  inputs,
+  inputOrder,
+  threadId = null,
+  tenantScope,
+}: UserBubbleProps) {
   const { t } = useTranslation();
   const inputEntries = orderEntries(inputs ? Object.entries(inputs) : [], inputOrder);
   const inputsTotalChars = inputEntries.reduce((n, [k, v]) => n + k.length + v.length + 1, 0);
@@ -102,19 +116,12 @@ export function UserBubble({ input, attachments, inputs, inputOrder }: UserBubbl
         {attachments.length > 0 && (
           <div style={{ marginTop: 4 }}>
             {attachments.map((a) => (
-              // 终审 F2 — antd Tag 默认近黑文字在品牌深蓝底上 ~2.8:1,半透明
-              // 白底白字两主题都可读。
-              <Tag
+              <AttachmentChip
                 key={a.id}
-                bordered={false}
-                style={{
-                  fontSize: 11,
-                  background: "rgba(255,255,255,0.22)",
-                  color: "#fff",
-                }}
-              >
-                {a.name}
-              </Tag>
+                attachment={a}
+                threadId={threadId}
+                tenantScope={tenantScope}
+              />
             ))}
           </div>
         )}

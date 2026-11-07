@@ -6,9 +6,11 @@
 import { describe, expect, it, vi } from "vitest";
 import { App } from "antd";
 import { render, screen, within } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
 import { MemoryRouter } from "react-router-dom";
 import "../../../i18n";
 
+import * as attachmentsSdk from "../../../api/attachments";
 import { Transcript, type TranscriptProps } from "../Transcript";
 import type { ConsoleTurn } from "../types";
 import type { Turn } from "../../turn/types";
@@ -160,5 +162,27 @@ describe("Transcript", () => {
     expect(registerHistoryRow).toHaveBeenCalledWith("run-h1", "th-9");
     expect(rowRefFn).toHaveBeenCalledTimes(1);
     expect(rowRefFn.mock.calls[0][0]).toBe(screen.getByTestId("console-turn"));
+  });
+
+  it("B-295 — history and live bubbles fetch their attachments from that thread and tenant", async () => {
+    const fetchAttachment = vi
+      .spyOn(attachmentsSdk, "fetchSessionAttachment")
+      .mockResolvedValue({ blob: new Blob(["x"]), contentType: "text/plain" });
+    const doc = { id: "d", name: "notes.txt", kind: "document" as const, value: "uploads/notes.txt" };
+    const turns = [
+      makeTurn("h1", "history", 0, "run-h1", { attachments: [doc] }),
+      makeTurn("l1", "live", 1, null, { attachments: [{ ...doc, id: "d2" }] }),
+    ];
+    renderTranscript(makeBaseProps({ turns, threadId: "th-9", tenantScope: "tenant-x" }));
+
+    const chips = screen.getAllByRole("button", { name: /notes\.txt/ });
+    expect(chips).toHaveLength(2);
+    for (const chip of chips) await userEvent.click(chip);
+
+    expect(fetchAttachment).toHaveBeenCalledTimes(2);
+    for (const call of fetchAttachment.mock.calls) {
+      expect(call).toEqual(["th-9", "uploads/notes.txt", "tenant-x"]);
+    }
+    fetchAttachment.mockRestore();
   });
 });

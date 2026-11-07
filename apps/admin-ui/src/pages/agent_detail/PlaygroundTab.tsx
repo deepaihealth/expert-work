@@ -723,6 +723,7 @@ export function PlaygroundTab({ detail }: PlaygroundTabProps) {
               // (控制台平面的规矩,同停止按钮)。
               onCancelQueuedLive={stopRun}
               onDownloadArtifact={handleDownloadArtifact}
+              tenantScope={concreteTenantScope(apiTenantScope)}
               onFireResult={handleFireResult}
             />
           </ViewPane>

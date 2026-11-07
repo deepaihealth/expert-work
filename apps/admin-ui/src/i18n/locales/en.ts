@@ -1871,6 +1871,14 @@ export interface TranslationKeys {
     footer_steps: string;
     footer_total_duration: string;
     turn_inputs_fold: string;
+    attachment_preview_hint: string;
+    attachment_download_hint: string;
+    attachment_download: string;
+    attachment_loading: string;
+    attachment_expired: string;
+    attachment_load_failed: string;
+    attachment_no_preview: string;
+    attachment_text_truncated: string;
     interrupt_reason_user_cancel: string;
     interrupt_reason_client_disconnect: string;
     interrupt_reason_tenant_suspended: string;
@@ -5847,6 +5855,14 @@ const en: TranslationKeys = {
     footer_steps: "{{n}} steps",
     footer_total_duration: "Total {{d}}",
     turn_inputs_fold: "{{n}} inputs",
+    attachment_preview_hint: "Click to preview",
+    attachment_download_hint: "Preview not supported; click to download",
+    attachment_download: "Download",
+    attachment_loading: "Loading…",
+    attachment_expired: "This file has expired or was deleted",
+    attachment_load_failed: "Could not load the attachment: {{detail}}",
+    attachment_no_preview: "This file type can't be previewed; download it to view",
+    attachment_text_truncated: "Showing the first {{kb}} KB only; download for the full file",
     interrupt_reason_user_cancel: "Cancelled",
     interrupt_reason_client_disconnect: "Interrupted (connection lost)",
     interrupt_reason_tenant_suspended: "Interrupted (tenant suspended)",
