@@ -36,9 +36,6 @@ from expert_work.runtime.middleware.circuit_breaker import (
     BreakerRegistry as BreakerRegistry,
 )
 from expert_work.runtime.middleware.circuit_breaker import (
-    BreakerState as BreakerState,
-)
-from expert_work.runtime.middleware.circuit_breaker import (
     CircuitBreaker as CircuitBreaker,
 )
 from expert_work.runtime.middleware.circuit_breaker import (

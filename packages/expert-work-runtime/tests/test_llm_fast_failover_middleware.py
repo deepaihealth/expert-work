@@ -122,7 +122,7 @@ async def _run_swallow(mw: LLMErrorHandlingMiddleware, terminal: Terminal) -> No
     try:
         await mw(_ctx(has_fallback=True), terminal)
     except LLMServerError:
-        pass
+        pass  # the failure is the point: these runs only feed the breaker
 
 
 @pytest.mark.asyncio
