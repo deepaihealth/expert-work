@@ -2279,20 +2279,28 @@ asyncio.run(main())
 - [ ] **103.3 服务回来,60 秒内工具回来**:恢复服务端,**不改配置**,记下恢复时刻。之后每 20 秒左右同一副本发一轮,直到调到 `probe_echo`。判据:最晚在上一次 `mcp.server_unreachable_skipped` 之后 60 秒(加一轮的间隔)调到 `probe_echo`、调用成功、run `success`;在此之前的轮次可以还没有这个工具(复用的是 60 秒内缓存的构建),但都是 200;调到之后的那次构建日志有 `mcp.session_restarted`、没有 `build_cached_short`;再过 60 秒以上发一轮仍调得到(完整的构建按正常 TTL 缓存)。**没修好时**:先是 500;只修跳过、构建按正常 TTL 缓存时,工具缺到构建缓存过期(30 分钟)。
 - [ ] **103.4 收尾**:删临时服务端、MCP 配置、智能体、key、会话与终端用户。
 
-## §103 对话里的附件可预览、可下载(B-295)
+## §105 对话里的附件可预览、可下载;对话页产物与对话同一个可见范围(B-295)
 
-**背景**:对话详情页(对话 / 轨迹 / 工作区)和调试台里,用户气泡下的附件原来只是一个不能点的标签(如 `微信图片_20261107135228_3352_6.jpg`)。现在点标签:图片在弹窗里预览,PDF 内嵌预览,txt / md / csv 以文本预览(最多显示前 200 KB),弹窗里都有「下载」;Word / Excel / PPT 等浏览器不能安全显示的类型,点了直接下载(标签上提示「此类型不支持预览，点击下载」)。文件已被留存清理或删掉时,弹窗显示「文件已过期或已删除」,不是报错或裂图,对话照常显示。
+**背景**:对话详情页(对话 / 轨迹 / 工作区)和调试台里,用户气泡下的附件原来只是一个不能点的标签(如 `微信图片_20261107135228_3352_6.jpg`)。现在点标签:图片在弹窗里预览,PDF 内嵌预览,txt / md / csv 以文本预览(最多显示前 200 KB),弹窗里都有「下载」;Word / Excel / PPT 等浏览器不能安全显示的类型,点了直接下载(标签上提示「此类型不支持预览，点击下载」)。文件已被留存清理或删掉时,弹窗显示「文件已过期或已删除」,不是报错或裂图,对话照常显示。下载另存的文件名取服务端 `Content-Disposition` 里存储的名字(不是标签上的名字:标签来自消息,对接方能影响)。
 
-新接口 `GET /v1/sessions/{thread_id}/attachment?ref=<标签的值>[&tenant_id=]`(仅控制台):`ref` 是消息里原样的值 —— 图片 `expert_work://image/…`(按 `image_upload` 登记行找,行必须属于这个会话,字节从行里的对象键读),文档 `uploads/<文件名>`(服务端按会话自己的布局解析:新布局 `agents/<key>/threads/<会话>/work/uploads/…`,老布局 agent 根 `uploads/…`;客户端给不了路径)。权限与本会话的其它读接口相同(`…/workspace/file`、产物下载):本人或租户管理员;系统管理员带 `tenant_id` 跨租户;别人 404。过期 / 已删 / 不属于本会话 → 410 `ATTACHMENT_GONE`。返回头:`X-Content-Type-Options: nosniff`、`Content-Disposition` 带 `filename*=UTF-8''…`;图片按登记的 MIME(只认 png / jpeg / webp / gif),PDF 只有字节以 `%PDF-` 开头才是 `application/pdf`,HTML / SVG / 未知类型一律 `attachment`。预览只看这个返回类型,不看文件名。控制台查看不算「使用」,不延长留存。
+**谁能看(用户 11-07 拍板)**:附件、以及对话页每一轮的产物下载(`GET /v1/sessions/{id}/workspace/artifacts/{name}/download`),都与对话本身同一个可见范围 —— 能读这段对话(`session:read`,对话列表 / 详情同一道闸,viewer / operator / admin 都有)的员工都能打开。产物下载原来只有本人或租户管理员,本次一并放宽。仍只限控制台(对外 API key 被拒)、按租户隔离、系统管理员带 `tenant_id` 跨租户(跨租户本身照旧记审计)。**不是对话主人的人**读到内容时,审计里记一条 `user:data_view`(`resource_id` = 对话主人,`details` 只有 `view`=`conversation_attachment` / `conversation_artifact` 与 `thread_id`,不含文件名 / 产物名);读失败(过期、不存在)不记。
 
-**怎么进**:测试控制台,租户管理员 + 一个普通(operator)账号 + system_admin;一个开着看图模型的智能体。浏览器开发者工具看网络请求。**花费**:约 ¥0.3(两轮短对话)。
+**接口**:`GET /v1/sessions/{thread_id}/attachment?ref=<标签的值>[&tenant_id=]`。`ref` 是消息里原样的值 —— 图片 `expert_work://image/…`(按本租户 `image_upload` 登记行找,行必须属于这个会话,字节从行里的对象键读),文档 `uploads/<文件名>`(服务端在对话主人的工作区里解析,客户端给不了路径)。新布局(`threads/<会话>/work/uploads/…`)的文档还必须有本会话一条没删的 `user_upload` 登记行(留存先软删行、字节可能晚一点才删,行一删就算过期);老布局(agent 根 `uploads/…`,同一用户同一智能体的各对话共用、本来就不登记)只按路径。
 
-- [ ] **103.1 图片预览 / 下载**:调试台新开会话,上传一张 jpg 发一轮(「这张图里有什么」)。在调试台点用户气泡里的图片标签,再到对话详情页同一会话点一次。判据:两处都弹窗显示原图;请求是 `GET …/attachment?ref=expert_work%3A%2F%2Fimage%2F…`,200、`Content-Type: image/jpeg`、`nosniff`、`inline; filename=…; filename*=UTF-8''…`;点「下载」存下的文件能打开;关掉弹窗再开不报错。刷新对话详情页(历史轮,标签名是图片 id)同样可预览。**没修好时**:标签点了没反应,或接口 404(路由不存在)。
-- [ ] **103.2 PDF**:同一会话上传一份 PDF(中文文件名)发一轮,点标签。判据:弹窗内嵌显示 PDF(浏览器自带阅读器),`Content-Type: application/pdf`;下载的文件名是标签上的中文名。**没修好时**:不能点,或 `application/octet-stream` 导致空白 / 直接下载。
-- [ ] **103.3 txt**:上传一个 UTF-8 中文 txt 发一轮,点标签。判据:弹窗里显示文本、中文不乱码;`Content-Type: text/plain; charset=utf-8`。再传一个 > 200 KB 的 txt:只显示前 200 KB,上方提示「仅显示前 200 KB，完整内容请下载」,下载得到完整文件。**没修好时**:不能点,或整份大文件塞进页面卡顿。
-- [ ] **103.4 docx**:上传一个 docx 发一轮。判据:标签悬停提示「此类型不支持预览，点击下载」,点了直接下载(不弹窗),文件能用 Word 打开;响应 `application/octet-stream` + `attachment`。**没修好时**:不能点;或弹窗里试图渲染。
-- [ ] **103.5 过期 / 已删除**:① 图片:控制台删掉 103.1 的图片(`DELETE /v1/uploads/<图片 id>`,行变软删);② 文档:在调试台工作区面板删掉 103.3 的 txt 和 103.4 的 docx(或 `DELETE /v1/sessions/<会话>/workspace/file?path=threads/<会话>/work/uploads/<文件名>`)。再分别点这三个标签。判据:接口 410 `ATTACHMENT_GONE`,弹窗显示「文件已过期或已删除」,「下载」置灰(docx 也弹这个窗,不是静默无反应);对话其余内容照常显示。**没修好时**:裂图、报错提示、页面白屏,或删掉的图片仍能看到。
-- [ ] **103.6 跨用户 / 跨租户拒绝**:取 103.1 那条请求的 URL,① 用同租户另一个 operator 账号的 token 请求 → 404 `session not found`;② 用别的租户的普通账号 token、带 `tenant_id=<本租户>` → 403 `TENANT_NOT_ALLOWED`;③ `tenant_id=*` → 400;④ system_admin 在租户切换器切到本租户,打开对话详情页点图片标签 → 200 能看到;⑤ 把 `ref` 换成 `uploads/../x`、`../etc/passwd` → 400;⑥ 对外 API key 调这个接口 → 被控制台平面拒绝(401 / 403)。**没修好时**:①②⑤⑥ 任一返回了文件内容。
-- [ ] **103.7 收尾**:删 103.1–103.4 的会话。
+- 410 `ATTACHMENT_GONE`:图片行不在 / 已软删 / 不属于本会话 / 字节不在;文档登记行不在或已删、文件不在、不是文件、整个对话目录已被清理(B-282)、路径被符号链接拦下。
+- 409:读的过程中文件变了(再点一次)。500:权限 / 对象存储读不动。503:工作区服务连不上(固定文案 `attachment content unavailable`)。413:超过下载上限。
+- 返回头:`X-Content-Type-Options: nosniff`、`Cache-Control: private, no-store`、`Content-Disposition` 带 `filename*=UTF-8''…`;图片按登记的 MIME(只认 png / jpeg / webp / gif),PDF 只有字节以 `%PDF-` 开头才是 `application/pdf`,md / csv 按 `text/plain`,HTML / SVG / 未知类型一律 `attachment`。预览只看这个返回类型,不看文件名。整份读进内存再发(同 `…/workspace/file`)。控制台查看不算「使用」,不延长留存。
+- **已接受的残余风险**:PDF 用同源 `blob:` iframe 内嵌,不加 `sandbox`(加了 Chrome 自带阅读器打不开);blob 固定按 `application/pdf` 交给浏览器阅读器。
 
-**生产(随发布之后,用户执行)**:任找一个带图片 / PDF 附件的对话,在对话详情页点标签各一次,能预览、能下载即可;不需要额外配置。
+**怎么进**:测试控制台,对话主人账号(operator)+ 同租户另一个 viewer 账号 + 一个没有任何角色的账号 + system_admin;一个开着看图模型的智能体;只读查审计(控制台「审计」页或库)。浏览器开发者工具看网络请求。**花费**:约 ¥0.3(两轮短对话)。
+
+- [ ] **105.1 图片预览 / 下载**:调试台新开会话,上传一张 jpg 发一轮(「这张图里有什么」)。在调试台点用户气泡里的图片标签,再到对话详情页同一会话点一次。判据:两处都弹窗显示原图;请求是 `GET …/attachment?ref=expert_work%3A%2F%2Fimage%2F…`,200、`Content-Type: image/jpeg`、`nosniff`、`Cache-Control: private, no-store`、`inline; filename=…; filename*=UTF-8''…`;点「下载」存下的文件能打开,文件名是 `<图片 id>.jpg`;关掉弹窗再开不报错。刷新对话详情页(历史轮,标签名是图片 id)同样可预览。**没修好时**:标签点了没反应,或接口 404(路由不存在)。
+- [ ] **105.2 PDF**:同一会话上传一份 PDF(中文文件名)发一轮,点标签。判据:弹窗内嵌显示 PDF(浏览器自带阅读器),`Content-Type: application/pdf`;下载的文件名是存储的名字(与上传名相同,同名不同内容时带 `-<8 位>` 后缀)。**没修好时**:不能点,或 `application/octet-stream` 导致空白 / 直接下载。
+- [ ] **105.3 txt**:上传一个 UTF-8 中文 txt 发一轮,点标签。判据:弹窗里显示文本、中文不乱码;`Content-Type: text/plain; charset=utf-8`。再传一个 > 200 KB 的 txt:只显示前 200 KB,上方提示「仅显示前 200 KB，完整内容请下载」,下载得到完整文件。**没修好时**:不能点,或整份大文件塞进页面卡顿。
+- [ ] **105.4 docx**:上传一个 docx 发一轮。判据:标签悬停提示「此类型不支持预览，点击下载」,点了直接下载(不弹窗),文件能用 Word 打开;响应 `application/octet-stream` + `attachment`。**没修好时**:不能点;或弹窗里试图渲染。
+- [ ] **105.5 过期 / 已删除**:① 图片:控制台删掉 105.1 的图片(`DELETE /v1/uploads/<图片 id>`,行变软删);② 文档:在调试台工作区面板删掉 105.3 的 txt 和 105.4 的 docx(或 `DELETE /v1/sessions/<会话>/workspace/file?path=threads/<会话>/work/uploads/<文件名>`)。再分别点这三个标签。判据:接口 410 `ATTACHMENT_GONE`,弹窗显示「文件已过期或已删除」,「下载」置灰(docx 也弹这个窗,不是静默无反应);对话其余内容照常显示。**没修好时**:裂图、报错提示、页面白屏,或删掉的图片仍能看到。
+- [ ] **105.6 同租户其他员工能看、并留审计**:用同租户 viewer 账号打开这段对话的对话详情页,点 105.2 的 PDF 标签,再点某一轮的产物下载按钮(没有产物就让智能体写一个文件再做)。判据:两者都 200 能看到 / 下载;审计里各多一条 `user:data_view`,`resource_id` 是对话主人的用户 id,`details` 为 `{"view":"conversation_attachment"|"conversation_artifact","thread_id":…}`,不含文件名;对话主人自己点不产生这类行。**没修好时**:viewer 得到 404(还是只给本人 / 管理员),或审计里没有这条 / 带了文件名。
+- [ ] **105.7 拒绝**:取 105.1 那条请求的 URL,① 用没有任何角色的账号 token 请求 → 403;② 用别的租户的普通账号 token、带 `tenant_id=<本租户>` → 403 `TENANT_NOT_ALLOWED`;③ `tenant_id=*` → 400;④ system_admin 在租户切换器切到本租户,打开对话详情页点图片标签 → 200 能看到,审计有 `user:data_view`;⑤ 把 `ref` 换成 `uploads/../x`、`../etc/passwd` → 400;⑥ 用一个有 read 权限的真实对外 API key 调这个接口和产物下载接口 → 403 `FORBIDDEN`(控制台平面不对 API key 开放)。**没修好时**:①②⑤⑥ 任一返回了文件内容。
+- [ ] **105.8 收尾**:删 105.1–105.6 的会话。
+
+**生产(随发布之后,用户执行)**:任找一个带图片 / PDF 附件的对话,在对话详情页点标签各一次,能预览、能下载即可;用一个非主人账号点一次,审计里看到 `user:data_view`。不需要额外配置。
