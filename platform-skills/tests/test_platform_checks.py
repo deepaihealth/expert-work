@@ -42,7 +42,7 @@ _CHECK_SECTION = re.compile(r"^## 检查成品\n(.*?)(?=^## )", re.S | re.M)
 _ASK_IMAGE_CALL = re.compile(r"ask_image\(([^)]*)\)")
 
 
-# pptx carries the designed-template fill workflow (B-295) on top of the original
+# pptx carries the designed-template fill workflow (B-296) on top of the original
 # sections; still far below the 11,000-char point where a doc reaches the agent cut to a
 # preview (see health_plan_report/test_skill_package.py DOC_CHAR_CEILING).
 _BODY_LIMIT = {"pptx": 7000}
