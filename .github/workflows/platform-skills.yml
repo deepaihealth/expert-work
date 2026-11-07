@@ -48,7 +48,11 @@ jobs:
         with:
           version: "0.9.26"   # 与 ci.yml 的 env.UV_VERSION 一致
           enable-cache: true
-      - run: uv sync --frozen
+      # 与 ci.yml 同:装 3.12 并优先用它。不装的话 uv 用 runner 自带的 /usr/bin/python3,
+      # 11-07 runner 升到 3.14 后 onnxruntime 1.20.1 没有 cp314 wheel,uv sync 直接失败。
+      - name: Install Python
+        run: uv python install 3.12
+      - run: uv sync --frozen --python 3.12
       - name: Layer-2 tests
         env:
           EXPERT_WORK_SKILLS_TEST_IMAGE: expert-work-sandbox:ci
