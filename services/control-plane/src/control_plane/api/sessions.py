@@ -40,6 +40,7 @@ from control_plane.api._artifact_content import (
 )
 from control_plane.api._artifact_mime import content_disposition_header, infer_content_type
 from control_plane.api._authz import console_only, require, require_key_scope
+from control_plane.api._conversation_view_audit import audit_conversation_data_view
 from control_plane.api._quota_admission import check_admission
 from control_plane.api._session_title import backfill_titles
 from control_plane.api._user_scope import (
@@ -743,7 +744,14 @@ def build_sessions_router() -> APIRouter:
     @router.get(
         "/{thread_id}/workspace/artifacts/{name:path}/download",
         response_model=None,
-        dependencies=[Depends(require_key_scope("read")), Depends(console_only())],
+        # B-295 —— 产物与对话同一个可见范围(用户 2026-11-07 拍板,与对话里的附件一致):能读
+        # 这段对话(``session:read``,对话列表 / 详情同一道闸)的员工都能下载;不是主人时记
+        # ``user:data_view``。原来是 ``caller_owns_thread``(本人或租户管理员)。
+        dependencies=[
+            Depends(require_key_scope("read")),
+            Depends(console_only()),
+            Depends(require("session", "read")),
+        ],
     )
     async def download_session_artifact(
         thread_id: UUID,
@@ -761,9 +769,10 @@ def build_sessions_router() -> APIRouter:
     ) -> Response:
         """Download the thread user's artifact by logical name.
 
-        Thread-scoped (the thread's owning user), unlike the caller-scoped
-        ``/v1/artifacts/download``. 404 hides cross-user / missing /
-        no-supervisor.
+        Thread-scoped (the thread's owning user's artifacts), unlike the caller-scoped
+        ``/v1/artifacts/download``. Visible to whoever may read the conversation
+        (``session:read``, B-295); a non-owner read is audited as ``user:data_view``.
+        404 hides missing / no-supervisor.
 
         B-235 —— ``version`` 给了就下那一版(对话页 / 调试台每一轮带上这一轮登记的
         版本号),不给是最新版;内容读登记时的副本(选版规则见
@@ -784,11 +793,6 @@ def build_sessions_router() -> APIRouter:
         async with applied_scope(scope):
             meta = await threads.get(thread_id, tenant_id=target_tenant)
         if meta is None:
-            raise HTTPException(status_code=404, detail="session not found")
-        caller_user_id = await resolve_caller_user_id(request, users)
-        if not caller_owns_thread(
-            meta=meta, caller_user_id=caller_user_id, principal=request.state.principal
-        ):
             raise HTTPException(status_code=404, detail="session not found")
         if meta.user_id is None or workspace_store is None:
             raise HTTPException(status_code=404, detail="artifact not found")
@@ -882,6 +886,14 @@ def build_sessions_router() -> APIRouter:
             "X-Content-Type-Options": "nosniff",
             VERSION_HEADER: str(chosen.version),
         }
+        await audit_conversation_data_view(
+            request,
+            audit,
+            tenant_id=target_tenant,
+            meta=meta,
+            caller_user_id=await resolve_caller_user_id(request, users),
+            view="conversation_artifact",
+        )
         return Response(content=data, media_type=inferred.content_type, headers=headers)
 
     @router.delete(

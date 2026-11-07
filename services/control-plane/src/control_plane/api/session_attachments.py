@@ -6,32 +6,41 @@ control plane wrote into the message: an image's ``expert_work://image/…`` ref
 or a document's ``uploads/<leaf>``. This endpoint turns that ``ref`` into bytes for
 the preview / download, and nothing else:
 
-- **Who.** The same gate as the other thread-scoped console reads in
-  :mod:`control_plane.api.sessions` (``…/workspace/file``, ``…/artifacts/…/download``):
-  console plane only, ``tenant_id`` passthrough for a system admin
-  (:func:`ensure_single_tenant_scope`), and :func:`caller_owns_thread` (the owner or a
-  tenant admin; anyone else gets the same 404 as a missing thread).
-- **What.** Only an attachment of *this* conversation. An image is looked up by the
-  ref's image id in this tenant's ``image_upload`` registry, and that row must belong to
-  this thread; the bytes are read from the row's object key — the ref is never trusted
-  to locate bytes on its own.
+- **Who.** The conversation's own visibility (user ruling 2026-11-07): whoever may
+  read the conversation — ``session:read``, the gate of ``/v1/conversations`` list and
+  detail — may open its attachments. Console plane only (an API key is refused), tenant
+  scoped, ``tenant_id`` passthrough for a system admin (:func:`ensure_single_tenant_scope`,
+  which audits the cross-tenant read). A read by someone other than the conversation's
+  owner leaves a ``user:data_view`` audit row (:mod:`._conversation_view_audit`) — the
+  contents are often health data.
+- **What.** An image is looked up by the ref's image id in this tenant's
+  ``image_upload`` registry, and that row must belong to this thread; the bytes are read
+  from the row's object key — the ref is never trusted to locate bytes on its own.
   A document ``ref`` must be the one shape uploads produce
   (:func:`is_safe_document_upload_id`: ``uploads/<one safe leaf>``) and is resolved by
-  the server inside the conversation's own directory (B-262: ``threads/<id>/work/``
-  for a conversation-view thread, the agent root for an old-view one) of the thread
-  owner's volume. The client never supplies a path.
-- **Gone.** Retention (B-63 / B-283 / B-286) deletes rows and bytes; a deleted image,
-  a reaped row, missing bytes, or a ref that is not this conversation's all answer the
-  same 410 ``ATTACHMENT_GONE`` so the page can say 「文件已过期或已删除」 and the
-  answers cannot be told apart.
+  the server in the thread owner's volume; the client never supplies a path. For a
+  conversation-view thread (B-262: ``threads/<id>/work/``) the leaf must also have a live
+  ``user_upload`` row of this thread — retention soft-deletes the row and may keep the
+  bytes a while, and the attachment is expired from that moment. An old-view thread
+  lands uploads in the agent root shared by that user's conversations with the agent,
+  where nothing is registered (B-281 deliberately does not register there): those are
+  served by path alone, so any upload in that shared root is reachable from any of
+  those conversations.
+- **Gone.** Retention (B-63 / B-283 / B-286 / B-282) deletes rows and bytes; a deleted
+  image, a reaped or soft-deleted row, missing bytes, or a ref that is not this
+  conversation's all answer the same 410 ``ATTACHMENT_GONE`` so the page can say
+  「文件已过期或已删除」 and the answers cannot be told apart. A storage problem is not
+  "gone": 500 (permission / object store), 503 (supervisor), 409 (changed mid-read).
 - **Headers.** ``Content-Type`` comes from the stored row (images, raster types only)
   or from the stored name plus sniffed magic (documents: a PDF is ``application/pdf``
   only when it starts with ``%PDF-``); everything else, and all active content (HTML,
-  SVG, …), goes out as an ``attachment``. Always ``nosniff``; ``Content-Disposition``
-  carries the RFC 5987 ``filename*``.
+  SVG, …), goes out as an ``attachment``. Always ``nosniff`` and
+  ``Cache-Control: private, no-store``; ``Content-Disposition`` carries the RFC 5987
+  ``filename*``.
 
-Reading here does not count as a use for retention: an operator looking at a
-conversation is not the tenant using the file.
+The whole file is read into memory before it is sent, like ``…/workspace/file`` (the
+store's own read cap bounds it). Reading here does not count as a use for retention:
+someone looking at a conversation is not the tenant using the file.
 """
 
 from __future__ import annotations
@@ -49,9 +58,10 @@ from control_plane.api._artifact_mime import (
     content_disposition_header,
     infer_content_type,
 )
-from control_plane.api._authz import console_only, require_key_scope
-from control_plane.api._user_scope import caller_owns_thread, get_user_repo, resolve_caller_user_id
-from control_plane.api._workspace_shared import thread_workspace_path
+from control_plane.api._authz import console_only, require, require_key_scope
+from control_plane.api._conversation_view_audit import audit_conversation_data_view
+from control_plane.api._user_scope import get_user_repo, resolve_caller_user_id
+from control_plane.api._workspace_shared import thread_conversation_id, thread_workspace_path
 from control_plane.api.uploads import is_safe_document_upload_id
 from control_plane.tenant_scope import (
     SingleTenant,
@@ -63,6 +73,7 @@ from expert_work.common.observability import current_trace_id_hex
 from expert_work.persistence.image_upload import ImageUploadStore
 from expert_work.persistence.tenant_user import TenantUserStore
 from expert_work.persistence.thread_meta import ThreadMetaStore
+from expert_work.persistence.user_upload import UserUploadStore
 from expert_work.protocol import ThreadMeta
 from expert_work.protocol.multimodal import IMAGE_REF_PREFIX, parse_image_ref
 from expert_work.runtime.audit.logger import AuditLogger
@@ -72,6 +83,13 @@ from orchestrator.tools import (
     WorkspaceFileTooLargeError,
     WorkspacePermissionError,
     WorkspaceStore,
+)
+from orchestrator.tools.nas_workspace_store import _WorkspacePathNotFoundError
+from orchestrator.tools.sandbox import (
+    WorkspaceFileChangedError,
+    WorkspaceFileNotFoundError,
+    WorkspaceNotAFileError,
+    WorkspacePathEscapeError,
 )
 
 logger = logging.getLogger("expert_work.control_plane.session_attachments")
@@ -88,6 +106,18 @@ _RASTER_IMAGE_MIMES: Final[frozenset[str]] = frozenset(
 
 _PDF_MAGIC: Final = b"%PDF-"
 _OPAQUE: Final = "application/octet-stream"
+_UNAVAILABLE: Final = "attachment content unavailable"
+
+#: The store's "nothing readable at that name" answers. ``_WorkspacePathNotFoundError`` is
+#: the NAS store's answer when a *parent* directory is missing — the conversation's whole
+#: ``work/`` reaped (B-282) — and is as expired as a missing leaf.
+_NOT_THERE: Final = (
+    WorkspaceFileNotFoundError,
+    WorkspaceNotAFileError,
+    _WorkspacePathNotFoundError,
+)
+
+_VIEW: Final = "conversation_attachment"
 
 
 def _gone() -> NoReturn:
@@ -106,6 +136,8 @@ def _bytes_response(
     headers = {
         "Content-Disposition": content_disposition_header(filename, disposition=disposition),
         "X-Content-Type-Options": "nosniff",
+        # Health data: never kept by a shared cache or the browser's disk cache.
+        "Cache-Control": "private, no-store",
     }
     return Response(content=data, media_type=content_type, headers=headers)
 
@@ -151,7 +183,7 @@ async def _image_response(
         # Subclass order: ObjectNotFoundError above. Readable-but-failing storage is a
         # server problem, not "expired"; the traceback stays in the log.
         logger.warning("session_attachment.object_store_failed", exc_info=True)
-        raise HTTPException(status_code=500, detail="attachment content unavailable") from exc
+        raise HTTPException(status_code=500, detail=_UNAVAILABLE) from exc
     raster = row.mime_type in _RASTER_IMAGE_MIMES
     return _bytes_response(
         data,
@@ -161,30 +193,64 @@ async def _image_response(
     )
 
 
+async def _registered_in_conversation(
+    ref: str, *, meta: ThreadMeta, scope: SingleTenant, uploads: UserUploadStore
+) -> bool:
+    """Is ``ref`` a live ``user_upload`` row of this thread? (Rows are written for every
+    upload into a conversation's own directory: external uploads, and console uploads
+    and cross-conversation copies since B-281.)"""
+    async with applied_scope(scope):
+        rows = await uploads.list_documents_for_thread(
+            tenant_id=scope.tenant_id, thread_id=meta.thread_id
+        )
+    return any(row.ref == ref for row in rows)
+
+
 async def _document_response(
-    ref: str, *, meta: ThreadMeta, tenant_id: UUID, workspace_store: WorkspaceStore | None
+    ref: str,
+    *,
+    meta: ThreadMeta,
+    scope: SingleTenant,
+    uploads: UserUploadStore,
+    workspace_store: WorkspaceStore | None,
 ) -> Response:
     if meta.user_id is None:
         # Machine / unowned thread — no per-user volume, so no uploads.
+        _gone()
+    if thread_conversation_id(meta) is not None and not await _registered_in_conversation(
+        ref, meta=meta, scope=scope, uploads=uploads
+    ):
         _gone()
     if workspace_store is None:
         raise HTTPException(status_code=503, detail="attachment storage unavailable")
     try:
         data = await workspace_store.read_file(
-            tenant_id=tenant_id, user_id=meta.user_id, path=thread_workspace_path(ref, meta)
+            tenant_id=scope.tenant_id, user_id=meta.user_id, path=thread_workspace_path(ref, meta)
         )
+    # Every class below subclasses SandboxSupervisorError — the catch-all stays last.
     except WorkspacePermissionError as exc:
-        # Subclass of SandboxSupervisorError — must come first (same rule as every
-        # workspace read in this package).
         logger.warning("session_attachment.read_permission_denied", exc_info=True)
-        raise HTTPException(status_code=500, detail="attachment content unavailable") from exc
+        raise HTTPException(status_code=500, detail=_UNAVAILABLE) from exc
     except WorkspaceFileTooLargeError as exc:
         logger.warning("session_attachment.file_too_large")
         raise HTTPException(
             status_code=413, detail="attachment exceeds the download size limit"
         ) from exc
-    except SandboxSupervisorError:
+    except _NOT_THERE:
         _gone()
+    except WorkspacePathEscapeError as exc:
+        # A symlink planted where the upload was: refused by the store, and to the
+        # reader it is simply not there. Type only — the message carries the path.
+        logger.warning("session_attachment.path_escape error=%s", type(exc).__name__)
+        _gone()
+    except WorkspaceFileChangedError as exc:
+        raise HTTPException(
+            status_code=409, detail="attachment changed while being read; try again"
+        ) from exc
+    except SandboxSupervisorError as exc:
+        # Supervisor unreachable / unexpected answer: not "expired".
+        logger.warning("session_attachment.read_failed", exc_info=True)
+        raise HTTPException(status_code=503, detail=_UNAVAILABLE) from exc
     leaf = PurePosixPath(ref).name
     content_type, disposition = _document_media(leaf, data)
     return _bytes_response(data, filename=leaf, content_type=content_type, disposition=disposition)
@@ -196,6 +262,10 @@ def _get_thread_repo(request: Request) -> ThreadMetaStore:
 
 def _get_image_upload_store(request: Request) -> ImageUploadStore:
     return request.app.state.image_upload_store  # type: ignore[no-any-return]
+
+
+def _get_user_upload_store(request: Request) -> UserUploadStore:
+    return request.app.state.user_upload_store  # type: ignore[no-any-return]
 
 
 def _get_object_store(request: Request) -> ObjectStore | None:
@@ -216,7 +286,11 @@ def build_session_attachments_router() -> APIRouter:
     @router.get(
         "/{thread_id}/attachment",
         response_model=None,
-        dependencies=[Depends(require_key_scope("read")), Depends(console_only())],
+        dependencies=[
+            Depends(require_key_scope("read")),
+            Depends(console_only()),
+            Depends(require("session", "read")),
+        ],
     )
     async def get_session_attachment(
         thread_id: UUID,
@@ -224,6 +298,7 @@ def build_session_attachments_router() -> APIRouter:
         threads: Annotated[ThreadMetaStore, Depends(_get_thread_repo)],
         users: Annotated[TenantUserStore, Depends(get_user_repo)],
         images: Annotated[ImageUploadStore, Depends(_get_image_upload_store)],
+        uploads: Annotated[UserUploadStore, Depends(_get_user_upload_store)],
         object_store: Annotated[ObjectStore | None, Depends(_get_object_store)],
         workspace_store: Annotated[WorkspaceStore | None, Depends(_get_workspace_store)],
         audit: Annotated[AuditLogger, Depends(_get_audit)],
@@ -245,19 +320,24 @@ def build_session_attachments_router() -> APIRouter:
             meta = await threads.get(thread_id, tenant_id=scope.tenant_id)
         if meta is None:
             raise HTTPException(status_code=404, detail="session not found")
-        caller_user_id = await resolve_caller_user_id(request, users)
-        if not caller_owns_thread(
-            meta=meta, caller_user_id=caller_user_id, principal=request.state.principal
-        ):
-            raise HTTPException(status_code=404, detail="session not found")
         if ref.startswith(IMAGE_REF_PREFIX):
-            return await _image_response(
+            response = await _image_response(
                 ref, meta=meta, scope=scope, images=images, object_store=object_store
             )
-        if is_safe_document_upload_id(ref):
-            return await _document_response(
-                ref, meta=meta, tenant_id=scope.tenant_id, workspace_store=workspace_store
+        elif is_safe_document_upload_id(ref):
+            response = await _document_response(
+                ref, meta=meta, scope=scope, uploads=uploads, workspace_store=workspace_store
             )
-        raise HTTPException(status_code=400, detail="invalid attachment ref")
+        else:
+            raise HTTPException(status_code=400, detail="invalid attachment ref")
+        await audit_conversation_data_view(
+            request,
+            audit,
+            tenant_id=scope.tenant_id,
+            meta=meta,
+            caller_user_id=await resolve_caller_user_id(request, users),
+            view=_VIEW,
+        )
+        return response
 
     return router
