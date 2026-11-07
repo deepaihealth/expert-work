@@ -38,8 +38,7 @@ from duplicate_slide import duplicate
 from pptx.oxml.ns import qn
 
 P14 = "http://schemas.microsoft.com/office/powerpoint/2010/main"
-_R_NS = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
-_LINK_TAGS = (qn("a:hlinkClick"), qn("a:hlinkMouseOver"))
+_R_PREFIX = "{http://schemas.openxmlformats.org/officeDocument/2006/relationships}"
 OVERFLOW_NOTE = (
     "估算值:按字号、框尺寸、汉字 1 字宽 / 西文约半字宽、1.2 倍行距推算;"
     "中文较准,西文随字体约差 ±20%,"
@@ -245,30 +244,39 @@ def _rewrite_sections(prs, final_ids: list[str], source_ids: list[str]) -> None:
             rebuilt.append(section)
     for section in sections:
         section_list.remove(section)
+    ext = section_list.find(f"{{{P14}}}extLst")  # schema order: sections, then extLst
     for section in rebuilt:
-        section_list.append(section)
+        if ext is None:
+            section_list.append(section)
+        else:
+            ext.addprevious(section)
 
 
-def _unlink(slide, dropped_parts) -> bool:
-    """Remove the slide's links (hlinkClick / hlinkMouseOver) to dropped slides and the
-    relationships behind them, so no dropped slide part is kept alive. -> any found?"""
-    found = False
-    for rid, rel in list(slide.part.rels.items()):
+def _references(root, rid: str) -> bool:
+    return any(
+        v == rid for node in root.iter() for k, v in node.attrib.items() if k.startswith(_R_PREFIX)
+    )
+
+
+def _unlink(part, root, dropped_parts) -> str | None:
+    """Remove every element that links (r:id) to a dropped slide - shape click / hover,
+    run click / mouse-over, action buttons - and then the relationship itself, so the
+    dropped slide part is not kept alive. -> None (no such link), "removed", or "broken"
+    (some other reference to it remains, so the relationship had to stay)."""
+    outcome = None
+    for rid, rel in list(part.rels.items()):
         if rel.is_external or rel.target_part not in dropped_parts:
             continue
-        found = True
-        for link in list(slide._element.iter(*_LINK_TAGS)):
-            if link.get(qn("r:id")) == rid:
-                link.getparent().remove(link)
-        still_used = any(
-            v == rid
-            for node in slide._element.iter()
-            for k, v in node.attrib.items()
-            if k.startswith(f"{{{_R_NS}}}")
-        )
-        if not still_used:
-            slide.part.drop_rel(rid)
-    return found
+        for node in list(root.iter()):
+            parent = node.getparent()
+            if parent is not None and node.get(qn("r:id")) == rid:
+                parent.remove(node)
+        if _references(root, rid):
+            outcome = "broken"
+        else:
+            part.drop_rel(rid)
+            outcome = outcome or "removed"
+    return outcome
 
 
 def _restructure(prs, slides, source_ids: list[str], drop: bool) -> list[str]:
@@ -286,8 +294,15 @@ def _restructure(prs, slides, source_ids: list[str], drop: bool) -> list[str]:
         ids.append(sid)
     _rewrite_sections(prs, [sid.get("id") for sid in keep], source_ids)
     for page, slide in enumerate(slides, start=1):
-        if _unlink(slide, dropped_parts):
-            warnings.append(f"第 {page} 页有链接指向被删掉的页, 已去掉这个链接")
+        places = [("", slide.part, slide._element)]
+        if slide.has_notes_slide:
+            places.append(("备注里", slide.notes_slide.part, slide.notes_slide._element))
+        for where, part, root in places:
+            outcome = _unlink(part, root, dropped_parts)
+            if outcome == "removed":
+                warnings.append(f"第 {page} 页{where}有链接指向被删掉的页, 已去掉这个链接")
+            elif outcome == "broken":
+                warnings.append(f"第 {page} 页{where}有指向被删掉的页的引用去不掉, 那个链接已失效")
     return warnings
 
 

@@ -306,6 +306,13 @@ def test_duplicate_shape_ids_are_ambiguous_and_never_filled(scripts, tmp_path):
 # ------------------------------------------------------------------ H2 crash cases + isolation
 
 
+def _fixed_size(prs):
+    bp = _box_el(prs).find(qn("p:txBody") + "/" + qn("a:bodyPr"))
+    for child in list(bp):
+        bp.remove(child)
+    bp.append(bp.makeelement(qn("a:noAutofit"), {}))
+
+
 def _empty_body(prs):
     body = _box_el(prs).find(qn("p:txBody"))
     for p in body.findall(qn("a:p")):
@@ -344,9 +351,11 @@ def _line_spacing(val):
 def test_unusual_text_bodies_inspect_and_fill(scripts, tmp_path, mutate):
     path = tmp_path / "odd.pptx"
     addr = _one_box_deck(path)
+    _edit(path, _fixed_size)  # so the box reports a capacity (resize boxes do not)
     _edit(path, mutate)
     entry = H.texts(H.inspect(scripts, path))[addr]
-    assert "error" not in entry
+    assert "error" not in entry and entry.get("autofit") != "resize"
+    assert isinstance(entry["cap"], int), entry
     report, out = H.fill(scripts, tmp_path, path, {"fill": {addr: "新的文字"}})
     assert report["results"][0]["status"] == "ok" and report["overflow_unknown"] == []
     assert H.shape_by_addr(pptx.Presentation(str(out)), addr).text_frame.text == "新的文字"

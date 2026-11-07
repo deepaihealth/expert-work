@@ -51,6 +51,8 @@ LEGEND = (
     "vertical=竖排; hidden=隐藏的形状; ambiguous=同页有重复 id, 这个地址填不了; "
     "error=这个形状读不了。表格 cells 逐行列出, null=被合并的格, col_chars=各列每行约几个汉字。"
     "locked: 文字改不了的形状(图表/SmartArt/图片/没有文字框的占位符等)。"
+    "more=还有页没列出, 用它给的 --slides 接着看; too_long=这几页单独就超长, 结尾会被截断, "
+    "去掉 --full 再看。"
 )
 
 
@@ -259,16 +261,22 @@ def main() -> None:
         )
         return
     default_style = prs.part._element.find(qn("p:defaultTextStyle"))
-    out = {"slide_size": [prs.slide_width, prs.slide_height], "legend": LEGEND, "slides": []}
-    used = len(_compact(out)) + len(',"more":"--slides 999-999"')
+    out: dict = {"slide_size": [prs.slide_width, prs.slide_height], "legend": LEGEND}
+    used = len(_compact(out)) + len(',"more":"--slides 999-999","slides":[]')
+    picked: list[dict] = []
     for k, n in enumerate(numbers):
         info = _texts_slide(n, slides[n - 1], master_of, default_style, args.full)
         size = len(_compact(info)) + 1
-        if out["slides"] and used + size > PAGE_BUDGET:  # whole slides only, at least one
+        if picked and used + size > PAGE_BUDGET:  # whole slides only, at least one
             out["more"] = "--slides " + _ranges(numbers[k:])
             break
-        out["slides"].append(info)
+        picked.append(info)
         used += size
+    # "more" / "too_long" go before "slides": an output cut at its end must keep them
+    too_long = [s["number"] for s in picked if len(_compact(s)) > PAGE_BUDGET]
+    if too_long:
+        out["too_long"] = too_long
+    out["slides"] = picked
     print(_compact(out))
 
 

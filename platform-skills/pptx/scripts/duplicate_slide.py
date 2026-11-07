@@ -17,7 +17,8 @@ from pptx.oxml.ns import qn
 
 _R_NS = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
 _SLIDE_ATTRS = ("show", "showMasterSp", "showMasterPhAnim")
-_IGNORABLE = "{http://schemas.openxmlformats.org/markup-compatibility/2006}Ignorable"
+_MC_NS = "http://schemas.openxmlformats.org/markup-compatibility/2006"
+_IGNORABLE = f"{{{_MC_NS}}}Ignorable"
 # Relationships whose *data part* is not duplicated — the new slide's relationship points
 # at the very same part as the original, so editing one's data (chart series, SmartArt
 # text, embedded workbook, ...) silently edits the other's too. Speaker notes are NOT in
@@ -121,15 +122,22 @@ def _carry_ignorable(src, new) -> None:
         return
     old = new._element
     nsmap = dict(old.nsmap)
-    for prefix in ("mc", *ignorable.split()):
+    kept = []
+    for prefix in ignorable.split():
         uri = src._element.nsmap.get(prefix)
-        if uri is not None:
-            nsmap.setdefault(prefix, uri)
+        if uri is None or nsmap.get(prefix, uri) != uri:
+            continue  # undeclared on the source, or bound to another namespace on the copy
+        nsmap[prefix] = uri
+        kept.append(prefix)
+    if not kept:
+        return
+    if nsmap.get("mc", _MC_NS) == _MC_NS:
+        nsmap["mc"] = _MC_NS
     decls = " ".join(f'xmlns:{k}="{v}"' if k else f'xmlns="{v}"' for k, v in nsmap.items())
     root = parse_xml(f"<p:sld {decls}/>")
     for name, value in old.attrib.items():
         root.set(name, value)
-    root.set(_IGNORABLE, ignorable)
+    root.set(_IGNORABLE, " ".join(kept))
     for child in list(old):
         root.append(child)
     new.part._element = root
