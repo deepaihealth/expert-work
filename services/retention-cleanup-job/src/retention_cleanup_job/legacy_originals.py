@@ -134,7 +134,7 @@ class AuditedUpload:
     sha256: str | None
 
 
-@dataclass(frozen=True, order=True)
+@dataclass(frozen=True)
 class Copy:
     """一条引用在它自己(对话视图)会话里应有的那份副本。"""
 
@@ -242,6 +242,18 @@ def _collect_audits(refs: _Refs, audits: Sequence[AuditedUpload], metas: _Metas)
         refs.copies.setdefault((audit.tenant_id, meta.user_id, relpath), set()).add(copy)
 
 
+def _copy_order(copy: Copy) -> tuple[str, str, int, str]:
+    """A stable order for one original's copies. ``size_bytes`` / ``sha256`` are ``None`` on
+    rows written before they were recorded, next to rows that have them: never compare
+    ``None`` with a value (B-281 live test 97.7)."""
+    return (
+        str(copy.user_id),
+        copy.relpath,
+        -1 if copy.size_bytes is None else copy.size_bytes,
+        copy.sha256 or "",
+    )
+
+
 def plan(
     rows: Sequence[LiveUpload],
     audits: Sequence[AuditedUpload],
@@ -272,7 +284,7 @@ def plan(
                     relpath=relpath,
                     size_bytes=registered[0].size_bytes,
                     row_ids=frozenset(r.id for r in registered),
-                    copies=tuple(sorted(refs.copies[key])),
+                    copies=tuple(sorted(refs.copies[key], key=_copy_order)),
                 )
             )
     return originals
