@@ -70,7 +70,9 @@ describe("AttachmentChip", () => {
   });
 
   it("previews a PDF inline as an application/pdf blob", async () => {
-    fetchAttachment.mockResolvedValue(bytes("%PDF-1.7", "application/pdf"));
+    // The object URL's blob is re-typed to the whitelisted server type — whatever
+    // type the fetched blob itself carried (here: an untyped one).
+    fetchAttachment.mockResolvedValue({ blob: new Blob(["%PDF-1.7"]), contentType: "application/pdf" });
     renderChip(PDF);
 
     const modal = await openChip("报告");
