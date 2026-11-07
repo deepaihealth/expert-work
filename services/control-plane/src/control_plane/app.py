@@ -105,6 +105,7 @@ from control_plane.api import (
     build_sandbox_egress_audit_router,
     build_sandboxes_router,
     build_service_accounts_router,
+    build_session_attachments_router,
     build_sessions_router,
     build_setup_router,
     build_skill_evolution_router,
@@ -3102,6 +3103,8 @@ def create_app(
     # B-278 —— 恢复 / 彻底删除(三段路径,和上面的两段 {name}/{version} 不冲突)。
     app.include_router(build_agent_lifecycle_router())
     app.include_router(build_sessions_router())
+    # B-295 —— 对话里附件的预览 / 下载(对话页与调试台的附件标签)。
+    app.include_router(build_session_attachments_router())
     app.include_router(build_runs_router())
     app.include_router(build_plan_router())
     app.include_router(build_runs_list_router())

@@ -74,6 +74,7 @@ from control_plane.api.runs import build_runs_list_router, build_runs_router
 from control_plane.api.sandbox_egress_audit import build_sandbox_egress_audit_router
 from control_plane.api.sandboxes import build_sandboxes_router
 from control_plane.api.service_accounts import build_service_accounts_router
+from control_plane.api.session_attachments import build_session_attachments_router
 from control_plane.api.sessions import build_sessions_router
 from control_plane.api.setup import build_setup_router
 from control_plane.api.skill_evolution import build_skill_evolution_router
@@ -148,6 +149,7 @@ __all__ = [
     "build_sandbox_egress_audit_router",
     "build_sandboxes_router",
     "build_service_accounts_router",
+    "build_session_attachments_router",
     "build_sessions_router",
     "build_setup_router",
     "build_skill_evolution_router",
