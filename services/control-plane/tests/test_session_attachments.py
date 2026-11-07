@@ -30,6 +30,7 @@ from expert_work.persistence.audit_log import InMemoryAuditLogStore
 from expert_work.protocol import AuditQuery
 from expert_work.protocol.agent_key import sanitize_agent_key
 from expert_work.protocol.multimodal import ImageRef
+from expert_work.runtime.runs import DisconnectMode, RunInfo, RunStatus
 from expert_work.runtime.storage import InMemoryObjectStore
 from orchestrator.tools import (
     RecordingWorkspaceStore,
@@ -37,7 +38,7 @@ from orchestrator.tools import (
     WorkspaceFileTooLargeError,
     WorkspacePermissionError,
 )
-from orchestrator.tools.nas_workspace_store import _WorkspacePathNotFoundError
+from orchestrator.tools.nas_workspace_store import MISSING_DIR_ERRORS
 from orchestrator.tools.sandbox import (
     WorkspaceFileChangedError,
     WorkspaceFileNotFoundError,
@@ -500,7 +501,8 @@ async def test_generic_supervisor_error_is_503_not_gone(world: World) -> None:
         WorkspaceFileNotFoundError("workspace file not found: 'x'"),
         WorkspaceNotAFileError("workspace path is not a file: 'x'"),
         WorkspacePathEscapeError("workspace path escapes the user root: 'x'"),
-        _WorkspacePathNotFoundError("workspace path not found: 'x'"),
+        # The NAS store's "a parent directory is missing" (MISSING_DIR_ERRORS' other member).
+        next(e for e in MISSING_DIR_ERRORS if e is not WorkspaceFileNotFoundError)("gone: 'x'"),
     ],
     ids=["file-not-found", "not-a-file", "path-escape", "parent-dir-gone"],
 )
@@ -677,18 +679,52 @@ async def test_api_key_is_refused_by_the_console_only_gate(world: World) -> None
 # ---------------------------------------------------------------------------
 
 
-async def _seed_artifact(world: World) -> str:
+async def _seed_run(world: World, thread_id: UUID | None = None) -> UUID:
+    """A run of ``thread_id`` (default: this conversation). ``save_artifact`` records the
+    run id — a sub-agent's or worker's artifact records its parent run's id — in
+    ``created_in_thread`` (``orchestrator/tools/artifact.py``)."""
+    run_id, now = uuid4(), datetime.now(UTC)
+    await world.app.state.run_store.create(  # type: ignore[attr-defined]
+        RunInfo(
+            run_id=run_id,
+            tenant_id=_TENANT,
+            thread_id=thread_id or world.thread_id,
+            user_id=world.owner_id,
+            status=RunStatus.SUCCESS,
+            on_disconnect=DisconnectMode.CONTINUE,
+            is_resume=False,
+            error=None,
+            created_at=now,
+            updated_at=now,
+            finished_at=now,
+        )
+    )
+    return run_id
+
+
+async def _save(
+    world: World, *, created_in: str, name: str = "report.pdf", agent_key: str = _KEY
+) -> None:
     await world.app.state.artifact_store.save_version(  # type: ignore[attr-defined]
         tenant_id=_TENANT,
         user_id=world.owner_id,
-        agent_key=_KEY,
-        name="report.pdf",
+        agent_key=agent_key,
+        name=name,
         kind="document",
-        path_in_workspace="report.pdf",
-        created_in_thread=str(world.thread_id),
+        path_in_workspace=name,
+        created_in_thread=created_in,
     )
+
+
+def _artifact_url(thread_id: UUID, name: str = "report.pdf") -> str:
+    return f"/v1/sessions/{thread_id}/workspace/artifacts/{name}/download"
+
+
+async def _seed_artifact(world: World) -> str:
+    """An artifact this conversation produced (a run of this thread)."""
+    await _save(world, created_in=str(await _seed_run(world)))
     world.workspace.workspace_file = b"%PDF-1.4 artifact"
-    return f"/v1/sessions/{world.thread_id}/workspace/artifacts/report.pdf/download"
+    return _artifact_url(world.thread_id)
 
 
 @pytest.mark.parametrize("role", ["viewer", "operator"])
@@ -742,3 +778,133 @@ async def test_artifact_download_refuses_an_api_key(world: World) -> None:
     resp = await world.client.get(url, headers={"Authorization": f"Bearer {plaintext}"})
     assert resp.status_code == 403, resp.text
     assert resp.json()["detail"]["code"] == "FORBIDDEN"
+
+
+_VIEWER = {"roles": ("viewer",)}
+
+
+@pytest.mark.asyncio
+async def test_non_owner_cannot_download_another_conversations_artifact(world: World) -> None:
+    """N1 — the owner's same-named artifact from another conversation (same agent) is not
+    this conversation's: a non-owner gets the opaque 404 and no data-view row."""
+    other_thread = uuid4()
+    await world.app.state.thread_meta_repo.create(  # type: ignore[attr-defined]
+        thread_id=other_thread,
+        tenant_id=_TENANT,
+        created_by=_OWNER,
+        user_id=world.owner_id,
+        agent_name=_AGENT,
+    )
+    await _save(world, created_in=str(await _seed_run(world, other_thread)), name="secret.pdf")
+    world.workspace.workspace_file = b"%PDF-1.4 other conversation"
+    resp = await world.client.get(
+        _artifact_url(world.thread_id, "secret.pdf"), headers=_headers("colleague", **_VIEWER)
+    )
+    assert resp.status_code == 404, resp.text
+    assert b"other conversation" not in resp.content
+    assert await world.views() == []
+    # The same artifact through its own conversation is fine.
+    ok = await world.client.get(
+        _artifact_url(other_thread, "secret.pdf"), headers=_headers("colleague", **_VIEWER)
+    )
+    assert ok.status_code == 200, ok.text
+
+
+@pytest.mark.asyncio
+async def test_non_owner_on_an_unbound_thread_cannot_reach_other_agents_artifacts(
+    world: World,
+) -> None:
+    """N1 — ``agent_name=None`` means "don't filter by agent"; a non-owner must still only
+    reach what this conversation produced."""
+    unbound = uuid4()
+    await world.app.state.thread_meta_repo.create(  # type: ignore[attr-defined]
+        thread_id=unbound, tenant_id=_TENANT, created_by=_OWNER, user_id=world.owner_id
+    )
+    await _save(
+        world,
+        created_in=str(await _seed_run(world)),  # produced in *another* conversation
+        name="x.pdf",
+        agent_key=sanitize_agent_key("other-agent"),
+    )
+    world.workspace.workspace_file = b"%PDF-1.4 other agent"
+    resp = await world.client.get(
+        _artifact_url(unbound, "x.pdf"), headers=_headers("colleague", **_VIEWER)
+    )
+    assert resp.status_code == 404, resp.text
+
+
+@pytest.mark.asyncio
+async def test_non_owner_gets_this_conversations_version_not_a_later_one(world: World) -> None:
+    """N1 — the bytes must come from a version this conversation produced. When the owner
+    later saved the same name in another conversation, a non-owner asking for this
+    conversation's version by number passes the gate (here it was registered before
+    per-version copies, so the usual 409 "not retained" follows — the page then offers
+    "latest"), and the newer one is a 404, by number and as "latest"."""
+    await _save(world, created_in=str(await _seed_run(world)))
+    await _save(world, created_in=str(await _seed_run(world, uuid4())))
+    world.workspace.workspace_file = b"%PDF-1.4 artifact"
+    viewer = _headers("colleague", **_VIEWER)
+    url = _artifact_url(world.thread_id)
+    mine = await world.client.get(url, params={"version": 1}, headers=viewer)
+    assert mine.status_code == 409, mine.text
+    assert mine.json()["detail"]["code"] == "ARTIFACT_VERSION_NOT_RETAINED"
+    assert (await world.client.get(url, params={"version": 2}, headers=viewer)).status_code == 404
+    assert (await world.client.get(url, headers=viewer)).status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_any_run_of_the_conversation_counts(world: World) -> None:
+    """N1 — every run of the thread counts (a later turn, a resumed run); a sub-agent or
+    worker records its parent run's id, so its artifacts land here too."""
+    await _seed_run(world)
+    await _save(world, created_in=str(await _seed_run(world)))
+    world.workspace.workspace_file = b"%PDF-1.4 artifact"
+    resp = await world.client.get(
+        _artifact_url(world.thread_id), headers=_headers("colleague", **_VIEWER)
+    )
+    assert resp.status_code == 200, resp.text
+
+
+@pytest.mark.parametrize(
+    "headers",
+    [_headers(), _headers("the-admin", roles=("admin",))],
+    ids=["owner", "tenant-admin"],
+)
+@pytest.mark.asyncio
+async def test_owner_and_tenant_admin_keep_todays_artifact_behaviour(
+    world: World, headers: dict[str, str]
+) -> None:
+    """Unchanged for the owner and tenant admins: the owner's artifact by name under the
+    session's agent, whichever conversation produced it."""
+    await _save(world, created_in=str(await _seed_run(world, uuid4())))
+    world.workspace.workspace_file = b"%PDF-1.4 artifact"
+    resp = await world.client.get(_artifact_url(world.thread_id), headers=headers)
+    assert resp.status_code == 200, resp.text
+
+
+async def _last_used(world: World) -> datetime | None:
+    latest = await world.app.state.artifact_store.get_latest_version(  # type: ignore[attr-defined]
+        tenant_id=_TENANT, user_id=world.owner_id, agent_key=_KEY, name="report.pdf"
+    )
+    assert latest is not None
+    return latest.last_used_at  # type: ignore[no-any-return]
+
+
+@pytest.mark.asyncio
+async def test_non_owner_download_is_not_a_retention_use(world: World) -> None:
+    """N2 — only the owner's download extends the artifact's retention."""
+    url = await _seed_artifact(world)
+    resp = await world.client.get(url, headers=_headers("colleague", **_VIEWER))
+    assert resp.status_code == 200, resp.text
+    assert await _last_used(world) is None
+    assert (await world.client.get(url)).status_code == 200
+    assert await _last_used(world) is not None
+
+
+@pytest.mark.asyncio
+async def test_artifact_download_is_not_cached(world: World) -> None:
+    """N3."""
+    url = await _seed_artifact(world)
+    resp = await world.client.get(url, headers=_headers("colleague", **_VIEWER))
+    assert resp.status_code == 200, resp.text
+    assert resp.headers["cache-control"] == "private, no-store"

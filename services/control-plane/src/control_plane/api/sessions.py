@@ -96,6 +96,7 @@ from expert_work.protocol import (
 )
 from expert_work.protocol.agent_key import sanitize_agent_key
 from expert_work.runtime.audit.logger import AuditLogger
+from expert_work.runtime.runs import RunStore
 from orchestrator.context.workspace_projection import thread_projection_prefix
 from orchestrator.tools import (
     SandboxSupervisorError,
@@ -245,6 +246,19 @@ def _get_workspace_store(request: Request) -> UserWorkspaceStore:
 
 def _get_artifact_store(request: Request) -> ArtifactStore:
     return request.app.state.artifact_store  # type: ignore[no-any-return]
+
+
+def _get_run_store(request: Request) -> RunStore:
+    return request.app.state.run_store  # type: ignore[no-any-return]
+
+
+async def _conversation_run_ids(runs: RunStore, *, thread_id: UUID, tenant_id: UUID) -> set[str]:
+    """B-295 —— 这段对话的全部 run id(字符串)。``save_artifact`` 在产物版本的
+    ``created_in_thread`` 里记的是 run id;子智能体 / worker 记的是父 run 的 id(B-63 PR2 起,
+    ``inputs_run_id``),所以它们登记的产物也落在这个集合里。"""
+    return {
+        str(r.run_id) for r in await runs.list_by_thread(thread_id=thread_id, tenant_id=tenant_id)
+    }
 
 
 def _get_artifact_snapshots(request: Request) -> ArtifactSnapshotStore | None:
@@ -762,6 +776,7 @@ def build_sessions_router() -> APIRouter:
         artifacts: Annotated[ArtifactStore, Depends(_get_artifact_store)],
         workspace_store: Annotated[WorkspaceStore | None, Depends(_get_workspace_file_client)],
         snapshots: Annotated[ArtifactSnapshotStore | None, Depends(_get_artifact_snapshots)],
+        runs: Annotated[RunStore, Depends(_get_run_store)],
         audit: Annotated[AuditLogger, Depends(_get_audit)],
         # W2 read scope — see ``get_session``.
         tenant_id: Annotated[UUID | Literal["*"] | None, Query()] = None,
@@ -773,6 +788,14 @@ def build_sessions_router() -> APIRouter:
         ``/v1/artifacts/download``. Visible to whoever may read the conversation
         (``session:read``, B-295); a non-owner read is audited as ``user:data_view``.
         404 hides missing / no-supervisor.
+
+        B-295 review N1 —— the lookup is by ``(owner, agent, name)``, which spans every
+        conversation the owner had with that agent (all agents when ``agent_name`` is unset,
+        purged conversations included). The owner and a tenant admin keep that (today's
+        behaviour). Anyone else only gets bytes from a version **this** conversation
+        produced: the version served (the requested one, else the latest) must have
+        ``created_in_thread`` among this thread's run ids; otherwise the same 404 as a
+        missing artifact. Their download is not a retention "use" (N2).
 
         B-235 —— ``version`` 给了就下那一版(对话页 / 调试台每一轮带上这一轮登记的
         版本号),不给是最新版;内容读登记时的副本(选版规则见
@@ -796,6 +819,11 @@ def build_sessions_router() -> APIRouter:
             raise HTTPException(status_code=404, detail="session not found")
         if meta.user_id is None or workspace_store is None:
             raise HTTPException(status_code=404, detail="artifact not found")
+        caller_user_id = await resolve_caller_user_id(request, users)
+        # Owner / tenant admin / machine principal: today's behaviour (B-295 review N1).
+        unrestricted = caller_owns_thread(
+            meta=meta, caller_user_id=caller_user_id, principal=request.state.principal
+        )
         async with applied_scope(scope):
             latest = await artifacts.get_latest_version(
                 tenant_id=target_tenant,
@@ -818,6 +846,14 @@ def build_sessions_router() -> APIRouter:
             )
         if latest is None:
             raise HTTPException(status_code=404, detail="artifact not found")
+        if not unrestricted:
+            candidate = pinned if version is not None else latest
+            async with applied_scope(scope):
+                own_runs = await _conversation_run_ids(
+                    runs, thread_id=thread_id, tenant_id=target_tenant
+                )
+            if candidate is None or candidate.created_in_thread not in own_runs:
+                raise HTTPException(status_code=404, detail="artifact not found")
         try:
             chosen = choose_version(latest=latest, requested=version, pinned=pinned)
         except VersionUnknown as exc:
@@ -857,8 +893,9 @@ def build_sessions_router() -> APIRouter:
                     snapshots=snapshots,
                     workspace_store=workspace_store,
                     artifacts=artifacts,
-                    # B-63 —— 平台运维跨租户查看不算这个租户在用。
-                    record_use=scope.tenant_id == request.state.principal.tenant_id,
+                    # B-63 / B-295 N2 —— 只有对话主人自己下载才算这个租户在用;别的员工看、
+                    # 平台运维跨租户看都不续留存。
+                    record_use=caller_user_id == meta.user_id,
                 )
         except WorkspacePermissionError as exc:
             # 元数据行存在,内容读不动是权限问题(服务端配置),不是"这个 artifact
@@ -885,13 +922,15 @@ def build_sessions_router() -> APIRouter:
             ),
             "X-Content-Type-Options": "nosniff",
             VERSION_HEADER: str(chosen.version),
+            # B-295 N3 —— 内容常是健康资料:共享缓存、浏览器磁盘缓存都不留。
+            "Cache-Control": "private, no-store",
         }
         await audit_conversation_data_view(
             request,
             audit,
             tenant_id=target_tenant,
             meta=meta,
-            caller_user_id=await resolve_caller_user_id(request, users),
+            caller_user_id=caller_user_id,
             view="conversation_artifact",
         )
         return Response(content=data, media_type=inferred.content_type, headers=headers)

@@ -87,10 +87,9 @@ from orchestrator.tools import (
     WorkspacePermissionError,
     WorkspaceStore,
 )
-from orchestrator.tools.nas_workspace_store import _WorkspacePathNotFoundError
+from orchestrator.tools.nas_workspace_store import MISSING_DIR_ERRORS
 from orchestrator.tools.sandbox import (
     WorkspaceFileChangedError,
-    WorkspaceFileNotFoundError,
     WorkspaceNotAFileError,
     WorkspacePathEscapeError,
 )
@@ -111,14 +110,10 @@ _PDF_MAGIC: Final = b"%PDF-"
 _OPAQUE: Final = "application/octet-stream"
 _UNAVAILABLE: Final = "attachment content unavailable"
 
-#: The store's "nothing readable at that name" answers. ``_WorkspacePathNotFoundError`` is
-#: the NAS store's answer when a *parent* directory is missing — the conversation's whole
-#: ``work/`` reaped (B-282) — and is as expired as a missing leaf.
-_NOT_THERE: Final = (
-    WorkspaceFileNotFoundError,
-    WorkspaceNotAFileError,
-    _WorkspacePathNotFoundError,
-)
+#: The store's "nothing readable at that name" answers. ``MISSING_DIR_ERRORS`` (the store
+#: module's public tuple) adds the NAS store's answer when a *parent* directory is missing —
+#: the conversation's whole ``work/`` reaped (B-282) — which is as expired as a missing leaf.
+_NOT_THERE: Final = (*MISSING_DIR_ERRORS, WorkspaceNotAFileError)
 
 _VIEW: Final = "conversation_attachment"
 
