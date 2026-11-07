@@ -382,3 +382,38 @@ async def test_streaming_probe_closes_the_breaker_at_its_first_token() -> None:
     )
     assert await _call(router) == "ok"
     assert states == ["CLOSED"], "the probe must resolve before the stream ends"
+
+
+@pytest.mark.asyncio
+async def test_payload_carries_the_attempt_deadline_for_the_probe_lease() -> None:
+    """Streaming with a backup → the capped first-token deadline; a
+    non-streaming attempt → the whole-answer deadline it really runs under."""
+    seen: list[object] = []
+
+    @dataclass
+    class _Spy:
+        name: str = "spy"
+        anchor: str = "around_llm_call"
+        after: tuple[str, ...] = ()
+        before: tuple[str, ...] = ()
+
+        async def __call__(self, ctx: MiddlewareContext, call_next: CallNext) -> None:
+            seen.append(ctx.payload.get("attempt_deadline_s"))
+            await call_next(ctx)
+
+    chain = MiddlewareChain.from_middlewares("around_llm_call", [_Spy()])
+    streaming = _router(
+        [(_Streamer(), "a:m", "a:m"), (_Provider("b"), "b:m", "b:m")],
+        chain=chain,
+        first_token_timeout_s=180.0,
+        token_estimator=_FixedEstimator(200_000),
+    )
+    await _call(streaming)
+    buffered = _router(
+        [(_Provider("a"), "a:m", "a:m"), (_Provider("b"), "b:m", "b:m")],
+        chain=chain,
+        first_token_timeout_s=180.0,
+        token_estimator=_FixedEstimator(10),
+    )
+    await _call(buffered)
+    assert seen == [120.0, 180.0]

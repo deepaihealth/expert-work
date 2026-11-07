@@ -19,11 +19,15 @@ outage it never opened. This module follows the common industry defaults
   refused until the probe resolves. The E.4 middleware resolves a streaming
   probe at its first progress delta (the upstream answers — no need to hold
   the slot for a whole generation); a probe that neither progresses nor ends
-  within ``probe_lease_s`` (60 s: hung upstream, deadline disabled) counts as
-  a failed probe and re-opens the breaker;
-* **any success closes** the breaker, also one observed while OPEN (a
-  single-model chain is let through an open breaker — its answer is fresh
-  evidence the upstream works).
+  within its lease (``probe_lease_s`` = 60 s, or the attempt's own first-token
+  / non-streaming deadline if longer) counts as a failed probe and re-opens
+  the breaker;
+* **fresh successes close** the breaker — the probe's, or a single-model
+  caller's let through the open breaker (its answer is evidence the upstream
+  works). The late success of a call admitted *before* the breaker opened is
+  ignored while it is not CLOSED.
+* every transition to OPEN increments ``expert_work_llm_breaker_open_total``
+  and logs ``llm_breaker.open`` (here, so lease-expiry opens count too).
 
 State is per process (one :class:`BreakerRegistry` per control-plane
 process, shared by every agent / sub-agent / run); replicas do not share it.
@@ -46,7 +50,18 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Literal
 
+from expert_work.common.observability.metrics import expert_work_counter
+
 logger = logging.getLogger(__name__)
+
+# One increment per transition to OPEN. Labelled by the router's
+# ``provider_key`` (``provider:model[#idx]``) — never the breaker key, whose
+# credential fingerprint would make the label set grow with tenants.
+_breaker_open_total = expert_work_counter(
+    "expert_work_llm_breaker_open_total",
+    "LLM upstream circuit breakers that opened (B-297).",
+    ("provider_key",),
+)
 
 BreakerState = Literal["CLOSED", "OPEN", "HALF_OPEN"]
 #: ``allowed`` — normal call; ``probe`` — the single half-open trial call;
@@ -96,7 +111,14 @@ class CircuitBreaker:
         max_cooldown_s: float = DEFAULT_MAX_COOLDOWN_S,
         probe_lease_s: float = DEFAULT_PROBE_LEASE_S,
         clock: Callable[[], float] | None = None,
+        key: str = "",
+        label: str = "",
     ) -> None:
+        #: ``key`` (breaker identity, may carry a fingerprint) and ``label``
+        #: (bounded metric label, the router's ``provider:model[#idx]``) are
+        #: only used for the open log / ``expert_work_llm_breaker_open_total``.
+        self.key = key
+        self.label = label
         self._failure_threshold = failure_threshold
         self._failure_rate = failure_rate
         self._min_attempts = min_attempts
@@ -114,6 +136,7 @@ class CircuitBreaker:
         self._probe_in_flight = False
         self._probe_id = 0
         self._probe_started = 0.0
+        self._probe_lease_current = probe_lease_s
 
     # -- reads ---------------------------------------------------------------
 
@@ -129,8 +152,13 @@ class CircuitBreaker:
 
     # -- admission -----------------------------------------------------------
 
-    async def admit(self) -> Permit:
-        """Admit or refuse one upstream attempt."""
+    async def admit(self, *, probe_lease_s: float | None = None) -> Permit:
+        """Admit or refuse one upstream attempt.
+
+        ``probe_lease_s`` — how long this attempt may legitimately go without
+        progress (the router's first-token / non-streaming deadline); a probe's
+        lease is never shorter than it, so a healthy slow probe is not declared
+        hung."""
         with self._lock:
             now = self._clock()
             self._maybe_half_open(now)
@@ -140,6 +168,7 @@ class CircuitBreaker:
                 self._probe_in_flight = True
                 self._probe_id += 1
                 self._probe_started = now
+                self._probe_lease_current = max(self._probe_lease_s, probe_lease_s or 0.0)
                 logger.info("circuit_breaker.probe")
                 return Permit("probe", self._probe_id)
             return Permit("rejected")
@@ -151,14 +180,19 @@ class CircuitBreaker:
     # -- outcomes ------------------------------------------------------------
 
     async def record_success(self, *, probe: bool = False, permit: Permit | None = None) -> None:
-        """Count one success. Any success closes a non-CLOSED breaker — it is
-        fresh evidence the upstream answers (a probe, or a single-model caller
-        let through an open breaker)."""
+        """Count one success. A success closes a non-CLOSED breaker when it is
+        fresh evidence the upstream answers — a probe, or a single-model caller
+        let through the open breaker (a ``"rejected"`` permit). The success of
+        a call admitted (``"allowed"``) before the breaker opened is stale and
+        ignored there: long streams finishing during an overload outage would
+        otherwise keep re-closing it and the cooldown would never grow."""
         with self._lock:
             now = self._clock()
-            self._consecutive_failures = 0
             if self._is_current_probe(probe, permit):
                 self._probe_in_flight = False
+            if self._state != "CLOSED" and permit is not None and permit.admission == "allowed":
+                return
+            self._consecutive_failures = 0
             if self._state != "CLOSED":
                 self._state = "CLOSED"
                 self._open_streak = 0
@@ -216,7 +250,7 @@ class CircuitBreaker:
         elif (
             self._state == "HALF_OPEN"
             and self._probe_in_flight
-            and now - self._probe_started >= self._probe_lease_s
+            and now - self._probe_started >= self._probe_lease_current
         ):
             # The probe neither progressed nor finished within its lease:
             # the upstream is not answering — a failed probe.
@@ -244,10 +278,19 @@ class CircuitBreaker:
             cooldown = min(self._max_cooldown_s, retry_after_s)
         self._state = "OPEN"
         self._open_until = now + cooldown
+        # Every transition to OPEN — failure threshold, failed probe, expired
+        # probe lease — is counted and logged here, in one place.
+        _breaker_open_total.labels(provider_key=self.label or "unlabelled").inc()
         logger.warning(
             "circuit_breaker.open consecutive_failures=%d cooldown_s=%.1f",
             self._consecutive_failures,
             cooldown,
+        )
+        logger.warning(
+            "llm_breaker.open provider_key=%s breaker_key=%s consecutive_failures=%d",
+            self.label,
+            self.key,
+            self._consecutive_failures,
         )
 
 
@@ -273,7 +316,9 @@ class BreakerRegistry:
         self._breakers: dict[str, CircuitBreaker] = {}
         self._lock = threading.Lock()
 
-    async def get(self, key: str) -> CircuitBreaker:
+    async def get(self, key: str, *, label: str = "") -> CircuitBreaker:
+        """The breaker for ``key``; ``label`` (bounded, e.g. ``provider:model``)
+        names it in the open metric / log."""
         with self._lock:
             breaker = self._breakers.get(key)
             if breaker is None:
@@ -281,6 +326,10 @@ class BreakerRegistry:
                     failure_threshold=self._failure_threshold,
                     cooldown_s=self._cooldown_s,
                     clock=self._clock,
+                    key=key,
+                    label=label,
                 )
                 self._breakers[key] = breaker
+            elif label and not breaker.label:
+                breaker.label = label
             return breaker

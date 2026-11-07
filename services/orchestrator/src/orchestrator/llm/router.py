@@ -685,6 +685,8 @@ class LLMRouter:
             # by ``has_alternative`` (any later handle, sibling keys included).
             "has_fallback": has_fallback,
             "has_alternative": has_alternative,
+            # B-297 — a half-open probe's lease never undercuts this.
+            "attempt_deadline_s": self._attempt_deadline_s(handle, messages, output_schema),
             "messages": list(messages),
             "tools": list(tools),
             # B-187 — read by the Langfuse middleware: the model this handle
@@ -748,18 +750,11 @@ class LLMRouter:
         streaming assembler cannot replicate.
         """
         if _streams(handle.provider, output_schema):
-            first_token = self.first_token_timeout_s
-            if _attempt_hints.get()[0]:
-                # B-297 — a backup group can serve: don't wait out the long
-                # single-model deadline on a primary that sends nothing.
-                first_token = fallback_first_token_timeout(
-                    first_token, messages, self.token_estimator or default_estimator()
-                )
             return await self._drive_stream(
                 handle,
                 _stream(handle.provider, messages=messages, tools=tools, output_schema=None),
                 _provider_assembler(handle.provider),
-                first_token_timeout_s=first_token,
+                first_token_timeout_s=self._attempt_deadline_s(handle, messages, output_schema),
             )
         result = await self._invoke_with_deadline(
             handle,
@@ -767,6 +762,25 @@ class LLMRouter:
         )
         assert isinstance(result, AIMessage)  # noqa: S101
         return result
+
+    def _attempt_deadline_s(
+        self,
+        handle: ProviderHandle,
+        messages: Sequence[BaseMessage],
+        output_schema: StructuredOutputSpec | None,
+    ) -> float | None:
+        """The deadline one attempt runs under: time to first token when it
+        streams, the whole answer otherwise (``first_token_timeout_s``).
+
+        B-297 — a streaming attempt with a backup group is capped (60 s /
+        120 s for large prompts): don't wait out the long single-model
+        deadline on a primary that sends nothing."""
+        deadline = self.first_token_timeout_s
+        if _streams(handle.provider, output_schema) and _attempt_hints.get()[0]:
+            deadline = fallback_first_token_timeout(
+                deadline, messages, self.token_estimator or default_estimator()
+            )
+        return deadline
 
     async def _drive_stream(
         self,

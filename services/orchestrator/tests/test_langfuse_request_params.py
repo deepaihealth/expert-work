@@ -419,8 +419,18 @@ async def test_request_params_failure_never_fails_the_call(
         response = await router(messages=[HumanMessage(content="hi")], tools=[])
 
     assert response.content == "ok"
-    # B-297 — the E.4 hints ``has_fallback`` / ``has_alternative`` are always present.
-    assert spy.keys == [{"provider_key", "has_fallback", "has_alternative", "messages", "tools"}]
+    # B-297 — the E.4 hints (``has_fallback`` / ``has_alternative`` /
+    # ``attempt_deadline_s``) are always present.
+    assert spy.keys == [
+        {
+            "provider_key",
+            "has_fallback",
+            "has_alternative",
+            "attempt_deadline_s",
+            "messages",
+            "tools",
+        }
+    ]
     [span] = client.spans
     assert span.error is None
     assert span.model_parameters is None

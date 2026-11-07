@@ -323,6 +323,82 @@ async def test_registry_returns_same_breaker_per_key() -> None:
 
 
 @pytest.mark.asyncio
+async def test_stale_allowed_success_does_not_close_an_open_breaker() -> None:
+    """A long stream admitted before the outage finishing late is not evidence
+    the upstream recovered — it must not re-close the breaker or reset the
+    streak, or the cooldown never grows."""
+    clock = FakeClock()
+    breaker = _breaker(clock)
+    old = await breaker.admit()
+    assert old.admission == "allowed"
+    for _ in range(3):
+        await breaker.record_failure(permit=await breaker.admit())
+    assert await breaker.check_state() == "OPEN"
+    await breaker.record_success(permit=old)
+    assert await breaker.check_state() == "OPEN"
+    assert breaker.consecutive_failures == 3
+    clock.advance(30.0)
+    probe = await breaker.admit()
+    await breaker.record_failure(permit=probe)
+    clock.advance(59.0)
+    assert await breaker.acquire() == "rejected", "streak must still double to 60 s"
+
+
+@pytest.mark.asyncio
+async def test_rejected_permit_success_closes() -> None:
+    """A single-model caller let through an open breaker holds a "rejected"
+    permit; its success is fresh evidence and closes the breaker."""
+    clock = FakeClock()
+    breaker = _breaker(clock)
+    await _fail(breaker, 3)
+    passthrough = await breaker.admit()
+    assert passthrough.admission == "rejected"
+    await breaker.record_success(permit=passthrough)
+    assert await breaker.check_state() == "CLOSED"
+
+
+@pytest.mark.asyncio
+async def test_probe_lease_covers_the_attempt_deadline() -> None:
+    """A healthy probe allowed 120 s to its first token (large context) or to
+    a whole non-streaming answer is not declared hung at 60 s."""
+    clock = FakeClock()
+    breaker = _breaker(clock)
+    await _fail(breaker, 3)
+    clock.advance(30.0)
+    probe = await breaker.admit(probe_lease_s=120.0)
+    assert probe.is_probe
+    clock.advance(119.0)
+    assert await breaker.acquire() == "rejected"
+    assert await breaker.check_state() == "HALF_OPEN"
+    clock.advance(1.0)
+    assert await breaker.check_state() == "OPEN"
+
+
+@pytest.mark.asyncio
+async def test_lease_expiry_open_is_counted_and_logged(caplog: pytest.LogCaptureFixture) -> None:
+    from prometheus_client import REGISTRY
+
+    def _value() -> float:
+        v = REGISTRY.get_sample_value(
+            "expert_work_llm_breaker_open_total", {"provider_key": "lease:model"}
+        )
+        return v or 0.0
+
+    clock = FakeClock()
+    registry = BreakerRegistry(clock=clock)
+    breaker = await registry.get("lease:model@fp", label="lease:model")
+    await _fail(breaker, 3)
+    before = _value()
+    clock.advance(30.0)
+    assert (await breaker.admit()).is_probe
+    clock.advance(60.0)
+    with caplog.at_level("WARNING"):
+        assert await breaker.check_state() == "OPEN"
+    assert _value() == before + 1
+    assert "llm_breaker.open provider_key=lease:model breaker_key=lease:model@fp" in caplog.text
+
+
+@pytest.mark.asyncio
 async def test_many_concurrent_callers_get_exactly_one_probe() -> None:
     import asyncio
 

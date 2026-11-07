@@ -546,3 +546,81 @@ async def test_first_progress_outside_a_probe_is_a_no_op() -> None:
     await mw(_ctx(has_fallback=True), _ok)
     breaker = await mw.breaker_registry.get("p:m")
     assert await breaker.check_state() == "CLOSED"
+
+
+@pytest.mark.asyncio
+async def test_first_progress_hook_does_not_outlive_the_attempt() -> None:
+    from expert_work.runtime.middleware.llm_error_handling import _first_progress_hook
+
+    clock = FakeClock()
+    mw = _mw(clock, ClockSleeper(clock))
+    await _open_then_half_open(mw, clock)
+    with pytest.raises(LLMServerError):
+        await mw(_ctx(has_fallback=True), Terminal([LLMServerError()], clock))
+    assert _first_progress_hook.get() is None
+
+
+@pytest.mark.asyncio
+async def test_first_progress_of_a_normal_attempt_does_not_count_as_success() -> None:
+    """Only a probe resolves early; an ordinary attempt that streams and then
+    dies is one more failure on top of the earlier ones."""
+    clock = FakeClock()
+    mw = _mw(clock, ClockSleeper(clock))
+    breaker = await mw.breaker_registry.get("p:m")
+    for _ in range(2):
+        await breaker.acquire()
+        await breaker.record_failure()
+
+    async def _streams_then_dies(_ctx: MiddlewareContext) -> None:
+        await notify_first_progress()
+        raise LLMStreamInterruptedError("died mid-generation")
+
+    with pytest.raises(LLMStreamInterruptedError):
+        await mw(_ctx(has_fallback=True), _streams_then_dies)
+    assert breaker.consecutive_failures == 3
+    assert await breaker.check_state() == "OPEN"
+
+
+@pytest.mark.asyncio
+async def test_task_spawned_in_a_probe_cannot_resolve_it_after_the_attempt() -> None:
+    clock = FakeClock()
+    mw = _mw(clock, ClockSleeper(clock))
+    await _open_then_half_open(mw, clock)
+    breaker = await mw.breaker_registry.get("p:m")
+    go = asyncio.Event()
+    children: list[asyncio.Task[None]] = []
+
+    async def _late_notify() -> None:
+        await go.wait()
+        await notify_first_progress()
+
+    async def _spawns_then_fails(_ctx: MiddlewareContext) -> None:
+        children.append(asyncio.create_task(_late_notify()))
+        raise LLMServerError("probe failed")
+
+    with pytest.raises(LLMServerError):
+        await mw(_ctx(has_fallback=True), _spawns_then_fails)
+    assert await breaker.check_state() == "OPEN"
+    go.set()
+    await children[0]
+    assert await breaker.check_state() == "OPEN"
+
+
+@pytest.mark.asyncio
+async def test_probe_lease_follows_the_routers_attempt_deadline() -> None:
+    clock = FakeClock()
+    mw = _mw(clock, ClockSleeper(clock))
+    await _open_then_half_open(mw, clock)
+    breaker = await mw.breaker_registry.get("p:m")
+    checked: list[str] = []
+
+    async def _slow_but_healthy(_ctx: MiddlewareContext) -> None:
+        clock.now += 100.0  # beyond the 60 s default lease, within 120 s
+        checked.append(await breaker.check_state())
+
+    ctx = MiddlewareContext(
+        payload={"provider_key": "p:m", "has_fallback": True, "attempt_deadline_s": 120.0}
+    )
+    await mw(ctx, _slow_but_healthy)
+    assert checked == ["HALF_OPEN"]
+    assert await breaker.check_state() == "CLOSED"

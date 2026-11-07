@@ -31,7 +31,6 @@ from collections.abc import Awaitable, Callable
 from contextvars import ContextVar
 from dataclasses import dataclass, field
 
-from expert_work.common.observability.metrics import expert_work_counter
 from expert_work.runtime.middleware.base import CallNext, MiddlewareContext
 from expert_work.runtime.middleware.circuit_breaker import (
     BreakerRegistry as BreakerRegistry,
@@ -199,15 +198,6 @@ _RETRYABLE_ERRORS: tuple[type[LLMError], ...] = (
 # Middleware
 # ---------------------------------------------------------------------------
 
-# B-297 — one increment per CLOSED/HALF_OPEN → OPEN transition. Labelled by the
-# router's ``provider_key`` (``provider:model[#idx]``) — never the breaker key,
-# whose credential fingerprint would make the label set grow with tenants.
-_breaker_open_total = expert_work_counter(
-    "expert_work_llm_breaker_open_total",
-    "LLM upstream circuit breakers that opened (B-297).",
-    ("provider_key",),
-)
-
 #: B-297 — failures that count toward the breaker but are never retried
 #: in place: a dead account/key, a hung provider (first-token timeout) and a
 #: stream that died after its first token (committed to this provider; the
@@ -313,9 +303,14 @@ class LLMErrorHandlingMiddleware:
     async def __call__(self, ctx: MiddlewareContext, call_next: CallNext) -> None:
         key = self.key_extractor(ctx)
         has_fallback = bool(ctx.payload.get("has_fallback", False))
+        provider_key = str(ctx.payload.get("provider_key", "default"))
+        # The router's per-attempt deadline (first token, or the whole answer
+        # when not streaming): a half-open probe's lease never undercuts it.
+        deadline = ctx.payload.get("attempt_deadline_s")
+        probe_lease = float(deadline) if isinstance(deadline, int | float) else None
         call = _Attempt(
-            breaker=await self.breaker_registry.get(key),
-            provider_key=str(ctx.payload.get("provider_key", "default")),
+            breaker=await self.breaker_registry.get(key, label=provider_key),
+            provider_key=provider_key,
             key=key,
             has_fallback=has_fallback,
             has_alternative=bool(ctx.payload.get("has_alternative", has_fallback)),
@@ -324,7 +319,7 @@ class LLMErrorHandlingMiddleware:
         last_exc: LLMError | None = None
         attempt = 0
         while True:
-            permit = await call.breaker.admit()
+            permit = await call.breaker.admit(probe_lease_s=probe_lease)
             if permit.admission == "rejected" and call.has_alternative:
                 if last_exc is not None:
                     raise last_exc
@@ -346,10 +341,13 @@ class LLMErrorHandlingMiddleware:
         the backoff already slept here; anything final is raised."""
         breaker = call.breaker
         resolved = False
+        # Cleared when the attempt ends: a task spawned inside the attempt
+        # inherits the hook (context copy) but must not resolve it afterwards.
+        active = True
 
         async def _probe_answered() -> None:
             nonlocal resolved
-            if not resolved:
+            if active and not resolved:
                 resolved = True
                 await breaker.record_success(permit=permit)
 
@@ -398,6 +396,7 @@ class LLMErrorHandlingMiddleware:
                 await breaker.record_success(permit=permit)
             return None
         finally:
+            active = False
             _first_progress_hook.reset(token)
 
     def _retry_delay(
@@ -444,13 +443,6 @@ class LLMErrorHandlingMiddleware:
     async def _record_failure(
         self, call: _Attempt, permit: Permit, *, retry_after_s: float | None = None
     ) -> bool:
-        opened = await call.breaker.record_failure(permit=permit, retry_after_s=retry_after_s)
-        if opened:
-            _breaker_open_total.labels(provider_key=call.provider_key).inc()
-            logger.warning(
-                "llm_breaker.open provider_key=%s breaker_key=%s consecutive_failures=%d",
-                call.provider_key,
-                call.key,
-                call.breaker.consecutive_failures,
-            )
-        return opened
+        # The open metric / ``llm_breaker.open`` log are emitted by the breaker
+        # itself, so lease-expiry opens are counted too.
+        return await call.breaker.record_failure(permit=permit, retry_after_s=retry_after_s)
