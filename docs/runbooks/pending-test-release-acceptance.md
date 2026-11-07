@@ -2093,10 +2093,10 @@ oauth2 目录项本来就不在平台池里:不再碰平台池;`enabled` 切换�
 - [x] **97.4 跨会话复制建行**:对外接口在会话 A 传 `b281-c.pdf`;会话 B(新开的,对话视图)带 `files:[{upload_id: <A 的 upl_>}]` 发两轮。判据:只读查会话 B 的 `user_upload` 多出**一行**(第二轮不再加),`ref` 是 B 里实际落地的名字、`sha256` 与 A 那一行相同、`user_id` 与 A 相同;A 那一行不变;审计 `document:upload` 两条都带 `copied_from_upload_id`。 **11-06 测试 `da1f50934` 过**
 - [x] **97.5 到期照常(用户批准后改库)**:把 97.1 所在会话全部 run 的 `created_at`、以及 97.1 **第一行**的 `created_at` 改到 100 天前,手动触发留存作业(`kubectl -n expert-work create job --from=cronjob/retention-cleanup b281-probe-1`)。判据:第一行 `deleted_at` 有值,文件**还在**(第二行还没到期、指着同一个文件);再把第二行也改 100 天前、触发 `b281-probe-2` → 第二行 `deleted_at` 有值、文件已删;作业退出码 0。 **11-06 测试 `da1f50934` 过**
 - [ ] **97.6 迁移时清原件**:找(或请用户提供)一个 (用户, 智能体) 下**只剩一个**老视图会话、且有对外上传登记行的组合(只读:`SELECT user_id, agent_name, count(*) FROM thread_meta WHERE workspace_layout = 'agent_root' GROUP BY 1, 2 HAVING count(*) = 1`,再挑一个在 `user_upload` 里有行的);先在 NAS 上确认 `agents/<key>/uploads/<名字>` 在。在这个会话里发一轮(触发迁移)。判据:control-plane 日志有 `platform_migration.done outcome=migrated`,随后一条 `platform_migration.release_originals legacy_originals mode=apply …`(只有计数),`deleted` ≥ 1、`failed=0`;agent 根的原件没了,对话目录的副本在;用对外接口按 `upl_` id 下载它 200 且内容不变;这一轮 run 正常完成。对照:若该 (用户, 智能体) 还有别的老视图会话,则没有 `release_originals` 那条日志、原件都在。 **11-06 测试 `da1f50934` 不可判**(同 97.2)
-- [ ] **97.7 清理存量:只数不删(测试)**: **11-06 测试 `da1f50934` 不过**:`TypeError` 崩溃(同一原件的副本一条有 sha256 / 大小、一条没有,排序比较 `None`);27 个候选中 16 个触发,NAS 无变化。修复见 B-281 后续 PR,待再发测试复验
+- [x] **97.7 清理存量:只数不删(测试)**: **11-07 测试 `fb03a0689` 过**:退出码 0,只有一行计数 `checked=20 deletable=0 no_original=2 kept_old_view_row=4 kept_old_view_conversation=13 kept_unregistered_upload=1 failed=0`(其余 kept_* 为 0)。**11-06 测试 `da1f50934` 不过**:`TypeError` 崩溃(同一原件的副本一条有 sha256 / 大小、一条没有,排序比较 `None`);27 个候选中 16 个触发,NAS 无变化。修复见 B-281 后续 PR,待再发测试复验
   `kubectl -n expert-work exec deploy/control-plane -c control-plane -- sh -c 'EXPERT_WORK_RETENTION_DB_DSN="$EXPERT_WORK_DB_DSN" EXPERT_WORK_RETENTION_WORKSPACE_ROOT="$EXPERT_WORK_WORKSPACE_NAS_ROOT" python -m retention_cleanup_job.legacy_originals'`
   判据:退出码 0;最后一行形如 `legacy_originals mode=dry-run checked=… deletable=… deleted=0 bytes=… no_original=… kept_…=… failed=0`,整段输出里没有文件名、租户 id、用户 id;NAS 上什么都没变。把整行贴回来(调查时测试上有 4 个这类原件,`deletable` 应 ≤ 4;只要同一 (用户, 智能体) 还有老视图会话,原件计在 `kept_old_view_conversation`)。
-- [ ] **97.8 清理存量:删(测试,用户批准后)**:同 97.7 的命令末尾加 ` --apply`。判据:`deleted` 等于 97.7 的 `deletable`(期间有变化时可少,计在 `kept_changed_during_run`),`failed=0`、退出码 0;再跑一次 97.7(不带 `--apply`):`deletable=0`,`no_original` 比 97.7 多出 `deleted` 个;抽一个被删原件对应的会话,按 `upl_` id 对外下载 200、内容不变。 **11-06 测试 `da1f50934` 未执行**(97.7 崩溃)
+- [x] **97.8 清理存量:删(测试,用户批准后)**:同 97.7 的命令末尾加 ` --apply`。判据:`deleted` 等于 97.7 的 `deletable`(期间有变化时可少,计在 `kept_changed_during_run`),`failed=0`、退出码 0;再跑一次 97.7(不带 `--apply`):`deletable=0`,`no_original` 比 97.7 多出 `deleted` 个;抽一个被删原件对应的会话,按 `upl_` id 对外下载 200、内容不变。 **11-07 测试 `fb03a0689` 已执行**:`--apply` 退出码 0、`deleted=0 failed=0`(97.7 已是 `deletable=0`),再跑只数不删结果与 97.7 逐项相同。测试上没有可删的原件(同 97.2 / 97.6:老视图会话的智能体都已删或属真实用户),真删分支由集成测试覆盖,生产先只数不删、贴回结果再定。**11-06 测试 `da1f50934` 未执行**(97.7 崩溃)
 - [x] **97.9 收尾**:删本节建的会话、上传与 probe job;吊销临时 key。 **11-06 测试 `da1f50934` 过**
 
 **生产(用户执行,随发布之后)**:发布完成、smoke 过之后,在生产集群执行 97.7 的同一条命令(只数不删),把输出的那一行贴回来;我们对一下各 `kept_*` 的原因后再决定是否执行 ` --apply`;执行完再跑一次只数不删,确认 `deletable=0`、`failed=0`。迁移时的清理随发布自动生效,不需要操作;可在 Prometheus 看 `expert_work_platform_migration_originals_total`。不需要改库、不需要停作业。
@@ -2243,3 +2243,22 @@ asyncio.run(main())
 - [x] **100.5 收尾**:删 probe job;若用了 ②,租户附件保留期设回原值;删 100.2 的会话。 **11-06 测试 `da1f50934` 过**
 
 **生产(用户执行,随发布之后)**:先确认 100.0(生产发布包含 B-283;两者同一次发布)。发布后第一晚(03:23)的作业日志看两行:`retention.object_store … available=true bucket=expert-work-prod` 与 `retention_cleanup_job.done … image_keys_failed=0`;第一晚会把此前积压的到期图片(行和字节)一次清掉(每轮上限 `EXPERT_WORK_RETENTION_BATCH_SIZE`,默认 10000 行,多的后几晚接着清)。若出现 `available=false error=…` 或 `retention.image_object_delete_failed`,把那一行贴回来(只有计数与异常类型,不含密钥、不含对象键)。第二天看一眼 Prometheus `expert_work_upload_images_degraded_total`:有增长说明有会话引用了被清掉的图片且照常继续了;同时 control-plane 日志里不应出现图片相关的 `ObjectNotFoundError`。
+
+## §101 MCP 服务建连失败后自动重拨(B-292)
+
+**背景**:池构建时某个远端 MCP 服务连不上,以前只记 `tenant_mcp_pool.server_build_failed` 就跳过,缺了它的池照样缓存 1800 秒 —— 这段时间里该副本上这个服务的工具都没有。现在池在后台只重拨失败的那几个服务(不占构建锁),60 秒起、之后每 120 秒,直到池过期;拨通后并入池(期间池被重建 / 配置变了就作废),日志 `failed_server_recovered`。用户 OAuth 池同理,重拨前重读连接与目录行(期间被关掉的连接器不会被接回);重拨里的令牌刷新不随关机被掐断。
+
+**怎么进**:测试控制台建临时 MCP 服务配置 + 临时智能体 + 临时 API key;临时 MCP 服务端起在集群里(一个工具 `probe_echo`);run 固定打到同一副本(`kubectl exec` 进该 pod 走 localhost)。智能体开着回复缓存时每轮用不同的提示词,否则同一句话会直接重放上一轮的回答。**花费**:几轮短对话,< ¥1。
+
+- [x] **101.1 断开后自动接回**:让服务端不可达后改一下配置(逼各副本重建池),发一轮 → 日志 `server_build_failed`、模型答「没有这个工具」;恢复服务端,约 70 秒后同一副本再发一轮。判据:`failed_server_recovered` 在失败后约 60 秒出现;这一轮工具在、调用成功、run `success`;配置没再改。**没修好时**:1800 秒内一直缺。 **11-07 测试 `fb03a0689` 过**(两轮:失败→恢复 60.05 s / 60.06 s,随后 run 在失败后约 71 s 注册到工具并调用成功,7 s 完成;对照:同条件下旧镜像 `da1f50934` 服务恢复后 160 s 仍缺)
+- [x] **101.2 收尾**:删临时服务端、MCP 配置、智能体、key、会话与终端用户。 **11-07 测试 `fb03a0689` 过**
+
+## §102 对外发起被拒不留空会话(B-293)
+
+**背景**:`run_agent_for_user` 先解析会话(首次见到的终端用户 + 新会话行),再查配额、构建、解析 `files[]`、参数上限;以前后面任一步拒绝都留下一段空会话。现在本次请求新建的会话在被拒时撤回(该会话已有 run / 别的请求的上传时不撤);上传端点同理。终端用户行保留(首次见到即登记,是设计)。
+
+**怎么进**:对外 key(测试用 release-canary 的 key 即可),每个用例用一个新的 `user_id`;只读计数该终端用户的 `thread_meta` / `user_upload` 行。**花费**:一轮短对话。
+
+- [x] **102.1 被拒不留会话**:新用户、不带 `session_id`,`files:[{"upload_id":"upl_<不存在>"}]` 发一轮;另一个新用户在上传端点传一个不支持的类型。判据:分别 404 `UPLOAD_NOT_FOUND`、400 `INVALID_UPLOAD`(与修复前相同);两人会话数都是 0、上传行 0。**没修好时**:各多一个空会话(11-06 §97.3 即如此)。 **11-07 测试 `fb03a0689` 过**
+- [x] **102.2 正常仍建一个**:新用户正常发一轮 → 200 `success`,会话数 1;同一用户再按 102.1 发一次被拒 → 404,会话数仍 1。 **11-07 测试 `fb03a0689` 过**
+- [x] **102.3 收尾**:删会话、清理终端用户。 **11-07 测试 `fb03a0689` 过**
