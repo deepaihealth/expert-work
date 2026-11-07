@@ -45,16 +45,22 @@ LEGEND = (
 )
 
 
+def _geometry(ph) -> dict:
+    # inherited geometry: python-pptx raises KeyError for a few placeholder types it
+    # cannot map to the master (see _pptx_text._base) -> same as "no fixed position"
+    try:
+        return {"left": ph.left, "top": ph.top, "width": ph.width, "height": ph.height}
+    except KeyError:
+        return dict.fromkeys(("left", "top", "width", "height"))
+
+
 def _layout_info(master: int, index: int, layout) -> dict:
     placeholders = [
         {
             "idx": ph.placeholder_format.idx,
             "type": str(ph.placeholder_format.type),
             "name": ph.name,
-            "left": ph.left,
-            "top": ph.top,
-            "width": ph.width,
-            "height": ph.height,
+            **_geometry(ph),
         }
         for ph in layout.placeholders
     ]

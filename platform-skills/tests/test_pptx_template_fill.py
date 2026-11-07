@@ -455,6 +455,26 @@ def test_multiple_masters(scripts, tmp_path):
     assert prs.slides[0].shapes.title.text == "母版一的标题"
 
 
+def test_legacy_placeholder_type_without_known_base(scripts, tmp_path):
+    """A slide placeholder whose layout placeholder has a type python-pptx cannot map to
+    the master (sldImg), geometry inherited only: listed with box null, fillable."""
+    prs = pptx.Presentation()
+    layout = prs.slide_layouts[1]
+    slide = prs.slides.add_slide(layout)
+    body = slide.placeholders[1]
+    body.text = "旧版占位符"
+    layout_ph = layout.placeholders[1]._element
+    layout_ph.find(qn("p:nvSpPr") + "/" + qn("p:nvPr") + "/" + qn("p:ph")).set("type", "sldImg")
+    path = tmp_path / "legacy.pptx"
+    prs.save(str(path))
+    addr = f"1:{body.shape_id}"
+    entry = _texts(_inspect(scripts, path))[addr]
+    assert entry["box"] is None and entry["cap"] is None and entry["text"] == "旧版占位符"
+    report, out = _fill(scripts, tmp_path, path, {"fill": {addr: "新字"}})
+    assert report["results"] == [{"page": 1, "addr": addr, "status": "ok"}]
+    assert pptx.Presentation(str(out)).slides[0].placeholders[1].text == "新字"
+
+
 # ------------------------------------------------------------------ estimate unit
 
 

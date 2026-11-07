@@ -171,12 +171,21 @@ def _text_shape(shape, addr, groups, slide, default_style) -> Target:
     )
 
 
+def _base(shape):
+    # python-pptx maps a layout placeholder's type to its master type with a fixed dict
+    # that lacks a few types (e.g. sldImg, hdr): KeyError = no known base
+    try:
+        return getattr(shape, "_base_placeholder", None)
+    except KeyError:
+        return None
+
+
 def _placeholder_bases(shape) -> list:
     bases = []
-    base = getattr(shape, "_base_placeholder", None)
+    base = _base(shape)
     while base is not None and len(bases) < 2:
         bases.append(base)
-        base = getattr(base, "_base_placeholder", None)
+        base = _base(base)
     return bases
 
 
@@ -224,7 +233,10 @@ def _group_xf(grp_el):
 
 
 def _box(shape, groups) -> tuple[int, int, int, int] | None:
-    vals = (shape.left, shape.top, shape.width, shape.height)
+    try:  # placeholders inherit geometry; see _base for the KeyError
+        vals = (shape.left, shape.top, shape.width, shape.height)
+    except KeyError:
+        return None
     return None if any(v is None for v in vals) else _apply_groups(vals, groups)
 
 
