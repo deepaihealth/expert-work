@@ -274,6 +274,11 @@ class KnowledgeChunkRow(Base):
     #: Full-text vector for the keyword side of hybrid search — populated
     #: by the store from jieba-segmented ``content`` (Stream J.5).
     content_tsv: Mapped[str | None] = mapped_column(TSVECTOR(), nullable=True)
+    #: BM25's document length (migration ``0187``, B-206 K-9): tokens in the
+    #: body part of ``content_tsv`` (``kb_keyword_length``; the title is not
+    #: counted). ``NULL`` for parent rows, and for rows an older release wrote —
+    #: keyword search reads those as the average length.
+    keyword_token_count: Mapped[int | None] = mapped_column(Integer, nullable=True)
     #: Model v2 (migration ``0165``). ``content`` is the clean body;
     #: ``heading_path`` holds the section breadcrumb that the embedding /
     #: keyword text prepend (``chunk_retrieval_text``).

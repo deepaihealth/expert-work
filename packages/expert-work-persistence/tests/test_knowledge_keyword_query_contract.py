@@ -35,6 +35,8 @@ from expert_work.persistence.knowledge import memory as kb_memory
 from expert_work.persistence.knowledge import sql as kb_sql
 from expert_work.persistence.knowledge.base import KnowledgeStore
 from expert_work.persistence.knowledge.text_search import (
+    KB_BM25_B,
+    KB_BM25_K1,
     KB_KEYWORD_PHRASE_BOOST,
     KB_KEYWORD_QUERY_PHRASE_BOOST,
     KbKeywordQuery,
@@ -113,8 +115,17 @@ async def _contents(store: KnowledgeStore, tenant: UUID, kb_id: UUID, query: str
 
 
 def _idf(chunks_in_scope: int, chunks_with_unit: int) -> float:
-    """BM25's idf (Lucene's form) — the weight coverage gives one query unit."""
+    """BM25's idf (Lucene's form) — the weight of one query unit."""
     return math.log(1 + (chunks_in_scope - chunks_with_unit + 0.5) / (chunks_with_unit + 0.5))
+
+
+def _bm25(units: list[tuple[float, float]], length: int, average_length: float) -> float:
+    """The normalised BM25 a chunk scores (B-206 K-9) for ``units`` = (idf, tf)
+    of every query unit: Σ idf·tf·(k1+1) / (tf + k1·(1 - b + b·dl/avgdl)),
+    divided by its ceiling (k1+1)·Σ idf so it stays below 1."""
+    norm = KB_BM25_K1 * (1 - KB_BM25_B + KB_BM25_B * length / average_length)
+    total = sum(idf * tf * (KB_BM25_K1 + 1) / (tf + norm) for idf, tf in units if tf)
+    return total / ((KB_BM25_K1 + 1) * sum(idf for idf, _ in units))
 
 
 async def test_natural_language_question_finds_the_chunk(store: KnowledgeStore) -> None:
@@ -169,27 +180,55 @@ async def test_more_distinct_words_outrank_one_repeated_word(store: KnowledgeSto
     assert hits == ["苹果 适合 老年 人群", repeated]
 
 
-async def test_covering_every_query_word_beats_a_higher_ts_rank(store: KnowledgeStore) -> None:
-    """Coverage decides before ``ts_rank``: the chunk holding all four query
-    words outranks one that repeats three of them — whose ``ts_rank`` is the
-    higher of the two (checked below, so the fixture keeps exercising it)."""
+async def test_covering_every_query_word_beats_repeating_some_of_them(
+    store: KnowledgeStore,
+) -> None:
+    """The chunk holding all four query words once outranks one that repeats
+    three of them ten times: BM25 saturates a repeated word (k1) and weighs
+    the long chunk's words down (b)."""
     every_word = "苹果 适合 老年 人群 吃"
     three_words = " ".join(["苹果 适合 吃"] * 10)
     tenant, kb_id = await _seed(store, [three_words, every_word])
     hits = await _search(store, tenant, kb_id, "苹果适合哪些人群吃？")
     assert [hit.chunk.content for hit in hits] == [every_word, three_words]
-    # score = coverage + ts_rank tie-break (no identifier, no verbatim match).
-    # 苹果 / 适合 / 吃 are in both chunks, 人群 only in ``every_word``.
+    # No identifier, no verbatim match: the score is the normalised BM25.
+    # 苹果 / 适合 / 吃 are in both chunks, 人群 only in ``every_word``; the
+    # lengths are 5 and 30 tokens (average 17.5).
     common, rare = _idf(2, 2), _idf(2, 1)
-    three_words_coverage = 3 * common / (3 * common + rare)
-    every_word_rank, three_words_rank = hits[0].score - 1, hits[1].score - three_words_coverage
-    assert 0 < every_word_rank < three_words_rank < 0.1
+    expected = [
+        _bm25([(common, 1), (common, 1), (rare, 1), (common, 1)], 5, 17.5),
+        _bm25([(common, 10), (common, 10), (rare, 0), (common, 10)], 30, 17.5),
+    ]
+    assert [hit.score for hit in hits] == pytest.approx(expected, abs=1e-6)
+
+
+async def test_a_short_chunk_outranks_a_long_one_holding_the_same_words(
+    store: KnowledgeStore,
+) -> None:
+    """BM25's length normalisation (B-206 K-9): of two chunks that each hold
+    the query's words once, the shorter ranks first — before K-9 they tied and
+    kept the scan order, which put the long one (inserted first) ahead."""
+    long_chunk = "苹果 沙拉 " + " ".join(LONG_WORDS[:30])
+    tenant, kb_id = await _seed(store, [long_chunk, "苹果 沙拉 配方"])
+    assert await _contents(store, tenant, kb_id, "沙拉和苹果") == ["苹果 沙拉 配方", long_chunk]
+
+
+async def test_the_keyword_score_is_normalised_bm25(store: KnowledgeStore) -> None:
+    """tf = the unit's occurrences in the body, dl = the body's tokens (not its
+    distinct words: ``苹果 苹果 沙拉`` is 3 long), avgdl and idf over the chunks
+    in scope — the same number from both stores."""
+    tenant, kb_id = await _seed(store, ["苹果 苹果 沙拉", "苹果 派 面包 牛奶 鸡蛋", "香蕉"])
+    hits = await _search(store, tenant, kb_id, "沙拉和苹果")
+    salad, apple = _idf(3, 1), _idf(3, 2)  # units in query order: 沙拉, 苹果
+    assert [hit.chunk.content for hit in hits] == ["苹果 苹果 沙拉", "苹果 派 面包 牛奶 鸡蛋"]
+    expected = [_bm25([(salad, 1), (apple, 2)], 3, 3.0), _bm25([(salad, 0), (apple, 1)], 5, 3.0)]
+    assert [hit.score for hit in hits] == pytest.approx(expected, abs=1e-6)
 
 
 async def test_rarer_word_outweighs_a_common_one(store: KnowledgeStore) -> None:
     """Of two chunks that each hold one of the two query words, the one whose
     word few chunks contain ranks first — although the other repeats its
-    common word and so has the higher ``ts_rank``."""
+    common word three times."""
     common_hit, rare_hit = "苹果 苹果 苹果 沙拉", "香蕉 沙拉"
     tenant, kb_id = await _seed(store, [common_hit, rare_hit, "苹果 甜点", "苹果 果汁", "苹果 派"])
     hits = await _contents(store, tenant, kb_id, "苹果和香蕉")
@@ -275,25 +314,28 @@ async def test_question_phrase_matches_across_widths(
 async def test_idf_weights_stay_positive_when_a_word_is_everywhere(store: KnowledgeStore) -> None:
     """BM25's idf stays usable at the extremes. When every chunk holds every
     query word (df = N) the +0.5 smoothing keeps each weight off zero, so the
-    weights never sum to zero and coverage is 1 (this half cannot tell the
-    sign of the weights apart). The +1 inside the log keeps the weight of a
-    word found in every chunk above zero: it still counts, just for less than
-    a rarer word (the second half)."""
+    weights never sum to zero and every chunk gets the same positive score
+    (this half cannot tell the sign of the weights apart). The +1 inside the
+    log keeps the weight of a word found in every chunk above zero: it still
+    counts, just for less than a rarer word (the second half)."""
     tenant, kb_id = await _seed(store, ["苹果 香蕉 沙拉", "香蕉 苹果 果汁", "苹果 派 香蕉"])
     hits = await _search(store, tenant, kb_id, "苹果和香蕉")
     assert len(hits) == 3
-    assert all(1.0 <= hit.score < 1.1 for hit in hits)
+    everywhere = _idf(3, 3)
+    expected = _bm25([(everywhere, 1), (everywhere, 1)], 3, 3.0)
+    assert [hit.score for hit in hits] == pytest.approx([expected] * 3, abs=1e-6)
+    assert expected > 0
     tenant, kb_id = await _seed(store, ["苹果 沙拉", "苹果 香蕉", "苹果 派"])
     hits = await _search(store, tenant, kb_id, "苹果和香蕉")
     assert hits[0].chunk.content == "苹果 香蕉"
     assert len(hits) == 3
-    assert all(0 < hit.score < 1.0 for hit in hits[1:])
+    assert all(0 < hit.score < hits[0].score for hit in hits[1:])
 
 
 async def test_identifier_chunk_first_even_for_a_long_query(store: KnowledgeStore) -> None:
-    """The phrase boost outweighs any coverage + ``ts_rank`` a chunk without the
-    identifier can reach, however many words the query has (40 here: a 1.0
-    boost would lose to the chunk repeating all of them)."""
+    """The phrase boost outweighs any BM25 a chunk without the identifier can
+    reach, however many words the query has (40 here, the other chunk
+    repeating all of them)."""
     words = ["w" + chr(97 + i // 26) + chr(97 + i % 26) for i in range(40)]
     every_word_repeated = " ".join(words * 10)
     tenant, kb_id = await _seed(store, [every_word_repeated, "QXA-N7"])
@@ -303,9 +345,9 @@ async def test_identifier_chunk_first_even_for_a_long_query(store: KnowledgeStor
 
 async def test_sql_and_memory_rank_a_shared_fixture_identically(store: KnowledgeStore) -> None:
     """One expected order for both stores: identifier hits first, the verbatim
-    question first among them, then more of the query covered (rarer words
-    weigh more), then ``ts_rank`` (repeats) breaking coverage ties. Insertion
-    order is deliberately not the expected order."""
+    question first among them, then BM25 (more of the query covered, rarer
+    words weighing more, repeats counting with diminishing returns, shorter
+    chunks ahead). Insertion order is deliberately not the expected order."""
     once = "苹果 适合 吃"
     repeated = "苹果 苹果 苹果 适合 适合 适合 吃 吃 吃"
     tenant, kb_id = await _seed(
@@ -314,7 +356,7 @@ async def test_sql_and_memory_rank_a_shared_fixture_identically(store: Knowledge
             "吃 吃 吃 吃 吃 吃 吃 吃",  # 1/5 covered
             once,  # 3/5, single occurrences
             "QXA-N7 品种",  # identifier, 1/5
-            repeated,  # 3/5, repeated: higher ts_rank than ``once``
+            repeated,  # 3/5, each three times: above ``once`` despite its length
             "苹果 适合 人群 吃",  # 4/5
             "无关 内容",  # no match
             "QXA-N7 苹果 适合",  # identifier, 3/5
@@ -332,8 +374,8 @@ async def test_sql_and_memory_rank_a_shared_fixture_identically(store: Knowledge
         "吃 吃 吃 吃 吃 吃 吃 吃",
     ]
     # Same scores too (values from Postgres): identifier 2.0 + question 1.5 +
-    # IDF-weighted coverage + ts_rank.
-    expected = [4.560793, 2.561594, 2.275329, 0.785463, 0.440373, 0.429397, 0.148476]
+    # the normalised BM25.
+    expected = [3.869702, 2.260215, 2.139622, 0.372014, 0.245263, 0.218412, 0.109636]
     assert [hit.score for hit in hits] == pytest.approx(expected, abs=1e-5)
 
 

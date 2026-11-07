@@ -161,17 +161,38 @@ KB_IDENTIFIER_MIN_DIGITS_ONLY_LENGTH = 6
 KB_DOC_TITLE_HIT_WEIGHT = 0.5
 
 #: Added to the score of a chunk that contains any identifier phrase of the
-#: query. Without it a chunk scores below 1.1 + KB_KEYWORD_QUERY_PHRASE_BOOST
-#: (coverage ≤ 1, ``ts_rank`` < 0.1); a verbatim match of a question holding an
+#: query. Without it a chunk scores below 1 + KB_KEYWORD_QUERY_PHRASE_BOOST
+#: (the normalised BM25 is < 1); a verbatim match of a question holding an
 #: identifier also holds that identifier, so identifier hits still sort first.
 KB_KEYWORD_PHRASE_BOOST = 2.0
 
 #: Added to the score of a chunk that contains the whole question verbatim
-#: (:attr:`KbKeywordQuery.query_phrase`). Coverage (≤ 1) plus the ``ts_rank``
-#: tie-break (< 0.1) is below 1.1, so 1.5 puts every verbatim match above every
-#: chunk that only holds the words — whatever its own coverage — with margin.
+#: (:attr:`KbKeywordQuery.query_phrase`). The normalised BM25 is below 1, so
+#: 1.5 puts every verbatim match above every chunk that only holds the words —
+#: whatever its own BM25 — with margin.
 #: It reorders only: the match predicate does not include the question phrase.
 KB_KEYWORD_QUERY_PHRASE_BOOST = 1.5
+
+#: BM25's term-frequency saturation (B-206 K-9; Lucene / Elasticsearch default):
+#: a unit's second occurrence adds less than its first, its tenth almost nothing.
+KB_BM25_K1 = 1.2
+
+#: BM25's length normalisation (B-206 K-9; Lucene / Elasticsearch default): a
+#: chunk longer than the average of the chunks in scope needs more occurrences
+#: for the same weight, a shorter one fewer.
+KB_BM25_B = 0.75
+
+
+def kb_keyword_length(text: str) -> int:
+    """BM25's document length of a chunk whose breadcrumb + body is ``text``:
+    the searchable tokens it is keyword-indexed as (:func:`kb_index_text`,
+    segmented) — one per position Postgres gives its ``tsvector`` body, not
+    the number of distinct words. The document title is not counted."""
+    return sum(
+        1
+        for token in tokenize_for_search(kb_index_text(text)).split()
+        if is_searchable_token(token)
+    )
 
 
 @dataclass(frozen=True)

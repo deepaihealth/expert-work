@@ -1495,10 +1495,10 @@ class KnowledgeStore(abc.ABC):
         form where NFKC changed the query.
         A chunk matches when it contains **any** term, or any identifier
         phrase as adjacent tokens. Chunks holding an identifier rank first;
-        then chunks holding the whole question verbatim; then chunks covering
-        more of the query, rarer terms weighing more (BM25 idf); ``ts_rank``
-        breaks the remaining ties. A query with nothing searchable left, or an
-        empty ``kb_ids``, yields an empty list."""
+        then chunks holding the whole question verbatim; then by BM25 (B-206
+        K-9): more of the query covered, rarer terms weighing more, repeats
+        counting with diminishing returns, shorter chunks ahead. A query with
+        nothing searchable left, or an empty ``kb_ids``, yields an empty list."""
 
     @abc.abstractmethod
     async def keyword_search_scored(
@@ -1510,11 +1510,15 @@ class KnowledgeStore(abc.ABC):
         limit: int = 5,
     ) -> list[ScoredChunk]:
         """Like :meth:`keyword_search` but each hit carries its keyword
-        score and ``source == "keyword"`` — NOT a [0, 1] similarity:
-        coverage (Σ idf·hit / Σ idf over the query's terms and identifier
-        phrases, idf = ln(1 + (N - df + 0.5) / (df + 0.5)) with N the searchable
-        chunks in scope and df those holding the unit; ≤ 1) plus ``ts_rank`` (< 0.1, a
-        tie-break), plus
+        score and ``source == "keyword"`` — NOT a [0, 1] similarity: the
+        normalised BM25 (B-206 K-9) Σ idf·s / ((k1+1)·Σ idf) over the query's
+        terms and identifier phrases (< 1), idf = ln(1 + (N - df + 0.5) /
+        (df + 0.5)) with N the searchable chunks in scope and df those holding
+        the unit, s = tf·(k1+1) / (tf + k1·(1 - b + b·dl/avgdl)) with tf the
+        unit's occurrences in the body and dl the body's tokens (avgdl over the
+        chunks in scope; a unit only in the document title counts
+        :data:`~expert_work.persistence.knowledge.text_search.KB_DOC_TITLE_HIT_WEIGHT`
+        of one occurrence at the average length), plus
         :data:`~expert_work.persistence.knowledge.text_search.KB_KEYWORD_PHRASE_BOOST`
         when an identifier phrase matched and
         :data:`~expert_work.persistence.knowledge.text_search.KB_KEYWORD_QUERY_PHRASE_BOOST`

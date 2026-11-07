@@ -3,7 +3,8 @@
 
 * 段带上入库时的文档名(``doc_title``),存取往返不丢;
 * 关键词索引里文档名单独一段(权重 A,正文 D):只在文档名里出现的词也能命中,
-  但只按 :data:`KB_DOC_TITLE_HIT_WEIGHT` 记覆盖率,同样的词写在正文里的段排在前面;
+  但词频只按 :data:`KB_DOC_TITLE_HIT_WEIGHT` 记(B-206 K-9 起是 BM25 的词频;此前是覆盖率),
+  同样的词写在正文里的段排在前面;
 * 写入侧与查询侧同一套归一:全角 / 半角互查,带空格与不带空格的编号互查;
 * 改前入库的旧段(原样建索引、没有文档名)照常命中,分数与同样字的新段一致。
 
@@ -35,14 +36,24 @@ from expert_work.persistence import (
 from expert_work.persistence.embedding import EMBEDDING_DIM
 from expert_work.persistence.knowledge.base import KnowledgeStore
 from expert_work.persistence.knowledge.text_search import (
+    KB_BM25_B,
+    KB_BM25_K1,
     KB_DOC_TITLE_HIT_WEIGHT,
     KB_KEYWORD_PHRASE_BOOST,
+    kb_keyword_length,
     tokenize_for_search,
 )
 from expert_work.protocol import KnowledgeChunk, ScoredChunk
 
 ALEMBIC_INI = Path(__file__).resolve().parent.parent / "alembic.ini"
 _DB = "knowledge_doc_title_contract"
+
+
+def _bm25(units: list[tuple[float, float]], length: float, average_length: float) -> float:
+    """The normalised BM25 of a chunk (B-206 K-9) for ``units`` = (idf, body tf)."""
+    norm = KB_BM25_K1 * (1 - KB_BM25_B + KB_BM25_B * length / average_length)
+    total = sum(idf * tf * (KB_BM25_K1 + 1) / (tf + norm) for idf, tf in units if tf)
+    return total / ((KB_BM25_K1 + 1) * sum(idf for idf, _ in units))
 
 
 @pytest.fixture(
@@ -145,16 +156,26 @@ async def test_a_word_only_in_the_doc_title_matches(store: KnowledgeStore) -> No
 
 async def test_a_title_only_hit_counts_for_less_than_a_body_hit(store: KnowledgeStore) -> None:
     """The same word in the body outranks it in the title: a title-only hit
-    adds ``KB_DOC_TITLE_HIT_WEIGHT`` of the unit's coverage, a body hit all
-    of it (``ts_rank`` < 0.1 breaks ties only)."""
+    counts as ``KB_DOC_TITLE_HIT_WEIGHT`` of one occurrence in a chunk of
+    average length, whatever the chunk's own length — so the body chunk wins
+    although it is the longer of the two (length normalisation alone would
+    put the short title-only chunk first)."""
+    body_hit, title_only = "益休可以和晚安饮一起吃", "每日一袋"
     tenant, kb_id = await _seed(
-        store, [("益休产品说明书", ["每日一袋"]), ("晚安饮说明书", ["益休可以和晚安饮一起吃"])]
+        store, [("益休产品说明书", [title_only]), ("晚安饮说明书", [body_hit])]
     )
     hits = await _search(store, tenant, kb_id, "益休")
-    assert [hit.chunk.content for hit in hits] == ["益休可以和晚安饮一起吃", "每日一袋"]
-    assert 1.0 <= hits[0].score < 1.1
-    assert hits[1].score < 1.0  # below full coverage, whatever its ts_rank
-    assert hits[1].score == pytest.approx(KB_DOC_TITLE_HIT_WEIGHT)  # no body word: ts_rank 0
+    assert [hit.chunk.content for hit in hits] == [body_hit, title_only]
+    lengths = kb_keyword_length(body_hit), kb_keyword_length(title_only)
+    assert lengths[0] > lengths[1]
+    average, idf = sum(lengths) / 2, math.log(1 + 0.5 / 2.5)  # 益休 in both chunks
+    assert [hit.score for hit in hits] == pytest.approx(
+        [
+            _bm25([(idf, 1)], lengths[0], average),
+            KB_DOC_TITLE_HIT_WEIGHT / (KB_BM25_K1 + 1),
+        ],
+        abs=1e-6,
+    )
 
 
 async def test_title_and_body_words_add_up(store: KnowledgeStore) -> None:
@@ -171,7 +192,8 @@ async def test_title_and_body_words_add_up(store: KnowledgeStore) -> None:
 
 async def test_a_title_only_hit_counts_as_a_whole_chunk_for_idf(store: KnowledgeStore) -> None:
     """BM25's df counts a chunk holding the unit anywhere, title included —
-    the title weight scales the chunk's coverage, not how common the unit is."""
+    the title weight scales the chunk's term frequency, not how common the
+    unit is."""
     tenant, kb_id = await _seed(
         store, [("alpha guide", ["gamma"]), (None, ["beta delta"]), (None, ["alpha"])]
     )
@@ -179,8 +201,9 @@ async def test_a_title_only_hit_counts_as_a_whole_chunk_for_idf(store: Knowledge
     idf_alpha = math.log(1 + (3 - 2 + 0.5) / (2 + 0.5))  # df = 2: the title and "alpha"
     idf_beta = math.log(1 + (3 - 1 + 0.5) / (1 + 0.5))
     title_only = next(hit for hit in hits if hit.chunk.content == "gamma")
-    expected = KB_DOC_TITLE_HIT_WEIGHT * idf_alpha / (idf_alpha + idf_beta)
-    assert title_only.score == pytest.approx(expected, abs=1e-6)  # no body word: ts_rank 0
+    ceiling = (KB_BM25_K1 + 1) * (idf_alpha + idf_beta)
+    expected = KB_DOC_TITLE_HIT_WEIGHT * idf_alpha / ceiling
+    assert title_only.score == pytest.approx(expected, abs=1e-6)
 
 
 async def test_identifier_in_the_doc_title_gets_the_identifier_boost(

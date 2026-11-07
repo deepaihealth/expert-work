@@ -51,6 +51,8 @@ from expert_work.persistence.knowledge.passages import (
     unapplied_revisions,
 )
 from expert_work.persistence.knowledge.text_search import (
+    KB_BM25_B,
+    KB_BM25_K1,
     KB_DOC_TITLE_HIT_WEIGHT,
     KB_KEYWORD_PHRASE_BOOST,
     KB_KEYWORD_QUERY_PHRASE_BOOST,
@@ -98,25 +100,6 @@ def _contains_run(tokens: Sequence[str], run: Sequence[str]) -> bool:
     return any(tokens[i : i + width] == run for i in range(len(tokens) - width + 1))
 
 
-#: ``ts_rank``'s weight for unlabelled positions (label D): ``content_tsv`` is
-#: built by ``to_tsvector`` without ``setweight``.
-_TS_RANK_WEIGHT = 0.1
-#: π²/6 — ``ts_rank`` divides each lexeme's Σ 1/j² over its occurrences by it.
-_TS_RANK_NORMALISER = math.pi**2 / 6
-
-
-def _ts_rank_or(tokens: Sequence[str], lexemes: Sequence[str]) -> float:
-    """Approximates Postgres ``ts_rank`` of an OR query over unlabelled
-    positions: a query lexeme occurring n times adds
-    weight * Σ_{j≤n} 1/j² / (π²/6), averaged over the query's distinct lexemes
-    (phrase tokens count as lexemes too). Not exact in general: Postgres ranks
-    a query that is one bare phrase by proximity, and its parser may split a
-    token into different lexemes than jieba produced."""
-    counts = Counter(tokens)
-    total = sum(sum(1 / j**2 for j in range(1, counts[lexeme] + 1)) for lexeme in lexemes)
-    return _TS_RANK_WEIGHT * total / _TS_RANK_NORMALISER / len(lexemes)
-
-
 def _bm25_idf(in_scope: int, with_unit: int) -> float:
     """Lucene's BM25 idf, ln(1 + (N - df + 0.5) / (df + 0.5)) — as in SQL;
     above zero for every 0 ≤ df ≤ N."""
@@ -126,6 +109,11 @@ def _bm25_idf(in_scope: int, with_unit: int) -> float:
 def _index_tokens(text: str) -> list[str]:
     """``text`` as the SQL store indexes it (:func:`kb_index_text`, segmented)."""
     return _searchable_tokens(tokenize_for_search(kb_index_text(text)))
+
+
+def _occurrences(tokens: Sequence[str], run: Sequence[str]) -> int:
+    width = len(run)
+    return sum(1 for i in range(len(tokens) - width + 1) if tokens[i : i + width] == run)
 
 
 def _unit_hit(title: Sequence[str], body: Sequence[str], runs: Sequence[Sequence[str]]) -> float:
@@ -138,23 +126,38 @@ def _unit_hit(title: Sequence[str], body: Sequence[str], runs: Sequence[Sequence
     return KB_DOC_TITLE_HIT_WEIGHT if any(_contains_run(whole, run) for run in runs) else 0.0
 
 
+def _unit_saturation(
+    hit: float, body: Sequence[str], runs: Sequence[Sequence[str]], norm: float
+) -> float:
+    """A unit's BM25 factor tf·(k1+1) / (tf + norm), tf = its occurrences in
+    the body (every form counted, as ``ts_rank_cd`` counts the covers of an
+    OR query). A unit only in the title has no body tf: it counts as
+    :data:`KB_DOC_TITLE_HIT_WEIGHT` of one occurrence in a chunk of average
+    length, so a body hit outranks it unless the body is more than about 3.4
+    times the average length."""
+    if hit < 1:
+        return hit
+    tf = sum(_occurrences(body, run) for run in runs)
+    return tf * (KB_BM25_K1 + 1) / (tf + norm)
+
+
 def _keyword_scores(query: KbKeywordQuery, chunks: Sequence[KnowledgeChunk]) -> list[float | None]:
     """The SQL store's match predicate and score over the chunks in scope:
     ``None`` for a chunk holding none of the units (terms, identifier phrases)
     in its title or body; otherwise :data:`KB_KEYWORD_PHRASE_BOOST` when an
     identifier phrase hit, plus :data:`KB_KEYWORD_QUERY_PHRASE_BOOST` when the
-    whole question appears verbatim, plus coverage (idf-weighted share of the
-    units hit, a title-only hit weighing :data:`KB_DOC_TITLE_HIT_WEIGHT`),
-    plus an approximate ``ts_rank`` tie-break over the body. Same predicate
-    and ordering intent as SQL; exact scores — and so the order of near-ties
-    — can differ."""
+    whole question appears verbatim, plus the normalised BM25 (B-206 K-9):
+    Σ idf·tf·(k1+1) / (tf + k1·(1 - b + b·dl/avgdl)) over the units, divided by
+    its ceiling (k1+1)·Σ idf — see :func:`_unit_saturation`; dl = the body's
+    tokens, avgdl and idf over ``chunks``. Same predicate and formula as SQL;
+    where Postgres' parser splits a token differently from jieba the numbers
+    can differ."""
     # Each unit as its token runs: the NFKC form, plus the raw form if any.
     units = [
         [_searchable_tokens(unit)]
         + ([_searchable_tokens(raw)] if (raw := query.unit_raw_form(unit)) else [])
         for unit in (*query.terms, *query.phrases)
     ]
-    lexemes = list(dict.fromkeys(token for runs in units for run in runs for token in run))
     questions = [_searchable_tokens(phrase) for phrase in query.question_phrases()]
     analysed = [
         (
@@ -168,12 +171,19 @@ def _keyword_scores(query: KbKeywordQuery, chunks: Sequence[KnowledgeChunk]) -> 
         _bm25_idf(len(chunks), sum(1 for row in hits if row[index] > 0))
         for index in range(len(units))
     ]
+    ceiling = (KB_BM25_K1 + 1) * sum(idf)
+    # No tokens anywhere (a title-only match over empty bodies) reads as 1.
+    average_length = sum(len(body) for _, body in analysed) / max(len(analysed), 1) or 1.0
     scores: list[float | None] = []
     for (title, body), row in zip(analysed, hits, strict=True):
         if not any(row):
             scores.append(None)
             continue
-        coverage = sum(weight * hit for weight, hit in zip(idf, row, strict=True)) / sum(idf)
+        norm = KB_BM25_K1 * (1 - KB_BM25_B + KB_BM25_B * len(body) / average_length)
+        bm25 = sum(
+            weight * _unit_saturation(hit, body, runs, norm)
+            for weight, hit, runs in zip(idf, row, units, strict=True)
+        )
         identifier = KB_KEYWORD_PHRASE_BOOST if any(row[len(query.terms) :]) else 0.0
         whole = [*title, *body]
         verbatim = (
@@ -181,7 +191,7 @@ def _keyword_scores(query: KbKeywordQuery, chunks: Sequence[KnowledgeChunk]) -> 
             if any(_contains_run(whole, question) for question in questions)
             else 0.0
         )
-        scores.append(identifier + verbatim + coverage + _ts_rank_or(body, lexemes))
+        scores.append(identifier + verbatim + bm25 / ceiling)
     return scores
 
 
