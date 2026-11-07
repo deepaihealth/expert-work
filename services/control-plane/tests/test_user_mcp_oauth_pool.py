@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from datetime import UTC, datetime, timedelta
 from uuid import UUID, uuid4
 
@@ -24,8 +25,8 @@ from expert_work.protocol import (
     McpOAuthConnectionPatch,
     McpOAuthConnectionRecord,
 )
-from orchestrator.tools.mcp import MCPServerConfig, MCPToolDef, RecordingMCPClient
-from tests.test_tenant_mcp_pool import _flaky_factory
+from orchestrator.tools.mcp import MCPServerConfig, MCPServerPool, MCPToolDef, RecordingMCPClient
+from tests.test_tenant_mcp_pool import _Dialer
 
 _NOW = datetime(2026, 6, 6, 12, 0, tzinfo=UTC)
 
@@ -380,104 +381,198 @@ async def test_ttl_backstop_rebuilds_expired_pool_and_reuses_fresh_one() -> None
     assert p2.names() == ["linear"]
 
 
-# B-292 —— 某个连接没连上:等够间隔后的那次请求重试一次(用户池每次 run 都会取),
-# 连着的原样复用,新连上了才清这个用户的构建。
+# B-292 —— 某个连接没连上:到点后的那次取池起一个后台重拨(用户池每次 run 都会取),
+# 不挡这次取池;只拨缺的,连上了才换新池对象(B-260 按对象认池)、清这个用户的构建。
 
 
-async def _two_connections(
-    cat_store: InMemoryMcpConnectorCatalogStore,
-    oauth_store: InMemoryMcpOAuthConnectionStore,
-    tid: UUID,
-    uid: str,
-) -> None:
-    for name in ("linear", "notion"):
-        cat_id = await _seed_catalog(cat_store, name=name)
+class _UserRig:
+    def __init__(self, down: set[str]) -> None:
+        self.cat_store = InMemoryMcpConnectorCatalogStore()
+        self.oauth_store = InMemoryMcpOAuthConnectionStore()
+        self.tid, self.uid = uuid4(), "user-1"
+        self.dialer = _Dialer(down)
+        self.now = {"t": 0.0}
+        self.expired: list[tuple[UUID, str]] = []
+        self.svc = UserMcpOAuthPoolService(
+            oauth_store=self.oauth_store,
+            catalog_store=self.cat_store,
+            client_factory=self.dialer,
+            clock=lambda: _NOW,
+            monotonic_clock=lambda: self.now["t"],
+            on_expire=lambda t, u: self.expired.append((t, u)),
+        )
+
+    async def get(self) -> MCPServerPool:
+        async with asyncio.timeout(1):  # never waits on a retry's dial
+            return await self.svc.get_or_build(self.tid, self.uid)
+
+    async def settle(self) -> None:
+        for _ in range(5):
+            await asyncio.sleep(0)
+
+    async def run_retry(self) -> None:
+        """等后台重拨跑完(它不睡,可能已经跑完了;有没有拨过由 ``dialer.calls`` 断言)。"""
+        async with asyncio.timeout(1):
+            while self.svc._retry_tasks:
+                await asyncio.gather(*self.svc._retry_tasks)
+
+
+async def _user_rig(*names: str, down: set[str]) -> _UserRig:
+    rig = _UserRig(down)
+    for name in names:
+        cat_id = await _seed_catalog(rig.cat_store, name=name)
         await _seed_connection(
-            oauth_store,
-            tenant_id=tid,
-            user_id=uid,
+            rig.oauth_store,
+            tenant_id=rig.tid,
+            user_id=rig.uid,
             catalog_id=cat_id,
             name=name,
             expires_at=_NOW + timedelta(hours=1),
         )
-
-
-def _flaky_svc(
-    oauth_store: InMemoryMcpOAuthConnectionStore,
-    cat_store: InMemoryMcpConnectorCatalogStore,
-    calls: list[str],
-    down: set[str],
-    now: dict[str, float],
-    expired: list[tuple[UUID, str]],
-) -> UserMcpOAuthPoolService:
-    return UserMcpOAuthPoolService(
-        oauth_store=oauth_store,
-        catalog_store=cat_store,
-        client_factory=_flaky_factory(calls, down),
-        clock=lambda: _NOW,
-        monotonic_clock=lambda: now["t"],
-        on_expire=lambda t, u: expired.append((t, u)),
-    )
+    return rig
 
 
 @pytest.mark.asyncio
-async def test_failed_connection_retried_after_backoff_reuses_healthy_and_evicts_builds() -> None:
-    cat_store = InMemoryMcpConnectorCatalogStore()
-    oauth_store = InMemoryMcpOAuthConnectionStore()
-    tid, uid = uuid4(), "user-1"
-    await _two_connections(cat_store, oauth_store, tid, uid)
-    calls: list[str] = []
-    down = {"notion"}
-    now = {"t": 0.0}
-    expired: list[tuple[UUID, str]] = []
-    svc = _flaky_svc(oauth_store, cat_store, calls, down, now, expired)
-
-    p1 = await svc.get_or_build(tid, uid)
+async def test_failed_connection_retried_in_background_then_new_pool_and_builds_evicted() -> None:
+    rig = await _user_rig("linear", "notion", down={"notion"})
+    p1 = await rig.get()
     assert p1.names() == ["linear"]
     linear = p1.get("linear")
-    now["t"] = _FAILED_RETRY_S - 1
-    assert await svc.get_or_build(tid, uid) is p1  # inside the window: no redial
-    assert calls == ["linear", "notion"]
+    rig.now["t"] = _FAILED_RETRY_S - 1
+    assert await rig.get() is p1  # inside the window: no retry
+    await rig.settle()
+    assert not rig.svc._retry_tasks
+    assert rig.dialer.calls == ["linear", "notion"]
 
-    down.clear()
-    now["t"] = _FAILED_RETRY_S
-    p2 = await svc.get_or_build(tid, uid)
+    rig.dialer.down.clear()
+    rig.now["t"] = _FAILED_RETRY_S
+    assert await rig.get() is p1  # due: the retry starts in the background
+    await rig.run_retry()
+
+    p2 = await rig.get()
+    assert p2 is not p1  # gained a server → new object (B-260 identity check)
     assert p2.names() == ["linear", "notion"]
-    assert calls == ["linear", "notion", "notion"]  # only the failed one redialed
-    assert p2.get("linear") is linear
-    assert isinstance(linear, RecordingMCPClient) and not linear.closed
-    assert expired == [(tid, uid)]  # that user's builds from the incomplete pool evicted
+    assert rig.dialer.calls == ["linear", "notion", "notion"]  # only the missing one
+    assert p2.get("linear") is linear and not rig.dialer.last("linear").closed
+    assert rig.expired == [(rig.tid, rig.uid)]
 
-    now["t"] = 1000.0
-    assert await svc.get_or_build(tid, uid) is p2  # complete pool: no more retries
-    now["t"] = 1801.0  # the retry did not extend the original TTL
-    assert await svc.get_or_build(tid, uid) is not p2
+    rig.now["t"] = 1000.0
+    assert await rig.get() is p2  # complete: no more retries
+    await rig.settle()
+    assert not rig.svc._retry_tasks
+    rig.now["t"] = 1801.0  # the retry did not extend the original TTL
+    assert await rig.get() is not p2
 
 
 @pytest.mark.asyncio
-async def test_still_failing_connection_retried_once_per_window_without_evicting_builds() -> None:
-    cat_store = InMemoryMcpConnectorCatalogStore()
-    oauth_store = InMemoryMcpOAuthConnectionStore()
-    tid, uid = uuid4(), "user-1"
-    await _two_connections(cat_store, oauth_store, tid, uid)
-    calls: list[str] = []
-    now = {"t": 0.0}
-    expired: list[tuple[UUID, str]] = []
-    svc = _flaky_svc(oauth_store, cat_store, calls, {"notion"}, now, expired)
+async def test_still_failing_connection_keeps_pool_object_and_backs_off() -> None:
+    rig = await _user_rig("linear", "notion", down={"notion"})
+    p1 = await rig.get()
+    rig.now["t"] = _FAILED_RETRY_S
+    await rig.get()
+    await rig.run_retry()
+    assert await rig.get() is p1  # nothing gained → same object, in-flight builds keep it
+    assert rig.expired == []
+    assert rig.dialer.calls == ["linear", "notion", "notion"]
 
-    p1 = await svc.get_or_build(tid, uid)
-    linear = p1.get("linear")
-    now["t"] = _FAILED_RETRY_S
-    p2 = await svc.get_or_build(tid, uid)
-    assert p2.names() == ["linear"]
-    assert calls == ["linear", "notion", "notion"]
-    assert p2.get("linear") is linear
-    assert isinstance(linear, RecordingMCPClient) and not linear.closed
-    assert expired == []  # nothing gained → builds stay
+    rig.now["t"] = _FAILED_RETRY_S + 2 * _FAILED_RETRY_S - 1  # backoff doubled to 120 s
+    await rig.get()
+    await rig.run_retry()
+    assert rig.dialer.calls == ["linear", "notion", "notion"]  # not due yet: no redial
+    rig.now["t"] = _FAILED_RETRY_S + 2 * _FAILED_RETRY_S
+    await rig.get()
+    await rig.run_retry()
+    assert rig.dialer.calls == ["linear", "notion", "notion", "notion"]
+    assert not rig.dialer.last("linear").closed
 
-    now["t"] = 2 * _FAILED_RETRY_S - 1  # next window not reached: no redial
-    assert await svc.get_or_build(tid, uid) is p2
-    assert calls == ["linear", "notion", "notion"]
-    now["t"] = 2 * _FAILED_RETRY_S
-    await svc.get_or_build(tid, uid)
-    assert calls == ["linear", "notion", "notion", "notion"]
+
+@pytest.mark.asyncio
+async def test_retry_dial_does_not_block_get_or_build() -> None:
+    rig = await _user_rig("linear", "notion", down={"notion"})
+    p1 = await rig.get()
+    rig.dialer.down.clear()
+    gate = await rig.dialer.gate_next("notion")
+    rig.now["t"] = _FAILED_RETRY_S
+    assert await rig.get() is p1  # starts the retry, does not wait for it
+    async with asyncio.timeout(1):
+        await rig.dialer.dialing.wait()
+    assert await rig.get() is p1  # a concurrent run while the dial hangs …
+    assert len(rig.svc._retry_tasks) == 1  # … starts no second retry
+    gate.set()
+    await rig.run_retry()
+    assert (await rig.get()).names() == ["linear", "notion"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("event", ["invalidate", "connector_off", "ttl_expired", "ttl_passed_idle"])
+async def test_retry_landing_after_pool_changed_closes_what_it_opened(event: str) -> None:
+    rig = await _user_rig("linear", "notion", down={"notion"})
+    p1 = await rig.get()
+    rig.dialer.down.clear()
+    gate = await rig.dialer.gate_next("notion")
+    rig.now["t"] = _FAILED_RETRY_S
+    await rig.get()
+    async with asyncio.timeout(1):
+        await rig.dialer.dialing.wait()
+
+    if event == "invalidate":
+        await rig.svc.invalidate(rig.tid, rig.uid)
+    elif event == "connector_off":
+        await rig.svc.connector_off("linear")
+    elif event == "ttl_passed_idle":
+        rig.now["t"] = 1801.0  # still cached, but expired: nobody asked for it yet
+    else:
+        rig.now["t"] = 1801.0
+        assert await rig.get() is not p1  # TTL path rebuilt
+    evicted_before = list(rig.expired)
+
+    gate.set()
+    await rig.run_retry()
+    (opened,) = rig.dialer.gated
+    assert opened.closed  # stale: closed, not swapped in, not leaked
+    assert rig.expired == evicted_before
+
+
+@pytest.mark.asyncio
+async def test_close_all_mid_retry_closes_opened_clients_and_stops_scheduling() -> None:
+    rig = await _user_rig("linear", "notion", "jira", down={"notion", "jira"})
+    await rig.get()
+    rig.dialer.down.clear()
+    gate = await rig.dialer.gate_next("notion")  # the store lists by name: jira first
+    rig.now["t"] = _FAILED_RETRY_S
+    await rig.get()
+    async with asyncio.timeout(1):
+        await rig.dialer.dialing.wait()  # jira dialed fine, notion hangs
+    (retry,) = rig.svc._retry_tasks
+    await rig.svc.close_all()
+    assert retry.cancelled()
+    assert rig.dialer.last("jira").closed  # opened by the retry, not leaked
+    gate.set()
+
+    rig.dialer.down.add("jira")
+    await rig.get()  # a degraded build after shutdown …
+    calls = list(rig.dialer.calls)
+    rig.now["t"] += _FAILED_RETRY_S
+    await rig.get()  # … and a due hit
+    await rig.run_retry()
+    assert rig.dialer.calls == calls  # start no retry nobody would cancel
+
+
+@pytest.mark.asyncio
+async def test_retried_connection_that_no_longer_fits_is_closed_and_pool_kept() -> None:
+    # Listed by name: a0 fails first, then s1..s5 fill the pool to its cap of 5.
+    rig = await _user_rig("a0", "s1", "s2", "s3", "s4", "s5", down={"a0"})
+    p1 = await rig.get()
+    assert p1.names() == ["s1", "s2", "s3", "s4", "s5"]
+    rig.dialer.down.clear()
+    rig.now["t"] = _FAILED_RETRY_S
+    await rig.get()
+    await rig.run_retry()
+    assert rig.dialer.last("a0").closed  # dialed, could not fit: closed, not leaked
+    assert await rig.get() is p1  # nothing swapped in → same object
+    assert rig.expired == []
+    calls = list(rig.dialer.calls)
+    rig.now["t"] = 1000.0
+    await rig.get()
+    await rig.run_retry()
+    assert rig.dialer.calls == calls  # cannot fit until a rebuild: no more retries

@@ -31,6 +31,7 @@ from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any, Literal
 
+from control_plane.mcp_failed_retry import MissingServers, next_retry_delay
 from control_plane.mcp_kept_clients import KeptClient, KeptMcpClients
 from control_plane.mcp_retired_clients import (
     RetiredMcpClients,
@@ -60,7 +61,7 @@ _MAX_BUILD_ATTEMPTS = 5
 # pool lives forever, so one lost bus event would be permanent staleness.
 _POOL_TTL_S = 1800.0
 
-# B-292 —— 构建时有目录项没连上:隔这么久在后台重试一次(取值理由同租户池)。
+# B-292 —— 构建时有目录项没连上:第一次后台重试的间隔,之后翻倍(取值理由同租户池)。
 _FAILED_RETRY_S = 60.0
 
 # The platform pool has a single cache entry; its retired clients share one key.
@@ -239,12 +240,13 @@ class PlatformMcpPoolService:
         # B-259 —— 缓存池成员的连接指纹;改一项时其它项暂存在这里给下次构建复用。
         # Guarded by ``_guard``.
         self._kept: KeptMcpClients[str] = KeptMcpClients()
-        # B-292 —— 缓存池缺了构建时没连上的目录项,和排着的后台重试(最多一个)。
-        # Guarded by ``_guard``.
+        # B-292 —— 缓存池里缺的、构建时没连上的目录项,和排着的后台重试(最多一个)。
+        # Guarded by ``_guard``; ``_closed`` 之后不再排。
         self._sleep = sleep  # injectable (tests)
-        self._degraded = False
+        self._missing: MissingServers[McpConnectorCatalogRecord] | None = None
         self._retry_pending = False
         self._retry_tasks: set[asyncio.Task[None]] = set()
+        self._closed = False
 
     async def get_or_build(self) -> MCPServerPool:
         """Return the platform pool, building (and caching) on miss.
@@ -295,9 +297,10 @@ class PlatformMcpPoolService:
                         # 复用的长连接按它最早的出生时间算 TTL,兜底时限不被拉长。
                         born = [m.born_at for m in members.values()]
                         self._pool = (pool, min([*born, self._clock()]))
-                        self._degraded = failed
+                        self._missing = None
                         if failed:
-                            self._schedule_retry()
+                            self._missing = MissingServers(pool, failed, _FAILED_RETRY_S)
+                            self._schedule_retry(_FAILED_RETRY_S)
                     elif last_attempt:
                         # B-248 — no cache entry will ever close it: track it
                         # for invalidate / close_all, retire it below.
@@ -317,14 +320,16 @@ class PlatformMcpPoolService:
 
     async def _build(
         self, carried: dict[str, KeptClient]
-    ) -> tuple[MCPServerPool, dict[str, KeptClient], list[MCPClient], bool]:
+    ) -> tuple[
+        MCPServerPool, dict[str, KeptClient], list[MCPClient], dict[str, McpConnectorCatalogRecord]
+    ]:
         """Build a pool from the catalog; returns it, its members, the clients
-        this call opened (as opposed to reused from ``carried``) and whether any
-        server failed to connect (B-292)."""
+        this call opened (as opposed to reused from ``carried``) and the
+        servers that failed to connect (B-292)."""
         pool = MCPServerPool()
         members: dict[str, KeptClient] = {}
         fresh: list[MCPClient] = []
-        failed = False
+        failed: dict[str, McpConnectorCatalogRecord] = {}
         async with bypass_rls_session():
             records = await self._store.list()
         for record in records:
@@ -339,13 +344,7 @@ class PlatformMcpPoolService:
                     # B-259 —— 连接配置没变:复用暂存的长连接,不重连。
                     client, born_at = kept.client, kept.born_at
                 else:
-                    client = await self._client_factory(_record_to_config(record))
-                    if record.disabled_tools:
-                        # Platform-curated tool denylist — drop disabled tools
-                        # from list_tools so no tenant agent ever registers them.
-                        client = _ToolFilteringClient(
-                            inner=client, disabled=frozenset(record.disabled_tools)
-                        )
+                    client = await self._open_client(record)
                     born_at = self._clock()
                 await pool.add(record.name, client)
                 members[record.name] = KeptClient(client, fingerprint, born_at)
@@ -361,40 +360,97 @@ class PlatformMcpPoolService:
                 break
             except Exception:
                 logger.warning("platform_mcp_pool.server_build_failed")
-                failed = True
+                failed[record.name] = record
         return pool, members, fresh, failed
 
-    def _schedule_retry(self) -> None:
-        """B-292 —— 排一次后台重试(已有排着的就不再排)。Caller holds ``_guard``.
+    async def _open_client(self, record: McpConnectorCatalogRecord) -> MCPClient:
+        """Dial one catalog server (build and B-292 retry share this)."""
+        client = await self._client_factory(_record_to_config(record))
+        if record.disabled_tools:
+            # Platform-curated tool denylist — drop disabled tools
+            # from list_tools so no tenant agent ever registers them.
+            client = _ToolFilteringClient(inner=client, disabled=frozenset(record.disabled_tools))
+        return client
+
+    def _schedule_retry(self, delay: float) -> None:
+        """B-292 —— 排一次后台重试(已有排着的 / 已关机就不排)。Caller holds ``_guard``.
         用空的上下文:不沾触发这次构建的请求的上下文(trace 等)。"""
-        if self._retry_pending:
+        if self._closed or self._retry_pending:
             return
         self._retry_pending = True
-        task = asyncio.create_task(self._retry_failed(), context=contextvars.Context())
+        task = asyncio.create_task(self._retry_failed(delay), context=contextvars.Context())
         self._retry_tasks.add(task)
         task.add_done_callback(self._retry_tasks.discard)
 
-    async def _retry_failed(self) -> None:
-        """B-292 —— 隔 ``_FAILED_RETRY_S`` 把缺项的缓存池摘掉重建一次:连着的长连接原样
-        复用(B-259 暂存),只重拨缺的。新连上了才清构建(``on_expire``),还是连不上就不清,
-        新池再排下一次。构建只在构建缓存未命中时才取池,所以不能等请求来触发。"""
-        await self._sleep(_FAILED_RETRY_S)
+    def _current_missing(self) -> MissingServers[McpConnectorCatalogRecord] | None:
+        """B-292 —— 记下的缺口还属于当前缓存池、且池没过 TTL 时返回它(见租户池同名
+        方法)。Caller holds ``_guard``."""
+        missing, entry = self._missing, self._pool
+        if missing is None or entry is None or entry[0] is not missing.pool:
+            return None
+        if self._clock() - entry[1] >= _POOL_TTL_S:
+            return None
+        return missing
+
+    async def _retry_failed(self, delay: float) -> None:
+        """B-292 —— 隔 ``delay`` 重拨缓存池里缺的目录项:锁外拨号、缓存池照常服务,
+        连上的在锁内并进同一个缓存池,新连上了才清构建(``on_expire``);拨号期间池变了
+        就一个不并、全关掉。构建只在构建缓存未命中时才取池,所以不能等请求来触发。"""
+        await self._sleep(delay)
         async with self._guard:
             self._retry_pending = False
-            entry = self._pool
-            if entry is None or not self._degraded:
-                return  # 已被摘掉 / 换成了完整的池:下一次构建自会处理
-            self._generation += 1
-            self._pool = None
-            self._kept.carry_all(_RETIRED_KEY)
+            missing = self._current_missing()
+            if missing is None:
+                return
+            gen = self._generation
+        opened: dict[str, KeptClient] = {}
+        merged: set[str] = set()
         try:
-            pool = await self.get_or_build()
-        except Exception as exc:
-            logger.warning("platform_mcp_pool.retry_failed err=%s", type(exc).__name__)
-            return
-        if set(pool.names()) - set(entry[0].names()):
+            for name, record in missing.records.items():
+                try:
+                    client = await self._open_client(record)
+                except Exception:
+                    logger.warning("platform_mcp_pool.server_retry_failed")
+                    continue
+                opened[name] = KeptClient(client, connection_fingerprint(record), self._clock())
+            await self._merge_retried(gen, missing, opened, merged)
+        finally:
+            # 没并进去的(池变了 / 到上限)和被取消时已拨出来的:关掉,别漏。
+            await release_clients(close=[k.client for n, k in opened.items() if n not in merged])
+        if merged:
             logger.info("platform_mcp_pool.failed_server_recovered")
             self._notify_expired()
+
+    async def _merge_retried(
+        self,
+        gen: int,
+        missing: MissingServers[McpConnectorCatalogRecord],
+        opened: dict[str, KeptClient],
+        merged: set[str],
+    ) -> None:
+        """B-292 —— 代次没变、缓存池还是记缺口时那一个,才把 ``opened`` 并进去
+        (并进的名字记进 ``merged``),再按退避排下一次;否则什么都不动。"""
+        async with self._guard:
+            entry = self._pool
+            if self._generation != gen or entry is None or self._current_missing() is not missing:
+                return
+            for name, kept in opened.items():
+                try:
+                    await missing.pool.add(name, kept.client)
+                except MCPServerPoolLimitError:
+                    logger.warning("platform_mcp_pool.server_cap_reached")
+                    continue
+                self._kept.joined(_RETIRED_KEY, name, kept)
+                merged.add(name)
+            # 连上了却到上限的也不再重试:整池重建之前都塞不进去。
+            remaining = {n: r for n, r in missing.records.items() if n not in opened}
+            age = self._clock() - entry[1]
+            nxt = next_retry_delay(missing.delay, pool_age=age, ttl=_POOL_TTL_S)
+            if remaining and nxt is not None:
+                self._missing = MissingServers(missing.pool, remaining, nxt)
+                self._schedule_retry(nxt)
+            else:
+                self._missing = None
 
     def _notify_expired(self) -> None:
         """Run ``on_expire`` (build eviction); a failure never fails the caller."""
@@ -456,8 +512,10 @@ class PlatformMcpPoolService:
             entry = self._pool
             self._pool = None
             retired = self._retired.pop_all() + self._kept.pop_all()
+            self._closed = True
             retries = list(self._retry_tasks)
             self._retry_pending = False
+            self._missing = None
         for task in retries:
             task.cancel()
         await asyncio.gather(*retries, return_exceptions=True)
