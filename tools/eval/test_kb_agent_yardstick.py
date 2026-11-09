@@ -185,3 +185,15 @@ def test_resume_refuses_rows_from_another_yardstick_vote_count_or_run(
 ) -> None:
     with pytest.raises(SystemExit, match=message):
         _resume(tmp_path, **row)
+
+
+@pytest.mark.asyncio
+async def test_a_judge_reply_that_fails_to_parse_is_not_cached(tmp_path: Path) -> None:
+    broken = _FlipFlopJudge(["not json at all"])
+    [row] = await _run(tmp_path, broken, votes=1)
+    assert row["category"] == "判分失败"
+    (tmp_path / "agent.jsonl").unlink()
+    fixed = _FlipFlopJudge([_verdict("stated")])
+    [row] = await _run(tmp_path, fixed, votes=1)
+    assert fixed.judge_calls == 1  # 坏回复没进缓存:这次重新判
+    assert row["category"] == "B式作答"

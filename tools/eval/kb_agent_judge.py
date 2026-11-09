@@ -38,8 +38,10 @@ from kb_metrics import anchor_key  # type: ignore[import-not-found]
 
 #: 默认每题判几次(多数票)。
 DEFAULT_JUDGE_VOTES = 3
-#: 原文核对时引文归一后至少几个字才算数(太短的到处都 ``in`` 得到)。
-MIN_QUOTE_KEY_CHARS = 4
+#: 原文核对时引文归一后至少几个字才算数。中文一个字约一个词,四五个字(「30分钟」「间隔30」)
+#: 在任何资料里都找得到,证明不了出处;6 个字约一个短语,判分照要求抄的是一整句(≤40 字),
+#: 不会因此漏配。
+MIN_QUOTE_KEY_CHARS = 6
 
 SUPPORTS = frozenset(
     {"stated", "inferred_labeled", "general_labeled", "inferred_unlabeled", "unsupported"}

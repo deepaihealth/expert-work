@@ -419,7 +419,8 @@ async def _judge_votes(
             cost += call_cny
             spend.judge_cny += call_cny
             spend.judge_calls += 1
-            if cache_verdicts:
+            # 判分失败(不是 JSON / 缺字段)的回复不进缓存:下次重判,不把一次坏回复钉死。
+            if cache_verdicts and "parse_error" not in score_verdict(parse_verdict(raw), ""):
                 cache.put(models.judge_model, prompt, raw, vote=vote)
         raws.append(raw)
     return raws, cost

@@ -217,3 +217,11 @@ def test_judge_cache_keeps_each_vote_apart(tmp_path: Path) -> None:
     assert cache.get("m", "p") == '{"v": 0}'
     assert cache.get("m", "p", vote=1) == '{"v": 1}'
     assert cache.get("m", "p", vote=2) is None
+
+
+def test_a_quote_shorter_than_six_characters_does_not_count_as_found() -> None:
+    # 中文一个字约一个词:四五个字(「30分钟」「间隔30」)在任何资料里都找得到,不足以证明出处
+    short = score_verdict(_raw([_claim("stated", "间隔30分")], refused=True), _PASSAGES)
+    assert (short["related_facts"], short["quote_misses"]) == (0, 1)
+    six = score_verdict(_raw([_claim("stated", "间隔30分钟")], refused=True), _PASSAGES)
+    assert six["related_facts"] == 1

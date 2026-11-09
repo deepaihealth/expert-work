@@ -64,6 +64,12 @@ _NAME_SEP = re.compile(
     "\u300a\u300b\"'\u201c\u201d]+"
 )
 _DIGITS = re.compile(r"[0-9]+")
+#: 文档类型词(以这些结尾的名字是「价目表 / 参数 / 说明书」这类通用词,不是某个对象):
+#: 差一个字的两个通用词(价目表 / 价格表、参数 / 参考)不算近名。只是文档类型的说法,不含租户内容。
+_GENERIC_NAME = re.compile(
+    "(?:表|书|单|册|图|稿|版|页|报告|指南|手册|清单|目录|参数|参考|说明|介绍|汇总|资料|证书|合同|"
+    "方案|规划|培训|记录)$"
+)
 _MIN_NAME, _MAX_NAME = 2, 12
 
 
@@ -318,11 +324,13 @@ def _one_edit(a: str, b: str) -> bool:
 
 def near_misses(name: str, names: Iterable[str]) -> list[str]:
     """``names`` 里与 ``name`` 相近却不是同一个的:等长差一个字,或数字不同的同一骨架
-    (``KX-305`` / ``KX-217``)。互相包含的是同一对象的长短名,不算。"""
+    (``KX-305`` / ``KX-217``)。互相包含的是同一对象的长短名,不算;文档类型词不算。"""
+    if _GENERIC_NAME.search(name):
+        return []
     skeleton = _DIGITS.sub("#", name)
     out = []
     for other in names:
-        if other == name or other in name or name in other:
+        if other == name or other in name or name in other or _GENERIC_NAME.search(other):
             continue
         same_skeleton = skeleton != name and _DIGITS.sub("#", other) == skeleton
         if _one_edit(name, other) or same_skeleton:

@@ -24,6 +24,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import sqlite3
 import statistics
@@ -62,9 +63,10 @@ DEFAULT_HARD_NEGATIVES = 30
 class History:
     questions: int
     answer_cny_per_q: float
-    answer_calls_per_q: float
+    #: 历史文件没有 run 行(中途停了)时不知道:None。
+    answer_calls_per_q: float | None
     judge_cny_per_call: float
-    rerank_cny_per_q: float
+    rerank_cny_per_q: float | None
     input_ratio: float
     answer_model: str
     judge_model: str
@@ -86,9 +88,9 @@ def history_from(path: Path) -> History:
     return History(
         questions=n,
         answer_cny_per_q=sum(r["cost_cny"]["answer"] for r in rows) / n,
-        answer_calls_per_q=sum(int(r["calls"]["answer"]) for r in runs) / n,
+        answer_calls_per_q=sum(int(r["calls"]["answer"]) for r in runs) / n if runs else None,
         judge_cny_per_call=sum(r["cost_cny"]["judge"] for r in rows) / judge_calls,
-        rerank_cny_per_q=sum(float(r["spend_cny"]["rerank"]) for r in runs) / n,
+        rerank_cny_per_q=sum(float(r["spend_cny"]["rerank"]) for r in runs) / n if runs else None,
         input_ratio=statistics.fmean(ratios),
         answer_model=str(rows[0].get("answer_model")),
         judge_model=str(rows[0].get("judge_model")),
@@ -96,12 +98,22 @@ def history_from(path: Path) -> History:
 
 
 def average_reply_chars(cache_db: Path) -> float | None:
-    """判分缓存里旧回复的平均字数;缓存不在就 None。"""
+    """判分缓存里**旧尺子**回复(JSON 里没有 ``claims``)的平均字数;缓存不在或一条旧回复都没有
+    就 None。新尺子的回复已经是结论列表,再乘倍数会重复计。"""
     if not cache_db.exists():
         return None
     with sqlite3.connect(cache_db) as con:
-        value = con.execute("SELECT AVG(LENGTH(v)) FROM j").fetchone()[0]
-    return float(value) if value is not None else None
+        values = [str(v) for (v,) in con.execute("SELECT v FROM j")]
+    old = [len(v) for v in values if _old_style(v)]
+    return statistics.fmean(old) if old else None
+
+
+def _old_style(raw: str) -> bool:
+    try:
+        value = json.loads(raw)
+    except json.JSONDecodeError:
+        return False
+    return isinstance(value, dict) and "claims" not in value
 
 
 def judge_call_cny(h: History, *, reply_chars: float, price: Price) -> float:
@@ -113,7 +125,7 @@ def judge_call_cny(h: History, *, reply_chars: float, price: Price) -> float:
 class RunEstimate:
     name: str
     questions: int
-    answer_calls: float
+    answer_calls: float | None
     judge_calls: int
     answer_cny: float
     judge_cny: float
@@ -137,18 +149,23 @@ def estimate_run(
     return RunEstimate(
         name=name,
         questions=questions,
-        answer_calls=questions * h.answer_calls_per_q,
+        answer_calls=None if h.answer_calls_per_q is None else questions * h.answer_calls_per_q,
         judge_calls=questions * votes,
         answer_cny=questions * h.answer_cny_per_q,
         judge_cny=questions * votes * judge_call,
-        rerank_cny=questions * h.rerank_cny_per_q,
+        rerank_cny=questions * (h.rerank_cny_per_q or 0.0),
         embed_cny=embed_cny,
     )
 
 
+def _calls(value: float | None) -> str:
+    return "?" if value is None else f"{value:.0f}"
+
+
 def _row(r: RunEstimate) -> str:
     return (
-        f"  {r.name} | {r.questions} 题 | 答题 {r.answer_calls:.0f} 次 / 判分 {r.judge_calls} 次 | "
+        f"  {r.name} | {r.questions} 题 | "
+        f"答题 {_calls(r.answer_calls)} 次 / 判分 {r.judge_calls} 次 | "
         f"答题 ¥{r.answer_cny:.2f} 判分 ¥{r.judge_cny:.2f} 重排 ¥{r.rerank_cny:.2f} "
         f"嵌入 ¥{r.embed_cny:.2f} | 合计 ¥{r.total:.2f}"
     )
@@ -162,8 +179,8 @@ def format_estimate(
     lines = [
         "知识库智能体层评测报价(不调任何模型:只读历史结果与判分缓存)",
         f"  历史:{h.questions} 题,答题 {h.answer_model} ¥{h.answer_cny_per_q:.3f}/题、"
-        f"{h.answer_calls_per_q:.2f} 次/题;判分 {h.judge_model} ¥{h.judge_cny_per_call:.3f}/次;"
-        f"重排 ¥{h.rerank_cny_per_q:.3f}/题",
+        f"{_calls(h.answer_calls_per_q)} 次/题;判分 {h.judge_model} "
+        f"¥{h.judge_cny_per_call:.3f}/次;重排 ¥{h.rerank_cny_per_q or 0.0:.3f}/题",
         f"  新判分:提示词约 {h.input_ratio:.3f} 倍、多出结论列表的输出 → ¥{judge_call:.3f}/次",
         *(f"  {n}" for n in notes),
         "一轮:",
@@ -226,7 +243,9 @@ def main(argv: Sequence[str] | None = None) -> int:
 
         cache = JUDGE_CACHE_DB
     reply = average_reply_chars(cache)
-    notes = [] if reply is not None else ["没有判分缓存:旧回复按 150 字估"]
+    notes = [] if reply is not None else ["判分缓存里没有旧尺子的回复:旧回复按 150 字估"]
+    if h.answer_calls_per_q is None:
+        notes.append("历史文件没有 run 行(中途停了):答题次数未知、重排按 ¥0 估")
     judge_call = judge_call_cny(h, reply_chars=reply or 150.0, price=price)
     standard, _distractors, hard_run, chars, more = _count_runs(args)
     embed_price = float(os.environ.get(EMBED_PRICE_ENV, DEFAULT_EMBED_PRICE_CNY_PER_1K))

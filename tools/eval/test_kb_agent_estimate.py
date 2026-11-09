@@ -100,9 +100,10 @@ def test_average_reply_chars_reads_the_judge_cache(tmp_path: Path) -> None:
     db = tmp_path / "judge.sqlite"
     con = sqlite3.connect(db)
     con.execute("CREATE TABLE j (k TEXT PRIMARY KEY, v TEXT)")
-    con.executemany("INSERT INTO j VALUES (?, ?)", [("a", "x" * 100), ("b", "y" * 200)])
+    a, b = json.dumps({"reason": "x" * 80}), json.dumps({"reason": "y" * 180})
+    con.executemany("INSERT INTO j VALUES (?, ?)", [("a", a), ("b", b), ("c", "not json")])
     con.commit()
-    assert average_reply_chars(db) == pytest.approx(150)
+    assert average_reply_chars(db) == pytest.approx((len(a) + len(b)) / 2)
     assert average_reply_chars(tmp_path / "missing.sqlite") is None
 
 
@@ -175,3 +176,25 @@ def test_cli_prints_baseline_and_after_change_without_any_call(
     assert "改动前基线(当前 main)" in out and "改动后一轮" in out
     assert "不调任何模型" in out
     assert no_network == []
+
+
+def test_reply_length_comes_only_from_old_style_cached_replies(tmp_path: Path) -> None:
+    db = tmp_path / "judge.sqlite"
+    con = sqlite3.connect(db)
+    con.execute("CREATE TABLE j (k TEXT PRIMARY KEY, v TEXT)")
+    old = json.dumps({"refused": True, "fabricated": False, "reason": "x" * 80})
+    new = json.dumps({"claims": [{"claim": "y" * 900}], "refused": True})
+    con.executemany("INSERT INTO j VALUES (?, ?)", [("a", old), ("b", new)])
+    con.commit()
+    assert average_reply_chars(db) == pytest.approx(len(old))
+
+
+def test_an_interrupted_history_without_a_run_row_still_estimates(tmp_path: Path) -> None:
+    path = _history_file(tmp_path)
+    lines = [x for x in path.read_text(encoding="utf-8").splitlines() if '"run"' not in x]
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    h = history_from(path)
+    assert h.answer_calls_per_q is None and h.rerank_cny_per_q is None
+    assert h.judge_cny_per_call == pytest.approx(0.1)  # 每题一次判分(旧尺子)
+    run = estimate_run("标准轮", 10, h, votes=3, judge_call=0.1)
+    assert run.rerank_cny == 0.0 and run.answer_calls is None

@@ -279,3 +279,24 @@ def test_the_builder_reads_the_same_documents_the_eval_ingests(tmp_path: Path) -
     )
     assert sorted(texts) == ["a/big.md", "a/copy.md", "a/x.md", "b/x.md"]
     assert "第二份" in texts["b/x.md"] and failed == []
+
+
+@pytest.mark.parametrize(
+    ("name", "others"),
+    [("价目表", {"价格表"}), ("参数", {"参考"}), ("说明书", {"说明单"})],
+)
+def test_generic_document_words_are_not_near_misses(name: str, others: set[str]) -> None:
+    # 文档类型词(价目表 / 参数 / 说明书 …)差一个字不是「另一个对象」
+    assert near_misses(name, others) == []
+
+
+def test_a_generic_word_is_not_the_near_miss_of_a_real_name() -> None:
+    assert near_misses("图甲", {"图表", "图乙"}) == ["图乙"]
+    # 自己是文档类型词:不当对象,邻近的名字再像也不算
+    assert near_misses("价格表", {"价格甲"}) == []
+
+
+def test_a_generic_word_in_the_question_is_not_taken_as_the_entity() -> None:
+    files = ["价格表.xlsx", "价目表.xlsx"]
+    cases = [_case("d1", "价格表里第一行是什么?", "价格表.xlsx", "第一行是表头说明文字")]
+    assert pick_distractors(cases, files, exclude_ids=set(), n=5, seed=1) == []
