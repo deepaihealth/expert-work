@@ -357,10 +357,13 @@ B-206 K-2 起默认同时给模型 `knowledge_read`(与生产一致:绑了知识
 - **难负例**(另起一轮,库不同):
 
   ```sh
-  # 1) 本机生成 spec(不花钱;解析缓存与 kb_build_dataset.py 共用)
+  # 1) 本机生成 spec(不花钱;与评测建库同一个解析器,缓存按解析器指纹 + 文件内容做键,别指向 kb_build_dataset 的旧缓存)
   uv run --no-sync python tools/eval/kb_hard_sets.py --dataset tools/eval/datasets/kb/huada_v1.yaml \
       --chat-dataset tools/eval/datasets/kb/huada_v1.chat.yaml --corpus-root <资料根目录> \
-      --manifest <清单>/manifest.csv --parsed-cache <解析缓存> --n 30 --out eval-out/kb/hard-negatives.yaml
+      --manifest <清单>/manifest.csv --parsed-cache <新的缓存目录> --n 30 --out eval-out/kb/hard-negatives.yaml
+  # 2') 免费空跑核一遍(假模型 + 假嵌入 + 内存库,不连任何接口):解析器护栏 / 删后残留都过了才值得真跑
+  uv run --no-sync python tools/eval/kb_agent_eval.py … --hard-negatives eval-out/kb/hard-negatives.yaml \
+      --dry --store memory --embedder fake --rerank off --out eval-out/kb/dry-hn.jsonl
   # 2) 删过答案句的库上跑 30 道难负例 + 30 道有答案对照
   uv run --no-sync python tools/eval/kb_agent_eval.py … --hard-negatives eval-out/kb/hard-negatives.yaml \
       --out eval-out/kb/agent-<label>-hn.jsonl

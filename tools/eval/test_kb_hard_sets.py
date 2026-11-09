@@ -17,6 +17,7 @@ from kb_hard_sets import (  # type: ignore[import-not-found]
     hard_negative_cases,
     load_hard_negative_spec,
     near_misses,
+    parser_fingerprint,
     pick_distractors,
     pick_hard_negatives,
     residue,
@@ -311,3 +312,48 @@ def test_a_candidate_whose_answer_cannot_be_fully_deleted_is_skipped() -> None:
         [_case("h1", "?", "s.md", "甲乙丙丁戊")], [], {"s.md": text}, n=3, seed=1
     )
     assert picked == [] and skipped == {"not_deletable": 1}
+
+
+def test_the_parse_cache_is_keyed_by_file_content_and_parser_version(tmp_path: Path) -> None:
+    """11-09 复审后的真语料空跑:选题读的是 10-13 的解析缓存(只按路径做键),评测用今天的
+    解析器,句子切法不同,删句删到了对照题的答案。缓存键要带文件内容和解析器版本。"""
+    import csv
+
+    from kb_corpus_inventory import MANIFEST_FIELDS
+
+    root = tmp_path / "corpus"
+    root.mkdir()
+    doc = root / "a.md"
+    doc.write_text("# 甲\n\n原来的内容。\n", encoding="utf-8")
+    manifest = tmp_path / "manifest.csv"
+    with manifest.open("w", encoding="utf-8", newline="") as fh:
+        writer = csv.DictWriter(fh, fieldnames=list(MANIFEST_FIELDS))
+        writer.writeheader()
+        row = dict.fromkeys(MANIFEST_FIELDS, "")
+        row.update(path="a.md", ext="md", size="10", tier="A", pages="0")
+        writer.writerow(row)
+    cache = tmp_path / "cache"
+
+    def read(fingerprint: str) -> str:
+        texts, _failed = corpus_texts(
+            manifest=manifest,
+            corpus_root=root,
+            tiers=("A",),
+            cache_dir=cache,
+            workers=1,
+            fingerprint=fingerprint,
+        )
+        return str(texts["a.md"])
+
+    assert "原来的内容" in read("parser-v1")
+    for cached in cache.glob("*"):
+        cached.write_text("缓存里的旧解析", encoding="utf-8")
+    assert read("parser-v1") == "缓存里的旧解析"  # 同一文件、同一解析器:用缓存
+    assert "原来的内容" in read("parser-v2")  # 解析器变了:重新解析
+    doc.write_text("# 甲\n\n改过的内容。\n", encoding="utf-8")
+    assert "改过的内容" in read("parser-v1")  # 文件变了:重新解析
+
+
+def test_the_parser_fingerprint_is_stable_and_names_the_parser() -> None:
+    assert parser_fingerprint() == parser_fingerprint()
+    assert len(parser_fingerprint()) == 16

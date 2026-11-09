@@ -6,7 +6,8 @@
 全部删掉,文档其余部分原样留着 —— 题目变成「资料没写」,但相关上下文还在,正好是 11-05
 记录里编造集中的那种情形(看到相邻事实就推出结论)。删句发生在解析之后、切块之前
 (:class:`AnchorDeletingParser` 包住入库用的 ``parse_document``),文件名不变。
-选题(:func:`pick_hard_negatives`)跑在本机解析缓存上,写一份 spec(只有题号、问题、被删的锚),
+选题(:func:`pick_hard_negatives`)用与评测建库同一个解析器本机解析(带缓存),
+写一份 spec(题号、问题、被删的锚),
 评测时 ``kb_agent_eval.py --hard-negatives <spec>`` 用它建一个删过句的库;同一次还跑那 30 道
 有答案对照题(看删句有没有误伤、量「不该拒却拒了」)。选题规则:
 
@@ -19,18 +20,20 @@
 看模型会不会把 N 的资料安到 E 头上、或因为看到两个相近的名字就不敢答。题不改,只给判分
 补一句说明。
 
-生成难负例 spec(本机,不花钱;解析缓存与 ``kb_build_dataset.py`` 共用)::
+生成难负例 spec(本机,不花钱;解析缓存按解析器指纹 + 文件内容做键,
+不与 ``kb_build_dataset.py`` 的缓存混用)::
 
     uv run --no-sync python tools/eval/kb_hard_sets.py \\
         --dataset tools/eval/datasets/kb/huada_v1.yaml \\
         --chat-dataset tools/eval/datasets/kb/huada_v1.chat.yaml \\
         --corpus-root ~/kb-eval/AI知识库 --manifest ~/kb-eval/huada/manifest.csv \\
-        --parsed-cache ~/kb-eval/huada/parsed --n 30 --out eval-out/kb/hard-negatives.yaml
+        --parsed-cache ~/kb-eval/huada/parsed-hn --n 30 --out eval-out/kb/hard-negatives.yaml
 """
 
 from __future__ import annotations
 
 import argparse
+import hashlib
 import os
 import random
 import re
@@ -392,24 +395,77 @@ def pick_distractors(
     return found[:n]
 
 
+def parser_fingerprint() -> str:
+    """入库解析器的版本指纹:``control_plane.knowledge`` 下全部源文件 + 三个解析库的版本。"""
+    import importlib.metadata as metadata
+
+    import control_plane.knowledge.parsing as parsing
+
+    digest = hashlib.sha256()
+    for source in sorted(Path(parsing.__file__).parent.glob("*.py")):
+        digest.update(source.name.encode() + b"\0" + source.read_bytes())
+    for dist in ("pymupdf", "pymupdf4llm", "markitdown"):
+        try:
+            digest.update(f"{dist}={metadata.version(dist)}".encode())
+        except metadata.PackageNotFoundError:
+            digest.update(f"{dist}=?".encode())
+    return digest.hexdigest()[:16]
+
+
+def _parse_fresh(path: Path, cache_dir: Path, fingerprint: str) -> str | None:
+    """进程池里跑:与评测建库同一个 ``parse_document(文件名, 字节)``;缓存键 = 解析器指纹 +
+    文件内容,换了解析器或文件就重新解析(旧的 ``kb_build_dataset`` 缓存只按路径做键)。"""
+    try:
+        raw = path.read_bytes()
+    except OSError:
+        return None
+    key = hashlib.sha256(fingerprint.encode() + b"\0" + raw).hexdigest()
+    cached = cache_dir / f"{key}.md"
+    if cached.exists():
+        return cached.read_text(encoding="utf-8")
+    from control_plane.knowledge.parsing import parse_document  # 子进程里导入
+
+    try:
+        text = str(parse_document(path.name, raw))
+        text.encode("utf-8")  # 孤立代理项:评测建库同样算解析失败
+    except Exception:  # 解析失败只列出来,选题不因一份坏文件中断
+        return None
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    cached.write_text(text, encoding="utf-8")
+    return text
+
+
 def corpus_texts(
-    *, manifest: Path, corpus_root: Path, tiers: Sequence[str], cache_dir: Path, workers: int
+    *,
+    manifest: Path,
+    corpus_root: Path,
+    tiers: Sequence[str],
+    cache_dir: Path,
+    workers: int,
+    fingerprint: str | None = None,
 ) -> tuple[dict[str, str], list[str]]:
     """评测建库会入的每一份文档的解析文本,按清单 ``path`` 记;解析失败的 path 另列。
 
     文档清单用评测同一个 ``kb_eval.select_rows``(重复组只留第一份;同名不同目录的文件都入、
     超长 PDF 也入),不用 ``kb_build_dataset.parse_corpus`` —— 后者同名只留一份、超长 PDF 跳过,
-    选题时会漏看评测库里实际有的文档(11-09 评审)。解析走 ``kb_build_dataset`` 的缓存。"""
+    选题时会漏看评测库里实际有的文档(11-09 评审)。解析与评测建库同一个解析器,缓存按解析器
+    指纹 + 文件内容做键(:func:`_parse_fresh`):真语料空跑发现,按路径做键的旧缓存是旧解析器的
+    输出,句子切法与评测时不同,删句会删到对照题的答案。"""
     from concurrent.futures import ProcessPoolExecutor
 
-    from kb_build_dataset import _parse_cached  # type: ignore[import-not-found]
     from kb_eval import read_manifest, select_rows  # type: ignore[import-not-found]
 
+    stamp = fingerprint if fingerprint is not None else parser_fingerprint()
     rows = select_rows(read_manifest(manifest), tiers=tiers, limit_docs=0).rows
     paths = [row["path"] for row in rows]
     with ProcessPoolExecutor(max_workers=max(1, workers)) as pool:
         parsed = list(
-            pool.map(_parse_cached, [corpus_root / p for p in paths], [cache_dir] * len(paths))
+            pool.map(
+                _parse_fresh,
+                [corpus_root / p for p in paths],
+                [cache_dir] * len(paths),
+                [stamp] * len(paths),
+            )
         )
     texts = {path: text for path, text in zip(paths, parsed, strict=True) if text is not None}
     return texts, [path for path, text in zip(paths, parsed, strict=True) if text is None]
@@ -428,7 +484,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--chat-dataset", type=Path, required=True)
     parser.add_argument("--corpus-root", type=Path, required=True)
     parser.add_argument("--manifest", type=Path, required=True)
-    parser.add_argument("--parsed-cache", type=Path, required=True)
+    parser.add_argument(
+        "--parsed-cache",
+        type=Path,
+        required=True,
+        help="解析缓存目录(按解析器指纹 + 文件内容做键;别用 kb_build_dataset 的旧缓存目录)",
+    )
     parser.add_argument("--n", type=int, default=30)
     parser.add_argument("--workers", type=int, default=os.cpu_count() or 1)
     parser.add_argument("--seed", type=int, default=DEFAULT_SEED)
