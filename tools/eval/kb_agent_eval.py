@@ -104,6 +104,7 @@ from kb_eval import (  # type: ignore[import-not-found]
     EVAL_TENANT_ID,
     INSTRUCT_NEEDS_SINGLE_VIEW,
     _all_chunk_texts,
+    _basename,
     _resolve_manifest,
     _resolve_tiers,
     build_corpus,
@@ -116,7 +117,14 @@ from kb_eval import (  # type: ignore[import-not-found]
     select_rows,
     tool_message_text,
 )
-from kb_metrics import anchor_in  # type: ignore[import-not-found]
+from kb_hard_sets import (  # type: ignore[import-not-found]
+    DISTRACTOR_SET,
+    AnchorDeletingParser,
+    hard_negative_cases,
+    load_hard_negative_spec,
+    pick_distractors,
+)
+from kb_metrics import anchor_in, anchor_key  # type: ignore[import-not-found]
 from kb_rerank import (  # type: ignore[import-not-found]
     OFFLINE_KEY,
     RERANK_KEY_ENV,
@@ -146,6 +154,8 @@ MAX_READS = 3
 MAX_CALLS = 8
 SEED = 20261018
 N_ANSWERABLE_PER_SET = 15
+#: B-206 11-09:标准一轮里另加几道近名干扰题(有答案)。
+DEFAULT_DISTRACTORS = 15
 #: 判分时每题最多给几段「含答案的完整段落」。
 GOLD_PASSAGES = 2
 #: B-206 11-09:只说上限到了、这次没执行,不再加「answer with what you have」——生产里没有这条
@@ -354,6 +364,56 @@ async def gold_passages(
     return gold
 
 
+async def store_residue(
+    store: KnowledgeStore, *, tenant_id: UUID, kb_id: UUID, anchors: Sequence[str]
+) -> list[str]:
+    """难负例臂:删过句的库里还能找到的锚(应为空;不空说明删句没删干净)。"""
+    keys = {a: anchor_key(a) for a in anchors}
+    left: set[str] = set()
+    for doc in await store.list_documents(tenant_id=tenant_id, kb_id=kb_id):
+        texts = await _all_chunk_texts(store, tenant_id=tenant_id, document_id=doc.id)
+        folded = "\n".join(anchor_key(t) for t in texts)
+        left |= {a for a, key in keys.items() if key and key in folded}
+    return [a for a in anchors if a in left]
+
+
+@dataclass(frozen=True)
+class RunPlan:
+    """这一轮跑哪些题:标准轮 = 固定 60 题 + 近名干扰题;难负例轮 = 30 道有答案对照题 +
+    难负例(``delete_anchors`` 非空:建库时删这些锚所在的句子)。"""
+
+    cases: list[tuple[str, KbCase]]
+    notes: dict[str, str]
+    delete_anchors: tuple[str, ...] = ()
+    distractors: int = 0
+
+
+def plan_run(args: argparse.Namespace, main_set: KbDataset, chat_set: KbDataset) -> RunPlan:
+    picked = select_cases(main_set, chat_set)
+    if args.hard_negatives is not None:
+        spec = load_hard_negative_spec(args.hard_negatives)
+        control = [(label, c) for label, c in picked if c.expected]
+        return RunPlan(
+            cases=control + hard_negative_cases(spec),
+            notes=dict(spec.notes),
+            delete_anchors=spec.anchors,
+        )
+    if not args.distractors:
+        return RunPlan(cases=picked, notes={})
+    _manifest, selection = _selection(args, main_set)
+    found = pick_distractors(
+        [*main_set.cases, *chat_set.cases],
+        [_basename(row["path"]) for row in selection.rows],
+        exclude_ids={c.id for _label, c in picked},
+        n=args.distractors,
+    )
+    return RunPlan(
+        cases=picked + [(DISTRACTOR_SET, d.case) for d in found],
+        notes={d.case.id: d.note for d in found},
+        distractors=len(found),
+    )
+
+
 # ---------------------------------------------------------------------------
 # 预算 / 跑题
 # ---------------------------------------------------------------------------
@@ -534,6 +594,22 @@ def _build_parser() -> argparse.ArgumentParser:
             "都已是 K-2 之后的)"
         ),
     )
+    parser.add_argument(
+        "--distractors",
+        type=int,
+        help=(
+            f"标准一轮另加几道近名干扰题(有答案;B-206 11-09),默认 {DEFAULT_DISTRACTORS},"
+            "0 = 不加;难负例轮不加"
+        ),
+    )
+    parser.add_argument(
+        "--hard-negatives",
+        type=Path,
+        help=(
+            "难负例 spec(kb_hard_sets.py 生成):这一轮建删过答案句的库,只跑难负例 + 30 道"
+            "有答案对照题;与 --distractors 分开跑"
+        ),
+    )
     parser.add_argument("--rerank", default="dashscope", choices=("dashscope", "off"))
     # B-206 K-14 对照组,与 kb_eval.py 同名同义;默认 = 生产默认。
     parser.add_argument("--rerank-view", default=DEFAULT_RERANK_VIEW, choices=RERANK_VIEWS)
@@ -550,6 +626,12 @@ def _check_args(parser: argparse.ArgumentParser, args: argparse.Namespace) -> No
     for name in ("dataset", "chat_dataset", "out"):
         if getattr(args, name) is None:
             parser.error(f"--{name.replace('_', '-')} is required (unless --tally)")
+    if args.hard_negatives is not None and args.distractors:
+        parser.error("--hard-negatives runs on its own corpus: leave out --distractors")
+    if args.distractors is None:
+        args.distractors = 0 if args.hard_negatives is not None else DEFAULT_DISTRACTORS
+    if args.distractors < 0:
+        parser.error(f"--distractors must be at least 0, got {args.distractors}")
     if args.judge_votes < 1:
         parser.error(f"--judge-votes must be at least 1, got {args.judge_votes}")
     if args.rerank_pool < 1:
@@ -571,6 +653,13 @@ def _check_args(parser: argparse.ArgumentParser, args: argparse.Namespace) -> No
             parser.error(f"missing env {', '.join(missing)}")
 
 
+def _selection(args: argparse.Namespace, main_set: KbDataset) -> tuple[Path, Any]:
+    """``(manifest.csv, 进评测库的清单行)``。"""
+    manifest = _resolve_manifest(args, main_set)
+    rows = read_manifest(manifest)
+    return manifest, select_rows(rows, tiers=_resolve_tiers(None, main_set), limit_docs=0)
+
+
 def _chat_client(
     model: str, price: Price, env: tuple[str, str], http: httpx.AsyncClient
 ) -> ChatClient:
@@ -581,7 +670,8 @@ def _chat_client(
 async def amain(args: argparse.Namespace) -> int:
     main_set = load_dataset(args.dataset)
     chat_set = load_dataset(args.chat_dataset)
-    cases = select_cases(main_set, chat_set)
+    plan = plan_run(args, main_set, chat_set)
+    cases = plan.cases
     if args.ids:
         wanted = set(args.ids.split(","))
         cases = [(label, c) for label, c in cases if c.id in wanted]
@@ -594,7 +684,7 @@ async def amain(args: argparse.Namespace) -> int:
     todo = [(label, c) for label, c in cases if c.id not in done]
     print(f"cases {len(cases)}; done {len(done)}; todo {len(todo)}", file=sys.stderr)
     if todo and args.dry:
-        await _run(args, main_set=main_set, todo=todo, models=FakeModels(), out=out)
+        await _run(args, main_set=main_set, todo=todo, models=FakeModels(), out=out, plan=plan)
     elif todo:
         answer_price = resolve_price(args.answer_model, args.answer_price)
         judge_price = resolve_price(args.judge_model, args.judge_price)
@@ -603,7 +693,7 @@ async def amain(args: argparse.Namespace) -> int:
                 answer_client=_chat_client(args.answer_model, answer_price, ANSWER_ENV, http),
                 judge_client=_chat_client(args.judge_model, judge_price, JUDGE_ENV, http),
             )
-            await _run(args, main_set=main_set, todo=todo, models=models, out=out)
+            await _run(args, main_set=main_set, todo=todo, models=models, out=out, plan=plan)
     print(tally(out))
     return 0
 
@@ -615,13 +705,11 @@ async def _run(
     todo: Sequence[tuple[str, KbCase]],
     models: Models,
     out: Path,
+    plan: RunPlan,
 ) -> None:
     started = datetime.now(UTC)
-    manifest = _resolve_manifest(args, main_set)
+    manifest, selection = _selection(args, main_set)
     corpus_root = cast(Path, args.corpus_root) if args.corpus_root is not None else manifest.parent
-    selection = select_rows(
-        read_manifest(manifest), tiers=_resolve_tiers(None, main_set), limit_docs=0
-    )
     bundle = build_embedder(
         args.embedder, concurrency=args.concurrency, query_marker=args.query_marker == "on"
     )
@@ -635,14 +723,22 @@ async def _run(
     out.parent.mkdir(parents=True, exist_ok=True)
     async with open_store(args.store) as store:
         with rls_tenant(EVAL_TENANT_ID):
+            # B-206 11-09 难负例臂:解析后删掉答案句再切块,文件名不变;库另起名。
+            deleting = (
+                {"parser": AnchorDeletingParser(anchors=plan.delete_anchors)}
+                if plan.delete_anchors
+                else {}
+            )
+            base_name = main_set.name + ("-hn" if plan.delete_anchors else "")
             report = await build_corpus(
                 store=store,
                 embedder=bundle.embedder,
                 tenant_id=EVAL_TENANT_ID,
-                base_name=main_set.name,
+                base_name=base_name,
                 corpus_root=corpus_root,
                 selection=selection,
                 concurrency=args.concurrency,
+                **deleting,
             )
             print(
                 f"corpus: ingested {report.docs_ingested}, failed {report.docs_failed}",
@@ -668,6 +764,23 @@ async def _run(
                 kb_id=report.base_id,
                 cases=[case for _label, case in todo],
             )
+            hard_negatives = None
+            if plan.delete_anchors:
+                left = await store_residue(
+                    store,
+                    tenant_id=EVAL_TENANT_ID,
+                    kb_id=report.base_id,
+                    anchors=plan.delete_anchors,
+                )
+                controls = [c for _label, c in todo if c.expected]
+                hard_negatives = {
+                    "cases": sum(1 for _label, c in todo if c.source == "hard_negative"),
+                    "anchors": len(plan.delete_anchors),
+                    "residue": left,
+                    "controls_without_gold": sum(1 for c in controls if not gold.get(c.id)),
+                }
+                if left or hard_negatives["controls_without_gold"]:
+                    print(f"WARNING hard-negative corpus: {hard_negatives}", file=sys.stderr)
             retriever = build_retriever(
                 store=store,
                 embedder=bundle.embedder,
@@ -676,7 +789,7 @@ async def _run(
                 rerank_pool=args.rerank_pool,
                 rerank_instruction=args.rerank_instruct,
             )
-            refs = (main_set.name,)
+            refs = (base_name,)
             written = await run_questions(
                 todo=todo,
                 models=models,
@@ -695,6 +808,7 @@ async def _run(
                 concurrency=args.concurrency,
                 cache_verdicts=not args.dry,
                 votes=args.judge_votes,
+                notes=plan.notes,
             )
     run = {
         "started": started.isoformat(),
@@ -714,6 +828,9 @@ async def _run(
             "threshold": args.rerank_threshold,
         },
         "judge_votes": args.judge_votes,
+        # B-206 11-09:这一轮加了几道近名干扰题;难负例臂的删句核对。
+        "distractors": plan.distractors,
+        "hard_negatives": hard_negatives,
         "calls": {"answer": spend.answer_calls, "judge": spend.judge_calls},
         "spend_cny": {
             "answer": round(spend.answer_cny, 6),
