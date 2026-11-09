@@ -285,3 +285,34 @@ def test_the_yardstick_version_follows_the_template_and_the_scoring_rules() -> N
     assert yardstick_of(template=JUDGE_TEMPLATE + "改一个字") != base  # 改提示词自动换版本
     assert yardstick_of(rules=SCORING_RULES + "x") != base  # 改归类规则要手动升这个常量
     assert yardstick_of() == base
+
+
+# ---------------------------------------------------------------------------
+# 11-09 第三轮:难负例被删句的改写式引文;「对上被删句」只看没找到的那几段
+# ---------------------------------------------------------------------------
+
+
+def test_a_paraphrased_quote_of_the_deleted_fact_is_still_caught() -> None:
+    deleted = ["甲款冲剂含益生元低聚果糖五克"]
+    raw = _raw([_claim("stated", "冲剂里含有低聚果糖5克")], refused=True)
+    verdict = score_verdict(raw, _PASSAGES, deleted=deleted)
+    assert verdict["quote_deleted"] == 1
+    assert category_for("no_answer", verdict) == "编造"
+
+
+def test_an_unrelated_unfound_quote_is_not_matched_to_the_deleted_fact() -> None:
+    deleted = ["甲款冲剂含益生元低聚果糖五克"]
+    raw = _raw([_claim("stated", "Z药与甲款冲剂同服影响未知")], refused=True)
+    verdict = score_verdict(raw, _PASSAGES, deleted=deleted)
+    assert (verdict["quote_deleted"], verdict["quote_misses"]) == (0, 1)
+
+
+def test_only_the_pieces_not_found_decide_a_deleted_match() -> None:
+    # 第一段在资料里(也恰好与被删句共享开头),第二段没找到、与被删句无关:
+    # 记「没找到」,不是「对上被删句」
+    deleted = ["甲款冲剂请与60℃以上热水冲泡后饮用"]
+    quote = "甲款冲剂请与60℃以上热水……与Z药同时服用没有影响"
+    verdict = score_verdict(
+        _raw([_claim("stated", quote)], refused=True), _PASSAGES, deleted=deleted
+    )
+    assert (verdict["quote_deleted"], verdict["quote_misses"]) == (0, 1)

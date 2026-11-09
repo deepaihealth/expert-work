@@ -92,7 +92,7 @@ _JSON_RE = re.compile(r"\{.*\}", re.S)
 
 #: 归类 / 计分规则的版本:改了 :func:`score_verdict` / :func:`category_for` 的判法就升一下。
 #: 判分提示词的变化不用管,:func:`yardstick_of` 自动带上它的哈希。
-SCORING_RULES = "2026-11-09.2"
+SCORING_RULES = "2026-11-09.3"
 
 
 def yardstick_of(template: str = JUDGE_TEMPLATE, rules: str = SCORING_RULES) -> str:
@@ -170,16 +170,46 @@ _ELLIPSIS = re.compile("\u2026+|\\.{3,}|\u22ef+")
 
 def _quote_status(quote: str, passages_key: str, deleted_keys: Sequence[str]) -> str:
     """``found``:切出来的每段(≥ :data:`MIN_QUOTE_KEY_CHARS` 字)都在资料里;``unchecked``:
-    空或每段都太短,核对不了;``deleted``:找不到、但对上了难负例被删掉的锚;``missed``:找不到。"""
+    空或每段都太短,核对不了;``deleted``:没找到的段对上了难负例被删掉的锚(含改写,见
+    :func:`_matches_deleted`);``missed``:找不到。"""
     pieces = [anchor_key(p) for p in _ELLIPSIS.split(quote)]
     pieces = [p for p in pieces if len(p) >= MIN_QUOTE_KEY_CHARS]
     if not pieces:
         return "unchecked"
-    if all(p in passages_key for p in pieces):
+    missing = [p for p in pieces if p not in passages_key]
+    if not missing:
         return "found"
-    if any(p in d or d in p for p in pieces for d in deleted_keys if d):
+    # 只看没找到的那几段(找到的段与被删句碰巧相同不算数)。
+    if any(_matches_deleted(p, d) for p in missing for d in deleted_keys if d):
         return "deleted"
     return "missed"
+
+
+#: 判分常把被删句改写着抄(「冲剂里含有低聚果糖5克」vs 被删的「甲款冲剂含益生元低聚果糖五克」):
+#: 连续相同 ≥ 6 字,或共有的不同字 ≥ 6 个且占引文用字的七成,都算对上被删句。
+_DELETED_CHAR_SHARE = 0.7
+
+
+def _lcs_len(a: str, b: str) -> int:
+    best = 0
+    prev = [0] * (len(b) + 1)
+    for ch in a:
+        cur = [0] * (len(b) + 1)
+        for j, other in enumerate(b, start=1):
+            if ch == other:
+                cur[j] = prev[j - 1] + 1
+                best = max(best, cur[j])
+        prev = cur
+    return best
+
+
+def _matches_deleted(piece: str, deleted_key: str) -> bool:
+    if _lcs_len(piece, deleted_key) >= MIN_QUOTE_KEY_CHARS:
+        return True
+    shared = set(piece) & set(deleted_key)
+    return len(shared) >= MIN_QUOTE_KEY_CHARS and len(shared) >= _DELETED_CHAR_SHARE * len(
+        set(piece)
+    )
 
 
 def score_verdict(
