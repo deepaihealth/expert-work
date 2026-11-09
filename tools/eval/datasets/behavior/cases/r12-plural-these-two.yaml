@@ -1,0 +1,13 @@
+id: r12-plural-these-two
+agent: eval-coref
+shape: 多轮指代(B-206)· 复数:「这两个」= 上一轮的两款,两个都要答
+turns:
+  - prompt: KX-305 和 KX-217 分别是什么品类?
+  - prompt: 这两个的保修期各多久?
+checks:
+  - type: coref
+    referent: plural
+    turn: 2
+    target: ["26 个月", "18 个月"]
+    others: ["15 个月"]
+    names: [KX-305, KX-217]

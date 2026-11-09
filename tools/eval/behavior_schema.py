@@ -21,7 +21,13 @@ FIXTURES_DIR = DATASET_DIR / "fixtures"
 AGENTS_DIR = DATASET_DIR / "agents"
 
 AgentCode = Literal[
-    "eval-general", "eval-ahp", "eval-compress", "eval-kb", "eval-tight", "eval-tight-24"
+    "eval-general",
+    "eval-ahp",
+    "eval-compress",
+    "eval-kb",
+    "eval-tight",
+    "eval-tight-24",
+    "eval-coref",
 ]
 
 
@@ -242,6 +248,47 @@ class ToolArgContains(_Strict):
         return self
 
 
+#: B-206 多轮指代:被指代的东西是哪一类(不限商品,用户 11-05「要做一个能泛化的方案」)。
+CorefReferent = Literal[
+    "person",
+    "customer",
+    "product",
+    "organisation",
+    "file",
+    "list_item",
+    "time_event",
+    "attribute_ellipsis",
+    "plural",
+]
+
+
+class Coref(_Strict):
+    """第 ``turn`` 轮的追问用代词 / 省略指回前文(B-206)。按那一轮回复里出现了谁的事实归类
+    (见 ``behavior_coref.classify``):``target`` 是该指的那个对象才有的事实(``plural`` 要全有),
+    ``others`` 是同类别的另一个候选的事实。``ambiguous``:前文有 ≥2 个同类候选、追问分不清
+    指谁 —— 这时 ``target`` / ``others`` 是两个候选各自的事实,追问或两个都答算过,只猜一个
+    不算。``names``:该指的对象的名字(看回复点没点名、外发 ``tool`` 参数里有没有写名字)。
+    事实比对前两边都去掉空白、逗号与连字符。"""
+
+    type: Literal["coref"]
+    referent: CorefReferent
+    turn: int = Field(ge=1)
+    target: list[str] = Field(min_length=1)
+    others: list[str] = Field(default_factory=list)
+    ambiguous: bool = False
+    names: list[str] = Field(default_factory=list)
+    tool: str | None = "knowledge_search"
+
+    @model_validator(mode="after")
+    def _consistent(self) -> Coref:
+        if self.ambiguous and not self.others:
+            raise ValueError("an ambiguous coref check needs the other candidate's facts")
+        both = set(self.target) & set(self.others)
+        if both:
+            raise ValueError(f"{sorted(both)} in both target and others")
+        return self
+
+
 class TurnTokensMax(_Strict):
     type: Literal["turn_tokens_max"]
     turn: int = Field(ge=1)
@@ -269,7 +316,8 @@ Check = Annotated[
     | ToolCountMax
     | ToolNotUsedOn
     | ToolArgContains
-    | TurnTokensMax,
+    | TurnTokensMax
+    | Coref,
     Field(discriminator="type"),
 ]
 
@@ -286,8 +334,8 @@ class Turn(_Strict):
 
 class Case(_Strict):
     #: 首字母 = 智能体:g 通用、h ahp、c 压缩、k 知识库 ``eval-kb``、
-    #: t 步数上限很紧的 ``eval-tight``(B-226)。
-    id: str = Field(pattern=r"^[ghckt][0-9]{2}-[a-z0-9-]+$")
+    #: t 步数上限很紧的 ``eval-tight``(B-226)、r 多轮指代 ``eval-coref``(B-206)。
+    id: str = Field(pattern=r"^[ghcktr][0-9]{2}-[a-z0-9-]+$")
     agent: AgentCode
     shape: str = Field(min_length=1)  # 出处:ROADMAP 编号
     fixtures: list[str] = Field(default_factory=list)
@@ -311,6 +359,13 @@ class Case(_Strict):
     #: warning / max_steps 帧, ``detail.max`` 是它的步数上限)都没有就判「不可判」(提前做完了,
     #: 没进预警窗口);子代的预警带子代自己的上限, 不算。
     requires_step_warning: bool = False
+
+    @model_validator(mode="after")
+    def _coref_turns_exist(self) -> Case:
+        for check in self.checks:
+            if isinstance(check, Coref) and check.turn > len(self.turns):
+                raise ValueError(f"coref check on turn {check.turn}, case has {len(self.turns)}")
+        return self
 
 
 #: 协议 ``spec.workflow.max_iterations`` 的默认值(test_behavior_dataset 钉住两边一致)。

@@ -157,6 +157,27 @@ EXPERT_WORK_API_TOKEN=… uv run --no-sync python tools/eval/behavior_runner.py 
 改动前的版本 `knowledge_search` 没有 `bases` 参数,k01 / k02 的 `tool_arg_contains` 在基线上必然不过;对照时看其余判据
 (答对没有、检索次数)与 k03~k05 有没有退步。改 fixtures 要改 `make_fixtures.py` 重新生成,并把库里的文档换成新版。
 
+多轮指代用例(B-206,`r01`~`r14`,`--only` 选它们):跑在 `eval-coref`,只绑一个合成知识库。测的是平台怎么带着
+整段对话把「它 / 那边 / 这份 / 第二个 / 那天 / 那价格呢 / 另一个呢 / 这两个」变成外发的检索参数和答复 —— 平台没有单独的
+改写层,主模型看着全部历史写 `knowledge_search.query`,所以放在真跑整段会话的 B-140,而不是单轮的 `kb_agent_eval.py`。
+指代对象不限商品:人、客户、商品、组织、文件(某一轮才附上的报价单)、上一条答复的第几项、时间 / 事件、省略属性、复数;
+r02 / r05 / r13 / r14 前文有两个同类候选,追问或两个都答算过,只猜一个不算。**一次性准备**(同一个租户):
+
+1. 建知识库 `b140-kb-coref`「员工通讯录、客户档案、在售型号与价格、分部、售后网点与设备巡检记录(合成数据)」,
+   把 `datasets/behavior/fixtures/kb/b140-kb-coref/` 下的六份文件传上去、等就绪;
+2. 导入 `datasets/behavior/agents/eval-coref.yaml`(开了工作区:r07 / r14 的报价单是逐轮附件)。
+
+```sh
+EXPERT_WORK_API_TOKEN=… uv run --no-sync python tools/eval/behavior_runner.py --label coref-base-$(date +%m%d) \
+  --only r01-person-he,r02-person-two-candidates,r03-customer-near-name,r04-product-named-by-answer,r05-product-two-candidates,r06-organisation-there,r07-file-this-one,r08-list-item-second,r09-time-that-day,r10-ellipsis-price,r11-ellipsis-the-other,r12-plural-these-two,r13-customer-two-candidates,r14-file-two-candidates
+uv run --no-sync python tools/eval/behavior_coref.py eval-out/b140/coref-base-<日期>.jsonl
+```
+
+判据 `coref` 只看结果:那一轮回复里出现了**该指的对象**的事实还是**另一个同类候选**的事实(每条事实在合成语料里只出现一次,
+`test_behavior_coref.py` 复核),有没有反问。`behavior_coref.py` 三个数一起报:**指错对象率**(含「很笃定地答错对象」次数)、
+**有两个候选时的追问率**(及「追问或两个都答」率、只猜一个的次数)、**外发检索参数点名率**(参数里写没写对象名、还留着几个
+「它 / 这个 / 第二个」这类指示词);另按指代对象类别列通过数。过 / 不过只按回复判,外发参数两项是平台改进要看的信号,不进过 / 不过。
+
 撞上限 / 原地打转用例(B-226,`t01`~`t04` 与 `g16`):`t*` 跑在 `eval-tight`(eval-general 只把步数上限压到 6 步),
 **要先在控制台导入** `datasets/behavior/agents/eval-tight.yaml`;10 份台账逐份处理做不完,测撞上限之后的收尾是否如实
 (`t01` 没登记、`t02` 登记了一部分)和快撞上限时有没有先把结果登记出去(`t03`)。用例写了 `requires_exit_reason: max_steps`:
