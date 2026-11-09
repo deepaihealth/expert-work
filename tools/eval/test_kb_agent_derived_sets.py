@@ -166,7 +166,7 @@ def test_hard_negative_run_deletes_the_answer_sentence_and_keeps_the_controls(
         "cases": 1,
         "anchors": 1,
         "residue": [],
-        "controls_without_gold": 0,
+        "controls_without_gold": [],
     }
 
 
@@ -257,3 +257,24 @@ def test_the_deleted_anchors_reach_the_judge_scoring(
     monkeypatch.setattr(kb_agent_eval, "run_questions", spy)
     assert main([*_corpus(tmp_path), "--hard-negatives", str(_spec(tmp_path, _GONE))]) == 0
     assert seen["deleted"] == {"hn-unit_kb-noise": (_GONE,)}
+
+
+def test_a_control_without_a_gold_passage_only_warns(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # 11-09 复审:对照题取不到含答案段落,在没删句的标准库上也会发生(锚跨段落边界);删句没删掉
+    # 对照答案已由解析器逐文档核过(ControlAnchorDeletedError),这里只警告、列出题号,不停
+    import kb_agent_eval
+
+    real = kb_agent_eval.gold_passages
+
+    async def one_missing(*args: Any, **kwargs: Any) -> dict[str, list[str]]:
+        gold = dict(await real(*args, **kwargs))
+        gold["unit_kb-a0"] = []
+        return gold
+
+    monkeypatch.setattr(kb_agent_eval, "gold_passages", one_missing)
+    assert main([*_corpus(tmp_path), "--hard-negatives", str(_spec(tmp_path, _GONE))]) == 0
+    _rows, run = _lines(tmp_path)
+    assert run["hard_negatives"]["controls_without_gold"] == ["unit_kb-a0"]
+    assert "WARNING" in capsys.readouterr().err
