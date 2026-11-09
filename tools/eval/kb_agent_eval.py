@@ -62,7 +62,6 @@ import asyncio
 import json
 import os
 import random
-import re
 import sys
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
@@ -70,14 +69,18 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Protocol, cast
 from uuid import UUID
-from zoneinfo import ZoneInfo
 
 sys.path.insert(0, str(Path(__file__).parent))
 
 import httpx
+from kb_agent_cost import (  # type: ignore[import-not-found]
+    BudgetGate,
+    Price,
+    Spend,
+    resolve_price,
+)
 from kb_agent_judge import (  # type: ignore[import-not-found]
     DEFAULT_JUDGE_VOTES,
-    JUDGE_SYSTEM,
     JudgeCache,
     category_for,
     judge_prompt,
@@ -85,6 +88,14 @@ from kb_agent_judge import (  # type: ignore[import-not-found]
     parse_verdict,
     score_verdict,
     seen_passages,
+)
+from kb_agent_models import (  # type: ignore[import-not-found]
+    DRY_MODEL,
+    READ_TOOL,
+    ChatClient,
+    FakeModels,
+    Models,
+    RealModels,
 )
 from kb_agent_tally import read_results, tally  # type: ignore[import-not-found]
 from kb_dataset import KbCase, KbDataset, load_dataset  # type: ignore[import-not-found]
@@ -141,217 +152,13 @@ GOLD_PASSAGES = 2
 #: 消息,那句话是评测独有的「有就答」压力(11-05 研究记录)。
 SEARCH_LIMIT_NOTE = "[search limit reached in this evaluation; this search was not run]"
 READ_LIMIT_NOTE = "[read limit reached in this evaluation; this read was not run]"
-READ_TOOL = "knowledge_read"
 
 DEFAULT_ANSWER_MODEL = "glm-5.3"
 DEFAULT_JUDGE_MODEL = "deepseek-v4-pro"
 ANSWER_ENV = ("EXPERT_WORK_EVAL_ANSWER_BASE_URL", "EXPERT_WORK_EVAL_ANSWER_API_KEY")
 JUDGE_ENV = ("EXPERT_WORK_EVAL_JUDGE_BASE_URL", "EXPERT_WORK_EVAL_JUDGE_API_KEY")
 DEFAULT_BUDGET_CNY = 20.0
-#: 暂停时多久看一次 ``<out>.budget``(秒)。
-BUDGET_POLL_S = 5.0
 JUDGE_CACHE_DB = EVAL_OUT_DIR / "agent_judge_cache.sqlite"
-#: ``--dry`` 的结果行记这个模型名,与真跑的行混不到一个 ``--out`` 里。
-DRY_MODEL = "dry"
-
-_BEIJING = ZoneInfo("Asia/Shanghai")
-
-
-# ---------------------------------------------------------------------------
-# 计费
-# ---------------------------------------------------------------------------
-
-
-@dataclass(frozen=True)
-class Price:
-    """元 / 百万 token,价目表上的(忙时)价。"""
-
-    input: float
-    cached: float
-    output: float
-
-
-PRICES: dict[str, Price] = {
-    "glm-5.3": Price(input=8.0, cached=2.0, output=28.0),
-    "deepseek-v4-pro": Price(input=9.0, cached=0.3, output=27.0),
-}
-
-
-def is_deepseek_offpeak(at: datetime) -> bool:
-    """DeepSeek 忙时 = 北京时间工作日 9-12 点、14-18 点;其余时间(含周末全天)半价。"""
-    local = at.astimezone(_BEIJING)
-    if local.weekday() >= 5:
-        return True
-    return not (9 <= local.hour < 12 or 14 <= local.hour < 18)
-
-
-def call_cost(usage: Mapping[str, Any], price: Price, *, model: str, at: datetime) -> float:
-    """一次调用的花费(元);DeepSeek 的模型在闲时按半价。"""
-    prompt = int(usage.get("prompt_tokens") or 0)
-    cached = int(
-        (usage.get("prompt_tokens_details") or {}).get("cached_tokens")
-        or usage.get("prompt_cache_hit_tokens")
-        or 0
-    )
-    out = int(usage.get("completion_tokens") or 0)
-    cny = ((prompt - cached) * price.input + cached * price.cached + out * price.output) / 1e6
-    return cny / 2 if model.startswith("deepseek") and is_deepseek_offpeak(at) else cny
-
-
-def parse_price(raw: str) -> Price:
-    try:
-        values = [float(v) for v in raw.split(",")]
-    except ValueError:
-        values = []
-    if len(values) != 3:
-        raise SystemExit(f"price must be 'input,cached,output' CNY per million tokens: {raw!r}")
-    return Price(*values)
-
-
-def resolve_price(model: str, raw: str | None) -> Price:
-    if raw is not None:
-        return parse_price(raw)
-    if model not in PRICES:
-        raise SystemExit(f"no price for model {model!r}: pass --answer-price / --judge-price")
-    return PRICES[model]
-
-
-@dataclass
-class Spend:
-    answer_cny: float = 0.0
-    judge_cny: float = 0.0
-    answer_calls: int = 0
-    judge_calls: int = 0
-
-
-# ---------------------------------------------------------------------------
-# 模型
-# ---------------------------------------------------------------------------
-
-
-class Models(Protocol):
-    @property
-    def answer_model(self) -> str: ...
-
-    @property
-    def judge_model(self) -> str: ...
-
-    async def agent(
-        self, messages: list[dict[str, Any]], tools: list[dict[str, Any]]
-    ) -> tuple[dict[str, Any], float]:
-        """One answer-model turn: the assistant message and what it cost (CNY)."""
-
-    async def judge(self, prompt: str) -> tuple[str, float]:
-        """The judge's raw reply and what it cost (CNY)."""
-
-
-async def _post(
-    client: httpx.AsyncClient, url: str, key: str, body: Mapping[str, Any]
-) -> dict[str, Any]:
-    for attempt in range(5):
-        try:
-            resp = await client.post(
-                url, json=body, headers={"Authorization": f"Bearer {key}"}, timeout=180.0
-            )
-        except httpx.TransportError:
-            if attempt == 4:
-                raise
-            await asyncio.sleep(2 * (attempt + 1))
-            continue
-        if resp.status_code in (429, 500, 502, 503, 504) and attempt < 4:
-            await asyncio.sleep(3 * (attempt + 1))
-            continue
-        resp.raise_for_status()
-        return cast(dict[str, Any], resp.json())
-    raise RuntimeError("unreachable")
-
-
-@dataclass(frozen=True)
-class ChatClient:
-    """OpenAI 兼容的 ``/chat/completions``,按回包的 ``usage`` 与调用时刻记账。"""
-
-    model: str
-    base_url: str
-    api_key: str
-    price: Price
-    http: httpx.AsyncClient
-
-    async def complete(self, body: Mapping[str, Any]) -> tuple[dict[str, Any], float]:
-        url = f"{self.base_url.rstrip('/')}/chat/completions"
-        data = await _post(self.http, url, self.api_key, {"model": self.model, **body})
-        cost = call_cost(
-            data.get("usage") or {}, self.price, model=self.model, at=datetime.now(UTC)
-        )
-        return cast(dict[str, Any], data["choices"][0]["message"]), cost
-
-
-@dataclass(frozen=True)
-class RealModels:
-    answer_client: ChatClient
-    judge_client: ChatClient
-
-    @property
-    def answer_model(self) -> str:
-        return self.answer_client.model
-
-    @property
-    def judge_model(self) -> str:
-        return self.judge_client.model
-
-    async def agent(
-        self, messages: list[dict[str, Any]], tools: list[dict[str, Any]]
-    ) -> tuple[dict[str, Any], float]:
-        # 厂商默认的思考设置,与 B-175 PR3 那次一样不另传。
-        return await self.answer_client.complete({"messages": messages, "tools": tools})
-
-    async def judge(self, prompt: str) -> tuple[str, float]:
-        message, cost = await self.judge_client.complete(
-            {
-                "messages": [
-                    {"role": "system", "content": JUDGE_SYSTEM},
-                    {"role": "user", "content": prompt},
-                ],
-                "response_format": {"type": "json_object"},
-            }
-        )
-        return str(message.get("content") or ""), cost
-
-
-class FakeModels:
-    """``--dry``:用题目原文搜一次;给了 knowledge_read 就再读一次检索结果里第一个
-    ``[D<n>#<k>]``(B-206 K-2);然后回一句占位。判分固定。不花钱、不连网。"""
-
-    answer_model = DRY_MODEL
-    judge_model = DRY_MODEL
-
-    async def agent(
-        self, messages: list[dict[str, Any]], tools: list[dict[str, Any]]
-    ) -> tuple[dict[str, Any], float]:
-        results = [str(m["content"]) for m in messages if m["role"] == "tool"]
-        if not results:
-            question = messages[-1]["content"]
-            return _dry_call(tools[0]["function"]["name"], {"query": question}), 0.0
-        offered = {t["function"]["name"] for t in tools}
-        reference = _DRY_REFERENCE.search(results[0])
-        if READ_TOOL in offered and len(results) == 1 and reference is not None:
-            return _dry_call(READ_TOOL, {"document": reference.group(1)}), 0.0
-        return {"role": "assistant", "content": "(空跑)"}, 0.0
-
-    async def judge(self, prompt: str) -> tuple[str, float]:
-        verdict = {"claims": [], "refused": False, "matches_reference": "n/a"}
-        return json.dumps({**verdict, "reason": "dry"}), 0.0
-
-
-_DRY_REFERENCE = re.compile(r"\[(D[0-9]+#[0-9]+)\]")
-
-
-def _dry_call(name: str, args: Mapping[str, Any]) -> dict[str, Any]:
-    call = {
-        "id": f"call_dry_{name}",
-        "type": "function",
-        "function": {"name": name, "arguments": json.dumps(args, ensure_ascii=False)},
-    }
-    return {"role": "assistant", "content": "", "tool_calls": [call]}
 
 
 # ---------------------------------------------------------------------------
@@ -552,54 +359,6 @@ async def gold_passages(
 # ---------------------------------------------------------------------------
 
 
-@dataclass
-class BudgetGate:
-    """``--budget``:花到上限就不再开新题;暂停时库与已落盘的结果都留着,等操作者往
-    ``control`` 写新上限(元)继续,或写 ``stop`` 收尾。"""
-
-    budget: float
-    control: Path
-    poll_s: float = BUDGET_POLL_S
-
-    async def wait_for_raise(self, spent: Callable[[], float]) -> bool:
-        """暂停到上限被调高(True)或收到 ``stop``(False)。"""
-        print(
-            f"PAUSED: spent ¥{spent():.2f} >= budget ¥{self.budget:.2f}. Write a new budget "
-            f"(CNY) into {self.control} to continue, or 'stop' to finish; finished questions "
-            "are kept and a rerun with the same --out resumes.",
-            file=sys.stderr,
-        )
-        while True:
-            raw = self._take()
-            if raw == "stop":
-                return False
-            if raw is not None:
-                try:
-                    value = float(raw)
-                except ValueError:
-                    value = None
-                if value is not None and value > spent():
-                    self.budget = value
-                    print(f"RESUMED: budget ¥{value:.2f}", file=sys.stderr)
-                    return True
-                print(
-                    f"ignored {raw!r} in {self.control}: need a number above ¥{spent():.2f} "
-                    "or 'stop'",
-                    file=sys.stderr,
-                )
-            await asyncio.sleep(self.poll_s)
-
-    def _take(self) -> str | None:
-        try:
-            raw = self.control.read_text(encoding="utf-8").strip()
-        except FileNotFoundError:
-            return None
-        if not raw:  # 操作者的 ``echo 30 > …`` 还没写完,下一轮再读
-            return None
-        self.control.unlink(missing_ok=True)
-        return raw
-
-
 async def run_questions(
     *,
     todo: Sequence[tuple[str, KbCase]],
@@ -627,7 +386,7 @@ async def run_questions(
     written = 0
 
     def total() -> float:
-        return spend.answer_cny + spend.judge_cny + other_cost()
+        return float(spend.answer_cny + spend.judge_cny + other_cost())
 
     async def admit() -> bool:
         async with gate_lock:
