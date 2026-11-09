@@ -26,7 +26,12 @@ from longmem.openai_client import render_chat_payload
 from longmem.retrieval import AblationConfig, evaluate_retrieval
 
 FIXTURES = Path(__file__).parent / "datasets" / "longmem_fixture"
-_NOW = datetime(2026, 6, 10, 12, 0, tzinfo=UTC)
+
+#: ``now`` for every test — the CM-K4 shift must use the same wall clock
+#: ``InMemoryMemoryStore.retrieve`` decays against (``datetime.now``);
+#: a fixed past date ages every shifted doc past the decay floor and
+#: erases the freshness tie-break as the calendar moves on.
+_NOW = datetime.now(UTC)
 
 
 # ---------------------------------------------------------------------------
