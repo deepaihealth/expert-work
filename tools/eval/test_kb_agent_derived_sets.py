@@ -170,17 +170,20 @@ def test_hard_negative_run_deletes_the_answer_sentence_and_keeps_the_controls(
     }
 
 
-def test_a_spec_that_deletes_a_control_answer_is_flagged(
+def test_a_spec_that_deletes_a_control_answer_stops_the_run(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
     argv = _corpus(tmp_path)
     sets = [load_dataset(Path(argv[1])), load_dataset(Path(argv[3]))]
     hit = sum(1 for _label, c in select_cases(*sets) if "named" in c.id)
     assert hit  # 抽样里有点名题,它们的答案正是被删的这句
-    assert main([*argv, "--hard-negatives", str(_spec(tmp_path, _DELETE))]) == 0
-    _rows, run = _lines(tmp_path)
-    assert run["hard_negatives"]["controls_without_gold"] == hit
-    assert "WARNING hard-negative corpus" in capsys.readouterr().err
+    # 11-09 评审:伤到对照题就停,不是打个 WARNING 接着花钱
+    with pytest.raises(SystemExit, match="removes control answers"):
+        main([*argv, "--hard-negatives", str(_spec(tmp_path, _DELETE))])
+    assert not (tmp_path / "agent.jsonl").exists() or not [
+        line for line in (tmp_path / "agent.jsonl").read_text().splitlines() if "case_id" in line
+    ]
+    assert "ControlAnchorDeletedError" in capsys.readouterr().err
 
 
 def test_hard_negatives_and_distractors_are_separate_runs(
@@ -226,3 +229,14 @@ def test_the_cli_will_not_resume_into_another_vote_count_or_run(tmp_path: Path) 
     hn = [a for a in argv if a not in ("--distractors", "0")]
     with pytest.raises(SystemExit, match="run_kind"):
         main([*hn, "--hard-negatives", str(_spec(tmp_path, _GONE))])
+
+
+def test_deleted_text_still_found_after_ingest_stops_the_run(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    async def still_there(*args: Any, **kwargs: Any) -> list[str]:
+        return [_GONE]
+
+    monkeypatch.setattr("kb_agent_eval.store_residue", still_there)
+    with pytest.raises(SystemExit, match="not usable"):
+        main([*_corpus(tmp_path), "--hard-negatives", str(_spec(tmp_path, _GONE))])

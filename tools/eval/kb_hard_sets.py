@@ -31,6 +31,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 import random
 import re
 import sys
@@ -77,8 +78,11 @@ def split_units(text: str) -> list[str]:
 
 
 def _windows_for(key: str, ukeys: Sequence[str]) -> set[int]:
-    """含 ``key`` 的最小相邻句窗口(每处出现一个),返回要删的句号。"""
+    """含 ``key`` 的最小相邻句窗口(每处出现一个),返回要删的句号。``key`` 为空(锚归一后什么
+    都不剩)时什么都不删 —— 空串在哪儿都「找得到」。"""
     drop: set[int] = set()
+    if not key:
+        return drop
     for i in range(len(ukeys)):
         for width in range(1, MAX_WINDOW + 1):
             window = ukeys[i : i + width]
@@ -113,17 +117,31 @@ def residue(text: str, anchors: Iterable[str]) -> list[str]:
     return [a for a in anchors if anchor_key(a) and anchor_key(a) in folded]
 
 
+class ControlAnchorDeletedError(ValueError):
+    """难负例删句删掉了对照题的答案锚:这份库不能用来量误拒。"""
+
+
 @dataclass(frozen=True)
 class AnchorDeletingParser:
-    """入库用的解析器外面包一层删句(进程池里跑,所以可以 pickle)。"""
+    """入库用的解析器外面包一层删句(进程池里跑,所以可以 pickle)。``guard`` = 这一轮对照题的
+    答案锚:删句删掉了其中任何一条(原文有、删后没有),这份文档就入库失败,评测随即退出。"""
 
     anchors: tuple[str, ...]
+    guard: tuple[str, ...] = ()
 
     def __call__(self, filename: str, raw: bytes) -> str:
         from control_plane.knowledge.parsing import parse_document  # 子进程里导入
 
-        text, _dropped = delete_anchor_units(str(parse_document(filename, raw)), self.anchors)
-        return text
+        return self.apply(str(parse_document(filename, raw)), filename=filename)
+
+    def apply(self, text: str, *, filename: str) -> str:
+        """删句;``guard`` 里的对照锚原文有、删后没了就报错(这份库不能用来量误拒)。"""
+        deleted, _dropped = delete_anchor_units(text, self.anchors)
+        keys = {anchor_key(a): a for a in self.guard}
+        lost = [keys[k] for k in _lost(text, deleted, list(keys))]
+        if lost:
+            raise ControlAnchorDeletedError(f"{filename}: deletion removes control anchors {lost}")
+        return deleted
 
 
 # ---------------------------------------------------------------------------
@@ -149,22 +167,18 @@ class HardNegative:
         }
 
 
-def _deletion(
-    anchors: Sequence[str], texts: Mapping[str, str]
-) -> tuple[list[str], tuple[str, ...]]:
-    """``(被删的句子, 动到的文档)``,全语料。"""
-    dropped: list[str] = []
-    touched: list[str] = []
-    for name, text in texts.items():
-        units = split_units(text)
-        ukeys = [anchor_key(u) for u in units]
-        drop: set[int] = set()
-        for anchor in anchors:
-            drop |= _windows_for(anchor_key(anchor), ukeys)
-        if drop:
-            touched.append(name)
-            dropped += [units[i] for i in sorted(drop)]
-    return dropped, tuple(touched)
+def _dropped_units(text: str, anchors: Sequence[str]) -> int:
+    ukeys = [anchor_key(u) for u in split_units(text)]
+    drop: set[int] = set()
+    for anchor in anchors:
+        drop |= _windows_for(anchor_key(anchor), ukeys)
+    return len(drop)
+
+
+def _lost(before: str, after: str, keys: Sequence[str]) -> list[str]:
+    """删句前在、删句后不在的锚(都按归一形)。"""
+    folded_before, folded_after = anchor_key(before), anchor_key(after)
+    return [k for k in keys if k and k in folded_before and k not in folded_after]
 
 
 def pick_hard_negatives(
@@ -175,11 +189,16 @@ def pick_hard_negatives(
     n: int,
     seed: int = DEFAULT_SEED,
 ) -> tuple[list[HardNegative], dict[str, int]]:
-    """按固定种子打乱后依次试,取够 ``n`` 道;返回 ``(选中的, 跳过原因计数)``。"""
+    """按固定种子打乱后依次试,取够 ``n`` 道;返回 ``(选中的, 跳过原因计数)``。
+
+    对照题核对按**累计**删句算(11-09 评审):候选加进来后,把已选的锚 + 它的锚一起从原文删
+    (与评测建库时 :class:`AnchorDeletingParser` 一次删全部锚相同),每份它动到的文档里,删前
+    在的对照锚删后都还得在 —— 只删半句、跨句整段删、两道题各删一处合起来删光,都算伤到对照。"""
     control_keys = [anchor_key(e.anchor) for c in control for e in c.expected]
     order = sorted(candidates, key=lambda c: c.id)
     random.Random(seed).shuffle(order)  # noqa: S311 - a reproducible sample
     picked: list[HardNegative] = []
+    chosen: list[str] = []  # 已选的锚(累计)
     skipped: Counter[str] = Counter()
     for case in order:
         if len(picked) >= n:
@@ -188,17 +207,25 @@ def pick_hard_negatives(
             skipped["match_all"] += 1
             continue
         anchors = tuple(dict.fromkeys(e.anchor for e in case.expected))
-        dropped, documents = _deletion(anchors, texts)
-        if not dropped:
+        hits = {name: _dropped_units(text, anchors) for name, text in texts.items()}
+        documents = tuple(name for name, count in hits.items() if count)
+        if not documents:
             skipped["anchor_not_found"] += 1
             continue
-        dropped_keys = "\n".join(anchor_key(u) for u in dropped)
-        if any(key and key in dropped_keys for key in control_keys):
+        trial = [*chosen, *anchors]
+        if any(
+            _lost(texts[name], delete_anchor_units(texts[name], trial)[0], control_keys)
+            for name in documents
+        ):
             skipped["touches_control"] += 1
             continue
+        chosen += anchors
         picked.append(
             HardNegative(
-                case=case, anchors=anchors, deleted_units=len(dropped), documents=documents
+                case=case,
+                anchors=anchors,
+                deleted_units=sum(hits.values()),
+                documents=documents,
             )
         )
     return picked, dict(skipped)
@@ -345,6 +372,29 @@ def pick_distractors(
     return found[:n]
 
 
+def corpus_texts(
+    *, manifest: Path, corpus_root: Path, tiers: Sequence[str], cache_dir: Path, workers: int
+) -> tuple[dict[str, str], list[str]]:
+    """评测建库会入的每一份文档的解析文本,按清单 ``path`` 记;解析失败的 path 另列。
+
+    文档清单用评测同一个 ``kb_eval.select_rows``(重复组只留第一份;同名不同目录的文件都入、
+    超长 PDF 也入),不用 ``kb_build_dataset.parse_corpus`` —— 后者同名只留一份、超长 PDF 跳过,
+    选题时会漏看评测库里实际有的文档(11-09 评审)。解析走 ``kb_build_dataset`` 的缓存。"""
+    from concurrent.futures import ProcessPoolExecutor
+
+    from kb_build_dataset import _parse_cached  # type: ignore[import-not-found]
+    from kb_eval import read_manifest, select_rows  # type: ignore[import-not-found]
+
+    rows = select_rows(read_manifest(manifest), tiers=tiers, limit_docs=0).rows
+    paths = [row["path"] for row in rows]
+    with ProcessPoolExecutor(max_workers=max(1, workers)) as pool:
+        parsed = list(
+            pool.map(_parse_cached, [corpus_root / p for p in paths], [cache_dir] * len(paths))
+        )
+    texts = {path: text for path, text in zip(paths, parsed, strict=True) if text is not None}
+    return texts, [path for path, text in zip(paths, parsed, strict=True) if text is None]
+
+
 # ---------------------------------------------------------------------------
 # CLI:生成难负例 spec
 # ---------------------------------------------------------------------------
@@ -360,22 +410,29 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--manifest", type=Path, required=True)
     parser.add_argument("--parsed-cache", type=Path, required=True)
     parser.add_argument("--n", type=int, default=30)
+    parser.add_argument("--workers", type=int, default=os.cpu_count() or 1)
     parser.add_argument("--seed", type=int, default=DEFAULT_SEED)
     parser.add_argument("--out", type=Path, required=True)
     args = parser.parse_args(argv)
 
     from kb_agent_cases import select_cases  # type: ignore[import-not-found]
-    from kb_build_dataset import parse_corpus  # type: ignore[import-not-found]
 
     main_set, chat_set = load_dataset(args.dataset), load_dataset(args.chat_dataset)
     control = [c for _label, c in select_cases(main_set, chat_set) if c.expected]
     control_ids = {c.id for c in control}
-    texts, counts = parse_corpus(
-        corpus_root=args.corpus_root.expanduser(),
+    texts, failed = corpus_texts(
         manifest=args.manifest.expanduser(),
+        corpus_root=args.corpus_root.expanduser(),
         tiers=main_set.corpus_tiers or ("A", "D-A"),
         cache_dir=args.parsed_cache.expanduser(),
+        workers=args.workers,
     )
+    if failed:
+        print(
+            f"WARNING {len(failed)} document(s) could not be parsed and were not checked "
+            "(the eval run still guards the control answers): " + ", ".join(failed[:5]),
+            file=sys.stderr,
+        )
     set_of = {c.id: "main" for c in main_set.cases} | {c.id: "chat" for c in chat_set.cases}
     candidates = [
         c for c in (*main_set.cases, *chat_set.cases) if c.expected and c.id not in control_ids
@@ -385,7 +442,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     spec = {
         "seed": args.seed,
         "datasets": [main_set.name, chat_set.name],
-        "parsed": counts.get("parsed", 0),
+        "parsed": len(texts),
+        "unparsed": failed,
         "skipped": skipped,
         # 删过句的文档要重新切块、嵌入(其余文档嵌入走缓存):估价用。
         "touched": {"documents": len(touched), "chars": sum(len(texts[d]) for d in touched)},

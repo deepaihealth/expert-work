@@ -643,7 +643,11 @@ async def _run(
         with rls_tenant(EVAL_TENANT_ID):
             # B-206 11-09 难负例臂:解析后删掉答案句再切块,文件名不变;库另起名。
             deleting = (
-                {"parser": AnchorDeletingParser(anchors=plan.delete_anchors)}
+                {
+                    "parser": AnchorDeletingParser(
+                        anchors=plan.delete_anchors, guard=plan.guard_anchors
+                    )
+                }
                 if plan.delete_anchors
                 else {}
             )
@@ -664,6 +668,16 @@ async def _run(
             )
             if report.docs_ingested == 0:
                 raise SystemExit(f"no document ingested — check --corpus-root ({corpus_root})")
+            lost = [
+                f.filename
+                for f in report.ingest_failures
+                if f.error_type == "ControlAnchorDeletedError"
+            ]
+            if lost:
+                raise SystemExit(
+                    f"hard-negative deletion removes control answers in {len(lost)} document(s) "
+                    f"({', '.join(lost[:5])}); regenerate the spec with kb_hard_sets.py"
+                )
             # 控制面建库默认开重排;评测建库时没开,工具读的是库上的设置。
             await store.update_base(
                 tenant_id=EVAL_TENANT_ID,
@@ -698,7 +712,10 @@ async def _run(
                     "controls_without_gold": sum(1 for c in controls if not gold.get(c.id)),
                 }
                 if left or hard_negatives["controls_without_gold"]:
-                    print(f"WARNING hard-negative corpus: {hard_negatives}", file=sys.stderr)
+                    raise SystemExit(
+                        f"hard-negative corpus is not usable (deleted anchors still found / "
+                        f"control questions without their answer passage): {hard_negatives}"
+                    )
             retriever = build_retriever(
                 store=store,
                 embedder=bundle.embedder,

@@ -10,6 +10,8 @@ import yaml
 from kb_dataset import KbCase, KbExpected  # type: ignore[import-not-found]
 from kb_hard_sets import (  # type: ignore[import-not-found]
     AnchorDeletingParser,
+    ControlAnchorDeletedError,
+    corpus_texts,
     delete_anchor_units,
     entity_names,
     hard_negative_cases,
@@ -187,3 +189,93 @@ def test_pick_distractors_needs_the_entity_in_the_query_and_its_own_document() -
     assert [(p.case.id, p.entity, p.near) for p in picked] == [("d1", "益休", ("益舒",))]
     assert "「益舒」" in picked[0].note and "「益休」" in picked[0].note
     assert pick_distractors(cases, files, exclude_ids={"d1"}, n=5, seed=1) == []
+
+
+# ---------------------------------------------------------------------------
+# 11-09 评审:对照题的锚按「累计删句前后还在不在」核,不是按子串碰撞
+# ---------------------------------------------------------------------------
+
+_SHOP = "# 价目(合成)\n\n甲产品说明。乙产品售价一百元。丙产品重五斤。丁产品是蓝色的。\n"
+_CONTROL = [_case("c1", "丙产品", "shop.md", "售价一百元。丙产品重五")]
+
+
+@pytest.mark.parametrize(
+    "anchor",
+    [
+        "乙产品售价",  # 只删掉对照锚的前半句:旧的子串核对看不出
+        "一百元。丙产品",  # 跨两句整段删掉:旧的核对用换行拼句也看不出
+    ],
+)
+def test_a_deletion_that_breaks_a_control_anchor_is_skipped(anchor: str) -> None:
+    picked, skipped = pick_hard_negatives(
+        [_case("h1", "乙产品多少钱", "shop.md", anchor)],
+        _CONTROL,
+        {"shop.md": _SHOP},
+        n=3,
+        seed=1,
+    )
+    assert picked == [] and skipped == {"touches_control": 1}
+
+
+def test_control_anchors_are_checked_against_the_cumulative_deletion() -> None:
+    # 对照锚在文中出现两次;两道候选各删一处,单看都还剩一处,合起来就一处不剩
+    text = "# 合成\n\n说明一:戊产品保修两年。说明二:戊产品保修两年。\n"
+    control = [_case("c1", "戊", "w.md", "戊产品保修两年")]
+    candidates = [
+        _case("h1", "说明一", "w.md", "说明一戊产品保修"),
+        _case("h2", "说明二", "w.md", "说明二戊产品保修"),
+    ]
+    picked, skipped = pick_hard_negatives(candidates, control, {"w.md": text}, n=5, seed=1)
+    assert len(picked) == 1 and skipped == {"touches_control": 1}
+
+
+def test_an_anchor_that_normalises_to_nothing_deletes_nothing() -> None:
+    picked, skipped = pick_hard_negatives(
+        [_case("h1", "?", "a.md", "——————————")], [], _TEXTS, n=3, seed=1
+    )
+    assert picked == [] and skipped == {"anchor_not_found": 1}
+
+
+def test_the_parser_refuses_to_delete_a_guarded_control_anchor() -> None:
+    parser = AnchorDeletingParser(anchors=("乙产品售价",), guard=("售价一百元。丙产品重五",))
+    with pytest.raises(ControlAnchorDeletedError, match="售价一百元"):
+        parser("shop.md", _SHOP.encode("utf-8"))
+    # 护住的锚原本就不在这份文档里:照常删
+    assert "乙产品" not in AnchorDeletingParser(anchors=("乙产品售价",), guard=("别的锚文本",))(
+        "shop.md", _SHOP.encode("utf-8")
+    )
+
+
+def test_the_builder_reads_the_same_documents_the_eval_ingests(tmp_path: Path) -> None:
+    """11-09 评审:旧版用 kb_build_dataset.parse_corpus,同名文件只留一份、超长 PDF 跳过,
+    而评测建库两者都入 —— 选题时没看到的文档里可能正好有对照题的答案。"""
+    import csv
+
+    from kb_corpus_inventory import MANIFEST_FIELDS  # type: ignore[import-not-found]
+
+    root = tmp_path / "corpus"
+    for sub, text in (("a", "# 甲\n\n第一份。\n"), ("b", "# 乙\n\n第二份,同名。\n")):
+        (root / sub).mkdir(parents=True)
+        (root / sub / "x.md").write_text(text, encoding="utf-8")
+    (root / "a" / "big.md").write_text("# 长文\n\n页数很多。\n", encoding="utf-8")
+    (root / "a" / "copy.md").write_text("# 甲\n\n第一份。\n", encoding="utf-8")
+    manifest = tmp_path / "manifest.csv"
+    rows = [
+        ("a/x.md", "", "0"),
+        ("b/x.md", "", "0"),
+        ("a/big.md", "", "999"),  # parse_corpus 按页数跳过的那种
+        ("a/copy.md", "g1", "0"),
+        ("a/x2.md", "g1", "0"),  # 与 copy.md 同一重复组:评测只入第一份
+    ]
+    with manifest.open("w", encoding="utf-8", newline="") as fh:
+        writer = csv.DictWriter(fh, fieldnames=list(MANIFEST_FIELDS))
+        writer.writeheader()
+        for path, group, pages in rows:
+            row = dict.fromkeys(MANIFEST_FIELDS, "")
+            row.update(path=path, ext="md", size="10", tier="A", pages=pages, dup_group=group)
+            writer.writerow(row)
+    texts, failed = corpus_texts(
+        manifest=manifest, corpus_root=root, tiers=("A",), cache_dir=tmp_path / "cache", workers=1
+    )
+    assert sorted(texts) == ["a/big.md", "a/copy.md", "a/x.md", "b/x.md"]
+    assert "第二份" in texts["b/x.md"] and failed == []

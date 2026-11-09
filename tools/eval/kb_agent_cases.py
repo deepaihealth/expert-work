@@ -108,6 +108,8 @@ class RunPlan:
     cases: list[tuple[str, KbCase]]
     notes: dict[str, str]
     delete_anchors: tuple[str, ...] = ()
+    #: 难负例轮里对照题的答案锚:建库删句删掉其中任何一条就停(11-09 评审)。
+    guard_anchors: tuple[str, ...] = ()
     distractors: int = 0
 
 
@@ -120,6 +122,7 @@ def plan_run(args: argparse.Namespace, main_set: KbDataset, chat_set: KbDataset)
             cases=control + hard_negative_cases(spec),
             notes=dict(spec.notes),
             delete_anchors=spec.anchors,
+            guard_anchors=tuple(dict.fromkeys(e.anchor for _l, c in control for e in c.expected)),
         )
     if not args.distractors:
         return RunPlan(cases=picked, notes={})
