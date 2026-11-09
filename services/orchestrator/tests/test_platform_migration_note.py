@@ -18,6 +18,7 @@ from langchain_core.runnables import RunnableConfig
 
 from orchestrator.graph_builder.builder import WORKSPACE_MIGRATION_NOTE
 from orchestrator.tools.registry import (
+    WORKSPACE_CLEANED_KEY,
     WORKSPACE_MIGRATED_KEY,
     ToolContext,
     ToolRegistry,
@@ -89,3 +90,36 @@ def test_the_note_is_plain_platform_text() -> None:
     assert note.isascii()
     for fragment in ("/workspace", "/agent/", "uploads", "inputs", "tool results"):
         assert fragment in note
+
+
+@pytest.mark.parametrize(
+    ("configurable", "expected"),
+    [
+        ({WORKSPACE_CLEANED_KEY: True}, 1),
+        ({}, 0),
+        ({WORKSPACE_CLEANED_KEY: True, "child_run": True}, 0),
+    ],
+    ids=["cleaned-run", "ordinary-run", "child-run"],
+)
+async def test_the_cleanup_note_appears_only_on_the_run_after_a_cleanup(
+    configurable: dict[str, Any], expected: int
+) -> None:
+    """B-282 —— 工作目录闲置被清之后的第一轮:平台段里一句一次性说明(子代不看)。"""
+    from orchestrator.graph_builder.builder import WORKSPACE_CLEANED_NOTE
+
+    registry = ToolRegistry()
+    registry.register(_Echo())
+    llm = _RecordingLLM(responses=[_tool_turn("echo")])
+
+    await _run(llm, registry, **configurable)
+
+    for prompt in llm.seen_prompts:
+        assert _text(prompt).count(WORKSPACE_CLEANED_NOTE) == expected
+
+
+def test_the_cleanup_note_is_plain_platform_text() -> None:
+    from orchestrator.graph_builder.builder import WORKSPACE_CLEANED_NOTE
+
+    assert WORKSPACE_CLEANED_NOTE.isascii()
+    for fragment in ("/workspace", "artifacts", "upload it again"):
+        assert fragment in WORKSPACE_CLEANED_NOTE

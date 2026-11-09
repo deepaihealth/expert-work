@@ -25,21 +25,25 @@ from expert_work.persistence import (
     RENDERED_FIGURE_UNIT_PREFIX,
     WORKSPACE_OVERFLOW_DIR,
 )
+from expert_work.protocol.multimodal import ImageRef
 from expert_work.runtime.middleware import (
     LLMClientError,
     LLMNetworkError,
     LLMRateLimitError,
     LLMServerError,
 )
+from expert_work.runtime.storage import InMemoryObjectStore
 from orchestrator.llm import (
     HTTPOpenAIClient,
     OpenAIProvider,
     RecordingOpenAIClient,
 )
 from orchestrator.multimodal import (
+    UPLOAD_IMAGE_GONE_TEXT,
     DispatchingImageResolver,
     InMemoryImageResolver,
     NasWorkspaceImageResolver,
+    ObjectStoreImageResolver,
     ResolvedImage,
     image_ref_block,
 )
@@ -626,7 +630,8 @@ async def test_every_workspace_image_missing_still_calls_the_model(tmp_path: Pat
 
 @pytest.mark.asyncio
 async def test_an_upload_ref_that_fails_to_resolve_still_raises(tmp_path: Path) -> None:
-    """回归钉:上传图的失败行为不在这次改动范围里 —— 异常原样抛出,一个字不改。"""
+    """回归钉:上传图除了「字节不在了」(B-283,见下一条)以外的失败照旧原样抛出 ——
+    这里是解析器本身认不出这条 ref。"""
     uri = f"expert_work://image/{uuid4()}/{uuid4()}/{uuid4()}.png"
     client = RecordingOpenAIClient(response={"choices": [{"message": {"content": "ok"}}]})
     provider = OpenAIProvider(
@@ -639,6 +644,43 @@ async def test_an_upload_ref_that_fails_to_resolve_still_raises(tmp_path: Path) 
             tools=[],
         )
     assert client.calls == []
+
+
+@pytest.mark.asyncio
+async def test_an_upload_image_past_retention_degrades_and_the_model_is_still_called() -> None:
+    """B-283 —— 上传图的字节被留存清理删了:那张图换成一句文字,另一张照常,模型照常被调用。
+
+    不降级的话这里抛 ``ObjectNotFoundError`` —— 而这条 ref 写在会话历史的用户消息里,
+    以后每一轮都会重新解析,会话从此每一轮都失败。
+    """
+    tenant, thread = uuid4(), uuid4()
+    gone = ImageRef(tenant_id=tenant, thread_id=thread, image_id=uuid4(), ext=".png")
+    kept = ImageRef(tenant_id=tenant, thread_id=thread, image_id=uuid4(), ext=".png")
+    store = InMemoryObjectStore()
+    await store.put(kept.storage_key, b"\x89PNG\r\n\x1a\nkept")
+    resolver = DispatchingImageResolver(uploads=ObjectStoreImageResolver(store=store))
+    client = RecordingOpenAIClient(response={"choices": [{"message": {"content": "ok"}}]})
+    provider = OpenAIProvider(client=client, model="gpt-4o", image_resolver=resolver)
+
+    await provider.complete(
+        messages=[
+            HumanMessage(
+                content=[
+                    {"type": "text", "text": "看看这两张"},
+                    image_ref_block(gone.to_uri()),
+                    image_ref_block(kept.to_uri()),
+                ]
+            )
+        ],
+        tools=[],
+    )
+
+    assert len(client.calls) == 1
+    content = client.calls[0]["messages"][0]["content"]
+    assert content[0] == {"type": "text", "text": "看看这两张"}
+    assert content[1] == {"type": "text", "text": UPLOAD_IMAGE_GONE_TEXT}
+    assert content[2]["type"] == "image_url"
+    assert len(content) == 3
 
 
 @pytest.mark.asyncio

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from datetime import datetime
 from typing import cast
 from uuid import UUID
@@ -13,6 +14,7 @@ from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from expert_work.persistence.bulk_delete import count_where, delete_in_chunks, delete_where
 from expert_work.persistence.curation.base import (
     CurationCandidateStore,
     EvalDatasetInUseError,
@@ -466,3 +468,28 @@ class SqlCurationCandidateStore(CurationCandidateStore):
             result = await session.execute(stmt)
             await session.commit()
         return int(getattr(result, "rowcount", 0) or 0)
+
+    async def count_for_agent(self, *, tenant_id: UUID, agent_name: str) -> int:
+        return await count_where(
+            self._sf,
+            CurationCandidateRow,
+            CurationCandidateRow.tenant_id == tenant_id,
+            CurationCandidateRow.agent_name == agent_name,
+        )
+
+    async def delete_for_agent(self, *, tenant_id: UUID, agent_name: str) -> int:
+        return await delete_where(
+            self._sf,
+            CurationCandidateRow,
+            CurationCandidateRow.tenant_id == tenant_id,
+            CurationCandidateRow.agent_name == agent_name,
+        )
+
+    async def delete_for_threads(self, *, tenant_id: UUID, thread_ids: Sequence[UUID]) -> int:
+        return await delete_in_chunks(
+            self._sf,
+            CurationCandidateRow,
+            CurationCandidateRow.thread_id,
+            list(thread_ids),
+            CurationCandidateRow.tenant_id == tenant_id,
+        )

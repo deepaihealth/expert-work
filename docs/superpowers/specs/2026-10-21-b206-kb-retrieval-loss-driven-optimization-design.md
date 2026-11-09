@@ -4,6 +4,7 @@
 - **v2 修订记录(2026-10-21)**:用户要求「对整个设计重新调研和评估,确保合理性,该细化的细化」+「不要只针对 qwen,会有不同厂家的向量 / 重排模型;文档也不只有示例和评测集」。第二轮调研五路(切块与父子块 / 查询侧与关键词路 / 重排与结果呈现 / 智能体检索与索引增强 / 各厂商嵌入与重排接口),都读原文;仓库现状逐条重核;ERB 正确文档的结构形态新算了一遍。改动汇总见 §0。
 - **v2.1(2026-10-21 晚)**:用户「WeKnora 是目前比较火的知识库项目,深度探索一下,有什么可以参考借鉴」→ 四路深读本机 `/Users/mac/src/github/WeKnora`(v0.8.3,2026-10-21,Go)入库切块 / 检索流水线 / 智能体工具层 / 前端管理面,逐条 file:line,借鉴清单见 §5.6,已并进对应 K 项与 §6;同时核实阿里云 RDS 插件表:**`pg_textsearch`(BM25)在 PG 17 / 18 可装、PG 16 不可**,K-9 改成两条路。
 - **v2.2(2026-10-26)**:K-11 首版开发集没过闸门(29% 的上下文写成英文;新挤到答案前面的 46 条里 43 条来自别的文档)→ 提示词业界调研(约 15 家 + 论文)→ K-11 第二版(§5.3 K-11 条改写,小测已过);用户「深挖 WeKnora 仓库,看看有没有其他可以借鉴的地方」→ 二次深读(`97d7f0ad7`,10-26),顺带查出**解析层两个大缺口**:表格(合并单元格只第一行有值、空格子写成 `NaN`、百分比读成小数)、Word 标题丢失(85% 的段没有标题路径)。新增 K-18~K-22,其余并进已有条目,清单见 §5.7。
+- **v2.3(2026-11-06)**:用户问「有没有比 HyDE 更好的做法,行业最佳实践是什么」→ 查询侧再调研,只查 v2 之后(2025 末~2026)的新证据和 v2 没覆盖的方向(问题门控、强化学习训练的改写器、聊天模型 / 推理型重排、学习型稀疏、主流产品现状),都读原文。**结论:v2 的方向不变**(不做 HyDE、K-10 降预期、原问题必留);新增 K-14 ④「聊天模型重排 vs 不重排」对照,K-10 / K-16 / §7 补依据。详见 §5.8。
 - **与 B-175 的关系**:K-2(读文档)、K-12(生成问题)、K-13(列文档)、K-15(元数据抽取)是 [B-175 设计](2026-10-10-b175-knowledge-base-v2-design.md) 里计划过、一直没做的能力;本文给出评测证据和先后顺序,开工时按本文的批次走,B-175 对应条目以本文为准。B-175 §3.2「Anthropic 实测 HyDE 效果差」是误读,已更正(见 §8.3)。
 - **用户约束**:① 方案必须**通用**,不能只针对某批资料设计(10-20);② 参考开源项目与行业最佳实践(10-20);③ 加父子块要同时设计 **Web 前端怎么展示**(10-20);④ 评测集只用来诊断,不拿来调参数(10-18 拍板,开发验证仍用华大题);⑤ **不能只针对阿里云 qwen 系列**,平台会接不同厂家的向量模型和重排模型(10-21);⑥ **文档形态不只示例资料和评测集**(10-21)。
 - **依据**:
@@ -250,6 +251,7 @@ D 组 46 题里 19 题我方答案其实写了被判缺的内容(有的近乎逐
 - 代价:几乎为 0(DashScope `instruct` 按查询条数计 token);一个新客户端;阈值重标一次。
 - 判据:华大开发集召回层 mrr@10 / chk_hit@10 不退且向量路单独 mrr 上升;阈值重标后无答案拒答率不变、误拒不升。
 - **10-21 开工前实测更正(DashScope `text-embedding-v4`,同一句中文查询,两个接口各调一遍,花费 < ¥0.001)**:① `text_type=query` / `document` / 不带,三者向量**逐位相同**(原生口、兼容口都是)—— v4 上 `text_type` 单独不起作用;② 兼容口请求体顶层带 `"instruct": "<任务说明>"` 会改变查询向量(与不带余弦 0.9185),且与原生口 `text_type=query` + `instruct` 完全相同;放进 `parameters` 里兼容口不认;③ 原生口 `text_type=document` + `instruct` 无效果 → 文档侧不变。**所以阿里 v4 = 「查询侧指令字段」,走现有兼容口即可,不用新增原生口客户端;文档侧不变 → 不进嵌入指纹、不用重新入库**;目录里 qwen 条目的 `text_type=query / document` 写错了,随 K-5 改。WeKnora 注释说两者都改变文档向量,与实测不符。
+- **v2.3(11-06)**:Qwen3-Embedding / Reranker 模型卡写「查询不加指令约掉 1%~5%」、多语言场景建议指令用英文;但阿里 v4 在我们开发集上 A/B 无收益(#1895,10-22:带重排 mrr@10 0.945→0.945,纯向量 0.797→0.793),所以 **v4 不开、机制保留给别家模型**,这条没有新动作;接入自部署 Qwen3 等「前缀型」模型时再按模型 A/B。
 
 **K-6 搜索工具说明定稿** —— S
 
@@ -279,7 +281,7 @@ D 组 46 题里 19 题我方答案其实写了被判缺的内容(有的近乎逐
   - **单视图**(K-14 的结论先用):每次检索调一次重排,不再调两次——`qwen3-vl-rerank` 600 RPM 的等效容量翻倍。
   - 通用「Cohere 风格」重排客户端(`POST …/rerank`,`{model, query, documents, top_n}` + `return_documents`):Cohere(`/v2/rerank`)、Jina、Voyage(`top_k`)、SiliconFlow、智谱、千帆、vLLM / TEI / Xinference 自部署都是这个形状,参数名的小差异(`top_n` / `top_k`、分数字段名)用适配表;Google(`topN`、`title` 独立字段)、Bedrock(`numberOfResults`)各一个薄适配;火山、腾讯没有 `top_n`、回一一对应的分数,也走适配。没有重排接口的厂商(OpenAI)仍用 `llm` 档。
 - 依据(v2 核实,阿里 2026-10-12 / 10-19 文档):限流 `qwen3-rerank` 5,400 RPM、`qwen3-vl-rerank` 600、`gte-rerank-v2` 5,040、`qwen3.7-text-rerank` 3,000;价格前三 ¥0.5 / 百万 token;单次总 token 上限 120,000,超限 HTTP 400 不截断;`instruct` 参数三个 qwen 重排都支持(建议英文);**没有批量 / 异步重排接口**;错误码文档对 429 建议「匀速调度、指数退避或请求队列缓冲」。评测第二轮实际出现 4 次 429、3 题受影响。
-- 厂商:核心就是厂商中立字段;`llm` 档(聊天模型排序)保留给没有重排接口的厂商。
+- 厂商:核心就是厂商中立字段;`llm` 档(聊天模型排序)保留给没有重排接口的厂商。**v2.3**:`llm` 档是否值得保留要看 K-14 ④ 的对照结果,不再默认当作专用重排的等价退路(§5.8)。
 - 形态:无关。
 
 **K-8 嵌入报错** —— S
@@ -312,6 +314,10 @@ D 组 46 题里 19 题我方答案其实写了被判缺的内容(有的近乎逐
 - 形态:Ⓑ Ⓔ(口语、内部术语多)最容易被扩写带偏 → 判据按题看。
 - 代价:每次检索多一次小模型调用(0.5~2 s,并行);token 可忽略。
 - 判据:华大真实问法集 172 题 mrr@10 上升;**逐题看「原来对、现在错」的数 ≤ 3**;两种融合择优;不达标只留原问题 + 换说法两路或整条不上。
+- **v2.3 补充(11-06,§5.8)**:
+  - 新证据都指向「强检索器 + 重排之上,查询侧改写收益接近 0」:2026-04 统一条件复现(2604.27421)生成式扩写只在 BM25 上 +10 点,换 SPLADE++ 后原问题最高、所有改写都更低;Azure(2024-11)在混合 + 语义重排之上开查询改写 NDCG@3 只 +1.7 / 0.0;Elastic(2026-01)混合检索加改写 recall@50 只 +1~3 点、去掉原问题平均变差;Adobe(2603.13301)替换原问题在术语规范的集上 −9.0%。
+  - 改法:**优先试关键词一路**(OpenAI `rewrite_query`、RAGFlow「关键词分析」都是这种形态),换说法一路只对口语、多轮问题可能有用;融合 A/B 加一组 **Onyx 权重**(原问题 0.5 / 改写 1.3 / 关键词 1.0)作对照;问题里有编号、引号短语、型号时**不改写**(Azure 文档明确提醒改写会丢精确词)。
+  - **不做「先判断要不要改写」的门控模型**:2603.13301 门控 AUC 0.593、每条都选对的理论上限也只 +3 个百分点;2504.01101 收益边缘且跨数据集不稳。只保留上面那条规则。
 
 **K-11 入库时给每段写一句上下文(上下文化切块)** —— L,要重新入库,**开发集验过才上;上线形态 10-26 拍板(见本条末)**
 
@@ -355,9 +361,15 @@ D 组 46 题里 19 题我方答案其实写了被判缺的内容(有的近乎逐
   - ② 重排候选池从合并后前 50 加到前 100(按模型 `max_documents` 封顶,总 token 按 `max_total_tokens` 卡)。
   - ③ 若双视图保留:两个视图都在整池上打分,或把 `_TITLED_VIEW_WEIGHT` 0.7 降到 0.3~0.5。
 - 依据(v2 核实):重放(§2.4):合并后掉出前 50 的 21 对全部在前 100 内;被带标题视图截掉 13 对(含重排池前 16 的 3 对);诊断里标题相似的干扰文档占先的题(0384 / 0400 / 0354 / 0447 / 0082 / 0404)。**双视图加权没有任何外部先例**;Cohere 最佳实践把 Title / Date / Content 以 YAML 拼成一个文档一次打分;Onyx 把 title / metadata 与正文一起送模型选段;Qwen3-Reranker 的训练输入就是「指令 + 查询 + 文档」单串。
-- 厂商:①③ 对 `llm` 档(聊天模型排序)同样适用;② 按模型上限。形态:无关。
+- 厂商:①③ 对 `llm` 档(聊天模型排序)同样适用;② 按模型上限。形态:无关。**v2.3**:`llm` 档本身是否比不重排好,见 ④。
 - 代价:① 调用减半;② 每次重排 token 翻倍(换纯文本模型后 ¥0.5 / 百万 token,可忽略)。
 - 判据:华大主集带重排 mrr@10 ≥ 0.914、精确编号 ≥ 0.958(PR2b 前的水平)、真实问法集 ≥ 0.885;ERB 复测时 §2.4 的 34 对回收数。
+- **10-22 结果(总计划 §2.1)**:② 池 100 上线;① 单视图让精确编号组 mrr 0.917→0.699,**默认保留双视图**,单视图 / 清洗 / 指令留作内部选项。
+- **④ 聊天模型重排对照(v2.3 新增,11-06)**:
+  - 现状:租户或平台把聊天模型配成重排模型时(没有重排接口的厂商,少见配置),走 `LLMReranker`(`orchestrator/tools/llm_reranker.py`):**全部候选一次塞进一个请求、每条截 600 字符、只要一个排序数组、没有分数**。
+  - 外部证据:Voyage(2025-10,厂商自测 13 个真实数据集)在强向量检索(81.58)之上,Qwen3-32B 列表排序**降到 80.63**、Gemini 2.0 Flash 降到 79.49;一次塞 100 条比滑动窗口差 22%~27%;2508.16757(EMNLP Findings 2025)没见过的新问题上各类重排都掉 5%~15%。反例:Onyx PR #16919(2026-10-30,实验分支、作者注明未上线)让 LLM 一次看完候选、**每段给相关概率**选段,ERB 500 题 78.05→81.66。
+  - 改什么:开发集上三组对比 —— 不重排(融合序)/ 现在的 `LLMReranker` / 逐段打相关概率(Onyx 式)。聊天模型选平台默认小模型和一个强模型各一组。
+  - 判据:`LLMReranker` 不比「不重排」好 → `llm` 档默认改成不重排(设置页提示「该模型不支持重排,已按检索分排序」);逐段打分明显好且延迟可接受 → 换成它。花费跑前报价。
 
 **第二梯队取舍(重放后定)**:
 1. **K-14 先做**(批 1 就带 ①②):有重放数据直接支撑、改动小、顺手减半重排调用;
@@ -378,7 +390,7 @@ D 组 46 题里 19 题我方答案其实写了被判缺的内容(有的近乎逐
 
 **K-16 稀疏向量** —— L,要重新嵌入,**K-9 之后再评估**
 
-- 依据(v2 数字更正):BGE-M3 论文 Table 3 MLDR 中文长文档 nDCG@10:BM25 34.6 / 稠密 26.0 / 稀疏 40.5 / 稠密 + 稀疏 42.0;Table 11:Lucene 分词的 BM25 均值 64.1 **高于** M3 稀疏 62.2;MIRACL 中文稀疏单独只 35.4(稠密 74.6)。即稀疏向量的收益主要是「替代 BM25」而非叠加,做完 K-9 后增量可能很小。可行性:pgvector 0.7 起有 `sparsevec`(HNSW 只支持 ≤ 1,000 个非零元素),RDS 是 0.8.0;厂商支持见表 5-A——**API 侧只有阿里原生口返回稀疏向量**(`dense&sparse`,新模型 qwen3.7-text-embedding 自称「类 SPLADE」),OpenAI / Cohere / Jina / Voyage / Google / 智谱 / 火山 / 千帆 / 混元都没有;自部署 bge-m3(`return_sparse`)、TEI `/embed_sparse` 才有。
+- 依据(v2 数字更正):BGE-M3 论文 Table 3 MLDR 中文长文档 nDCG@10:BM25 34.6 / 稠密 26.0 / 稀疏 40.5 / 稠密 + 稀疏 42.0;Table 11:Lucene 分词的 BM25 均值 64.1 **高于** M3 稀疏 62.2;MIRACL 中文稀疏单独只 35.4(稠密 74.6)。即稀疏向量的收益主要是「替代 BM25」而非叠加,做完 K-9 后增量可能很小。可行性:pgvector 0.7 起有 `sparsevec`(HNSW 只支持 ≤ 1,000 个非零元素),RDS 是 0.8.0;厂商支持见表 5-A——**API 侧只有阿里原生口返回稀疏向量**(`dense&sparse`,新模型 qwen3.7-text-embedding 自称「类 SPLADE」),OpenAI / Cohere / Jina / Voyage / Google / 智谱 / 火山 / 千帆 / 混元都没有;自部署 bge-m3(`return_sparse`)、TEI `/embed_sparse` 才有。**v2.3 更正(11-06)**:「学习型稀疏在中文上弱」只对 BGE-M3 成立 —— MILCO(ICLR 2026,2510.00671)MIRACL 18 种语言平均 72.3,比 BGE-M3 稀疏高 34.1%、比 Qwen3-Embed-8B 高 3.6%,中文 +8.09%;但它只能自部署、没有托管 API,**结论(K-9 之后再评估、靠 `supports_sparse` 能力字段)不变**。
 - 厂商:强依赖厂商与部署形态 → 作为能力字段 `supports_sparse`,没有就不做,混合检索的词法那一路靠 K-9 的 BM25。
 
 **K-17 大库性能体检** —— S~M,某租户超约 10 万段时触发
@@ -510,6 +522,40 @@ D 组 46 题里 19 题我方答案其实写了被判缺的内容(有的近乎逐
 
 **查过、不借(我们相当或更好)**:加权融合(它的 RRF 曾按列表拼接顺序排,`04adc1327` 才修);重排带标题(我们双视图有实测,K-14);阈值绑重排模型(K-7b);「候选都没过门槛」的提示(已有);关键词检索(OR + 覆盖计分 + 停用词 + jieba ≈ 它的 OR + BM25,真 BM25 是 K-9);嵌入失败降级(K-8);识别清洗(`recognition/cleaning.py` 已引 WeKnora 与 olmOCR);补前后文(K-1);编号行当切点(`chunking.py` 同款);按文档分组(K-4 实测变差,暂缓);工具说明(K-6 有实测,它没有);查询扩展(它只在关键词侧去停用词,弱于 K-10);产品内评测(它近期的修复 `29c52b034` / `9e6fee362` 是指标恒为 0);多轮改写与意图路由(只在它的对话模式,我们是智能体自己写检索词);分段编辑与启停(B-175 P3 已排);知识图谱 / 自动生成百科 / FAQ 库 / 记忆(§7 与用户 10-21 已排除)。
 
+### 5.8 11-06 查询侧再调研(v2.3)
+
+用户 11-06「有没有比 HyDE 更好的做法,看看行业内的最佳实践」。只查 v2 之后的新证据和没覆盖的方向;v2 已引的(2407.01219、2309.08541、2505.12694、query2doc、RAG-Fusion、2210.11934、Weaviate、Anthropic 上下文检索、T2-RAGBench、Doc2Query--、WeKnora)不重读。网页用无头浏览器读原文,Onyx / RAGFlow 读源码与 PR。
+
+**结论**:在「强嵌入 + 混合检索 + 重排」上,没有哪种查询侧技术稳定地明显好于 HyDE,因为这层本身收益就很小;拉开差距的是重排和底层检索器质量。v2 方向不变,改动落在 K-10 / K-14 ④ / K-16 / §7 / §8.3。
+
+| 方向 | 新证据(数字 · 基准 · 出处 · 日期) | 对我们 |
+|---|---|---|
+| 生成伪文档(HyDE、Query2doc、MUGI) | 2604.27421(2026-04,GPT-4.1,9 个数据集统一条件):BM25 在 BEIR 6 集 nDCG@10 0.421→0.525;**SPLADE++ 上原问题 0.539 最高**,改写 0.513~0.521;BGE-base 多在 ±1~3 点。2504.14175:收益来自「知识泄漏」 | 继续不做(§7) |
+| 单次改写替换原问题 | 2603.13301(Adobe,2026-03):FiQA −9.0%(p<0.001)、TREC-COVID +5.1%(边缘显著)、SciFact 无差异;改写把语料里原有的术语换掉就变差 | 原问题必留(K-10 不变) |
+| 多路查询 + 保留原问题 | Elastic(2026-01-30):关键词扩充对 BM25 只 +1 点,混合 + 改写 recall@50 +1~3 点,调权线性组合优于 RRF(权重在测试集上调,属上限);Azure(2024-11-19):混合 + 语义重排之上开改写 NDCG@3 +1.7 / 0.0,纯关键词 +3.5 / +4.0 | K-10 最小形态 A/B,优先关键词一路 |
+| 「要不要改写」门控 | 2603.13301 AUC 0.593、上限 +3 点;2504.01101 边缘;2604.22661(2026-04)检索前轻量预测器挑改写版本常不输检索后的,但「检索最好」与「答案最好」常不是同一版本 | 不做(§7) |
+| 训练改写器 / 搜索智能体 | Search-R1 +20%~41%(维基语料)、DeepRetrieval、s3、ConvSearch-R1、AdaQR(2510.21727,BRIGHT 成本 −28%、检索 +7%) | 与厂商中立冲突,不做(§7) |
+| 专用重排 | Azure:混合 + 语义重排 NDCG@3 +23 / +19,比改写大一个数量级;Voyage rerank-2.5(2025-10,厂商自测)81.58→83.02,候选 50 条→84.4、超过 100 条收益递减;Qwen3-Reranker 模型卡 CMTEB-R:0.6B 嵌入 71.02,加 0.6B 重排只到 71.31、8B 到 77.45 | 已做(K-7 / K-14 池 100);弱重排可能白加 |
+| 聊天模型当重排 | Voyage(2025-10):强检索之上反降 1~2 点,一次塞 100 条差 22%~27%;Onyx PR #16919(2026-10-30,未上线)逐段概率选段 78.05→81.66 | **新增 K-14 ④ 对照** |
+| 指令式 / 推理型重排 | Voyage rerank-2.5 加领域指令 24 个内部集 +8.13%;Cohere Rerank 5(2026-10-21)明确不支持指令;ReasonRank BRIGHT 40.6 | 指令「有则用」(K-14 已有内部选项);推理型不作默认(§7) |
+| 学习型稀疏 | MILCO(ICLR 2026)MIRACL 平均 72.3,中文 +8.09% | 只能自部署,K-16 结论不变 |
+
+**主流产品实际上线的形态**(都读过原文):
+
+| 系统 | 查询侧 |
+|---|---|
+| OpenAI 向量库检索 | `rewrite_query` **默认关**,示例是把口语压成关键词;混合检索 RRF |
+| Azure AI Search | 查询改写仍是预览,最多 10 条、**与原问题一起检索**、文档提醒会丢编号;智能体检索的 LLM 规划仍是预览 |
+| AWS Bedrock 知识库 | 可选 `QUERY_DECOMPOSITION`;新的智能体检索接口迭代检索 |
+| Google Vertex AI Search | `queryExpansionSpec` **默认 DISABLED** |
+| Onyx | 语义改写 1.3 / 关键词 1.0 / 模型自写 0.7 / 原问题 0.5,加权 RRF(k = 50);同一轮重复搜索跳过扩写;不用交叉编码器;没有 HyDE |
+| RAGFlow | 「关键词分析」开关(文档建议开关都测);关键词 + 向量加权;重排候选默认 64;没有 HyDE |
+| Dify | 知识检索节点不改写,改写放在 Agent 节点里自己搭 |
+
+共同点:**没有一家把 HyDE 设为默认**;改写都是可选、保留原问题、偏关键词;重心都在混合召回 + 重排。
+
+**没核实到**:Glean 的查询理解(只有营销材料);pgvector / RDS 上能否原生做 ColBERT 的 MaxSim;ReasonRank 的绝对延迟;Cohere Rerank 5 的 BRIGHT 分是它自定义指标,不能和论文 nDCG 直接比。
+
 ---
 
 ## 6. Web 前端展示(K-1 / K-2 / K-4 / K-11 / K-12 落地时同步做)
@@ -545,7 +591,11 @@ D 组 46 题里 19 题我方答案其实写了被判缺的内容(有的近乎逐
 | RAPTOR 分层摘要 | 「+20%」是 RAPTOR + GPT-4 对别家旧模型(82.6 vs 62.3);**同读者受控对比只 +2.0(vs DPR)/ +5.1(vs BM25)**;收益在单篇长文综合,不是我们丢分的地方;建库成本高 |
 | 迟分块(late chunking) | 要逐词向量再池化(Jina 原文),只给一个最终向量的 API 不支持;厂商中立的平台不能依赖 |
 | 文档摘要索引 / 通用摘要 | Anthropic 原话:「adding generic document summaries to chunks (we experimented and saw very limited gains)… summary-based indexing (we evaluated and saw low performance)」 |
-| HyDE | 《Best Practices》里 HyDE 是最强单项(+5.2 nDCG)**但延迟 2.6 s → 7.2 s**,且对强检索器 / 内部术语有害(2309.08541、2505.12694);T2-RAGBench 上 HyDE 低于稠密基线。**v2 理由改为「收益不稳 + 延迟 3 倍」**,不再说「效果差」 |
+| HyDE / Query2doc 类生成伪文档 | 《Best Practices》里 HyDE 是最强单项(+5.2 nDCG)**但延迟 2.6 s → 7.2 s**,且对强检索器 / 内部术语有害(2309.08541、2505.12694);T2-RAGBench 上 HyDE 低于稠密基线。**v2 理由改为「收益不稳 + 延迟 3 倍」**,不再说「效果差」。**v2.3 补充**:2604.27421(2026-04,统一条件)换 SPLADE++ 后所有改写都低于原问题,稠密检索多在 ±1~3 点;2504.14175(ACL Findings 2025)扩写有效的前提是模型生成的文字里本来就有标准证据(「知识泄漏」)—— 租户私有资料正是模型不知道答案的那类。唯一正面新数据是 Elastic(2026-01)把伪答案只加到关键词一路、保留原问题,recall@50 +1~3 点,但测的是公开数据集、有泄漏风险 |
+| 「要不要改写」的门控模型 / 查询性能预测(v2.3) | 2603.13301:门控 AUC 0.593,每条都选对的理论上限 +3 个百分点;2504.01101:收益边缘且跨数据集不稳。K-10 只留「有编号 / 引号 / 型号不改写」的规则 |
+| 训练专用改写器或搜索智能体(Search-R1、DeepRetrieval、s3、ConvSearch-R1、AdaQR、蒸馏扩写模型)(v2.3) | 收益真实(Search-R1 7 个问答集 +20%~41%),但都要按「检索器 × 语料」训练、自己部署,换一家嵌入就要重训,与「厂商中立、多租户」冲突;蒸馏扩写(2603.13776)只测了 BM25 |
+| 检索工具内部固定加一步「拆问题」(v2.3) | 我们是智能体平台,智能体多次调用检索本身就在拆;Azure 智能体检索的 LLM 规划仍是预览(2026-04 正式版只开放跳过规划的 minimal 档)、AWS 是可选项;BrowseComp-Plus(2508.06600)显示智能体代替不了检索器质量(GPT-5:BM25 55.9% → Qwen3-Embed-8B 70.1%) |
+| 推理型重排(Rank1、ReasonRank)作平台默认(v2.3) | 收益在推理密集型题(BRIGHT),普通企业事实问答收益不明且贵;进模型目录让租户自选,不作默认 |
 | 按时间自动降权 / 新版覆盖旧版 | 全国版与地区版政策可以并存;改成显示日期让模型判断(K-4) |
 | 激进的相似文档去重 | 会藏掉有冲突的版本;只去字节完全相同的 |
 | 不留原问题的纯扩写 | 对内部术语失效(K-10 必须留原问题一路) |
@@ -579,6 +629,7 @@ D 组 46 题里 19 题我方答案其实写了被判缺的内容(有的近乎逐
 - B-175 设计 §3.2「查询改写 / HyDE」一行写「Anthropic 实测 HyDE 效果差」:Anthropic 文章只**列举**了 HyDE,没有测;「效果低 / 收益有限」说的是摘要索引与通用文档摘要。已改(#1873),结论见 K-10 与 §7。
 - v1 → v2 引用更正:Doc2Query-- 的「+16% / −33%」是过滤 vs 不过滤(K-12);RAPTOR「+20%」是跨模型(§7);Onyx「±5 段」是模型分类后扩展(K-1);Onyx 找全题 59.0 是文档召回、正确率反降(K-6 / K-13);BGE-M3 MLDR 中文数字(K-16);RAGFlow 已重写为 Go,`rag/app/naive.py` 不存在(§11);NVIDIA 博客标题是《Finding the Best Chunking Strategy for Accurate AI Responses》;Dify 父子模式无重叠、「全文模式 10,000 token」只在文档没在源码;AtlasNav 不是「仍弱」(§7);榜单分档按 2026-10-20 更新(§1)。
 - v2 → v2.1 更正:「RDS 装不了任何 BM25 扩展」只对 PG 16 成立,`pg_textsearch` 1.3.1 在阿里云 RDS PG 17 / 18 可装(K-9 路 A);B-175 设计 §3.1 WeKnora 一行里「切块在 Python docreader」已过时,v0.8 起切块在 Go `internal/infrastructure/chunker/`。
+- v2.2 → v2.3 更正:§0 / K-14 依据里「Cohere / Onyx / Qwen 都是单串」—— Onyx 根本**不用交叉编码器重排**,是把标题 / 元数据与正文一起送 LLM 选段(`internal-search.md`,2026-10-30 又加了一次请求重排 100 段的「决策模型」);「单串」这一点仍成立,但不能读成 Onyx 用的是专用重排模型。
 
 ---
 
@@ -649,3 +700,4 @@ D 组 46 题里 19 题我方答案其实写了被判缺的内容(有的近乎逐
 - pgvector:https://github.com/pgvector/pgvector
 - ★ v2.1 WeKnora(本机 `/Users/mac/src/github/WeKnora`,HEAD e18fb23,2026-10-21,https://github.com/Tencent/WeKnora):`internal/infrastructure/chunker/{strategy,heading_splitter,validator,profiler,splitter}.go`、`internal/types/{chunk,knowledgebase,rerank,retrieval_config}.go`、`internal/reranking/{rerank,passage,mmr}.go`、`internal/models/api/{rerank,rerank_settings,embeddings,embeddings_settings}.go`、`internal/agent/tools/{search_knowledge,read_document,list_documents}.go`、`internal/agent/{grounding_prompt,observe}.go`、`internal/modelcontext/{model_output,citations}.go`、`config/prompt_templates/{agent_system_prompt,rewrite,generate_questions,generate_summary}.yaml`、`frontend/src/views/knowledge/settings/{KBChunkingSettings,KBChunkingDebug}.vue`、`website-docs/03-features/{04-chunking,04-rag-pipeline,05-retrieval-engines}.md`
 - ★ v2.1 RDS:插件列表 https://help.aliyun.com/zh/rds/apsaradb-rds-for-postgresql/plug-ins-1/(2026-09-23,`pg_textsearch` 行);大版本升级 https://help.aliyun.com/zh/rds/apsaradb-rds-for-postgresql/upgrade-the-major-engine-version-of-an-apsaradb-rds-for-postgresql-instance(2026-07-30);pg_textsearch https://github.com/timescale/pg_textsearch 、https://www.tigerdata.com/docs/learn/search/using-pg-textsearch
+- ★ v2.3 查询侧再调研(11-06):论文 2604.27421 https://arxiv.org/html/2604.27421 、2603.13301 https://arxiv.org/html/2603.13301 、2604.22661 https://arxiv.org/html/2604.22661 、2504.01101 https://arxiv.org/html/2504.01101 、2504.14175 https://arxiv.org/html/2504.14175 、2510.21727 https://arxiv.org/html/2510.21727v2 、2603.13776 https://arxiv.org/html/2603.13776 、2508.16757 https://arxiv.org/html/2508.16757v1 、ReasonRank https://arxiv.org/html/2508.07050 、ReasonIR https://arxiv.org/html/2504.20595 、BrowseComp-Plus https://arxiv.org/html/2508.06600 、MILCO https://arxiv.org/html/2510.00671v2 、Search-R1 https://arxiv.org/abs/2503.09516 、s3 https://arxiv.org/abs/2505.14146 、ConvSearch-R1 https://arxiv.org/abs/2505.15776 、DeepRetrieval https://arxiv.org/abs/2503.00223 ;厂商:Azure 改写与重排博客 https://techcommunity.microsoft.com/blog/azure-ai-services-blog/-/4302729 、Azure 查询改写 https://learn.microsoft.com/en-us/azure/search/semantic-how-to-query-rewrite 、OpenAI retrieval https://platform.openai.com/docs/guides/retrieval 、Bedrock https://docs.aws.amazon.com/bedrock/latest/userguide/kb-how-retrieval.html 、Vertex QueryExpansionSpec https://cloud.google.com/generative-ai-app-builder/docs/reference/rest/v1/QueryExpansionSpec 、Elastic https://www.elastic.co/search-labs/blog/query-rewriting-llm-search-improve 、Pinecone https://www.pinecone.io/blog/cascading-retrieval/ 、Perplexity https://research.perplexity.ai/articles/architecting-and-evaluating-an-ai-first-search-api 、Weaviate Query Agent https://weaviate.io/blog/query-agent 、Voyage《The case against LLMs as rerankers》https://mongodb.com/company/blog/technical/case-against-llms-as-rerankers 、Voyage rerank-2.5 https://mongodb.com/company/blog/product-release-announcements/rerank-2-5-and-rerank-2-5-lite-instruction-following-rerankers 、Cohere Rerank 5 https://cohere.com/blog/rerank-5 、Qwen3-Reranker-8B https://huggingface.co/Qwen/Qwen3-Reranker-8B 、LlamaCloud 检索模式 https://developers.llamaindex.ai/llamaparse/cloud-index/guides/retrieval/modes/index.md 、Dify https://docs.dify.ai/en/use-dify/nodes/knowledge-retrieval ;开源:Onyx PR https://github.com/onyx-dot-app/onyx/pull/16919 、RAGFlow `docs/guides/chat/chat_configuration.md`(2026-11-03)

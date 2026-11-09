@@ -139,11 +139,11 @@ async def test_retrieval_logs_past_retention_go_in_bounded_batches() -> None:
     assert await unwired._delete_expired_knowledge_retrieval_logs() == 0
 
 
-def test_job_rejects_non_positive_image_retention_days() -> None:
-    with pytest.raises(ValueError, match="image_retention_days"):
+def test_job_rejects_non_positive_upload_retention_days_for_images_too() -> None:
+    with pytest.raises(ValueError, match="upload_retention_days"):
         RetentionCleanupJob(
             db_session_factory=lambda: None,  # type: ignore[arg-type]
-            image_retention_days=0,
+            upload_retention_days=0,
         )
 
 
@@ -194,7 +194,7 @@ def test_job_rejects_non_positive_tenant_user_hard_delete_grace_days() -> None:
 
 @pytest.mark.asyncio
 async def test_delete_expired_images_purges_old_rows_and_object_keys() -> None:
-    """Rows older than ``image_retention_days`` get their object key
+    """Rows older than ``upload_retention_days`` (B-283: images share it) get their object key
     removed + are hard-deleted from the registry."""
     images = InMemoryImageUploadStore()
     object_store = InMemoryObjectStore()
@@ -238,7 +238,7 @@ async def test_delete_expired_images_purges_old_rows_and_object_keys() -> None:
         db_session_factory=lambda: None,  # type: ignore[arg-type]
         image_upload_store=images,
         object_store=object_store,
-        image_retention_days=90,
+        upload_retention_days=90,
     )
 
     rows, keys_ok, keys_failed = await job._delete_expired_images()
@@ -258,52 +258,93 @@ async def test_delete_expired_images_purges_old_rows_and_object_keys() -> None:
 
 
 @pytest.mark.asyncio
-async def test_delete_expired_images_continues_on_object_store_failure() -> None:
-    """A failed object-store delete is tallied + logged — the row is
-    still hard-deleted (orphaned key < stuck row whose bytes never go away)."""
+async def test_delete_expired_images_keeps_rows_whose_bytes_were_not_deleted(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """B-286 —— a key the store refuses to delete keeps its row for the next run (no job scans the
+    bucket for orphaned images, so a deleted row would strand its bytes forever); the other rows
+    still go, the pass is reported failed, and the log is one summary line with no keys."""
 
     images = InMemoryImageUploadStore()
     tenant = uuid4()
-    old_id = uuid4()
-    await images.insert(
-        image_id=old_id,
-        tenant_id=tenant,
-        thread_id=uuid4(),
-        user_id=None,
-        object_key="tenants/x/uploads/old.png",
-        size_bytes=3,
-        mime_type="image/png",
-        sha256="x",
-    )
-    images._rows[old_id] = images._rows[old_id].model_copy(
-        update={"created_at": datetime.now(UTC) - timedelta(days=200)},
-    )
+    stuck_id, done_id, absent_id = uuid4(), uuid4(), uuid4()
+    stuck_key = "tenants/x/uploads/stuck.png"
+    for image_id, key in (
+        (stuck_id, stuck_key),
+        (done_id, "tenants/x/uploads/done.png"),
+        (absent_id, "tenants/x/uploads/already-gone.png"),
+    ):
+        await images.insert(
+            image_id=image_id,
+            tenant_id=tenant,
+            thread_id=uuid4(),
+            user_id=None,
+            object_key=key,
+            size_bytes=3,
+            mime_type="image/png",
+            sha256="x",
+        )
+        images._rows[image_id] = images._rows[image_id].model_copy(
+            update={"created_at": datetime.now(UTC) - timedelta(days=200)},
+        )
+    store = InMemoryObjectStore()
+    await store.put("tenants/x/uploads/done.png", b"DONE", content_type="image/png")
+    await store.put(stuck_key, b"STUCK", content_type="image/png")
 
-    class _FailingStore:
+    class _RefusesOneKey(InMemoryObjectStore):
         async def delete(self, key: str) -> None:
-            raise RuntimeError("boom")
-
-        async def put(self, *args: object, **kwargs: object) -> None:
-            return None
-
-        async def get(self, key: str) -> bytes | None:
-            return None
-
-        async def list_prefix(self, prefix: str) -> list[str]:
-            return []
+            if key == stuck_key:
+                raise PermissionError("object locked")
+            await store.delete(key)
 
     job = RetentionCleanupJob(
         db_session_factory=lambda: None,  # type: ignore[arg-type]
         image_upload_store=images,
-        object_store=_FailingStore(),  # type: ignore[arg-type]
-        image_retention_days=90,
+        object_store=_RefusesOneKey(),
+        upload_retention_days=90,
     )
 
     rows, keys_ok, keys_failed = await job._delete_expired_images()
-    assert rows == 1
-    assert keys_ok == 0
-    assert keys_failed == 1
-    assert await images.get(image_id=old_id, tenant_id=tenant) is None
+
+    assert (rows, keys_ok, keys_failed) == (2, 2, 1)
+    assert await images.get(image_id=stuck_id, tenant_id=tenant) is not None
+    assert await images.get(image_id=done_id, tenant_id=tenant) is None
+    assert await images.get(image_id=absent_id, tenant_id=tenant) is None
+    assert await store.get(stuck_key) == b"STUCK"
+    assert job._failed_passes == ["images"]
+    failures = [r for r in caplog.records if "image_object_delete_failed" in r.getMessage()]
+    assert len(failures) == 1
+    assert "keys_failed=1 keys_ok=2 errors=PermissionError:1" in failures[0].getMessage()
+    assert stuck_key not in failures[0].getMessage()
+    assert failures[0].exc_info is None
+
+
+@pytest.mark.asyncio
+async def test_delete_expired_images_all_keys_deleted_is_not_a_failed_pass() -> None:
+    images = InMemoryImageUploadStore()
+    tenant, image_id = uuid4(), uuid4()
+    await images.insert(
+        image_id=image_id,
+        tenant_id=tenant,
+        thread_id=uuid4(),
+        user_id=None,
+        object_key="tenants/x/uploads/never-written.png",
+        size_bytes=3,
+        mime_type="image/png",
+        sha256="x",
+    )
+    images._rows[image_id] = images._rows[image_id].model_copy(
+        update={"created_at": datetime.now(UTC) - timedelta(days=200)},
+    )
+    job = RetentionCleanupJob(
+        db_session_factory=lambda: None,  # type: ignore[arg-type]
+        image_upload_store=images,
+        object_store=InMemoryObjectStore(),
+        upload_retention_days=90,
+    )
+
+    assert await job._delete_expired_images() == (1, 1, 0)
+    assert job._failed_passes == []
 
 
 @pytest.mark.asyncio
@@ -345,11 +386,18 @@ async def test_sweep_artifacts_soft_deletes_stale_active_rows() -> None:
         path_in_workspace="stale.md",
         created_in_thread="t-1",
     )
-    # Backdate ``updated_at`` to before the retention horizon.
+    # Backdate ``updated_at`` to before the retention horizon — and (B-63) its
+    # version, since a row's clock is its versions' last use.
     stale = (await artifacts.list_for_user(tenant_id=tenant, user_id=user, agent_key=_AGENT_KEY))[0]
     artifacts._artifacts[stale.id] = stale.model_copy(
         update={"updated_at": datetime.now(UTC) - timedelta(days=120)}
     )
+    artifacts._versions = [
+        v.model_copy(update={"created_at": datetime.now(UTC) - timedelta(days=120)})
+        if v.artifact_id == stale.id
+        else v
+        for v in artifacts._versions
+    ]
     # And a fresh row that must survive.
     await artifacts.save_version(
         tenant_id=tenant,
@@ -772,3 +820,35 @@ async def test_sweep_workspaces_hard_delete_failure_leaves_dependents_untouched(
     )
     assert await uploads.delete_all_for_user(tenant_id=tenant, user_id=user) == 1
     assert (await audit_store.query(AuditQuery(tenant_id=tenant))).entries == []
+
+
+@pytest.mark.asyncio
+async def test_images_use_the_upload_days_as_their_platform_default() -> None:
+    """B-283 —— 图片与附件同一个平台默认(``upload_retention_days``):租户没设时,两者在同一天到期。"""
+    images = InMemoryImageUploadStore()
+    store = InMemoryObjectStore()
+    tenant, image_id = uuid4(), uuid4()
+    await store.put("k", b"x", content_type="image/png")
+    await images.insert(
+        image_id=image_id,
+        tenant_id=tenant,
+        thread_id=uuid4(),
+        user_id=None,
+        object_key="k",
+        size_bytes=1,
+        mime_type="image/png",
+        sha256="x",
+    )
+    images._rows[image_id] = images._rows[image_id].model_copy(
+        update={"created_at": datetime.now(UTC) - timedelta(days=40)},
+    )
+    job = RetentionCleanupJob(
+        db_session_factory=lambda: None,  # type: ignore[arg-type]
+        image_upload_store=images,
+        object_store=store,
+        upload_retention_days=30,
+    )
+
+    rows, keys_ok, _failed = await job._delete_expired_images()
+
+    assert (rows, keys_ok) == (1, 1)

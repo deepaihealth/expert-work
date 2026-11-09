@@ -31,6 +31,7 @@ from control_plane.audit import build_default_audit_logger
 from control_plane.settings import DEFAULT_DEV_TENANT_ID, Settings
 from expert_work.persistence import ArtifactStore
 from expert_work.persistence.audit_log import InMemoryAuditLogStore
+from expert_work.protocol import ArtifactVersion
 from expert_work.protocol.agent_key import sanitize_agent_key
 from orchestrator.tools import RecordingWorkspaceStore, WorkspacePermissionError
 from orchestrator.tools.artifact_snapshots import (
@@ -505,3 +506,138 @@ async def test_a_legacy_session_fetches_the_pinned_version_from_the_latest_row(
     )
 
     assert (resp.status_code, resp.content) == (200, b"A2"), resp.text
+
+
+# --------------------------------------------------------------------------- B-63
+
+
+def _versions(world: _World) -> list[ArtifactVersion]:
+    """The app's in-memory store, every version row (all tests here use it)."""
+    rows: list[ArtifactVersion] = world.artifacts._versions  # type: ignore[attr-defined]
+    return rows
+
+
+async def _expire(world: _World, version: int) -> None:
+    """What the retention job does to a version past its retention period."""
+    ids = [v.id for v in _versions(world) if v.version == version]
+    assert await world.artifacts.delete_versions(version_ids=ids) == 1
+
+
+@pytest.mark.asyncio
+async def test_every_download_surface_marks_the_version_used(
+    surface: tuple[str, object],
+) -> None:
+    """B-63 —— 三个下载面都经 ``read_version_bytes``,下载成功记 ``last_used_at``。"""
+    world, request = await _download_v1(surface)
+    assert [v.last_used_at for v in _versions(world)] == [None]
+
+    resp = await request  # type: ignore[misc]
+
+    assert resp.status_code == 200, resp.text
+    assert [v.last_used_at is not None for v in _versions(world)] == [True]
+
+
+@pytest.mark.asyncio
+async def test_a_failing_touch_does_not_fail_the_download(
+    surface: tuple[str, object],
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    world, request = await _download_v1(surface)
+
+    async def _down(**_kwargs: object) -> bool:
+        raise RuntimeError("db down")
+
+    monkeypatch.setattr(world.artifacts, "touch_version", _down)
+    with caplog.at_level("WARNING"):
+        resp = await request  # type: ignore[misc]
+
+    assert (resp.status_code, resp.content) == (200, b"AAA")
+    assert "artifact.touch_failed" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_session_download_tells_an_expired_version_from_one_never_kept(
+    session: _Session,
+) -> None:
+    """B-63 —— 两种都是 409、都给「下载最新版」,用 ``detail.code`` 区分;未知版本仍 404。"""
+    await session.save(b"OLD", with_copy=False)
+    await session.save(b"AAA")
+    await session.save(b"BBB")
+    await session.save(b"CCC")
+    await _expire(session.world, 2)
+
+    expired = await session.download(version=2)
+    assert expired.status_code == 409, expired.text  # type: ignore[attr-defined]
+    assert expired.json()["detail"]["code"] == "ARTIFACT_VERSION_EXPIRED"  # type: ignore[attr-defined]
+    assert "retention" in expired.json()["detail"]["message"]  # type: ignore[attr-defined]
+    never_kept = await session.download(version=1)
+    assert never_kept.status_code == 409  # type: ignore[attr-defined]
+    assert never_kept.json()["detail"]["code"] == "ARTIFACT_VERSION_NOT_RETAINED"  # type: ignore[attr-defined]
+    assert (await session.download(version=9)).status_code == 404  # type: ignore[attr-defined]
+
+
+@pytest.mark.asyncio
+async def test_console_download_tells_an_expired_version_apart(
+    console: tuple[_World, UUID],
+) -> None:
+    world, user_id = console
+    await _save(world, user_id=user_id, agent_key="a-1", content=b"AAA")
+    await _save(world, user_id=user_id, agent_key="a-1", content=b"BBB")
+    await _expire(world, 1)
+    artifact_id = await _console_artifact_id(world.client)
+
+    resp = await world.client.get(
+        "/v1/artifacts/download", params={"artifact_id": artifact_id, "version": 1}
+    )
+
+    assert resp.status_code == 409, resp.text
+    assert resp.json()["detail"]["code"] == "ARTIFACT_VERSION_EXPIRED"
+
+
+@pytest.mark.asyncio
+async def test_external_expired_version_keeps_the_code_and_says_why(
+    external: tuple[_World, UUID],
+) -> None:
+    """对外错误码不变(``ARTIFACT_VERSION_MISMATCH``),原因写在 ``message`` 里。"""
+    world, user_id = external
+    key = agent_key_for_code(_AGENT_CODE)
+    await _save(world, user_id=user_id, agent_key=key, content=b"OLD", with_copy=False)
+    await _save(world, user_id=user_id, agent_key=key, content=b"AAA")
+    await _save(world, user_id=user_id, agent_key=key, content=b"BBB")
+    await _expire(world, 2)
+
+    expired = await _external_get(world, 2)
+    never_kept = await _external_get(world, 1)
+
+    assert expired.status_code == 409  # type: ignore[attr-defined]
+    assert expired.json()["error"]["code"] == "ARTIFACT_VERSION_MISMATCH"  # type: ignore[attr-defined]
+    assert "retention period" in expired.json()["error"]["message"]  # type: ignore[attr-defined]
+    assert never_kept.json()["error"]["code"] == "ARTIFACT_VERSION_MISMATCH"  # type: ignore[attr-defined]
+    assert "retention" not in never_kept.json()["error"]["message"]  # type: ignore[attr-defined]
+
+
+@pytest.mark.asyncio
+async def test_a_platform_admin_drilling_into_a_tenant_is_not_a_use(
+    console: tuple[_World, UUID],
+) -> None:
+    """B-63 —— 平台运维跨租户下载(系统管理员切到别的租户)不算这个租户的使用,不续命;
+    租户自己的人下载才算。"""
+    from tests.auth_fixtures import grant_system_admin
+
+    world, user_id = console
+    await _save(world, user_id=user_id, agent_key="a-1", content=b"AAA")
+    artifact_id = await _console_artifact_id(world.client)
+    admin = await grant_system_admin(world.client)
+
+    drill_in = await world.client.get(
+        "/v1/artifacts/download",
+        params={"artifact_id": artifact_id, "tenant_id": str(_TENANT), "user_id": str(user_id)},
+        headers=admin,
+    )
+
+    assert drill_in.status_code == 200, drill_in.text
+    assert [v.last_used_at for v in _versions(world)] == [None]
+    own = await world.client.get("/v1/artifacts/download", params={"artifact_id": artifact_id})
+    assert own.status_code == 200, own.text
+    assert [v.last_used_at is not None for v in _versions(world)] == [True]

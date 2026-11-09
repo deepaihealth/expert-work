@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import contextlib
 from collections.abc import AsyncIterator
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Literal
 
 from expert_work.runtime.storage.base import ObjectStore
@@ -40,8 +40,9 @@ class S3CompatibleConfig:
     endpoint_url: str
     region: str
     bucket: str
-    access_key: str
-    secret_key: str
+    #: B-286 —— 不进 ``repr``:这个对象会被日志 / 异常 / 调试输出带出去。
+    access_key: str = field(repr=False)
+    secret_key: str = field(repr=False)
     addressing_style: Literal["path", "virtual", "auto"] = "path"
 
 

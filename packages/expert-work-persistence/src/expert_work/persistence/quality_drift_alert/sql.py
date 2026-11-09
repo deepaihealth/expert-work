@@ -8,6 +8,7 @@ from uuid import UUID
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from expert_work.persistence.bulk_delete import count_where, delete_where
 from expert_work.persistence.models import QualityDriftAlertRow
 from expert_work.persistence.quality_drift_alert.base import QualityDriftAlertStore
 from expert_work.protocol import QualityDriftAlertRecord
@@ -97,3 +98,19 @@ class SqlQualityDriftAlertStore(QualityDriftAlertStore):
         async with self._sf() as session:
             rows = (await session.execute(stmt)).scalars().all()
         return [_row_to_record(row) for row in rows]
+
+    async def count_for_agent(self, *, tenant_id: UUID, agent_name: str) -> int:
+        return await count_where(
+            self._sf,
+            QualityDriftAlertRow,
+            QualityDriftAlertRow.tenant_id == tenant_id,
+            QualityDriftAlertRow.agent_name == agent_name,
+        )
+
+    async def delete_for_agent(self, *, tenant_id: UUID, agent_name: str) -> int:
+        return await delete_where(
+            self._sf,
+            QualityDriftAlertRow,
+            QualityDriftAlertRow.tenant_id == tenant_id,
+            QualityDriftAlertRow.agent_name == agent_name,
+        )

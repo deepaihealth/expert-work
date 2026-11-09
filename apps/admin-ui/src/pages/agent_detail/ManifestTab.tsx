@@ -43,9 +43,12 @@ interface ManifestTabProps {
   /** Called after a successful save — parent refetches so the SHA, the
    *  ``updated_at`` timestamp, and any server-side coercion show up. */
   onSaved: () => void;
+  /** B-278 — a deleted version: no save / publish / discard, and no
+   *  「生成委派策略」(it writes nothing but drafts against a dead agent). */
+  readOnly?: boolean;
 }
 
-export function ManifestTab({ detail, onSaved }: ManifestTabProps) {
+export function ManifestTab({ detail, onSaved, readOnly = false }: ManifestTabProps) {
   const { t } = useTranslation();
   const r = detail.record;
   // Track C W2 — 切入态只读:保存是写操作,切入目标租户后置灰。
@@ -189,7 +192,7 @@ export function ManifestTab({ detail, onSaved }: ManifestTabProps) {
           >
             {t("manifest_tab.reset")}
           </Button>
-          {hasDraft && (
+          {!readOnly && hasDraft && (
             <ReadonlyTooltip on={isTenantSwitched}>
               <Button
                 size="small"
@@ -203,32 +206,36 @@ export function ManifestTab({ detail, onSaved }: ManifestTabProps) {
               </Button>
             </ReadonlyTooltip>
           )}
-          <ReadonlyTooltip on={isTenantSwitched}>
-            <Button
-              size="small"
-              icon={<Save size={14} strokeWidth={1.75} />}
-              onClick={handleSaveDraft}
-              loading={busy === "draft"}
-              disabled={saving || isTenantSwitched}
-              data-testid="manifest-save-btn"
-            >
-              {t("manifest_tab.save_draft")}
-            </Button>
-          </ReadonlyTooltip>
-          <ReadonlyTooltip on={isTenantSwitched}>
-            <Button
-              size="small"
-              type="primary"
-              icon={<Upload size={14} strokeWidth={1.75} />}
-              onClick={handlePublish}
-              loading={busy === "publish"}
-              // 没有草稿就没有可发布的东西 —— 后端 409,这里不该让人点到那一步。
-              disabled={saving || isTenantSwitched || !hasDraft}
-              data-testid="manifest-publish-btn"
-            >
-              {t("manifest_tab.publish")}
-            </Button>
-          </ReadonlyTooltip>
+          {!readOnly && (
+            <>
+              <ReadonlyTooltip on={isTenantSwitched}>
+                <Button
+                  size="small"
+                  icon={<Save size={14} strokeWidth={1.75} />}
+                  onClick={handleSaveDraft}
+                  loading={busy === "draft"}
+                  disabled={saving || isTenantSwitched}
+                  data-testid="manifest-save-btn"
+                >
+                  {t("manifest_tab.save_draft")}
+                </Button>
+              </ReadonlyTooltip>
+              <ReadonlyTooltip on={isTenantSwitched}>
+                <Button
+                  size="small"
+                  type="primary"
+                  icon={<Upload size={14} strokeWidth={1.75} />}
+                  onClick={handlePublish}
+                  loading={busy === "publish"}
+                  // 没有草稿就没有可发布的东西 —— 后端 409,这里不该让人点到那一步。
+                  disabled={saving || isTenantSwitched || !hasDraft}
+                  data-testid="manifest-publish-btn"
+                >
+                  {t("manifest_tab.publish")}
+                </Button>
+              </ReadonlyTooltip>
+            </>
+          )}
         </Space>
       </div>
 
@@ -292,7 +299,7 @@ export function ManifestTab({ detail, onSaved }: ManifestTabProps) {
         onActiveGroupChange={handleGroupChange}
         // 委派增强层 3 — 已保存 Agent 才有「生成委派策略」(后端读已保存
         // manifest 起草);创建流/模板表单不传,按钮不渲染。
-        agentRef={{ name: r.name, version: r.version }}
+        agentRef={readOnly ? undefined : { name: r.name, version: r.version }}
       />
     </Card>
   );

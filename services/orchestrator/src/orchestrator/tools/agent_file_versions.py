@@ -16,6 +16,10 @@ agent 自己的记忆(偏好、模板、脚本、索引 ``AGENT_NOTES.md``)住�
   且每个 agent 的全部版本合计不超过它自己的 :data:`MAX_AGENT_VERSION_BYTES`(review 10:只删
   这个 agent 自己的版本,各 agent 之间按构造隔离)。受保护的最新几份只在自己到期时删;受保护的
   部分本身超了预算(跨副本同时观察、恢复了大文件)就一直超着(``still_over``),不删它们。
+* **B-284。** 登记成产物的文件不留版本(它们每一版都有产物副本);源文件确认不见满 30 天的
+  版本目录不在这里删 —— 这里只记 / 刷新 / 撤 ``missing`` 标记,删由留存作业每晚做
+  (``retention_cleanup_job.agent_file_versions``):闲着不跑的 agent 也会到期。留存作业另把
+  每个文件最新 3 份之外、写下满 90 天的版本删掉。
 * **失败不连累 run。** 整个观察在 run 结束之后 fire-and-forget,任何异常只记日志(异常类型)
   和计数。清除用户时整个用户目录删掉(``purge_user`` / 留存作业)。
 
@@ -36,7 +40,7 @@ import re
 import shutil
 import stat
 import time
-from collections.abc import Iterator, Mapping
+from collections.abc import Awaitable, Callable, Iterable, Iterator, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Protocol, runtime_checkable
@@ -145,7 +149,8 @@ class ObserveReport:
     unchanged: int = 0
     skipped: int = 0
     pruned: int = 0
-    #: 整个删掉的版本目录数:源文件确认不见满 30 天的,和孤儿(一份版本都没有、建了满 1 小时)。
+    #: 整个删掉的版本目录数:孤儿(一份版本都没有、建了满 1 小时)。B-284 起源文件不见满 30 天的
+    #: 由留存作业删,不在这里。
     dropped: int = 0
     #: review 11~13 —— 碰到了这个 agent 的上限:有新版本没留(字节预算 ``bytes`` / 版本目录数
     #: ``dir_cap``),或删完所有能删的仍超预算(``still_over``:受保护的版本不删)。
@@ -155,6 +160,10 @@ class ObserveReport:
     #: review 14/15 —— 这次遍历有目录没列全(名字数 / 条目数到顶、打不开、读目录出错、太深、
     #: 读的时候名字没了、``lstat`` 被拒),或索引单独查出错:那些文件这次「不知道」在不在。
     walk_incomplete: bool = False
+
+
+#: B-284 —— ``(tenant, user, agent_key) -> {agent 根相对路径: 已有产物副本的 sha256 们}``。
+RegisteredPaths = Callable[[UUID, UUID, str], Awaitable[Mapping[str, Iterable[str]]]]
 
 
 @runtime_checkable
@@ -169,6 +178,9 @@ class AgentFileVersionStore(Protocol):
 
     async def delete_for_path(self, *, tenant_id: UUID, user_id: UUID, path: str) -> int:
         """工作区删文件接口删掉 ``path``(用户根相对)时,连它的版本一起删;返回版本文件数。"""
+
+    async def delete_for_agent(self, *, tenant_id: UUID, user_id: UUID, agent_key: str) -> int:
+        """B-278 —— 彻底删除智能体:删这个用户在这个 agent 下的全部版本;返回版本文件数。"""
 
 
 @dataclass
@@ -537,13 +549,21 @@ def _valid_path(file_dir: int, key: str) -> str | None:
 
 
 def observe_sync(
-    workspace: NasWorkspaceStore, tenant_id: UUID, user_id: UUID, agent_key: str
+    workspace: NasWorkspaceStore,
+    tenant_id: UUID,
+    user_id: UUID,
+    agent_key: str,
+    exclude: Mapping[str, frozenset[str]] | None = None,
 ) -> ObserveReport:
     """扫一遍该 agent 的 ``/agent``,改过的文件各留一份。
 
     review 7 —— 用户已被清除(``.deleted`` 软删标记在)就什么都不做:清除之后才结束的 run 不能
     把版本又建回来。review 10 —— 先把变了的文件读好,再在 :func:`_housekeep` 里按这个 agent 的
     字节预算决定写不写、删哪些;版本目录只在真正写版本时才建。
+
+    B-284 —— ``exclude``:``{agent 根相对路径: 已有产物副本的内容 sha256}``。读到的内容正好是其中
+    之一就不另留版本(那一份已经有产物副本);改过之后的内容、B-235 之前没副本的版本、副本已随
+    清除删掉的,照常留。这些文件照样算「在」,已有的版本目录不会因此被当成不见。
     """
     require_safe_key(agent_key)
     if os.path.lexists(workspace_deleted_marker(workspace.root, tenant_id, user_id)):
@@ -562,7 +582,9 @@ def observe_sync(
         _after_failed_walk(workspace.root, tenant_id, user_id, agent_key)
         raise
     try:
-        _walk_and_read(workspace.root, tenant_id, user_id, agent_key, agent_fd, scan, pending)
+        _walk_and_read(
+            workspace.root, tenant_id, user_id, agent_key, agent_fd, scan, pending, exclude
+        )
     except BaseException:
         _after_failed_walk(workspace.root, tenant_id, user_id, agent_key)
         raise
@@ -589,8 +611,10 @@ def _walk_and_read(
     agent_fd: int,
     scan: _Scan,
     pending: list[_Pending],
+    exclude: Mapping[str, frozenset[str]] | None = None,
 ) -> None:
-    """遍历 + 把变了的文件读进 ``pending``(单个文件的错误只跳过那一个)。"""
+    """遍历 + 把变了的文件读进 ``pending``(单个文件的错误只跳过那一个;``exclude`` 里的
+    产物文件不读)。"""
     agent_dir = _open_agent_versions(root, tenant_id, user_id, agent_key, create=False)
     try:
         walked = [*_check_index(agent_fd, scan), *_files(agent_fd, "", 0, scan)]
@@ -600,6 +624,8 @@ def _walk_and_read(
             except OSError:
                 scan.skipped += 1  # 刚被换成符号链接 / 删掉了:这一个跳过
                 continue
+            if found is not None and exclude and found.digest in exclude.get(rel, ()):
+                continue  # B-284 —— 这份内容已经有产物副本,不再另留
             if found is not None:
                 pending.append(found)
     finally:
@@ -884,8 +910,8 @@ def _sweep(agent_dir: int, scan: _Scan, now: float) -> None:
       有版本的目录从不当孤儿;``path`` 没了或坏了只算「不知道」)。
     * ``path`` 读不动(EIO / ESTALE…,review 14):这次跳过这个目录,不删、不动它的标记。
     * 源文件在(``live``):撤掉 ``missing`` 标记。
-    * 确认不见(``missing``:一路上的目录都列全了):记 / 刷新标记(:func:`_note_missing`),满 30 天
-      删掉整个版本目录。
+    * 确认不见(``missing``:一路上的目录都列全了):记 / 刷新标记(:func:`_note_missing`)。满 30 天
+      删掉整个版本目录的是留存作业(B-284),不在这里。
     * 不知道(``unknown``:某一层没列全,或 ``path`` 坏了):撤掉标记(review 14)—— 之后要再确认一次
       不见、从那时重新算 30 天;不然「确认不见 → 一个月都看不清 → 藏一次」就能把整个目录一下删掉。
 
@@ -923,7 +949,8 @@ def _sweep(agent_dir: int, scan: _Scan, now: float) -> None:
                     rel = seen_by_key[key]
             status = scan.status(rel) if rel is not None else "unknown"
             if status == "missing":
-                drop = _note_missing(file_dir, now)
+                # B-284 —— 只记标记;满 30 天的删除归留存作业(闲着的 agent 也要到期)。
+                _note_missing(file_dir, now)
             else:
                 with contextlib.suppress(FileNotFoundError):
                     os.unlink(_MISSING_FILE, dir_fd=file_dir)
@@ -1075,14 +1102,21 @@ class NasAgentFileVersionStore:
     """生产实现 —— 版本放在 NAS 上用户根旁边、沙箱挂不到的地方。"""
 
     workspace: NasWorkspaceStore
+    #: B-284 —— 这个(租户, 用户, agent)已有产物副本的内容:``{agent 根相对路径: sha256 们}``;
+    #: 读到的内容正好是其中之一就不另留版本。
+    #: 查不到(``None`` 或出错)就照旧全都观察:多留几份版本比漏掉一份好。
+    registered_paths: RegisteredPaths | None = None
     #: review 12 —— 同一个(租户, 用户, agent)的观察在本进程里一个一个来:两个对话同时结束时
     #: 各自按旧的现状算预算,受保护的部分合计会冲过预算。只管本进程;跨副本的同时观察见 spec。
     lock: KeyedLock = field(default_factory=ProcessKeyedLock)
 
     async def observe(self, *, tenant_id: UUID, user_id: UUID, agent_key: str) -> ObserveReport:
+        exclude = await self._registered(tenant_id, user_id, agent_key)
         async with self.lock.acquire(key=f"{tenant_id}:{user_id}:{agent_key}"):
             work = asyncio.ensure_future(
-                asyncio.to_thread(observe_sync, self.workspace, tenant_id, user_id, agent_key)
+                asyncio.to_thread(
+                    observe_sync, self.workspace, tenant_id, user_id, agent_key, exclude
+                )
             )
             try:
                 return await asyncio.shield(work)
@@ -1102,6 +1136,22 @@ class NasAgentFileVersionStore:
                     )
                 raise
 
+    async def _registered(
+        self, tenant_id: UUID, user_id: UUID, agent_key: str
+    ) -> dict[str, frozenset[str]]:
+        if self.registered_paths is None:
+            return {}
+        try:
+            found = await self.registered_paths(tenant_id, user_id, agent_key)
+            return {rel: frozenset(digests) for rel, digests in found.items()}
+        except Exception as exc:
+            logger.warning(
+                "agent_file_versions.registered_paths_failed agent_key=%s error=%s",
+                agent_key,
+                type(exc).__name__,
+            )
+            return {}
+
     async def delete_all_for_user(self, *, tenant_id: UUID, user_id: UUID) -> int:
         return await asyncio.to_thread(
             _delete_user_versions, self.workspace.root, tenant_id, user_id
@@ -1111,6 +1161,43 @@ class NasAgentFileVersionStore:
         return await asyncio.to_thread(
             _delete_path_versions, self.workspace.root, tenant_id, user_id, path
         )
+
+    async def delete_for_agent(self, *, tenant_id: UUID, user_id: UUID, agent_key: str) -> int:
+        require_safe_key(agent_key)
+        async with self.lock.acquire(key=f"{tenant_id}:{user_id}:{agent_key}"):
+            return await asyncio.to_thread(
+                _delete_agent_versions, self.workspace.root, tenant_id, user_id, agent_key
+            )
+
+
+def _delete_agent_versions(root: str, tenant_id: UUID, user_id: UUID, agent_key: str) -> int:
+    """``{root}/{tenant}/.agent-file-versions/{user}/{agent_key}`` 整个删掉(B-278)。
+
+    同 :func:`_delete_user_versions`:每级 ``O_NOFOLLOW`` 打开,最后一段 ``lstat`` 确认是目录
+    再 ``rmtree(dir_fd=...)``——被换成 symlink 的话宁可失败,也不跟过去删到别处。"""
+    try:
+        user_fd = _open_versions_root(root, tenant_id, user_id, create=False)
+    except FileNotFoundError:
+        return 0
+    try:
+        try:
+            info = os.lstat(agent_key, dir_fd=user_fd)
+        except FileNotFoundError:
+            return 0
+        if not stat.S_ISDIR(info.st_mode):
+            msg = f"agent file version entry is not a directory: {agent_key!r}"
+            raise WorkspacePathEscapeError(msg)
+        agent_fd = _openat_dir(user_fd, agent_key, create=False)
+        try:
+            count = 0
+            for _base, _dirs, files, _dfd in os.fwalk(dir_fd=agent_fd):
+                count += sum(1 for f in files if _VERSION_RE.match(f))
+        finally:
+            os.close(agent_fd)
+        shutil.rmtree(agent_key, dir_fd=user_fd)
+        return count
+    finally:
+        os.close(user_fd)
 
 
 def _delete_path_versions(root: str, tenant_id: UUID, user_id: UUID, path: str) -> int:

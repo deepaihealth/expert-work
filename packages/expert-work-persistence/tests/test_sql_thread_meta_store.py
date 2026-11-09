@@ -254,6 +254,74 @@ async def test_nonempty_filters_threads_without_runs(sql_store: SqlStoreFixture)
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("holder", ["none", "run", "image", "others_upload", "own_upload"])
+async def test_delete_unused_only_removes_a_thread_nobody_uses(
+    sql_store: SqlStoreFixture, holder: str
+) -> None:
+    """B-293 —— 撤新会话的那条删除自己带条件:有 run 行、有图片行、有不在 ``own_upload_ids``
+    里的登记行都不删(同一条语句里判断,锁外的并发请求也躲不过)。"""
+    from datetime import UTC, datetime
+
+    from expert_work.persistence.models.agent_run import AgentRunRow
+    from expert_work.persistence.models.image_upload import ImageUploadRow
+    from expert_work.persistence.models.user_upload import UserUploadRow
+
+    store, engine = sql_store
+    try:
+        tenant_id, thread_id, user_id, upload_id = uuid4(), uuid4(), uuid4(), uuid4()
+        await store.create(thread_id=thread_id, tenant_id=tenant_id, created_by="u")
+        now = datetime.now(UTC)
+        rows = {
+            "run": AgentRunRow(
+                id=uuid4(),
+                tenant_id=tenant_id,
+                thread_id=thread_id,
+                status="queued",
+                on_disconnect="continue",
+                created_at=now,
+                updated_at=now,
+            ),
+            "image": ImageUploadRow(
+                id=uuid4(),
+                tenant_id=tenant_id,
+                user_id=user_id,
+                thread_id=thread_id,
+                object_key="k",
+                size_bytes=1,
+                mime_type="image/png",
+                sha256="0" * 64,
+            ),
+        }
+        upload = UserUploadRow(
+            id=upload_id,
+            tenant_id=tenant_id,
+            user_id=user_id,
+            thread_id=thread_id,
+            kind="document",
+            ref="uploads/a.pdf",
+            mime_type="application/pdf",
+            size_bytes=1,
+            filename="a.pdf",
+        )
+        rows["others_upload"] = rows["own_upload"] = upload
+        if holder in rows:
+            async with create_async_session_factory(engine)() as session:
+                session.add(rows[holder])
+                await session.commit()
+        own = [upload_id] if holder == "own_upload" else []
+
+        # 别的租户删不到。
+        assert not await store.delete_unused(thread_id, tenant_id=uuid4(), own_upload_ids=own)
+        removed = await store.delete_unused(thread_id, tenant_id=tenant_id, own_upload_ids=own)
+
+        expected = holder in ("none", "own_upload")
+        assert removed is expected
+        assert (await store.get(thread_id, tenant_id=tenant_id) is None) is expected
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
 async def test_update_title_and_tenant_isolation(sql_store: SqlStoreFixture) -> None:
     store, engine = sql_store
     try:

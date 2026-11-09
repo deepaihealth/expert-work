@@ -282,7 +282,7 @@ async def test_invalidate_tenant_drops_only_that_tenants_cached_agents() -> None
         spec: AgentSpec, *, tenant_id: UUID | None = None, user_id: str | None = None
     ) -> object:
         builds.append((tenant_id, spec.metadata.name if spec is not None else None))
-        return object()  # stand-in BuiltAgent
+        return BuiltAgent(graph=object(), system_prompt="", max_steps=1)  # type: ignore[arg-type]
 
     runtime = AgentRuntime(
         run_manager=RunManager(store=None),  # type: ignore[arg-type]
@@ -312,7 +312,7 @@ async def test_invalidate_tenant_fans_out_to_registered_hooks() -> None:
     async def _builder(
         spec: AgentSpec, *, tenant_id: UUID | None = None, user_id: str | None = None
     ) -> object:
-        return object()
+        return BuiltAgent(graph=object(), system_prompt="", max_steps=1)  # type: ignore[arg-type]
 
     runtime = AgentRuntime(
         run_manager=RunManager(store=None),  # type: ignore[arg-type]
@@ -341,7 +341,7 @@ def _recording_runtime(builds: list[str]) -> AgentRuntime:
         spec: AgentSpec, *, tenant_id: UUID | None = None, user_id: str | None = None
     ) -> object:
         builds.append(spec.spec.system_prompt.template)
-        return object()  # stand-in BuiltAgent
+        return BuiltAgent(graph=object(), system_prompt="", max_steps=1)  # type: ignore[arg-type]
 
     return AgentRuntime(
         run_manager=RunManager(store=None),  # type: ignore[arg-type]
@@ -436,7 +436,7 @@ async def test_invalidate_all_drops_every_tenants_cached_agents() -> None:
         spec: AgentSpec, *, tenant_id: UUID | None = None, user_id: str | None = None
     ) -> object:
         builds.append(tenant_id)
-        return object()
+        return BuiltAgent(graph=object(), system_prompt="", max_steps=1)  # type: ignore[arg-type]
 
     runtime = AgentRuntime(
         run_manager=RunManager(store=None),  # type: ignore[arg-type]
@@ -464,7 +464,7 @@ async def test_invalidate_all_fans_out_to_registered_clear_hooks() -> None:
     async def _builder(
         spec: AgentSpec, *, tenant_id: UUID | None = None, user_id: str | None = None
     ) -> object:
-        return object()
+        return BuiltAgent(graph=object(), system_prompt="", max_steps=1)  # type: ignore[arg-type]
 
     runtime = AgentRuntime(
         run_manager=RunManager(store=None),  # type: ignore[arg-type]
@@ -489,7 +489,7 @@ def _runtime_with_oauth(builds: list[tuple[str | None, ...]], users_with_oauth: 
         spec: AgentSpec, *, tenant_id: UUID | None = None, user_id: str | None = None
     ) -> object:
         builds.append((str(tenant_id), user_id))
-        return object()
+        return BuiltAgent(graph=object(), system_prompt="", max_steps=1)  # type: ignore[arg-type]
 
     # Cached per (tenant, user) like the real ``get_or_build`` — B-260 compares the
     # pool object the key was decided from with the one fetched after the build.

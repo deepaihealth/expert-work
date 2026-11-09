@@ -13,11 +13,13 @@ from __future__ import annotations
 
 import json
 import logging
+from collections.abc import AsyncIterator, Collection, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
-from typing import Any, get_args
+from typing import Any, Protocol, get_args
 from uuid import UUID
 
+from expert_work.protocol.trajectory_keys import parse_trajectory_key
 from expert_work.runtime.storage import ObjectNotFoundError, ObjectStore, ObjectStoreError
 from orchestrator.trajectory.recorder import DEFAULT_PREFIX, TrajectoryOutcome
 
@@ -169,3 +171,40 @@ def _opt_uuid(value: object) -> UUID | None:
 
 def _opt_dt(value: object) -> datetime | None:
     return datetime.fromisoformat(str(value)) if value is not None else None
+
+
+class _ThreadLookup(Protocol):
+    async def get_many(
+        self, thread_ids: Collection[UUID], *, tenant_id: UUID
+    ) -> Mapping[UUID, object]: ...
+
+
+#: How many keys' conversations to look up per ``get_many`` round trip.
+_LIVE_CHUNK = 100
+
+
+async def live_trajectory_keys(
+    keys: Sequence[str],
+    *,
+    tenant_id: UUID,
+    threads: _ThreadLookup | None,
+    prefix: str = DEFAULT_PREFIX,
+) -> AsyncIterator[str]:
+    """B-285 —— ``keys`` in order, minus those whose conversation no longer has a
+    ``thread_meta`` row (a deleted conversation / user) and those whose layout is
+    not recognised (cannot be checked). Conversations are looked up a chunk at a
+    time, so a caller that stops early does not pay for the whole listing.
+    ``threads=None`` (legacy assembly) yields every key unchanged."""
+    if threads is None:
+        for key in keys:
+            yield key
+        return
+    for start in range(0, len(keys), _LIVE_CHUNK):
+        chunk = keys[start : start + _LIVE_CHUNK]
+        owners = {key: parse_trajectory_key(key, prefix=prefix) for key in chunk}
+        ids = {p.conversation_id for p in owners.values() if p is not None}
+        alive = await threads.get_many(ids, tenant_id=tenant_id) if ids else {}
+        for key in chunk:
+            parsed = owners[key]
+            if parsed is not None and parsed.conversation_id in alive:
+                yield key

@@ -46,3 +46,7 @@ class ImageUpload(BaseModel):
     sha256: str
     created_at: datetime
     deleted_at: datetime | None = None
+    #: B-283 —— 最后一次被下载的时间(对外下载端点记,每张每天最多记一次);列加上之前没被
+    #: 下载过的为 ``None``。保留期从上传时间 / 这个时间 / 所在会话最后一次 run 三者最晚的
+    #: 那个算起。
+    last_used_at: datetime | None = None

@@ -488,13 +488,17 @@ async def test_call_dispatches_trajectory_on_success() -> None:
         child_depth=2,
         trajectory_recorder=recorder,  # type: ignore[arg-type]
     )
+    conversation = uuid4()
 
-    result = await tool.call({"task": "x"}, ctx=_ctx())
+    result = await tool.call({"task": "x"}, ctx=_ctx(thread_id=conversation))
 
     # Let the fire-and-forget task drain.
     await asyncio.sleep(0)
     assert len(recorder.records) == 1
     rec = recorder.records[0]
+    # B-285 —— filed under the conversation it ran in, so deleting that
+    # conversation finds it.
+    assert rec.conversation_id == conversation
     assert rec.outcome == "success"
     assert rec.step_count == 2
     assert rec.metadata["subagent_name"] == "researcher"
@@ -524,9 +528,11 @@ async def test_call_dispatches_trajectory_on_max_steps() -> None:
         trajectory_recorder=recorder,  # type: ignore[arg-type]
     )
 
-    result = await tool.call({"task": "x"}, ctx=_ctx())
+    conversation = uuid4()
+    result = await tool.call({"task": "x"}, ctx=_ctx(thread_id=conversation))
 
     await asyncio.sleep(0)
+    assert recorder.records[0].conversation_id == conversation
     assert result.meta["subagent_max_steps"] is True
     assert result.meta["iteration_used"] == 5
     assert result.meta["llm_call_count"] == 1
@@ -551,11 +557,15 @@ async def test_call_dispatches_trajectory_on_cancellation() -> None:
         trajectory_recorder=recorder,  # type: ignore[arg-type]
     )
 
+    conversation, top = uuid4(), uuid4()
     with pytest.raises(RunCancelledError):
-        await tool.call({"task": "x"}, ctx=_ctx())
+        # A grandchild: its own thread is a sub-thread; the conversation is the
+        # top-level one it carries as ``workspace_thread_id``.
+        await tool.call({"task": "x"}, ctx=_ctx(thread_id=conversation, workspace_thread_id=top))
 
     await asyncio.sleep(0)
     assert len(recorder.records) == 1
+    assert recorder.records[0].conversation_id == top
     assert recorder.records[0].outcome == "cancelled"
     assert recorder.records[0].step_count == 1
 

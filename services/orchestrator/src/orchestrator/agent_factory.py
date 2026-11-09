@@ -143,6 +143,7 @@ from orchestrator.llm import (
     make_qwen_client,
     make_self_hosted_client,
 )
+from orchestrator.llm.failover import breaker_key_for
 from orchestrator.llm.truncation import ANTHROPIC_DEFAULT_MAX_TOKENS, served_output_cap
 from orchestrator.middleware_assembly import MiddlewareEnv, build_middleware_chains
 from orchestrator.multimodal import ImageResolver
@@ -1438,6 +1439,8 @@ async def build_agent(
         worker_max_concurrent=spec.spec.dynamic_workers.max_concurrent,
         worker_max_per_run=spec.spec.dynamic_workers.max_per_run,
         knowledge_catalog_fingerprint=knowledge_fingerprint,
+        # B-294 —— 连不上而跳过的 MCP 服务;非空时控制面只缓存这次构建 60 秒。
+        skipped_mcp_servers=registry.skipped_mcp_servers(),
     )
 
 
@@ -2807,7 +2810,16 @@ async def build_llm_router(
                         key=key, secret_ref=secret_ref, rate_limit_rpm=entry.rate_limit_rpm
                     ),
                 )
-            handles.append(ProviderHandle(provider=rate_limited, key=key, group=group))
+            handles.append(
+                ProviderHandle(
+                    provider=rate_limited,
+                    key=key,
+                    group=group,
+                    # B-297 — the breaker registry is process-wide: tell two
+                    # tenants' credentials / endpoints for one model apart.
+                    breaker_key=breaker_key_for(key, secret_ref, entry.base_url),
+                )
+            )
     return LLMRouter(
         providers=handles,
         around_llm_chain=around_llm_chain,

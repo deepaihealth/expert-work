@@ -20,7 +20,7 @@ supervisor 上(``httpx.MockTransport``)—— 所以**故意不打 marker**,理�
 from __future__ import annotations
 
 import os
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING
 from uuid import UUID, uuid4
@@ -158,7 +158,10 @@ async def test_list_files_reports_mtime(tmp_path: Path) -> None:
     mtime = files[0].mtime
     assert mtime is not None
     assert mtime.tzinfo is not None, "时间一律带 tzinfo —— 裸 datetime 比不了"
-    assert before <= mtime <= after
+    # 文件 mtime 取自内核的粗粒度时钟,与 ``datetime.now`` 可差零点几毫秒(CI 上见过
+    # mtime 比 after 晚 0.27 ms),所以两边各放 1 秒余量。
+    slack = timedelta(seconds=1)
+    assert before - slack <= mtime <= after + slack
 
 
 async def test_mtime_survives_the_listing_round_trip(

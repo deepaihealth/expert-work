@@ -10,7 +10,11 @@ billing / analytics:
   artifacts (+ versions, + each version's copy of its bytes — B-235), MCP OAuth
   connections, agent-instance bindings,
   approvals, triggers (+ their runs), webhook endpoints (+ their deliveries),
-  image uploads, volume-backup DLQ, the knowledge retrieval logs (B-175
+  image uploads (an image whose object-store bytes could not be deleted keeps
+  its row and fails the step, so a re-run finds it), volume-backup DLQ, the
+  quality scores and curation candidates of the user's conversations (B-280:
+  a candidate carries the user's own 👎 comment and points at the purged
+  conversation's trajectory), the knowledge retrieval logs (B-175
   P2-PR4: every search in the user's conversations whoever's run made it, their
   runs elsewhere, their own console tests — if that fails, the run-deleting and
   run-anonymising steps are ``skipped`` so a re-run can still find the rows),
@@ -19,7 +23,9 @@ billing / analytics:
   + ``sandbox_instance`` rows.
 * **ANONYMIZE** (KEEP the row, null the user link) — ``token_usage`` and
   ``agent_run`` (billing / analytics), ``skill`` actor columns (tenant IP),
-  ``eval_dataset.source_user_id`` and ``curation_candidate.user_id``.
+  ``eval_dataset.source_user_id`` and ``curation_candidate.user_id`` (the
+  candidates left after the per-conversation delete — ones on other users'
+  conversations).
 * **IDENTITY** — soft-deactivate the ``tenant_user`` row (``deleted_at``).
 
 Modelled on ``api/tenants.py:_bulk_cancel_tenant_runs`` (enumerate-then-act,
@@ -37,6 +43,7 @@ table EXCEPT ``mcp_oauth_connection``, which is keyed by the user's
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from collections.abc import Awaitable
 from dataclasses import dataclass, field
@@ -44,6 +51,14 @@ from datetime import UTC, datetime
 from uuid import UUID
 
 from control_plane.audit import emit
+from control_plane.purge.image_blobs import ImageTally, delete_images
+from control_plane.purge.trajectories import (
+    TrajectoriesNotDeletedError,
+    TrajectoryStore,
+    conversation_days,
+    delete_conversation_trajectories,
+    delete_late_trajectories,
+)
 from control_plane.runtime import AgentRuntime
 from expert_work.persistence.agent_instance.base import AgentInstanceStore
 from expert_work.persistence.approval import ApprovalStore
@@ -54,6 +69,7 @@ from expert_work.persistence.image_upload import ImageUploadStore
 from expert_work.persistence.knowledge import KnowledgeRetrievalLogStore
 from expert_work.persistence.mcp_oauth_connection.base import McpOAuthConnectionStore
 from expert_work.persistence.memory import MemoryStore, MemoryWritebackDLQ, MemoryWritebackJobStore
+from expert_work.persistence.quality_score import QualityScoreStore
 from expert_work.persistence.skill import SkillStore
 from expert_work.persistence.tenant_user import TenantUserStore
 from expert_work.persistence.thread_meta import ThreadMetaStore
@@ -62,6 +78,8 @@ from expert_work.persistence.trigger import TriggerRunStore, TriggerStore
 from expert_work.persistence.user_upload import UserUploadStore
 from expert_work.persistence.webhook import WebhookDeliveryStore, WebhookEndpointStore
 from expert_work.persistence.workspace.dlq import VolumeBackupDLQ
+from expert_work.persistence.workspace.layout import PURGED_AGENTS_DIR
+from expert_work.persistence.workspace.safe_remove import ABSENT, REMOVED, remove_entry
 from expert_work.protocol import AuditAction, AuditResult
 from expert_work.runtime.audit.logger import AuditLogger
 from expert_work.runtime.runs import RunStore
@@ -83,6 +101,14 @@ _MAX_THREADS = 20_000
 #: ``failures`` key, and while it has failed the run-deleting and
 #: run-anonymising steps are skipped.
 _LOG_STEP = "knowledge_retrieval_log"
+#: B-280 —— ``failures`` keys of the thread-keyed child steps in
+#: :func:`_purge_threads`; any of them failed → the threads stay for a re-run.
+#: B-285 —— ``deleted`` / ``failures`` key of the per-thread trajectory step.
+_TRAJECTORY_STEP = "trajectory"
+#: B-285 —— conversations whose trajectory dates could not be derived (no runs,
+#: no thread timestamps).
+_UNDATABLE = "trajectory_undatable"
+_THREAD_CHILD_STEPS = ("feedback", "quality_score", "curation_candidate_delete", "agent_approval")
 
 
 @dataclass(frozen=True)
@@ -110,7 +136,7 @@ class PurgeUserDeps:
     feedback: FeedbackStore
     #: ``None`` when no object store is wired (e.g. some dev/test deployments)
     #: — the image-blob purge step then hard-deletes rows only and counts them
-    #: as skipped (the retention sweep reaps the orphaned keys later).
+    #: as skipped (there are no bytes it could delete).
     object_store: ObjectStore | None
     #: ``None`` in control-plane deployments — the volume-backup DLQ is a
     #: supervisor-owned store (like ``sandbox_instance``); wire it if present.
@@ -120,6 +146,9 @@ class PurgeUserDeps:
     skills: SkillStore
     eval_datasets: EvalDatasetStore
     curation_candidates: CurationCandidateStore
+    #: B-280 —— the judge's verdicts on the user's conversations (the rationale
+    #: quotes the exchange).
+    quality_scores: QualityScoreStore
     #: B-175 P2-PR4 — knowledge searches made in the user's runs (the question
     #: asked is the user's text).
     retrieval_logs: KnowledgeRetrievalLogStore
@@ -134,6 +163,12 @@ class PurgeUserDeps:
     #: B-236 第三层 —— ``/agent`` 文件的历史版本(住在用户根旁边,工作区那步删不到)。
     #: ``None`` = 这个部署不留版本。
     agent_file_versions: AgentFileVersionStore | None = None
+    #: B-278 —— NAS 根(只有 NAS 后端有):删掉这个用户在彻底删除智能体时留在隔离区
+    #: ``{tenant}/.purged-agents/{user}`` 里的目录,别等留存作业的 7 天。
+    workspace_root: str | None = None
+    #: B-285 —— where the run path writes trajectory objects
+    #: (``runtime.trajectory_recorder``); ``None`` = this deployment writes none.
+    trajectories: TrajectoryStore | None = None
 
 
 @dataclass
@@ -259,7 +294,8 @@ async def _purge_threads(
     # below: if a thread's delete fails partway through, we don't want to be
     # left with "the thread is gone but its feedback rows survive" — cascading
     # the comments first means a failed thread purge still leaves a consistent
-    # (feedback-free) state to retry.
+    # (feedback-free) state to retry. (And if the feedback delete itself fails,
+    # the threads stay — see ``_THREAD_CHILD_STEPS`` below.)
     try:
         summary.deleted["feedback"] = await deps.feedback.delete_for_threads(
             tenant_id=tenant_id, thread_ids=thread_ids
@@ -268,6 +304,29 @@ async def _purge_threads(
         logger.warning("purge_user.feedback_failed", exc_info=True)
         # Type only, never str(exc) — see _step's docstring.
         summary.failures["feedback"] = type(exc).__name__
+
+    # B-280 —— the judge's verdicts on these conversations, and the curation
+    # candidates flagged on them (the user's own 👎 comment + a pointer at the
+    # conversation's trajectory). Same best-effort shape as feedback; the
+    # candidates on other users' conversations are anonymised later.
+    for table, key, coro in (
+        (
+            "quality_score",
+            "quality_score",
+            deps.quality_scores.delete_for_threads(tenant_id=tenant_id, thread_ids=thread_ids),
+        ),
+        (
+            "curation_candidate",
+            "curation_candidate_delete",
+            deps.curation_candidates.delete_for_threads(tenant_id=tenant_id, thread_ids=thread_ids),
+        ),
+    ):
+        try:
+            summary.deleted[table] = await coro
+        except Exception as exc:
+            logger.warning("purge_user.step_failed step=%s error=%s", key, type(exc).__name__)
+            # Type only, never str(exc) — see _step's docstring.
+            summary.failures[key] = type(exc).__name__
 
     # Approvals are keyed by thread, not user — the only writer (orchestrator
     # sse.py pause flow) stamps user_id=None on every row, so the per-user
@@ -280,6 +339,15 @@ async def _purge_threads(
         logger.warning("purge_user.approvals_failed", exc_info=True)
         # Type only, never str(exc) — see _step's docstring.
         summary.failures["agent_approval"] = type(exc).__name__
+
+    # B-280 —— child before parent (as ``agent_purge_steps.purge_conversations``):
+    # these rows are found by thread id only (``quality_score`` has no user
+    # column, curation candidates get anonymised further down), so deleting the
+    # threads now would leave them with nothing to find them by. Keep the
+    # threads; a re-run deletes the leftovers, then the threads.
+    if any(step in summary.failures for step in _THREAD_CHILD_STEPS):
+        summary.skipped.append("threads")
+        return
 
     checkpointer = deps.runtime.durable_checkpointer
     adelete = getattr(checkpointer, "adelete_thread", None)
@@ -297,6 +365,31 @@ async def _purge_threads(
             summary.failures[_LOG_STEP] = type(exc).__name__
             continue
         summary.deleted[_LOG_STEP] = summary.deleted.get(_LOG_STEP, 0) + removed
+        # B-285 —— the conversation's trajectory objects (the whole conversation,
+        # one per run, in object storage). Their date comes from the runs, so
+        # before the runs go; if any cannot go, the thread is kept for a re-run.
+        try:
+            runs = await deps.runs.list_by_thread(thread_id=thread_id, tenant_id=tenant_id)
+            meta = None if runs else await deps.threads.get(thread_id, tenant_id=tenant_id)
+            dated = conversation_days(runs, meta)
+            if dated.undatable:
+                # No runs and no thread timestamps: nothing could be dated — count
+                # it visibly instead of reporting a clean delete.
+                summary.deleted[_UNDATABLE] = summary.deleted.get(_UNDATABLE, 0) + 1
+                logger.warning("purge_user.trajectory_undatable")
+            summary.deleted[_TRAJECTORY_STEP] = summary.deleted.get(
+                _TRAJECTORY_STEP, 0
+            ) + await delete_conversation_trajectories(
+                deps.trajectories, tenant_id=tenant_id, thread_id=thread_id, days=dated.days
+            )
+        except Exception as exc:
+            logger.warning("purge_user.trajectories_failed error=%s", type(exc).__name__)
+            summary.failures[_TRAJECTORY_STEP] = type(exc).__name__
+            if isinstance(exc, TrajectoriesNotDeletedError):
+                summary.deleted[_TRAJECTORY_STEP] = (
+                    summary.deleted.get(_TRAJECTORY_STEP, 0) + exc.removed
+                )
+            continue
         if adelete is not None:
             try:
                 await adelete(str(thread_id))
@@ -327,6 +420,15 @@ async def _purge_threads(
             logger.warning("purge_user.retrieval_logs_failed error=%s", type(exc).__name__)
         else:
             summary.deleted[_LOG_STEP] = summary.deleted.get(_LOG_STEP, 0) + late
+        # B-285 —— the same for a trajectory that run writes now (today's keys).
+        summary.deleted[_TRAJECTORY_STEP] = summary.deleted.get(
+            _TRAJECTORY_STEP, 0
+        ) + await delete_late_trajectories(
+            deps.trajectories,
+            tenant_id=tenant_id,
+            thread_id=thread_id,
+            log_event="purge_user.trajectories_late_failed",
+        )
 
 
 async def _purge_retrieval_logs(
@@ -378,32 +480,37 @@ async def _purge_webhooks(
     )
 
 
+#: Image rows per pass; a full page means there may be more (every row of a
+#: page that raised nothing is gone, so the next page is new rows).
+_IMAGE_PAGE = 1000
+
+
 async def _purge_images(
     deps: PurgeUserDeps, summary: PurgeSummary, *, tenant_id: UUID, user_id: UUID
 ) -> None:
-    """Delete the user's image-upload object-store blobs, then their rows.
+    """Delete the user's image-upload object-store bytes, then the rows whose
+    bytes are gone (:mod:`control_plane.purge.image_blobs`).
 
-    Deletion-hygiene purge (Task 8) — ``list_for_user`` returns every row
-    (active AND soft-deleted, per its docstring) so a soft-deleted image's
-    blob is cleaned up too, not just the ones still visible in the UI.
-    Row deletion always runs (even with no ``object_store`` wired) — an
-    orphaned object-store key is recoverable by the retention sweep, a
-    stuck ``image_upload`` row is not.
+    ``list_for_user`` returns active AND soft-deleted rows, so a soft-deleted
+    image's bytes are cleaned up too. An image whose bytes could not be deleted
+    keeps its row and the step fails (``ImageBytesNotDeletedError``): nothing
+    sweeps object storage for keys without a row, so deleting the row first
+    would leave the bytes in the bucket for good — a re-run retries them.
     """
-    rows = await deps.image_uploads.list_for_user(tenant_id=tenant_id, user_id=user_id)
-    if deps.object_store is None:
-        summary.image_blobs_skipped = len(rows)
-    else:
-        for row in rows:
-            try:
-                await deps.object_store.delete(row.object_key)
-                summary.image_blobs_removed += 1
-            except Exception:  # best-effort: orphaned key beats a stuck purge
-                summary.image_blobs_failed += 1
-                logger.warning("purge_user.image_blob_failed", exc_info=True)
-    summary.deleted["image_upload"] = await deps.image_uploads.delete_all_for_user(
-        tenant_id=tenant_id, user_id=user_id
-    )
+    tally = ImageTally()
+    try:
+        while True:
+            rows = await deps.image_uploads.list_for_user(
+                tenant_id=tenant_id, user_id=user_id, limit=_IMAGE_PAGE
+            )
+            await delete_images(deps.image_uploads, deps.object_store, rows, tally)
+            if len(rows) < _IMAGE_PAGE:
+                break
+    finally:
+        summary.image_blobs_removed += tally.blobs_removed
+        summary.image_blobs_failed += tally.blobs_failed
+        summary.image_blobs_skipped += tally.blobs_skipped
+        summary.deleted["image_upload"] = tally.rows_deleted
 
 
 async def purge_user(
@@ -610,6 +717,24 @@ async def purge_user(
             deps.agent_file_versions.delete_all_for_user(tenant_id=tenant_id, user_id=user_id),
             default=0,
         )
+
+    # B-278 —— 这个用户在「彻底删除智能体」时被挪进隔离区的目录(删不动的残留),一起删掉。
+    if deps.workspace_root is not None:
+        removed = await _step(
+            summary,
+            "purged_agents",
+            asyncio.to_thread(
+                remove_entry,
+                deps.workspace_root,
+                [str(tenant_id), PURGED_AGENTS_DIR],
+                str(user_id),
+                tenant_id=tenant_id,
+                owner_id=user_id,
+                quarantine=False,
+            ),
+            default=ABSENT,
+        )
+        summary.deleted["purged_agents"] = 1 if removed == REMOVED else 0
 
     # 5) Identity — soft-deactivate the tenant_user row (kept, recoverable).
     summary.deactivated = await _step(

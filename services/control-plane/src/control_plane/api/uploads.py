@@ -20,10 +20,12 @@ import io
 import logging
 import re
 import zipfile
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
+from contextlib import AbstractAsyncContextManager, nullcontext
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from pathlib import PurePosixPath
-from typing import Annotated, Any, Final
+from typing import Annotated, Any, Final, Protocol
 from uuid import UUID, uuid4
 
 from fastapi import APIRouter, Depends, File, HTTPException, Request, UploadFile
@@ -50,12 +52,14 @@ from expert_work.common.observability import current_trace_id_hex
 from expert_work.persistence import WORKSPACE_UPLOADS_DIR
 from expert_work.persistence.image_upload import ImageUploadStore
 from expert_work.persistence.tenant_user import TenantUserStore
+from expert_work.persistence.user_upload import UserUploadStore
 from expert_work.protocol import (
     AuditAction,
     AuditResult,
     QuotaDimension,
     ThreadMeta,
     UserUpload,
+    parse_upload_id,
     render_upload_id,
 )
 from expert_work.protocol.multimodal import ImageRef
@@ -229,8 +233,50 @@ async def _land_document_bytes(
     raise SandboxSupervisorError(msg)
 
 
+class ExternalFileRefLike(Protocol):
+    """``files[]`` 的一项(:class:`control_plane.api.agents.ExternalFileRef`)。"""
+
+    @property
+    def upload_id(self) -> str: ...
+
+
+async def note_uploads_used(
+    uploads: UserUploadStore, *, tenant_id: UUID, upload_ids: Sequence[UUID]
+) -> None:
+    """B-63 —— 记一次「用到了这些附件」(run 被接受之后的 ``files[]`` / 对外下载成功):保留期
+    从最后一次使用算起。
+
+    存储层每行每天最多真写一次。记不上只打 warning、不影响这次请求:少记一次的后果是这份附件
+    按上一次使用的时间到期,不会更早于改动之前(按上传时间)的到期日。
+    """
+    now = datetime.now(UTC)
+    for upload_id in upload_ids:
+        try:
+            await uploads.touch(upload_id=upload_id, tenant_id=tenant_id, now=now)
+        except Exception:
+            logger.warning("upload.touch_failed upload_id=%s", upload_id, exc_info=True)
+
+
+async def note_image_used(images: ImageUploadStore, *, tenant_id: UUID, image_id: UUID) -> None:
+    """B-283 —— 图片的字节按 ``image_upload`` 那一行到期:对外下载成功时也在那一行记一次使用。
+
+    与 :func:`note_uploads_used` 同一个规矩:存储层每张每天最多真写一次,记不上只打 warning、
+    不影响这次下载(少记一次只是按上一次使用的时间到期)。会话里的使用(提问、``ask_image``、
+    ``files[]`` 附图都只认本会话的图)由「会话最后一次 run」覆盖,不在这里记。"""
+    try:
+        await images.touch(image_id=image_id, tenant_id=tenant_id, now=datetime.now(UTC))
+    except Exception:
+        logger.warning("image.touch_failed image_id=%s", image_id, exc_info=True)
+
+
+def file_upload_ids(files: Sequence[ExternalFileRefLike]) -> list[UUID]:
+    """``files[]`` 里能解析的 ``upload_id``(run 被接受时它们都已经校验过)。"""
+    return [uid for item in files if (uid := parse_upload_id(item.upload_id)) is not None]
+
+
 async def copy_document_into_thread(
     account: LandingAccount,
+    uploads: UserUploadStore,
     *,
     tenant_id: UUID,
     user_id: UUID,
@@ -238,6 +284,7 @@ async def copy_document_into_thread(
     ref: str,
     source: ThreadMeta,
     target: ThreadMeta,
+    created: list[UUID] | None = None,
 ) -> str:
     """B-262 P1 §3 —— 会话 ``source`` 的上传 ``ref``(``uploads/<名字>``)挂到会话 ``target``
     的 run 上:复制进 ``target`` 自己的 ``uploads/``,回实际落地的名字(同 P0 的同名规则:同内容
@@ -248,11 +295,20 @@ async def copy_document_into_thread(
 
     B-262 review —— 像一次上传一样记账(:func:`_land_and_account`:配额闸、写了才记字节、
     给 ``target`` 记一条 ``DOCUMENT_UPLOAD`` 审计,``copied_from_upload_id`` 是登记行的
-    ``upl_`` id);不新建登记行。源文件大小与登记行对不上(源对话里被改写过)就拒,不悄悄复制
-    改过的内容(只比大小:登记行与审计都不便宜地给出 sha256)。
+    ``upl_`` id)。源文件大小与登记行对不上(源对话里被改写过)就拒,不悄悄复制改过的内容(只比
+    大小:登记行与审计都不便宜地给出 sha256)。
+
+    B-281 —— 落进 ``target`` 自己对话目录的那份在 ``target`` 名下建一条登记行
+    (:func:`register_document_upload`),留存作业才管得到它;落进共享根(老视图 / 没绑 agent)的不建
+    (:func:`landing_is_registrable`)。``target`` 已经有一条没删的行指着同一个文件(同名同 sha256 ——
+    同一份再挂一次)就不再加:这一轮 run 本身就把 ``target`` 的「最后使用」往后推了。新行的 id
+    不回给对接方,他们照旧用源那一行的 ``upl_`` id。
 
     失败抛 ``HTTPException``,状态码同上传端点(503 / 429 / 500 / 502);另有源文件不在 404、
     源被改过 409(读按登记的大小 + 1 封顶,读超了也算改过)。
+
+    B-293 —— ``created`` 非空时把这里新建的登记行 id 记进去:请求随后被拒、撤掉它刚建的会话时,
+    这些行算「本请求自己的」。
     """
     store = account.workspace_store
     if store is None:
@@ -300,7 +356,43 @@ async def copy_document_into_thread(
         content_type=upload.mime_type,
         extra_details={"copied_from_upload_id": render_upload_id(upload.id)},
     )
+    if landing_is_registrable(target) and not await _already_registered(
+        uploads, tenant_id=tenant_id, user_id=user_id, thread_id=target.thread_id, landed=result
+    ):
+        row = await register_document_upload(
+            uploads,
+            tenant_id=tenant_id,
+            user_id=user_id,
+            thread_id=target.thread_id,
+            landed=result,
+            mime_type=upload.mime_type,
+        )
+        if created is not None:
+            created.append(row.id)
     return result.path
+
+
+def landing_is_registrable(meta: ThreadMeta) -> bool:
+    """B-281 —— 控制台上传 / 跨会话复制落进 ``meta`` 这个会话时要不要建登记行:只有落进它自己的
+    对话目录(``threads/<会话>/work/``)才建。老视图(agent 根)和没绑 agent(用户根)是共享的根,
+    别的会话也看得到;留存作业的引用检查只认登记行,在那里登记,到期时会删掉别的会话还在用的文件。
+    (对外上传端点在老视图会话里本来就登记,B-281 不改。)"""
+    return thread_conversation_id(meta) is not None
+
+
+async def _already_registered(
+    uploads: UserUploadStore,
+    *,
+    tenant_id: UUID,
+    user_id: UUID,
+    thread_id: UUID,
+    landed: DocumentUploadResult,
+) -> bool:
+    """``thread_id`` 已有一条没删的登记行指着 ``landed`` 这个文件(同一工作区、同名、同 sha256)。"""
+    return any(
+        row.user_id == user_id and row.ref == landed.path and row.sha256 == landed.sha256
+        for row in await uploads.list_documents_for_thread(tenant_id=tenant_id, thread_id=thread_id)
+    )
 
 
 #: 上传失败(``HTTPException`` 的状态码)→ 对外信封的 ``code``。对外上传端点与跨会话复制附件
@@ -382,6 +474,35 @@ class DocumentUploadResult:
     reused: bool = False
 
 
+async def register_document_upload(
+    uploads: UserUploadStore,
+    *,
+    tenant_id: UUID,
+    user_id: UUID,
+    thread_id: UUID,
+    landed: DocumentUploadResult,
+    mime_type: str,
+) -> UserUpload:
+    """一份落进工作区的文档建一条 ``user_upload`` 登记行 —— 对外上传、控制台上传(B-281)、跨会话
+    复制(B-281)共用这一个写法,字段不会各写各的。
+
+    ``user_id`` 是**文件落进的那个工作区**的主人(留存作业按它找文件);``ref`` 是实际落盘的名字
+    (可能换过名);``sha256`` 是落地字节的哈希,留存作业删文件前用它核对。没有登记行的文件留存
+    作业看不到,永远不会到期。"""
+    return await uploads.insert(
+        upload_id=uuid4(),
+        tenant_id=tenant_id,
+        user_id=user_id,
+        thread_id=thread_id,
+        kind="document",
+        ref=landed.path,
+        mime_type=mime_type,
+        size_bytes=landed.size_bytes,
+        filename=landed.path.rsplit("/", 1)[-1],
+        sha256=landed.sha256,
+    )
+
+
 async def _handle_document_upload(
     *,
     content_type: str,
@@ -436,6 +557,7 @@ async def _handle_document_upload(
             audit=audit,
             actor_id=getattr(request.state, "actor_id", "anonymous"),
             quota_service=getattr(request.app.state, "workspace_quota_service", None),
+            landing_lock=getattr(request.app.state, "conversation_landing_lock", None),
         ),
         tenant_id=tenant_id,
         user_id=caller_user_id,
@@ -462,6 +584,9 @@ class LandingAccount:
     audit: AuditLogger
     actor_id: str
     quota_service: Any = None
+    #: B-282 —— 按会话的落盘锁(``PgConversationSeedLock``,用它的 ``acquire_shared``);
+    #: 没接线(无库部署)为 ``None``,不加锁。
+    landing_lock: Any = None
 
     @classmethod
     def from_request(cls, request: Request) -> LandingAccount:
@@ -471,7 +596,18 @@ class LandingAccount:
             audit=state.audit_logger,
             actor_id=getattr(request.state, "actor_id", "anonymous"),
             quota_service=getattr(state, "workspace_quota_service", None),
+            landing_lock=getattr(state, "conversation_landing_lock", None),
         )
+
+
+def _landing_lock(
+    account: LandingAccount, *, tenant_id: UUID, thread_id: UUID
+) -> AbstractAsyncContextManager[None]:
+    lock = account.landing_lock
+    if lock is None:
+        return nullcontext()
+    cm: AbstractAsyncContextManager[None] = lock.acquire_shared(key=f"{tenant_id}:{thread_id}")
+    return cm
 
 
 async def _land_and_account(
@@ -495,82 +631,85 @@ async def _land_and_account(
     """
     if account.workspace_store is None:
         raise HTTPException(status_code=503, detail="document upload unavailable: no sandbox")
-    quota_service = account.quota_service
-    if quota_service is not None:
+    # B-282 —— 落盘到审计写完都持着这段会话落盘锁的共享形式:留存作业清闲置会话目录时拿排他
+    # 的那一种,两者不交叉(见 ``PgConversationSeedLock.acquire_shared``)。
+    async with _landing_lock(account, tenant_id=tenant_id, thread_id=thread_id):
+        quota_service = account.quota_service
+        if quota_service is not None:
+            try:
+                # 闸 B(spec § 3.3):写完会超就拦(+incoming >)。与闸 A 的
+                # >= 谓词刻意不同 —— 上传知道 incoming 大小,acquire 不知道。
+                await quota_service.check_upload(
+                    tenant_id=tenant_id, user_id=user_id, incoming_bytes=len(raw)
+                )
+            except WorkspaceQuotaExceededError as exc:
+                # 固定文案不插值异常对象(本文件既有约定);429 与 supervisor 时代的
+                # quota 语义一致。给用户留了自救路:删文件永远放行。
+                logger.warning("upload.workspace_quota_exceeded")
+                raise HTTPException(
+                    status_code=429,
+                    detail="workspace is full — delete files to free space",
+                ) from exc
+
+        # ``workspace_path`` 是**对会话 ``/workspace`` 相对**的 ``uploads/<name>``——它同时是
+        # 回给调用方的 ``upload_id``,也是 run 里 ``read_document`` 收到的参数,两处都相对
+        # 这个会话的 ``/workspace`` 解析(老视图是 agent 根,B-262 起对话视图是本对话的
+        # ``work/``,由 ``conv_id`` 决定),所以这个值不带前缀。
+        #
+        # 落盘要投影:``workspace_store`` 是按 ``(tenant, user)`` 开的,不知道
+        # agent。不投影的话新上传永远落扁平根,而 run 去 agent 根下找——今天靠
+        # 迁移期读回落兜着,Task 14 摘掉回落就断(B-50 补漏)。
+        #
+        # B-262 —— 名字不一定是用户给的那个:同名已被别的内容占了就换名(见
+        # ``_land_document_bytes``)。下面回给调用方、写审计、进 run 的一律是实际落盘的名字。
+        sha256_hex = hashlib.sha256(raw).hexdigest()
         try:
-            # 闸 B(spec § 3.3):写完会超就拦(+incoming >)。与闸 A 的
-            # >= 谓词刻意不同 —— 上传知道 incoming 大小,acquire 不知道。
-            await quota_service.check_upload(
-                tenant_id=tenant_id, user_id=user_id, incoming_bytes=len(raw)
+            landed, reused = await _land_document_bytes(
+                account.workspace_store,
+                tenant_id=tenant_id,
+                user_id=user_id,
+                agent_key=agent_key,
+                conv_id=conv_id,
+                workspace_path=workspace_path,
+                ext=ext,
+                raw=raw,
+                sha256_hex=sha256_hex,
             )
-        except WorkspaceQuotaExceededError as exc:
-            # 固定文案不插值异常对象(本文件既有约定);429 与 supervisor 时代的
-            # quota 语义一致。给用户留了自救路:删文件永远放行。
-            logger.warning("upload.workspace_quota_exceeded")
-            raise HTTPException(
-                status_code=429,
-                detail="workspace is full — delete files to free space",
-            ) from exc
+        except WorkspacePermissionError as exc:
+            # 权限失败是服务端配置问题(共享 uid 没配上/存量目录属主没迁移/mode 不
+            # 对),不是笼统的"上游写失败"——必须排在下面的 SandboxSupervisorError
+            # 之前(它的子类,顺序反了这一分支永远走不到,同六处 workspace 端点的
+            # 坑)。500(而非下面的 502)与那六处的约定一致:服务端配置问题不该被
+            # 当成"上游 502"。detail 是固定文案,不插值异常对象:store 的消息里带
+            # 工作区相对路径,Task A 已经把它从绝对路径/uid/mode 里 scrub 掉了,但
+            # 这里原样 f"...: {exc}" 会把 store 消息原封不动地 echo 回响应体,等于
+            # 白 scrub。
+            logger.warning("upload.write_permission_denied", exc_info=True)
+            raise HTTPException(status_code=500, detail="workspace write failed") from exc
+        except SandboxSupervisorError as exc:
+            # 同上——固定文案,不插值异常对象;诊断细节只进下面这条结构化日志。
+            logger.warning("upload.write_failed", exc_info=True)
+            raise HTTPException(status_code=502, detail="workspace write failed") from exc
 
-    # ``workspace_path`` 是**对会话 ``/workspace`` 相对**的 ``uploads/<name>``——它同时是
-    # 回给调用方的 ``upload_id``,也是 run 里 ``read_document`` 收到的参数,两处都相对
-    # 这个会话的 ``/workspace`` 解析(老视图是 agent 根,B-262 起对话视图是本对话的
-    # ``work/``,由 ``conv_id`` 决定),所以这个值不带前缀。
-    #
-    # 落盘要投影:``workspace_store`` 是按 ``(tenant, user)`` 开的,不知道
-    # agent。不投影的话新上传永远落扁平根,而 run 去 agent 根下找——今天靠
-    # 迁移期读回落兜着,Task 14 摘掉回落就断(B-50 补漏)。
-    #
-    # B-262 —— 名字不一定是用户给的那个:同名已被别的内容占了就换名(见
-    # ``_land_document_bytes``)。下面回给调用方、写审计、进 run 的一律是实际落盘的名字。
-    sha256_hex = hashlib.sha256(raw).hexdigest()
-    try:
-        landed, reused = await _land_document_bytes(
-            account.workspace_store,
+        await audit_emit(
+            account.audit,
             tenant_id=tenant_id,
-            user_id=user_id,
-            agent_key=agent_key,
-            conv_id=conv_id,
-            workspace_path=workspace_path,
-            ext=ext,
-            raw=raw,
-            sha256_hex=sha256_hex,
+            actor_id=account.actor_id,
+            action=AuditAction.DOCUMENT_UPLOAD,
+            resource_type="user_workspace",
+            resource_id=landed,
+            result=AuditResult.SUCCESS,
+            trace_id=current_trace_id_hex(),
+            details={
+                "thread_id": str(thread_id),
+                "workspace_path": landed,
+                "file_size_bytes": len(raw),
+                "mime_type": content_type,
+                "sha256": sha256_hex,
+                "reused_existing": reused,
+                **dict(extra_details or {}),
+            },
         )
-    except WorkspacePermissionError as exc:
-        # 权限失败是服务端配置问题(共享 uid 没配上/存量目录属主没迁移/mode 不
-        # 对),不是笼统的"上游写失败"——必须排在下面的 SandboxSupervisorError
-        # 之前(它的子类,顺序反了这一分支永远走不到,同六处 workspace 端点的
-        # 坑)。500(而非下面的 502)与那六处的约定一致:服务端配置问题不该被
-        # 当成"上游 502"。detail 是固定文案,不插值异常对象:store 的消息里带
-        # 工作区相对路径,Task A 已经把它从绝对路径/uid/mode 里 scrub 掉了,但
-        # 这里原样 f"...: {exc}" 会把 store 消息原封不动地 echo 回响应体,等于
-        # 白 scrub。
-        logger.warning("upload.write_permission_denied", exc_info=True)
-        raise HTTPException(status_code=500, detail="workspace write failed") from exc
-    except SandboxSupervisorError as exc:
-        # 同上——固定文案,不插值异常对象;诊断细节只进下面这条结构化日志。
-        logger.warning("upload.write_failed", exc_info=True)
-        raise HTTPException(status_code=502, detail="workspace write failed") from exc
-
-    await audit_emit(
-        account.audit,
-        tenant_id=tenant_id,
-        actor_id=account.actor_id,
-        action=AuditAction.DOCUMENT_UPLOAD,
-        resource_type="user_workspace",
-        resource_id=landed,
-        result=AuditResult.SUCCESS,
-        trace_id=current_trace_id_hex(),
-        details={
-            "thread_id": str(thread_id),
-            "workspace_path": landed,
-            "file_size_bytes": len(raw),
-            "mime_type": content_type,
-            "sha256": sha256_hex,
-            "reused_existing": reused,
-            **dict(extra_details or {}),
-        },
-    )
     if quota_service is not None and not reused:
         # 记账第 1 层(spec § 3.2):增量入账,便宜且即时。B-262 起上传不再覆盖
         # 同名文件;复用已有文件时没写字节,不记账。写已成功、
@@ -614,6 +753,10 @@ def _get_image_upload_store(request: Request) -> ImageUploadStore:
 
 def _get_workspace_store(request: Request) -> WorkspaceStore | None:
     return getattr(request.app.state, "workspace_store", None)
+
+
+def _get_user_upload_store(request: Request) -> UserUploadStore:
+    return request.app.state.user_upload_store  # type: ignore[no-any-return]
 
 
 async def _prepare_image_upload(
@@ -797,6 +940,7 @@ def build_uploads_router() -> APIRouter:
         audit: Annotated[AuditLogger, Depends(_get_audit)],
         images: Annotated[ImageUploadStore, Depends(_get_image_upload_store)],
         workspace_store: Annotated[WorkspaceStore | None, Depends(_get_workspace_store)],
+        uploads: Annotated[UserUploadStore, Depends(_get_user_upload_store)],
     ) -> JSONResponse:
         tenant_id: UUID = request.state.tenant_id
 
@@ -835,6 +979,22 @@ def build_uploads_router() -> APIRouter:
                 workspace_store=workspace_store,
                 audit=audit,
             )
+            # B-281 —— 同对外上传建登记行,留存作业才管得到它。行记在落盘的那个工作区(调用者
+            # 自己的)名下;``caller_user_id`` 为空的请求上面已经 400 了。控制台响应不回
+            # ``upl_`` id(形状不变);对外接口的 ``user_id`` 带 ``ext:`` 前缀,摸不到这些行。
+            # 只登记落进本对话自己目录的:落在共享根(老视图的 agent 根 / 没绑 agent 的用户根)的
+            # 文件别的会话也看得到、可能用着,留存作业的引用检查只认登记行,登记了到期就会删掉
+            # 别人还在用的文件 —— 那里照旧不登记(:func:`landing_is_registrable`)。
+            assert caller_user_id is not None  # noqa: S101
+            if landing_is_registrable(meta):
+                await register_document_upload(
+                    uploads,
+                    tenant_id=tenant_id,
+                    user_id=caller_user_id,
+                    thread_id=thread_id,
+                    landed=result,
+                    mime_type=content_type,
+                )
             return JSONResponse(
                 status_code=201,
                 content={"path": result.path, "kind": "document"},

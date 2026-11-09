@@ -123,3 +123,38 @@
   看到这条日志先查该轮实际时长(通常是部署当天的 backlog 轮——PR-1→PR-2 之间攒的整批归档
   + 首次全树 du 一次追平,量级远超稳态后的 30 分钟一轮)。
 - **配额显示与实际不符**:30 分钟粒度 + 同名覆盖上传重复计数是已知偏差,全量扫兜正。
+
+## 彻底删除智能体留下的隔离区(B-278)
+
+**是什么**:控制台「彻底删除」一个智能体时,要删掉每个用户的 `agents/<agent_key>/`、
+`.agent-file-versions/<user>/<agent_key>/` 和老布局的对话目录。删除先给我们自己拥有的目录补回
+属主权限(不经符号链接)、不递归地删、删完 `lstat` 核实;**仍然删不掉**的(典型:目录里有别的
+uid 的文件)会被改名挪进用户根旁边的隔离区:
+
+```
+{NAS 根}/{tenant_id}/.purged-agents/{user_id}/{原名}-{unix 秒}-{8 位随机}
+```
+
+- 与用户根同一个挂载,挪过去是一次 `rename`;跨设备(`EXDEV`)算失败,智能体停在 `purging`。
+- 在用户根**外面**:沙箱(只挂 `{tenant}/{user}`)、控制台工作区浏览、配额统计、janitor / 留存按
+  agent 目录的清理都看不到它;同名新智能体也继承不到。
+- 彻底删除的汇总(审计 `manifest:purge` 的 details、接口返回)里 `nas_quarantined` 是挪进来的个数。
+
+**谁清理**:留存作业(`retention-cleanup-job`,`retention_cleanup_job.purged_agents`)每天按名字里的
+时间删掉满 7 天的条目。作业结束的那行日志 `retention_cleanup_job.done … purged_agent_dirs_removed=N
+purged_agent_dirs_failed=M … failed_passes=…` 带这两个计数;有删不掉的,`failed_passes` 带
+`purged_agents`、作业以非 0 退出,并且每个删不掉的条目各有一行
+`safe_remove.sweep_entry_failed tenant_id=… owner_id=… entry=…`(整个租户 / 用户目录打不开时是
+`safe_remove.sweep_tenant_unavailable` / `safe_remove.sweep_owner_unavailable`)。一个条目失败不影响
+其它条目;名字形状不对的条目(不是 `{原名}-{秒}-{8 位 hex}`)不碰、不计数。
+
+清除用户(成员页「清除」)时,这个用户的 `.purged-agents/{user_id}` 整个随之删掉
+(`purge_user` 汇总里的 `deleted.purged_agents`),不等 7 天。
+
+**删不掉时**:按 `safe_remove.sweep_entry_failed` 那行的 `tenant_id` / `owner_id` / `entry` 登上 NAS
+挂载点看 `{根}/{tenant_id}/.purged-agents/{owner_id}/{entry}` 的属主(`ls -ln`),多半是别的 uid 的
+文件,用该 uid 或 root 删掉即可。
+
+**智能体卡在 `purging`**:汇总 `failures` 里有 `agent_workspace` / `agent_file_version`、
+`nas_failed_users` 非 0 = 有用户的目录既删不掉也挪不进隔离区(例:隔离区父目录不可写、跨设备)。
+修好 NAS 权限后在控制台再点一次「彻底删除」即可;只有这些用户的对话 / 产物 / 实例绑定会留到重跑。

@@ -63,7 +63,7 @@ class InMemoryAuditLogStore(AuditLogStore):
         tenant_id: UUID,
         thread_ids: Collection[UUID],
         since: datetime,
-        until: datetime,
+        until: datetime | None = None,
     ) -> list[AuditEntry]:
         wanted = {str(t) for t in thread_ids}
         rows = [
@@ -74,7 +74,8 @@ class InMemoryAuditLogStore(AuditLogStore):
             and r.result == AuditResult.SUCCESS
             and (r.details or {}).get("thread_id") in wanted
             and r.occurred_at is not None
-            and since <= r.occurred_at <= until
+            and since <= r.occurred_at
+            and (until is None or r.occurred_at <= until)
         ]
         return sorted(rows, key=lambda r: r.id or 0)
 

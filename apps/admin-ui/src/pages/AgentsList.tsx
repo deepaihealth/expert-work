@@ -53,6 +53,7 @@ import {
   getAgent,
   disableAgent,
   enableAgent,
+  isDeletedStatus,
   type AgentRecord,
   type AgentList,
 } from "../api/agents";
@@ -71,6 +72,7 @@ const STATUS_COLOR: Record<string, string> = {
   draft: "warning",
   archived: "default",
   deleted: "error",
+  purging: "error",
 };
 
 //: Statuses offered in the filter — the closed set the backend assigns.
@@ -158,9 +160,9 @@ function AgentRowActions({
     });
   }, [modal, message, t, record.name, onChanged]);
 
-  // A soft-deleted version can't be played/edited/disabled/re-deleted —
-  // its menu keeps only the read-only run history entry.
-  const isDeleted = record.status === "deleted";
+  // A soft-deleted (or half-purged, B-278) version can't be played/edited/
+  // disabled/re-deleted — its menu keeps only the read-only run history entry.
+  const isDeleted = isDeletedStatus(record.status);
 
   return (
     <Dropdown
@@ -279,7 +281,9 @@ export function AgentsList() {
   // soft-deleted version is history, not a working agent); "all" = truly
   // everything incl. deleted. Both fetch without a server-side status
   // param (the backend filter is single-status only) — "default" drops
-  // deleted rows client-side below.
+  // deleted rows client-side below. B-278: a half-purged name (``purging``)
+  // counts as deleted — hidden by "default"; the server's ``status=deleted``
+  // already returns both ``deleted`` and ``purging`` rows.
   const [statusFilter, setStatusFilter] = useState<string>("default");
 
   const refresh = useCallback(async () => {
@@ -290,13 +294,11 @@ export function AgentsList() {
         tenantScope: apiTenantScope,
         name: nameFilter.trim() || undefined,
         status:
-          statusFilter === "default" || statusFilter === "all"
-            ? undefined
-            : statusFilter,
+          statusFilter === "default" || statusFilter === "all" ? undefined : statusFilter,
       });
       setData(
         statusFilter === "default"
-          ? { ...result, items: result.items.filter((a) => a.status !== "deleted") }
+          ? { ...result, items: result.items.filter((a) => !isDeletedStatus(a.status)) }
           : result,
       );
     } catch (err) {

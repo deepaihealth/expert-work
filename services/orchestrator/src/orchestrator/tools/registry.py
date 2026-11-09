@@ -39,6 +39,9 @@ WORKSPACE_THREAD_ID_KEY = "workspace_thread_id"
 #: platform_migration``):这一轮的平台段给模型一句一次性说明。只有起新 run 的入口写它;
 #: ``_child_config`` 不往子代传。
 WORKSPACE_MIGRATED_KEY = "workspace_migrated"
+#: B-282 —— 留存作业在上一轮之后清掉了这段会话闲置的工作目录:这一轮的平台段给模型一句一次性
+#: 说明。只有起新 run 的入口写它;``_child_config`` 不往子代传。
+WORKSPACE_CLEANED_KEY = "workspace_cleaned"
 #: B-262 —— ``_child_run._child_config`` 给子代写父对话渲染过页的 run(见
 #: :attr:`ToolContext.figure_run_ids`)。
 FIGURE_RUN_IDS_KEY = "figure_run_ids"
@@ -636,6 +639,8 @@ class ToolRegistry:
         #: ``allow_tools`` 会把别人绑的那个工具挡在它那一次循环之外 —— 拿单次注册
         #: 的剩余项当答案,就会对一条**好好落了**的绑定谎报「目录里没这个工具」。
         self._landed_arg_bindings: dict[tuple[str, str], str] = {}
+        #: B-294 —— 本次构建因连不上而跳过的 MCP 服务(按首次出现的顺序、不重复)。
+        self._skipped_mcp_servers: list[str] = []
 
     def register(self, tool: Tool, *, deferred: bool = False, source: str | None = None) -> None:
         """Register a tool by its spec ``name``. Re-registering replaces.
@@ -759,6 +764,16 @@ class ToolRegistry:
         同一 ``(server, tool)`` 再次落地会覆盖 —— 后一次注册的就是活着的那个。
         """
         self._landed_arg_bindings[server, tool] = wire_name
+
+    def note_skipped_mcp_server(self, server: str) -> None:
+        """B-294 —— 这台 MCP 服务本次构建连不上,它的工具一个都没注册。
+        多个 ``mcp`` 条目会各注册一遍同一台服务器,同一台只记一次。"""
+        if server not in self._skipped_mcp_servers:
+            self._skipped_mcp_servers.append(server)
+
+    def skipped_mcp_servers(self) -> tuple[str, ...]:
+        """B-294 —— 本次构建因连不上而跳过的 MCP 服务;非空时这次构建只短暂缓存。"""
+        return tuple(self._skipped_mcp_servers)
 
     def landed_arg_bindings(self) -> dict[tuple[str, str], str]:
         """真落了地的绑定:``(server, 裸工具名) → 注册用的 wire 名``。

@@ -65,11 +65,14 @@ class AuditLogStore(abc.ABC):
         tenant_id: UUID,
         thread_ids: Collection[UUID],
         since: datetime,
-        until: datetime,
+        until: datetime | None = None,
     ) -> list[AuditEntry]:
         """B-271 —— 一批会话的成功 ``document:upload`` 审计行(``details.thread_id`` 在
         ``thread_ids`` 里,``since <= occurred_at <= until``),按发生先后。留存作业按它给没有
-        sha256 的老上传行找登记时的 sha256 —— 一个租户一次读,不逐行查。"""
+        sha256 的老上传行找登记时的 sha256 —— 一个租户一次读,不逐行查。
+
+        B-282 —— ``until`` 为 ``None`` = 不设上界(``occurred_at`` 是库的 ``now()``,调用方的
+        时钟和它对不齐)。"""
 
     @abc.abstractmethod
     async def query(self, query: AuditQuery) -> AuditPage:

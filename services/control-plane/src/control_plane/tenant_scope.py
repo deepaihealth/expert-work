@@ -39,6 +39,7 @@ from uuid import UUID
 from fastapi import HTTPException, Request
 
 from control_plane.audit import emit
+from expert_work.persistence.rls import bypass_rls_session as bypass_rls_session
 from expert_work.persistence.rls import bypass_rls_var, current_tenant_id_var
 from expert_work.protocol import AuditAction, Principal
 from expert_work.runtime.audit.logger import AuditLogger
@@ -349,23 +350,9 @@ async def ensure_single_tenant_scope(
 # ---------------------------------------------------------------------------
 
 
-@asynccontextmanager
-async def bypass_rls_session() -> AsyncIterator[None]:
-    """Async context manager flipping ``bypass_rls_var=True`` for the body.
-
-    Matches the existing per-worker bypass pattern
-    (``CurationWorker._bypass_rls`` / ``Scheduler._bypass_rls``) but
-    exposed as a public helper for HTTP endpoints that have just
-    resolved to :class:`CrossTenant`. Resets ContextVar on exit so
-    nested calls inherit cleanly.
-    """
-    bypass = bypass_rls_var.set(True)
-    tenant = current_tenant_id_var.set(None)
-    try:
-        yield
-    finally:
-        current_tenant_id_var.reset(tenant)
-        bypass_rls_var.reset(bypass)
+# B-286 —— defined once in :mod:`expert_work.persistence.rls` (the retention job's secret store
+# needs it without importing control-plane); this name stays the control plane's import path.
+# Exposed for HTTP endpoints that have just resolved to :class:`CrossTenant`.
 
 
 @asynccontextmanager

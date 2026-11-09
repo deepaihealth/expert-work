@@ -2,7 +2,8 @@
  * DeleteAgentModal — the high-risk, type-to-confirm gate for
  * ``DELETE /v1/agents/{name}/{version}`` (soft delete: flips this exact
  * version's status to ``DELETED``; other versions of the agent are
- * untouched and there is no undelete endpoint).
+ * untouched). B-278: the detail page of a deleted version can restore it or
+ * purge the whole name.
  *
  * Mirrors ``user_profile/PurgeUserModal``'s type-to-confirm pattern: the
  * admin must type the agent's ``name`` verbatim to arm the danger button.

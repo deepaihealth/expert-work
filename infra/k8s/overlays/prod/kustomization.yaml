@@ -81,3 +81,4 @@ patches:
 - path: langfuse-configmap-patch.yaml
 - path: langfuse-ingress-patch.yaml
 - path: workspace-nas-patch.yaml
+- path: retention-cleanup-patch.yaml

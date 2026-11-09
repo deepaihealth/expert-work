@@ -100,6 +100,16 @@ describe("HistoryTab", () => {
     expect(screen.getByTestId("history-rollback-1")).toBeInTheDocument();
   });
 
+  // B-278 — a deleted version keeps its history viewable but can't roll back.
+  it("readOnly (deleted agent) lists revisions without any rollback button", async () => {
+    vi.spyOn(agentsSdk, "listRevisions").mockResolvedValue({ items: summaries });
+
+    render(<HistoryTab detail={detail} onRolledBack={vi.fn()} readOnly />);
+
+    await waitFor(() => expect(screen.getByText("#1")).toBeInTheDocument());
+    expect(screen.queryByTestId("history-rollback-1")).toBeNull();
+  });
+
   it('maps the "*" aggregate scope to no tenant_id (backend 422s a literal "*")', async () => {
     tenantScopeRef.current = "*";
     const listMock = vi

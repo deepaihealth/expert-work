@@ -22,6 +22,7 @@ from sqlalchemy import delete, func, select, text, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from expert_work.persistence.bulk_delete import count_in_chunks
 from expert_work.persistence.models.feedback import FeedbackRow
 
 #: Stream HX-2 — cross-tenant scan role (ledger/audit precedent).
@@ -123,6 +124,10 @@ class FeedbackStore(abc.ABC):
         """
 
     @abc.abstractmethod
+    async def count_for_threads(self, *, tenant_id: UUID, thread_ids: Sequence[UUID]) -> int:
+        """B-278 —— rows ``delete_for_threads`` would remove (agent purge preview)."""
+
+    @abc.abstractmethod
     async def upsert(self, record: FeedbackRecord) -> tuple[FeedbackRecord, bool]:
         """Insert-or-overwrite keyed by ``(tenant_id, run_id, actor_id)`` — P-2「可改票」.
 
@@ -197,6 +202,10 @@ class InMemoryFeedbackStore(FeedbackStore):
             r for r in self._rows if not (r.tenant_id == tenant_id and r.thread_id in wanted)
         ]
         return before - len(self._rows)
+
+    async def count_for_threads(self, *, tenant_id: UUID, thread_ids: Sequence[UUID]) -> int:
+        wanted = set(thread_ids)
+        return sum(1 for r in self._rows if r.tenant_id == tenant_id and r.thread_id in wanted)
 
     async def upsert(self, record: FeedbackRecord) -> tuple[FeedbackRecord, bool]:
         if record.run_id is None:
@@ -342,6 +351,15 @@ class DbFeedbackStore(FeedbackStore):
                 total += int(getattr(result, "rowcount", 0) or 0)
             await session.commit()
         return total
+
+    async def count_for_threads(self, *, tenant_id: UUID, thread_ids: Sequence[UUID]) -> int:
+        return await count_in_chunks(
+            self._sf,
+            FeedbackRow,
+            FeedbackRow.thread_id,
+            list(thread_ids),
+            FeedbackRow.tenant_id == tenant_id,
+        )
 
     async def upsert(self, record: FeedbackRecord) -> tuple[FeedbackRecord, bool]:
         if record.run_id is None:

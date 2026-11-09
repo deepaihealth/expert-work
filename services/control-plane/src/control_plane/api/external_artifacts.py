@@ -53,6 +53,7 @@ from fastapi.responses import JSONResponse, Response
 
 from control_plane.api._artifact_content import (
     VERSION_HEADER,
+    VersionExpired,
     VersionNotRetained,
     VersionUnknown,
     choose_version,
@@ -296,6 +297,14 @@ def build_external_artifacts_router() -> APIRouter:
                 f"artifact {name!r} has no version {version}; the latest is {latest.version}",
                 409,
             )
+        except VersionExpired:
+            # B-63 —— 错误码不变(对接方按码分支),原因写在 ``message`` 里。
+            return _artifact_error(
+                "ARTIFACT_VERSION_MISMATCH",
+                f"version {version} of artifact {name!r} was removed after its retention "
+                f"period; the latest is {latest.version}",
+                409,
+            )
         except VersionNotRetained:
             return _artifact_error(
                 "ARTIFACT_VERSION_MISMATCH",
@@ -337,6 +346,8 @@ def build_external_artifacts_router() -> APIRouter:
                 user_id=end_user_id,
                 snapshots=snapshots,
                 workspace_store=workspace_store,
+                artifacts=store,
+                record_use=True,
             )
         except WorkspacePermissionError:
             # 元数据行在、内容读不动是权限问题(服务端配置),不是「不存在」——

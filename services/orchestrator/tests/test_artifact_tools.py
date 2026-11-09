@@ -749,3 +749,38 @@ async def test_implicit_save_artifact_is_skipped_without_a_snapshot_store() -> N
     registry = await build_tool_registry([], tool_env=env)
     assert registry.get("save_artifact") is None
     assert isinstance(registry.get("list_artifacts"), ListArtifactsTool)
+
+
+# ---------------------------------------------------------------------------
+# B-63 —— 产物的保留期按「登记它的会话最后一次 run」续命:``created_in_thread`` 必须是
+# ``agent_run`` 里查得到的 run。委派出的子代(静态子 Agent / worker)每次新铸的 run id 从不
+# 落 ``agent_run``,所以子代登记的产物记**父**的 run id(``inputs_run_id``,``_child_config``
+# 带下来的就是它);主 run 没有 ``inputs_run_id`` 时用自己的 ``run_id``。
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_a_sub_agent_artifact_records_the_parent_run_id() -> None:
+    store = InMemoryArtifactStore()
+    tool = SaveArtifactTool(snapshots=_snapshots(), store=store, client=_sandbox())
+    parent_run, child_run = uuid4(), uuid4()
+    ctx = ToolContext(
+        tenant_id=uuid4(), run_id=child_run, user_id=uuid4(), inputs_run_id=parent_run
+    )
+
+    await tool.call({"name": "report.md"}, ctx=ctx)
+
+    (version,) = store._versions
+    assert version.created_in_thread == str(parent_run)
+
+
+@pytest.mark.asyncio
+async def test_a_main_run_artifact_records_its_own_run_id() -> None:
+    store = InMemoryArtifactStore()
+    tool = SaveArtifactTool(snapshots=_snapshots(), store=store, client=_sandbox())
+    ctx = _ctx()
+
+    await tool.call({"name": "report.md"}, ctx=ctx)
+
+    (version,) = store._versions
+    assert version.created_in_thread == str(ctx.run_id)

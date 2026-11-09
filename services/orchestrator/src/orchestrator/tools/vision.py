@@ -50,18 +50,21 @@ from expert_work.runtime.middleware.llm_error_handling import (
     LLMClientError,
     LLMUnauthorizedError,
 )
+from expert_work.runtime.storage.base import ObjectNotFoundError
 from orchestrator.llm.truncation import (
     ServedOutputCap,
     is_unusable_truncation,
     output_truncated_total,
 )
 from orchestrator.multimodal import (
+    UPLOAD_IMAGE_GONE_TEXT,
     WORKSPACE_IMAGE_EXTENSIONS,
     ImageResolver,
     image_ref_block,
     is_missing_file,
     parse_rendered_figure_ref,
     unreadable_workspace_image_text,
+    upload_image_id_for_log,
 )
 from orchestrator.tools._guards import usage_total
 from orchestrator.tools.error_classifier import GuidedTimeoutError, GuidedToolError
@@ -422,6 +425,7 @@ class AskImageTool:
             raise ToolBlockedError(msg)
         if not ref_str.startswith(WORKSPACE_REF_PREFIX):
             _refuse_another_conversations_upload(parse_image_ref(ref_str), ctx)
+            await self._require_present_upload_image(ref_str)
         if ref_str.startswith(WORKSPACE_REF_PREFIX):
             _refuse_another_conversations_run(parse_workspace_image_ref(ref_str), ctx)
             await self._require_readable_workspace_image(ref_str)
@@ -1080,6 +1084,33 @@ class AskImageTool:
             if is_missing_file(exc):
                 raise FileNotFoundError(message) from exc
             raise RuntimeError(message) from exc
+
+    async def _require_present_upload_image(self, ref_str: str) -> None:
+        """B-283 —— 上传图的字节已经不在了(过了保留期被清理、或被删)就让这一次工具调用显式失败。
+
+        适配器那一层(``multimodal.resolve_message_images``)对这种图降级成一段文字,因为另一
+        个选择是这条会话以后每一轮都失败。到了 ``ask_image`` 这里,那段文字会被交给 VL 模型,
+        VL 回一句「看不到图」,主模型会把它当成看图的结果 —— 与工作区图那道预检
+        (:meth:`_require_readable_workspace_image`)同一个理由。这里抛 ``FileNotFoundError``
+        (``tools`` 节点把它包成 ``status="error"``、错误分类 ``resource_not_found``),文字就是
+        降级那一句,VL 不被调用。
+
+        **只认「不在了」**:别的失败(对象存储暂时故障……)不在这里报,留给后面真正读图的
+        那一次照旧报出来 —— 与加这道预检之前的行为一样。外层是
+        :class:`~orchestrator.multimodal.CachingImageResolver` 时,这次读到的字节会被缓存,
+        后面 VL 那一次不再多读一遍。
+        """
+        try:
+            await self.image_resolver.resolve(ref_str)
+        except ObjectNotFoundError as exc:
+            raise FileNotFoundError(UPLOAD_IMAGE_GONE_TEXT) from exc
+        except Exception as exc:
+            # 只探「不在了」;别的失败留给后面真正读图的那一次报(那里会原样抛出)。
+            logger.debug(
+                "ask_image.upload_probe_failed image_id=%s error=%s",
+                upload_image_id_for_log(ref_str),
+                type(exc).__name__,
+            )
 
 
 def _spec_with_short_form() -> ToolSpec:

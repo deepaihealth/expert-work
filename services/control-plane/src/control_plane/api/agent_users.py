@@ -34,6 +34,7 @@ from control_plane.api._authz import console_only, require
 from control_plane.api._user_scope import get_user_repo, resolve_target_user_id
 from control_plane.audit import emit
 from control_plane.purge import PurgeUserDeps, purge_user
+from control_plane.purge.trajectories import trajectory_store_for
 from control_plane.tenant_scope import (
     CrossTenant,
     SingleTenant,
@@ -331,13 +332,23 @@ def _build_purge_deps(request: Request) -> PurgeUserDeps:
         skills=state.skill_store,
         eval_datasets=state.eval_dataset_store,
         curation_candidates=state.curation_candidate_store,
+        quality_scores=state.quality_score_store,
         retrieval_logs=state.knowledge_retrieval_log_store,
         tenant_users=state.tenant_user_repo,
         audit=state.audit_logger,
         workspace_store=getattr(state, "workspace_store", None),
         artifact_snapshots=getattr(state, "artifact_snapshots", None),
         agent_file_versions=getattr(state, "agent_file_versions", None),
+        workspace_root=_nas_root(getattr(state, "workspace_store", None)),
+        trajectories=trajectory_store_for(state.agent_runtime),
     )
+
+
+def _nas_root(workspace_store: object) -> str | None:
+    """The NAS root when the workspace store is the NAS one (B-278 holding area)."""
+    from orchestrator.tools.nas_workspace_store import NasWorkspaceStore
+
+    return workspace_store.root if isinstance(workspace_store, NasWorkspaceStore) else None
 
 
 def build_tenant_users_router() -> APIRouter:

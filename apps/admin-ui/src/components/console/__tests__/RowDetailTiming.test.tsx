@@ -316,6 +316,34 @@ describe("RowDetailTiming — 成本按平台价目表(B-202)", () => {
     expect(costCells()).toEqual(["¥0.4800"]);
   });
 
+  it("B-279 —— Anthropic 主 Agent:输入不扣缓存,缓存写入按写入价另算(与月度计费同口径)", () => {
+    // 每百万 token:输入 3 / 命中 0.3 / 写入 3.75 / 输出 15 元。
+    const claudeBook: RateBook = {
+      agentKey: rateKey("anthropic", "claude-x"),
+      byModel: new Map([
+        [
+          rateKey("anthropic", "claude-x"),
+          {
+            id: "rc-c", tenant_id: null, provider: "anthropic", model: "claude-x",
+            input_per_mtok_micros: 3_000_000, output_per_mtok_micros: 15_000_000,
+            cache_creation_per_mtok_micros: 3_750_000, cache_read_per_mtok_micros: 300_000,
+          },
+        ],
+      ]),
+    };
+    render(
+      <RowDetailTiming
+        row={assistantRow({ inputTokens: 10_000, outputTokens: 1_000, cacheReadTokens: 90_000, cacheCreationTokens: 20_000 })}
+        {...noTrace}
+        traceLoading={false}
+        onRefreshTrace={() => {}}
+        rateBook={claudeBook}
+      />,
+    );
+    // 10k × 3 + 90k × 0.3 + 20k × 3.75 + 1k × 15,每百万 → ¥0.147(旧算法 ¥0.042)
+    expect(costCells()).toEqual(["¥0.1470"]);
+  });
+
   it("没有价目表(非 system_admin)→ 「—」;非模型调用的行没有成本这一行(B-203)", () => {
     const { unmount } = render(
       <RowDetailTiming

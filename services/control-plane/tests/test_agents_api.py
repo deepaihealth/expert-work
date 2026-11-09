@@ -281,9 +281,30 @@ async def test_delete_soft_removes(b5_client: AsyncClient) -> None:
     # raised "Response content longer than Content-Length" after replying.
     assert response.content == b""
 
-    # GET no longer returns the row (soft-deleted rows are hidden).
+    # B-278 —— the detail read still returns the row (the list's "deleted" filter
+    # links here), marked deleted, so the page can offer restore / purge.
     follow_up = await b5_client.get("/v1/agents/code-reviewer/1.0.0")
-    assert follow_up.status_code == 404
+    assert follow_up.status_code == 200, follow_up.text
+    assert follow_up.json()["data"]["record"]["status"] == "deleted"
+    revisions = await b5_client.get("/v1/agents/code-reviewer/1.0.0/revisions")
+    assert revisions.status_code == 200, revisions.text
+    assert [r["revision"] for r in revisions.json()["data"]["items"]] == [1]
+
+
+@pytest.mark.asyncio
+async def test_create_over_a_deleted_same_name_returns_409_deleted(b5_client: AsyncClient) -> None:
+    """B-278 —— re-creating a deleted name gets its own 409 code, so the console
+    can offer restore / purge instead of a dead-end "already exists"."""
+    await b5_client.post("/v1/agents", json={"manifest_yaml": _VALID_YAML})
+    got_1 = await b5_client.delete("/v1/agents/code-reviewer/1.0.0")
+    assert got_1.status_code == 204
+
+    response = await b5_client.post("/v1/agents", json={"manifest_yaml": _VALID_YAML})
+
+    assert response.status_code == 409
+    error = response.json()["error"]
+    assert error["code"] == "MANIFEST_DUPLICATE_DELETED"
+    assert error["details"] == {"name": "code-reviewer", "version": "1.0.0", "status": "deleted"}
 
 
 @pytest.mark.asyncio
@@ -681,6 +702,8 @@ async def test_delete_disables_only_this_versions_triggers(cascade_ctx: _Cascade
 
     details = await _manifest_delete_details(cascade_ctx)
     assert details["triggers_disabled"] == 1
+    # B-278 —— which triggers the delete (not a person) turned off, for a later restore.
+    assert details["disabled_trigger_ids"] == [str(target.id)]
     assert details["runs_cancelled"] == 0
     assert "triggers_disable_failed" not in details
     assert "runs_cancel_failed" not in details
@@ -1141,6 +1164,37 @@ async def test_a_fixed_param_the_tool_does_not_declare_yet_gets_its_own_warning(
         "until it does and the agent is rebuilt: records/fetch_record (detail_level)"
     ) in warning
     assert "(project_code, detail_level)" not in warning
+
+
+@pytest.mark.asyncio
+async def test_a_server_unreachable_at_save_time_is_named_in_the_warning(
+    b5_app_client: tuple[object, AsyncClient],
+) -> None:
+    """B-294 —— 试建时某台 MCP 服务连不上,构建跳过它照常成功;保存照常,但要说出来:
+    它的工具和参数绑定这次都没核对。与落空绑定的告警并存。"""
+    app, client = b5_app_client
+
+    async def _built(spec, *, tenant_id=None, user_id=None):
+        return SimpleNamespace(
+            skipped_mcp_servers=("deepcare",),
+            unmatched_arg_bindings=(
+                UnmatchedArgBinding(
+                    server="records", tool="fetch", params=("pc",), reason="tool_missing"
+                ),
+            ),
+        )
+
+    app.state.agent_runtime.agent_builder = _built  # type: ignore[attr-defined]
+
+    resp = await client.post("/v1/agents", json={"manifest_yaml": _VALID_YAML})
+    assert resp.status_code == 201, resp.text
+    warning = resp.json()["data"]["build_warning"]
+    assert warning is not None
+    assert (
+        "MCP server(s) could not be reached during this save check, so their tools and "
+        "arg_bindings were not checked: deepcare"
+    ) in warning
+    assert "no such tool in the assembled catalog: records/fetch" in warning
 
 
 # B-112 —— 模型名写错:以前构建放行,第一个 run 才被厂商 404(4xx 不切备用)。

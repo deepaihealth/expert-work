@@ -37,6 +37,9 @@ from retention_cleanup_job import job as job_module
 from retention_cleanup_job import main as main_module
 from retention_cleanup_job import uploads as uploads_module
 from retention_cleanup_job import workspace_files
+from retention_cleanup_job.agent_file_versions import VersionSweepTally
+from retention_cleanup_job.agent_roots import AgentRootTally
+from retention_cleanup_job.conversation_dirs import ConversationDirTally
 from retention_cleanup_job.job import RetentionCleanupJob
 from retention_cleanup_job.main import EXIT_PASS_FAILED, exit_code
 from retention_cleanup_job.uploads import UploadSweepTally
@@ -524,7 +527,7 @@ async def test_a_row_inserted_between_the_check_and_the_unlink_keeps_the_file(
     second = await world.thread(layout="agent_root")
     shared = world.place(first)
     await world.register(first.thread_id)
-    real_list = world.uploads.list_active_by_ref
+    real_list = world.uploads.list_unexpired_by_ref
     calls: list[int] = []
 
     async def _list_with_a_late_insert(**kwargs: object) -> object:
@@ -533,7 +536,7 @@ async def test_a_row_inserted_between_the_check_and_the_unlink_keeps_the_file(
             await world.register(second.thread_id, created_at=datetime.now(UTC))
         return await real_list(**kwargs)  # type: ignore[arg-type]
 
-    monkeypatch.setattr(world.uploads, "list_active_by_ref", _list_with_a_late_insert)
+    monkeypatch.setattr(world.uploads, "list_unexpired_by_ref", _list_with_a_late_insert)
 
     assert _counts(await world.job()._sweep_uploads()) == (1, 0, 0)
 
@@ -776,6 +779,23 @@ def _stub_sql_passes(job: RetentionCleanupJob) -> None:
     job._delete_finished_knowledge_tasks = _zero  # type: ignore[method-assign]
     job._delete_orphaned_knowledge_revisions = _zero  # type: ignore[method-assign]
     job._delete_expired_jwt_blacklist = _jwt  # type: ignore[method-assign]
+
+    async def _conversations() -> ConversationDirTally:
+        # B-282 —— 闲置会话目录这条 pass 选会话靠 Postgres(``test_conversation_dirs.py`` 管它)。
+        return ConversationDirTally()
+
+    job._sweep_conversation_dirs = _conversations  # type: ignore[method-assign]
+
+    async def _agent_roots() -> AgentRootTally:
+        # B-284 —— agent 根存量要查 Postgres(``test_agent_roots.py`` 管它);版本区那条在
+        # ``test_agent_file_versions_sweep.py``。这里的用例只看上传 / 工作区规则。
+        return AgentRootTally()
+
+    async def _file_versions() -> VersionSweepTally:
+        return VersionSweepTally()
+
+    job._sweep_agent_roots = _agent_roots  # type: ignore[method-assign]
+    job._sweep_agent_file_versions = _file_versions  # type: ignore[method-assign]
 
 
 @pytest.mark.asyncio
@@ -1235,3 +1255,131 @@ async def test_unreadable_roots_for_many_users_abort_the_pass_keeping_its_tally(
     assert not any([await who.deleted(upload) for who, upload in locked])
     # 中止之后的行这一轮没处理。
     assert last_file.exists() and not await world.deleted(last_upload)
+
+
+# ------------------------------------------------------------ B-63 (last use)
+
+
+async def _used(world: _World, upload_id: UUID, *, days_ago: int) -> None:
+    key = (world.tenant, upload_id)
+    world.uploads._rows[key] = world.uploads._rows[key].model_copy(
+        update={"last_used_at": datetime.now(UTC) - timedelta(days=days_ago)}
+    )
+
+
+@pytest.mark.asyncio
+async def test_an_old_upload_used_recently_is_kept_with_its_file(world: _World) -> None:
+    """B-63 —— 200 天前上传、10 天前还用过:没到期,行与文件都留着。"""
+    meta = await world.thread(layout="conversation")
+    real = world.place(meta)
+    upload = await world.register(
+        meta.thread_id, created_at=datetime.now(UTC) - timedelta(days=200)
+    )
+    await _used(world, upload, days_ago=10)
+
+    assert _counts(await world.job()._sweep_uploads()) == (0, 0, 0)
+
+    assert real.read_bytes() == _BODY
+    assert not await world.deleted(upload)
+
+
+@pytest.mark.asyncio
+async def test_a_recently_used_row_on_the_same_file_holds_it(world: _World) -> None:
+    """B-63 —— 引用检查用同一个时钟:另一条行按上传时间早该到期,但 5 天前用过 → 它还活着,
+    共用的文件不删;到期的这行照样软删。"""
+    first = await world.thread(layout="agent_root")
+    second = await world.thread(layout="agent_root")
+    shared = world.place(first)
+    old = await world.register(first.thread_id)
+    used = await world.register(second.thread_id)
+    await _used(world, used, days_ago=5)
+
+    assert _counts(await world.job()._sweep_uploads()) == (1, 0, 0)
+
+    assert shared.read_bytes() == _BODY
+    assert await world.deleted(old)
+    assert not await world.deleted(used)
+
+
+@pytest.mark.asyncio
+async def test_giving_up_counts_from_the_last_use_expiry_not_the_upload_time(
+    world: _World, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """B-63 —— 「过了到期日 7 天还在失败」从**最后使用**的到期日算:200 天前上传、92 天前用过
+    (2 天前才到期)的行暂时失败 → 明天再试,不当成过期太久放弃。"""
+    meta = await world.thread(layout="conversation")
+    real = world.place(meta)
+    upload = await world.register(
+        meta.thread_id, created_at=datetime.now(UTC) - timedelta(days=200)
+    )
+    await _used(world, upload, days_ago=92)
+    _fail_reading_with(monkeypatch, errno.EIO)
+
+    tally = await world.job()._sweep_uploads()
+
+    assert (_counts(tally), tally.rows_failed, tally.rows_abandoned) == ((0, 0, 0), 1, 0)
+    assert real.exists()
+    assert not await world.deleted(upload)
+
+
+@pytest.mark.asyncio
+async def test_a_deferred_row_still_failing_a_week_past_expiry_needs_attention(
+    world: _World, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """B-63 —— 放弃被租户配置改动推迟(``give_up_from`` 晚于到期日)时,行这一轮照样重试;但它
+    已经过了到期日 7 天还在失败 —— 记 ``rows_failing_overdue``,pass 记失败(进程非 0 退出,
+    告警会响),不能静悄悄地一天天拖下去。"""
+    from expert_work.persistence.user_upload import ExpiredUpload
+
+    meta = await world.thread(layout="conversation")
+    world.place(meta)
+    upload_id = await world.register(
+        meta.thread_id, created_at=datetime.now(UTC) - timedelta(days=100)
+    )
+    row = await world.uploads.get(upload_id=upload_id, tenant_id=world.tenant)
+    assert row is not None
+    expired_at = datetime.now(UTC) - timedelta(days=10)
+
+    async def _deferred(**_kwargs: object) -> list[ExpiredUpload]:
+        return [ExpiredUpload(upload=row, expires_at=expired_at, give_up_from=datetime.now(UTC))]
+
+    monkeypatch.setattr(world.uploads, "list_expired", _deferred)
+    _fail_reading_with(monkeypatch, errno.EIO)
+    job = world.job()
+
+    tally = await job._sweep_uploads()
+
+    assert (tally.rows_failed, tally.rows_abandoned, tally.rows_failing_overdue) == (1, 0, 1)
+    assert tally.needs_attention
+    assert job._failed_passes == ["uploads"]
+    assert not await world.deleted(upload_id)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("method", ["list_versions_expired", "list_active_past_retention"])
+async def test_a_failing_artifact_pass_is_reported_and_the_later_passes_still_run(
+    world: _World, method: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """B-63 —— 产物两条 pass 的查询变重了(按最后使用算),撞上 ``statement_timeout`` 之类时
+    只记这一 pass 失败(进程以非 0 退出),后面的 pass 照跑。"""
+    artifacts = InMemoryArtifactStore()
+
+    async def _down(**_kwargs: object) -> object:
+        raise RuntimeError("canceling statement due to statement timeout")
+
+    monkeypatch.setattr(artifacts, method, _down)
+    job = world.job(artifact_store=artifacts)
+    _stub_sql_passes(job)
+    later: list[str] = []
+
+    async def _orphans() -> int:
+        later.append("orphan_thread_dirs")
+        return 0
+
+    monkeypatch.setattr(job, "_sweep_orphan_thread_dirs", _orphans)
+
+    report = await job.run_once()
+
+    assert report.failed_passes == ("artifacts",)
+    assert later == ["orphan_thread_dirs"]
+    assert exit_code(report) == EXIT_PASS_FAILED

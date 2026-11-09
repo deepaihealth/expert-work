@@ -148,6 +148,7 @@ from orchestrator.graph_builder._config import (
     compaction_sink_from_config,
     configurable_uuid,
     current_run_id,
+    failover_sink_from_config,
     token_sink_from_config,
 )
 from orchestrator.graph_builder.figure_block import (
@@ -186,6 +187,7 @@ from orchestrator.llm.empty_reply import (
     is_empty_reply,
     is_filtered,
 )
+from orchestrator.llm.failover import failover_frames
 from orchestrator.llm.stall import (
     STALLED_AFTER_S,
     StalledWithoutAnswerError,
@@ -255,6 +257,7 @@ from orchestrator.tools.registry import (
     FIGURE_RUN_IDS_KEY,
     TOOL_ALLOWED_STATE_KEYS,
     TURN_ROOT_RUN_KEY,
+    WORKSPACE_CLEANED_KEY,
     WORKSPACE_MIGRATED_KEY,
     Tool,
     ToolContext,
@@ -1193,6 +1196,9 @@ def build_react_graph(
         # 这里再挡一道)。
         if configurable.get(WORKSPACE_MIGRATED_KEY) is True and not configurable.get("child_run"):
             messages = _append_tail_human_message(messages, WORKSPACE_MIGRATION_NOTE)
+        # B-282 —— 留存作业清掉了这段会话闲置的工作目录:同样一次性、只进提示词视图。
+        if configurable.get(WORKSPACE_CLEANED_KEY) is True and not configurable.get("child_run"):
+            messages = _append_tail_human_message(messages, WORKSPACE_CLEANED_NOTE)
         # 两条都有时步数预警在前(B-226 ②)。
         if step_notice is not None:
             messages = _append_tail_human_message(messages, step_notice)
@@ -1364,7 +1370,12 @@ def build_react_graph(
             # in-flight await rather than waiting it out (E.15).
             # 10.1 — one ``expert_work.orchestrator.llm_call`` child span per
             # provider call, attached under the session root span.
-            with expert_work_span(ExpertWorkComponent.ORCHESTRATOR, "llm_call"):
+            # B-297 PR2 — a switch to a backup model during this call shows up
+            # as a console-only ``llm_failover`` frame for this step.
+            with (
+                expert_work_span(ExpertWorkComponent.ORCHESTRATOR, "llm_call"),
+                failover_frames(step_count + 1, failover_sink_from_config(config)),
+            ):
                 if _token_sink is not None:
                     # Only pass ``on_delta`` when a sink is actually wired
                     # (子项目 2 streaming path) — omitting the kwarg otherwise
@@ -2584,6 +2595,13 @@ def _after_reflect(state: AgentState) -> Literal["agent", "__end__"]:
 
 
 #: B-262 P3 —— 老对话迁到对话视图的那一轮,平台段里的一次性说明。平台文字,不含任何租户内容。
+WORKSPACE_CLEANED_NOTE = (
+    "[workspace notice] This conversation was idle past the retention period, so the "
+    "files it had written under /workspace were cleaned up. Files saved as artifacts are "
+    "not affected. /workspace has been prepared again as at the start of a conversation; "
+    "if an earlier file is needed, ask the user to upload it again."
+)
+
 WORKSPACE_MIGRATION_NOTE = (
     "[workspace notice] The workspace of this conversation is now per conversation. "
     "Files that were under /workspace in earlier turns are now at the same paths under "

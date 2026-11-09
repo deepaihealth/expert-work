@@ -28,6 +28,20 @@ class CleanupReport:
     artifacts_expired: int = 0
     # B-235 —— 找不到版本行的产物副本(登记失败 / 清除用户没删成)满 24 小时清掉。
     orphan_artifact_copies_removed: int = 0
+    #: B-278 —— 彻底删除智能体时挪进隔离区(``{tenant}/.purged-agents``)满 7 天删掉的条目,
+    #: 与删不掉的条目数(非 0 时 ``failed_passes`` 带 ``purged_agents``)。
+    purged_agent_dirs_removed: int = 0
+    purged_agent_dirs_failed: int = 0
+    #: B-285 —— 轨迹对象:到期删掉的、对话已不在而删掉的、删不掉的(非 0 时
+    #: ``failed_passes`` 带 ``trajectories``)。
+    trajectories_expired: int = 0
+    trajectory_orphans_removed: int = 0
+    trajectories_failed: int = 0
+    #: 列出来看过的键数;删除预算用完(剩下的明天删);这一轮没跑(没接对象存储 ——
+    #: B-286 之前的部署环境)。``skipped`` 与「跑了、没东西可删」靠它区分。
+    trajectories_scanned: int = 0
+    trajectories_capped: bool = False
+    trajectories_skipped: bool = False
     # 留存链 —— 上传 90 天。
     uploads_expired: int = 0
     upload_files_removed: int = 0
@@ -42,6 +56,34 @@ class CleanupReport:
     upload_rows_held: int = 0
     #: B-271 —— ``{tenant}`` / ``{user}`` 目录打不开的用户数(他们这一轮的上传行跳过、不标)。
     upload_owners_unavailable: int = 0
+    #: B-63 —— 过了到期日 7 天还在暂时失败、因租户配置改动推迟放弃而仍在重试的上传行。
+    upload_rows_failing_overdue: int = 0
+    #: B-282 —— 闲置会话的工作目录:删掉的会话目录、agent 根下的 ``.tool_results/<run>/``,
+    #: 这一轮因为有没结束的 run / 产物保护 / 路径有符号链接 / 用户已软删而没删的,与删失败的
+    #: (非 0 时 ``failed_passes`` 带 ``conversation_dirs``)。
+    conversation_dirs_removed: int = 0
+    conversation_tool_results_removed: int = 0
+    conversation_dirs_skipped_active: int = 0
+    conversation_dirs_skipped_artifact: int = 0
+    conversation_dirs_skipped_unsafe: int = 0
+    conversation_dirs_skipped_owner_deleted: int = 0
+    conversation_dirs_failed: int = 0
+    conversation_tool_results_skipped_artifact: int = 0
+    conversation_dirs_raced: int = 0
+    #: B-284 —— agent 根 B-236 之前的存量(顶层文件 / 模板子目录)、过期的 ``shared/``、
+    #: 删失败的项(非 0 时 ``failed_passes`` 带 ``agent_roots``)。
+    agent_root_files_removed: int = 0
+    agent_root_dirs_removed: int = 0
+    shared_dirs_removed: int = 0
+    agent_root_failed: int = 0
+    agent_root_skipped_unknown: int = 0
+    agent_root_skipped_symlinks: int = 0
+    agent_root_skipped_changed: int = 0
+    #: B-284 —— ``/agent`` 文件历史版本:源文件不见满 30 天整个删掉的版本目录、满 90 天删掉的
+    #: 老版本、出错的版本目录(非 0 时 ``failed_passes`` 带 ``agent_file_versions``)。
+    agent_file_version_dirs_dropped: int = 0
+    agent_file_versions_capped: int = 0
+    agent_file_versions_failed: int = 0
     # 留存链 B-27 —— 孤儿 threads/<id>/ 目录。
     thread_dirs_removed: int = 0
     #: B-50 spec §4.2 —— 孤儿 ``.tool_results/<run_id>/``。此前从没被清过

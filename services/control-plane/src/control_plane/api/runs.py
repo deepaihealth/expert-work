@@ -121,7 +121,6 @@ from expert_work.persistence.workspace.upload_names import original_name_note
 from expert_work.protocol import (
     AgentSpec,
     AgentSpecRecord,
-    AgentSpecStatus,
     ApprovalStatus,
     AuditAction,
     AuditResult,
@@ -155,6 +154,7 @@ from orchestrator.multimodal import image_ref_block
 from orchestrator.sse import end_frame_data, format_sse
 from orchestrator.stream_items import STREAM_FORMAT_LEGACY
 from orchestrator.tools.registry import (
+    WORKSPACE_CLEANED_KEY,
     WORKSPACE_LAYOUT_KEY,
     WORKSPACE_MIGRATED_KEY,
     WorkspaceLayout,
@@ -979,7 +979,7 @@ async def resolve_approval_decision(
             status_code=404,
             detail=f"agent {meta.agent_name}@{meta.agent_version} not found",
         )
-    elif spec_record.status is AgentSpecStatus.DELETED:
+    elif spec_record.status.gone:
         agent_gone = HTTPException(
             status_code=410,
             detail={
@@ -1374,6 +1374,23 @@ async def spawn_run(
     queued_behind: Admission | None = None
     run_record: RunRecord | None = None
     async with supersede_thread_lock(state.session_factory, thread_id):
+        # B-293 —— 对外端点撤掉「请求自己建、随后被拒」的新会话时,在这同一把锁里确认没有 run
+        # 行再删会话行(``_new_session_undo``)。等锁的这一轮进来后重读会话行:已经被撤了就回
+        # 「会话不存在」,不在一条已删的会话上建 run。
+        if await state.thread_meta_repo.get(thread_id, tenant_id=tenant_id) is None:
+            if envelope:
+                return JSONResponse(
+                    status_code=404,
+                    content={
+                        "success": False,
+                        "data": None,
+                        "error": {
+                            "code": "SESSION_NOT_FOUND",
+                            "message": "session not found for this user / agent",
+                        },
+                    },
+                )
+            raise HTTPException(status_code=404, detail="session not found")
         replay_messages: tuple[BaseMessage, ...] | None = None
         regenerated_from: UUID | None = None
         if supersede is None and store is not None:
@@ -1718,6 +1735,8 @@ async def _start_run(
     configurable[WORKSPACE_LAYOUT_KEY] = workspace_layout
     if prepared.migrated:
         configurable[WORKSPACE_MIGRATED_KEY] = True
+    if prepared.cleaned:
+        configurable[WORKSPACE_CLEANED_KEY] = True
     if built.run_deadline_s > 0:
         configurable["deadline_at"] = time.monotonic() + float(built.run_deadline_s)
     if payload.use_draft:
@@ -1887,7 +1906,7 @@ def build_runs_router() -> APIRouter:
                 status_code=404,
                 detail=f"agent {meta.agent_name}@{meta.agent_version} not found",
             )
-        if record.status is AgentSpecStatus.DELETED:
+        if record.status.gone:
             raise HTTPException(
                 status_code=410,
                 detail={

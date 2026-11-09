@@ -21,6 +21,7 @@ Wiring overview (see [STREAM-B-DESIGN § 2.2](../../../docs/streams/STREAM-B-DES
 from __future__ import annotations
 
 import asyncio
+import functools
 import http.cookiejar
 import logging
 import os
@@ -44,6 +45,7 @@ from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 from control_plane.advisory_locks import MEMORY_WRITEBACK_CLAIM_LOCK_CLASSID
 from control_plane.agent_disable_status import AgentDisableService
 from control_plane.api import (
+    build_agent_lifecycle_router,
     build_agent_schema_router,
     build_agent_templates_router,
     build_agent_users_router,
@@ -103,6 +105,7 @@ from control_plane.api import (
     build_sandbox_egress_audit_router,
     build_sandboxes_router,
     build_service_accounts_router,
+    build_session_attachments_router,
     build_sessions_router,
     build_setup_router,
     build_skill_evolution_router,
@@ -489,6 +492,11 @@ from expert_work.persistence.sandbox_egress_audit import (
     SqlSandboxEgressAuditStore,
 )
 from expert_work.persistence.sandbox_instance_store import SqlSandboxInstanceStore
+from expert_work.persistence.secret_allowlist import (
+    AgentSecretAllowlistStore,
+    InMemoryAgentSecretAllowlistStore,
+    SqlAgentSecretAllowlistStore,
+)
 from expert_work.persistence.skill import (
     InMemorySkillStore,
     SkillStore,
@@ -599,6 +607,7 @@ from orchestrator.tools import (
 from orchestrator.tools.locks import ProcessKeyedLock
 from orchestrator.tools.nas_workspace_store import NasWorkspaceStore
 from orchestrator.trajectory import TrajectoryReader
+from retention_cleanup_job.legacy_originals import release_migrated_originals
 
 __all__ = ["create_app"]
 
@@ -811,6 +820,12 @@ def create_app(
         if sql_stores
         else InMemorySandboxEgressAuditStore()
     )
+    # B-278 —— 彻底删除智能体时连它的 secret_allowlist 行一起删(表归 credential-proxy 读写)。
+    resolved_secret_allowlist: AgentSecretAllowlistStore = (
+        SqlAgentSecretAllowlistStore(sql_stores.session_factory)
+        if sql_stores
+        else InMemoryAgentSecretAllowlistStore()
+    )
     # 波 1 Task 7 — the agent_sandbox branch needs a warm-session CAS store;
     # only a real SQL session factory can back it durably (sandbox_instance
     # is shared with the docker-supervisor backend). ``None`` sql_stores
@@ -875,8 +890,9 @@ def create_app(
     # 端点的同一口径),orchestrator 那侧只有 Protocol,这里注入。
     resolved_agent_runtime.thread_stats_recorder = ThreadStatsRecorderImpl(threads=resolved_threads)
     # B-236 第三层 —— /agent 文件的版本放在 NAS 上用户根旁边;只有 NAS 后端有。
+    # B-284 —— 登记成产物的文件不再留版本(每一版都有产物副本)。
     resolved_agent_runtime.agent_file_versions = build_agent_file_version_store(
-        resolved_workspace_store
+        resolved_workspace_store, resolved_artifact_store
     )
     # Late-bound PII resolver: lets the audit logger reference
     # tenant_config without forcing it to exist yet (D.2 cycle break).
@@ -1525,6 +1541,17 @@ def create_app(
                         runs=resolved_agent_runtime.run_manager.store,
                         audit_store=sql_stores.audit_log if sql_stores is not None else None,
                         checkpointer=checkpointer,
+                        # B-281 —— 迁移完在后台清 agent 根里已迁移的上传原件;要查库,无库不清。
+                        release_originals=(
+                            functools.partial(
+                                release_migrated_originals,
+                                sql_stores.session_factory,
+                                resolved_threads,
+                                resolved_workspace_store.root,
+                            )
+                            if sql_stores is not None
+                            else None
+                        ),
                     )
                 # Stream O Mini-ADR O-9/O-10 — one CredentialsResolver over
                 # the effective (legacy-derived) catalog. The web_search /
@@ -2509,6 +2536,8 @@ def create_app(
                     # the BuiltAgent cache must drop the tenant's entries.
                     # PR-E3a: the wrapper also broadcasts to peer replicas.
                     cache_invalidator=_invalidate_tenant_and_broadcast,
+                    # B-285 —— 列出来的轨迹只用对话还在的。
+                    thread_store=_app.state.thread_meta_repo,
                 )
                 skill_evolution_worker.start()
                 _app.state.skill_evolution_worker = skill_evolution_worker
@@ -2844,6 +2873,7 @@ def create_app(
     app.state.quality_drift_alert_store = resolved_quality_drift_alert
     app.state.quality_config_service = quality_config_service
     app.state.sandbox_egress_audit_store = resolved_egress_audit_store
+    app.state.secret_allowlist_store = resolved_secret_allowlist
     app.state.knowledge_store = resolved_knowledge_store
     app.state.knowledge_retrieval_log_store = resolved_retrieval_log_store
     app.state.image_upload_store = resolved_image_upload_store
@@ -2885,6 +2915,15 @@ def create_app(
     app.state.knowledge_profile_refresh_worker = None
     app.state.sandbox_runtime = resolved_sandbox_runtime
     app.state.workspace_store = resolved_workspace_store
+    # B-282 —— 上传落盘按会话拿开场复制锁的共享形式(留存作业清闲置会话目录时拿排他的那种)。
+    app.state.conversation_landing_lock = (
+        PgConversationSeedLock(create_async_session_factory(sql_stores.engine))
+        if sql_stores is not None
+        else None
+    )
+    if sql_stores is not None and app.state.conversation_landing_lock is None:
+        # 有库却没有落盘锁:留存作业清闲置会话目录时,同时落盘的上传可能被一起挪走。
+        logger.warning("control_plane.conversation_landing_lock_missing")
     app.state.artifact_snapshots = resolved_artifact_snapshots
     # B-236 第三层 —— 清除用户时连同 /agent 文件的历史版本一起删(``purge_user``)。
     app.state.agent_file_versions = resolved_agent_runtime.agent_file_versions
@@ -3061,7 +3100,11 @@ def create_app(
     app.include_router(build_external_artifacts_router())
 
     app.include_router(build_agents_router())
+    # B-278 —— 恢复 / 彻底删除(三段路径,和上面的两段 {name}/{version} 不冲突)。
+    app.include_router(build_agent_lifecycle_router())
     app.include_router(build_sessions_router())
+    # B-295 —— 对话里附件的预览 / 下载(对话页与调试台的附件标签)。
+    app.include_router(build_session_attachments_router())
     app.include_router(build_runs_router())
     app.include_router(build_plan_router())
     app.include_router(build_runs_list_router())

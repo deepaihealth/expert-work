@@ -189,13 +189,15 @@ async def test_list_expired_and_soft_delete() -> None:
     old = await _seed_upload(store, tenant=tenant, age_days=120)
     older = await _seed_upload(store, tenant=other, age_days=200)
     fresh = await _seed_upload(store, tenant=tenant, age_days=1)
-    cutoff = datetime.now(UTC) - timedelta(days=90)
-
-    expired = await store.list_expired(before=cutoff)
-    assert [r.id for r in expired] == [older, old]  # cross-tenant, oldest first
-    assert [r.id for r in await store.list_expired(before=cutoff, limit=1)] == [older]
-
     now = datetime.now(UTC)
+
+    expired = await store.list_expired(now=now, default_days=90)
+    assert [e.upload.id for e in expired] == [older, old]  # cross-tenant, earliest expiry first
+    old_row = await store.get(upload_id=old, tenant_id=tenant)
+    assert old_row is not None and expired[1].expires_at == old_row.created_at + timedelta(days=90)
+    limited = await store.list_expired(now=now, default_days=90, limit=1)
+    assert [e.upload.id for e in limited] == [older]
+
     assert await store.soft_delete(upload_id=old, tenant_id=tenant, now=now) is True
     assert await store.soft_delete(upload_id=old, tenant_id=tenant, now=now) is False  # idempotent
     assert await store.soft_delete(upload_id=old, tenant_id=other, now=now) is False  # wrong tenant
@@ -203,9 +205,51 @@ async def test_list_expired_and_soft_delete() -> None:
     row = await store.get(upload_id=old, tenant_id=tenant)
     assert row is not None and row.deleted_at == now
     # Already soft-deleted rows are no longer candidates; the fresh one never was.
-    assert [r.id for r in await store.list_expired(before=cutoff)] == [older]
+    assert [e.upload.id for e in await store.list_expired(now=now, default_days=90)] == [older]
     fresh_row = await store.get(upload_id=fresh, tenant_id=tenant)
     assert fresh_row is not None and fresh_row.deleted_at is None
+
+
+@pytest.mark.asyncio
+async def test_a_recent_use_keeps_an_old_upload() -> None:
+    """B-63 —— 保留期从最后一次使用算起:120 天前上传、10 天前用过 → 没到期;到期日跟着
+    ``last_used_at`` 走。"""
+    store = InMemoryUserUploadStore()
+    tenant = uuid4()
+    used = await _seed_upload(store, tenant=tenant, age_days=120)
+    unused = await _seed_upload(store, tenant=tenant, age_days=120)
+    now = datetime.now(UTC)
+    ten_days_ago = now - timedelta(days=10)
+    assert await store.touch(upload_id=used, tenant_id=tenant, now=ten_days_ago) is True
+
+    expired = await store.list_expired(now=now, default_days=90)
+    assert [e.upload.id for e in expired] == [unused]
+    later = await store.list_expired(now=now + timedelta(days=81), default_days=90)
+    assert {e.upload.id for e in later} == {used, unused}
+    by_id = {e.upload.id: e.expires_at for e in later}
+    assert by_id[used] == ten_days_ago + timedelta(days=90)
+
+
+@pytest.mark.asyncio
+async def test_touch_writes_at_most_once_a_day_and_never_on_deleted_rows() -> None:
+    store = InMemoryUserUploadStore()
+    tenant = uuid4()
+    upload = await _seed_upload(store, tenant=tenant, age_days=5)
+    now = datetime.now(UTC)
+
+    assert await store.touch(upload_id=upload, tenant_id=tenant, now=now) is True
+    assert (
+        await store.touch(upload_id=upload, tenant_id=tenant, now=now + timedelta(hours=23))
+        is False
+    )
+    row = await store.get(upload_id=upload, tenant_id=tenant)
+    assert row is not None and row.last_used_at == now
+    next_day = now + timedelta(days=1, minutes=1)
+    assert await store.touch(upload_id=upload, tenant_id=tenant, now=next_day) is True
+    assert await store.touch(upload_id=upload, tenant_id=uuid4(), now=next_day) is False
+    await store.soft_delete(upload_id=upload, tenant_id=tenant, now=next_day)
+    later = next_day + timedelta(days=2)
+    assert await store.touch(upload_id=upload, tenant_id=tenant, now=later) is False
 
 
 @pytest.mark.asyncio
@@ -265,8 +309,9 @@ async def test_insert_records_sha256_and_old_rows_have_none() -> None:
 
 
 @pytest.mark.asyncio
-async def test_list_active_by_ref_matches_tenant_user_and_ref_only_live_rows() -> None:
-    """B-271 —— 留存作业的引用检查:同租户、同用户、同 ``ref``、没删的行,不论会话、不论新旧。"""
+async def test_list_unexpired_by_ref_matches_tenant_user_and_ref_only_live_rows() -> None:
+    """B-271 / B-63 —— 留存作业的引用检查:同租户、同用户、同 ``ref``、没删、没到期的行,不论
+    会话。"""
     store = InMemoryUserUploadStore()
     tenant, user = uuid4(), uuid4()
 
@@ -294,6 +339,89 @@ async def test_list_active_by_ref_matches_tenant_user_and_ref_only_live_rows() -
     await _put(tenant_id=uuid4())
     gone = await _put()
     await store.soft_delete(upload_id=gone, tenant_id=tenant, now=datetime.now(UTC))
+    stale = await _put()
+    store._rows[(tenant, stale)] = store._rows[(tenant, stale)].model_copy(
+        update={"created_at": datetime.now(UTC) - timedelta(days=100)}
+    )
 
-    rows = await store.list_active_by_ref(tenant_id=tenant, user_id=user, ref="uploads/a.pdf")
+    rows = await store.list_unexpired_by_ref(
+        tenant_id=tenant,
+        user_id=user,
+        ref="uploads/a.pdf",
+        now=datetime.now(UTC),
+        default_days=90,
+    )
     assert sorted(r.id for r in rows) == sorted([first, second])
+
+
+@pytest.mark.asyncio
+async def test_hard_delete_removes_one_row_of_this_tenant() -> None:
+    store = InMemoryUserUploadStore()
+    tenant, upload_id, other_id = uuid4(), uuid4(), uuid4()
+    for uid in (upload_id, other_id):
+        await store.insert(
+            upload_id=uid,
+            tenant_id=tenant,
+            user_id=uuid4(),
+            thread_id=uuid4(),
+            kind="document",
+            ref="uploads/a.pdf",
+            mime_type="application/pdf",
+            size_bytes=1,
+            filename="a.pdf",
+        )
+
+    assert not await store.hard_delete(upload_id=upload_id, tenant_id=uuid4())
+    assert await store.hard_delete(upload_id=upload_id, tenant_id=tenant)
+    assert not await store.hard_delete(upload_id=upload_id, tenant_id=tenant)
+    assert await store.get(upload_id=upload_id, tenant_id=tenant) is None
+    assert await store.get(upload_id=other_id, tenant_id=tenant) is not None
+
+
+@pytest.mark.asyncio
+async def test_list_documents_for_thread_ref_includes_deleted_rows() -> None:
+    """B-295 —— 控制台附件预览要分清「登记过、已删」与「从没登记过」:本租户、本会话、文档类、
+    同 ``ref`` 的行,**含已删的**,按上传先后。"""
+    store = InMemoryUserUploadStore()
+    tenant, thread, user = uuid4(), uuid4(), uuid4()
+
+    async def _put(
+        *,
+        thread_id: UUID = thread,
+        tenant_id: UUID = tenant,
+        kind: str = "document",
+        ref: str = "uploads/a.pdf",
+    ) -> UUID:
+        uid = uuid4()
+        await store.insert(
+            upload_id=uid,
+            tenant_id=tenant_id,
+            user_id=user,
+            thread_id=thread_id,
+            kind=kind,  # type: ignore[arg-type]
+            ref=ref,
+            mime_type="application/pdf",
+            size_bytes=3,
+            filename="a.pdf",
+        )
+        return uid
+
+    live = await _put()
+    gone = await _put()
+    await store.soft_delete(upload_id=gone, tenant_id=tenant, now=datetime.now(UTC))
+    await _put(ref="uploads/b.pdf")
+    await _put(thread_id=uuid4())
+    await _put(tenant_id=uuid4())
+    await _put(kind="image")
+
+    rows = await store.list_documents_for_thread_ref(
+        tenant_id=tenant, thread_id=thread, ref="uploads/a.pdf"
+    )
+    assert [r.id for r in rows] == [live, gone]
+    assert [r.deleted_at is None for r in rows] == [True, False]
+    assert (
+        await store.list_documents_for_thread_ref(
+            tenant_id=tenant, thread_id=thread, ref="uploads/none.pdf"
+        )
+        == []
+    )

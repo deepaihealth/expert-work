@@ -32,6 +32,7 @@ from uuid import UUID, uuid4
 from sqlalchemy import delete, select, update
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from expert_work.persistence.bulk_delete import count_in_chunks, delete_in_chunks
 from expert_work.persistence.models import MemoryWritebackDLQRow
 
 #: How long a claimed row stays invisible to other ``take_ready`` callers
@@ -148,6 +149,15 @@ class MemoryWritebackDLQ(abc.ABC):
         The queued payload holds extracted memory content (PII), so it is
         hard-deleted with the rest of the user's memory."""
 
+    @abc.abstractmethod
+    async def count_for_threads(self, *, tenant_id: UUID, thread_ids: Sequence[UUID]) -> int:
+        """B-278 —— rows ``delete_for_threads`` would remove (agent purge preview)."""
+
+    @abc.abstractmethod
+    async def delete_for_threads(self, *, tenant_id: UUID, thread_ids: Sequence[UUID]) -> int:
+        """B-278 —— drop the queued writebacks extracted from these conversations
+        (``source_thread_id``); tenant-scoped, returns the count deleted."""
+
 
 # ---------------------------------------------------------------------------
 # In-memory implementation — unit tests
@@ -246,6 +256,23 @@ class InMemoryMemoryWritebackDLQ(MemoryWritebackDLQ):
             for rid, r in self._rows.items()
             if r.tenant_id == tenant_id and r.user_id == user_id
         ]
+        for rid in victims:
+            del self._rows[rid]
+        return len(victims)
+
+    def _thread_rows(self, tenant_id: UUID, thread_ids: Sequence[UUID]) -> list[UUID]:
+        wanted = {str(t) for t in thread_ids}
+        return [
+            rid
+            for rid, r in self._rows.items()
+            if r.tenant_id == tenant_id and r.source_thread_id in wanted
+        ]
+
+    async def count_for_threads(self, *, tenant_id: UUID, thread_ids: Sequence[UUID]) -> int:
+        return len(self._thread_rows(tenant_id, thread_ids))
+
+    async def delete_for_threads(self, *, tenant_id: UUID, thread_ids: Sequence[UUID]) -> int:
+        victims = self._thread_rows(tenant_id, thread_ids)
         for rid in victims:
             del self._rows[rid]
         return len(victims)
@@ -374,6 +401,24 @@ class SqlMemoryWritebackDLQ(MemoryWritebackDLQ):
             result = await session.execute(stmt)
             await session.commit()
         return int(getattr(result, "rowcount", 0) or 0)
+
+    async def count_for_threads(self, *, tenant_id: UUID, thread_ids: Sequence[UUID]) -> int:
+        return await count_in_chunks(
+            self._sf,
+            MemoryWritebackDLQRow,
+            MemoryWritebackDLQRow.source_thread_id,
+            [str(t) for t in thread_ids],
+            MemoryWritebackDLQRow.tenant_id == tenant_id,
+        )
+
+    async def delete_for_threads(self, *, tenant_id: UUID, thread_ids: Sequence[UUID]) -> int:
+        return await delete_in_chunks(
+            self._sf,
+            MemoryWritebackDLQRow,
+            MemoryWritebackDLQRow.source_thread_id,
+            [str(t) for t in thread_ids],
+            MemoryWritebackDLQRow.tenant_id == tenant_id,
+        )
 
 
 __all__ = [

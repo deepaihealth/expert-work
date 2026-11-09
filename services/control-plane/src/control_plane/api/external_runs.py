@@ -52,7 +52,7 @@ from control_plane.api.agents import (
     resolve_external_files,
 )
 from control_plane.api.runs import MAX_RUN_INPUT_CHARS, RunRequest, SupersedeRequest, spawn_run
-from control_plane.api.uploads import LandingAccount
+from control_plane.api.uploads import LandingAccount, file_upload_ids, note_uploads_used
 from control_plane.run_cancel import cancel_run_two_level
 from control_plane.supersede import SupersedeError
 from expert_work.common.observability import current_trace_id_hex
@@ -326,7 +326,7 @@ async def _supersede_and_run(
         run_payload = RunRequest(input=None, mode=mode)
 
     try:
-        return await spawn_run(
+        response = await spawn_run(
             runtime=runtime,
             audit=state.audit_logger,
             approvals=state.approval_store,
@@ -353,6 +353,14 @@ async def _supersede_and_run(
             on_disconnect=DisconnectMode.CONTINUE,
             supersede=SupersedeRequest(target_run_id=target.run_id, replay=(op == "regenerate")),
         )
+        # B-63 —— ``:edit`` 的 ``files[]`` 在新一轮被接受之后才记使用(同发起对话)。
+        if isinstance(payload, ExternalEditRequest) and response.status_code < 400:
+            await note_uploads_used(
+                state.user_upload_store,
+                tenant_id=tenant_id,
+                upload_ids=file_upload_ids(payload.files),
+            )
+        return response
     except SupersedeError as exc:
         return _envelope_error(exc.code, exc.message, exc.status_code)
     except RunIdempotencyConflict:

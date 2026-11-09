@@ -338,6 +338,14 @@ async def test_list_active_past_retention_picks_stale_active_only(
                 ),
                 {"ts": backdated, "t": tenant_id, "u": user_id},
             )
+            # B-63 —— the row's clock is its versions' last use: backdate the version too.
+            await conn.execute(
+                text(
+                    "UPDATE artifact_version SET created_at = :ts "
+                    "WHERE tenant_id = :t AND user_id = :u AND path_in_workspace = 'stale.md'"
+                ),
+                {"ts": backdated, "t": tenant_id, "u": user_id},
+            )
         await store.save_version(
             tenant_id=tenant_id,
             user_id=user_id,
@@ -347,9 +355,8 @@ async def test_list_active_past_retention_picks_stale_active_only(
             path_in_workspace="fresh.md",
             created_in_thread="t-new",
         )
-        cutoff = datetime.now(UTC) - timedelta(days=90)
-        rows = await store.list_active_past_retention(before=cutoff)
-        assert [a.name for a in rows] == ["stale.md"]
+        rows = await store.list_active_past_retention(now=datetime.now(UTC), default_days=90)
+        assert [a.name for a in rows if a.tenant_id == tenant_id] == ["stale.md"]
     finally:
         await engine.dispose()
 
@@ -518,14 +525,13 @@ async def test_version_retention_methods_round_trip(sql_store: SqlStoreFixture) 
                 ),
                 {"d": 200, "v": vb.id},
             )
-        cutoff = datetime.now(UTC) - timedelta(days=90)
+        now = datetime.now(UTC)
 
-        expired = await store.list_versions_expired(before=cutoff)
+        expired = [e.version for e in await store.list_versions_expired(now=now, default_days=90)]
         mine = [(x.artifact_id, x.version) for x in expired if x.tenant_id in {tenant_a, tenant_b}]
         assert mine == [(vb.artifact_id, 1), (artifact_a, 1), (artifact_a, 2)]
-        assert len(await store.list_versions_expired(before=cutoff, limit=2)) == 2
+        assert len(await store.list_versions_expired(now=now, default_days=90, limit=2)) == 2
 
-        now = datetime.now(UTC)
         a_old = [x.id for x in expired if x.artifact_id == artifact_a]
         assert await store.delete_versions(version_ids=a_old) == 2
         assert await store.delete_versions(version_ids=a_old) == 0
@@ -607,12 +613,305 @@ async def test_list_versions_expired_orders_same_timestamp_by_version(
                     ),
                     {"new": new_id, "old": old_id},
                 )
-        cutoff = datetime.now(UTC) - timedelta(days=90)
         expired = [
-            (x.artifact_id, x.version)
-            for x in await store.list_versions_expired(before=cutoff)
-            if x.artifact_id == artifact_id
+            (e.version.artifact_id, e.version.version)
+            for e in await store.list_versions_expired(now=datetime.now(UTC), default_days=90)
+            if e.version.artifact_id == artifact_id
         ]
         assert expired == [(artifact_id, 1), (artifact_id, 2), (artifact_id, 3)]
+    finally:
+        await engine.dispose()
+
+
+# ---------------------------------------------------------------------------
+# B-63 —— 按最后使用到期(真 Postgres):版本时钟 = greatest(created_at, last_used_at,
+# 登记它的会话最后一次 run);最新版与产物行 = 各版本最晚的那个;租户保留期覆盖默认。
+# ---------------------------------------------------------------------------
+
+
+class _ArtifactClock:
+    def __init__(self, store: SqlArtifactStore, engine: AsyncEngine) -> None:
+        self.store = store
+        self.engine = engine
+
+    async def versions(
+        self,
+        *,
+        tenant_id: UUID,
+        name: str,
+        ages_days: list[int],
+        created_in_thread: str = "save-artifact",
+    ) -> UUID:
+        user_id = uuid4()
+        artifact_id: UUID | None = None
+        for i, age in enumerate(ages_days, start=1):
+            v = await self.store.save_version(
+                tenant_id=tenant_id,
+                user_id=user_id,
+                agent_key=_AGENT_KEY,
+                name=name,
+                kind="document",
+                path_in_workspace=f"{name}.v{i}",
+                created_in_thread=created_in_thread,
+            )
+            artifact_id = v.artifact_id
+            async with self.engine.begin() as conn:
+                await conn.execute(
+                    text(
+                        "UPDATE artifact_version SET created_at = now() - make_interval(days => :d)"
+                        " WHERE id = :v"
+                    ),
+                    {"d": age, "v": v.id},
+                )
+                await conn.execute(
+                    text(
+                        "UPDATE artifact SET updated_at = now() - make_interval(days => :d) "
+                        "WHERE id = :a"
+                    ),
+                    {"d": age, "a": v.artifact_id},
+                )
+        assert artifact_id is not None
+        return artifact_id
+
+    async def used(self, artifact_id: UUID, version: int, *, days_ago: int) -> None:
+        async with self.engine.begin() as conn:
+            await conn.execute(
+                text(
+                    "UPDATE artifact_version SET last_used_at = now() - make_interval(days => :d) "
+                    "WHERE artifact_id = :a AND version = :n"
+                ),
+                {"d": days_ago, "a": artifact_id, "n": version},
+            )
+
+    async def run(self, *, run_id: UUID, tenant_id: UUID, thread_id: UUID, days_ago: int) -> None:
+        async with self.engine.begin() as conn:
+            await conn.execute(
+                text(
+                    "INSERT INTO agent_run (id, tenant_id, thread_id, status, on_disconnect, "
+                    " created_at, updated_at) VALUES (:r, :t, :th, 'success', 'continue', "
+                    " now() - make_interval(days => :d), now())"
+                ),
+                {"r": run_id, "t": tenant_id, "th": thread_id, "d": days_ago},
+            )
+
+    async def tenant_days(self, tenant_id: UUID, days: int | None) -> None:
+        async with self.engine.begin() as conn:
+            await conn.execute(
+                text(
+                    "INSERT INTO tenant_config (tenant_id, display_name, updated_by, "
+                    " artifact_retention_days) VALUES (:t, 't', 'test', :d)"
+                ),
+                {"t": tenant_id, "d": days},
+            )
+
+    async def expired(self, artifact_ids: set[UUID]) -> set[tuple[UUID, int]]:
+        rows = await self.store.list_versions_expired(
+            now=datetime.now(UTC), default_days=90, limit=100000
+        )
+        return {
+            (e.version.artifact_id, e.version.version)
+            for e in rows
+            if e.version.artifact_id in artifact_ids
+        }
+
+    async def rows_past(self, artifact_ids: set[UUID]) -> set[UUID]:
+        rows = await self.store.list_active_past_retention(
+            now=datetime.now(UTC), default_days=90, limit=100000
+        )
+        return {r.id for r in rows if r.id in artifact_ids}
+
+
+@pytest.mark.asyncio
+async def test_versions_and_rows_expire_by_last_use_on_one_clock(
+    sql_store: SqlStoreFixture,
+) -> None:
+    store, engine = sql_store
+    try:
+        clock = _ArtifactClock(store, engine)
+        tenant = uuid4()
+        # v1 old but downloaded 10 days ago; v2 (latest) old and never used → both kept
+        # (the latest follows the artifact's newest clock); the row stays listed.
+        old_used = await clock.versions(tenant_id=tenant, name="old-used.md", ages_days=[200, 120])
+        await clock.used(old_used, 1, days_ago=10)
+        # v1 old and unused → goes; v2 (latest) used 10 days ago → stays with the row.
+        latest_used = await clock.versions(
+            tenant_id=tenant, name="latest-used.md", ages_days=[200, 120]
+        )
+        await clock.used(latest_used, 2, days_ago=10)
+        # Everything old → both versions go, and the row is past retention too.
+        all_old = await clock.versions(tenant_id=tenant, name="all-old.md", ages_days=[200, 120])
+        ids = {old_used, latest_used, all_old}
+
+        assert await clock.expired(ids) == {(latest_used, 1), (all_old, 1), (all_old, 2)}
+        assert await clock.rows_past(ids) == {all_old}
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_a_recent_run_in_the_registering_conversation_keeps_the_version(
+    sql_store: SqlStoreFixture,
+) -> None:
+    """``created_in_thread`` 存的是 run id:经那个 run 找到会话,会话里最近还有 run → 留着。
+    回落常量(不是 UUID)不会让查询报错,只是这一项为空。"""
+    store, engine = sql_store
+    try:
+        clock = _ArtifactClock(store, engine)
+        tenant, thread = uuid4(), uuid4()
+        source_run = uuid4()
+        await clock.run(run_id=source_run, tenant_id=tenant, thread_id=thread, days_ago=200)
+        await clock.run(run_id=uuid4(), tenant_id=tenant, thread_id=thread, days_ago=5)
+        active = await clock.versions(
+            tenant_id=tenant, name="active.md", ages_days=[200], created_in_thread=str(source_run)
+        )
+        idle_run = uuid4()
+        await clock.run(run_id=idle_run, tenant_id=tenant, thread_id=uuid4(), days_ago=150)
+        idle = await clock.versions(
+            tenant_id=tenant, name="idle.md", ages_days=[200], created_in_thread=str(idle_run)
+        )
+        fallback = await clock.versions(tenant_id=tenant, name="fallback.md", ages_days=[200])
+        ids = {active, idle, fallback}
+
+        assert await clock.expired(ids) == {(idle, 1), (fallback, 1)}
+        assert await clock.rows_past(ids) == {idle, fallback}
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_the_tenant_artifact_retention_days_apply_to_that_tenant_only(
+    sql_store: SqlStoreFixture,
+) -> None:
+    store, engine = sql_store
+    try:
+        clock = _ArtifactClock(store, engine)
+        short, long_, plain = uuid4(), uuid4(), uuid4()
+        await clock.tenant_days(short, 30)
+        await clock.tenant_days(long_, 200)
+        short_40 = await clock.versions(tenant_id=short, name="s40.md", ages_days=[40])
+        long_120 = await clock.versions(tenant_id=long_, name="l120.md", ages_days=[120])
+        plain_40 = await clock.versions(tenant_id=plain, name="p40.md", ages_days=[40])
+        plain_100 = await clock.versions(tenant_id=plain, name="p100.md", ages_days=[100])
+        ids = {short_40, long_120, plain_40, plain_100}
+
+        assert await clock.expired(ids) == {(short_40, 1), (plain_100, 1)}
+        assert await clock.rows_past(ids) == {short_40, plain_100}
+        days = {
+            e.version.artifact_id: e.retention_days
+            for e in await store.list_versions_expired(now=datetime.now(UTC), default_days=90)
+            if e.version.artifact_id in ids
+        }
+        assert days == {short_40: 30, plain_100: 90}
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_touch_version_writes_at_most_once_a_day(sql_store: SqlStoreFixture) -> None:
+    store, engine = sql_store
+    try:
+        v = await store.save_version(
+            tenant_id=uuid4(),
+            user_id=uuid4(),
+            agent_key=_AGENT_KEY,
+            name="touch.md",
+            kind="document",
+            path_in_workspace="touch.md",
+            created_in_thread="t",
+        )
+        now = datetime.now(UTC)
+        t = v.tenant_id
+        assert await store.touch_version(version_id=v.id, tenant_id=uuid4(), now=now) is False
+        assert await store.touch_version(version_id=v.id, tenant_id=t, now=now) is True
+        later = now + timedelta(hours=23)
+        assert await store.touch_version(version_id=v.id, tenant_id=t, now=later) is False
+        (row,) = await store.list_versions_by_artifact(artifact_id=v.artifact_id)
+        assert row.last_used_at == now
+        next_day = now + timedelta(days=1, minutes=1)
+        assert await store.touch_version(version_id=v.id, tenant_id=t, now=next_day)
+        assert await store.touch_version(version_id=uuid4(), tenant_id=t, now=now) is False
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_a_sub_agent_version_lives_on_the_parent_runs_conversation(
+    sql_store: SqlStoreFixture,
+) -> None:
+    """B-63 —— 子代的 run id 从不落 ``agent_run``:按它登记的版本没有会话时钟,200 天前登记就
+    到期;按父 run id 登记(``save_artifact`` 现在的写法)就跟着会话最近的 run 续命。"""
+    store, engine = sql_store
+    try:
+        clock = _ArtifactClock(store, engine)
+        tenant, thread, parent_run = uuid4(), uuid4(), uuid4()
+        await clock.run(run_id=parent_run, tenant_id=tenant, thread_id=thread, days_ago=200)
+        await clock.run(run_id=uuid4(), tenant_id=tenant, thread_id=thread, days_ago=3)
+        on_child = await clock.versions(
+            tenant_id=tenant, name="child.md", ages_days=[200], created_in_thread=str(uuid4())
+        )
+        on_parent = await clock.versions(
+            tenant_id=tenant, name="parent.md", ages_days=[200], created_in_thread=str(parent_run)
+        )
+
+        assert await clock.expired({on_child, on_parent}) == {(on_child, 1)}
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_a_run_of_another_tenant_never_keeps_a_version(
+    sql_store: SqlStoreFixture,
+) -> None:
+    """run → 会话这一跳只认同租户:``created_in_thread`` 指向别的租户的 run(那个会话最近还在
+    跑)不算。"""
+    store, engine = sql_store
+    try:
+        clock = _ArtifactClock(store, engine)
+        tenant, other = uuid4(), uuid4()
+        foreign_run, foreign_thread = uuid4(), uuid4()
+        await clock.run(run_id=foreign_run, tenant_id=other, thread_id=foreign_thread, days_ago=1)
+        version = await clock.versions(
+            tenant_id=tenant, name="x.md", ages_days=[200], created_in_thread=str(foreign_run)
+        )
+
+        assert await clock.expired({version}) == {(version, 1)}
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_snapshotted_digests_filters_by_user_prefix_and_copy_in_sql(
+    sql_store: SqlStoreFixture,
+) -> None:
+    """B-284 —— 只回这个用户、路径以前缀开头(``_`` 是字面量,不是 LIKE 通配)、有副本的版本。"""
+    store, engine = sql_store
+    try:
+        tenant, user, other = uuid4(), uuid4(), uuid4()
+        for who, name, path, digest in (
+            (user, "a1", "agents/p_k/a.md", "a" * 64),
+            (user, "a1", "agents/p_k/a.md", "b" * 64),
+            (user, "old", "agents/p_k/old.md", None),
+            (user, "wild", "agents/pxk/wild.md", "c" * 64),  # would match LIKE 'agents/p_k/%'
+            (other, "theirs", "agents/p_k/theirs.md", "d" * 64),
+        ):
+            await store.save_version(
+                tenant_id=tenant,
+                user_id=who,
+                agent_key=_AGENT_KEY,
+                name=name,
+                kind="document",
+                path_in_workspace=path,
+                created_in_thread="t",
+                version_id=uuid4(),
+                snapshot_key=None if digest is None else f"snap/{digest}",
+                size_bytes=None if digest is None else 1,
+                sha256=digest,
+            )
+
+        found = await store.snapshotted_digests(
+            tenant_id=tenant, user_id=user, path_prefix="agents/p_k/"
+        )
+
+        assert found == {"agents/p_k/a.md": {"a" * 64, "b" * 64}}
     finally:
         await engine.dispose()

@@ -368,8 +368,8 @@ export function ConversationDetail() {
   const attributedModels = useMemo(() => attributedModelsOf(statsInputs), [statsInputs]);
   const rateBook = useRateBook({ enabled: isSystemAdmin, agentModel, models: attributedModels });
   const stats = useMemo(
-    () => computeSessionStats(statsInputs, rateBook),
-    [statsInputs, rateBook],
+    () => computeSessionStats(statsInputs, rateBook, agentModel?.provider ?? null),
+    [statsInputs, rateBook, agentModel],
   );
   // 配置改动立刻对新一轮生效(含正在进行的会话),所以同一个会话可能前后跑在
   // 两套配置上。事后看「第 5 轮起答复不对」时,这条是唯一能把「模型的问题」
@@ -807,6 +807,7 @@ export function ConversationDetail() {
                     exportingKey={exportingId}
                     onCancelQueuedHistory={canOperate ? handleCancelQueued : undefined}
                     onDownloadArtifact={handleDownloadArtifact}
+                    tenantScope={concreteTenantScope(apiTenantScope)}
                     runHrefOf={runHrefOf}
                     planOf={planOf}
                     feedbackOf={feedbackOf}

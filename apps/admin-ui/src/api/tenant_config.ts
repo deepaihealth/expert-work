@@ -39,6 +39,14 @@ export interface TenantConfigRecord {
   mcp_servers: Record<string, unknown>[];
   audit_retention_days: number;
   event_log_retention_days: number;
+  /** B-63 — upload / artifact retention in days, counted from LAST USE
+   *  (upload time, last re-attach / download, last run in its conversation —
+   *  whichever is latest). Range [7, 365]; ``null`` = platform default (90). */
+  upload_retention_days: number | null;
+  artifact_retention_days: number | null;
+  /** B-282 — days a conversation's work directory survives after its last run.
+   *  Range [7, 365]; ``null`` = platform default (90). */
+  conversation_workspace_retention_days: number | null;
   /** Sprint #4 (Mini-ADR U-28) — Curator thresholds.
    *  ``skill_stale_days`` default 30, range [1, 365].
    *  ``skill_archive_days`` default 90, range [2, 730], and must be
@@ -73,6 +81,10 @@ export interface TenantConfigPatchBody {
   mcp_servers?: Record<string, unknown>[];
   audit_retention_days?: number;
   event_log_retention_days?: number;
+  /** B-63 — ``null`` resets to the platform default; omit the key to leave it. */
+  upload_retention_days?: number | null;
+  artifact_retention_days?: number | null;
+  conversation_workspace_retention_days?: number | null;
   skill_stale_days?: number;
   skill_archive_days?: number;
   skill_evolution_enabled?: boolean;
@@ -103,13 +115,41 @@ export async function getTenantConfig(tenantId: string): Promise<TenantConfigRec
   );
 }
 
+/** B-63 — the platform default the backend compares against when a
+ *  retention field is unset (``null``). */
+export const FILE_RETENTION_DEFAULT_DAYS = 90;
+
+/** B-63 — which file retention fields this patch lowers (effective days,
+ *  unset = platform default). Lowering needs an explicit confirmation: the
+ *  backend answers 409 ``RETENTION_DECREASE_NOT_CONFIRMED`` otherwise. */
+export function retentionDecreases(
+  record: TenantConfigRecord,
+  patch: TenantConfigPatchBody,
+): { field: string; from: number; to: number }[] {
+  const fields = [
+    "upload_retention_days",
+    "artifact_retention_days",
+    "conversation_workspace_retention_days",
+  ] as const;
+  const out: { field: string; from: number; to: number }[] = [];
+  for (const field of fields) {
+    if (!(field in patch)) continue;
+    const from = record[field] ?? FILE_RETENTION_DEFAULT_DAYS;
+    const to = patch[field] ?? FILE_RETENTION_DEFAULT_DAYS;
+    if (to < from) out.push({ field, from, to });
+  }
+  return out;
+}
+
 export async function upsertTenantConfig(
   tenantId: string,
   body: TenantConfigPatchBody,
+  options: { confirmRetentionDecrease?: boolean } = {},
 ): Promise<TenantConfigRecord> {
   return putJson<TenantConfigRecord>(
     `/v1/tenants/${encodeURIComponent(tenantId)}/config`,
     body,
+    options.confirmRetentionDecrease ? { params: { confirm_retention_decrease: true } } : undefined,
   );
 }
 

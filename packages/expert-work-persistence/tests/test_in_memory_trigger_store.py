@@ -567,8 +567,9 @@ async def test_disable_for_agent_scopes_by_name_version_tenant() -> None:
     for rec in (r1, r2, r_v2, r_off, r_b):
         await store.create(rec)
 
-    n = await store.disable_for_agent(agent_name="target", agent_version="v1", tenant_id=ten_a)
-    assert n == 2  # 已 disabled 的不计数
+    ids = await store.disable_for_agent(agent_name="target", agent_version="v1", tenant_id=ten_a)
+    # 已 disabled 的不计数;B-278 —— 返回的是这次关掉的那几条的 id(审计里留着,恢复时用得上)
+    assert sorted(ids) == sorted([r1.id, r2.id])
 
     async def _enabled(rec: TriggerRecord) -> bool:
         got = await store.get(trigger_id=rec.id, tenant_id=rec.tenant_id)
@@ -583,4 +584,4 @@ async def test_disable_for_agent_scopes_by_name_version_tenant() -> None:
 
     # 幂等重跑:全部已 disabled → 0
     again = await store.disable_for_agent(agent_name="target", agent_version="v1", tenant_id=ten_a)
-    assert again == 0
+    assert again == []

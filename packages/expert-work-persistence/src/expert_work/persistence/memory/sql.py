@@ -19,6 +19,7 @@ from expert_work.common.search.decay import (
 )
 from expert_work.common.search.rrf import rrf_fuse_scored
 from expert_work.common.threat_patterns import ThreatFinding, scan_for_threats
+from expert_work.persistence.bulk_delete import count_where, delete_where
 from expert_work.persistence.knowledge.text_search import tokenize_for_search
 from expert_work.persistence.memory.base import MemoryInjectionBlockedError, MemoryStore
 from expert_work.persistence.memory.hash import hash_content
@@ -918,3 +919,19 @@ class SqlMemoryStore(MemoryStore):
             "lands the interface + status='archived' retrieve filter."
         )
         raise NotImplementedError(msg)
+
+    async def count_for_agent(self, *, tenant_id: UUID, agent_name: str) -> int:
+        return await count_where(
+            self._sf,
+            MemoryItemRow,
+            MemoryItemRow.tenant_id == tenant_id,
+            MemoryItemRow.agent_name == agent_name,
+        )
+
+    async def delete_for_agent(self, *, tenant_id: UUID, agent_name: str) -> int:
+        return await delete_where(
+            self._sf,
+            MemoryItemRow,
+            MemoryItemRow.tenant_id == tenant_id,
+            MemoryItemRow.agent_name == agent_name,
+        )

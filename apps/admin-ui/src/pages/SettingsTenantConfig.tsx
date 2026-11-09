@@ -32,6 +32,7 @@ import { ApiError } from "../api/client";
 import { PageHeader } from "../components/PageHeader";
 import {
   getTenantConfig,
+  retentionDecreases,
   upsertTenantConfig,
   type TenantConfigPatchBody,
   type TenantConfigRecord,
@@ -75,6 +76,10 @@ function recordToPatchJson(record: TenantConfigRecord): string {
     mcp_servers: record.mcp_servers,
     audit_retention_days: record.audit_retention_days,
     event_log_retention_days: record.event_log_retention_days,
+    // B-63 — ``null`` = platform default; sending it back keeps it that way.
+    upload_retention_days: record.upload_retention_days,
+    artifact_retention_days: record.artifact_retention_days,
+    conversation_workspace_retention_days: record.conversation_workspace_retention_days,
     // Sprint #4 (Mini-ADR U-28) — Curator thresholds round-trip
     // through the same JSON-edit surface as the rest of tenant_config.
     skill_stale_days: record.skill_stale_days,
@@ -98,7 +103,7 @@ function formatRateLimitOverride(ov: Record<string, unknown>): string {
 
 export function SettingsTenantConfig() {
   const { t } = useTranslation();
-  const { message } = App.useApp();
+  const { message, modal } = App.useApp();
   const { scope, apiTenantScope } = useTenantScope();
   const auth = useAuth();
   const homeTenantId = auth.identity?.homeTenantId ?? null;
@@ -171,21 +176,47 @@ export function SettingsTenantConfig() {
     setEditing(false);
   }, [pristineJson]);
 
+  const save = useCallback(
+    async (confirmRetentionDecrease: boolean) => {
+      if (effectiveTenantId === null) return;
+      if (!parseResult.ok) return;
+      setSubmitting(true);
+      try {
+        const updated = await upsertTenantConfig(effectiveTenantId, parseResult.value, {
+          confirmRetentionDecrease,
+        });
+        setRecord(updated);
+        setEditing(false);
+        message.success(t("settings_ops.config_saved"));
+      } catch (err) {
+        message.error(err instanceof Error ? err.message : "failed");
+      } finally {
+        setSubmitting(false);
+      }
+    },
+    [effectiveTenantId, parseResult, message, t],
+  );
+
+  // B-63 — lowering a file retention period deletes more files as soon as
+  // tonight and cannot be undone: ask first, then send the explicit flag.
   const onSave = useCallback(async () => {
-    if (effectiveTenantId === null) return;
-    if (!parseResult.ok) return;
-    setSubmitting(true);
-    try {
-      const updated = await upsertTenantConfig(effectiveTenantId, parseResult.value);
-      setRecord(updated);
-      setEditing(false);
-      message.success(t("settings_ops.config_saved"));
-    } catch (err) {
-      message.error(err instanceof Error ? err.message : "failed");
-    } finally {
-      setSubmitting(false);
+    if (record === null || !parseResult.ok) return;
+    const lowered = retentionDecreases(record, parseResult.value);
+    if (lowered.length === 0) {
+      await save(false);
+      return;
     }
-  }, [effectiveTenantId, parseResult, message, t]);
+    modal.confirm({
+      title: t("settings_ops.retention_decrease_title"),
+      content: t("settings_ops.retention_decrease_body", {
+        changes: lowered.map((d) => `${t(`settings_ops.${d.field}`)}: ${d.from} → ${d.to}`).join("; "),
+      }),
+      okText: t("settings_ops.retention_decrease_ok"),
+      okButtonProps: { danger: true },
+      cancelText: t("common.cancel"),
+      onOk: () => save(true),
+    });
+  }, [record, parseResult, save, modal, t]);
 
   return (
     <div data-testid="config-root">
@@ -284,6 +315,25 @@ export function SettingsTenantConfig() {
             <dd style={{ margin: 0 }}>{record.audit_retention_days}</dd>
             <dt style={{ color: "var(--ew-text-tertiary)" }}>{t("settings_ops.event_log_retention_days")}</dt>
             <dd style={{ margin: 0 }}>{record.event_log_retention_days}</dd>
+            {/* B-63 — upload / artifact retention, counted from last use. Edit via
+                the JSON editor; ``null`` = platform default. */}
+            <dt style={{ color: "var(--ew-text-tertiary)" }}>{t("settings_ops.upload_retention_days")}</dt>
+            <dd style={{ margin: 0 }} data-testid="tenant-config-upload-retention-days">
+              {record.upload_retention_days ?? t("settings_ops.file_retention_default")}
+            </dd>
+            <dt style={{ color: "var(--ew-text-tertiary)" }}>{t("settings_ops.artifact_retention_days")}</dt>
+            <dd style={{ margin: 0 }} data-testid="tenant-config-artifact-retention-days">
+              {record.artifact_retention_days ?? t("settings_ops.file_retention_default")}
+            </dd>
+            {/* B-282 — idle conversations lose their work directory after this many
+                days; ``null`` = platform default. */}
+            <dt style={{ color: "var(--ew-text-tertiary)" }}>
+              {t("settings_ops.conversation_workspace_retention_days")}
+            </dt>
+            <dd style={{ margin: 0 }} data-testid="tenant-config-conversation-workspace-retention-days">
+              {record.conversation_workspace_retention_days ??
+                t("settings_ops.file_retention_default")}
+            </dd>
             {/* Stream C.6 — per-tenant rate limit. Read-only here; edit via the
                 JSON editor: "rate_limit_override": {"requests_per_minute": N}. */}
             <dt style={{ color: "var(--ew-text-tertiary)" }}>{t("settings_ops.rate_limit_override")}</dt>

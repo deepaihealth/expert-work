@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import pytest
 
@@ -115,8 +115,7 @@ async def test_list_reapable_and_hard_delete() -> None:
         sha256="x",
     )
 
-    future_cutoff = datetime.now(UTC) + timedelta(days=1)
-    expired = await store.list_reapable(before=future_cutoff)
+    expired = await store.list_reapable(now=datetime.now(UTC) + timedelta(days=91), default_days=90)
     assert [r.id for r in expired] == [image_id]
 
     removed = await store.hard_delete(image_ids=[image_id])
@@ -128,7 +127,7 @@ async def test_list_reapable_and_hard_delete() -> None:
 
 @pytest.mark.asyncio
 async def test_list_reapable_predicate_covers_old_and_soft_deleted() -> None:
-    """``list_reapable`` matches ``(created_at < before) OR (deleted_at IS
+    """``list_reapable`` matches ``(last use + days < now) OR (deleted_at IS
     NOT NULL)`` — a manually soft-deleted row is swept even when it's too
     young to be caught by the age predicate alone (the PR1 fix: hand-deleted
     images no longer wait out the retention window before the sweep reaps
@@ -136,7 +135,6 @@ async def test_list_reapable_predicate_covers_old_and_soft_deleted() -> None:
     store = InMemoryImageUploadStore()
     tenant = uuid4()
     now = datetime.now(UTC)
-    cutoff = now - timedelta(days=90)
     old_time = now - timedelta(days=200)
 
     new_active = uuid4()
@@ -166,7 +164,7 @@ async def test_list_reapable_predicate_covers_old_and_soft_deleted() -> None:
     for image_id in (new_soft_deleted, old_soft_deleted):
         store._rows[image_id] = store._rows[image_id].model_copy(update={"deleted_at": now})
 
-    reapable = await store.list_reapable(before=cutoff)
+    reapable = await store.list_reapable(now=now, default_days=90)
 
     reapable_ids = {r.id for r in reapable}
     assert reapable_ids == {old_active, new_soft_deleted, old_soft_deleted}
@@ -256,3 +254,58 @@ async def test_list_for_user_respects_limit() -> None:
         )
     rows = await store.list_for_user(tenant_id=tenant, user_id=user, limit=2)
     assert len(rows) == 2
+
+
+async def _old_image(store: InMemoryImageUploadStore, tenant: UUID, *, age_days: int) -> UUID:
+    image_id = uuid4()
+    await store.insert(
+        image_id=image_id,
+        tenant_id=tenant,
+        thread_id=uuid4(),
+        user_id=None,
+        object_key=f"k-{image_id}",
+        size_bytes=1,
+        mime_type="image/png",
+        sha256="x",
+    )
+    created = datetime.now(UTC) - timedelta(days=age_days)
+    store._rows[image_id] = store._rows[image_id].model_copy(update={"created_at": created})
+    return image_id
+
+
+@pytest.mark.asyncio
+async def test_a_recent_download_keeps_an_old_image() -> None:
+    """B-283 —— 到期按最后使用:200 天前上传、10 天前被下载的图还在保留期里。"""
+    store = InMemoryImageUploadStore()
+    tenant = uuid4()
+    used = await _old_image(store, tenant, age_days=200)
+    unused = await _old_image(store, tenant, age_days=200)
+    now = datetime.now(UTC)
+    assert await store.touch(image_id=used, tenant_id=tenant, now=now - timedelta(days=10))
+
+    reapable = {r.id for r in await store.list_reapable(now=now, default_days=90)}
+
+    assert reapable == {unused}
+
+
+@pytest.mark.asyncio
+async def test_touch_writes_at_most_once_a_day_and_only_for_its_tenant() -> None:
+    store = InMemoryImageUploadStore()
+    tenant = uuid4()
+    image = await _old_image(store, tenant, age_days=5)
+    now = datetime.now(UTC)
+
+    assert await store.touch(image_id=image, tenant_id=tenant, now=now) is True
+    assert (
+        await store.touch(image_id=image, tenant_id=tenant, now=now + timedelta(hours=23)) is False
+    )
+    next_day = now + timedelta(days=1, minutes=1)
+    assert await store.touch(image_id=image, tenant_id=uuid4(), now=next_day) is False
+    row = await store.get(image_id=image, tenant_id=tenant)
+    assert row is not None and row.last_used_at == now
+    assert await store.touch(image_id=image, tenant_id=tenant, now=next_day) is True
+    await store.soft_delete(image_id=image, tenant_id=tenant, now=next_day)
+    assert (
+        await store.touch(image_id=image, tenant_id=tenant, now=next_day + timedelta(days=2))
+        is False
+    )

@@ -30,6 +30,18 @@ class TenantConfigAlreadyExistsError(Exception):
         self.tenant_id = tenant_id
 
 
+class RetentionDecreaseNotConfirmedError(Exception):
+    """B-63 —— 这次写入会把附件 / 产物保留期改小,而调用方没有确认。
+
+    比较在 :meth:`TenantConfigStore.upsert` 里、锁住那一行之后做(与写入同一个事务),所以
+    并发的另一次改动不会让一次没确认的改小漏过去。``decreases`` = ``[{field, from, to}]``。
+    """
+
+    def __init__(self, decreases: list[dict[str, object]]) -> None:
+        super().__init__(f"unconfirmed retention decrease: {decreases}")
+        self.decreases = decreases
+
+
 class TenantConfigStore(abc.ABC):
     """Persistence Protocol for the per-tenant runtime config row."""
 
@@ -64,8 +76,13 @@ class TenantConfigStore(abc.ABC):
         tenant_id: UUID,
         patch: TenantConfigPatch,
         actor_id: str,
+        reject_unconfirmed_decrease: bool = False,
     ) -> TenantConfigRecord:
-        """Insert-or-merge the patch. ``display_name`` is required for first insert."""
+        """Insert-or-merge the patch. ``display_name`` is required for first insert.
+
+        B-63 —— ``reject_unconfirmed_decrease=True``:这个 patch 若把保留期改小(按锁住的现值比,
+        见 :meth:`TenantConfigPatch.retention_decreases`),抛
+        :class:`RetentionDecreaseNotConfirmedError`、什么都不写。"""
 
     @abc.abstractmethod
     async def add_mcp_allowlist_name(
@@ -107,3 +124,10 @@ class TenantConfigStore(abc.ABC):
         Platform-level cross-tenant read behind ``GET /v1/tenants``
         (system_admin only). Paginated via ``limit``/``offset``.
         """
+
+    @abc.abstractmethod
+    async def clear_default_agent_name(self, *, tenant_id: UUID, agent_name: str) -> bool:
+        """B-278 —— set ``default_agent_name`` to NULL **only if** it is still
+        ``agent_name`` (the agent being purged). Conditional in one statement so
+        an admin's concurrent switch to another default is never undone.
+        Returns whether the row changed; no row / another default → ``False``."""

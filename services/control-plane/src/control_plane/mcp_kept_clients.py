@@ -69,6 +69,10 @@ class KeptMcpClients[K: Hashable]:
             del self._carry[key]
         return hit
 
+    def joined(self, key: K, name: str, kept: KeptClient) -> None:
+        """B-292 —— 重试连上的 ``name`` 并进了 ``key`` 的缓存池:记进成员表。"""
+        self._members.setdefault(key, {})[name] = kept
+
     def pop_key(self, key: K) -> list[MCPClient]:
         """整键失效:暂存的客户端交回给调用方硬停。"""
         self._members.pop(key, None)

@@ -361,7 +361,9 @@ class HTTPAnthropicClient:
             # (402 / quota / billing → LLMKeyUnavailableError, router tries a
             # sibling key) from plain 429 rate-limits, malformed 4xx, and 5xx.
             # 401 stays an LLMUnauthorizedError for the L.L8 OAuth refresh path.
-            raise classify_http_error("anthropic", status, _truncate(response.text))
+            raise classify_http_error(
+                "anthropic", status, _truncate(response.text), headers=response.headers
+            )
 
         data = response.json()
         if not isinstance(data, Mapping):
@@ -414,7 +416,10 @@ class HTTPAnthropicClient:
                     if response.status_code >= 400:
                         await response.aread()
                         raise classify_http_error(
-                            "anthropic", response.status_code, _truncate(response.text)
+                            "anthropic",
+                            response.status_code,
+                            _truncate(response.text),
+                            headers=response.headers,
                         )
                     async for line in response.aiter_lines():
                         event = _parse_anthropic_sse_line(line)
@@ -967,7 +972,8 @@ async def _human_content(
         logger.warning("anthropic_adapter.image_dropped_no_resolver count=%d", len(image_refs))
         return text
     blocks: list[dict[str, Any]] = [{"type": "text", "text": text}]
-    # B-64 Task 7 —— 工作区图读不出来时 ``resolve_message_images`` 给一段文字顶替。
+    # B-64 Task 7 / B-283 —— 工作区图读不出来、上传图的字节不在了时
+    # ``resolve_message_images`` 给一段文字顶替。
     for item in await resolve_message_images(image_refs, resolver):
         if isinstance(item, str):
             blocks.append({"type": "text", "text": item})

@@ -41,6 +41,11 @@ class UserUploadRow(Base):
     #: B-271 (migration ``0182``): hex sha256 of the stored bytes, written at
     #: upload. NULL for rows created before the column existed.
     sha256: Mapped[str | None] = mapped_column(Text, nullable=True)
+    #: B-63 (migration ``0183``): last time the upload was re-attached to a run or
+    #: downloaded through the external API, stamped at most once a day. NULL = never
+    #: since the column existed. The retention clock is ``greatest(created_at,
+    #: last_used_at, last run of the conversation)``.
+    last_used_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
     __table_args__ = (
         CheckConstraint("kind IN ('image','document')", name="user_upload_kind_enum"),

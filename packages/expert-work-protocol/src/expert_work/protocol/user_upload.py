@@ -20,6 +20,7 @@ __all__ = [
     "UPLOAD_ID_PREFIX",
     "UserUpload",
     "UserUploadKind",
+    "is_session_deleted_tombstone",
     "parse_upload_id",
     "render_upload_id",
 ]
@@ -56,6 +57,10 @@ class UserUpload(BaseModel):
     deleted_at: datetime | None = None
     #: B-271 —— 落地字节的 sha256(十六进制),上传时写入;列加上之前的老行为 ``None``。
     sha256: str | None = None
+    #: B-63 —— 最后一次被重新附加到 run、或经对外接口下载的时间(每行每天最多记一次);
+    #: 列加上之前没用过的行为 ``None``。保留期从 ``created_at`` / 这个时间 / 会话最后一次
+    #: run 三者中最晚的那个算起。
+    last_used_at: datetime | None = None
 
 
 def render_upload_id(upload_id: UUID) -> str:
@@ -78,3 +83,20 @@ def parse_upload_id(raw: str) -> UUID | None:
     if not _UUID_RE.fullmatch(body):
         return None
     return UUID(body)
+
+
+#: B-280 —— 会话被彻底删除后,它的 document 登记行留成「墓碑」:只留 id / 租户 / 用户 / 会话 /
+#: ``kind`` / ``created_at``,``ref`` / ``filename`` / ``mime_type`` 清成空串(列是 NOT NULL)、
+#: ``size_bytes`` 0、``sha256`` / ``last_used_at`` 置空、``deleted_at`` 有值。留着它只为一件事:
+#: 别的会话再引用这个 ``upload_id`` 时仍回 404 ``UPLOAD_SESSION_DELETED``(对外已公布的码)。
+#: 空 ``ref`` 只会出现在墓碑上 —— 上传总是写 ``uploads/<名字>``。
+SESSION_DELETED_TOMBSTONE_REF: Final = ""
+
+
+def is_session_deleted_tombstone(upload: UserUpload) -> bool:
+    """这一行是会话被彻底删除后留下的墓碑(见 :data:`SESSION_DELETED_TOMBSTONE_REF`)。"""
+    return (
+        upload.deleted_at is not None
+        and upload.kind == "document"
+        and upload.ref == SESSION_DELETED_TOMBSTONE_REF
+    )

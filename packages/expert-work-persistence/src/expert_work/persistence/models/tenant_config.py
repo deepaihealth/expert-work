@@ -59,6 +59,16 @@ class TenantConfigRow(Base):
     event_log_retention_days: Mapped[int] = mapped_column(
         Integer, nullable=False, server_default=text("30"), default=30
     )
+    # B-63 (migration 0183): per-tenant retention windows for user uploads and
+    # artifacts, counted from LAST USE. NULL → the retention job's platform default
+    # (90). CHECK constraints bound both to [7, 365].
+    upload_retention_days: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    artifact_retention_days: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # B-282 (migration 0186): days a conversation's work directory survives after its
+    # last run. NULL → the retention job's platform default (90). CHECK [7, 365].
+    conversation_workspace_retention_days: Mapped[int | None] = mapped_column(
+        Integer, nullable=True
+    )
     # Capability Uplift Sprint #1 — Mini-ADR U-2.
     # ``warn`` is platform-wide default; ``block`` is opt-in for
     # high-compliance tenants. CHECK constraint in migration 0039.

@@ -1,5 +1,6 @@
 """FastAPI routers for the Control Plane (Streams B + C)."""
 
+from control_plane.api.agent_lifecycle import build_agent_lifecycle_router
 from control_plane.api.agent_schema import build_agent_schema_router
 from control_plane.api.agent_templates import build_agent_templates_router
 from control_plane.api.agent_users import build_agent_users_router, build_tenant_users_router
@@ -73,6 +74,7 @@ from control_plane.api.runs import build_runs_list_router, build_runs_router
 from control_plane.api.sandbox_egress_audit import build_sandbox_egress_audit_router
 from control_plane.api.sandboxes import build_sandboxes_router
 from control_plane.api.service_accounts import build_service_accounts_router
+from control_plane.api.session_attachments import build_session_attachments_router
 from control_plane.api.sessions import build_sessions_router
 from control_plane.api.setup import build_setup_router
 from control_plane.api.skill_evolution import build_skill_evolution_router
@@ -87,6 +89,7 @@ from control_plane.api.webhook_endpoints import build_webhook_endpoints_router
 from control_plane.api.workspace import build_workspace_router
 
 __all__ = [
+    "build_agent_lifecycle_router",
     "build_agent_schema_router",
     "build_agent_templates_router",
     "build_agent_users_router",
@@ -146,6 +149,7 @@ __all__ = [
     "build_sandbox_egress_audit_router",
     "build_sandboxes_router",
     "build_service_accounts_router",
+    "build_session_attachments_router",
     "build_sessions_router",
     "build_setup_router",
     "build_skill_evolution_router",

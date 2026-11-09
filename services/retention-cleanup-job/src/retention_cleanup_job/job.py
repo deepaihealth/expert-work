@@ -21,19 +21,29 @@ NOLOGIN BYPASSRLS with the minimum delete grants).
 留存链 PR2(波 3 线 R,用户 2026-09-09 拍板:产物 90 天、上传 90 天、已删工作区
 库行 90 天销账)在这之上加了三条碰 NAS 工作区的规则 + 一条不变式:
 
-* B-28 ``_sweep_artifact_versions`` —— ``artifact_version.created_at`` 满 90 天:
+* B-28 ``_sweep_artifact_versions`` —— 版本按最后使用(B-63:登记时间 / ``last_used_at`` /
+  登记它的会话最后一次 run 最晚的那个;最新版用整条产物最晚的那个)满租户保留期(默认 90 天):
   删 NAS 文件 + 删版本行;版本清空的 ``artifact`` 行标过期(复用 ``deleted_at``)。
-* 上传 ``_sweep_uploads`` —— ``user_upload.created_at`` 满 90 天:按会话当前的 agent / 布局
+* 上传 ``_sweep_uploads`` —— 最后使用(B-63:``created_at`` / ``last_used_at`` / 会话最后一次
+  run 最晚的那个)满租户保留期(默认 90 天):按会话当前的 agent / 布局
   删 ``[agents/<key>/][threads/<会话>/work/]uploads/<file>``(B-271)+ 标 ``deleted_at``。
 * B-27 ``_sweep_orphan_thread_dirs`` —— ``threads/<thread_id>/`` 的 thread 行不存在
-  → 删目录。**不按时间删活会话的目录**。
+  → 删目录。**不按时间删活会话的目录** —— 活会话按**闲置**清是下面那一条。
+* B-282 ``_sweep_conversation_dirs`` —— 会话最后一次 run 之后满租户保留期(默认 90 天)、
+  没有未结束的 run:删对话视图会话的 ``threads/<会话>/`` 与各 run 的 ``.tool_results/<run>/``,
+  库里的行不动(:mod:`retention_cleanup_job.conversation_dirs`)。
 * X-4 ② ``_sweep_workspaces`` —— 软删且已归档满 90 天的 ``user_workspace`` 行连
   从属行硬删;OSS 归档对象**不主动删**(桶生命周期到期)。
 
 不变式(``tests/test_workspace_invariant.py``):对活着的工作区,job 只删 (a) 登记
-过的产物文件 (b) ``uploads/`` 下登记过的文件 (c) 孤儿 ``threads/<id>/``;根目录
-其它任何文件/目录(``style/``、MEMORY.md、未登记文件)永不触碰。碰文件的入口
-只有 :mod:`retention_cleanup_job.workspace_files` 那两个函数。
+过的产物文件 (b) ``uploads/`` 下登记过的文件 (c) 孤儿 ``threads/<id>/`` (d) B-282 闲置满保留期
+的会话自己的 ``threads/<会话>/`` 与它的 run 的 ``.tool_results/<run>/`` (e) B-284 切换时刻 ``T``
+之前写下、之后没再改过的 agent 根存量(:mod:`retention_cleanup_job.agent_roots`)与过了运维日期的
+``shared/``;``T`` 之后改过的 agent 根文件/目录(``style/``、未登记文件)永不按时间触碰,长期记忆
+文件(``AGENT_NOTES.md`` / ``MEMORY.md`` / ``PLAN.md`` / ``TODO.md``)与点开头的名字永不触碰;
+删的子目录先挪进隔离区 ``{tenant}/.purged-agents/{user}/``,满 7 天删。(d) 走
+:func:`expert_work.persistence.workspace.safe_remove.remove_entry`,其余入口在
+:mod:`retention_cleanup_job.workspace_files`。
 """
 
 from __future__ import annotations
@@ -43,6 +53,7 @@ import logging
 import time
 from collections.abc import Iterator
 from contextlib import contextmanager
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from uuid import UUID
 
@@ -68,24 +79,53 @@ from expert_work.protocol import (
 from expert_work.runtime.audit import AuditLogger
 from expert_work.runtime.runs.store import RunStore
 from expert_work.runtime.storage import ObjectStore
+from retention_cleanup_job.agent_file_versions import (
+    VersionSweepTally,
+    sweep_agent_file_versions,
+)
+from retention_cleanup_job.agent_roots import (
+    AgentRootTally,
+    parse_cutover,
+    parse_shared_delete_after,
+    sweep_agent_roots,
+    sweep_shared,
+)
 from retention_cleanup_job.artifact_copies import (
     release_version_files,
     remove_user_agent_file_versions,
     remove_user_copies,
     sweep_orphan_copies,
 )
+from retention_cleanup_job.conversation_dirs import (
+    ConversationDirSweep,
+    ConversationDirTally,
+)
 from retention_cleanup_job.knowledge_revisions import delete_orphaned_revisions
 from retention_cleanup_job.orphan_threads import (
     sweep_orphan_thread_dirs,
     sweep_orphan_tool_results,
 )
+from retention_cleanup_job.purged_agents import PurgedAgentsSweep, sweep_purged_agents
 from retention_cleanup_job.report import CleanupReport
+from retention_cleanup_job.trajectories import TrajectorySweepTally, sweep_trajectories
 from retention_cleanup_job.uploads import UploadSweep, UploadSweepTally
 
 logger = logging.getLogger(__name__)
 
 #: 审计行的 actor —— 与 control-plane 的 sweep 同款写法(``actor_type="system"``)。
 _ACTOR_ID = "retention_cleanup_job"
+
+
+@dataclass
+class _ArtifactTally:
+    """B-63 —— 产物两条 pass 边做边记的计数;pass 中途失败时报告里仍是已经做了的部分
+    (与上传 pass 的 ``UploadSweepTally`` 同一个做法)。"""
+
+    versions_deleted: int = 0
+    files_removed: int = 0
+    artifacts_expired: int = 0
+    soft_deleted: int = 0
+    hard_deleted: int = 0
 
 
 # The cleanup runs against a DB connection that's already authenticated
@@ -130,7 +170,7 @@ class RetentionCleanupJob:
         batch_size: int = 10000,
         image_upload_store: ImageUploadStore | None = None,
         object_store: ObjectStore | None = None,
-        image_retention_days: int = 90,
+        object_store_unavailable: str | None = None,
         artifact_store: ArtifactStore | None = None,
         artifact_retention_days: int = 90,
         artifact_hard_delete_grace_days: int = 60,
@@ -148,6 +188,10 @@ class RetentionCleanupJob:
         knowledge_retrieval_log_retention_days: int = 30,
         user_upload_store: UserUploadStore | None = None,
         upload_retention_days: int = 90,
+        conversation_workspace_retention_days: int = 90,
+        conversation_workspace_batch_size: int = 500,
+        shared_delete_after: str | None = None,
+        agent_root_cutover: str | None = None,
         thread_store: ThreadMetaStore | None = None,
         run_store: RunStore | None = None,
         workspace_root: str | None = None,
@@ -156,9 +200,6 @@ class RetentionCleanupJob:
     ) -> None:
         if batch_size <= 0:
             msg = "batch_size must be positive"
-            raise ValueError(msg)
-        if image_retention_days < 1:
-            msg = "image_retention_days must be >= 1"
             raise ValueError(msg)
         if artifact_retention_days < 1:
             msg = "artifact_retention_days must be >= 1"
@@ -193,11 +234,19 @@ class RetentionCleanupJob:
         if upload_retention_days < 1:
             msg = "upload_retention_days must be >= 1"
             raise ValueError(msg)
+        if conversation_workspace_retention_days < 1:
+            msg = "conversation_workspace_retention_days must be >= 1"
+            raise ValueError(msg)
+        if conversation_workspace_batch_size < 1:
+            msg = "conversation_workspace_batch_size must be >= 1"
+            raise ValueError(msg)
         self._sf = db_session_factory
         self._batch_size = batch_size
         self._image_upload_store = image_upload_store
         self._object_store = object_store
-        self._image_retention_days = image_retention_days
+        #: B-286 —— 对象存储配了却用不了(引用解不出 / 建不起来)的原因(异常类型);图片 pass
+        #: 记跳过并进 ``failed_passes``,不让整个作业崩。
+        self._object_store_unavailable = object_store_unavailable
         self._artifact_store = artifact_store
         self._artifact_retention_days = artifact_retention_days
         self._artifact_hard_delete_grace_days = artifact_hard_delete_grace_days
@@ -215,6 +264,10 @@ class RetentionCleanupJob:
         self._knowledge_retrieval_log_retention_days = knowledge_retrieval_log_retention_days
         self._user_upload_store = user_upload_store
         self._upload_retention_days = upload_retention_days
+        self._conversation_workspace_retention_days = conversation_workspace_retention_days
+        self._conversation_workspace_batch_size = conversation_workspace_batch_size
+        self._shared_delete_after = shared_delete_after
+        self._agent_root_cutover = agent_root_cutover
         self._thread_store = thread_store
         self._run_store = run_store
         self._workspace_root = workspace_root
@@ -223,6 +276,8 @@ class RetentionCleanupJob:
         self._audit_log_store = audit_log_store
         #: 吞掉异常继续跑的 pass 失败时记在这里(``run_once`` 开头清空),进 ``CleanupReport``。
         self._failed_passes: list[str] = []
+        #: B-63 —— 产物两条 pass 的计数(``_sweep_artifact_passes`` 开头清零)。
+        self._artifact_tally = _ArtifactTally()
 
     async def run_once(self) -> CleanupReport:
         """Run the retention passes once and return a tally.
@@ -262,9 +317,18 @@ class RetentionCleanupJob:
                 artifact_versions_deleted,
                 artifact_files_removed,
                 artifacts_expired,
-            ) = await self._sweep_artifact_versions()
-            artifact_soft, artifact_hard = await self._sweep_artifacts()
+                artifact_soft,
+                artifact_hard,
+            ) = await self._sweep_artifact_passes()
+            # B-282 —— 闲置会话的工作目录;排在产物两条 pass 之后(先让到期的产物版本走掉,
+            # 产物保护看的是这之后还在的最新版)。
+            conversations = await self._sweep_conversation_dirs()
+            # B-284 —— agent 根的 B-236 之前存量、冻结的 shared/、/agent 文件的历史版本。
+            agent_roots = await self._sweep_agent_roots()
+            file_versions = await self._sweep_agent_file_versions()
             orphan_artifact_copies_removed = await self._sweep_orphan_artifact_copies()
+            purged = await self._sweep_purged_agents()
+            trajectories = await self._sweep_trajectories()
             thread_dirs_removed = await self._sweep_orphan_thread_dirs()
             tool_result_dirs_removed = await self._sweep_orphan_tool_results()
             memory_hard_deleted = await self._sweep_memory()
@@ -286,6 +350,14 @@ class RetentionCleanupJob:
             artifact_files_removed=artifact_files_removed,
             artifacts_expired=artifacts_expired,
             orphan_artifact_copies_removed=orphan_artifact_copies_removed,
+            purged_agent_dirs_removed=purged.removed,
+            purged_agent_dirs_failed=purged.failed,
+            trajectories_expired=trajectories.expired_removed,
+            trajectory_orphans_removed=trajectories.orphans_removed,
+            trajectories_failed=trajectories.failed,
+            trajectories_scanned=trajectories.scanned,
+            trajectories_capped=trajectories.capped,
+            trajectories_skipped=trajectories.skipped,
             uploads_expired=uploads.marked,
             upload_files_removed=uploads.files_removed,
             upload_files_unsafe=uploads.files_unsafe,
@@ -293,6 +365,28 @@ class RetentionCleanupJob:
             upload_rows_abandoned=uploads.rows_abandoned,
             upload_rows_held=uploads.rows_held,
             upload_owners_unavailable=uploads.owners_unavailable,
+            upload_rows_failing_overdue=uploads.rows_failing_overdue,
+            conversation_dirs_removed=conversations.removed,
+            conversation_tool_results_removed=conversations.tool_results_removed,
+            conversation_dirs_skipped_active=conversations.skipped_active,
+            conversation_dirs_skipped_artifact=conversations.skipped_artifact,
+            conversation_dirs_skipped_unsafe=conversations.skipped_unsafe,
+            conversation_dirs_skipped_owner_deleted=conversations.skipped_owner_deleted,
+            conversation_dirs_failed=conversations.failed,
+            conversation_tool_results_skipped_artifact=(
+                conversations.tool_results_skipped_artifact
+            ),
+            conversation_dirs_raced=conversations.raced,
+            agent_root_files_removed=agent_roots.files_removed,
+            agent_root_dirs_removed=agent_roots.dirs_removed,
+            shared_dirs_removed=agent_roots.shared_removed,
+            agent_root_failed=agent_roots.failed,
+            agent_root_skipped_unknown=agent_roots.skipped_unknown,
+            agent_root_skipped_symlinks=agent_roots.skipped_symlinks,
+            agent_root_skipped_changed=agent_roots.skipped_changed,
+            agent_file_version_dirs_dropped=file_versions.dirs_dropped,
+            agent_file_versions_capped=file_versions.versions_capped,
+            agent_file_versions_failed=file_versions.failed,
             failed_passes=tuple(self._failed_passes),
             thread_dirs_removed=thread_dirs_removed,
             tool_result_dirs_removed=tool_result_dirs_removed,
@@ -434,10 +528,45 @@ class RetentionCleanupJob:
             )
         return hard, len(pending)
 
-    async def _sweep_artifact_versions(self) -> tuple[int, int, int]:
-        """留存链 B-28 —— 产物按**版本** 90 天。
+    async def _sweep_artifact_passes(self) -> tuple[int, int, int, int, int]:
+        """B-63 —— 产物两条 pass(版本 → 逻辑产物)。按最后使用算的查询更重,撞上
+        ``statement_timeout`` 之类时与上传 pass 一样:记日志、记进 ``failed_passes``(进程以非 0
+        退出),后面的线程目录 / 记忆 / 工作区清理照跑。版本 pass 失败时不跑逻辑产物 pass(它
+        假定版本 pass 已经跑完)。两条 pass 边做边记,中途失败时返回的是已经做了的部分。
 
-        ``artifact_version.created_at < now - artifact_retention_days`` 的版本:
+        Returns ``(versions_deleted, files_removed, artifacts_expired, soft, hard)``。
+        """
+        tally = self._artifact_tally = _ArtifactTally()
+        try:
+            await self._sweep_artifact_versions()
+            await self._sweep_artifacts()
+        except Exception:
+            logger.exception(
+                "retention.artifact_sweep_failed versions_deleted=%d files_removed=%d "
+                "artifacts_expired=%d soft=%d hard=%d (partial)",
+                tally.versions_deleted,
+                tally.files_removed,
+                tally.artifacts_expired,
+                tally.soft_deleted,
+                tally.hard_deleted,
+            )
+            self._failed_passes.append("artifacts")
+        return (
+            tally.versions_deleted,
+            tally.files_removed,
+            tally.artifacts_expired,
+            tally.soft_deleted,
+            tally.hard_deleted,
+        )
+
+    async def _sweep_artifact_versions(self) -> tuple[int, int, int]:
+        """留存链 B-28 —— 产物按**版本**到期。
+
+        B-63 —— 按**最后使用**:一版自己的时钟是 ``greatest(created_at, last_used_at, 登记它的
+        会话最后一次 run)``,最新版用整条产物最晚的那个时钟(所以最新版不会先于旧版本被清,
+        产物离开列表的那一刻正是最新版到期的那一刻);保留期是租户的
+        ``tenant_config.artifact_retention_days``,没设用 ``artifact_retention_days``。谓词在
+        :meth:`ArtifactStore.list_versions_expired`。到期的版本:
         删它登记时留的副本(B-235)+ NAS 文件(``path_in_workspace``,只 unlink 那一个
         普通文件;**同一路径还有别的版本在用时不删**,见
         :func:`~retention_cleanup_job.artifact_copies.release_version_files`)+ 删版本行;
@@ -455,13 +584,14 @@ class RetentionCleanupJob:
         if self._artifact_store is None or self._workspace_root is None:
             return 0, 0, 0
         now = datetime.now(UTC)
-        cutoff = now - timedelta(days=self._artifact_retention_days)
         expired = await self._artifact_store.list_versions_expired(
-            before=cutoff, limit=self._batch_size
+            now=now, default_days=self._artifact_retention_days, limit=self._batch_size
         )
         by_artifact: dict[UUID, list[ArtifactVersion]] = {}
-        for version in expired:
-            by_artifact.setdefault(version.artifact_id, []).append(version)
+        retention_days: dict[UUID, int] = {}
+        for entry in expired:
+            by_artifact.setdefault(entry.version.artifact_id, []).append(entry.version)
+            retention_days[entry.version.artifact_id] = entry.retention_days
         versions_deleted = files_removed = artifacts_expired = 0
         for artifact_id, versions in by_artifact.items():
             deletable, removed_here = await release_version_files(
@@ -472,16 +602,21 @@ class RetentionCleanupJob:
             deleted = await self._artifact_store.delete_versions(version_ids=deletable)
             versions_deleted += deleted
             files_removed += removed_here
+            self._artifact_tally.versions_deleted += deleted
+            self._artifact_tally.files_removed += removed_here
             expired_now = await self._artifact_store.mark_expired_if_versionless(
                 artifact_id=artifact_id, now=now
             )
             artifacts_expired += int(expired_now)
+            self._artifact_tally.artifacts_expired += int(expired_now)
             details: dict[str, object] = {
                 "user_id": str(versions[0].user_id),
                 "versions_deleted": sorted(v.version for v in versions if v.id in deletable),
                 "files_removed": removed_here,
                 "artifact_expired": expired_now,
-                "retention_days": self._artifact_retention_days,
+                # B-63 —— 这个租户实际生效的天数(按最后使用算起)。
+                "retention_days": retention_days[artifact_id],
+                "clock": "last_use",
             }
             if not expired_now:
                 # 审计要能自解释:没标过期是因为还有版本(正常,含本轮删不掉
@@ -509,8 +644,11 @@ class RetentionCleanupJob:
     async def _sweep_artifacts(self) -> tuple[int, int]:
         """Mini-ADR J-25 (J.9-step1) — two-stage artifact lifecycle sweep.
 
-        Stage 1: active rows past ``artifact_retention_days`` → soft-delete
-        (sets ``deleted_at``). Stage 2: soft-deleted rows past
+        Stage 1: active rows past their retention window → soft-delete
+        (sets ``deleted_at``). B-63: the window counts from **last use** — the same
+        clock and tenant days as the latest version in
+        :meth:`_sweep_artifact_versions` (which runs first), so a row leaves the list
+        exactly when its latest version expires. Stage 2: soft-deleted rows past
         ``artifact_hard_delete_grace_days`` → hard-delete (row +
         version rows).
 
@@ -525,13 +663,21 @@ class RetentionCleanupJob:
         if self._artifact_store is None:
             return 0, 0
         now = datetime.now(UTC)
-        # Stage 1 — soft-delete active rows past retention.
-        soft_cutoff = now - timedelta(days=self._artifact_retention_days)
+        # Stage 1 — soft-delete active rows past retention (B-63: last use).
         active = await self._artifact_store.list_active_past_retention(
-            before=soft_cutoff, limit=self._batch_size
+            now=now, default_days=self._artifact_retention_days, limit=self._batch_size
         )
         soft_count = 0
         for row in active:
+            # B-63 —— 版本 pass(先跑)已经把这条产物到期的版本连文件清掉、清空的行也标了过期;
+            # 还剩版本行 = 某个文件今天删不掉(明天再试)或这一批没轮到。那时产物留在列表里、
+            # 与剩下的版本一起,不出现「列表里没了、版本还在」。没配工作区根时版本 pass 不跑,
+            # 照旧按时钟软删。
+            if (
+                self._workspace_root is not None
+                and await self._artifact_store.list_versions_by_artifact(artifact_id=row.id)
+            ):
+                continue
             ok = await self._artifact_store.soft_delete(
                 tenant_id=row.tenant_id,
                 user_id=row.user_id,
@@ -544,6 +690,7 @@ class RetentionCleanupJob:
             )
             if ok:
                 soft_count += 1
+                self._artifact_tally.soft_deleted += 1
         # Stage 2 — hard-delete soft-deleted rows past the grace window.
         hard_cutoff = now - timedelta(days=self._artifact_hard_delete_grace_days)
         expired = await self._artifact_store.list_expired(
@@ -567,16 +714,20 @@ class RetentionCleanupJob:
         if not hard_ids:
             return soft_count, 0
         hard_count = await self._artifact_store.hard_delete(artifact_ids=hard_ids)
+        self._artifact_tally.hard_deleted += hard_count
         return soft_count, hard_count
 
     async def _sweep_uploads(self) -> UploadSweepTally:
         """留存链 —— 上传 90 天;规则本体在 :class:`retention_cleanup_job.uploads.UploadSweep`
         (B-271:按会话当前的 agent / 布局删真实位置上的文件,引用检查、改动保护、不安全路径)。
 
-        ``user_upload.created_at < now - upload_retention_days`` 且未软删的行,文档类删文件、
-        两类都标 ``deleted_at``(对外 GET 从此 404,复用既有语义)。只管有登记行的上传:控制台
-        上传与跨会话引用复制(copy-on-attach)不建 ``user_upload`` 行,这里永远看不到它们
-        (B-271 不改,另立)。
+        B-63 —— 按**最后使用**到期:``greatest(created_at, last_used_at, 会话最后一次 run)`` 加上
+        租户的 ``tenant_config.upload_retention_days``(没设用 ``upload_retention_days``)早于现在、
+        且未软删的行(谓词在 :meth:`UserUploadStore.list_expired`),文档类删文件、
+        两类都标 ``deleted_at``(对外 GET 从此 404,复用既有语义)。只管有登记行的上传:B-281 起
+        落进对话自己目录的控制台上传与跨会话引用复制(copy-on-attach)也建 ``user_upload`` 行;
+        B-281 之前的、以及落在共享根(老视图 agent 根 / 用户根)的没有登记行,这里看不到。老对话
+        迁移后留在 agent 根的原件见 :mod:`retention_cleanup_job.legacy_originals`。
 
         Returns the :class:`UploadSweepTally`。No-op when :class:`UserUploadStore`,
         :class:`ThreadMetaStore` or ``workspace_root`` is missing —— 没有会话就算不出文件在哪,
@@ -590,18 +741,18 @@ class RetentionCleanupJob:
         ):
             return UploadSweepTally()
         now = datetime.now(UTC)
-        cutoff = now - timedelta(days=self._upload_retention_days)
         sweep = UploadSweep(
             uploads=self._user_upload_store,
             threads=self._thread_store,
             root=self._workspace_root,
+            default_days=self._upload_retention_days,
             audit=self._audit_log_store,
         )
         try:
             expired = await self._user_upload_store.list_expired(
-                before=cutoff, limit=self._batch_size
+                now=now, default_days=self._upload_retention_days, limit=self._batch_size
             )
-            tally = await sweep.run(expired, cutoff=cutoff, now=now)
+            tally = await sweep.run(expired, now=now)
         except Exception:
             logger.exception("retention.upload_sweep_failed")
             self._failed_passes.append("uploads")
@@ -611,6 +762,152 @@ class RetentionCleanupJob:
             # 退出,让人去看。
             self._failed_passes.append("uploads")
         return tally
+
+    async def _sweep_conversation_dirs(self) -> ConversationDirTally:
+        """B-282 —— 闲置满租户保留期(``tenant_config.conversation_workspace_retention_days``,
+        没设用 ``conversation_workspace_retention_days``)的会话:删它的 ``threads/<会话>/`` 与各 run
+        的 ``.tool_results/<run>/``,库里的行不动。规则本体在
+        :mod:`retention_cleanup_job.conversation_dirs`。没配 ``workspace_root`` 不跑。
+
+        整条 pass 出错(列会话的查询)或有会话删失败:记日志、记进 ``failed_passes``(进程以
+        非 0 退出),已经做了的照样计数,后面的 pass 照跑。"""
+        if self._workspace_root is None:
+            return ConversationDirTally()
+        sweep = ConversationDirSweep(
+            sf=self._sf,
+            root=self._workspace_root,
+            default_days=self._conversation_workspace_retention_days,
+            batch_size=self._conversation_workspace_batch_size,
+            audit=self._audit_log_store,
+        )
+        try:
+            tally = await sweep.run(now=datetime.now(UTC))
+        except Exception:
+            logger.exception("retention.conversation_dirs_failed")
+            self._failed_passes.append("conversation_dirs")
+            return sweep.tally
+        if tally.needs_attention:
+            self._failed_passes.append("conversation_dirs")
+        return tally
+
+    async def _sweep_agent_roots(self) -> AgentRootTally:
+        """B-284 —— agent 根下 B-236 之前留下的顶层文件 / 模板子目录(按租户的
+        ``artifact_retention_days``,没设用 ``artifact_retention_days``),与过了运维设定日期的
+        ``shared/``;规则本体在 :mod:`retention_cleanup_job.agent_roots`。没配 ``workspace_root``
+        不跑。出错或有一项删失败:记进 ``failed_passes``(退出码 3),已经做了的照样计数。"""
+        tally = AgentRootTally()
+        if self._workspace_root is None:
+            return tally
+        cutover, cutover_problem = parse_cutover(self._agent_root_cutover)
+        shared_after, shared_problem = parse_shared_delete_after(self._shared_delete_after)
+        # 每一轮都把两道闸当前的样子打出来:运维一眼看得到它们开没开、开在哪天。
+        logger.info(
+            "retention.agent_roots_gate cutover=%s shared_delete_after=%s",
+            cutover.isoformat() if cutover else "off",
+            shared_after.date().isoformat() if shared_after else "off",
+        )
+        for env, raw, problem in (
+            ("AGENT_ROOT_CUTOVER", self._agent_root_cutover, cutover_problem),
+            ("SHARED_DELETE_AFTER", self._shared_delete_after, shared_problem),
+        ):
+            if problem is not None:
+                # 写错的配置不让整个作业停:只关掉这一步,记失败让人去看。
+                logger.error(
+                    "retention.config_invalid env=EXPERT_WORK_RETENTION_%s value=%r problem=%s",
+                    env,
+                    raw,
+                    problem,
+                )
+                tally.failed += 1
+        try:
+            if cutover is not None:
+                await sweep_agent_roots(
+                    self._sf,
+                    self._workspace_root,
+                    cutover=cutover,
+                    default_days=self._artifact_retention_days,
+                    tally=tally,
+                )
+            await asyncio.to_thread(
+                sweep_shared,
+                self._workspace_root,
+                delete_after=shared_after,
+                now=datetime.now(UTC),
+                tally=tally,
+            )
+        except Exception:
+            logger.exception("retention.agent_roots_failed")
+            self._failed_passes.append("agent_roots")
+            return tally
+        if tally.needs_attention:
+            self._failed_passes.append("agent_roots")
+        return tally
+
+    async def _sweep_agent_file_versions(self) -> VersionSweepTally:
+        """B-284 —— ``/agent`` 文件历史版本:源文件不见满 30 天的版本目录、每个文件最新 3 份之外
+        满 90 天的版本;规则本体在 :mod:`retention_cleanup_job.agent_file_versions`。"""
+        if self._workspace_root is None:
+            return VersionSweepTally()
+        try:
+            tally = await asyncio.to_thread(sweep_agent_file_versions, self._workspace_root)
+        except Exception:
+            logger.exception("retention.agent_file_versions_failed")
+            self._failed_passes.append("agent_file_versions")
+            return VersionSweepTally()
+        if tally.needs_attention:
+            self._failed_passes.append("agent_file_versions")
+        return tally
+
+    async def _sweep_purged_agents(self) -> PurgedAgentsSweep:
+        """B-278 —— 隔离区(``{tenant}/.purged-agents``)满 7 天的条目;规则本体在
+        :mod:`retention_cleanup_job.purged_agents`。没配 ``workspace_root`` 时不跑;删不掉的
+        条目进 ``failed_passes``(进程以非 0 退出,让人去看)。"""
+        if self._workspace_root is None:
+            return PurgedAgentsSweep()
+        try:
+            sweep = await sweep_purged_agents(self._workspace_root)
+        except Exception:
+            logger.exception("retention.purged_agents_failed")
+            self._failed_passes.append("purged_agents")
+            return PurgedAgentsSweep()
+        if sweep.failed:
+            self._failed_passes.append("purged_agents")
+        return sweep
+
+    async def _sweep_trajectories(self) -> TrajectorySweepTally:
+        """B-285 —— 对象存储里的轨迹对象:到期(租户 ``upload_retention_days``)与孤儿(对话行已
+        不在);规则本体在 :mod:`retention_cleanup_job.trajectories`。没接对象存储或
+        ``ThreadMetaStore`` 时不跑,但**不静默**:warning + ``skipped``(完成日志里看得出
+        「没跑」与「跑了、没东西可删」的区别 —— 部署环境在 B-286 之前就是这样);列不出 / 删不掉
+        进 ``failed_passes``。"""
+        if self._object_store is None or self._thread_store is None:
+            reason = "no_object_store" if self._object_store is None else "no_thread_store"
+            logger.warning("retention.trajectories_skipped reason=%s", reason)
+            return TrajectorySweepTally(skipped=True)
+        try:
+            async with self._sf() as session:
+                rows = (
+                    await session.execute(
+                        text("SELECT tenant_id, upload_retention_days FROM tenant_config")
+                    )
+                ).all()
+            sweep = await sweep_trajectories(
+                store=self._object_store,
+                threads=self._thread_store,
+                retention_days={row[0]: row[1] for row in rows},
+                default_days=self._upload_retention_days,
+                now=datetime.now(UTC),
+                limit=self._batch_size,
+            )
+        except Exception:
+            logger.exception("retention.trajectories_failed")
+            self._failed_passes.append("trajectories")
+            return TrajectorySweepTally()
+        if sweep.needs_attention:
+            self._failed_passes.append("trajectories")
+        if sweep.unrecognised:
+            logger.warning("retention.trajectory_keys_unrecognised count=%d", sweep.unrecognised)
+        return sweep
 
     async def _sweep_orphan_thread_dirs(self) -> int:
         """留存链 B-27 —— 孤儿 ``threads/<thread_id>/`` 目录;规则本体在
@@ -672,47 +969,71 @@ class RetentionCleanupJob:
     async def _delete_expired_images(self) -> tuple[int, int, int]:
         """Remove image rows past their retention window + their bytes.
 
-        Mini-ADR J-32 — finds the reapable ``image_upload`` rows: those
-        whose ``created_at`` is older than ``now - image_retention_days``,
-        plus **any already-soft-deleted row regardless of age** (a user
+        Mini-ADR J-32 — finds the reapable ``image_upload`` rows, plus
+        **any already-soft-deleted row regardless of age** (a user
         delete means the blob should leave at the next sweep, not at the
         original retention horizon). Removes the object-store key for
-        each, then hard-deletes the row.
+        each, then hard-deletes **only the rows whose key is gone** (a key
+        that was already absent counts as gone: ``ObjectStore.delete`` is
+        idempotent on S3 / OSS / MinIO and in memory).
 
-        Object-store failures don't block row hard-delete: an orphaned
-        key is a far smaller correctness problem than a stuck row
-        whose key never goes away (the bytes are billed against
-        ``IMAGE_STORAGE_BYTES``). The failure count lands in the report
-        so SRE can investigate without the sweep stalling.
+        B-283 —— 按**最后使用**到期:``greatest(created_at, last_used_at, 会话最后一次 run)``
+        加上租户的 ``tenant_config.upload_retention_days``(图片也是附件;没设用
+        ``upload_retention_days``,与附件同一个默认 90)早于现在
+        (谓词在 :meth:`ImageUploadStore.list_reapable`)。
+        会话还在用的图不再按上传时间被删;删掉之后会话里再引用它,适配器换成一句文字
+        (``orchestrator.multimodal.resolve_message_images``),那一轮照常跑。
+
+        B-286 —— 字节删不掉的行**留着**,下一轮再删(同 control-plane 彻底删除的
+        ``purge/image_blobs.py``):没有任何作业按键扫桶里的孤儿图片,行一没,字节就永远留在
+        桶里。这一轮有键删不掉 → 一行汇总日志(条数 + 异常类型,不打键、不逐条打堆栈),
+        ``images`` 进 ``failed_passes``,进程以非 0 退出。永远删不掉的行会每轮重试(没有
+        「放弃」上限:放弃就只能删行、丢字节,正是这里要避免的),靠失败的 pass 让人去看。
 
         Returns ``(rows_deleted, keys_removed, keys_failed)``. Returns
         ``(0, 0, 0)`` when either store is missing (unit-test path).
+
+        B-286 —— 对象存储配了却用不了(``object_store_unavailable``):行一条都不动(删了行、字节
+        却删不掉,就成了永远没人认领的字节),记 ``failed_passes``,进程以非 0 退出。
         """
+        if self._object_store_unavailable is not None:
+            logger.error(
+                "retention.images_skipped reason=object_store_unavailable error=%s",
+                self._object_store_unavailable,
+            )
+            self._failed_passes.append("images")
+            return 0, 0, 0
         if self._image_upload_store is None or self._object_store is None:
             return 0, 0, 0
-        cutoff = datetime.now(UTC) - timedelta(days=self._image_retention_days)
         expired = await self._image_upload_store.list_reapable(
-            before=cutoff,
+            now=datetime.now(UTC),
+            default_days=self._upload_retention_days,
             limit=self._batch_size,
         )
         if not expired:
             return 0, 0, 0
-        keys_ok = 0
-        keys_failed = 0
+        gone: list[UUID] = []
+        errors: dict[str, int] = {}
         for row in expired:
             try:
                 await self._object_store.delete(row.object_key)
-                keys_ok += 1
-            except Exception:
-                keys_failed += 1
-                logger.exception(
-                    "retention.image_object_delete_failed key=%s",
-                    row.object_key,
-                )
-        rows = await self._image_upload_store.hard_delete(
-            image_ids=[r.id for r in expired],
-        )
-        return rows, keys_ok, keys_failed
+            except Exception as exc:
+                name = type(exc).__name__
+                errors[name] = errors.get(name, 0) + 1
+                continue
+            gone.append(row.id)
+        keys_failed = len(expired) - len(gone)
+        if keys_failed:
+            logger.error(
+                "retention.image_object_delete_failed keys_failed=%d keys_ok=%d errors=%s "
+                "— their rows are kept for the next run",
+                keys_failed,
+                len(gone),
+                ",".join(f"{name}:{count}" for name, count in sorted(errors.items())),
+            )
+            self._failed_passes.append("images")
+        rows = await self._image_upload_store.hard_delete(image_ids=gone) if gone else 0
+        return rows, len(gone), keys_failed
 
     # ------------------------------------------------------------------
     # Per-table helpers (private). Each opens its own session + txn,
@@ -817,8 +1138,8 @@ class RetentionCleanupJob:
         """删掉过了保留期的沙箱出网审计行。
 
         ``ctid`` 子查询给 DELETE 限批(Postgres 不支持 ``DELETE ... LIMIT``),
-        与本文件其他几个 pass 同款。全局窗口、无 per-tenant 覆盖 —— 同
-        ``image_retention_days`` 的理由。表级 GRANT 见迁移 0143:这个 pass 以
+        与本文件其他几个 pass 同款。全局窗口、无 per-tenant 覆盖(运维 / 安全遥测,不是
+        租户的数据)。表级 GRANT 见迁移 0143:这个 pass 以
         ``retention_cleanup_worker`` 角色执行,少了那条授权就是 permission denied。
 
         Uses ``make_interval(days => :days)`` rather than

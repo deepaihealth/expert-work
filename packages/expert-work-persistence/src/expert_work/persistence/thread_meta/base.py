@@ -275,6 +275,13 @@ class ThreadMetaStore(abc.ABC):
         """
 
     @abc.abstractmethod
+    async def consume_workspace_cleaned(self, thread_id: UUID, *, tenant_id: UUID) -> bool:
+        """B-282 —— 留存作业清过这段会话的工作目录(``workspace_cleaned_at`` 有值)就把它清回空、
+        返回 ``True``:起新 run 的入口据此给模型一句一次性说明。比较再交换,只有一个调用方拿到
+        ``True``;``updated_at`` 不动(这一笔不是会话本身的变化)。清回空之后这段会话照常按新的
+        闲置时间再算到期。"""
+
+    @abc.abstractmethod
     async def check_access(self, thread_id: UUID, tenant_id: UUID) -> bool:
         """``True`` iff the thread exists and belongs to ``tenant_id``."""
 
@@ -283,4 +290,16 @@ class ThreadMetaStore(abc.ABC):
         """Delete the thread; returns True if a row matched the tenant filter.
 
         Test / admin only. Production retention is driven by Stream D.3 TTL job.
+        """
+
+    @abc.abstractmethod
+    async def delete_unused(
+        self, thread_id: UUID, *, tenant_id: UUID, own_upload_ids: Collection[UUID] = ()
+    ) -> bool:
+        """B-293 —— 撤掉一个请求刚建、还没人用的会话:只在没有任何 ``agent_run`` 行、没有
+        ``image_upload`` 行、``user_upload`` 行全在 ``own_upload_ids`` 里(本请求自己登记的)时
+        删除。判断与删除是同一条语句;返回是否删掉了。
+
+        调用方在会话的接单锁里调(``supersede_thread_lock``)。内存实现不知道别的表,与
+        :meth:`delete` 一样直接删 —— 调用方锁里的检查是内存栈上唯一的那道判断。
         """

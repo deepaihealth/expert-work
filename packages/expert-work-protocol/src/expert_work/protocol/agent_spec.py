@@ -1639,7 +1639,9 @@ class AgentSpecBody(BaseModel):
             "this ends the turn with the partial output (the model went "
             "silent mid-stream); if that partial is reasoning only, with no "
             "answer text and no complete tool call, the agent loop fails the "
-            "run instead (B-186; planner / reflection still get the partial). "
+            "run (B-186; planner / reflection still get the partial) — unless "
+            "nothing but reasoning streamed and a fallback model is "
+            "configured: then the call is redone on it (B-297). "
             "Distinct from ``stream_deadline_s`` (the "
             "time-to-first-token budget). Set ``0`` to disable the idle "
             "timer (dev / long-batch). Non-streaming providers ignore this."
@@ -1879,6 +1881,15 @@ class AgentSpecStatus(StrEnum):
     ACTIVE = "active"
     DEPRECATED = "deprecated"
     DELETED = "deleted"
+    #: B-278 —— 彻底删除开始时整个名字的所有版本一起翻成这个状态,删完才删行。处于
+    #: 这个状态的名字不能恢复、不能新建同名版本(409 ``AGENT_PURGING``);删到一半失败
+    #: 会停在这里,只能再点一次彻底删除把剩下的清完。
+    PURGING = "purging"
+
+    @property
+    def gone(self) -> bool:
+        """``deleted`` or ``purging`` —— not runnable, hidden from live reads."""
+        return self in (AgentSpecStatus.DELETED, AgentSpecStatus.PURGING)
 
 
 class AgentSpecDraft(BaseModel):

@@ -9,7 +9,7 @@
 | | |
 |---|---|
 | 生产现在钉的版本 | **`91e8daf02`**(2026-11-04 晚上线:B-236..B-276,迁移 0181 + 0182 先单独跑,沙箱镜像 `daf63cb1 → f2ee1b4a`,执行单 [`2026-11-04-prod-release-checklist.md`](./2026-11-04-prod-release-checklist.md);沙箱池 11-03 起临时在集群安全组,见 ROADMAP B-217)。上一版 `5a1600934`(2026-10-30 晚热修上线:MCP 连接池到期改为「退役」不再直接关,#1979;上一版 `0db5633d3` 同日上线:`list_files` 按 fd 遍历,#1975;再上一版 `7e6b7679e` 为 2026-10-29 上线,同窗口 PostgreSQL 16 → 17、沙箱镜像 `daf63cb1`、B-217 沙箱独立安全组,执行单 [`2026-10-29-prod-release-checklist.md`](./2026-10-29-prod-release-checklist.md)) |
-| 下一班 | 未定。候选:B-236(每个对话独立工作目录,要先钉带 `/agent` 的沙箱镜像再发代码)、B-228(发版脚本先等迁移跑完)。 |
+| 下一班 | 未定。候选:B-236(每个对话独立工作目录,要先钉带 `/agent` 的沙箱镜像再发代码)、B-228(发版脚本先等迁移跑完)。**带上 B-284(agent 根存量清理)的那一班,执行单里必须有**:`EXPERT_WORK_RETENTION_AGENT_ROOT_CUTOVER=2026-11-04T19:10:00+08:00` 已钉在 `infra/k8s/overlays/prod/retention-cleanup-patch.yaml`(生产 B-236 上线那晚执行单的开始时刻,比真正滚动早、只会少删;固定值),随 `release.sh` 下发,发完核一下 CronJob 上有它;`EXPERT_WORK_RETENTION_SHARED_DELETE_AFTER=<发布日 + 30 天,YYYY-MM-DD>` 不进 git,发布当天通知深护之后 `kubectl set env cronjob/retention-cleanup …` 手设,不设 = 永不删 `shared/`;发完看第一晚日志的 `retention.agent_roots_gate` 一行(见 `pending-test-release-acceptance.md` §98.9)。 |
 
 历次生产发布(执行单都在本目录,发完归档):
 
@@ -409,6 +409,7 @@ kubectl -n expert-work exec -it <control-plane-pod> -- python -m control_plane.k
   第二套审批超时已删、B-45 RLS sessionmaker 已接)。放行依据是 09-17 测试环境
   造数据实删 37/37(test 一周的日志删除数全 0,验不出东西),记录在
   `base/retention-cleanup-job/kustomization.yaml` 头注。image_upload 那条 pass
-  两环境都是 no-op(job 不持有 OSS 凭据)。billing-rollup-job /
+  两环境都是 no-op(job 不持有 OSS 凭据)—— B-286 起 job 与 control-plane 用同一个对象存储,
+  这条 pass 真的删行和字节(叠在 B-283 上,同一次发布,见 pending-test-release-acceptance §100)。billing-rollup-job /
   event-log-archive-job / audit-backup-worker 仍是**只有代码没有部署物**
   (infra/k8s 零 CronJob),test 也没跑,首发保持一致。

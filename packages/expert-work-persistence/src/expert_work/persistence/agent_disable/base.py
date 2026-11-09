@@ -50,3 +50,10 @@ class AgentDisableStore(abc.ABC):
         ``disabled=False`` 的行,它**必须**不在结果里 —— 否则目录端点会把
         一个正常 agent 标成不可用。
         """
+
+    @abc.abstractmethod
+    async def delete(self, *, tenant_id: UUID, agent_name: str) -> bool:
+        """B-278 —— drop the ``(tenant_id, agent_name)`` row (agent purge).
+
+        A row left behind would make a new agent created under the same name
+        start out disabled. Returns whether a row was removed."""

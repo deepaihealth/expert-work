@@ -187,9 +187,13 @@ async def test_upload_503_when_no_object_store_configured() -> None:
 
 
 async def _doc_client(
+    *,
+    agent: str | None = None,
+    layout: str = "conversation",
     **settings_overrides: object,
 ) -> tuple[AsyncClient, UUID, object, object]:
-    """A booted app with a fake workspace store wired + a seeded thread."""
+    """A booted app with a fake workspace store wired + a seeded thread (unbound unless
+    ``agent``; ``layout="agent_root"`` makes it an old-view conversation)."""
     from orchestrator.tools import RecordingWorkspaceStore
 
     store = RecordingWorkspaceStore()
@@ -202,8 +206,13 @@ async def _doc_client(
     app.state.workspace_store = store
     thread_id = uuid4()
     await app.state.thread_meta_repo.create(
-        thread_id=thread_id, tenant_id=_TENANT, created_by="user-a"
+        thread_id=thread_id, tenant_id=_TENANT, created_by="user-a", agent_name=agent
     )
+    if layout != "conversation":
+        repo = app.state.thread_meta_repo
+        repo._rows[thread_id] = repo._rows[thread_id].model_copy(
+            update={"workspace_layout": layout}
+        )
     transport = ASGITransport(app=app)
     client = AsyncClient(transport=transport, base_url="http://cp.test", headers=_headers())
     return client, thread_id, store, app
@@ -286,6 +295,111 @@ async def test_upload_document_oversize_rejected() -> None:
             files={"file": ("big.pdf", b"%PDF-" + b"x" * 100, "application/pdf")},
         )
     assert resp.status_code == 413
+
+
+@pytest.mark.asyncio
+async def test_console_document_upload_is_registered_like_an_external_one() -> None:
+    """B-281 —— 控制台上传的文档也建 ``user_upload`` 登记行(同对外上传的字段与 sha256 语义),
+    留存作业按最后使用到期、删前核对 sha256、「还有别的行指着同一个文件就不删」才管得到它。
+    行记在**落盘的那个工作区**(调用者自己的)名下。"""
+    import hashlib
+
+    client, thread_id, store, app = await _doc_client(agent="support-bot")
+    raw = b"%PDF-1.4 console body"
+    async with client:
+        resp = await client.post(
+            f"/v1/sessions/{thread_id}/uploads",
+            files={"file": ("Q3 Report.pdf", raw, "application/pdf")},
+        )
+    assert resp.status_code == 201, resp.text
+    path = resp.json()["path"]
+    assert set(resp.json()) == {"path", "kind"}  # 响应形状不变,不把 upl_ id 回给控制台
+
+    caller = await app.state.tenant_user_repo.get_by_subject(  # type: ignore[attr-defined]
+        tenant_id=_TENANT, subject_type="user", subject_id="user-a"
+    )
+    rows = await app.state.user_upload_store.list_documents_for_thread(  # type: ignore[attr-defined]
+        tenant_id=_TENANT, thread_id=thread_id
+    )
+    assert [
+        (r.user_id, r.kind, r.ref, r.filename, r.mime_type, r.size_bytes, r.sha256) for r in rows
+    ] == [
+        (
+            caller.id,
+            "document",
+            path,
+            path.rsplit("/", 1)[-1],
+            "application/pdf",
+            len(raw),
+            hashlib.sha256(raw).hexdigest(),
+        )
+    ]
+    _tenant, written_user, written_path, _data = store.workspace_writes[0]  # type: ignore[attr-defined]
+    assert written_user == caller.id
+    assert written_path.endswith(f"/threads/{thread_id}/work/{path}")  # its own conversation dir
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("agent", "layout"),
+    [(None, "conversation"), ("support-bot", "agent_root")],
+    ids=["unbound-user-root", "old-view-agent-root"],
+)
+async def test_console_upload_into_a_shared_root_is_not_registered(
+    agent: str | None, layout: str
+) -> None:
+    """B-281 review F4 —— 落进共享根(没绑 agent 的用户根 / 老视图的 agent 根)的上传不登记:别的
+    会话也看得到那个文件,留存作业的引用检查只认登记行,登记了到期就会删掉别人还在用的文件。"""
+    client, thread_id, store, app = await _doc_client(agent=agent, layout=layout)
+    async with client:
+        resp = await client.post(
+            f"/v1/sessions/{thread_id}/uploads",
+            files={"file": ("shared.pdf", b"%PDF-1.4 shared", "application/pdf")},
+        )
+    assert resp.status_code == 201, resp.text
+    _tenant, _user, written_path, _data = store.workspace_writes[0]  # type: ignore[attr-defined]
+    assert "/work/" not in written_path  # really a shared root
+    rows = await app.state.user_upload_store.list_documents_for_thread(  # type: ignore[attr-defined]
+        tenant_id=_TENANT, thread_id=thread_id
+    )
+    assert rows == []
+
+
+@pytest.mark.asyncio
+async def test_console_reupload_of_the_same_bytes_registers_again() -> None:
+    """同一份再传一次:文件复用(只写一次),登记行照样再建一条 —— 同对外上传,保留期从这次上传
+    算起。两行指着同一个文件,到期的那一行不会删掉另一行还在用的文件(留存作业的引用检查)。"""
+    client, thread_id, store, app = await _doc_client(agent="support-bot")
+    async with client:
+        for _ in range(2):
+            resp = await client.post(
+                f"/v1/sessions/{thread_id}/uploads",
+                files={"file": ("same.pdf", b"%PDF-1.4 same", "application/pdf")},
+            )
+            assert resp.status_code == 201, resp.text
+    rows = await app.state.user_upload_store.list_documents_for_thread(  # type: ignore[attr-defined]
+        tenant_id=_TENANT, thread_id=thread_id
+    )
+    assert [r.ref for r in rows] == ["uploads/same.pdf", "uploads/same.pdf"]
+    assert len(store.workspace_writes) == 1  # type: ignore[attr-defined]
+
+
+@pytest.mark.asyncio
+async def test_a_failed_console_document_upload_registers_nothing() -> None:
+    from orchestrator.tools import SandboxSupervisorError
+
+    client, thread_id, store, app = await _doc_client(agent="support-bot")
+    store.workspace_write_error = SandboxSupervisorError("supervisor unreachable")  # type: ignore[attr-defined]
+    async with client:
+        resp = await client.post(
+            f"/v1/sessions/{thread_id}/uploads",
+            files={"file": ("report.pdf", b"%PDF-1.4 body", "application/pdf")},
+        )
+    assert resp.status_code == 502, resp.text
+    rows = await app.state.user_upload_store.list_documents_for_thread(  # type: ignore[attr-defined]
+        tenant_id=_TENANT, thread_id=thread_id
+    )
+    assert rows == []
 
 
 @pytest.mark.asyncio

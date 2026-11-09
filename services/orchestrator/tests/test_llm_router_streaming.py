@@ -79,15 +79,15 @@ async def test_idle_after_first_token_ends_turn_with_partial() -> None:
 
 @pytest.mark.asyncio
 async def test_idle_after_reasoning_only_returns_a_stamped_partial() -> None:
-    # B-186: the model thinks, then goes silent before any answer. The router
-    # still hands back the partial (no fallback: the thinking has already
-    # streamed), stamped so the agent loop can fail the run. Planner and
+    # B-186: the model thinks, then goes silent before any answer. With no
+    # other provider group to redo the step on (B-297 PR2 covers the backup
+    # case in test_llm_reasoning_stall_failover.py), the router hands back the
+    # partial, stamped so the agent loop can fail the run. Planner and
     # reflection share this router and keep treating it as an empty reply.
     slow = _handle(
         [LLMDelta(reasoning="let me think "), LLMDelta(reasoning="some more"), 0.3], key="glm:a"
     )
-    never = _handle([LLMDelta(content="SHOULD NOT REACH")], key="glm:b")
-    router = LLMRouter(providers=[slow, never], first_token_timeout_s=0.5, idle_timeout_s=0.1)
+    router = LLMRouter(providers=[slow], first_token_timeout_s=0.5, idle_timeout_s=0.1)
     msg = await router(messages=[], tools=[])
     assert msg.content == ""
     assert msg.additional_kwargs.get("reasoning_content") == "let me think some more"

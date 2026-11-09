@@ -11,7 +11,9 @@
 * B-235 之前登记的(没有副本)且正是最新版 → 照旧读工作区文件(这一点上与以前逐字相同);
 * B-235 之前登记的、已经不是最新版 → :class:`VersionNotRetained`:那一版的字节早被同名的
   后续登记盖掉了,拿最新版冒充正是 B-235 要修的事;
-* 不存在(从没有过、或已被留存作业清掉)→ :class:`VersionUnknown`。
+* 版本号比最新版小、却没有版本行 → :class:`VersionExpired`(B-63):版本号从 1 连续往上分配,
+  单独删掉某一版的只有留存作业,所以这一版是超过保留期被清掉的;
+* 其它不存在(版本号比最新版大、从没有过)→ :class:`VersionUnknown`。
 
 指定版本一律从「最新版」那一行按 id 取(``get_version_by_id(artifact_id=latest.artifact_id)``),
 不按名字查第二次 —— 两次按名字的查询之间同名产物可能被更新,落到另一条产物上。
@@ -26,15 +28,24 @@ B 的那条产物上(B 有 v2 就下发 B 的 v2,没有就 404)。今天建会�
 **从哪读**:有副本读副本,没有读 ``path_in_workspace``。副本读不到(进程内存后端重启、被
 误删)就是读不到 —— 抛出来的仍是 ``SandboxSupervisorError`` 家族,端点既有的
 「500 权限 / 413 太大 / 404 不在」翻译照用,**不**退回去读工作区里的当前文件。
+
+**记一次使用**(B-63):字节读到之后记这一版的 ``last_used_at``(每版每天最多写一次),三个
+下载端点都经过这里。产物的保留期从最后一次使用算起。平台运维跨租户查看(系统管理员切到别的
+租户)不是这个租户在用,调用方传 ``record_use=False``,不记。
 """
 
 from __future__ import annotations
 
+import logging
+from datetime import UTC, datetime
 from uuid import UUID
 
+from expert_work.persistence.artifact import ArtifactStore
 from expert_work.protocol import ArtifactVersion
 from orchestrator.tools import SandboxSupervisorError, WorkspaceStore
 from orchestrator.tools.artifact_snapshots import ArtifactSnapshotStore
+
+logger = logging.getLogger(__name__)
 
 #: 每个下载响应都带上实际下发的版本号 —— 对接方据此核对拿到的是哪一版。
 VERSION_HEADER = "X-Artifact-Version"
@@ -42,6 +53,15 @@ VERSION_HEADER = "X-Artifact-Version"
 
 class VersionUnknown(Exception):  # noqa: N818 - a selection outcome, not an error class
     """请求的版本号没有对应的版本行。"""
+
+
+class VersionExpired(Exception):  # noqa: N818 - a selection outcome, not an error class
+    """B-63 —— 请求的版本号比最新版小,版本行却不在了:超过保留期被留存作业清掉了。"""
+
+    def __init__(self, *, requested: int, latest: int) -> None:
+        super().__init__(f"version {requested} expired; latest is {latest}")
+        self.requested = requested
+        self.latest = latest
 
 
 class VersionNotRetained(Exception):  # noqa: N818 - a selection outcome, not an error class
@@ -65,6 +85,8 @@ def choose_version(
     """
     if requested is None:
         return latest
+    if pinned is None and 1 <= requested < latest.version:
+        raise VersionExpired(requested=requested, latest=latest.version)
     # 调用方从「最新版」那一行按 id 取 ``pinned``,所以它们本该是同一条产物;不是就当作
     # 不存在(防御:绝不把别的产物的内容当这一版下发)。
     if pinned is None or pinned.artifact_id != latest.artifact_id:
@@ -81,15 +103,33 @@ async def read_version_bytes(
     user_id: UUID,
     snapshots: ArtifactSnapshotStore | None,
     workspace_store: WorkspaceStore,
+    artifacts: ArtifactStore,
+    record_use: bool,
 ) -> bytes:
-    """读一版的字节:有副本读副本,B-235 之前的版本读工作区路径。"""
+    """读一版的字节:有副本读副本,B-235 之前的版本读工作区路径;读到了且 ``record_use`` 时记
+    一次使用(B-63)。"""
     if version.snapshot_key is not None:
         if snapshots is None:
             msg = "artifact snapshot store is not configured"
             raise SandboxSupervisorError(msg)
-        return await snapshots.read(
+        data = await snapshots.read(
             tenant_id=tenant_id, user_id=user_id, snapshot_key=version.snapshot_key
         )
-    return await workspace_store.read_file(
-        tenant_id=tenant_id, user_id=user_id, path=version.path_in_workspace
-    )
+    else:
+        data = await workspace_store.read_file(
+            tenant_id=tenant_id, user_id=user_id, path=version.path_in_workspace
+        )
+    if record_use:
+        await _note_version_used(artifacts, version)
+    return data
+
+
+async def _note_version_used(artifacts: ArtifactStore, version: ArtifactVersion) -> None:
+    """B-63 —— 记不上只打 warning、不影响这次下载:少记一次的后果是这一版按上一次使用的
+    时间到期,不会早于改动之前(按登记时间)的到期日。"""
+    try:
+        await artifacts.touch_version(
+            version_id=version.id, tenant_id=version.tenant_id, now=datetime.now(UTC)
+        )
+    except Exception:
+        logger.warning("artifact.touch_failed version=%s", version.id, exc_info=True)

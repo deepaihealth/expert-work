@@ -250,6 +250,10 @@ from expert_work.protocol.subagent import (
     SubagentStatus,
 )
 from expert_work.protocol.tenant_config import (
+    FILE_RETENTION_DEFAULT_DAYS,
+    FILE_RETENTION_FIELDS,
+    FILE_RETENTION_MAX_DAYS,
+    FILE_RETENTION_MIN_DAYS,
     CredentialsMode,
     MemoryRecallMode,
     TenantConfigPatch,
@@ -288,6 +292,7 @@ from expert_work.protocol.user_upload import (
     UPLOAD_ID_PREFIX,
     UserUpload,
     UserUploadKind,
+    is_session_deleted_tombstone,
     parse_upload_id,
     render_upload_id,
 )
@@ -313,6 +318,10 @@ __all__ = [
     "DEFAULT_WORKSPACE_BYTES_PER_USER",
     "DIMENSION_RESOURCE_KINDS",
     "FIELD_TIERS",
+    "FILE_RETENTION_DEFAULT_DAYS",
+    "FILE_RETENTION_FIELDS",
+    "FILE_RETENTION_MAX_DAYS",
+    "FILE_RETENTION_MIN_DAYS",
     "KB_DOCUMENT_TITLE_MAX_CHARS",
     "MAX_CHUNK_MAX_TOKENS",
     "MAX_RESULT_EXCERPT_CHARS",
@@ -541,6 +550,7 @@ __all__ = [
     "chunk_retrieval_text",
     "dimension_applies",
     "enforce_security_floor",
+    "is_session_deleted_tombstone",
     "knowledge_document_title",
     "models_for_provider",
     "parse_agent_ref",

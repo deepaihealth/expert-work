@@ -315,6 +315,47 @@ async def test_memory_predictive_review_enabled_default_and_patch(
         await engine.dispose()
 
 
+@pytest.mark.asyncio
+async def test_file_retention_days_set_keep_and_reset_to_the_platform_default(
+    tenant_config_store: tuple[SqlTenantConfigStore, AsyncEngine],
+) -> None:
+    """B-63 —— 与内存实现同义:默认 ``None``;不带键的 patch 不动;显式 ``null`` 改回平台默认。"""
+    store, engine = tenant_config_store
+    try:
+        tenant = uuid4()
+        current_tenant_id_var.set(tenant)
+        created = await store.create(tenant_id=tenant, display_name="Acme", actor_id="bootstrap")
+        assert (created.upload_retention_days, created.artifact_retention_days) == (None, None)
+
+        set_ = await store.upsert(
+            tenant_id=tenant,
+            patch=TenantConfigPatch(upload_retention_days=30, artifact_retention_days=180),
+            actor_id="ops",
+        )
+        assert (set_.upload_retention_days, set_.artifact_retention_days) == (30, 180)
+        kept = await store.upsert(
+            tenant_id=tenant, patch=TenantConfigPatch(display_name="Acme 2"), actor_id="ops"
+        )
+        assert (kept.upload_retention_days, kept.artifact_retention_days) == (30, 180)
+        await store.upsert(
+            tenant_id=tenant, patch=TenantConfigPatch(upload_retention_days=None), actor_id="ops"
+        )
+        fetched = await store.get(tenant_id=tenant)
+        assert fetched is not None
+        assert (fetched.upload_retention_days, fetched.artifact_retention_days) == (None, 180)
+
+        fresh = uuid4()
+        current_tenant_id_var.set(fresh)
+        first = await store.upsert(
+            tenant_id=fresh,
+            patch=TenantConfigPatch(display_name="New", artifact_retention_days=7),
+            actor_id="ops",
+        )
+        assert first.artifact_retention_days == 7
+    finally:
+        await engine.dispose()
+
+
 # ---------------------------------------------------------------------------
 # BUG-1(2026-08-24)mcp_allowlist 原子 add/remove(语义见 base.py;in-memory
 # 对应用例在 test_in_memory_tenant_config_store.py,两后端行为必须同义)。
@@ -432,5 +473,93 @@ async def test_add_blocks_on_row_lock_then_merges(
         fetched = await store.get(tenant_id=tenant)
         assert fetched is not None
         assert sorted(fetched.mcp_allowlist) == ["amap", "deep"]
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_an_unconfirmed_decrease_is_judged_against_the_locked_row(
+    tenant_config_store: tuple[SqlTenantConfigStore, AsyncEngine],
+) -> None:
+    """B-63 —— 「改小要确认」的比较必须与写入在同一个事务、锁住那一行之后做。否则:另一个
+    事务把 30 调到 365 还没提交时,这边读到 30、判「60 不算改小」,等对面提交后照样把 365
+    写成 60。这里先占住行锁把值改成 365,再发一个不确认的「改成 60」,然后提交 —— 它必须
+    看到 365 并拒绝。"""
+    import asyncio
+
+    from expert_work.persistence.tenant_config.base import RetentionDecreaseNotConfirmedError
+
+    store, engine = tenant_config_store
+    try:
+        tenant = uuid4()
+        current_tenant_id_var.set(tenant)
+        await store.create(tenant_id=tenant, display_name="Acme", actor_id="bootstrap")
+        await store.upsert(
+            tenant_id=tenant,
+            patch=TenantConfigPatch(upload_retention_days=30),
+            actor_id="ops",
+        )
+        async with engine.connect() as holder:
+            tx = await holder.begin()
+            await holder.execute(
+                text("SELECT set_config('app.tenant_id', :t, true)"), {"t": str(tenant)}
+            )
+            await holder.execute(
+                text("SELECT 1 FROM tenant_config WHERE tenant_id = :t FOR UPDATE"),
+                {"t": tenant},
+            )
+            await holder.execute(
+                text("UPDATE tenant_config SET upload_retention_days = 365 WHERE tenant_id = :t"),
+                {"t": tenant},
+            )
+            lower = asyncio.create_task(
+                store.upsert(
+                    tenant_id=tenant,
+                    patch=TenantConfigPatch(upload_retention_days=60),
+                    actor_id="ops",
+                    reject_unconfirmed_decrease=True,
+                )
+            )
+            await asyncio.sleep(0.5)
+            assert not lower.done()  # waiting for the row lock
+            await tx.commit()
+
+        with pytest.raises(RetentionDecreaseNotConfirmedError) as caught:
+            await lower
+        assert caught.value.decreases == [{"field": "upload_retention_days", "from": 365, "to": 60}]
+        fetched = await store.get(tenant_id=tenant)
+        assert fetched is not None and fetched.upload_retention_days == 365
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_conversation_workspace_retention_days_round_trip(
+    tenant_config_store: tuple[SqlTenantConfigStore, AsyncEngine],
+) -> None:
+    """B-282 —— 新列在真库上存取:设值、不带键不动、显式 ``null`` 改回平台默认。"""
+    store, engine = tenant_config_store
+    try:
+        tenant = uuid4()
+        current_tenant_id_var.set(tenant)
+        created = await store.create(tenant_id=tenant, display_name="Acme", actor_id="bootstrap")
+        assert created.conversation_workspace_retention_days is None
+        await store.upsert(
+            tenant_id=tenant,
+            patch=TenantConfigPatch(conversation_workspace_retention_days=200),
+            actor_id="ops",
+        )
+        await store.upsert(
+            tenant_id=tenant, patch=TenantConfigPatch(display_name="Acme 2"), actor_id="ops"
+        )
+        fetched = await store.get(tenant_id=tenant)
+        assert fetched is not None and fetched.conversation_workspace_retention_days == 200
+        await store.upsert(
+            tenant_id=tenant,
+            patch=TenantConfigPatch(conversation_workspace_retention_days=None),
+            actor_id="ops",
+        )
+        fetched = await store.get(tenant_id=tenant)
+        assert fetched is not None and fetched.conversation_workspace_retention_days is None
     finally:
         await engine.dispose()

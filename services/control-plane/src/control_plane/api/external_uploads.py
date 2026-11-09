@@ -59,6 +59,7 @@ from control_plane.api._external import (
     reject_nul_path_params,
 )
 from control_plane.api._external_agent_scope import agent_key_for_code
+from control_plane.api._new_session_undo import NewSessionUndo, discard_new_session
 from control_plane.api._quota_admission import check_admission
 from control_plane.api._user_scope import get_user_repo
 from control_plane.api._workspace_shared import thread_workspace_path
@@ -68,9 +69,13 @@ from control_plane.api.uploads import (
     _handle_document_upload,
     _land_image_upload,
     _prepare_image_upload,
+    note_image_used,
+    note_uploads_used,
+    register_document_upload,
 )
 from control_plane.quota.base import QuotaService
 from control_plane.settings import Settings
+from control_plane.supersede import supersede_thread_lock
 from expert_work.persistence.agent_instance import AgentInstanceStore
 from expert_work.persistence.agent_spec import AgentSpecStore
 from expert_work.persistence.image_upload import ImageUploadStore
@@ -78,7 +83,7 @@ from expert_work.persistence.tenant_user import TenantUserStore
 from expert_work.persistence.thread_meta import ThreadMetaStore
 from expert_work.persistence.user_upload import UserUploadStore
 from expert_work.protocol import Principal, QuotaDimension, parse_upload_id, render_upload_id
-from expert_work.protocol.multimodal import parse_image_ref
+from expert_work.protocol.multimodal import ImageRef, parse_image_ref
 from expert_work.runtime.audit.logger import AuditLogger
 from expert_work.runtime.storage import ObjectNotFoundError, ObjectStore, ObjectStoreError
 from orchestrator.tools import SandboxSupervisorError, WorkspacePermissionError, WorkspaceStore
@@ -178,6 +183,43 @@ def _get_user_upload_store(request: Request) -> UserUploadStore:
 
 def _get_workspace_store(request: Request) -> WorkspaceStore | None:
     return getattr(request.app.state, "workspace_store", None)
+
+
+async def _withdrawn_if_session_gone(
+    request: Request,
+    *,
+    tenant_id: UUID,
+    thread_id: UUID,
+    threads: ThreadMetaStore,
+    uploads: UserUploadStore,
+    upload_id: UUID,
+    images: ImageUploadStore | None = None,
+    store: ObjectStore | None = None,
+    image_ref: ImageRef | None = None,
+) -> JSONResponse | None:
+    """B-293 —— 登记行写下之后重读会话行:会话在落地期间被撤了(另一个请求撤掉了它自己建、
+    又被拒的新会话,而这个请求是拿到那个 id 往里传的),就撤回刚登记的行(图片连同字节和
+    ``image_upload`` 行),回与「会话不存在」相同的 404,不回一个指向已删会话的 201。
+
+    只在重读时短暂拿接单锁(``supersede_thread_lock``,撤会话的那一方判断「没人在用」再删会话行
+    都在锁里):撤的一方如果正在锁里,这里等它删完再读,读到的就是「没了」;它还没进锁,就会看见
+    这里刚提交的登记行而不撤。落盘本身不在锁里。落下的文件不在这里删:会话行没了,留存作业的
+    孤儿目录扫描收拾。"""
+    session_factory = getattr(request.app.state, "session_factory", None)
+    async with supersede_thread_lock(session_factory, thread_id):
+        if await threads.get(thread_id, tenant_id=tenant_id) is not None:
+            return None
+    try:
+        await uploads.hard_delete(upload_id=upload_id, tenant_id=tenant_id)
+        if image_ref is not None and images is not None:
+            if store is not None:
+                await store.delete(image_ref.storage_key)
+            await images.hard_delete(image_ids=[image_ref.image_id])
+    except Exception as exc:
+        logger.warning("upload.withdraw_after_session_gone_failed error=%s", type(exc).__name__)
+    return external_error(
+        ExternalScopeError("SESSION_NOT_FOUND", "session not found for this user / agent", 404)
+    )
 
 
 def build_external_uploads_router() -> APIRouter:
@@ -281,6 +323,24 @@ def build_external_uploads_router() -> APIRouter:
             end_user_id = meta.user_id
             layout = meta.workspace_layout
 
+        #: B-293 —— 本请求已经写进工作区、记过 ``note_written`` 的字节(撤会话时减回去)。
+        landed_bytes = 0
+
+        async def _discard_if_new() -> None:
+            # B-293 —— 上传被拒时调:本请求自己建的会话(连同落盘失败可能留下的半份文件)不留;
+            # 有人在用(别的请求拿它的 id 起了 run / 传了文件)就不撤,见 ``_new_session_undo``。
+            if session_id is None:
+                await discard_new_session(
+                    NewSessionUndo.from_request(request),
+                    tenant_id=tenant_id,
+                    thread_id=thread_id,
+                    end_user_id=end_user_id,
+                    agent_code=agent_code,
+                    workspace_layout=layout,
+                    landed_files=True,
+                    landed_bytes=landed_bytes,
+                )
+
         try:
             if not file.filename:
                 raise HTTPException(status_code=400, detail="uploaded file has no filename")
@@ -311,18 +371,26 @@ def build_external_uploads_router() -> APIRouter:
                     workspace_store=workspace_store,
                     audit=audit,
                 )
-                row = await uploads.insert(
-                    upload_id=uuid4(),
+                if not doc_result.reused:
+                    landed_bytes = doc_result.size_bytes
+                row = await register_document_upload(
+                    uploads,
                     tenant_id=tenant_id,
                     user_id=end_user_id,
                     thread_id=thread_id,
-                    kind="document",
-                    ref=doc_result.path,
+                    landed=doc_result,
                     mime_type=content_type,
-                    size_bytes=doc_result.size_bytes,
-                    filename=doc_result.path.rsplit("/", 1)[-1],
-                    sha256=doc_result.sha256,
                 )
+                withdrawn = await _withdrawn_if_session_gone(
+                    request,
+                    tenant_id=tenant_id,
+                    thread_id=thread_id,
+                    threads=threads,
+                    uploads=uploads,
+                    upload_id=row.id,
+                )
+                if withdrawn is not None:
+                    return withdrawn
                 return JSONResponse(
                     status_code=201,
                     content={
@@ -355,6 +423,7 @@ def build_external_uploads_router() -> APIRouter:
                 cost_overrides={QuotaDimension.IMAGE_STORAGE_BYTES: len(raw)},
             )
             if denial is not None:
+                await _discard_if_new()
                 return denial
 
             image_ref = await _land_image_upload(
@@ -382,6 +451,19 @@ def build_external_uploads_router() -> APIRouter:
                 # B-271 —— 同 ``image_upload.sha256``:``raw`` 就是落进对象存储的那份字节。
                 sha256=hashlib.sha256(raw).hexdigest(),
             )
+            withdrawn = await _withdrawn_if_session_gone(
+                request,
+                tenant_id=tenant_id,
+                thread_id=thread_id,
+                threads=threads,
+                uploads=uploads,
+                upload_id=row.id,
+                images=images,
+                store=store,
+                image_ref=image_ref,
+            )
+            if withdrawn is not None:
+                return withdrawn
             return JSONResponse(
                 status_code=201,
                 content={
@@ -397,7 +479,12 @@ def build_external_uploads_router() -> APIRouter:
                 },
             )
         except HTTPException as exc:
+            await _discard_if_new()
             return _upload_error_envelope(exc)
+        except Exception:
+            # B-293 —— 意外异常(如文件落下之后登记出错)同样撤掉新会话,异常原样抛出。
+            await _discard_if_new()
+            raise
 
     @router.get(
         "/{agent_code}/uploads/{upload_id}",
@@ -443,9 +530,11 @@ def build_external_uploads_router() -> APIRouter:
         if row is None or row.user_id != end_user_id or row.deleted_at is not None:
             return _upload_download_error("UPLOAD_NOT_FOUND", "upload not found", 404)
         # B-50 PR4 —— 按 agent 收口。``user_upload`` 没有 ``agent_key`` 列,归属
-        # 沿 ``thread_id → thread_meta.agent_name`` 反查:这张表唯一的写入方是本
-        # 模块的 ``upload_for_user``,它走 ``_resolve_session``,那条路必然绑定
-        # agent,所以 ``agent_name`` 结构上总是有值(测试环境 51/51 实测可解)。
+        # 沿 ``thread_id → thread_meta.agent_name`` 反查:对外端点能摸到的行都是本
+        # 模块的 ``upload_for_user`` 或跨会话复制写的,它们走 ``_resolve_session``,那条路
+        # 必然绑定 agent,所以 ``agent_name`` 结构上总是有值(测试环境 51/51 实测可解)。
+        # B-281 起控制台上传也建行,但记在控制台用户名下(``user_id`` 不带 ``ext:``),
+        # 上面的 ``row.user_id != end_user_id`` 已经把它们挡在外面。
         #
         # 比的是 ``agent_name`` 与 ``agent_code`` 本身,不是两边各算一次
         # ``sanitize_agent_key`` —— ``_external.load_owned_thread`` 判会话归属用
@@ -533,6 +622,8 @@ def build_external_uploads_router() -> APIRouter:
                 return _upload_download_error(
                     "UPLOAD_CONTENT_UNAVAILABLE", "upload content unavailable", 500
                 )
+            # B-283 —— 字节真的读到了:图片自己的登记行也记一次使用(对象存储里的字节按它到期)。
+            await note_image_used(images, tenant_id=tenant_id, image_id=image_id)
             # Extension-based, like the document branch above: only the
             # DISPOSITION side is read here (see the Content-Type comment
             # below), and that verdict does not depend on the upload's kind.
@@ -553,6 +644,8 @@ def build_external_uploads_router() -> APIRouter:
         # DISPOSITION side of ``infer_content_type``'s verdict is used —
         # the active-content-forces-attachment / unknown-forces-attachment
         # rule stays in force regardless of what MIME the upload declared.
+        # B-63 —— 内容真的读到了才算一次使用:保留期按最后一次使用算起。
+        await note_uploads_used(uploads, tenant_id=tenant_id, upload_ids=[row.id])
         return Response(content=data, media_type=row.mime_type, headers=headers)
 
     return router

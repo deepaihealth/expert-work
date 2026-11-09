@@ -94,7 +94,12 @@ from expert_work.runtime.stream_bridge import (
     is_end,
 )
 from orchestrator.errors import MaxStepsExceededError
-from orchestrator.graph_builder._config import AUDIT_LOGGER_KEY, COMPACTION_SINK_KEY, TOKEN_SINK_KEY
+from orchestrator.graph_builder._config import (
+    AUDIT_LOGGER_KEY,
+    COMPACTION_SINK_KEY,
+    FAILOVER_SINK_KEY,
+    TOKEN_SINK_KEY,
+)
 from orchestrator.run_retry import (
     MAX_RUN_RETRIES,
     is_transient_run_error,
@@ -217,6 +222,11 @@ DEFAULT_STREAM_MODE = "updates"
 #: ``metadata``. Console-plane only: external producers pass it in
 #: ``hide_events`` (see ``sse_consumer``).
 SYSTEM_PROMPT_EVENT = "system_prompt"
+
+#: B-297 PR2 — an LLM call of an agent step switched to a backup model
+#: (``{step, from_model, to_model, reason}``; no conversation content).
+#: Console-plane only, like ``system_prompt``: external producers hide it.
+LLM_FAILOVER_EVENT = "llm_failover"
 
 #: B-126 (fix round 1, I2) — ``AgentState`` channels that are internal
 #: bookkeeping, never run output: an ``updates`` chunk publishes a node's
@@ -651,9 +661,16 @@ async def run_agent(
     async def _publish_plan(plan: Any) -> None:
         await _publish_frame(EventType.PLAN.value, plan)
 
+    # B-297 PR2 — console-only notice that a step's LLM call switched to a
+    # backup model. Persisted (the console replays it); hidden from the
+    # external plane via ``EXTERNAL_HIDDEN_EVENTS``.
+    async def _publish_failover(frame: dict[str, Any]) -> None:
+        await _publish_frame(LLM_FAILOVER_EVENT, frame)
+
     # ``configurable`` was populated in the effective_config literal above.
     effective_config["configurable"][COMPACTION_SINK_KEY] = _publish_compaction
     effective_config["configurable"][TOKEN_SINK_KEY] = _publish_token
+    effective_config["configurable"][FAILOVER_SINK_KEY] = _publish_failover
     effective_config["configurable"][WORKER_EVENT_SINK_KEY] = _publish_worker
     effective_config["configurable"][GUARD_SINK_KEY] = _publish_guard
     effective_config["configurable"][ARTIFACT_RECORDER_KEY] = artifact_manifest

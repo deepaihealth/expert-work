@@ -75,6 +75,22 @@ describe("parseTimeline", () => {
     expect(kinds).toEqual(["compaction", "retry", "end"]);
   });
 
+  it("renders an llm_failover frame as a short Chinese switch line (B-297)", () => {
+    const events = [
+      ev("llm_failover", { step: 3, from_model: "deepseek-flash", to_model: "qwen3.8-max", reason: "first_token_timeout" }, "t1"),
+      ev("llm_failover", { step: 4, from_model: "a", to_model: "b", reason: "reasoning_stall" }, "t2"),
+      ev("llm_failover", { step: 5, from_model: "a", to_model: "b", reason: "not-a-known-code" }, "t3"),
+    ];
+    const items = parseTimeline(events);
+    expect(items.map((i) => i.kind)).toEqual(["failover", "failover", "failover"]);
+    expect(items.map((i) => (i.kind === "failover" ? i.text : null))).toEqual([
+      "已从 deepseek-flash 切换到 qwen3.8-max（无响应）",
+      "已从 a 切换到 b（思考后停住）",
+      "已从 a 切换到 b（调用失败）",
+    ]);
+    expect(items.every((i) => i.kind === "failover" && i.tone === "warn")).toBe(true);
+  });
+
   it("assigns increasing seq in arrival order across types", () => {
     const events = [
       upd("memory_recall", { recalled_memories: [{ id: "m1", kind: "fact", content: "x", importance: 0.5, confidence: 0.5 }] }, "t1"),
@@ -265,6 +281,28 @@ describe("parseTimeline", () => {
     expect(steps[0].cacheReadTokens).toBe(14336);
     expect(steps[1].reasoningTokens).toBeUndefined();
     expect(steps[1].cacheReadTokens).toBeUndefined();
+  });
+
+  it("agent step carries the cache-write count (B-279 — priced per call; undefined when the vendor omits it)", () => {
+    const items = parseTimeline([
+      upd("agent", {
+        step_count: 1,
+        messages: [{
+          type: "ai", content: "答",
+          usage_metadata: {
+            input_tokens: 300, output_tokens: 20, total_tokens: 320,
+            input_token_details: { cache_read: 9000, cache_creation: 2048 },
+          },
+        }],
+      }, "t1"),
+      upd("agent", {
+        step_count: 2,
+        messages: [{ type: "ai", content: "再答", usage_metadata: { input_tokens: 10, output_tokens: 2 } }],
+      }, "t2"),
+    ]);
+    const steps = items.filter((i): i is AgentStep => i.kind === "agent");
+    expect(steps[0].cacheCreationTokens).toBe(2048);
+    expect(steps[1].cacheCreationTokens).toBeUndefined();
   });
 
   it("reads additional_kwargs.first_token_ms into AgentStep.firstTokenMs (undefined when absent)", () => {

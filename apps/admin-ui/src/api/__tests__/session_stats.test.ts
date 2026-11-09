@@ -26,7 +26,7 @@ describe("computeSessionStats", () => {
     const s = computeSessionStats([
       live([aiStep(1, 800, { in: 1000, out: 100, cacheRead: 900 }), toolsStep(300), aiStep(2, 700, { in: 1200, out: 50, cacheRead: 1100 })]),
       live([aiStep(1, 500, { in: 500, out: 20 })]),
-    ], null);
+    ], null, null);
     expect(s).toMatchObject({ turns: 2, steps: 3, llmMs: 2000, toolMs: 300, inputTokens: 2700, outputTokens: 170, partial: false, costCny: null });
     expect(s.cacheHitPct).toBe(74); // 2000/2700
   });
@@ -35,7 +35,7 @@ describe("computeSessionStats", () => {
       live([aiStep(1, 100, { in: 10, out: 300 })], { timing: { ttftMs: 800, firstTokenAt: 10_000, lastTokenAt: 12_000 } }),
       live([aiStep(1, 100, { in: 10, out: 100 })], { timing: { ttftMs: 400, firstTokenAt: 20_000, lastTokenAt: 21_000 } }),
       live([aiStep(1, 100, { in: 10, out: 999 })], { timing: null }), // no timing → excluded from tok/s
-    ], null);
+    ], null, null);
     expect(s.ttftAvgMs).toBe(600);
     expect(s.tokPerSec).toBe(133.3); // (300+100)/(2+1)s
   });
@@ -43,33 +43,33 @@ describe("computeSessionStats", () => {
     const s = computeSessionStats([
       { events: [], loaded: false, status: "done", timing: null, tokens: { input_tokens: 400, output_tokens: 40, cache_creation_tokens: 0, cache_read_tokens: 200, total_tokens: 440, llm_calls: 1, models: [] } },
       { events: [], loaded: false, status: "done", timing: null, tokens: null },
-    ], null);
+    ], null, null);
     expect(s).toMatchObject({ turns: 2, steps: 0, inputTokens: 400, outputTokens: 40, cacheHitPct: 50, partial: true });
   });
   it("prices with the rate card exactly like TurnCard.costCny (non-cached input + cache read + output)", () => {
-    const s = computeSessionStats([live([aiStep(1, 1, { in: 1_000_000, out: 100_000, cacheRead: 400_000 })])], AGENT_ONLY);
+    const s = computeSessionStats([live([aiStep(1, 1, { in: 1_000_000, out: 100_000, cacheRead: 400_000 })])], AGENT_ONLY, null);
     // (600k*3e6 + 400k*3e5 + 100k*1.5e7)/1e12 = 1.8 + 0.12 + 1.5
     expect(s.costCny).toBeCloseTo(3.42, 6);
   });
   it("counts a running turn with no step yet; empty input → zeros/nulls", () => {
-    expect(computeSessionStats([live([], { status: "running" })], null).turns).toBe(1);
-    expect(computeSessionStats([], null)).toEqual({ turns: 0, steps: 0, llmMs: 0, toolMs: 0, ttftAvgMs: null, tokPerSec: null, cacheHitPct: null, inputTokens: 0, outputTokens: 0, costCny: null, partial: false });
+    expect(computeSessionStats([live([], { status: "running" })], null, null).turns).toBe(1);
+    expect(computeSessionStats([], null, null)).toEqual({ turns: 0, steps: 0, llmMs: 0, toolMs: 0, ttftAvgMs: null, tokPerSec: null, cacheHitPct: null, inputTokens: 0, outputTokens: 0, costCny: null, partial: false });
   });
   it("excludes a loaded, settled turn with zero steps from the turns count (not merely 'count everything')", () => {
     // loaded && stepCount 0 && status "done" satisfies none of the three
     // turns disjuncts — a mutant that counted every turn would still pass
     // every other case above (they all happen to be counted).
-    expect(computeSessionStats([live([], { status: "done" })], null).turns).toBe(0);
+    expect(computeSessionStats([live([], { status: "done" })], null, null).turns).toBe(0);
   });
   it("rounds cacheHitPct (not floors/truncates)", () => {
     // 2/3 * 100 = 66.666...  round → 67, floor/trunc → 66.
-    const s = computeSessionStats([live([aiStep(1, 1, { in: 3, out: 1, cacheRead: 2 })])], null);
+    const s = computeSessionStats([live([aiStep(1, 1, { in: 3, out: 1, cacheRead: 2 })])], null, null);
     expect(s.cacheHitPct).toBe(67);
   });
   it("clamps costCny's non-cached-input term at 0 when cache_read exceeds input (TurnCard.tsx's Math.max(0, …))", () => {
     // input=100, cacheRead=900 (unrealistic but exercises the clamp): an
     // unclamped (input − cacheRead) would go negative and under-price.
-    const s = computeSessionStats([live([aiStep(1, 1, { in: 100, out: 0, cacheRead: 900 })])], AGENT_ONLY);
+    const s = computeSessionStats([live([aiStep(1, 1, { in: 100, out: 0, cacheRead: 900 })])], AGENT_ONLY, null);
     // (max(0,100-900)*3e6 + 900*3e5 + 0)/1e12 = (0 + 2.7e8)/1e12
     expect(s.costCny).toBeCloseTo(0.00027, 10);
   });
@@ -84,17 +84,17 @@ describe("computeSessionStats", () => {
     try {
       const settledEvents = [aiStep(1, 800, { in: 1000, out: 100, cacheRead: 900 }), toolsStep(300)];
 
-      const first = computeSessionStats([live(settledEvents)], null);
+      const first = computeSessionStats([live(settledEvents)], null, null);
       expect(spy).toHaveBeenCalledTimes(1);
 
       // Same array reference (a settled turn across frames) → cache hit.
-      const second = computeSessionStats([live(settledEvents)], null);
+      const second = computeSessionStats([live(settledEvents)], null, null);
       expect(spy).toHaveBeenCalledTimes(1);
       expect(second).toEqual(first);
 
       // A structurally-equal but freshly-allocated array (the streaming turn
       // every frame) must miss — the cache must not key on content.
-      const third = computeSessionStats([live([...settledEvents])], null);
+      const third = computeSessionStats([live([...settledEvents])], null, null);
       expect(spy).toHaveBeenCalledTimes(2);
       expect(third).toEqual(first);
     } finally {
@@ -106,7 +106,7 @@ describe("computeSessionStats", () => {
 
 it("counts a loaded interrupted turn with zero completed steps (终审 F6 — no 轮数 flicker on lazy load)", () => {
   expect(
-    computeSessionStats([live([], { status: "interrupted" })], null).turns,
+    computeSessionStats([live([], { status: "interrupted" })], null, null).turns,
   ).toBe(1);
 });
 
@@ -143,11 +143,13 @@ function workerEndFrame(
   };
 }
 
+// B-279 —— 主 Agent 卡原来写的是 anthropic,但期望值按「输入含缓存」厂商的公式(先扣
+// 缓存命中)算;那正是 B-279 修掉的少算。厂商改成 deepseek,用例本意不变。
 const AGENT_CARD = {
   id: "rc-a",
   tenant_id: null,
-  provider: "anthropic",
-  model: "claude-x",
+  provider: "deepseek",
+  model: "deepseek-chat",
   input_per_mtok_micros: 3_000_000,
   output_per_mtok_micros: 15_000_000,
   cache_creation_per_mtok_micros: 0,
@@ -164,15 +166,15 @@ const WORKER_CARD = {
   cache_read_per_mtok_micros: 50_000,
 };
 const BOOK: RateBook = {
-  agentKey: rateKey("anthropic", "claude-x"),
+  agentKey: rateKey("deepseek", "deepseek-chat"),
   byModel: new Map([
-    [rateKey("anthropic", "claude-x"), AGENT_CARD],
+    [rateKey("deepseek", "deepseek-chat"), AGENT_CARD],
     [rateKey("zhipu", "glm-5.3"), WORKER_CARD],
   ]),
 };
 const AGENT_ONLY: RateBook = {
-  agentKey: rateKey("anthropic", "claude-x"),
-  byModel: new Map([[rateKey("anthropic", "claude-x"), AGENT_CARD]]),
+  agentKey: rateKey("deepseek", "deepseek-chat"),
+  byModel: new Map([[rateKey("deepseek", "deepseek-chat"), AGENT_CARD]]),
 };
 
 describe("computeSessionStats — cost by (provider, model)", () => {
@@ -180,6 +182,7 @@ describe("computeSessionStats — cost by (provider, model)", () => {
     const s = computeSessionStats(
       [live([aiStep(1, 1, { in: 1_000_000, out: 100_000, cacheRead: 400_000 }), workerEndFrame({ in: 2_000_000, out: 50_000 }, { provider: "zhipu", model: "glm-5.3" })])],
       BOOK,
+      null,
     );
     // 主线 (600000×3 + 400000×0.3 + 100000×15)/1e6 = 3.42;worker (2000000×0.5 + 50000×2)/1e6 = 1.1
     expect(s.costCny).toBeCloseTo(4.52, 6);
@@ -188,8 +191,9 @@ describe("computeSessionStats — cost by (provider, model)", () => {
 
   it("matches the old single-card total exactly when the worker shares the agent's model", () => {
     const s = computeSessionStats(
-      [live([aiStep(1, 1, { in: 1_000_000, out: 100_000, cacheRead: 400_000 }), workerEndFrame({ in: 2_000_000, out: 50_000 }, { provider: "anthropic", model: "claude-x" })])],
+      [live([aiStep(1, 1, { in: 1_000_000, out: 100_000, cacheRead: 400_000 }), workerEndFrame({ in: 2_000_000, out: 50_000 }, { provider: "deepseek", model: "deepseek-chat" })])],
       AGENT_ONLY,
+      null,
     );
     const legacy = (Math.max(0, 3_000_000 - 400_000) * 3_000_000 + 400_000 * 300_000 + 150_000 * 15_000_000) / 1e12;
     expect(s.costCny).toBe(legacy);
@@ -199,25 +203,28 @@ describe("computeSessionStats — cost by (provider, model)", () => {
     const s = computeSessionStats(
       [live([aiStep(1, 1, { in: 1_000_000, out: 100_000, cacheRead: 400_000 }), workerEndFrame({ in: 2_000_000, out: 50_000 }, null)])],
       BOOK,
+      null,
     );
     const legacy = (Math.max(0, 3_000_000 - 400_000) * 3_000_000 + 400_000 * 300_000 + 150_000 * 15_000_000) / 1e12;
     expect(s.costCny).toBe(legacy);
   });
 
   it("prices an unloaded history turn's persisted usage_by_model per model, and its bare rollup at the agent's card", () => {
-    const rollup = { input_tokens: 3_000_000, output_tokens: 150_000, cache_creation_tokens: 0, cache_read_tokens: 400_000, total_tokens: 3_150_000, llm_calls: 2, models: ["claude-x", "glm-5.3"] };
+    const rollup = { input_tokens: 3_000_000, output_tokens: 150_000, cache_creation_tokens: 0, cache_read_tokens: 400_000, total_tokens: 3_150_000, llm_calls: 2, models: ["deepseek-chat", "glm-5.3"] };
     const split = computeSessionStats(
       [{ events: [], loaded: false, status: "done", timing: null, tokens: { ...rollup, usage_by_model: [
-        { provider: "anthropic", model: "claude-x", input_tokens: 1_000_000, output_tokens: 100_000, cache_creation_tokens: 0, cache_read_tokens: 400_000, total_tokens: 1_100_000, llm_calls: 1 },
+        { provider: "deepseek", model: "deepseek-chat", input_tokens: 1_000_000, output_tokens: 100_000, cache_creation_tokens: 0, cache_read_tokens: 400_000, total_tokens: 1_100_000, llm_calls: 1 },
         { provider: "zhipu", model: "glm-5.3", input_tokens: 2_000_000, output_tokens: 50_000, cache_creation_tokens: 0, cache_read_tokens: 0, total_tokens: 2_050_000, llm_calls: 1 },
       ] } }],
       BOOK,
+      null,
     );
     expect(split.costCny).toBeCloseTo(4.52, 6);
 
     const bare = computeSessionStats(
       [{ events: [], loaded: false, status: "done", timing: null, tokens: rollup }],
       BOOK,
+      null,
     );
     const legacy = (Math.max(0, 3_000_000 - 400_000) * 3_000_000 + 400_000 * 300_000 + 150_000 * 15_000_000) / 1e12;
     expect(bare.costCny).toBe(legacy);
@@ -227,8 +234,104 @@ describe("computeSessionStats — cost by (provider, model)", () => {
     const s = computeSessionStats(
       [live([aiStep(1, 1, { in: 10, out: 1 }), workerEndFrame({ in: 100, out: 10 }, { provider: "zhipu", model: "glm-5.3" })])],
       AGENT_ONLY,
+      null,
     );
     expect(s.costCny).toBeNull();
+  });
+});
+
+describe("computeSessionStats — Anthropic 缓存口径(B-279)", () => {
+  // 每百万 token:输入 3 元 / 缓存命中 0.3 元 / 缓存写入 3.75 元 / 输出 15 元。
+  const CLAUDE_CARD = {
+    id: "rc-c", tenant_id: null, provider: "anthropic", model: "claude-x",
+    input_per_mtok_micros: 3_000_000, output_per_mtok_micros: 15_000_000,
+    cache_creation_per_mtok_micros: 3_750_000, cache_read_per_mtok_micros: 300_000,
+  };
+  const CLAUDE_BOOK: RateBook = {
+    agentKey: rateKey("anthropic", "claude-x"),
+    byModel: new Map([[rateKey("anthropic", "claude-x"), CLAUDE_CARD]]),
+  };
+
+  it("prices an unloaded history turn's Anthropic rollup without taking the cache out of input", () => {
+    // token_usage 落库的 Anthropic 行:输入 10k 不含缓存,另有命中 90k、写入 20k、输出 1k。
+    // 10k×3 + 90k×0.3 + 20k×3.75 + 1k×15 = 147000 → ¥0.147
+    const s = computeSessionStats(
+      [{ events: [], loaded: false, status: "done", timing: null, tokens: {
+        input_tokens: 10_000, output_tokens: 1_000, cache_creation_tokens: 20_000, cache_read_tokens: 90_000,
+        total_tokens: 11_000, llm_calls: 1, models: ["claude-x"],
+      } }],
+      CLAUDE_BOOK,
+      null,
+    );
+    expect(s.costCny).toBeCloseTo(0.147, 12);
+  });
+});
+
+describe("computeSessionStats — 缓存命中率按厂商口径(B-279)", () => {
+  // 命中率 = Σ 缓存命中 ÷ Σ 提示词总量,提示词总量同 runtime ``token_usage._prompt_tokens``
+  // (B-142):Anthropic 的 input 不含缓存读写 → input + 命中 + 写入;其它厂商 input 已含 → input。
+  function mainStep(u: { in: number; cacheRead: number; cacheCreation: number }): SseEvent {
+    return upd("agent", {
+      step_count: 1, _duration_ms: 1,
+      messages: [{ type: "ai", content: "a", usage_metadata: {
+        input_tokens: u.in, output_tokens: 10, total_tokens: u.in + 10,
+        input_token_details: { cache_read: u.cacheRead, cache_creation: u.cacheCreation },
+      } }],
+    });
+  }
+
+  it("Anthropic agent: the denominator is input + cache read + cache write — no more >100%", () => {
+    // 输入 1,000(不含缓存)+ 命中 9,000 + 写入 2,000 → 9000 / 12000 = 75%
+    // (旧算法 9000 / 1000 = 900%)
+    const s = computeSessionStats(
+      [live([mainStep({ in: 1_000, cacheRead: 9_000, cacheCreation: 2_000 })])],
+      null,
+      "anthropic",
+    );
+    expect(s.cacheHitPct).toBe(75);
+  });
+
+  it("non-Anthropic agent: the denominator is input alone (it already contains the hits) — unchanged", () => {
+    // 输入 10,000(含命中 6,000、写入 1,000)→ 6000 / 10000 = 60%
+    const s = computeSessionStats(
+      [live([mainStep({ in: 10_000, cacheRead: 6_000, cacheCreation: 1_000 })])],
+      null,
+      "deepseek",
+    );
+    expect(s.cacheHitPct).toBe(60);
+  });
+
+  it("mixed session: each bucket's prompt total under its own provider, then summed", () => {
+    // 主线 Anthropic:命中 9,000 / 总量 1,000 + 9,000 + 2,000 = 12,000
+    // worker DeepSeek:命中 4,000 / 总量 8,000
+    // → (9000 + 4000) / (12000 + 8000) = 65%
+    const s = computeSessionStats(
+      [live([
+        mainStep({ in: 1_000, cacheRead: 9_000, cacheCreation: 2_000 }),
+        workerEndFrame({ in: 8_000, out: 10, cacheRead: 4_000 }, { provider: "deepseek", model: "deepseek-chat" }),
+      ])],
+      null,
+      "anthropic",
+    );
+    expect(s.cacheHitPct).toBe(65);
+  });
+
+  it("an unloaded history turn's usage_by_model carries its own provider (no agent provider needed)", () => {
+    // Anthropic 桶:命中 3,000 / 总量 1,000 + 3,000 + 0 = 4,000;deepseek 桶:命中 0 / 总量 4,000
+    // → 3000 / 8000 = 37.5% → 38%
+    const s = computeSessionStats(
+      [{ events: [], loaded: false, status: "done", timing: null, tokens: {
+        input_tokens: 5_000, output_tokens: 20, cache_creation_tokens: 0, cache_read_tokens: 3_000,
+        total_tokens: 5_020, llm_calls: 2, models: ["claude-x", "deepseek-chat"],
+        usage_by_model: [
+          { provider: "anthropic", model: "claude-x", input_tokens: 1_000, output_tokens: 10, cache_creation_tokens: 0, cache_read_tokens: 3_000, total_tokens: 1_010, llm_calls: 1 },
+          { provider: "deepseek", model: "deepseek-chat", input_tokens: 4_000, output_tokens: 10, cache_creation_tokens: 0, cache_read_tokens: 0, total_tokens: 4_010, llm_calls: 1 },
+        ],
+      } }],
+      null,
+      null,
+    );
+    expect(s.cacheHitPct).toBe(38);
   });
 });
 

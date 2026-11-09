@@ -32,6 +32,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from control_plane.api._artifact_content import (
     VERSION_HEADER,
+    VersionExpired,
     VersionNotRetained,
     VersionUnknown,
     choose_version,
@@ -39,6 +40,7 @@ from control_plane.api._artifact_content import (
 )
 from control_plane.api._artifact_mime import content_disposition_header, infer_content_type
 from control_plane.api._authz import console_only, require, require_key_scope
+from control_plane.api._conversation_view_audit import audit_conversation_data_view
 from control_plane.api._quota_admission import check_admission
 from control_plane.api._session_title import backfill_titles
 from control_plane.api._user_scope import (
@@ -54,6 +56,12 @@ from control_plane.api._workspace_shared import (
     workspace_agent_path,
 )
 from control_plane.audit import emit
+from control_plane.purge.session_purge import (
+    SessionPurgeStores,
+    purge_late_children,
+    purge_thread_children,
+)
+from control_plane.purge.trajectories import trajectory_store_for
 from control_plane.quota.base import QuotaService
 from control_plane.runtime import AgentRuntime
 from control_plane.tenant_scope import (
@@ -88,6 +96,7 @@ from expert_work.protocol import (
 )
 from expert_work.protocol.agent_key import sanitize_agent_key
 from expert_work.runtime.audit.logger import AuditLogger
+from expert_work.runtime.runs import RunStore
 from orchestrator.context.workspace_projection import thread_projection_prefix
 from orchestrator.tools import (
     SandboxSupervisorError,
@@ -203,6 +212,22 @@ def _get_retrieval_logs(request: Request) -> KnowledgeRetrievalLogStore:
     return request.app.state.knowledge_retrieval_log_store  # type: ignore[no-any-return]
 
 
+def _get_session_purge_stores(request: Request) -> SessionPurgeStores:
+    # B-280 —— 按 ``thread_id`` 存的子数据(反馈、质量评分、评测候选、写回失败队列、上传、图片)。
+    state = request.app.state
+    return SessionPurgeStores(
+        feedback=state.feedback_store,
+        quality_scores=state.quality_score_store,
+        curation_candidates=state.curation_candidate_store,
+        memory_dlq=state.memory_writeback_dlq,
+        user_uploads=state.user_upload_store,
+        image_uploads=state.image_upload_store,
+        object_store=getattr(state, "object_store", None),
+        runs=getattr(state, "run_store", None),
+        trajectories=trajectory_store_for(state.agent_runtime),
+    )
+
+
 def _get_audit(request: Request) -> AuditLogger:
     return request.app.state.audit_logger  # type: ignore[no-any-return]
 
@@ -221,6 +246,19 @@ def _get_workspace_store(request: Request) -> UserWorkspaceStore:
 
 def _get_artifact_store(request: Request) -> ArtifactStore:
     return request.app.state.artifact_store  # type: ignore[no-any-return]
+
+
+def _get_run_store(request: Request) -> RunStore:
+    return request.app.state.run_store  # type: ignore[no-any-return]
+
+
+async def _conversation_run_ids(runs: RunStore, *, thread_id: UUID, tenant_id: UUID) -> set[str]:
+    """B-295 —— 这段对话的全部 run id(字符串)。``save_artifact`` 在产物版本的
+    ``created_in_thread`` 里记的是 run id;子智能体 / worker 记的是父 run 的 id(B-63 PR2 起,
+    ``inputs_run_id``),所以它们登记的产物也落在这个集合里。"""
+    return {
+        str(r.run_id) for r in await runs.list_by_thread(thread_id=thread_id, tenant_id=tenant_id)
+    }
 
 
 def _get_artifact_snapshots(request: Request) -> ArtifactSnapshotStore | None:
@@ -720,7 +758,14 @@ def build_sessions_router() -> APIRouter:
     @router.get(
         "/{thread_id}/workspace/artifacts/{name:path}/download",
         response_model=None,
-        dependencies=[Depends(require_key_scope("read")), Depends(console_only())],
+        # B-295 —— 产物与对话同一个可见范围(用户 2026-11-07 拍板,与对话里的附件一致):能读
+        # 这段对话(``session:read``,对话列表 / 详情同一道闸)的员工都能下载;不是主人时记
+        # ``user:data_view``。原来是 ``caller_owns_thread``(本人或租户管理员)。
+        dependencies=[
+            Depends(require_key_scope("read")),
+            Depends(console_only()),
+            Depends(require("session", "read")),
+        ],
     )
     async def download_session_artifact(
         thread_id: UUID,
@@ -731,6 +776,7 @@ def build_sessions_router() -> APIRouter:
         artifacts: Annotated[ArtifactStore, Depends(_get_artifact_store)],
         workspace_store: Annotated[WorkspaceStore | None, Depends(_get_workspace_file_client)],
         snapshots: Annotated[ArtifactSnapshotStore | None, Depends(_get_artifact_snapshots)],
+        runs: Annotated[RunStore, Depends(_get_run_store)],
         audit: Annotated[AuditLogger, Depends(_get_audit)],
         # W2 read scope — see ``get_session``.
         tenant_id: Annotated[UUID | Literal["*"] | None, Query()] = None,
@@ -738,15 +784,25 @@ def build_sessions_router() -> APIRouter:
     ) -> Response:
         """Download the thread user's artifact by logical name.
 
-        Thread-scoped (the thread's owning user), unlike the caller-scoped
-        ``/v1/artifacts/download``. 404 hides cross-user / missing /
-        no-supervisor.
+        Thread-scoped (the thread's owning user's artifacts), unlike the caller-scoped
+        ``/v1/artifacts/download``. Visible to whoever may read the conversation
+        (``session:read``, B-295); a non-owner read is audited as ``user:data_view``.
+        404 hides missing / no-supervisor.
+
+        B-295 review N1 —— the lookup is by ``(owner, agent, name)``, which spans every
+        conversation the owner had with that agent (all agents when ``agent_name`` is unset,
+        purged conversations included). The owner and a tenant admin keep that (today's
+        behaviour). Anyone else only gets bytes from a version **this** conversation
+        produced: the version served (the requested one, else the latest) must have
+        ``created_in_thread`` among this thread's run ids; otherwise the same 404 as a
+        missing artifact. Their download is not a retention "use" (N2).
 
         B-235 —— ``version`` 给了就下那一版(对话页 / 调试台每一轮带上这一轮登记的
         版本号),不给是最新版;内容读登记时的副本(选版规则见
         :mod:`control_plane.api._artifact_content`)。B-235 之前登记、已不是最新的
-        一版 → 409:前端据此提示「这一版内容没有单独保留」并给出「下载最新版」,
-        绝不拿最新版冒充。未知版本 → 404。
+        一版 → 409 ``ARTIFACT_VERSION_NOT_RETAINED``:前端据此提示「这一版内容没有单独保留」并
+        给出「下载最新版」,绝不拿最新版冒充。B-63 —— 超过保留期被清掉的一版 → 409
+        ``ARTIFACT_VERSION_EXPIRED``(提示「这一版已超过保留期被清理」)。未知版本 → 404。
         """
         scope = await ensure_single_tenant_scope(
             request.state.principal,
@@ -761,13 +817,13 @@ def build_sessions_router() -> APIRouter:
             meta = await threads.get(thread_id, tenant_id=target_tenant)
         if meta is None:
             raise HTTPException(status_code=404, detail="session not found")
-        caller_user_id = await resolve_caller_user_id(request, users)
-        if not caller_owns_thread(
-            meta=meta, caller_user_id=caller_user_id, principal=request.state.principal
-        ):
-            raise HTTPException(status_code=404, detail="session not found")
         if meta.user_id is None or workspace_store is None:
             raise HTTPException(status_code=404, detail="artifact not found")
+        caller_user_id = await resolve_caller_user_id(request, users)
+        # Owner / tenant admin / machine principal: today's behaviour (B-295 review N1).
+        unrestricted = caller_owns_thread(
+            meta=meta, caller_user_id=caller_user_id, principal=request.state.principal
+        )
         async with applied_scope(scope):
             latest = await artifacts.get_latest_version(
                 tenant_id=target_tenant,
@@ -790,26 +846,57 @@ def build_sessions_router() -> APIRouter:
             )
         if latest is None:
             raise HTTPException(status_code=404, detail="artifact not found")
+        if not unrestricted:
+            candidate = pinned if version is not None else latest
+            async with applied_scope(scope):
+                own_runs = await _conversation_run_ids(
+                    runs, thread_id=thread_id, tenant_id=target_tenant
+                )
+            if candidate is None or candidate.created_in_thread not in own_runs:
+                raise HTTPException(status_code=404, detail="artifact not found")
         try:
             chosen = choose_version(latest=latest, requested=version, pinned=pinned)
         except VersionUnknown as exc:
             raise HTTPException(status_code=404, detail="artifact version not found") from exc
+        except VersionExpired as exc:
+            # B-63 —— 与「B-235 之前登记、没有单独保留」同为 409,用 ``code`` 区分:前端据此
+            # 提示「这一版已超过保留期被清理」,两种都给「下载最新版」。
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "ARTIFACT_VERSION_EXPIRED",
+                    "message": (
+                        f"version {exc.requested} of this artifact was removed after its "
+                        f"retention period; the latest is {exc.latest}"
+                    ),
+                },
+            ) from exc
         except VersionNotRetained as exc:
             raise HTTPException(
                 status_code=409,
-                detail=(
-                    f"version {exc.requested} of this artifact was registered before per-version "
-                    f"copies existed and its content was not kept; the latest is {exc.latest}"
-                ),
+                detail={
+                    "code": "ARTIFACT_VERSION_NOT_RETAINED",
+                    "message": (
+                        f"version {exc.requested} of this artifact was registered before "
+                        f"per-version copies existed and its content was not kept; the latest "
+                        f"is {exc.latest}"
+                    ),
+                },
             ) from exc
         try:
-            data = await read_version_bytes(
-                chosen,
-                tenant_id=target_tenant,
-                user_id=meta.user_id,
-                snapshots=snapshots,
-                workspace_store=workspace_store,
-            )
+            # B-63 —— 读到之后记一次使用(写 ``artifact_version``),所以在目标租户的范围里读。
+            async with applied_scope(scope):
+                data = await read_version_bytes(
+                    chosen,
+                    tenant_id=target_tenant,
+                    user_id=meta.user_id,
+                    snapshots=snapshots,
+                    workspace_store=workspace_store,
+                    artifacts=artifacts,
+                    # B-63 / B-295 N2 —— 只有对话主人自己下载才算这个租户在用;别的员工看、
+                    # 平台运维跨租户看都不续留存。
+                    record_use=caller_user_id == meta.user_id,
+                )
         except WorkspacePermissionError as exc:
             # 元数据行存在,内容读不动是权限问题(服务端配置),不是"这个 artifact
             # 不存在"——同六处 workspace 端点的坑,必须排在下面的
@@ -835,7 +922,17 @@ def build_sessions_router() -> APIRouter:
             ),
             "X-Content-Type-Options": "nosniff",
             VERSION_HEADER: str(chosen.version),
+            # B-295 N3 —— 内容常是健康资料:共享缓存、浏览器磁盘缓存都不留。
+            "Cache-Control": "private, no-store",
         }
+        await audit_conversation_data_view(
+            request,
+            audit,
+            tenant_id=target_tenant,
+            meta=meta,
+            caller_user_id=caller_user_id,
+            view="conversation_artifact",
+        )
         return Response(content=data, media_type=inferred.content_type, headers=headers)
 
     @router.delete(
@@ -1104,6 +1201,7 @@ def build_sessions_router() -> APIRouter:
             MemoryWritebackJobStore | None, Depends(_get_memory_writeback_jobs)
         ],
         retrieval_logs: Annotated[KnowledgeRetrievalLogStore, Depends(_get_retrieval_logs)],
+        child_stores: Annotated[SessionPurgeStores, Depends(_get_session_purge_stores)],
     ) -> JSONResponse:
         """Hard-delete — irreversibly purge the whole conversation.
 
@@ -1121,6 +1219,32 @@ def build_sessions_router() -> APIRouter:
         AND flagged in the audit details (``*_delete_failed``), not fatal,
         and the thread_meta row is deleted LAST so a partial failure never
         orphans the metadata.
+
+        B-280 — the rows keyed by the thread itself (feedback, quality scores,
+        curation candidates, memory-writeback DLQ, image rows + their
+        object-store bytes; upload registry rows — documents are kept as
+        scrubbed tombstones so a later reference from another conversation
+        still answers ``UPLOAD_SESSION_DELETED``; see ``purge.session_purge``) go right
+        after the writeback jobs. Unlike the steps below, if any of them fails
+        nothing further is deleted and the thread row is KEPT — it is the only
+        way a retry finds the conversation — and the request answers 503 (the
+        console treats any 2xx as "gone"). Not deleted: legacy-layout upload
+        files in the agent-shared ``agents/<key>/uploads/`` (other conversations
+        may use the same file; the conversation-layout ``work/uploads/`` goes
+        with ``threads/<id>/``), memories extracted from the conversation (the
+        user's, shared across conversations), its registered artifacts (B-236:
+        deleting a conversation keeps them), the billing / audit rows
+        (``token_usage``, ``audit_log`` …; the agent purge keeps those too), and
+        the ``event_log`` cold archive (nothing in production writes ``event_log``).
+        B-285 — the run trajectory objects in object storage (the whole
+        conversation, one per run, plus its sub-agents') are one of the child
+        kinds above: dated from the runs, deleted before the runs go. A run still
+        executing is not stopped: the rows it may write after the first pass
+        (retrieval logs, feedback, quality score, writeback DLQ, today's
+        trajectory) get one best-effort second pass after the thread row. A
+        trajectory written even later is only caught by the retention job's
+        orphan pass, which runs only once B-286 lets the job reach the real
+        object store — until then nothing catches it.
         """
         meta = await _load_owned_session(thread_id, request, threads, users)
         tenant_id: UUID = request.state.tenant_id
@@ -1159,6 +1283,31 @@ def build_sessions_router() -> APIRouter:
             except Exception:
                 logger.warning("session_purge.memory_writeback_jobs_failed", exc_info=True)
                 deleted["memory_writeback_jobs_delete_failed"] = True
+
+        # B-280 —— 按 thread_id 存的子数据。有一类没删干净:后面什么都不删、对话行留着,重跑时
+        # 还找得到这条对话(每类都可重跑);已经删掉的那部分照实记进审计。
+        children = await purge_thread_children(
+            child_stores, tenant_id=tenant_id, thread_id=thread_id, meta=meta
+        )
+        deleted.update(children.as_details())
+        if children.failures:
+            await emit(
+                audit,
+                tenant_id=tenant_id,
+                actor_id=request.state.actor_id,
+                action=AuditAction.SESSION_WRITE,
+                resource_type="session",
+                resource_id=str(thread_id),
+                result=AuditResult.ERROR,
+                reason="purge_incomplete",
+                trace_id=current_trace_id_hex(),
+                details={"op": "purge", "meta_removed": False, **deleted},
+            )
+            raise HTTPException(
+                status_code=503,
+                detail="some of the conversation's data could not be deleted; "
+                "the conversation was kept, retry",
+            )
 
         checkpointer = runtime.durable_checkpointer
         adelete = getattr(checkpointer, "adelete_thread", None)
@@ -1203,6 +1352,12 @@ def build_sessions_router() -> APIRouter:
             deleted["retrieval_logs"] = logs_deleted
         except Exception as exc:  # best-effort: retention removes a straggler
             logger.warning("session_purge.retrieval_logs_failed error=%s", type(exc).__name__)
+        # B-280 —— the same second pass for the other rows a still-running run can
+        # write (feedback, judge verdict, writeback DLQ); failures only logged.
+        late = await purge_late_children(child_stores, tenant_id=tenant_id, thread_id=thread_id)
+        for kind, count in late.items():
+            previous = deleted.get(kind, 0)
+            deleted[kind] = (previous if isinstance(previous, int) else 0) + count
         # 留存链 B-27 —— the thread's projected-state directory
         # (``threads/<thread_id>/``: MEMORY.md / PLAN.md / TODO.md) goes with the
         # thread. After the row delete on purpose: once the row is gone the

@@ -15,6 +15,7 @@ plane's ``{success, data, error}`` envelope (not FastAPI's bare ``detail``).
 from __future__ import annotations
 
 import base64
+import dataclasses
 import hashlib
 import re
 from collections.abc import AsyncIterator
@@ -864,6 +865,75 @@ async def test_an_upload_whose_session_is_gone_is_not_found(ctx: _Ctx) -> None:
     assert "deleted" in info.value.message
 
 
+@pytest.mark.asyncio
+async def test_a_purged_sessions_upload_still_says_session_deleted(ctx: _Ctx) -> None:
+    """B-280 —— 会话彻底删除(``:purge``)不再留下完整的登记行,document 行留成墓碑:对外
+    引用仍回已公布的 404 ``UPLOAD_SESSION_DELETED``;下载 404 ``UPLOAD_NOT_FOUND``(删除前
+    也是);同一会话里的图片行随会话删掉,引用回 ``UPLOAD_NOT_FOUND``(删除前也是)。"""
+    from control_plane.api._external import ExternalScopeError
+    from control_plane.api.agents import ExternalFileRef, resolve_external_files
+
+    await ctx.seed_agent()
+    a = await _upload_document(ctx, b"%PDF-1.4 A")
+    image = await ctx.client.post(
+        "/v1/agents/support-bot/uploads",
+        data={"user_id": "cust-77", "session_id": a["session_id"]},
+        files={"file": ("a.png", _PNG_BYTES, "image/png")},
+        headers=ctx.headers,
+    )
+    assert image.status_code == 201, image.text
+    b = await _upload_document(ctx, b"%PDF-1.4 B")
+    end_user = (await _upload_row(ctx, a)).user_id
+
+    console = {"Authorization": f"Bearer {make_test_jwt(tenant_id=ctx.tenant_id)}"}
+    purged = await ctx.client.post(f"/v1/sessions/{a['session_id']}:purge", headers=console)
+    assert purged.status_code == 200, purged.text
+
+    with pytest.raises(ExternalScopeError) as info:
+        await _attach(ctx, a, into=b["session_id"])
+    assert (info.value.code, info.value.status_code) == ("UPLOAD_SESSION_DELETED", 404)
+    assert "deleted" in info.value.message
+
+    tombstone = await _upload_row(ctx, a)
+    assert (tombstone.ref, tombstone.filename, tombstone.mime_type) == ("", "", "")
+    assert (tombstone.size_bytes, tombstone.sha256, tombstone.last_used_at) == (0, None, None)
+    assert tombstone.deleted_at is not None
+
+    download = await ctx.client.get(
+        f"/v1/agents/support-bot/uploads/{a['upload_id']}",
+        params={"user_id": "cust-77"},
+        headers=ctx.headers,
+    )
+    assert download.status_code == 404, download.text
+    assert download.json()["error"]["code"] == "UPLOAD_NOT_FOUND"
+
+    with pytest.raises(ExternalScopeError) as img_info:
+        await resolve_external_files(
+            files=[ExternalFileRef(upload_id=image.json()["data"]["upload_id"])],
+            tenant_id=ctx.tenant_id,
+            end_user_id=end_user,
+            thread_id=UUID(b["session_id"]),
+            uploads_store=ctx.app.state.user_upload_store,
+            threads=ctx.app.state.thread_meta_repo,
+            copier=_copier(ctx),
+        )
+    assert (img_info.value.code, img_info.value.status_code) == ("UPLOAD_NOT_FOUND", 404)
+
+    # Another end user holding the tombstoned id learns nothing: the owner check
+    # comes before the tombstone check, so it is plain UPLOAD_NOT_FOUND.
+    with pytest.raises(ExternalScopeError) as other_user:
+        await resolve_external_files(
+            files=[ExternalFileRef(upload_id=a["upload_id"])],
+            tenant_id=ctx.tenant_id,
+            end_user_id=uuid4(),
+            thread_id=UUID(b["session_id"]),
+            uploads_store=ctx.app.state.user_upload_store,
+            threads=ctx.app.state.thread_meta_repo,
+            copier=_copier(ctx),
+        )
+    assert (other_user.value.code, other_user.value.status_code) == ("UPLOAD_NOT_FOUND", 404)
+
+
 # ---------------------------------------------------------------------------
 # B-262 review —— 跨会话复制要像上传一样记账(配额 + 审计),出错按上传端点的码回;
 # 源会话已删、源文件被改过也要说清楚。
@@ -898,8 +968,9 @@ async def _document_audit_rows(ctx: _Ctx) -> list[Any]:
 async def _upload_row_count(ctx: _Ctx) -> int:
     from datetime import UTC, datetime, timedelta
 
+    # Every live row: its expiry (last use + 1 day) is before "two days from now".
     rows = await ctx.app.state.user_upload_store.list_expired(
-        before=datetime.now(UTC) + timedelta(days=1)
+        now=datetime.now(UTC) + timedelta(days=2), default_days=1
     )
     return len(rows)
 
@@ -935,7 +1006,137 @@ async def test_a_copy_is_accounted_and_audited_like_an_upload(ctx: _Ctx) -> None
         (b["session_id"], names[0], sha, False, a["upload_id"]),
         (b["session_id"], names[0], sha, True, a["upload_id"]),
     ]
-    assert await _upload_row_count(ctx) == upload_rows  # 不新建登记行
+    # B-281 —— 复制进来的那份在本会话建一条登记行(到期才管得到它);同一份再挂一次复用文件,
+    # 不再加行(本会话这一轮 run 已经把它的「最后使用」往后推了)。
+    assert await _upload_row_count(ctx) == upload_rows + 1
+
+
+@pytest.mark.asyncio
+async def test_a_copy_is_registered_in_the_target_session(ctx: _Ctx) -> None:
+    """B-281 —— 跨会话复制落进本会话的那份,登记在本会话名下:字段同一次上传(落地名、大小、
+    mime、sha256),到期、改动核对、引用检查都按它算。源会话自己的登记行不动。"""
+    await ctx.seed_agent()
+    raw = b"%PDF-1.4 A"
+    a = await _upload_document(ctx, raw)
+    b = await _upload_document(ctx, b"%PDF-1.4 B")
+    source = await _upload_row(ctx, a)
+    before = await ctx.app.state.user_upload_store.list_documents_for_thread(
+        tenant_id=ctx.tenant_id, thread_id=UUID(b["session_id"])
+    )
+
+    names = await _attach(ctx, a, into=b["session_id"])
+    await _attach(ctx, a, into=b["session_id"])  # 再挂一次:复用,不加行
+
+    after = await ctx.app.state.user_upload_store.list_documents_for_thread(
+        tenant_id=ctx.tenant_id, thread_id=UUID(b["session_id"])
+    )
+    added = [r for r in after if r.id not in {x.id for x in before}]
+    assert [
+        (r.user_id, r.kind, r.ref, r.filename, r.mime_type, r.size_bytes, r.sha256) for r in added
+    ] == [
+        (
+            source.user_id,
+            "document",
+            names[0],
+            names[0].rsplit("/", 1)[-1],
+            "application/pdf",
+            len(raw),
+            hashlib.sha256(raw).hexdigest(),
+        )
+    ]
+    assert await _upload_row(ctx, a) == source
+
+
+@pytest.mark.asyncio
+async def test_a_copy_onto_the_same_file_in_an_old_view_session_adds_no_row(ctx: _Ctx) -> None:
+    """两条都是老视图:源与落点本来就是同一个文件,不复制,也不加行(源那一行已经登记着它)。"""
+    await ctx.seed_agent()
+    old = await _upload_document(ctx, b"%PDF-1.4 first")
+    _old_layout(ctx, old["session_id"])
+    in_root = await _upload_document(ctx, b"%PDF-1.4 old", session_id=old["session_id"])
+    other_old = await _upload_document(ctx, b"%PDF-1.4 x")
+    _old_layout(ctx, other_old["session_id"])
+    rows = await _upload_row_count(ctx)
+
+    await _attach(ctx, in_root, into=other_old["session_id"])
+
+    assert await _upload_row_count(ctx) == rows
+
+
+@pytest.mark.asyncio
+async def test_a_copy_into_an_old_view_session_is_not_registered(ctx: _Ctx) -> None:
+    """B-281 review F4 —— 复制进老视图会话落在 agent 共用的 ``uploads/``(共享根):不登记。"""
+    await ctx.seed_agent()
+    key = agent_key_for_code("support-bot")
+    a = await _upload_document(ctx, b"%PDF-1.4 A")
+    old = await _upload_document(ctx, b"%PDF-1.4 old")
+    _old_layout(ctx, old["session_id"])
+    rows = await _upload_row_count(ctx)
+
+    names = await _attach(ctx, a, into=old["session_id"])
+
+    assert ctx.workspace_store.created_files[f"agents/{key}/{names[0]}"] == b"%PDF-1.4 A"
+    assert await _upload_row_count(ctx) == rows
+
+
+@pytest.mark.asyncio
+async def test_console_uploads_are_invisible_to_the_external_plane(ctx: _Ctx) -> None:
+    """B-281 —— 控制台上传的登记行记在控制台用户名下;对外接口的 ``user_id`` 一律带 ``ext:``
+    前缀,即使对接方传的 ``user_id`` 与控制台用户的登录名逐字相同,也摸不到这些行:下载、
+    ``files[]`` 都是不透明的 404。"""
+    from control_plane.api._external import ExternalScopeError
+    from control_plane.api.agents import ExternalFileRef, resolve_external_files
+    from expert_work.protocol import render_upload_id
+
+    await ctx.seed_agent()
+    # 对接方也有一个叫 ``console-alice`` 的用户,在同一个 agent 下有自己的会话。
+    ext = await _upload_document(ctx, b"%PDF-1.4 ext", user_id="console-alice")
+    ext_user = (await _upload_row(ctx, ext)).user_id
+
+    console_jwt = make_test_jwt(tenant_id=ctx.tenant_id, subject="console-alice")
+    console_headers = {"Authorization": f"Bearer {console_jwt}"}
+    console_user = await ctx.app.state.tenant_user_repo.resolve(
+        tenant_id=ctx.tenant_id, subject_type="user", subject_id="console-alice"
+    )
+    console_thread = uuid4()
+    await ctx.app.state.thread_meta_repo.create(
+        thread_id=console_thread,
+        tenant_id=ctx.tenant_id,
+        created_by="console-alice",
+        user_id=console_user.id,
+        agent_name="support-bot",
+    )
+    resp = await ctx.client.post(
+        f"/v1/sessions/{console_thread}/uploads",
+        files={"file": ("secret.pdf", b"%PDF-1.4 console", "application/pdf")},
+        headers=console_headers,
+    )
+    assert resp.status_code == 201, resp.text
+    [row] = await ctx.app.state.user_upload_store.list_documents_for_thread(
+        tenant_id=ctx.tenant_id, thread_id=console_thread
+    )
+    assert row.user_id != ext_user
+    upload_id = render_upload_id(row.id)
+
+    resp = await ctx.client.get(
+        f"/v1/agents/support-bot/uploads/{upload_id}",
+        params={"user_id": "console-alice"},
+        headers=ctx.headers,
+    )
+    assert resp.status_code == 404, resp.text
+    assert resp.json()["error"]["code"] == "UPLOAD_NOT_FOUND"
+
+    with pytest.raises(ExternalScopeError) as info:
+        await resolve_external_files(
+            files=[ExternalFileRef(upload_id=upload_id)],
+            tenant_id=ctx.tenant_id,
+            end_user_id=ext_user,
+            thread_id=UUID(ext["session_id"]),
+            uploads_store=ctx.app.state.user_upload_store,
+            threads=ctx.app.state.thread_meta_repo,
+            copier=_copier(ctx),
+        )
+    assert (info.value.code, info.value.status_code) == ("UPLOAD_NOT_FOUND", 404)
 
 
 @pytest.mark.asyncio
@@ -1073,3 +1274,228 @@ async def test_the_source_read_is_bounded_by_the_recorded_size(
     monkeypatch.setattr(ctx.workspace_store, "read_file", spy)
     await _attach(ctx, a, into=b["session_id"])
     assert caps[0] == len(b"%PDF-1.4 A") + 1
+
+
+# ---------------------------------------------------------------------------
+# B-63 —— 保留期按最后一次使用算:重新附加(记在登记行上,跨会话就是源会话那一行)与对外
+# 下载都记一次 ``last_used_at``。
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_resolving_files_alone_does_not_mark_them_used(ctx: _Ctx) -> None:
+    """B-63 —— 解析 ``files[]`` 时还不知道这一轮会不会被接受(后面还有批量校验、排队上限……):
+    记使用放在 run 被接受之后(见 ``test_external_run_files.py``),这里不记。"""
+    await ctx.seed_agent()
+    a = await _upload_document(ctx, b"%PDF-1.4 A")
+    b = await _upload_document(ctx, b"%PDF-1.4 B")
+
+    await _attach(ctx, a, into=b["session_id"])
+
+    assert (await _upload_row(ctx, a)).last_used_at is None
+
+
+@pytest.mark.asyncio
+async def test_downloading_an_upload_marks_it_used(ctx: _Ctx) -> None:
+    await ctx.seed_agent()
+    up = await _upload_document(ctx, b"%PDF-1.4 dl")
+
+    refused = await ctx.client.get(
+        f"/v1/agents/support-bot/uploads/{up['upload_id']}",
+        params={"user_id": "someone-else"},
+        headers=ctx.headers,
+    )
+    assert refused.status_code == 404
+    assert (await _upload_row(ctx, up)).last_used_at is None  # a refused read is not a use
+
+    resp = await ctx.client.get(
+        f"/v1/agents/support-bot/uploads/{up['upload_id']}",
+        params={"user_id": "cust-77"},
+        headers=ctx.headers,
+    )
+    assert resp.status_code == 200, resp.text
+    assert (await _upload_row(ctx, up)).last_used_at is not None
+
+
+@pytest.mark.asyncio
+async def test_a_failing_touch_does_not_fail_the_download(
+    ctx: _Ctx, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    await ctx.seed_agent()
+    up = await _upload_document(ctx, b"%PDF-1.4 dl")
+
+    async def _down(**_kwargs: object) -> bool:
+        raise RuntimeError("db down")
+
+    monkeypatch.setattr(ctx.app.state.user_upload_store, "touch", _down)
+    with caplog.at_level("WARNING"):
+        resp = await ctx.client.get(
+            f"/v1/agents/support-bot/uploads/{up['upload_id']}",
+            params={"user_id": "cust-77"},
+            headers=ctx.headers,
+        )
+    assert resp.status_code == 200, resp.text
+    assert resp.content == b"%PDF-1.4 dl"
+    assert "upload.touch_failed" in caplog.text
+
+
+# ---------------------------------------------------------------------------
+# B-283 —— 图片的字节按 ``image_upload`` 那一行到期:对外下载成功时那一行也记一次使用。
+# ---------------------------------------------------------------------------
+
+
+async def _upload_image(ctx: _Ctx) -> tuple[dict[str, Any], UUID]:
+    resp = await ctx.client.post(
+        "/v1/agents/support-bot/uploads",
+        data={"user_id": "cust-77"},
+        files={"file": ("a.png", _PNG_BYTES, "image/png")},
+        headers=ctx.headers,
+    )
+    assert resp.status_code == 201, resp.text
+    data: dict[str, Any] = resp.json()["data"]
+    image_id = parse_image_ref((await _upload_row(ctx, data)).ref).image_id
+    return data, image_id
+
+
+async def _image_last_used(ctx: _Ctx, image_id: UUID) -> Any:
+    row = await ctx.app.state.image_upload_store.get(image_id=image_id, tenant_id=ctx.tenant_id)
+    assert row is not None
+    return row.last_used_at
+
+
+@pytest.mark.asyncio
+async def test_downloading_an_image_marks_its_image_row_used(ctx: _Ctx) -> None:
+    await ctx.seed_agent()
+    up, image_id = await _upload_image(ctx)
+
+    refused = await ctx.client.get(
+        f"/v1/agents/support-bot/uploads/{up['upload_id']}",
+        params={"user_id": "someone-else"},
+        headers=ctx.headers,
+    )
+    assert refused.status_code == 404
+    assert await _image_last_used(ctx, image_id) is None  # a refused read is not a use
+
+    resp = await ctx.client.get(
+        f"/v1/agents/support-bot/uploads/{up['upload_id']}",
+        params={"user_id": "cust-77"},
+        headers=ctx.headers,
+    )
+    assert resp.status_code == 200, resp.text
+    assert await _image_last_used(ctx, image_id) is not None
+
+
+@pytest.mark.asyncio
+async def test_an_image_whose_bytes_are_gone_is_not_marked_used(ctx: _Ctx) -> None:
+    await ctx.seed_agent()
+    up, image_id = await _upload_image(ctx)
+    row = await ctx.app.state.image_upload_store.get(image_id=image_id, tenant_id=ctx.tenant_id)
+    await ctx.app.state.object_store.delete(row.object_key)
+
+    resp = await ctx.client.get(
+        f"/v1/agents/support-bot/uploads/{up['upload_id']}",
+        params={"user_id": "cust-77"},
+        headers=ctx.headers,
+    )
+    assert resp.status_code == 404
+    assert await _image_last_used(ctx, image_id) is None
+
+
+@pytest.mark.asyncio
+async def test_a_failing_image_touch_does_not_fail_the_download(
+    ctx: _Ctx, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    await ctx.seed_agent()
+    up, _image_id = await _upload_image(ctx)
+
+    async def _down(**_kwargs: object) -> bool:
+        raise RuntimeError("db down")
+
+    monkeypatch.setattr(ctx.app.state.image_upload_store, "touch", _down)
+    with caplog.at_level("WARNING"):
+        resp = await ctx.client.get(
+            f"/v1/agents/support-bot/uploads/{up['upload_id']}",
+            params={"user_id": "cust-77"},
+            headers=ctx.headers,
+        )
+    assert resp.status_code == 200, resp.text
+    assert resp.headers["content-type"] == "image/png"
+    assert "image.touch_failed" in caplog.text
+
+
+# ---------------------------------------------------------------------------
+# B-282 —— 上传落盘(含跨会话复制附件)持着这段会话落盘锁的共享形式,留存作业清闲置会话目录
+# 时拿排他的那种:落盘要么整个在清理再查之前(审计已写),要么在目录挪走之后。
+# ---------------------------------------------------------------------------
+
+
+class _RecordingLandingLock:
+    def __init__(self) -> None:
+        self.held: str | None = None
+        self.keys: list[str] = []
+
+    def acquire_shared(self, *, key: str) -> Any:
+        from contextlib import asynccontextmanager
+
+        @asynccontextmanager
+        async def _cm() -> AsyncIterator[None]:
+            self.keys.append(key)
+            self.held = key
+            try:
+                yield
+            finally:
+                self.held = None
+
+        return _cm()
+
+
+@pytest.mark.asyncio
+async def test_landing_a_document_holds_the_conversations_landing_lock(
+    ctx: _Ctx, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from control_plane.api import uploads as uploads_module
+
+    await ctx.seed_agent()
+    lock = _RecordingLandingLock()
+    ctx.app.state.conversation_landing_lock = lock
+    seen: list[tuple[str, str | None]] = []
+    real_land = uploads_module._land_document_bytes
+    real_emit = uploads_module.audit_emit
+
+    async def _land(*args: Any, **kwargs: Any) -> Any:
+        seen.append(("write", lock.held))
+        return await real_land(*args, **kwargs)
+
+    async def _emit(*args: Any, **kwargs: Any) -> Any:
+        seen.append(("audit", lock.held))
+        return await real_emit(*args, **kwargs)
+
+    monkeypatch.setattr(uploads_module, "_land_document_bytes", _land)
+    monkeypatch.setattr(uploads_module, "audit_emit", _emit)
+
+    a = await _upload_document(ctx, b"%PDF-1.4 A")
+    b = await _upload_document(ctx, b"%PDF-1.4 B")
+    copier = dataclasses.replace(_copier(ctx), landing_lock=lock)
+    from control_plane.api.agents import ExternalFileRef, resolve_external_files
+
+    row = await _upload_row(ctx, a)
+    await resolve_external_files(
+        files=[ExternalFileRef(upload_id=a["upload_id"])],
+        tenant_id=ctx.tenant_id,
+        end_user_id=row.user_id,
+        thread_id=UUID(b["session_id"]),
+        uploads_store=ctx.app.state.user_upload_store,
+        threads=ctx.app.state.thread_meta_repo,
+        copier=copier,
+    )
+
+    expected = [f"{ctx.tenant_id}:{a['session_id']}", f"{ctx.tenant_id}:{b['session_id']}"]
+    assert lock.keys == [*expected, expected[1]]  # two uploads, then the copy into B
+    assert seen == [
+        ("write", expected[0]),
+        ("audit", expected[0]),
+        ("write", expected[1]),
+        ("audit", expected[1]),
+        ("write", expected[1]),
+        ("audit", expected[1]),
+    ]

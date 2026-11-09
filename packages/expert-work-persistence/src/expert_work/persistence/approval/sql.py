@@ -11,6 +11,7 @@ from sqlalchemy import delete, func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from expert_work.persistence.approval.base import ApprovalStore
+from expert_work.persistence.bulk_delete import count_in_chunks
 from expert_work.persistence.models import AgentApprovalRow
 from expert_work.protocol import ApprovalReasonKind, ApprovalRecord, ApprovalStatus
 
@@ -291,3 +292,12 @@ class SqlApprovalStore(ApprovalStore):
             result = await session.execute(stmt)
             await session.commit()
         return int(getattr(result, "rowcount", 0) or 0)
+
+    async def count_for_threads(self, *, tenant_id: UUID, thread_ids: Sequence[UUID]) -> int:
+        return await count_in_chunks(
+            self._sf,
+            AgentApprovalRow,
+            AgentApprovalRow.thread_id,
+            list(thread_ids),
+            AgentApprovalRow.tenant_id == tenant_id,
+        )

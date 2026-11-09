@@ -1945,12 +1945,527 @@ oauth2 目录项本来就不在平台池里:不再碰平台池;`enabled` 切换�
 - [x] **89.5 重试带上附件**:在调试台从侧栏打开 89.1 的对话,点那一轮的「重试」。判据:输入框回填提问原文,附件区出现同一个 PDF 标签;不会自动发出。 **11-04 测试 `72abce48b` 过**:调试台从侧栏打开会话点重试:输入框回填原文,附件区出现 `acc-a.pdf`,没有自动发出(运行数仍 1)
 - [x] **89.6 收尾**:删本节建的对话和上传。 **11-04 测试 `72abce48b` 过**:会话、临时智能体、对外用户已删,临时 key 吊销、服务账号删除
 
-## §90 旧检索结果压成可找回的引用(B-206 track D,#1972)
+## §90 附件按最后使用到期 + 租户可调保留期(B-63 PR1)
+
+**背景**:附件(`user_upload`)的 90 天改为从**最后使用**算起:`greatest(created_at, last_used_at, 会话最后一次 run)` + 租户 `tenant_config.upload_retention_days`(为空用平台默认 90)。`last_used_at` 在对外接口重新附加(登记行;跨会话就是源会话那一行)与对外下载成功时记,每行每天最多一次。迁移 `0183_b63_upload_last_used` 加三列(都可空):`user_upload.last_used_at`、`tenant_config.upload_retention_days` / `artifact_retention_days`(7–365;产物那一列 PR2 才生效)。改小要显式确认:接口不带 `?confirm_retention_decrease=true` 回 409 `RETENTION_DECREASE_NOT_CONFIRMED`,控制台弹确认框。「过期 7 天还失败就放弃」从 `max(到期日, tenant_config.updated_at)` 算,但最多推迟 30 天;因此仍在重试、而已过到期日 7 天的行计入 `upload_rows_failing_overdue`,作业以 3 退出(**目前没有告警**,只体现在 Job 状态和日志里,见 §100 末尾与 B-288)。作业环境变量 `EXPERT_WORK_RETENTION_{UPLOAD,ARTIFACT}_RETENTION_DAYS` 同样限 7–365(超出夹回并打 warning),默认 90 必须与协议的 `FILE_RETENTION_DEFAULT_DAYS` 一致。janitor 里关着的 uploads / artifacts 两条规则已删。
+
+**回滚注意**:回滚镜像会恢复「按创建时间到期」(老代码不认 `last_used_at`),当晚就会清掉一批按新规则还该保留的附件 / 产物。**先暂停 retention-cleanup CronJob(`kubectl patch cronjob retention-cleanup -p '{"spec":{"suspend":true}}'`)再回滚,确认回滚后的行为可以接受后再恢复(`suspend: false`)**。迁移是只加列,回滚不需要 downgrade。
+
+**怎么进**:测试环境控制台(system_admin,平台租户);对外接口用平台租户临时 API key。测试数据都不满 90 天,所以要**造过期行**:只改本节自建的行(按 id),每次改库前用户批准;造完手动触发一次留存作业(`kubectl create job --from=cronjob/retention-cleanup b63-probe-<n>`),看日志与库。**花费**:约 ¥1(两轮短对话)。
+
+- [x] **90.1 迁移**:发布后只读查 `alembic_version` = `0183_b63_upload_last_used`;三列存在且可空;`tenant_config` 有两条 `*_retention_range_ck` 约束 **11-06 测试 `da1f50934` 过**(alembic 0186,三列可空、两条约束在)
+- [x] **90.2 记使用**:对外接口在会话 A 传 `probe-a.pdf`,在会话 B 传 `probe-b.pdf`;用会话 B 发一轮带 `files:[{upload_id: probe-a}]`;再对 `probe-b` 调一次下载。判据:只读查两行的 `last_used_at` 都有值(a 是因为被跨会话引用,b 是因为下载);当天再下载一次 `last_used_at` 不变 **11-06 测试 `da1f50934` 过**
+- [x] **90.3 造过期行(用户批准后改库)**:在一个新会话 C 里传 4 个文档并发一轮,然后按 id 改:① `c1`:`created_at` 改 100 天前,把会话 C 的全部 run 的 `created_at` 改 100 天前 —— 应删;② 新会话 D 里传 `c2` 并发一轮,只把 `c2` 的 `created_at` 改 200 天前、D 的 run 保持今天 —— 应留(会话最近有 run);③ 新会话 E 里传 `c3`,`created_at` 改 200 天前、E 的 run 改 100 天前、`last_used_at` 改 5 天前 —— 应留(最近用过);④ 新会话 F 里传 `c4`,`created_at` 与 F 的 run 都改 40 天前 —— 默认 90 天下应留 **11-06 测试 `da1f50934` 已造**
+- [x] **90.4 租户覆盖**:控制台「租户配置」JSON 里把平台租户的 `upload_retention_days` 设为 30。判据:保存时弹「确认改小保留期」(内容含「改小后最早今晚就会清理更多文件，且不可恢复」),取消则不改,确认后读视图显示 30(另一项显示「平台默认」);设 6 或 366 时保存失败(422);用 API 直接 PUT 30→10 不带 `confirm_retention_decrease=true` 回 409 `RETENTION_DECREASE_NOT_CONFIRMED`、值不变 **11-06 测试 `da1f50934` 过**(控制台默认英文,`expert_work.admin.lang=zh-CN` 才是中文文案)
+- [x] **90.5 跑作业**:手动触发留存作业。判据:`c1`、`c4` 的行 `deleted_at` 有值、文件已删(`c4` 是因为租户改成了 30 天);`c2`、`c3` 行与文件都在、对外下载 200;作业日志 `uploads_expired` ≥ 2、退出码 0;另一个租户(若有自建测试租户则在其下放一条 40 天前的行)不受 30 天影响 **11-06 测试 `da1f50934` 过**:90 天轮 `uploads_expired=2`、30 天轮 `=3`,退出码 0;「另一个租户」一项不可判(没有自建测试租户)
+- [x] **90.6 收尾**:租户配置里 `upload_retention_days` 设回 `null`(读视图显示「平台默认」,审计 `TENANT_CONFIG_WRITE` 的 `fields` 里有它);删本节建的会话、上传与 probe job;吊销临时 key **11-06 测试 `da1f50934` 过**
+
+## §91 产物按最后使用到期 + 已清理版本的 409 说清原因(B-63 PR2)
+
+**背景**:依赖 §90(同一次发布)。产物版本的「最后使用」= 登记时间 / `artifact_version.last_used_at`(三个下载端点下载成功时记,每版每天最多一次)/ 登记它的会话最后一次 run(`created_in_thread` 存的是 run id,经 `agent_run` 找到会话)三者最晚的;**最新版与产物行**用整条产物最晚的那个,所以只要有一版还在用,最新版与列表里的产物就都在;保留期 = `tenant_config.artifact_retention_days`(为空用 90)。迁移 `0184_b63_artifact_last_used` 加一列(可空)。已清理的旧版本:对外仍是 409 `ARTIFACT_VERSION_MISMATCH`,`message` 写明 `removed after its retention period`;控制台 / 会话面是 409 `detail.code = ARTIFACT_VERSION_EXPIRED`(B-235 之前没单独保留的那种改为 `ARTIFACT_VERSION_NOT_RETAINED`),对话页提示「这一版已超过保留期被清理」并给「下载最新版」。
+
+**怎么进**:同 §90。造过期行要用户逐次批准、只改本节自建的行(按 id);造完手动触发留存作业(`kubectl create job --from=cronjob/retention-cleanup b63-probe-<n>`)。**花费**:约 ¥2(几轮让智能体登记产物的短对话)。
+
+- [x] **91.1 迁移**:发布后只读查 `alembic_version` = `0184_b63_artifact_last_used`;`artifact_version.last_used_at` 存在且可空 **11-06 测试 `da1f50934` 过**
+- [x] **91.2 记使用**:让智能体在会话 A 登记 `probe.md` 两版(v1、v2)。分别用对外下载、控制台产物页、对话页各下载一次 v1。判据:只读查 v1 的 `last_used_at` 有值,v2 仍为空;当天再下载一次 `last_used_at` 不变;另用 system_admin 从别的租户切过来在产物页下载 v2 → v2 的 `last_used_at` 仍为空(平台运维跨租户不算使用) **11-06 测试 `da1f50934` 过**;跨租户那一项不可判(system_admin 主租户即平台租户,不下载真实租户产物)
+- [x] **91.3 造过期行(用户批准后改库)**:① 会话 B 登记 `keep.md` v1、v2:两版 `created_at` 改 200 / 120 天前,会话 B 的 run 改 150 天前,v1 的 `last_used_at` 改 10 天前 —— 两版都应留、产物仍在列表;② 会话 C 登记 `mixed.md` v1、v2:`created_at` 200 / 120 天前,C 的 run 改 150 天前,v2 的 `last_used_at` 改 10 天前 —— v1 应删、v2 与产物留;③ 会话 D 登记 `gone.md` v1、v2:`created_at` 200 / 120 天前,D 的 run 改 150 天前,不设使用 —— 两版连文件与副本都删、产物离开列表;④ 会话 E 登记 `ran.md` v1:`created_at` 200 天前,E 里今天再发一轮 —— 应留(会话最近有 run);⑤ 让智能体经静态子 Agent 登记 `sub.md`,只读查它的 `created_in_thread` 等于父 run 的 id(在 `agent_run` 里查得到),再按 ④ 的办法改时间 —— 应留。**已知限制(不回填)**:本次发布之前由子 Agent 登记的版本,`created_in_thread` 是子 run 的 id(不在 `agent_run` 里),没有会话时钟,只按登记时间 / 最后一次下载 + 保留天数到期 **11-06 测试 `da1f50934` 已造**(sub.md 的 `created_in_thread` = 父 run id)
+- [x] **91.4 跑作业**:手动触发留存作业。判据:与 91.3 每条一致(文件、副本、版本行、列表);`audit_log` 的 `artifact:expired` 只出现 `mixed.md` 与 `gone.md`,`details.retention_days` = 90、`details.clock` = `last_use`;退出码 0 **11-06 测试 `da1f50934` 过**:`artifact_versions_deleted=3`,审计 `artifact:expired` 只有 mixed / gone
+- [x] **91.5 已清理版本的提示**:对外 `GET …/artifacts/download?name=mixed.md&version=1` → 409 `ARTIFACT_VERSION_MISMATCH`,`message` 含 `removed after its retention period`;`version=9` → 409,`message` 是「has no version」那句。对话页 / 调试台点 `mixed.md` 第 1 版的产物按钮 → 弹窗「这一版已超过保留期被清理」+「下载最新版」(点了下到 v2);B-235 之前登记的老版本(若测试环境还有)仍提示「内容没有单独保留」 **11-06 测试 `da1f50934` 过**;B-235 之前的老版本一项无数据,不可判
+- [x] **91.6 租户覆盖**:租户配置设 `artifact_retention_days = 30`,新造一个只有一版、`created_at` 40 天前、会话 run 也 40 天前的产物,跑作业 → 被清,审计 `retention_days` = 30;再设回 `null` **11-06 测试 `da1f50934` 过**
+- [x] **91.7 收尾**:删本节建的会话、产物与 probe job;租户配置恢复;吊销临时 key **11-06 测试 `da1f50934` 过**
+
+## §92 11-05 批次:发布先迁移 + 建沙箱失败信号 + 模型名校验 + `run.paused` + 附件原名 + MCP 断线 + 乱码文件名 + 彻底删除智能体 + 多轮指代召回(B-228 / B-87 / X-14 / B-112 / B-230 / B-275 / B-177 / B-243 / B-196 / B-278 / #2030)
+
+> B-63(附件 / 产物按最后使用到期)见 §90 / §91。B-185(月度计费汇总)测试环境没部署该任务,不在本节,生产首次出账时核对。
+
+- [x] **92.1 发布先跑迁移(B-228)**:这次发测试就是验证。判据:`release.sh` 输出里迁移 Job 先单独下发并 `wait` 完成,之后才 `apply` 全部 Deployment;迁移 Pod 环境里有 `PGOPTIONS=-c lock_timeout=5s`。 **11-06 测试 `da1f50934` 过**(迁移 Job 先下发等完成,`PGOPTIONS=-c lock_timeout=5s`)
+- [x] **92.2 建沙箱失败有信号(B-87 / X-14 P3-P4)**:发完跑 smoke。判据:smoke 输出里有「sandbox create failures (24h)」一项(有失败时是 WARN 不阻断);Prometheus 查得到 `expert_work_sandbox_create_total`(按结果分标签);告警规则 `ExpertWorkSandboxCreateFailureRate` 已加载;canary 失败时输出带分类。 **11-06 测试 `da1f50934` 过**(smoke `0/3`、指标与告警规则在)
+- [x] **92.3 目录外的模型名保存时就拦(B-112)**:控制台新建智能体,主模型填一个内置厂商下不存在的名字(如 `deepseek-not-a-model`)保存;再用 azure / 自建厂商随便填一个名字保存。判据:前者 4xx,提示说明模型不在目录里;后者能保存。已标「已弃用」的 3 个模型在下拉里显示「已弃用」。 **11-06 测试 `da1f50934` 过**:deepseek 目录外名 422 `MANIFEST_UNBUILDABLE`,azure / 自建 201;「已弃用」下拉标签未验(接口里弃用模型不进下拉)
+- [x] **92.4 停在审批处发 `run.paused`(B-230)**:临时建一个 webhook 接收端(测试集群内起一个回显服务即可,事后删),订阅 `run.paused` 和 `run.failed`;跑一个会停在审批处的任务。判据:收到 `run.paused`,没有收到 `run.failed`;payload 里有 run / 会话编号。 **11-06 测试 `da1f50934` 过**(收到 `run.paused`,约 20 分钟内无 `run.failed`)
+- [x] **92.5 附件提示带原名(B-275)**:对外接口同一会话先后上传两份同名不同内容的 `report.pdf`,带 `files[]` 发一轮,让模型原样复述它看到的附件说明;再让主智能体把文件交给一个子智能体做同样的复述。判据:第二份是 `[file attached: uploads/report-<8 位> (original name: report.pdf)]`;子智能体看到的也带原名。 **11-06 测试 `da1f50934` 过**:主智能体 `(original name: report.pdf)`;子智能体看到的是 `[attachments]` 列表,同样带原名
+- [x] **92.6 MCP 会话断了不挂住(B-177)**:找一个连了远端 MCP 的智能体先跑一轮,然后让 MCP 服务端丢掉这个会话(重启 MCP 服务端或删其会话),再跑一轮调用同一个 MCP 工具。判据:这一轮在超时内完成——要么自动重连后调用成功,要么快速报错;不出现长时间无响应;日志有重连记录。 **11-06 测试 `da1f50934` 过**(自建临时 MCP 服务验:重连成功 / 快速失败,无挂住);观察到建连失败后该副本工具缺失 1–2 分钟 → B-292
+- [x] **92.7 乱码文件名 + 新智能体首次列目录(B-243 / B-196)**:沙箱里 `touch $'bad\xff.txt'`,下一轮问「工作区里有哪些文件」;再新建一个从没写过文件的智能体,第一轮就让它 `list_dir` / `search_files`。判据:前者正常回答(文件名显示为 `bad\xff.txt` 一类),不报编码错误;后者返回空,不报 `workspace path not found`。 **11-06 测试 `da1f50934` 过**(沙箱里 `touch $'…'` 不解释,改用 python 写 0xFF 文件名)
+- [x] **92.8 删除 → 恢复 → 彻底删除(B-278)**:建临时智能体 `acc-purge`,跑两轮对话、存一个产物,然后删除。判据:列表「已删除」筛选能看到它,详情页只读并有「恢复」「彻底删除」;点恢复后对话、产物都在;再删除后点「彻底删除」,确认框列出各类数据条数,输名字确认后成功;新建同名 `acc-purge` 能成功。 **11-06 测试 `da1f50934` 过**
+- [x] **92.9 彻底删除时网盘上的特殊情况(B-278)**:另建临时智能体,跑一轮后在沙箱里执行 `chmod 555 /workspace/agents`(老布局)或对话目录的上级目录、建一个指向别处的软链接、建一个 1,100 层深的目录,然后删除并彻底删除。判据:返回成功;该智能体的 `agents/<key>` 目录在 NAS 上已不存在;软链接指向的目标没被动;`{tenant}/.purged-agents/` 下没有残留(或有残留时弹窗说明了「移到隔离区」)。 **11-06 测试 `da1f50934` 过**(`nas_quarantined:0`,软链目标未动)
+- [x] **92.10 同名并发彻底删除(B-278)**:对一个工作区较大的已删除智能体,两个浏览器标签几乎同时点「彻底删除」。判据:一个成功,另一个提示「正在被另一个彻底删除操作处理……请稍后再试」(409 `AGENT_BUSY`),什么都没删。 **11-06 测试 `da1f50934` 逻辑过**(一个 409 `AGENT_BUSY` 什么都没删;另一个 2 万文件删约 7.5 分钟,页面 180 秒 504、服务端删完)→ 体验问题登记 B-290
+- [ ] **92.11 隔离区清理(B-278)**:如 92.9 留下了隔离区条目,把条目名里的时间改到 8 天前(或等 7 天),手动触发一次留存作业。判据:完成日志里 `purged_agent_dirs_removed` ≥ 1、`purged_agent_dirs_failed=0`,条目已删。 **11-06 测试 `da1f50934` 未验**:本次没有留下隔离区条目(验收自建的条目随智能体彻底删除一并清掉);隔离区删除路径有单测
+- [x] **92.12 多轮指代召回(#2030)**:给一个开了长期记忆的智能体先写入「《大国食养》作者李明,另著《四季食疗》」这类记忆(另起对话聊到),新对话里问「大国食养谁写的」,再追问「那他还写过什么」「第二个呢」,最后说「好的谢谢」。判据:追问能召回同一条记忆(调试台记忆召回里能看到);「好的谢谢」不触发带上文的召回;换话题(「我对花生过敏有什么零食」)不带上一话题的记忆。 **11-06 测试 `da1f50934` 过**
+- [x] **92.13 收尾**:删本节建的智能体、对话、上传、webhook 接收端与订阅、临时 key。 **11-06 测试 `da1f50934` 过**
+
+## §93 控制台成本按厂商区分缓存口径(B-279)
+
+**背景**:控制台(调试台 / 对话页的整轮成本、会话统计、「计时」页每步成本)原来对所有厂商都按「输入 − 缓存命中」算输入费,且不算缓存写入费。Anthropic 的 `input_tokens` 本来就不含缓存读写(三个数分开报),于是被少算。现与月度计费(billing-rollup-job `_uncached_input_tokens`,B-185)同口径:Anthropic 输入不扣缓存;其它厂商输入扣掉缓存命中与写入;缓存写入按价目表「缓存写入价」另算。纯前端改动,无迁移。
+
+**前提**:要有一个 Anthropic 模型的凭据(平台或租户级)和它的价目表行(含缓存写入价)。10-04 记录两个环境都没有 Anthropic 平台凭据——发前先查;仍没有就 93.1 记「不可判(无凭据)」,只跑 93.2,别为它临时开凭据(花钱,要用户批准)。**花费**:Anthropic 两轮约 ¥1;deepseek 一轮约 ¥0.1。
+
+**判据公式**(与计费作业一致,每百万 token 单价取价目表):Anthropic 一次调用 = `input×输入价 + cache_read×命中价 + cache_creation×写入价 + output×输出价`;其它厂商 = `max(0, input − cache_read − cache_creation)×输入价 + 后三项同上`。账本数取只读 SQL:`select provider, model, input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens from token_usage where trace_id = (select trace_id from agent_run where id = '<run id>')`。
+
+- [ ] **93.1 Anthropic 有缓存的轮(需凭据)**:system_admin 在调试台给临时智能体 `acc-b279`(主模型 Anthropic,系统提示词写长一些,超过缓存最小长度)连发两轮。判据:第二轮的 `token_usage` 行 `cache_read_tokens` > 0 且 `input_tokens` 远小于它(确认是 Anthropic 口径);控制台该轮成本 = 按上式对该 run 全部 `token_usage` 行求和(显示到 4 位小数,差 ≤ ¥0.0001);「计时」页每步成本之和等于整轮成本;同一 run 在 Langfuse 里的 input / cache 读写 token 数与 `token_usage` 一致(Langfuse 的美元成本口径不同,不比金额)。改前同一轮会明显偏低(命中大于输入时输入费变 0);状态栏「缓存命中」= Σ cache_read ÷ Σ(input + cache_read + cache_creation),不超过 100%(改前是 命中 ÷ input,会出现几百 %)。**已知限制**:对话详情页对非 system_admin 不读智能体 manifest(B-202 的设计),拿不到主线厂商,命中率仍按旧口径 **11-06 测试 `da1f50934` 不可判(无 Anthropic 凭据,按约定不开)**
+- [x] **93.2 其它厂商不变**:同样操作换 deepseek 主模型跑两轮。判据:控制台成本 = 上式「其它厂商」求和;与改前版本(若还有改前截图 / 记录)同一轮数字一致 **11-06 测试 `da1f50934` 会话级过**(两轮合计 ¥0.0680 = 对话页 ¥0.07,命中率 50%);每轮 4 位小数与「计时」页每步成本没核到
+- [x] **93.3 收尾**:删 `acc-b279` 及其对话 **11-06 测试 `da1f50934` 过**
+
+## §94 删除单个对话把按对话存的数据一起删掉(B-280)
+
+> §93 由 B-279 占用(另一个分支);两边都追加在文件末尾,合并时按编号排好即可。
+
+**背景**:控制台 / 会话面 `POST /v1/sessions/{id}:purge` 原来删检索记录、记忆写回任务、checkpoint、run(连 `run_event`)、审批、对话行(`thread_message` 级联)和 NAS 上的对话目录,**漏了**按 `thread_id` 存的几类。现在在写回任务之后、checkpoint 之前多处理六类:删 `feedback`、`quality_score`、`curation_candidate`(含已采纳进评测集的;评测集本身不动)、`memory_writeback_dlq`(按 `source_thread_id`)、`image_upload` 连对象存储里的图片(`{租户}/uploads/{会话}/{图片 id}.{扩展名}`);`user_upload` 的文档行**留成墓碑**(只留 id / 租户 / 用户 / 会话 / `kind` / `created_at`,`ref` / `filename` / `mime_type` 清成空串、`size_bytes` 0、`sha256` / `last_used_at` 置空、`deleted_at` 有值),图片行与已到期的行直接删。这六类任一类删不掉:后面什么都不删、**对话行留着**、回 503,审计记一条 `result=error`、`reason=purge_incomplete`(带已删条数与 `<类>_delete_failed`),再点一次删完;图片字节没删掉的那几行留着(没有作业按键扫孤儿图片)—— 同一条规矩也改进了删智能体(B-278,算失败 → 409 `AGENT_PURGE_INCOMPLETE`)和删用户(`failures.image_upload`),原来那两处字节删不掉照样删行。删用户另外补删该用户各条对话上的 `quality_score` 与 `curation_candidate`(候选里有用户自己的 👎 评论);这几类(连同反馈、审批)任一删不掉,该用户的对话行就留着(`skipped` 含 `threads`),重跑删完。删智能体时对话里的上传文档也留成墓碑(别的智能体的对话再引用仍回 `UPLOAD_SESSION_DELETED`)。图片字节一直删不掉(无权限、对象锁)时删对话会一直 503:审计 `details.image_rows_kept` 给出条数,日志 `session_purge.image_rows_kept` 列出图片 id,运维据此处理。对话行删掉之后,反馈 / 质量评分 / 写回失败队列再删一遍(还在跑的 run 可能刚写了一行),失败只记日志。对象存储里的 run 轨迹对象见 §99(B-285);`event_log` 冷归档里没有对话内容(生产上没有代码写 `event_log`)。**保留**:`token_usage` / 计费 / `audit_log`(对账)、登记过的产物(用户拍板:删对话不删产物)、长期记忆(`memory_item`)、老布局 agent 共用的 `agents/<key>/uploads/` 里的文件(别的对话可能在用同一个文件;对话布局的 `threads/<会话>/work/uploads/` 本来就随对话目录删)。对外接口 `DELETE /v1/agents/{code}/sessions/{id}` 只是归档,不受影响。**对外不变**(用户 11-06 拍板保留错误码):在别的会话 `files[]` 里引用「已被 purge 的会话」上传的文档仍回 404 `UPLOAD_SESSION_DELETED`(认墓碑);图片的 `upload_id` 仍回 404 `UPLOAD_NOT_FOUND`;下载仍 404 `UPLOAD_NOT_FOUND`。
+
+**怎么进**:测试环境控制台(system_admin,平台租户)建临时智能体 `acc-b280`;对外接口用平台租户临时 API key,`user_id` 用 `u-b280`。数据库只读连接;对象存储运维侧只读列桶;NAS 用 control-plane pod 只读 `ls`。质量评分要抽样命中:先在平台「质量监控」设置里记下抽样比例,临时调到 100%(事后调回)。合成文件(零租户内容):`/tmp/b280.pdf`(一页 PDF)、`/tmp/b280.png`(小图)。**花费**:约 ¥1(四轮短对话 + 质量评审)。
+
+- [x] **94.1 造数据**:同一个 `u-b280` 在 `acc-b280` 下开会话 A、B,各用对外接口上传 `b280.pdf` 与 `b280.png`,带 `files[]` 各发一轮;两个会话各点一次 👎 并写一句评论。等质量监控与评测候选扫描各跑过一轮(看日志或只读查到 A、B 的 `quality_score` / `curation_candidate` 行)。只读查下面这条 SQL,A、B 各自记一份「删之前」的条数(`memory_writeback_dlq` 在正常对话里通常是 0,不强造): **11-06 测试 `da1f50934` 过**(测试环境质量监控关着,`quality_score` 按 94.1「是 0 先补造」给自建 run 各合成一行)
+
+  ```sql
+  SELECT 'feedback' k, count(*) FROM feedback WHERE thread_id = :t
+  UNION ALL SELECT 'quality_score', count(*) FROM quality_score WHERE thread_id = :t
+  UNION ALL SELECT 'curation_candidate', count(*) FROM curation_candidate WHERE thread_id = :t
+  UNION ALL SELECT 'memory_writeback_dlq', count(*) FROM memory_writeback_dlq WHERE source_thread_id = :t::text
+  UNION ALL SELECT 'user_upload_live', count(*) FROM user_upload WHERE thread_id = :t AND ref <> ''
+  UNION ALL SELECT 'user_upload_tombstone', count(*) FROM user_upload WHERE thread_id = :t AND ref = '' AND kind = 'document' AND deleted_at IS NOT NULL AND filename = '' AND mime_type = '' AND size_bytes = 0 AND sha256 IS NULL AND last_used_at IS NULL
+  UNION ALL SELECT 'image_upload', count(*) FROM image_upload WHERE thread_id = :t
+  UNION ALL SELECT 'knowledge_retrieval_log', count(*) FROM knowledge_retrieval_log WHERE thread_id = :t
+  UNION ALL SELECT 'agent_run', count(*) FROM agent_run WHERE thread_id = :t
+  UNION ALL SELECT 'agent_approval', count(*) FROM agent_approval WHERE thread_id = :t
+  UNION ALL SELECT 'thread_meta', count(*) FROM thread_meta WHERE thread_id = :t;
+  ```
+
+  同时记下 A、B 图片的 `image_upload.object_key`。判据:A、B 的 `feedback` / `quality_score` / `curation_candidate` / `user_upload_live` / `image_upload` 都 ≥ 1(`user_upload_live` 应是 2:pdf 与 png 各一行;哪一类是 0 先补造,不然这一类等于没验),`user_upload_tombstone` 都是 0。
+- [x] **94.2 删会话 A**:控制台对话页删除会话 A(彻底删除)。判据:200;响应里 `feedback`、`quality_scores`、`curation_candidates`、`user_uploads`、`image_uploads`、`image_blobs_removed` 与 94.1 的条数一致,`image_blobs_failed` = 0,没有任何 `*_delete_failed`;再跑 94.1 的 SQL:A 除 `user_upload_tombstone` = 1(pdf 那一行,所有被清的列都已清空)外每一行都是 0;**B 的每一行与 94.1 记的一样**;对象存储里 A 的图片键已不存在、B 的还在;NAS 上 `agents/<key>/threads/<A>/` 已不在、`threads/<B>/` 还在;审计 `SESSION_WRITE` 有 `details.op = purge`、`meta_removed = true` 的一行。**没修好时**:A 的前五类条数不变、图片键还在。 **11-06 测试 `da1f50934` 过**
+- [x] **94.3 引用已删会话的上传**:在会话 B 发一轮,`files[]` 带 A 的 pdf `upload_id`;再发一轮带 A 的 png `upload_id`;再 `GET …/uploads/<A 的 pdf upload_id>?user_id=u-b280`。判据:依次 404 `UPLOAD_SESSION_DELETED`、404 `UPLOAD_NOT_FOUND`、404 `UPLOAD_NOT_FOUND`(与 B-280 之前一致)。 **11-06 测试 `da1f50934` 过**
+- [x] **94.4 失败时对话留着**:真栈不造故障(要停库或对象存储),由单测覆盖(`test_session_purge_children.py`:六类任一类失败 → 503、对话还在、别的类已删、重试删完;图片字节删不掉 → 行留着)。记「单测覆盖」。 **11-06 测试 `da1f50934` 单测覆盖**
+- [x] **94.5 删用户带走质量评分与候选**:在会话 B 还在时,对 `u-b280` 走 `POST /v1/users/<id>:purge`。判据:200,`deleted.quality_score`、`deleted.curation_candidate` ≥ 1,`failures` 为空;94.1 的 SQL 对 B:`quality_score` / `curation_candidate` / `image_upload` 都是 0,对象存储里 B 的图片键已不存在。 **11-06 测试 `da1f50934` 过**
+- [x] **94.6 收尾**:质量抽样比例调回 94.1 记下的值;删临时智能体 `acc-b280`(彻底删除);吊销临时 key **11-06 测试 `da1f50934` 过**
+
+## §95 图片按最后使用到期 + 图片被清理后会话照常继续(B-283)
+
+**背景**:以前图片(`image_upload` + 对象存储)按上传时间满 90 天就删,会话还在用也删;删了之后这段会话历史里那条图片引用每一轮都要重新取字节,取不到就整轮失败 —— 会话从此每一轮都失败。现在:① 到期 = `greatest(上传时间, image_upload.last_used_at, 所在会话最后一次 run)` + 租户的 `upload_retention_days`(图片也是附件,没设用与附件同一个 `EXPERT_WORK_RETENTION_UPLOAD_RETENTION_DAYS`,默认 90;老的 `..._IMAGE_RETENTION_DAYS` 不再生效、配着打 warning。**天数相同时只会比以前删得晚;但天数跟随租户的附件保留期,租户设得比 90 短时图片也更早被删**);`last_used_at` 在对外下载图片成功时记(每张每天最多一次),会话里的使用(提问、`ask_image`、对外 `files[]` 附图都只认本会话的图)靠「会话最后一次 run」;用户手动删的图照旧下一轮清。② 图的字节不在了(对象存储 404)时,两个模型适配器在那张图的位置放一句「[图:用户上传的这张图片已不存在(可能已过保留期被清理),现在看不到]」,这一轮照常跑;`ask_image` 问这样的图直接报错(不把降级文字交给看图模型);对象存储暂时故障(5xx / 凭据)照旧报错,不当成「不在了」。迁移 `0185_b283_image_last_used` 加一列(可空)。
+
+**前置依赖(B-286)**:留存作业今天的对象存储是 `memory`,图片 pass 在部署环境里整个不跑(字节与行都不删)。95.4 / 95.5 / 95.6 只有在 B-286 给作业配上真实的对象存储凭据(`EXPERT_WORK_RETENTION_OBJECT_STORE_BACKEND=s3-compatible` 等)之后才可能通过;先核 CronJob 的这几个 env,没配就把这三条记成「受阻于 B-286」,不要记失败。95.6 也可以不等作业:用户批准后手动删掉那张图的对象存储 key 来造「字节不在了」。
+
+**怎么进**:测试环境对外接口(平台租户临时 API key)+ 只读查库。造过期行与删对象要用户逐次批准、只动本节自建的行与对象(按 id);造完手动触发留存作业(`kubectl create job --from=cronjob/retention-cleanup b283-probe-<n>`)。**花费**:约 ¥1(几轮带图的短对话,需一个看图模型)。
+
+- [x] **95.1 迁移**:发布后只读查 `alembic_version` = `0185_b283_image_last_used`;`image_upload.last_used_at` 存在且可空 **11-06 测试 `da1f50934` 过**
+- [x] **95.2 下载记使用**:对外接口上传一张图 `probe-a.png`(拿到 `upload_id` 与会话 A),调一次 `GET /v1/agents/{code}/uploads/{upload_id}?user_id=…` 成功。判据:只读查这张图的 `image_upload.last_used_at` 有值;当天再下载一次不变;用别的 `user_id` 下载(404)不改它 **11-06 测试 `da1f50934` 过**
+- [x] **95.3 造过期行(用户批准后改库)**:① 会话 B 上传 `b.png` 并带它发一轮,把 `b.png` 的 `created_at` 改 200 天前、会话 B 的 run 保持今天 —— 应留(会话还在用);② 会话 C 上传 `c.png` 发一轮,把 `c.png` 的 `created_at` 与 C 的全部 run 都改 100 天前 —— 应删;③ 会话 D 上传 `d.png`(不发轮),`created_at` 改 200 天前、`last_used_at` 改 5 天前 —— 应留;④ 会话 E 上传 `e.png`,`created_at` 改 40 天前 —— 默认 90 天下应留 **11-06 测试 `da1f50934` 已造**
+- [x] **95.4 跑作业(需 B-286)**:手动触发留存作业。判据:`c.png` 的 `image_upload` 行已删、对象存储里对应 key 已不在;`b.png`、`d.png`、`e.png` 行与对象都在、对外下载 200;作业日志 `image_uploads_hard_deleted` ≥ 1、`image_object_keys_failed=0`、退出码 0 **11-06 测试 `da1f50934` 过**(`image_rows=2 image_keys_ok=2`)
+- [x] **95.5 租户天数管图片(需 B-286)**:租户配置设 `upload_retention_days = 30`(确认改小),再跑一次作业。判据:`e.png`(40 天、没用过)被删;`b.png`、`d.png` 仍在。设回 `null` **11-06 测试 `da1f50934` 过**
+- [x] **95.6 被清理的图不再让会话失败**:在会话 C(它的图在 95.4 已被删)里再发一轮「刚才那张图里写了什么?」。判据:这一轮 `success`(不是 `error`);模型回答里说图已经看不到 / 不存在;control-plane 日志有 `multimodal.upload_image_degraded image_id=<c 的 id>`,日志里没有租户 / 会话 id;如果模型调了 `ask_image`,那一次工具调用是错误(`resource_not_found`),不是一句「看不到图」的看图结果 **11-06 测试 `da1f50934` 过**(第二次落到没缓存这张图的 pod 才验到:进程内图片缓存删后不失效 → B-291)
+- [ ] **95.7 暂时故障不算「不在了」**(可选,能临时让对象存储读失败时才做,否则跳过并注明):判据是那一轮报错,而不是出现「已不存在」的文字 **11-06 测试 `da1f50934` 跳过(可选)**
+- [x] **95.8 收尾**:租户配置恢复;删本节建的会话、图片与 probe job;吊销临时 key **11-06 测试 `da1f50934` 过**
+
+**上生产前**:通知深护智康 —— 更新记录「图片附件按最后一次使用保留；图片清除后会话不再报错」(行为变化,提前通知):天数相同时图片只会比以前留得更久;但天数改为跟随租户的附件保留期(`upload_retention_days`),租户把它设得比 90 天短时,图片也按这个更短的天数清除;图片被清除之后,引用它的会话照常继续,模型看到一句「图片已不存在」的文字。更新记录随发布改日期。
+
+## §96 闲置会话的工作目录到期清理(B-282)
+
+**背景**:B-236 起每段会话有自己的 `agents/<key>/threads/<会话>/`(`work/` = 那段会话的 `/workspace`、`PLAN.md` 投影、开场复制标记 `.seeded`),以前只有清除(会话 / 用户 / 智能体)删它,对外接口又没有删除会话,所以对外会话的目录永远不清。现在留存作业新增一条 pass:最后活动 = `greatest(会话创建, 最后一次 run, 本会话没删的文档上传最后一次被用(上传 / `files[]` 引用 / 下载))`(持锁再查时另看到期线之后、到再查那一刻为止的 `DOCUMENT_UPLOAD` 审计,覆盖 B-281 之前的控制台上传与跨会话复制)早于 `now - 租户的 conversation_workspace_retention_days`(为空用 `EXPERT_WORK_RETENTION_CONVERSATION_WORKSPACE_RETENTION_DAYS`,默认 90,7–365)、没有 pending / queued / running / paused 的 run、**并且没有没删的文档上传登记行**(`upl_` 下载读的就是这段会话 `work/uploads/` 里的文件;租户上传保留期可以比会话的长,比如 365 对 90,登记行由 B-63 按自己的保留期到期、标 `deleted_at` 之后才轮到这里)的会话 → **改名挪进隔离区** `{tenant}/.purged-agents/{user}/<原名>-<秒>-<随机>`(沙箱挂不到;满 7 天由隔离区那一条删,**7 天内可以手工挪回**):整棵 `threads/<会话>/`(对话视图)与这段会话每个 run 在 agent 根(没绑 agent 的在用户根)下的 `.tool_results/<run>/`。持开场复制那把 advisory lock(classid 8624,键 `{tenant}:{会话}`)只做再查 + 改名 + 记清理时间,不在锁里删;上传落盘(含跨会话复制附件)拿同一把锁的共享形式,所以落盘要么在再查之前写完(登记行 / 审计看得到,会话不清)、要么在挪走之后落进新目录。改名之后再查一次:期间新起了 run 就挪回原处(原名已被新目录占了就留在隔离区)、记 `conversation_dirs_raced`、不记清理时间。`.tool_results/<run>` 里有下载要读的产物文件的 run 目录不动。库里的行全部保留;清完记 `thread_meta.workspace_cleaned_at`;下一轮起 run 时把它清回空,并给模型一句一次性说明(`[workspace notice] This conversation was idle past the retention period …`);`.seeded` 随整棵树挪走,下一轮照常重新复制。用户已软删的(`tenant_user.deleted_at` 有值,或 NAS 上有 `.deleted/<user>`)不动、不记、不占批。会话目录里有 B-235 之前登记、仍是最新版(没有副本、下载读工作区)的产物文件的,整段会话不动。每轮最多 500 段(`..._CONVERSATION_WORKSPACE_BATCH_SIZE`);列到了却没清的记 `thread_meta.workspace_clean_attempted_at`,下一轮排在没试过的后面;一批满了且一半以上没清打 `retention.conversation_dirs_mostly_skipped`。迁移 `0186_b282_conv_dir_expiry` 加三列(都可空)。
+
+
+**行为变化 / 已知局限**:① 上传落盘(控制台、对外接口、跨会话复制附件)现在拿这段会话开场复制锁的共享形式,所以**会话第一轮正在做开场复制时,同一会话的上传要等复制做完**(最多复制 20 MB,通常几秒;run 被取消时复制线程最多再跑 120 秒),更新记录里写了。② 每份上传持锁期间占两条连接池连接(锁的事务一条、落盘 / 审计 / 配额各自一条),与 `PgWorkspaceLock` 同一种写法,这次不改;上传突发很大时会先表现为连接池等待。③ 判「挪走前后有没有新 run」用的是 run 集合,与行顺序无关。④ 挪走之后任何一步出错(第二次查、记一笔、提交、挪到一半)都会把已挪走的挪回原处,挪不回的在日志 `retention.conversation_dir_unparked_after_error … left_in_quarantine=…` / `retention.conversation_dir_raced … left_in_quarantine=…` 里写出隔离区里的名字。
+**怎么进**:测试环境控制台(system_admin,平台租户)+ 对外接口(平台租户临时 API key)+ 只读查库 / NAS(`kubectl exec` 进 control-plane 看 `/mnt/workspaces/<tenant>/<user>/agents/<key>/…`)。造闲置要用户逐次批准、只改本节自建的会话与 run(按 id);造完手动触发留存作业(`kubectl create job --from=cronjob/retention-cleanup b282-probe-<n>`)。**花费**:约 ¥1(几轮短对话)。
+
+- [x] **96.1 迁移**:发布后只读查 `alembic_version` = `0186_b282_conv_dir_expiry`;`tenant_config.conversation_workspace_retention_days`、`thread_meta.workspace_cleaned_at`、`thread_meta.workspace_clean_attempted_at` 存在且可空;`tenant_config_conv_workspace_retention_range_ck` 在 **11-06 测试 `da1f50934` 过**
+- [x] **96.2 租户设置**:控制台「租户配置」只读视图多一行「对话工作目录保留（天，从最后一次对话算起）」显示「平台默认」;JSON 里设 `conversation_workspace_retention_days: 30` 保存 → 弹「确认改小保留期」,确认后显示 30;设 6 / 366 → 422;API 直接 PUT 改小不带 `confirm_retention_decrease=true` → 409 `RETENTION_DECREASE_NOT_CONFIRMED`。最后设回 `null` **11-06 测试 `da1f50934` 过**
+- [x] **96.3 造闲置会话(用户批准后改库)**:对外接口建 5 段会话,每段跑一轮让智能体在 `/workspace` 写一个 `note.md`:① A:会话与 run 的 `created_at` 都改 100 天前 —— 应清;② B:会话改 200 天前、run 保持今天 —— 应留(最近有 run);③ C:会话与 run 都改 100 天前,再插一条 `status='paused'` 的 run(或让它真的停在审批处)—— 应留;④ D:同 A,再让智能体在 D 里用 B-235 之前的方式登记一个产物 —— 测试环境做不出没有副本的新版本时,改那一版 `snapshot_key = NULL`(用户批准)—— 应整段不动;⑤ E:会话与 run 改 40 天前 —— 默认 90 天下应留。记下各段的 `updated_at` **11-06 测试 `da1f50934` 已造**
+- [ ] **96.3b 有没到期的上传就不清(用户批准后改库)**:再建会话 F、G,各跑一轮写 `note.md`,会话与 run 都改 100 天前;F 里再用对外接口上传一个文档(不发轮);G 也上传一个文档,把它的登记行 `created_at` / `last_used_at` 都改 100 天前(租户上传保留期设 365,模拟「上传保留期比会话长」)。96.4 判据加:F、G 的目录都在、对外下载 G 的 `upl_` 仍是 200,`conversation_dirs_skipped_active` 与列表里都没有它们;之后把 G 的登记行标 `deleted_at = now()`(用户批准)再跑一次 → G 被清 **11-06 测试 `da1f50934` 前半过、后半未过(步骤问题)**:标 `deleted_at` 后 G 仍计 `skipped_active` —— 持锁再查看的是到期线之后的 `DOCUMENT_UPLOAD` 审计,而 G 的上传审计是今天的;要验需连审计时间一起回拨。产品行为符合设计
+- [x] **96.4 跑作业**:手动触发留存作业。判据:NAS 上 A 的 `threads/<A>/` 已不存在,挪进了 `<tenant>/.purged-agents/<user>/<A>-<秒>-<随机>/`(里面还是原来的 `work/note.md`)、A 的 run 在 agent 根的 `.tool_results/<run>/`(如有)同样挪进隔离区;B、C、D、E 的目录都在;只读查 A 的 `workspace_cleaned_at` 有值、`updated_at` 与改库后一致(会话列表顺序不变)、A 的 `agent_run` / 历史消息 / 产物行都在;D 的 `workspace_clean_attempted_at` 有值;完成日志 `conversation_dirs_removed` ≥ 1、`conversation_dirs_skipped_artifact` ≥ 1、`conversation_dirs_failed=0`、退出码 0。**挪回演练(可选)**:`mv <tenant>/.purged-agents/<user>/<A>-… <user>/agents/<key>/threads/<A>` 后 A 的 `note.md` 又能列出;演练完再挪回隔离区 **11-06 测试 `da1f50934` 过**(`conversation_dirs_removed=1 skipped_artifact=1`)
+- [x] **96.5 对外可见的变化**:`GET /v1/agents/{code}/workspace/files?user_id=…` 里 A 的 `threads/<A>/work/note.md` 不再出现;下载它 → 404 `WORKSPACE_FILE_FAILED`;A 的产物(如有)照常下载;`GET …/sessions/<A>/messages` 照常 **11-06 测试 `da1f50934` 过**
+- [x] **96.6 会话继续**:在 A 里再发一轮「列一下工作区里的文件,再写一个 hello.md」。判据:这一轮 `success`;调试台里这一轮的平台段有一次 `[workspace notice] This conversation was idle past the retention period` 那句(下一轮没有);只读查 A 的 `workspace_cleaned_at` 已清回空;NAS 上 `threads/<A>/` 重新出现 `.seeded` 与 agent 级目录的副本、`work/hello.md`;`note.md` 不在(没登记成产物的文件不恢复,符合预期)。再跑一次作业:A 不会被清(刚有 run) **11-06 测试 `da1f50934` 过**
+- [x] **96.7 再跑一次不重复**:不改任何东西再触发一次作业。判据:`conversation_dirs_removed=0`(A 已清过、又刚用过;B–E 条件不变) **11-06 测试 `da1f50934` 过**(两次作业 `conversation_dirs_removed=0`;中间改过上传保留期 / 作业 env,与「什么都不改」略有出入)
+- [x] **96.8 租户天数**:租户配置设 `conversation_workspace_retention_days = 30`(确认改小),再跑作业 → E(40 天)被清;设回 `null` **11-06 测试 `da1f50934` 过**
+- [x] **96.9 收尾**:删本节建的会话与 probe job;租户配置恢复(含 96.3b 的上传保留期);隔离区里本节的条目满 7 天自动删,也可以用户批准后提前删;吊销临时 key **11-06 测试 `da1f50934` 过**
+
+**上生产前**:通知深护智康 —— 更新记录「会话的工作目录在闲置 90 天后清理」(行为变化,提前通知):闲置满保留期、且没有未到期上传的会话,`threads/<session_id>/work/` 里没登记成产物的文件不再能列出和下载(404 `WORKSPACE_FILE_FAILED`;平台侧 7 天内可恢复);会话、历史、产物照常;要长期留的文件让 Agent 登记成产物。更新记录随发布改日期。
+
+## §97 控制台上传 / 跨会话复制也建登记行 + 清理迁移后留在 agent 根的原件(B-281)
+
+**背景**:B-63 的附件到期只认 `user_upload` 登记行。此前两种落盘不建行、永远不会到期:① 控制台上传文档(`POST /v1/sessions/{id}/uploads`,调试台 / 对话页);② 对外 run 的 `files[]` 引用别的会话的上传时复制进本会话的那一份。本次两处都建登记行,但**只在文件落进本对话自己的目录(`threads/<会话>/work/uploads/`)时**;落在共享根(老视图会话的 agent 根、没绑 agent 的用户根)的照旧不建 —— 那里别的会话也看得到,留存作业的引用检查只认登记行,登记了到期就会删掉别人还在用的文件。字段与对外上传同一个写法(会话、文件落进的那个工作区的用户、实际落盘名、大小、mime、sha256);复制进同一会话的同一份(同名同 sha256)只建一行。控制台响应不变(仍是 `{path, kind}`,不回 `upl_` id);对外接口的 `user_id` 一律带 `ext:` 前缀,摸不到控制台用户名下的行。**没有数据库迁移。**
+
+另:老对话迁移(B-262 P3)把上传**复制**进对话目录,agent 根下的原件从此没有登记行指着、永远删不到。清理谓词在 `retention_cleanup_job.legacy_originals`(模块头有全文),两个入口:**① 每个对话迁移成功之后**,control-plane 在后台对那个 (租户, 用户, agent) 跑一次(不等它、不影响 run、失败只记异常类型,每次最多 500 个原件,指标 `expert_work_platform_migration_originals_total`);**② 一次性命令** `python -m retention_cleanup_job.legacy_originals`(默认只数,`--apply` 才删)清存量。只删**逐字节重复**的原件,下面每一条都满足才删:有没删的登记行指着它(只有审计的原件永远不删);指着它的登记行 / `DOCUMENT_UPLOAD` 审计行没有一条在老视图会话、没有一条登记行的会话已不在;每条引用在自己对话目录里的副本都在且 sha256 相同;**同租户、同 agent、属于这个用户或没有用户的会话里一个老视图会话都不剩**(老视图的 `/workspace` 就是 agent 根,`uploads/` 下每个文件它都看得到 —— 所以实际上是这个 agent 最后一个老视图会话迁完时才清);**没有 `snapshot_key IS NULL` 的产物版本**(B-235 之前登记的)指着这个文件;原件和路径上每一段都不是软链。删之前紧挨着再查一次库(登记表、老视图会话、产物版本),然后在核对时打开的那组 fd 上删(再比一次 inode)。输出只有一行计数与字节数,不打文件名、租户、用户。
+
+**对外可见的变化(低影响)**:原件删掉之后,对外 `GET /v1/agents/{code}/workspace/file?path=uploads/<名字>`(按 agent 根路径读)回 404;按 `upl_` id 下载(`GET /v1/agents/{code}/uploads/{upload_id}`)不受影响(读的是对话目录里的副本)。生产 Prometheus 近 30 天该对外端点调用为 0。跨会话复制进对话目录的那一份现在会按保留期到期(从目标会话最后一次 run / 使用算起)。
+
+**回滚注意**:回滚镜像后控制台上传 / 复制又不建行,迁移完也不再清原件;已建的行留着,老代码的留存作业照样按它们到期,无害。已删掉的原件不能恢复,但删的只是逐字节重复(副本都核对过在)。
+
+**怎么进**:测试环境控制台(system_admin,平台租户);对外接口用平台租户临时 API key;库只读查询;清理命令在 control-plane pod 里跑(镜像自带 `retention_cleanup_job`,与留存 CronJob 同镜像、同 NAS 挂载、同 uid)。`kubectl exec` **不要带 `-i`**(stdin EOF 会吞输出);命令整段用单引号(zsh)。命令连库失败时**不要贴完整报错**(驱动报错可能带整条 DSN),只贴异常类型。**花费**:约 ¥2(几轮短对话)。
+
+- [x] **97.1 控制台上传建行(对话目录)**:调试台在一个**新**对话里给某智能体上传 `b281-a.pdf`,同一对话再传一次同一个文件。只读查 `SELECT id, kind, ref, filename, mime_type, size_bytes, sha256, user_id FROM user_upload WHERE thread_id = '<会话 id>' ORDER BY created_at`。判据:两行,`kind = document`,`ref` 都等于上传响应的 `path`,`sha256` 等于本地 `shasum -a 256 b281-a.pdf`,`user_id` 是自己的 `tenant_user.id`;NAS 上文件在 `agents/<key>/threads/<会话>/work/uploads/` 下且只有一个(第二次复用)。**没修好时**:零行。 **11-06 测试 `da1f50934` 过**
+- [ ] **97.2 共享根不建行**:找一个还在老视图的会话(只读查 `thread_meta.workspace_layout = 'agent_root'`,没有就跳过并注明)在控制台上传 `b281-b.pdf`。判据:这个会话没有新的 `user_upload` 行;文件落在 `agents/<key>/uploads/`(不是 `threads/…/work/`);审计 `document:upload` 照常有一条。 **11-06 测试 `da1f50934` 不可判**(平台租户里老视图会话的智能体都已删,别的租户是真实用户)
+- [x] **97.3 对外接口摸不到控制台的行**:取 97.1 第一行的 `id`,拼成 `upl_<id>`;用对外 key 调 `GET /v1/agents/<code>/uploads/upl_<id>?user_id=<你的控制台登录名>`,再在任一对外会话里带 `files:[{"upload_id":"upl_<id>"}]` 发一轮。判据:两次都是 404 `UPLOAD_NOT_FOUND`(不是 200、不是 500)。 **11-06 测试 `da1f50934` 过**(副作用:404 那次已先建了终端用户与空会话 → B-293)
+- [x] **97.4 跨会话复制建行**:对外接口在会话 A 传 `b281-c.pdf`;会话 B(新开的,对话视图)带 `files:[{upload_id: <A 的 upl_>}]` 发两轮。判据:只读查会话 B 的 `user_upload` 多出**一行**(第二轮不再加),`ref` 是 B 里实际落地的名字、`sha256` 与 A 那一行相同、`user_id` 与 A 相同;A 那一行不变;审计 `document:upload` 两条都带 `copied_from_upload_id`。 **11-06 测试 `da1f50934` 过**
+- [x] **97.5 到期照常(用户批准后改库)**:把 97.1 所在会话全部 run 的 `created_at`、以及 97.1 **第一行**的 `created_at` 改到 100 天前,手动触发留存作业(`kubectl -n expert-work create job --from=cronjob/retention-cleanup b281-probe-1`)。判据:第一行 `deleted_at` 有值,文件**还在**(第二行还没到期、指着同一个文件);再把第二行也改 100 天前、触发 `b281-probe-2` → 第二行 `deleted_at` 有值、文件已删;作业退出码 0。 **11-06 测试 `da1f50934` 过**
+- [ ] **97.6 迁移时清原件**:找(或请用户提供)一个 (用户, 智能体) 下**只剩一个**老视图会话、且有对外上传登记行的组合(只读:`SELECT user_id, agent_name, count(*) FROM thread_meta WHERE workspace_layout = 'agent_root' GROUP BY 1, 2 HAVING count(*) = 1`,再挑一个在 `user_upload` 里有行的);先在 NAS 上确认 `agents/<key>/uploads/<名字>` 在。在这个会话里发一轮(触发迁移)。判据:control-plane 日志有 `platform_migration.done outcome=migrated`,随后一条 `platform_migration.release_originals legacy_originals mode=apply …`(只有计数),`deleted` ≥ 1、`failed=0`;agent 根的原件没了,对话目录的副本在;用对外接口按 `upl_` id 下载它 200 且内容不变;这一轮 run 正常完成。对照:若该 (用户, 智能体) 还有别的老视图会话,则没有 `release_originals` 那条日志、原件都在。 **11-06 测试 `da1f50934` 不可判**(同 97.2)
+- [x] **97.7 清理存量:只数不删(测试)**: **11-07 测试 `fb03a0689` 过**:退出码 0,只有一行计数 `checked=20 deletable=0 no_original=2 kept_old_view_row=4 kept_old_view_conversation=13 kept_unregistered_upload=1 failed=0`(其余 kept_* 为 0)。**11-06 测试 `da1f50934` 不过**:`TypeError` 崩溃(同一原件的副本一条有 sha256 / 大小、一条没有,排序比较 `None`);27 个候选中 16 个触发,NAS 无变化。修复见 B-281 后续 PR,待再发测试复验
+  `kubectl -n expert-work exec deploy/control-plane -c control-plane -- sh -c 'EXPERT_WORK_RETENTION_DB_DSN="$EXPERT_WORK_DB_DSN" EXPERT_WORK_RETENTION_WORKSPACE_ROOT="$EXPERT_WORK_WORKSPACE_NAS_ROOT" python -m retention_cleanup_job.legacy_originals'`
+  判据:退出码 0;最后一行形如 `legacy_originals mode=dry-run checked=… deletable=… deleted=0 bytes=… no_original=… kept_…=… failed=0`,整段输出里没有文件名、租户 id、用户 id;NAS 上什么都没变。把整行贴回来(调查时测试上有 4 个这类原件,`deletable` 应 ≤ 4;只要同一 (用户, 智能体) 还有老视图会话,原件计在 `kept_old_view_conversation`)。
+- [x] **97.8 清理存量:删(测试,用户批准后)**:同 97.7 的命令末尾加 ` --apply`。判据:`deleted` 等于 97.7 的 `deletable`(期间有变化时可少,计在 `kept_changed_during_run`),`failed=0`、退出码 0;再跑一次 97.7(不带 `--apply`):`deletable=0`,`no_original` 比 97.7 多出 `deleted` 个;抽一个被删原件对应的会话,按 `upl_` id 对外下载 200、内容不变。 **11-07 测试 `fb03a0689` 已执行**:`--apply` 退出码 0、`deleted=0 failed=0`(97.7 已是 `deletable=0`),再跑只数不删结果与 97.7 逐项相同。测试上没有可删的原件(同 97.2 / 97.6:老视图会话的智能体都已删或属真实用户),真删分支由集成测试覆盖,生产先只数不删、贴回结果再定。**11-06 测试 `da1f50934` 未执行**(97.7 崩溃)
+- [x] **97.9 收尾**:删本节建的会话、上传与 probe job;吊销临时 key。 **11-06 测试 `da1f50934` 过**
+
+**生产(用户执行,随发布之后)**:发布完成、smoke 过之后,在生产集群执行 97.7 的同一条命令(只数不删),把输出的那一行贴回来;我们对一下各 `kept_*` 的原因后再决定是否执行 ` --apply`;执行完再跑一次只数不删,确认 `deletable=0`、`failed=0`。迁移时的清理随发布自动生效,不需要操作;可在 Prometheus 看 `expert_work_platform_migration_originals_total`。不需要改库、不需要停作业。
+
+## §98 agent 根的存量、`/agent` 文件历史版本、冻结的 `shared/`(B-284)
+
+**背景**:B-236 之后新对话都写进自己的 `threads/<会话>/work/`;之前老视图对话直接写在 agent 根(`agents/<key>/`),那是一批固定存量,一直没人清。留存作业新增:
+
+- **切换时刻 `T` 钉在 overlay 里**:`EXPERT_WORK_RETENTION_AGENT_ROOT_CUTOVER`,带时区的 ISO 时间,填这个环境 B-236 上线的时刻,写在 `infra/k8s/overlays/{test,prod}/retention-cleanup-patch.yaml`(固定的历史事实,随发布一起下发,不再 `kubectl set env`):**测试 `2026-10-30T23:48:00+08:00`**(测试集群 B-236 镜像 `44b8260a3` 的 ReplicaSet 创建于 `2026-10-30T15:48:08Z` = 23:48:08 CST,取到分钟、比滚动开始早)、**生产 `2026-11-04T19:10:00+08:00`**(发布执行单 `2026-11-04-prod-release-checklist.md` 头上「19:10 已执行」的开始时刻,B-236 代码是之后 2.2 段才滚上去的)。**`T` 只能比真正上线早、不能晚**:晚了,上线到 `T` 之间有意放进 `/agent` 的东西会被当成存量删(23:51 就晚了 3 分钟,已改);早了只会少删。不设 = agent 根这条不跑;写错(纯数字、没时区、解析不了、**晚于现在**)= 这条不跑、记 `retention.config_invalid`、作业以 3 退出(别的 pass 照跑)。**不再从 `thread_meta` 现算**(清除最早的对话会让它往后挪、老对话被迁成新布局会让它往前挪)。每轮都打一行 `retention.agent_roots_gate cutover=… shared_delete_after=…`。`EXPERT_WORK_RETENTION_SHARED_DELETE_AFTER` 故意**不**进 overlay:它是发布当天(通知深护之后)才打开的闸,按 98.9 在 CronJob 上设。**注意:带着这个 overlay 发到测试 / 生产之后,当晚的 CronJob 就会按 `T` 真删存量**(测试:10-30 之前写下、满 90 天没动过的 agent 根文件;生产 09-07 才开荒,最早 12-06 才有满 90 天的)。
+- **「早于 `T`」与「满天数」都看 `max(mtime, ctime)`**:mtime 用户态随便设(`unzip` / `tar` / `cp -p` / `rsync -a` / `mv` / `touch -d`、开场复制本身也保留 mtime),ctime 改不了、只会往「更新」那边走。所以 `T` 之后放进 `/agent` 的老 mtime 文件不删;`T` 之前解压出来、带着几年前 mtime 的文件,从写下那天起满天数才删。
+- ① agent 根**顶层文件**:`max(mtime, ctime)` 早于 `T`、也早于「现在 - 租户的 `artifact_retention_days`(默认 90)」、没登记成产物 → 删;删之前那一次 `lstat` 再核对:还是判定时的 `(st_dev, st_ino)`、`max(mtime, ctime)` 还早于 `T`,不是就不删、计 `agent_root_skipped_changed`。② **子目录**:整棵树每一项(含目录自己)`max(mtime, ctime)` 都早于 `T`(碰到第一项不早于 `T` 的就停)、没有产物文件、这个用户在这个 agent 下闲置(最后一次 run 与树里最晚的那一项较晚者)满同样天数 → 按判定时的 inode **改名挪进隔离区** `{tenant}/.purged-agents/{user}/<原名>-<秒>-<随机>`(沙箱挂不到;满 7 天由隔离区那一条删,**7 天内可以挪回**),在那里复查、复查不过挪回原名(计 `agent_root_skipped_changed`)。③ 永不碰:点开头的名字(包括用户自己建的 `.retention-hold-*`)、`AGENT_NOTES.md` / `MEMORY.md` / `PLAN.md` / `TODO.md`、平台目录、符号链接(计 `agent_root_skipped_symlinks`)、`T` 之后改过的任何东西;子树超过 5,000 项判不了的计 `agent_root_skipped_unknown`、不删。
+- ④ `/agent` 文件历史版本:读到的内容正好已经是某个产物版本的副本(同路径、同 sha256、有副本)才不另留版本 —— 登记后又改过的、B-235 之前没副本的照常留;「源文件不见满 30 天整个删」挪到留存作业(闲着的 agent 也到期);每个文件最新 3 份之外、写下满 90 天的版本删;写到一半留下的 `.tmp-*` 满 1 小时删。
+- ⑤ `shared/`:`EXPERT_WORK_RETENTION_SHARED_DELETE_AFTER` 只认 `YYYY-MM-DD`(UTC 零点)且不早于 2026-11-06;到了就删每个用户根下的 `shared/`。不设 / 空 = 永不删;数字(`20261201` 不再被当成 unix 时间)、别的写法、更早的日期 = 只跳过 `shared/` 这一步、记 `retention.config_invalid`、作业以 3 退出(别的照跑)。沙箱挂载与 `shared:` 前缀在目录不在时本来就容忍,到期前照常能读;删除之后另拆。
+- agent 根 `.tool_results/<run>` 随会话闲置清理已在 B-282(§96)。
+
+**怎么进**:测试环境 `kubectl exec` 进 control-plane 看 NAS + 只读查库。probe job 改 env、改文件前用户逐次批准。**不要用 probe job 把 `T` 钉到将来 / 把 `SHARED_DELETE_AFTER` 设成今天来造数据**:probe job 扫的是整个 NAS,会删掉所有测试用户的存量与 `shared/`,不止本节自建的东西。删除规则用 98.2 的 pod 内探针验证:它只在 NAS 根下自建的 `.b284-probe/`(不是 UUID 名,作业与 janitor 都不看)里造文件,直接调 `sweep_agent_roots` / `sweep_shared`(可以传「现在」与 `T`),跑完把 `.b284-probe/` 整个删掉。probe job 只用于 98.1 / 98.7 那几种什么都不会删的配置。**花费**:约 ¥0.5(一两轮短对话)。
+
+给 probe job 临时改 env 的写法(`<n>` 每次换一个;`KEY-` 是去掉这个 env):
+
+```bash
+kubectl create job --from=cronjob/retention-cleanup b284-probe-<n> --dry-run=client -o yaml \
+  | kubectl set env --local -f - EXPERT_WORK_RETENTION_AGENT_ROOT_CUTOVER=20261201 -o yaml \
+  | kubectl apply -f -
+```
+
+- [x] **98.1 闸门**:先确认发布带上了 overlay:`kubectl get cronjob retention-cleanup -o jsonpath='{.spec.jobTemplate.spec.template.spec.containers[0].env[?(@.name=="EXPERT_WORK_RETENTION_AGENT_ROOT_CUTOVER")].value}'` 输出 `2026-10-30T23:48:00+08:00`;当晚(或手动 `kubectl create job --from=cronjob/retention-cleanup b284-probe-1`)日志 `retention.agent_roots_gate cutover=2026-10-30T23:48:00+08:00 shared_delete_after=off`、`agent_root_failed=0`、退出码 0,记下 `agent_root_files_removed` / `agent_root_dirs_removed` / `agent_root_skipped_*`(测试环境 2026-08-08 之前没写过 agent 根的话都是 0,属预期),`agent_root_dirs_removed` 计的子目录挪进了各自租户的 `.purged-agents/<user>/`(条目名 `<原名>-<秒>-<随机>`,7 天内可以 `mv` 回原处,之后隔离区那一条删)。**NAS 改名不动 mtime(上线前必验,用户批准)**:子目录挪进隔离区之后在那里复查「还都早于 `T`」,目录自己按 mtime 看;如果这块 NAS 跨父目录 `rename` 时会刷新目录的 mtime,复查永远不过、子目录全都被挪回原处,这一步**悄悄什么都不删**。验法:在 98.2 探针之前,`kubectl exec deploy/control-plane -- sh -c 'd=/mnt/workspaces/.b284-mtime; mkdir -p $d/a/x $d/b && touch -d "2020-01-01" $d/a/x && stat -c %Y $d/a/x && mv $d/a/x $d/b/x && stat -c %Y $d/b/x; rm -rf $d'`,两行输出必须相同(`1577836800` 左右);另外 98.2 场景 A 里 `dirs 1 held 1`、真跑之后 `agent_root_dirs_removed` 与 `agent_root_skipped_changed` 对得上(满足条件的子目录没有全部计成 `skipped_changed`)。再用上面的写法起三个 probe job:`EXPERT_WORK_RETENTION_AGENT_ROOT_CUTOVER-`(去掉)→ `cutover=off`、`agent_root_files_removed=0`、退出码 0;`EXPERT_WORK_RETENTION_AGENT_ROOT_CUTOVER=20261201` → `retention.config_invalid env=EXPERT_WORK_RETENTION_AGENT_ROOT_CUTOVER`、`agent_root_files_removed=0 agent_root_dirs_removed=0`、退出码 3;`EXPERT_WORK_RETENTION_AGENT_ROOT_CUTOVER=2099-01-01T00:00:00+08:00`(晚于现在)→ `retention.config_invalid … problem=later than now`、什么都没删、退出码 3 **11-06 测试 `da1f50934` 过**:NAS 跨父目录改名目录 mtime 不变;gate 行正确;三个 probe(去掉 / `20261201` / `2099-…`)判据都对
+- [x] **98.2 删除规则(pod 内探针,只动 `.b284-probe/`)**:执行下面的命令(参数是测试的 B-236 时刻)。场景 A 在「现在 + 100 天」、`T` = 现在 + 99 天跑(`T` 不能晚于跑的那一刻):`old.txt`(100 天)该删,`tpl/`(整棵 100 天、这个 agent 从没跑过)该挪进隔离区(`held 1`),`pre.txt`(40 天)、记忆文件、点开头的该留;场景 B 新放一个 mtime 拨到 200 天前的 `restored.md`,用测试的真实 `T` 跑 —— 它的 ctime 是现在、在 `T` 之后,该留;场景 C 是 `shared/` 的三种日期。判据(逐字):`A old.txt=gone tpl=gone pre.txt=kept AGENT_NOTES.md=kept MEMORY.md=kept .hidden=kept files 1 dirs 1 held 1 failed 0` / `B restored.md=kept files 0 failed 0` / `C 20261201:invalid 2099-01-01:kept <今天>:gone` / `cleaned True`。**没修好时**:只看 mtime 的版本 B 是 `restored.md=gone`;日期按数字解析的版本 C 第一项是 `gone`。(11-06 本机连真 Postgres、把 `Settings` 换成本地连接串原样跑过,输出同上。) **11-06 测试 `da1f50934` 过**(输出与判据逐字一致)
+
+```bash
+kubectl exec deploy/control-plane -- python -c '
+import asyncio, os, shutil, sys, time, uuid
+from datetime import UTC, datetime, timedelta
+from pathlib import Path
+from control_plane.settings import Settings
+from expert_work.persistence import DatabaseConfig, create_async_engine_from_config, create_async_session_factory
+from retention_cleanup_job.agent_roots import AgentRootTally, parse_shared_delete_after, sweep_agent_roots, sweep_shared
+B236 = datetime.fromisoformat(sys.argv[1])
+s = Settings()
+root = Path(s.workspace_nas_root) / ".b284-probe"
+user_root = root / str(uuid.uuid4()) / str(uuid.uuid4())
+agent = user_root / "agents" / "probe-agent"
+LATER = 100 * 86400
+def put(rel, age_days, at):
+    p = agent / rel
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(rel)
+    os.utime(p, (at - age_days * 86400,) * 2)
+    return p
+def state(names):
+    return " ".join(n + ("=kept" if os.path.lexists(agent / n) else "=gone") for n in names)
+async def sweep(sf, cutover, now):
+    t = AgentRootTally()
+    await sweep_agent_roots(sf, str(root), cutover=cutover, default_days=90, tally=t, now=now)
+    return t
+async def main():
+    engine = create_async_engine_from_config(DatabaseConfig(dsn=s.db_dsn, pgbouncer_mode=s.db_pgbouncer_mode))
+    sf = create_async_session_factory(engine)
+    try:
+        later = time.time() + LATER
+        for rel in ("old.txt", "AGENT_NOTES.md", "MEMORY.md", ".hidden", "tpl/a.md"):
+            put(rel, 100, later)
+        put("pre.txt", 40, later)
+        os.utime(agent / "tpl", (later - 100 * 86400,) * 2)
+        t = await sweep(sf, datetime.now(UTC) + timedelta(days=99), datetime.fromtimestamp(later, UTC))
+        held = len(os.listdir(user_root.parent / ".purged-agents" / user_root.name))
+        print("A", state(["old.txt", "tpl", "pre.txt", "AGENT_NOTES.md", "MEMORY.md", ".hidden"]), "files", t.files_removed, "dirs", t.dirs_removed, "held", held, "failed", t.failed)
+        put("restored.md", 200, time.time())
+        t = await sweep(sf, B236, datetime.fromtimestamp(later, UTC))
+        print("B", state(["restored.md"]), "files", t.files_removed, "failed", t.failed)
+        (user_root / "shared").mkdir()
+        out = []
+        for raw in ("20261201", "2099-01-01", datetime.now(UTC).date().isoformat()):
+            when, problem = parse_shared_delete_after(raw)
+            sweep_shared(str(root), delete_after=when, now=datetime.now(UTC), tally=AgentRootTally())
+            out.append(raw + ":" + ("invalid" if problem else "kept" if (user_root / "shared").exists() else "gone"))
+        print("C", " ".join(out))
+    finally:
+        await engine.dispose()
+        shutil.rmtree(root)
+        print("cleaned", not root.exists())
+asyncio.run(main())
+' 2026-10-30T23:48:00+08:00
+```
+
+- [ ] **98.3**(并入 98.1,CronJob 的真值随 overlay 下发)
+- [x] **98.4 `T` 之后的老 mtime 不删(真 NAS)**:在一个测试用户的某个 agent 根下放 `restored.md` 并 `touch -d '200 days ago'`(用户批准),再触发一次作业 → `restored.md` 还在(ctime 是今天、在 `T` 之后)。删掉它 **11-06 测试 `da1f50934` 过**
+- [x] **98.5 版本:有副本的内容不另留**:在对话视图会话里让智能体往 `/agent/report.md` 写一份并登记成产物 → 版本区里没有这份内容的版本;再让它改一次 `report.md`(不登记)→ 版本区出现 `report.md` 的版本 **11-06 测试 `da1f50934` 过**
+- [x] **98.6 版本:不见满 30 天由作业删**:挑一个有版本的 `/agent` 文件,删掉源文件,跑一次作业 → 它的版本目录里出现 `missing`;把 `missing` 内容改成 31 天前的时间戳(mtime 保持今天,用户批准)再跑 → 版本目录已删,日志 `agent_file_version_dirs_dropped` ≥ 1 **11-06 测试 `da1f50934` 过**(`agent_file_version_dirs_dropped=1`)
+- [ ] **98.7 版本:90 天封顶**:测试数据没有满 90 天的版本时跳过并注明;有的话判据是只剩最新 3 份 + 不满 90 天的 **11-06 测试 `da1f50934` 跳过**(测试环境没有满 90 天的版本)
+- [x] **98.8 `shared/` 的作业接线**:probe job 设 `SHARED_DELETE_AFTER=20261201` → 所有 `shared/` 还在、`retention.config_invalid env=EXPERT_WORK_RETENTION_SHARED_DELETE_AFTER`、退出码 3,agent 根那条照跑(gate 行 `cutover=2026-10-30T23:48:00+08:00`);设 `2099-01-01` → 还在、gate 行 `shared_delete_after=2099-01-01`、退出码 0。真删由 98.2 场景 C 验。另找一个用户根下没有 `shared/` 的测试用户(只读 `ls`),在他的会话里跑一轮带 `bash ls /workspace` 的对话:正常(没有 `shared` 挂载、不报错),`read_file('shared:x')` 回「不存在」 **11-06 测试 `da1f50934` 过**(`shared/` 前后都是 14 个)
+- [x] **98.9 生产发布单**:`EXPERT_WORK_RETENTION_AGENT_ROOT_CUTOVER=2026-11-04T19:10:00+08:00` 已在 prod overlay,随 `release.sh prod` 下发,不用手设(发完用 98.1 的 `jsonpath` 命令核一下)。发布当天、通知深护之后,给生产 CronJob 设 `kubectl set env cronjob/retention-cleanup EXPERT_WORK_RETENTION_SHARED_DELETE_AFTER=<发布日 + 30 天,YYYY-MM-DD>`(写进 `production-release.md`「下一班」;不进 git)。发完看第一晚的 `retention.agent_roots_gate` 那一行与 `agent_root_failed=0`。生产 2026-09-07 才开荒,第一批满 90 天的存量最早 12-06 才出现,在那之前 `agent_root_files_removed` / `agent_root_dirs_removed` 为 0 属预期 **11-06 测试 `da1f50934` git 里 prod overlay 值已核**
+- [x] **98.10 收尾**:删本节造的文件与 probe job;`.b284-probe/` 不在;租户配置恢复 **11-06 测试 `da1f50934` 过**
+
+**上生产前**:通知深护智康 —— 更新记录「Agent 级旧文件的清理」(行为变化,提前通知):B-236 之前写在 Agent 级(列表里 `session_id` 为 `null`)、之后没再改过的文件,顶层的满产物保留期、子目录在这个终端用户闲置满同样天数后删除,之后列表里没有、下载 404 `WORKSPACE_FILE_FAILED`;登记成产物的、B-236 之后改过的不按时间清理。更新记录随发布改日期。
+
+## §99 彻底删除与留存带走对象存储里的轨迹对象(B-285)
+
+> §95–§98 由别的条目占用(各自分支);都追加在文件末尾,合并时按编号排好即可。依赖 §94(B-280,同一条栈)。
+>
+> **B-286 是本节的发布前提**(`fix/b286-retention-job-object-store`):部署环境里留存作业的对象存储目前是 `memory`(解析不了控制面的 vault 引用),作业里所有对象存储 pass 都不跑 —— 本节新加的轨迹 pass 走的是作业既有的对象存储依赖(与图片 pass 同一个),没有它时完成日志写 `trajectories_skipped=True` 并打 warning `retention.trajectories_skipped reason=no_object_store`。B-285 必须与 B-286 同批发,否则删除之后才收尾的 run 写的轨迹、本修复之前删掉的对话留下的轨迹、老的平铺子智能体轨迹都**没有任何东西删**。99.1–99.4(控制面里的删除,控制面有真凭据)不依赖 B-286。
+
+**背景**:每个结束的 run 在对象存储里写一个轨迹对象 `trajectories/{租户}/{结果}/{YYYY}/{MM}/{DD}/{对话}.jsonl`,内容是整段对话(给评测候选与技能自动演化用)。此前**没有任何东西删它们**:删对话 / 删用户 / 彻底删除智能体都不删,留存不删,仓库里也没有桶生命周期;技能演化会按租户列出这些对象去蒸馏、回放第一句用户话,删掉的对话照样进模型。现在:
+
+- 三处彻底删除在删 run 行**之前**,按每个 run 的时间推出日期(`created_at` 到 `finished_at`,没收尾的用 `updated_at`,两头各放 1 小时;没有 run 行的对话按对话行自己的 `created_at` 到 `updated_at`;两样都没有的记 `trajectory_undatable`,不当删干净了)。每天的四种结果各一个单元、并发(最多 8 个):对话自己的键是确定的,**直接删**(不存在的键删除也算成功,所以响应里的数是「清掉的键」,不是「之前确实存在的对象」);只列 `…/{日期}/{对话}/`(它名下子智能体的对象)并逐个删。删不掉:删对话回 503、对话留着;删智能体算失败(409 `AGENT_PURGE_INCOMPLETE`);删用户进 `failures.trajectory`、该对话留着。三处都在删完对话行后,再扫一遍「今天」(还在收尾的 run 此刻写的那一份),失败只记日志。
+- 子智能体的轨迹键改成 `…/{日期}/{所属对话}/{子线程}.jsonl`(原来平铺在 `{子线程}.jsonl`,找不到所属对话)。
+- 留存作业新加一条:到期(对象日期早于今天减租户 `upload_retention_days`,没设用平台默认 90)与孤儿(所属对话的 `thread_meta` 行已不在,包括本修复之前删掉的对话、之前平铺的子智能体对象)都删。按页列,删成功 `batch_size` 个就停止往下列(剩下的第二天接着删,info 日志 `retention.trajectories_capped`);删失败不占这个额度,另有 50 次失败上限,到了就停、这一轮记失败(进程非 0 退出)。键的识别是严格的(只认这套代码自己能写出来的形状),认不出的不动。完成日志多六项:`trajectories_expired` / `trajectory_orphans_removed` / `trajectories_failed` / `trajectories_scanned` / `trajectories_capped` / `trajectories_skipped`。
+- 技能演化按结果列出的轨迹只用对话还在的。
+
+**事件归档不处理**:`event_log` 冷归档(`event-log-archive-job`)归档的是 `event_log` 表,生产上没有任何代码写这张表(B-278 已核),归档里没有对话内容。
+
+**怎么进**:测试环境控制台(system_admin,平台租户)建临时智能体 `acc-b285`(带一个子智能体,任务里让主智能体委派一次);对象存储运维侧只读列桶(`trajectories/<平台租户>/`);数据库只读连接。留存作业手动触发 `kubectl create job --from=cronjob/retention-cleanup b285-probe-<n>`。**花费**:约 ¥1。
+
+- [ ] **99.1 写入**:`acc-b285` 开会话 A、B,各跑一轮(A 里触发一次委派)。判据:桶里有 `trajectories/<租户>/success/<今天>/<A>.jsonl`、`…/<B>.jsonl`,以及 `…/<今天>/<A>/<子线程>.jsonl`(子智能体那份在 A 名下);**没修好时**:子智能体那份平铺在 `<今天>/<子线程>.jsonl`。 **11-06 测试 `da1f50934` 主线过、子智能体部分不过**:主对话轨迹在;子智能体轨迹根本没写(control-plane 从未给 `ToolEnv.trajectory_recorder` 赋值,自 J-21 起)→ B-289,不是 B-285 回归
+- [x] **99.2 删对话**:控制台彻底删除会话 A。判据:200,`trajectory_undatable` = 0,`trajectories` ≥ 1(数的是清掉的键:每天 4 个自己的键 + 子智能体对象数);桶里 A 的两份都不在,B 的在。 **11-06 测试 `da1f50934` 过**
+- [x] **99.3 删用户**:对外接口用临时用户 `u-b285` 在 `acc-b285` 开会话 C 跑一轮,然后 `POST /v1/users/<id>:purge`。判据:200,`deleted.trajectory` ≥ 1,没有 `deleted.trajectory_undatable`,`failures` 为空;桶里 C 的那份不在。 **11-06 测试 `da1f50934` 过**
+- [x] **99.4 彻底删除智能体**:删除并彻底删除 `acc-b285`。判据:200;桶里 B 的那份不在。 **11-06 测试 `da1f50934` 过**
+- [x] **99.5 留存补扫存量(B-286 同批上线后才能验;B-286 没上不算过,记「阻塞:待 B-286」)**:跑留存作业前,只读预数整个 `trajectories/` 前缀(作业扫的是所有租户,不只平台租户)下的对象,**只打印数字**(脚本读对象只为看 `metadata` 里有没有某个键,不打印任何内容 / 键名 / id):① 总数;② 到期的(键里的日期早于今天减该租户 `upload_retention_days`,没设按 90);以下两类都**不含**到期的:③ 老的平铺子智能体键 —— 平铺键 `…/{日期}/{线程}.jsonl`、`thread_meta` 里没有这个线程,且对象第一行 JSON 的 `metadata` 里有 `child_depth`(只有子智能体的 run 写这一项;对话本身的 run 只可能写 `retried`);④ 已删对话的键 —— 所属对话在 `thread_meta` 里没有的其余键(平铺键里 `metadata` 不带 `child_depth` 的,加上 `…/{日期}/{对话}/{子线程}.jsonl` 里对话不在的)。**别用 `agent_run` 去分 ③ / ④**:彻底删除连 run 行一起删,删掉的对话在 `agent_run` 里同样查不到,会全被算进 ③。命令随发布单给出。跑一次。判据:完成日志 `trajectories_skipped=False`(为 `True` 即不过 —— 说明作业没连上对象存储,「计数为 0、没报错」不能当通过)、`trajectories_failed=0`、退出码 0;没封顶(`trajectories_capped=False`)时 `trajectories_scanned` = ①、`trajectories_expired` = ②、`trajectory_orphans_removed` = ③+④;②+③+④ 超过 `batch_size` 时 `trajectories_capped=True`、`trajectories_expired + trajectory_orphans_removed` = `batch_size`,第二天接着删;还在的会话的对象都在。**上生产前**先在生产只读统计同样四个数(只数字),写进发布单(第一次跑会删掉所有已删对话留下的轨迹和全部老的平铺子智能体轨迹)。 **11-06 测试 `da1f50934` 过**:预数 总 6188 / 到期 6 / 平铺子智能体 0 / 已删对话 89;`b286-probe-1`:`trajectories_scanned=6188 expired=6 orphans_removed=89 capped=False skipped=False failed=0`,退出码 0
+- [x] **99.6 技能演化**:单测覆盖(`test_skill_evidence_provider.py`:删掉的对话的轨迹不进蒸馏证据、不进回放、取够了就不再往下查),真栈记「单测覆盖」。 **11-06 测试 `da1f50934` 单测覆盖**
+- [x] **99.7 收尾**:删本节建的会话、用户与 probe job。 **11-06 测试 `da1f50934` 过**
+
+## §100 留存作业用上 control-plane 的对象存储(B-286)
+
+**叠在 B-283 上(硬前提)**:本 PR 的分支基于 B-283(`feat/b283-image-last-use`,§95),PR 的 base 是 B-283 的分支,B-283 合入 main 之后本 PR 再改 base 到 main 合入;不会单独发。原因:本节上线后,作业第一次真的删图片字节;没有 B-283 时,会话里引用的图片字节一旦被删,之后**这个会话的每一轮**都会因 `ObjectNotFoundError` 失败。B-283 让多模态适配器遇到已删的图片换成一句文字、那一轮照常跑(计数 `expert_work_upload_images_degraded_total`)。图片 pass 的到期谓词(最后使用 + 租户 `upload_retention_days`)来自 B-283;本节只改用哪个对象存储、以及字节删不掉时行怎么处理。
+
+**背景**:留存作业(CronJob `retention-cleanup`)此前只认 `EXPERT_WORK_RETENTION_OBJECT_STORE_*`(默认 `memory`、要明文 AK/SK),而 envFrom 带进来的是 control-plane 那套 `EXPERT_WORK_OBJECT_STORE_*`:AK/SK 是 `secret://` 引用,只有 control-plane 经 `sql_encrypted` 金库解得出来。于是作业一直跑在 `memory` 上,`image_upload` 那条 pass 在测试 / 生产**是 no-op:到期的行没删,OSS 里的字节也没删**。积压的是「行 + 字节」两样。本次作业用同一套配置和同一份代码解引用:`resolve_object_store_config` 移到 `expert_work.runtime.storage.config`,`SqlEncryptedSecretStore` 移到 `expert_work.runtime.secret_store.sql_encrypted`(control-plane 原路径照旧可 import,行为不变)。每轮日志一行 `retention.object_store backend=… source=shared available=…`。
+
+- 解不出来(KEK 缺 / 不对、密钥行不在、配置不全或取值不合法、客户端建不起来)**不崩**:这一行 `available=false error=<异常类型>`,图片 pass 跳过(行不动)并记 `failed_passes=images`,其余 pass 照跑,退出码 3。
+- 个别图片字节删不掉(无权限、对象锁、限流):**只删字节已经没了的行**(键本来就不在也算删掉 —— S3 / OSS / MinIO 的 DeleteObject 对不存在的键返回成功),删不掉的行留到下一轮;一行汇总日志 `retention.image_object_delete_failed keys_failed=… keys_ok=… errors=<异常类型:条数>`(不打键、不逐条打堆栈),`images` 进 `failed_passes`,退出码 3。此前是行照删、字节留在桶里永远没人认领。没有「放弃」上限:永远删不掉的行每晚重试(放弃只能删行丢字节,正是要避免的)。
+- 显式设了 `EXPERT_WORK_RETENTION_OBJECT_STORE_BACKEND` 的照旧走作业自己那套(明文 AK/SK,本地用);只设了别的 `EXPERT_WORK_RETENTION_OBJECT_STORE_*` 没设 `…_BACKEND` 时它们不生效,日志 `retention.object_store_override_ignored vars=…` 只列变量名。
+
+**退出码 3 不会触发任何告警**:仓库里 Prometheus 只抓 control-plane,没有 kube-state-metrics,也没有 Job 失败的告警规则;日志进阿里云 SLS,但没配 SLS 告警;smoke 不看留存作业。失败只体现在 Job 状态(Failed)和日志里。
+
+**运维要做的**:发布本身无操作。作业与 control-plane 同一个镜像、同一个 DSN(同一个库角色,读得到 `encrypted_secret`)、envFrom 同一份 `control-plane-config` / `control-plane-secrets`(里面已有 `EXPERT_WORK_OBJECT_STORE_*`、`EXPERT_WORK_SECRET_STORE_BACKEND=sql_encrypted`、`EXPERT_WORK_SECRET_ENCRYPTION_KEY`),不加 env / secret / 授权,k8s 只改了 `cronjob.yaml` / `kustomization.yaml` 的头注释。集群里没有 NetworkPolicy,作业 Pod 访问 OSS 内网端点与 control-plane 相同。**建议(运维项,不在本 PR 内,要用户批准再建)**:在 SLS 上给留存作业的日志加两条告警 —— `retention.object_store` 且 `available=false`;`retention.passes_failed`(任一 pass 失败,也覆盖 B-63 的上传 pass)。没有它们,作业失败只能靠人看 Job 状态。
+
+**回滚注意**:回滚后作业退回 `memory`,图片 pass 又变回 no-op —— 行和字节都不动(与本次之前相同,无副作用);本次已删掉的行和字节不会回来。
+
+**怎么进**:测试环境控制台(system_admin,平台租户);库只读查询;`kubectl` 只读 + 手动起 job。**花费**:约 ¥0.2(一轮带图对话 + 一轮不带图)。
+
+- [x] **100.0 前提**:本 PR 叠在 B-283 上,发布提交天然包含 B-283;发前仍核一次:`git merge-base --is-ancestor <B-283 合入提交> <发布提交>` 为真,且 §95.1 的迁移已到位。不满足就**不要**做 100.2,也不要发生产。 **11-06 测试 `da1f50934` 过**
+- [x] **100.1 作业认出对象存储**:发布后手动起一次:`kubectl -n expert-work create job --from=cronjob/retention-cleanup b286-probe-1`,等完成,看日志。判据:有且只有一行 `retention.object_store backend=s3-compatible source=shared available=true bucket=expert-work-test`;`retention_cleanup_job.done … failed_passes=-`(或只有与本节无关的项);没有 `retention.image_object_delete_failed`;退出码 0;日志里没有 AK / SK / `secret://`。**没修好时**:没有这一行,或 `available=false`,或 `image_keys_ok` 永远是 0。 **11-06 测试 `da1f50934` 过**(`available=true bucket=expert-work-test`,`failed_passes=-`,日志无密钥)
+- [x] **100.2 到期图片的字节真的删了**:在控制台(调试台)新开一个会话,上传一张图片并带着它发一轮(「这张图里有什么」),run 正常完成;响应里的 `image_ref` 带图片 id。只读查 `SELECT id, object_key, created_at, deleted_at FROM image_upload WHERE id = '<图片 id>'` 记下 `object_key`,在阿里云 OSS 控制台(`expert-work-test` 桶 → 文件管理,按 `object_key` 前缀搜)确认对象在。然后让它到期,二选一:① 控制台删掉这张图(`DELETE /v1/uploads/<图片 id>`,软删的行下一轮不论年龄都回收)—— 不改库,优先用;② 测试租户的附件保留期设 7 天(B-283 起图片与附件同一个天数),用户批准后把这一行的 `created_at`、`last_used_at`(有值时)与该会话全部 run 的 `created_at` 都改到 8 天前(到期 = 三者最晚 + 天数,见 §95)。再起一次 job(`b286-probe-2`)。判据:日志 `image_rows≥1 image_keys_ok≥1 image_keys_failed=0`;`image_upload` 里这一行没了;OSS 控制台里这个对象**不在了**(`image_keys_ok` 只说明删除请求成功,对象本来不在也会成功,所以要看桶);退出码 0。 **11-06 测试 `da1f50934` 过**(走 ①,在 pod 里用同一配置只读 get 确认对象前在后不在)
+- [x] **100.3 字节删掉后同一会话还能继续**:在 100.2 那个会话里再发一轮纯文字(「刚才那张图是什么颜色」)。判据:run 正常完成(不是 failed),回复里说明图片已不可用之类;control-plane 日志里这一轮没有 `ObjectNotFoundError` 的 Traceback;Prometheus `expert_work_upload_images_degraded_total` 增加 ≥ 1。**没带 B-283 时**:这一轮失败,报 `ObjectNotFoundError` —— 这时停止发布。 **11-06 测试 `da1f50934` 过**(`expert_work_upload_images_degraded_total` 0→1;需落到没缓存的 pod,见 B-291)
+- [x] **100.4 删除失败时行留着**:真栈不造故障(要改桶策略 / 对象锁),由单测覆盖(`services/retention-cleanup-job/tests/test_job_unit.py::test_delete_expired_images_keeps_rows_whose_bytes_were_not_deleted`:一个键删不掉 → 那一行留着、其余行删掉、`failed_passes=images`、一行汇总日志不含键)。记「单测覆盖」。 **11-06 测试 `da1f50934` 单测覆盖**
+- [x] **100.5 收尾**:删 probe job;若用了 ②,租户附件保留期设回原值;删 100.2 的会话。 **11-06 测试 `da1f50934` 过**
+
+**生产(用户执行,随发布之后)**:先确认 100.0(生产发布包含 B-283;两者同一次发布)。发布后第一晚(03:23)的作业日志看两行:`retention.object_store … available=true bucket=expert-work-prod` 与 `retention_cleanup_job.done … image_keys_failed=0`;第一晚会把此前积压的到期图片(行和字节)一次清掉(每轮上限 `EXPERT_WORK_RETENTION_BATCH_SIZE`,默认 10000 行,多的后几晚接着清)。若出现 `available=false error=…` 或 `retention.image_object_delete_failed`,把那一行贴回来(只有计数与异常类型,不含密钥、不含对象键)。第二天看一眼 Prometheus `expert_work_upload_images_degraded_total`:有增长说明有会话引用了被清掉的图片且照常继续了;同时 control-plane 日志里不应出现图片相关的 `ObjectNotFoundError`。
+
+## §101 MCP 服务建连失败后自动重拨(B-292)
+
+**背景**:池构建时某个远端 MCP 服务连不上,以前只记 `tenant_mcp_pool.server_build_failed` 就跳过,缺了它的池照样缓存 1800 秒 —— 这段时间里该副本上这个服务的工具都没有。现在池在后台只重拨失败的那几个服务(不占构建锁),60 秒起、之后每 120 秒,直到池过期;拨通后并入池(期间池被重建 / 配置变了就作废),日志 `failed_server_recovered`。用户 OAuth 池同理,重拨前重读连接与目录行(期间被关掉的连接器不会被接回);重拨里的令牌刷新不随关机被掐断。
+
+**怎么进**:测试控制台建临时 MCP 服务配置 + 临时智能体 + 临时 API key;临时 MCP 服务端起在集群里(一个工具 `probe_echo`);run 固定打到同一副本(`kubectl exec` 进该 pod 走 localhost)。智能体开着回复缓存时每轮用不同的提示词,否则同一句话会直接重放上一轮的回答。**花费**:几轮短对话,< ¥1。
+
+- [x] **101.1 断开后自动接回**:让服务端不可达后改一下配置(逼各副本重建池),发一轮 → 日志 `server_build_failed`、模型答「没有这个工具」;恢复服务端,约 70 秒后同一副本再发一轮。判据:`failed_server_recovered` 在失败后约 60 秒出现;这一轮工具在、调用成功、run `success`;配置没再改。**没修好时**:1800 秒内一直缺。 **11-07 测试 `fb03a0689` 过**(两轮:失败→恢复 60.05 s / 60.06 s,随后 run 在失败后约 71 s 注册到工具并调用成功,7 s 完成;对照:同条件下旧镜像 `da1f50934` 服务恢复后 160 s 仍缺)
+- [x] **101.2 收尾**:删临时服务端、MCP 配置、智能体、key、会话与终端用户。 **11-07 测试 `fb03a0689` 过**
+
+## §102 对外发起被拒不留空会话(B-293)
+
+**背景**:`run_agent_for_user` 先解析会话(首次见到的终端用户 + 新会话行),再查配额、构建、解析 `files[]`、参数上限;以前后面任一步拒绝都留下一段空会话。现在本次请求新建的会话在被拒时撤回(该会话已有 run / 别的请求的上传时不撤);上传端点同理。终端用户行保留(首次见到即登记,是设计)。
+
+**怎么进**:对外 key(测试用 release-canary 的 key 即可),每个用例用一个新的 `user_id`;只读计数该终端用户的 `thread_meta` / `user_upload` 行。**花费**:一轮短对话。
+
+- [x] **102.1 被拒不留会话**:新用户、不带 `session_id`,`files:[{"upload_id":"upl_<不存在>"}]` 发一轮;另一个新用户在上传端点传一个不支持的类型。判据:分别 404 `UPLOAD_NOT_FOUND`、400 `INVALID_UPLOAD`(与修复前相同);两人会话数都是 0、上传行 0。**没修好时**:各多一个空会话(11-06 §97.3 即如此)。 **11-07 测试 `fb03a0689` 过**
+- [x] **102.2 正常仍建一个**:新用户正常发一轮 → 200 `success`,会话数 1;同一用户再按 102.1 发一次被拒 → 404,会话数仍 1。 **11-07 测试 `fb03a0689` 过**
+- [x] **102.3 收尾**:删会话、清理终端用户。 **11-07 测试 `fb03a0689` 过**
+
+## §103 MCP 服务连上后断开不再 500(B-294)
+
+**背景**:智能体的远端 MCP 服务先连上、后掉线时,池里缓存的客户端还在;下一次构建(构建缓存未命中:改了智能体、构建过期、B-292 接回服务后清构建等)在 `register_mcp_tools` 里调 `list_tools()`,客户端重连也连不上,异常一路冒到 `run_agent_for_user` → `get_agent` → `build_tool_registry`,整轮 HTTP 500(11-07 测试 `fb03a0689` 实测:副本连上后关掉服务端,紧接着两轮都 500)。现在:
+
+- 只有「连不上 / 会话断了」这一类错误跳过这台服务:`MCPSessionBrokenError` 等 `ConnectionError`、超时(含比 `timeout_s` 还慢的 `list_tools`)、httpx 传输错误、网关回的 5xx、anyio 流断、SSE 对端刚死时 SDK 给挂着的请求的 `McpError(-32000 Connection closed)`;SDK 包在 `ExceptionGroup` 里的,要求组里每一个都是这一类。这一轮没有它的工具、run 照常跑,warning 日志 `mcp.server_unreachable_skipped server=<名字> err=<异常类型>`(不打 URL / 令牌 / 异常文本)。别的错误(编程错误、401/403、对端回的其它 `McpError`、取消)照旧抛出。四个池(运维文件池、平台共享目录、租户、用户 OAuth)走的是同一个函数。同一次构建里已经跳过的服务,后面的 `mcp` 条目不再拨。
+- 跳过了服务的构建在构建缓存里**只留 60 秒**(`DEGRADED_BUILD_TTL_S`,主智能体与子智能体两份缓存都是),info 日志 `control_plane.build_cached_short reason=mcp_server_skipped ttl_s=60`。60 秒内的 run 复用它(不重新构建、不重拨);过了 60 秒下一次构建重新 `list_tools`,池里同一个客户端自己重连(B-177),服务回来了工具就回来,不用等池 TTL(1800 秒)。B-292 的重拨不管这种情况(它只管池构建时没连上的服务,这里客户端一直在池里)。
+- 代价:服务一直断着的时候,每 60 秒(每个智能体、每个副本)重新构建一次、重拨一次。对端拒绝连接 / 网关回 5xx 时很快;对端「接了不回」时那一次构建多等一个 `timeout_s`(修之前每轮都等,而且等完 500)。
+- 平台服务掉线时名字照旧由平台占着,同名的租户服务不会顶上来;绑在掉线服务上的参数绑定不报「工具不存在」。保存时的试建碰上连不上的服务照常保存,`build_warning` 里多一句 `MCP server(s) could not be reached during this save check, so their tools and arg_bindings were not checked: <名字>`。
+
+**怎么进**:同 §101(测试控制台建临时 MCP 服务配置 + 临时智能体 `acc-b294` + 临时 API key;临时 MCP 服务端起在集群里,一个工具 `probe_echo`;run 固定打到同一副本,`kubectl exec` 进该 pod 走 localhost)。每轮用不同的提示词(避开回复缓存)。**花费**:几轮短对话,< ¥1。
+
+- [ ] **103.1 连上后断开,这一轮不 500**:服务端在线时先发一轮,确认调到 `probe_echo`(该副本已连上);关掉服务端;改一下 `acc-b294` 的提示词(只改智能体,**不改** MCP 配置,池不重建、坏客户端还在池里)。保存响应的 `build_warning` 里有 `could not be reached during this save check … <服务名>`(保存时的试建也跳过了它)。同一副本再发一轮。判据:HTTP 200、run `success`,模型答没有这个工具 / 调不了;该 pod 日志有 `mcp.server_unreachable_skipped server=<服务名> err=<类型>` 与 `control_plane.build_cached_short reason=mcp_server_skipped`;这两行里没有 URL、令牌、异常文本。**没修好时**:HTTP 500(11-07 即如此)。
+- [ ] **103.2 还断着,60 秒内复用、过了再试**:不恢复服务端、不改任何配置。103.1 那一轮之后 60 秒内同一副本再发一轮:200 `success`,日志里**没有**新的 `mcp.server_unreachable_skipped`(复用了缓存的构建,没重拨)。等到 103.1 那一轮之后 60 秒以上再发一轮:200 `success`,有一行新的 `mcp.server_unreachable_skipped`(重新构建、重拨了一次)。记下这一轮的耗时,与服务端在线时的一轮比,多出的应在 1~2 秒内(拒绝连接很快)。**没修好时**:500。
+- [ ] **103.3 服务回来,60 秒内工具回来**:恢复服务端,**不改配置**,记下恢复时刻。之后每 20 秒左右同一副本发一轮,直到调到 `probe_echo`。判据:最晚在上一次 `mcp.server_unreachable_skipped` 之后 60 秒(加一轮的间隔)调到 `probe_echo`、调用成功、run `success`;在此之前的轮次可以还没有这个工具(复用的是 60 秒内缓存的构建),但都是 200;调到之后的那次构建日志有 `mcp.session_restarted`、没有 `build_cached_short`;再过 60 秒以上发一轮仍调得到(完整的构建按正常 TTL 缓存)。**没修好时**:先是 500;只修跳过、构建按正常 TTL 缓存时,工具缺到构建缓存过期(30 分钟)。
+- [ ] **103.4 收尾**:删临时服务端、MCP 配置、智能体、key、会话与终端用户。
+
+## §105 对话里的附件可预览、可下载;对话页产物与对话同一个可见范围(B-295)
+
+**背景**:对话详情页(对话 / 轨迹 / 工作区)和调试台里,用户气泡下的附件原来只是一个不能点的标签(如 `微信图片_20261107135228_3352_6.jpg`)。现在点标签:图片在弹窗里预览,PDF 内嵌预览,txt / md / csv 以文本预览(最多显示前 200 KB),弹窗里都有「下载」;Word / Excel / PPT 等浏览器不能安全显示的类型,点了直接下载(标签上提示「此类型不支持预览，点击下载」)。文件已被留存清理或删掉时,弹窗显示「文件已过期或已删除」,不是报错或裂图,对话照常显示。下载另存的文件名取服务端 `Content-Disposition` 里存储的名字(不是标签上的名字:标签来自消息,对接方能影响)。
+
+**谁能看(用户 11-07 拍板)**:附件、以及对话页每一轮的产物下载(`GET /v1/sessions/{id}/workspace/artifacts/{name}/download`),都与对话本身同一个可见范围 —— 能读这段对话(`session:read`,对话列表 / 详情同一道闸,viewer / operator / admin 都有)的员工都能打开。产物下载原来只有本人或租户管理员,本次一并放宽 —— 但**非主人只拿得到这段对话自己产出的那一版**:产物按「主人 + 智能体 + 名字」找,会跨到主人别的对话(没绑智能体的会话跨到所有智能体,已删对话的产物也在);下发的那一版(指定的版本,不指定就是最新版)的 `created_in_thread` 必须是这段对话某个 run 的 id(子智能体 / worker 登记的是父 run 的 id,也算),否则 404。主人与租户管理员照旧。非主人下载不算「使用」,不延长产物留存;响应带 `Cache-Control: private, no-store`。仍只限控制台(对外 API key 被拒)、按租户隔离、系统管理员带 `tenant_id` 跨租户(跨租户本身照旧记审计)。**不是对话主人的人**读到内容时,审计里记一条 `user:data_view`(`resource_id` = 对话主人,`details` 只有 `view`=`conversation_attachment` / `conversation_artifact` 与 `thread_id`,不含文件名 / 产物名);读失败(过期、不存在)不记。
+
+**接口**:`GET /v1/sessions/{thread_id}/attachment?ref=<标签的值>[&tenant_id=]`。`ref` 是消息里原样的值 —— 图片 `expert_work://image/…`(按本租户 `image_upload` 登记行找,行必须属于这个会话,字节从行里的对象键读),文档 `uploads/<文件名>`(服务端在对话主人的工作区里解析,客户端给不了路径)。新布局(`threads/<会话>/work/uploads/…`)的文档先看本会话同名的 `user_upload` 登记行:有登记行、但全都删了 → 过期(留存先软删行、字节可能晚一点才删,行一删就算过期);一条登记行都没有 → 按路径给(B-281 之前控制台上传 / 跨会话复制从不登记,生产 11-04 起就有这样的对话;路径由服务端拼在本会话自己的目录里),文件在就给、不在就过期;老布局(agent 根 `uploads/…`,同一用户同一智能体的各对话共用、本来就不登记)只按路径。
+
+- 410 `ATTACHMENT_GONE`:图片行不在 / 已软删 / 不属于本会话 / 字节不在;文档同名登记行都已删、文件不在、不是文件、整个对话目录已被清理(B-282)、路径被符号链接拦下。
+- 409:读的过程中文件变了(再点一次)。500:权限 / 对象存储读不动。503:工作区服务连不上(固定文案 `attachment content unavailable`)。413:超过下载上限。
+- 返回头:`X-Content-Type-Options: nosniff`、`Cache-Control: private, no-store`、`Content-Disposition` 带 `filename*=UTF-8''…`;图片按登记的 MIME(只认 png / jpeg / webp / gif),PDF 只有字节以 `%PDF-` 开头才是 `application/pdf`,md / csv 按 `text/plain`,HTML / SVG / 未知类型一律 `attachment`。预览只看这个返回类型,不看文件名。整份读进内存再发(同 `…/workspace/file`)。控制台查看不算「使用」,不延长留存。
+- **已接受的残余风险**:PDF 用同源 `blob:` iframe 内嵌,不加 `sandbox`(加了 Chrome 自带阅读器打不开);blob 固定按 `application/pdf` 交给浏览器阅读器。
+
+**怎么进**:测试控制台,对话主人账号(operator)+ 同租户另一个 viewer 账号 + 一个没有任何角色的账号 + system_admin;一个开着看图模型的智能体;只读查审计(控制台「审计」页或库)。浏览器开发者工具看网络请求。**花费**:约 ¥0.3(两轮短对话)。
+
+- [ ] **105.1 图片预览 / 下载**:调试台新开会话,上传一张 jpg 发一轮(「这张图里有什么」)。在调试台点用户气泡里的图片标签,再到对话详情页同一会话点一次。判据:两处都弹窗显示原图;请求是 `GET …/attachment?ref=expert_work%3A%2F%2Fimage%2F…`,200、`Content-Type: image/jpeg`、`nosniff`、`Cache-Control: private, no-store`、`inline; filename=…; filename*=UTF-8''…`;点「下载」存下的文件能打开,文件名是 `<图片 id>.jpg`;关掉弹窗再开不报错。刷新对话详情页(历史轮,标签名是图片 id)同样可预览。**没修好时**:标签点了没反应,或接口 404(路由不存在)。
+- [ ] **105.2 PDF**:同一会话上传一份 PDF(中文文件名)发一轮,点标签。判据:弹窗内嵌显示 PDF(浏览器自带阅读器),`Content-Type: application/pdf`;下载的文件名是存储的名字(与上传名相同,同名不同内容时带 `-<8 位>` 后缀)。**没修好时**:不能点,或 `application/octet-stream` 导致空白 / 直接下载。
+- [ ] **105.3 txt**:上传一个 UTF-8 中文 txt 发一轮,点标签。判据:弹窗里显示文本、中文不乱码;`Content-Type: text/plain; charset=utf-8`。再传一个 > 200 KB 的 txt:只显示前 200 KB,上方提示「仅显示前 200 KB，完整内容请下载」,下载得到完整文件。**没修好时**:不能点,或整份大文件塞进页面卡顿。
+- [ ] **105.4 docx**:上传一个 docx 发一轮。判据:标签悬停提示「此类型不支持预览，点击下载」,点了直接下载(不弹窗),文件能用 Word 打开;响应 `application/octet-stream` + `attachment`。**没修好时**:不能点;或弹窗里试图渲染。
+- [ ] **105.5 过期 / 已删除**:① 图片:控制台删掉 105.1 的图片(`DELETE /v1/uploads/<图片 id>`,行变软删);② 文档:在调试台工作区面板删掉 105.3 的 txt 和 105.4 的 docx(或 `DELETE /v1/sessions/<会话>/workspace/file?path=threads/<会话>/work/uploads/<文件名>`)。再分别点这三个标签。③ 登记行:只读查 `SELECT deleted_at FROM user_upload WHERE thread_id='<会话>' AND ref='uploads/<105.2 的存储名>'`,若测试租户允许改库(用户批准),把这一行 `deleted_at` 设成现在(字节不动),再点 105.2 的 PDF。判据:接口 410 `ATTACHMENT_GONE`,弹窗显示「文件已过期或已删除」,「下载」置灰(docx 也弹这个窗,不是静默无反应);对话其余内容照常显示。**没修好时**:裂图、报错提示、页面白屏,或删掉的图片仍能看到。
+- [ ] **105.6 同租户其他员工能看、并留审计**:用同租户 viewer 账号打开这段对话的对话详情页,点 105.2 的 PDF 标签,再点某一轮的产物下载按钮(没有产物就让智能体写一个文件再做)。再找对话主人**另一段**对话(同一智能体)里产出的产物名,用 viewer 的 token 请求 `GET /v1/sessions/<本会话>/workspace/artifacts/<那个名字>/download` → 404。判据:本会话的两者都 200 能看到 / 下载;别的对话的产物 404;只读查那一版 `artifact_version.last_used_at` 没有因 viewer 下载而变;审计里各多一条 `user:data_view`,`resource_id` 是对话主人的用户 id,`details` 为 `{"view":"conversation_attachment"|"conversation_artifact","thread_id":…}`,不含文件名;对话主人自己点不产生这类行。**没修好时**:viewer 得到 404(还是只给本人 / 管理员),或审计里没有这条 / 带了文件名。
+- [ ] **105.7 拒绝**:取 105.1 那条请求的 URL,① 用没有任何角色的账号 token 请求 → 403;② 用别的租户的普通账号 token、带 `tenant_id=<本租户>` → 403 `TENANT_NOT_ALLOWED`;③ `tenant_id=*` → 400;④ system_admin 在租户切换器切到本租户,打开对话详情页点图片标签 → 200 能看到,审计有 `user:data_view`;⑤ 把 `ref` 换成 `uploads/../x`、`../etc/passwd` → 400;⑥ 用一个有 read 权限的真实对外 API key 调这个接口和产物下载接口 → 403 `FORBIDDEN`(控制台平面不对 API key 开放)。**没修好时**:①②⑤⑥ 任一返回了文件内容。
+- [ ] **105.8 收尾**:删 105.1–105.6 的会话。
+
+**生产(随发布之后,用户执行)**:任找一个带图片 / PDF 附件的对话,在对话详情页点标签各一次,能预览、能下载即可;用一个非主人账号点一次,审计里看到 `user:data_view`。不需要额外配置。
+
+## §106 pptx 技能:套用已排好版的模板(B-296)
+
+**背景**:用户上传一份已经设计好的 10 页 PPT 当模板、要求按它出报告,一次运行 36 分钟,其中工具只占约 1.7 分钟:约 10 分钟是模型手写 6 个探查脚本摸模板结构(没用 `inspect_template.py`,它当时也只给形状名 / 类型),约 8 分钟首次填充,约 12 分钟是看图发现溢出后改一处、渲染一次地反复 5–6 轮。本次改平台 pptx 技能(只改技能包,不改镜像 / 后端):
+
+- `inspect_template.py 模板.pptx --texts`:每页列出所有带字的形状(含组合内、嵌套组合、表格单元格),带地址 `页:形状id[/组内id][@行,列]`、位置、预览、段数、生效字号(沿继承链)、autofit / 换行、按当前字号约能放几个汉字;图表 / SmartArt / 图片列为 `locked`。不带 `--texts` 时原有 `layouts` / `slides[].shapes` 输出不变。
+- 新 `fill_template.py 模板.pptx spec.json 成品.pptx`:按地址换字,保留段落格式和首个文字段的字号 / 颜色 / 粗细,其它形状逐字节不动;可复制 / 调序页,删页必须显式 `drop_unlisted`;地址不存在或改不了时整份不保存并一次列出全部问题;输出估计溢出的地址(估算,标明误差)。
+- 复制页(`duplicate_slide.py` 与 `slides` 模式共用)连同页面背景(含背景图)、切换效果、隐藏 / 不显示母版图形等页级设置一起复制;删页 / 调序后分节跟着更新(调序把一节拆散时每段连续的页各成一节)、被删的页从自定义放映里去掉,留下的页(含其备注)上指向被删页的链接(点击 / 悬停、整个形状或一段文字)连同关系一起去掉并在 `warnings` 里提示;有去不掉的引用时关系保留、提示「链接已失效」。
+- 读不了的形状只在那一条上报 `error`,不影响整页;同页重复 id 标 `ambiguous`、拒绝填;竖排、隐藏形状有标记;估不了的列进 `overflow_unknown`,接近放满的单列在 `near`(不用改短);`--texts` 为紧凑 JSON,超过约 18,000 字按整页截断并给出 `more`,照它的 `--slides` 接着看;`more` 放在 `slides` 前面,单页就超长时另标 `too_long`(去掉 `--full` 再看)。
+- SKILL.md「套用模板」改为四步:inspect → 写 spec 填值 → 一次改完所有溢出 → 渲染全部改动页、问题记全后一次改完。
+
+**怎么进**:测试控制台(system_admin,平台租户)建一个临时智能体(只绑平台 pptx 技能 + 沙箱,模型用测试常用主模型,能看图),在调试台跑。**模板用通用合成件,不用任何客户文件**:本机生成 `uv run --no-sync python -c "import sys; sys.path.insert(0, 'platform-skills/tests/in_image'); import _pptx_fixtures as f; f.build_designed_deck('通用模板.pptx')"`(6 页:占位符版式页、自由文本框页含混排字号与三种 autofit、组合 / 嵌套组合页、表格页含合并格、图表 + SmartArt + 图片页)。**花费**:4 轮带 PPT 的对话(改前 / 改后各 1 轮套模板 + 新建回归各 1 轮),按测试模型价目约几元。
+
+**固定提示词(改前改后逐字相同)**:上传 `通用模板.pptx`,发:「请用附件这个模板做一份《第三季度工作回顾》PPT,保持模板原有设计,只替换文字:第 1 页标题『第三季度工作回顾』、副标题『部门例会 · 2026 年 10 月』;第 2 页要点:『完成三项重点任务』,下面两条细节『上线新版服务流程,处理时长缩短 20%』『完成年度预算中期复核』;第 3 页把写着『标题文字』的那一行改成『客户满意度持续提升:季度调研平均分 4.6,较上季度提高 0.3 分,投诉量下降 15%』,『小标题』改成『关键数据』;第 4 页两个组合里的字分别改成『流程优化』『成本控制』;第 5 页表格第 2 行改成『服务流程 / 张三 / 已完成』;最后检查有没有文字溢出、重叠,有就改好再交付。」
+
+- [ ] **106.0 改前基线**:导入前(测试上仍是旧 pptx 技能)用上面的提示词跑一轮。在 Run 详情 / 轨迹面板记四个数:**总耗时**、**模型调用次数**、**探查脚本数**(交付前为了弄清模板结构而写的 python-pptx / 解 XML 脚本次数,不含技能自带脚本)、**修复轮数**(首份成品之后「改 → 再生成」的次数)。产物要能打开、模板设计保留。
+- [ ] **106.1 导入新技能**:本机 `uv run --no-sync python platform-skills/build.py --only pptx`;按 `platform-skills/README.md`「发布」一节:`export KUBECONFIG=~/.kube/expert-work-test.yaml`、`kubectl config current-context` 确认是测试集群、取 control-plane `POD`,先 `uv run --no-sync python platform-skills/import_in_pod.py bundle --dry-run platform-skills/dist/pptx.skill | kubectl -n expert-work exec -i "$POD" -- python3 -`。判据:一行 `name=pptx`、`status="dry-run"`、`would_create_version` = 当前版本 + 1。再去掉 `--dry-run` 正式导入。判据:`status=201`、`created=true`,随后一行 `{"invalidation": "published", ...}`(若是 `skipped`,按 README 处理:滚动重启 control-plane 或等 30 分钟,**不要重跑导入**)。
+- [ ] **106.2 改后同题对比**:新开会话,同一模板、同一提示词再跑一轮,记同样四个数。判据:轨迹里依次出现 `inspect_template.py … --texts` 与 `fill_template.py`;探查脚本数 ≤ 1;修复轮数 ≤ 1(第 3 页『标题文字』那一行是 28 磅、约放 19 个字的单行框,新句子明显超长,应在 `fill_template.py` 的 `overflow` 里一次报出并在首轮改短,而不是看图后才发现);总耗时比 106.0 至少少 40%;成品打开后第 4 页组合、第 5 页表格、第 6 页图表仍在原位且颜色字号不变,第 6 页图表文字没被声称改过。把两轮四个数并排记在本条下。
+- [ ] **106.2b 复制页保留设计**:同一会话追加「第 3 页这个版式再复制一页,写『补充说明』」。判据:成品里两页背景、切换效果相同(PowerPoint 或渲染图对比),`fill_template.py` 输出 `slides` 里出现两次 3。**没修好时**:复制出的那页背景变成母版默认、切换效果丢失。
+- [ ] **106.3 新建回归**:同一智能体新会话发「做一份 3 页的项目周报 PPT:封面、进度表、一页数据图」(不给模板)。判据:按 SKILL.md「新建」骨架出成品、`save_artifact` 登记、能打开、中文不是方块;耗时与导入前同类请求相当(没有误走 `fill_template.py`)。
+- [ ] **106.4 收尾**:删临时智能体与会话;技能新版本保留(要回退见 `platform-skills/README.md` 回滚一节)。
+
+**没修好时**:106.2 里模型仍先写多个 python-pptx / XML 脚本摸结构(≥ 2 个),或不调 `inspect_template.py --texts` / `fill_template.py`;或 `fill_template.py` 没报第 3 页溢出、要靠看图才发现;或修复轮数 ≥ 3;或总耗时没有明显下降;或成品里非目标形状被改动 / 模板设计丢失;或 106.3 新建出错、误用填模板脚本。出现任一条:不随下次发布带出,把对应轨迹(步骤与工具调用,不贴模板内容)贴回来。
+
+## §107 主模型坏了几秒内转备用,一轮内不来回切,熔断真的会开(B-297 PR1)
+
+**背景**:11-07 测试环境主模型连续约 1 小时回 5xx,每一步先在同一厂商重试 4 次(约 55 秒)才转备用,下一步又从坏掉的主模型开始,熔断从来没开。现在:
+
+- 后面还有别的模型组(备用)时:同厂商最多重试 1 次(≤1 秒抖动退避、单厂商 15 秒预算),`Retry-After` 超过 1 秒不等、直接转备用;流式调用的首 token 等待封顶 60 秒(估算上下文 >10 万 token 时 120 秒)。没有备用组(同一模型的其它 key 不算)时保持原来的 3 次指数重试和 180 秒首 token 下限。
+- 后面还有任何可试的(其它 key 也算)时:开着的熔断直接跳过、429 不原地重试;链路最后一个不被熔断拦。
+- 一轮里一旦由备用接手,后面的步骤直接从备用开始(新一轮回到主模型)。
+- 每次失败的上游尝试都计入熔断,连续 3 次(或 60 秒内 ≥5 次尝试失败率 ≥50%)打开,冷却 30 秒、连续重开翻倍到 300 秒;半开只放一个探活,探活在租期内(60 秒与这次尝试的首 token / 非流式整体超时取大)既没增量也没结束算失败;熔断打开前就已放行的调用晚到的成功不会把它关上。
+
+熔断状态每个 control-plane 进程一份(副本之间不共享),所以全部用例都要**固定打到同一个 pod**,并按顺序做(次数判据依赖该 pod 上这几个桩模型此前没被调用过;做乱了就重启该 pod 或换新的模型名从头来)。
+
+**怎么进(只在测试环境)**:
+
+- **故障桩**:在测试命名空间起一个临时 pod `b297-stub`(用 control-plane 镜像,自带 Python;不要临时从 Docker Hub 拉)+ ClusterIP 服务,端口 8080。它对任何 POST 按 `/tmp/mode` 回:`503`(默认,立刻回 503);`429`(回 429 + `retry-after: 40`);`hang`(收下请求、600 秒不回);`perkey`(Authorization 以 `k0` 结尾回 429、不带 retry-after,其余回 503)。每个请求打一行带时刻、模式和 key 末两位的日志。切模式:`kubectl exec b297-stub -- sh -c 'echo <模式> > /tmp/mode'`。脚本:
+
+  ```python
+  import http.server, os, time
+  class H(http.server.BaseHTTPRequestHandler):
+      def do_POST(self):
+          self.rfile.read(int(self.headers.get("content-length", 0)))
+          mode = open("/tmp/mode").read().strip() if os.path.exists("/tmp/mode") else "503"
+          key = self.headers.get("authorization", "")[-2:]
+          print(time.strftime("%H:%M:%S"), "POST", mode, "key", key, flush=True)
+          if mode == "hang":
+              time.sleep(600)
+              return
+          status = 503
+          if mode == "429" or (mode == "perkey" and key == "k0"):
+              status = 429
+          self.send_response(status)
+          if mode == "429":
+              self.send_header("retry-after", "40")
+          self.send_header("content-type", "application/json")
+          self.end_headers()
+          self.wfile.write(b'{"error":{"message":"stub"}}')
+  http.server.ThreadingHTTPServer(("", 8080), H).serve_forever()
+  ```
+- **临时智能体**(测试控制台),`base_url` 都是 `http://b297-stub.<命名空间>.svc:8080`,`provider: self-hosted`:
+  - `acc-b297`:主模型 `name: b297-stub`,备用一个测试环境可用的便宜聊天模型;
+  - `acc-b297-ra`:同上,主模型 `name: b297-stub-ra`(独立熔断键,107.5 用);
+  - `acc-b297-hang`:同上,主模型 `name: b297-stub-hang`(107.6 用);
+  - `acc-b297-solo`:只有 `b297-stub`,没有备用;
+  - `acc-b297-keys`:只有 `name: b297-stub-keys`,没有备用(107.8 用,那时平台给 `self-hosted` 配两把 key)。
+  - **全部**:不写 `memory.long_term`(不开长期记忆)、`policies.context_compression.enabled: false`(不自动压缩)、不写 `routing` 规则、不开计划 / 反思;关回复缓存或每轮换提示词。否则记忆 / 压缩这些后台调用会默认用同一家模型(即桩),多出 POST、提前喂熔断,次数判据全乱。
+  - 测试租户若解析不到 `self-hosted` 平台凭据,给本租户加一条 `self-hosted` 覆盖凭据(值 `dummy-k0`,桩不校验),收尾删掉。
+- **提示词**要让模型至少调一次工具再回答(例:「先列一下工作区里的文件,再告诉我有几个」),保证一轮有 ≥2 次模型调用。
+- run 用对外 key 发,`kubectl exec` 进同一个 control-plane pod 走 localhost;看该 pod 的日志和 `/metrics`,另开一个终端 `kubectl logs -f` 桩。**花费**:十来轮短对话全由备用模型回答,< ¥1。
+
+- [ ] **107.1 第一步几秒内转备用**:桩 `503`。`acc-b297` 发第 1 轮,记下 run 起止时刻。判据:这一轮的第一次模型调用,桩**正好收到 2 个** POST,间隔 ≤1 秒;pod 日志依次有 `llm_error_handling.retryable attempt=1 key=self-hosted:b297-stub … has_fallback=True retry_in_s=0.xx`、`attempt=2 … retry_in_s=none`、`llm_router.provider_failed`、`llm_router.sticky_set group=<备用 provider:model>`;从桩第一个 POST 到备用开始应答 ≤ 3 秒;run `success`,答案来自备用。**没修好时**:桩收到 4 个 POST,间隔 1 / 2 / 4 秒,这一步多花 7 秒以上(11-07 真实 5xx 时约 55 秒)。
+- [ ] **107.2 同一轮后面的步骤直接走备用**:看 107.1 那一轮。判据:第一步之后桩再没收到 POST;之后每次模型调用 pod 日志有 `llm_router.sticky_start from_group=self-hosted:b297-stub to_group=<备用>`;`/metrics` 的 `expert_work_llm_failover_total{from_group="self-hosted:b297-stub",reason="sticky"}` 比发之前多出「本轮模型调用次数 − 1」,`reason="server_error"` 多 1。**没修好时**:每一步桩都收到请求、每一步都慢。
+- [ ] **107.3 新一轮先试主模型,第 3 次失败开熔断,开了就不再打**:107.1 之后 30 秒内,`acc-b297` 发第 2 轮。判据:这一轮桩**只收到 1 个** POST(累计第 3 次失败 → 熔断打开、不再重试、也不先等退避);pod 日志 `llm_breaker.open provider_key=self-hosted:b297-stub breaker_key=self-hosted:b297-stub@<12 位十六进制> consecutive_failures=3` 与 `circuit_breaker.open … cooldown_s=30.0`;`breaker_key` 里没有密钥、没有 `secret://` 字样;`expert_work_llm_breaker_open_total{provider_key="self-hosted:b297-stub"}` +1。紧接着(仍在 30 秒内)发第 3 轮:桩 **0 个** POST,日志 `llm_router.key_failed … err=CircuitOpenError`,`failover_total{reason="circuit_open"}` +1,run `success`。**没修好时**:熔断不开,每一轮都先打桩(且每次 4 个)。
+- [ ] **107.4 冷却后只放一个探活,失败则冷却翻倍**:107.3 熔断打开 30 秒以上后,两个终端**同时**各发一轮 `acc-b297`。判据:桩**只收到 1 个** POST;日志 `circuit_breaker.probe` 一次、随后 `circuit_breaker.open … cooldown_s=60.0`;两轮都 `success`(另一轮直接 `CircuitOpenError` 转备用)。60 秒内再发一轮:桩 0 个 POST。**没修好时**:两轮都打到桩(半开谁都放行)。
+- [ ] **107.5 Retry-After 长于 1 秒不等、直接转备用**:桩切 `429`。`acc-b297-ra` 发一轮。判据:桩收到 1 个 POST,日志 `llm_error_handling.retryable … err=LLMRateLimitError has_fallback=True retry_in_s=none`,这一步 ≤ 3 秒转到备用,没有等 40 秒;再发两轮新的(每轮桩 1 个 POST,第 3 次失败开熔断),熔断日志 `cooldown_s=40.0`(Retry-After 比 30 秒长,按它)。**没修好时**:同厂商退避重试;熔断冷却仍是固定值。
+- [ ] **107.6 主模型不回包,60 秒转备用(不是 180 秒)**:桩切 `hang`。`acc-b297-hang` 发一轮,记下桩收到 POST 的时刻和备用开始应答的时刻。判据:桩收到 1 个 POST;约 60 秒后 pod 日志 `llm_router.first_token_timeout key=self-hosted:b297-stub-hang deadline_s=60.0`,随即备用应答,run `success`;同一轮后面的步骤不再打桩(粘住备用)。**没修好时**:等满 180 秒才转备用。做完把桩切回 `503`(挂着的请求随 pod 删除结束)。
+- [ ] **107.7 单模型智能体不比以前更脆**:桩为 `503`。`acc-b297-solo` 发一轮(它和 `acc-b297` 主模型同一个熔断键,此时熔断是开的或半开)。判据:桩仍收到 **4 个** POST、间隔约 1 / 2 / 4 秒(链路最后一个不被熔断拦、重试预算不变),run 以模型错误结束。**判据红的情形**:桩 0 个或 1~2 个 POST(单模型智能体被熔断 / 快速预算拦掉了)。
+- [ ] **107.8 同一模型两把 key:第一把熔断后直接用第二把**:**前置(改的是测试集群的平台凭据,影响所有测试租户)**:先只读查测试平台 `self-hosted` 的平台凭据,以及各租户有没有 `provider: self-hosted` 的智能体。原来有 key 的,原样记下 key 列表(引用名与顺序,不抄密钥值);有别的智能体在用平台 `self-hosted` 凭据时,本步挑它们没在跑的时段做,或跳过本步并记「未做(原因)」。然后在测试平台给 `self-hosted` 配两把有序 key(值 `dummy-k0`、`dummy-k1`;若 107 开头加的是租户覆盖凭据,先删掉它,否则覆盖会顶替 key 列表),确认 `acc-b297-keys` 构建出 `self-hosted:b297-stub-keys#0` / `#1` 两个熔断键。桩切 `perkey`(k0 回 429,k1 回 503)。`acc-b297-keys` 连发 4 轮(每轮都会以模型错误结束,不花钱)。判据:第 1~3 轮每轮桩收到 k0 **1 个**(429 后面还有 k1,不原地重试、不等)+ k1 4 个(最后一个,完整预算);第 3 轮 k0 熔断打开(`llm_breaker.open provider_key=self-hosted:b297-stub-keys#0`);第 4 轮(第 3 轮结束后 30 秒内发)桩收到 k0 **0 个**、k1 照常,日志 `llm_router.key_failed idx=0 … err=CircuitOpenError`。**没修好时**:第 4 轮 k0 仍被打(熔断开着也不跳过)、且 429 在 k0 上原地退避重试。**做完立刻恢复**平台 `self-hosted` 凭据到前置里记下的样子(原来没有就删掉这两把 key),再确认恢复后的 key 列表与记录一致。
+- [ ] **107.9 日志不带客户内容**:把 107.1–107.8 里出现的 `llm_error_handling.*`、`llm_router.*`、`llm_breaker.*`、`circuit_breaker.*` 日志行过一遍。判据:只有 provider:model、熔断键、错误类型、次数 / 秒数,没有提示词、回答、文件名、密钥或凭据引用原文。
+- [ ] **107.10 收尾**:删 `b297-stub` pod 与服务、五个临时智能体、临时 key、会话与终端用户;删掉加过的 `self-hosted` 租户覆盖凭据;再核一次平台 `self-hosted` 凭据与 107.8 前置的记录一致。
+
+**生产**:本条没有生产步骤(不在生产造故障)。
+
+## §108 主模型只出了思考就卡住时换备用重做这一步;控制台显示「已从 X 切换到 Y」(B-297 PR2)
+
+**背景**:11-07 测试环境主模型故障期间,最后一步先流出一些思考、然后不再出字,45 秒后按 B-186 以「思考后停顿」报错结束 —— 已经出过增量就算绑定在这家,不转备用。现在:只出了思考(没有正文,也没流出过任何工具调用)且后面有备用模型组时,丢掉这次、在备用上重做这一步;已经出过正文或工具调用(哪怕参数没写完 —— 工具名已作为预览发出去了)、或没有备用组时行为不变;备用也没答上时,结果与不重做时一样。控制台轨迹多一行「已从 … 切换到 …」,对外不新增任何事件。
+
+**怎么进(只在测试环境)**:沿用 §107 的桩 pod `b297-stub` 与做法(固定打同一个 control-plane pod;§107 做完未收尾时可直接接着用;若已收尾,按 §107 重建桩和凭据)。
+
+- **桩加两个流式模式**:把 §107 脚本的 `do_POST` 换成下面这版(其余不变,重启桩)。`think-hang`:按 OpenAI 流式格式回 3 段 `reasoning_content` 后不再发、600 秒不断开;`text-hang`:3 段思考 + 1 段正文「半句」后同样挂住;`tool-hang`:3 段思考 + 一个工具调用的名字(`list_files`)和半截参数后同样挂住。其它模式照 §107。
+
+  ```python
+  import http.server, json, os, time
+  def chunk(delta):
+      body = {"id": "s", "object": "chat.completion.chunk", "model": "stub",
+              "choices": [{"index": 0, "delta": delta, "finish_reason": None}]}
+      return f"data: {json.dumps(body, ensure_ascii=False)}\n\n".encode()
+  class H(http.server.BaseHTTPRequestHandler):
+      def do_POST(self):
+          self.rfile.read(int(self.headers.get("content-length", 0)))
+          mode = open("/tmp/mode").read().strip() if os.path.exists("/tmp/mode") else "503"
+          key = self.headers.get("authorization", "")[-2:]
+          print(time.strftime("%H:%M:%S"), "POST", mode, "key", key, flush=True)
+          if mode in ("think-hang", "text-hang", "tool-hang"):
+              self.send_response(200)
+              self.send_header("content-type", "text/event-stream")
+              self.end_headers()  # HTTP/1.0:正文一直读到断开,不用分块
+              parts = [{"role": "assistant", "reasoning_content": "先想一想"},
+                       {"reasoning_content": "这一步要做什么"}, {"reasoning_content": "再看看"}]
+              if mode == "text-hang":
+                  parts.append({"content": "半句"})
+              if mode == "tool-hang":
+                  parts.append({"tool_calls": [{"index": 0, "id": "call_stub", "type": "function",
+                                                "function": {"name": "list_files", "arguments": '{"pa'}}]})
+              for d in parts:
+                  self.wfile.write(chunk(d))
+                  self.wfile.flush()
+                  time.sleep(0.5)
+              time.sleep(600)
+              return
+          if mode == "hang":
+              time.sleep(600)
+              return
+          status = 503
+          if mode == "429" or (mode == "perkey" and key == "k0"):
+              status = 429
+          self.send_response(status)
+          if mode == "429":
+              self.send_header("retry-after", "40")
+          self.send_header("content-type", "application/json")
+          self.end_headers()
+          self.wfile.write(b'{"error":{"message":"stub"}}')
+  http.server.ThreadingHTTPServer(("", 8080), H).serve_forever()
+  ```
+- **临时智能体**(写法、「全部」那条限制与 §107 相同;各用独立模型名,熔断键互不影响):
+  - `acc-b297-think`:主模型 `name: b297-stub-think`,备用同 §107;
+  - `acc-b297-text`:主模型 `name: b297-stub-text`,备用同 §107;
+  - `acc-b297-think-solo`:只有 `b297-stub-think-solo`,没有备用;
+  - `acc-b297-tool`:主模型 `name: b297-stub-tool`,备用同 §107(108.5 用)。
+  - `idle_timeout_s` 不写(默认 45 秒)。
+- 提示词同 §107(让模型先调一次工具再回答)。在**调试台**发(看实时视图),另用对外 key 按 `mode: "stream"` 再发一轮(看对外流),每轮 `curl -N` 存下对外 SSE 原文。看同一 pod 的日志和 `/metrics`。**花费**:几轮短对话由备用模型回答,< ¥1。
+
+- [ ] **108.1 只出思考就卡住 → 约 45 秒后在备用上重做,run 成功**:桩切 `think-hang`。调试台 `acc-b297-think` 发一轮,记下桩收到 POST 的时刻和备用开始出字的时刻。判据:桩收到 **1 个** POST;约 45 秒后 pod 日志依次有 `llm_router.idle_timeout key=self-hosted:b297-stub-think deadline_s=45.0`、`llm_router.reasoning_only_stall key=self-hosted:b297-stub-think cause=idle 45.0s`、`llm_router.provider_failed … err=LLMReasoningStallError`、`llm_router.sticky_set group=<备用>`;备用随即应答;run `success`,答案来自备用;同一轮后面的步骤不再打桩;`expert_work_llm_failover_total{from_group="self-hosted:b297-stub-think",reason="reasoning_stall"}` +1。**没修好时**:45 秒后 run 以「模型思考后停顿超过 45 秒…」报错结束,备用一次没被调用。
+- [ ] **108.2 控制台显示切换,实时视图丢掉被放弃的思考**:看 108.1 那一轮。判据:调试台实时视图里,桩那 3 段思考在切换时消失、换成备用模型的思考;轨迹 / 时间线在这一步有一行 FAILOVER「已从 b297-stub-think 切换到 <备用模型名>(思考后停住)」;刷新页面后从对话记录 / Run 详情重放,这一行仍在。**没修好时**:没有这一行;实时视图里桩的思考和备用的思考连在一起。
+- [ ] **108.3 对外流没有新事件类型**:对外 key 按 `mode: "stream"` 用 `acc-b297-think` 发一轮(此时熔断可能已累计,无所谓:桩被跳过时同样有切换,只是没有思考可丢),另取 108.1 那一轮的 run id 调 `GET /v1/agents/{agent_code}/runs/{run_id}/events?user_id=…` 回放(legacy 与 `stream_format=items` 各一次)。判据:三份 SSE 里出现的 `event:` 名都在既有集合内(legacy:`metadata`/`updates`/`token`/`plan`/`worker`/`guard`/`compaction`/`retry`/`approval`/`error`/`end`/`gap`/`truncated`;items:`item.added`/`item.delta`/`item.done` 加 `metadata`/`guard`/`compaction`/`retry`/`worker`/`end`/`gap`/`truncated`),**没有** `llm_failover`;实时那份的 token 帧里能看到桩的思考、一段 `"\n\n"`、再是备用的思考与回答(回放不含 token 帧)。**判据红的情形**:出现 `llm_failover` 或任何新事件名。
+- [ ] **108.4 已出正文 → 行为不变**:桩切 `text-hang`。调试台 `acc-b297-text` 发一轮。判据:桩收到 1 个 POST;约 45 秒后 `llm_router.idle_timeout key=self-hosted:b297-stub-text …`,**没有** `reasoning_only_stall`,备用**没被调用**,这一步以「半句」结束(run 照以前的方式往下走或结束);没有 FAILOVER 行。**判据红的情形**:备用被调用(已经给用户看过的正文被丢掉重做)。
+- [ ] **108.5 已流出工具名(参数没写完)→ 行为不变**:桩切 `tool-hang`。调试台 `acc-b297-tool` 发一轮,另用对外 key 按 `stream_format=items` 的 `mode: "stream"` 再发一轮。判据:桩每轮收到 1 个 POST;约 45 秒后 `llm_router.idle_timeout key=self-hosted:b297-stub-tool …`,**没有** `reasoning_only_stall`,备用**没被调用**,run 以「模型思考后停顿超过 45 秒…」报错结束(B-186 原样),没有 FAILOVER 行;对外流里 `list_files` 的工具卡之后没有备用模型的输出。**判据红的情形**:备用被调用 —— 对外流里会留下一张永远不收尾的工具卡。
+- [ ] **108.6 没有备用 → 行为不变**:桩切 `think-hang`。`acc-b297-think-solo` 发一轮。判据:约 45 秒后 run 以「模型思考后停顿超过 45 秒…」报错结束(B-186 原样),没有 `reasoning_only_stall`、没有 FAILOVER 行。
+- [ ] **108.7 首个增量耗时直方图**:在 §107 / §108 做完后读该 pod 的 `/metrics`。判据:有 `expert_work_llm_first_progress_seconds_bucket{provider_key="self-hosted:b297-stub-think",…}`(108.1 那次约 0.x 秒落在 `le="0.5"` / `le="1"`),备用模型的 `provider_key` 也有;§107.6 那个挂住的 `b297-stub-hang` **没有**这条直方图的样本(超时不记,只在 `expert_work_llm_stream_stale_total` 里)。**发测试后要读的**:跑一两天后按 `provider_key` 看真实模型的 p50 / p95 / p99(`histogram_quantile`),对照 PR1 的首 token 封顶(有备用时 60 秒、大上下文 120 秒):p99 明显低于 60 秒才说明封顶不会误伤正常请求;若大上下文请求的 p99 接近 60 秒,回来调封顶。
+- [ ] **108.8 日志与事件不带客户内容**:把本节出现的 `llm_router.*` 日志与库里这几轮的 `llm_failover` 事件行(`run_event` 表 `event_name='llm_failover'`)过一遍。判据:只有 provider:model / 模型名、原因码、步号、秒数,没有提示词、思考、回答。
+- [ ] **108.9 收尾**:删本节四个临时智能体及会话;桩与凭据按 §107.10 收尾。
+
+**生产**:本条没有生产步骤(不在生产造故障)。
+
+## §109 旧检索结果压成可找回的引用(B-206 track D,#1972)
 
 只保留「旧的 `knowledge_search` 结果在清理时压成一行可找回的引用」;「读到的原文没写就说没写」那部分措辞评测没过,已从 PR 撤掉(PR 正文有数)。准备步骤见 `tools/eval/README.md`「跨轮清理后的找回用例」:建库 `b140-kb-manual`、传合成说明书、导入 `eval-kb-prune`,在 B-140 评测租户里做。
 
-- [ ] **90.1 改动前基线**:发测试**之前**,在当前测试版本上用 B-140 跑 `k06-recover-pruned-search`、`k07-pruned-search-not-stated` 各 3 次(`--only`),结果存为改动前那一臂。判据:跑完、结果文件齐全(这一臂只是对照,不判过不过)。
-- [ ] **90.2 找回旧结果(k06)**:发测试后同样各跑 3 次。判据:k06 3 次里答对(137 分钟 / 2 小时 17 分)的次数不少于改动前,且不出现相邻型号的 112 / 163;第 3 轮工具调用 ≤ 3 次。进 pod 查一次第 3 轮的模型输入,里面有 `[knowledge_search for '…'` 开头的那行引用 —— 没有就说明清理没发生,本条记「不可判」,不记「过」。
-- [ ] **90.3 压掉之后不照邻居作答(k07)**:同一批运行。判据:k07 3 次都说说明书没写 VT-330 的噪音,且不给任何分贝数;次数不少于改动前那一臂。
-- [ ] **90.4 回归 k01–k05**:发测试后各跑 1 次(有失败再补到 3 次)。判据:与这几条上一次通过的记录相比没有新的失败。
-- [ ] **90.5 收尾**:k06 的 `turn_tokens_max` 按 90.2 实测最大值 ×1.5 改(README 写明的暂定上限);删本节建的评测用户与会话。
+- [ ] **109.1 改动前基线**:发测试**之前**,在当前测试版本上用 B-140 跑 `k06-recover-pruned-search`、`k07-pruned-search-not-stated` 各 3 次(`--only`),结果存为改动前那一臂。判据:跑完、结果文件齐全(这一臂只是对照,不判过不过)。
+- [ ] **109.2 找回旧结果(k06)**:发测试后同样各跑 3 次。判据:k06 3 次里答对(137 分钟 / 2 小时 17 分)的次数不少于改动前,且不出现相邻型号的 112 / 163;第 3 轮工具调用 ≤ 3 次。进 pod 查一次第 3 轮的模型输入,里面有 `[knowledge_search for '…'` 开头的那行引用 —— 没有就说明清理没发生,本条记「不可判」,不记「过」。
+- [ ] **109.3 压掉之后不照邻居作答(k07)**:同一批运行。判据:k07 3 次都说说明书没写 VT-330 的噪音,且不给任何分贝数;次数不少于改动前那一臂。
+- [ ] **109.4 回归 k01–k05**:发测试后各跑 1 次(有失败再补到 3 次)。判据:与这几条上一次通过的记录相比没有新的失败。
+- [ ] **109.5 收尾**:k06 的 `turn_tokens_max` 按 109.2 实测最大值 ×1.5 改(README 写明的暂定上限);删本节建的评测用户与会话。

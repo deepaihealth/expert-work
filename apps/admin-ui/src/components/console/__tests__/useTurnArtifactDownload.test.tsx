@@ -62,6 +62,24 @@ describe("useTurnArtifactDownload", () => {
     expect(download).toHaveBeenLastCalledWith("t-1", "report.txt", undefined, undefined);
   });
 
+  it("on 409 ARTIFACT_VERSION_EXPIRED says the version passed its retention period (B-63)", async () => {
+    download.mockRejectedValueOnce(new ApiError("expired", "ARTIFACT_VERSION_EXPIRED", 409));
+    download.mockResolvedValueOnce("report.txt");
+    renderProbe(1);
+
+    await userEvent.click(screen.getByText("go"));
+
+    expect(
+      await screen.findByText(/这一版已超过保留期被清理|passed its retention period/),
+    ).toBeInTheDocument();
+    expect(screen.queryByText(/内容没有单独保留|was not kept/)).toBeNull();
+
+    await userEvent.click(screen.getByRole("button", { name: /下载最新版|Download latest/ }));
+
+    await waitFor(() => expect(download).toHaveBeenCalledTimes(2));
+    expect(download).toHaveBeenLastCalledWith("t-1", "report.txt", undefined, undefined);
+  });
+
   it("other failures stay a plain error toast", async () => {
     download.mockRejectedValue(new ApiError("gone", "HTTP_404", 404));
     renderProbe(1);

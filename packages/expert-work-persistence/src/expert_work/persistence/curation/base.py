@@ -21,6 +21,7 @@ Implementations:
 from __future__ import annotations
 
 import abc
+from collections.abc import Sequence
 from datetime import datetime
 from uuid import UUID
 
@@ -239,3 +240,26 @@ class CurationCandidateStore(abc.ABC):
         user) is nulled. Returns the count updated. Tenant- AND user-scoped;
         ``tenant_id`` is NOT NULL on this table so the predicate is
         unambiguous."""
+
+    # --- B-278 彻底删除智能体 ---------------------------------------------
+
+    @abc.abstractmethod
+    async def count_for_agent(self, *, tenant_id: UUID, agent_name: str) -> int:
+        """B-278 —— rows ``delete_for_agent`` would remove (purge preview)."""
+
+    @abc.abstractmethod
+    async def delete_for_agent(self, *, tenant_id: UUID, agent_name: str) -> int:
+        """B-278 —— hard-delete every row whose ``agent_name`` is exactly this
+        name (agent purge). Tenant-scoped; returns the rows removed.
+
+        Must run before the agent's ``eval_dataset`` rows go: a promoted
+        candidate points at its dataset through a ``RESTRICT`` foreign key."""
+
+    # --- B-280 删除单个对话 -------------------------------------------------
+
+    @abc.abstractmethod
+    async def delete_for_threads(self, *, tenant_id: UUID, thread_ids: Sequence[UUID]) -> int:
+        """B-280 —— hard-delete the candidates flagged on these conversations
+        (conversation purge), whatever their review status. Tenant-scoped;
+        returns the rows removed. A promoted candidate's ``eval_dataset`` row
+        is not touched (the foreign key points from the candidate to it)."""

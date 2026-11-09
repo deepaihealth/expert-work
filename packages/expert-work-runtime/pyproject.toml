@@ -31,6 +31,16 @@ dependencies = [
     "langfuse>=3,<5",
 ]
 
+[project.optional-dependencies]
+# B-286 —— AES-256-GCM for the ``sql_encrypted`` SecretStore
+# (``expert_work.runtime.secret_store.sql_encrypted``, moved here from control-plane so the
+# retention job resolves the same object-store key refs). An extra, not a base dependency:
+# only control-plane and retention-cleanup-job import that module; the other services that
+# depend on this package do not pull cryptography in through it. Same range as
+# control-plane's own pin (it needs cryptography for pyjwt[crypto] regardless) — move both
+# together.
+sql-encrypted = ["cryptography>=50.0.0,<51"]
+
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"

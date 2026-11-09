@@ -118,23 +118,65 @@ describe("422 detail shapes (B-9)", () => {
     ).rejects.toMatchObject({ status: 422, code: "HTTP_422", details: fastapiDetail });
   });
 
-  it("finds nothing to read in the third-party envelope (why console routes stay bare)", async () => {
+});
+
+// B-278 —— 控制台路由里也有一批 4xx 走 ``{success, data, error}`` 信封(agents.py 的
+// ``_envelope_error``:MANIFEST_DUPLICATE / MANIFEST_STALE_WRITE,以及 B-278 的
+// MANIFEST_DUPLICATE_DELETED / AGENT_PURGE_BLOCKED …)。以前拦截器只读 ``detail``,
+// 这些错误码在界面上全变成 ``HTTP_409`` + axios 通用文案,页面按错误码给的提示一条都
+// 走不到。现在 ``detail`` 缺席时退回读信封。
+describe("error envelope on a non-2xx response (B-278)", () => {
+  it("surfaces the envelope's code, message and details", async () => {
     const err = await createClient()
-      .get("/v1/agents/support-bot/1.0.0/revisions", {
-        adapter: rejectWithData(422, {
-          success: false,
-          data: null,
-          error: { code: "INVALID_REQUEST", message: "Input should be a valid integer" },
-        }),
-      })
+      .post(
+        "/v1/agents",
+        {},
+        {
+          adapter: rejectWithData(409, {
+            success: false,
+            data: null,
+            error: {
+              code: "MANIFEST_DUPLICATE_DELETED",
+              message: "a deleted agent with this name and version exists",
+              details: { name: "x", version: "1.0.0", status: "deleted" },
+            },
+          }),
+        },
+      )
       .catch((e: unknown) => e);
     expect(err).toBeInstanceOf(ApiError);
     const apiErr = err as ApiError;
-    expect(apiErr.status).toBe(422);
-    expect(apiErr.code).toBe("HTTP_422");
-    expect(apiErr.details).toBeUndefined();
-    // The envelope's own code/message never reach the caller.
-    expect(apiErr.message).not.toContain("valid integer");
+    expect(apiErr.status).toBe(409);
+    expect(apiErr.code).toBe("MANIFEST_DUPLICATE_DELETED");
+    expect(apiErr.message).toBe("a deleted agent with this name and version exists");
+    expect(apiErr.details).toEqual({ name: "x", version: "1.0.0", status: "deleted" });
+  });
+
+  it("leaves details undefined when the envelope carries none", async () => {
+    await expect(
+      createClient().put(
+        "/v1/agents/x/1.0.0/draft",
+        {},
+        {
+          adapter: rejectWithData(409, {
+            success: false,
+            data: null,
+            error: { code: "MANIFEST_STALE_WRITE", message: "changed" },
+          }),
+        },
+      ),
+    ).rejects.toMatchObject({ status: 409, code: "MANIFEST_STALE_WRITE", details: undefined });
+  });
+
+  it("still prefers FastAPI's detail when both are present", async () => {
+    await expect(
+      createClient().get("/v1/x", {
+        adapter: rejectWithData(409, {
+          detail: { code: "FROM_DETAIL", message: "d" },
+          error: { code: "FROM_ENVELOPE", message: "e" },
+        }),
+      }),
+    ).rejects.toMatchObject({ code: "FROM_DETAIL", message: "d" });
   });
 });
 
@@ -185,5 +227,29 @@ describe("401 unauthorized handler", () => {
       createClient().get("/v1/agents", { adapter: rejectWithStatus(500) }),
     ).rejects.toBeInstanceOf(ApiError);
     expect(handler).not.toHaveBeenCalled();
+  });
+});
+
+// B-63 —— 下载类请求(responseType: "blob")出错时响应体是 Blob:JSON 错误体要解开,
+// 下载失败才带得上后端的错误码(产物「超过保留期」与「没有单独保留」靠 detail.code 区分)。
+describe("blob error bodies (B-63)", () => {
+  it("reads code and message out of a JSON error body that arrived as a Blob", async () => {
+    const body = new Blob(
+      [JSON.stringify({ detail: { code: "ARTIFACT_VERSION_EXPIRED", message: "expired" } })],
+      { type: "application/json" },
+    );
+    await expect(
+      createClient().get("/v1/sessions/t/workspace/artifacts/a/download", {
+        responseType: "blob",
+        adapter: rejectWithData(409, body),
+      }),
+    ).rejects.toMatchObject({ status: 409, code: "ARTIFACT_VERSION_EXPIRED", message: "expired" });
+  });
+
+  it("leaves a non-JSON blob alone", async () => {
+    const body = new Blob(["<html>bad gateway</html>"], { type: "text/html" });
+    await expect(
+      createClient().get("/x", { responseType: "blob", adapter: rejectWithData(502, body) }),
+    ).rejects.toMatchObject({ status: 502, code: "HTTP_502" });
   });
 });

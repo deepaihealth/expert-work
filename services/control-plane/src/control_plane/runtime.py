@@ -20,7 +20,7 @@ from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field, replace
 from pathlib import Path
-from typing import Any, Literal, Protocol, cast, runtime_checkable
+from typing import Any, Protocol, cast, runtime_checkable
 from uuid import UUID
 
 import httpx
@@ -47,7 +47,7 @@ from expert_work.common.skill_activity import SkillActivityRecorder
 from expert_work.common.skill_run_usage import SkillRunUsageRecorder
 from expert_work.common.uplift_metrics import set_built_agent_cache_entries
 from expert_work.common.url_validation import validate_remote_url
-from expert_work.persistence import ArtifactStore, KnowledgeStore
+from expert_work.persistence import WORKSPACE_AGENTS_DIR, ArtifactStore, KnowledgeStore
 from expert_work.persistence.platform_agent_template import compute_spec_sha256
 from expert_work.persistence.sandbox_instance_store import InMemorySandboxInstanceStore
 from expert_work.persistence.skill import SkillStore
@@ -68,11 +68,18 @@ from expert_work.runtime.audit import DefaultSecretRedactor
 from expert_work.runtime.audit.logger import AuditLogger
 from expert_work.runtime.checkpointer import make_checkpoint_serde
 from expert_work.runtime.llm import InMemoryRedisCache, LLMResponseCache
-from expert_work.runtime.middleware import LangfuseClient, RecordingLangfuseClient
+from expert_work.runtime.middleware import (
+    BreakerRegistry,
+    LangfuseClient,
+    RecordingLangfuseClient,
+)
 from expert_work.runtime.runs import RunEventStore, RunManager, RunStore
 from expert_work.runtime.secret_store import SecretStore, parse_secret_ref
 from expert_work.runtime.skill_assets import ObjectStore as SkillAssetStore
-from expert_work.runtime.storage import ObjectStore, ObjectStoreBackend, S3CompatibleConfig
+from expert_work.runtime.storage import ObjectStore
+from expert_work.runtime.storage.config import (
+    resolve_object_store_config as resolve_object_store_config,
+)
 from expert_work.runtime.stream_bridge import InMemoryStreamBridge, StreamBridge
 from orchestrator import (
     ActionJudge,
@@ -325,6 +332,26 @@ def catalog_build_cacheable(keyed: str | None, built: BuiltAgent, *, checked: bo
         built.knowledge_catalog_fingerprint,
     )
     return False
+
+
+#: B-294 —— 跳过了连不上的 MCP 服务的构建在缓存里只留这么久(秒;与 B-292 重拨同一节奏)。
+DEGRADED_BUILD_TTL_S = 60.0
+
+
+def build_cache_ttl_s(built: BuiltAgent, ttl_s: float) -> float:
+    """B-294 —— ``built`` 在构建缓存里留多久。跳过了连不上的 MCP 服务时只留
+    ``min(ttl_s, DEGRADED_BUILD_TTL_S)``:留满 ``ttl_s``,服务恢复后整个 TTL 里都没有它的
+    工具;一点不留,服务断着的时候每个 run / 每次委派都要重新构建、重拨一次。过期后下一次
+    构建重新 ``list_tools``,池里的客户端自己重连(B-177)。"""
+    if not built.skipped_mcp_servers:
+        return ttl_s
+    degraded = min(ttl_s, DEGRADED_BUILD_TTL_S)
+    logger.info(
+        "control_plane.build_cached_short reason=mcp_server_skipped count=%d ttl_s=%.0f",
+        len(built.skipped_mcp_servers),
+        degraded,
+    )
+    return degraded
 
 
 @dataclass
@@ -625,8 +652,9 @@ class AgentRuntime:
         return None
 
     def _store(self, key: _CacheKey, built: BuiltAgent) -> None:
-        """Cache ``built`` under ``key`` with a fresh TTL, LRU-bounded."""
-        self._cache[key] = (built, self._clock() + self.cache_ttl_s)
+        """Cache ``built`` under ``key`` with a fresh TTL, LRU-bounded.
+        B-294 —— 跳过了 MCP 服务的构建 TTL 更短(:func:`build_cache_ttl_s`)。"""
+        self._cache[key] = (built, self._clock() + build_cache_ttl_s(built, self.cache_ttl_s))
         self._cache.move_to_end(key)
         while len(self._cache) > self.cache_max_size:
             # LRU eviction — pure abandonment, no hook fan-out (same
@@ -2171,12 +2199,38 @@ def build_artifact_snapshot_store(
 
 def build_agent_file_version_store(
     workspace_store: WorkspaceStore | None,
+    artifact_store: ArtifactStore | None = None,
 ) -> AgentFileVersionStore | None:
     """B-236 第三层 —— ``/agent`` 文件的版本存储,只有 NAS 后端有(放在用户根旁边、沙箱挂不到
-    的地方);别的后端 ``None`` = 不留版本。传进来的必须是工作区端点用的同一个实例。"""
+    的地方);别的后端 ``None`` = 不留版本。传进来的必须是工作区端点用的同一个实例。
+
+    B-284 —— 给了 ``artifact_store``:登记成产物的文件不再留版本(每一版都有产物副本)。"""
     if isinstance(workspace_store, NasWorkspaceStore):
-        return NasAgentFileVersionStore(workspace=workspace_store)
+        return NasAgentFileVersionStore(
+            workspace=workspace_store,
+            registered_paths=(
+                registered_artifact_paths(artifact_store) if artifact_store is not None else None
+            ),
+        )
     return None
+
+
+def registered_artifact_paths(
+    artifact_store: ArtifactStore,
+) -> Callable[[UUID, UUID, str], Awaitable[dict[str, set[str]]]]:
+    """B-284 —— 一个 (租户, 用户, agent) 已有产物副本的内容:``{agent 根相对路径: sha256 们}``
+    (``agents/<key>/`` 之后那段)。只算有副本的版本:观察器读到的内容正好是其中之一才不另留版本;
+    登记之后又改过、B-235 之前没副本的,照常留。按用户与路径前缀在库里筛(不把整个 agent 的
+    版本行拉回来)。"""
+
+    async def _paths(tenant_id: UUID, user_id: UUID, agent_key: str) -> dict[str, set[str]]:
+        prefix = f"{WORKSPACE_AGENTS_DIR}/{agent_key}/"
+        found = await artifact_store.snapshotted_digests(
+            tenant_id=tenant_id, user_id=user_id, path_prefix=prefix
+        )
+        return {path.removeprefix(prefix): digests for path, digests in found.items()}
+
+    return _paths
 
 
 def build_tool_env(
@@ -2264,47 +2318,6 @@ def make_knowledge_retriever(
     )
 
 
-async def resolve_object_store_config(
-    *,
-    backend: ObjectStoreBackend,
-    endpoint_url: str | None,
-    region: str,
-    bucket: str,
-    access_key_ref: str | None,
-    secret_key_ref: str | None,
-    secret_store: SecretStore,
-    addressing_style: Literal["path", "virtual", "auto"] = "path",
-) -> S3CompatibleConfig | None:
-    """Build the S3 config for ``make_object_store`` (Stream J.6).
-
-    ``None`` for the in-memory backend (no config needed). For
-    ``s3-compatible`` the endpoint URL + both ``secret://`` key
-    references are required; the keys are resolved through the
-    SecretStore. Missing fields fail fast with a clear error.
-
-    ``addressing_style`` defaults to ``"path"`` (MinIO local dev);
-    callers must pass ``Settings.object_store_addressing_style`` through
-    so OSS prod can request ``"virtual"`` (W0 real-bucket finding: OSS
-    rejects path-style addressing).
-    """
-    if backend != "s3-compatible":
-        return None
-    if not (endpoint_url and access_key_ref and secret_key_ref):
-        msg = (
-            "object_store_backend='s3-compatible' requires object_store_endpoint_url "
-            "+ object_store_access_key_ref + object_store_secret_key_ref"
-        )
-        raise RuntimeError(msg)
-    return S3CompatibleConfig(
-        endpoint_url=endpoint_url,
-        region=region,
-        bucket=bucket,
-        access_key=await secret_store.get(parse_secret_ref(access_key_ref)),
-        secret_key=await secret_store.get(parse_secret_ref(secret_key_ref)),
-        addressing_style=addressing_style,
-    )
-
-
 def make_image_resolver(store: ObjectStore, *, workspace_root: Path | None = None) -> ImageResolver:
     """Build **the one** J.6 image resolver — backs both multimodal paths
     (Path A content blocks + Path B ``ask_image``) and both provider
@@ -2389,6 +2402,13 @@ def build_middleware_env(
     :class:`TokenUsageMiddleware` lands on the ``after_llm_call`` chain
     of every agent built from this env. ``app.py`` wires the SQL store;
     tests can leave it unset to keep the chain shape unchanged.
+
+    B-297 — one :class:`BreakerRegistry` per env, and ``app.py`` builds the env
+    once per process, so every agent / sub-agent / run / memory-writeback
+    router in this process shares breaker state per upstream (keyed by
+    ``provider:model[#idx]`` + credential/endpoint fingerprint). Per process,
+    not cross-replica: each replica learns an outage from its own first
+    failures.
     """
     secret_redactor = DefaultSecretRedactor()
 
@@ -2401,6 +2421,7 @@ def build_middleware_env(
             langfuse_client if langfuse_client is not None else RecordingLangfuseClient()
         ),
         redact_text=_redact_text,
+        breaker_registry=BreakerRegistry(),
         token_usage_store=token_usage_store,
     )
 

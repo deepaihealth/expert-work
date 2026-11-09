@@ -238,8 +238,8 @@ export function PlaygroundTab({ detail }: PlaygroundTabProps) {
     models: attributedModels,
   });
   const stats = useMemo(
-    () => computeSessionStats(statsInputs, rateBook),
-    [statsInputs, rateBook],
+    () => computeSessionStats(statsInputs, rateBook, agentModel?.provider ?? null),
+    [statsInputs, rateBook, agentModel],
   );
   const missing = missingRequired(promptVariables, varValues);
 
@@ -723,6 +723,7 @@ export function PlaygroundTab({ detail }: PlaygroundTabProps) {
               // (控制台平面的规矩,同停止按钮)。
               onCancelQueuedLive={stopRun}
               onDownloadArtifact={handleDownloadArtifact}
+              tenantScope={concreteTenantScope(apiTenantScope)}
               onFireResult={handleFireResult}
             />
           </ViewPane>

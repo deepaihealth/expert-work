@@ -193,6 +193,115 @@ describe("SettingsTenantConfig", () => {
     );
   });
 
+  it("shows file retention days or the platform default (B-63)", async () => {
+    installAdapter([
+      {
+        match: (u) => u.endsWith("/config"),
+        respond: () => ({
+          success: true,
+          data: { ...configRow, upload_retention_days: 30, artifact_retention_days: null },
+          error: null,
+        }),
+      },
+    ]);
+    renderConfig();
+    await waitFor(() => expect(screen.getByText("Acme")).toBeInTheDocument());
+    expect(screen.getByTestId("tenant-config-upload-retention-days")).toHaveTextContent("30");
+    expect(screen.getByTestId("tenant-config-artifact-retention-days")).toHaveTextContent(
+      "Platform default",
+    );
+  });
+
+  describe("lowering file retention days (B-63)", () => {
+    function installCapturingAdapter(puts: { params: unknown; body: unknown }[]) {
+      apiClient.defaults.adapter = (config) => {
+        const method = (config.method ?? "get").toLowerCase();
+        if (method === "put") {
+          puts.push({ params: config.params, body: JSON.parse(String(config.data)) });
+        }
+        const isConfig = (config.url ?? "").endsWith("/config");
+        return Promise.resolve({
+          data: isConfig ? { success: true, data: configRow, error: null } : {},
+          status: 200,
+          statusText: "OK",
+          headers: {},
+          config,
+          request: {},
+        });
+      };
+    }
+
+    async function editAndSave(json: string) {
+      const user = userEvent.setup();
+      renderConfig();
+      await waitFor(() => expect(screen.getByTestId("config-edit-btn")).toBeInTheDocument());
+      await user.click(screen.getByTestId("config-edit-btn"));
+      fireEvent.change(await screen.findByTestId("config-editor"), { target: { value: json } });
+      await waitFor(() => expect(screen.getByTestId("config-save-btn")).not.toBeDisabled());
+      await user.click(screen.getByTestId("config-save-btn"));
+      return user;
+    }
+
+    it("asks before saving a lower value and then sends the confirmation flag", async () => {
+      const puts: { params: unknown; body: unknown }[] = [];
+      installCapturingAdapter(puts);
+
+      const user = await editAndSave('{"upload_retention_days":30}');
+
+      expect(
+        await screen.findByText(/改小后最早今晚就会清理更多文件，且不可恢复|irreversible/),
+      ).toBeInTheDocument();
+      expect(puts).toHaveLength(0);
+      await user.click(screen.getByRole("button", { name: /确认改小|Lower it/ }));
+      await waitFor(() => expect(puts).toHaveLength(1));
+      expect(puts[0].params).toEqual({ confirm_retention_decrease: true });
+    });
+
+    it("saves a raise straight away without the flag", async () => {
+      const puts: { params: unknown; body: unknown }[] = [];
+      installCapturingAdapter(puts);
+
+      await editAndSave('{"upload_retention_days":180}');
+
+      await waitFor(() => expect(puts).toHaveLength(1));
+      expect(puts[0].params).toBeUndefined();
+      expect(screen.queryByText(/改小后最早今晚|irreversible/)).toBeNull();
+    });
+
+    it("asks before lowering the conversation work directory days too (B-282)", async () => {
+      const puts: { params: unknown; body: unknown }[] = [];
+      installCapturingAdapter(puts);
+
+      const user = await editAndSave('{"conversation_workspace_retention_days":30}');
+
+      expect(
+        await screen.findByText(/对话工作目录保留|Conversation work directory retention/),
+      ).toBeInTheDocument();
+      expect(puts).toHaveLength(0);
+      await user.click(screen.getByRole("button", { name: /确认改小|Lower it/ }));
+      await waitFor(() => expect(puts).toHaveLength(1));
+      expect(puts[0].params).toEqual({ confirm_retention_decrease: true });
+    });
+  });
+
+  it("shows the conversation work directory days or the platform default (B-282)", async () => {
+    installAdapter([
+      {
+        match: (u) => u.endsWith("/config"),
+        respond: () => ({
+          success: true,
+          data: { ...configRow, conversation_workspace_retention_days: 180 },
+          error: null,
+        }),
+      },
+    ]);
+    renderConfig();
+    await waitFor(() => expect(screen.getByText("Acme")).toBeInTheDocument());
+    expect(
+      screen.getByTestId("tenant-config-conversation-workspace-retention-days"),
+    ).toHaveTextContent("180");
+  });
+
   it("Edit button reveals the JSON editor + dirty detection", async () => {
     installAdapter([
       {

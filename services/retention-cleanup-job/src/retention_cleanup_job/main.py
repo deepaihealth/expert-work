@@ -38,9 +38,12 @@ from expert_work.runtime.audit import (
     InMemoryAuditFallbackQueue,
 )
 from expert_work.runtime.runs.store import SqlRunStore
-from expert_work.runtime.storage import make_object_store
-from expert_work.runtime.storage.factory import S3CompatibleConfig
 from retention_cleanup_job.job import RetentionCleanupJob
+from retention_cleanup_job.object_store import (
+    enter_object_store,
+    log_plan,
+    plan_object_store,
+)
 from retention_cleanup_job.report import CleanupReport
 from retention_cleanup_job.settings import RetentionCleanupSettings
 from retention_cleanup_job.workspace_files import validate_workspace_root
@@ -111,6 +114,30 @@ def configure_logging(settings: RetentionCleanupSettings, *, stream: IO[str] | N
     )
 
 
+def warn_retired_image_retention(settings: RetentionCleanupSettings) -> None:
+    """B-283 —— ``EXPERT_WORK_RETENTION_IMAGE_RETENTION_DAYS`` 不再生效:图片与附件同一个天数
+    (``upload_retention_days``)。还配着就说一声,免得以为它管用。"""
+    if settings.image_retention_days is not None:
+        logger.warning(
+            "retention.image_retention_days_ignored configured=%d used=upload_retention_days=%d",
+            settings.image_retention_days,
+            settings.upload_retention_days,
+        )
+
+
+def warn_clamped_retention(settings: RetentionCleanupSettings) -> None:
+    """B-63 —— 产物 / 上传保留期配得超出 7-365 的,settings 已夹回范围;这里在日志装好之后
+    逐条打 warning,让人知道实际用的不是配的那个数。"""
+    for name, configured in settings.clamped_retention.items():
+        logger.warning(
+            "retention.retention_days_clamped field=%s configured=%d used=%d "
+            "— the allowed range is 7-365 days",
+            name,
+            configured,
+            getattr(settings, name),
+        )
+
+
 #: B-271 —— 有 pass 失败(吞掉异常、其余 pass 照跑完)时进程的退出码,让 CronJob 显示失败。
 #: 与启动校验拒跑的 ``2`` 区分开。``backoffLimit: 1`` 会再起一个 pod 重跑一次:每个 pass 都
 #: 幂等,重跑只是多一份日志,不会多删东西。
@@ -122,9 +149,102 @@ def exit_code(report: CleanupReport) -> int:
     return EXIT_PASS_FAILED if report.failed_passes else 0
 
 
+def log_done(report: CleanupReport) -> None:
+    """The one ``retention_cleanup_job.done`` line ops (and the runbooks) read."""
+    logger.info(
+        "retention_cleanup_job.done audit=%d audit_skipped_unacked=%d "
+        "event=%d jwt=%d image_rows=%d image_keys_ok=%d image_keys_failed=%d "
+        "artifact_soft=%d artifact_hard=%d "
+        "artifact_versions_deleted=%d artifact_files_removed=%d artifacts_expired=%d "
+        "orphan_artifact_copies_removed=%d "
+        "purged_agent_dirs_removed=%d purged_agent_dirs_failed=%d "
+        "trajectories_expired=%d trajectory_orphans_removed=%d trajectories_failed=%d "
+        "trajectories_scanned=%d trajectories_capped=%s trajectories_skipped=%s "
+        "uploads_expired=%d upload_files_removed=%d upload_files_unsafe=%d "
+        "upload_rows_failed=%d upload_rows_abandoned=%d upload_rows_held=%d "
+        "upload_owners_unavailable=%d upload_rows_failing_overdue=%d "
+        "conversation_dirs_removed=%d conversation_tool_results_removed=%d "
+        "conversation_dirs_skipped_active=%d conversation_dirs_skipped_artifact=%d "
+        "conversation_dirs_skipped_unsafe=%d conversation_dirs_skipped_owner_deleted=%d "
+        "conversation_dirs_failed=%d conversation_tool_results_skipped_artifact=%d "
+        "conversation_dirs_raced=%d "
+        "agent_root_files_removed=%d agent_root_dirs_removed=%d shared_dirs_removed=%d "
+        "agent_root_failed=%d agent_root_skipped_unknown=%d agent_root_skipped_symlinks=%d "
+        "agent_root_skipped_changed=%d agent_file_version_dirs_dropped=%d "
+        "agent_file_versions_capped=%d agent_file_versions_failed=%d "
+        "thread_dirs_removed=%d "
+        "memory_hard_deleted=%d workspaces_hard_deleted=%d "
+        "workspaces_pending_archive=%d tenant_users_hard_deleted=%d "
+        "sandbox_egress_audit=%d memory_writeback_jobs=%d knowledge_tasks=%d "
+        "knowledge_revisions=%d knowledge_retrieval_logs=%d failed_passes=%s duration=%.2fs",
+        report.audit_deleted,
+        report.audit_skipped_unacked,
+        report.event_deleted,
+        report.jwt_blacklist_deleted,
+        report.image_uploads_hard_deleted,
+        report.image_object_keys_removed,
+        report.image_object_keys_failed,
+        report.artifacts_soft_deleted,
+        report.artifacts_hard_deleted,
+        report.artifact_versions_deleted,
+        report.artifact_files_removed,
+        report.artifacts_expired,
+        report.orphan_artifact_copies_removed,
+        report.purged_agent_dirs_removed,
+        report.purged_agent_dirs_failed,
+        report.trajectories_expired,
+        report.trajectory_orphans_removed,
+        report.trajectories_failed,
+        report.trajectories_scanned,
+        report.trajectories_capped,
+        report.trajectories_skipped,
+        report.uploads_expired,
+        report.upload_files_removed,
+        report.upload_files_unsafe,
+        report.upload_rows_failed,
+        report.upload_rows_abandoned,
+        report.upload_rows_held,
+        report.upload_owners_unavailable,
+        report.upload_rows_failing_overdue,
+        report.conversation_dirs_removed,
+        report.conversation_tool_results_removed,
+        report.conversation_dirs_skipped_active,
+        report.conversation_dirs_skipped_artifact,
+        report.conversation_dirs_skipped_unsafe,
+        report.conversation_dirs_skipped_owner_deleted,
+        report.conversation_dirs_failed,
+        report.conversation_tool_results_skipped_artifact,
+        report.conversation_dirs_raced,
+        report.agent_root_files_removed,
+        report.agent_root_dirs_removed,
+        report.shared_dirs_removed,
+        report.agent_root_failed,
+        report.agent_root_skipped_unknown,
+        report.agent_root_skipped_symlinks,
+        report.agent_root_skipped_changed,
+        report.agent_file_version_dirs_dropped,
+        report.agent_file_versions_capped,
+        report.agent_file_versions_failed,
+        report.thread_dirs_removed,
+        report.memory_hard_deleted,
+        report.workspaces_hard_deleted,
+        report.workspaces_pending_archive,
+        report.tenant_users_hard_deleted,
+        report.sandbox_egress_audit_deleted,
+        report.memory_writeback_jobs_deleted,
+        report.knowledge_tasks_deleted,
+        report.knowledge_revisions_deleted,
+        report.knowledge_retrieval_logs_deleted,
+        ",".join(report.failed_passes) or "-",
+        report.duration_seconds,
+    )
+
+
 async def _amain() -> int:
     settings = RetentionCleanupSettings()
     configure_logging(settings)
+    warn_clamped_retention(settings)
+    warn_retired_image_retention(settings)
     # 连库之前先定工作区根:不合格就退出,一条 DELETE 都不发。
     workspace_root = resolve_workspace_root(settings, environ=os.environ)
 
@@ -135,33 +255,15 @@ async def _amain() -> int:
         # Mini-ADR J-32 (J.6.补强-3b) — the image pass needs both a
         # registry + the object store. ``memory`` backend skips the
         # pass (in-memory bytes vanish per process anyway).
-        image_store: SqlImageUploadStore | None = None
-        object_store = None
-        if settings.object_store_backend == "s3-compatible":
-            if (
-                not settings.object_store_endpoint_url
-                or not settings.object_store_access_key
-                or not settings.object_store_secret_key
-            ):
-                msg = (
-                    "object_store_backend=s3-compatible requires endpoint_url + "
-                    "access_key + secret_key"
-                )
-                raise ValueError(msg)
-            object_store = await stack.enter_async_context(
-                make_object_store(
-                    settings.object_store_backend,
-                    S3CompatibleConfig(
-                        endpoint_url=settings.object_store_endpoint_url,
-                        region=settings.object_store_region,
-                        bucket=settings.object_store_bucket,
-                        access_key=settings.object_store_access_key,
-                        secret_key=settings.object_store_secret_key,
-                        addressing_style=settings.object_store_addressing_style,
-                    ),
-                )
-            )
-            image_store = SqlImageUploadStore(session_factory)
+        #
+        # B-286 —— 与 control-plane 同一个对象存储(``EXPERT_WORK_OBJECT_STORE_*`` + 同一个
+        # SecretStore 解 ``secret://`` 引用)。解不出来不崩:图片 pass 记跳过、进失败清单。
+        plan = await plan_object_store(settings, session_factory)
+        object_store, plan = await enter_object_store(stack, plan)
+        log_plan(plan)
+        image_store = (
+            SqlImageUploadStore(session_factory) if plan.backend == "s3-compatible" else None
+        )
 
         # Mini-ADR J-25 (J.9-step1) — artifact lifecycle sweep wires the
         # SqlArtifactStore in unconditionally; the artifact pass is
@@ -199,7 +301,7 @@ async def _amain() -> int:
             batch_size=settings.batch_size,
             image_upload_store=image_store,
             object_store=object_store,
-            image_retention_days=settings.image_retention_days,
+            object_store_unavailable=(plan.error or "unavailable") if plan.unavailable else None,
             artifact_store=artifact_store,
             artifact_retention_days=settings.artifact_retention_days,
             artifact_hard_delete_grace_days=settings.artifact_hard_delete_grace_days,
@@ -218,6 +320,10 @@ async def _amain() -> int:
             knowledge_retrieval_log_retention_days=settings.knowledge_retrieval_log_retention_days,
             user_upload_store=user_upload_store,
             upload_retention_days=settings.upload_retention_days,
+            conversation_workspace_retention_days=(settings.conversation_workspace_retention_days),
+            conversation_workspace_batch_size=settings.conversation_workspace_batch_size,
+            shared_delete_after=settings.shared_delete_after,
+            agent_root_cutover=settings.agent_root_cutover,
             thread_store=thread_store,
             run_store=run_store,
             workspace_root=workspace_root,
@@ -226,53 +332,7 @@ async def _amain() -> int:
         )
         logger.info("retention_cleanup_job.start batch=%d", settings.batch_size)
         report = await job.run_once()
-        logger.info(
-            "retention_cleanup_job.done audit=%d audit_skipped_unacked=%d "
-            "event=%d jwt=%d image_rows=%d image_keys_ok=%d image_keys_failed=%d "
-            "artifact_soft=%d artifact_hard=%d "
-            "artifact_versions_deleted=%d artifact_files_removed=%d artifacts_expired=%d "
-            "orphan_artifact_copies_removed=%d "
-            "uploads_expired=%d upload_files_removed=%d upload_files_unsafe=%d "
-            "upload_rows_failed=%d upload_rows_abandoned=%d upload_rows_held=%d "
-            "upload_owners_unavailable=%d "
-            "thread_dirs_removed=%d "
-            "memory_hard_deleted=%d workspaces_hard_deleted=%d "
-            "workspaces_pending_archive=%d tenant_users_hard_deleted=%d "
-            "sandbox_egress_audit=%d memory_writeback_jobs=%d knowledge_tasks=%d "
-            "knowledge_revisions=%d knowledge_retrieval_logs=%d failed_passes=%s duration=%.2fs",
-            report.audit_deleted,
-            report.audit_skipped_unacked,
-            report.event_deleted,
-            report.jwt_blacklist_deleted,
-            report.image_uploads_hard_deleted,
-            report.image_object_keys_removed,
-            report.image_object_keys_failed,
-            report.artifacts_soft_deleted,
-            report.artifacts_hard_deleted,
-            report.artifact_versions_deleted,
-            report.artifact_files_removed,
-            report.artifacts_expired,
-            report.orphan_artifact_copies_removed,
-            report.uploads_expired,
-            report.upload_files_removed,
-            report.upload_files_unsafe,
-            report.upload_rows_failed,
-            report.upload_rows_abandoned,
-            report.upload_rows_held,
-            report.upload_owners_unavailable,
-            report.thread_dirs_removed,
-            report.memory_hard_deleted,
-            report.workspaces_hard_deleted,
-            report.workspaces_pending_archive,
-            report.tenant_users_hard_deleted,
-            report.sandbox_egress_audit_deleted,
-            report.memory_writeback_jobs_deleted,
-            report.knowledge_tasks_deleted,
-            report.knowledge_revisions_deleted,
-            report.knowledge_retrieval_logs_deleted,
-            ",".join(report.failed_passes) or "-",
-            report.duration_seconds,
-        )
+        log_done(report)
         if report.audit_skipped_unacked > 0:
             logger.warning(
                 "retention.skipped_unacked count=%d — D.1c backup worker may be lagging",

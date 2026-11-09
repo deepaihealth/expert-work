@@ -243,7 +243,11 @@ class SaveArtifactTool:
             ctx.agent_key, agent_relative(target, ctx.workspace_view)
         )
         kind = _coerce_kind(args.get("kind"))
-        thread_id = str(ctx.run_id) if ctx.run_id is not None else _FALLBACK_THREAD_ID
+        # B-63 —— 产物的保留期跟着「登记它的会话最后一次 run」续命,所以这里要记一个
+        # ``agent_run`` 里查得到的 run id。委派出的子代每次新铸的 run id 从不落 ``agent_run``:
+        # 记父的(``inputs_run_id``,``_child_config`` 带下来的就是它);主 run 用自己的。
+        owning_run = ctx.inputs_run_id or ctx.run_id
+        thread_id = str(owning_run) if owning_run is not None else _FALLBACK_THREAD_ID
 
         # 登记之前先确认文件真的在登记的那个位置。没有这一步,agent 喊一声
         # save_artifact 就能造出一条「列表里看得见、下载 404」的产物,而 run
