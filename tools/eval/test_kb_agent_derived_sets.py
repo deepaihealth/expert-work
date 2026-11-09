@@ -237,7 +237,7 @@ def test_deleted_text_still_found_after_ingest_stops_the_run(
     async def still_there(*args: Any, **kwargs: Any) -> list[str]:
         return [_GONE]
 
-    monkeypatch.setattr("kb_agent_eval.store_residue", still_there)
+    monkeypatch.setattr("kb_agent_cases.store_residue", still_there)
     with pytest.raises(SystemExit, match="not usable"):
         main([*_corpus(tmp_path), "--hard-negatives", str(_spec(tmp_path, _GONE))])
 

@@ -19,6 +19,12 @@ from uuid import uuid4
 import httpx
 import pytest
 import yaml
+from kb_agent_answer import (  # type: ignore[import-not-found]
+    MAX_READS,
+    MAX_SEARCHES,
+    SEARCH_LIMIT_NOTE,
+    run_agent,
+)
 from kb_agent_cases import gold_passages, select_cases  # type: ignore[import-not-found]
 from kb_agent_cost import (  # type: ignore[import-not-found]
     PRICES,
@@ -32,9 +38,6 @@ from kb_agent_cost import (  # type: ignore[import-not-found]
 from kb_agent_eval import (  # type: ignore[import-not-found]
     ANSWER_ENV,
     JUDGE_ENV,
-    MAX_READS,
-    MAX_SEARCHES,
-    SEARCH_LIMIT_NOTE,
     YARDSTICK,
     FakeModels,
     JudgeCache,
@@ -42,7 +45,6 @@ from kb_agent_eval import (  # type: ignore[import-not-found]
     judge_prompt,
     main,
     parse_verdict,
-    run_agent,
     run_questions,
     tally,
 )

@@ -9,9 +9,11 @@ from typing import Any
 from uuid import uuid4
 
 import pytest
-from kb_agent_eval import (  # type: ignore[import-not-found]
+from kb_agent_answer import (  # type: ignore[import-not-found]
     READ_LIMIT_NOTE,
     SEARCH_LIMIT_NOTE,
+)
+from kb_agent_eval import (  # type: ignore[import-not-found]
     YARDSTICK,
     BudgetGate,
     Spend,

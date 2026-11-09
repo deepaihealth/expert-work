@@ -6,7 +6,7 @@ from __future__ import annotations
 import argparse
 import random
 import sys
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -98,6 +98,41 @@ async def store_residue(
         folded = "\n".join(anchor_key(t) for t in texts)
         left |= {a for a, key in keys.items() if key and key in folded}
     return [a for a in anchors if a in left]
+
+
+def stop_on_lost_controls(failures: Sequence[Any]) -> None:
+    """难负例建库:解析器发现删句删掉了对照题答案(``ControlAnchorDeletedError``)就停。"""
+    lost = [f.filename for f in failures if f.error_type == "ControlAnchorDeletedError"]
+    if lost:
+        raise SystemExit(
+            f"hard-negative deletion removes control answers in {len(lost)} document(s) "
+            f"({', '.join(lost[:5])}); regenerate the spec with kb_hard_sets.py"
+        )
+
+
+async def check_hard_negative_corpus(
+    store: KnowledgeStore,
+    *,
+    tenant_id: UUID,
+    kb_id: UUID,
+    todo: Sequence[tuple[str, KbCase]],
+    gold: Mapping[str, list[str]],
+    plan: RunPlan,
+) -> dict[str, Any]:
+    """难负例建库后:删过的锚还能找到就停;对照题取不到含答案段落只警告(删句没删掉对照答案
+    已由解析器逐文档核过,取不到是切块造成的,没删句的标准库上也会有)。返回记进 run 行的核对。"""
+    left = await store_residue(store, tenant_id=tenant_id, kb_id=kb_id, anchors=plan.delete_anchors)
+    if left:
+        raise SystemExit(f"hard-negative corpus is not usable: deleted anchors still found {left}")
+    no_gold = [c.id for _label, c in todo if c.expected and not gold.get(c.id)]
+    if no_gold:
+        print(f"WARNING control questions without a gold passage: {no_gold}", file=sys.stderr)
+    return {
+        "cases": sum(1 for _label, c in todo if c.source == "hard_negative"),
+        "anchors": len(plan.delete_anchors),
+        "residue": left,
+        "controls_without_gold": no_gold,
+    }
 
 
 @dataclass(frozen=True)
