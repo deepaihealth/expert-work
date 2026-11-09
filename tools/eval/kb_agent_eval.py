@@ -128,8 +128,10 @@ SEED = 20261018
 N_ANSWERABLE_PER_SET = 15
 #: 判分时每题最多给几段「含答案的完整段落」。
 GOLD_PASSAGES = 2
-SEARCH_LIMIT_NOTE = "[search limit reached in this evaluation; answer with what you have]"
-READ_LIMIT_NOTE = "[read limit reached in this evaluation; answer with what you have]"
+#: B-206 11-09:只说上限到了、这次没执行,不再加「answer with what you have」——生产里没有这条
+#: 消息,那句话是评测独有的「有就答」压力(11-05 研究记录)。
+SEARCH_LIMIT_NOTE = "[search limit reached in this evaluation; this search was not run]"
+READ_LIMIT_NOTE = "[read limit reached in this evaluation; this read was not run]"
 READ_TOOL = "knowledge_read"
 
 DEFAULT_ANSWER_MODEL = "glm-5.3"
