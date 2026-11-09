@@ -59,14 +59,11 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-import hashlib
 import json
 import os
 import random
 import re
-import sqlite3
 import sys
-from collections import Counter
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -78,6 +75,18 @@ from zoneinfo import ZoneInfo
 sys.path.insert(0, str(Path(__file__).parent))
 
 import httpx
+from kb_agent_judge import (  # type: ignore[import-not-found]
+    DEFAULT_JUDGE_VOTES,
+    JUDGE_SYSTEM,
+    JudgeCache,
+    category_for,
+    judge_prompt,
+    majority,
+    parse_verdict,
+    score_verdict,
+    seen_passages,
+)
+from kb_agent_tally import read_results, tally  # type: ignore[import-not-found]
 from kb_dataset import KbCase, KbDataset, load_dataset  # type: ignore[import-not-found]
 from kb_eval import (  # type: ignore[import-not-found]
     EVAL_OUT_DIR,
@@ -145,32 +154,6 @@ JUDGE_CACHE_DB = EVAL_OUT_DIR / "agent_judge_cache.sqlite"
 #: ``--dry`` 的结果行记这个模型名,与真跑的行混不到一个 ``--out`` 里。
 DRY_MODEL = "dry"
 
-JUDGE_SYSTEM = "你是严格、细致的评审。只输出一个 JSON 对象,不要输出别的文字。"
-JUDGE_TEMPLATE = """评审一个客服智能体的回答。智能体只能通过知识库检索获得公司资料,下面给出它检索到的全部段落。
-
-【用户问题】
-{question}
-
-【智能体检索到的段落】(可能为空)
-{passages}
-
-【参考信息】
-{reference}
-
-【智能体的回答】
-{answer}
-
-请判断并输出 JSON,字段:
-- "refused":布尔。回答是否明确表示知识库 / 资料里没有写这个问题要的具体信息(或没查到)。只说「资料里没写 X」但同时给出了 X 的具体答案的,仍算 true,另由 fabricated 判断。
-- "fabricated":布尔。回答是否把上面段落里没有的具体信息当作事实说出来(例如产品是否有某认证、价格、编码、成分、功效、用法、公司政策等),且没有说明这不是来自资料。依据段落能直接推出的不算;明确说明「资料没写、以下仅是一般常识」的泛泛建议不算。
-- "matches_reference":"yes" / "partial" / "no" / "n/a"。回答是否给出了参考答案的要点;参考信息写着「本题资料里没有答案」时填 "n/a"。
-- "reason":一句话中文理由,点出关键依据。
-"""  # noqa: E501
-
-CATEGORIES_NO_ANSWER = ("正确说没写", "编造", "其它", "判分失败")
-CATEGORIES_ANSWERABLE = ("答对", "误拒", "编造", "答偏", "判分失败")
-
-_JSON_RE = re.compile(r"\{.*\}", re.S)
 _BEIJING = ZoneInfo("Asia/Shanghai")
 
 
@@ -247,8 +230,11 @@ class Spend:
 
 
 class Models(Protocol):
-    answer_model: str
-    judge_model: str
+    @property
+    def answer_model(self) -> str: ...
+
+    @property
+    def judge_model(self) -> str: ...
 
     async def agent(
         self, messages: list[dict[str, Any]], tools: list[dict[str, Any]]
@@ -352,7 +338,7 @@ class FakeModels:
         return {"role": "assistant", "content": "(空跑)"}, 0.0
 
     async def judge(self, prompt: str) -> tuple[str, float]:
-        verdict = {"refused": False, "fabricated": False, "matches_reference": "n/a"}
+        verdict = {"claims": [], "refused": False, "matches_reference": "n/a"}
         return json.dumps({**verdict, "reason": "dry"}), 0.0
 
 
@@ -561,71 +547,6 @@ async def gold_passages(
     return gold
 
 
-def judge_prompt(case: KbCase, run: Mapping[str, Any], gold: Mapping[str, list[str]]) -> str:
-    # B-206 K-2: 读文档拿到的也是智能体看过的资料;没有读文档时提示词与之前逐字相同(判分缓存照用)。
-    seen = [*run["searches"], *run.get("reads", ())]
-    passages = (
-        "\n\n=====\n\n".join(s["content"] for s in seen if s.get("content")) or "(没有检索到段落)"
-    )
-    if case.expected:
-        anchors = "\n".join(f"- 《{e.document}》中的原文片段:{e.anchor}" for e in case.expected[:3])
-        passages_gold = "\n\n-----\n\n".join(gold.get(case.id, [])) or "(未取到)"
-        reference = (
-            f"参考答案:{case.answer or '(无文字答案,以下面的资料原文为准)'}\n"
-            f"正确答案所在的资料原文片段:\n{anchors}\n含答案的完整段落:\n{passages_gold}"
-        )
-    else:
-        reference = "本题资料里没有答案(公司知识库没有写这个问题要的具体信息)。"
-    return JUDGE_TEMPLATE.format(
-        question=case.query, passages=passages, reference=reference, answer=run["answer"] or "(空)"
-    )
-
-
-class JudgeCache:
-    """判分结果按(判分模型, 提示词)缓存;同样的回答复跑不再花钱。"""
-
-    def __init__(self, path: Path) -> None:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        self.db = sqlite3.connect(path)
-        self.db.execute("CREATE TABLE IF NOT EXISTS j (k TEXT PRIMARY KEY, v TEXT)")
-
-    def get(self, model: str, prompt: str) -> str | None:
-        row = self.db.execute("SELECT v FROM j WHERE k = ?", (self._key(model, prompt),)).fetchone()
-        return cast(str, row[0]) if row else None
-
-    def put(self, model: str, prompt: str, value: str) -> None:
-        self.db.execute("INSERT OR REPLACE INTO j VALUES (?, ?)", (self._key(model, prompt), value))
-        self.db.commit()
-
-    @staticmethod
-    def _key(model: str, prompt: str) -> str:
-        return hashlib.sha256(f"{model}\0{prompt}".encode()).hexdigest()
-
-
-def parse_verdict(raw: str) -> dict[str, Any]:
-    match = _JSON_RE.search(raw)
-    if not match:
-        return {"parse_error": raw[:200]}
-    try:
-        return cast(dict[str, Any], json.loads(match.group(0)))
-    except json.JSONDecodeError:
-        return {"parse_error": raw[:200]}
-
-
-def category(answerable: bool, verdict: Mapping[str, Any]) -> str:
-    if "parse_error" in verdict:
-        return "判分失败"
-    if verdict.get("fabricated"):
-        return "编造"
-    if answerable:
-        if verdict.get("matches_reference") in ("yes", "partial"):
-            return "答对"
-        if verdict.get("refused"):
-            return "误拒"
-        return "答偏"
-    return "正确说没写" if verdict.get("refused") else "其它"
-
-
 # ---------------------------------------------------------------------------
 # 预算 / 跑题
 # ---------------------------------------------------------------------------
@@ -694,9 +615,11 @@ async def run_questions(
     concurrency: int = 4,
     cache_verdicts: bool = True,
     reader: Tool | None = None,
+    votes: int = DEFAULT_JUDGE_VOTES,
+    notes: Mapping[str, str] | None = None,
 ) -> int:
     """答题 + 判分,每题一行追加进 ``out``;返回写了几行。``other_cost`` 是计入预算的其它花费
-    (重排)。"""
+    (重排)。每题判 ``votes`` 次取多数(B-206 11-09);``notes`` 是派生题给判分的补充说明。"""
     sem = asyncio.Semaphore(max(1, concurrency))
     gate_lock = asyncio.Lock()
     write_lock = asyncio.Lock()
@@ -721,26 +644,28 @@ async def run_questions(
             run, answer_cny = await run_agent(
                 models, tool, question=case.query, tenant_id=tenant_id, spend=spend, reader=reader
             )
-            prompt = judge_prompt(case, run, gold)
-            raw = cache.get(models.judge_model, prompt)
-            judge_cny = 0.0
-            if raw is None:
-                raw, judge_cny = await models.judge(prompt)
-                spend.judge_cny += judge_cny
-                spend.judge_calls += 1
-                if cache_verdicts:
-                    cache.put(models.judge_model, prompt, raw)
-            verdict = parse_verdict(raw)
+            prompt = judge_prompt(case, run, gold, (notes or {}).get(case.id, ""))
+            raws, judge_cny = await _judge_votes(
+                models, cache, prompt, votes=votes, spend=spend, cache_verdicts=cache_verdicts
+            )
+            passages = seen_passages(run)
+            verdicts = [score_verdict(parse_verdict(raw), passages) for raw in raws]
+            categories = [category_for(case.answer_label, v) for v in verdicts]
+            final, agreement = majority(categories)
             row = {
                 "case_id": case.id,
                 "set": label,
                 "answerable": bool(case.expected),
+                "label": case.answer_label,
                 "question": case.query,
                 "answer": run["answer"],
                 "searches": run["searches"],
                 "reads": run["reads"],
-                "verdict": verdict,
-                "category": category(bool(case.expected), verdict),
+                # 代表票:第一张投给多数类别的票(判分分歧时取第一票)。
+                "verdict": verdicts[categories.index(final) if final in categories else 0],
+                "votes": categories,
+                "agreement": agreement,
+                "category": final,
                 "answer_model": models.answer_model,
                 "judge_model": models.judge_model,
                 "cost_cny": {"answer": round(answer_cny, 6), "judge": round(judge_cny, 6)},
@@ -755,26 +680,34 @@ async def run_questions(
     return written
 
 
+async def _judge_votes(
+    models: Models,
+    cache: JudgeCache,
+    prompt: str,
+    *,
+    votes: int,
+    spend: Spend,
+    cache_verdicts: bool,
+) -> tuple[list[str], float]:
+    """同一提示词判 ``votes`` 次(每票单独缓存):``(每票原文, 这题判分花费)``。"""
+    raws: list[str] = []
+    cost = 0.0
+    for vote in range(max(1, votes)):
+        raw = cache.get(models.judge_model, prompt, vote=vote)
+        if raw is None:
+            raw, call_cny = await models.judge(prompt)
+            cost += call_cny
+            spend.judge_cny += call_cny
+            spend.judge_calls += 1
+            if cache_verdicts:
+                cache.put(models.judge_model, prompt, raw, vote=vote)
+        raws.append(raw)
+    return raws, cost
+
+
 # ---------------------------------------------------------------------------
 # 结果文件 / 统计
 # ---------------------------------------------------------------------------
-
-
-def read_results(path: Path) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
-    """``(每题一行, 每次运行末尾的 run 行)``;文件不存在时两个空列表。"""
-    rows: list[dict[str, Any]] = []
-    runs: list[dict[str, Any]] = []
-    if not path.exists():
-        return rows, runs
-    for line in path.read_text(encoding="utf-8").splitlines():
-        if not line.strip():
-            continue
-        item = json.loads(line)
-        if "case_id" in item:
-            rows.append(item)
-        elif "run" in item:
-            runs.append(item["run"])
-    return rows, runs
 
 
 def done_case_ids(path: Path, *, answer_model: str, judge_model: str) -> set[str]:
@@ -790,57 +723,6 @@ def done_case_ids(path: Path, *, answer_model: str, judge_model: str) -> set[str
     return {row["case_id"] for row in rows}
 
 
-def tally(path: Path) -> str:
-    """「资料没写」「有答案」两组,各按全部 / 主集 / 真实问法集数各类判定;外加总数、检索次数
-    与花费。"""
-    rows, runs = read_results(path)
-    lines: list[str] = []
-    for answerable, cats in ((False, CATEGORIES_NO_ANSWER), (True, CATEGORIES_ANSWERABLE)):
-        lines.append("## 有答案" if answerable else "## 资料没写")
-        for scope in ("all", "main", "chat"):
-            sel = [r for r in rows if r["answerable"] == answerable and scope in ("all", r["set"])]
-            counts = Counter(r["category"] for r in sel)
-            lines.append(f"  {scope:4} n={len(sel)} " + " ".join(f"{k} {counts[k]}" for k in cats))
-    total = Counter(r["category"] for r in rows)
-    lines.append(f"total n={len(rows)} " + " ".join(f"{k} {v}" for k, v in sorted(total.items())))
-    searches = [s for r in rows for s in r["searches"]]
-    # B-206 K-2: 读文档单独统计(之前的结果行没有 reads)。
-    reads = [s for r in rows for s in r.get("reads", ())]
-    lines.append(
-        f"searches per question {len(searches) / max(1, len(rows)):.2f}; "
-        f"degraded {sum(1 for s in searches if s.get('degraded'))}, "
-        f"embedding degraded {sum(1 for s in searches if s.get('embedding_degraded'))}, "
-        f"keyword degraded {sum(1 for s in searches if s.get('keyword_degraded'))}, "
-        f"errors {sum(1 for s in searches if s.get('error'))}, "
-        f"skipped {sum(1 for s in searches if s.get('skipped'))}"
-    )
-    ran = [s for s in searches if "status" in s]
-    outcomes = Counter(s.get("rerank_outcome") or "ok" for s in ran)
-    lines.append(
-        "rerank outcomes "
-        + ", ".join(f"{k} {v}" for k, v in sorted(outcomes.items()))
-        + f"; threshold paused {sum(1 for s in ran if s.get('rerank_threshold_paused'))}"
-    )
-    if reads:
-        with_read = sum(1 for r in rows if r.get("reads"))
-        modes = Counter(s["mode"] for s in reads if s.get("mode"))
-        lines.append(
-            f"reads per question {len(reads) / max(1, len(rows)):.2f} "
-            f"(questions with a read {with_read}); modes "
-            + ", ".join(f"{k} {v}" for k, v in sorted(modes.items()))
-            + f"; errors {sum(1 for s in reads if s.get('error'))}, "
-            f"skipped {sum(1 for s in reads if s.get('skipped'))}"
-        )
-    answer = sum(r["cost_cny"]["answer"] for r in rows)
-    judge = sum(r["cost_cny"]["judge"] for r in rows)
-    rerank = sum(run["spend_cny"]["rerank"] for run in runs)
-    lines.append(
-        f"spend ¥{answer + judge + rerank:.2f} (answer ¥{answer:.2f}, judge ¥{judge:.2f}, "
-        f"rerank ¥{rerank:.2f} over {len(runs)} run(s))"
-    )
-    return "\n".join(lines)
-
-
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
@@ -850,7 +732,12 @@ def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
-    parser.add_argument("--tally", type=Path, help="只打印这个结果文件的统计,不跑")
+    parser.add_argument(
+        "--tally",
+        type=Path,
+        nargs="+",
+        help="只打印这些结果文件的统计(按答题模型分节;几个模型就多一张对比表),不跑",
+    )
     parser.add_argument("--dataset", type=Path, help="主集 YAML(库名 = 它的 name)")
     parser.add_argument("--chat-dataset", type=Path, help="真实问法集 YAML(同一语料)")
     parser.add_argument("--corpus", type=Path, help="manifest.csv;覆盖主集里的 corpus.manifest")
@@ -859,6 +746,12 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--judge-cache", type=Path, default=JUDGE_CACHE_DB)
     parser.add_argument("--answer-model", default=DEFAULT_ANSWER_MODEL)
     parser.add_argument("--judge-model", default=DEFAULT_JUDGE_MODEL)
+    parser.add_argument(
+        "--judge-votes",
+        type=int,
+        default=DEFAULT_JUDGE_VOTES,
+        help="每题判几次取多数(B-206 11-09;没有严格多数记「判分分歧」)",
+    )
     parser.add_argument("--answer-price", help="input,cached,output 元 / 百万 token")
     parser.add_argument("--judge-price", help="input,cached,output 元 / 百万 token")
     parser.add_argument("--budget", type=float, default=DEFAULT_BUDGET_CNY, help="本次上限,元")
@@ -898,6 +791,8 @@ def _check_args(parser: argparse.ArgumentParser, args: argparse.Namespace) -> No
     for name in ("dataset", "chat_dataset", "out"):
         if getattr(args, name) is None:
             parser.error(f"--{name.replace('_', '-')} is required (unless --tally)")
+    if args.judge_votes < 1:
+        parser.error(f"--judge-votes must be at least 1, got {args.judge_votes}")
     if args.rerank_pool < 1:
         parser.error(f"--rerank-pool must be at least 1, got {args.rerank_pool}")
     if args.rerank_instruct and args.rerank_view == "dual":
@@ -1040,6 +935,7 @@ async def _run(
                 other_cost=rerank_cny,
                 concurrency=args.concurrency,
                 cache_verdicts=not args.dry,
+                votes=args.judge_votes,
             )
     run = {
         "started": started.isoformat(),
@@ -1058,6 +954,7 @@ async def _run(
             "model": rerank_model,
             "threshold": args.rerank_threshold,
         },
+        "judge_votes": args.judge_votes,
         "calls": {"answer": spend.answer_calls, "judge": spend.judge_calls},
         "spend_cny": {
             "answer": round(spend.answer_cny, 6),
@@ -1076,7 +973,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser = _build_parser()
     args = parser.parse_args(argv)
     if args.tally is not None:
-        print(tally(cast(Path, args.tally)))
+        print(tally(cast(list[Path], args.tally)))
         return 0
     _check_args(parser, args)
     return asyncio.run(amain(args))

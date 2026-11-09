@@ -32,7 +32,6 @@ from kb_agent_eval import (  # type: ignore[import-not-found]
     Price,
     Spend,
     call_cost,
-    category,
     done_case_ids,
     gold_passages,
     is_deepseek_offpeak,
@@ -92,25 +91,6 @@ def test_parse_verdict_reads_the_json_object_and_flags_anything_else() -> None:
     assert parse_verdict("{not json}" + "x" * 300) == {
         "parse_error": ("{not json}" + "x" * 300)[:200]
     }
-
-
-@pytest.mark.parametrize(
-    ("answerable", "verdict", "expected"),
-    [
-        (True, {"parse_error": "x"}, "判分失败"),
-        (True, {"fabricated": True, "matches_reference": "yes"}, "编造"),
-        (True, {"matches_reference": "yes"}, "答对"),
-        (True, {"matches_reference": "partial", "refused": True}, "答对"),
-        (True, {"matches_reference": "no", "refused": True}, "误拒"),
-        (True, {"matches_reference": "no", "refused": False}, "答偏"),
-        (False, {"fabricated": True, "refused": True}, "编造"),
-        (False, {"refused": True, "matches_reference": "n/a"}, "正确说没写"),
-        (False, {"refused": False, "matches_reference": "n/a"}, "其它"),
-        (False, {"parse_error": "x"}, "判分失败"),
-    ],
-)
-def test_category(answerable: bool, verdict: dict[str, Any], expected: str) -> None:
-    assert category(answerable, verdict) == expected
 
 
 # ---------------------------------------------------------------------------
@@ -420,6 +400,7 @@ async def _run_four(
         gate=gate,
         spend=spend,
         concurrency=1,
+        votes=1,
     )
     return written, spend
 
@@ -479,6 +460,7 @@ async def test_rerank_spend_counts_toward_the_budget(tmp_path: Path) -> None:
         spend=Spend(),
         other_cost=lambda: 60.0,
         concurrency=1,
+        votes=1,
     )
     assert written == 0
 
@@ -576,14 +558,14 @@ def test_tally_counts_each_category_with_totals_and_spend(tmp_path: Path) -> Non
     run = {"run": {"spend_cny": {"answer": 1.25, "judge": 0.5, "rerank": 0.2}}}
     lines = [json.dumps(r, ensure_ascii=False) for r in [*rows, run]]
     out.write_text("\n".join(lines) + "\n", encoding="utf-8")
-    text = tally(out).splitlines()
+    text = tally(out).splitlines()[6:]  # 头 6 行是模型标题与头条(test_kb_agent_tally)
     assert text[0] == "## 资料没写"
-    assert text[1] == "  all  n=2 正确说没写 1 编造 1 其它 0 判分失败 0"
-    assert text[2] == "  main n=1 正确说没写 1 编造 0 其它 0 判分失败 0"
-    assert text[3] == "  chat n=1 正确说没写 0 编造 1 其它 0 判分失败 0"
+    assert text[1] == "  all  n=2 正确说没写 1 编造 1 其它 0 判分失败 0 判分分歧 0"
+    assert text[2] == "  main n=1 正确说没写 1 编造 0 其它 0 判分失败 0 判分分歧 0"
+    assert text[3] == "  chat n=1 正确说没写 0 编造 1 其它 0 判分失败 0 判分分歧 0"
     assert text[4] == "## 有答案"
-    assert text[5] == "  all  n=3 答对 1 误拒 1 编造 1 答偏 0 判分失败 0"
-    assert text[6] == "  main n=2 答对 1 误拒 1 编造 0 答偏 0 判分失败 0"
+    assert text[5] == "  all  n=3 答对 1 误拒 1 编造 1 答偏 0 判分失败 0 判分分歧 0"
+    assert text[6] == "  main n=2 答对 1 误拒 1 编造 0 答偏 0 判分失败 0 判分分歧 0"
     assert text[8] == "total n=5 正确说没写 1 答对 1 编造 2 误拒 1"
     assert text[9] == (
         "searches per question 0.80; degraded 1, embedding degraded 1, keyword degraded 1, "
