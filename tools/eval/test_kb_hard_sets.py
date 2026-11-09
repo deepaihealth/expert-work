@@ -169,7 +169,7 @@ def test_entity_names_come_from_document_names() -> None:
 @pytest.mark.parametrize(
     ("name", "others", "expected"),
     [
-        ("益休", {"益舒", "益家人", "益休"}, ["益舒"]),
+        ("青松", {"青柏", "白桦林", "青松"}, ["青柏"]),
         ("KX-305", {"KX-217", "KX-30", "KY-305"}, ["KX-217", "KY-305"]),
         ("甲一", {"甲一款", "乙二"}, []),  # 互相包含 = 同一个对象的长短名
     ],
@@ -179,15 +179,15 @@ def test_near_misses(name: str, others: set[str], expected: list[str]) -> None:
 
 
 def test_pick_distractors_needs_the_entity_in_the_query_and_its_own_document() -> None:
-    files = ["说明书:益休.docx", "说明书:益舒.docx", "说明书:益家人.docx"]
+    files = ["说明书:青松.docx", "说明书:青柏.docx", "说明书:白桦林.docx"]
     cases = [
-        _case("d1", "益休每天吃几袋?", "说明书:益休.docx", "每日两袋温水冲服"),
-        _case("d2", "一天吃几袋?", "说明书:益休.docx", "每日两袋温水冲服"),  # 问句没点名
-        _case("d3", "益家人怎么保存?", "说明书:益家人.docx", "常温避光保存即可"),  # 没有近名
+        _case("d1", "青松每天用几次?", "说明书:青松.docx", "每日一次随餐服用"),
+        _case("d2", "一天用几次?", "说明书:青松.docx", "每日一次随餐服用"),  # 问句没点名
+        _case("d3", "白桦林怎么保存?", "说明书:白桦林.docx", "放在阴凉干燥处即可"),  # 没有近名
     ]
     picked = pick_distractors(cases, files, exclude_ids=set(), n=5, seed=1)
-    assert [(p.case.id, p.entity, p.near) for p in picked] == [("d1", "益休", ("益舒",))]
-    assert "「益舒」" in picked[0].note and "「益休」" in picked[0].note
+    assert [(p.case.id, p.entity, p.near) for p in picked] == [("d1", "青松", ("青柏",))]
+    assert "「青柏」" in picked[0].note and "「青松」" in picked[0].note
     assert pick_distractors(cases, files, exclude_ids={"d1"}, n=5, seed=1) == []
 
 

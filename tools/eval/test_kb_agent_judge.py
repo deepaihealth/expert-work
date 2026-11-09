@@ -18,7 +18,7 @@ from kb_agent_judge import (  # type: ignore[import-not-found]
 )
 from kb_dataset import KbCase, KbExpected  # type: ignore[import-not-found]
 
-_PASSAGES = "益生菌请注意与40℃以上热水间隔30分钟食用,与中西药间隔30分钟食用(抗生素需间隔2小时)。"
+_PASSAGES = "甲款冲剂请与60℃以上热水间隔30分钟服用,与X类药物间隔30分钟服用(Y类药物需间隔2小时)。"
 
 
 def _claim(support: str, quote: str = "", claim: str = "c") -> dict[str, str]:
@@ -38,8 +38,8 @@ def test_style_b_answer_to_a_partial_question_is_correct() -> None:
     # 「资料没直接写」+ 列出原文事实 + 推断标明 = B 式作答(用户 11-07 拍板)
     raw = _raw(
         [
-            _claim("stated", "与中西药间隔30分钟食用"),
-            _claim("inferred_labeled", claim="按这条推测降压药也间隔 30 分钟较稳妥"),
+            _claim("stated", "与X类药物间隔30分钟服用"),
+            _claim("inferred_labeled", claim="按这条推测Z药也间隔 30 分钟较稳妥"),
         ],
         refused=True,
     )
@@ -52,8 +52,8 @@ def test_style_b_answer_to_a_partial_question_is_correct() -> None:
 def test_an_unlabeled_inference_is_fabrication_even_when_facts_are_listed() -> None:
     raw = _raw(
         [
-            _claim("stated", "与中西药间隔30分钟食用"),
-            _claim("inferred_unlabeled", claim="降压药和益生菌一起吃没有影响"),
+            _claim("stated", "与X类药物间隔30分钟服用"),
+            _claim("inferred_unlabeled", claim="Z药和甲款冲剂一起吃没有影响"),
         ],
         refused=True,
     )
@@ -83,7 +83,7 @@ def test_only_saying_not_written_on_a_partial_question_is_style_a_not_b() -> Non
 
 def test_a_stated_claim_whose_quote_is_not_in_the_passages_is_not_a_related_fact() -> None:
     # 判分模型说「原文写了」却给不出能在原文里找到的句子:不算列出了相关事实,单独计数待人看。
-    raw = _raw([_claim("stated", "与降压药间隔两小时服用")], refused=True)
+    raw = _raw([_claim("stated", "与Z药间隔两小时服用")], refused=True)
     verdict = score_verdict(raw, _PASSAGES)
     assert verdict["related_facts"] == 0
     assert verdict["quote_misses"] == 1
@@ -93,7 +93,7 @@ def test_a_stated_claim_whose_quote_is_not_in_the_passages_is_not_a_related_fact
 def test_on_a_no_answer_question_an_unfound_quote_is_fabrication() -> None:
     # 资料没写 / 难负例:判分说「原文写了」却在智能体看到的资料里找不到 —— 回答里的这条只能来自
     # 资料以外(难负例里正是被删掉的那句),记编造,不落进「其它」。
-    raw = _raw([_claim("stated", "与降压药间隔两小时服用")], refused=False)
+    raw = _raw([_claim("stated", "与Z药间隔两小时服用")], refused=False)
     verdict = score_verdict(raw, _PASSAGES)
     assert verdict["fabricated"] is False and verdict["quote_misses"] == 1
     assert category_for("no_answer", verdict) == "编造"
@@ -101,7 +101,7 @@ def test_on_a_no_answer_question_an_unfound_quote_is_fabrication() -> None:
 
 
 def test_quote_match_ignores_spacing_and_full_width_punctuation() -> None:
-    raw = _raw([_claim("stated", "与 中西药间隔 30 分钟食用。")], refused=True)
+    raw = _raw([_claim("stated", "与 X类药物间隔 30 分钟服用。")], refused=True)
     assert score_verdict(raw, _PASSAGES)["related_facts"] == 1
 
 
@@ -125,10 +125,10 @@ def test_malformed_verdicts_are_judge_failures(raw: dict[str, Any]) -> None:
 @pytest.mark.parametrize(
     ("claims", "refused", "matches", "expected"),
     [
-        ([_claim("stated", "与中西药间隔30分钟食用")], False, "yes", "答对"),
-        ([_claim("stated", "与中西药间隔30分钟食用")], False, "partial", "答对"),
+        ([_claim("stated", "与X类药物间隔30分钟服用")], False, "yes", "答对"),
+        ([_claim("stated", "与X类药物间隔30分钟服用")], False, "partial", "答对"),
         ([], True, "no", "误拒"),
-        ([_claim("stated", "与中西药间隔30分钟食用")], False, "no", "答偏"),
+        ([_claim("stated", "与X类药物间隔30分钟服用")], False, "no", "答偏"),
         ([_claim("unsupported")], False, "yes", "编造"),
     ],
 )
@@ -174,7 +174,7 @@ def test_majority_needs_votes() -> None:
 def _case(label: str | None, **kw: Any) -> KbCase:
     return KbCase(
         id="q1",
-        query="益生菌和降压药一起吃有影响吗?",
+        query="甲款冲剂和Z药一起吃有影响吗?",
         source="no_answer",
         tags=(),
         expected=kw.pop("expected", ()),
@@ -188,10 +188,10 @@ _RUN = {"answer": "资料没直接写。", "searches": [{"content": _PASSAGES}],
 
 
 def test_partial_prompt_lists_the_stated_facts_and_asks_for_labeled_inference() -> None:
-    related = (KbExpected(document="说明书.docx", anchor="与中西药间隔30分钟食用", page=None),)
+    related = (KbExpected(document="说明书.docx", anchor="与X类药物间隔30分钟服用", page=None),)
     prompt = judge_prompt(_case("partial", related=related, answer="只写了间隔"), _RUN, {})
     assert "没有直接写" in prompt
-    assert "《说明书.docx》中的原文片段:与中西药间隔30分钟食用" in prompt
+    assert "《说明书.docx》中的原文片段:与X类药物间隔30分钟服用" in prompt
     assert "标明是推断" in prompt
     assert _PASSAGES in prompt
 
@@ -203,7 +203,7 @@ def test_prompt_carries_the_case_note() -> None:
 
 
 def test_answerable_prompt_keeps_the_reference_and_gold_passages() -> None:
-    expected = (KbExpected(document="说明书.docx", anchor="与中西药间隔30分钟食用", page=None),)
+    expected = (KbExpected(document="说明书.docx", anchor="与X类药物间隔30分钟服用", page=None),)
     case = _case("answerable", expected=expected, answer="间隔 30 分钟")
     prompt = judge_prompt(case, _RUN, {"q1": ["整段原文"]})
     assert "参考答案:间隔 30 分钟" in prompt

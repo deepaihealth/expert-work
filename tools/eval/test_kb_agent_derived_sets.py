@@ -74,7 +74,7 @@ def _corpus(tmp_path: Path) -> list[str]:
             for i in range(3)
         ]
         cases.append(
-            {"id": f"{name}-n0", "query": "含多少咖啡因", "source": "no_answer", "expected": []}
+            {"id": f"{name}-n0", "query": "含多少某种成分", "source": "no_answer", "expected": []}
         )
         corpus = {"manifest": str(manifest), "tiers": ["A"]}
         path = tmp_path / f"{name}.yaml"

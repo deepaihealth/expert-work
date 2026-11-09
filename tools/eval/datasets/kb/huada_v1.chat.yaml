@@ -11,9 +11,8 @@
 # 各取前 20 段汇成候选池,同样的判题、摘引与产品名规则(抽查 40 条约 35 条对);收 97 道有答案(chat_qa-0056~0152,
 # 其中 0111 的锚文本人工补)、15 道无答案(chat_no_answer-0006~0020,全语料核过关键词);只能部分回答、或资料里
 # 只有相关内容的 23 道不收(算有答案会压低检索分,算无答案会误导拒答线)。
-# 11-09 改标签(B-206 尺子修正):chat_no_answer-0006 / 0007 / 0008 改 label: partial —— 资料没直接写
-# 咖啡茶 / 胰酶 / 降压药能否同吃,但写了「与 40℃ 以上热水、与中西药间隔 30 分钟」这类相关事实(related 列原文);
-# 期望 B 式作答。expected 仍为空,检索层(kb_eval)照旧当无答案题算。
+# 11-09 改标签(B-206 尺子修正):chat_no_answer-0006 / 0007 / 0008 改 label: partial —— 资料没直接写这三道题
+# 要的结论,只写了相关的服用间隔规定(related 列最短的原文锚);期望 B 式作答。expected 仍为空,检索层照旧当无答案题算。
 name: huada_v1_chat
 corpus:
   manifest: ~/kb-eval/huada/manifest.csv
@@ -5035,17 +5034,17 @@ cases:
   - 无答案
   - 部分写了
   expected: []
-  answer: 资料没直接写咖啡、茶能不能喝;只写了益生菌要与 40℃ 以上热水间隔 30 分钟食用、与大多数熬制饮品间隔 30 分钟以上。
+  answer: 资料没直接写这个结论,只写了相关的服用间隔规定(见 related)。
   label: partial
   related:
   - document: 产品说明书：益健.docx
-    anchor: 注意与40℃以上热水间隔30分钟食用，与中西药间隔30分钟食用
+    anchor: 与40℃以上热水间隔30分钟食用
     page: null
   - document: 产品说明书 ：清风（尿酸管理）.docx
-    anchor: 注意与40℃以上热水间隔30分钟食用，与中西药间隔30分钟食用
+    anchor: 与40℃以上热水间隔30分钟食用
     page: null
   - document: 82_益舒口播稿菌株+带货-12月30日.docx
-    anchor: 和大多数熬制饮品或营养补充剂，间隔30分钟以上服用即可
+    anchor: 熬制饮品或营养补充剂
     page: null
 - id: chat_no_answer-0007
   query: 在吃胰酶肠溶胶囊，还能同时吃益生菌吗？
@@ -5055,17 +5054,14 @@ cases:
   - 无答案
   - 部分写了
   expected: []
-  answer: 资料没直接写胰酶肠溶胶囊能否同吃;只写了益生菌与药物(中西药)至少间隔 30 分钟服用、抗生素间隔 2 小时。
+  answer: 资料没直接写这个结论,只写了相关的服用间隔规定(见 related)。
   label: partial
   related:
   - document: 产品知识：代谢性问题的健康干预策略.docx
-    anchor: 益生菌与药物服用时间至少间隔30分钟，避免相互影响
+    anchor: 益生菌与药物服用时间至少间隔30分钟
     page: null
   - document: 产品说明书：益健.docx
-    anchor: 注意与40℃以上热水间隔30分钟食用，与中西药间隔30分钟食用
-    page: null
-  - document: 产品说明书 ：清风（尿酸管理）.docx
-    anchor: 注意与40℃以上热水间隔30分钟食用，与中西药间隔30分钟食用
+    anchor: 与中西药间隔30分钟食用
     page: null
 - id: chat_no_answer-0008
   query: 益生菌和降压药一起吃有影响吗？
@@ -5075,17 +5071,14 @@ cases:
   - 无答案
   - 部分写了
   expected: []
-  answer: 资料没直接写与降压药同服有无影响;只写了益生菌与药物(中西药)至少间隔 30 分钟服用。
+  answer: 资料没直接写这个结论,只写了相关的服用间隔规定(见 related)。
   label: partial
   related:
   - document: 产品知识：代谢性问题的健康干预策略.docx
-    anchor: 益生菌与药物服用时间至少间隔30分钟，避免相互影响
+    anchor: 益生菌与药物服用时间至少间隔30分钟
     page: null
   - document: 产品说明书：益健.docx
-    anchor: 注意与40℃以上热水间隔30分钟食用，与中西药间隔30分钟食用
-    page: null
-  - document: 产品说明书 ：清风（尿酸管理）.docx
-    anchor: 注意与40℃以上热水间隔30分钟食用，与中西药间隔30分钟食用
+    anchor: 与中西药间隔30分钟食用
     page: null
 - id: chat_no_answer-0009
   query: 测糖化血红蛋白需要空腹吗？

@@ -132,7 +132,7 @@ def _datasets(tmp_path: Path) -> list[str]:
                 "id": f"{name}-a{i}",
                 "query": f"q{i}",
                 "source": "faq_xlsx",
-                "expected": [{"document": "d.md", "anchor": "常温密封保存即可", "page": None}],
+                "expected": [{"document": "d.md", "anchor": "合成锚文本第一句", "page": None}],
             }
             for i in range(20)
         ]
@@ -148,7 +148,7 @@ def test_cli_prints_baseline_and_after_change_without_any_call(
 ) -> None:
     main_set, chat_set = _datasets(tmp_path)
     spec = tmp_path / "hn.yaml"
-    entries = [{"id": f"m-a{i}", "query": "q", "anchors": ["常温密封保存即可"]} for i in range(5)]
+    entries = [{"id": f"m-a{i}", "query": "q", "anchors": ["合成锚文本第一句"]} for i in range(5)]
     spec.write_text(
         yaml.safe_dump({"touched": {"documents": 2, "chars": 100_000}, "cases": entries}),
         encoding="utf-8",
@@ -175,6 +175,7 @@ def test_cli_prints_baseline_and_after_change_without_any_call(
     assert "难负例轮 | 35 题" in out
     assert "改动前基线(当前 main)" in out and "改动后一轮" in out
     assert "不调任何模型" in out
+    assert "2.50 次/题" in out  # 历史每题答题次数不取整
     assert no_network == []
 
 

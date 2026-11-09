@@ -158,8 +158,8 @@ def estimate_run(
     )
 
 
-def _calls(value: float | None) -> str:
-    return "?" if value is None else f"{value:.0f}"
+def _calls(value: float | None, *, digits: int = 0) -> str:
+    return "?" if value is None else f"{value:.{digits}f}"
 
 
 def _row(r: RunEstimate) -> str:
@@ -179,7 +179,7 @@ def format_estimate(
     lines = [
         "知识库智能体层评测报价(不调任何模型:只读历史结果与判分缓存)",
         f"  历史:{h.questions} 题,答题 {h.answer_model} ¥{h.answer_cny_per_q:.3f}/题、"
-        f"{_calls(h.answer_calls_per_q)} 次/题;判分 {h.judge_model} "
+        f"{_calls(h.answer_calls_per_q, digits=2)} 次/题;判分 {h.judge_model} "
         f"¥{h.judge_cny_per_call:.3f}/次;重排 ¥{h.rerank_cny_per_q or 0.0:.3f}/题",
         f"  新判分:提示词约 {h.input_ratio:.3f} 倍、多出结论列表的输出 → ¥{judge_call:.3f}/次",
         *(f"  {n}" for n in notes),

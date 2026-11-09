@@ -284,7 +284,7 @@ def test_committed_chat_set_loads_and_stays_apart_from_the_other_sets() -> None:
 # B-206 11-09:第三种标签 partial(资料只写了相关事实,没直接写结论)
 # ---------------------------------------------------------------------------
 
-_RELATED = [{"document": "说明书A.docx", "anchor": "与中西药间隔30分钟食用", "page": None}]
+_RELATED = [{"document": "说明书A.docx", "anchor": "与X类药物间隔30分钟服用", "page": None}]
 
 
 def test_label_defaults_from_expected(tmp_path: Path) -> None:
@@ -300,7 +300,7 @@ def test_partial_case_keeps_expected_empty_and_carries_related_facts(tmp_path: P
     # 检索层(kb_eval)仍按「没有期望段」处理:召回分数不受这次改标签影响。
     assert loaded.expected == ()
     assert loaded.related == (
-        KbExpected(document="说明书A.docx", anchor="与中西药间隔30分钟食用", page=None),
+        KbExpected(document="说明书A.docx", anchor="与X类药物间隔30分钟服用", page=None),
     )
 
 

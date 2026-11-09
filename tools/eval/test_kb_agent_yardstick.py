@@ -37,7 +37,7 @@ def test_limit_notes_state_the_cap_without_pushing_the_model_to_answer(note: str
 # 多数票接进跑题流程
 # ---------------------------------------------------------------------------
 
-_FACT = "注意与中西药间隔30分钟食用"
+_FACT = "与X类药物间隔30分钟服用"
 
 
 class _OneResultTool:
@@ -82,8 +82,8 @@ class _FlipFlopJudge:
 def _partial_case() -> KbCase:
     related = (KbExpected(document="说明书.docx", anchor=_FACT, page=None),)
     return KbCase(
-        id="chat_no_answer-0008",
-        query="益生菌和降压药一起吃有影响吗?",
+        id="p-0001",
+        query="甲款冲剂和Z药一起吃有影响吗?",
         source="no_answer",
         tags=(),
         expected=(),
