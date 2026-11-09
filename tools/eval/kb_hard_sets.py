@@ -136,6 +136,7 @@ class HardNegative:
     case: KbCase
     anchors: tuple[str, ...]
     deleted_units: int
+    documents: tuple[str, ...] = ()  # 删句动到的文档(估重新嵌入的量)
 
     def to_spec(self, set_label: str) -> dict[str, Any]:
         return {
@@ -144,20 +145,26 @@ class HardNegative:
             "query": self.case.query,
             "anchors": list(self.anchors),
             "deleted_units": self.deleted_units,
+            "documents": list(self.documents),
         }
 
 
-def _deletion(anchors: Sequence[str], texts: Mapping[str, str]) -> tuple[int, list[str]]:
-    """``(删几句, 被删的句子)``,全语料。"""
+def _deletion(
+    anchors: Sequence[str], texts: Mapping[str, str]
+) -> tuple[list[str], tuple[str, ...]]:
+    """``(被删的句子, 动到的文档)``,全语料。"""
     dropped: list[str] = []
-    for text in texts.values():
+    touched: list[str] = []
+    for name, text in texts.items():
         units = split_units(text)
         ukeys = [anchor_key(u) for u in units]
         drop: set[int] = set()
         for anchor in anchors:
             drop |= _windows_for(anchor_key(anchor), ukeys)
-        dropped += [units[i] for i in sorted(drop)]
-    return len(dropped), dropped
+        if drop:
+            touched.append(name)
+            dropped += [units[i] for i in sorted(drop)]
+    return dropped, tuple(touched)
 
 
 def pick_hard_negatives(
@@ -181,15 +188,19 @@ def pick_hard_negatives(
             skipped["match_all"] += 1
             continue
         anchors = tuple(dict.fromkeys(e.anchor for e in case.expected))
-        count, dropped = _deletion(anchors, texts)
-        if count == 0:
+        dropped, documents = _deletion(anchors, texts)
+        if not dropped:
             skipped["anchor_not_found"] += 1
             continue
         dropped_keys = "\n".join(anchor_key(u) for u in dropped)
         if any(key and key in dropped_keys for key in control_keys):
             skipped["touches_control"] += 1
             continue
-        picked.append(HardNegative(case=case, anchors=anchors, deleted_units=count))
+        picked.append(
+            HardNegative(
+                case=case, anchors=anchors, deleted_units=len(dropped), documents=documents
+            )
+        )
     return picked, dict(skipped)
 
 
@@ -370,11 +381,14 @@ def main(argv: Sequence[str] | None = None) -> int:
         c for c in (*main_set.cases, *chat_set.cases) if c.expected and c.id not in control_ids
     ]
     picked, skipped = pick_hard_negatives(candidates, control, texts, n=args.n, seed=args.seed)
+    touched = sorted({d for p in picked for d in p.documents})
     spec = {
         "seed": args.seed,
         "datasets": [main_set.name, chat_set.name],
         "parsed": counts.get("parsed", 0),
         "skipped": skipped,
+        # 删过句的文档要重新切块、嵌入(其余文档嵌入走缓存):估价用。
+        "touched": {"documents": len(touched), "chars": sum(len(texts[d]) for d in touched)},
         "cases": [p.to_spec(set_of[p.case.id]) for p in picked],
     }
     args.out.parent.mkdir(parents=True, exist_ok=True)

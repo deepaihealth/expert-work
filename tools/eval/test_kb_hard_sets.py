@@ -111,6 +111,7 @@ def test_pick_hard_negatives_keeps_every_control_anchor_and_is_deterministic() -
     ]
     picked, skipped = pick_hard_negatives(candidates, control, _TEXTS, n=5, seed=1)
     assert sorted(p.case.id for p in picked) == ["h1", "h4"]
+    assert {p.case.id: p.documents for p in picked} == {"h1": ("a.md",), "h4": ("b.md",)}
     assert skipped == {"touches_control": 1, "match_all": 1}
     again, _ = pick_hard_negatives(candidates, control, _TEXTS, n=5, seed=1)
     assert [p.case.id for p in again] == [p.case.id for p in picked]
