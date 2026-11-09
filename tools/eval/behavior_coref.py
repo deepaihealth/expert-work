@@ -36,6 +36,11 @@ from behavior_schema import CaseResult, CheckVerdict, Coref, RunRecord, read_res
 _SENTENCE_END = re.compile("(?<=[\u3002\uff01!\uff1f?\n])")
 _QUESTION = re.compile("[?\uff1f]")
 _WHICH = re.compile("哪(?:一|个|位|款|家|份)|还是|指的是|是指|是问|问的是")
+#: 不点名候选也算反问的问句:「指的是 / 是指 / 问的是」+ 指向某一类对象的「哪位 / 哪款 / 哪个 …」
+#: (11-09 复审);「您还想了解哪些」「需要我帮您确认吗」这类客套问句都不含这两样。
+_ASKS_WHICH_ONE = re.compile(
+    "(?:指的是|是指|问的是).*哪一?(?:位|款|家|份|个|项|天|条|次|型号|客户|同事|分部)"
+)
 #: 外发参数里不该留下的指示词 / 序数指代(离开对话后对方看不懂)。
 _DEMONSTRATIVE = re.compile(
     "(?<!其)[他它]|她|这个|那个|这款|那款|这份|那份|这家|那家|这位|那位|这两|那两|上面|刚才|"
@@ -69,7 +74,7 @@ def _asks(text: str, candidates: Sequence[str]) -> bool:
     for sentence in _SENTENCE_END.split(text):
         if not (_QUESTION.search(sentence) and _WHICH.search(sentence)):
             continue
-        if any(key in _norm(sentence) for key in keys):
+        if any(key in _norm(sentence) for key in keys) or _ASKS_WHICH_ONE.search(sentence):
             return True
     return False
 

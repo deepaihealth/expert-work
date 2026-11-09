@@ -83,8 +83,10 @@ def _record(final: str, *, query: str | None = "KX-305 保修期", error: bool =
         # 指代明确时把候选全列出来 = 没把指的那个挑出来,不算过(单独计「混答」)
         ("KX-305 保修 26 个月,KX-217 是 18 个月。", "mixed", False),
         ("您问的是 KX-305 还是 KX-217?", "over_clarified", False),
-        # 不点名候选的问句不算反问
-        ("您指的是哪一款?", "missed", False),
+        # 不点名、但真在问「指的是哪一款」也算反问(指代明确时问 = 多余)
+        ("您指的是哪一款?", "over_clarified", False),
+        # 「哪些」不是在问指哪个
+        ("您还想了解哪些型号?", "missed", False),
         ("没有查到。", "missed", False),
     ],
 )
@@ -116,12 +118,17 @@ def test_ambiguous_outcomes(final: str, outcome: str, passed: bool) -> None:
         ("沈遥的分机是 7415。需要我帮您确认其他信息吗?", "confident_pick", False),
         ("没有找到,您还想查哪些内容?", "missed", False),
         ("您问的是林舟还是沈遥?", "clarified", True),
-        ("您指的是哪一位同事?", "missed", False),
+        # 11-09 复审:不点名,但问句是「指的是 / 问的是」+ 哪位 / 哪款 … 这类真反问,算追问
+        ("您指的是哪一位同事?", "clarified", True),
+        ("请问您问的是哪位?", "clarified", True),
+        ("请问是哪位同事呢?", "missed", False),  # 没有「指的是 / 问的是」:不认
         ("林舟的分机是 6203;您问的是林舟吗?", "hedged_pick", True),
         # 问句点了名,但问的是「还想了解哪些」(泛泛的哪些),不是问指哪位
         ("林舟的分机是 6203,关于林舟您还想了解哪些?", "confident_pick", False),
-        # 名字只出现在陈述句里,问句本身没点名
-        ("林舟的分机是 6203。您指的是哪一位?", "confident_pick", False),
+        # 名字只出现在陈述句里,问句是「指的是哪一位」:答了一个又反问 = 带反问的挑一个
+        ("林舟的分机是 6203。您指的是哪一位?", "hedged_pick", True),
+        # 问句没点名,也不是「指的是 / 问的是」:仍是只猜一个
+        ("林舟的分机是 6203。是哪一位呢?", "confident_pick", False),
     ],
 )
 def test_a_clarifying_question_must_name_a_candidate(
