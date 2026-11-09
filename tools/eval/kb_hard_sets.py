@@ -395,16 +395,23 @@ def pick_distractors(
     return found[:n]
 
 
+#: 入库解析器实际用到的模块(``parse_document`` 及它导入的两个 Office 转换)与第三方库。
+FINGERPRINT_MODULES = ("parsing.py", "office_docx.py", "office_xlsx.py")
+FINGERPRINT_DISTS = ("pymupdf", "pymupdf4llm", "markitdown", "openpyxl", "mammoth", "lxml")
+
+
 def parser_fingerprint() -> str:
-    """入库解析器的版本指纹:``control_plane.knowledge`` 下全部源文件 + 三个解析库的版本。"""
+    """入库解析器的版本指纹::data:`FINGERPRINT_MODULES` 的源码 +
+    :data:`FINGERPRINT_DISTS` 的版本。"""
     import importlib.metadata as metadata
 
     import control_plane.knowledge.parsing as parsing
 
     digest = hashlib.sha256()
-    for source in sorted(Path(parsing.__file__).parent.glob("*.py")):
-        digest.update(source.name.encode() + b"\0" + source.read_bytes())
-    for dist in ("pymupdf", "pymupdf4llm", "markitdown"):
+    folder = Path(parsing.__file__).parent
+    for name in FINGERPRINT_MODULES:
+        digest.update(name.encode() + b"\0" + (folder / name).read_bytes())
+    for dist in FINGERPRINT_DISTS:
         try:
             digest.update(f"{dist}={metadata.version(dist)}".encode())
         except metadata.PackageNotFoundError:
@@ -431,7 +438,10 @@ def _parse_fresh(path: Path, cache_dir: Path, fingerprint: str) -> str | None:
     except Exception:  # 解析失败只列出来,选题不因一份坏文件中断
         return None
     cache_dir.mkdir(parents=True, exist_ok=True)
-    cached.write_text(text, encoding="utf-8")
+    # 先写临时文件再改名:并发 / 中途被杀都不会留下半截缓存
+    temp = cache_dir / f"{key}.{os.getpid()}.tmp"
+    temp.write_text(text, encoding="utf-8")
+    os.replace(temp, cached)
     return text
 
 

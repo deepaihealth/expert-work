@@ -357,3 +357,38 @@ def test_the_parse_cache_is_keyed_by_file_content_and_parser_version(tmp_path: P
 def test_the_parser_fingerprint_is_stable_and_names_the_parser() -> None:
     assert parser_fingerprint() == parser_fingerprint()
     assert len(parser_fingerprint()) == 16
+
+
+def test_the_parse_cache_is_written_atomically(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import kb_hard_sets
+
+    replaced: list[tuple[str, str]] = []
+    real = kb_hard_sets.os.replace
+
+    def spy(src: str | Path, dst: str | Path) -> None:
+        replaced.append((str(src), str(dst)))
+        real(src, dst)
+
+    monkeypatch.setattr(kb_hard_sets.os, "replace", spy)
+    doc = tmp_path / "a.md"
+    doc.write_text("# 甲\n\n内容。\n", encoding="utf-8")
+    assert "内容" in str(kb_hard_sets._parse_fresh(doc, tmp_path / "cache", "fp"))
+    [(src, dst)] = replaced
+    assert src.endswith(".tmp") and dst.endswith(".md")
+    assert [p.name for p in (tmp_path / "cache").iterdir()] == [Path(dst).name]
+
+
+def test_the_fingerprint_covers_only_the_parser_modules_and_libraries() -> None:
+    from kb_hard_sets import FINGERPRINT_DISTS, FINGERPRINT_MODULES
+
+    assert FINGERPRINT_MODULES == ("parsing.py", "office_docx.py", "office_xlsx.py")
+    assert set(FINGERPRINT_DISTS) == {
+        "pymupdf",
+        "pymupdf4llm",
+        "markitdown",
+        "openpyxl",
+        "mammoth",
+        "lxml",
+    }
