@@ -7,6 +7,7 @@ turns:
 checks:
   - type: coref
     referent: list_item
+    candidates: [杭州, 苏州, 宁波]
     turn: 2
     target: ["0512-6633-4071"]
     others: ["0571-8810-2210", "0574-2786-5592"]

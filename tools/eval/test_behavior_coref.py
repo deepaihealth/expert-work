@@ -33,9 +33,25 @@ _PRODUCT = Coref(
     target=["26 个月"],
     others=["18 个月"],
     names=["KX-305"],
+    candidates=["KX-305", "KX-217"],
 )
 _AMBIGUOUS = Coref(
-    type="coref", referent="product", turn=2, target=["1299"], others=["899"], ambiguous=True
+    type="coref",
+    referent="product",
+    turn=2,
+    target=["1299"],
+    others=["899"],
+    ambiguous=True,
+    candidates=["KX-305", "KX-217"],
+)
+_PERSONS = Coref(
+    type="coref",
+    referent="person",
+    turn=2,
+    target=["6203"],
+    others=["7415"],
+    ambiguous=True,
+    candidates=["林舟", "沈遥"],
 )
 
 
@@ -64,8 +80,11 @@ def _record(final: str, *, query: str | None = "KX-305 保修期", error: bool =
         ("您是问 KX-217 吗?它保修 18 个月。", "wrong_hedged", False),
         # 结尾一句客套的问句不是反问「指哪个」
         ("整机保修 18 个月。还有别的问题吗?", "confident_wrong", False),
-        ("KX-305 保修 26 个月,KX-217 是 18 个月。", "mixed", True),
-        ("您指的是哪一款?", "over_clarified", False),
+        # 指代明确时把候选全列出来 = 没把指的那个挑出来,不算过(单独计「混答」)
+        ("KX-305 保修 26 个月,KX-217 是 18 个月。", "mixed", False),
+        ("您问的是 KX-305 还是 KX-217?", "over_clarified", False),
+        # 不点名候选的问句不算反问
+        ("您指的是哪一款?", "missed", False),
         ("没有查到。", "missed", False),
     ],
 )
@@ -89,6 +108,29 @@ def test_ambiguous_outcomes(final: str, outcome: str, passed: bool) -> None:
     assert (got.outcome, got.passed) == (outcome, passed)
 
 
+@pytest.mark.parametrize(
+    ("final", "outcome", "passed"),
+    [
+        # 评审 11-09 找到的误判:答了一个、结尾是客套问句 / 没找到加客套问句
+        ("林舟的分机号是 6203。您还想了解哪些信息?", "confident_pick", False),
+        ("沈遥的分机是 7415。需要我帮您确认其他信息吗?", "confident_pick", False),
+        ("没有找到,您还想查哪些内容?", "missed", False),
+        ("您问的是林舟还是沈遥?", "clarified", True),
+        ("您指的是哪一位同事?", "missed", False),
+        ("林舟的分机是 6203;您问的是林舟吗?", "hedged_pick", True),
+        # 问句点了名,但问的是「还想了解哪些」(泛泛的哪些),不是问指哪位
+        ("林舟的分机是 6203,关于林舟您还想了解哪些?", "confident_pick", False),
+        # 名字只出现在陈述句里,问句本身没点名
+        ("林舟的分机是 6203。您指的是哪一位?", "confident_pick", False),
+    ],
+)
+def test_a_clarifying_question_must_name_a_candidate(
+    final: str, outcome: str, passed: bool
+) -> None:
+    got = classify(_PERSONS, _record(final, query=None))
+    assert (got.outcome, got.passed) == (outcome, passed)
+
+
 def test_plural_needs_every_target() -> None:
     plural = Coref(
         type="coref", referent="plural", turn=2, target=["26 个月", "18 个月"], others=["15 个月"]
@@ -107,6 +149,9 @@ def test_outgoing_query_signals() -> None:
     assert (named.named, named.query_named, named.query_demonstrative) == (False, True, False)
     vague = classify(_PRODUCT, _record("KX-305 保修 26 个月", query="它的保修期多久"))
     assert (vague.named, vague.query_named, vague.query_demonstrative) == (True, False, True)
+    # 「其他」里的「他」不是指示词
+    other = classify(_PRODUCT, _record("KX-305 保修 26 个月", query="KX-305 和其他型号的保修期"))
+    assert other.query_demonstrative is False
     # 被拒的调用不算;这一轮没调工具就记「不适用」
     refused = classify(_PRODUCT, _record("26 个月", query="KX-305", error=True))
     assert (refused.query_named, refused.query_demonstrative) == (None, None)
@@ -136,6 +181,7 @@ def test_the_verdict_always_carries_its_detail() -> None:
     ("fields", "message"),
     [
         ({"ambiguous": True, "others": []}, "ambiguous"),
+        ({"ambiguous": True, "others": ["18 个月"], "candidates": ["KX-305"]}, "candidates"),
         ({"target": ["26 个月"], "others": ["26 个月"]}, "both"),
         ({"referent": "pet"}, "referent"),
     ],
@@ -168,17 +214,18 @@ def test_summary_reports_the_three_numbers_and_a_row_per_referent_type() -> None
         _result("r01", d.format("person", 0, "right", 1, 0), True),
         _result("r01", d.format("person", 0, "confident_wrong", 0, 1), False),
         _result("r03", d.format("customer", 0, "wrong_hedged", "-", "-"), False),
+        _result("r03", d.format("customer", 0, "mixed", "-", "-"), False),
         _result("r02", d.format("person", 1, "clarified", "-", "-"), True),
         _result("r05", d.format("product", 1, "confident_pick", "-", "-"), False),
         _result("r05", d.format("product", 1, "answered_both", "-", "-"), True),
         CaseResult(case_id="r09", rep=1, passed=None, infra_error="boom"),
     ]
     text = summarize(results)
-    assert "指代对象明确 n=3:指错对象 66.7%(2/3),其中很笃定地答错对象 1" in text
+    assert "指代对象明确 n=4:指错对象 50.0%(2/4),其中很笃定地答错对象 1;混答 25.0%(1/4)" in text
     assert "有两个以上候选 n=3:追问 33.3%(1/3),追问或两个都答 66.7%(2/3),只猜一个 1" in text
     assert "外发检索参数:点名 50.0%(1/2),残留指示词 1" in text
     assert "  person n=3 通过 2" in text
-    assert "  customer n=1 通过 0" in text
+    assert "  customer n=2 通过 0" in text
     assert "(另有 1 次没跑成,不计)" in text
 
 
@@ -257,3 +304,13 @@ def test_eval_coref_binds_only_the_coref_base_and_the_readme_lists_it() -> None:
     assert sorted(p.name for p in (FIXTURES_DIR / "kb" / "b140-kb-coref").iterdir()) == sorted(
         module.COREF_DOCS["b140-kb-coref"]
     )
+
+
+def test_every_coref_case_lists_its_candidates_in_the_corpus() -> None:
+    corpus = _norm(_corpus())
+    for case in _coref_cases():
+        [check] = [c for c in case.checks if isinstance(c, Coref)]
+        assert len(check.candidates) >= 2, case.id
+        assert set(check.names) <= set(check.candidates), case.id
+        for name in check.candidates:
+            assert _norm(name) in corpus, (case.id, name)

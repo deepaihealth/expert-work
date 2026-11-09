@@ -9,6 +9,7 @@ turns:
 checks:
   - type: coref
     referent: file
+    candidates: [远航五金, 远帆五金]
     turn: 2
     target: ["2027 年 1 月 15 日"]
     others: ["2026 年 12 月 31 日"]

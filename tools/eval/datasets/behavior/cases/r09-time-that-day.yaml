@@ -5,4 +5,4 @@ turns:
   - prompt: 第二次设备巡检是哪天?
   - prompt: 那天做了什么?
 checks:
-  - {type: coref, referent: time_event, turn: 2, target: [压缩机], others: [滤网], names: [5 月 20 日, 第二次巡检]}
+  - {type: coref, referent: time_event, turn: 2, target: [压缩机], others: [滤网], names: [5 月 20 日, 第二次巡检], candidates: [第一次巡检, 第二次巡检, 3 月 12 日, 5 月 20 日]}

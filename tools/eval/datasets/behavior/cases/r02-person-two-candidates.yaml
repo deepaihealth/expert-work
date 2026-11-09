@@ -5,4 +5,4 @@ turns:
   - prompt: 林舟和沈遥分别负责什么?
   - prompt: 他的分机号是多少?
 checks:
-  - {type: coref, referent: person, turn: 2, ambiguous: true, target: ["6203"], others: ["7415"]}
+  - {type: coref, referent: person, turn: 2, ambiguous: true, target: ["6203"], others: ["7415"], candidates: [林舟, 沈遥]}

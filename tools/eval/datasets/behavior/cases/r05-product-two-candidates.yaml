@@ -5,4 +5,4 @@ turns:
   - prompt: KX-305 和 KX-217 分别是什么品类?
   - prompt: 它多少钱?
 checks:
-  - {type: coref, referent: product, turn: 2, ambiguous: true, target: ["1299"], others: ["899"]}
+  - {type: coref, referent: product, turn: 2, ambiguous: true, target: ["1299"], others: ["899"], candidates: [KX-305, KX-217]}

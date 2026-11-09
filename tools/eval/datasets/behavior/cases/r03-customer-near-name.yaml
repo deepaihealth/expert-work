@@ -5,4 +5,4 @@ turns:
   - prompt: 青禾商贸的合同什么时候到期?
   - prompt: 它的账户经理是谁?
 checks:
-  - {type: coref, referent: customer, turn: 2, target: [柏青], others: [何川], names: [青禾商贸]}
+  - {type: coref, referent: customer, turn: 2, target: [柏青], others: [何川], names: [青禾商贸], candidates: [青禾商贸, 青和商贸]}

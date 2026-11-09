@@ -277,12 +277,17 @@ class Coref(_Strict):
     others: list[str] = Field(default_factory=list)
     ambiguous: bool = False
     names: list[str] = Field(default_factory=list)
+    #: 同类候选的名字(含该指的那个):回复里的问句点了其中之一,才算在反问「指哪个」。
+    #: 有歧义的判据至少两个。
+    candidates: list[str] = Field(default_factory=list)
     tool: str | None = "knowledge_search"
 
     @model_validator(mode="after")
     def _consistent(self) -> Coref:
         if self.ambiguous and not self.others:
             raise ValueError("an ambiguous coref check needs the other candidate's facts")
+        if self.ambiguous and len(self.candidates) < 2:
+            raise ValueError("an ambiguous coref check needs at least two candidates")
         both = set(self.target) & set(self.others)
         if both:
             raise ValueError(f"{sorted(both)} in both target and others")

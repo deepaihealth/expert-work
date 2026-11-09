@@ -5,4 +5,4 @@ turns:
   - prompt: 林舟在公司是做什么的?
   - prompt: 他的分机号是多少?
 checks:
-  - {type: coref, referent: person, turn: 2, target: ["6203"], others: ["7415", "5130"], names: [林舟]}
+  - {type: coref, referent: person, turn: 2, target: ["6203"], others: ["7415", "5130"], names: [林舟], candidates: [林舟, 沈遥, 方叙]}

@@ -31,18 +31,22 @@ if str(_HERE) not in sys.path:
 
 from behavior_schema import CaseResult, CheckVerdict, Coref, RunRecord, read_results  # noqa: E402
 
-#: 反问:有问号,且在问「哪一个 / 是 A 还是 B / 指的是」。
+#: 反问 = 一个以问号结尾的句子,问「哪一个 / 是 A 还是 B / 指的是」,且点了至少一个候选的名字。
+#: 只看问句本身:「您还想了解哪些信息?」「需要我帮您确认其他信息吗?」这类客套收尾不算(评审 11-09)。
+_SENTENCE_END = re.compile("(?<=[\u3002\uff01!\uff1f?\n])")
 _QUESTION = re.compile("[?\uff1f]")
-_WHICH = re.compile("哪|还是|指的是|是指|是问|确认")
+_WHICH = re.compile("哪(?:一|个|位|款|家|份)|还是|指的是|是指|是问|问的是")
 #: 外发参数里不该留下的指示词 / 序数指代(离开对话后对方看不懂)。
 _DEMONSTRATIVE = re.compile(
-    "它|他们|他|她|这个|那个|这款|那款|这份|那份|这家|那家|这位|那位|这两|那两|上面|刚才|"
+    "(?<!其)[他它]|她|这个|那个|这款|那款|这份|那份|这家|那家|这位|那位|这两|那两|上面|刚才|"
     "那天|这天|另一个|第[一二三四五六七八九十0-9]+[个条项款份]"
 )
 #: 比对事实前去掉:空白、半角 / 全角逗号、连字符与全角 / 长短破折号。
 _NOISE = re.compile("[\\s,\uff0c\\-\uff0d\u2013\u2014]")
 
-UNAMBIGUOUS_PASS = frozenset({"right", "mixed"})
+#: 指代明确时只有「right」算过:把同类候选的事实一起列出来(mixed)= 没把指的那个挑出来,
+#: 用户还得自己在答复里找;它单独计数,不算「指错对象」。
+UNAMBIGUOUS_PASS = frozenset({"right"})
 AMBIGUOUS_PASS = frozenset({"answered_both", "clarified", "hedged_pick"})
 WRONG = frozenset({"confident_wrong", "wrong_hedged"})
 
@@ -60,8 +64,14 @@ class CorefOutcome:
     query_demonstrative: bool | None
 
 
-def _asks(text: str) -> bool:
-    return bool(_QUESTION.search(text) and _WHICH.search(text))
+def _asks(text: str, candidates: Sequence[str]) -> bool:
+    keys = [_norm(c) for c in candidates if _norm(c)]
+    for sentence in _SENTENCE_END.split(text):
+        if not (_QUESTION.search(sentence) and _WHICH.search(sentence)):
+            continue
+        if any(key in _norm(sentence) for key in keys):
+            return True
+    return False
 
 
 def _outcome(check: Coref, text: str) -> str:
@@ -69,7 +79,7 @@ def _outcome(check: Coref, text: str) -> str:
     hits = [_norm(t) in norm for t in check.target]
     target = all(hits) if check.referent == "plural" else any(hits)
     other = any(_norm(o) in norm for o in check.others)
-    asks = _asks(text)
+    asks = _asks(text, check.candidates or check.names)
     if check.ambiguous:
         if any(hits) and other:
             return "answered_both"
@@ -128,7 +138,8 @@ def _pct(hit: int, n: int) -> str:
 
 
 def summarize(results: Sequence[CaseResult]) -> str:
-    """三个数一起报:指错对象率(含很笃定地答错的次数)、有歧义时追问率、外发参数点名率。"""
+    """三个数一起报:指错对象率(含很笃定地答错的次数;把候选全列出来的「混答」另计)、
+    有歧义时追问率、外发参数点名率。"""
     rows = [
         (parse_detail(v.detail), v.passed) for r in results for v in r.verdicts if v.type == "coref"
     ]
@@ -143,7 +154,8 @@ def summarize(results: Sequence[CaseResult]) -> str:
     lines = [
         "## 多轮指代(三个数一起看)",
         f"  指代对象明确 n={len(clear)}:指错对象 {_pct(wrong, len(clear))},"
-        f"其中很笃定地答错对象 {out_clear['confident_wrong']}",
+        f"其中很笃定地答错对象 {out_clear['confident_wrong']};"
+        f"混答 {_pct(out_clear['mixed'], len(clear))}",
         f"  有两个以上候选 n={len(unclear)}:追问 {_pct(asked, len(unclear))},"
         f"追问或两个都答 {_pct(asked + out_unclear['answered_both'], len(unclear))},"
         f"只猜一个 {out_unclear['confident_pick']}",

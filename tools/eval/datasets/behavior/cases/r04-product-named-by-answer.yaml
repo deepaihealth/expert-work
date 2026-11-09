@@ -5,4 +5,4 @@ turns:
   - prompt: KX-305 和 KX-217 哪个是除湿机?
   - prompt: 它的保修期多久?
 checks:
-  - {type: coref, referent: product, turn: 2, target: ["26 个月"], others: ["18 个月"], names: [KX-305]}
+  - {type: coref, referent: product, turn: 2, target: ["26 个月"], others: ["18 个月"], names: [KX-305], candidates: [KX-305, KX-217]}

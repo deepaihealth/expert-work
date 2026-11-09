@@ -6,4 +6,4 @@ turns:
     fixtures: [coref-quote-a.md, coref-quote-b.md]
   - prompt: 这份的总价是多少?
 checks:
-  - {type: coref, referent: file, turn: 2, ambiguous: true, target: ["48600"], others: ["52300"], tool: null}
+  - {type: coref, referent: file, turn: 2, ambiguous: true, target: ["48600"], others: ["52300"], tool: null, candidates: [远帆五金, 远航五金]}
