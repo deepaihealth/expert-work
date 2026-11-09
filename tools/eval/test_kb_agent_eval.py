@@ -559,7 +559,7 @@ def test_tally_counts_each_category_with_totals_and_spend(tmp_path: Path) -> Non
     run = {"run": {"spend_cny": {"answer": 1.25, "judge": 0.5, "rerank": 0.2}}}
     lines = [json.dumps(r, ensure_ascii=False) for r in [*rows, run]]
     out.write_text("\n".join(lines) + "\n", encoding="utf-8")
-    text = tally(out).splitlines()[6:]  # 头 6 行是模型标题与头条(test_kb_agent_tally)
+    text = tally(out).splitlines()[8:]  # 头 8 行是模型标题与头条(test_kb_agent_tally)
     assert text[0] == "## 资料没写"
     assert text[1] == "  all  n=2 正确说没写 1 编造 1 其它 0 判分失败 0 判分分歧 0"
     assert text[2] == "  main n=1 正确说没写 1 编造 0 其它 0 判分失败 0 判分分歧 0"

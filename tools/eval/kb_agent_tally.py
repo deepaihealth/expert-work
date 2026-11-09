@@ -2,7 +2,8 @@
 
 头条三个数**总是一起报**(11-05 研究:任何防编造的改动都会抬高误拒,单看一个会选错):
 
-* 资料没写(含难负例):**该拒拒了**的比例 + 编造题数;
+* 资料没写(含难负例):**该拒拒了**的比例 + 编造题数(编造另按 资料没写 / 难负例 / 部分写了 /
+  有答案 四组各数一遍,再给合计);
 * 有答案(含近名干扰题):**不该拒却拒了**的比例;
 * 部分写了(``partial``):**B 式作答**的比例。
 
@@ -61,7 +62,9 @@ def headline_rates(rows: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
     for row in rows:
         by_label.setdefault(row_label(row), Counter())[row["category"]] += 1
     no_answer, answerable, partial = (by_label[k] for k in ("no_answer", "answerable", "partial"))
+    fabricated_by = Counter(_fabrication_group(r) for r in rows if r["category"] == "编造")
     return {
+        "fabricated_by": {k: fabricated_by[k] for k in _FAB_GROUPS},
         "abstain": (no_answer["正确说没写"], no_answer.total()),
         "fabricated": no_answer["编造"],
         "false_refusal": (answerable["误拒"], answerable.total()),
@@ -69,6 +72,38 @@ def headline_rates(rows: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
         "disagree": sum(1 for r in rows if r["category"] == DISAGREE),
         "failed": sum(1 for r in rows if r["category"] == FAILED),
     }
+
+
+#: 编造按这几组分开数(11-09 评审:只数「资料没写」会把改标 partial 的题、有答案题上的编造藏起来)。
+_FAB_GROUPS = ("no_answer", "hard_negative", "partial", "answerable")
+
+
+def _fabrication_group(row: Mapping[str, Any]) -> str:
+    label = row_label(row)
+    if label == "no_answer" and row.get("set") == "hard_negative":
+        return "hard_negative"
+    return label
+
+
+def _fab_line(r: Mapping[str, Any]) -> str:
+    by = r["fabricated_by"]
+    return (
+        f"  编造:资料没写 {by['no_answer']}、难负例 {by['hard_negative']}、部分写了 {by['partial']}、"
+        f"有答案(含干扰){by['answerable']},合计 {sum(by.values())}"
+    )
+
+
+def _quote_misses(rows: Sequence[Mapping[str, Any]]) -> str:
+    parts = []
+    for label in ("no_answer", "partial", "answerable"):
+        ids = [
+            str(r["case_id"])
+            for r in rows
+            if row_label(r) == label and (r.get("verdict") or {}).get("quote_misses")
+        ]
+        shown = f"({', '.join(ids[:10])}{', …' if len(ids) > 10 else ''})" if ids else ""
+        parts.append(f"{_LABEL_TITLES[label]} {len(ids)} 题{shown}")
+    return "  引文在资料里没找到:" + ";".join(parts)
 
 
 def _pct(rate: Rate) -> str:
@@ -91,7 +126,9 @@ def _headline(rows: Sequence[Mapping[str, Any]]) -> list[str]:
         f"  资料没写 n={r['abstain'][1]}:该拒拒了 {_pct(r['abstain'])},编造 {r['fabricated']}",
         f"  有答案 n={r['false_refusal'][1]}:不该拒却拒了 {_pct(r['false_refusal'])}",
         f"  部分写了 n={r['style_b'][1]}:B 式作答 {_pct(r['style_b'])}",
+        _fab_line(r),
         f"  判分:分歧 {r['disagree']},失败 {r['failed']};全票一致 {_unanimous(rows)}",
+        _quote_misses(rows),
     ]
 
 
@@ -158,11 +195,16 @@ def _usage(rows: Sequence[Mapping[str, Any]], runs: Sequence[Mapping[str, Any]])
 
 
 def _compare(by_model: Mapping[str, Sequence[Mapping[str, Any]]]) -> list[str]:
-    lines = ["## 分模型对比", "  模型 | 该拒拒了 | 编造 | 不该拒却拒了 | B 式作答"]
+    lines = [
+        "## 分模型对比",
+        "  模型 | 该拒拒了 | 编造 没写/难负例/部分/有答案/合计 | 不该拒却拒了 | B 式作答",
+    ]
     for model in sorted(by_model):
         r = headline_rates(by_model[model])
+        by = r["fabricated_by"]
+        fab = "/".join(str(by[k]) for k in _FAB_GROUPS) + f"/{sum(by.values())}"
         lines.append(
-            f"  {model} | {_pct(r['abstain'])} | {r['fabricated']} | "
+            f"  {model} | {_pct(r['abstain'])} | {fab} | "
             f"{_pct(r['false_refusal'])} | {_pct(r['style_b'])}"
         )
     return lines

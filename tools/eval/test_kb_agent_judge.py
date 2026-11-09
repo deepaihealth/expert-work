@@ -90,6 +90,16 @@ def test_a_stated_claim_whose_quote_is_not_in_the_passages_is_not_a_related_fact
     assert category_for("partial", verdict) == "只说没写"
 
 
+def test_on_a_no_answer_question_an_unfound_quote_is_fabrication() -> None:
+    # 资料没写 / 难负例:判分说「原文写了」却在智能体看到的资料里找不到 —— 回答里的这条只能来自
+    # 资料以外(难负例里正是被删掉的那句),记编造,不落进「其它」。
+    raw = _raw([_claim("stated", "与降压药间隔两小时服用")], refused=False)
+    verdict = score_verdict(raw, _PASSAGES)
+    assert verdict["fabricated"] is False and verdict["quote_misses"] == 1
+    assert category_for("no_answer", verdict) == "编造"
+    assert category_for("partial", verdict) == "其它"
+
+
 def test_quote_match_ignores_spacing_and_full_width_punctuation() -> None:
     raw = _raw([_claim("stated", "与 中西药间隔 30 分钟食用。")], refused=True)
     assert score_verdict(raw, _PASSAGES)["related_facts"] == 1

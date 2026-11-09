@@ -79,8 +79,9 @@ def test_tally_splits_by_answer_model_and_compares_them(tmp_path: Path) -> None:
     assert "# 答题模型 glm-5.3" in text
     assert "# 答题模型 deepseek-v4-flash" in text
     assert "## 分模型对比" in text
-    assert "  deepseek-v4-flash | 50.0%(1/2) | 1 | —(0/0) | —(0/0)" in text
-    assert "  glm-5.3 | 50.0%(2/4) | 1 | 50.0%(1/2) | 50.0%(1/2)" in text
+    assert "  模型 | 该拒拒了 | 编造 没写/难负例/部分/有答案/合计 | 不该拒却拒了 | B 式作答" in text
+    assert "  deepseek-v4-flash | 50.0%(1/2) | 1/0/0/0/1 | —(0/0) | —(0/0)" in text
+    assert "  glm-5.3 | 50.0%(2/4) | 1/0/0/0/1 | 50.0%(1/2) | 50.0%(1/2)" in text
 
 
 def test_rows_from_before_labels_are_read_by_answerable(tmp_path: Path) -> None:
@@ -88,3 +89,41 @@ def test_rows_from_before_labels_are_read_by_answerable(tmp_path: Path) -> None:
     text = tally([_write(tmp_path / "a.jsonl", old)])
     assert "资料没写 n=4:该拒拒了 50.0%(2/4),编造 1" in text
     assert "有答案 n=1:不该拒却拒了 0.0%(0/1)" in text
+
+
+def _fab(case_id: str, label: str, set_: str, *, quote_misses: int = 0) -> dict[str, Any]:
+    row = _row(case_id, label, "编造", set_=set_)
+    row["verdict"] = {"fabricated": True, "quote_misses": quote_misses}
+    return row
+
+
+def test_fabrication_is_counted_for_every_label_not_only_no_answer(tmp_path: Path) -> None:
+    # 11-09 评审:0006~0008 改标 partial 后,只数「资料没写」的编造会把它们藏起来
+    rows = [
+        _fab("n1", "no_answer", "chat"),
+        _fab("h1", "no_answer", "hard_negative"),
+        _fab("h2", "no_answer", "hard_negative"),
+        _fab("p1", "partial", "chat"),
+        _fab("a1", "answerable", "main"),
+        _fab("d1", "answerable", "distractor"),
+    ]
+    rates = headline_rates(rows)
+    assert rates["fabricated_by"] == {
+        "no_answer": 1,
+        "hard_negative": 2,
+        "partial": 1,
+        "answerable": 2,
+    }
+    text = tally([_write(tmp_path / "a.jsonl", rows)])
+    assert "  编造:资料没写 1、难负例 2、部分写了 1、有答案(含干扰)2,合计 6" in text
+
+
+def test_quote_misses_are_listed_per_label_with_case_ids(tmp_path: Path) -> None:
+    rows = [
+        _fab("n1", "no_answer", "chat", quote_misses=2),
+        _fab("h1", "no_answer", "hard_negative", quote_misses=1),
+        {**_row("p1", "partial", "只说没写"), "verdict": {"quote_misses": 1}},
+        _row("a1", "answerable", "答对"),
+    ]
+    text = tally([_write(tmp_path / "a.jsonl", rows)])
+    assert "  引文在资料里没找到:资料没写 2 题(n1, h1);部分写了 1 题(p1);有答案 0 题" in text
