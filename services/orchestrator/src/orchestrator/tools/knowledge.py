@@ -166,10 +166,23 @@ MULTI_KNOWLEDGE_FIRST_RULE = (
 #: tool, so an agent with no knowledge base never sees it. The rule itself sits in
 #: the tool description; the text appended to results states facts rather than
 #: commands (B-163: command-voiced out-of-band text trips injection defenses).
+#: B-206 11-09 — the partial-answer form the user chose on 11-07 (style B): when
+#: no passage states the fact asked, say so, give the related facts the documents
+#: do state with where they come from, and mark an inference or general knowledge
+#: as such. Not "only say it is not stated" (A), not "infer freely" (C). The
+#: opening, measured since B-175, is unchanged.
 KNOWLEDGE_ANSWERABILITY_RULE = (
     "Results are the closest passages, not confirmed answers: rely only on what they "
-    "explicitly state, and if none states the specific fact asked, say the knowledge "
-    "base does not state it instead of inferring or guessing it."
+    "explicitly state. If none states the specific fact asked, say the knowledge base does "
+    "not directly state it, then give the related facts it does state with the documents "
+    "they come from; mark any inference of your own, and anything from general knowledge, "
+    "as such, never as what the knowledge base says."
+)
+#: B-206 11-09 — the receiving retriever sees only this string, never the
+#: conversation (multi-turn references, ``graph_builder.outgoing_reference``).
+QUERY_DESCRIPTION = (
+    "Natural-language search query, self-contained: write out the name that a pronoun or a "
+    "reference to earlier messages stands for."
 )
 #: B-206 K-6 — how to search, in the tool description only (so, like the rule
 #: above, an agent with no knowledge base never sees it). Searching more widely is
@@ -1099,10 +1112,7 @@ class KnowledgeSearchTool:
             parameters={
                 "type": "object",
                 "properties": {
-                    "query": {
-                        "type": "string",
-                        "description": "Natural-language search query.",
-                    },
+                    "query": {"type": "string", "description": QUERY_DESCRIPTION},
                     "limit": {
                         "type": "integer",
                         "minimum": 1,

@@ -247,7 +247,8 @@ def _excerpt(text: str, head: int, tail: int) -> str:
     return f"{text[:head]}{_ELLIPSIS}{text[-tail:]}"
 
 
-def _has_marker(text: str) -> bool:
+def has_reference_marker(text: str) -> bool:
+    """``text`` holds a reference / ellipsis marker (Chinese or English)."""
     return bool(_ZH_MARKERS.search(text) or _EN_MARKERS.search(text))
 
 
@@ -267,7 +268,7 @@ def trigger_of(text: str) -> Trigger:
     """Whether a message needs the conversation to be understood on its own."""
     if is_small_talk_text(text) or _TOPIC_SWITCH.search(text):
         return "none"
-    marker = _has_marker(text)
+    marker = has_reference_marker(text)
     if not marker and _names_identifier(text):
         return "none"
     if len(text) <= FOLLOW_UP_MAX_CHARS:

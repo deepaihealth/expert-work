@@ -151,6 +151,7 @@ from orchestrator.graph_builder._config import (
     failover_sink_from_config,
     token_sink_from_config,
 )
+from orchestrator.graph_builder.answer_check import answer_check_note
 from orchestrator.graph_builder.figure_block import (
     figure_block_message,
     figure_freshness,
@@ -164,6 +165,7 @@ from orchestrator.graph_builder.input_url_guard import (
     guard_message,
 )
 from orchestrator.graph_builder.memory import MemoryNode, PreCompactionFlush
+from orchestrator.graph_builder.outgoing_reference import note_outgoing_query
 from orchestrator.graph_builder.planner import (
     PlannerNode,
     complete_open_steps,
@@ -1199,6 +1201,11 @@ def build_react_graph(
         # B-282 —— 留存作业清掉了这段会话闲置的工作目录:同样一次性、只进提示词视图。
         if configurable.get(WORKSPACE_CLEANED_KEY) is True and not configurable.get("child_run"):
             messages = _append_tail_human_message(messages, WORKSPACE_CLEANED_NOTE)
+        # B-206 11-09 —— 这一轮用过知识库, 之后每一步平台段里带一句「答前核对」(只进视图,
+        # 不多调一次模型;见 ``answer_check``)。
+        answer_check = answer_check_note(state["messages"])
+        if answer_check is not None:
+            messages = _append_tail_human_message(messages, answer_check)
         # 两条都有时步数预警在前(B-226 ②)。
         if step_notice is not None:
             messages = _append_tail_human_message(messages, step_notice)
@@ -4755,6 +4762,8 @@ async def _invoke_tool(
             0,
             classified_invalid_arguments(tool_name=tool.spec.name, summary=schema_error),
         )
+    # B-206 11-09 —— 外发检索词里残留的代词 / 指代词只计数(启发式信号), 不改行为。
+    note_outgoing_query(tool.spec.name, args)
     try:
         result = await tool.call(args, ctx=ctx)
     except Exception as exc:

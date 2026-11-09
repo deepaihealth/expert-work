@@ -120,6 +120,10 @@ from orchestrator.graph_builder.agent_notes import (
     make_agent_notes_node,
 )
 from orchestrator.graph_builder.conversation_seed import make_conversation_seed_node
+from orchestrator.graph_builder.outgoing_reference import (
+    OUTGOING_ARGUMENTS_CLAUSE,
+    sends_arguments_out,
+)
 from orchestrator.graph_builder.platform_context import PLATFORM_CONTEXT_SYSTEM_CLAUSE
 from orchestrator.llm import (
     AnthropicProvider,
@@ -1238,6 +1242,7 @@ async def build_agent(
         # that one fact, so an agent without the tool never reads its rubric.
         worker_delegation=SPAWN_WORKER_TOOL_NAME in registry,
         knowledge_catalog=knowledge_catalog,
+        outgoing_arguments=sends_arguments_out(entry.name for entry in registry.catalog()),
         agent_memory=(
             agent_memory_rules(
                 has_edit_file="edit_file" in registry,
@@ -2091,6 +2096,7 @@ def _assemble_system_prompt(
     worker_delegation: bool = False,
     knowledge_catalog: str | None = None,
     agent_memory: str | None = None,
+    outgoing_arguments: bool = False,
 ) -> str:
     """Splice base system prompt + skill summary list + ordered body
     fragments (eager skills only) + SE-10 text-class component blocks.
@@ -2125,6 +2131,10 @@ def _assemble_system_prompt(
     pieces.append("\n\n" + COMPLETION_CONTRACT_CLAUSE)
     # B-162 —— 无条件:``<platform-context>`` 的含义只在这里讲一次, 段内只留短标注。
     pieces.append("\n\n" + PLATFORM_CONTEXT_SYSTEM_CLAUSE)
+    # B-206 11-09 —— 只给有外发工具(知识库检索 / 联网搜索 / http / MCP)的构建:外发参数
+    # 自带主语。构建期定、整段不变, 放在按天变化的日期段之前。
+    if outgoing_arguments:
+        pieces.append("\n\n" + OUTGOING_ARGUMENTS_CLAUSE)
 
     # Dynamic-context — day-granular current date (``dynamic_context.
     # inject_current_date``). Placed first after base so the model reads it as
