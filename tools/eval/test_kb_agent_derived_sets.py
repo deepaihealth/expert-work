@@ -12,12 +12,8 @@ from typing import Any
 
 import pytest
 import yaml
-from kb_agent_eval import (  # type: ignore[import-not-found]
-    ANSWER_ENV,
-    JUDGE_ENV,
-    main,
-    select_cases,
-)
+from kb_agent_cases import select_cases  # type: ignore[import-not-found]
+from kb_agent_eval import ANSWER_ENV, JUDGE_ENV, main  # type: ignore[import-not-found]
 from kb_agent_models import FakeModels  # type: ignore[import-not-found]
 from kb_corpus_inventory import MANIFEST_FIELDS  # type: ignore[import-not-found]
 from kb_dataset import load_dataset  # type: ignore[import-not-found]

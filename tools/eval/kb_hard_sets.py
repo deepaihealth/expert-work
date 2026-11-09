@@ -364,7 +364,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--out", type=Path, required=True)
     args = parser.parse_args(argv)
 
-    from kb_agent_eval import select_cases  # type: ignore[import-not-found]
+    from kb_agent_cases import select_cases  # type: ignore[import-not-found]
     from kb_build_dataset import parse_corpus  # type: ignore[import-not-found]
 
     main_set, chat_set = load_dataset(args.dataset), load_dataset(args.chat_dataset)

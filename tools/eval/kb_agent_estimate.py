@@ -178,7 +178,7 @@ def format_estimate(
 
 def _count_runs(args: argparse.Namespace) -> tuple[int, int, int, float, list[str]]:
     """``(标准轮题数, 其中干扰题, 难负例轮题数, 难负例删句文档字数, 说明)``。"""
-    from kb_agent_eval import plan_run, select_cases  # type: ignore[import-not-found]
+    from kb_agent_cases import plan_run, select_cases  # type: ignore[import-not-found]
 
     main_set, chat_set = load_dataset(args.dataset), load_dataset(args.chat_dataset)
     picked = select_cases(main_set, chat_set)
@@ -222,7 +222,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     price = resolve_price(h.judge_model, args.judge_price)
     cache = args.judge_cache
     if cache is None:
-        from kb_agent_eval import JUDGE_CACHE_DB
+        from kb_agent_eval import JUDGE_CACHE_DB  # type: ignore[import-not-found]
 
         cache = JUDGE_CACHE_DB
     reply = average_reply_chars(cache)

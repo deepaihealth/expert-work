@@ -19,6 +19,7 @@ from uuid import uuid4
 import httpx
 import pytest
 import yaml
+from kb_agent_cases import gold_passages, select_cases  # type: ignore[import-not-found]
 from kb_agent_cost import (  # type: ignore[import-not-found]
     PRICES,
     BudgetGate,
@@ -37,13 +38,11 @@ from kb_agent_eval import (  # type: ignore[import-not-found]
     FakeModels,
     JudgeCache,
     done_case_ids,
-    gold_passages,
     judge_prompt,
     main,
     parse_verdict,
     run_agent,
     run_questions,
-    select_cases,
     tally,
 )
 from kb_corpus_inventory import MANIFEST_FIELDS  # type: ignore[import-not-found]
