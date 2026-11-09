@@ -15,6 +15,12 @@ sys.path.insert(0, str(Path(__file__).parent))
 
 from kb_agent_cost import Spend  # type: ignore[import-not-found]
 from kb_agent_models import READ_TOOL, Models  # type: ignore[import-not-found]
+from kb_agent_prod_prompt import (  # type: ignore[import-not-found]
+    ProductionPrompt,
+    load_production_prompt,
+    tool_result,
+    turn_start,
+)
 from kb_eval import tool_message_text  # type: ignore[import-not-found]
 
 from expert_work.common.spotlight import SPOTLIGHT_SYSTEM_CLAUSE
@@ -141,25 +147,34 @@ async def run_agent(
     tenant_id: UUID,
     spend: Spend,
     reader: Tool | None = None,
+    prompt: ProductionPrompt | None = None,
 ) -> tuple[dict[str, Any], float]:
     """答一道题:``({answer, searches, reads}, 答题花费)``。``reader``(B-206 K-2)给了就把
     knowledge_read 一起给模型:调用名是它的走它、记进 ``reads``, 其余都当检索(与之前一样)。
-    两种各有各的次数上限。"""
+    两种各有各的次数上限。``prompt``:照生产加的提示段(``kb_agent_prod_prompt``,不给就按本分支的
+    产品代码现取;产品模块不在时什么都不加)。"""
     recorder = _RecordingTool(tool)
     reading = _RecordingTool(reader) if reader is not None else None
     tools = [_to_openai_tool(tool.spec)]
     if reader is not None:
         tools.append(_to_openai_tool(reader.spec))
+    if prompt is None:
+        prompt = load_production_prompt(t["function"]["name"] for t in tools)
     messages: list[dict[str, Any]] = [
-        {"role": "system", "content": AGENT_SYSTEM + "\n\n" + SPOTLIGHT_SYSTEM_CLAUSE},
+        {
+            "role": "system",
+            "content": prompt.system(AGENT_SYSTEM + "\n\n" + SPOTLIGHT_SYSTEM_CLAUSE),
+        },
         {"role": "user", "content": question},
     ]
+    # 交给产品「答前核对」函数的本轮视图:问题 + 每次成功的知识库结果(生产的形状)。
+    product_view = turn_start(question)
     searches: list[dict[str, Any]] = []
     reads: list[dict[str, Any]] = []
     answer = ""
     cost = 0.0
     for _ in range(MAX_CALLS):
-        message, call_cny = await models.agent(messages, tools)
+        message, call_cny = await models.agent(prompt.view(messages, product_view), tools)
         cost += call_cny
         spend.answer_cny += call_cny
         spend.answer_calls += 1
@@ -172,12 +187,18 @@ async def run_agent(
         )
         for call in calls:
             if reading is not None and call["function"]["name"] == READ_TOOL:
+                used, done = reading, len(reading.results)
                 rendered, record = await _read(reading, call, done=len(reads), tenant_id=tenant_id)
                 reads.append(record)
             else:
+                used, done = recorder, len(recorder.results)
                 rendered, record = await _search(
                     recorder, call, done=len(searches), tenant_id=tenant_id
                 )
                 searches.append(record)
+            if len(used.results) > done:  # 工具真跑了、返回了结果(报错 / 超次数的不算)
+                product_view.append(
+                    tool_result(used.spec.name, str(call["id"]), rendered, used.results[-1].meta)
+                )
             messages.append({"role": "tool", "tool_call_id": call["id"], "content": rendered})
     return {"answer": answer, "searches": searches, "reads": reads}, cost

@@ -137,3 +137,24 @@ def test_quotes_that_cannot_be_checked_are_listed_apart(tmp_path: Path) -> None:
     ]
     text = tally([_write(tmp_path / "a.jsonl", rows)])
     assert "  引文空或太短、核对不了:资料没写 1 题(n1);部分写了 0 题;有答案 1 题(a1)" in text
+
+
+def test_the_tally_says_which_production_prompt_parts_each_run_had(tmp_path: Path) -> None:
+    rows = [_row("a1", "answerable", "答对")]
+    runs = [
+        {"run": {"answer_model": "glm-5.3", "spend_cny": {"rerank": 0.0}, "prod_prompt_parts": []}},
+        {
+            "run": {
+                "answer_model": "glm-5.3",
+                "spend_cny": {"rerank": 0.0},
+                "prod_prompt_parts": ["answer_check", "outgoing_reference"],
+            }
+        },
+    ]
+    path = tmp_path / "a.jsonl"
+    path.write_text(
+        "".join(json.dumps(x, ensure_ascii=False) + "\n" for x in [*rows, *runs]),
+        encoding="utf-8",
+    )
+    text = tally([path])
+    assert "照生产加的提示段:无(基线) | answer_check, outgoing_reference" in text

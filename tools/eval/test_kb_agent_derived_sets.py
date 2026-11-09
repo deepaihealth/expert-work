@@ -278,3 +278,27 @@ def test_a_control_without_a_gold_passage_only_warns(
     _rows, run = _lines(tmp_path)
     assert run["hard_negatives"]["controls_without_gold"] == ["unit_kb-a0"]
     assert "WARNING" in capsys.readouterr().err
+
+
+def test_the_run_row_records_which_production_prompt_parts_were_active(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import kb_agent_eval
+    from kb_agent_prod_prompt import (  # type: ignore[import-not-found]
+        ProductionPrompt,
+        load_production_prompt,
+    )
+
+    assert main([*_corpus(tmp_path), "--distractors", "0"]) == 0
+    _rows, run = _lines(tmp_path)
+    # 本分支上产品代码有哪几段就记哪几段(main 上没有 #2066:空)
+    here = load_production_prompt(["knowledge_search", "knowledge_read"]).parts
+    assert run["prod_prompt_parts"] == list(here)
+
+    with_parts = ProductionPrompt(parts=("answer_check", "outgoing_reference"))
+    monkeypatch.setattr(kb_agent_eval, "load_production_prompt", lambda names: with_parts)
+    other = tmp_path / "other"
+    other.mkdir()
+    assert main([*_corpus(other), "--distractors", "0"]) == 0
+    _rows, run = _lines(other)
+    assert run["prod_prompt_parts"] == ["answer_check", "outgoing_reference"]

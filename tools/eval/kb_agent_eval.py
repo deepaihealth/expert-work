@@ -106,6 +106,10 @@ from kb_agent_models import (  # type: ignore[import-not-found]
     Models,
     RealModels,
 )
+from kb_agent_prod_prompt import (  # type: ignore[import-not-found]
+    ProductionPrompt,
+    load_production_prompt,
+)
 from kb_agent_tally import read_results, tally  # type: ignore[import-not-found]
 from kb_dataset import KbCase, KbDataset, load_dataset  # type: ignore[import-not-found]
 from kb_eval import (  # type: ignore[import-not-found]
@@ -172,9 +176,11 @@ async def run_questions(
     notes: Mapping[str, str] | None = None,
     run_kind: str = "standard",
     deleted: Mapping[str, Sequence[str]] | None = None,
+    production: ProductionPrompt | None = None,
 ) -> int:
     """答题 + 判分,每题一行追加进 ``out``;返回写了几行。``other_cost`` 是计入预算的其它花费
-    (重排)。每题判 ``votes`` 次取多数(B-206 11-09);``notes`` 是派生题给判分的补充说明。"""
+    (重排)。``production``:照生产加的提示段(见 ``kb_agent_prod_prompt``)。
+    每题判 ``votes`` 次取多数(B-206 11-09);``notes`` 是派生题给判分的补充说明。"""
     sem = asyncio.Semaphore(max(1, concurrency))
     gate_lock = asyncio.Lock()
     write_lock = asyncio.Lock()
@@ -197,7 +203,13 @@ async def run_questions(
             if not await admit():
                 return
             run, answer_cny = await run_agent(
-                models, tool, question=case.query, tenant_id=tenant_id, spend=spend, reader=reader
+                models,
+                tool,
+                question=case.query,
+                tenant_id=tenant_id,
+                spend=spend,
+                reader=reader,
+                prompt=production,
             )
             prompt = judge_prompt(case, run, gold, (notes or {}).get(case.id, ""))
             raws, judge_cny = await _judge_votes(
@@ -548,14 +560,20 @@ async def _run(
                 rerank_instruction=args.rerank_instruct,
             )
             refs = (base_name,)
+            search = KnowledgeSearchTool(retriever=retriever, knowledge_base_refs=refs)
+            # B-206 K-2:生产里有知识库的智能体两个工具都有;--no-read 只是读文档关掉。
+            reader = (
+                None if args.no_read else KnowledgeReadTool(store=store, knowledge_base_refs=refs)
+            )
+            # B-206 #2066:照生产加的提示段(本分支有哪几个产品模块就加哪几段),记进 run 行。
+            production = load_production_prompt(
+                [search.spec.name, *([reader.spec.name] if reader is not None else [])]
+            )
             written = await run_questions(
                 todo=todo,
                 models=models,
-                tool=KnowledgeSearchTool(retriever=retriever, knowledge_base_refs=refs),
-                # B-206 K-2:生产里有知识库的智能体两个工具都有;--no-read 只是读文档关掉。
-                reader=None
-                if args.no_read
-                else KnowledgeReadTool(store=store, knowledge_base_refs=refs),
+                tool=search,
+                reader=reader,
                 tenant_id=EVAL_TENANT_ID,
                 gold=gold,
                 cache=JudgeCache(args.judge_cache),
@@ -569,6 +587,7 @@ async def _run(
                 notes=plan.notes,
                 run_kind=run_kind_of(args),
                 deleted=plan.deleted_by_case,
+                production=production,
             )
     run = {
         "started": started.isoformat(),
@@ -588,6 +607,7 @@ async def _run(
             "threshold": args.rerank_threshold,
         },
         "judge_votes": args.judge_votes,
+        "prod_prompt_parts": list(production.parts),
         # B-206 11-09:这一轮加了几道近名干扰题;难负例臂的删句核对。
         "distractors": plan.distractors,
         "hard_negatives": hard_negatives,

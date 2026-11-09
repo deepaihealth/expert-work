@@ -48,6 +48,7 @@ from kb_agent_eval import (  # type: ignore[import-not-found]
     run_questions,
     tally,
 )
+from kb_agent_prod_prompt import BASELINE  # type: ignore[import-not-found]
 from kb_corpus_inventory import MANIFEST_FIELDS  # type: ignore[import-not-found]
 from kb_dataset import KbCase, KbDataset, KbExpected  # type: ignore[import-not-found]
 from kb_eval import (  # type: ignore[import-not-found]
@@ -232,8 +233,9 @@ async def test_run_agent_uses_the_tool_as_shipped_and_caps_searches() -> None:
     models = _KeepSearching()
     tool = _tool()
     spend = Spend()
+    # 照生产加的提示段另有 test_kb_agent_prod_prompt;这里钉住基线(不随分支上有没有 #2066 变)
     run, cost = await run_agent(
-        models, tool, question="益生菌要冷藏吗", tenant_id=uuid4(), spend=spend
+        models, tool, question="益生菌要冷藏吗", tenant_id=uuid4(), spend=spend, prompt=BASELINE
     )
     assert run["answer"] == "答完了"
     assert models.tools == [_to_openai_tool(tool.spec)]  # 说明 / 参数取自工具本身

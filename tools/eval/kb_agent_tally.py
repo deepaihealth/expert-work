@@ -185,6 +185,11 @@ def _usage(rows: Sequence[Mapping[str, Any]], runs: Sequence[Mapping[str, Any]])
             + f"; errors {sum(1 for s in reads if s.get('error'))}, "
             f"skipped {sum(1 for s in reads if s.get('skipped'))}"
         )
+    # B-206 #2066:每次运行照生产加了哪几段提示(老结果没有这个键,不打)。
+    parts = [run["prod_prompt_parts"] for run in runs if "prod_prompt_parts" in run]
+    if parts:
+        shown = [", ".join(p) if p else "无(基线)" for p in parts]
+        lines.append("照生产加的提示段:" + " | ".join(dict.fromkeys(shown)))
     answer = sum(r["cost_cny"]["answer"] for r in rows)
     judge = sum(r["cost_cny"]["judge"] for r in rows)
     rerank = sum(run["spend_cny"]["rerank"] for run in runs)
