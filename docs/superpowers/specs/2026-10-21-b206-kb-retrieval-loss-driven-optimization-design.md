@@ -576,11 +576,14 @@ D 组 46 题里 19 题我方答案其实写了被判缺的内容(有的近乎逐
 
    43 → 75 token,在工具说明里,随前缀缓存走。
 
-3. **答前核对**(`graph_builder/answer_check.py`):这一轮出现过知识库工具结果(`knowledge_search` / `knowledge_read`)之后,每一步的平台段里带一句:
+3. **答前核对**(`graph_builder/answer_check.py`):这一轮有知识库工具结果**真的显示了段落**之后(检索有命中、读文档显示了段落),每一步的平台段里带一句:
 
-   > [answer check] This turn used knowledge base results. Before the final answer, check each conclusion against text a result showed. For one that no shown text states, say the knowledge base does not directly state it, give the related facts it does state with their documents, and mark any inference of your own as inference.
+   > [answer check] Knowledge base results in this turn showed passages. Before the final answer, check each conclusion against the text they showed. For one that no shown text states, say the results shown do not directly state it, give the related facts they do state with their documents, and mark any inference of your own as inference.
 
-   只进这一步的提示词视图,不落库、不累加,下一轮自动没有。约 64 token / 步,只算用过知识库之后的那几步;平台段本来每步都重挂(工作区快照),不多破缓存。触发条件是「本轮有知识库工具结果」这个结构事实,跟问题、答复用什么语言无关,没有关键词判断。
+   - **什么不算**:调用失败(没有库、参数不对、报错)、检索没命中(含某条检索路径失败的没命中)、读文档没显示段落 —— 这些结果自己的提示已经说了该怎么理解,而「检索不完整时没找到」不能说成「资料里没有」(K-22)。判法与旧结果压成引用时认「成功结果」的口径一致(`status` 不是 error、`artifact` 里状态 ok),再加「有命中 / 有段落」。措辞只说「显示出来的结果没直接写」,不对整个知识库下结论,所以部分库没搜到、但显示了段落的检索也照样带。
+   - **成本**:只进这一步的提示词视图,不落库、不累加,下一轮自动没有。约 66 token / 步,只算显示过段落之后的那几步。这一步本来就有平台段时(工作区里有文件时的快照、计划、召回的记忆)它并进去,不多破缓存;没有别的平台段时它会单独挂一段,缓存代价与 B-162 说明的一样(上一步的最后一条消息要按原样重新算一遍)—— 不是每个知识库智能体每一步都有工作区快照(没有工作区、或工作区为空时就没有)。
+   - **委派子代**:交给 `spawn_worker` 的子任务在子代自己的图里跑,子代读到的知识库结果让核对出现在**子代**的提示词里,不出现在父代给用户的最终答复那一步。
+   - 触发条件是结构事实,跟问题、答复用什么语言无关,没有关键词判断。
 
 **为什么不做「答完再提醒一次」**:先查规则(B-267)下,绑了知识库的智能体几乎每轮都会查库,答完再提醒 = 几乎每个知识库轮都多一次完整的模型调用(延迟多一整次作答,通常几秒到十几秒),而且第一版答复已经逐字流给用户,改写后用户会看到两版。放在作答之前提醒:**额外调用率 0、额外延迟 0**。同一上下文里的自我核对效果有上限(业界结论,见 11-05 研究记录),所以下一步要靠评测数据决定要不要上独立核查。
 
@@ -600,13 +603,13 @@ D 组 46 题里 19 题我方答案其实写了被判缺的内容(有的近乎逐
 
 1. **系统提示词一段 `# Tool arguments`**(`graph_builder/outgoing_reference.py` `OUTGOING_ARGUMENTS_CLAUSE`):
 
-   > Searches and calls to outside services receive only the arguments you pass, not this conversation. Make each query or argument you send self-contained: write out the name, identifier, date or title that a pronoun, a word like "this" or "the other one", a pointer such as "the second item above", or an omitted subject stands for in the conversation. When the user's message refers to something without naming it, say in your answer what you took it to mean. If the conversation leaves two or more things of the same kind it could mean, ask which one, or answer for each by name.
+   > Searches and calls to outside services receive only the arguments you pass, not this conversation. Make each query or argument you send self-contained: write out the name, identifier, date or title that a pronoun, a word like "this" or "the other one", a pointer such as "the second item above", or an omitted subject stands for in the conversation. When the thing referred to decides what you search for or send, say in your answer what you took it to mean; if the conversation leaves two or more things of the same kind it could mean, ask which one, or answer for each by name.
 
-   门控:构建里有 `knowledge_search`、`web_search`、`http` 或任一 MCP 工具(含延迟加载的)才加,别的智能体一个字都看不到。约 128 token,构建期定好、整段不变,放在按天变化的日期段之前,不影响缓存。措辞不举任何行业例子。
+   门控:构建里有 `knowledge_search`、`web_search`、`http` 或任一 MCP 工具(含延迟加载的)才加,别的智能体一个字都看不到。约 130 token,构建期定好、整段不变,放在按天变化的日期段之前,不影响缓存。措辞不举任何行业例子。后两句(答复点明指的是谁、两个候选时追问)只管「指代决定了要搜什么 / 发什么」的时候;「把上面的回答缩短一点」这种不调工具的改写轮不受影响,不会冒出一句「我理解的『它』是……」。
 
 2. **两个检索工具的 `query` 参数说明各一行**:「self-contained: write out the name that a pronoun or a reference to earlier messages stands for」(各约 25 token)。
 
-3. **监控**:`expert_work_outgoing_query_reference_total{tool}`,只数 `knowledge_search` / `web_search` 的 `query` 里还带指代词的调用,标签只有工具名,不记内容。检测器 = 复用 `retrieval_query` 的指代词表(这 / 那 + 量词、他 / 她 / 它(不含「其他」「其它」)、上面 / 前者 / 第 N 个、the other / that one …),再加检索词专用的 it / its / they / them / their 和「该」(不含「应该」)。这是启发式信号,只计数、不改行为,调用照常发出。不数 http / MCP:参数多是结构化字段或要发出去的正文,代词常常是合法内容;工具名也不受控。
+3. **监控**:`expert_work_outgoing_query_reference_total{tool}`,只数 `knowledge_search` / `web_search` 的 `query` 里还带指代词的调用,标签只有工具名,不记内容。检测器是检索词专用的一张表,**不复用** `retrieval_query` 判用户消息的那张(#2030 的行为一字未改):检索词常是关键词串、专业名词,那张表的单字「他」会误中「阿托伐他汀」「吉他」,「该」会误中「该吃什么药」(应该),「第三章」「提到」是文档里的普通词。这里:代词只按词算(他们 / 它的,或单独成词,不含其他 / 其它 / 吉他);这 / 那 + 量词(不含这个月);上述 / 前者 / 后者 / 上面的 / 另一个 / 第 N 个;「该」只在后面跟名词时算(该产品,不算该吃 / 该如何 / 应该);英文代词只认小写(句首大写也算),所以「IT 部门」不算。这是启发式信号,只计数、不改行为,调用照常发出。不数 http / MCP:参数多是结构化字段或要发出去的正文,代词常常是合法内容;工具名也不受控。
 
 **后续(不在这次)**:多类型多轮评测集(上面九类指代,含两个同类候选的歧义题),看「解析错对象」和「错对象还答得很笃定」两个数;从检索日志离线查答复点名的对象与检索词对象不一致的会话。
 
