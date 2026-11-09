@@ -231,3 +231,9 @@ async def test_a_hard_negative_answer_quoting_the_deleted_text_is_fabrication(
     (tmp_path / "plain").mkdir()
     [row] = await _run(tmp_path / "plain", _FlipFlopJudge([raw]), votes=1, case=case)
     assert row["category"] == "正确说没写"
+
+
+def test_the_runner_writes_the_derived_yardstick() -> None:
+    from kb_agent_judge import yardstick_of
+
+    assert yardstick_of() == YARDSTICK

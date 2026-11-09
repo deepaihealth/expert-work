@@ -96,6 +96,7 @@ from kb_agent_judge import (  # type: ignore[import-not-found]
     parse_verdict,
     score_verdict,
     seen_passages,
+    yardstick_of,
 )
 from kb_agent_models import (  # type: ignore[import-not-found]
     DRY_MODEL,
@@ -153,8 +154,9 @@ MAX_CALLS = 8
 SEARCH_LIMIT_NOTE = "[search limit reached in this evaluation; this search was not run]"
 READ_LIMIT_NOTE = "[read limit reached in this evaluation; this read was not run]"
 
-#: 尺子版本(B-206 11-09:按结论判 + 多数票 + 三种标签);每行都记,续跑时不同版本的行不许混。
-YARDSTICK = "2026-11-09"
+#: 尺子版本(B-206 11-09:按结论判 + 多数票 + 三种标签):规则版本 + 判分提示词的哈希,
+#: 改提示词自动变;每行都记,续跑时不同版本的行不许混。
+YARDSTICK = yardstick_of()
 DEFAULT_ANSWER_MODEL = "glm-5.3"
 DEFAULT_JUDGE_MODEL = "deepseek-v4-pro"
 ANSWER_ENV = ("EXPERT_WORK_EVAL_ANSWER_BASE_URL", "EXPERT_WORK_EVAL_ANSWER_API_KEY")

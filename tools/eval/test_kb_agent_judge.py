@@ -275,3 +275,13 @@ def test_on_a_hard_negative_a_quote_of_the_deleted_text_is_fabrication() -> None
     assert category_for("no_answer", verdict) == "编造"
     # 没给被删的锚(普通无答案题):同一份判定只列出来
     assert category_for("no_answer", score_verdict(raw, _PASSAGES)) == "正确说没写"
+
+
+def test_the_yardstick_version_follows_the_template_and_the_scoring_rules() -> None:
+    from kb_agent_judge import JUDGE_TEMPLATE, SCORING_RULES, yardstick_of
+
+    base = yardstick_of()
+    assert base.startswith(SCORING_RULES + "+")
+    assert yardstick_of(template=JUDGE_TEMPLATE + "改一个字") != base  # 改提示词自动换版本
+    assert yardstick_of(rules=SCORING_RULES + "x") != base  # 改归类规则要手动升这个常量
+    assert yardstick_of() == base

@@ -90,6 +90,15 @@ JUDGE_TEMPLATE = """评审一个客服智能体的回答。智能体只能通过
 
 _JSON_RE = re.compile(r"\{.*\}", re.S)
 
+#: 归类 / 计分规则的版本:改了 :func:`score_verdict` / :func:`category_for` 的判法就升一下。
+#: 判分提示词的变化不用管,:func:`yardstick_of` 自动带上它的哈希。
+SCORING_RULES = "2026-11-09.2"
+
+
+def yardstick_of(template: str = JUDGE_TEMPLATE, rules: str = SCORING_RULES) -> str:
+    """尺子版本 = 规则版本 + 判分提示词的哈希;结果行都记它,续跑时不同版本的行不许混。"""
+    return f"{rules}+{hashlib.sha256(template.encode()).hexdigest()[:8]}"
+
 
 # ---------------------------------------------------------------------------
 # 提示词
@@ -285,4 +294,5 @@ __all__ = [
     "parse_verdict",
     "score_verdict",
     "seen_passages",
+    "yardstick_of",
 ]
