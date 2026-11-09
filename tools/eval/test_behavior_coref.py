@@ -129,6 +129,9 @@ def test_ambiguous_outcomes(final: str, outcome: str, passed: bool) -> None:
         ("林舟的分机是 6203。您指的是哪一位?", "hedged_pick", True),
         # 问句没点名,也不是「指的是 / 问的是」:仍是只猜一个
         ("林舟的分机是 6203。是哪一位呢?", "confident_pick", False),
+        # 「问的是」后面隔得远、问的是「其他内容」:客套收尾,不是反问
+        ("林舟的分机号是 6203。如果您问的是其他内容,想了解哪个方面?", "confident_pick", False),
+        ("林舟的分机号是 6203。您问的是别的哪位?", "confident_pick", False),
     ],
 )
 def test_a_clarifying_question_must_name_a_candidate(
