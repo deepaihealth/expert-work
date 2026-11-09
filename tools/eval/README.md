@@ -337,3 +337,43 @@ B-206 K-2 起默认同时给模型 `knowledge_read`(与生产一致:绑了知识
 模型最多回 8 轮;读到的内容记进结果行的 `reads` 并给判分看,`--tally` 另报每题读几次、按读法分布。`--no-read` =
 读文档关掉(只给 `knowledge_search`),**不是**改动前的基线:检索结果标头、工具说明、最多回几轮都已是 K-2 之后的;
 改动前那一臂要在改动前的检出上用当时的脚本跑。带读文档的一轮约 ¥15~25。
+
+**11-09 尺子修正(B-206)**,设计见 `docs/superpowers/specs/2026-10-21-b206-kb-retrieval-loss-driven-optimization-design.md` §8.2:
+
+- **按结论判 + 多数票**(`kb_agent_judge.py`):判分模型把回答拆成结论,逐条标依据(原文写了 / 标明了的推断 /
+  标明了的常识 / **没标明的推断** / 资料里没有),有一条没标明的推断或资料里没有的就是编造 —— 由代码算,不靠判分模型
+  整体拍板;「原文写了」要附一句能在智能体看到的资料里找到的原文。每题判 `--judge-votes`(默认 3)次、每票单独缓存,
+  严格过半取多数,否则记「判分分歧」单列。结果行多了 `label` / `votes` / `agreement`。
+- **限额提示不再施压**:第 4 次检索 / 读文档的提示只说「上限到了、这次没执行」,去掉了「answer with what you have」。
+- **第三种标签 `partial`**:资料只写了相关事实、没直接写结论的题(评测集里写 `label: partial` + `related` 原文锚,见
+  `datasets/kb/README.md`);合格作答 = B 式(说「资料没直接写」+ 列相关事实 + 推断标明)。
+- **头条三个数一起报**(`kb_agent_tally.py`):资料没写的「该拒拒了」率 + 编造题数、有答案的「不该拒却拒了」率、部分写了的
+  B 式作答率;再按标签 × 集(main / chat / distractor / hard_negative)细分。`--tally a.jsonl b.jsonl …` 按答题模型分节,
+  多个模型另出一张对比表 —— 同一套题换 `--answer-model` 各写一个 `--out` 就是分模型评测。
+- **近名干扰题**:标准一轮默认另加 15 道(`--distractors N`,0 = 不加):问句点了名的对象、语料里还有名字只差一个字 /
+  同型号骨架的另一份文档;判分被告知那些近名。
+- **难负例**(另起一轮,库不同):
+
+  ```sh
+  # 1) 本机生成 spec(不花钱;解析缓存与 kb_build_dataset.py 共用)
+  uv run --no-sync python tools/eval/kb_hard_sets.py --dataset tools/eval/datasets/kb/huada_v1.yaml \
+      --chat-dataset tools/eval/datasets/kb/huada_v1.chat.yaml --corpus-root <资料根目录> \
+      --manifest <清单>/manifest.csv --parsed-cache <解析缓存> --n 30 --out eval-out/kb/hard-negatives.yaml
+  # 2) 删过答案句的库上跑 30 道难负例 + 30 道有答案对照
+  uv run --no-sync python tools/eval/kb_agent_eval.py … --hard-negatives eval-out/kb/hard-negatives.yaml \
+      --out eval-out/kb/agent-<label>-hn.jsonl
+  ```
+
+  删句在解析之后、切块之前,文件名不变;spec 只有题号、问题、被删的锚和动到的文档。选题跳过「找全」题、找不到锚的题、
+  删句会连带删掉对照题答案的题。run 行的 `hard_negatives` 记建库后还能找到的锚(应为空)和没取到含答案段落的对照题数
+  (应为 0);不为空时 stderr 打 `WARNING`。锚以外的同义改写删不到 —— 跑之前把 spec 过一眼。
+- **免费报价**(不调任何模型):
+
+  ```sh
+  uv run --no-sync python tools/eval/kb_agent_estimate.py --dataset … --chat-dataset … \
+      --history eval-out/kb/<上一份结果>.jsonl --judge-cache eval-out/kb/agent_judge_cache.sqlite \
+      --hard-negatives eval-out/kb/hard-negatives.yaml
+  ```
+
+  按历史结果的每题实花估答题 / 重排,判分按新旧提示词长度比 + 结论列表多出的输出 × 票数,难负例轮加删过句文档的重新嵌入;
+  打印标准轮、难负例轮、改动前基线与改动后一轮(+ `--margin` 余量)。
