@@ -146,8 +146,28 @@ def test_the_answerability_rule_gives_the_partial_answer_form() -> None:
 # ---------------------------------------------------------------------------
 
 
-def _kb_result(name: str = "knowledge_search", call_id: str = "c1") -> ToolMessage:
-    return ToolMessage(content="passages", tool_call_id=call_id, name=name)
+#: What the tools node records in ``artifact`` for a knowledge result that showed
+#: passages (``ToolResult.meta``): a search's hit count, a read's passages.
+_SHOWN: dict[str, dict[str, Any]] = {
+    "knowledge_search": {"status": "ok", "hits": 2, "refs": ["D1#0", "D1#1"]},
+    "knowledge_read": {"status": "ok", "passages": [{"ref": "D1#0"}]},
+}
+
+
+def _kb_result(
+    name: str = "knowledge_search",
+    call_id: str = "c1",
+    *,
+    artifact: dict[str, Any] | None = None,
+    status: str = "success",
+) -> ToolMessage:
+    return ToolMessage(
+        content="passages",
+        tool_call_id=call_id,
+        name=name,
+        status=status,
+        artifact=_SHOWN[name] if artifact is None else artifact,
+    )
 
 
 def _call(name: str, call_id: str = "c1") -> AIMessage:
@@ -203,13 +223,67 @@ def test_a_hidden_platform_message_does_not_start_a_turn() -> None:
     assert answer_check_note(messages) == ANSWER_CHECK_NOTE
 
 
+@pytest.mark.parametrize(
+    ("name", "artifact", "status"),
+    [
+        # A failed call (no bases, invalid args, a raised error): nothing was shown.
+        ("knowledge_search", {}, "error"),
+        ("knowledge_read", {}, "error"),
+        ("knowledge_search", {"status": "ok", "hits": 2}, "error"),
+        # A search that ran and found nothing, also when a retrieval path failed
+        # (K-22: that says nothing about absence; its own notice already says so).
+        ("knowledge_search", {"status": "no_hits", "hits": 0}, "success"),
+        ("knowledge_search", {"status": "below_threshold", "hits": 0}, "success"),
+        ("knowledge_search", {"status": "no_hits", "hits": 0, "keyword_degraded": True}, "success"),
+        # A read that showed no passage (find without a match, no such section).
+        ("knowledge_read", {"status": "no_match", "passages": []}, "success"),
+        # No recorded metadata: cannot tell what was shown.
+        ("knowledge_search", {}, "success"),
+    ],
+    ids=[
+        "search-error",
+        "read-error",
+        "error-with-metadata",
+        "no-hits",
+        "below-threshold",
+        "degraded-no-hits",
+        "read-no-match",
+        "no-artifact",
+    ],
+)
+def test_no_check_when_no_knowledge_result_showed_a_passage(
+    name: str, artifact: dict[str, Any], status: str
+) -> None:
+    messages: list[BaseMessage] = [
+        HumanMessage(content="q"),
+        _call(name),
+        _kb_result(name, artifact=artifact, status=status),
+    ]
+    assert answer_check_note(messages) is None
+
+
+def test_a_degraded_search_that_showed_passages_still_gets_the_check() -> None:
+    """Its wording is about the results shown, so it claims nothing about the
+    bases or paths that could not be searched."""
+    artifact = {"status": "ok", "hits": 1, "unsearched": 1, "embedding_degraded": True}
+    messages: list[BaseMessage] = [
+        HumanMessage(content="q"),
+        _call("knowledge_search"),
+        _kb_result(artifact=artifact),
+    ]
+    assert answer_check_note(messages) == ANSWER_CHECK_NOTE
+
+
 def test_the_check_is_short_platform_text_in_style_b() -> None:
     note = ANSWER_CHECK_NOTE
     assert note.isascii()
     assert _tokens(note) <= _ANSWER_CHECK_MAX_TOKENS
     lowered = note.lower()
     assert "final answer" in lowered
-    assert "does not directly state" in lowered
+    # Scoped to what was shown: never a claim about the whole knowledge base
+    # (K-22 / the no-bases advice forbid "not in the knowledge base").
+    assert "the results shown do not directly state" in lowered
+    assert "knowledge base does not" not in lowered
     assert "related facts" in lowered
     assert "inference" in lowered
 
@@ -222,6 +296,7 @@ def test_the_check_is_short_platform_text_in_style_b() -> None:
 @dataclass
 class _Fake:
     name: str
+    fails: bool = False
 
     @property
     def spec(self) -> ToolSpec:
@@ -229,7 +304,10 @@ class _Fake:
 
     async def call(self, args: Mapping[str, Any], *, ctx: ToolContext) -> ToolResult:
         del args, ctx
-        return ToolResult(content="ok")
+        if self.fails:
+            msg = "none of this agent's knowledge bases exists"
+            raise RuntimeError(msg)
+        return ToolResult(content="ok", meta=_SHOWN.get(self.name, {}))
 
 
 def _text(messages: list[BaseMessage]) -> str:
@@ -279,6 +357,17 @@ async def test_the_check_is_not_in_the_checkpoint() -> None:
         )
     assert ANSWER_CHECK_NOTE not in _text(final["messages"])
     assert ANSWER_CHECK_NOTE in _text(llm.seen_prompts[-1])
+
+
+async def test_no_check_after_a_failed_knowledge_call() -> None:
+    registry = ToolRegistry()
+    registry.register(_Fake("knowledge_search", fails=True))
+    llm = _RecordingLLM(responses=[_call("knowledge_search")])
+
+    await _run(llm, registry, [HumanMessage(content="q")])
+
+    assert len(llm.seen_prompts) == 2
+    assert all(ANSWER_CHECK_NOTE not in _text(p) for p in llm.seen_prompts)
 
 
 async def test_no_check_when_the_turn_used_no_knowledge_tool() -> None:

@@ -41,7 +41,7 @@ from orchestrator.tools import KnowledgeRetriever
 from orchestrator.tools.knowledge import KnowledgeSearchTool
 from orchestrator.tools.web_search import WebSearchTool
 
-_CLAUSE_MAX_TOKENS = 130
+_CLAUSE_MAX_TOKENS = 160
 _METRIC = "expert_work_outgoing_query_reference_total"
 
 
@@ -76,6 +76,10 @@ def test_the_clause_is_generic_platform_text_within_budget() -> None:
     assert "pronoun" in lowered
     assert "name" in lowered and "answer" in lowered  # the answer names the referent
     assert "two or more" in lowered and "ask" in lowered  # ambiguity: ask or answer each
+    # Only when the referent decides an outgoing call: a plain rewrite turn
+    # ("make it shorter") is not told to explain what "it" meant.
+    assert "when the thing referred to decides what you search for or send" in lowered
+    assert "when the user's message refers to something without naming it" not in lowered
     # Generic: no domain words, no tool tied to a tenant scenario.
     for word in ("product", "customer", "patient", "drug", "price", "order"):
         assert word not in lowered, word
@@ -194,6 +198,11 @@ def test_both_query_parameters_ask_for_a_self_contained_query() -> None:
         "is it safe for children",
         "what about the other one",
         "their opening hours",
+        "它 保质期",
+        "这两款 区别",
+        "前者 和 后者 区别",
+        "上面第二个",
+        "It is safe for children?",
     ],
 )
 def test_a_query_with_a_reference_marker_is_flagged(query: str) -> None:
@@ -210,6 +219,17 @@ def test_a_query_with_a_reference_marker_is_flagged(query: str) -> None:
         "60岁以上人群 用量",
         "opening hours of the Shanghai store",
         "items that contain gluten",
+        # 11-09 review: self-contained queries the user-message markers flag.
+        "阿托伐他汀 副作用",
+        "吉他 课程",
+        "吉他的价格",
+        "高血压该吃什么药",
+        "糖尿病患者该如何控制饮食",
+        "服用期间应该注意什么",
+        "IT 部门 报销流程",
+        "员工手册 第三章 请假",
+        "文档中提到的 报销标准",
+        "前面板 安装",
     ],
 )
 def test_a_self_contained_query_is_not_flagged(query: str) -> None:
