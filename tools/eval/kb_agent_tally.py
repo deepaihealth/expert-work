@@ -88,8 +88,8 @@ def _fabrication_group(row: Mapping[str, Any]) -> str:
 def _fab_line(r: Mapping[str, Any]) -> str:
     by = r["fabricated_by"]
     return (
-        f"  编造:资料没写 {by['no_answer']}、难负例 {by['hard_negative']}、部分写了 {by['partial']}、"
-        f"有答案(含干扰){by['answerable']},合计 {sum(by.values())}"
+        f"  编造:资料没写 {by['no_answer']}、难负例 {by['hard_negative']}、"
+        f"部分写了 {by['partial']}、有答案(含干扰){by['answerable']},合计 {sum(by.values())}"
     )
 
 
