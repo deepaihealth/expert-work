@@ -93,10 +93,17 @@ def _partial_case() -> KbCase:
     )
 
 
-async def _run(tmp_path: Path, models: _FlipFlopJudge, votes: int) -> list[dict[str, Any]]:
+async def _run(
+    tmp_path: Path,
+    models: _FlipFlopJudge,
+    votes: int,
+    *,
+    case: KbCase | None = None,
+    deleted: dict[str, tuple[str, ...]] | None = None,
+) -> list[dict[str, Any]]:
     out = tmp_path / "agent.jsonl"
     await run_questions(
-        todo=[("chat", _partial_case())],
+        todo=[("chat", case or _partial_case())],
         models=models,
         tool=_OneResultTool(),
         tenant_id=uuid4(),
@@ -108,6 +115,7 @@ async def _run(tmp_path: Path, models: _FlipFlopJudge, votes: int) -> list[dict[
         concurrency=1,
         votes=votes,
         run_kind="hn:0123456789ab",
+        deleted=deleted,
     )
     return [json.loads(line) for line in out.read_text(encoding="utf-8").splitlines()]
 
@@ -197,3 +205,29 @@ async def test_a_judge_reply_that_fails_to_parse_is_not_cached(tmp_path: Path) -
     [row] = await _run(tmp_path, fixed, votes=1)
     assert fixed.judge_calls == 1  # 坏回复没进缓存:这次重新判
     assert row["category"] == "B式作答"
+
+
+@pytest.mark.asyncio
+async def test_a_hard_negative_answer_quoting_the_deleted_text_is_fabrication(
+    tmp_path: Path,
+) -> None:
+    gone = "甲款冲剂可以与Z药同服无需间隔"
+    claims = [{"claim": "c", "support": "stated", "quote": "甲款冲剂可以与Z药同服"}]
+    raw = json.dumps({"claims": claims, "refused": True, "matches_reference": "n/a"})
+    case = KbCase(
+        id="hn-x1",
+        query="甲款冲剂能和Z药一起吃吗?",
+        source="hard_negative",
+        tags=(),
+        expected=(),
+        answer=None,
+        label="no_answer",
+    )
+    [row] = await _run(
+        tmp_path, _FlipFlopJudge([raw]), votes=1, case=case, deleted={"hn-x1": (gone,)}
+    )
+    assert row["category"] == "编造"
+    (tmp_path / "agent.jsonl").unlink()
+    (tmp_path / "plain").mkdir()
+    [row] = await _run(tmp_path / "plain", _FlipFlopJudge([raw]), votes=1, case=case)
+    assert row["category"] == "正确说没写"

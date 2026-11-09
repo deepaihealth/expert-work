@@ -127,3 +127,13 @@ def test_quote_misses_are_listed_per_label_with_case_ids(tmp_path: Path) -> None
     ]
     text = tally([_write(tmp_path / "a.jsonl", rows)])
     assert "  引文在资料里没找到:资料没写 2 题(n1, h1);部分写了 1 题(p1);有答案 0 题" in text
+
+
+def test_quotes_that_cannot_be_checked_are_listed_apart(tmp_path: Path) -> None:
+    rows = [
+        {**_row("n1", "no_answer", "正确说没写"), "verdict": {"quote_unchecked": 1}},
+        {**_row("a1", "answerable", "答对"), "verdict": {"quote_unchecked": 2}},
+        _row("a2", "answerable", "答对"),
+    ]
+    text = tally([_write(tmp_path / "a.jsonl", rows)])
+    assert "  引文空或太短、核对不了:资料没写 1 题(n1);部分写了 0 题;有答案 1 题(a1)" in text

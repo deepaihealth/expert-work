@@ -334,6 +334,7 @@ async def run_questions(
     votes: int = DEFAULT_JUDGE_VOTES,
     notes: Mapping[str, str] | None = None,
     run_kind: str = "standard",
+    deleted: Mapping[str, Sequence[str]] | None = None,
 ) -> int:
     """答题 + 判分,每题一行追加进 ``out``;返回写了几行。``other_cost`` 是计入预算的其它花费
     (重排)。每题判 ``votes`` 次取多数(B-206 11-09);``notes`` 是派生题给判分的补充说明。"""
@@ -366,7 +367,8 @@ async def run_questions(
                 models, cache, prompt, votes=votes, spend=spend, cache_verdicts=cache_verdicts
             )
             passages = seen_passages(run)
-            verdicts = [score_verdict(parse_verdict(raw), passages) for raw in raws]
+            gone = (deleted or {}).get(case.id, ())
+            verdicts = [score_verdict(parse_verdict(raw), passages, deleted=gone) for raw in raws]
             categories = [category_for(case.answer_label, v) for v in verdicts]
             final, agreement = majority(categories)
             row = {
@@ -746,6 +748,7 @@ async def _run(
                 votes=args.judge_votes,
                 notes=plan.notes,
                 run_kind=run_kind_of(args),
+                deleted=plan.deleted_by_case,
             )
     run = {
         "started": started.isoformat(),

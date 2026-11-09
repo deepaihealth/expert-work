@@ -93,17 +93,17 @@ def _fab_line(r: Mapping[str, Any]) -> str:
     )
 
 
-def _quote_misses(rows: Sequence[Mapping[str, Any]]) -> str:
+def _quote_list(rows: Sequence[Mapping[str, Any]], key: str, title: str) -> str:
     parts = []
     for label in ("no_answer", "partial", "answerable"):
         ids = [
             str(r["case_id"])
             for r in rows
-            if row_label(r) == label and (r.get("verdict") or {}).get("quote_misses")
+            if row_label(r) == label and (r.get("verdict") or {}).get(key)
         ]
         shown = f"({', '.join(ids[:10])}{', …' if len(ids) > 10 else ''})" if ids else ""
         parts.append(f"{_LABEL_TITLES[label]} {len(ids)} 题{shown}")
-    return "  引文在资料里没找到:" + ";".join(parts)
+    return f"  {title}:" + ";".join(parts)
 
 
 def _pct(rate: Rate) -> str:
@@ -128,7 +128,8 @@ def _headline(rows: Sequence[Mapping[str, Any]]) -> list[str]:
         f"  部分写了 n={r['style_b'][1]}:B 式作答 {_pct(r['style_b'])}",
         _fab_line(r),
         f"  判分:分歧 {r['disagree']},失败 {r['failed']};全票一致 {_unanimous(rows)}",
-        _quote_misses(rows),
+        _quote_list(rows, "quote_misses", "引文在资料里没找到"),
+        _quote_list(rows, "quote_unchecked", "引文空或太短、核对不了"),
     ]
 
 

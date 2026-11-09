@@ -8,10 +8,10 @@
   「编造」由代码算:有一条 ``inferred_unlabeled`` 或 ``unsupported`` 就是编造。11-05 的抖动
   (0006 同一回答 7 次判 2 次编造 / 5 次其它)出在旧口径「依据段落能直接推出的不算」—— 推断
   算不算「直接推出」每次判法不一;新口径把「推断」和「标没标」拆开,判分模型只需答这两件事。
-* **原文核对**:``stated`` 要附一句原文;在智能体看到的资料里(去空白与标点后)找不到的不算
-  列出了相关事实,另计 ``quote_misses``,统计里按标签列出题号给人看。资料没写(含难负例)的题
-  上找不到引文记编造(那条只能来自资料以外);其余标签不自动判编造,免得把判分模型的抄写误差
-  记到智能体头上。
+* **原文核对**:``stated`` 要附一句原文;按省略号切段,每段(≥ 6 字)去空白与标点后都在智能体
+  看到的资料里才算找到。找不到的(``quote_misses``)、空或太短核对不了的(``quote_unchecked``)
+  不算列出了相关事实,统计里按标签列题号给人看。资料没写的题上只有两种按编造记:引文对上难负例
+  被删掉的那句,或回答没说「资料没写」又拿找不到的引文当依据(见 :func:`category_for`)。
 * **多数票**:每题判 N 次(默认 3),取严格多数;没有严格多数记「判分分歧」单列,不偏向
   任何一类。按结论判之后剩下的采样噪声由它压掉。
 
@@ -155,13 +155,29 @@ def parse_verdict(raw: str) -> dict[str, Any]:
         return {"parse_error": raw[:200]}
 
 
-def _quote_found(quote: str, passages_key: str) -> bool:
-    key = anchor_key(quote)
-    return len(key) >= MIN_QUOTE_KEY_CHARS and key in passages_key
+#: 判分常把长引文用省略号缩短:按省略号切段,每段分别核对。
+_ELLIPSIS = re.compile("\u2026+|\\.{3,}|\u22ef+")
 
 
-def score_verdict(raw: Mapping[str, Any], passages: str) -> dict[str, Any]:
-    """判分模型的一份 JSON → 带 ``fabricated`` / ``related_facts`` / ``quote_misses`` 的判定。
+def _quote_status(quote: str, passages_key: str, deleted_keys: Sequence[str]) -> str:
+    """``found``:切出来的每段(≥ :data:`MIN_QUOTE_KEY_CHARS` 字)都在资料里;``unchecked``:
+    空或每段都太短,核对不了;``deleted``:找不到、但对上了难负例被删掉的锚;``missed``:找不到。"""
+    pieces = [anchor_key(p) for p in _ELLIPSIS.split(quote)]
+    pieces = [p for p in pieces if len(p) >= MIN_QUOTE_KEY_CHARS]
+    if not pieces:
+        return "unchecked"
+    if all(p in passages_key for p in pieces):
+        return "found"
+    if any(p in d or d in p for p in pieces for d in deleted_keys if d):
+        return "deleted"
+    return "missed"
+
+
+def score_verdict(
+    raw: Mapping[str, Any], passages: str, *, deleted: Sequence[str] = ()
+) -> dict[str, Any]:
+    """判分模型的一份 JSON → 带 ``fabricated`` / ``related_facts`` / ``quote_misses`` /
+    ``quote_unchecked`` / ``quote_deleted`` 的判定。``deleted`` = 难负例这道题被删掉的锚。
     格式不对(缺 ``claims``、依据不在枚举里…)记 ``parse_error``。"""
     if "parse_error" in raw:
         return dict(raw)
@@ -172,13 +188,19 @@ def score_verdict(raw: Mapping[str, Any], passages: str) -> dict[str, Any]:
     if not all(isinstance(c, Mapping) and c.get("support") in SUPPORTS for c in claims):
         return {**raw, "parse_error": f"each claim needs a support in {sorted(SUPPORTS)}"}
     passages_key = anchor_key(passages)
-    stated = [c for c in claims if c["support"] == "stated"]
-    found = [c for c in stated if _quote_found(str(c.get("quote") or ""), passages_key)]
+    deleted_keys = [anchor_key(d) for d in deleted]
+    statuses = Counter(
+        _quote_status(str(c.get("quote") or ""), passages_key, deleted_keys)
+        for c in claims
+        if c["support"] == "stated"
+    )
     return {
         **raw,
         "fabricated": any(c["support"] in FABRICATING_SUPPORTS for c in claims),
-        "related_facts": len(found),
-        "quote_misses": len(stated) - len(found),
+        "related_facts": statuses["found"],
+        "quote_misses": statuses["missed"],
+        "quote_unchecked": statuses["unchecked"],
+        "quote_deleted": statuses["deleted"],
     }
 
 
@@ -188,11 +210,16 @@ def category_for(label: str, verdict: Mapping[str, Any]) -> str:
         return FAILED
     if verdict["fabricated"]:
         return "编造"
-    if label == "no_answer" and verdict.get("quote_misses"):
-        # 资料没写(含难负例):说「原文写了」的结论在智能体看到的资料里找不到,只能来自资料
-        # 以外 —— 难负例里正是被删掉的那句(判分说明里给了它)—— 记编造,不落进「其它」。
-        return "编造"
     refused = bool(verdict.get("refused"))
+    if label == "no_answer" and (
+        verdict.get("quote_deleted") or (not refused and verdict.get("quote_misses"))
+    ):
+        # 资料没写(含难负例)上只在两种情况下按引文判编造(11-09 复审):
+        # - 引文对上了难负例被删掉的那句:回答里有资料里已经没有的答案;
+        # - 回答没说「资料没写」,又拿一句在智能体看到的资料里找不到的「原文」当依据。
+        # 说了没写、只是引文找不到 / 太短 / 为空的,只列出来给人看 —— 判分缩写引文的方式各票
+        # 一致,多数票纠不过来,不能记到智能体头上。
+        return "编造"
     if label == "answerable":
         if verdict.get("matches_reference") in ("yes", "partial"):
             return "答对"

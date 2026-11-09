@@ -90,9 +90,8 @@ def test_a_stated_claim_whose_quote_is_not_in_the_passages_is_not_a_related_fact
     assert category_for("partial", verdict) == "只说没写"
 
 
-def test_on_a_no_answer_question_an_unfound_quote_is_fabrication() -> None:
-    # 资料没写 / 难负例:判分说「原文写了」却在智能体看到的资料里找不到 —— 回答里的这条只能来自
-    # 资料以外(难负例里正是被删掉的那句),记编造,不落进「其它」。
+def test_an_unfound_quote_in_a_non_refusing_no_answer_reply_is_fabrication() -> None:
+    # 资料没写的题上没说「资料没写」、又拿一句在资料里找不到的「原文」当依据:按编造记
     raw = _raw([_claim("stated", "与Z药间隔两小时服用")], refused=False)
     verdict = score_verdict(raw, _PASSAGES)
     assert verdict["fabricated"] is False and verdict["quote_misses"] == 1
@@ -222,6 +221,57 @@ def test_judge_cache_keeps_each_vote_apart(tmp_path: Path) -> None:
 def test_a_quote_shorter_than_six_characters_does_not_count_as_found() -> None:
     # 中文一个字约一个词:四五个字(「30分钟」「间隔30」)在任何资料里都找得到,不足以证明出处
     short = score_verdict(_raw([_claim("stated", "间隔30分")], refused=True), _PASSAGES)
-    assert (short["related_facts"], short["quote_misses"]) == (0, 1)
+    assert (short["related_facts"], short["quote_misses"], short["quote_unchecked"]) == (0, 0, 1)
     six = score_verdict(_raw([_claim("stated", "间隔30分钟")], refused=True), _PASSAGES)
     assert six["related_facts"] == 1
+
+
+# ---------------------------------------------------------------------------
+# 11-09 复审:说了「资料没写」的正确作答不能因为判分抄引文的方式被记成编造
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("quote", "found", "missed", "unchecked"),
+    [
+        (
+            "甲款冲剂请与60℃以上热水间隔30分钟服用,与X类药物间隔30分钟服用(Y类药物需间隔2小时)。",
+            1,
+            0,
+            0,
+        ),
+        # 判分常用省略号缩短引文:每段 ≥6 字都在资料里就算找到
+        ("甲款冲剂请与60℃以上热水……与X类药物间隔30分钟服用", 1, 0, 0),
+        ("甲款冲剂请与60℃以上热水...与X类药物间隔30分钟服用", 1, 0, 0),
+        ("甲款冲剂请与60℃以上热水⋯与Z药同时服用没有影响", 0, 1, 0),  # 有一段不在资料里
+        ("间隔2小时", 0, 0, 1),  # 太短:核对不了
+        ("", 0, 0, 1),  # 空:核对不了
+        ("甲款……间隔", 0, 0, 1),  # 每段都太短
+    ],
+)
+def test_quote_check_handles_ellipses_short_and_empty_quotes(
+    quote: str, found: int, missed: int, unchecked: int
+) -> None:
+    verdict = score_verdict(_raw([_claim("stated", quote)], refused=True), _PASSAGES)
+    got = (verdict["related_facts"], verdict["quote_misses"], verdict["quote_unchecked"])
+    assert got == (found, missed, unchecked)
+    # 说了没写、唯一的结论是资料里的事实:不管引文怎么抄,都不是编造
+    assert category_for("no_answer", verdict) == "正确说没写"
+
+
+def test_a_refusing_reply_with_an_unfound_quote_is_listed_not_fabrication() -> None:
+    raw = _raw([_claim("stated", "与Z药间隔两小时服用")], refused=True)
+    verdict = score_verdict(raw, _PASSAGES)
+    assert verdict["quote_misses"] == 1
+    assert category_for("no_answer", verdict) == "正确说没写"
+
+
+def test_on_a_hard_negative_a_quote_of_the_deleted_text_is_fabrication() -> None:
+    # 难负例:引文对上被删掉的那句 = 回答里有资料里已经没有的答案,哪怕也说了没写
+    deleted = ["甲款冲剂可以与Z药同服无需间隔"]
+    raw = _raw([_claim("stated", "甲款冲剂可以与Z药同服")], refused=True)
+    verdict = score_verdict(raw, _PASSAGES, deleted=deleted)
+    assert verdict["quote_deleted"] == 1
+    assert category_for("no_answer", verdict) == "编造"
+    # 没给被删的锚(普通无答案题):同一份判定只列出来
+    assert category_for("no_answer", score_verdict(raw, _PASSAGES)) == "正确说没写"

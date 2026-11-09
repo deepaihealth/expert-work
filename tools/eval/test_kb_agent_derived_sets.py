@@ -240,3 +240,20 @@ def test_deleted_text_still_found_after_ingest_stops_the_run(
     monkeypatch.setattr("kb_agent_eval.store_residue", still_there)
     with pytest.raises(SystemExit, match="not usable"):
         main([*_corpus(tmp_path), "--hard-negatives", str(_spec(tmp_path, _GONE))])
+
+
+def test_the_deleted_anchors_reach_the_judge_scoring(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import kb_agent_eval
+
+    seen: dict[str, Any] = {}
+    real = kb_agent_eval.run_questions
+
+    async def spy(**kwargs: Any) -> int:
+        seen.update(kwargs)
+        return int(await real(**kwargs))
+
+    monkeypatch.setattr(kb_agent_eval, "run_questions", spy)
+    assert main([*_corpus(tmp_path), "--hard-negatives", str(_spec(tmp_path, _GONE))]) == 0
+    assert seen["deleted"] == {"hn-unit_kb-noise": (_GONE,)}

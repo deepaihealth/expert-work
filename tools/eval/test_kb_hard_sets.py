@@ -146,6 +146,7 @@ def test_spec_round_trip_gives_no_answer_cases_with_a_judge_note(tmp_path: Path)
     assert case.id == "hn-h1" and case.query == "甲款滤芯多久换"
     assert case.answer_label == "no_answer" and case.expected == ()
     assert "滤芯建议每6个月更换一次" in spec.notes["hn-h1"]
+    assert spec.deleted == {"hn-h1": ("滤芯建议每6个月更换一次",)}
 
 
 def test_spec_with_a_bad_entry_is_refused(tmp_path: Path) -> None:

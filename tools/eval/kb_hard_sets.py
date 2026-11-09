@@ -242,6 +242,7 @@ class HardNegativeSpec:
     cases: tuple[KbCase, ...]
     anchors: tuple[str, ...]  # 全部要删的锚(去重,按出现顺序)
     notes: dict[str, str]  # 题号 → 给判分的说明
+    deleted: dict[str, tuple[str, ...]]  # 题号 → 这道题被删掉的锚(判分核对引文用)
 
 
 def _note(anchors: Sequence[str]) -> str:
@@ -260,6 +261,7 @@ def load_hard_negative_spec(path: Path) -> HardNegativeSpec:
     cases: list[KbCase] = []
     anchors: dict[str, None] = {}
     notes: dict[str, str] = {}
+    deleted: dict[str, tuple[str, ...]] = {}
     for entry in entries:
         ok = (
             isinstance(entry, Mapping)
@@ -285,7 +287,10 @@ def load_hard_negative_spec(path: Path) -> HardNegativeSpec:
         )
         anchors.update(dict.fromkeys(entry["anchors"]))
         notes[case_id] = _note(entry["anchors"])
-    return HardNegativeSpec(cases=tuple(cases), anchors=tuple(anchors), notes=notes)
+        deleted[case_id] = tuple(entry["anchors"])
+    return HardNegativeSpec(
+        cases=tuple(cases), anchors=tuple(anchors), notes=notes, deleted=deleted
+    )
 
 
 def hard_negative_cases(spec: HardNegativeSpec) -> list[tuple[str, KbCase]]:

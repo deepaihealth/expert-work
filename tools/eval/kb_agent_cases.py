@@ -7,7 +7,7 @@ import argparse
 import random
 import sys
 from collections.abc import Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 from uuid import UUID
@@ -110,6 +110,8 @@ class RunPlan:
     delete_anchors: tuple[str, ...] = ()
     #: 难负例轮里对照题的答案锚:建库删句删掉其中任何一条就停(11-09 评审)。
     guard_anchors: tuple[str, ...] = ()
+    #: 难负例题号 → 它被删掉的锚:判分引文对上这些就是编造(11-09 复审)。
+    deleted_by_case: dict[str, tuple[str, ...]] = field(default_factory=dict)
     distractors: int = 0
 
 
@@ -121,6 +123,7 @@ def plan_run(args: argparse.Namespace, main_set: KbDataset, chat_set: KbDataset)
         return RunPlan(
             cases=control + hard_negative_cases(spec),
             notes=dict(spec.notes),
+            deleted_by_case=dict(spec.deleted),
             delete_anchors=spec.anchors,
             guard_anchors=tuple(dict.fromkeys(e.anchor for _l, c in control for e in c.expected)),
         )
