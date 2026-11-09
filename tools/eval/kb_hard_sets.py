@@ -12,7 +12,7 @@
 
 * 只选 ``match: any`` 的题(「找全」题删一处删不干净);
 * 删掉的句子里不能含任何对照题的锚(否则对照题自己变成没答案);
-* 锚在语料里一处都找不到的不选(删不掉 = 题没变)。
+* 锚在语料里一处都找不到的不选(删不掉 = 题没变);有一处删不干净(跨的句子太多)的也不选。
 
 **近名干扰(有答案)**:问句点了名的对象 E(名字取自它期望文档的文件名),语料里还有一份
 文档名里带着近名 N(等长差一个字,或数字不同的同型号骨架,如 KX-305 / KX-217);这类题
@@ -201,6 +201,7 @@ def pick_hard_negatives(
     (与评测建库时 :class:`AnchorDeletingParser` 一次删全部锚相同),每份它动到的文档里,删前
     在的对照锚删后都还得在 —— 只删半句、跨句整段删、两道题各删一处合起来删光,都算伤到对照。"""
     control_keys = [anchor_key(e.anchor) for c in control for e in c.expected]
+    folded = {name: anchor_key(text) for name, text in texts.items()}
     order = sorted(candidates, key=lambda c: c.id)
     random.Random(seed).shuffle(order)  # noqa: S311 - a reproducible sample
     picked: list[HardNegative] = []
@@ -219,6 +220,12 @@ def pick_hard_negatives(
             skipped["anchor_not_found"] += 1
             continue
         trial = [*chosen, *anchors]
+        keys = [anchor_key(a) for a in anchors]
+        holding = [name for name, f in folded.items() if any(k and k in f for k in keys)]
+        if any(residue(delete_anchor_units(texts[name], trial)[0], anchors) for name in holding):
+            # 有一处跨了 MAX_WINDOW 句以上删不掉:选上了建库后残留检查也会停(11-09 复审)
+            skipped["not_deletable"] += 1
+            continue
         if any(
             _lost(texts[name], delete_anchor_units(texts[name], trial)[0], control_keys)
             for name in documents

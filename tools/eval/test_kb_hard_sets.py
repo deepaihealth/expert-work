@@ -301,3 +301,13 @@ def test_a_generic_word_in_the_question_is_not_taken_as_the_entity() -> None:
     files = ["价格表.xlsx", "价目表.xlsx"]
     cases = [_case("d1", "价格表里第一行是什么?", "价格表.xlsx", "第一行是表头说明文字")]
     assert pick_distractors(cases, files, exclude_ids=set(), n=5, seed=1) == []
+
+
+def test_a_candidate_whose_answer_cannot_be_fully_deleted_is_skipped() -> None:
+    # 11-09 复审:一处可删(同一句)、另一处跨 5 行(超过 MAX_WINDOW 句)删不掉 —— 选上了,
+    # 评测建库后残留检查必停,重新生成还是同一份 spec
+    text = "资料:甲乙丙丁戊。\n甲乙\n丙\n丁\n戊\n"
+    picked, skipped = pick_hard_negatives(
+        [_case("h1", "?", "s.md", "甲乙丙丁戊")], [], {"s.md": text}, n=3, seed=1
+    )
+    assert picked == [] and skipped == {"not_deletable": 1}
