@@ -215,3 +215,14 @@ def test_the_judge_is_told_about_the_near_miss_and_the_deleted_text(
     assert main([*argv, "--hard-negatives", str(_spec(tmp_path, _GONE))]) == 0
     assert "已从资料里删掉" in prompts["甲一运行时噪音多大?"]
     assert _GONE in prompts["甲一运行时噪音多大?"]
+
+
+def test_the_cli_will_not_resume_into_another_vote_count_or_run(tmp_path: Path) -> None:
+    argv = [*_corpus(tmp_path), "--distractors", "0"]
+    assert main(argv) == 0
+    assert main(argv) == 0  # 同一轮续跑:没做完的题补上,不报错
+    with pytest.raises(SystemExit, match="judge_votes"):
+        main([*argv, "--judge-votes", "1"])
+    hn = [a for a in argv if a not in ("--distractors", "0")]
+    with pytest.raises(SystemExit, match="run_kind"):
+        main([*hn, "--hard-negatives", str(_spec(tmp_path, _GONE))])

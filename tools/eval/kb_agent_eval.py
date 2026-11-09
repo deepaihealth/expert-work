@@ -59,6 +59,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import hashlib
 import json
 import os
 import sys
@@ -152,6 +153,8 @@ MAX_CALLS = 8
 SEARCH_LIMIT_NOTE = "[search limit reached in this evaluation; this search was not run]"
 READ_LIMIT_NOTE = "[read limit reached in this evaluation; this read was not run]"
 
+#: 尺子版本(B-206 11-09:按结论判 + 多数票 + 三种标签);每行都记,续跑时不同版本的行不许混。
+YARDSTICK = "2026-11-09"
 DEFAULT_ANSWER_MODEL = "glm-5.3"
 DEFAULT_JUDGE_MODEL = "deepseek-v4-pro"
 ANSWER_ENV = ("EXPERT_WORK_EVAL_ANSWER_BASE_URL", "EXPERT_WORK_EVAL_ANSWER_API_KEY")
@@ -330,6 +333,7 @@ async def run_questions(
     reader: Tool | None = None,
     votes: int = DEFAULT_JUDGE_VOTES,
     notes: Mapping[str, str] | None = None,
+    run_kind: str = "standard",
 ) -> int:
     """答题 + 判分,每题一行追加进 ``out``;返回写了几行。``other_cost`` 是计入预算的其它花费
     (重排)。每题判 ``votes`` 次取多数(B-206 11-09);``notes`` 是派生题给判分的补充说明。"""
@@ -381,6 +385,9 @@ async def run_questions(
                 "category": final,
                 "answer_model": models.answer_model,
                 "judge_model": models.judge_model,
+                "yardstick": YARDSTICK,
+                "judge_votes": votes,
+                "run_kind": run_kind,
                 "cost_cny": {"answer": round(answer_cny, 6), "judge": round(judge_cny, 6)},
             }
             async with write_lock:
@@ -423,8 +430,11 @@ async def _judge_votes(
 # ---------------------------------------------------------------------------
 
 
-def done_case_ids(path: Path, *, answer_model: str, judge_model: str) -> set[str]:
-    """已做完的题;文件里是别的模型答 / 判的就拒绝续写(混在一起的统计没有意义)。"""
+def done_case_ids(
+    path: Path, *, answer_model: str, judge_model: str, judge_votes: int, run_kind: str
+) -> set[str]:
+    """已做完的题;文件里是别的模型答 / 判的、别的尺子版本(含 11-09 之前没记版本的行)、别的票数
+    或别的轮次(标准轮 / 某份难负例 spec)的,就拒绝续写 —— 混在一起的统计没有意义。"""
     rows, _runs = read_results(path)
     for row in rows:
         if (row.get("answer_model"), row.get("judge_model")) != (answer_model, judge_model):
@@ -433,7 +443,22 @@ def done_case_ids(path: Path, *, answer_model: str, judge_model: str) -> set[str
                 f"model {row.get('judge_model')!r}; use another --out for "
                 f"{answer_model!r} / {judge_model!r}"
             )
+        wanted = {"yardstick": YARDSTICK, "judge_votes": judge_votes, "run_kind": run_kind}
+        for key, value in wanted.items():
+            if row.get(key) != value:
+                raise SystemExit(
+                    f"{path} has a row with {key}={row.get(key)!r}, this run is {value!r}; "
+                    "use another --out"
+                )
     return {row["case_id"] for row in rows}
+
+
+def run_kind_of(args: argparse.Namespace) -> str:
+    """``standard`` 或 ``hn:<spec 内容 sha256 前 12 位>``。"""
+    if args.hard_negatives is None:
+        return "standard"
+    digest = hashlib.sha256(Path(args.hard_negatives).read_bytes()).hexdigest()[:12]
+    return f"hn:{digest}"
 
 
 # ---------------------------------------------------------------------------
@@ -567,7 +592,13 @@ async def amain(args: argparse.Namespace) -> int:
     answer_model = DRY_MODEL if args.dry else args.answer_model
     judge_model = DRY_MODEL if args.dry else args.judge_model
     out = cast(Path, args.out)
-    done = done_case_ids(out, answer_model=answer_model, judge_model=judge_model)
+    done = done_case_ids(
+        out,
+        answer_model=answer_model,
+        judge_model=judge_model,
+        judge_votes=args.judge_votes,
+        run_kind=run_kind_of(args),
+    )
     todo = [(label, c) for label, c in cases if c.id not in done]
     print(f"cases {len(cases)}; done {len(done)}; todo {len(todo)}", file=sys.stderr)
     if todo and args.dry:
@@ -696,6 +727,7 @@ async def _run(
                 cache_verdicts=not args.dry,
                 votes=args.judge_votes,
                 notes=plan.notes,
+                run_kind=run_kind_of(args),
             )
     run = {
         "started": started.isoformat(),

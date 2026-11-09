@@ -35,6 +35,7 @@ from kb_agent_eval import (  # type: ignore[import-not-found]
     MAX_READS,
     MAX_SEARCHES,
     SEARCH_LIMIT_NOTE,
+    YARDSTICK,
     FakeModels,
     JudgeCache,
     done_case_ids,
@@ -420,7 +421,9 @@ async def test_budget_pauses_keeps_what_was_done_and_a_rerun_resumes(
     assert spend.answer_cny + spend.judge_cny == pytest.approx(5.0)
     assert "PAUSED" in capsys.readouterr().err
     out = tmp_path / "agent.jsonl"
-    done = done_case_ids(out, answer_model="costly", judge_model="costly")
+    done = done_case_ids(
+        out, answer_model="costly", judge_model="costly", judge_votes=1, run_kind="standard"
+    )
     assert done == {"q0", "q1"}
     rows = [json.loads(line) for line in out.read_text(encoding="utf-8").splitlines()]
     assert [r["cost_cny"] for r in rows] == [{"answer": 2.0, "judge": 0.5}] * 2
@@ -429,7 +432,9 @@ async def test_budget_pauses_keeps_what_was_done_and_a_rerun_resumes(
     todo = [(label, c) for label, c in _four() if c.id not in done]
     written, _spend = await _run_four(tmp_path, budget=100.0, control=None, todo=todo)
     assert written == 2
-    done = done_case_ids(out, answer_model="costly", judge_model="costly")
+    done = done_case_ids(
+        out, answer_model="costly", judge_model="costly", judge_votes=1, run_kind="standard"
+    )
     assert done == {"q0", "q1", "q2", "q3"}
     assert len(out.read_text(encoding="utf-8").splitlines()) == 4
 
@@ -506,11 +511,21 @@ async def test_budget_gate_ignores_a_budget_not_above_what_was_spent(tmp_path: P
 
 def test_resume_refuses_a_file_written_by_other_models(tmp_path: Path) -> None:
     out = tmp_path / "agent.jsonl"
-    row = {"case_id": "q", "answer_model": "glm-5.3", "judge_model": "deepseek-v4-pro"}
+    row = {
+        "case_id": "q",
+        "answer_model": "glm-5.3",
+        "judge_model": "deepseek-v4-pro",
+        "yardstick": YARDSTICK,
+        "judge_votes": 3,
+        "run_kind": "standard",
+    }
     out.write_text(json.dumps(row) + "\n" + json.dumps({"run": {}}) + "\n", encoding="utf-8")
-    assert done_case_ids(out, answer_model="glm-5.3", judge_model="deepseek-v4-pro") == {"q"}
+    same = {"judge_votes": 3, "run_kind": "standard"}
+    assert done_case_ids(out, answer_model="glm-5.3", judge_model="deepseek-v4-pro", **same) == {
+        "q"
+    }
     with pytest.raises(SystemExit, match="another --out"):
-        done_case_ids(out, answer_model="dry", judge_model="dry")
+        done_case_ids(out, answer_model="dry", judge_model="dry", **same)
 
 
 # ---------------------------------------------------------------------------

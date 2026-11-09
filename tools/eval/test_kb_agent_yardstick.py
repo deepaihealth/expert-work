@@ -12,8 +12,10 @@ import pytest
 from kb_agent_eval import (  # type: ignore[import-not-found]
     READ_LIMIT_NOTE,
     SEARCH_LIMIT_NOTE,
+    YARDSTICK,
     BudgetGate,
     Spend,
+    done_case_ids,
     run_questions,
 )
 from kb_agent_judge import JudgeCache  # type: ignore[import-not-found]
@@ -105,6 +107,7 @@ async def _run(tmp_path: Path, models: _FlipFlopJudge, votes: int) -> list[dict[
         spend=Spend(),
         concurrency=1,
         votes=votes,
+        run_kind="hn:0123456789ab",
     )
     return [json.loads(line) for line in out.read_text(encoding="utf-8").splitlines()]
 
@@ -130,3 +133,55 @@ async def test_each_vote_is_cached_on_its_own(tmp_path: Path) -> None:
     [row] = await _run(tmp_path, again, votes=3)
     assert again.judge_calls == 0
     assert row["category"] == "B式作答" and row["agreement"] == "3/3"
+
+
+# ---------------------------------------------------------------------------
+# 续跑:换了尺子 / 票数 / 轮次的结果文件不许接着写(11-09 评审)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_rows_carry_the_yardstick_votes_and_run_kind(tmp_path: Path) -> None:
+    [row] = await _run(tmp_path, _FlipFlopJudge([_verdict("stated")]), votes=3)
+    assert (row["yardstick"], row["judge_votes"], row["run_kind"]) == (
+        YARDSTICK,
+        3,
+        "hn:0123456789ab",
+    )
+
+
+def _resume(tmp_path: Path, **row: Any) -> set[str]:
+    out = tmp_path / "agent.jsonl"
+    base = {
+        "case_id": "q",
+        "answer_model": "m",
+        "judge_model": "j",
+        "yardstick": YARDSTICK,
+        "judge_votes": 3,
+        "run_kind": "standard",
+    }
+    out.write_text(json.dumps({**base, **row}) + "\n", encoding="utf-8")
+    done: set[str] = done_case_ids(
+        out, answer_model="m", judge_model="j", judge_votes=3, run_kind="standard"
+    )
+    return done
+
+
+def test_resume_accepts_rows_from_the_same_run(tmp_path: Path) -> None:
+    assert _resume(tmp_path) == {"q"}
+
+
+@pytest.mark.parametrize(
+    ("row", "message"),
+    [
+        ({"yardstick": None}, "yardstick"),  # 11-09 之前的行:没有这个字段
+        ({"yardstick": "2026-10-29"}, "yardstick"),
+        ({"judge_votes": 1}, "judge_votes"),
+        ({"run_kind": "hn:0123456789ab"}, "run_kind"),
+    ],
+)
+def test_resume_refuses_rows_from_another_yardstick_vote_count_or_run(
+    tmp_path: Path, row: dict[str, Any], message: str
+) -> None:
+    with pytest.raises(SystemExit, match=message):
+        _resume(tmp_path, **row)
