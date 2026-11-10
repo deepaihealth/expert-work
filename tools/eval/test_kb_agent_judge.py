@@ -606,13 +606,13 @@ def test_a_deleted_match_in_either_comparison_is_reported(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     # 审查第四轮 LOW-6:两种比法都没找到时,任一种判出「对上被删句」就报 deleted
-    import kb_agent_judge
+    from kb_agent_judge import _quote_status, passage_index
 
     seen = iter(["missed", "deleted"])
-    monkeypatch.setattr(kb_agent_judge, "_variant_status", lambda *a, **k: next(seen))
-    monkeypatch.setattr(kb_agent_judge, "quote_variants", lambda q: [q, q + "x"])
-    index = kb_agent_judge.passage_index("资料")
-    assert kb_agent_judge._quote_status("引文", index, []) == "deleted"
+    monkeypatch.setattr("kb_agent_judge._variant_status", lambda *a, **k: next(seen))
+    monkeypatch.setattr("kb_agent_judge.quote_variants", lambda q: [q, q + "x"])
+    index = passage_index("资料")
+    assert _quote_status("引文", index, []) == "deleted"
 
 
 def test_a_paren_list_number_without_a_space_is_recognised() -> None:
@@ -629,18 +629,18 @@ def test_a_section_sign_in_the_source_is_dropped_like_other_punctuation() -> Non
 def test_decide_builds_the_passage_index_once_for_all_votes(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    import kb_agent_judge
+    from kb_agent_judge import PassageIndex, decide
+    from kb_agent_judge import passage_index as real
 
     calls: list[str] = []
-    real = kb_agent_judge.passage_index
 
-    def counting(passages: str) -> kb_agent_judge.PassageIndex:
+    def counting(passages: str) -> PassageIndex:
         calls.append(passages)
         return real(passages)
 
-    monkeypatch.setattr(kb_agent_judge, "passage_index", counting)
+    monkeypatch.setattr("kb_agent_judge.passage_index", counting)
     raw = json.dumps(_raw([_claim("stated", "与X类药物间隔30分钟服用")], refused=True))
-    kb_agent_judge.decide("partial", [raw, raw, raw], _PASSAGES)
+    decide("partial", [raw, raw, raw], _PASSAGES)
     assert len(calls) == 1
 
 

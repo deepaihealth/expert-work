@@ -7,7 +7,6 @@ from pathlib import Path
 from typing import Any
 
 import kb_agent_eval  # type: ignore[import-not-found]
-import kb_agent_rejudge  # type: ignore[import-not-found]
 import pytest
 from kb_agent_cost import Spend  # type: ignore[import-not-found]
 from kb_agent_judge import EXCLUDED, JudgeCache, judge_prompt  # type: ignore[import-not-found]
@@ -15,6 +14,7 @@ from kb_agent_rejudge import (  # type: ignore[import-not-found]
     YARDSTICK,
     check_spec,
     done_ids,
+    main,
     rejudge_rows,
     rows_gold,
 )
@@ -252,8 +252,8 @@ def test_the_cli_rejudges_an_old_file_and_rebuilds_gold_offline(
     rejudge = _rejudge_argv(argv, out)
     no_root = [x for i, x in enumerate(rejudge) if "--corpus-root" not in (x, rejudge[i - 1])]
     with pytest.raises(SystemExit, match="--corpus-root"):
-        kb_agent_rejudge.main(no_root)
-    assert kb_agent_rejudge.main(rejudge) == 0
+        main(no_root)
+    assert main(rejudge) == 0
     lines = [json.loads(x) for x in out.read_text(encoding="utf-8").splitlines()]
     rows = [x for x in lines if "case_id" in x]
     [run] = [x["run"] for x in lines if "run" in x]
@@ -267,7 +267,7 @@ def test_the_cli_rejudges_an_old_file_and_rebuilds_gold_offline(
     assert run["rejudge"]["source"] == source and run["rejudge"]["yardstick"] == YARDSTICK
     assert all(r["rejudged_from"]["file"] == source for r in rows)
     assert run["calls"]["answer"] == 0
-    assert kb_agent_rejudge.main(rejudge) == 0  # 续跑:全做完了,只补一行 run
+    assert main(rejudge) == 0  # 续跑:全做完了,只补一行 run
     assert len([x for x in out.read_text().splitlines() if "case_id" in x]) == 32
     assert "# 答题模型 dry" in capsys.readouterr().out
 
@@ -280,8 +280,8 @@ def test_the_cli_rejudges_a_hard_negative_file_with_its_spec(tmp_path: Path) -> 
     out = tmp_path / "rejudged.jsonl"
     rejudge = _rejudge_argv(argv, out)
     with pytest.raises(SystemExit, match="hard-negative run"):
-        kb_agent_rejudge.main(rejudge)
-    assert kb_agent_rejudge.main([*rejudge, "--hard-negatives", str(spec)]) == 0
+        main(rejudge)
+    assert main([*rejudge, "--hard-negatives", str(spec)]) == 0
     rows = [json.loads(x) for x in out.read_text().splitlines() if "case_id" in x]
     [hn] = [r for r in rows if r["set"] == "hard_negative"]
     assert hn["yardstick"] == YARDSTICK and hn["run_kind"].startswith("hn:")
@@ -306,7 +306,7 @@ def test_a_rejudge_stopped_by_the_budget_says_so(
     monkeypatch.setattr(FakeModels, "judge", paid)
     out = tmp_path / "rejudged.jsonl"
     rejudge = [*_rejudge_argv(argv, out), "--budget", "2.5", "--concurrency", "1"]
-    assert kb_agent_rejudge.main(rejudge) == 0
+    assert main(rejudge) == 0
     lines = [json.loads(x) for x in out.read_text(encoding="utf-8").splitlines()]
     [run] = [x["run"] for x in lines if "run" in x]
     assert run["stopped_by_budget"] is True and run["questions"] == 1  # 每题 3 票 = ¥3
@@ -340,12 +340,12 @@ def test_a_rejudge_of_legacy_rows_without_run_kind_or_votes_can_resume(
     out = tmp_path / "rejudged.jsonl"
     # 第一次:每题 1 票 ¥1,预算 ¥0.5 —— 判完一题花费就到上限,停在中途
     first = [*_rejudge_argv(argv, out), "--budget", "0.5", "--concurrency", "1"]
-    assert kb_agent_rejudge.main(first) == 0
+    assert main(first) == 0
     rows = [json.loads(x) for x in out.read_text().splitlines() if "case_id" in x]
     assert len(rows) == 1
     assert rows[0]["run_kind"] == "standard" and rows[0]["judge_votes"] == 1
     # 第二次:同一个 --out 续跑,接上剩下的题
-    assert kb_agent_rejudge.main([*_rejudge_argv(argv, out), "--budget", "100"]) == 0
+    assert main([*_rejudge_argv(argv, out), "--budget", "100"]) == 0
     done = [json.loads(x) for x in out.read_text().splitlines() if "case_id" in x]
     assert len(done) == 32 and len({r["case_id"] for r in done}) == 32
 
@@ -368,7 +368,7 @@ def test_a_rejudge_skips_a_failed_recheck_row_that_a_later_row_replaced(tmp_path
         "\n".join([json.dumps(failed, ensure_ascii=False), *lines]) + "\n", encoding="utf-8"
     )
     out = tmp_path / "rejudged.jsonl"
-    assert kb_agent_rejudge.main(_rejudge_argv(argv, out)) == 0
+    assert main(_rejudge_argv(argv, out)) == 0
     rows = [json.loads(x) for x in out.read_text().splitlines() if "case_id" in x]
     mine = [r for r in rows if r["case_id"] == first["case_id"]]
     assert len(mine) == 1 and mine[0]["category"] != "excluded_recheck_search_failed"
@@ -378,7 +378,7 @@ def test_resuming_refuses_a_same_named_source_from_another_folder(tmp_path: Path
     argv = [*_corpus(tmp_path), "--distractors", "0"]
     assert kb_agent_eval.main(argv) == 0
     out = tmp_path / "rejudged.jsonl"
-    assert kb_agent_rejudge.main(_rejudge_argv(argv, out)) == 0
+    assert main(_rejudge_argv(argv, out)) == 0
     other = tmp_path / "copy"
     other.mkdir()
     (other / "agent.jsonl").write_bytes((tmp_path / "agent.jsonl").read_bytes())
@@ -387,7 +387,7 @@ def test_resuming_refuses_a_same_named_source_from_another_folder(tmp_path: Path
         for x in _rejudge_argv(argv, out)
     ]
     with pytest.raises(SystemExit, match="rejudged_from"):
-        kb_agent_rejudge.main(again)
+        main(again)
 
 
 def test_a_hard_negative_rejudge_rebuilds_the_deleted_text_note_and_scoring(
@@ -415,7 +415,7 @@ def test_a_hard_negative_rejudge_rebuilds_the_deleted_text_note_and_scoring(
 
     monkeypatch.setattr(FakeModels, "judge", flags_everything)
     out = tmp_path / "rejudged.jsonl"
-    assert kb_agent_rejudge.main([*_rejudge_argv(argv, out), "--hard-negatives", str(spec)]) == 0
+    assert main([*_rejudge_argv(argv, out), "--hard-negatives", str(spec)]) == 0
     rows = [json.loads(x) for x in out.read_text().splitlines() if "case_id" in x]
     [hn] = [r for r in rows if r["set"] == "hard_negative"]
     assert hn["category"] == "编造" and hn["verdict"]["repeats_deleted"] == 1

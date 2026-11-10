@@ -407,7 +407,7 @@ async def test_the_store_residue_check_folds_radical_spellings(
     from types import SimpleNamespace
     from uuid import uuid4
 
-    import kb_agent_cases  # type: ignore[import-not-found]
+    from kb_agent_cases import store_residue  # type: ignore[import-not-found]
 
     class _Store:
         async def list_documents(self, **_kw: Any) -> list[Any]:
@@ -416,8 +416,8 @@ async def test_the_store_residue_check_folds_radical_spellings(
     async def chunks(*_a: Any, **_kw: Any) -> list[str]:
         return ["适用:饮\u2edd清淡的成年人。"]
 
-    monkeypatch.setattr(kb_agent_cases, "_all_chunk_texts", chunks)
-    left = await kb_agent_cases.store_residue(
+    monkeypatch.setattr("kb_agent_cases._all_chunk_texts", chunks)
+    left = await store_residue(
         _Store(), tenant_id=uuid4(), kb_id=uuid4(), anchors=["饮食清淡的成年人"]
     )
     assert left == ["饮食清淡的成年人"]
