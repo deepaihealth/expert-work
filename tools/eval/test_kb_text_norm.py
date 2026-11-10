@@ -95,3 +95,30 @@ def test_key_facts_are_extracted_by_generic_rules(text: str, kind: str, value: s
 
 def test_a_number_with_a_unit_is_not_also_a_code() -> None:
     assert key_facts("每次10g") == [("number", "10g")]
+
+
+# ---------------------------------------------------------------------------
+# 审查 M1 / M2 / L3:千分位、小数切出的假型号、边界、列表编号
+# ---------------------------------------------------------------------------
+
+
+def test_thousands_separators_are_dropped_before_extracting_numbers() -> None:
+    assert unit_numbers("每粒含1,000毫克,每盒 2\uff0c500mg") == ["1000毫克", "2500mg"]
+    assert has_number("1000毫克", quote_key("含 1,000 毫克"))
+    assert key_facts("1,000毫克") == [("number", "1000毫克")]
+
+
+def test_a_decimal_number_does_not_yield_a_fake_code() -> None:
+    assert key_facts("每片1.5mg") == [("number", "1.5mg")]
+    assert key_facts("规格 1.5mg/片,型号 KX-305") == [("number", "1.5mg"), ("code", "kx-305")]
+
+
+def test_number_matching_has_a_trailing_boundary() -> None:
+    assert has_number("10g", quote_key("容量10gb")) is False
+    assert has_number("10g", quote_key("每份10g,"))
+
+
+def test_list_numbering_is_not_read_as_a_decimal_point() -> None:
+    assert quote_key("1. 5克装每盒") == "5克装每盒"
+    assert quote_key("说明\n2. 每天1袋") == "说明每天1袋"
+    assert quote_key("规格1.5克") == "规格1.5克"

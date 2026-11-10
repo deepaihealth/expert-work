@@ -184,6 +184,7 @@ async def run_questions(
     run_kind: str = "standard",
     deleted: Mapping[str, Sequence[str]] | None = None,
     production: ProductionPrompt | None = None,
+    recheck_costs: Mapping[str, float] | None = None,
 ) -> int:
     """答题 + 判分,每题一行追加进 ``out``;返回写了几行。``other_cost`` 是计入预算的其它花费
     (重排)。``production``:照生产加的提示段(见 ``kb_agent_prod_prompt``)。
@@ -241,7 +242,16 @@ async def run_questions(
                 "yardstick": YARDSTICK,
                 "judge_votes": votes,
                 "run_kind": run_kind,
-                "cost_cny": {"answer": round(answer_cny, 6), "judge": round(judge_cny, 6)},
+                "cost_cny": {
+                    "answer": round(answer_cny, 6),
+                    "judge": round(judge_cny, 6),
+                    # 审查 M4:难负例答前复核的判分花费记在留下来答题的那一行上
+                    **(
+                        {"recheck": round(recheck_costs[case.id], 6)}
+                        if recheck_costs and case.id in recheck_costs
+                        else {}
+                    ),
+                },
             }
             async with write_lock:
                 with out.open("a", encoding="utf-8") as fh:
@@ -553,8 +563,17 @@ async def _run(
             refs = (base_name,)
             search = KnowledgeSearchTool(retriever=retriever, knowledge_base_refs=refs)
             cache = JudgeCache(args.judge_cache)
-            todo, recheck = await _recheck(
-                args, todo=todo, plan=plan, search=search, models=models, cache=cache, spend=spend
+            gate = BudgetGate(budget=args.budget, control=Path(f"{out}.budget"))
+            todo, recheck, recheck_costs = await _recheck(
+                args,
+                todo=todo,
+                plan=plan,
+                search=search,
+                models=models,
+                cache=cache,
+                spend=spend,
+                gate=gate,
+                total=lambda: float(spend.answer_cny + spend.judge_cny + rerank_cny()),
             )
             # B-206 K-2:生产里有知识库的智能体两个工具都有;--no-read 只是读文档关掉。
             reader = (
@@ -573,7 +592,7 @@ async def _run(
                 gold=gold,
                 cache=cache,
                 out=out,
-                gate=BudgetGate(budget=args.budget, control=Path(f"{out}.budget")),
+                gate=gate,
                 spend=spend,
                 other_cost=rerank_cny,
                 concurrency=args.concurrency,
@@ -583,6 +602,7 @@ async def _run(
                 run_kind=run_kind_of(args),
                 deleted=plan.deleted_by_case,
                 production=production,
+                recheck_costs=recheck_costs,
             )
     run = {
         "started": started.isoformat(),
@@ -631,11 +651,25 @@ async def _recheck(
     models: Models,
     cache: JudgeCache,
     spend: Spend,
-) -> tuple[list[tuple[str, KbCase]], dict[str, object] | None]:
-    """难负例答前复核(``kb_agent_recheck``):判为答案仍在库里的题落一行剔除记录、不再答题。
-    返回 ``(还要答的题, 记进 run 行的复核摘要)``。"""
+    gate: BudgetGate,
+    total: Callable[[], float],
+) -> tuple[list[tuple[str, KbCase]], dict[str, object] | None, dict[str, float]]:
+    """难负例答前复核(``kb_agent_recheck``):判为答案仍在库里 / 复核检索报错的题落一行不计分的
+    记录、不再答题。受同一个 ``--budget`` 约束(审查 L2):暂停时等操作者调高上限,收到 ``stop``
+    就不再复核、也不再答题。返回 ``(还要答的题, 记进 run 行的复核摘要, 留下的题各自的
+    复核花费)``。"""
     if not plan.delete_anchors or args.no_recheck:
-        return list(todo), None
+        return list(todo), None, {}
+    stopped = False
+
+    async def admit() -> bool:
+        nonlocal stopped
+        while total() >= gate.budget:
+            if not await gate.wait_for_raise(total):
+                stopped = True
+                return False
+        return True
+
     hard = [case for label, case in todo if label == HARD_NEGATIVE_SET]
     checks = await recheck_hard_negatives(
         cases=hard,
@@ -648,6 +682,7 @@ async def _recheck(
         votes=args.judge_votes,
         k=args.recheck_k,
         cache_verdicts=not args.dry,
+        admit=admit,
     )
     meta = {
         "answer_model": models.answer_model,
@@ -657,18 +692,31 @@ async def _recheck(
         "run_kind": run_kind_of(args),
     }
     gone = {cid for cid, check in checks.items() if check["excluded"]}
+    failed = {cid for cid, check in checks.items() if check["search_error"]}
     write_excluded(
         cast(Path, args.out),
         [
             excluded_row(label, case, checks[case.id], meta=meta)
             for label, case in todo
-            if case.id in gone
+            if case.id in gone | failed
         ],
     )
     for case_id in sorted(gone):
         print(f"{case_id} -> excluded: answer still retrievable after deletion", file=sys.stderr)
-    summary = {"k": args.recheck_k, "checked": len(checks), "excluded": sorted(gone)}
-    return [(label, case) for label, case in todo if case.id not in gone], summary
+    for case_id in sorted(failed):
+        print(f"{case_id} -> not scored: recheck search failed", file=sys.stderr)
+    summary = {
+        "k": args.recheck_k,
+        "checked": len(checks),
+        "excluded": sorted(gone),
+        "search_errors": sorted(failed),
+        "stopped_by_budget": stopped,
+    }
+    if stopped:  # 操作者写了 stop:后面的题都不答(没复核的难负例不能直接答)
+        return [], summary, {}
+    costs = {cid: float(check["cost_cny"]) for cid, check in checks.items()}
+    left = [(label, case) for label, case in todo if case.id not in gone | failed]
+    return left, summary, costs
 
 
 def main(argv: Sequence[str] | None = None) -> int:

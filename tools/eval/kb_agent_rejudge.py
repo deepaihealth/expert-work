@@ -48,7 +48,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 
 from kb_agent_cost import Spend, resolve_price  # type: ignore[import-not-found]
 from kb_agent_judge import (  # type: ignore[import-not-found]
-    EXCLUDED,
+    UNSCORED,
     Judge,
     JudgeCache,
     decide,
@@ -118,7 +118,7 @@ def rows_gold(rows: Sequence[Mapping[str, Any]]) -> dict[str, list[str]] | None:
     """结果行里记着的 ``gold``;有一道有答案的题没记就 None(要重建库取)。"""
     gold: dict[str, list[str]] = {}
     for row in rows:
-        if row.get("category") == EXCLUDED:
+        if row.get("category") in UNSCORED:
             continue
         if "gold" not in row:
             if row.get("label", "answerable" if row.get("answerable") else "") == "answerable":
@@ -175,14 +175,30 @@ async def offline_gold(
 # ---------------------------------------------------------------------------
 
 
-def done_ids(path: Path) -> set[str]:
+def done_ids(path: Path, *, judge_model: str, votes: int, source: str, run_kind: str) -> set[str]:
+    """``--out`` 里已重判的题;尺子、判分模型、票数、源文件、轮次有一项与这次不同就拒绝续写
+    (审查 M3)。复核剔除的行不重判,不核判分模型。"""
     rows, _runs = read_results(path)
     for row in rows:
-        if row.get("yardstick") != YARDSTICK:
-            raise SystemExit(
-                f"{path} has a row judged with yardstick {row.get('yardstick')!r}, this rejudge "
-                f"uses {YARDSTICK!r}; use another --out"
+        wanted: dict[str, object] = {
+            "yardstick": YARDSTICK,
+            "judge_votes": votes,
+            "run_kind": run_kind,
+            "rejudged_from": source,
+        }
+        if row.get("category") not in UNSCORED:
+            wanted["judge_model"] = judge_model
+        for key, value in wanted.items():
+            got = (
+                (row.get("rejudged_from") or {}).get("file")
+                if key == "rejudged_from"
+                else row.get(key)
             )
+            if got != value:
+                raise SystemExit(
+                    f"{path} has a row with {key}={got!r}, this rejudge is {value!r}; "
+                    "use another --out"
+                )
     return {str(r["case_id"]) for r in rows}
 
 
@@ -232,8 +248,9 @@ async def rejudge_rows(
             "cost_cny": row.get("cost_cny"),
         }
         meta = {"yardstick": YARDSTICK, "judge_votes": votes, "rejudged_from": was}
-        if row.get("category") == EXCLUDED:
-            return {**row, **meta}
+        if row.get("category") in UNSCORED:
+            # 不重判:这次没花钱(审查 L7),原来的花费留在 rejudged_from
+            return {**row, **meta, "cost_cny": {"answer": 0.0, "judge": 0.0}}
         case_id = str(row["case_id"])
         if case_id not in cases:
             raise SystemExit(f"{case_id} is not in this run's cases: check --dataset / spec")
@@ -328,7 +345,15 @@ async def amain(args: argparse.Namespace) -> int:
     plan = plan_for(args, runs, main_set, chat_set)
     cases = {c.id: c for _label, c in plan.cases}
     out = cast(Path, args.out)
-    done = done_ids(out)
+    if args.dry:
+        from kb_agent_models import DRY_MODEL  # type: ignore[import-not-found]
+
+        judge_model = DRY_MODEL
+    else:
+        judge_model = args.judge_model
+    done = done_ids(
+        out, judge_model=judge_model, votes=votes, source=args.source.name, run_kind=run_kind
+    )
     todo = [r for r in rows if str(r["case_id"]) not in done]
     gold = rows_gold(todo)
     if gold is None:
@@ -366,9 +391,8 @@ async def amain(args: argparse.Namespace) -> int:
         return written
 
     if args.dry:
-        from kb_agent_models import DRY_MODEL, FakeModels  # type: ignore[import-not-found]
+        from kb_agent_models import FakeModels  # type: ignore[import-not-found]
 
-        judge_model = DRY_MODEL
         written = await run_with(FakeModels())
     else:
         import httpx
@@ -379,18 +403,26 @@ async def amain(args: argparse.Namespace) -> int:
             raise SystemExit(f"missing env {', '.join(missing)}")
         base_url, key = (os.environ[name] for name in JUDGE_ENV)
         price = resolve_price(args.judge_model, args.judge_price)
-        judge_model = args.judge_model
         async with httpx.AsyncClient() as http:
             client = ChatClient(
                 model=judge_model, base_url=base_url, api_key=key, price=price, http=http
             )
             written = await run_with(_JudgeOnly(client))
+    stopped = written < len(todo)
+    if stopped:
+        print(
+            f"stopped by budget: spent ¥{spend.judge_cny:.2f} >= ¥{args.budget:.2f}; "
+            f"{len(todo) - written} row(s) left, rerun with the same --out to finish",
+            file=sys.stderr,
+        )
     source_run = runs[-1] if runs else {}
     run = {
         **{k: v for k, v in source_run.items() if k not in ("calls", "spend_cny", "questions")},
         "started": started.isoformat(),
         "finished": datetime.now(UTC).isoformat(),
         "questions": written,
+        # 审查 L7:花费到了 --budget、还有题没重判
+        "stopped_by_budget": stopped,
         "answer_model": rows[0].get("answer_model"),
         "judge_model": judge_model,
         "judge_votes": votes,

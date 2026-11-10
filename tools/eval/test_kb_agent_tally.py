@@ -209,5 +209,35 @@ def test_grounded_claim_share_is_reported_per_set_and_per_file(tmp_path: Path) -
     text = tally([before, after])
     assert "  有依据的断言占比:all 66.7%(8/12);main 87.5%(7/8);chat 25.0%(1/4)" in text
     assert "## 有依据的断言占比(按文件、按集;不需要出处的断言不进分母)" in text
-    assert "  before.jsonl | all 50.0%(4/8) | main 75.0%(3/4) | chat 25.0%(1/4)" in text
-    assert "  after.jsonl | all 100.0%(4/4) | main 100.0%(4/4)" in text
+    assert f"  {before} | all 50.0%(4/8) | main 75.0%(3/4) | chat 25.0%(1/4)" in text
+    assert f"  {after} | all 100.0%(4/4) | main 100.0%(4/4)" in text
+
+
+def test_per_question_usage_leaves_out_rows_excluded_by_the_recheck(tmp_path: Path) -> None:
+    kept = [
+        {**_row(f"n{i}", "no_answer", "正确说没写"), "searches": [{"status": "ok"}], "reads": [{}]}
+        for i in range(2)
+    ]
+    rows = [*kept, _excluded("hn-x1"), _excluded("hn-x2")]
+    text = tally([_write(tmp_path / "a.jsonl", rows)])
+    assert "searches per question 1.00" in text
+    assert "reads per question 1.00" in text
+
+
+def test_recheck_costs_on_kept_rows_count_as_judge_spend(tmp_path: Path) -> None:
+    row = {
+        **_row("n1", "no_answer", "正确说没写"),
+        "cost_cny": {"answer": 0.1, "judge": 0.1, "recheck": 0.05},
+    }
+    text = tally([_write(tmp_path / "a.jsonl", [row])])
+    assert "judge ¥0.15" in text
+
+
+def test_files_with_the_same_name_in_different_folders_are_kept_apart(tmp_path: Path) -> None:
+    (tmp_path / "x").mkdir()
+    (tmp_path / "y").mkdir()
+    a = _write(tmp_path / "x" / "r.jsonl", [_claims("a1", "main", 1, 2)])
+    b = _write(tmp_path / "y" / "r.jsonl", [_claims("a1", "main", 2, 2)])
+    text = tally([a, b])
+    assert f"  {a} | all 50.0%(1/2)" in text
+    assert f"  {b} | all 100.0%(2/2)" in text

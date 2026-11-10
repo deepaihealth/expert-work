@@ -508,3 +508,33 @@ def test_the_spec_lists_excluded_cases_by_id_and_reason_only() -> None:
     )
     assert spec["excluded"] == [{"id": "h1", "reason": "fact_number"}]
     assert spec["cases"] == [] and "suspects" not in spec
+
+
+# ---------------------------------------------------------------------------
+# 审查 M2:小数尾巴不是型号;型号前后都要有边界
+# ---------------------------------------------------------------------------
+
+
+def test_other_doses_do_not_count_as_the_answer_dose() -> None:
+    anchor = "甲片每片含活性成分1.5mg"
+    case = _answer_case("h1", "甲片每片多少", "a.md", anchor, "1.5mg")
+    base = {"a.md": f"# 甲片(合成)\n\n{anchor}。\n"}
+    others = {**base, "b.md": "# 乙片(合成)\n\n乙片每片含活性成分2.5mg,丙片每片含活性成分15mg。\n"}
+    picked, _skipped, flagged = pick_hard_negatives([case], [], others, n=3, seed=1)
+    assert flagged == [] and [p.case.id for p in picked] == ["h1"]
+    same = {**base, "c.md": "# 合成\n\n甲片每片活性成分含量为1.5mg。\n"}
+    _picked, _skipped, flagged = pick_hard_negatives([case], [], same, n=3, seed=1)
+    assert flagged == [("h1", "fact_number")]
+
+
+def test_a_code_inside_a_longer_code_is_not_the_same_code() -> None:
+    case = _answer_case("h1", "甲款型号", "a.md", "甲款的型号是KX-305", "KX-305")
+    texts = {
+        "a.md": "# 合成\n\n甲款的型号是 KX-305,出厂编号另见铭牌。\n",
+        "b.md": "# 目录(合成)\n\n甲款(型号 KX-3050)在第三页。\n",
+    }
+    _picked, _skipped, flagged = pick_hard_negatives([case], [], texts, n=3, seed=1)
+    assert flagged == []
+    texts["b.md"] += "甲款(型号 KX-305)在第五页。\n"
+    _picked, _skipped, flagged = pick_hard_negatives([case], [], texts, n=3, seed=1)
+    assert flagged == [("h1", "fact_code")]

@@ -145,15 +145,48 @@ async def test_a_recheck_excluded_row_is_carried_over_without_judging(tmp_path: 
     )
     [row] = [json.loads(x) for x in out.read_text(encoding="utf-8").splitlines()]
     assert judge.prompts == [] and row["category"] == EXCLUDED and row["yardstick"] == YARDSTICK
+    # 审查 L7:这次没花钱;原来的花费留在 rejudged_from 里
+    assert row["cost_cny"] == {"answer": 0.0, "judge": 0.0}
+    assert row["rejudged_from"]["cost_cny"] == {"answer": 0.3, "judge": 0.2}
 
 
-def test_an_output_judged_with_another_yardstick_is_refused(tmp_path: Path) -> None:
+_DONE = {
+    "yardstick": YARDSTICK,
+    "judge_model": "scripted",
+    "judge_votes": 3,
+    "run_kind": "standard",
+    "rejudged_from": {"file": "old.jsonl"},
+}
+
+
+def _done(tmp_path: Path, **row: Any) -> set[str]:
     out = tmp_path / "new.jsonl"
-    out.write_text(json.dumps(_old_row()) + "\n", encoding="utf-8")
-    with pytest.raises(SystemExit, match="yardstick"):
-        done_ids(out)
-    out.write_text(json.dumps(_old_row(yardstick=YARDSTICK)) + "\n", encoding="utf-8")
-    assert done_ids(out) == {"n1"}
+    out.write_text(json.dumps(_old_row(**{**_DONE, **row})) + "\n", encoding="utf-8")
+    ids: set[str] = done_ids(
+        out, judge_model="scripted", votes=3, source="old.jsonl", run_kind="standard"
+    )
+    return ids
+
+
+def test_resuming_a_rejudge_accepts_rows_of_the_same_rejudge(tmp_path: Path) -> None:
+    assert _done(tmp_path) == {"n1"}
+
+
+@pytest.mark.parametrize(
+    ("row", "message"),
+    [
+        ({"yardstick": _OLD}, "yardstick"),
+        ({"judge_model": "other"}, "judge_model"),  # 审查 M3
+        ({"judge_votes": 1}, "judge_votes"),
+        ({"rejudged_from": {"file": "another.jsonl"}}, "rejudged_from"),
+        ({"run_kind": "hn:0123456789ab"}, "run_kind"),
+    ],
+)
+def test_resuming_a_rejudge_refuses_rows_from_another_rejudge(
+    tmp_path: Path, row: dict[str, Any], message: str
+) -> None:
+    with pytest.raises(SystemExit, match=message):
+        _done(tmp_path, **row)
 
 
 def test_the_hard_negative_spec_must_be_the_one_the_source_ran_with(tmp_path: Path) -> None:
@@ -186,8 +219,13 @@ def test_rows_without_gold_need_a_rebuild() -> None:
 # ---------------------------------------------------------------------------
 
 
-def _as_old(path: Path) -> None:
-    """把空跑结果改成 11-10 之前的样子:旧尺子、没有 gold。"""
+def _as_old(path: Path) -> dict[str, list[str]]:
+    """把空跑结果改成 11-10 之前的样子:旧尺子、没有 gold。返回原来记着的 gold。"""
+    gold = {
+        json.loads(x)["case_id"]: json.loads(x)["gold"]
+        for x in path.read_text(encoding="utf-8").splitlines()
+        if '"case_id"' in x
+    }
     lines = []
     for line in path.read_text(encoding="utf-8").splitlines():
         item = json.loads(line)
@@ -195,6 +233,7 @@ def _as_old(path: Path) -> None:
             item = {k: v for k, v in item.items() if k != "gold"} | {"yardstick": _OLD}
         lines.append(json.dumps(item, ensure_ascii=False))
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return gold
 
 
 def _rejudge_argv(argv: list[str], out: Path) -> list[str]:
@@ -208,7 +247,7 @@ def test_the_cli_rejudges_an_old_file_and_rebuilds_gold_offline(
 ) -> None:
     argv = [*_corpus(tmp_path), "--distractors", "0"]
     assert kb_agent_eval.main(argv) == 0
-    _as_old(tmp_path / "agent.jsonl")
+    original = _as_old(tmp_path / "agent.jsonl")
     out = tmp_path / "rejudged.jsonl"
     rejudge = _rejudge_argv(argv, out)
     no_root = [x for i, x in enumerate(rejudge) if "--corpus-root" not in (x, rejudge[i - 1])]
@@ -222,6 +261,8 @@ def test_the_cli_rejudges_an_old_file_and_rebuilds_gold_offline(
     assert all(r["rejudged_from"]["yardstick"] == _OLD for r in rows)
     answerable = [r for r in rows if r["label"] == "answerable"]
     assert answerable and all(r["gold"] for r in answerable)  # 库在本机重建,取回了含答案段落
+    # 与原跑判分看到的含答案段落逐题相同
+    assert {r["case_id"]: r["gold"] for r in rows} == original
     assert run["rejudge"]["source"] == "agent.jsonl" and run["rejudge"]["yardstick"] == YARDSTICK
     assert run["calls"]["answer"] == 0
     assert kb_agent_rejudge.main(rejudge) == 0  # 续跑:全做完了,只补一行 run
@@ -233,6 +274,7 @@ def test_the_cli_rejudges_a_hard_negative_file_with_its_spec(tmp_path: Path) -> 
     spec = _spec(tmp_path, _GONE)
     argv = [*_corpus(tmp_path), "--hard-negatives", str(spec), "--no-recheck"]
     assert kb_agent_eval.main(argv) == 0
+    original = _as_old(tmp_path / "agent.jsonl")
     out = tmp_path / "rejudged.jsonl"
     rejudge = _rejudge_argv(argv, out)
     with pytest.raises(SystemExit, match="hard-negative run"):
@@ -241,3 +283,29 @@ def test_the_cli_rejudges_a_hard_negative_file_with_its_spec(tmp_path: Path) -> 
     rows = [json.loads(x) for x in out.read_text().splitlines() if "case_id" in x]
     [hn] = [r for r in rows if r["set"] == "hard_negative"]
     assert hn["yardstick"] == YARDSTICK and hn["run_kind"].startswith("hn:")
+    # 删过句的库在本机重建(同样删句),对照题的含答案段落与原跑逐题相同
+    assert {r["case_id"]: r["gold"] for r in rows} == original
+    assert any(original[r["case_id"]] for r in rows if r["label"] == "answerable")
+
+
+def test_a_rejudge_stopped_by_the_budget_says_so(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    from kb_agent_models import FakeModels  # type: ignore[import-not-found]
+
+    argv = [*_corpus(tmp_path), "--distractors", "0"]
+    assert kb_agent_eval.main(argv) == 0
+    original = FakeModels.judge
+
+    async def paid(self: FakeModels, prompt: str) -> tuple[str, float]:
+        raw, _cost = await original(self, prompt)
+        return str(raw), 1.0
+
+    monkeypatch.setattr(FakeModels, "judge", paid)
+    out = tmp_path / "rejudged.jsonl"
+    rejudge = [*_rejudge_argv(argv, out), "--budget", "2.5", "--concurrency", "1"]
+    assert kb_agent_rejudge.main(rejudge) == 0
+    lines = [json.loads(x) for x in out.read_text(encoding="utf-8").splitlines()]
+    [run] = [x["run"] for x in lines if "run" in x]
+    assert run["stopped_by_budget"] is True and run["questions"] == 1  # 每题 3 票 = ¥3
+    assert "stopped by budget" in capsys.readouterr().err

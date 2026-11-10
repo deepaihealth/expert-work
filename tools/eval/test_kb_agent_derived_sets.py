@@ -335,7 +335,13 @@ def test_a_hard_negative_still_answerable_after_deletion_is_excluded_before_answ
     [hn] = [r for r in rows if r["set"] == "hard_negative"]
     assert hn["category"] == "excluded_answer_still_present"
     assert hn["answer"] is None and hn["searches"] == []
-    assert run["recheck"] == {"k": 20, "checked": 1, "excluded": ["hn-unit_kb-noise"]}
+    assert run["recheck"] == {
+        "k": 20,
+        "checked": 1,
+        "excluded": ["hn-unit_kb-noise"],
+        "search_errors": [],
+        "stopped_by_budget": False,
+    }
     # 复核用题目检索、给判分看被删的原文作对照;只复核难负例
     assert len(prompts) == 3 and len(set(prompts)) == 1  # 默认 3 票取多数
     prompt = prompts[0]
@@ -357,7 +363,13 @@ def test_a_hard_negative_the_recheck_cannot_answer_is_answered(
     rows, run = _lines(tmp_path)
     [hn] = [r for r in rows if r["set"] == "hard_negative"]
     assert hn["category"] != "excluded_answer_still_present" and hn["answer"]
-    assert run["recheck"] == {"k": 5, "checked": 1, "excluded": []}
+    assert run["recheck"] == {
+        "k": 5,
+        "checked": 1,
+        "excluded": [],
+        "search_errors": [],
+        "stopped_by_budget": False,
+    }
     assert hn["run_kind"].endswith(":recheck5")
 
 
@@ -407,3 +419,72 @@ async def test_the_store_residue_check_folds_radical_spellings(
         _Store(), tenant_id=uuid4(), kb_id=uuid4(), anchors=["饮食清淡的成年人"]
     )
     assert left == ["饮食清淡的成年人"]
+
+
+# ---------------------------------------------------------------------------
+# 审查 M4 / L1 / L2:复核花费进结果行、检索失败、预算
+# ---------------------------------------------------------------------------
+
+
+def _priced(monkeypatch: pytest.MonkeyPatch, answerable: bool, cny: float) -> None:
+    original = FakeModels.judge
+
+    async def judge(self: FakeModels, prompt: str) -> tuple[str, float]:
+        if "【检索到的资料段落】" in prompt:
+            return json.dumps({"answerable": answerable, "reason": "r"}), cny
+        raw, _cost = await original(self, prompt)
+        return str(raw), cny
+
+    monkeypatch.setattr(FakeModels, "judge", judge)
+
+
+def test_the_recheck_cost_of_a_kept_hard_negative_lands_on_its_row(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _priced(monkeypatch, False, 0.01)
+    argv = [*_corpus(tmp_path), "--hard-negatives", str(_spec(tmp_path, _GONE))]
+    assert kb_agent_eval.main(argv) == 0
+    rows, run = _lines(tmp_path)
+    [hn] = [r for r in rows if r["set"] == "hard_negative"]
+    assert hn["cost_cny"]["recheck"] == pytest.approx(0.03)  # 3 票
+    rows_judge = sum(r["cost_cny"]["judge"] + r["cost_cny"].get("recheck", 0.0) for r in rows)
+    assert rows_judge == pytest.approx(run["spend_cny"]["judge"])
+    text = kb_agent_eval.tally(tmp_path / "agent.jsonl")
+    assert f"judge ¥{run['spend_cny']['judge']:.2f}" in text
+
+
+def test_a_hard_negative_whose_recheck_search_fails_is_not_scored(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from orchestrator.tools.knowledge import KnowledgeSearchTool
+
+    prompts = _recheck_says(monkeypatch, False)
+    real = KnowledgeSearchTool.call
+
+    async def flaky(self: KnowledgeSearchTool, args: Any, *, ctx: Any) -> Any:
+        if args.get("limit") == 20:  # 只有复核带 limit=20
+            raise RuntimeError("search backend down")
+        return await real(self, args, ctx=ctx)
+
+    monkeypatch.setattr(KnowledgeSearchTool, "call", flaky)
+    argv = [*_corpus(tmp_path), "--hard-negatives", str(_spec(tmp_path, _GONE))]
+    assert kb_agent_eval.main(argv) == 0
+    rows, run = _lines(tmp_path)
+    [hn] = [r for r in rows if r["set"] == "hard_negative"]
+    assert prompts == []  # 检索失败:没有段落可判,不调判分
+    assert hn["category"] == "excluded_recheck_search_failed" and hn["answer"] is None
+    assert run["recheck"]["search_errors"] == ["hn-unit_kb-noise"]
+    assert run["recheck"]["excluded"] == []
+    text = kb_agent_eval.tally(tmp_path / "agent.jsonl")
+    assert "复核检索失败(不答、不进分母):1 题(hn-unit_kb-noise)" in text
+    assert "资料没写 n=0" in text
+
+
+def test_the_recheck_respects_the_budget(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    prompts = _recheck_says(monkeypatch, False)
+    argv = [*_corpus(tmp_path), "--hard-negatives", str(_spec(tmp_path, _GONE)), "--budget", "0"]
+    (tmp_path / "agent.jsonl.budget").write_text("stop", encoding="utf-8")
+    assert kb_agent_eval.main(argv) == 0
+    rows, run = _lines(tmp_path)
+    assert prompts == [] and rows == []
+    assert run["recheck"]["stopped_by_budget"] is True and run["recheck"]["checked"] == 0

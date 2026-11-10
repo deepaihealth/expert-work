@@ -51,8 +51,8 @@ sys.path.insert(0, str(Path(__file__).parent))
 from kb_agent_cost import Price, resolve_price  # type: ignore[import-not-found]
 from kb_agent_judge import (  # type: ignore[import-not-found]
     DEFAULT_JUDGE_VOTES,
-    EXCLUDED,
     JUDGE_TEMPLATE,
+    UNSCORED,
     seen_passages,
 )
 from kb_agent_recheck import RECHECK_TEMPLATE  # type: ignore[import-not-found]
@@ -75,10 +75,9 @@ DEFAULT_HARD_NEGATIVES = 30
 #: 一次 ``knowledge_search`` 结果的字数上限(``orchestrator.tools.knowledge_results
 #: .RESULTS_TEXT_BUDGET``;不 import:太重)。答前复核取前 20 段也只有这么多字。
 SEARCH_TEXT_BUDGET = 10_000
-#: 复核的参考答案(原题文字答案 + 被删原文)、问题、回复各约多少字(估算假设)。
+#: 复核的参考答案(原题文字答案 + 被删原文)、问题各约多少字(估算假设)。
 RECHECK_REFERENCE_CHARS = 200
 RECHECK_QUESTION_CHARS = 30
-RECHECK_REPLY_CHARS = 80
 #: 旧结果行没记 ``gold`` 时,一段「含答案的完整段落」按多少字估(10 月切块导出的平均块长约 290 字)。
 GOLD_PASSAGE_CHARS = 300
 #: 部分写了 / 资料没写的参考信息约多少字;派生题的补充说明另加多少字(估算假设)。
@@ -104,6 +103,8 @@ class History:
     input_ratio: float
     answer_model: str
     judge_model: str
+    #: 历史每次判分提示词的平均字数(旧模板 + 问题 + 资料 + 回答);按字数比推别的判分调用用。
+    prompt_chars: float = 0.0
 
 
 def history_from(path: Path) -> History:
@@ -128,6 +129,11 @@ def history_from(path: Path) -> History:
         input_ratio=statistics.fmean(ratios),
         answer_model=str(rows[0].get("answer_model")),
         judge_model=str(rows[0].get("judge_model")),
+        prompt_chars=statistics.fmean(
+            OLD_TEMPLATE_CHARS + rest(r) for r in rows if r.get("category") not in UNSCORED
+        )
+        if any(r.get("category") not in UNSCORED for r in rows)
+        else float(OLD_TEMPLATE_CHARS),
     )
 
 
@@ -217,12 +223,13 @@ def _row(r: RunEstimate) -> str:
     )
 
 
-def recheck_call_cny(price: Price) -> float:
-    """一次答前复核的钱(价目表价,不算闲时半价)。"""
+def recheck_call_cny(h: History) -> float:
+    """一次答前复核的钱,与主估价同一口径(审查 L2):历史每次判分的实花(含判分模型看不见的思考
+    token、历史的忙闲时比例)乘「复核提示词字数 / 历史判分提示词平均字数」。复核的回复比判分短,
+    这样估偏高。"""
     template = len(RECHECK_TEMPLATE.format(question="", reference="", passages=""))
     chars = template + RECHECK_QUESTION_CHARS + RECHECK_REFERENCE_CHARS + SEARCH_TEXT_BUDGET
-    tokens_in, tokens_out = chars * TOKENS_PER_CHAR, RECHECK_REPLY_CHARS * TOKENS_PER_CHAR
-    return float((tokens_in * price.input + tokens_out * price.output) / 1e6)
+    return float(h.judge_cny_per_call * chars / h.prompt_chars)
 
 
 # ---------------------------------------------------------------------------
@@ -259,7 +266,7 @@ def rejudge_estimate(
     path: Path, *, price: Price, reply_chars: float, votes: int | None = None
 ) -> RejudgeEstimate:
     """一份结果文件用新尺子重判要多少调用、多少钱(不调模型);复核剔除的行不重判。"""
-    rows = [r for r in read_results(path)[0] if r.get("category") != EXCLUDED]
+    rows = [r for r in read_results(path)[0] if r.get("category") not in UNSCORED]
     calls = 0
     tokens_in = tokens_out = full = cached = history = 0.0
     out_per_call = reply_chars * TOKENS_PER_CHAR
@@ -452,7 +459,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         notes.append("历史文件没有 run 行(中途停了):答题次数未知、重排按 ¥0 估")
     judge_call = judge_call_cny(h, reply_chars=reply or 150.0, price=price)
     standard, _distractors, hard_run, hard, chars, more = _count_runs(args)
-    recheck = (0 if args.no_recheck else hard * args.judge_votes, recheck_call_cny(price))
+    recheck = (0 if args.no_recheck else hard * args.judge_votes, recheck_call_cny(h))
     embed_price = float(os.environ.get(EMBED_PRICE_ENV, DEFAULT_EMBED_PRICE_CNY_PER_1K))
     embed = chars * TOKENS_PER_CHAR / 1000 * embed_price
     runs = [

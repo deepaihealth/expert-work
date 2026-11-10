@@ -381,13 +381,30 @@ def test_no_source_needed_claims_are_neither_fabrication_nor_related_facts() -> 
     assert category_for("partial", verdict) == "只说没写"
 
 
-def test_a_no_answer_reply_whose_core_conclusion_has_no_source_is_fabrication() -> None:
-    # 资料没写的题没说没写,结论本身又没有依据(判分模型把它记成「不需要出处」也一样)
-    core = _claim("no_source_needed", claim="可以一起吃", core=True)
+def test_a_pure_referral_without_saying_not_written_is_other_not_fabrication() -> None:
+    # 审查 H1:资料没写的题只回「建议咨询医生」、没说没写,判分把这句标成 core —— 没有事实性结论,
+    # 不是编造(旧尺子下也记「其它」)
+    referral = _claim("no_source_needed", claim="建议咨询医生或药师", core=True)
+    verdict = score_verdict(_raw([referral], refused=False), _PASSAGES)
+    assert category_for("no_answer", verdict) == "其它"
+    plain = score_verdict(_raw([{**referral, "core": False}], refused=False), _PASSAGES)
+    assert category_for("no_answer", plain) == "其它"
+
+
+def test_a_core_fact_mislabeled_as_needing_no_source_is_still_fabrication() -> None:
+    # 判分误标:带具体数字的结论本身被标成「不需要出处」,没说没写 —— 仍按编造记
+    core = _claim("no_source_needed", claim="每天可以吃2袋", core=True)
     verdict = score_verdict(_raw([core], refused=False), _PASSAGES)
     assert category_for("no_answer", verdict) == "编造"
     said_so = score_verdict(_raw([core], refused=True), _PASSAGES)
     assert category_for("no_answer", said_so) == "正确说没写"
+
+
+def test_a_core_stated_claim_whose_quote_is_not_found_goes_to_review_not_fabrication() -> None:
+    core = _claim("stated", "与Z药间隔两小时服用", claim="Z药要间隔两小时", core=True)
+    verdict = score_verdict(_raw([core], refused=False), _PASSAGES)
+    assert verdict["quote_misses"] == 1
+    assert category_for("no_answer", verdict) == "其它"
 
 
 def test_grounded_claim_counts_leave_out_claims_that_need_no_source() -> None:
@@ -416,7 +433,7 @@ def test_the_template_defines_the_new_supports_core_and_the_restatement_rule() -
 def test_the_scoring_rules_moved_past_the_veto_yardstick() -> None:
     from kb_agent_judge import SCORING_RULES, yardstick_of
 
-    assert SCORING_RULES == "2026-11-10.1"
+    assert SCORING_RULES == "2026-11-10.2"
     assert yardstick_of() != "2026-11-09.3+902042cf"
 
 
@@ -448,3 +465,18 @@ def test_a_number_with_a_unit_in_the_quote_must_be_in_the_passages() -> None:
     assert (verdict["related_facts"], verdict["quote_misses"]) == (0, 1)
     ok = _raw([_claim("stated", "甲款冲剂请与60℃以上热水……间隔2小时")], refused=True)
     assert score_verdict(ok, _PASSAGES)["related_facts"] == 1
+
+
+def test_a_quote_cannot_be_stitched_across_two_retrieved_passages() -> None:
+    # 审查 L3:两段资料之间的分隔符投影后会消失,不能让引文跨段拼出来
+    from kb_agent_judge import seen_passages
+
+    run = {"searches": [{"content": "甲款冲剂请与热水"}, {"content": "间隔三十分钟饮用"}]}
+    raw = _raw([_claim("stated", "请与热水间隔三十分钟")], refused=True)
+    verdict = score_verdict(raw, seen_passages(run))
+    assert (verdict["related_facts"], verdict["quote_misses"]) == (0, 1)
+
+
+def test_a_quote_with_thousands_separators_matches_the_plain_number() -> None:
+    raw = _raw([_claim("stated", "每粒含 1,000 毫克维生素")], refused=True)
+    assert score_verdict(raw, "每粒含1000毫克维生素。")["related_facts"] == 1

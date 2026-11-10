@@ -32,6 +32,8 @@ from kb_agent_judge import (  # type: ignore[import-not-found]
     DISAGREE,
     EXCLUDED,
     FAILED,
+    RECHECK_FAILED,
+    UNSCORED,
 )
 
 _LABEL_TITLES = {"no_answer": "资料没写", "answerable": "有答案", "partial": "部分写了"}
@@ -66,8 +68,8 @@ def row_label(row: Mapping[str, Any]) -> str:
 
 
 def scored(rows: Iterable[Mapping[str, Any]]) -> list[Mapping[str, Any]]:
-    """去掉答前复核剔除的题(它们不答、不进任何分母)。"""
-    return [r for r in rows if r["category"] != EXCLUDED]
+    """去掉答前复核剔除 / 复核检索失败的题(它们不答、不进任何分母)。"""
+    return [r for r in rows if r["category"] not in UNSCORED]
 
 
 def headline_rates(rows: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
@@ -159,6 +161,9 @@ def _headline(rows: Sequence[Mapping[str, Any]]) -> list[str]:
             "  复核剔除(答前检索判为答案仍在库里,不答、不进分母):"
             f"{len(excluded)} 题({', '.join(excluded)})"
         )
+    failed = [str(x["case_id"]) for x in rows if x["category"] == RECHECK_FAILED]
+    if failed:
+        lines.append(f"  复核检索失败(不答、不进分母):{len(failed)} 题({', '.join(failed)})")
     return lines
 
 
@@ -205,11 +210,13 @@ def _breakdown(rows: Sequence[Mapping[str, Any]]) -> list[str]:
 
 def _usage(rows: Sequence[Mapping[str, Any]], runs: Sequence[Mapping[str, Any]]) -> list[str]:
     lines: list[str] = []
-    searches = [s for r in rows for s in r["searches"]]
+    # 审查 M4:每题几次的分母只算真答了的题(复核剔除 / 失败的题没答)
+    answered = scored(rows)
+    searches = [s for r in answered for s in r["searches"]]
     # B-206 K-2: 读文档单独统计(之前的结果行没有 reads)。
-    reads = [s for r in rows for s in r.get("reads", ())]
+    reads = [s for r in answered for s in r.get("reads", ())]
     lines.append(
-        f"searches per question {len(searches) / max(1, len(rows)):.2f}; "
+        f"searches per question {len(searches) / max(1, len(answered)):.2f}; "
         f"degraded {sum(1 for s in searches if s.get('degraded'))}, "
         f"embedding degraded {sum(1 for s in searches if s.get('embedding_degraded'))}, "
         f"keyword degraded {sum(1 for s in searches if s.get('keyword_degraded'))}, "
@@ -224,10 +231,10 @@ def _usage(rows: Sequence[Mapping[str, Any]], runs: Sequence[Mapping[str, Any]])
         + f"; threshold paused {sum(1 for s in ran if s.get('rerank_threshold_paused'))}"
     )
     if reads:
-        with_read = sum(1 for r in rows if r.get("reads"))
+        with_read = sum(1 for r in answered if r.get("reads"))
         modes = Counter(s["mode"] for s in reads if s.get("mode"))
         lines.append(
-            f"reads per question {len(reads) / max(1, len(rows)):.2f} "
+            f"reads per question {len(reads) / max(1, len(answered)):.2f} "
             f"(questions with a read {with_read}); modes "
             + ", ".join(f"{k} {v}" for k, v in sorted(modes.items()))
             + f"; errors {sum(1 for s in reads if s.get('error'))}, "
@@ -239,7 +246,7 @@ def _usage(rows: Sequence[Mapping[str, Any]], runs: Sequence[Mapping[str, Any]])
         shown = [", ".join(p) if p else "无(基线)" for p in parts]
         lines.append("照生产加的提示段:" + " | ".join(dict.fromkeys(shown)))
     answer = sum(r["cost_cny"]["answer"] for r in rows)
-    judge = sum(r["cost_cny"]["judge"] for r in rows)
+    judge = sum(r["cost_cny"]["judge"] + r["cost_cny"].get("recheck", 0.0) for r in rows)
     rerank = sum(run["spend_cny"]["rerank"] for run in runs)
     lines.append(
         f"spend ¥{answer + judge + rerank:.2f} (answer ¥{answer:.2f}, judge ¥{judge:.2f}, "
@@ -272,7 +279,7 @@ def tally(paths: Path | Sequence[Path]) -> str:
     by_file: dict[str, list[dict[str, Any]]] = {}
     for path in files:
         rows, runs = read_results(path)
-        by_file[path.name] = rows
+        by_file[str(path)] = rows  # 完整路径做键:不同目录的同名文件不互相覆盖(审查 L6)
         for row in rows:
             by_model.setdefault(str(row.get("answer_model")), []).append(row)
         for run in runs:

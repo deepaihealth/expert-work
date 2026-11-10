@@ -57,6 +57,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 
 from kb_dataset import KbCase, load_dataset, select_cases  # type: ignore[import-not-found]
 from kb_text_norm import (  # type: ignore[import-not-found]
+    fact_positions,
     fold_key,
     key_facts,
     quote_key,
@@ -313,14 +314,14 @@ class _DeletedCorpus:
         named = [quote_key(x) for x in entity_names(own) if x in case.query]
         for name, (whole, units) in self.views(trial).items():
             for kind, value in facts:
-                if not _positions(kind, value, whole):
+                if not fact_positions(kind, value, whole):
                     continue
                 for unit in units:
                     if named and not any(x in unit or x in self.names[name] for x in named):
                         continue
                     if any(
                         _restated(unit[max(0, at - width) : at + len(value) + width], anchor_sets)
-                        for at in _positions(kind, value, unit)
+                        for at in fact_positions(kind, value, unit)
                     ):
                         return f"fact_{kind}"
         return None
@@ -329,12 +330,6 @@ class _DeletedCorpus:
 def _projected(text: str) -> tuple[str, list[str]]:
     units = [quote_key(u) for u in split_units(text)]
     return "".join(units), [u for u in units if u]
-
-
-def _positions(kind: str, value: str, key: str) -> list[int]:
-    if kind == "number":
-        return [m.start() for m in re.finditer(rf"(?<![0-9.]){re.escape(value)}", key)]
-    return [m.start() for m in re.finditer(re.escape(value), key)]
 
 
 def _restated(window: str, anchor_sets: Sequence[set[str]]) -> bool:

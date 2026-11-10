@@ -33,9 +33,20 @@ _ALWAYS_KEEP = frozenset("%<>≤≥±")
 _JOINERS = frozenset(".-~")
 
 
+#: 数字里的千分位逗号(NFKC 后全角逗号也成了半角):先去掉,``1,000毫克`` 不能切成 ``000毫克``。
+_THOUSANDS = re.compile(r"(?<=\d),(?=\d{3}(?!\d))")
+#: 行首的列表编号(``1. `` / ``2、`` / ``3) ``):不是小数点,``1. 5克装`` 不能读成 ``1.5克``。
+_LIST_NUMBER = re.compile(r"(?m)^[ \t]*\d{1,2}[.\u3001)][ \t]+")
+
+
 def normalize_cjk(text: str) -> str:
     """部首 → 统一汉字,再 NFKC。"""
     return unicodedata.normalize("NFKC", text.translate(_RADICALS))
+
+
+def _numbers_ready(text: str) -> str:
+    """部首归一 + NFKC,去掉千分位逗号与行首列表编号。"""
+    return _LIST_NUMBER.sub("", _THOUSANDS.sub("", normalize_cjk(text)))
 
 
 def _alnum(ch: str) -> bool:
@@ -50,7 +61,7 @@ def fold_key(text: str) -> str:
 
 def quote_key(text: str) -> str:
     """引文核对的投影(见模块说明)。"""
-    folded = normalize_cjk(_HTML_TAG.sub(" ", text)).lower()
+    folded = _numbers_ready(_HTML_TAG.sub(" ", text)).lower()
     kept = [ch for ch in folded if _alnum(ch) or ch in _ALWAYS_KEEP or ch in _JOINERS]
     out: list[str] = []
     for i, ch in enumerate(kept):
@@ -127,7 +138,10 @@ _UNITS = (
     "条|元|倍|度|亿|万|斤|kcal|mmol|mg|μg|ug|kg|ml|cfu|iu|kj|cm|mm|g|l|%|°c"
 )
 _UNIT_NUMBER = re.compile(rf"(?<![0-9.])(\d+(?:\.\d+)?)\s*({_UNITS})(?![a-z])")
-_CODE = re.compile(r"(?<![a-z0-9])(?=[a-z0-9-]*[a-z])(?=[a-z0-9-]*[0-9])[a-z0-9][a-z0-9-]*[a-z0-9]")
+#: 型号 / 编号:前面不能紧挨字母数字或小数点(``1.5mg`` 切不出 ``5mg``)。
+_CODE = re.compile(
+    r"(?<![a-z0-9.])(?=[a-z0-9-]*[a-z])(?=[a-z0-9-]*[0-9])[a-z0-9][a-z0-9-]*[a-z0-9]"
+)
 #: 「」 “” "" 『』 里的短语。
 _QUOTED = re.compile('[「“"『]([^」”"』\\n]{2,40})[」”"』]')
 _MIN_CODE = 3
@@ -135,25 +149,42 @@ _MIN_CODE = 3
 
 def unit_numbers(text: str) -> list[str]:
     """带单位的数字,按 :func:`quote_key` 投影(``60℃`` → ``60c``),去重保序。"""
-    folded = normalize_cjk(text).lower()
+    folded = _numbers_ready(text).lower()
     found = [quote_key(m.group(1) + m.group(2)) for m in _UNIT_NUMBER.finditer(folded)]
     return list(dict.fromkeys(found))
 
 
+def fact_positions(kind: str, value: str, key: str) -> list[int]:
+    """投影后的 ``key`` 里 ``value`` 出现的位置,两头都要有边界:带单位的数字前面不能紧挨数字或
+    小数点(``5岁`` 不在 ``15岁`` 里、``1.5mg`` 不在 ``2.5mg`` 里),型号前面不能紧挨字母数字、
+    小数点或连字符;两者后面都不能紧挨字母数字(``10g`` 不在 ``10gb`` 里、``kx-305`` 不在
+    ``kx-3050`` 里)。引号短语不加边界。"""
+    escaped = re.escape(value)
+    if kind == "number":
+        pattern = rf"(?<![0-9.]){escaped}(?![a-z0-9])"
+    elif kind == "code":
+        pattern = rf"(?<![a-z0-9.\-]){escaped}(?![a-z0-9])"
+    else:
+        pattern = escaped
+    return [m.start() for m in re.finditer(pattern, key)]
+
+
 def has_number(token: str, key: str) -> bool:
-    """投影后的 ``key`` 里有没有 ``token``(前面不能紧挨数字或小数点:``5岁`` 不算在 ``15岁`` 里)。"""
-    return re.search(rf"(?<![0-9.]){re.escape(token)}", key) is not None
+    """投影后的 ``key`` 里有没有带单位的数字 ``token``(边界见 :func:`fact_positions`)。"""
+    return bool(fact_positions("number", token, key))
 
 
 def key_facts(text: str) -> list[tuple[str, str]]:
     """参考答案里的关键事实 ``(类别, 投影后的值)``:``number`` 带单位的数字、``code`` 型号 / 编号类
     字符串(字母数字混排、≥ 3 个字符,不含已算作带单位数字的)、``quote`` 引号里的短语。"""
     numbers = unit_numbers(text)
-    folded = normalize_cjk(text).lower()
+    folded = _numbers_ready(text).lower()
     codes = [
         m.group(0)
         for m in _CODE.finditer(folded)
-        if len(m.group(0)) >= _MIN_CODE and quote_key(m.group(0)) not in numbers
+        # 带单位的数字本身、或它的尾巴(``1.5mg`` 的 ``5mg``)不是型号
+        if len(m.group(0)) >= _MIN_CODE
+        and not any(n.endswith(quote_key(m.group(0))) for n in numbers)
     ]
     quotes = [quote_key(m.group(1)) for m in _QUOTED.finditer(normalize_cjk(text))]
     facts = [("number", n) for n in numbers]
@@ -163,6 +194,7 @@ def key_facts(text: str) -> list[tuple[str, str]]:
 
 
 __all__ = [
+    "fact_positions",
     "fold_key",
     "has_number",
     "key_facts",

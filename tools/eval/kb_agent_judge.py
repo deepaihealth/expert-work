@@ -41,6 +41,7 @@ from kb_agent_cost import Spend  # type: ignore[import-not-found]
 from kb_dataset import KbCase  # type: ignore[import-not-found]
 from kb_text_norm import (  # type: ignore[import-not-found]
     has_number,
+    key_facts,
     quote_key,
     table_views,
     unit_numbers,
@@ -78,6 +79,10 @@ FAILED = "判分失败"
 DISAGREE = "判分分歧"
 #: 难负例答前复核判为答案仍在库里的题(11-10):不答、不进任何分母,统计里单列。
 EXCLUDED = "excluded_answer_still_present"
+#: 难负例答前复核的检索报错、没判成的题(审查 L1):同样不答、不进分母,原因码不同。
+RECHECK_FAILED = "excluded_recheck_search_failed"
+#: 不计分的行(答前复核剔除 / 复核失败)。
+UNSCORED = frozenset({EXCLUDED, RECHECK_FAILED})
 #: 本来合格、却夹带了一条没标明的旁支推断 / 资料里没有的补充(11-10,单独计数)。
 CARRYING = "夹带推断"
 #: 只有这几个「合格」类别会被夹带推断降级;误拒 / 答偏 / 其它 / 只说没写 照旧。
@@ -115,7 +120,7 @@ JUDGE_TEMPLATE = """评审一个客服智能体的回答。智能体只能通过
    - "unsupported":资料里没有、也推不出,却当事实说(含把「资料里没找到」说成「没有 / 不存在 / 不能」)。
    - "contradicted":与资料原文矛盾(资料写的是别的数字 / 相反的结论)。quote 填矛盾的那句原文。
    - "misattributed":资料里有这个事实,但属于另一个对象(另一款产品、另一类人群、另一家公司…),回答把它说成了被问的对象,或推广到了同类。quote 填那句原文。
-3. 每条结论再标 "core":布尔。这条是否直接回答了用户的问题、是结论本身(true);背景、补充、提示类(false)。
+3. 每条结论再标 "core":布尔。这条是否直接回答了用户的问题、是关于问题对象的事实性结论本身(true);背景、补充,以及转介、安全提示、免责、寒暄(如「建议咨询医生」)一律 false。
 4. "refused":布尔。回答是否明确说了资料没有写(或没有直接写)这个问题要的具体信息 / 结论。
 5. "matches_reference":"yes" / "partial" / "no" / "n/a"。回答是否给出了参考答案的要点;参考信息说本题资料里没有答案、或只写了相关事实时填 "n/a"。
 6. "reason":一句话中文理由,点出关键依据。
@@ -128,7 +133,7 @@ _JSON_RE = re.compile(r"\{.*\}", re.S)
 
 #: 归类 / 计分规则的版本:改了 :func:`score_verdict` / :func:`category_for` 的判法就升一下。
 #: 判分提示词的变化不用管,:func:`yardstick_of` 自动带上它的哈希。
-SCORING_RULES = "2026-11-10.1"
+SCORING_RULES = "2026-11-10.2"
 
 
 def yardstick_of(template: str = JUDGE_TEMPLATE, rules: str = SCORING_RULES) -> str:
@@ -141,10 +146,15 @@ def yardstick_of(template: str = JUDGE_TEMPLATE, rules: str = SCORING_RULES) -> 
 # ---------------------------------------------------------------------------
 
 
+#: 智能体看到的各段资料之间的分隔(判分提示词里就是这样拼的;引文核对按它切开逐段比,
+#: 引文不能跨段拼出来)。
+PASSAGE_SEP = "\n\n=====\n\n"
+
+
 def seen_passages(run: Mapping[str, Any]) -> str:
     """智能体看到的全部资料(检索 + 读文档),判分与原文核对都用这一份。"""
     seen = [*run["searches"], *run.get("reads", ())]
-    return "\n\n=====\n\n".join(s["content"] for s in seen if s.get("content"))
+    return PASSAGE_SEP.join(s["content"] for s in seen if s.get("content"))
 
 
 def _anchors(entries: Sequence[Any]) -> str:
@@ -205,8 +215,13 @@ _ELLIPSIS = re.compile("\u2026+|\\.{3,}|\u22ef+")
 
 
 def passage_keys(passages: str) -> tuple[str, ...]:
-    """引文核对的「资料」:整份资料的投影 + 每张表按行 / 按列序列化后的投影(11-10)。"""
-    return (quote_key(passages), *(quote_key(v) for v in table_views(passages)))
+    """引文核对的「资料」:每段资料(按 :data:`PASSAGE_SEP` 切开)的投影 + 每张表按行 / 按列
+    序列化后的投影(11-10)。分段投影:分隔符投影后会消失,整份一起投影会让引文跨段拼出来。"""
+    pieces = passages.split(PASSAGE_SEP)
+    return (
+        *(quote_key(p) for p in pieces),
+        *(quote_key(v) for p in pieces for v in table_views(p)),
+    )
 
 
 def _quote_status(quote: str, keys: Sequence[str], deleted_keys: Sequence[str]) -> str:
@@ -290,9 +305,7 @@ def score_verdict(
         **raw,
         "fabricated": fabricated,
         "inferred_extra": sum(1 for c in claims if not c["core"] and c["support"] in UNGROUNDED),
-        "core_ungrounded": sum(
-            1 for c in claims if c["core"] and c["support"] not in CORE_GROUNDED
-        ),
+        "core_ungrounded": sum(1 for c in claims if _ungrounded_core_fact(c)),
         "related_facts": statuses["found"],
         "quote_misses": statuses["missed"],
         "quote_unchecked": statuses["unchecked"],
@@ -302,11 +315,23 @@ def score_verdict(
     }
 
 
+def _ungrounded_core_fact(claim: Mapping[str, Any]) -> bool:
+    """结论本身、又没有依据的事实性结论(编造的第三种,审查 H1)。``no_source_needed`` 不算 ——
+    纯转介 / 提示(「建议咨询医生」)不是事实;但标成 ``no_source_needed`` 的结论里带着具体数字、
+    型号或引号短语(模板说这种不能标不需要出处),是判分误标,仍算。"""
+    if not claim["core"] or claim["support"] in CORE_GROUNDED:
+        return False
+    if claim["support"] != "no_source_needed":
+        return True
+    return bool(key_facts(str(claim.get("claim") or "")))
+
+
 def category_for(label: str, verdict: Mapping[str, Any]) -> str:
     """一次判分的类别(:data:`CATEGORIES`)。``verdict`` 是 :func:`score_verdict` 的结果。
 
     编造只有三种(11-10):任何 ``contradicted`` / ``misattributed``;结论本身 ``unsupported`` /
-    ``inferred_unlabeled``(都在 ``fabricated`` 里);资料没写的题没说没写、结论本身又没依据。
+    ``inferred_unlabeled``(都在 ``fabricated`` 里);资料没写的题没说没写、又有没依据的事实性
+    结论本身(:func:`_ungrounded_core_fact`;纯转介记「其它」,``stated`` 但引文对不上只进待复核)。
     另保留「引文对上难负例被删句」。本来合格、只是夹带了旁支推断的记 :data:`CARRYING`。"""
     if "parse_error" in verdict:
         return FAILED
@@ -436,6 +461,9 @@ __all__ = [
     "EXCLUDED",
     "FAILED",
     "JUDGE_SYSTEM",
+    "PASSAGE_SEP",
+    "RECHECK_FAILED",
+    "UNSCORED",
     "JudgeCache",
     "category_for",
     "decide",

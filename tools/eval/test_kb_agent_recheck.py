@@ -169,3 +169,29 @@ def test_references_join_the_original_answer_and_the_deleted_text() -> None:
         {"hn-a": ("滤芯每6个月更换",), "hn-b": ("乙款重5斤",)}, {"hn-a": "半年换一次"}
     )
     assert refs == {"hn-a": "半年换一次\n原文:滤芯每6个月更换", "hn-b": "原文:乙款重5斤"}
+
+
+class _BrokenSearch(_Search):
+    async def call(self, args: Mapping[str, Any], *, ctx: ToolContext) -> ToolResult:
+        raise RuntimeError("search backend down")
+
+
+@pytest.mark.asyncio
+async def test_a_failed_search_is_recorded_and_not_judged(tmp_path: Path) -> None:
+    judge = _Judge({"甲款": [_yes(True)], "乙款": [_yes(True)]})
+    result = await _recheck(tmp_path, judge, _BrokenSearch(), votes=1)
+    assert judge.prompts == []
+    assert result["hn-a"]["search_error"] is True and result["hn-a"]["excluded"] is False
+
+
+@pytest.mark.asyncio
+async def test_the_recheck_stops_when_admission_is_refused(tmp_path: Path) -> None:
+    judge = _Judge({"甲款": [_yes(True)], "乙款": [_yes(True)]})
+    seen: list[int] = []
+
+    async def admit() -> bool:
+        seen.append(1)
+        return len(seen) < 2  # 第一题放行,第二题停
+
+    result = await _recheck(tmp_path, judge, _Search(), votes=1, admit=admit)
+    assert sorted(k for k in result if k.startswith("hn-")) == ["hn-a"]

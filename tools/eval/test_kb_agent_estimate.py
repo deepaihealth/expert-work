@@ -233,8 +233,20 @@ def test_the_hard_negative_run_prices_the_pre_answer_recheck(
 
     assert main(_cli_argv(tmp_path)) == 0
     out = capsys.readouterr().out
-    call = recheck_call_cny(PRICES["deepseek-v4-pro"])
-    assert call > 0
+    h = history_from(_history_file(tmp_path))
+    call = recheck_call_cny(h)
+    # 审查 L2:与主估价同一口径 —— 按历史每次判分的实花(含看不见的思考 token)乘提示词字数比
+    from kb_agent_estimate import (  # type: ignore[import-not-found]
+        RECHECK_QUESTION_CHARS,
+        RECHECK_REFERENCE_CHARS,
+        SEARCH_TEXT_BUDGET,
+    )
+    from kb_agent_recheck import RECHECK_TEMPLATE  # type: ignore[import-not-found]
+
+    template = len(RECHECK_TEMPLATE.format(question="", reference="", passages=""))
+    chars = template + RECHECK_QUESTION_CHARS + RECHECK_REFERENCE_CHARS + SEARCH_TEXT_BUDGET
+    assert h.prompt_chars == pytest.approx(OLD_TEMPLATE_CHARS + 10 + 90 + 400)
+    assert call == pytest.approx(h.judge_cny_per_call * chars / h.prompt_chars)
     assert f"答前复核 15 次 ¥{5 * 3 * call:.2f}" in out  # 5 道难负例乘3 票
     assert main(_cli_argv(tmp_path, "--no-recheck")) == 0
     assert "答前复核 0 次 ¥0.00" in capsys.readouterr().out

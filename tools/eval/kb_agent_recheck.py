@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import json
 import sys
-from collections.abc import Mapping, Sequence
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from pathlib import Path
 from typing import Any, Protocol
 from uuid import UUID
@@ -20,7 +20,12 @@ from uuid import UUID
 sys.path.insert(0, str(Path(__file__).parent))
 
 from kb_agent_cost import Spend  # type: ignore[import-not-found]
-from kb_agent_judge import EXCLUDED, JudgeCache, parse_verdict  # type: ignore[import-not-found]
+from kb_agent_judge import (  # type: ignore[import-not-found]
+    EXCLUDED,
+    RECHECK_FAILED,
+    JudgeCache,
+    parse_verdict,
+)
 from kb_dataset import KbCase  # type: ignore[import-not-found]
 
 from orchestrator.tools.registry import ToolContext, ToolResult, ToolSpec
@@ -80,14 +85,15 @@ def parse_recheck(raw: str) -> bool | None:
     return value if isinstance(value, bool) else None
 
 
-async def _passages(search: _Search, question: str, *, k: int, tenant_id: UUID) -> str:
+async def _passages(search: _Search, question: str, *, k: int, tenant_id: UUID) -> str | None:
+    """检索结果文本;检索报错时 None(审查 L1:这题复核不了,不判、不计分)。"""
     try:
         result = await search.call(
             {"query": question, "limit": k}, ctx=ToolContext(tenant_id=tenant_id)
         )
-    except Exception as exc:  # 检索报错:没有段落可判,照「答不了」处理并记下原因
+    except Exception as exc:
         print(f"WARNING recheck search failed for {question!r}: {exc}", file=sys.stderr)
-        return ""
+        return None
     return str(result.content or "")
 
 
@@ -103,11 +109,25 @@ async def recheck_hard_negatives(
     votes: int = 1,
     k: int = DEFAULT_RECHECK_K,
     cache_verdicts: bool = True,
+    admit: Callable[[], Awaitable[bool]] | None = None,
 ) -> dict[str, dict[str, Any]]:
-    """题号 → ``{"excluded", "votes", "cost_cny", "k"}``;``excluded`` = 严格多数票判为能答。"""
+    """题号 → ``{"excluded", "search_error", "votes", "cost_cny", "k"}``;``excluded`` = 严格多数票
+    判为能答,``search_error`` = 复核检索报错(没判)。``admit``(预算闸门)每题前问一次,不放行就停,
+    后面的题不在结果里。"""
     out: dict[str, dict[str, Any]] = {}
     for case in cases:
+        if admit is not None and not await admit():
+            break
         passages = await _passages(search, case.query, k=k, tenant_id=tenant_id)
+        if passages is None:
+            out[case.id] = {
+                "excluded": False,
+                "search_error": True,
+                "votes": [],
+                "cost_cny": 0.0,
+                "k": k,
+            }
+            continue
         prompt = recheck_prompt(case.query, references.get(case.id, ""), passages)
         answers: list[bool | None] = []
         cost = 0.0
@@ -124,6 +144,7 @@ async def recheck_hard_negatives(
         yes = sum(1 for a in answers if a is True)
         out[case.id] = {
             "excluded": yes * 2 > len(answers),
+            "search_error": False,
             "votes": answers,
             "cost_cny": round(cost, 6),
             "k": k,
@@ -134,8 +155,8 @@ async def recheck_hard_negatives(
 def excluded_row(
     label: str, case: KbCase, check: Mapping[str, Any], *, meta: Mapping[str, Any]
 ) -> dict[str, Any]:
-    """复核剔除的题落盘的那一行:不答题、不判分;``meta`` = 模型 / 尺子 / 票数 / 轮次这些
-    续跑守卫要核的字段。"""
+    """复核剔除(或复核检索失败)的题落盘的那一行:不答题、不判分;``meta`` = 模型 / 尺子 / 票数 /
+    轮次这些续跑守卫要核的字段。"""
     votes = list(check["votes"])
     yes = sum(1 for v in votes if v is True)
     return {
@@ -149,8 +170,8 @@ def excluded_row(
         "reads": [],
         "verdict": {"recheck": dict(check)},
         "votes": votes,
-        "agreement": f"{yes}/{len(votes)}",
-        "category": EXCLUDED,
+        "agreement": f"{yes}/{len(votes)}" if votes else None,
+        "category": RECHECK_FAILED if check.get("search_error") else EXCLUDED,
         **meta,
         "cost_cny": {"answer": 0.0, "judge": float(check["cost_cny"])},
     }
