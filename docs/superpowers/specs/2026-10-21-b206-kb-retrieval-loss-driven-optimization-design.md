@@ -556,6 +556,63 @@ D 组 46 题里 19 题我方答案其实写了被判缺的内容(有的近乎逐
 
 **没核实到**:Glean 的查询理解(只有营销材料);pgvector / RDS 上能否原生做 ColBERT 的 MaxSim;ReasonRank 的绝对延迟;Cohere Rerank 5 的 BRIGHT 分是它自定义指标,不能和论文 nDCG 直接比。
 
+### 5.9 防编造(11-09)
+
+**起因**:11-05 看了 11 道「资料没写却答了」的评测轨迹,9 道是判断题(「能不能」「是什么关系」),资料里有相邻的事实、没有现成的结论。答出来的依据分四类:从文件名 / 水印 / 同一张表里挨着推出关系(5 道);「禁忌清单里没有 = 可以」,或把另一个产品的规矩套过来(4 道);常识当成资料说(1 道);「没搜到」说成「不存在」(1 道)。查值的题(价格、编号、证书)0 编造。平台这边的缺口:`knowledge_search` 的结果带依据提示(B-175 量过),`knowledge_read` 的结果什么都没带。
+
+**用户拍板(11-07)**:判断题只有部分资料时按 **B** 答 —— 先说「资料没直接写」,再列资料写了的相关事实(带出处),自己的推断标明是推断。不选 A(只说没写)、不选 C(直接推断)。
+
+**这次做的三处**(都只在绑了知识库时出现):
+
+1. **读文档结果带一句依据提示**(`tools/knowledge_read_reader.py` `GROUNDING_NOTICE`)。只有显示了段落的读结果才带,没读到东西的(找词没命中、没有这个标题)不带。原文:
+
+   > [knowledge_read: what this document states is what the passages shown say. A file name, title, heading or watermark, and two items sitting in the same table or list, show where text is, not that the items are related; that a list leaves an item out does not make the item allowed; what a passage says about one item it does not say about another.]
+
+   意思:文档说了什么只看显示出来的段落;文件名、标题、水印、同一张表里挨着,只说明文字在哪,不说明两者有关系;清单里没列不等于允许;说某一项的话不适用于另一项。用陈述口吻(B-163:命令口吻的场外文字会触发注入防御);每次读约 76 token,旧的读结果被压成引用时这句一起去掉(#1972)。**没有**复用 11-05 撤掉的「多读不算证据」那种说法(`c2509964e`,在 chat_no_answer-0005 上反而多编)。
+
+2. **检索工具说明里的作答规矩改成 B 式**(`tools/knowledge.py` `KNOWLEDGE_ANSWERABILITY_RULE`,开头一句 B-175 起没变):
+
+   > Results are the closest passages, not confirmed answers: rely only on what they explicitly state. If none states the specific fact asked, say the knowledge base does not directly state it, then give the related facts it does state with the documents they come from; mark any inference of your own, and anything from general knowledge, as such, never as what the knowledge base says.
+
+   43 → 75 token,在工具说明里,随前缀缓存走。
+
+3. **答前核对**(`graph_builder/answer_check.py`):这一轮有知识库工具结果**真的显示了段落**之后(检索有命中、读文档显示了段落),每一步的平台段里带一句:
+
+   > [answer check] Knowledge base results in this turn showed passages. Before the final answer, check each conclusion against the text they showed. For one that no shown text states, say the results shown do not directly state it, give the related facts they do state with their documents, and mark any inference of your own as inference.
+
+   - **什么不算**:调用失败(没有库、参数不对、报错)、检索没命中(含某条检索路径失败的没命中)、读文档没显示段落 —— 这些结果自己的提示已经说了该怎么理解,而「检索不完整时没找到」不能说成「资料里没有」(K-22)。判法与旧结果压成引用时认「成功结果」的口径一致(`status` 不是 error、`artifact` 里状态 ok),再加「有命中 / 有段落」。措辞只说「显示出来的结果没直接写」,不对整个知识库下结论,所以部分库没搜到、但显示了段落的检索也照样带。
+   - **成本**:只进这一步的提示词视图,不落库、不累加,下一轮自动没有。约 66 token / 步,只算显示过段落之后的那几步。这一步本来就有平台段时(工作区里有文件时的快照、计划、召回的记忆)它并进去,不多破缓存;没有别的平台段时它会单独挂一段,缓存代价与 B-162 说明的一样(上一步的最后一条消息要按原样重新算一遍)—— 不是每个知识库智能体每一步都有工作区快照(没有工作区、或工作区为空时就没有)。
+   - **委派子代**:交给 `spawn_worker` 的子任务在子代自己的图里跑,子代读到的知识库结果让核对出现在**子代**的提示词里,不出现在父代给用户的最终答复那一步。
+   - 触发条件是结构事实,跟问题、答复用什么语言无关,没有关键词判断。
+
+**为什么不做「答完再提醒一次」**:先查规则(B-267)下,绑了知识库的智能体几乎每轮都会查库,答完再提醒 = 几乎每个知识库轮都多一次完整的模型调用(延迟多一整次作答,通常几秒到十几秒),而且第一版答复已经逐字流给用户,改写后用户会看到两版。放在作答之前提醒:**额外调用率 0、额外延迟 0**。同一上下文里的自我核对效果有上限(业界结论,见 11-05 研究记录),所以下一步要靠评测数据决定要不要上独立核查。
+
+**不在这次**:独立的「资料够不够」核查调用(另起一次调用,只给问题 + 已显示的段落,不给对话)。挂点:知识库结果之后的那一步返回最终答复、`agent` 走向结束之前(`_should_continue` 返回结束的分支)。要等评测同时给出「该拒拒了」和「不该拒却拒了」两个数再定。
+
+**检索结果(`knowledge_search`)没加新提示**:它已有 B-175 量过的依据提示,答前核对也覆盖它;每次检索再多 70 多 token 的收益没有数据支撑。
+
+**要评测才能定的**:① 判分模板要认 B 式 —— 标明了是推断、且先说了「没直接写」的,不该判成编造;模板不改,B 式会被误判。② 同时盯「资料没写的题编造率」和「有答案的题误拒率」两个数,三处改动分开开关测不了,建议本分支对主干整体比一次。
+
+### 5.10 多轮指代(11-09)
+
+**现状**:平台没有单独的改写层,智能体的主模型带着整段历史自己写检索词(业界默认做法)。自动的两处 —— 长期记忆召回、知识库探针 —— 11-05 已修(#2030:短问句 / 带指代词时带上上一轮的问和答)。剩下的是**智能体自己写出去的参数**:检索词、联网搜索词、MCP / http 业务参数。指代解析错了,答出来是「对另一个对象的正确答案」,防编造那一套拦不住。
+
+**用户要求**:通用,不限商品 —— 人、客户、商品、机构、文件 / 附件、上一条答复的第几项、时间 / 事件、省略的属性、复数都算;不靠对接方传「当前对象」(11-05 否决)。
+
+**这次做的三处**:
+
+1. **系统提示词一段 `# Tool arguments`**(`graph_builder/outgoing_reference.py` `OUTGOING_ARGUMENTS_CLAUSE`):
+
+   > Searches and calls to outside services receive only the arguments you pass, not this conversation. Make each query or argument you send self-contained: write out the name, identifier, date or title that a pronoun, a word like "this" or "the other one", a pointer such as "the second item above", or an omitted subject stands for in the conversation. When the thing referred to decides what you search for or send, say in your answer what you took it to mean; if the conversation leaves two or more things of the same kind it could mean, ask which one, or answer for each by name.
+
+   门控:构建里有 `knowledge_search`、`web_search`、`http` 或任一 MCP 工具(含延迟加载的)才加,别的智能体一个字都看不到。约 130 token,构建期定好、整段不变,放在按天变化的日期段之前,不影响缓存。措辞不举任何行业例子。后两句(答复点明指的是谁、两个候选时追问)只管「指代决定了要搜什么 / 发什么」的时候;「把上面的回答缩短一点」这种不调工具的改写轮不受影响,不会冒出一句「我理解的『它』是……」。
+
+2. **两个检索工具的 `query` 参数说明各一行**:「self-contained: write out the name that a pronoun or a reference to earlier messages stands for」(各约 25 token)。
+
+3. **监控**:`expert_work_outgoing_query_reference_total{tool}`,只数 `knowledge_search` / `web_search` 的 `query` 里还带指代词的调用,标签只有工具名,不记内容。检测器是检索词专用的一张表,**不复用** `retrieval_query` 判用户消息的那张(#2030 的行为一字未改):检索词常是关键词串、专业名词,那张表的单字「他」会误中「阿托伐他汀」「吉他」,「该」会误中「该吃什么药」(应该),「第三章」「提到」是文档里的普通词。这里:代词只按词算(他们 / 它的,或单独成词,不含其他 / 其它 / 吉他);这 / 那 + 量词(不含这个月);上述 / 前者 / 后者 / 上面的 / 另一个 / 第 N 个;「该」只在后面跟名词时算(该产品,不算该吃 / 该如何 / 应该);英文代词只认小写(句首大写也算),所以「IT 部门」不算。这是启发式信号,只计数、不改行为,调用照常发出。不数 http / MCP:参数多是结构化字段或要发出去的正文,代词常常是合法内容;工具名也不受控。
+
+**后续(不在这次)**:多类型多轮评测集(上面九类指代,含两个同类候选的歧义题),看「解析错对象」和「错对象还答得很笃定」两个数;从检索日志离线查答复点名的对象与检索词对象不一致的会话。
+
 ---
 
 ## 6. Web 前端展示(K-1 / K-2 / K-4 / K-11 / K-12 落地时同步做)

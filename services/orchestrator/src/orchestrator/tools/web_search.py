@@ -173,6 +173,12 @@ WEB_SEARCH_KNOWLEDGE_FIRST_RULE = (
 )
 
 
+#: B-206 11-09 — the search engine sees only this string, never the conversation.
+_QUERY_DESCRIPTION = (
+    "Search query in natural language, self-contained: write out the name that a pronoun or "
+    "a reference to earlier messages stands for."
+)
+
 #: B-267 —— what the fixture backend may add to a result's meta.
 _FIXTURE_META_KEYS = ("fixture", "fixture_entry", "fixture_miss")
 
@@ -206,10 +212,7 @@ class WebSearchTool:
             parameters={
                 "type": "object",
                 "properties": {
-                    "query": {
-                        "type": "string",
-                        "description": "Search query in natural language.",
-                    },
+                    "query": {"type": "string", "description": _QUERY_DESCRIPTION},
                     "max_results": {
                         "type": "integer",
                         "minimum": 1,
