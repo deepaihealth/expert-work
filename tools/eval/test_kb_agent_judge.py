@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import random
 from pathlib import Path
 from typing import Any
 
@@ -312,12 +313,13 @@ def test_an_unrelated_unfound_quote_is_not_matched_to_the_deleted_fact() -> None
 
 
 def test_only_the_pieces_not_found_decide_a_deleted_match() -> None:
-    # 第一段在资料里(也恰好与被删句共享开头),第二段没找到、与被删句无关:
-    # 记「没找到」,不是「对上被删句」
-    deleted = ["甲款冲剂请与60℃以上热水冲泡后饮用"]
-    quote = "甲款冲剂请与60℃以上热水……与Z药同时服用没有影响"
+    # 第一段在资料里找得到(跨两句留下的资料),它若参与判定会对上被删句;第二段没找到、与被删句
+    # 无关 —— 只看没找到的那段:记「没找到」,不是「对上被删句」
+    passages = "用温热水冲服。每日一次随餐。"
+    deleted = ["用温热水冲服每日一次"]
+    quote = "温热水冲服。每日一次……与Z药同时服用没有影响"
     verdict = score_verdict(
-        _raw([_claim("stated", quote)], refused=True), _PASSAGES, deleted=deleted
+        _raw([_claim("stated", quote)], refused=True), passages, deleted=deleted
     )
     assert (verdict["quote_deleted"], verdict["quote_misses"]) == (0, 1)
 
@@ -603,3 +605,98 @@ def test_a_real_number_before_the_ideographic_comma_is_not_a_list_number() -> No
     raw = _raw([_claim("stated", "每日服用1、2次为宜")], refused=True)
     verdict = score_verdict(raw, "每日服用2次为宜")
     assert (verdict["related_facts"], verdict["quote_misses"]) == (0, 1)
+
+
+# ---------------------------------------------------------------------------
+# 审查第四轮:被删句判定按「用到了几个不同的字」和留下的**句子**比
+# ---------------------------------------------------------------------------
+
+#: 难负例里删掉一句后,相邻的同对象、同句式的句子留着。
+_SIBLINGS = "甲款冲剂含益生元菊粉三克。甲款冲剂每日一袋,温水冲服。"
+
+
+def test_a_reworded_deleted_fact_next_to_same_shaped_siblings_is_deleted() -> None:
+    claim = _claim("stated", "甲款冲剂含低聚果糖5克")
+    verdict = score_verdict(
+        _raw([claim], refused=False), _SIBLINGS, deleted=["甲款冲剂含益生元低聚果糖五克"]
+    )
+    assert verdict["quote_deleted"] == 1
+    assert category_for("no_answer", verdict) == "编造"
+
+
+def test_a_verbatim_sentence_around_a_short_deleted_anchor_is_deleted() -> None:
+    claim = _claim("stated", "甲款冲剂含益生元低聚果糖五克")
+    verdict = score_verdict(
+        _raw([claim], refused=True), _SIBLINGS + "甲款冲剂每日一袋。", deleted=["低聚果糖五克"]
+    )
+    assert verdict["quote_deleted"] == 1
+    assert category_for("no_answer", verdict) == "编造"
+
+
+@pytest.mark.parametrize(
+    ("a", "b"),
+    [
+        ("", "abc"),
+        ("abc", ""),
+        ("abcd", "abcd"),
+        ("abc", "xyz"),
+        ("甲款冲剂含", "冲剂含益生元"),
+        *[
+            (
+                "".join(random.Random(seed).choice("abc") for _ in range(seed % 9)),  # noqa: S311
+                "".join(random.Random(seed + 99).choice("abcd") for _ in range(seed % 23)),  # noqa: S311
+            )
+            for seed in range(20)
+        ],
+    ],
+)
+def test_longest_shared_matches_brute_force(a: str, b: str) -> None:
+    from kb_agent_judge import _longest_shared
+
+    brute = max(
+        (j - i for i in range(len(a)) for j in range(i + 1, len(a) + 1) if a[i:j] in b),
+        default=0,
+    )
+    assert _longest_shared(a, b) == brute
+
+
+def test_a_deleted_match_in_either_comparison_is_reported(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # 审查第四轮 LOW-6:两种比法都没找到时,任一种判出「对上被删句」就报 deleted
+    import kb_agent_judge
+
+    seen = iter(["missed", "deleted"])
+    monkeypatch.setattr(kb_agent_judge, "_variant_status", lambda *a, **k: next(seen))
+    monkeypatch.setattr(kb_agent_judge, "quote_variants", lambda q: [q, q + "x"])
+    index = kb_agent_judge.passage_index("资料")
+    assert kb_agent_judge._quote_status("引文", index, []) == "deleted"
+
+
+def test_a_paren_list_number_without_a_space_is_recognised() -> None:
+    raw = _raw([_claim("stated", "用法 1\uff09每日2袋温水冲服")], refused=True)
+    verdict = score_verdict(raw, "用法\n1\uff09 每日2袋温水冲服")
+    assert (verdict["related_facts"], verdict["quote_misses"]) == (1, 0)
+
+
+def test_a_section_sign_in_the_source_is_dropped_like_other_punctuation() -> None:
+    raw = _raw([_claim("stated", "参见3条款的规定执行")], refused=True)
+    assert score_verdict(raw, "参见\u00a73条款的规定执行。")["related_facts"] == 1
+
+
+def test_decide_builds_the_passage_index_once_for_all_votes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import kb_agent_judge
+
+    calls: list[str] = []
+    real = kb_agent_judge.passage_index
+
+    def counting(passages: str) -> kb_agent_judge.PassageIndex:
+        calls.append(passages)
+        return real(passages)
+
+    monkeypatch.setattr(kb_agent_judge, "passage_index", counting)
+    raw = json.dumps(_raw([_claim("stated", "与X类药物间隔30分钟服用")], refused=True))
+    kb_agent_judge.decide("partial", [raw, raw, raw], _PASSAGES)
+    assert len(calls) == 1

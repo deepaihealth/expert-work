@@ -228,22 +228,20 @@ def _view(raw: str) -> View:
     return View(key=quote_key(raw), numbers=frozenset(unit_numbers(raw)))
 
 
+#: 留下的资料按句切(句末标点、分号、换行;表格一行一句),被删句判定拿引文和每一句比用字。
+_SENTENCE_END = re.compile("(?<=[\u3002\uff01\uff1f!?;\uff1b\n])")
+
+
 @dataclass(frozen=True)
 class PassageIndex:
     """引文核对的「资料」:每段资料(按 :data:`PASSAGE_SEP` 切开)与每张表按行 / 按列序列化后的
     视图(分段:分隔符投影后会消失,整份一起投影会让引文跨段拼出来);``marked`` = 同样的视图,
-    行首列表编号换成记号(引文的第二种比法用,见 :func:`kb_text_norm.quote_variants`)。"""
+    行首列表编号换成记号(引文的第二种比法用,见 :func:`kb_text_norm.quote_variants`);
+    ``sentences`` = 留下的资料逐句的投影(被删句判定用,见 :func:`_is_deleted`)。"""
 
     views: tuple[View, ...]
     marked: tuple[View, ...]
-
-    @property
-    def keys(self) -> tuple[str, ...]:
-        return tuple(v.key for v in self.views)
-
-    @property
-    def numbers(self) -> frozenset[str]:
-        return frozenset().union(*(v.numbers for v in self.views))
+    sentences: tuple[str, ...]
 
 
 def passage_index(passages: str) -> PassageIndex:
@@ -258,28 +256,28 @@ def passage_index(passages: str) -> PassageIndex:
             v if m == r else _view(m) for v, r, m in zip(views, raws, marked_raws, strict=True)
         )
     )
-    return PassageIndex(views=views, marked=marked)
-
-
-def passage_keys(passages: str) -> tuple[str, ...]:
-    return passage_index(passages).keys
+    sentences = tuple(key for p in pieces for s in _SENTENCE_END.split(p) if (key := quote_key(s)))
+    return PassageIndex(views=views, marked=marked, sentences=sentences)
 
 
 def _quote_status(quote: str, index: PassageIndex, deleted_keys: Sequence[str]) -> str:
     """``found``:切出来的每段(≥ :data:`MIN_QUOTE_KEY_CHARS` 字)都在某个视图里,而且这一段带单位
     的数字也在**同一个**视图里(审查第三轮 LOW-1;太短不核的段,数字对全部资料比);``unchecked``:
     空或每段都太短,核对不了;``deleted``:没找到的段对上了难负例被删掉的锚(见 :func:`_is_deleted`);
-    ``missed``:找不到。引文比两遍(:func:`kb_text_norm.quote_variants`),有一遍找到就算。"""
+    ``missed``:找不到。引文比两遍(:func:`kb_text_norm.quote_variants`),有一遍找到就算;都没找到时,
+    任一遍判出对上被删句就报 ``deleted``(审查第四轮 LOW-6)。"""
     variants = quote_variants(quote)
     statuses = [
-        _variant_status(v, index.marked if i else index.views, index.views, deleted_keys)
+        _variant_status(v, index.marked if i else index.views, index.sentences, deleted_keys)
         for i, v in enumerate(variants)
     ]
-    return "found" if "found" in statuses else statuses[0]
+    if "found" in statuses:
+        return "found"
+    return "deleted" if "deleted" in statuses else statuses[0]
 
 
 def _variant_status(
-    quote: str, views: Sequence[View], kept: Sequence[View], deleted_keys: Sequence[str]
+    quote: str, views: Sequence[View], kept: Sequence[str], deleted_keys: Sequence[str]
 ) -> str:
     everywhere = frozenset().union(*(v.numbers for v in views))
     checked = missing = 0
@@ -313,16 +311,27 @@ def _longest_shared(a: str, b: str) -> int:
     return lo
 
 
-def _is_deleted(piece: str, deleted_keys: Sequence[str], kept: Sequence[View]) -> bool:
-    """没找到的这段对上了被删句(:func:`_matches_deleted`),而且它和被删句的最长公共子串**严格
-    长于**它和任何留下来的视图的 —— 只是共享对象名、留下的资料里一样有的,不算(审查第三轮 MEDIUM-2:
-    拒答并列相关事实、引文稍有改写,不能因为和被删句共享 ≥ 6 字的对象名就记编造)。"""
-    hits = [d for d in deleted_keys if d and _matches_deleted(piece, d)]
-    if not hits:
-        return False
-    to_deleted = max(_longest_shared(piece, d) for d in hits)
-    to_kept = max((_longest_shared(piece, v.key) for v in kept), default=0)
-    return to_deleted > to_kept
+#: 引文这段里,来自被删句、却没有任何一句留下的资料能解释的字,至少几个才算对上被删句。
+DELETED_EXTRA_CHARS = 3
+
+
+def _is_deleted(piece: str, deleted_keys: Sequence[str], kept: Sequence[str]) -> bool:
+    """没找到的这段对上了被删句(:func:`_matches_deleted`),而且它和被删句共有的字里,至少
+    :data:`DELETED_EXTRA_CHARS` 个**没有任何一句**留下的资料能解释 —— 只是共享对象名、留下的
+    资料里一样有的,不算(审查第三轮 MEDIUM-2)。按句比用字、不按整段比连续串(审查第四轮 MEDIUM-1):
+    难负例删掉一句后,同对象、同句式的相邻句留着,按连续串比,换个说法(「五克」写成「5克」)或锚比
+    整句短时就打成平局漏掉。"""
+    chars = set(piece)
+    for deleted in deleted_keys:
+        if not deleted or not _matches_deleted(piece, deleted):
+            continue
+        from_deleted = chars & set(deleted)
+        if len(from_deleted) < DELETED_EXTRA_CHARS:
+            continue
+        # 有一句留下的资料把它解释得只剩不到 N 个字,就不是对上这条被删句(提前返回,审查第四轮 LOW-3)
+        if all(len(from_deleted - set(sentence)) >= DELETED_EXTRA_CHARS for sentence in kept):
+            return True
+    return False
 
 
 #: 判分常把被删句改写着抄(「冲剂里含有低聚果糖5克」vs 被删的「甲款冲剂含益生元低聚果糖五克」):
@@ -330,21 +339,8 @@ def _is_deleted(piece: str, deleted_keys: Sequence[str], kept: Sequence[View]) -
 _DELETED_CHAR_SHARE = 0.7
 
 
-def _lcs_len(a: str, b: str) -> int:
-    best = 0
-    prev = [0] * (len(b) + 1)
-    for ch in a:
-        cur = [0] * (len(b) + 1)
-        for j, other in enumerate(b, start=1):
-            if ch == other:
-                cur[j] = prev[j - 1] + 1
-                best = max(best, cur[j])
-        prev = cur
-    return best
-
-
 def _matches_deleted(piece: str, deleted_key: str) -> bool:
-    if _lcs_len(piece, deleted_key) >= MIN_QUOTE_KEY_CHARS:
+    if _longest_shared(piece, deleted_key) >= MIN_QUOTE_KEY_CHARS:
         return True
     shared = set(piece) & set(deleted_key)
     return len(shared) >= MIN_QUOTE_KEY_CHARS and len(shared) >= _DELETED_CHAR_SHARE * len(
@@ -353,7 +349,11 @@ def _matches_deleted(piece: str, deleted_key: str) -> bool:
 
 
 def score_verdict(
-    raw: Mapping[str, Any], passages: str, *, deleted: Sequence[str] = ()
+    raw: Mapping[str, Any],
+    passages: str,
+    *,
+    deleted: Sequence[str] = (),
+    index: PassageIndex | None = None,
 ) -> dict[str, Any]:
     """判分模型的一份 JSON → 带 ``fabricated`` / ``inferred_extra`` / ``core_ungrounded`` /
     ``related_facts`` / ``quote_misses`` / ``quote_unchecked`` / ``quote_deleted`` /
@@ -376,7 +376,7 @@ def score_verdict(
             **raw,
             "parse_error": f"each claim needs a support in {sorted(SUPPORTS)} and a boolean core",
         }
-    index = passage_index(passages)
+    index = index if index is not None else passage_index(passages)
     deleted_keys = [quote_key(d) for d in deleted]
     statuses = Counter(
         _quote_status(str(c.get("quote") or ""), index, deleted_keys)
@@ -461,7 +461,10 @@ def decide(
 ) -> dict[str, Any]:
     """几票判分原文 → 结果行里的 ``verdict`` / ``votes`` / ``agreement`` / ``category``。
     代表票:第一张投给多数类别的票(判分分歧时取第一票)。"""
-    verdicts = [score_verdict(parse_verdict(raw), passages, deleted=deleted) for raw in raws]
+    index = passage_index(passages)  # 几票共用一份(审查第四轮 LOW-3)
+    verdicts = [
+        score_verdict(parse_verdict(raw), passages, deleted=deleted, index=index) for raw in raws
+    ]
     categories = [category_for(label, v) for v in verdicts]
     final, agreement = majority(categories)
     return {
@@ -557,7 +560,7 @@ __all__ = [
     "judge_votes",
     "majority",
     "parse_verdict",
-    "passage_keys",
+    "passage_index",
     "score_verdict",
     "seen_passages",
     "yardstick_of",

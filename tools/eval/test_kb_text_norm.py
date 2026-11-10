@@ -151,3 +151,20 @@ def test_list_numbers_after_the_ideographic_comma_need_no_space() -> None:
 def test_an_ellipsis_before_a_number_does_not_hide_it() -> None:
     assert unit_numbers("甲片每片……1.5mg") == ["1.5mg"]
     assert unit_numbers("每天...2袋") == ["2袋"]
+
+
+def test_a_section_sign_is_not_the_list_marker() -> None:
+    # 审查第四轮 LOW-1:列表记号用私用区字符;原文里的「§」照旧当标点去掉
+    from kb_text_norm import LIST_MARK
+
+    assert quote_key("参见\u00a73条款") == "参见3条款"
+    assert LIST_MARK != "\u00a7" and LIST_MARK in quote_key(f"用法{LIST_MARK}每日")
+
+
+def test_paren_list_numbers_need_no_space() -> None:
+    from kb_text_norm import mark_line_lists, quote_variants
+
+    assert quote_key("用法\n1)每日2袋") == "用法每日2袋"
+    assert quote_key(mark_line_lists("用法\n1\uff09每日2袋")) == quote_key(
+        quote_variants("用法 1\uff09每日2袋")[1]
+    )
