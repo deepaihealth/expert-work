@@ -303,3 +303,221 @@ def test_the_run_row_records_which_production_prompt_parts_were_active(
     assert kb_agent_eval.main([*_corpus(other), "--distractors", "0"]) == 0
     _rows, run = _lines(other)
     assert run["prod_prompt_parts"] == ["answer_check", "outgoing_reference"]
+
+
+# ---------------------------------------------------------------------------
+# 11-10:难负例答前复核 —— 答案还检索得到的题不答、不进分母
+# ---------------------------------------------------------------------------
+
+
+def _recheck_says(monkeypatch: pytest.MonkeyPatch, answerable: bool) -> list[str]:
+    prompts: list[str] = []
+    original = FakeModels.judge
+
+    async def judge(self: FakeModels, prompt: str) -> tuple[str, float]:
+        if "【检索到的资料段落】" in prompt:
+            prompts.append(prompt)
+            return json.dumps({"answerable": answerable, "reason": "r"}), 0.0
+        raw, cost = await original(self, prompt)
+        return str(raw), float(cost)
+
+    monkeypatch.setattr(FakeModels, "judge", judge)
+    return prompts
+
+
+def test_a_hard_negative_still_answerable_after_deletion_is_excluded_before_answering(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    prompts = _recheck_says(monkeypatch, True)
+    argv = [*_corpus(tmp_path), "--hard-negatives", str(_spec(tmp_path, _GONE))]
+    assert kb_agent_eval.main(argv) == 0
+    rows, run = _lines(tmp_path)
+    [hn] = [r for r in rows if r["set"] == "hard_negative"]
+    assert hn["category"] == "excluded_answer_still_present"
+    assert hn["answer"] is None and hn["searches"] == []
+    assert run["recheck"] == {
+        "k": 20,
+        "checked": 1,
+        "excluded": ["hn-unit_kb-noise"],
+        "search_errors": [],
+        "search_error_reasons": {},
+        "stopped_by_budget": False,
+    }
+    # 复核用题目检索、给判分看被删的原文作对照;只复核难负例
+    assert len(prompts) == 3 and len(set(prompts)) == 1  # 默认 3 票取多数
+    prompt = prompts[0]
+    assert "甲一运行时噪音多大?" in prompt and _GONE in prompt
+    assert "静音模式" in prompt  # 检索到的段落
+    assert sum(1 for r in rows if r["label"] == "answerable") == 30
+    text = kb_agent_eval.tally(tmp_path / "agent.jsonl")
+    assert "复核剔除(答前检索判为答案仍在库里,不答、不进分母):1 题(hn-unit_kb-noise)" in text
+    assert kb_agent_eval.main(argv) == 0  # 续跑:剔除的题算做完了,不再复核
+    assert len(prompts) == 3
+
+
+def test_a_hard_negative_the_recheck_cannot_answer_is_answered(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _recheck_says(monkeypatch, False)
+    argv = [*_corpus(tmp_path), "--hard-negatives", str(_spec(tmp_path, _GONE))]
+    assert kb_agent_eval.main([*argv, "--recheck-k", "5"]) == 0
+    rows, run = _lines(tmp_path)
+    [hn] = [r for r in rows if r["set"] == "hard_negative"]
+    assert hn["category"] != "excluded_answer_still_present" and hn["answer"]
+    assert run["recheck"] == {
+        "k": 5,
+        "checked": 1,
+        "excluded": [],
+        "search_errors": [],
+        "search_error_reasons": {},
+        "stopped_by_budget": False,
+    }
+    assert hn["run_kind"].endswith(":recheck5")
+
+
+def test_the_recheck_can_be_turned_off(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    prompts = _recheck_says(monkeypatch, True)
+    argv = [*_corpus(tmp_path), "--hard-negatives", str(_spec(tmp_path, _GONE))]
+    assert kb_agent_eval.main([*argv, "--no-recheck"]) == 0
+    rows, run = _lines(tmp_path)
+    [hn] = [r for r in rows if r["set"] == "hard_negative"]
+    assert prompts == [] and run["recheck"] is None
+    assert hn["category"] != "excluded_answer_still_present"
+    # 开 / 关复核的结果不混在一个 --out 里
+    assert hn["run_kind"].endswith(":norecheck")
+    with pytest.raises(SystemExit, match="run_kind"):
+        kb_agent_eval.main(argv)
+
+
+@pytest.mark.parametrize("k", ["0", "21"])
+def test_the_recheck_depth_is_bounded_by_the_search_limit(
+    tmp_path: Path, k: str, capsys: pytest.CaptureFixture[str]
+) -> None:
+    argv = [*_corpus(tmp_path), "--hard-negatives", str(_spec(tmp_path, _GONE))]
+    with pytest.raises(SystemExit):
+        kb_agent_eval.main([*argv, "--recheck-k", k])
+    assert f"--recheck-k must be within [1, 20], got {k}" in capsys.readouterr().err
+
+
+@pytest.mark.asyncio
+async def test_the_store_residue_check_folds_radical_spellings(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # 11-10:库里留着部首写法的被删句,残留核对也得认得出来(与删句同一个归一)
+    from types import SimpleNamespace
+    from uuid import uuid4
+
+    from kb_agent_cases import store_residue  # type: ignore[import-not-found]
+
+    class _Store:
+        async def list_documents(self, **_kw: Any) -> list[Any]:
+            return [SimpleNamespace(id=uuid4())]
+
+    async def chunks(*_a: Any, **_kw: Any) -> list[str]:
+        return ["适用:饮\u2edd清淡的成年人。"]
+
+    monkeypatch.setattr("kb_agent_cases._all_chunk_texts", chunks)
+    left = await store_residue(
+        _Store(), tenant_id=uuid4(), kb_id=uuid4(), anchors=["饮食清淡的成年人"]
+    )
+    assert left == ["饮食清淡的成年人"]
+
+
+# ---------------------------------------------------------------------------
+# 审查 M4 / L1 / L2:复核花费进结果行、检索失败、预算
+# ---------------------------------------------------------------------------
+
+
+def _priced(monkeypatch: pytest.MonkeyPatch, answerable: bool, cny: float) -> None:
+    original = FakeModels.judge
+
+    async def judge(self: FakeModels, prompt: str) -> tuple[str, float]:
+        if "【检索到的资料段落】" in prompt:
+            return json.dumps({"answerable": answerable, "reason": "r"}), cny
+        raw, _cost = await original(self, prompt)
+        return str(raw), cny
+
+    monkeypatch.setattr(FakeModels, "judge", judge)
+
+
+def test_the_recheck_cost_of_a_kept_hard_negative_lands_on_its_row(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _priced(monkeypatch, False, 0.01)
+    argv = [*_corpus(tmp_path), "--hard-negatives", str(_spec(tmp_path, _GONE))]
+    assert kb_agent_eval.main(argv) == 0
+    rows, run = _lines(tmp_path)
+    [hn] = [r for r in rows if r["set"] == "hard_negative"]
+    assert hn["cost_cny"]["recheck"] == pytest.approx(0.03)  # 3 票
+    rows_judge = sum(r["cost_cny"]["judge"] + r["cost_cny"].get("recheck", 0.0) for r in rows)
+    assert rows_judge == pytest.approx(run["spend_cny"]["judge"])
+    text = kb_agent_eval.tally(tmp_path / "agent.jsonl")
+    assert f"judge ¥{run['spend_cny']['judge']:.2f}" in text
+
+
+def test_a_hard_negative_whose_recheck_search_fails_is_not_scored(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from orchestrator.tools.knowledge import KnowledgeSearchTool
+
+    prompts = _recheck_says(monkeypatch, False)
+    real = KnowledgeSearchTool.call
+
+    async def flaky(self: KnowledgeSearchTool, args: Any, *, ctx: Any) -> Any:
+        if args.get("limit") == 20:  # 只有复核带 limit=20
+            raise RuntimeError("search backend down")
+        return await real(self, args, ctx=ctx)
+
+    monkeypatch.setattr(KnowledgeSearchTool, "call", flaky)
+    argv = [*_corpus(tmp_path), "--hard-negatives", str(_spec(tmp_path, _GONE))]
+    assert kb_agent_eval.main(argv) == 0
+    rows, run = _lines(tmp_path)
+    [hn] = [r for r in rows if r["set"] == "hard_negative"]
+    assert prompts == []  # 检索失败:没有段落可判,不调判分
+    assert hn["category"] == "excluded_recheck_search_failed" and hn["answer"] is None
+    assert run["recheck"]["search_errors"] == ["hn-unit_kb-noise"]
+    assert run["recheck"]["excluded"] == []
+    assert run["recheck"]["search_error_reasons"] == {"hn-unit_kb-noise": "exception"}
+    text = kb_agent_eval.tally(tmp_path / "agent.jsonl")
+    assert "复核检索失败(不答、不进分母):1 题(hn-unit_kb-noise)" in text
+    assert "资料没写 n=0" in text
+
+
+def test_the_recheck_respects_the_budget(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    prompts = _recheck_says(monkeypatch, False)
+    argv = [*_corpus(tmp_path), "--hard-negatives", str(_spec(tmp_path, _GONE)), "--budget", "0"]
+    (tmp_path / "agent.jsonl.budget").write_text("stop", encoding="utf-8")
+    assert kb_agent_eval.main(argv) == 0
+    rows, run = _lines(tmp_path)
+    assert prompts == [] and rows == []
+    assert run["recheck"]["stopped_by_budget"] is True and run["recheck"]["checked"] == 0
+
+
+def test_a_failed_recheck_is_rechecked_when_the_run_resumes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from orchestrator.tools.knowledge import KnowledgeSearchTool
+
+    prompts = _recheck_says(monkeypatch, False)
+    real = KnowledgeSearchTool.call
+    down = {"on": True}
+
+    async def flaky(self: KnowledgeSearchTool, args: Any, *, ctx: Any) -> Any:
+        if down["on"] and args.get("limit") == 20:
+            raise RuntimeError("search backend down")
+        return await real(self, args, ctx=ctx)
+
+    monkeypatch.setattr(KnowledgeSearchTool, "call", flaky)
+    argv = [*_corpus(tmp_path), "--hard-negatives", str(_spec(tmp_path, _GONE))]
+    assert kb_agent_eval.main(argv) == 0
+    assert prompts == []
+    down["on"] = False
+    assert kb_agent_eval.main(argv) == 0  # 续跑:检索失败的那题不算做完,重新复核、答题
+    assert prompts  # 这次复核真判了
+    lines = [json.loads(x) for x in (tmp_path / "agent.jsonl").read_text().splitlines()]
+    hn = [x for x in lines if x.get("case_id") == "hn-unit_kb-noise"]
+    assert hn[0]["category"] == "excluded_recheck_search_failed"
+    assert hn[-1]["category"] != "excluded_recheck_search_failed" and hn[-1]["answer"]
+    text = kb_agent_eval.tally(tmp_path / "agent.jsonl")
+    assert "复核检索失败" not in text  # 后来补上的那行取代了失败记录
+    assert "资料没写 n=1" in text

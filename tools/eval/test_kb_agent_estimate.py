@@ -199,3 +199,167 @@ def test_an_interrupted_history_without_a_run_row_still_estimates(tmp_path: Path
     assert h.judge_cny_per_call == pytest.approx(0.1)  # 每题一次判分(旧尺子)
     run = estimate_run("标准轮", 10, h, votes=3, judge_call=0.1)
     assert run.rerank_cny == 0.0 and run.answer_calls is None
+
+
+# ---------------------------------------------------------------------------
+# 11-10:难负例答前复核的判分钱 + 已有结果重判的免费估价
+# ---------------------------------------------------------------------------
+
+
+def _cli_argv(tmp_path: Path, *extra: str) -> list[str]:
+    main_set, chat_set = _datasets(tmp_path)
+    spec = tmp_path / "hn.yaml"
+    entries = [{"id": f"m-a{i}", "query": "q", "anchors": ["合成锚文本第一句"]} for i in range(5)]
+    spec.write_text(yaml.safe_dump({"cases": entries}), encoding="utf-8")
+    return [
+        "--dataset",
+        main_set,
+        "--chat-dataset",
+        chat_set,
+        "--history",
+        str(_history_file(tmp_path)),
+        "--judge-cache",
+        str(tmp_path / "none.sqlite"),
+        "--hard-negatives",
+        str(spec),
+        *extra,
+    ]
+
+
+def test_the_hard_negative_run_prices_the_pre_answer_recheck(
+    tmp_path: Path, no_network: list[str], capsys: pytest.CaptureFixture[str]
+) -> None:
+    from kb_agent_estimate import recheck_call_cny  # type: ignore[import-not-found]
+
+    assert main(_cli_argv(tmp_path)) == 0
+    out = capsys.readouterr().out
+    h = history_from(_history_file(tmp_path))
+    call = recheck_call_cny(h)
+    # 审查 L2:与主估价同一口径 —— 按历史每次判分的实花(含看不见的思考 token)乘提示词字数比
+    from kb_agent_estimate import (  # type: ignore[import-not-found]
+        RECHECK_QUESTION_CHARS,
+        RECHECK_REFERENCE_CHARS,
+        SEARCH_TEXT_BUDGET,
+    )
+    from kb_agent_recheck import RECHECK_TEMPLATE  # type: ignore[import-not-found]
+
+    template = len(RECHECK_TEMPLATE.format(question="", reference="", passages=""))
+    chars = template + RECHECK_QUESTION_CHARS + RECHECK_REFERENCE_CHARS + SEARCH_TEXT_BUDGET
+    assert h.prompt_chars == pytest.approx(OLD_TEMPLATE_CHARS + 10 + 90 + 400)
+    assert call == pytest.approx(h.judge_cny_per_call * chars / h.prompt_chars)
+    assert f"答前复核 15 次 ¥{5 * 3 * call:.2f}" in out  # 5 道难负例乘3 票
+    assert main(_cli_argv(tmp_path, "--no-recheck")) == 0
+    assert "答前复核 0 次 ¥0.00" in capsys.readouterr().out
+    assert no_network == []
+
+
+def _result_rows(path: Path, *, votes: int = 3, excluded: int = 0) -> Path:
+    rows: list[dict[str, Any]] = [
+        {
+            "case_id": f"a{i}",
+            "label": "answerable",
+            "question": "问" * 10,
+            "answer": "答" * 90,
+            "searches": [{"content": "段" * 400}],
+            "reads": [{"content": "读" * 100}],
+            "category": "答对",
+            "judge_votes": votes,
+            "judge_model": "deepseek-v4-pro",
+            "cost_cny": {"answer": 0.2, "judge": 0.3},
+        }
+        for i in range(4)
+    ]
+    rows += [
+        {**rows[0], "case_id": f"x{i}", "category": "excluded_answer_still_present"}
+        for i in range(excluded)
+    ]
+    path.write_text("".join(json.dumps(r, ensure_ascii=False) + "\n" for r in rows), "utf-8")
+    return path
+
+
+def test_rejudge_estimate_counts_calls_and_prompt_tokens_from_the_rows(tmp_path: Path) -> None:
+    from kb_agent_estimate import (  # type: ignore[import-not-found]
+        GOLD_PASSAGE_CHARS,
+        rejudge_estimate,
+    )
+
+    path = _result_rows(tmp_path / "r.jsonl", excluded=2)
+    price = PRICES["deepseek-v4-pro"]
+    est = rejudge_estimate(path, price=price, reply_chars=500.0)
+    assert (est.questions, est.calls) == (4, 12)  # 复核剔除的两行不重判
+    reference = 2 * GOLD_PASSAGE_CHARS  # 旧行没记 gold:按假设的两段估
+    per_prompt = _NEW_TEMPLATE + 10 + 90 + 400 + 100 + len("\n\n=====\n\n") + reference
+    assert est.input_tokens == pytest.approx(12 * per_prompt * TOKENS_PER_CHAR, rel=0.05)
+    full = (est.input_tokens * price.input + est.output_tokens * price.output) / 1e6
+    assert est.full_cny == pytest.approx(full)
+    assert est.cached_cny < est.full_cny  # 同一提示词的第 2、3 票走提示词缓存
+    # 按原文件判分实花推(含看不见的思考 token、原来的忙闲时):每行实花乘新旧提示词长度比
+    from kb_agent_estimate import YARDSTICK_1109_TEMPLATE_CHARS  # type: ignore[import-not-found]
+
+    rest = per_prompt - _NEW_TEMPLATE
+    ratio = (_NEW_TEMPLATE + rest) / (YARDSTICK_1109_TEMPLATE_CHARS + rest)
+    assert est.history_cny == pytest.approx(4 * 0.3 * ratio, rel=0.01)
+
+
+def test_the_1109_template_size_is_the_one_measured_on_its_commit() -> None:
+    from kb_agent_estimate import YARDSTICK_1109_TEMPLATE_CHARS  # type: ignore[import-not-found]
+
+    # 3b074f291 的 JUDGE_TEMPLATE(尺子 2026-11-09.3+902042cf)去掉四个占位符后 1003 字
+    assert YARDSTICK_1109_TEMPLATE_CHARS == 1003
+
+
+def test_rejudge_cli_estimates_each_file_without_any_call(
+    tmp_path: Path, no_network: list[str], capsys: pytest.CaptureFixture[str]
+) -> None:
+    a = _result_rows(tmp_path / "a.jsonl")
+    b = _result_rows(tmp_path / "b.jsonl", votes=1)
+    argv = ["--rejudge", str(a), str(b), "--judge-cache", str(tmp_path / "none.sqlite")]
+    assert main(argv) == 0
+    out = capsys.readouterr().out
+    assert "重判报价(不调任何模型" in out
+    assert "a.jsonl | 4 题 | 判分 12 次" in out
+    assert "按原文件判分实花推" in out
+    assert "b.jsonl | 4 题 | 判分 4 次" in out
+    assert "合计 8 题 / 16 次" in out
+    assert no_network == []
+
+
+def test_history_leaves_out_rows_the_recheck_did_not_score(tmp_path: Path) -> None:
+    path = _history_file(tmp_path)
+    unscored = {
+        "case_id": "x1",
+        "question": "问",
+        "answer": None,
+        "searches": [],
+        "reads": [],
+        "category": "excluded_answer_still_present",
+        "cost_cny": {"answer": 0.0, "judge": 0.05},
+        "answer_model": "glm-5.3",
+        "judge_model": "deepseek-v4-pro",
+    }
+    failed = {**unscored, "case_id": "x2", "category": "excluded_recheck_search_failed"}
+    with path.open("a", encoding="utf-8") as fh:
+        fh.write(json.dumps(unscored, ensure_ascii=False) + "\n")
+        fh.write(json.dumps(failed, ensure_ascii=False) + "\n")
+    h = history_from(path)
+    assert h.questions == 4
+    assert h.answer_cny_per_q == pytest.approx(0.2)
+    rest = 10 + 90 + 400
+    assert h.input_ratio == pytest.approx((_NEW_TEMPLATE + rest) / (OLD_TEMPLATE_CHARS + rest))
+
+
+def test_the_judge_unit_price_counts_every_row_s_judge_and_recheck_spend(tmp_path: Path) -> None:
+    # 审查第三轮 LOW-4:分母是 run 行的全部判分调用(含复核),分子也要是全部行的判分 + 复核花费
+    path = _history_file(tmp_path)
+    lines = path.read_text(encoding="utf-8").splitlines()
+    rows = [json.loads(x) for x in lines if '"case_id"' in x]
+    rows[0]["cost_cny"]["recheck"] = 0.03
+    excluded = {**rows[1], "case_id": "x1", "category": "excluded_answer_still_present"}
+    excluded["cost_cny"] = {"answer": 0.0, "judge": 0.05}
+    run = json.loads(next(x for x in lines if '"run"' in x))
+    run["run"]["calls"]["judge"] = 6
+    body = [*rows, excluded, run]
+    path.write_text("".join(json.dumps(x, ensure_ascii=False) + "\n" for x in body), "utf-8")
+    h = history_from(path)
+    assert h.questions == 4
+    assert h.judge_cny_per_call == pytest.approx((4 * 0.1 + 0.03 + 0.05) / 6)

@@ -90,12 +90,11 @@ from kb_agent_cost import (  # type: ignore[import-not-found]
 )
 from kb_agent_judge import (  # type: ignore[import-not-found]
     DEFAULT_JUDGE_VOTES,
+    RECHECK_FAILED,
     JudgeCache,
-    category_for,
+    decide,
     judge_prompt,
-    majority,
-    parse_verdict,
-    score_verdict,
+    judge_votes,
     seen_passages,
     yardstick_of,
 )
@@ -109,6 +108,14 @@ from kb_agent_models import (  # type: ignore[import-not-found]
 from kb_agent_prod_prompt import (  # type: ignore[import-not-found]
     ProductionPrompt,
     load_production_prompt,
+)
+from kb_agent_recheck import (  # type: ignore[import-not-found]
+    DEFAULT_RECHECK_K,
+    MAX_RECHECK_K,
+    excluded_row,
+    recheck_hard_negatives,
+    recheck_references,
+    write_excluded,
 )
 from kb_agent_tally import read_results, tally  # type: ignore[import-not-found]
 from kb_dataset import KbCase, KbDataset, load_dataset  # type: ignore[import-not-found]
@@ -124,6 +131,7 @@ from kb_eval import (  # type: ignore[import-not-found]
     rls_tenant,
 )
 from kb_hard_sets import (  # type: ignore[import-not-found]
+    HARD_NEGATIVE_SET,
     AnchorDeletingParser,
 )
 from kb_rerank import (  # type: ignore[import-not-found]
@@ -177,6 +185,7 @@ async def run_questions(
     run_kind: str = "standard",
     deleted: Mapping[str, Sequence[str]] | None = None,
     production: ProductionPrompt | None = None,
+    recheck_costs: Mapping[str, float] | None = None,
 ) -> int:
     """答题 + 判分,每题一行追加进 ``out``;返回写了几行。``other_cost`` 是计入预算的其它花费
     (重排)。``production``:照生产加的提示段(见 ``kb_agent_prod_prompt``)。
@@ -212,14 +221,11 @@ async def run_questions(
                 prompt=production,
             )
             prompt = judge_prompt(case, run, gold, (notes or {}).get(case.id, ""))
-            raws, judge_cny = await _judge_votes(
+            raws, judge_cny = await judge_votes(
                 models, cache, prompt, votes=votes, spend=spend, cache_verdicts=cache_verdicts
             )
-            passages = seen_passages(run)
             gone = (deleted or {}).get(case.id, ())
-            verdicts = [score_verdict(parse_verdict(raw), passages, deleted=gone) for raw in raws]
-            categories = [category_for(case.answer_label, v) for v in verdicts]
-            final, agreement = majority(categories)
+            decided = decide(case.answer_label, raws, seen_passages(run), deleted=gone)
             row = {
                 "case_id": case.id,
                 "set": label,
@@ -229,17 +235,24 @@ async def run_questions(
                 "answer": run["answer"],
                 "searches": run["searches"],
                 "reads": run["reads"],
-                # 代表票:第一张投给多数类别的票(判分分歧时取第一票)。
-                "verdict": verdicts[categories.index(final) if final in categories else 0],
-                "votes": categories,
-                "agreement": agreement,
-                "category": final,
+                # 11-10:判分看到的「含答案的完整段落」也记下,以后重判(kb_agent_rejudge)不用重建库。
+                "gold": list(gold.get(case.id, [])),
+                **decided,
                 "answer_model": models.answer_model,
                 "judge_model": models.judge_model,
                 "yardstick": YARDSTICK,
                 "judge_votes": votes,
                 "run_kind": run_kind,
-                "cost_cny": {"answer": round(answer_cny, 6), "judge": round(judge_cny, 6)},
+                "cost_cny": {
+                    "answer": round(answer_cny, 6),
+                    "judge": round(judge_cny, 6),
+                    # 审查 M4:难负例答前复核的判分花费记在留下来答题的那一行上
+                    **(
+                        {"recheck": round(recheck_costs[case.id], 6)}
+                        if recheck_costs and case.id in recheck_costs
+                        else {}
+                    ),
+                },
             }
             async with write_lock:
                 with out.open("a", encoding="utf-8") as fh:
@@ -249,32 +262,6 @@ async def run_questions(
 
     await asyncio.gather(*(one(label, case) for label, case in todo))
     return written
-
-
-async def _judge_votes(
-    models: Models,
-    cache: JudgeCache,
-    prompt: str,
-    *,
-    votes: int,
-    spend: Spend,
-    cache_verdicts: bool,
-) -> tuple[list[str], float]:
-    """同一提示词判 ``votes`` 次(每票单独缓存):``(每票原文, 这题判分花费)``。"""
-    raws: list[str] = []
-    cost = 0.0
-    for vote in range(max(1, votes)):
-        raw = cache.get(models.judge_model, prompt, vote=vote)
-        if raw is None:
-            raw, call_cny = await models.judge(prompt)
-            cost += call_cny
-            spend.judge_cny += call_cny
-            spend.judge_calls += 1
-            # 判分失败(不是 JSON / 缺字段)的回复不进缓存:下次重判,不把一次坏回复钉死。
-            if cache_verdicts and "parse_error" not in score_verdict(parse_verdict(raw), ""):
-                cache.put(models.judge_model, prompt, raw, vote=vote)
-        raws.append(raw)
-    return raws, cost
 
 
 # ---------------------------------------------------------------------------
@@ -302,15 +289,18 @@ def done_case_ids(
                     f"{path} has a row with {key}={row.get(key)!r}, this run is {value!r}; "
                     "use another --out"
                 )
-    return {row["case_id"] for row in rows}
+    # 复核检索失败的题不算做完:续跑时重新复核(审查第二轮)
+    return {row["case_id"] for row in rows if row.get("category") != RECHECK_FAILED}
 
 
 def run_kind_of(args: argparse.Namespace) -> str:
-    """``standard`` 或 ``hn:<spec 内容 sha256 前 12 位>``。"""
+    """``standard`` 或 ``hn:<spec 内容 sha256 前 12 位>:recheck<k>`` / ``…:norecheck``
+    (答前复核开没开、取几段的结果不混,11-10)。"""
     if args.hard_negatives is None:
         return "standard"
     digest = hashlib.sha256(Path(args.hard_negatives).read_bytes()).hexdigest()[:12]
-    return f"hn:{digest}"
+    recheck = "norecheck" if args.no_recheck else f"recheck{args.recheck_k}"
+    return f"hn:{digest}:{recheck}"
 
 
 # ---------------------------------------------------------------------------
@@ -381,6 +371,17 @@ def _build_parser() -> argparse.ArgumentParser:
             "有答案对照题;与 --distractors 分开跑"
         ),
     )
+    parser.add_argument(
+        "--no-recheck",
+        action="store_true",
+        help="难负例轮不做答前复核(11-10;默认做:检索前 k 段让判分模型判答案还在不在,会花判分钱)",
+    )
+    parser.add_argument(
+        "--recheck-k",
+        type=int,
+        default=DEFAULT_RECHECK_K,
+        help=f"答前复核每题取前几段(1~{MAX_RECHECK_K},knowledge_search 的 limit 上限)",
+    )
     parser.add_argument("--rerank", default="dashscope", choices=("dashscope", "off"))
     # B-206 K-14 对照组,与 kb_eval.py 同名同义;默认 = 生产默认。
     parser.add_argument("--rerank-view", default=DEFAULT_RERANK_VIEW, choices=RERANK_VIEWS)
@@ -403,6 +404,8 @@ def _check_args(parser: argparse.ArgumentParser, args: argparse.Namespace) -> No
         args.distractors = 0 if args.hard_negatives is not None else DEFAULT_DISTRACTORS
     if args.distractors < 0:
         parser.error(f"--distractors must be at least 0, got {args.distractors}")
+    if not 1 <= args.recheck_k <= MAX_RECHECK_K:
+        parser.error(f"--recheck-k must be within [1, {MAX_RECHECK_K}], got {args.recheck_k}")
     if args.judge_votes < 1:
         parser.error(f"--judge-votes must be at least 1, got {args.judge_votes}")
     if args.rerank_pool < 1:
@@ -561,6 +564,19 @@ async def _run(
             )
             refs = (base_name,)
             search = KnowledgeSearchTool(retriever=retriever, knowledge_base_refs=refs)
+            cache = JudgeCache(args.judge_cache)
+            gate = BudgetGate(budget=args.budget, control=Path(f"{out}.budget"))
+            todo, recheck, recheck_costs = await _recheck(
+                args,
+                todo=todo,
+                plan=plan,
+                search=search,
+                models=models,
+                cache=cache,
+                spend=spend,
+                gate=gate,
+                total=lambda: float(spend.answer_cny + spend.judge_cny + rerank_cny()),
+            )
             # B-206 K-2:生产里有知识库的智能体两个工具都有;--no-read 只是读文档关掉。
             reader = (
                 None if args.no_read else KnowledgeReadTool(store=store, knowledge_base_refs=refs)
@@ -576,9 +592,9 @@ async def _run(
                 reader=reader,
                 tenant_id=EVAL_TENANT_ID,
                 gold=gold,
-                cache=JudgeCache(args.judge_cache),
+                cache=cache,
                 out=out,
-                gate=BudgetGate(budget=args.budget, control=Path(f"{out}.budget")),
+                gate=gate,
                 spend=spend,
                 other_cost=rerank_cny,
                 concurrency=args.concurrency,
@@ -588,6 +604,7 @@ async def _run(
                 run_kind=run_kind_of(args),
                 deleted=plan.deleted_by_case,
                 production=production,
+                recheck_costs=recheck_costs,
             )
     run = {
         "started": started.isoformat(),
@@ -611,6 +628,8 @@ async def _run(
         # B-206 11-09:这一轮加了几道近名干扰题;难负例臂的删句核对。
         "distractors": plan.distractors,
         "hard_negatives": hard_negatives,
+        # 11-10:难负例答前复核(没开 / 标准轮为 None)。
+        "recheck": recheck,
         "calls": {"answer": spend.answer_calls, "judge": spend.judge_calls},
         "spend_cny": {
             "answer": round(spend.answer_cny, 6),
@@ -623,6 +642,84 @@ async def _run(
     }
     with out.open("a", encoding="utf-8") as fh:
         fh.write(json.dumps({"run": run}, ensure_ascii=False) + "\n")
+
+
+async def _recheck(
+    args: argparse.Namespace,
+    *,
+    todo: Sequence[tuple[str, KbCase]],
+    plan: RunPlan,
+    search: KnowledgeSearchTool,
+    models: Models,
+    cache: JudgeCache,
+    spend: Spend,
+    gate: BudgetGate,
+    total: Callable[[], float],
+) -> tuple[list[tuple[str, KbCase]], dict[str, object] | None, dict[str, float]]:
+    """难负例答前复核(``kb_agent_recheck``):判为答案仍在库里 / 复核检索报错的题落一行不计分的
+    记录、不再答题。受同一个 ``--budget`` 约束(审查 L2):暂停时等操作者调高上限,收到 ``stop``
+    就不再复核、也不再答题。返回 ``(还要答的题, 记进 run 行的复核摘要, 留下的题各自的
+    复核花费)``。"""
+    if not plan.delete_anchors or args.no_recheck:
+        return list(todo), None, {}
+    stopped = False
+
+    async def admit() -> bool:
+        nonlocal stopped
+        while total() >= gate.budget:
+            if not await gate.wait_for_raise(total):
+                stopped = True
+                return False
+        return True
+
+    hard = [case for label, case in todo if label == HARD_NEGATIVE_SET]
+    checks = await recheck_hard_negatives(
+        cases=hard,
+        search=search,
+        tenant_id=EVAL_TENANT_ID,
+        models=models,
+        cache=cache,
+        references=recheck_references(plan.deleted_by_case, plan.original_answers),
+        spend=spend,
+        votes=args.judge_votes,
+        k=args.recheck_k,
+        cache_verdicts=not args.dry,
+        admit=admit,
+    )
+    meta = {
+        "answer_model": models.answer_model,
+        "judge_model": models.judge_model,
+        "yardstick": YARDSTICK,
+        "judge_votes": args.judge_votes,
+        "run_kind": run_kind_of(args),
+    }
+    gone = {cid for cid, check in checks.items() if check["excluded"]}
+    failed = {cid for cid, check in checks.items() if check["search_error"]}
+    write_excluded(
+        cast(Path, args.out),
+        [
+            excluded_row(label, case, checks[case.id], meta=meta)
+            for label, case in todo
+            if case.id in gone | failed
+        ],
+    )
+    for case_id in sorted(gone):
+        print(f"{case_id} -> excluded: answer still retrievable after deletion", file=sys.stderr)
+    for case_id in sorted(failed):
+        print(f"{case_id} -> not scored: recheck search failed", file=sys.stderr)
+    summary = {
+        "k": args.recheck_k,
+        "checked": len(checks),
+        "excluded": sorted(gone),
+        "search_errors": sorted(failed),
+        "search_error_reasons": {cid: checks[cid]["search_error"] for cid in sorted(failed)},
+        "stopped_by_budget": stopped,
+    }
+    if stopped:  # 操作者写了 stop:后面的题都不答(没复核的难负例不能直接答)
+        return [], summary, {}
+    costs = {cid: float(check["cost_cny"]) for cid, check in checks.items()}
+    left = [(label, case) for label, case in todo if case.id not in gone | failed]
+    return left, summary, costs
 
 
 def main(argv: Sequence[str] | None = None) -> int:
