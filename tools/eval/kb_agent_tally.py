@@ -60,6 +60,19 @@ def read_results(path: Path) -> tuple[list[dict[str, Any]], list[dict[str, Any]]
     return rows, runs
 
 
+def superseded(rows: Sequence[dict[str, Any]]) -> list[dict[str, Any]]:
+    """去掉被续跑补上的复核失败行:同一题后面又有一行(重新复核后答了 / 剔除了),失败那行作废。"""
+    later: set[str] = set()
+    kept: list[dict[str, Any]] = []
+    for row in reversed(rows):
+        case_id = str(row["case_id"])
+        if row.get("category") == RECHECK_FAILED and case_id in later:
+            continue
+        later.add(case_id)
+        kept.append(row)
+    return kept[::-1]
+
+
 def row_label(row: Mapping[str, Any]) -> str:
     label = row.get("label")
     if isinstance(label, str):
@@ -154,6 +167,8 @@ def _headline(rows: Sequence[Mapping[str, Any]]) -> list[str]:
         f"  判分:分歧 {r['disagree']},失败 {r['failed']};全票一致 {_unanimous(kept)}",
         _quote_list(kept, "quote_misses", "待复核·引文在资料里没找到"),
         _quote_list(kept, "quote_unchecked", "引文空或太短、核对不了"),
+        # 审查第二轮 MEDIUM-1:core 断言标成「不需要出处」—— 转介还是误标的结论,人看
+        _quote_list(kept, "core_unsourced", "待复核·结论本身标了不需要出处"),
         _grounded_line(kept),
     ]
     if excluded:
@@ -279,6 +294,7 @@ def tally(paths: Path | Sequence[Path]) -> str:
     by_file: dict[str, list[dict[str, Any]]] = {}
     for path in files:
         rows, runs = read_results(path)
+        rows = superseded(rows)
         by_file[str(path)] = rows  # 完整路径做键:不同目录的同名文件不互相覆盖(审查 L6)
         for row in rows:
             by_model.setdefault(str(row.get("answer_model")), []).append(row)

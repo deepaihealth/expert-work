@@ -263,7 +263,9 @@ def test_the_cli_rejudges_an_old_file_and_rebuilds_gold_offline(
     assert answerable and all(r["gold"] for r in answerable)  # 库在本机重建,取回了含答案段落
     # 与原跑判分看到的含答案段落逐题相同
     assert {r["case_id"]: r["gold"] for r in rows} == original
-    assert run["rejudge"]["source"] == "agent.jsonl" and run["rejudge"]["yardstick"] == YARDSTICK
+    source = str((tmp_path / "agent.jsonl").resolve())
+    assert run["rejudge"]["source"] == source and run["rejudge"]["yardstick"] == YARDSTICK
+    assert all(r["rejudged_from"]["file"] == source for r in rows)
     assert run["calls"]["answer"] == 0
     assert kb_agent_rejudge.main(rejudge) == 0  # 续跑:全做完了,只补一行 run
     assert len([x for x in out.read_text().splitlines() if "case_id" in x]) == 32
@@ -309,3 +311,41 @@ def test_a_rejudge_stopped_by_the_budget_says_so(
     [run] = [x["run"] for x in lines if "run" in x]
     assert run["stopped_by_budget"] is True and run["questions"] == 1  # 每题 3 票 = ¥3
     assert "stopped by budget" in capsys.readouterr().err
+
+
+def test_a_rejudge_of_legacy_rows_without_run_kind_or_votes_can_resume(tmp_path: Path) -> None:
+    # 审查第二轮 MEDIUM-2:#2067 之前的结果行没有 run_kind / judge_votes,重判续跑不能被拒
+    argv = [*_corpus(tmp_path), "--distractors", "0"]
+    assert kb_agent_eval.main(argv) == 0
+    _as_old(tmp_path / "agent.jsonl")
+    source = tmp_path / "agent.jsonl"
+    lines = []
+    for line in source.read_text(encoding="utf-8").splitlines():
+        item = json.loads(line)
+        if "case_id" in item:
+            item = {k: v for k, v in item.items() if k not in ("run_kind", "judge_votes")}
+        lines.append(json.dumps(item, ensure_ascii=False))
+    source.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    out = tmp_path / "rejudged.jsonl"
+    rejudge = [*_rejudge_argv(argv, out), "--budget", "0"]  # 第一次一题都不做,只为续跑
+    assert kb_agent_rejudge.main(_rejudge_argv(argv, out)) == 0
+    rows = [json.loads(x) for x in out.read_text().splitlines() if "case_id" in x]
+    assert {r["run_kind"] for r in rows} == {"standard"} and {r["judge_votes"] for r in rows} == {1}
+    assert kb_agent_rejudge.main(rejudge) == 0  # 续跑接得上
+    assert len([x for x in out.read_text().splitlines() if "case_id" in x]) == len(rows)
+
+
+def test_resuming_refuses_a_same_named_source_from_another_folder(tmp_path: Path) -> None:
+    argv = [*_corpus(tmp_path), "--distractors", "0"]
+    assert kb_agent_eval.main(argv) == 0
+    out = tmp_path / "rejudged.jsonl"
+    assert kb_agent_rejudge.main(_rejudge_argv(argv, out)) == 0
+    other = tmp_path / "copy"
+    other.mkdir()
+    (other / "agent.jsonl").write_bytes((tmp_path / "agent.jsonl").read_bytes())
+    again = [
+        x if x != str(tmp_path / "agent.jsonl") else str(other / "agent.jsonl")
+        for x in _rejudge_argv(argv, out)
+    ]
+    with pytest.raises(SystemExit, match="rejudged_from"):
+        kb_agent_rejudge.main(again)

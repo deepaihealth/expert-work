@@ -10,8 +10,8 @@
   ``-`` / ``~`` 只在两个字母数字之间留(型号、范围)—— 句末的半角句点、列表前的短横不是内容。
 * :func:`table_views`:Markdown 表格按行(表头 + 单元格成对)、按列(表头 + 这一列的单元格)序列化,
   引文常把表头和值连着抄,原文里它们隔着几行。
-* :func:`unit_numbers` / :func:`key_facts`:带单位的数字、型号 / 编号类字符串、引号里的短语 ——
-  通用规则,不针对任何一份资料。
+* :func:`unit_numbers` / :func:`key_facts`:带单位的数字、型号 / 编号类字符串 —— 通用规则,
+  不针对任何一份资料;在保留分隔符的原文上抽,比集合。
 """
 
 from __future__ import annotations
@@ -33,10 +33,17 @@ _ALWAYS_KEEP = frozenset("%<>≤≥±")
 _JOINERS = frozenset(".-~")
 
 
-#: 数字里的千分位逗号(NFKC 后全角逗号也成了半角):先去掉,``1,000毫克`` 不能切成 ``000毫克``。
-_THOUSANDS = re.compile(r"(?<=\d),(?=\d{3}(?!\d))")
-#: 行首的列表编号(``1. `` / ``2、`` / ``3) ``):不是小数点,``1. 5克装`` 不能读成 ``1.5克``。
-_LIST_NUMBER = re.compile(r"(?m)^[ \t]*\d{1,2}[.\u3001)][ \t]+")
+#: 完整的千分位数字(``1,000`` / ``1,000,000``):只认半角逗号、在 NFKC 之前合并 ——
+#: 全角逗号是列举(``100,200,500毫升`` 用全角逗号时是三个数),``12,34`` 也不合并。
+_THOUSANDS = re.compile(r"(?<![\d.,])\d{1,3}(?:,\d{3})+(?![\d,])")
+#: 行首的列表编号(``1. `` / ``2、`` / ``3) ``,``、`` 后面的空白可有可无):不是小数点,
+#: ``1. 5克装`` 不能读成 ``1.5克``。
+_LIST_NUMBER = re.compile(r"(?m)^[ \t]*\d{1,2}(?:[.)][ \t]+|\u3001[ \t]*)")
+_ELLIPSES = re.compile("[\u2026\u22ef]+")
+_DOTS = re.compile(r"\.{3,}")
+#: 任意位置的列表编号(引文常把几条列表压成一行抄);只用在引文的第二种比法上(见
+#: :func:`quote_variants`),``第1、2条`` 这种正文按第一种比法照样对得上。
+_INLINE_LIST_NUMBER = re.compile(r"(?<![0-9.])\d{1,2}(?:[.)]\s+|\u3001\s*)")
 
 
 def normalize_cjk(text: str) -> str:
@@ -45,8 +52,17 @@ def normalize_cjk(text: str) -> str:
 
 
 def _numbers_ready(text: str) -> str:
-    """部首归一 + NFKC,去掉千分位逗号与行首列表编号。"""
-    return _LIST_NUMBER.sub("", _THOUSANDS.sub("", normalize_cjk(text)))
+    """合并完整的半角千分位(NFKC 之前),部首归一 + NFKC,去掉行首列表编号。"""
+    merged = _THOUSANDS.sub(lambda m: m.group(0).replace(",", ""), text)
+    # 省略号换成空格:NFKC 把「…」变成「...」,紧跟的数字会被当成小数的一部分
+    folded = _DOTS.sub(" ", normalize_cjk(_ELLIPSES.sub(" ", merged)))
+    return _LIST_NUMBER.sub("", folded)
+
+
+def quote_variants(quote: str) -> list[str]:
+    """引文的两种比法:原样;去掉任意位置的列表编号(``产品规格: 1. 5克装`` / ``5克装 2. 10克装``)。"""
+    stripped = _INLINE_LIST_NUMBER.sub("", normalize_cjk(quote))
+    return list(dict.fromkeys([quote, stripped]))
 
 
 def _alnum(ch: str) -> bool:
@@ -120,11 +136,13 @@ def table_views(text: str) -> list[str]:
             header, rows = rows[0], rows[2:]
         rows = [r for r in rows if r and not _is_separator(r)]
         if header is not None:
-            views += ["".join(f"{h}{c}" for h, c in zip(header, r, strict=False)) for r in rows]
+            # 单元格之间留空格:投影时消失,按原文抽数字时不把相邻单元格粘成一个数
+            views += [" ".join(f"{h} {c}" for h, c in zip(header, r, strict=False)) for r in rows]
         width = max((len(r) for r in rows), default=0)
         for j in range(width):
-            column = "".join(r[j] for r in rows if j < len(r))
-            views.append((header[j] if header is not None and j < len(header) else "") + column)
+            column = " ".join(r[j] for r in rows if j < len(r))
+            title = header[j] if header is not None and j < len(header) else ""
+            views.append(f"{title} {column}")
     return views
 
 
@@ -142,8 +160,6 @@ _UNIT_NUMBER = re.compile(rf"(?<![0-9.])(\d+(?:\.\d+)?)\s*({_UNITS})(?![a-z])")
 _CODE = re.compile(
     r"(?<![a-z0-9.])(?=[a-z0-9-]*[a-z])(?=[a-z0-9-]*[0-9])[a-z0-9][a-z0-9-]*[a-z0-9]"
 )
-#: 「」 “” "" 『』 里的短语。
-_QUOTED = re.compile('[「“"『]([^」”"』\\n]{2,40})[」”"』]')
 _MIN_CODE = 3
 
 
@@ -155,28 +171,26 @@ def unit_numbers(text: str) -> list[str]:
 
 
 def fact_positions(kind: str, value: str, key: str) -> list[int]:
-    """投影后的 ``key`` 里 ``value`` 出现的位置,两头都要有边界:带单位的数字前面不能紧挨数字或
-    小数点(``5岁`` 不在 ``15岁`` 里、``1.5mg`` 不在 ``2.5mg`` 里),型号前面不能紧挨字母数字、
-    小数点或连字符;两者后面都不能紧挨字母数字(``10g`` 不在 ``10gb`` 里、``kx-305`` 不在
-    ``kx-3050`` 里)。引号短语不加边界。"""
+    """投影后的 ``key`` 里 ``value`` 出现的位置,**只用来定位窗口**:「有没有这个事实」要在保留分隔符
+    的原文上用 :func:`key_facts` 抽出来比集合(审查第二轮 HIGH-1:投影压掉了分隔符,「5g 乘号 10袋」
+    投影成 ``5g10袋``,在投影上加尾边界会漏)。这里只加前边界:带单位的数字前面不能紧挨数字或
+    小数点,型号前面不能紧挨字母数字、小数点或连字符。"""
     escaped = re.escape(value)
     if kind == "number":
-        pattern = rf"(?<![0-9.]){escaped}(?![a-z0-9])"
+        pattern = rf"(?<![0-9.]){escaped}"
     elif kind == "code":
-        pattern = rf"(?<![a-z0-9.\-]){escaped}(?![a-z0-9])"
+        pattern = rf"(?<![a-z0-9.\-]){escaped}"
     else:
         pattern = escaped
     return [m.start() for m in re.finditer(pattern, key)]
 
 
-def has_number(token: str, key: str) -> bool:
-    """投影后的 ``key`` 里有没有带单位的数字 ``token``(边界见 :func:`fact_positions`)。"""
-    return bool(fact_positions("number", token, key))
-
-
 def key_facts(text: str) -> list[tuple[str, str]]:
-    """参考答案里的关键事实 ``(类别, 投影后的值)``:``number`` 带单位的数字、``code`` 型号 / 编号类
-    字符串(字母数字混排、≥ 3 个字符,不含已算作带单位数字的)、``quote`` 引号里的短语。"""
+    """原文里的关键事实 ``(类别, 投影后的值)``:``number`` 带单位的数字、``code`` 型号 / 编号类
+    字符串(字母数字混排、≥ 3 个字符,不含带单位的数字及其尾巴)。在原文上抽,分隔符还在,
+    「5g 乘号 10袋」 抽出 ``5g`` 和 ``10袋``、``2.5mg`` 里抽不出 ``1.5mg``。
+    引号里的短语不算(审查第二轮
+    MEDIUM-1:引号常是评委转述时加的)。"""
     numbers = unit_numbers(text)
     folded = _numbers_ready(text).lower()
     codes = [
@@ -186,20 +200,18 @@ def key_facts(text: str) -> list[tuple[str, str]]:
         if len(m.group(0)) >= _MIN_CODE
         and not any(n.endswith(quote_key(m.group(0))) for n in numbers)
     ]
-    quotes = [quote_key(m.group(1)) for m in _QUOTED.finditer(normalize_cjk(text))]
     facts = [("number", n) for n in numbers]
     facts += [("code", quote_key(c)) for c in codes]
-    facts += [("quote", q) for q in quotes if q]
     return list(dict.fromkeys(facts))
 
 
 __all__ = [
     "fact_positions",
     "fold_key",
-    "has_number",
     "key_facts",
     "normalize_cjk",
     "quote_key",
+    "quote_variants",
     "table_views",
     "unit_numbers",
 ]

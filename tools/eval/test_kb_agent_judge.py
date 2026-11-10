@@ -381,23 +381,42 @@ def test_no_source_needed_claims_are_neither_fabrication_nor_related_facts() -> 
     assert category_for("partial", verdict) == "只说没写"
 
 
-def test_a_pure_referral_without_saying_not_written_is_other_not_fabrication() -> None:
-    # 审查 H1:资料没写的题只回「建议咨询医生」、没说没写,判分把这句标成 core —— 没有事实性结论,
-    # 不是编造(旧尺子下也记「其它」)
-    referral = _claim("no_source_needed", claim="建议咨询医生或药师", core=True)
-    verdict = score_verdict(_raw([referral], refused=False), _PASSAGES)
+@pytest.mark.parametrize(
+    "claim",
+    [
+        "建议咨询医生或药师",
+        "回答建议用户「咨询专业医生」",
+        "可拨打24小时客服热线咨询",
+        "孕妇及3岁以下儿童请遵医嘱",
+        "建议在医生指导下使用COVID-19疫苗",
+        "可以一起吃",  # 结论本身被误标成「不需要出处」
+    ],
+)
+def test_a_core_claim_marked_as_needing_no_source_is_other_and_listed_for_review(
+    claim: str,
+) -> None:
+    # 审查第二轮 MEDIUM-1:资料没写的题没说没写、core 断言被标成「不需要出处」—— 不判编造,也不静默
+    # 判其它:记「其它」,verdict 里 core_unsourced 计数,进头条「待复核」
+    verdict = score_verdict(
+        _raw([_claim("no_source_needed", claim=claim, core=True)], refused=False), _PASSAGES
+    )
     assert category_for("no_answer", verdict) == "其它"
-    plain = score_verdict(_raw([{**referral, "core": False}], refused=False), _PASSAGES)
-    assert category_for("no_answer", plain) == "其它"
+    assert verdict["core_unsourced"] == 1
+    side = score_verdict(
+        _raw([_claim("no_source_needed", claim=claim, core=False)], refused=False), _PASSAGES
+    )
+    assert side["core_unsourced"] == 0
 
 
-def test_a_core_fact_mislabeled_as_needing_no_source_is_still_fabrication() -> None:
-    # 判分误标:带具体数字的结论本身被标成「不需要出处」,没说没写 —— 仍按编造记
-    core = _claim("no_source_needed", claim="每天可以吃2袋", core=True)
-    verdict = score_verdict(_raw([core], refused=False), _PASSAGES)
+@pytest.mark.parametrize("support", ["unsupported", "inferred_unlabeled"])
+def test_an_ungrounded_core_claim_on_a_no_answer_question_is_still_fabrication(
+    support: str,
+) -> None:
+    verdict = score_verdict(
+        _raw([_claim(support, claim="每天可以吃2袋")], refused=False), _PASSAGES
+    )
     assert category_for("no_answer", verdict) == "编造"
-    said_so = score_verdict(_raw([core], refused=True), _PASSAGES)
-    assert category_for("no_answer", said_so) == "正确说没写"
+    assert verdict["core_unsourced"] == 0
 
 
 def test_a_core_stated_claim_whose_quote_is_not_found_goes_to_review_not_fabrication() -> None:
@@ -433,7 +452,7 @@ def test_the_template_defines_the_new_supports_core_and_the_restatement_rule() -
 def test_the_scoring_rules_moved_past_the_veto_yardstick() -> None:
     from kb_agent_judge import SCORING_RULES, yardstick_of
 
-    assert SCORING_RULES == "2026-11-10.2"
+    assert SCORING_RULES == "2026-11-10.3"
     assert yardstick_of() != "2026-11-09.3+902042cf"
 
 
@@ -480,3 +499,55 @@ def test_a_quote_cannot_be_stitched_across_two_retrieved_passages() -> None:
 def test_a_quote_with_thousands_separators_matches_the_plain_number() -> None:
     raw = _raw([_claim("stated", "每粒含 1,000 毫克维生素")], refused=True)
     assert score_verdict(raw, "每粒含1000毫克维生素。")["related_facts"] == 1
+
+
+# ---------------------------------------------------------------------------
+# 审查第二轮 HIGH-1:数字 / 型号按原文抽出来比集合,不在压掉分隔符的投影上比边界
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("passages", "quote"),
+    [
+        # 一段末尾的数字后面紧跟下一段的标题
+        ("[D3#1] a.pdf\n本品每日用量5克\n\n---\n\n[D4#2] b.pdf\n其它内容", "本品每日用量5克"),
+        ("产品规格:每袋5g\u00d710袋,每盒售价98元。", "每袋5g\u00d710袋"),
+        ("服用方法:每日1次1袋,温水冲服。", "每日1次1袋,温水冲服"),
+        (
+            "| 项目 | 每100g | NRV% |\n|---|---|---|\n| 蛋白质 | 5g | 8% |\n| 钠 | 300mg | 15% |",
+            "蛋白质 5g 8%",
+        ),
+        ("每片含钙300mg,VD 5\u03bcg。", "每片含钙300mg"),
+        ("甲款型号KX-305,2盒起订。", "甲款型号KX-305"),
+    ],
+)
+def test_a_verbatim_quote_with_numbers_or_codes_is_found(passages: str, quote: str) -> None:
+    verdict = score_verdict(_raw([_claim("stated", quote)], refused=True), passages)
+    assert (verdict["related_facts"], verdict["quote_misses"]) == (1, 0)
+
+
+def test_another_dose_is_not_the_quoted_dose() -> None:
+    raw = _raw([_claim("stated", "甲片每片……1.5mg")], refused=True)
+    verdict = score_verdict(raw, "甲片每片含2.5mg,乙片每片含15mg。")
+    assert verdict["quote_misses"] == 1
+
+
+def test_a_partial_answer_quoting_a_nutrition_row_stays_style_b() -> None:
+    passages = "| 项目 | 每100g | NRV% |\n|---|---|---|\n| 蛋白质 | 5g | 8% |\n| 钠 | 300mg | 15% |"
+    claim = _claim("stated", "蛋白质 5g 8%", claim="每100g含蛋白质5g", core=False)
+    verdict = score_verdict(_raw([claim], refused=True), passages)
+    assert category_for("partial", verdict) == "B式作答"
+
+
+@pytest.mark.parametrize(
+    ("passages", "quote"),
+    [
+        ("产品规格:\n1. 5克装\n2. 10克装", "产品规格: 1. 5克装"),
+        ("产品规格:\n1. 5克装\n2. 10克装", "5克装 2. 10克装"),
+        ("用法:\n2、每天1袋温水冲服", "2、每天1袋温水冲服"),
+        ("注意:\n1、5岁以下儿童慎用", "1、5岁以下儿童慎用"),
+    ],
+)
+def test_list_numbers_in_a_quote_do_not_break_the_match(passages: str, quote: str) -> None:
+    verdict = score_verdict(_raw([_claim("stated", quote)], refused=True), passages)
+    assert (verdict["related_facts"], verdict["quote_misses"]) == (1, 0)

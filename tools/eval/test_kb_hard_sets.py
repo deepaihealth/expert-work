@@ -473,7 +473,7 @@ def test_a_restated_fact_about_another_named_object_does_not_count() -> None:
     assert flagged == [("h1", "fact_number")]
 
 
-def test_codes_and_quoted_phrases_are_checked_too() -> None:
+def test_codes_are_checked_too() -> None:
     texts = {
         "a.md": "# 合成\n\n甲款的型号是 KX-305,出厂编号另见铭牌。\n",
         "b.md": "# 目录(合成)\n\n甲款(型号 KX-305)在第三页。\n",
@@ -536,5 +536,32 @@ def test_a_code_inside_a_longer_code_is_not_the_same_code() -> None:
     _picked, _skipped, flagged = pick_hard_negatives([case], [], texts, n=3, seed=1)
     assert flagged == []
     texts["b.md"] += "甲款(型号 KX-305)在第五页。\n"
+    _picked, _skipped, flagged = pick_hard_negatives([case], [], texts, n=3, seed=1)
+    assert flagged == [("h1", "fact_code")]
+
+
+@pytest.mark.parametrize(
+    "restated",
+    [
+        "甲片规格:每片含活性成分1.5mg\u00d730片",
+        "甲片的活性成分每片1.5mg,2盒起订",
+    ],
+)
+def test_a_restated_dose_followed_by_more_numbers_is_still_found(restated: str) -> None:
+    # 审查第二轮 HIGH-1:投影后数字后面紧跟别的数字,旧的尾边界会漏掉答案还在库里的题
+    anchor = "甲片每片含活性成分1.5mg"
+    case = _answer_case("h1", "甲片每片多少", "a.md", anchor, "1.5mg")
+    texts = {"a.md": f"# 甲片(合成)\n\n{anchor}。\n", "b.md": f"# 合成\n\n{restated}。\n"}
+    _picked, _skipped, flagged = pick_hard_negatives([case], [], texts, n=3, seed=1)
+    assert flagged == [("h1", "fact_number")]
+
+
+def test_a_restated_code_followed_by_a_number_is_still_found() -> None:
+    # 审查第二轮 HIGH-1:「KX-305,2盒」投影成 kx-3052盒,旧的尾边界认不出型号
+    case = _answer_case("h1", "甲款型号", "a.md", "甲款的型号是KX-305", "KX-305")
+    texts = {
+        "a.md": "# 合成\n\n甲款的型号是 KX-305,出厂编号另见铭牌。\n",
+        "b.md": "# 订货(合成)\n\n甲款型号KX-305,2盒起订。\n",
+    }
     _picked, _skipped, flagged = pick_hard_negatives([case], [], texts, n=3, seed=1)
     assert flagged == [("h1", "fact_code")]

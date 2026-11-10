@@ -32,6 +32,7 @@ import sqlite3
 import sys
 from collections import Counter
 from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol, cast
 
@@ -40,9 +41,8 @@ sys.path.insert(0, str(Path(__file__).parent))
 from kb_agent_cost import Spend  # type: ignore[import-not-found]
 from kb_dataset import KbCase  # type: ignore[import-not-found]
 from kb_text_norm import (  # type: ignore[import-not-found]
-    has_number,
-    key_facts,
     quote_key,
+    quote_variants,
     table_views,
     unit_numbers,
 )
@@ -133,7 +133,7 @@ _JSON_RE = re.compile(r"\{.*\}", re.S)
 
 #: 归类 / 计分规则的版本:改了 :func:`score_verdict` / :func:`category_for` 的判法就升一下。
 #: 判分提示词的变化不用管,:func:`yardstick_of` 自动带上它的哈希。
-SCORING_RULES = "2026-11-10.2"
+SCORING_RULES = "2026-11-10.3"
 
 
 def yardstick_of(template: str = JUDGE_TEMPLATE, rules: str = SCORING_RULES) -> str:
@@ -214,27 +214,47 @@ def parse_verdict(raw: str) -> dict[str, Any]:
 _ELLIPSIS = re.compile("\u2026+|\\.{3,}|\u22ef+")
 
 
-def passage_keys(passages: str) -> tuple[str, ...]:
-    """引文核对的「资料」:每段资料(按 :data:`PASSAGE_SEP` 切开)的投影 + 每张表按行 / 按列
-    序列化后的投影(11-10)。分段投影:分隔符投影后会消失,整份一起投影会让引文跨段拼出来。"""
+@dataclass(frozen=True)
+class PassageIndex:
+    """引文核对的「资料」:``keys`` = 每段资料(按 :data:`PASSAGE_SEP` 切开)与每张表按行 / 按列
+    序列化后的投影(分段投影:分隔符投影后会消失,整份一起投影会让引文跨段拼出来);``numbers``
+    = 在这些**原文**上抽出来的带单位数字(审查第二轮 HIGH-1:在投影上比边界会漏)。"""
+
+    keys: tuple[str, ...]
+    numbers: frozenset[str]
+
+
+def passage_index(passages: str) -> PassageIndex:
     pieces = passages.split(PASSAGE_SEP)
-    return (
-        *(quote_key(p) for p in pieces),
-        *(quote_key(v) for p in pieces for v in table_views(p)),
+    views = [*pieces, *(v for p in pieces for v in table_views(p))]
+    return PassageIndex(
+        keys=tuple(quote_key(v) for v in views),
+        numbers=frozenset(n for v in views for n in unit_numbers(v)),
     )
 
 
-def _quote_status(quote: str, keys: Sequence[str], deleted_keys: Sequence[str]) -> str:
+def passage_keys(passages: str) -> tuple[str, ...]:
+    return passage_index(passages).keys
+
+
+def _quote_status(quote: str, index: PassageIndex, deleted_keys: Sequence[str]) -> str:
     """``found``:切出来的每段(≥ :data:`MIN_QUOTE_KEY_CHARS` 字)都在资料里,引文里带单位的数字
-    也都在;``unchecked``:空或每段都太短,核对不了;``deleted``:没找到的段对上了难负例被删掉的锚
-    (含改写,见 :func:`_matches_deleted`);``missed``:找不到。比对都过 ``quote_key`` 投影。"""
+    也都在资料的数字里;``unchecked``:空或每段都太短,核对不了;``deleted``:没找到的段对上了
+    难负例被删掉的锚(含改写,见 :func:`_matches_deleted`);``missed``:找不到。
+    引文比两遍(:func:`kb_text_norm.quote_variants`:原样 / 去掉任意位置的列表编号),
+    有一遍找到就算。"""
+    statuses = [_variant_status(v, index, deleted_keys) for v in quote_variants(quote)]
+    return "found" if "found" in statuses else statuses[0]
+
+
+def _variant_status(quote: str, index: PassageIndex, deleted_keys: Sequence[str]) -> str:
     pieces = [quote_key(p) for p in _ELLIPSIS.split(quote)]
     pieces = [p for p in pieces if len(p) >= MIN_QUOTE_KEY_CHARS]
-    missing = [p for p in pieces if not any(p in k for k in keys)]
+    missing = [p for p in pieces if not any(p in k for k in index.keys)]
     # 只看没找到的那几段(找到的段与被删句碰巧相同不算数)。
     if any(_matches_deleted(p, d) for p in missing for d in deleted_keys if d):
         return "deleted"
-    numbers = [n for n in unit_numbers(quote) if not any(has_number(n, k) for k in keys)]
+    numbers = set(unit_numbers(quote)) - index.numbers
     if missing or numbers:
         return "missed"
     return "found" if pieces else "unchecked"
@@ -291,10 +311,10 @@ def score_verdict(
             **raw,
             "parse_error": f"each claim needs a support in {sorted(SUPPORTS)} and a boolean core",
         }
-    keys = passage_keys(passages)
+    index = passage_index(passages)
     deleted_keys = [quote_key(d) for d in deleted]
     statuses = Counter(
-        _quote_status(str(c.get("quote") or ""), keys, deleted_keys)
+        _quote_status(str(c.get("quote") or ""), index, deleted_keys)
         for c in claims
         if c["support"] == "stated"
     )
@@ -305,7 +325,16 @@ def score_verdict(
         **raw,
         "fabricated": fabricated,
         "inferred_extra": sum(1 for c in claims if not c["core"] and c["support"] in UNGROUNDED),
-        "core_ungrounded": sum(1 for c in claims if _ungrounded_core_fact(c)),
+        "core_ungrounded": sum(
+            1
+            for c in claims
+            if c["core"] and c["support"] not in CORE_GROUNDED | {"no_source_needed"}
+        ),
+        # 审查第二轮 MEDIUM-1:core 断言被标成「不需要出处」—— 转介还是误标的结论,代码分不出;
+        # 不判编造,列进「待复核」给人看
+        "core_unsourced": sum(
+            1 for c in claims if c["core"] and c["support"] == "no_source_needed"
+        ),
         "related_facts": statuses["found"],
         "quote_misses": statuses["missed"],
         "quote_unchecked": statuses["unchecked"],
@@ -315,23 +344,15 @@ def score_verdict(
     }
 
 
-def _ungrounded_core_fact(claim: Mapping[str, Any]) -> bool:
-    """结论本身、又没有依据的事实性结论(编造的第三种,审查 H1)。``no_source_needed`` 不算 ——
-    纯转介 / 提示(「建议咨询医生」)不是事实;但标成 ``no_source_needed`` 的结论里带着具体数字、
-    型号或引号短语(模板说这种不能标不需要出处),是判分误标,仍算。"""
-    if not claim["core"] or claim["support"] in CORE_GROUNDED:
-        return False
-    if claim["support"] != "no_source_needed":
-        return True
-    return bool(key_facts(str(claim.get("claim") or "")))
-
-
 def category_for(label: str, verdict: Mapping[str, Any]) -> str:
     """一次判分的类别(:data:`CATEGORIES`)。``verdict`` 是 :func:`score_verdict` 的结果。
 
     编造只有三种(11-10):任何 ``contradicted`` / ``misattributed``;结论本身 ``unsupported`` /
-    ``inferred_unlabeled``(都在 ``fabricated`` 里);资料没写的题没说没写、又有没依据的事实性
-    结论本身(:func:`_ungrounded_core_fact`;纯转介记「其它」,``stated`` 但引文对不上只进待复核)。
+    ``inferred_unlabeled``(都在 ``fabricated`` 里);资料没写的题没说没写、结论本身又没依据(依据
+    不在 ``stated`` / ``inferred_labeled`` / ``general_labeled`` / ``no_source_needed`` 里)。
+    core 断言
+    标成 ``no_source_needed`` 的(转介,或判分把结论误标)记「其它」、计 ``core_unsourced`` 进待复核;
+    ``stated`` 但引文对不上的只进待复核。
     另保留「引文对上难负例被删句」。本来合格、只是夹带了旁支推断的记 :data:`CARRYING`。"""
     if "parse_error" in verdict:
         return FAILED

@@ -8,8 +8,8 @@ import unicodedata
 import pytest
 from kb_cjk_radicals import RADICAL_TO_UNIFIED  # type: ignore[import-not-found]
 from kb_text_norm import (  # type: ignore[import-not-found]
+    fact_positions,
     fold_key,
-    has_number,
     key_facts,
     normalize_cjk,
     quote_key,
@@ -74,10 +74,13 @@ def test_unit_numbers_pick_numbers_with_units() -> None:
     assert got == ["10g", "2袋", "60c", "5%", "5岁"]
 
 
-def test_has_number_does_not_match_inside_a_longer_number() -> None:
-    assert has_number("5岁", quote_key("15岁以上")) is False
-    assert has_number("5岁", quote_key("5岁以上"))
-    assert has_number("0.5g", quote_key("每份10.5g")) is False
+def test_a_number_is_not_found_inside_a_longer_number() -> None:
+    assert ("number", "5岁") not in key_facts("15岁以上")
+    assert ("number", "5岁") in key_facts("5岁以上")
+    assert ("number", "0.5g") not in key_facts("每份10.5g")
+    # 定位窗口只看前边界
+    assert fact_positions("number", "5岁", quote_key("15岁以上")) == []
+    assert fact_positions("number", "5g", quote_key("5g\u00d710袋")) == [0]
 
 
 @pytest.mark.parametrize(
@@ -85,7 +88,6 @@ def test_has_number_does_not_match_inside_a_longer_number() -> None:
     [
         ("一盒 15 袋,每天 1 袋", "number", "15袋"),
         ("型号是 KX-305 的那款", "code", "kx-305"),
-        ("说明书写的是「不宜空腹」", "quote", "不宜空腹"),
         ("证书编号 ZL201911234", "code", "zl201911234"),
     ],
 )
@@ -103,8 +105,8 @@ def test_a_number_with_a_unit_is_not_also_a_code() -> None:
 
 
 def test_thousands_separators_are_dropped_before_extracting_numbers() -> None:
-    assert unit_numbers("每粒含1,000毫克,每盒 2\uff0c500mg") == ["1000毫克", "2500mg"]
-    assert has_number("1000毫克", quote_key("含 1,000 毫克"))
+    assert unit_numbers("每粒含1,000毫克,每盒 2,500mg") == ["1000毫克", "2500mg"]
+    assert key_facts("含 1,000 毫克") == [("number", "1000毫克")]
     assert key_facts("1,000毫克") == [("number", "1000毫克")]
 
 
@@ -113,12 +115,39 @@ def test_a_decimal_number_does_not_yield_a_fake_code() -> None:
     assert key_facts("规格 1.5mg/片,型号 KX-305") == [("number", "1.5mg"), ("code", "kx-305")]
 
 
-def test_number_matching_has_a_trailing_boundary() -> None:
-    assert has_number("10g", quote_key("容量10gb")) is False
-    assert has_number("10g", quote_key("每份10g,"))
+def test_numbers_are_read_off_the_text_before_separators_are_dropped() -> None:
+    # 审查第二轮 HIGH-1:在原文上抽,分隔符还在
+    assert unit_numbers("每袋5g\u00d710袋") == ["5g", "10袋"]
+    assert unit_numbers("每日1次1袋") == ["1次", "1袋"]
+    assert unit_numbers("钙300mg,VD 5\u03bcg") == ["300mg", "5\u03bcg"]
+    assert key_facts("型号KX-305,2盒") == [("number", "2盒"), ("code", "kx-305")]
+    assert unit_numbers("容量10gb") == []
 
 
 def test_list_numbering_is_not_read_as_a_decimal_point() -> None:
     assert quote_key("1. 5克装每盒") == "5克装每盒"
     assert quote_key("说明\n2. 每天1袋") == "说明每天1袋"
     assert quote_key("规格1.5克") == "规格1.5克"
+
+
+def test_quoted_phrases_are_not_key_facts() -> None:
+    # 审查第二轮 MEDIUM-1:引号是评委转述时加的,不是回答里的事实
+    assert key_facts("说明书写的是「不宜空腹」") == []
+
+
+def test_only_well_formed_half_width_thousands_are_merged() -> None:
+    assert unit_numbers("共1,000,000袋") == ["1000000袋"]
+    assert unit_numbers("每瓶1,000毫升") == ["1000毫升"]
+    # 全角逗号是列举,不是千分位
+    assert unit_numbers("规格100\uff0c200\uff0c500毫升") == ["500毫升"]
+    assert unit_numbers("12,34克") == ["34克"]
+
+
+def test_list_numbers_after_the_ideographic_comma_need_no_space() -> None:
+    assert quote_key("用法\n2、每天1袋") == "用法每天1袋"
+    assert unit_numbers("1、5岁以下儿童慎用") == ["5岁"]
+
+
+def test_an_ellipsis_before_a_number_does_not_hide_it() -> None:
+    assert unit_numbers("甲片每片……1.5mg") == ["1.5mg"]
+    assert unit_numbers("每天...2袋") == ["2袋"]

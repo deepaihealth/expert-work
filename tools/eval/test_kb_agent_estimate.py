@@ -322,3 +322,27 @@ def test_rejudge_cli_estimates_each_file_without_any_call(
     assert "b.jsonl | 4 题 | 判分 4 次" in out
     assert "合计 8 题 / 16 次" in out
     assert no_network == []
+
+
+def test_history_leaves_out_rows_the_recheck_did_not_score(tmp_path: Path) -> None:
+    path = _history_file(tmp_path)
+    unscored = {
+        "case_id": "x1",
+        "question": "问",
+        "answer": None,
+        "searches": [],
+        "reads": [],
+        "category": "excluded_answer_still_present",
+        "cost_cny": {"answer": 0.0, "judge": 0.05},
+        "answer_model": "glm-5.3",
+        "judge_model": "deepseek-v4-pro",
+    }
+    failed = {**unscored, "case_id": "x2", "category": "excluded_recheck_search_failed"}
+    with path.open("a", encoding="utf-8") as fh:
+        fh.write(json.dumps(unscored, ensure_ascii=False) + "\n")
+        fh.write(json.dumps(failed, ensure_ascii=False) + "\n")
+    h = history_from(path)
+    assert h.questions == 4
+    assert h.answer_cny_per_q == pytest.approx(0.2)
+    rest = 10 + 90 + 400
+    assert h.input_ratio == pytest.approx((_NEW_TEMPLATE + rest) / (OLD_TEMPLATE_CHARS + rest))

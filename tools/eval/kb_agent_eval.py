@@ -90,6 +90,7 @@ from kb_agent_cost import (  # type: ignore[import-not-found]
 )
 from kb_agent_judge import (  # type: ignore[import-not-found]
     DEFAULT_JUDGE_VOTES,
+    RECHECK_FAILED,
     JudgeCache,
     decide,
     judge_prompt,
@@ -288,7 +289,8 @@ def done_case_ids(
                     f"{path} has a row with {key}={row.get(key)!r}, this run is {value!r}; "
                     "use another --out"
                 )
-    return {row["case_id"] for row in rows}
+    # 复核检索失败的题不算做完:续跑时重新复核(审查第二轮)
+    return {row["case_id"] for row in rows if row.get("category") != RECHECK_FAILED}
 
 
 def run_kind_of(args: argparse.Namespace) -> str:
@@ -710,6 +712,7 @@ async def _recheck(
         "checked": len(checks),
         "excluded": sorted(gone),
         "search_errors": sorted(failed),
+        "search_error_reasons": {cid: checks[cid]["search_error"] for cid in sorted(failed)},
         "stopped_by_budget": stopped,
     }
     if stopped:  # 操作者写了 stop:后面的题都不答(没复核的难负例不能直接答)

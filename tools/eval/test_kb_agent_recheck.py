@@ -181,7 +181,7 @@ async def test_a_failed_search_is_recorded_and_not_judged(tmp_path: Path) -> Non
     judge = _Judge({"甲款": [_yes(True)], "乙款": [_yes(True)]})
     result = await _recheck(tmp_path, judge, _BrokenSearch(), votes=1)
     assert judge.prompts == []
-    assert result["hn-a"]["search_error"] is True and result["hn-a"]["excluded"] is False
+    assert result["hn-a"]["search_error"] == "exception" and result["hn-a"]["excluded"] is False
 
 
 @pytest.mark.asyncio
@@ -195,3 +195,31 @@ async def test_the_recheck_stops_when_admission_is_refused(tmp_path: Path) -> No
 
     result = await _recheck(tmp_path, judge, _Search(), votes=1, admit=admit)
     assert sorted(k for k in result if k.startswith("hn-")) == ["hn-a"]
+
+
+class _DegradedSearch(_Search):
+    def __init__(self, meta: dict[str, Any]) -> None:
+        super().__init__()
+        self.meta = meta
+
+    async def call(self, args: Mapping[str, Any], *, ctx: ToolContext) -> ToolResult:
+        return ToolResult(content="[D1#1] 段落", meta={"status": "ok", **self.meta})
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("meta", "reason"),
+    [
+        ({"embedding_degraded": True}, "embedding_degraded"),
+        ({"keyword_degraded": True}, "keyword_degraded"),
+        ({"unsearched": 1}, "unsearched"),
+    ],
+)
+async def test_a_degraded_recheck_search_counts_as_a_failed_recheck(
+    tmp_path: Path, meta: dict[str, Any], reason: str
+) -> None:
+    # 审查第二轮:检索降级 / 有库没检索到时取到的段落不全,判「答不了」不可信
+    judge = _Judge({"甲款": [_yes(False)], "乙款": [_yes(False)]})
+    result = await _recheck(tmp_path, judge, _DegradedSearch(meta), votes=1)
+    assert judge.prompts == []
+    assert result["hn-a"]["search_error"] == reason and result["hn-a"]["excluded"] is False

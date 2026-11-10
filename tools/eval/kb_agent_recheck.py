@@ -85,16 +85,26 @@ def parse_recheck(raw: str) -> bool | None:
     return value if isinstance(value, bool) else None
 
 
-async def _passages(search: _Search, question: str, *, k: int, tenant_id: UUID) -> str | None:
-    """检索结果文本;检索报错时 None(审查 L1:这题复核不了,不判、不计分)。"""
+#: 复核检索降级的这几种情况取到的段落不全,判「答不了」不可信,按复核失败处理(审查第二轮)。
+DEGRADED_META = ("embedding_degraded", "keyword_degraded", "unsearched")
+
+
+async def _passages(
+    search: _Search, question: str, *, k: int, tenant_id: UUID
+) -> tuple[str, str | None]:
+    """``(检索结果文本, 失败原因)``;检索报错(``exception``)或降级(:data:`DEGRADED_META`)时
+    原因非空:这题复核不了,不判、不计分(审查 L1)。"""
     try:
         result = await search.call(
             {"query": question, "limit": k}, ctx=ToolContext(tenant_id=tenant_id)
         )
     except Exception as exc:
         print(f"WARNING recheck search failed for {question!r}: {exc}", file=sys.stderr)
-        return None
-    return str(result.content or "")
+        return "", "exception"
+    degraded = next((m for m in DEGRADED_META if result.meta.get(m)), None)
+    if degraded is not None:
+        print(f"WARNING recheck search degraded for {question!r}: {degraded}", file=sys.stderr)
+    return str(result.content or ""), degraded
 
 
 async def recheck_hard_negatives(
@@ -112,17 +122,17 @@ async def recheck_hard_negatives(
     admit: Callable[[], Awaitable[bool]] | None = None,
 ) -> dict[str, dict[str, Any]]:
     """题号 → ``{"excluded", "search_error", "votes", "cost_cny", "k"}``;``excluded`` = 严格多数票
-    判为能答,``search_error`` = 复核检索报错(没判)。``admit``(预算闸门)每题前问一次,不放行就停,
-    后面的题不在结果里。"""
+    判为能答,``search_error`` = 复核检索报错 / 降级的原因(没判;正常时 False)。
+    ``admit``(预算闸门)每题前问一次,不放行就停,后面的题不在结果里。"""
     out: dict[str, dict[str, Any]] = {}
     for case in cases:
         if admit is not None and not await admit():
             break
-        passages = await _passages(search, case.query, k=k, tenant_id=tenant_id)
-        if passages is None:
+        passages, failure = await _passages(search, case.query, k=k, tenant_id=tenant_id)
+        if failure is not None:
             out[case.id] = {
                 "excluded": False,
-                "search_error": True,
+                "search_error": failure,
                 "votes": [],
                 "cost_cny": 0.0,
                 "k": k,

@@ -109,6 +109,8 @@ class History:
 
 def history_from(path: Path) -> History:
     rows, runs = read_results(path)
+    # 复核剔除 / 失败的题没答题,不进每题的平均(审查第二轮)
+    rows = [r for r in rows if r.get("category") not in UNSCORED]
     if not rows:
         raise SystemExit(f"{path}: no result rows to estimate from")
     n = len(rows)
@@ -129,11 +131,7 @@ def history_from(path: Path) -> History:
         input_ratio=statistics.fmean(ratios),
         answer_model=str(rows[0].get("answer_model")),
         judge_model=str(rows[0].get("judge_model")),
-        prompt_chars=statistics.fmean(
-            OLD_TEMPLATE_CHARS + rest(r) for r in rows if r.get("category") not in UNSCORED
-        )
-        if any(r.get("category") not in UNSCORED for r in rows)
-        else float(OLD_TEMPLATE_CHARS),
+        prompt_chars=statistics.fmean(OLD_TEMPLATE_CHARS + rest(r) for r in rows),
     )
 
 

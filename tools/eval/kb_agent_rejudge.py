@@ -189,11 +189,12 @@ def done_ids(path: Path, *, judge_model: str, votes: int, source: str, run_kind:
         if row.get("category") not in UNSCORED:
             wanted["judge_model"] = judge_model
         for key, value in wanted.items():
-            got = (
-                (row.get("rejudged_from") or {}).get("file")
-                if key == "rejudged_from"
-                else row.get(key)
-            )
+            if key == "rejudged_from":
+                got = (row.get("rejudged_from") or {}).get("file")
+            elif key == "run_kind":  # #2067 之前的行没有 run_kind(审查第二轮 MEDIUM-2)
+                got = row.get("run_kind") or "standard"
+            else:
+                got = row.get(key)
             if got != value:
                 raise SystemExit(
                     f"{path} has a row with {key}={got!r}, this rejudge is {value!r}; "
@@ -215,6 +216,7 @@ async def rejudge_rows(
     votes: int,
     spend: Spend,
     source: str,
+    run_kind: str = "standard",
     budget: float = float("inf"),
     concurrency: int = 4,
     cache_verdicts: bool = True,
@@ -247,7 +249,12 @@ async def rejudge_rows(
             "category": row.get("category"),
             "cost_cny": row.get("cost_cny"),
         }
-        meta = {"yardstick": YARDSTICK, "judge_votes": votes, "rejudged_from": was}
+        meta = {
+            "yardstick": YARDSTICK,
+            "judge_votes": votes,
+            "run_kind": run_kind,
+            "rejudged_from": was,
+        }
         if row.get("category") in UNSCORED:
             # 不重判:这次没花钱(审查 L7),原来的花费留在 rejudged_from
             return {**row, **meta, "cost_cny": {"answer": 0.0, "judge": 0.0}}
@@ -351,9 +358,9 @@ async def amain(args: argparse.Namespace) -> int:
         judge_model = DRY_MODEL
     else:
         judge_model = args.judge_model
-    done = done_ids(
-        out, judge_model=judge_model, votes=votes, source=args.source.name, run_kind=run_kind
-    )
+    # 源文件按解析后的完整路径记:不同目录的同名文件不能续写到一个 --out
+    source = str(args.source.resolve())
+    done = done_ids(out, judge_model=judge_model, votes=votes, source=source, run_kind=run_kind)
     todo = [r for r in rows if str(r["case_id"]) not in done]
     gold = rows_gold(todo)
     if gold is None:
@@ -383,7 +390,8 @@ async def amain(args: argparse.Namespace) -> int:
             out=out,
             votes=votes,
             spend=spend,
-            source=args.source.name,
+            source=source,
+            run_kind=run_kind,
             budget=args.budget,
             concurrency=args.concurrency,
             cache_verdicts=not args.dry,
@@ -427,7 +435,7 @@ async def amain(args: argparse.Namespace) -> int:
         "judge_model": judge_model,
         "judge_votes": votes,
         "rejudge": {
-            "source": args.source.name,
+            "source": source,
             "source_yardstick": sorted({str(r.get("yardstick")) for r in rows}),
             "yardstick": YARDSTICK,
             "run_kind": run_kind,

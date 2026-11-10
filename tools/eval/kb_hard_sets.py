@@ -15,9 +15,9 @@
 * 删掉的句子里不能含任何对照题的锚(否则对照题自己变成没答案);
 * 锚在语料里一处都找不到的不选(删不掉 = 题没变);有一处删不干净(跨的句子太多)的也不选。
 * **删后穷尽核对**(11-10,参考 CRUMQs / hermes-agent 造负例时逐个核对):对删过的整份语料,
-  参考答案里的关键事实(带单位的数字、型号 / 编号、引号里的短语,见 ``kb_text_norm.key_facts``;
+  参考答案里的关键事实(带单位的数字、型号 / 编号,见 ``kb_text_norm.key_facts``;
   没有文字答案就取被删的锚)换个说法、在别的文档或表格行里还在的,记「疑似仍可答」,默认剔除,
-  spec 的 ``excluded`` 只记题号和原因码(``fact_number`` / ``fact_code`` / ``fact_quote``)。
+  spec 的 ``excluded`` 只记题号和原因码(``fact_number`` / ``fact_code``)。
   「还在」= 事实所在的那一句 / 表格行里,事实前后各一个锚长的窗口有 ≥ :data:`RESTATED_SHARE` 的锚用字
   (在复述同一件事,不是别处碰巧同一个数);问句点了对象名(取自期望文档名)时,文档名或那一句里
   还得有这个对象(别的产品的同一句是另一个对象的事实)。
@@ -276,17 +276,18 @@ RESTATED_SHARE = 0.6
 
 
 class _DeletedCorpus:
-    """删后穷尽核对用的语料视图:每份文档的投影(整份 + 逐句 / 表格行)。没被删句动到的文档用
-    原文的(只算一次),动到的按这次累计的锚现删(按文档里实际含的那几条锚缓存)。"""
+    """删后穷尽核对用的语料视图:每份文档逐句 / 表格行的投影,以及在**原文**上抽出来的关键事实
+    (审查第二轮 HIGH-1:投影压掉了分隔符,在投影上比边界会漏)。没被删句动到的文档用原文的
+    (只算一次),动到的按这次累计的锚现删(按文档里实际含的那几条锚缓存)。"""
 
     def __init__(self, texts: Mapping[str, str]) -> None:
         self.texts = texts
         self.folded = {name: fold_key(text) for name, text in texts.items()}
         self.names = {name: quote_key(name) for name in texts}
         self.base = {name: _projected(text) for name, text in texts.items()}
-        self.cache: dict[tuple[str, tuple[str, ...]], tuple[str, list[str]]] = {}
+        self.cache: dict[tuple[str, tuple[str, ...]], _Projected] = {}
 
-    def views(self, anchors: Sequence[str]) -> dict[str, tuple[str, list[str]]]:
+    def views(self, anchors: Sequence[str]) -> dict[str, _Projected]:
         keys = {a: fold_key(a) for a in anchors}
         out = dict(self.base)
         for name, folded in self.folded.items():
@@ -312,11 +313,13 @@ class _DeletedCorpus:
         width = max((len(quote_key(a)) for a in anchors), default=0)
         own = {e.document for e in case.expected}
         named = [quote_key(x) for x in entity_names(own) if x in case.query]
-        for name, (whole, units) in self.views(trial).items():
+        for name, doc in self.views(trial).items():
             for kind, value in facts:
-                if not fact_positions(kind, value, whole):
+                if (kind, value) not in doc.facts:
                     continue
-                for unit in units:
+                for unit, unit_facts in doc.units:
+                    if (kind, value) not in unit_facts:
+                        continue
                     if named and not any(x in unit or x in self.names[name] for x in named):
                         continue
                     if any(
@@ -327,9 +330,19 @@ class _DeletedCorpus:
         return None
 
 
-def _projected(text: str) -> tuple[str, list[str]]:
-    units = [quote_key(u) for u in split_units(text)]
-    return "".join(units), [u for u in units if u]
+@dataclass(frozen=True)
+class _Projected:
+    #: 整份文档的关键事实(先筛文档)。
+    facts: frozenset[tuple[str, str]]
+    #: 每句 / 表格行:``(投影, 在这一句原文上抽出来的关键事实)``。
+    units: tuple[tuple[str, frozenset[tuple[str, str]]], ...]
+
+
+def _projected(text: str) -> _Projected:
+    units = tuple(
+        (quote_key(u), frozenset(key_facts(u))) for u in split_units(text) if quote_key(u)
+    )
+    return _Projected(facts=frozenset().union(*(f for _k, f in units)), units=units)
 
 
 def _restated(window: str, anchor_sets: Sequence[set[str]]) -> bool:
