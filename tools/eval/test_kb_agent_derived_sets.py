@@ -10,10 +10,10 @@ import json
 from pathlib import Path
 from typing import Any
 
+import kb_agent_eval  # type: ignore[import-not-found]
 import pytest
 import yaml
 from kb_agent_cases import select_cases  # type: ignore[import-not-found]
-from kb_agent_eval import ANSWER_ENV, JUDGE_ENV, main  # type: ignore[import-not-found]
 from kb_agent_models import FakeModels  # type: ignore[import-not-found]
 from kb_corpus_inventory import MANIFEST_FIELDS  # type: ignore[import-not-found]
 from kb_dataset import load_dataset  # type: ignore[import-not-found]
@@ -111,7 +111,7 @@ def _lines(tmp_path: Path) -> tuple[list[dict[str, Any]], dict[str, Any]]:
 
 @pytest.fixture(autouse=True)
 def _no_endpoints(monkeypatch: pytest.MonkeyPatch) -> None:
-    for name in (*ANSWER_ENV, *JUDGE_ENV):
+    for name in (*kb_agent_eval.ANSWER_ENV, *kb_agent_eval.JUDGE_ENV):
         monkeypatch.delenv(name, raising=False)
 
 
@@ -123,7 +123,7 @@ def test_distractors_join_the_standard_run_as_their_own_set(tmp_path: Path) -> N
     left_out = sorted(c.id for ds in sets for c in ds.cases if "named" in c.id)
     expected = [i for i in left_out if i not in sampled]
     assert expected  # 这组数据下至少有一道,否则本用例测不到东西
-    assert main(argv) == 0
+    assert kb_agent_eval.main(argv) == 0
     rows, run = _lines(tmp_path)
     distractors = [r for r in rows if r["set"] == "distractor"]
     assert sorted(r["case_id"] for r in distractors) == expected
@@ -133,7 +133,7 @@ def test_distractors_join_the_standard_run_as_their_own_set(tmp_path: Path) -> N
 
 
 def test_no_distractors_when_turned_off(tmp_path: Path) -> None:
-    assert main([*_corpus(tmp_path), "--distractors", "0"]) == 0
+    assert kb_agent_eval.main([*_corpus(tmp_path), "--distractors", "0"]) == 0
     rows, run = _lines(tmp_path)
     assert not [r for r in rows if r["set"] == "distractor"] and run["distractors"] == 0
 
@@ -152,7 +152,7 @@ def test_hard_negative_run_deletes_the_answer_sentence_and_keeps_the_controls(
     tmp_path: Path,
 ) -> None:
     argv = _corpus(tmp_path)
-    assert main([*argv, "--hard-negatives", str(_spec(tmp_path, _GONE))]) == 0
+    assert kb_agent_eval.main([*argv, "--hard-negatives", str(_spec(tmp_path, _GONE))]) == 0
     rows, run = _lines(tmp_path)
     [hn] = [r for r in rows if r["set"] == "hard_negative"]
     assert hn["case_id"] == "hn-unit_kb-noise" and hn["label"] == "no_answer"
@@ -179,7 +179,7 @@ def test_a_spec_that_deletes_a_control_answer_stops_the_run(
     assert hit  # 抽样里有点名题,它们的答案正是被删的这句
     # 11-09 评审:伤到对照题就停,不是打个 WARNING 接着花钱
     with pytest.raises(SystemExit, match="removes control answers"):
-        main([*argv, "--hard-negatives", str(_spec(tmp_path, _DELETE))])
+        kb_agent_eval.main([*argv, "--hard-negatives", str(_spec(tmp_path, _DELETE))])
     assert not (tmp_path / "agent.jsonl").exists() or not [
         line for line in (tmp_path / "agent.jsonl").read_text().splitlines() if "case_id" in line
     ]
@@ -193,7 +193,7 @@ def test_hard_negatives_and_distractors_are_separate_runs(
     spec.write_text("cases: []\n", encoding="utf-8")
     argv = [*_corpus(tmp_path), "--hard-negatives", str(spec), "--distractors", "3"]
     with pytest.raises(SystemExit):
-        main(argv)
+        kb_agent_eval.main(argv)
     assert "--hard-negatives" in capsys.readouterr().err
 
 
@@ -211,24 +211,24 @@ def test_the_judge_is_told_about_the_near_miss_and_the_deleted_text(
 
     monkeypatch.setattr(FakeModels, "judge", spy)
     argv = _corpus(tmp_path)
-    assert main([*argv, "--distractors", "5"]) == 0
+    assert kb_agent_eval.main([*argv, "--distractors", "5"]) == 0
     named = [p for q, p in prompts.items() if q.startswith("甲一的额定流量")]
     assert any("名字相近的「甲二」" in p for p in named)
     (tmp_path / "agent.jsonl").unlink()
-    assert main([*argv, "--hard-negatives", str(_spec(tmp_path, _GONE))]) == 0
+    assert kb_agent_eval.main([*argv, "--hard-negatives", str(_spec(tmp_path, _GONE))]) == 0
     assert "已从资料里删掉" in prompts["甲一运行时噪音多大?"]
     assert _GONE in prompts["甲一运行时噪音多大?"]
 
 
 def test_the_cli_will_not_resume_into_another_vote_count_or_run(tmp_path: Path) -> None:
     argv = [*_corpus(tmp_path), "--distractors", "0"]
-    assert main(argv) == 0
-    assert main(argv) == 0  # 同一轮续跑:没做完的题补上,不报错
+    assert kb_agent_eval.main(argv) == 0
+    assert kb_agent_eval.main(argv) == 0  # 同一轮续跑:没做完的题补上,不报错
     with pytest.raises(SystemExit, match="judge_votes"):
-        main([*argv, "--judge-votes", "1"])
+        kb_agent_eval.main([*argv, "--judge-votes", "1"])
     hn = [a for a in argv if a not in ("--distractors", "0")]
     with pytest.raises(SystemExit, match="run_kind"):
-        main([*hn, "--hard-negatives", str(_spec(tmp_path, _GONE))])
+        kb_agent_eval.main([*hn, "--hard-negatives", str(_spec(tmp_path, _GONE))])
 
 
 def test_deleted_text_still_found_after_ingest_stops_the_run(
@@ -239,14 +239,12 @@ def test_deleted_text_still_found_after_ingest_stops_the_run(
 
     monkeypatch.setattr("kb_agent_cases.store_residue", still_there)
     with pytest.raises(SystemExit, match="not usable"):
-        main([*_corpus(tmp_path), "--hard-negatives", str(_spec(tmp_path, _GONE))])
+        kb_agent_eval.main([*_corpus(tmp_path), "--hard-negatives", str(_spec(tmp_path, _GONE))])
 
 
 def test_the_deleted_anchors_reach_the_judge_scoring(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    import kb_agent_eval
-
     seen: dict[str, Any] = {}
     real = kb_agent_eval.run_questions
 
@@ -255,7 +253,10 @@ def test_the_deleted_anchors_reach_the_judge_scoring(
         return int(await real(**kwargs))
 
     monkeypatch.setattr(kb_agent_eval, "run_questions", spy)
-    assert main([*_corpus(tmp_path), "--hard-negatives", str(_spec(tmp_path, _GONE))]) == 0
+    assert (
+        kb_agent_eval.main([*_corpus(tmp_path), "--hard-negatives", str(_spec(tmp_path, _GONE))])
+        == 0
+    )
     assert seen["deleted"] == {"hn-unit_kb-noise": (_GONE,)}
 
 
@@ -264,8 +265,6 @@ def test_a_control_without_a_gold_passage_only_warns(
 ) -> None:
     # 11-09 复审:对照题取不到含答案段落,在没删句的标准库上也会发生(锚跨段落边界);删句没删掉
     # 对照答案已由解析器逐文档核过(ControlAnchorDeletedError),这里只警告、列出题号,不停
-    import kb_agent_eval
-
     real = kb_agent_eval.gold_passages
 
     async def one_missing(*args: Any, **kwargs: Any) -> dict[str, list[str]]:
@@ -274,7 +273,10 @@ def test_a_control_without_a_gold_passage_only_warns(
         return gold
 
     monkeypatch.setattr(kb_agent_eval, "gold_passages", one_missing)
-    assert main([*_corpus(tmp_path), "--hard-negatives", str(_spec(tmp_path, _GONE))]) == 0
+    assert (
+        kb_agent_eval.main([*_corpus(tmp_path), "--hard-negatives", str(_spec(tmp_path, _GONE))])
+        == 0
+    )
     _rows, run = _lines(tmp_path)
     assert run["hard_negatives"]["controls_without_gold"] == ["unit_kb-a0"]
     assert "WARNING" in capsys.readouterr().err
@@ -283,13 +285,12 @@ def test_a_control_without_a_gold_passage_only_warns(
 def test_the_run_row_records_which_production_prompt_parts_were_active(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    import kb_agent_eval
     from kb_agent_prod_prompt import (  # type: ignore[import-not-found]
         ProductionPrompt,
         load_production_prompt,
     )
 
-    assert main([*_corpus(tmp_path), "--distractors", "0"]) == 0
+    assert kb_agent_eval.main([*_corpus(tmp_path), "--distractors", "0"]) == 0
     _rows, run = _lines(tmp_path)
     # 本分支上产品代码有哪几段就记哪几段(main 上没有 #2066:空)
     here = load_production_prompt(["knowledge_search", "knowledge_read"]).parts
@@ -299,6 +300,6 @@ def test_the_run_row_records_which_production_prompt_parts_were_active(
     monkeypatch.setattr(kb_agent_eval, "load_production_prompt", lambda names: with_parts)
     other = tmp_path / "other"
     other.mkdir()
-    assert main([*_corpus(other), "--distractors", "0"]) == 0
+    assert kb_agent_eval.main([*_corpus(other), "--distractors", "0"]) == 0
     _rows, run = _lines(other)
     assert run["prod_prompt_parts"] == ["answer_check", "outgoing_reference"]

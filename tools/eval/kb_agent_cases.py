@@ -4,7 +4,6 @@
 from __future__ import annotations
 
 import argparse
-import random
 import sys
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
@@ -14,7 +13,7 @@ from uuid import UUID
 
 sys.path.insert(0, str(Path(__file__).parent))
 
-from kb_dataset import KbCase, KbDataset  # type: ignore[import-not-found]
+from kb_dataset import KbCase, KbDataset, select_cases  # type: ignore[import-not-found]
 from kb_eval import (  # type: ignore[import-not-found]
     _all_chunk_texts,
     _basename,
@@ -34,8 +33,6 @@ from kb_metrics import anchor_in, anchor_key  # type: ignore[import-not-found]
 from expert_work.persistence import KnowledgeStore
 from expert_work.protocol import DocumentStatus
 
-SEED = 20261018
-N_ANSWERABLE_PER_SET = 15
 #: B-206 11-09:标准一轮里另加几道近名干扰题(有答案)。
 DEFAULT_DISTRACTORS = 15
 #: 判分时每题最多给几段「含答案的完整段落」。
@@ -45,18 +42,6 @@ GOLD_PASSAGES = 2
 # ---------------------------------------------------------------------------
 # 选题 / 判分
 # ---------------------------------------------------------------------------
-
-
-def select_cases(main: KbDataset, chat: KbDataset) -> list[tuple[str, KbCase]]:
-    """两个集各取全部无答案题 + 固定种子抽 :data:`N_ANSWERABLE_PER_SET` 道有答案题。"""
-    rng = random.Random(SEED)  # noqa: S311 - a fixed, reproducible sample
-    picked: list[tuple[str, KbCase]] = []
-    for label, dataset in (("main", main), ("chat", chat)):
-        no_answer = [c for c in dataset.cases if not c.expected]
-        answerable = [c for c in dataset.cases if c.expected]
-        picked += [(label, c) for c in no_answer]
-        picked += [(label, c) for c in rng.sample(answerable, N_ANSWERABLE_PER_SET)]
-    return picked
 
 
 async def gold_passages(

@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import csv
+import random
 from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -257,3 +258,20 @@ __all__ = [
     "check_corpus",
     "load_dataset",
 ]
+
+
+#: B-206 智能体层评测的固定抽样(放这里而不是 kb_agent_cases,免得 kb_hard_sets 与它互相导入)。
+SEED = 20261018
+N_ANSWERABLE_PER_SET = 15
+
+
+def select_cases(main: KbDataset, chat: KbDataset) -> list[tuple[str, KbCase]]:
+    """两个集各取全部无答案题 + 固定种子抽 :data:`N_ANSWERABLE_PER_SET` 道有答案题。"""
+    rng = random.Random(SEED)  # noqa: S311 - a fixed, reproducible sample
+    picked: list[tuple[str, KbCase]] = []
+    for label, dataset in (("main", main), ("chat", chat)):
+        no_answer = [c for c in dataset.cases if not c.expected]
+        answerable = [c for c in dataset.cases if c.expected]
+        picked += [(label, c) for c in no_answer]
+        picked += [(label, c) for c in rng.sample(answerable, N_ANSWERABLE_PER_SET)]
+    return picked

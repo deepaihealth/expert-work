@@ -31,10 +31,12 @@ DRY_MODEL = "dry"
 
 class Models(Protocol):
     @property
-    def answer_model(self) -> str: ...
+    def answer_model(self) -> str:
+        """Name of the model that answers."""
 
     @property
-    def judge_model(self) -> str: ...
+    def judge_model(self) -> str:
+        """Name of the model that judges."""
 
     async def agent(
         self, messages: list[dict[str, Any]], tools: list[dict[str, Any]]

@@ -48,7 +48,7 @@ import yaml
 
 sys.path.insert(0, str(Path(__file__).parent))
 
-from kb_dataset import KbCase, load_dataset  # type: ignore[import-not-found]
+from kb_dataset import KbCase, load_dataset, select_cases  # type: ignore[import-not-found]
 from kb_metrics import anchor_key  # type: ignore[import-not-found]
 
 #: 跨几个相邻句子找一条锚(锚偶尔跨句号)。
@@ -405,7 +405,7 @@ def parser_fingerprint() -> str:
     :data:`FINGERPRINT_DISTS` 的版本。"""
     import importlib.metadata as metadata
 
-    import control_plane.knowledge.parsing as parsing
+    from control_plane.knowledge import parsing
 
     digest = hashlib.sha256()
     folder = Path(parsing.__file__).parent
@@ -505,8 +505,6 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--seed", type=int, default=DEFAULT_SEED)
     parser.add_argument("--out", type=Path, required=True)
     args = parser.parse_args(argv)
-
-    from kb_agent_cases import select_cases  # type: ignore[import-not-found]
 
     main_set, chat_set = load_dataset(args.dataset), load_dataset(args.chat_dataset)
     control = [c for _label, c in select_cases(main_set, chat_set) if c.expected]
