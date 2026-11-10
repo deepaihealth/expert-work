@@ -95,6 +95,8 @@ cases:
 | `expected[].page` | 否 | 整数或 `null` | 现阶段恒 `null`;P5 加了 `source_locator` 再补 |
 | `expected[].via` | 否 | `pool-judge` | 汇集标注补进来的条目;加载器不读,只给人看出处 |
 | `cases[].answer` | 否 | 字符串或 `null` | 只用于 Faithfulness 抽检 |
+| `cases[].label` | 否 | `answerable` / `no_answer` / `partial` | 智能体层期望的作答(B-206 11-09);不写按 `expected` 推。`partial` = 资料只写了相关事实、没直接写结论,`expected` 必须为空(检索层照旧当无答案题),期望 B 式作答 |
+| `cases[].related` | `partial` 必填 | 同 `expected[]` 的列表 | `partial` 题资料里写了的相关事实(原文锚),只给智能体层判分看 |
 
 ## `source` 枚举
 

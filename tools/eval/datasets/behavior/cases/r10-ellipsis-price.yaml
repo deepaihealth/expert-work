@@ -1,0 +1,8 @@
+id: r10-ellipsis-price
+agent: eval-coref
+shape: 多轮指代(B-206)· 省略属性:「那价格呢」= KX-217 的价格
+turns:
+  - prompt: KX-217 的额定功率是多少?
+  - prompt: 那价格呢?
+checks:
+  - {type: coref, referent: attribute_ellipsis, turn: 2, target: ["899"], others: ["1299", "239"], names: [KX-217], candidates: [KX-217, KX-305, KX-512]}

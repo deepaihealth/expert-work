@@ -1,0 +1,17 @@
+id: r07-file-this-one
+agent: eval-coref
+shape: 多轮指代(B-206)· 文件:「这份」指这一轮新附上的报价单,不是上一轮那份
+turns:
+  - prompt: 帮我看看这份报价单的总价是多少。
+    fixtures: [coref-quote-a.md]
+  - prompt: 这份的有效期到哪天?
+    fixtures: [coref-quote-b.md]
+checks:
+  - type: coref
+    referent: file
+    candidates: [远航五金, 远帆五金]
+    turn: 2
+    target: ["2027 年 1 月 15 日"]
+    others: ["2026 年 12 月 31 日"]
+    names: [远航五金]
+    tool: null

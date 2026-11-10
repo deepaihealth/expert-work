@@ -278,3 +278,43 @@ def test_committed_chat_set_loads_and_stays_apart_from_the_other_sets() -> None:
         assert {c.query for c in other.cases}.isdisjoint({c.query for c in chat.cases})
     assert all("真实问法" in c.tags for c in chat.cases)
     assert {c.source for c in chat.cases} == {"chat_qa", "no_answer"}
+
+
+# ---------------------------------------------------------------------------
+# B-206 11-09:第三种标签 partial(资料只写了相关事实,没直接写结论)
+# ---------------------------------------------------------------------------
+
+_RELATED = [{"document": "说明书A.docx", "anchor": "与X类药物间隔30分钟服用", "page": None}]
+
+
+def test_label_defaults_from_expected(tmp_path: Path) -> None:
+    ds = load_dataset(_write(tmp_path, [_case(), _case("n-0001", source="no_answer", expected=[])]))
+    assert [c.answer_label for c in ds.cases] == ["answerable", "no_answer"]
+    assert [c.related for c in ds.cases] == [(), ()]
+
+
+def test_partial_case_keeps_expected_empty_and_carries_related_facts(tmp_path: Path) -> None:
+    case = _case("n-0006", source="no_answer", expected=[], label="partial", related=_RELATED)
+    [loaded] = load_dataset(_write(tmp_path, [case])).cases
+    assert loaded.answer_label == "partial"
+    # 检索层(kb_eval)仍按「没有期望段」处理:召回分数不受这次改标签影响。
+    assert loaded.expected == ()
+    assert loaded.related == (
+        KbExpected(document="说明书A.docx", anchor="与X类药物间隔30分钟服用", page=None),
+    )
+
+
+@pytest.mark.parametrize(
+    ("overrides", "message"),
+    [
+        ({"label": "maybe"}, "'label'"),
+        ({"label": "partial", "expected": [], "source": "no_answer"}, "needs 'related'"),
+        ({"label": "partial", "related": _RELATED}, "'expected' must be empty"),
+        ({"related": _RELATED}, "'related' only with label partial"),
+        ({"label": "no_answer"}, "'expected' must be empty"),
+        ({"label": "answerable", "expected": [], "source": "no_answer"}, "needs 'expected'"),
+    ],
+)
+def test_label_rules(tmp_path: Path, overrides: dict[str, Any], message: str) -> None:
+    with pytest.raises(KbDatasetError, match=message):
+        load_dataset(_write(tmp_path, [_case("x-0001", **overrides)]))

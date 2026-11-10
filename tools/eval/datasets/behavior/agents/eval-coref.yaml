@@ -1,0 +1,38 @@
+# B-140 行为回归评测 —— 多轮指代(B-206,r01~r14):知识库问答智能体,只绑一个合成知识库
+# b140-kb-coref;r07 / r14 的报价单是某一轮才附上的文件,所以开工作区。建库、上传见 tools/eval/README.md。
+apiVersion: expert_work.io/v1
+kind: Agent
+metadata:
+  name: eval-coref
+  version: "1.0.0"
+  tenant: b140-eval
+spec:
+  description: B-140 行为回归评测用的多轮指代智能体(合成资料专用)。
+  tenant_config:
+    isolation_level: dedicated_sandbox
+  model:
+    provider: glm
+    name: glm-5.3
+    temperature: 0.2
+    max_tokens: 32768
+  system_prompt:
+    template: |
+      你是一个知识库问答助手。回答前先用 knowledge_search 检索,只根据检索到的内容和用户发来的文件回答;
+      知识库里没有写的,如实说明没有找到,不要编造。
+  knowledge:
+    knowledge_base_refs:
+      - b140-kb-coref
+  policies:
+    token_budget: 200000
+  sandbox:
+    runtime: gvisor
+    resources:
+      cpu: "0.5"
+      memory: 512Mi
+    network:
+      egress: none
+    filesystem:
+      readonly_root: true
+      persistent_workspace: true
+      writable:
+        - /tmp

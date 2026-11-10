@@ -177,6 +177,28 @@ EXPERT_WORK_API_TOKEN=… uv run --no-sync python tools/eval/behavior_runner.py 
 必然好答;对照时看的是改动后有没有稳定退步。`k06` 的 `turn_tokens_max` 是暂定上限、不是「清理发生了」的证据(基线一次
 调用就能答,输入反而可能更少),第一次 3× 真跑之后按实测最大值 ×1.5 改。
 
+多轮指代用例(B-206,`r01`~`r14`,`--only` 选它们):跑在 `eval-coref`,只绑一个合成知识库。测的是平台怎么带着
+整段对话把「它 / 那边 / 这份 / 第二个 / 那天 / 那价格呢 / 另一个呢 / 这两个」变成外发的检索参数和答复 —— 平台没有单独的
+改写层,主模型看着全部历史写 `knowledge_search.query`,所以放在真跑整段会话的 B-140,而不是单轮的 `kb_agent_eval.py`。
+指代对象不限商品:人、客户、商品、组织、文件(某一轮才附上的报价单)、上一条答复的第几项、时间 / 事件、省略属性、复数;
+r02 / r05 / r13 / r14 前文有两个同类候选,追问或两个都答算过,只猜一个不算。**一次性准备**(同一个租户):
+
+1. 建知识库 `b140-kb-coref`「员工通讯录、客户档案、在售型号与价格、分部、售后网点与设备巡检记录(合成数据)」,
+   把 `datasets/behavior/fixtures/kb/b140-kb-coref/` 下的六份文件传上去、等就绪;
+2. 导入 `datasets/behavior/agents/eval-coref.yaml`(开了工作区:r07 / r14 的报价单是逐轮附件)。
+
+```sh
+EXPERT_WORK_API_TOKEN=… uv run --no-sync python tools/eval/behavior_runner.py --label coref-base-$(date +%m%d) \
+  --only r01-person-he,r02-person-two-candidates,r03-customer-near-name,r04-product-named-by-answer,r05-product-two-candidates,r06-organisation-there,r07-file-this-one,r08-list-item-second,r09-time-that-day,r10-ellipsis-price,r11-ellipsis-the-other,r12-plural-these-two,r13-customer-two-candidates,r14-file-two-candidates
+uv run --no-sync python tools/eval/behavior_coref.py eval-out/b140/coref-base-<日期>.jsonl
+```
+
+判据 `coref` 只看结果:那一轮回复里出现了**该指的对象**的事实还是**另一个同类候选**的事实(每条事实在合成语料里只出现一次,
+`test_behavior_coref.py` 复核),有没有反问 —— 反问只认**问句本身**点了某个候选(判据的 `candidates`)、在问「哪一个 / A 还是 B / 指的是」,或不点名但问「指的是 / 问的是哪位 / 哪款 …」;
+「您还想了解哪些信息?」这类客套收尾不算。指代明确时把候选全列出来(混答)不算过,单独计数。`behavior_coref.py` 三个数一起报:**指错对象率**(含「很笃定地答错对象」次数)、
+**有两个候选时的追问率**(及「追问或两个都答」率、只猜一个的次数)、**外发检索参数点名率**(参数里写没写对象名、还留着几个
+「它 / 这个 / 第二个」这类指示词);另按指代对象类别列通过数。过 / 不过只按回复判,外发参数两项是平台改进要看的信号,不进过 / 不过。
+
 撞上限 / 原地打转用例(B-226,`t01`~`t04` 与 `g16`):`t*` 跑在 `eval-tight`(eval-general 只把步数上限压到 6 步),
 **要先在控制台导入** `datasets/behavior/agents/eval-tight.yaml`;10 份台账逐份处理做不完,测撞上限之后的收尾是否如实
 (`t01` 没登记、`t02` 登记了一部分)和快撞上限时有没有先把结果登记出去(`t03`)。用例写了 `requires_exit_reason: max_steps`:
@@ -336,3 +358,55 @@ B-206 K-2 起默认同时给模型 `knowledge_read`(与生产一致:绑了知识
 模型最多回 8 轮;读到的内容记进结果行的 `reads` 并给判分看,`--tally` 另报每题读几次、按读法分布。`--no-read` =
 读文档关掉(只给 `knowledge_search`),**不是**改动前的基线:检索结果标头、工具说明、最多回几轮都已是 K-2 之后的;
 改动前那一臂要在改动前的检出上用当时的脚本跑。带读文档的一轮约 ¥15~25。
+
+**11-09 尺子修正(B-206)**,设计见 `docs/superpowers/specs/2026-10-21-b206-kb-retrieval-loss-driven-optimization-design.md` §8.2:
+
+- **按结论判 + 多数票**(`kb_agent_judge.py`):判分模型把回答拆成结论,逐条标依据(原文写了 / 标明了的推断 /
+  标明了的常识 / **没标明的推断** / 资料里没有),有一条没标明的推断或资料里没有的就是编造 —— 由代码算,不靠判分模型
+  整体拍板;「原文写了」要附一句能在智能体看到的资料里找到的原文。每题判 `--judge-votes`(默认 3)次、每票单独缓存,
+  严格过半取多数,否则记「判分分歧」单列。引文按省略号切段、每段 ≥ 6 字都在资料里才算找到;找不到 / 空或太短的
+  只按标签列题号,**资料没写(含难负例)的题上两种例外记编造**:没找到的段对上难负例被删掉的那句(连续 6 字相同,
+  或改写着抄、共有的字 ≥ 6 个且占七成),或回答**没说**「资料没写」(refused=false)又拿找不到的引文当依据。结果行多了 `label` / `votes` / `agreement`,以及 `yardstick`(尺子版本)/
+  `judge_votes` / `run_kind`(`standard` 或 `hn:<spec 哈希>`):续跑时这三项与本次不同的 `--out`(含 11-09 之前的旧结果)直接拒绝。
+- **答题循环照生产加提示段**(`kb_agent_prod_prompt.py`,B-206 #2066):产品代码里有 `answer_check` /
+  `outgoing_reference` 时,系统提示词照生产加上 `<platform-context>` 说明段与「外发参数」段(按产品的门控函数判),
+  本轮有知识库结果显示了段落之后的每次调用,把产品的「答前核对」平台段贴在那次调用视图的最后一条消息末尾(不存)。
+  判「显示了段落」直接调产品函数。产品模块不在(改动前的 main)时什么都不加、消息逐字节不变;run 行的
+  `prod_prompt_parts` 记这一轮加了哪几段,`--tally` 打出来。
+- **限额提示不再施压**:第 4 次检索 / 读文档的提示只说「上限到了、这次没执行」,去掉了「answer with what you have」。
+- **第三种标签 `partial`**:资料只写了相关事实、没直接写结论的题(评测集里写 `label: partial` + `related` 原文锚,见
+  `datasets/kb/README.md`);合格作答 = B 式(说「资料没直接写」+ 列相关事实 + 推断标明)。
+- **头条三个数一起报**(`kb_agent_tally.py`):资料没写的「该拒拒了」率 + 编造题数、有答案的「不该拒却拒了」率、部分写了的
+  B 式作答率;再按标签 × 集(main / chat / distractor / hard_negative)细分。`--tally a.jsonl b.jsonl …` 按答题模型分节,
+  多个模型另出一张对比表 —— 同一套题换 `--answer-model` 各写一个 `--out` 就是分模型评测。
+- **近名干扰题**:标准一轮默认另加 15 道(`--distractors N`,0 = 不加):问句点了名的对象、语料里还有名字只差一个字 /
+  同型号骨架的另一份文档;判分被告知那些近名。
+- **难负例**(另起一轮,库不同):
+
+  ```sh
+  # 1) 本机生成 spec(不花钱;与评测建库同一个解析器,缓存按解析器指纹 + 文件内容做键,别指向 kb_build_dataset 的旧缓存)
+  uv run --no-sync python tools/eval/kb_hard_sets.py --dataset tools/eval/datasets/kb/huada_v1.yaml \
+      --chat-dataset tools/eval/datasets/kb/huada_v1.chat.yaml --corpus-root <资料根目录> \
+      --manifest <清单>/manifest.csv --parsed-cache <新的缓存目录> --n 30 --out eval-out/kb/hard-negatives.yaml
+  # 2') 免费空跑核一遍(假模型 + 假嵌入 + 内存库,不连任何接口):解析器护栏 / 删后残留都过了才值得真跑
+  uv run --no-sync python tools/eval/kb_agent_eval.py … --hard-negatives eval-out/kb/hard-negatives.yaml \
+      --dry --store memory --embedder fake --rerank off --out eval-out/kb/dry-hn.jsonl
+  # 2) 删过答案句的库上跑 30 道难负例 + 30 道有答案对照
+  uv run --no-sync python tools/eval/kb_agent_eval.py … --hard-negatives eval-out/kb/hard-negatives.yaml \
+      --out eval-out/kb/agent-<label>-hn.jsonl
+  ```
+
+  删句在解析之后、切块之前,文件名不变;spec 有题号、问题、被删的锚(语料原文)和动到的文档 —— **不进仓库**,生成到
+  `eval-out/`(已在 .gitignore)。选题读的文档清单与评测建库同一份;跳过「找全」题、找不到锚的题、与已选的锚**累计**删句后
+  会伤到对照题答案的题。评测建库时解析器再核一遍对照锚:删掉任何一条、删后还能找到被删的锚、或对照题取不到含答案段落,
+  整轮在答题前就停。锚以外的同义改写删不到 —— 跑之前把 spec 过一眼。
+- **免费报价**(不调任何模型):
+
+  ```sh
+  uv run --no-sync python tools/eval/kb_agent_estimate.py --dataset … --chat-dataset … \
+      --history eval-out/kb/<上一份结果>.jsonl --judge-cache eval-out/kb/agent_judge_cache.sqlite \
+      --hard-negatives eval-out/kb/hard-negatives.yaml
+  ```
+
+  按历史结果的每题实花估答题 / 重排,判分按新旧提示词长度比 + 结论列表多出的输出 × 票数,难负例轮加删过句文档的重新嵌入;
+  打印标准轮、难负例轮、改动前基线与改动后一轮(+ `--margin` 余量)。

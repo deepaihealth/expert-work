@@ -1,0 +1,8 @@
+id: r03-customer-near-name
+agent: eval-coref
+shape: 多轮指代(B-206)· 客户:「它」指青禾商贸;档案里还有名字只差一个字的青和商贸
+turns:
+  - prompt: 青禾商贸的合同什么时候到期?
+  - prompt: 它的账户经理是谁?
+checks:
+  - {type: coref, referent: customer, turn: 2, target: [柏青], others: [何川], names: [青禾商贸], candidates: [青禾商贸, 青和商贸]}

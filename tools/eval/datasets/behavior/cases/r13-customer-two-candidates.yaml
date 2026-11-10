@@ -1,0 +1,8 @@
+id: r13-customer-two-candidates
+agent: eval-coref
+shape: 多轮指代(B-206)· 客户,两个候选:两家名字只差一个字的客户并列问过,「它」分不清
+turns:
+  - prompt: 青禾商贸和青和商贸的合同分别什么时候到期?
+  - prompt: 它的账户经理是谁?
+checks:
+  - {type: coref, referent: customer, turn: 2, ambiguous: true, target: [柏青], others: [何川], candidates: [青禾商贸, 青和商贸]}

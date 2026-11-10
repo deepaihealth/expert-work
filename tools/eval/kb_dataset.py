@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import csv
+import random
 from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -18,6 +19,8 @@ import yaml
 #: 用例来源。``faq_xlsx`` 产品 FAQ 表 / ``faq_2026`` FAQ-2026 表 / ``manual_qa`` 说明书 Q&A /
 #: ``hard_cross`` 跨文档 / ``hard_exact`` 精确标识 / ``hard_table`` 表格 /
 #: ``no_answer`` 资料里没有(应拒答)/ ``chat_qa`` 客户聊天里的真实问法(脱敏改写)。
+#: (``kb_hard_sets.py`` 运行时派生的难负例 / 近名干扰题另记 ``hard_negative`` / ``distractor``,
+#: 不是评测集文件里能写的值。)
 SOURCES = frozenset(
     {
         "faq_xlsx",
@@ -38,6 +41,11 @@ MATCH_MODES = frozenset({"any", "all"})
 DEFAULT_MATCH = "any"
 #: ``check_corpus`` 只认这两层:有文字层、会进评测库的文档。
 CORPUS_CHECK_TIERS = frozenset({"A", "D-A"})
+#: 智能体层的期望作答(B-206 11-09)。``answerable`` 有答案;``no_answer`` 资料没写、应说没写;
+#: ``partial`` 资料只写了相关事实、没直接写问题要的结论 —— 应按用户 11-07 拍板的 B 式作答:
+#: 说「资料没直接写」+ 列出相关的原文事实 + 推断处标明是推断。文件里不写 ``label`` 时按
+#: ``expected`` 推(非空 = answerable,空 = no_answer)。
+LABELS = frozenset({"answerable", "no_answer", "partial"})
 
 
 class KbDatasetError(ValueError):
@@ -70,6 +78,18 @@ class KbCase:
     expected: tuple[KbExpected, ...]  # 空元组 = 应「无答案」
     answer: str | None
     match: str = DEFAULT_MATCH  # any | all,见 MATCH_MODES
+    #: 文件里写的 ``label``;None = 按 ``expected`` 推(见 :attr:`answer_label`)。
+    label: str | None = None
+    #: ``partial`` 题:资料里写了的相关事实(原文锚)。``expected`` 仍为空,检索层照旧按
+    #: 「没有期望段」算,召回分数不受改标签影响;只给智能体层判分看。
+    related: tuple[KbExpected, ...] = ()
+
+    @property
+    def answer_label(self) -> str:
+        """:data:`LABELS` 之一。"""
+        if self.label is not None:
+            return self.label
+        return "answerable" if self.expected else "no_answer"
 
 
 @dataclass(frozen=True)
@@ -148,15 +168,40 @@ def _parse_case(entry: Any, *, index: int) -> KbCase:
     match = entry.get("match", DEFAULT_MATCH)
     if match not in MATCH_MODES:
         raise KbDatasetError(f"{case_id}: 'match' {match!r} not in {sorted(MATCH_MODES)}")
+    expected = tuple(_parse_expected(e, case_id=case_id) for e in expected_raw)
+    answer_label, related = _parse_label(entry, expected=expected, case_id=case_id)
     return KbCase(
         id=case_id,
         query=query,
         source=source,
         tags=_parse_tags(entry.get("tags"), case_id=case_id),
-        expected=tuple(_parse_expected(e, case_id=case_id) for e in expected_raw),
+        expected=expected,
         answer=answer,
         match=str(match),
+        label=answer_label,
+        related=related,
     )
+
+
+def _parse_label(
+    entry: Mapping[str, Any], *, expected: tuple[KbExpected, ...], case_id: str
+) -> tuple[str | None, tuple[KbExpected, ...]]:
+    label = entry.get("label")
+    if label is not None and label not in LABELS:
+        raise KbDatasetError(f"{case_id}: 'label' {label!r} not in {sorted(LABELS)}")
+    related_raw = entry.get("related") or []
+    if not isinstance(related_raw, list):
+        raise KbDatasetError(f"{case_id}: 'related' must be a list")
+    related = tuple(_parse_expected(e, case_id=case_id) for e in related_raw)
+    if related and label != "partial":
+        raise KbDatasetError(f"{case_id}: 'related' only with label partial")
+    if label in ("partial", "no_answer") and expected:
+        raise KbDatasetError(f"{case_id}: 'expected' must be empty for label {label}")
+    if label == "partial" and not related:
+        raise KbDatasetError(f"{case_id}: label partial needs 'related' (the stated facts)")
+    if label == "answerable" and not expected:
+        raise KbDatasetError(f"{case_id}: label answerable needs 'expected'")
+    return label, related
 
 
 def _parse_tags(raw: Any, *, case_id: str) -> tuple[str, ...]:
@@ -202,6 +247,7 @@ def _manifest_basenames(manifest_csv: Path) -> Iterator[str]:
 __all__ = [
     "CORPUS_CHECK_TIERS",
     "DEFAULT_MATCH",
+    "LABELS",
     "MATCH_MODES",
     "MIN_ANCHOR_CHARS",
     "SOURCES",
@@ -212,3 +258,20 @@ __all__ = [
     "check_corpus",
     "load_dataset",
 ]
+
+
+#: B-206 智能体层评测的固定抽样(放这里而不是 kb_agent_cases,免得 kb_hard_sets 与它互相导入)。
+SEED = 20261018
+N_ANSWERABLE_PER_SET = 15
+
+
+def select_cases(main: KbDataset, chat: KbDataset) -> list[tuple[str, KbCase]]:
+    """两个集各取全部无答案题 + 固定种子抽 :data:`N_ANSWERABLE_PER_SET` 道有答案题。"""
+    rng = random.Random(SEED)  # noqa: S311 - a fixed, reproducible sample
+    picked: list[tuple[str, KbCase]] = []
+    for label, dataset in (("main", main), ("chat", chat)):
+        no_answer = [c for c in dataset.cases if not c.expected]
+        answerable = [c for c in dataset.cases if c.expected]
+        picked += [(label, c) for c in no_answer]
+        picked += [(label, c) for c in rng.sample(answerable, N_ANSWERABLE_PER_SET)]
+    return picked

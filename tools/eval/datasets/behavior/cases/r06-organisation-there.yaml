@@ -1,0 +1,8 @@
+id: r06-organisation-there
+agent: eval-coref
+shape: 多轮指代(B-206)· 组织:「那边」指华东分部;还有华南分部
+turns:
+  - prompt: 华东分部的负责人是谁?
+  - prompt: 那边的办公地址在哪?
+checks:
+  - {type: coref, referent: organisation, turn: 2, target: [江南大道], others: [体育西路], names: [华东分部], candidates: [华东分部, 华南分部]}

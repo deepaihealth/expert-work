@@ -1,0 +1,8 @@
+id: r09-time-that-day
+agent: eval-coref
+shape: 多轮指代(B-206)· 时间 / 事件:「那天」指第二次巡检那天;还有第一次巡检
+turns:
+  - prompt: 第二次设备巡检是哪天?
+  - prompt: 那天做了什么?
+checks:
+  - {type: coref, referent: time_event, turn: 2, target: [压缩机], others: [滤网], names: [5 月 20 日, 第二次巡检], candidates: [第一次巡检, 第二次巡检, 3 月 12 日, 5 月 20 日]}

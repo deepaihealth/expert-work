@@ -1,0 +1,9 @@
+id: r14-file-two-candidates
+agent: eval-coref
+shape: 多轮指代(B-206)· 文件,两个候选:同一轮附了两份报价单,「这份」分不清
+turns:
+  - prompt: 这两份报价单分别是哪家供应商的?
+    fixtures: [coref-quote-a.md, coref-quote-b.md]
+  - prompt: 这份的总价是多少?
+checks:
+  - {type: coref, referent: file, turn: 2, ambiguous: true, target: ["48600"], others: ["52300"], tool: null, candidates: [远帆五金, 远航五金]}

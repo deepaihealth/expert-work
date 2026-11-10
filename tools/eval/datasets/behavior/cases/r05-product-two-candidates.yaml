@@ -1,0 +1,8 @@
+id: r05-product-two-candidates
+agent: eval-coref
+shape: 多轮指代(B-206)· 商品,两个候选:上一轮两款并列,「它」分不清 → 追问或两个都答
+turns:
+  - prompt: KX-305 和 KX-217 分别是什么品类?
+  - prompt: 它多少钱?
+checks:
+  - {type: coref, referent: product, turn: 2, ambiguous: true, target: ["1299"], others: ["899"], candidates: [KX-305, KX-217]}

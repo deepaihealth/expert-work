@@ -1,0 +1,8 @@
+id: r02-person-two-candidates
+agent: eval-coref
+shape: 多轮指代(B-206)· 人,两个候选:上一轮问了两位,「他」分不清是谁 → 追问或两个都答
+turns:
+  - prompt: 林舟和沈遥分别负责什么?
+  - prompt: 他的分机号是多少?
+checks:
+  - {type: coref, referent: person, turn: 2, ambiguous: true, target: ["6203"], others: ["7415"], candidates: [林舟, 沈遥]}

@@ -1,0 +1,9 @@
+id: r11-ellipsis-the-other
+agent: eval-coref
+shape: 多轮指代(B-206)· 省略属性:「另一个呢」= 两款里没问过的 KX-217 的保修期
+turns:
+  - prompt: KX-305 和 KX-217 分别是什么品类?
+  - prompt: KX-305 的保修期多久?
+  - prompt: 另一个呢?
+checks:
+  - {type: coref, referent: attribute_ellipsis, turn: 3, target: ["18 个月"], others: ["26 个月", "15 个月"], names: [KX-217], candidates: [KX-217, KX-305]}

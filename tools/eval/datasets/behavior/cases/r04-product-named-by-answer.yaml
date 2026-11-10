@@ -1,0 +1,8 @@
+id: r04-product-named-by-answer
+agent: eval-coref
+shape: 多轮指代(B-206)· 商品:「它」指上一轮**回复里**点出的那一款(用户自己没说型号)
+turns:
+  - prompt: KX-305 和 KX-217 哪个是除湿机?
+  - prompt: 它的保修期多久?
+checks:
+  - {type: coref, referent: product, turn: 2, target: ["26 个月"], others: ["18 个月"], names: [KX-305], candidates: [KX-305, KX-217]}

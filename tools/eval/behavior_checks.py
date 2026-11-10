@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Literal
 from xml.etree import ElementTree as ET
 
+from behavior_coref import verdict as coref_verdict
 from behavior_extract import UnsupportedDocumentError, document_text
 from behavior_schema import (
     ArtifactContains,
@@ -24,6 +25,7 @@ from behavior_schema import (
     Check,
     CheckVerdict,
     Completed,
+    Coref,
     ExitReason,
     FinalTextContains,
     FinalTextNotContains,
@@ -182,8 +184,8 @@ def _one(
         got = turns[-1].completed if turns else None
         return _verdict(check, got is False, f"completed={got!r}")
     if isinstance(check, ExitReason):
-        got = turns[-1].exit_reason if turns else None
-        return _verdict(check, got == check.value, f"exit_reason={got!r}")
+        reason = turns[-1].exit_reason if turns else None
+        return _verdict(check, reason == check.value, f"exit_reason={reason!r}")
     if isinstance(check, FinalTextContains):
         missing = [s for s in check.all if s not in final]
         return _verdict(check, not missing, f"missing {missing}")
@@ -282,11 +284,14 @@ def _one(
             any(_arg_ok(c, check) for c in judged),
             f"{check.arg}={[c.args.get(check.arg) for c in judged]}",
         )
+    if isinstance(check, Coref):
+        # B-206 多轮指代:过与不过都带归类明细(behavior_coref.py 汇总靠它)。
+        return coref_verdict(check, record)
     if isinstance(check, TurnTokensMax):
         if check.turn > len(turns):
             return _verdict(check, False, f"only {len(turns)} turns")
-        got = turns[check.turn - 1].input_tokens
-        if got is None:
+        tokens = turns[check.turn - 1].input_tokens
+        if tokens is None:
             return _verdict(check, False, "no usage recorded")
-        return _verdict(check, got <= check.max_input_tokens, f"input_tokens={got}")
+        return _verdict(check, tokens <= check.max_input_tokens, f"input_tokens={tokens}")
     raise AssertionError(f"unhandled check {check!r}")

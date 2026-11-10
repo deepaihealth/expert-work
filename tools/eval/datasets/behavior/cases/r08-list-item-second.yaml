@@ -1,0 +1,14 @@
+id: r08-list-item-second
+agent: eval-coref
+shape: 多轮指代(B-206)· 上一条答复的第几项:用户定了顺序,「第二个」= 苏州
+turns:
+  - prompt: 按杭州、苏州、宁波的顺序,告诉我这三个售后网点的营业时间。
+  - prompt: 第二个的电话是多少?
+checks:
+  - type: coref
+    referent: list_item
+    candidates: [杭州, 苏州, 宁波]
+    turn: 2
+    target: ["0512-6633-4071"]
+    others: ["0571-8810-2210", "0574-2786-5592"]
+    names: [苏州]
