@@ -20,7 +20,7 @@ from __future__ import annotations
 import json
 import sys
 from collections import Counter
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
@@ -138,6 +138,14 @@ def _quote_list(rows: Sequence[Mapping[str, Any]], key: str, title: str) -> str:
     return f"  {title}:" + ";".join(parts)
 
 
+def _id_list(
+    rows: Sequence[Mapping[str, Any]], hit: Callable[[Mapping[str, Any]], bool], title: str
+) -> str:
+    ids = [str(r["case_id"]) for r in rows if hit(r.get("verdict") or {})]
+    shown = f"({', '.join(ids[:10])}{', …' if len(ids) > 10 else ''})" if ids else ""
+    return f"  {title}:{len(ids)} 题{shown}"
+
+
 def _pct(rate: Rate) -> str:
     hit, n = rate
     return f"{hit / n:.1%}({hit}/{n})" if n else f"—({hit}/{n})"
@@ -169,6 +177,17 @@ def _headline(rows: Sequence[Mapping[str, Any]]) -> list[str]:
         _quote_list(kept, "quote_unchecked", "引文空或太短、核对不了"),
         # 审查第二轮 MEDIUM-1:core 断言标成「不需要出处」—— 转介还是误标的结论,人看
         _quote_list(kept, "core_unsourced", "待复核·结论本身标了不需要出处"),
+        # 审查第五轮:难负例上文字比对与评委的 repeats_deleted 不一致的题,两个方向都列,不改类别
+        _id_list(
+            kept,
+            lambda v: bool(v.get("quote_deleted")) and not v.get("repeats_deleted"),
+            "待复核·引文像被删句、评委没标",
+        ),
+        _id_list(
+            kept,
+            lambda v: bool(v.get("repeats_deleted")) and not v.get("quote_deleted"),
+            "待复核·评委标了复述被删原文、引文没对上被删句",
+        ),
         _grounded_line(kept),
     ]
     if excluded:

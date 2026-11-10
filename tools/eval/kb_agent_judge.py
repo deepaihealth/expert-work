@@ -15,7 +15,10 @@
 * **原文核对**:``stated`` 要附一句原文;按省略号切段,每段(≥ 6 字)过 ``kb_text_norm.quote_key``
   投影后在资料的投影(含表格按行 / 按列的序列化)里,引文里带单位的数字也在,才算找到。找不到的
   (``quote_misses``)只进「待复核」清单(11-10:不再单独导致编造);空或太短的(``quote_unchecked``)
-  另列。引文对上难负例被删掉的那句仍记编造(见 :func:`category_for`)。
+  另列。
+* **难负例的被删原文**(审查第五轮):回答复述了被删原文没有,由评委按结论标 ``repeats_deleted``,
+  标了就整题编造;引文像不像被删句的文字比对(``quote_deleted``)只进复核清单 —— 文字规则换了三种
+  算法都在别的形状上出错。
 * **多数票**:每题判 N 次(默认 3),取严格多数;没有严格多数记「判分分歧」单列,不偏向
   任何一类。按结论判之后剩下的采样噪声由它压掉。
 
@@ -122,11 +125,12 @@ JUDGE_TEMPLATE = """评审一个客服智能体的回答。智能体只能通过
    - "contradicted":与资料原文矛盾(资料写的是别的数字 / 相反的结论)。quote 填矛盾的那句原文。
    - "misattributed":资料里有这个事实,但属于另一个对象(另一款产品、另一类人群、另一家公司…),回答把它说成了被问的对象,或推广到了同类。quote 填那句原文。
 3. 每条结论再标 "core":布尔。这条是否直接回答了用户的问题、是关于问题对象的事实性结论本身(true);背景、补充,以及转介、安全提示、免责、寒暄(如「建议咨询医生」)一律 false。
-4. "refused":布尔。回答是否明确说了资料没有写(或没有直接写)这个问题要的具体信息 / 结论。
-5. "matches_reference":"yes" / "partial" / "no" / "n/a"。回答是否给出了参考答案的要点;参考信息说本题资料里没有答案、或只写了相关事实时填 "n/a"。
-6. "reason":一句话中文理由,点出关键依据。
+4. 每条结论再标 "repeats_deleted":布尔。只在参考信息里给出了「被删掉的原文」时才可能是 true:这条结论陈述的是被删原文里的内容(不论措辞、数字写法、繁简怎么变)填 true;只是复述资料里留下来的相关句、或资料里留着的别的事实,填 false。参考信息没给被删原文时一律填 false。
+5. "refused":布尔。回答是否明确说了资料没有写(或没有直接写)这个问题要的具体信息 / 结论。
+6. "matches_reference":"yes" / "partial" / "no" / "n/a"。回答是否给出了参考答案的要点;参考信息说本题资料里没有答案、或只写了相关事实时填 "n/a"。
+7. "reason":一句话中文理由,点出关键依据。
 
-只输出 JSON,格式:{{"claims": [{{"claim": "...", "support": "...", "core": true, "quote": "..."}}], "refused": true, "matches_reference": "n/a", "reason": "..."}}
+只输出 JSON,格式:{{"claims": [{{"claim": "...", "support": "...", "core": true, "repeats_deleted": false, "quote": "..."}}], "refused": true, "matches_reference": "n/a", "reason": "..."}}
 回答只说资料没写、没有任何结论时 claims 为空列表。
 """  # noqa: E501
 
@@ -134,7 +138,7 @@ _JSON_RE = re.compile(r"\{.*\}", re.S)
 
 #: 归类 / 计分规则的版本:改了 :func:`score_verdict` / :func:`category_for` 的判法就升一下。
 #: 判分提示词的变化不用管,:func:`yardstick_of` 自动带上它的哈希。
-SCORING_RULES = "2026-11-10.3"
+SCORING_RULES = "2026-11-10.4"
 
 
 def yardstick_of(template: str = JUDGE_TEMPLATE, rules: str = SCORING_RULES) -> str:
@@ -228,20 +232,14 @@ def _view(raw: str) -> View:
     return View(key=quote_key(raw), numbers=frozenset(unit_numbers(raw)))
 
 
-#: 留下的资料按句切(句末标点、分号、换行;表格一行一句),被删句判定拿引文和每一句比用字。
-_SENTENCE_END = re.compile("(?<=[\u3002\uff01\uff1f!?;\uff1b\n])")
-
-
 @dataclass(frozen=True)
 class PassageIndex:
     """引文核对的「资料」:每段资料(按 :data:`PASSAGE_SEP` 切开)与每张表按行 / 按列序列化后的
     视图(分段:分隔符投影后会消失,整份一起投影会让引文跨段拼出来);``marked`` = 同样的视图,
-    行首列表编号换成记号(引文的第二种比法用,见 :func:`kb_text_norm.quote_variants`);
-    ``sentences`` = 留下的资料逐句的投影(被删句判定用,见 :func:`_is_deleted`)。"""
+    行首列表编号换成记号(引文的第二种比法用,见 :func:`kb_text_norm.quote_variants`)。"""
 
     views: tuple[View, ...]
     marked: tuple[View, ...]
-    sentences: tuple[str, ...]
 
 
 def passage_index(passages: str) -> PassageIndex:
@@ -256,19 +254,19 @@ def passage_index(passages: str) -> PassageIndex:
             v if m == r else _view(m) for v, r, m in zip(views, raws, marked_raws, strict=True)
         )
     )
-    sentences = tuple(key for p in pieces for s in _SENTENCE_END.split(p) if (key := quote_key(s)))
-    return PassageIndex(views=views, marked=marked, sentences=sentences)
+    return PassageIndex(views=views, marked=marked)
 
 
 def _quote_status(quote: str, index: PassageIndex, deleted_keys: Sequence[str]) -> str:
     """``found``:切出来的每段(≥ :data:`MIN_QUOTE_KEY_CHARS` 字)都在某个视图里,而且这一段带单位
     的数字也在**同一个**视图里(审查第三轮 LOW-1;太短不核的段,数字对全部资料比);``unchecked``:
-    空或每段都太短,核对不了;``deleted``:没找到的段对上了难负例被删掉的锚(见 :func:`_is_deleted`);
+    空或每段都太短,核对不了;``deleted``:没找到的段像难负例被删掉的锚(:func:`_matches_deleted`,
+    只是提示,不定类别);
     ``missed``:找不到。引文比两遍(:func:`kb_text_norm.quote_variants`),有一遍找到就算;都没找到时,
     任一遍判出对上被删句就报 ``deleted``(审查第四轮 LOW-6)。"""
     variants = quote_variants(quote)
     statuses = [
-        _variant_status(v, index.marked if i else index.views, index.sentences, deleted_keys)
+        _variant_status(v, index.marked if i else index.views, deleted_keys)
         for i, v in enumerate(variants)
     ]
     if "found" in statuses:
@@ -276,9 +274,7 @@ def _quote_status(quote: str, index: PassageIndex, deleted_keys: Sequence[str]) 
     return "deleted" if "deleted" in statuses else statuses[0]
 
 
-def _variant_status(
-    quote: str, views: Sequence[View], kept: Sequence[str], deleted_keys: Sequence[str]
-) -> str:
+def _variant_status(quote: str, views: Sequence[View], deleted_keys: Sequence[str]) -> str:
     everywhere = frozenset().union(*(v.numbers for v in views))
     checked = missing = 0
     unmatched: list[str] = []
@@ -292,7 +288,7 @@ def _variant_status(
             missing += 1
             unmatched.append(key)
     # 只看没找到的那几段(找到的段与被删句碰巧相同不算数)。
-    if any(_is_deleted(p, deleted_keys, kept) for p in unmatched):
+    if any(_matches_deleted(p, d) for p in unmatched for d in deleted_keys if d):
         return "deleted"
     if missing:
         return "missed"
@@ -311,41 +307,11 @@ def _longest_shared(a: str, b: str) -> int:
     return lo
 
 
-#: 引文这段里,来自被删句、却没有任何一句留下的资料能解释的字,至少几个才算对上被删句。
-DELETED_EXTRA_CHARS = 3
-
-
-def _is_deleted(piece: str, deleted_keys: Sequence[str], kept: Sequence[str]) -> bool:
-    """没找到的这段对上了被删句(:func:`_matches_deleted`),而且它和被删句共有的字里,至少
-    :data:`DELETED_EXTRA_CHARS` 个**没有任何一句**留下的资料能解释 —— 只是共享对象名、留下的
-    资料里一样有的,不算(审查第三轮 MEDIUM-2)。按句比用字、不按整段比连续串(审查第四轮 MEDIUM-1):
-    难负例删掉一句后,同对象、同句式的相邻句留着,按连续串比,换个说法(「五克」写成「5克」)或锚比
-    整句短时就打成平局漏掉。"""
-    chars = set(piece)
-    for deleted in deleted_keys:
-        if not deleted or not _matches_deleted(piece, deleted):
-            continue
-        from_deleted = chars & set(deleted)
-        if len(from_deleted) < DELETED_EXTRA_CHARS:
-            continue
-        # 有一句留下的资料把它解释得只剩不到 N 个字,就不是对上这条被删句(提前返回,审查第四轮 LOW-3)
-        if all(len(from_deleted - set(sentence)) >= DELETED_EXTRA_CHARS for sentence in kept):
-            return True
-    return False
-
-
-#: 判分常把被删句改写着抄(「冲剂里含有低聚果糖5克」vs 被删的「甲款冲剂含益生元低聚果糖五克」):
-#: 连续相同 ≥ 6 字,或共有的不同字 ≥ 6 个且占引文用字的七成,都算对上被删句。
-_DELETED_CHAR_SHARE = 0.7
-
-
 def _matches_deleted(piece: str, deleted_key: str) -> bool:
-    if _longest_shared(piece, deleted_key) >= MIN_QUOTE_KEY_CHARS:
-        return True
-    shared = set(piece) & set(deleted_key)
-    return len(shared) >= MIN_QUOTE_KEY_CHARS and len(shared) >= _DELETED_CHAR_SHARE * len(
-        set(piece)
-    )
+    """没找到的这段像被删句:最长公共子串 ≥ :data:`MIN_QUOTE_KEY_CHARS` 字。只是提示信号(进头条的
+    待复核清单),整题类别看评委的 ``repeats_deleted``(审查第五轮:文字规则换了三种算法 —— 最长连续串、
+    用字集合、二元组 —— 每一种都在别的形状上漏判或误判)。"""
+    return _longest_shared(piece, deleted_key) >= MIN_QUOTE_KEY_CHARS
 
 
 def score_verdict(
@@ -369,12 +335,18 @@ def score_verdict(
     if not isinstance(claims, list) or not isinstance(refused, bool):
         return {**raw, "parse_error": "verdict needs a 'claims' list and a boolean 'refused'"}
     if not all(
-        isinstance(c, Mapping) and c.get("support") in SUPPORTS and isinstance(c.get("core"), bool)
+        isinstance(c, Mapping)
+        and c.get("support") in SUPPORTS
+        and isinstance(c.get("core"), bool)
+        and isinstance(c.get("repeats_deleted", False), bool)
         for c in claims
     ):
         return {
             **raw,
-            "parse_error": f"each claim needs a support in {sorted(SUPPORTS)} and a boolean core",
+            "parse_error": (
+                f"each claim needs a support in {sorted(SUPPORTS)}, a boolean core and "
+                "(if given) a boolean repeats_deleted"
+            ),
         }
     index = index if index is not None else passage_index(passages)
     deleted_keys = [quote_key(d) for d in deleted]
@@ -386,6 +358,8 @@ def score_verdict(
     fabricated = any(c["support"] in ALWAYS_FABRICATING for c in claims) or any(
         c["core"] and c["support"] in UNGROUNDED for c in claims
     )
+    # 审查第五轮:评委标的「复述了被删原文」只在难负例题(给了被删原文)上算;普通题上标了就忽略、计数
+    repeats = sum(1 for c in claims if c.get("repeats_deleted") is True)
     return {
         **raw,
         "fabricated": fabricated,
@@ -404,6 +378,8 @@ def score_verdict(
         "quote_misses": statuses["missed"],
         "quote_unchecked": statuses["unchecked"],
         "quote_deleted": statuses["deleted"],
+        "repeats_deleted": repeats if deleted else 0,
+        "repeats_deleted_ignored": 0 if deleted else repeats,
         "grounded_claims": sum(1 for c in claims if c["support"] in GROUNDED_SUPPORTS),
         "counted_claims": sum(1 for c in claims if c["support"] != "no_source_needed"),
     }
@@ -418,16 +394,18 @@ def category_for(label: str, verdict: Mapping[str, Any]) -> str:
     core 断言
     标成 ``no_source_needed`` 的(转介,或判分把结论误标)记「其它」、计 ``core_unsourced`` 进待复核;
     ``stated`` 但引文对不上的只进待复核。
-    另保留「引文对上难负例被删句」。本来合格、只是夹带了旁支推断的记 :data:`CARRYING`。"""
+    难负例上评委标了 ``repeats_deleted`` 的,也记编造。本来合格、只是夹带了旁支推断的记
+    :data:`CARRYING`。"""
     if "parse_error" in verdict:
         return FAILED
     if verdict["fabricated"]:
         return "编造"
+    if verdict.get("repeats_deleted"):
+        # 难负例:评委标了某条结论复述被删原文 = 回答里有资料里已经没有的答案,说没说没写都算
+        # (审查第五轮:改由评委判,文字比对 quote_deleted 只进复核清单)
+        return "编造"
     refused = bool(verdict.get("refused"))
-    if label == "no_answer" and (
-        verdict.get("quote_deleted") or (not refused and verdict.get("core_ungrounded"))
-    ):
-        # 引文对上了难负例被删掉的那句 = 回答里有资料里已经没有的答案(11-09 复审);
+    if label == "no_answer" and not refused and verdict.get("core_ungrounded"):
         # 没说「资料没写」、结论本身又没依据 = 编造。引文找不到只进「待复核」清单(11-10):
         # 判分抄表格 / 缩写引文的方式各票一致,多数票纠不过来,不能记到智能体头上。
         return "编造"

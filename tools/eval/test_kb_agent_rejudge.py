@@ -388,3 +388,39 @@ def test_resuming_refuses_a_same_named_source_from_another_folder(tmp_path: Path
     ]
     with pytest.raises(SystemExit, match="rejudged_from"):
         kb_agent_rejudge.main(again)
+
+
+def test_a_hard_negative_rejudge_rebuilds_the_deleted_text_note_and_scoring(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # 审查第五轮:重判时给评委的被删原文说明、按题的被删锚(deleted_by_case)都要完整重建;
+    # 评委标了 repeats_deleted 的难负例记编造,对照题(没有被删原文)上标了也不算
+    from kb_agent_models import FakeModels  # type: ignore[import-not-found]
+
+    spec = _spec(tmp_path, _GONE)
+    argv = [*_corpus(tmp_path), "--hard-negatives", str(spec), "--no-recheck"]
+    assert kb_agent_eval.main(argv) == 0
+    prompts: list[str] = []
+
+    async def flags_everything(self: FakeModels, prompt: str) -> tuple[str, float]:
+        prompts.append(prompt)
+        claim = {
+            "claim": "c",
+            "support": "stated",
+            "core": False,
+            "quote": "",
+            "repeats_deleted": True,
+        }
+        return json.dumps({"claims": [claim], "refused": True, "matches_reference": "n/a"}), 0.0
+
+    monkeypatch.setattr(FakeModels, "judge", flags_everything)
+    out = tmp_path / "rejudged.jsonl"
+    assert kb_agent_rejudge.main([*_rejudge_argv(argv, out), "--hard-negatives", str(spec)]) == 0
+    rows = [json.loads(x) for x in out.read_text().splitlines() if "case_id" in x]
+    [hn] = [r for r in rows if r["set"] == "hard_negative"]
+    assert hn["category"] == "编造" and hn["verdict"]["repeats_deleted"] == 1
+    controls = [r for r in rows if r["set"] != "hard_negative"]
+    assert controls and all(r["verdict"]["repeats_deleted"] == 0 for r in controls)
+    assert all(r["verdict"]["repeats_deleted_ignored"] == 1 for r in controls)
+    [hn_prompt] = {p for p in prompts if "甲一运行时噪音多大?" in p}
+    assert "被删掉的原文" in hn_prompt and _GONE in hn_prompt and "repeats_deleted" in hn_prompt

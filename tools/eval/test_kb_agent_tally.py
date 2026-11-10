@@ -252,3 +252,26 @@ def test_core_claims_marked_as_needing_no_source_are_listed_for_review(tmp_path:
     ]
     text = tally([_write(tmp_path / "a.jsonl", rows)])
     assert "  待复核·结论本身标了不需要出处:资料没写 1 题(n1);部分写了 0 题;有答案 1 题(a1)" in text
+
+
+def test_disagreements_between_the_text_match_and_the_judge_flag_are_listed(
+    tmp_path: Path,
+) -> None:
+    # 审查第五轮:文字比对命中、评委没标 / 评委标了、文字比对没命中 —— 两个方向都列题号,不改类别
+    rows = [
+        {
+            **_row("h1", "no_answer", "正确说没写", set_="hard_negative"),
+            "verdict": {"quote_deleted": 1, "repeats_deleted": 0},
+        },
+        {
+            **_row("h2", "no_answer", "编造", set_="hard_negative"),
+            "verdict": {"quote_deleted": 0, "repeats_deleted": 1},
+        },
+        {
+            **_row("h3", "no_answer", "编造", set_="hard_negative"),
+            "verdict": {"quote_deleted": 1, "repeats_deleted": 1},
+        },
+    ]
+    text = tally([_write(tmp_path / "a.jsonl", rows)])
+    assert "  待复核·引文像被删句、评委没标:1 题(h1)" in text
+    assert "  待复核·评委标了复述被删原文、引文没对上被删句:1 题(h2)" in text

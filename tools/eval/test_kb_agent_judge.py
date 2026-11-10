@@ -271,17 +271,6 @@ def test_a_refusing_reply_with_an_unfound_quote_is_listed_not_fabrication() -> N
     assert category_for("no_answer", verdict) == "正确说没写"
 
 
-def test_on_a_hard_negative_a_quote_of_the_deleted_text_is_fabrication() -> None:
-    # 难负例:引文对上被删掉的那句 = 回答里有资料里已经没有的答案,哪怕也说了没写
-    deleted = ["甲款冲剂可以与Z药同服无需间隔"]
-    raw = _raw([_claim("stated", "甲款冲剂可以与Z药同服")], refused=True)
-    verdict = score_verdict(raw, _PASSAGES, deleted=deleted)
-    assert verdict["quote_deleted"] == 1
-    assert category_for("no_answer", verdict) == "编造"
-    # 没给被删的锚(普通无答案题):同一份判定只列出来
-    assert category_for("no_answer", score_verdict(raw, _PASSAGES)) == "正确说没写"
-
-
 def test_the_yardstick_version_follows_the_template_and_the_scoring_rules() -> None:
     from kb_agent_judge import JUDGE_TEMPLATE, SCORING_RULES, yardstick_of
 
@@ -295,14 +284,6 @@ def test_the_yardstick_version_follows_the_template_and_the_scoring_rules() -> N
 # ---------------------------------------------------------------------------
 # 11-09 第三轮:难负例被删句的改写式引文;「对上被删句」只看没找到的那几段
 # ---------------------------------------------------------------------------
-
-
-def test_a_paraphrased_quote_of_the_deleted_fact_is_still_caught() -> None:
-    deleted = ["甲款冲剂含益生元低聚果糖五克"]
-    raw = _raw([_claim("stated", "冲剂里含有低聚果糖5克")], refused=True)
-    verdict = score_verdict(raw, _PASSAGES, deleted=deleted)
-    assert verdict["quote_deleted"] == 1
-    assert category_for("no_answer", verdict) == "编造"
 
 
 def test_an_unrelated_unfound_quote_is_not_matched_to_the_deleted_fact() -> None:
@@ -455,7 +436,7 @@ def test_the_template_defines_the_new_supports_core_and_the_restatement_rule() -
 def test_the_scoring_rules_moved_past_the_veto_yardstick() -> None:
     from kb_agent_judge import SCORING_RULES, yardstick_of
 
-    assert SCORING_RULES == "2026-11-10.3"
+    assert SCORING_RULES == "2026-11-10.4"
     assert yardstick_of() != "2026-11-09.3+902042cf"
 
 
@@ -560,24 +541,6 @@ def test_list_numbers_in_a_quote_do_not_break_the_match(passages: str, quote: st
 # 审查第三轮:被删句判定只认「比留下的资料更像被删句」;数字在同一个视图里;列表编号的第二种比法
 # ---------------------------------------------------------------------------
 
-_KEPT = "甲款益生元冲剂饭后服用,温水冲调。\n甲款益生元冲剂不宜与X类药物同服。"
-_GONE_TEXT = ["甲款益生元冲剂每日两次每次一袋"]
-
-
-def test_a_refusal_with_a_reworded_related_quote_is_not_a_deleted_match() -> None:
-    # 拒答并列了相关事实,引文稍有改写、和被删句共享对象名:对象名在留下的资料里一样有,不算对上被删句
-    claim = _claim("stated", "甲款益生元冲剂应在饭后服用", core=False)
-    verdict = score_verdict(_raw([claim], refused=True), _KEPT, deleted=_GONE_TEXT)
-    assert (verdict["quote_deleted"], verdict["quote_misses"]) == (0, 1)
-    assert category_for("no_answer", verdict) == "正确说没写"
-
-
-def test_a_quote_copying_the_deleted_sentence_is_still_a_deleted_match() -> None:
-    claim = _claim("stated", "甲款益生元冲剂每日两次", core=False)
-    verdict = score_verdict(_raw([claim], refused=True), _KEPT, deleted=_GONE_TEXT)
-    assert verdict["quote_deleted"] == 1
-    assert category_for("no_answer", verdict) == "编造"
-
 
 @pytest.mark.parametrize(
     ("passages", "quote"),
@@ -608,29 +571,8 @@ def test_a_real_number_before_the_ideographic_comma_is_not_a_list_number() -> No
 
 
 # ---------------------------------------------------------------------------
-# 审查第四轮:被删句判定按「用到了几个不同的字」和留下的**句子**比
+# 审查第四轮:列表记号、右括号编号、两种比法、最长公共子串
 # ---------------------------------------------------------------------------
-
-#: 难负例里删掉一句后,相邻的同对象、同句式的句子留着。
-_SIBLINGS = "甲款冲剂含益生元菊粉三克。甲款冲剂每日一袋,温水冲服。"
-
-
-def test_a_reworded_deleted_fact_next_to_same_shaped_siblings_is_deleted() -> None:
-    claim = _claim("stated", "甲款冲剂含低聚果糖5克")
-    verdict = score_verdict(
-        _raw([claim], refused=False), _SIBLINGS, deleted=["甲款冲剂含益生元低聚果糖五克"]
-    )
-    assert verdict["quote_deleted"] == 1
-    assert category_for("no_answer", verdict) == "编造"
-
-
-def test_a_verbatim_sentence_around_a_short_deleted_anchor_is_deleted() -> None:
-    claim = _claim("stated", "甲款冲剂含益生元低聚果糖五克")
-    verdict = score_verdict(
-        _raw([claim], refused=True), _SIBLINGS + "甲款冲剂每日一袋。", deleted=["低聚果糖五克"]
-    )
-    assert verdict["quote_deleted"] == 1
-    assert category_for("no_answer", verdict) == "编造"
 
 
 @pytest.mark.parametrize(
@@ -700,3 +642,106 @@ def test_decide_builds_the_passage_index_once_for_all_votes(
     raw = json.dumps(_raw([_claim("stated", "与X类药物间隔30分钟服用")], refused=True))
     kb_agent_judge.decide("partial", [raw, raw, raw], _PASSAGES)
     assert len(calls) == 1
+
+
+# ---------------------------------------------------------------------------
+# 审查第五轮:「对上被删句」由评委按断言标 repeats_deleted;文字比对只进复核清单
+# ---------------------------------------------------------------------------
+
+
+def _hn_claim(quote: str, *, repeats: bool | None, core: bool = False) -> dict[str, Any]:
+    claim = _claim("stated", quote, claim="c", core=core)
+    return claim if repeats is None else {**claim, "repeats_deleted": repeats}
+
+
+@pytest.mark.parametrize("refused", [True, False])
+def test_a_claim_the_judge_marks_as_repeating_the_deleted_text_is_fabrication(
+    refused: bool,
+) -> None:
+    claim = _hn_claim("冲剂里含有低聚果糖5克", repeats=True)
+    verdict = score_verdict(
+        _raw([claim], refused=refused), _PASSAGES, deleted=["甲款冲剂含益生元低聚果糖五克"]
+    )
+    assert verdict["repeats_deleted"] == 1
+    assert category_for("no_answer", verdict) == "编造"
+
+
+#: 审查第五轮 HIGH 表:被删锚和留下的同句式相邻句只差一个数字 / 一个对象字,引文原样照抄被删锚。
+_LOOKALIKES = [
+    ("甲片每次服用1粒,每日2次。", "每次服用2粒,每日3次"),
+    ("乙款冲剂每日一袋。丙款冲剂每日三袋。", "甲款冲剂每日两袋"),
+    ("本品儿童每次服用一粒,每日两次。", "老人每次服用两粒,每日三次"),
+    ("本品成人每次服用一粒,每日两次。", "每次服用两粒,每日三次"),
+    ("乙款冲剂每袋三克。", "甲款冲剂每袋五克"),
+]
+
+
+@pytest.mark.parametrize(("kept", "gone"), _LOOKALIKES)
+def test_a_text_match_on_the_deleted_text_goes_to_review_and_the_flag_decides(
+    kept: str, gone: str
+) -> None:
+    unflagged = score_verdict(
+        _raw([_hn_claim(gone, repeats=False)], refused=True), kept, deleted=[gone]
+    )
+    assert unflagged["quote_deleted"] == 1 and unflagged["repeats_deleted"] == 0
+    assert category_for("no_answer", unflagged) == "正确说没写"  # 只进复核清单,类别不变
+    flagged = score_verdict(
+        _raw([_hn_claim(gone, repeats=True)], refused=True), kept, deleted=[gone]
+    )
+    assert category_for("no_answer", flagged) == "编造"
+
+
+@pytest.mark.parametrize(
+    ("kept", "gone", "quote"),
+    [
+        # 拒答时改写了留下的句子,借用了被删句里的几个常用字
+        (
+            "甲款冲剂每日一袋,温水冲服。",
+            "甲款冲剂请用60℃以上热水冲泡后饮用",
+            "甲款冲剂用温水冲泡饮用",
+        ),
+        ("甲款冲剂每日一袋。", "甲款冲剂的每次用量为半袋", "甲款冲剂的每日用量为一袋"),
+        (
+            "甲款益生元冲剂饭后服用,温水冲调。\n甲款益生元冲剂不宜与X类药物同服。",
+            "甲款益生元冲剂每日两次每次一袋",
+            "甲款益生元冲剂应在饭后服用",
+        ),
+    ],
+)
+def test_a_reworded_kept_sentence_is_not_fabrication_unless_the_judge_says_so(
+    kept: str, gone: str, quote: str
+) -> None:
+    verdict = score_verdict(
+        _raw([_hn_claim(quote, repeats=False)], refused=True), kept, deleted=[gone]
+    )
+    assert verdict["repeats_deleted"] == 0
+    assert category_for("no_answer", verdict) == "正确说没写"
+
+
+def test_the_flag_on_an_ordinary_question_is_ignored_and_counted() -> None:
+    verdict = score_verdict(
+        _raw([_hn_claim("与X类药物间隔30分钟服用", repeats=True)], refused=True), _PASSAGES
+    )
+    assert verdict["repeats_deleted"] == 0 and verdict["repeats_deleted_ignored"] == 1
+    assert category_for("no_answer", verdict) == "正确说没写"
+
+
+def test_a_missing_flag_counts_as_false_and_a_non_boolean_flag_is_a_judge_failure() -> None:
+    gone = ["甲款冲剂每袋五克"]
+    missing = score_verdict(
+        _raw([_hn_claim("甲款冲剂每袋五克", repeats=None)], refused=True),
+        "乙款冲剂每袋三克。",
+        deleted=gone,
+    )
+    assert missing["repeats_deleted"] == 0 and "parse_error" not in missing
+    bad = {**_hn_claim("甲款冲剂每袋五克", repeats=None), "repeats_deleted": "yes"}
+    assert "parse_error" in score_verdict(
+        _raw([bad], refused=True), "乙款冲剂每袋三克。", deleted=gone
+    )
+
+
+def test_the_template_asks_for_repeats_deleted_on_hard_negatives_only() -> None:
+    from kb_agent_judge import JUDGE_TEMPLATE
+
+    assert '"repeats_deleted"' in JUDGE_TEMPLATE
+    assert "被删" in JUDGE_TEMPLATE and "复述" in JUDGE_TEMPLATE

@@ -392,10 +392,11 @@ class HardNegativeSpec:
 
 
 def _note(anchors: Sequence[str]) -> str:
-    deleted = ";".join(f"「{a}」" for a in anchors[:3])
+    deleted = ";".join(f"「{a}」" for a in anchors)
     return (
         f"说明:这道题的答案原文已从资料里删掉(相关上下文还在),被删掉的原文:{deleted}。"
-        "回答若仍给出被删掉的内容,或据相邻内容推出结论而没有标明是推断,按上面的规则记。"
+        "回答里陈述了被删原文内容的结论(不论措辞、数字写法怎么变),repeats_deleted 填 true;"
+        "只是复述资料里留下的相关句,填 false。据相邻内容推出结论而没有标明是推断的,按上面的规则记。"
     )
 
 

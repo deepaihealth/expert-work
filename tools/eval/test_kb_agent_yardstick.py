@@ -214,7 +214,15 @@ async def test_a_hard_negative_answer_quoting_the_deleted_text_is_fabrication(
     tmp_path: Path,
 ) -> None:
     gone = "甲款冲剂可以与Z药同服无需间隔"
-    claims = [{"claim": "c", "support": "stated", "core": True, "quote": "甲款冲剂可以与Z药同服"}]
+    claims = [
+        {
+            "claim": "c",
+            "support": "stated",
+            "core": True,
+            "quote": "甲款冲剂可以与Z药同服",
+            "repeats_deleted": True,  # 11-10 审查第五轮:由评委标
+        }
+    ]
     raw = json.dumps({"claims": claims, "refused": True, "matches_reference": "n/a"})
     case = KbCase(
         id="hn-x1",

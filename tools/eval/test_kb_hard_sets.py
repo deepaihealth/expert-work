@@ -584,3 +584,18 @@ def test_a_fact_right_after_a_bare_number_is_still_located(
     texts = {"a.md": f"# 合成\n\n{anchor}。\n", "b.md": f"# 合成\n\n{restated}\n"}
     _picked, _skipped, flagged = pick_hard_negatives([case], [], texts, n=3, seed=1)
     assert len(flagged) == 1 and flagged[0][0] == "h1"
+
+
+def test_the_judge_note_lists_every_deleted_anchor_and_asks_for_the_flag(tmp_path: Path) -> None:
+    # 审查第五轮:「对上被删句」由评委按断言标 repeats_deleted;说明里要有全部被删原文
+    anchors = [f"甲款第{i}条被删的说明文字" for i in range(5)]
+    path = tmp_path / "hn.yaml"
+    path.write_text(
+        yaml.safe_dump(
+            {"cases": [{"id": "h1", "query": "q", "anchors": anchors}]}, allow_unicode=True
+        ),
+        encoding="utf-8",
+    )
+    note = load_hard_negative_spec(path).notes["hn-h1"]
+    assert all(a in note for a in anchors)
+    assert "repeats_deleted" in note
