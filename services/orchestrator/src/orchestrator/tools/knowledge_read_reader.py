@@ -89,6 +89,21 @@ _NOT_INGESTED_NOTICE = (
     "[knowledge_read: a newer version of this document was uploaded but not ingested (its "
     "ingest failed or was cancelled); this is the version in use.]"
 )
+#: B-206 11-09 (A) — on every read that shows passages. The 11-05 traces: most
+#: answers the documents do not support were judgment questions, concluded from
+#: a file name, title or watermark, from two items sitting in the same table,
+#: from an item missing from a list, or from a rule stated for another item.
+#: Facts, not commands (B-163); about 75 tokens, and an old read collapses to its
+#: reference line, notice and all (``context.knowledge_reference``). The rule
+#: for what to answer is in ``knowledge_search``'s description
+#: (``KNOWLEDGE_ANSWERABILITY_RULE``).
+GROUNDING_NOTICE = (
+    "[knowledge_read: what this document states is what the passages shown say. A file "
+    "name, title, heading or watermark, and two items sitting in the same table or list, "
+    "show where text is, not that the items are related; that a list leaves an item out "
+    "does not make the item allowed; what a passage says about one item it does not say "
+    "about another.]"
+)
 #: Passage texts whose token counts a tool keeps (about 100 bytes each).
 _PASSAGE_TOKEN_ENTRIES = 10_000
 _CUT_NOTICE = (
@@ -371,6 +386,8 @@ class DocumentReader:
             lines.append(_REINGEST_NOTICE)
         elif self.doc.row.has_pending:
             lines.append(_NOT_INGESTED_NOTICE)
+        if shown:
+            lines.append(GROUNDING_NOTICE)
         return "\n".join(lines) or None
 
     def _result(

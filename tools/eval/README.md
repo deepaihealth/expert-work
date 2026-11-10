@@ -157,6 +157,26 @@ EXPERT_WORK_API_TOKEN=… uv run --no-sync python tools/eval/behavior_runner.py 
 改动前的版本 `knowledge_search` 没有 `bases` 参数,k01 / k02 的 `tool_arg_contains` 在基线上必然不过;对照时看其余判据
 (答对没有、检索次数)与 k03~k05 有没有退步。改 fixtures 要改 `make_fixtures.py` 重新生成,并把库里的文档换成新版。
 
+跨轮清理后的找回用例(B-206 track D,`k06` / `k07`,`--only` 选它们):跑在 `eval-kb-prune`(`eval-kb` 的副本,只绑一本
+合成说明书,跨轮清理门槛压到 3,000 / 500、一条都不保留),第 3 轮开头一定把前两轮的 `knowledge_search` 结果清成一行引用。
+`k06` 第 3 轮问的数就在第 1 轮检索到的段落里,看模型会不会按引用重读 / 重搜找回来;`k07` 问的是说明书只给相邻型号写了的
+参数,看重读之后会不会照邻居的数作答。**一次性准备**(同一个租户;嵌入费用几分钱):
+
+1. 建知识库 `b140-kb-manual`「VT 系列便携储能电源各型号的技术参数与存放保养说明(合成数据)」(名字与描述照
+   `make_fixtures.py` 的 `KB_MANUAL_BASE` / `KB_MANUAL_DESCRIPTION`),其余设置用默认值 —— 尺寸复核
+   (`test_behavior_kb_prune.py`)按默认设置算:一次检索返回整本说明书,两次就越过清理门槛。
+2. 把 `datasets/behavior/fixtures/kb/b140-kb-manual/` 下的文件上传到这个库,等文档变成就绪。
+3. 导入 `datasets/behavior/agents/eval-kb-prune.yaml`。
+
+```sh
+EXPERT_WORK_API_TOKEN=… uv run --no-sync python tools/eval/behavior_runner.py --label kb-prune-cand-$(date +%m%d) \
+  --only k06-recover-pruned-search,k07-pruned-search-not-stated
+```
+
+改动前的版本(没有 `knowledge_search` 的引用行)不清理没有工作区的智能体的旧检索结果,`k06` 在基线上等于原样都在、
+必然好答;对照时看的是改动后有没有稳定退步。`k06` 的 `turn_tokens_max` 是暂定上限、不是「清理发生了」的证据(基线一次
+调用就能答,输入反而可能更少),第一次 3× 真跑之后按实测最大值 ×1.5 改。
+
 多轮指代用例(B-206,`r01`~`r14`,`--only` 选它们):跑在 `eval-coref`,只绑一个合成知识库。测的是平台怎么带着
 整段对话把「它 / 那边 / 这份 / 第二个 / 那天 / 那价格呢 / 另一个呢 / 这两个」变成外发的检索参数和答复 —— 平台没有单独的
 改写层,主模型看着全部历史写 `knowledge_search.query`,所以放在真跑整段会话的 B-140,而不是单轮的 `kb_agent_eval.py`。

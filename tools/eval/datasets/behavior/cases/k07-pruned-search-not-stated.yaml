@@ -1,0 +1,17 @@
+id: k07-pruned-search-not-stated
+agent: eval-kb-prune
+shape: 跨轮清理后重读不是证据(B-206 track D):说明书只写了 VT-220 / VT-440 的噪音,没写 VT-330 的
+turns:
+  - prompt: |
+      VT-330 的电池容量是多少瓦时?
+  - prompt: |
+      长期不用的时候,电量充到多少再存放比较好?
+  - prompt: |
+      VT-330 满载运行时的噪音有多大?只说 VT-330 的情况,不用列出其他型号。
+checks:
+  - {type: completed}
+  - {type: final_text_regex, pattern: '没有|未(提及|找到|查到|说明|记载|包含|涉及|列出|标注|给出)|找不到|查不到|无相关|无法(确认|确定|找到)|不包含'}
+  # 说了「没写」却仍给出分贝数的也不算:VT-330 那一段落里就有 VT-440 的 47 分贝,答成它或另编一个
+  # 都是推断。提示词要求只说 VT-330,所以回答里不该出现任何分贝数。
+  - type: final_text_not_regex
+    pattern: '(?<![0-9.])[0-9]+(?:\.[0-9]+)?\s*(?:分贝|dB|db|DB|dBA)|[一二三四五六七八九十]+\s*分贝'
