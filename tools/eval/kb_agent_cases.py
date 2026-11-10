@@ -28,7 +28,8 @@ from kb_hard_sets import (  # type: ignore[import-not-found]
     load_hard_negative_spec,
     pick_distractors,
 )
-from kb_metrics import anchor_in, anchor_key  # type: ignore[import-not-found]
+from kb_metrics import anchor_in  # type: ignore[import-not-found]
+from kb_text_norm import fold_key  # type: ignore[import-not-found]
 
 from expert_work.persistence import KnowledgeStore
 from expert_work.protocol import DocumentStatus
@@ -75,12 +76,13 @@ async def gold_passages(
 async def store_residue(
     store: KnowledgeStore, *, tenant_id: UUID, kb_id: UUID, anchors: Sequence[str]
 ) -> list[str]:
-    """难负例臂:删过句的库里还能找到的锚(应为空;不空说明删句没删干净)。"""
-    keys = {a: anchor_key(a) for a in anchors}
+    """难负例臂:删过句的库里还能找到的锚(应为空;不空说明删句没删干净)。与删句同一个归一
+    (``fold_key``:含部首归一,11-10)。"""
+    keys = {a: fold_key(a) for a in anchors}
     left: set[str] = set()
     for doc in await store.list_documents(tenant_id=tenant_id, kb_id=kb_id):
         texts = await _all_chunk_texts(store, tenant_id=tenant_id, document_id=doc.id)
-        folded = "\n".join(anchor_key(t) for t in texts)
+        folded = "\n".join(fold_key(t) for t in texts)
         left |= {a for a, key in keys.items() if key and key in folded}
     return [a for a in anchors if a in left]
 
@@ -132,6 +134,8 @@ class RunPlan:
     guard_anchors: tuple[str, ...] = ()
     #: 难负例题号 → 它被删掉的锚:判分引文对上这些就是编造(11-09 复审)。
     deleted_by_case: dict[str, tuple[str, ...]] = field(default_factory=dict)
+    #: 难负例题号 → 原题的文字答案(答前复核给判分对照,11-10;原题不在评测集里时没有)。
+    original_answers: dict[str, str | None] = field(default_factory=dict)
     distractors: int = 0
 
 
@@ -140,7 +144,13 @@ def plan_run(args: argparse.Namespace, main_set: KbDataset, chat_set: KbDataset)
     if args.hard_negatives is not None:
         spec = load_hard_negative_spec(args.hard_negatives)
         control = [(label, c) for label, c in picked if c.expected]
+        originals = {c.id: c for c in (*main_set.cases, *chat_set.cases)}
+        answers = {
+            c.id: originals[c.tags[1]].answer if c.tags[1] in originals else None
+            for c in spec.cases
+        }
         return RunPlan(
+            original_answers=answers,
             cases=control + hard_negative_cases(spec),
             notes=dict(spec.notes),
             deleted_by_case=dict(spec.deleted),

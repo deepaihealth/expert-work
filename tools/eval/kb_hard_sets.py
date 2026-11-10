@@ -14,6 +14,13 @@
 * 只选 ``match: any`` 的题(「找全」题删一处删不干净);
 * 删掉的句子里不能含任何对照题的锚(否则对照题自己变成没答案);
 * 锚在语料里一处都找不到的不选(删不掉 = 题没变);有一处删不干净(跨的句子太多)的也不选。
+* **删后穷尽核对**(11-10,参考 CRUMQs / hermes-agent 造负例时逐个核对):对删过的整份语料,
+  参考答案里的关键事实(带单位的数字、型号 / 编号、引号里的短语,见 ``kb_text_norm.key_facts``;
+  没有文字答案就取被删的锚)换个说法、在别的文档或表格行里还在的,记「疑似仍可答」,默认剔除,
+  spec 的 ``excluded`` 只记题号和原因码(``fact_number`` / ``fact_code`` / ``fact_quote``)。
+  「还在」= 事实所在的那一句 / 表格行里,事实前后各一个锚长的窗口有 ≥ :data:`RESTATED_SHARE` 的锚用字
+  (在复述同一件事,不是别处碰巧同一个数);问句点了对象名(取自期望文档名)时,文档名或那一句里
+  还得有这个对象(别的产品的同一句是另一个对象的事实)。
 
 **近名干扰(有答案)**:问句点了名的对象 E(名字取自它期望文档的文件名),语料里还有一份
 文档名里带着近名 N(等长差一个字,或数字不同的同型号骨架,如 KX-305 / KX-217);这类题
@@ -49,7 +56,11 @@ import yaml
 sys.path.insert(0, str(Path(__file__).parent))
 
 from kb_dataset import KbCase, load_dataset, select_cases  # type: ignore[import-not-found]
-from kb_metrics import anchor_key  # type: ignore[import-not-found]
+from kb_text_norm import (  # type: ignore[import-not-found]
+    fold_key,
+    key_facts,
+    quote_key,
+)
 
 #: 跨几个相邻句子找一条锚(锚偶尔跨句号)。
 MAX_WINDOW = 3
@@ -106,13 +117,14 @@ def _windows_for(key: str, ukeys: Sequence[str]) -> set[int]:
 
 
 def delete_anchor_units(text: str, anchors: Iterable[str]) -> tuple[str, int]:
-    """删掉含任一锚(归一后比对,见 ``kb_metrics.anchor_key``)的句子 / 表格行,每处出现都删。
+    """删掉含任一锚(归一后比对,见 ``kb_text_norm.fold_key``:``kb_metrics.anchor_key`` 加部首
+    归一,11-10)的句子 / 表格行,每处出现都删。
     返回 ``(新文本, 删了几句)``。"""
     units = split_units(text)
-    ukeys = [anchor_key(u) for u in units]
+    ukeys = [fold_key(u) for u in units]
     drop: set[int] = set()
     for anchor in anchors:
-        key = anchor_key(anchor)
+        key = fold_key(anchor)
         if key:
             drop |= _windows_for(key, ukeys)
     if not drop:
@@ -122,8 +134,8 @@ def delete_anchor_units(text: str, anchors: Iterable[str]) -> tuple[str, int]:
 
 def residue(text: str, anchors: Iterable[str]) -> list[str]:
     """还能在 ``text`` 里找到的锚。"""
-    folded = anchor_key(text)
-    return [a for a in anchors if anchor_key(a) and anchor_key(a) in folded]
+    folded = fold_key(text)
+    return [a for a in anchors if fold_key(a) and fold_key(a) in folded]
 
 
 class ControlAnchorDeletedError(ValueError):
@@ -146,7 +158,7 @@ class AnchorDeletingParser:
     def apply(self, text: str, *, filename: str) -> str:
         """删句;``guard`` 里的对照锚原文有、删后没了就报错(这份库不能用来量误拒)。"""
         deleted, _dropped = delete_anchor_units(text, self.anchors)
-        keys = {anchor_key(a): a for a in self.guard}
+        keys = {fold_key(a): a for a in self.guard}
         lost = [keys[k] for k in _lost(text, deleted, list(keys))]
         if lost:
             raise ControlAnchorDeletedError(f"{filename}: deletion removes control anchors {lost}")
@@ -177,16 +189,16 @@ class HardNegative:
 
 
 def _dropped_units(text: str, anchors: Sequence[str]) -> int:
-    ukeys = [anchor_key(u) for u in split_units(text)]
+    ukeys = [fold_key(u) for u in split_units(text)]
     drop: set[int] = set()
     for anchor in anchors:
-        drop |= _windows_for(anchor_key(anchor), ukeys)
+        drop |= _windows_for(fold_key(anchor), ukeys)
     return len(drop)
 
 
 def _lost(before: str, after: str, keys: Sequence[str]) -> list[str]:
     """删句前在、删句后不在的锚(都按归一形)。"""
-    folded_before, folded_after = anchor_key(before), anchor_key(after)
+    folded_before, folded_after = fold_key(before), fold_key(after)
     return [k for k in keys if k and k in folded_before and k not in folded_after]
 
 
@@ -197,19 +209,24 @@ def pick_hard_negatives(
     *,
     n: int,
     seed: int = DEFAULT_SEED,
-) -> tuple[list[HardNegative], dict[str, int]]:
-    """按固定种子打乱后依次试,取够 ``n`` 道;返回 ``(选中的, 跳过原因计数)``。
+    keep_suspects: bool = False,
+) -> tuple[list[HardNegative], dict[str, int], list[tuple[str, str]]]:
+    """按固定种子打乱后依次试,取够 ``n`` 道;返回 ``(选中的, 跳过原因计数, 疑似仍可答的
+    (题号, 原因码))``。疑似的默认剔除(计进 ``answer_still_present``),``keep_suspects`` 时照选、
+    只列出来。
 
     对照题核对按**累计**删句算(11-09 评审):候选加进来后,把已选的锚 + 它的锚一起从原文删
     (与评测建库时 :class:`AnchorDeletingParser` 一次删全部锚相同),每份它动到的文档里,删前
     在的对照锚删后都还得在 —— 只删半句、跨句整段删、两道题各删一处合起来删光,都算伤到对照。"""
-    control_keys = [anchor_key(e.anchor) for c in control for e in c.expected]
-    folded = {name: anchor_key(text) for name, text in texts.items()}
+    control_keys = [fold_key(e.anchor) for c in control for e in c.expected]
+    folded = {name: fold_key(text) for name, text in texts.items()}
     order = sorted(candidates, key=lambda c: c.id)
     random.Random(seed).shuffle(order)  # noqa: S311 - a reproducible sample
     picked: list[HardNegative] = []
     chosen: list[str] = []  # 已选的锚(累计)
     skipped: Counter[str] = Counter()
+    flagged: list[tuple[str, str]] = []
+    corpus = _DeletedCorpus(texts)
     for case in order:
         if len(picked) >= n:
             break
@@ -223,7 +240,7 @@ def pick_hard_negatives(
             skipped["anchor_not_found"] += 1
             continue
         trial = [*chosen, *anchors]
-        keys = [anchor_key(a) for a in anchors]
+        keys = [fold_key(a) for a in anchors]
         holding = [name for name, f in folded.items() if any(k and k in f for k in keys)]
         if any(residue(delete_anchor_units(texts[name], trial)[0], anchors) for name in holding):
             # 有一处跨了 MAX_WINDOW 句以上删不掉:选上了建库后残留检查也会停(11-09 复审)
@@ -235,6 +252,12 @@ def pick_hard_negatives(
         ):
             skipped["touches_control"] += 1
             continue
+        reason = corpus.still_present(case, anchors, trial)
+        if reason is not None:
+            flagged.append((case.id, reason))
+            if not keep_suspects:
+                skipped["answer_still_present"] += 1
+                continue
         chosen += anchors
         picked.append(
             HardNegative(
@@ -244,7 +267,103 @@ def pick_hard_negatives(
                 documents=documents,
             )
         )
-    return picked, dict(skipped)
+    return picked, dict(skipped), flagged
+
+
+#: 删后核对:事实出现处的窗口里至少要有锚的几成用字,才算在复述被删的那件事。
+RESTATED_SHARE = 0.6
+
+
+class _DeletedCorpus:
+    """删后穷尽核对用的语料视图:每份文档的投影(整份 + 逐句 / 表格行)。没被删句动到的文档用
+    原文的(只算一次),动到的按这次累计的锚现删(按文档里实际含的那几条锚缓存)。"""
+
+    def __init__(self, texts: Mapping[str, str]) -> None:
+        self.texts = texts
+        self.folded = {name: fold_key(text) for name, text in texts.items()}
+        self.names = {name: quote_key(name) for name in texts}
+        self.base = {name: _projected(text) for name, text in texts.items()}
+        self.cache: dict[tuple[str, tuple[str, ...]], tuple[str, list[str]]] = {}
+
+    def views(self, anchors: Sequence[str]) -> dict[str, tuple[str, list[str]]]:
+        keys = {a: fold_key(a) for a in anchors}
+        out = dict(self.base)
+        for name, folded in self.folded.items():
+            inside = tuple(sorted(a for a, k in keys.items() if k and k in folded))
+            if not inside:
+                continue
+            if (name, inside) not in self.cache:
+                deleted = delete_anchor_units(self.texts[name], inside)[0]
+                self.cache[(name, inside)] = _projected(deleted)
+            out[name] = self.cache[(name, inside)]
+        return out
+
+    def still_present(
+        self, case: KbCase, anchors: Sequence[str], trial: Sequence[str]
+    ) -> str | None:
+        """删掉 ``trial``(已选 + 这道题的锚)之后,这道题的答案还在库里的原因码;不在就 None。
+        事实要与复述同一件事的上下文出现在同一句 / 表格行里(见模块说明);问句点了对象名时,
+        文档名或那一句里得有这个对象。"""
+        facts = key_facts(case.answer or "\n".join(anchors))
+        if not facts:
+            return None
+        anchor_sets = [set(quote_key(a)) for a in anchors if quote_key(a)]
+        width = max((len(quote_key(a)) for a in anchors), default=0)
+        own = {e.document for e in case.expected}
+        named = [quote_key(x) for x in entity_names(own) if x in case.query]
+        for name, (whole, units) in self.views(trial).items():
+            for kind, value in facts:
+                if not _positions(kind, value, whole):
+                    continue
+                for unit in units:
+                    if named and not any(x in unit or x in self.names[name] for x in named):
+                        continue
+                    if any(
+                        _restated(unit[max(0, at - width) : at + len(value) + width], anchor_sets)
+                        for at in _positions(kind, value, unit)
+                    ):
+                        return f"fact_{kind}"
+        return None
+
+
+def _projected(text: str) -> tuple[str, list[str]]:
+    units = [quote_key(u) for u in split_units(text)]
+    return "".join(units), [u for u in units if u]
+
+
+def _positions(kind: str, value: str, key: str) -> list[int]:
+    if kind == "number":
+        return [m.start() for m in re.finditer(rf"(?<![0-9.]){re.escape(value)}", key)]
+    return [m.start() for m in re.finditer(re.escape(value), key)]
+
+
+def _restated(window: str, anchor_sets: Sequence[set[str]]) -> bool:
+    chars = set(window)
+    return any(len(chars & s) >= RESTATED_SHARE * len(s) for s in anchor_sets)
+
+
+def spec_document(
+    picked: Sequence[HardNegative],
+    skipped: Mapping[str, int],
+    flagged: Sequence[tuple[str, str]],
+    *,
+    texts: Mapping[str, str],
+    set_of: Mapping[str, str],
+    keep_suspects: bool,
+    header: Mapping[str, Any],
+) -> dict[str, Any]:
+    """写进 spec 的内容。疑似仍可答的题只记题号与原因码(不记原文):剔除了的在 ``excluded``,
+    ``--keep-suspects`` 留下的在 ``suspects``。"""
+    touched = sorted({d for p in picked for d in p.documents})
+    listed = [{"id": case_id, "reason": reason} for case_id, reason in flagged]
+    return {
+        **header,
+        "skipped": dict(skipped),
+        ("suspects" if keep_suspects else "excluded"): listed,
+        # 删过句的文档要重新切块、嵌入(其余文档嵌入走缓存):估价用。
+        "touched": {"documents": len(touched), "chars": sum(len(texts[d]) for d in touched)},
+        "cases": [p.to_spec(set_of[p.case.id]) for p in picked],
+    }
 
 
 @dataclass(frozen=True)
@@ -364,7 +483,7 @@ class Distractor:
         near = "、".join(f"「{n}」" for n in self.near)
         return (
             f"说明:资料里还有名字相近的{near},与本题的「{self.entity}」不是同一个对象;"
-            f"把它们的内容当成「{self.entity}」的回答,该结论 support 记 unsupported,"
+            f"把它们的内容当成「{self.entity}」的回答,该结论 support 记 misattributed,"
             "matches_reference 填 no。"
         )
 
@@ -503,6 +622,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--n", type=int, default=30)
     parser.add_argument("--workers", type=int, default=os.cpu_count() or 1)
     parser.add_argument("--seed", type=int, default=DEFAULT_SEED)
+    parser.add_argument(
+        "--keep-suspects",
+        action="store_true",
+        help="删后核对判为疑似仍可答的题照选(只列进 spec 的 suspects);默认剔除",
+    )
     parser.add_argument("--out", type=Path, required=True)
     args = parser.parse_args(argv)
 
@@ -526,24 +650,29 @@ def main(argv: Sequence[str] | None = None) -> int:
     candidates = [
         c for c in (*main_set.cases, *chat_set.cases) if c.expected and c.id not in control_ids
     ]
-    picked, skipped = pick_hard_negatives(candidates, control, texts, n=args.n, seed=args.seed)
-    touched = sorted({d for p in picked for d in p.documents})
-    spec = {
-        "seed": args.seed,
-        "datasets": [main_set.name, chat_set.name],
-        "parsed": len(texts),
-        "unparsed": failed,
-        "skipped": skipped,
-        # 删过句的文档要重新切块、嵌入(其余文档嵌入走缓存):估价用。
-        "touched": {"documents": len(touched), "chars": sum(len(texts[d]) for d in touched)},
-        "cases": [p.to_spec(set_of[p.case.id]) for p in picked],
-    }
+    picked, skipped, flagged = pick_hard_negatives(
+        candidates, control, texts, n=args.n, seed=args.seed, keep_suspects=args.keep_suspects
+    )
+    spec = spec_document(
+        picked,
+        skipped,
+        flagged,
+        texts=texts,
+        set_of=set_of,
+        keep_suspects=args.keep_suspects,
+        header={
+            "seed": args.seed,
+            "datasets": [main_set.name, chat_set.name],
+            "parsed": len(texts),
+            "unparsed": failed,
+        },
+    )
     args.out.parent.mkdir(parents=True, exist_ok=True)
     args.out.write_text(yaml.safe_dump(spec, allow_unicode=True, sort_keys=False), "utf-8")
     deleted = sum(p.deleted_units for p in picked)
     print(
         f"picked {len(picked)} hard negatives ({deleted} sentences/rows deleted); "
-        f"skipped {skipped}; candidates {len(candidates)} -> {args.out}"
+        f"skipped {skipped}; suspects {len(flagged)}; candidates {len(candidates)} -> {args.out}"
     )
     return 0
 

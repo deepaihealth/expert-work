@@ -21,11 +21,11 @@ from kb_dataset import KbCase, KbExpected  # type: ignore[import-not-found]
 _PASSAGES = "甲款冲剂请与60℃以上热水间隔30分钟服用,与X类药物间隔30分钟服用(Y类药物需间隔2小时)。"
 
 
-def _claim(support: str, quote: str = "", claim: str = "c") -> dict[str, str]:
-    return {"claim": claim, "support": support, "quote": quote}
+def _claim(support: str, quote: str = "", claim: str = "c", *, core: bool = True) -> dict[str, Any]:
+    return {"claim": claim, "support": support, "quote": quote, "core": core}
 
 
-def _raw(claims: list[dict[str, str]], *, refused: bool, matches: str = "n/a") -> dict[str, Any]:
+def _raw(claims: list[dict[str, Any]], *, refused: bool, matches: str = "n/a") -> dict[str, Any]:
     return {"claims": claims, "refused": refused, "matches_reference": matches, "reason": "r"}
 
 
@@ -90,12 +90,12 @@ def test_a_stated_claim_whose_quote_is_not_in_the_passages_is_not_a_related_fact
     assert category_for("partial", verdict) == "只说没写"
 
 
-def test_an_unfound_quote_in_a_non_refusing_no_answer_reply_is_fabrication() -> None:
-    # 资料没写的题上没说「资料没写」、又拿一句在资料里找不到的「原文」当依据:按编造记
+def test_an_unfound_quote_alone_no_longer_makes_a_no_answer_reply_fabrication() -> None:
+    # 11-10:引文找不到只进「待复核」清单,不再单独导致编造(判分抄表格 / 改写引文的方式会误伤)
     raw = _raw([_claim("stated", "与Z药间隔两小时服用")], refused=False)
     verdict = score_verdict(raw, _PASSAGES)
     assert verdict["fabricated"] is False and verdict["quote_misses"] == 1
-    assert category_for("no_answer", verdict) == "编造"
+    assert category_for("no_answer", verdict) == "其它"
     assert category_for("partial", verdict) == "其它"
 
 
@@ -110,7 +110,10 @@ def test_quote_match_ignores_spacing_and_full_width_punctuation() -> None:
         {"parse_error": "x"},
         {"refused": True, "matches_reference": "n/a"},  # 没有 claims
         {"claims": "none", "refused": True},
-        {"claims": [{"claim": "c", "support": "maybe"}], "refused": True},
+        {"claims": [{"claim": "c", "support": "maybe", "core": True}], "refused": True},
+        # 11-10:每条结论要带布尔的 core
+        {"claims": [{"claim": "c", "support": "stated", "quote": "q"}], "refused": True},
+        {"claims": [{"claim": "c", "support": "stated", "core": "yes"}], "refused": True},
         {"claims": [], "refused": "yes"},
     ],
 )
@@ -132,7 +135,7 @@ def test_malformed_verdicts_are_judge_failures(raw: dict[str, Any]) -> None:
     ],
 )
 def test_answerable_categories(
-    claims: list[dict[str, str]], refused: bool, matches: str, expected: str
+    claims: list[dict[str, Any]], refused: bool, matches: str, expected: str
 ) -> None:
     verdict = score_verdict(_raw(claims, refused=refused, matches=matches), _PASSAGES)
     assert category_for("answerable", verdict) == expected
@@ -316,3 +319,132 @@ def test_only_the_pieces_not_found_decide_a_deleted_match() -> None:
         _raw([_claim("stated", quote)], refused=True), _PASSAGES, deleted=deleted
     )
     assert (verdict["quote_deleted"], verdict["quote_misses"]) == (0, 1)
+
+
+# ---------------------------------------------------------------------------
+# 11-10 尺子:分级,不再一票否决
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("support", ["contradicted", "misattributed"])
+def test_contradicted_or_misattributed_claims_are_fabrication_even_when_not_core(
+    support: str,
+) -> None:
+    verdict = score_verdict(_raw([_claim(support, core=False)], refused=True), _PASSAGES)
+    assert verdict["fabricated"] is True
+    for label in CATEGORIES:
+        assert category_for(label, verdict) == "编造"
+
+
+@pytest.mark.parametrize("support", ["unsupported", "inferred_unlabeled"])
+def test_only_a_core_unsupported_or_unlabeled_claim_is_fabrication(support: str) -> None:
+    core = score_verdict(_raw([_claim(support, core=True)], refused=True), _PASSAGES)
+    assert core["fabricated"] is True
+    assert category_for("no_answer", core) == "编造"
+    side = score_verdict(_raw([_claim(support, core=False)], refused=True), _PASSAGES)
+    assert side["fabricated"] is False
+    assert category_for("no_answer", side) != "编造"
+
+
+@pytest.mark.parametrize("support", ["unsupported", "inferred_unlabeled"])
+def test_a_side_inference_downgrades_a_good_answer_to_carrying_inference(support: str) -> None:
+    fact = _claim("stated", "与X类药物间隔30分钟服用", core=False)
+    side = _claim(support, claim="空腹喝效果更好", core=False)
+    refusing = score_verdict(_raw([fact, side], refused=True), _PASSAGES)
+    assert refusing["fabricated"] is False and refusing["inferred_extra"] == 1
+    assert category_for("no_answer", refusing) == "夹带推断"
+    assert category_for("partial", refusing) == "夹带推断"
+    answered = score_verdict(
+        _raw([{**fact, "core": True}, side], refused=False, matches="yes"), _PASSAGES
+    )
+    assert category_for("answerable", answered) == "夹带推断"
+
+
+def test_a_side_inference_leaves_a_bad_outcome_as_it_was() -> None:
+    side = _claim("unsupported", claim="空腹喝效果更好", core=False)
+    verdict = score_verdict(_raw([side], refused=True, matches="no"), _PASSAGES)
+    assert category_for("answerable", verdict) == "误拒"
+    assert category_for("partial", verdict) == "只说没写"
+
+
+def test_carrying_inference_is_a_category_of_every_label() -> None:
+    for cats in CATEGORIES.values():
+        assert "夹带推断" in cats
+
+
+def test_no_source_needed_claims_are_neither_fabrication_nor_related_facts() -> None:
+    # 「不能替代药物」「如有不适请咨询医生」这类通用提示不需要出处
+    tip = _claim("no_source_needed", claim="本品不能替代药物", core=False)
+    verdict = score_verdict(_raw([tip], refused=True), _PASSAGES)
+    assert verdict["fabricated"] is False and verdict["inferred_extra"] == 0
+    assert category_for("no_answer", verdict) == "正确说没写"
+    assert category_for("partial", verdict) == "只说没写"
+
+
+def test_a_no_answer_reply_whose_core_conclusion_has_no_source_is_fabrication() -> None:
+    # 资料没写的题没说没写,结论本身又没有依据(判分模型把它记成「不需要出处」也一样)
+    core = _claim("no_source_needed", claim="可以一起吃", core=True)
+    verdict = score_verdict(_raw([core], refused=False), _PASSAGES)
+    assert category_for("no_answer", verdict) == "编造"
+    said_so = score_verdict(_raw([core], refused=True), _PASSAGES)
+    assert category_for("no_answer", said_so) == "正确说没写"
+
+
+def test_grounded_claim_counts_leave_out_claims_that_need_no_source() -> None:
+    claims = [
+        _claim("stated", "与X类药物间隔30分钟服用"),
+        _claim("inferred_labeled", core=False),
+        _claim("unsupported", core=False),
+        _claim("no_source_needed", core=False),
+    ]
+    verdict = score_verdict(_raw(claims, refused=True), _PASSAGES)
+    assert (verdict["grounded_claims"], verdict["counted_claims"]) == (2, 3)
+
+
+def test_the_template_defines_the_new_supports_core_and_the_restatement_rule() -> None:
+    from kb_agent_judge import JUDGE_TEMPLATE, SUPPORTS
+
+    for support in ("contradicted", "misattributed", "no_source_needed"):
+        assert f'"{support}"' in JUDGE_TEMPLATE
+        assert support in SUPPORTS
+    assert '"core"' in JUDGE_TEMPLATE
+    # 复述、概括、只用原文数字的简单算术算 stated
+    for words in ("复述", "概括", "算术"):
+        assert words in JUDGE_TEMPLATE
+
+
+def test_the_scoring_rules_moved_past_the_veto_yardstick() -> None:
+    from kb_agent_judge import SCORING_RULES, yardstick_of
+
+    assert SCORING_RULES == "2026-11-10.1"
+    assert yardstick_of() != "2026-11-09.3+902042cf"
+
+
+# ---------------------------------------------------------------------------
+# 11-10 引文核对放宽:同一投影、表格按行列序列化、数字核对
+# ---------------------------------------------------------------------------
+
+_TABLE = (
+    "| 品名 | 规格 | 用量 |\n| --- | --- | --- |\n| 甲款 | 10g | 每天1袋 |\n| 乙款 | 5g | 每天2袋 |"
+)
+
+
+def test_a_quote_that_pairs_a_table_header_with_its_cell_is_found() -> None:
+    raw = _raw([_claim("stated", "品名:甲款,规格:10g,用量:每天1袋")], refused=True)
+    verdict = score_verdict(raw, _TABLE)
+    assert (verdict["related_facts"], verdict["quote_misses"]) == (1, 0)
+
+
+def test_a_quote_matches_text_spelled_with_radical_characters() -> None:
+    passages = "适用:饮\u2edd清淡的成年人。"
+    raw = _raw([_claim("stated", "饮食清淡的成年人")], refused=True)
+    assert score_verdict(raw, passages)["related_facts"] == 1
+
+
+def test_a_number_with_a_unit_in_the_quote_must_be_in_the_passages() -> None:
+    # 省略号后面那段太短不核对;但它带的「5小时」资料里没有
+    raw = _raw([_claim("stated", "甲款冲剂请与60℃以上热水……间隔5小时")], refused=True)
+    verdict = score_verdict(raw, _PASSAGES)
+    assert (verdict["related_facts"], verdict["quote_misses"]) == (0, 1)
+    ok = _raw([_claim("stated", "甲款冲剂请与60℃以上热水……间隔2小时")], refused=True)
+    assert score_verdict(ok, _PASSAGES)["related_facts"] == 1

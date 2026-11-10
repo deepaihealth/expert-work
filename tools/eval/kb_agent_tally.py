@@ -9,6 +9,10 @@
 
 同一份结果按答题模型分节;给几个模型的结果文件就多一张「分模型对比」表。
 旧结果行(没有 ``label`` / ``agreement``)按 ``answerable`` 推标签,照样能统计。
+
+11-10 尺子:「夹带推断」(本来合格、夹带了旁支推断)按标签单列;难负例答前复核判为答案仍在库里的
+题(``excluded_answer_still_present``)不进任何分母,单列题号;断言级「有依据的断言占比」
+(``stated`` + ``inferred_labeled`` / 除「不需要出处」外的全部断言)按集、按文件(臂)报。
 """
 
 from __future__ import annotations
@@ -22,7 +26,13 @@ from typing import Any
 
 sys.path.insert(0, str(Path(__file__).parent))
 
-from kb_agent_judge import CATEGORIES, DISAGREE, FAILED  # type: ignore[import-not-found]
+from kb_agent_judge import (  # type: ignore[import-not-found]
+    CARRYING,
+    CATEGORIES,
+    DISAGREE,
+    EXCLUDED,
+    FAILED,
+)
 
 _LABEL_TITLES = {"no_answer": "资料没写", "answerable": "有答案", "partial": "部分写了"}
 #: 分集按这个顺序列,其余集名按字母排在后面。
@@ -55,9 +65,15 @@ def row_label(row: Mapping[str, Any]) -> str:
     return "answerable" if row.get("answerable") else "no_answer"
 
 
+def scored(rows: Iterable[Mapping[str, Any]]) -> list[Mapping[str, Any]]:
+    """去掉答前复核剔除的题(它们不答、不进任何分母)。"""
+    return [r for r in rows if r["category"] != EXCLUDED]
+
+
 def headline_rates(rows: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
     """``abstain`` / ``false_refusal`` / ``style_b`` 是 ``(分子, 分母)``;分母 = 该标签全部题
-    (判分失败 / 分歧也在分母里,另外单列)。"""
+    (判分失败 / 分歧 / 夹带推断也在分母里,另外单列);答前复核剔除的题不算。"""
+    rows = scored(rows)
     by_label: dict[str, Counter[str]] = {label: Counter() for label in CATEGORIES}
     for row in rows:
         by_label.setdefault(row_label(row), Counter())[row["category"]] += 1
@@ -69,6 +85,7 @@ def headline_rates(rows: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
         "fabricated": no_answer["编造"],
         "false_refusal": (answerable["误拒"], answerable.total()),
         "style_b": (partial["B式作答"], partial.total()),
+        "carrying": {k: by_label[k][CARRYING] for k in ("no_answer", "answerable", "partial")},
         "disagree": sum(1 for r in rows if r["category"] == DISAGREE),
         "failed": sum(1 for r in rows if r["category"] == FAILED),
     }
@@ -121,16 +138,46 @@ def _unanimous(rows: Sequence[Mapping[str, Any]]) -> str:
 
 def _headline(rows: Sequence[Mapping[str, Any]]) -> list[str]:
     r = headline_rates(rows)
-    return [
+    carry = r["carrying"]
+    kept = scored(rows)
+    excluded = [str(x["case_id"]) for x in rows if x["category"] == EXCLUDED]
+    lines = [
         "## 头条(三个数一起看)",
-        f"  资料没写 n={r['abstain'][1]}:该拒拒了 {_pct(r['abstain'])},编造 {r['fabricated']}",
-        f"  有答案 n={r['false_refusal'][1]}:不该拒却拒了 {_pct(r['false_refusal'])}",
-        f"  部分写了 n={r['style_b'][1]}:B 式作答 {_pct(r['style_b'])}",
+        f"  资料没写 n={r['abstain'][1]}:该拒拒了 {_pct(r['abstain'])},"
+        f"夹带推断 {carry['no_answer']},编造 {r['fabricated']}",
+        f"  有答案 n={r['false_refusal'][1]}:不该拒却拒了 {_pct(r['false_refusal'])},"
+        f"夹带推断 {carry['answerable']}",
+        f"  部分写了 n={r['style_b'][1]}:B 式作答 {_pct(r['style_b'])},夹带推断 {carry['partial']}",
         _fab_line(r),
-        f"  判分:分歧 {r['disagree']},失败 {r['failed']};全票一致 {_unanimous(rows)}",
-        _quote_list(rows, "quote_misses", "引文在资料里没找到"),
-        _quote_list(rows, "quote_unchecked", "引文空或太短、核对不了"),
+        f"  判分:分歧 {r['disagree']},失败 {r['failed']};全票一致 {_unanimous(kept)}",
+        _quote_list(kept, "quote_misses", "待复核·引文在资料里没找到"),
+        _quote_list(kept, "quote_unchecked", "引文空或太短、核对不了"),
+        _grounded_line(kept),
     ]
+    if excluded:
+        lines.append(
+            "  复核剔除(答前检索判为答案仍在库里,不答、不进分母):"
+            f"{len(excluded)} 题({', '.join(excluded)})"
+        )
+    return lines
+
+
+def _grounded(rows: Iterable[Mapping[str, Any]]) -> Rate:
+    verdicts = [r.get("verdict") or {} for r in rows]
+    return (
+        sum(int(v.get("grounded_claims") or 0) for v in verdicts),
+        sum(int(v.get("counted_claims") or 0) for v in verdicts),
+    )
+
+
+def _grounded_by_set(rows: Sequence[Mapping[str, Any]], sep: str) -> str:
+    parts = [f"all {_pct(_grounded(rows))}"]
+    parts += [f"{s} {_pct(_grounded(r for r in rows if r['set'] == s))}" for s in _sets(rows)]
+    return sep.join(parts)
+
+
+def _grounded_line(rows: Sequence[Mapping[str, Any]]) -> str:
+    return "  有依据的断言占比:" + _grounded_by_set(rows, ";")
 
 
 def _sets(rows: Iterable[Mapping[str, Any]]) -> list[str]:
@@ -139,6 +186,7 @@ def _sets(rows: Iterable[Mapping[str, Any]]) -> list[str]:
 
 
 def _breakdown(rows: Sequence[Mapping[str, Any]]) -> list[str]:
+    rows = scored(rows)
     lines: list[str] = []
     for label, cats in CATEGORIES.items():
         mine = [r for r in rows if row_label(r) == label]
@@ -221,8 +269,10 @@ def tally(paths: Path | Sequence[Path]) -> str:
     files = [paths] if isinstance(paths, Path) else list(paths)
     by_model: dict[str, list[dict[str, Any]]] = {}
     runs_by_model: dict[str, list[dict[str, Any]]] = {}
+    by_file: dict[str, list[dict[str, Any]]] = {}
     for path in files:
         rows, runs = read_results(path)
+        by_file[path.name] = rows
         for row in rows:
             by_model.setdefault(str(row.get("answer_model")), []).append(row)
         for run in runs:
@@ -234,7 +284,12 @@ def tally(paths: Path | Sequence[Path]) -> str:
         lines += _headline(rows) + _breakdown(rows) + _usage(rows, runs_by_model.get(model, []))
     if len(by_model) > 1:
         lines += _compare(by_model)
+    if len(by_file) > 1:
+        lines.append("## 有依据的断言占比(按文件、按集;不需要出处的断言不进分母)")
+        lines += [
+            f"  {name} | {_grounded_by_set(scored(rows), ' | ')}" for name, rows in by_file.items()
+        ]
     return "\n".join(lines)
 
 
-__all__ = ["headline_rates", "read_results", "row_label", "tally"]
+__all__ = ["headline_rates", "read_results", "row_label", "scored", "tally"]

@@ -60,7 +60,7 @@ def test_headline_rates_always_come_together() -> None:
 
 def test_tally_prints_the_three_headline_numbers_side_by_side(tmp_path: Path) -> None:
     text = tally([_write(tmp_path / "a.jsonl", _ROWS)])
-    assert "资料没写 n=4:该拒拒了 50.0%(2/4),编造 1" in text
+    assert "资料没写 n=4:该拒拒了 50.0%(2/4),夹带推断 0,编造 1" in text
     assert "有答案 n=2:不该拒却拒了 50.0%(1/2)" in text
     assert "部分写了 n=2:B 式作答 50.0%(1/2)" in text
     assert "判分:分歧 1,失败 0;全票一致 6/8" in text
@@ -68,9 +68,9 @@ def test_tally_prints_the_three_headline_numbers_side_by_side(tmp_path: Path) ->
 
 def test_tally_breaks_each_label_down_by_set_including_the_derived_sets(tmp_path: Path) -> None:
     text = tally([_write(tmp_path / "a.jsonl", _ROWS)]).splitlines()
-    assert "  hard_negative n=1 正确说没写 1 编造 0 其它 0 判分失败 0 判分分歧 0" in text
-    assert "  distractor n=1 答对 0 误拒 1 编造 0 答偏 0 判分失败 0 判分分歧 0" in text
-    assert "  chat n=2 B式作答 1 只说没写 1 编造 0 其它 0 判分失败 0 判分分歧 0" in text
+    assert "  hard_negative n=1 正确说没写 1 夹带推断 0 编造 0 其它 0 判分失败 0 判分分歧 0" in text
+    assert "  distractor n=1 答对 0 夹带推断 0 误拒 1 编造 0 答偏 0 判分失败 0 判分分歧 0" in text
+    assert "  chat n=2 B式作答 1 夹带推断 0 只说没写 1 编造 0 其它 0 判分失败 0 判分分歧 0" in text
 
 
 def test_tally_splits_by_answer_model_and_compares_them(tmp_path: Path) -> None:
@@ -87,7 +87,7 @@ def test_tally_splits_by_answer_model_and_compares_them(tmp_path: Path) -> None:
 def test_rows_from_before_labels_are_read_by_answerable(tmp_path: Path) -> None:
     old = [{k: v for k, v in r.items() if k not in ("label", "agreement")} for r in _ROWS[:5]]
     text = tally([_write(tmp_path / "a.jsonl", old)])
-    assert "资料没写 n=4:该拒拒了 50.0%(2/4),编造 1" in text
+    assert "资料没写 n=4:该拒拒了 50.0%(2/4),夹带推断 0,编造 1" in text
     assert "有答案 n=1:不该拒却拒了 0.0%(0/1)" in text
 
 
@@ -126,7 +126,7 @@ def test_quote_misses_are_listed_per_label_with_case_ids(tmp_path: Path) -> None
         _row("a1", "answerable", "答对"),
     ]
     text = tally([_write(tmp_path / "a.jsonl", rows)])
-    assert "  引文在资料里没找到:资料没写 2 题(n1, h1);部分写了 1 题(p1);有答案 0 题" in text
+    assert "  待复核·引文在资料里没找到:资料没写 2 题(n1, h1);部分写了 1 题(p1);有答案 0 题" in text
 
 
 def test_quotes_that_cannot_be_checked_are_listed_apart(tmp_path: Path) -> None:
@@ -158,3 +158,56 @@ def test_the_tally_says_which_production_prompt_parts_each_run_had(tmp_path: Pat
     )
     text = tally([path])
     assert "照生产加的提示段:无(基线) | answer_check, outgoing_reference" in text
+
+
+# ---------------------------------------------------------------------------
+# 11-10:夹带推断单列、复核剔除不进分母、断言级「有依据的断言占比」
+# ---------------------------------------------------------------------------
+
+
+def test_carrying_inference_is_counted_apart_for_each_label(tmp_path: Path) -> None:
+    rows = [
+        *_ROWS,
+        _row("n5", "no_answer", "夹带推断"),
+        _row("a3", "answerable", "夹带推断"),
+        _row("p3", "partial", "夹带推断", set_="chat"),
+    ]
+    rates = headline_rates(rows)
+    assert rates["carrying"] == {"no_answer": 1, "answerable": 1, "partial": 1}
+    assert rates["abstain"] == (2, 5)  # 夹带推断不算「该拒拒了」,但在分母里
+    text = tally([_write(tmp_path / "a.jsonl", rows)])
+    assert "资料没写 n=5:该拒拒了 40.0%(2/5),夹带推断 1,编造 1" in text
+    assert "有答案 n=3:不该拒却拒了 33.3%(1/3),夹带推断 1" in text
+    assert "部分写了 n=3:B 式作答 33.3%(1/3),夹带推断 1" in text
+
+
+def _excluded(case_id: str) -> dict[str, Any]:
+    row = _row(case_id, "no_answer", "excluded_answer_still_present", set_="hard_negative")
+    return {**row, "cost_cny": {"answer": 0.0, "judge": 0.2}}
+
+
+def test_rows_excluded_by_the_recheck_stay_out_of_every_denominator(tmp_path: Path) -> None:
+    rows = [*_ROWS, _excluded("hn-x1"), _excluded("hn-x2")]
+    assert headline_rates(rows) == headline_rates(_ROWS)
+    text = tally([_write(tmp_path / "a.jsonl", rows)])
+    assert "资料没写 n=4:该拒拒了 50.0%(2/4),夹带推断 0,编造 1" in text
+    assert "  复核剔除(答前检索判为答案仍在库里,不答、不进分母):2 题(hn-x1, hn-x2)" in text
+    assert "  hard_negative n=1 正确说没写 1" in text  # 剔除的两题不在分集里
+    assert "judge ¥0.80" in text  # 复核的判分花费照算
+
+
+def _claims(case_id: str, set_: str, grounded: int, counted: int) -> dict[str, Any]:
+    row = _row(case_id, "answerable", "答对", set_=set_)
+    return {**row, "verdict": {"grounded_claims": grounded, "counted_claims": counted}}
+
+
+def test_grounded_claim_share_is_reported_per_set_and_per_file(tmp_path: Path) -> None:
+    before = _write(
+        tmp_path / "before.jsonl", [_claims("a1", "main", 3, 4), _claims("a2", "chat", 1, 4)]
+    )
+    after = _write(tmp_path / "after.jsonl", [_claims("a1", "main", 4, 4)])
+    text = tally([before, after])
+    assert "  有依据的断言占比:all 66.7%(8/12);main 87.5%(7/8);chat 25.0%(1/4)" in text
+    assert "## 有依据的断言占比(按文件、按集;不需要出处的断言不进分母)" in text
+    assert "  before.jsonl | all 50.0%(4/8) | main 75.0%(3/4) | chat 25.0%(1/4)" in text
+    assert "  after.jsonl | all 100.0%(4/4) | main 100.0%(4/4)" in text

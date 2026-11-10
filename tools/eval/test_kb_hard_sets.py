@@ -25,6 +25,7 @@ from kb_hard_sets import (  # type: ignore[import-not-found]
     pick_distractors,
     pick_hard_negatives,
     residue,
+    spec_document,
     split_units,
 )
 
@@ -116,25 +117,25 @@ def test_pick_hard_negatives_keeps_every_control_anchor_and_is_deterministic() -
         _case("h3", "哪些款有滤芯", "a.md", "滤芯建议每6个月", match="all"),
         _case("h4", "乙款滤芯多久换", "b.md", "滤芯建议每9个月更换一次"),
     ]
-    picked, skipped = pick_hard_negatives(candidates, control, _TEXTS, n=5, seed=1)
+    picked, skipped, _flagged = pick_hard_negatives(candidates, control, _TEXTS, n=5, seed=1)
     assert sorted(p.case.id for p in picked) == ["h1", "h4"]
     assert {p.case.id: p.documents for p in picked} == {"h1": ("a.md",), "h4": ("b.md",)}
     assert skipped == {"touches_control": 1, "match_all": 1}
-    again, _ = pick_hard_negatives(candidates, control, _TEXTS, n=5, seed=1)
+    again, _, _ = pick_hard_negatives(candidates, control, _TEXTS, n=5, seed=1)
     assert [p.case.id for p in again] == [p.case.id for p in picked]
-    one, _ = pick_hard_negatives(candidates, control, _TEXTS, n=1, seed=1)
+    one, _, _ = pick_hard_negatives(candidates, control, _TEXTS, n=1, seed=1)
     assert len(one) == 1
 
 
 def test_pick_hard_negatives_skips_anchors_it_cannot_find() -> None:
-    picked, skipped = pick_hard_negatives(
+    picked, skipped, _flagged = pick_hard_negatives(
         [_case("h9", "丙款", "c.md", "资料里根本没有的一句话")], [], _TEXTS, n=3, seed=1
     )
     assert picked == [] and skipped == {"anchor_not_found": 1}
 
 
 def test_spec_round_trip_gives_no_answer_cases_with_a_judge_note(tmp_path: Path) -> None:
-    picked, _ = pick_hard_negatives(
+    picked, _, _ = pick_hard_negatives(
         [_case("h1", "甲款滤芯多久换", "a.md", "滤芯建议每6个月更换一次")], [], _TEXTS, n=1, seed=1
     )
     path = tmp_path / "hn.yaml"
@@ -194,6 +195,8 @@ def test_pick_distractors_needs_the_entity_in_the_query_and_its_own_document() -
     picked = pick_distractors(cases, files, exclude_ids=set(), n=5, seed=1)
     assert [(p.case.id, p.entity, p.near) for p in picked] == [("d1", "青松", ("青柏",))]
     assert "「青柏」" in picked[0].note and "「青松」" in picked[0].note
+    # 11-10:安到本题对象上的近名资料按「张冠李戴」记(整题编造),不再记 unsupported
+    assert "misattributed" in picked[0].note and "unsupported" not in picked[0].note
     assert pick_distractors(cases, files, exclude_ids={"d1"}, n=5, seed=1) == []
 
 
@@ -213,7 +216,7 @@ _CONTROL = [_case("c1", "丙产品", "shop.md", "售价一百元。丙产品重�
     ],
 )
 def test_a_deletion_that_breaks_a_control_anchor_is_skipped(anchor: str) -> None:
-    picked, skipped = pick_hard_negatives(
+    picked, skipped, _flagged = pick_hard_negatives(
         [_case("h1", "乙产品多少钱", "shop.md", anchor)],
         _CONTROL,
         {"shop.md": _SHOP},
@@ -231,12 +234,14 @@ def test_control_anchors_are_checked_against_the_cumulative_deletion() -> None:
         _case("h1", "说明一", "w.md", "说明一戊产品保修"),
         _case("h2", "说明二", "w.md", "说明二戊产品保修"),
     ]
-    picked, skipped = pick_hard_negatives(candidates, control, {"w.md": text}, n=5, seed=1)
+    picked, skipped, _flagged = pick_hard_negatives(
+        candidates, control, {"w.md": text}, n=5, seed=1
+    )
     assert len(picked) == 1 and skipped == {"touches_control": 1}
 
 
 def test_an_anchor_that_normalises_to_nothing_deletes_nothing() -> None:
-    picked, skipped = pick_hard_negatives(
+    picked, skipped, _flagged = pick_hard_negatives(
         [_case("h1", "?", "a.md", "——————————")], [], _TEXTS, n=3, seed=1
     )
     assert picked == [] and skipped == {"anchor_not_found": 1}
@@ -312,7 +317,7 @@ def test_a_candidate_whose_answer_cannot_be_fully_deleted_is_skipped() -> None:
     # 11-09 复审:一处可删(同一句)、另一处跨 5 行(超过 MAX_WINDOW 句)删不掉 —— 选上了,
     # 评测建库后残留检查必停,重新生成还是同一份 spec
     text = "资料:甲乙丙丁戊。\n甲乙\n丙\n丁\n戊\n"
-    picked, skipped = pick_hard_negatives(
+    picked, skipped, _flagged = pick_hard_negatives(
         [_case("h1", "?", "s.md", "甲乙丙丁戊")], [], {"s.md": text}, n=3, seed=1
     )
     assert picked == [] and skipped == {"not_deletable": 1}
@@ -392,3 +397,114 @@ def test_the_fingerprint_covers_only_the_parser_modules_and_libraries() -> None:
         "mammoth",
         "lxml",
     }
+
+
+# ---------------------------------------------------------------------------
+# 11-10:删后穷尽核对 —— 部首归一、锚不能再出现、参考答案的关键事实还在就剔除
+# ---------------------------------------------------------------------------
+
+
+def test_an_anchor_spelled_with_supplement_radicals_in_the_text_is_deleted() -> None:
+    # U+2EDD 是部首补充区块的「食」:NFKC 归一不掉,旧的删句对不上、删不掉
+    text = "# 合成\n\n适用:饮\u2edd清淡的成年人。其余说明照常。\n"
+    deleted, dropped = delete_anchor_units(text, ["饮食清淡的成年人"])
+    assert dropped == 1 and "清淡" not in deleted and "其余说明照常" in deleted
+    assert residue(text, ["饮食清淡的成年人"]) == ["饮食清淡的成年人"]
+    assert residue(deleted, ["饮食清淡的成年人"]) == []
+
+
+def test_the_parser_guard_sees_a_control_anchor_spelled_with_radicals() -> None:
+    text = "# 合成\n\n丙产品售价一百元,适合饮\u2edd清淡的人。\n"
+    parser = AnchorDeletingParser(anchors=("丙产品售价",), guard=("饮食清淡的人",))
+    with pytest.raises(ControlAnchorDeletedError):
+        parser.apply(text, filename="x.md")
+
+
+_FILTER = "# 甲款净水器说明书(合成)\n\n甲款净水器适合家庭使用。滤芯建议每6个月更换一次。\n"
+
+
+def _answer_case(case_id: str, query: str, document: str, anchor: str, answer: str) -> KbCase:
+    return KbCase(
+        id=case_id,
+        query=query,
+        source="faq_xlsx",
+        tags=(),
+        expected=(KbExpected(document=document, anchor=anchor, page=None),),
+        answer=answer,
+    )
+
+
+def test_a_candidate_whose_answer_fact_is_restated_elsewhere_is_excluded() -> None:
+    texts = {
+        "a.md": _FILTER,
+        # 另一份文档换了说法把同一件事又写了一遍:删掉锚句,答案还在库里
+        "faq.md": "# 常见问题(合成)\n\n问:滤芯多久换?答:建议每6个月更换一次滤芯。\n",
+    }
+    case = _answer_case("h1", "甲款滤芯多久换", "a.md", "滤芯建议每6个月更换一次", "每6个月")
+    picked, skipped, flagged = pick_hard_negatives([case], [], texts, n=3, seed=1)
+    assert picked == [] and flagged == [("h1", "fact_number")]
+    assert skipped == {"answer_still_present": 1}
+
+
+def test_the_same_number_in_an_unrelated_sentence_is_not_a_restated_answer() -> None:
+    case = _answer_case("h1", "甲款滤芯多久换", "a.md", "滤芯建议每6个月更换一次", "每6个月")
+    unrelated = {"a.md": _FILTER, "b.md": "# 丙款(合成)\n\n丙款净水器整机保修期为6个月。\n"}
+    picked, _skipped, flagged = pick_hard_negatives([case], [], unrelated, n=3, seed=1)
+    assert [p.case.id for p in picked] == ["h1"] and flagged == []
+    # 同一个数在复述同一件事的句子里:才算答案还在
+    restated = {**unrelated, "c.md": "# 合成\n\n滤芯的更换周期建议为每6个月一次。\n"}
+    picked, _skipped, flagged = pick_hard_negatives([case], [], restated, n=3, seed=1)
+    assert picked == [] and flagged == [("h1", "fact_number")]
+
+
+def test_a_restated_fact_about_another_named_object_does_not_count() -> None:
+    # 问句点了「甲款」:只有写到甲款的文档里还留着答案才算;乙款的同一句是另一个对象的事实
+    texts = {
+        "说明书:甲款.md": _FILTER,
+        "说明书:乙款.md": "# 乙款(合成)\n\n乙款的滤芯建议每6个月更换一次哦。\n",
+    }
+    case = _answer_case(
+        "h1", "甲款滤芯多久换", "说明书:甲款.md", "滤芯建议每6个月更换一次", "每6个月"
+    )
+    picked, _skipped, flagged = pick_hard_negatives([case], [], texts, n=3, seed=1)
+    assert flagged == [] and [p.case.id for p in picked] == ["h1"]
+    texts["说明书:乙款.md"] += "甲款同理,滤芯也是每6个月更换一次。\n"
+    _picked, _skipped, flagged = pick_hard_negatives([case], [], texts, n=3, seed=1)
+    assert flagged == [("h1", "fact_number")]
+
+
+def test_codes_and_quoted_phrases_are_checked_too() -> None:
+    texts = {
+        "a.md": "# 合成\n\n甲款的型号是 KX-305,出厂编号另见铭牌。\n",
+        "b.md": "# 目录(合成)\n\n甲款(型号 KX-305)在第三页。\n",
+    }
+    case = _answer_case("h1", "甲款型号", "a.md", "甲款的型号是KX-305", "KX-305")
+    _picked, _skipped, flagged = pick_hard_negatives([case], [], texts, n=3, seed=1)
+    assert flagged == [("h1", "fact_code")]
+
+
+def test_suspects_can_be_kept_and_are_still_listed() -> None:
+    texts = {
+        "a.md": _FILTER,
+        "faq.md": "# 常见问题(合成)\n\n问:滤芯多久换?答:建议每6个月更换一次滤芯。\n",
+    }
+    case = _answer_case("h1", "甲款滤芯多久换", "a.md", "滤芯建议每6个月更换一次", "每6个月")
+    picked, skipped, flagged = pick_hard_negatives(
+        [case], [], texts, n=3, seed=1, keep_suspects=True
+    )
+    assert [p.case.id for p in picked] == ["h1"] and skipped == {}
+    assert flagged == [("h1", "fact_number")]
+
+
+def test_the_spec_lists_excluded_cases_by_id_and_reason_only() -> None:
+    texts = {
+        "a.md": _FILTER,
+        "faq.md": "# 常见问题(合成)\n\n问:滤芯多久换?答:建议每6个月更换一次滤芯。\n",
+    }
+    case = _answer_case("h1", "甲款滤芯多久换", "a.md", "滤芯建议每6个月更换一次", "每6个月")
+    picked, skipped, flagged = pick_hard_negatives([case], [], texts, n=3, seed=1)
+    spec = spec_document(
+        picked, skipped, flagged, texts=texts, set_of={}, keep_suspects=False, header={"seed": 1}
+    )
+    assert spec["excluded"] == [{"id": "h1", "reason": "fact_number"}]
+    assert spec["cases"] == [] and "suspects" not in spec

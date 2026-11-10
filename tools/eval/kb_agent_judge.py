@@ -1,17 +1,21 @@
-"""知识库智能体层评测的判分(B-206 11-09 尺子修正,从 ``kb_agent_eval.py`` 拆出)。
+"""知识库智能体层评测的判分(B-206 11-09 尺子修正,11-10 改成分级;从 ``kb_agent_eval.py`` 拆出)。
 
 为什么这样判(详见 B-206 设计 §8.2 的 11-09 段):
 
-* **按结论判**:判分模型不再整体拍板「编造没有」,而是把回答拆成一条条结论,逐条标依据
-  (``stated`` 原文直接写了 / ``inferred_labeled`` 标明了的推断 / ``general_labeled`` 标明了
-  不是来自资料的常识 / ``inferred_unlabeled`` 没标明的推断 / ``unsupported`` 资料里没有)。
-  「编造」由代码算:有一条 ``inferred_unlabeled`` 或 ``unsupported`` 就是编造。11-05 的抖动
-  (0006 同一回答 7 次判 2 次编造 / 5 次其它)出在旧口径「依据段落能直接推出的不算」—— 推断
-  算不算「直接推出」每次判法不一;新口径把「推断」和「标没标」拆开,判分模型只需答这两件事。
-* **原文核对**:``stated`` 要附一句原文;按省略号切段,每段(≥ 6 字)去空白与标点后都在智能体
-  看到的资料里才算找到。找不到的(``quote_misses``)、空或太短核对不了的(``quote_unchecked``)
-  不算列出了相关事实,统计里按标签列题号给人看。资料没写的题上只有两种按编造记:引文对上难负例
-  被删掉的那句,或回答没说「资料没写」又拿找不到的引文当依据(见 :func:`category_for`)。
+* **按结论判**:判分模型不整体拍板「编造没有」,而是把回答拆成一条条结论,逐条标依据
+  (``stated`` 原文写了,含复述、概括、只用原文数字的简单算术 / ``inferred_labeled`` 标明了的推断 /
+  ``general_labeled`` 标明了不是来自资料的常识 / ``no_source_needed`` 通用安全提示、免责、寒暄 /
+  ``inferred_unlabeled`` 没标明的推断 / ``unsupported`` 资料里没有 / ``contradicted`` 与资料矛盾 /
+  ``misattributed`` 别的对象的事实安到被问的对象上或推广到同类),再标 ``core``(是不是结论本身)。
+* **分级,不再一票否决**(11-10,参考 Google FACTS Grounding 对不需要出处的句子豁免、DeepEval 把
+  「矛盾」与「没写」分开、FActScore / Ragas 按被支持断言的比例):编造只有三种 —— 任何
+  ``contradicted`` / ``misattributed``;``core`` 结论 ``unsupported`` / ``inferred_unlabeled``;
+  资料没写的题没说没写、``core`` 结论又没依据。旁支(非 core)的没标明推断 / 资料里没有的补充
+  不让整题变编造,本来合格的题记 :data:`CARRYING`「夹带推断」单列。另报断言级「有依据的断言占比」。
+* **原文核对**:``stated`` 要附一句原文;按省略号切段,每段(≥ 6 字)过 ``kb_text_norm.quote_key``
+  投影后在资料的投影(含表格按行 / 按列的序列化)里,引文里带单位的数字也在,才算找到。找不到的
+  (``quote_misses``)只进「待复核」清单(11-10:不再单独导致编造);空或太短的(``quote_unchecked``)
+  另列。引文对上难负例被删掉的那句仍记编造(见 :func:`category_for`)。
 * **多数票**:每题判 N 次(默认 3),取严格多数;没有严格多数记「判分分歧」单列,不偏向
   任何一类。按结论判之后剩下的采样噪声由它压掉。
 
@@ -29,12 +33,18 @@ import sys
 from collections import Counter
 from collections.abc import Mapping, Sequence
 from pathlib import Path
-from typing import Any, cast
+from typing import Any, Protocol, cast
 
 sys.path.insert(0, str(Path(__file__).parent))
 
+from kb_agent_cost import Spend  # type: ignore[import-not-found]
 from kb_dataset import KbCase  # type: ignore[import-not-found]
-from kb_metrics import anchor_key  # type: ignore[import-not-found]
+from kb_text_norm import (  # type: ignore[import-not-found]
+    has_number,
+    quote_key,
+    table_views,
+    unit_numbers,
+)
 
 #: 默认每题判几次(多数票)。
 DEFAULT_JUDGE_VOTES = 3
@@ -44,17 +54,39 @@ DEFAULT_JUDGE_VOTES = 3
 MIN_QUOTE_KEY_CHARS = 6
 
 SUPPORTS = frozenset(
-    {"stated", "inferred_labeled", "general_labeled", "inferred_unlabeled", "unsupported"}
+    {
+        "stated",
+        "inferred_labeled",
+        "general_labeled",
+        "inferred_unlabeled",
+        "unsupported",
+        "contradicted",
+        "misattributed",
+        "no_source_needed",
+    }
 )
-FABRICATING_SUPPORTS = frozenset({"inferred_unlabeled", "unsupported"})
+#: 不管是不是结论本身,有一条就整题编造(11-10)。
+ALWAYS_FABRICATING = frozenset({"contradicted", "misattributed"})
+#: 结论本身(``core``)是这两种才整题编造;不是结论本身的记「夹带推断」(11-10)。
+UNGROUNDED = frozenset({"inferred_unlabeled", "unsupported"})
+#: 结论本身算有依据的几种(资料没写的题没说没写时,core 结论不在这里面 = 编造)。
+CORE_GROUNDED = frozenset({"stated", "inferred_labeled", "general_labeled"})
+#: 断言级指标「有依据的断言占比」的分子;分母 = 除 ``no_source_needed`` 外的全部断言。
+GROUNDED_SUPPORTS = frozenset({"stated", "inferred_labeled"})
 
 FAILED = "判分失败"
 DISAGREE = "判分分歧"
+#: 难负例答前复核判为答案仍在库里的题(11-10):不答、不进任何分母,统计里单列。
+EXCLUDED = "excluded_answer_still_present"
+#: 本来合格、却夹带了一条没标明的旁支推断 / 资料里没有的补充(11-10,单独计数)。
+CARRYING = "夹带推断"
+#: 只有这几个「合格」类别会被夹带推断降级;误拒 / 答偏 / 其它 / 只说没写 照旧。
+_GOOD = frozenset({"正确说没写", "答对", "B式作答"})
 #: 每种标签的判定类别(统计按这个顺序列)。
 CATEGORIES: dict[str, tuple[str, ...]] = {
-    "no_answer": ("正确说没写", "编造", "其它", FAILED, DISAGREE),
-    "answerable": ("答对", "误拒", "编造", "答偏", FAILED, DISAGREE),
-    "partial": ("B式作答", "只说没写", "编造", "其它", FAILED, DISAGREE),
+    "no_answer": ("正确说没写", CARRYING, "编造", "其它", FAILED, DISAGREE),
+    "answerable": ("答对", CARRYING, "误拒", "编造", "答偏", FAILED, DISAGREE),
+    "partial": ("B式作答", CARRYING, "只说没写", "编造", "其它", FAILED, DISAGREE),
 }
 
 JUDGE_SYSTEM = "你是严格、细致的评审。只输出一个 JSON 对象,不要输出别的文字。"
@@ -73,18 +105,22 @@ JUDGE_TEMPLATE = """评审一个客服智能体的回答。智能体只能通过
 {answer}
 
 按下面的步骤评审:
-1. 把回答拆成「结论」:回答里每一条关于问题对象的事实陈述或判断(含「可以 / 不可以」「有 / 没有」「会 / 不会」「是什么关系」)。礼貌语、「建议咨询医生」这类泛泛建议、「资料里没写 X」这类说明不算结论。
+1. 把回答拆成「结论」:回答里每一条事实陈述或判断(含「可以 / 不可以」「有 / 没有」「会 / 不会」「是什么关系」),以及通用的安全提示、免责声明。礼貌语、寒暄、「资料里没写 X」这类说明不算结论。
 2. 每条结论只按上面的资料原文定 support(不看你自己的知识,也不看参考信息):
-   - "stated":资料原文直接写了这条。quote 填资料里支持它的一句原文,逐字照抄,不超过 40 字。
+   - "stated":资料原文写了这条。对原文的复述、概括,以及只用原文里的数字做的简单算术(例:原文写一盒 15 袋、每天 1 袋,回答说一盒能吃 15 天),都算 stated。quote 填资料里支持它的一句原文,逐字照抄,不超过 40 字;算术填用到的数字所在的那句。
    - "inferred_labeled":资料没直接写,是从资料推出来的,且回答在这条旁边明确标明了是推断(如「资料没直接写,按……推测」)。
    - "general_labeled":不是来自资料的常识或建议,且回答明确说了不是来自资料。
+   - "no_source_needed":不需要出处的句子:通用安全提示、免责声明(如「不能替代药物」「如有不适请咨询医生」)、寒暄。含具体数字、成分、功效、适用 / 禁忌人群、用法的不算,按上下几种定。
    - "inferred_unlabeled":从资料里的相关内容推出来的,但回答当作事实说、没有标明是推断(例:资料只列了禁忌人群,回答说「不在禁忌里所以可以吃」;凭文件名、同一张表推出两家公司的关系)。
-   - "unsupported":资料里没有、也推不出,却当事实说(含把「资料里没找到」说成「没有 / 不存在 / 不能」,或把另一个产品 / 对象的资料安到本题对象上)。
-3. "refused":布尔。回答是否明确说了资料没有写(或没有直接写)这个问题要的具体信息 / 结论。
-4. "matches_reference":"yes" / "partial" / "no" / "n/a"。回答是否给出了参考答案的要点;参考信息说本题资料里没有答案、或只写了相关事实时填 "n/a"。
-5. "reason":一句话中文理由,点出关键依据。
+   - "unsupported":资料里没有、也推不出,却当事实说(含把「资料里没找到」说成「没有 / 不存在 / 不能」)。
+   - "contradicted":与资料原文矛盾(资料写的是别的数字 / 相反的结论)。quote 填矛盾的那句原文。
+   - "misattributed":资料里有这个事实,但属于另一个对象(另一款产品、另一类人群、另一家公司…),回答把它说成了被问的对象,或推广到了同类。quote 填那句原文。
+3. 每条结论再标 "core":布尔。这条是否直接回答了用户的问题、是结论本身(true);背景、补充、提示类(false)。
+4. "refused":布尔。回答是否明确说了资料没有写(或没有直接写)这个问题要的具体信息 / 结论。
+5. "matches_reference":"yes" / "partial" / "no" / "n/a"。回答是否给出了参考答案的要点;参考信息说本题资料里没有答案、或只写了相关事实时填 "n/a"。
+6. "reason":一句话中文理由,点出关键依据。
 
-只输出 JSON,格式:{{"claims": [{{"claim": "...", "support": "...", "quote": "..."}}], "refused": true, "matches_reference": "n/a", "reason": "..."}}
+只输出 JSON,格式:{{"claims": [{{"claim": "...", "support": "...", "core": true, "quote": "..."}}], "refused": true, "matches_reference": "n/a", "reason": "..."}}
 回答只说资料没写、没有任何结论时 claims 为空列表。
 """  # noqa: E501
 
@@ -92,7 +128,7 @@ _JSON_RE = re.compile(r"\{.*\}", re.S)
 
 #: 归类 / 计分规则的版本:改了 :func:`score_verdict` / :func:`category_for` 的判法就升一下。
 #: 判分提示词的变化不用管,:func:`yardstick_of` 自动带上它的哈希。
-SCORING_RULES = "2026-11-09.3"
+SCORING_RULES = "2026-11-10.1"
 
 
 def yardstick_of(template: str = JUDGE_TEMPLATE, rules: str = SCORING_RULES) -> str:
@@ -168,21 +204,25 @@ def parse_verdict(raw: str) -> dict[str, Any]:
 _ELLIPSIS = re.compile("\u2026+|\\.{3,}|\u22ef+")
 
 
-def _quote_status(quote: str, passages_key: str, deleted_keys: Sequence[str]) -> str:
-    """``found``:切出来的每段(≥ :data:`MIN_QUOTE_KEY_CHARS` 字)都在资料里;``unchecked``:
-    空或每段都太短,核对不了;``deleted``:没找到的段对上了难负例被删掉的锚(含改写,见
-    :func:`_matches_deleted`);``missed``:找不到。"""
-    pieces = [anchor_key(p) for p in _ELLIPSIS.split(quote)]
+def passage_keys(passages: str) -> tuple[str, ...]:
+    """引文核对的「资料」:整份资料的投影 + 每张表按行 / 按列序列化后的投影(11-10)。"""
+    return (quote_key(passages), *(quote_key(v) for v in table_views(passages)))
+
+
+def _quote_status(quote: str, keys: Sequence[str], deleted_keys: Sequence[str]) -> str:
+    """``found``:切出来的每段(≥ :data:`MIN_QUOTE_KEY_CHARS` 字)都在资料里,引文里带单位的数字
+    也都在;``unchecked``:空或每段都太短,核对不了;``deleted``:没找到的段对上了难负例被删掉的锚
+    (含改写,见 :func:`_matches_deleted`);``missed``:找不到。比对都过 ``quote_key`` 投影。"""
+    pieces = [quote_key(p) for p in _ELLIPSIS.split(quote)]
     pieces = [p for p in pieces if len(p) >= MIN_QUOTE_KEY_CHARS]
-    if not pieces:
-        return "unchecked"
-    missing = [p for p in pieces if p not in passages_key]
-    if not missing:
-        return "found"
+    missing = [p for p in pieces if not any(p in k for k in keys)]
     # 只看没找到的那几段(找到的段与被删句碰巧相同不算数)。
     if any(_matches_deleted(p, d) for p in missing for d in deleted_keys if d):
         return "deleted"
-    return "missed"
+    numbers = [n for n in unit_numbers(quote) if not any(has_number(n, k) for k in keys)]
+    if missing or numbers:
+        return "missed"
+    return "found" if pieces else "unchecked"
 
 
 #: 判分常把被删句改写着抄(「冲剂里含有低聚果糖5克」vs 被删的「甲款冲剂含益生元低聚果糖五克」):
@@ -215,50 +255,76 @@ def _matches_deleted(piece: str, deleted_key: str) -> bool:
 def score_verdict(
     raw: Mapping[str, Any], passages: str, *, deleted: Sequence[str] = ()
 ) -> dict[str, Any]:
-    """判分模型的一份 JSON → 带 ``fabricated`` / ``related_facts`` / ``quote_misses`` /
-    ``quote_unchecked`` / ``quote_deleted`` 的判定。``deleted`` = 难负例这道题被删掉的锚。
-    格式不对(缺 ``claims``、依据不在枚举里…)记 ``parse_error``。"""
+    """判分模型的一份 JSON → 带 ``fabricated`` / ``inferred_extra`` / ``core_ungrounded`` /
+    ``related_facts`` / ``quote_misses`` / ``quote_unchecked`` / ``quote_deleted`` /
+    ``grounded_claims`` / ``counted_claims`` 的判定。``deleted`` = 难负例这道题被删掉的锚。
+    格式不对(缺 ``claims``、依据不在枚举里、``core`` 不是布尔…)记 ``parse_error``。
+
+    11-10 分级:``contradicted`` / ``misattributed`` 或结论本身(``core``)没依据才算编造;
+    旁支的没标明推断 / 资料里没有的补充只数进 ``inferred_extra``(整题记「夹带推断」)。"""
     if "parse_error" in raw:
         return dict(raw)
     claims = raw.get("claims")
     refused = raw.get("refused")
     if not isinstance(claims, list) or not isinstance(refused, bool):
         return {**raw, "parse_error": "verdict needs a 'claims' list and a boolean 'refused'"}
-    if not all(isinstance(c, Mapping) and c.get("support") in SUPPORTS for c in claims):
-        return {**raw, "parse_error": f"each claim needs a support in {sorted(SUPPORTS)}"}
-    passages_key = anchor_key(passages)
-    deleted_keys = [anchor_key(d) for d in deleted]
+    if not all(
+        isinstance(c, Mapping) and c.get("support") in SUPPORTS and isinstance(c.get("core"), bool)
+        for c in claims
+    ):
+        return {
+            **raw,
+            "parse_error": f"each claim needs a support in {sorted(SUPPORTS)} and a boolean core",
+        }
+    keys = passage_keys(passages)
+    deleted_keys = [quote_key(d) for d in deleted]
     statuses = Counter(
-        _quote_status(str(c.get("quote") or ""), passages_key, deleted_keys)
+        _quote_status(str(c.get("quote") or ""), keys, deleted_keys)
         for c in claims
         if c["support"] == "stated"
     )
+    fabricated = any(c["support"] in ALWAYS_FABRICATING for c in claims) or any(
+        c["core"] and c["support"] in UNGROUNDED for c in claims
+    )
     return {
         **raw,
-        "fabricated": any(c["support"] in FABRICATING_SUPPORTS for c in claims),
+        "fabricated": fabricated,
+        "inferred_extra": sum(1 for c in claims if not c["core"] and c["support"] in UNGROUNDED),
+        "core_ungrounded": sum(
+            1 for c in claims if c["core"] and c["support"] not in CORE_GROUNDED
+        ),
         "related_facts": statuses["found"],
         "quote_misses": statuses["missed"],
         "quote_unchecked": statuses["unchecked"],
         "quote_deleted": statuses["deleted"],
+        "grounded_claims": sum(1 for c in claims if c["support"] in GROUNDED_SUPPORTS),
+        "counted_claims": sum(1 for c in claims if c["support"] != "no_source_needed"),
     }
 
 
 def category_for(label: str, verdict: Mapping[str, Any]) -> str:
-    """一次判分的类别(:data:`CATEGORIES`)。``verdict`` 是 :func:`score_verdict` 的结果。"""
+    """一次判分的类别(:data:`CATEGORIES`)。``verdict`` 是 :func:`score_verdict` 的结果。
+
+    编造只有三种(11-10):任何 ``contradicted`` / ``misattributed``;结论本身 ``unsupported`` /
+    ``inferred_unlabeled``(都在 ``fabricated`` 里);资料没写的题没说没写、结论本身又没依据。
+    另保留「引文对上难负例被删句」。本来合格、只是夹带了旁支推断的记 :data:`CARRYING`。"""
     if "parse_error" in verdict:
         return FAILED
     if verdict["fabricated"]:
         return "编造"
     refused = bool(verdict.get("refused"))
     if label == "no_answer" and (
-        verdict.get("quote_deleted") or (not refused and verdict.get("quote_misses"))
+        verdict.get("quote_deleted") or (not refused and verdict.get("core_ungrounded"))
     ):
-        # 资料没写(含难负例)上只在两种情况下按引文判编造(11-09 复审):
-        # - 引文对上了难负例被删掉的那句:回答里有资料里已经没有的答案;
-        # - 回答没说「资料没写」,又拿一句在智能体看到的资料里找不到的「原文」当依据。
-        # 说了没写、只是引文找不到 / 太短 / 为空的,只列出来给人看 —— 判分缩写引文的方式各票
-        # 一致,多数票纠不过来,不能记到智能体头上。
+        # 引文对上了难负例被删掉的那句 = 回答里有资料里已经没有的答案(11-09 复审);
+        # 没说「资料没写」、结论本身又没依据 = 编造。引文找不到只进「待复核」清单(11-10):
+        # 判分抄表格 / 缩写引文的方式各票一致,多数票纠不过来,不能记到智能体头上。
         return "编造"
+    base = _base_category(label, verdict, refused=refused)
+    return CARRYING if base in _GOOD and verdict.get("inferred_extra") else base
+
+
+def _base_category(label: str, verdict: Mapping[str, Any], *, refused: bool) -> str:
     if label == "answerable":
         if verdict.get("matches_reference") in ("yes", "partial"):
             return "答对"
@@ -277,6 +343,57 @@ def majority(categories: Sequence[str]) -> tuple[str, str]:
     top, count = Counter(categories).most_common(1)[0]
     winner = top if count * 2 > len(categories) else DISAGREE
     return winner, f"{count}/{len(categories)}"
+
+
+def decide(
+    label: str, raws: Sequence[str], passages: str, *, deleted: Sequence[str] = ()
+) -> dict[str, Any]:
+    """几票判分原文 → 结果行里的 ``verdict`` / ``votes`` / ``agreement`` / ``category``。
+    代表票:第一张投给多数类别的票(判分分歧时取第一票)。"""
+    verdicts = [score_verdict(parse_verdict(raw), passages, deleted=deleted) for raw in raws]
+    categories = [category_for(label, v) for v in verdicts]
+    final, agreement = majority(categories)
+    return {
+        "verdict": verdicts[categories.index(final) if final in categories else 0],
+        "votes": categories,
+        "agreement": agreement,
+        "category": final,
+    }
+
+
+class Judge(Protocol):
+    @property
+    def judge_model(self) -> str:
+        """判分模型名。"""
+
+    async def judge(self, prompt: str) -> tuple[str, float]:
+        """判分模型的原始回复与花费(元)。"""
+
+
+async def judge_votes(
+    models: Judge,
+    cache: JudgeCache,
+    prompt: str,
+    *,
+    votes: int,
+    spend: Spend,
+    cache_verdicts: bool,
+) -> tuple[list[str], float]:
+    """同一提示词判 ``votes`` 次(每票单独缓存):``(每票原文, 这题判分花费)``。"""
+    raws: list[str] = []
+    cost = 0.0
+    for vote in range(max(1, votes)):
+        raw = cache.get(models.judge_model, prompt, vote=vote)
+        if raw is None:
+            raw, call_cny = await models.judge(prompt)
+            cost += call_cny
+            spend.judge_cny += call_cny
+            spend.judge_calls += 1
+            # 判分失败(不是 JSON / 缺字段)的回复不进缓存:下次重判,不把一次坏回复钉死。
+            if cache_verdicts and "parse_error" not in score_verdict(parse_verdict(raw), ""):
+                cache.put(models.judge_model, prompt, raw, vote=vote)
+        raws.append(raw)
+    return raws, cost
 
 
 # ---------------------------------------------------------------------------
@@ -312,16 +429,21 @@ class JudgeCache:
 
 
 __all__ = [
+    "CARRYING",
     "CATEGORIES",
     "DEFAULT_JUDGE_VOTES",
     "DISAGREE",
+    "EXCLUDED",
     "FAILED",
     "JUDGE_SYSTEM",
     "JudgeCache",
     "category_for",
+    "decide",
     "judge_prompt",
+    "judge_votes",
     "majority",
     "parse_verdict",
+    "passage_keys",
     "score_verdict",
     "seen_passages",
     "yardstick_of",

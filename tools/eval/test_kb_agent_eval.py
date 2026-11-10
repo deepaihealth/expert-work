@@ -44,10 +44,10 @@ from kb_agent_eval import (  # type: ignore[import-not-found]
     done_case_ids,
     judge_prompt,
     main,
-    parse_verdict,
     run_questions,
     tally,
 )
+from kb_agent_judge import parse_verdict  # type: ignore[import-not-found]
 from kb_agent_prod_prompt import BASELINE  # type: ignore[import-not-found]
 from kb_corpus_inventory import MANIFEST_FIELDS  # type: ignore[import-not-found]
 from kb_dataset import KbCase, KbDataset, KbExpected  # type: ignore[import-not-found]
@@ -578,14 +578,15 @@ def test_tally_counts_each_category_with_totals_and_spend(tmp_path: Path) -> Non
     run = {"run": {"spend_cny": {"answer": 1.25, "judge": 0.5, "rerank": 0.2}}}
     lines = [json.dumps(r, ensure_ascii=False) for r in [*rows, run]]
     out.write_text("\n".join(lines) + "\n", encoding="utf-8")
-    text = tally(out).splitlines()[9:]  # 头 9 行是模型标题与头条(test_kb_agent_tally)
+    lines = tally(out).splitlines()
+    text = lines[lines.index("## 资料没写") :]  # 前面是模型标题与头条(test_kb_agent_tally)
     assert text[0] == "## 资料没写"
-    assert text[1] == "  all  n=2 正确说没写 1 编造 1 其它 0 判分失败 0 判分分歧 0"
-    assert text[2] == "  main n=1 正确说没写 1 编造 0 其它 0 判分失败 0 判分分歧 0"
-    assert text[3] == "  chat n=1 正确说没写 0 编造 1 其它 0 判分失败 0 判分分歧 0"
+    assert text[1] == "  all  n=2 正确说没写 1 夹带推断 0 编造 1 其它 0 判分失败 0 判分分歧 0"
+    assert text[2] == "  main n=1 正确说没写 1 夹带推断 0 编造 0 其它 0 判分失败 0 判分分歧 0"
+    assert text[3] == "  chat n=1 正确说没写 0 夹带推断 0 编造 1 其它 0 判分失败 0 判分分歧 0"
     assert text[4] == "## 有答案"
-    assert text[5] == "  all  n=3 答对 1 误拒 1 编造 1 答偏 0 判分失败 0 判分分歧 0"
-    assert text[6] == "  main n=2 答对 1 误拒 1 编造 0 答偏 0 判分失败 0 判分分歧 0"
+    assert text[5] == "  all  n=3 答对 1 夹带推断 0 误拒 1 编造 1 答偏 0 判分失败 0 判分分歧 0"
+    assert text[6] == "  main n=2 答对 1 夹带推断 0 误拒 1 编造 0 答偏 0 判分失败 0 判分分歧 0"
     assert text[8] == "total n=5 正确说没写 1 答对 1 编造 2 误拒 1"
     assert text[9] == (
         "searches per question 0.80; degraded 1, embedding degraded 1, keyword degraded 1, "

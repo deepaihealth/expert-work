@@ -303,3 +303,107 @@ def test_the_run_row_records_which_production_prompt_parts_were_active(
     assert kb_agent_eval.main([*_corpus(other), "--distractors", "0"]) == 0
     _rows, run = _lines(other)
     assert run["prod_prompt_parts"] == ["answer_check", "outgoing_reference"]
+
+
+# ---------------------------------------------------------------------------
+# 11-10:难负例答前复核 —— 答案还检索得到的题不答、不进分母
+# ---------------------------------------------------------------------------
+
+
+def _recheck_says(monkeypatch: pytest.MonkeyPatch, answerable: bool) -> list[str]:
+    prompts: list[str] = []
+    original = FakeModels.judge
+
+    async def judge(self: FakeModels, prompt: str) -> tuple[str, float]:
+        if "【检索到的资料段落】" in prompt:
+            prompts.append(prompt)
+            return json.dumps({"answerable": answerable, "reason": "r"}), 0.0
+        raw, cost = await original(self, prompt)
+        return str(raw), float(cost)
+
+    monkeypatch.setattr(FakeModels, "judge", judge)
+    return prompts
+
+
+def test_a_hard_negative_still_answerable_after_deletion_is_excluded_before_answering(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    prompts = _recheck_says(monkeypatch, True)
+    argv = [*_corpus(tmp_path), "--hard-negatives", str(_spec(tmp_path, _GONE))]
+    assert kb_agent_eval.main(argv) == 0
+    rows, run = _lines(tmp_path)
+    [hn] = [r for r in rows if r["set"] == "hard_negative"]
+    assert hn["category"] == "excluded_answer_still_present"
+    assert hn["answer"] is None and hn["searches"] == []
+    assert run["recheck"] == {"k": 20, "checked": 1, "excluded": ["hn-unit_kb-noise"]}
+    # 复核用题目检索、给判分看被删的原文作对照;只复核难负例
+    assert len(prompts) == 3 and len(set(prompts)) == 1  # 默认 3 票取多数
+    prompt = prompts[0]
+    assert "甲一运行时噪音多大?" in prompt and _GONE in prompt
+    assert "静音模式" in prompt  # 检索到的段落
+    assert sum(1 for r in rows if r["label"] == "answerable") == 30
+    text = kb_agent_eval.tally(tmp_path / "agent.jsonl")
+    assert "复核剔除(答前检索判为答案仍在库里,不答、不进分母):1 题(hn-unit_kb-noise)" in text
+    assert kb_agent_eval.main(argv) == 0  # 续跑:剔除的题算做完了,不再复核
+    assert len(prompts) == 3
+
+
+def test_a_hard_negative_the_recheck_cannot_answer_is_answered(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _recheck_says(monkeypatch, False)
+    argv = [*_corpus(tmp_path), "--hard-negatives", str(_spec(tmp_path, _GONE))]
+    assert kb_agent_eval.main([*argv, "--recheck-k", "5"]) == 0
+    rows, run = _lines(tmp_path)
+    [hn] = [r for r in rows if r["set"] == "hard_negative"]
+    assert hn["category"] != "excluded_answer_still_present" and hn["answer"]
+    assert run["recheck"] == {"k": 5, "checked": 1, "excluded": []}
+    assert hn["run_kind"].endswith(":recheck5")
+
+
+def test_the_recheck_can_be_turned_off(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    prompts = _recheck_says(monkeypatch, True)
+    argv = [*_corpus(tmp_path), "--hard-negatives", str(_spec(tmp_path, _GONE))]
+    assert kb_agent_eval.main([*argv, "--no-recheck"]) == 0
+    rows, run = _lines(tmp_path)
+    [hn] = [r for r in rows if r["set"] == "hard_negative"]
+    assert prompts == [] and run["recheck"] is None
+    assert hn["category"] != "excluded_answer_still_present"
+    # 开 / 关复核的结果不混在一个 --out 里
+    assert hn["run_kind"].endswith(":norecheck")
+    with pytest.raises(SystemExit, match="run_kind"):
+        kb_agent_eval.main(argv)
+
+
+@pytest.mark.parametrize("k", ["0", "21"])
+def test_the_recheck_depth_is_bounded_by_the_search_limit(
+    tmp_path: Path, k: str, capsys: pytest.CaptureFixture[str]
+) -> None:
+    argv = [*_corpus(tmp_path), "--hard-negatives", str(_spec(tmp_path, _GONE))]
+    with pytest.raises(SystemExit):
+        kb_agent_eval.main([*argv, "--recheck-k", k])
+    assert f"--recheck-k must be within [1, 20], got {k}" in capsys.readouterr().err
+
+
+@pytest.mark.asyncio
+async def test_the_store_residue_check_folds_radical_spellings(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # 11-10:库里留着部首写法的被删句,残留核对也得认得出来(与删句同一个归一)
+    from types import SimpleNamespace
+    from uuid import uuid4
+
+    import kb_agent_cases  # type: ignore[import-not-found]
+
+    class _Store:
+        async def list_documents(self, **_kw: Any) -> list[Any]:
+            return [SimpleNamespace(id=uuid4())]
+
+    async def chunks(*_a: Any, **_kw: Any) -> list[str]:
+        return ["适用:饮\u2edd清淡的成年人。"]
+
+    monkeypatch.setattr(kb_agent_cases, "_all_chunk_texts", chunks)
+    left = await kb_agent_cases.store_residue(
+        _Store(), tenant_id=uuid4(), kb_id=uuid4(), anchors=["饮食清淡的成年人"]
+    )
+    assert left == ["饮食清淡的成年人"]

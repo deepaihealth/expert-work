@@ -52,7 +52,7 @@ class _OneResultTool:
 
 
 def _verdict(support: str) -> str:
-    claims = [{"claim": "c", "support": support, "quote": _FACT}]
+    claims = [{"claim": "c", "support": support, "core": True, "quote": _FACT}]
     return json.dumps({"claims": claims, "refused": True, "matches_reference": "n/a"})
 
 
@@ -214,7 +214,7 @@ async def test_a_hard_negative_answer_quoting_the_deleted_text_is_fabrication(
     tmp_path: Path,
 ) -> None:
     gone = "甲款冲剂可以与Z药同服无需间隔"
-    claims = [{"claim": "c", "support": "stated", "quote": "甲款冲剂可以与Z药同服"}]
+    claims = [{"claim": "c", "support": "stated", "core": True, "quote": "甲款冲剂可以与Z药同服"}]
     raw = json.dumps({"claims": claims, "refused": True, "matches_reference": "n/a"})
     case = KbCase(
         id="hn-x1",
@@ -233,6 +233,12 @@ async def test_a_hard_negative_answer_quoting_the_deleted_text_is_fabrication(
     (tmp_path / "plain").mkdir()
     [row] = await _run(tmp_path / "plain", _FlipFlopJudge([raw]), votes=1, case=case)
     assert row["category"] == "正确说没写"
+
+
+def test_resume_refuses_rows_judged_with_the_veto_yardstick(tmp_path: Path) -> None:
+    # 11-10:一票否决的旧尺子(11-09.3)判的行不能与新尺子的行混在一个 --out 里
+    with pytest.raises(SystemExit, match="yardstick"):
+        _resume(tmp_path, yardstick="2026-11-09.3+902042cf")
 
 
 def test_the_runner_writes_the_derived_yardstick() -> None:
