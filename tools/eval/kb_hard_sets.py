@@ -18,7 +18,8 @@
   参考答案里的关键事实(带单位的数字、型号 / 编号,见 ``kb_text_norm.key_facts``;
   没有文字答案就取被删的锚)换个说法、在别的文档或表格行里还在的,记「疑似仍可答」,默认剔除,
   spec 的 ``excluded`` 只记题号和原因码(``fact_number`` / ``fact_code``)。
-  「还在」= 事实所在的那一句 / 表格行里,事实前后各一个锚长的窗口有 ≥ :data:`RESTATED_SHARE` 的锚用字
+  「还在」= 事实所在的那一句 / 表格行里,事实前后各一个锚长(再加事实本身的长度)的窗口有
+  ≥ :data:`RESTATED_SHARE` 的锚用字
   (在复述同一件事,不是别处碰巧同一个数);问句点了对象名(取自期望文档名)时,文档名或那一句里
   还得有这个对象(别的产品的同一句是另一个对象的事实)。
 
@@ -322,9 +323,17 @@ class _DeletedCorpus:
                         continue
                     if named and not any(x in unit or x in self.names[name] for x in named):
                         continue
+                    # 原文上已确认这一句有这个事实;投影后它前面若紧挨一个不带单位的数字
+                    # (「| 30 | 1.5mg |」),带边界的定位会落空 —— 退回不带边界的查找(审查第三轮)
+                    spots = fact_positions(kind, value, unit) or [
+                        m.start() for m in re.finditer(re.escape(value), unit)
+                    ]
+                    # 窗口两侧各伸一个锚长再加事实本身的长度:表格行里事实和对象名之间常隔着
+                    # 一个序号 / 型号(「…剂量 KX-305 2袋」)
+                    reach = width + len(value)
                     if any(
-                        _restated(unit[max(0, at - width) : at + len(value) + width], anchor_sets)
-                        for at in fact_positions(kind, value, unit)
+                        _restated(unit[max(0, at - reach) : at + len(value) + reach], anchor_sets)
+                        for at in spots
                     ):
                         return f"fact_{kind}"
         return None

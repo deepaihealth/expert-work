@@ -241,3 +241,14 @@ def test_files_with_the_same_name_in_different_folders_are_kept_apart(tmp_path: 
     text = tally([a, b])
     assert f"  {a} | all 50.0%(1/2)" in text
     assert f"  {b} | all 100.0%(2/2)" in text
+
+
+def test_core_claims_marked_as_needing_no_source_are_listed_for_review(tmp_path: Path) -> None:
+    # 审查第三轮 LOW-5:这条清单列所有标签的题
+    rows = [
+        {**_row("n1", "no_answer", "其它"), "verdict": {"core_unsourced": 1}},
+        {**_row("a1", "answerable", "答对"), "verdict": {"core_unsourced": 2}},
+        _row("p1", "partial", "B式作答"),
+    ]
+    text = tally([_write(tmp_path / "a.jsonl", rows)])
+    assert "  待复核·结论本身标了不需要出处:资料没写 1 题(n1);部分写了 0 题;有答案 1 题(a1)" in text

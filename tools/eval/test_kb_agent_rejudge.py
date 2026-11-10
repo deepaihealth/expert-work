@@ -313,8 +313,12 @@ def test_a_rejudge_stopped_by_the_budget_says_so(
     assert "stopped by budget" in capsys.readouterr().err
 
 
-def test_a_rejudge_of_legacy_rows_without_run_kind_or_votes_can_resume(tmp_path: Path) -> None:
-    # 审查第二轮 MEDIUM-2:#2067 之前的结果行没有 run_kind / judge_votes,重判续跑不能被拒
+def test_a_rejudge_of_legacy_rows_without_run_kind_or_votes_can_resume(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # 审查第二轮 MEDIUM-2:#2067 之前的结果行没有 run_kind / judge_votes,重判停在中途后续跑不能被拒
+    from kb_agent_models import FakeModels  # type: ignore[import-not-found]
+
     argv = [*_corpus(tmp_path), "--distractors", "0"]
     assert kb_agent_eval.main(argv) == 0
     _as_old(tmp_path / "agent.jsonl")
@@ -326,13 +330,48 @@ def test_a_rejudge_of_legacy_rows_without_run_kind_or_votes_can_resume(tmp_path:
             item = {k: v for k, v in item.items() if k not in ("run_kind", "judge_votes")}
         lines.append(json.dumps(item, ensure_ascii=False))
     source.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    original = FakeModels.judge
+
+    async def paid(self: FakeModels, prompt: str) -> tuple[str, float]:
+        raw, _cost = await original(self, prompt)
+        return str(raw), 1.0
+
+    monkeypatch.setattr(FakeModels, "judge", paid)
     out = tmp_path / "rejudged.jsonl"
-    rejudge = [*_rejudge_argv(argv, out), "--budget", "0"]  # 第一次一题都不做,只为续跑
+    # 第一次:每题 1 票 ¥1,预算 ¥0.5 —— 判完一题花费就到上限,停在中途
+    first = [*_rejudge_argv(argv, out), "--budget", "0.5", "--concurrency", "1"]
+    assert kb_agent_rejudge.main(first) == 0
+    rows = [json.loads(x) for x in out.read_text().splitlines() if "case_id" in x]
+    assert len(rows) == 1
+    assert rows[0]["run_kind"] == "standard" and rows[0]["judge_votes"] == 1
+    # 第二次:同一个 --out 续跑,接上剩下的题
+    assert kb_agent_rejudge.main([*_rejudge_argv(argv, out), "--budget", "100"]) == 0
+    done = [json.loads(x) for x in out.read_text().splitlines() if "case_id" in x]
+    assert len(done) == 32 and len({r["case_id"] for r in done}) == 32
+
+
+def test_a_rejudge_skips_a_failed_recheck_row_that_a_later_row_replaced(tmp_path: Path) -> None:
+    # 审查第三轮 LOW-3:源文件里先有复核失败行、续跑后又有同题的一行 —— 只重判后来那行
+    argv = [*_corpus(tmp_path), "--distractors", "0"]
+    assert kb_agent_eval.main(argv) == 0
+    source = tmp_path / "agent.jsonl"
+    lines = source.read_text(encoding="utf-8").splitlines()
+    first = json.loads(lines[0])
+    failed = {
+        **first,
+        "category": "excluded_recheck_search_failed",
+        "answer": None,
+        "searches": [],
+        "reads": [],
+    }
+    source.write_text(
+        "\n".join([json.dumps(failed, ensure_ascii=False), *lines]) + "\n", encoding="utf-8"
+    )
+    out = tmp_path / "rejudged.jsonl"
     assert kb_agent_rejudge.main(_rejudge_argv(argv, out)) == 0
     rows = [json.loads(x) for x in out.read_text().splitlines() if "case_id" in x]
-    assert {r["run_kind"] for r in rows} == {"standard"} and {r["judge_votes"] for r in rows} == {1}
-    assert kb_agent_rejudge.main(rejudge) == 0  # 续跑接得上
-    assert len([x for x in out.read_text().splitlines() if "case_id" in x]) == len(rows)
+    mine = [r for r in rows if r["case_id"] == first["case_id"]]
+    assert len(mine) == 1 and mine[0]["category"] != "excluded_recheck_search_failed"
 
 
 def test_resuming_refuses_a_same_named_source_from_another_folder(tmp_path: Path) -> None:

@@ -565,3 +565,22 @@ def test_a_restated_code_followed_by_a_number_is_still_found() -> None:
     }
     _picked, _skipped, flagged = pick_hard_negatives([case], [], texts, n=3, seed=1)
     assert flagged == [("h1", "fact_code")]
+
+
+@pytest.mark.parametrize(
+    ("anchor", "answer", "query", "restated"),
+    [
+        ("甲款的型号是KX-305", "KX-305", "甲款型号", "| 甲款的型号 | 序号1 | KX-305 |"),
+        ("甲款的型号是KX-305", "KX-305", "甲款型号", "| 甲款型号 | 2 | KX-305 |"),
+        ("甲片每片含活性成分1.5mg", "1.5mg", "甲片每片多少", "| 甲片每片含活性成分 | 30 | 1.5mg |"),
+        ("甲款冲剂每次冲服2袋", "2袋", "甲款每次几袋", "甲款冲剂每次冲服剂量 KX-305 2袋"),
+    ],
+)
+def test_a_fact_right_after_a_bare_number_is_still_located(
+    anchor: str, answer: str, query: str, restated: str
+) -> None:
+    # 审查第三轮 MEDIUM-1:原文上确认事实还在;投影后前面紧挨一个不带单位的数字,定位不能落空
+    case = _answer_case("h1", query, "a.md", anchor, answer)
+    texts = {"a.md": f"# 合成\n\n{anchor}。\n", "b.md": f"# 合成\n\n{restated}\n"}
+    _picked, _skipped, flagged = pick_hard_negatives([case], [], texts, n=3, seed=1)
+    assert len(flagged) == 1 and flagged[0][0] == "h1"

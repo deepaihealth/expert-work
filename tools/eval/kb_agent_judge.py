@@ -41,6 +41,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 from kb_agent_cost import Spend  # type: ignore[import-not-found]
 from kb_dataset import KbCase  # type: ignore[import-not-found]
 from kb_text_norm import (  # type: ignore[import-not-found]
+    mark_line_lists,
     quote_key,
     quote_variants,
     table_views,
@@ -215,22 +216,49 @@ _ELLIPSIS = re.compile("\u2026+|\\.{3,}|\u22ef+")
 
 
 @dataclass(frozen=True)
-class PassageIndex:
-    """引文核对的「资料」:``keys`` = 每段资料(按 :data:`PASSAGE_SEP` 切开)与每张表按行 / 按列
-    序列化后的投影(分段投影:分隔符投影后会消失,整份一起投影会让引文跨段拼出来);``numbers``
-    = 在这些**原文**上抽出来的带单位数字(审查第二轮 HIGH-1:在投影上比边界会漏)。"""
+class View:
+    """一个视图:一段资料或一张表的一行 / 一列。``key`` = 投影;``numbers`` = 在这个视图的**原文**
+    上抽出来的带单位数字(审查第二轮 HIGH-1:在投影上比边界会漏)。"""
 
-    keys: tuple[str, ...]
+    key: str
     numbers: frozenset[str]
+
+
+def _view(raw: str) -> View:
+    return View(key=quote_key(raw), numbers=frozenset(unit_numbers(raw)))
+
+
+@dataclass(frozen=True)
+class PassageIndex:
+    """引文核对的「资料」:每段资料(按 :data:`PASSAGE_SEP` 切开)与每张表按行 / 按列序列化后的
+    视图(分段:分隔符投影后会消失,整份一起投影会让引文跨段拼出来);``marked`` = 同样的视图,
+    行首列表编号换成记号(引文的第二种比法用,见 :func:`kb_text_norm.quote_variants`)。"""
+
+    views: tuple[View, ...]
+    marked: tuple[View, ...]
+
+    @property
+    def keys(self) -> tuple[str, ...]:
+        return tuple(v.key for v in self.views)
+
+    @property
+    def numbers(self) -> frozenset[str]:
+        return frozenset().union(*(v.numbers for v in self.views))
 
 
 def passage_index(passages: str) -> PassageIndex:
     pieces = passages.split(PASSAGE_SEP)
-    views = [*pieces, *(v for p in pieces for v in table_views(p))]
-    return PassageIndex(
-        keys=tuple(quote_key(v) for v in views),
-        numbers=frozenset(n for v in views for n in unit_numbers(v)),
+    raws = [*pieces, *(v for p in pieces for v in table_views(p))]
+    views = tuple(_view(r) for r in raws)
+    marked_raws = [mark_line_lists(r) for r in raws]
+    marked = (
+        views
+        if marked_raws == raws
+        else tuple(
+            v if m == r else _view(m) for v, r, m in zip(views, raws, marked_raws, strict=True)
+        )
     )
+    return PassageIndex(views=views, marked=marked)
 
 
 def passage_keys(passages: str) -> tuple[str, ...]:
@@ -238,26 +266,63 @@ def passage_keys(passages: str) -> tuple[str, ...]:
 
 
 def _quote_status(quote: str, index: PassageIndex, deleted_keys: Sequence[str]) -> str:
-    """``found``:切出来的每段(≥ :data:`MIN_QUOTE_KEY_CHARS` 字)都在资料里,引文里带单位的数字
-    也都在资料的数字里;``unchecked``:空或每段都太短,核对不了;``deleted``:没找到的段对上了
-    难负例被删掉的锚(含改写,见 :func:`_matches_deleted`);``missed``:找不到。
-    引文比两遍(:func:`kb_text_norm.quote_variants`:原样 / 去掉任意位置的列表编号),
-    有一遍找到就算。"""
-    statuses = [_variant_status(v, index, deleted_keys) for v in quote_variants(quote)]
+    """``found``:切出来的每段(≥ :data:`MIN_QUOTE_KEY_CHARS` 字)都在某个视图里,而且这一段带单位
+    的数字也在**同一个**视图里(审查第三轮 LOW-1;太短不核的段,数字对全部资料比);``unchecked``:
+    空或每段都太短,核对不了;``deleted``:没找到的段对上了难负例被删掉的锚(见 :func:`_is_deleted`);
+    ``missed``:找不到。引文比两遍(:func:`kb_text_norm.quote_variants`),有一遍找到就算。"""
+    variants = quote_variants(quote)
+    statuses = [
+        _variant_status(v, index.marked if i else index.views, index.views, deleted_keys)
+        for i, v in enumerate(variants)
+    ]
     return "found" if "found" in statuses else statuses[0]
 
 
-def _variant_status(quote: str, index: PassageIndex, deleted_keys: Sequence[str]) -> str:
-    pieces = [quote_key(p) for p in _ELLIPSIS.split(quote)]
-    pieces = [p for p in pieces if len(p) >= MIN_QUOTE_KEY_CHARS]
-    missing = [p for p in pieces if not any(p in k for k in index.keys)]
+def _variant_status(
+    quote: str, views: Sequence[View], kept: Sequence[View], deleted_keys: Sequence[str]
+) -> str:
+    everywhere = frozenset().union(*(v.numbers for v in views))
+    checked = missing = 0
+    unmatched: list[str] = []
+    for raw in _ELLIPSIS.split(quote):
+        key, numbers = quote_key(raw), set(unit_numbers(raw))
+        if len(key) < MIN_QUOTE_KEY_CHARS:
+            missing += bool(numbers - everywhere)
+            continue
+        checked += 1
+        if not any(key in v.key and numbers <= v.numbers for v in views):
+            missing += 1
+            unmatched.append(key)
     # 只看没找到的那几段(找到的段与被删句碰巧相同不算数)。
-    if any(_matches_deleted(p, d) for p in missing for d in deleted_keys if d):
+    if any(_is_deleted(p, deleted_keys, kept) for p in unmatched):
         return "deleted"
-    numbers = set(unit_numbers(quote)) - index.numbers
-    if missing or numbers:
+    if missing:
         return "missed"
-    return "found" if pieces else "unchecked"
+    return "found" if checked else "unchecked"
+
+
+def _longest_shared(a: str, b: str) -> int:
+    """``a`` 与 ``b`` 最长公共子串的长度(``a`` 短、``b`` 可以很长:按长度二分,子串查找走 C)。"""
+    lo, hi = 0, len(a)
+    while lo < hi:
+        mid = (lo + hi + 1) // 2
+        if any(a[i : i + mid] in b for i in range(len(a) - mid + 1)):
+            lo = mid
+        else:
+            hi = mid - 1
+    return lo
+
+
+def _is_deleted(piece: str, deleted_keys: Sequence[str], kept: Sequence[View]) -> bool:
+    """没找到的这段对上了被删句(:func:`_matches_deleted`),而且它和被删句的最长公共子串**严格
+    长于**它和任何留下来的视图的 —— 只是共享对象名、留下的资料里一样有的,不算(审查第三轮 MEDIUM-2:
+    拒答并列相关事实、引文稍有改写,不能因为和被删句共享 ≥ 6 字的对象名就记编造)。"""
+    hits = [d for d in deleted_keys if d and _matches_deleted(piece, d)]
+    if not hits:
+        return False
+    to_deleted = max(_longest_shared(piece, d) for d in hits)
+    to_kept = max((_longest_shared(piece, v.key) for v in kept), default=0)
+    return to_deleted > to_kept
 
 
 #: 判分常把被删句改写着抄(「冲剂里含有低聚果糖5克」vs 被删的「甲款冲剂含益生元低聚果糖五克」):

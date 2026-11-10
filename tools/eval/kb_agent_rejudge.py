@@ -57,7 +57,7 @@ from kb_agent_judge import (  # type: ignore[import-not-found]
     seen_passages,
     yardstick_of,
 )
-from kb_agent_tally import read_results, tally  # type: ignore[import-not-found]
+from kb_agent_tally import read_results, superseded, tally  # type: ignore[import-not-found]
 from kb_dataset import KbCase, KbDataset, load_dataset  # type: ignore[import-not-found]
 
 YARDSTICK = yardstick_of()
@@ -341,6 +341,8 @@ def _parser() -> argparse.ArgumentParser:
 
 async def amain(args: argparse.Namespace) -> int:
     rows, runs = read_results(args.source)
+    # 续跑补上的行取代先前的复核失败行,只重判后来那行(审查第三轮 LOW-3)
+    rows = superseded(rows)
     if not rows:
         raise SystemExit(f"{args.source}: no result rows")
     run_kind = run_kind_of_rows(rows)

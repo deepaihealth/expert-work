@@ -10,6 +10,7 @@ import pytest
 from kb_agent_judge import (  # type: ignore[import-not-found]
     CATEGORIES,
     DISAGREE,
+    PASSAGE_SEP,
     JudgeCache,
     category_for,
     judge_prompt,
@@ -551,3 +552,54 @@ def test_a_partial_answer_quoting_a_nutrition_row_stays_style_b() -> None:
 def test_list_numbers_in_a_quote_do_not_break_the_match(passages: str, quote: str) -> None:
     verdict = score_verdict(_raw([_claim("stated", quote)], refused=True), passages)
     assert (verdict["related_facts"], verdict["quote_misses"]) == (1, 0)
+
+
+# ---------------------------------------------------------------------------
+# 审查第三轮:被删句判定只认「比留下的资料更像被删句」;数字在同一个视图里;列表编号的第二种比法
+# ---------------------------------------------------------------------------
+
+_KEPT = "甲款益生元冲剂饭后服用,温水冲调。\n甲款益生元冲剂不宜与X类药物同服。"
+_GONE_TEXT = ["甲款益生元冲剂每日两次每次一袋"]
+
+
+def test_a_refusal_with_a_reworded_related_quote_is_not_a_deleted_match() -> None:
+    # 拒答并列了相关事实,引文稍有改写、和被删句共享对象名:对象名在留下的资料里一样有,不算对上被删句
+    claim = _claim("stated", "甲款益生元冲剂应在饭后服用", core=False)
+    verdict = score_verdict(_raw([claim], refused=True), _KEPT, deleted=_GONE_TEXT)
+    assert (verdict["quote_deleted"], verdict["quote_misses"]) == (0, 1)
+    assert category_for("no_answer", verdict) == "正确说没写"
+
+
+def test_a_quote_copying_the_deleted_sentence_is_still_a_deleted_match() -> None:
+    claim = _claim("stated", "甲款益生元冲剂每日两次", core=False)
+    verdict = score_verdict(_raw([claim], refused=True), _KEPT, deleted=_GONE_TEXT)
+    assert verdict["quote_deleted"] == 1
+    assert category_for("no_answer", verdict) == "编造"
+
+
+@pytest.mark.parametrize(
+    ("passages", "quote"),
+    [
+        # 引文那段在第一段里找得到,但「2袋」只在另一段里(第一段是「12袋」)
+        ("甲款每日12袋温水冲服即可。" + PASSAGE_SEP + "乙款每次2袋。", "2袋温水冲服即可"),
+        # 「5mg」只在另一段;第一段是「1.5mg」
+        ("甲片每片1.5mg建议随餐服用" + PASSAGE_SEP + "乙片每片5mg", "5mg建议随餐服用"),
+    ],
+)
+def test_numbers_in_a_quote_must_be_in_the_view_the_quote_was_found_in(
+    passages: str, quote: str
+) -> None:
+    verdict = score_verdict(_raw([_claim("stated", quote)], refused=True), passages)
+    assert (verdict["related_facts"], verdict["quote_misses"]) == (0, 1)
+
+
+def test_full_width_commas_survive_the_list_number_comparison() -> None:
+    passages = "产品规格:\n1、100\uff0c200\uff0c500毫升装"
+    raw = _raw([_claim("stated", "产品规格:1、100\uff0c200\uff0c500毫升装")], refused=True)
+    assert score_verdict(raw, passages)["related_facts"] == 1
+
+
+def test_a_real_number_before_the_ideographic_comma_is_not_a_list_number() -> None:
+    raw = _raw([_claim("stated", "每日服用1、2次为宜")], refused=True)
+    verdict = score_verdict(raw, "每日服用2次为宜")
+    assert (verdict["related_facts"], verdict["quote_misses"]) == (0, 1)

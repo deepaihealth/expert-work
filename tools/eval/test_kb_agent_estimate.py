@@ -346,3 +346,20 @@ def test_history_leaves_out_rows_the_recheck_did_not_score(tmp_path: Path) -> No
     assert h.answer_cny_per_q == pytest.approx(0.2)
     rest = 10 + 90 + 400
     assert h.input_ratio == pytest.approx((_NEW_TEMPLATE + rest) / (OLD_TEMPLATE_CHARS + rest))
+
+
+def test_the_judge_unit_price_counts_every_row_s_judge_and_recheck_spend(tmp_path: Path) -> None:
+    # 审查第三轮 LOW-4:分母是 run 行的全部判分调用(含复核),分子也要是全部行的判分 + 复核花费
+    path = _history_file(tmp_path)
+    lines = path.read_text(encoding="utf-8").splitlines()
+    rows = [json.loads(x) for x in lines if '"case_id"' in x]
+    rows[0]["cost_cny"]["recheck"] = 0.03
+    excluded = {**rows[1], "case_id": "x1", "category": "excluded_answer_still_present"}
+    excluded["cost_cny"] = {"answer": 0.0, "judge": 0.05}
+    run = json.loads(next(x for x in lines if '"run"' in x))
+    run["run"]["calls"]["judge"] = 6
+    body = [*rows, excluded, run]
+    path.write_text("".join(json.dumps(x, ensure_ascii=False) + "\n" for x in body), "utf-8")
+    h = history_from(path)
+    assert h.questions == 4
+    assert h.judge_cny_per_call == pytest.approx((4 * 0.1 + 0.03 + 0.05) / 6)

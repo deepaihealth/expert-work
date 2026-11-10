@@ -5,19 +5,22 @@
 估法(假设都打印在输出里):
 
 * 答题、重排:照搬历史结果文件里每题的实花(答题模型与产品代码不变,题的难度相近);
-* 判分:历史每次判分的实花,乘新旧提示词的长度比(逐题按「模板 + 问题 + 资料 + 回答」的
-  字数算),加上按结论判多出来的输出(旧回复平均字数,乘 :data:`CLAIMS_OUTPUT_FACTOR` 减 1,
- 乘:data:`TOKENS_PER_CHAR`,乘判分模型输出价),再乘每题票数;
+* 判分:历史每次判分的实花(全部行的判分 + 复核花费 / run 行的判分调用数),乘新旧提示词的
+  长度比(逐题按「模板 + 问题 + 资料 + 回答」的字数算),加上按结论判多出来的输出(旧回复平均
+  字数,乘 :data:`CLAIMS_OUTPUT_FACTOR` 减 1,乘 :data:`TOKENS_PER_CHAR`,乘判分模型输出价),
+  再乘每题票数;
 * 嵌入:难负例轮删过句的文档整篇重新嵌入(上限;其余文档走缓存),字数取自 spec;
 * 改动后一轮 = 改动前基线乘 (1 + ``--margin``):B 式作答更长、可能多一次收尾提醒,
   代码还没写,只能给余量。
-* 难负例答前复核(11-10,``--no-recheck`` = 不做):难负例题数乘票数乘一次复核的钱(复核提示词 +
-  一次检索结果的字数上限 :data:`SEARCH_TEXT_BUDGET` + 参考答案,按判分模型价目表价算)。
+* 难负例答前复核(11-10,``--no-recheck`` = 不做):难负例题数乘票数乘一次复核的钱 = 历史每次判分的
+  实花,乘「复核提示词字数(模板 + 一次检索结果的字数上限 :data:`SEARCH_TEXT_BUDGET` + 参考答案)/
+  历史判分提示词平均字数」(与判分同一口径,含思考 token;复核的回复更短,偏高)。
 
 **重判已有结果**(``--rejudge a.jsonl b.jsonl …``,不需要 ``--dataset`` / ``--history``):
 逐行按新判分模板拼出来的提示词字数(模板 + 问题 + 资料 + 回答 + 参考信息;旧行没记 ``gold`` 时,
-有答案题的含答案段落按 :data:`GOLD_PASSAGE_CHARS`乘2 估)乘 票数估输入,输出按判分缓存里按结论判的
-回复平均字数乘:data:`CORE_FIELD_FACTOR` 估;报全价、同一提示词第 2 票起走提示词缓存的价、闲时半价。
+有答案题的含答案段落按 :data:`GOLD_PASSAGE_CHARS` 的两倍估)乘票数估输入,输出按判分缓存里按结论判的
+回复平均字数乘 :data:`CORE_FIELD_FACTOR` 估;报全价、同一提示词第 2 票起走提示词缓存的价、闲时半价,
+另按原文件每行的判分实花推一个数(含判分模型看不见的思考 token)。
 
 用法::
 
@@ -108,13 +111,18 @@ class History:
 
 
 def history_from(path: Path) -> History:
-    rows, runs = read_results(path)
+    every, runs = read_results(path)
+    # 每次判分的单价:分子是全部行(含复核剔除 / 失败的行)的判分 + 复核花费,与分母 run 行的
+    # 判分调用数(含复核调用)同一口径(审查第三轮 LOW-4)
+    judge_spent = sum(
+        float(r["cost_cny"]["judge"]) + float(r["cost_cny"].get("recheck", 0.0)) for r in every
+    )
     # 复核剔除 / 失败的题没答题,不进每题的平均(审查第二轮)
-    rows = [r for r in rows if r.get("category") not in UNSCORED]
+    rows = [r for r in every if r.get("category") not in UNSCORED]
     if not rows:
         raise SystemExit(f"{path}: no result rows to estimate from")
     n = len(rows)
-    judge_calls = sum(int(r["calls"]["judge"]) for r in runs) or n
+    judge_calls = sum(int(r["calls"]["judge"]) for r in runs) or len(every)
 
     def rest(row: dict[str, Any]) -> int:
         seen = [*row["searches"], *row.get("reads", ())]
@@ -126,7 +134,7 @@ def history_from(path: Path) -> History:
         questions=n,
         answer_cny_per_q=sum(r["cost_cny"]["answer"] for r in rows) / n,
         answer_calls_per_q=sum(int(r["calls"]["answer"]) for r in runs) / n if runs else None,
-        judge_cny_per_call=sum(r["cost_cny"]["judge"] for r in rows) / judge_calls,
+        judge_cny_per_call=judge_spent / judge_calls,
         rerank_cny_per_q=sum(float(r["spend_cny"]["rerank"]) for r in runs) / n if runs else None,
         input_ratio=statistics.fmean(ratios),
         answer_model=str(rows[0].get("answer_model")),

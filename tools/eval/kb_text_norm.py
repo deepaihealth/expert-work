@@ -28,7 +28,7 @@ from kb_cjk_radicals import RADICAL_TO_UNIFIED  # type: ignore[import-not-found]
 _RADICALS = str.maketrans({chr(k): chr(v) for k, v in RADICAL_TO_UNIFIED.items()})
 _HTML_TAG = re.compile(r"</?[A-Za-z][^<>]{0,40}>")
 #: 引文投影里留下的符号(≤ ≥ ±)。
-_ALWAYS_KEEP = frozenset("%<>≤≥±")
+_ALWAYS_KEEP = frozenset("%<>≤≥±\u00a7")
 #: 只在两侧都是字母数字时留(``.`` 只在两个数字之间)。
 _JOINERS = frozenset(".-~")
 
@@ -41,9 +41,16 @@ _THOUSANDS = re.compile(r"(?<![\d.,])\d{1,3}(?:,\d{3})+(?![\d,])")
 _LIST_NUMBER = re.compile(r"(?m)^[ \t]*\d{1,2}(?:[.)][ \t]+|\u3001[ \t]*)")
 _ELLIPSES = re.compile("[\u2026\u22ef]+")
 _DOTS = re.compile(r"\.{3,}")
-#: 任意位置的列表编号(引文常把几条列表压成一行抄);只用在引文的第二种比法上(见
-#: :func:`quote_variants`),``第1、2条`` 这种正文按第一种比法照样对得上。
-_INLINE_LIST_NUMBER = re.compile(r"(?<![0-9.])\d{1,2}(?:[.)]\s+|\u3001\s*)")
+#: 列表编号在第二种比法里换成的记号(投影里留着它):引文里任意位置的编号、资料里行首的编号
+#: 都换成它,两边对得上才算 —— 「每日服用1、2次」去掉「1、」后不会去对资料里的「每日服用2次」。
+LIST_MARK = "\u00a7"
+#: 原文(不做 NFKC)上的列表编号:行首的(资料) / 任意位置的(引文)。全角右括号、全角句点也认。
+_RAW_LINE_LIST = re.compile(
+    r"(?m)^[ \t\u3000]*\d{1,2}(?:[.)\uff09\uff0e][ \t\u3000]+|\u3001[ \t\u3000]*)"
+)
+_RAW_INLINE_LIST = re.compile(
+    r"(?<![0-9.\uff10-\uff19])\d{1,2}(?:[.)\uff09\uff0e][ \t\u3000]+|\u3001[ \t\u3000]*)"
+)
 
 
 def normalize_cjk(text: str) -> str:
@@ -59,10 +66,16 @@ def _numbers_ready(text: str) -> str:
     return _LIST_NUMBER.sub("", folded)
 
 
+def mark_line_lists(text: str) -> str:
+    """资料一侧的第二种比法:行首的列表编号换成 :data:`LIST_MARK`(原文上换,不做 NFKC)。"""
+    return _RAW_LINE_LIST.sub(LIST_MARK, text)
+
+
 def quote_variants(quote: str) -> list[str]:
-    """引文的两种比法:原样;去掉任意位置的列表编号(``产品规格: 1. 5克装`` / ``5克装 2. 10克装``)。"""
-    stripped = _INLINE_LIST_NUMBER.sub("", normalize_cjk(quote))
-    return list(dict.fromkeys([quote, stripped]))
+    """引文的两种比法:原样(与资料的原样比);任意位置的列表编号换成 :data:`LIST_MARK`(与
+    :func:`mark_line_lists` 过的资料比 —— 引文常把几条列表压成一行抄:``产品规格: 1. 5克装`` /
+    ``5克装 2. 10克装``)。原文上换,不做 NFKC:全角逗号还是全角,不会被当成千分位合并。"""
+    return list(dict.fromkeys([quote, _RAW_INLINE_LIST.sub(LIST_MARK, quote)]))
 
 
 def _alnum(ch: str) -> bool:
@@ -206,9 +219,11 @@ def key_facts(text: str) -> list[tuple[str, str]]:
 
 
 __all__ = [
+    "LIST_MARK",
     "fact_positions",
     "fold_key",
     "key_facts",
+    "mark_line_lists",
     "normalize_cjk",
     "quote_key",
     "quote_variants",
