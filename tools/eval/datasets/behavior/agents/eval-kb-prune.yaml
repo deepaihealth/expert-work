@@ -1,0 +1,45 @@
+# B-140 行为回归评测 —— 跨轮清理后找回旧检索结果(B-206 track D,k06 / k07)。
+# eval-kb 的副本,只改两处(下面标出):只绑合成说明书库 b140-kb-manual,并把跨轮清理的门槛
+# 压低,让第 3 轮开头一定清掉前两轮的检索结果。建库、上传文档见 tools/eval/README.md。不用工作区。
+apiVersion: expert_work.io/v1
+kind: Agent
+metadata:
+  name: eval-kb-prune
+  version: "1.0.0"
+  tenant: b140-eval
+spec:
+  description: B-140 行为回归评测用的知识库问答智能体(合成说明书,跨轮清理门槛压低)。
+  tenant_config:
+    isolation_level: dedicated_sandbox
+  model:
+    provider: glm
+    name: glm-5.3
+    temperature: 0.2
+    max_tokens: 32768
+  system_prompt:
+    template: |
+      你是一个知识库问答助手。回答前先用 knowledge_search 检索,只根据检索到的内容回答;
+      知识库里没有写的,如实说明没有找到,不要编造。
+  # 与 eval-kb 不同 ①:只绑一个库(单库没有目录与 bases 参数)。
+  knowledge:
+    knowledge_base_refs:
+      - b140-kb-manual
+  policies:
+    token_budget: 200000
+    # 与 eval-kb 不同 ②:新一轮开头,更早轮次累计 3,000 token 以上、能省 500 以上就清理,
+    # 一条都不保留(默认 30,000 / 5,000 / 4,三轮的知识库问答到不了)。
+    tool_result_prune:
+      min_context_tokens: 3000
+      min_reclaim_tokens: 500
+      recent_tool_results_kept: 0
+  sandbox:
+    runtime: gvisor
+    resources:
+      cpu: "0.5"
+      memory: 512Mi
+    network:
+      egress: none
+    filesystem:
+      readonly_root: true
+      writable:
+        - /tmp

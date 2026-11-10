@@ -364,14 +364,16 @@ def test_eval_kb_binds_the_three_bases_in_handle_order() -> None:
     assert spec.sandbox.filesystem.persistent_workspace is False
     assert spec.policies.token_budget > 0
     for case in load_cases(CASES_DIR):
-        assert (case.agent == "eval-kb") == case.id.startswith("k"), case.id
+        assert (case.agent in ("eval-kb", "eval-kb-prune")) == case.id.startswith("k"), case.id
 
 
 def test_readme_lists_the_kb_descriptions_verbatim() -> None:
     """建库的人照 README 填描述;它与 ``KB_BASES`` 漂开,k05 判的就不是同一件事。"""
     readme = (Path(__file__).parent / "README.md").read_text(encoding="utf-8")
-    for base, description in _make_fixtures_module().KB_BASES.items():
+    module = _make_fixtures_module()
+    for base, description in module.KB_BASES.items():
         assert f"`{base}`「{description}」" in readme, base
+    assert f"`{module.KB_MANUAL_BASE}`「{module.KB_MANUAL_DESCRIPTION}」" in readme
 
 
 def test_kb_fixtures_have_five_or_six_documents_per_base() -> None:
@@ -403,7 +405,7 @@ def test_kb_fixture_facts_the_k_cases_rely_on() -> None:
 
 
 def test_k_cases_check_the_fixture_facts() -> None:
-    cases = {c.id: c for c in load_cases(CASES_DIR) if c.id.startswith("k")}
+    cases = {c.id: c for c in load_cases(CASES_DIR) if c.agent == "eval-kb"}
     assert sorted(cases) == [
         "k01-route-specs",
         "k02-route-warranty",
@@ -471,6 +473,25 @@ def test_k_cases_check_the_fixture_facts() -> None:
             "k05-catalog-not-evidence",
             "截至2026年10月,知识库没有提到体检。",
             "一般是春季三、四月安排,知识库没有说明。",
+        ),
+        # B-206 track D:k06 答成同一段落里相邻型号的满充时间算串型号
+        ("k06-recover-pruned-search", "VT-330 用交流电充满约需 137 分钟。", "约需 163 分钟。"),
+        ("k06-recover-pruned-search", "大约 2 小时 17 分钟可以充满。", "VT-330 满充约 112 分钟。"),
+        # k07:说了「没写」又给出分贝数(相邻型号的,或照同系列推算的)都不算
+        (
+            "k07-pruned-search-not-stated",
+            "说明书里没有写 VT-330 的运行噪音。",
+            "VT-330 满载时噪音约 47 分贝。",
+        ),
+        (
+            "k07-pruned-search-not-stated",
+            "手册未列出 VT-330 的噪音参数,建议向售后确认。",
+            "手册没有单独写,按同系列推算约 44 dB。",
+        ),
+        (
+            "k07-pruned-search-not-stated",
+            "知识库里查不到 VT-330 的噪音数据。",
+            "VT-330 的噪音没有写明,大概四十五分贝左右。",
         ),
     ],
 )

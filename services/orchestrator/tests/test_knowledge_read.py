@@ -175,6 +175,14 @@ def test_the_tool_is_a_read_only_knowledge_read() -> None:
     assert (props["max_tokens"]["minimum"], props["max_tokens"]["maximum"]) == (4000, 16000)
 
 
+def test_the_description_rereads_a_compressed_reference() -> None:
+    """B-206 track D — a passage that now shows only as a compressed reference
+    is read again."""
+    spec = KnowledgeReadTool(store=InMemoryKnowledgeStore(), knowledge_base_refs=("kb",)).spec
+    description = " ".join(spec.description.split())
+    assert "unless they now show only as a compressed reference" in description
+
+
 async def test_a_read_needs_a_tenant() -> None:
     lib = await _lib()
     with pytest.raises(ToolBlockedError):

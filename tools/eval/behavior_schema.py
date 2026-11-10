@@ -21,7 +21,13 @@ FIXTURES_DIR = DATASET_DIR / "fixtures"
 AGENTS_DIR = DATASET_DIR / "agents"
 
 AgentCode = Literal[
-    "eval-general", "eval-ahp", "eval-compress", "eval-kb", "eval-tight", "eval-tight-24"
+    "eval-general",
+    "eval-ahp",
+    "eval-compress",
+    "eval-kb",
+    "eval-kb-prune",
+    "eval-tight",
+    "eval-tight-24",
 ]
 
 
@@ -285,7 +291,7 @@ class Turn(_Strict):
 
 
 class Case(_Strict):
-    #: 首字母 = 智能体:g 通用、h ahp、c 压缩、k 知识库 ``eval-kb``、
+    #: 首字母 = 智能体:g 通用、h ahp、c 压缩、k 知识库 ``eval-kb`` / ``eval-kb-prune``、
     #: t 步数上限很紧的 ``eval-tight``(B-226)。
     id: str = Field(pattern=r"^[ghckt][0-9]{2}-[a-z0-9-]+$")
     agent: AgentCode

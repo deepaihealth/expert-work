@@ -118,8 +118,12 @@ FALLBACK_MAX_CHARS = 30_000
 #: results are NOT cheaply re-readable, so it must still be externalized).
 #: ``knowledge_read`` (B-206 K-2) re-reads a knowledge document; the pruner
 #: collapses it to a re-read reference instead
-#: (:mod:`orchestrator.context.knowledge_reference`).
-EXEMPT_TOOLS = frozenset({"read_document", "read_file", "list_dir", "knowledge_read"})
+#: (:mod:`orchestrator.context.knowledge_reference`). So does ``knowledge_search``
+#: (B-206 track D): its passages are re-read by reference with ``knowledge_read``
+#: and the search can be run again, so a workspace copy would be dead weight.
+EXEMPT_TOOLS = frozenset(
+    {"read_document", "read_file", "list_dir", "knowledge_read", "knowledge_search"}
+)
 
 
 def _elide(text: str, *, head: int, tail: int, note: str) -> str:
