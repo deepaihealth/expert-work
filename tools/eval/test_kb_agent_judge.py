@@ -436,7 +436,7 @@ def test_the_template_defines_the_new_supports_core_and_the_restatement_rule() -
 def test_the_scoring_rules_moved_past_the_veto_yardstick() -> None:
     from kb_agent_judge import SCORING_RULES, yardstick_of
 
-    assert SCORING_RULES == "2026-11-10.4"
+    assert SCORING_RULES == "2026-11-10.5"
     assert yardstick_of() != "2026-11-09.3+902042cf"
 
 
@@ -745,3 +745,65 @@ def test_the_template_asks_for_repeats_deleted_on_hard_negatives_only() -> None:
 
     assert '"repeats_deleted"' in JUDGE_TEMPLATE
     assert "被删" in JUDGE_TEMPLATE and "复述" in JUDGE_TEMPLATE
+
+
+# ---------------------------------------------------------------------------
+# 审查第六轮:按票归类再取多数、null / 漏填、复核清单的信号、说明模板进尺子
+# ---------------------------------------------------------------------------
+
+_HN_KEPT = "乙款冲剂每袋三克。甲款冲剂每日一袋。"
+_HN_GONE = ["甲款冲剂每袋五克"]
+
+
+def _vote(flag: Any = ..., *, quote: str = "甲款冲剂每日一袋") -> str:
+    claim = {"claim": "c", "support": "stated", "core": False, "quote": quote}
+    if flag is not ...:
+        claim["repeats_deleted"] = flag
+    return json.dumps({"claims": [claim], "refused": True, "matches_reference": "n/a"})
+
+
+def test_each_vote_is_classified_by_its_own_flag_then_the_strict_majority_wins() -> None:
+    from kb_agent_judge import decide
+
+    one = decide("no_answer", [_vote(True), _vote(False), _vote(False)], _HN_KEPT, deleted=_HN_GONE)
+    assert (one["category"], one["agreement"]) == ("正确说没写", "2/3")
+    # 代表票来自多数(第 0 票不在多数里):复核清单读到的 flag 也是多数票的
+    assert one["verdict"]["repeats_deleted"] == 0
+    assert one["vote_repeats"] == [1, 0, 0]
+    two = decide("no_answer", [_vote(False), _vote(True), _vote(True)], _HN_KEPT, deleted=_HN_GONE)
+    assert (two["category"], two["agreement"]) == ("编造", "2/3")
+    assert two["verdict"]["repeats_deleted"] == 1
+
+
+def test_a_null_flag_counts_as_false_and_as_missing_on_a_hard_negative() -> None:
+    verdict = score_verdict(json.loads(_vote(None)), _HN_KEPT, deleted=_HN_GONE)
+    assert "parse_error" not in verdict
+    assert verdict["repeats_deleted"] == 0 and verdict["repeats_deleted_missing"] == 1
+    absent = score_verdict(json.loads(_vote()), _HN_KEPT, deleted=_HN_GONE)
+    assert absent["repeats_deleted_missing"] == 1
+    # 普通题上不填是对的,不算漏填
+    assert score_verdict(json.loads(_vote()), _HN_KEPT)["repeats_deleted_missing"] == 0
+
+
+def test_a_flag_on_a_claim_whose_quote_is_in_the_kept_passages_is_counted() -> None:
+    # 标了复述被删原文、引文却在留下的资料里找得到:矛盾,进复核清单
+    verdict = score_verdict(json.loads(_vote(True)), _HN_KEPT, deleted=_HN_GONE)
+    assert verdict["repeats_found_quote"] == 1
+    gone = score_verdict(
+        json.loads(_vote(True, quote="甲款冲剂每袋五克")), _HN_KEPT, deleted=_HN_GONE
+    )
+    assert gone["repeats_found_quote"] == 0
+
+
+def test_the_template_says_kept_content_is_not_a_repeat() -> None:
+    from kb_agent_judge import JUDGE_TEMPLATE
+
+    assert "留下的资料里也写着的内容" in JUDGE_TEMPLATE
+
+
+def test_the_case_note_templates_are_part_of_the_yardstick() -> None:
+    from kb_agent_judge import DISTRACTOR_NOTE, HARD_NEGATIVE_NOTE, yardstick_of
+
+    base = yardstick_of()
+    assert yardstick_of(notes=(HARD_NEGATIVE_NOTE + "x", DISTRACTOR_NOTE)) != base
+    assert yardstick_of(notes=(HARD_NEGATIVE_NOTE, DISTRACTOR_NOTE + "x")) != base

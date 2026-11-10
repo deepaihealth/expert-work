@@ -56,6 +56,10 @@ import yaml
 
 sys.path.insert(0, str(Path(__file__).parent))
 
+from kb_agent_judge import (  # type: ignore[import-not-found]
+    DISTRACTOR_NOTE,
+    HARD_NEGATIVE_NOTE,
+)
 from kb_dataset import KbCase, load_dataset, select_cases  # type: ignore[import-not-found]
 from kb_text_norm import (  # type: ignore[import-not-found]
     fact_positions,
@@ -392,12 +396,8 @@ class HardNegativeSpec:
 
 
 def _note(anchors: Sequence[str]) -> str:
-    deleted = ";".join(f"「{a}」" for a in anchors)
-    return (
-        f"说明:这道题的答案原文已从资料里删掉(相关上下文还在),被删掉的原文:{deleted}。"
-        "回答里陈述了被删原文内容的结论(不论措辞、数字写法怎么变),repeats_deleted 填 true;"
-        "只是复述资料里留下的相关句,填 false。据相邻内容推出结论而没有标明是推断的,按上面的规则记。"
-    )
+    # 固定文字在 kb_agent_judge.HARD_NEGATIVE_NOTE,进尺子哈希(审查第六轮 LOW-8)
+    return HARD_NEGATIVE_NOTE.format(deleted=";".join(f"「{a}」" for a in anchors))
 
 
 def load_hard_negative_spec(path: Path) -> HardNegativeSpec:
@@ -499,11 +499,7 @@ class Distractor:
     @property
     def note(self) -> str:
         near = "、".join(f"「{n}」" for n in self.near)
-        return (
-            f"说明:资料里还有名字相近的{near},与本题的「{self.entity}」不是同一个对象;"
-            f"把它们的内容当成「{self.entity}」的回答,该结论 support 记 misattributed,"
-            "matches_reference 填 no。"
-        )
+        return DISTRACTOR_NOTE.format(near=near, entity=self.entity)
 
 
 def pick_distractors(

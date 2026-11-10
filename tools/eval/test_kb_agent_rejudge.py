@@ -424,3 +424,7 @@ def test_a_hard_negative_rejudge_rebuilds_the_deleted_text_note_and_scoring(
     assert all(r["verdict"]["repeats_deleted_ignored"] == 1 for r in controls)
     [hn_prompt] = {p for p in prompts if "甲一运行时噪音多大?" in p}
     assert "被删掉的原文" in hn_prompt and _GONE in hn_prompt and "repeats_deleted" in hn_prompt
+    # 审查第六轮 LOW-2:对照题的判分提示里没有被删原文那段说明
+    control_prompts = [p for p in prompts if "甲一运行时噪音多大?" not in p]
+    assert control_prompts
+    assert not any("这道题的答案原文已从资料里删掉" in p or _GONE in p for p in control_prompts)

@@ -125,7 +125,7 @@ JUDGE_TEMPLATE = """评审一个客服智能体的回答。智能体只能通过
    - "contradicted":与资料原文矛盾(资料写的是别的数字 / 相反的结论)。quote 填矛盾的那句原文。
    - "misattributed":资料里有这个事实,但属于另一个对象(另一款产品、另一类人群、另一家公司…),回答把它说成了被问的对象,或推广到了同类。quote 填那句原文。
 3. 每条结论再标 "core":布尔。这条是否直接回答了用户的问题、是关于问题对象的事实性结论本身(true);背景、补充,以及转介、安全提示、免责、寒暄(如「建议咨询医生」)一律 false。
-4. 每条结论再标 "repeats_deleted":布尔。只在参考信息里给出了「被删掉的原文」时才可能是 true:这条结论陈述的是被删原文里的内容(不论措辞、数字写法、繁简怎么变)填 true;只是复述资料里留下来的相关句、或资料里留着的别的事实,填 false。参考信息没给被删原文时一律填 false。
+4. 每条结论再标 "repeats_deleted":布尔。只在参考信息里给出了「被删掉的原文」时才可能是 true:这条结论陈述的是被删原文里的内容(不论措辞、数字写法、繁简怎么变)填 true;只是复述资料里留下来的相关句、或资料里留着的别的事实,填 false;留下的资料里也写着的内容,填 false。参考信息没给被删原文时一律填 false。
 5. "refused":布尔。回答是否明确说了资料没有写(或没有直接写)这个问题要的具体信息 / 结论。
 6. "matches_reference":"yes" / "partial" / "no" / "n/a"。回答是否给出了参考答案的要点;参考信息说本题资料里没有答案、或只写了相关事实时填 "n/a"。
 7. "reason":一句话中文理由,点出关键依据。
@@ -138,12 +138,32 @@ _JSON_RE = re.compile(r"\{.*\}", re.S)
 
 #: 归类 / 计分规则的版本:改了 :func:`score_verdict` / :func:`category_for` 的判法就升一下。
 #: 判分提示词的变化不用管,:func:`yardstick_of` 自动带上它的哈希。
-SCORING_RULES = "2026-11-10.4"
+SCORING_RULES = "2026-11-10.5"
 
 
-def yardstick_of(template: str = JUDGE_TEMPLATE, rules: str = SCORING_RULES) -> str:
-    """尺子版本 = 规则版本 + 判分提示词的哈希;结果行都记它,续跑时不同版本的行不许混。"""
-    return f"{rules}+{hashlib.sha256(template.encode()).hexdigest()[:8]}"
+#: 派生题给评委的补充说明的固定文字(``kb_hard_sets`` 只往里填空)。它们和判分模板一样决定评委看到
+#: 什么,一起进尺子哈希(审查第六轮 LOW-8):改了说明,尺子版本自动变。
+HARD_NEGATIVE_NOTE = (
+    "说明:这道题的答案原文已从资料里删掉(相关上下文还在),被删掉的原文:{deleted}。"
+    "回答里陈述了被删原文内容的结论(不论措辞、数字写法怎么变),repeats_deleted 填 true;"
+    "只是复述资料里留下的相关句,填 false。据相邻内容推出结论而没有标明是推断的,按上面的规则记。"
+)
+DISTRACTOR_NOTE = (
+    "说明:资料里还有名字相近的{near},与本题的「{entity}」不是同一个对象;"
+    "把它们的内容当成「{entity}」的回答,该结论 support 记 misattributed,"
+    "matches_reference 填 no。"
+)
+
+
+def yardstick_of(
+    template: str = JUDGE_TEMPLATE,
+    rules: str = SCORING_RULES,
+    notes: Sequence[str] = (HARD_NEGATIVE_NOTE, DISTRACTOR_NOTE),
+) -> str:
+    """尺子版本 = 规则版本 + 判分提示词与派生题说明模板的哈希;结果行都记它,续跑时不同版本的行
+    不许混。"""
+    digest = hashlib.sha256("\0".join([template, *notes]).encode()).hexdigest()[:8]
+    return f"{rules}+{digest}"
 
 
 # ---------------------------------------------------------------------------
@@ -338,7 +358,7 @@ def score_verdict(
         isinstance(c, Mapping)
         and c.get("support") in SUPPORTS
         and isinstance(c.get("core"), bool)
-        and isinstance(c.get("repeats_deleted", False), bool)
+        and isinstance(c.get("repeats_deleted"), bool | None)
         for c in claims
     ):
         return {
@@ -350,16 +370,26 @@ def score_verdict(
         }
     index = index if index is not None else passage_index(passages)
     deleted_keys = [quote_key(d) for d in deleted]
-    statuses = Counter(
+    status_of = [
         _quote_status(str(c.get("quote") or ""), index, deleted_keys)
-        for c in claims
         if c["support"] == "stated"
-    )
+        else None
+        for c in claims
+    ]
+    statuses = Counter(s for s in status_of if s is not None)
     fabricated = any(c["support"] in ALWAYS_FABRICATING for c in claims) or any(
         c["core"] and c["support"] in UNGROUNDED for c in claims
     )
     # 审查第五轮:评委标的「复述了被删原文」只在难负例题(给了被删原文)上算;普通题上标了就忽略、计数
+    # (审查第六轮)null 当 false;难负例上没填(缺 / null)的计 repeats_deleted_missing
     repeats = sum(1 for c in claims if c.get("repeats_deleted") is True)
+    missing = sum(1 for c in claims if c.get("repeats_deleted") is None) if deleted else 0
+    # 标了复述被删原文、引文却在留下的资料里找得到 —— 自相矛盾,进复核清单
+    found_quote = sum(
+        1
+        for c, status in zip(claims, status_of, strict=True)
+        if deleted and c.get("repeats_deleted") is True and status == "found"
+    )
     return {
         **raw,
         "fabricated": fabricated,
@@ -380,6 +410,8 @@ def score_verdict(
         "quote_deleted": statuses["deleted"],
         "repeats_deleted": repeats if deleted else 0,
         "repeats_deleted_ignored": 0 if deleted else repeats,
+        "repeats_deleted_missing": missing,
+        "repeats_found_quote": found_quote,
         "grounded_claims": sum(1 for c in claims if c["support"] in GROUNDED_SUPPORTS),
         "counted_claims": sum(1 for c in claims if c["support"] != "no_source_needed"),
     }
@@ -448,6 +480,8 @@ def decide(
     return {
         "verdict": verdicts[categories.index(final) if final in categories else 0],
         "votes": categories,
+        # 每票标了几条「复述被删原文」(审查第六轮:少数票标了、整题没判编造的列进复核清单)
+        "vote_repeats": [int(v.get("repeats_deleted") or 0) for v in verdicts],
         "agreement": agreement,
         "category": final,
     }
@@ -525,8 +559,10 @@ __all__ = [
     "CATEGORIES",
     "DEFAULT_JUDGE_VOTES",
     "DISAGREE",
+    "DISTRACTOR_NOTE",
     "EXCLUDED",
     "FAILED",
+    "HARD_NEGATIVE_NOTE",
     "JUDGE_SYSTEM",
     "PASSAGE_SEP",
     "RECHECK_FAILED",

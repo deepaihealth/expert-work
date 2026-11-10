@@ -599,3 +599,13 @@ def test_the_judge_note_lists_every_deleted_anchor_and_asks_for_the_flag(tmp_pat
     note = load_hard_negative_spec(path).notes["hn-h1"]
     assert all(a in note for a in anchors)
     assert "repeats_deleted" in note
+
+
+def test_the_case_notes_come_from_the_templates_in_the_yardstick() -> None:
+    # 审查第六轮 LOW-8:说明的固定文字在 kb_agent_judge 里、进尺子哈希;这里只填空
+    from kb_agent_judge import DISTRACTOR_NOTE, HARD_NEGATIVE_NOTE  # type: ignore[import-not-found]
+    from kb_hard_sets import Distractor, _note  # type: ignore[import-not-found]
+
+    assert _note(["甲", "乙"]) == HARD_NEGATIVE_NOTE.format(deleted="「甲」;「乙」")
+    d = Distractor(case=_case("d1", "q", "a.md", "x"), entity="青松", near=("青柏",))
+    assert d.note == DISTRACTOR_NOTE.format(near="「青柏」", entity="青松")

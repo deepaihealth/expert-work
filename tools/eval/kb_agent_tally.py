@@ -146,6 +146,14 @@ def _id_list(
     return f"  {title}:{len(ids)} 题{shown}"
 
 
+def _row_list(
+    rows: Sequence[Mapping[str, Any]], hit: Callable[[Mapping[str, Any]], bool], title: str
+) -> str:
+    ids = [str(r["case_id"]) for r in rows if hit(r)]
+    shown = f"({', '.join(ids[:10])}{', …' if len(ids) > 10 else ''})" if ids else ""
+    return f"  {title}:{len(ids)} 题{shown}"
+
+
 def _pct(rate: Rate) -> str:
     hit, n = rate
     return f"{hit / n:.1%}({hit}/{n})" if n else f"—({hit}/{n})"
@@ -180,7 +188,12 @@ def _headline(rows: Sequence[Mapping[str, Any]]) -> list[str]:
         # 审查第五轮:难负例上文字比对与评委的 repeats_deleted 不一致的题,两个方向都列,不改类别
         _id_list(
             kept,
-            lambda v: bool(v.get("quote_deleted")) and not v.get("repeats_deleted"),
+            # .4 之前的旧行没问过评委(没有 repeats_deleted),不算「评委没标」(审查第六轮 LOW-9)
+            lambda v: (
+                bool(v.get("quote_deleted"))
+                and "repeats_deleted" in v
+                and not v.get("repeats_deleted")
+            ),
             "待复核·引文像被删句、评委没标",
         ),
         _id_list(
@@ -188,12 +201,38 @@ def _headline(rows: Sequence[Mapping[str, Any]]) -> list[str]:
             lambda v: bool(v.get("repeats_deleted")) and not v.get("quote_deleted"),
             "待复核·评委标了复述被删原文、引文没对上被删句",
         ),
+        _id_list(
+            kept,
+            lambda v: bool(v.get("repeats_found_quote")),
+            "待复核·标了复述被删原文、但引文在留下的资料里找到了",
+        ),
+        _id_list(
+            kept,
+            lambda v: bool(v.get("repeats_deleted_missing")),
+            "待复核·难负例上评委漏填 repeats_deleted",
+        ),
+        _row_list(
+            kept,
+            lambda r: any(r.get("vote_repeats") or ()) and r["category"] != "编造",
+            "待复核·有少数票因复述被删原文判编造、整题没判编造",
+        ),
         _grounded_line(kept),
     ]
     if excluded:
         lines.append(
             "  复核剔除(答前检索判为答案仍在库里,不答、不进分母):"
             f"{len(excluded)} 题({', '.join(excluded)})"
+        )
+    old = [
+        str(r["case_id"])
+        for r in kept
+        if (r.get("verdict") or {}).get("quote_deleted")
+        and "repeats_deleted" not in (r.get("verdict") or {})
+    ]
+    if old:
+        lines.append(
+            "  旧尺子未问评委(引文像被删句,没有 repeats_deleted):"
+            f"{len(old)} 题({', '.join(old[:10])}{', …' if len(old) > 10 else ''})"
         )
     failed = [str(x["case_id"]) for x in rows if x["category"] == RECHECK_FAILED]
     if failed:

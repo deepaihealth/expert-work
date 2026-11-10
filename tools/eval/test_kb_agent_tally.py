@@ -275,3 +275,37 @@ def test_disagreements_between_the_text_match_and_the_judge_flag_are_listed(
     text = tally([_write(tmp_path / "a.jsonl", rows)])
     assert "  待复核·引文像被删句、评委没标:1 题(h1)" in text
     assert "  待复核·评委标了复述被删原文、引文没对上被删句:1 题(h2)" in text
+
+
+def test_review_lists_for_minority_flags_missing_flags_found_quotes_and_old_rows(
+    tmp_path: Path,
+) -> None:
+    rows = [
+        # 有一票因复述被删原文判了编造,整题(多数)没判编造
+        {
+            **_row("h1", "no_answer", "正确说没写", set_="hard_negative"),
+            "vote_repeats": [1, 0, 0],
+            "verdict": {"repeats_deleted": 0},
+        },
+        # 难负例上评委漏填
+        {
+            **_row("h2", "no_answer", "正确说没写", set_="hard_negative"),
+            "verdict": {"repeats_deleted": 0, "repeats_deleted_missing": 2},
+        },
+        # 标了复述被删原文、引文却在留下的资料里
+        {
+            **_row("h3", "no_answer", "编造", set_="hard_negative"),
+            "verdict": {"repeats_deleted": 1, "repeats_found_quote": 1, "quote_deleted": 1},
+        },
+        # .4 之前的旧行:没问过评委,不进「评委没标」
+        {
+            **_row("h4", "no_answer", "正确说没写", set_="hard_negative"),
+            "verdict": {"quote_deleted": 1},
+        },
+    ]
+    text = tally([_write(tmp_path / "a.jsonl", rows)])
+    assert "  待复核·有少数票因复述被删原文判编造、整题没判编造:1 题(h1)" in text
+    assert "  待复核·难负例上评委漏填 repeats_deleted:1 题(h2)" in text
+    assert "  待复核·标了复述被删原文、但引文在留下的资料里找到了:1 题(h3)" in text
+    assert "  待复核·引文像被删句、评委没标:0 题" in text
+    assert "  旧尺子未问评委(引文像被删句,没有 repeats_deleted):1 题(h4)" in text
