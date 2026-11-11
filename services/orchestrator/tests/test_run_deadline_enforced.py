@@ -361,6 +361,47 @@ async def test_t1_4_spawn_worker_is_refused_past_80_percent() -> None:
     assert builder.calls == [] and graph.calls == []
 
 
+def _expired_ctx() -> ToolContext:
+    """模型调用中途已越过 100%:80% 与截止时刻都在过去。"""
+    now = time.monotonic()
+    return ToolContext(
+        tenant_id=uuid4(),
+        cancellation_token=CancellationToken(),
+        deadline_notice_at=now - 300.0,
+        deadline_at=now - 1.0,
+    )
+
+
+async def test_t1_4_subagent_past_100_percent_is_soft_refused_not_cancelled() -> None:
+    """守卫:咬「已过截止」的硬拒绝排在 80% 软拒绝之前 —— 那样会抛 RunCancelledError,
+    在失败台账里留一条 unknown(审查 L1)。"""
+    graph = _SubFakeGraph(result={"messages": [AIMessage(content="ok")], "step_count": 1})
+    builder = _RecordingBuilder(built=_sub_built(graph))
+    tool = SubAgentTool(subagent=_SUB, builder=builder, child_depth=1)
+
+    result = await tool.call({"task": "x"}, ctx=_expired_ctx())
+
+    assert "final phase" in str(result.content)
+    assert result.failed and result.failure_transient
+    assert builder.calls == [] and graph.calls == []
+
+
+async def test_t1_4_spawn_worker_past_100_percent_is_soft_refused_not_cancelled() -> None:
+    """守卫:同上,``spawn_worker`` 那一处的顺序。"""
+    from .test_spawn_worker import _answer_graph, _RecordingWorkerBuilder
+    from .test_spawn_worker import _built as _worker_built
+
+    graph = _answer_graph("ok")
+    builder = _RecordingWorkerBuilder(built=_worker_built(graph))
+    tool = SpawnWorkerTool(builder=builder, child_depth=1)
+
+    result = await tool.call({"task": "x"}, ctx=_expired_ctx())
+
+    assert "final phase" in str(result.content)
+    assert result.failed and result.failure_transient
+    assert builder.calls == [] and graph.calls == []
+
+
 # ---------------------------------------------------------------------------
 # T1-6 —— 审批暂停 30 分钟不算;暂停那步的模型调用、续跑后被批工具都算
 # ---------------------------------------------------------------------------

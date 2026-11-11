@@ -1123,9 +1123,10 @@ class PolicySpec(BaseModel):
             "Longest active run time of one turn, in seconds, including any "
             "delegated sub-agents. Time spent waiting for a human (approval / "
             "clarification) is not counted. ``0`` (default) = the platform "
-            "default of 90 minutes. At 80% the run is told to stop new checks "
-            "and deliver what it has; at the limit it stops calling tools and "
-            "writes the final reply from what it has (``exit_reason=deadline``). "
+            "default (90 minutes unless the platform changes it). At 80% the "
+            "run is told to stop new checks and deliver what it has; at the "
+            "limit it stops calling tools and writes the final reply from what "
+            "it has (``exit_reason=deadline``). "
             "86400 (the maximum) effectively removes the limit."
         ),
     )

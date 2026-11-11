@@ -277,9 +277,8 @@ class SpawnWorkerTool:
         if ctx.tenant_id is None:
             msg = "spawn_worker cannot run without a tenant binding"
             raise ToolBlockedError(msg)
-        if ctx.deadline_at is not None and ctx.deadline_at - time.monotonic() <= 0:
-            raise RunCancelledError("spawn_worker declined: global deadline already expired")
-        # B-302 —— 过了这一轮时限的 80% 不再派新的 worker(同 ``SubAgentTool``)。
+        # B-302 —— 过了这一轮时限的 80% 不再派新的 worker(同 ``SubAgentTool``);排在「已过
+        # 截止」之前,越过 100% 时也走中性的软拒绝。
         if past_notice(ctx.deadline_notice_at):
             return ToolResult(
                 content=FINAL_PHASE_DELEGATION_REFUSAL,
@@ -288,6 +287,8 @@ class SpawnWorkerTool:
                 failed=True,
                 failure_transient=True,
             )
+        if ctx.deadline_at is not None and ctx.deadline_at - time.monotonic() <= 0:
+            raise RunCancelledError("spawn_worker declined: global deadline already expired")
 
         task = self._require_task(args)
         focus = args.get("focus")

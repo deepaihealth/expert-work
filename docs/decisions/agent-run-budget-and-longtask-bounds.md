@@ -12,6 +12,8 @@ Two of the findings below were built (the rest stays deferred):
 
 **Still deferred:** token/$ per-run budget (方案 C, cost-motivated); Gap #2 (dedicated Reporter synthesis role); the deadline→graceful-wrap-up rewiring (deadline still enforced at delegation boundaries + cancellation, not the wrap-up gate).
 
+**Update (B-302, 2026-11-11).** The deadline→graceful-wrap-up rewiring is now built: the main loop enforces the deadline on *active* run time (checkpoint-accounted; human approval/clarification waits and pod-down time excluded; orphan reclaim continues the count; reset per turn and on regenerate). At 80% the run gets one notice to stop new checking and deliver; at 100% it takes the same tool-less wrap-up as `max_steps`, with `exit_reason="deadline"`. The platform default (`settings.default_run_deadline_s`) is now **5400 s (90 min)**, chosen from the production run-duration distribution; the approval/clarification resume path now also carries a deadline (it previously had none). See `docs/superpowers/specs/2026-11-11-b302-runaway-reverify-design.md` §4.1. The 3600 s figure below is historical.
+
 ## TL;DR / Decision
 
 The question that started this: *"a hardcoded `max_steps` isn't optimal — should we add a token/$ budget and/or heartbeat/lease?"*
