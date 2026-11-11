@@ -1244,3 +1244,18 @@ def test_every_turn_input_resets_the_loop_trip_count_and_step_warning() -> None:
         assert "no_progress_streak" not in graph_input  # B-226:不再按连续次数判, 通道已删
         assert graph_input["loop_trip_count"] == 0  # 「这次运行第 N 次打转」按本轮算
         assert graph_input["step_budget_warned"] is False
+
+
+def test_every_turn_input_clears_the_edit_file_tracking() -> None:
+    """B-302 PR 3 —— 每个文件的 edit_file 连续失败次数与本轮成功改动只属于一轮:省略时
+    上一轮的失败会让这一轮第一次失败就被说成「第 3 次」,上一轮的改动被说成「本轮」。"""
+    built = BuiltAgent(graph=None, system_prompt="sys", max_steps=3)  # type: ignore[arg-type]
+    fresh = build_run_graph_input(
+        built, input_text="hi", image_refs=[], untrusted_content=None, run_id=uuid4()
+    )
+    replay = replay_graph_input(
+        built, [SystemMessage(content="sys"), HumanMessage(content="hi")], run_id=uuid4()
+    )
+    for graph_input in (fresh, replay):
+        assert graph_input["edit_file_streaks"] == {}
+        assert graph_input["edit_file_history"] == {}

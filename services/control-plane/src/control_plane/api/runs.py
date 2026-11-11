@@ -612,6 +612,9 @@ def build_run_graph_input(
         "step_budget_warned": False,
         # B-302 —— 这一轮实际运行了多少秒(三个记账键一起清)与时限提醒同样只属于一轮。
         **RUN_CLOCK_TURN_RESET,
+        # B-302 PR 3 —— 每个文件的 edit_file 连续失败次数与本轮成功改动同样只属于一轮。
+        "edit_file_streaks": {},
+        "edit_file_history": {},
     }
 
 
@@ -671,6 +674,8 @@ def replay_graph_input(
         "loop_trip_count": 0,  # B-226,同上
         "step_budget_warned": False,
         **RUN_CLOCK_TURN_RESET,  # B-302,同上
+        "edit_file_streaks": {},  # B-302 PR 3,同上
+        "edit_file_history": {},
     }
 
 

@@ -1035,6 +1035,10 @@ GET /v1/agents/{agent_code}/sessions/{session_id}/items
 
 `tool_result` 的两个可选字段：`artifact` 是工具产出的结构化数据，结构随工具而定；`duration_ms` 是这次调用耗时，服务端没有量到时不出现。
 
+`edit_file` 的 `artifact` 里可能多出两个键，都只供参考、可以忽略：
+- 失败的结果（`status` 为 `error`）可能带 `expert_work_edit_file_failure`，取值是失败种类，例如 `no_match`（要替换的文字没对上）、`ambiguous`（对上了不止一处）、`stale`（文件在读取之后被改过）。
+- 成功的结果可能带 `already_applied`，是一个列表，每项为 `{index, line}`：第 `index` 处改动的新文字已经在文件第 `line` 行、旧文字已经不在，这一处按已完成计，没有再改文件。
+
 用 `call_id` 而不是列表位置去配对 `tool_call` 与 `tool_result`：工具是并行执行的，两者之间可能插着别的条目。
 
 ### 防注入包装的处理

@@ -389,7 +389,7 @@ CE-OCR 说对的读法会收敛、错的会发散,所以「读 3 次取一致」
 **4.3.2 最像的 3 行,说出从第几个字符开始不同**
 
 - 取 `old_string` 里**第一条「不是文件中任何一行的子串」的那一行**(去首尾空白后比;不是第一行 —— 事故里错的常在中间)。
-- 在文件所有行里按字符级相似度(difflib `SequenceMatcher`,门槛 0.45,同 openclaw)取最像的最多 3 行;文件超过 5,000 行时先用 `quick_ratio` 粗筛。
+- 在文件所有行里按字符级相似度(difflib `SequenceMatcher`,门槛 0.45,同 openclaw)取最像的最多 3 行;文件超过 5,000 行时先用 `quick_ratio` 粗筛。(实现补充,PR 3 复审:粗筛对所有文件都做;每行先比前 200 码点、得分最高的 10 行再按整行重算;整次调用共用一个工作量上限(「行长乘 probe 长」合计)和 5 秒墙钟兜底(墙钟只在两次比较之间检查;整行重算的单次比较另有 400 万单位上限),本机实测审查给的几种最坏形状 0.2~2.6 秒,墙钟将到时再碰上一次大比较,本机可能到约 10 秒(沙箱默认 30 秒);整行长度上界已低于门槛的行直接跳过、不算截断;截断或上限用完时结果记为近似,不用于条件 6,说明里写「只比到第 N 行」或「长行按近似比较」。)
 - 每行给:行号;**列号按原行算**(不去缩进,与 `read_file` 看到的那一行对得上),「第几个字符」按 Unicode 码点数;两边从这个位置前后各取约 8 个码点的片段并排:`yours «…» / file «…»`。
 - **片段边界不切断一个字形**:标准库没有字形切分,所以向外扩边界,直到边界两侧都不是组合附加符(Unicode 类别 M)、零宽连接符(U+200D)、变体选择符或肤色修饰符;列号照旧按码点报,并注明「counting Unicode code points」。
 - 不用 `^^^` 标记:全角、组合字符没有等宽对齐,箭头会指错;并排片段对任何文字都成立。
@@ -403,7 +403,7 @@ CE-OCR 说对的读法会收敛、错的会发散,所以「读 3 次取一致」
 3. `old_string` 在原文里一次都不出现(原样和去空白整块两级都没有);
 4. `old_string` 不包含 `new_string`;
 5. 不是 `replace_all`;
-6. `new_string` 在原文里那一处**覆盖的任一行**(`new_string` 可以跨多行),是 §4.3.2 算出的「与 `old_string` 出错那一行最像的 3 行」之一 —— 「已改过」的位置必须就是这一处改动瞄准的位置。
+6. `new_string` 在原文里那一处**覆盖的任一行**(`new_string` 可以跨多行),是 §4.3.2 算出的「与 `old_string` 出错那一行最像的 3 行」之一 —— 「已改过」的位置必须就是这一处改动瞄准的位置。user decision 11-11: keep top-3, accepted risk: sibling near-identical line(两行几乎一样时,`old_string` 抄错一个字、`new_string` 恰好等于旁边那一行,会被判成「已改过」而真正要改的那一行没动;测试 `test_m1_accepted_risk_a_near_identical_sibling_line_counts_as_applied` 钉住现状,改它要先改这条决定)。
 
 满足 → 这一处当作对上(不改动),结果里写:「edit 4: its new text is already in the file at line L and its old text is not — counted as applied; do not send it again.」
 

@@ -225,6 +225,14 @@ from orchestrator.tools.artifact import (
     SAVE_ARTIFACT_TOOL_NAME,
     ArtifactRecorder,
 )
+from orchestrator.tools.edit_file_tracking import (
+    EDIT_FAILURE_ARTIFACT_KEY,
+    EDIT_FILE_HISTORY_KEY,
+    EDIT_FILE_STREAKS_KEY,
+    FileToolEvent,
+    next_history,
+    next_streaks,
+)
 from orchestrator.tools.error_classifier import (
     ClassifiedToolError,
     classified_blocked,
@@ -235,6 +243,7 @@ from orchestrator.tools.error_classifier import (
     render_recovery_advisory,
 )
 from orchestrator.tools.figure_lookup import figure_run_ids
+from orchestrator.tools.file_ops import EditFileMismatchError
 from orchestrator.tools.find_tools import promotion_events
 from orchestrator.tools.knowledge_probe import (
     KnowledgeProbe,
@@ -2106,6 +2115,8 @@ def build_react_graph(
             viewed_figures=state.get("viewed_figures"),
             figure_reads=state.get("figure_reads"),
             run_state=state,
+            edit_file_streaks=state.get("edit_file_streaks"),
+            edit_file_history=state.get("edit_file_history"),
         )
         # Stream TE-2 — per-tool-call audit sink (may be None on the dev /
         # unit-test path; ``_dispatch_tool`` treats the emit as best-effort).
@@ -2223,6 +2234,8 @@ def build_react_graph(
         advisory_chars = 0
         # B-268 —— 平台拒绝的重复读取(``read_page`` 熔断)计进本 run 的防循环次数。
         refused_reads = 0
+        # B-302 PR 3 —— 本批真跑过的调用,按 tool_call 顺序,喂给每个文件的两本账。
+        file_events: list[FileToolEvent] = []
         for idx in range(len(tool_calls)):
             tool_message, tool_state, refund_inc, classified = results[idx]
             message_pos = len(new_messages)
@@ -2257,6 +2270,7 @@ def build_react_graph(
                 if idx in approved_questions:
                     batch_outcomes.append((_ledger_key(tool_calls[idx], tool_message, None), None))
                 continue
+            file_events.append(_file_tool_event(tool_calls[idx], tool_message))
             failure = _classify_tool_failure(tool_calls[idx], tool_message, classified)
             ledger_failure = _ledger_failure(failure, classified)
             if not _is_read_only_failure(
@@ -2352,6 +2366,8 @@ def build_react_graph(
         result_dict["unresolved_failures"] = _apply_failure_ledger(
             state.get("unresolved_failures") or [], batch_outcomes
         )
+        # B-302 PR 3 —— 每个文件的连续失败次数与本轮成功改动;没变就不写(state 形状不变)。
+        result_dict.update(_edit_file_tracking_update(state, file_events))
         # Stream J.8 — when this batch ran on an approve / modify resume,
         # clear the transient ``approval_resume`` channel so a follow-on
         # turn does not re-apply the stale verdict.
@@ -3097,6 +3113,47 @@ def _classify_tool_failure(
             path=outcome.path,
         )
     return classified
+
+
+def _file_tool_event(tool_call: dict[str, Any], tool_message: ToolMessage) -> FileToolEvent:
+    """B-302 PR 3 —— 一次真跑过的调用,交给 ``edit_file_tracking`` 的两本账。
+
+    成败看 ``ToolMessage.status``(同 L-4 的 mutation 分类器);失败种类与「已改过」的那几处
+    都在模型看不到的 ``artifact`` 里(``_invoke_tool`` 的失败分支 / ``edit_file`` 的 meta)。
+    """
+    artifact = getattr(tool_message, "artifact", None)
+    meta = artifact if isinstance(artifact, Mapping) else {}
+    ok = getattr(tool_message, "status", "success") != "error"
+    kind = meta.get(EDIT_FAILURE_ARTIFACT_KEY)
+    already = meta.get("already_applied") if ok else None
+    return FileToolEvent(
+        tool=str(tool_call.get("name", "")),
+        args=tool_call.get("args") or {},
+        ok=ok,
+        failure_kind=kind if isinstance(kind, str) else None,
+        already_applied=tuple(
+            item["index"]
+            for item in (already if isinstance(already, list) else [])
+            if isinstance(item, Mapping) and isinstance(item.get("index"), int)
+        ),
+    )
+
+
+def _edit_file_tracking_update(
+    state: Mapping[str, Any], events: Sequence[FileToolEvent]
+) -> dict[str, Any]:
+    """B-302 PR 3 —— 本批之后的两本账(spec §4.3.3 末段、§4.3.4);只返回变了的通道。"""
+    out: dict[str, Any] = {}
+    for key, advance in (
+        (EDIT_FILE_STREAKS_KEY, next_streaks),
+        (EDIT_FILE_HISTORY_KEY, next_history),
+    ):
+        previous = state.get(key)
+        before = previous if isinstance(previous, Mapping) else {}
+        after = advance(before, events)
+        if after != before:
+            out[key] = after
+    return out
 
 
 def _ledger_key_for(tool_name: str, path: str | None) -> tuple[str, str]:
@@ -4576,6 +4633,8 @@ def _build_tool_context(
     viewed_figures: list[str] | None = None,
     figure_reads: list[dict[str, Any]] | None = None,
     run_state: Mapping[str, Any] | None = None,
+    edit_file_streaks: Mapping[str, Any] | None = None,
+    edit_file_history: Mapping[str, Any] | None = None,
 ) -> ToolContext:
     """Lift tenant / user binding out of ``config["configurable"]`` into
     a :class:`ToolContext`. Missing values fall through as ``None`` —
@@ -4703,6 +4762,8 @@ def _build_tool_context(
         child_run=configurable.get("child_run") is True,
         figure_run_ids=figure_run_ids(_string_list(viewed_figures)) | inherited_runs,
         figure_reads=tuple(figure_reads) if isinstance(figure_reads, list) else (),
+        edit_file_streaks=edit_file_streaks if isinstance(edit_file_streaks, Mapping) else {},
+        edit_file_history=edit_file_history if isinstance(edit_file_history, Mapping) else {},
         turn_root_run_id=_parse_uuid(configurable.get(TURN_ROOT_RUN_KEY)),
     )
 
@@ -4885,12 +4946,16 @@ async def _invoke_tool(
         # tool's capability spec) are in hand, rather than re-parsing the
         # formatted ToolMessage downstream.
         classified = classify_tool_error(tool_name=tool.spec.name, error=exc, spec=tool.spec)
+        # B-302 PR 3 —— the kind of an ``edit_file`` mismatch rides the (model-invisible)
+        # artifact, for the tools node's per-file consecutive-failure count.
+        kind = exc.kind if isinstance(exc, EditFileMismatchError) else None
         return (
             ToolMessage(
                 content=_format_error(exc),
                 tool_call_id=call_id,
                 status="error",
                 name=tool.spec.name,
+                artifact={EDIT_FAILURE_ARTIFACT_KEY: kind} if kind else None,
             ),
             {},
             0,
@@ -5047,6 +5112,9 @@ async def _externalize_tool_overflow(
 
 def _format_error(exc: BaseException) -> str:
     summary = str(exc)
-    if len(summary) > _ERROR_SUMMARY_MAX_CHARS:
-        summary = summary[:_ERROR_SUMMARY_MAX_CHARS] + "...[truncated]"
+    # B-302 PR 3 —— an exception may carry its own cap (``edit_file``'s mismatch error:
+    # 1,500, spec §4.3.6); every other tool keeps the 500-character cut.
+    cap = int(getattr(exc, "max_error_chars", _ERROR_SUMMARY_MAX_CHARS))
+    if len(summary) > cap:
+        summary = summary[:cap] + "...[truncated]"
     return f"[tool error] {type(exc).__name__}: {summary}"

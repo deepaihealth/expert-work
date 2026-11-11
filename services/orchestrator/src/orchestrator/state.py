@@ -395,6 +395,14 @@ class AgentState(TypedDict):
     #: B-268 —— ``read_page`` 本 run 每次渲染一条(``tools.figure_reads.ledger_entries``):
     #: 重看回执、超上限预告、熔断都按它算。只留最新那个 run 的条目(见 :func:`_merge_figure_reads`)。
     figure_reads: NotRequired[Annotated[list[dict[str, Any]], _merge_figure_reads]]
+    #: B-302 PR 3 —— 每个文件(键 = ``path`` 入参去首尾空白,与欠账 ``("file", path)`` 同一个
+    #: 标识)``edit_file`` 的连续失败次数与「失败之后是否已 read_file」:``{"failures", "read"}``。
+    #: 只由 tools 节点整份写(``tools.edit_file_tracking.next_streaks``),默认覆盖 reducer;
+    #: 每轮开始清空(``control_plane.api.runs`` 的两个图输入函数)。
+    edit_file_streaks: NotRequired[dict[str, dict[str, Any]]]
+    #: B-302 PR 3 —— 每个文件本轮成功的 ``edit_file`` 改动 ``[{"old", "new"}]``(每处前 2,000
+    #: 码点、每文件最近 20 处)。没对上时用来说明「这段已被你本轮的改动替换」。写法、清空同上。
+    edit_file_history: NotRequired[dict[str, list[dict[str, str]]]]
     #: B-126 —— L2 滚动摘要写回检查点:``{"through_id": <消息 id>, "text": <整段摘要>}``。
     #: 下一次压缩时被覆盖的历史未变就直接复用,不再每步重写(spec §3.7)。默认覆盖 reducer。
     context_summary: NotRequired[dict[str, str] | None]

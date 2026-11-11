@@ -48,6 +48,16 @@ from pathlib import PurePosixPath
 from typing import Any, NoReturn
 from uuid import UUID
 
+from orchestrator.tools.edit_file_diagnostics import (
+    COUNTED_EDIT_FAILURES,
+    EDIT_DIAGNOSTICS_SOURCE,
+    EDIT_ERROR_MAX_CHARS,
+    already_applied_text,
+    edit_failure_text,
+    streak_text,
+)
+from orchestrator.tools.edit_file_tracking import EditStreak, history_for, streak_for
+from orchestrator.tools.error_classifier import KindClassifiedError
 from orchestrator.tools.locks import (
     NullWorkspaceLock,
     WorkspaceLock,
@@ -124,6 +134,22 @@ class FileOpError(RuntimeError):
     (missing file, binary content, I/O error). The ReAct tools node wraps
     it into a ``ToolMessage(status='error')`` (Mini-ADR E-12) so the model
     sees the structured ``error`` kind and self-corrects (re-read, fix path)."""
+
+
+class EditFileMismatchError(FileOpError, KindClassifiedError):
+    """B-302 PR 3 —— ``edit_file`` 的 ``no_match`` / ``ambiguous`` / ``stale``(spec §4.3.5)。
+
+    文字里引用了文件原文(相似行、片段、本轮改过的那一行),所以分类器**先认类型**,给出
+    这几种失败本来的类别 ``unknown``(进欠账),不去扫文字;错误文字上限 1,500(§4.3.6,
+    ``builder._format_error`` 读 :attr:`max_error_chars`),其它工具仍是 500。``kind`` 交给
+    tools 节点记「同一文件连续失败」。"""
+
+    error_class = "unknown"
+    max_error_chars = EDIT_ERROR_MAX_CHARS
+
+    def __init__(self, message: str, *, kind: str) -> None:
+        super().__init__(message)
+        self.kind = kind
 
 
 def _require_path(
@@ -279,7 +305,7 @@ def _main():
 print(json.dumps(_main()))
 """
 
-_EDIT_MAIN = """
+_EDIT_HELPERS = """
 
 def _fuzzy_line_span(text, old):
     # Unique line range [i, j) in text whose strip-normalized lines equal old's
@@ -301,23 +327,6 @@ def _fuzzy_line_span(text, old):
         return (hits[0], hits[0] + k)
     if len(hits) > 1:
         return "ambiguous"
-    return None
-
-
-def _candidate(text, old):
-    import difflib
-
-    ol = [x.strip() for x in old.split("\\n") if x.strip()]
-    if not ol:
-        return None
-    lines = text.split("\\n")
-    stripped = [x.strip() for x in lines]
-    close = difflib.get_close_matches(ol[0], stripped, n=1, cutoff=0.6)
-    if not close:
-        return None
-    for idx, s in enumerate(stripped):
-        if s == close[0]:
-            return "near line " + str(idx + 1) + ": " + lines[idx].strip()[:80]
     return None
 
 
@@ -344,11 +353,8 @@ def _apply(text, old, new):
     if span == "ambiguous":
         return {"ok": False, "error": "ambiguous", "detail": "multiple fuzzy matches"}
     if span is None:
-        result = {"ok": False, "error": "no_match"}
-        hint = _candidate(text, old)
-        if hint:
-            result["detail"] = hint
-        return result
+        # B-302 —— the "what differs" detail is added by _main, on the original text.
+        return {"ok": False, "error": "no_match"}
     i, j = span
     # Preserve a uniformly-CRLF file's endings; mixed / LF rebuild as LF.
     if "\\r\\n" in text and "\\n" not in text.replace("\\r\\n", ""):
@@ -365,11 +371,7 @@ def _replace_all(text, old, new):
     # indent-insensitive match would silently rewrite lines nobody meant).
     count = text.count(old)
     if count == 0:
-        result = {"ok": False, "error": "no_match"}
-        hint = _candidate(text, old)
-        if hint:
-            result["detail"] = hint
-        return result
+        return {"ok": False, "error": "no_match"}
     return {"ok": True, "text": text.replace(old, new), "match": "exact", "count": count}
 
 
@@ -385,7 +387,9 @@ def _apply_edit(text, old, new, replace_all):
             retry["match"] = "unmarked"
             applied = retry
     return applied
+"""
 
+_EDIT_RUN = """
 
 def _main():
     full = _resolve(_P["rel"])
@@ -416,20 +420,14 @@ def _main():
     # B-137 — every call is a list of edits (a single edit is a list of one).
     # They apply in order, each to the text the previous one produced, and
     # the file is written only if all of them matched.
+    # B-302 — on a failure the WHOLE list is still tried (nothing written), so the
+    # model learns which edits would have applied (_try_all / _failure).
     edits = _P["edits"]
-    updated = text
-    matches = []
-    replaced = 0
-    for k, edit in enumerate(edits):
-        applied = _apply_edit(updated, edit["old"], edit["new"], edit.get("replace_all", False))
-        if not applied.get("ok"):
-            if len(edits) > 1:
-                applied["index"] = k + 1
-                applied["total"] = len(edits)
-            return applied
-        updated = applied["text"]
-        matches.append(applied["match"])
-        replaced += applied.get("count", 1)
+    updated, matches, replaced, outcomes = _try_all(text, edits)
+    _recheck(edits, outcomes, updated)
+    failure = _failure(text, edits, outcomes, _P.get("history") or [])
+    if failure is not None:
+        return failure
     try:
         out = updated.encode("utf-8")
     except UnicodeEncodeError:
@@ -438,7 +436,7 @@ def _main():
         _atomic_write(full, out)
     except OSError as exc:
         return {"ok": False, "error": "io_error", "detail": str(exc)}
-    return {
+    result = {
         "ok": True,
         "content_hash": hashlib.sha256(out).hexdigest(),
         "size": len(out),
@@ -447,10 +445,148 @@ def _main():
         "matches": matches,
         "replaced": replaced,
     }
+    already = [
+        {"index": k + 1, "line": oc["line"]}
+        for k, oc in enumerate(outcomes)
+        if oc["state"] == "already"
+    ]
+    if already:
+        result["already_applied"] = already
+    return result
 
 
 print(json.dumps(_main()))
 """
+
+#: B-302 PR 3 (spec §4.3.1 / §4.3.3) —— 失败时整张清单试一遍、只看不写。拼在
+#: :data:`~orchestrator.tools.edit_file_diagnostics.EDIT_DIAGNOSTICS_SOURCE` 之后、``_main``
+#: 之前(那一段定义了 ``_already_applied`` / ``_depends_on`` / ``_no_match_detail`` …)。
+_EDIT_TRY_ALL = r"""
+
+def _try_all(text, edits):
+    # Try EVERY edit in order: a failed one is skipped, the rest go on top of the ones
+    # that matched. Each outcome: ok / already (§4.3.3) / unchecked (its old_string shares
+    # a line with the new_string of a skipped edit) / failed.
+    updated = text
+    matches = []
+    replaced = 0
+    outcomes = []
+    skipped = {}
+    for k, edit in enumerate(edits):
+        old, new = edit["old"], edit["new"]
+        applied = _apply_edit(updated, old, new, edit.get("replace_all", False))
+        if applied.get("ok"):
+            updated = applied["text"]
+            matches.append(applied["match"])
+            replaced += applied.get("count", 1)
+            outcomes.append({"state": "ok"})
+            continue
+        if applied.get("error") == "no_match":
+            line = _already_applied(text, edit)
+            if line is not None:
+                matches.append("already_applied")
+                # Decided by _recheck at the end; "seen" only picks its wording.
+                seen = new.strip() in updated
+                outcomes.append({"state": "already", "line": line, "seen": seen})
+                continue
+        on = _depends_on(old, skipped, updated)
+        if on is not None:
+            outcomes.append({"state": "unchecked", "on": on})
+        else:
+            outcomes.append({"state": "failed", "env": applied})
+        for raw in new.split("\n"):
+            body = raw.strip()
+            if body and body not in skipped:
+                skipped[body] = k + 1
+    return updated, matches, replaced, outcomes
+
+
+def _recheck(edits, outcomes, updated):
+    # §4.3.3 —— judged "already applied" on the original text, but another edit of this
+    # call changes that place: its new text is gone from the final text -> no_match.
+    for k, oc in enumerate(outcomes):
+        if oc["state"] == "already" and edits[k]["new"].strip() not in updated:
+            which = "a later" if oc["seen"] else "an earlier"
+            detail = "its new text was in the file, but " + which
+            detail += " edit in this call changes that place"
+            outcomes[k] = {
+                "state": "failed",
+                "env": {"ok": False, "error": "no_match", "detail": detail},
+            }
+
+
+def _would_match(text, edit):
+    # The real matcher's verdict (all three levels, replace_all included): anything but
+    # no_match means this edit's old_string finds its place in ``text``.
+    applied = _apply_edit(text, edit["old"], edit["new"], edit.get("replace_all", False))
+    return applied.get("ok") or applied.get("error") != "no_match"
+
+
+def _changed_by_earlier(text, edits, outcomes, first):
+    # Edit `first` did not match the text the edits before it produced. When it DOES match
+    # the original file, replay the earlier edits that matched and name the one after
+    # which it stops matching. None when that is not what happened.
+    if not _would_match(text, edits[first]):
+        return None
+    current = text
+    for k in range(first):
+        if outcomes[k]["state"] != "ok":
+            continue
+        edit = edits[k]
+        current = _apply_edit(current, edit["old"], edit["new"], edit.get("replace_all", False))[
+            "text"
+        ]
+        if not _would_match(current, edits[first]):
+            return (
+                "its old text is in the file, but an earlier edit in this call (edit %d) "
+                "changes that place" % (k + 1)
+            )
+    return None
+
+
+def _failure(text, edits, outcomes, history):
+    # The envelope of a failed call, or None. Reports the first failed edit in full
+    # (closest lines on the ORIGINAL text, the run's own earlier edits) and, for a
+    # list, what every other edit would have done.
+    failed = [k for k, oc in enumerate(outcomes) if oc["state"] == "failed"]
+    if not failed:
+        return None
+    first = failed[0]
+    env = dict(outcomes[first]["env"])
+    old = edits[first]["old"]
+    if env.get("error") == "no_match":
+        if "detail" not in env:
+            detail = _changed_by_earlier(text, edits, outcomes, first)
+            if detail is None and edits[first].get("replace_all") and _old_in(text, old):
+                # replace_all has no whitespace-tolerant level (B-137).
+                detail = (
+                    "with replace_all, 'old_string' must match exactly, indentation and "
+                    "spaces included; it matches here only when spaces are ignored"
+                )
+            if detail is None:
+                detail = _no_match_detail(text, old)
+            if detail:
+                env["detail"] = detail
+        own = _own_edit(text, old, history)
+        if own:
+            env["own_edit"] = own
+    if len(edits) > 1:
+        env["index"] = first + 1
+        env["total"] = len(edits)
+        env["report"] = {
+            "applied": [
+                k + 1 for k, oc in enumerate(outcomes) if oc["state"] in ("ok", "already")
+            ],
+            "failed": [[k + 1, outcomes[k]["env"].get("error")] for k in failed],
+            "unchecked": [
+                [k + 1, oc["on"]] for k, oc in enumerate(outcomes) if oc["state"] == "unchecked"
+            ],
+        }
+    return env
+"""
+
+#: The whole ``edit_file`` snippet body: helpers, diagnostics, try-all, then ``_main``.
+_EDIT_MAIN = _EDIT_HELPERS + EDIT_DIAGNOSTICS_SOURCE + _EDIT_TRY_ALL + _EDIT_RUN
 
 _ARTIFACT_LOCATE_MAIN = """
 
@@ -518,10 +654,15 @@ def build_edits_wrapper(
     *,
     expected_hash: str | None = None,
     ws: str = _WORKSPACE_ROOT,
+    history: Sequence[Mapping[str, str]] = (),
 ) -> str:
     """B-137 —— snippet that applies ``edits`` (``{old, new, replace_all}``) to
-    ``ws/rel`` in order, all-or-nothing, in one atomic write."""
-    return _edit_snippet(rel, edits, expected_hash=expected_hash, ws=ws)
+    ``ws/rel`` in order, all-or-nothing, in one atomic write.
+
+    B-302 —— ``history`` is this run's earlier successful edits of the same file
+    (``{old, new}``); on a ``no_match`` the snippet says when the text being replaced
+    was already replaced by one of them (spec §4.3.3)."""
+    return _edit_snippet(rel, edits, expected_hash=expected_hash, ws=ws, history=history)
 
 
 def _edit_snippet(
@@ -530,10 +671,13 @@ def _edit_snippet(
     *,
     expected_hash: str | None,
     ws: str,
+    history: Sequence[Mapping[str, str]] = (),
 ) -> str:
     params: dict[str, Any] = {"ws": ws, "rel": rel, "edits": [dict(e) for e in edits]}
     if expected_hash is not None:
         params["expected_hash"] = expected_hash
+    if history:
+        params["history"] = [dict(h) for h in history]
     return _snippet(params, _EDIT_MAIN)
 
 
@@ -639,8 +783,8 @@ _EDIT_ESCALATE_AFTER_TWO = (
 #: 就不是文件不在, 是 ``old_string`` 没对上。测试钉着这条不变式。
 #:
 #: ⚠ 这段文字接在 ``msg`` 尾巴上, 而 ``builder._format_error`` 对 ``str(exc)``
-#: 有 500 字符硬截断 —— 超了就正好把新加的引导截没, 看起来像没加。最坏情况
-#: (``no_match`` 带满 80 字符的 near-line 提示)测试里钉着。(B-163 之前 advisory
+#: 有硬截断(B-302 起 ``edit_file`` 的这几种失败是 1,500, 见 :class:`EditFileMismatchError`)
+#: —— 超了就正好把新加的引导截没, 看起来像没加。最坏情况测试里钉着。(B-163 之前 advisory
 #: 通道还会按 ``_SUMMARY_MAX_CHARS`` = 300 再截一刀;现在建议不抄原文, 只剩这一刀。)
 #: 所以**可执行的第一步排在最前面**, 第二级升级排在最后:被截掉的永远是阶梯的第二级,
 #: 不是第一级。
@@ -659,7 +803,9 @@ _EDIT_RECOVERY: dict[str, str] = {
 }
 
 
-def _raise_for_error(env: Mapping[str, Any], *, tool: str) -> None:
+def _raise_for_error(
+    env: Mapping[str, Any], *, tool: str, streak: EditStreak | None = None
+) -> None:
     """Map a ``{"ok": False, ...}`` envelope to the right exception.
 
     ``path_escapes_workspace`` is a security denial → :class:`ToolBlockedError`
@@ -669,13 +815,26 @@ def _raise_for_error(env: Mapping[str, Any], *, tool: str) -> None:
     B-84 第 9 条 —— ``edit_file`` 的失败额外带一句下一步动作(见
     :data:`_EDIT_RECOVERY`)。只挂在 ``edit_file`` 上:同一个函数还服务
     ``write_file`` / ``read_document`` / 两条 projection 通道, 那几条的同名 kind
-    语义不同, 措辞不能共用。"""
+    语义不同, 措辞不能共用。
+
+    B-302 PR 3 —— ``edit_file`` 的 ``no_match`` / ``ambiguous`` / ``stale`` 抛
+    :class:`EditFileMismatchError`(分类按种类、不扫引用的文件内容;上限 1,500),文字由
+    :func:`~orchestrator.tools.edit_file_diagnostics.edit_failure_text` 组装;``streak`` 是
+    这次调用**之前**这个文件的连续失败账(本次失败算第 ``failures + 1`` 次)。"""
     if env.get("ok"):
         return
     kind = env.get("error", "unknown")
     if kind == "path_escapes_workspace":
         msg = f"{tool}: path escapes the workspace"
         raise ToolBlockedError(msg)
+    if tool == "edit_file" and kind in COUNTED_EDIT_FAILURES:
+        prior = streak or EditStreak()
+        text = edit_failure_text(
+            env,
+            guidance=_EDIT_RECOVERY.get(str(kind)),
+            streak=streak_text(prior.failures + 1, read=prior.read),
+        )
+        raise EditFileMismatchError(text, kind=str(kind))
     detail = env.get("detail")
     # B-137 —— 多处编辑里第几项失败(整次调用什么都没写)。
     where = f"edit {env['index']} of {env['total']}: " if env.get("index") else ""
@@ -1438,7 +1597,13 @@ class EditFileTool:
         ):
             outcome = await run_in_sandbox(
                 self.client,
-                code=build_edits_wrapper(rel, edits, expected_hash=expected, ws=ws),
+                code=build_edits_wrapper(
+                    rel,
+                    edits,
+                    expected_hash=expected,
+                    ws=ws,
+                    history=history_for(ctx.edit_file_history, args.get("path")),
+                ),
                 timeout_s=None,
                 ctx=ctx,
                 tool_label="edit_file",
@@ -1449,7 +1614,9 @@ class EditFileTool:
         if env.get("error") == "stale":
             # B-137 —— 不把哈希交给模型:它从来看不到真值, 交了只会被抄去再编。
             env = {**env, "detail": None}
-        _raise_for_error(env, tool="edit_file")
+        _raise_for_error(
+            env, tool="edit_file", streak=streak_for(ctx.edit_file_streaks, args.get("path"))
+        )
         size = env.get("size")
         match = env.get("match")
         matches = env.get("matches") or ([match] if match else [])
@@ -1457,8 +1624,14 @@ class EditFileTool:
             suffix = f": {len(edits)} edits ({', '.join(map(str, matches))} match)"
         elif edits[0]["replace_all"]:
             suffix = f" (replaced {env.get('replaced')} occurrences)"
+        elif match == "already_applied":
+            suffix = ""
         else:
             suffix = f" ({match} match)" if match else ""
+        # B-302 —— 「已改过」的那几处(spec §4.3.3):明说算作改成了、别再发。
+        notes = already_applied_text(env.get("already_applied"))
+        if notes:
+            suffix = f"{suffix}. {notes}"
         meta: dict[str, Any] = {
             "path": rel,
             "content_hash": env.get("content_hash"),
@@ -1469,6 +1642,9 @@ class EditFileTool:
         }
         if hash_ignored:
             meta["expected_hash_ignored"] = True
+        if env.get("already_applied"):
+            # The tools node keeps these out of the run's edit history (they replaced nothing).
+            meta["already_applied"] = env.get("already_applied")
         return ToolResult(content=f"Edited {rel} ({size} bytes){suffix}", meta=meta)
 
 
