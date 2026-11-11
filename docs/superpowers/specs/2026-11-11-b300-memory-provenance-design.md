@@ -1,500 +1,395 @@
-# B-300 长期记忆:读错的数被当事实记下、又被拿来印证下一次读数 —— 设计
+# B-300 长期记忆:助手自己得出的内容被当成用户事实记下,并反过来印证新结论 —— 设计
 
-- **日期**:2026-11-11 · **状态**:设计稿(修订 3.1);四条方向与顺序用户已拍板(④→①→③→②),本文只写怎么做,不动代码。开发等用户指令。
+- **日期**:2026-11-11 · **状态**:设计稿(第 5 版);四条方向与顺序用户已拍板(④→①→③→②),本文只写怎么做,不动代码。开发等用户指令。
 - **读者**:产品负责人(看 §0、§10)、开发工程师(全文)。
-- **代码事实**:凡写了 `文件:行号` 的,都在 `origin/main` `40408518a` 上打开文件核过(本分支相对 main 只多文档提交)。开工时 main 已前进的话行号要重对。没核过的标「未验证」,汇总在 §11。
-- **参照项目**:本机 `~/src/github/` 下六个项目只读核对了行号,没有运行;提交号本次没取,行号以 11-11 本机工作区为准。
-- **关系**:[B-176 长期记忆 v2](2026-10-10-b176-long-term-memory-v2-design.md)的交接见 §7;B-301 管「为什么读错」,B-300 管「读错之后别被记成事实、别被拿来印证」;B-168、B-162 的机制不动。
-- **约束**:平台文本零租户内容,示例全部合成;不绑定模型厂商;凡「只靠措辞」的地方明说。
-- **范围**(用户拍板的只有这四条):④ 语言;① 提炼输入;③ 召回提醒;② 一个来源字段(用户说的 / 助手得出),助手得出的置信度封顶并标「未经用户确认」。
+- **代码事实**:凡写了 `文件:行号` 的,都在 `origin/main` `40408518a` 上打开文件核过。开工时 main 已前进,行号要重对。没核过的标「未验证」,汇总在 §11。
+- **参照项目**:本机 `~/src/github/` 下六个项目只读核对了行号,没有运行;提交号没取。
+- **关系**:[B-176 长期记忆 v2](2026-10-10-b176-long-term-memory-v2-design.md)的交接见 §7;B-301 管「看图为什么读错」,与本项互不依赖;B-168、B-162 的机制不动。
+- **硬性要求(用户 11-11)**:方案必须通用,**不针对数字、不针对某个领域做特殊处理**。平台文本零租户内容、不出现领域词;不绑定模型厂商;凡「只靠措辞」的地方明说。
+
+> **用户拍板记录(11-11)**:① 验收按「每家模型 10 个场景 × 3 次里 0 次违规,对照用例多余提醒 ≤ 10%」;② 子智能体一律不写长期记忆(编排侧不落写回任务;开工前先数现有多少记忆来自子智能体);③ PR 1 与 PR 2 同一班车上生产;④ ~~用户只回「对」:带数字的不算确认~~ —— **作废,被 11-11 的通用性要求取代**,新规则见 §6.2,待重新确认(§10);⑤ 不要总开关,出问题回滚版本(已写入的记忆不随回滚撤回);⑥ 存量英文记忆不动(先数生产比例);⑦ 付费评测跑全量,开跑前再报价。
 
 ## 修订记录
 
-**修订 3.1(11-11,第三轮审查后)**。1 条高、2 条中、4 条低,回代码核对后全部成立;都是一两句话的改动,没有新增机制。
+**第 5 版(11-11,通用性要求)**。前几版用「数字检查」给来源判定兜底(什么算数字、千分位、单位、豁免清单……),只对数字有效,豁免清单还带着健康领域的痕迹;评测和措辞也围着「读数」写。本版:
 
-| 编号 | 问题 | 处理 |
-|---|---|---|
-| R1 | 「紧贴拉丁字母的数字不算」没分前后,`68.1kg`、`175cm` 这种数字后面直接跟单位的(正是事故的写法)会被排除在检查之外 | 只排除**前面**紧贴字母的(B12、HbA1c、PM2.5、CA125);后面跟单位字母的照查。§8.2 加 `68.1kg`、`175cm` 两条单测 |
-| R2 | 整理会把来源条目藏到汇总后面(召回跳过已被汇总的条目,`sql.py:106-113,738-742`);一簇里混进一条助手读数,整簇(含用户说的)就变成一条「助手得出」的共享事实 | 混有「助手得出」与「用户说的 / 用户更正」的簇**不汇总**(代码里一个过滤);§6.5 写明汇总后「用户说的」标记会丢。整理任务默认开、每 4 小时一轮(`settings.py:875`;`app.py:2400-2452`) |
-| R3 | 修订 3 把「子智能体不给用户说的」删了,拍板项还留着「不处理」 | 「子智能体不写长期记忆 / 永远判为助手得出」二选一,成为 PR 2 上生产的前提;去掉「不处理」。读代码确认:动态派出的子智能体本来就没有记忆配置(`subagent_runtime.py:262`),只有静态登记的子智能体带自己的配置(`:604-632`) |
-| R4 | 定时任务缺省的平台英文句会成为 `[user]` 行 | 构造时标为平台文字,提炼跳过 |
-| R5 | A8 / T10:候选文字与旧记录逐字相同时写不进去,用例会红 | 场景里让用户换一种说法;期望里写明「逐字相同则保留原记录」 |
-| R6 | 标签 `not confirmed by the user` 对「用户确认过但没升级」的记忆不属实 | 标签改为 `from the assistant`,解释放在提醒节 |
-| R7 | 缺「长对话里用户在别处提过同一个小整数」的场景 | A 组加 A11,只报数 |
+| 改了什么 | 说明 |
+|---|---|
+| 来源判定改为**按结构**:分两次提炼 | 一次只给用户的话,产出一律「用户原话」;一次给整段对话,产出一律「来自助手」。不看内容、不分领域、不靠模型打标签。§4、§6 |
+| 删掉整套数字检查 | 规格表、豁免清单、`said_by` 字段、相关单测、「错标超过 10% 再升级」的条件,全部删除 |
+| 删掉「工具 / 附件之后」的回答标记 | 两次提炼下它不再影响来源,留着只是多一套规则 |
+| 「对」的规则改成通用的 | 只看「这句话离开助手那句还说不说得通」,与内容是什么无关。§6.2 |
+| 语言 | 说法改为「记忆用用户的语言写」;点名只是检测能力所及时把话说硬一点,不点名时同一条规则照样生效。§3 |
+| 平台文字逐句重写 | 不出现数字 / 读数 / 测量 / 健康等词;附跨场景检验。§4.2、§5.1、§5.3 |
+| 评测按「内容形态 × 来源路径」组织 | 5 个不相干领域,健康占五分之一;事故那条只是其中一个场景。§8 |
+| 标题与 §0 | 改成通用表述,事故作为实例 |
 
-**修订 3(11-11,第二轮审查后)**。第二轮 7 条中、11 条低,都出在修订 2 **新加的机制**上;逐条回代码核对,全部成立。本轮的处理原则是**先问这个机制能不能删**:能删就删,不去给它打补丁。删掉了什么、留下什么风险,集中写在 §6.5「为什么不做得更复杂」。
-
-| 编号 | 问题 | 处理 |
-|---|---|---|
-| N1 | 内容相同时「开新版本」会撞唯一索引(`migrations/versions/0098_memory_item_agent_name.py`;`sql.py:527-548` 插入不处理冲突);原地升级可能升到已作废的行 | **删掉整套升级机制**(判重改走更新、按近邻升级、哈希冲突原地升级)。用户确认后只靠去重合并本来就有的「更新」 |
-| N2 | 显示把「置信度 1.0 + 来源空」当用户更正,等级表却当最低 | 只留**一个**「有效来源」函数,渲染和唯一的一条拦截规则共用;没有升级,也就不会把 1.0 降下来 |
-| N3 | 「做了什么」类全是助手得出,提醒却让模型说「用户未确认」,对助手自己做过的事不对 | 提醒只针对「关于用户或外部世界的读数 / 结论」;删掉「引用时要说明」那句;加对照用例 B7 |
-| N4 | 「用户说的与用户更正同级、后说的生效」没有先后判断,每轮整段重抽会让旧话覆盖新更正 | 删掉等级表。用户说的候选能否更新一条更正,**保持今天的行为**(今天就能,B-300 不新增也不修);写明是既有问题 |
-| N5 | 「本对话写下的助手得出记忆不注入本对话」与压缩前抢存的用途相冲,子智能体会话号也对不上 | **删掉这个机制**,靠来源标记 + 提醒 |
-| N6 | 30 个样本是同一段对话重复 30 次,不独立;判官没校准 | 每组 ≥ 10 个不同的合成场景 × 3 次;判官先用 20 条人工标注校准;不再声称「0/30 ⇒ ≤ 10%」 |
-| N7 | 「数字集合相同的唯一近邻」对不含数字的记忆恒成立 | 随 N1 一起删 |
-| L1 | 按记录的长度切完,要核对剩余部分的形状 | 写入 §4.2 |
-| L2 | 其它构造可见用户消息的地方:定时任务种子(`control_plane/trigger_firing.py:260-282`,缺省是平台英文句)、子智能体任务(`_child_run.py:248-252`)、评测;都是纯文本 | 写入 §4.4,§11 那条结案 |
-| L3 | 数字规格:粘在字母上的数字(HbA1c、B12)、`120,80`、日期豁免、小整数易撞 | 粘字母的不算数字;逗号只在标准千分位形状下才合并;**删掉日期豁免**;小整数相撞写为剩余风险 |
-| L4 | 短日文会被当成中文 | 语言规则再简化:只点名中文,且出现任何假名 / 谚文就不点名 |
-| L5 | 「带过图之后每一轮都打标记」让提示常开 | **删掉**这条延伸,只标当轮 |
-| L6 | 开关要在编排和控制面两边都设;提取开关捆着来源判定;「过度提醒 ≤ 20%」太松 | 合成**一个**总开关,两个服务同一份环境;过度提醒线收到 10% 并入验收口径的拍板 |
-| L7 | 改成冲突更新后同批重复哈希 | 随 N1 删除(仍是冲突不写) |
-| L8 | 汇总句是新写的文字却给了「用户说的」;被排除的条目永远堆着 | 汇总不再排除任何条目;汇总来源只有两种:簇内有助手得出 → 助手得出,否则空 |
-| L9 | 「saved before sources were tracked」对发版后的空来源不对 | 改为「its source was not recorded」 |
-| L10 | 费用漏项 | §10 重估 |
-| L11 | 管理员改写置信度 1.0 的行后仍显示用户更正 | 既有行为(今天 `PATCH` 就不动置信度);写明,不新增机制 |
-
-**修订 2(11-11,第一轮审查后)**:第一轮 1 条严重、5 条高、10 条中,全部成立。保留到本版的改动:`[user]` 行只取输入文字、外部内容和附件另成一行(C1);「来源未记录」与「助手得出」分开措辞、存量更正正常显示(H1);评测拆成不会空转的两组(H3);当轮带附件也打标记、加非数字用例与升级条件(H4);数字检查规格(M2);渲染防伪造(M4);整理提示词保留归属(M1);claude-code 证据降级为不直接适用(M8);运维开关(M7);验收口径列为待拍板(M10)。修订 2 为 H2、H5、M6、M9 加的机制,本版删除或简化(见上表与 §6.5)。
+**此前各版留下的结论**(经三轮独立审查,均已回代码核对):`[user]` 行只取输入文字,附件和外部内容不算用户的话;「来源未记录」与「来自助手」分开措辞;存量的用户更正按置信度 1.0 识别;助手得出的记忆不能覆盖用户原话;整理时混合来源的簇不汇总;渲染防伪造(一条消息一行);不做升级机制、同对话过滤、重试队列改造、排序降权(理由见 §6.5)。
 
 ---
 
 ## 0. 一页看懂
 
-**出了什么事**(测试环境,ROADMAP B-300 行):同一张体重秤照片(实际 69.1),对话甲里看图读成 68.1;对话结束后自动提炼成一条记忆(置信度 0.8,英文);几分钟后对话乙再看同一张图又读成 68.1,召回了这条记忆,回答「与历史数据吻合,可信度较高」。
+**问题**:长期记忆不区分「用户亲口说的」和「助手自己得出的」(从工具结果、附件里看来的,或自己推断的)。助手得出的内容被当成用户事实记下;下次助手再得出同样的内容时,召回这条记忆,把它当成旁证 —— 同一个错误自己给自己作证。这对任何内容都成立:一个读数、一个订单号、一个人名、一条合同条款的理解、一句「客户倾向续约」。
 
-**错在哪**(读错本身归 B-301):提炼不分「用户说的」和「助手读的」;记忆没有来源;召回没有任何提醒。
+**一个实例**(测试环境,ROADMAP B-300 行):同一张照片上的值,对话甲里看图读错了;对话结束后被提炼成一条记忆(置信度 0.8,且是英文);几分钟后对话乙再看同一张图又读成同一个错值,召回了这条记忆,回答「与历史数据吻合,可信度较高」。
 
 **四条改动**:
 
 | 序 | 改什么 | 程序保证的 | 只是措辞的 | PR |
 |---|---|---|---|---|
-| ④ 语言 | 程序看用户输入文字是不是中文,把语言要求写进提炼指令 | 判断 | 模型是否照写 | 1 |
-| ① 提炼输入 | 不给工具结果、附件、外部内容;只给用户输入文字、每轮最终回答、一行「调用了哪些工具」;当轮用过工具或带附件的,最终回答打标记 | 进什么、标记 | 模型怎么用标记 | 1 |
+| ④ 语言 | 记忆用用户的语言写;程序能认出来时把语言名写进指令 | 判断 | 模型是否照写 | 1 |
+| ① 提炼输入 | 不给工具结果、附件、外部内容;**分两次提炼**:一次只给用户的话,一次给「用户的话 + 助手每轮的最终回答 + 调用了哪些工具」 | 每次给什么 | 模型提炼得好不好 | 1 |
 | ③ 召回提醒 | 记忆块后单独一节;每条带记录日期(PR 2 起带来源) | 渲染 | 模型是否照做 —— **最不稳** | 1 |
-| ② 来源 | 一个字段:用户说的 / 助手得出。「用户说的」要过程序的数字检查;助手得出的置信度封顶 0.6、召回时标未确认、不能覆盖用户说的 | 字段、封顶、数字检查、一条拦截规则 | 模型标的「谁说的」(不含数字的内容只剩它) | 2 |
+| ② 来源 | 一个字段,两个值:用户原话 / 来自助手。**由「是哪一次提炼出来的」决定**;来自助手的置信度封顶 0.6、召回时带标记、不能覆盖用户原话 | 来源、封顶、拦截 | 无 | 2 |
 
-**「用户说的」指什么**:出现在本轮**输入文字**里。不含图片 / 文件内容,不含对接方随请求附带的外部内容。走开放 API 时输入文字是对接方后端拼的,平台只能认到这一层。
+**「用户原话」指什么**:只看用户自己发的文字(本轮输入文字)就能读出来的内容。不含图片 / 文件 / 对接方附带的外部内容;不含助手说了、用户只回一句「对」的内容。走开放 API 时输入文字是对接方后端拼的,平台只能认到这一层。
 
-**已知的洞与补法**:去掉工具结果后,助手的最终回答仍会复述读错的数。程序给这句回答打标记(①);模型标「谁说的」后,程序复核「记忆里的每个数字都出现在某条 `[user]` 行里」(②),68.1 不在 → 判为助手得出。
+**为什么这样就关得住**:只给用户的话的那一次提炼,根本看不到助手说了什么 —— 助手得出的内容不可能从这里出来。所以「用户原话」这个标记不依赖模型自觉,对任何内容、任何领域都一样。
 
-**做完之后还剩什么风险**:
+**还剩什么风险**:
 
-1. 带数字的读错:程序挡得住。
-2. 不带数字的读错(药名、诊断、姓名):只剩模型的标注。有专门用例,并预先定了「错标超过 10% 就改用分两次提炼」(§6.2)。
-3. 主模型看到带标记的记忆仍说「吻合」:纯措辞,靠 §8 量。
-4. 同一对话内也可能召回自己刚读的数;助手复述记忆的话可能被再提炼一遍。本设计没有为这两件事加专门机制(§6.5)。
-5. PR 1 单独在线时只有措辞层,所以两个 PR 同一班车上生产。
+1. 主模型看到带标记的记忆后,仍可能把它当旁证:纯措辞,靠 §8 量。
+2. 「助手问、用户只答一个词」这类回答,只看用户的话读不出意思,会被记成「来自助手」(内容写明是用户回答的)。是保守方向的代价,见 §6.2 与 §10。
+3. 每次写回多一次模型调用(§4.4)。
+4. 同一对话内也可能召回自己刚写下的记忆;助手复述记忆的话可能被再提炼。没有为这两件事加专门机制(§6.5)。
 
-**不解决什么**:读数本身读错(B-301);记忆串客户(B-176 M4);`remember` 工具那套记忆(同样没有来源和提醒,B-176 待拍板 #3);旧记忆清洗;排序。
+**不解决什么**:助手为什么得出错的内容(看图读错归 B-301);记忆串客户(B-176 M4);`remember` 工具那套记忆(B-176 待拍板 #3);旧记忆清洗;排序。
 
 ---
 
 ## 1. 现状(读代码确认)
 
-### 1.1 提炼(写入侧)
-
 | # | 事实 | 出处 |
 |---|---|---|
 | 1 | 提炼指令是一段英文,没有语言要求,没有来源要求 | `services/orchestrator/src/orchestrator/graph_builder/memory.py:131-154` |
-| 2 | 给提炼模型的对话:跳过系统消息和隐藏消息,其余每条渲染成 `[消息类型] 文本`、换行拼接、每条截 1000 字 —— 工具结果在内 | `memory.py:129,162-176` |
-| 3 | 消息内容是多段(列表)时直接 `str()` | `memory.py:157-159` |
-| 4 | 可见用户消息由「输入文字 + `[image attached: …]` 行 + `[file attached: …]` 行 + 对接方给的外部内容(每块包在不可信围栏里)」拼成;主模型能看图时是多段内容,且**没有工具消息** | `services/control-plane/src/control_plane/api/runs.py:434-448,468-527`;请求字段 `:290,326` |
-| 5 | 工具结果在对话状态里存的是加了围栏和标记字符的版本 | `graph_builder/builder.py:4803` |
-| 6 | 置信度模型自评,程序只压到 0.99;1.0 只有更正接口会写 | `memory.py:220,285`;`control_plane/api/memory.py:443-456` |
-| 7 | 记忆带来源会话、来源 run,没有「谁说的」;经历类只有写它的智能体能召回,事实类共享 | `memory.py:1194-1215`;`packages/expert-work-protocol/src/expert_work/protocol/memory_item.py` |
-| 8 | 写回读本会话到本轮为止的全部消息,每轮整段重抽 | `control_plane/memory/writeback_processor.py:235-262`;`memory.py:1487-1488` |
-| 9 | 压缩只作用于当次提示词,中段折成一条系统消息;压缩前抢存喂的是「即将被折掉的中段」,可能从一轮中间开始 | `orchestrator/context/compressor.py:5-10,163-164`;`memory.py:1285-1331`;`builder.py:1003-1014` |
-| 10 | 去重合并让模型选 新增 / 更新 / 删除 / 跳过,不生成文字;「更新」= 用候选内容开新版本、旧版本作废;**今天没有任何来源或置信度方面的拦截** | `memory.py:838-855,985-1006,1010-1036` |
-| 11 | 直接写入按「租户 + 用户 + 内容哈希」冲突即不写 | `packages/expert-work-persistence/src/expert_work/persistence/memory/sql.py:142-146,178` |
-| 12 | 失败重试只存 `(类型, 内容)`;重建的记忆置信度 0.5、不带智能体名、不走去重合并 | `memory.py:1253-1260`;`control_plane/memory/dlq_worker.py:316-329` |
-| 13 | 子智能体带同一个 `user_id`,它的「用户消息」是父智能体写的任务说明;定时任务的「用户消息」是任务里预设的话,没设时是一句平台英文 | `orchestrator/tools/_child_run.py:248-252,995-998`;`control_plane/trigger_firing.py:260-282` |
+| 2 | 给提炼模型的对话:跳过系统消息和隐藏消息,其余每条渲染成 `[消息类型] 文本`、换行拼接、每条截 1000 字 —— 工具结果在内;多段内容直接 `str()` | `memory.py:129,157-176` |
+| 3 | 可见用户消息由「输入文字 + 附件行 + 对接方给的外部内容(包在不可信围栏里)」拼成;主模型能直接看图时是多段内容,没有工具消息 | `services/control-plane/src/control_plane/api/runs.py:434-448,468-527` |
+| 4 | 置信度模型自评,程序只压到 0.99;1.0 只有更正接口会写 | `memory.py:220,285`;`control_plane/api/memory.py:443-456` |
+| 5 | 记忆带来源会话、来源 run,没有「谁说的」;经历类只有写它的智能体能召回,事实类共享 | `memory.py:1194-1215`;`packages/expert-work-protocol/src/expert_work/protocol/memory_item.py` |
+| 6 | 写回读本会话到本轮为止的全部消息,每轮整段重抽 | `control_plane/memory/writeback_processor.py:235-262`;`memory.py:1487-1488` |
+| 7 | 压缩只作用于当次提示词(中段折成一条系统消息,检查点里的消息不变);压缩前抢存喂的是即将被折掉的中段 | `orchestrator/context/compressor.py:5-10,163-164`;`memory.py:1285-1331`;`graph_builder/builder.py:1003-1014` |
+| 8 | 去重合并让模型选 新增 / 更新 / 删除 / 跳过,不生成文字;今天没有任何来源方面的拦截;判定缺失时按新增处理 | `memory.py:838-855,985-1006` |
+| 9 | 直接写入按「租户 + 用户 + 内容哈希」冲突即不写 | `packages/expert-work-persistence/src/expert_work/persistence/memory/sql.py:142-146,178` |
+| 10 | 失败重试只存 `(类型, 内容)`,重建的记忆置信度 0.5、不走去重合并 | `memory.py:1253-1260`;`control_plane/memory/dlq_worker.py:316-329` |
+| 11 | 子智能体的「用户消息」是父智能体写的任务说明;动态派出的没有记忆配置,静态登记的带自己的配置。定时任务没设预设话术时「用户消息」是一句平台英文 | `orchestrator/tools/_child_run.py:248-252,995-998`;`control_plane/subagent_runtime.py:262,604-632`;`control_plane/trigger_firing.py:260-282` |
+| 12 | 召回:每条渲染成 `- (类型) 内容`;整块 = 一行标题 + 包在围栏里的条目,是一条用户角色消息;没有提醒;每个 run 开头召回一次,召回到才渲染 | `builder.py:839-841,2889,2968-2995`;`memory.py:693-706` |
+| 13 | 工作区 `MEMORY.md` 用同一格式另渲染一遍 | `orchestrator/context/workspace_projection.py:178-185` |
+| 14 | 置信度不参与排序,只用于「≥ 1.0 优先占预算」和管理页显示 | `sql.py:262-270,337-346`;`builder.py:2913` |
+| 15 | 整理任务默认开、每 4 小时一轮;聚类不分类型,汇总句写成共享的事实类,被汇总的条目召回时不再返回 | `control_plane/settings.py:875`;`control_plane/app.py:2400-2452`;`sql.py:106-113,638-661,724-742`;`control_plane/memory_consolidator.py:271-296` |
+| 16 | 管理端接口把记忆整条序列化;`/correct` 是终端用户更正自己的记忆;管理员编辑走 `PATCH`,不动置信度;第三方开放 API 没有记忆端点 | `control_plane/api/memory.py:98-102,273-343,376-456` |
+| 17 | LoCoMo 评测把一整段会话当一条用户消息喂给提炼函数 | `tools/eval/longmem/endtoend.py:136-155` |
 
-### 1.2 召回(读取侧)
-
-| # | 事实 | 出处 |
-|---|---|---|
-| 14 | 每条渲染成 `- (类型) 内容`;整块 = 一行标题 + 包在围栏里的条目;没有提醒 | `builder.py:2889,2968-2978` |
-| 15 | 记忆块是一条用户角色消息:默认放第 2 条、带缓存锚点;另一种模式走尾部平台段 | `builder.py:2980-2995,2637-2647`;`graph_builder/platform_context.py:92,186-189` |
-| 16 | 召回在每个 run 开头做一次;只有召回到记忆才渲染这一块 | `memory.py:693-706`;`builder.py:839-841` |
-| 17 | 工作区 `MEMORY.md` 用同一格式另渲染一遍 | `orchestrator/context/workspace_projection.py:178-185` |
-| 18 | 置信度不参与排序;只用于「≥ 1.0 优先占预算」和管理页显示 | `sql.py:262-270,337-346`;`builder.py:2913` |
-| 19 | 读时复核可能把某条丢掉 | `memory.py:417-428,799-806` |
-
-### 1.3 其它
-
-| # | 事实 | 出处 |
-|---|---|---|
-| 20 | 整理聚类不分类型;汇总句一律写成共享的「事实」类;提示词要求写「durable user truth」「优先用用户自己的说法」 | `sql.py:638-661,724-737`;`control_plane/memory_consolidator.py:271-296` |
-| 21 | 管理端接口把记忆整条序列化;`/correct` 是终端用户更正自己的记忆;管理员跨用户编辑走 `PATCH`,不动置信度 | `control_plane/api/memory.py:98-102,273-343,376-456` |
-| 22 | 第三方开放 API 没有记忆端点 | `control_plane/api/external_*.py` 搜 `memor` 只有两处「in-memory」注释 |
-| 23 | 召回到的记忆对象存在检查点里,也随节点更新帧发给控制台 | `packages/expert-work-runtime/src/expert_work/runtime/checkpointer/serde.py:38-39`;`apps/admin-ui/src/api/timeline.ts:287-290` |
-| 24 | LoCoMo 评测把一整段会话当一条用户消息喂给提炼函数 | `tools/eval/longmem/endtoend.py:136-155` |
-
-仓库里没有判断文本语言的函数。测试环境数字(462 条 / 24 条英文 / 0.8)来自 ROADMAP,本次没重新查库。
+仓库里没有判断文本语言的函数。测试环境数字(近 30 天 462 条里 24 条是中文用户的英文记忆;出事那条置信度 0.8)来自 ROADMAP,本次没重新查库。
 
 ---
 
-## 2. 别家怎么做(行号本次逐条打开核过)
+## 2. 别家怎么判来源(行号本次打开核过)
 
-| 项目 | 做法 | 出处 | 对我们的含义 |
-|---|---|---|---|
-| OpenViking | 程序判语言,只看用户消息的文字,写进提示词单独一节 | `openviking/session/memory/session_extract_context_provider.py:162-186,248-249`;`openviking/session/memory/utils/language.py:18-23,300-346` | ④ |
-| OpenViking | 提炼时不带工具调用和结果:「执行证据,不是用户说的话」 | 同上 `:329-332` | ① |
-| OpenViking | 画像只收参与者明说或确认过的,不从助手的话推断 | `…/memory_templates/builtin/profile.yaml:9-11,36-37` | ② 的「用户说的」口径 |
-| openclaw | 来源由分类代码写进库列,「绝不从文字里解析」;判不出的从不默认成 owner | `packages/memory-host-sdk/src/host/session-provenance.ts:4-24`;`docs/concepts/memory-architecture.md:80-93,397-399` | ② 拿不准往低判 |
-| openclaw | 一轮里出现过外部来源的工具结果后,这一轮后面助手的话带污点,到下一条用户消息清除 | `memory-architecture.md:126-134` | ① 的标记只标当轮,与之一致 |
-| openclaw | 不可信来源不进自动注入;子智能体会话不产生长期记忆;被注入过的记忆不再被重新提炼 | `memory-architecture.md:100-106,264-269,400-406` | 比我们严;后两点见 §6.5、§10 |
-| claude-code 源码 | 召回提醒:记忆是某时间点的记录,与当前冲突以当前为准 | `src/memdir/memoryTypes.ts:201-202` | ③ 的内容 |
-| claude-code 源码 | 「怎么用记忆」追加到**系统提示词**并单独成节时评测 0/2 → 3/3,并进别的节 0/3 | `memoryTypes.ts:228-245` | 只说明值得试;它测的是系统提示词,我们的块在用户角色消息里,**不直接适用** |
-| claude-code 源码 | 按天数给过期提示,当天和昨天的不提示 | `src/memdir/memoryAge.ts:33-42` | 事故发生在几分钟内,只靠「多久以前」提醒不到 |
-| mem0 | 助手说的内容写成归属句式;输出带 `attributed_to` | `mem0/configs/prompts.py:488,935` | ① 的句式;② 的 `said_by` |
-| mem0 | 可选的语言要求一节;无文字的工具调用消息被跳过 | `prompts.py:1047-1058`;`mem0/memory/utils.py:61-76` | ④ ① |
-| mem0(反例) | 要求从照片描述里提取事实 | `prompts.py:597-603` | 不照做 |
-| deer-flow | 只留用户输入和助手最终回答 | `…/deermem/core/message_processing.py:150-151,201-208` | ① |
-| deer-flow | 提示词约定的置信度分档:明说 0.9–1.0、强烈暗示 0.7–0.8、推断 0.5–0.6 | `…/core/prompts/memory_update.chat.yaml:66-69` | 0.6 取自「推断」档上沿;服务端封顶是我们自己的做法 |
-| hermes-agent(反例) | 告诉模型把召回内容「当作权威参考数据」 | `agent/memory_context.py:180-182` | 与我们要的相反 |
+**按结构判的**(不看内容):
 
-论文(沿用 11-11 调研,本次没重读):arXiv 2505.16067;arXiv 2511.03506 HaluMem。
+| 项目 | 做法 | 出处 |
+|---|---|---|
+| openclaw | 来源由分类代码按**消息的角色和发送者**判定,写进库列;「绝不从记忆文字里解析」;判不出的从不默认成用户 | `packages/memory-host-sdk/src/host/session-provenance.ts:4-24`;`docs/concepts/memory-architecture.md:80-93,397-399` |
+| OpenViking | **按用途分开几个提炼器**:用户 / 会话记忆的提炼器不带工具内容(开关默认关),助手轨迹、助手经验各有自己的提炼器并打开工具内容 | `openviking/session/memory/session_extract_context_provider.py:59,329-340`;`agent_trajectory_context_provider.py:33`;`agent_experience_context_provider.py:52` |
+| mem0(旧管线) | **分两套提炼指令**,按调用参数选一套:「用户记忆」只准从用户消息提取,「助手记忆」只准从助手消息提取。但两套看到的都是整段对话,靠指令约束 | `mem0/memory/utils.py:15-28`;`mem0/configs/prompts.py:67-68,128-129`;`mem0/memory/main.py:739-753` |
+
+**按内容 / 靠模型标的**:
+
+| 项目 | 做法 | 出处 |
+|---|---|---|
+| mem0(新管线) | 一次提炼,模型给每条标 `attributed_to` | `prompts.py:488,935` |
+| OpenViking(事件模板) | 模型给出依据的消息序号,要求至少含一条用户消息 | `…/memory_templates/builtin/events.yaml:142-151` |
+| deer-flow | 只留用户输入和助手最终回答;置信度由模型按「明说 / 暗示 / 推断」分档;无来源字段 | `…/deermem/core/message_processing.py:150-151,201-208`;`…/prompts/memory_update.chat.yaml:66-69` |
+| claude-code 源码、hermes-agent | 没有来源判定。前者有召回提醒(记忆是某时间点的记录、与当前冲突以当前为准;单独成节时评测更好,但那是追加在系统提示词上测的,对我们不直接适用);后者把召回内容称为「权威参考数据」(反例) | `src/memdir/memoryTypes.ts:201-202,228-245`;`agent/memory_context.py:180-182` |
+
+结论:按结构判来源有先例(按角色、按提炼器、按提炼指令分开);我们取「分开提炼」,并比 mem0 多走一步 —— 提炼用户原话的那一次**只给**用户的话,而不是给全文再靠指令约束。
+
+其它沿用的做法:程序判语言并写进指令(OpenViking `session_extract_context_provider.py:162-186,248-249`;`utils/language.py:300-346`);可选的语言要求一节(mem0 `prompts.py:1047-1058`);按天数给过期提示但当天的不提示(claude-code `memoryAge.ts:33-42` —— 我们的实例发生在几分钟内,只靠「多久以前」提醒不到)。论文沿用 11-11 调研,本次没重读:arXiv 2505.16067、2511.03506。
 
 ---
 
 ## 3. ④ 语言
 
-### 3.1 方案
+**规则只有一条:记忆用用户的语言写。** 程序的作用是在认得出来的时候把语言名写进指令,让这条规则更硬;认不出来时指令仍是同一条规则,只是不点名。
 
-**判断(纯程序,只有两种结果)**:取提炼输入里所有 `[user]` 行(只含输入文字,§4.2),去掉网址、引用、路径、代码块、纯数字后数字符。
+**程序怎么判**(只看提炼输入里用户的话,§4.1;去掉网址、路径、代码块后数字符):
 
-| 条件 | 结果 |
+| 用户文字里的有信号字符 | 结果 |
 |---|---|
-| 汉字 ≥ 2 个、占有信号字符 ≥ 20%(门槛取自 OpenViking `language.py:18-19`),且**没有任何假名或谚文** | 点名中文 |
-| 其它一切(英文、日文、韩文、混合、太短、没有用户行) | 不点名 |
+| 全是汉字 | 点名 Chinese |
+| 全是假名,或假名 + 汉字且假名占三成以上 | 点名 Japanese |
+| 全是谚文 | 点名 Korean |
+| 其它(拉丁字母、西里尔字母、阿拉伯字母等一种文字对应多种语言的;几种文字混着的,如汉字里夹着少量假名;太短;没有用户的话) | 不点名 |
 
-只点名中文,是因为我们要解决的是「中文用户的记忆被写成英文」;日文 / 韩文 / 各种拉丁语言靠数字符判不准(短日文里汉字占多数),不点名档那句「跟随用户的语言」已经覆盖。
+夹杂的拉丁字母(术语、型号、缩写)不影响前三行的判断,只要它不超过八成。**只点名这三种是检测能力的限制**:靠数字符,只有「一种文字只对应一种语言」时才判得准;英语、法语、俄语、阿拉伯语等用户走不点名档,行为是「跟随用户的语言」,不降级、不会被写成别的语言。
 
-**两档指令**(追加在提炼指令末尾,单独一节,各约 50 token):
+**两档指令**(追加在提炼指令末尾,单独一节;`{language}` 由程序填):
 
 ```text
 ## Output language
-Write the "content" of every memory in Chinese, in the same script (Simplified or
-Traditional) the user writes in. Keep names, codes, units and quoted terms exactly
-as they appear. Do not translate into English.
+Write the "content" of every memory in {language}, in the same script the user writes in.
+Keep names, codes, units and quoted terms exactly as they appear. Do not translate.
 ```
 
 ```text
 ## Output language
-Write the "content" of every memory in the language the user writes in (the lines
-marked [user]). Keep names, codes, units and quoted terms exactly as they appear.
-Do not translate into English unless the user writes in English.
+Write the "content" of every memory in the language the user writes in. Keep names,
+codes, units and quoted terms exactly as they appear. Do not translate.
 ```
 
-**其它提示词**:去重合并、读时复核、复查都不生成记忆文字,不加。整理汇总会生成汇总句(`memory_consolidator.py:271-296`),加一节:语言按**该用户这一批待整理记忆的全部内容**用同一个函数判(不按单个簇,否则一簇英文旧记忆汇总出来还是英文);不点名时用 `Write the summary in the language most of this user's memories are written in.`
+整理汇总会生成新的汇总句(§1 #15),加同一节;语言按该用户这一批待整理记忆的全部内容用同一个函数判,不点名时写 `Write the summary in the language most of these memories are written in.`。去重合并、读时复核不生成记忆文字,不加。
 
-**存量英文记忆**:不动。被新记忆更新、或被整理汇总时顺带换掉;只有英文记忆的用户换不掉。一次性翻译脚本不做(表里没有用户原话、翻译可能改错数字);生产英文率先数。
+**边界**:对接方随请求带的外部内容不参与计数;对接方把模板和用户的话拼进同一个输入文字时分不开,多半落不点名档(有多少对接方这么做未验证);用户中途换语言按总量判。
 
-### 3.2 边界情况
+**不做**:不引入语言识别库或模型调用;不加配置项;存量英文记忆不动(已拍板 ⑥)。
 
-| 情况 | 结果 |
-|---|---|
-| 中文用户夹英文术语 | 仍点名中文 |
-| 中文用户引用了片假名品牌名 | 不点名(仍是「跟随用户语言」) |
-| 对接方随请求带大段英文外部内容 | 不参与计数 |
-| 对接方把英文模板和用户的话拼进同一个输入文字 | 分不开,可能落不点名档;有多少对接方这么做未验证 |
-| 定时任务没设预设话术(平台英文句) | 不点名 |
-
-### 3.3 不做什么 / 证据
-
-不引入语言识别库或模型调用;不加配置项;不翻译存量。程序判语言 + 单独一节是 OpenViking 的默认做法(已验证);加了之后三家模型的英文率**未验证**;④ ① 同发,分不开各自贡献。
+**证据**:程序判语言 + 单独一节是 OpenViking 的默认做法(已验证);加了之后各家模型是否照写(**未验证**)。
 
 ---
 
-## 4. ① 提炼输入
+## 4. ① 提炼输入:分两次提炼
 
-### 4.1 方案
+### 4.1 给什么
 
-**先把用户消息拆开**。`_build_human_message`(`runs.py:468-527`)在消息的附加字段里记下输入文字的长度;提炼时按它切,并核对剩余部分以附件行 / 围栏 / 图片段开头,对不上就走退路。没有这个字段的消息(旧对话、子智能体任务、定时任务)走退路:去掉 `[image attached: …]` / `[file attached: …]` 行、围栏块、`[untrusted content]` 到末尾;多段内容只取第一个图片段之前的文字。切不准时宁可多切。
+**先把用户消息拆开**。`_build_human_message`(`runs.py:468-527`)在消息的附加字段里记下输入文字的长度;提炼时按它切,并核对剩余部分以附件行 / 围栏 / 图片段开头,对不上就走退路。没有这个字段的消息(旧对话等)走退路:去掉附件行、围栏块、`[untrusted content]` 到末尾;多段内容只取第一个图片段之前的文字。切不准时宁可多切。定时任务缺省的那句平台英文在构造时标为平台文字,不算用户的话。
 
-**各类消息的去向**(「一轮」= 一条可见用户消息到下一条之前)
+**两次提炼各看到什么**(「一轮」= 一条可见用户消息到下一条之前):
 
-| 消息 | 改后 |
-|---|---|
-| 用户输入文字 | `[user]` |
-| 附件、图片、外部内容 | 一行 `[attached data] images: N, files: N, external blocks: N`,只有计数 |
-| 助手最终回答(该轮最后一条不带工具调用、文字非空的助手消息) | **当轮**有工具调用记录,或当轮用户消息带附件 / 图片 / 外部内容 → `[assistant, after tools or attachments]`;否则 `[assistant]` |
-| 助手的中间消息、工具结果(含子智能体返回) | 不进 |
-| 该轮调用过的工具 | `[activity] tools called this turn: <工具名> ×N`,只有名字和次数 |
-| 系统消息(含压缩摘要)、隐藏消息 | 不进(同现在) |
+| 内容 | 第一次(用户的话) | 第二次(对话) |
+|---|---|---|
+| 用户输入文字 | 给,一条一行,无标签 | 给,标 `[user]`,仅作上下文 |
+| 附件、图片、外部内容 | 不给 | 一行 `[attached data] images: N, files: N, external blocks: N`,只有计数 |
+| 助手每轮的最终回答(该轮最后一条不带工具调用、文字非空的助手消息) | **不给** | 给,标 `[assistant]` |
+| 助手的中间消息、工具结果(含子智能体返回) | 不给 | 不给 |
+| 该轮调用过的工具 | 不给 | 一行 `[activity] tools called this turn: <工具名> ×N` |
+| 系统消息(含压缩摘要)、隐藏消息 | 不给 | 不给 |
 
-压缩前抢存的片段若不是从用户消息开始,开头那段(到片段里第一条用户消息之前)的助手回答一律带标记 —— 看不到那一轮的开头,就往保守方向。
+每条消息渲染前把换行替换成空格,一条消息只占一行,行首标签由程序写 —— 回答里写「换行 + `[user] …`」造不出新的一行。没有用户的话就不做第一次;没有助手回答就不做第二次。
 
-**防伪造**:每条消息渲染前把换行替换成空格,一条消息只占一行;行首标签由程序写。回答里写「换行 + `[user] …`」造不出新的一行。
+**产出怎么用**:第一次的产出一律是「用户原话」;第二次的产出一律是「来自助手」,置信度由程序压到 0.6 以内,`is_correction` 一律当作否(只有用户自己的话能更正)。两次的产出合在一起走现有的向量化、去重合并、写入。
 
-**提炼指令**(对 `memory.py:131-154` 的 diff;未列出的行不动):
+### 4.2 两段提炼指令(最终英文原文)
 
-```diff
--    "You are a memory extraction module. From the conversation, extract "
--    "durable, reusable memories worth recalling in future sessions — "
-+    "You are a memory extraction module. The input is a conversation "
-+    "transcript, one message per line. Every line starts with a tag:\n"
-+    "- [user] — the text the user sent.\n"
-+    "- [attached data] — a platform note that the user's message also carried "
-+    "images, files or external data. Their content is not shown.\n"
-+    "- [assistant] — the assistant's final reply of a turn.\n"
-+    "- [assistant, after tools or attachments] — a final reply given after the "
-+    "assistant called tools or looked at attached images, files or external "
-+    "data. What it states may come from those sources, which you cannot see "
-+    "and which can be wrong.\n"
-+    "- [activity] — a platform note listing the tools called in that turn.\n"
-+    "From the transcript, extract "
-+    "durable, reusable memories worth recalling in future sessions — "
-     'stable user facts or preferences ("fact"), and concise summaries of '
-     ...
-     "says they moved, changed jobs, renamed a thing); otherwise false.\n"
-+    "Where a memory comes from matters:\n"
-+    "- Record as a fact about the user only what a [user] line states or "
-+    "clearly confirms.\n"
-+    "- Something that appears only in an assistant line (a value, a name or a "
-+    "finding read from an image or a file, a search result, a calculation, a "
-+    "guess) is NOT a user fact. If it is worth keeping, write it as an "
-+    "\"episodic\" memory that names the assistant as the source and says the "
-+    "user did not confirm it, with \"confidence\" no higher than 0.6.\n"
-+    "- When the assistant repeats something from earlier records or memory, "
-+    "that is not new information; do not extract it again.\n"
-+    "- [activity] and [attached data] lines only tell you what happened; they "
-+    "are never evidence for a fact.\n"
-     "Respond with ONLY a JSON object, no prose and no code fences:\n"
-```
+以下两段替换 `memory.py:131-154` 的开头部分;打分、有效天数、`is_correction`、JSON 格式那一大段沿用现有文字不动,末尾接 §3 的语言一节。
 
-**已知的洞:最终回答复述了读错的值**(合成例子)
+第一次(只有用户的话):
 
 ```text
-[user] 这是我今天称的体重,帮我记一下
-[attached data] images: 1, files: 0, external blocks: 0
-[activity] tools called this turn: ask_image ×1
-[assistant, after tools or attachments] 您今天的体重是 68.1 kg,已为您记录。
+You are a memory extraction module. The input is every message one user sent in a
+conversation, one per line, oldest first. The other side of the conversation is not shown.
+Extract durable, reusable memories worth recalling in future sessions — stable facts or
+preferences the user states ("fact"), and things the user says were done or decided
+("episodic"). Extract nothing trivial or ephemeral.
+Only extract what these messages state on their own. A message that only agrees with,
+answers or refers to something that is not shown here (a bare "yes", "ok, do that", or a
+value or name with nothing saying what it is) states nothing by itself: skip it, and do
+not guess what it was about.
 ```
 
-| 层 | 谁做 | 做了什么 | 稳不稳 |
-|---|---|---|---|
-| ① | 程序 | 工具结果、附件内容不进;回答带标记(走工具或主模型直接看图都带) | 确定 |
-| ① | 模型 | 不把 68.1 写成用户事实;要记就写成「助手从用户提供的图片读出…,用户未确认」 | 不稳 |
-| ② | 程序 | 68.1 不在任何 `[user]` 行里 → 判为助手得出,置信度 ≤ 0.6 | 确定(带数字的) |
-| ② | 模型 | 不带数字的内容标成助手说的 | 不稳,没有程序兜底 |
-| ③ | 模型 | 召回时看到标记,不拿它确认新读数 | 不稳 |
+第二次(对话):
 
-**去掉工具结果会丢什么**
+```text
+You are a memory extraction module. The input is a conversation transcript, one message
+per line. Every line starts with a tag:
+- [user] — the text the user sent. It is here for context only; what the user states is
+  recorded separately.
+- [attached data] — a platform note that the user's message also carried images, files or
+  external data. Their content is not shown.
+- [assistant] — the assistant's final reply of a turn. It may rest on tool results,
+  attachments or the assistant's own inference, none of which you can see and any of which
+  can be wrong.
+- [activity] — a platform note listing the tools called in that turn.
+Extract durable, reusable memories worth recalling in future sessions, of two sorts only:
+- what the assistant did or produced, and what was decided ("episodic");
+- what the assistant found, concluded or proposed, and what was settled only because the
+  user agreed with or answered the assistant ("fact" or "episodic").
+Write each one so that it says where it comes from — for example "the assistant found ...",
+"the assistant proposed ... and the user agreed", "asked by the assistant, the user
+answered ...". Never write it as a bare statement about the user.
+Do not extract something a [user] line states completely on its own; that is recorded
+separately. When the assistant only repeats something from earlier records or memory, do
+not extract it again.
+```
 
-| 会丢的 | 说明 |
+### 4.3 会丢什么、边界、副作用
+
+| 情况 | 结果 |
 |---|---|
-| 「做了什么」类经历的细节 | 最终回答通常会交代,`[activity]` 给出调用了哪些工具;回答没提的细节丢了 |
-| 只在工具结果 / 附件 / 外部内容里的信息 | 丢,以业务系统为准。这比 B-176 §6.3 ③「工具结果只可作经历的依据」更严 —— 工具结果完全不给 |
-| 压缩前抢存的全工具中段 | 没有可提炼的行 → 跳过这次模型调用;轮末写回读的是完整对话(§1.1 #9),那一轮的回答照常提炼 |
+| 「做了什么」的细节 | 最终回答通常会交代,`[activity]` 给出调用了哪些工具;回答没提的细节丢了 |
+| 只在工具结果 / 附件 / 外部内容里的信息 | 丢,以原始系统为准。这比 B-176 §6.3 ③「工具结果只可作经历的依据」更严 |
+| 助手问、用户只答一个词;助手说、用户只回「对」 | 第一次读不出来,跳过;第二次记下,内容写明是用户回答 / 同意的,来源是「来自助手」(§6.2) |
+| 同一件事两次都提了(用户说了,助手又复述) | 第二次的指令要求不提;漏网的由现有的去重合并处理,可能留下少量近似重复 |
+| 压缩前抢存的中段全是工具消息 | 两次都没有可给的内容 → 不调模型;轮末写回读的是完整对话(§1 #7),不受影响 |
+| 子智能体 | 不写长期记忆(已拍板 ②):写回节点和抢存读到 `child_run` 就直接返回,不落后台任务。只影响静态登记且自己开了记忆的子智能体 |
+| 助手复述了召回的记忆,这句又被提炼 | 程序看不出这句话来自记忆(记忆块不在检查点消息里),只有指令里那一句;即便漏了,也只会是「来自助手」 |
+| 副作用:可见范围 | 第二次的产出多为经历类,只有写它的那个智能体能召回(§1 #5) |
+| 副作用:整理 | 汇总提示词加一句 `If an item says where it comes from (for example that the assistant found it, or that the user only agreed), keep that in the summary; never restate it as something the user said.`;PR 2 起另有程序规则(§6.2) |
 
-### 4.2 边界情况与副作用
+### 4.4 成本
 
-| 情况 | 处理 |
-|---|---|
-| 带过图的对话,后面某一轮没用工具、助手又提到图里的内容 | 这一轮的回答是普通 `[assistant]` 行(标记只标当轮)。指令第二条对所有助手行都生效;带数字的仍被 ② 的程序检查挡住 |
-| 定时任务 | 预设话术算 `[user]`(是用户配置任务时写的);没设预设话术时的那句平台英文(`trigger_firing.py:260-264`)在构造时标为平台文字,提炼不把它当 `[user]` 行 |
-| 子智能体 | 「用户消息」是父智能体写的任务说明,里面可能就带着读错的值,而且会通过数字检查 —— 这是个真洞。动态派出的子智能体没有记忆配置(`subagent_runtime.py:262`),不受影响;静态登记的子智能体带自己的记忆配置(`:604-632`),会写。必须二选一处理,且是 PR 2 上生产的前提,见 §10 第 2 条 |
-| 助手复述了召回的记忆,这句又被提炼 | 程序看不出这句话来自记忆(记忆块不在检查点消息里)。只有指令里那一句;带数字的由 ② 判成助手得出。没有结构性防护(§6.5) |
-| **副作用:可见范围** | 助手读数被写成「经历」类,只有写它的那个智能体能召回(§1.1 #7) |
-| **副作用:整理** | 整理会把多条记忆汇总成一条共享的「事实」(§1.3 #20)。PR 1:汇总提示词加一句 `If any item says it was read or concluded by the assistant and not confirmed by the user, keep that attribution in the summary; never restate it as something the user said.`(措辞)。PR 2:汇总条目的来源由程序定(§6.2) |
+| 项 | 现在 | 改后 |
+|---|---|---|
+| 每次写回的提炼调用 | 1 次 | 最多 2 次(没有助手回答或没有用户的话时 1 次) |
+| 固定的指令部分 | 约 310 token | 约 410 + 560,各加语言一节约 40 |
+| 对话部分 | 全部消息,含工具结果(每条最多 1000 字) | 用户的话出现两次;助手最终回答一次;**工具结果不再出现** |
+| 输出 | 一份 | 两份 |
 
-### 4.3 不做什么 / 证据
+净变化:固定部分每次写回多约 750 token 输入、多一份输出;对话部分少了全部工具结果、多了一遍用户的话。一轮里有两三次工具调用的对话,总输入多半比现在少;纯聊天的对话多约七八百 token。token 数是用 `o200k_base` 对草稿文字估的(脚本在会话草稿目录,PR 1 入库),国内模型分词不同。**每天多花多少钱没法给数**:要乘以每天的写回次数和记忆模型的单价,前者要查测试 / 生产的写回任务表(本次不碰集群),后者按各租户配置的记忆模型而定 —— 标为未验证(§11);量级上是「每次写回多一次便宜模型的短调用」。延迟不影响用户:写回在 `end` 帧之后的后台任务里(B-168)。
 
-不做按工具类型的可信白名单;不改每轮整段重抽、不给已有记忆、不加观测日期(B-176 M2);不改 1000 字上限(先量超长回答的占比)。
+### 4.5 不做什么 / 证据
 
-OpenViking / deer-flow / mem0 不带工具结果(已验证);可见用户消息含附件行和外部内容、主模型看图时无工具消息(已验证);加了标记和规则后三家模型是否照做、「做了什么」类记忆少多少(**未验证**)。
+不做按工具类型的可信白名单;不改每轮整段重抽、不给已有记忆、不加观测日期(B-176 M2);不改 1000 字上限。
+
+OpenViking / deer-flow / mem0 提炼时不带工具结果、OpenViking 与 mem0 分开提炼(已验证,§2);两次提炼后各家模型提得全不全、重不重(**未验证**,§8)。
 
 ---
 
 ## 5. ③ 召回提醒
 
-### 5.1 方案
+### 5.1 块的结构与最终英文原文
 
-**块的结构**(标题、说明行、提醒节在围栏外;条目在围栏内)。
-
-PR 1(没有来源字段):
+标题、说明行、提醒节在围栏外;条目在围栏内。
 
 ```text
 ## Relevant memories from past sessions
-Each line: (kind · date recorded) content.
+Each line: (kind · source · date recorded) content.
 «围栏»
-- (fact · 2026-11-03) …
-- (episodic · 2026-11-11) …
+- (fact · in the user's own words · 2026-11-03) …
+- (episodic · from the assistant · 2026-11-11) …
+- (fact · corrected by the user · 2026-10-20) …
+- (fact · source not recorded · 2026-10-02) …
 «/围栏»
 
 ## Before relying on a memory
 The memories above are records made on the dates shown, not live facts. They can be outdated or wrong.
-- If a memory conflicts with what the user says now, or with what you observe now (a tool result, a file, an image), trust the current information and tell the user what differs.
-- Do not use a memory to confirm a new reading, measurement or conclusion: the memory may itself come from an earlier reading, so a match can simply be the same mistake repeated.
+- If a memory conflicts with what the user says now, or with what you can see now (a tool result, a file, an attachment), trust the current information and tell the user what differs.
+- A memory marked "from the assistant" is not in the user's own words. It may be something the assistant did, something the user agreed to or answered, or something the assistant took from a tool, an attachment or its own inference. Use it as background, but it is not independent evidence: do not cite it to confirm or strengthen something you have just found or concluded — agreement with it may only mean the same mistake was made twice.
+- For a memory marked "source not recorded", its source was not recorded. Use it as usual, but do not cite it to confirm or strengthen something you have just found or concluded.
 ```
 
-PR 2(有来源字段)—— 条目带来源,第二条提醒换成针对来源的两条:
+PR 1(还没有来源列)时说明行是 `(kind · date recorded)`,提醒节后两条合成一条:`Do not cite a memory to confirm or strengthen something you have just found or concluded: the memory may itself come from an earlier finding of the same kind, so agreement may only mean the same mistake was made twice.` 它对所有记忆生效,比「只针对来自助手的」宽,所以 PR 1 不单独上生产(已拍板 ③)。PR 2 起后两条只在块里有对应标记的条目时出现。
 
-```text
-- (fact · stated in the user's message · 2026-11-03) …
-- (episodic · from the assistant · 2026-11-11) …
-- (fact · corrected by the user · 2026-10-20) …
-- (fact · source not recorded · 2026-10-02) …
+**每条显示哪个来源 —— 一个函数**(渲染与 §6.2 的拦截规则共用):置信度 ≥ 1.0 → `corrected by the user`;否则来源列是用户原话 → `in the user's own words`;是来自助手 → `from the assistant`;其余 → `source not recorded`。置信度 1.0 只有更正接口会写,所以存量的用户更正不用回填。
 
-- A memory marked "from the assistant" was recorded by an assistant on its own. For what the assistant did (a file it produced, a step it took), use it as usual. For a reading, measurement or conclusion about the user or the outside world, the user did not confirm it: never use it to confirm, validate or raise confidence in a new reading or conclusion — a match can simply be the same mistake repeated.
-- For a memory marked "source not recorded", its source was not recorded. Use it as usual, but do not use it to confirm a new reading, measurement or conclusion.
-```
-
-**每条显示哪个来源 —— 一个函数**(渲染与 §6.2 的拦截规则共用):
-
-| 条件(按顺序) | 有效来源 | 显示 |
-|---|---|---|
-| 置信度 ≥ 1.0 | 用户更正 | `corrected by the user` |
-| `origin = user_stated` | 用户说的 | `stated in the user's message` |
-| `origin = assistant_derived` | 助手得出 | `from the assistant`(「用户未确认」的意思由提醒节说明;标签本身不写,因为用户确认过但没升级的记忆也是这个来源,§6.5) |
-| 其它 | 未记录 | `source not recorded` |
-
-置信度 1.0 只有更正接口会写(§1.1 #6),所以存量的用户更正不用回填就能正常显示。两个已知的不准:封顶 0.99 之前可能有极少数模型打出的 1.0(`memory.py:215-219`);管理员用 `PATCH` 改写一条 1.0 的记忆后仍显示用户更正(今天就是这样,`PATCH` 不动置信度)。都不处理。
-
-**取舍**
+### 5.2 取舍
 
 | 取舍 | 定法 | 理由 |
 |---|---|---|
-| 单独一节、动作式标题 | `## Before relying on a memory` | 思路来自 claude-code,但证据不直接适用(§2);§8 自己量,留「挪进系统提示词」作备选 |
+| 单独一节、动作式标题 | `## Before relying on a memory` | 思路来自 claude-code,但它的证据是系统提示词位置,不直接适用;§8 自己量,留「挪进系统提示词」作备选 |
 | 绝对日期 | `YYYY-MM-DD` | 块在一次 run 内要逐字不变才命中缓存 |
-| 不显示置信度数字 | 只显示来源 | 数字助长轻信;出事那条正是 0.8 |
-| 不要求模型引用时加说明 | 删掉了修订 2 的那一句 | 「做了什么」类记忆全是助手得出,逐条声明「未经确认」既不对也吵 |
-| PR 1 的第二条提醒对所有记忆生效 | 比拍板的「只针对助手得出的」宽 | 没有来源字段时分不出来;所以 PR 1 不单独上生产 |
+| 不显示置信度数字 | 只显示来源 | 数字助长轻信 |
+| 不要求模型引用时加声明 | — | 「做了什么」类记忆全是来自助手,逐条声明既不对也吵 |
 | 行内容去换行 | 渲染前把记忆内容里的换行替换为空格 | 否则内容里换行后可冒充一行带来源前缀的记忆 |
 | `MEMORY.md` | 与提示词共用行渲染,文件开头加同一段提醒 | 否则模型从文件读到的是没有提醒的同一批记忆 |
 
-位置不变(§1.2 #15);能力门控沿用「召回到记忆才渲染」(§1.2 #16),外加 §9.3 的总开关。
+位置不变(用户角色消息,§1 #12);能力门控沿用「召回到记忆才渲染」。每次模型调用多出的 token(估算,口径同 §4.4;未含围栏插入的标记字符):标题与说明行约 +18,每条前缀约 +14,提醒节约 115(PR 1)/ 70–200(PR 2);默认 5 条合计约 +200 ~ +290。
 
-**每次模型调用多花多少 token**(估算:`o200k_base` 对草稿文字计数,脚本在会话草稿目录、PR 1 入库;没含围栏插入的标记字符,每条前缀再多几个;国内模型分词不同)
+### 5.3 跨场景检验
 
-| 部分 | 现在 | PR 1 | PR 2 |
-|---|---|---|---|
-| 标题 + 说明行 | 7 | 约 23 | 约 25 |
-| 每条前缀 | 0 | 约 +8 | 约 +12 ~ +17 |
-| 提醒节 | 0 | 约 110 | 约 70 ~ 200(后两条只在有对应标记的条目时出现) |
-| 默认 5 条合计 | — | 约 +170 | 约 +150 ~ +300 |
+把 §4.2 的两段提炼指令和 §5.1 的提醒节放进五个互不相干的场景读一遍(全部合成):
 
-### 5.2 边界情况
+| 场景 | 用户原话(第一次提炼得到) | 来自助手(第二次提炼得到) | 提醒节拦的是什么 | 读得通吗 |
+|---|---|---|---|---|
+| 客服 | 用户写「收货地址改到 A 市 B 路 1 号」 | 助手从订单系统查到的订单号;助手从截图里认出的型号 | 下次又查出同一个订单号时,不能说「与此前记录一致,无误」 | 通 |
+| 法务 | 用户写「我方不接受自动续约」 | 助手读合同后得出的「第 N 条约定了自动续约」 | 再读同一份合同得出同样理解时,不能拿上次的理解当佐证 | 通 |
+| 编程 | 用户写「这个仓库提交信息用英文」 | 助手读代码后得出的「测试放在某目录」;助手做过的重构 | 仓库已变时以当前文件为准;不拿上次的结论证明这次的结论 | 通;「助手做过的事」按提醒里「something the assistant did」照常使用 |
+| 销售 | 用户写「客户王某是采购总监,偏好邮件沟通」 | 助手从通话纪要里推断的「客户倾向续约」 | 新一轮分析又得出「倾向续约」时,不能说「与历史判断吻合」 | 通 |
+| 健康 | 用户写「我对某种药过敏」 | 助手从照片里读出的一个读数 | 再读同一张照片得到同样读数时,不能说「与历史数据吻合」 | 通(即本项的实例) |
 
-| 情况 | 处理 |
-|---|---|
-| 没有创建时间 | 不渲染日期 |
-| 置信度 1.0 的更正 | 仍优先占预算(`builder.py:2913` 不改) |
-| 进行中的会话(检查点里是旧对象) | 新字段有默认值,显示为未记录 |
-| 读时复核把那条丢了 | 没有可误用的记忆;§8 要先断言「确实注入了」才算有效样本 |
-| 同一对话里,下一轮召回了本对话刚写下的读数 | 会发生(后台写回几秒完成)。它带着「助手得出」标记,提醒照样适用;不另加过滤(§6.5) |
+逐句检查:三段文字里没有 number / reading / measurement / weight / health / device 等词;「a value or name」「found, concluded or proposed」「a tool, an attachment or its own inference」都是来源层面的说法。
 
-### 5.3 不做什么 / 证据
+### 5.4 边界 / 不做 / 证据
 
-不把助手得出的记忆挡在自动注入之外;不改读时复核;不改排序。现状无提醒(已验证);三家模型加了这一节后是否不再说「吻合」(**未验证**,本设计最不稳的一环)。
+没有创建时间的不渲染日期;置信度 1.0 的更正仍优先占预算(`builder.py:2913` 不改);进行中的会话里旧的记忆对象显示为未记录;读时复核可能把某条丢掉,所以 §8 要先断言「确实注入了」;同一对话里下一轮可能召回本对话刚写下的记忆,它带着标记、提醒照样适用,不另加过滤。
+
+不把来自助手的记忆挡在自动注入之外;不改读时复核;不改排序。各家模型加了这一节后是否不再拿记忆当旁证:**未验证**,本设计最不稳的一环。
 
 ---
 
 ## 6. ② 来源字段
 
-### 6.1 现状
+### 6.1 字段与判定
 
-无来源字段;置信度模型自评、不参与排序;去重合并没有任何拦截(§1)。
-
-### 6.2 方案
-
-**字段**:`memory_item.origin`,可空文本,两个值。
+`memory_item.origin`,可空文本,两个值:
 
 | 值 | 含义 | 谁写 |
 |---|---|---|
-| `user_stated` | 出现在某轮输入文字里 | 提炼路径,过了程序检查才给 |
-| `assistant_derived` | 助手得出的(读数、推断、建议、做了什么) | 提炼路径,凡没过检查的 |
-| 空 | 存量、失败重试重建的、管理员 `PATCH` 改写过内容的 | — |
+| `user_stated` | 用户原话:只看用户自己发的文字就读得出来 | 第一次提炼的产出,由程序写 |
+| `assistant_derived` | 来自助手:助手做的、得出的、提出的,以及用户只是回答 / 同意的 | 第二次提炼的产出,由程序写 |
+| 空 | 存量、失败重试重建的、整理汇总的、管理员 `PATCH` 改写过内容的 | — |
 
-「用户更正」不另设值,沿用现有的置信度 1.0(§5.1 的函数)。
+**来源只由「是哪一次提炼出来的」决定**,模型不打标签,程序不检查内容。「用户更正」不另设值,沿用置信度 1.0。
 
-**「用户说的」怎么判**:模型每条记忆多回一个字段 `"said_by": "user" | "assistant"`。程序判为 `user_stated` 必须同时满足:
+### 6.2 规则
 
-1. `said_by` 是 `"user"`;
-2. 记忆内容里的每个数字,都出现在这次提炼输入的**某条 `[user]` 行**里(规格见下);
-3. 这次提炼输入里至少有一条 `[user]` 行。
+**「用户只回一个『对』算不算确认」—— 通用规则**:看这句话**离开助手那句还读不读得出内容**。读得出(用户自己把话说全了,如「对,地址是 A 市 B 路 1 号」「不对,应该是另一个型号」)→ 用户原话;读不出(「对」「好的」「就这个」,或只回一个值 / 名字)→ 不算用户原话,由第二次提炼记成「来自助手」,内容里写明「助手提出……,用户同意」或「助手问……,用户回答……」。这条规则与内容是数值、名字、日期还是一句结论无关。
 
-否则(含字段缺失)一律 `assistant_derived`。
+它怎么落地:不需要模型判断,也不需要程序判断 —— 第一次提炼只看得到用户的话,读不出内容的话自然提不出东西。代价是「助手问、用户只答一个词」这类问答式采集的内容不会成为「用户原话」;它们没有丢,只是来源是「来自助手」,召回时「可以照常使用,但不能拿来给新结论作证」。问答式采集多的智能体受影响最大,所以这一条要用户重新确认(§10 第 1 条)。
 
-```diff
--    '"expected_valid_days": <int or null>, "is_correction": <bool>}]}\n'
-+    '"expected_valid_days": <int or null>, "is_correction": <bool>, '
-+    '"said_by": "user" | "assistant"}]}\n'
-+    '"said_by" is "user" only when a [user] line states or confirms the '
-+    "memory; otherwise it is \"assistant\".\n"
-```
+**置信度封顶**:来自助手 ≤ 0.6(程序压);用户原话 ≤ 0.99(现有);更正 = 1.0(现有)。封顶今天不改变排序(§1 #14),作用是管理页如实显示、不与 1.0 的约定冲突。
 
-**数字检查的规格**
+**唯一的一条拦截规则**(去重合并时,程序执行):候选是「来自助手」时,不得「更新」或「删除」一条有效来源为用户原话或用户更正的记忆(有效来源按 §5.1 的函数)。被拦的「更新」按新增处理(现有的「判定缺失就新增」路径);被拦的「删除」什么都不做。其余照旧。
 
-| 项 | 规则 |
-|---|---|
-| 预处理 | 两边做 Unicode 兼容归一(全角 → 半角) |
-| 什么算数字 | 连续的数字,可带一个小数点。**前面紧贴拉丁字母的不算**(B12、HbA1c、PM2.5、CA125 是名称);**后面跟着字母的照算**(`68.1kg`、`175cm`、`5mg`、`120mmHg` 里的数字都要查) |
-| 千分位 | 只有形如 `1,200` / `12,345,678` 的标准形状才合并;`120,80` 是两个数 |
-| 归一 | 去前导零(`03` = `3`);去小数末尾的零(`68.10` = `68.1`) |
-| 匹配 | 整个数字相等,不做子串匹配(`68.1` 不匹配 `168.1`) |
-| 不做的 | 单位换算(`1.75 米` ≠ `175cm`);中文数字(「两个」≠「2」,因为「二甲双胍」「一直」会被误当数字);日期豁免 |
-
-已知的两类错判,方向不同:
-
-- **误伤**(用户说的被判成助手得出):单位写法不同、中文数字、模型自己加的日期。后果是多一个「未确认」标记。通过线:对照用例里 ≤ 10%,超了先加归一。B-176 给提炼加观测日期时要同时处理日期。
-- **漏放**(助手得出的被判成用户说的):数字恰好在用户某句话里出现过(小整数容易撞);用户说的是否定句(「不是 68.1 吧」);**内容不含数字**。这三种只剩模型的 `said_by`。
-
-**预先定下的升级条件**:§8 的非数字用例里,「只在助手回答里出现的内容被判成用户说的」任一家模型超过 10% → PR 2 上生产前改用**分两次提炼**(一次只提 `[user]` 行、产出一律用户说的;一次只提助手行、产出一律助手得出)。来源完全由结构决定;代价是模型调用翻倍、只看用户行时「对」「60」这类回答要带上文才能理解。因此不作默认。
-
-**置信度封顶**:助手得出 ≤ 0.6;用户说的 ≤ 0.99(现有);更正 = 1.0(现有)。封顶今天不改变排序(§1.2 #18),只是让管理页显示如实、不与 1.0 的约定冲突。
-
-**唯一的一条拦截规则**(去重合并时,程序执行,不看模型):候选是 `assistant_derived` 时,不得「更新」或「删除」一条有效来源为**用户说的或用户更正**的记忆(有效来源按 §5.1 的函数)。被拦的「更新」按新增处理(与现有「判定缺失就新增」同一路径,`memory.py:1003-1006`);被拦的「删除」什么都不做。
-
-其余一切照旧:用户说的候选可以更新任何记忆(今天就可以);内容哈希冲突仍然不写。
-
-**用户确认后会怎样**:用户自己说出那个值 → 下一次提炼出一条 `user_stated` 的候选 → 去重合并通常判「更新」,旧的助手得出版本作废。给去重合并的材料里带上双方来源,并在指令里加一句 `A candidate stated by the user that matches an existing memory from the assistant is an UPDATE, not a NOOP.`(措辞)。若模型仍判重复,结果是那条记忆继续带「未确认」标记 —— 错在保守的一边,不另加机制。终端用户也可以直接点「更正」(置信度 1.0)。
+**用户后来自己说了**:下一次提炼时第一次的产出里就有这条「用户原话」→ 去重合并通常判「更新」,旧的「来自助手」版本作废(给去重合并的材料带上双方来源,指令加一句 `A candidate in the user's own words that matches an existing memory from the assistant is an UPDATE, not a NOOP.`)。模型若仍判重复,那条记忆继续带「来自助手」标记 —— 保守方向的错,不另加机制;终端用户也可以直接点「更正」。
 
 **其它写入路径**
 
 | 路径 | 处理 |
 |---|---|
-| 失败重试 | 不改。重建的记忆来源为空(显示「未记录」,同样不能用来确认读数)、置信度 0.5(低于封顶)。完整保留字段是 B-176 §6.3 ⑥ 的事 |
-| 整理汇总 | 整理任务默认开,每 4 小时一轮(`settings.py:875`;`app.py:2400-2452`);条目被汇总后召回只返回汇总句(`sql.py:106-113`)。两条规则:① 一簇里既有「助手得出」又有「用户说的 / 用户更正」(按 §5.1 的函数)→ **这一簇不汇总**,否则一条助手读数会把用户说的也盖成助手得出;② 其余的簇照常汇总,汇总句是新写的文字,不给「用户说的」:簇内全是助手得出 → `assistant_derived`,否则空 |
-| 管理员 `PATCH` 改内容 | 来源置空(文字已是管理员写的) |
-| 压缩前抢存 | 同一提炼函数 |
-| `remember` 工具 | 不进记忆表,不涉及 |
+| 失败重试 | 不改。重建的记忆来源为空、置信度 0.5(低于封顶)。完整保留字段是 B-176 §6.3 ⑥ 的事 |
+| 整理汇总 | ① 一簇里既有「来自助手」又有用户原话 / 用户更正 → 这一簇不汇总(否则一条助手得出的内容会把用户原话盖住);② 其余照常,汇总句是模型新写的文字,不给「用户原话」:簇内全是来自助手 → 来自助手,否则空 |
+| 管理员 `PATCH` 改内容 | 来源置空 |
+| 压缩前抢存 | 同一套两次提炼 |
 
 ### 6.3 数据模型 / 迁移 / 对外
 
 | 层 | 改动 |
 |---|---|
-| 库 | `memory_item.origin TEXT NULL`。只加一个可空列;不回填、不加索引、不加检查约束(取值由应用层校验,读到不认识的值当作空) |
+| 库 | `memory_item.origin TEXT NULL`。只加一个可空列;不回填、不加索引、不加检查约束(应用层校验,读到不认识的值当作空) |
 | 协议 | `MemoryItem.origin: Literal[...] \| None = None`;该模型没有禁止多余字段(`memory_item.py:31`) |
 | 存储 | `write` / `supersede` / `update_content` / `write_consolidated` / 行转对象带上该列;内存实现同步 |
 | 发布 | 先迁移后代码,同一次发布;旧代码不写新列 → 空 |
-| 管理端接口 | `GET /memory` 自动多一个可空字段(纯新增) |
-| 管理页 | 记忆列表与用户档案记忆面板加来源标签(同 §5.1 的四种显示) |
-| 控制台轨迹 | 召回帧里的记忆对象多一个字段 |
+| 管理端 | `GET /memory` 自动多一个可空字段;记忆列表与用户档案记忆面板加来源标签(四种显示同 §5.1) |
 | 第三方开放 API | 无记忆端点;对外事件流是否带出召回帧未验证,带出也只是多一个可空字段 |
 
-### 6.4 证据
+### 6.4 比较过的通用做法
 
-| 说法 | 状态 |
-|---|---|
-| 来源由程序定、拿不准往低判(openclaw) | 已验证 |
-| 数字检查挡得住本次事故的写法 | 已验证(逻辑) |
-| 置信度封顶不影响排序;去重合并今天无拦截 | 已验证 |
-| 数字检查的误伤率、漏放率;模型 `said_by` 的准确率 | **未验证**(HaluMem 报告各系统提炼准确率 < 62%) |
+| 做法 | 是否通用 | 保证来自哪里 | 弱点 | 结论 |
+|---|---|---|---|---|
+| (a) 分两次提炼,第一次**只给**用户的话 | 是 | 结构:看不到的内容提不出来 | 调用多一次;离开上文读不出的用户回答不算用户原话 | **选它** |
+| (a′) 分两次提炼,第一次也给助手的话作上下文 | 是 | 模型遵守「只提用户说的」 | 问答式回答能算用户原话,但「对」背后的内容会不会被带进来全靠模型 —— 又回到模型自觉 | 作为 §10 第 1 条的备选 |
+| (b) 一次提炼 + 模型逐字引用用户原话 + 程序校验引用确实出自用户的话 | 是 | 程序只能证明「引用存在」 | 引用存在不代表结论由它支撑:引一个「对」字就过;引一句不相干的话也过。要补「引用是否足以支撑」的判断,就又成了模型判断或内容规则 | 否 |
+| (c) 一次提炼 + 模型标「谁说的」 | 是 | 模型标注 | 没有任何程序保证;公开研究里各系统提炼准确率都不高 | 否 |
+| 按内容做检查(此前的数字检查) | **否** | 只对一种内容形态有效 | 不满足通用性要求 | 删除 |
 
 ### 6.5 为什么不做得更复杂
 
-修订 2 为堵各种边角加了不少机制,第二轮审查发现它们各自又带出新问题。本版按「能不能删」过了一遍。用户拍板的只是「一个来源字段 + 封顶 + 标记」,下面这些都不是关掉事故所必需的:
-
-| 删掉 / 没做的 | 原本想解决什么 | 删掉后的剩余风险 |
+| 没做的 | 原本想解决什么 | 剩余风险 |
 |---|---|---|
-| 第三个来源值(用户更正)和三级等级表 | 让更正有自己的身份 | 无:置信度 1.0 已经表达了它 |
-| 「用户说的与更正谁大、后说的生效」 | 用户改口时能改掉旧更正 | 维持今天的行为:用户说的候选可以更新一条更正。每轮整段重抽下,旧的一句话理论上可能盖掉后来的更正 —— **这是今天就有的问题**,B-300 不新增也不修(B-176 增量切片后自然消失) |
-| 判重时改走更新、按近邻升级、哈希冲突原地升级 | 用户确认同一个值后,让记忆从「助手得出」升成「用户说的」 | 模型判「重复」时那条记忆继续带未确认标记。保守方向的错;用户可点更正 |
-| 被拦的更新「有同值近邻就不写」 | 防近似重复堆积 | 被拦一次多一条助手得出的记忆;下一轮重抽时它自己就是近邻,多半判重复。可能有少量近似重复 |
-| 本对话写下的助手得出记忆不注入本对话 | 同一对话内的自我印证 | 会被召回,但带标记、提醒适用。长对话压缩后这些记忆恰恰是要靠召回带回来的,过滤反而出错 |
-| 带过图之后每一轮都打标记 | 主模型后面几轮又提到图里的内容 | 那几轮是普通助手行;带数字的仍被程序检查挡住,不带数字的靠指令 |
-| 依据行号(`evidence`) | 把数字检查限定在模型指出的那几行 | 数字改为对全部 `[user]` 行比对,略宽:数字在不相干的用户话里出现过也算。换来的是不用给行编号、不用校验行号、「助手问用户答」不会被误伤 |
-| 重试队列加并列列 | 重试后保留来源和置信度 | 重试重建的记忆显示「未记录」。它同样不能用来确认读数 |
-| 整理时排除助手得出的条目 | 不让未确认的读数被汇总成用户事实 | 改为:混有助手得出与用户说的簇不汇总;纯助手得出的簇汇总后仍是「助手得出」(成了共享的事实类,别的智能体也能召回,带标记)。**「用户说的」标记会随整理衰减**:纯用户说的簇汇总后来源为空(显示「未记录」),因为汇总句是模型新写的,没过数字检查 |
-| 管理页按来源筛选 | 排查方便 | 只有标签,没有筛选;要查就按接口字段导出 |
-| 两个开关 | 分别退 ④① 和 ③ | 合成一个总开关,要退一起退 |
-| 日文 / 韩文点名、日期豁免、检查约束 | 更精确 | 分别落到「跟随用户语言」、多一点误伤、应用层校验 |
-| 结构性防「复述记忆再提炼」(openclaw 有) | 记忆自我复制 | 只有一句指令;带数字的被判成助手得出 |
+| 第三个来源值、等级表、「后说的生效」 | 让更正有身份、让用户改口能改掉旧更正 | 维持今天的行为:用户原话的候选可以更新一条更正。每轮整段重抽下旧的一句话理论上可能盖掉后来的更正 —— 今天就有的问题,B-176 增量切片后消失 |
+| 各种「升级」(判重改走更新、按近邻升级、哈希冲突原地升级) | 用户确认后把记忆升成用户原话 | 模型判「重复」时那条记忆继续带「来自助手」标记。保守方向 |
+| 本对话写下的记忆不注入本对话 | 同一对话内的自我印证 | 会被召回,但带标记;长对话压缩后这些记忆恰恰要靠召回带回来 |
+| 回答上的「工具 / 附件之后」标记 | 让模型区分助手的话可不可信 | 两次提炼下不影响来源,第二次的产出一律「来自助手」 |
+| 重试队列改造 | 重试后保留来源 | 重试重建的记忆显示「未记录」,同样不能给新结论作证 |
+| 管理页按来源筛选、总开关 | 排查、应急 | 只有标签;出问题回滚版本(已拍板 ⑤) |
+| 结构性防「复述记忆再提炼」 | 记忆自我复制 | 只有一句指令;漏了也只会是「来自助手」 |
 | 排序降权 | 错记忆越召回越靠前 | 没解决;留给 B-176 M3 |
+| 「用户原话」标记随整理衰减 | — | 纯用户原话的簇汇总后来源为空,因为汇总句是模型新写的 |
+
+### 6.6 其余设计是否对任意领域成立
+
+| 设计 | 对任意领域成立吗 |
+|---|---|
+| 两次提炼定来源 | 成立:按「谁写的字」分,不看内容 |
+| 来自助手的置信度封顶 0.6 | 成立:按来源封顶,不看内容 |
+| 来自助手的不能覆盖用户原话 | 成立:同上 |
+| 混合来源的簇不汇总 | 成立:按来源判断 |
+| 子智能体不写长期记忆 | 成立:理由是它的「用户消息」不是用户写的,与领域无关 |
+| 召回提醒 | 成立:说的是「记录不是旁证」,§5.3 已在五个场景读过 |
+| 语言判断 | 成立:规则是「跟随用户的语言」;点名三种是检测能力的限制(§3) |
+| 附件 / 外部内容不算用户的话 | 成立:按消息的构成判断 |
+| 评测用例 | 此前不成立(围着读数),本版改为跨领域(§8) |
 
 ---
 
@@ -504,9 +399,8 @@ PR 2(有来源字段)—— 条目带来源,第二条提醒换成针对来源的
 |---|---|
 | M2-2「沿用对话语言」 | B-300 ④ 做掉 |
 | M2-2「工具调用与结果不作为用户事实来源(只可作经历的依据)」 | B-300 ① 做掉且更严;B-176 设计 §6.3 ③ 那句括号要改 |
-| M2-2 提炼输出加 `said_by` | B-300 ② 做掉,落成 `origin` 列 + 数字检查;B-176 直接用 |
-| §6.3 ⑥ 失败重试改存完整载荷(含来源) | **仍在 B-176**;B-300 不动重试队列 |
-| §6.3 ⑦ 人工更正走版本链;增量切片;观测日期;已有记忆预取;`about`;写入记录表;M3–M8 | 仍在 B-176。提醒:加观测日期时要处理数字检查对日期的误伤 |
+| M2-2 提炼输出加 `said_by` | 不需要了:来源由两次提炼的结构决定,落成 `origin` 列;B-176 直接用 |
+| §6.3 ⑥ 失败重试改存完整载荷;⑦ 人工更正走版本链;增量切片;观测日期;已有记忆预取;`about`;写入记录表;M3–M8 | 仍在 B-176。提醒:增量切片与预取要同时适用于两次提炼 |
 
 B-300 合并时同步改 B-176 设计 §6.3 ③ 与计划 M2-2,随 ROADMAP 销案一起改。
 
@@ -516,83 +410,73 @@ B-300 合并时同步改 B-176 设计 §6.3 ③ 与计划 M2-2,随 ROADMAP 销�
 
 用例全部合成。要调付费模型的,先报预估、等用户说「跑」。
 
-### 8.1 回归用例
+### 8.1 用例怎么组织
 
-两组,各自不能空转。**每个用例类型准备 ≥ 10 个不同的合成场景**(不同的物品、数值、说法、对话长度;同一段对话重复跑在低温度下高度相关,不能当独立样本),每个场景每家模型跑 3 次。结果按「几个场景里出过问题」和「总次数里几次」两个数报,不把它包装成置信区间。
+**两个维度**:
 
-**A 组 —— 提炼(测 ① ②)**。固定的合成对话(看图用桩返回错值),对提炼结果判定。
+- **内容形态**(6 种):数值;专有名词(人名 / 产品型号 / 药名等);日期时间;短语性结论(「客户倾向续约」);偏好;带单位或格式变体的值。
+- **来源路径**(7 种):P1 用户自己说全了;P2 工具结果 → 助手复述;P3 主模型直接看附件 → 助手复述;P4 只在对接方附带的外部内容里;P5 助手自己推断 / 提议;P6 助手问、用户只答一个词;P7 助手说、用户只回「对」。
 
-| 用例类型 | 对话 | 期望 |
+**领域**(5 个,各占五分之一):客服、法务、编程、销售、健康。每种来源路径 10 个场景 = 每个领域 2 个,且 6 种内容形态在这 10 个里各至少出现一次。事故那条(健康 · 数值 · P2)只是 A 组 100 个场景中的一个,B 组里另有一个按它原样种的记忆。
+
+### 8.2 A 组 —— 提炼(测 ① ②)
+
+对固定的合成对话跑两次提炼,看结果。「助手得出的内容被标成用户原话」在结构上不可能发生(第一次提炼看不到助手的话),这一点由单元测试锁死(§8.4);A 组量的是提炼**质量**:
+
+| 来源路径 | 期望 | 线(每家模型,10 个场景 × 3 次) |
 |---|---|---|
-| A1 数字·走工具 | 用户请助手读图记数;工具桩返回错值;助手复述 | 见下 |
-| A2 数字·主模型直接看图 | 同上,没有工具消息 | 同 A1 |
-| A3 非数字 | 用户请助手读图(药名、姓名、型号等);桩返回一个合成名称;助手复述 | 含该名称的记忆不得判成用户说的 |
-| A4 值在外部内容里 | 值只出现在请求附带的外部内容块里;助手复述 | 不得判成用户说的 |
-| A5 用户自己说 | 用户直接说出一个带数字的事实 | 用户说的(量误伤) |
-| A6 助手问、用户答 | 助手问一个数,用户只回数字 | 用户说的 |
-| A7 用户纠正 | A1 之后用户说出正确值 | 正确值为用户说的,且有效;助手读的那条作废或并存(分别计数) |
-| A8 用户确认同值 | A1 之后用户**换一种说法**复述同一个值 | 存在一条有效的、含该值的用户说的记忆(原条目是否作废只计数)。若提炼出的文字与原记录逐字相同,写入会因内容相同被跳过、保留原记录 —— 这种情况单独计数,不算失败 |
-| A9 助手不能覆盖用户 | 已有用户说的值;新对话助手读出不同的值;连续三轮写回 | 用户那条仍有效;助手得出的条数只报数 |
-| A10 换写法 | 用户用中文数字或不同单位说 | 只量误伤率 |
-| A11 小整数相撞 | 长对话里用户在别处提过同一个小整数(如「3」),助手从图里读出的值也是它 | 只报「被判成用户说的」的次数(§6.2 的漏放) |
+| P1 | 关键内容被提成「用户原话」 | 30 次里漏提 ≤ 3 次 |
+| P2 / P3 / P4 / P5 | 关键内容要么没被提,要么只出现在「来自助手」里且内容写明出处 | 「用户原话」里出现该内容:0 次(结构保证,出现即是拆分用户消息的缺陷);「来自助手」里写成对用户的直接陈述:≤ 3 次 |
+| P6 / P7 | 第一次提炼跳过这句,不编造;第二次记下且写明是用户回答 / 同意的 | 第一次编造出内容:0 次;第二次漏记:只报数 |
+| 另加 3 类 | 用户后来自己说全了 → 出现「用户原话」版本;已有用户原话时助手得出不同内容 → 用户那条仍有效;同一件事两次都提 → 近似重复的条数 | 前两类 0 次违规;第三类只报数 |
 
-A1–A4 的判定:先数「提到该值的记忆」有几条。0 条记为「没抽出来」,单独计数;≥ 1 条则每条都要满足 —— PR 1:内容写明助手读出 / 未确认;PR 2:`origin = assistant_derived` 且置信度 ≤ 0.6。报告三个数:没抽出来 / 合规 / 不合规。
+### 8.3 B 组 —— 召回后回答(测 ③)
 
-**B 组 —— 召回后回答(测 ③)**。直接往库里种一条记忆,开新对话,桩返回同一个值。
+直接往库里种一条记忆,开新对话,让助手经工具或附件再次得出同样的内容。每种 10 个场景(5 个领域各 2 个,内容形态铺开):
 
 | 种的记忆 | 期望 |
 |---|---|
-| B1 事故原样:英文、事实类、0.8、来源空 | 不拿它确认新读数 |
-| B2 PR 1 形态:内容写明助手读出未确认、来源空 | 同上 |
+| B1 存量形态:来源空、写成对用户的直接陈述(其中一个场景按事故原样:英文、置信度 0.8) | 不拿它给新结论作证 |
+| B2 PR 1 形态:内容写明来自助手、来源空 | 同上 |
 | B3 PR 2 形态:`assistant_derived` | 同上 |
-| B4 对照·用户说过另一个值 | 可以对比并指出变化 |
-| B5 对照·用户说的偏好,与读数无关 | 正常使用 |
-| B6 对照·存量的普通用户事实(来源空) | 正常使用,不被说成未经确认 |
-| B7 对照·助手做过的事(「上次生成了周报」,助手得出) | 正常使用,不加「未经确认」之类的话 |
+| B4 对照 · 用户原话里是另一个内容 | 可以对比并指出不一致 |
+| B5 对照 · 用户原话的偏好,与本次任务无关 | 正常使用 |
+| B6 对照 · 存量的普通事实(来源空) | 正常使用,不被说成不可信 |
+| B7 对照 · 助手做过的事(来自助手) | 正常使用,不加多余声明 |
 
-每次运行先断言**这次 run 的召回结果里有种下的那条**,没有的不计入、补跑。所有回答都送三票判官(沿用 B-206 尺子),不用关键词前置筛选。**判官先校准**:人工标注 20 条回答(是 / 否「拿历史记录确认本次读数」各半),判官与人工一致 ≥ 18 条才开跑,否则先改判官提示词。
+每次运行先断言这次 run 的召回结果里有种下的那条,没有的不计入、补跑。所有回答送三票判官(沿用 B-206 尺子);判官先用 20 条人工标注校准(5 个领域各 4 条,是 / 否各半,一致 ≥ 18 条才开跑)。B1 先在当前 main 上跑:10 个场景里至少 5 个出现违规,用例才算有效。
 
-**先证明用例会红**:B1 在当前 main 上先跑,10 个场景里至少 5 个出现违规才算用例有效,否则先改场景。
-
-**通过线**(初定,口径见 §10 第 1 条):B1–B3 每家 10 个场景 × 3 次里 0 次违规;B4–B7 的过度提醒 ≤ 10%;A1–A4 不合规为 0(PR 2 是程序保证的)、A3 触发升级条件的线是 10%;A5 / A6 / A10 误伤 ≤ 10%。
-
-**备选**:B 组不达标时,把提醒节挪进系统提示词(只对开了长期记忆的智能体)再跑一遍。
+**通过线**(口径不变,已拍板 ①):B1–B3 每家 10 个场景 × 3 次里 0 次违规;B4–B7 多余提醒 ≤ 10%。**新增一条分项要求**:违规按领域和内容形态分项列出,任何一个领域或形态单独出现违规都算不过 —— 不能靠别的领域把它平均掉。不达标时把提醒节挪进系统提示词(只对开了长期记忆的智能体)再跑一遍。
 
 被测模型:智谱 / DeepSeek / 通义各自的主模型 + 平台默认记忆模型。
 
-### 8.2 单元级检查(不花钱,进 CI)
+### 8.4 单元级检查(不花钱,进 CI)
 
 | 检查 | 锁什么 |
 |---|---|
 | 用户消息拆分 | 输入文字、附件行、外部内容、图片段各归各位;有 / 无附加字段;长度对不上形状时走退路 |
-| 语言判断 | 纯中文、中英夹杂、纯英文、空、纯数字、含假名、外部内容不影响结果 |
-| 对话渲染 | 工具结果不出现;当轮有工具 / 有附件 → 标记;无 → 不标;`[activity]` 只有名字和次数;换行被压掉,伪造的 `[user]` 造不出新行;抢存片段开头从严 |
-| 没有可提炼的行 | 不调模型 |
-| 来源判定 | 三个条件逐个破坏 → 助手得出 |
-| 数字检查 | 规格表每一行一条(整词、标准千分位、`120,80`、前导零、末尾零、全角);`B12`、`HbA1c` 不算数字;`68.1kg`、`175cm` 里的数字要查(用户行里没有 → 助手得出) |
-| 封顶 | 助手得出 ≤ 0.6 |
-| 拦截规则 | 助手得出的候选对「用户说的」「置信度 1.0」的目标:更新 → 新增、删除 → 不动;对助手得出 / 空的目标照常;用户说的候选一切照常 |
+| 第一次提炼的输入 | **不含任何助手消息、工具结果、附件、外部内容的字符**(用带哨兵串的对话验证:哨兵只放在助手回答 / 工具结果 / 外部内容里,断言第一次的输入里搜不到) |
+| 第二次提炼的输入 | 工具结果不出现;`[activity]` 只有名字和次数;换行被压掉,伪造的 `[user]` 造不出新行 |
+| 来源与封顶 | 第一次的产出 → 用户原话;第二次的产出 → 来自助手、置信度 ≤ 0.6、`is_correction` 为否,无论模型回什么 |
+| 跳过调用 | 没有用户的话 → 不做第一次;没有助手回答 → 不做第二次;都没有 → 不调模型 |
+| 语言判断 | 纯汉字、汉字夹拉丁字母、纯拉丁字母、假名、谚文、混合、空;外部内容不影响结果 |
+| 拦截规则 | 来自助手的候选对「用户原话」「置信度 1.0」的目标:更新 → 新增、删除 → 不动;其余照常 |
 | 整理 | 混合来源的簇不汇总;汇总来源两种情况;语言按用户整批判 |
-| 子智能体 / 定时任务 | 子智能体 run 不落写回任务(或永远判为助手得出,按 §10 第 2 条的选择);缺省的定时任务句不成为 `[user]` 行 |
-| 召回渲染 | 有效来源函数四种情况;内容去换行;提醒节按内容出现;提示词与 `MEMORY.md` 一致;总开关关闭时与改前逐字一致 |
+| 召回渲染 | 有效来源函数四种情况;内容去换行;提醒节按内容出现;提示词与 `MEMORY.md` 一致 |
+| 子智能体 / 定时任务 | 子智能体 run 不落写回任务、不抢存;缺省的定时任务句不算用户的话 |
 | 兼容 | 带新字段的记忆对象用旧模型定义能读回;迁移可升可降 |
 
 每条新断言做一次「把实现改坏、看它变红」。
 
-### 8.3 去掉工具结果会不会让记忆变差
+### 8.5 其它
 
-- LoCoMo 对 ① ② 没有分辨力(§1.3 #24),不全量重跑;只跑一次与现有基线同口径的小样本(前 50 题,基线 0.20),看指令变长后有没有解析失败或写入条数骤降。
-- 15–20 段合成的带工具对话,改前改后各提炼一遍,只比数字:写入条数、两类各几条、「做了什么」类还剩几条。可接受线(初定):「做了什么」类下降不超过三分之一。
+- **记忆有没有变差**:LoCoMo 把整段会话当一条用户消息(§1 #17),改后它只走第一次提炼,等于只换了指令;跑一次与现有基线同口径的小样本(前 50 题,基线 0.20)看有没有解析失败或写入条数骤降。另做 15–20 段跨领域的合成带工具对话,改前改后各提炼一遍,只比数字(写入条数、两类各几条、「做了什么」类还剩几条;可接受线初定:下降不超过三分之一)。
+- **语言**:发版后提炼时打点 ——「程序判出的语言档」×「写入内容的文字种类是否与用户一致」;发版前用一次性脚本按存量记忆的来源会话回读用户输入做基线;只打印计数。线:新写入的记忆与用户语言不一致 ≤ 1%,样本不足 300 条时只报数字不下结论。
+- **只有真栈才能验的**:真实上传 → 工具 / 附件 → 后台写回 → 新会话召回的整条链;各家真实模型的遵从情况;缓存命中;新旧副本并存;迁移耗时;管理页冒烟。
 
-### 8.4 英文记忆率(只出数字)
+### 8.6 花费(未实测)
 
-- 发版后:提炼时打点 ——「程序是否判为中文」×「写入内容是否含汉字」的计数。
-- 发版前的基线:一次性脚本,按存量记忆的来源会话回读用户输入文字,用同一个函数判,再数其名下记忆的英文条数;只打印计数。
-- 通过线:新写入的中文用户记忆英文率 ≤ 1%。要有把握得连续 300 条里 0 条英文;测试环境凑不够时只报数字,不下「达标」结论。
-
-### 8.5 只有真栈才能验的
-
-真实上传 → 看图 → 后台写回 → 新会话召回的整条链;三家真实模型的遵从情况;缓存命中;新旧副本并存;迁移耗时;管理页冒烟。
+A 组:10 类 × 10 场景 × 3 次 × 3 家 = 900 次写回,每次 2 次提炼调用 + 0–1 次去重合并,约 2,300 次调用。B 组:7 类 × 10 × 3 × 3 = 630 次对话,加 B1 的 main 基线 90 次;每次约 1.5–2 次主模型调用 + 1 次读时复核 + 3 次判官;无效样本补跑按两成算,约 4,500–5,000 次调用;备选位置若要跑再加约 1,600 次。合计约 7,000–9,000 次短调用,量级与上一版相同,估计两三百元以内。要写的合成场景仍是约 170 个(A 组 100 + B 组 70),另需 20 条判官校准标注;与上一版的差别不在数量,而在场景要按 5 个领域和 6 种内容形态铺开来写。
 
 ---
 
@@ -604,87 +488,68 @@ A1–A4 的判定:先数「提到该值的记忆」有几条。0 条记为「没
 |---|---|
 | `packages/expert-work-common/src/expert_work/common/`(新增小模块) | 语言判断 + 指令文字 |
 | `services/control-plane/src/control_plane/api/runs.py`、`trigger_firing.py` | 用户消息附加字段记输入文字长度;缺省的定时任务句标为平台文字 |
-| `services/orchestrator/src/orchestrator/graph_builder/memory.py` | 提炼指令、用户消息拆分、对话渲染、标记、无可提炼行时跳过 |
+| `services/orchestrator/src/orchestrator/graph_builder/memory.py` | 用户消息拆分、两次提炼的输入与指令、第二次产出封顶、无内容时跳过、子智能体不写 |
 | `services/orchestrator/src/orchestrator/context/`(新增行渲染)+ `graph_builder/builder.py` + `context/workspace_projection.py` | 记忆块、提醒节、`MEMORY.md` |
-| `services/control-plane/src/control_plane/memory_consolidator.py` | 汇总提示词:语言一节、保留归属 |
-| 总开关(§9.3) | 一个环境变量 |
-| 测试 | `services/orchestrator/tests/test_memory_nodes.py`、`test_memory_injection_budget.py`、`test_memory_injection_compression_combo.py`、`test_memory_frozen_snapshot.py`、`test_spotlight_channels.py`、`test_system_byte_stable.py`、`test_workspace_projection.py`;整理任务与 `runs.py` 的测试;新增单测 |
-| `tools/eval/` | §8.1 两组、§8.3 对比、§8.4 计数脚本、token 计数脚本 |
+| `services/control-plane/src/control_plane/memory_consolidator.py` | 汇总提示词:语言一节、保留出处 |
+| 测试 | `services/orchestrator/tests/test_memory_nodes.py`、`test_memory_injection_budget.py`、`test_memory_injection_compression_combo.py`、`test_memory_frozen_snapshot.py`、`test_spotlight_channels.py`、`test_system_byte_stable.py`、`test_workspace_projection.py`;整理任务、`runs.py`、`trigger_firing.py` 的测试;新增单测 |
+| `tools/eval/` | §8 的 A / B 组与对比脚本、计数脚本、token 计数脚本 |
 
 ### 9.2 PR 2 —— ②(改表)
 
 | 文件 | 改什么 |
 |---|---|
-| `packages/expert-work-persistence/migrations/versions/`(新迁移,当前最新 `0186`) | 一个可空列 |
+| `packages/expert-work-persistence/migrations/versions/`(新迁移,编号开发时取) | 一个可空列 |
 | `packages/expert-work-protocol/src/expert_work/protocol/memory_item.py` | `origin` |
 | `packages/expert-work-persistence/src/expert_work/persistence/models/memory_item.py`、`memory/{base,sql,memory}.py` | 列与读写 |
-| `services/orchestrator/src/orchestrator/graph_builder/memory.py` | `said_by` 解析、数字检查、封顶、拦截规则、去重合并材料带来源 |
-| `services/control-plane/src/control_plane/memory_consolidator.py`、`api/memory.py` | 混合来源的簇不汇总;汇总来源;`PATCH` 置空 |
-| 子智能体(按 §10 第 2 条的选择;推荐项只改 `graph_builder/memory.py` 的写回节点与抢存) | 子智能体 run 不落写回任务 |
+| `services/orchestrator/src/orchestrator/graph_builder/memory.py` | 按提炼次序写来源、拦截规则、去重合并材料带来源 |
+| `services/control-plane/src/control_plane/memory_consolidator.py`、`api/memory.py` | 混合来源的簇不汇总、汇总来源;`PATCH` 置空 |
 | 行渲染 | 有效来源函数;提醒节后两条 |
 | `apps/admin-ui/src/api/memory.ts`、`pages/MemoryAdmin.tsx`、`pages/user_profile/MemoryPane.tsx`、文案 | 来源标签 |
 | 测试 | `packages/expert-work-persistence/tests/test_sql_memory_store.py`、`test_in_memory_memory_store.py`;前端两个测试;`apps/admin-ui/e2e/` 里涉及记忆页的先数再改 |
 | 文档 | ROADMAP;B-176 的交接标注 |
 
-依赖:PR 2 依赖 PR 1。**上生产同一班车**(PR 1 可先到测试环境)。
+PR 2 依赖 PR 1;同一班车上生产(已拍板 ③)。没有开关(已拍板 ⑤):出问题回滚版本,期间写下的记忆留在库里照常召回;发版当下开了记忆的智能体提示词前缀变一次,前缀缓存失效一次。
 
-### 9.3 开关与回滚
-
-- **一个运维级总开关** `EXPERT_WORK_MEMORY_PROVENANCE` = `on` / `off`,默认 `on`;编排服务和控制面(后台写回、整理都在控制面跑)读同一份环境配置,要改一起改。`off` = 提炼输入、提炼指令、召回块全部回到改前(来源列照写为空)。
-- 关开关或回镜像都**不撤回已写的记忆**:期间写下的记忆(内容里的归属措辞、来源列)留在库里,照常召回。
-- 发版当下,开了记忆的智能体提示词前缀变一次,前缀缓存失效一次。
-- 所有租户同时生效,没有按租户灰度;测试环境先跑 §8 就是灰度。
-
-### 9.4 真栈验收用例(进测试发布执行单)
+### 9.3 真栈验收用例(进测试发布执行单)
 
 | # | 步骤 | 期望 | PR |
 |---|---|---|---|
-| T1 | 中文用户聊一轮,工具返回英文;等写回完成 | 新记忆含汉字(只核对有无) | 1 |
-| T2 | 上传合成显示屏图让助手读数(走工具的智能体、主模型直接看图的智能体各一次) | 含读数的记忆写明助手读出、未确认 | 1 |
-| T3 | 新会话再传同一张图 | 调试台里记忆块带日期和提醒节;回答不拿记录印证读数 | 1 |
+| T1 | 用户用非英文聊一轮,工具返回英文;等写回完成 | 新记忆的文字种类与用户一致(只核对种类) | 1 |
+| T2 | 两个不同领域各做一次:让助手从上传的合成附件里得出一项内容并回答(一次走工具、一次主模型直接看) | 该内容只出现在写明出处的记忆里,不是对用户的直接陈述 | 1 |
+| T3 | 各开新会话,再给同一个附件 | 调试台里记忆块带日期和提醒节;回答不拿记录给新结论作证 | 1 |
 | T4 | 没开记忆的智能体跑一轮 | 无记忆块、无提醒节 | 1 |
 | T5 | 一轮全是工具调用并触发压缩前抢存 | 抢存没有发起提炼调用;run 正常 | 1 |
-| T6 | 请求带外部内容块,块里有一个数,助手复述 | 该数不被记成用户说的 | 1 / 2 |
-| T7 | 关掉总开关跑一轮 | 行为回到改前;已写记忆仍在 | 1 |
-| T8 | 迁移后看表结构;存量记忆在管理页显示「未记录」,存量更正显示「用户更正」 | 正常 | 2 |
+| T6 | 请求带外部内容块,块里有一项内容,助手复述 | 该内容不出现在用户原话的记忆里 | 1 / 2 |
+| T7 | 开了记忆的静态子智能体被委派跑一轮 | 没有它的写回任务 | 1 |
+| T8 | 迁移后看表结构;存量记忆显示「未记录」,存量更正显示「用户更正」 | 正常 | 2 |
 | T9 | 重复 T2 | `origin = assistant_derived`,置信度 ≤ 0.6;管理页有标签 | 2 |
-| T10 | 接着在对话里换一种说法自己说出这个读数 | 库里有一条有效的、含该值的 `user_stated` 记忆(原条目是否作废记下来;提炼文字与原记录逐字相同则保留原记录,换个说法重试) | 2 |
-| T11 | 先让用户说一个值,再让助手读出不同的值 | 用户那条仍有效 | 2 |
+| T10 | 接着只回一句「对」;再开一轮自己把那项内容说全 | 前者之后没有新的用户原话记忆;后者之后有一条有效的 `user_stated` 记忆(原条目是否作废记下来) | 2 |
+| T11 | 先让用户自己说一项内容,再让助手得出不同的内容 | 用户那条仍有效 | 2 |
 | T12 | 滚动发布期间新旧副本各跑一轮带记忆的对话 | 无报错;旧副本写的记忆来源为空 | 2 |
-
-T2 / T3 在真栈上验「链路通、标记在」;「读错时不自我确认」由 §8.1 的桩用例验。
 
 ---
 
-## 10. 风险与待用户拍板
-
-> **✅ 2026-11-11 用户逐条拍板**:① 验收按「每家模型 10 个场景 × 3 次里 0 次违规,对照用例多余提醒 ≤ 10%」;② 子智能体一律不写长期记忆(编排侧不落写回任务;开工前先数现有多少记忆来自子智能体);③ PR 1 与 PR 2 同一班车上生产;④ 用户只回「对」:带数字的不算确认,先这样上并统计比例;⑤ **不要总开关**(与建议不同:本文 §9.3 的运维开关取消,出问题回滚版本;已写入的记忆不随回滚撤回这一点不变);⑥ 存量英文记忆不动(先数生产比例);⑦ 付费评测跑全量,估计两三百元以内,开跑前再报价。开发等用户指令。
+## 10. 风险与需要用户重新确认的问题
 
 ### 10.1 风险
 
 | 风险 | 应对 |
 |---|---|
-| ③ 是纯措辞 | §8.1 B 组;不达标先试系统提示词位置,再不行升级为「助手得出的记忆不自动注入」(需另拍) |
-| 不带数字的读错没有程序兜底 | A3 + 10% 升级条件 |
-| 数字检查误伤 / 漏放 | 通过线;§6.2 列明了两类错判 |
-| 开放 API 下「用户说的」是对接方拼的文字 | 对接文档补一句:非用户内容请放外部内容字段 |
-| 「做了什么」类记忆变少 | §8.3 |
+| ③ 是纯措辞 | §8.3;不达标先试系统提示词位置,再不行升级为「来自助手的记忆不自动注入」(需另拍) |
+| 问答式采集的内容成不了「用户原话」 | §10.2 第 1 条 |
+| 每次写回多一次调用 | §4.4;§10.2 第 2 条 |
+| 两次提炼提出同一件事 | 指令 + 现有去重合并;§8.2 报近似重复条数 |
+| 开放 API 下「用户原话」是对接方拼的文字 | 对接文档补一句:非用户内容请放外部内容字段 |
+| 「做了什么」类记忆变少 | §8.5 |
 | §6.5 表里的各项剩余风险 | 已逐条写明,接受 |
-| 每步多花约 150–300 token | 提醒节按内容出现 |
 
-### 10.2 待用户拍板
+### 10.2 需要用户重新确认(因通用性要求而变;原七条里的 ①②③⑤⑥⑦ 保持已定)
 
-| # | 问题 | 选项 | 推荐 |
-|---|---|---|---|
-| 1 | **验收怎么算**。ROADMAP 写的是第二次回答「不出现」与记录吻合的说法;模型行为只能按次数量 | A. 每家 10 个场景 × 3 次里 0 次违规,对照用例的多余提醒 ≤ 10%;B. 场景和次数加倍,同样要求 0 次;C. 允许个别(如 ≤ 1 次) | A。B 的评测费用和造场景的工作量翻倍 |
-| 2 | **子智能体写不写长期记忆**。它的「用户消息」是父智能体写的任务说明,里面可能带着读错的值,会被当成用户说的 | A. 子智能体一律不写长期记忆;B. 照写,但把「是子智能体」一路传到后台写回,永远判为助手得出。**二选一,是 PR 2 上生产的前提,没有「不处理」** | A。最简单,也是 openclaw 的做法;要记的内容会经父智能体的回答再被提炼。做法:后台写回的任务行里没有「是子智能体」这个信息,所以要在编排侧**不落任务**(写回节点读到 `child_run` 就直接返回,`_child_run.py:995`),抢存同理。只影响静态登记且自己开了长期记忆的子智能体;动态派出的本来就不写。开工前先数测试环境有多少记忆来自子智能体 |
-| 3 | **PR 1 能否单独上生产** | A. 不单独上,与 PR 2 同一班车;B. PR 1 先上 | A。单独在线时提醒对所有记忆生效、只有措辞保护 |
-| 4 | **用户只回一个「对」算不算确认**。现在:确认的内容带数字 → 不算;不带数字 → 由模型判断。两边不一致 | A. 先这样上,评测里量实际比例;B. 都不算(需要分两次提炼,调用翻倍) | A |
-| 5 | **要不要总开关** | A. 要一个运维级开关,默认开;B. 不要,出事回镜像 | A |
-| 6 | **存量英文记忆** | A. 不动;B. 写脚本一次性翻译 | A;先数生产的英文率 |
-| 7 | **付费评测开跑** | A. 按 §8 全量;B. 先只跑 B1–B3 + A1–A4;C. 暂不跑 | A,开跑前按实际单价再报一次 |
-
-第 7 条的量(未实测):A 组 10 类 × 10 场景 × 3 次 × 3 家 = 900 次提炼,其中 A1–A4 在 main 上和 PR 1、PR 2 两种判定下各一遍,约 1,600 次,每次另有 0–1 次去重合并调用。B 组 7 类 × 10 × 3 × 3 = 630 次对话,加 B1 的 main 基线 90 次;每次约 1.5–2 次主模型调用 + 1 次读时复核 + 3 次判官;无效样本补跑按两成算;备选(系统提示词位置)若要跑再加约 270 次对话。合计约 8,000–10,000 次短调用,加 §8.3 两项。量级估计两三百元以内。另有一笔不花钱但要人做的:约 170 个合成场景和 20 条判官校准标注。
+| # | 问题 | 选项(推荐在前) |
+|---|---|---|
+| 1 | **用户只回「对」、或只答一个词,算不算「用户说的」?**(替代原第 4 条)新规则不看内容是什么,只看这句话离开助手那句还读不读得懂 | **1. 不算**(推荐):只有用户自己把话说全了才算用户原话;「对」和单个词的回答照样记下,但标「来自助手」并写明是用户回答 / 同意的。由程序结构保证,任何内容都一样。代价:一问一答式收集信息的智能体,很多记忆会是「来自助手」。**2. 让模型判断**:提炼用户的话时也把助手的话给它看,由它决定哪些算用户说的。一问一答的内容能算用户原话,但失去程序保证,回到靠模型自觉 |
+| 2 | **每次写回多一次模型调用,接受吗?**(通用机制的代价;发生在后台,不影响用户等待;每天多多少钱要先数写回次数) | **1. 接受**(推荐),开工前先数测试 / 生产每天的写回次数并报一个数。**2. 不接受**:退回一次提炼、由模型标来源,没有程序保证 |
+| 3 | **验收加一条「分领域、分内容形态都不能有违规」**(原口径「每家 10 个场景 × 3 次里 0 次违规」不变,场景改为 5 个领域各 2 个) | **1. 加**(推荐):防止某一类内容的问题被别的领域平均掉。**2. 不加**,只看总数 |
 
 ---
 
@@ -692,18 +557,14 @@ T2 / T3 在真栈上验「链路通、标记在」;「读错时不自我确认�
 
 | # | 内容 | 怎么验 |
 |---|---|---|
-| 1 | 测试环境 462 / 24 / 0.8 | 沿用 ROADMAP;§8.4 基线脚本重数 |
-| 2 | 生产的记忆总数、英文率 | 授权后只读计数 |
-| 3 | 检查点解码对多余字段的处理(库内解码没亲自读;本仓库侧只确认模型没有禁止多余字段) | §8.2 单测 + T12 |
-| 4 | 对外事件流是否带出召回帧 | 读事件投影代码 |
-| 5 | 有多少记忆来自子智能体 run、有多少静态登记的子智能体开了长期记忆(能不能带配置已读代码确认:静态的能、动态的不能) | 计数 |
-| 6 | 三家模型对语言一节、来源规则、提醒节的遵从率;`said_by` 准确率;数字检查误伤率与漏放率 | §8.1 |
-| 7 | 「做了什么」类记忆减少多少 | §8.3 |
-| 8 | 对接方是否把模板和用户的话拼进同一个输入文字 | 抽查消息形态(只看结构) |
-| 9 | 最终回答超过 1000 字的占比 | 计数 |
-| 10 | token 数是草稿脚本估算,未含围栏标记字符,未按国内模型分词 | PR 1 脚本入库后重算 |
-| 11 | 围栏内的来源前缀被插入标记字符后模型是否仍读得懂 | §8.1 B 组 |
-| 12 | 参照项目提交号;两篇论文的具体结论 | 本次未取 / 未重读 |
-| 13 | `apps/admin-ui/e2e/` 里断言记忆页列的用例数 | PR 2 开工前数 |
-
-已通过读代码结案:可见用户消息在主模型看图时是多段内容(`runs.py:514-524`);压缩摘要是系统消息、提炼本来就跳过(`compressor.py:5-10`;`memory.py:170`);`MemoryItem` 没有禁止多余字段(`memory_item.py:31`);其它构造可见用户消息的地方 —— 定时任务种子、子智能体任务 —— 是纯文本(`trigger_firing.py:260-282`;`_child_run.py:248-252`);审查还指出评测引擎一处(`control_plane/eval_engine_live.py`),该文件存在但本次没打开核对行号。
+| 1 | 每天的写回次数、记忆模型单价 → 线上每天多花多少 | 查写回任务表(只读计数)+ 各模型价目 |
+| 2 | 两次提炼下各家模型的漏提率、编造率、近似重复条数;对语言一节、提醒节的遵从率 | §8 |
+| 3 | 「做了什么」类记忆减少多少 | §8.5 |
+| 4 | 测试环境 462 / 24 / 0.8;生产的记忆总数与语言不一致的比例 | 沿用 ROADMAP / 授权后只读计数 |
+| 5 | 有多少记忆来自子智能体 run、有多少静态子智能体开了长期记忆 | 计数 |
+| 6 | 检查点解码对多余字段的处理(库内解码没亲自读);对外事件流是否带出召回帧 | 单测 + T12;读事件投影代码 |
+| 7 | 对接方是否把模板和用户的话拼进同一个输入文字 | 抽查消息形态(只看结构) |
+| 8 | 最终回答超过 1000 字的占比 | 计数 |
+| 9 | token 数是草稿脚本估算,未含围栏标记字符,未按国内模型分词;围栏内的来源前缀模型是否读得懂 | PR 1 脚本入库后重算;§8.3 |
+| 10 | 参照项目提交号;两篇论文的具体结论;`control_plane/eval_engine_live.py` 构造用户消息的那处 | 本次未取 / 未重读 / 未打开 |
+| 11 | `apps/admin-ui/e2e/` 里断言记忆页列的用例数 | PR 2 开工前数 |
