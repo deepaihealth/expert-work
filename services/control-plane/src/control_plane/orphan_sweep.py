@@ -27,7 +27,6 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import time
 from collections.abc import Iterator
 from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
@@ -63,6 +62,7 @@ from expert_work.runtime.audit.logger import AuditLogger
 from expert_work.runtime.runs import RunInfo, RunStore
 from orchestrator import AgentFactoryError, run_agent
 from orchestrator.tools.registry import WORKSPACE_LAYOUT_KEY
+from orchestrator.tools.run_clock import run_segment_config
 
 logger = logging.getLogger("expert_work.control_plane.orphan_sweep")
 
@@ -411,8 +411,8 @@ class OrphanSweep:
             configurable["agent_key"] = sanitize_agent_key(record.spec.metadata.name)
             # B-236 —— 复活的那一轮沿用这条对话自己的布局,/workspace 与中断前同一个目录。
             configurable[WORKSPACE_LAYOUT_KEY] = meta.workspace_layout
-            if built.run_deadline_s > 0:
-                configurable["deadline_at"] = time.monotonic() + float(built.run_deadline_s)
+            # B-302 —— 新的本段令牌;已用秒数在检查点里,接着算,不重新给满。
+            configurable.update(run_segment_config(built.run_deadline_s))
             config: RunnableConfig = {"configurable": configurable}
 
             # B-58 —— 先确认**有东西可续**,再决定怎么派。

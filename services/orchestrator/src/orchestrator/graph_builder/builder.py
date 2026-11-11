@@ -206,6 +206,7 @@ from orchestrator.llm.truncation import (
 from orchestrator.output_judge import ActionJudge, OutputJudge
 from orchestrator.sse import PROMPT_INPUTS_KEY
 from orchestrator.state import AgentState
+from orchestrator.tools import run_clock
 from orchestrator.tools._budget import DELEGATION_GATE_KEY
 from orchestrator.tools._guards import (
     DEFAULT_LOOP_TRIPS_PER_RUN,
@@ -314,6 +315,9 @@ _WRAPUP_LIMIT_TEXT: dict[str, str] = {
     "max_steps": "step budget ({max_steps} steps)",
     "token_budget": "token budget",
     "no_progress": "no-progress limit (the same tool calls kept repeating without progress)",
+    # B-302 —— 子代没有时限秒数(只认父的两个时刻)时只写「time limit」,见
+    # :func:`build_wrapup_instruction`。
+    "deadline": "time limit ({minutes} minutes)",
 }
 
 # Stream L.L6 — counters for the adaptive tool scheduler. ``stages_total``
@@ -726,13 +730,48 @@ def build_react_graph(
         guard_sink_raw = configurable.get(GUARD_SINK_KEY)
         guard_sink = guard_sink_raw if callable(guard_sink_raw) else None
         token_tripped = token_budget is not None and token_budget.exhausted
-        budget_exhausted = (max_steps > 0 and step_count >= max_steps) or stuck or token_tripped
-        # B-85 ③ —— 盖章要盖在**知道答案的那一行**。下一行之后三个布尔就被
+        # B-302 —— 这一轮的实际运行时间(``tools.run_clock``)。主运行按检查点记账:到 80%
+        # 提醒,到 100% 并入预算用尽;委派子代不记账,到父的 80% 就地收尾、不发帧。
+        clock = run_clock.RunClock.from_config(configurable)
+        used_s = clock.used_s(state, at=run_clock.now()) if clock is not None else 0.0
+        if clock is not None:
+            deadline_tripped = used_s >= clock.limit_s
+            deadline_near = not deadline_tripped and (
+                used_s >= clock.limit_s * run_clock.NOTICE_FRACTION
+            )
+        else:
+            deadline_tripped = run_clock.past_notice(
+                run_clock.instant_from_config(configurable, run_clock.DEADLINE_NOTICE_AT_KEY)
+            )
+            deadline_near = False
+        budget_exhausted = (
+            (max_steps > 0 and step_count >= max_steps)
+            or stuck
+            or token_tripped
+            or deadline_tripped
+        )
+        # B-85 ③ —— 盖章要盖在**知道答案的那一行**。下一行之后几个布尔就被
         # 并成一个 ``budget_exhausted`` 了;再往后,撞预算走的「一次无工具的
         # 收尾轮」在 ``_should_continue`` 眼里与「模型自然说完了」逐字相同。
         budget_reason = budget_exit_reason(
-            max_steps=max_steps, step_count=step_count, stuck=stuck, token_tripped=token_tripped
+            max_steps=max_steps,
+            step_count=step_count,
+            stuck=stuck,
+            token_tripped=token_tripped,
+            deadline_tripped=deadline_tripped,
         )
+        # B-302 —— 时限提醒只在没撞预算时出;「已提醒」跟着这一步的每个出口写。
+        deadline_notice = deadline_near and not budget_exhausted
+        deadline_first_notice = deadline_notice and not state.get(run_clock.WARNED_KEY)
+
+        def _clock_fields() -> dict[str, Any]:
+            """这一步落 state 的记账(三个键一起写)+「已提醒」;每个出口现算一次。"""
+            fields: dict[str, Any] = (
+                clock.checkpoint(state, at=run_clock.now()) if clock is not None else {}
+            )
+            if deadline_first_notice:
+                fields[run_clock.WARNED_KEY] = True
+            return fields
 
         # Stream TE-6 — bind active specs plus any deferred tools the run has
         # promoted via ``find_tools`` (carried per-thread on AgentState, so the
@@ -1164,6 +1203,7 @@ def build_react_graph(
                 content=build_wrapup_instruction(
                     reason=budget_reason,
                     max_steps=max_steps,
+                    limit_minutes=clock.limit_s / 60 if clock is not None else None,
                     unresolved_failures=len(state.get("unresolved_failures") or []),
                     artifacts=_recorded_artifact_count(configurable) if saves_artifacts else None,
                     open_plan_steps=(
@@ -1174,9 +1214,10 @@ def build_react_graph(
                 ),
                 additional_kwargs={HIDE_FROM_UI: True},
             )
+        # B-302 —— 时限提醒出了就不再出步数预警那句「继续做」:两条意思相反,时限优先。
         step_notice = (
             None
-            if budget_exhausted
+            if budget_exhausted or deadline_notice
             else step_budget_notice(
                 step_count=step_count, max_steps=max_steps, registers=saves_artifacts
             )
@@ -1209,6 +1250,13 @@ def build_react_graph(
         # 两条都有时步数预警在前(B-226 ②)。
         if step_notice is not None:
             messages = _append_tail_human_message(messages, step_notice)
+        if deadline_notice and clock is not None:
+            messages = _append_tail_human_message(
+                messages,
+                run_clock.deadline_notice_text(
+                    used_s=used_s, limit_s=clock.limit_s, registers=saves_artifacts
+                ),
+            )
         if not budget_exhausted and token_budget is not None and token_budget.warning:
             messages = _append_tail_human_message(
                 messages,
@@ -1341,6 +1389,17 @@ def build_react_graph(
                         detail={"streak": loop_trip_count, "max": no_progress_limit},
                     ),
                 )
+            # B-302 —— 只有主运行(按检查点记账的那一个)到 100% 才发;子代到父的 80% 收尾时
+            # 主运行还在继续,发 ``tripped`` 会让对接方以为这一轮已经结束。
+            if deadline_tripped and clock is not None:
+                await emit_guard_frame(
+                    guard_sink,
+                    build_guard_frame(
+                        kind="tripped",
+                        guard="deadline",
+                        detail={"used_s": round(used_s), "limit_s": round(clock.limit_s)},
+                    ),
+                )
             logger.warning("agent.budget_graceful_wrapup step=%d max=%d", step_count, max_steps)
         elif token_budget is not None and token_budget.warning:
             # B3 — 80% 预警:首跨发一条 warning 帧(flag 挂共享对象,全树一次);
@@ -1420,6 +1479,17 @@ def build_react_graph(
                 ),
             )
             logger.info("agent.step_budget_warning step=%d max=%d", step_count, max_steps)
+        # B-302 —— 时限 80% 的一次性预警帧,同步数预警:这一步的调用返回之后才发。
+        if deadline_first_notice and clock is not None:
+            await emit_guard_frame(
+                guard_sink,
+                build_guard_frame(
+                    kind="warning",
+                    guard="deadline",
+                    detail={"used_s": round(used_s), "limit_s": round(clock.limit_s)},
+                ),
+            )
+            logger.info("agent.deadline_warning used_s=%d limit_s=%d", used_s, clock.limit_s)
 
         # B3 — count the INITIAL response's real spend right where it
         # resolves (cache hit or fresh call), before screen/judge below can
@@ -1471,6 +1541,7 @@ def build_react_graph(
                     "step_count": step_count + 1,
                     "step_count_refund_pending": 0,
                     **step_warned,
+                    **_clock_fields(),  # B-302
                 }
 
         # B-186 —— 思考完停住、一个字的回答都没有。路由照旧交回半截(规划 / 复盘把空回复
@@ -1528,6 +1599,7 @@ def build_react_graph(
                 "step_count": step_count + 1,
                 "step_count_refund_pending": 0,
                 **step_warned,
+                **_clock_fields(),  # B-302
             }
 
         # Stream RT-1 PR-3 (RT-ADR-4) — structured finalization. Only a
@@ -1711,6 +1783,7 @@ def build_react_graph(
                 # exactly one turn (next turn diffs against this value).
                 "last_plan_goal": current_goal,
                 **step_warned,  # B-226 ②
+                **_clock_fields(),  # B-302
             }
             if demoted_tools:
                 update_mw["promoted_tools"] = {"remove": demoted_tools}
@@ -1749,6 +1822,7 @@ def build_react_graph(
             "escalate_next": False,  # CM-9 — no middleware chain, reset
             "last_plan_goal": current_goal,  # CM-11 — rebaseline the goal
             **step_warned,  # B-226 ②
+            **_clock_fields(),  # B-302
         }
         if demoted_tools:
             update_plain["promoted_tools"] = {"remove": demoted_tools}
@@ -2031,6 +2105,7 @@ def build_react_graph(
             turn_image_refs=state.get("turn_image_refs"),
             viewed_figures=state.get("viewed_figures"),
             figure_reads=state.get("figure_reads"),
+            run_state=state,
         )
         # Stream TE-2 — per-tool-call audit sink (may be None on the dev /
         # unit-test path; ``_dispatch_tool`` treats the emit as best-effort).
@@ -3286,7 +3361,12 @@ def _exit_reason_for(messages: Sequence[BaseMessage], *, budget_reason: str | No
 
 
 def budget_exit_reason(
-    *, max_steps: int, step_count: int, stuck: bool, token_tripped: bool
+    *,
+    max_steps: int,
+    step_count: int,
+    stuck: bool,
+    token_tripped: bool,
+    deadline_tripped: bool = False,
 ) -> str | None:
     """B-85 ③ —— 预算用尽时是**哪一种**用尽,没用尽返回 ``None``。
 
@@ -3303,6 +3383,8 @@ def budget_exit_reason(
         return "no_progress"
     if token_tripped:
         return "token_budget"
+    if deadline_tripped:  # B-302 —— 这一轮的实际运行时间用完(取值顺序排最后)
+        return "deadline"
     return None
 
 
@@ -3310,6 +3392,7 @@ def build_wrapup_instruction(
     *,
     reason: str,
     max_steps: int,
+    limit_minutes: float | None = None,
     unresolved_failures: int,
     artifacts: int | None,
     open_plan_steps: int | None,
@@ -3319,12 +3402,20 @@ def build_wrapup_instruction(
     旧措辞要模型「写出最好的、完整的最终答复」, 实测模型照此宣布「已交付、已核验」,
     而这一轮一个产物都没登记。改成固定的英文措辞, 只有上限与计数是动态的, 不解析
     任何模型文字。``reason`` 是 :func:`budget_exit_reason` 的取值(文字与 ``exit_reason``
-    一致)。``artifacts=None``(没绑 ``save_artifact`` / 本 run 没有登记记录器)去掉登记
+    一致)。``limit_minutes``(B-302)= 时限分钟数,只有 ``deadline`` 用;子代没有时限秒数,
+    传 ``None``,文字只说「time limit」。
+    ``artifacts=None``(没绑 ``save_artifact`` / 本 run 没有登记记录器)去掉登记
     那一项和「只有登记过的才算交付」那一句;``open_plan_steps=None``(没有计划)去掉计划那一项。
     这条指令落库, 下一轮的模型也读得到:「不能调工具」只说本 run / 这条回复, 不能让下一轮
     (用户说「继续」, 新的 run 有工具)也不敢调。
     """
-    limit = _WRAPUP_LIMIT_TEXT[reason].format(max_steps=max_steps)
+    if reason == "deadline" and limit_minutes is None:
+        limit = "time limit"  # B-302 —— 子代没有时限秒数
+    else:
+        limit = _WRAPUP_LIMIT_TEXT[reason].format(
+            max_steps=max_steps,
+            minutes=run_clock.format_minutes((limit_minutes or 0) * 60),
+        )
     record: list[str] = []
     if artifacts is not None:
         record.append(f"{artifacts} deliverable(s) registered with save_artifact")
@@ -4484,6 +4575,7 @@ def _build_tool_context(
     turn_image_refs: list[str] | None = None,
     viewed_figures: list[str] | None = None,
     figure_reads: list[dict[str, Any]] | None = None,
+    run_state: Mapping[str, Any] | None = None,
 ) -> ToolContext:
     """Lift tenant / user binding out of ``config["configurable"]`` into
     a :class:`ToolContext`. Missing values fall through as ``None`` —
@@ -4497,6 +4589,12 @@ def _build_tool_context(
     ``plan`` (Stream K.K8) carries the current ``AgentState.plan`` so the
     ``update_plan`` builtin can keep the original goal when revising
     steps. ``None`` for react-mode runs.
+
+    ``run_state`` (B-302) is the graph state the tools node dispatches from: a
+    run whose config carries a segment token gets its 80% / 100% instants
+    worked out from the active seconds recorded there. Without it (or without
+    a token) the two instants come from the config as given — a delegated
+    child's are its parent's.
     """
     configurable = config.get("configurable") or {}
     tenant_id = _parse_uuid(configurable.get("tenant_id"))
@@ -4504,11 +4602,20 @@ def _build_tool_context(
     user_id = _parse_uuid(configurable.get("user_id"))
     thread_id = _parse_uuid(configurable.get("thread_id"))
     trigger_origin = bool(configurable.get("trigger_origin", False))
-    # Mini-ADR J-40 — global deadline lands in config["configurable"]
-    # ["deadline_at"] (a ``time.monotonic`` timestamp). ``None`` when the
-    # manifest carries no ``policies.run_deadline_s``.
-    deadline_raw = configurable.get("deadline_at")
-    deadline_at = float(deadline_raw) if isinstance(deadline_raw, int | float) else None
+    # Mini-ADR J-40 / B-302 — the run's deadline (and its 80% instant) as
+    # ``time.monotonic`` timestamps. The main run works them out per batch from
+    # the checkpoint's active seconds (``tools.run_clock``); a delegated child
+    # reads its parent's from config. ``None`` = no deadline.
+    clock = run_clock.RunClock.from_config(configurable)
+    if clock is not None:
+        deadline_notice_at, deadline_at = (
+            clock.instants(run_state) if run_state is not None else (None, None)
+        )
+    else:
+        deadline_at = run_clock.instant_from_config(configurable, run_clock.DEADLINE_AT_KEY)
+        deadline_notice_at = run_clock.instant_from_config(
+            configurable, run_clock.DEADLINE_NOTICE_AT_KEY
+        )
     # 1.3 Orchestrator-Worker — the per-run spawn budget is created once in
     # ``sse.run_agent`` and lives in config["configurable"]; ``None`` when the
     # feature is unwired. Read verbatim (mirrors cancellation_token).
@@ -4578,6 +4685,7 @@ def _build_tool_context(
         cancellation_token=cancellation_token(config),
         plan=plan,
         deadline_at=deadline_at,
+        deadline_notice_at=deadline_notice_at,
         worker_spawn_budget=worker_spawn_budget,
         delegation_gate=delegation_gate,
         worker_event_sink=worker_event_sink,

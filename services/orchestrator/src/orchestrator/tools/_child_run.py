@@ -67,6 +67,7 @@ from orchestrator.tools.registry import (
     ToolContext,
     ToolResult,
 )
+from orchestrator.tools.run_clock import DEADLINE_AT_KEY, DEADLINE_NOTICE_AT_KEY
 from orchestrator.trajectory import (
     TrajectoryOutcome,
     TrajectoryRecord,
@@ -106,6 +107,8 @@ _BUDGET_EXIT_NOTES: Mapping[str, str] = {
         "{max_no_progress} loop trips in this run)"
     ),
     "token_budget": "the run's token budget ran out",
+    # B-302 —— 子代到父的 80% 就地收尾,把已有结果交回。
+    "deadline": "reached the time limit of the run that delegated it",
 }
 
 _children_seeded_with_attachments = expert_work_counter(
@@ -1045,8 +1048,12 @@ def _child_config(ctx: ToolContext, *, sub_thread_id: UUID, sub_run_id: UUID) ->
         # ``orchestrator.context`` 上死掉(实测 ImportError)。字面量与常量的一致性
         # 由 ``test_mcp_arg_bindings_wiring`` 里那条断言钉住,不靠人记得。
         configurable["prompt_inputs"] = dict(ctx.prompt_inputs)
+    # B-302 —— 子代只拿父算好的两个绝对时刻(80% 与 100%),不带时限秒数和本段令牌:子代
+    # 不记账(一轮一个钟),到父的 80% 就地收尾。
     if ctx.deadline_at is not None:
-        configurable["deadline_at"] = ctx.deadline_at
+        configurable[DEADLINE_AT_KEY] = ctx.deadline_at
+    if ctx.deadline_notice_at is not None:
+        configurable[DEADLINE_NOTICE_AT_KEY] = ctx.deadline_notice_at
     # B2 — 向下透传 worker 事件 sink,孙 worker 帧直达父 run bridge。
     if ctx.worker_event_sink is not None:
         configurable[WORKER_EVENT_SINK_KEY] = ctx.worker_event_sink

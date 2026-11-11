@@ -333,6 +333,7 @@ async def _build_agent(
     sandbox: RecordingSandboxRuntime,
     writer: RecordingSandboxRuntime,
     probe: _ContextProbe,
+    run_deadline_s: int = 0,
 ) -> BuiltAgent:
     pool = MCPServerPool()
     await pool.add(_SERVER, mcp)
@@ -363,6 +364,7 @@ async def _build_agent(
         prompt_jinja=jinja,
         prompt_variables=variables,
         prompt_base="项目 {{ pc }}" if jinja else "",
+        run_deadline_s=run_deadline_s,
     )
 
 
@@ -393,6 +395,7 @@ async def _stack(
     *,
     jinja: bool = True,
     gated: frozenset[str] = frozenset(),
+    run_deadline_s: int = 0,
 ) -> AsyncIterator[_Stack]:
     lifecycle = Lifecycle()
     lifecycle.mark_ready()
@@ -410,7 +413,14 @@ async def _stack(
     )
     probe = _ContextProbe()
     built = await _build_agent(
-        llm, jinja=jinja, gated=gated, mcp=mcp, sandbox=sandbox, writer=writer, probe=probe
+        llm,
+        jinja=jinja,
+        gated=gated,
+        mcp=mcp,
+        sandbox=sandbox,
+        writer=writer,
+        probe=probe,
+        run_deadline_s=run_deadline_s,
     )
     audit = _RecordingAuditStore()
     app = create_app(
@@ -522,6 +532,24 @@ async def test_a_resumed_run_that_pauses_again_still_carries_the_turn_inputs() -
         child = _build_tool_context(_child_config(ctx, sub_thread_id=uuid4(), sub_run_id=uuid4()))
         assert child.inputs_run_id == r0
         assert dict(child.prompt_inputs or {}) == _INPUTS
+
+
+@pytest.mark.asyncio
+async def test_b302_an_approval_resumed_segment_runs_under_the_time_limit() -> None:
+    """B-302 T1-5 —— 审批续跑段组运行配置时以前不写时限:续跑那一段完全不限时,派子代、
+    ``ask_image`` 都按「没有时限」处理。续跑段由 ``resolve_approval_decision`` 自己建 config。"""
+    script = [_calls(_BOUND_CALL), _calls(_PROBE_CALL), _DONE]
+    async with _stack(script, gated=frozenset({_WIRE}), run_deadline_s=600) as s:
+        _thread, r0 = await s.start(inputs=_INPUTS)
+        assert await s.wait(r0) is RunStatus.PAUSED
+        c1 = await s.decide(r0)
+        assert await s.wait(c1) is RunStatus.SUCCESS
+
+        (ctx,) = s.probe.seen
+        assert ctx.run_id == c1
+        assert ctx.deadline_at is not None
+        assert ctx.deadline_notice_at is not None
+        assert ctx.deadline_notice_at < ctx.deadline_at
 
 
 # ---------------------------------------------------------------------------

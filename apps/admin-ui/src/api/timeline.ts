@@ -89,6 +89,10 @@ function str(v: unknown): string {
 function int(v: unknown): number {
   return typeof v === "number" && Number.isFinite(v) ? v : 0;
 }
+/** Seconds → minutes, at most one decimal (B-302 deadline guard). */
+function minutes(v: unknown): number {
+  return Math.round((int(v) / 60) * 10) / 10;
+}
 function textOf(v: unknown): string | null {
   if (typeof v === "string") return v.trim() === "" ? null : v;
   // #9c — block-list content (Anthropic-style array): join the text parts,
@@ -209,7 +213,15 @@ export function parseTimeline(events: readonly SseEvent[]): TimelineItem[] {
             ? i18n.t(warn ? "console_runtime.guard_max_steps_warn" : "console_runtime.guard_max_steps", {
                 steps: int(detail.steps), max: int(detail.max),
               })
-            : i18n.t("console_runtime.guard_no_progress", { streak: int(detail.streak), max: int(detail.max) });
+            : g === "no_progress"
+              ? i18n.t("console_runtime.guard_no_progress", { streak: int(detail.streak), max: int(detail.max) })
+              : g === "deadline"
+                // B-302 — the turn's active run time (seconds on the wire, minutes on screen).
+                ? i18n.t(warn ? "console_runtime.guard_deadline_warn" : "console_runtime.guard_deadline", {
+                    used: minutes(detail.used_s), limit: minutes(detail.limit_s),
+                  })
+                // A guard this console does not know yet: its raw name, never another guard's text.
+                : i18n.t("console_runtime.guard_other", { guard: g || "?" });
       push({ kind: "guard", receivedAt: at, tone: warn ? "warn" : "bad", text });
       continue;
     }

@@ -742,7 +742,7 @@ function onPlan(data) {
 
 只有 `success` 表示子任务完成了交给它的工作，其余取值都不要显示成成功。
 
-- `max_steps`：叫停它的限制可能是子任务自己的步数上限、这次 run 的 token 预算、反复原地打转，或这次 run 的时间上限。带回的是部分结果，父 Agent 会带着它继续推理。
+- `max_steps`：叫停它的限制可能是子任务自己的步数上限、这次 run 的 token 预算、反复原地打转，或这次 run 的时间上限（这一轮的运行时间用到 80% 时，正在运行的子任务就提前收尾，把时间留给主 Agent 整合结果）。带回的是部分结果，父 Agent 会带着它继续推理。
 - `cancelled`：执行中被取消、出现意外错误，或者结束时没有给出回答。出现意外错误时这条事件照常发出。
 - `approval_blocked`：子任务里无法发起人工审批，主 Agent 会收回这部分工作。
 
@@ -820,9 +820,9 @@ function onWorker(w) {
 
 #### 什么时候发
 
-平台的三道限制预警或者真正触发时，服务端发一次到当前这条连接。三道限制是：步数上限、token 预算（这里的 token 指模型用量单位，不是 `token` 事件）、反复原地打转没有实质进展。触发限制的可能是主 Agent，也可能是它派出的[子任务](#worker)；事件本身不标明是哪一方。
+平台的四道限制预警或者真正触发时，服务端发一次到当前这条连接。四道限制是：步数上限、token 预算（这里的 token 指模型用量单位，不是 `token` 事件）、反复原地打转没有实质进展、这一轮的运行时间。前三道触发限制的可能是主 Agent，也可能是它派出的[子任务](#worker)；事件本身不标明是哪一方。运行时间只按整轮算，`deadline` 的事件只来自主 Agent。
 
-- 上限由谁设定：步数上限和无进展上限来自主 Agent 或子任务各自的配置（无进展上限没有配置时，平台规则是同一次运行里第 2 次原地打转就收尾），token 预算由平台为这次 run 设定、主 Agent 与子任务共用。调用方都不能修改，需要调整要联系租户管理员。
+- 上限由谁设定：步数上限和无进展上限来自主 Agent 或子任务各自的配置（无进展上限没有配置时，平台规则是同一次运行里第 2 次原地打转就收尾），token 预算由平台为这次 run 设定、主 Agent 与子任务共用。运行时间上限来自主 Agent 的配置，没有配置时平台默认 90 分钟；算的是这一轮（一次用户消息引出的全部运行，含审批之后的续跑）实际运行的时间，等人审批或回答澄清的时间不算。调用方都不能修改，需要调整要联系租户管理员。
 - 触发之后发生了什么：平台给触发限制的那一方追加一条收尾指令，并且这一步不再提供任何工具，只能直接作答。主 Agent 触发时，用户仍然会拿到一段完整回答，只是后续推理被截断；子任务触发时，子任务把部分结果交回主 Agent，主 Agent 可以继续工作。
 - 客户端要做什么：按「已到上限」的提示显示，不要按错误显示，也不要据此判断这一轮的结果，见下文。
 
@@ -831,7 +831,7 @@ function onWorker(w) {
 | 字段 | 类型 | 说明 |
 |---|---|---|
 | `kind` | string | 这条事件是预警还是已经触发。取值：`tripped`（限制触发，平台已经收尾）/ `warning`（预警，尚未触发）。只有这两个取值 |
-| `guard` | string | 是哪一道限制。取值：`max_steps`（步数上限）/ `token_budget`（token 预算）/ `no_progress`（反复原地打转没有实质进展）。只有这三个取值 |
+| `guard` | string | 是哪一道限制。取值：`max_steps`（步数上限）/ `token_budget`（token 预算）/ `no_progress`（反复原地打转没有实质进展）/ `deadline`（这一轮的运行时间）。将来新增取值是向后兼容的追加，遇到不认识的取值按「某道限制已预警或触发」显示它的原名即可 |
 | `detail` | object | 这道限制当前的两个数值，字段名随 `guard` 变化，见下表 |
 
 `detail` 里的字段：
@@ -844,10 +844,12 @@ function onWorker(w) {
 | `token_budget` | `limit` | integer | 平台为这次 run 设定的 token 预算 |
 | `no_progress` | `streak` | integer | 这次运行里原地打转被拦下的累计次数（中间正常走了几步也不清零） |
 | `no_progress` | `max` | integer | 第几次被拦下就收尾：配了就是配置值，没配是平台规则的 2 |
+| `deadline` | `used_s` | integer | 这一轮已经实际运行的秒数（不含等人审批或回答澄清的时间） |
+| `deadline` | `limit_s` | integer | 这一轮的运行时间上限（秒）：主 Agent 配置的值，没配是平台默认的 5400 |
 
-三道限制的 `tripped` 出自同一个判断，因此同一步可能一次到达两条或三条 `tripped`，客户端不要假设一轮只有一条。
+四道限制的 `tripped` 出自同一个判断，因此同一步可能一次到达多条 `tripped`，客户端不要假设一轮只有一条。
 
-会发 `warning` 的是 `token_budget` 与 `max_steps`：`token_budget` 在用量达到预算 80% 时发一次，整棵委托树只发一次；`max_steps` 在剩下的步数不超过 `max(2, 上限 ÷ 6 向下取整)` 时发一次（上限 48 步的 Agent 在已执行 40 步时发），主 Agent 和每个子任务各按自己的步数上限最多发一次。`no_progress` 当前只有 `tripped`，没有预警，不要写一个等待它预警的分支，那个分支不会被触发。`warning` 比 `tripped` 轻，只表示接近上限，不代表任何收尾动作已经发生。
+会发 `warning` 的是 `token_budget`、`max_steps` 与 `deadline`：`token_budget` 在用量达到预算 80% 时发一次，整棵委托树只发一次；`max_steps` 在剩下的步数不超过 `max(2, 上限 ÷ 6 向下取整)` 时发一次（上限 48 步的 Agent 在已执行 40 步时发），主 Agent 和每个子任务各按自己的步数上限最多发一次；`deadline` 在这一轮的运行时间用到 80% 时发一次，此后平台提醒助手不再开始新的核对、用已有的结果交付（主 Agent 已收到 `deadline` 的 `warning` 之后，步数上限的 `warning` 不再出现）。`deadline` 的 `warning` 之后，正在运行的子任务会提前把部分结果交回主 Agent，平台也不再派出新的子任务，这些都不另发事件；`deadline` 的 `tripped` 只在主 Agent 到点时发。`no_progress` 当前只有 `tripped`，没有预警，不要写一个等待它预警的分支，那个分支不会被触发。`warning` 比 `tripped` 轻，只表示接近上限，不代表任何收尾动作已经发生。
 
 **这一轮有没有把事做成，只看 `end` 的 `completed`**，不要从 `guard` 事件推断。主 Agent 触发限制时，这一轮的 `end` 是 `status` 为 `incomplete`、`completed` 为 `false`，`exit_reason` 指出是哪一道限制；子任务触发步数上限或无进展限制时只有这个子任务收尾，主 Agent 可能照常把事做完，`end` 的 `completed` 仍是 `true`。`completed` 与 `exit_reason` 的读法见 [end](#end)。
 
@@ -872,6 +874,7 @@ const GUARD_TEXT = {
   max_steps:    (d) => `已执行 ${d.steps} 步,上限 ${d.max} 步`,
   token_budget: (d) => `已用 ${d.spent} token,预算 ${d.limit}`,
   no_progress:  (d) => `第 ${d.streak} 次原地打转(上限 ${d.max} 次)`,
+  deadline:     (d) => `已运行 ${Math.round(d.used_s / 60)} 分钟,上限 ${Math.round(d.limit_s / 60)} 分钟`,
 };
 
 function onGuard(data) {
@@ -1082,7 +1085,7 @@ run 执行失败时，服务端发一次到当前这条连接，紧接着是 `st
 | `message` | string | 失败原因的文本描述，供排查使用，不适合直接显示给终端用户 |
 | `name` | string | 服务端给这次失败的错误类型名。开放取值，会随平台演进变化，不保证任何取值的语义。不要按它写分支，只用它做日志和上报 |
 
-[guard](#guard) 的三道限制触发时不会产生这个事件：平台让助手收尾，这一轮照常以 `end` 结束。主 Agent 触发限制时，`end` 的 `status` 是 `incomplete`，不是 `success`，见 [end](#end)。
+[guard](#guard) 的四道限制触发时不会产生这个事件：平台让助手收尾，这一轮照常以 `end` 结束。主 Agent 触发限制时，`end` 的 `status` 是 `incomplete`，不是 `success`，见 [end](#end)。
 
 #### 示例
 
@@ -1200,7 +1203,7 @@ Agent 产生的文件分两种去向：一种直接写进这个终端用户的**
 | 取值 | 含义 | 客户端处理 |
 |---|---|---|
 | `success` | 这一轮跑完了，没有出错，也没有被平台的限制叫停。要做的事有没有做成，看 `completed` | 显示最终回答；`completed` 为 `false` 时同时提示这一轮没有做完 |
-| `incomplete` | 被平台的一道限制叫停：步数或 token 预算用完，或者反复原地打转。`exit_reason` 是 `max_steps`、`token_budget`、`no_progress` 之一，`completed` 恒为 `false` | 显示助手收尾时给出的回答，同时提示这一轮没有做完 |
+| `incomplete` | 被平台的一道限制叫停：步数、token 预算或这一轮的运行时间用完，或者反复原地打转。`exit_reason` 是 `max_steps`、`token_budget`、`no_progress`、`deadline` 之一，`completed` 恒为 `false` | 显示助手收尾时给出的回答，同时提示这一轮没有做完 |
 | `paused` | 停在人工审批点等待决策。这不是失败，批准或拒绝之后这一轮对话还会继续 | 显示审批界面，前面的 `approval` 事件已经给了全部信息；不要按错误显示 |
 | `interrupted` | run 被中断，例如调用方主动取消。取消不会另外发 `error` 事件 | 按「已取消」处理，不必重试 |
 | `error` | 执行失败，包括执行出错和超时 | 按失败处理，细节见 [8 错误码总表](./errors) |
@@ -1235,6 +1238,7 @@ const ok = data.status === "success" && data.completed !== false;
 | `max_steps` | 这一轮的步数预算用尽，平台让助手用现有结果收尾（`status` 为 `incomplete`） | 否 |
 | `no_progress` | 助手反复原地打转（重复同样的工具调用），平台判定卡住并收尾（`status` 为 `incomplete`） | 否 |
 | `token_budget` | 这一轮的 token 预算用尽（`status` 为 `incomplete`） | 否 |
+| `deadline` | 这一轮实际运行的时间用尽，平台让助手用现有结果收尾（`status` 为 `incomplete`）。等人审批或回答澄清的时间不算在内 | 否 |
 | `approval_pending` | 停在人工审批点（对应 `status` 的 `paused`） | 否 —— 批准之后这一轮会接着跑 |
 | `approval_rejected` | 强制审批被拒绝，这一轮就此终止。其他审批被拒绝时 run 继续，不会出现这个取值 | 否 |
 

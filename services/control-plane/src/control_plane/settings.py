@@ -859,13 +859,15 @@ class Settings(BaseSettings):
     #: tools verbatim (still a subset of what the parent itself had).
     dynamic_worker_allowed_toolsets: list[str] = Field(default_factory=list)
 
-    #: Platform-default wall-clock floor (seconds) for a run's deadline,
-    #: applied when a manifest leaves ``policies.run_deadline_s`` at 0. A
-    #: generous safety net so an unconfigured run cannot run unbounded on
-    #: wall-clock (steps can be minutes); an agent that genuinely needs
-    #: longer raises ``run_deadline_s`` explicitly. 3600 = 1h; 0 disables
-    #: the floor (opt every run back to manifest-only). Capped at 24h.
-    default_run_deadline_s: int = Field(default=3600, ge=0, le=86400)
+    #: Platform-default limit (seconds) on a turn's active run time, applied
+    #: when a manifest leaves ``policies.run_deadline_s`` at 0. Time waiting on
+    #: a human (approval / clarification) and time with no replica running the
+    #: turn are not counted (B-302). At 80% the run is told to stop new checks
+    #: and deliver what it has; at 100% it wraps up without tools
+    #: (``exit_reason=deadline``). An agent that genuinely needs longer raises
+    #: ``run_deadline_s`` (86400 effectively turns it off). 5400 = 90 min; 0
+    #: disables the platform default (agents that set their own still apply).
+    default_run_deadline_s: int = Field(default=5400, ge=0, le=86400)
 
     # --------------------------------------------------- memory consolidator (Sprint #7)
     #: Capability Uplift Sprint #7 (Mini-ADR U-34) — MemoryConsolidator

@@ -276,6 +276,15 @@ class AgentState(TypedDict):
     #: 挂在本图的 state 上:每个子代有自己的步数上限;审批续跑带着它接着跑;
     #: ``api/runs.py`` 的每轮图输入把它清回 ``False``。
     step_budget_warned: NotRequired[bool]
+    #: B-302 —— 这一轮已经实际运行了多少秒(等人审批、实例挂掉的时间不算;孤儿恢复接着算)、
+    #: 上次记账的单调时刻、上次记账时运行配置里的本段令牌。**三个键永远在同一次状态更新里
+    #: 一起写**(``tools.run_clock.RunClock.checkpoint``),只写 ``agent_node``;运行配置里没有
+    #: 令牌(不限时)的路径和委派子代都不写。``api/runs.py`` 的每轮图输入一起清掉。
+    run_active_s: NotRequired[float]
+    run_clock_mark: NotRequired[float | None]
+    run_clock_segment: NotRequired[str | None]
+    #: B-302 —— 本轮已发过时限 80% 的 ``warning`` 帧(只发一次);每轮清零。
+    deadline_warned: NotRequired[bool]
     #: Stream CM-11 — the plan goal as of the previous agent turn. agent_node
     #: sets it each turn to the current ``plan.goal`` (``None`` for react
     #: graphs). A change versus the live plan goal — a re-plan, or a human
@@ -318,10 +327,10 @@ class AgentState(TypedDict):
     #: B-85 ③ —— run 从哪个出口结束的,由**知道答案的那一行**盖章。
     #:
     #: 封闭取值:``text_response`` / ``max_steps`` / ``no_progress`` /
-    #: ``token_budget`` / ``approval_pending`` / ``approval_rejected``。
+    #: ``token_budget`` / ``deadline`` / ``approval_pending`` / ``approval_rejected``。
     #:
     #: 不在 ``_should_continue`` / ``_after_tools`` 里盖 —— 它们是 LangGraph 的
-    #: conditional-edge 函数,只返回路由、不写 state;而且撞预算的三种情况走的是
+    #: conditional-edge 函数,只返回路由、不写 state;而且撞预算的四种情况走的是
     #: 「一次无工具的收尾轮」,到了路由那一步与自然结束**逐字相同**,分不出来。
     exit_reason: NotRequired[str]
     subagent_invocations: NotRequired[Annotated[list[SubAgentInvocation], add]]

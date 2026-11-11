@@ -22,7 +22,6 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import time
 from collections.abc import Iterator
 from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
@@ -60,6 +59,7 @@ from orchestrator.tools.registry import (
     WORKSPACE_LAYOUT_KEY,
     WORKSPACE_MIGRATED_KEY,
 )
+from orchestrator.tools.run_clock import run_segment_config
 
 logger = logging.getLogger("expert_work.control_plane.run_queue_worker")
 
@@ -393,8 +393,8 @@ class RunQueueWorker:
                 configurable[WORKSPACE_MIGRATED_KEY] = True
             if prepared.cleaned:
                 configurable[WORKSPACE_CLEANED_KEY] = True
-            if built.run_deadline_s > 0:
-                configurable["deadline_at"] = time.monotonic() + float(built.run_deadline_s)
+            # B-302 —— 时限与本段令牌(与 ``api/runs._start_run`` 同一个函数)。
+            configurable.update(run_segment_config(built.run_deadline_s))
             if replay:
                 # B-66 —— 与 ``spawn_run`` 同一条:重放轮不查响应缓存。
                 configurable[LLM_CACHE_BYPASS_KEY] = True

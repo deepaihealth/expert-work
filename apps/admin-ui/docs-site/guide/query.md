@@ -300,7 +300,7 @@ GET /v1/agents/{agent_code}/runs
 | `superseded_by` | string（UUID） \| null | 取代这一轮的新 `run_id`；没有被取代时是 `null`。含义见 [2.10 重新生成与编辑重发](./chat#_2-10-重新生成与编辑重发) |
 | `regenerated_from` | string（UUID） \| null | 这一轮是对哪一轮的重新生成或者编辑重发；不是重来的一轮时是 `null` |
 | `completed` | boolean \| null | 这次 run 有没有把要做的事做成，与 [3.4 的 `end`](./sse-events#end) 里的同名字段相同。`null` 表示没有记录，多见于失败、被取消、还没结束的 run 与平台升级前的历史 run，不要当成 `false` |
-| `exit_reason` | string \| null | 这次 run 从哪个出口结束，`null` 的含义与 `completed` 相同。取值：`text_response`（助手自然说完）/ `max_steps`（步数用完）/ `no_progress`（反复原地打转）/ `token_budget`（token 预算用完）/ `approval_pending`（停在人工审批处）/ `approval_rejected`（审批被拒绝）；遇到不认识的取值时按「没有正常完成」处理 |
+| `exit_reason` | string \| null | 这次 run 从哪个出口结束，`null` 的含义与 `completed` 相同。取值：`text_response`（助手自然说完）/ `max_steps`（步数用完）/ `no_progress`（反复原地打转）/ `token_budget`（token 预算用完）/ `deadline`（这一轮的运行时间用完，不含等人审批的时间）/ `approval_pending`（停在人工审批处）/ `approval_rejected`（审批被拒绝）；遇到不认识的取值时按「没有正常完成」处理 |
 | `unresolved_failures` | array \| null | 因为工具失败没做成时，是哪些工具。元素结构与 [3.4 的 `end`](./sse-events#end) 里的同名字段相同（`{tool, kind}`，最多 20 个）；`[]` 表示没有。`null` 表示没有记录，按「不清楚」处理，平台升级前的历史 run 可能 `completed` 有值而这里是 `null` |
 | `started_at` | string（ISO 8601） \| null | 开始执行的时间。还没开始执行，或者是平台升级前的历史 run 时为 `null`；执行中途改由另一个服务端实例接手时不变 |
 | `heartbeat_at` | string（ISO 8601） \| null | 只在还没有进入最终状态的 run 上出现：执行这次 run 的服务端实例最近一次确认自己仍在执行的时间；还没开始执行时为 `null` |

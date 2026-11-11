@@ -1120,13 +1120,14 @@ class PolicySpec(BaseModel):
         ge=0,
         le=86400,
         description=(
-            "Mini-ADR J-40 (J.4-补强-2) — wall-clock cap on the whole "
-            "run *including any sub-agent recursion*. ``0`` (default) "
-            "disables the deadline. When > 0, ``sse.run_agent`` "
-            "computes ``deadline_at = time.monotonic() + run_deadline_s`` "
-            "once and threads it through config; SubAgentTool checks "
-            "the value before each delegation and propagates to child "
-            "config unchanged (the child does not reset)."
+            "Longest active run time of one turn, in seconds, including any "
+            "delegated sub-agents. Time spent waiting for a human (approval / "
+            "clarification) is not counted. ``0`` (default) = the platform "
+            "default (90 minutes unless the platform changes it). At 80% the "
+            "run is told to stop new checks and deliver what it has; at the "
+            "limit it stops calling tools and writes the final reply from what "
+            "it has (``exit_reason=deadline``). "
+            "86400 (the maximum) effectively removes the limit."
         ),
     )
     token_budget: int = Field(

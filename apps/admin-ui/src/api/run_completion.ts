@@ -16,6 +16,8 @@ const EXIT_REASON_KEYS: ReadonlyMap<string, string> = new Map([
   ["max_steps", "console_runtime.exit_reason_max_steps"],
   ["token_budget", "console_runtime.exit_reason_token_budget"],
   ["no_progress", "console_runtime.exit_reason_no_progress"],
+  // B-302 — the turn's active run time ran out.
+  ["deadline", "console_runtime.exit_reason_deadline"],
   ["approval_rejected", "console_runtime.exit_reason_approval_rejected"],
   // The model stopped on its own, but a tool failure was never recovered.
   ["text_response", "console_runtime.exit_reason_text_response"],

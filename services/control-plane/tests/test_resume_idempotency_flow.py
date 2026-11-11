@@ -132,6 +132,7 @@ class _FakeRuntime:
             tool_replay_safe=None,
             trajectory_recording=True,
             token_budget=0,
+            run_deadline_s=0,  # B-302 —— 续跑段也写时限(0 = 不限)
             worker_max_concurrent=None,
             worker_max_per_run=None,
         )

@@ -45,10 +45,12 @@ class BuiltAgent:
     #: The control-plane run assembler uses this to decide whether to
     #: emit a multimodal ``HumanMessage`` or a plain-text one.
     supports_vision: bool = False
-    #: Mini-ADR J-40 (J.4-补强-2) — wall-clock cap on the whole run
-    #: including sub-agent recursion, in seconds. ``0`` disables the
-    #: deadline. ``sse.run_agent`` reads this to compute
-    #: ``deadline_at = time.monotonic() + run_deadline_s`` once per run.
+    #: Mini-ADR J-40 (J.4-补强-2) — limit on a turn's active run time
+    #: including sub-agent recursion, in seconds (manifest value, else the
+    #: platform default). ``0`` = no limit. Every run entry point writes it
+    #: into config with a fresh segment token (B-302,
+    #: ``tools.run_clock.run_segment_config``); the active seconds are kept in
+    #: the checkpoint.
     run_deadline_s: int = 0
     #: No-progress stop — the run force-wraps up early at its Nth loop-detection
     #: trip (0 = the platform rule, the 2nd trip). Seeds ``max_no_progress``

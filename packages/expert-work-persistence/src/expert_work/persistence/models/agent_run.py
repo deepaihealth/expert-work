@@ -95,7 +95,7 @@ class AgentRunRow(Base):
     # 那些洗白,两种都是在没有证据的地方造证据。
     #
     # ``exit_reason`` 封闭取值:text_response / max_steps / no_progress /
-    # token_budget / approval_pending / approval_rejected。
+    # token_budget / deadline / approval_pending / approval_rejected。
     completed: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
     exit_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
     # B-226 ⑥ (migration 0178) — the run's final failure ledger as
