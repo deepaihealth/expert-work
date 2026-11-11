@@ -448,7 +448,7 @@ List the documents of the knowledge bases knowledge_search searches: reference, 
 
 ### 4.1 对接方
 
-已有接口不变。R2 / R3 开关开了且智能体用到时,工具调用事件里会出现两个新的工具名;对外文档里没找到「工具名是开放集合」的明文(V10),按「已有枚举新增取值」提前通知。深护智康的对接不需要改代码。
+已有接口不变。R2 / R3 开关开了且智能体用到时,工具调用事件里会出现两个新的工具名,出处里会出现表格这种新形状;对外文档里没找到「工具名是开放集合」的明文(V10),按「已有枚举新增取值」提前通知 —— 新工具名由 L1、D2 各自写进更新记录,表格出处由 D3 写。深护智康的对接不需要改代码。
 
 ### 4.2 已有的库与文档
 
@@ -474,7 +474,7 @@ List the documents of the knowledge bases knowledge_search searches: reference, 
 | 交界 | 事实 | 怎么处理 |
 |---|---|---|
 | R3 的清单与总数 | 一个 FAQ 库只有一份「系统文档」,条目是它的段;FAQ 设计要求列出时标明类型并给条目数 | 清单那一行加类型和条目数;总数把 FAQ 库单独数(「N 份文档 + M 个问答库」) |
-| 4a 的识别函数被三处扩展 | 本文加 `#T<数字>`(表);FAQ 用 `#<数字>`(不需要新写法);4c(第 3 版 `422bf5a08`)加 `@<6~16 位十六进制>`(图) | 三种写法按 `#` / `@` 后的第一个字符就能分开(对着 4a 的实现验证,V14);谁后合谁加一条三种写法放在一起的单测 |
+| 4a 的识别函数被三处扩展 | 本文加 `#T<数字>`(表);FAQ(`19028ae03`)用 `#<数字>`(不需要新写法);4c(`b00795c66`)加 `@<6~16 位十六进制>`(图) | 三种写法按 `#` / `@` 后的第一个字符就能分开(对着 4a 的实现验证,V14)。协调人定的扩展顺序:4c 的 G2 → 本文的 D3 → FAQ 的 F3b;后合的补上把已有写法放在一起的联合单测 |
 | 知识库路由的权限资源 | FAQ 设计写了「4b 的 P1 先合时资源名改成 `knowledge`」 | P1 随 R1 搁置(§0.2 第 6 条):FAQ 的新路由用 `manifest`。R1 启动时 P1 一并替换 |
 | R2 与 FAQ | FAQ 的批量导入文件不是知识库文档 | 不产生表格数据 |
 
@@ -494,12 +494,12 @@ List the documents of the knowledge bases knowledge_search searches: reference, 
 
 ### 5.2 R2
 
-**第 0 步(D2 的第一步,结果决定走不走 §3.1.7 的退路;除最后一行外不花模型钱)**:
+**第 0 步(D2 的第一步,结果决定走不走 §3.1.7 的退路;除最后一行外不花模型钱)**。它可以提前作为独立探针先做,不必等 D1 合并:依赖与镜像、安全对照、方言这三项只需要装上 DuckDB 和手写的小表;装载与查询那一项只需要按 §3.1.2 的格式合成两种形状的字节(格式是本文定的,不需要 D1 的代码),只有「主进程读出」这一段要等 D1 的存储才能在真栈上复量。
 
 | 探针 | 做法 | 判据(事先定) |
 |---|---|---|
 | 依赖 | 钉住的版本在 x86-64 与 arm64 的 Python 3.12 上都有预编译包;不联网、不装扩展可用;镜像增加多少 | 不成立 → 换版本;都不行走第二档 |
-| 装载与查询 | 在**执行容器的限额下**(1 核、1.5 GiB、每查询 512 MiB)量两种形状(50,000 行 × 20 列;5,000 行 × 200 列)和「一次装 200 万格」:字节数、主进程读出与传送的耗时和内存峰值、起一次性进程 + 导入 + 装载的耗时、四种查询(全表计数、分组求和、两个条件筛选 + 排序、按月分组)各 20 次 | 从调用到返回的第 95 百分位 ≤ 3 秒 → 上限照用;否则按 §3.1.7 降上限 |
+| 装载与查询 | 在**执行容器的限额下**(1 核、1.5 GiB、每查询 512 MiB)量两种形状(50,000 行 × 20 列;5,000 行 × 200 列)和「一次装 200 万格」:字节数、主进程读出与传送的耗时和内存峰值、起一次性进程 + 导入 + 装载的耗时、四种查询(全表计数、分组求和、两个条件筛选 + 排序、按月分组)各 20 次 | 从调用到返回的第 95 百分位 ≤ 3 秒 → 上限照用;否则按 §3.1.7 降上限。**主进程内存**:控制面的余量只有约 98 MiB,所以一次查询交给执行容器的字节合计不许超过 16 MiB(代码里硬卡,超了让模型少选文档),并且从库里边读边传、不留第二份;过线 = 两个查询并发时主进程峰值增加 ≤ 48 MiB。超了就把 16 MiB 往下调到达标 |
 | 安全对照 | 见下 | 全部按预期;否则走第一档 |
 | 方言 | 四家模型(GLM / DeepSeek / Qwen / 豆包)各拿开发组 10 题的「表结构 + 问题」写一条语句,本地执行看能不能跑、对不对 | 不设线,如实报;几元钱,开跑前报价 |
 
@@ -566,7 +566,7 @@ List the documents of the knowledge bases knowledge_search searches: reference, 
 
 - **护栏(R2 + R3 一起)**:两个开关开 / 关各跑两次(3 票判分)。退步 = 关着两次都对、开着两次都不对的题。两套题都跑、分开报:
   - 现有普通集的有答案题 20 道:其中**固定至少 8 道的答案出自文字型的表格文件**(问答表、清单这一类,单独报 —— 量这类库的智能体有没有被表格工具和提示行带偏),其余用固定种子随机抽。线:退步 ≤ 1 道,且那 8 道里退步 0 道。
-  - **通用合成集**(定义见 4a 设计:合同条款、SOP、会议纪要、接口 / 代码文档四个领域,约 40 题):按领域报;线:每个领域退步 ≤ 1 道。4a 的这套集没建好之前,本项不算验收完成。
+  - **通用合成集**(定义见 4a 设计 `1f801be0c` §5.0:合同条款、SOP、会议纪要、接口 / 代码文档四个领域各 10 题共 40 题,每领域一个库):按领域报;线:每个领域退步 ≤ 1 道 —— **这条线是 4b 自己加的**(4a 在这套集上除硬红线外只报数)。这套集没建好之前,本项不算验收完成。
 
 ### 5.4 花费(只给算法;开跑前按当时的记录出报价,用户说「跑」再跑)
 
@@ -579,7 +579,7 @@ List the documents of the knowledge bases knowledge_search searches: reference, 
 | R2 四家方言冒烟 | 40 | ¥38(按默认单价估,各家价目另算) |
 | R3:验收 10 × 2 × 2 + 开发 10 × 最多 3 轮 | 70 | ¥67 |
 | 护栏:现有集 20 × 2 × 2 | 80 | ¥77 |
-| 护栏:通用合成集约 40 × 2 × 2(本版新增) | 160 | ¥154 |
+| 护栏:通用合成集 40 × 2 × 2 | 160 | ¥154 |
 | **小计** | 560 | **估算约 ¥538**(上一版约 ¥384) |
 | R4:30 条 × 5 次 = 150 次多轮对话 | 150 | 没有可用单价;开跑前先实测 3 条再报价 |
 | **合计** | | **估算约 ¥538 + R4(待实测)** |
@@ -595,11 +595,11 @@ List the documents of the knowledge bases knowledge_search searches: reference, 
 | # | PR | 内容 | 主要改动文件 | 依赖 | 测试 |
 |---|---|---|---|---|---|
 | 1 | **E0b** 评测地基 | 合成工作簿与 csv(按 §5.2 的资料矩阵)、R2 / R3 的题、标准答案脚本、护栏抽样(固定种子 + 8 道文字型表格题) | `tools/eval/datasets/kb/`(新子目录)、新 `tools/eval/kb_table_cases.py` | 无 | 标准答案脚本的结果人工抽 5 题用表格软件核对 |
-| 2 | **M0** R4 测量 | 30 条新用例(至少 8 条英文或中英混合);判据按 §3.3.2 改;三个离线对照 | `tools/eval/datasets/behavior/cases/`、`behavior_coref.py`、`behavior_schema.py`、README | 无 | 对自带的合成记录汇总照常出表;三个对照按预期 |
-| 3 | **L1** 列文档(R3) | 「可服务文档」的共用判断;存储方法;工具;注册与开关;各清单;`knowledge_read` 一行提示;评测循环;管理端显示名 | 新 `tools/knowledge_list.py`;`tools/assembly.py:476-501`;`persistence/knowledge/{base,sql,memory}.py`;`protocol/agent_spec.py:1408-1418`;`tools/overflow.py:124-126`;`graph_builder/outgoing_reference.py:45`;`tools/knowledge_read.py:413-418`;`settings.py`;`tools/eval/kb_agent_answer.py`;`admin-ui/src/api/tool_timeline.ts`、`i18n` | E0b | 见下 |
+| 2 | **M0** R4 测量 | 30 条新用例(至少 8 条英文或中英混合);判据按 §3.3.2 改;三个离线对照 | `tools/eval/datasets/behavior/cases/`、`behavior_coref.py`、`behavior_schema.py`、README | 代码无依赖;**测量本身要等 #2066 发到测试环境**(总计划 R4) | 对自带的合成记录汇总照常出表;三个对照按预期 |
+| 3 | **L1** 列文档(R3) | 「可服务文档」的共用判断;存储方法;工具;注册与开关;各清单;`knowledge_read` 一行提示;评测循环;管理端显示名;FAQ 库在清单里标类型与条目数(与 FAQ 的 F3a 谁后合谁补);对外更新记录以「待发布」列出新工具名 | 新 `tools/knowledge_list.py`;`tools/assembly.py:476-501`;`persistence/knowledge/{base,sql,memory}.py`;`protocol/agent_spec.py:1408-1418`;`tools/overflow.py:124-126`;`graph_builder/outgoing_reference.py:45`;`tools/knowledge_read.py:413-418`;`settings.py`;`tools/eval/kb_agent_answer.py`;`admin-ui/src/api/tool_timeline.ts`、`i18n`;`docs-site/guide/changelog.md` | E0b | 见下 |
 | 4 | **D1** 表格:存储与入库(不含 DuckDB) | 迁移;读表、定类型、标不规整;写压缩 CSV 字节与说明;同事务清 / 写;补算命令(带围栏);文档两个只读字段与详情页;开关 | 新迁移;新 `knowledge/table_data.py`、`knowledge/backfill_tables.py`;`knowledge/office_xlsx.py:53-100`;`knowledge/ingestion.py:545-702,862-934`;`persistence/knowledge/{base,sql,memory}.py`、`persistence/models/knowledge.py`;`protocol/knowledge.py:441-507`;`api/knowledge.py`(文档序列化处);文档详情页、`i18n` | E0b | 见下 |
-| 5 | **D2** 表格:执行容器与工具 | **第一步是第 0 步**(加 `duckdb` 钉版本、探针脚本、安全对照),过了才往下;执行服务(一次性进程:装载 → 锁死 → 判语句 → 执行 → 限额);部署清单加容器,内存预算测试加一条;报错三类;工具;按「有没有表」门控与构建缓存键;停用 / 改过段的判断;`notice` 提示行;各清单;评测循环;管理端显示名 | `services/control-plane/pyproject.toml`、`uv.lock`;新 `knowledge/table_query_worker.py`(只有它导入 `duckdb`)、`tools/eval/kb_table_probe.py`、新 `tools/knowledge_table.py`;`infra/k8s/base/control-plane/deployment.yaml`、`tools/deploy/test_parse_worker_memory_budget.py`;`settings.py`;`tools/assembly.py:476-501`;`tools/knowledge.py:884-916`(带出「文档有表」;与 4a 的 A0 同一段,排在 A0 之后)、`:1204-1225`(只动 `notice`);`tools/knowledge_list.py`;构建缓存键;各清单同 L1 | D1;L1 | 见下 |
-| 6 | **D3** 表格:出处与界面 | 识别函数认 `#T`;表格结果的 `sources`;答前核对把表格查询结果算作显示过内容;来源抽屉的表格视图(工作表名、列、行数、本轮的语句) | 4a 新建的 `graph_builder/citations.py`;`graph_builder/answer_check.py`;`tools/knowledge_table.py`;`components/console/AnswerBubble.tsx`、来源抽屉、`i18n` | D2;4a 的 A1a、A1b、A3 | 见下 |
+| 5 | **D2** 表格:执行容器与工具 | **第一步是第 0 步**(加 `duckdb` 钉版本、探针脚本、安全对照),过了才往下;执行服务(一次性进程:装载 → 锁死 → 判语句 → 执行 → 限额);部署清单加容器,内存预算测试加一条;报错三类;工具;按「有没有表」门控与构建缓存键;停用 / 改过段的判断;`notice` 提示行;各清单;评测循环;管理端显示名 | `services/control-plane/pyproject.toml`、`uv.lock`;新 `knowledge/table_query_worker.py`(只有它导入 `duckdb`)、`tools/eval/kb_table_probe.py`、新 `tools/knowledge_table.py`;`infra/k8s/base/control-plane/deployment.yaml`、`tools/deploy/test_parse_worker_memory_budget.py`;`settings.py`;`docs-site/guide/changelog.md`(新工具名,待发布);`tools/assembly.py:476-501`;`tools/knowledge.py:884-916`(带出「文档有表」;与 4a 的 A0 同一段,排在 A0 之后)、`:1204-1225`(只动 `notice`);`tools/knowledge_list.py`;构建缓存键;各清单同 L1 | D1;L1 | 见下 |
+| 6 | **D3** 表格:出处与界面 | 识别函数认 `#T`;表格结果的 `sources`;答前核对把表格查询结果算作显示过内容;来源抽屉的表格视图(工作表名、列、行数、本轮的语句) | 4a 新建的 `graph_builder/citations.py`;`graph_builder/answer_check.py`;`tools/knowledge_table.py`;`components/console/AnswerBubble.tsx`、来源抽屉、`i18n`;`docs-site/guide/{sse-events,changelog}.md`(新出处形状 `kind: table` 的对外说明)。**流式预览与子智能体回传**沿用 4a A1b 的机制,不另写一套:预览里的扣留和回传时的插回都以识别函数为准,所以认 `#T` 只改识别函数这一处;若 A1b 落地时 `graph_builder/streaming_redact.py`、`tools/_child_run.py` 里各有一份编号写法,则同改(4c 的 G2 就要改这两个文件) | D2;4a 的 A1a、A1b、A3;排在 4c 的 G2 之后 | 见下 |
 
 **顺序**:E0b、M0 最先;L1 不依赖 4a,可以最先合;D1 → D2 → D3。L1 与 4a 的 E1 都要改评测答题循环的工具清单,谁后合谁带上对方的那一行。
 
@@ -608,11 +608,11 @@ List the documents of the knowledge bases knowledge_search searches: reference, 
 | 文件 | 4b 谁碰 | 别的线谁碰 | 怎么排 |
 |---|---|---|---|
 | `tools/knowledge.py:884-916,1204-1225` | D2 | 4a 的 A0、A1a、B2b | D2 排在 A0、A1a 之后 |
-| `graph_builder/citations.py`(4a 新建)、`answer_check.py` | D3 | 4a 的 A1a、A1b、B1;4c 的图片编号 | D3 在 A1b 之后;与 4c 谁后合谁补联合单测 |
+| `graph_builder/citations.py`(4a 新建)、`answer_check.py` | D3 | 4a 的 A1a、A1b、B1;4c 的图片编号 | A1b → 4c 的 G2 → D3 → FAQ 的 F3b;后合的补联合单测 |
 | `protocol/agent_spec.py:1408-1418`、`tools/overflow.py:124-126`、`tools/assembly.py:476-501`、`outgoing_reference.py:45` | L1、D2 | 4c 的看图工具可能也加 | L1 → D2;各加各的一行 |
 | `protocol/knowledge.py`、`persistence/models/knowledge.py` | D1(文档对象、新表) | 4a 的 B3、B2a;FAQ | 行段不重叠 |
 | `i18n/locales/zh-CN.ts`、`en.ts` | L1、D1、D2、D3 | 4a、FAQ | 各自只在自己的键组里加 |
-| 迁移编号 | D1 一个 | FAQ 的 F1、4c 的 E1-b、4a 的 B2a(可能) | 按合并顺序取号;后合的改号并改上一版本指针 |
+| 迁移编号 | D1 一个 | FAQ、4c 各有 | 不写具体号:合并时由协调人发号 |
 | `settings.py`、`uv.lock`、部署清单 | L1、D1、D2 | 4a、4c | `uv.lock` 冲突时重新生成,不手工合 |
 
 **开关与发布窗口**:
@@ -629,7 +629,7 @@ List the documents of the knowledge bases knowledge_search searches: reference, 
 | L1 | ① 60 份的库问「一共几份」:一次调用、数字对;② 用 `after` 翻页,期间上传一份、停用一份:不重不漏;③ 两个库:不带 `bases` 列全部,带 `K2` 只列第二个;④ `name` 带 `%`:按字面;⑤ 停用一份:清单里没有、总数减一;⑥ 一份正在重新入库:仍在清单里;⑦ 一份从没入库成功:不在清单里,`knowledge_read` 按名也找不到;⑧ 清单里的文档号交给 `knowledge_read` 能读;⑨ 子智能体里能用;⑩ 开关关 / 没绑库:工具清单与改动前相同 |
 | D1 | ① 入库路径与主进程都没有导入 `duckdb`;② 开关开,上传多工作表 xlsx:详情显示表数;③ 带合并格 / 标题行 / 百分比列:列名与段落表头一致;④ 两行表头:被标「疑似不规整」;⑤ 超过行数上限:文档就绪、记原因、检索照常;⑥ 重新上传同名文件:表格数据跟着换;⑦ 开关关着重新上传:旧表被清空;⑧ 入库中途取消:没有半份表格数据;⑨ 删文档 / 删库:清空;⑩ 空跑补算只打印数字;`--apply` 后用量表没有新增行、段落与向量不变;⑪ 补算进行中对同一文档重新入库:补算那一份被跳过;⑫ 估价单与改动前逐项相同 |
 | D2 | ⓪ 第 0 步的数写进 PR;镜像在两种 CPU 架构上能构建、离线能启动;执行容器里环境变量为空、读不到主容器的进程、根文件系统只读;控制面的内存预算测试仍绿;① 问「某类一共多少条」「每个月多少单」:数字与标准答案一致;② 先看表结构再写语句;③ 列名写错:报错里有可用列,模型改对;④ 连续写错 3 次:工具停止执行并提示;⑤ 诱导智能体读文件 / 查别的文档的表 / 写两条语句:都被拒,回答里没有路径;⑥ 另一个租户查这个文档号 / 本租户没绑定的库:没有这份文档;⑦ 停用这份文档的一个段:表不装载、提示原因;恢复启用后可查;停用状态下重新上传仍不可查;⑧ 写一条算不完的语句:8 秒内返回提示,之后的查询和检索照常,另一个租户同时在跑的查询不受影响;⑨ 同一步并行发 3 个表格查询:都成功(排队);⑩ 没有表的智能体看不到工具;上传第一份表格后另一个副本上的下一次运行也看得到;⑪ 开关关:没有任何请求到执行容器;⑫ 同一租户并行两个对话都查表:第二个排队,超过 2 秒的返回「稍后再试」;⑬ 子智能体里能用 |
-| D3 | ① 回答引用表格结果:角标点开显示工作表名、列、行数、语句;② 重新入库后点旧角标:提示已变更;③ 同一轮既引段落又引表:各自正确;④ 只看了表结构就写 `[D12#T1]`:不认得,被拿掉;⑤ 4a 的出处开关关:无编号、无角标 |
+| D3 | ⓪ 逐字预览里全程看不到 `[D12#T1]` 和半截编号;子智能体查表后回传,父级回答能引这张表;① 回答引用表格结果:角标点开显示工作表名、列、行数、语句;② 重新入库后点旧角标:提示已变更;③ 同一轮既引段落又引表:各自正确;④ 只看了表结构就写 `[D12#T1]`:不认得,被拿掉;⑤ 4a 的出处开关关:无编号、无角标 |
 
 ---
 
@@ -696,7 +696,7 @@ List the documents of the knowledge bases knowledge_search searches: reference, 
 
 ## 8. 出处
 
-- 总计划 `docs/superpowers/plans/2026-10-21-kb-optimization-master-plan.md` §2.3;ROADMAP B-175、B-206、B-299 行;波 4a 设计;B-206 设计 §5.3、§5.4;FAQ 设计(分支 `docs/b299-faq-kb-design`)与波 4c 设计(分支 `docs/b299-wave4c-enrichment-design`)的相关段落。
+- 总计划 `docs/superpowers/plans/2026-10-21-kb-optimization-master-plan.md` §2.3;ROADMAP B-175、B-206、B-299 行;波 4a 设计;B-206 设计 §5.3、§5.4;同批设计:波 4a `1f801be0c`、波 4c `b00795c66`、FAQ `19028ae03`。
 - 本仓库代码:文中逐条给了 `文件:行号`(代码同 `origin/main` `40408518a`)。路径前缀省略时:`tools/…`、`graph_builder/…`、`context/…`、`llm/…` 在 `services/orchestrator/src/orchestrator/` 下;`api/…`、`auth/…`、`knowledge/…`、`middleware/…` 在 `services/control-plane/src/control_plane/` 下;`persistence/…`、`protocol/…` 在 `packages/` 下对应的包里;`tools/eval/…` 在仓库根。
 - DuckDB(2026-11-11 读;没有安装或运行):
   - 官方「Securing DuckDB」:<https://duckdb.org/docs/current/operations_manual/securing_duckdb/overview>(`enable_external_access`、`disabled_filesystems`、`lock_configuration`、扩展自动安装 / 加载的开关、设置的先后顺序)
