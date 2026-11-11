@@ -583,7 +583,7 @@ PR 1 无;PR 2 读 §6 的字段。
 | 层 | 改动 |
 |---|---|
 | 库 | `memory_item.origin TEXT NULL`;`memory_writeback_dlq.extracted_meta JSONB NULL`。只加可空列,不回填、不加索引、**不加检查约束**(给已有表加约束要扫全表;取值由应用层校验,读到不认识的值当作空) |
-| 协议 | `MemoryItem.origin: Literal[...] \| None = None`;该模型没有禁止多余字段(`memory_item.py:32`),旧副本读到带新字段的对象会忽略它 |
+| 协议 | `MemoryItem.origin: Literal[...] \| None = None`;该模型没有禁止多余字段(`memory_item.py:31`),旧副本读到带新字段的对象会忽略它 |
 | 存储 | `write`(冲突时按等级升级来源和置信度)/ `supersede` / `update_content`(可选参数)/ `write_consolidated` / 行转对象;内存实现同步 |
 | 回填 | 不回填 |
 | 发布顺序 | 先迁移后代码,同一次发布做完;旧代码不写新列 → 空 |
@@ -845,4 +845,4 @@ T2 / T3 在真栈上验「链路通、标记在」;「读错时不自我确认�
 | 15 | `apps/admin-ui/e2e/` 里断言记忆页列的用例数 | PR 2 开工前数 |
 | 16 | 生产 `memory_item` 行数(虽已不加约束,加列前仍看一眼) | 只读计数 |
 
-修订 1 里已通过读代码结案的三条:可见用户消息在主模型看图时是多段内容(`runs.py:514-524`);压缩摘要是系统消息、提炼本来就跳过(`compressor.py:5-10`;`memory.py:170`);`MemoryItem` 没有禁止多余字段(`memory_item.py:32`)。
+修订 1 里已通过读代码结案的三条:可见用户消息在主模型看图时是多段内容(`runs.py:514-524`);压缩摘要是系统消息、提炼本来就跳过(`compressor.py:5-10`;`memory.py:170`);`MemoryItem` 没有禁止多余字段(`memory_item.py:31`)。
