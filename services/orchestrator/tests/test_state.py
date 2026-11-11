@@ -24,7 +24,8 @@ def test_required_keys_present() -> None:
     B-126 ``context_summary``, B-168 ``written_memory_count`` / ``memory_writeback_failed`` /
     ``memory_writeback_queued``, B-226 ``step_budget_warned`` / ``loop_trip_count``
     (B-226 drops ``no_progress_streak``: the no-progress stop counts trips per run),
-    B-236 ``seed_skipped_dirs`` / ``seed_quota_blocked``,B-275 ``turn_document_original_names``。
+    B-236 ``seed_skipped_dirs`` / ``seed_quota_blocked``,B-275 ``turn_document_original_names``,
+    B-302 ``run_active_s`` / ``run_clock_mark`` / ``run_clock_segment`` / ``deadline_warned``。
 
     ``turn_*`` 放在 state 而不是 config,是为了让检查点在
     ``graph_input=None`` 的续跑(审批 / orphan 复活)里替我们保住它们。"""
@@ -47,6 +48,11 @@ def test_required_keys_present() -> None:
         "loop_trip_count",
         "max_no_progress",
         "step_budget_warned",
+        # B-302 —— 这一轮实际运行的秒数(三个记账键)与时限提醒。
+        "run_active_s",
+        "run_clock_mark",
+        "run_clock_segment",
+        "deadline_warned",
         "last_plan_goal",
         "tool_failures",
         # B-85 ③ / B-84 第 3 条 —— 见 state.py 上的注释:``tool_failures`` 按轮

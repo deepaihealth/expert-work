@@ -39,6 +39,7 @@ from expert_work.runtime.cancellation import RunCancelledError
 from orchestrator.tools._budget import DELEGATIONS_GATED, WorkerSpawnBudget
 from orchestrator.tools._child_run import run_child_to_result
 from orchestrator.tools.registry import ToolBlockedError, ToolContext, ToolResult, ToolSpec
+from orchestrator.tools.run_clock import FINAL_PHASE_DELEGATION_REFUSAL, past_notice
 from orchestrator.tools.worker_policy import worker_policy_enabled
 from orchestrator.trajectory import TrajectoryRecorder
 
@@ -278,6 +279,15 @@ class SpawnWorkerTool:
             raise ToolBlockedError(msg)
         if ctx.deadline_at is not None and ctx.deadline_at - time.monotonic() <= 0:
             raise RunCancelledError("spawn_worker declined: global deadline already expired")
+        # B-302 —— 过了这一轮时限的 80% 不再派新的 worker(同 ``SubAgentTool``)。
+        if past_notice(ctx.deadline_notice_at):
+            return ToolResult(
+                content=FINAL_PHASE_DELEGATION_REFUSAL,
+                meta={"spawn_worker_blocked": True, "reason": "run_final_phase"},
+                # B-226 ③ — neutral: nothing later in this run could settle it.
+                failed=True,
+                failure_transient=True,
+            )
 
         task = self._require_task(args)
         focus = args.get("focus")

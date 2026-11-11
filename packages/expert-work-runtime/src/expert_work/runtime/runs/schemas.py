@@ -79,6 +79,7 @@ RUN_EXIT_REASONS: frozenset[str] = frozenset(
         "max_steps",  # 步数预算用尽
         "no_progress",  # 循环检测连续 N 轮无进展
         "token_budget",  # 全树共享 token 池耗尽
+        "deadline",  # B-302 —— 这一轮的实际运行时间用尽
         "approval_pending",  # 挂在审批门上(RunStatus.PAUSED)
         "approval_rejected",  # 声明式门否决
     }
@@ -117,7 +118,9 @@ def compute_completed(*, exit_reason: str, unresolved_failures: Sequence[Any]) -
 #: budget_exit_reason``): the run was stopped before its natural end. Partners
 #: see these runs as ``status="incomplete"``; ``agent_run.status`` stays
 #: ``success`` (internal storage and queue logic do not change).
-INCOMPLETE_EXIT_REASONS: frozenset[str] = frozenset({"max_steps", "no_progress", "token_budget"})
+INCOMPLETE_EXIT_REASONS: frozenset[str] = frozenset(
+    {"max_steps", "no_progress", "token_budget", "deadline"}
+)
 
 
 def external_run_status(status: str, exit_reason: str | None) -> str:

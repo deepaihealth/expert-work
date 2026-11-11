@@ -159,6 +159,7 @@ from orchestrator.tools.registry import (
     WORKSPACE_MIGRATED_KEY,
     WorkspaceLayout,
 )
+from orchestrator.tools.run_clock import RUN_CLOCK_TURN_RESET, run_segment_config
 
 logger = logging.getLogger("expert_work.control_plane.runs")
 
@@ -609,6 +610,8 @@ def build_run_graph_input(
         # 停在打转上留下的计数会让这一轮第一步就被判「卡住」。
         "loop_trip_count": 0,
         "step_budget_warned": False,
+        # B-302 —— 这一轮实际运行了多少秒(三个记账键一起清)与时限提醒同样只属于一轮。
+        **RUN_CLOCK_TURN_RESET,
     }
 
 
@@ -667,6 +670,7 @@ def replay_graph_input(
         "unresolved_failures": [],
         "loop_trip_count": 0,  # B-226,同上
         "step_budget_warned": False,
+        **RUN_CLOCK_TURN_RESET,  # B-302,同上
     }
 
 
@@ -1161,6 +1165,9 @@ async def resolve_approval_decision(
     config["configurable"]["agent_key"] = sanitize_agent_key(spec_record.spec.metadata.name)
     # B-236 —— 同理,布局取这条对话自己的:续跑段的 /workspace 与批准前同一个目录。
     config["configurable"][WORKSPACE_LAYOUT_KEY] = meta.workspace_layout
+    # B-302 —— 续跑段同样带时限与本段令牌(以前不带:续跑那一段完全不限时)。已用秒数在
+    # 检查点里,等审批的时间不算。
+    config["configurable"].update(run_segment_config(built.run_deadline_s))
     worker = asyncio.create_task(
         run_agent(
             bridge=runtime.stream_bridge,
@@ -1682,7 +1689,7 @@ async def _start_run(
     workspace_layout: WorkspaceLayout,
 ) -> None:
     """建好输入与配置、起 ``run_agent``。B-139 抽出来:立即执行与排队轮到后执行
-    走同一份,``deadline_at`` 从**真正开跑**那一刻算。"""
+    走同一份,这一轮的运行时间从**真正开跑**那一刻算。"""
     run_id = run_record.run_id
     # 只有 stream 分支记:上面的 queue 分支入队就返回,``built`` 直接丢掉,
     # 真正的构建晚一步发生在 RunQueueWorker 里(那边自己记)。
@@ -1737,8 +1744,8 @@ async def _start_run(
         configurable[WORKSPACE_MIGRATED_KEY] = True
     if prepared.cleaned:
         configurable[WORKSPACE_CLEANED_KEY] = True
-    if built.run_deadline_s > 0:
-        configurable["deadline_at"] = time.monotonic() + float(built.run_deadline_s)
+    # B-302 —— 时限与本段令牌;已用秒数记在检查点里(``orchestrator.tools.run_clock``)。
+    configurable.update(run_segment_config(built.run_deadline_s))
     if payload.use_draft:
         # B-168 —— 后台记忆写回按 (name, version) 取线上配置执行,而这一轮跑的是草稿:
         # 草稿 run 的记忆写回留在本轮内,用的就是草稿自己的设置。

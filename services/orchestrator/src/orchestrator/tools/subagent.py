@@ -34,6 +34,7 @@ from expert_work.runtime.cancellation import RunCancelledError
 from orchestrator.tools._budget import DELEGATIONS_GATED
 from orchestrator.tools._child_run import run_child_to_result
 from orchestrator.tools.registry import ToolBlockedError, ToolContext, ToolResult, ToolSpec
+from orchestrator.tools.run_clock import FINAL_PHASE_DELEGATION_REFUSAL, past_notice
 from orchestrator.trajectory import TrajectoryRecorder
 
 if TYPE_CHECKING:
@@ -151,6 +152,16 @@ class SubAgentTool:
         if ctx.deadline_at is not None and ctx.deadline_at - time.monotonic() <= 0:
             raise RunCancelledError(
                 f"sub-agent {self.subagent.name!r} declined: global deadline already expired"
+            )
+        # B-302 —— 过了这一轮时限的 80% 不再派新的子代:父要在剩下的时间里把已有结果整合成
+        # 交付件,新派的子代做不完就会被硬超时取消。
+        if past_notice(ctx.deadline_notice_at):
+            return ToolResult(
+                content=FINAL_PHASE_DELEGATION_REFUSAL,
+                meta={"delegation_refused": True, "reason": "run_final_phase"},
+                # B-226 ③ — neutral: nothing later in this run could settle it.
+                failed=True,
+                failure_transient=True,
             )
         task = self._require_task(args)
         name, version = parse_agent_ref(self.subagent.agent_ref)

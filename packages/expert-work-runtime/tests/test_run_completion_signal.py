@@ -84,6 +84,8 @@ def test_an_unknown_exit_reason_is_not_completed() -> None:
         ("success", "max_steps", "incomplete"),
         ("success", "no_progress", "incomplete"),
         ("success", "token_budget", "incomplete"),
+        # B-302 —— the run's active-time limit ran out (T1-11).
+        ("success", "deadline", "incomplete"),
         # A natural end stays success, even with unresolved failures
         # (that is completed=false, not incomplete).
         ("success", "text_response", "success"),
@@ -109,9 +111,9 @@ def test_external_run_status_truth_table(
 
 
 def test_incomplete_exit_reasons_are_exactly_the_budget_exits() -> None:
-    """The three exits a platform limit stamps (``budget_exit_reason``) and
+    """The four exits a platform limit stamps (``budget_exit_reason``) and
     nothing else: approval exits and the natural end are not limits."""
-    assert INCOMPLETE_EXIT_REASONS == {"max_steps", "no_progress", "token_budget"}
+    assert INCOMPLETE_EXIT_REASONS == {"max_steps", "no_progress", "token_budget", "deadline"}
     assert INCOMPLETE_EXIT_REASONS <= RUN_EXIT_REASONS
 
 

@@ -19,7 +19,6 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import time
 from datetime import datetime
 from typing import Any
 from uuid import UUID, uuid4
@@ -49,6 +48,7 @@ from expert_work.protocol.agent_key import sanitize_agent_key
 from expert_work.runtime.audit.logger import AuditLogger
 from orchestrator import AgentFactoryError, run_agent
 from orchestrator.tools.registry import WORKSPACE_LAYOUT_KEY
+from orchestrator.tools.run_clock import run_segment_config
 
 logger = logging.getLogger("expert_work.control_plane.trigger_firing")
 
@@ -292,8 +292,8 @@ async def fire_trigger(
     }
     if trigger.user_id is not None:
         configurable["user_id"] = str(trigger.user_id)
-    if built.run_deadline_s > 0:
-        configurable["deadline_at"] = time.monotonic() + float(built.run_deadline_s)
+    # B-302 —— 时限与本段令牌(与 ``api/runs._start_run`` 同一个函数)。
+    configurable.update(run_segment_config(built.run_deadline_s))
     # Spec 1 D-13 — self-scheduling guardrail: a scheduler-fired run must not
     # be able to schedule more tasks. This flag flows into ToolContext.trigger_
     # origin (orchestrator._build_tool_context) and drives both the agent

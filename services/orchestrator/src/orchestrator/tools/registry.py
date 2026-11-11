@@ -313,13 +313,18 @@ class ToolContext:
     plan: Plan | None = None
     #: Mini-ADR J-40 (J.4-补强-2) — wall-clock deadline (``time.monotonic``
     #: timestamp) for the *current run including any sub-agent recursion*.
-    #: Established once in ``sse.run_agent`` from the manifest's
-    #: ``policies.run_deadline_s``; ``SubAgentTool`` propagates the value
-    #: to child config unchanged (child does not reset). A tool that
+    #: B-302 —— the tools node works it out per batch from the active seconds
+    #: the checkpoint has recorded (``tools.run_clock``), so an approval
+    #: resume and an orphan reclaim carry it too; ``SubAgentTool`` propagates
+    #: the value to child config unchanged (child does not reset). A tool that
     #: opts in checks ``deadline_at - time.monotonic() <= 0`` before
     #: doing expensive work and short-circuits with a cancel. ``None``
     #: when no deadline is configured.
     deadline_at: float | None = None
+    #: B-302 —— the run's 80% instant (same clock as ``deadline_at``): past it
+    #: no new child is delegated, and a child already running wraps up with
+    #: what it has. ``None`` when no deadline is configured.
+    deadline_notice_at: float | None = None
     #: 1.3 Orchestrator-Worker — the per-run dynamic-worker spawn budget
     #: (cumulative count cap + concurrency semaphore), created once per run
     #: and shared across every ``spawn_worker`` call. ``None`` when the
