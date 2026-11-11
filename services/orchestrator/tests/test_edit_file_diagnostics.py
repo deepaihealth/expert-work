@@ -429,6 +429,16 @@ def _named(name: str, path: str = "f.py") -> dict[str, Any]:
 async def _run_batches(tmp_path: Path, *batches: list[dict[str, Any]]) -> list[str]:
     for name in ("f.py", "g.py"):
         (tmp_path / name).write_text("present line\n", encoding="utf-8")
+    state = await _run_graph(tmp_path, *batches)
+    return [
+        str(m.content)
+        for m in state["messages"]
+        if isinstance(m, ToolMessage) and m.name == "edit_file"
+    ]
+
+
+async def _run_graph(tmp_path: Path, *batches: list[dict[str, Any]]) -> dict[str, Any]:
+    """The real ReAct graph: real ``edit_file`` on ``tmp_path``, stand-in read / write."""
     registry = ToolRegistry()
     registry.register(EditFileTool(client=_LocalSandbox(root=tmp_path)))
     registry.register(_NamedOk(name="read_file", read_only=True))
@@ -453,11 +463,7 @@ async def _run_batches(tmp_path: Path, *batches: list[dict[str, Any]]) -> list[s
             {"messages": [HumanMessage(content="go")], "step_count": 0, "max_steps": 20},
             config=cfg,
         )
-    return [
-        str(m.content)
-        for m in state["messages"]
-        if isinstance(m, ToolMessage) and m.name == "edit_file"
-    ]
+    return dict(state)
 
 
 def _body(content: str) -> str:
@@ -666,3 +672,182 @@ async def test_t3_12_platform_wording_has_no_not_found_streak_and_success(
     assert "already replaced by your own edit" in texts[1]
     for text in texts:
         assert "not found" not in text.lower(), text
+
+
+# ---------------------------------------------------------------------------
+# Review fixes (B-302 PR 3 review, 11-11)
+# ---------------------------------------------------------------------------
+
+
+def test_m2_old_text_changed_by_an_earlier_edit_of_the_same_call(tmp_path: Path) -> None:
+    """Edit 2's old_string IS in the file; edit 1 of the same call changed that place.
+
+    Saying "every line is in the file, but not together in this order" would be false.
+    """
+    body = "def f(a):\n    return a + 1\n"
+    (tmp_path / "f.py").write_text(body, encoding="utf-8")
+    edits = _edits(
+        ("def f(a):", "def f(a, b):"),
+        ("def f(a):\n    return a + 1", "def f(a):\n    return a + 2"),
+    )
+    env = _run_snippet(build_edits_wrapper("f.py", edits, ws=str(tmp_path)))
+    msg = _render(env)
+    assert (
+        "its old text is in the file, but an earlier edit in this call (edit 1) "
+        "changes that place" in msg
+    )
+    assert "not together in this order" not in msg
+    assert (tmp_path / "f.py").read_text(encoding="utf-8") == body
+
+
+def test_low1_a_middle_line_must_be_a_whole_file_line(tmp_path: Path) -> None:
+    """A middle line that is only part of a file line (trailing comment dropped) is the
+    line that differs, and gets similar lines."""
+    body = "def run():\n    step_one()\n    step_two()  # keep in sync\n    step_three()\n"
+    (tmp_path / "f.py").write_text(body, encoding="utf-8")
+    old = "def run():\n    step_one()\n    step_two()\n    step_three()"
+    env = _run_snippet(build_edit_wrapper("f.py", old, "pass", ws=str(tmp_path)))
+    detail = env["detail"]
+    assert "line 3 of 'old_string' differs" in detail
+    assert "near line 3, column 15:" in detail
+    assert "not together in this order" not in detail
+
+
+def test_low1_first_and_last_lines_may_still_be_partial(tmp_path: Path) -> None:
+    """old_string may start / end inside a line: the first line (a fragment here) is not
+    the one that differs; the mis-copied last line is."""
+    body = "value = alpha(1) + beta(2)\nmiddle = 3\ntotal = gamma(4) + delta(5)\n"
+    (tmp_path / "f.py").write_text(body, encoding="utf-8")
+    old = "beta(2)\nmiddle = 3\ntotal = gama(4)"
+    env = _run_snippet(build_edit_wrapper("f.py", old, "B\nM\nT", ws=str(tmp_path)))
+    assert "line 3 of 'old_string' differs" in env["detail"]
+    assert "near line 3," in env["detail"]
+
+
+def test_low2_a_common_line_still_in_the_text_is_not_a_dependency(tmp_path: Path) -> None:
+    body = "if a:\n    x = 1\nelse:\n    x = 2\nif b:\n    y = 1\nelse:\n    y = 2\n"
+    (tmp_path / "f.py").write_text(body, encoding="utf-8")
+    edits = _edits(
+        ("if a:\n    x = 11\nelse:", "if a:\n    x = 10\nelse:"),  # mis-copied
+        ("if b:\n    y = 11\nelse:", "if b:\n    y = 10\nelse:"),  # mis-copied too
+    )
+    msg = _render(_run_snippet(build_edits_wrapper("f.py", edits, ws=str(tmp_path))))
+    assert "Edit 2 also did not match (no_match)" in msg
+    assert "could not be checked" not in msg
+
+
+def test_low3_similarity_on_a_huge_random_file_stays_bounded(tmp_path: Path) -> None:
+    """Long random lines defeat the cheap upper bounds; the per-line cap and the total
+    budget keep the scan bounded (the reviewer's 4,900 x 2,000 case took 156 s before)."""
+    import random
+
+    rng = random.Random(302)  # noqa: S311 — synthetic test content, not security
+    alphabet = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789+-*/=(){}<>"
+    lines = ["".join(rng.choices(alphabet, k=2000)) for _ in range(1500)]
+    (tmp_path / "big.txt").write_text("\n".join(lines) + "\n", encoding="utf-8")
+    probe = lines[700][:1000] + "#" + lines[700][1001:]
+    started = time.perf_counter()
+    env = _run_snippet(build_edit_wrapper("big.txt", probe, "x", ws=str(tmp_path)))
+    elapsed = time.perf_counter() - started
+    print(f"[b302-pr3] 1,500 x 2,000 random no_match diagnostics took {elapsed:.3f}s")
+    assert env["error"] == "no_match"
+    assert "near line 701, column 1001:" in env["detail"]
+    assert elapsed < 5.0
+
+
+def test_m1_accepted_risk_a_near_identical_sibling_line_counts_as_applied(
+    tmp_path: Path,
+) -> None:
+    """Pins condition 6 as the spec has it: "any of the top-3 most similar lines".
+
+    ACCEPTED RISK (user decision 11-11): two near-identical sibling lines; the model meant
+    to edit line 1 but mis-copied one character of its old_string, and its new_string
+    happens to equal line 2. Line 2 is among the 3 lines most like the mis-copied line, so
+    the edit counts as "already applied" — a false success, and line 1 stays unchanged.
+    The user chose to keep "top-3" over "the single most similar line". Changing this test
+    means changing that decision: do it deliberately, together with the spec (§4.3.3).
+    """
+    body = 'role = "reader"  # primary\nrole = "writer"  # primary\n'
+    (tmp_path / "f.py").write_text(body, encoding="utf-8")
+    env = _run_snippet(
+        build_edit_wrapper(
+            "f.py", 'role = "raeder"  # primary', 'role = "writer"  # primary', ws=str(tmp_path)
+        )
+    )
+    assert env["ok"] is True
+    assert env["already_applied"] == [{"index": 1, "line": 2}]
+    assert (tmp_path / "f.py").read_text(encoding="utf-8") == body
+
+
+async def test_low8a_already_applied_comes_from_the_artifact_and_skips_history(
+    tmp_path: Path,
+) -> None:
+    (tmp_path / "f.py").write_text(_APPLIED_FILE, encoding="utf-8")
+    call = {
+        "name": "edit_file",
+        "args": {
+            "path": "f.py",
+            "edits": [
+                {"old_string": "header line one", "new_string": "header line 1"},
+                {"old_string": _APPLIED_OLD, "new_string": _APPLIED_NEW},
+            ],
+        },
+        "id": "c1",
+        "type": "tool_call",
+    }
+    state = await _run_graph(tmp_path, [call])
+    message = next(m for m in state["messages"] if isinstance(m, ToolMessage))
+    assert message.status != "error"
+    assert message.artifact["already_applied"] == [{"index": 2, "line": 2}]
+    assert state["edit_file_history"] == {
+        "f.py": [{"old": "header line one", "new": "header line 1"}]
+    }
+
+
+async def test_low8b_history_and_counter_reach_the_tool_through_the_graph(
+    tmp_path: Path,
+) -> None:
+    (tmp_path / "f.py").write_text("intro\nalpha = 1\nbeta = 10\noutro\n", encoding="utf-8")
+    first = {
+        "name": "edit_file",
+        "args": {"path": "f.py", "old_string": "alpha = 1\nbeta = 10", "new_string": "beta = 20"},
+        "id": "c1",
+        "type": "tool_call",
+    }
+    again = {
+        "name": "edit_file",
+        "args": {"path": "f.py", "old_string": "beta = 10", "new_string": "beta = 30"},
+        "id": "c2",
+        "type": "tool_call",
+    }
+    state = await _run_graph(tmp_path, [first], [again])
+    second = [m for m in state["messages"] if isinstance(m, ToolMessage)][1]
+    assert "this text was already replaced by your own edit earlier in this run" in str(
+        second.content
+    )
+    assert "that place now reads: «beta = 20» (line 2)" in str(second.content)
+    assert state["edit_file_streaks"] == {"f.py": {"failures": 1, "read": False}}
+
+
+async def test_low8c_stale_is_a_counted_kind_classified_failure(tmp_path: Path) -> None:
+    from orchestrator.tools.edit_file_tracking import FileToolEvent, next_streaks, streak_for
+    from orchestrator.tools.file_ops import EditFileMismatchError
+
+    (tmp_path / "f.py").write_text("unchanged = 1  # connection timeout\n", encoding="utf-8")
+    tool = EditFileTool(client=_LocalSandbox(root=tmp_path))
+    streaks = {"f.py": {"failures": 2, "read": False}}
+    args = {
+        "path": "f.py",
+        "old_string": "unchanged = 1",
+        "new_string": "unchanged = 2",
+        "expected_hash": "0" * 64,
+    }
+    with pytest.raises(EditFileMismatchError) as excinfo:
+        await tool.call(args, ctx=_ctx(edit_file_streaks=streaks))
+    error = excinfo.value
+    assert error.kind == "stale"
+    assert str(error).startswith("This is failure 3 of edit_file on this file in a row.")
+    classified = classify_tool_error(tool_name="edit_file", error=error, spec=tool.spec)
+    assert classified.error_class == "unknown"
+    event = FileToolEvent("edit_file", args, ok=False, failure_kind=error.kind)
+    assert streak_for(next_streaks(streaks, [event]), "f.py").failures == 3

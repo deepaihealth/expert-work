@@ -127,3 +127,12 @@ def test_inputs_are_not_mutated() -> None:
     next_history(history, [_edit("a.py", ok=True, old_string="p", new_string="q")])
     assert previous == {"a.py": {"failures": 1, "read": False}}
     assert history == {"a.py": [{"old": "x", "new": "y"}]}
+
+
+def test_a_successful_write_file_clears_that_files_history() -> None:
+    history = {"a.py": [{"old": "x", "new": "y"}], "b.py": [{"old": "p", "new": "q"}]}
+    out = next_history(history, [_tool("write_file", "a.py")])
+    assert history_for(out, "a.py") == []
+    assert history_for(out, "b.py") == [{"old": "p", "new": "q"}]
+    # a failed write keeps it.
+    assert history_for(next_history(history, [_tool("write_file", "a.py", ok=False)]), "a.py")

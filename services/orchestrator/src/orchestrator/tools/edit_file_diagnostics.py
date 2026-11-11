@@ -33,7 +33,7 @@ COUNTED_EDIT_FAILURES = frozenset({"no_match", "ambiguous", "stale"})
 STREAK_NOTICE_FROM = 3
 
 #: 沙箱代码段。原样拼进 ``_EDIT_MAIN``(在 ``_main`` 之前),所以**模块级只有定义**,
-#: 不碰 ``_P``。用 raw 字符串:里面的 ``\n`` / ``‍`` 是给沙箱里的 Python 解释的。
+#: 不碰 ``_P``。用 raw 字符串:里面的反斜杠转义(换行、码点)是给沙箱里的 Python 解释的。
 EDIT_DIAGNOSTICS_SOURCE = r"""
 
 import unicodedata
@@ -41,7 +41,11 @@ import unicodedata
 #: §4.3.2 —— 相似度门槛(同 openclaw)、最多几行、超过多少行先粗筛。
 _SIM_CUTOFF = 0.45
 _SIM_TOP = 3
-_SIM_PREFILTER_LINES = 5000
+#: 相似度只比每行(和 probe)的前这么多码点;过了两道上界粗筛、真正去算 ratio 的行,整个文件
+#: 合计最多这么多码点(之后的行不再比)—— 大文件 / 超长行的最坏情况(几千行、每行两千字符)
+#: 要远低于沙箱的执行时限。列号与片段仍按整行算(_describe)。
+_SIM_LINE_CAP = 200
+_SIM_BUDGET = 4000000
 #: 片段:差异处前后各约 8 个码点;为了不切断字形,每侧最多再向外扩 8 个。
 _SNIP_RADIUS = 8
 _SNIP_STRETCH = 8
@@ -86,31 +90,45 @@ def _clip(s, a, b):
 
 
 def _probe(text, old):
-    # §4.3.2 —— old_string 里第一条「不是文件中任何一行的子串」的行(去首尾空白后比),
-    # 返回 (它在 old_string 里是第几行, 去空白后的内容)。不含换行的串是 text 的子串,
-    # 当且仅当它是某一行的子串。每一行都在文件里时返回 None。
-    for j, raw in enumerate(old.split("\n")):
-        body = raw.strip()
-        if body and body not in text:
-            return j + 1, body
+    # §4.3.2 —— old_string 里第一条在文件里找不到的行(去首尾空白后比),返回 (它在
+    # old_string 里是第几行, 去空白后的内容);每一行都找得到时返回 None。
+    # 首尾两行可以只是文件某一行的一段(old_string 可以从行中间开始、到行中间结束);
+    # 中间的行必须与文件里某一整行相同 —— 否则「漏抄了行尾注释」的中间行会被当成找得到。
+    # 不含换行的串是 text 的子串,当且仅当它是某一行的子串。
+    numbered = [(j + 1, raw.strip()) for j, raw in enumerate(old.split("\n")) if raw.strip()]
+    whole = None
+    for pos, (number, body) in enumerate(numbered):
+        if pos in (0, len(numbered) - 1):
+            if body not in text:
+                return number, body
+            continue
+        if whole is None:
+            whole = {line.strip() for line in text.split("\n")}
+        if body not in whole:
+            return number, body
     return None
 
 
 def _similar(lines, probe):
     # 与 probe 最像的至多 _SIM_TOP 行的下标(0 起),按相似度从高到低、同分按行序。
+    # real_quick_ratio / quick_ratio 是 ratio 的上界,先用它们筛掉不可能过门槛的行(结果不变);
+    # 只比前 _SIM_LINE_CAP 个码点;去算 ratio 的行合计最多 _SIM_BUDGET 个码点(之后的行不再比)。
     import difflib
 
     matcher = difflib.SequenceMatcher(autojunk=False)
-    matcher.set_seq2(probe)
-    big = len(lines) > _SIM_PREFILTER_LINES
+    matcher.set_seq2(probe[:_SIM_LINE_CAP])
+    budget = _SIM_BUDGET
     scored = []
     for idx, raw in enumerate(lines):
-        body = raw.strip()
+        body = raw.strip()[:_SIM_LINE_CAP]
         if not body:
             continue
         matcher.set_seq1(body)
-        if big and matcher.quick_ratio() < _SIM_CUTOFF:
+        if matcher.real_quick_ratio() < _SIM_CUTOFF or matcher.quick_ratio() < _SIM_CUTOFF:
             continue
+        budget -= len(body)
+        if budget < 0:
+            break
         ratio = matcher.ratio()
         if ratio >= _SIM_CUTOFF:
             scored.append((-ratio, idx))
@@ -192,7 +210,7 @@ def _already_applied(text, edit):
         return None
     if text.count(new) != 1:  # 2
         return None
-    if old in text or _fuzzy_line_span(text, old) is not None:  # 3
+    if _old_in(text, old):  # 3
         return None
     if new in old:  # 4
         return None
@@ -258,13 +276,24 @@ def _locate(text, new, probe):
     return _clip(line, 0, _OWN_SNIP), first + best + 1
 
 
-def _depends_on(old, skipped):
-    # old_string 与某个被跳过的改动的 new_string 有共同的行(去首尾空白后相同)→ 那一处的编号。
+def _depends_on(old, skipped, updated):
+    # old_string 与某个被跳过的改动的 new_string 有共同的行(去首尾空白后相同),且这一行在
+    # 当前文字 updated 里没有 → 那一处的编号。当前文字里本来就有的共同行(else:、空括号这类
+    # 常见短行)不算依赖:那样的 old_string 没对上,是它自己抄错了。
+    present = None
     for raw in old.split("\n"):
         body = raw.strip()
         if body and body in skipped:
-            return skipped[body]
+            if present is None:
+                present = {line.strip() for line in updated.split("\n")}
+            if body not in present:
+                return skipped[body]
     return None
+
+
+def _old_in(text, old):
+    # old_string 在 text 里对得上(原样,或去空白整块;不唯一也算)。
+    return old in text or _fuzzy_line_span(text, old) is not None
 """
 
 

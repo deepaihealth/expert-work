@@ -403,7 +403,7 @@ CE-OCR 说对的读法会收敛、错的会发散,所以「读 3 次取一致」
 3. `old_string` 在原文里一次都不出现(原样和去空白整块两级都没有);
 4. `old_string` 不包含 `new_string`;
 5. 不是 `replace_all`;
-6. `new_string` 在原文里那一处**覆盖的任一行**(`new_string` 可以跨多行),是 §4.3.2 算出的「与 `old_string` 出错那一行最像的 3 行」之一 —— 「已改过」的位置必须就是这一处改动瞄准的位置。
+6. `new_string` 在原文里那一处**覆盖的任一行**(`new_string` 可以跨多行),是 §4.3.2 算出的「与 `old_string` 出错那一行最像的 3 行」之一 —— 「已改过」的位置必须就是这一处改动瞄准的位置。user decision 11-11: keep top-3, accepted risk: sibling near-identical line(两行几乎一样时,`old_string` 抄错一个字、`new_string` 恰好等于旁边那一行,会被判成「已改过」而真正要改的那一行没动;测试 `test_m1_accepted_risk_a_near_identical_sibling_line_counts_as_applied` 钉住现状,改它要先改这条决定)。
 
 满足 → 这一处当作对上(不改动),结果里写:「edit 4: its new text is already in the file at line L and its old text is not — counted as applied; do not send it again.」
 

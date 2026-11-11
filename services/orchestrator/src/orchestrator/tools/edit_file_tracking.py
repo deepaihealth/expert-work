@@ -134,16 +134,21 @@ def next_history(
 ) -> dict[str, list[dict[str, str]]]:
     """把一批里成功的 ``edit_file`` 记进本轮改动账,返回新的账(不改 ``previous``)。
 
-    「已改过」的那几处不记 —— 它们这一次没有替换任何东西。
+    「已改过」的那几处不记 —— 它们这一次没有替换任何东西。同一文件 ``write_file`` 成功
+    → 清掉这个文件的记录(整篇重写之后,先前的改动不再说明文件里是什么)。
     """
     out: dict[str, list[dict[str, str]]] = {
         key: history_for(previous, key) for key in previous if history_for(previous, key)
     }
     for event in events:
-        if event.tool != "edit_file" or not event.ok:
+        if event.tool not in ("edit_file", "write_file") or not event.ok:
             continue
         key = file_key(event.args.get("path"))
         if key is None:
+            continue
+        if event.tool == "write_file":
+            # A full rewrite: the earlier edits no longer describe what that file holds.
+            out.pop(key, None)
             continue
         added = [
             {"old": old[:HISTORY_CHARS], "new": new[:HISTORY_CHARS]}

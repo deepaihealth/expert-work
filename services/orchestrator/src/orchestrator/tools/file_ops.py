@@ -489,7 +489,7 @@ def _try_all(text, edits):
                 seen = new.strip() in updated
                 outcomes.append({"state": "already", "line": line, "seen": seen})
                 continue
-        on = _depends_on(old, skipped)
+        on = _depends_on(old, skipped, updated)
         if on is not None:
             outcomes.append({"state": "unchecked", "on": on})
         else:
@@ -515,6 +515,27 @@ def _recheck(edits, outcomes, updated):
             }
 
 
+def _changed_by_earlier(text, edits, outcomes, first):
+    # Edit `first` did not match the text the edits before it produced, but its old_string
+    # IS in the original file: an earlier edit of this call changed that place. Replays
+    # the earlier edits that matched to name the one after which it stops matching.
+    old = edits[first]["old"]
+    current = text
+    for k in range(first):
+        if outcomes[k]["state"] != "ok":
+            continue
+        edit = edits[k]
+        current = _apply_edit(current, edit["old"], edit["new"], edit.get("replace_all", False))[
+            "text"
+        ]
+        if not _old_in(current, old):
+            return (
+                "its old text is in the file, but an earlier edit in this call (edit %d) "
+                "changes that place" % (k + 1)
+            )
+    return "its old text is in the file, but an earlier edit in this call changes that place"
+
+
 def _failure(text, edits, outcomes, history):
     # The envelope of a failed call, or None. Reports the first failed edit in full
     # (closest lines on the ORIGINAL text, the run's own earlier edits) and, for a
@@ -527,7 +548,10 @@ def _failure(text, edits, outcomes, history):
     old = edits[first]["old"]
     if env.get("error") == "no_match":
         if "detail" not in env:
-            detail = _no_match_detail(text, old)
+            if _old_in(text, old):
+                detail = _changed_by_earlier(text, edits, outcomes, first)
+            else:
+                detail = _no_match_detail(text, old)
             if detail:
                 env["detail"] = detail
         own = _own_edit(text, old, history)
