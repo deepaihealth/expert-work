@@ -1,6 +1,6 @@
 # B-299 波 4b「可用」—— 设计(R2 表格当数据查 / R3 列文档工具 / R4 多轮补全问题:先测;R1 开放 API 本期不做,见附录 A)
 
-- **日期**:2026-11-11 · **状态**:设计稿第 5 版(三轮独立审查 + 用户拍板后修订);只写方案,不动代码、不跑评测、不花钱。
+- **日期**:2026-11-11 · **状态**:设计稿第 6 版(三轮独立审查 + 用户拍板 + 通用性审计后修订);只写方案,不动代码、不跑评测、不花钱。
 - **读者**:产品负责人(看 §0、§4、§7.2)、开发工程师(全文)。
 - **用户已拍板(2026-11-11)**:R1 对外检索接口本期不做(没有对接方明确需要;设计保留在附录 A);R2 的查询由**模型直接写查询语句、在内嵌的 DuckDB 上跑**(与第 3 版的推荐相反;第 3 版的「模型填条件」压成附录 B,作为退路);其余按第 3 版的推荐。全表见 §7.2。
 - **与波 4a 的关系**:4a 设计(`docs/superpowers/specs/2026-11-11-b299-wave4a-trustworthy-answers-design.md`)已定的东西直接沿用:出处对象的形状、「一个编号 = 显示给模型的那一段文字」、平台开关默认关、评测要有事先定的线和必须变红的对照、每个 PR 带真栈用例。
@@ -9,6 +9,7 @@
 
 ## 修订记录
 
+- **第 6 版(11-11,通用性审计:5 中 / 3 低)**:数字与日期的可接受写法逐条列出、有歧义的当文本;平台文字写出英文原文并做跨场景检验(§3.4);评测资料矩阵写死(四个领域、三种表头语言、宽表、交叉表);护栏加「答案在文字型表格里」的题并在通用合成集上再跑;R4 用例加英文、写明结论适用范围;按名找两侧做全半角归一。
 - **第 5 版(11-11,第三轮审查,安全为主:3 高 / 6 中 / 6 低)**:执行改到同 pod 的独立容器(控制面的内存预算已满、密钥在主进程环境里);数据改存压缩 CSV、物理列名 `c1`…`cN`、表头走视图;装表步骤写死;安全对照补齐每层的反向对照和漏掉的攻击类;加每租户并发、单格与整表字节上限;进阶问法的线标为待确认。
 - **第 4 版(11-11,用户拍板后)**:R1 整节与它的验收、PR(含权限资源拆分 P1)移到附录 A;R2 改为「模型写 SQL + 内嵌 DuckDB」并重写(存储、在哪跑、隔离、限额、评测、PR);「模型填条件」压成附录 B;R3、R4 不变;§7.2 改成拍板记录。
 - **第 3 版(第二轮审查,2 高 / 4 中 / 5 低)**:表不可查的恢复办法、R4 把「没点名 + 漏答」数进去、日上限走配额服务、不规整标记加误报线等。
@@ -52,7 +53,7 @@
 
 | 缺什么 | 用户会遇到什么 | 现状(已验证) |
 |---|---|---|
-| 表格只能当文字读 | 「三月一共多少单」「哪个型号卖得最多」算不全 | xlsx 逐格读成 Markdown 表(`knowledge/office_xlsx.py:53-75`),按行切段、每段重复表头(`knowledge/chunking.py:1483-1533`);没有结构化存储 |
+| 表格只能当文字读 | 「一共多少条」「哪一类最多」「平均多少」这类要把很多行算一遍的问题答不全 | xlsx 逐格读成 Markdown 表(`knowledge/office_xlsx.py:53-75`),按行切段、每段重复表头(`knowledge/chunking.py:1483-1533`);没有结构化存储 |
 | 没法问「库里有什么」 | 「一共几份文档」「有没有叫某某的文件」只能碰运气 | `knowledge_read` 能按文件名找,但最多列 10 个、没有总数、不能翻页(`tools/knowledge_read.py:66,260-290,398-428`) |
 | 多轮追问 | 「那价格呢」这类追问,检索词里可能还留着「它」 | 明确不设独立改写步,靠一条规则 + 一个计数器(`graph_builder/outgoing_reference.py:7-9,49-58,131-137`);没量过 |
 
@@ -119,12 +120,18 @@
 
 **大小上限**(前四项用户 11-11 已定):每张表 50,000 行、200 列;每份文档 1,000,000 格、50 张表;单格最长 2,000 字符(超出截断并计数);一张表的字节(压缩前)最多 64 MiB。超了不存成数据(文档照常入库、检索不受影响),文档上记原因。一次查询最多装 3 份文档的表、合计不超过 2,000,000 格。数据那一列按需加载、不许顺带读出(与原文件字节那一列同样的写法,`persistence/models/knowledge.py:156-158`)。
 
-**类型怎么定**(程序算;第 3 版的结论全部沿用):
+**类型怎么定**(程序算,不调模型)。xlsx 里本来就是数值 / 日期类型的格子直接用,没有歧义;下面的规则只管**以文字形式存的值**(csv 的全部格子、xlsx 里的文本格),先做全半角归一再判:
 
-- 每格按固定写法试着读成数(正负号、小数点、千分位逗号、末尾 `%`)或日期;xlsx 里存成文本的数字同样这么读。
+| 读成 | 接受的写法(只有这些) |
+|---|---|
+| 数 | 可带正负号的整数或小数(小数点是 `.`);科学计数法;千分位逗号且每组恰好三位(`1,234,567.8`);末尾带 `%`(存显示出来的数,列说明标明百分比) |
+| 日期 | 年在最前的写法:`2026-03-04`、`2026/03/04`、`2026.03.04`、`2026年3月4日`,后面可带 `时:分(:秒)` |
+| 文本(安全降级,不猜) | 带货币符号或代码、带单位、括号表示负数、带「万 / 亿 / k / M」等量级后缀、空格作千分位、月份名、只有年月 |
+| 文本,并在列说明里标「有两种读法,未转换」 | 日 / 月谁在前分不清的日期(`03/04/2026`);逗号后不是三位的数(`1,5` 可能是小数逗号);整列带点的值都是「点后恰好三位」(`1.234` 可能是千分位点);同一列里几种写法混着 |
+
 - 一列的非空格八成以上读得成数 → 数值列,读不成的格是空值并计数;否则文本列。有前导零或超过 15 位的一律当文字(不带前导零的短编号挡不住,已知限制)。
-- 百分比存显示出来的数(61.12),列说明标明;其余数值用原始值。公式格取缓存结果。隐藏的工作表 / 行 / 列照读。
-- DuckDB 里的类型:数值列 `DOUBLE`(全是整数时 `BIGINT`)、日期 `DATE` / `TIMESTAMP`、其余 `VARCHAR`。
+- 读成文本不丢信息:模型看得到列类型和样例,需要时可以在 SQL 里自己转换(工具说明要求它说明做了转换)。
+- 公式格取缓存结果。隐藏的工作表 / 行 / 列照读。DuckDB 里的类型:数值列 `DOUBLE`(全是整数时 `BIGINT`)、日期 `DATE` / `TIMESTAMP`、其余 `VARCHAR`。
 
 **程序标「疑似不规整」**(只标记,不纠正;标了的表照样能查,每次结果都提醒):表头行三成以上为空或重名;数据第一行全是文字而下面的列大多是数;数据中间有全空的行(在现有解析删空行**之前**判,`office_xlsx.py:94-100`)或「除一两格外全空」的行;数据中途出现整行文字而这些列大多是数;csv 的表头与 MarkItDown 认的不一致。表尾合计行标不出来(已知限制)。
 
@@ -180,7 +187,8 @@
 - **看表结构不装数据、不进执行容器**:直接从表的说明里取 —— SQL 里的表名、工作表名、行数、每列给模型看的列名(已带双引号,可以直接抄)、类型、非空数、范围或取值清单、前 3 行样例、不规整提醒。
 - **表名**:`d12_t1`(文档 12 的第 1 张表)—— 纯 ASCII、可预测、与出处编号 `D12#T1` 对得上。
 - **列名**:用原表头(中文照用),一律要求写在双引号里。规范化:去首尾空格、连续空白并成一个、去掉双引号和控制字符、最长 60 字符;空表头叫 `column_3`;重名(不分大小写 —— DuckDB 的标识符不分大小写)加 `_2`、`_3`;另有固定列 `_row`。
-- **工具说明**(平台文本,英文):什么时候用(计数、合计、平均、排序、筛选、按时间分组、跨表合并);先不带 `sql` 调一次看表结构;写 DuckDB 方言的单条 SELECT;列名加双引号;行列互换用分组和条件聚合来写(透视语句会被展开成多条而被拒);结果有行数上限,要全量就用聚合;表里可能有合计行。
+- **工具说明与全部固定文字**的英文原文在 §3.4。要点:什么时候用;先看表结构;单条 SELECT;列名加双引号;文本列要算就显式转换并说明;行列互换用分组和条件聚合(透视语句会被展开成多条而被拒);结果有行数上限;可能有合计行。
+- **注册条件是「库里有表格文件」,不是「表像数据」**:很多 xlsx 是问答表、清单、话术表。不为此加判断机制;对「列全是文本」的表,看表结构的结果里多一句提示(§3.4),并在护栏里专门量这类库有没有被带偏(§5.3)。
 - **结果**:一张 Markdown 表(租户文字,放 `content`)+ 说明行(平台文字,放 `notice`):用到的表的编号、返回了多少行 / 是否截断、不规整提醒、被挡下的文档及原因。
 - **写错了**:报错回给模型,模型可以改了再调;同一轮连续 3 次执行失败后,工具改为只返回平台文字「先看表结构,或换一种问法」,不再执行。
 - **智能体怎么知道哪份文档是表**:检索结果的 `notice` 里多一行,列出本次结果里哪些文档号有表格数据(取自文档行的 `table_count`,检索本来就读文档行,`tools/knowledge.py:901-905`)。不改结果正文和标头。R3 的清单同样处理。
@@ -269,7 +277,7 @@
 
 | 参数 | 说明 |
 |---|---|
-| `name` | 可选。文件名或标题里包含这段文字(字面、不分大小写) |
+| `name` | 可选。文件名或标题里包含这段文字(字面、不分大小写;比较前两侧都做全角 / 半角归一,全角字母数字写的文件名也找得到) |
 | `bases` | 可选,绑了两个以上库时才有:`K1`、`K2`(与 `knowledge_search` 同一套代号和校验)。目录外的库(超过 20 个时)没有代号,只能在不填时被列到 |
 | `order` | 可选:`number`(默认,文档号从小到大)或 `newest`(文档号从大到小;文档号按首次上传递增,重传不变) |
 | `after` | 可选:上一页最后一个文档号。不用页码 —— 文档号唯一且递增,用它当游标,中途有人上传、删除、停用都不会让后面的页错位 |
@@ -279,7 +287,7 @@
 - 每一行:`D12 · 文件名 · 标题(不同才有)· 库代号 · 上传日期 · 段数`。文件名超过 120 字符截断。
 - 说明行(平台文字):这一页多少份、符合条件的**准确总数**、涉及哪些库、下一页用的 `after` 值、哪些文档号有表格数据(R2 开着时)、还没入库成功的文档数。
 - 零结果分两种说:名字没有匹配;库里没有文档。
-- 工具说明(平台文本):看库里有什么、数一共几份、按名字找文档时用;文档号可以交给 `knowledge_read`;清单不是任何内容的依据,要引用内容先读。
+- 工具说明与固定文字的英文原文在 §3.4。
 - **出处**:清单里的 `D12` 只有文档号,按 4a 的规则不能当出处;清单结果不算「本轮显示过段落」。
 - `knowledge_read` 的候选清单超过 10 个时那一行,在本工具已注册的构建里多一句指向本工具(平台文字);没注册时逐字节不变。
 
@@ -331,7 +339,7 @@
 
 9 条用例、每条重复几次,结果会被一两条用例左右,说明不了问题。所以:
 
-**用例**:新造 **30 条指代明确**的合成用例(九类指代对象都有;每条的前文里至少有两个同类候选;追问必须检索才能答 —— 答案不在上一轮的结果里;每条的对象名带常见的别写法,例如日期的几种写法)。现有 9 条降为**开发集**,只用来调判据脚本,不进判定。
+**用例**:新造 **30 条指代明确**的合成用例(**至少 8 条是英文或中英混合的对话**;九类指代对象都有,且分散在互不相干的领域;每条的前文里至少有两个同类候选;追问必须检索才能答 —— 答案不在上一轮的结果里;每条的对象名带常见的别写法,例如日期的几种写法)。现有 9 条降为**开发集**,只用来调判据脚本,不进判定。
 
 **一次试验**怎么算错。前提两条:这一轮有成功的 `knowledge_search` 调用;这一轮所有检索词里,要么没有该指对象的名字(复数指代要求**全部**名字都在),要么写的是别的候选的名字。在这个前提下分两类,分开报:
 
@@ -353,7 +361,7 @@
 | 2~3 条 | 不自动下结论:把这几条的对话明细(标明甲类还是乙类)摆给用户定 |
 | 进分母的用例不到 20 条 | 测量作废(模型多数没检索),先改用例 |
 
-**模型**:只用平台默认答题模型跑(30 × 5 = 150 次多轮对话)。另外两家厂商不在本次范围;结论是「做」时,在验收阶段再各跑一遍。
+**模型**:只用平台默认答题模型跑(30 × 5 = 150 次多轮对话)。另外两家厂商不在本次范围;结论是「做」时,在验收阶段再各跑一遍。**结论的适用范围**:只对平台默认模型成立;中文和英文分开报数,哪种语言的用例不足 8 条有效,就写明结论对那种语言不成立。
 
 **证明指标咬得住**(离线重算,不花钱;任一条不成立则测量作废、先修脚本):
 
@@ -374,11 +382,65 @@
 | 参考 | 两家的改写都在非智能体流程里;用在「模型写的检索词」上没有先例 | 没有先例;与「规则写在参数上」的现有方向一致 |
 | 风险 | 辅助模型看的历史少,可能改错对象且更隐蔽 | 启发式误伤时多走一步,不会卡死 |
 
-两种都依赖启发式的准头;真要做,第一步是给计数器补分母。
+两种都依赖启发式的准头,而它现在只有中文(量词 + 指示词)和英文代词两套规则(`outgoing_reference.py:60-84`),别的语言的对话永远不会命中 —— 真要做,这两种草图都只对中文和英文有效,要么先补语言,要么写明限制。第一步是给计数器补分母。
 
 #### 3.3.4 不做什么
 
 测量结果出来之前不写任何产品代码;不把「当前对象」交给对接方传(11-05 已否决);不为每次检索无条件加一次改写调用。
+
+---
+
+### 3.4 平台文字原文与跨场景检验
+
+下面是这一批新增的、会被模型读到的全部平台文字。不带任何示例表名、列名、领域词;`D12`、`K2` 是平台自己的编号写法(现有工具说明里已在用);花括号里是程序填的编号和数字。实现时逐字用这些文本,改动要重过评测。
+
+**`knowledge_table` 的说明**:
+
+```text
+Run one read-only SQL query over the spreadsheet documents of the knowledge bases knowledge_search searches. Use it when the answer has to be computed from many rows: counting, totals, averages, ranking, filtering by a condition, grouping by a period or a category, or combining several sheets. For what one row or one piece of text says, use knowledge_search or knowledge_read. documents takes one to three document references (D12). Call it without sql first: the result lists each table of those documents with its SQL name, its row count, three sample rows and its columns (name, type, value range or distinct values). Then pass sql: a single SELECT statement in DuckDB SQL over those tables. Write every column name in double quotes exactly as listed. A column typed as text holds text even when its values look like numbers, dates or amounts; convert it in SQL only if the question needs a computation on it, and say in your answer that you converted it. To turn rows into columns, use GROUP BY with conditional aggregates. A result shows at most 200 rows, so aggregate in SQL instead of reading rows. A table may hold subtotal or total rows; leave them out when you add values up. Only what a query returned is evidence: the structure of a table alone is not.
+```
+
+参数:`documents` —— `One to three document references, e.g. D12.`;`sql` —— `A single SELECT statement in DuckDB SQL. Omit it to see the tables and their columns.`
+
+**`knowledge_list_documents` 的说明**:
+
+```text
+List the documents of the knowledge bases knowledge_search searches: reference, file name, title and upload date of each, and the exact total. Use it to see what the knowledge bases hold, to count documents, or to find a document by part of its file name or title. name keeps the documents whose file name or title contains that text, compared literally and ignoring case. Documents are listed by document number; pass the last reference of a result as after to get the next ones. A reference from the list can be passed to knowledge_read. The list says which documents exist, not what they say: read a document before stating anything about its content.
+```
+
+参数:`name` —— `Text the file name or title must contain.`;`bases` —— 沿用 `knowledge_search` 的原文;`order` —— `number (default, oldest first) or newest.`;`after` —— `The last reference of the previous result, e.g. D12.`;`limit` —— `Documents per result (default 20, at most 50).`
+
+**固定文字**(都放 `notice` 或报错,不混租户文字):
+
+| 用在哪 | 原文 |
+|---|---|
+| 检索结果里有表格文档(R2 开着) | `[table data: {refs} are spreadsheet documents; knowledge_table can count, total, sort or filter their rows]` |
+| 列文档结果的说明行 | `[documents {first}-{last} of {total} in {bases}; next: after={ref}]`;没有下一页时没有后半句;有表格文档时再加上一行同上的 `[table data: …]`;还没入库成功的:`[{n} more documents are not ready and are not listed]` |
+| 列文档零结果 | `[no document name contains that text]` / `[these knowledge bases hold no documents]` |
+| `knowledge_read` 候选超过 10 个时多的一句 | `knowledge_list_documents lists every match.` |
+| 表格查询结果的说明行 | `[tables used: {refs}; {n} rows returned]`;截断时 `[tables used: {refs}; first 200 rows of a longer result]` |
+| 表疑似不规整 | `[{ref} may not be one regular table: its header row or its blocks are unclear. Check the sample rows before relying on totals]` |
+| 表的列全是文本 | `[every column of {ref} is text: it is a list of text entries, not numeric data. knowledge_search usually answers questions about it; use SQL on it only to count or filter entries]` |
+| 列看着像数或日期但写法有两种读法 | 列类型处写 `text (values look like numbers or dates in a format that can be read two ways; not converted)` |
+| 文档的表不可查(有段被停用 / 被改过) | `[the table data of {ref} is not available: a passage of this document was switched off]` / `[… was edited]`,后接 `[knowledge_search and knowledge_read show its current text]` |
+| 没有这份文档(不存在、别的租户、没绑定的库,同一句) | `no document {ref} in this agent's knowledge bases` |
+| 文档没有表格数据 | `document {ref} has no table data` |
+| 语句不合规 | `[nothing was run: pass exactly one SELECT statement]` |
+| 访问被拒及其它不带原文的错误 | `[the query could not be run: files, network access and settings are not available here]` |
+| 超时或内存超限 | `[the query was stopped: it took too long or needed too much memory. Add a condition, or aggregate instead of returning rows]` |
+| 连续 3 次失败 | `[not run: three queries in a row failed in this turn. Look at the table structure again by calling without sql, or answer with what you have and say what could not be computed]` |
+| 排队超过 2 秒 | `[the table service is busy; make this call again in a moment]` |
+
+**跨场景检验**(拿六种不相干的表过一遍,每种写一条「这段文字会被怎么读错」;挡不住的如实写):
+
+| 场景 | 哪句、怎么读错 | 现在的措辞挡不挡得住 |
+|---|---|---|
+| 订单 / 流水 | 「leave total rows out」:表里有一**列**叫合计,模型把这一列排除 | 写的是 rows;挡得住多数,残留靠看样例行 |
+| 人员排班(日期横着排成列的交叉表) | 「grouping by a period」:模型按日期分组,而日期其实是列名 | 入库时这类表会被标不规整,不规整提示要求先看样例行;「rows into columns」那句不适用于反方向,残留 |
+| 设备 / 库存台账 | 「convert it in SQL」:模型把序列号、资产编号这类文本列转成数去算 | 限定为「only if the question needs a computation on it」;短编号被误判成数值列时挡不住(§3.1.2 已知限制) |
+| 问卷 / 工单(大段文字) | 「filtering by a condition」:问「大家怎么评价某件事」,模型去写 `LIKE` 而不是检索 | 说明第三句把「一行或一段文字说了什么」指回检索;全是文本列的表另有提示。按类别数回答数是正当用法,所以提示写的是 usually |
+| 问答表 / 话术表 | 每次检索的 `[table data: …]` 提示把模型引去查表,而答案就在检索到的那一段里 | 提示只说能 count / total / sort / filter;残留用护栏里「答案在文字型表格里」的 8 题量(§5.3) |
+| 测量 / 检验记录(带单位) | 「values look like numbers」:`12 mg` 这样的列是文本,模型不转换就比较大小,得到按字典序的结果 | 说明写明文本列「holds text」并要求转换时说明;模型不转换就比较的情况挡不住,列类型在表结构里是明示的 |
 
 ---
 
@@ -452,19 +514,28 @@
 | 5 | 容器里的环境变量为空、读不到主容器的进程信息、根文件系统写不进去 | (部署配置,真栈用例验) |
 | 全部 | 每条之后:内存盘目录之外没有新文件;回给模型的文字里没有环境变量、密钥;设置值里的目录只有那个固定的空目录 | — |
 
+**资料矩阵**(写死在 E0b 里;题数不变,只约束资料长什么样。7 份验收文件合起来必须满足):
+
+| 维度 | 要求 |
+|---|---|
+| 领域 | 至少四个互不相干的:订单或流水、人员或排班、设备或库存台账、工单或问卷这类文字多的表 |
+| 表头语言 | 中文、英文、中英混合各至少一份 |
+| 形状 | 至少一份 50 列以上的宽表;不规整组里有一份「月份当列」的交叉表 |
+| 写法 | 至少各有一列:带货币符号或单位的数、非年在前的日期、百分比、带前导零的编号 |
+
 **资料与题**(开发 / 验收分开;验收组开发期间不看逐题结果):
 
 | 组 | 资料 | 题 |
 |---|---|---|
 | 开发 | 3 份 xlsx + 1 份 csv | 统计 10 |
-| 验收 · 规整表 | 2 份 xlsx + 1 份 csv | 基础统计 12(计数、求和 / 平均、最大最小与排序、分组、带条件明细) |
+| 验收 · 规整表 | 3 份 xlsx + 1 份 csv | 基础统计 12(计数、求和 / 平均、最大最小与排序、分组、带条件明细) |
 | 验收 · 进阶问法 | 同上资料 | 10(按月分组、单价 × 数量、分组后筛选、每组前 N、「或」、跨表合计)—— 第 3 版里是「语法外、不设线」,现在应当能答,**进验收并设线** |
-| 验收 · 不规整表 | 2 份 xlsx(表头不在第一行、两行表头、一张工作表两块表、表尾合计行) | 统计 8 |
+| 验收 · 不规整表 | 3 份 xlsx(表头不在第一行、两行表头、一张工作表两块表、表尾合计行、月份当列的交叉表) | 统计 8 |
 | 点查护栏 | 同上资料 | 10 |
 
 标准答案由独立脚本从原文件算。程序判分(数值容差千分之一;名字集合相同)。两臂(改动前 / 改动后),每题两次。题目难度的作废判定只在开发组上做(开发组改动前两次合计 > 10 / 20 则出题方法要改)。
 
-**「数不是从工具来的」怎么判**(程序):答对了,但这道题全部工具结果里找不到答案里的那个数 —— 匹配用与判分相同的千分之一容差,并把 ×100(百分比)和 ÷10,000(万)两种换算也算作匹配。
+**「数不是从工具来的」怎么判**(程序):答对了,但这道题全部工具结果里找不到答案里的那个数 —— 匹配用与判分相同的千分之一容差,并把常见的量级换算也算作匹配(×100;÷1,000、÷10,000、÷1,000,000,即百分比与「千 / 万 / 百万、k / M」)。这只影响评测里这一个指标的判定,不影响产品;别的量级写法会被误算成「不是从工具来的」,报数时人工看一遍。
 
 **线**(用户 11-11 已定;进阶问法一行是起点值、没有基线,用户同日确认按此):
 
@@ -493,7 +564,9 @@
 | 开发组改动前两次合计 | > 6 / 20 则出题方法要改 |
 | 对照:标准答案轮换一位 / 关开关 | ≤ 1 / 20;工具清单逐字节相同 |
 
-- **护栏(R2 + R3 一起)**:从普通集的有答案题里用固定种子随机抽 20 题,两个开关开 / 关各跑两次(80 题次,3 票判分)。退步 = 关着两次都对、开着两次都不对的题;线:≤ 1 道。
+- **护栏(R2 + R3 一起)**:两个开关开 / 关各跑两次(3 票判分)。退步 = 关着两次都对、开着两次都不对的题。两套题都跑、分开报:
+  - 现有普通集的有答案题 20 道:其中**固定至少 8 道的答案出自文字型的表格文件**(问答表、清单这一类,单独报 —— 量这类库的智能体有没有被表格工具和提示行带偏),其余用固定种子随机抽。线:退步 ≤ 1 道,且那 8 道里退步 0 道。
+  - **通用合成集**(定义见 4a 设计:合同条款、SOP、会议纪要、接口 / 代码文档四个领域,约 40 题):按领域报;线:每个领域退步 ≤ 1 道。4a 的这套集没建好之前,本项不算验收完成。
 
 ### 5.4 花费(只给算法;开跑前按当时的记录出报价,用户说「跑」再跑)
 
@@ -505,10 +578,11 @@
 | R2 开发组:10 题,最多 5 轮 | 50 | ¥48 |
 | R2 四家方言冒烟 | 40 | ¥38(按默认单价估,各家价目另算) |
 | R3:验收 10 × 2 × 2 + 开发 10 × 最多 3 轮 | 70 | ¥67 |
-| 护栏:20 × 2 × 2 | 80 | ¥77 |
-| **小计** | 400 | **估算约 ¥384** |
+| 护栏:现有集 20 × 2 × 2 | 80 | ¥77 |
+| 护栏:通用合成集约 40 × 2 × 2(本版新增) | 160 | ¥154 |
+| **小计** | 560 | **估算约 ¥538**(上一版约 ¥384) |
 | R4:30 条 × 5 次 = 150 次多轮对话 | 150 | 没有可用单价;开跑前先实测 3 条再报价 |
-| **合计** | | **估算约 ¥384 + R4(待实测)** |
+| **合计** | | **估算约 ¥538 + R4(待实测)** |
 
 写 SQL 会让每题多几次模型调用,¥0.96 的单价多半偏低:开跑前先实测几题再报价。第 0 步、安全对照、全部离线对照:不花模型钱。
 
@@ -520,8 +594,8 @@
 
 | # | PR | 内容 | 主要改动文件 | 依赖 | 测试 |
 |---|---|---|---|---|---|
-| 1 | **E0b** 评测地基 | 合成工作簿与 csv、R2 / R3 的题、标准答案脚本、护栏抽样(固定种子) | `tools/eval/datasets/kb/`(新子目录)、新 `tools/eval/kb_table_cases.py` | 无 | 标准答案脚本的结果人工抽 5 题用表格软件核对 |
-| 2 | **M0** R4 测量 | 30 条新用例;判据按 §3.3.2 改;三个离线对照 | `tools/eval/datasets/behavior/cases/`、`behavior_coref.py`、`behavior_schema.py`、README | 无 | 对自带的合成记录汇总照常出表;三个对照按预期 |
+| 1 | **E0b** 评测地基 | 合成工作簿与 csv(按 §5.2 的资料矩阵)、R2 / R3 的题、标准答案脚本、护栏抽样(固定种子 + 8 道文字型表格题) | `tools/eval/datasets/kb/`(新子目录)、新 `tools/eval/kb_table_cases.py` | 无 | 标准答案脚本的结果人工抽 5 题用表格软件核对 |
+| 2 | **M0** R4 测量 | 30 条新用例(至少 8 条英文或中英混合);判据按 §3.3.2 改;三个离线对照 | `tools/eval/datasets/behavior/cases/`、`behavior_coref.py`、`behavior_schema.py`、README | 无 | 对自带的合成记录汇总照常出表;三个对照按预期 |
 | 3 | **L1** 列文档(R3) | 「可服务文档」的共用判断;存储方法;工具;注册与开关;各清单;`knowledge_read` 一行提示;评测循环;管理端显示名 | 新 `tools/knowledge_list.py`;`tools/assembly.py:476-501`;`persistence/knowledge/{base,sql,memory}.py`;`protocol/agent_spec.py:1408-1418`;`tools/overflow.py:124-126`;`graph_builder/outgoing_reference.py:45`;`tools/knowledge_read.py:413-418`;`settings.py`;`tools/eval/kb_agent_answer.py`;`admin-ui/src/api/tool_timeline.ts`、`i18n` | E0b | 见下 |
 | 4 | **D1** 表格:存储与入库(不含 DuckDB) | 迁移;读表、定类型、标不规整;写压缩 CSV 字节与说明;同事务清 / 写;补算命令(带围栏);文档两个只读字段与详情页;开关 | 新迁移;新 `knowledge/table_data.py`、`knowledge/backfill_tables.py`;`knowledge/office_xlsx.py:53-100`;`knowledge/ingestion.py:545-702,862-934`;`persistence/knowledge/{base,sql,memory}.py`、`persistence/models/knowledge.py`;`protocol/knowledge.py:441-507`;`api/knowledge.py`(文档序列化处);文档详情页、`i18n` | E0b | 见下 |
 | 5 | **D2** 表格:执行容器与工具 | **第一步是第 0 步**(加 `duckdb` 钉版本、探针脚本、安全对照),过了才往下;执行服务(一次性进程:装载 → 锁死 → 判语句 → 执行 → 限额);部署清单加容器,内存预算测试加一条;报错三类;工具;按「有没有表」门控与构建缓存键;停用 / 改过段的判断;`notice` 提示行;各清单;评测循环;管理端显示名 | `services/control-plane/pyproject.toml`、`uv.lock`;新 `knowledge/table_query_worker.py`(只有它导入 `duckdb`)、`tools/eval/kb_table_probe.py`、新 `tools/knowledge_table.py`;`infra/k8s/base/control-plane/deployment.yaml`、`tools/deploy/test_parse_worker_memory_budget.py`;`settings.py`;`tools/assembly.py:476-501`;`tools/knowledge.py:884-916`(带出「文档有表」;与 4a 的 A0 同一段,排在 A0 之后)、`:1204-1225`(只动 `notice`);`tools/knowledge_list.py`;构建缓存键;各清单同 L1 | D1;L1 | 见下 |
@@ -585,7 +659,8 @@
 | 5 | 已有表格文件怎么补、多大的表不存 | 平台免费补算;每表 5 万行 / 200 列、每文档 100 万格 | 已定 |
 | 6 | 段被停用或改过之后 | 整份表不可查并提示原因 | 已定;重新上传恢复不了 |
 | 7 | R4「做不做」怎么判 | 按文档的数(§3.3.2) | 已定 |
-| 8 | 验收线与花费 | 按文档的数,开跑前再报价 | 已定;因 #4 新增一组安全对照和进阶问法的线(见下两行),花费估算从约 ¥375 变为约 ¥384 |
+| 8 | 验收线与花费 | 按文档的数,开跑前再报价 | 已定;因 #4 新增一组安全对照和进阶问法的线;通用性审计后护栏加跑通用合成集,花费估算现为约 ¥538 |
+
 | 9 | 模型写的查询语句在哪里执行 | **测试和生产都在同一个 pod 里的独立容器(不带任何密钥)** | 已定,按推荐(§3.1.3)。已知代价:每个副本多一个容器(1.5 GiB、1 核);与主服务共用网络、禁不了出网,万一限制被绕过,这一次查的那几张表可能被发到外面 |
 | 10 | 「进阶问法」的验收线 | **20 题次里答对 ≥ 14** | 已定,按推荐;14 是起点值,没有基线 |
 
@@ -605,7 +680,8 @@
 | V8 | 各厂商模型写 DuckDB 方言的能力 | §5.2 四家冒烟 |
 | V9 | csv 经 MarkItDown 得到的表头与我们自己读的是否一致;K-18 之前入库的 xlsx,段落表头与补算出的列名是否一致 | D1 开工时用合成文件比;补算空跑时计数 |
 | V10 | 对外文档有没有约定「工具名是开放集合」 | 没找到明文;按提前通知处理 |
-| V11 | 「八成读得成数」的阈值;五个不规整信号的命中与误报 | 开发组上调,验收组上验 |
+| V11 | 「八成读得成数」的阈值;五个不规整信号的命中与误报;「有两种读法」几条规则的误判 | 开发组上调,验收组上验 |
+| V21 | §3.4 的平台文字各模型读了之后的实际行为(跨场景检验是纸面推演);这两个工具的说明没有在英文对话、非中文表头上跑过 | §5.2 的资料矩阵与四家冒烟;护栏的通用合成集 |
 | V12 | 构建缓存的键在哪里拼 | D2 开工时读 `agent_factory.py` |
 | V13 | 旧的工具结果被压缩时,不认识的知识库工具走哪条路 | 读 `context/tool_result_prune.py:206-243,375-383`;L1 的单测钉住 |
 | V14 | 4a 的识别函数加 `#T` 后与区间写法、4c 的 `@` 是否冲突 | 4a 的模块还不存在;D3 开工时写联合单测 |
@@ -739,7 +815,7 @@
 | 项 | 数 | 依据 |
 |---|---|---|
 | 一次检索送重排的候选 | 50~100 个,每个最多 3,000 字符 + 查询 | `tools/knowledge.py:293,487-490` |
-| 最坏一次的重排量 | 100 ×(3,000 + 500)字符,再加「只看正文」那一路的 20 个候选 ≈ 42 万字符;按中文 1 字约 1 token 计 ≈ 42 万 token | 双视图(`tools/knowledge.py:104-105`) |
+| 最坏一次的重排量(「中文 1 字约 1 token」「查询 500 字符」都是按中文资料估的口径,**R1 启动时按当时的语料和价目重估**) | 100 ×(3,000 + 500)字符,再加「只看正文」那一路的 20 个候选 ≈ 42 万字符;按中文 1 字约 1 token 计 ≈ 42 万 token | 双视图(`tools/knowledge.py:104-105`) |
 | 重排单价 | 仓库价目里没有重排模型的行;按 B-206 设计里写的 ¥0.5 / 百万 token 估 | **未验证**,P3 开工前按生产价目表重算 |
 | 最坏一次 | 高估值约 ¥0.21;按现有的单次重排上限(12 万 token,超了会裁候选)约 **¥0.1**。嵌入那一次不到 ¥0.001。「用聊天模型重排」的配置(`usage_metering.py:38-40`)没算 | 目录注释里的整次上限(`protocol/model_catalog.py:837`);`llm/rerank.py:143-152` |
 | 一般一次 | 段落 500 字左右、查询 50 字:约 ¥0.03 | 估算 |
