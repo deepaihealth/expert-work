@@ -851,3 +851,156 @@ async def test_low8c_stale_is_a_counted_kind_classified_failure(tmp_path: Path) 
     assert classified.error_class == "unknown"
     event = FileToolEvent("edit_file", args, ok=False, failure_kind=error.kind)
     assert streak_for(next_streaks(streaks, [event]), "f.py").failures == 3
+
+
+# ---------------------------------------------------------------------------
+# Re-review fixes (B-302 PR 3 re-review of 4bace8eb4)
+# ---------------------------------------------------------------------------
+
+
+def _random_lines(seed: int, alphabet: str, count: int, width: int) -> list[str]:
+    import random
+
+    rng = random.Random(seed)  # noqa: S311 — synthetic test content, not security
+    return ["".join(rng.choices(alphabet, k=width)) for _ in range(count)]
+
+
+@pytest.mark.parametrize("two_edits", [False, True])
+def test_rr_m2_replace_all_with_indent_drift_names_no_earlier_edit(
+    tmp_path: Path, two_edits: bool
+) -> None:
+    """Reviewer scenario A / A2: replace_all only matches exactly. "Matches when spaces are
+    ignored" is not "an earlier edit changed it" — there may be no earlier edit at all."""
+    body = "a = 0\ndef f():\n    x = 1\n    y = 2\n"
+    (tmp_path / "f.py").write_text(body, encoding="utf-8")
+    drift = {"old": "  x = 1\n  y = 2", "new": "z", "replace_all": True}
+    edits = (
+        [{"old": "a = 0", "new": "a = 9", "replace_all": False}, drift] if two_edits else [drift]
+    )
+    msg = _render(_run_snippet(build_edits_wrapper("f.py", edits, ws=str(tmp_path))))
+    assert "earlier edit" not in msg
+    assert "with replace_all, 'old_string' must match exactly" in msg
+    assert (tmp_path / "f.py").read_text(encoding="utf-8") == body
+
+
+def test_rr_m2_replay_uses_the_real_matcher_at_each_step(tmp_path: Path) -> None:
+    """Edit 1 re-indents a line with a tab; edit 2 (replace_all) then only matches when
+    spaces are ignored — which replace_all does not do. So it is edit 1 that broke it."""
+    body = "    x = 1\n    y = 2\n"
+    (tmp_path / "f.py").write_text(body, encoding="utf-8")
+    edits = [
+        {"old": "    x = 1", "new": "\tx = 1", "replace_all": False},
+        {"old": "    x = 1\n    y = 2", "new": "z", "replace_all": True},
+    ]
+    msg = _render(_run_snippet(build_edits_wrapper("f.py", edits, ws=str(tmp_path))))
+    assert "an earlier edit in this call (edit 1) changes that place" in msg
+
+
+def test_rr_m3_wall_clock_backstop_stops_the_scan(tmp_path: Path) -> None:
+    """The wall-clock backstop alone (no work budget involved) stops the scan."""
+    body = "".join(f"value_{k} = compute({k})\n" for k in range(50))
+    (tmp_path / "f.py").write_text(body, encoding="utf-8")
+    code = build_edit_wrapper("f.py", "value_7 = compute(77)", "x", ws=str(tmp_path))
+    assert code.count("_SIM_WALL_S = 5.0") == 1
+    env = _run_snippet(code.replace("_SIM_WALL_S = 5.0", "_SIM_WALL_S = -1.0"))
+    assert "no close line among lines 1-" in env["detail"]
+
+
+def test_rr_m2_glyph_level_counts_as_a_match_on_the_original(tmp_path: Path) -> None:
+    """The real matcher's third level (datamark glyphs stripped) decides too."""
+    body = "def f(a):\n    return a + 1\n"
+    (tmp_path / "f.py").write_text(body, encoding="utf-8")
+    edits = _edits(
+        ("def f(a):", "def f(a, b):"),
+        ("def▁ f(a):\n    return a + 1", "def f(a):\n    return a + 2"),
+    )
+    msg = _render(_run_snippet(build_edits_wrapper("f.py", edits, ws=str(tmp_path))))
+    assert "an earlier edit in this call (edit 1) changes that place" in msg
+
+
+def test_rr_m1_truncated_ties_never_count_as_already_applied(tmp_path: Path) -> None:
+    """Reviewer scenario B: template lines sharing a >200-code-point prefix all tie after
+    truncation. The new text equals line 1 but the mis-copied line is line 5: no success."""
+    prefix = "INSERT INTO events (id, kind, payload, created_at, source, region) VALUES (" + (
+        "'common-prefix-padding-" * 8
+    )
+    assert len(prefix) > 200
+    target = prefix + "1001, 'click', 'button-ok', '2026-01-01');"
+    new_line = prefix + "9, 'zzz', 'qqq', 'n/a');"
+    others = [prefix + f"100{k}, 'click', 'button-ok', '2026-01-0{k}');" for k in (2, 3, 4)]
+    body = "\n".join([new_line, *others, target]) + "\n"
+    (tmp_path / "f.sql").write_text(body, encoding="utf-8")
+    old = prefix + "1001, 'click', 'buton-ok', '2026-01-01');"
+    env = _run_snippet(build_edit_wrapper("f.sql", old, new_line, ws=str(tmp_path)))
+    assert env["ok"] is False
+    assert env["error"] == "no_match"
+    assert env["detail"].index("near line 5,") < env["detail"].index("yours")
+    assert (tmp_path / "f.sql").read_text(encoding="utf-8") == body
+
+
+def test_rr_m1_rescoring_alone_does_not_make_truncation_exact(tmp_path: Path) -> None:
+    """More than 10 lines tie after truncation, so the whole-line re-score only sees the
+    first 10 by line order. Among those the new text (line 1) looks like a top-3 line, but
+    the truly closest lines come later: truncation must keep the result approximate."""
+    prefix = "UPDATE settings SET " + ("value_with_a_long_shared_prefix_" * 7)
+    assert len(prefix) > 200
+    probe = prefix + "1001, 'click', 'buton-ok', '2026-01-01');"
+    new_line = prefix + "1001, 'click', 'zzzz', 'n/a');"
+    far = [prefix + f"{'Q' * 30}{k}" for k in range(9)]
+    near = [prefix + f"1001, 'click', 'button-ok', '2026-01-0{k}');" for k in (2, 3, 4)]
+    target = prefix + "1001, 'click', 'button-ok', '2026-01-01');"
+    body = "\n".join([new_line, *far, *near, target]) + "\n"
+    (tmp_path / "f.sql").write_text(body, encoding="utf-8")
+    env = _run_snippet(build_edit_wrapper("f.sql", probe, new_line, ws=str(tmp_path)))
+    assert env["ok"] is False
+    assert (tmp_path / "f.sql").read_text(encoding="utf-8") == body
+
+
+def test_rr_m1_scan_stopped_early_never_counts_as_already_applied(tmp_path: Path) -> None:
+    """Reviewer "budget" scenario: the new text is on line 1, the real target is after
+    thousands of lines that pass the cheap filters but score low. The scan stops before the
+    target: the result is approximate, so no "already applied", and the detail says how far
+    the comparison went."""
+    import random
+
+    rng = random.Random(1)  # noqa: S311 — synthetic test content, not security
+    alpha = "abcdefghijklmnopqrstuvwxyz"
+    target = "".join(rng.choices(alpha, k=200))
+    probe = target[:150] + "#" + target[151:]
+    new_line = target[:120] + "".join(rng.choices(alpha, k=80))
+    filler = ["".join(rng.sample(probe, len(probe))) for _ in range(5000)]
+    (tmp_path / "f.txt").write_text("\n".join([new_line, *filler, target]) + "\n")
+    env = _run_snippet(build_edit_wrapper("f.txt", probe, new_line, ws=str(tmp_path)))
+    assert env["ok"] is False
+    assert "closest among lines 1-" in env["detail"]
+    assert "only" in env["detail"]
+
+
+def test_rr_m3_one_budget_for_the_whole_call_on_hard_shapes(tmp_path: Path) -> None:
+    """Reviewer csv2 / bin shapes: small alphabets make difflib slow per character, and
+    several edits each scan. One budget (work + wall clock) for the whole call keeps it
+    bounded; the generous time limit only guards against a runaway, the budget-exhausted
+    wording is the real assertion."""
+    binary = _random_lines(7, "01", 5000, 200)
+    (tmp_path / "bin.txt").write_text("\n".join(binary) + "\n", encoding="utf-8")
+    edits = [
+        {"old": binary[4000 + k][:100] + "2" + binary[4000 + k][101:], "new": binary[k * 7]}
+        for k in range(6)
+    ]
+    started = time.perf_counter()
+    env = _run_snippet(build_edits_wrapper("bin.txt", edits, ws=str(tmp_path)))
+    elapsed = time.perf_counter() - started
+    print(f"[b302-pr3] 6 edits on 5,000 x 200 binary lines: {elapsed:.2f}s")
+    assert env["ok"] is False
+    assert "only" in env["detail"]
+    assert elapsed < 10.0
+
+    rows = [",".join("%.4f" % (k * 0.37 % 1) for k in range(i, i + 33))[:200] for i in range(6000)]
+    (tmp_path / "rows.csv").write_text("\n".join(rows) + "\n", encoding="utf-8")
+    old = rows[5000][:100] + "9" + rows[5000][101:]
+    started = time.perf_counter()
+    env = _run_snippet(build_edit_wrapper("rows.csv", old, rows[5], ws=str(tmp_path)))
+    elapsed = time.perf_counter() - started
+    print(f"[b302-pr3] 6,000-row numeric CSV, new_string an existing row: {elapsed:.2f}s")
+    assert env["ok"] is False
+    assert elapsed < 10.0

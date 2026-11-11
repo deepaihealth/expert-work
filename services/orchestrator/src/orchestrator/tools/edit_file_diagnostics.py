@@ -36,16 +36,24 @@ STREAK_NOTICE_FROM = 3
 #: 不碰 ``_P``。用 raw 字符串:里面的反斜杠转义(换行、码点)是给沙箱里的 Python 解释的。
 EDIT_DIAGNOSTICS_SOURCE = r"""
 
+import time
 import unicodedata
 
-#: §4.3.2 —— 相似度门槛(同 openclaw)、最多几行、超过多少行先粗筛。
+#: §4.3.2 —— 相似度门槛(同 openclaw)、最多几行。
 _SIM_CUTOFF = 0.45
 _SIM_TOP = 3
-#: 相似度只比每行(和 probe)的前这么多码点;过了两道上界粗筛、真正去算 ratio 的行,整个文件
-#: 合计最多这么多码点(之后的行不再比)—— 大文件 / 超长行的最坏情况(几千行、每行两千字符)
-#: 要远低于沙箱的执行时限。列号与片段仍按整行算(_describe)。
+#: 相似度先只比每行(和 probe)的前这么多码点;得分最高的 _SIM_RESCORE 行再按整行重算,
+#: 打破截断造成的并列。列号与片段始终按整行算(_describe)。
 _SIM_LINE_CAP = 200
-_SIM_BUDGET = 4000000
+_SIM_RESCORE = 10
+#: 整次 edit_file 调用(所有改动、所有扫描)共用的上限:真正算过 ratio 的每一对按
+#: 「行长乘 probe 长」计工作量,合计不超过 _SIM_WORK(difflib 在最坏的字母表上本机约
+#: 一两千万单位每秒,所以约 3 秒);另有墙钟兜底 _SIM_WALL_S 秒。任一用完,之后的行不再比,
+#: 结果记为「近似」:不拿它判「已改过」(条件 6),说明里写明只比到第几行。
+_SIM_WORK = 40000000
+_SIM_WALL_S = 5.0
+_SCAN = {"work": _SIM_WORK, "deadline": None}
+_NEAR_CACHE = {}
 #: 片段:差异处前后各约 8 个码点;为了不切断字形,每侧最多再向外扩 8 个。
 _SNIP_RADIUS = 8
 _SNIP_STRETCH = 8
@@ -109,39 +117,88 @@ def _probe(text, old):
     return None
 
 
+def _late():
+    # 墙钟兜底:第一次扫描时开始计,整次调用 _SIM_WALL_S 秒。
+    if _SCAN["deadline"] is None:
+        _SCAN["deadline"] = time.monotonic() + _SIM_WALL_S
+    return time.monotonic() > _SCAN["deadline"]
+
+
+def _spend(units):
+    # 从整次调用共用的工作量上限里扣 units;扣不起(或墙钟到点)返回 False,什么都不扣。
+    if units > _SCAN["work"] or _late():
+        return False
+    _SCAN["work"] -= units
+    return True
+
+
 def _similar(lines, probe):
     # 与 probe 最像的至多 _SIM_TOP 行的下标(0 起),按相似度从高到低、同分按行序。
-    # real_quick_ratio / quick_ratio 是 ratio 的上界,先用它们筛掉不可能过门槛的行(结果不变);
-    # 只比前 _SIM_LINE_CAP 个码点;去算 ratio 的行合计最多 _SIM_BUDGET 个码点(之后的行不再比)。
+    # 返回 (下标, 近似?, 比到第几行为止或 None)。
+    # real_quick_ratio / quick_ratio 是 ratio 的上界,先用它们筛掉不可能过门槛的行(结果不变)。
+    # 「近似」:有截断(probe 或某行超过 _SIM_LINE_CAP —— 截断后的分数不是整行分数的上界,
+    # 前 3 行可能不是真的前 3 行),或上限用完、后面的行没比。
     import difflib
 
     matcher = difflib.SequenceMatcher(autojunk=False)
-    matcher.set_seq2(probe[:_SIM_LINE_CAP])
-    budget = _SIM_BUDGET
+    short = probe[:_SIM_LINE_CAP]
+    matcher.set_seq2(short)
+    truncated = len(probe) > _SIM_LINE_CAP
+    stopped = None
     scored = []
     for idx, raw in enumerate(lines):
-        body = raw.strip()[:_SIM_LINE_CAP]
-        if not body:
+        full = raw.strip()
+        if not full:
             continue
+        body = full[:_SIM_LINE_CAP]
+        truncated = truncated or len(full) > _SIM_LINE_CAP
         matcher.set_seq1(body)
         if matcher.real_quick_ratio() < _SIM_CUTOFF or matcher.quick_ratio() < _SIM_CUTOFF:
+            if _late():
+                stopped = idx
+                break
             continue
-        budget -= len(body)
-        if budget < 0:
+        if not _spend(len(body) * len(short)):
+            stopped = idx
             break
         ratio = matcher.ratio()
         if ratio >= _SIM_CUTOFF:
             scored.append((-ratio, idx))
     scored.sort()
-    return [idx for _neg, idx in scored[:_SIM_TOP]]
+    if truncated and scored:
+        scored = _rescore(lines, probe, scored)
+    return [idx for _neg, idx in scored[:_SIM_TOP]], truncated or stopped is not None, stopped
+
+
+def _rescore(lines, probe, scored):
+    # 截断造成的并列:得分最高的 _SIM_RESCORE 行按整行重算(算进同一个上限);
+    # 上限不够时保留截断后的次序(结果本来就已记为近似)。
+    import difflib
+
+    matcher = difflib.SequenceMatcher(autojunk=False)
+    matcher.set_seq2(probe)
+    rescored = []
+    for _neg, idx in scored[:_SIM_RESCORE]:
+        full = lines[idx].strip()
+        if not _spend(len(full) * len(probe)):
+            return scored
+        matcher.set_seq1(full)
+        rescored.append((-matcher.ratio(), idx))
+    rescored.sort()
+    return rescored + scored[_SIM_RESCORE:]
 
 
 def _near(text, old):
-    # (probe, 最像的行下标)。probe 为 None 时下标为空。
-    probe = _probe(text, old)
-    if probe is None:
-        return None, []
-    return probe, _similar(text.split("\n"), probe[1])
+    # (probe, 最像的行下标, 近似?, 比到第几行为止或 None)。probe 为 None 时下标为空。
+    # 同一次调用里同一处改动只扫一次(「已改过」与说明共用)。
+    key = (text, old)
+    if key not in _NEAR_CACHE:
+        probe = _probe(text, old)
+        if probe is None:
+            _NEAR_CACHE[key] = (None, [], False, None)
+        else:
+            _NEAR_CACHE[key] = (probe,) + _similar(text.split("\n"), probe[1])
+    return _NEAR_CACHE[key]
 
 
 def _first_diff(a, b):
@@ -165,11 +222,18 @@ def _describe(raw, probe):
 
 
 def _no_match_detail(text, old):
-    probe, near = _near(text, old)
+    probe, near, _approx, stopped = _near(text, old)
     if probe is None:
         return "every line of 'old_string' is in the file, but not together in this order"
+    # 上限用完时只比到第 stopped 行:说「在前 N 行里最像的」,不说成整个文件里最像的。
+    scope = "closest" if stopped is None else "closest among lines 1-%d only" % stopped
     if not near:
-        return None
+        if stopped is None:
+            return None
+        return "line %d of 'old_string' differs; no close line among lines 1-%d " % (
+            probe[0],
+            stopped,
+        ) + "(the comparison stopped there)"
     lines = text.split("\n")
     parts = []
     for idx in near:
@@ -178,7 +242,7 @@ def _no_match_detail(text, old):
             "near line %d, column %d: yours «%s» / file «%s»" % (idx + 1, col, yours, mine)
         )
     return (
-        "line %d of 'old_string' differs; closest: " % probe[0]
+        "line %d of 'old_string' differs; %s: " % (probe[0], scope)
         + "; ".join(parts)
         + " (columns counting Unicode code points)"
     )
@@ -227,7 +291,9 @@ def _already_applied(text, edit):
             touched.append(idx)
     if not whole:  # 1(覆盖至少一整行)
         return None
-    near = _near(text, old)[1]
+    _probe_line, near, approx, _stopped = _near(text, old)
+    if approx:  # 6 判不准(截断 / 上限用完)→ 宁可报没对上,也不误判成功
+        return None
     hits = [idx for idx in touched if idx in near]  # 6(覆盖的任一行在最像的 3 行里)
     if not hits:
         return None

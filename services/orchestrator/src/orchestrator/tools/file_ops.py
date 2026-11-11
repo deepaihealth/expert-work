@@ -515,11 +515,19 @@ def _recheck(edits, outcomes, updated):
             }
 
 
+def _would_match(text, edit):
+    # The real matcher's verdict (all three levels, replace_all included): anything but
+    # no_match means this edit's old_string finds its place in ``text``.
+    applied = _apply_edit(text, edit["old"], edit["new"], edit.get("replace_all", False))
+    return applied.get("ok") or applied.get("error") != "no_match"
+
+
 def _changed_by_earlier(text, edits, outcomes, first):
-    # Edit `first` did not match the text the edits before it produced, but its old_string
-    # IS in the original file: an earlier edit of this call changed that place. Replays
-    # the earlier edits that matched to name the one after which it stops matching.
-    old = edits[first]["old"]
+    # Edit `first` did not match the text the edits before it produced. When it DOES match
+    # the original file, replay the earlier edits that matched and name the one after
+    # which it stops matching. None when that is not what happened.
+    if not _would_match(text, edits[first]):
+        return None
     current = text
     for k in range(first):
         if outcomes[k]["state"] != "ok":
@@ -528,12 +536,12 @@ def _changed_by_earlier(text, edits, outcomes, first):
         current = _apply_edit(current, edit["old"], edit["new"], edit.get("replace_all", False))[
             "text"
         ]
-        if not _old_in(current, old):
+        if not _would_match(current, edits[first]):
             return (
                 "its old text is in the file, but an earlier edit in this call (edit %d) "
                 "changes that place" % (k + 1)
             )
-    return "its old text is in the file, but an earlier edit in this call changes that place"
+    return None
 
 
 def _failure(text, edits, outcomes, history):
@@ -548,9 +556,14 @@ def _failure(text, edits, outcomes, history):
     old = edits[first]["old"]
     if env.get("error") == "no_match":
         if "detail" not in env:
-            if _old_in(text, old):
-                detail = _changed_by_earlier(text, edits, outcomes, first)
-            else:
+            detail = _changed_by_earlier(text, edits, outcomes, first)
+            if detail is None and edits[first].get("replace_all") and _old_in(text, old):
+                # replace_all has no whitespace-tolerant level (B-137).
+                detail = (
+                    "with replace_all, 'old_string' must match exactly, indentation and "
+                    "spaces included; it matches here only when spaces are ignored"
+                )
+            if detail is None:
                 detail = _no_match_detail(text, old)
             if detail:
                 env["detail"] = detail
