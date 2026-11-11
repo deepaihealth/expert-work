@@ -2481,3 +2481,16 @@ asyncio.run(main())
 - [ ] **110.5 多轮指代**:触发:知识库智能体会话第 1 轮问资料里有的对象 A 的一项属性,第 2 轮只问「那它的 <另一项属性> 呢」。再开一个会话:第 1 轮让答复同时讲到资料里的两个同类对象 A、B,第 2 轮问「它的 <属性> 呢」。看哪里:轨迹里第 2 轮 `knowledge_search` 的 `query`;答复正文。判据:第一组 `query` 写出了 A 的名字、不含「它」,答复点明说的是 A;第二组答复先问是哪一个,或 A、B 分别作答并点名。各跑 2 次,记录结果。
 - [ ] **110.6 指代词计数器**:触发:临时建一个绑同一知识库的智能体,系统提示词写「Always call knowledge_search with the user's message, unchanged, as the query」,问「它的保质期多久」1 次。看哪里:测试集群 Prometheus 查 `expert_work_outgoing_query_reference_total`。判据:`tool="knowledge_search"` 的序列 +1(按调用次数),标签只有 `tool`;再问一句不带指代词的问题,计数不变。做完删掉这个临时智能体。
 - [ ] **110.7 非知识库智能体:改写轮不受影响,外发参数照样自带主语**:用只有 `web_search` 的对照智能体(有接好的 MCP 工具的智能体也可以)。触发:第 1 轮问一个公开的对象 A 的情况(让它联网搜);第 2 轮「把上面的回答缩短一点」;第 3 轮「那它的 <另一项> 呢」。看哪里:轨迹里每轮的工具调用与 `query`;答复正文。判据:第 2 轮不调工具,答复里没有「我理解的『它』指的是……」一类的说明;第 3 轮 `web_search` 的 `query` 写出了 A 的名字、不含「它」,答复点明说的是 A。系统提示词里有 `# Tool arguments`,没有 `[answer check]`。
+
+## §111 运行时限按实际运行时间 + `edit_file` 失败诊断 + 模型目录(B-302 PR 1 #2081 / PR 3 #2082 / #2075)
+
+**怎么进(只在测试环境)**:在 release canary 的租户里用存储层建临时智能体(照 `release-canary` 的模型与清单,改工具 / `policies`),用 Secret `canary-credentials` 的 key 从 control-plane pod 内走对外平面发 run(key 走 stdin 首行),做完先标删除再彻底删除。提示词全是合成内容。
+
+- [x] **111.1 到时限 80% 提醒、100% 无工具收尾**:`run_deadline_s: 120`,让它做 12 步、每步 `exec_python` 睡 20 秒。判据:`guard` `warning` `deadline`(`used_s` ≥ 96),随后 `guard` `tripped` `deadline`,`end` 为 `status=incomplete`、`exit_reason=deadline`、`completed=false`,仍有最终回答。**没修好时**:没有 `deadline` 的 `guard`,一直跑到步数上限。 **11-11 测试 `75b62447c-r3` 过**:提醒 `used_s=101`,收尾 `used_s=145`(到点后多出的是当时正在跑的那一步),`end` incomplete / deadline。注:是否到 80% 只在每次模型调用前查,一步(模型调用 + 工具)长于「80%~100% 之间的时长」时会直接收尾、不出提醒 —— 本条第一次审批续跑就是这样(85 秒查一次,下一次已是 123 秒);默认 90 分钟时这段有 18 分钟,不影响。
+- [x] **111.2 等审批的时间不计入,续跑后时限照样生效**:`run_deadline_s: 120`、`approval_required_tools: [write_file]`;第 1 步 `write_file`(停下等审批),180 秒后批准,接着 8 步各睡 20 秒。判据:续跑后不在第一步就收尾;`warning` / `tripped` 的 `used_s` ≈ 停下前的秒数 + 续跑后的秒数(不含那 180 秒)。**没修好时**:等的 180 秒算进去,续跑第一步就收尾;或续跑路径根本没有时限(改前)。 **11-11 过**:续跑后 104.9 秒 `warning used_s=102`、125.8 秒 `tripped used_s=126`,`end` incomplete / deadline,整轮墙钟 312 秒。
+- [x] **111.3 子任务到父的 80% 提前交回**:同 111.1 的智能体,让它把「10 步、每步睡 20 秒」整个交给 `spawn_worker`。判据:子任务没做完 10 步就交回部分结果,父在 120 秒内作答。 **11-11 过**:子任务做完 4 步(第 5~10 步标明没做)在 119.4 秒交回,父 `warning used_s=118` 后作答,`end` success / `completed=false`。
+- [x] **111.4 `edit_file` 对不上时给最像的行与列**:文件 4 行,`old_string` 抄错一个字。判据:错误里有 `near line 3, column N: yours «…» / file «…»`,文件没变。 **11-11 过**:`near line 3, column 36: yours «, backof=2)» / file «, backoff=2)»`;第二次 `column 24`。
+- [x] **111.5 同一文件连续第 3 次失败要求重读或整篇重写**:判据:第 3 次的错误以 `This is failure 3 of edit_file on this file in a row` 开头,要求 `read_file` 或 `write_file`。 **11-11 过**。
+- [x] **111.6 已经改过算成功、不写文件**:新文字已在第 3 行、旧文字不在。判据:成功,`artifact.already_applied=[{index:1,line:3}]`,文字说明 counted as applied。 **11-11 过**。
+- [x] **111.7 价目表 0187 与两个新模型真调**:判据:`model_rate_card` 平台行 `qwen3.8-max-0902` 12 000 000 / 36 000 000 / 0 / 1 500 000、`doubao-seed-2-1-pro-260915` 6 000 000 / 30 000 000 / 0 / 1 200 000;两个新模型、以及保存了已下架 `doubao-seed-2-1-pro-260628` 的智能体(不配备用)各跑一轮 `success`,`token_usage` 有对应模型的行。 **11-11 过**:价格逐项一致,旧快照价目行未动;三轮都 success、各 2 行用量。
+- [ ] **111.8 下拉里没有已下架的豆包快照**(要控制台登录):智能体编辑页模型下拉。判据:有 `doubao-seed-2-1-pro-260915`、`qwen3.8-max-0902`,没有 `doubao-seed-2-1-pro-260628`;已保存旧快照的智能体打开不报错。
