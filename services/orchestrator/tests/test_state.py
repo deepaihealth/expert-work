@@ -25,7 +25,8 @@ def test_required_keys_present() -> None:
     ``memory_writeback_queued``, B-226 ``step_budget_warned`` / ``loop_trip_count``
     (B-226 drops ``no_progress_streak``: the no-progress stop counts trips per run),
     B-236 ``seed_skipped_dirs`` / ``seed_quota_blocked``,B-275 ``turn_document_original_names``,
-    B-302 ``run_active_s`` / ``run_clock_mark`` / ``run_clock_segment`` / ``deadline_warned``。
+    B-302 ``run_active_s`` / ``run_clock_mark`` / ``run_clock_segment`` / ``deadline_warned`` /
+    ``edit_file_streaks`` / ``edit_file_history``。
 
     ``turn_*`` 放在 state 而不是 config,是为了让检查点在
     ``graph_input=None`` 的续跑(审批 / orphan 复活)里替我们保住它们。"""
@@ -75,6 +76,9 @@ def test_required_keys_present() -> None:
         "viewed_figures",
         "figure_documents",
         "figure_reads",
+        # B-302 PR 3 —— 每个文件的 edit_file 连续失败次数 / 本轮成功改动(每轮清空)。
+        "edit_file_streaks",
+        "edit_file_history",
         "context_summary",
         "seed_skipped_dirs",
         "seed_quota_blocked",
