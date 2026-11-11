@@ -120,6 +120,19 @@ class GuidedToolError(RuntimeError):
         self.advice = advice
 
 
+class KindClassifiedError(RuntimeError):
+    """A failure whose class the raising tool states from the failure's kind.
+
+    B-302 PR 3 —— its message quotes the user's own file (similar lines, snippets), and
+    a file line that happens to say ``timeout`` / ``connection`` / ``not found`` /
+    ``invalid`` must not turn the failure into ``transient`` (dropped from the run's
+    ledger) or ``resource_not_found``. :func:`classify_tool_error` takes
+    :attr:`error_class` as is, **before** any scan of the text.
+    """
+
+    error_class: ToolErrorClass = "unknown"
+
+
 # ---------------------------------------------------------------------------
 # Classification (error path)
 # ---------------------------------------------------------------------------
@@ -160,6 +173,8 @@ def classify_tool_error(
             retryable=False,
             advice=error.advice,
         )
+    if isinstance(error, KindClassifiedError):
+        return _make(error.error_class, tool_name, summary, spec)
     return _make(_classify_by_signal(error), tool_name, summary, spec)
 
 

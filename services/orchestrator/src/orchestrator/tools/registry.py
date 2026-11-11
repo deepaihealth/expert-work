@@ -441,6 +441,11 @@ class ToolContext:
     #: B-268 —— 检查点里的 ``figure_reads``(本 run 的 ``read_page`` 读取账,原样、未校验;
     #: 读的一侧 ``tools.figure_reads`` 逐条校验)。
     figure_reads: tuple[Any, ...] = ()
+    #: B-302 PR 3 —— 检查点里的 ``edit_file_streaks`` / ``edit_file_history``(每个文件的连续
+    #: 失败次数、本轮成功改动;原样、未校验,读的一侧 ``tools.edit_file_tracking`` 逐条校验)。
+    #: tools 节点写,``edit_file`` 读。
+    edit_file_streaks: Mapping[str, Any] = field(default_factory=dict)
+    edit_file_history: Mapping[str, Any] = field(default_factory=dict)
     #: B-268 —— 这一轮首段的 run id(审批续跑段是新 run_id;``None`` = 本 run 就是首段)。
     #: ``read_page`` 的读取账按它记,续跑段接着上一段的计数。子代不继承(它有自己的 state)。
     turn_root_run_id: UUID | None = None
