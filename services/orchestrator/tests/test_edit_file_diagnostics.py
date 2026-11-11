@@ -345,6 +345,43 @@ def test_t3_7b_any_line_the_new_text_covers_may_be_the_similar_one(tmp_path: Pat
     assert (tmp_path / "f.py").read_text(encoding="utf-8") == body
 
 
+def test_rr2_an_unrelated_long_line_does_not_switch_off_already_applied(
+    tmp_path: Path,
+) -> None:
+    """Re-review (2): a line far too long to ever be one of the closest (its whole-length
+    upper bound is under the cut-off) is skipped, not truncated — so one long comment or
+    paragraph elsewhere in the file does not make the result approximate."""
+    long_line = "# " + "note " * 60
+    assert len(long_line.strip()) > 200
+    body = (
+        "setup()\n"
+        + long_line
+        + "\n# section: retry policy\nretries = configure(limit=5, backoff=2)\nrun()\n"
+    )
+    (tmp_path / "f.py").write_text(body, encoding="utf-8")
+    new = "# section: retry policy\nretries = configure(limit=5, backoff=2)"
+    env = _run_snippet(
+        build_edit_wrapper("f.py", "retries = configure(limit=3)", new, ws=str(tmp_path))
+    )
+    assert env["ok"] is True
+    assert env["already_applied"] == [{"index": 1, "line": 4}]
+    assert (tmp_path / "f.py").read_text(encoding="utf-8") == body
+
+
+def test_rr2_truncation_alone_is_named_in_the_detail(tmp_path: Path) -> None:
+    """Re-review LOW-3: when only truncation (no early stop) makes the result approximate,
+    the detail says so instead of a bare "closest"."""
+    prefix = "INSERT INTO events (id, kind) VALUES (" + ("'shared-prefix-" * 14)
+    assert len(prefix) > 200
+    lines = [prefix + f"{k}, 'click');" for k in range(4)]
+    body = "\n".join(lines) + "\n"
+    (tmp_path / "f.sql").write_text(body, encoding="utf-8")
+    old = prefix + "2, 'clik');"
+    env = _run_snippet(build_edit_wrapper("f.sql", old, "x", ws=str(tmp_path)))
+    assert env["ok"] is False
+    assert "closest (long lines compared approximately): " in env["detail"]
+
+
 # ---------------------------------------------------------------------------
 # T3-8 —— the run's own earlier edit replaced this text
 # ---------------------------------------------------------------------------
@@ -903,7 +940,8 @@ def test_rr_m3_wall_clock_backstop_stops_the_scan(tmp_path: Path) -> None:
     code = build_edit_wrapper("f.py", "value_7 = compute(77)", "x", ws=str(tmp_path))
     assert code.count("_SIM_WALL_S = 5.0") == 1
     env = _run_snippet(code.replace("_SIM_WALL_S = 5.0", "_SIM_WALL_S = -1.0"))
-    assert "no close line among lines 1-" in env["detail"]
+    assert "the comparison budget ran out before any line was compared" in env["detail"]
+    assert "lines 1-0" not in env["detail"]
 
 
 def test_rr_m2_glyph_level_counts_as_a_match_on_the_original(tmp_path: Path) -> None:

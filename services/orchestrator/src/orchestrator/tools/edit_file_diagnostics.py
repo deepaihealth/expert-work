@@ -46,6 +46,8 @@ _SIM_TOP = 3
 #: 打破截断造成的并列。列号与片段始终按整行算(_describe)。
 _SIM_LINE_CAP = 200
 _SIM_RESCORE = 10
+#: 整行重算时单次比较的工作量上限(「行长乘 probe 长」):超过就保留截断后的次序。
+_SIM_RESCORE_ONE = 4000000
 #: 整次 edit_file 调用(所有改动、所有扫描)共用的上限:真正算过 ratio 的每一对按
 #: 「行长乘 probe 长」计工作量,合计不超过 _SIM_WORK(difflib 在最坏的字母表上本机约
 #: 一两千万单位每秒,所以约 3 秒);另有墙钟兜底 _SIM_WALL_S 秒。任一用完,之后的行不再比,
@@ -150,6 +152,10 @@ def _similar(lines, probe):
         full = raw.strip()
         if not full:
             continue
+        # 整行长度给出的上界(2·min/和,即整行的 real_quick_ratio)已低于门槛:这一行按整行
+        # 也不可能进前 3,跳过且不算截断 —— 否则文件里一行无关的长行就会把「已改过」关掉。
+        if 2 * min(len(full), len(probe)) < _SIM_CUTOFF * (len(full) + len(probe)):
+            continue
         body = full[:_SIM_LINE_CAP]
         truncated = truncated or len(full) > _SIM_LINE_CAP
         matcher.set_seq1(body)
@@ -180,7 +186,8 @@ def _rescore(lines, probe, scored):
     rescored = []
     for _neg, idx in scored[:_SIM_RESCORE]:
         full = lines[idx].strip()
-        if not _spend(len(full) * len(probe)):
+        # 单次 ratio 不受墙钟约束(墙钟只在两次之间查):单次太大就不重算。
+        if len(full) * len(probe) > _SIM_RESCORE_ONE or not _spend(len(full) * len(probe)):
             return scored
         matcher.set_seq1(full)
         rescored.append((-matcher.ratio(), idx))
@@ -222,14 +229,25 @@ def _describe(raw, probe):
 
 
 def _no_match_detail(text, old):
-    probe, near, _approx, stopped = _near(text, old)
+    probe, near, approx, stopped = _near(text, old)
     if probe is None:
         return "every line of 'old_string' is in the file, but not together in this order"
-    # 上限用完时只比到第 stopped 行:说「在前 N 行里最像的」,不说成整个文件里最像的。
-    scope = "closest" if stopped is None else "closest among lines 1-%d only" % stopped
+    # 上限用完时只比到第 stopped 行:说「在前 N 行里最像的」,不说成整个文件里最像的;
+    # 只因长行截断而近似时也标明。
+    if stopped is not None:
+        scope = "closest among lines 1-%d only" % stopped
+    elif approx:
+        scope = "closest (long lines compared approximately)"
+    else:
+        scope = "closest"
     if not near:
         if stopped is None:
             return None
+        if stopped == 0:
+            return (
+                "line %d of 'old_string' differs; the comparison budget ran out before "
+                "any line was compared" % probe[0]
+            )
         return "line %d of 'old_string' differs; no close line among lines 1-%d " % (
             probe[0],
             stopped,
