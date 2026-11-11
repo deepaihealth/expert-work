@@ -150,6 +150,9 @@ def test_current_context_windows() -> None:
         ("qwen", "qwen3.7-max"): 1_000_000,
         ("qwen", "qwen3.6-plus"): 1_000_000,
         ("doubao", "doubao-seed-2-1-pro-260628"): 256_000,
+        # 2026-11-11 厂商控制台页面:Seed 2.1 pro 上下文 1024k;Qwen3.8-Max 1M。
+        ("doubao", "doubao-seed-2-1-pro-260915"): 1_024_000,
+        ("qwen", "qwen3.8-max-0902"): 1_000_000,
     }
     for (provider, name), window in expected.items():
         entry = catalog_entry(provider, name)
@@ -749,7 +752,8 @@ def test_retired_qwen3_vl_flash_is_deprecated_but_resolvable() -> None:
 
 def test_2026_11_dated_ids_mirror_their_predecessors() -> None:
     """2026-11 —— 两个新的带日期模型名:看图与思考 / 输出上限参数实调过(见目录条目注释),
-    能力位与前一个名字相同;上下文窗口和输出上限是照抄的。"""
+    思考形态与输出上限字段同前一个名字;上下文窗口 / 输出上限按 2026-11-11 厂商控制台页面
+    (豆包 Seed 2.1 pro:上下文 1024k、最大输出 256k;通义 Qwen3.8-Max:上下文 1M)。"""
     q_new = _e("qwen", "qwen3.8-max-0902")
     d_new = _e("doubao", "doubao-seed-2-1-pro-260915")
     q_old = _e("qwen", "qwen3.8-max")
@@ -758,9 +762,14 @@ def test_2026_11_dated_ids_mirror_their_predecessors() -> None:
     assert (q_new.thinking, q_new.thinking_default) == ("budget", True)
     assert (d_new.thinking, d_new.thinking_default) == ("effort", True)
     assert q_new.model_dump(exclude={"name"}) == q_old.model_dump(exclude={"name"})
-    assert d_new.model_dump(exclude={"name", "deprecated"}) == d_old.model_dump(
-        exclude={"name", "deprecated"}
-    )
+    differs = {"name", "deprecated", "context_window"}
+    assert d_new.model_dump(exclude=differs) == d_old.model_dump(exclude=differs)
+    # 厂商页:上下文 1024k(260628 的 256k 不动);最大输出 256k = 262,144。
+    assert (d_new.context_window, d_old.context_window) == (1_024_000, 256_000)
+    assert d_new.max_output_tokens == 262_144
+    # 通义:上下文 1M;合计上限厂商不报范围(传 1,000 万不报错),不校验。
+    assert q_new.context_window == 1_000_000
+    assert q_new.max_output_tokens is None
     # 260628 让位给 260915:不进下拉,已经写了它的 manifest 照样能解析。
     assert d_old.deprecated is True and d_new.deprecated is False
     doubao = [e.name for e in models_for_provider("doubao")]

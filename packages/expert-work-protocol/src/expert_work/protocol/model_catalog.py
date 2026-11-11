@@ -12,7 +12,7 @@ provider's official docs — do NOT carry stale names. Mark retired models
 
 Last verified: 2026-11 (qwen3.8-max-0902 / doubao-seed-2-1-pro-260915: image input,
 thinking on/off and the thinking / output-cap parameters probed; context window
-and max output copied from the previous IDs) / 2026-10 (deepseek-flash) / 2026-08
+and max output from the vendor console pages, 2026-11-11) / 2026-10 (deepseek-flash) / 2026-08
 (glm/qwen additions) against each provider's official API docs; other providers
 2026-07.
 
@@ -713,8 +713,12 @@ MODEL_CATALOG: dict[Provider, tuple[ModelEntry, ...]] = {
         # 2026-11 —— qwen3.8-max 的带日期快照。实调(2026-11-11):看图 84 次(能收图、
         # 能关思考);文字 4 次:enable_thinking 开 / 关、thinking_budget、
         # max_completion_tokens 都被接受,开思考时回思考内容、关时不回。没核到的:
-        # thinking_budget 是否仍是硬上限(探针题太短,没撞到 200)、上下文窗口
-        # (照抄 qwen3.8-max)。qwen3.8-max 是不带日期的别名,仍在售,两个名字都留在下拉里。
+        # thinking_budget 是否仍是硬上限(探针题太短,没撞到 200)。上下文窗口按
+        # 2026-11-11 厂商控制台页面(Qwen3.8-Max:上下文 1M、最大输出 128K、最大思维链
+        # 256K;页面是 qwen3.8-max 的,没有单列 -0902)。max_output_tokens 不设:
+        # max_completion_tokens 是思考 + 回答的合计上限,页面的 128K 只是回答部分,厂商对
+        # 超大值也不报范围 —— 设了会在构建期拦掉厂商其实接受的配置。
+        # qwen3.8-max 是不带日期的别名,仍在售,两个名字都留在下拉里。
         ModelEntry(
             name="qwen3.8-max-0902",
             vision=True,
@@ -888,7 +892,8 @@ MODEL_CATALOG: dict[Provider, tuple[ModelEntry, ...]] = {
     # Seed 2.1 (doubao-seed-2-1-pro-260915, dated model ID) is the current
     # flagship; its previous snapshot doubao-seed-2-1-pro-260628 and the Seed
     # 2.0 family are kept deprecated so saved manifests still resolve. All
-    # tiers support vision and 256K context. Older doubao-*-32k series superseded.
+    # tiers support vision; 260915 has a 1024K context (vendor console
+    # 2026-11-11), the older entries 256K. Older doubao-*-32k series superseded.
     # B-105(2026-09-24 实调)—— ``thinking.budget_tokens`` 被厂商忽略(200 正常返回,
     # 思考长度不受限),真正生效的档位控制是 ``reasoning_effort`` → shape "effort";
     # 厂商档位 minimal/low/medium/high 实调都有效、没有 max,effort_map 把 max 顶到 high。
@@ -896,12 +901,13 @@ MODEL_CATALOG: dict[Provider, tuple[ModelEntry, ...]] = {
         # 2026-11 —— Seed 2.1 的新快照。实调(2026-11-11):看图 84 次(能收图、
         # ``thinking.type=disabled`` 被接受);文字 5 次:reasoning_effort 四档都被接受
         # (minimal 不思考,low / medium 几十个思考 token,high 约 280),
-        # max_completion_tokens 被接受。没核到的:输出上限(传 1000 万厂商不报错,
-        # 读不出范围)与上下文窗口,两项照抄 260628。
+        # max_completion_tokens 被接受。输出上限实调读不出范围(传 1000 万厂商不报错);
+        # 上下文窗口 / 输出上限按 2026-11-11 厂商控制台页面(Doubao-Seed-2.1-pro:上下文
+        # 1024k、最大输出 256k、最大思考内容 256k;页面是这一档的,不分日期快照)。
         ModelEntry(
             name="doubao-seed-2-1-pro-260915",
             vision=True,
-            context_window=256_000,
+            context_window=1_024_000,
             thinking="effort",
             thinking_default=True,
             output_cap_field="max_completion_tokens",
