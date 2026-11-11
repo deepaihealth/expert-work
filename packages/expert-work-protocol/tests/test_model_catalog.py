@@ -398,6 +398,7 @@ def test_max_output_tokens_match_vendor_ranges() -> None:
 def test_thinking_cap_only_on_qwen_thinking_models() -> None:
     capped = {
         "qwen3.8-max",
+        "qwen3.8-max-0902",
         "qwen3.7-max",
         "qwen3.6-plus",
         "qwen3.5-plus",
@@ -744,3 +745,27 @@ def test_retired_qwen3_vl_flash_is_deprecated_but_resolvable() -> None:
     assert entry.deprecated is True
     assert "qwen3-vl-flash" not in {e.name for e in models_for_provider("qwen")}
     assert {"qwen3.7-flash", "qwen3.8-flash"} <= {e.name for e in models_for_provider("qwen")}
+
+
+def test_2026_11_dated_ids_mirror_their_predecessors() -> None:
+    """2026-11 —— 两个新的带日期模型名:看图实调过(能收图、能关思考);其余能力位照抄
+    前一个名字,等实调探针核过再改。"""
+    q_new = _e("qwen", "qwen3.8-max-0902")
+    d_new = _e("doubao", "doubao-seed-2-1-pro-260915")
+    q_old = _e("qwen", "qwen3.8-max")
+    d_old = _e("doubao", "doubao-seed-2-1-pro-260628")
+    assert q_new.vision is True and d_new.vision is True
+    assert (q_new.thinking, q_new.thinking_default) == ("budget", True)
+    assert (d_new.thinking, d_new.thinking_default) == ("effort", True)
+    assert q_new.model_dump(exclude={"name"}) == q_old.model_dump(exclude={"name"})
+    assert d_new.model_dump(exclude={"name", "deprecated"}) == d_old.model_dump(
+        exclude={"name", "deprecated"}
+    )
+    # 260628 让位给 260915:不进下拉,已经写了它的 manifest 照样能解析。
+    assert d_old.deprecated is True and d_new.deprecated is False
+    doubao = [e.name for e in models_for_provider("doubao")]
+    assert doubao == ["doubao-seed-2-1-pro-260915"]
+    # qwen3.8-max 是不带日期的别名,仍在售:两个名字都可选,别名排在前面。
+    qwen = [e.name for e in models_for_provider("qwen")]
+    assert q_old.deprecated is False
+    assert qwen.index("qwen3.8-max") < qwen.index("qwen3.8-max-0902")
