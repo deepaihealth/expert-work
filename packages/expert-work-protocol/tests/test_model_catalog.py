@@ -748,8 +748,8 @@ def test_retired_qwen3_vl_flash_is_deprecated_but_resolvable() -> None:
 
 
 def test_2026_11_dated_ids_mirror_their_predecessors() -> None:
-    """2026-11 —— 两个新的带日期模型名:看图实调过(能收图、能关思考);其余能力位照抄
-    前一个名字,等实调探针核过再改。"""
+    """2026-11 —— 两个新的带日期模型名:看图与思考 / 输出上限参数实调过(见目录条目注释),
+    能力位与前一个名字相同;上下文窗口和输出上限是照抄的。"""
     q_new = _e("qwen", "qwen3.8-max-0902")
     d_new = _e("doubao", "doubao-seed-2-1-pro-260915")
     q_old = _e("qwen", "qwen3.8-max")

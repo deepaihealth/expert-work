@@ -10,8 +10,9 @@ provider's official docs — do NOT carry stale names. Mark retired models
 ``deprecated=True`` so they stay referenceable but drop out of the dropdown
 (``models_for_provider``).
 
-Last verified: 2026-11 (qwen3.8-max-0902 / doubao-seed-2-1-pro-260915: image input
-and thinking-off only, other fields copied) / 2026-10 (deepseek-flash) / 2026-08
+Last verified: 2026-11 (qwen3.8-max-0902 / doubao-seed-2-1-pro-260915: image input,
+thinking on/off and the thinking / output-cap parameters probed; context window
+and max output copied from the previous IDs) / 2026-10 (deepseek-flash) / 2026-08
 (glm/qwen additions) against each provider's official API docs; other providers
 2026-07.
 
@@ -709,10 +710,11 @@ MODEL_CATALOG: dict[Provider, tuple[ModelEntry, ...]] = {
             output_cap_field="max_completion_tokens",
             thinking_cap=True,
         ),
-        # 2026-11 —— qwen3.8-max 的带日期快照。看图实调过(2026-11-11,84 次:能收图、
-        # 能关思考);其余能力位照抄 qwen3.8-max,**待实调探针核对**(enable_thinking +
-        # thinking_budget、max_completion_tokens、上下文窗口)。qwen3.8-max 是不带日期
-        # 的别名,仍在售,两个名字都留在下拉里。
+        # 2026-11 —— qwen3.8-max 的带日期快照。实调(2026-11-11):看图 84 次(能收图、
+        # 能关思考);文字 4 次:enable_thinking 开 / 关、thinking_budget、
+        # max_completion_tokens 都被接受,开思考时回思考内容、关时不回。没核到的:
+        # thinking_budget 是否仍是硬上限(探针题太短,没撞到 200)、上下文窗口
+        # (照抄 qwen3.8-max)。qwen3.8-max 是不带日期的别名,仍在售,两个名字都留在下拉里。
         ModelEntry(
             name="qwen3.8-max-0902",
             vision=True,
@@ -891,9 +893,11 @@ MODEL_CATALOG: dict[Provider, tuple[ModelEntry, ...]] = {
     # 思考长度不受限),真正生效的档位控制是 ``reasoning_effort`` → shape "effort";
     # 厂商档位 minimal/low/medium/high 实调都有效、没有 max,effort_map 把 max 顶到 high。
     "doubao": (
-        # 2026-11 —— Seed 2.1 的新快照。看图实调过(2026-11-11,84 次:能收图、
-        # ``thinking.type=disabled`` 被接受);其余能力位照抄 260628,**待实调探针核对**
-        # (reasoning_effort 四档、max_completion_tokens 与输出上限、上下文窗口)。
+        # 2026-11 —— Seed 2.1 的新快照。实调(2026-11-11):看图 84 次(能收图、
+        # ``thinking.type=disabled`` 被接受);文字 5 次:reasoning_effort 四档都被接受
+        # (minimal 不思考,low / medium 几十个思考 token,high 约 280),
+        # max_completion_tokens 被接受。没核到的:输出上限(传 1000 万厂商不报错,
+        # 读不出范围)与上下文窗口,两项照抄 260628。
         ModelEntry(
             name="doubao-seed-2-1-pro-260915",
             vision=True,
