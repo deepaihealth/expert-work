@@ -22,6 +22,15 @@
 
 ## 12.2 变更记录
 
+### 每一轮的运行时间上限真正生效
+
+| 项目 | 内容 |
+|---|---|
+| 日期 | 待发布 |
+| 摘要 | 每一轮（一次用户消息引出的全部运行，含审批之后的续跑）实际运行的时间有了上限：Agent 没有配置时平台默认 90 分钟，等人审批或回答澄清的时间不算。用到 80% 时平台提醒助手不再开始新的核对、用已有的结果交付，正在运行的子任务提前把部分结果交回，也不再派出新的子任务；到上限时助手不再调用工具、用已有的结果写最终回答 |
+| 影响范围 | SSE `end` 事件与 run 查询的 `exit_reason` 新增取值 `deadline`，此时 `status` 为 `incomplete`、`completed` 为 `false`，见 [3.4 的 `end`](./sse-events#end)；SSE `guard` 事件的 `guard` 新增取值 `deadline`，`detail` 为 `{used_s, limit_s}`，`tripped` 只在主 Agent 到点时发，见 [3.4 的 `guard`](./sse-events#guard)；子任务可能在这一轮结束之前提前交回结果（`worker` 事件的 `outcome` 为 `max_steps`） |
+| 调用方的改动 | 对 `exit_reason`、`guard` 做分支或枚举校验的代码要认 `deadline`；按文档把不认识的取值当作「没有正常完成」处理的代码不需要改 |
+
 ### Agent 级旧文件的清理
 
 | 项目 | 内容 |

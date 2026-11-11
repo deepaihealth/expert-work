@@ -1972,6 +1972,7 @@ export interface TranslationKeys {
     exit_reason_max_steps: string;
     exit_reason_token_budget: string;
     exit_reason_no_progress: string;
+    exit_reason_deadline: string;
     exit_reason_approval_rejected: string;
     exit_reason_text_response: string;
     unresolved_failures: string;
@@ -1995,6 +1996,9 @@ export interface TranslationKeys {
     guard_max_steps: string;
     guard_max_steps_warn: string;
     guard_no_progress: string;
+    guard_deadline: string;
+    guard_deadline_warn: string;
+    guard_other: string;
     gap_frames: string;
     memory_recall: string;
     memory_writeback: string;
@@ -5079,11 +5083,11 @@ const en: TranslationKeys = {
     max_no_progress_default: "0 (platform default: 2nd loop in a run)",
     subhead_structured: "Structured execution",
     subhead_time: "Time & spend",
-    run_deadline_label: "Max run time (seconds)",
-    run_deadline_brief: "The longest this run may take (0 = platform default, 1h)",
+    run_deadline_label: "Max run time per turn (seconds)",
+    run_deadline_brief: "The longest a turn may actually run (0 = platform default, 90 min)",
     run_deadline_impact:
-      "The longest this run may take, in seconds, including any sub-agents it spawns along the way; once exceeded, the run is force-stopped, so a stuck run can't quietly run up the bill.\n0 doesn't mean unlimited — it just falls back to the platform's own default cap (currently 3600 seconds / 1 hour, set by ops). Set an explicit number here for a longer run or tighter control.\nExample: a task doing live web lookups gets stuck in a loop — this cap force-kills it instead of letting it burn on forever.",
-    run_deadline_default: "0 (platform default, 1h)",
+      "The longest one turn (everything a single user message sets off) may actually run, in seconds, including any sub-agents it spawns; time spent waiting for a human to approve or answer a question does not count.\n0 = the platform default of 90 minutes. At 80% the agent is told to stop starting new checks and deliver what it has; at the limit it stops calling tools and writes the final reply from what it has (exit reason \"time limit reached\"). To effectively remove the limit, set 86400.\nExample: a task keeps re-checking and re-editing without converging — at 72 minutes it is told to wrap up, and at 90 minutes it delivers what it has instead of running on.",
+    run_deadline_default: "0 (platform default, 90 min)",
     stream_deadline_label: "First-token timeout (seconds)",
     stream_deadline_brief: "The longest wait for the model to start replying",
     stream_deadline_impact:
@@ -5967,6 +5971,7 @@ const en: TranslationKeys = {
     exit_reason_max_steps: "step limit reached",
     exit_reason_token_budget: "token budget used up",
     exit_reason_no_progress: "no progress",
+    exit_reason_deadline: "time limit reached",
     exit_reason_approval_rejected: "approval rejected",
     exit_reason_text_response: "unresolved failures",
     unresolved_failures: "Unresolved failures: {{list}}",
@@ -5990,6 +5995,9 @@ const en: TranslationKeys = {
     guard_max_steps: "Step limit reached ({{steps}}/{{max}}) → wrap-up turn",
     guard_max_steps_warn: "Steps {{steps}}/{{max}} used — near the step limit",
     guard_no_progress: "No progress {{streak}}/{{max}} → wrap-up turn",
+    guard_deadline: "Run time used up ({{used}}/{{limit}} min) → wrap-up turn",
+    guard_deadline_warn: "Run time {{used}}/{{limit}} min used — told to wrap up",
+    guard_other: "Limit triggered: {{guard}}",
     gap_frames: "Frames {{from}}–{{to}} missing (unrecoverable on this connection; replaying usually restores them)",
     memory_recall: "Memory recall · {{n}}",
     memory_writeback: "Memory written · {{n}}",

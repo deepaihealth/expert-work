@@ -188,6 +188,32 @@ describe("parseTimeline", () => {
     expect(text).not.toContain("耗尽");
   });
 
+  it("renders a deadline guard as a time limit, never as no-progress (B-302)", () => {
+    const items = parseTimeline([
+      ev("guard", { kind: "warning", guard: "deadline", detail: { used_s: 4320, limit_s: 5400 } }, "t1"),
+      ev("guard", { kind: "tripped", guard: "deadline", detail: { used_s: 5400, limit_s: 5400 } }, "t2"),
+    ]);
+    expect(items).toHaveLength(2);
+    expect(items[0]).toMatchObject({ kind: "guard", tone: "warn" });
+    expect(items[1]).toMatchObject({ kind: "guard", tone: "bad" });
+    const texts = items.map((i) => (i.kind === "guard" ? i.text : ""));
+    expect(texts[0]).toContain("72/90");
+    expect(texts[1]).toContain("90");
+    for (const text of texts) {
+      expect(text).not.toContain("无进展");
+      expect(text).not.toContain("NaN");
+    }
+  });
+
+  it("shows an unknown guard by its raw name, not as no-progress", () => {
+    const items = parseTimeline([
+      ev("guard", { kind: "tripped", guard: "some_future_limit", detail: {} }, "t1"),
+    ]);
+    const text = items[0].kind === "guard" ? items[0].text : "";
+    expect(text).toContain("some_future_limit");
+    expect(text).not.toContain("无进展");
+  });
+
   // ——— P3 PR-1 契约变更 ———
 
   it("renders a gap frame as a warn marker naming the missing range", () => {

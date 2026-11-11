@@ -31,6 +31,7 @@ describe("notCompletedLabel", () => {
     ["max_steps", "已结束，未完成（步数用完）"],
     ["token_budget", "已结束，未完成（token 预算用完）"],
     ["no_progress", "已结束，未完成（没有进展）"],
+    ["deadline", "已结束，未完成（运行时间用完）"],
     ["approval_rejected", "已结束，未完成（审批被拒绝）"],
     // text_response + completed=false = a tool failure was never recovered.
     ["text_response", "已结束，未完成（有未解决的失败）"],
