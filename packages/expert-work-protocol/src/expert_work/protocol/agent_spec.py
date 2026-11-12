@@ -1209,6 +1209,39 @@ class PolicySpec(BaseModel):
             "model."
         ),
     )
+    reading_rule: bool | None = Field(
+        default=None,
+        description=(
+            "B-302 — the reading rule in the system prompt of an agent whose main "
+            "model sees images itself: a detail that is unclear on first reading is "
+            "written down as uncertain with its candidate readings and not changed "
+            "without new evidence or a user correction. ``null`` (default) = the "
+            "platform setting; ``true`` / ``false`` turn it on / off for this agent."
+        ),
+    )
+    figure_view_steps: int | None = Field(
+        default=None,
+        ge=0,
+        le=50,
+        description=(
+            "B-302 — how many model calls a document's fetched page images stay "
+            "attached after the last read_page on that document; then they are "
+            "replaced by a note saying how to fetch them again. ``0`` = keep them "
+            "(no expiry). ``null`` (default) = the platform setting."
+        ),
+    )
+
+    @model_serializer(mode="wrap")
+    def _omit_unset_b302(  # type: ignore[no-untyped-def]
+        self, handler: SerializerFunctionWrapHandler
+    ):
+        """B-302 —— 两个覆盖字段为空(跟平台)时不落库:存量配置的内容与指纹不变,回滚到没有这两个
+        字段的镜像时(``extra="forbid"``)不填的配置照样能读。"""
+        data = handler(self)
+        for key in ("reading_rule", "figure_view_steps"):
+            if key in data and data[key] is None:
+                data.pop(key)
+        return data
 
 
 class CodePackageSpec(BaseModel):

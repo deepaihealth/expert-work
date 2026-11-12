@@ -46,10 +46,32 @@ _REFUSAL_TAIL = (
     "Finish the task from what you have already written down; "
     "if data is really missing, say in your answer what is missing."
 )
+#: B-302 §4.2.4 —— 「number(s)」改成「detail(s)」:要记下的不只是数字(名称、日期、编号、短语)。
 _THINKING_NOTE = (
-    "Note: numbers noted in your thinking are not kept to the next step — write the numbers "
+    "Note: details noted in your thinking are not kept to the next step — write the details "
     "you need into your reply, or record them in a workspace file with write_file, and rely "
     "on the file afterwards."
+)
+
+
+def _window_note(view_steps: int) -> str:
+    """B-302 第 2 层开着时(``figure_view_steps`` > 0)取页成功的回执,替换 :data:`_THINKING_NOTE`。"""
+    return (
+        "Note: your thinking is not kept to the next step, and these pages stay attached only "
+        f"for the next {view_steps} steps. Write what you need from them into your reply, or "
+        "into a workspace file with write_file, now, and rely on that afterwards. If something "
+        "is unclear, write it down as uncertain with the candidate readings."
+    )
+
+
+#: B-302 第 1 层 —— 主模型自己能看图、且开关开着时进系统提示词的读取规矩(§4.2.1,原文照抄)。
+READING_RULE = (
+    "When you read documents or images: if a detail is unclear on the first reading, write it "
+    'down as uncertain together with the candidate readings (for example: unclear, "A" or '
+    '"B") instead of silently picking one. Once a reading is written down, do not change it '
+    "unless you get new evidence from the source (such as a zoomed-in view of that exact spot) "
+    "or the user corrects it; looking at the same page again to re-check it is not new "
+    "evidence. In your reply, tell the user which details are still uncertain."
 )
 
 Box = tuple[int, int, int, int]
@@ -92,6 +114,31 @@ def ledger_entries(
         }
         for read in reads
     ]
+
+
+def stamp_step(entries: Sequence[object], step: int) -> list[object]:
+    """B-302 §4.2.3 —— tools 节点合并 ``read_page`` 写回的账时,给每条盖上当前步数(新列表)。
+
+    盖章的是平台,工具自己写的 ``step`` 一律被覆盖 —— 通道工具可写,不能让它自己定「何时读的」。
+    """
+    return [{**e, "step": step} if isinstance(e, Mapping) else e for e in entries]
+
+
+def last_read_steps(ledger: Sequence[object], *, run_id: UUID | None) -> dict[str, int]:
+    """B-302 §4.2.3 —— 本轮每份文档最后一次 ``read_page`` 的步数:``{<doc-sha>: step}``。
+
+    不是本轮的、没有步数章的、形状不对的条目都当没读过 —— 读的一侧照样不信通道里的值。
+    """
+    if run_id is None:
+        return {}
+    last: dict[str, int] = {}
+    for raw in ledger:
+        entry = _parse_entry(raw, str(run_id))
+        step = _plain_int(raw.get("step")) if isinstance(raw, Mapping) else None
+        if entry is None or step is None:
+            continue
+        last[entry.doc] = max(step, last.get(entry.doc, step))
+    return last
 
 
 def _plain_int(value: object) -> int | None:
@@ -237,19 +284,26 @@ def _in_view_sentence(entries: Sequence[_Entry], reads: Sequence[FigureRead]) ->
     )
 
 
-def _receipt(entries: Sequence[_Entry], reads: Sequence[FigureRead]) -> str | None:
-    """重看回执(第 3 点):这次读的里面本轮已经读过的那些,第几次读。"""
+def _receipt(
+    entries: Sequence[_Entry], reads: Sequence[FigureRead], *, view_steps: int = 0
+) -> str | None:
+    """重看回执(第 3 点):这次读的里面本轮已经读过的那些,第几次读。
+
+    B-302 —— ``view_steps`` > 0(第 2 层开着)时每次取页都有回执:没有重看就只有「只留 N 步」那句,
+    有重看时那句替换 :data:`_THINKING_NOTE`。
+    """
     seen = [(read, _times(entries, read) + 1) for read in dict.fromkeys(reads)]
     seen = [(read, nth) for read, nth in seen if nth > 1]
+    note = _window_note(view_steps) if view_steps > 0 else _THINKING_NOTE
     if not seen:
-        return None
+        return note if view_steps > 0 else None
     if len(seen) == 1:
         read, nth = seen[0]
         head = f"You already viewed {_describe(read)} in this task (read #{nth})."
     else:
         items = "; ".join(f"{_describe(read)} (read #{nth})" for read, nth in seen)
         head = f"You already viewed {items} in this task."
-    parts = [head, _in_view_sentence(entries, reads), _THINKING_NOTE]
+    parts = [head, _in_view_sentence(entries, reads), note]
     return " ".join(p for p in parts if p)
 
 
@@ -260,10 +314,12 @@ def read_notice(
     doc_sha: str,
     reads: Sequence[FigureRead],
     pages: int | None = None,
+    view_steps: int = 0,
 ) -> str | None:
     """渲染成功之后附在回执后面的平台文字:重看回执(第 3 点)+ 超上限预告(第 5 点)。
 
     只给能直接看图的模型(``read_page`` 的 ``inline`` 投递)—— 「在你眼前」对别的投递是假话。
+    ``view_steps`` 是 B-302 第 2 层的 ``figure_view_steps``(0 = 关,与之前逐字相同)。
     """
     entries = _doc_entries(ledger, run_id, doc_sha)
     parts: list[str] = []
@@ -274,7 +330,7 @@ def read_notice(
             "can be in view at once. Write the numbers into a workspace file as you read, then "
             "calculate from the file."
         )
-    receipt = _receipt(entries, reads)
+    receipt = _receipt(entries, reads, view_steps=view_steps)
     if receipt is not None:
         parts.append(receipt)
     return " ".join(parts) or None

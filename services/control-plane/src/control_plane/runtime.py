@@ -2250,6 +2250,8 @@ def build_tool_env(
     kb_first_routing: bool = False,
     web_search_fixtures_dir: str | None = None,
     embedding_model_key: Callable[[], Awaitable[str | None]] | None = None,
+    reading_rule: bool = False,
+    figure_view_steps: int = 0,
 ) -> ToolEnv:
     """Assemble the M0 :class:`ToolEnv`.
 
@@ -2292,6 +2294,9 @@ def build_tool_env(
         web_search_fixtures_dir=web_search_fixtures_dir,
         # B-267 第 3 步 —— 每轮探测核对「此刻的嵌入模型」用。
         embedding_model_key=embedding_model_key,
+        # B-302 PR 2 —— 读取规矩与页图只留几步的平台值(都来自 Settings,默认关)。
+        reading_rule=reading_rule,
+        figure_view_steps=figure_view_steps,
     )
 
 

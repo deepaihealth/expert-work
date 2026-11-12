@@ -269,7 +269,7 @@ def test_the_eviction_notice_does_not_send_the_model_after_a_page() -> None:
     """B-268 E2 —— 旧提示「需要重看就调用 read_page,units 填…」被模型直接当成重看理由。"""
     text = _block_text(_tail([], [_ref(p) for p in range(1, 9)]))
     assert "do not re-read pages in turn just to check them side by side" in text
-    assert "only if you are actually missing a specific number" in text
+    assert "only if you are actually missing a specific detail" in text  # B-302 §4.2.4
     assert "units 填" not in text
     assert "需要重看" not in text
 

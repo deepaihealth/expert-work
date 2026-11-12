@@ -441,6 +441,9 @@ class ToolContext:
     #: B-268 —— 检查点里的 ``figure_reads``(本 run 的 ``read_page`` 读取账,原样、未校验;
     #: 读的一侧 ``tools.figure_reads`` 逐条校验)。
     figure_reads: tuple[Any, ...] = ()
+    #: B-302 PR 2 第 2 层 —— 这次构建的 ``figure_view_steps``(页图在文档最后一次取页之后带几次
+    #: 模型调用;0 = 关)。``read_page`` 的回执按它说「只留 N 步」。由图构建时定,不从 config 读。
+    figure_view_steps: int = 0
     #: B-302 PR 3 —— 检查点里的 ``edit_file_streaks`` / ``edit_file_history``(每个文件的连续
     #: 失败次数、本轮成功改动;原样、未校验,读的一侧 ``tools.edit_file_tracking`` 逐条校验)。
     #: tools 节点写,``edit_file`` 读。

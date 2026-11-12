@@ -177,7 +177,8 @@ def test_a_re_read_gets_a_receipt_naming_the_read_count_and_what_is_in_view() ->
         notice
     )
     assert "write_file" in notice
-    assert "numbers noted in your thinking are not kept to the next step" in notice
+    # B-302 §4.2.4 —— number(s) → detail(s)
+    assert "details noted in your thinking are not kept to the next step" in notice
 
 
 def test_the_receipt_counts_by_unit_not_by_page() -> None:

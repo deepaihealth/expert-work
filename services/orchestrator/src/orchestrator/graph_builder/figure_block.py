@@ -33,6 +33,7 @@ from orchestrator.tools.figure_reads import (
     FIGURE_CROPS_IN_VIEW,
     FIGURE_OTHER_PAGES_IN_VIEW,
     FIGURE_PAGES_IN_VIEW,
+    last_read_steps,
 )
 from orchestrator.tools.read_page import document_sha
 from orchestrator.tools.workspace_paths import WorkspaceView
@@ -51,6 +52,33 @@ logger = logging.getLogger(__name__)
 #: 一个槽(见 :func:`_figure_slots`)。
 
 _FIGURE_BLOCK_HEADING = "# 你取来的文档页(这一轮可见)\n"
+
+Slot = tuple[str, int, tuple[int, int, int, int] | None]
+
+
+@dataclass(frozen=True)
+class FigureExpiry:
+    """B-302 第 2 层 —— 文档的页图在它最后一次 ``read_page`` 之后只带 ``view_steps`` 次调用。
+
+    * ``view_steps`` —— ``figure_view_steps``;``<= 0`` = 关,与之前逐字节相同;
+    * ``step`` —— 这一次模型调用的 ``step_count``(被退还的内务调用不算,§4.2.3);
+    * ``reads`` / ``run_id`` —— 检查点里的读取账(tools 节点盖了步数章)与这一轮的首段 run。
+      本轮账里没有这份文档的(上一轮取的、旧会话、没章的)一律算过期。
+    """
+
+    view_steps: int
+    step: int
+    reads: tuple[object, ...] = ()
+    run_id: UUID | None = None
+
+    def expired_documents(self, doc_shas: Sequence[str]) -> set[str]:
+        """``doc_shas`` 里已经过期的那些(``view_steps <= 0`` 时恒为空)。"""
+        if self.view_steps <= 0:
+            return set()
+        last = last_read_steps(self.reads, run_id=self.run_id)
+        return {
+            doc for doc in doc_shas if doc not in last or self.step - last[doc] >= self.view_steps
+        }
 
 
 @dataclass(frozen=True)
@@ -221,8 +249,39 @@ def _retired_line(label: str, pages: Sequence[int], crops: Sequence[int], *, rea
     return (
         f"[{label}: " + "; ".join(parts) + ". What you already wrote in your replies or in "
         "files is still valid — do not re-read pages in turn just to check them side by side. "
-        "Call read_page for a unit only if you are actually missing a specific number from it.]"
+        "Call read_page for a unit only if you are actually missing a specific detail from it.]"
     )
+
+
+def _expired_line(label: str, units: Sequence[int], view_steps: int) -> str:
+    """B-302 §4.2.4 —— 过期文档的占位:看过哪些编号、怎么拿回来;不点名该取哪页。"""
+    ranges = _unit_ranges(units, sep=", ")
+    viewed = f"unit {ranges}" if len(set(units)) == 1 else f"units {ranges}"
+    return (
+        f"[{label}: you viewed {viewed}. Fetched pages stay attached only for {view_steps} steps "
+        "after you last called read_page on this document, so they are no longer attached. What "
+        "you already wrote in your replies or files from them stands; do not fetch them again "
+        "just to re-check or compare. If you need a specific detail you never wrote down, call "
+        "read_page again for that page, or for a zoomed region of it.]"
+    )
+
+
+def _expired_lines(
+    expired: Mapping[str, Sequence[int]],
+    documents: Mapping[str, object],
+    view: WorkspaceView,
+    view_steps: int,
+) -> list[str]:
+    lines: list[str] = []
+    for doc_sha, units in expired.items():
+        path = _document_path(doc_sha, documents, view)
+        label = (
+            f"Document {_quote_path(path)}"
+            if path is not None
+            else "A document (path not recorded)"
+        )
+        lines.append(_expired_line(label, units, view_steps))
+    return lines
 
 
 def _placeholder_lines(
@@ -341,11 +400,18 @@ def _live_slots(
 
 
 def _window(
-    viewed: Sequence[object], *, tenant_id: UUID | None, user_id: UUID | None, view: WorkspaceView
-) -> tuple[
-    list[tuple[_Figure, list[_Figure]]], set[tuple[str, int, tuple[int, int, int, int] | None]]
-]:
-    """通过三项比对的 ref 按槽归并,外加窗口里的槽 —— 建块与核对新鲜度看的是同一个窗口。"""
+    viewed: Sequence[object],
+    *,
+    tenant_id: UUID | None,
+    user_id: UUID | None,
+    view: WorkspaceView,
+    expiry: FigureExpiry | None = None,
+) -> tuple[list[tuple[_Figure, list[_Figure]]], set[Slot], dict[str, list[int]]]:
+    """通过三项比对的 ref 按槽归并,外加窗口里的槽 —— 建块与核对新鲜度看的是同一个窗口。
+
+    B-302 —— 过期文档(:class:`FigureExpiry`)的槽**整个拿掉**,另返回「过期文档 → 看过的编号」:
+    它们不做新鲜度核对、不进 B-268 的退役行,只出一行过期占位。
+    """
     figures: list[_Figure] = []
     for ref in viewed:
         fig = _own_figure(ref, tenant_id=tenant_id, user_id=user_id, agent_key=view.agent_key)
@@ -358,7 +424,17 @@ def _window(
             len(viewed),
         )
     slots = _figure_slots(figures)
-    return slots, _live_slots(slots)
+    gone = (
+        expiry.expired_documents([current.doc_sha for current, _ in slots])
+        if expiry is not None
+        else set()
+    )
+    expired: dict[str, list[int]] = {}
+    for current, _older in slots:
+        if current.doc_sha in gone:
+            expired.setdefault(current.doc_sha, []).append(current.unit)
+    kept = [(current, older) for current, older in slots if current.doc_sha not in gone]
+    return kept, _live_slots(kept), expired
 
 
 async def figure_freshness(
@@ -369,6 +445,7 @@ async def figure_freshness(
     tenant_id: UUID | None,
     user_id: UUID | None,
     view: WorkspaceView,
+    expiry: FigureExpiry | None = None,
 ) -> dict[str, FigureFreshness]:
     """终审 #1 —— 窗口里每一张(见 :func:`_live_slots`)的新鲜度,按 ref 索引。
 
@@ -377,7 +454,9 @@ async def figure_freshness(
     """
     if tenant_id is None or user_id is None:
         return {}
-    slots, in_view = _window(viewed, tenant_id=tenant_id, user_id=user_id, view=view)
+    slots, in_view, _expired = _window(
+        viewed, tenant_id=tenant_id, user_id=user_id, view=view, expiry=expiry
+    )
     result: dict[str, FigureFreshness] = {}
     for current in (current for current, _older in slots if current.slot in in_view):
         path = _document_path(current.doc_sha, documents, view)
@@ -411,8 +490,12 @@ def figure_block_message(
     user_id: UUID | None,
     view: WorkspaceView,
     freshness: Mapping[str, FigureFreshness] | None = None,
+    expiry: FigureExpiry | None = None,
 ) -> HumanMessage | None:
     """造这一轮的渲染页段;没有可挂的就 ``None``。
+
+    **过期(B-302 第 2 层)。** ``expiry`` 给了且开着时,文档最后一次取页之后满 N 次调用,它的页
+    换成一行可找回的过期占位(:func:`_window` 里判,核对新鲜度看到的是同一组页)。
 
     **新鲜度(终审 #1)。** ``freshness`` 是 :func:`figure_freshness` 对窗口里每张的
     核对结果。给了它,窗口里不是 ``"fresh"`` 的页**一律不附图**,换成可见文字(文档
@@ -438,10 +521,14 @@ def figure_block_message(
     """
     if not supports_vision or not viewed:
         return None
-    slots, in_view = _window(viewed, tenant_id=tenant_id, user_id=user_id, view=view)
-    if not slots:
+    slots, in_view, expired = _window(
+        viewed, tenant_id=tenant_id, user_id=user_id, view=view, expiry=expiry
+    )
+    if not slots and not expired:
         return None
     lines = _placeholder_lines(slots, in_view, documents, view)
+    if expiry is not None:
+        lines.extend(_expired_lines(expired, documents, view, expiry.view_steps))
     # 回修第 4 轮 —— 窗口里的几张按文档归到一起(文档之间按首次出现排,文档内保持
     # 原次序),路径每份文档只写一次;图片块按同一次序挂,文字与图一一对应。
     in_window = [current for current, _ in slots if current.slot in in_view]
@@ -493,6 +580,7 @@ def figure_block_tail(
     user_id: UUID | None,
     view: WorkspaceView,
     freshness: Mapping[str, FigureFreshness] | None = None,
+    expiry: FigureExpiry | None = None,
 ) -> list[BaseMessage]:
     """:func:`figure_block_message` + :func:`with_figure_block` 一步做完(测试用这个入口)。"""
     block = figure_block_message(
@@ -503,5 +591,6 @@ def figure_block_tail(
         user_id=user_id,
         view=view,
         freshness=freshness,
+        expiry=expiry,
     )
     return with_figure_block(messages, block)

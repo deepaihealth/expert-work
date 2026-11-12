@@ -2495,6 +2495,32 @@ asyncio.run(main())
 - [x] **111.7 价目表 0187 与两个新模型真调**:判据:`model_rate_card` 平台行 `qwen3.8-max-0902` 12 000 000 / 36 000 000 / 0 / 1 500 000、`doubao-seed-2-1-pro-260915` 6 000 000 / 30 000 000 / 0 / 1 200 000;两个新模型、以及保存了已下架 `doubao-seed-2-1-pro-260628` 的智能体(不配备用)各跑一轮 `success`,`token_usage` 有对应模型的行。 **11-11 过**:价格逐项一致,旧快照价目行未动;三轮都 success、各 2 行用量。
 - [x] **111.8 下拉里没有已下架的豆包快照**(要控制台登录):智能体编辑页模型下拉。判据:有 `doubao-seed-2-1-pro-260915`、`qwen3.8-max-0902`,没有 `doubao-seed-2-1-pro-260628`;已保存旧快照的智能体打开不报错。 **11-12 过**:控制台模型目录接口(下拉的来源)有 `qwen3.8-max-0902`、`qwen3.8-max`、`doubao-seed-2-1-pro-260915`,没有 `260628`;保存了旧快照的智能体照常构建、运行(111.7)。
 
+## §112 读取规矩 + 页图只留几步(B-302 PR 2,两层默认关)
+
+**背景**:设计 `docs/superpowers/specs/2026-11-11-b302-runaway-reverify-design.md` §4.2。第 1 层:主模型自己能看图的智能体,系统提示词多一段 `# Reading documents and images`(没看清记成「不确定 + 候选读法」、没有新证据或用户更正不改、不确定的在回复里说)。第 2 层:一份文档最后一次 `read_page` 之后,它的页图只带 N 次模型调用,之后换成一行可找回的占位(`[Document "…": you viewed units …. Fetched pages stay attached only for N steps …]`)。**两层合并时都关**:平台设置 `EXPERT_WORK_READING_RULE`(默认 false)、`EXPERT_WORK_FIGURE_VIEW_STEPS`(默认 0);智能体可在 `policies.reading_rule` / `policies.figure_view_steps` 单独打开(不进控制台表单,用 YAML / 接口改)。默认下只有一处措辞立即生效:B-268 的退役行与 `read_page` 回执里 number(s) → detail(s)。**A/B(设计 §5)不在本节**:要先重新报价、用户批了才跑。
+
+**读取账的步数章默认也盖**(独立审查 LOW-1,有意保持):tools 节点合并 `read_page` 写回的账时,不管开关开没开都给每条加 `step`。理由:开关是按智能体覆盖、随时可能打开;如果只在开着时盖章,打开那一刻当轮已有的账全都没有章,`_window` 会按「本轮账里没有这份文档」把正在读的页**立即全部判成过期**。默认关时它只是账里多一个整数键,模型看到的提示词与挂图不变(T2-9)。
+
+**怎么进(只在测试环境)**:平台租户,对外 key 或调试台均可。文档用 `tools/eval/b302_docs.py` 生成的合成件(`--out <scratchpad>/b302-docs`;回归集 `regression-4p.pdf` 是 4 页纯图片表格,够用)。临时智能体按 `python tools/eval/b302_ab.py manifests --out <dir> --doubao-model <任意>` 生成的 `eval-b302-glm-5-3-flash-a.yaml` 改名导入(主模型 glm-5.3-flash 自己看图),下面各条只改 `policies` 里那两个字段。看模型输入用 Langfuse(每步的 generation 输入)。**花费**:十来轮短对话,< ¥3。
+
+- [ ] **112.1 默认值 = 今天(两个字段都不填、平台默认)**:触发:智能体 `acc-b302-default`(删掉 `policies` 里的 `reading_rule` / `figure_view_steps` 两行),上传 `regression-4p.pdf`,说「先用 read_page 看第 1~3 页,然后分四步各在工作区写一个小文件 note1.txt ~ note4.txt,每步只写一个,不要再看页」。看哪里:Langfuse 这一轮每步输入的系统提示词和最后那段「你取来的文档页」。判据:系统提示词里**没有** `# Reading documents and images`;取页之后每一步(含第 4 步及以后)都还挂着 3 张页图;没有 `you viewed units` 字样;`read_page` 的回执里没有 `stay attached only for`。**判据红的情形**:任何一步的页图提前消失,或出现过期占位行。
+- [ ] **112.2 措辞(默认下就生效)**:同 112.1 的会话再发一轮「把第 1 页再看一遍」(重看会带回执),以及另传一份 7 页以上的 PDF 读第 1 页(超上限预告)。看哪里:轨迹里 `read_page` 的结果。判据:重看回执含 `details noted in your thinking are not kept to the next step`;超上限预告含 `Write the details into a workspace file`;全部回执与页图段文字里没有 `number` / `numbers`。**没修好时**:还是 `numbers noted in your thinking`。
+- [ ] **112.3 第 2 层按智能体打开(N=3)**:触发:智能体 `acc-b302-window`,`policies.figure_view_steps: 3`,同 112.1 的提示词。看哪里:Langfuse 每步输入的页图段;轨迹里 `read_page` 的结果。判据:发起 `read_page` 那一步之后的第 1、2、3 次模型调用各挂 3 张页图;第 4 次调用**没有图**,页图段里恰好一行 `[Document "…regression-4p.pdf": you viewed units 1-3. Fetched pages stay attached only for 3 steps after you last called read_page on this document, …]`,**没有**这份文档的 `left your context` 行,也没有「重新调用 read_page,path 填…」行;`read_page` 结果的平台说明以 `Note: your thinking is not kept to the next step, and these pages stay attached only for the next 3 steps.` 开头。**判据红的情形**:第 4 次调用还带图,或过期行与退役行同时出现。
+- [ ] **112.4 还在往下读时整份都在(按文档计)**:同 112.3 的智能体,新会话传一份 6 页的 PDF(`b302_docs` 生成的 6 页文档,或回归集 `regression-6p.pdf`),说「先看第 1~3 页,写一句小结,再看第 4~6 页,然后一次写出全部 6 页的要点」。判据:读第 4~6 页之后的那次调用挂着 6 张图(1~6 页都在),不是只有 4~6 页。**判据红的情形**:第 1~3 页在第 4~6 页读完后立刻消失(按每页过期)。
+- [ ] **112.5 跨轮一律过期 + 再取能拿回来**:接 112.3 的会话再发一轮「第 2 页上那个表头写的是什么?」。判据:这一轮第一次调用就**没有**图、有过期占位行;模型调 `read_page` 取第 2 页之后的下一次调用里第 2 页的图回来了。**判据红的情形**:新一轮第一次调用还带着上一轮的图;或重取之后图没回来。
+- [ ] **112.6 第 1 层按能力开关**:触发:智能体 `acc-b302-rule`(主模型自己看图,`policies.reading_rule: true`),以及 `acc-b302-rule-blind`(同样 `reading_rule: true`,但主模型 `supports_vision: false`、配 `vision` 块走 `ask_image`)。各发一句「你好」。看哪里:调试台或 Langfuse 第一步的系统提示词。判据:前者有 `# Reading documents and images` 一段,内含 `or the user corrects it` 与 `In your reply, tell the user which details are still uncertain`;后者**没有**这段(`read_page` 它也有,但不按它判)。**判据红的情形**:后者也有这段。
+- [ ] **112.7 不确定的写进回复(观察项,不挡发布)**:`acc-b302-rule` 传一份 `b302_docs` 生成的扫描件(手写体的会议纪要那份),说「看一下这份文件,说说要点」。判据(只记录):回复里对拿不准的字段写成「不确定:A 或 B」一类;记下原文贴 PR 评论。定量看 A/B。
+- [ ] **112.8 存量配置不变 + 回滚前检查**:控制台打开任意一个存量智能体、不改任何东西点保存(生成新版本)。只读查:
+  ```sql
+  SELECT name, version FROM agent_spec
+  WHERE spec_json->'spec'->'policies' ?| array['reading_rule','figure_view_steps']
+     OR draft_spec_json->'spec'->'policies' ?| array['reading_rule','figure_view_steps'];
+  ```
+  判据:刚保存的那个版本**不在**结果里(没填的两个字段不落库,哪怕是 null);结果里只有本节的临时智能体。收尾后再查一次应为 0 行 —— 回滚到没有这两个字段的镜像之前必须是 0 行(`PolicySpec` 是 `extra="forbid"`,填了这两个字段的配置在旧镜像上建不起来)。**判据红的情形**:存量智能体保存后出现 `"reading_rule": null`。
+- [ ] **112.9 收尾(必做)**:删本节 `acc-b302-*` 临时智能体与会话;若测试环境里有 A/B 留下的 `eval-b302-*`,用 `python tools/eval/b302_ab.py cleanup --base-url <测试环境> --doubao-model <A/B 用的豆包型号> --yes`(只删脚本生成的那几个确切 code)(控制台凭据 `EXPERT_WORK_EVAL_CONSOLE_TOKEN`;不带 `--yes` 只列不删)删掉;按 112.8 再查一次为 0 行 —— 不是 0 行就不许回滚到旧镜像。
+
+**生产**:合并发布后行为与今天相同(两层都关),只有措辞那一处;发布清单加 112.8 的查询作为回滚前检查。两层改成平台默认开要等 A/B 全部模型通过后的另一个 PR(设计 §4.2.9)。
+
 ## §113 结果重复检测只记不动(影子模式)(B-302 PR 4)
 
 **背景**:防打转只认「连续 3 次参数完全相同」。现在 tools 节点每批之后给每条工具结果算指纹(去掉 UUID、日期时间、时刻、长十六进制串、10 / 13 位时间戳、耗时、`/tmp/` 路径与本次调用 id 之后按字节算),标出两种情况:**同参数同结果**(`same_args`,本轮第 3 次起,不要求连续)与**换参数同结果**(`changed_args`,出现过 ≥ 2 种参数,本轮第 3 次起;第 3、4 次记 `remind`,第 5 次起记 `trip`)。**只记不动**:模型看不到任何提醒,工具结果、打转次数、路由与收尾都和以前一样。记三处:计数器 `expert_work_outcome_repeat_shadow_total{signal,action,tool}` 与 `expert_work_outcome_repeat_shadow_trips_total`(有 `trip` 的批次各 +1)、Langfuse span `expert_work.orchestrator.outcome_repeat_shadow`(属性 `same_args` / `changed_args` / `would_trip` / `tools` / `max_occurrence`)、pod 日志一行 `outcome_repeat.shadow …`。设计见 `docs/superpowers/specs/2026-11-11-b302-runaway-reverify-design.md` §4.4,用户 D2 定的是「先影子、看误伤数字再定开不开」。

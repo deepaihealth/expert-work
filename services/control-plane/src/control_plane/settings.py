@@ -869,6 +869,16 @@ class Settings(BaseSettings):
     #: disables the platform default (agents that set their own still apply).
     default_run_deadline_s: int = Field(default=5400, ge=0, le=86400)
 
+    #: B-302 PR 2 第 1 层 —— 平台开关「读取规矩」:主模型自己能看图的智能体,系统提示词里加一段
+    #: 「第一次没看清就记成不确定 + 候选读法;没有新证据或用户更正不改;不确定的在回复里说」。
+    #: 默认关 —— 测试环境 A/B(设计 §5)所有测过的模型都过才改成默认开。智能体的
+    #: ``policies.reading_rule`` 填了就用自己的。启动时读一次,改了要重启。
+    reading_rule: bool = False
+    #: B-302 PR 2 第 2 层 —— 一份文档的页图在它最后一次 ``read_page`` 之后只带几次模型调用,之后
+    #: 换成可找回的占位文字。0(默认)= 关,与之前的挂图行为相同;A/B 的值是 3。智能体的
+    #: ``policies.figure_view_steps`` 填了就用自己的。启动时读一次,改了要重启。
+    figure_view_steps: int = Field(default=0, ge=0, le=50)
+
     # --------------------------------------------------- memory consolidator (Sprint #7)
     #: Capability Uplift Sprint #7 (Mini-ADR U-34) — MemoryConsolidator
     #: sweep cadence. Default 14400 = every 4 hours (4 sweeps / day).
