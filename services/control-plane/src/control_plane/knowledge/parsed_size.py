@@ -66,6 +66,7 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
 from control_plane.knowledge.parsing import DocumentParseError, parse_document
+from control_plane.knowledge.recognition.orientation import process_classifier
 from control_plane.knowledge.recognition.pages import PdfAnalysis, analyse_pdf
 from expert_work.protocol import IngestErrorCode, PageDecision
 
@@ -178,10 +179,16 @@ def parse_within_cap(filename: str, raw: bytes, limit: int) -> str:
     return text
 
 
-def analyse_pdf_within_cap(filename: str, raw: bytes, limit: int) -> PdfAnalysis:
+def analyse_pdf_within_cap(
+    filename: str, raw: bytes, limit: int, orientation_pages: int = 0
+) -> PdfAnalysis:
     """:func:`analyse_pdf` with the same refusal, on the text it returns: the
-    whole Markdown, or the text pages' (before any page is recognized)."""
-    analysis = analyse_pdf(filename, raw)
+    whole Markdown, or the text pages' (before any page is recognized).
+    ``orientation_pages`` (B-301 PR 4): the first that many pages to recognize
+    are asked their orientation by this worker's classifier (created here on
+    first use); 0: none."""
+    classifier = process_classifier() if orientation_pages > 0 else None
+    analysis = analyse_pdf(filename, raw, classifier, orientation_pages)
     if analysis.markdown is not None:
         chars = len(analysis.markdown)
     else:

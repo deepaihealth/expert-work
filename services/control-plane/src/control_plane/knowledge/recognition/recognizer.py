@@ -9,6 +9,7 @@
   上传文档的租户名下(不合格的回答、形状不对的回包厂商也收了钱,一样记)。
 * 缓存**按文档**(复核 M1:文档删了,它的识别文字 —— 可能是健康资料 —— 随之删除),键 =
   图片字节 sha256 + 模型 + 请求参数(提示词版本 / 温度 / 关思考字段 / 输出上限)+ 渲染参数;
+  转正过的页(B-301 PR 4)渲染参数后加「角度 + 方向模型文件哈希」,读法摘要随之不同;没转的页不变。
   存的是厂商**原始回答**,读出时按当前规则重新清洗与校验 —— 清洗规则修了,缓存里的页跟着修。
 * 页面与文档上给租户看的错误只有固定的错误类(:data:`ERROR_CLASSES`),厂商原文、凭据
   解析的报错只进服务端日志(复核 L2)。
@@ -54,6 +55,11 @@ from control_plane.knowledge.recognition.figure_images import image_size
 from control_plane.knowledge.recognition.figure_markup import (
     region_placeholder,
     resolve_figures,
+)
+from control_plane.knowledge.recognition.orientation import (
+    Orientation,
+    cache_tags,
+    reading_suffix,
 )
 from control_plane.knowledge.recognition.pages import RENDERER_VERSION, render_params
 from control_plane.knowledge.stale import StaleIngestionError
@@ -287,10 +293,11 @@ class RecognitionPlan:
         reasons = [f"{e.choice.key}: {e.unavailable}" for e in self.engines if e.unavailable]
         return "; ".join(reasons) or ERROR_NOT_CONFIGURED
 
-    def page_readers(self) -> tuple[str, ...]:
+    def page_readers(self, suffix: str = "") -> tuple[str, ...]:
         """B-238 —— how the usable models read this plan's scanned pages: the
-        ``reader`` a cached page reading records (:func:`reader_digest`)."""
-        render = render_params(self.max_pixels)
+        ``reader`` a cached page reading records (:func:`reader_digest`).
+        ``suffix``: a turned page's (:func:`~.orientation.reading_suffix`)."""
+        render = render_params(self.max_pixels) + suffix
         return tuple(
             reader_digest(engine.choice.key, engine.cache_tag, render)
             for engine in self.engines
@@ -301,10 +308,11 @@ class RecognitionPlan:
 @dataclass(frozen=True)
 class _PageSource:
     """B-238 —— the document bytes (:func:`source_digest`) and rendering the
-    scanned pages being read come from."""
+    scanned page being read comes from; B-301 PR 4 —— and what turned it upright."""
 
     sha256: str
     render: str
+    orientation: Orientation | None = None
 
 
 def default_client(
@@ -388,6 +396,7 @@ def _page_tags(index: int, engine: _Engine, source: _PageSource) -> dict[str, ob
         PAGE_OCR_PAGE: index,
         PAGE_OCR_SOURCE: source.sha256,
         PAGE_OCR_READER: reader_digest(engine.choice.key, engine.cache_tag, source.render),
+        **cache_tags(source.orientation),
     }
 
 
@@ -496,6 +505,7 @@ class DocumentRecognizer:
         kind: ParseCacheKind = _CACHE_KIND,
         checkpoint: CallCheckpoint | None = None,
         source_sha256: str | None = None,
+        orientations: Mapping[int, Orientation] | None = None,
     ) -> dict[int, PageOutcome]:
         """Recognize the given pages (index → JPEG bytes). One page going
         wrong never leaves the others' paid calls running unattended: an
@@ -505,10 +515,13 @@ class DocumentRecognizer:
         is raised once the calls under way are done. ``source_sha256``
         (:func:`source_digest` of the document the pages were rendered from):
         each ``page_ocr`` reading cached records it, its page and its reader
-        (B-238)."""
+        (B-238). ``orientations``: the scanned pages' (B-301 PR 4) — a page
+        rendered turned upright is read under its own render parameters."""
+        turned = orientations or {}
+        renders = {index: render + reading_suffix(turned.get(index)) for index in images}
         keys = {
             index: [
-                cache_key(image, engine.choice.key, engine.cache_tag, render)
+                cache_key(image, engine.choice.key, engine.cache_tag, renders[index])
                 for engine in plan.engines
             ]
             for index, image in images.items()
@@ -516,11 +529,11 @@ class DocumentRecognizer:
         cached = await self._cached(
             tenant_id, document_id, kind, [key for row in keys.values() for key in row]
         )
-        source = (
-            _PageSource(source_sha256, render)
+        sources = {
+            index: _PageSource(source_sha256, renders[index], turned.get(index))
+            for index in images
             if kind == "page_ocr" and source_sha256 is not None
-            else None
-        )
+        }
         results = await asyncio.gather(
             *(
                 self._guarded_page(
@@ -533,7 +546,7 @@ class DocumentRecognizer:
                     cached,
                     kind,
                     checkpoint,
-                    source,
+                    sources.get(index),
                 )
                 for index, image in images.items()
             )
@@ -552,6 +565,7 @@ class DocumentRecognizer:
         before_batch: BatchGuard | None = None,
         max_chars: int | None = None,
         source_sha256: str | None = None,
+        orientations: Mapping[int, Orientation] | None = None,
     ) -> dict[int, PageOutcome]:
         """Recognize one document's scanned pages (0-based indexes, in page
         order) up to the per-document cap — the rest are ``over_limit``.
@@ -560,7 +574,8 @@ class DocumentRecognizer:
         before each batch and raises to stop a worker that lost the document.
         Once the pages read hold ``max_chars`` characters, the remaining pages
         are not read (nor paid for): they are ``document_text_limit``.
-        ``source_sha256``: see :meth:`recognize`.
+        ``source_sha256`` / ``orientations``: see :meth:`recognize` (``render``
+        draws the turned pages upright).
 
         No model configured at all: every page is ``pending``, nothing is
         rendered. Models configured but none usable (no key, account down):
@@ -602,6 +617,7 @@ class DocumentRecognizer:
                     images=dict(zip(indexes, images, strict=True)),
                     render=params,
                     source_sha256=source_sha256,
+                    orientations=orientations,
                 )
                 outcomes.update(batch)
                 read += sum(

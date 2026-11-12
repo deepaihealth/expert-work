@@ -37,8 +37,10 @@ from control_plane.knowledge.profile import (
     profile_token_bounds,
 )
 from control_plane.knowledge.recognition.ingest_parse import LocalParse
+from control_plane.knowledge.recognition.orientation import reading_suffix
 from control_plane.knowledge.recognition.recognizer import (
     DocumentRecognizer,
+    RecognitionPlan,
     RecognitionSettingsSource,
     source_digest,
 )
@@ -109,7 +111,7 @@ class _Recognition:
     max_pages: int
     configured: bool
     #: B-238 —— how the usable models read the pages (:meth:`RecognitionPlan.page_readers`).
-    readers: tuple[str, ...] = ()
+    plan: RecognitionPlan | None = None
 
 
 @dataclass
@@ -148,6 +150,12 @@ class IngestEstimator:
     @property
     def prices(self) -> PriceSource | None:
         return self._prices
+
+    @property
+    def recognizer(self) -> DocumentRecognizer | None:
+        """The ingest's scanned-page recognizer (the local parse asks the pages it
+        will read their orientation, B-301 PR 4)."""
+        return self._recognizer
 
     async def estimate(
         self,
@@ -270,16 +278,23 @@ class IngestEstimator:
         # B-238 / B-256 —— 已读页的识别在文档缓存里(主 / 兜底模型的都算),只认记了页码、
         # 来源正是这份字节、读法与这次入库相同的识别:入库也只复用这些(按缓存键查),
         # 上次入库的逐页记录不看(换了模型 / 提示词版本时它们全部要重新收费)。
-        cached = (
-            await self._store.cached_page_indexes(
-                tenant_id=claim.tenant_id,
-                document_id=claim.document_id,
-                source_sha256=await asyncio.to_thread(source_digest, claim.content),
-                readers=recognition.readers,
-            )
-            if recognition.readers and claim.content is not None
-            else set()
-        )
+        # B-301 PR 4 —— 转正过的页读法另算(角度 + 方向模型文件哈希):按读法分组查,每组只认
+        # 本组的页 —— 以前横着读过的那一条不能算成转正后「已识别、免费」。
+        plan = recognition.plan
+        cached: set[int] = set()
+        if plan is not None and plan.page_readers() and claim.content is not None:
+            source = await asyncio.to_thread(source_digest, claim.content)
+            groups: dict[str, set[int]] = {}
+            for page in local.analysis.ocr_pages:
+                groups.setdefault(reading_suffix(page.orientation), set()).add(page.index)
+            for suffix, indexes in groups.items():
+                found = await self._store.cached_page_indexes(
+                    tenant_id=claim.tenant_id,
+                    document_id=claim.document_id,
+                    source_sha256=source,
+                    readers=plan.page_readers(suffix),
+                )
+                cached |= found & indexes
         return count_pages(local.analysis, max_pages=recognition.max_pages, cached=cached)
 
     async def _recognition(self, claim: ClaimedIngestion) -> _Recognition:
@@ -292,7 +307,7 @@ class IngestEstimator:
             fallback=usable[1] if len(usable) > 1 else None,
             max_pages=plan.max_pages,
             configured=bool(plan.engines),
-            readers=plan.page_readers(),
+            plan=plan,
         )
 
     async def _figures_of(

@@ -62,6 +62,7 @@ from control_plane.knowledge.recognition.figure_pdf import (
 )
 from control_plane.knowledge.recognition.figure_pipeline import FigureDescriber, FigureOutcome
 from control_plane.knowledge.recognition.figure_scan import ScannedFigures, crop_scanned_figures
+from control_plane.knowledge.recognition.orientation import page_orientation_enabled
 from control_plane.knowledge.recognition.pages import PdfAnalysis, pdf_page_texts, render_pages
 from control_plane.knowledge.recognition.recognizer import (
     ERROR_NOT_CONFIGURED,
@@ -69,11 +70,24 @@ from control_plane.knowledge.recognition.recognizer import (
     PageOutcome,
     source_digest,
 )
+from expert_work.common.observability import expert_work_counter
 from expert_work.persistence import KnowledgeStore
 from expert_work.persistence.knowledge.base import UNSET
 from expert_work.protocol import FigureStats, PageDecision, PageReason, PageStatus
 
 logger = logging.getLogger(__name__)
+
+#: B-301 PR 4 —— scanned pages the orientation classifier was asked about at ingest,
+#: by the degrees they were turned (``0``: kept as they are) / that it failed on.
+_page_orientations = expert_work_counter(
+    "expert_work_knowledge_page_orientation_total",
+    "Scanned pages asked their orientation at ingest, by the degrees they were turned.",
+    ["rotation"],
+)
+_page_orientation_failures = expert_work_counter(
+    "expert_work_knowledge_page_orientation_failures_total",
+    "Scanned pages the orientation classifier could not be asked about (read as they are).",
+)
 
 
 class PoolRunner(Protocol):
@@ -139,7 +153,7 @@ async def parse_upload(
     :raises Exception: ``job.lost()`` when a fenced write was refused."""
     on = figures is not None and await figures_enabled(figures, tenant_id=job.tenant_id)
     describer = figures if on else None
-    local = await local_parse(job, figures_on=describer is not None)
+    local = await local_parse(job, figures_on=describer is not None, recognizer=recognizer)
     return await finish_parse(job, local, recognizer=recognizer, figures=describer)
 
 
@@ -153,12 +167,16 @@ async def figures_enabled(figures: FigureDescriber, *, tenant_id: UUID) -> bool:
         return False
 
 
-async def local_parse(job: ParseJob, *, figures_on: bool) -> LocalParse:
+async def local_parse(
+    job: ParseJob, *, figures_on: bool, recognizer: DocumentRecognizer | None
+) -> LocalParse:
     """The parse-pool half of :func:`parse_upload` (``figures_on``: a usable
-    figure describer will describe the figures)."""
+    figure describer will describe the figures; ``recognizer``: the one the
+    ingest reads scanned pages with — B-301 PR 4, only the pages it will read
+    are asked their orientation)."""
     ext = Path(job.filename).suffix.lower()
     if ext == ".pdf":
-        return await _local_pdf(job, figures_on)
+        return await _local_pdf(job, figures_on, await orientation_page_cap(job, recognizer))
     if figures_on and ext in FIGURE_OFFICE_EXTENSIONS:
         parsed: OfficeParse = await job.run(
             parse_office_figures_within_cap, job.raw, ext, max_parsed_chars()
@@ -202,9 +220,36 @@ async def _finish_office(job: ParseJob, local: LocalParse, figures: FigureDescri
     return markdown
 
 
-async def _local_pdf(job: ParseJob, figures_on: bool) -> LocalParse:
+async def orientation_page_cap(job: ParseJob, recognizer: DocumentRecognizer | None) -> int:
+    """B-301 PR 4 —— how many of a PDF's pages to recognize are asked their
+    orientation: the ones recognition will read — the first ``max_pages`` of
+    them (:meth:`DocumentRecognizer.recognize_document`). None while the switch
+    is off, without a recognizer, or with no recognition model configured (the
+    pages wait; a later 补识别 parses the document again). The settings cannot be
+    read: none either — logged and counted, the parse goes on as before B-301
+    (a passing settings blip must not fail a document that never needed them)."""
+    if not page_orientation_enabled() or recognizer is None:
+        return 0
+    try:
+        plan = await recognizer.plan(tenant_id=job.tenant_id)
+    except Exception:
+        _page_orientation_failures.inc()
+        logger.warning(
+            "knowledge.page_orientation_cap_failed document=%s — pages read as they are",
+            job.document_id,
+            exc_info=True,
+        )
+        return 0
+    return plan.max_pages if plan.engines else 0
+
+
+async def _local_pdf(job: ParseJob, figures_on: bool, orientation_pages: int) -> LocalParse:
     analysis: PdfAnalysis = await job.run(
-        analyse_pdf_within_cap, job.filename, job.raw, max_parsed_chars()
+        analyse_pdf_within_cap,
+        job.filename,
+        job.raw,
+        max_parsed_chars(),
+        orientation_pages,
     )
     if not analysis.pages:  # PyMuPDF could not walk it: parsed as before, no records
         return LocalParse(kind="text", figures_on=figures_on, markdown=analysis.markdown or "")
@@ -236,7 +281,7 @@ async def _finish_pdf(
     outcome: FigureOutcome | None = None
     if figures is not None:
         outcomes, extraction = await _scanned_figures(
-            job, outcomes, local.pdf_figures or FigureExtraction()
+            job, outcomes, local.pdf_figures or FigureExtraction(), analysis.rotations()
         )
         text = "\n".join([*(p.text for p in analysis.pages), *(o.text for o in outcomes.values())])
         outcome = await _describe(job, figures, extraction, text)
@@ -274,12 +319,15 @@ async def _recognize(
     if not scanned:
         return {}
     await job.recognizing()
+    _count_orientations(job, analysis)
     if recognizer is None:
         pending = PageOutcome(status=PageStatus.PENDING, error=ERROR_NOT_CONFIGURED)
         return dict.fromkeys(scanned, pending)
+    rotations = analysis.rotations()
 
     async def render(indexes: list[int], max_pixels: int | None) -> list[bytes]:
-        return await job.run(render_pages, job.raw, indexes, max_pixels)
+        turns = {index: rotations[index] for index in indexes if index in rotations}
+        return await job.run(render_pages, job.raw, indexes, max_pixels, turns)
 
     outcomes = await recognizer.recognize_document(
         tenant_id=job.tenant_id,
@@ -289,8 +337,34 @@ async def _recognize(
         before_batch=job.recognizing,
         max_chars=limit,
         source_sha256=await asyncio.to_thread(source_digest, job.raw),
+        orientations={
+            page.index: page.orientation
+            for page in analysis.ocr_pages
+            if page.orientation is not None
+        },
     )
     return cap_recognized_text(outcomes, limit)
+
+
+def _count_orientations(job: ParseJob, analysis: PdfAnalysis) -> None:
+    """B-301 PR 4 —— the scanned pages the classifier was asked about, by the angle
+    they are turned (``0``: kept as they are); a page it could not be asked about is
+    a warning and counts as a failure (the page is not turned)."""
+    failed = 0
+    for page in analysis.ocr_pages:
+        if page.orientation is None:
+            continue
+        if page.orientation.failed:
+            failed += 1
+            continue
+        _page_orientations.labels(rotation=str(page.rotation)).inc()
+    if failed:
+        _page_orientation_failures.inc(failed)
+        logger.warning(
+            "knowledge.page_orientation_failed document=%s pages=%d — read as they are",
+            job.document_id,
+            failed,
+        )
 
 
 async def _text_page_figures(
@@ -336,11 +410,15 @@ async def _text_page_figures(
 
 
 async def _scanned_figures(
-    job: ParseJob, outcomes: Mapping[int, PageOutcome], extraction: FigureExtraction
+    job: ParseJob,
+    outcomes: Mapping[int, PageOutcome],
+    extraction: FigureExtraction,
+    rotations: Mapping[int, int],
 ) -> tuple[dict[int, PageOutcome], FigureExtraction]:
     """The scanned pages' image regions cropped and their placeholders in
     place, numbered after the text pages' ``extraction`` and added to it
-    (going wrong costs only those figures, counted unreadable)."""
+    (going wrong costs only those figures, counted unreadable). A turned page
+    (``rotations``) is cropped upright, as it was read."""
     regions = {
         index: outcome.regions
         for index, outcome in outcomes.items()
@@ -355,6 +433,7 @@ async def _scanned_figures(
         job.raw,
         regions,
         extraction.next_number,
+        {index: rotations[index] for index in regions if index in rotations},
         fallback=ScannedFigures(
             figures=FigureExtraction(extracted=unreadable, unsupported=unreadable), numbers={}
         ),

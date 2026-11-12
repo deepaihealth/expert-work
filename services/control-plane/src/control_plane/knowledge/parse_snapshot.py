@@ -22,6 +22,7 @@ from typing import Any, Final
 from control_plane.knowledge.recognition.figure_extract import FigureExtraction
 from control_plane.knowledge.recognition.figure_filters import FigureCandidate
 from control_plane.knowledge.recognition.ingest_parse import LocalParse
+from control_plane.knowledge.recognition.orientation import Orientation
 from control_plane.knowledge.recognition.pages import PdfAnalysis, PdfPage
 from expert_work.persistence.knowledge.base import ParseSnapshot
 from expert_work.protocol import PageDecision, PageReason
@@ -173,6 +174,7 @@ def _analysis(analysis: PdfAnalysis | None) -> dict[str, Any] | None:
                 "chars": p.chars,
                 "images": p.images,
                 "text": p.text,
+                "orientation": _orientation(p.orientation),
             }
             for p in analysis.pages
         ],
@@ -192,8 +194,34 @@ def _read_analysis(body: dict[str, Any] | None) -> PdfAnalysis | None:
                 chars=int(p["chars"]),
                 images=int(p["images"]),
                 text=str(p["text"]),
+                orientation=_read_orientation(p.get("orientation")),
             )
             for p in body["pages"]
         ),
         markdown=body["markdown"],
+    )
+
+
+def _orientation(orientation: Orientation | None) -> dict[str, Any] | None:
+    """B-301 PR 4 —— a scanned page's orientation, so the confirmed ingest turns
+    the page the estimate counted as turned (it never asks the classifier again)."""
+    if orientation is None:
+        return None
+    return {
+        "angle": orientation.angle,
+        "confidence": orientation.confidence,
+        "model": orientation.model,
+        "failed": orientation.failed,
+    }
+
+
+def _read_orientation(body: dict[str, Any] | None) -> Orientation | None:
+    """A snapshot written before B-301 PR 4 has none: the page was not asked."""
+    if body is None:
+        return None
+    return Orientation(
+        angle=int(body["angle"]),
+        confidence=float(body["confidence"]),
+        model=str(body["model"]),
+        failed=bool(body["failed"]),
     )
