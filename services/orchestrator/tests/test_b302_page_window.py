@@ -261,7 +261,8 @@ def test_t2_7_the_wording_says_detail_not_number() -> None:
     texts.append(_block_text(_tail([_ref(1)], expiry=_expiry([], step=0))))
     ledger = ledger_entries(_TURN, "doc", [FigureRead(1), FigureRead(2)], 9)
     for view_steps in (0, _N):
-        for reads, pages in (([FigureRead(1)], 9), ([FigureRead(3)], 9)):
+        # pages=None:不触发超上限预告 —— 它不在 §4.2.4 点名的两处里,措辞照旧(见下一条测试)。
+        for reads, pages in (([FigureRead(1)], None), ([FigureRead(3)], None)):
             for prior in ([], ledger):
                 notice = read_notice(
                     prior,
@@ -284,6 +285,19 @@ def test_t2_7_the_wording_says_detail_not_number() -> None:
     joined = " ".join(texts)
     assert "a specific detail" in joined
     assert "details noted in your thinking are not kept to the next step" in joined
+
+
+def test_the_over_cap_heads_up_keeps_its_wording() -> None:
+    """§4.2.4 只改退役行与回执两处;超上限预告不在范围内,原文不动(独立审查 MEDIUM-4)。"""
+    for view_steps in (0, _N):
+        notice = read_notice(
+            [], run_id=_TURN, doc_sha="doc", reads=[FigureRead(1)], pages=9, view_steps=view_steps
+        )
+        assert notice is not None
+        assert notice.startswith(
+            "This document has 9 pages, more than the 6 pages that can be in view at once. "
+            "Write the numbers into a workspace file as you read, then calculate from the file."
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -433,3 +447,43 @@ async def test_t2_9_the_graph_default_and_zero_are_today() -> None:
         [m.content for m in f["messages"] if m.type == "tool"] for f in (default_final, zero_final)
     ]
     assert tools[0] == tools[1]
+
+
+class _ForgesStep:
+    """往 ``figure_reads`` 里自己写 ``step`` 的工具 —— 通道工具可写,章必须由平台盖。"""
+
+    @property
+    def spec(self) -> ToolSpec:
+        return ToolSpec(name="forge", description="stub")
+
+    async def call(self, args: Mapping[str, Any], *, ctx: ToolContext) -> ToolResult:
+        del args
+        entry = {"run": str(ctx.run_id), "doc": "d", "unit": 1, "region": None, "pages": None}
+        return ToolResult(content="ok", state_updates={"figure_reads": [{**entry, "step": 999}]})
+
+
+async def test_a_step_a_tool_writes_itself_is_overwritten_by_the_platform() -> None:
+    registry = ToolRegistry()
+    registry.register(_ForgesStep())
+    llm = _RecordingLLM(
+        responses=[AIMessage(content="", tool_calls=[{"name": "forge", "args": {}, "id": "f"}])]
+    )
+    config: RunnableConfig = {
+        "configurable": {
+            "thread_id": str(uuid4()),
+            "run_id": str(_GRAPH_RUN),
+            "tenant_id": str(_TENANT),
+            "user_id": str(_USER),
+            "agent_key": _AGENT_KEY,
+        }
+    }
+    async with make_checkpointer("memory") as cp:
+        graph = GraphRunner(checkpointer=cp).compile(
+            build_react_graph(llm_caller=llm, tool_registry=registry, supports_vision=True)
+        )
+        final = await graph.ainvoke(
+            {"messages": [HumanMessage(content="x")], "step_count": 0, "max_steps": 4},
+            config=config,
+        )
+    # 第 0 次调用发起工具,tools 节点里 step_count = 1;开关关着(默认)也盖章(理由见 §112)。
+    assert [e["step"] for e in final["figure_reads"]] == [1]

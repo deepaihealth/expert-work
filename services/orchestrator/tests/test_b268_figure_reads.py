@@ -205,7 +205,7 @@ def test_a_document_over_the_cap_gets_a_heads_up_on_its_first_read_only() -> Non
     first = read_notice([], run_id=_RUN, doc_sha=_DOC, reads=[_page(1)], pages=9)
     assert first == (
         "This document has 9 pages, more than the 6 pages that can be in view at once. "
-        "Write the details into a workspace file as you read, then work from the file."
+        "Write the numbers into a workspace file as you read, then calculate from the file."
     )
     later = read_notice(_ledger(_page(1), pages=9), run_id=_RUN, doc_sha=_DOC, reads=[_page(2)])
     assert later is None

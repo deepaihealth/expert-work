@@ -327,8 +327,8 @@ def read_notice(
     if not entries and total is not None and total > FIGURE_PAGES_IN_VIEW:
         parts.append(
             f"This document has {total} pages, more than the {FIGURE_PAGES_IN_VIEW} pages that "
-            "can be in view at once. Write the details into a workspace file as you read, then "
-            "work from the file."
+            "can be in view at once. Write the numbers into a workspace file as you read, then "
+            "calculate from the file."
         )
     receipt = _receipt(entries, reads, view_steps=view_steps)
     if receipt is not None:
