@@ -241,9 +241,24 @@ LLM_FAILOVER_EVENT = "llm_failover"
 #: durable event log. Stripped once, at the single choke point both paths
 #: share — see ``_strip_internal_state_keys``. B-236 —— ``seed_skipped_dirs`` (agent
 #: directory names the conversation-start copy left out) only feeds the model's
-#: workspace block; it is not run output either.
+#: workspace block; it is not run output either. B-302 —— the run-clock bookkeeping
+#: (``run_active_s`` / ``run_clock_mark`` / ``run_clock_segment`` / ``deadline_warned``),
+#: the per-file ``edit_file`` ledgers (keyed by file path, holding edited text) and the
+#: outcome-repeat ledger are platform bookkeeping too (no reader takes them from a frame).
 _INTERNAL_STATE_KEYS: frozenset[str] = frozenset(
-    {"context_summary", "seed_skipped_dirs", "seed_quota_blocked", "seed_skipped_more"}
+    {
+        "context_summary",
+        "seed_skipped_dirs",
+        "seed_quota_blocked",
+        "seed_skipped_more",
+        "run_active_s",
+        "run_clock_mark",
+        "run_clock_segment",
+        "deadline_warned",
+        "edit_file_streaks",
+        "edit_file_history",
+        "outcome_repeats",
+    }
 )
 
 

@@ -165,6 +165,7 @@ from orchestrator.graph_builder.input_url_guard import (
     guard_message,
 )
 from orchestrator.graph_builder.memory import MemoryNode, PreCompactionFlush
+from orchestrator.graph_builder.outcome_repeat import outcome_repeat_update
 from orchestrator.graph_builder.outgoing_reference import note_outgoing_query
 from orchestrator.graph_builder.planner import (
     PlannerNode,
@@ -2236,6 +2237,11 @@ def build_react_graph(
         refused_reads = 0
         # B-302 PR 3 —— 本批真跑过的调用,按 tool_call 顺序,喂给每个文件的两本账。
         file_events: list[FileToolEvent] = []
+        # B-302 PR 4 —— 本批真派发过的调用与它的原始结果,喂给结果重复检测(影子模式)。平台
+        # 合成、没真派发的结果不算:审批续跑里扣下的、手抄 URL 守卫拦下的、平台拦下或平台环节
+        # 出错的(``blocked_by_policy``:前置中间件拦截,或派发前的平台环节抛错),以及 B-268
+        # 拒绝的重复读取(它已经计进打转次数)。
+        ran_calls: list[tuple[dict[str, Any], ToolMessage]] = []
         for idx in range(len(tool_calls)):
             tool_message, tool_state, refund_inc, classified = results[idx]
             message_pos = len(new_messages)
@@ -2271,6 +2277,12 @@ def build_react_graph(
                     batch_outcomes.append((_ledger_key(tool_calls[idx], tool_message, None), None))
                 continue
             file_events.append(_file_tool_event(tool_calls[idx], tool_message))
+            if not (
+                idx in guard_hits
+                or _is_refused_repeat(tool_message)
+                or (classified is not None and classified.error_class == "blocked_by_policy")
+            ):
+                ran_calls.append((tool_calls[idx], tool_message))
             failure = _classify_tool_failure(tool_calls[idx], tool_message, classified)
             ledger_failure = _ledger_failure(failure, classified)
             if not _is_read_only_failure(
@@ -2368,6 +2380,8 @@ def build_react_graph(
         )
         # B-302 PR 3 —— 每个文件的连续失败次数与本轮成功改动;没变就不写(state 形状不变)。
         result_dict.update(_edit_file_tracking_update(state, file_events))
+        # B-302 PR 4 —— 影子模式:只记指标与轨迹,只写自己的账,不改结果、路由与打转次数。
+        result_dict.update(outcome_repeat_update(state, ran_calls))
         # Stream J.8 — when this batch ran on an approve / modify resume,
         # clear the transient ``approval_resume`` channel so a follow-on
         # turn does not re-apply the stale verdict.

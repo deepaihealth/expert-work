@@ -403,6 +403,10 @@ class AgentState(TypedDict):
     #: B-302 PR 3 —— 每个文件本轮成功的 ``edit_file`` 改动 ``[{"old", "new"}]``(每处前 2,000
     #: 码点、每文件最近 20 处)。没对上时用来说明「这段已被你本轮的改动替换」。写法、清空同上。
     edit_file_history: NotRequired[dict[str, list[dict[str, str]]]]
+    #: B-302 PR 4 —— 结果重复检测(影子模式)的本轮账:``{结果指纹: {参数指纹: 次数}}``(指纹都含
+    #: 工具名,只存哈希)。只由 tools 节点整份写(``graph_builder.outcome_repeat``),默认覆盖
+    #: reducer;每轮开始清空(``control_plane.api.runs`` 的两个图输入函数)。
+    outcome_repeats: NotRequired[dict[str, dict[str, int]]]
     #: B-126 —— L2 滚动摘要写回检查点:``{"through_id": <消息 id>, "text": <整段摘要>}``。
     #: 下一次压缩时被覆盖的历史未变就直接复用,不再每步重写(spec §3.7)。默认覆盖 reducer。
     context_summary: NotRequired[dict[str, str] | None]
