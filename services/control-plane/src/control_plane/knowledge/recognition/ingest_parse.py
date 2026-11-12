@@ -225,10 +225,21 @@ async def orientation_page_cap(job: ParseJob, recognizer: DocumentRecognizer | N
     orientation: the ones recognition will read — the first ``max_pages`` of
     them (:meth:`DocumentRecognizer.recognize_document`). None while the switch
     is off, without a recognizer, or with no recognition model configured (the
-    pages wait; a later 补识别 parses the document again)."""
+    pages wait; a later 补识别 parses the document again). The settings cannot be
+    read: none either — logged and counted, the parse goes on as before B-301
+    (a passing settings blip must not fail a document that never needed them)."""
     if not page_orientation_enabled() or recognizer is None:
         return 0
-    plan = await recognizer.plan(tenant_id=job.tenant_id)
+    try:
+        plan = await recognizer.plan(tenant_id=job.tenant_id)
+    except Exception:
+        _page_orientation_failures.inc()
+        logger.warning(
+            "knowledge.page_orientation_cap_failed document=%s — pages read as they are",
+            job.document_id,
+            exc_info=True,
+        )
+        return 0
     return plan.max_pages if plan.engines else 0
 
 

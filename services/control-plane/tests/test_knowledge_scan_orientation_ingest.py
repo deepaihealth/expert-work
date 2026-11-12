@@ -517,6 +517,37 @@ async def test_only_pages_recognition_will_read_are_asked_their_orientation(
     assert counting.calls == 0
 
 
+class _SettingsDown(_Settings):
+    async def recognition_settings(self) -> RecognitionSettings:
+        raise ConnectionError("platform settings unreadable")
+
+
+async def test_unreadable_settings_leave_the_pages_unasked_and_the_parse_going(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # A passing settings blip at parse time must not fail the parse (a text-only PDF
+    # never read them before B-301): no orientation, logged once and counted.
+    failures = _counted(_FAILURES)
+    doc = await _document(_turned_pdf(90))
+    recognizer = _recognizer(doc.store, _UprightOnlyReader(), _SettingsDown())
+    with caplog.at_level("WARNING"):
+        local = await parse_locally(
+            doc.store,
+            tenant_id=doc.tenant,
+            kb_id=doc.kb,
+            document_id=doc.document,
+            filename="scan.pdf",
+            raw=doc.raw,
+            figures=None,
+            recognizer=recognizer,
+        )
+    assert local.analysis is not None
+    assert [page.orientation for page in local.analysis.pages] == [None]
+    assert _counted(_FAILURES) == failures + 1
+    logged = [r for r in caplog.records if "page_orientation_cap_failed" in r.getMessage()]
+    assert len(logged) == 1 and logged[0].exc_info is not None
+
+
 @pytest.mark.usefixtures("in_process_parse")
 async def test_a_new_orientation_model_is_estimated_at_what_it_pays(
     monkeypatch: pytest.MonkeyPatch,
