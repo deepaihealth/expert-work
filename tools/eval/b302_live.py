@@ -45,6 +45,10 @@ SETTLE_TIMEOUT_S = 180.0
 #: ``GET .../runs/{id}/usage`` 的 ``run_status`` 里还会变的那几个(``ExternalRunStatus``);
 #: 其余(success / error / timeout / interrupted / paused / incomplete)都是这次运行不会再花钱了。
 LIVE_RUN_STATUSES = frozenset({"pending", "queued", "running"})
+#: 这次运行不会再花钱的那几个。两边都不在(``None`` = 补账接口查不到、或没见过的值)= 不知道停没停。
+SETTLED_RUN_STATUSES = frozenset(
+    {"success", "error", "timeout", "interrupted", "paused", "incomplete"}
+)
 CONCURRENCY_PER_VENDOR = 2
 #: 一轮的 HTTP 读超时:时限 90 分钟 + 收尾余量。
 RUN_TIMEOUT_S = 7200.0
@@ -352,6 +356,13 @@ async def _settle(
                     "charged at the cap",
                 )
                 return usage, "cap_charged"
+        if status not in SETTLED_RUN_STATUSES and usage is None:
+            # 第四轮 LOW-1 —— 状态不明(补账接口非 200 / 未知值):不能当终态记 0,先试着停掉。
+            await _cancel(http, agent, run_id)
+            tracker.charge_cap(
+                model, f"run {run_id}: status unknown ({status}) and no usage; charged at the cap"
+            )
+            return None, "cap_charged"
     except Exception as exc:
         tracker.charge_cap(
             model, f"run {run_id} could not be settled ({exc!r}); charged at the cap"
@@ -371,9 +382,10 @@ async def _settle(
 
 
 def _never_started(exc: BaseException, run_id: str | None) -> bool:
-    """运行根本没创建:``POST /runs`` 被拒(429 / 409 / 422 等),或请求没发出去(连不上)。"""
+    """运行根本没创建:``POST /runs`` 回 4xx(429 / 409 / 422 等),或请求没发出去(连不上)。
+    5xx 不算(第四轮 LOW-2):网关 502 / 504 时上游可能已经建好并在跑这次运行。"""
     if isinstance(exc, httpx.HTTPStatusError):
-        return True
+        return 400 <= exc.response.status_code < 500
     return run_id is None and isinstance(exc, httpx.ConnectError | httpx.ConnectTimeout)
 
 

@@ -78,6 +78,7 @@ class _Platform:
         runs_status: int = 200,
         cancel_error: bool = False,
         usage_error: bool = False,
+        usage_http_status: int = 200,
     ) -> None:
         self.seen: list[str] = []
         self.runs = 0
@@ -98,6 +99,8 @@ class _Platform:
         #: 取消 / 补账接口本身连不上。
         self.cancel_error = cancel_error
         self.usage_error = usage_error
+        #: 补账接口回的 HTTP 状态码(非 200 = 查不到,``run_status`` 也就不知道)。
+        self.usage_http_status = usage_http_status
         self.artifacts = artifacts or []
         self.workspace = workspace or {}
         self.steps = steps or [_ai()]
@@ -147,6 +150,8 @@ class _Platform:
         if path.endswith("/usage"):
             if self.usage_error:
                 raise httpx.ConnectError("platform went away")
+            if self.usage_http_status != 200:
+                return httpx.Response(self.usage_http_status, json={"error": "unavailable"})
             return httpx.Response(200, json=self._usage_body(path.split("/")[-2]))
         if path.endswith("/artifacts/download"):
             body = self.download or _ooxml({"ppt/slides/slide1.xml": "<a:t>X</a:t>"})
@@ -644,3 +649,32 @@ async def test_an_end_frame_without_any_model_step_blocks(tmp_path: Path) -> Non
     await _run_session(platform, tmp_path, tracker)
     assert tracker.spent == 0.0
     assert tracker.blocked is not None and "no model step" in tracker.blocked
+
+
+# ---------------------------------------------- 第四轮 LOW-1 / LOW-2:状态不明就按上限计
+
+
+@pytest.mark.usefixtures("_fast_settle")
+async def test_an_unknown_run_status_with_no_steps_is_cancelled_and_charged_the_cap(
+    tmp_path: Path,
+) -> None:
+    # 没有 end 帧、一步都没看到、补账接口 500:不知道这次运行停没停 —— 不能当终态记 0。
+    platform = _Platform(end=False, usage_http_status=500)
+    platform.steps = []
+    tracker = live.SpendTracker(stop_line=100.0, prices=_PRICES, run_caps=_CAPS)
+    record = await _run_session(platform, tmp_path, tracker)
+    assert platform.cancels >= 1
+    assert tracker.spent == pytest.approx(23.36)
+    assert tracker.blocked is not None
+    assert record["turns"][0]["usage_source"] == "cap_charged"
+
+
+async def test_a_5xx_on_post_runs_is_charged_the_cap(tmp_path: Path) -> None:
+    # 网关 502 / 504 时上游可能已经建好并在跑这次运行,而我们拿不到 run id 去取消。
+    for status in (502, 504):
+        platform = _Platform(runs_status=status)
+        tracker = live.SpendTracker(stop_line=100.0, prices=_PRICES, run_caps=_CAPS)
+        with pytest.raises(httpx.HTTPStatusError):
+            await _run_session(platform, tmp_path, tracker)
+        assert tracker.spent == pytest.approx(23.36)
+        assert tracker.blocked is not None
