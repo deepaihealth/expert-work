@@ -474,6 +474,8 @@ CE-OCR 说对的读法会收敛、错的会发散,所以「读 3 次取一致」
 
 **在这次事故里**:逐字相同的输出出现在第 52~60 步附近,S2 最早在那时提醒。它是补充,不是修复。
 
+**影子模式的实现(PR 4)**:代码在 `graph_builder/outcome_repeat.py`,tools 节点每批调一次。记三处,只有工具名、次数、布尔:计数器 `expert_work_outcome_repeat_shadow_total{signal=same_args|changed_args, action=remind|trip, tool}`(每个被标的调用一次;S1 记 `trip`,S2 第 3、4 次 `remind`、第 5 次起 `trip`)、`expert_work_outcome_repeat_shadow_trips_total`(有 `trip` 的批次一次,对应「每步至多计一次打转」)、轨迹 span `expert_work.orchestrator.outcome_repeat_shadow` 与一行 INFO 日志。本轮账存检查点 `outcome_repeats`(只存截短的指纹),每轮开始清空。与上文的两处差别:易变字段另去掉**本次调用自己的 `tool_call_id`**(按整段去;超长结果的落盘引用里带着它,不去的话同样的大输出永远对不上);ISO-8601 只去「日期 + 时刻」,单独的日期不去(防误认)。离线回放脚本不在 PR 4 里(取测试环境 30 天轨迹的数据源未核,§10 第 10 条),规则是纯函数 `next_outcomes`,回放可直接复用。
+
 **测试**:S1 交替 A、B、A、B、A → 第 3 次 A 计一次打转(旧代码不计 → 红);S2 同结果三种参数 → 第 3 次有提醒(红);结果只差一个时间戳 / UUID → 判相同(红);结果差一个汉字 → 判不同(守卫,咬「去易变字段时误删正文」);影子模式下模型可见文字零变化(守卫,咬「影子模式漏出提醒」)。
 
 ### 4.5 考虑过、不做:调低 GLM 的思考档位
