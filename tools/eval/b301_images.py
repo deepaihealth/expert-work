@@ -64,6 +64,9 @@ class SetImage:
     question: str
     data: bytes = field(repr=False)
     media_type: str = "image/jpeg"
+    #: 关键字段的种类(sentence / name / date / number / code);无文字图是空串。判分时只有
+    #: ``number`` 的数统一写法(``36.80`` = ``36.8``),编号、日期按原样比。
+    kind: str = ""
 
     @property
     def upright(self) -> bool:
@@ -128,6 +131,7 @@ def build_set() -> tuple[SetImage, ...]:
                     key=spec.key,
                     question=spec.question,
                     data=encode(stored(upright, rotation)),
+                    kind=spec.kind,
                 )
             )
     for index in range(NO_TEXT_COUNT):

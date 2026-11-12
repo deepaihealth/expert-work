@@ -25,15 +25,17 @@
    不进 argv)取,变量名见 ``b301_health_run.KEY_VARIABLES``:豆包 ``ARK_API_KEY``;通义的
    ``HELIX_EVAL_LLM_API_KEY`` 在 ``~/.helix-eval.env``(``--with-qwen`` 时再加一个 ``--env-file``)。
    缺哪个就只报变量名、不开跑。
-4. ``run`` 每次调用之前判止损线,并按单次上限预留、写进花费账本 ``OUT.spend.jsonl``(落盘后才发),
-   调用后结算;过线、用量不可信的回答、单次输入超上限、厂商返回超时以外的任何错误,都立刻停下
-   (不再发新调用),已在飞的最多「每家 2 个 ``ask_image`` x 每个最多 3 个并行调用」。结果文件只放
-   跑完的条目;同一条命令再跑接着跑,止损线从**账本合计**起算(作废的、出错的、崩溃时在飞的调用都
-   算,没结算的按上限)。同一个结果文件同一时间只许一个 run(``OUT.lock``)。
+4. ``run`` 每次调用之前判止损线,并按单次上限预留、写进这个计划的花费账本(落盘后才发),调用后
+   结算;过线、用量不可信的回答、单次输入超上限、厂商返回超时以外的任何错误、账本写不进去,都立刻
+   停下(不再发新调用),已在飞的最多「每家 2 个 ``ask_image`` x 每个最多 3 个并行调用」。账本和锁
+   **按计划**放在 ``~/.cache/b301-health/<plan_id>.spend.jsonl`` / ``.lock``(``--state-dir`` 可改,
+   测试用),与 ``--results`` 无关:换结果路径续跑,止损线照样从这个计划已花的钱起算;同一个计划
+   同一时间只许一个 run。结果文件只放跑完的条目,同一条命令再跑接着跑。**账本不能删**(删了就是把
+   已花的钱清零);读不出来的行每行按单次上限算。
 5. ``report``(:mod:`b301_report`):按 §9.2 出各线和每个模型的结论。**通过 = 数据齐 + L1'(正放
    33 + 无文字 4 张 0 张被转、「判不出」≤ 3)+ L6(超时 + 答非所问 ≤ 5%)**;厂商出错而停的次数从
-   账本单独报;L1 / L2 照常报数(L2 严格 / 宽松并列,按类结论用严格),不挡发布,任何一类「变差」
-   标出来交用户定。
+   账本单独报;L1 / L2 照常报数(L2 严格 / 宽松并列,按类结论用严格,两者不一致的回答逐条列出供
+   人工看),不挡发布,任何一类「变差」标出来交用户定。
 """
 
 from __future__ import annotations
@@ -377,6 +379,23 @@ def _add_selection(parser: argparse.ArgumentParser) -> None:
     )
 
 
+def _report(results: Path, state_dir: Path | None) -> int:
+    """离线报告:结果文件 + 这个计划的花费账本(按结果里的 ``plan_id`` 找)。"""
+    import b301_report
+    import b301_spend
+
+    records = read_records(results)
+    plan_ids = sorted({str(r["plan_id"]) for r in records if "plan_id" in r})
+    caps = [per_call_cap_yuan(price_of(model, accept_documented=True)) for model in PROVIDERS]
+    ledger: list[dict[str, Any]] = []
+    for plan in plan_ids:
+        path = b301_spend.ledger_path(state_dir or b301_spend.DEFAULT_STATE_DIR, plan)
+        ledger.extend(b301_spend.read_ledger(path, broken_line_cost=max(caps)))
+    result = b301_report.report(records, ledger_rows=ledger)
+    sys.stdout.write(b301_report.render_report(result) + "\n")
+    return 0
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
@@ -395,16 +414,17 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     report_parser = sub.add_parser("report", help="offline report")
     report_parser.add_argument("--results", type=Path, required=True)
+    for each in (run_parser, report_parser):
+        each.add_argument(
+            "--state-dir",
+            type=Path,
+            default=None,
+            help="where the per-plan spend ledger and lock live; default ~/.cache/b301-health",
+        )
     args = parser.parse_args(argv)
 
     if args.command == "report":
-        import b301_report
-        import b301_spend
-
-        ledger = b301_spend.read_ledger(b301_spend.ledger_path(args.results))
-        result = b301_report.report(read_records(args.results), ledger_rows=ledger)
-        sys.stdout.write(b301_report.render_report(result) + "\n")
-        return 0
+        return _report(args.results, args.state_dir)
     models, probe = _selection(args)
     try:
         q = quote(
@@ -429,10 +449,18 @@ def main(argv: Sequence[str] | None = None) -> int:
     import b301_health_run as runner
 
     env_files = args.env_file or [runner.DEFAULT_ENV_FILE]
+    import b301_spend
+
+    state_dir = args.state_dir or b301_spend.DEFAULT_STATE_DIR
     try:
         summary = asyncio.run(
             runner.run_from_quote(
-                q, models=models, probe_models=probe, results=args.results, env_files=env_files
+                q,
+                models=models,
+                probe_models=probe,
+                results=args.results,
+                env_files=env_files,
+                state_dir=state_dir,
             )
         )
     except runner.RunRefusedError as exc:

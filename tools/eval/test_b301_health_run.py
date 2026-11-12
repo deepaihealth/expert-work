@@ -131,6 +131,10 @@ def _items(model: str = MODEL) -> list[health.Item]:
     return [*on, *control]
 
 
+def _state(tmp_path: Path) -> Path:
+    return tmp_path / "state"
+
+
 async def _run(
     tmp_path: Path,
     items: Sequence[health.Item],
@@ -138,7 +142,7 @@ async def _run(
     *,
     stop_line: float = 100.0,
 ) -> runner.RunSummary:
-    ledger = spend.SpendLedger(spend.ledger_path(tmp_path / "results.jsonl"), "p1")
+    ledger = spend.SpendLedger(spend.ledger_path(_state(tmp_path), "p1"), "p1")
     return await runner.run_items(
         items,
         image_set=IMAGES,
@@ -150,12 +154,17 @@ async def _run(
     )
 
 
-def _records(tmp_path: Path) -> list[dict[str, Any]]:
-    return health.read_records(tmp_path / "results.jsonl")
+def _records(tmp_path: Path, results: str = "results.jsonl") -> list[dict[str, Any]]:
+    return health.read_records(tmp_path / results)
 
 
-def _ledger(tmp_path: Path) -> list[dict[str, Any]]:
-    return spend.read_ledger(spend.ledger_path(tmp_path / "results.jsonl"))
+def _ledger(tmp_path: Path, plan_id: str = "p1") -> list[dict[str, Any]]:
+    path = spend.ledger_path(_state(tmp_path), plan_id)
+    return spend.read_ledger(path, broken_line_cost=health.per_call_cap_yuan(PRICES[MODEL]))
+
+
+def _numeric(image: images_mod.SetImage) -> bool:
+    return image.kind in report_mod.NUMERIC_KINDS
 
 
 @pytest.mark.parametrize("quick", [False, True], ids=["vl-route", "quick-route"])
@@ -168,13 +177,14 @@ async def test_the_real_tool_turns_each_image_and_reads_it_while_the_control_rea
     assert summary.stopped_reason is None and summary.done == 17 + 12
     records = {(r["mode"], r["image_id"]): r for r in _records(tmp_path)}
     for image in (i for i in IMAGES if i.base_id in SUBSET):
+        key, numeric = image.key or "", _numeric(image)
         on = records[("on", image.image_id)]
         assert on["orientation"]["degrees"] == image.rotation, image.image_id
-        assert report_mod.field_matches_strict(image.key or "", on["answer"]), on["answer"]
+        assert report_mod.field_matches_strict(key, on["answer"], numeric=numeric), on["answer"]
         if image.rotation:
             assert ROTATED_NOTE.format(degrees=image.rotation) in on["content"]
             control = records[("control", image.image_id)]["answer"]
-            assert not report_mod.field_matches(image.key or "", control)
+            assert not report_mod.field_matches(key, control, numeric=numeric)
             turns = [c["turn"] for c in on["calls"] if c["kind"] == "orientation"]
             assert turns[0] == 0  # 第 1 步问 0 度候选,第 2 步三个角度
             assert sorted(turns[1:]) == [90, 180, 270]
@@ -223,19 +233,26 @@ async def test_a_stop_inside_the_step_2_gather_discards_the_item_cleanly(tmp_pat
     assert spend.ledger_total(_ledger(tmp_path)) == pytest.approx(PER_CALL)
 
 
-def _quote() -> dict[str, Any]:
-    return health.quote(models=(MODEL,), probe_models=(), stop_line=10.0, accept_documented=False)
+QUOTE = health.quote(models=(MODEL,), probe_models=(), stop_line=10.0, accept_documented=False)
+PLAN = str(QUOTE["plan_id"])
 
 
-async def _run_from_quote(tmp_path: Path, factory: _Factory) -> runner.RunSummary:
+async def _run_from_quote(
+    tmp_path: Path,
+    factory: _Factory,
+    *,
+    results: str = "results.jsonl",
+    items: Sequence[health.Item] | None = None,
+) -> runner.RunSummary:
     return await runner.run_from_quote(
-        _quote(),
+        QUOTE,
         models=(MODEL,),
         probe_models=(),
-        results=tmp_path / "results.jsonl",
+        results=tmp_path / results,
         env_files=[],
+        state_dir=_state(tmp_path),
         factory=factory,
-        items=_items(),
+        items=_items() if items is None else items,
     )
 
 
@@ -247,7 +264,7 @@ async def test_after_an_error_the_resumed_run_starts_from_everything_charged(
     first = await _run_from_quote(tmp_path, _Factory(fail_on=12))
 
     assert first.stopped_reason is not None and "unknown status" in first.stopped_reason
-    charged = spend.ledger_total(_ledger(tmp_path))
+    charged = spend.ledger_total(_ledger(tmp_path, PLAN))
     assert first.spent_yuan == pytest.approx(charged)
     in_records = sum(float(r["cost_yuan"]) for r in _records(tmp_path))
     assert charged > in_records  # 出错那次的上限 + 作废条目的钱不在结果文件里
@@ -258,10 +275,68 @@ async def test_after_an_error_the_resumed_run_starts_from_everything_charged(
     assert second.stopped_reason is None
     keys = sorted(f"{r['model']}|{r['mode']}|{r['image_id']}" for r in _records(tmp_path))
     assert keys == sorted(item.key for item in _items())
-    assert (
-        report_mod.report(_records(tmp_path), IMAGES, _ledger(tmp_path))["health"][0]["error_stops"]
-        == 1
-    )
+    result = report_mod.report(_records(tmp_path), IMAGES, _ledger(tmp_path, PLAN))
+    assert result["health"][0]["error_stops"] == 1
+
+
+async def test_a_different_results_path_still_resumes_from_the_plan_budget(
+    tmp_path: Path,
+) -> None:
+    """同一个计划换了结果路径(手误、新目录):止损线照样从这个计划已花的钱起算,不从 ¥0。"""
+    first = await _run_from_quote(tmp_path, _Factory(fail_on=12), results="a/run.jsonl")
+    charged = spend.ledger_total(_ledger(tmp_path, PLAN))
+    assert first.stopped_reason is not None and charged > 0
+
+    second = await _run_from_quote(tmp_path, _Factory(), results="b/sub/run.jsonl")
+
+    assert second.spent_at_start_yuan == pytest.approx(charged)
+    assert second.skipped == 0  # 新的结果文件里还没有条目,全部重跑
+    assert second.spent_yuan > charged
+
+
+async def test_a_concurrent_run_of_the_same_plan_is_refused_on_any_results_path(
+    tmp_path: Path,
+) -> None:
+    _state(tmp_path).mkdir()
+    with spend.lock_path(_state(tmp_path), PLAN).open("a") as held:
+        fcntl.flock(held.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        factory = _Factory()
+        for results in ("results.jsonl", "elsewhere/other.jsonl"):
+            with pytest.raises(runner.RunRefusedError, match="another run"):
+                await _run_from_quote(tmp_path, factory, results=results)
+    assert factory.calls == 0 and not (tmp_path / "results.jsonl").exists()
+
+
+async def test_a_failed_ledger_write_discards_the_item_and_the_resume_redoes_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """账本写不进去(第 3 次写:第 2 次调用的预留):停、这一条不留记录(否则会被当成跑完、续跑
+    跳过),第 2 次调用没发;续跑重做这一条。"""
+    real_append = spend.SpendLedger.append
+    writes = {"n": 0}
+
+    def flaky(self: spend.SpendLedger, row: Any) -> None:
+        writes["n"] += 1
+        if writes["n"] == 3:
+            raise OSError(28, "No space left on device")
+        real_append(self, row)
+
+    item = [health.Item(MODEL, "on", "ui-2@90")]
+    monkeypatch.setattr(spend.SpendLedger, "append", flaky)
+    factory = _Factory()
+    first = await _run_from_quote(tmp_path, factory, items=item)
+
+    assert first.stopped_reason is not None and "ledger" in first.stopped_reason
+    assert _records(tmp_path) == [] and factory.calls == 1
+    assert spend.ledger_total(_ledger(tmp_path, PLAN)) == pytest.approx(PER_CALL)
+
+    monkeypatch.setattr(spend.SpendLedger, "append", real_append)
+    second = await _run_from_quote(tmp_path, _Factory(), items=item)
+
+    assert second.spent_at_start_yuan == pytest.approx(PER_CALL)
+    rows = _records(tmp_path)
+    assert [r["image_id"] for r in rows] == ["ui-2@90"]
+    assert rows[0]["orientation"]["degrees"] == 90
 
 
 async def test_results_or_ledger_of_another_plan_are_refused(tmp_path: Path) -> None:
@@ -272,21 +347,11 @@ async def test_results_or_ledger_of_another_plan_are_refused(tmp_path: Path) -> 
         await _run_from_quote(tmp_path, _Factory())
 
     results.unlink()
-    spend.SpendLedger(spend.ledger_path(results), "other").append(
+    spend.SpendLedger(spend.ledger_path(_state(tmp_path), PLAN), "other").append(
         {"call_id": "a", "model": MODEL, "cost_yuan": 0.1, "reason": "ok"}
     )
     with pytest.raises(runner.RunRefusedError, match="another plan"):
         await _run_from_quote(tmp_path, _Factory())
-
-
-async def test_a_concurrent_run_on_the_same_results_file_is_refused(tmp_path: Path) -> None:
-    results = tmp_path / "results.jsonl"
-    with spend.lock_path(results).open("a") as held:
-        fcntl.flock(held.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-        factory = _Factory()
-        with pytest.raises(runner.RunRefusedError, match="another run"):
-            await _run_from_quote(tmp_path, factory)
-    assert factory.calls == 0 and not results.exists()
 
 
 async def test_a_vendor_error_in_the_probe_stops_the_run_without_crashing(tmp_path: Path) -> None:

@@ -132,22 +132,26 @@ async def test_a_timeout_is_charged_the_cap_but_does_not_stop() -> None:
     assert guard.spent == pytest.approx(CAP)
 
 
+def _read(path: Path) -> list[dict[str, Any]]:
+    return spend.read_ledger(path, broken_line_cost=CAP)
+
+
 async def test_every_call_is_reserved_on_disk_before_it_is_sent_then_settled(
     tmp_path: Path,
 ) -> None:
-    ledger = tmp_path / "r.spend.jsonl"
+    ledger = tmp_path / "p1.spend.jsonl"
     guard = _guard(ledger=ledger)
     seen_before_send: list[list[dict[str, Any]]] = []
 
     async def inner(*, messages: Sequence[BaseMessage], tools: Sequence[Any]) -> AIMessage:
-        seen_before_send.append(spend.read_ledger(ledger))
+        seen_before_send.append(_read(ledger))
         return AIMessage(content="yes", usage_metadata=_usage(2000, 10))
 
     await runner.MeteredCaller(inner, MODEL, guard)(messages=_msgs(), tools=[])
 
     assert [row["reason"] for row in seen_before_send[0]] == ["reserve"]
     assert seen_before_send[0][0]["cost_yuan"] == pytest.approx(CAP)
-    rows = spend.read_ledger(ledger)
+    rows = _read(ledger)
     assert [row["reason"] for row in rows] == ["reserve", "ok"]
     assert rows[0]["call_id"] == rows[1]["call_id"] and rows[1]["plan_id"] == "p1"
     assert spend.ledger_total(rows) == pytest.approx((2000 * 6 + 10 * 30) / 1e6)
@@ -155,13 +159,51 @@ async def test_every_call_is_reserved_on_disk_before_it_is_sent_then_settled(
 
 def test_a_reserve_that_was_never_settled_counts_at_the_cap(tmp_path: Path) -> None:
     """进程崩了 / Ctrl-C:只有预留行,没有结算行 —— 按单次上限算进账本合计。"""
-    ledger = tmp_path / "r.spend.jsonl"
+    ledger = tmp_path / "p1.spend.jsonl"
     book = spend.SpendLedger(ledger, "p1")
     book.append({"call_id": "a", "model": MODEL, "cost_yuan": CAP, "reason": "reserve"})
     book.append({"call_id": "a", "model": MODEL, "cost_yuan": 0.01, "reason": "ok"})
     book.append({"call_id": "b", "model": MODEL, "cost_yuan": CAP, "reason": "reserve"})
 
-    assert spend.ledger_total(spend.read_ledger(ledger)) == pytest.approx(0.01 + CAP)
+    assert spend.ledger_total(_read(ledger)) == pytest.approx(0.01 + CAP)
+
+
+def test_a_truncated_last_line_counts_at_the_cap_with_a_notice(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """写到一半被打断:最后一行读不出来 —— 按单次上限算、提示,不建议删账本;之后再追加的行
+    不会接在半行后面。"""
+    ledger = tmp_path / "p1.spend.jsonl"
+    book = spend.SpendLedger(ledger, "p1")
+    book.append({"call_id": "a", "model": MODEL, "cost_yuan": 0.01, "reason": "ok"})
+    with ledger.open("a", encoding="utf-8") as fh:
+        fh.write('{"plan_id": "p1", "call_id": "b", "cost_yu')
+
+    assert spend.ledger_total(_read(ledger)) == pytest.approx(0.01 + CAP)
+    notice = capsys.readouterr().err
+    assert "line 2" in notice and "Keep the ledger" in notice and "delete" not in notice.lower()
+
+    book.append({"call_id": "c", "model": MODEL, "cost_yuan": 0.02, "reason": "ok"})
+    rows = _read(ledger)
+    assert [row["call_id"] for row in rows] == ["a", "unreadable-line-2", "c"]
+    assert spend.ledger_total(rows) == pytest.approx(0.01 + CAP + 0.02)
+
+
+async def test_a_failed_reserve_write_stops_sends_nothing_and_reserves_nothing(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    guard = _guard(ledger=tmp_path / "p1.spend.jsonl")
+    inner = _Inner(AIMessage(content="yes", usage_metadata=_usage()))
+
+    def disk_full(self: spend.SpendLedger, row: Any) -> None:
+        raise OSError(28, "No space left on device")
+
+    monkeypatch.setattr(spend.SpendLedger, "append", disk_full)
+    with pytest.raises(spend.SpendStopError, match="ledger could not be written"):
+        await runner.MeteredCaller(inner, MODEL, guard)(messages=_msgs(), tools=[])
+
+    assert inner.calls == 0
+    assert guard.spent == 0.0 and guard.blocked is not None
 
 
 def test_error_stops_are_counted_per_model_from_the_ledger() -> None:
@@ -172,14 +214,17 @@ def test_error_stops_are_counted_per_model_from_the_ledger() -> None:
     assert spend.error_stops(rows) == {MODEL: 1}
 
 
-def test_a_second_run_on_the_same_results_file_is_refused(tmp_path: Path) -> None:
-    results = tmp_path / "r.jsonl"
-    with spend.lock_path(results).open("a") as held:
+def test_the_lock_and_ledger_are_per_plan_not_per_results_path(tmp_path: Path) -> None:
+    assert spend.ledger_path(tmp_path, "p1") == tmp_path / "p1.spend.jsonl"
+    with spend.lock_path(tmp_path, "p1").open("a") as held:
         fcntl.flock(held.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-        with pytest.raises(spend.LockedError, match="another run"), spend.exclusive(results):
+        with pytest.raises(spend.LockedError, match="another run"), spend.exclusive(tmp_path, "p1"):
             pass
-    with spend.exclusive(results):  # 放开之后拿得到
+        with spend.exclusive(tmp_path, "p2"):  # 别的计划不受影响
+            pass
+    with spend.exclusive(tmp_path, "p1"):  # 放开之后拿得到
         pass
+    assert spend.DEFAULT_STATE_DIR == Path.home() / ".cache" / "b301-health"
 
 
 def test_missing_credentials_name_the_variable_and_never_the_value(

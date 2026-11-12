@@ -57,6 +57,7 @@ def _record(
     if answer is None:
         answer = (image.key or "") if mode == "on" else WRONG
     return {
+        "plan_id": "p1",
         "model": MODEL,
         "mode": mode,
         "image_id": image.image_id,
@@ -159,6 +160,24 @@ def test_hedged_answers_count_only_as_lenient_and_classes_use_strict() -> None:
     assert "display: 3(3)/3, 0(9)/9" in lines
 
 
+def test_answers_where_strict_and_lenient_disagree_are_listed_for_review() -> None:
+    """「87.5(第4周)」读对了但带了别的数:严格算错 —— 报告逐条列出来给人看。"""
+    rows = _perfect()
+    for row in rows:
+        if row["image_id"] == "ch-2@90" and row["mode"] == "on":
+            row["answer"] = "87.5(第4周)"
+    result = report_mod.model_report(MODEL, rows, IMAGES)
+
+    chart = result["L2"]["chart"]
+    assert chart["on"] == 8 and chart["lenient"]["on"] == 9
+    assert chart["disagreements"] == [
+        {"image_id": "ch-2@90", "mode": "on", "key": "87.5", "answer": "87.5(第4周)"}
+    ]
+    assert result["L2"]["ui"]["disagreements"] == []
+    lines = report_mod.render_report(report_mod.report(rows, IMAGES))
+    assert "严格≠宽松 ch-2@90 (on) 关键字段 '87.5':'87.5(第4周)'" in lines
+
+
 def test_orientation_is_derived_from_the_calls_when_the_tool_failed() -> None:
     calls = [
         {"kind": "orientation", "turn": 0, "outcome": "ok", "answer": "no"},
@@ -174,34 +193,78 @@ def test_orientation_is_derived_from_the_calls_when_the_tool_failed() -> None:
 
 
 @pytest.mark.parametrize(
-    ("key", "answer", "lenient", "strict"),
+    ("key", "answer", "numeric", "lenient", "strict"),
     [
-        ("69.1", "69.1", True, True),
-        ("69.1", "读数是 69.1 kg。", True, True),
-        ("69.1", "69.1kg", True, True),
-        ("69.1", "可能是 69.1,也可能是 1.69", True, False),
-        ("69.1", "might be 69.1 or 61.9", True, False),
-        ("69.1", "169.1", False, False),
-        ("69.1", "69.15", False, False),
-        ("36.80", "36.8", True, True),
-        ("08:47", "8:47", True, True),
-        ("KX-450B", "KX-450BX", False, False),
-        ("KX-450B", "KX-450B or KX-460B", True, False),
-        ("2026-03-17", "2026-03-17", True, True),
-        ("2026-03-17", "2026年3月17日", False, False),
-        ("Harbor_Guest_5G", "**Harbor_Guest_5G**", True, True),
+        ("69.1", "69.1", True, True, True),
+        ("69.1", "读数是 69.1 kg。", True, True, True),
+        ("69.1", "69.1kg", True, True, True),
+        ("69.1", "可能是 69.1,也可能是 1.69", True, True, False),
+        ("69.1", "might be 69.1 or 61.9", True, True, False),
+        ("69.1", "169.1", True, False, False),
+        ("69.1", "69.15", True, False, False),
+        ("87.5", "87.5(第4周)", True, True, False),
+        ("36.80", "36.8", True, True, True),
+        ("08:47", "8:47", True, True, True),
+        # 编号、日期不做数的统一写法:前导 0 是编号的一部分。
+        ("7731-0428", "7731-428", False, False, False),
+        ("HT-2026-0915-07", "HT-2026-915-7", False, False, False),
+        ("2026-03-17", "2026-3-17", False, False, False),
+        ("KX-450B", "KX-450BX", False, False, False),
+        ("KX-450B", "KX-450B or KX-460B", False, True, False),
+        ("2026-03-17", "2026-03-17", False, True, True),
+        ("2026-03-17", "2026年3月17日", False, False, False),
+        ("Harbor_Guest_5G", "**Harbor_Guest_5G**", False, True, True),
         # 全角括号 / 逗号 / 弯引号写成转义(ruff 的模糊字符规则会把它们「修」成半角)。
-        ("青禾便利店(南湖店)", "青禾便利店\uff08南湖店\uff09", True, True),
-        ("每日两次,每次一片", "每日两次\uff0c每次一片。", True, True),
-        ("Riverside Terminal", "\u201cRiverside Terminal\u201d", True, True),
-        ("4:30 pm", "4:30 PM", True, True),
-        ("Room 204", "Room 2048", False, False),
-        ("128.46", "合计 128.46 元", True, True),
+        ("青禾便利店(南湖店)", "青禾便利店\uff08南湖店\uff09", False, True, True),
+        ("每日两次,每次一片", "每日两次\uff0c每次一片。", False, True, True),
+        ("Riverside Terminal", "\u201cRiverside Terminal\u201d", False, True, True),
+        ("Riverside Terminal", "The sign says Riverside Terminal", False, True, True),
+        (
+            "Riverside Terminal",
+            "maybe Riverside Terminal or Riverside Terminus",
+            False,
+            True,
+            False,
+        ),
+        ("林记老茶铺", "林记老茶铺,也可能是林家老茶铺", False, True, False),
+        ("4:30 pm", "4:30 PM", True, True, True),
+        ("Room 204", "Room 2048", False, False, False),
+        ("128.46", "合计 128.46 元", True, True, True),
     ],
 )
-def test_field_matching(key: str, answer: str, lenient: bool, strict: bool) -> None:
-    assert report_mod.field_matches(key, answer) is lenient
-    assert report_mod.field_matches_strict(key, answer) is strict
+def test_field_matching(key: str, answer: str, numeric: bool, lenient: bool, strict: bool) -> None:
+    assert report_mod.field_matches(key, answer, numeric=numeric) is lenient
+    assert report_mod.field_matches_strict(key, answer, numeric=numeric) is strict
+
+
+def test_only_number_keys_get_the_number_normal_form() -> None:
+    kinds = {spec.key: spec.kind for spec in images_mod.base_specs()}
+    assert kinds["7731-0428"] == "code" and kinds["HT-2026-0915-07"] == "code"
+    assert kinds["2026-03-17"] == "date" and kinds["08:47"] == "number"
+    assert all(image.kind == kinds[image.key] for image in IMAGES if image.key is not None)
+
+
+TEXT_KEYS = [spec.key for spec in images_mod.base_specs() if not any(c.isdigit() for c in spec.key)]
+
+
+@pytest.mark.parametrize("key", TEXT_KEYS)
+def test_strict_rejects_alternatives_and_long_answers_for_keys_without_digits(key: str) -> None:
+    for hedged in (
+        f"maybe {key} or Riverside Terminus",
+        f"{key}, possibly something else",
+        f"{key},也可能是别的",
+        f"可能是{key},也可能不是",
+        f"{key} 或 别的",
+        f"{key} — and here is a long explanation of what else is written on the image",
+    ):
+        assert report_mod.field_matches(key, hedged), hedged
+        assert not report_mod.field_matches_strict(key, hedged), hedged
+    for plain in (key, f"答案:{key}", f"It reads {key}."):
+        assert report_mod.field_matches_strict(key, plain), plain
+
+
+def test_twelve_of_the_keys_have_no_digits() -> None:
+    assert len(TEXT_KEYS) == 12
 
 
 def test_notes_added_by_the_tool_are_not_part_of_the_answer() -> None:
@@ -231,17 +294,19 @@ def test_probe_report_counts_yes_no_none() -> None:
     assert p["unanswered"] == 0
 
 
-def test_report_cli_reads_the_ledger_for_spend_and_error_stops(
+def test_report_cli_reads_the_plan_ledger_for_spend_and_error_stops(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    results = tmp_path / "r.jsonl"
+    results = tmp_path / "anywhere" / "r.jsonl"
+    results.parent.mkdir()
     lines = "".join(json.dumps(r, ensure_ascii=False) + "\n" for r in _perfect())
     results.write_text(lines, encoding="utf-8")
-    book = spend.SpendLedger(spend.ledger_path(results), "p1")
+    state = tmp_path / "state"
+    book = spend.SpendLedger(spend.ledger_path(state, "p1"), "p1")
     book.append({"call_id": "a", "model": MODEL, "cost_yuan": 1.5, "reason": "ok"})
     book.append({"call_id": "b", "model": MODEL, "cost_yuan": 0.168, "reason": "cap_error"})
 
-    assert health.main(["report", "--results", str(results)]) == 0
+    assert health.main(["report", "--results", str(results), "--state-dir", str(state)]) == 0
     out = capsys.readouterr().out
     assert f"{MODEL}:通过" in out
     assert "厂商出错而停(账本):1 次" in out

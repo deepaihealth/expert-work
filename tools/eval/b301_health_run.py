@@ -3,11 +3,12 @@
 入口是 ``b301_health.py run``(先核 ``quote_id``)。这里:
 
 * 止损与账本在 :mod:`b301_spend`:每次调用**之前**判止损线、按单次上限预留并落账(fsync),调用后
-  结算;没有单价的模型、用量不可信的回答、单次输入超上限、厂商返回超时以外的错误 → 停,不再发调用
-  (:class:`~b301_spend.SpendStopError` 不是 ``Exception``,工具里「问方向出错就按没问成」的兜底
-  接不住它,这一条作废、续跑时重做;钱已经在账上)。超时 / 被取消的调用按单次上限结算。
-* 续跑时止损线从**账本合计**起算(作废的、出错的、崩溃时在飞的调用都算);同一个结果文件同一时间
-  只许一个 run(``flock``)。
+  结算;没有单价的模型、用量不可信的回答、单次输入超上限、厂商返回超时以外的错误、账本写不进去
+  → 停,不再发调用(:class:`~b301_spend.SpendStopError` 不是 ``Exception``,工具里「问方向出错就按
+  没问成」的兜底接不住它,这一条作废、续跑时重做;钱已经在账上)。超时 / 被取消的调用按单次上限结算。
+* 账本与锁按计划放在状态目录里(默认 ``~/.cache/b301-health/<plan_id>.*``),与 ``--results`` 无关:
+  续跑(哪怕换了结果路径)止损线都从这个计划的**账本合计**起算(作废的、出错的、崩溃时在飞的
+  调用都算);同一个计划同一时间只许一个 run(``flock``)。
 * :class:`MeteredCaller` —— 包在看图路由外面:预留 / 结算、计时、把每次调用记进当前这一条的调用表。
 * 工具按生产的装法建(:func:`real_callers_factory` 用 ``build_llm_router``,快看关思考、深入看补
   默认档位、不配备用链、不挂重试中间件,所以一次逻辑调用就是一次厂商请求),直接构造
@@ -518,7 +519,7 @@ def _prices(q: Mapping[str, Any]) -> dict[str, health.Price]:
 
 
 def _same_plan(rows: Sequence[Mapping[str, Any]], plan_id: str, path: Path) -> None:
-    other = {str(r.get("plan_id")) for r in rows} - {plan_id}
+    other = {str(r.get("plan_id")) for r in rows if not r.get("unreadable")} - {plan_id}
     if other:
         raise RunRefusedError(f"{path} holds rows of another plan {sorted(other)}")
 
@@ -530,19 +531,24 @@ async def run_from_quote(
     probe_models: Sequence[str],
     results: Path,
     env_files: Sequence[Path],
+    state_dir: Path = spend.DEFAULT_STATE_DIR,
     factory: CallerFactory | None = None,
     image_set: Sequence[images_mod.SetImage] | None = None,
     items: Sequence[health.Item] | None = None,
 ) -> RunSummary:
-    """``run`` 子命令:独占结果文件、核计划、取凭据、止损线从账本合计起算,然后跑。
-    ``items`` 只给测试用(默认按计划跑全部)。"""
+    """``run`` 子命令:独占这个计划、核计划、取凭据、止损线从这个计划的账本合计起算,然后跑。
+    账本与锁在 ``state_dir`` 里按计划放,与 ``results`` 在哪无关。``items`` 只给测试用(默认按
+    计划跑全部)。"""
     image_set = images_mod.build_set() if image_set is None else image_set
     plan_id = str(q["plan_id"])
+    prices = _prices(q)
+    broken_line_cost = max(health.per_call_cap_yuan(p) for p in prices.values())
     try:
-        with spend.exclusive(results):
+        with spend.exclusive(state_dir, plan_id):
+            results.parent.mkdir(parents=True, exist_ok=True)
             existing = health.read_records(results)
-            ledger_file = spend.ledger_path(results)
-            ledger_rows = spend.read_ledger(ledger_file)
+            ledger_file = spend.ledger_path(state_dir, plan_id)
+            ledger_rows = spend.read_ledger(ledger_file, broken_line_cost=broken_line_cost)
             _same_plan(existing, plan_id, results)
             _same_plan(ledger_rows, plan_id, ledger_file)
             providers = sorted({health.PROVIDERS[m] for m in [*models, *probe_models]})
@@ -550,7 +556,7 @@ async def run_from_quote(
                 factory = real_callers_factory(load_keys(providers, env_files))
             guard = SpendGuard(
                 stop_line=float(q["stop_line_yuan"]),
-                prices=_prices(q),
+                prices=prices,
                 ledger=SpendLedger(ledger_file, plan_id),
                 settled=spend.ledger_total(ledger_rows),
             )

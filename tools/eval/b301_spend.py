@@ -1,13 +1,19 @@
-"""B-301 PR 2 体检的花费:止损线、逐次调用的花费账本、结果文件的独占锁。
+"""B-301 PR 2 体检的花费:止损线、逐次调用的花费账本、按计划的独占锁。
 
-账本 ``<结果>.spend.jsonl`` 与结果文件并排,每次调用两行:
+账本与锁**按计划**放在一个固定的地方,和 ``--results`` 写到哪无关:
+``<状态目录>/<plan_id>.spend.jsonl`` 与 ``<plan_id>.lock``,状态目录默认
+``~/.cache/b301-health``(只有显式的 ``--state-dir`` 能改,测试用)。换一个结果路径续跑,止损线
+照样从这个计划已经花掉的钱起算;两个终端用不同的结果路径跑同一个计划,第二个拿不到锁。
+
+每次调用两行:
 
 1. 发出**之前**写一行 ``reason="reserve"``、``cost_yuan`` = 单次上限,落盘(fsync)后才发;
 2. 调用结束写一行结算:``ok``(按回答里的用量)/ ``cap_timeout`` / ``cap_error`` /
    ``cap_no_usage``(后三种按单次上限)。
 
-账本合计 = 每次调用有结算行的按结算、没有结算行的(进程崩了、Ctrl-C)按上限。续跑时止损线从
-账本合计起算 —— 作废的条目、出错的那次调用、止损后别的路跑完的条目、崩溃时在飞的调用,钱都在账上。
+账本合计 = 每次调用有结算行的按结算、没有结算行的(进程崩了、Ctrl-C)按上限;读不出来的行
+(写到一半被打断)每行按单次上限算,并提示 —— **账本不能删**,删了就等于把已经花的钱清零。
+账本写不进去(磁盘满、权限……)= 止损:这次调用不发(预留没写成就不算),这一条作废、续跑时重做。
 结果文件只放跑完的条目(给「已完成」和报告用)。
 """
 
@@ -17,6 +23,7 @@ import contextlib
 import fcntl
 import json
 import os
+import sys
 import uuid
 from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
@@ -26,6 +33,7 @@ from typing import Any
 import b301_health as health
 
 SETTLE_REASONS = ("ok", "cap_timeout", "cap_error", "cap_no_usage")
+DEFAULT_STATE_DIR = Path.home() / ".cache" / "b301-health"
 
 
 class SpendStopError(BaseException):
@@ -33,27 +41,27 @@ class SpendStopError(BaseException):
 
 
 class LockedError(RuntimeError):
-    """另一个进程正拿着同一个结果文件在跑。"""
+    """另一个进程正在跑同一个计划。"""
 
 
-def ledger_path(results: Path) -> Path:
-    return results.with_suffix(".spend.jsonl")
+def ledger_path(state_dir: Path, plan_id: str) -> Path:
+    return state_dir / f"{plan_id}.spend.jsonl"
 
 
-def lock_path(results: Path) -> Path:
-    return results.with_suffix(".lock")
+def lock_path(state_dir: Path, plan_id: str) -> Path:
+    return state_dir / f"{plan_id}.lock"
 
 
 @contextlib.contextmanager
-def exclusive(results: Path) -> Iterator[None]:
-    """整个 run 期间独占这个结果文件(``flock``,不等);拿不到就 :class:`LockedError`。"""
-    path = lock_path(results)
+def exclusive(state_dir: Path, plan_id: str) -> Iterator[None]:
+    """整个 run 期间独占这个计划(``flock``,不等);拿不到就 :class:`LockedError`。"""
+    path = lock_path(state_dir, plan_id)
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("a") as fh:
         try:
             fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError as exc:
-            msg = f"{results} is being used by another run ({path} is locked)"
+            msg = f"plan {plan_id} is being used by another run ({path} is locked)"
             raise LockedError(msg) from exc
         try:
             yield
@@ -61,11 +69,34 @@ def exclusive(results: Path) -> Iterator[None]:
             fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
 
 
-def read_ledger(path: Path) -> list[dict[str, Any]]:
+def read_ledger(path: Path, *, broken_line_cost: float) -> list[dict[str, Any]]:
+    """读账本。读不出来的行(写到一半被打断)每行当作一次按 ``broken_line_cost``(单次上限)
+    预留、没结算的调用,并在 stderr 提示。"""
     if not path.exists():
         return []
-    lines = path.read_text(encoding="utf-8").splitlines()
-    return [json.loads(line) for line in lines if line.strip()]
+    rows: list[dict[str, Any]] = []
+    for number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), start=1):
+        if not line.strip():
+            continue
+        try:
+            row = json.loads(line)
+            if not isinstance(row, dict) or "call_id" not in row or "cost_yuan" not in row:
+                raise ValueError(line)
+        except ValueError:
+            sys.stderr.write(
+                f"notice: line {number} of {path} cannot be read (an interrupted write); it is "
+                f"counted as one call at the per-call cap ¥{broken_line_cost:.4f}. Keep the "
+                "ledger: it is the record of what this plan has already spent.\n"
+            )
+            row = {
+                "call_id": f"unreadable-line-{number}",
+                "model": "unknown",
+                "cost_yuan": broken_line_cost,
+                "reason": "reserve",
+                "unreadable": True,
+            }
+        rows.append(row)
+    return rows
 
 
 def ledger_total(rows: Sequence[Mapping[str, Any]]) -> float:
@@ -94,7 +125,8 @@ def error_stops(rows: Sequence[Mapping[str, Any]]) -> dict[str, int]:
 
 @dataclass
 class SpendLedger:
-    """往账本追加一行并落盘;``path`` 为 ``None`` 时只记在内存里(测试)。"""
+    """往账本追加一行并落盘;``path`` 为 ``None`` 时只记在内存里(测试)。上一行没写完(没有换行)
+    就先补一个换行,新的一行不会接在半行后面。"""
 
     path: Path | None
     plan_id: str
@@ -103,8 +135,13 @@ class SpendLedger:
         if self.path is None:
             return
         line = json.dumps({"plan_id": self.plan_id, **row}, ensure_ascii=False) + "\n"
-        with self.path.open("a", encoding="utf-8") as fh:
-            fh.write(line)
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        with self.path.open("a+b") as fh:
+            if fh.tell() > 0:
+                fh.seek(-1, os.SEEK_END)
+                if fh.read(1) != b"\n":
+                    line = "\n" + line
+            fh.write(line.encode("utf-8"))
             fh.flush()
             os.fsync(fh.fileno())
 
@@ -138,12 +175,13 @@ class SpendGuard:
             raise SpendStopError(self.blocked)
 
     def reserve(self, model: str, *, item: str, phase: str) -> str:
-        """过止损线,再按单次上限预留并落账,返回调用编号。之后才能发。"""
+        """过止损线,再按单次上限预留并落账,返回调用编号。之后才能发。落账失败 = 这次不发、
+        不算预留,并止损(:meth:`_write`)。"""
         self.check(model)
         call_id = uuid.uuid4().hex
         cap = health.per_call_cap_yuan(self.prices[model])
-        self._open[call_id] = cap
         self._write(call_id, model, item, phase, cap, "reserve")
+        self._open[call_id] = cap
         return call_id
 
     def settle(
@@ -194,13 +232,20 @@ class SpendGuard:
     def _write(
         self, call_id: str, model: str, item: str, phase: str, cost: float, reason: str
     ) -> None:
-        if self.ledger is not None:
-            row = {
-                "call_id": call_id,
-                "item": item,
-                "model": model,
-                "phase": phase,
-                "cost_yuan": round(cost, 8),
-                "reason": reason,
-            }
+        """落账;写不进去就止损并抛 :class:`SpendStopError` —— 它不是 ``Exception``,工具的兜底
+        接不住,这一条作废、续跑时重做(结算行没写成的,续跑时按那条预留 = 单次上限算)。"""
+        if self.ledger is None:
+            return
+        row = {
+            "call_id": call_id,
+            "item": item,
+            "model": model,
+            "phase": phase,
+            "cost_yuan": round(cost, 8),
+            "reason": reason,
+        }
+        try:
             self.ledger.append(row)
+        except OSError as exc:
+            self.block(f"the spend ledger could not be written ({type(exc).__name__})")
+            raise SpendStopError(self.blocked) from exc

@@ -3,12 +3,16 @@
 关键字段两种判法并列报告:
 
 * **严格**(按类结论「有收益 / 无收益 / 变差」用它):规范化后与关键字段相等;或关键字段作为整体
-  出现在回答里,且(关键字段带数字时)回答里没有别的数 / 编号 —— 「可能是 69.1,也可能是 1.69」
-  这种两头押的回答不算对。
+  出现在回答里,并且
+  - 关键字段带数字时:回答里没有别的数 / 编号(「可能是 69.1,也可能是 1.69」算错;「87.5(第4周)」
+    这种带了别的数的对答案也算错 —— 所以报告把严格与宽松不一致的回答逐条列出,供人工看);
+  - 关键字段不带数字时:回答没有给备选(``or`` / ``maybe`` / ``possibly`` / ``perhaps`` / 或 /
+    也可能 / 可能是),也没有比「关键字段 + 一个短标签」长出很多。
 * **宽松**:关键字段作为整体出现在回答里就算对。
 
-规范化:NFKC(全角转半角)、小写、去空白 / 千分位逗号 / 引号括号 / markdown 记号、去句末标点;
-数统一写法(``36.80`` = ``36.8``,``08:47`` = ``8:47``,``2026-03-17`` = ``2026-3-17``)。
+规范化:NFKC(全角转半角)、小写、去空白 / 千分位逗号 / 引号括号 / markdown 记号、去句末标点。
+只有种类是数(``number``,含时刻)的关键字段把数统一写法(``36.80`` = ``36.8``,``08:47`` =
+``8:47``);编号、日期按原样比(``7731-0428`` 不等于 ``7731-428``)。
 """
 
 from __future__ import annotations
@@ -52,6 +56,12 @@ _TRAILING = re.compile(r"[。.!?;]+$")
 _NUMBER = re.compile(r"\d+(?:[.:]\d+)*")
 _PART = re.compile(r"([.:])")
 _DIGIT = re.compile(r"\d")
+#: 数统一写法只用在这些种类的关键字段上。
+NUMERIC_KINDS = frozenset({"number", "time"})
+#: 不带数字的关键字段:回答里出现这些就是给了备选(在去掉关键字段之后的剩余部分里找)。
+_HEDGE = re.compile(r"\b(?:or|maybe|possibly|perhaps)\b|或|也可能|可能是.*也")
+#: 不带数字的关键字段:回答比关键字段长出这么多字符(规范化后、去空白)以上,就不是「只写字段」。
+STRICT_EXTRA_CHARS = 16
 
 
 def _canon_number(match: re.Match[str]) -> str:
@@ -68,15 +78,15 @@ def _canon_number(match: re.Match[str]) -> str:
     return "".join(out)
 
 
-def _norm(text: str, *, keep_space: bool) -> str:
+def _norm(text: str, *, keep_space: bool, numeric: bool) -> str:
     folded = unicodedata.normalize("NFKC", text).lower()
-    folded = _DROP.sub("", _SPACE.sub(" " if keep_space else "", folded)).strip()
-    return _NUMBER.sub(_canon_number, _TRAILING.sub("", folded))
+    folded = _TRAILING.sub("", _DROP.sub("", _SPACE.sub(" " if keep_space else "", folded)).strip())
+    return _NUMBER.sub(_canon_number, folded) if numeric else folded
 
 
-def normalize(text: str) -> str:
+def normalize(text: str, *, numeric: bool = False) -> str:
     """见模块说明(去掉空白)。保留 ``. - / : % _``:它们在日期、编号、读数里有意义。"""
-    return _norm(text, keep_space=False)
+    return _norm(text, keep_space=False, numeric=numeric)
 
 
 def _glued(neighbour: str, edge: str) -> bool:
@@ -93,10 +103,11 @@ def _glued(neighbour: str, edge: str) -> bool:
     return bool(neighbour) and kind(neighbour) != "" and kind(neighbour) == kind(edge)
 
 
-def _occurrences(key: str, answer: str) -> tuple[str, list[tuple[int, int]]]:
+def _occurrences(key: str, answer: str, *, numeric: bool) -> tuple[str, list[tuple[int, int]]]:
     """回答(保留单个空格的规范化形态)和关键字段在其中作为整体出现的位置。关键字段各字符之间
     允许多一个空格(``4:30pm`` 与 ``4:30 pm`` 一样);两侧按 :func:`_glued` 判断边界。"""
-    want, spaced = normalize(key), _norm(answer, keep_space=True)
+    want = normalize(key, numeric=numeric)
+    spaced = _norm(answer, keep_space=True, numeric=numeric)
     if not want:
         return spaced, []
     pattern = re.compile(" ?".join(re.escape(ch) for ch in want))
@@ -110,30 +121,33 @@ def _occurrences(key: str, answer: str) -> tuple[str, list[tuple[int, int]]]:
     return spaced, spans
 
 
-def field_matches(key: str, answer: str) -> bool:
+def field_matches(key: str, answer: str, *, numeric: bool = False) -> bool:
     """宽松:规范化后相等,或作为整体出现在回答里。"""
-    want = normalize(key)
-    if want and normalize(answer) == want:
+    want = normalize(key, numeric=numeric)
+    if want and normalize(answer, numeric=numeric) == want:
         return True
-    return bool(_occurrences(key, answer)[1])
+    return bool(_occurrences(key, answer, numeric=numeric)[1])
 
 
-def field_matches_strict(key: str, answer: str) -> bool:
-    """严格:相等;或宽松算对、且(关键字段带数字时)去掉它之后回答里没有别的数 / 编号。"""
-    want = normalize(key)
-    if want and normalize(answer) == want:
+def field_matches_strict(key: str, answer: str, *, numeric: bool = False) -> bool:
+    """严格:相等;或宽松算对、且回答没有给别的候选(见模块说明)。"""
+    want = normalize(key, numeric=numeric)
+    if want and normalize(answer, numeric=numeric) == want:
         return True
-    spaced, spans = _occurrences(key, answer)
+    spaced, spans = _occurrences(key, answer, numeric=numeric)
     if not spans:
         return False
-    if not _DIGIT.search(want):
-        return True
-    rest, cursor = [], 0
+    pieces, cursor = [], 0
     for start, end in spans:
-        rest.append(spaced[cursor:start])
+        pieces.append(spaced[cursor:start])
         cursor = end
-    rest.append(spaced[cursor:])
-    return not _DIGIT.search(" ".join(rest))
+    pieces.append(spaced[cursor:])
+    rest = " ".join(pieces)
+    if _DIGIT.search(want):
+        return not _DIGIT.search(rest)
+    if _HEDGE.search(rest):
+        return False
+    return len(normalize(answer, numeric=numeric)) <= len(want) + STRICT_EXTRA_CHARS
 
 
 def strip_notes(content: str) -> str:
@@ -174,12 +188,19 @@ def _latency_stats(values: Sequence[float]) -> dict[str, float | None]:
     return {"median_s": round(statistics.median(ordered), 2), "p95_s": round(p95, 2)}
 
 
-def _read_right(record: Mapping[str, Any] | None, key: str, *, strict: bool) -> bool:
+def _read_right(
+    record: Mapping[str, Any] | None, image: images_mod.SetImage, *, strict: bool
+) -> bool:
     """这一条读出了关键字段(工具出错的一律算没读出)。"""
-    if record is None or record.get("status") != "ok":
+    if record is None or record.get("status") != "ok" or image.key is None:
         return False
-    answer = str(record.get("answer", ""))
-    return field_matches_strict(key, answer) if strict else field_matches(key, answer)
+    answer, numeric = str(record.get("answer", "")), image.kind in NUMERIC_KINDS
+    match = field_matches_strict if strict else field_matches
+    return match(image.key, answer, numeric=numeric)
+
+
+#: 报告里每条「严格与宽松不一致」的回答最多显示多少字。
+DISAGREEMENT_CHARS = 120
 
 
 def _classify(upright_ok: int, on_ok: int, control_ok: int) -> str:
@@ -240,13 +261,32 @@ def _l2(
             continue
         c = classes.setdefault(
             image.image_class,
-            {"upright": 0, "on": 0, "control": 0, "lenient": {"upright": 0, "on": 0, "control": 0}},
+            {
+                "upright": 0,
+                "on": 0,
+                "control": 0,
+                "lenient": {"upright": 0, "on": 0, "control": 0},
+                "disagreements": [],
+            },
         )
-        for strict, counts in ((True, c), (False, c["lenient"])):
-            if _read_right(on.get(image.image_id), image.key, strict=strict):
-                counts["upright" if image.upright else "on"] += 1
-            if _read_right(control.get(image.image_id), image.key, strict=strict):
-                counts["control"] += 1
+        for mode, record in (
+            ("on", on.get(image.image_id)),
+            ("control", control.get(image.image_id)),
+        ):
+            strict = _read_right(record, image, strict=True)
+            lenient = _read_right(record, image, strict=False)
+            slot = mode if mode == "control" or not image.upright else "upright"
+            c[slot] += strict
+            c["lenient"][slot] += lenient
+            if strict != lenient and record is not None:
+                c["disagreements"].append(
+                    {
+                        "image_id": image.image_id,
+                        "mode": mode,
+                        "key": image.key,
+                        "answer": str(record.get("answer", ""))[:DISAGREEMENT_CHARS],
+                    }
+                )
     for c in classes.values():
         c["l2_pass"] = c["upright"] < L2_PREMISE_MIN or c["on"] >= L2_MIN
         c["result"] = _classify(c["upright"], c["on"], c["control"])
@@ -406,6 +446,11 @@ def _render_model(m: Mapping[str, Any]) -> list[str]:
             f"       {name}: {c['upright']}({loose['upright']})/3, {c['on']}({loose['on']})/9, "
             f"{c['control']}({loose['control']})/9 → {c['result']}"
         )
+        for d in c["disagreements"]:  # 严格算错、宽松算对:人工看一眼是不是其实读对了
+            lines.append(
+                f"         严格≠宽松 {d['image_id']} ({d['mode']}) 关键字段 {d['key']!r}:"
+                f"{d['answer']!r}"
+            )
     lines.append(
         f"   L6  问方向 {l6['calls']} 次:超时 {l6['timeouts']}、答非所问 {l6['off_topic']}"
         f"({l6['bad_rate']:.1%});耗时中位 {l6['median_s']} s、p95 {l6['p95_s']} s:"
