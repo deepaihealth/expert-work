@@ -1127,7 +1127,9 @@ def build_knowledge_router() -> APIRouter:
         or waited for recognition (e.g. the model was configured since). The
         whole document goes through the pipeline again, but pages already
         recognized come from the recognition cache: only the failed / waiting
-        pages are sent to a model (and billed)."""
+        pages are sent to a model (and billed). B-301 PR 4: with page
+        orientation on, a page recognized sideways before may now be turned
+        upright — then it is read, and billed, again (its estimate says so)."""
         tenant_id: UUID = request.state.tenant_id
         base = await _require_base(store, tenant_id, name)
         document = await _require_redrivable(store, runner, tenant_id, base, document_id)

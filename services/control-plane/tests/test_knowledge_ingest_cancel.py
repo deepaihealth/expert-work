@@ -539,6 +539,7 @@ async def test_the_estimate_after_a_cancel_leaves_out_the_pages_already_read() -
         filename="scan.pdf",
         raw=raw,
         figures=None,
+        recognizer=recognizer,
     )
     estimator = IngestEstimator(store=store, recognizer=recognizer)
     estimate = await estimator.estimate(claim, local, embedding_model=None, now=datetime.now(UTC))
@@ -611,6 +612,7 @@ async def test_the_estimate_after_a_model_switch_bills_every_page_read_again() -
         filename="scan.pdf",
         raw=raw,
         figures=None,
+        recognizer=recognizer,
     )
     estimator = IngestEstimator(store=store, recognizer=recognizer)
 
@@ -683,6 +685,7 @@ async def test_pages_read_before_b238_are_free_again_after_one_reingest() -> Non
         filename="scan.pdf",
         raw=raw,
         figures=None,
+        recognizer=recognizer,
     )
     estimator = IngestEstimator(store=store, recognizer=recognizer)
 

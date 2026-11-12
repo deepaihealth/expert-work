@@ -687,11 +687,13 @@ async def parse_locally(
     filename: str,
     raw: bytes,
     figures: FigureDescriber | None,
+    recognizer: DocumentRecognizer | None,
 ) -> LocalParse:
     """B-222 PR-2 —— the free half of :func:`ingest_document_bytes`'s parse:
     the parse pools only (same budgets), no model, nothing written. What an
     estimate counts; its snapshot spares the confirmed ingest from parsing
-    again (``local``)."""
+    again (``local``). ``recognizer``: the ingest's (B-301 PR 4 —— the scanned
+    pages asked their orientation are the ones the ingest's own parse would ask)."""
     job = _parse_job(
         store,
         tenant_id=tenant_id,
@@ -702,7 +704,7 @@ async def parse_locally(
         generation=None,
     )
     on = figures is not None and await figures_enabled(figures, tenant_id=tenant_id)
-    return await local_parse(job, figures_on=on)
+    return await local_parse(job, figures_on=on, recognizer=recognizer)
 
 
 def _pool_runners(filename: str) -> tuple[PoolRunner, PoolRunner]:
@@ -1116,6 +1118,7 @@ async def estimate_document(
         filename=claim.filename,
         raw=claim.content,
         figures=figures,
+        recognizer=estimator.recognizer,
     )
     model_key, _ = await pin_embedder(embedder, tenant_id=claim.tenant_id)
     now = datetime.now(UTC)
@@ -1309,6 +1312,7 @@ async def start_paid_ingest(
             filename=claim.filename,
             raw=claim.content,
             figures=figures,
+            recognizer=estimator.recognizer,
         )
     else:
         logger.info("knowledge.snapshot_used document=%s", claim.document_id)

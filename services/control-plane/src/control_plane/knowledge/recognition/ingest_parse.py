@@ -153,7 +153,7 @@ async def parse_upload(
     :raises Exception: ``job.lost()`` when a fenced write was refused."""
     on = figures is not None and await figures_enabled(figures, tenant_id=job.tenant_id)
     describer = figures if on else None
-    local = await local_parse(job, figures_on=describer is not None)
+    local = await local_parse(job, figures_on=describer is not None, recognizer=recognizer)
     return await finish_parse(job, local, recognizer=recognizer, figures=describer)
 
 
@@ -167,12 +167,16 @@ async def figures_enabled(figures: FigureDescriber, *, tenant_id: UUID) -> bool:
         return False
 
 
-async def local_parse(job: ParseJob, *, figures_on: bool) -> LocalParse:
+async def local_parse(
+    job: ParseJob, *, figures_on: bool, recognizer: DocumentRecognizer | None
+) -> LocalParse:
     """The parse-pool half of :func:`parse_upload` (``figures_on``: a usable
-    figure describer will describe the figures)."""
+    figure describer will describe the figures; ``recognizer``: the one the
+    ingest reads scanned pages with — B-301 PR 4, only the pages it will read
+    are asked their orientation)."""
     ext = Path(job.filename).suffix.lower()
     if ext == ".pdf":
-        return await _local_pdf(job, figures_on)
+        return await _local_pdf(job, figures_on, await orientation_page_cap(job, recognizer))
     if figures_on and ext in FIGURE_OFFICE_EXTENSIONS:
         parsed: OfficeParse = await job.run(
             parse_office_figures_within_cap, job.raw, ext, max_parsed_chars()
@@ -216,13 +220,25 @@ async def _finish_office(job: ParseJob, local: LocalParse, figures: FigureDescri
     return markdown
 
 
-async def _local_pdf(job: ParseJob, figures_on: bool) -> LocalParse:
+async def orientation_page_cap(job: ParseJob, recognizer: DocumentRecognizer | None) -> int:
+    """B-301 PR 4 —— how many of a PDF's pages to recognize are asked their
+    orientation: the ones recognition will read — the first ``max_pages`` of
+    them (:meth:`DocumentRecognizer.recognize_document`). None while the switch
+    is off, without a recognizer, or with no recognition model configured (the
+    pages wait; a later 补识别 parses the document again)."""
+    if not page_orientation_enabled() or recognizer is None:
+        return 0
+    plan = await recognizer.plan(tenant_id=job.tenant_id)
+    return plan.max_pages if plan.engines else 0
+
+
+async def _local_pdf(job: ParseJob, figures_on: bool, orientation_pages: int) -> LocalParse:
     analysis: PdfAnalysis = await job.run(
         analyse_pdf_within_cap,
         job.filename,
         job.raw,
         max_parsed_chars(),
-        page_orientation_enabled(),
+        orientation_pages,
     )
     if not analysis.pages:  # PyMuPDF could not walk it: parsed as before, no records
         return LocalParse(kind="text", figures_on=figures_on, markdown=analysis.markdown or "")

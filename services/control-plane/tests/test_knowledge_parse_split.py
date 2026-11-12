@@ -175,6 +175,7 @@ async def _ingest(doc: FormDoc, *, via_snapshot: bool, figures_model: bool = Tru
             filename=doc.filename,
             raw=doc.raw,
             figures=figures,
+            recognizer=recognizer,
         )
         assert models.reads == models.descriptions == 0  # the estimate's half calls no model
         snapshot = encode_snapshot(parsed)
@@ -247,6 +248,7 @@ async def test_an_ingest_from_the_snapshot_runs_no_parse_step_again(
         filename=_ILLUSTRATED.filename,
         raw=_ILLUSTRATED.raw,
         figures=None,
+        recognizer=None,
     )
     steps = ("analyse_pdf_within_cap", "parse_within_cap", "parse_office_figures_within_cap")
 

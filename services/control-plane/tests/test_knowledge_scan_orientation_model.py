@@ -83,10 +83,11 @@ def test_the_image_build_loads_the_model_and_runs_one_inference() -> None:
     # Fail loud at build time (as the tokenizer files are fetched there): a model left
     # out of the package, with another hash or that will not run fails the build.
     dockerfile = (Path(__file__).resolve().parents[1] / "Dockerfile").read_text()
-    builder = dockerfile.split("\nFROM ")[1]  # the builder stage, up to the runtime stage
-    (check,) = [line for line in builder.splitlines() if "OnnxPageClassifier()" in line]
-    assert check.startswith("RUN /app/.venv/bin/python -c ")
-    assert ".classify(" in check and "assert " in check
+    _, builder, runtime = dockerfile.split("\nFROM ")  # both stages: built, then copied
+    for stage in (builder, runtime):
+        (check,) = [line for line in stage.splitlines() if "OnnxPageClassifier()" in line]
+        assert check.startswith("RUN /app/.venv/bin/python -c ")
+        assert ".classify(" in check and "assert " in check
 
 
 def test_a_model_file_that_is_not_the_pinned_one_is_refused(tmp_path: Path) -> None:
@@ -126,6 +127,21 @@ def test_a_process_whose_model_will_not_load_fails_every_page_and_tries_again_la
     assert orientation.session_loaded()
 
 
+def test_a_model_that_will_not_load_fails_every_page_with_one_warning(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    monkeypatch.setattr(orientation, "_classifier", None)
+    monkeypatch.setattr(orientation, "MODEL_SHA256", "0" * 64)
+    raw = orientation_pages.scanned_pdf(
+        [orientation_pages.turned(orientation_pages.document("en", i), 90) for i in range(3)]
+    )
+    with caplog.at_level("WARNING", logger=orientation.logger.name):
+        analysis = analyse_pdf_within_cap("a.pdf", raw, 10_000_000, 1000)
+    assert [page.orientation for page in analysis.pages] == [FAILED] * 3
+    warnings = [r for r in caplog.records if r.name == orientation.logger.name]
+    assert [r.getMessage() for r in warnings] == ["knowledge.page_orientation_model_unavailable"]
+
+
 # -- preprocessing and the angle convention --------------------------------------------------
 
 
@@ -147,6 +163,51 @@ def test_the_small_render_has_a_short_side_of_256() -> None:
     rendered = small_render(doc[0])
     doc.close()
     assert min(rendered.shape[:2]) == 256 and rendered.shape[2] == 3
+
+
+def _whole_page(page: pymupdf.Page) -> np.ndarray:
+    """The page drawn whole at a short side of 256 (what the model's input was cut from
+    when the baseline was made)."""
+    zoom = 256 / min(page.rect.width, page.rect.height)
+    pixmap = page.get_pixmap(
+        matrix=pymupdf.Matrix(zoom, zoom), alpha=False, colorspace=pymupdf.csRGB
+    )
+    return np.frombuffer(pixmap.samples, np.uint8).reshape(pixmap.height, pixmap.width, 3)
+
+
+def _page_of(
+    picture: Image.Image, width: float, height: float
+) -> tuple[pymupdf.Document, pymupdf.Page]:
+    doc = pymupdf.open()
+    page = doc.new_page(width=width, height=height)
+    out = io.BytesIO()
+    picture.save(out, format="JPEG")
+    page.insert_image(page.rect, stream=out.getvalue(), keep_proportion=False)
+    return doc, page
+
+
+@pytest.mark.parametrize(("width", "height"), [(595, 842), (842, 595), (390, 690), (1376, 1110)])
+def test_a_page_of_ordinary_shape_is_drawn_small_exactly_as_whole(
+    width: float, height: float
+) -> None:
+    doc, page = _page_of(orientation_pages.document("zh", 3), width, height)
+    small = small_render(page)
+    assert np.array_equal(small, _whole_page(page))
+    doc.close()
+
+
+def test_a_long_thin_page_is_drawn_only_around_its_centre(classifier: OnnxPageClassifier) -> None:
+    # Drawn whole, this strip would be 256 x 4,096 pixels; the model only ever looks
+    # at the centre 224 square of it.
+    doc, page = _page_of(
+        orientation_pages.turned(orientation_pages.document("en", 2), 90), 1600, 100
+    )
+    small, whole = small_render(page), _whole_page(page)
+    assert small.shape == (256, 256, 3) and whole.shape == (256, 4096, 3)
+    centre = whole[:, (4096 - 256) // 2 : (4096 + 256) // 2]
+    assert np.abs(centre.astype(int) - small.astype(int)).mean() < 1  # same pixels, near enough
+    assert classifier.classify(small).angle == classifier.classify(whole).angle
+    doc.close()
 
 
 @pytest.mark.parametrize("clockwise", [90, 180, 270])
@@ -240,7 +301,7 @@ def test_with_the_switch_off_the_worker_asks_nothing(monkeypatch: pytest.MonkeyP
 
     monkeypatch.setattr("control_plane.knowledge.parsed_size.process_classifier", forbidden)
     raw = _scan(orientation_pages.turned(orientation_pages.document("zh", 1), 90))
-    analysis = analyse_pdf_within_cap("a.pdf", raw, 10_000_000, False)
+    analysis = analyse_pdf_within_cap("a.pdf", raw, 10_000_000, 0)
     assert [p.orientation for p in analysis.pages] == [None]
     assert orientation.page_orientation_enabled()  # the platform default is on
 

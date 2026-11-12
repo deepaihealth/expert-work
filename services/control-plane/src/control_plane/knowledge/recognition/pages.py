@@ -37,6 +37,7 @@ from control_plane.knowledge.recognition.orientation import (
     FAILED,
     Orientation,
     PageClassifier,
+    UnavailableClassifier,
     classify_page,
 )
 from expert_work.protocol import IngestErrorCode, PageDecision, PageReason
@@ -115,9 +116,15 @@ def render_params(max_pixels: int | None = None) -> str:
     return f"dpi={RENDER_DPI};edge={RENDER_MAX_EDGE_PX};jpeg={RENDER_JPEG_QUALITY}{pixels}"
 
 
-def analyse_pdf(filename: str, raw: bytes, classifier: PageClassifier | None = None) -> PdfAnalysis:
+def analyse_pdf(
+    filename: str,
+    raw: bytes,
+    classifier: PageClassifier | None = None,
+    orientation_pages: int | None = None,
+) -> PdfAnalysis:
     """Decide every page of a PDF (see module doc); with a ``classifier``, each page
-    to recognize is asked its orientation.
+    to recognize — the first ``orientation_pages`` of them when given — is asked
+    its orientation.
 
     A PDF with no page to recognize parses exactly as before: ``markdown`` is
     :func:`parse_document`'s output, its MarkItDown fallback and its errors
@@ -138,7 +145,7 @@ def analyse_pdf(filename: str, raw: bytes, classifier: PageClassifier | None = N
         if not any(page.decision is PageDecision.OCR for page in pages):
             return PdfAnalysis(pages=tuple(pages), markdown=parse_document(filename, raw))
         if classifier is not None:
-            pages = _oriented(doc, pages, classifier)
+            pages = _oriented(doc, pages, classifier, orientation_pages)
         texts = _page_texts(doc, pages)
     finally:
         doc.close()
@@ -187,13 +194,24 @@ def pdf_page_texts(raw: bytes, analysis: PdfAnalysis) -> PdfAnalysis:
 
 
 def _oriented(
-    doc: pymupdf.Document, pages: Sequence[PdfPage], classifier: PageClassifier
+    doc: pymupdf.Document,
+    pages: Sequence[PdfPage],
+    classifier: PageClassifier,
+    limit: int | None,
 ) -> list[PdfPage]:
-    """``pages`` with each page to recognize asked its orientation. The small renders
-    leave their decoded images in PyMuPDF's store (a 47 MiB scanned PDF: +89~105 MiB
-    at the worker's peak, measured 2026-11-12); they are dropped before going on."""
+    """``pages`` with each page to recognize — up to ``limit`` of them, in page
+    order: the ones recognition will read — asked its orientation. A classifier
+    whose model would not load (logged once already) fails them all, unasked. The
+    small renders leave their decoded images in PyMuPDF's store (a 47 MiB scanned
+    PDF: +89~105 MiB at the worker's peak, measured 2026-11-12); they are dropped
+    before going on."""
+    unavailable = isinstance(classifier, UnavailableClassifier)
+    asking = [page.index for page in pages if page.decision is PageDecision.OCR]
+    wanted = set(asking if limit is None else asking[:limit])
 
     def asked(page: PdfPage) -> Orientation:
+        if unavailable:
+            return FAILED
         try:
             return classify_page(doc[page.index], classifier)
         except Exception:  # never fails the document: the page is not turned
@@ -201,7 +219,7 @@ def _oriented(
 
     try:
         return [
-            replace(page, orientation=asked(page)) if page.decision is PageDecision.OCR else page
+            replace(page, orientation=asked(page)) if page.index in wanted else page
             for page in pages
         ]
     finally:

@@ -162,6 +162,9 @@ ENV PYTHONPATH=/app
 # to WORKDIR /app) resolves at startup; unset → seeding is a no-op.
 COPY --chown=expert_work:expert_work configs /app/configs
 
+# B-301 PR 4 —— 同一条模型自检在运行阶段再跑一次:确认拷过来的 venv 里模型还在、跑得动。
+RUN /app/.venv/bin/python -c "import numpy as np; from control_plane.knowledge.recognition.orientation import LABELS, OnnxPageClassifier; o = OnnxPageClassifier().classify(np.full((362, 256, 3), 255, np.uint8)); assert o.angle in LABELS and 0.0 <= o.confidence <= 1.0, o; print('orientation model ok:', o)"
+
 USER expert_work
 EXPOSE 8000
 ENTRYPOINT ["uvicorn", "control_plane.main:app", "--host", "0.0.0.0", "--port", "8000"]

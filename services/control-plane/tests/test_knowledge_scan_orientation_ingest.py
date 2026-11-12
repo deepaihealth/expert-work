@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import io
 import json
-from collections.abc import Iterator, Sequence
+from collections.abc import Iterator
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field, replace
 from pathlib import Path
@@ -21,13 +21,13 @@ from uuid import UUID, uuid4
 import numpy as np
 import pymupdf
 import pytest
-from langchain_core.messages import AIMessage, BaseMessage
 from PIL import Image, ImageDraw
 from prometheus_client import REGISTRY
 
 from control_plane.knowledge import ingestion
 from control_plane.knowledge.estimate import IngestEstimator
 from control_plane.knowledge.ingestion import (
+    KnowledgeIngestionRunner,
     ingest_document_bytes,
     parse_locally,
     shutdown_parse_pool,
@@ -35,6 +35,7 @@ from control_plane.knowledge.ingestion import (
 from control_plane.knowledge.parse_snapshot import decode_snapshot, encode_snapshot
 from control_plane.knowledge.parse_workers import FIGURE_POOL, PoolBudget
 from control_plane.knowledge.parsed_size import analyse_pdf_within_cap
+from control_plane.knowledge.parsing import DocumentParseError
 from control_plane.knowledge.recognition import figure_images, orientation
 from control_plane.knowledge.recognition.clients import Reading, RecognitionClient
 from control_plane.knowledge.recognition.figure_pipeline import FigureDescriber
@@ -57,14 +58,11 @@ from expert_work.persistence.knowledge.base import ClaimedIngestion
 from expert_work.protocol import (
     DEFAULT_CHUNK_MAX_TOKENS,
     DEFAULT_CHUNK_OVERLAP_TOKENS,
-    ImageRef,
+    DocumentStatus,
 )
 from expert_work.protocol.knowledge_estimate import EstimateKind
 from expert_work.runtime.storage import InMemoryObjectStore
 from orchestrator.llm import FakeEmbedder
-from orchestrator.multimodal import InMemoryImageResolver, ResolvedImage
-from orchestrator.tools.registry import ToolContext
-from orchestrator.tools.vision import AskImageTool
 from tests import orientation_pages
 from tests.figure_test_images import noise_png
 
@@ -159,10 +157,12 @@ class _UprightOnlyReader:
 @dataclass
 class _Settings:
     figure: ModelChoice | None = None
+    max_pages: int = 1000
+    primary: ModelChoice | None = field(default_factory=lambda: ModelChoice("glm", "glm-ocr"))
 
     async def recognition_settings(self) -> RecognitionSettings:
         return RecognitionSettings(
-            primary=ModelChoice("glm", "glm-ocr"), fallback=None, max_pages=1000, figure=self.figure
+            primary=self.primary, fallback=None, max_pages=self.max_pages, figure=self.figure
         )
 
 
@@ -298,7 +298,7 @@ async def test_a_turned_pages_cached_reading_records_its_angle_and_confidence() 
 def test_the_parse_snapshot_keeps_each_pages_orientation() -> None:
     from control_plane.knowledge.recognition.ingest_parse import LocalParse
 
-    analysis = analyse_pdf_within_cap("a.pdf", _turned_pdf(0, 90), 10_000_000, True)
+    analysis = analyse_pdf_within_cap("a.pdf", _turned_pdf(0, 90), 10_000_000, 1000)
     assert [page.rotation for page in analysis.pages] == [0, 90]
     local = LocalParse(kind="pdf", figures_on=False, analysis=analysis, text_limit=100)
     snapshot = encode_snapshot(local)
@@ -341,6 +341,7 @@ async def _estimated_paid_pages(doc: _Doc) -> int:
         filename="scan.pdf",
         raw=doc.raw,
         figures=None,
+        recognizer=recognizer,
     )
     claim = ClaimedIngestion(
         tenant_id=doc.tenant,
@@ -403,6 +404,117 @@ class _AnotherModel:
 
     def classify(self, image: np.ndarray) -> Orientation:
         return replace(self._real.classify(image), model="f" * 64)
+
+
+async def test_the_estimate_asks_and_the_confirmed_ingest_turns_the_page_it_counted() -> None:
+    # The runner's estimate phase parses with the ingest's recognizer: the snapshot it
+    # keeps carries the angle, and the confirmed ingest reads the page upright from it.
+    store, tenant = InMemoryKnowledgeStore(), uuid4()
+    base = await store.create_base(tenant_id=tenant, name="kb")
+    started = await store.begin_upload(
+        tenant_id=tenant,
+        kb_id=base.id,
+        filename="scan.pdf",
+        content=_turned_pdf(90),
+        content_sha256="sha-sideways",
+        now=_now(),
+    )
+    document_id = started.document.id
+    reader = _UprightOnlyReader()
+    recognizer = _recognizer(store, reader)
+    runner = KnowledgeIngestionRunner(
+        store=store,
+        embedder=FakeEmbedder(),
+        recognizer=recognizer,
+        estimator=IngestEstimator(store=store, settings=_Settings(), recognizer=recognizer),
+    )
+    await runner.submit(tenant_id=tenant, document_id=document_id)
+    waiting = await store.get_document(tenant_id=tenant, document_id=document_id)
+    assert waiting is not None and waiting.status is DocumentStatus.AWAITING_CONFIRMATION
+    assert waiting.ingest_estimate is not None and reader.calls == 0
+    snapshot = await store.get_parse_snapshot(
+        tenant_id=tenant, document_id=document_id, estimate_id=waiting.ingest_estimate.id
+    )
+    assert snapshot is not None
+    local = decode_snapshot(snapshot)
+    assert local is not None and local.analysis is not None
+    assert [page.rotation for page in local.analysis.pages] == [90]
+    await store.confirm_documents(
+        tenant_id=tenant,
+        kb_id=base.id,
+        estimates=[(document_id, waiting.ingest_estimate.id)],
+        confirmed_by="user",
+        now=_now(),
+    )
+    await runner.submit(tenant_id=tenant, document_id=document_id)
+    ready = await store.get_document(tenant_id=tenant, document_id=document_id)
+    assert ready is not None
+    assert ready.status is DocumentStatus.READY, ready.error
+    assert reader.calls == 1 and _is_upright(reader.images[0])
+
+
+class _Counting:
+    """The real classifier, counting the pages it is asked about."""
+
+    def __init__(self, real: PageClassifier) -> None:
+        self._real = real
+        self.calls = 0
+
+    def classify(self, image: np.ndarray) -> Orientation:
+        self.calls += 1
+        return self._real.classify(image)
+
+
+async def _parse_and_ingest(doc: _Doc, settings: _Settings | None) -> None:
+    """The estimate's parse, then an ingest that parses for itself (with
+    ``settings``' recognizer; ``None``: no recognizer at all)."""
+    reader = _UprightOnlyReader()
+    recognizer = _recognizer(doc.store, reader, settings) if settings is not None else None
+    await parse_locally(
+        doc.store,
+        tenant_id=doc.tenant,
+        kb_id=doc.kb,
+        document_id=doc.document,
+        filename="scan.pdf",
+        raw=doc.raw,
+        figures=None,
+        recognizer=recognizer,
+    )
+    await ingest_document_bytes(
+        store=doc.store,
+        embedder=FakeEmbedder(),
+        tenant_id=doc.tenant,
+        document_id=doc.document,
+        kb_id=doc.kb,
+        filename="scan.pdf",
+        raw=doc.raw,
+        chunk_max_tokens=DEFAULT_CHUNK_MAX_TOKENS,
+        chunk_overlap_tokens=DEFAULT_CHUNK_OVERLAP_TOKENS,
+        recognizer=recognizer,
+    )
+
+
+@pytest.mark.usefixtures("in_process_parse")
+async def test_only_pages_recognition_will_read_are_asked_their_orientation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    counting = _Counting(orientation.process_classifier())
+    monkeypatch.setattr(orientation, "_classifier", counting)
+    doc = await _document(_turned_pdf(90, 90, 90, 90))
+    # The page cap is 2: pages 3 and 4 are never read — not drawn small or asked
+    # either, by the estimate's parse or the ingest's.
+    await _parse_and_ingest(doc, _Settings(max_pages=2))
+    assert counting.calls == 2 + 2
+    analysis = analyse_pdf_within_cap("scan.pdf", doc.raw, 10_000_000, 2)
+    assert [page.rotation for page in analysis.pages] == [90, 90, 0, 0]
+    assert [page.orientation is None for page in analysis.pages] == [False, False, True, True]
+    # No recognition model configured, or no recognizer at all: nothing is read now
+    # (a later 补识别 parses again), nothing is asked.
+    counting.calls = 0
+    for settings in (_Settings(primary=None), None):
+        with pytest.raises(DocumentParseError, match="no text"):  # all scanned, none read
+            await _parse_and_ingest(await _document(doc.raw), settings)
+    assert counting.calls == 0
 
 
 @pytest.mark.usefixtures("in_process_parse")
@@ -560,74 +672,32 @@ async def test_the_figure_worker_never_creates_a_session() -> None:
         assert not await FIGURE_POOL.run("a.pdf", orientation.session_loaded, budget=budget)
         # The probe can tell: the same worker, once it has analysed a page with orientation on.
         await FIGURE_POOL.run(
-            "a.pdf", analyse_pdf_within_cap, "a.pdf", raw, 10_000_000, True, budget=budget
+            "a.pdf", analyse_pdf_within_cap, "a.pdf", raw, 10_000_000, 1000, budget=budget
         )
         assert await FIGURE_POOL.run("a.pdf", orientation.session_loaded, budget=budget)
     finally:
         FIGURE_POOL.shutdown(kill=True)
 
 
-@dataclass
-class _VisionCaller:
-    calls: int = 0
-
-    async def __call__(
-        self,
-        *,
-        messages: Sequence[BaseMessage],
-        tools: Sequence[Any],
-        output_schema: Any = None,
-        on_delta: Any = None,
-    ) -> AIMessage:
-        self.calls += 1
-        return AIMessage(content="一页横着的文字")
-
-
-@dataclass
-class _AnyRef:
-    data: bytes
-
-    async def resolve(self, ref: str) -> ResolvedImage:
-        return ResolvedImage(media_type="image/jpeg", data=self.data)
-
-
-async def test_d4_ask_image_never_reaches_the_classifier(monkeypatch: pytest.MonkeyPatch) -> None:
-    asked: list[str] = []
-
-    def spy(name: str) -> Any:
-        def called(*args: object, **kwargs: object) -> Any:
-            asked.append(name)
-            raise AssertionError(f"{name} was called")
-
-        return called
-
-    for name in ("process_classifier", "classify_page", "small_render"):
-        monkeypatch.setattr(orientation, name, spy(name))
-    monkeypatch.setattr(orientation.OnnxPageClassifier, "classify", spy("OnnxPageClassifier"))
-    out = io.BytesIO()
-    orientation_pages.turned(_upright_page(), 90).save(out, format="JPEG")
-    sideways = out.getvalue()
-    tenant, user, thread = uuid4(), uuid4(), uuid4()
-    upload = ImageRef(tenant_id=tenant, thread_id=thread, image_id=uuid4(), ext=".jpg").to_uri()
-    workspace = f"expert_work://workspace/{tenant}/{user}/photos/sideways.jpg"
-    vision = _VisionCaller()
-    resolver = InMemoryImageResolver(
-        images={"any": ResolvedImage(media_type="image/jpeg", data=sideways)}
-    )
-    for ref, image_resolver in ((upload, resolver), (workspace, _AnyRef(sideways))):
-        tool = AskImageTool(vl_caller=vision, image_resolver=image_resolver)
-        result = await tool.call(
-            {"image_ref": ref, "question": "上面写了什么?"},
-            ctx=ToolContext(tenant_id=tenant, user_id=user),
-        )
-        assert "横着" in result.content
-    assert vision.calls >= 2
-    assert asked == []
-    # And no code outside the knowledge parse path imports the classifier.
+def test_d4_nothing_on_the_ask_image_side_can_reach_the_classifier() -> None:
+    # ``ask_image`` (uploads, workspace images) lives in the orchestrator, which does
+    # not depend on the control plane: it can only reach the classifier by importing
+    # the control plane, onnxruntime or the model file — none of its modules does.
     orchestrator_src = Path(__file__).resolve().parents[2] / "orchestrator" / "src"
+    sources = list(orchestrator_src.rglob("*.py"))
+    assert any(path.name == "vision.py" for path in sources)  # the ask_image tool is here
     users = [
         path
-        for path in orchestrator_src.rglob("*.py")
-        if "recognition.orientation" in path.read_text() or "onnxruntime" in path.read_text()
+        for path in sources
+        if any(
+            needle in path.read_text()
+            for needle in (
+                "recognition.orientation",
+                "onnxruntime",
+                "pp_lcnet",
+                "from control_plane",
+                "import control_plane",
+            )
+        )
     ]
     assert users == []

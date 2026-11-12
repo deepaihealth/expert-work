@@ -40,6 +40,9 @@ LABELS: Final = (0, 90, 180, 270)
 #: constant, not a per-tenant / per-agent setting).
 THRESHOLD: Final = 0.9
 SHORT_SIDE: Final = 256
+#: The small render's longest side, in pixels (3 x the short side: any page up to
+#: 1 : 3 is drawn whole); past it only the centre square is drawn.
+SMALL_RENDER_MAX_EDGE: Final = 3 * 256
 CROP: Final = 224
 _MEAN: Final = np.array([0.485, 0.456, 0.406], np.float32)
 _STD: Final = np.array([0.229, 0.224, 0.225], np.float32)
@@ -170,8 +173,9 @@ class OnnxPageClassifier:
         return Orientation(angle=LABELS[best], confidence=float(scores[best]), model=self.model)
 
 
-class _Unavailable:
-    """The classifier of a process whose model would not load: every page fails."""
+class UnavailableClassifier:
+    """The classifier of a process whose model would not load: every page fails
+    (:func:`~.pages.analyse_pdf` does not even ask it)."""
 
     def __init__(self, error: Exception) -> None:
         self._error = error
@@ -193,7 +197,7 @@ def process_classifier() -> PageClassifier:
             _classifier = OnnxPageClassifier(MODEL_FILE, MODEL_SHA256)
         except Exception as exc:
             logger.warning("knowledge.page_orientation_model_unavailable", exc_info=True)
-            return _Unavailable(exc)
+            return UnavailableClassifier(exc)
     return _classifier
 
 
@@ -203,11 +207,27 @@ def session_loaded() -> bool:
 
 
 def small_render(page: pymupdf.Page) -> np.ndarray:
-    """``page`` drawn with its short side :data:`SHORT_SIDE` pixels (RGB)."""
+    """``page`` drawn with its short side :data:`SHORT_SIDE` pixels (RGB). A page
+    whose long side would pass :data:`SMALL_RENDER_MAX_EDGE` pixels (a long thin
+    strip) is drawn only around its centre square — all the model looks at
+    (:func:`preprocess` takes the centre :data:`CROP`) — so no page allocates
+    a large pixmap."""
     zoom = SHORT_SIDE / min(page.rect.width, page.rect.height)
-    pixmap = page.get_pixmap(
-        matrix=pymupdf.Matrix(zoom, zoom), alpha=False, colorspace=pymupdf.csRGB
-    )
+    matrix = pymupdf.Matrix(zoom, zoom)
+    whole = (page.rect * matrix).round()  # the pixels the whole page is drawn on
+    clip = None
+    if max(whole.width, whole.height) > SMALL_RENDER_MAX_EDGE:
+        left = whole.x0 + (whole.width - SHORT_SIDE) // 2
+        top = whole.y0 + (whole.height - SHORT_SIDE) // 2
+        # A quarter pixel inside the square's edges: exactly those whole pixels, on
+        # the grid of the whole page drawn (MuPDF scales embedded images a little
+        # differently once clipped — under one level on average, measured 2026-11-12
+        # — which is why pages of ordinary shape are drawn whole).
+        square = pymupdf.Rect(
+            left + 0.25, top + 0.25, left + SHORT_SIDE - 0.25, top + SHORT_SIDE - 0.25
+        )
+        clip = square * ~matrix
+    pixmap = page.get_pixmap(matrix=matrix, clip=clip, alpha=False, colorspace=pymupdf.csRGB)
     return np.frombuffer(pixmap.samples, np.uint8).reshape(pixmap.height, pixmap.width, 3)
 
 

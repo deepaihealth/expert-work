@@ -240,6 +240,7 @@ async def _local(setup: _Setup) -> LocalParse:
         filename=setup.filename,
         raw=setup.raw,
         figures=setup.figures,
+        recognizer=setup.recognizer,
     )
 
 

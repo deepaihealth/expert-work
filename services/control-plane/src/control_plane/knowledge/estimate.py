@@ -151,6 +151,12 @@ class IngestEstimator:
     def prices(self) -> PriceSource | None:
         return self._prices
 
+    @property
+    def recognizer(self) -> DocumentRecognizer | None:
+        """The ingest's scanned-page recognizer (the local parse asks the pages it
+        will read their orientation, B-301 PR 4)."""
+        return self._recognizer
+
     async def estimate(
         self,
         claim: ClaimedIngestion,
