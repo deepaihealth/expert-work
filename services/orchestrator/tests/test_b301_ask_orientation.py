@@ -1332,16 +1332,17 @@ async def test_time_spent_writing_the_turned_copies_counts_against_the_budget(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """M2 —— 写三张转过的副本也算问方向的时间:写完已经过了「留给读之前、再留下限」的那一刻,
-    就不问第 2 步,按 0 度读、不加说明。写副本本身不被截断(不留半张 JPEG)。"""
+    就不问第 2 步,按 0 度读、不加说明。写副本本身不被截断(不留半张 JPEG)。这里只有最后一张
+    慢(写之前的估算看不出来),靠的是写完之后、问之前那一次检查。"""
     real = vision._crop_in_thread
 
     async def slow(data: bytes, boxes: Sequence[Any], degrees: int) -> Any:
-        if degrees:
-            await asyncio.sleep(1.0)
+        if degrees == 270:
+            await asyncio.sleep(3.0)
         return await real(data, boxes, degrees)
 
     monkeypatch.setattr(vision, "_crop_in_thread", slow)
-    # 留给读 1 秒;开问时比下限多 1.5 秒;第 1 步立即答 no,写三张副本用掉 3 秒,之后比下限少 1.5 秒。
+    # 留给读 1 秒;开问时比下限多 1.5 秒;第 1 步立即答 no,最后一张副本用掉 3 秒,之后比下限少 1.5 秒。
     up = _setup(tmp_path, _stored(90), orient=_orient_by_dir({}), timeout_s=1.0)
     up.tool = dataclasses.replace(up.tool, orientation_timeout_s=30.0)
     _with_deadline(up, 1.0 + ORIENTATION_MIN_BUDGET_S + 1.5)
@@ -1383,6 +1384,47 @@ async def test_time_spent_writing_the_first_copy_counts_against_the_budget(
     assert up.vision.read_refs == [up.ref]
 
 
+async def test_slow_turned_copies_stop_before_they_eat_the_reads_time(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """M2 回修 —— 每张转过的副本写之前先估:剩的时间不够「下限 + 还要写的张数 乘 最慢一张」就停。
+    这里 0 度副本很快、转过的每张 3 秒:写完第一张就看出不够,不再写后两张;deep 超时再改用
+    快看的那次读照样有足够的时间。"""
+    real = vision._crop_in_thread
+
+    async def slow(data: bytes, boxes: Sequence[Any], degrees: int) -> Any:
+        if degrees:
+            await asyncio.sleep(3.0)
+        return await real(data, boxes, degrees)
+
+    monkeypatch.setattr(vision, "_crop_in_thread", slow)
+    up = _setup(tmp_path, _stored(90))
+    quick = _Route(up.resolver, orient_s=0.0, read_s=2.5)
+    tool = AskImageTool(
+        vl_caller=_Hangs(),
+        quick_vl_caller=quick,
+        image_resolver=up.resolver,
+        workspace_store=up.tool.workspace_store,
+        ask_orientation=True,
+        timeout_s=3.0,
+        deep_timeout_s=1.0,
+        orientation_timeout_s=30.0,
+    )  # 留给读 1 + 3 = 4 秒
+    # 开问时比下限多 4 秒:写第一张(3 秒)之前按 0 度那张估、够;写完只比下限多 1 秒,按最慢
+    # 一张(3 秒)估还要 6 秒,停。只按 0 度那张估的话会接着写第二张。
+    _with_deadline(up, 4.0 + ORIENTATION_MIN_BUDGET_S + 4.0)
+
+    result = await tool.call({"image_ref": up.ref, "question": "q", "depth": "deep"}, ctx=up.ctx)
+
+    assert "quick read" in result.content
+    orientation = result.meta["orientation"]
+    assert (orientation["conclusion"], orientation["reason"]) == ("not_asked", "deadline")
+    assert orientation["answers"] == {"0": "no"}
+    crops = next(up.root.rglob("orientation.json")).parent
+    assert (crops / "r90" / _FULL).exists()
+    assert not (crops / "r180").exists() and not (crops / "r270").exists()
+
+
 class _CacheReadFailsOnce(NasWorkspaceStore):
     """读 ``orientation.json`` 第一次失败(NAS 抖一下)。"""
 
@@ -1396,10 +1438,13 @@ class _CacheReadFailsOnce(NasWorkspaceStore):
         return await super().read_file(**kwargs)
 
 
-async def test_a_transient_cache_read_error_does_not_change_the_frame(tmp_path: Path) -> None:
-    """L1 —— 同一 run 里的结论先记在进程内,缓存文件读坏一次也不改角度、不重问。"""
+async def test_the_in_process_memo_keeps_the_frame_when_the_cache_file_cannot_be_read(
+    tmp_path: Path,
+) -> None:
+    """L1 —— 进程内记录:同一进程里之后的看直接用它,不去读缓存文件;文件一直读不出来也不改角度、
+    不重问(没有这份记录时,读不出文件的那几次会按「没问成」退回 0 度)。"""
     up = _setup(tmp_path, _stored(90))
-    tool = dataclasses.replace(up.tool, workspace_store=_CacheReadFailsOnce(root=str(up.root)))
+    tool = dataclasses.replace(up.tool, workspace_store=_CacheNeverReadable(root=str(up.root)))
 
     results = [
         await tool.call({"image_ref": up.ref, "question": "q"}, ctx=up.ctx) for _ in range(3)
@@ -1434,27 +1479,64 @@ async def test_a_bug_inside_the_orientation_step_still_reads(
     assert _counter("not_asked", 0) == before + 1
 
 
-async def test_another_process_that_cannot_read_the_cache_file_decides_once_and_sticks(
-    tmp_path: Path,
-) -> None:
-    """L1 —— 进程内没有记录(这个 run 的后一次看落到了另一个副本)、缓存文件又读坏一次:当没有缓存,
-    自己问一次并记下;之后在这个进程里一直按它,不会这一次「没问成」、下一次又按文件转。"""
-    up = _setup(tmp_path, _stored(90))
-    await up.look(image_ref=up.ref)
-    other = AskImageTool(
+def _another_process(up: _Setup, store: NasWorkspaceStore) -> AskImageTool:
+    """同一个 run 的后一次看落到了另一个副本:进程内没有记录,只有 NAS 上的缓存文件。"""
+    return AskImageTool(
         vl_caller=up.vision,
         image_resolver=up.resolver,
-        workspace_store=_CacheReadFailsOnce(root=str(up.root)),
+        workspace_store=store,
         ask_orientation=True,
     )
+
+
+async def test_another_process_retries_a_failed_cache_read_and_keeps_the_decision(
+    tmp_path: Path,
+) -> None:
+    """跨副本 —— 缓存文件在、第一次读坏(NAS 抖一下):再读一次,用文件里的角度,不重问。"""
+    up = _setup(tmp_path, _stored(90))
+    await up.look(image_ref=up.ref)
+    other = _another_process(up, _CacheReadFailsOnce(root=str(up.root)))
 
     results = [
         await other.call({"image_ref": up.ref, "question": "q"}, ctx=up.ctx) for _ in range(2)
     ]
 
-    assert [r.meta["orientation"]["conclusion"] for r in results] == ["rotated", "rotated"]
     assert [r.meta["orientation"]["degrees"] for r in results] == [90, 90]
-    assert [r.meta["orientation"]["from_cache"] for r in results] == [False, True]
+    assert [r.meta["orientation"]["from_cache"] for r in results] == [True, True]
+    assert len(up.vision.orientation_refs) == 4  # 只有第一个副本问过
+    assert all(r.content.startswith(SECRET) for r in results)
+
+
+class _CacheNeverReadable(NasWorkspaceStore):
+    async def read_file(self, **kwargs: Any) -> bytes:
+        if str(kwargs.get("path", "")).endswith("/orientation.json"):
+            msg = "NAS read error"
+            raise OSError(msg)
+        return await super().read_file(**kwargs)
+
+
+async def test_another_process_that_cannot_read_the_cache_never_overwrites_it(
+    tmp_path: Path,
+) -> None:
+    """跨副本 —— 缓存文件在、怎么都读不出来:不重问、不覆盖别的副本写下的结论;这一次按今天的
+    样子读(``not_asked`` / ``error``,不对主模型说什么),之后读得出来了就按文件。"""
+    up = _setup(tmp_path, _stored(90))
+    await up.look(image_ref=up.ref)
+    cache = up.path_of(up.vision.orientation_refs[0]).parent / "orientation.json"
+    decided = cache.read_bytes()
+    other = _another_process(up, _CacheNeverReadable(root=str(up.root)))
+
+    result = await other.call({"image_ref": up.ref, "question": "q"}, ctx=up.ctx)
+
+    assert cache.read_bytes() == decided
+    assert len(up.vision.orientation_refs) == 4
+    orientation = result.meta["orientation"]
+    assert (orientation["conclusion"], orientation["reason"]) == ("not_asked", "error")
+    assert result.content == WRONG
+    assert up.vision.read_refs[-1] == up.ref
+    recovered = _another_process(up, NasWorkspaceStore(root=str(up.root)))
+    later = await recovered.call({"image_ref": up.ref, "question": "q"}, ctx=up.ctx)
+    assert later.meta["orientation"]["degrees"] == 90
 
 
 class _CacheWriteFails(NasWorkspaceStore):

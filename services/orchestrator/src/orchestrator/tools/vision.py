@@ -972,7 +972,7 @@ class AskImageTool:
         async with self._render_lock(key):
             orientation = self._remembered(key)
             if orientation is None:
-                orientation = await self._cached_orientation_or_none(out_dir, ctx=ctx)
+                orientation = await self._cached_orientation(out_dir, ctx=ctx)
                 if orientation is not None:
                     self._remember(key, orientation)
             if orientation is None:
@@ -998,14 +998,15 @@ class AskImageTool:
             return self._limit_s("deep") + self.timeout_s
         return self.timeout_s
 
-    def _orientation_budget(self, orient_until: float | None) -> float | None:
+    def _orientation_budget(self, orient_until: float | None, extra_s: float = 0.0) -> float | None:
         """此刻再问一次方向最多等多久:``orientation_timeout_s``,且不过 ``orient_until``。
-        离 ``orient_until`` 不到 :data:`ORIENTATION_MIN_BUDGET_S` 就是 ``None`` —— 不问。
-        每次调用之前现算(写副本的时间也算进去)。"""
+        离 ``orient_until`` 不到 :data:`ORIENTATION_MIN_BUDGET_S`(加上问之前还要花的
+        ``extra_s``,例如还没写的副本)就是 ``None`` —— 不问。每次调用之前现算(写副本的时间
+        也算进去)。"""
         budget = self.orientation_timeout_s
         if orient_until is not None:
             spare = orient_until - time.monotonic()
-            if spare < ORIENTATION_MIN_BUDGET_S:
+            if spare < ORIENTATION_MIN_BUDGET_S + extra_s:
                 return None
             budget = min(budget, spare)
         return budget
@@ -1020,11 +1021,13 @@ class AskImageTool:
         但它用掉的时间算数,写完已经过了线就不再问。"""
         if self._orientation_budget(orient_until) is None:
             return Orientation("not_asked", reason="deadline")
+        started = time.monotonic()
         try:
             zero = await self._write_crops(data, out_dir, [_FULL_FRAME], degrees=0, ctx=ctx)
         except Exception:
             logger.warning("ask_image.orientation_candidate_failed", exc_info=True)
             return Orientation("not_asked", reason="no_copy")
+        copy_s = time.monotonic() - started
         budget = self._orientation_budget(orient_until)
         if budget is None:
             return Orientation("not_asked", reason="deadline")
@@ -1037,18 +1040,23 @@ class AskImageTool:
         if conclusion is not None:
             return Orientation(conclusion, 0, answers, models, extra_calls=1)
         out_of_time = Orientation("not_asked", 0, answers, models, "deadline", extra_calls=1)
-        if self._orientation_budget(orient_until) is None:
-            return out_of_time
-        try:
-            turned = [
-                (await self._write_crops(data, out_dir, [_FULL_FRAME], degrees=turn, ctx=ctx))
-                .crops[0]
-                .ref
-                for turn in TURNS
-            ]
-        except Exception:
-            logger.warning("ask_image.orientation_candidate_failed", exc_info=True)
-            return Orientation("undetermined", 0, answers, models, extra_calls=1)
+        turned: list[str] = []
+        for index, turn in enumerate(TURNS):
+            # 写之前先估:剩的时间要够「下限 + 还要写的张数 乘 到目前为止最慢的一张」(第一次估用
+            # 0 度那张),不够就不写了 —— 写到一半才发现,吃掉的是留给读的时间。
+            needed = (len(TURNS) - index) * copy_s
+            if self._orientation_budget(orient_until, extra_s=needed) is None:
+                return out_of_time
+            started = time.monotonic()
+            try:
+                render = await self._write_crops(
+                    data, out_dir, [_FULL_FRAME], degrees=turn, ctx=ctx
+                )
+            except Exception:
+                logger.warning("ask_image.orientation_candidate_failed", exc_info=True)
+                return Orientation("undetermined", 0, answers, models, extra_calls=1)
+            copy_s = max(copy_s, time.monotonic() - started)
+            turned.append(render.crops[0].ref)
         budget = self._orientation_budget(orient_until)
         if budget is None:
             return out_of_time
@@ -1098,16 +1106,6 @@ class AskImageTool:
             return self.output_cap_resolver(response)[1] or None
         return self.vl_model_name or None
 
-    async def _cached_orientation_or_none(
-        self, out_dir: str, *, ctx: ToolContext
-    ) -> Orientation | None:
-        """缓存文件里的结论;读不出来(NAS 抖一下……)当没有,记日志。"""
-        try:
-            return await self._cached_orientation(out_dir, ctx=ctx)
-        except Exception:
-            logger.warning("ask_image.orientation_cache_read_failed", exc_info=True)
-            return None
-
     def _remembered(self, key: tuple[object, str]) -> Orientation | None:
         """进程内记下的本 run 这张图的结论(用它时按「来自缓存、没多花调用」报)。"""
         orientation = self._orientation_memo.get(key)
@@ -1124,6 +1122,12 @@ class AskImageTool:
             self._orientation_memo.popitem(last=False)
 
     async def _cached_orientation(self, out_dir: str, *, ctx: ToolContext) -> Orientation | None:
+        """缓存文件里的结论;没有这个文件是 ``None``(去问)。
+
+        跨副本:这个 run 的前一次看可能在别的副本上,结论只在这个文件里。文件在、却读不出来
+        (NAS 抖一下)就再读一次;还是不行(或者连目录都列不出来、不知道文件在不在)就往外抛 ——
+        调用方这一次按「没问成」读(:meth:`_oriented`),**不重问、不覆盖**别的副本写下的结论,
+        也不记进进程内,之后读得出来了就按文件。"""
         store = self.workspace_store
         if store is None or ctx.tenant_id is None or ctx.user_id is None:
             return None
@@ -1133,15 +1137,18 @@ class AskImageTool:
         entry = (await lister.entries_if_present(out_dir)).get(CACHE_NAME)
         if entry is None or entry.is_dir:
             return None
-        raw = await store.read_file(
-            tenant_id=ctx.tenant_id, user_id=ctx.user_id, path=f"{out_dir}/{CACHE_NAME}"
-        )
+        path = f"{out_dir}/{CACHE_NAME}"
+        try:
+            raw = await store.read_file(tenant_id=ctx.tenant_id, user_id=ctx.user_id, path=path)
+        except Exception:
+            logger.warning("ask_image.orientation_cache_read_retry", exc_info=True)
+            raw = await store.read_file(tenant_id=ctx.tenant_id, user_id=ctx.user_id, path=path)
         return Orientation.from_cache_bytes(raw)
 
     async def _store_orientation(
         self, out_dir: str, orientation: Orientation, *, ctx: ToolContext
     ) -> None:
-        """写缓存;写不进去只记日志 —— 这次照样按结论读,同一 run 下次看会再问一次。"""
+        """写缓存;写不进去只记日志 —— 这次照样按结论读,同一进程里之后的看用进程内的记录。"""
         store = self.workspace_store
         if store is None or ctx.tenant_id is None or ctx.user_id is None:
             return
