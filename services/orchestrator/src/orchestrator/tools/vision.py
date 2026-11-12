@@ -104,7 +104,9 @@ from orchestrator.tools.region_zoom import (
     DOCUMENT_ZOOM_DPI,
     HOST_CROP_SLOTS,
     LARGE_IMAGE_PIXELS,
+    MAX_BAND_PIXELS,
     REGION_HINT,
+    REGION_TARGET_PIXELS,
     Box,
     CroppedImage,
     Region,
@@ -118,8 +120,19 @@ from orchestrator.tools.region_zoom import (
     plan_bands,
 )
 from orchestrator.tools.registry import ToolBlockedError, ToolContext, ToolResult, ToolSpec
+from orchestrator.tools.seam_relook import (
+    SEAM_LABEL,
+    SEAM_RELOOK_MIN_RUN_LEFT_S,
+    SEAM_RELOOK_TIMEOUT_S,
+    SeamRelook,
+    ask_image_seam_relook_total,
+    judged,
+    seam_box,
+    seam_content,
+)
 from orchestrator.tools.tile_reading import (
     RAW_META_CHARS,
+    AutoDecision,
     TileResult,
     decide_auto,
     decide_whole_question,
@@ -208,13 +221,15 @@ _HOST_CROP_GATES: weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, asyncio.S
 )
 
 
-async def _crop_in_thread(data: bytes, boxes: Sequence[Box], degrees: int) -> list[CroppedImage]:
+async def _crop_in_thread(
+    data: bytes, boxes: Sequence[Box], degrees: int, max_pixels: int = REGION_TARGET_PIXELS
+) -> list[CroppedImage]:
     loop = asyncio.get_running_loop()
     gate = _HOST_CROP_GATES.get(loop)
     if gate is None:
         gate = _HOST_CROP_GATES[loop] = asyncio.Semaphore(HOST_CROP_SLOTS)
     async with gate:
-        return await asyncio.to_thread(crop_image, data, boxes, degrees)
+        return await asyncio.to_thread(crop_image, data, boxes, degrees, max_pixels)
 
 
 def _tile_slots() -> asyncio.Semaphore:
@@ -360,6 +375,8 @@ class AskImageTool:
     ask_orientation: bool = False
     #: B-301 —— 一次问方向的整体上限(含排队);只有测试会改它。
     orientation_timeout_s: float = ORIENTATION_TIMEOUT_S
+    #: B-301 PR 3 —— ``region="auto"`` 重看接缝那一次的整体上限(含排队);只有测试会改它。
+    seam_relook_timeout_s: float = SEAM_RELOOK_TIMEOUT_S
     #: B-251 —— 按页看时那一页没渲染 / 已过期,用它先渲一次再看。``None`` = 这个 agent
     #: 没有 ``read_page``:照旧报错,让模型自己去渲。
     page_renderer: PageRenderer | None = None
@@ -672,6 +689,11 @@ class AskImageTool:
         else:
             decision = decide_auto(results, full_answer=full_answer, full_error=full_error)
         ask_image_region_auto_total.labels(path=decision.path, reason=decision.reason).inc()
+        content, relook = await self._maybe_relook_seam(
+            located, question, bands, results, decision, full_answer, ctx=ctx
+        )
+        if relook is not None and relook.usage:
+            usages.append(relook.usage)
         meta.update(
             {
                 "auto": decision.path,
@@ -684,12 +706,83 @@ class AskImageTool:
                 "full": {"answer": full_answer[:RAW_META_CHARS]}
                 if full_answer is not None
                 else {"error": full_error},
-                "vl_calls": len(looked) + 1,
+                "vl_calls": len(looked) + 1 + (relook.calls if relook is not None else 0),
             }
         )
+        if relook is not None:
+            meta["seam_relook"] = relook.meta()
         if usages:
             meta["vl_usage"] = _sum_usage(usages)
-        return decision.content, meta
+        return content, meta
+
+    async def _maybe_relook_seam(
+        self,
+        located: _Located,
+        question: str,
+        bands: tuple[Tile, ...],
+        results: Sequence[TileResult],
+        decision: AutoDecision,
+        full_answer: str | None,
+        *,
+        ctx: ToolContext,
+    ) -> tuple[str, SeamRelook | None]:
+        """B-301 PR 3(设计 §4.2)—— 退回整张读、原因是有横条报 ``partial`` 时,把接缝再快看一次。
+
+        别的情形(横条给了值、横条冲突而没有 ``partial``、整体类问题、整张读失败)不看,原样返回
+        ``decision.content``。看了但失败 / 超时 / 时间不够,也原样返回 —— 与今天逐字节相同。"""
+        if decision.path != "full_fallback" or decision.reason != "partial" or full_answer is None:
+            return decision.content, None
+        box = seam_box(results, bands)
+        if box is None:
+            return decision.content, None
+        relook = await self._relook_seam(located, question, box, bands, full_answer, ctx=ctx)
+        ask_image_seam_relook_total.labels(outcome=relook.outcome).inc()
+        if not relook.looked:
+            return decision.content, relook
+        return seam_content(full_answer, results, relook), relook
+
+    async def _relook_seam(
+        self,
+        located: _Located,
+        question: str,
+        box: Box,
+        bands: tuple[Tile, ...],
+        full_answer: str,
+        *,
+        ctx: ToolContext,
+    ) -> SeamRelook:
+        """在横条用的同一张(可能转正过的)画面上、按横条的分辨率(``bands=True``)裁出 ``box``,用横条
+        同样的提示快看**一次**:占切块名额、整体不超过 ``seam_relook_timeout_s``、run 剩的时间不够
+        就不看。裁图本身不设限时(截断写到一半会留下半张 JPEG),但裁完再判一次时间。裁图与调用的
+        任何 ``Exception`` 都是 ``error``;调用之后的记账与横条同一条路(:meth:`_tile_result`),
+        记账出错照样让工具失败,与横条一致。"""
+        if not self._time_for_relook(ctx):
+            return SeamRelook("skipped_deadline", box)
+        calls = 0
+        try:
+            crop = (await self._crops(located, [box], ctx=ctx, bands=True)).crops[0]
+            if not self._time_for_relook(ctx):
+                return SeamRelook("skipped_deadline", box)
+            messages = _messages(crop.ref, tile_question(question, band_axis(bands)))
+            calls = 1
+            async with asyncio.timeout(self.seam_relook_timeout_s):
+                async with _tile_slots():
+                    response = await self._ask(messages, depth="quick", ctx=ctx)
+        except Exception as exc:
+            reason = "timed out" if isinstance(exc, TimeoutError) else type(exc).__name__
+            logger.info("ask_image.seam_relook_failed err=%s", reason)
+            return SeamRelook("error", box, error=reason, calls=calls)
+        result, _error = await self._tile_result(Tile(SEAM_LABEL, box), response, ctx=ctx)
+        usage = response.usage_metadata
+        if result.reply is None:  # 截断成空 / 没有文字:当作没看成
+            return SeamRelook("error", box, error=result.error, calls=1, usage=usage)
+        return judged(full_answer, box, result.reply, usage=usage)
+
+    def _time_for_relook(self, ctx: ToolContext) -> bool:
+        """run 剩的时间够不够重看一次(:data:`SEAM_RELOOK_MIN_RUN_LEFT_S`);没有截止时刻就够。"""
+        if ctx.deadline_at is None:
+            return True
+        return ctx.deadline_at - time.monotonic() >= SEAM_RELOOK_MIN_RUN_LEFT_S
 
     async def _full_result(
         self, outcome: AIMessage | BaseException, *, ctx: ToolContext
@@ -823,7 +916,11 @@ class AskImageTool:
         bands: bool = False,
     ) -> RegionRender:
         """B-266 —— 按 ``boxes`` 裁出局部:文档页(``path`` + ``unit``)在沙箱里按区域高分辨率渲,
-        别的图(上传图、工作区图片)在宿主按原像素裁。都落本对话 ``.tool_results/<run>/crops/``。"""
+        别的图(上传图、工作区图片)在宿主按原像素裁。都落本对话 ``.tool_results/<run>/crops/``。
+
+        ``bands=True``:按横条的分辨率(文档页 ``band_dpi``;宿主裁图上限 :data:`MAX_BAND_PIXELS`,
+        而不是一般局部的约 150 万像素)。B-301 PR 3 的接缝重看用它:接缝框是两条横条的并集,
+        按一般局部的上限会比横条更糊。宿主上的横条本身约 150 万像素,仍按默认上限裁。"""
         source = located.resolved_from or {}
         path, unit = source.get("path"), source.get("unit")
         if isinstance(path, str) and unit is not None:
@@ -834,21 +931,33 @@ class AskImageTool:
                 return await self.page_renderer.render_regions(
                     path=path, figure_ref=located.ref, boxes=boxes, ctx=ctx, bands=bands
                 )
-        return await self._crop_image(located.ref, boxes, ctx=ctx, degrees=located.degrees)
+        return await self._crop_image(
+            located.ref, boxes, ctx=ctx, degrees=located.degrees, bands=bands
+        )
 
     async def _crop_image(
-        self, ref_str: str, boxes: Sequence[Box], *, ctx: ToolContext, degrees: int = 0
+        self,
+        ref_str: str,
+        boxes: Sequence[Box],
+        *,
+        ctx: ToolContext,
+        degrees: int = 0,
+        bands: bool = False,
     ) -> RegionRender:
         """宿主侧裁图:字节经同一个 resolver 拿(上传图来自对象存储),原像素裁,写进本对话
         ``.tool_results/<run>/crops/<源图哈希>/<框>.jpg``;同一张图同一个框已经裁过就直接用。
-        B-301 —— ``degrees`` 不是 0 时框在转正后的画面上,文件放进 ``r<degrees>/`` 子目录。"""
+        B-301 —— ``degrees`` 不是 0 时框在转正后的画面上,文件放进 ``r<degrees>/`` 子目录。
+        B-301 PR 3 —— ``bands=True``:按横条分辨率裁(上限 :data:`MAX_BAND_PIXELS`),文件名
+        ``<框>-b.jpg``,与同一个框的一般局部不共用文件。"""
         self._require_crop_bindings(ctx)
         data = (await self.image_resolver.resolve(ref_str)).data
         out_dir = self._crop_dir(data, ctx=ctx)
         # 并行的两次 ask_image 看同一张图(常见:同一张化验单问两个值)会写同一批文件:排队,
         # 后来的直接复用 —— 不排队时两边同时写同一个名字,NAS 的写入会互相踩掉。
         async with self._render_lock((ctx.run_id, out_dir)):
-            return await self._write_crops(data, out_dir, boxes, degrees=degrees, ctx=ctx)
+            return await self._write_crops(
+                data, out_dir, boxes, degrees=degrees, ctx=ctx, bands=bands
+            )
 
     def _require_crop_bindings(self, ctx: ToolContext) -> None:
         if (
@@ -887,28 +996,33 @@ class AskImageTool:
         *,
         degrees: int,
         ctx: ToolContext,
+        bands: bool = False,
     ) -> RegionRender:
         """裁 ``boxes`` 写进 ``out_dir``(0 度)或 ``out_dir/r<degrees>``;已有的同名文件直接用。
+        ``bands=True`` 按横条分辨率裁、文件名带 ``-b``(见 :meth:`_crop_image`)。
         调用方持有 ``(run, out_dir)`` 那把锁。"""
+        max_pixels = MAX_BAND_PIXELS if bands else REGION_TARGET_PIXELS
         store = self.workspace_store
         if store is None or ctx.tenant_id is None or ctx.user_id is None:
             msg = "ask_image 'region' needs a workspace and a tenant, user and run binding"
             raise ToolBlockedError(msg)
         target = _crop_target(out_dir, degrees)
-        names = {region_crop_stem(box) + ".jpg" for box in boxes}
+        names = {region_crop_stem(box, band=bands) + ".jpg" for box in boxes}
         lister = _ScopeLister(
             store=store, tenant_id=ctx.tenant_id, user_id=ctx.user_id, scope=SCOPE_USER_ROOT
         )
         crops: list[RegionCrop] = []
         existing = await lister.entries_if_present(target)
         reusable = {n for n in names if n in existing and not existing[n].is_dir}
-        todo = [box for box in boxes if region_crop_stem(box) + ".jpg" not in reusable]
+        todo = [box for box in boxes if region_crop_stem(box, band=bands) + ".jpg" not in reusable]
         pieces = (
-            dict(zip(todo, await _crop_in_thread(data, todo, degrees), strict=True)) if todo else {}
+            dict(zip(todo, await _crop_in_thread(data, todo, degrees, max_pixels), strict=True))
+            if todo
+            else {}
         )
         size = image_size(data, degrees) if reusable else None
         for box in boxes:
-            rel = f"{target}/{region_crop_stem(box)}.jpg"
+            rel = f"{target}/{region_crop_stem(box, band=bands)}.jpg"
             piece = pieces.get(box)
             if piece is not None:
                 await store.write_file(
@@ -916,7 +1030,7 @@ class AskImageTool:
                 )
                 width, height = piece.width, piece.height
             else:
-                width, height = crop_output_size(box, size or (0, 0))
+                width, height = crop_output_size(box, size or (0, 0), max_pixels)
             ref = workspace_figure_ref(ctx.tenant_id, ctx.user_id, rel)
             crops.append(
                 RegionCrop(box=box, ref=ref, width=width, height=height, reused=piece is None)

@@ -314,11 +314,17 @@ class CroppedImage:
     height: int
 
 
-def crop_image(data: bytes, boxes: Sequence[Box], degrees: int = 0) -> list[CroppedImage]:
-    """按原像素裁出每个框(不放大;超过约 1.5 百万像素的缩到那个量),存成 JPEG。
+def crop_image(
+    data: bytes,
+    boxes: Sequence[Box],
+    degrees: int = 0,
+    max_pixels: int = REGION_TARGET_PIXELS,
+) -> list[CroppedImage]:
+    """按原像素裁出每个框(不放大;超过 ``max_pixels``(默认约 1.5 百万像素)的缩到那个量),存成 JPEG。
 
     B-301 —— ``degrees``:按方向标记转正之后再顺时针转这么多度,框是转完之后那张图上的坐标。
     与方向标记合成一个方向值(:func:`turned_orientation`),所以仍然只转裁下来的那一块。
+    B-301 PR 3 —— 接缝重看的框是两条横条的并集,按 :data:`MAX_BAND_PIXELS` 裁,不比横条更糊。
 
     省内存(一张 6000 万像素的 RGBA PNG 整张转一次就是几百 MB):
     * 进程内最多 :data:`HOST_CROP_SLOTS` 张同时在裁(闸在调用方);
@@ -331,7 +337,7 @@ def crop_image(data: bytes, boxes: Sequence[Box], degrees: int = 0) -> list[Crop
     """
     try:
         with Image.open(io.BytesIO(data), formats=OPEN_FORMATS) as image:
-            return _crop_open_image(image, boxes, degrees)
+            return _crop_open_image(image, boxes, degrees, max_pixels)
     except RegionImageError:
         raise
     except (UnidentifiedImageError, OSError, Image.DecompressionBombError) as exc:
@@ -339,7 +345,9 @@ def crop_image(data: bytes, boxes: Sequence[Box], degrees: int = 0) -> list[Crop
         raise RegionImageError(msg) from exc
 
 
-def _crop_open_image(image: Image.Image, boxes: Sequence[Box], degrees: int) -> list[CroppedImage]:
+def _crop_open_image(
+    image: Image.Image, boxes: Sequence[Box], degrees: int, max_pixels: int
+) -> list[CroppedImage]:
     width, height = image.size
     if width * height > MAX_DECODE_PIXELS:
         msg = (
@@ -349,13 +357,13 @@ def _crop_open_image(image: Image.Image, boxes: Sequence[Box], degrees: int) -> 
         raise RegionImageError(msg)
     orientation = turned_orientation(_orientation(image), degrees)
     if isinstance(image, JpegImageFile):
-        scale = _draft_scale((width, height), boxes)
+        scale = _draft_scale((width, height), boxes, max_pixels)
         if scale > 1:
             image.draft(image.mode, (-(-width // scale), -(-height // scale)))
     crops: list[CroppedImage] = []
     for box in boxes:
         piece = _flatten(crop_upright(image, box, orientation))
-        piece = _cap_pixels(piece)
+        piece = _cap_pixels(piece, max_pixels)
         buffer = io.BytesIO()
         piece.save(buffer, format="JPEG", quality=CROP_JPEG_QUALITY)
         crops.append(CroppedImage(data=buffer.getvalue(), width=piece.width, height=piece.height))
@@ -367,15 +375,15 @@ def _orientation(image: Image.Image) -> int:
     return value if isinstance(value, int) and value in _UPRIGHT_METHODS else 1
 
 
-def _draft_scale(size: tuple[int, int], boxes: Sequence[Box]) -> int:
-    """JPEG 能缩小解码多少倍:每一块缩小后仍不少于 :data:`REGION_TARGET_PIXELS`(不够就不缩)。"""
+def _draft_scale(size: tuple[int, int], boxes: Sequence[Box], max_pixels: int) -> int:
+    """JPEG 能缩小解码多少倍:每一块缩小后仍不少于 ``max_pixels``(不够就不缩)。"""
     width, height = size
     smallest = min(
         (x2 - x1) * (y2 - y1) * width * height / (REGION_SCALE * REGION_SCALE)
         for x1, y1, x2, y2 in boxes
     )
     for scale in _JPEG_DRAFT_SCALES:
-        if smallest / (scale * scale) >= REGION_TARGET_PIXELS:
+        if smallest / (scale * scale) >= max_pixels:
             return scale
     return 1
 
@@ -413,13 +421,13 @@ def _raw_point(x: int, y: int, orientation: int, raw: tuple[int, int]) -> tuple[
     }[orientation]
 
 
-def _capped(width: int, height: int) -> tuple[int, int]:
-    """超过约 1.5 百万像素、或长边超过 :data:`MAX_SIDE_PIXELS`,就等比缩到线内(看图模型反正会压);
-    从不放大。"""
+def _capped(width: int, height: int, max_pixels: int = REGION_TARGET_PIXELS) -> tuple[int, int]:
+    """超过 ``max_pixels``(默认约 1.5 百万像素)、或长边超过 :data:`MAX_SIDE_PIXELS`,就等比缩到
+    线内(看图模型反正会压);从不放大。"""
     pixels = width * height
     factor = min(
         1.0,
-        math.sqrt(REGION_TARGET_PIXELS / pixels) if pixels else 1.0,
+        math.sqrt(max_pixels / pixels) if pixels else 1.0,
         MAX_SIDE_PIXELS / max(width, height, 1),
     )
     if factor >= 1.0:
@@ -427,15 +435,17 @@ def _capped(width: int, height: int) -> tuple[int, int]:
     return max(1, math.floor(width * factor)), max(1, math.floor(height * factor))
 
 
-def _cap_pixels(piece: Image.Image) -> Image.Image:
-    size = _capped(piece.width, piece.height)
+def _cap_pixels(piece: Image.Image, max_pixels: int) -> Image.Image:
+    size = _capped(piece.width, piece.height, max_pixels)
     return piece if size == piece.size else piece.resize(size, Image.Resampling.LANCZOS)
 
 
-def crop_output_size(box: Box, upright_size: tuple[int, int]) -> tuple[int, int]:
+def crop_output_size(
+    box: Box, upright_size: tuple[int, int], max_pixels: int = REGION_TARGET_PIXELS
+) -> tuple[int, int]:
     """:func:`crop_image` 对这个框出的图有多大(复用已裁好的图时报尺寸用)。"""
     left, top, right, bottom = pixel_box(box, upright_size)
-    return _capped(right - left, bottom - top)
+    return _capped(right - left, bottom - top, max_pixels)
 
 
 def _flatten(image: Image.Image) -> Image.Image:

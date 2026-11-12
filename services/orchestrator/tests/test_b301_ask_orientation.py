@@ -1337,10 +1337,10 @@ async def test_time_spent_writing_the_turned_copies_counts_against_the_budget(
     慢(写之前的估算看不出来),靠的是写完之后、问之前那一次检查。"""
     real = vision._crop_in_thread
 
-    async def slow(data: bytes, boxes: Sequence[Any], degrees: int) -> Any:
+    async def slow(data: bytes, boxes: Sequence[Any], degrees: int, *rest: Any) -> Any:
         if degrees == 270:
             await asyncio.sleep(3.0)
-        return await real(data, boxes, degrees)
+        return await real(data, boxes, degrees, *rest)
 
     monkeypatch.setattr(vision, "_crop_in_thread", slow)
     # 留给读 1 秒;开问时比下限多 1.5 秒;第 1 步立即答 no,最后一张副本用掉 3 秒,之后比下限少 1.5 秒。
@@ -1366,9 +1366,9 @@ async def test_time_spent_writing_the_first_copy_counts_against_the_budget(
     """M2 —— 第 1 步那张 0 度副本写得慢,写完已经过线:一次都不问,按今天的样子读。"""
     real = vision._crop_in_thread
 
-    async def slow(data: bytes, boxes: Sequence[Any], degrees: int) -> Any:
+    async def slow(data: bytes, boxes: Sequence[Any], degrees: int, *rest: Any) -> Any:
         await asyncio.sleep(3.0)
-        return await real(data, boxes, degrees)
+        return await real(data, boxes, degrees, *rest)
 
     monkeypatch.setattr(vision, "_crop_in_thread", slow)
     # 留给读 1 秒;开问时比下限多 1.5 秒,写 0 度副本用掉 3 秒,之后比下限少 1.5 秒。
@@ -1393,10 +1393,10 @@ async def test_slow_turned_copies_stop_before_they_eat_the_reads_time(
     快看的那次读照样有足够的时间。"""
     real = vision._crop_in_thread
 
-    async def slow(data: bytes, boxes: Sequence[Any], degrees: int) -> Any:
+    async def slow(data: bytes, boxes: Sequence[Any], degrees: int, *rest: Any) -> Any:
         if degrees:
             await asyncio.sleep(3.0)
-        return await real(data, boxes, degrees)
+        return await real(data, boxes, degrees, *rest)
 
     monkeypatch.setattr(vision, "_crop_in_thread", slow)
     up = _setup(tmp_path, _stored(90))
