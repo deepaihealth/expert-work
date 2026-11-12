@@ -14,8 +14,9 @@ from langchain_core.messages import AIMessage, BaseMessage
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-import b301_health as health
+import b301_health as cli
 import b301_health_run as runner
+import b301_plan as health
 import b301_spend as spend
 
 from orchestrator.llm.providers.openai import _extract_usage_metadata
@@ -245,4 +246,4 @@ def test_missing_credentials_name_the_variable_and_never_the_value(
     message = str(refused.value)
     assert "DEEPSEEK_API_KEY" in message and "HELIX_EVAL_LLM_API_KEY" in message
     assert "secret" not in message
-    assert runner.DEFAULT_ENV_FILE == Path.home() / ".kube" / "eval-llm.env"
+    assert cli.DEFAULT_ENV_FILE == Path.home() / ".kube" / "eval-llm.env"

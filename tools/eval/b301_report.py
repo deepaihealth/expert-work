@@ -26,7 +26,7 @@ from typing import Any
 
 import b301_images as images_mod
 import b301_spend as spend
-from b301_health import (
+from b301_plan import (
     L1_MIN,
     L1_PER_CLASS_MIN,
     L1P_UNDETERMINED_MAX,

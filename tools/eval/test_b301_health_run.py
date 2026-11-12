@@ -20,9 +20,9 @@ from PIL import Image
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-import b301_health as health
 import b301_health_run as runner
 import b301_images as images_mod
+import b301_plan as health
 import b301_report as report_mod
 import b301_spend as spend
 

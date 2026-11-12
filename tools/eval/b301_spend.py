@@ -30,7 +30,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-import b301_health as health
+import b301_plan as health
 
 SETTLE_REASONS = ("ok", "cap_timeout", "cap_error", "cap_no_usage")
 DEFAULT_STATE_DIR = Path.home() / ".cache" / "b301-health"

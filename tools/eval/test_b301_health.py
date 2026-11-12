@@ -12,8 +12,9 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-import b301_health as health
+import b301_health as cli
 import b301_health_run as runner
+import b301_plan as health
 
 from orchestrator.multimodal import (
     DispatchingImageResolver,
@@ -115,9 +116,7 @@ def test_probe_needs_documented_prices_accepted_and_asks_70_images_once() -> Non
 def test_run_refuses_a_quote_id_that_does_not_match(
     capsys: pytest.CaptureFixture[str], tmp_path: Path
 ) -> None:
-    code = health.main(
-        ["run", "--quote-id", "000000000000", "--results", str(tmp_path / "r.jsonl")]
-    )
+    code = cli.main(["run", "--quote-id", "000000000000", "--results", str(tmp_path / "r.jsonl")])
 
     assert code == 2
     assert "refused" in capsys.readouterr().err

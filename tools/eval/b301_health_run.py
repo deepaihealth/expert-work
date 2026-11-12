@@ -31,11 +31,10 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-import b301_health as health
 import b301_images as images_mod
+import b301_plan as health
 import b301_report as report_mod
 import b301_spend as spend
-from b301_spend import SpendGuard, SpendLedger, SpendStopError
 from langchain_core.messages import AIMessage, BaseMessage
 
 from expert_work.protocol.multimodal import ImageRef
@@ -60,18 +59,15 @@ if TYPE_CHECKING:
     from expert_work.protocol import StructuredOutputSpec
     from orchestrator.llm.providers._streaming import LLMDelta
 
-__all__ = ["SpendGuard", "SpendLedger", "SpendStopError"]
-
-#: 每家厂商的凭据变量名:先查环境变量,再按顺序查各个 ``--env-file``。默认凭据文件
-#: ``~/.kube/eval-llm.env`` 里有 ``ARK_API_KEY``(豆包)、``GLM_API_KEY``、``DEEPSEEK_API_KEY``;
-#: 通义的 ``HELIX_EVAL_LLM_API_KEY`` 在 ``~/.helix-eval.env``(要用就再加一个 ``--env-file``)。
+#: 每家厂商的凭据变量名:先查环境变量,再按顺序查各个 ``--env-file``(默认文件见
+#: ``b301_health.DEFAULT_ENV_FILE``)。通义的 ``HELIX_EVAL_LLM_API_KEY`` 在 ``~/.helix-eval.env``
+#: (要用就再加一个 ``--env-file``)。
 KEY_VARIABLES: Mapping[str, tuple[str, ...]] = {
     "doubao": ("ARK_API_KEY",),
     "qwen": ("HELIX_EVAL_LLM_API_KEY",),
     "glm": ("GLM_API_KEY",),
     "deepseek": ("DEEPSEEK_API_KEY",),
 }
-DEFAULT_ENV_FILE = Path.home() / ".kube" / "eval-llm.env"
 _TENANT = uuid.UUID("b3010000-0000-4000-8000-000000000001")
 _USER = uuid.UUID("b3010000-0000-4000-8000-000000000002")
 _THREAD = uuid.UUID("b3010000-0000-4000-8000-000000000003")
@@ -132,7 +128,7 @@ class MeteredCaller:
 
     inner: LLMCallable
     model: str
-    guard: SpendGuard
+    guard: spend.SpendGuard
     clock: Callable[[], float] = time.monotonic
 
     async def __call__(
@@ -188,7 +184,7 @@ class MeteredCaller:
         if calls is not None:
             calls.append(call)
         if self.guard.blocked is not None:
-            raise SpendStopError(self.guard.blocked)
+            raise spend.SpendStopError(self.guard.blocked)
         return response
 
     def _failed(
@@ -356,7 +352,7 @@ def _ctx() -> ToolContext:
 class _Runner:
     """一次 run 的工具 / 路由与按条执行。"""
 
-    guard: SpendGuard
+    guard: spend.SpendGuard
     refs: Mapping[str, str]
     by_id: Mapping[str, images_mod.SetImage]
     stamp: Mapping[str, str]
@@ -410,7 +406,7 @@ class _Runner:
                     return None
             else:
                 await self._ask(item, image, record)
-        except SpendStopError:
+        except spend.SpendStopError:
             return None
         finally:
             _CALLS.reset(tokens[0])
@@ -457,7 +453,7 @@ async def run_items(
     items: Sequence[health.Item],
     *,
     image_set: Sequence[images_mod.SetImage],
-    guard: SpendGuard,
+    guard: spend.SpendGuard,
     factory: CallerFactory,
     results: Path,
     stamp: Mapping[str, str],
@@ -589,10 +585,10 @@ async def run_from_quote(
             providers = sorted({health.PROVIDERS[m] for m in [*models, *probe_models]})
             if factory is None:
                 factory = real_callers_factory(load_keys(providers, env_files))
-            guard = SpendGuard(
+            guard = spend.SpendGuard(
                 stop_line=float(q["stop_line_yuan"]),
                 prices=prices,
-                ledger=SpendLedger(ledger_file, plan_id),
+                ledger=spend.SpendLedger(ledger_file, plan_id),
                 settled=spend.ledger_total(ledger_rows),
             )
             planned = health.plan_items(models, probe_models, image_set) if items is None else items

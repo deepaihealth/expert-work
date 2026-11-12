@@ -30,7 +30,8 @@ def test_the_set_is_11_classes_x_3_bases_x_4_turns_plus_4_without_text() -> None
     assert len(image_set) == 136
     assert len({image.image_id for image in image_set}) == 136
     per_class = Counter(image.image_class for image in image_set)
-    assert per_class.pop(images_mod.NO_TEXT_CLASS) == 4
+    without_text = per_class.pop(images_mod.NO_TEXT_CLASS)
+    assert without_text == 4
     assert len(per_class) == 11
     assert set(per_class.values()) == {12}
     assert Counter(image.rotation for image in image_set if image.key is not None) == {
