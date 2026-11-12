@@ -260,9 +260,12 @@ def test_flags_are_recorded_as_a_counter_a_span_and_a_log_without_content(
     metric = "expert_work_outcome_repeat_shadow_total"
     before = _sample(metric, signal="changed_args", action="trip", tool="probe")
     trips_before = _sample("expert_work_outcome_repeat_shadow_trips_total")
+    errors_before = _sample("expert_work_outcome_repeat_shadow_errors_total")
     with caplog.at_level(logging.INFO, logger="orchestrator.graph_builder.outcome_repeat"):
         update = outcome_repeat_update(state, batch)
     assert set(update) == {OUTCOME_REPEATS_KEY}
+    # 检测自己没出错(出错会被吞掉,只有这个计数说得出来)。
+    assert _sample("expert_work_outcome_repeat_shadow_errors_total") == errors_before
     assert _sample(metric, signal="changed_args", action="trip", tool="probe") == before + 1
     assert _sample("expert_work_outcome_repeat_shadow_trips_total") == trips_before + 1
 
@@ -394,7 +397,9 @@ async def test_shadow_mode_changes_nothing_the_model_sees_or_the_run_does(
         for s in ("same_args", "changed_args")
         for a in ("remind", "trip")
     )
+    errors_before = _sample("expert_work_outcome_repeat_shadow_errors_total")
     shadow_final, shadow_llm = await _run_graph()
+    assert _sample("expert_work_outcome_repeat_shadow_errors_total") == errors_before
     after = sum(
         _sample(metric, signal=s, action=a, tool="probe")
         for s in ("same_args", "changed_args")
@@ -507,6 +512,8 @@ async def test_a_failing_hook_leaves_the_run_unchanged(monkeypatch: pytest.Monke
     [
         ("order 123456789012345678 shipped", "order 123456789012345679 shipped"),
         ("snowflake 1859273648102938475 id", "snowflake 1859273648102938476 id"),
+        # 16 / 19 位纯数字是正文(卡号、雪花 ID):微秒 / 纳秒时间戳因此故意不去(LOW-3)。
+        ("card 6222021234567890 ok", "card 6222021234567891 ok"),
         ("popular in the 1990s here", "popular in the 1980s here"),
         ("there are 100s of files", "there are 200s of files"),
         ("version 3 s build", "version 4 s build"),

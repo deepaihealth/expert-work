@@ -2238,8 +2238,9 @@ def build_react_graph(
         # B-302 PR 3 —— 本批真跑过的调用,按 tool_call 顺序,喂给每个文件的两本账。
         file_events: list[FileToolEvent] = []
         # B-302 PR 4 —— 本批真派发过的调用与它的原始结果,喂给结果重复检测(影子模式)。平台
-        # 合成、没真派发的结果不算:审批续跑里扣下的、手抄 URL 守卫拦下的、前置中间件拦下的,
-        # 以及 B-268 拒绝的重复读取(它已经计进打转次数)。
+        # 合成、没真派发的结果不算:审批续跑里扣下的、手抄 URL 守卫拦下的、平台拦下或平台环节
+        # 出错的(``blocked_by_policy``:前置中间件拦截,或派发前的平台环节抛错),以及 B-268
+        # 拒绝的重复读取(它已经计进打转次数)。
         ran_calls: list[tuple[dict[str, Any], ToolMessage]] = []
         for idx in range(len(tool_calls)):
             tool_message, tool_state, refund_inc, classified = results[idx]
