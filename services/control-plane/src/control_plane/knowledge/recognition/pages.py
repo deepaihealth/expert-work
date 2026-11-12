@@ -14,6 +14,10 @@
 
 **渲染**:200 DPI、长边上限 2,000 px(模型声明了像素上限的再按它缩)、JPEG 质量 85。
 
+**方向**(B-301 PR 4):给了方向分类器时,每个判为「要识别」的页再渲一张小图问一次方向,
+结果记在这一页上(:attr:`PdfPage.orientation`);正式渲染按它把页转正(渲染矩阵里转,不是渲完再
+转图)。没转的页与以前逐字节相同。
+
 **插图**(B-209 PR-2)另走一次进程池调用(:mod:`~.figure_pdf`);要描述插图而这份 PDF 原本整份
 解析(没有扫描页)时,用 :func:`pdf_page_texts` 取各页文字、按页拼回(同扫描页)。
 """
@@ -21,14 +25,20 @@
 from __future__ import annotations
 
 import re
-from collections.abc import Sequence
-from dataclasses import dataclass
+from collections.abc import Mapping, Sequence
+from dataclasses import dataclass, replace
 from itertools import pairwise
 
 import pymupdf
 import pymupdf4llm
 
 from control_plane.knowledge.parsing import DocumentParseError, parse_document
+from control_plane.knowledge.recognition.orientation import (
+    FAILED,
+    Orientation,
+    PageClassifier,
+    classify_page,
+)
 from expert_work.protocol import IngestErrorCode, PageDecision, PageReason
 
 #: Signal 1 / hidden text layer — characters (whitespace removed).
@@ -61,7 +71,9 @@ _WHITESPACE = re.compile(r"\s+")
 @dataclass(frozen=True)
 class PdfPage:
     """One page's decision. ``text`` is the page's text-layer Markdown
-    (pymupdf4llm) when it is used, empty for a page sent to recognition."""
+    (pymupdf4llm) when it is used, empty for a page sent to recognition.
+    ``orientation``: what the orientation classifier said about a page sent to
+    recognition (B-301 PR 4; ``None``: not asked)."""
 
     index: int
     decision: PageDecision
@@ -69,6 +81,12 @@ class PdfPage:
     chars: int
     images: int
     text: str = ""
+    orientation: Orientation | None = None
+
+    @property
+    def rotation(self) -> int:
+        """Degrees clockwise the page's content is turned, undone when it is rendered."""
+        return self.orientation.rotation if self.orientation is not None else 0
 
 
 @dataclass(frozen=True)
@@ -85,6 +103,10 @@ class PdfAnalysis:
     def ocr_pages(self) -> tuple[PdfPage, ...]:
         return tuple(page for page in self.pages if page.decision is PageDecision.OCR)
 
+    def rotations(self) -> dict[int, int]:
+        """The turned pages (0-based index → degrees), for rendering them upright."""
+        return {page.index: page.rotation for page in self.pages if page.rotation}
+
 
 def render_params(max_pixels: int | None = None) -> str:
     """The rendering settings as a string — part of the recognition cache key:
@@ -93,8 +115,9 @@ def render_params(max_pixels: int | None = None) -> str:
     return f"dpi={RENDER_DPI};edge={RENDER_MAX_EDGE_PX};jpeg={RENDER_JPEG_QUALITY}{pixels}"
 
 
-def analyse_pdf(filename: str, raw: bytes) -> PdfAnalysis:
-    """Decide every page of a PDF (see module doc).
+def analyse_pdf(filename: str, raw: bytes, classifier: PageClassifier | None = None) -> PdfAnalysis:
+    """Decide every page of a PDF (see module doc); with a ``classifier``, each page
+    to recognize is asked its orientation.
 
     A PDF with no page to recognize parses exactly as before: ``markdown`` is
     :func:`parse_document`'s output, its MarkItDown fallback and its errors
@@ -114,6 +137,8 @@ def analyse_pdf(filename: str, raw: bytes) -> PdfAnalysis:
             return PdfAnalysis(pages=(), markdown=parse_document(filename, raw))
         if not any(page.decision is PageDecision.OCR for page in pages):
             return PdfAnalysis(pages=tuple(pages), markdown=parse_document(filename, raw))
+        if classifier is not None:
+            pages = _oriented(doc, pages, classifier)
         texts = _page_texts(doc, pages)
     finally:
         doc.close()
@@ -161,6 +186,28 @@ def pdf_page_texts(raw: bytes, analysis: PdfAnalysis) -> PdfAnalysis:
     )
 
 
+def _oriented(
+    doc: pymupdf.Document, pages: Sequence[PdfPage], classifier: PageClassifier
+) -> list[PdfPage]:
+    """``pages`` with each page to recognize asked its orientation. The small renders
+    leave their decoded images in PyMuPDF's store (a 47 MiB scanned PDF: +89~105 MiB
+    at the worker's peak, measured 2026-11-12); they are dropped before going on."""
+
+    def asked(page: PdfPage) -> Orientation:
+        try:
+            return classify_page(doc[page.index], classifier)
+        except Exception:  # never fails the document: the page is not turned
+            return FAILED
+
+    try:
+        return [
+            replace(page, orientation=asked(page)) if page.decision is PageDecision.OCR else page
+            for page in pages
+        ]
+    finally:
+        pymupdf.TOOLS.store_shrink(100)
+
+
 def _decide_or_text(doc: pymupdf.Document, index: int) -> PdfPage:
     """:func:`_decide` for one page; a page PyMuPDF cannot inspect is a text
     page (what it was before B-209)."""
@@ -202,11 +249,18 @@ def _plain_text(doc: pymupdf.Document, index: int) -> str:
         return ""
 
 
-def render_pages(raw: bytes, indexes: Sequence[int], max_pixels: int | None = None) -> list[bytes]:
-    """JPEG bytes of the given pages (0-based), in order — see :func:`render_params`."""
+def render_pages(
+    raw: bytes,
+    indexes: Sequence[int],
+    max_pixels: int | None = None,
+    rotations: Mapping[int, int] | None = None,
+) -> list[bytes]:
+    """JPEG bytes of the given pages (0-based), in order — see :func:`render_params`;
+    a page in ``rotations`` (index → degrees its content is turned clockwise) upright."""
+    turns = rotations or {}
     doc = open_pdf(raw)
     try:
-        return [render_page(doc[index], max_pixels) for index in indexes]
+        return [render_page(doc[index], max_pixels, turns.get(index, 0)) for index in indexes]
     finally:
         doc.close()
 
@@ -321,7 +375,9 @@ def _union_area(boxes: Sequence[tuple[float, float, float, float]]) -> float:
     return total
 
 
-def render_page(page: pymupdf.Page, max_pixels: int | None) -> bytes:
+def render_page(page: pymupdf.Page, max_pixels: int | None, rotation: int = 0) -> bytes:
+    """The page as JPEG; ``rotation`` (degrees its content is turned clockwise) is
+    undone in the render matrix. The size limits do not depend on it."""
     zoom = RENDER_DPI / 72
     longest = max(page.rect.width, page.rect.height)
     if longest * zoom > RENDER_MAX_EDGE_PX:
@@ -330,5 +386,8 @@ def render_page(page: pymupdf.Page, max_pixels: int | None) -> bytes:
         pixels = page.rect.width * page.rect.height * zoom * zoom
         if pixels > max_pixels:
             zoom *= (max_pixels / pixels) ** 0.5
-    pixmap = page.get_pixmap(matrix=pymupdf.Matrix(zoom, zoom), alpha=False)
+    matrix = pymupdf.Matrix(zoom, zoom)
+    if rotation:
+        matrix = matrix.prerotate(-rotation)
+    pixmap = page.get_pixmap(matrix=matrix, alpha=False)
     return bytes(pixmap.tobytes("jpeg", jpg_quality=RENDER_JPEG_QUALITY))

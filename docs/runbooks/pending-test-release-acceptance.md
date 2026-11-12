@@ -2554,3 +2554,47 @@ asyncio.run(main())
 - [ ] **114.6 收尾**:删 `acc-b301-orient` 及其会话;本机删掉两张合成图。
 
 **生产**:本 PR 合进去后默认对所有看图模型生效,所以**不随班车上生产,先等 PR 2 体检通过**(体检测在用的三个看图模型:doubao-seed-2-1-pro-260628、doubao-seed-2-1-pro-260915、qwen3.8-max;重点是正放的图 0 张被转)。体检通过后的生产发布:发布后读一次 `/metrics`,有 `expert_work_ask_image_orientation_total` 即说明已装上;出问题时设 `EXPERT_WORK_ASK_IMAGE_ORIENTATION=0` 重启即可回到旧行为。
+
+## §115 知识库扫描页方向小模型(B-301 PR 4,开关默认开)
+
+**背景**:设计 `docs/superpowers/specs/2026-11-11-b301-image-orientation-design.md` §7 / §9.4。PDF 里解析判为「要识别」的页,在逐页判定时(解析进程池里)渲一张短边 256 的小图问一次方向(PP-LCNet_x1_0_doc_ori 官方 ONNX,随包进镜像,文件哈希钉死),**把握 ≥ 0.9** 才把这一页转正再送识别;插图裁剪用同一个角度;转过的页读法带「角度 + 模型文件哈希」,费用预估与实付对齐;没转的页与今天逐字节相同。只对之后新判定的页生效(新入库、重新入库、补识别、预估),已入库的不动;用户上传的照片、工作区图片永远不进小模型。开关 `EXPERT_WORK_KNOWLEDGE_SCAN_PAGE_ORIENTATION` **默认开**(用户 11-12 定),设 `false` 即关。计数器 `expert_work_knowledge_page_orientation_total{rotation}`(问过方向的扫描页,按转了几度,`0` = 没转)与 `expert_work_knowledge_page_orientation_failures_total`(模型加载 / 推理失败、按不转处理的页)。
+
+**怎么进(只在测试环境)**:任一测试租户,建临时知识库 `acc-b301-orient`(识别模型用测试环境平台配置的那个)。测试文件现场合成(零租户内容),在仓库根目录跑,产出 `sideways.pdf`(一页,内容顺时针转了 90 度,没有文字层)和 `upright.pdf`(同一页正放):
+
+```bash
+uv run python - <<'PY'
+import io, pymupdf
+from PIL import Image
+SENTENCE = "第七条 横置扫描页方向校验句 编号B301甲 设备维护记录应保存不少于三年。"
+src = pymupdf.open(); page = src.new_page()
+for i in range(18):
+    page.insert_text((60, 90 + i * 38), SENTENCE if i % 3 == 0 else "本制度适用于全体员工,各部门每季度末完成内部检查并提交书面报告。", fontname="china-s", fontsize=13)
+pix = page.get_pixmap(dpi=150, alpha=False)
+upright = Image.frombytes("RGB", (pix.width, pix.height), pix.samples)
+for name, picture in (("upright.pdf", upright), ("sideways.pdf", upright.rotate(-90, expand=True))):
+    out = io.BytesIO(); picture.save(out, format="JPEG", quality=90)
+    doc = pymupdf.open(); p = doc.new_page(width=picture.width * 72 / 150, height=picture.height * 72 / 150)
+    p.insert_image(p.rect, stream=out.getvalue()); doc.save(name)
+PY
+```
+
+发测试前后各读一次运行入库的那个 control-plane pod 的 `/metrics` 做基数。**花费**:两三页识别,< ¥0.5。
+
+- [ ] **115.0 镜像自检**:判据:这次发布的 control-plane 镜像构建日志里有一行 `orientation model ok: Orientation(angle=…, confidence=…, model='af9a0a4f…', failed=False)`(builder 阶段加载模型、核对哈希、推理一张图;失败则构建失败)。
+- [ ] **115.1 横着的扫描页能搜到**:把 `sideways.pdf` 上传到 `acc-b301-orient`(确认费用预估后入库)。看哪里:文档详情的逐页记录;`/metrics`;知识库检索(调试台 `knowledge_search` 或控制台检索)。判据:第 1 页 `decision=ocr`、`status=recognized`;检索「横置扫描页方向校验句 编号B301甲」能命中这一页的段落,段落文字是正常的中文句子;`expert_work_knowledge_page_orientation_total{rotation="90"}` **+1**,`…_failures_total` 不变。**判据红的情形**:搜不到 / 段落是乱的,或计数落在 `rotation="0"`。
+- [ ] **115.2 识别缓存记了角度**(只读 SQL,把 `<document_id>` 换成 115.1 那份):
+  ```sql
+  SELECT result->'page' AS page, result->'rotation' AS rotation, result->'rotation_confidence' AS confidence
+  FROM knowledge_parse_cache WHERE document_id = '<document_id>' AND kind = 'page_ocr';
+  ```
+  判据:一行,`rotation=90`,`confidence` 在 0.9 ~ 0.95 之间。
+- [ ] **115.3 再估一次价 = 不再收费**:对 115.1 那份点「重新入库」看费用预估。判据:扫描页识别一行「已识别 1 页、需付费 0 页」;确认入库后 `token_usage` 里这份文档没有新的识别用量行。**判据红的情形**:预估说要付费(转过的页的缓存没对上),或预估免费但实际又调了识别模型。
+- [ ] **115.4 开关关掉就搜不到(对照)**:control-plane 设 `EXPERT_WORK_KNOWLEDGE_SCAN_PAGE_ORIENTATION=false`(`kubectl set env`,等滚动完成),把同一个 `sideways.pdf` 改名 `sideways-off.pdf` 上传到同一知识库。判据:检索「编号B301甲」**命中的只有 115.1 那份**,不命中 `sideways-off.pdf`(或命中的段落是乱的);`…_page_orientation_total` 两个标签都不变。做完用 `EXPERT_WORK_KNOWLEDGE_SCAN_PAGE_ORIENTATION-` 去掉这个变量(回到默认开)。**判据红的情形**:关了还能把横着的页读对(开关没生效)。
+- [ ] **115.5 正放的 PDF 不受影响(只读核对)**:先查已有文档没被碰过 —— 在本节任何上传之前跑一次,115.6 之后再跑一次:
+  ```sql
+  SELECT count(*) FROM knowledge_parse_cache WHERE kind = 'page_ocr' AND result ? 'rotation';
+  ```
+  判据:发布后、本节上传前为 **0**;最后只多出本节横着那份的行。再上传 `upright.pdf`:`…_page_orientation_total{rotation="0"}` +1,`rotation="90"` 不变;它的 `page_ocr` 缓存行**没有** `rotation` 键;检索「编号B301甲」能命中它。**判据红的情形**:正放的页被转了(计数落在 90 / 180 / 270),或有存量文档的缓存行出现 `rotation`。
+- [ ] **115.6 收尾**:删除 `acc-b301-orient` 知识库(连同三份文档)。
+
+**生产**:没有单独的验收步骤(生产知识库目前没有 PDF)。发布后读一次生产 control-plane pod 的 `/metrics`:有 `expert_work_knowledge_page_orientation_failures_total` 且为 0 之前不用管;以后出现 `{rotation="90"|"180"|"270"}` 的增长,按设计 §7.6 第 4 项做 D6 确认率(测试环境只读抽样,生产由用户跑同一脚本)。

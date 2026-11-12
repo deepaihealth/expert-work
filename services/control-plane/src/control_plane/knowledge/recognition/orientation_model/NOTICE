@@ -1,0 +1,28 @@
+Document orientation classifier (B-301 PR 4)
+============================================
+
+pp_lcnet_x1_0_doc_ori.onnx is the PP-LCNet_x1_0_doc_ori document image
+orientation classification model by PaddlePaddle (PaddleOCR / PaddleX),
+licensed under the Apache License, Version 2.0 (full text: LICENSE in this
+directory). The licence is stated in the model card front matter
+("license: apache-2.0"); the model repositories carry no LICENSE file of
+their own.
+
+The file is the UNMODIFIED official ONNX export, byte for byte:
+
+  Source       https://huggingface.co/PaddlePaddle/PP-LCNet_x1_0_doc_ori_onnx
+  Commit       7330ab7039123e46af2dc03154b9969aa412c61d
+  Size         6,788,069 bytes
+  SHA-256      af9a0a4f317ff0709ce752067807f819cb15d883f8ecad89f28df1c6ee2d9c92
+  Format       ONNX, opset 7; input "x" (1x3x224x224 float32, RGB, ImageNet
+               mean / std); output: softmax over the labels 0, 90, 180, 270
+
+It was exported from the original Paddle weights:
+
+  Source       https://huggingface.co/PaddlePaddle/PP-LCNet_x1_0_doc_ori
+  Commit       d3b95a6dff5fe8a94f2748e12b61cb26818a0df8
+  inference.pdiparams SHA-256
+               e8d6e7c5d264507e40e58a655779059d616b20d7441ea22047d829eb3931989c
+
+The SHA-256 above is pinned in ../orientation.py: a file that does not match
+is refused at load time.

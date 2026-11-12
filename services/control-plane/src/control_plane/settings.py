@@ -557,6 +557,13 @@ class Settings(BaseSettings):
     #: size only, at about half the ingest embedding cost.
     knowledge_semantic_breaks: bool = True
 
+    #: B-301 PR 4 —— scanned PDF pages are asked their orientation (a small
+    #: classifier in the parse worker) and read turned upright when it is sure
+    #: (confidence ≥ 0.9); off: read as they are. Only new page decisions — an
+    #: ingest, re-ingest or estimate after the switch — follow it. On by default
+    #: (user decision 2026-11-12).
+    knowledge_scan_page_orientation: bool = True
+
     #: Original upload bytes the server holds at once, over every document it
     #: is ingesting (upload path and recovery worker together). A claim holds
     #: its document's bytes for the whole ingest — parsing and every batch of

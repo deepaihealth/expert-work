@@ -1,0 +1,12 @@
+id,content_turned_cw,paddle_angle,paddle_confidence
+doc_form_01,0,0,0.924380
+doc_form_01_r90,90,90,0.925730
+doc_form_01_r180,180,180,0.928230
+doc_form_03_r270,270,270,0.924140
+doc_table_00_r180,180,180,0.914520
+doc_table_03_r90,90,90,0.873880
+doc_vertical_02_r90,90,90,0.898040
+nt_drawing_14,0,0,0.899810
+nt_stamp_blank_21,0,180,0.842600
+nt_poster_09,0,0,0.880570
+nt_map_15,0,180,0.886680

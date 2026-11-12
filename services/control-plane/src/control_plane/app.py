@@ -187,6 +187,7 @@ from control_plane.knowledge.recognition.figure_reconcile import (
     build_figure_reconciler,
 )
 from control_plane.knowledge.recognition.figure_storage import FigureStorage
+from control_plane.knowledge.recognition.orientation import configure_page_orientation
 from control_plane.knowledge.recognition.recognizer import (
     DocumentRecognizer,
     ModelLimits,
@@ -2212,6 +2213,9 @@ def create_app(
                     max_chunks=resolved_settings.knowledge_document_max_chunks,
                 )
                 configure_semantic_breaks(enabled=resolved_settings.knowledge_semantic_breaks)
+                configure_page_orientation(
+                    enabled=resolved_settings.knowledge_scan_page_orientation
+                )
                 configure_raw_bytes(
                     budget=resolved_settings.knowledge_ingest_raw_bytes_budget,
                     upload_max_bytes=resolved_settings.knowledge_document_max_bytes,

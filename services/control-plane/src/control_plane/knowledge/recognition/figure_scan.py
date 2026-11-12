@@ -2,6 +2,7 @@
 
 识别模型(版面解析接口)报出的图片区域(识别器已换算成相对这一页图片的 0~1 坐标),按框从
 这一页的渲染图(与识别时同样的 200 DPI / 长边 2,000 px)裁出来。裁出来的图走同一套单文档过滤。
+识别时转正过的页(B-301 PR 4)按同一个角度转正再裁 —— 框是相对转正后的图给的。
 """
 
 from __future__ import annotations
@@ -28,17 +29,20 @@ def crop_scanned_figures(
     raw: bytes,
     regions: Mapping[int, Sequence[tuple[float, float, float, float]]],
     first_number: int,
+    rotations: Mapping[int, int] | None = None,
 ) -> ScannedFigures:
     """Crop the image regions of recognized scanned pages (page index →
     boxes relative to the page, 0..1), filter them and number the survivors
-    from ``first_number``."""
+    from ``first_number``. A page in ``rotations`` (index → degrees its content
+    is turned clockwise) is rendered upright first, as it was read."""
+    turns = rotations or {}
     doc = open_pdf(raw)
     crops: list[tuple[int, int, figure_images.NormalizedImage, float, int]] = []
     unreadable = 0  # a page that will not render, a box that will not crop
     try:
         for index, boxes in sorted(regions.items()):
             try:
-                rendered = render_page(doc[index], None)
+                rendered = render_page(doc[index], None, turns.get(index, 0))
                 width, height = figure_images.image_size(rendered) or (0, 0)
             except Exception:
                 unreadable += len(boxes)

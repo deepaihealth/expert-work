@@ -95,6 +95,12 @@ ENV TIKTOKEN_CACHE_DIR=/app/tiktoken-cache
 RUN /app/.venv/bin/python -c "import tiktoken; [tiktoken.get_encoding(n) for n in ('o200k_base', 'cl100k_base')]" \
     && test "$(ls /app/tiktoken-cache | wc -l)" -eq 2
 
+# B-301 PR 4 —— 知识库扫描页的方向小模型(ONNX 文件随 control_plane 包装进 venv)。
+# 构建时从装好的包里加载一次(核对钉死的文件哈希、建推理会话)并推理一张图,失败则构建
+# 失败 —— 宁可构建红,也不打出一个模型没打进包、哈希不对或 onnxruntime 跑不动的镜像
+# (运行期失败只会让页不转、静默变差,只有告警计数)。
+RUN /app/.venv/bin/python -c "import numpy as np; from control_plane.knowledge.recognition.orientation import LABELS, OnnxPageClassifier; o = OnnxPageClassifier().classify(np.full((362, 256, 3), 255, np.uint8)); assert o.angle in LABELS and 0.0 <= o.confidence <= 1.0, o; print('orientation model ok:', o)"
+
 
 FROM public.ecr.aws/docker/library/python:3.12-slim-bookworm
 
