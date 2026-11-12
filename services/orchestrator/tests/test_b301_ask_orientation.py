@@ -833,7 +833,8 @@ async def test_a_model_that_always_says_yes_changes_nothing_but_one_call_and_the
         normalise(off, r) for r in off.vision.read_refs
     ]
     meta = dict(with_check.meta)
-    assert meta.pop("orientation")["conclusion"] == "upright"
+    orientation = meta.pop("orientation")
+    assert orientation["conclusion"] == "upright"
     assert normalise(on, meta) == normalise(off, dict(without.meta))
 
 
@@ -1177,7 +1178,7 @@ async def test_a_cancelled_step_two_releases_the_lock_and_the_tile_slots(tmp_pat
 
     look.cancel()
     with pytest.raises(asyncio.CancelledError):
-        await look
+        _ = await look
 
     assert vision._tile_slots()._value == vision.MAX_TILE_CALLS_IN_FLIGHT
     up.vision.orient = _default_orient
