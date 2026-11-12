@@ -23,6 +23,7 @@ import hashlib
 import logging
 import time
 import weakref
+from collections import OrderedDict
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from pathlib import PurePosixPath
@@ -227,6 +228,8 @@ def _tile_slots() -> asyncio.Semaphore:
 
 #: B-301 —— 整张图的框:候选副本 = 对它带角度裁一次(自动缩到约 150 万像素)。
 _FULL_FRAME: Box = (0, 0, 1000, 1000)
+#: B-301 —— 进程内最多记多少条方向结论(每条几百字节;长跑的进程不会越攒越多)。
+ORIENTATION_MEMO_SIZE = 512
 
 AskImageDepth = Literal["quick", "deep"]
 _DEPTHS: tuple[AskImageDepth, ...] = ("quick", "deep")
@@ -367,6 +370,10 @@ class AskImageTool:
     _render_locks: weakref.WeakValueDictionary[tuple[object, str], asyncio.Lock] = field(
         default_factory=weakref.WeakValueDictionary, compare=False, repr=False
     )
+    #: B-301 —— 进程内记下的方向结论,键 ``(run, 这张图的裁图目录)``;见 :meth:`_orient`。
+    _orientation_memo: OrderedDict[tuple[object, str], Orientation] = field(
+        default_factory=OrderedDict, compare=False, repr=False
+    )
 
     @property
     def spec(self) -> ToolSpec:
@@ -468,9 +475,7 @@ class AskImageTool:
         if resolved_from is not None:
             meta["resolved_from"] = resolved_from
         # B-301 —— 先问方向(只对上传图 / 工作区图片,能力开着时);之后整张、横条、区域都按它。
-        # 留给读的时间 = 读那一次今天能拿到的上限(``auto`` 一律快看)。
-        reserve_s = self._limit_s("quick" if region == AUTO_REGION else depth)
-        located = await self._oriented(located, ctx=ctx, reserve_s=reserve_s)
+        located = await self._oriented(located, ctx=ctx)
         if located.orientation is not None:
             meta["orientation"] = located.orientation.meta()
         if region == AUTO_REGION:
@@ -918,14 +923,20 @@ class AskImageTool:
             )
         return RegionRender(crops=tuple(crops))
 
-    async def _oriented(self, located: _Located, *, ctx: ToolContext, reserve_s: float) -> _Located:
+    async def _oriented(self, located: _Located, *, ctx: ToolContext) -> _Located:
         """B-301 —— 读之前定方向(设计 §4.1)。不该问的原样返回;问方向出任何错都按「没问成」、
-        按 0 度往下读 —— 看图绝不因为问方向而失败。``reserve_s`` 是留给读的那一份时间
-        (见 :meth:`_orientation_budget`)。"""
+        按 0 度往下读 —— 看图绝不因为问方向而失败。
+
+        时间:问方向最晚问到 ``orient_until`` = run 的截止时刻减去留给读的那一份
+        (:meth:`_read_reserve_s`,与这次看的深浅无关 —— 排在这把目录锁后面的别的看也靠它);
+        每次调用前按它现算还剩多少(见 :meth:`_orientation_budget`)。"""
         if not self._asks_orientation(located, ctx=ctx):
             return located
+        orient_until = (
+            ctx.deadline_at - self._read_reserve_s() if ctx.deadline_at is not None else None
+        )
         try:
-            return await self._orient(located, ctx=ctx, reserve_s=reserve_s)
+            return await self._orient(located, ctx=ctx, orient_until=orient_until)
         except Exception:
             logger.warning("ask_image.orientation_failed", exc_info=True)
             ask_image_orientation_total.labels(conclusion="not_asked", degrees="0").inc()
@@ -945,23 +956,33 @@ class AskImageTool:
             return WORKSPACE_OVERFLOW_DIR not in PurePosixPath(rel).parts
         return True
 
-    async def _orient(self, located: _Located, *, ctx: ToolContext, reserve_s: float) -> _Located:
-        """本 run 这张图的方向:有缓存用缓存,没有就问。
+    async def _orient(
+        self, located: _Located, *, ctx: ToolContext, orient_until: float | None
+    ) -> _Located:
+        """本 run 这张图的方向:先查进程内的记录,再查缓存文件,都没有才问。
 
         缓存文件与候选副本都在这张图的裁图目录里,并行的 ``ask_image`` 在同一把目录锁上排队,
-        后来的读缓存、不再问。整张看用的副本就是问方向时那张候选(问的时候已经写好),所以
-        **先备好它、最后才写结论**;用缓存的那次不再写任何文件 —— 同一 run 里画面不会中途换。"""
+        后来的不再问。整张看用的副本就是问方向时那张候选(问的时候已经写好),所以**先备好它、
+        最后才写结论**;用记录 / 缓存的那次不再写任何文件。结论在写文件之前先记在进程内
+        (:meth:`_remember`):缓存文件读写偶尔失败也不重问、不换角度 —— 同一 run 里画面不会
+        中途换。文件只在进程内没有记录时(例如这个 run 换了副本)才用得上。"""
         data = (await self.image_resolver.resolve(located.ref)).data
         out_dir = self._crop_dir(data, ctx=ctx)
-        async with self._render_lock((ctx.run_id, out_dir)):
-            orientation = await self._cached_orientation(out_dir, ctx=ctx)
+        key = (ctx.run_id, out_dir)
+        async with self._render_lock(key):
+            orientation = self._remembered(key)
+            if orientation is None:
+                orientation = await self._cached_orientation_or_none(out_dir, ctx=ctx)
+                if orientation is not None:
+                    self._remember(key, orientation)
             if orientation is None:
                 orientation = await self._ask_orientation(
-                    data, out_dir, ctx=ctx, reserve_s=reserve_s
+                    data, out_dir, ctx=ctx, orient_until=orient_until
                 )
                 ask_image_orientation_total.labels(
                     conclusion=orientation.conclusion, degrees=str(orientation.degrees)
                 ).inc()
+                self._remember(key, orientation)
                 await self._store_orientation(out_dir, orientation, ctx=ctx)
         whole_ref = None
         if _reads_a_copy(orientation, data):
@@ -970,31 +991,43 @@ class AskImageTool:
             located, degrees=orientation.degrees, whole_ref=whole_ref, orientation=orientation
         )
 
-    def _orientation_budget(self, ctx: ToolContext, reserve_s: float) -> float | None:
-        """这一轮问方向最多等多久:``orientation_timeout_s``,且 run 的剩余时间里先扣掉留给读的
-        ``reserve_s``(读那一次今天能拿到的上限)。扣完不到 :data:`ORIENTATION_MIN_BUDGET_S`
-        就是 ``None`` —— 不问,读拿到的时间与今天相同。"""
+    def _read_reserve_s(self) -> float:
+        """留给读的时间:一次读最长能用多久。有快看路由时 deep 超时后还会用快看再看一次
+        (B-252),所以是两次之和;与这次看的深浅无关(见 :meth:`_oriented`)。"""
+        if self.quick_vl_caller is not None:
+            return self._limit_s("deep") + self.timeout_s
+        return self.timeout_s
+
+    def _orientation_budget(self, orient_until: float | None) -> float | None:
+        """此刻再问一次方向最多等多久:``orientation_timeout_s``,且不过 ``orient_until``。
+        离 ``orient_until`` 不到 :data:`ORIENTATION_MIN_BUDGET_S` 就是 ``None`` —— 不问。
+        每次调用之前现算(写副本的时间也算进去)。"""
         budget = self.orientation_timeout_s
-        if ctx.deadline_at is not None:
-            spare = ctx.deadline_at - time.monotonic() - reserve_s
+        if orient_until is not None:
+            spare = orient_until - time.monotonic()
             if spare < ORIENTATION_MIN_BUDGET_S:
                 return None
             budget = min(budget, spare)
         return budget
 
     async def _ask_orientation(
-        self, data: bytes, out_dir: str, *, ctx: ToolContext, reserve_s: float
+        self, data: bytes, out_dir: str, *, ctx: ToolContext, orient_until: float | None
     ) -> Orientation:
         """问方向的两步(设计 §4.1)。没时间、候选副本裁不出来、第 1 步没答成 = 没问成(按今天
-        的样子读);第 1 步答 no 之后没时间问第 2 步也是没问成,不对主模型说什么。"""
-        budget = self._orientation_budget(ctx, reserve_s)
-        if budget is None:
+        的样子读);第 1 步答 no 之后没时间问第 2 步也是没问成,不对主模型说什么。
+
+        时间每次调用前现算:写副本(线程里裁 + 写 NAS)不设限时 —— 截断它会留下半张 JPEG ——
+        但它用掉的时间算数,写完已经过了线就不再问。"""
+        if self._orientation_budget(orient_until) is None:
             return Orientation("not_asked", reason="deadline")
         try:
             zero = await self._write_crops(data, out_dir, [_FULL_FRAME], degrees=0, ctx=ctx)
         except Exception:
             logger.warning("ask_image.orientation_candidate_failed", exc_info=True)
             return Orientation("not_asked", reason="no_copy")
+        budget = self._orientation_budget(orient_until)
+        if budget is None:
+            return Orientation("not_asked", reason="deadline")
         first, first_model = await self._orientation_answer(zero.crops[0].ref, budget, ctx=ctx)
         answers: dict[str, Answer] = {"0": first}
         models: dict[str, str | None] = {"0": first_model}
@@ -1003,9 +1036,9 @@ class AskImageTool:
             return Orientation(conclusion, 0, answers, models, "no_answer", extra_calls=1)
         if conclusion is not None:
             return Orientation(conclusion, 0, answers, models, extra_calls=1)
-        budget = self._orientation_budget(ctx, reserve_s)
-        if budget is None:
-            return Orientation("not_asked", 0, answers, models, "deadline", extra_calls=1)
+        out_of_time = Orientation("not_asked", 0, answers, models, "deadline", extra_calls=1)
+        if self._orientation_budget(orient_until) is None:
+            return out_of_time
         try:
             turned = [
                 (await self._write_crops(data, out_dir, [_FULL_FRAME], degrees=turn, ctx=ctx))
@@ -1016,6 +1049,9 @@ class AskImageTool:
         except Exception:
             logger.warning("ask_image.orientation_candidate_failed", exc_info=True)
             return Orientation("undetermined", 0, answers, models, extra_calls=1)
+        budget = self._orientation_budget(orient_until)
+        if budget is None:
+            return out_of_time
         replies = await asyncio.gather(
             *(self._orientation_answer(ref, budget, ctx=ctx) for ref in turned)
         )
@@ -1061,6 +1097,31 @@ class AskImageTool:
         if self.output_cap_resolver is not None:
             return self.output_cap_resolver(response)[1] or None
         return self.vl_model_name or None
+
+    async def _cached_orientation_or_none(
+        self, out_dir: str, *, ctx: ToolContext
+    ) -> Orientation | None:
+        """缓存文件里的结论;读不出来(NAS 抖一下……)当没有,记日志。"""
+        try:
+            return await self._cached_orientation(out_dir, ctx=ctx)
+        except Exception:
+            logger.warning("ask_image.orientation_cache_read_failed", exc_info=True)
+            return None
+
+    def _remembered(self, key: tuple[object, str]) -> Orientation | None:
+        """进程内记下的本 run 这张图的结论(用它时按「来自缓存、没多花调用」报)。"""
+        orientation = self._orientation_memo.get(key)
+        if orientation is None:
+            return None
+        self._orientation_memo.move_to_end(key)
+        return replace(orientation, from_cache=True, extra_calls=0)
+
+    def _remember(self, key: tuple[object, str], orientation: Orientation) -> None:
+        """记下结论;最多 :data:`ORIENTATION_MEMO_SIZE` 条,最久没用的先挤出去。"""
+        self._orientation_memo[key] = orientation
+        self._orientation_memo.move_to_end(key)
+        while len(self._orientation_memo) > ORIENTATION_MEMO_SIZE:
+            self._orientation_memo.popitem(last=False)
 
     async def _cached_orientation(self, out_dir: str, *, ctx: ToolContext) -> Orientation | None:
         store = self.workspace_store

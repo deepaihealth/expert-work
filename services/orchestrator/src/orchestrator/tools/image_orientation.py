@@ -171,7 +171,7 @@ class Orientation:
         if degrees not in (0, *TURNS) or (degrees != 0) != (conclusion == "rotated"):
             return None
         answers = _checked_answers(payload.get("answers"))
-        models = _checked_models(payload.get("models"))
+        models = _checked_models(payload["models"] if "models" in payload else _old_models(payload))
         raw_reason = payload.get("reason")
         reason = _REASONS.get(raw_reason) if isinstance(raw_reason, str) else None
         if answers is None or models is None or (raw_reason is not None and reason is None):
@@ -189,6 +189,17 @@ def _checked_answers(raw: object) -> dict[str, Answer] | None:
             return None
         checked[key] = answer
     return checked
+
+
+def _old_models(payload: Mapping[str, object]) -> object:
+    """上一版写的缓存只有一个 ``model``(回答第 1 步的模型),没有 ``models`` / ``reason``:
+    跨一次发布的 run 照样认,``model`` 记成 0 度那一项。两样都没有就不是合法的缓存。"""
+    if "model" not in payload:
+        return None
+    model = payload["model"]
+    if model is None:
+        return {}
+    return {"0": model}
 
 
 def _checked_models(raw: object) -> dict[str, str | None] | None:

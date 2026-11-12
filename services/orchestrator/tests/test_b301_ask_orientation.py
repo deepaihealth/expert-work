@@ -41,6 +41,7 @@ from orchestrator.tools.image_orientation import (
     ORIENTATION_ENV,
     ORIENTATION_MIN_BUDGET_S,
     ORIENTATION_QUESTION,
+    TURNS,
     ask_image_orientation_off_topic_total,
     ask_image_orientation_total,
 )
@@ -1059,10 +1060,12 @@ async def test_time_for_step_one_but_not_step_two_reads_at_zero_without_a_note(
     tmp_path: Path,
 ) -> None:
     """M1 —— 第 1 步问完时剩的时间不够第 2 步:按 0 度读,记「没问成(deadline)」,不加任何说明。"""
-    # 读的上限 1 秒;开问时多出下限 0.5 秒,第 1 步答 no 用掉 0.8 秒,剩下的不够第 2 步。
-    up = _setup(tmp_path, _stored(90), orient=_slow(0.8, 30.0), timeout_s=1.0)
+    # 留给读 6 秒(没有快看路由时就是读的上限);开问时比下限多 2.5 秒,第 1 步答 no 用掉
+    # 4.5 秒(比读的上限少 1.5 秒,不会被它截断),之后比下限少 2 秒 —— 每一侧都留了秒级余量,
+    # xdist 下一次 GC 停顿翻不了结论。
+    up = _setup(tmp_path, _stored(90), orient=_slow(4.5, 30.0), timeout_s=6.0)
     up.tool = dataclasses.replace(up.tool, orientation_timeout_s=30.0)
-    _with_deadline(up, 1.0 + ORIENTATION_MIN_BUDGET_S + 0.5)
+    _with_deadline(up, 6.0 + ORIENTATION_MIN_BUDGET_S + 2.5)
 
     result = await up.look(image_ref=up.ref)
     again = await up.look(image_ref=up.ref)
@@ -1108,60 +1111,6 @@ async def test_an_exif_image_too_large_to_copy_is_not_asked_once_per_run(
     assert all(m["conclusion"] == "not_asked" for m in metas)
     assert up.vision.orientation_refs == []
     assert up.vision.read_refs == [original] * 3
-
-
-@dataclass
-class _RecordingStore(NasWorkspaceStore):
-    """记下每次写的路径(按先后)。"""
-
-    writes: list[str] = field(default_factory=list)
-
-    async def write_file(self, *, tenant_id: UUID, user_id: UUID, path: str, data: bytes) -> None:
-        self.writes.append(path)
-        await super().write_file(tenant_id=tenant_id, user_id=user_id, path=path, data=data)
-
-
-async def test_the_decision_is_cached_only_after_the_whole_image_copy_exists(
-    tmp_path: Path,
-) -> None:
-    """L2 —— 先备好整张看的副本,最后才写结论;之后这次 run 里不再为它写任何文件。"""
-    up = _setup(tmp_path, _stored(90))
-    store = _RecordingStore(root=str(up.root))
-    tool = dataclasses.replace(up.tool, workspace_store=store)
-
-    first = await tool.call({"image_ref": up.ref, "question": "q"}, ctx=up.ctx)
-    written = list(store.writes)
-    second = await tool.call({"image_ref": up.ref, "question": "q"}, ctx=up.ctx)
-
-    assert written[-1].endswith("/orientation.json")
-    assert any(path.endswith(f"/r90/{_FULL}") for path in written[:-1])
-    assert store.writes == written  # 用缓存的那次一个文件都不写
-    assert first.content.startswith(SECRET) and second.content.startswith(SECRET)
-    assert up.vision.read_refs[0] == up.vision.read_refs[1]
-
-
-@dataclass
-class _NoWrites(NasWorkspaceStore):
-    """不许写任何文件(读、列目录照常)。"""
-
-    async def write_file(self, *, tenant_id: UUID, user_id: UUID, path: str, data: bytes) -> None:
-        msg = "the workspace is read-only right now"
-        raise OSError(msg)
-
-
-async def test_a_cached_turn_survives_failing_writes_and_keeps_the_frame(tmp_path: Path) -> None:
-    """L2 —— 结论已缓存为转 90 度之后写文件坏了:之后的整张看仍按 90 度(同一个副本),不退回 0 度。"""
-    up = _setup(tmp_path, _stored(90))
-    first = await up.look(image_ref=up.ref)
-    broken = dataclasses.replace(up.tool, workspace_store=_NoWrites(root=str(up.root)))
-
-    second = await broken.call({"image_ref": up.ref, "question": "q"}, ctx=up.ctx)
-
-    assert second.meta["orientation"]["degrees"] == 90
-    assert second.meta["orientation"]["from_cache"] is True
-    assert second.content.startswith(SECRET)
-    assert up.vision.read_refs[1] == up.vision.read_refs[0]
-    assert first.meta["orientation"]["degrees"] == 90
 
 
 @dataclass
@@ -1292,3 +1241,279 @@ async def test_each_direction_records_the_model_that_answered_it(tmp_path: Path)
     }
     assert orientation["answers"]["180"] == "off_topic"
     assert counter._value.get() == before + 1
+
+
+# ---------------------------------------------------------------------------
+# 审查回修第 2 轮(409e41f46 之后)
+# ---------------------------------------------------------------------------
+
+
+class _Route:
+    """快看路由替身:问方向等 ``orient_s`` 秒再答,读等 ``read_s`` 秒再答。"""
+
+    def __init__(self, resolver: ImageResolver, *, orient_s: float, read_s: float) -> None:
+        self.resolver, self.orient_s, self.read_s = resolver, orient_s, read_s
+        self.questions: list[str] = []
+
+    async def __call__(self, *, messages: Sequence[BaseMessage], tools: Sequence[Any]) -> AIMessage:
+        question, ref = _sent(messages)
+        self.questions.append(question)
+        image = _decode((await self.resolver.resolve(ref)).data)
+        if question == ORIENTATION_QUESTION:
+            await asyncio.sleep(self.orient_s)
+            return AIMessage(content=await _default_orient(ref, image))
+        await asyncio.sleep(self.read_s)
+        return AIMessage(content="quick read")
+
+
+class _Hangs:
+    async def __call__(self, *, messages: Sequence[BaseMessage], tools: Sequence[Any]) -> AIMessage:
+        await asyncio.sleep(3600)
+        raise AssertionError
+
+
+class _Instant:
+    async def __call__(self, *, messages: Sequence[BaseMessage], tools: Sequence[Any]) -> AIMessage:
+        return AIMessage(content="deep read")
+
+
+def _two_routes(up: _Setup, quick: Any, deep: Any) -> AskImageTool:
+    """快看上限 4 秒、deep 上限 1 秒(超时后改用快看再看一次):读最长要 5 秒。"""
+    return AskImageTool(
+        vl_caller=deep,
+        quick_vl_caller=quick,
+        image_resolver=up.resolver,
+        workspace_store=up.tool.workspace_store,
+        ask_orientation=True,
+        timeout_s=4.0,
+        deep_timeout_s=1.0,
+        orientation_timeout_s=30.0,
+    )
+
+
+async def test_the_reserve_covers_a_deep_look_that_falls_back_to_the_quick_look(
+    tmp_path: Path,
+) -> None:
+    """M1 —— deep 超时后改用快看再看一次(B-252):留给读的时间要够这两次。只留 deep 那一次的
+    话,问方向吃掉的正是快看重看要用的时间,读就失败了。"""
+    up = _setup(tmp_path, _stored(0))
+    quick = _Route(up.resolver, orient_s=3.8, read_s=3.5)
+    tool = _two_routes(up, quick, _Hangs())
+    _with_deadline(up, 1.0 + 6.0)
+
+    result = await tool.call({"image_ref": up.ref, "question": "q", "depth": "deep"}, ctx=up.ctx)
+
+    assert "quick read" in result.content
+    assert ORIENTATION_QUESTION not in quick.questions
+    assert result.meta["orientation"]["reason"] == "deadline"
+
+
+async def test_a_quick_look_waiting_behind_a_deep_look_keeps_its_time(tmp_path: Path) -> None:
+    """M1 —— deep 看在问方向时占着这张图的目录锁,并行的快看排在后面:留给读的时间与深浅无关,
+    排队的快看拿到的时间与今天相同。"""
+    up = _setup(tmp_path, _stored(0))
+    quick = _Route(up.resolver, orient_s=3.8, read_s=3.5)
+    tool = _two_routes(up, quick, _Instant())
+    _with_deadline(up, 1.0 + 6.0)
+
+    deep = asyncio.create_task(
+        tool.call({"image_ref": up.ref, "question": "q", "depth": "deep"}, ctx=up.ctx)
+    )
+    await asyncio.sleep(0.05)
+    fast = asyncio.create_task(tool.call({"image_ref": up.ref, "question": "q2"}, ctx=up.ctx))
+    deep_result, quick_result = await asyncio.gather(deep, fast)
+
+    assert deep_result.content == "deep read"
+    assert quick_result.content == "quick read"
+    assert ORIENTATION_QUESTION not in quick.questions
+
+
+async def test_time_spent_writing_the_turned_copies_counts_against_the_budget(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """M2 —— 写三张转过的副本也算问方向的时间:写完已经过了「留给读之前、再留下限」的那一刻,
+    就不问第 2 步,按 0 度读、不加说明。写副本本身不被截断(不留半张 JPEG)。"""
+    real = vision._crop_in_thread
+
+    async def slow(data: bytes, boxes: Sequence[Any], degrees: int) -> Any:
+        if degrees:
+            await asyncio.sleep(1.0)
+        return await real(data, boxes, degrees)
+
+    monkeypatch.setattr(vision, "_crop_in_thread", slow)
+    # 留给读 1 秒;开问时比下限多 1.5 秒;第 1 步立即答 no,写三张副本用掉 3 秒,之后比下限少 1.5 秒。
+    up = _setup(tmp_path, _stored(90), orient=_orient_by_dir({}), timeout_s=1.0)
+    up.tool = dataclasses.replace(up.tool, orientation_timeout_s=30.0)
+    _with_deadline(up, 1.0 + ORIENTATION_MIN_BUDGET_S + 1.5)
+
+    result = await up.look(image_ref=up.ref)
+
+    orientation = result.meta["orientation"]
+    assert (orientation["conclusion"], orientation["reason"]) == ("not_asked", "deadline")
+    assert orientation["answers"] == {"0": "no"}
+    assert len(up.vision.orientation_refs) == 1  # 第 2 步一次都没问
+    assert result.content == WRONG
+    for turn in TURNS:  # 副本都写完整了
+        copy = up.path_of(up.vision.orientation_refs[0]).parent / f"r{turn}" / _FULL
+        assert _decode(copy.read_bytes()).size == _stored(90).transpose(_CLOCKWISE[turn]).size
+
+
+async def test_time_spent_writing_the_first_copy_counts_against_the_budget(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """M2 —— 第 1 步那张 0 度副本写得慢,写完已经过线:一次都不问,按今天的样子读。"""
+    real = vision._crop_in_thread
+
+    async def slow(data: bytes, boxes: Sequence[Any], degrees: int) -> Any:
+        await asyncio.sleep(3.0)
+        return await real(data, boxes, degrees)
+
+    monkeypatch.setattr(vision, "_crop_in_thread", slow)
+    # 留给读 1 秒;开问时比下限多 1.5 秒,写 0 度副本用掉 3 秒,之后比下限少 1.5 秒。
+    up = _setup(tmp_path, _stored(90), timeout_s=1.0)
+    up.tool = dataclasses.replace(up.tool, orientation_timeout_s=30.0)
+    _with_deadline(up, 1.0 + ORIENTATION_MIN_BUDGET_S + 1.5)
+
+    result = await up.look(image_ref=up.ref)
+
+    orientation = result.meta["orientation"]
+    assert (orientation["conclusion"], orientation["reason"]) == ("not_asked", "deadline")
+    assert up.vision.orientation_refs == []
+    assert result.content == WRONG
+    assert up.vision.read_refs == [up.ref]
+
+
+class _CacheReadFailsOnce(NasWorkspaceStore):
+    """读 ``orientation.json`` 第一次失败(NAS 抖一下)。"""
+
+    failures = 1
+
+    async def read_file(self, **kwargs: Any) -> bytes:
+        if str(kwargs.get("path", "")).endswith("/orientation.json") and self.failures:
+            self.failures -= 1
+            msg = "transient NAS read error"
+            raise OSError(msg)
+        return await super().read_file(**kwargs)
+
+
+async def test_a_transient_cache_read_error_does_not_change_the_frame(tmp_path: Path) -> None:
+    """L1 —— 同一 run 里的结论先记在进程内,缓存文件读坏一次也不改角度、不重问。"""
+    up = _setup(tmp_path, _stored(90))
+    tool = dataclasses.replace(up.tool, workspace_store=_CacheReadFailsOnce(root=str(up.root)))
+
+    results = [
+        await tool.call({"image_ref": up.ref, "question": "q"}, ctx=up.ctx) for _ in range(3)
+    ]
+
+    assert [r.meta["orientation"]["degrees"] for r in results] == [90, 90, 90]
+    assert [r.meta["orientation"]["from_cache"] for r in results] == [False, True, True]
+    assert len(up.vision.orientation_refs) == 4
+
+
+async def test_a_bug_inside_the_orientation_step_still_reads(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """兜底:问方向这一步自己抛了没想到的错,看图照常(按今天的样子),记「没问成(error)」。"""
+
+    async def broken(*_args: Any, **_kwargs: Any) -> Any:
+        msg = "unexpected"
+        raise RuntimeError(msg)
+
+    monkeypatch.setattr(AskImageTool, "_ask_orientation", broken)
+    up = _setup(tmp_path, _stored(90))
+    before = _counter("not_asked", 0)
+
+    result = await up.look(image_ref=up.ref)
+
+    assert result.content == WRONG
+    assert up.vision.read_refs == [up.ref]
+    assert (result.meta["orientation"]["conclusion"], result.meta["orientation"]["reason"]) == (
+        "not_asked",
+        "error",
+    )
+    assert _counter("not_asked", 0) == before + 1
+
+
+async def test_another_process_that_cannot_read_the_cache_file_decides_once_and_sticks(
+    tmp_path: Path,
+) -> None:
+    """L1 —— 进程内没有记录(这个 run 的后一次看落到了另一个副本)、缓存文件又读坏一次:当没有缓存,
+    自己问一次并记下;之后在这个进程里一直按它,不会这一次「没问成」、下一次又按文件转。"""
+    up = _setup(tmp_path, _stored(90))
+    await up.look(image_ref=up.ref)
+    other = AskImageTool(
+        vl_caller=up.vision,
+        image_resolver=up.resolver,
+        workspace_store=_CacheReadFailsOnce(root=str(up.root)),
+        ask_orientation=True,
+    )
+
+    results = [
+        await other.call({"image_ref": up.ref, "question": "q"}, ctx=up.ctx) for _ in range(2)
+    ]
+
+    assert [r.meta["orientation"]["conclusion"] for r in results] == ["rotated", "rotated"]
+    assert [r.meta["orientation"]["degrees"] for r in results] == [90, 90]
+    assert [r.meta["orientation"]["from_cache"] for r in results] == [False, True]
+
+
+class _CacheWriteFails(NasWorkspaceStore):
+    async def write_file(self, **kwargs: Any) -> None:
+        if str(kwargs.get("path", "")).endswith("/orientation.json"):
+            msg = "cache write failed"
+            raise OSError(msg)
+        await super().write_file(**kwargs)
+
+
+async def test_a_failed_cache_write_neither_re_asks_nor_changes_the_frame(tmp_path: Path) -> None:
+    """L1 —— 缓存文件写不进去:同一 run 里不重问(重问时模型可能改口,画面就换了)。"""
+    first_asks = {"n": 0}
+
+    async def orient(ref: str, image: Image.Image) -> str:
+        if "/r" not in ref.rsplit("/crops/", 1)[1]:
+            first_asks["n"] += 1
+            if first_asks["n"] > 1:
+                return "yes"  # 再问一次就改口
+        return await _default_orient(ref, image)
+
+    up = _setup(tmp_path, _stored(90), orient=orient)
+    tool = dataclasses.replace(up.tool, workspace_store=_CacheWriteFails(root=str(up.root)))
+
+    results = [
+        await tool.call({"image_ref": up.ref, "question": "q"}, ctx=up.ctx) for _ in range(2)
+    ]
+
+    assert [r.meta["orientation"]["degrees"] for r in results] == [90, 90]
+    assert first_asks["n"] == 1
+
+
+def test_the_in_process_memo_is_bounded() -> None:
+    tool = AskImageTool(vl_caller=_Instant(), image_resolver=InMemoryImageResolver())
+    decided = image_orientation.Orientation("upright", 0, {"0": "yes"}, {"0": "vl"})
+    for index in range(vision.ORIENTATION_MEMO_SIZE + 50):
+        tool._remember(("run", f"dir-{index}"), decided)
+
+    assert len(tool._orientation_memo) == vision.ORIENTATION_MEMO_SIZE
+    assert tool._remembered(("run", "dir-0")) is None  # 最早的被挤出去了
+    newest = tool._remembered(("run", f"dir-{vision.ORIENTATION_MEMO_SIZE + 49}"))
+    assert newest is not None and newest.from_cache is True and newest.extra_calls == 0
+
+
+def test_a_cache_entry_written_by_the_previous_version_is_still_read() -> None:
+    """L4 —— 跨一次发布的 run:旧版本写的缓存(只有 ``model``、没有 ``models`` /
+    ``reason``)照样认。"""
+    raw = (
+        b'{"answers": {"0": "no", "90": "yes", "180": "no", "270": "no"}, '
+        b'"conclusion": "rotated", "degrees": 90, "model": "vl"}'
+    )
+
+    back = image_orientation.Orientation.from_cache_bytes(raw)
+
+    assert back is not None
+    assert (back.conclusion, back.degrees, back.reason) == ("rotated", 90, None)
+    assert dict(back.models) == {"0": "vl"}
+    old_none = (
+        b'{"answers": {"0": "timeout"}, "conclusion": "not_asked", "degrees": 0, "model": null}'
+    )
+    restored = image_orientation.Orientation.from_cache_bytes(old_none)
+    assert restored is not None and dict(restored.models) == {}
