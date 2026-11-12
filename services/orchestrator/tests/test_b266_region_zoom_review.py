@@ -207,14 +207,14 @@ class _CropSpy:
     calls: int = 0
     lock: threading.Lock = field(default_factory=threading.Lock)
 
-    def __call__(self, data: bytes, boxes: Sequence[region_zoom.Box]) -> Any:
+    def __call__(self, data: bytes, boxes: Sequence[region_zoom.Box], degrees: int = 0) -> Any:
         with self.lock:
             self.active += 1
             self.calls += 1
             self.peak = max(self.peak, self.active)
         time.sleep(0.05)
         try:
-            return crop_image(data, boxes)
+            return crop_image(data, boxes, degrees)
         finally:
             with self.lock:
                 self.active -= 1

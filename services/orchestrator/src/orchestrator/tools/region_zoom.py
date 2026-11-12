@@ -250,6 +250,21 @@ _UPRIGHT_METHODS: Final[dict[int, Image.Transpose]] = {
     7: Image.Transpose.TRANSVERSE,
     8: Image.Transpose.ROTATE_90,
 }
+#: B-301 —— 顺时针多转的角度(转正之后再转)。
+ROTATIONS: Final = (0, 90, 180, 270)
+#: B-301 —— 方向标记 + 转正之后再顺时针转 ``d`` 度 = 另一个方向标记:``_TURNED[标记][d // 90]``。
+#: 方向标记的 8 个值连同四个角度的旋转构成同一个群(正方形的对称群),合成之后仍是这 8 个值之一;
+#: 这张表由 Pillow 的 ``transpose`` 逐个对出来,测试对 8 x 4 种组合逐像素钉住。
+_TURNED: Final[dict[int, tuple[int, int, int, int]]] = {
+    1: (1, 6, 3, 8),
+    2: (2, 7, 4, 5),
+    3: (3, 8, 1, 6),
+    4: (4, 5, 2, 7),
+    5: (5, 2, 7, 4),
+    6: (6, 3, 8, 1),
+    7: (7, 4, 5, 2),
+    8: (8, 1, 6, 3),
+}
 #: 打开模型 / 用户给的字节时只认上传白名单这几种格式:别让 Pillow 按魔数去试 TIFF / PSD
 #: 之类别的解码器。手机的多图 JPEG(MPO)由 "JPEG" 这一项打开(Pillow 没有单独的 "MPO"
 #: 打开项,写进来反而 ``KeyError``)。
@@ -262,16 +277,34 @@ _JPEG_DRAFT_SCALES: Final = (8, 4, 2)
 HOST_CROP_SLOTS: Final = 2
 
 
-def image_size(data: bytes) -> tuple[int, int] | None:
-    """图片转正之后的像素尺寸(只读文件头,不解码);认不出来是 ``None``。"""
+def turned_orientation(orientation: int, degrees: int) -> int:
+    """B-301 —— 按方向标记 ``orientation`` 转正、再顺时针转 ``degrees`` 度,合成一个方向值。"""
+    if degrees not in ROTATIONS:
+        msg = f"degrees must be one of {ROTATIONS}, got {degrees!r}"
+        raise ValueError(msg)
+    return _TURNED[orientation][degrees // 90]
+
+
+def image_size(data: bytes, degrees: int = 0) -> tuple[int, int] | None:
+    """图片转正(B-301:再顺时针转 ``degrees`` 度)之后的像素尺寸(只读文件头,不解码);
+    认不出来是 ``None``。"""
     try:
         with Image.open(io.BytesIO(data), formats=OPEN_FORMATS) as image:
             width, height = image.size
-            if _orientation(image) in _SWAPPED_ORIENTATIONS:
+            if turned_orientation(_orientation(image), degrees) in _SWAPPED_ORIENTATIONS:
                 return height, width
             return width, height
     except (UnidentifiedImageError, OSError, ValueError, Image.DecompressionBombError):
         return None
+
+
+def exif_orientation(data: bytes) -> int:
+    """B-301 —— 图片自带的方向标记(只读文件头);没有、认不出来都是 1(不用转)。"""
+    try:
+        with Image.open(io.BytesIO(data), formats=OPEN_FORMATS) as image:
+            return _orientation(image)
+    except (UnidentifiedImageError, OSError, ValueError, Image.DecompressionBombError):
+        return 1
 
 
 @dataclass(frozen=True)
@@ -281,8 +314,11 @@ class CroppedImage:
     height: int
 
 
-def crop_image(data: bytes, boxes: Sequence[Box]) -> list[CroppedImage]:
+def crop_image(data: bytes, boxes: Sequence[Box], degrees: int = 0) -> list[CroppedImage]:
     """按原像素裁出每个框(不放大;超过约 1.5 百万像素的缩到那个量),存成 JPEG。
+
+    B-301 —— ``degrees``:按方向标记转正之后再顺时针转这么多度,框是转完之后那张图上的坐标。
+    与方向标记合成一个方向值(:func:`turned_orientation`),所以仍然只转裁下来的那一块。
 
     省内存(一张 6000 万像素的 RGBA PNG 整张转一次就是几百 MB):
     * 进程内最多 :data:`HOST_CROP_SLOTS` 张同时在裁(闸在调用方);
@@ -295,7 +331,7 @@ def crop_image(data: bytes, boxes: Sequence[Box]) -> list[CroppedImage]:
     """
     try:
         with Image.open(io.BytesIO(data), formats=OPEN_FORMATS) as image:
-            return _crop_open_image(image, boxes)
+            return _crop_open_image(image, boxes, degrees)
     except RegionImageError:
         raise
     except (UnidentifiedImageError, OSError, Image.DecompressionBombError) as exc:
@@ -303,7 +339,7 @@ def crop_image(data: bytes, boxes: Sequence[Box]) -> list[CroppedImage]:
         raise RegionImageError(msg) from exc
 
 
-def _crop_open_image(image: Image.Image, boxes: Sequence[Box]) -> list[CroppedImage]:
+def _crop_open_image(image: Image.Image, boxes: Sequence[Box], degrees: int) -> list[CroppedImage]:
     width, height = image.size
     if width * height > MAX_DECODE_PIXELS:
         msg = (
@@ -311,7 +347,7 @@ def _crop_open_image(image: Image.Image, boxes: Sequence[Box]) -> list[CroppedIm
             "limit for cropping"
         )
         raise RegionImageError(msg)
-    orientation = _orientation(image)
+    orientation = turned_orientation(_orientation(image), degrees)
     if isinstance(image, JpegImageFile):
         scale = _draft_scale((width, height), boxes)
         if scale > 1:
