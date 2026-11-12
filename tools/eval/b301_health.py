@@ -11,7 +11,7 @@
     python tools/eval/b301_health.py quote [--with-qwen] [--with-probe --accept-documented-prices]
                                            [--stop-line 元]
     python tools/eval/b301_health.py run --quote-id <quote 打印的编号> --results OUT.jsonl
-                                         [与 quote 相同的开关] [--env-file ~/.helix-eval.env]
+                                         [与 quote 相同的开关] [--env-file F ...]
     python tools/eval/b301_health.py report --results OUT.jsonl
     python tools/eval/b301_images.py OUT_DIR       # 把图集写成文件,人工抽看(不花钱)
 
@@ -21,15 +21,19 @@
    止损线、硬上限和 ``quote_id``。价目表里查不到、又不在「同档」表里的模型直接拒(fail-stop)。
 2. 把报价交用户批。批了再 ``run``:``--quote-id`` 必须等于在**同一台机器、同样开关**下现算的编号
    (图集字节、模型、单价、止损线任一变了编号就变,旧批准不作数)。
-3. 凭据只从环境变量或 ``--env-file``(进程内解析,不 echo、不进 argv)取,变量名见
-   ``b301_health_run.KEY_VARIABLES``;豆包是 ``EXPERT_WORK_EVAL_DOUBAO_API_KEY``。缺哪个就报变量名、
-   不开跑。
-4. ``run`` 每次调用之前判止损线;过线、遇到没有用量的回答、单次输入超上限、或厂商返回超时以外的
-   任何错误,都立刻停下(不再发新调用),已在飞的最多「每家 2 个 ``ask_image`` x 每个最多 3 个并行
-   调用」。结果按条追加进 JSONL,断了再跑同一条命令接着跑(已花的钱计入止损线)。
-5. ``report``:按 §9.2 出各线和每个模型的结论。**通过 = 数据齐 + L1'(正放 33 + 无文字 4 张 0 张被转、
-   「判不出」≤ 3)+ L6(超时 + 答非所问 + 出错 ≤ 5%)**;L1 / L2 照常报数,不挡发布,任何一类
-   「变差」标出来交用户定。
+3. 凭据只从环境变量或 ``--env-file``(可给多个,默认 ``~/.kube/eval-llm.env``;进程内解析,不 echo、
+   不进 argv)取,变量名见 ``b301_health_run.KEY_VARIABLES``:豆包 ``ARK_API_KEY``;通义的
+   ``HELIX_EVAL_LLM_API_KEY`` 在 ``~/.helix-eval.env``(``--with-qwen`` 时再加一个 ``--env-file``)。
+   缺哪个就只报变量名、不开跑。
+4. ``run`` 每次调用之前判止损线,并按单次上限预留、写进花费账本 ``OUT.spend.jsonl``(落盘后才发),
+   调用后结算;过线、用量不可信的回答、单次输入超上限、厂商返回超时以外的任何错误,都立刻停下
+   (不再发新调用),已在飞的最多「每家 2 个 ``ask_image`` x 每个最多 3 个并行调用」。结果文件只放
+   跑完的条目;同一条命令再跑接着跑,止损线从**账本合计**起算(作废的、出错的、崩溃时在飞的调用都
+   算,没结算的按上限)。同一个结果文件同一时间只许一个 run(``OUT.lock``)。
+5. ``report``(:mod:`b301_report`):按 §9.2 出各线和每个模型的结论。**通过 = 数据齐 + L1'(正放
+   33 + 无文字 4 张 0 张被转、「判不出」≤ 3)+ L6(超时 + 答非所问 ≤ 5%)**;厂商出错而停的次数从
+   账本单独报;L1 / L2 照常报数(L2 严格 / 宽松并列,按类结论用严格),不挡发布,任何一类「变差」
+   标出来交用户定。
 """
 
 from __future__ import annotations
@@ -39,10 +43,7 @@ import ast
 import hashlib
 import json
 import math
-import re
-import statistics
 import sys
-import unicodedata
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -55,15 +56,7 @@ if str(_HERE) not in sys.path:
 import b301_images as images_mod  # noqa: E402
 
 from expert_work.protocol.model_catalog import catalog_entry  # noqa: E402
-from orchestrator.tools.image_orientation import (  # noqa: E402
-    ORIENTATION_QUESTION,
-    ROTATED_NOTE,
-    TURNS,
-    UNDETERMINED_NOTE,
-    first_conclusion,
-    turned_conclusion,
-)
-from orchestrator.tools.region_zoom import REGION_HINT  # noqa: E402
+from orchestrator.tools.image_orientation import ORIENTATION_QUESTION, TURNS  # noqa: E402
 
 DEFAULT_MODELS = ("doubao-seed-2-1-pro-260628", "doubao-seed-2-1-pro-260915")
 QWEN_MODEL = "qwen3.8-max-0902"
@@ -356,306 +349,12 @@ def quote(
     return {**body, "quote_id": hashlib.sha256(digest).hexdigest()[:12]}
 
 
-# --------------------------------------------------------------------------- 判分
-
-
-#: 弯引号写成转义:ruff 的模糊字符规则会把全角标点「修」成半角。
-_DROP = re.compile(
-    "[\\s,\"'\\u201c\\u201d\\u2018\\u2019`*()\\[\\]{}<>\\u300a\\u300b\\u300c\\u300d\\u3010\\u3011]"
-)
-_TRAILING = re.compile(r"[。.!?;]+$")
-
-
-def normalize(text: str) -> str:
-    """NFKC(全角转半角)、小写、去空白 / 千分位逗号 / 引号括号 / markdown 记号、去句末标点。
-    保留 ``. - / : % _``:它们在日期、编号、读数里有意义。"""
-    folded = unicodedata.normalize("NFKC", text).lower()
-    return _TRAILING.sub("", _DROP.sub("", folded))
-
-
-def field_matches(key: str, answer: str) -> bool:
-    """关键字段对不对:规范化后相等,或作为整体出现在回答里(两侧不是紧挨着的字母数字 / 小数点)。"""
-    want, got = normalize(key), normalize(answer)
-    if not want:
-        return False
-    if got == want:
-        return True
-    start = got.find(want)
-    while start != -1:
-        before = got[start - 1] if start > 0 else ""
-        after = got[start + len(want)] if start + len(want) < len(got) else ""
-        if not _glued(before, want[0]) and not _glued(after, want[-1]):
-            return True
-        start = got.find(want, start + 1)
-    return False
-
-
-def _glued(neighbour: str, edge: str) -> bool:
-    """紧挨着的是同一类(数字 / 小数点挨数字,字母挨字母)才算粘连:``169.1`` 里没有 ``69.1``,
-    ``69.1kg`` 里有。"""
-
-    def kind(ch: str) -> str:
-        if ch.isascii() and (ch.isdigit() or ch == "."):
-            return "number"
-        if ch.isascii() and ch.isalpha():
-            return "letter"
-        return ""
-
-    return bool(neighbour) and kind(neighbour) != "" and kind(neighbour) == kind(edge)
-
-
-def strip_notes(content: str) -> str:
-    """去掉工具追加在回答后面的说明(转过 / 判不出 / 建议用 region),只留看图模型的回答。"""
-    for note in (UNDETERMINED_NOTE, REGION_HINT, *(ROTATED_NOTE.format(degrees=d) for d in TURNS)):
-        content = content.replace(note, "")
-    return content.strip()
-
-
-def orientation_of(record: Mapping[str, Any]) -> tuple[str, int, str | None]:
-    """(结论, 角度, 第 1 步的回答)。工具结果里有 meta 就用它;工具出错没有 meta 时按调用记录
-    用同一套规则推出来(第 2 步三个角度靠副本路径里的 ``r<角度>`` 分辨)。"""
-    meta = record.get("orientation")
-    if isinstance(meta, Mapping):
-        first_answer = (meta.get("answers") or {}).get("0")
-        return str(meta["conclusion"]), int(meta["degrees"]), first_answer
-    answers: dict[int, Any] = {}
-    for call in record.get("calls", []):
-        if call.get("kind") == "orientation":
-            answers[int(call.get("turn", 0))] = call.get("answer")
-    first = answers.get(0)
-    if first is None:
-        return "not_asked", 0, None
-    conclusion = first_conclusion(first)
-    if conclusion is not None:
-        return conclusion, 0, first
-    if not all(turn in answers for turn in TURNS):
-        return "not_asked", 0, first
-    turned, degrees = turned_conclusion({turn: answers[turn] for turn in TURNS})
-    return turned, degrees, first
-
-
-def _latency_stats(values: Sequence[float]) -> dict[str, float | None]:
-    if not values:
-        return {"median_s": None, "p95_s": None}
-    ordered = sorted(values)
-    p95 = ordered[min(len(ordered) - 1, math.ceil(0.95 * len(ordered)) - 1)]
-    return {"median_s": round(statistics.median(ordered), 2), "p95_s": round(p95, 2)}
-
-
-def _read_right(record: Mapping[str, Any] | None, key: str) -> bool:
-    """这一条读出了关键字段(工具出错的一律算没读出)。"""
-    if record is None or record.get("status") != "ok":
-        return False
-    return field_matches(key, str(record.get("answer", "")))
-
-
-def _classify(upright_ok: int, on_ok: int, control_ok: int) -> str:
-    if upright_ok < L2_PREMISE_MIN:
-        return "模型本来就读不好(不计入)"
-    if on_ok <= control_ok - WORSE_BY:
-        return "变差"
-    if control_ok >= L2_CONTROL_HIGH:
-        return "无收益"
-    if control_ok <= L2_CONTROL_LOW and on_ok >= L2_MIN:
-        return "有收益"
-    return "介于之间"
-
-
-def model_report(
-    model: str, records: Sequence[Mapping[str, Any]], image_set: Sequence[images_mod.SetImage]
-) -> dict[str, Any]:
-    """一个体检模型的 §9.2 各线与结论。"""
-    on = {r["image_id"]: r for r in records if r["model"] == model and r["mode"] == "on"}
-    control = {r["image_id"]: r for r in records if r["model"] == model and r["mode"] == "control"}
-    upright_ids = [i.image_id for i in image_set if i.upright]
-    rotated = [i for i in image_set if not i.upright]
-    missing = len(upright_ids) + len(rotated) - len(on) + len(rotated) - len(control)
-
-    l1_ok, l1_by_class = 0, dict[str, int]()
-    for image in rotated:
-        record = on.get(image.image_id)
-        hit = record is not None and orientation_of(record)[:2] == ("rotated", image.rotation)
-        l1_ok += hit
-        l1_by_class[image.image_class] = l1_by_class.get(image.image_class, 0) + hit
-    l1_pass = l1_ok >= L1_MIN and all(v >= L1_PER_CLASS_MIN for v in l1_by_class.values())
-
-    turned, undetermined, first_no = [], [], 0
-    for image_id in upright_ids:
-        record = on.get(image_id)
-        if record is None:
-            continue
-        conclusion, _degrees, first = orientation_of(record)
-        turned += [image_id] if conclusion == "rotated" else []
-        undetermined += [image_id] if conclusion == "undetermined" else []
-        first_no += first == "no"
-    l1p_pass = not turned and len(undetermined) <= L1P_UNDETERMINED_MAX
-
-    classes: dict[str, dict[str, Any]] = {}
-    for image in image_set:
-        if image.key is None:
-            continue
-        c = classes.setdefault(image.image_class, {"upright": 0, "on": 0, "control": 0})
-        if _read_right(on.get(image.image_id), image.key):
-            c["upright" if image.upright else "on"] += 1
-        if _read_right(control.get(image.image_id), image.key):
-            c["control"] += 1
-    for c in classes.values():
-        c["l2_pass"] = c["upright"] < L2_PREMISE_MIN or c["on"] >= L2_MIN
-        c["result"] = _classify(c["upright"], c["on"], c["control"])
-
-    calls = [
-        call
-        for r in on.values()
-        for call in r.get("calls", [])
-        if call.get("kind") == "orientation"
-    ]
-    timeouts = sum(call.get("outcome") == "timeout" for call in calls)
-    errors = sum(call.get("outcome") == "error" for call in calls)
-    off_topic = sum(
-        call.get("outcome") == "ok" and call.get("answer") == "off_topic" for call in calls
-    )
-    bad_rate = (timeouts + off_topic + errors) / len(calls) if calls else 1.0
-    latency = _latency_stats([c["latency_s"] for c in calls if c.get("outcome") == "ok"])
-    l6_pass = bool(calls) and bad_rate <= L6_MAX_RATE
-
-    complete = missing == 0
-    why: list[str] = []
-    if not complete:
-        why.append(f"数据不齐:还差 {missing} 条")
-    if turned:
-        why.append(f"L1' 正放的图被转了 {len(turned)} 张:{', '.join(turned)}")
-    if len(undetermined) > L1P_UNDETERMINED_MAX:
-        why.append(f"L1' 「判不出」{len(undetermined)} 张 > {L1P_UNDETERMINED_MAX}")
-    if not l6_pass:
-        why.append(f"L6 问方向没问成的比例 {bad_rate:.1%} > {L6_MAX_RATE:.0%}")
-    verdict = "不完整" if not complete else ("通过" if l1p_pass and l6_pass else "不通过")
-    worse = [name for name, c in classes.items() if c["result"] == "变差"]
-    return {
-        "model": model,
-        "verdict": verdict,
-        "why": why,
-        "needs_user": [f"L2「变差」:{', '.join(worse)}"] if worse else [],
-        "L1": {"ok": l1_ok, "of": len(rotated), "by_class": l1_by_class, "pass": l1_pass},
-        "L1'": {
-            "turned": turned,
-            "undetermined": undetermined,
-            "first_step_no": first_no,
-            "of": len(upright_ids),
-            "pass": l1p_pass,
-        },
-        "L2": classes,
-        "L6": {
-            "calls": len(calls),
-            "timeouts": timeouts,
-            "off_topic": off_topic,
-            "errors": errors,
-            "bad_rate": round(bad_rate, 4),
-            **latency,
-            "pass": l6_pass,
-        },
-        "spent_yuan": round(
-            sum(float(r.get("cost_yuan", 0.0)) for r in records if r["model"] == model), 4
-        ),
-    }
-
-
-def probe_report(
-    model: str, records: Sequence[Mapping[str, Any]], image_set: Sequence[images_mod.SetImage]
-) -> dict[str, Any]:
-    """§8.1:正放答 yes(或无文字答 none)、转过的答 no 的张数;没答成的另计。"""
-    rotation = {i.image_id: (i.rotation, i.image_class) for i in image_set}
-    rows = [r for r in records if r["model"] == model and r["mode"] == "probe"]
-    counts = {
-        "upright_yes": 0,
-        "upright": 0,
-        "rotated_no": 0,
-        "rotated": 0,
-        "no_text_none": 0,
-        "no_text": 0,
-    }
-    unanswered = 0
-    for r in rows:
-        degrees, image_class = rotation[r["image_id"]]
-        answer = r.get("probe_answer")
-        unanswered += answer not in ("yes", "no", "none")
-        if image_class == images_mod.NO_TEXT_CLASS:
-            counts["no_text"] += 1
-            counts["no_text_none"] += answer == "none"
-        elif degrees == 0:
-            counts["upright"] += 1
-            counts["upright_yes"] += answer == "yes"
-        else:
-            counts["rotated"] += 1
-            counts["rotated_no"] += answer == "no"
-    latency = _latency_stats(
-        [c["latency_s"] for r in rows for c in r.get("calls", []) if c.get("outcome") == "ok"]
-    )
-    return {"model": model, **counts, "unanswered": unanswered, **latency}
-
-
 def read_records(path: Path) -> list[dict[str, Any]]:
+    """结果文件(JSONL):每行一条跑完的条目。"""
     if not path.exists():
         return []
-    rows = [
-        json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line.strip()
-    ]
-    return rows
-
-
-def report(
-    records: Sequence[Mapping[str, Any]], image_set: Sequence[images_mod.SetImage] | None = None
-) -> dict[str, Any]:
-    image_set = images_mod.build_set() if image_set is None else image_set
-    health = sorted({r["model"] for r in records if r["mode"] in ("on", "control")})
-    probe = sorted({r["model"] for r in records if r["mode"] == "probe"})
-    return {
-        "health": [model_report(m, records, image_set) for m in health],
-        "probe": [probe_report(m, records, image_set) for m in probe],
-        "spent_yuan": round(sum(float(r.get("cost_yuan", 0.0)) for r in records), 4),
-    }
-
-
-def _mark(passed: bool) -> str:
-    return "过" if passed else "没过"
-
-
-def render_report(result: Mapping[str, Any]) -> str:
-    lines: list[str] = []
-    for m in result["health"]:
-        lines.append(f"== {m['model']}:{m['verdict']}")
-        lines.extend(f"   - {why}" for why in m["why"])
-        lines.extend(f"   - 交用户定:{item}" for item in m["needs_user"])
-        l1, l1p, l6 = m["L1"], m["L1'"], m["L6"]
-        lines.append(
-            f"   L1  转过的 {l1['ok']}/{l1['of']}"
-            f"(及格 ≥{L1_MIN},每类 ≥{L1_PER_CLASS_MIN}/9):{_mark(l1['pass'])}"
-        )
-        lines.append("       每类:" + ", ".join(f"{k} {v}/9" for k, v in l1["by_class"].items()))
-        lines.append(
-            f"   L1' 正放 + 无文字 {l1p['of']} 张:被转 {len(l1p['turned'])}、"
-            f"判不出 {len(l1p['undetermined'])}、第 1 步答 no {l1p['first_step_no']}:"
-            f"{_mark(l1p['pass'])}"
-        )
-        lines.append("   L2  每类(正放 /3、开 /9、对照 /9 → 结论):")
-        for name, c in m["L2"].items():
-            lines.append(
-                f"       {name}: {c['upright']}/3, {c['on']}/9, {c['control']}/9 → {c['result']}"
-            )
-        lines.append(
-            f"   L6  问方向 {l6['calls']} 次:超时 {l6['timeouts']}、答非所问 {l6['off_topic']}、"
-            f"出错 {l6['errors']}({l6['bad_rate']:.1%});"
-            f"耗时中位 {l6['median_s']} s、p95 {l6['p95_s']} s:{_mark(l6['pass'])}"
-        )
-        lines.append(f"   花费 ¥{m['spent_yuan']}")
-    for p in result["probe"]:
-        lines.append(
-            f"== §8.1 {p['model']}:正放答 yes {p['upright_yes']}/{p['upright']}、"
-            f"转过答 no {p['rotated_no']}/{p['rotated']}、"
-            f"无文字答 none {p['no_text_none']}/{p['no_text']}、没答成 {p['unanswered']};"
-            f"耗时中位 {p['median_s']} s"
-        )
-    lines.append(f"合计花费 ¥{result['spent_yuan']}")
-    return "\n".join(lines)
+    lines = path.read_text(encoding="utf-8").splitlines()
+    return [json.loads(line) for line in lines if line.strip()]
 
 
 # --------------------------------------------------------------------------- CLI
@@ -688,13 +387,23 @@ def main(argv: Sequence[str] | None = None) -> int:
     _add_selection(run_parser)
     run_parser.add_argument("--quote-id", required=True)
     run_parser.add_argument("--results", type=Path, required=True)
-    run_parser.add_argument("--env-file", type=Path, default=Path.home() / ".helix-eval.env")
+    run_parser.add_argument(
+        "--env-file",
+        type=Path,
+        action="append",
+        help="credential file(s), parsed in-process; default ~/.kube/eval-llm.env",
+    )
     report_parser = sub.add_parser("report", help="offline report")
     report_parser.add_argument("--results", type=Path, required=True)
     args = parser.parse_args(argv)
 
     if args.command == "report":
-        sys.stdout.write(render_report(report(read_records(args.results))) + "\n")
+        import b301_report
+        import b301_spend
+
+        ledger = b301_spend.read_ledger(b301_spend.ledger_path(args.results))
+        result = b301_report.report(read_records(args.results), ledger_rows=ledger)
+        sys.stdout.write(b301_report.render_report(result) + "\n")
         return 0
     models, probe = _selection(args)
     try:
@@ -719,10 +428,11 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     import b301_health_run as runner
 
+    env_files = args.env_file or [runner.DEFAULT_ENV_FILE]
     try:
         summary = asyncio.run(
             runner.run_from_quote(
-                q, models=models, probe_models=probe, results=args.results, env_file=args.env_file
+                q, models=models, probe_models=probe, results=args.results, env_files=env_files
             )
         )
     except runner.RunRefusedError as exc:
