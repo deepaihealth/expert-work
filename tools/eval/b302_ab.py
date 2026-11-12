@@ -25,6 +25,7 @@
 from __future__ import annotations
 
 import argparse
+import ast
 import asyncio
 import hashlib
 import json
@@ -110,11 +111,33 @@ class ModelPlan:
     regression: bool = False
 
 
-#: runbook 里记过价的豆包型号(元 / 百万 token):给的单价与它不一致就拒跑。
-#: ``docs/runbooks/2026-09-24-prod-release-checklist.md:746``(6 / 1.2 / 30,输入 / 缓存读 / 输出)。
-KNOWN_DOUBAO_PRICES: dict[str, tuple[float, float, float]] = {
-    "doubao-seed-2-1-pro-260628": (6.0, 30.0, 1.2),
-}
+#: 豆包单价以价目表迁移为准(第三轮 MEDIUM-P):``model_rate_card`` 的平台行由迁移种下,
+#: 0187 种了 ``doubao-seed-2-1-pro-260915``。这里解析那份迁移里的 ``_PRICES`` 常量(不 import:
+#: 它依赖 alembic 的运行上下文),不抄 runbook。
+RATE_CARD_MIGRATION = (
+    Path(__file__).resolve().parents[2]
+    / "packages/expert-work-persistence/migrations/versions/0187_rate_card_dated_model_ids.py"
+)
+
+#: 三家各自跑哪几组(D9:豆包只跑 A、C)。
+_ARMS_BY_PROVIDER = {"glm": ("A", "B", "C"), "deepseek": ("A", "B", "C"), "doubao": ("A", "C")}
+_FIXED_MODELS = (("glm-5.3-flash", "glm"), ("deepseek-flash", "deepseek"))
+
+
+def doubao_rate_card() -> dict[str, tuple[float, float, float]]:
+    """``{型号: (输入, 输出, 缓存读)}``,元 / 百万 token,取自 :data:`RATE_CARD_MIGRATION`。"""
+    tree = ast.parse(RATE_CARD_MIGRATION.read_text(encoding="utf-8"))
+    for node in tree.body:
+        if isinstance(node, ast.Assign) and any(
+            isinstance(t, ast.Name) and t.id == "_PRICES" for t in node.targets
+        ):
+            rows = ast.literal_eval(node.value)
+            return {
+                str(model): (inp / 1e6, out / 1e6, read / 1e6)
+                for provider, model, inp, out, _creation, read in rows
+                if provider == "doubao"
+            }
+    raise PlanError(f"no _PRICES in {RATE_CARD_MIGRATION}")
 
 
 def default_models(
@@ -122,33 +145,47 @@ def default_models(
 ) -> list[ModelPlan]:
     """§5.3 + D9:glm-5.3-flash(事故模型,另跑回归集)、deepseek-flash 三组;豆包只 A、C 两组。
 
-    glm / deepseek 的单价取自设计 §5.5 引的价目表。豆包型号以 §6.2 的查询为准、单价由调用方给
-    (``--doubao-price``,对着生产 / 测试的 ``model_rate_card`` 核过的数):型号必须在模型目录里、
-    能看图、没下架;runbook 里有据可查的型号,单价对不上就拒。``doubao_price`` 为空只给不花钱的
-    子命令用(生成临时智能体、清理),单价记 0。
+    glm / deepseek 的单价取自设计 §5.5 引的价目表。豆包型号以 §6.2 的查询为准:必须在模型目录里、
+    能看图、没下架;单价由调用方给(``--doubao-price``),必须与价目表迁移里这一型号的那一行
+    一致(:func:`doubao_rate_card`),价目表里没有这一型号也拒。``doubao_price`` 为空只给不花钱
+    的子命令用(生成临时智能体),单价记 0、不比对。
     """
     entry = catalog_entry("doubao", doubao_model)
     if entry is None:
         raise PlanError(f"{doubao_model!r} is not in the model catalog for provider doubao")
-    known = KNOWN_DOUBAO_PRICES.get(doubao_model)
-    if doubao_price is not None and known is not None and tuple(doubao_price) != known:
-        raise PlanError(
-            f"price {doubao_price} for {doubao_model} contradicts the documented price {known}"
-        )
     if entry.deprecated:
         raise PlanError(f"{doubao_model} is deprecated in the model catalog; use the current one")
     if not entry.vision:
         raise PlanError(f"{doubao_model} cannot see images; the A/B needs a vision model")
+    if doubao_price is not None:
+        card = doubao_rate_card().get(doubao_model)
+        if card is None:
+            raise PlanError(f"{doubao_model} has no rate card row in {RATE_CARD_MIGRATION.name}")
+        if tuple(doubao_price) != card:
+            raise PlanError(
+                f"price {doubao_price} for {doubao_model} contradicts the rate card {card} "
+                f"({RATE_CARD_MIGRATION.name})"
+            )
     return [
-        ModelPlan("glm-5.3-flash", "glm", ("A", "B", "C"), (0.8, 2.8, 0.23), regression=True),
-        ModelPlan("deepseek-flash", "deepseek", ("A", "B", "C"), (2.0, 8.0, 0.04)),
-        ModelPlan(doubao_model, "doubao", ("A", "C"), doubao_price or (0.0, 0.0, 0.0)),
+        ModelPlan(
+            "glm-5.3-flash", "glm", _ARMS_BY_PROVIDER["glm"], (0.8, 2.8, 0.23), regression=True
+        ),
+        ModelPlan("deepseek-flash", "deepseek", _ARMS_BY_PROVIDER["deepseek"], (2.0, 8.0, 0.04)),
+        ModelPlan(
+            doubao_model, "doubao", _ARMS_BY_PROVIDER["doubao"], doubao_price or (0.0, 0.0, 0.0)
+        ),
     ]
 
 
 def temporary_agent_codes(doubao_model: str) -> set[str]:
-    """``write_manifests`` 会生成的全部临时智能体 code —— ``cleanup`` 只删这些。"""
-    return {agent_code(m.name, arm) for m in default_models(doubao_model) for arm in m.arms}
+    """``write_manifests`` 会生成的全部临时智能体 code —— ``cleanup`` 只删这些。
+
+    不走目录 / 价目表校验(第三轮 LOW-c):旧快照(比如已下架的 260628)导过的临时智能体也要删得掉。
+    """
+    models = [*_FIXED_MODELS, (doubao_model, "doubao")]
+    return {
+        agent_code(name, arm) for name, provider in models for arm in _ARMS_BY_PROVIDER[provider]
+    }
 
 
 def phase_of(session: Session) -> str:
@@ -501,8 +538,12 @@ def _price(raw: str) -> tuple[float, float, float]:
         values = tuple(float(x) for x in parts)
     except ValueError as exc:
         raise argparse.ArgumentTypeError(f"not numbers: {raw!r}") from exc
-    if len(values) != 3 or not all(math.isfinite(v) and v >= 0 for v in values):
-        raise argparse.ArgumentTypeError("give input,output,cache_read in yuan per million tokens")
+    if len(values) != 3 or not all(math.isfinite(v) and v > 0 for v in values):
+        raise argparse.ArgumentTypeError(
+            "give input,output,cache_read in yuan per million tokens, all > 0"
+        )
+    if values[1] < values[0]:
+        raise argparse.ArgumentTypeError("output price below input price: wrong order?")
     return (values[0], values[1], values[2])
 
 

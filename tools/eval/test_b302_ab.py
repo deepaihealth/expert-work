@@ -541,10 +541,50 @@ def test_the_doubao_model_must_be_a_live_vision_model_in_the_catalog(
         ab.default_models(DOUBAO, DOUBAO_PRICE)
 
 
-def test_a_price_that_contradicts_the_documented_one_is_refused() -> None:
-    """价目表里有据可查的型号(runbook 记过的),给的单价对不上就拒跑。"""
-    with pytest.raises(ab.PlanError, match="price"):
-        ab.default_models("doubao-seed-2-1-pro-260628", (5.0, 30.0, 1.2))
+def test_the_doubao_rate_card_comes_from_migration_0187() -> None:
+    """第三轮 MEDIUM-P:单价以价目表迁移为准(0187 种的那一行),不是抄 runbook。"""
+    assert ab.doubao_rate_card()[DOUBAO] == (6.0, 30.0, 1.2)
+
+
+@pytest.mark.parametrize(
+    "price",
+    [
+        (5.0, 30.0, 1.2),  # 与 0187 不一致
+        (6.0, 30.0, 1.0),
+        (30.0, 6.0, 1.2),  # 输入 / 输出颠倒(同时也与 0187 不一致)
+    ],
+)
+def test_a_price_that_contradicts_the_rate_card_is_refused(
+    price: tuple[float, float, float],
+) -> None:
+    with pytest.raises(ab.PlanError, match="rate card"):
+        ab.default_models(DOUBAO, price)
+
+
+def test_a_catalog_model_missing_from_the_rate_card_is_refused(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(ab, "doubao_rate_card", lambda: {})
+    with pytest.raises(ab.PlanError, match="no rate card row"):
+        ab.default_models(DOUBAO, DOUBAO_PRICE)
+
+
+@pytest.mark.parametrize("raw", ["0,0,0", "6,0,1.2", "30,6,1.2", "6,30,-1", "6,30"])
+def test_a_doubao_price_must_be_positive_with_output_not_below_input(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], raw: str
+) -> None:
+    with pytest.raises(SystemExit):
+        ab.main(
+            ["plan", "--docs", str(_docs_dir(tmp_path)), "--doubao-model", DOUBAO,
+             "--doubao-price", raw]
+        )  # fmt: skip
+    assert "--doubao-price" in capsys.readouterr().err
+
+
+def test_the_rate_card_price_passes(tmp_path: Path) -> None:
+    out: list[str] = []
+    ab.main(["plan", "--docs", str(_docs_dir(tmp_path)), *_DOUBAO_ARGS], emit=out.append)
+    assert json.loads(out[0])["models"][DOUBAO]["runs"] == 63
 
 
 def test_the_doubao_price_is_required_on_the_command_line(
@@ -621,3 +661,12 @@ def test_cleanup_needs_the_doubao_model_to_know_the_exact_codes(
         for m in ab.default_models(DOUBAO, DOUBAO_PRICE)
         for arm in m.arms
     }
+
+
+def test_cleanup_codes_work_for_an_old_snapshot_too() -> None:
+    """第三轮 LOW-c:旧快照(已下架、价目表里也没有)导过的临时智能体照样能列出来删。"""
+    codes = ab.temporary_agent_codes("doubao-seed-2-1-pro-260628")
+    assert "eval-b302-doubao-seed-2-1-pro-260628-a" in codes
+    assert "eval-b302-doubao-seed-2-1-pro-260628-c" in codes
+    assert "eval-b302-doubao-seed-2-1-pro-260628-b" not in codes
+    assert len(codes) == 8

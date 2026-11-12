@@ -28,6 +28,8 @@ from io import BytesIO
 from pathlib import Path
 from typing import Any
 
+import httpx
+
 _HERE = Path(__file__).resolve().parent
 if str(_HERE) not in sys.path:
     sys.path.insert(0, str(_HERE))
@@ -314,39 +316,50 @@ async def _cancel(http: Any, agent: str, run_id: str) -> None:
     await http.post(f"/v1/agents/{agent}/runs/{run_id}:cancel", json={"user_id": _USER})
 
 
+#: 时钟与睡眠的间接层 —— 测试换成假时钟(按调用次数推进),不去碰全局的 ``time`` / ``asyncio``。
+_now = time.monotonic
+_sleep = asyncio.sleep
+
+
 async def _settle(
     http: Any,
     agent: str,
-    run_id: str | None,
+    run_id: str,
     *,
     model: str,
     tracker: SpendTracker,
-    why: str = "",
+    steps_seen: int | None,
 ) -> tuple[list[Any] | None, str]:
-    """没接住 ``end`` 帧时给这次运行记账,返回 ``(用量, 来源)``。
+    """没接住 ``end`` 帧(或流断了)时给这次运行记账,返回 ``(用量, 来源)``。
 
     run 还在跑(``LIVE_RUN_STATUSES``)→ 先取消,再短轮询到终态,按终态的用量记;等不到终态 →
-    按这个型号一次运行的上限计入并阻塞。终态但没有用量记录 → 阻塞。连 run id 都没有(运行还没
-    开始就断了,或开始了但没收到第一帧)→ 同样按上限计入并阻塞,宁可多算。"""
-    if run_id is None:
+    按这个型号一次运行的上限计入并阻塞。终态但没有用量记录:一步模型调用都没观察到 → 记 0 并阻塞;
+    否则按上限计入并阻塞。``steps_seen=None`` = 流断了、看到的步数不作数(断点之后可能还有
+    调用)。**取消、查询本身出任何网络错误 → 按上限计入并阻塞**(第三轮 MEDIUM-R3'),不往外抛
+    —— 调用方手上的原异常才是要报的。"""
+    try:
+        status, usage = await _usage_from_endpoint(http, agent, run_id)
+        if status in LIVE_RUN_STATUSES:
+            await _cancel(http, agent, run_id)
+            deadline = _now() + SETTLE_TIMEOUT_S
+            while status in LIVE_RUN_STATUSES and _now() < deadline:
+                await _sleep(SETTLE_POLL_S)
+                status, usage = await _usage_from_endpoint(http, agent, run_id)
+            if status in LIVE_RUN_STATUSES:
+                tracker.charge_cap(
+                    model,
+                    f"run {run_id} did not settle after cancel (last status {status}); "
+                    "charged at the cap",
+                )
+                return usage, "cap_charged"
+    except Exception as exc:
         tracker.charge_cap(
-            model, f"a run broke before its run id was known; charged at the cap {why}".strip()
+            model, f"run {run_id} could not be settled ({exc!r}); charged at the cap"
         )
         return None, "cap_charged"
-    status, usage = await _usage_from_endpoint(http, agent, run_id)
-    if status in LIVE_RUN_STATUSES:
-        await _cancel(http, agent, run_id)
-        deadline = time.monotonic() + SETTLE_TIMEOUT_S
-        while status in LIVE_RUN_STATUSES and time.monotonic() < deadline:
-            await asyncio.sleep(SETTLE_POLL_S)
-            status, usage = await _usage_from_endpoint(http, agent, run_id)
-        if status in LIVE_RUN_STATUSES:
-            tracker.charge_cap(
-                model,
-                f"run {run_id} did not settle after cancel (last status {status}); "
-                "charged at the cap",
-            )
-            return usage, "cap_charged"
+    if usage is None and steps_seen == 0:
+        tracker.block(f"run {run_id} ended ({status}) with no model step and no usage; billed 0")
+        return None, "none_no_steps"
     if usage is None:
         tracker.charge_cap(
             model,
@@ -355,6 +368,46 @@ async def _settle(
         return None, "cap_charged"
     tracker.add(usage)
     return usage, "usage_endpoint"
+
+
+def _never_started(exc: BaseException, run_id: str | None) -> bool:
+    """运行根本没创建:``POST /runs`` 被拒(429 / 409 / 422 等),或请求没发出去(连不上)。"""
+    if isinstance(exc, httpx.HTTPStatusError):
+        return True
+    return run_id is None and isinstance(exc, httpx.ConnectError | httpx.ConnectTimeout)
+
+
+async def _account_for_broken_turn(
+    http: Any,
+    agent: str,
+    collector: TurnCollector,
+    exc: BaseException,
+    *,
+    cancelled: bool,
+    model: str,
+    tracker: SpendTracker,
+) -> None:
+    """复审 R3 / 第三轮 LOW-a —— 这一轮断了,给它记账;自己绝不抛(原异常由调用方照常抛)。
+
+    * 运行根本没创建 → 记 0 并阻塞;
+    * 请求发出去了但没拿到 run id → 按上限计入并阻塞;
+    * 拿到了 run id → 取消(出错也接住),再按补账接口记账(见 :func:`_settle`)。"""
+    run_id = collector.run_id
+    if _never_started(exc, run_id):
+        tracker.block(f"a run was not created ({exc!r}); billed 0")
+        return
+    if run_id is None:
+        tracker.charge_cap(
+            model, f"a run broke before its run id was known ({exc!r}); charged at the cap"
+        )
+        return
+    if not cancelled:
+        try:
+            await _cancel(http, agent, run_id)
+        except Exception as cancel_exc:
+            tracker.block(f"cancelling run {run_id} failed: {cancel_exc!r}")
+    await _settle(http, agent, run_id, model=model, tracker=tracker, steps_seen=None)
+    tracker.block(f"run {run_id} broke mid-stream: {exc!r}")
 
 
 async def _turn(
@@ -389,11 +442,11 @@ async def _turn(
                     cancelled = True
                     await _cancel(http, agent, collector.run_id)
     except BaseException as exc:
-        # 复审 R3 —— 流中途断了:这次运行可能还在花钱。取消它、按补账接口记账(查不到按上限),
-        # 再把异常照常抛出去(由 ``run_phase`` 阻塞后续派发)。
-        if collector.run_id is not None and not cancelled:
-            await _cancel(http, agent, collector.run_id)
-        await _settle(http, agent, collector.run_id, model=model, tracker=tracker, why=repr(exc))
+        # 流断了:这次运行可能还在花钱。先记账(记账自己出错也接住),再把原异常照常抛出去
+        # (由 ``run_phase`` 阻塞后续派发)。
+        await _account_for_broken_turn(
+            http, agent, collector, exc, cancelled=cancelled, model=model, tracker=tracker
+        )
         raise
     tail = parser.flush()
     if tail is not None:
@@ -401,11 +454,23 @@ async def _turn(
     end = collector.end or {}
     usage = end.get("usage_by_model") if collector.end is not None else None
     source = "end_frame"
-    if usage is None:
-        usage, source = await _settle(http, agent, collector.run_id, model=model, tracker=tracker)
-    else:
+    if usage is not None:
         tracker.add(usage)
-    if collector.steps and not any(collector.input_tokens):
+    elif collector.run_id is None:
+        tracker.charge_cap(model, "a run stream ended without a run id; charged at the cap")
+        source = "cap_charged"
+    else:
+        usage, source = await _settle(
+            http,
+            agent,
+            collector.run_id,
+            model=model,
+            tracker=tracker,
+            steps_seen=len(collector.steps),
+        )
+    if not collector.steps:
+        tracker.block(f"run {collector.run_id} ended with no model step; check before going on")
+    elif not any(collector.input_tokens):
         tracker.block(
             f"run {collector.run_id}: no step carried usage_metadata input_tokens; the "
             f"{MAX_INPUT_TOKENS}-token guard cannot work"

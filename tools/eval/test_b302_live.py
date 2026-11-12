@@ -74,6 +74,10 @@ class _Platform:
         steps: list[dict[str, Any]] | None = None,
         broken_stream: bool = False,
         download: bytes | None = None,
+        break_before_run_id: bool = False,
+        runs_status: int = 200,
+        cancel_error: bool = False,
+        usage_error: bool = False,
     ) -> None:
         self.seen: list[str] = []
         self.runs = 0
@@ -87,6 +91,13 @@ class _Platform:
         self.cancels = 0
         self.broken_stream = broken_stream
         self.download = download
+        #: 流断在第一帧之前(请求已发出,但没收到 run id)。
+        self.break_before_run_id = break_before_run_id
+        #: ``POST /runs`` 的状态码(429 / 409 / 422 = 运行没创建)。
+        self.runs_status = runs_status
+        #: 取消 / 补账接口本身连不上。
+        self.cancel_error = cancel_error
+        self.usage_error = usage_error
         self.artifacts = artifacts or []
         self.workspace = workspace or {}
         self.steps = steps or [_ai()]
@@ -100,6 +111,8 @@ class _Platform:
             self.runs += 1
             if self.run_error is not None and self.run_error(self.runs):
                 raise httpx.ConnectError("platform went away")
+            if self.runs_status != 200:
+                return httpx.Response(self.runs_status, json={"error": "busy"})
             run_id = f"r{self.runs}"
             events: list[tuple[str, dict[str, Any]]] = [
                 ("metadata", {"run_id": run_id, "thread_id": "s1"})
@@ -118,19 +131,22 @@ class _Platform:
                         },
                     )
                 )
-            if self.broken_stream:
+            if self.broken_stream or self.break_before_run_id:
+                head = b"" if self.break_before_run_id else _sse(events[:1])
                 return httpx.Response(
-                    200,
-                    stream=_Breaks(_sse(events[:1])),
-                    headers={"content-type": "text/event-stream"},
+                    200, stream=_Breaks(head), headers={"content-type": "text/event-stream"}
                 )
             return httpx.Response(
                 200, content=_sse(events), headers={"content-type": "text/event-stream"}
             )
         if path.endswith(":cancel"):
             self.cancels += 1
+            if self.cancel_error:
+                raise httpx.ConnectError("platform went away")
             return httpx.Response(200, json={"success": True})
         if path.endswith("/usage"):
+            if self.usage_error:
+                raise httpx.ConnectError("platform went away")
             return httpx.Response(200, json=self._usage_body(path.split("/")[-2]))
         if path.endswith("/artifacts/download"):
             body = self.download or _ooxml({"ppt/slides/slide1.xml": "<a:t>X</a:t>"})
@@ -429,9 +445,18 @@ async def test_cleanup_deletes_only_the_exact_codes_across_pages() -> None:
 
 
 @pytest.fixture
-def _fast_settle(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(live, "SETTLE_POLL_S", 0.001)
-    monkeypatch.setattr(live, "SETTLE_TIMEOUT_S", 0.05)
+def _fast_settle(monkeypatch: pytest.MonkeyPatch) -> list[float]:
+    """假时钟(复审 LOW-b):轮询里的「睡」只推进假时钟,超时由调用次数决定,不受 GC 停顿影响。"""
+    clock = [0.0]
+    sleeps: list[float] = []
+
+    async def _sleep(seconds: float) -> None:
+        sleeps.append(seconds)
+        clock[0] += seconds
+
+    monkeypatch.setattr(live, "_now", lambda: clock[0])
+    monkeypatch.setattr(live, "_sleep", _sleep)
+    return sleeps
 
 
 @pytest.mark.usefixtures("_fast_settle")
@@ -462,6 +487,16 @@ async def test_a_run_that_never_settles_is_charged_the_cap_and_blocks(tmp_path: 
     assert tracker.spent == pytest.approx(23.36)
     assert tracker.blocked is not None and "did not settle" in tracker.blocked
     assert record["turns"][0]["usage_source"] == "cap_charged"
+
+
+async def test_settling_polls_on_the_clock_until_the_timeout(
+    tmp_path: Path, _fast_settle: list[float]
+) -> None:
+    platform = _Platform(end=False, usage_status=["running"])
+    tracker = live.SpendTracker(stop_line=100.0, prices=_PRICES, run_caps={"glm-5.3-flash": 1.0})
+    await _run_session(platform, tmp_path, tracker)
+    assert _fast_settle == [live.SETTLE_POLL_S] * int(live.SETTLE_TIMEOUT_S / live.SETTLE_POLL_S)
+    assert platform.usage_calls == len(_fast_settle) + 1
 
 
 # ------------------------------------------------------------ 复审 R3:流中途断掉
@@ -529,3 +564,83 @@ def test_path_arguments_come_first_and_parent_paths_are_dropped() -> None:
     assert found[:2] == ["reports/final v2.pptx", "out dir/my report.pptx"]
     assert "decks/old deck.pptx" in found
     assert all(".." not in c for c in found)
+
+
+# ------------------------------------------------------------ 第三轮 MEDIUM-R3':补账时网络也断了
+
+
+_CAPS = {"glm-5.3-flash": 23.36}
+
+
+@pytest.mark.usefixtures("_fast_settle")
+async def test_a_dead_network_while_settling_charges_the_cap_and_keeps_the_original_error(
+    tmp_path: Path,
+) -> None:
+    platform = _Platform(broken_stream=True, cancel_error=True, usage_error=True)
+    tracker = live.SpendTracker(stop_line=100.0, prices=_PRICES, run_caps=_CAPS)
+    with pytest.raises(httpx.ReadError):  # 原来的异常,不是取消 / 补账时的 ConnectError
+        await _run_session(platform, tmp_path, tracker)
+    assert tracker.spent == pytest.approx(23.36)
+    assert tracker.blocked is not None
+
+
+@pytest.mark.usefixtures("_fast_settle")
+async def test_no_end_frame_and_a_dead_usage_endpoint_charges_the_cap(tmp_path: Path) -> None:
+    platform = _Platform(end=False, usage_error=True)
+    tracker = live.SpendTracker(stop_line=100.0, prices=_PRICES, run_caps=_CAPS)
+    record = await _run_session(platform, tmp_path, tracker)
+    assert tracker.spent == pytest.approx(23.36)
+    assert tracker.blocked is not None and "ConnectError" in tracker.blocked
+    assert record["turns"][0]["usage_source"] == "cap_charged"
+    assert record["stopped"] is not None
+
+
+# ------------------------------------------------------------ 第三轮 LOW-a:根本没发生模型调用的运行
+
+
+async def test_a_refused_run_is_billed_zero_and_blocks(tmp_path: Path) -> None:
+    for status in (429, 409, 422):
+        platform = _Platform(runs_status=status)
+        tracker = live.SpendTracker(stop_line=100.0, prices=_PRICES, run_caps=_CAPS)
+        with pytest.raises(httpx.HTTPStatusError):
+            await _run_session(platform, tmp_path, tracker)
+        assert tracker.spent == 0.0
+        assert tracker.blocked is not None and str(status) in tracker.blocked
+
+
+async def test_a_run_that_could_not_be_sent_is_billed_zero(tmp_path: Path) -> None:
+    platform = _Platform(run_error=lambda _n: True)  # ConnectError:请求没发出去
+    tracker = live.SpendTracker(stop_line=100.0, prices=_PRICES, run_caps=_CAPS)
+    with pytest.raises(httpx.ConnectError):
+        await _run_session(platform, tmp_path, tracker)
+    assert tracker.spent == 0.0
+    assert tracker.blocked is not None
+
+
+async def test_a_stream_that_breaks_before_the_run_id_is_charged_the_cap(tmp_path: Path) -> None:
+    platform = _Platform(break_before_run_id=True)
+    tracker = live.SpendTracker(stop_line=100.0, prices=_PRICES, run_caps=_CAPS)
+    with pytest.raises(httpx.ReadError):
+        await _run_session(platform, tmp_path, tracker)
+    assert tracker.spent == pytest.approx(23.36)
+    assert tracker.blocked is not None
+
+
+@pytest.mark.usefixtures("_fast_settle")
+async def test_a_run_that_settled_without_any_model_step_is_billed_zero(tmp_path: Path) -> None:
+    platform = _Platform(end=False, steps=[], usage_status=["error"])  # 终态,没有用量,没有一步
+    platform.steps = []
+    tracker = live.SpendTracker(stop_line=100.0, prices=_PRICES, run_caps=_CAPS)
+    record = await _run_session(platform, tmp_path, tracker)
+    assert tracker.spent == 0.0
+    assert tracker.blocked is not None and "no model step" in tracker.blocked
+    assert record["turns"][0]["usage_source"] == "none_no_steps"
+
+
+async def test_an_end_frame_without_any_model_step_blocks(tmp_path: Path) -> None:
+    platform = _Platform(usage=[])
+    platform.steps = []
+    tracker = live.SpendTracker(stop_line=100.0, prices=_PRICES, run_caps=_CAPS)
+    await _run_session(platform, tmp_path, tracker)
+    assert tracker.spent == 0.0
+    assert tracker.blocked is not None and "no model step" in tracker.blocked
