@@ -25,6 +25,7 @@ from opentelemetry.sdk.trace.export.in_memory_span_exporter import (
 from expert_work.common.observability import init_tracing
 from expert_work.protocol import AuditAction, AuditEntry, AuditResult
 from expert_work.runtime.runs import DisconnectMode, RunManager, RunRecord, RunStatus
+from expert_work.runtime.runs.event_store import InMemoryRunEventStore
 from expert_work.runtime.stream_bridge import InMemoryStreamBridge, is_end
 from orchestrator.sse import (
     PROMPT_INPUTS_KEY,
@@ -232,6 +233,51 @@ async def test_run_agent_strips_context_summary_from_updates() -> None:
     # strip removes ONLY the internal key, nothing else.
     agent_update = next(e for e in updates if "agent" in e.data)
     assert agent_update.data["agent"]["step_count"] == 1
+
+
+#: B-302 —— 内部记账键与一份合成值:时限的三个记账键与提醒标记(PR 1)、每个文件的
+#: edit_file 两本账(PR 3,键是文件路径、存改动原文片段)、结果重复检测的本轮账(PR 4)。
+_B302_BOOKKEEPING: dict[str, Any] = {
+    "run_active_s": 12.5,
+    "run_clock_mark": 1234.5,
+    "run_clock_segment": "segment-token",
+    "deadline_warned": True,
+    "edit_file_streaks": {"/workspace/private-name.txt": {"failures": 2, "read": False}},
+    "edit_file_history": {"/workspace/private-name.txt": [{"old": "secret a", "new": "b"}]},
+    "outcome_repeats": {"0123456789abcdef": {"fedcba9876543210": 3}},
+}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("key", sorted(_B302_BOOKKEEPING))
+async def test_run_agent_strips_b302_bookkeeping_from_updates_and_run_event(key: str) -> None:
+    """B-302 —— 这些通道只给平台自己记账,不是 run 输出:不能进实时 ``updates`` 帧,
+    也不能进 ``run_event``(同一个对象,持久化与实时一起看)。"""
+    bridge = InMemoryStreamBridge()
+    rm = RunManager()
+    record = await _new_record(rm)
+    store = InMemoryRunEventStore()
+    graph = _ScriptedGraph(chunks=[{"tools": {"step_count": 1, key: _B302_BOOKKEEPING[key]}}])
+    await run_agent(
+        bridge=bridge,
+        run_manager=rm,
+        record=record,
+        graph=graph,
+        graph_input={"messages": []},
+        config={"configurable": {"thread_id": str(record.thread_id)}},
+        event_store=store,
+    )
+    live = [e.data for e in await _drain(bridge, record.run_id) if e.event == "updates"]
+    stored = [
+        e.data
+        for e in await store.list(run_id=record.run_id, limit=500)
+        if e.event_name == "updates"
+    ]
+    assert live, "expected updates frames"
+    assert stored, "expected persisted updates rows"
+    for data in (*live, *stored):
+        assert key not in data["tools"]
+        assert data["tools"]["step_count"] == 1
 
 
 @pytest.mark.asyncio
