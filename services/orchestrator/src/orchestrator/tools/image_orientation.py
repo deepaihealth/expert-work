@@ -25,6 +25,9 @@ ORIENTATION_QUESTION: Final = (
 )
 #: 一次问方向的整体限时(秒),含排队等切块名额。普通快看测试环境 30 天最长 28 秒。
 ORIENTATION_TIMEOUT_S: Final = 30.0
+#: run 剩的时间扣掉留给读的那一份之后,不到这么多秒就不问了:这点时间多半等不到回答,
+#: 只会白白多一次超时。
+ORIENTATION_MIN_BUDGET_S: Final = 5.0
 #: 第 2 步试的三个角度(顺时针,在 0 度候选上转)。
 TURNS: Final = (90, 180, 270)
 #: 结论的缓存文件名,放在本 run 这张图的裁图目录里。
@@ -37,9 +40,12 @@ _OFF_VALUES: Final = frozenset({"0", "false", "off", "no"})
 Conclusion = Literal["upright", "no_text", "rotated", "undetermined", "not_asked"]
 #: 一个方向上的回答:解析出的词,或没答成的原因。
 Answer = Literal["yes", "no", "none", "off_topic", "timeout", "error"]
+#: ``not_asked`` 的原因。
+Reason = Literal["deadline", "no_copy", "no_answer", "error"]
 _WORDS: Final = ("yes", "no", "none")
 _ANSWERS: Final[dict[str, Answer]] = {answer: answer for answer in get_args(Answer)}
 _CONCLUSIONS: Final[dict[str, Conclusion]] = {c: c for c in get_args(Conclusion)}
+_REASONS: Final[dict[str, Reason]] = {r: r for r in get_args(Reason)}
 
 ROTATED_NOTE: Final = (
     "(The image was stored turned; it was rotated {degrees} degrees clockwise before reading. "
@@ -111,8 +117,11 @@ class Orientation:
     degrees: int = 0
     #: 角度(字符串)→ 回答;没问到的角度不出现。
     answers: Mapping[str, Answer] = field(default_factory=dict)
-    #: 回答第 1 步的模型(备用链上实际应答的那个);没答成是 ``None``。
-    model: str | None = None
+    #: 角度(字符串)→ 实际应答的模型(备用链上可能换了模型);没答成是 ``None``。
+    models: Mapping[str, str | None] = field(default_factory=dict)
+    #: ``not_asked`` 的原因:``deadline``(run 剩的时间不够)/ ``no_copy``(副本裁不出来)/
+    #: ``no_answer``(第 1 步没答成)/ ``error``(这一步自己出错);其余结论是 ``None``。
+    reason: Reason | None = None
     from_cache: bool = False
     #: 这一次 ``ask_image`` 为问方向多花的调用数(用了缓存是 0)。
     extra_calls: int = 0
@@ -122,7 +131,8 @@ class Orientation:
             "conclusion": self.conclusion,
             "degrees": self.degrees,
             "answers": dict(self.answers),
-            "model": self.model,
+            "models": dict(self.models),
+            "reason": self.reason,
             "from_cache": self.from_cache,
             "extra_calls": self.extra_calls,
         }
@@ -140,7 +150,8 @@ class Orientation:
             "conclusion": self.conclusion,
             "degrees": self.degrees,
             "answers": dict(self.answers),
-            "model": self.model,
+            "models": dict(self.models),
+            "reason": self.reason,
         }
         return json.dumps(payload, sort_keys=True).encode()
 
@@ -154,23 +165,38 @@ class Orientation:
         if not isinstance(payload, dict):
             return None
         raw_conclusion, degrees = payload.get("conclusion"), payload.get("degrees")
-        answers, model = payload.get("answers"), payload.get("model")
         conclusion = _CONCLUSIONS.get(raw_conclusion) if isinstance(raw_conclusion, str) else None
         if conclusion is None or not isinstance(degrees, int) or isinstance(degrees, bool):
             return None
         if degrees not in (0, *TURNS) or (degrees != 0) != (conclusion == "rotated"):
             return None
-        if not isinstance(answers, dict):
+        answers = _checked_answers(payload.get("answers"))
+        models = _checked_models(payload.get("models"))
+        raw_reason = payload.get("reason")
+        reason = _REASONS.get(raw_reason) if isinstance(raw_reason, str) else None
+        if answers is None or models is None or (raw_reason is not None and reason is None):
             return None
-        checked: dict[str, Answer] = {}
-        for key, value in answers.items():
-            answer = _ANSWERS.get(value) if isinstance(value, str) else None
-            if not isinstance(key, str) or answer is None:
-                return None
-            checked[key] = answer
-        if model is not None and not isinstance(model, str):
+        return cls(conclusion, degrees, answers, models, reason, from_cache=True, extra_calls=0)
+
+
+def _checked_answers(raw: object) -> dict[str, Answer] | None:
+    if not isinstance(raw, dict):
+        return None
+    checked: dict[str, Answer] = {}
+    for key, value in raw.items():
+        answer = _ANSWERS.get(value) if isinstance(value, str) else None
+        if not isinstance(key, str) or answer is None:
             return None
-        return cls(conclusion, degrees, checked, model, from_cache=True, extra_calls=0)
+        checked[key] = answer
+    return checked
+
+
+def _checked_models(raw: object) -> dict[str, str | None] | None:
+    if not isinstance(raw, dict):
+        return None
+    if not all(isinstance(k, str) and (v is None or isinstance(v, str)) for k, v in raw.items()):
+        return None
+    return dict(raw)
 
 
 def orientation_switch_on() -> bool:

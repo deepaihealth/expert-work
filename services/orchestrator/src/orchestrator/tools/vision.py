@@ -76,6 +76,7 @@ from orchestrator.tools.figure_lookup import (
 from orchestrator.tools.file_ops import _require_path
 from orchestrator.tools.image_orientation import (
     CACHE_NAME,
+    ORIENTATION_MIN_BUDGET_S,
     ORIENTATION_QUESTION,
     ORIENTATION_TIMEOUT_S,
     TURNS,
@@ -467,7 +468,9 @@ class AskImageTool:
         if resolved_from is not None:
             meta["resolved_from"] = resolved_from
         # B-301 —— 先问方向(只对上传图 / 工作区图片,能力开着时);之后整张、横条、区域都按它。
-        located = await self._oriented(located, ctx=ctx)
+        # 留给读的时间 = 读那一次今天能拿到的上限(``auto`` 一律快看)。
+        reserve_s = self._limit_s("quick" if region == AUTO_REGION else depth)
+        located = await self._oriented(located, ctx=ctx, reserve_s=reserve_s)
         if located.orientation is not None:
             meta["orientation"] = located.orientation.meta()
         if region == AUTO_REGION:
@@ -863,6 +866,14 @@ class AskImageTool:
             f"{RENDERED_CROP_DIR}/{source_sha}",
         )
 
+    def _crop_ref(self, out_dir: str, box: Box, *, degrees: int, ctx: ToolContext) -> str:
+        """``_write_crops`` 给这个框、这个角度写的那个文件的 ref(不碰存储)。"""
+        if ctx.tenant_id is None or ctx.user_id is None:
+            msg = "ask_image 'region' needs a workspace and a tenant, user and run binding"
+            raise ToolBlockedError(msg)
+        rel = f"{_crop_target(out_dir, degrees)}/{region_crop_stem(box)}.jpg"
+        return workspace_figure_ref(ctx.tenant_id, ctx.user_id, rel)
+
     async def _write_crops(
         self,
         data: bytes,
@@ -878,7 +889,7 @@ class AskImageTool:
         if store is None or ctx.tenant_id is None or ctx.user_id is None:
             msg = "ask_image 'region' needs a workspace and a tenant, user and run binding"
             raise ToolBlockedError(msg)
-        target = out_dir if degrees == 0 else f"{out_dir}/r{degrees}"
+        target = _crop_target(out_dir, degrees)
         names = {region_crop_stem(box) + ".jpg" for box in boxes}
         lister = _ScopeLister(
             store=store, tenant_id=ctx.tenant_id, user_id=ctx.user_id, scope=SCOPE_USER_ROOT
@@ -907,17 +918,18 @@ class AskImageTool:
             )
         return RegionRender(crops=tuple(crops))
 
-    async def _oriented(self, located: _Located, *, ctx: ToolContext) -> _Located:
+    async def _oriented(self, located: _Located, *, ctx: ToolContext, reserve_s: float) -> _Located:
         """B-301 —— 读之前定方向(设计 §4.1)。不该问的原样返回;问方向出任何错都按「没问成」、
-        按 0 度往下读 —— 看图绝不因为问方向而失败。"""
+        按 0 度往下读 —— 看图绝不因为问方向而失败。``reserve_s`` 是留给读的那一份时间
+        (见 :meth:`_orientation_budget`)。"""
         if not self._asks_orientation(located, ctx=ctx):
             return located
         try:
-            return await self._orient(located, ctx=ctx)
+            return await self._orient(located, ctx=ctx, reserve_s=reserve_s)
         except Exception:
             logger.warning("ask_image.orientation_failed", exc_info=True)
             ask_image_orientation_total.labels(conclusion="not_asked", degrees="0").inc()
-            return replace(located, orientation=Orientation("not_asked"))
+            return replace(located, orientation=Orientation("not_asked", reason="error"))
 
     def _asks_orientation(self, located: _Located, *, ctx: ToolContext) -> bool:
         """只问上传图与工作区图片文件:不问文档页(``path`` + ``unit``)、平台自己产出的图
@@ -933,45 +945,67 @@ class AskImageTool:
             return WORKSPACE_OVERFLOW_DIR not in PurePosixPath(rel).parts
         return True
 
-    async def _orient(self, located: _Located, *, ctx: ToolContext) -> _Located:
-        """本 run 这张图的方向:有缓存用缓存,没有就问并写缓存;再按结论备好整张看的 ref。
+    async def _orient(self, located: _Located, *, ctx: ToolContext, reserve_s: float) -> _Located:
+        """本 run 这张图的方向:有缓存用缓存,没有就问。
 
         缓存文件与候选副本都在这张图的裁图目录里,并行的 ``ask_image`` 在同一把目录锁上排队,
-        后来的读缓存、不再问。"""
+        后来的读缓存、不再问。整张看用的副本就是问方向时那张候选(问的时候已经写好),所以
+        **先备好它、最后才写结论**;用缓存的那次不再写任何文件 —— 同一 run 里画面不会中途换。"""
         data = (await self.image_resolver.resolve(located.ref)).data
         out_dir = self._crop_dir(data, ctx=ctx)
         async with self._render_lock((ctx.run_id, out_dir)):
             orientation = await self._cached_orientation(out_dir, ctx=ctx)
             if orientation is None:
-                orientation = await self._ask_orientation(data, out_dir, ctx=ctx)
+                orientation = await self._ask_orientation(
+                    data, out_dir, ctx=ctx, reserve_s=reserve_s
+                )
                 ask_image_orientation_total.labels(
                     conclusion=orientation.conclusion, degrees=str(orientation.degrees)
                 ).inc()
                 await self._store_orientation(out_dir, orientation, ctx=ctx)
-            whole_ref = None
-            if orientation.degrees != 0 or exif_orientation(data) != 1:
-                # 转过、或带方向标记:整张看用候选副本(已转正、约 150 万像素);正放且无标记时
-                # 原图引用原样交给模型,与今天逐字节相同。
-                render = await self._write_crops(
-                    data, out_dir, [_FULL_FRAME], degrees=orientation.degrees, ctx=ctx
-                )
-                whole_ref = render.crops[0].ref
+        whole_ref = None
+        if _reads_a_copy(orientation, data):
+            whole_ref = self._crop_ref(out_dir, _FULL_FRAME, degrees=orientation.degrees, ctx=ctx)
         return replace(
             located, degrees=orientation.degrees, whole_ref=whole_ref, orientation=orientation
         )
 
-    async def _ask_orientation(self, data: bytes, out_dir: str, *, ctx: ToolContext) -> Orientation:
-        """问方向的两步(设计 §4.1);候选副本裁不出来(图解不开……)= 没问成。"""
+    def _orientation_budget(self, ctx: ToolContext, reserve_s: float) -> float | None:
+        """这一轮问方向最多等多久:``orientation_timeout_s``,且 run 的剩余时间里先扣掉留给读的
+        ``reserve_s``(读那一次今天能拿到的上限)。扣完不到 :data:`ORIENTATION_MIN_BUDGET_S`
+        就是 ``None`` —— 不问,读拿到的时间与今天相同。"""
+        budget = self.orientation_timeout_s
+        if ctx.deadline_at is not None:
+            spare = ctx.deadline_at - time.monotonic() - reserve_s
+            if spare < ORIENTATION_MIN_BUDGET_S:
+                return None
+            budget = min(budget, spare)
+        return budget
+
+    async def _ask_orientation(
+        self, data: bytes, out_dir: str, *, ctx: ToolContext, reserve_s: float
+    ) -> Orientation:
+        """问方向的两步(设计 §4.1)。没时间、候选副本裁不出来、第 1 步没答成 = 没问成(按今天
+        的样子读);第 1 步答 no 之后没时间问第 2 步也是没问成,不对主模型说什么。"""
+        budget = self._orientation_budget(ctx, reserve_s)
+        if budget is None:
+            return Orientation("not_asked", reason="deadline")
         try:
             zero = await self._write_crops(data, out_dir, [_FULL_FRAME], degrees=0, ctx=ctx)
         except Exception:
             logger.warning("ask_image.orientation_candidate_failed", exc_info=True)
-            return Orientation("not_asked")
-        first, model = await self._orientation_answer(zero.crops[0].ref, ctx=ctx)
+            return Orientation("not_asked", reason="no_copy")
+        first, first_model = await self._orientation_answer(zero.crops[0].ref, budget, ctx=ctx)
         answers: dict[str, Answer] = {"0": first}
+        models: dict[str, str | None] = {"0": first_model}
         conclusion = first_conclusion(first)
+        if conclusion == "not_asked":
+            return Orientation(conclusion, 0, answers, models, "no_answer", extra_calls=1)
         if conclusion is not None:
-            return Orientation(conclusion, 0, answers, model, extra_calls=1)
+            return Orientation(conclusion, 0, answers, models, extra_calls=1)
+        budget = self._orientation_budget(ctx, reserve_s)
+        if budget is None:
+            return Orientation("not_asked", 0, answers, models, "deadline", extra_calls=1)
         try:
             turned = [
                 (await self._write_crops(data, out_dir, [_FULL_FRAME], degrees=turn, ctx=ctx))
@@ -981,36 +1015,44 @@ class AskImageTool:
             ]
         except Exception:
             logger.warning("ask_image.orientation_candidate_failed", exc_info=True)
-            return Orientation("undetermined", 0, answers, model, extra_calls=1)
-        replies = await asyncio.gather(*(self._orientation_answer(ref, ctx=ctx) for ref in turned))
-        by_turn = {turn: reply for turn, (reply, _model) in zip(TURNS, replies, strict=True)}
-        answers.update({str(turn): reply for turn, reply in by_turn.items()})
+            return Orientation("undetermined", 0, answers, models, extra_calls=1)
+        replies = await asyncio.gather(
+            *(self._orientation_answer(ref, budget, ctx=ctx) for ref in turned)
+        )
+        by_turn: dict[int, Answer] = {}
+        for turn, (reply, model) in zip(TURNS, replies, strict=True):
+            by_turn[turn] = reply
+            answers[str(turn)] = reply
+            models[str(turn)] = model
         conclusion, degrees = turned_conclusion(by_turn)
-        return Orientation(conclusion, degrees, answers, model, extra_calls=1 + len(TURNS))
+        return Orientation(conclusion, degrees, answers, models, extra_calls=1 + len(TURNS))
 
-    async def _orientation_answer(self, ref: str, *, ctx: ToolContext) -> tuple[Answer, str | None]:
-        """问一次「正不正」:快看那条链、被厂商拒不退回正常看图、限时(含排队等切块名额)。
-        回答照常扣池 / 记账。返回 ``(回答, 应答的模型)``;从不抛 ``Exception``。"""
+    async def _orientation_answer(
+        self, ref: str, budget_s: float, *, ctx: ToolContext
+    ) -> tuple[Answer, str | None]:
+        """问一次「正不正」:快看那条链、被厂商拒不退回正常看图、最多等 ``budget_s``(含排队等
+        切块名额)。回答照常扣池 / 记账。返回 ``(回答, 应答的模型)``;**任何** ``Exception``
+        (含调用之后的记账)都变成 ``error``,从不往外抛 —— 第 2 步的 gather 因此不会半途抛出、
+        留下还在跑的另外两个。"""
         try:
-            async with asyncio.timeout(self.orientation_timeout_s):
-                slots = _tile_slots()
-                async with slots:
+            async with asyncio.timeout(budget_s):
+                async with _tile_slots():
                     response = await self._ask(
                         _messages(ref, ORIENTATION_QUESTION),
                         depth="quick",
                         ctx=ctx,
                         deep_fallback=False,
                     )
+            await self._meter(response, ctx=ctx)
+            model = self._served_model(response)
         except TimeoutError:
             return "timeout", None
         except Exception as exc:
             logger.info("ask_image.orientation_not_answered err=%s", type(exc).__name__)
             return "error", None
-        await self._meter(response, ctx=ctx)
-        model = self._served_model(response)
         word = parse_orientation_reply(_stringify(response.content))
         if word is None:
-            ask_image_orientation_off_topic_total.labels(model=self.vl_model_name).inc()
+            ask_image_orientation_off_topic_total.labels(model=model or "").inc()
             return "off_topic", model
         return word, model
 
@@ -1125,6 +1167,13 @@ class AskImageTool:
         )
         raise GuidedToolError(msg, advice=_TRUNCATED_ADVICE)
 
+    def _limit_s(self, depth: AskImageDepth) -> float:
+        """一次看图调用自己的上限(还没按 run 的剩余时间收紧)。"""
+        if depth == "deep" and self.quick_vl_caller is not None:
+            # B-257 —— deep 超时有快看兜底(B-252),不必等满整体上限。
+            return min(self.deep_timeout_s, self.timeout_s)
+        return self.timeout_s
+
     async def _call_with_limit(
         self,
         caller: LLMCaller,
@@ -1142,10 +1191,7 @@ class AskImageTool:
         重试一次」。调用没有返回,
         所以调用方不扣池也不记账(与 Task 9「失败不记账」一致)。
         """
-        limit_s = self.timeout_s
-        if depth == "deep" and self.quick_vl_caller is not None:
-            # B-257 —— deep 超时有快看兜底(B-252),不必等满整体上限。
-            limit_s = min(self.deep_timeout_s, limit_s)
+        limit_s = self._limit_s(depth)
         by_run_deadline = False
         if ctx.deadline_at is not None:
             remaining_s = ctx.deadline_at - time.monotonic()
@@ -1604,6 +1650,20 @@ def _messages(ref_str: str, text: str) -> list[BaseMessage]:
         SystemMessage(content=_SYSTEM_PROMPT),
         HumanMessage(content=[{"type": "text", "text": text}, image_ref_block(ref_str)]),
     ]
+
+
+def _crop_target(out_dir: str, degrees: int) -> str:
+    """裁图写在哪个目录:0 度就是 ``out_dir``,转过的放 ``r<角度>/`` 子目录(B-301)。"""
+    return out_dir if degrees == 0 else f"{out_dir}/r{degrees}"
+
+
+def _reads_a_copy(orientation: Orientation, data: bytes) -> bool:
+    """B-301 —— 整张看要不要用候选副本:转过的、或带方向标记(副本已按标记转正)的用;
+    没问成的一律按今天的样子读原图,正放且无标记的也读原图(引用与今天逐字节相同)。
+    用副本的这几种结论,问方向时那张副本都已经写好了。"""
+    if orientation.conclusion == "not_asked":
+        return False
+    return orientation.degrees != 0 or exif_orientation(data) != 1
 
 
 def _with_orientation_note(content: str, located: _Located) -> str:

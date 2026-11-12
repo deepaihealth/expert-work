@@ -8,8 +8,10 @@ meta 里记下角度,才说明它真的把图转正了。
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import io
 import json
+import time
 from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -33,10 +35,11 @@ from orchestrator.multimodal import (
     is_cacheable_image_ref,
     parse_rendered_figure_ref,
 )
-from orchestrator.tools import image_orientation, region_zoom
+from orchestrator.tools import image_orientation, region_zoom, vision
 from orchestrator.tools.assembly import ToolEnv, build_tool_registry
 from orchestrator.tools.image_orientation import (
     ORIENTATION_ENV,
+    ORIENTATION_MIN_BUDGET_S,
     ORIENTATION_QUESTION,
     ask_image_orientation_off_topic_total,
     ask_image_orientation_total,
@@ -140,6 +143,8 @@ class _Vision:
     resolver: ImageResolver
     orient: Orient = _default_orient
     calls: list[tuple[str, str]] = field(default_factory=list)
+    #: 按 ref 报「实际应答的模型」(写进 ``response_metadata``,备用链上换了模型时用)。
+    served_by: Callable[[str], str] | None = None
 
     async def __call__(self, *, messages: Sequence[BaseMessage], tools: Sequence[Any]) -> AIMessage:
         question, ref = _sent(messages)
@@ -150,7 +155,8 @@ class _Vision:
         else:
             reply = SECRET if _is_upright(image) else WRONG
         usage = {"input_tokens": 10, "output_tokens": 1, "total_tokens": 11}
-        return AIMessage(content=reply, usage_metadata=usage)  # type: ignore[arg-type]
+        served = {"model_name": self.served_by(ref)} if self.served_by is not None else {}
+        return AIMessage(content=reply, usage_metadata=usage, response_metadata=served)  # type: ignore[arg-type]
 
     @property
     def orientation_refs(self) -> list[str]:
@@ -945,21 +951,32 @@ def test_the_second_step_needs_three_answers_and_exactly_one_yes(
 
 def test_the_cache_round_trips_and_refuses_anything_malformed() -> None:
     orientation = image_orientation.Orientation(
-        "rotated", 90, {"0": "no", "90": "yes", "180": "no", "270": "no"}, "vl", extra_calls=4
+        "rotated",
+        90,
+        {"0": "no", "90": "yes", "180": "no", "270": "timeout"},
+        {"0": "vl", "90": "vl", "180": "backup", "270": None},
+        extra_calls=4,
     )
-    back = image_orientation.Orientation.from_cache_bytes(orientation.cache_bytes())
-    assert back is not None
-    assert back.meta() == orientation.meta() | {"from_cache": True, "extra_calls": 0}
+    not_asked = image_orientation.Orientation(
+        "not_asked", 0, {"0": "no"}, {"0": "vl"}, "deadline", extra_calls=1
+    )
+    for original in (orientation, not_asked):
+        back = image_orientation.Orientation.from_cache_bytes(original.cache_bytes())
+        assert back is not None
+        assert back.meta() == original.meta() | {"from_cache": True, "extra_calls": 0}
+    ok = '"answers": {}, "models": {}, "reason": null'
     for raw in (
         b"not json",
         b"[]",
-        b'{"conclusion": "sideways", "degrees": 0, "answers": {}, "model": null}',
-        b'{"conclusion": "rotated", "degrees": 0, "answers": {}, "model": null}',
-        b'{"conclusion": "upright", "degrees": 90, "answers": {}, "model": null}',
-        b'{"conclusion": "upright", "degrees": 45, "answers": {}, "model": null}',
-        b'{"conclusion": "upright", "degrees": 0, "answers": {"0": 1}, "model": null}',
-        b'{"conclusion": "upright", "degrees": 0, "answers": {"0": "maybe"}, "model": null}',
-        b'{"conclusion": "upright", "degrees": 0, "answers": {}, "model": 3}',
+        f'{{"conclusion": "sideways", "degrees": 0, {ok}}}'.encode(),
+        f'{{"conclusion": "rotated", "degrees": 0, {ok}}}'.encode(),
+        f'{{"conclusion": "upright", "degrees": 90, {ok}}}'.encode(),
+        f'{{"conclusion": "upright", "degrees": 45, {ok}}}'.encode(),
+        b'{"conclusion": "upright", "degrees": 0, "answers": {"0": 1}, "models": {}}',
+        b'{"conclusion": "upright", "degrees": 0, "answers": {"0": "maybe"}, "models": {}}',
+        b'{"conclusion": "upright", "degrees": 0, "answers": {}, "models": {"0": 3}}',
+        b'{"conclusion": "upright", "degrees": 0, "answers": {}}',
+        b'{"conclusion": "not_asked", "degrees": 0, "answers": {}, "models": {}, "reason": "x"}',
     ):
         assert image_orientation.Orientation.from_cache_bytes(raw) is None, raw
 
@@ -998,3 +1015,280 @@ def test_turned_crops_keep_the_crop_shape(tail: str, is_crop: bool) -> None:
         ref = workspace_figure_ref(uuid4(), uuid4(), f"agents/{_KEY}/{tail}")
         assert is_cacheable_image_ref(ref) is is_crop
         assert parse_rendered_figure_ref(ref) is None
+
+
+# ---------------------------------------------------------------------------
+# 审查回修(feb683690 之后)
+# ---------------------------------------------------------------------------
+
+
+def _with_deadline(up: _Setup, seconds: float) -> None:
+    up.ctx = dataclasses.replace(up.ctx, deadline_at=time.monotonic() + seconds)
+
+
+def _slow(step_one: float, step_two: float) -> Orient:
+    """第 1 步睡 ``step_one`` 秒答 no,第 2 步每个方向睡 ``step_two`` 秒答 no。"""
+
+    async def orient(ref: str, _image: Image.Image) -> str:
+        await asyncio.sleep(step_two if "/r" in ref.rsplit("/crops/", 1)[1] else step_one)
+        return "no"
+
+    return orient
+
+
+async def test_with_little_run_time_left_nothing_is_asked_and_the_read_succeeds(
+    tmp_path: Path,
+) -> None:
+    """M1 —— run 剩的时间不够「留给读的那一份 + 下限」:一次都不问,读照常成功(与今天相同)。
+    没有这道检查时,问方向把剩余时间吃光,读那一次报「run 没时间了」。"""
+    # 读的上限是默认的 120 秒:run 只剩 3 秒,留给读的都不够,更不用说问方向。
+    up = _setup(tmp_path, _stored(90), orient=_slow(1.0, 30.0))
+    up.tool = dataclasses.replace(up.tool, orientation_timeout_s=30.0)
+    _with_deadline(up, 3.0)
+
+    result = await up.look(image_ref=up.ref)
+
+    assert result.content == WRONG  # 读成功(按原图),不对主模型说什么
+    assert up.vision.orientation_refs == []
+    orientation = result.meta["orientation"]
+    assert (orientation["conclusion"], orientation["reason"]) == ("not_asked", "deadline")
+    assert orientation["extra_calls"] == 0
+
+
+async def test_time_for_step_one_but_not_step_two_reads_at_zero_without_a_note(
+    tmp_path: Path,
+) -> None:
+    """M1 —— 第 1 步问完时剩的时间不够第 2 步:按 0 度读,记「没问成(deadline)」,不加任何说明。"""
+    # 读的上限 1 秒;开问时多出下限 0.5 秒,第 1 步答 no 用掉 0.8 秒,剩下的不够第 2 步。
+    up = _setup(tmp_path, _stored(90), orient=_slow(0.8, 30.0), timeout_s=1.0)
+    up.tool = dataclasses.replace(up.tool, orientation_timeout_s=30.0)
+    _with_deadline(up, 1.0 + ORIENTATION_MIN_BUDGET_S + 0.5)
+
+    result = await up.look(image_ref=up.ref)
+    again = await up.look(image_ref=up.ref)
+
+    assert result.content == WRONG
+    assert len(up.vision.orientation_refs) == 1  # 只问了第 1 步
+    orientation = result.meta["orientation"]
+    assert (orientation["conclusion"], orientation["degrees"]) == ("not_asked", 0)
+    assert orientation["reason"] == "deadline"
+    assert orientation["answers"] == {"0": "no"}
+    assert up.vision.read_refs[0] == up.ref
+    assert again.content == WRONG and again.meta["orientation"]["from_cache"] is True
+
+
+async def test_without_a_run_deadline_the_budget_is_the_orientation_cap(tmp_path: Path) -> None:
+    up = _setup(tmp_path, _stored(90), timeout_s=1.0)
+
+    result = await up.look(image_ref=up.ref)
+
+    assert result.meta["orientation"]["conclusion"] == "rotated"
+    assert result.meta["orientation"]["reason"] is None
+
+
+async def test_an_exif_image_too_large_to_copy_is_not_asked_once_per_run(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """L1 —— 带方向标记、却大到裁不了副本:每张图每 run 只记一次「没问成」,之后用缓存;
+    整张看用原图引用(与今天相同)。"""
+    monkeypatch.setattr(region_zoom, "MAX_DECODE_PIXELS", 1000)
+    raw = _exif_jpeg(_stored(90), orientation=6)
+    up = _setup(tmp_path, _stored(0))
+    rel = f"agents/{_KEY}/threads/{_CONV}/work/photo.jpg"
+    target = up.root / str(up.ctx.tenant_id) / str(up.ctx.user_id) / rel
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_bytes(raw)
+    original = workspace_figure_ref(up.ctx.tenant_id, up.ctx.user_id, rel)  # type: ignore[arg-type]
+    before = _counter("not_asked", 0)
+
+    metas = [(await up.look(path="/workspace/photo.jpg")).meta["orientation"] for _ in range(3)]
+
+    assert _counter("not_asked", 0) == before + 1
+    assert [m["from_cache"] for m in metas] == [False, True, True]
+    assert all(m["conclusion"] == "not_asked" for m in metas)
+    assert up.vision.orientation_refs == []
+    assert up.vision.read_refs == [original] * 3
+
+
+@dataclass
+class _RecordingStore(NasWorkspaceStore):
+    """记下每次写的路径(按先后)。"""
+
+    writes: list[str] = field(default_factory=list)
+
+    async def write_file(self, *, tenant_id: UUID, user_id: UUID, path: str, data: bytes) -> None:
+        self.writes.append(path)
+        await super().write_file(tenant_id=tenant_id, user_id=user_id, path=path, data=data)
+
+
+async def test_the_decision_is_cached_only_after_the_whole_image_copy_exists(
+    tmp_path: Path,
+) -> None:
+    """L2 —— 先备好整张看的副本,最后才写结论;之后这次 run 里不再为它写任何文件。"""
+    up = _setup(tmp_path, _stored(90))
+    store = _RecordingStore(root=str(up.root))
+    tool = dataclasses.replace(up.tool, workspace_store=store)
+
+    first = await tool.call({"image_ref": up.ref, "question": "q"}, ctx=up.ctx)
+    written = list(store.writes)
+    second = await tool.call({"image_ref": up.ref, "question": "q"}, ctx=up.ctx)
+
+    assert written[-1].endswith("/orientation.json")
+    assert any(path.endswith(f"/r90/{_FULL}") for path in written[:-1])
+    assert store.writes == written  # 用缓存的那次一个文件都不写
+    assert first.content.startswith(SECRET) and second.content.startswith(SECRET)
+    assert up.vision.read_refs[0] == up.vision.read_refs[1]
+
+
+@dataclass
+class _NoWrites(NasWorkspaceStore):
+    """不许写任何文件(读、列目录照常)。"""
+
+    async def write_file(self, *, tenant_id: UUID, user_id: UUID, path: str, data: bytes) -> None:
+        msg = "the workspace is read-only right now"
+        raise OSError(msg)
+
+
+async def test_a_cached_turn_survives_failing_writes_and_keeps_the_frame(tmp_path: Path) -> None:
+    """L2 —— 结论已缓存为转 90 度之后写文件坏了:之后的整张看仍按 90 度(同一个副本),不退回 0 度。"""
+    up = _setup(tmp_path, _stored(90))
+    first = await up.look(image_ref=up.ref)
+    broken = dataclasses.replace(up.tool, workspace_store=_NoWrites(root=str(up.root)))
+
+    second = await broken.call({"image_ref": up.ref, "question": "q"}, ctx=up.ctx)
+
+    assert second.meta["orientation"]["degrees"] == 90
+    assert second.meta["orientation"]["from_cache"] is True
+    assert second.content.startswith(SECRET)
+    assert up.vision.read_refs[1] == up.vision.read_refs[0]
+    assert first.meta["orientation"]["degrees"] == 90
+
+
+@dataclass
+class _TurnedDirBreaksAfterDecision(NasWorkspaceStore):
+    """结论写进 ``orientation.json`` 之后,列 ``r90/`` 目录就坏(写结论之前照常)。"""
+
+    async def list_dir(self, **kwargs: Any) -> Any:
+        path = str(kwargs.get("path", ""))
+        decided = any(Path(self.root).rglob("orientation.json"))
+        if decided and path.endswith("/r90"):
+            msg = "listing is down"
+            raise RuntimeError(msg)
+        return await super().list_dir(**kwargs)
+
+
+async def test_storage_trouble_after_the_decision_never_changes_the_frame(tmp_path: Path) -> None:
+    """L2 —— 结论写好之后存储出问题:这一次和之后每一次都按同一个角度读(以前这一次会退回 0 度,
+    之后的又按缓存转 90 度 —— 同一 run 里画面中途换了)。"""
+    up = _setup(tmp_path, _stored(90))
+    tool = dataclasses.replace(
+        up.tool, workspace_store=_TurnedDirBreaksAfterDecision(root=str(up.root))
+    )
+
+    first = await tool.call({"image_ref": up.ref, "question": "q"}, ctx=up.ctx)
+    second = await tool.call({"image_ref": up.ref, "question": "q"}, ctx=up.ctx)
+
+    assert [r.meta["orientation"]["degrees"] for r in (first, second)] == [90, 90]
+    assert first.content.startswith(SECRET) and second.content.startswith(SECRET)
+    assert up.vision.read_refs[0] == up.vision.read_refs[1]
+
+
+async def test_a_meter_that_raises_in_step_two_is_that_direction_failing(tmp_path: Path) -> None:
+    """L3 —— 第 2 步某个方向答完之后记账抛错:只算那个方向失败(判不出),gather 不抛,看图照常。"""
+
+    async def meter(response: AIMessage, *, tenant_id: UUID, user_id: UUID | None) -> None:
+        if response.content == "Yes.":
+            msg = "usage store is down"
+            raise RuntimeError(msg)
+
+    up = _setup(tmp_path, _stored(90), usage_meter=meter)
+
+    result = await up.look(image_ref=up.ref)
+
+    orientation = result.meta["orientation"]
+    assert orientation["conclusion"] == "undetermined"
+    assert orientation["answers"] == {"0": "no", "90": "error", "180": "no", "270": "no"}
+    assert result.content.startswith(WRONG)
+
+
+async def test_a_cancelled_step_two_releases_the_lock_and_the_tile_slots(tmp_path: Path) -> None:
+    """L4 —— 第 2 步进行中被取消:目录锁和切块名额都还回去,同一张图之后照常能看。"""
+    started = asyncio.Event()
+
+    async def orient(ref: str, _image: Image.Image) -> str:
+        if "/r" in ref.rsplit("/crops/", 1)[1]:
+            started.set()
+            await asyncio.sleep(30)
+        return "no"
+
+    up = _setup(tmp_path, _stored(90), orient=orient, orientation_timeout_s=60.0)
+    look = asyncio.create_task(up.look(image_ref=up.ref))
+    await asyncio.wait_for(started.wait(), 5)
+    await asyncio.sleep(0.05)
+
+    look.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await look
+
+    assert vision._tile_slots()._value == vision.MAX_TILE_CALLS_IN_FLIGHT
+    up.vision.orient = _default_orient
+    result = await asyncio.wait_for(up.look(image_ref=up.ref), 5)  # 锁没被占着
+    assert result.meta["orientation"]["degrees"] == 90
+
+
+async def test_a_refusal_on_the_default_route_does_not_fall_back_to_the_plain_route(
+    tmp_path: Path,
+) -> None:
+    """L4 —— 没有单独的快看路由时,问方向走 ``vl_caller``;被厂商拒也不退回配置原样的路由。"""
+    rejected = LLMClientError("400 invalid image")
+    rejected.status = 400
+    plain = _Plain()
+    up = _setup(tmp_path, _stored(90), orient=_orient_by_dir({"0": rejected}))
+    tool = AskImageTool(
+        vl_caller=up.vision,
+        plain_vl_caller=plain,
+        image_resolver=up.resolver,
+        workspace_store=up.tool.workspace_store,
+        ask_orientation=True,
+    )
+
+    result = await tool.call({"image_ref": up.ref, "question": "?"}, ctx=up.ctx)
+
+    assert result.meta["orientation"]["conclusion"] == "not_asked"
+    assert ORIENTATION_QUESTION not in plain.calls
+    assert len(up.vision.orientation_refs) == 1
+
+
+async def test_each_direction_records_the_model_that_answered_it(tmp_path: Path) -> None:
+    """L5 —— 备用链上换了模型时,每个方向记实际应答的模型;答非所问按实际应答的模型计数。"""
+
+    def served_by(ref: str) -> str:
+        return "backup-vl" if "/r180/" in ref else "main-vl"
+
+    async def orient(ref: str, image: Image.Image) -> str:
+        if "/r180/" in ref:
+            return "It shows a label."
+        return await _default_orient(ref, image)
+
+    counter = ask_image_orientation_off_topic_total.labels(model="backup-vl")
+    before = counter._value.get()
+    up = _setup(
+        tmp_path,
+        _stored(90),
+        orient=orient,
+        vl_model_name="main-vl",
+        output_cap_resolver=lambda r: ("p", str(r.response_metadata.get("model_name", "")), None),
+    )
+    up.vision.served_by = served_by
+
+    result = await up.look(image_ref=up.ref)
+
+    orientation = result.meta["orientation"]
+    assert orientation["models"] == {
+        "0": "main-vl",
+        "90": "main-vl",
+        "180": "backup-vl",
+        "270": "main-vl",
+    }
+    assert orientation["answers"]["180"] == "off_topic"
+    assert counter._value.get() == before + 1
