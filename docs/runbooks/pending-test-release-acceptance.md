@@ -2546,12 +2546,12 @@ asyncio.run(main())
 
 **怎么进(只在测试环境)**:平台租户,调试台。临时智能体 `acc-b301-orient`:主模型用一个**不能看图**的模型(例如 glm-5.3,`supports_vision: false`),配 `vision` 块,看图模型用测试环境在用的 `doubao-seed-2-1-pro-260628`;提示词写「Use ask_image to look at images. Report exactly what it returns.」。测试图本机用 Pillow 合成(不进仓库,不用真实照片):白底 1600×1200,中间一行大号黑字 `TEST 47.3 kg`,存成 `upright.jpg`(不带方向标记);再存一份 `sideways.jpg` = `Image.open("upright.jpg").rotate(90, expand=True)`(逆时针转 90 度,要顺时针转 90 度才正)。看哪里:调试台轨迹里 `ask_image` 的结果与 meta;Langfuse 这一轮看图模型的 generation;control-plane pod 的 `/metrics`(发之前先读一次做基数);需要时看 NAS 上这个 run 的 `.tool_results/<run>/crops/`。**花费**:几轮短对话,每张图多 1~4 次看图调用,< ¥1。
 
-- [ ] **114.1 横着的上传图:转 90 度后读**:新会话上传 `sideways.jpg`,说「用 ask_image 看图里写的数字是多少」。判据:`ask_image` meta 有 `orientation`,`conclusion="rotated"`、`degrees=90`、`answers={"0":"no","90":"yes","180":"no","270":"no"}`、`from_cache=false`、`extra_calls=4`;工具结果末尾有 `rotated 90 degrees clockwise before reading`;Langfuse 里这次 `ask_image` 对应 5 次看图调用(4 次问方向 + 1 次读),读的那次输入的是转正的图(Langfuse 不显示图时,看 NAS 上 `crops/<图哈希>/r90/0-0-1000-1000.jpg` 存在且字是正的);回答是 47.3;`expert_work_ask_image_orientation_total{conclusion="rotated",degrees="90"}` 比基数 +1。**判据红的情形**:meta 里**没有** `orientation`(代码没生效)、`extra_calls` 不是 4、或结论是 `rotated` 但读的不是 `r90/` 下的副本。结论是 `upright` / `undetermined` 而 `answers` 里有模型的原话回答,算**模型判错不是代码错**:把 `answers` 原样记进 PR 评论,交给 PR 2 体检,不挡本节其余条目。
-- [ ] **114.2 同一 run 再看:不再问**:在 114.1 同一轮里接着说「再用 ask_image 只看图的上半部分,region 用 [0, 0, 1000, 500]」(或让模型在同一轮里第二次调用 `ask_image`)。判据:第二次的 meta `orientation.from_cache=true`、`extra_calls=0`、`degrees=90`;Langfuse 里第二次只有 1 次看图调用;NAS 上的局部在 `r90/0-0-1000-500.jpg`;结果末尾仍有 rotated 那句。**判据红的情形**:第二次又问了方向(多出 4 次调用),或局部不在 `r90/` 下。
-- [ ] **114.3 正放的上传图:只多 1 次调用,引用不变**:新会话上传 `upright.jpg`,同样的问法。判据:meta `orientation.conclusion="upright"`、`degrees=0`、`answers={"0":"yes"}`、`extra_calls=1`;Langfuse 里共 2 次看图调用,读的那次输入的图引用就是 meta `image_ref` 那个 `expert_work://image/...`(原图,不是 `crops/` 下的副本);工具结果末尾**没有**任何 orientation 说明;回答是 47.3。**判据红的情形**:读的是副本、多于 1 次问方向、或结果里出现 rotated / could not be determined 字样。若 `conclusion` 是 `rotated`(把正放的图转歪了),这是体检最关心的那类错:立即记下 `answers` 与 `degrees` 贴 PR 评论并告知用户,**这一条算红,挡发布**。
-- [ ] **114.4 文档页不问**:新会话上传一份任意 PDF,说「先 read_page 看第 1 页,再用 ask_image 问这一页的标题」。判据:`ask_image` 的 meta **没有** `orientation`,Langfuse 里没有问方向的调用(没有 `Look only at orientation` 那句)。**判据红的情形**:出现 `orientation` 字段或问方向的调用。
-- [ ] **114.5 运维紧急开关(可选,要改环境变量)**:在测试环境 control-plane 的部署上设 `EXPERT_WORK_ASK_IMAGE_ORIENTATION=0` 并重启,重复 114.1。判据:meta **没有** `orientation`,Langfuse 里只有 1 次看图调用,读的是原图引用,回答多半读错(这就是对照)。做完**必须**把环境变量删掉(或设回 `1`)并重启,再跑一遍 114.3 确认又开了。**判据红的情形**:设了 `0` 之后仍在问方向。这一条要改部署,不方便时可以跳过(单元测试 `test_control_with_the_switch_off_a_turned_image_is_read_wrong` / `test_assembly_asks_for_every_vision_model_unless_the_switch_is_off` 覆盖了开关)。
-- [ ] **114.6 收尾**:删 `acc-b301-orient` 及其会话;本机删掉两张合成图。
+- [x] **114.1 横着的上传图:转 90 度后读**:新会话上传 `sideways.jpg`,说「用 ask_image 看图里写的数字是多少」。判据:`ask_image` meta 有 `orientation`,`conclusion="rotated"`、`degrees=90`、`answers={"0":"no","90":"yes","180":"no","270":"no"}`、`from_cache=false`、`extra_calls=4`;工具结果末尾有 `rotated 90 degrees clockwise before reading`;Langfuse 里这次 `ask_image` 对应 5 次看图调用(4 次问方向 + 1 次读),读的那次输入的是转正的图(Langfuse 不显示图时,看 NAS 上 `crops/<图哈希>/r90/0-0-1000-1000.jpg` 存在且字是正的);回答是 47.3;`expert_work_ask_image_orientation_total{conclusion="rotated",degrees="90"}` 比基数 +1。**判据红的情形**:meta 里**没有** `orientation`(代码没生效)、`extra_calls` 不是 4、或结论是 `rotated` 但读的不是 `r90/` 下的副本。结论是 `upright` / `undetermined` 而 `answers` 里有模型的原话回答,算**模型判错不是代码错**:把 `answers` 原样记进 PR 评论,交给 PR 2 体检,不挡本节其余条目。 **11-12 测试 `69b15c916` 过**:`conclusion=rotated`、`degrees=90`、`answers={"0":"no","90":"yes","180":"no","270":"no"}`(4 次都是 doubao-seed-2-1-pro-260628)、`extra_calls=4`;Langfuse 5 次看图调用,读的那次引用 `crops/<哈希>/r90/0-0-1000-1000.jpg`(NAS 上的副本字是正的);回答 47.3;计数 `{rotated,90}` +1。
+- [x] **114.2 同一 run 再看:不再问**:在 114.1 同一轮里接着说「再用 ask_image 只看图的上半部分,region 用 [0, 0, 1000, 500]」(或让模型在同一轮里第二次调用 `ask_image`)。判据:第二次的 meta `orientation.from_cache=true`、`extra_calls=0`、`degrees=90`;Langfuse 里第二次只有 1 次看图调用;NAS 上的局部在 `r90/0-0-1000-500.jpg`;结果末尾仍有 rotated 那句。**判据红的情形**:第二次又问了方向(多出 4 次调用),或局部不在 `r90/` 下。 **11-12 测试 `69b15c916` 过**:第二次 `from_cache=true`、`extra_calls=0`、`degrees=90`,Langfuse 只 1 次看图调用,引用 `r90/0-0-1000-500.jpg`,rotated 那句仍在。
+- [x] **114.3 正放的上传图:只多 1 次调用,引用不变**:新会话上传 `upright.jpg`,同样的问法。判据:meta `orientation.conclusion="upright"`、`degrees=0`、`answers={"0":"yes"}`、`extra_calls=1`;Langfuse 里共 2 次看图调用,读的那次输入的图引用就是 meta `image_ref` 那个 `expert_work://image/...`(原图,不是 `crops/` 下的副本);工具结果末尾**没有**任何 orientation 说明;回答是 47.3。**判据红的情形**:读的是副本、多于 1 次问方向、或结果里出现 rotated / could not be determined 字样。若 `conclusion` 是 `rotated`(把正放的图转歪了),这是体检最关心的那类错:立即记下 `answers` 与 `degrees` 贴 PR 评论并告知用户,**这一条算红,挡发布**。 **11-12 测试 `69b15c916` 过**:`upright`、`degrees=0`、`answers={"0":"yes"}`、`extra_calls=1`;2 次看图调用,读的是原图引用;无说明;回答 47.3;计数 `{upright,0}` +1。114.5 之后重跑一次同样通过。
+- [x] **114.4 文档页不问**:新会话上传一份任意 PDF,说「先 read_page 看第 1 页,再用 ask_image 问这一页的标题」。判据:`ask_image` 的 meta **没有** `orientation`,Langfuse 里没有问方向的调用(没有 `Look only at orientation` 那句)。**判据红的情形**:出现 `orientation` 字段或问方向的调用。 **11-12 测试 `69b15c916` 过**:`resolved_from={path, unit:1}`,meta 无 `orientation`,Langfuse 0 次问方向。
+- [x] **114.5 运维紧急开关(可选,要改环境变量)**:在测试环境 control-plane 的部署上设 `EXPERT_WORK_ASK_IMAGE_ORIENTATION=0` 并重启,重复 114.1。判据:meta **没有** `orientation`,Langfuse 里只有 1 次看图调用,读的是原图引用,回答多半读错(这就是对照)。做完**必须**把环境变量删掉(或设回 `1`)并重启,再跑一遍 114.3 确认又开了。**判据红的情形**:设了 `0` 之后仍在问方向。这一条要改部署,不方便时可以跳过(单元测试 `test_control_with_the_switch_off_a_turned_image_is_read_wrong` / `test_assembly_asks_for_every_vision_model_unless_the_switch_is_off` 覆盖了开关)。 **11-12 测试 `69b15c916` 过**:设 `0` 后 meta 无 `orientation`、0 次问方向、读原图引用、计数不变;对照没显出来 —— doubao 直接读横着的图也读出了 47.3(合成图字大且干净)。变量已删除(`grep -c ORIENTATION` = 0),114.3 重跑确认又开了。
+- [x] **114.6 收尾**:删 `acc-b301-orient` 及其会话;本机删掉两张合成图。 **11-12 测试 `69b15c916`**:智能体 0 行、本机合成图已删;合成会话 8 个存储层删不掉(对外 key 只能归档),同 112.9 留待控制台登录后清。
 
 **生产**:本 PR 合进去后默认对所有看图模型生效,所以**不随班车上生产,先等 PR 2 体检通过**(体检测在用的三个看图模型:doubao-seed-2-1-pro-260628、doubao-seed-2-1-pro-260915、qwen3.8-max;重点是正放的图 0 张被转)。体检通过后的生产发布:发布后读一次 `/metrics`,有 `expert_work_ask_image_orientation_total` 即说明已装上;出问题时设 `EXPERT_WORK_ASK_IMAGE_ORIENTATION=0` 重启即可回到旧行为。
 
@@ -2568,7 +2568,8 @@ from PIL import Image
 SENTENCE = "第七条 横置扫描页方向校验句 编号B301甲 设备维护记录应保存不少于三年。"
 src = pymupdf.open(); page = src.new_page()
 for i in range(18):
-    page.insert_text((60, 90 + i * 38), SENTENCE if i % 3 == 0 else "本制度适用于全体员工,各部门每季度末完成内部检查并提交书面报告。", fontname="china-s", fontsize=13)
+    line = SENTENCE if i % 3 == 0 else "本制度适用于全体员工,各部门每季度末完成内部检查并提交书面报告。"
+    page.insert_text((60, 90 + i * 38), f"{i + 1}. {line}", fontname="china-s", fontsize=13)  # 行号:否则整页重复会被识别结果的重复检测判坏
 pix = page.get_pixmap(dpi=150, alpha=False)
 upright = Image.frombytes("RGB", (pix.width, pix.height), pix.samples)
 for name, picture in (("upright.pdf", upright), ("sideways.pdf", upright.rotate(-90, expand=True))):
@@ -2580,21 +2581,21 @@ PY
 
 发测试前后各读一次运行入库的那个 control-plane pod 的 `/metrics` 做基数。**花费**:两三页识别,< ¥0.5。
 
-- [ ] **115.0 镜像自检**:判据:这次发布的 control-plane 镜像构建日志里有一行 `orientation model ok: Orientation(angle=…, confidence=…, model='af9a0a4f…', failed=False)`(builder 阶段加载模型、核对哈希、推理一张图;失败则构建失败)。
-- [ ] **115.1 横着的扫描页能搜到**:把 `sideways.pdf` 上传到 `acc-b301-orient`(确认费用预估后入库)。看哪里:文档详情的逐页记录;`/metrics`;知识库检索(调试台 `knowledge_search` 或控制台检索)。判据:第 1 页 `decision=ocr`、`status=recognized`;检索「横置扫描页方向校验句 编号B301甲」能命中这一页的段落,段落文字是正常的中文句子;`expert_work_knowledge_page_orientation_total{rotation="90"}` **+1**,`…_failures_total` 不变。**判据红的情形**:搜不到 / 段落是乱的,或计数落在 `rotation="0"`。
-- [ ] **115.2 识别缓存记了角度**(只读 SQL,把 `<document_id>` 换成 115.1 那份):
+- [x] **115.0 镜像自检**:判据:这次发布的 control-plane 镜像构建日志里有一行 `orientation model ok: Orientation(angle=…, confidence=…, model='af9a0a4f…', failed=False)`(builder 阶段加载模型、核对哈希、推理一张图;失败则构建失败)。 **11-12 测试 `69b15c916` 过**:builder 与运行阶段各一行 `orientation model ok: Orientation(angle=0, confidence=0.2557, model='af9a0a4f…', failed=False)`。
+- [x] **115.1 横着的扫描页能搜到**:把 `sideways.pdf` 上传到 `acc-b301-orient`(确认费用预估后入库)。看哪里:文档详情的逐页记录;`/metrics`;知识库检索(调试台 `knowledge_search` 或控制台检索)。判据:第 1 页 `decision=ocr`、`status=recognized`;检索「横置扫描页方向校验句 编号B301甲」能命中这一页的段落,段落文字是正常的中文句子;`expert_work_knowledge_page_orientation_total{rotation="90"}` **+1**,`…_failures_total` 不变。**判据红的情形**:搜不到 / 段落是乱的,或计数落在 `rotation="0"`。 **11-12 测试 `69b15c916` 过**(用加行号的合成件;11-12 更正:原合成件每 3 行完全重复 6 遍,识别得再准也会被 `cleaning._repeated_tail` 判成 `bad_output(repeated)` 而失败):`decision=ocr`、`status=recognized`;检索命中,段落是正常中文;`{rotation="90"}` +1(两个 pod 相加),`failures_total` 不变。
+- [x] **115.2 识别缓存记了角度**(只读 SQL,把 `<document_id>` 换成 115.1 那份):
   ```sql
   SELECT result->'page' AS page, result->'rotation' AS rotation, result->'rotation_confidence' AS confidence
   FROM knowledge_parse_cache WHERE document_id = '<document_id>' AND kind = 'page_ocr';
   ```
-  判据:一行,`rotation=90`,`confidence` 在 0.9 ~ 0.95 之间。
-- [ ] **115.3 再估一次价 = 不再收费**:对 115.1 那份点「重新入库」看费用预估。判据:扫描页识别一行「已识别 1 页、需付费 0 页」;确认入库后 `token_usage` 里这份文档没有新的识别用量行。**判据红的情形**:预估说要付费(转过的页的缓存没对上),或预估免费但实际又调了识别模型。
-- [ ] **115.4 开关关掉就搜不到(对照)**:control-plane 设 `EXPERT_WORK_KNOWLEDGE_SCAN_PAGE_ORIENTATION=false`(`kubectl set env`,等滚动完成),把同一个 `sideways.pdf` 改名 `sideways-off.pdf` 上传到同一知识库。判据:检索「编号B301甲」**命中的只有 115.1 那份**,不命中 `sideways-off.pdf`(或命中的段落是乱的);`…_page_orientation_total` 两个标签都不变。做完用 `EXPERT_WORK_KNOWLEDGE_SCAN_PAGE_ORIENTATION-` 去掉这个变量(回到默认开)。**判据红的情形**:关了还能把横着的页读对(开关没生效)。
-- [ ] **115.5 正放的 PDF 不受影响(只读核对)**:先查已有文档没被碰过 —— 在本节任何上传之前跑一次,115.6 之后再跑一次:
+  判据:一行,`rotation=90`,`confidence` 在 0.9 ~ 0.95 之间。 **11-12 测试 `69b15c916` 过**:一行,`rotation=90`,`confidence=0.923`。
+- [x] **115.3 再估一次价 = 不再收费**:对 115.1 那份点「重新入库」看费用预估。判据:扫描页识别一行「已识别 1 页、需付费 0 页」;确认入库后 `token_usage` 里这份文档没有新的识别用量行。**判据红的情形**:预估说要付费(转过的页的缓存没对上),或预估免费但实际又调了识别模型。 **11-12 测试 `69b15c916` 过**:预估「已识别 1 页、需付费 0 页」;确认后该页 `cached:true`,`token_usage` 无新的识别行。注意 `page_orientation_total{rotation="90"}` 又 +1 —— 计数器按「解析一次」记,不是按新页记,重新入库也会加。
+- [x] **115.4 开关关掉不再判方向(对照)**:control-plane 设 `EXPERT_WORK_KNOWLEDGE_SCAN_PAGE_ORIENTATION=false`(`kubectl set env`,等滚动完成),把同一个 `sideways.pdf` 改名 `sideways-off.pdf` 上传到同一知识库(内容相同会提示重复,照样入库)。判据:`…_page_orientation_total` 两个标签都不变;它的 `page_ocr` 缓存行**没有** `rotation` 键。做完用 `EXPERT_WORK_KNOWLEDGE_SCAN_PAGE_ORIENTATION-` 去掉这个变量(回到默认开)。**判据红的情形**:关了还有方向计数,或缓存行带 `rotation`。(11-12 更正:原判据「关了就搜不到」不成立 —— 测试环境的识别模型 glm-ocr 直接读干净的 90 度合成页也能读对,检索照样命中,所以检索结果分不出开关开没开;改看计数与缓存行。) **11-12 测试 `69b15c916` 过**:两个计数都不变,缓存行无 `rotation` 键;检索仍命中(文字略差:行号丢失、个别形近字错、切块 12 vs 2,符合「读的是横着的原图」)。变量已删除。
+- [x] **115.5 正放的 PDF 不受影响(只读核对)**:先查已有文档没被碰过 —— 在本节任何上传之前跑一次,115.6 之后再跑一次:
   ```sql
   SELECT count(*) FROM knowledge_parse_cache WHERE kind = 'page_ocr' AND result ? 'rotation';
   ```
-  判据:发布后、本节上传前为 **0**;最后只多出本节横着那份的行。再上传 `upright.pdf`:`…_page_orientation_total{rotation="0"}` +1,`rotation="90"` 不变;它的 `page_ocr` 缓存行**没有** `rotation` 键;检索「编号B301甲」能命中它。**判据红的情形**:正放的页被转了(计数落在 90 / 180 / 270),或有存量文档的缓存行出现 `rotation`。
-- [ ] **115.6 收尾**:删除 `acc-b301-orient` 知识库(连同三份文档)。
+  判据:发布后、本节上传前为 **0**;最后只多出本节横着那份的行。再上传 `upright.pdf`:`…_page_orientation_total{rotation="0"}` +1,`rotation="90"` 不变;它的 `page_ocr` 缓存行**没有** `rotation` 键;检索「编号B301甲」能命中它。**判据红的情形**:正放的页被转了(计数落在 90 / 180 / 270),或有存量文档的缓存行出现 `rotation`。 **11-12 测试 `69b15c916` 过**:上传前 0;上传后 1(只有横着那份);`upright.pdf` `{rotation="0"}` +1、`{90}` 不变、缓存行无 `rotation` 键、能检索命中。
+- [x] **115.6 收尾**:删除 `acc-b301-orient` 知识库(连同三份文档)。 **11-12 测试 `69b15c916` 过**:知识库、文档、切块、解析缓存均 0 行,115.5 查询回到 0。
 
 **生产**:没有单独的验收步骤(生产知识库目前没有 PDF)。发布后读一次生产 control-plane pod 的 `/metrics`:有 `expert_work_knowledge_page_orientation_failures_total` 且为 0 之前不用管;以后出现 `{rotation="90"|"180"|"270"}` 的增长,按设计 §7.6 第 4 项做 D6 确认率(测试环境只读抽样,生产由用户跑同一脚本)。
