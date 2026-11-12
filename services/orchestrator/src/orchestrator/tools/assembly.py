@@ -53,6 +53,7 @@ from orchestrator.tools.file_ops import (
 )
 from orchestrator.tools.find_tools import FindToolsTool
 from orchestrator.tools.http import AllowlistProvider, DenylistProvider, HTTPTool
+from orchestrator.tools.image_orientation import orientation_switch_on
 from orchestrator.tools.knowledge import KnowledgeRetriever, KnowledgeSearchTool
 from orchestrator.tools.knowledge_read import KnowledgeReadTool
 from orchestrator.tools.locks import (
@@ -575,6 +576,8 @@ def _register_ask_image(
             # read_page 是基础能力,先于这里注册;没有它(没接沙箱)就保持旧行为。
             # B-266 —— 它也负责渲文档页的局部(``render_regions``)。
             page_renderer=read_page if isinstance(read_page, ReadPageTool) else None,
+            # B-301 —— 读图前先问方向:底层能力,所有看图模型都做;只看运维紧急开关。
+            ask_orientation=orientation_switch_on(),
         )
     )
 

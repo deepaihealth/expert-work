@@ -207,8 +207,12 @@ def is_rendered_figure_rel(rel: str) -> bool:
 #:
 #: 两种都由「源内容哈希 + 框」唯一决定(分辨率是这两样的确定函数),所以与渲染页一样可缓存。
 #: 框是 0-1000 的整数坐标。
+#:
+#: B-301 —— 图片转正后再顺时针转过的局部(含整张的候选副本)放在 ``<src-sha>/r<角度>/`` 下
+#: (``r90`` / ``r180`` / ``r270``):同一个框转不同角度是不同的图,不许互相复用;0 度沿用原位置。
 RENDERED_CROP_DIR = "crops"
 _BOX_PATTERN = "[0-9]{1,4}-[0-9]{1,4}-[0-9]{1,4}-[0-9]{1,4}"
+_ROTATED_CROP_DIR_PATTERN = "(?:r(?:90|180|270)/)?"
 _RENDERED_CROP_RE = re.compile(
     "^"
     + re.escape(WORKSPACE_OVERFLOW_DIR)
@@ -227,6 +231,7 @@ _RENDERED_CROP_RE = re.compile(
     + "-[0-9]+-"
     + _BOX_PATTERN
     + "-d[1-9][0-9]{0,3}|"
+    + _ROTATED_CROP_DIR_PATTERN
     + _BOX_PATTERN
     + r")\.jpg\Z"
 )
