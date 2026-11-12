@@ -39,6 +39,10 @@ _INCIDENT = {
 }
 
 
+#: 形近字对里出现过的字(从 ``docs.LOOKALIKES`` 展开)。
+_LOOKALIKE_CHARS = frozenset(c for pair in docs.LOOKALIKES for c in pair)
+
+
 def _incident(tmp_path: Path) -> docs.Category:
     path = tmp_path / "incident.json"
     path.write_text(json.dumps(_INCIDENT, ensure_ascii=False), encoding="utf-8")
@@ -70,7 +74,7 @@ def test_each_document_has_four_to_six_pages_and_ten_key_fields(tmp_path: Path) 
 
 def test_key_fields_carry_look_alike_characters(tmp_path: Path) -> None:
     for d in _full_set(tmp_path):
-        with_lookalikes = [f for f in d.fields if any(c in docs._LOOKALIKE_CHARS for c in f.value)]
+        with_lookalikes = [f for f in d.fields if any(c in _LOOKALIKE_CHARS for c in f.value)]
         assert len(with_lookalikes) >= 2, d.doc_id
 
 
@@ -137,10 +141,7 @@ def test_the_regression_set_has_four_and_six_page_tables(tmp_path: Path) -> None
 
 
 def test_rendering_makes_a_scanned_pdf(tmp_path: Path) -> None:
-    try:
-        font = docs.find_font()
-    except FileNotFoundError:
-        pytest.skip("no CJK font on this machine")
+    font = _font_or_skip()
     built = _full_set(tmp_path)
     minutes = next(d for d in built if d.category == "minutes")
     category = next(c for c in docs.CATEGORIES if c.key == "minutes")
@@ -159,10 +160,14 @@ def test_rendering_makes_a_scanned_pdf(tmp_path: Path) -> None:
 
 
 def _font_or_skip() -> str:
+    font: str | None = None
     try:
-        return docs.find_font()
+        font = docs.find_font()
     except FileNotFoundError:
+        pass
+    if font is None:
         pytest.skip("no CJK font on this machine")
+    return font
 
 
 def test_a_line_wider_than_the_page_is_refused(tmp_path: Path) -> None:

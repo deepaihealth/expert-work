@@ -45,7 +45,6 @@ LOOKALIKES: tuple[tuple[str, str], ...] = (
     ("己", "已"),
     ("未", "末"),
 )
-_LOOKALIKE_CHARS = frozenset(c for pair in LOOKALIKES for c in pair)
 
 
 @dataclass(frozen=True)
