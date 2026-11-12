@@ -17,6 +17,11 @@ import httpx
 import pytest
 import yaml
 
+#: 豆包的被测型号(§6.2;260628 已下架)与单价(元 / 百万 token,输入 / 输出 / 缓存读)。
+DOUBAO = "doubao-seed-2-1-pro-260915"
+DOUBAO_PRICE = (6.0, 30.0, 1.2)
+_DOUBAO_ARGS = ["--doubao-model", DOUBAO, "--doubao-price", "6,30,1.2"]
+
 
 def _docs_dir(tmp_path: Path) -> Path:
     incident = {
@@ -54,21 +59,21 @@ def _docs_dir(tmp_path: Path) -> Path:
 
 
 def test_the_plan_matches_the_spec_counts(tmp_path: Path) -> None:
-    sessions = ab.plan(ab.load_docs(_docs_dir(tmp_path)), ab.default_models("doubao-x"))
+    sessions = ab.plan(ab.load_docs(_docs_dir(tmp_path)), ab.default_models(DOUBAO, DOUBAO_PRICE))
     runs = ab.runs_per_model(sessions)
-    assert runs == {"glm-5.3-flash": 105, "deepseek-flash": 93, "doubao-x": 63}
+    assert runs == {"glm-5.3-flash": 105, "deepseek-flash": 93, DOUBAO: 63}
     per_arm = ab.runs_per_model(s for s in sessions if s.phase == "main")
-    assert per_arm == {"glm-5.3-flash": 90, "deepseek-flash": 90, "doubao-x": 60}
+    assert per_arm == {"glm-5.3-flash": 90, "deepseek-flash": 90, DOUBAO: 60}
 
 
 def test_the_plan_runs_pilots_then_arm_a_then_the_rest(tmp_path: Path) -> None:
-    sessions = ab.plan(ab.load_docs(_docs_dir(tmp_path)), ab.default_models("doubao-x"))
+    sessions = ab.plan(ab.load_docs(_docs_dir(tmp_path)), ab.default_models(DOUBAO, DOUBAO_PRICE))
     phases = [ab.phase_of(s) for s in sessions]
     assert phases == sorted(phases, key=["pilot", "arm_a", "rest"].index)
     assert {s.arm for s in sessions if ab.phase_of(s) == "arm_a"} == {"A"}
     assert all(s.arm == "A" and s.turns == 3 for s in sessions if s.phase == "pilot")
     assert {s.model for s in sessions if s.phase == "regression"} == {"glm-5.3-flash"}
-    assert {s.arm for s in sessions if s.model == "doubao-x"} == {"A", "C"}
+    assert {s.arm for s in sessions if s.model == DOUBAO} == {"A", "C"}
 
 
 def test_an_incomplete_document_set_is_refused(tmp_path: Path) -> None:
@@ -79,16 +84,23 @@ def test_an_incomplete_document_set_is_refused(tmp_path: Path) -> None:
 
 
 def test_the_quote_reproduces_the_spec_numbers() -> None:
-    caps = {m.name: round(ab.run_cap_yuan(m.price), 2) for m in ab.default_models("doubao-x")}
-    assert caps == {"glm-5.3-flash": 23.36, "deepseek-flash": 64.87, "doubao-x": 233.52}
-    expected = {m.name: round(ab.run_expected_yuan(m.price), 3) for m in ab.default_models("d")}
-    assert expected == {"glm-5.3-flash": 0.486, "deepseek-flash": 1.26, "d": 4.05}
+    caps = {
+        m.name: round(ab.run_cap_yuan(m.price), 2) for m in ab.default_models(DOUBAO, DOUBAO_PRICE)
+    }
+    assert caps == {"glm-5.3-flash": 23.36, "deepseek-flash": 64.87, DOUBAO: 233.52}
+    expected = {
+        m.name: round(ab.run_expected_yuan(m.price), 3)
+        for m in ab.default_models(DOUBAO, DOUBAO_PRICE)
+    }
+    assert expected == {"glm-5.3-flash": 0.486, "deepseek-flash": 1.26, DOUBAO: 4.05}
     # 设计 §5.7 / §11 D4:止损线 ¥650 时实际硬上限约 ¥1,294(650 + 177 + 2 x 233.5,按整数取)
-    assert ab.hard_ceiling_yuan(650, ab.default_models("d")) == pytest.approx(1294, abs=1)
+    assert ab.hard_ceiling_yuan(650, ab.default_models(DOUBAO, DOUBAO_PRICE)) == pytest.approx(
+        1294, abs=1
+    )
 
 
 def test_the_call_estimate(tmp_path: Path) -> None:
-    sessions = ab.plan(ab.load_docs(_docs_dir(tmp_path)), ab.default_models("doubao-x"))
+    sessions = ab.plan(ab.load_docs(_docs_dir(tmp_path)), ab.default_models(DOUBAO, DOUBAO_PRICE))
     estimate = ab.call_estimate(sessions)
     assert estimate["runs"] == 261
     assert estimate["expected_calls"] == 261 * 15
@@ -112,14 +124,14 @@ def test_the_stop_line_alone_stops_new_runs() -> None:
 
 def test_the_quote_id_is_stable_and_follows_what_was_quoted(tmp_path: Path) -> None:
     docs_dir = _docs_dir(tmp_path)
-    models = ab.default_models("d")
+    models = ab.default_models(DOUBAO, DOUBAO_PRICE)
     sessions = ab.plan(ab.load_docs(docs_dir), models, docs_dir)
     q = ab.quote(sessions, models, 650.0)
     assert q["quote_id"] == ab.quote(sessions, models, 650.0)["quote_id"]
     assert q["quote_id"] != ab.quote(sessions, models, 400.0)["quote_id"]
     assert q["quote_id"] != ab.quote(sessions[:-1], models, 650.0)["quote_id"]
     out: list[str] = []
-    ab.main(["plan", "--docs", str(docs_dir), "--doubao-model", "d"], emit=out.append)
+    ab.main(["plan", "--docs", str(docs_dir), *_DOUBAO_ARGS], emit=out.append)
     assert json.loads(out[0])["quote_id"] == q["quote_id"]
 
 
@@ -131,7 +143,7 @@ def test_a_stop_line_must_be_a_sane_number(
     docs_dir = _docs_dir(tmp_path)
     args = [
         "run", "--phase", "pilot", "--docs", str(docs_dir), "--out", str(tmp_path / "o"),
-        "--doubao-model", "d", "--base-url", "http://platform.invalid",
+        *_DOUBAO_ARGS, "--base-url", "http://platform.invalid",
         "--approved-quote", "x", "--stop-line", bad,
     ]  # fmt: skip
     with pytest.raises(SystemExit):
@@ -142,7 +154,7 @@ def test_a_stop_line_must_be_a_sane_number(
 def _run_args(tmp_path: Path, docs_dir: Path, quote_id: str) -> list[str]:
     return [
         "run", "--phase", "pilot", "--docs", str(docs_dir), "--out", str(tmp_path / "o"),
-        "--doubao-model", "d", "--base-url", "http://platform.invalid",
+        *_DOUBAO_ARGS, "--base-url", "http://platform.invalid",
         "--approved-quote", quote_id, "--stop-line", "650",
     ]  # fmt: skip
 
@@ -164,7 +176,7 @@ def test_the_quote_id_is_written_into_spent_and_every_record(
     """文档没渲染(没有 PDF):每个会话在上传之前就出错 —— 不碰网络,正好走一遍记账与阻塞。"""
     monkeypatch.setenv("EXPERT_WORK_EVAL_API_KEY", "k")
     docs_dir = _docs_dir(tmp_path)
-    models = ab.default_models("d")
+    models = ab.default_models(DOUBAO, DOUBAO_PRICE)
     qid = ab.quote(ab.plan(ab.load_docs(docs_dir), models, docs_dir), models, 650.0)["quote_id"]
     ab.main(_run_args(tmp_path, docs_dir, qid), emit=lambda _l: None)
     spent = json.loads((tmp_path / "o" / "spent.json").read_text())
@@ -294,7 +306,7 @@ def test_text_and_structure_of_the_three_deliverable_kinds() -> None:
 
 def test_the_three_arms_differ_only_in_the_two_override_fields(tmp_path: Path) -> None:
     out = tmp_path / "agents"
-    paths = ab.write_manifests(out, ab.default_models("doubao-x"))
+    paths = ab.write_manifests(out, ab.default_models(DOUBAO, DOUBAO_PRICE))
     glm = {arm: yaml.safe_load(paths[("glm-5.3-flash", arm)].read_text()) for arm in "ABC"}
     policies = {arm: glm[arm]["spec"]["policies"] for arm in "ABC"}
     assert policies["A"]["reading_rule"] is False and policies["A"]["figure_view_steps"] == 0
@@ -318,7 +330,7 @@ def test_the_three_arms_differ_only_in_the_two_override_fields(tmp_path: Path) -
     for absent in ("memory", "reflection", "vision", "knowledge", "subagents"):
         assert absent not in spec
     assert spec["dynamic_workers"] == {"enabled": False}
-    assert ("doubao-x", "B") not in paths
+    assert (DOUBAO, "B") not in paths
     from expert_work.protocol import AgentSpec
 
     for path in paths.values():
@@ -341,8 +353,7 @@ def test_running_needs_an_approval_and_a_stop_line(
         str(docs_dir),
         "--out",
         str(tmp_path / "o"),
-        "--doubao-model",
-        "d",
+        *_DOUBAO_ARGS,
         "--base-url",
         "http://platform.invalid",
     ]
@@ -508,3 +519,105 @@ def test_the_report_deduplicates_and_counts_what_could_not_be_scored(tmp_path: P
     }
     assert result["blocked"] == "x"
     assert "glm-5.3-flash" in result["verdicts"]
+
+
+# ------------------------------------------------------------ 复审:豆包型号与单价
+
+
+def test_the_doubao_model_must_be_a_live_vision_model_in_the_catalog(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    assert ab.default_models(DOUBAO, DOUBAO_PRICE)[-1].price == DOUBAO_PRICE
+    with pytest.raises(ab.PlanError, match="not in the model catalog"):
+        ab.default_models("doubao-made-up", DOUBAO_PRICE)
+    with pytest.raises(ab.PlanError, match="deprecated"):
+        ab.default_models("doubao-seed-2-1-pro-260628", (6.0, 30.0, 1.2))
+    # 目录里眼下没有「在用、但看不了图」的豆包型号,拿当前型号改一个字段造一个。
+    real = ab.catalog_entry("doubao", DOUBAO)
+    assert real is not None
+    blind = real.model_copy(update={"vision": False})
+    monkeypatch.setattr(ab, "catalog_entry", lambda _provider, _name: blind)
+    with pytest.raises(ab.PlanError, match="cannot see images"):
+        ab.default_models(DOUBAO, DOUBAO_PRICE)
+
+
+def test_a_price_that_contradicts_the_documented_one_is_refused() -> None:
+    """价目表里有据可查的型号(runbook 记过的),给的单价对不上就拒跑。"""
+    with pytest.raises(ab.PlanError, match="price"):
+        ab.default_models("doubao-seed-2-1-pro-260628", (5.0, 30.0, 1.2))
+
+
+def test_the_doubao_price_is_required_on_the_command_line(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    with pytest.raises(SystemExit):
+        ab.main(["plan", "--docs", str(_docs_dir(tmp_path)), "--doubao-model", DOUBAO])
+    assert "--doubao-price" in capsys.readouterr().err
+    with pytest.raises(SystemExit):
+        ab.main(
+            [
+                "plan", "--docs", str(_docs_dir(tmp_path)),
+                "--doubao-model", DOUBAO, "--doubao-price", "6,30",
+            ]
+        )  # fmt: skip
+
+
+# ------------------------------------------------------------ 复审 R6:跨报价账本、解除阻塞
+
+
+def test_the_quote_id_does_not_depend_on_int_or_float(tmp_path: Path) -> None:
+    docs_dir = _docs_dir(tmp_path)
+    models = ab.default_models(DOUBAO, DOUBAO_PRICE)
+    sessions = ab.plan(ab.load_docs(docs_dir), models, docs_dir)
+    assert (
+        ab.quote(sessions, models, 650)["quote_id"] == ab.quote(sessions, models, 650.0)["quote_id"]
+    )
+
+
+def test_plan_prints_what_was_already_spent_under_the_output_root(tmp_path: Path) -> None:
+    root = tmp_path / "runs"
+    for name, spent in (("first", 120.5), ("second", 30.25)):
+        (root / name).mkdir(parents=True)
+        (root / name / "spent.json").write_text(json.dumps({"spent": spent, "quote_id": name}))
+    out: list[str] = []
+    ab.main(
+        ["plan", "--docs", str(_docs_dir(tmp_path)), *_DOUBAO_ARGS, "--out-root", str(root)],
+        emit=out.append,
+    )
+    history = json.loads(out[0])["spent_history"]
+    assert history["total_yuan"] == pytest.approx(150.75)
+    assert len(history["runs"]) == 2
+
+
+def test_a_blocked_run_stays_blocked_unless_unblocked_with_a_reason(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("EXPERT_WORK_EVAL_API_KEY", "k")
+    docs_dir = _docs_dir(tmp_path)
+    models = ab.default_models(DOUBAO, DOUBAO_PRICE)
+    qid = ab.quote(ab.plan(ab.load_docs(docs_dir), models, docs_dir), models, 650.0)["quote_id"]
+    out = tmp_path / "o"
+    out.mkdir()
+    spent_file = out / "spent.json"
+    spent_file.write_text(json.dumps({"spent": 1.0, "quote_id": qid, "blocked": "no usage"}))
+    ab.main(_run_args(tmp_path, docs_dir, qid), emit=lambda _l: None)
+    assert not (out / "records.jsonl").exists()  # 阻塞着:一个会话都没派
+    assert json.loads(spent_file.read_text())["blocked"] == "no usage"
+    ab.main([*_run_args(tmp_path, docs_dir, qid), "--unblock", "checked the bill"], emit=print)
+    saved = json.loads(spent_file.read_text())
+    assert saved["unblocks"] == [{"reason": "checked the bill", "was": "no usage"}]
+    assert (out / "records.jsonl").exists()  # 解除后真的派了(没有 PDF,随即出错再阻塞)
+
+
+def test_cleanup_needs_the_doubao_model_to_know_the_exact_codes(
+    capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("EXPERT_WORK_EVAL_CONSOLE_TOKEN", "t")
+    with pytest.raises(SystemExit):
+        ab.main(["cleanup", "--base-url", "http://platform.invalid"])
+    assert "--doubao-model" in capsys.readouterr().err
+    assert ab.temporary_agent_codes(DOUBAO) == {
+        ab.agent_code(m.name, arm)
+        for m in ab.default_models(DOUBAO, DOUBAO_PRICE)
+        for arm in m.arms
+    }

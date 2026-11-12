@@ -2517,7 +2517,7 @@ asyncio.run(main())
      OR draft_spec_json->'spec'->'policies' ?| array['reading_rule','figure_view_steps'];
   ```
   判据:刚保存的那个版本**不在**结果里(没填的两个字段不落库,哪怕是 null);结果里只有本节的临时智能体。收尾后再查一次应为 0 行 —— 回滚到没有这两个字段的镜像之前必须是 0 行(`PolicySpec` 是 `extra="forbid"`,填了这两个字段的配置在旧镜像上建不起来)。**判据红的情形**:存量智能体保存后出现 `"reading_rule": null`。
-- [ ] **112.9 收尾(必做)**:删本节 `acc-b302-*` 临时智能体与会话;若测试环境里有 A/B 留下的 `eval-b302-*`,用 `python tools/eval/b302_ab.py cleanup --base-url <测试环境> --yes`(控制台凭据 `EXPERT_WORK_EVAL_CONSOLE_TOKEN`;不带 `--yes` 只列不删)删掉;按 112.8 再查一次为 0 行 —— 不是 0 行就不许回滚到旧镜像。
+- [ ] **112.9 收尾(必做)**:删本节 `acc-b302-*` 临时智能体与会话;若测试环境里有 A/B 留下的 `eval-b302-*`,用 `python tools/eval/b302_ab.py cleanup --base-url <测试环境> --doubao-model <A/B 用的豆包型号> --yes`(只删脚本生成的那几个确切 code)(控制台凭据 `EXPERT_WORK_EVAL_CONSOLE_TOKEN`;不带 `--yes` 只列不删)删掉;按 112.8 再查一次为 0 行 —— 不是 0 行就不许回滚到旧镜像。
 
 **生产**:合并发布后行为与今天相同(两层都关),只有措辞那一处;发布清单加 112.8 的查询作为回滚前检查。两层改成平台默认开要等 A/B 全部模型通过后的另一个 PR(设计 §4.2.9)。
 

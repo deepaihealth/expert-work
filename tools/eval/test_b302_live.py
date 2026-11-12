@@ -19,6 +19,7 @@ import pytest
 
 from control_plane.api._run_usage import usage_buckets_to_wire
 from expert_work.persistence.token_usage_store import ModelTokenTotals
+from expert_work.runtime.runs import external_run_status
 
 _PRICES = {"glm-5.3-flash": (0.8, 2.8, 0.23)}
 
@@ -66,17 +67,26 @@ class _Platform:
         usage: list[dict[str, Any]] | None = None,
         end: bool = True,
         run_error: Callable[[int], bool] | None = None,
-        usage_endpoint: dict[str, Any] | None = None,
+        usage_status: list[str] | None = None,
+        endpoint_usage: dict[str, list[dict[str, Any]] | None] | None = None,
         artifacts: list[dict[str, Any]] | None = None,
         workspace: dict[str, bytes] | None = None,
         steps: list[dict[str, Any]] | None = None,
+        broken_stream: bool = False,
+        download: bytes | None = None,
     ) -> None:
         self.seen: list[str] = []
         self.runs = 0
         self.usage = usage if usage is not None else _wire(input_tokens=1000, output_tokens=10)
         self.end = end
         self.run_error = run_error
-        self.usage_endpoint = usage_endpoint
+        #: ``GET .../usage`` 依次回的 ``run_status``(最后一个一直重复)与各状态下的用量。
+        self.usage_status = usage_status or ["success"]
+        self.endpoint_usage = endpoint_usage or {}
+        self.usage_calls = 0
+        self.cancels = 0
+        self.broken_stream = broken_stream
+        self.download = download
         self.artifacts = artifacts or []
         self.workspace = workspace or {}
         self.steps = steps or [_ai()]
@@ -108,19 +118,51 @@ class _Platform:
                         },
                     )
                 )
+            if self.broken_stream:
+                return httpx.Response(
+                    200,
+                    stream=_Breaks(_sse(events[:1])),
+                    headers={"content-type": "text/event-stream"},
+                )
             return httpx.Response(
                 200, content=_sse(events), headers={"content-type": "text/event-stream"}
             )
+        if path.endswith(":cancel"):
+            self.cancels += 1
+            return httpx.Response(200, json={"success": True})
         if path.endswith("/usage"):
-            return httpx.Response(200, json=self.usage_endpoint or {"run_id": "r"})
+            return httpx.Response(200, json=self._usage_body(path.split("/")[-2]))
         if path.endswith("/artifacts/download"):
-            return httpx.Response(200, content=_ooxml({"ppt/slides/slide1.xml": "<a:t>X</a:t>"}))
+            body = self.download or _ooxml({"ppt/slides/slide1.xml": "<a:t>X</a:t>"})
+            return httpx.Response(200, content=body)
         if path.endswith("/workspace/file"):
             data = self.workspace.get(str(request.url.params.get("path")))
             return httpx.Response(200, content=data) if data is not None else httpx.Response(404)
         if request.method == "DELETE":
             return httpx.Response(200, json={})
         return httpx.Response(404)
+
+    def _usage_body(self, run_id: str) -> dict[str, Any]:
+        """与 ``external_runs.run_usage`` 同形:``run_status`` 恒有,``usage_by_model`` 无记录时
+        缺席。"""
+        status = self.usage_status[min(self.usage_calls, len(self.usage_status) - 1)]
+        self.usage_calls += 1
+        body: dict[str, Any] = {"run_id": run_id, "run_status": external_run_status(status, None)}
+        usage = self.endpoint_usage.get(status)
+        if usage is not None:
+            body["usage_by_model"] = usage
+        return body
+
+
+class _Breaks(httpx.AsyncByteStream):
+    """先给一段正常的帧,然后连接断掉。"""
+
+    def __init__(self, head: bytes) -> None:
+        self._head = head
+
+    async def __aiter__(self):  # type: ignore[no-untyped-def]
+        yield self._head
+        raise httpx.ReadError("connection reset mid-stream")
 
 
 def _doc(tmp_path: Path, *, deliverable: str = "slides") -> dict[str, Any]:
@@ -196,10 +238,7 @@ async def test_a_session_stops_between_turns_once_the_line_is_crossed(tmp_path: 
 
 
 async def test_a_missing_end_frame_is_filled_from_the_usage_endpoint(tmp_path: Path) -> None:
-    platform = _Platform(
-        end=False,
-        usage_endpoint={"run_id": "r1", "usage_by_model": _wire(input_tokens=1_000_000)},
-    )
+    platform = _Platform(end=False, endpoint_usage={"success": _wire(input_tokens=1_000_000)})
     tracker = live.SpendTracker(stop_line=100.0, prices=_PRICES)
     record = await _run_session(platform, tmp_path, tracker)
     assert any("/runs/r1/usage" in s for s in platform.seen)
@@ -209,7 +248,7 @@ async def test_a_missing_end_frame_is_filled_from_the_usage_endpoint(tmp_path: P
 
 
 async def test_no_usage_anywhere_blocks_further_dispatch(tmp_path: Path) -> None:
-    platform = _Platform(end=False, usage_endpoint={"run_id": "r1"})
+    platform = _Platform(end=False)  # 终态,但没有用量记录
     tracker = live.SpendTracker(stop_line=100.0, prices=_PRICES)
     record = await _run_session(platform, tmp_path, tracker)
     assert platform.runs == 1
@@ -344,32 +383,149 @@ def test_records_are_deduplicated_keeping_the_last() -> None:
 # ------------------------------------------------------------ LOW-3: cleanup
 
 
-async def test_cleanup_is_a_dry_run_unless_told_yes() -> None:
+async def test_cleanup_deletes_only_the_exact_codes_across_pages() -> None:
+    """复审 R4:只删 ``write_manifests`` 会生成的确切 code;按 offset 翻页;打印租户与数量。"""
     seen: list[str] = []
+    tenant = "11111111-1111-1111-1111-111111111111"
+    names = [f"agent-{i}" for i in range(5)] + [
+        "eval-b302-glm-5-3-flash-a",
+        "eval-b302-glm-5-3-flash-a-copy",  # 前缀对得上,但不是生成的 code
+        "eval-b302-deepseek-flash-c",
+    ]
+    rows = [{"name": n, "version": "1.0.0", "tenant_id": tenant} for n in names]
 
     def handler(request: httpx.Request) -> httpx.Response:
-        seen.append(f"{request.method} {request.url.path}")
+        seen.append(f"{request.method} {request.url.path}?{request.url.query.decode()}")
         if request.method == "GET":
-            items = [
-                {"name": "eval-b302-glm-5-3-flash-a", "version": "1.0.0"},
-                {"name": "eval-b302-deepseek-flash-c", "version": "1.0.0"},
-                {"name": "customer-agent", "version": "2.0.0"},
-            ]
+            offset = int(request.url.params["offset"])
+            limit = int(request.url.params["limit"])
+            items = rows[offset : offset + limit]
             return httpx.Response(200, json={"success": True, "data": {"items": items}})
         return httpx.Response(204)
 
+    codes = {"eval-b302-glm-5-3-flash-a", "eval-b302-deepseek-flash-c", "eval-b302-x-b"}
+    lines: list[str] = []
     async with httpx.AsyncClient(
         transport=httpx.MockTransport(handler), base_url="http://platform"
     ) as http:
-        listed = await live.cleanup(http, yes=False, emit=lambda _l: None)
-        assert [n for n, _v in listed] == [
-            "eval-b302-glm-5-3-flash-a",
+        listed = await live.cleanup(http, codes=codes, yes=False, emit=lines.append, page=3)
+        assert sorted(n for n, _v in listed) == [
             "eval-b302-deepseek-flash-c",
+            "eval-b302-glm-5-3-flash-a",
         ]
         assert not any(s.startswith("DELETE") for s in seen)
-        await live.cleanup(http, yes=True, emit=lambda _l: None)
-    deletes = [s for s in seen if s.startswith("DELETE")]
+        assert sum(s.startswith("GET") for s in seen) >= 3  # 8 行、每页 3 行:翻了页
+        assert any(tenant in line for line in lines)
+        assert any("2 matching" in line for line in lines)
+        await live.cleanup(http, codes=codes, yes=True, emit=lines.append, page=3)
+    deletes = sorted(s.split("?")[0] for s in seen if s.startswith("DELETE"))
     assert deletes == [
-        "DELETE /v1/agents/eval-b302-glm-5-3-flash-a/1.0.0",
         "DELETE /v1/agents/eval-b302-deepseek-flash-c/1.0.0",
+        "DELETE /v1/agents/eval-b302-glm-5-3-flash-a/1.0.0",
     ]
+
+
+# ------------------------------------------------------------ 复审 R1:补账接口说 run 还在跑
+
+
+@pytest.fixture
+def _fast_settle(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(live, "SETTLE_POLL_S", 0.001)
+    monkeypatch.setattr(live, "SETTLE_TIMEOUT_S", 0.05)
+
+
+@pytest.mark.usefixtures("_fast_settle")
+async def test_a_running_run_is_cancelled_and_billed_only_once_it_settles(tmp_path: Path) -> None:
+    partial, full = _wire(input_tokens=100_000), _wire(input_tokens=1_000_000)
+    platform = _Platform(
+        end=False,
+        usage_status=["running", "running", "interrupted"],
+        endpoint_usage={"running": partial, "interrupted": full},
+    )
+    tracker = live.SpendTracker(stop_line=100.0, prices=_PRICES)
+    record = await _run_session(platform, tmp_path, tracker)
+    first = record["turns"][0]
+    assert platform.cancels >= 1
+    assert first["usage_source"] == "usage_endpoint"
+    assert first["usage_by_model"] == full  # 不是还在跑时那份「到目前为止」的
+    assert tracker.blocked is None
+
+
+@pytest.mark.usefixtures("_fast_settle")
+async def test_a_run_that_never_settles_is_charged_the_cap_and_blocks(tmp_path: Path) -> None:
+    platform = _Platform(
+        end=False, usage_status=["running"], endpoint_usage={"running": _wire(input_tokens=10)}
+    )
+    tracker = live.SpendTracker(stop_line=100.0, prices=_PRICES, run_caps={"glm-5.3-flash": 23.36})
+    record = await _run_session(platform, tmp_path, tracker)
+    assert platform.runs == 1
+    assert tracker.spent == pytest.approx(23.36)
+    assert tracker.blocked is not None and "did not settle" in tracker.blocked
+    assert record["turns"][0]["usage_source"] == "cap_charged"
+
+
+# ------------------------------------------------------------ 复审 R3:流中途断掉
+
+
+@pytest.mark.usefixtures("_fast_settle")
+async def test_a_broken_stream_cancels_and_bills_the_run_then_raises(tmp_path: Path) -> None:
+    platform = _Platform(
+        broken_stream=True,
+        usage_status=["interrupted"],
+        endpoint_usage={"interrupted": _wire(input_tokens=1_000_000)},
+    )
+    tracker = live.SpendTracker(stop_line=100.0, prices=_PRICES)
+    with pytest.raises(httpx.ReadError):
+        await _run_session(platform, tmp_path, tracker)
+    assert platform.cancels == 1
+    assert tracker.spent == pytest.approx(0.8)
+    assert any(s.startswith("DELETE") for s in platform.seen)
+
+
+@pytest.mark.usefixtures("_fast_settle")
+async def test_a_broken_stream_without_usage_is_charged_the_cap(tmp_path: Path) -> None:
+    platform = _Platform(broken_stream=True, usage_status=["interrupted"])
+    tracker = live.SpendTracker(stop_line=100.0, prices=_PRICES, run_caps={"glm-5.3-flash": 23.36})
+    with pytest.raises(httpx.ReadError):
+        await _run_session(platform, tmp_path, tracker)
+    assert tracker.spent == pytest.approx(23.36)
+    assert tracker.blocked is not None
+
+
+# ------------------------------------------------------------ 复审 R2:交付件读不了
+
+
+async def test_an_unreadable_deliverable_is_scored_as_none_and_the_session_goes_on(
+    tmp_path: Path,
+) -> None:
+    platform = _Platform(artifacts=[{"name": "x.pptx", "version": 1}], download=b"not a zip")
+    tracker = live.SpendTracker(stop_line=100.0, prices=_PRICES)
+    record = await _run_session(platform, tmp_path, tracker)
+    assert [t["turn"] for t in record["turns"]] == [1, 2, 3]
+    second = record["turns"][1]
+    assert second["deliverable_source"] == "unreadable"
+    assert second["deliverable_text"] is None
+    assert second["deliverable_structure"] is None
+
+
+# ------------------------------------------------------------ 复审 R5:交付件路径
+
+
+def _call(tool: str, **args: Any) -> Any:
+    import b302_metrics as m
+
+    return m.Step(index=0, calls=(m.Call(tool, args),))
+
+
+def test_path_arguments_come_first_and_parent_paths_are_dropped() -> None:
+    steps = [
+        _call("exec_python", code="prs.save('decks/old deck.pptx')"),
+        _call("write_file", path="/workspace/out dir/my report.pptx", content="x"),
+        _call("save_artifact", name="final.pptx", path="reports/final v2.pptx"),
+        _call("bash", command="cp a.pptx ../escape.pptx"),
+        _call("write_file", path="../outside.pptx", content="x"),
+    ]
+    found = live.deliverable_candidates(steps, ".pptx")
+    assert found[:2] == ["reports/final v2.pptx", "out dir/my report.pptx"]
+    assert "decks/old deck.pptx" in found
+    assert all(".." not in c for c in found)

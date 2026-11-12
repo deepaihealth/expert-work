@@ -65,6 +65,8 @@ from b302_live import (  # noqa: E402
     template_followed,
 )
 
+from expert_work.protocol.model_catalog import catalog_entry  # noqa: E402
+
 __all__ = [
     "DELIVERABLE_EXT",
     "MAX_INPUT_TOKENS",
@@ -108,14 +110,45 @@ class ModelPlan:
     regression: bool = False
 
 
-def default_models(doubao_model: str) -> list[ModelPlan]:
+#: runbook 里记过价的豆包型号(元 / 百万 token):给的单价与它不一致就拒跑。
+#: ``docs/runbooks/2026-09-24-prod-release-checklist.md:746``(6 / 1.2 / 30,输入 / 缓存读 / 输出)。
+KNOWN_DOUBAO_PRICES: dict[str, tuple[float, float, float]] = {
+    "doubao-seed-2-1-pro-260628": (6.0, 30.0, 1.2),
+}
+
+
+def default_models(
+    doubao_model: str, doubao_price: tuple[float, float, float] | None = None
+) -> list[ModelPlan]:
     """§5.3 + D9:glm-5.3-flash(事故模型,另跑回归集)、deepseek-flash 三组;豆包只 A、C 两组。
-    单价取自设计 §5.5 / §5.7 引的价目表。豆包型号以 §6.2 的查询为准,由调用方给。"""
+
+    glm / deepseek 的单价取自设计 §5.5 引的价目表。豆包型号以 §6.2 的查询为准、单价由调用方给
+    (``--doubao-price``,对着生产 / 测试的 ``model_rate_card`` 核过的数):型号必须在模型目录里、
+    能看图、没下架;runbook 里有据可查的型号,单价对不上就拒。``doubao_price`` 为空只给不花钱的
+    子命令用(生成临时智能体、清理),单价记 0。
+    """
+    entry = catalog_entry("doubao", doubao_model)
+    if entry is None:
+        raise PlanError(f"{doubao_model!r} is not in the model catalog for provider doubao")
+    known = KNOWN_DOUBAO_PRICES.get(doubao_model)
+    if doubao_price is not None and known is not None and tuple(doubao_price) != known:
+        raise PlanError(
+            f"price {doubao_price} for {doubao_model} contradicts the documented price {known}"
+        )
+    if entry.deprecated:
+        raise PlanError(f"{doubao_model} is deprecated in the model catalog; use the current one")
+    if not entry.vision:
+        raise PlanError(f"{doubao_model} cannot see images; the A/B needs a vision model")
     return [
         ModelPlan("glm-5.3-flash", "glm", ("A", "B", "C"), (0.8, 2.8, 0.23), regression=True),
         ModelPlan("deepseek-flash", "deepseek", ("A", "B", "C"), (2.0, 8.0, 0.04)),
-        ModelPlan(doubao_model, "doubao", ("A", "C"), (6.0, 30.0, 1.2)),
+        ModelPlan(doubao_model, "doubao", ("A", "C"), doubao_price or (0.0, 0.0, 0.0)),
     ]
+
+
+def temporary_agent_codes(doubao_model: str) -> set[str]:
+    """``write_manifests`` 会生成的全部临时智能体 code —— ``cleanup`` 只删这些。"""
+    return {agent_code(m.name, arm) for m in default_models(doubao_model) for arm in m.arms}
 
 
 def phase_of(session: Session) -> str:
@@ -203,6 +236,7 @@ def call_estimate(sessions: Sequence[Session]) -> dict[str, int]:
 def quote(
     sessions: Sequence[Session], models: Sequence[ModelPlan], stop_line: float
 ) -> dict[str, Any]:
+    stop_line = float(stop_line)  # 650 与 650.0 是同一份报价
     runs = runs_per_model(sessions)
     by_model = {
         m.name: {
@@ -461,13 +495,39 @@ def _stop_line(raw: str) -> float:
     return value
 
 
+def _price(raw: str) -> tuple[float, float, float]:
+    parts = raw.split(",")
+    try:
+        values = tuple(float(x) for x in parts)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(f"not numbers: {raw!r}") from exc
+    if len(values) != 3 or not all(math.isfinite(v) and v >= 0 for v in values):
+        raise argparse.ArgumentTypeError("give input,output,cache_read in yuan per million tokens")
+    return (values[0], values[1], values[2])
+
+
+def spent_history(root: Path) -> dict[str, Any]:
+    """输出根目录下历次运行(每个 ``spent.json`` 一次报价)已花的合计 —— 跨报价的总账。"""
+    runs: dict[str, Any] = {}
+    for path in sorted(root.rglob("spent.json")):
+        saved = json.loads(path.read_text())
+        runs[str(path.relative_to(root))] = {
+            "spent": float(saved.get("spent") or 0.0),
+            "quote_id": saved.get("quote_id"),
+            "blocked": saved.get("blocked"),
+        }
+    return {"total_yuan": round(sum(r["spent"] for r in runs.values()), 2), "runs": runs}
+
+
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="B-302 PR 2 A/B (design §5)")
     sub = parser.add_subparsers(dest="cmd", required=True)
     p_plan = sub.add_parser("plan")
     p_plan.add_argument("--docs", type=Path, required=True)
     p_plan.add_argument("--doubao-model", required=True)
+    p_plan.add_argument("--doubao-price", type=_price, required=True)
     p_plan.add_argument("--stop-line", type=_stop_line, default=650.0)
+    p_plan.add_argument("--out-root", type=Path, default=None)
     p_man = sub.add_parser("manifests")
     p_man.add_argument("--out", type=Path, required=True)
     p_man.add_argument("--doubao-model", required=True)
@@ -476,7 +536,9 @@ def _parser() -> argparse.ArgumentParser:
     p_run.add_argument("--docs", type=Path, required=True)
     p_run.add_argument("--out", type=Path, required=True)
     p_run.add_argument("--doubao-model", default=None)
+    p_run.add_argument("--doubao-price", type=_price, required=True)
     p_run.add_argument("--stop-line", type=_stop_line, required=True)
+    p_run.add_argument("--unblock", default=None, metavar="REASON")
     p_run.add_argument("--approved-quote", required=True)
     p_run.add_argument("--base-url", default=os.environ.get("EXPERT_WORK_EVAL_BASE_URL"))
     p_rep = sub.add_parser("report")
@@ -484,6 +546,7 @@ def _parser() -> argparse.ArgumentParser:
     p_rep.add_argument("--out", type=Path, required=True)
     p_clean = sub.add_parser("cleanup")
     p_clean.add_argument("--base-url", default=os.environ.get("EXPERT_WORK_EVAL_BASE_URL"))
+    p_clean.add_argument("--doubao-model", required=True)
     p_clean.add_argument("--yes", action="store_true")
     return parser
 
@@ -518,22 +581,27 @@ async def _run_cli(
         )
 
 
-async def _cleanup_cli(base_url: str, token: str, yes: bool, emit: Callable[[str], None]) -> None:
+async def _cleanup_cli(
+    base_url: str, token: str, codes: set[str], yes: bool, emit: Callable[[str], None]
+) -> None:
     import httpx
 
     async with httpx.AsyncClient(
         base_url=base_url, headers={"Authorization": f"Bearer {token}"}, timeout=60.0
     ) as http:
-        await cleanup(http, yes=yes, emit=emit)
+        await cleanup(http, codes=codes, yes=yes, emit=emit)
 
 
 def main(argv: Sequence[str] | None = None, *, emit: Callable[[str], None] = print) -> int:
     parser = _parser()
     args = parser.parse_args(argv)
     if args.cmd == "plan":
-        models = default_models(args.doubao_model)
+        models = default_models(args.doubao_model, args.doubao_price)
         sessions = plan(load_docs(args.docs), models, args.docs)
-        emit(json.dumps(quote(sessions, models, args.stop_line), indent=2, ensure_ascii=False))
+        body = quote(sessions, models, args.stop_line)
+        if args.out_root is not None:
+            body["spent_history"] = spent_history(args.out_root)
+        emit(json.dumps(body, indent=2, ensure_ascii=False))
         return 0
     if args.cmd == "manifests":
         for path in write_manifests(args.out, default_models(args.doubao_model)).values():
@@ -546,12 +614,13 @@ def main(argv: Sequence[str] | None = None, *, emit: Callable[[str], None] = pri
         token = os.environ.get("EXPERT_WORK_EVAL_CONSOLE_TOKEN")
         if not args.base_url or not token:
             parser.error("cleanup needs --base-url and EXPERT_WORK_EVAL_CONSOLE_TOKEN (console)")
-        asyncio.run(_cleanup_cli(args.base_url, token, args.yes, emit))
+        codes = temporary_agent_codes(args.doubao_model)
+        asyncio.run(_cleanup_cli(args.base_url, token, codes, args.yes, emit))
         return 0
     api_key = os.environ.get("EXPERT_WORK_EVAL_API_KEY")
     if not args.doubao_model or not args.base_url or not api_key:
         parser.error("run needs --doubao-model, --base-url and EXPERT_WORK_EVAL_API_KEY")
-    models = default_models(args.doubao_model)
+    models = default_models(args.doubao_model, args.doubao_price)
     full_plan = plan(load_docs(args.docs), models, args.docs)
     quote_id = quote(full_plan, models, args.stop_line)["quote_id"]
     if args.approved_quote != quote_id:
@@ -560,14 +629,24 @@ def main(argv: Sequence[str] | None = None, *, emit: Callable[[str], None] = pri
             "run `plan` with the same arguments and get that quote approved"
         )
     sessions = [s for s in full_plan if phase_of(s) == args.phase]
-    tracker = SpendTracker(stop_line=args.stop_line, prices={m.name: m.price for m in models})
+    tracker = SpendTracker(
+        stop_line=args.stop_line,
+        prices={m.name: m.price for m in models},
+        run_caps={m.name: run_cap_yuan(m.price) for m in models},
+    )
     spent_file = args.out / "spent.json"
+    unblocks: list[dict[str, Any]] = []
     if spent_file.exists():
         saved = json.loads(spent_file.read_text())
         if saved.get("quote_id") != quote_id:
             parser.error(f"{spent_file} belongs to quote {saved.get('quote_id')}, not {quote_id}")
         tracker.spent = float(saved["spent"])
         tracker.blocked = saved.get("blocked")
+        unblocks = list(saved.get("unblocks") or [])
+    if tracker.blocked is not None and args.unblock:
+        # 显式解除阻塞:原因与被解除的那条一起记进 spent.json,事后能查。
+        unblocks.append({"reason": args.unblock, "was": tracker.blocked})
+        tracker.blocked = None
     emit(
         f"approved quote {quote_id}; stop line {args.stop_line}; "
         f"already spent {tracker.spent:.2f}; blocked={tracker.blocked}"
@@ -577,7 +656,14 @@ def main(argv: Sequence[str] | None = None, *, emit: Callable[[str], None] = pri
     finally:
         args.out.mkdir(parents=True, exist_ok=True)
         spent_file.write_text(
-            json.dumps({"spent": tracker.spent, "quote_id": quote_id, "blocked": tracker.blocked})
+            json.dumps(
+                {
+                    "spent": tracker.spent,
+                    "quote_id": quote_id,
+                    "blocked": tracker.blocked,
+                    "unblocks": unblocks,
+                }
+            )
         )
     return 0
 
