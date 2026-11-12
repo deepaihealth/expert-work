@@ -615,6 +615,8 @@ def build_run_graph_input(
         # B-302 PR 3 —— 每个文件的 edit_file 连续失败次数与本轮成功改动同样只属于一轮。
         "edit_file_streaks": {},
         "edit_file_history": {},
+        # B-302 PR 4 —— 结果重复检测(影子模式)的账同样只属于一轮。
+        "outcome_repeats": {},
     }
 
 
@@ -676,6 +678,7 @@ def replay_graph_input(
         **RUN_CLOCK_TURN_RESET,  # B-302,同上
         "edit_file_streaks": {},  # B-302 PR 3,同上
         "edit_file_history": {},
+        "outcome_repeats": {},  # B-302 PR 4,同上
     }
 
 

@@ -1259,3 +1259,17 @@ def test_every_turn_input_clears_the_edit_file_tracking() -> None:
     for graph_input in (fresh, replay):
         assert graph_input["edit_file_streaks"] == {}
         assert graph_input["edit_file_history"] == {}
+
+
+def test_every_turn_input_clears_the_outcome_repeat_ledger() -> None:
+    """B-302 PR 4 —— 结果重复检测的账只属于一轮:省略时上一轮的结果会让这一轮第一次
+    出现同样结果就被算成「第 3 次」。"""
+    built = BuiltAgent(graph=None, system_prompt="sys", max_steps=3)  # type: ignore[arg-type]
+    fresh = build_run_graph_input(
+        built, input_text="hi", image_refs=[], untrusted_content=None, run_id=uuid4()
+    )
+    replay = replay_graph_input(
+        built, [SystemMessage(content="sys"), HumanMessage(content="hi")], run_id=uuid4()
+    )
+    for graph_input in (fresh, replay):
+        assert graph_input["outcome_repeats"] == {}
