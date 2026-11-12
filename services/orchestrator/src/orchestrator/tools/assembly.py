@@ -244,6 +244,14 @@ class ToolEnv:
     #: 库的校准、库向量的模型、此刻查询用的模型三者一致时才用向量这一路;``None``(没接线)=
     #: 只用关键词。进程内字段,不是 manifest 字段。
     embedding_model_key: Callable[[], Awaitable[str | None]] | None = None
+    #: B-302 PR 2 第 1 层 —— 平台开关「读取规矩」(控制面 ``Settings.reading_rule``,
+    #: ``EXPERT_WORK_READING_RULE``,默认关)。只对主模型自己能看图的构建生效;智能体的
+    #: ``policies.reading_rule`` 填了就用自己的。进程内字段,不是 manifest 字段。
+    reading_rule: bool = False
+    #: B-302 PR 2 第 2 层 —— 平台的 ``figure_view_steps``(控制面 ``Settings.figure_view_steps``,
+    #: ``EXPERT_WORK_FIGURE_VIEW_STEPS``,默认 0 = 关)。智能体的 ``policies.figure_view_steps``
+    #: 填了就用自己的。进程内字段,不是 manifest 字段。
+    figure_view_steps: int = 0
 
 
 async def build_tool_registry(

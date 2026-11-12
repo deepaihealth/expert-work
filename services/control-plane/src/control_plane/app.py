@@ -1924,6 +1924,9 @@ def create_app(
                     embedding_model_key=partial(
                         live_embedding_key, resolved_platform_embedding_config_service
                     ),
+                    # B-302 PR 2 —— 读取规矩 / 页图只留几步的平台值(默认关)。
+                    reading_rule=resolved_settings.reading_rule,
+                    figure_view_steps=resolved_settings.figure_view_steps,
                 )
                 # Stream HX-7 — resolve the Langfuse client once: the
                 # SDK adapter when the deployment configures an instance,

@@ -153,6 +153,7 @@ from orchestrator.graph_builder._config import (
 )
 from orchestrator.graph_builder.answer_check import answer_check_note
 from orchestrator.graph_builder.figure_block import (
+    FigureExpiry,
     figure_block_message,
     figure_freshness,
     with_figure_block,
@@ -244,6 +245,7 @@ from orchestrator.tools.error_classifier import (
     render_recovery_advisory,
 )
 from orchestrator.tools.figure_lookup import figure_run_ids
+from orchestrator.tools.figure_reads import stamp_step
 from orchestrator.tools.file_ops import EditFileMismatchError
 from orchestrator.tools.find_tools import promotion_events
 from orchestrator.tools.knowledge_probe import (
@@ -593,6 +595,9 @@ def build_react_graph(
     # ``agent_node`` 每轮把 ``viewed_figures`` 里最近几页挂到提示词尾部(Path A)。
     # 默认 ``False`` = 不接线时一个像素都不挂 —— 失败方向是安全那一侧。
     supports_vision: bool = False,
+    # B-302 PR 2 第 2 层 —— 一份文档的页图在它最后一次 ``read_page`` 之后带几次模型调用
+    # (``FigureExpiry``)。``0``(默认)= 关:挂图与回执与之前逐字节相同。
+    figure_view_steps: int = 0,
     approval_required_tools: frozenset[str] = frozenset(),
     approval_timeout_s: int = 86400,
     # B-20 approval triage — clarification-class ``ask_for_approval`` rows
@@ -1008,11 +1013,24 @@ def build_react_graph(
         # config。每轮重建、不落检查点。
         # B-236 —— 本轮的工作区视图(布局 / 对话)与工具那一侧同一个来源:
         # ``_build_tool_context`` 读 config。渲染页段与工作区快照都用它。
-        turn_view = _build_tool_context(config).workspace_view
+        turn_ctx = _build_tool_context(config)
+        turn_view = turn_ctx.workspace_view
         figure_viewed = state.get("viewed_figures") or []
         figure_documents = state.get("figure_documents") or {}
         figure_tenant = _parse_uuid(configurable.get("tenant_id"))
         figure_user = _parse_uuid(configurable.get("user_id"))
+        # B-302 第 2 层 —— 页图按「这份文档最后一次取页之后的调用次数」退役;读取账按轮记
+        # (与 ``read_page`` 同一个首段 run),步数章由 tools 节点盖。关着(0)时不传,原样。
+        figure_expiry = (
+            FigureExpiry(
+                view_steps=figure_view_steps,
+                step=step_count,
+                reads=tuple(state.get("figure_reads") or ()),
+                run_id=turn_ctx.turn_root_run_id or turn_ctx.run_id,
+            )
+            if figure_view_steps > 0
+            else None
+        )
         # 终审 #1 —— 窗口里的页先核对新鲜度(文档在渲染之后被改过/替换了就不附图)。
         # 没接工作区存储就核对不了,``None`` 保持原行为(见 figure_block_message)。
         figure_fresh = (
@@ -1023,6 +1041,7 @@ def build_react_graph(
                 tenant_id=figure_tenant,
                 user_id=figure_user,
                 view=turn_view,
+                expiry=figure_expiry,
             )
             if supports_vision and figure_viewed and workspace_store is not None
             else None
@@ -1035,6 +1054,7 @@ def build_react_graph(
             user_id=figure_user,
             view=turn_view,
             freshness=figure_fresh,
+            expiry=figure_expiry,
         )
         reserved: tuple[BaseMessage, ...] = (figure_block,) if figure_block is not None else ()
         # B-126 —— set below when this turn's compression reports a fresh/updated
@@ -2118,6 +2138,7 @@ def build_react_graph(
             run_state=state,
             edit_file_streaks=state.get("edit_file_streaks"),
             edit_file_history=state.get("edit_file_history"),
+            figure_view_steps=figure_view_steps,
         )
         # Stream TE-2 — per-tool-call audit sink (may be None on the dev /
         # unit-test path; ``_dispatch_tool`` treats the emit as best-effort).
@@ -2331,6 +2352,14 @@ def build_react_graph(
         # (find_tools result or a call-through) gets its baseline. Tools
         # without a stamp would otherwise be un-ageable.
         current_step = int(state.get("step_count", 0))
+        # B-302 §4.2.3 —— ``read_page`` 本批记的账按当前步数盖章(平台盖,覆盖工具自己写的);
+        # ``agent_node`` 据此判一份文档的页图过没过期。不开新通道、不改 reducer。
+        batch_reads = accumulated_state.get("figure_reads")
+        if isinstance(batch_reads, list):
+            accumulated_state = {
+                **accumulated_state,
+                "figure_reads": stamp_step(batch_reads, current_step),
+            }
         already_promoted = set(state.get("promoted_tools") or [])
         batch_promoted = accumulated_state.get("promoted_tools")
         freshly_promoted = set(batch_promoted) if isinstance(batch_promoted, list) else set()
@@ -4649,6 +4678,7 @@ def _build_tool_context(
     run_state: Mapping[str, Any] | None = None,
     edit_file_streaks: Mapping[str, Any] | None = None,
     edit_file_history: Mapping[str, Any] | None = None,
+    figure_view_steps: int = 0,
 ) -> ToolContext:
     """Lift tenant / user binding out of ``config["configurable"]`` into
     a :class:`ToolContext`. Missing values fall through as ``None`` —
@@ -4779,6 +4809,7 @@ def _build_tool_context(
         edit_file_streaks=edit_file_streaks if isinstance(edit_file_streaks, Mapping) else {},
         edit_file_history=edit_file_history if isinstance(edit_file_history, Mapping) else {},
         turn_root_run_id=_parse_uuid(configurable.get(TURN_ROOT_RUN_KEY)),
+        figure_view_steps=figure_view_steps,
     )
 
 

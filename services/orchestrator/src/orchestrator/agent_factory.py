@@ -155,6 +155,7 @@ from orchestrator.output_judge import ActionJudge, OutputJudge
 from orchestrator.runner import GraphRunner
 from orchestrator.tools import ToolEnv, build_tool_registry
 from orchestrator.tools.arg_bindings import manifest_bindings
+from orchestrator.tools.figure_reads import READING_RULE
 from orchestrator.tools.file_ops import SandboxWorkspaceWriter
 from orchestrator.tools.knowledge import Reranker
 from orchestrator.tools.knowledge_catalog import CATALOG_UNAVAILABLE, load_knowledge_catalog
@@ -1251,6 +1252,7 @@ async def build_agent(
             if agent_memory
             else None
         ),
+        reading_rule=_reading_rule(spec, env),
     )
 
     # Capability Uplift Sprint #8 (Mini-ADR U-8) — render mode for the
@@ -1364,6 +1366,8 @@ async def build_agent(
         # B-64 —— Path A 的渲染页段只挂给能看图的主模型;与下面 ``BuiltAgent`` 用的
         # 是同一个表达式。
         supports_vision=spec.spec.model.supports_vision,
+        # B-302 PR 2 第 2 层 —— 页图在文档最后一次取页之后带几次调用(0 = 关)。
+        figure_view_steps=_figure_view_steps(spec, env),
         workspace_ingest_node=workspace_ingest_node,
         inputs_node=inputs_node,
         conversation_seed_node=conversation_seed_node,
@@ -2017,6 +2021,25 @@ COMPLETION_CONTRACT_CLAUSE = """<completion-contract>
 </completion-contract>"""
 
 
+def _reading_rule(spec: AgentSpec, env: ToolEnv) -> bool:
+    """B-302 第 1 层 —— 这次构建的系统提示词里有没有读取规矩。
+
+    只给主模型自己能看图的构建(``model.supports_vision``,构建期就能判);**不按有没有
+    ``read_page`` 判** —— 那是所有智能体都有的基础能力。走 ``ask_image`` 的本批不加(没测)。
+    智能体的 ``policies.reading_rule`` 填了就用它,空 = 平台开关 ``ToolEnv.reading_rule``。
+    """
+    if not spec.spec.model.supports_vision:
+        return False
+    override = spec.spec.policies.reading_rule
+    return env.reading_rule if override is None else override
+
+
+def _figure_view_steps(spec: AgentSpec, env: ToolEnv) -> int:
+    """B-302 第 2 层 —— 智能体的 ``policies.figure_view_steps`` 填了就用它,空 = 平台值。"""
+    override = spec.spec.policies.figure_view_steps
+    return env.figure_view_steps if override is None else override
+
+
 def _knowledge_probe(spec: AgentSpec, env: ToolEnv) -> KnowledgeProbe | None:
     """B-267 step 3 — the per-turn probe of an agent binding knowledge bases,
     with the platform switch ``ToolEnv.kb_first_routing`` on and the manifest's
@@ -2097,6 +2120,7 @@ def _assemble_system_prompt(
     knowledge_catalog: str | None = None,
     agent_memory: str | None = None,
     outgoing_arguments: bool = False,
+    reading_rule: bool = False,
 ) -> str:
     """Splice base system prompt + skill summary list + ordered body
     fragments (eager skills only) + SE-10 text-class component blocks.
@@ -2210,6 +2234,11 @@ def _assemble_system_prompt(
     # 用户自己的索引内容不在这里,见 ``graph_builder.agent_notes``)。
     if agent_memory:
         pieces.append("\n\n" + agent_memory)
+
+    # B-302 PR 2 第 1 层 —— 读取规矩(只给主模型自己能看图、开关开着的构建,见 ``_reading_rule``)。
+    # 构建期定、整段不变,在系统提示词里(前缀稳定、可缓存),不是每步现加的尾段。
+    if reading_rule:
+        pieces.append("\n\n# Reading documents and images\n" + READING_RULE)
 
     # B-175 P4 — the knowledge catalog (``knowledge_catalog`` module; 2+ bound
     # bases). Last, so a description edit or a document-count bucket change

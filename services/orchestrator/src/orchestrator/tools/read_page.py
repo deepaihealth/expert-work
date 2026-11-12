@@ -1760,7 +1760,12 @@ class ReadPageTool:
         if self.figure_delivery != "inline":
             return None
         return read_notice(
-            ctx.figure_reads, run_id=_ledger_run(ctx), doc_sha=doc_sha, reads=reads, pages=pages
+            ctx.figure_reads,
+            run_id=_ledger_run(ctx),
+            doc_sha=doc_sha,
+            reads=reads,
+            pages=pages,
+            view_steps=ctx.figure_view_steps,
         )
 
     async def _region_result(

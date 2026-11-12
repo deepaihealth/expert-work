@@ -177,7 +177,8 @@ def test_a_re_read_gets_a_receipt_naming_the_read_count_and_what_is_in_view() ->
         notice
     )
     assert "write_file" in notice
-    assert "numbers noted in your thinking are not kept to the next step" in notice
+    # B-302 §4.2.4 —— number(s) → detail(s)
+    assert "details noted in your thinking are not kept to the next step" in notice
 
 
 def test_the_receipt_counts_by_unit_not_by_page() -> None:
@@ -204,7 +205,7 @@ def test_a_document_over_the_cap_gets_a_heads_up_on_its_first_read_only() -> Non
     first = read_notice([], run_id=_RUN, doc_sha=_DOC, reads=[_page(1)], pages=9)
     assert first == (
         "This document has 9 pages, more than the 6 pages that can be in view at once. "
-        "Write the numbers into a workspace file as you read, then calculate from the file."
+        "Write the details into a workspace file as you read, then work from the file."
     )
     later = read_notice(_ledger(_page(1), pages=9), run_id=_RUN, doc_sha=_DOC, reads=[_page(2)])
     assert later is None
