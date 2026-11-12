@@ -246,8 +246,10 @@ class DocResult:
     recopy_share: float
     calls_after_deliverable: int | None
     thinking_median: float | None
-    refetches: int
-    no_progress_exit: bool
+    #: 每次运行(这个会话的每一轮)各自的过期后重取次数 —— 判据 5 按「每次运行」取中位数与最大值。
+    refetches: tuple[int, ...]
+    #: 这个会话里以 ``no_progress`` 收尾的运行数(每一轮分别计)。
+    no_progress_runs: int
     wall_s: float
     tokens: int
     correction_applied: bool | None = None
@@ -325,10 +327,10 @@ def recopy_reduced(a: Sequence[DocResult], b: Sequence[DocResult]) -> bool:
 def refetch_gate(a: Sequence[DocResult], c: Sequence[DocResult]) -> bool:
     """判据 5(上线闸门):C 每次运行的过期后重取中位数 ≤ 1、最多 ≤ 5;因熔断以「无进展」收尾的
     运行 C ≤ A + 1。"""
-    counts = [d.refetches for d in c]
+    counts = [n for d in c for n in d.refetches]
     if not counts or statistics.median(counts) > 1 or max(counts) > 5:
         return False
-    return sum(d.no_progress_exit for d in c) <= sum(d.no_progress_exit for d in a) + 1
+    return sum(d.no_progress_runs for d in c) <= sum(d.no_progress_runs for d in a) + 1
 
 
 def not_slower(a: Sequence[DocResult], x: Sequence[DocResult]) -> bool | None:
@@ -336,9 +338,11 @@ def not_slower(a: Sequence[DocResult], x: Sequence[DocResult]) -> bool | None:
     pairs = [(p, q) for p, q in _pairs(a, x) if not p.runaway and not q.runaway]
     if not pairs:
         return None
-    wall = statistics.median(q.wall_s / p.wall_s for p, q in pairs if p.wall_s > 0)
-    tokens = statistics.median(q.tokens / p.tokens for p, q in pairs if p.tokens > 0)
-    return wall <= 1.1 and tokens <= 1.1
+    walls = [q.wall_s / p.wall_s for p, q in pairs if p.wall_s > 0]
+    tokens = [q.tokens / p.tokens for p, q in pairs if p.tokens > 0]
+    if not walls or not tokens:
+        return None
+    return statistics.median(walls) <= 1.1 and statistics.median(tokens) <= 1.1
 
 
 def corrections_followed(a: Sequence[DocResult], x: Sequence[DocResult]) -> bool:

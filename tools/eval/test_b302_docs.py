@@ -156,3 +156,32 @@ def test_rendering_makes_a_scanned_pdf(tmp_path: Path) -> None:
     assert original.min() < 100, "nothing was drawn on the page"
     # 扫描效果确实改了像素:不是原样白底黑字。
     assert np.abs(np.asarray(scanned.convert("L"), dtype=float) - original).mean() > 5
+
+
+def _font_or_skip() -> str:
+    try:
+        return docs.find_font()
+    except FileNotFoundError:
+        pytest.skip("no CJK font on this machine")
+
+
+def test_a_line_wider_than_the_page_is_refused(tmp_path: Path) -> None:
+    """独立审查 LOW-5:模板里的一行在页面上放不下就拒收,不然排版时被裁掉、标准答案对不上。"""
+    font = _font_or_skip()
+    for category in docs.CATEGORIES:
+        docs.check_category(category, font_path=font)
+    wide = dict(_INCIDENT, filler=["这一行合成的说明文字写得特别长" * 8])
+    path = tmp_path / "wide.json"
+    path.write_text(json.dumps(wide, ensure_ascii=False), encoding="utf-8")
+    with pytest.raises(ValueError, match="wider than the page"):
+        docs.load_incident_template(path, font_path=font)
+    long_label = dict(_INCIDENT)
+    long_label["fields"] = [
+        {**f, "label": "非常非常长的字段名称" * 6} if i == 0 else f
+        for i, f in enumerate(_INCIDENT["fields"])
+    ]
+    path.write_text(json.dumps(long_label, ensure_ascii=False), encoding="utf-8")
+    with pytest.raises(ValueError, match="wider than the page"):
+        docs.load_incident_template(path, font_path=font)
+    with pytest.raises(ValueError, match="wider than the page"):
+        docs.render_page("宽" * 200, font, handwriting=False, rng=random.Random(1))  # noqa: S311

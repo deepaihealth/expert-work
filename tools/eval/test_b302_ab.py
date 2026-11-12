@@ -98,28 +98,80 @@ def test_the_call_estimate(tmp_path: Path) -> None:
 # --------------------------------------------------------------------------- spend and guards
 
 
-def test_spend_counts_cache_reads_at_their_price_and_stops_at_the_line() -> None:
+def test_the_stop_line_alone_stops_new_runs() -> None:
+    """缓存读 / 没单价 / 没用量的计费在 ``test_b302_live`` 按平台真实形状测。"""
     tracker = ab.SpendTracker(stop_line=1.0, prices={"glm-5.3-flash": (0.8, 2.8, 0.23)})
-    cost = tracker.add(
-        [
-            {
-                "model": "glm-5.3-flash",
-                "input_tokens": 1_000_000,
-                "output_tokens": 100_000,
-                "input_token_details": {"cache_read": 400_000},
-            }
-        ]
-    )
-    assert cost == pytest.approx(0.6 * 0.8 + 0.4 * 0.23 + 0.1 * 2.8)
+    tracker.add([{"model": "glm-5.3-flash", "input_tokens": 1_000_000, "output_tokens": 0}])
     assert tracker.may_start() is True
     tracker.add([{"model": "glm-5.3-flash", "input_tokens": 1_000_000, "output_tokens": 0}])
     assert tracker.may_start() is False
 
 
-def test_an_unpriced_model_is_an_error_not_free() -> None:
-    tracker = ab.SpendTracker(stop_line=1.0, prices={})
-    with pytest.raises(ab.PlanError, match="no price"):
-        tracker.add([{"model": "other", "input_tokens": 1, "output_tokens": 1}])
+# ------------------------------------------------------------------ quote id and stop line (LOW-2)
+
+
+def test_the_quote_id_is_stable_and_follows_what_was_quoted(tmp_path: Path) -> None:
+    docs_dir = _docs_dir(tmp_path)
+    models = ab.default_models("d")
+    sessions = ab.plan(ab.load_docs(docs_dir), models, docs_dir)
+    q = ab.quote(sessions, models, 650.0)
+    assert q["quote_id"] == ab.quote(sessions, models, 650.0)["quote_id"]
+    assert q["quote_id"] != ab.quote(sessions, models, 400.0)["quote_id"]
+    assert q["quote_id"] != ab.quote(sessions[:-1], models, 650.0)["quote_id"]
+    out: list[str] = []
+    ab.main(["plan", "--docs", str(docs_dir), "--doubao-model", "d"], emit=out.append)
+    assert json.loads(out[0])["quote_id"] == q["quote_id"]
+
+
+@pytest.mark.parametrize("bad", ["nan", "inf", "0", "-1", "2000.01", "abc"])
+def test_a_stop_line_must_be_a_sane_number(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], bad: str
+) -> None:
+    monkeypatch.setenv("EXPERT_WORK_EVAL_API_KEY", "k")
+    docs_dir = _docs_dir(tmp_path)
+    args = [
+        "run", "--phase", "pilot", "--docs", str(docs_dir), "--out", str(tmp_path / "o"),
+        "--doubao-model", "d", "--base-url", "http://platform.invalid",
+        "--approved-quote", "x", "--stop-line", bad,
+    ]  # fmt: skip
+    with pytest.raises(SystemExit):
+        ab.main(args)
+    assert "--stop-line" in capsys.readouterr().err
+
+
+def _run_args(tmp_path: Path, docs_dir: Path, quote_id: str) -> list[str]:
+    return [
+        "run", "--phase", "pilot", "--docs", str(docs_dir), "--out", str(tmp_path / "o"),
+        "--doubao-model", "d", "--base-url", "http://platform.invalid",
+        "--approved-quote", quote_id, "--stop-line", "650",
+    ]  # fmt: skip
+
+
+def test_the_approved_quote_must_be_the_quote_of_this_plan(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setenv("EXPERT_WORK_EVAL_API_KEY", "k")
+    docs_dir = _docs_dir(tmp_path)
+    with pytest.raises(SystemExit):
+        ab.main(_run_args(tmp_path, docs_dir, "not-the-quote"))
+    assert "does not match" in capsys.readouterr().err
+    assert not (tmp_path / "o").exists()
+
+
+def test_the_quote_id_is_written_into_spent_and_every_record(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """文档没渲染(没有 PDF):每个会话在上传之前就出错 —— 不碰网络,正好走一遍记账与阻塞。"""
+    monkeypatch.setenv("EXPERT_WORK_EVAL_API_KEY", "k")
+    docs_dir = _docs_dir(tmp_path)
+    models = ab.default_models("d")
+    qid = ab.quote(ab.plan(ab.load_docs(docs_dir), models, docs_dir), models, 650.0)["quote_id"]
+    ab.main(_run_args(tmp_path, docs_dir, qid), emit=lambda _l: None)
+    spent = json.loads((tmp_path / "o" / "spent.json").read_text())
+    assert spent["quote_id"] == qid
+    assert spent["blocked"] is not None and "FileNotFoundError" in spent["blocked"]
+    records = [json.loads(x) for x in (tmp_path / "o" / "records.jsonl").read_text().splitlines()]
+    assert records and all(r["quote_id"] == qid for r in records)
 
 
 # --------------------------------------------------------------------------- frames
@@ -397,9 +449,62 @@ def test_a_session_record_becomes_a_document_result(tmp_path: Path) -> None:
     result = ab.doc_result({"turns": [first, second, third]}, doc, view_steps=3)
     assert result.correct == 9
     assert result.calls_after_deliverable == 2
-    assert result.refetches == 1  # 上一轮读过的文档,本轮第一次再读 = 过期后重取
+    # 每次运行分别计(独立审查 MEDIUM-2):第 1 轮第一次读不算;第 2 轮再读上一轮读过的 = 1;第 3 轮没读
+    assert result.refetches == (0, 1, 0)
+    assert result.no_progress_runs == 0
     assert result.correction_applied is True
     assert result.template_ok is True
     assert result.tokens == 120
     assert result.thinking_median == 6.5
     assert result.runaway is False
+
+
+def test_the_report_deduplicates_and_counts_what_could_not_be_scored(tmp_path: Path) -> None:
+    """MEDIUM-3:同键留最后一条;待确认 3:没登记的交付件、没有交付件、出错与被拦下的会话
+    都单独计数。"""
+    docs_dir = _docs_dir(tmp_path)
+    doc = ab.load_docs(docs_dir)[0]
+    out = tmp_path / "o"
+    out.mkdir()
+
+    def _rec(arm: str, source: str, **kw: Any) -> dict[str, Any]:
+        second = {
+            "turn": 2,
+            "steps": [],
+            "exit_reason": "text_response",
+            "warnings": [],
+            "wall_s": 1.0,
+            "usage_by_model": [],
+            "deliverable_source": source,
+            "deliverable_text": None,
+            "deliverable_structure": None,
+        }
+        base = {
+            "phase": "main",
+            "model": "glm-5.3-flash",
+            "arm": arm,
+            "doc_id": doc["doc_id"],
+            "turns": 3,
+            "repeat": 0,
+            "quote_id": "q",
+            "stopped": None,
+        }
+        return {**base, "turns": [second], **kw}
+
+    records = [
+        _rec("A", "missing", stopped="stop line reached"),
+        _rec("A", "registered"),
+        _rec("C", "workspace_unregistered"),
+        {"phase": "main", "model": "glm-5.3-flash", "arm": "B", "doc_id": "x", "repeat": 0,
+         "quote_id": "q", "error": "ConnectError()"},
+    ]  # fmt: skip
+    (out / "records.jsonl").write_text("\n".join(json.dumps(r) for r in records) + "\n")
+    (out / "spent.json").write_text(json.dumps({"spent": 1.0, "quote_id": "q", "blocked": "x"}))
+    result = ab.report(docs_dir, out)
+    assert result["sessions"] == {"records": 3, "errors": 1, "stopped": 0}
+    assert result["deliverables"]["glm-5.3-flash"] == {
+        "A": {"registered": 1},
+        "C": {"workspace_unregistered": 1},
+    }
+    assert result["blocked"] == "x"
+    assert "glm-5.3-flash" in result["verdicts"]

@@ -222,7 +222,7 @@ CATEGORIES: tuple[Category, ...] = (
 )
 
 
-def load_incident_template(path: Path) -> Category:
+def load_incident_template(path: Path, *, font_path: str | None = None) -> Category:
     """协调人给的第 6 类模板(JSON):
 
     ``{"key", "language": "zh"|"en", "title", "fields": [{"label", "kind"} x 10], "filler": [...],
@@ -239,11 +239,12 @@ def load_incident_template(path: Path) -> Category:
         sections=tuple(str(x) for x in raw["sections"]),
         handwriting=bool(raw.get("handwriting", False)),
     )
-    check_category(category)
+    check_category(category, font_path=font_path)
     return category
 
 
-def check_category(category: Category) -> None:
+def check_category(category: Category, *, font_path: str | None = None) -> None:
+    """字段数与种类;给了字体时再量每一行(标题、说明文字、带最长样值的字段行)放不放得下。"""
     kinds = [f.kind for f in category.fields]
     if len(kinds) != 10:
         raise ValueError(f"{category.key}: needs exactly 10 key fields, got {len(kinds)}")
@@ -254,6 +255,37 @@ def check_category(category: Category) -> None:
         raise ValueError(f"{category.key}: at least 6 key fields must not be numbers")
     if category.language not in ("zh", "en") or not category.filler or not category.sections:
         raise ValueError(f"{category.key}: language must be zh/en, filler and sections non-empty")
+    if font_path is not None:
+        for line in _layout_lines(category):
+            _check_width(line, font_path, handwriting=category.handwriting)
+
+
+def _layout_lines(category: Category) -> list[str]:
+    """这一类文档可能排出的最宽的那些行:标题、说明文字、每个字段配它这一种最长的样值。"""
+    rng = random.Random(0)  # noqa: S311 - synthetic test data, not security
+    longest = {
+        kind: max((_value(kind, category.language, rng) for _ in range(60)), key=len)
+        for kind in {f.kind for f in category.fields}
+    }
+    return [
+        f"{category.title} (6/6)",
+        *category.filler,
+        *(f"[#WWWW] {f.label}: {longest[f.kind]}" for f in category.fields),
+    ]
+
+
+def _check_width(line: str, font_path: str, *, handwriting: bool) -> None:
+    from PIL import ImageFont
+
+    # 手写体每个字最多放大 4 磅、字间多 3 像素(见 :func:`render_page`)。
+    size = FONT_SIZE + (4 if handwriting else 0)
+    width = ImageFont.truetype(font_path, size).getlength(line) + (
+        3 * len(line) if handwriting else 0
+    )
+    if width > TEXT_WIDTH_PX:
+        raise ValueError(
+            f"line is wider than the page ({int(width)} > {TEXT_WIDTH_PX} px): {line[:40]}..."
+        )
 
 
 # --------------------------------------------------------------------------- values
@@ -454,6 +486,9 @@ def build_set(categories: Sequence[Category], *, seed: int) -> list[GoldDoc]:
 # --------------------------------------------------------------------------- rendering
 
 PAGE_PX = (1240, 1754)  # A4 at 150 DPI
+MARGIN_X = 110
+TEXT_WIDTH_PX = PAGE_PX[0] - 2 * MARGIN_X
+FONT_SIZE = 24  # about 11.5 pt at 150 DPI
 DPI = 150
 FONT_CANDIDATES: tuple[str, ...] = (
     "/System/Library/Fonts/Hiragino Sans GB.ttc",
@@ -479,14 +514,15 @@ def render_page(text: str, font_path: str, *, handwriting: bool, rng: random.Ran
 
     page = Image.new("L", PAGE_PX, 255)
     draw = ImageDraw.Draw(page)
-    size = 24  # about 11.5 pt at 150 DPI
+    size = FONT_SIZE
     font = ImageFont.truetype(font_path, size)
     y = 120
     for line in text.splitlines():
+        _check_width(line, font_path, handwriting=handwriting)
         if not handwriting:
-            draw.text((110, y), line, fill=20, font=font)
+            draw.text((MARGIN_X, y), line, fill=20, font=font)
         else:
-            x = 110
+            x = MARGIN_X
             box = size * 2
             for ch in line:
                 ch_font = ImageFont.truetype(font_path, size + rng.randint(-3, 4))
@@ -621,6 +657,9 @@ def write_set(
     by_key = {c.key: c for c in categories}
     out.mkdir(parents=True, exist_ok=True)
     font_path = find_font(font) if render else ""
+    if render:
+        for category in categories:
+            check_category(category, font_path=font_path)
     for doc in docs:
         (out / f"{doc.doc_id}.gold.json").write_text(
             json.dumps(doc.to_json(), ensure_ascii=False, indent=2), encoding="utf-8"
@@ -658,7 +697,11 @@ def main(argv: Sequence[str] | None = None, *, emit: Callable[[str], None] = pri
     parser.add_argument("--incident-template", type=Path, default=None)
     parser.add_argument("--font", default=None)
     args = parser.parse_args(argv)
-    incident = load_incident_template(args.incident_template) if args.incident_template else None
+    incident = (
+        load_incident_template(args.incident_template, font_path=find_font(args.font))
+        if args.incident_template
+        else None
+    )
     manifest = write_set(args.out, seed=args.seed, incident=incident, font=args.font)
     if not manifest["complete"]:
         emit("WARNING: no --incident-template: 10 of 12 documents; the A/B runner refuses this set")

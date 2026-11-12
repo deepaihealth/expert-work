@@ -173,8 +173,8 @@ def _doc(**kw: object) -> m.DocResult:
         "recopy_share": 0.0,
         "calls_after_deliverable": 2,
         "thinking_median": 100.0,
-        "refetches": 0,
-        "no_progress_exit": False,
+        "refetches": (0, 0, 0),
+        "no_progress_runs": 0,
         "wall_s": 100.0,
         "tokens": 1000,
         "correction_applied": True,
@@ -265,12 +265,20 @@ def test_criterion_3_flips() -> None:
 
 def test_criterion_5_refetch_gate() -> None:
     a = _arm()
-    assert m.refetch_gate(a, _arm(refetches=1)) is True
-    assert m.refetch_gate(a, _arm(refetches=2)) is False  # 中位数 2
-    spike = [_doc(doc_id=f"d{i}", refetches=6 if i == 0 else 0) for i in range(12)]
+    assert m.refetch_gate(a, _arm(refetches=(1, 1, 1))) is True
+    assert m.refetch_gate(a, _arm(refetches=(2, 2, 2))) is False  # 中位数 2
+    spike = [_doc(doc_id=f"d{i}", refetches=(0, 6 if i == 0 else 0)) for i in range(12)]
     assert m.refetch_gate(a, spike) is False
-    stuck = [_doc(doc_id=f"d{i}", no_progress_exit=i < 2) for i in range(12)]
+    # 按「每次运行」算(独立审查 MEDIUM-2):每份文档 3 次运行合计 3 次、但每次运行的中位数是 0
+    per_run = _arm(refetches=(0, 0, 3))
+    assert m.refetch_gate(a, per_run) is True
+    # 无进展收尾按运行数计:C 一共 2 次运行,A 0 次
+    stuck = [_doc(doc_id=f"d{i}", no_progress_runs=1 if i < 2 else 0) for i in range(12)]
     assert m.refetch_gate(a, stuck) is False
+    one_doc_two_runs = [
+        _doc(doc_id=f"d{i}", no_progress_runs=2 if i == 0 else 0) for i in range(12)
+    ]
+    assert m.refetch_gate(a, one_doc_two_runs) is False
 
 
 def test_criterion_6_cost_and_time_only_on_documents_neither_ran_away() -> None:
@@ -279,6 +287,12 @@ def test_criterion_6_cost_and_time_only_on_documents_neither_ran_away() -> None:
     assert m.not_slower(a, _arm(wall_s=120.0, tokens=1000)) is False
     runaway_x = _arm(wall_s=500.0, tokens=1000, runaway=True)
     assert m.not_slower(a, runaway_x) is None  # no document where neither ran away
+
+
+def test_criterion_6_without_any_usable_ratio_is_none_not_an_error() -> None:
+    """独立审查 LOW-4:A 的墙钟 / token 全为 0 时没有可除的,返回 None,不抛 StatisticsError。"""
+    zero = _arm(wall_s=0.0, tokens=0)
+    assert m.not_slower(zero, _arm()) is None
 
 
 def test_criterion_8_and_9() -> None:
