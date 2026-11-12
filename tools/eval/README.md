@@ -517,3 +517,14 @@ B-206 K-2 起默认同时给模型 `knowledge_read`(与生产一致:绑了知识
   这一轮的 run 行(重排花费、调用次数缺这一段),在跑的那几题已花的钱也没落进任何一行。续跑收尾后补上的 run 行只记续跑那一段。
 - **尺子版本**:`SCORING_RULES` 加判分模板哈希;旧尺子(`2026-11-09.3+…`)写的 `--out` 不能接着写,要么换 `--out`,
   要么用上面的「重判」。
+
+## B-302 PR 2 读取规矩 / 页图只留几步 A/B(`b302_*.py`,花钱,不进 CI)
+
+设计 `docs/superpowers/specs/2026-11-11-b302-runaway-reverify-design.md` §5。三个文件:`b302_docs.py` 生成合成文档(6 类 x 2 份 + B-268 回归集,做成手机扫描件),`b302_metrics.py` 是 §5.4 的指标与及格线(纯函数),`b302_ab.py` 是计划 / 报价 / 运行 / 报告。
+
+1. **事故那一类的模板由协调人给**(JSON,格式见 `b302_docs.load_incident_template`);不给就只有 10 份,`b302_ab.py` 拒收。
+   `python tools/eval/b302_docs.py --out <dir> --incident-template <模板.json>`
+2. **先离线报价**:`python tools/eval/b302_ab.py plan --docs <dir> --doubao-model <§6.2 查到的型号> --stop-line 650` —— 打印每家运行次数(glm 105 / deepseek 93 / 豆包 63)、预计花费、理论上限、实际硬上限、预计模型调用次数。**拿这份数找用户批**。
+3. 生成临时智能体:`python tools/eval/b302_ab.py manifests --out <dir> --doubao-model <...>`,控制台导入(三组只差 `policies.reading_rule` / `policies.figure_view_steps`)。用完即删(回滚前检查见 `docs/runbooks/pending-test-release-acceptance.md` §112.8)。
+4. 按先后跑,每段都要带批过的报价编号与止损线:`run --phase pilot` → 人工按 §5.3 查 `token_usage` 的全部用量种类(`conversation` 以外不为 0 就停) → `run --phase arm_a` → `report` 看判据 0(复现前提),glm 没复现就停 → `run --phase rest`。凭据走 `EXPERT_WORK_EVAL_API_KEY` / `--base-url`。每跑完一轮按 `end` 帧累计花费,到止损线不再派新会话;单次调用输入超过 25 万 token 就取消那次运行。
+5. `report` 输出每个模型的判据与结论,以及按 §5.4 末尾规则的落地建议(所有测过的模型都过才改平台默认)。
