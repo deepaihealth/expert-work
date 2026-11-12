@@ -2237,7 +2237,9 @@ def build_react_graph(
         refused_reads = 0
         # B-302 PR 3 —— 本批真跑过的调用,按 tool_call 顺序,喂给每个文件的两本账。
         file_events: list[FileToolEvent] = []
-        # B-302 PR 4 —— 本批真跑过的调用与它的原始结果,喂给结果重复检测(影子模式)。
+        # B-302 PR 4 —— 本批真派发过的调用与它的原始结果,喂给结果重复检测(影子模式)。平台
+        # 合成、没真派发的结果不算:审批续跑里扣下的、手抄 URL 守卫拦下的、前置中间件拦下的,
+        # 以及 B-268 拒绝的重复读取(它已经计进打转次数)。
         ran_calls: list[tuple[dict[str, Any], ToolMessage]] = []
         for idx in range(len(tool_calls)):
             tool_message, tool_state, refund_inc, classified = results[idx]
@@ -2274,7 +2276,12 @@ def build_react_graph(
                     batch_outcomes.append((_ledger_key(tool_calls[idx], tool_message, None), None))
                 continue
             file_events.append(_file_tool_event(tool_calls[idx], tool_message))
-            ran_calls.append((tool_calls[idx], tool_message))
+            if not (
+                idx in guard_hits
+                or _is_refused_repeat(tool_message)
+                or (classified is not None and classified.error_class == "blocked_by_policy")
+            ):
+                ran_calls.append((tool_calls[idx], tool_message))
             failure = _classify_tool_failure(tool_calls[idx], tool_message, classified)
             ledger_failure = _ledger_failure(failure, classified)
             if not _is_read_only_failure(

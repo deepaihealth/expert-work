@@ -21,10 +21,12 @@ from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanE
 from prometheus_client import REGISTRY
 
 from expert_work.common.observability import init_tracing
+from expert_work.common.spotlight import spotlight_untrusted
 from expert_work.runtime.checkpointer import make_checkpointer
 from orchestrator import GraphRunner, ToolContext, ToolRegistry, build_react_graph
 from orchestrator.graph_builder import builder as builder_module
 from orchestrator.graph_builder.outcome_repeat import (
+    FINGERPRINT_EDGE_CHARS,
     MIN_RESULT_BYTES,
     OUTCOME_REPEATS_KEY,
     OutcomeFlag,
@@ -33,6 +35,8 @@ from orchestrator.graph_builder.outcome_repeat import (
     result_fingerprint,
     strip_volatile,
 )
+from orchestrator.sse import PROMPT_INPUTS_KEY
+from orchestrator.tools._guards import LOOP_TRIP_META_KEY
 from orchestrator.tools.registry import ToolResult, ToolSpec
 
 from .test_figure_block_injection import _RecordingLLM
@@ -136,9 +140,9 @@ def test_the_calls_own_id_is_volatile() -> None:
 
 
 def test_the_call_id_is_only_removed_as_a_whole_token() -> None:
-    """守卫:短 id 不能把正文里恰好含这几个字符的片段挖掉(「8c1e」里的「c1」)。"""
-    a = _msg(_BODY + "value 8c1e here", call_id="c1")
-    b = _msg(_BODY + "value 8e here", call_id="c1")
+    """守卫:id 不能把正文里恰好含这几个字符的片段挖掉(「x9call42z」里的「call42」)。"""
+    a = _msg(_BODY + "value x9call42z here", call_id="call42")
+    b = _msg(_BODY + "value x9z here", call_id="call42")
     assert result_fingerprint("probe", a) != result_fingerprint("probe", b)
 
 
@@ -417,3 +421,254 @@ async def test_shadow_mode_changes_nothing_the_model_sees_or_the_run_does(
     for key in ("loop_trip_count", "exit_reason", "step_count"):
         assert shadow_final.get(key) == plain_final.get(key)
     assert OUTCOME_REPEATS_KEY not in plain_final
+
+
+# --- 审查修复(M2 / M3 / L1 / L3 / L6 / L9 / L10) ---------------------------------
+
+
+@pytest.mark.parametrize(
+    ("first", "second"),
+    [
+        ("took 7.5 s total", "took 12.25 s total"),
+        ("at 2026-11-12 10:00:00 done", "at 2026-11-13 21:04:59 done"),
+        ("at 2026-11-13 21:04 done", "at 2026-11-14 08:30 done"),
+    ],
+)
+def test_spotlighted_results_with_spaced_volatile_fields_fingerprint_the_same(
+    first: str, second: str
+) -> None:
+    """M2 —— 工具结果默认被 spotlight 包过:行内空白前插了 ▁,围栏 nonce 每次构建一换。
+    先还原再去易变字段,带空格的写法和换了 nonce 的同一结果才认得出。"""
+    a = _msg(spotlight_untrusted(_BODY + first, nonce="a1b2c3d4e5f6"))
+    b = _msg(spotlight_untrusted(_BODY + second, nonce="0f9e8d7c6b5a"))
+    assert result_fingerprint("probe", a) is not None
+    assert result_fingerprint("probe", a) == result_fingerprint("probe", b)
+
+
+def test_spotlighted_results_that_really_differ_stay_different() -> None:
+    a = _msg(spotlight_untrusted(_BODY + "value 甲", nonce="a1b2c3d4e5f6"))
+    b = _msg(spotlight_untrusted(_BODY + "value 乙", nonce="a1b2c3d4e5f6"))
+    assert result_fingerprint("probe", a) != result_fingerprint("probe", b)
+
+
+def test_a_lone_surrogate_does_not_raise() -> None:
+    """M3 —— 孤立代理字符 utf-8 编码会抛;指纹照算。"""
+    assert result_fingerprint("probe", _msg(_BODY + "\ud800 tail")) is not None
+
+
+def test_list_content_with_mixed_key_types_does_not_raise() -> None:
+    """M3 —— dict 键 int / str 混用时 ``json.dumps(sort_keys=True)`` 抛 TypeError;回退 ``str``。"""
+    message = ToolMessage(
+        content=[{"type": "text", "text": _BODY}, {1: "a", "b": 2}],
+        tool_call_id="c1",
+        name="probe",
+    )
+    assert result_fingerprint("probe", message) is not None
+
+
+def test_any_internal_error_is_swallowed_counted_and_logged_by_type_only(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    from orchestrator.graph_builder import outcome_repeat as module
+
+    def _boom(*_a: Any, **_k: Any) -> Any:
+        raise RuntimeError("secret detail from a tool result")
+
+    monkeypatch.setattr(module, "next_outcomes", _boom)
+    before = _sample("expert_work_outcome_repeat_shadow_errors_total")
+    with caplog.at_level(logging.WARNING, logger="orchestrator.graph_builder.outcome_repeat"):
+        assert outcome_repeat_update({}, [(_call({"q": 1}), _msg(_BODY))]) == {}
+    assert _sample("expert_work_outcome_repeat_shadow_errors_total") == before + 1
+    logged = " ".join(r.getMessage() for r in caplog.records)
+    assert "RuntimeError" in logged
+    assert "secret detail" not in logged
+
+
+async def test_a_failing_hook_leaves_the_run_unchanged(monkeypatch: pytest.MonkeyPatch) -> None:
+    """M3 —— 钩子里任何异常都不打断 run:同一脚本,检测内部抛错与检测关掉,逐项相同。"""
+    from orchestrator.graph_builder import outcome_repeat as module
+
+    def _boom(*_a: Any, **_k: Any) -> Any:
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(module, "next_outcomes", _boom)
+    failing_final, failing_llm = await _run_graph()
+    monkeypatch.setattr(builder_module, "outcome_repeat_update", lambda *_a, **_k: {})
+    plain_final, plain_llm = await _run_graph()
+    assert failing_llm.calls == plain_llm.calls == len(_script()) + 1
+    assert _shape(failing_final["messages"]) == _shape(plain_final["messages"])
+    for key in ("loop_trip_count", "exit_reason", "step_count"):
+        assert failing_final.get(key) == plain_final.get(key)
+    assert OUTCOME_REPEATS_KEY not in failing_final
+
+
+@pytest.mark.parametrize(
+    ("first", "second"),
+    [
+        ("order 123456789012345678 shipped", "order 123456789012345679 shipped"),
+        ("snowflake 1859273648102938475 id", "snowflake 1859273648102938476 id"),
+        ("popular in the 1990s here", "popular in the 1980s here"),
+        ("there are 100s of files", "there are 200s of files"),
+        ("version 3 s build", "version 4 s build"),
+    ],
+)
+def test_ordinary_numbers_are_not_volatile(first: str, second: str) -> None:
+    """L1 —— 纯十进制长号码不是十六进制串;年代、数量、版本号后面的 s 不是耗时。"""
+    assert result_fingerprint("probe", _msg(_BODY + first)) != result_fingerprint(
+        "probe", _msg(_BODY + second)
+    )
+
+
+def test_fingerprinting_reads_only_the_head_and_tail_of_a_huge_result() -> None:
+    """L6 —— 超大结果只取头尾各 :data:`FINGERPRINT_EDGE_CHARS` 个字符算指纹(不阻塞事件循环)。"""
+    head = "h" * FINGERPRINT_EDGE_CHARS
+    tail = "t" * FINGERPRINT_EDGE_CHARS
+    a = _msg(head + "middle A " * 50_000 + tail)
+    b = _msg(head + "middle B " * 50_000 + tail)
+    assert result_fingerprint("probe", a) == result_fingerprint("probe", b)
+    c = _msg("x" + head + "middle A " * 50_000 + tail)
+    assert result_fingerprint("probe", a) != result_fingerprint("probe", c)
+    d = _msg(head + "middle A " * 50_000 + tail + "x")
+    assert result_fingerprint("probe", a) != result_fingerprint("probe", d)
+
+
+def test_a_short_call_id_is_not_removed() -> None:
+    """L9 —— 不足 6 个字符的 id 太容易撞上正文里的同样片段,不去。"""
+    a = _msg(_BODY + "row c1 value", call_id="c1")
+    b = _msg(_BODY + "row c2 value", call_id="c2")
+    assert result_fingerprint("probe", a) != result_fingerprint("probe", b)
+
+
+# --- 没真派发的结果不进账(L3 / L10):在钩子上记下交进来的是哪几条 --------------------
+
+
+def _record_hook(monkeypatch: pytest.MonkeyPatch) -> list[str]:
+    seen: list[str] = []
+    real = builder_module.outcome_repeat_update
+
+    def _recording(state: Any, calls: Any) -> dict[str, Any]:
+        seen.extend(str(call.get("id")) for call, _message in calls)
+        return real(state, calls)
+
+    monkeypatch.setattr(builder_module, "outcome_repeat_update", _recording)
+    return seen
+
+
+@dataclass
+class _Plain:
+    name: str
+    meta: Mapping[str, Any] | None = None
+
+    @property
+    def spec(self) -> ToolSpec:
+        return ToolSpec(name=self.name, description="synthetic")
+
+    async def call(self, args: Mapping[str, Any], *, ctx: ToolContext) -> ToolResult:
+        del args, ctx
+        return ToolResult(content=_BODY, meta=dict(self.meta) if self.meta else {})
+
+
+async def _one_batch(
+    registry: ToolRegistry,
+    calls: list[dict[str, Any]],
+    *,
+    configurable: Mapping[str, Any] | None = None,
+    **graph_kwargs: Any,
+) -> dict[str, Any]:
+    llm = _RecordingLLM(responses=[AIMessage(content="", tool_calls=calls)])
+    async with make_checkpointer("memory") as cp:
+        graph = GraphRunner(checkpointer=cp).compile(
+            build_react_graph(llm_caller=llm, tool_registry=registry, **graph_kwargs)
+        )
+        return await graph.ainvoke(
+            {"messages": [HumanMessage(content="go")], "step_count": 0, "max_steps": 5},
+            config={
+                "configurable": {
+                    "thread_id": str(uuid4()),
+                    "run_id": str(uuid4()),
+                    "tenant_id": str(uuid4()),
+                    **(configurable or {}),
+                }
+            },
+        )
+
+
+async def test_a_refused_repeat_read_is_not_counted(monkeypatch: pytest.MonkeyPatch) -> None:
+    """L3 —— B-268 拒绝的重复读取已经计进打转次数,影子不能再算一遍。"""
+    seen = _record_hook(monkeypatch)
+    registry = ToolRegistry()
+    registry.register(_Plain("refused", meta={LOOP_TRIP_META_KEY: True}))
+    registry.register(_Plain("probe"))
+    await _one_batch(
+        registry,
+        [
+            {"name": "refused", "args": {}, "id": "tc-refused"},
+            {"name": "probe", "args": {}, "id": "tc-probe"},
+        ],
+    )
+    assert seen == ["tc-probe"]
+
+
+class _BlockOne:
+    """前置中间件:拦下名叫 ``blocked`` 的工具。"""
+
+    async def invoke(self, ctx: Any, terminal: Any) -> None:
+        if ctx.payload.get("tool_name") == "blocked":
+            raise PermissionError("blocked by policy")
+        await terminal(ctx)
+
+
+async def test_a_middleware_blocked_call_is_not_counted(monkeypatch: pytest.MonkeyPatch) -> None:
+    seen = _record_hook(monkeypatch)
+    registry = ToolRegistry()
+    registry.register(_Plain("blocked"))
+    registry.register(_Plain("probe"))
+    await _one_batch(
+        registry,
+        [
+            {"name": "blocked", "args": {}, "id": "tc-blocked"},
+            {"name": "probe", "args": {}, "id": "tc-probe"},
+        ],
+        before_tool_dispatch_chain=_BlockOne(),
+    )
+    assert seen == ["tc-probe"]
+
+
+async def test_a_retyped_url_call_is_not_counted(monkeypatch: pytest.MonkeyPatch) -> None:
+    seen = _record_hook(monkeypatch)
+    logo = "https://files.example.com/brand/cover-1726394851207.png"
+    retyped = logo.replace("1726394851207", "17263948512077")
+    registry = ToolRegistry()
+    registry.register(_Plain("exec_python"))
+    await _one_batch(
+        registry,
+        [
+            {"name": "exec_python", "args": {"code": f"get('{retyped}')"}, "id": "tc-bad"},
+            {"name": "exec_python", "args": {"code": "print(1)"}, "id": "tc-ok"},
+        ],
+        configurable={PROMPT_INPUTS_KEY: {"org_logo": logo}},
+    )
+    assert seen == ["tc-ok"]
+
+
+async def test_calls_withheld_on_an_approval_continuation_are_not_counted(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """L10 —— 审批续跑时只有被批准的那条真跑;其余由平台作答(没执行),不进账。"""
+    from .test_approval_only_approved_call import _call as approval_call
+    from .test_approval_only_approved_call import _pause_then_resume
+
+    seen = _record_hook(monkeypatch)
+    turn = AIMessage(
+        content="",
+        tool_calls=[
+            approval_call("lookup", {"q": 1}, "tc-0"),
+            approval_call("send_email", {"to": "x"}, "tc-1"),
+            approval_call("echo", {"q": 2}, "tc-2"),
+        ],
+    )
+    out = await _pause_then_resume(
+        turn, ["lookup", "send_email", "echo"], gated=frozenset({"send_email"})
+    )
+    assert out.tools["send_email"].seen == [{"to": "x"}]
+    assert seen == ["tc-1"]
