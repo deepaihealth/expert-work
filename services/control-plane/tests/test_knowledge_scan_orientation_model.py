@@ -226,9 +226,8 @@ def test_a_turned_page_renders_upright(classifier: OnnxPageClassifier, clockwise
     assert original.shape == fixed.shape
     assert np.abs(original - fixed).mean() < 8  # same page (JPEG / resampling aside)
     wrong = render_pages(raw, [1], None, {1: (found.rotation + 180) % 360})[0]
-    assert (
-        np.abs(original - np.asarray(Image.open(_jpeg(wrong)).convert("L"), np.float32)).mean() > 8
-    )
+    wrong_pixels = np.asarray(Image.open(_jpeg(wrong)).convert("L"), np.float32)
+    assert np.abs(original - wrong_pixels).mean() > 8
     turned_back = _classify(
         classifier, Image.open(_jpeg(render_pages(raw, [1], None, {1: clockwise})[0]))
     )
