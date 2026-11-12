@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import fcntl
 import io
 import json
@@ -65,15 +66,19 @@ class _PixelModel:
         upright_says_no: frozenset[str] = frozenset(),
         fail_on: int | None = None,
         usage: dict[str, int] | None = None,
+        delay_s: float = 0.0,
     ) -> None:
         self.resolver = resolver
         self.upright_says_no = upright_says_no
         self.fail_on = fail_on
         self.usage = usage or USAGE
+        self.delay_s = delay_s
         self.calls = 0
 
     async def __call__(self, *, messages: Sequence[BaseMessage], tools: Sequence[Any]) -> AIMessage:
         self.calls += 1
+        if self.delay_s:
+            await asyncio.sleep(self.delay_s)
         if self.fail_on is not None and self.calls == self.fail_on:
             msg = "HTTP 400 from the vendor"
             raise ValueError(msg)
@@ -387,3 +392,67 @@ async def test_a_turned_upright_image_shows_up_in_the_report_as_a_failure(tmp_pa
     result = report_mod.model_report(MODEL, rows, IMAGES)
     assert result["L1'"]["turned"] == ["ds-1@0"]
     assert result["L1'"]["pass"] is False
+
+
+async def test_records_without_their_ledger_are_refused_naming_the_state_dir(
+    tmp_path: Path,
+) -> None:
+    """跑过一段(结果里有花了钱的条目),再用另一个状态目录跑同一个计划:那里没有账本 —— 拒跑,
+    不从 ¥0 重新起算;错误里写明用的状态目录。"""
+    await _run_from_quote(tmp_path, _Factory(), items=_items()[:3])
+    assert _records(tmp_path)
+
+    factory = _Factory()
+    wrong = tmp_path / "other-state"
+    with pytest.raises(runner.RunRefusedError, match="no spend ledger") as refused:
+        await runner.run_from_quote(
+            QUOTE,
+            models=(MODEL,),
+            probe_models=(),
+            results=tmp_path / "results.jsonl",
+            env_files=[],
+            state_dir=wrong,
+            factory=factory,
+            items=_items(),
+        )
+    assert str(wrong) in str(refused.value) and factory.calls == 0
+
+
+async def test_a_ledger_holding_less_than_the_records_is_refused(tmp_path: Path) -> None:
+    await _run_from_quote(tmp_path, _Factory(), items=_items()[:3])
+    ledger = spend.ledger_path(_state(tmp_path), PLAN)
+    small = {"plan_id": PLAN, "call_id": "x", "model": MODEL, "cost_yuan": 0.001, "reason": "ok"}
+    ledger.write_text(json.dumps(small) + "\n")  # 账上只剩 ¥0.001,结果里记的远多于它
+
+    factory = _Factory()
+    with pytest.raises(runner.RunRefusedError, match="less than") as refused:
+        await _run_from_quote(tmp_path, factory)
+    assert str(_state(tmp_path)) in str(refused.value) and factory.calls == 0
+
+
+async def test_a_failed_settle_write_in_the_cancel_path_discards_the_item_at_the_cap(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """§8.1 那次调用超时(``asyncio.timeout`` 取消它),计量层在取消路径里写结算行时账本写不进去:
+    ``SpendStopError`` 取代了 ``CancelledError`` —— 这一条作废、不留记录,这次调用按预留(单次上限)
+    留在账上。"""
+    real_append = spend.SpendLedger.append
+    writes = {"n": 0}
+
+    def settle_fails(self: spend.SpendLedger, row: Any) -> None:
+        writes["n"] += 1
+        if writes["n"] == 2:  # 第 1 行是预留,第 2 行是取消路径里的结算
+            raise OSError(5, "Input/output error")
+        real_append(self, row)
+
+    monkeypatch.setattr(spend.SpendLedger, "append", settle_fails)
+    monkeypatch.setattr(runner, "ORIENTATION_TIMEOUT_S", 0.05)
+    factory = _Factory(delay_s=5.0)
+
+    summary = await _run(tmp_path, [health.Item(PROBE, "probe", "ui-1@0")], factory)
+
+    assert summary.stopped_reason is not None and "ledger" in summary.stopped_reason
+    assert summary.discarded == 1 and _records(tmp_path) == []
+    rows = _ledger(tmp_path)
+    assert [row["reason"] for row in rows] == ["reserve"]
+    assert spend.ledger_total(rows) == pytest.approx(health.per_call_cap_yuan(PRICES[PROBE]))

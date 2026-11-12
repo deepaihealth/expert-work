@@ -524,6 +524,40 @@ def _same_plan(rows: Sequence[Mapping[str, Any]], plan_id: str, path: Path) -> N
         raise RunRefusedError(f"{path} holds rows of another plan {sorted(other)}")
 
 
+#: 账本合计与结果里花费比较时容许的舍入误差(元)。
+_ROUNDING_YUAN = 1e-6
+
+
+def _ledger_covers_records(
+    records: Sequence[Mapping[str, Any]],
+    ledger_file: Path,
+    ledger_rows: Sequence[Mapping[str, Any]],
+    state_dir: Path,
+) -> None:
+    """结果里已经有这个计划花了钱的条目,账本却不在、或者账上的钱比结果里的还少 —— 多半是状态目录
+    指错了(``--state-dir`` 换了、``HOME`` 不同),照跑就是从 ¥0 重新起算。拒跑,并说清用的是哪个
+    状态目录。"""
+    if not records:
+        return
+    spent_in_records = sum(float(r.get("cost_yuan", 0.0)) for r in records)
+    if not ledger_file.exists():
+        msg = (
+            f"the results file already holds {len(records)} rows of this plan, but there is no "
+            f"spend ledger for it in the state dir {state_dir} ({ledger_file.name}); refusing to "
+            "start the budget again from ¥0. Point --state-dir at the directory used before."
+        )
+        raise RunRefusedError(msg)
+    charged = spend.ledger_total(ledger_rows)
+    if charged + _ROUNDING_YUAN < spent_in_records:
+        msg = (
+            f"the spend ledger in the state dir {state_dir} totals ¥{charged:.4f}, less than the "
+            f"¥{spent_in_records:.4f} the results file already records for this plan; refusing to "
+            "run on a ledger that does not hold everything spent. Point --state-dir at the "
+            "directory used before."
+        )
+        raise RunRefusedError(msg)
+
+
 async def run_from_quote(
     q: Mapping[str, Any],
     *,
@@ -551,6 +585,7 @@ async def run_from_quote(
             ledger_rows = spend.read_ledger(ledger_file, broken_line_cost=broken_line_cost)
             _same_plan(existing, plan_id, results)
             _same_plan(ledger_rows, plan_id, ledger_file)
+            _ledger_covers_records(existing, ledger_file, ledger_rows, state_dir)
             providers = sorted({health.PROVIDERS[m] for m in [*models, *probe_models]})
             if factory is None:
                 factory = real_callers_factory(load_keys(providers, env_files))

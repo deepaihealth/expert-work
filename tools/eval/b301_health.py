@@ -387,13 +387,29 @@ def _report(results: Path, state_dir: Path | None) -> int:
     records = read_records(results)
     plan_ids = sorted({str(r["plan_id"]) for r in records if "plan_id" in r})
     caps = [per_call_cap_yuan(price_of(model, accept_documented=True)) for model in PROVIDERS]
+    state = state_dir or b301_spend.DEFAULT_STATE_DIR
     ledger: list[dict[str, Any]] = []
+    missing: list[str] = []
     for plan in plan_ids:
-        path = b301_spend.ledger_path(state_dir or b301_spend.DEFAULT_STATE_DIR, plan)
+        path = b301_spend.ledger_path(state, plan)
+        if not path.exists():
+            missing.append(path.name)
         ledger.extend(b301_spend.read_ledger(path, broken_line_cost=max(caps)))
     result = b301_report.report(records, ledger_rows=ledger)
+    if missing or any(m["error_stops"] is None for m in [*result["health"], *result["probe"]]):
+        detail = f"missing {', '.join(missing)}" if missing else "it holds less than the results"
+        sys.stdout.write(
+            f"warning: the spend ledger in the state dir {state} does not cover these results "
+            f"({detail}); ledger spend and error stops below are not reliable. Pass the "
+            "--state-dir used for the run.\n"
+        )
     sys.stdout.write(b301_report.render_report(result) + "\n")
     return 0
+
+
+def _state_dir(value: str) -> Path:
+    """``--state-dir``:展开 ``~``(``--state-dir=~/x`` 这种写法 shell 不展开)。"""
+    return Path(value).expanduser()
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -417,9 +433,13 @@ def main(argv: Sequence[str] | None = None) -> int:
     for each in (run_parser, report_parser):
         each.add_argument(
             "--state-dir",
-            type=Path,
+            type=_state_dir,
             default=None,
-            help="where the per-plan spend ledger and lock live; default ~/.cache/b301-health",
+            help=(
+                "TEST ONLY - leave unset for real runs. Where the per-plan spend ledger and lock "
+                "live; default ~/.cache/b301-health. A different directory starts a different "
+                "budget."
+            ),
         )
     args = parser.parse_args(argv)
 

@@ -303,11 +303,77 @@ def test_report_cli_reads_the_plan_ledger_for_spend_and_error_stops(
     results.write_text(lines, encoding="utf-8")
     state = tmp_path / "state"
     book = spend.SpendLedger(spend.ledger_path(state, "p1"), "p1")
-    book.append({"call_id": "a", "model": MODEL, "cost_yuan": 1.5, "reason": "ok"})
+    book.append({"call_id": "a", "model": MODEL, "cost_yuan": 2.5, "reason": "ok"})
     book.append({"call_id": "b", "model": MODEL, "cost_yuan": 0.168, "reason": "cap_error"})
 
     assert health.main(["report", "--results", str(results), "--state-dir", str(state)]) == 0
     out = capsys.readouterr().out
     assert f"{MODEL}:通过" in out
     assert "厂商出错而停(账本):1 次" in out
-    assert "账本 ¥1.668" in out
+    assert "账本 ¥2.668" in out  # 结果里记的是 235 x ¥0.01 = ¥2.35,账本盖得住
+    assert "warning" not in out
+
+
+@pytest.mark.parametrize("ledger_cost", [None, 0.5], ids=["no-ledger", "ledger-below-results"])
+def test_report_warns_and_says_unknown_when_the_ledger_does_not_cover_the_results(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], ledger_cost: float | None
+) -> None:
+    results = tmp_path / "r.jsonl"
+    lines = "".join(json.dumps(r, ensure_ascii=False) + "\n" for r in _perfect())
+    results.write_text(lines, encoding="utf-8")
+    state = tmp_path / "wrong-state"
+    if ledger_cost is not None:
+        book = spend.SpendLedger(spend.ledger_path(state, "p1"), "p1")
+        book.append({"call_id": "a", "model": MODEL, "cost_yuan": ledger_cost, "reason": "ok"})
+
+    assert health.main(["report", "--results", str(results), "--state-dir", str(state)]) == 0
+    out = capsys.readouterr().out
+    assert out.startswith("warning:") and str(state) in out.splitlines()[0]
+    assert "厂商出错而停(账本):未知" in out and "0 次" not in out
+
+
+def test_the_state_dir_flag_expands_the_home_directory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """``--state-dir=~/x`` 这种写法 shell 不展开;工具自己展开,不会落到一个叫 ``~`` 的目录。"""
+    monkeypatch.setenv("HOME", str(tmp_path))
+    assert health._state_dir("~/state") == tmp_path / "state"
+    results = tmp_path / "r.jsonl"
+    lines = "".join(json.dumps(r, ensure_ascii=False) + "\n" for r in _perfect())
+    results.write_text(lines, encoding="utf-8")
+    book = spend.SpendLedger(spend.ledger_path(tmp_path / "state", "p1"), "p1")
+    book.append({"call_id": "a", "model": MODEL, "cost_yuan": 2.5, "reason": "ok"})
+
+    assert health.main(["report", "--results", str(results), "--state-dir=~/state"]) == 0
+    out = capsys.readouterr().out
+    assert "warning" not in out and "账本 ¥2.5" in out
+
+
+@pytest.mark.parametrize(
+    ("key", "answer"),
+    [
+        ("Margaret Ellison", "The letter was signed by Margaret Ellison."),
+        ("Riverside Terminal", "The destination on the sign is Riverside Terminal."),
+        ("Oat Crunch Granola", "The product name is Oat Crunch Granola."),
+        ("林记老茶铺", "竖排招牌上的店名是:林记老茶铺"),
+    ],
+)
+def test_strict_accepts_a_short_label_in_english_or_chinese(key: str, answer: str) -> None:
+    assert report_mod.field_matches_strict(key, answer)
+
+
+@pytest.mark.parametrize(
+    ("key", "answer"),
+    [
+        ("Margaret Ellison", "The letter was signed by Margaret Ellison, or perhaps M. Allison."),
+        ("Riverside Terminal", "Maybe Riverside Terminal."),
+        ("Oat Crunch Granola", "Oat Crunch Granola or Oat Crunch Muesli"),
+        (
+            "Margaret Ellison",
+            "The letter at the bottom of the page appears to have been signed by Margaret Ellison",
+        ),
+    ],
+)
+def test_strict_still_rejects_hedges_and_long_english_answers(key: str, answer: str) -> None:
+    assert report_mod.field_matches(key, answer)
+    assert not report_mod.field_matches_strict(key, answer)

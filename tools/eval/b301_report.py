@@ -60,8 +60,12 @@ _DIGIT = re.compile(r"\d")
 NUMERIC_KINDS = frozenset({"number", "time"})
 #: 不带数字的关键字段:回答里出现这些就是给了备选(在去掉关键字段之后的剩余部分里找)。
 _HEDGE = re.compile(r"\b(?:or|maybe|possibly|perhaps)\b|或|也可能|可能是.*也")
-#: 不带数字的关键字段:回答比关键字段长出这么多字符(规范化后、去空白)以上,就不是「只写字段」。
+#: 不带数字的关键字段:回答比关键字段长出这么多以上,就不是「只写字段」。含中日韩文字的回答按字符
+#: (规范化后、去空白)数;拉丁文字的回答按词数 —— 英文的短标签(「The letter was signed by」)
+#: 按字符算会超。
 STRICT_EXTRA_CHARS = 16
+STRICT_EXTRA_WORDS = 6
+_CJK = re.compile("[\\u3400-\\u9fff\\uf900-\\ufaff\\u3040-\\u30ff\\uac00-\\ud7af]")
 
 
 def _canon_number(match: re.Match[str]) -> str:
@@ -147,7 +151,10 @@ def field_matches_strict(key: str, answer: str, *, numeric: bool = False) -> boo
         return not _DIGIT.search(rest)
     if _HEDGE.search(rest):
         return False
-    return len(normalize(answer, numeric=numeric)) <= len(want) + STRICT_EXTRA_CHARS
+    if _CJK.search(spaced):
+        return len(normalize(answer, numeric=numeric)) <= len(want) + STRICT_EXTRA_CHARS
+    key_words = len(_norm(key, keep_space=True, numeric=numeric).split())
+    return len(spaced.split()) - key_words <= STRICT_EXTRA_WORDS
 
 
 def strip_notes(content: str) -> str:
@@ -348,6 +355,7 @@ def model_report(
     verdict = "不完整" if missing else ("通过" if l1p["pass"] and l6["pass"] else "不通过")
     worse = [name for name, c in classes.items() if c["result"] == "变差"]
     own_ledger = [row for row in ledger_rows if row.get("model") == model]
+    own_records = [r for r in records if r["model"] == model]
     return {
         "model": model,
         "verdict": verdict,
@@ -357,7 +365,7 @@ def model_report(
         "L1'": l1p,
         "L2": classes,
         "L6": l6,
-        "error_stops": spend.error_stops(own_ledger).get(model, 0),
+        "error_stops": _error_stops(model, own_records, own_ledger),
         "spent_records_yuan": round(
             sum(float(r.get("cost_yuan", 0.0)) for r in records if r["model"] == model), 4
         ),
@@ -400,8 +408,19 @@ def probe_report(
         **counts,
         "unanswered": unanswered,
         **latency,
-        "error_stops": spend.error_stops(own_ledger).get(model, 0),
+        "error_stops": _error_stops(model, rows, own_ledger),
     }
+
+
+def _error_stops(
+    model: str, records: Sequence[Mapping[str, Any]], ledger: Sequence[Mapping[str, Any]]
+) -> int | None:
+    """账本里这个模型「厂商出错而停」的次数;账本没有这个模型、或账上的钱比结果里的还少(状态目录
+    多半指错了)→ ``None`` = 不知道,报告里写「未知」,不写 0。"""
+    spent_in_records = sum(float(r.get("cost_yuan", 0.0)) for r in records)
+    if records and (not ledger or spend.ledger_total(ledger) + 1e-6 < spent_in_records):
+        return None
+    return spend.error_stops(ledger).get(model, 0)
 
 
 def report(
@@ -456,11 +475,17 @@ def _render_model(m: Mapping[str, Any]) -> list[str]:
         f"({l6['bad_rate']:.1%});耗时中位 {l6['median_s']} s、p95 {l6['p95_s']} s:"
         f"{_mark(l6['pass'])}"
     )
-    lines.append(f"   厂商出错而停(账本):{m['error_stops']} 次")
+    lines.append(f"   厂商出错而停(账本):{_stops(m['error_stops'])}")
     lines.append(
         f"   花费:账本 ¥{m['spent_ledger_yuan']}(结果里跑完的条目 ¥{m['spent_records_yuan']})"
     )
     return lines
+
+
+def _stops(count: int | None) -> str:
+    if count is None:
+        return "未知(账本缺失或少于结果里的花费,状态目录可能不对)"
+    return f"{count} 次"
 
 
 def render_report(result: Mapping[str, Any]) -> str:
@@ -472,7 +497,7 @@ def render_report(result: Mapping[str, Any]) -> str:
             f"== §8.1 {p['model']}:正放答 yes {p['upright_yes']}/{p['upright']}、"
             f"转过答 no {p['rotated_no']}/{p['rotated']}、"
             f"无文字答 none {p['no_text_none']}/{p['no_text']}、没答成 {p['unanswered']}、"
-            f"厂商出错而停 {p['error_stops']} 次;耗时中位 {p['median_s']} s"
+            f"厂商出错而停 {_stops(p['error_stops'])};耗时中位 {p['median_s']} s"
         )
     lines.append(
         f"合计花费:账本 ¥{result['spent_ledger_yuan']}"
