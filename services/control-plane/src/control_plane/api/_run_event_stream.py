@@ -32,7 +32,13 @@ from expert_work.runtime.stream_bridge import (
     StreamBridge,
     is_end,
 )
-from orchestrator.sse import LLM_FAILOVER_EVENT, SYSTEM_PROMPT_EVENT, end_frame_data, format_sse
+from orchestrator.sse import (
+    LLM_FAILOVER_EVENT,
+    SYSTEM_PROMPT_EVENT,
+    end_frame_data,
+    format_sse,
+    strip_frame_state_keys,
+)
 from orchestrator.stream_items import (
     STREAM_FORMAT_ITEMS,
     STREAM_FORMAT_LEGACY,
@@ -59,6 +65,19 @@ EVENT_PAGE_LIMIT: int = _RUN_STORE_MAX_LIST_LIMIT
 #: 常量,两条对外调用路径(这个模块的回放/live-接合 + 那个模块的
 #: stream-mode SSE consumer)因此共享同一份"对外隐藏什么"的定义,不会分叉。
 EXTERNAL_HIDDEN_EVENTS: frozenset[str] = frozenset({SYSTEM_PROMPT_EVENT, LLM_FAILOVER_EVENT})
+
+#: 对外平面(API key)从 ``updates`` 帧里删掉的节点写入键 —— 帧照发,只是值里少
+#: 这些键。与 ``EXTERNAL_HIDDEN_EVENTS`` 同一批调用点一起传(实时、回放、幂等重放、
+#: 审批续跑、重新生成 / 编辑),由 ``orchestrator.sse.strip_frame_state_keys`` 在
+#: 编码前裁。为什么不在写入侧删(像 ``orchestrator.sse._INTERNAL_STATE_KEYS`` 那样):
+#: 控制台的轨迹要画「召回了哪些记忆」,``run_event`` 里必须留全量。
+#:
+#: * ``recalled_memories`` —— ``memory_recall`` 节点召回的整条长期记忆:正文明文、
+#:   ``tenant_id`` / ``user_id``、来源会话与 run 的内部 id、哈希、时间戳。只供本轮
+#:   注入提示词与控制台查看,第三方只看得到这一步发生过(``_duration_ms``)。
+#:
+#: 新增「节点写进 state、控制台要看、但不该给第三方」的键,加在这里。
+EXTERNAL_STRIPPED_STATE_KEYS: frozenset[str] = frozenset({"recalled_memories"})
 
 #: ``RunStatus`` → 对外 ``end`` 帧的 status。词表与 ``sse.py`` 的
 #: ``_EXTERNAL_END_STATUS`` 同源(见 ``EXTERNAL_END_STATUSES``):
@@ -210,6 +229,7 @@ async def build_event_producer(
     since_seq: int | None,
     scope: Callable[[], AbstractAsyncContextManager[None]] | None,
     hide_events: frozenset[str] = frozenset(),
+    strip_state_keys: frozenset[str] = frozenset(),
     stream_format: str = STREAM_FORMAT_LEGACY,
 ) -> EventStreamPlan:
     """Return the SSE byte producer for one run, plus the replay cursor.
@@ -227,6 +247,10 @@ async def build_event_producer(
     ``truncated`` / ``end`` 的判定依旧基于真实的原始行,只是这一条本身不会
     被写进 wire。控制台调用方(``runs.py`` 的 console 回放 / live)不传这个
     参数,继续拿到未过滤的全量帧。
+
+    ``strip_state_keys`` —— 与 ``hide_events`` 配对:对外平面传
+    :data:`EXTERNAL_STRIPPED_STATE_KEYS`,``updates`` 帧照发、值里删掉这些键;
+    同样只在 ``_encode`` 里做,游标不受影响。控制台不传,拿到落库原样。
 
     * Terminal run → :meth:`RunEventStore.list`,**一页**(``EVENT_PAGE_LIMIT``),
       按 seq 排序。后面还有的话流以 ``truncated`` 帧收尾而**不发 ``end``** ——
@@ -292,6 +316,7 @@ async def build_event_producer(
         一帧时完全同款,调用方的游标照旧按真实记录推进。"""
         if event_name in hide_events:
             return []
+        data = strip_frame_state_keys(event_name, data, strip_state_keys)
         if converter is None:
             return [format_sse(event_name, data, event_id=event_id)]
         frames = converter.convert(event_name, data, event_id=event_id)

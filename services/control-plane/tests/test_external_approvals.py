@@ -400,6 +400,36 @@ async def test_decide_stream_passes_external_hidden_events_to_sse_consumer(
 
 
 @pytest.mark.asyncio
+async def test_decide_stream_passes_external_stripped_state_keys_to_sse_consumer(
+    ctx: _Ctx, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """审批续跑的 SSE 流同样要把 ``EXTERNAL_STRIPPED_STATE_KEYS`` 传给
+    ``sse_consumer`` —— 否则续跑里的 ``updates`` 帧会把召回的长期记忆整条交给第三方。
+    帧内容由 ``test_external_stream_strips_recalled_memories.py`` 走真端点钉;这里钉接线。
+    """
+    import control_plane.api.external_approvals as mod
+    from control_plane.api._run_event_stream import EXTERNAL_STRIPPED_STATE_KEYS
+
+    real = mod.sse_consumer
+    seen: list[object] = []
+
+    def spy(*args: Any, **kwargs: Any) -> Any:
+        seen.append(kwargs.get("strip_state_keys"))
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(mod, "sse_consumer", spy)
+    run_id, _thread_id, _end_user_id = await _seed_pending_decision(ctx)
+    resp = await ctx.client.post(
+        f"/v1/agents/support-bot/runs/{run_id}:decide",
+        json={"user_id": "cust-77", "decision": "approve"},
+        headers=ctx.headers,
+    )
+    assert resp.status_code == 200, resp.text
+    assert "event: end" in resp.text
+    assert seen == [EXTERNAL_STRIPPED_STATE_KEYS]
+
+
+@pytest.mark.asyncio
 async def test_decide_forwards_stream_format(ctx: _Ctx, monkeypatch: pytest.MonkeyPatch) -> None:
     """审批续跑是第三方能选流形态的四个入口之一(条目 program PR3)。
 

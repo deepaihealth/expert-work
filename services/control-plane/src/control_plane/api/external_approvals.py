@@ -51,7 +51,10 @@ from control_plane.api._external import (
     reject_nul_deep,
     reject_nul_path_params,
 )
-from control_plane.api._run_event_stream import EXTERNAL_HIDDEN_EVENTS
+from control_plane.api._run_event_stream import (
+    EXTERNAL_HIDDEN_EVENTS,
+    EXTERNAL_STRIPPED_STATE_KEYS,
+)
 from control_plane.api._user_scope import get_user_repo
 from control_plane.api.runs import resolve_approval_decision
 from control_plane.runtime import AgentRuntime
@@ -329,6 +332,7 @@ def build_external_approvals_router() -> APIRouter:
                 # PR-A.3 Task 8 — 对外平面零新暴露:approval 续跑的 SSE 流
                 # 同样是第三方 API key 直接消费,system_prompt 不可见。
                 hide_events=EXTERNAL_HIDDEN_EVENTS,
+                strip_state_keys=EXTERNAL_STRIPPED_STATE_KEYS,
                 stream_format=payload.stream_format,
                 load_usage=make_usage_loader(
                     usage=request.app.state.token_usage_store,

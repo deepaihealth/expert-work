@@ -262,9 +262,9 @@ _INTERNAL_STATE_KEYS: frozenset[str] = frozenset(
 )
 
 
-def _strip_internal_state_keys(chunk: Any) -> Any:
-    """Remove :data:`_INTERNAL_STATE_KEYS` from every node's writes in an
-    ``updates``-mode chunk (``{node_name: {key: value, ...}}``).
+def _strip_state_keys(chunk: Any, keys: frozenset[str]) -> Any:
+    """Remove ``keys`` from every node's writes in an ``updates``-mode chunk
+    (``{node_name: {key: value, ...}}``).
 
     Returns a new object — never mutates ``chunk``. Non-dict / non-dict-writes
     shapes pass through unchanged (defensive: an unexpected chunk shape must
@@ -273,12 +273,32 @@ def _strip_internal_state_keys(chunk: Any) -> Any:
         return chunk
     return {
         node: (
-            {k: v for k, v in writes.items() if k not in _INTERNAL_STATE_KEYS}
+            {k: v for k, v in writes.items() if k not in keys}
             if isinstance(writes, dict)
             else writes
         )
         for node, writes in chunk.items()
     }
+
+
+def _strip_internal_state_keys(chunk: Any) -> Any:
+    """Remove :data:`_INTERNAL_STATE_KEYS` from an ``updates``-mode chunk."""
+    return _strip_state_keys(chunk, _INTERNAL_STATE_KEYS)
+
+
+def strip_frame_state_keys(event_name: str, data: Any, keys: frozenset[str]) -> Any:
+    """The external plane's read-side projection of one stored / live frame.
+
+    Unlike :data:`_INTERNAL_STATE_KEYS` (stripped before the frame is published
+    or persisted, so nobody ever sees them), these keys stay on the frame the
+    bridge carries and ``run_event`` stores — the console needs them — and are
+    removed only on the way out to a third party. Only ``updates`` frames carry
+    ``{node: writes}``; every other frame passes through untouched, as does
+    everything when ``keys`` is empty (the console callers). Never mutates
+    ``data``: the live frame object is shared by every subscriber."""
+    if not keys or event_name != DEFAULT_STREAM_MODE:
+        return data
+    return _strip_state_keys(data, keys)
 
 
 def _system_prompt_of(graph_input: Any) -> str | None:
@@ -1844,6 +1864,7 @@ async def sse_consumer(
     last_event_id: str | None = None,
     heartbeat_interval: float = 15.0,
     hide_events: frozenset[str] = frozenset(),
+    strip_state_keys: frozenset[str] = frozenset(),
     stream_format: str = STREAM_FORMAT_LEGACY,
     # B-52 —— 取本 run 的用量,只在 ``end`` 帧之前调一次。``None`` = 不带这个
     # 字段(调用方没接线)。装配与口径都在
@@ -1865,6 +1886,10 @@ async def sse_consumer(
     (e.g. ``system_prompt``) from the wire; the filtered frame's id is
     still skipped over (the bridge already assigned it a ``seq``), so a
     client resuming from ``since_seq`` never re-sees or misparses it.
+
+    ``strip_state_keys`` —— the external plane's companion to ``hide_events``:
+    keys removed from each ``updates`` frame's node writes before encoding
+    (:func:`strip_frame_state_keys`). Empty (the console) = frames unchanged.
 
     ``stream_format`` —— ``"legacy"``(默认)一字节不改地保持既有 wire;
     ``"items"`` 让每一帧先过 :class:`~orchestrator.stream_items.ItemStreamConverter`
@@ -1939,12 +1964,13 @@ async def sse_consumer(
                     yield tick
                 continue
 
+            data = strip_frame_state_keys(entry.event, entry.data, strip_state_keys)
             if converter is None:
-                yield format_sse(entry.event, entry.data, event_id=entry.id or None)
+                yield format_sse(entry.event, data, event_id=entry.id or None)
                 beat.wrote()
                 continue
 
-            frames = converter.convert(entry.event, entry.data, event_id=entry.id or None)
+            frames = converter.convert(entry.event, data, event_id=entry.id or None)
             if not frames:
                 if (tick := beat.due_frame()) is not None:
                     yield tick

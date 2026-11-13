@@ -1236,6 +1236,7 @@ async def spawn_run(
     request_digest: str | None = None,
     envelope: bool = False,
     hide_events: frozenset[str] = frozenset(),
+    strip_state_keys: frozenset[str] = frozenset(),
     stream_format: str = STREAM_FORMAT_LEGACY,
     on_disconnect: DisconnectMode = DisconnectMode.CANCEL,
     supersede: SupersedeRequest | None = None,
@@ -1278,7 +1279,9 @@ async def spawn_run(
     frames (e.g. ``system_prompt``, the server-synthesised system prompt
     text) off the wire. Defaults to an empty set so the console
     ``trigger_run`` caller is unaffected; only ``run_agent_for_user``
-    (``agents.py``) passes ``EXTERNAL_HIDDEN_EVENTS``.
+    (``agents.py``) passes ``EXTERNAL_HIDDEN_EVENTS``. ``strip_state_keys`` rides
+    alongside it the same way (``EXTERNAL_STRIPPED_STATE_KEYS``: node-write keys
+    such as recalled memories that the console shows but a third party must not get).
 
     ``stream_format``(对话条目 program PR3)—— 同样只转发给 ``sse_consumer``
     的 stream 分支。默认 ``"legacy"``,所以控制台 ``trigger_run`` 这个调用点
@@ -1595,6 +1598,7 @@ async def spawn_run(
             is_disconnected=request.is_disconnected,
             last_event_id=request.headers.get("Last-Event-ID"),
             hide_events=hide_events,
+            strip_state_keys=strip_state_keys,
             stream_format=stream_format,
             # B-52 —— end 帧带本 run 的用量;装配与口径在 ``_run_usage``。
             load_usage=make_usage_loader(
