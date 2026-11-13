@@ -34,12 +34,14 @@ from b300_phases import (  # noqa: E402
     append_jsonl,
     build_units,
     bundle_source,
+    earliest_start,
     inpod_rows,
     latest,
     load_units,
     phase_dir,
     read_jsonl,
     recalled_payload,
+    save_units,
     seed_payload,
     user_name,
     users_payload,
@@ -106,7 +108,7 @@ def prepare(args: argparse.Namespace, emit: Callable[[str], None]) -> None:
     phase = PHASES[args.phase]
     path = phase_dir(args.out, phase.name) / "units.json"
     if args.reruns:
-        units = load_units(args.out, phase.name)
+        units = load_units(args.out, phase.name, q["quote_id"])
         _items, facts = judge_items(args.out, phase)
         added = rerun_units(
             units,
@@ -126,7 +128,7 @@ def prepare(args: argparse.Namespace, emit: Callable[[str], None]) -> None:
         if path.exists():
             raise EvalError(f"{path} exists; use --reruns to add attempts")
         units = build_units(phase, q)
-    path.write_text(json.dumps(units, indent=1, ensure_ascii=False), encoding="utf-8")
+    save_units(args.out, phase.name, units, q)
     emit(f"{len(units)} units -> {path}")
     seeded = latest(inpod_rows(args.out, phase.name, "seed"), "key")
     unseeded = [u for u in units if u["user"] not in seeded]
@@ -143,18 +145,11 @@ def prepare(args: argparse.Namespace, emit: Callable[[str], None]) -> None:
 # --------------------------------------------------------------------------- bundle
 
 
-def _phase_started(out: Path, phase: str) -> str:
-    meta = out / phase / "meta.json"
-    if not meta.exists():
-        raise EvalError(f"{meta} missing: run the phase first")
-    return str(json.loads(meta.read_text(encoding="utf-8"))["recorded_at"])
-
-
 def _reserve_consolidation(
     args: argparse.Namespace, phase: str, users: Sequence[Any]
 ) -> dict[str, Any]:
     with spending(args):
-        _q, guard = approved(args, cmd=f"bundle consolidate {phase}")
+        _q, guard = approved(args, cmd=f"bundle consolidate {phase}", phase=phase)
         max_calls = len(users) * int(plan.CONSOLIDATE_PER_SWEEP[1])
         cap = (
             max_calls
@@ -175,18 +170,20 @@ def _reserve_consolidation(
 
 def bundle(args: argparse.Namespace, emit: Callable[[str], None]) -> None:
     phase = PHASES[args.phase]
-    check_quote(args)
+    q = check_quote(args)
     if args.op == "preflight":
         payload: dict[str, Any] = {"op": "preflight", "tenant_id": args.tenant_id}
     else:
-        units = load_units(args.out, phase.name)
+        units = load_units(args.out, phase.name, q["quote_id"])
         if args.op == "seed":
             payload = seed_payload(phase, units, args.tenant_id)
         elif args.op == "recalled":
             payload = recalled_payload(args.out, phase.name, args.tenant_id)
         elif args.op == "writeback_usage":
+            reservations = runs.open_writeback_reservations(args.out, phase.name)
+            run_ids = {user: [r["run_id"] for r in rows] for user, rows in reservations.items()}
             payload = writeback_usage_payload(
-                units, args.tenant_id, _phase_started(args.out, phase.name)
+                units, args.tenant_id, earliest_start(args.out, phase.name), run_ids
             )
         elif args.op == "consolidate":
             users = users_payload("consolidate", units, args.tenant_id)["users"]
@@ -270,9 +267,13 @@ def ingest(args: argparse.Namespace, emit: Callable[[str], None]) -> None:
     emit(f"{len(rows)} rows -> {target}")
     if args.op in {"consolidate", "writeback_usage"}:
         with spending(args):
-            _q, guard = approved(args, cmd=f"ingest {args.op} {phase.name}", allow_blocked=True)
+            _q, guard = approved(
+                args, cmd=f"ingest {args.op} {phase.name}", phase=phase.name, allow_blocked=True
+            )
             if args.op == "consolidate":
                 cost = settle_consolidation(args.out, phase.name, rows, guard)
             else:
-                cost = runs.settle_writeback_usage(args.out, phase.name, rows, guard)
+                result = runs.settle_writeback_usage(args.out, phase.name, rows, guard)
+                cost = float(result["settled_yuan"])
+                emit(json.dumps(result))
         emit(f"{args.op} settled ¥{cost:.4f}; blocked={guard.blocked}")

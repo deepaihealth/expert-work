@@ -26,9 +26,10 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import sys
 from collections.abc import Iterable, Mapping, Sequence
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from typing import Any
 
@@ -392,25 +393,82 @@ def budget_of_group(group: str) -> str:
     return _GROUP_BUDGET.get(group, "C" if group.startswith("C-") else "B")
 
 
-def phase_budgets(planned: Mapping[str, Any], stop_line: float) -> dict[str, Any]:
-    """每段的高档估计与分到的预算;分不满的段写明差多少。"""
-    need: dict[str, float] = {}
+def parse_phases(raw: str | None) -> tuple[str, ...]:
+    """``--phases b,c,a`` → 这份报价覆盖的段(审查 M-b);默认三段都覆盖。"""
+    if not raw:
+        return BUDGET_ORDER
+    picked = tuple(dict.fromkeys(x.strip().upper() for x in raw.split(",") if x.strip()))
+    if not picked or set(picked) - set(BUDGET_ORDER):
+        raise PlanError(f"--phases takes a subset of b,c,a; got {raw!r}")
+    return tuple(b for b in BUDGET_ORDER if b in picked)
+
+
+def parse_allocation(raw: str | None) -> dict[str, float] | None:
+    """``--allocation b=200,c=100`` → 用户给的分预算(元)。"""
+    if not raw:
+        return None
+    out: dict[str, float] = {}
+    for part in raw.split(","):
+        name, sep, value = part.partition("=")
+        if not sep:
+            raise PlanError(f"--allocation wants phase=yuan pairs; got {raw!r}")
+        out[name.strip().upper()] = float(value)
+    return out
+
+
+def select_lines(
+    lines: Sequence[Line], phases: Sequence[str], remaining: Mapping[str, float] | None
+) -> list[Line]:
+    """只留这份报价覆盖的段;每段按还没做完的比例缩(审查 M-b:重报价时扣掉已做完的)。"""
+    out = []
+    for line in lines:
+        budget = budget_of_group(line.group)
+        if budget not in phases:
+            continue
+        share = 1.0 if remaining is None else float(remaining.get(budget, 1.0))
+        out.append(replace(line, low=line.low * share, high=line.high * share))
+    return out
+
+
+def phase_budgets(
+    planned: Mapping[str, Any],
+    stop_line: float,
+    phases: Sequence[str],
+    allocation: Mapping[str, float] | None = None,
+    remaining: Mapping[str, float] | None = None,
+) -> dict[str, Any]:
+    """分预算是报价里**写明、由用户批**的一部分(审查 M-b):默认按每段估计的中点(低档与高档的
+    平均)按比例分止损线;给了 ``--allocation`` 就用用户的(只能覆盖本报价的段、合计不超过止损线)。
+    超了分预算只拒那一段。"""
+    low: dict[str, float] = dict.fromkeys(phases, 0.0)
+    high: dict[str, float] = dict.fromkeys(phases, 0.0)
     for group, g in planned["groups"].items():
         budget = budget_of_group(group)
-        need[budget] = need.get(budget, 0.0) + float(g["yuan_high"])
-    left = float(stop_line)
-    out: dict[str, Any] = {}
-    for budget in [*BUDGET_ORDER, *sorted(set(need) - set(BUDGET_ORDER))]:
-        if budget not in need:
-            continue
-        given = min(need[budget], left)
-        left -= given
-        out[budget] = {
-            "high_estimate_yuan": round(need[budget], 2),
-            "budget_yuan": round(given, 2),
-            "short_by_yuan": round(need[budget] - given, 2),
+        if budget in low:
+            low[budget] += float(g["yuan_low"])
+            high[budget] += float(g["yuan_high"])
+    mid = {b: (low[b] + high[b]) / 2 for b in phases}
+    if allocation is not None:
+        if set(allocation) != set(phases):
+            raise PlanError(f"--allocation must name exactly the covered phases {list(phases)}")
+        if sum(allocation.values()) > stop_line + 1e-9 or min(allocation.values()) < 0:
+            raise PlanError("--allocation must be non-negative and sum to at most the stop line")
+        given, basis = dict(allocation), "user (--allocation)"
+    else:
+        total = sum(mid.values()) or 1.0
+        given = {b: stop_line * mid[b] / total for b in phases}
+        basis = "proportional to the low-high midpoint of each phase"
+    return {
+        b: {
+            "low_estimate_yuan": round(low[b], 2),
+            "high_estimate_yuan": round(high[b], 2),
+            "midpoint_yuan": round(mid[b], 2),
+            "remaining_share": round(1.0 if remaining is None else remaining.get(b, 1.0), 4),
+            "budget_yuan": round(given[b], 2),
+            "basis": basis,
         }
-    return out
+        for b in phases
+    }
 
 
 #: 嵌入没有价目行(价目表里只有对话模型),用量只报估计条数与 token;给了 ``--embed-price``
@@ -549,23 +607,18 @@ def choose_cuts(
     cap: float | None = None,
     tokens: TokenTable = CALL_TOKENS,
     a_votes: int = A_JUDGE_VOTES,
+    phases: Sequence[str] = BUDGET_ORDER,
+    remaining: Mapping[str, float] | None = None,
 ) -> tuple[list[int], dict[str, Any], str]:
     """按 §8.6 的顺序删,直到「已花 + 本次高档」≤ 上限;三步都删完仍超 → ``stop_and_ask``。"""
     cap = CAP_YUAN if cap is None else cap
     cuts: list[int] = []
     one = single_vendor or most_expensive(vendors, prices)
     while True:
-        summary = summarize(
-            lines_for(
-                vendors,
-                cuts=cuts,
-                single_vendor=one,
-                include_compare=include_compare,
-                a_votes=a_votes,
-            ),
-            prices,
-            tokens,
+        lines = lines_for(
+            vendors, cuts=cuts, single_vendor=one, include_compare=include_compare, a_votes=a_votes
         )
+        summary = summarize(select_lines(lines, phases, remaining), prices, tokens)
         if already_spent + summary["total"]["yuan_high"] <= cap:
             return cuts, summary, "within_cap"
         if len(cuts) == len(CUTS):
@@ -579,7 +632,7 @@ def quote(
     *,
     already_spent: float,
     single_vendor: str | None,
-    stop_line: float,
+    stop_line: float | None,
     scenario_digest: str,
     include_compare: bool = True,
     cap: float | None = None,
@@ -587,6 +640,9 @@ def quote(
     a_votes: int = A_JUDGE_VOTES,
     pilot: bool = False,
     embed_price: float | None = None,
+    phases: Sequence[str] = BUDGET_ORDER,
+    allocation: Mapping[str, float] | None = None,
+    remaining: Mapping[str, float] | None = None,
 ) -> dict[str, Any]:
     """报价:不删时的全量、按顺序删后的计划、状态、止损线、报价编号(内容哈希)。"""
     cap = CAP_YUAN if cap is None else cap
@@ -600,11 +656,10 @@ def quote(
             "within_cap" if already_spent + full["total"]["yuan_high"] <= cap else "stop_and_ask"
         )
     else:
-        full = summarize(
-            lines_for(vendors, single_vendor=one, include_compare=include_compare, a_votes=a_votes),
-            prices,
-            tokens,
+        lines = lines_for(
+            vendors, single_vendor=one, include_compare=include_compare, a_votes=a_votes
         )
+        full = summarize(select_lines(lines, phases, remaining), prices, tokens)
         cuts, planned, status = choose_cuts(
             vendors,
             prices,
@@ -614,7 +669,12 @@ def quote(
             cap=cap,
             tokens=tokens,
             a_votes=a_votes,
+            phases=phases,
+            remaining=remaining,
         )
+    if stop_line is None:
+        # 试点的止损线默认取它自己的高档估计(审查 M-c),正式报价默认 ¥400。
+        stop_line = float(math.ceil(planned["total"]["yuan_high"])) if pilot else cap
     if stop_line <= 0:
         raise PlanError("stop line must be positive")
     if already_spent + stop_line > cap:
@@ -647,10 +707,11 @@ def quote(
         "without_cuts": full,
         "cuts_applied": [{"step": c, "what": CUTS[c]} for c in cuts],
         "planned": planned,
+        "phases": ["pilot"] if pilot else list(phases),
         "phase_budgets": (
-            {"pilot": {"budget_yuan": float(stop_line)}}
+            {"pilot": {"budget_yuan": float(stop_line), "basis": "the whole pilot"}}
             if pilot
-            else phase_budgets(planned, stop_line)
+            else phase_budgets(planned, stop_line, phases, allocation, remaining)
         ),
         "embeddings": embedding_estimate(vendors, embed_price),
         "not_priced": [

@@ -61,6 +61,8 @@ from b300_phases import (  # noqa: E402
     check_labels,
     latest,
     load_units,
+    meaningful_text,
+    progress,
     read_jsonl,
     release_meta,
     seed_payload,
@@ -118,6 +120,13 @@ def _price(raw: str) -> float:
     return value
 
 
+def _words(raw: str) -> str:
+    try:
+        return meaningful_text(raw)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(str(exc)) from exc
+
+
 def _quote_args(p: argparse.ArgumentParser, *, stop_required: bool) -> None:
     p.add_argument("--vendor", action="append", help="provider=main[:memory]; repeat; default four")
     p.add_argument(
@@ -127,7 +136,7 @@ def _quote_args(p: argparse.ArgumentParser, *, stop_required: bool) -> None:
         "--stop-line",
         type=_stop_line,
         required=stop_required,
-        default=None if stop_required else plan.CAP_YUAN,
+        default=None,  # 不给:正式报价 ¥400,试点取它自己的高档估计(审查 M-c)
     )
     p.add_argument("--tokens", type=Path, default=None, help="token table measured in a pilot")
     p.add_argument("--accept-documented-prices", action="store_true")
@@ -136,8 +145,15 @@ def _quote_args(p: argparse.ArgumentParser, *, stop_required: bool) -> None:
     p.add_argument("--a-judge-votes", type=int, choices=(1, 3), default=plan.A_JUDGE_VOTES)
     p.add_argument("--embed-price", type=_price, default=None, help="yuan / M tokens, if known")
     p.add_argument("--state-dir", type=Path, default=spend.DEFAULT_STATE_DIR)
-    p.add_argument("--user-said", default=None, help="the user's go-ahead on stop_and_ask; kept")
-    p.add_argument("--unblock", default=None, metavar="REASON", help="go on after a recorded stop")
+    p.add_argument("--phases", default=None, help="phases this quote covers, e.g. b or b,c,a")
+    p.add_argument("--allocation", default=None, help="sub-budgets, e.g. b=250,c=100,a=50")
+    p.add_argument("--progress", type=Path, default=None, help="`progress` output: remaining work")
+    p.add_argument(
+        "--user-said", type=_words, default=None, help="the user's go-ahead on stop_and_ask; kept"
+    )
+    p.add_argument(
+        "--unblock", type=_words, default=None, metavar="REASON", help="go on after a recorded stop"
+    )
 
 
 def parser() -> argparse.ArgumentParser:
@@ -176,6 +192,9 @@ def parser() -> argparse.ArgumentParser:
     p.add_argument("--set", dest="which", choices=("a", "b"), default="b")
     _quote_args(p, stop_required=True)
     p.add_argument("--approved-quote", required=True)
+    p = sub.add_parser("progress")
+    p.add_argument("--out", type=Path, required=True)
+    p.add_argument("--write", type=Path, required=True)
     p = sub.add_parser("pilot-tokens")
     p.add_argument("--out", type=Path, required=True)
     p.add_argument("--write", type=Path, required=True)
@@ -247,10 +266,10 @@ def _run(args: argparse.Namespace, emit: Callable[[str], None]) -> None:
             "`bundle --op preflight`, exec it in the control plane, `ingest --op preflight`"
         )
     with spending(args):
-        q, guard = approved(args, cmd=f"run {phase.name}")
+        q, guard = approved(args, cmd=f"run {phase.name}", phase=phase.name)
+        units = load_units(args.out, phase.name, q["quote_id"])
         meta = {**release_meta(phase, args.release_tag), "user_said": args.user_said}
-        write_meta(args.out, phase, meta)
-        units = load_units(args.out, phase.name)
+        write_meta(args.out, phase, meta, step=args.step)
         vendors = {v["provider"]: plan.Vendor(**v) for v in q["vendors"]}
         emit(f"approved quote {q['quote_id']}; stop ¥{args.stop_line}; spent ¥{guard.spent:.2f}")
         if phase.kind == "extraction":
@@ -316,7 +335,8 @@ def judge_votes(out: Path, q: Mapping[str, Any], phase_kind: str) -> int:
 def _judge(args: argparse.Namespace, emit: Callable[[str], None]) -> None:
     phase = PHASES[args.phase]
     with spending(args):
-        q, guard = approved(args, cmd=f"judge {phase.name}")
+        q, guard = approved(args, cmd=f"judge {phase.name}", phase=phase.name)
+        load_units(args.out, phase.name, q["quote_id"])
         votes = judge_votes(args.out, q, phase.kind)
         items, _facts = judge_items(args.out, phase)
         asyncio.run(
@@ -339,7 +359,7 @@ def _calibrate(args: argparse.Namespace, emit: Callable[[str], None]) -> None:
     args.out.mkdir(parents=True, exist_ok=True)
     phase = "calibration" if args.which == "b" else "calibration-a"
     with spending(args):
-        q, guard = approved(args, cmd=f"calibrate {args.which}")
+        q, guard = approved(args, cmd=f"calibrate {args.which}", phase=phase)
         votes = plan.JUDGE_VOTES if args.which == "b" else int(q["judge"]["a_group_votes"])
         out_file = args.out / f"{phase}-votes-{votes}.jsonl"
         asyncio.run(
@@ -388,6 +408,11 @@ def main(argv: Sequence[str] | None = None, *, emit: Callable[[str], None] = pri
         if args.cmd == "manifests":
             for path in write_manifests(args.out, vendors_of(args.vendor)):
                 emit(str(path))
+            return 0
+        if args.cmd == "progress":
+            body = progress(args.out)
+            args.write.write_text(json.dumps(body, indent=2), encoding="utf-8")
+            emit(json.dumps(body))
             return 0
         if args.cmd == "pilot-tokens":
             table = runs.pilot_tokens(args.out)

@@ -178,7 +178,7 @@ def test_spending_commands_refuse_while_another_holds_the_state_lock(tmp_path: P
                 "--stop-line",
                 "100",
                 "--user-said",
-                "go",
+                "go ahead with it",
                 "--accept-documented-prices",
                 "--state-dir",
                 str(tmp_path / "state"),
@@ -256,7 +256,7 @@ async def test_inpod_reads_actual_writeback_usage_numbers_only() -> None:
             "rows": 2,
         }
     ]
-    assert set(row) == {"op", "key", "models"}  # 只有数字,没有内容
+    assert set(row) == {"op", "key", "models", "jobs"}  # 只有数字,没有内容
 
 
 def _wb_guard(tmp_path: Path) -> spend.Guard:
@@ -280,15 +280,18 @@ def test_writeback_reservation_stays_open_then_settles_by_actuals(tmp_path: Path
     assert resumed.spent == pytest.approx(0.8)  # 账本按实际
 
 
-def test_writeback_settles_at_cap_only_when_unreadable(tmp_path: Path) -> None:
+def test_unreadable_writeback_usage_keeps_the_reservation(tmp_path: Path) -> None:
+    """读不到(``None`` 或空)不结算:预留留着,账本按上限算,从不按 0 结(第二轮审查 HIGH)。"""
     guard = _wb_guard(tmp_path)
     calls = [
         live.reserve_writeback(guard, item=f"k|c{i}", model="glm-5.3-flash", phase="c4")
         for i in range(2)
     ]
-    live.settle_writebacks(guard, calls, None, phase="c4")
     cap = live.writeback_cap_yuan(guard.prices["glm-5.3-flash"])
-    assert guard.settled == pytest.approx(2 * cap)
+    for usage in (None, []):
+        assert live.settle_writebacks(guard, calls, usage, phase="c4") == 0.0
+    assert guard.settled == 0 and guard.spent == pytest.approx(2 * cap)
+    assert all(guard.open_cap(c) > 0 for c in calls)
 
 
 # --------------------------------------------------------------------------- M1

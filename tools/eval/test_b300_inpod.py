@@ -221,7 +221,10 @@ async def test_consolidate_refuses_another_model() -> None:
 
 
 @pytest.mark.asyncio
-async def test_consolidate_reports_calls_and_tokens() -> None:
+async def test_consolidate_reports_calls_and_tokens(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(inpod, "RUN_MARKER_DIR", tmp_path / "markers")
     deps, _store, _fake = _deps()
     await _run(deps, {"op": "seed", "entries": [_seed_entry(_c5())]})
     rows = await _run(
@@ -230,12 +233,14 @@ async def test_consolidate_reports_calls_and_tokens() -> None:
             "op": "consolidate",
             "max_calls": 9,
             "model": "glm-5.3-flash",
+            "nonce": "n1",
             "users": [{"key": "b300-u1", "tenant_id": str(TENANT), "user": "b300-u1"}],
         },
     )
     total = rows[-1]
     assert total["op"] == "consolidate_total"
     assert total["input_tokens"] == 100 * total["calls"]
+    assert total["marker"].endswith("consolidate-n1.started")
 
 
 @pytest.mark.asyncio

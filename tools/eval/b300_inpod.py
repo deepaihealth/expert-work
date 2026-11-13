@@ -38,7 +38,9 @@ import argparse
 import asyncio
 import contextlib
 import json
+import os
 import sys
+import threading
 from collections.abc import AsyncIterator, Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -54,6 +56,22 @@ OPS = ("seed", "recalled", "candidates", "consolidate", "state", "writeback_usag
 PLATFORM_OVERHEAD = "platform_overhead"
 
 
+#: 模块载入时已有的线程(审查 LOW:之后新起的非默认执行器线程都算后台活动)。
+_IMPORT_THREADS = frozenset(t.ident for t in threading.enumerate())
+
+
+@dataclass(frozen=True)
+class Background:
+    tasks: frozenset[Any]
+    threads: frozenset[int | None]
+
+
+def background_now() -> Background:
+    return Background(
+        frozenset(asyncio.all_tasks()), frozenset(t.ident for t in threading.enumerate())
+    )
+
+
 @dataclass
 class Deps:
     memory: Any  # MemoryStore
@@ -63,6 +81,10 @@ class Deps:
     consolidator_factory: Callable[[int], Any]  # max_calls -> (consolidator, CappedAux)
     consolidation_model: str
     token_usage: Any = None  # TokenUsageStore
+    writeback_jobs: Any = None  # MemoryWritebackJobStore
+    agent_specs: Any = None  # AgentSpecStore
+    #: 装配前的任务 / 线程;每个操作前后都按它查一遍(审查 LOW)。``None`` = 不查(测试)。
+    baseline: Background | None = None
     tenant_config: Any = None  # TenantConfigService
     consolidation_interval_s: float | None = None
 
@@ -293,6 +315,7 @@ async def consolidate(deps: Deps, payload: Mapping[str, Any], emit: Callable[[st
             f"this deployment consolidates with {deps.consolidation_model!r}, "
             f"the eval expects {expected!r} (design §12 ②); stopped before any call"
         )
+    marker = claim_run_marker(str(payload.get("nonce") or ""))
     consolidator, aux = deps.consolidator_factory(int(payload["max_calls"]))
     for entry in payload["users"]:
         tenant_id = UUID(entry["tenant_id"])
@@ -329,6 +352,7 @@ async def consolidate(deps: Deps, payload: Mapping[str, Any], emit: Callable[[st
             {
                 "op": "consolidate_total",
                 "nonce": payload.get("nonce"),
+                "marker": str(marker),
                 "calls": aux.calls,
                 "unparsed_calls": aux.unparsed,
                 "input_tokens": aux.input_tokens,
@@ -337,6 +361,28 @@ async def consolidate(deps: Deps, payload: Mapping[str, Any], emit: Callable[[st
             }
         )
     )
+
+
+#: 整理脚本的「跑过了」标记放在 pod 里的这个目录(审查 LOW:同一份脚本只许跑一次)。pod 重建后
+#: 目录就没了 —— 那时本地 ``ingest`` 的「同一 nonce 收两次」仍会补记并停下。
+RUN_MARKER_DIR = Path(os.environ.get("B300_MARKER_DIR", "/tmp/b300-eval-markers"))  # noqa: S108
+
+
+def claim_run_marker(nonce: str, directory: Path | None = None) -> Path:
+    """在发任何调用之前占一个标记;同一个 nonce 的标记已在 → 这份脚本跑过了,拒绝。"""
+    if not nonce:
+        raise SystemExit("b300 in-pod: consolidation payload has no nonce; regenerate the bundle")
+    base = directory or RUN_MARKER_DIR
+    base.mkdir(parents=True, exist_ok=True)
+    path = base / f"consolidate-{nonce}.started"
+    try:
+        with path.open("x", encoding="utf-8") as fh:
+            fh.write(datetime.now(UTC).isoformat())
+    except FileExistsError as exc:
+        raise SystemExit(
+            f"b300 in-pod: consolidation bundle {nonce} already ran here ({path}); make a new one"
+        ) from exc
+    return path
 
 
 # --------------------------------------------------------------------------- state
@@ -407,12 +453,20 @@ async def writeback_usage(
             t["output_tokens"] += int(row.output_tokens)
             t["cache_read_tokens"] += int(row.cache_read_tokens)
             t["rows"] += 1
+        jobs: dict[str, str | None] = {}
+        for run_id in entry.get("run_ids") or []:
+            with _scope(tenant_id, user_id):
+                job = await deps.writeback_jobs.get_by_run(tenant_id=tenant_id, run_id=UUID(run_id))
+            jobs[run_id] = job.status if job is not None else None
         emit(
             json.dumps(
                 {
                     "op": "writeback_usage",
                     "key": entry["key"],
                     "models": [{"model": m, **v} for m, v in sorted(totals.items())],
+                    # 每次运行的写回任务状态(pending / running / done / failed / 没有):本地只在
+                    # 全部结束后才按用量结算(审查 HIGH)。
+                    "jobs": jobs,
                 }
             )
         )
@@ -436,6 +490,8 @@ async def preflight(deps: Deps, payload: Mapping[str, Any], emit: Callable[[str]
         configured = True
     except TenantConfigNotConfiguredError:
         purge, min_age, review, configured = True, 30, False, False
+    counts = await tenant_population(deps, tenant_id)
+    eval_tenant = counts["external_users_not_eval"] == 0 and counts["agents_not_eval"] == 0
     emit(
         json.dumps(
             {
@@ -446,21 +502,71 @@ async def preflight(deps: Deps, payload: Mapping[str, Any], emit: Callable[[str]
                 "memory_predictive_review_enabled": review,
                 "consolidation_switch_per_tenant": False,
                 "consolidation_interval_s": deps.consolidation_interval_s,
-                "ok": not purge and not review,
+                **counts,
+                "looks_like_eval_tenant": eval_tenant,
+                "ok": not purge and not review and eval_tenant,
             }
         )
     )
 
 
-def assert_no_background_tasks(*, baseline: set[Any]) -> None:
-    """装配完以后不许有任何后台任务(审查 H1):有就是某个 worker / sweep 起来了 —— 它可能去认领
-    真租户排队的运行或写回任务。直接退出,不往下做。"""
+#: 评测租户里只该有这些:评测脚本建的对外用户、评测智能体。
+EVAL_USER_PREFIX = "b300-"
+EVAL_AGENT_PREFIX = "eval-b300-"
+
+
+async def tenant_population(deps: Deps, tenant_id: UUID) -> dict[str, int]:
+    """预检(审查 LOW):这个租户像不像评测租户 —— 只数个数。对外用户里不是评测脚本建的、智能体里
+    不是评测智能体的,都要是 0(登录控制台的员工不算,导入智能体总要有人登录)。从不改租户的设置。"""
+    from control_plane.api._external import external_subject_id
+
+    eval_prefix = external_subject_id(EVAL_USER_PREFIX + "x")[: -len("x")]
+    external_prefix = external_subject_id("x")[: -len("x")]
+    users, offset = [], 0
+    with _scope(tenant_id):
+        while True:
+            page = await deps.users.list_by_tenant(tenant_id, limit=500, offset=offset)
+            users.extend(page)
+            if len(page) < 500:
+                break
+            offset += 500
+        agents = await deps.agent_specs.list_distinct_active_by_tenant(
+            tenant_id=tenant_id, limit=500
+        )
+    external = [u for u in users if str(u.subject_id).startswith(external_prefix)]
+    return {
+        "external_users": len(external),
+        "external_users_not_eval": sum(
+            not str(u.subject_id).startswith(eval_prefix) for u in external
+        ),
+        "console_users": len(users) - len(external),
+        "agents": len(agents),
+        "agents_not_eval": sum(not str(a.name).startswith(EVAL_AGENT_PREFIX) for a in agents),
+    }
+
+
+def assert_no_background_tasks(*, baseline: Background | set[Any]) -> None:
+    """不许有任何后台任务、也不许有新起的线程(审查 H1 / LOW):有就是某个 worker / sweep 起来了
+    —— 它可能去认领真租户排队的运行或写回任务。直接退出,不往下做。asyncio 自己的默认执行器线程
+    (``asyncio_N``,域名解析用)不算。"""
+    if not isinstance(baseline, Background):
+        baseline = Background(
+            frozenset(baseline), frozenset(t.ident for t in threading.enumerate())
+        )
     current = asyncio.current_task()
-    extra = [t for t in asyncio.all_tasks() if t is not current and t not in baseline]
+    extra = [t for t in asyncio.all_tasks() if t is not current and t not in baseline.tasks]
     if extra:
         names = sorted({t.get_name() for t in extra})
+        raise SystemExit(f"b300 in-pod: background task(s) started {names}; stopped")
+    allowed = baseline.threads | _IMPORT_THREADS
+    threads = [
+        t
+        for t in threading.enumerate()
+        if t.ident not in allowed and not t.name.startswith("asyncio_")
+    ]
+    if threads:
         raise SystemExit(
-            f"b300 in-pod: background task(s) started during bootstrap {names}; stopped"
+            f"b300 in-pod: extra thread(s) started {sorted(t.name for t in threads)}; stopped"
         )
 
 
@@ -485,7 +591,7 @@ async def bootstrap() -> AsyncIterator[Deps]:
     from control_plane.tenancy import TenantConfigService
     from control_plane.tenant_secret_overlay import TenantOverlayCredentialsResolver
 
-    baseline = set(asyncio.all_tasks())
+    baseline = background_now()
     settings = Settings()
     stores = _build_sql_stores(settings)
     secret_store = _build_secret_store(settings, stores)
@@ -551,6 +657,9 @@ async def bootstrap() -> AsyncIterator[Deps]:
             token_usage=stores.token_usage,
             tenant_config=tenant_config,
             consolidation_interval_s=float(settings.memory_consolidator_interval_s),
+            writeback_jobs=stores.memory_writeback_job,
+            agent_specs=stores.agent_spec,
+            baseline=baseline,
         )
         assert_no_background_tasks(baseline=baseline)
     finally:
@@ -573,7 +682,11 @@ async def dispatch(deps: Deps, payload: Mapping[str, Any], emit: Callable[[str],
     op = payload.get("op")
     if op not in _HANDLERS:
         raise SystemExit(f"unknown op {op!r}; one of {OPS}")
+    if deps.baseline is not None:
+        assert_no_background_tasks(baseline=deps.baseline)
     await _HANDLERS[op](deps, payload, emit)
+    if deps.baseline is not None:
+        assert_no_background_tasks(baseline=deps.baseline)
 
 
 async def _main_async(payload: Mapping[str, Any]) -> None:

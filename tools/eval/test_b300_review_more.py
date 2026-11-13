@@ -62,19 +62,25 @@ def test_a_judge_needs_its_own_calibration(tmp_path: Path) -> None:
 # --------------------------------------------------------------------------- M4
 
 
-def test_phase_budgets_go_b_then_c_then_a() -> None:
+def test_phase_budgets_default_to_midpoint_shares() -> None:
+    """第二轮审查 M-b:不再把止损线全给 B;默认按每段低档与高档的中点按比例分,写进报价由用户批。"""
     planned = {
         "groups": {
-            "A": {"yuan_high": 50.0},
-            "B": {"yuan_high": 300.0},
-            "C-C1": {"yuan_high": 80.0},
-            "calibration": {"yuan_high": 2.0},
+            "A": {"yuan_low": 10.0, "yuan_high": 50.0},  # 中点 30
+            "B": {"yuan_low": 100.0, "yuan_high": 300.0},  # 中点 200(+ 校准)
+            "calibration": {"yuan_low": 0.0, "yuan_high": 0.0},
+            "C-C1": {"yuan_low": 50.0, "yuan_high": 90.0},  # 中点 70
         }
     }
-    budgets = plan.phase_budgets(planned, 350.0)
-    assert budgets["B"] == {"high_estimate_yuan": 302.0, "budget_yuan": 302.0, "short_by_yuan": 0.0}
-    assert budgets["C"]["budget_yuan"] == 48.0 and budgets["C"]["short_by_yuan"] == 32.0
-    assert budgets["A"]["budget_yuan"] == 0.0
+    budgets = plan.phase_budgets(planned, 300.0, ("B", "C", "A"))
+    assert [budgets[b]["budget_yuan"] for b in ("B", "C", "A")] == [200.0, 70.0, 30.0]
+    assert budgets["B"]["basis"].startswith("proportional")
+    user = plan.phase_budgets(planned, 300.0, ("B", "C", "A"), {"B": 150.0, "C": 100.0, "A": 50.0})
+    assert user["C"]["budget_yuan"] == 100.0 and user["C"]["basis"].startswith("user")
+    with pytest.raises(plan.PlanError):
+        plan.phase_budgets(planned, 300.0, ("B", "C", "A"), {"B": 250.0, "C": 100.0, "A": 50.0})
+    with pytest.raises(plan.PlanError):
+        plan.phase_budgets(planned, 300.0, ("B",), {"B": 100.0, "C": 1.0})
 
 
 def test_guard_enforces_the_sub_budget() -> None:
@@ -152,6 +158,23 @@ def test_every_seed_is_well_inside_the_30_day_windows() -> None:
     assert max(ages) <= sc.MAX_SEED_DAYS_AGO <= 20
 
 
+class _Users:
+    def __init__(self, subjects: tuple[str, ...] = ("ext:b300-u1", "kc-admin")) -> None:
+        self.subjects = subjects
+
+    async def list_by_tenant(self, tenant_id: Any, *, limit: int, offset: int) -> list[Any]:
+        from types import SimpleNamespace
+
+        return [SimpleNamespace(subject_id=s) for s in self.subjects][offset : offset + limit]
+
+
+class _Agents:
+    async def list_distinct_active_by_tenant(self, *, tenant_id: Any, limit: int) -> list[Any]:
+        from types import SimpleNamespace
+
+        return [SimpleNamespace(name="eval-b300-glm"), SimpleNamespace(name="eval-b300-glm-wb")]
+
+
 @pytest.mark.asyncio
 async def test_preflight_reports_switches_only() -> None:
     import b300_inpod as inpod
@@ -167,13 +190,14 @@ async def test_preflight_reports_switches_only() -> None:
 
     deps = inpod.Deps(
         memory=None,
-        users=None,
         run_events=None,
         embedder=None,
         consolidator_factory=lambda n: (None, None),
         consolidation_model="m",
         tenant_config=_Svc(),
         consolidation_interval_s=14400.0,
+        users=_Users(),
+        agent_specs=_Agents(),
     )
     out: list[str] = []
     await inpod.dispatch(

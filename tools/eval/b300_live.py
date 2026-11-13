@@ -511,15 +511,11 @@ def settle_writebacks(
     *,
     phase: str,
 ) -> float:
-    """一个评测用户的全部写回预留按 ``token_usage`` 里的实际用量结算(平台开销行,只有数字);
-    读不到(``None``)才按上限。实际用量记在第一笔上,其余记 0。"""
-    if not call_ids:
+    """一个评测用户的全部写回预留按 ``token_usage`` 里的实际用量结算(平台开销行,只有数字),
+    按各笔上限依次分摊。读不到(``None`` 或空)就**不结算、留着预留**(账本里按上限算;审查 HIGH:
+    从不按 0 结)。调用方只在这个用户的写回任务都结束之后才调。"""
+    if not call_ids or not usage_by_model:
         return 0.0
-    if usage_by_model is None:
-        return sum(
-            guard.settle_cap(c, item="writeback", model="", phase=phase, reason="cap_unreadable")
-            for c in call_ids
-        )
     try:
         remaining = usage_cost(usage_by_model, guard.prices)
     except KeyError as exc:

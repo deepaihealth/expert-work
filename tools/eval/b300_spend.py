@@ -61,16 +61,26 @@ def ledger_path(state_dir: Path, quote_id: str) -> Path:
     return state_dir / f"{quote_id}.spend.jsonl"
 
 
+def state_dirs(state_dir: Path) -> list[Path]:
+    """总账要看的状态目录:给定的那个,**加上默认的那个**(审查 LOW:换 ``--state-dir`` 不能绕开
+    ¥400 —— 默认目录里的账永远算进来)。按路径排序,上锁时顺序固定。"""
+    dirs = {state_dir.resolve(), Path(DEFAULT_STATE_DIR).resolve()}
+    return sorted(dirs, key=str)
+
+
 def history_total(state_dir: Path, *, exclude: str | None = None) -> dict[str, float]:
-    """状态目录里每个报价已花的钱(``exclude`` 那个报价除外)。"""
+    """每个报价已花的钱(``exclude`` 那个报价除外),给定目录与默认目录一起算。"""
     out: dict[str, float] = {}
-    if not state_dir.exists():
-        return out
-    for path in sorted(state_dir.glob("*.spend.jsonl")):
-        quote_id = path.name.removesuffix(".spend.jsonl")
-        if quote_id == exclude:
+    for directory in state_dirs(state_dir):
+        if not directory.exists():
             continue
-        out[quote_id] = ledger_total(read_ledger(path, broken_line_cost=BROKEN_LINE_YUAN))
+        for path in sorted(directory.glob("*.spend.jsonl")):
+            quote_id = path.name.removesuffix(".spend.jsonl")
+            if quote_id == exclude:
+                continue
+            out[quote_id] = out.get(quote_id, 0.0) + ledger_total(
+                read_ledger(path, broken_line_cost=BROKEN_LINE_YUAN)
+            )
     return out
 
 
@@ -106,7 +116,9 @@ def state_lock(state_dir: Path) -> Iterator[None]:
     """一个状态目录同一时间只许一个花钱的进程(``run`` / ``judge`` / ``calibrate`` / 整理的
     ``bundle`` 与 ``ingest``)。拿不到就 :class:`LockedError`,不等。审查 H3:¥400 总账只有在
     「别的报价已花」读出来之后不再变的前提下才守得住,所以读账、判线、花钱都在这把锁里。"""
-    with exclusive(state_dir, _LOCK_NAME):
+    with contextlib.ExitStack() as stack:
+        for directory in state_dirs(state_dir):  # 给定目录与默认目录都锁上
+            stack.enter_context(exclusive(directory, _LOCK_NAME))
         yield
 
 
@@ -149,6 +161,8 @@ class Guard:
     global_cap: float = GLOBAL_CAP_YUAN
     phase_caps: Mapping[str, float] = field(default_factory=dict)
     budget_of: Callable[[str], str] | None = None
+    #: 超了分预算的段(审查 M-b):只拒这一段,**不**写进账本、不停整份报价。
+    phase_refused: dict[str, str] = field(default_factory=dict)
     _open: dict[str, tuple[float, str]] = field(default_factory=dict, repr=False)
     _phase_settled: dict[str, float] = field(default_factory=dict, repr=False)
 
@@ -204,6 +218,9 @@ class Guard:
         open_part = sum(c for c, p in self._open.values() if self._budget(p) == budget)
         return self._phase_settled.get(budget, 0.0) + open_part
 
+    def may_spend(self, phase: str) -> bool:
+        return self.blocked is None and self._budget(phase) not in self.phase_refused
+
     def block(self, reason: str) -> None:
         if self.blocked is None:
             self.blocked = reason
@@ -240,14 +257,16 @@ class Guard:
                 f"the ¥{self.global_cap:g} cap across quotes would be crossed (other quotes "
                 f"¥{self.others:.2f} + this quote ¥{self.spent:.4f} + up to ¥{cap:.4f})"
             )
-        if self.blocked is None and budget in self.phase_caps:
-            if self.phase_spent(budget) + cap > self.phase_caps[budget]:
-                self.block(
-                    f"the {budget} sub-budget ¥{self.phase_caps[budget]:.2f} would be crossed "
-                    f"(spent ¥{self.phase_spent(budget):.4f} + up to ¥{cap:.4f})"
-                )
         if self.blocked is not None:
             raise SpendStopError(self.blocked)
+        if budget in self.phase_refused:
+            raise SpendStopError(self.phase_refused[budget])
+        if budget in self.phase_caps and self.phase_spent(budget) + cap > self.phase_caps[budget]:
+            self.phase_refused[budget] = (
+                f"the {budget} sub-budget ¥{self.phase_caps[budget]:.2f} would be crossed "
+                f"(spent ¥{self.phase_spent(budget):.4f} + up to ¥{cap:.4f}); only this phase stops"
+            )
+            raise SpendStopError(self.phase_refused[budget])
         call_id = uuid.uuid4().hex
         self._write(call_id, item, model, phase, cap, "reserve")
         self._open[call_id] = (cap, phase)

@@ -57,7 +57,7 @@ async def run_extraction_phase(
 
         async def one(u: Mapping[str, Any]) -> None:
             key = unit_key(u)
-            if key in done or not guard_ok(guard):
+            if key in done or not guard_ok(guard, phase.name):
                 return
             v = vendors[u["vendor"]]
             base_url, api_key = live.vendor_env(v.provider)
@@ -96,8 +96,9 @@ async def run_extraction_phase(
         await asyncio.gather(*(one(u) for u in units))
 
 
-def guard_ok(guard: spend.Guard) -> bool:
-    return guard.blocked is None
+def guard_ok(guard: spend.Guard, phase: str) -> bool:
+    """整份报价没停、这一段也没超分预算(超了只拒这一段,审查 M-b)。"""
+    return guard.may_spend(phase)
 
 
 async def run_conversation_phase(
@@ -132,8 +133,9 @@ async def run_conversation_phase(
             s = scenarios[u["scenario_id"]]
             prior = previous.get(key, {})
             convs = list(prior.get("convs", []))
+            reservations = list(prior.get("writeback_reservations", []))
             index = (step or 1) - 1
-            if len(convs) > index or not guard_ok(guard):
+            if len(convs) > index or not guard_ok(guard, phase.name):
                 return
             if len(convs) != index:
                 emit(f"{key}: step {step} needs step {index} first; skipped")
@@ -146,6 +148,16 @@ async def run_conversation_phase(
             writeback = phase.kind == "c4" and index < 2
             agent = agent_code(v.provider, writeback=writeback)
             async with sems[u["vendor"]]:
+                if writeback:
+                    # 审查 M-a:写回的预留在对话**之前**。预留被拒就不开这段对话(什么都没花)。
+                    try:
+                        wb_call = live.reserve_writeback(
+                            guard, item=f"{key}|c{index}", model=v.memory, phase=phase.name
+                        )
+                    except spend.SpendStopError as exc:
+                        emit(f"{key}: {exc}")
+                        return
+                    reservations.append({"call_id": wb_call, "conv": index, "run_id": None})
                 try:
                     conv = await live.run_conversation(
                         http,
@@ -157,18 +169,31 @@ async def run_conversation_phase(
                         item=f"{key}|c{index}",
                         phase=phase.name,
                     )
-                    if writeback:  # 先按上限预留,之后按 pod 里读出的实际用量结算(审查 H4)
-                        conv["writeback_reservation"] = live.reserve_writeback(
-                            guard, item=f"{key}|c{index}", model=v.memory, phase=phase.name
-                        )
+                    if writeback:
+                        reservations[-1]["run_id"] = conv.get("run_id")
                     convs.append(conv)
                     append_jsonl(
-                        records_path, {**u, "key": key, "seed_ids": seed_ids, "convs": convs}
+                        records_path,
+                        {
+                            **u,
+                            "key": key,
+                            "seed_ids": seed_ids,
+                            "convs": convs,
+                            "writeback_reservations": reservations,
+                        },
                     )
                 except (Exception, spend.SpendStopError) as exc:
+                    # 对话断了:写回的预留照样记下(它可能已经在后台跑),之后按实际结算或留着。
                     append_jsonl(
                         records_path,
-                        {**u, "key": key, "seed_ids": seed_ids, "convs": convs, "error": repr(exc)},
+                        {
+                            **u,
+                            "key": key,
+                            "seed_ids": seed_ids,
+                            "convs": convs,
+                            "writeback_reservations": reservations,
+                            "error": repr(exc),
+                        },
                     )
                     emit(f"{key}: {exc!r}")
 
@@ -209,7 +234,7 @@ async def run_judge(
         )
 
         async def one(item: rep.JudgeItem) -> None:
-            if item.key in done or not guard_ok(guard):
+            if item.key in done or not guard_ok(guard, phase):
                 return
             async with sem:
                 try:
@@ -235,28 +260,55 @@ async def run_judge(
 # ------------------------------------------------------------------ 写回结算 / 试点量 token
 
 
-def open_writeback_reservations(out: Path, phase: str) -> dict[str, list[str]]:
-    """每个评测用户还没结算的写回预留(审查 H4)。"""
-    by_user: dict[str, list[str]] = {}
-    for r in {x["key"]: x for x in read_jsonl(out / phase / "records.jsonl")}.values():
-        for conv in r.get("convs", []):
-            call_id = conv.get("writeback_reservation")
-            if call_id:
-                by_user.setdefault(r["user"], []).append(call_id)
+def open_writeback_reservations(out: Path, phase: str) -> dict[str, list[dict[str, Any]]]:
+    """每个评测用户的写回预留(调用编号 + 对应的 run id;对话断了的 run id 为空)。"""
+    by_user: dict[str, list[dict[str, Any]]] = {}
+    seen: set[str] = set()
+    for r in read_jsonl(out / phase / "records.jsonl"):
+        for res in r.get("writeback_reservations", []):
+            if res["call_id"] not in seen:
+                seen.add(res["call_id"])
+                by_user.setdefault(r["user"], []).append(res)
     return by_user
+
+
+FINISHED_JOB_STATUSES = frozenset({"done", "failed"})
 
 
 def settle_writeback_usage(
     out: Path, phase: str, rows: Sequence[Mapping[str, Any]], guard: spend.Guard
-) -> float:
-    """按 pod 里 ``writeback_usage`` 读出的实际用量结算写回预留;读不到的用户按上限。"""
-    usage = {r["key"]: r.get("models") for r in rows if r.get("op") == "writeback_usage"}
+) -> dict[str, Any]:
+    """按 pod 里 ``writeback_usage`` 读出的实际用量结算写回预留(审查 HIGH):
+
+    * 一个用户的写回任务**全部**结束(done / failed)、且用量读得到(非空)才结算;
+    * 有任务没结束、找不到任务(run id 为空、还没入队)、用量为空 —— 都是「还读不到」,**留着预留**
+      (账本里按上限算),下次再收;从不按 0 结。"""
+    reports = {r["key"]: r for r in rows if r.get("op") == "writeback_usage"}
+    settled_users, waiting = 0, 0
     total = 0.0
-    for user, call_ids in open_writeback_reservations(out, phase).items():
-        pending = [c for c in call_ids if guard.open_cap(c) > 0]
-        if pending:
-            total += live.settle_writebacks(guard, pending, usage.get(user), phase=phase)
-    return total
+    for user, reservations in open_writeback_reservations(out, phase).items():
+        pending = [res for res in reservations if guard.open_cap(res["call_id"]) > 0]
+        if not pending:
+            continue
+        report = reports.get(user) or {}
+        jobs = report.get("jobs") or {}
+        ready = all(
+            res["run_id"] and jobs.get(res["run_id"]) in FINISHED_JOB_STATUSES
+            for res in reservations
+        )
+        models = report.get("models") or []
+        if not ready or not models:
+            waiting += 1
+            continue
+        total += live.settle_writebacks(
+            guard, [res["call_id"] for res in pending], models, phase=phase
+        )
+        settled_users += 1
+    return {
+        "settled_yuan": round(total, 6),
+        "settled_users": settled_users,
+        "waiting_users": waiting,
+    }
 
 
 def _spread(samples: Sequence[tuple[int, int]]) -> dict[str, list[int]]:

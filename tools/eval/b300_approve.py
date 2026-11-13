@@ -53,7 +53,19 @@ def make_quote(args: argparse.Namespace, *, exclude: str | None = None) -> dict[
         a_votes=args.a_judge_votes,
         pilot=args.pilot,
         embed_price=args.embed_price,
+        phases=plan.parse_phases(args.phases),
+        allocation=plan.parse_allocation(args.allocation),
+        remaining=_remaining(args.progress),
     )
+
+
+def _remaining(path: Path | None) -> Mapping[str, float] | None:
+    """``--progress FILE``(``progress`` 子命令写的):各段还没做完的比例,报价时固定下来。"""
+    import json
+
+    if path is None:
+        return None
+    return dict(json.loads(path.read_text(encoding="utf-8"))["remaining_share"])
 
 
 def check_quote(args: argparse.Namespace) -> dict[str, Any]:
@@ -68,11 +80,25 @@ def check_quote(args: argparse.Namespace) -> dict[str, Any]:
 
 
 def approved(
-    args: argparse.Namespace, *, cmd: str, allow_blocked: bool = False
+    args: argparse.Namespace,
+    *,
+    cmd: str,
+    phase: str | None = None,
+    allow_blocked: bool = False,
 ) -> tuple[dict[str, Any], spend.Guard]:
     """花钱之前的全部核对;从这个报价的账本接着记。用户原话记进 ``approvals.jsonl``。
     ``allow_blocked``:只结算、不新花的步骤(收整理 / 写回的实际用量)在停着时也能做。"""
     q = check_quote(args)
+    if phase is not None and not q["pilot"] and budget_of(phase) not in q["phases"]:
+        raise EvalError(
+            f"phase {phase} ({budget_of(phase)}) is not covered by quote {q['quote_id']} "
+            f"(covers {q['phases']}); quote it with --phases first"
+        )
+    if Path(args.state_dir).resolve() != Path(spend.DEFAULT_STATE_DIR).resolve():
+        sys.stderr.write(
+            f"note: --state-dir {args.state_dir} is not the default; the default dir "
+            f"{spend.DEFAULT_STATE_DIR} is still read and locked, so the ¥400 total covers both\n"
+        )
     if q["status"] != "within_cap" and not args.user_said:
         raise EvalError(
             "the quote says stop_and_ask (design §8.6 step 4): ask the user first; if they say go "

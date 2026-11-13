@@ -89,7 +89,9 @@ def test_prepare_b_writes_units_and_a_seed_bundle(tmp_path: Path) -> None:
     q = _quote(tmp_path)
     code, out = _prepare(tmp_path, "b", q)
     assert code == 0, out
-    units = json.loads((tmp_path / "out" / "b" / "units.json").read_text())
+    body = json.loads((tmp_path / "out" / "b" / "units.json").read_text())
+    assert body["quote_id"] == q["quote_id"] and body["pilot"] is False
+    units = body["units"]
     assert len(units) == 7 * 10 * 3 * 4
     assert len({u["user"] for u in units}) == len(units)  # 每次一个新用户,种子互不串
     bundle = (tmp_path / "out" / "b" / "bundle-seed.py").read_text()
@@ -162,7 +164,7 @@ def test_stop_line_cannot_cross_the_cap_with_history(tmp_path: Path) -> None:
         "--stop-line",
         "100",
         "--user-said",
-        "go",
+        "go ahead with it",
         *_cheap_quote_args(tmp_path),
     )
     assert code == 2 and "cross the ¥400 cap" in out[0]
@@ -184,10 +186,13 @@ def test_release_meta() -> None:
 def test_write_meta_refuses_a_different_release(tmp_path: Path) -> None:
     phase = cli.PHASES["b"]
     (tmp_path / "b").mkdir()
-    cli.write_meta(tmp_path, phase, {"release_tag": "aaa", "script_commit": "c"})
-    cli.write_meta(tmp_path, phase, {"release_tag": "aaa", "script_commit": "c"})
+    at = "2026-11-13T10:00:00+00:00"
+    cli.write_meta(tmp_path, phase, {"release_tag": "aaa", "script_commit": "c", "recorded_at": at})
+    cli.write_meta(tmp_path, phase, {"release_tag": "aaa", "script_commit": "c", "recorded_at": at})
     with pytest.raises(cli.EvalError):
-        cli.write_meta(tmp_path, phase, {"release_tag": "bbb", "script_commit": "c"})
+        cli.write_meta(
+            tmp_path, phase, {"release_tag": "bbb", "script_commit": "c", "recorded_at": at}
+        )
 
 
 def test_manifests_validate_against_the_protocol(tmp_path: Path) -> None:

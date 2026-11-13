@@ -191,11 +191,30 @@ def append_jsonl(path: Path, row: Mapping[str, Any]) -> None:
         fh.write(json.dumps(row, ensure_ascii=False) + "\n")
 
 
-def load_units(out: Path, phase: str) -> list[dict[str, Any]]:
+def save_units(
+    out: Path, phase: str, units: Sequence[Mapping[str, Any]], q: Mapping[str, Any]
+) -> Path:
+    """单元绑定到报价(审查 M-c):``units.json`` 里记报价编号与是不是试点。"""
+    path = phase_dir(out, phase) / "units.json"
+    body = {"quote_id": q["quote_id"], "pilot": bool(q.get("pilot")), "units": list(units)}
+    path.write_text(json.dumps(body, indent=1, ensure_ascii=False), encoding="utf-8")
+    return path
+
+
+def load_units(out: Path, phase: str, quote_id: str | None = None) -> list[dict[str, Any]]:
+    """读单元;给了 ``quote_id`` 就核对:别的报价备的单元不跑(试点的单元只能用试点的报价跑)。"""
     path = out / phase / "units.json"
     if not path.exists():
         raise EvalError(f"{path} missing: run `prepare --phase {phase}` first")
-    return list(json.loads(path.read_text(encoding="utf-8")))
+    body = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(body, dict) or "quote_id" not in body:
+        raise EvalError(f"{path} is not bound to a quote; prepare it again")
+    if quote_id is not None and body["quote_id"] != quote_id:
+        raise EvalError(
+            f"{path} was prepared under quote {body['quote_id']} (pilot={body['pilot']}), "
+            f"not {quote_id}; prepare a new --out for this quote"
+        )
+    return list(body["units"])
 
 
 def inpod_rows(out: Path, phase: str, op: str, step: int | None = None) -> list[dict[str, Any]]:
@@ -266,9 +285,13 @@ def users_payload(
 
 
 def writeback_usage_payload(
-    units: Sequence[Mapping[str, Any]], tenant_id: str, since: str
+    units: Sequence[Mapping[str, Any]],
+    tenant_id: str,
+    since: str,
+    run_ids: Mapping[str, Sequence[str]],
 ) -> dict[str, Any]:
-    """C4 的带写回对话之后:每个评测用户的后台写回实际用量(审查 H4)。"""
+    """C4 的带写回对话之后:每个评测用户的后台写回实际用量与写回任务状态(审查 H4 / HIGH)。
+    ``since`` 是这一段最早一次 run 的开始时间;``run_ids`` 是每个用户带写回的那几次运行。"""
     users, seen = [], set()
     for u in units:
         if u["user"] in seen:
@@ -280,6 +303,7 @@ def writeback_usage_payload(
                 "tenant_id": tenant_id,
                 "user": u["user"],
                 "agent_name": agent_code(u["vendor"], writeback=True),
+                "run_ids": [r for r in run_ids.get(u["user"], []) if r],
             }
         )
     return {"op": "writeback_usage", "since": since, "users": users}
@@ -327,7 +351,10 @@ def release_meta(phase: Phase, release_tag: str | None) -> dict[str, Any]:
     }
 
 
-def write_meta(out: Path, phase: Phase, meta: Mapping[str, Any]) -> None:
+def write_meta(
+    out: Path, phase: Phase, meta: Mapping[str, Any], *, step: int | None = None
+) -> None:
+    """记版本;**每次 run 的开始时间都留着、从不覆盖**(审查 HIGH:写回用量从最早那一步算起)。"""
     path = out / phase.name / "meta.json"
     old = json.loads(path.read_text(encoding="utf-8")) if path.exists() else None
     if old and (old.get("release_tag"), old.get("script_commit")) != (
@@ -335,7 +362,62 @@ def write_meta(out: Path, phase: Phase, meta: Mapping[str, Any]) -> None:
         meta["script_commit"],
     ):
         raise EvalError(f"{path} records another release / commit {old}; use another --out")
-    path.write_text(json.dumps(meta, indent=2, ensure_ascii=False), encoding="utf-8")
+    starts = list((old or {}).get("starts") or [])
+    starts.append({"step": step, "at": meta["recorded_at"]})
+    body = {**(old or {}), **meta, "recorded_at": (old or meta)["recorded_at"], "starts": starts}
+    path.write_text(json.dumps(body, indent=2, ensure_ascii=False), encoding="utf-8")
+
+
+def earliest_start(out: Path, phase: str) -> str:
+    """这一段最早一次 run 的开始时间(ISO);没有就报错。"""
+    path = out / phase / "meta.json"
+    if not path.exists():
+        raise EvalError(f"{path} missing: run the phase first")
+    meta = json.loads(path.read_text(encoding="utf-8"))
+    times = [meta["recorded_at"], *(s["at"] for s in meta.get("starts") or [])]
+    return min(datetime.fromisoformat(t) for t in times).isoformat()
+
+
+#: ``--user-said`` / ``--unblock`` 太短、只是「好」「ok」之类的不收(审查 LOW)。
+_TRIVIAL = frozenset({"yes", "okay", "sure", "fine", "go on", "好的", "可以", "继续"})
+
+
+def meaningful_text(raw: str) -> str:
+    text = raw.strip()
+    if len(text) < 4 or text.lower() in _TRIVIAL:
+        raise ValueError("give the actual words / reason (at least 4 characters, not just 'ok')")
+    return text
+
+
+def progress(out: Path) -> dict[str, Any]:
+    """各段还剩多少没做完(审查 M-b:重报价扣掉已完成的)。一个单元做完 = 有一条没出错、对话也
+    齐了的记录(提炼段 = 有结果)。"""
+    total: dict[str, int] = {}
+    done: dict[str, int] = {}
+    scenarios = all_scenarios()
+    for name, phase in PHASES.items():
+        if not (out / name / "units.json").exists():
+            continue
+        budget = budget_of(name)
+        units = load_units(out, name)
+        records = {r["key"]: r for r in read_jsonl(out / name / "records.jsonl")}
+        finished = 0
+        for u in units:
+            r = records.get(unit_key(u))
+            if not r or r.get("error"):
+                continue
+            if phase.kind == "extraction" or len(r.get("convs", [])) >= len(
+                scenarios[u["scenario_id"]].conversations
+            ):
+                finished += 1
+        total[budget] = total.get(budget, 0) + len(units)
+        done[budget] = done.get(budget, 0) + finished
+    return {
+        "units": {b: {"total": total[b], "done": done[b]} for b in total},
+        "remaining_share": {
+            b: round(1 - done[b] / total[b], 4) if total[b] else 1.0 for b in total
+        },
+    }
 
 
 def calibration_path(out: Path, which: str) -> Path:
