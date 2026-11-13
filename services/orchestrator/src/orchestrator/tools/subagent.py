@@ -52,6 +52,14 @@ logger = logging.getLogger(__name__)
 #: each agent's ``max_iterations``.
 MAX_SUBAGENT_DEPTH: Final = 3
 
+#: B-300 —— 委派出去的子代不召回长期记忆,也读不到工作区里的记忆投影文件;主智能体开了长期
+#: 记忆时,``task`` 参数说明在「看不到本次对话」之后加这一句(设计 §13.2 定稿)。写「不给」
+#: 而不是「看不到」:子代仍读得到 agent 自己的笔记 ``AGENT_NOTES.md``。
+DELEGATED_MEMORY_NOTE: Final = (
+    "It is not given what is remembered about the user from earlier sessions, "
+    "so put anything it needs from that into this text."
+)
+
 
 @runtime_checkable
 class ChildAgentBuilder(Protocol):
@@ -112,9 +120,19 @@ class SubAgentTool:
     #: own L7 ObjectStore key. ``None`` is a valid deployment (no recorder
     #: configured) — the dispatch is a no-op.
     trajectory_recorder: TrajectoryRecorder | None = None
+    #: B-300 —— 主智能体开了长期记忆(manifest 有 ``memory.long_term``)。子代拿不到这些记忆,
+    #: ``task`` 说明据此多一句,让主智能体把需要的写进任务里;没开就不提(平台提示词跟着能力走)。
+    parent_has_long_term_memory: bool = False
 
     @property
     def spec(self) -> ToolSpec:
+        task_text = (
+            "The subtask to delegate, described in full. The "
+            "sub-agent runs fresh with only this text as its "
+            "instruction — it sees none of this conversation."
+        )
+        if self.parent_has_long_term_memory:
+            task_text += " " + DELEGATED_MEMORY_NOTE
         return ToolSpec(
             name=self.subagent.name,
             description=self.subagent.description,
@@ -123,11 +141,7 @@ class SubAgentTool:
                 "properties": {
                     "task": {
                         "type": "string",
-                        "description": (
-                            "The subtask to delegate, described in full. The "
-                            "sub-agent runs fresh with only this text as its "
-                            "instruction — it sees none of this conversation."
-                        ),
+                        "description": task_text,
                     },
                 },
                 "required": ["task"],

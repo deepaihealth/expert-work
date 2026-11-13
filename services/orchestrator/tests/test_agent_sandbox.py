@@ -3126,13 +3126,13 @@ async def test_exec_command_is_the_shared_exec_view_command() -> None:
 
     assert re.fullmatch(
         _COMMAND_HEAD + r"ew-exec-view /mnt/workspace/agents/plan-aaaaaaaa '' '' "
-        r"(ew-exec-[0-9a-f]{32}\.py) [0-9a-f]{64} python -E -P /tmp/\.ew-exec/\1",
+        r"(ew-exec-[0-9a-f]{32}\.py) [0-9a-f]{64} '' python -E -P /tmp/\.ew-exec/\1",
         bound,
         re.DOTALL,
     ), bound
     assert re.fullmatch(
         _COMMAND_HEAD + r"ew-exec-view '' '' '' "
-        r"(ew-exec-[0-9a-f]{32}\.py) [0-9a-f]{64} python -E -P /tmp/\.ew-exec/\1",
+        r"(ew-exec-[0-9a-f]{32}\.py) [0-9a-f]{64} '' python -E -P /tmp/\.ew-exec/\1",
         unbound,
         re.DOTALL,
     ), unbound
@@ -3158,7 +3158,34 @@ async def test_exec_command_carries_the_conversation_view() -> None:
 
     assert re.fullmatch(
         _COMMAND_HEAD + rf"ew-exec-view /mnt/workspace/agents/plan-aaaaaaaa {conv} {conv} "
-        r"(ew-exec-[0-9a-f]{32}\.py) [0-9a-f]{64} python -E -P /tmp/\.ew-exec/\1",
+        r"(ew-exec-[0-9a-f]{32}\.py) [0-9a-f]{64} '' python -E -P /tmp/\.ew-exec/\1",
+        command,
+        re.DOTALL,
+    ), command
+
+
+@pytest.mark.asyncio
+async def test_exec_command_carries_the_child_flag() -> None:
+    """B-300 —— 委派子代:``$6`` 是 ``1``,执行视图据此不放回本对话那一格、盖住旧投影。"""
+    sdk, store = FakeSdk(), FakeInstanceStore()
+    client = make_client(sdk, store)
+    sid = await client.acquire(tenant_id=uuid4(), thread_id="t", user_id=uuid4())
+    conv = uuid4()
+
+    await client.exec(
+        sandbox_id=sid,
+        code="print(1)",
+        timeout_s=5,
+        agent_key="plan-aaaaaaaa",
+        conv_id=conv,
+        workspace_thread_id=conv,
+        child_run=True,
+    )
+    command, *_ = sdk.sandbox.commands.calls[-1]
+
+    assert re.fullmatch(
+        _COMMAND_HEAD + rf"ew-exec-view /mnt/workspace/agents/plan-aaaaaaaa {conv} {conv} "
+        r"(ew-exec-[0-9a-f]{32}\.py) [0-9a-f]{64} 1 python -E -P /tmp/\.ew-exec/\1",
         command,
         re.DOTALL,
     ), command

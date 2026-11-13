@@ -43,13 +43,14 @@ runner = _load_runner()
 _REAL_EXEC_ARGV = runner._exec_argv
 
 #: ``_EXEC_VIEW_SCRIPT`` 的 ``$0``;它后面是 ``$1``(bind 源)、``$2``(对话 id)、``$3``
-#: (本对话线程 id)、``$4`` / ``$5``(B-242:代码文件名与 sha256,本地恒为空),再后面是解释器。
+#: (本对话线程 id)、``$4`` / ``$5``(B-242:代码文件名与 sha256,本地恒为空)、``$6``(B-300:
+#: 委派子代标记),再后面是解释器。
 _ARGV0 = "ew-exec-view"
 
 
 def _python_start(argv: list[str]) -> int:
-    """argv 里解释器那一格的下标 —— 跳过 ``$1``…``$5``。"""
-    return argv.index(_ARGV0) + 6
+    """argv 里解释器那一格的下标 —— 跳过 ``$1``…``$6``。"""
+    return argv.index(_ARGV0) + 7
 
 
 def _root_slot(argv: list[str]) -> str:
@@ -74,8 +75,9 @@ def direct_exec(monkeypatch: pytest.MonkeyPatch) -> None:
         agent_root: str | None,
         conv_id: str | None = None,
         thread_id: str | None = None,
+        child_run: bool = False,
     ) -> list[str]:
-        argv = _REAL_EXEC_ARGV(code, agent_root, conv_id, thread_id)
+        argv = _REAL_EXEC_ARGV(code, agent_root, conv_id, thread_id, child_run)
         return argv[_python_start(argv) :]
 
     monkeypatch.setattr(runner, "_exec_argv", _without_the_namespace_wrapper)
@@ -330,6 +332,7 @@ def test_exec_argv_binds_the_agent_root() -> None:
         "",
         "",
         "",
+        "",
         sys.executable,
         "-E",
         "-P",
@@ -362,6 +365,7 @@ def test_exec_argv_unbound_leaves_the_root_slot_empty(agent_root: str | None) ->
         "",
         "",
         "",
+        "",
         sys.executable,
         "-E",
         "-P",
@@ -378,8 +382,9 @@ def _recording_exec_argv(seen: list[list[str]], monkeypatch: pytest.MonkeyPatch)
         agent_root: str | None,
         conv_id: str | None = None,
         thread_id: str | None = None,
+        child_run: bool = False,
     ) -> list[str]:
-        seen.append(_REAL_EXEC_ARGV(code, agent_root, conv_id, thread_id))
+        seen.append(_REAL_EXEC_ARGV(code, agent_root, conv_id, thread_id, child_run))
         return [sys.executable, "-c", "pass"]
 
     monkeypatch.setattr(runner, "_exec_argv", _record)
@@ -460,8 +465,8 @@ def test_exec_argv_drops_the_conversation_without_an_agent_root() -> None:
     argv = runner._exec_argv("print(1)", None, "11111111-1111-1111-1111-111111111111", "x")
 
     at = argv.index(_ARGV0)
-    assert argv[at + 1 : at + 6] == ["", "", "", "", ""]
-    assert argv[at + 6] == sys.executable
+    assert argv[at + 1 : at + 7] == ["", "", "", "", "", ""]
+    assert argv[at + 7] == sys.executable
 
 
 def test_handle_request_passes_the_conversation_view_through(
@@ -501,3 +506,42 @@ def test_handle_request_passes_the_legacy_thread_through(monkeypatch: pytest.Mon
 
     at = seen[0].index(_ARGV0)
     assert seen[0][at + 2 : at + 4] == ["", "22222222-2222-2222-2222-222222222222"]
+
+
+# ---------------------------------------------------------------------------
+# B-300 —— 委派子代标记(``$6``):与云上 ``exec_view_argv`` 同一个取值口径。
+# ---------------------------------------------------------------------------
+
+
+def test_exec_argv_carries_the_child_flag_only_with_an_agent_root() -> None:
+    root = "/mnt/workspace/agents/a"
+    child = runner._exec_argv("print(1)", root, None, None, True)
+    main = runner._exec_argv("print(1)", root, None, None)
+    unbound = runner._exec_argv("print(1)", None, None, None, True)
+    for argv, flag in ((child, "1"), (main, ""), (unbound, "")):
+        at = argv.index(_ARGV0)
+        assert argv[at + 4 : at + 7] == ["", "", flag]
+        assert argv[_python_start(argv)] == sys.executable
+
+
+@pytest.mark.parametrize(
+    ("raw", "flag"), [(True, "1"), (False, ""), ("true", ""), (1, ""), (None, "")]
+)
+def test_handle_request_passes_the_child_flag_through(
+    raw: object, flag: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """只认 JSON ``true``;别的类型当没给(与 ``agent_root`` 同一个口径)。"""
+    seen: list[list[str]] = []
+    _recording_exec_argv(seen, monkeypatch)
+
+    runner.handle_request(
+        {
+            "code": "print(1)",
+            "agent_root": "/mnt/workspace/agents/plan-aaaaaaaa",
+            "thread_id": "22222222-2222-2222-2222-222222222222",
+            "child_run": raw,
+        }
+    )
+
+    at = seen[0].index(_ARGV0)
+    assert seen[0][at + 6] == flag

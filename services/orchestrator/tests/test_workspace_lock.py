@@ -68,6 +68,7 @@ class _LockProbeClient:
         has_skills: bool = False,
         conv_id: UUID | None = None,
         workspace_thread_id: UUID | None = None,
+        child_run: bool = False,
     ) -> SandboxOutcome:
         self.active_at_exec = self.lock.active
         return SandboxOutcome(stdout=self.envelope, stderr="", exit_code=0, timed_out=False)

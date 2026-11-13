@@ -113,6 +113,9 @@ class ExecRequest(BaseModel):
     #: B-236 —— 本对话的线程 id:两种视图里 ``<agent_root>/threads/`` 都只留它那一格。
     #: ``None`` → 一格都不留。
     thread_id: UUID | None = None
+    #: B-300 —— 委派出去的子代:``threads/`` 里那一格不放回(对话视图只放回它的 ``work/``),
+    #: agent 根下的旧记忆投影 ``MEMORY.md`` 盖住。没绑 agent 时 runner 不发,无意义。
+    child_run: bool = False
 
     @model_validator(mode="after")
     def _conversation_view_needs_an_agent_root(self) -> ExecRequest:

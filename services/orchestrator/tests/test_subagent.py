@@ -162,6 +162,32 @@ def test_spec_exposes_subagent_name_and_task_param() -> None:
     assert "task" in spec.parameters["properties"]
 
 
+_MEMORY_SENTENCE = (
+    "It is not given what is remembered about the user from earlier sessions, "
+    "so put anything it needs from that into this text."
+)
+
+
+def test_task_text_tells_the_parent_to_pass_on_what_it_remembers_when_it_has_memory() -> None:
+    """B-300 T17 —— 主智能体开了长期记忆:``task`` 说明在「看不到本次对话」之后加设计 §13.2
+    定稿的那一句;不提任何行业、内容类型。"""
+    tool = SubAgentTool(
+        subagent=_SUB,
+        builder=_RecordingBuilder(),
+        child_depth=1,
+        parent_has_long_term_memory=True,
+    )
+    task = tool.spec.parameters["properties"]["task"]["description"]
+    assert task.endswith("it sees none of this conversation. " + _MEMORY_SENTENCE), task
+
+
+def test_task_text_has_no_memory_sentence_when_the_parent_has_no_memory() -> None:
+    default = SubAgentTool(subagent=_SUB, builder=_RecordingBuilder(), child_depth=1)
+    task = default.spec.parameters["properties"]["task"]["description"]
+    assert "remembered" not in task
+    assert task.endswith("it sees none of this conversation."), task
+
+
 # ---------------------------------------------------------------------------
 # SubAgentTool.call — happy path
 # ---------------------------------------------------------------------------

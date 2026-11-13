@@ -80,14 +80,14 @@ def chown_all():
     os.chown(U, 10000, 10000)
 
 
-def argv_of(code, conv="", own=None, key="a"):
+def argv_of(code, conv="", own=None, key="a", child=""):
     chown_all()
     root = "/mnt/workspace/agents/" + key if key else ""
     own = conv if own is None else own
     return [
         "setpriv", "--reuid", "10000", "--regid", "10000", "--clear-groups",
         "sh", "-c", 'umask 077 && exec "$@"', "x",
-        *PREFIX, root, conv, own, "", "", "sh", "-c", code,
+        *PREFIX, root, conv, own, "", "", child, "sh", "-c", code,
     ]
 
 
@@ -389,6 +389,90 @@ def test_legacy_and_unbound_views(scenario: Scenario) -> None:
     assert unbound["out"].split() == ["/agent:", "agents", "/workspace:", "agents"]
     # B-262 —— 老视图不变:平台目录就是 agent 根那一份,两个写法读到同一个文件。
     assert r["uploads"] == {"rc": 0, "out": "up\nup\n", "err": ""}
+
+
+#: B-300 —— 读一串路径:每条打印正文或 ``refused``(打不开 / 不存在)。
+_READ_EACH = 'for p in {paths}; do cat "$p" 2>/dev/null || echo refused; done'
+
+
+def _read_each(*paths: str) -> str:
+    return _READ_EACH.format(paths=" ".join(paths))
+
+
+def test_delegated_run_cannot_open_the_memory_projection(scenario: Scenario) -> None:
+    """B-300 —— 委派子代(``$6`` = ``1``)在执行视图里打不开记忆投影的四种写法;主智能体照旧
+    读得到(对话视图 ①③,老视图四种)。对话视图里子代自己的 ``/workspace/MEMORY.md`` 照常
+    可读写,平台经 ``/agent/threads/<对话>/work`` 落的件照常写得进;``PLAN.md`` 这类对话状态
+    文件子代看不到。"""
+    one = f"/agent/threads/{_CONV}/MEMORY.md"
+    two = f"/workspace/threads/{_CONV}/MEMORY.md"
+    r = scenario(f"""
+        put("agents/a/MEMORY.md", "ROOT\\n")
+        put("agents/a/threads/{_CONV}/MEMORY.md", "THREAD\\n")
+        put("agents/a/threads/{_CONV}/PLAN.md", "PLAN\\n")
+        put("agents/a/threads/{_CONV}/work/MEMORY.md", "OWN\\n")
+        put("agents/a/threads/{_OTHER}/MEMORY.md", "OTHER\\n")
+        result["conv_parent"] = ex({_read_each(one, "/agent/MEMORY.md")!r}, conv="{_CONV}")
+        result["conv_child"] = ex(
+            {_read_each(one, "/agent/MEMORY.md", f"/agent/threads/{_CONV}/PLAN.md")!r}
+            + "; ls -A /agent/threads/{_CONV}"
+            + "; echo mine > /workspace/MEMORY.md && cat /workspace/MEMORY.md"
+            + "; echo p > /agent/threads/{_CONV}/work/platform.txt && echo platform-ok"
+            + "; echo x > /agent/MEMORY.md 2>/dev/null && echo root-written || echo root-ro"
+            + "; grep -rl THREAD /agent /workspace 2>/dev/null | wc -l",
+            conv="{_CONV}",
+            child="1",
+        )
+        result["own_after"] = open(AG + "/threads/{_CONV}/work/MEMORY.md").read()
+        result["platform"] = open(AG + "/threads/{_CONV}/work/platform.txt").read()
+        result["root_after"] = open(AG + "/MEMORY.md").read()
+        result["legacy_parent"] = ex(
+            {_read_each(one, two, "/agent/MEMORY.md", "/workspace/MEMORY.md")!r}, own="{_CONV}"
+        )
+        result["legacy_child"] = ex(
+            {_read_each(one, two, "/agent/MEMORY.md", "/workspace/MEMORY.md")!r}
+            + "; ls -A /agent/threads /workspace/threads | grep -c ."
+            + "; grep -rl -e THREAD -e ROOT /agent /workspace 2>/dev/null | wc -l",
+            own="{_CONV}",
+            child="1",
+        )
+        os.remove(AG + "/MEMORY.md")
+        result["no_root_file"] = ex("echo ran", own="{_CONV}", child="1")
+        link("agents/a/MEMORY.md", "threads/{_CONV}/MEMORY.md")
+        result["root_symlink"] = ex(
+            {_read_each("/agent/MEMORY.md", "MEMORY.md")!r}, own="{_CONV}", child="1"
+        )
+    """)
+    assert r["conv_parent"] == {"rc": 0, "out": "THREAD\nROOT\n", "err": ""}
+    child = r["conv_child"]
+    assert child["rc"] == 0, child["err"]
+    assert child["out"].splitlines() == [
+        "refused",
+        "refused",
+        "refused",
+        "work",  # 本对话那一格里只放回了 work/
+        "mine",
+        "platform-ok",
+        "root-ro",
+        "0",
+    ], child
+    assert (r["own_after"], r["platform"], r["root_after"]) == ("mine\n", "p\n", "ROOT\n")
+    legacy_parent = r["legacy_parent"]
+    assert legacy_parent["out"] == "THREAD\nTHREAD\nROOT\nROOT\n", legacy_parent
+    legacy_child = r["legacy_child"]
+    assert legacy_child["rc"] == 0, legacy_child["err"]
+    assert legacy_child["out"].splitlines() == [
+        "refused",
+        "refused",
+        "refused",
+        "refused",
+        "2",  # ls 的两行标题,两处 threads/ 都是空的
+        "0",
+    ], legacy_child
+    assert r["no_root_file"] == {"rc": 0, "out": "ran\n", "err": ""}
+    symlink = r["root_symlink"]
+    assert symlink["rc"] == 0, symlink["err"]
+    assert symlink["out"] == "refused\nrefused\n", symlink
 
 
 def test_conversation_dirs_that_are_not_plain_dirs_fail_closed(scenario: Scenario) -> None:

@@ -1381,7 +1381,11 @@ class SearchFilesTool:
                 continue
             except SandboxSupervisorError as exc:
                 _raise_for_store_error(exc, tool="search_files")
-            hits.extend(replace(e, path=f"{prefix}{e.path}") for e in found.entries)
+            hits.extend(
+                _addressable_hits(
+                    [replace(e, path=f"{prefix}{e.path}") for e in found.entries], ctx=ctx
+                )
+            )
             truncated = truncated or found.truncated
             too_deep = too_deep or found.too_deep
         found = WorkspaceSearchResult(entries=tuple(hits), truncated=truncated, too_deep=too_deep)
@@ -1396,6 +1400,24 @@ class SearchFilesTool:
                 "too_deep": found.too_deep,
             },
         )
+
+
+def _addressable_hits(
+    hits: list[WorkspaceFileEntry], *, ctx: ToolContext
+) -> list[WorkspaceFileEntry]:
+    """B-300 —— 委派子代的搜索结果只留它寻址得到的:命中的写法再过一遍唯一的路径解析入口,
+    被拒的(agent 根下的旧记忆投影)不出现。``threads/`` 存储侧本来就不搜。主智能体原样。"""
+    if not ctx.child_run:
+        return hits
+    view = ctx.workspace_view
+    kept = []
+    for hit in hits:
+        try:
+            resolve_workspace_path(hit.path, view=view, tool="search_files")
+        except ValueError:
+            continue
+        kept.append(hit)
+    return kept
 
 
 def _optional_str(args: Mapping[str, Any], key: str, *, tool: str) -> str | None:

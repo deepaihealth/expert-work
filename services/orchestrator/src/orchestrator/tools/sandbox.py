@@ -382,6 +382,7 @@ class SandboxRuntime(Protocol):
         egress: EgressContext | None = None,
         conv_id: UUID | None = None,
         workspace_thread_id: UUID | None = None,
+        child_run: bool = False,
     ) -> SandboxOutcome:
         """Run ``code`` in the sandbox; return its captured outcome.
 
@@ -409,6 +410,9 @@ class SandboxRuntime(Protocol):
         ``workspace_thread_id`` 是本对话的线程 id:两种视图里 ``threads/`` 都只留它那一格
         (``None`` = 一格都不留)。只在绑了 agent 时有意义;``run_in_sandbox`` 从
         ``ctx.workspace_view`` 取,wrapper 原样透传。
+
+        ``child_run``(B-300)—— 委派出去的子代:``threads/`` 里那一格不放回(对话视图只放回
+        它的 ``work/``),agent 根下的旧记忆投影 ``MEMORY.md`` 盖住。来源同上。
         """
 
     async def release(self, *, sandbox_id: UUID) -> None:
@@ -493,6 +497,7 @@ class HTTPSupervisorRuntime:
         egress: EgressContext | None = None,
         conv_id: UUID | None = None,
         workspace_thread_id: UUID | None = None,
+        child_run: bool = False,
     ) -> SandboxOutcome:
         # B-217 —— the docker supervisor bakes each container's egress env at
         # `docker run` (acquire carries it) on an `internal: true` network; there
@@ -521,6 +526,9 @@ class HTTPSupervisorRuntime:
                 payload["conv_id"] = str(conv_id)
             if workspace_thread_id is not None:
                 payload["thread_id"] = str(workspace_thread_id)
+            # B-300 —— 委派子代;只在为真时发,主智能体的请求形状一个字不变。
+            if child_run:
+                payload["child_run"] = True
         # The sandbox enforces the exec wall-clock (it SIGKILLs + returns
         # ``timed_out``); the HTTP read timeout must OUTLAST that enforcement so
         # the orchestrator receives the real outcome instead of giving up early
@@ -638,6 +646,8 @@ class RecordingSandboxRuntime:
     exec_views: list[UUID | None] = field(default_factory=list)
     #: B-236 — the ``workspace_thread_id`` passed to each exec (same reasoning).
     exec_thread_ids: list[UUID | None] = field(default_factory=list)
+    #: B-300 — the ``child_run`` passed to each exec (same reasoning).
+    exec_child_runs: list[bool] = field(default_factory=list)
     released: list[UUID] = field(default_factory=list)
     destroyed: list[tuple[UUID, str]] = field(default_factory=list)
     reaped: list[bool] = field(default_factory=list)
@@ -670,6 +680,7 @@ class RecordingSandboxRuntime:
         egress: EgressContext | None = None,
         conv_id: UUID | None = None,
         workspace_thread_id: UUID | None = None,
+        child_run: bool = False,
     ) -> SandboxOutcome:
         del timeout_s
         self.execs.append((sandbox_id, code))
@@ -679,6 +690,7 @@ class RecordingSandboxRuntime:
         self.exec_egress.append(egress)
         self.exec_views.append(conv_id)
         self.exec_thread_ids.append(workspace_thread_id)
+        self.exec_child_runs.append(child_run)
         if self.exec_error is not None:
             raise self.exec_error
         return self.outcome
@@ -742,6 +754,7 @@ class _EgressBindingClient:
         egress: EgressContext | None = None,
         conv_id: UUID | None = None,
         workspace_thread_id: UUID | None = None,
+        child_run: bool = False,
     ) -> SandboxOutcome:
         # This wrapper doesn't own agent_key, run_id or has_skills — it's a pure
         # passthrough here so a chain like _AgentKeyBindingClient(inner=_EgressBindingClient(...))
@@ -758,6 +771,7 @@ class _EgressBindingClient:
             egress=self.egress,
             conv_id=conv_id,
             workspace_thread_id=workspace_thread_id,
+            child_run=child_run,
         )
 
     async def release(self, *, sandbox_id: UUID) -> None:
@@ -825,6 +839,7 @@ class _AgentKeyBindingClient:
         egress: EgressContext | None = None,
         conv_id: UUID | None = None,
         workspace_thread_id: UUID | None = None,
+        child_run: bool = False,
     ) -> SandboxOutcome:
         # B-124 —— 调用方给了 key 就用调用方的:``run_in_sandbox`` 传 ``ctx.agent_key``,
         # 委派出去的子代那里是**父的** key(``_child_run._child_config``),与宿主侧
@@ -843,6 +858,7 @@ class _AgentKeyBindingClient:
             egress=egress,
             conv_id=conv_id,
             workspace_thread_id=workspace_thread_id,
+            child_run=child_run,
         )
 
     async def release(self, *, sandbox_id: UUID) -> None:
@@ -958,6 +974,7 @@ async def run_in_sandbox(
             has_skills=bool(seed_files),
             conv_id=view.conv_id,
             workspace_thread_id=view.thread_id,
+            child_run=view.child_run,
         )
     except asyncio.CancelledError:
         cancelled = True

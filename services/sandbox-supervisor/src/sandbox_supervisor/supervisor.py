@@ -393,6 +393,7 @@ class SandboxSupervisor:
         agent_root: str | None = None,
         conv_id: UUID | None = None,
         thread_id: UUID | None = None,
+        child_run: bool = False,
     ) -> ExecResult:
         """Run ``code`` in an acquired sandbox via its held runner link.
 
@@ -422,6 +423,10 @@ class SandboxSupervisor:
         ``agent_root`` as ``/agent``; ``thread_id`` is the conversation's own
         ``threads/<id>/`` (the only one left visible in either view). Per-call for the
         same reason as ``agent_root``.
+
+        ``child_run`` (B-300) — a delegated run: the runner does not put that
+        ``threads/<id>/`` back (only its ``work/`` in the conversation view) and
+        covers the agent-root ``MEMORY.md``.
         """
         link = self._links.get(sandbox_id)
         if link is None:
@@ -438,6 +443,7 @@ class SandboxSupervisor:
                     agent_root=agent_root,
                     conv_id=conv_id,
                     thread_id=thread_id,
+                    child_run=child_run,
                 )
             except RunnerLinkError as exc:
                 msg = f"sandbox exec failed: {exc}"

@@ -1543,6 +1543,7 @@ class AgentSandboxClient:
         egress: EgressContext | None = None,
         conv_id: UUID | None = None,
         workspace_thread_id: UUID | None = None,
+        child_run: bool = False,
     ) -> SandboxOutcome:
         """波 1 Task 8(spec § 6.1 四契约点)。契约源头是
         ``infra/sandbox-image/runner.py:28-72``——本地 docker 沙箱里的
@@ -1695,6 +1696,8 @@ class AgentSandboxClient:
                     hashlib.sha256(data).hexdigest(),
                     conv_id=conv_id,
                     thread_id=workspace_thread_id,
+                    # B-300 —— 委派子代:执行视图不放回对话那一格、盖住旧记忆投影。
+                    child_run=child_run,
                 ),
                 user=SANDBOX_EXEC_USER,
                 timeout=effective,

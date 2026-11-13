@@ -161,6 +161,11 @@ AGENT_ROOT_RESERVED = frozenset(
 #: (``file_ops``),对话第一次 run 开场时读一次(``graph_builder.agent_notes``)。
 AGENT_NOTES_FILE = "AGENT_NOTES.md"
 
+#: B-300 —— 平台投影长期记忆的文件名(``context.workspace_projection.MEMORY_FILE``,
+#: ``test_b300_child_memory_projection`` 钉两边相等)。投影在 agent 根下的
+#: ``threads/<对话>/``;BUG-10 之前的旧投影可能还在 agent 根下。委派子代两处都不许寻址。
+MEMORY_PROJECTION_FILE = "MEMORY.md"
+
 ResolvedKind = Literal["conversation", "agent", "shared", "legacy"]
 
 
@@ -174,11 +179,15 @@ class WorkspaceView:
     ``thread_id`` 是本对话的线程 id:两种视图里 agent 根下的 ``threads/`` 都只留它那一格
     (老视图也不许看见别的对话 —— 包括发布后新开的对话的工作目录)。对话视图里它就是
     ``conv_id``(见 :attr:`own_thread`);``None`` = 一格都不留。
+
+    ``child_run``(B-300)= 委派出去的子代:``threads/`` 里那一格它不许寻址(主智能体的记忆
+    投影在里面),agent 根下的旧投影 ``MEMORY.md`` 也不许。
     """
 
     agent_key: str = ""
     conv_id: UUID | None = None
     thread_id: UUID | None = None
+    child_run: bool = False
 
     @property
     def per_conversation(self) -> bool:
@@ -326,7 +335,10 @@ def resolve_workspace_path(path: str, *, view: WorkspaceView, tool: str) -> Reso
     head = parts[0] if parts else ""
     rel = "/".join(parts) if parts else "."
     if agent_key and not (head == THREADS_DIR and view.per_conversation and not agent_view):
-        own = str(view.own_thread) if view.own_thread is not None else None
+        # B-300 —— 委派子代没有「自己那一格」:它用的是主智能体那一格,主智能体的记忆投影
+        # 就在里面。``threads/`` 对它整个不许寻址。
+        own_thread = None if view.child_run else view.own_thread
+        own = str(own_thread) if own_thread is not None else None
         _reject_reserved_head(parts, raw=path, tool=tool, agent_view=agent_view, own_thread=own)
     if agent_view:
         if view.per_conversation and head in PLATFORM_DIRS:
@@ -337,10 +349,29 @@ def resolve_workspace_path(path: str, *, view: WorkspaceView, tool: str) -> Reso
                 f"this conversation's {head}/ is /workspace/{head}/: {path!r}"
             )
             raise ValueError(msg)
-        return ResolvedPath(ws=AGENT_VIEW, rel=rel, kind="agent", path=_agent_spelling(rel))
-    if not view.per_conversation:
-        return ResolvedPath(ws=EXEC_VIEW, rel=rel, kind="legacy", path=rel)
-    return ResolvedPath(ws=EXEC_VIEW, rel=rel, kind="conversation", path=rel)
+        target = ResolvedPath(ws=AGENT_VIEW, rel=rel, kind="agent", path=_agent_spelling(rel))
+    elif not view.per_conversation:
+        target = ResolvedPath(ws=EXEC_VIEW, rel=rel, kind="legacy", path=rel)
+    else:
+        target = ResolvedPath(ws=EXEC_VIEW, rel=rel, kind="conversation", path=rel)
+    _refuse_root_projection_from_a_child(target, view, raw=path, tool=tool)
+    return target
+
+
+def _refuse_root_projection_from_a_child(
+    target: ResolvedPath, view: WorkspaceView, *, raw: str, tool: str
+) -> None:
+    """B-300 —— 委派子代不许寻址 agent 根下的旧记忆投影(``/agent/MEMORY.md``,老视图里也就是
+    相对路径 ``MEMORY.md``)。与 ``file_ops._refuse_notes_write_from_a_child`` 同一个认法:只认
+    agent 根下那一个文件名;对话视图里 ``/workspace/MEMORY.md`` 是对话自己的普通文件,照常。"""
+    if not view.child_run or not view.agent_key or target.kind not in ("agent", "legacy"):
+        return
+    if target.rel == MEMORY_PROJECTION_FILE:
+        msg = (
+            f"{tool}: delegated runs cannot access {_agent_spelling(target.rel)}; it holds what "
+            f"is remembered about the user from earlier sessions: {raw!r}"
+        )
+        raise ValueError(msg)
 
 
 def _agent_spelling(rel: str) -> str:

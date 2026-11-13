@@ -849,6 +849,7 @@ class _EchoRenderRuntime(RecordingSandboxRuntime):
         egress: EgressContext | None = None,
         conv_id: UUID | None = None,
         workspace_thread_id: UUID | None = None,
+        child_run: bool = False,
     ) -> SandboxOutcome:
         await super().exec(
             sandbox_id=sandbox_id,

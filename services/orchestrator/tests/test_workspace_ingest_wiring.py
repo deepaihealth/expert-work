@@ -196,9 +196,10 @@ class _FsSandbox(RecordingSandboxRuntime):
         egress: EgressContext | None = None,
         conv_id: UUID | None = None,
         workspace_thread_id: UUID | None = None,
+        child_run: bool = False,
     ) -> SandboxOutcome:
         del timeout_s, agent_key, run_id, has_skills, egress, conv_id
-        del workspace_thread_id
+        del workspace_thread_id, child_run
         self.execs.append((sandbox_id, code))
         for rel, content in self.files.items():
             if json.dumps(rel) in code:
@@ -398,6 +399,7 @@ class _ViewedSandbox(RecordingSandboxRuntime):
         egress: EgressContext | None = None,
         conv_id: UUID | None = None,
         workspace_thread_id: UUID | None = None,
+        child_run: bool = False,
     ) -> SandboxOutcome:
         await super().exec(
             sandbox_id=sandbox_id,
@@ -409,6 +411,7 @@ class _ViewedSandbox(RecordingSandboxRuntime):
             egress=egress,
             conv_id=conv_id,
             workspace_thread_id=workspace_thread_id,
+            child_run=child_run,
         )
         own = conv_id or workspace_thread_id
         if agent_key == self.agent_key and own is not None and f"threads/{own}/" in code:

@@ -1657,14 +1657,17 @@ def test_exec_view_script_matches_the_sandbox_image() -> None:
         "前缀之后必须是 agent_root、对话 id、线程 id 三个表达式"
     )
     assert argv[n + 3 : n + 5] == ["", ""], "本地走 -c,没有代码文件"
-    assert argv[n + 5] == "<sys.executable>"
-    ours = exec_view_argv("a-1", ["py"], conv_id=UUID(int=1), thread_id=UUID(int=2))
+    # B-300 —— ``$6`` 委派子代标记(表达式:按请求给 ``1`` / 空串)
+    assert argv[n + 5] is None, "代码文件之后必须是委派子代标记这个表达式"
+    assert argv[n + 6] == "<sys.executable>"
+    ours = exec_view_argv("a-1", ["py"], conv_id=UUID(int=1), thread_id=UUID(int=2), child_run=True)
     assert ours[n:] == [
         "/mnt/workspace/agents/a-1",
         str(UUID(int=1)),
         str(UUID(int=2)),
         "",
         "",
+        "1",
         "py",
     ]
 

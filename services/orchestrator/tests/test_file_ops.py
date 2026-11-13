@@ -1403,6 +1403,7 @@ class _SequenceRuntime(RecordingSandboxRuntime):
         egress: EgressContext | None = None,
         conv_id: UUID | None = None,
         workspace_thread_id: UUID | None = None,
+        child_run: bool = False,
     ) -> SandboxOutcome:
         self.execs.append((sandbox_id, code))
         self.exec_agent_keys.append(agent_key)

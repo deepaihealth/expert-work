@@ -137,6 +137,7 @@ class _ViewRuntime(RecordingSandboxRuntime):
         egress: EgressContext | None = None,
         conv_id: UUID | None = None,
         workspace_thread_id: UUID | None = None,
+        child_run: bool = False,
     ) -> SandboxOutcome:
         self.exec_agent_keys.append(agent_key)
         view = self.user_root / "agents" / agent_key
