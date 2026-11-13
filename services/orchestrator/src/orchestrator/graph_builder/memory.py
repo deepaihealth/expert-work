@@ -315,13 +315,19 @@ def _activity_line(tool_names: Sequence[str]) -> str:
 
 def _segments(messages: Sequence[BaseMessage]) -> list[list[BaseMessage]]:
     """按轮切开:一条可见的用户消息(或定时投递)开一轮;系统消息、隐藏消息、被取代的消息
-    不进任何一轮(被取代的判断同 ``retrieval_query``);草稿试跑那一轮整轮去掉。"""
+    不进任何一轮(被取代的判断同 ``retrieval_query``);草稿试跑那一轮整轮去掉。
+
+    第一个开轮消息之前的消息(半轮)整段丢掉(review R2-M1):压缩前抢存拿到的中段常从一轮中间
+    开始,开这一轮的用户消息留在头部,认不出这半轮是谁开的 —— 可能是草稿轮。轮末写回重读整段
+    对话(总是从系统消息 + 用户消息开始),不会因此丢东西。"""
     segments: list[list[BaseMessage]] = []
     for message in messages:
         if isinstance(message, SystemMessage) or is_hidden(message) or is_superseded(message):
             continue
-        if opens_segment(message) or not segments:
+        if opens_segment(message):
             segments.append([])
+        elif not segments:
+            continue
         segments[-1].append(message)
     # B-300 review M1 —— 草稿试跑那一整轮(用户消息带服务端草稿标记)两次提炼都不给:续跑、
     # 接管、后面的线上轮重抽整段对话时也不会把它记下。

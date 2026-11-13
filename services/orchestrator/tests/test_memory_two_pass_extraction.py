@@ -608,3 +608,22 @@ async def test_an_ordinary_failure_in_one_pass_keeps_the_other() -> None:
         token=CancellationToken(),
     )
     assert (outcome.written, outcome.failed) == (1, True)
+
+
+async def test_a_half_turn_whose_opener_is_outside_the_slice_is_dropped() -> None:
+    """B-300 review R2-M1 —— 压缩前抢存拿到的中段常从一轮中间开始(开这一轮的用户消息留在头部)。
+    这半轮认不出是谁开的(可能是草稿轮),两次提炼都不给;轮末写回会重读整段对话,不会真丢。"""
+    middle = [
+        AIMessage(content="", tool_calls=[{"name": "search", "args": {}, "id": "c1"}]),
+        ToolMessage(content="TOOLSENTINEL", tool_call_id="c1", name="search"),
+        AIMessage(content="DRAFT REPLY"),
+    ]
+    llm = _ByPassLLM()
+    written, failed, _ = await _flush(middle, llm)
+    assert llm.calls == []
+    assert (written, failed) == (0, False)
+    # 半轮之后完整的一轮照常给。
+    llm = _ByPassLLM()
+    await _flush([*middle, _user("我喜欢绿茶"), AIMessage(content="好的")], llm)
+    assert llm.input_of("conversation") == "[user] 我喜欢绿茶\n[assistant] 好的"
+    assert "DRAFT" not in llm.input_of("user")
