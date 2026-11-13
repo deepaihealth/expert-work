@@ -46,6 +46,7 @@ REPEATS = 3
 RERUN_FACTOR = 1.2
 #: B-206 尺子:判官 deepseek-v4-pro、三票取多数(``kb_agent_eval.py:156``、``kb_agent_judge.py``)。
 JUDGE_MODEL = "deepseek-v4-pro"
+JUDGE_PROVIDER = "deepseek"
 JUDGE_VOTES = 3
 #: A 组(提炼)的判官每条只判一票:设计 §8.6 没给 A 组算判官钱,这里本脚本安排一票,报告里写明。
 A_JUDGE_VOTES = 1
@@ -213,6 +214,7 @@ def lines_for(
     cuts: Iterable[int] = (),
     single_vendor: str | None = None,
     include_compare: bool = True,
+    a_votes: int = A_JUDGE_VOTES,
 ) -> list[Line]:
     """全部调用。``cuts`` 是 §8.6 的删减编号;②③ 只跑一家时用 ``single_vendor``(没定就按最贵的
     那家算,偏保守)。"""
@@ -233,11 +235,11 @@ def lines_for(
                 v.provider,
                 JUDGE_MODEL,
                 "judge",
-                a_items * A_JUDGE_VOTES,
-                a_items * A_JUDGE_VOTES,
+                a_items * a_votes,
+                a_items * a_votes,
             )
         )
-        lines.append(Line("A", v.provider, JUDGE_MODEL, "judge_p8", 0, p8_items * A_JUDGE_VOTES))
+        lines.append(Line("A", v.provider, JUDGE_MODEL, "judge_p8", 0, p8_items * a_votes))
         # B 组(§8.3)。
         lines += _conversations("B", v, b_convs)
         if 1 not in cut:
@@ -320,7 +322,120 @@ def lines_for(
             CALIBRATION_ITEMS * JUDGE_VOTES,
         )
     )
+    # A 组判官另有一套校准(审查 M3):A 组的判法与 B 组不同,用 A 组的票数校。
+    lines.append(
+        Line(
+            "calibration-a",
+            "judge",
+            JUDGE_MODEL,
+            "judge",
+            CALIBRATION_ITEMS * a_votes,
+            CALIBRATION_ITEMS * a_votes,
+        )
+    )
     return lines
+
+
+#: 试点(审查 M4):每段 2 个单元、只跑一家、每个只跑 1 次;量出来的 token 交给 ``--tokens`` 重报。
+PILOT_UNITS_PER_PHASE = 2
+
+
+def pilot_lines(
+    vendors: Sequence[Vendor], *, single_vendor: str, a_votes: int = A_JUDGE_VOTES
+) -> list[Line]:
+    """试点的全部调用:A 2 次写回;B、C(C1 / C2)各 2 段对话;C4 2 条链;C5 2 个用户各整理一次 +
+    2 段提问。判官照常判(试点的判分不作数,只为量 token)。"""
+    v = _single(vendors, single_vendor)
+    n = float(PILOT_UNITS_PER_PHASE)
+    lines = _writebacks("pilot-A", v, n)
+    lines.append(Line("pilot-A", v.provider, JUDGE_MODEL, "judge", n * a_votes, n * a_votes))
+    lines += _conversations("pilot-B", v, n)
+    lines += _conversations("pilot-C", v, n)
+    lines += [
+        Line("pilot-C4", v.provider, v.main, "main", n * 2 * 1.0, n * 2 * 2.0),
+        Line("pilot-C4", v.provider, v.memory, "review", n * 1.0, n * 2.0),
+    ]
+    lines += _writebacks("pilot-C4", v, n * 2)
+    lines += _conversations("pilot-C4", v, n)
+    lines += [
+        Line(
+            "pilot-C5",
+            "consolidation",
+            CONSOLIDATION_MODEL,
+            "consolidate",
+            n * CONSOLIDATE_PER_SWEEP[0],
+            n * CONSOLIDATE_PER_SWEEP[1],
+        ),
+        Line("pilot-C5", "consolidation", JUDGE_MODEL, "judge", n * JUDGE_VOTES, n * JUDGE_VOTES),
+    ]
+    lines += _conversations("pilot-C5", v, n)
+    return lines
+
+
+#: 分预算(审查 M4):止损线按 B → C → A 的先后分给三段(B 是核心验收),每段最多拿到自己的高档
+#: 估计;记账用的 phase → 段。
+BUDGET_ORDER = ("B", "C", "A")
+_GROUP_BUDGET = {
+    "B": "B",
+    "B-alt": "B",
+    "B-screen": "B",
+    "calibration": "B",
+    "A": "A",
+    "D-compare": "A",
+    "calibration-a": "A",
+}
+
+
+def budget_of_group(group: str) -> str:
+    if group.startswith("pilot"):
+        return "pilot"
+    return _GROUP_BUDGET.get(group, "C" if group.startswith("C-") else "B")
+
+
+def phase_budgets(planned: Mapping[str, Any], stop_line: float) -> dict[str, Any]:
+    """每段的高档估计与分到的预算;分不满的段写明差多少。"""
+    need: dict[str, float] = {}
+    for group, g in planned["groups"].items():
+        budget = budget_of_group(group)
+        need[budget] = need.get(budget, 0.0) + float(g["yuan_high"])
+    left = float(stop_line)
+    out: dict[str, Any] = {}
+    for budget in [*BUDGET_ORDER, *sorted(set(need) - set(BUDGET_ORDER))]:
+        if budget not in need:
+            continue
+        given = min(need[budget], left)
+        left -= given
+        out[budget] = {
+            "high_estimate_yuan": round(need[budget], 2),
+            "budget_yuan": round(given, 2),
+            "short_by_yuan": round(need[budget] - given, 2),
+        }
+    return out
+
+
+#: 嵌入没有价目行(价目表里只有对话模型),用量只报估计条数与 token;给了 ``--embed-price``
+#: (元 / 百万 token)才折成钱(审查 LOW)。每条记忆 / 每个查询约 30~80 token(假设)。
+EMBED_TOKENS_PER_TEXT = (30, 80)
+
+
+def embedding_estimate(vendors: Sequence[Vendor], embed_price: float | None) -> dict[str, Any]:
+    n_v = len(vendors)
+    a_texts = (_a_writebacks_per_vendor() * 1, _a_writebacks_per_vendor() * 3)  # 每次写回写 1~3 条
+    seeds = sum(len(s.seeds) for s in sc.build_all() if s.group in {"B", "C"}) * REPEATS
+    convs = (
+        len(sc.B_CLASSES) * sc.SCENARIOS_PER_CLASS["B"] + 3 * sc.SCENARIOS_PER_CLASS["C"]
+    ) * REPEATS
+    texts = (
+        a_texts[0] * n_v + seeds * n_v + convs * n_v,
+        a_texts[1] * n_v + seeds * n_v + convs * n_v * 2,
+    )
+    tokens = (texts[0] * EMBED_TOKENS_PER_TEXT[0], texts[1] * EMBED_TOKENS_PER_TEXT[1])
+    body: dict[str, Any] = {"texts": list(texts), "tokens": list(tokens), "in_ledger": False}
+    if embed_price is not None:
+        body["yuan"] = [round(t * embed_price / 1e6, 2) for t in tokens]
+    else:
+        body["yuan"] = "not priced: no rate card row for embeddings; pass --embed-price"
+    return body
 
 
 def _single(vendors: Sequence[Vendor], single_vendor: str | None) -> Vendor:
@@ -433,6 +548,7 @@ def choose_cuts(
     include_compare: bool = True,
     cap: float | None = None,
     tokens: TokenTable = CALL_TOKENS,
+    a_votes: int = A_JUDGE_VOTES,
 ) -> tuple[list[int], dict[str, Any], str]:
     """按 §8.6 的顺序删,直到「已花 + 本次高档」≤ 上限;三步都删完仍超 → ``stop_and_ask``。"""
     cap = CAP_YUAN if cap is None else cap
@@ -440,7 +556,13 @@ def choose_cuts(
     one = single_vendor or most_expensive(vendors, prices)
     while True:
         summary = summarize(
-            lines_for(vendors, cuts=cuts, single_vendor=one, include_compare=include_compare),
+            lines_for(
+                vendors,
+                cuts=cuts,
+                single_vendor=one,
+                include_compare=include_compare,
+                a_votes=a_votes,
+            ),
             prices,
             tokens,
         )
@@ -462,22 +584,37 @@ def quote(
     include_compare: bool = True,
     cap: float | None = None,
     tokens: TokenTable = CALL_TOKENS,
+    a_votes: int = A_JUDGE_VOTES,
+    pilot: bool = False,
+    embed_price: float | None = None,
 ) -> dict[str, Any]:
     """报价:不删时的全量、按顺序删后的计划、状态、止损线、报价编号(内容哈希)。"""
     cap = CAP_YUAN if cap is None else cap
     one = single_vendor or most_expensive(vendors, prices)
-    full = summarize(
-        lines_for(vendors, single_vendor=one, include_compare=include_compare), prices, tokens
-    )
-    cuts, planned, status = choose_cuts(
-        vendors,
-        prices,
-        already_spent=already_spent,
-        single_vendor=one,
-        include_compare=include_compare,
-        cap=cap,
-        tokens=tokens,
-    )
+    if a_votes not in (1, JUDGE_VOTES):
+        raise PlanError(f"A-group judge votes must be 1 or {JUDGE_VOTES}")
+    if pilot:
+        full = summarize(pilot_lines(vendors, single_vendor=one, a_votes=a_votes), prices, tokens)
+        cuts, planned = [], full
+        status = (
+            "within_cap" if already_spent + full["total"]["yuan_high"] <= cap else "stop_and_ask"
+        )
+    else:
+        full = summarize(
+            lines_for(vendors, single_vendor=one, include_compare=include_compare, a_votes=a_votes),
+            prices,
+            tokens,
+        )
+        cuts, planned, status = choose_cuts(
+            vendors,
+            prices,
+            already_spent=already_spent,
+            single_vendor=one,
+            include_compare=include_compare,
+            cap=cap,
+            tokens=tokens,
+            a_votes=a_votes,
+        )
     if stop_line <= 0:
         raise PlanError("stop line must be positive")
     if already_spent + stop_line > cap:
@@ -503,11 +640,23 @@ def quote(
             k: {"low": v[0], "high": v[1], "source": _token_source(k, tokens)}
             for k, v in tokens.items()
         },
-        "judge": {"model": JUDGE_MODEL, "votes": JUDGE_VOTES, "a_group_votes": A_JUDGE_VOTES},
+        "judge": {"model": JUDGE_MODEL, "votes": JUDGE_VOTES, "a_group_votes": a_votes},
+        "pilot": pilot,
         "scenario_digest": scenario_digest,
+        "languages": language_mix(),
         "without_cuts": full,
         "cuts_applied": [{"step": c, "what": CUTS[c]} for c in cuts],
         "planned": planned,
+        "phase_budgets": (
+            {"pilot": {"budget_yuan": float(stop_line)}}
+            if pilot
+            else phase_budgets(planned, stop_line)
+        ),
+        "embeddings": embedding_estimate(vendors, embed_price),
+        "not_priced": [
+            "sandbox time of the eval agents (not model spend)",
+            "embeddings unless --embed-price is given (see 'embeddings')",
+        ],
     }
     if status == "stop_and_ask":
         body["note"] = (
@@ -524,6 +673,13 @@ def _token_source(kind: str, tokens: TokenTable) -> str:
     if kind == "consolidate":
         return "measured: design §12 ⑥ averages"
     return "assumption, not measured"
+
+
+def language_mix() -> dict[str, Any]:
+    """场景的语言配比(:data:`b300_scenarios.LANG_CYCLE`),报价时给用户看、由用户定要不要改。"""
+    rows = [*sc.build_all(), *sc.build_compare()]
+    counts = {lang: sum(s.lang == lang for s in rows) for lang in sc.LANGS}
+    return {"cycle": list(sc.LANG_CYCLE), "scenarios_by_language": counts}
 
 
 def planned_groups(q: Mapping[str, Any]) -> set[str]:

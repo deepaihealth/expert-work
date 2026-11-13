@@ -103,7 +103,7 @@ def test_b_seeds_and_documents() -> None:
     assert b3.seeds[0].origin == "assistant_derived"
     assert sc.fact("budget").texts[lang].y in b3.conversations[0].documents[0][1]
     b5 = rows[("B5", "budget")]
-    assert [s.days_ago for s in b5.seeds] == [30, 3]  # X 早、Y 晚
+    assert [s.days_ago for s in b5.seeds] == [sc.MAX_SEED_DAYS_AGO, 3]  # X 早、Y 晚
     # B4:一半种「用户说的」,一半种「用户更正」(置信度 1.0)。
     assert {s.confidence for f in sc.FACTS for s in rows[("B4", f.key)].seeds} == {0.9, 1.0}
     assert rows[("B7", "budget")].seeds[0].kind == "episodic"

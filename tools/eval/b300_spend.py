@@ -8,15 +8,17 @@
   结束后写一行结算(``ok`` 按用量,``cap_*`` 按上限)。没有结算行的(进程崩了)按预留算。
 * **预留前判线**:「已结算 + 在飞的预留 + 这一笔的上限」超过止损线就不发、止损。所以只要每一笔的
   结算不超过它的上限,花费就到不了止损线以上。
-* **¥400 是跨报价的总账**:``run`` 开始前把状态目录里**别的**报价已花的钱加起来,止损线 + 它们
-  超过 :data:`b300_plan.CAP_YUAN` 就拒跑(先按 §8.6 的顺序删减、重新报价)。
+* **¥400 是跨报价的总账**:花钱的进程先拿状态目录的独占锁(:func:`state_lock`),在锁里读出
+  **别的**报价已花的钱,每次预留都按「别的 + 本报价 + 这一笔」判 ¥400;同一时间只有一个进程在花。
+* 停下(过线、计不了账、账本写不进)写一行 ``blocked`` 落盘;续跑要显式 ``unblock``,原因也落盘。
 """
 
 from __future__ import annotations
 
+import contextlib
 import sys
 import uuid
-from collections.abc import Iterable, Mapping
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -45,6 +47,7 @@ __all__ = [
     "exclusive",
     "history_total",
     "ledger_path",
+    "state_lock",
     "usage_cost",
 ]
 
@@ -92,45 +95,139 @@ def usage_cost(usage_by_model: Iterable[Mapping[str, Any]], prices: Mapping[str,
     return cost
 
 
+#: 跨全部报价的总上限(用户拍板 ¥400)。与 ``b300_plan.CAP_YUAN`` 同一个数;这里不 import plan,
+#: 免得花费模块依赖报价模块。
+GLOBAL_CAP_YUAN = 400.0
+_LOCK_NAME = "b300-state"
+
+
+@contextlib.contextmanager
+def state_lock(state_dir: Path) -> Iterator[None]:
+    """一个状态目录同一时间只许一个花钱的进程(``run`` / ``judge`` / ``calibrate`` / 整理的
+    ``bundle`` 与 ``ingest``)。拿不到就 :class:`LockedError`,不等。审查 H3:¥400 总账只有在
+    「别的报价已花」读出来之后不再变的前提下才守得住,所以读账、判线、花钱都在这把锁里。"""
+    with exclusive(state_dir, _LOCK_NAME):
+        yield
+
+
+def _replay(
+    rows: Sequence[Mapping[str, Any]],
+) -> tuple[dict[str, float], dict[str, tuple[float, str]], str | None]:
+    """账本 → (已结算的每笔, 只有预留的每笔 (上限, 段), 当前是否停着)。"""
+    settled: dict[str, float] = {}
+    reserved: dict[str, tuple[float, str]] = {}
+    blocked: str | None = None
+    for row in rows:
+        reason, call_id = row["reason"], str(row["call_id"])
+        if reason == "blocked":
+            blocked = str(row.get("detail") or "blocked")
+        elif reason == "unblock":
+            blocked = None
+        elif reason == "reserve":
+            if call_id not in settled:
+                reserved[call_id] = (float(row["cost_yuan"]), str(row.get("phase") or ""))
+        else:
+            reserved.pop(call_id, None)
+            settled[call_id] = float(row["cost_yuan"])
+    return settled, reserved, blocked
+
+
 @dataclass
 class Guard:
-    """一个报价的止损与记账。``spent`` = 已结算 + 在飞的预留。"""
+    """一个报价的止损与记账。``spent`` = 已结算 + 在飞的预留(含上次进程留下没结算的预留)。
+
+    每次预留前判四条线:止损线、¥400 总账(``others`` = 别的报价已花,锁里读出)、所属段的分预算
+    (``phase_caps``,段名由 ``budget_of`` 从记账用的 phase 映射)、单价存在。一旦停下,写一行
+    ``blocked`` 落盘;续跑要显式 ``unblock``(原因也落盘)。"""
 
     stop_line: float
     prices: Mapping[str, Price]
     ledger: SpendLedger | None = None
     settled: float = 0.0
     blocked: str | None = None
-    _open: dict[str, float] = field(default_factory=dict, repr=False)
+    others: float = 0.0
+    global_cap: float = GLOBAL_CAP_YUAN
+    phase_caps: Mapping[str, float] = field(default_factory=dict)
+    budget_of: Callable[[str], str] | None = None
+    _open: dict[str, tuple[float, str]] = field(default_factory=dict, repr=False)
+    _phase_settled: dict[str, float] = field(default_factory=dict, repr=False)
 
     @classmethod
     def resume(
-        cls, *, stop_line: float, prices: Mapping[str, Price], state_dir: Path | None, quote_id: str
+        cls,
+        *,
+        stop_line: float,
+        prices: Mapping[str, Price],
+        state_dir: Path | None,
+        quote_id: str,
+        unblock: str | None = None,
+        phase_caps: Mapping[str, float] | None = None,
+        budget_of: Callable[[str], str] | None = None,
     ) -> Guard:
-        """从这个报价的账本接着记(没有账本 = 从 0 起)。``state_dir=None`` 只记内存(测试)。"""
+        """从这个报价的账本接着记。``state_dir=None`` 只记内存(测试)。调用方应已持有
+        :func:`state_lock`。"""
         if state_dir is None:
-            return cls(stop_line=stop_line, prices=prices)
+            return cls(
+                stop_line=stop_line, prices=prices, phase_caps=phase_caps or {}, budget_of=budget_of
+            )
         path = ledger_path(state_dir, quote_id)
-        already = ledger_total(read_ledger(path, broken_line_cost=BROKEN_LINE_YUAN))
-        return cls(
+        rows = read_ledger(path, broken_line_cost=BROKEN_LINE_YUAN)
+        settled, reserved, blocked = _replay(rows)
+        guard = cls(
             stop_line=stop_line,
             prices=prices,
             ledger=SpendLedger(path, quote_id),
-            settled=already,
+            settled=sum(settled.values()),
+            blocked=blocked,
+            others=sum(history_total(state_dir, exclude=quote_id).values()),
+            phase_caps=phase_caps or {},
+            budget_of=budget_of,
         )
+        guard._open = dict(reserved)
+        phase_of = {str(r["call_id"]): str(r.get("phase") or "") for r in rows}
+        for call_id, cost in settled.items():
+            budget = guard._budget(phase_of.get(call_id, ""))
+            guard._phase_settled[budget] = guard._phase_settled.get(budget, 0.0) + cost
+        if guard.blocked is not None and unblock:
+            guard._mark("unblock", f"{unblock} (was: {guard.blocked})")
+            guard.blocked = None
+        return guard
 
     @property
     def spent(self) -> float:
-        return self.settled + sum(self._open.values())
+        return self.settled + sum(cost for cost, _phase in self._open.values())
+
+    def _budget(self, phase: str) -> str:
+        return self.budget_of(phase) if self.budget_of is not None else ""
+
+    def phase_spent(self, budget: str) -> float:
+        open_part = sum(c for c, p in self._open.values() if self._budget(p) == budget)
+        return self._phase_settled.get(budget, 0.0) + open_part
 
     def block(self, reason: str) -> None:
         if self.blocked is None:
             self.blocked = reason
+            self._mark("blocked", reason)
+
+    def _mark(self, reason: str, detail: str) -> None:
+        if self.ledger is None:
+            return
+        row = {
+            "call_id": f"{reason}-{uuid.uuid4().hex}",
+            "cost_yuan": 0.0,
+            "reason": reason,
+            "detail": detail,
+        }
+        try:
+            self.ledger.append(row)
+        except OSError:
+            pass  # 已经停了;写不进去也只是少一行说明
 
     def reserve(self, *, item: str, model: str, cap: float, phase: str) -> str:
         """判线 → 按上限预留并落账 → 返回编号;之后才能发。
 
-        超线 / 已停 / 没单价 → :class:`SpendStopError`。"""
+        超任一条线 / 已停 / 没单价 → :class:`SpendStopError`。"""
+        budget = self._budget(phase)
         if self.blocked is None and model not in self.prices:
             self.block(f"no validated price for {model}")
         if self.blocked is None and self.spent + cap > self.stop_line:
@@ -138,26 +235,45 @@ class Guard:
                 f"stop line ¥{self.stop_line:.2f} would be crossed "
                 f"(spent ¥{self.spent:.4f} + this one up to ¥{cap:.4f})"
             )
+        if self.blocked is None and self.others + self.spent + cap > self.global_cap:
+            self.block(
+                f"the ¥{self.global_cap:g} cap across quotes would be crossed (other quotes "
+                f"¥{self.others:.2f} + this quote ¥{self.spent:.4f} + up to ¥{cap:.4f})"
+            )
+        if self.blocked is None and budget in self.phase_caps:
+            if self.phase_spent(budget) + cap > self.phase_caps[budget]:
+                self.block(
+                    f"the {budget} sub-budget ¥{self.phase_caps[budget]:.2f} would be crossed "
+                    f"(spent ¥{self.phase_spent(budget):.4f} + up to ¥{cap:.4f})"
+                )
         if self.blocked is not None:
             raise SpendStopError(self.blocked)
         call_id = uuid.uuid4().hex
         self._write(call_id, item, model, phase, cap, "reserve")
-        self._open[call_id] = cap
+        self._open[call_id] = (cap, phase)
         return call_id
 
     def settle(
         self, call_id: str, *, item: str, model: str, phase: str, cost: float, reason: str = "ok"
     ) -> float:
-        cap = self._open.pop(call_id, None)
+        opened = self._open.pop(call_id, None)
         self.settled += cost
+        budget = self._budget(phase)
+        self._phase_settled[budget] = self._phase_settled.get(budget, 0.0) + cost
         self._write(call_id, item, model, phase, cost, reason)
-        if cap is not None and cost > cap + 1e-9:
-            self.block(f"{item}: cost ¥{cost:.4f} exceeded its cap ¥{cap:.4f}; check the caps")
+        if opened is not None and cost > opened[0] + 1e-9:
+            self.block(
+                f"{item}: cost ¥{cost:.4f} exceeded its cap ¥{opened[0]:.4f}; check the caps"
+            )
         return cost
+
+    def open_cap(self, call_id: str) -> float:
+        opened = self._open.get(call_id)
+        return opened[0] if opened is not None else 0.0
 
     def settle_cap(self, call_id: str, *, item: str, model: str, phase: str, reason: str) -> float:
         """说不清花了多少:按预留的上限结算(并不自动止损;要止损的调用方另调 :meth:`block`)。"""
-        cap = self._open.get(call_id, 0.0)
+        cap = self.open_cap(call_id)
         return self.settle(call_id, item=item, model=model, phase=phase, cost=cap, reason=reason)
 
     def settle_usage(
@@ -171,17 +287,19 @@ class Guard:
     ) -> float:
         """按用量结算;没有用量 / 有没单价的型号 → 按上限结算并止损。"""
         if usage_by_model is None:
-            self.block(f"{item}: no usage reported; charged at the cap")
-            return self.settle_cap(
+            cost = self.settle_cap(
                 call_id, item=item, model=model, phase=phase, reason="cap_no_usage"
             )
+            self.block(f"{item}: no usage reported; charged at the cap")
+            return cost
         try:
             cost = usage_cost(usage_by_model, self.prices)
         except KeyError as exc:
-            self.block(f"{item}: no price for model {exc}; charged at the cap")
-            return self.settle_cap(
+            charged = self.settle_cap(
                 call_id, item=item, model=model, phase=phase, reason="cap_no_price"
             )
+            self.block(f"{item}: no price for model {exc}; charged at the cap")
+            return charged
         return self.settle(call_id, item=item, model=model, phase=phase, cost=cost)
 
     def _write(
@@ -200,5 +318,7 @@ class Guard:
         try:
             self.ledger.append(row)
         except OSError as exc:
-            self.block(f"the spend ledger could not be written ({type(exc).__name__})")
+            self.blocked = (
+                self.blocked or f"the spend ledger could not be written ({type(exc).__name__})"
+            )
             raise SpendStopError(self.blocked) from exc

@@ -24,10 +24,12 @@
 * ``state``:评测用户当前有效的记忆:id、类型、来源会话、是否汇总行、是否含关键串;只有
   **汇总行**带正文(C5 ① 要判官判;正文全部来自合成的种子)。
 
+另有 ``writeback_usage``(带写回的评测智能体每个评测用户的后台写回实际用了多少 token,只出数字)
+与 ``preflight``(评测租户的记忆清理 / 到期复核开关,只出数字与开关)。
+
 这个文件**不能 import ``tools/eval`` 里的任何东西**(pod 里没有);平台包在函数里按需 import。
-引导(:func:`bootstrap`)用 ``create_app(enable_scheduler=False, ...)`` 进一次 lifespan 拿到与线上
-同一套装配(嵌入、凭据解析、存储);lifespan 里总会起的后台 worker(如写回失败重试)在这个短命进程里
-也会起 —— 已知副作用,未在 pod 里验证过。
+引导(:func:`bootstrap`)**不建 app、不进 lifespan**,只拼要用的那几样,装配前后都查一遍没有
+后台任务 —— 否则这个进程可能去认领真租户排队的运行或写回任务(审查 H1)。
 """
 
 from __future__ import annotations
@@ -47,7 +49,9 @@ from uuid import UUID, uuid4
 #: ``bundle`` 生成的文件在这里塞进这一步的输入;直接跑本文件时为 ``None``,用 ``--input``。
 EMBEDDED_INPUT: Mapping[str, Any] | None = None
 
-OPS = ("seed", "recalled", "candidates", "consolidate", "state")
+OPS = ("seed", "recalled", "candidates", "consolidate", "state", "writeback_usage", "preflight")
+#: 平台的写回把用量记成这一类(``token_usage_store.PLATFORM_OVERHEAD_USAGE_KIND``)。
+PLATFORM_OVERHEAD = "platform_overhead"
 
 
 @dataclass
@@ -58,6 +62,9 @@ class Deps:
     embedder: Any  # orchestrator Embedder(.embed(texts, tenant_id=...))
     consolidator_factory: Callable[[int], Any]  # max_calls -> (consolidator, CappedAux)
     consolidation_model: str
+    token_usage: Any = None  # TokenUsageStore
+    tenant_config: Any = None  # TenantConfigService
+    consolidation_interval_s: float | None = None
 
 
 # --------------------------------------------------------------------------- RLS 作用域
@@ -218,6 +225,9 @@ async def candidates(deps: Deps, payload: Mapping[str, Any], emit: Callable[[str
         with _scope(tenant_id):
             cfg = await consolidator._resolve_thresholds(tenant_id)
         with _scope(tenant_id, user_id):
+            # 平台自己的整理每 4 小时扫一轮,评测租户关不掉(没有按租户的开关):我们这一步之前就已
+            # 被整理过的,前提不成立(审查 M5)。
+            live = await deps.memory.list_for_user(tenant_id=tenant_id, user_id=user_id, limit=200)
             clusters = await consolidator._find_candidate_clusters(
                 tenant_id=tenant_id,
                 user_id=user_id,
@@ -233,6 +243,7 @@ async def candidates(deps: Deps, payload: Mapping[str, Any], emit: Callable[[str
                     "min_cluster_size": cfg.min_cluster_size,
                     "similarity": cfg.similarity,
                     "clusters": [[str(m.id) for m in cluster] for cluster in clusters],
+                    "already_consolidated": any(bool(m.consolidated_from) for m in live),
                 }
             )
         )
@@ -255,6 +266,9 @@ class CappedAux:
         self.input_tokens = 0
         self.output_tokens = 0
         self.models: set[str] = set()
+        #: 要了结构化输出却没拿到 ``parsed`` 的次数:路由器在里面最多再试 2 次,那几次的 token
+        #: 回包里没有,本地按上限补记。
+        self.unparsed = 0
 
     async def __call__(self, **kwargs: Any) -> Any:
         if self.calls >= self.max_calls:
@@ -264,6 +278,8 @@ class CappedAux:
         self.input_tokens += int(getattr(reply, "input_tokens", 0) or 0)
         self.output_tokens += int(getattr(reply, "output_tokens", 0) or 0)
         self.models.add(str(getattr(reply, "model", "")))
+        if kwargs.get("output_schema") is not None and getattr(reply, "parsed", None) is None:
+            self.unparsed += 1
         return reply
 
 
@@ -312,7 +328,9 @@ async def consolidate(deps: Deps, payload: Mapping[str, Any], emit: Callable[[st
         json.dumps(
             {
                 "op": "consolidate_total",
+                "nonce": payload.get("nonce"),
                 "calls": aux.calls,
+                "unparsed_calls": aux.unparsed,
                 "input_tokens": aux.input_tokens,
                 "output_tokens": aux.output_tokens,
                 "models": sorted(aux.models),
@@ -360,57 +378,184 @@ async def state(deps: Deps, payload: Mapping[str, Any], emit: Callable[[str], No
 # --------------------------------------------------------------------------- 引导与入口
 
 
+# --------------------------------------------------------------------------- 写回用量 / 预检
+
+
+async def writeback_usage(
+    deps: Deps, payload: Mapping[str, Any], emit: Callable[[str], None]
+) -> None:
+    """每个评测用户:带写回的评测智能体在 ``since`` 之后记下的平台开销(后台写回)token,按型号合计。
+    只出数字(审查 H4:本地按它结算写回的预留,不再按上限)。"""
+    since = datetime.fromisoformat(payload["since"])
+    now = datetime.now(UTC)
+    for entry in payload["users"]:
+        tenant_id = UUID(entry["tenant_id"])
+        user_id = await _user_id(deps, tenant_id, entry["user"])
+        with _scope(tenant_id, user_id):
+            rows = await deps.token_usage.list_for_tenant_window(
+                tenant_id=tenant_id, start=since, end=now, user_id=user_id
+            )
+        totals: dict[str, dict[str, int]] = {}
+        for row in rows:
+            if row.usage_kind != PLATFORM_OVERHEAD or row.agent_name != entry["agent_name"]:
+                continue
+            t = totals.setdefault(
+                row.model,
+                {"input_tokens": 0, "output_tokens": 0, "cache_read_tokens": 0, "rows": 0},
+            )
+            t["input_tokens"] += int(row.input_tokens)
+            t["output_tokens"] += int(row.output_tokens)
+            t["cache_read_tokens"] += int(row.cache_read_tokens)
+            t["rows"] += 1
+        emit(
+            json.dumps(
+                {
+                    "op": "writeback_usage",
+                    "key": entry["key"],
+                    "models": [{"model": m, **v} for m, v in sorted(totals.items())],
+                }
+            )
+        )
+
+
+async def preflight(deps: Deps, payload: Mapping[str, Any], emit: Callable[[str], None]) -> None:
+    """评测租户的记忆维护开关(只出开关与数字,审查 M5)。整理(凑簇汇总)**没有按租户的开关**,
+    平台每隔 ``consolidation_interval_s`` 秒扫一轮;记忆清理(``memory_purge_enabled``)与到期复核
+    (``memory_predictive_review_enabled``)有,评测要求这两项都关。"""
+    from control_plane.tenancy import TenantConfigNotConfiguredError
+
+    tenant_id = UUID(payload["tenant_id"])
+    try:
+        with _scope(tenant_id):
+            cfg = await deps.tenant_config.get(tenant_id=tenant_id)
+        purge, min_age, review = (
+            bool(cfg.memory_purge_enabled),
+            int(cfg.memory_purge_min_age_days),
+            bool(cfg.memory_predictive_review_enabled),
+        )
+        configured = True
+    except TenantConfigNotConfiguredError:
+        purge, min_age, review, configured = True, 30, False, False
+    emit(
+        json.dumps(
+            {
+                "op": "preflight",
+                "tenant_configured": configured,
+                "memory_purge_enabled": purge,
+                "memory_purge_min_age_days": min_age,
+                "memory_predictive_review_enabled": review,
+                "consolidation_switch_per_tenant": False,
+                "consolidation_interval_s": deps.consolidation_interval_s,
+                "ok": not purge and not review,
+            }
+        )
+    )
+
+
+def assert_no_background_tasks(*, baseline: set[Any]) -> None:
+    """装配完以后不许有任何后台任务(审查 H1):有就是某个 worker / sweep 起来了 —— 它可能去认领
+    真租户排队的运行或写回任务。直接退出,不往下做。"""
+    current = asyncio.current_task()
+    extra = [t for t in asyncio.all_tasks() if t is not current and t not in baseline]
+    if extra:
+        names = sorted({t.get_name() for t in extra})
+        raise SystemExit(
+            f"b300 in-pod: background task(s) started during bootstrap {names}; stopped"
+        )
+
+
 @contextlib.asynccontextmanager
 async def bootstrap() -> AsyncIterator[Deps]:
-    """控制面进程里的装配:与线上同一套 ``create_app``,不起调度器(不起整理任务、触发器等)。"""
-    from control_plane.app import create_app
+    """控制面进程里的最小装配(审查 H1):**不建 app、不进 lifespan**,所以不会起排队运行 worker、
+    后台写回 worker、写回失败重试、质量监控、知识库恢复、webhook、评测 worker、工作区清理、
+    审批 / 对话镜像 sweep 等任何后台任务。只按 ``create_app`` 同样的取法拼出这几样:存储
+    (``_build_sql_stores``)、密钥库、租户配置、平台凭据与凭据解析、嵌入配置与嵌入、审计、
+    token 用量;整理任务类只在要用时建、从不 ``start()``。装配前后各查一次后台任务。"""
+    import httpx
+
+    from control_plane.app import _build_secret_store, _build_sql_stores
+    from control_plane.audit import TenantConfigPiiResolver, build_default_audit_logger
     from control_plane.aux_model_adapter import make_llm_router_aux_model
+    from control_plane.credential_value_cache import CredentialValueCache
     from control_plane.memory_consolidator import MemoryConsolidator, make_consolidator_embedder
+    from control_plane.platform_embedding_config import PlatformEmbeddingConfigService
+    from control_plane.platform_secrets import PlatformSecretsService
+    from control_plane.runtime import DynamicResolvingEmbedder
+    from control_plane.settings import Settings
+    from control_plane.tenancy import TenantConfigService
+    from control_plane.tenant_secret_overlay import TenantOverlayCredentialsResolver
 
-    app = create_app(enable_reaper=False, enable_scheduler=False, enable_curation_worker=False)
-    async with app.router.lifespan_context(app):
-        st = app.state
-        settings = st.settings
-        missing = [
-            name
-            for name in ("memory_repo", "tenant_user_repo", "run_event_store", "embedder")
-            if getattr(st, name, None) is None
-        ]
-        if missing:
-            raise SystemExit(f"app.state has no {missing}; this release wires them differently")
+    baseline = set(asyncio.all_tasks())
+    settings = Settings()
+    stores = _build_sql_stores(settings)
+    secret_store = _build_secret_store(settings, stores)
+    pii = TenantConfigPiiResolver()
+    audit = build_default_audit_logger(store=stores.audit_log, pii_fields_resolver=pii)
+    ttl = float(settings.tenant_config_cache_ttl_s)
+    tenant_config = TenantConfigService(store=stores.tenant_config, audit_logger=audit, ttl_s=ttl)
+    pii.bind(tenant_config)
+    secrets = PlatformSecretsService(store=stores.platform_secret, settings=settings, ttl_s=ttl)
+    resolver = TenantOverlayCredentialsResolver(
+        tenant_provider_view=secrets.effective_provider_credentials_for,
+        tenant_tool_view=secrets.effective_tool_credentials_for,
+        tenant_provider_keys_view=secrets.effective_provider_secret_refs_for,
+        platform_provider_credentials=settings.effective_platform_provider_credentials,
+        platform_tool_credentials=settings.effective_platform_tool_credentials,
+        tenant_config_getter=tenant_config,
+        platform_provider_getter=secrets.effective_provider_credentials,
+        platform_tool_getter=secrets.effective_tool_credentials,
+    )
+    cache = CredentialValueCache()
+    http = httpx.AsyncClient()
+    embedder = DynamicResolvingEmbedder(
+        config_service=PlatformEmbeddingConfigService(
+            store=stores.platform_embedding_config, settings=settings, ttl_seconds=ttl
+        ),
+        resolver=resolver,
+        secret_store=secret_store,
+        http=http,
+        secret_cache=cache,
+        max_input_bytes=settings.embedding_max_input_bytes,
+    )
 
-        def factory(max_calls: int) -> tuple[Any, CappedAux]:
-            resolver = getattr(st, "credentials_resolver", None)
-            inner = (
-                make_llm_router_aux_model(
-                    resolver=resolver,
-                    secret_store=st.secret_store,
-                    default_provider=settings.memory_consolidator_default_aux_provider,
-                    default_model=settings.memory_consolidator_default_aux_model,
-                    secret_cache=getattr(st, "credential_value_cache", None),
-                )
-                if resolver is not None
-                else None
-            )
-            aux = CappedAux(inner, max_calls)
-            consolidator = MemoryConsolidator(
-                memory_store=st.memory_repo,
-                tenant_config_service=st.tenant_config_service,
-                audit_logger=st.audit_logger,
-                aux_model=aux,
-                embedder=make_consolidator_embedder(st.embedder),
-                default_aux_model_name=settings.memory_consolidator_default_aux_model,
-            )
-            return consolidator, aux
+    def factory(max_calls: int) -> tuple[Any, CappedAux]:
+        inner = make_llm_router_aux_model(
+            resolver=resolver,
+            secret_store=secret_store,
+            default_provider=settings.memory_consolidator_default_aux_provider,
+            default_model=settings.memory_consolidator_default_aux_model,
+            secret_cache=cache,
+        )
+        aux = CappedAux(inner, max_calls)
+        consolidator = MemoryConsolidator(
+            memory_store=stores.memory,
+            tenant_config_service=tenant_config,
+            audit_logger=audit,
+            aux_model=aux,
+            embedder=make_consolidator_embedder(embedder),
+            default_aux_model_name=settings.memory_consolidator_default_aux_model,
+            # 与线上同样落 token_usage(usage_kind = memory_consolidation)。
+            usage_store=stores.token_usage,
+        )
+        return consolidator, aux
 
+    assert_no_background_tasks(baseline=baseline)
+    try:
         yield Deps(
-            memory=st.memory_repo,
-            users=st.tenant_user_repo,
-            run_events=st.run_event_store,
-            embedder=st.embedder,
+            memory=stores.memory,
+            users=stores.tenant_user,
+            run_events=stores.run_event,
+            embedder=embedder,
             consolidator_factory=factory,
             consolidation_model=settings.memory_consolidator_default_aux_model,
+            token_usage=stores.token_usage,
+            tenant_config=tenant_config,
+            consolidation_interval_s=float(settings.memory_consolidator_interval_s),
         )
+        assert_no_background_tasks(baseline=baseline)
+    finally:
+        await http.aclose()
+        await stores.engine.dispose()
 
 
 _HANDLERS = {
@@ -419,6 +564,8 @@ _HANDLERS = {
     "candidates": candidates,
     "consolidate": consolidate,
     "state": state,
+    "writeback_usage": writeback_usage,
+    "preflight": preflight,
 }
 
 

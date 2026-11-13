@@ -63,10 +63,11 @@ async def test_transport_reserves_then_settles_by_usage() -> None:
 
     guard = _guard()
     async with _client(handler) as http:
-        t = live.ChatTransport("mem", "https://v", "k", guard, http, 500)
+        t = live.ChatTransport("mem", "https://v", "k", guard, http, 500, provider="deepseek")
         text, usage = await t.complete([{"role": "user", "content": "hi"}], item="i", phase="p")
     assert text == "ok" and usage["prompt_tokens"] == 1_000_000
     assert guard.settled == pytest.approx(1.0 + 0.4)
+    assert "exceeded its cap" in (guard.blocked or "")  # 实际超过了这一下的上限:停下
     assert seen[0]["max_tokens"] == 500 and seen[0]["model"] == "mem"
 
 
@@ -84,7 +85,7 @@ async def test_transport_rate_limit_then_error_blocks(monkeypatch: pytest.Monkey
 
     monkeypatch.setattr(live, "_sleep", no_sleep)
     async with _client(handler) as http:
-        t = live.ChatTransport("mem", "https://v", "k", guard, http, 500)
+        t = live.ChatTransport("mem", "https://v", "k", guard, http, 500, provider="deepseek")
         with pytest.raises(SpendStopError):
             await t.complete([{"role": "user", "content": "hi"}], item="i", phase="p")
     assert "HTTP 500" in (guard.blocked or "")
@@ -98,7 +99,7 @@ async def test_transport_missing_usage_blocks() -> None:
     async with _client(
         lambda r: httpx.Response(200, json={"choices": [{"message": {"content": "x"}}]})
     ) as http:
-        t = live.ChatTransport("mem", "https://v", "k", guard, http, 500)
+        t = live.ChatTransport("mem", "https://v", "k", guard, http, 500, provider="deepseek")
         with pytest.raises(SpendStopError):
             await t.complete([{"role": "user", "content": "hi"}], item="i", phase="p")
     assert "no usage" in (guard.blocked or "")
@@ -145,7 +146,9 @@ async def test_run_extraction_end_to_end_with_fakes() -> None:
 
     guard = _guard()
     async with _client(handler) as http:
-        transport = live.ChatTransport("mem", "https://v", "k", guard, http, 500)
+        transport = live.ChatTransport(
+            "mem", "https://v", "k", guard, http, 500, provider="deepseek"
+        )
         result = await live.run_extraction(
             scenario, transport=transport, embedder=KeywordEmbedder(), item="u1", phase="a"
         )
@@ -240,10 +243,11 @@ async def test_run_conversation_without_end_cancels_and_charges_the_cap() -> Non
     assert guard.blocked is not None
 
 
-def test_writeback_is_charged_at_the_cap() -> None:
+def test_writeback_is_reserved_not_settled() -> None:
     guard = _guard()
-    live.charge_writeback(guard, item="k", model="mem", phase="c4")
-    assert guard.settled == pytest.approx(live.writeback_cap_yuan(PRICES["mem"]))
+    live.reserve_writeback(guard, item="k", model="mem", phase="c4")
+    assert guard.settled == 0
+    assert guard.spent == pytest.approx(live.writeback_cap_yuan(PRICES["mem"]))
 
 
 @pytest.mark.asyncio
@@ -251,7 +255,10 @@ async def test_judge_votes_and_majority() -> None:
     answers = iter(['{"answer": "yes"}', '{"answer": "no"}', "garbage"])
     guard = _guard()
     async with _client(lambda r: _chat(next(answers))) as http:
-        judge = live.Judge(live.ChatTransport("mem", "https://j", "k", guard, http, 200), votes=3)
+        judge = live.Judge(
+            live.ChatTransport("mem", "https://j", "k", guard, http, 200, provider="deepseek"),
+            votes=3,
+        )
         votes = await judge.vote("prompt", item="i", phase="p")
     assert votes == [True, False, None]
     assert live.majority(votes) is None

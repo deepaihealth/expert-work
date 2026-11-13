@@ -59,6 +59,28 @@ PHASES: dict[str, Phase] = {
 }
 
 
+#: 记账用的 phase → 分预算的段(审查 M4,先后 B → C → A,见 ``b300_plan.BUDGET_ORDER``)。
+PHASE_BUDGET = {
+    "b": "B",
+    "b-screen": "B",
+    "calibration": "B",
+    "c": "C",
+    "c4": "C",
+    "c5": "C",
+    "c2-baseline": "C",
+    "c4-baseline": "C",
+    "c5-baseline": "C",
+    "a": "A",
+    "compare-before": "A",
+    "compare-after": "A",
+    "calibration-a": "A",
+}
+
+
+def budget_of(phase: str, *, pilot: bool = False) -> str:
+    return "pilot" if pilot else PHASE_BUDGET.get(phase, "B")
+
+
 def scenarios_for(phase: Phase) -> list[sc.Scenario]:
     if phase.classes == ("D",):
         return sc.build_compare()
@@ -94,12 +116,28 @@ def user_name(
     return f"b300-{quote_id[:6]}-{phase}-{scenario_id}{who}-r{repeat}-a{attempt}".lower()
 
 
+def pilot_scenarios(phase: Phase) -> list[sc.Scenario]:
+    """试点每段 :data:`b300_plan.PILOT_UNITS_PER_PHASE` 个场景:尽量取不同的类,各取第一个。"""
+    rows = scenarios_for(phase)
+    firsts = [next(s for s in rows if s.cls == cls) for cls in dict.fromkeys(s.cls for s in rows)]
+    picked = firsts[: plan.PILOT_UNITS_PER_PHASE]
+    for s in rows:  # 只有一类的段(C4 / C5 / 对比)补同类的下一个
+        if len(picked) >= plan.PILOT_UNITS_PER_PHASE:
+            break
+        if s not in picked:
+            picked.append(s)
+    return picked
+
+
 def build_units(phase: Phase, q: Mapping[str, Any]) -> list[dict[str, Any]]:
-    """一段的全部单元(第 0 次尝试)。C5 的种子 / 整理按用户(场景 x 次),不分家;提问分家。"""
+    """一段的全部单元(第 0 次尝试)。C5 的种子 / 整理按用户(场景 x 次),不分家;提问分家。
+    试点报价(``q["pilot"]``)只取 :func:`pilot_scenarios`、一家、每个 1 次。"""
     units = []
-    for s in scenarios_for(phase):
-        for repeat in range(plan.REPEATS):
-            for vendor in vendors_for_class(phase, s.cls, q):
+    pilot = bool(q.get("pilot"))
+    for s in pilot_scenarios(phase) if pilot else scenarios_for(phase):
+        for repeat in range(1 if pilot else plan.REPEATS):
+            vendors = [q["single_vendor"]] if pilot else vendors_for_class(phase, s.cls, q)
+            for vendor in vendors:
                 shared = phase.kind == "c5"
                 units.append(
                     {
@@ -227,6 +265,26 @@ def users_payload(
     return {"op": op, "users": users, **extra}
 
 
+def writeback_usage_payload(
+    units: Sequence[Mapping[str, Any]], tenant_id: str, since: str
+) -> dict[str, Any]:
+    """C4 的带写回对话之后:每个评测用户的后台写回实际用量(审查 H4)。"""
+    users, seen = [], set()
+    for u in units:
+        if u["user"] in seen:
+            continue
+        seen.add(u["user"])
+        users.append(
+            {
+                "key": u["user"],
+                "tenant_id": tenant_id,
+                "user": u["user"],
+                "agent_name": agent_code(u["vendor"], writeback=True),
+            }
+        )
+    return {"op": "writeback_usage", "since": since, "users": users}
+
+
 def recalled_payload(out: Path, phase: str, tenant_id: str) -> dict[str, Any]:
     run_ids = [
         c["run_id"]
@@ -280,14 +338,36 @@ def write_meta(out: Path, phase: Phase, meta: Mapping[str, Any]) -> None:
     path.write_text(json.dumps(meta, indent=2, ensure_ascii=False), encoding="utf-8")
 
 
-def calibration_ok(out: Path) -> bool:
-    path = out / "calibration.json"
+def calibration_path(out: Path, which: str) -> Path:
+    """两套校准(审查 M3):``b`` = B / C 组回答(3 票);``a`` = A 组提炼(按报价的 A 组票数)。"""
+    return out / ("calibration.json" if which == "b" else "calibration-a.json")
+
+
+def calibration_ok(out: Path, which: str = "b", *, votes: int | None = None) -> bool:
+    path = calibration_path(out, which)
     if not path.exists():
         return False
     data = json.loads(path.read_text(encoding="utf-8"))
     return (
         data.get("judge_model") == plan.JUDGE_MODEL
+        and (votes is None or int(data.get("votes", 0)) == votes)
         and int(data.get("agree", 0)) >= plan.CALIBRATION_MIN_AGREE
+    )
+
+
+def record_approval(out: Path, *, cmd: str, quote_id: str, user_said: str | None) -> None:
+    """用户在 ``stop_and_ask`` 时说「跑」的原话,每个花钱的命令都记一行(审查 LOW)。"""
+    if not user_said:
+        return
+    out.mkdir(parents=True, exist_ok=True)
+    append_jsonl(
+        out / "approvals.jsonl",
+        {
+            "cmd": cmd,
+            "quote_id": quote_id,
+            "user_said": user_said,
+            "at": datetime.now(UTC).isoformat(),
+        },
     )
 
 

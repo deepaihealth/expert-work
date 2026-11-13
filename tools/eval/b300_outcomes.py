@@ -71,6 +71,10 @@ def judge_items(out: Path, phase: Phase) -> tuple[list[rep.JudgeItem], dict[str,
             )
         if phase.kind == "c5":
             cand = candidates.get(r["user"])
+            if cand and cand.get("already_consolidated"):
+                # 平台的定时整理在我们这一步之前就整理过了(没有按租户的开关,审查 M5):前提不成立。
+                info["precondition"] = False
+                info["consolidated_before"] = True
             info.update(
                 rep.c5_region_in_candidates(r.get("seed_ids", {}), cand["clusters"]) if cand else {}
             )
@@ -171,6 +175,10 @@ def _c5_summaries(
     for key, info in facts.items():
         r = records[key]
         if r["user"] in seen or not info.get("state_known"):
+            continue
+        if info.get("consolidated_before"):
+            seen.add(r["user"])
+            counts["c5_consolidated_before_our_step"] += 1
             continue
         seen.add(r["user"])
         counts["x_in_candidates"] += bool(info.get("x_in_candidates"))

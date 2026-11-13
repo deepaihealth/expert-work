@@ -1,6 +1,6 @@
 """B-300 设计里平台文字的 token 数(设计 §4.4、§5.2:「token 数是用 ``o200k_base`` 对草稿文字估的,
-脚本 PR 1 入库」)。不调模型、不连网(``tiktoken`` 的 ``o200k_base`` 词表要在本机缓存里;没有就报错,
-不退回按字数估)。
+脚本 PR 1 入库」)。不调模型。**注意联网**:``tiktoken`` 第一次用 ``o200k_base`` 时会去下载词表;
+要完全离线,先把 ``TIKTOKEN_CACHE_DIR`` 指到已缓存词表的目录。拿不到词表就报错,不退回按字数估。
 
     python tools/eval/b300_tokens.py                       # 设计文档里的每个 ```text 块
     python tools/eval/b300_tokens.py --file a.txt --file b.txt

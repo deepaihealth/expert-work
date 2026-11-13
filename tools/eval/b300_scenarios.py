@@ -73,6 +73,11 @@ C_CLASSES = ("C1", "C2", "C3", "C4", "C5")
 SCENARIOS_PER_CLASS = {"A": 10, "B": 10, "C": 5}
 #: A12 每段对话写回几次(§8.2「同一对话连写 5 轮」)。
 A12_ROUNDS = 5
+#: 场景按序号轮着用的语言(审查 LOW:配比做成一个看得见的常量,报价里打印出来由用户定)。现在是中、英
+#: 各一半;两种都要留(量「记忆跟随用户的语言」)。
+LANG_CYCLE: tuple[str, ...] = ("zh", "en")
+#: 种子最老几天(审查 M5):平台整理只看 30 天内的、记忆清理按 30 天起算,种子要离 30 天留足余量。
+MAX_SEED_DAYS_AGO = 20
 
 
 @dataclass(frozen=True)
@@ -286,7 +291,7 @@ def build_b(cls: str, fact: Fact, lang: str, index: int) -> Scenario:
     elif cls == "B5":
         answered = _fmt(lang, "answered", topic=t.topic, s=t.short_y)
         seeds = (
-            Seed("x", "fact", t.memory_x, "user_stated", 0.9, 30),
+            Seed("x", "fact", t.memory_x, "user_stated", 0.9, MAX_SEED_DAYS_AGO),
             Seed("y", "fact", answered, "assistant_derived", 0.6, 3),
         )
         convo = Turn(t.ask)
@@ -410,7 +415,7 @@ def build_group(group: str) -> list[Scenario]:
     out: list[Scenario] = []
     for ci, cls in enumerate(classes_of(group)):
         for i, fact in enumerate(_facts_for(group, ci)):
-            lang = LANGS[(ci + i) % len(LANGS)]
+            lang = LANG_CYCLE[(ci + i) % len(LANG_CYCLE)]
             out.append(_BUILDERS[group](cls, fact, lang, i))
     return out
 

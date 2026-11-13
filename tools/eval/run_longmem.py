@@ -209,7 +209,9 @@ async def _run_endtoend(args: argparse.Namespace) -> None:
         embedder=embedder,  # type: ignore[arg-type]
         llm_caller=llm_caller,
         judge=judge,
-        config=EndToEndConfig(reconcile=not args.no_reconcile),
+        config=EndToEndConfig(
+            reconcile=not args.no_reconcile, expect_user_text=args.expect_user_text
+        ),
         done_ids=done_ids,
         on_result=lambda r: asyncio.to_thread(append_result, results_path, r),
         concurrency=args.concurrency,
@@ -265,6 +267,11 @@ def main() -> None:
     parser.add_argument("--top-k", type=int, default=None, help="override arm top_k")
     parser.add_argument("--results", default="eval-out/longmem_results.jsonl")
     parser.add_argument("--no-reconcile", action="store_true")
+    parser.add_argument(
+        "--expect-user-text",
+        action="store_true",
+        help="B-300: fail if the extraction entry has no explicit user-text parameter",
+    )
     parser.add_argument(
         "--llm-provider",
         default="openai-compat",

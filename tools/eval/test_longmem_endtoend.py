@@ -305,6 +305,12 @@ def test_user_text_kwargs_declares_the_corpus_as_user_text() -> None:
 
     assert user_text_kwargs(new_entry, [session]) == {USER_TEXT_PARAM: [session]}
     assert user_text_kwargs(old_entry, [session]) == {}
+    # B-300 的跑法要求有这个入口:没有就报错,不悄悄跳过(审查 M2)。
+    from longmem.endtoend import MissingUserTextEntryError
+
+    with pytest.raises(MissingUserTextEntryError, match=USER_TEXT_PARAM):
+        user_text_kwargs(old_entry, [session], required=True)
+    assert user_text_kwargs(new_entry, [session], required=True) == {USER_TEXT_PARAM: [session]}
 
 
 @pytest.mark.asyncio

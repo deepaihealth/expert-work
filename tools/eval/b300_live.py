@@ -37,7 +37,7 @@ if str(_HERE) not in sys.path:
     sys.path.insert(0, str(_HERE))
 
 import b300_scenarios as sc  # noqa: E402
-from b300_spend import Guard, SpendStopError, call_cap_yuan  # noqa: E402
+from b300_spend import Guard, SpendStopError, call_cap_yuan, usage_cost  # noqa: E402
 from b301_plan import Price  # noqa: E402
 from b302_live import TurnCollector  # noqa: E402
 from behavior_client import SseParser, content_type_for  # noqa: E402
@@ -113,6 +113,8 @@ class ChatTransport:
     guard: Guard
     http: httpx.AsyncClient
     max_tokens: int
+    #: 厂商(glm / deepseek / qwen / doubao):决定关思考与输出上限的字段(审查 H2)。
+    provider: str = ""
 
     async def complete(
         self, messages: list[dict[str, str]], *, item: str, phase: str, json_mode: bool = False
@@ -122,8 +124,8 @@ class ChatTransport:
         body: dict[str, Any] = {
             "model": self.model,
             "messages": messages,
-            "max_tokens": self.max_tokens,
             "temperature": 0.0,
+            **request_fields(self.provider, self.model, max_tokens=self.max_tokens),
         }
         if json_mode:
             body["response_format"] = {"type": "json_object"}
@@ -180,6 +182,20 @@ class ChatTransport:
         raise SpendStopError(f"{item}: still rate limited after retries")
 
 
+def request_fields(provider: str, model: str, *, max_tokens: int) -> dict[str, Any]:
+    """与产品同一套「关思考 + 输出上限」字段(``agent_factory.thinking_off_request_fields``:
+    记忆调用关思考,B-168;qwen / 豆包的上限字段是 ``max_completion_tokens``)。目录里没有思考
+    开关的型号(如 glm-5.3-flash 始终思考)按目录给的最低档。不认识的厂商不发。"""
+    if not provider:
+        raise ValueError(f"no provider for {model}: the request fields depend on it")
+    from orchestrator.agent_factory import thinking_off_request_fields
+
+    fields = dict(thinking_off_request_fields(provider, model, max_tokens=max_tokens))
+    if "max_tokens" not in fields and "max_completion_tokens" not in fields:
+        fields["max_tokens"] = max_tokens
+    return fields
+
+
 # --------------------------------------------------------------------------- A 组提炼
 
 
@@ -191,6 +207,9 @@ class GuardedCaller:
     item: str
     phase: str
     calls: list[dict[str, Any]] = field(default_factory=list)
+    #: 失败的调用(审查 M1):产品的写回入口会把提炼 / 去重合并里的异常吞掉、照常返回,这里记下,
+    #: 由 :func:`run_extraction` 把这一条判为出错。
+    failures: list[str] = field(default_factory=list)
 
     async def __call__(
         self, *, messages: Sequence[Any], tools: Sequence[Any] = (), **_: Any
@@ -204,9 +223,13 @@ class GuardedCaller:
         )
         system = "\n".join(m["content"] for m in payload["messages"] if m["role"] == "system")
         kind = classify_call(system)
-        text, usage = await self.transport.complete(
-            payload["messages"], item=f"{self.item}|{kind}", phase=self.phase
-        )
+        try:
+            text, usage = await self.transport.complete(
+                payload["messages"], item=f"{self.item}|{kind}", phase=self.phase
+            )
+        except BaseException as exc:
+            self.failures.append(f"{kind}: {exc!r}")
+            raise
         self.calls.append(
             {
                 "kind": kind,
@@ -321,6 +344,10 @@ async def run_extraction(
             reconcile=True,
             agent_name=A_AGENT,
         )
+        if caller.failures or transport.guard.blocked:
+            if transport.guard.blocked:
+                raise SpendStopError(transport.guard.blocked)
+            raise RuntimeError(f"model call failed inside the writeback: {caller.failures}")
         rounds.append(
             {
                 "after_turn": index,
@@ -463,17 +490,51 @@ async def run_conversation(
         "final_text": final,
         "status": (collector.end or {}).get("status"),
         "usage_by_model": usage,
+        # 试点量 token 用:每步的输入 token(``usage_metadata``)与步数。
+        "steps": len(collector.steps),
+        "step_input_tokens": list(collector.input_tokens),
         "wall_s": round(time.monotonic() - started, 1),
     }
 
 
-def charge_writeback(guard: Guard, *, item: str, model: str, phase: str) -> None:
-    """带写回的智能体每跑一次,后台写回按上限预留并结算(对外看不到它的用量,§4.4)。"""
+def reserve_writeback(guard: Guard, *, item: str, model: str, phase: str) -> str:
+    """带写回的智能体每跑一次,先按上限给后台写回预留(对外看不到它的用量,§4.4),**不结算**;
+    之后由 pod 里 ``writeback_usage`` 读出的实际用量结算(:func:`settle_writebacks`)。"""
     cap = writeback_cap_yuan(guard.prices[model])
-    call_id = guard.reserve(item=f"{item}|writeback", model=model, cap=cap, phase=phase)
-    guard.settle_cap(
-        call_id, item=f"{item}|writeback", model=model, phase=phase, reason="cap_unobservable"
-    )
+    return guard.reserve(item=f"{item}|writeback", model=model, cap=cap, phase=phase)
+
+
+def settle_writebacks(
+    guard: Guard,
+    call_ids: Sequence[str],
+    usage_by_model: Sequence[Mapping[str, Any]] | None,
+    *,
+    phase: str,
+) -> float:
+    """一个评测用户的全部写回预留按 ``token_usage`` 里的实际用量结算(平台开销行,只有数字);
+    读不到(``None``)才按上限。实际用量记在第一笔上,其余记 0。"""
+    if not call_ids:
+        return 0.0
+    if usage_by_model is None:
+        return sum(
+            guard.settle_cap(c, item="writeback", model="", phase=phase, reason="cap_unreadable")
+            for c in call_ids
+        )
+    try:
+        remaining = usage_cost(usage_by_model, guard.prices)
+    except KeyError as exc:
+        guard.block(f"writeback usage has a model without a price: {exc}")
+        return sum(
+            guard.settle_cap(c, item="writeback", model="", phase=phase, reason="cap_no_price")
+            for c in call_ids
+        )
+    total = 0.0
+    for n, call_id in enumerate(call_ids):  # 按各笔上限依次分摊,最后一笔拿余数
+        last = n == len(call_ids) - 1
+        cost = remaining if last else min(remaining, guard.open_cap(call_id))
+        remaining -= cost
+        total += guard.settle(call_id, item="writeback", model="", phase=phase, cost=cost)
+    return total
 
 
 # --------------------------------------------------------------------------- 判官
@@ -492,15 +553,25 @@ class Judge:
 
     async def vote(self, prompt: str, *, item: str, phase: str) -> list[bool | None]:
         """``votes`` 次独立判;每票 ``True`` / ``False``,解析不了记 ``None``。"""
-        out: list[bool | None] = []
+        return [v for v, _u in await self.vote_with_usage(prompt, item=item, phase=phase)]
+
+    async def vote_with_usage(
+        self, prompt: str, *, item: str, phase: str
+    ) -> list[tuple[bool | None, dict[str, int]]]:
+        """同 :meth:`vote`,另带每票的 token(试点量 token 用)。"""
+        out: list[tuple[bool | None, dict[str, int]]] = []
         for n in range(self.votes):
-            text, _usage = await self.transport.complete(
+            text, usage = await self.transport.complete(
                 [{"role": "system", "content": JUDGE_SYSTEM}, {"role": "user", "content": prompt}],
                 item=f"{item}|v{n}",
                 phase=phase,
                 json_mode=True,
             )
-            out.append(parse_vote(text))
+            tokens = {
+                "input_tokens": int(usage.get("prompt_tokens") or 0),
+                "output_tokens": int(usage.get("completion_tokens") or 0),
+            }
+            out.append((parse_vote(text), tokens))
         return out
 
 
