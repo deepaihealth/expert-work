@@ -146,6 +146,15 @@ def scope_hidden_heads(scope: str) -> frozenset[str]:
     return frozenset()
 
 
+def scope_hidden_files(scope: str) -> frozenset[str]:
+    """B-300 —— 作用域根下**不列出、不搜**的普通文件名:只有委派子代的两档有(旧记忆投影
+    ``MEMORY.md``)。主智能体各档为空 —— NAS 遍历根下的文件从来不按 :func:`scope_hidden_heads`
+    过滤,主智能体的结果一个字不变。"""
+    if scope.startswith((SCOPE_AGENT_CHILD_PREFIX, SCOPE_AGENT_CONVERSATION_CHILD_PREFIX)):
+        return frozenset({MEMORY_PROJECTION_FILE})
+    return frozenset()
+
+
 def _safe_key(scope: str, key: str) -> str:
     try:
         require_safe_key(key)

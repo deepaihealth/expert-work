@@ -267,6 +267,51 @@ async def test_a_delegated_runs_search_cannot_tell_whether_the_projection_matche
     assert "MEMORY.md" not in " ".join(with_match.meta["paths"])
 
 
+@pytest.mark.parametrize(
+    ("layout", "expected"), [("conversation", ["/agent/threads"]), ("agent_root", ["threads"])]
+)
+async def test_the_main_runs_search_still_finds_a_root_file_named_like_a_hidden_dir(
+    tmp_path: Path, layout: str, expected: list[str]
+) -> None:
+    """主智能体的结果一个字不变:根下一个**普通文件**名叫 ``threads``(``scope_hidden_heads``
+    只藏同名目录),照旧搜得到。只有委派子代的作用域才按文件名藏东西。"""
+    agent = _agent_root(tmp_path)
+    agent.mkdir(parents=True)
+    (agent / "threads").write_text("needle")
+    found = await SearchFilesTool(store=NasWorkspaceStore(root=str(tmp_path))).call(
+        {"content": "needle"}, ctx=_parent(layout)
+    )
+    assert found.meta["paths"] == expected
+
+
+@pytest.mark.parametrize("layout", ["conversation", "agent_root"])
+async def test_every_backend_leaves_the_root_projection_out_of_a_childs_listing(
+    tmp_path: Path, layout: str
+) -> None:
+    """``list_files`` 在委派子代的作用域上:NAS 与只有扁平清单的后端(``scope_view``)一样,
+    都不列根下的 ``MEMORY.md``;主智能体的作用域照旧列。"""
+    from orchestrator.tools.file_ops import _store_scope
+    from orchestrator.tools.sandbox_image_contract import AGENT_VIEW
+    from orchestrator.tools.workspace_store import RecordingWorkspaceStore, WorkspaceFileEntry
+
+    nas = _plant(tmp_path)
+    (_agent_root(tmp_path) / "style.md").write_text("s")
+    flat = RecordingWorkspaceStore(
+        workspace_files=[
+            WorkspaceFileEntry(path=f"agents/{_KEY}/{name}", size=1)
+            for name in ("MEMORY.md", "style.md")
+        ]
+    )
+    child_scope = _store_scope(AGENT_VIEW, _child(layout))
+    parent_scope = _store_scope(AGENT_VIEW, _parent(layout))
+    for store in (nas, flat):
+        child = await store.list_files(tenant_id=_TENANT, user_id=_USER, scope=child_scope)
+        parent = await store.list_files(tenant_id=_TENANT, user_id=_USER, scope=parent_scope)
+        assert "MEMORY.md" not in [e.path for e in child], type(store).__name__
+        assert "style.md" in [e.path for e in child], type(store).__name__
+        assert "MEMORY.md" in [e.path for e in parent], type(store).__name__
+
+
 async def test_a_delegated_runs_search_finds_its_own_conversation_memory_file(
     tmp_path: Path,
 ) -> None:

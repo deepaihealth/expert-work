@@ -190,6 +190,7 @@ from orchestrator.tools.sandbox import (
 from orchestrator.tools.workspace_scope import (
     SCOPE_USER_ROOT,
     normalize_workspace_path,
+    scope_hidden_files,
     scope_hidden_heads,
     scope_parts,
     scoped_dir,
@@ -544,6 +545,7 @@ def _walk_and_match(
     content: str | None,
     max_results: int,
     hidden: frozenset[str] = frozenset(),
+    hidden_files: frozenset[str] = frozenset(),
 ) -> WorkspaceSearchResult:
     """The body of :meth:`NasWorkspaceStore.search_files` — walk under ``dfd``, match, cap.
 
@@ -595,9 +597,9 @@ def _walk_and_match(
                     # B-236 —— 作用域根下藏起来的首段(``agent_shared`` 的 ``threads/``)
                     # 连走都不走进去:别的对话的文件不该出现在任何一条结果里。
                     dirnames[:] = [d for d in dirnames if d not in hidden]
-                    # B-300 —— 首段也可以是根下的文件(委派子代的旧记忆投影 ``MEMORY.md``):
-                    # 不读、不占命中名额,结果与它不存在时一样。
-                    filenames = [f for f in filenames if f not in hidden]
+                    # B-300 —— 委派子代根下藏起来的文件(旧记忆投影 ``MEMORY.md``):不读、
+                    # 不占命中名额,结果与它不存在时一样。主智能体的作用域没有这一项。
+                    filenames = [f for f in filenames if f not in hidden_files]
                 if dirnames and _walk_depth(dirpath) >= MAX_WALK_DEPTH:
                     # review 9 —— 再往下不走:fwalk 每深一层多握一个目录 fd。结果标成 ``too_deep``
                     # (review 10 起与 ``truncated`` 分开;也不在这里停整个遍历,别的分支照搜)。
@@ -1196,6 +1198,7 @@ class NasWorkspaceStore:
                 return WorkspaceFileListing()
             entries: list[WorkspaceFileEntry] = []
             hidden = scope_hidden_heads(scope)
+            hidden_files = scope_hidden_files(scope)
             # fwalk + follow_symlinks=False —— 见模块 docstring:子目录先 lstat 再
             # 开、开出来的 fd 与 lstat 不是同一个 inode 就跳过, 被换成 symlink 的
             # 目录名因此走不出去。os.walk 是先 islink 后按名字列, 中间那段空隙就是
@@ -1214,6 +1217,9 @@ class NasWorkspaceStore:
                         if dirpath == "." and hidden:
                             # B-236 —— ``agent_shared`` 不列各对话自己的 ``threads/``。
                             dirnames[:] = [d for d in dirnames if d not in hidden]
+                        if dirpath == "." and hidden_files:
+                            # B-300 —— 委派子代不列根下的旧记忆投影(与 ``scope_view`` 一致)。
+                            filenames = [f for f in filenames if f not in hidden_files]
                         if dirnames and _walk_depth(dirpath) >= MAX_WALK_DEPTH:
                             # review 9 —— 再往下不走(fwalk 每深一层多握一个目录 fd),记一条日志。
                             dirnames[:] = []
@@ -1352,6 +1358,7 @@ class NasWorkspaceStore:
                     content=content,
                     max_results=max_results,
                     hidden=scope_hidden_heads(scope),
+                    hidden_files=scope_hidden_files(scope),
                 )
             finally:
                 os.close(dfd)

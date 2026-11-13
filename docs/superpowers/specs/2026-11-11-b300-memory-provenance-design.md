@@ -549,7 +549,7 @@ B-300 合并时同步改 B-176 设计 §6.3 ③ 与计划 M2-2,随 ROADMAP 销�
 | `tools/eval/` | §8 的 A / B / C 组与对比脚本、计数脚本、token 计数脚本;`longmem/endtoend.py:144` 改用显式入口 |
 | 并入项(11-13) | `graph_builder/memory.py`:D3 的输入上限与计数、G9 读时复核带日期、D7 草稿不写、子智能体不召回、D12 计数口径;`graph_builder/builder.py`:D5 前半把加频次分挪到预算截断之后;`memory_consolidator.py`:G9 到期复核带日期;`agent_factory.py`:召回节点拿到注入预算与 token 估算器(D5 前半);`api/runs.py`:D7 的草稿标记;D7 删掉的本轮内写回标记还连着常量定义 `orchestrator/graph_builder/_config.py:53`、包导出 `orchestrator/__init__.py:60,173`,以及测试 `services/control-plane/tests/test_spawn_run_supersede.py:316-330`、`services/orchestrator/tests/test_memory_nodes.py:839-845`;`orchestrator/tools/subagent.py`、`tools/assembly.py`:委派工具 `task` 参数说明按主智能体是否开记忆加一句;子运行读不到记忆投影文件:`tools/workspace_paths.py`、`tools/file_ops.py`(含 `search_files`)、`tools/exec_view.py`、`tools/agent_sandbox.py`(传子运行标记)、`infra/sandbox-image/runner.py`(逐字副本)与本地沙箱镜像重建、`services/orchestrator/tests/test_sandbox_runtime_contract.py`;对应测试 |
 
-**11-13 调整**:子运行读不到记忆投影文件、委派工具那句话、子智能体不召回三项从 PR 1 挪出,单独一个 PR(第 2 条线);子智能体不召回接在 `agent_factory.py` 建召回节点处,上表里 `graph_builder/memory.py` 的「子智能体不召回」不再由 PR 1 做。
+**11-13 调整**:子运行读不到记忆投影文件、委派工具那句话、子智能体不召回三项从 PR 1 挪出,单独一个 PR(第 2 条线);子智能体不召回接在 `agent_factory.py` 建召回节点处,上表里 `graph_builder/memory.py` 的「子智能体不召回」不再由 PR 1 做。**「子智能体不写」(子运行不写长期记忆)仍归 PR 1,别漏**:现在 `graph_builder/memory.py` 的写回不看 `child_run`。
 
 ### 9.2 PR 2 —— ②(改表)
 
@@ -772,7 +772,7 @@ T17、T20 随第 2 条线的 PR 跑(11-13 从 PR 1 挪出)。**T20 必须在云�
 **11-13 调整(第 2 条线)**:
 - 「子运行读不到记忆投影文件」「委派工具那句话」「子智能体不召回」三项从 PR 1 挪到单独的第 2 条线 PR(用户「四条线都开」)。子智能体不召回接在 `agent_factory.py` 建召回节点的地方(读到 `child_run` 直接返回),不动 `graph_builder/memory.py`;子智能体不写仍归 PR 1。
 - 实现与上表的一处出入:对话视图里子运行的执行视图放回 `threads/<对话>/work`(就是它自己的 `/workspace`)。平台给子运行落的渲染页、超长结果都经 `/agent/threads/<对话>/work/…` 写,整个盖住会把这些弄坏;投影 `MEMORY.md`、`PLAN.md` 仍看不到。
-- 没绑智能体的视图(没有 `agent_key`)不在范围内:没有 agent 根,也就没有投影。建 run 的各入口(`api/runs.py` 两处、`run_queue_worker`、`trigger_firing`、`orphan_sweep`、`skill_evolution_wiring`)都写了 `agent_key`,子运行沿用父的;没绑的只有单测与合成评测。
+- 没绑智能体的视图(没有 `agent_key`)不在范围内。这种视图里 `/agent` 与 `/workspace` 都是整个用户根,投影照样写在用户根下的 `threads/<线程>/MEMORY.md`,本项没有为它堵。不做的理由:建 run 的各入口(`api/runs.py` 两处、`run_queue_worker`、`trigger_firing`、`orphan_sweep`、`skill_evolution_wiring`)都写了 `agent_key`,子运行沿用父的;没绑的只有单测与合成评测,线上不会出现。
 
 ### 13.3 PR 2
 
