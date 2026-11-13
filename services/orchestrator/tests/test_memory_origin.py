@@ -335,7 +335,8 @@ async def test_user_stated_candidate_may_update_a_user_memory() -> None:
     store = InMemoryMemoryStore()
     target = await _seed(store, "old words", origin="user_stated")
     llm = _LLM(
-        user_reply=_reply({"kind": "fact", "content": "new words"}),
+        # 用户 11-14 —— 置信度不低于目标(0.8)才可以;更低的见 test_memory_lower_confidence_guard。
+        user_reply=_reply({"kind": "fact", "content": "new words", "confidence": 0.8}),
         ops_reply=_ops("UPDATE", target.id),
     )
     await _flush(llm, store, _ReportingEmbedder({"new words": _NEAR_EAST}), reconcile=True)
@@ -571,7 +572,7 @@ class _GoneTargetStore(InMemoryMemoryStore):
 
 async def test_written_counts_reconciled_adds() -> None:
     store = InMemoryMemoryStore()
-    await _seed(store, "old", origin=None)
+    _ = await _seed(store, "old", origin=None)
     llm = _LLM(user_reply=_reply({"kind": "fact", "content": "cand"}), ops_reply=_ops("ADD"))
     written, _ = await _flush(llm, store, _ReportingEmbedder({"cand": _NEAR_EAST}), reconcile=True)
     assert written == 1

@@ -116,6 +116,30 @@ class UserSideTargetError(RuntimeError):
     调用方按拦截规则处理(被拦的更新带更正 → 按新增,否则丢弃;被拦的删除 → 不动)。"""
 
 
+class UserSideHigherConfidenceError(UserSideTargetError):
+    """B-300 用户 11-14 —— ``refuse_user_side_above``:锁里重读的目标是用户一方的、且它此刻的
+    置信度高于调用方给的值(候选的置信度):什么都没改。是 :class:`UserSideTargetError` 的子类,
+    同一条处理路径接得住;调用方据类型分开计数。"""
+
+
+async def refuse_if_user_side(
+    row: MemoryItem, load: MemberLoader, *, refuse: bool, above: float | None
+) -> None:
+    """两个存储实现在行锁里共用的重判(行已由调用方锁住 / 重读,成员只读):
+
+    * ``refuse``(来自助手的候选):目标是用户一方的 → :class:`UserSideTargetError`;
+    * ``above``(用户消息里说的候选的置信度):目标是用户一方的、且置信度高于它 →
+      :class:`UserSideHigherConfidenceError`。汇总行按它自己这一行的置信度比。"""
+    stricter = above is not None and row.confidence > above
+    if not (refuse or stricter) or not await is_user_side_protected(row, load):
+        return
+    if refuse:
+        msg = f"memory item {row.id} is on the user's side; not changing it"
+        raise UserSideTargetError(msg)
+    msg = f"memory item {row.id} is on the user's side and more certain; not changing it"
+    raise UserSideHigherConfidenceError(msg)
+
+
 @dataclass(frozen=True)
 class BlockedMemory:
     """B-300 D2 — one memory text the strict write scan refused.
@@ -375,6 +399,7 @@ class MemoryStore(abc.ABC):
         old_id: UUID,
         new_item: MemoryItem,
         refuse_user_side: bool = False,
+        refuse_user_side_above: float | None = None,
     ) -> MemoryItem | None:
         """P5b — append-only UPDATE. Atomically close ``old_id`` (set
         ``invalid_at=now``, ``superseded_by=new_item.id``) and insert
@@ -398,7 +423,12 @@ class MemoryStore(abc.ABC):
         B-300 review MEDIUM-1 — ``refuse_user_side`` (the write-back passes it for
         an assistant-derived candidate): under the same row lock, a target that
         is :func:`is_user_side_protected` raises :class:`UserSideTargetError` and
-        nothing changes."""
+        nothing changes.
+
+        B-300 user 11-14 — ``refuse_user_side_above`` (the write-back passes the
+        candidate's confidence for a user-stated candidate): under the same row
+        lock, a user-side target whose confidence is above it raises
+        :class:`UserSideHigherConfidenceError` and nothing changes."""
 
     @abc.abstractmethod
     async def expire(
@@ -408,6 +438,7 @@ class MemoryStore(abc.ABC):
         user_id: UUID,
         memory_id: UUID,
         refuse_user_side: bool = False,
+        refuse_user_side_above: float | None = None,
     ) -> bool:
         """P5b — retraction: stamp ``expired_at=now`` on a fact that stopped
         being true in the world with NO successor (orthogonal to ``supersede``'s
@@ -417,7 +448,8 @@ class MemoryStore(abc.ABC):
 
         B-300 review MEDIUM-1 — the target row is locked (``FOR UPDATE``) before
         it is changed; with ``refuse_user_side`` a :func:`is_user_side_protected`
-        target raises :class:`UserSideTargetError` and nothing changes."""
+        target raises :class:`UserSideTargetError` and nothing changes;
+        ``refuse_user_side_above`` as in :meth:`supersede`."""
 
     @abc.abstractmethod
     async def user_side_protected(self, *, tenant_id: UUID, user_id: UUID, memory_id: UUID) -> bool:

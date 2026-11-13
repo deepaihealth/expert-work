@@ -22,9 +22,9 @@ from expert_work.persistence.memory.base import (
     MemoryStore,
     MemoryWriteResult,
     SupersedeTargetChangedError,
-    UserSideTargetError,
     is_mixed_origin,
     is_user_side_protected,
+    refuse_if_user_side,
     scan_memory_content,
     split_blocked,
     summary_fields,
@@ -399,6 +399,7 @@ class InMemoryMemoryStore(MemoryStore):
         old_id: UUID,
         new_item: MemoryItem,
         refuse_user_side: bool = False,
+        refuse_user_side_above: float | None = None,
     ) -> MemoryItem | None:
         hit = scan_memory_content(new_item.id, new_item.content)
         if hit is not None:
@@ -423,7 +424,9 @@ class InMemoryMemoryStore(MemoryStore):
             # archived since the caller picked it: change nothing.
             msg = f"memory item {old_id} is no longer current; not superseding it"
             raise SupersedeTargetChangedError(msg)
-        await self._refuse_if_user_side(self._rows[idx], refuse=refuse_user_side)
+        await self._refuse_if_user_side(
+            self._rows[idx], refuse=refuse_user_side, above=refuse_user_side_above
+        )
         self._rows[idx] = self._rows[idx].model_copy(
             update={"invalid_at": now, "superseded_by": new_item.id}
         )
@@ -447,6 +450,7 @@ class InMemoryMemoryStore(MemoryStore):
         user_id: UUID,
         memory_id: UUID,
         refuse_user_side: bool = False,
+        refuse_user_side_above: float | None = None,
     ) -> bool:
         for idx, row in enumerate(self._rows):
             if (
@@ -455,7 +459,9 @@ class InMemoryMemoryStore(MemoryStore):
                 and row.user_id == user_id
                 and row.deleted_at is None
             ):
-                await self._refuse_if_user_side(row, refuse=refuse_user_side)
+                await self._refuse_if_user_side(
+                    row, refuse=refuse_user_side, above=refuse_user_side_above
+                )
                 self._rows[idx] = row.model_copy(update={"expired_at": datetime.now(UTC)})
                 return True
         return False
@@ -484,13 +490,13 @@ class InMemoryMemoryStore(MemoryStore):
 
         return load
 
-    async def _refuse_if_user_side(self, row: MemoryItem, *, refuse: bool) -> None:
-        """B-300 review MEDIUM-1 / MEDIUM-3 — re-judge the target as it is now."""
-        if refuse and await is_user_side_protected(
-            row, self._member_loader(row.tenant_id, row.user_id)
-        ):
-            msg = f"memory item {row.id} is on the user's side; not changing it"
-            raise UserSideTargetError(msg)
+    async def _refuse_if_user_side(
+        self, row: MemoryItem, *, refuse: bool, above: float | None
+    ) -> None:
+        """B-300 review MEDIUM-1 / MEDIUM-3, user 11-14 — re-judge the target as it is now."""
+        await refuse_if_user_side(
+            row, self._member_loader(row.tenant_id, row.user_id), refuse=refuse, above=above
+        )
 
     async def delete_all_for_user(self, *, tenant_id: UUID, user_id: UUID) -> int:
         now = datetime.now(UTC)

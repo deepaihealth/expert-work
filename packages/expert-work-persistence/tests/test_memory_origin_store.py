@@ -33,6 +33,7 @@ from expert_work.persistence.embedding import EMBEDDING_DIM
 from expert_work.persistence.memory.base import (
     ConsolidationSourcesChangedError,
     MemoryStore,
+    UserSideHigherConfidenceError,
     UserSideTargetError,
 )
 from expert_work.persistence.memory.hash import hash_content
@@ -408,6 +409,85 @@ async def test_nested_summary_inherits_protection(store: MemoryStore) -> None:
         store, [plain, _item(t, u, "p1", created_at=_T0), _item(t, u, "p2", created_at=_T0)]
     )
     assert not await store.user_side_protected(tenant_id=t, user_id=u, memory_id=outer2.id)
+
+
+# ─── 用户 11-14:置信度更低的「用户消息里说的」候选不得改用户一方的记忆(锁里重判)──────
+
+
+async def _refuse_both(
+    store: MemoryStore, t: UUID, u: UUID, target: MemoryItem, above: float
+) -> None:
+    with pytest.raises(UserSideHigherConfidenceError):
+        _ = await store.supersede(
+            tenant_id=t, user_id=u, old_id=target.id,
+            new_item=_item(t, u, f"rewrite {uuid4()}", origin="user_stated", confidence=above),
+            refuse_user_side_above=above,
+        )  # fmt: skip
+    with pytest.raises(UserSideHigherConfidenceError):
+        _ = await store.expire(
+            tenant_id=t, user_id=u, memory_id=target.id, refuse_user_side_above=above
+        )
+    await _assert_untouched(store, t, u, target)
+
+
+@pytest.mark.asyncio
+async def test_lower_confidence_guard_refuses_a_more_certain_user_side_target(
+    store: MemoryStore,
+) -> None:
+    t, u = uuid4(), uuid4()
+    stated = _item(t, u, "stated", origin="user_stated", confidence=0.9)
+    _ = await store.write([stated])
+    await _refuse_both(store, t, u, stated, above=0.5)
+    # 同一个错误也是 ``UserSideTargetError`` —— 现有的处理路径照样接得住。
+    assert issubclass(UserSideHigherConfidenceError, UserSideTargetError)
+
+
+@pytest.mark.asyncio
+async def test_lower_confidence_guard_rereads_the_locked_row(store: MemoryStore) -> None:
+    """读邻居时目标是 0.5(候选 0.6 放得过),判的那几秒里用户「更正」成 1.0:锁里按此刻的
+    置信度重判,拒。"""
+    t, u = uuid4(), uuid4()
+    target = _item(t, u, "stated", origin="user_stated", confidence=0.5)
+    _ = await store.write([target])
+    _ = await store.update_content(
+        tenant_id=t, user_id=u, memory_id=target.id, content="corrected",
+        embedding=_vec(1.0), confidence=1.0,
+    )  # fmt: skip
+    await _refuse_both(store, t, u, target, above=0.6)
+
+
+@pytest.mark.asyncio
+async def test_lower_confidence_guard_lets_equal_and_non_user_targets_through(
+    store: MemoryStore,
+) -> None:
+    t, u = uuid4(), uuid4()
+    equal = _item(t, u, "equal", origin="user_stated", confidence=0.5)
+    derived = _item(t, u, "derived", origin="assistant_derived", confidence=0.6)
+    unrecorded = _item(t, u, "unrecorded", confidence=0.9)
+    _ = await store.write([equal, derived, unrecorded])
+    for target in (equal, derived):
+        assert await store.supersede(
+            tenant_id=t, user_id=u, old_id=target.id,
+            new_item=_item(t, u, f"new {target.content}", origin="user_stated"),
+            refuse_user_side_above=0.5,
+        )  # fmt: skip
+    assert await store.expire(
+        tenant_id=t, user_id=u, memory_id=unrecorded.id, refuse_user_side_above=0.5
+    )
+
+
+@pytest.mark.asyncio
+async def test_lower_confidence_guard_on_a_summary_uses_its_row_confidence(
+    store: MemoryStore,
+) -> None:
+    """成员里有用户说的汇总行算用户一方;比的是汇总行自己的置信度(成员最小值,这里 0.5)。"""
+    t, u = uuid4(), uuid4()
+    summary = await _summary(store, t, u, ["user_stated", None, None])
+    assert summary.confidence == 0.5
+    await _refuse_both(store, t, u, summary, above=0.4)
+    assert await store.expire(
+        tenant_id=t, user_id=u, memory_id=summary.id, refuse_user_side_above=0.5
+    )
 
 
 @pytest.mark.asyncio
