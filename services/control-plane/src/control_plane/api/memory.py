@@ -220,13 +220,15 @@ async def _resolve_write_target(
 ) -> tuple[SingleTenant, _TargetUser]:
     """B-300 D8 — the tenant + user an edit / forget acts on.
 
-    The list page's cross-tenant view shows rows from other tenants, so a write
-    may name the row's tenant. It resolves exactly like ``GET`` does
-    (``ensure_tenant_scope``: only a principal allowed into that tenant — in
-    practice a platform admin — gets through, with the tenant-switch audit and
-    the deployment's cross-tenant switch); ``*`` is a read aggregate and is not
-    accepted for a write. Naming another tenant requires naming the user too:
-    the caller's own user lives in their home tenant. Omitting the tenant keeps
+    The console's non-home views show rows from other tenants, so a write may
+    name the row's tenant. It resolves like ``GET`` does, through
+    ``ensure_single_tenant_scope`` (``allowed_tenants``, the tenant-switch
+    audit, the deployment's cross-tenant switch; ``*`` is a read aggregate and
+    is refused for a write). On top of that, writing into a tenant other than
+    the caller's home one needs a platform admin: the caller's admin role
+    belongs to their home tenant, and ``allowed_tenants`` only grants reading
+    elsewhere. Naming another tenant requires naming the user too: the
+    caller's own user lives in their home tenant. Omitting the tenant keeps
     today's meaning — the caller's home tenant.
     """
     principal: Principal = request.state.principal
@@ -252,6 +254,14 @@ async def _resolve_write_target(
         endpoint=endpoint,
         cross_tenant_enabled=cross_tenant_query_enabled(request),
     )
+    if scope.tenant_id != principal.tenant_id and not principal.is_system_admin:
+        raise HTTPException(
+            status_code=403,
+            detail={
+                "code": "PLATFORM_ADMIN_REQUIRED",
+                "message": "only a platform admin may change memories in another tenant",
+            },
+        )
     target = await _resolve_target_user(request, users, requested=requested_user)
     return scope, target
 

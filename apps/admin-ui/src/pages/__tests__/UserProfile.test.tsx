@@ -353,20 +353,74 @@ describe("UserProfile", () => {
         HIGH.id,
         expect.objectContaining({ content: "Corrected content", kind: "fact" }),
         USER_ID,
+        undefined, // home view: no tenant on the wire
       ),
     );
   });
 
-  it("切入态置灰记忆编辑/遗忘(两态:home 态由上下用例覆盖)", async () => {
+  // B-300 D8(11-13 用户定)—— 切入态不再置灰记忆编辑/遗忘:写操作带上这一行的
+  // 用户 id + 租户 id,由后端按平台管理员校验。
+  const SWITCHED_TENANT = "bbbbbbbb-0000-0000-0000-00000000000b";
+  function stubSwitchedIn() {
     isTenantSwitchedMock.mockReturnValue(true);
+    scopeRef.current = SWITCHED_TENANT;
     stubCommon();
+    vi.spyOn(memorySdk, "listMemories").mockResolvedValue({
+      items: [
+        { ...LOW, tenant_id: SWITCHED_TENANT },
+        { ...HIGH, tenant_id: SWITCHED_TENANT },
+      ],
+      total: 2,
+      cross_tenant: false,
+      caller_user_id: null,
+    });
+  }
+
+  it("switched-in view: edit is enabled and sends the row's user and tenant (B-300 D8)", async () => {
+    stubSwitchedIn();
+    vi.spyOn(memorySdk, "updateMemory").mockResolvedValue(HIGH);
     const user = userEvent.setup();
     renderPage();
     await screen.findByText("Alice");
     await user.click(screen.getByRole("tab", { name: "Memory" }));
 
-    expect(await screen.findByTestId(`memory-edit-${HIGH.id}`)).toBeDisabled();
-    expect(screen.getByTestId(`memory-forget-${HIGH.id}`)).toBeDisabled();
+    const edit = await screen.findByTestId(`memory-edit-${HIGH.id}`);
+    expect(edit).toBeEnabled();
+    // Correct is the owner's own assertion — never offered on someone else's row.
+    expect(screen.queryByTestId(`memory-correct-${HIGH.id}`)).toBeNull();
+    await user.click(edit);
+    const textarea = await screen.findByTestId("memory-edit-content");
+    await user.clear(textarea);
+    await user.type(textarea, "Fixed by platform admin");
+    await user.click(screen.getByRole("button", { name: "Save" }));
+
+    await waitFor(() =>
+      expect(memorySdk.updateMemory).toHaveBeenCalledWith(
+        HIGH.id,
+        expect.objectContaining({ content: "Fixed by platform admin" }),
+        USER_ID,
+        SWITCHED_TENANT,
+      ),
+    );
+  });
+
+  it("switched-in view: forget is enabled and sends the row's user and tenant (B-300 D8)", async () => {
+    stubSwitchedIn();
+    vi.spyOn(memorySdk, "deleteMemory").mockResolvedValue(undefined);
+    const user = userEvent.setup();
+    renderPage();
+    await screen.findByText("Alice");
+    await user.click(screen.getByRole("tab", { name: "Memory" }));
+
+    const forget = await screen.findByTestId(`memory-forget-${LOW.id}`);
+    expect(forget).toBeEnabled();
+    await user.click(forget);
+    const confirms = screen.getAllByRole("button", { name: "Forget" });
+    await user.click(confirms[confirms.length - 1]);
+
+    await waitFor(() =>
+      expect(memorySdk.deleteMemory).toHaveBeenCalledWith(LOW.id, USER_ID, SWITCHED_TENANT),
+    );
   });
 
   it("forgets a memory, threading the userId", async () => {
@@ -383,7 +437,8 @@ describe("UserProfile", () => {
     await user.click(confirms[confirms.length - 1]);
 
     await waitFor(() =>
-      expect(memorySdk.deleteMemory).toHaveBeenCalledWith(LOW.id, USER_ID),
+      // home view: no tenant on the wire
+      expect(memorySdk.deleteMemory).toHaveBeenCalledWith(LOW.id, USER_ID, undefined),
     );
   });
 

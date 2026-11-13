@@ -17,6 +17,7 @@ from control_plane.audit import build_default_audit_logger
 from control_plane.settings import DEFAULT_DEV_TENANT_ID, Settings
 from expert_work.persistence import InMemoryMemoryStore, InMemoryTenantUserStore
 from expert_work.persistence.audit_log import InMemoryAuditLogStore
+from expert_work.persistence.rls import bypass_rls_var, current_tenant_id_var
 from expert_work.protocol import AuditAction, AuditQuery, MemoryItem, Principal
 from orchestrator import AgentFactoryError
 from tests.auth_fixtures import (
@@ -935,3 +936,134 @@ async def test_patch_hit_still_scans_then_embeds_once(
     assert resp.status_code == 200, resp.text
     assert embedder.calls == 1
     assert _has_audit(await _query_audit(audit_store), _PATCH_INJECTION_AUDIT)
+
+
+class _ScopeSpyStore(InMemoryMemoryStore):
+    """Records the RLS context each write-path store call runs under.
+
+    The in-memory store ignores the GUC, so without this nothing proves a
+    cross-tenant write runs inside ``applied_scope`` (the SQL store relies on
+    it for the RLS tenant)."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.seen: list[tuple[str, UUID | None, bool]] = []
+
+    def _note(self, op: str) -> None:
+        self.seen.append((op, current_tenant_id_var.get(), bypass_rls_var.get()))
+
+    async def get_live(self, **kwargs: Any) -> MemoryItem | None:
+        self._note("get_live")
+        return await super().get_live(**kwargs)
+
+    async def update_content(self, **kwargs: Any) -> MemoryItem | None:
+        self._note("update_content")
+        return await super().update_content(**kwargs)
+
+    async def soft_delete(self, **kwargs: Any) -> bool:
+        self._note("soft_delete")
+        return await super().soft_delete(**kwargs)
+
+
+async def _spy_client() -> tuple[AsyncClient, _ScopeSpyStore, UUID, UUID]:
+    users = InMemoryTenantUserStore()
+    alice = await users.resolve(tenant_id=_TENANT, subject_type="user", subject_id=_SUBJECT)
+    store = _ScopeSpyStore()
+    mem_id = uuid4()
+    await store.write(
+        [
+            MemoryItem(
+                id=mem_id,
+                tenant_id=_TENANT,
+                user_id=alice.id,
+                kind="fact",
+                content="Likes coffee",
+                embedding=(0.1, 0.2, 0.3),
+            )
+        ]
+    )
+    app = create_app(
+        settings=_settings(),
+        tenant_user_repo=users,
+        memory_repo=store,
+        audit_logger=build_default_audit_logger(InMemoryAuditLogStore()),
+        jwt_verifier=build_test_jwt_verifier(),
+    )
+    app.state.embedder = _StubEmbedder()
+    client = AsyncClient(transport=ASGITransport(app=app), base_url="http://cp.test")
+    return client, store, alice.id, mem_id
+
+
+@pytest.mark.asyncio
+async def test_cross_tenant_patch_runs_its_store_calls_in_the_target_tenant_scope() -> None:
+    client, store, alice_id, mem_id = await _spy_client()
+    async with client:
+        sys_headers = await grant_system_admin(client)
+        resp = await client.patch(
+            f"/v1/memory/{mem_id}?user_id={alice_id}&tenant_id={_TENANT}",
+            json={"content": "Prefers green tea"},
+            headers=sys_headers,
+        )
+    assert resp.status_code == 200, resp.text
+    assert [op for op, _, _ in store.seen] == ["get_live", "update_content"]
+    assert all(tenant == _TENANT and not bypass for _, tenant, bypass in store.seen), store.seen
+
+
+@pytest.mark.asyncio
+async def test_cross_tenant_delete_runs_its_store_call_in_the_target_tenant_scope() -> None:
+    client, store, alice_id, mem_id = await _spy_client()
+    async with client:
+        sys_headers = await grant_system_admin(client)
+        resp = await client.delete(
+            f"/v1/memory/{mem_id}?user_id={alice_id}&tenant_id={_TENANT}", headers=sys_headers
+        )
+    assert resp.status_code == 204, resp.text
+    assert store.seen == [("soft_delete", _TENANT, False)]
+
+
+def _multi_tenant_admin_headers(home: UUID) -> dict[str, str]:
+    """A tenant admin (not a platform admin) whose token also lists ``_TENANT``
+    in ``allowed_tenants`` — enough for reads to switch in, not for writes."""
+    token = make_test_jwt(
+        tenant_id=home,
+        subject="multi-tenant-admin",
+        roles=("admin",),
+        extra_claims={"allowed_tenants": [str(home), str(_TENANT)]},
+    )
+    return {"Authorization": f"Bearer {token}"}
+
+
+@pytest.mark.asyncio
+async def test_non_platform_admin_cannot_write_into_another_allowed_tenant(
+    setup: tuple[AsyncClient, InMemoryMemoryStore, UUID, UUID, InMemoryAuditLogStore],
+) -> None:
+    """Admin in their home tenant is not admin in another tenant they may
+    read: writing someone else's memory there needs a platform admin."""
+    client, store, user_id, mem_id, _ = setup
+    headers = _multi_tenant_admin_headers(uuid4())
+    target = f"/v1/memory/{mem_id}?user_id={user_id}&tenant_id={_TENANT}"
+    patched = await client.patch(target, json={"content": "hijack"}, headers=headers)
+    assert patched.status_code == 403, patched.text
+    assert patched.json()["detail"]["code"] == "PLATFORM_ADMIN_REQUIRED"
+    deleted = await client.delete(target, headers=headers)
+    assert deleted.status_code == 403, deleted.text
+    assert deleted.json()["detail"]["code"] == "PLATFORM_ADMIN_REQUIRED"
+    items = await store.list_for_user(tenant_id=_TENANT, user_id=user_id)
+    assert any(i.id == mem_id and i.content == "Likes coffee" for i in items)
+
+
+@pytest.mark.asyncio
+async def test_list_in_a_non_home_tenant_has_no_caller_user_id(
+    setup: tuple[AsyncClient, InMemoryMemoryStore, UUID, UUID, InMemoryAuditLogStore],
+) -> None:
+    """The caller's own rows live in their home tenant; switched into another
+    tenant, no row is theirs, so the page must offer no "correct"."""
+    client, _, user_id, _, _ = setup
+    sys_headers = await grant_system_admin(client)
+    resp = await client.get(
+        f"/v1/memory?tenant_id={_TENANT}&user_id={user_id}", headers=sys_headers
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["data"]["cross_tenant"] is False
+    assert resp.json()["data"]["items"]
+    assert resp.json()["data"]["caller_user_id"] is None

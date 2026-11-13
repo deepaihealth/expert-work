@@ -1,7 +1,8 @@
 /**
  * UserProfile — Memory pane. The tenant-admin governance view of one
  * user's cross-agent long-term memory: list + edit (content / kind) +
- * forget (soft-delete), all threaded through ``?user_id=``.
+ * forget (soft-delete), all threaded through ``?user_id=`` (plus
+ * ``?tenant_id=`` in a switched-in view — B-300 D8).
  */
 import { useCallback, useEffect, useMemo, useState } from "react";
 import {
@@ -33,9 +34,7 @@ import {
   type MemoryList,
 } from "../../api/memory";
 import { concreteTenantScope, useTenantScope } from "../../tenant/TenantScopeContext";
-import { useIsTenantSwitched } from "../../tenant/useIsTenantSwitched";
 import { errMessage } from "./useLoad";
-import { ReadonlyTooltip } from "../../components/ReadonlyTooltip";
 
 const { Text } = Typography;
 
@@ -47,8 +46,14 @@ export function MemoryPane({ userId }: { userId: string }) {
   const navigate = useNavigate();
   // Cross-tenant W3 — user detail is single-tenant semantics: concrete UUID only.
   const { apiTenantScope } = useTenantScope();
-  // Cross-tenant W3 — 切入态只读:编辑/遗忘记忆是写操作,置灰。
-  const isTenantSwitched = useIsTenantSwitched();
+  const concreteScope = concreteTenantScope(apiTenantScope);
+  // B-300 D8 — edit / forget stay available in the switched-in view (like the
+  // memory list page): they name the row's user and, off the home scope, its
+  // tenant; the backend only lets a platform admin write into another tenant.
+  const rowTenant = useCallback(
+    (item: MemoryItem) => (concreteScope === undefined ? undefined : item.tenant_id),
+    [concreteScope],
+  );
 
   const [data, setData] = useState<MemoryList | null>(null);
   const [loading, setLoading] = useState(true);
@@ -69,7 +74,7 @@ export function MemoryPane({ userId }: { userId: string }) {
         await listMemories({
           userId,
           as_of: asOf ?? undefined,
-          tenantScope: concreteTenantScope(apiTenantScope),
+          tenantScope: concreteScope,
         }),
       );
     } catch (err) {
@@ -77,7 +82,7 @@ export function MemoryPane({ userId }: { userId: string }) {
     } finally {
       setLoading(false);
     }
-  }, [userId, asOf, apiTenantScope]);
+  }, [userId, asOf, concreteScope]);
 
   useEffect(() => {
     void refresh();
@@ -93,7 +98,12 @@ export function MemoryPane({ userId }: { userId: string }) {
     if (editing === null) return;
     setSaving(true);
     try {
-      await updateMemory(editing.id, { content: draftContent, kind: draftKind }, userId);
+      await updateMemory(
+        editing.id,
+        { content: draftContent, kind: draftKind },
+        editing.user_id,
+        rowTenant(editing),
+      );
       message.success(t("user_profile.memory_updated"));
       setEditing(null);
       await refresh();
@@ -102,13 +112,13 @@ export function MemoryPane({ userId }: { userId: string }) {
     } finally {
       setSaving(false);
     }
-  }, [editing, draftContent, draftKind, userId, message, t, refresh]);
+  }, [editing, draftContent, draftKind, rowTenant, message, t, refresh]);
 
   const handleForget = useCallback(
-    async (id: string) => {
-      setBusyId(id);
+    async (item: MemoryItem) => {
+      setBusyId(item.id);
       try {
-        await deleteMemory(id, userId);
+        await deleteMemory(item.id, item.user_id, rowTenant(item));
         message.success(t("user_profile.memory_forgotten"));
         await refresh();
       } catch (err) {
@@ -117,7 +127,7 @@ export function MemoryPane({ userId }: { userId: string }) {
         setBusyId(null);
       }
     },
-    [userId, message, t, refresh],
+    [rowTenant, message, t, refresh],
   );
 
   const columns: TableColumnsType<MemoryItem> = useMemo(
@@ -197,42 +207,37 @@ export function MemoryPane({ userId }: { userId: string }) {
         width: 160,
         render: (_: unknown, record) => (
           <Space size={6}>
-            <ReadonlyTooltip on={isTenantSwitched}>
+            <Button
+              size="small"
+              icon={<Pencil size={13} strokeWidth={1.5} />}
+              onClick={() => openEdit(record)}
+              disabled={asOf !== null}
+              data-testid={`memory-edit-${record.id}`}
+            >
+              {t("user_profile.memory_edit")}
+            </Button>
+            <Popconfirm
+              title={t("user_profile.memory_forget_confirm")}
+              onConfirm={() => void handleForget(record)}
+              okText={t("user_profile.memory_forget")}
+              okButtonProps={{ danger: true }}
+            >
               <Button
                 size="small"
-                icon={<Pencil size={13} strokeWidth={1.5} />}
-                onClick={() => openEdit(record)}
-                disabled={asOf !== null || isTenantSwitched}
-                data-testid={`memory-edit-${record.id}`}
+                danger
+                icon={<Trash2 size={13} strokeWidth={1.5} />}
+                loading={busyId === record.id}
+                disabled={asOf !== null}
+                data-testid={`memory-forget-${record.id}`}
               >
-                {t("user_profile.memory_edit")}
+                {t("user_profile.memory_forget")}
               </Button>
-            </ReadonlyTooltip>
-            <ReadonlyTooltip on={isTenantSwitched}>
-              <Popconfirm
-                title={t("user_profile.memory_forget_confirm")}
-                onConfirm={() => void handleForget(record.id)}
-                okText={t("user_profile.memory_forget")}
-                okButtonProps={{ danger: true }}
-                disabled={isTenantSwitched}
-              >
-                <Button
-                  size="small"
-                  danger
-                  icon={<Trash2 size={13} strokeWidth={1.5} />}
-                  loading={busyId === record.id}
-                  disabled={asOf !== null || isTenantSwitched}
-                  data-testid={`memory-forget-${record.id}`}
-                >
-                  {t("user_profile.memory_forget")}
-                </Button>
-              </Popconfirm>
-            </ReadonlyTooltip>
+            </Popconfirm>
           </Space>
         ),
       },
     ],
-    [t, busyId, openEdit, handleForget, navigate, asOf, isTenantSwitched],
+    [t, busyId, openEdit, handleForget, navigate, asOf],
   );
 
   return (
