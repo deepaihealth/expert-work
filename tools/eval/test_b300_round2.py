@@ -242,17 +242,6 @@ def test_quote_covers_only_the_named_phases(tmp_path: Path) -> None:
     )
 
 
-def test_requote_counts_only_remaining_work(tmp_path: Path) -> None:
-    progress = tmp_path / "progress.json"
-    progress.write_text(json.dumps({"remaining_share": {"b": 0.5, "b-screen": 1.0}}))
-    whole = _quote(tmp_path, "--phases", "b")
-    half = _quote(tmp_path, "--phases", "b", "--progress", str(progress))
-    assert half["planned"]["groups"]["B"]["calls_high"] == pytest.approx(
-        whole["planned"]["groups"]["B"]["calls_high"] / 2, rel=0.01
-    )
-    assert half["remaining_by_phase"]["b"] == 0.5
-
-
 def test_sub_budget_breach_stops_only_that_phase_and_is_not_persisted(tmp_path: Path) -> None:
     guard = spend.Guard.resume(
         stop_line=100.0,
@@ -419,20 +408,6 @@ def test_every_spending_command_refuses_while_the_lock_is_held(
             emit=out.append,
         )
     assert code == 2 and "locked" in out[-1]
-
-
-def test_another_state_dir_still_counts_the_default_dir(tmp_path: Path) -> None:
-    default = Path(spend.DEFAULT_STATE_DIR)
-    g = spend.Guard.resume(
-        stop_line=400.0, prices={"m": Price(1, 1, 1, "t")}, state_dir=default, quote_id="d"
-    )
-    call = g.reserve(item="x", model="m", cap=350.0, phase="b")
-    g.settle(call, item="x", model="m", phase="b", cost=350.0)
-    other = tmp_path / "elsewhere"
-    assert spend.history_total(other) == {"d": 350.0}
-    with spend.state_lock(other), pytest.raises(spend.LockedError):
-        with spend.state_lock(default):
-            pass
 
 
 def test_consolidation_marker_refuses_a_second_run(tmp_path: Path) -> None:

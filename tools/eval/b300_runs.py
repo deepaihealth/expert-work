@@ -335,9 +335,10 @@ def settle_writeback_usage(
         seen["yuan"] = max(float(seen["yuan"]), cumulative)
         settled_users += 1
     (out / phase).mkdir(parents=True, exist_ok=True)
-    (out / phase / "writeback-settled.json").write_text(
-        json.dumps(state, indent=1), encoding="utf-8"
-    )
+    target = out / phase / "writeback-settled.json"
+    tmp = target.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(state, indent=1), encoding="utf-8")
+    os.replace(tmp, target)  # 原子替换:写到一半中断不会留下半个文件(审查第四轮 LOW)
     return {
         "settled_yuan": round(total, 6),
         "settled_users": settled_users,

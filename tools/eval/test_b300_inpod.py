@@ -191,11 +191,16 @@ async def test_recalled_reads_run_events() -> None:
 @pytest.mark.asyncio
 async def test_candidates_print_ids_only() -> None:
     deps, _store, fake = _deps()
-    # 这一条在关键词假嵌入下凑得成簇(确定性的),所以下面的「只出 id」不是空转。
+    # 这三条(X 与两条相近的,都**当前有效**)在关键词假嵌入下凑得成簇(确定性的),所以下面的
+    # 「只出 id」不是空转。不用「X 已被取代」那一版:整理取数排不排除已作废的,随 PR A 的 D1 变。
     scenario = next(
         s for s in sc.build_group("C") if s.cls == "C5" and s.fact_key == "auto-renewal"
     )
-    (seeded,) = await _run(deps, {"op": "seed", "entries": [_seed_entry(scenario)]})
+    entry = _seed_entry(scenario)
+    entry["seeds"] = [
+        {**seed, "superseded_by": None} for seed in entry["seeds"] if seed["key"] != "y"
+    ]
+    (seeded,) = await _run(deps, {"op": "seed", "entries": [entry]})
     (row,) = await _run(
         deps,
         {

@@ -22,7 +22,7 @@ if str(_HERE) not in sys.path:
 import b300_plan as plan  # noqa: E402
 import b300_scenarios as sc  # noqa: E402
 import b300_spend as spend  # noqa: E402
-from b300_phases import EvalError, budget_of, record_approval  # noqa: E402
+from b300_phases import EvalError, budget_of, record_approval, remaining_for  # noqa: E402
 
 
 def vendors_of(raw: Sequence[str] | None) -> list[plan.Vendor]:
@@ -41,6 +41,8 @@ def make_quote(args: argparse.Namespace, *, exclude: str | None = None) -> dict[
     vendors = vendors_of(args.vendor)
     prices = plan.prices_for(vendors, accept_documented=args.accept_documented_prices)
     already = sum(spend.history_total(args.state_dir, exclude=exclude).values())
+    phases_covered = plan.parse_phases(args.phases)
+    remaining_for, digest = _remaining(args.progress, vendors, phases_covered, args.pilot)
     return plan.quote(
         vendors,
         prices,
@@ -53,19 +55,31 @@ def make_quote(args: argparse.Namespace, *, exclude: str | None = None) -> dict[
         a_votes=args.a_judge_votes,
         pilot=args.pilot,
         embed_price=args.embed_price,
-        phases=plan.parse_phases(args.phases),
+        phases=phases_covered,
         allocation=plan.parse_allocation(args.allocation),
-        remaining=_remaining(args.progress),
+        remaining_for=remaining_for,
+        progress_digest=digest,
     )
 
 
-def _remaining(path: Path | None) -> Mapping[str, float] | None:
-    """``--progress FILE``(``progress`` 子命令写的):各段还没做完的比例,报价时固定下来。"""
+def _remaining(
+    path: Path | None, vendors: Sequence[plan.Vendor], phases: Sequence[str], pilot: bool
+) -> tuple[plan.RemainingFor | None, str | None]:
+    """``--progress FILE``(``progress`` 子命令写的,记着旧目录里做完了哪些单元):报价按**这份报价
+    意味着的单元**减去做完的算还剩多少(审查第四轮 M2),与 ``prepare --resume-from`` 建的一致。"""
     import json
+    from dataclasses import asdict
 
     if path is None:
-        return None
-    return plan.check_remaining(json.loads(path.read_text(encoding="utf-8"))["remaining_share"])
+        return None, None
+    data = json.loads(path.read_text(encoding="utf-8"))
+    shape = {
+        "quote_id": "0" * 12,  # 只用来起用户名,不影响单元个数
+        "pilot": pilot,
+        "vendors": [asdict(v) for v in vendors],
+        "phases": list(phases),
+    }
+    return remaining_for(shape, data["done"]), str(data["digest"])
 
 
 def check_quote(args: argparse.Namespace) -> dict[str, Any]:
@@ -94,11 +108,6 @@ def approved(
             f"phase {phase} ({budget_of(phase)}) is not covered by quote {q['quote_id']} "
             f"(covers {q['phases']}); quote it with --phases first"
         )
-    if Path(args.state_dir).resolve() != Path(spend.DEFAULT_STATE_DIR).resolve():
-        sys.stderr.write(
-            f"note: --state-dir {args.state_dir} is not the default; the default dir "
-            f"{spend.DEFAULT_STATE_DIR} is still read and locked, so the ¥400 total covers both\n"
-        )
     if q["status"] != "within_cap" and not args.user_said:
         raise EvalError(
             "the quote says stop_and_ask (design §8.6 step 4): ask the user first; if they say go "
@@ -125,7 +134,7 @@ def approved(
             phase_caps=caps,
             budget_of=lambda phase: budget_of(phase, pilot=pilot),
         )
-    except spend.QuoteDirError as exc:
+    except spend.StateDirError as exc:
         raise EvalError(str(exc)) from exc
     if guard.blocked is not None and not allow_blocked:
         raise EvalError(
@@ -150,7 +159,7 @@ def settle_guard(args: argparse.Namespace) -> spend.Guard:
         return spend.Guard.resume(
             stop_line=float("inf"), prices=prices, state_dir=args.state_dir, quote_id=quote_id
         )
-    except spend.QuoteDirError as exc:
+    except spend.StateDirError as exc:
         raise EvalError(str(exc)) from exc
 
 

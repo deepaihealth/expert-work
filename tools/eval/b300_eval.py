@@ -144,7 +144,12 @@ def _quote_args(p: argparse.ArgumentParser, *, stop_required: bool) -> None:
     p.add_argument("--pilot", action="store_true", help="the small pilot plan (its own quote)")
     p.add_argument("--a-judge-votes", type=int, choices=(1, 3), default=plan.A_JUDGE_VOTES)
     p.add_argument("--embed-price", type=_price, default=None, help="yuan / M tokens, if known")
-    p.add_argument("--state-dir", type=Path, default=spend.DEFAULT_STATE_DIR)
+    p.add_argument(
+        "--state-dir",
+        type=Path,
+        default=None,
+        help=f"tests only ({spend.TEST_STATE_DIR_ENV}=1); spending always uses the default dir",
+    )
     p.add_argument("--phases", default=None, help="phases this quote covers, e.g. b or b,c,a")
     p.add_argument("--allocation", default=None, help="sub-budgets, e.g. b=250,c=100,a=50")
     p.add_argument("--progress", type=Path, default=None, help="`progress` output: remaining work")
@@ -181,6 +186,12 @@ def parser() -> argparse.ArgumentParser:
             p.add_argument("--file", type=Path, required=True)
         if name == "prepare":
             p.add_argument("--reruns", action="store_true", help="add attempts for excluded units")
+            p.add_argument(
+                "--resume-from",
+                type=Path,
+                default=None,
+                help="old out dir: carry finished records over, prepare only the rest",
+            )
         _quote_args(p, stop_required=name in {"run", "judge", "bundle", "ingest"})
         p.add_argument("--approved-quote", required=True)
         if name == "run":
@@ -195,7 +206,6 @@ def parser() -> argparse.ArgumentParser:
     p = sub.add_parser("progress")
     p.add_argument("--out", type=Path, required=True)
     p.add_argument("--write", type=Path, required=True)
-    _quote_args(p, stop_required=False)  # 同一组报价参数:分母是这份报价意味着的全部单元
     p = sub.add_parser("pilot-tokens")
     p.add_argument("--out", type=Path, required=True)
     p.add_argument("--write", type=Path, required=True)
@@ -401,6 +411,8 @@ def _scenarios(args: argparse.Namespace, emit: Callable[[str], None]) -> int:
 def main(argv: Sequence[str] | None = None, *, emit: Callable[[str], None] = print) -> int:
     args = parser().parse_args(argv)
     try:
+        if hasattr(args, "state_dir"):  # 只有一个状态目录(审查第四轮 M1)
+            args.state_dir = spend.check_state_dir(args.state_dir or spend.DEFAULT_STATE_DIR)
         if args.cmd == "scenarios":
             return _scenarios(args, emit)
         if args.cmd == "quote":
@@ -411,7 +423,7 @@ def main(argv: Sequence[str] | None = None, *, emit: Callable[[str], None] = pri
                 emit(str(path))
             return 0
         if args.cmd == "progress":
-            body = progress(args.out, make_quote(args))
+            body = progress(args.out)
             args.write.write_text(json.dumps(body, indent=2), encoding="utf-8")
             emit(json.dumps(body))
             return 0
@@ -434,7 +446,7 @@ def main(argv: Sequence[str] | None = None, *, emit: Callable[[str], None] = pri
         }
         handlers[args.cmd](args, emit)
         return 0
-    except (EvalError, plan.PlanError, spend.LockedError) as exc:
+    except (EvalError, plan.PlanError, spend.LockedError, spend.StateDirError) as exc:
         emit(f"error: {exc}")
         return 2
 

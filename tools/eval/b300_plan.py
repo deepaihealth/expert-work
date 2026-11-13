@@ -28,7 +28,7 @@ import hashlib
 import json
 import math
 import sys
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from typing import Any
@@ -446,6 +446,11 @@ GROUP_PHASES: dict[str, tuple[str, ...]] = {
 }
 
 
+#: ``(cuts, 只跑一家的那家) -> (每段还剩的比例, 每段还剩的单元数)``:按这组删减下这份报价意味着的
+#: 单元算(审查第四轮 M2:报价数的与 ``prepare --resume-from`` 建的一模一样)。
+RemainingFor = Callable[[Sequence[int], str], tuple[dict[str, float], dict[str, int]]]
+
+
 def group_share(group: str, remaining: Mapping[str, float] | None) -> float:
     names = GROUP_PHASES.get(group, ())
     if remaining is None or not names:
@@ -472,7 +477,6 @@ def phase_budgets(
     stop_line: float,
     phases: Sequence[str],
     allocation: Mapping[str, float] | None = None,
-    remaining: Mapping[str, float] | None = None,
 ) -> dict[str, Any]:
     """分预算是报价里**写明、由用户批**的一部分(审查 M-b):默认按每段估计的中点(低档与高档的
     平均)按比例分止损线;给了 ``--allocation`` 就用用户的(只能覆盖本报价的段、合计不超过止损线)。
@@ -644,7 +648,7 @@ def choose_cuts(
     tokens: TokenTable = CALL_TOKENS,
     a_votes: int = A_JUDGE_VOTES,
     phases: Sequence[str] = BUDGET_ORDER,
-    remaining: Mapping[str, float] | None = None,
+    remaining_for: RemainingFor | None = None,
 ) -> tuple[list[int], dict[str, Any], str]:
     """按 §8.6 的顺序删,直到「已花 + 本次高档」≤ 上限;三步都删完仍超 → ``stop_and_ask``。"""
     cap = CAP_YUAN if cap is None else cap
@@ -654,6 +658,7 @@ def choose_cuts(
         lines = lines_for(
             vendors, cuts=cuts, single_vendor=one, include_compare=include_compare, a_votes=a_votes
         )
+        remaining = remaining_for(cuts, one)[0] if remaining_for is not None else None
         summary = summarize(select_lines(lines, phases, remaining), prices, tokens)
         if already_spent + summary["total"]["yuan_high"] <= cap:
             return cuts, summary, "within_cap"
@@ -678,7 +683,8 @@ def quote(
     embed_price: float | None = None,
     phases: Sequence[str] = BUDGET_ORDER,
     allocation: Mapping[str, float] | None = None,
-    remaining: Mapping[str, float] | None = None,
+    remaining_for: RemainingFor | None = None,
+    progress_digest: str | None = None,
 ) -> dict[str, Any]:
     """报价:不删时的全量、按顺序删后的计划、状态、止损线、报价编号(内容哈希)。"""
     cap = CAP_YUAN if cap is None else cap
@@ -695,7 +701,8 @@ def quote(
         lines = lines_for(
             vendors, single_vendor=one, include_compare=include_compare, a_votes=a_votes
         )
-        full = summarize(select_lines(lines, phases, remaining), prices, tokens)
+        start = remaining_for([], one)[0] if remaining_for is not None else None
+        full = summarize(select_lines(lines, phases, start), prices, tokens)
         cuts, planned, status = choose_cuts(
             vendors,
             prices,
@@ -706,8 +713,9 @@ def quote(
             tokens=tokens,
             a_votes=a_votes,
             phases=phases,
-            remaining=remaining,
+            remaining_for=remaining_for,
         )
+    shares, counts = remaining_for(cuts, one) if remaining_for is not None else ({}, {})
     if stop_line is None:
         # 试点的止损线默认取它自己的高档估计(审查 M-c),正式报价默认 ¥400。
         stop_line = float(math.ceil(planned["total"]["yuan_high"])) if pilot else cap
@@ -749,7 +757,10 @@ def quote(
             if pilot
             else phase_budgets(planned, stop_line, phases, allocation)
         ),
-        "remaining_by_phase": dict(sorted((remaining or {}).items())),
+        # 重报价(``--progress``):每段还剩的比例与单元数 —— ``prepare --resume-from`` 正好建这么多
+        "remaining_by_phase": dict(sorted(shares.items())),
+        "remaining_units_by_phase": dict(sorted(counts.items())),
+        "progress_digest": progress_digest,
         "embeddings": embedding_estimate(vendors, embed_price),
         "not_priced": [
             "sandbox time of the eval agents (not model spend)",

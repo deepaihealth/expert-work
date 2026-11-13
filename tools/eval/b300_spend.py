@@ -16,6 +16,7 @@
 from __future__ import annotations
 
 import contextlib
+import os
 import sys
 import uuid
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
@@ -39,16 +40,17 @@ from b301_spend import (  # noqa: E402
 
 __all__ = [
     "DEFAULT_STATE_DIR",
+    "TEST_STATE_DIR_ENV",
     "Guard",
     "LockedError",
-    "QuoteDirError",
     "SpendLedger",
     "SpendStopError",
+    "StateDirError",
     "call_cap_yuan",
+    "check_state_dir",
     "exclusive",
     "history_total",
     "ledger_path",
-    "quote_spent",
     "state_lock",
     "usage_cost",
 ]
@@ -63,61 +65,37 @@ def ledger_path(state_dir: Path, quote_id: str) -> Path:
     return state_dir / f"{quote_id}.spend.jsonl"
 
 
-def state_dirs(state_dir: Path) -> list[Path]:
-    """总账要看的状态目录:给定的那个,**加上默认的那个**(审查 LOW:换 ``--state-dir`` 不能绕开
-    ¥400 —— 默认目录里的账永远算进来)。按路径排序,上锁时顺序固定。"""
-    dirs = {state_dir.resolve(), Path(DEFAULT_STATE_DIR).resolve()}
-    return sorted(dirs, key=str)
+#: 只有测试打开这个开关时,才许用默认以外的状态目录(``tools/eval/conftest.py`` 打开)。
+TEST_STATE_DIR_ENV = "B300_EVAL_ALLOW_TEST_STATE_DIR"
+
+
+class StateDirError(RuntimeError):
+    """花钱的状态目录只有一个:默认的那个(审查第四轮 M1)。"""
+
+
+def check_state_dir(state_dir: Path) -> Path:
+    """只有一个状态目录(``~/.cache/b300-eval``):总账、锁、每个报价的账本都在这里,换目录绕不开
+    ¥400。别的目录只给测试用(要设 :data:`TEST_STATE_DIR_ENV`)。"""
+    if Path(state_dir).resolve() != Path(DEFAULT_STATE_DIR).resolve() and not os.environ.get(
+        TEST_STATE_DIR_ENV
+    ):
+        raise StateDirError(
+            f"spending always uses the default state dir {DEFAULT_STATE_DIR}; {state_dir} is only "
+            f"accepted in tests ({TEST_STATE_DIR_ENV}=1)"
+        )
+    return Path(state_dir)
 
 
 def history_total(state_dir: Path, *, exclude: str | None = None) -> dict[str, float]:
-    """每个报价已花的钱(``exclude`` 那个报价除外),给定目录与默认目录一起算。"""
+    """状态目录里每个报价已花的钱(``exclude`` 那个报价除外)。"""
     out: dict[str, float] = {}
-    for directory in state_dirs(state_dir):
-        if not directory.exists():
-            continue
-        for path in sorted(directory.glob("*.spend.jsonl")):
-            quote_id = path.name.removesuffix(".spend.jsonl")
-            if quote_id == exclude:
-                continue
-            out[quote_id] = out.get(quote_id, 0.0) + ledger_total(
-                read_ledger(path, broken_line_cost=BROKEN_LINE_YUAN)
-            )
+    if not state_dir.exists():
+        return out
+    for path in sorted(state_dir.glob("*.spend.jsonl")):
+        quote_id = path.name.removesuffix(".spend.jsonl")
+        if quote_id != exclude:
+            out[quote_id] = ledger_total(read_ledger(path, broken_line_cost=BROKEN_LINE_YUAN))
     return out
-
-
-class QuoteDirError(RuntimeError):
-    """一个报价只认一个状态目录(审查第三轮 M1):它在别的目录里已经有账了。"""
-
-
-def quote_ledgers(state_dir: Path, quote_id: str) -> list[Path]:
-    """这个报价在所有要看的目录(给定的 + 默认的)里的账本。"""
-    return [
-        ledger_path(d, quote_id) for d in state_dirs(state_dir) if ledger_path(d, quote_id).exists()
-    ]
-
-
-def quote_rows(state_dir: Path, quote_id: str) -> list[dict[str, Any]]:
-    rows: list[dict[str, Any]] = []
-    for path in quote_ledgers(state_dir, quote_id):
-        rows.extend(read_ledger(path, broken_line_cost=BROKEN_LINE_YUAN))
-    return rows
-
-
-def quote_spent(state_dir: Path, quote_id: str) -> float:
-    """这个报价已花的(跨目录合计)。"""
-    return ledger_total(quote_rows(state_dir, quote_id))
-
-
-def check_one_dir(state_dir: Path, quote_id: str) -> None:
-    """一个报价、一个目录:它在别的目录里有账,就不许在这个目录里接着记。"""
-    here = ledger_path(state_dir, quote_id).resolve()
-    elsewhere = [p for p in quote_ledgers(state_dir, quote_id) if p.resolve() != here]
-    if elsewhere:
-        raise QuoteDirError(
-            f"quote {quote_id} already has a ledger in {elsewhere[0].parent}: one quote, one state "
-            f"dir — run it with --state-dir {elsewhere[0].parent}"
-        )
 
 
 def call_cap_yuan(price: Price, max_input: int, max_output: int) -> float:
@@ -152,9 +130,7 @@ def state_lock(state_dir: Path) -> Iterator[None]:
     """一个状态目录同一时间只许一个花钱的进程(``run`` / ``judge`` / ``calibrate`` / 整理的
     ``bundle`` 与 ``ingest``)。拿不到就 :class:`LockedError`,不等。审查 H3:¥400 总账只有在
     「别的报价已花」读出来之后不再变的前提下才守得住,所以读账、判线、花钱都在这把锁里。"""
-    with contextlib.ExitStack() as stack:
-        for directory in state_dirs(state_dir):  # 给定目录与默认目录都锁上
-            stack.enter_context(exclusive(directory, _LOCK_NAME))
+    with exclusive(check_state_dir(state_dir), _LOCK_NAME):
         yield
 
 
@@ -220,9 +196,8 @@ class Guard:
             return cls(
                 stop_line=stop_line, prices=prices, phase_caps=phase_caps or {}, budget_of=budget_of
             )
-        check_one_dir(state_dir, quote_id)
-        path = ledger_path(state_dir, quote_id)
-        rows = quote_rows(state_dir, quote_id)  # 本报价的账:跨目录合计(审查第三轮 M1)
+        path = ledger_path(check_state_dir(state_dir), quote_id)
+        rows = read_ledger(path, broken_line_cost=BROKEN_LINE_YUAN)
         settled, reserved, blocked = _replay(rows)
         guard = cls(
             stop_line=stop_line,

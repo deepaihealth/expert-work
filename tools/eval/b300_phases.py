@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 import subprocess
 import sys
 from collections import defaultdict
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -389,42 +390,114 @@ def meaningful_text(raw: str) -> str:
     return text
 
 
-def progress(out: Path, q: Mapping[str, Any]) -> dict[str, Any]:
-    """各段还剩多少没做完(审查 M-b / 第三轮 M2)。分母是**这份报价意味着的全部单元**(对它覆盖的
-    每一段都 ``build_units``,没 ``prepare`` 过的段也算进去),分子是 ``out`` 里已经做完的(同一个
-    场景 / 家 / 次,任何一次尝试做完就算):没出错、对话也齐了(提炼段 = 有结果)。"""
-    scenarios = all_scenarios()
-    total: dict[str, int] = {}
-    done: dict[str, int] = {}
-    per_phase: dict[str, dict[str, Any]] = {}
-    for name, phase in PHASES.items():
-        budget = budget_of(name)
-        if budget not in q["phases"]:
+Slot = tuple[str, str, int]  # (场景, 家, 次)
+
+
+def _slot(u: Mapping[str, Any]) -> Slot:
+    return (str(u["scenario_id"]), str(u["vendor"]), int(u["repeat"]))
+
+
+def finished_records(out: Path, name: str) -> list[dict[str, Any]]:
+    """一段里做完了的记录(同一单元留最后一条):没出错、对话也齐了(提炼段 = 有结果)。"""
+    phase, scenarios = PHASES[name], all_scenarios()
+    latest_rows = {r["key"]: r for r in read_jsonl(out / name / "records.jsonl")}
+    done = []
+    for r in latest_rows.values():
+        if r.get("error"):
             continue
-        implied = build_units(phase, q)
-        finished: set[tuple[str, str, int]] = set()
-        for r in read_jsonl(out / name / "records.jsonl"):
-            if r.get("error"):
-                continue
-            complete = phase.kind == "extraction" and r.get("result") is not None
-            if phase.kind != "extraction":
-                complete = len(r.get("convs", [])) >= len(scenarios[r["scenario_id"]].conversations)
-            if complete:
-                finished.add((r["scenario_id"], r["vendor"], int(r["repeat"])))
-        n_done = sum((u["scenario_id"], u["vendor"], int(u["repeat"])) in finished for u in implied)
-        per_phase[name] = {
-            "total": len(implied),
-            "done": n_done,
-            "remaining_share": round(1 - n_done / len(implied), 4) if implied else 1.0,
-        }
-        total[budget] = total.get(budget, 0) + len(implied)
-        done[budget] = done.get(budget, 0) + n_done
-    return {
-        "units": {b: {"total": total[b], "done": done[b]} for b in total},
-        "phases": per_phase,
-        # 报价按段缩(``b300_plan.GROUP_PHASES``)
-        "remaining_share": {n: v["remaining_share"] for n, v in per_phase.items()},
+        if phase.kind == "extraction":
+            ok = r.get("result") is not None
+        else:
+            ok = len(r.get("convs", [])) >= len(scenarios[r["scenario_id"]].conversations)
+        if ok:
+            done.append(r)
+    return done
+
+
+def progress(out: Path) -> dict[str, Any]:
+    """哪些单元已经做完(审查第三 / 四轮 M2):每段做完的(场景, 家, 次),与它们的摘要。重报价
+    (``quote --progress``)用它算这份报价意味着的单元里还剩哪些;``prepare --resume-from`` 用同一个
+    函数、核对同一个摘要,建的正好是报价数的那些。"""
+    done = {
+        name: sorted({_slot(r) for r in finished_records(out, name)})
+        for name in PHASES
+        if (out / name / "records.jsonl").exists()
     }
+    digest = hashlib.sha256(json.dumps(done, sort_keys=True).encode()).hexdigest()[:12]
+    return {
+        "from_out": str(out),
+        "done": {k: [list(x) for x in v] for k, v in done.items()},
+        "digest": digest,
+    }
+
+
+def remaining_units(
+    phase: Phase, q: Mapping[str, Any], done: Mapping[str, Any]
+) -> list[dict[str, Any]]:
+    """这份报价在这一段意味着的单元,去掉已经做完的(场景, 家, 次)。"""
+    finished = {tuple(x) for x in done.get(phase.name, [])}
+    return [u for u in build_units(phase, q) if _slot(u) not in finished]
+
+
+def remaining_for(
+    q_shape: Mapping[str, Any], done: Mapping[str, Any]
+) -> Callable[[Sequence[int], str], tuple[dict[str, float], dict[str, int]]]:
+    """给报价用:按某一组删减、某一家「只跑一家」时,每段还剩的比例与单元数。"""
+
+    def compute(cuts: Sequence[int], single: str) -> tuple[dict[str, float], dict[str, int]]:
+        q = {**q_shape, "single_vendor": single, "cuts_applied": [{"step": c} for c in cuts]}
+        shares: dict[str, float] = {}
+        counts: dict[str, int] = {}
+        for name, phase in PHASES.items():
+            if budget_of(name) not in q["phases"]:
+                continue
+            implied = build_units(phase, q)
+            left = remaining_units(phase, q, done)
+            counts[name] = len(left)
+            shares[name] = round(len(left) / len(implied), 6) if implied else 1.0
+        return shares, counts
+
+    return compute
+
+
+def carry_over(old_out: Path, new_out: Path, name: str, new_quote_id: str) -> int:
+    """把旧目录里这一段做完的记录搬进新目录(``carried_from_quote`` 标原报价),每条在
+    ``carried.jsonl`` 留一行审计;召回 / 状态 / 判分等结果文件整份带过来,报告才能合着算。"""
+    rows = finished_records(old_out, name)
+    if not rows:
+        return 0
+    units_file = old_out / name / "units.json"
+    old_quote = (
+        json.loads(units_file.read_text(encoding="utf-8")).get("quote_id")
+        if units_file.exists()
+        else None
+    )
+    target = phase_dir(new_out, name)
+    at = datetime.now(UTC).isoformat()
+    for r in rows:
+        append_jsonl(
+            target / "records.jsonl",
+            {**r, "carried_from_quote": old_quote, "carried_from_out": str(old_out)},
+        )
+        append_jsonl(
+            target / "carried.jsonl",
+            {
+                "key": r["key"],
+                "from_quote": old_quote,
+                "from_out": str(old_out),
+                "to_quote": new_quote_id,
+                "at": at,
+            },
+        )
+    for src in [*sorted((old_out / name).glob("inpod-*.jsonl")), old_out / name / "verdicts.jsonl"]:
+        if src.exists():
+            with (target / src.name).open("a", encoding="utf-8") as fh:
+                fh.write(src.read_text(encoding="utf-8"))
+    if (old_out / name / "meta.json").exists():
+        (target / "carried-meta.json").write_text(
+            (old_out / name / "meta.json").read_text(encoding="utf-8")
+        )
+    return len(rows)
 
 
 def calibration_path(out: Path, which: str) -> Path:

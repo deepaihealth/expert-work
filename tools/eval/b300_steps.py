@@ -34,13 +34,16 @@ from b300_phases import (  # noqa: E402
     append_jsonl,
     build_units,
     bundle_source,
+    carry_over,
     earliest_start,
     inpod_rows,
     latest,
     load_units,
     phase_dir,
+    progress,
     read_jsonl,
     recalled_payload,
+    remaining_units,
     save_units,
     seed_payload,
     user_name,
@@ -124,6 +127,8 @@ def prepare(args: argparse.Namespace, emit: Callable[[str], None]) -> None:
             )
         units = [*units, *added]
         emit(f"{len(added)} reruns added")
+    elif args.resume_from is not None:
+        units = _resume(args, q, phase, emit)
     else:
         if path.exists():
             raise EvalError(f"{path} exists; use --reruns to add attempts")
@@ -140,6 +145,38 @@ def prepare(args: argparse.Namespace, emit: Callable[[str], None]) -> None:
             bundle_source(seed_payload(phase, unseeded, args.tenant_id)), encoding="utf-8"
         )
         emit(f"seed bundle -> {target} (kubectl exec -i POD -- python - < it)")
+
+
+def _resume(
+    args: argparse.Namespace, q: Mapping[str, Any], phase: Any, emit: Callable[[str], None]
+) -> list[dict[str, Any]]:
+    """``prepare --resume-from OLD`` (审查第四轮 M2):新报价必须是按 OLD 的 ``progress`` 报的,
+    而且 OLD 在报价之后没再变(摘要一致)。做完的记录搬过来(审计行在 ``carried.jsonl``),只为
+    还没做完的(场景, 家, 次)建单元 —— 个数正好是报价里的 ``remaining_units_by_phase``。新单元用
+    新报价的用户名,所以只给它们重新种。"""
+    if (args.out / phase.name / "units.json").exists():
+        raise EvalError(f"{args.out / phase.name} already prepared; resume into a fresh --out")
+    if Path(args.resume_from).resolve() == Path(args.out).resolve():
+        raise EvalError("--resume-from must be the old out dir, not the new one")
+    if not q.get("progress_digest"):
+        raise EvalError(
+            "this quote was not made with --progress; quote again from the old progress"
+        )
+    now = progress(args.resume_from)
+    if now["digest"] != q["progress_digest"]:
+        raise EvalError(
+            f"{args.resume_from} moved on since the progress used by this quote "
+            f"({now['digest']} != {q['progress_digest']}); write the progress again and re-quote"
+        )
+    carried = carry_over(args.resume_from, args.out, phase.name, q["quote_id"])
+    units = remaining_units(phase, q, now["done"])
+    expected = q["remaining_units_by_phase"].get(phase.name)
+    if expected is not None and expected != len(units):
+        raise EvalError(
+            f"{phase.name}: {len(units)} remaining units but the quote counted {expected}"
+        )
+    emit(f"{carried} finished records carried from {args.resume_from}")
+    return units
 
 
 # --------------------------------------------------------------------------- bundle

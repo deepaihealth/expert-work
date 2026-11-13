@@ -269,6 +269,11 @@ def compare_counts(out: Path) -> dict[str, Any]:
 
 def report(out: Path, q: Mapping[str, Any] | None) -> dict[str, Any]:
     outcomes, counts, baseline = collect_outcomes(out)
+    carried = {
+        name: len(read_jsonl(out / name / "carried.jsonl"))
+        for name in PHASES
+        if (out / name / "carried.jsonl").exists()
+    }
     meta = {
         name: json.loads((out / name / "meta.json").read_text(encoding="utf-8"))
         for name in PHASES
@@ -298,4 +303,6 @@ def report(out: Path, q: Mapping[str, Any] | None) -> dict[str, Any]:
     )
     if (out / "compare-before").exists() or (out / "compare-after").exists():
         body["compare"] = compare_counts(out)
+    # 从旧报价搬过来的记录(``prepare --resume-from``)与新跑的合在一起算;这里报搬了多少。
+    body["carried"] = carried
     return body

@@ -28,6 +28,10 @@ def _b300_default_state_dir(
     monkeypatch = pytest.MonkeyPatch()
     fake_default = tmp_path_factory.mktemp("b300-default")
     monkeypatch.setattr(b300_spend, "DEFAULT_STATE_DIR", fake_default)
+    # 测试里各用各的临时状态目录(生产上只有默认目录一个,``--state-dir`` 不收)。
+    monkeypatch.setenv(
+        getattr(b300_spend, "TEST_STATE_DIR_ENV", "B300_EVAL_ALLOW_TEST_STATE_DIR"), "1"
+    )
     assert b300_spend.DEFAULT_STATE_DIR == fake_default  # 绝不碰本机真实的账本目录
     try:
         yield

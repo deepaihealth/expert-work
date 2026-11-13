@@ -467,9 +467,13 @@ async def run_conversation(
         payload["session_id"] = session_id
     if uploads:
         payload["files"] = [{"upload_id": u} for u in uploads]
-    call_id = guard.reserve(
-        item=item, model=model, cap=run_cap_yuan(guard.prices, models), phase=phase
-    )
+    try:
+        call_id = guard.reserve(
+            item=item, model=model, cap=run_cap_yuan(guard.prices, models), phase=phase
+        )
+    except BaseException as exc:
+        mark_run(exc, run_id=None, started=False)  # 运行本身的预留被拒:没发 POST,一定没有运行
+        raise
     collector, parser = TurnCollector(), SseParser()
     started = time.monotonic()
     try:

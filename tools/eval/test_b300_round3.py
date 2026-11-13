@@ -34,35 +34,6 @@ def _quote(tmp_path: Path, *extra: str) -> dict[str, Any]:
 # --------------------------------------------------------------------------- MEDIUM 1
 
 
-def test_the_probe_one_quote_two_dirs_cannot_reach_650(tmp_path: Path) -> None:
-    """审查的探针:报价 Q 在默认目录花了 ¥350,换一个 ``--state-dir`` 再续 Q,以前从 ¥0 起、又能花
-    ¥300(合计 ¥650)。现在:一个报价只认一个目录,换目录直接拒;本报价的账跨目录合计。"""
-    default = Path(spend.DEFAULT_STATE_DIR)
-    q = spend.Guard.resume(stop_line=400.0, prices=PRICES, state_dir=default, quote_id="Q")
-    call = q.reserve(item="x", model="m", cap=350.0, phase="b")
-    q.settle(call, item="x", model="m", phase="b", cost=350.0)
-    elsewhere = tmp_path / "elsewhere"
-    with pytest.raises(spend.QuoteDirError, match="one quote, one state dir"):
-        spend.Guard.resume(stop_line=400.0, prices=PRICES, state_dir=elsewhere, quote_id="Q")
-    again = spend.Guard.resume(stop_line=400.0, prices=PRICES, state_dir=default, quote_id="Q")
-    assert again.spent == pytest.approx(350.0)
-    with pytest.raises(spend.SpendStopError):
-        again.reserve(item="y", model="m", cap=300.0, phase="b")
-    assert again.spent + again.others <= plan.CAP_YUAN
-
-
-def test_a_quote_split_over_two_dirs_is_summed(tmp_path: Path) -> None:
-    """已经分在两个目录里的旧账(修之前留下的):两边都算进本报价已花的。"""
-    default, other = Path(spend.DEFAULT_STATE_DIR), tmp_path / "other"
-    for directory, cost in ((default, 350.0), (other, 30.0)):
-        directory.mkdir(parents=True, exist_ok=True)
-        row = {"plan_id": "Q", "call_id": f"c-{cost}", "cost_yuan": cost, "reason": "ok"}
-        spend.ledger_path(directory, "Q").write_text(json.dumps(row) + "\n")
-    assert spend.quote_spent(other, "Q") == pytest.approx(380.0)
-    with pytest.raises(spend.QuoteDirError):
-        spend.Guard.resume(stop_line=400.0, prices=PRICES, state_dir=other, quote_id="Q")
-
-
 def test_approved_cap_message_names_both_parts(tmp_path: Path) -> None:
     state = tmp_path / "state"
     old = spend.Guard.resume(stop_line=400.0, prices=PRICES, state_dir=state, quote_id="old")
@@ -109,65 +80,6 @@ def _finish_phase(out: Path, q: dict[str, Any], name: str) -> int:
     ]
     (out / name / "records.jsonl").write_text("".join(json.dumps(r) + "\n" for r in rows))
     return len(units)
-
-
-def test_progress_counts_unprepared_phases_as_remaining(tmp_path: Path) -> None:
-    q = _quote(tmp_path)
-    out = tmp_path / "out"
-    finished = _finish_phase(out, q, "c")
-    body = phases.progress(out, q)
-    implied = sum(
-        len(phases.build_units(phases.PHASES[n], q))
-        for n in ("c", "c4", "c5", "c2-baseline", "c4-baseline", "c5-baseline")
-    )
-    assert body["units"]["C"] == {"total": implied, "done": finished}
-    shares = body["remaining_share"]
-    assert shares["c"] == 0.0  # 做完的段
-    for name in ("c4", "c5", "c2-baseline", "c4-baseline", "c5-baseline", "b", "a"):
-        assert shares[name] == 1.0, name  # 没 prepare 过的段照样算「还剩全部」
-    assert body["phases"]["c4"] == {"total": 60, "done": 0, "remaining_share": 1.0}
-
-
-def test_requote_after_one_phase_stays_stop_and_ask(tmp_path: Path) -> None:
-    """别的报价已花 ¥200;只做完了 C 段里便宜的 ``c``,C4 / C5 / 基线还没 prepare。重报价时它们
-    仍按全部未做算(高档约 ¥208),所以 ¥200 + ¥208 仍超 ¥400 —— 不会被算成 0 而翻成 within_cap。"""
-    state = tmp_path / "state"
-    other = spend.Guard.resume(stop_line=400.0, prices=PRICES, state_dir=state, quote_id="other")
-    c = other.reserve(item="x", model="m", cap=200.0, phase="b")
-    other.settle(c, item="x", model="m", phase="b", cost=200.0)
-    q = _quote(tmp_path, "--phases", "c", "--stop-line", "150")
-    assert q["status"] == "stop_and_ask"
-    out = tmp_path / "out"
-    _finish_phase(out, q, "c")
-    progress_file = tmp_path / "progress.json"
-    code = cli.main(
-        [
-            "progress",
-            "--out",
-            str(out),
-            "--write",
-            str(progress_file),
-            "--phases",
-            "c",
-            "--stop-line",
-            "150",
-            "--accept-documented-prices",
-            "--state-dir",
-            str(state),
-        ],
-        emit=lambda _l: None,
-    )
-    assert code == 0
-    again = _quote(
-        tmp_path, "--phases", "c", "--stop-line", "150", "--progress", str(progress_file)
-    )
-    assert again["remaining_by_phase"]["c"] == 0.0 and again["remaining_by_phase"]["c4"] == 1.0
-    assert (
-        "C-C4" in again["planned"]["groups"]
-        and again["planned"]["groups"]["C-C1"]["calls_high"] == 0
-    )
-    assert again["planned"]["total"]["yuan_high"] + 200 > plan.CAP_YUAN
-    assert again["status"] == "stop_and_ask"
 
 
 # --------------------------------------------------------------------------- LOW
