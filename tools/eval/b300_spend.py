@@ -41,12 +41,14 @@ __all__ = [
     "DEFAULT_STATE_DIR",
     "Guard",
     "LockedError",
+    "QuoteDirError",
     "SpendLedger",
     "SpendStopError",
     "call_cap_yuan",
     "exclusive",
     "history_total",
     "ledger_path",
+    "quote_spent",
     "state_lock",
     "usage_cost",
 ]
@@ -82,6 +84,40 @@ def history_total(state_dir: Path, *, exclude: str | None = None) -> dict[str, f
                 read_ledger(path, broken_line_cost=BROKEN_LINE_YUAN)
             )
     return out
+
+
+class QuoteDirError(RuntimeError):
+    """一个报价只认一个状态目录(审查第三轮 M1):它在别的目录里已经有账了。"""
+
+
+def quote_ledgers(state_dir: Path, quote_id: str) -> list[Path]:
+    """这个报价在所有要看的目录(给定的 + 默认的)里的账本。"""
+    return [
+        ledger_path(d, quote_id) for d in state_dirs(state_dir) if ledger_path(d, quote_id).exists()
+    ]
+
+
+def quote_rows(state_dir: Path, quote_id: str) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for path in quote_ledgers(state_dir, quote_id):
+        rows.extend(read_ledger(path, broken_line_cost=BROKEN_LINE_YUAN))
+    return rows
+
+
+def quote_spent(state_dir: Path, quote_id: str) -> float:
+    """这个报价已花的(跨目录合计)。"""
+    return ledger_total(quote_rows(state_dir, quote_id))
+
+
+def check_one_dir(state_dir: Path, quote_id: str) -> None:
+    """一个报价、一个目录:它在别的目录里有账,就不许在这个目录里接着记。"""
+    here = ledger_path(state_dir, quote_id).resolve()
+    elsewhere = [p for p in quote_ledgers(state_dir, quote_id) if p.resolve() != here]
+    if elsewhere:
+        raise QuoteDirError(
+            f"quote {quote_id} already has a ledger in {elsewhere[0].parent}: one quote, one state "
+            f"dir — run it with --state-dir {elsewhere[0].parent}"
+        )
 
 
 def call_cap_yuan(price: Price, max_input: int, max_output: int) -> float:
@@ -184,8 +220,9 @@ class Guard:
             return cls(
                 stop_line=stop_line, prices=prices, phase_caps=phase_caps or {}, budget_of=budget_of
             )
+        check_one_dir(state_dir, quote_id)
         path = ledger_path(state_dir, quote_id)
-        rows = read_ledger(path, broken_line_cost=BROKEN_LINE_YUAN)
+        rows = quote_rows(state_dir, quote_id)  # 本报价的账:跨目录合计(审查第三轮 M1)
         settled, reserved, blocked = _replay(rows)
         guard = cls(
             stop_line=stop_line,

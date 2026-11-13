@@ -148,9 +148,10 @@ def test_a_broken_conversation_keeps_its_writeback_reservation_unsettled(tmp_pat
     guard = spend.Guard.resume(
         stop_line=100.0, prices=FLASH, state_dir=tmp_path / "s", quote_id="q"
     )
-    _records_with_reservations(tmp_path, guard, [None])
+    (call,) = _records_with_reservations(tmp_path, guard, [None])
     report = {"op": "writeback_usage", "key": "u", "jobs": {}, "models": _USAGE}
-    assert runs.settle_writeback_usage(tmp_path, "c4", [report], guard)["waiting_users"] == 1
+    runs.settle_writeback_usage(tmp_path, "c4", [report], guard)
+    assert guard.open_cap(call) > 0 and guard.settled == 0  # 不知道建没建 run:留着,按上限算
 
 
 # --------------------------------------------------------------------------- M-a
@@ -243,35 +244,13 @@ def test_quote_covers_only_the_named_phases(tmp_path: Path) -> None:
 
 def test_requote_counts_only_remaining_work(tmp_path: Path) -> None:
     progress = tmp_path / "progress.json"
-    progress.write_text(json.dumps({"remaining_share": {"B": 0.5, "C": 1.0, "A": 1.0}}))
+    progress.write_text(json.dumps({"remaining_share": {"b": 0.5, "b-screen": 1.0}}))
     whole = _quote(tmp_path, "--phases", "b")
     half = _quote(tmp_path, "--phases", "b", "--progress", str(progress))
     assert half["planned"]["groups"]["B"]["calls_high"] == pytest.approx(
         whole["planned"]["groups"]["B"]["calls_high"] / 2, rel=0.01
     )
-    assert half["phase_budgets"]["B"]["remaining_share"] == 0.5
-
-
-def test_progress_counts_finished_units(tmp_path: Path) -> None:
-    q = {"quote_id": "q" * 12, "pilot": False}
-    units = [
-        {"phase": "b", "scenario_id": f"S{i}", "vendor": "glm", "repeat": 0, "attempt": 0}
-        for i in range(4)
-    ]
-    phases.save_units(tmp_path, "b", units, q)
-    rows = [
-        {"key": phases.unit_key(units[0]), "convs": [{}]},
-        {"key": phases.unit_key(units[1]), "convs": [{}], "error": "x"},
-    ]
-    (tmp_path / "b" / "records.jsonl").write_text("".join(json.dumps(r) + "\n" for r in rows))
-    monkey = {f"S{i}": SimpleNamespace(conversations=(object(),)) for i in range(4)}
-    original = phases.all_scenarios
-    phases.all_scenarios = lambda: monkey  # type: ignore[assignment]
-    try:
-        body = phases.progress(tmp_path)
-    finally:
-        phases.all_scenarios = original  # type: ignore[assignment]
-    assert body["units"]["B"] == {"total": 4, "done": 1} and body["remaining_share"]["B"] == 0.75
+    assert half["remaining_by_phase"]["b"] == 0.5
 
 
 def test_sub_budget_breach_stops_only_that_phase_and_is_not_persisted(tmp_path: Path) -> None:

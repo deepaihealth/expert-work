@@ -389,34 +389,41 @@ def meaningful_text(raw: str) -> str:
     return text
 
 
-def progress(out: Path) -> dict[str, Any]:
-    """各段还剩多少没做完(审查 M-b:重报价扣掉已完成的)。一个单元做完 = 有一条没出错、对话也
-    齐了的记录(提炼段 = 有结果)。"""
+def progress(out: Path, q: Mapping[str, Any]) -> dict[str, Any]:
+    """各段还剩多少没做完(审查 M-b / 第三轮 M2)。分母是**这份报价意味着的全部单元**(对它覆盖的
+    每一段都 ``build_units``,没 ``prepare`` 过的段也算进去),分子是 ``out`` 里已经做完的(同一个
+    场景 / 家 / 次,任何一次尝试做完就算):没出错、对话也齐了(提炼段 = 有结果)。"""
+    scenarios = all_scenarios()
     total: dict[str, int] = {}
     done: dict[str, int] = {}
-    scenarios = all_scenarios()
+    per_phase: dict[str, dict[str, Any]] = {}
     for name, phase in PHASES.items():
-        if not (out / name / "units.json").exists():
-            continue
         budget = budget_of(name)
-        units = load_units(out, name)
-        records = {r["key"]: r for r in read_jsonl(out / name / "records.jsonl")}
-        finished = 0
-        for u in units:
-            r = records.get(unit_key(u))
-            if not r or r.get("error"):
+        if budget not in q["phases"]:
+            continue
+        implied = build_units(phase, q)
+        finished: set[tuple[str, str, int]] = set()
+        for r in read_jsonl(out / name / "records.jsonl"):
+            if r.get("error"):
                 continue
-            if phase.kind == "extraction" or len(r.get("convs", [])) >= len(
-                scenarios[u["scenario_id"]].conversations
-            ):
-                finished += 1
-        total[budget] = total.get(budget, 0) + len(units)
-        done[budget] = done.get(budget, 0) + finished
+            complete = phase.kind == "extraction" and r.get("result") is not None
+            if phase.kind != "extraction":
+                complete = len(r.get("convs", [])) >= len(scenarios[r["scenario_id"]].conversations)
+            if complete:
+                finished.add((r["scenario_id"], r["vendor"], int(r["repeat"])))
+        n_done = sum((u["scenario_id"], u["vendor"], int(u["repeat"])) in finished for u in implied)
+        per_phase[name] = {
+            "total": len(implied),
+            "done": n_done,
+            "remaining_share": round(1 - n_done / len(implied), 4) if implied else 1.0,
+        }
+        total[budget] = total.get(budget, 0) + len(implied)
+        done[budget] = done.get(budget, 0) + n_done
     return {
         "units": {b: {"total": total[b], "done": done[b]} for b in total},
-        "remaining_share": {
-            b: round(1 - done[b] / total[b], 4) if total[b] else 1.0 for b in total
-        },
+        "phases": per_phase,
+        # 报价按段缩(``b300_plan.GROUP_PHASES``)
+        "remaining_share": {n: v["remaining_share"] for n, v in per_phase.items()},
     }
 
 

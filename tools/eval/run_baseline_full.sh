@@ -22,6 +22,9 @@ cd "$(dirname "$0")/../.."
 ENV_FILE="${EXPERT_WORK_EVAL_ENV:-$HOME/.expert-work-eval.env}"
 MODE="${1:-full}"
 RUN="uv run python tools/eval/run_longmem.py"
+# B-300:端到端档必须说明被测代码有没有显式的「用户文字」入口(run_longmem.py 二选一)。
+# B-300 PR 1 合并之前是 --pre-b300;之后改成 --expect-user-text(也可用环境变量覆盖)。
+USER_TEXT_FLAG="${USER_TEXT_FLAG:---pre-b300}"
 
 if [[ ! -f "$ENV_FILE" ]]; then
     echo "ERROR: env file not found: $ENV_FILE" >&2
@@ -47,7 +50,7 @@ run_smoke() {
     log "smoke: fixture retrieval (fake embedder, free)"
     $RUN --benchmark fixture_longmemeval --tier retrieval --arms default,no_decay
     log "smoke: fixture endtoend (real Qwen, a few cents — validates both keys)"
-    $RUN --benchmark fixture_locomo --tier endtoend --embedder real \
+    $RUN --benchmark fixture_locomo --tier endtoend --embedder real "$USER_TEXT_FLAG" \
         --results eval-out/smoke_locomo.jsonl --concurrency 2
     log "smoke OK — keys and endpoints are live"
 }
@@ -63,7 +66,7 @@ run_retrieval() {
 
 run_endtoend() {
     log "endtoend: locomo full (resumable — rerun this script to continue)"
-    $RUN --benchmark locomo --tier endtoend \
+    $RUN --benchmark locomo --tier endtoend "$USER_TEXT_FLAG" \
         --embedder real --concurrency "$CONCURRENCY" \
         --results eval-out/locomo_endtoend.jsonl --update-baseline
     # S re-scoped to a 150-question stratified sample (2026-06-10 user
@@ -71,7 +74,7 @@ run_endtoend() {
     # cross-vendor comparison. Full-S stays available for milestone runs
     # (drop --sample).
     log "endtoend: longmemeval_s sample=150 (resumable)"
-    $RUN --benchmark longmemeval_s --tier endtoend --sample 150 \
+    $RUN --benchmark longmemeval_s --tier endtoend --sample 150 "$USER_TEXT_FLAG" \
         --embedder real --concurrency "$CONCURRENCY" \
         --results eval-out/longmemeval_s_endtoend.jsonl --update-baseline
 }

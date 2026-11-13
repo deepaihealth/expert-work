@@ -65,7 +65,7 @@ def _remaining(path: Path | None) -> Mapping[str, float] | None:
 
     if path is None:
         return None
-    return dict(json.loads(path.read_text(encoding="utf-8"))["remaining_share"])
+    return plan.check_remaining(json.loads(path.read_text(encoding="utf-8"))["remaining_share"])
 
 
 def check_quote(args: argparse.Namespace) -> dict[str, Any]:
@@ -106,23 +106,27 @@ def approved(
         )
     if q["already_spent_yuan"] + args.stop_line > plan.CAP_YUAN:
         raise EvalError(
-            f"other quotes already spent ¥{q['already_spent_yuan']}; stop line ¥{args.stop_line} "
-            f"would cross the ¥{plan.CAP_YUAN:g} cap"
+            f"other quotes have spent ¥{q['already_spent_yuan']:g} (this quote's own spend counts "
+            f"against its stop line ¥{args.stop_line:g}); the two together would cross the "
+            f"¥{plan.CAP_YUAN:g} cap"
         )
     prices = plan.prices_for(
         vendors_of(args.vendor), accept_documented=args.accept_documented_prices
     )
     caps = {name: float(b["budget_yuan"]) for name, b in q["phase_budgets"].items()}
     pilot = bool(q["pilot"])
-    guard = spend.Guard.resume(
-        stop_line=args.stop_line,
-        prices=prices,
-        state_dir=args.state_dir,
-        quote_id=q["quote_id"],
-        unblock=args.unblock,
-        phase_caps=caps,
-        budget_of=lambda phase: budget_of(phase, pilot=pilot),
-    )
+    try:
+        guard = spend.Guard.resume(
+            stop_line=args.stop_line,
+            prices=prices,
+            state_dir=args.state_dir,
+            quote_id=q["quote_id"],
+            unblock=args.unblock,
+            phase_caps=caps,
+            budget_of=lambda phase: budget_of(phase, pilot=pilot),
+        )
+    except spend.QuoteDirError as exc:
+        raise EvalError(str(exc)) from exc
     if guard.blocked is not None and not allow_blocked:
         raise EvalError(
             f"this quote is stopped: {guard.blocked}. Check, then re-run with --unblock "
@@ -130,6 +134,24 @@ def approved(
         )
     record_approval(args.out, cmd=cmd, quote_id=q["quote_id"], user_said=args.user_said)
     return q, guard
+
+
+def settle_guard(args: argparse.Namespace) -> spend.Guard:
+    """只结算、不新花的步骤(收整理 / 写回的实际用量,审查第三轮 LOW):认账本里的报价编号,
+    **不重算报价** —— 新报价花了钱以后,旧报价重算出的编号会变,它的预留却还要能结掉。
+    必须在 :func:`spending` 里调;这个报价在给定目录里没有账本就拒。"""
+    quote_id = args.approved_quote
+    if not spend.ledger_path(args.state_dir, quote_id).exists():
+        raise EvalError(f"no ledger for quote {quote_id} in {args.state_dir}; nothing to settle")
+    prices = plan.prices_for(
+        vendors_of(args.vendor), accept_documented=args.accept_documented_prices
+    )
+    try:
+        return spend.Guard.resume(
+            stop_line=float("inf"), prices=prices, state_dir=args.state_dir, quote_id=quote_id
+        )
+    except spend.QuoteDirError as exc:
+        raise EvalError(str(exc)) from exc
 
 
 @contextmanager

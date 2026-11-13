@@ -412,8 +412,45 @@ def parse_allocation(raw: str | None) -> dict[str, float] | None:
         name, sep, value = part.partition("=")
         if not sep:
             raise PlanError(f"--allocation wants phase=yuan pairs; got {raw!r}")
-        out[name.strip().upper()] = float(value)
+        amount = float(value)
+        if not math.isfinite(amount) or amount < 0:
+            raise PlanError(f"--allocation values must be finite and >= 0; got {part!r}")
+        out[name.strip().upper()] = amount
     return out
+
+
+def check_remaining(raw: Mapping[str, Any]) -> dict[str, float]:
+    """``--progress`` 里各段还剩的比例:有限、在 [0, 1] 里(审查第三轮 LOW)。"""
+    out: dict[str, float] = {}
+    for name, value in raw.items():
+        share = float(value)
+        if not math.isfinite(share) or not 0.0 <= share <= 1.0:
+            raise PlanError(f"remaining share for {name} must be within [0, 1]; got {value!r}")
+        out[str(name)] = share
+    return out
+
+
+#: 报价里的组 → 跑它的段(``b300_phases.PHASES`` 的名字);重报价按段的「还剩多少」缩每一组
+#: (审查第三轮 M2:按段缩,便宜的段做完了不能把贵的段也一起缩掉)。没有对应段的组不缩。
+GROUP_PHASES: dict[str, tuple[str, ...]] = {
+    "A": ("a",),
+    "D-compare": ("compare-before", "compare-after"),
+    "B": ("b",),
+    "B-screen": ("b-screen",),
+    "C-C1": ("c",),
+    "C-C2": ("c",),
+    "C-C3": ("c",),
+    "C-C4": ("c4",),
+    "C-C5": ("c5",),
+    "C-baseline": ("c2-baseline", "c4-baseline", "c5-baseline"),
+}
+
+
+def group_share(group: str, remaining: Mapping[str, float] | None) -> float:
+    names = GROUP_PHASES.get(group, ())
+    if remaining is None or not names:
+        return 1.0
+    return sum(float(remaining.get(n, 1.0)) for n in names) / len(names)
 
 
 def select_lines(
@@ -425,7 +462,7 @@ def select_lines(
         budget = budget_of_group(line.group)
         if budget not in phases:
             continue
-        share = 1.0 if remaining is None else float(remaining.get(budget, 1.0))
+        share = group_share(line.group, remaining)
         out.append(replace(line, low=line.low * share, high=line.high * share))
     return out
 
@@ -463,7 +500,6 @@ def phase_budgets(
             "low_estimate_yuan": round(low[b], 2),
             "high_estimate_yuan": round(high[b], 2),
             "midpoint_yuan": round(mid[b], 2),
-            "remaining_share": round(1.0 if remaining is None else remaining.get(b, 1.0), 4),
             "budget_yuan": round(given[b], 2),
             "basis": basis,
         }
@@ -711,8 +747,9 @@ def quote(
         "phase_budgets": (
             {"pilot": {"budget_yuan": float(stop_line), "basis": "the whole pilot"}}
             if pilot
-            else phase_budgets(planned, stop_line, phases, allocation, remaining)
+            else phase_budgets(planned, stop_line, phases, allocation)
         ),
+        "remaining_by_phase": dict(sorted((remaining or {}).items())),
         "embeddings": embedding_estimate(vendors, embed_price),
         "not_priced": [
             "sandbox time of the eval agents (not model spend)",

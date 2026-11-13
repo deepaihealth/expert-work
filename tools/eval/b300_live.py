@@ -391,6 +391,23 @@ def parse_extraction(reply: str) -> list[dict[str, Any]]:
 # --------------------------------------------------------------------------- B / C 组对话
 
 
+def never_started(exc: BaseException, run_id: str | None) -> bool:
+    """运行确定没建起来:``POST /runs`` 回 4xx,或连不上(连 run id 都没有)。5xx 不算 —— 网关
+    502 / 504 时上游可能已经建好了(同 ``b302_live._never_started``)。"""
+    if isinstance(exc, httpx.HTTPStatusError):
+        return 400 <= exc.response.status_code < 500
+    return run_id is None and isinstance(exc, httpx.ConnectError | httpx.ConnectTimeout)
+
+
+def mark_run(exc: BaseException, *, run_id: str | None, started: bool | None) -> None:
+    """把「有没有建起运行」挂在异常上,写回预留据此结算(审查第三轮 LOW)。"""
+    try:
+        exc.b300_run_id = run_id  # type: ignore[attr-defined]
+        exc.b300_run_started = started  # type: ignore[attr-defined]
+    except AttributeError:
+        pass
+
+
 def run_cap_yuan(prices: Mapping[str, Price], models: Sequence[str]) -> float:
     """一次运行的上限:预算内的 token 全按其中最贵的输出价算。"""
     return RUN_TOKEN_BUDGET * max(prices[m].output for m in models) / 1e6
@@ -431,16 +448,20 @@ async def run_conversation(
     ``end`` 帧就查用量接口,还在跑就取消并按上限结算、止损。"""
     model = models[0]
     uploads: list[str] = []
-    for name, text in turn.documents:
-        resp = await http.post(
-            f"/v1/agents/{agent}/uploads",
-            data={"user_id": user, **({"session_id": session_id} if session_id else {})},
-            files={"file": (name, text.encode("utf-8"), content_type_for(name))},
-        )
-        resp.raise_for_status()
-        body = resp.json()["data"]
-        uploads.append(str(body["upload_id"]))
-        session_id = str(body["session_id"])
+    try:
+        for name, text in turn.documents:
+            resp = await http.post(
+                f"/v1/agents/{agent}/uploads",
+                data={"user_id": user, **({"session_id": session_id} if session_id else {})},
+                files={"file": (name, text.encode("utf-8"), content_type_for(name))},
+            )
+            resp.raise_for_status()
+            body = resp.json()["data"]
+            uploads.append(str(body["upload_id"]))
+            session_id = str(body["session_id"])
+    except BaseException as exc:
+        mark_run(exc, run_id=None, started=False)  # 还没发 POST /runs:一定没有运行
+        raise
     payload: dict[str, Any] = {"user_id": user, "input": turn.user, "mode": "stream"}
     if session_id:
         payload["session_id"] = session_id
@@ -464,7 +485,8 @@ async def run_conversation(
         tail = parser.flush()
         if tail is not None:
             collector.on_frame(*tail)
-    except BaseException:
+    except BaseException as exc:
+        mark_run(exc, run_id=collector.run_id, started=not never_started(exc, collector.run_id))
         if collector.run_id:
             try:
                 await _cancel(http, agent, collector.run_id, user)

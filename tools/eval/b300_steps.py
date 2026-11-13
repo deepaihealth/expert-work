@@ -24,7 +24,7 @@ import b300_live as live  # noqa: E402
 import b300_plan as plan  # noqa: E402
 import b300_runs as runs  # noqa: E402
 import b300_spend as spend  # noqa: E402
-from b300_approve import approved, check_quote, spending  # noqa: E402
+from b300_approve import approved, check_quote, settle_guard, spending  # noqa: E402
 from b300_outcomes import judge_items, latest_records  # noqa: E402
 from b300_phases import (  # noqa: E402
     PHASES,
@@ -267,9 +267,7 @@ def ingest(args: argparse.Namespace, emit: Callable[[str], None]) -> None:
     emit(f"{len(rows)} rows -> {target}")
     if args.op in {"consolidate", "writeback_usage"}:
         with spending(args):
-            _q, guard = approved(
-                args, cmd=f"ingest {args.op} {phase.name}", phase=phase.name, allow_blocked=True
-            )
+            guard = settle_guard(args)  # 认账本里的报价编号,不重算(审查第三轮 LOW)
             if args.op == "consolidate":
                 cost = settle_consolidation(args.out, phase.name, rows, guard)
             else:

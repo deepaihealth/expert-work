@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import statistics
 import sys
@@ -184,6 +185,10 @@ async def run_conversation_phase(
                     )
                 except (Exception, spend.SpendStopError) as exc:
                     # 对话断了:写回的预留照样记下(它可能已经在后台跑),之后按实际结算或留着。
+                    # 运行确定没建起来(``never_started``)的,记下来,结算时按 0 结。
+                    if writeback and reservations and reservations[-1]["run_id"] is None:
+                        reservations[-1]["run_id"] = getattr(exc, "b300_run_id", None)
+                        reservations[-1]["run_started"] = getattr(exc, "b300_run_started", None)
                     append_jsonl(
                         records_path,
                         {
@@ -275,35 +280,64 @@ def open_writeback_reservations(out: Path, phase: str) -> dict[str, list[dict[st
 FINISHED_JOB_STATUSES = frozenset({"done", "failed"})
 
 
+def _settled_state(out: Path, phase: str) -> dict[str, Any]:
+    path = out / phase / "writeback-settled.json"
+    return dict(json.loads(path.read_text(encoding="utf-8"))) if path.exists() else {}
+
+
 def settle_writeback_usage(
     out: Path, phase: str, rows: Sequence[Mapping[str, Any]], guard: spend.Guard
 ) -> dict[str, Any]:
-    """按 pod 里 ``writeback_usage`` 读出的实际用量结算写回预留(审查 HIGH):
+    """按 pod 里 ``writeback_usage`` 读出的实际用量结算写回预留(审查 HIGH / 第三轮 LOW):
 
-    * 一个用户的写回任务**全部**结束(done / failed)、且用量读得到(非空)才结算;
-    * 有任务没结束、找不到任务(run id 为空、还没入队)、用量为空 —— 都是「还读不到」,**留着预留**
-      (账本里按上限算),下次再收;从不按 0 结。"""
+    * 对话没建起运行(记录里 ``run_started`` 为假)的那笔:没有写回,按 0 结;
+    * 不知道建没建起运行(没有 run id、也证明不了没建)的那笔:**单独留着**(按上限算),不挡同一
+      用户别的几笔;
+    * 有 run id 的:这个用户所有有 run id 的写回任务都结束(done / failed)、用量读得到,才结;
+      没结束、找不到任务、用量为空 —— 留着,下次再收,从不按 0 结;
+    * 用量窗口从这一段最早一次 run 算起,所以每次报回的是累计数:按 run id 记下已经结过的,只结
+      「累计减去已结」那部分,已结过的 run 不再结(``writeback-settled.json``)。"""
     reports = {r["key"]: r for r in rows if r.get("op") == "writeback_usage"}
-    settled_users, waiting = 0, 0
-    total = 0.0
+    state = _settled_state(out, phase)
+    settled_users, waiting, total = 0, 0, 0.0
     for user, reservations in open_writeback_reservations(out, phase).items():
         pending = [res for res in reservations if guard.open_cap(res["call_id"]) > 0]
-        if not pending:
+        for res in [
+            r for r in pending if r.get("run_id") is None and r.get("run_started") is False
+        ]:
+            guard.settle(
+                res["call_id"], item="writeback", model="", phase=phase, cost=0.0, reason="no_run"
+            )
+        with_runs = [r for r in reservations if r.get("run_id")]
+        todo = [r for r in pending if r.get("run_id")]
+        if not todo:
             continue
         report = reports.get(user) or {}
         jobs = report.get("jobs") or {}
-        ready = all(
-            res["run_id"] and jobs.get(res["run_id"]) in FINISHED_JOB_STATUSES
-            for res in reservations
-        )
         models = report.get("models") or []
-        if not ready or not models:
+        if not models or not all(jobs.get(r["run_id"]) in FINISHED_JOB_STATUSES for r in with_runs):
             waiting += 1
             continue
-        total += live.settle_writebacks(
-            guard, [res["call_id"] for res in pending], models, phase=phase
-        )
+        try:
+            cumulative = spend.usage_cost(models, guard.prices)
+        except KeyError as exc:
+            guard.block(f"writeback usage for {user} has a model without a price: {exc}")
+            continue
+        seen = state.setdefault(user, {"yuan": 0.0, "runs": []})
+        amount = max(0.0, cumulative - float(seen["yuan"]))
+        for n, res in enumerate(todo):  # 按各笔上限依次分摊,最后一笔拿余数
+            cost = amount if n == len(todo) - 1 else min(amount, guard.open_cap(res["call_id"]))
+            amount -= cost
+            total += guard.settle(
+                res["call_id"], item="writeback", model="", phase=phase, cost=cost
+            )
+            seen["runs"].append(res["run_id"])
+        seen["yuan"] = max(float(seen["yuan"]), cumulative)
         settled_users += 1
+    (out / phase).mkdir(parents=True, exist_ok=True)
+    (out / phase / "writeback-settled.json").write_text(
+        json.dumps(state, indent=1), encoding="utf-8"
+    )
     return {
         "settled_yuan": round(total, 6),
         "settled_users": settled_users,

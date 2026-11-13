@@ -195,6 +195,7 @@ def parser() -> argparse.ArgumentParser:
     p = sub.add_parser("progress")
     p.add_argument("--out", type=Path, required=True)
     p.add_argument("--write", type=Path, required=True)
+    _quote_args(p, stop_required=False)  # 同一组报价参数:分母是这份报价意味着的全部单元
     p = sub.add_parser("pilot-tokens")
     p.add_argument("--out", type=Path, required=True)
     p.add_argument("--write", type=Path, required=True)
@@ -410,7 +411,7 @@ def main(argv: Sequence[str] | None = None, *, emit: Callable[[str], None] = pri
                 emit(str(path))
             return 0
         if args.cmd == "progress":
-            body = progress(args.out)
+            body = progress(args.out, make_quote(args))
             args.write.write_text(json.dumps(body, indent=2), encoding="utf-8")
             emit(json.dumps(body))
             return 0
