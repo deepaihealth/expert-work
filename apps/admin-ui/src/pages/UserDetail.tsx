@@ -24,6 +24,7 @@ import {
 import { listMemories, type MemoryItem, type MemoryKind } from "../api/memory";
 import { getUsageTokens } from "../api/usage";
 import { getTenantUser } from "../api/users";
+import { MemoryOriginTag } from "../components/MemoryOriginTag";
 import { PageHeader } from "../components/PageHeader";
 import { concreteTenantScope, useTenantScope } from "../tenant/TenantScopeContext";
 import { ArtifactsPane } from "./user_detail/ArtifactsPane";
@@ -211,6 +212,13 @@ function MemoryPane({ userId }: { userId: string }) {
             {kind}
           </Tag>
         ),
+      },
+      {
+        // B-300 PR 2 — the same source label the agent sees at recall.
+        title: t("memory.col_origin"),
+        key: "origin",
+        width: 150,
+        render: (_: unknown, record) => <MemoryOriginTag item={record} />,
       },
       { title: t("memory_tab.col_content"), dataIndex: "content", key: "content", ellipsis: true },
       {

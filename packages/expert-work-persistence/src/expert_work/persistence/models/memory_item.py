@@ -122,5 +122,11 @@ class MemoryItemRow(Base):
     supersedes: Mapped[UUID | None] = mapped_column(PG_UUID(as_uuid=True), nullable=True)
     superseded_by: Mapped[UUID | None] = mapped_column(PG_UUID(as_uuid=True), nullable=True)
     expected_valid_days: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # ---- B-300 PR 2, migration 0189 ----
+    # origin: ``user_stated`` / ``assistant_derived`` / NULL (not recorded). No CHECK
+    # constraint — the application maps an unknown value to NULL on read.
+    origin: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # embedding_model: the ``provider/model`` that computed ``embedding``; NULL = unknown.
+    embedding_model: Mapped[str | None] = mapped_column(Text, nullable=True)
 
     __table_args__ = (Index("memory_item_tenant_user_idx", "tenant_id", "user_id"),)

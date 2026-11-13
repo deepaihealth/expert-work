@@ -3393,6 +3393,11 @@ export interface TranslationKeys {
     empty_home: string;
     empty_cross: string;
     col_kind: string;
+    col_origin: string;
+    origin_user_stated: string;
+    origin_assistant_derived: string;
+    origin_user_corrected: string;
+    origin_unrecorded: string;
     col_content: string;
     col_score: string;
     col_user: string;
@@ -7551,6 +7556,11 @@ const en: TranslationKeys = {
     empty_home: "No memories in this tenant yet.",
     empty_cross: "No memories across all tenants yet.",
     col_kind: "Kind",
+    col_origin: "Source",
+    origin_user_stated: "stated in user messages",
+    origin_assistant_derived: "from the assistant",
+    origin_user_corrected: "corrected by the user",
+    origin_unrecorded: "source not recorded",
     col_content: "Content",
     col_score: "Scores",
     col_user: "User",

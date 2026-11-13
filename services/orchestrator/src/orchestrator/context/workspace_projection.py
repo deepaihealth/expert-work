@@ -30,7 +30,7 @@ from typing import Protocol
 
 from expert_work.protocol import MemoryItem, Plan, PlanStep
 from expert_work.protocol.plan import PlanStepExecution, PlanStepStatus
-from orchestrator.context.memory_render import MEMORY_LINE_LEGEND, MEMORY_REMINDER, memory_line
+from orchestrator.context.memory_render import MEMORY_LINE_LEGEND, memory_line, memory_reminder
 
 logger = logging.getLogger(__name__)
 
@@ -187,7 +187,7 @@ def render_memory_md(memories: Sequence[MemoryItem]) -> str:
         return ""
     lines = [_READONLY_NOTE, "", "# Memory", "", MEMORY_LINE_LEGEND]
     lines.extend(memory_line(item) for item in memories)
-    lines.extend(["", MEMORY_REMINDER])
+    lines.extend(["", memory_reminder(memories)])
     return "\n".join(lines) + "\n"
 
 

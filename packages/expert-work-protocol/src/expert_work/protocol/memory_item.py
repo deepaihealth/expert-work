@@ -9,10 +9,10 @@ Scoped to ``(tenant_id, user_id)``.
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Literal
+from typing import Literal, get_args
 from uuid import UUID
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 # Capability Uplift Sprint #7 — Mini-ADR U-33.
 # Lifecycle of a memory item:
@@ -23,6 +23,18 @@ from pydantic import BaseModel, ConfigDict, Field
 #                  registers the state + retrieve() filter, M2-C wires
 #                  the archive() implementation
 MemoryStatus = Literal["transient", "consolidated", "archived"]
+
+# B-300 ② —— 记忆的来源。提炼写入的只由「是哪一次提炼出来的」决定(模型不打标签,程序不看内容):
+#   user_stated       —— 第一次提炼的产出:只看白名单里用户输入的文字就读得出来;
+#                        另外,用户本人在控制台改写自己这一条也记它
+#   assistant_derived —— 第二次提炼的产出:助手做的、得出的、提出的,以及用户只是回答 / 同意的
+# 空 = 存量、失败重试重建的、整理汇总里不全是来自助手的、别人在控制台改写过内容的
+# (那时置信度也压到 0.99 以内)。
+MemoryOrigin = Literal["user_stated", "assistant_derived"]
+MEMORY_ORIGINS: frozenset[str] = frozenset(get_args(MemoryOrigin))
+
+#: 召回渲染与去重合并的拦截规则共用的「有效来源」(B-300 设计 §5.1)。
+EffectiveOrigin = Literal["user_corrected", "user_stated", "assistant_derived", "unrecorded"]
 
 
 class MemoryItem(BaseModel):
@@ -174,3 +186,37 @@ class MemoryItem(BaseModel):
         description="P5b — LLM-estimated validity window in days (per-fact predictive "
         "review input, read in P5b-2; column reserved here).",
     )
+    # ---- B-300 PR 2 ----
+    origin: MemoryOrigin | None = Field(
+        default=None,
+        description="B-300 — where the memory came from: ``user_stated`` (extracted "
+        "from what the user typed) or ``assistant_derived`` (from the transcript). "
+        "NULL = not recorded. An unknown stored value reads as NULL. Internal only.",
+    )
+    embedding_model: str | None = Field(
+        default=None,
+        description="B-300 — the embedding model (``provider/model``) that computed "
+        "``embedding``; NULL for rows written before the column or by a path that "
+        "cannot tell. Internal only — never on an external surface.",
+    )
+
+    @field_validator("origin", mode="before")
+    @classmethod
+    def _unknown_origin_is_unrecorded(cls, value: object) -> object:
+        # 应用层校验(库里不加检查约束):不认识的值当作「未记录」,读时不报错。
+        return value if isinstance(value, str) and value in MEMORY_ORIGINS else None
+
+
+def effective_origin(item: MemoryItem) -> EffectiveOrigin:
+    """The one source label every reader uses (B-300 design §5.1): the recall
+    block, the reconcile blocking rule, consolidation and the console.
+
+    ``confidence >= 1.0`` is written only by the user-correction endpoint, so it
+    wins over the column — stored corrections need no backfill."""
+    if item.confidence >= 1.0:
+        return "user_corrected"
+    if item.origin == "user_stated":
+        return "user_stated"
+    if item.origin == "assistant_derived":
+        return "assistant_derived"
+    return "unrecorded"

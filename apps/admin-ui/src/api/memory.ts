@@ -23,6 +23,26 @@ import { listAudit, type AuditEntry } from "./audit";
 
 export type MemoryKind = "fact" | "episodic";
 
+/** B-300 PR 2 — the source column: what the user typed (``user_stated``) or
+ *  what came from the transcript (``assistant_derived``); null = not recorded. */
+export type MemoryOrigin = "user_stated" | "assistant_derived";
+
+/** The four labels every reader shows (B-300 design §5.1). */
+export type EffectiveOrigin =
+  | "user_corrected"
+  | "user_stated"
+  | "assistant_derived"
+  | "unrecorded";
+
+/** Same rule as the backend's ``effective_origin``: confidence 1.0 is written
+ *  only by the user-correction endpoint, so it wins over the column. */
+export function effectiveOrigin(item: Pick<MemoryItem, "origin" | "confidence">): EffectiveOrigin {
+  if (item.confidence >= 1) return "user_corrected";
+  if (item.origin === "user_stated") return "user_stated";
+  if (item.origin === "assistant_derived") return "assistant_derived";
+  return "unrecorded";
+}
+
 export interface MemoryItem {
   id: string;
   tenant_id: string;
@@ -41,6 +61,8 @@ export interface MemoryItem {
   expired_at?: string | null;
   invalid_at?: string | null;
   expected_valid_days?: number | null;
+  /** B-300 PR 2 — absent on rows read from an older backend. */
+  origin?: MemoryOrigin | null;
 }
 
 export interface MemoryList {

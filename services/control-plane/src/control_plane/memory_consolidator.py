@@ -39,7 +39,7 @@ from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import UTC, date, datetime, timedelta
-from typing import TYPE_CHECKING, Any, Protocol
+from typing import TYPE_CHECKING, Any, Protocol, cast, runtime_checkable
 from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, ValidationError
@@ -66,6 +66,7 @@ from expert_work.common.uplift_metrics import (
 from expert_work.persistence.memory.base import (
     ConsolidationSourcesChangedError,
     MemoryInjectionBlockedError,
+    is_mixed_origin,
 )
 from expert_work.persistence.memory.hash import hash_content
 from expert_work.persistence.rls import (
@@ -77,6 +78,7 @@ from expert_work.persistence.token_usage_store import TokenUsageRecord, TokenUsa
 from expert_work.protocol import AuditAction, AuditResult, MemoryItem, StructuredOutputSpec
 from expert_work.runtime.audit.logger import AuditLogger
 from expert_work.runtime.middleware import LLMOutputValidationError
+from orchestrator.llm import Embedder, embed_with_model
 
 if TYPE_CHECKING:
     from expert_work.persistence.memory.base import MemoryStore
@@ -185,6 +187,26 @@ class ConsolidatorEmbedder(Protocol):
         ``tenant_id`` resolves the per-tenant embedding credential)."""
 
 
+@runtime_checkable
+class ModelReportingConsolidatorEmbedder(Protocol):
+    """B-300 PR 2 —— a :class:`ConsolidatorEmbedder` that can also name the
+    embedding model (``provider/model``) a call used."""
+
+    async def embed_one_reporting_model(
+        self, text: str, *, tenant_id: UUID
+    ) -> tuple[tuple[float, ...], str | None]:
+        """:meth:`ConsolidatorEmbedder.embed_one`, plus the model (``None`` = unknown)."""
+
+
+async def _embed_one_with_model(
+    embedder: ConsolidatorEmbedder, text: str, *, tenant_id: UUID
+) -> tuple[tuple[float, ...], str | None]:
+    """The summary's vector and, when the embedder can tell, its model."""
+    if isinstance(embedder, ModelReportingConsolidatorEmbedder):
+        return await embedder.embed_one_reporting_model(text, tenant_id=tenant_id)
+    return await embedder.embed_one(text, tenant_id=tenant_id), None
+
+
 class _OrchestratorEmbedderAdapter:
     """Wraps an orchestrator-style ``Embedder`` (batch) as a
     :class:`ConsolidatorEmbedder` (single-text)."""
@@ -193,14 +215,22 @@ class _OrchestratorEmbedderAdapter:
         self._embedder = embedder
 
     async def embed_one(self, text: str, *, tenant_id: UUID) -> tuple[float, ...]:
+        vector, _model = await self.embed_one_reporting_model(text, tenant_id=tenant_id)
+        return vector
+
+    async def embed_one_reporting_model(
+        self, text: str, *, tenant_id: UUID
+    ) -> tuple[tuple[float, ...], str | None]:
         # Embedder.embed returns ``list[tuple[float, ...]]``; we always
-        # send a single text and unwrap.
-        result = await self._embedder.embed([text], tenant_id=tenant_id)  # type: ignore[attr-defined]
+        # send a single text and unwrap. B-300 PR 2 —— 内层报得出模型就一并报。
+        result, model = await embed_with_model(
+            cast(Embedder, self._embedder), [text], tenant_id=tenant_id
+        )
         if not result:
             msg = "embedder returned empty result for single text"
             raise RuntimeError(msg)
         first = result[0]
-        return tuple(float(v) for v in first)
+        return tuple(float(v) for v in first), model
 
 
 class _NullConsolidatorAuxModel:
@@ -1001,6 +1031,7 @@ class MemoryConsolidator:
 
         B-300 —— 模型拒过的簇(成员集合一样)直接跳过,不占每个用户的簇数上限;跳过的簇的
         成员照样记进 ``seen``,否则同一片里的下一个种子会取出一组略有不同的成员、又问一次。
+        混合来源的簇(PR 2)同样在这里滤掉、成员同样记进 ``seen``。
         """
         transients = await self._memory.list_transient(
             tenant_id=tenant_id,
@@ -1035,6 +1066,10 @@ class MemoryConsolidator:
                 continue
             seen.update(n.id for n in fresh)
             if _cluster_hash(fresh) in rejected:
+                continue
+            if is_mixed_origin(fresh):
+                # B-300 §6.2 —— 既有来自助手、又有用户说的 / 用户更正的:不汇总,不调模型。
+                # 程序判断、每轮结果一样,所以不用记标记;成员已记进 ``seen``(同上)。
                 continue
             clusters.append(fresh)
         return clusters
@@ -1105,7 +1140,9 @@ class MemoryConsolidator:
             return
 
         if verdict.keep and verdict.summary is not None:
-            embedding = await self._embedder.embed_one(verdict.summary, tenant_id=tenant_id)
+            embedding, embedding_model = await _embed_one_with_model(
+                self._embedder, verdict.summary, tenant_id=tenant_id
+            )
             source_ids = [item.id for item in cluster]
             try:
                 new_item = await self._memory.write_consolidated(
@@ -1113,6 +1150,7 @@ class MemoryConsolidator:
                     user_id=user_id,
                     content=verdict.summary,
                     embedding=embedding,
+                    embedding_model=embedding_model,
                     source_ids=source_ids,
                     # 取簇时读到的每条成员的内容哈希:判的这段时间里被原地更正过的
                     # 成员也算变了(汇总是按旧内容写的)。

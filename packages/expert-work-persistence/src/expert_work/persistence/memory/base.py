@@ -12,7 +12,7 @@ persistence layer free of any embedding-model dependency.
 from __future__ import annotations
 
 import abc
-from collections.abc import Mapping, Sequence
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Literal
@@ -20,6 +20,100 @@ from uuid import UUID
 
 from expert_work.common.threat_patterns import ThreatFinding, scan_for_threats
 from expert_work.protocol import MemoryItem
+from expert_work.protocol.memory_item import MemoryOrigin, effective_origin
+
+#: B-300 —— 不是用户更正的行(汇总行、别人改写过的行)置信度的上限:1.0 只留给用户更正
+#: (更正接口独占的哨兵值)。
+NON_CORRECTION_MAX_CONFIDENCE = 0.99
+#: B-300 ② —— 来自助手的记忆置信度上限(与提炼第二次的封顶同一个数)。
+ASSISTANT_DERIVED_MAX_CONFIDENCE = 0.6
+#: 有效来源里算「用户一方」的两种(拦截规则、混合簇判断共用)。
+USER_SIDE_ORIGINS = frozenset({"user_stated", "user_corrected"})
+
+
+def is_mixed_origin(members: Sequence[MemoryItem]) -> bool:
+    """B-300 §6.2 —— 一组记忆里既有「来自助手」,又有用户消息里说的 / 用户更正的。
+
+    来源未记录的不算哪一边。整理时这样的簇不汇总。"""
+    origins = {effective_origin(m) for m in members}
+    return "assistant_derived" in origins and bool(origins & USER_SIDE_ORIGINS)
+
+
+@dataclass(frozen=True)
+class SummaryFields:
+    """B-300 D6 前半 + §6.2 —— 一条汇总行从成员继承的出处、分数与来源。"""
+
+    source_thread_id: str | None
+    source_run_id: str | None
+    importance: float
+    confidence: float
+    origin: MemoryOrigin | None
+
+
+def summary_fields(members: Sequence[MemoryItem]) -> SummaryFields:
+    """汇总行带的出处和分数(两个存储实现在写汇总的事务里、按重读到的成员算):
+
+    * 来源会话 / 来源 run 取成员里最新(``created_at`` 最大)的那一条的;
+    * 重要度取成员最大值;置信度取成员最小值,上限 0.99(1.0 只留给用户更正);
+    * 成员全是「来自助手」→ 来源记「来自助手」、置信度再压到 0.6 以内;否则来源为空
+      (汇总句是模型新写的文字,不给「用户消息里说的」)。
+    """
+
+    def _created(item: MemoryItem) -> float:
+        return item.created_at.timestamp() if item.created_at is not None else float("-inf")
+
+    newest = max(members, key=_created)
+    all_assistant = all(effective_origin(m) == "assistant_derived" for m in members)
+    confidence = min(min(m.confidence for m in members), NON_CORRECTION_MAX_CONFIDENCE)
+    if all_assistant:
+        confidence = min(confidence, ASSISTANT_DERIVED_MAX_CONFIDENCE)
+    return SummaryFields(
+        source_thread_id=newest.source_thread_id,
+        source_run_id=newest.source_run_id,
+        importance=max(m.importance for m in members),
+        confidence=confidence,
+        origin="assistant_derived" if all_assistant else None,
+    )
+
+
+#: 嵌套汇总向下查成员的层数上限;查到上限还有没查的成员,按「受保护」处理(保守方向)。
+MAX_SUMMARY_DEPTH = 8
+
+#: 按 id 取一批记忆(不看是否仍有效、是否已删):受保护判断向下查汇总成员用。
+MemberLoader = Callable[[Sequence[UUID]], Awaitable[Sequence[MemoryItem]]]
+
+
+async def is_user_side_protected(item: MemoryItem, load: MemberLoader) -> bool:
+    """B-300 §6.2 拦截规则保护的对象(审查 MEDIUM-3,用户 11-13 定「补上保护」):
+
+    * 有效来源是用户消息里说的 / 用户更正的那一条;
+    * 一条汇总行(来源为空),它的成员 —— 一层层往下,成员本身是汇总的接着查它的成员 ——
+      里有任何一条是用户一方的。成员早已被汇总、取代或过期,照样算(汇总句里还有它的内容)。
+
+    ``visited`` 防环;``MAX_SUMMARY_DEPTH`` 层之后还有没查的成员 → 受保护。"""
+    if effective_origin(item) in USER_SIDE_ORIGINS:
+        return True
+    visited = {item.id}
+    frontier = [sid for sid in item.consolidated_from if sid not in visited]
+    for _depth in range(MAX_SUMMARY_DEPTH):
+        if not frontier:
+            return False
+        visited.update(frontier)
+        members = await load(frontier)
+        if any(effective_origin(m) in USER_SIDE_ORIGINS for m in members):
+            return True
+        frontier = list(
+            dict.fromkeys(sid for m in members for sid in m.consolidated_from if sid not in visited)
+        )
+    return bool(frontier)
+
+
+class UserSideTargetError(RuntimeError):
+    """B-300 审查 MEDIUM-1 —— 带保护的 ``supersede`` / ``expire``(``refuse_user_side``)
+    在锁里重读目标,发现它(或它汇总的成员)是用户一方的:什么都没改。
+
+    去重合并读邻居与真正改库之间隔着一次模型调用,用户可能恰好在这几秒里「更正」了这一条;
+    调用方按拦截规则处理(被拦的更新带更正 → 按新增,否则丢弃;被拦的删除 → 不动)。"""
 
 
 @dataclass(frozen=True)
@@ -225,8 +319,20 @@ class MemoryStore(abc.ABC):
         embedding: Sequence[float],
         kind: Literal["fact", "episodic"] | None = None,
         confidence: float | None = None,
+        embedding_model: str | None = None,
+        clear_origin: bool = False,
+        origin: MemoryOrigin | None = None,
+        max_confidence: float | None = None,
     ) -> MemoryItem | None:
         """Stream K.K6 — rewrite a live memory's content / kind.
+
+        B-300 PR 2 — ``embedding_model`` (the model that computed ``embedding``;
+        ``None`` = not known) always replaces the row's value, since the vector
+        is replaced. The source column: ``clear_origin`` sets it to NULL,
+        otherwise a given ``origin`` replaces it, otherwise it is kept (a user
+        correction keeps it — its effective source is the 1.0 confidence).
+        ``max_confidence`` caps the row's confidence as stored (review
+        MEDIUM-2: someone else's edit takes the row out of the 1.0 sentinel).
 
         The caller must re-embed before calling — the store does not
         own an embedder. Soft-deleted rows are not updatable; returns
@@ -268,6 +374,7 @@ class MemoryStore(abc.ABC):
         user_id: UUID,
         old_id: UUID,
         new_item: MemoryItem,
+        refuse_user_side: bool = False,
     ) -> MemoryItem | None:
         """P5b — append-only UPDATE. Atomically close ``old_id`` (set
         ``invalid_at=now``, ``superseded_by=new_item.id``) and insert
@@ -286,7 +393,12 @@ class MemoryStore(abc.ABC):
         B-300 D1 (the other direction) — the target is re-read under a row lock;
         when it was folded into a summary, expired or archived since the caller
         picked it, :class:`SupersedeTargetChangedError` is raised and nothing
-        changes (``None`` keeps meaning unknown / deleted / already superseded)."""
+        changes (``None`` keeps meaning unknown / deleted / already superseded).
+
+        B-300 review MEDIUM-1 — ``refuse_user_side`` (the write-back passes it for
+        an assistant-derived candidate): under the same row lock, a target that
+        is :func:`is_user_side_protected` raises :class:`UserSideTargetError` and
+        nothing changes."""
 
     @abc.abstractmethod
     async def expire(
@@ -295,12 +407,22 @@ class MemoryStore(abc.ABC):
         tenant_id: UUID,
         user_id: UUID,
         memory_id: UUID,
+        refuse_user_side: bool = False,
     ) -> bool:
         """P5b — retraction: stamp ``expired_at=now`` on a fact that stopped
         being true in the world with NO successor (orthogonal to ``supersede``'s
         ``invalid_at``). The row is KEPT (history/audit) but excluded from
         default retrieve. Returns ``False`` for unknown id / wrong tenant-user.
-        Tenant- AND user-scoped."""
+        Tenant- AND user-scoped.
+
+        B-300 review MEDIUM-1 — the target row is locked (``FOR UPDATE``) before
+        it is changed; with ``refuse_user_side`` a :func:`is_user_side_protected`
+        target raises :class:`UserSideTargetError` and nothing changes."""
+
+    @abc.abstractmethod
+    async def user_side_protected(self, *, tenant_id: UUID, user_id: UUID, memory_id: UUID) -> bool:
+        """B-300 review MEDIUM-3 — :func:`is_user_side_protected` for one row, its
+        summary members read whatever their current validity. Unknown id → False."""
 
     @abc.abstractmethod
     async def delete_all_for_user(self, *, tenant_id: UUID, user_id: UUID) -> int:
@@ -433,6 +555,7 @@ class MemoryStore(abc.ABC):
         embedding: Sequence[float],
         source_ids: Sequence[UUID],
         source_hashes: Mapping[UUID, str],
+        embedding_model: str | None = None,
     ) -> MemoryItem:
         """Sprint #7 SUB-PASS 1 commit — write a new consolidated item
         with ``status='consolidated'`` + ``consolidated_from=source_ids``
@@ -451,7 +574,15 @@ class MemoryStore(abc.ABC):
         as it was read when the cluster was picked; a member corrected in place
         meanwhile (still current, new text) counts as changed too — the summary
         was decided on the old text. ``content`` goes through the strict write scan first;
-        blocked → :class:`MemoryInjectionBlockedError`, nothing written (D2)."""
+        blocked → :class:`MemoryInjectionBlockedError`, nothing written (D2).
+
+        B-300 PR 2 — the summary row takes its provenance, scores and source
+        from the re-read members (:func:`summary_fields`) and records
+        ``embedding_model``. Members that turned out mixed-source (assistant and
+        user side, :func:`is_mixed_origin`) raise
+        :class:`ConsolidationSourcesChangedError` — such clusters are never
+        summarized; the consolidator filters them when it picks clusters, this
+        re-check covers a member corrected meanwhile."""
 
     @abc.abstractmethod
     async def list_purge_candidates(

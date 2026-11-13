@@ -22,12 +22,17 @@ from expert_work.persistence.bulk_delete import count_where, delete_where
 from expert_work.persistence.knowledge.text_search import tokenize_for_search
 from expert_work.persistence.memory.base import (
     ConsolidationSourcesChangedError,
+    MemberLoader,
     MemoryInjectionBlockedError,
     MemoryStore,
     MemoryWriteResult,
     SupersedeTargetChangedError,
+    UserSideTargetError,
+    is_mixed_origin,
+    is_user_side_protected,
     scan_memory_content,
     split_blocked,
+    summary_fields,
 )
 from expert_work.persistence.memory.hash import hash_content
 from expert_work.persistence.models import (
@@ -36,6 +41,7 @@ from expert_work.persistence.models import (
     MemoryItemRow,
 )
 from expert_work.protocol import MemoryItem
+from expert_work.protocol.memory_item import MemoryOrigin
 
 #: Postgres ``tsvector`` configuration — ``simple`` so app-side jieba
 #: segmentation is what controls tokenization (mirrors J.5 knowledge).
@@ -102,6 +108,9 @@ def _row_to_item(row: MemoryItemRow) -> MemoryItem:
         supersedes=row.supersedes,
         superseded_by=row.superseded_by,
         expected_valid_days=row.expected_valid_days,
+        # B-300 PR 2 — an unknown stored origin reads as None (model validator).
+        origin=row.origin,  # type: ignore[arg-type]
+        embedding_model=row.embedding_model,
     )
     # Capability Uplift Sprint #2 (Mini-ADR U-4) — drift detection.
     if row.content_hash and hash_content(row.content) != row.content_hash:
@@ -132,6 +141,39 @@ def _retrieve_filter(as_of: datetime | None = None) -> list[ColumnElement[bool]]
         base.append(or_(MemoryItemRow.invalid_at.is_(None), MemoryItemRow.invalid_at > as_of))
         base.append(or_(MemoryItemRow.expired_at.is_(None), MemoryItemRow.expired_at > as_of))
     return base
+
+
+def _member_loader(session: AsyncSession, tenant_id: UUID, user_id: UUID) -> MemberLoader:
+    """B-300 review MEDIUM-3 — read summary members by id in ``session``, whatever
+    their current validity (folded, superseded, expired, deleted all count)."""
+
+    async def load(ids: Sequence[UUID]) -> list[MemoryItem]:
+        rows = (
+            (
+                await session.execute(
+                    select(MemoryItemRow).where(
+                        MemoryItemRow.id.in_(list(ids)),
+                        MemoryItemRow.tenant_id == tenant_id,
+                        MemoryItemRow.user_id == user_id,
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+        return [_row_to_item(row) for row in rows]
+
+    return load
+
+
+async def _refuse_if_user_side(session: AsyncSession, row: MemoryItemRow, *, refuse: bool) -> None:
+    """B-300 review MEDIUM-1 — with ``refuse``, raise on a user-side target (the
+    row is already locked by the caller; members are read, not locked)."""
+    if refuse and await is_user_side_protected(
+        _row_to_item(row), _member_loader(session, row.tenant_id, row.user_id)
+    ):
+        msg = f"memory item {row.id} is on the user's side; not changing it"
+        raise UserSideTargetError(msg)
 
 
 class SqlMemoryStore(MemoryStore):
@@ -189,6 +231,9 @@ class SqlMemoryStore(MemoryStore):
                 "valid_at": item.valid_at if item.valid_at is not None else func.now(),
                 "supersedes": item.supersedes,
                 "expected_valid_days": item.expected_valid_days,
+                # B-300 PR 2 — source + the model that computed the vector.
+                "origin": item.origin,
+                "embedding_model": item.embedding_model,
             }
             for item in items
         ]
@@ -445,6 +490,10 @@ class SqlMemoryStore(MemoryStore):
         embedding: Sequence[float],
         kind: Literal["fact", "episodic"] | None = None,
         confidence: float | None = None,
+        embedding_model: str | None = None,
+        clear_origin: bool = False,
+        origin: MemoryOrigin | None = None,
+        max_confidence: float | None = None,
     ) -> MemoryItem | None:
         async with self._sf() as session:
             row = (
@@ -471,6 +520,17 @@ class SqlMemoryStore(MemoryStore):
             # content as truth, so the caller bumps confidence to 1.0.
             if confidence is not None:
                 row.confidence = confidence
+            # B-300 review MEDIUM-2 — capped on the row as stored, not on a value
+            # the caller read earlier.
+            if max_confidence is not None:
+                row.confidence = min(float(row.confidence), max_confidence)
+            # B-300 PR 2 — the vector is new, so is its model name; the source
+            # as the caller decides (see the base class).
+            row.embedding_model = embedding_model
+            if clear_origin:
+                row.origin = None
+            elif origin is not None:
+                row.origin = origin
             await session.commit()
             await session.refresh(row)
             return _row_to_item(row)
@@ -537,6 +597,7 @@ class SqlMemoryStore(MemoryStore):
         user_id: UUID,
         old_id: UUID,
         new_item: MemoryItem,
+        refuse_user_side: bool = False,
     ) -> MemoryItem | None:
         hit = scan_memory_content(new_item.id, new_item.content)
         if hit is not None:
@@ -568,6 +629,8 @@ class SqlMemoryStore(MemoryStore):
             if current != 1:
                 msg = f"memory item {old_id} is no longer current; not superseding it"
                 raise SupersedeTargetChangedError(msg)
+            # B-300 review MEDIUM-1 / MEDIUM-3 — re-judged on the locked row.
+            await _refuse_if_user_side(session, old, refuse=refuse_user_side)
             old.invalid_at = now
             old.superseded_by = new_item.id
             content = new_item.content
@@ -590,6 +653,8 @@ class SqlMemoryStore(MemoryStore):
                 valid_at=now,
                 supersedes=old_id,
                 expected_valid_days=new_item.expected_valid_days,
+                origin=new_item.origin,
+                embedding_model=new_item.embedding_model,
             )
             session.add(new_row)
             await session.commit()
@@ -602,22 +667,47 @@ class SqlMemoryStore(MemoryStore):
         tenant_id: UUID,
         user_id: UUID,
         memory_id: UUID,
+        refuse_user_side: bool = False,
     ) -> bool:
         now = datetime.now(UTC)
-        stmt = (
-            update(MemoryItemRow)
-            .where(
-                MemoryItemRow.id == memory_id,
-                MemoryItemRow.tenant_id == tenant_id,
-                MemoryItemRow.user_id == user_id,
-                MemoryItemRow.deleted_at.is_(None),
-            )
-            .values(expired_at=now)
-        )
         async with self._sf() as session:
-            result = await session.execute(stmt)
+            # B-300 review MEDIUM-1 — lock the one target row (single-row lock, so
+            # PR A's id-ordered locking holds) and re-judge it before changing it.
+            row = (
+                await session.execute(
+                    select(MemoryItemRow)
+                    .where(
+                        MemoryItemRow.id == memory_id,
+                        MemoryItemRow.tenant_id == tenant_id,
+                        MemoryItemRow.user_id == user_id,
+                        MemoryItemRow.deleted_at.is_(None),
+                    )
+                    .with_for_update()
+                )
+            ).scalar_one_or_none()
+            if row is None:
+                return False
+            await _refuse_if_user_side(session, row, refuse=refuse_user_side)
+            row.expired_at = now
             await session.commit()
-        return int(getattr(result, "rowcount", 0) or 0) > 0
+        return True
+
+    async def user_side_protected(self, *, tenant_id: UUID, user_id: UUID, memory_id: UUID) -> bool:
+        async with self._sf() as session:
+            row = (
+                await session.execute(
+                    select(MemoryItemRow).where(
+                        MemoryItemRow.id == memory_id,
+                        MemoryItemRow.tenant_id == tenant_id,
+                        MemoryItemRow.user_id == user_id,
+                    )
+                )
+            ).scalar_one_or_none()
+            if row is None:
+                return False
+            return await is_user_side_protected(
+                _row_to_item(row), _member_loader(session, tenant_id, user_id)
+            )
 
     async def delete_all_for_user(self, *, tenant_id: UUID, user_id: UUID) -> int:
         now = datetime.now(UTC)
@@ -837,6 +927,7 @@ class SqlMemoryStore(MemoryStore):
         embedding: Sequence[float],
         source_ids: Sequence[UUID],
         source_hashes: Mapping[UUID, str],
+        embedding_model: str | None = None,
     ) -> MemoryItem:
         now = datetime.now(UTC)
         new_id = uuid4()
@@ -858,29 +949,37 @@ class SqlMemoryStore(MemoryStore):
                 MemoryItemRow.user_id == user_id,
             ]
             locked = (
-                await session.execute(
-                    select(
-                        MemoryItemRow.id,
-                        MemoryItemRow.consolidated_into,
-                        MemoryItemRow.content_hash,
+                (
+                    await session.execute(
+                        select(MemoryItemRow)
+                        .where(*owned)
+                        .order_by(MemoryItemRow.id)
+                        .with_for_update()
                     )
-                    .where(*owned)
-                    .order_by(MemoryItemRow.id)
-                    .with_for_update()
                 )
-            ).all()
+                .scalars()
+                .all()
+            )
             # Idempotency guard — if any source has consolidated_into set
             # already, abort cleanly so the worker can skip on the next tick.
-            already = next((row for row in locked if row[1] is not None), None)
+            already = next((row for row in locked if row.consolidated_into is not None), None)
             if already is not None:
-                msg = f"memory item {already[0]} already consolidated_into {already[1]}; "
-                raise ConsolidationSourcesChangedError(msg + "skipping cluster")
+                msg = f"memory item {already.id} already consolidated_into "
+                msg += f"{already.consolidated_into}; skipping cluster"
+                raise ConsolidationSourcesChangedError(msg)
             # Review MEDIUM-1 — a member corrected in place since it was read: the
             # summary was decided on the old text.
-            changed = next((row for row in locked if source_hashes.get(row[0]) != row[2]), None)
+            changed = next(
+                (row for row in locked if source_hashes.get(row.id) != row.content_hash), None
+            )
             if changed is not None:
-                msg = f"memory item {changed[0]} changed since it was read; skipping cluster"
+                msg = f"memory item {changed.id} changed since it was read; skipping cluster"
                 raise ConsolidationSourcesChangedError(msg)
+            members = [_row_to_item(row) for row in locked]
+            # B-300 §6.2 — a mixed-source cluster is never summarized.
+            if is_mixed_origin(members):
+                msg = "cluster members mix assistant-derived and user-side sources; "
+                raise ConsolidationSourcesChangedError(msg + "skipping cluster")
             # The same "currently valid" predicate recall uses.
             current = (
                 await session.execute(
@@ -892,6 +991,8 @@ class SqlMemoryStore(MemoryStore):
             if current != len(set(source_ids)):
                 msg = "a cluster member is no longer current; skipping cluster"
                 raise ConsolidationSourcesChangedError(msg)
+            # B-300 D6 前半 — provenance and scores from the re-read members.
+            inherited = summary_fields(members)
             # Insert the consolidated parent.
             new_row = MemoryItemRow(
                 id=new_id,
@@ -906,6 +1007,12 @@ class SqlMemoryStore(MemoryStore):
                 content_tsv=func.to_tsvector(_TS_CONFIG, tokenize_for_search(content)),
                 status="consolidated",
                 consolidated_from=[str(sid) for sid in source_ids],
+                source_thread_id=inherited.source_thread_id,
+                source_run_id=inherited.source_run_id,
+                importance=inherited.importance,
+                confidence=inherited.confidence,
+                origin=inherited.origin,
+                embedding_model=embedding_model,
             )
             session.add(new_row)
             # Atomically link sources back to the new parent.

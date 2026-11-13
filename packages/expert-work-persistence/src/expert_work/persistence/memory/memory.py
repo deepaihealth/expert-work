@@ -17,15 +17,21 @@ from expert_work.common.search.rrf import rrf_fuse_scored
 from expert_work.persistence.knowledge.text_search import tokenize_for_search
 from expert_work.persistence.memory.base import (
     ConsolidationSourcesChangedError,
+    MemberLoader,
     MemoryInjectionBlockedError,
     MemoryStore,
     MemoryWriteResult,
     SupersedeTargetChangedError,
+    UserSideTargetError,
+    is_mixed_origin,
+    is_user_side_protected,
     scan_memory_content,
     split_blocked,
+    summary_fields,
 )
 from expert_work.persistence.memory.hash import hash_content
 from expert_work.protocol import MemoryItem
+from expert_work.protocol.memory_item import MemoryOrigin
 
 #: Per-side recall depth fetched before RRF fusion — mirrors the J.5
 #: knowledge subsystem so behavior is comparable across hybrid paths.
@@ -322,6 +328,10 @@ class InMemoryMemoryStore(MemoryStore):
         embedding: Sequence[float],
         kind: Literal["fact", "episodic"] | None = None,
         confidence: float | None = None,
+        embedding_model: str | None = None,
+        clear_origin: bool = False,
+        origin: MemoryOrigin | None = None,
+        max_confidence: float | None = None,
     ) -> MemoryItem | None:
         for idx, row in enumerate(self._rows):
             if (
@@ -330,6 +340,10 @@ class InMemoryMemoryStore(MemoryStore):
                 and row.user_id == user_id
                 and row.deleted_at is None
             ):
+                new_confidence = confidence if confidence is not None else row.confidence
+                if max_confidence is not None:
+                    new_confidence = min(new_confidence, max_confidence)
+                new_origin = None if clear_origin else (origin or row.origin)
                 updated = row.model_copy(
                     update={
                         "content": content,
@@ -339,7 +353,11 @@ class InMemoryMemoryStore(MemoryStore):
                         "kind": kind if kind is not None else row.kind,
                         # Stream Memory-Enhance (M-4) — user correction asserts
                         # the rewrite as truth (confidence 1.0).
-                        "confidence": confidence if confidence is not None else row.confidence,
+                        "confidence": new_confidence,
+                        # B-300 PR 2 — the vector is new, so is its model name;
+                        # the source as the caller decides (see the base class).
+                        "embedding_model": embedding_model,
+                        "origin": new_origin,
                     }
                 )
                 self._rows[idx] = updated
@@ -380,6 +398,7 @@ class InMemoryMemoryStore(MemoryStore):
         user_id: UUID,
         old_id: UUID,
         new_item: MemoryItem,
+        refuse_user_side: bool = False,
     ) -> MemoryItem | None:
         hit = scan_memory_content(new_item.id, new_item.content)
         if hit is not None:
@@ -404,6 +423,7 @@ class InMemoryMemoryStore(MemoryStore):
             # archived since the caller picked it: change nothing.
             msg = f"memory item {old_id} is no longer current; not superseding it"
             raise SupersedeTargetChangedError(msg)
+        await self._refuse_if_user_side(self._rows[idx], refuse=refuse_user_side)
         self._rows[idx] = self._rows[idx].model_copy(
             update={"invalid_at": now, "superseded_by": new_item.id}
         )
@@ -426,6 +446,7 @@ class InMemoryMemoryStore(MemoryStore):
         tenant_id: UUID,
         user_id: UUID,
         memory_id: UUID,
+        refuse_user_side: bool = False,
     ) -> bool:
         for idx, row in enumerate(self._rows):
             if (
@@ -434,9 +455,42 @@ class InMemoryMemoryStore(MemoryStore):
                 and row.user_id == user_id
                 and row.deleted_at is None
             ):
+                await self._refuse_if_user_side(row, refuse=refuse_user_side)
                 self._rows[idx] = row.model_copy(update={"expired_at": datetime.now(UTC)})
                 return True
         return False
+
+    async def user_side_protected(self, *, tenant_id: UUID, user_id: UUID, memory_id: UUID) -> bool:
+        row = next(
+            (
+                r
+                for r in self._rows
+                if r.id == memory_id and r.tenant_id == tenant_id and r.user_id == user_id
+            ),
+            None,
+        )
+        if row is None:
+            return False
+        return await is_user_side_protected(row, self._member_loader(tenant_id, user_id))
+
+    def _member_loader(self, tenant_id: UUID, user_id: UUID) -> MemberLoader:
+        async def load(ids: Sequence[UUID]) -> list[MemoryItem]:
+            wanted = set(ids)
+            return [
+                r
+                for r in self._rows
+                if r.id in wanted and r.tenant_id == tenant_id and r.user_id == user_id
+            ]
+
+        return load
+
+    async def _refuse_if_user_side(self, row: MemoryItem, *, refuse: bool) -> None:
+        """B-300 review MEDIUM-1 / MEDIUM-3 — re-judge the target as it is now."""
+        if refuse and await is_user_side_protected(
+            row, self._member_loader(row.tenant_id, row.user_id)
+        ):
+            msg = f"memory item {row.id} is on the user's side; not changing it"
+            raise UserSideTargetError(msg)
 
     async def delete_all_for_user(self, *, tenant_id: UUID, user_id: UUID) -> int:
         now = datetime.now(UTC)
@@ -567,6 +621,7 @@ class InMemoryMemoryStore(MemoryStore):
         embedding: Sequence[float],
         source_ids: Sequence[UUID],
         source_hashes: Mapping[UUID, str],
+        embedding_model: str | None = None,
     ) -> MemoryItem:
         now = datetime.now(UTC)
         new_id = uuid4()
@@ -593,6 +648,13 @@ class InMemoryMemoryStore(MemoryStore):
             if (row.content_hash or hash_content(row.content)) != source_hashes.get(sid):
                 msg = f"memory item {sid} changed since it was read; skipping cluster"
                 raise ConsolidationSourcesChangedError(msg)
+        members = [by_id[sid] for sid in source_ids]
+        # B-300 §6.2 — a mixed-source cluster is never summarized.
+        if is_mixed_origin(members):
+            msg = "cluster members mix assistant-derived and user-side sources; skipping cluster"
+            raise ConsolidationSourcesChangedError(msg)
+        # B-300 D6 前半 — provenance and scores from the members.
+        inherited = summary_fields(members)
         new_item = MemoryItem(
             id=new_id,
             tenant_id=tenant_id,
@@ -605,6 +667,12 @@ class InMemoryMemoryStore(MemoryStore):
             last_used_at=now,
             status="consolidated",
             consolidated_from=tuple(source_ids),
+            source_thread_id=inherited.source_thread_id,
+            source_run_id=inherited.source_run_id,
+            importance=inherited.importance,
+            confidence=inherited.confidence,
+            origin=inherited.origin,
+            embedding_model=embedding_model,
         )
         self._rows.append(new_item)
         # Atomically link sources back to the new consolidated parent.

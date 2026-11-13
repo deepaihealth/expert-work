@@ -136,8 +136,8 @@ from orchestrator.context import (
 from orchestrator.context.memory_render import (
     MEMORY_BLOCK_HEADING,
     MEMORY_LINE_LEGEND,
-    MEMORY_REMINDER,
     memory_line,
+    memory_reminder,
     select_memory_lines,
 )
 from orchestrator.context.system_prompt_view import keep_latest_system_prompt
@@ -2960,13 +2960,16 @@ def _render_memory_lines(
     token_budget: int,
     correction_token_budget: int,
     count: Callable[[str], int],
-) -> list[str]:
+) -> list[tuple[int, str]]:
     """RT-2 PR-2 (RT-ADR-10) — the memory item lines that fit the injection
-    token budget, in rank order. The selection itself is
+    token budget, in rank order, as ``(index into memories, line)``. The
+    selection itself is
     :func:`~orchestrator.context.memory_render.select_memory_lines` (B-300 D5:
     the recall node calls the same function once per run to bump only what is
     injected); this wrapper counts truncated / dropped items on
     ``expert_work_memory_injection_truncated_total{outcome}`` each step.
+    B-300 PR 2 — the indices pick the reminder lines (only marks that made it
+    into the block count).
     """
     chosen = select_memory_lines(
         memories,
@@ -2980,7 +2983,7 @@ def _render_memory_lines(
     dropped = len(memories) - len(chosen)
     if dropped:
         _memory_injection_truncated_total.labels(outcome="dropped").inc(dropped)
-    return [line for _idx, line in chosen]
+    return chosen
 
 
 def _inject_memories(
@@ -3025,18 +3028,19 @@ def _inject_memories(
     # into a memory in an earlier session and recalled here). Spotlight the
     # item block (the expert-work-owned header stays trusted) so the model treats it
     # as data, not instructions.
-    items = "\n".join(
-        _render_memory_lines(
-            memories,
-            token_budget=token_budget,
-            correction_token_budget=correction_token_budget,
-            count=(estimator or CharTokenEstimator()).count,
-        )
+    chosen = _render_memory_lines(
+        memories,
+        token_budget=token_budget,
+        correction_token_budget=correction_token_budget,
+        count=(estimator or CharTokenEstimator()).count,
     )
+    items = "\n".join(line for _idx, line in chosen)
     if spotlight_nonce:
         items = spotlight_untrusted(items, nonce=spotlight_nonce)
-    # B-300 ③ —— 标题、说明行、提醒节在围栏外(平台写的,可信);条目在围栏内。
-    body = f"{MEMORY_BLOCK_HEADING}\n{MEMORY_LINE_LEGEND}\n{items}\n\n{MEMORY_REMINDER}"
+    # B-300 ③ —— 标题、说明行、提醒节在围栏外(平台写的,可信);条目在围栏内。提醒节按块里
+    # 真正出现的那几条的来源标记出(预算挤掉的不算)。
+    reminder = memory_reminder([memories[idx] for idx, _line in chosen])
+    body = f"{MEMORY_BLOCK_HEADING}\n{MEMORY_LINE_LEGEND}\n{items}\n\n{reminder}"
 
     if mode == "per_turn":
         return _append_tail_human_message(messages, body)

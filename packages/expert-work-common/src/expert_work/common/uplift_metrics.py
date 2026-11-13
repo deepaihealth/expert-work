@@ -473,11 +473,15 @@ def record_memory_reconcile(*, op: str) -> None:
     """Bump ``expert_work_cm_memory_reconcile_total{op}`` (Stream CM-7).
 
     ``op`` ∈ ``{"add", "update", "delete", "noop", "degraded",
-    "target_changed"}`` — the operation actually applied per extracted
+    "target_changed", "blocked_update_added", "blocked_update_dropped",
+    "blocked_delete"}`` — the operation actually applied per extracted
     candidate; ``degraded`` = the reconcile decision failed and the candidate
     fell back to a direct ADD (never lose a memory); ``target_changed`` (B-300)
     = the UPDATE's target was folded into a summary / expired meanwhile, so the
-    candidate was written as a direct ADD instead.
+    candidate was written as a direct ADD instead. ``blocked_*`` (B-300 PR 2) =
+    an assistant-derived candidate was refused an UPDATE / DELETE of a memory the
+    user stated or corrected: the update was stored as a new memory (it was a
+    correction) or dropped, the delete did nothing.
     """
     _memory_reconcile_total.labels(op=op).inc()
 

@@ -13,7 +13,7 @@ import { MemoryRouter } from "react-router-dom";
 import { App } from "antd";
 import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import "../../i18n";
+import i18n from "../../i18n";
 
 import { MemoryAdmin } from "../MemoryAdmin";
 import * as memorySdk from "../../api/memory";
@@ -556,5 +556,40 @@ describe("MemoryAdmin — consolidator health (B-51)", () => {
     );
     expect(spy).not.toHaveBeenCalled();
     expect(screen.queryByTestId("memory-consolidator-alert")).toBeNull();
+  });
+});
+
+describe("MemoryAdmin — source label (B-300 PR 2)", () => {
+  it("shows the four effective sources; confidence 1.0 wins over the column", async () => {
+    const rows = [
+      { ...memRow, id: "s1", content: "row one", origin: "user_stated" },
+      { ...memRow, id: "s2", content: "row two", origin: "assistant_derived" },
+      { ...memRow, id: "s3", content: "row three", origin: "assistant_derived", confidence: 1 },
+      { ...memRow, id: "s4", content: "row four" },
+    ];
+    installAdapter([
+      {
+        match: (u) => u.startsWith("/v1/memory"),
+        respond: () => ({
+          success: true,
+          data: { items: rows, total: rows.length, cross_tenant: false },
+          error: null,
+        }),
+      },
+    ]);
+    renderMemory();
+    await waitFor(() => expect(screen.getByText("row one")).toBeInTheDocument());
+    expect(screen.getByTestId("memory-origin-s1")).toHaveTextContent(
+      i18n.t("memory.origin_user_stated"),
+    );
+    expect(screen.getByTestId("memory-origin-s2")).toHaveTextContent(
+      i18n.t("memory.origin_assistant_derived"),
+    );
+    expect(screen.getByTestId("memory-origin-s3")).toHaveTextContent(
+      i18n.t("memory.origin_user_corrected"),
+    );
+    expect(screen.getByTestId("memory-origin-s4")).toHaveTextContent(
+      i18n.t("memory.origin_unrecorded"),
+    );
   });
 });

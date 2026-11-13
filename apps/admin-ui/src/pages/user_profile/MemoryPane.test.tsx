@@ -11,7 +11,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { App } from "antd";
 import { render, screen, fireEvent, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import "../../i18n";
+import i18n from "../../i18n";
 
 const mockNavigate = vi.fn();
 vi.mock("react-router-dom", () => ({
@@ -121,6 +121,37 @@ describe("MemoryPane — source-run column", () => {
     expect(
       screen.queryByTestId(`memory-source-run-${NO_SOURCE.id}`),
     ).not.toBeInTheDocument();
+  });
+});
+
+describe("MemoryPane — source label (B-300 PR 2)", () => {
+  it("shows the four effective sources; confidence 1.0 wins over the column", async () => {
+    const rows: MemoryItem[] = [
+      { ...WITH_SOURCE, id: "o1", content: "first", origin: "user_stated" },
+      { ...WITH_SOURCE, id: "o2", content: "second", origin: "assistant_derived" },
+      { ...WITH_SOURCE, id: "o3", content: "third", origin: "assistant_derived", confidence: 1 },
+      { ...WITH_SOURCE, id: "o4", content: "fourth", origin: null },
+    ];
+    vi.spyOn(memorySdk, "listMemories").mockResolvedValue({
+      items: rows,
+      total: rows.length,
+      cross_tenant: false,
+    });
+    renderPane();
+
+    await screen.findByText("first");
+    expect(screen.getByTestId("memory-origin-o1")).toHaveTextContent(
+      i18n.t("memory.origin_user_stated"),
+    );
+    expect(screen.getByTestId("memory-origin-o2")).toHaveTextContent(
+      i18n.t("memory.origin_assistant_derived"),
+    );
+    expect(screen.getByTestId("memory-origin-o3")).toHaveTextContent(
+      i18n.t("memory.origin_user_corrected"),
+    );
+    expect(screen.getByTestId("memory-origin-o4")).toHaveTextContent(
+      i18n.t("memory.origin_unrecorded"),
+    );
   });
 });
 

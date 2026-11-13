@@ -33,6 +33,7 @@ import {
   type MemoryKind,
   type MemoryList,
 } from "../../api/memory";
+import { MemoryOriginTag } from "../../components/MemoryOriginTag";
 import { concreteTenantScope, useTenantScope } from "../../tenant/TenantScopeContext";
 import { errMessage } from "./useLoad";
 
@@ -143,6 +144,13 @@ export function MemoryPane({ userId }: { userId: string }) {
             {kind}
           </Tag>
         ),
+      },
+      {
+        // B-300 PR 2 — the same source label the agent sees at recall.
+        title: t("memory.col_origin"),
+        key: "origin",
+        width: 150,
+        render: (_: unknown, record) => <MemoryOriginTag item={record} />,
       },
       {
         title: t("user_profile.memory_col_importance"),
