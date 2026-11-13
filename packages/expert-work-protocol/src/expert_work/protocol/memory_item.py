@@ -24,10 +24,12 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 #                  the archive() implementation
 MemoryStatus = Literal["transient", "consolidated", "archived"]
 
-# B-300 ② —— 记忆的来源,只由「是哪一次提炼出来的」决定(模型不打标签,程序不看内容):
-#   user_stated       —— 第一次提炼的产出:只看白名单里用户输入的文字就读得出来
+# B-300 ② —— 记忆的来源。提炼写入的只由「是哪一次提炼出来的」决定(模型不打标签,程序不看内容):
+#   user_stated       —— 第一次提炼的产出:只看白名单里用户输入的文字就读得出来;
+#                        另外,用户本人在控制台改写自己这一条也记它
 #   assistant_derived —— 第二次提炼的产出:助手做的、得出的、提出的,以及用户只是回答 / 同意的
-# 空 = 存量、失败重试重建的、整理汇总里不全是来自助手的、管理员改写过内容的。
+# 空 = 存量、失败重试重建的、整理汇总里不全是来自助手的、别人在控制台改写过内容的
+# (那时置信度也压到 0.99 以内)。
 MemoryOrigin = Literal["user_stated", "assistant_derived"]
 MEMORY_ORIGINS: frozenset[str] = frozenset(get_args(MemoryOrigin))
 
