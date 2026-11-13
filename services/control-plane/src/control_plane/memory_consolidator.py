@@ -32,12 +32,13 @@ See ``docs/streams/STREAM-UPLIFT-DESIGN.md`` § 8 (Mini-ADRs U-33~U-42).
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Any, Protocol
 from uuid import UUID
 
@@ -53,6 +54,7 @@ from expert_work.common.observability import current_trace_id_hex
 from expert_work.common.uplift_metrics import (
     record_consolidator_llm_tokens,
     record_consolidator_run,
+    record_memory_blocked,
     record_memory_cluster_candidates,
     record_memory_cluster_rejected,
     record_memory_consolidated,
@@ -60,6 +62,11 @@ from expert_work.common.uplift_metrics import (
     record_memory_purged,
     record_memory_reviewed_durable,
 )
+from expert_work.persistence.memory.base import (
+    ConsolidationSourcesChangedError,
+    MemoryInjectionBlockedError,
+)
+from expert_work.persistence.memory.hash import hash_content
 from expert_work.persistence.rls import (
     bypass_rls_var,
     current_tenant_id_var,
@@ -728,10 +735,14 @@ class MemoryConsolidator:
                 summary.record_error(exc)
                 continue
             summary.tenant_count += 1
-            with _bypass_rls():
-                users = (await self._memory.distinct_users(tenant_id=tenant_id))[
-                    :_MAX_USERS_PER_TICK
-                ]
+            await self._prune_rejected_clusters(tenant_id, summary)
+            try:
+                users = await self._users_this_tick(tenant_id)
+            except Exception as exc:
+                # 一个租户的游标读不了,不能拖垮整轮:记一次失败,接着做下一个租户。
+                logger.exception("memory_consolidator.user_list_failed tenant_id=%s", tenant_id)
+                summary.record_error(exc)
+                continue
             for user_id in users:
                 summary.user_count += 1
                 try:
@@ -749,6 +760,9 @@ class MemoryConsolidator:
                         user_id,
                     )
                     summary.record_error(exc)
+                # B-300 D4 —— 成败都推进:总出错的用户不能卡住后面的人;进程中途没了,
+                # 已处理的部分也不重来。
+                await self._advance_cursor(tenant_id, user_id, summary)
 
         summary.finished_at = datetime.now(UTC)
 
@@ -785,6 +799,56 @@ class MemoryConsolidator:
             summary.errors,
         )
         return summary
+
+    async def _users_this_tick(self, tenant_id: UUID) -> list[UUID]:
+        """B-300 D4 —— 本轮这个租户整理哪些用户:按用户 id 排序,从库里的游标之后取满
+        :data:`_MAX_USERS_PER_TICK` 个,不够就从头接着取(不重复)。
+
+        游标是租户级的,在该租户作用域里读;两次枚举跨用户,显式 bypass(同之前)。
+        """
+        with _scope(tenant_id):
+            cursor = await self._memory.get_consolidation_cursor(tenant_id=tenant_id)
+        with _bypass_rls():
+            users = await self._memory.distinct_users(
+                tenant_id=tenant_id, after=cursor, limit=_MAX_USERS_PER_TICK
+            )
+            if cursor is not None and len(users) < _MAX_USERS_PER_TICK:
+                wrapped = await self._memory.distinct_users(
+                    tenant_id=tenant_id, limit=_MAX_USERS_PER_TICK - len(users)
+                )
+                taken = set(users)
+                users += [u for u in wrapped if u not in taken]
+        return users
+
+    async def _prune_rejected_clusters(
+        self, tenant_id: UUID, summary: ConsolidatorRunSummary
+    ) -> None:
+        """被拒的簇的标记只在扫描窗口内有用(成员都比标记早,标记过了 30 天,成员也都出了
+        窗口)。每个租户每轮清一次、整租户一起清:没有可整理记忆的用户、清除用户时并发
+        又写回来的标记,也都会过期。"""
+        try:
+            with _scope(tenant_id):
+                await self._memory.prune_rejected_clusters(
+                    tenant_id=tenant_id,
+                    before=datetime.now(UTC) - timedelta(days=_TRANSIENT_SCAN_AGE_DAYS),
+                )
+        except Exception as exc:
+            logger.exception("memory_consolidator.marker_prune_failed tenant_id=%s", tenant_id)
+            summary.record_error(exc)
+
+    async def _advance_cursor(
+        self, tenant_id: UUID, user_id: UUID, summary: ConsolidatorRunSummary
+    ) -> None:
+        try:
+            with _scope(tenant_id):
+                await self._memory.set_consolidation_cursor(tenant_id=tenant_id, user_id=user_id)
+        except Exception as exc:
+            logger.exception(
+                "memory_consolidator.cursor_write_failed tenant_id=%s user_id=%s",
+                tenant_id,
+                user_id,
+            )
+            summary.record_error(exc)
 
     # ------------------------------------------------------------------
     # Per-user sweep — SUB-PASS 1 + SUB-PASS 2
@@ -915,6 +979,9 @@ class MemoryConsolidator:
     ) -> list[list[MemoryItem]]:
         """Embedding seed-walk — for each unseen transient item, ask the
         store for cosine neighbors. Mini-ADR U-35 candidate algorithm.
+
+        B-300 —— 模型拒过的簇(成员集合一样)直接跳过,不占每个用户的簇数上限;跳过的簇的
+        成员照样记进 ``seen``,否则同一片里的下一个种子会取出一组略有不同的成员、又问一次。
         """
         transients = await self._memory.list_transient(
             tenant_id=tenant_id,
@@ -924,6 +991,7 @@ class MemoryConsolidator:
         )
         if len(transients) < min_cluster_size:
             return []
+        rejected = await self._memory.list_rejected_clusters(tenant_id=tenant_id, user_id=user_id)
         cosine_max = max(0.0, 1.0 - similarity)
         seen: set[UUID] = set()
         clusters: list[list[MemoryItem]] = []
@@ -946,8 +1014,10 @@ class MemoryConsolidator:
             fresh = [n for n in neighbors if n.id not in seen]
             if len(fresh) < min_cluster_size:
                 continue
-            clusters.append(fresh)
             seen.update(n.id for n in fresh)
+            if _cluster_hash(fresh) in rejected:
+                continue
+            clusters.append(fresh)
         return clusters
 
     async def _record_aux_usage(
@@ -1016,13 +1086,49 @@ class MemoryConsolidator:
 
         if verdict.keep and verdict.summary is not None:
             embedding = await self._embedder.embed_one(verdict.summary, tenant_id=tenant_id)
-            new_item = await self._memory.write_consolidated(
-                tenant_id=tenant_id,
-                user_id=user_id,
-                content=verdict.summary,
-                embedding=embedding,
-                source_ids=[item.id for item in cluster],
-            )
+            source_ids = [item.id for item in cluster]
+            try:
+                new_item = await self._memory.write_consolidated(
+                    tenant_id=tenant_id,
+                    user_id=user_id,
+                    content=verdict.summary,
+                    embedding=embedding,
+                    source_ids=source_ids,
+                    # 取簇时读到的每条成员的内容哈希:判的这段时间里被原地更正过的
+                    # 成员也算变了(汇总是按旧内容写的)。
+                    source_hashes={
+                        item.id: item.content_hash or hash_content(item.content) for item in cluster
+                    },
+                )
+            except ConsolidationSourcesChangedError:
+                # B-300 D1 —— 模型判的这段时间里有成员被取代 / 过期 / 删除 / 汇总 / 更正:不写,
+                # 下一轮按当时的有效记忆重新取簇。
+                logger.info(
+                    "memory_consolidator.cluster_skipped_sources_changed tenant=%s user=%s",
+                    tenant_id,
+                    user_id,
+                )
+                return
+            except MemoryInjectionBlockedError as exc:
+                # B-300 D2 —— 汇总句被严格扫描拦下:这一簇不写,发审计(不带正文)。
+                for blocked in exc.blocked:
+                    record_memory_blocked(source="consolidation")
+                    await self._safe_audit(
+                        tenant_id=tenant_id,
+                        action=AuditAction.MEMORY_INJECTION_BLOCKED,
+                        resource_id=None,
+                        details={
+                            "user_id": str(user_id),
+                            "source": "consolidation",
+                            "source_ids": [str(sid) for sid in source_ids],
+                            "content_length": blocked.content_length,
+                            "categories": list(blocked.categories),
+                            "pattern_count": len(blocked.findings),
+                        },
+                        result=AuditResult.DENIED,
+                        reason="strict_scan",
+                    )
+                return
             record_memory_consolidated()
             summary.consolidated += 1
             await self._safe_audit(
@@ -1040,6 +1146,14 @@ class MemoryConsolidator:
         reject_reason = verdict.reject_reason or "false_cluster"
         record_memory_cluster_rejected(reason=_reason_label(reject_reason))
         summary.cluster_rejected += 1
+        # B-300 —— 模型拒过的这组成员记下来,下一轮不再问;来了新成员哈希就变,重新问。
+        # 只记模型真给出的拒绝:回复坏了 / 校验重试用完不是判断,下一轮照常再问。
+        await self._memory.record_rejected_cluster(
+            tenant_id=tenant_id,
+            user_id=user_id,
+            member_hash=_cluster_hash(cluster),
+            reason=reject_reason,
+        )
         if reject_reason != "false_cluster":
             # anti_mislearn rejections deserve an audit row so SecOps
             # can see what the consolidator refused; false_cluster is
@@ -1235,6 +1349,8 @@ class MemoryConsolidator:
         action: AuditAction,
         resource_id: str | None,
         details: dict[str, object],
+        result: AuditResult = AuditResult.SUCCESS,
+        reason: str | None = None,
     ) -> None:
         try:
             await audit_emit(
@@ -1244,12 +1360,19 @@ class MemoryConsolidator:
                 action=action,
                 resource_type="memory_item",
                 resource_id=resource_id,
-                result=AuditResult.SUCCESS,
+                result=result,
+                reason=reason,
                 trace_id=current_trace_id_hex(),
                 details=details,
             )
         except Exception:
             logger.exception("memory_consolidator.audit_emit_failed action=%s", action.value)
+
+
+def _cluster_hash(cluster: Sequence[MemoryItem]) -> str:
+    """B-300 —— 被拒的簇的标识:成员 id 排序后算哈希(只有 id,不含正文)。"""
+    joined = ",".join(sorted(str(item.id) for item in cluster))
+    return hashlib.sha256(joined.encode("ascii")).hexdigest()
 
 
 def _reason_label(reject_reason: str) -> str:

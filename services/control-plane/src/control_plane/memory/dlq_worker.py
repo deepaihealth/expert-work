@@ -28,16 +28,18 @@ from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
 from uuid import UUID, uuid4
 
+from control_plane.audit import emit as audit_emit
 from control_plane.uplift.threat_metrics import record_memory_blocked
-from expert_work.common.observability import expert_work_counter
+from expert_work.common.observability import current_trace_id_hex, expert_work_counter
 from expert_work.persistence.memory import MemoryStore, MemoryWritebackDLQ
-from expert_work.persistence.memory.base import MemoryInjectionBlockedError
+from expert_work.persistence.memory.base import BlockedMemory
 from expert_work.persistence.rls import (
     bypass_rls_var,
     current_tenant_id_var,
     current_user_id_var,
 )
-from expert_work.protocol import MemoryItem
+from expert_work.protocol import AuditAction, AuditResult, MemoryItem
+from expert_work.runtime.audit.logger import AuditLogger
 from orchestrator.llm import Embedder
 
 logger = logging.getLogger("expert_work.control_plane.memory.dlq_worker")
@@ -118,6 +120,7 @@ class MemoryDLQWorker:
         interval_s: int = 30,
         batch_size: int = _BATCH_SIZE,
         max_attempts: int = _MAX_ATTEMPTS,
+        audit_logger: AuditLogger | None = None,
     ) -> None:
         if interval_s <= 0:
             msg = "interval_s must be positive"
@@ -134,6 +137,8 @@ class MemoryDLQWorker:
         self._interval_s = interval_s
         self._batch_size = batch_size
         self._max_attempts = max_attempts
+        #: B-300 D2 —— 被写入扫描拦下的条目发 ``MEMORY_INJECTION_BLOCKED`` 审计用。
+        self._audit_logger = audit_logger
         self._task: asyncio.Task[None] | None = None
         self._stop = asyncio.Event()
 
@@ -235,26 +240,7 @@ class MemoryDLQWorker:
                 [content for _, content in row.extracted], tenant_id=row.tenant_id
             )
             items = _build_memory_items(row, vectors)
-            await self._store.write(items)
-        except MemoryInjectionBlockedError as exc:
-            # Capability Uplift Sprint #2 — content can't pass strict
-            # scan; retrying won't change the content, so skip the
-            # backoff loop and dead-letter immediately. The audit row
-            # already lands inside MemoryStore.write() callers as the
-            # exception bubbles up here.
-            logger.error(
-                "memory.dlq_worker.dead_letter_injection row_id=%s blocked=%d",
-                row.id,
-                len(exc.blocked),
-            )
-            record_memory_blocked(source="dlq")
-            await self._dlq.record_failure(
-                row_id=row.id,
-                error=f"MemoryInjectionBlockedError: {len(exc.blocked)} item(s)",
-                when=now,
-                next_retry_at=now + timedelta(days=365),
-            )
-            return "dead"
+            result = await self._store.write(items)
         except Exception as exc:
             # ``row.attempts`` already counts this try — take_ready's claim
             # bumped it atomically before handing the row here (W1-PR1).
@@ -284,8 +270,47 @@ class MemoryDLQWorker:
                 next_retry_at=now + timedelta(seconds=backoff),
             )
             return "retry"
+        if result.blocked:
+            # B-300 D2 —— 严格扫描逐条拦:被拦的不写、其余已写;内容是确定的,重试也
+            # 一样被拦,所以这一行照样收掉。每条被拦的发一行审计(不带正文)。
+            logger.error(
+                "memory.dlq_worker.blocked row_id=%s blocked=%d", row.id, len(result.blocked)
+            )
+            for _blocked in result.blocked:
+                record_memory_blocked(source="dlq")  # one per item, as on the other paths
+            await self._audit_blocked(row, items, result.blocked)
         await self._dlq.mark_done(row_id=row.id)
         return "ok"
+
+    async def _audit_blocked(
+        self, row: DLQRowLike, items: Sequence[MemoryItem], blocked: Sequence[BlockedMemory]
+    ) -> None:
+        if self._audit_logger is None:
+            return
+        positions = {item.id: idx for idx, item in enumerate(items)}
+        for entry in blocked:
+            try:
+                await audit_emit(
+                    self._audit_logger,
+                    tenant_id=row.tenant_id,
+                    actor_id="memory_dlq_worker",
+                    action=AuditAction.MEMORY_INJECTION_BLOCKED,
+                    resource_type="memory_item",
+                    result=AuditResult.DENIED,
+                    reason="strict_scan",
+                    trace_id=current_trace_id_hex(),
+                    details={
+                        "user_id": str(row.user_id),
+                        "source": "dlq",
+                        "dlq_row_id": str(row.id),
+                        "candidate": positions[entry.item_id],
+                        "content_length": entry.content_length,
+                        "categories": list(entry.categories),
+                        "pattern_count": len(entry.findings),
+                    },
+                )
+            except Exception:
+                logger.exception("memory.dlq_worker.blocked_audit_failed row_id=%s", row.id)
 
     async def _release(self, row: DLQRowLike, *, now: datetime, error: BaseException) -> None:
         """Best-effort release for a row ``take_ready`` claimed but

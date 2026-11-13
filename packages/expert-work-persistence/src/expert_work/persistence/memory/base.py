@@ -12,43 +12,110 @@ persistence layer free of any embedding-model dependency.
 from __future__ import annotations
 
 import abc
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
 from datetime import datetime
 from typing import Literal
 from uuid import UUID
 
-from expert_work.common.threat_patterns import ThreatFinding
+from expert_work.common.threat_patterns import ThreatFinding, scan_for_threats
 from expert_work.protocol import MemoryItem
+
+
+@dataclass(frozen=True)
+class BlockedMemory:
+    """B-300 D2 — one memory text the strict write scan refused.
+
+    Carries what an audit row may hold — the item id, the text length and the
+    matched rule categories — and the findings themselves; never the text.
+    """
+
+    item_id: UUID
+    content_length: int
+    findings: tuple[ThreatFinding, ...]
+
+    @property
+    def categories(self) -> tuple[str, ...]:
+        return tuple(sorted({str(f.category) for f in self.findings}))
+
+
+@dataclass(frozen=True)
+class MemoryWriteResult:
+    """B-300 D2 — what :meth:`MemoryStore.write` did not store, item by item."""
+
+    blocked: tuple[BlockedMemory, ...] = ()
+
+
+def scan_memory_content(item_id: UUID, content: str) -> BlockedMemory | None:
+    """The one strict scan every automatic memory write goes through (B-300 D2):
+    ``write`` / ``supersede`` / ``write_consolidated``. ``None`` = clean."""
+    findings = scan_for_threats(content, scope="strict")
+    if not findings:
+        return None
+    return BlockedMemory(item_id=item_id, content_length=len(content), findings=tuple(findings))
+
+
+def split_blocked(items: Sequence[MemoryItem]) -> tuple[list[MemoryItem], list[BlockedMemory]]:
+    """Scan a batch: the items that pass, and one :class:`BlockedMemory` per refused item."""
+    clean: list[MemoryItem] = []
+    blocked: list[BlockedMemory] = []
+    for item in items:
+        hit = scan_memory_content(item.id, item.content)
+        if hit is None:
+            clean.append(item)
+        else:
+            blocked.append(hit)
+    return clean, blocked
 
 
 class MemoryInjectionBlockedError(Exception):
     """Capability Uplift Sprint #2 (Mini-ADR U-3) — write rejected.
 
-    Raised by :meth:`MemoryStore.write` when any item's ``content``
-    matches the ``strict`` threat-pattern set. The batch is rejected
-    atomically (no partial writes) — see
-    ``docs/streams/STREAM-UPLIFT-DESIGN.md`` § 3.2.
+    B-300 D2: raised by the single-item writes — :meth:`MemoryStore.supersede`
+    and :meth:`MemoryStore.write_consolidated` — when the new text matches the
+    ``strict`` threat-pattern set, before anything is changed (the old row stays
+    current, no summary is written). :meth:`MemoryStore.write` no longer raises:
+    it stores the clean items and returns the blocked ones.
 
-    Carries the per-item finding set so callers can emit one audit row
-    per blocked item with the right caller-side context (API actor_id,
-    writeback thread_id, DLQ row id).
+    Carries the blocked items so the caller can emit one
+    ``MEMORY_INJECTION_BLOCKED`` audit row per item with its own context.
     """
 
-    def __init__(
-        self,
-        blocked: list[tuple[UUID, list[ThreatFinding]]],
-    ) -> None:
+    def __init__(self, blocked: Sequence[BlockedMemory]) -> None:
         super().__init__(f"{len(blocked)} memory item(s) blocked by strict threat scan")
-        self.blocked = blocked
+        self.blocked = tuple(blocked)
+
+
+class SupersedeTargetChangedError(RuntimeError):
+    """B-300 D1 (the other direction) — the memory an UPDATE meant to replace
+    was folded into a summary, expired or archived after the write-back picked
+    it. Raised by :meth:`MemoryStore.supersede` under the target's row lock,
+    before anything changes; the caller stores the new fact as a plain write
+    instead, so it is not lost."""
+
+
+class ConsolidationSourcesChangedError(RuntimeError):
+    """B-300 D1 — a summary's members changed after the cluster was picked.
+
+    Raised by :meth:`MemoryStore.write_consolidated` when, re-read under a row
+    lock in the write's own transaction, a member is no longer current
+    (deleted, superseded, expired, archived) or was already folded into another
+    summary. Nothing is written; the next sweep re-reads the members.
+    """
 
 
 class MemoryStore(abc.ABC):
     """Cross-session memory repository, scoped to ``(tenant_id, user_id)``."""
 
     @abc.abstractmethod
-    async def write(self, items: Sequence[MemoryItem]) -> None:
+    async def write(self, items: Sequence[MemoryItem]) -> MemoryWriteResult:
         """Persist long-term memories. Each item carries its own ``id``
-        and ``embedding``."""
+        and ``embedding``.
+
+        B-300 D2 — every item goes through :func:`scan_memory_content`; a
+        blocked item is dropped on its own (the rest of the batch is written)
+        and returned in :attr:`MemoryWriteResult.blocked` for the caller to
+        audit. Nothing is raised for a blocked item."""
 
     @abc.abstractmethod
     async def retrieve(
@@ -205,7 +272,16 @@ class MemoryStore(abc.ABC):
         Returns the newly written item, or ``None`` when ``old_id`` is
         unknown / wrong tenant-user / already superseded (``invalid_at`` set) —
         in which case NO new row is written (the caller falls back to a plain
-        write). Tenant- AND user-scoped."""
+        write). Tenant- AND user-scoped.
+
+        B-300 D2 — ``new_item`` goes through the same strict scan as
+        :meth:`write`; when blocked, :class:`MemoryInjectionBlockedError` is
+        raised before anything changes: the old row stays current.
+
+        B-300 D1 (the other direction) — the target is re-read under a row lock;
+        when it was folded into a summary, expired or archived since the caller
+        picked it, :class:`SupersedeTargetChangedError` is raised and nothing
+        changes (``None`` keeps meaning unknown / deleted / already superseded)."""
 
     @abc.abstractmethod
     async def expire(
@@ -265,12 +341,47 @@ class MemoryStore(abc.ABC):
         self,
         *,
         tenant_id: UUID,
+        after: UUID | None = None,
+        limit: int | None = None,
     ) -> list[UUID]:
         """Return distinct ``user_id`` with at least one transient row.
 
         Used by the consolidator worker to enumerate users worth
         scanning per tick (skipping users with no fresh writes).
-        Soft-deleted rows are excluded."""
+        Soft-deleted rows are excluded.
+
+        B-300 D4 — ordered by user id; ``after`` keeps only ids greater than it
+        (the consolidation cursor), ``limit`` caps the count."""
+
+    @abc.abstractmethod
+    async def get_consolidation_cursor(self, *, tenant_id: UUID) -> UUID | None:
+        """B-300 D4 — the last user the consolidator swept in this tenant, or
+        ``None`` before the first one."""
+
+    @abc.abstractmethod
+    async def set_consolidation_cursor(self, *, tenant_id: UUID, user_id: UUID) -> None:
+        """B-300 D4 — move the tenant's consolidation cursor to ``user_id``."""
+
+    @abc.abstractmethod
+    async def list_rejected_clusters(self, *, tenant_id: UUID, user_id: UUID) -> set[str]:
+        """Member-set hashes of the clusters the consolidation model rejected
+        for this user (B-300 PR A rejected-cluster markers)."""
+
+    @abc.abstractmethod
+    async def record_rejected_cluster(
+        self, *, tenant_id: UUID, user_id: UUID, member_hash: str, reason: str
+    ) -> None:
+        """Mark a rejected cluster (by its member-set hash); re-marking the
+        same set refreshes its reason and time."""
+
+    @abc.abstractmethod
+    async def prune_rejected_clusters(self, *, tenant_id: UUID, before: datetime) -> int:
+        """Drop the tenant's markers (every user) recorded before ``before``;
+        returns how many."""
+
+    @abc.abstractmethod
+    async def delete_rejected_clusters_for_user(self, *, tenant_id: UUID, user_id: UUID) -> int:
+        """Drop every marker of a user (user purge); returns how many."""
 
     @abc.abstractmethod
     async def list_transient(
@@ -283,7 +394,10 @@ class MemoryStore(abc.ABC):
     ) -> list[MemoryItem]:
         """Sprint #7 SUB-PASS 1 candidate fetch — return live transient
         items written within ``max_age_days``, oldest first, capped at
-        ``limit``. Skips items already consolidated_into something."""
+        ``limit``. Skips items already consolidated_into something.
+
+        B-300 D1 — only currently-valid rows: the same predicate as the
+        current-time :meth:`retrieve` (no superseded / expired / archived row)."""
 
     @abc.abstractmethod
     async def vector_neighbors(
@@ -298,7 +412,8 @@ class MemoryStore(abc.ABC):
         """Sprint #7 SUB-PASS 1 cluster builder — return live transient
         items within ``cosine_max`` cosine distance of ``embedding``,
         closest first, capped at ``limit``. Skips items already
-        ``consolidated_into`` something.
+        ``consolidated_into`` something; B-300 D1 — currently-valid rows only,
+        as :meth:`list_transient`.
 
         Implementations should use the existing pgvector HNSW index
         (no new index for Sprint #7)."""
@@ -312,6 +427,7 @@ class MemoryStore(abc.ABC):
         content: str,
         embedding: Sequence[float],
         source_ids: Sequence[UUID],
+        source_hashes: Mapping[UUID, str],
     ) -> MemoryItem:
         """Sprint #7 SUB-PASS 1 commit — write a new consolidated item
         with ``status='consolidated'`` + ``consolidated_from=source_ids``
@@ -321,7 +437,16 @@ class MemoryStore(abc.ABC):
 
         Idempotent under retry: if any source already has
         ``consolidated_into`` set the entire operation aborts and the
-        method raises so the worker can skip the cluster on the next tick."""
+        method raises so the worker can skip the cluster on the next tick.
+
+        B-300 — the members are re-read (row-locked) in the write's own
+        transaction; when any is missing or no longer current
+        :class:`ConsolidationSourcesChangedError` is raised and nothing is
+        written (D1). ``source_hashes`` carries each member's ``content_hash``
+        as it was read when the cluster was picked; a member corrected in place
+        meanwhile (still current, new text) counts as changed too — the summary
+        was decided on the old text. ``content`` goes through the strict write scan first;
+        blocked → :class:`MemoryInjectionBlockedError`, nothing written (D2)."""
 
     @abc.abstractmethod
     async def list_purge_candidates(

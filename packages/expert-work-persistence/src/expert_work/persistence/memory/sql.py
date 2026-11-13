@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import math
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from datetime import UTC, datetime, timedelta
 from typing import Literal
 from uuid import UUID, uuid4
@@ -18,12 +18,23 @@ from expert_work.common.search.decay import (
     temporal_decay_factor,
 )
 from expert_work.common.search.rrf import rrf_fuse_scored
-from expert_work.common.threat_patterns import ThreatFinding, scan_for_threats
 from expert_work.persistence.bulk_delete import count_where, delete_where
 from expert_work.persistence.knowledge.text_search import tokenize_for_search
-from expert_work.persistence.memory.base import MemoryInjectionBlockedError, MemoryStore
+from expert_work.persistence.memory.base import (
+    ConsolidationSourcesChangedError,
+    MemoryInjectionBlockedError,
+    MemoryStore,
+    MemoryWriteResult,
+    SupersedeTargetChangedError,
+    scan_memory_content,
+    split_blocked,
+)
 from expert_work.persistence.memory.hash import hash_content
-from expert_work.persistence.models import MemoryItemRow
+from expert_work.persistence.models import (
+    MemoryClusterRejectionRow,
+    MemoryConsolidationCursorRow,
+    MemoryItemRow,
+)
 from expert_work.protocol import MemoryItem
 
 #: Postgres ``tsvector`` configuration — ``simple`` so app-side jieba
@@ -129,17 +140,13 @@ class SqlMemoryStore(MemoryStore):
     def __init__(self, session_factory: async_sessionmaker[AsyncSession]) -> None:
         self._sf = session_factory
 
-    async def write(self, items: Sequence[MemoryItem]) -> None:
+    async def write(self, items: Sequence[MemoryItem]) -> MemoryWriteResult:
+        # B-300 D2 — strict scan per item: blocked ones are dropped on their own
+        # and handed back; the rest of the batch is written.
+        items, blocked = split_blocked(items)
+        result = MemoryWriteResult(blocked=tuple(blocked))
         if not items:
-            return
-        # Capability Uplift Sprint #2 (Mini-ADR U-3) — atomic strict scan.
-        blocked: list[tuple[UUID, list[ThreatFinding]]] = []
-        for item in items:
-            findings = scan_for_threats(item.content, scope="strict")
-            if findings:
-                blocked.append((item.id, findings))
-        if blocked:
-            raise MemoryInjectionBlockedError(blocked)
+            return result
         # Stream K.K7 — fill content_hash here so callers do not need
         # to import the hash helper, and use ON CONFLICT DO NOTHING
         # against the (tenant_id, user_id, content_hash) partial unique
@@ -189,6 +196,7 @@ class SqlMemoryStore(MemoryStore):
         async with self._sf() as session:
             await session.execute(stmt)
             await session.commit()
+        return result
 
     async def retrieve(
         self,
@@ -523,21 +531,36 @@ class SqlMemoryStore(MemoryStore):
         old_id: UUID,
         new_item: MemoryItem,
     ) -> MemoryItem | None:
+        hit = scan_memory_content(new_item.id, new_item.content)
+        if hit is not None:
+            raise MemoryInjectionBlockedError([hit])
         now = datetime.now(UTC)
         async with self._sf() as session:
+            target: list[ColumnElement[bool]] = [
+                MemoryItemRow.id == old_id,
+                MemoryItemRow.tenant_id == tenant_id,
+                MemoryItemRow.user_id == user_id,
+            ]
+            # B-300 D1 (other direction) — lock the target: a summary folding it
+            # (``write_consolidated``) either commits first and is seen below, or
+            # waits for this commit.
             old = (
                 await session.execute(
-                    select(MemoryItemRow).where(
-                        MemoryItemRow.id == old_id,
-                        MemoryItemRow.tenant_id == tenant_id,
-                        MemoryItemRow.user_id == user_id,
-                        MemoryItemRow.deleted_at.is_(None),
-                        MemoryItemRow.invalid_at.is_(None),
-                    )
+                    select(MemoryItemRow)
+                    .where(*target)
+                    .order_by(MemoryItemRow.id)
+                    .with_for_update()
                 )
             ).scalar_one_or_none()
-            if old is None:
+            if old is None or old.deleted_at is not None or old.invalid_at is not None:
                 return None
+            # The same "currently valid" predicate recall uses.
+            current = (
+                await session.execute(select(func.count()).where(*target, *_retrieve_filter()))
+            ).scalar_one()
+            if current != 1:
+                msg = f"memory item {old_id} is no longer current; not superseding it"
+                raise SupersedeTargetChangedError(msg)
             old.invalid_at = now
             old.superseded_by = new_item.id
             content = new_item.content
@@ -591,17 +614,34 @@ class SqlMemoryStore(MemoryStore):
 
     async def delete_all_for_user(self, *, tenant_id: UUID, user_id: UUID) -> int:
         now = datetime.now(UTC)
-        stmt = (
-            update(MemoryItemRow)
-            .where(
-                MemoryItemRow.tenant_id == tenant_id,
-                MemoryItemRow.user_id == user_id,
-                MemoryItemRow.deleted_at.is_(None),
-            )
-            .values(deleted_at=now)
-        )
+        live: list[ColumnElement[bool]] = [
+            MemoryItemRow.tenant_id == tenant_id,
+            MemoryItemRow.user_id == user_id,
+            MemoryItemRow.deleted_at.is_(None),
+        ]
         async with self._sf() as session:
-            result = await session.execute(stmt)
+            # B-300 —— 先按 id 顺序锁住这些行再改:一条不带顺序的批量 UPDATE 按扫描顺序
+            # 上锁,会与按 id 顺序锁成员的 ``write_consolidated`` 互相死锁。
+            ids = (
+                (
+                    await session.execute(
+                        select(MemoryItemRow.id)
+                        .where(*live)
+                        .order_by(MemoryItemRow.id)
+                        .with_for_update()
+                    )
+                )
+                .scalars()
+                .all()
+            )
+            if not ids:
+                await session.rollback()
+                return 0
+            result = await session.execute(
+                update(MemoryItemRow)
+                .where(MemoryItemRow.id.in_(list(ids)), *live)
+                .values(deleted_at=now)
+            )
             await session.commit()
         return int(getattr(result, "rowcount", 0) or 0)
 
@@ -638,19 +678,92 @@ class SqlMemoryStore(MemoryStore):
             rows = (await session.execute(stmt)).scalars().all()
         return list(rows)
 
-    async def distinct_users(self, *, tenant_id: UUID) -> list[UUID]:
+    async def distinct_users(
+        self, *, tenant_id: UUID, after: UUID | None = None, limit: int | None = None
+    ) -> list[UUID]:
+        conds: list[ColumnElement[bool]] = [
+            MemoryItemRow.tenant_id == tenant_id,
+            MemoryItemRow.deleted_at.is_(None),
+            MemoryItemRow.status == "transient",
+        ]
+        if after is not None:
+            conds.append(MemoryItemRow.user_id > after)
+        # B-300 D4 — ordered by user id so the cursor walk is stable.
         stmt = (
             select(MemoryItemRow.user_id)
-            .where(
-                MemoryItemRow.tenant_id == tenant_id,
-                MemoryItemRow.deleted_at.is_(None),
-                MemoryItemRow.status == "transient",
-            )
+            .where(*conds)
             .distinct()
+            .order_by(MemoryItemRow.user_id)
+            .limit(limit)
         )
         async with self._sf() as session:
             rows = (await session.execute(stmt)).scalars().all()
         return list(rows)
+
+    async def get_consolidation_cursor(self, *, tenant_id: UUID) -> UUID | None:
+        stmt = select(MemoryConsolidationCursorRow.last_user_id).where(
+            MemoryConsolidationCursorRow.tenant_id == tenant_id
+        )
+        async with self._sf() as session:
+            return (await session.execute(stmt)).scalar_one_or_none()
+
+    async def set_consolidation_cursor(self, *, tenant_id: UUID, user_id: UUID) -> None:
+        stmt = (
+            pg_insert(MemoryConsolidationCursorRow)
+            .values(tenant_id=tenant_id, last_user_id=user_id)
+            .on_conflict_do_update(
+                index_elements=[MemoryConsolidationCursorRow.tenant_id],
+                set_={"last_user_id": user_id, "updated_at": func.now()},
+            )
+        )
+        async with self._sf() as session:
+            await session.execute(stmt)
+            await session.commit()
+
+    async def list_rejected_clusters(self, *, tenant_id: UUID, user_id: UUID) -> set[str]:
+        stmt = select(MemoryClusterRejectionRow.member_hash).where(
+            MemoryClusterRejectionRow.tenant_id == tenant_id,
+            MemoryClusterRejectionRow.user_id == user_id,
+        )
+        async with self._sf() as session:
+            return set((await session.execute(stmt)).scalars().all())
+
+    async def record_rejected_cluster(
+        self, *, tenant_id: UUID, user_id: UUID, member_hash: str, reason: str
+    ) -> None:
+        stmt = (
+            pg_insert(MemoryClusterRejectionRow)
+            .values(
+                tenant_id=tenant_id, user_id=user_id, member_hash=member_hash, reject_reason=reason
+            )
+            .on_conflict_do_update(
+                index_elements=[
+                    MemoryClusterRejectionRow.tenant_id,
+                    MemoryClusterRejectionRow.user_id,
+                    MemoryClusterRejectionRow.member_hash,
+                ],
+                set_={"reject_reason": reason, "rejected_at": func.now()},
+            )
+        )
+        async with self._sf() as session:
+            await session.execute(stmt)
+            await session.commit()
+
+    async def prune_rejected_clusters(self, *, tenant_id: UUID, before: datetime) -> int:
+        return await delete_where(
+            self._sf,
+            MemoryClusterRejectionRow,
+            MemoryClusterRejectionRow.tenant_id == tenant_id,
+            MemoryClusterRejectionRow.rejected_at < before,
+        )
+
+    async def delete_rejected_clusters_for_user(self, *, tenant_id: UUID, user_id: UUID) -> int:
+        return await delete_where(
+            self._sf,
+            MemoryClusterRejectionRow,
+            MemoryClusterRejectionRow.tenant_id == tenant_id,
+            MemoryClusterRejectionRow.user_id == user_id,
+        )
 
     async def list_transient(
         self,
@@ -669,6 +782,7 @@ class SqlMemoryStore(MemoryStore):
                 MemoryItemRow.deleted_at.is_(None),
                 MemoryItemRow.status == "transient",
                 MemoryItemRow.consolidated_into.is_(None),
+                *_retrieve_filter(),  # B-300 D1 — currently-valid rows only
                 MemoryItemRow.created_at >= cutoff,
             )
             .order_by(MemoryItemRow.created_at.asc())
@@ -697,6 +811,7 @@ class SqlMemoryStore(MemoryStore):
                 MemoryItemRow.deleted_at.is_(None),
                 MemoryItemRow.status == "transient",
                 MemoryItemRow.consolidated_into.is_(None),
+                *_retrieve_filter(),  # B-300 D1 — currently-valid rows only
                 MemoryItemRow.embedding.cosine_distance(list(embedding)) <= cosine_max,
             )
             .order_by(MemoryItemRow.embedding.cosine_distance(list(embedding)))
@@ -714,29 +829,62 @@ class SqlMemoryStore(MemoryStore):
         content: str,
         embedding: Sequence[float],
         source_ids: Sequence[UUID],
+        source_hashes: Mapping[UUID, str],
     ) -> MemoryItem:
         now = datetime.now(UTC)
         new_id = uuid4()
+        # B-300 D2 — the summary goes through the same strict scan as write().
+        hit = scan_memory_content(new_id, content)
+        if hit is not None:
+            raise MemoryInjectionBlockedError([hit])
         content_hash = hash_content(content)
         async with self._sf() as session:
-            # Idempotency guard — if any source has consolidated_into set
-            # already, abort cleanly so the worker can skip on the next
-            # tick. The link-update below is a 2-statement transaction so
-            # this guard removes most of the practical race window.
-            already = (
+            # B-300 D1 — re-read the members under a row lock in this write's
+            # own transaction: a concurrent supersede / expire / delete / in-place
+            # correction either commits first (and is seen here) or waits for this
+            # commit. Locked in id order; ``delete_all_for_user`` (user purge)
+            # locks the same way, so the two cannot deadlock. ``bump_access`` /
+            # ``flag_for_review`` still update in scan order (not changed here).
+            owned: list[ColumnElement[bool]] = [
+                MemoryItemRow.id.in_(list(source_ids)),
+                MemoryItemRow.tenant_id == tenant_id,
+                MemoryItemRow.user_id == user_id,
+            ]
+            locked = (
                 await session.execute(
-                    select(MemoryItemRow.id, MemoryItemRow.consolidated_into).where(
-                        MemoryItemRow.id.in_(list(source_ids)),
-                        MemoryItemRow.consolidated_into.is_not(None),
+                    select(
+                        MemoryItemRow.id,
+                        MemoryItemRow.consolidated_into,
+                        MemoryItemRow.content_hash,
+                    )
+                    .where(*owned)
+                    .order_by(MemoryItemRow.id)
+                    .with_for_update()
+                )
+            ).all()
+            # Idempotency guard — if any source has consolidated_into set
+            # already, abort cleanly so the worker can skip on the next tick.
+            already = next((row for row in locked if row[1] is not None), None)
+            if already is not None:
+                msg = f"memory item {already[0]} already consolidated_into {already[1]}; "
+                raise ConsolidationSourcesChangedError(msg + "skipping cluster")
+            # Review MEDIUM-1 — a member corrected in place since it was read: the
+            # summary was decided on the old text.
+            changed = next((row for row in locked if source_hashes.get(row[0]) != row[2]), None)
+            if changed is not None:
+                msg = f"memory item {changed[0]} changed since it was read; skipping cluster"
+                raise ConsolidationSourcesChangedError(msg)
+            # The same "currently valid" predicate recall uses.
+            current = (
+                await session.execute(
+                    select(func.count()).where(
+                        *owned, MemoryItemRow.deleted_at.is_(None), *_retrieve_filter()
                     )
                 )
-            ).first()
-            if already is not None:
-                msg = (
-                    f"memory item {already[0]} already consolidated_into {already[1]}; "
-                    "skipping cluster"
-                )
-                raise RuntimeError(msg)
+            ).scalar_one()
+            if current != len(set(source_ids)):
+                msg = "a cluster member is no longer current; skipping cluster"
+                raise ConsolidationSourcesChangedError(msg)
             # Insert the consolidated parent.
             new_row = MemoryItemRow(
                 id=new_id,

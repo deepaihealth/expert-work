@@ -576,6 +576,14 @@ async def purge_user(
         deps.memory_dlq.delete_all_for_user(tenant_id=tenant_id, user_id=user_id),
         default=0,
     )
+    # B-300 PR A —— 整理记下的「被拒的簇」(只有成员 id 的哈希)。整理游标是租户级的,
+    # 记着这个用户也不用动:下一轮从它之后接着取。
+    summary.deleted["memory_cluster_rejection"] = await _step(
+        summary,
+        "memory_cluster_rejection",
+        deps.memory.delete_rejected_clusters_for_user(tenant_id=tenant_id, user_id=user_id),
+        default=0,
+    )
     # B-235 —— 先删副本再删登记行(同图片:没删掉的副本由留存作业的孤儿清理按「找不到
     # 版本行」兜底,反过来卡住的登记行没人兜)。
     if deps.artifact_snapshots is not None:

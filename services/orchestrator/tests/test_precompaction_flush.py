@@ -18,7 +18,8 @@ from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, System
 
 from expert_work.persistence import InMemoryMemoryStore
 from expert_work.persistence.memory import InMemoryMemoryWritebackDLQ
-from expert_work.persistence.memory.base import MemoryInjectionBlockedError
+from expert_work.persistence.memory.base import BlockedMemory, MemoryWriteResult
+from expert_work.protocol import MemoryItem
 from expert_work.runtime.cancellation import CancellationToken, RunCancelledError
 from orchestrator.context import ContextCompressor
 from orchestrator.graph_builder.memory import flush_messages_to_memory
@@ -98,9 +99,15 @@ async def test_flush_returns_zero_on_empty_extraction() -> None:
 async def test_flush_returns_zero_when_blocked_by_scanner() -> None:
     @dataclass
     class _BlockingStore:
-        async def write(self, items: Sequence[object]) -> None:
-            del items
-            raise MemoryInjectionBlockedError(blocked=[(uuid4(), [])])
+        """B-300 D2 — the store hands every item back as blocked."""
+
+        async def write(self, items: Sequence[MemoryItem]) -> MemoryWriteResult:
+            return MemoryWriteResult(
+                blocked=tuple(
+                    BlockedMemory(item_id=i.id, content_length=len(i.content), findings=())
+                    for i in items
+                )
+            )
 
     llm = _RecordingLLM(
         responses=[AIMessage(content='{"memories": [{"kind": "fact", "content": "x"}]}')]

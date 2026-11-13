@@ -50,6 +50,7 @@ from expert_work.persistence.token_usage_store import (
     TokenUsageStore,
 )
 from expert_work.protocol import AgentSpec, ModelSpec
+from expert_work.runtime.audit.logger import AuditLogger
 from expert_work.runtime.cancellation import CancellationToken, RunCancelledError
 from orchestrator import MemoryEnv, MiddlewareEnv, build_llm_router, build_middleware_chains
 from orchestrator.agent_factory import memory_model, step_stream_timeouts
@@ -143,6 +144,7 @@ class MemoryWritebackProcessor:
         caller_factory: CallerFactory,
         usage_store: TokenUsageStore | None,
         resolve_spec: SpecResolver | None = None,
+        audit_logger: AuditLogger | None = None,
     ) -> None:
         self._agents = agent_specs
         self._env = memory_env
@@ -150,6 +152,8 @@ class MemoryWritebackProcessor:
         self._caller_factory = caller_factory
         self._usage_store = usage_store
         self._resolve_spec = resolve_spec
+        #: B-300 D2 —— 被写入扫描拦下的记忆发 ``MEMORY_INJECTION_BLOCKED`` 审计用。
+        self._audit_logger = audit_logger
 
     async def __call__(
         self, job: MemoryWritebackJob, *, still_held: Callable[[], Awaitable[bool]]
@@ -224,6 +228,7 @@ class MemoryWritebackProcessor:
                     agent_name=spec.metadata.name,
                     write_min_importance=long_term.write_min_importance,
                     before_store=before_store,
+                    audit_logger=self._audit_logger,
                 )
         except RunCancelledError:
             if recheck_error:

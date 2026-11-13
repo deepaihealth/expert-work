@@ -360,7 +360,11 @@ def record_trigger_blocked(*, phase: str) -> None:
 def record_memory_blocked(*, source: str) -> None:
     """Bump ``expert_work_uplift_memory_writes_blocked_total{source}``.
 
-    ``source`` ∈ ``{"api", "writeback", "dlq"}`` (Sprint #2 § 3.7).
+    ``source`` ∈ ``{"api", "writeback", "dlq"}`` (Sprint #2 § 3.7); B-300 D2
+    adds ``"reconcile_update"`` (an UPDATE's new text) and ``"consolidation"``
+    (a summary) — the same labels as the ``MEMORY_INJECTION_BLOCKED`` audit's
+    ``source``. ``writeback`` covers the run-end write-back (in-run and
+    background) and the pre-compaction flush.
     """
     _memory_blocked_total.labels(source=source).inc()
 
@@ -447,10 +451,12 @@ def record_memory_rewrite(*, outcome: str) -> None:
 def record_memory_reconcile(*, op: str) -> None:
     """Bump ``expert_work_cm_memory_reconcile_total{op}`` (Stream CM-7).
 
-    ``op`` ∈ ``{"add", "update", "delete", "noop", "degraded"}`` — the
-    operation actually applied per extracted candidate; ``degraded`` =
-    the reconcile decision failed and the candidate fell back to a
-    direct ADD (never lose a memory).
+    ``op`` ∈ ``{"add", "update", "delete", "noop", "degraded",
+    "target_changed"}`` — the operation actually applied per extracted
+    candidate; ``degraded`` = the reconcile decision failed and the candidate
+    fell back to a direct ADD (never lose a memory); ``target_changed`` (B-300)
+    = the UPDATE's target was folded into a summary / expired meanwhile, so the
+    candidate was written as a direct ADD instead.
     """
     _memory_reconcile_total.labels(op=op).inc()
 

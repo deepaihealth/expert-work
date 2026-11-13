@@ -37,6 +37,10 @@ from expert_work.persistence.models.knowledge import (
 )
 from expert_work.persistence.models.mcp_connector_catalog import McpConnectorCatalogRow
 from expert_work.persistence.models.mcp_oauth_connection import McpOAuthConnectionRow
+from expert_work.persistence.models.memory_consolidation import (
+    MemoryClusterRejectionRow,
+    MemoryConsolidationCursorRow,
+)
 from expert_work.persistence.models.memory_item import MemoryItemRow
 from expert_work.persistence.models.memory_writeback_dlq import MemoryWritebackDLQRow
 from expert_work.persistence.models.memory_writeback_job import MemoryWritebackJobRow
@@ -146,6 +150,8 @@ __all__ = [
     "KnowledgeTaskRow",
     "McpConnectorCatalogRow",
     "McpOAuthConnectionRow",
+    "MemoryClusterRejectionRow",
+    "MemoryConsolidationCursorRow",
     "MemoryItemRow",
     "MemoryWritebackDLQRow",
     "MemoryWritebackJobRow",
