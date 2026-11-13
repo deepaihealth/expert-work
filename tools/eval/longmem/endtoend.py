@@ -27,6 +27,7 @@ fingerprint):
 from __future__ import annotations
 
 import asyncio
+import inspect
 import logging
 from collections import defaultdict
 from collections.abc import Awaitable, Callable, Sequence
@@ -70,6 +71,8 @@ class EndToEndConfig:
     hybrid: bool = True
     mmr: bool = True
     reconcile: bool = True
+    #: B-300:被测代码应当有显式入口(PR 1 之后)时打开 —— 没有就报错,不悄悄跳过(审查 M2)。
+    expect_user_text: bool = False
 
 
 @dataclass(frozen=True)
@@ -97,6 +100,33 @@ class EndToEndReport:
         return data
 
 
+#: B-300 PR 1(设计 §4.1):第一次提炼只看白名单里「用户在对话里输入的文字」,只有生产的
+#: ``_build_human_message`` 写那个标记。这里的语料是整段会话塞进一条用户消息、不经那个构造点,
+#: 所以必须经提炼入口的**显式参数**声明「这几条是用户文字」,而不是去仿造标记。参数名以 PR 1 为准;
+#: 入口还没有这个参数(PR 1 之前的提交)时什么都不传,行为与改前一致。
+USER_TEXT_PARAM = "user_text_messages"
+
+
+class MissingUserTextEntryError(RuntimeError):
+    """要求显式入口(``expect_user_text``)而被测代码没有。"""
+
+
+def user_text_kwargs(
+    entry: Callable[..., Any], messages: Sequence[Any], *, required: bool = False
+) -> dict[str, Any]:
+    """``entry`` 认 :data:`USER_TEXT_PARAM` 就把 ``messages`` 声明为用户文字;不认就返回空 ——
+    ``required`` 时改为报错(B-300 的跑法:PR 1 之后的代码必须有这个入口)。"""
+    if USER_TEXT_PARAM in inspect.signature(entry).parameters:
+        return {USER_TEXT_PARAM: list(messages)}
+    if required:
+        raise MissingUserTextEntryError(
+            f"{entry.__qualname__} has no {USER_TEXT_PARAM!r} parameter, but this run expects the "
+            "B-300 explicit user-text entry (drop --expect-user-text only for pre-B-300 code)"
+        )
+    logger.debug("longmem.ingest: %s has no %s parameter (pre-B-300 code)", entry, USER_TEXT_PARAM)
+    return {}
+
+
 def _session_transcripts(docs: Sequence[MemoryDoc]) -> list[tuple[datetime | None, str]]:
     """Group docs back into per-session transcripts, oldest first.
 
@@ -122,6 +152,7 @@ async def _ingest_corpus(
     reconcile: bool,
     token: CancellationToken,
     sem: asyncio.Semaphore,
+    expect_user_text: bool = False,
 ) -> int:
     """Feed every session through the production extraction path.
 
@@ -138,9 +169,10 @@ async def _ingest_corpus(
             if timestamp is not None
             else "[Conversation session]"
         )
+        session = HumanMessage(content=f"{header}\n{transcript}")
         async with sem:
             return await flush_messages_to_memory(
-                [HumanMessage(content=f"{header}\n{transcript}")],
+                [session],
                 memory_store=store,
                 embedder=embedder,  # type: ignore[arg-type]
                 llm_caller=llm_caller,
@@ -150,6 +182,7 @@ async def _ingest_corpus(
                 token=token,
                 log_label="longmem.ingest",
                 reconcile=reconcile,
+                **user_text_kwargs(flush_messages_to_memory, [session], required=expect_user_text),
             )
 
     counts = await asyncio.gather(
@@ -292,6 +325,7 @@ async def run_end_to_end(
             reconcile=cfg.reconcile,
             token=token,
             sem=sem,
+            expect_user_text=cfg.expect_user_text,
         )
         rows = await asyncio.gather(*[_process_question(i, store) for i in pending])
         return list(rows), written

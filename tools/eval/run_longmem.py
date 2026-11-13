@@ -209,7 +209,9 @@ async def _run_endtoend(args: argparse.Namespace) -> None:
         embedder=embedder,  # type: ignore[arg-type]
         llm_caller=llm_caller,
         judge=judge,
-        config=EndToEndConfig(reconcile=not args.no_reconcile),
+        config=EndToEndConfig(
+            reconcile=not args.no_reconcile, expect_user_text=args.expect_user_text
+        ),
         done_ids=done_ids,
         on_result=lambda r: asyncio.to_thread(append_result, results_path, r),
         concurrency=args.concurrency,
@@ -249,7 +251,7 @@ async def _run_endtoend(args: argparse.Namespace) -> None:
         print(f"baseline updated: {args.baseline_out}")
 
 
-def main() -> None:
+def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="CM-N5 LongMemEval/LoCoMo runner")
     parser.add_argument("--benchmark", required=True, choices=_BENCHMARKS)
     parser.add_argument("--tier", required=True, choices=("retrieval", "endtoend"))
@@ -265,6 +267,16 @@ def main() -> None:
     parser.add_argument("--top-k", type=int, default=None, help="override arm top_k")
     parser.add_argument("--results", default="eval-out/longmem_results.jsonl")
     parser.add_argument("--no-reconcile", action="store_true")
+    parser.add_argument(
+        "--expect-user-text",
+        action="store_true",
+        help="B-300: fail if the extraction entry has no explicit user-text parameter",
+    )
+    parser.add_argument(
+        "--pre-b300",
+        action="store_true",
+        help="the code under test predates B-300 PR 1 (no explicit user-text entry)",
+    )
     parser.add_argument(
         "--llm-provider",
         default="openai-compat",
@@ -283,7 +295,23 @@ def main() -> None:
     )
     parser.add_argument("--baseline-out", default=str(_DEFAULT_BASELINE))
     parser.add_argument("--update-baseline", action="store_true")
+    return parser
+
+
+def check_user_text_choice(args: argparse.Namespace) -> None:
+    """端到端档必须二选一(B-300 第三轮审查):``--expect-user-text``(PR 1 之后的代码,没有显式入口
+    就报错)或 ``--pre-b300``(PR 1 之前的代码)。两个都不给 / 都给 → 退出,免得忘了。"""
+    if args.tier == "endtoend" and args.expect_user_text == args.pre_b300:
+        raise SystemExit(
+            "endtoend tier: pass exactly one of --expect-user-text (code with the B-300 explicit "
+            "user-text entry) or --pre-b300 (code from before B-300 PR 1)"
+        )
+
+
+def main() -> None:
+    parser = build_parser()
     args = parser.parse_args()
+    check_user_text_choice(args)
 
     if args.llm_model is None:
         if args.llm_provider == "openai-compat":

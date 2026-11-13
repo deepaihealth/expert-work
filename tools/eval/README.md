@@ -528,3 +528,51 @@ B-206 K-2 起默认同时给模型 `knowledge_read`(与生产一致:绑了知识
 3. 生成临时智能体:`python tools/eval/b302_ab.py manifests --out <dir> --doubao-model <...>`,控制台导入(三组只差 `policies.reading_rule` / `policies.figure_view_steps`)。**跑完必须删**:`python tools/eval/b302_ab.py cleanup --base-url <测试环境> --doubao-model <同上>` 先翻页列出脚本会生成的那几个确切 code(带租户与数量),确认后加 `--yes` 删(控制台凭据 `EXPERT_WORK_EVAL_CONSOLE_TOKEN`)。这两个覆盖字段在旧镜像上会让整份配置被拒收,回滚前检查见 `docs/runbooks/pending-test-release-acceptance.md` §112.8。
 4. 按先后跑,每段都要带批过的报价编号与止损线:`run --phase pilot` → 人工按 §5.3 查 `token_usage` 的全部用量种类(`conversation` 以外不为 0 就停) → `run --phase arm_a` → `report` 看判据 0(复现前提),glm 没复现就停 → `run --phase rest`。凭据走 `EXPERT_WORK_EVAL_API_KEY` / `--base-url`。每一轮开始前判止损线(过线后在跑的会话不再开下一轮);花费按 `end` 帧的 `usage_by_model` 累计(缺 `end` 帧时查 `GET /v1/agents/{code}/runs/{run_id}/usage` 补账)。补账接口说 run 还在跑时先取消、再轮询到终态才记账(等不到就按这一型号每次运行的上限计入);流中途断了同样先取消、再补账,然后把错误抛出。计不了账(两处都没有用量、没有单价的型号、某个会话出错、更新帧里没有 `usage_metadata`)就**阻塞**:不再派新运行,原因写进 `spent.json` 的 `blocked` 与 `report`。查清楚后用同样的参数加 `--unblock "<原因>"` 续跑,原因和被解除的那条记进 `spent.json` 的 `unblocks`。交付件读不了(不是 OOXML)记 `unreadable`、按没有交付件算分,这一轮的轨迹照样保留。单次调用输入超过 25 万 token 就取消那次运行。按 Ctrl-C 中断时,在跑的会话若正在补账(取消后等终态),最多还要轮询 180 秒才退出;补账时网络也断了就按上限计入并阻塞。根本没创建出来的运行(`POST /runs` 被拒,或请求没发出去)、以及正常结束却一步模型调用都没有的运行记 0 并阻塞。中断后用同样的参数再跑同一段即可续跑:已跑完的会话跳过,`report` 按会话去重(留最后一条)。`report` 另报出错 / 被拦下的会话数和交付件来源(登记过 / 只在工作区、没登记 / 没有)。
 5. `report` 输出每个模型的判据与结论,以及按 §5.4 末尾规则的落地建议(所有测过的模型都过才改平台默认)。
+
+## B-300 长期记忆来源评测(`b300_*.py`,花钱,不进 CI)
+
+设计 `docs/superpowers/specs/2026-11-11-b300-memory-provenance-design.md` §8(A / B / C 组、§8.5 对比、§8.6 花费与删减顺序、§8.7 C 组)。离线单测 `test_b300_*.py`(假 HTTP、进程内存储、假嵌入)进 CI;真跑不进。
+
+| 文件 | 做什么 |
+|---|---|
+| `b300_facts.py` / `b300_scenarios.py` | 合成场景:10 条事实(5 个领域 x 2,8 种内容形态,中 / 英两套文字);A 组 12 类 x 10、B 组 7 类 x 10、C 组 5 类 x 5(每领域 1 个,用户 11-13「缩小新题规模,守住 ¥400」),§8.5 对比 20 段。没有租户名、客户内容 |
+| `b300_phases.py` / `b300_outcomes.py` | 各段(`a` / `b` / `b-screen` / `c` / `c4` / `c5` / 基线 / 对比)的单元、文件、控制面那几步的输入、版本记录;判分材料与报告汇总 |
+| `b300_plan.py` | 报价:每组、每家的调用次数与 ¥ 区间;§8.6 删减顺序;¥400 上限 |
+| `b300_spend.py` | 账本(沿用 `b301_spend` 的格式与锁):每次调用 / 每次运行**先按上限预留并落盘,再发**;止损线;跨报价总账 |
+| `b300_live.py` | 会花钱的那段:A 组本机进程内提炼、B / C 组对外平面对话、判官 |
+| `b300_inpod.py` | 只能在**控制面进程里**做的几步(自包含,不 import 本目录):种记忆、读召回到的记忆 id、C5 / T13 的候选簇记录器(调 `_find_candidate_clusters`,**只出 id**)、只对评测用户整理一轮、查状态 |
+| `b300_report.py` | 判分材料、通过线、报告 |
+| `b300_approve.py` / `b300_steps.py` / `b300_runs.py` | 报价核对与花钱前的批准(状态目录锁里);`prepare` / `bundle` / `ingest`;花钱的循环与试点量 token |
+| `b300_eval.py` | 命令行:`scenarios` / `quote` / `manifests` / `prepare` / `bundle` / `ingest` / `run` / `judge` / `calibrate` / `pilot-tokens` / `report` |
+| `b300_tokens.py` | 设计里平台文字的 `o200k_base` token 数(§4.4 / §5.2;tiktoken 第一次用会联网下词表,离线要先设 `TIKTOKEN_CACHE_DIR`) |
+
+**花钱的规矩(用户定)**:上限 ¥400,跨全部报价累计。每次跑前先 `quote`;哪一次会让累计超过 ¥400,先按 §8.6 的顺序删 —— ① B 组备选位置不自动跑、② B1 / B2 在旧提交上的筛选只跑一家、③ C1 / C3 只跑一家(报告写明是哪家、其余没测)—— 删完仍超就 `status: stop_and_ask`,**停下问用户**,不自行再删;用户说跑,把原话用 `--user-said "<原话>"` 传给每个花钱的命令(记进 `<out>/approvals.jsonl`)。`quote` 按每次调用 token 的**高档假设**判会不会超(假设未实测,见报价里的 `token_assumptions`),所以先跑**试点**:`quote --pilot --single-vendor <家> --stop-line <小数>` 单独报价、单独批(每段 2 个单元、一家、各 1 次),用另一个 `--out` 跑完后 `pilot-tokens --out <试点 out> --write tokens.json`,再 `quote --tokens tokens.json` 报正式的价。一份报价用 `--phases b` / `--phases b,c,a` 写明覆盖哪几段(没覆盖的段 `run` / `judge` 直接拒);止损线怎么分给这几段是报价里**写明、由用户批**的一部分(`phase_budgets`:默认按每段低档与高档的中点按比例分,或用户给 `--allocation b=250,c=100,a=50`),某一段超了自己的分预算**只停那一段**,不写进账本、不停整份报价。重报价接着做(用户 11-13 定:先试点、再按实测 token 重报):`progress --out 旧OUT --write progress.json`(记下旧目录里每段**做完了哪些**单元)→ `quote --progress progress.json ...`(按**这份新报价意味着的全部单元**减去做完的算还剩多少,印出 `remaining_by_phase` / `remaining_units_by_phase`)→ 批了以后对每一段 `prepare --phase X --out 新OUT --resume-from 旧OUT`(带同样的报价参数):做完的记录搬进新目录(标 `carried_from_quote`,每条在 `carried.jsonl` 留一行审计,召回 / 状态 / 判分文件一起带过来,报告合着算),只为还没做完的建单元(个数与报价里数的一模一样;用新报价的用户名,只给它们重新种)。旧目录在报价之后又有变动(摘要对不上)就拒,重新 `progress`、重新报价。单元(`units.json`)绑定报价编号,换了报价就要另开 `--out` 重新 `prepare`;试点报价不给 `--stop-line` 时止损线取它自己的高档估计(向上取整),之后的命令要带上报价里印出来的那个数。报价里另列语言配比(`languages`,常量 `b300_scenarios.LANG_CYCLE`,由用户定要不要改)、嵌入的估计(`embeddings`,没有价目,给 `--embed-price` 才折钱)、不计价的项(`not_priced`:沙箱时长等)。
+
+花钱的命令(`run` / `judge` / `calibrate` / `bundle --op consolidate` / `ingest --op consolidate|writeback_usage`)要 `--approved-quote <quote_id>` 与 `--stop-line`(≤ 400,且「别的报价已花 + 止损线」≤ 400,否则拒),并**独占状态目录的锁**(另一个花钱的进程在跑就直接拒);每次预留都按「别的报价已花 + 本报价 + 这一笔」判 ¥400。停下(过线、计不了账)会在账本里写一行 `blocked`,续跑要加 `--unblock "<为什么可以继续>"`(也落账)。改了任何参数报价编号就变。账本在 `~/.cache/b300-eval/<quote_id>.spend.jsonl`,**不能删**;**花钱只有一个状态目录**(`~/.cache/b300-eval`):总账、锁、每个报价的账本都在这里;`--state-dir` 只给测试用(要设 `B300_EVAL_ALLOW_TEST_STATE_DIR=1`,`tools/eval/conftest.py` 会设),平时给了就拒 —— 换目录绕开 ¥400 的路整个没有了。注意这个默认目录跟着 `HOME` 走:换了 `HOME` 就是另一本账、看不到之前花的钱 —— 别换。接着做(`--resume-from`)还要核对版本:旧目录这一段的发布版本、脚本提交必须与这次相同(对话类各段 `prepare` 要带 `--release-tag`;提炼段 `a` / `compare-*` 在本机跑、不打测试环境,**不收** `--release-tag`,给了就拒,版本只看脚本提交),每条搬过来的记录的型号与场景摘要也要与这份报价、现在的场景相同,对不上就整段拒。C5 的种子是 X 加三条仍然有效的相近记忆;C5 ① 没测到的分三种原因各自计数、都不进过线:平台的定时整理在我们这一步之前就整理过了(`c5_consolidated_before_our_step`,它整理出的汇总行照样送判官,判分另列为 `c5_platform_summary_*`)、候选没记录(`c5_candidates_not_recorded`,不判)、整理前没凑成簇(`c5_not_measured`,不判)。只结算的步骤(`ingest --op consolidate|writeback_usage`)认账本里的报价编号、不重算报价,所以有了新报价以后旧报价的预留照样能结。`--user-said` / `--unblock` 要写清原话 / 原因(至少 4 个字符,不收「ok」「好的」这类)。A 组与判官的请求体带产品同一套「关思考 + 输出上限」字段(`agent_factory.thinking_off_request_fields`)。单价:qwen / 豆包取价目表迁移 0187,glm-5.3 / deepseek-v4-pro / glm-5.3-flash 不在迁移里,要 `--accept-documented-prices`(出处写在报价里)。
+
+**凭据只从环境变量读**,不进命令行:对外平面 `EXPERT_WORK_EVAL_API_KEY`(+ `--base-url` 或 `EXPERT_WORK_EVAL_BASE_URL`);A 组各家 `EXPERT_WORK_EVAL_<GLM|DEEPSEEK|QWEN|DOUBAO>_BASE_URL` / `_API_KEY`;判官 `EXPERT_WORK_EVAL_JUDGE_BASE_URL` / `_API_KEY`(deepseek-v4-pro,B-206 尺子);嵌入 `EXPERT_WORK_EVAL_EMBED_*`(同 `kb_eval`;嵌入没有价目,不进账本)。
+
+**在哪跑**:
+
+* A 组、§8.5 对比:本机,进程内直接调生产的写回入口(`flush_messages_with_outcome`),用户消息由生产的 `_build_human_message` 拼。测的是**跑脚本的这个检出目录的代码**:`compare-before` 在 PR 1 合并前那个提交的另一个工作区里跑同一份脚本。
+* B / C 组:对外平面,打**当时测试环境上线的那一版**;`run` 必须带 `--release-tag`(如 `f2a21c6b2-test`),连同脚本所在提交记进 `<out>/<段>/meta.json`,换了版本就要换 `--out`。基线(`b-screen`、`c2-baseline` 用 PR 1 合并前的提交;`c4-baseline` / `c5-baseline` 用 PR A 合并前的提交)就是在那一版上线时跑。
+* 控制面里的几步:`bundle` 生成自包含脚本,测试环境 `kubectl -n expert-work exec -i "$POD" -- python - < bundle.py > out.jsonl`(同 `compaction_retention.py`),本地栈 `python tools/eval/b300_inpod.py --input step.json`;然后 `ingest --file out.jsonl`。
+
+**控制面里的几步不进 app 的 lifespan**:`b300_inpod.bootstrap` 只拼存储、密钥、租户配置、凭据解析、嵌入、审计、token 用量,不建任何 worker / sweep,装配前后都查没有后台任务(否则这个进程可能去认领真租户排队的运行或写回任务)。
+
+**评测租户的预检**(每个租户一次,对话类各段 `run` 之前必须有):`bundle --op preflight` → pod → `ingest --op preflight`。要求该租户 `memory_purge_enabled` 与 `memory_predictive_review_enabled` 都关,且像个评测租户:对外用户里不是评测脚本建的(`b300-` 开头以外)为 0、智能体里不是评测智能体的(`eval-b300-` 开头以外)为 0(登录控制台的员工只计数、不拦);只出开关与个数,**脚本从不改租户的设置**,要关的由人去关。**整理(凑簇汇总)没有按租户的开关**,平台每 4 小时扫一轮;C5 在取候选时若发现评测用户已经有汇总行(平台先整理了),这一条前提不成立、补跑。种子都在 20 天以内(`MAX_SEED_DAYS_AGO`),离整理与清理的 30 天窗口留足余量。
+
+**一段对话类评测的顺序**(以 `b` 为例;`--tenant-id` 是导入评测智能体的那个租户):
+
+1. `manifests --out agents/` → 控制台导入(每家 `eval-b300-<家>` 不写回、`eval-b300-<家>-wb` 写回)。先人工跑一段确认智能体读得到上传的文件。
+2. `prepare --phase b --out OUT --tenant-id T --approved-quote Q` → `OUT/b/units.json` 与 `bundle-seed.py`;pod 里跑它 → `ingest --op seed`。每次运行一个新的评测用户,种子互不串。
+3. `calibrate --labels labels.jsonl ...`(只做一次):20 条**人工**标注(每行 `domain` / `label` / `prompt`,5 个领域各 4 条、是否各半),判官一致 ≥ 18 才让 `judge` 开跑。A 组另有一套(`calibrate --set a --labels a-labels.jsonl`,按报价的 A 组票数,默认 1 票);1 票没过就 `quote --a-judge-votes 3` 重新报价、批、再校。
+4. `run --phase b --release-tag ... --approved-quote Q --stop-line S` → `bundle --op recalled` → pod → `ingest --op recalled`(召回帧对外已剔除,只能在库里读)→ `judge --phase b`。
+5. 种下的那条没被召回的、前提不成立的不计入:`prepare --phase b --reruns` 加一次尝试(补跑合计超过两成就停下问)→ 重复 2、4。出错的那几条不另开尝试,同样的参数再 `run` 就在原地续跑。
+6. `report --out OUT --quote-file quote.json`。
+
+C4 分三步:`run --step 1`(写回智能体)→ 等写回 → `bundle --op state --step 1` → pod → `ingest --op state --step 1` → `run --step 2` → 同样查 `--step 2` 的状态 → `run --step 3`(提问)→ 召回 / 判分同上。写回在对外流里看不到用量:`run` 时**在开这段对话之前**按上限预留(预留被拒就不开),之后 `bundle --op writeback_usage` → pod(读 `token_usage` 里这几个评测用户的平台开销行,并报每次运行的写回任务状态,只出数字;时间从这一段**最早**一次 `run` 算起)→ `ingest --op writeback_usage`:一个用户有 run id 的写回任务**全部**结束、且用量读得到,才按实际结算;还有任务没跑完、找不到任务、用量为空,一律**留着预留**(账本里按上限算),过一会儿再 bundle / ingest 一次,从不按 0 结。用量是从最早一次 run 起的累计数,每次只结「累计减去已结」(`writeback-settled.json` 记着),已结过的 run 不再结。对话确定没建起运行(`POST /runs` 回 4xx、连不上、上传就失败了)的那笔写回按 0 结;不知道建没建起的那笔单独留着,不挡同一用户别的几笔。前提(对话二写回后对话一那几条不再有效)不成立的单独计数、补跑。C5:`prepare`(种 X 已被 Y 取代 + 两条相近的)→ `bundle --op candidates`(记录整理前的候选簇,只出 id)→ `bundle --op consolidate`(在 pod 里只对评测用户整理一轮,先核对整理用的是 `glm-5.3-flash`,调用数有上限;每生成一次一个 nonce、一份预留,`ingest` 时按 token 结算,没过结构化校验的调用按 2 次重试的上限补记;同一份脚本的输出收两次会照实补记并停下 —— **一份脚本只跑一次**;pod 里另在 `/tmp/b300-eval-markers`(可用 `B300_MARKER_DIR` 改)留一个按 nonce 的标记,同一份脚本再跑直接拒;pod 重建后标记就没了,这时只剩本地的「收两次」那道)→ `bundle --op state`(汇总行给判官判)→ `run`(四家提问)→ 召回 / 判分同上。
+
+**报告**:每类 x 每家 x 领域判线。B 组线是 11-11 拍板 ①;P6 / P7 / P9 是 §10.2 第 1 条;其余 A 组线是 §8.2 所列;**C 组线一律「待用户确认」,报告只说按提出的线会过 / 不过,不作验收依据**。C1 / C3 只在一家上跑时报告写明哪一家、其余没测;A 组判官默认 1 票(设计没给 A 组算判官钱,本脚本安排),另有 A 组校准把关。基线段报每个场景 3 次里红了几次(≥ 1 留用,0 换掉)。§8.5 对比报写入条数、两类、来源与「下降不超过三分之一」。
+
+**LoCoMo / LongMemEval**:`longmem/endtoend.py` 经提炼入口的显式参数 `user_text_messages` 声明「语料是用户文字」(设计 §4.1);入口还没有这个参数时什么都不传,行为与改前一致;**B-300 的那次 LoCoMo 检查(PR 1 之后的代码)要加 `run_longmem.py --expect-user-text`**,入口没有这个参数就报错,不悄悄跳过。`run_longmem.py` 的端到端档**必须二选一** `--expect-user-text` / `--pre-b300`(都不给、都给都退出);`run_baseline_full.sh` 用 `USER_TEXT_FLAG`(默认 `--pre-b300`,PR 1 合并后改成 `--expect-user-text`)。参数名以 PR 1 为准,改名要同步改 `USER_TEXT_PARAM`。A 组若在被测代码上没看到两次提炼,第一条就停下(不空转花钱)。
