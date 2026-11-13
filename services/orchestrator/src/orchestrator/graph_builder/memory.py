@@ -71,10 +71,12 @@ from expert_work.common.user_input import (
 from expert_work.persistence import MemoryStore
 from expert_work.persistence.memory import MemoryWritebackDLQ, MemoryWritebackJobStore
 from expert_work.persistence.memory.base import (
+    ASSISTANT_DERIVED_MAX_CONFIDENCE,
     USER_SIDE_ORIGINS,
     BlockedMemory,
     MemoryInjectionBlockedError,
     SupersedeTargetChangedError,
+    UserSideTargetError,
 )
 from expert_work.persistence.rls import (
     bypass_rls_var,
@@ -165,9 +167,6 @@ _TRUNCATED_SUFFIX = "...[truncated]"
 #: B-300 D3 —— 每次提炼输入的总量上限(字符);超了从最早的行丢起、保留最近的。
 #: 记忆调用默认走主模型同一家的便宜型号,32,000 字远在它们的窗口之内。
 _EXTRACT_INPUT_CHAR_CAP = 32_000
-#: B-300 —— 第二次提炼(整段对话)的产出都是「来自助手」:置信度由程序压到这个数以内,
-#: 无论模型回什么。
-_MAX_ASSISTANT_DERIVED_CONFIDENCE = 0.6
 
 #: B-300 ① —— 两次提炼的名字(计数的标签、日志里都用它)。
 _USER_TEXT_EXTRACTION = "user"
@@ -1120,9 +1119,39 @@ _RECONCILE_SYSTEM = (
 )
 
 
-def _assistant_overrides_user(candidate: MemoryItem, target: MemoryItem) -> bool:
-    """B-300 §6.2 —— 候选来自助手,目标的有效来源是用户消息里说的或用户更正的。"""
-    return candidate.origin == "assistant_derived" and effective_origin(target) in USER_SIDE_ORIGINS
+async def _protects_user_side(
+    memory_store: MemoryStore, target: MemoryItem, token: CancellationToken, log_label: str
+) -> bool:
+    """B-300 §6.2 拦截规则的预判:目标的有效来源是用户消息里说的 / 用户更正的,或者它是
+    一条成员里有这种记忆的汇总行(审查 MEDIUM-3)。
+
+    预判用的是读邻居时的那份目标;真正改库时 ``supersede`` / ``expire`` 还会在锁里重判
+    (审查 MEDIUM-1)。所以查汇总成员失败时这里按「不受保护」放过,由锁里那道兜底。"""
+    if effective_origin(target) in USER_SIDE_ORIGINS:
+        return True
+    if not target.consolidated_from:
+        return False
+    try:
+        return await token.run_cancellable(
+            memory_store.user_side_protected(
+                tenant_id=target.tenant_id, user_id=target.user_id, memory_id=target.id
+            )
+        )
+    except RunCancelledError:
+        raise
+    except Exception:
+        logger.warning("%s_protection_lookup_failed id=%s", log_label, target.id, exc_info=True)
+        return False
+
+
+def _blocked_by_user_side(op: str, item: MemoryItem, *, is_correction: bool) -> MemoryItem | None:
+    """B-300 §6.2 —— 被拦的删除什么都不做;被拦的更新:是用户的更正(短更新)→ 与旧的并存、
+    按新增存下(返回这条候选);否则丢弃(多半只是把用户说过的话换个说法又提了一遍)。"""
+    if op == "UPDATE" and is_correction:
+        record_memory_reconcile(op="blocked_update_added")
+        return item
+    record_memory_reconcile(op="blocked_update_dropped" if op == "UPDATE" else "blocked_delete")
+    return None
 
 
 def _reconcile_cosine(a: Sequence[float], b: Sequence[float]) -> float:
@@ -1280,28 +1309,33 @@ async def _reconcile_and_apply(
         valid = {str(n.id): n for n in similar}
         target_item = valid.get(target_raw) if target_raw is not None else None
         target = target_item.id if target_item is not None else None
+        # B-300 §6.2 唯一的拦截规则:来自助手的候选不得更新 / 删除用户一方的记忆。
+        guarded = item.origin == "assistant_derived"
         if (
             op in ("UPDATE", "DELETE")
             and target_item is not None
-            and _assistant_overrides_user(item, target_item)
+            and guarded
+            and await _protects_user_side(memory_store, target_item, token, log_label)
         ):
-            # B-300 §6.2 唯一的拦截规则:来自助手的候选不得更新 / 删除用户说的、用户更正的。
-            # 被拦的删除什么都不做;被拦的更新:是用户的更正(短更新)→ 与旧的并存、按新增
-            # 存下;否则丢弃(多半只是把用户说过的话换个说法又提了一遍)。
-            if op == "UPDATE" and is_corr:
-                record_memory_reconcile(op="blocked_update_added")
-                direct.append(item)
-            else:
-                record_memory_reconcile(
-                    op="blocked_update_dropped" if op == "UPDATE" else "blocked_delete"
-                )
+            kept = _blocked_by_user_side(op, item, is_correction=is_corr)
+            direct.extend([kept] if kept is not None else [])
         elif op == "NOOP":
             record_memory_reconcile(op="noop")
         elif op == "UPDATE" and target is not None:
             try:
                 updated = await _apply_update(
-                    item, target, memory_store=memory_store, token=token, before_store=before_store
+                    item,
+                    target,
+                    memory_store=memory_store,
+                    token=token,
+                    before_store=before_store,
+                    refuse_user_side=guarded,
                 )
+            except UserSideTargetError:
+                # 审查 MEDIUM-1 —— 读邻居之后目标变成了用户一方的(例如用户这时点了更正)。
+                kept = _blocked_by_user_side(op, item, is_correction=is_corr)
+                direct.extend([kept] if kept is not None else [])
+                continue
             except MemoryInjectionBlockedError as exc:
                 blocked.extend(
                     _BlockedWrite(b, "reconcile_update", position[item.id], target)
@@ -1320,9 +1354,18 @@ async def _reconcile_and_apply(
             if not updated:
                 direct.append(item)
         elif op == "DELETE" and target is not None:
-            deleted = await _apply_delete(
-                item, target, memory_store=memory_store, token=token, before_store=before_store
-            )
+            try:
+                deleted = await _apply_delete(
+                    item,
+                    target,
+                    memory_store=memory_store,
+                    token=token,
+                    before_store=before_store,
+                    refuse_user_side=guarded,
+                )
+            except UserSideTargetError:
+                _ = _blocked_by_user_side(op, item, is_correction=is_corr)  # 删除:不动
+                continue
             # The candidate is the retraction event — not stored either way.
             record_memory_reconcile(op="delete" if deleted else "degraded")
         elif op == "ADD":
@@ -1342,13 +1385,15 @@ async def _apply_update(
     memory_store: MemoryStore,
     token: CancellationToken,
     before_store: BeforeStore | None = None,
+    refuse_user_side: bool = False,
 ) -> bool:
     """Stream P5b — append-only UPDATE: supersede ``target`` with ``item``
     (close old row + open new versioned row) instead of overwriting in place.
 
     B-300 D2 —— 新内容被写入扫描拦下时 ``MemoryInjectionBlockedError`` 原样抛给调用方
     (什么都没改);目标已被汇总 / 过期时 ``SupersedeTargetChangedError`` 也原样抛给调用方;
-    别的失败照旧返回 ``False``、由调用方退回直接写入。"""
+    ``refuse_user_side`` 时目标在锁里重判成用户一方的,``UserSideTargetError`` 原样抛
+    (审查 MEDIUM-1);别的失败照旧返回 ``False``、由调用方退回直接写入。"""
     if before_store is not None:
         await before_store()  # B-168 —— 抛 RunCancelledError 就整批放弃,不吞
     try:
@@ -1358,9 +1403,15 @@ async def _apply_update(
                 user_id=item.user_id,
                 old_id=target,
                 new_item=item,
+                refuse_user_side=refuse_user_side,
             )
         )
-    except (RunCancelledError, MemoryInjectionBlockedError, SupersedeTargetChangedError):
+    except (
+        RunCancelledError,
+        MemoryInjectionBlockedError,
+        SupersedeTargetChangedError,
+        UserSideTargetError,
+    ):
         raise
     except Exception:
         logger.warning("memory.reconcile_update_failed id=%s", target, exc_info=True)
@@ -1375,16 +1426,25 @@ async def _apply_delete(
     memory_store: MemoryStore,
     token: CancellationToken,
     before_store: BeforeStore | None = None,
+    refuse_user_side: bool = False,
 ) -> bool:
     """Stream P5b — retraction: expire ``target`` (world no longer true, no
-    successor) instead of soft-deleting it (which means user-forget)."""
+    successor) instead of soft-deleting it (which means user-forget).
+
+    B-300 审查 MEDIUM-1 —— ``refuse_user_side`` 时目标在锁里重判成用户一方的:
+    ``UserSideTargetError`` 原样抛给调用方(什么都没改)。"""
     if before_store is not None:
         await before_store()  # B-168 —— 抛 RunCancelledError 就整批放弃,不吞
     try:
         return await token.run_cancellable(
-            memory_store.expire(tenant_id=item.tenant_id, user_id=item.user_id, memory_id=target)
+            memory_store.expire(
+                tenant_id=item.tenant_id,
+                user_id=item.user_id,
+                memory_id=target,
+                refuse_user_side=refuse_user_side,
+            )
         )
-    except RunCancelledError:
+    except (RunCancelledError, UserSideTargetError):
         raise
     except Exception:
         logger.warning("memory.reconcile_delete_failed id=%s", target, exc_info=True)
@@ -1416,11 +1476,11 @@ async def _extract_pass(
     record_memory_extraction(pass_name=pass_name, outcome=outcome)
     memories = parsed or []
     if pass_name == _CONVERSATION_EXTRACTION:
-        # 来自助手:无论模型给多少,置信度压到 0.6 以内(B-300 ①)。
+        # 来自助手:无论模型给多少,置信度压到 0.6 以内(B-300 ①;与整理汇总共用一个数)。
         return [
             replace(
                 m,
-                confidence=min(m.confidence, _MAX_ASSISTANT_DERIVED_CONFIDENCE),
+                confidence=min(m.confidence, ASSISTANT_DERIVED_MAX_CONFIDENCE),
                 origin="assistant_derived",
             )
             for m in memories
@@ -1620,6 +1680,8 @@ async def flush_messages_with_outcome(
     """
     extracted: list[ExtractedMemory] = []
     blocked: list[_BlockedWrite] = []
+    #: 写失败时交给失败队列的 ``(kind, content)``;``None`` = 还没去重合并,按全部提炼结果。
+    retry_pairs: list[tuple[str, str]] | None = None
     written = 0
     extract_failed = False
     try:
@@ -1686,6 +1748,9 @@ async def flush_messages_with_outcome(
                 log_label=log_label,
                 before_store=before_store,
             )
+            # 审查 LOW-1 —— 去重合并之后,失败重试只该重建本来要写的这几条:被拦下丢弃的
+            # 更新、删除事件、跳过的重复都不进失败队列(已经取代 / 作废的也已落库)。
+            retry_pairs = [(str(item.kind), item.content) for item in items]
         if items:
             if before_store is not None:
                 await before_store()
@@ -1701,22 +1766,24 @@ async def flush_messages_with_outcome(
         # extraction produced pairs, hand them to the DLQ for a retry
         # sweep; otherwise (parse / cancel-shaped failures below the
         # extraction line) log and drop as before.
-        if dlq is not None and extracted:
+        if retry_pairs is None:
+            retry_pairs = [(str(m.kind), m.content) for m in extracted]
+        if dlq is not None and retry_pairs:
             try:
-                # DLQ enqueue takes ``Sequence[tuple[str, str]]``; widen the
-                # Literal kind so mypy accepts the tuple element.
+                # DLQ enqueue takes ``Sequence[tuple[str, str]]``; the Literal
+                # kind is widened to ``str`` above so mypy accepts the tuples.
                 await dlq.enqueue(
                     tenant_id=tenant_id,
                     user_id=user_id,
                     source_thread_id=str(thread_id) if thread_id is not None else None,
                     source_run_id=run_id,
-                    extracted=[(str(m.kind), m.content) for m in extracted],
+                    extracted=retry_pairs,
                     error=f"{type(exc).__name__}: {exc}",
                 )
                 logger.warning(
                     "%s_failed — enqueued %d pair(s) to DLQ",
                     log_label,
-                    len(extracted),
+                    len(retry_pairs),
                     exc_info=True,
                 )
             except Exception:

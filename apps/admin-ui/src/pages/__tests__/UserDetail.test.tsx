@@ -9,7 +9,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { MemoryRouter, Route, Routes } from "react-router-dom";
-import "../../i18n";
+import i18n from "../../i18n";
 
 import * as convoSdk from "../../api/conversations";
 import * as memorySdk from "../../api/memory";
@@ -170,6 +170,49 @@ describe("UserDetail", () => {
     );
     expect(usageSdk.getUsageTokens).toHaveBeenCalledWith(
       expect.objectContaining({ userId: USER_ID }),
+    );
+  });
+
+  it("labels each memory with its source (B-300 PR 2)", async () => {
+    stubAll();
+    vi.spyOn(memorySdk, "listMemories").mockResolvedValue({
+      items: [
+        {
+          id: "m-derived",
+          tenant_id: "t",
+          user_id: USER_ID,
+          kind: "fact",
+          content: "Found by the assistant",
+          created_at: "2026-06-30T10:00:00Z",
+          importance: 0.5,
+          confidence: 0.5,
+          origin: "assistant_derived",
+        },
+        {
+          id: "m-corrected",
+          tenant_id: "t",
+          user_id: USER_ID,
+          kind: "fact",
+          content: "Corrected by the user",
+          created_at: "2026-06-30T10:00:00Z",
+          importance: 0.5,
+          confidence: 1,
+          origin: null,
+        },
+      ],
+      total: 2,
+      cross_tenant: false,
+    });
+    const user = userEvent.setup();
+    renderPage();
+    await screen.findByText("refund question");
+    await user.click(screen.getByRole("tab", { name: "Memory" }));
+    await screen.findByText("Found by the assistant");
+    expect(screen.getByTestId("memory-origin-m-derived")).toHaveTextContent(
+      i18n.t("memory.origin_assistant_derived"),
+    );
+    expect(screen.getByTestId("memory-origin-m-corrected")).toHaveTextContent(
+      i18n.t("memory.origin_user_corrected"),
     );
   });
 

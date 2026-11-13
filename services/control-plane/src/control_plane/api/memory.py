@@ -54,6 +54,7 @@ from control_plane.uplift.threat_metrics import (
 from expert_work.common.observability import current_trace_id_hex
 from expert_work.common.threat_patterns import ThreatFinding, scan_for_threats
 from expert_work.persistence.memory import MemoryStore
+from expert_work.persistence.memory.base import NON_CORRECTION_MAX_CONFIDENCE
 from expert_work.persistence.tenant_user import TenantUserStore
 from expert_work.protocol import AuditAction, MemoryItem, Principal
 from expert_work.runtime.audit.logger import AuditLogger
@@ -414,6 +415,15 @@ def build_memory_router() -> APIRouter:
                     },
                 ) from exc
 
+            # B-300 —— 来源按编辑人区分(用户 11-13 拍板):本人改自己的,这段文字是用户
+            # 自己写的 →「用户消息里说的」,置信度不动(1.0 仍是更正);别人改的 → 来源置空、
+            # 置信度压到 0.99 以内(在存储里按行上的值压),显示「来源未记录」,也就不再受
+            # 拦截规则保护。「本人」= 这一行的用户就是调用者自己的记忆用户(D8 判「更正」
+            # 按钮用的同一个身份),且在调用者的主租户里。
+            own = (
+                target_tenant_id == principal.tenant_id
+                and existing.user_id == target.caller_user_id
+            )
             updated = await store.update_content(
                 tenant_id=target_tenant_id,
                 user_id=target.user_id,
@@ -422,8 +432,9 @@ def build_memory_router() -> APIRouter:
                 embedding=vectors[0],
                 kind=payload.kind,
                 embedding_model=embedding_model,
-                # B-300 §6.2 —— 管理员改写过的内容不是谁「说的」了:来源置空。
-                clear_origin=True,
+                origin="user_stated" if own else None,
+                clear_origin=not own,
+                max_confidence=None if own else NON_CORRECTION_MAX_CONFIDENCE,
             )
             # Still possible: forgotten between the lookup and the write.
             if updated is None:

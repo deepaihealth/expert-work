@@ -19,6 +19,7 @@ from expert_work.persistence import InMemoryMemoryStore, InMemoryTenantUserStore
 from expert_work.persistence.audit_log import InMemoryAuditLogStore
 from expert_work.persistence.rls import bypass_rls_var, current_tenant_id_var
 from expert_work.protocol import AuditAction, AuditQuery, MemoryItem, Principal
+from expert_work.protocol.memory_item import effective_origin
 from orchestrator import AgentFactoryError
 from tests.auth_fixtures import (
     TEST_AUDIENCE,
@@ -1085,28 +1086,64 @@ class _ReportingEmbedder(_StubEmbedder):
         return await self.embed(texts, tenant_id=tenant_id), _EMBED_MODEL
 
 
-async def _mark_user_stated(store: InMemoryMemoryStore, mem_id: UUID) -> None:
-    store._rows = [
-        r.model_copy(update={"origin": "user_stated", "embedding_model": "old/model"})
-        if r.id == mem_id
-        else r
-        for r in store._rows
-    ]
+async def _mark_user_stated(
+    store: InMemoryMemoryStore,
+    mem_id: UUID,
+    *,
+    origin: str = "user_stated",
+    confidence: float | None = None,
+) -> None:
+    update: dict[str, object] = {"origin": origin, "embedding_model": "old/model"}
+    if confidence is not None:
+        update["confidence"] = confidence
+    store._rows = [r.model_copy(update=update) if r.id == mem_id else r for r in store._rows]
+
+
+async def _the_row(store: InMemoryMemoryStore, user_id: UUID, mem_id: UUID) -> MemoryItem:
+    [row] = [r for r in await store.list_for_user(tenant_id=_TENANT, user_id=user_id)
+             if r.id == mem_id]  # fmt: skip
+    return row
 
 
 @pytest.mark.asyncio
-async def test_admin_patch_clears_the_source_and_records_the_model(
+async def test_owner_edit_of_own_memory_is_stated_by_the_user(
     setup: tuple[AsyncClient, InMemoryMemoryStore, UUID, UUID, InMemoryAuditLogStore],
 ) -> None:
+    """User decision 11-13 ("按编辑人区分"): the owner wrote this text, so the
+    row is "stated in user messages"; confidence stays (a 1.0 stays a correction)."""
     client, store, user_id, mem_id, _ = setup
-    await _mark_user_stated(store, mem_id)
+    await _mark_user_stated(store, mem_id, origin="assistant_derived", confidence=1.0)
     client._transport.app.state.embedder = _ReportingEmbedder()  # type: ignore[attr-defined]
-    resp = await client.patch(f"/v1/memory/{mem_id}", json={"content": "Rewritten by admin"})
+    resp = await client.patch(f"/v1/memory/{mem_id}", json={"content": "Rewritten by me"})
     assert resp.status_code == 200, resp.text
-    assert resp.json()["data"]["origin"] is None
-    [row] = [r for r in await store.list_for_user(tenant_id=_TENANT, user_id=user_id)
-             if r.id == mem_id]  # fmt: skip
+    assert resp.json()["data"]["origin"] == "user_stated"
+    row = await _the_row(store, user_id, mem_id)
+    assert (row.origin, row.confidence, row.embedding_model) == ("user_stated", 1.0, _EMBED_MODEL)
+    assert effective_origin(row) == "user_corrected"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("confidence", [1.0, 0.7])
+async def test_edit_of_someone_elses_memory_leaves_it_unrecorded(
+    setup: tuple[AsyncClient, InMemoryMemoryStore, UUID, UUID, InMemoryAuditLogStore],
+    confidence: float,
+) -> None:
+    """Another member (an admin) edits alice's memory: source NULL and confidence
+    at most 0.99, so even a former correction shows "source not recorded" and is
+    no longer protected by the blocking rule."""
+    client, store, user_id, mem_id, _ = setup
+    await _mark_user_stated(store, mem_id, confidence=confidence)
+    client._transport.app.state.embedder = _ReportingEmbedder()  # type: ignore[attr-defined]
+    resp = await client.patch(
+        f"/v1/memory/{mem_id}?user_id={user_id}",
+        json={"content": "Rewritten by an admin"},
+        headers=_headers("admin-b"),
+    )
+    assert resp.status_code == 200, resp.text
+    row = await _the_row(store, user_id, mem_id)
     assert (row.origin, row.embedding_model) == (None, _EMBED_MODEL)
+    assert row.confidence == min(confidence, 0.99)
+    assert effective_origin(row) == "unrecorded"
 
 
 @pytest.mark.asyncio

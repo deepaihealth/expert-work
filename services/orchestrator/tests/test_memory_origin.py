@@ -12,7 +12,7 @@
 from __future__ import annotations
 
 import json
-from collections.abc import Sequence
+from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass, field
 from typing import Any
 from uuid import UUID, uuid4
@@ -63,6 +63,8 @@ class _LLM:
     conversation_reply: str = _EMPTY
     ops_reply: str = '{"ops": []}'
     calls: list[list[BaseMessage]] = field(default_factory=list)
+    #: 在去重合并的模型「判的那几秒」里做的事(模拟用户这时点了更正)。
+    while_deciding: Callable[[], Awaitable[object]] | None = None
 
     def reconcile_calls(self) -> list[list[BaseMessage]]:
         return [
@@ -79,6 +81,8 @@ class _LLM:
             return AIMessage(content=self.user_reply)
         if PASS2_MARK in system:
             return AIMessage(content=self.conversation_reply)
+        if self.while_deciding is not None:
+            _ = await self.while_deciding()
         return AIMessage(content=self.ops_reply)
 
 
@@ -364,3 +368,189 @@ async def test_reconcile_material_carries_both_sides_sources_and_the_rule() -> N
         "derived before": "from the assistant",
         "corrected before": "corrected by the user",
     }
+
+
+# ---------------------------------------------------------------------------
+# 审查 MEDIUM-1:读邻居之后、改库之前,目标被用户更正
+# ---------------------------------------------------------------------------
+
+
+def _correct_while_deciding(
+    store: InMemoryMemoryStore, target: MemoryItem
+) -> Callable[[], Awaitable[object]]:
+    async def correct() -> object:
+        return await store.update_content(
+            tenant_id=_TENANT,
+            user_id=_USER,
+            memory_id=target.id,
+            content="corrected by the user",
+            embedding=_EAST,
+            confidence=1.0,
+        )
+
+    return correct
+
+
+@pytest.mark.parametrize(
+    ("op", "is_correction", "expected_live", "label"),
+    [
+        ("UPDATE", False, {"corrected by the user"}, "blocked_update_dropped"),
+        ("UPDATE", True, {"corrected by the user", "cand"}, "blocked_update_added"),
+        ("DELETE", True, {"corrected by the user"}, "blocked_delete"),
+    ],
+    ids=["update-dropped", "update-added", "delete-noop"],
+)
+async def test_target_corrected_while_the_model_decides_is_still_protected(
+    op: str, is_correction: bool, expected_live: set[str], label: str
+) -> None:
+    store = InMemoryMemoryStore()
+    target = await _seed(store, "derived", origin="assistant_derived", confidence=0.5)
+    llm = _LLM(
+        conversation_reply=_assistant_candidate(is_correction=is_correction),
+        ops_reply=_ops(op, target.id),
+        while_deciding=_correct_while_deciding(store, target),
+    )
+    before = _reconcile_count(label)
+    await _flush(llm, store, _ReportingEmbedder({"cand": _NEAR_EAST}), reconcile=True)
+    rows = await _live(store)
+    assert set(rows) == expected_live
+    assert rows["corrected by the user"].supersedes is None
+    assert _reconcile_count(label) == before + 1
+
+
+# ---------------------------------------------------------------------------
+# 审查 MEDIUM-3:成员里有用户一方的汇总行同样受保护
+# ---------------------------------------------------------------------------
+
+
+class _CountingStore(InMemoryMemoryStore):
+    def __init__(self) -> None:
+        super().__init__()
+        self.writes_to_targets = 0
+
+    async def supersede(self, **kwargs: Any) -> MemoryItem | None:
+        self.writes_to_targets += 1
+        return await super().supersede(**kwargs)
+
+    async def expire(self, **kwargs: Any) -> bool:
+        self.writes_to_targets += 1
+        return await super().expire(**kwargs)
+
+
+async def _seed_summary(
+    store: InMemoryMemoryStore, member_origins: Sequence[MemoryOrigin | None]
+) -> MemoryItem:
+    members = [
+        MemoryItem(
+            id=uuid4(),
+            tenant_id=_TENANT,
+            user_id=_USER,
+            kind="fact",
+            content=f"member {i}",
+            embedding=_NORTH,
+            origin=origin,
+        )
+        for i, origin in enumerate(member_origins)
+    ]
+    await store.write(members)
+    stored = {r.id: r for r in store._rows}
+    return await store.write_consolidated(
+        tenant_id=_TENANT,
+        user_id=_USER,
+        content="summary",
+        embedding=_EAST,
+        source_ids=[m.id for m in members],
+        source_hashes={m.id: str(stored[m.id].content_hash) for m in members},
+    )
+
+
+@pytest.mark.parametrize("op", ["UPDATE", "DELETE"])
+async def test_summary_of_user_side_members_is_protected(op: str) -> None:
+    store = _CountingStore()
+    summary = await _seed_summary(store, ["user_stated", None, None])
+    assert summary.origin is None
+    llm = _LLM(conversation_reply=_assistant_candidate(), ops_reply=_ops(op, summary.id))
+    written, _ = await _flush(llm, store, _ReportingEmbedder({"cand": _NEAR_EAST}), reconcile=True)
+    assert written == 0
+    assert set(await _live(store)) == {"summary"}
+    # 预判就拦下了,没有走到改库那一步(锁里的那道是兜底)。
+    assert store.writes_to_targets == 0
+
+
+async def test_summary_of_unrecorded_members_is_not_protected() -> None:
+    store = InMemoryMemoryStore()
+    summary = await _seed_summary(store, [None, None, None])
+    llm = _LLM(conversation_reply=_assistant_candidate(), ops_reply=_ops("UPDATE", summary.id))
+    await _flush(llm, store, _ReportingEmbedder({"cand": _NEAR_EAST}), reconcile=True)
+    assert set(await _live(store)) == {"cand"}
+
+
+# ---------------------------------------------------------------------------
+# 审查 LOW-1:写入失败时进失败队列的,只是本来要写的那几条
+# ---------------------------------------------------------------------------
+
+
+class _FailingWriteStore(InMemoryMemoryStore):
+    async def write(self, items: Sequence[MemoryItem]) -> Any:
+        del items
+        raise RuntimeError("database down")
+
+
+@dataclass
+class _RecordingDLQ:
+    enqueued: list[list[tuple[str, str]]] = field(default_factory=list)
+
+    async def enqueue(self, *, extracted: Sequence[tuple[str, str]], **_: Any) -> None:
+        self.enqueued.append(list(extracted))
+
+
+async def test_dlq_gets_only_what_reconcile_meant_to_write() -> None:
+    store = _FailingWriteStore()
+    user_target = await _seed_in(store, "user said", origin="user_stated")
+    derived_target = await _seed_in(store, "derived", origin="assistant_derived")
+    llm = _LLM(
+        conversation_reply=_reply(
+            {"kind": "fact", "content": "keep"},
+            {"kind": "fact", "content": "drop"},
+            {"kind": "fact", "content": "retract"},
+        ),
+        ops_reply=json.dumps(
+            {
+                "ops": [
+                    {"index": 0, "op": "UPDATE", "target_id": str(user_target.id)},
+                    {"index": 1, "op": "DELETE", "target_id": str(derived_target.id)},
+                ]
+            }
+        ),
+    )
+    dlq = _RecordingDLQ()
+    outcome = await flush_messages_with_outcome(
+        _turn(),
+        memory_store=store,
+        embedder=_ReportingEmbedder({"drop": _NEAR_EAST, "retract": _NEAR_EAST}),
+        llm_caller=llm,
+        tenant_id=_TENANT,
+        user_id=_USER,
+        thread_id=uuid4(),
+        token=CancellationToken(),
+        reconcile=True,
+        dlq=dlq,  # type: ignore[arg-type]
+    )
+    assert outcome.failed
+    # 被拦下丢弃的更新、删除事件都不该在重试时被重建成新记忆。
+    assert dlq.enqueued == [[("fact", "keep")]]
+
+
+async def _seed_in(store: InMemoryMemoryStore, content: str, *, origin: MemoryOrigin) -> MemoryItem:
+    """绕过 ``write``(这个存储的写入会失败)直接放一行。"""
+    item = MemoryItem(
+        id=uuid4(),
+        tenant_id=_TENANT,
+        user_id=_USER,
+        kind="fact",
+        content=content,
+        embedding=_EAST,
+        origin=origin,
+    )
+    store._rows.append(item)
+    return item
