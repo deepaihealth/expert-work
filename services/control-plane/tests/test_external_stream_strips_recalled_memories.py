@@ -72,6 +72,8 @@ _MEMORY_USER = UUID("00000000-0000-4000-8000-00000000c33e")
 _SOURCE_THREAD = "source-thread-7d2f"
 _SOURCE_RUN = "source-run-8e3a"
 _CONTENT_HASH = "content-hash-9f4b"
+#: B-300 PR 2 —— 记忆对象上新加的两个内部字段(设计 §6.3):来源与向量模型名。
+_EMBEDDING_MODEL = "embed-vendor-0a6c/model-1d7e"
 
 #: 对外 wire 上一个都不能出现的东西 —— 正文、各种 id、内部字段名。
 _FORBIDDEN = (
@@ -83,6 +85,10 @@ _FORBIDDEN = (
     _SOURCE_RUN,
     _CONTENT_HASH,
     "recalled_memories",
+    "assistant_derived",
+    '"origin"',
+    _EMBEDDING_MODEL,
+    '"embedding_model"',
 )
 
 _SPEC: dict[str, Any] = {
@@ -113,6 +119,8 @@ def _memory() -> MemoryItem:
         source_thread_id=_SOURCE_THREAD,
         source_run_id=_SOURCE_RUN,
         content_hash=_CONTENT_HASH,
+        origin="assistant_derived",
+        embedding_model=_EMBEDDING_MODEL,
     )
 
 
@@ -329,6 +337,9 @@ async def test_console_data_keeps_full_recalled_memories(ctx: _Ctx) -> None:
     assert len(stored) == 1
     assert stored[0]["recalled_memories"][0]["content"] == _SECRET_CONTENT
     assert stored[0]["recalled_memories"][0]["id"] == str(_MEMORY_ID)
+    # B-300 PR 2 —— 落库行里两个内部字段都在(证明对外那边是被裁掉、不是本来就没有)。
+    assert stored[0]["recalled_memories"][0]["origin"] == "assistant_derived"
+    assert stored[0]["recalled_memories"][0]["embedding_model"] == _EMBEDDING_MODEL
 
     plan = await build_event_producer(
         run_id=run_id,

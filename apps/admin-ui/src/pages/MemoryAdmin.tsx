@@ -47,6 +47,7 @@ import {
 import { ApiError } from "../api/client";
 import { useAuth } from "../auth/AuthContext";
 import { useTenantScope } from "../tenant/TenantScopeContext";
+import { MemoryOriginTag } from "../components/MemoryOriginTag";
 import { PageHeader } from "../components/PageHeader";
 
 const { Text } = Typography;
@@ -222,6 +223,13 @@ export function MemoryAdmin() {
       key: "kind",
       width: 110,
       render: (k: MemoryKind) => <Tag color={KIND_COLOR[k]}>{k}</Tag>,
+    },
+    {
+      // B-300 PR 2 — the same source label the agent sees at recall.
+      title: t("memory.col_origin"),
+      key: "origin",
+      width: 150,
+      render: (_, record) => <MemoryOriginTag item={record} />,
     },
     {
       title: t("memory.col_content"),

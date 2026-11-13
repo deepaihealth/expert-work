@@ -103,6 +103,25 @@ async def test_pin_fixes_one_model_for_the_whole_unit_of_work(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_memory_embed_reports_the_model_each_call_used(monkeypatch):
+    """B-300 PR 2 —— 长期记忆写入要记下这一次实际用的向量模型:每次调用各自解析一次平台
+    配置,报出来的正是发请求的那个(管理员中途换了模型,第二次报的就是新的),请求本身与
+    ``embed`` 一字不差(不带知识库的标记)。"""
+    _declare_caps(monkeypatch, _QUERY_FIELD)
+    cfg = _Cfg()
+    emb, bodies = _recording_embedder(cfg)
+    vectors, model = await emb.embed_reporting_model(["a"], tenant_id=uuid4())
+    assert (vectors, model) == ([(0.5,)], "qwen/text-embedding-v4")
+    cfg.embedding = ("glm", "embedding-3")
+    _, model = await emb.embed_reporting_model(["b"], tenant_id=uuid4())
+    assert model == "glm/embedding-3"
+    assert bodies == [
+        {"model": "text-embedding-v4", "input": ["a"]},
+        {"model": "embedding-3", "input": ["b"]},
+    ]
+
+
+@pytest.mark.asyncio
 async def test_pinned_embedder_carries_the_input_byte_cap(monkeypatch):
     # B-200 — the deployment's cap reaches the embedder that sends the request.
     monkeypatch.setattr("control_plane.runtime.HTTPEmbeddingClient", lambda **kw: object())

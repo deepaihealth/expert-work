@@ -71,6 +71,7 @@ from expert_work.common.user_input import (
 from expert_work.persistence import MemoryStore
 from expert_work.persistence.memory import MemoryWritebackDLQ, MemoryWritebackJobStore
 from expert_work.persistence.memory.base import (
+    USER_SIDE_ORIGINS,
     BlockedMemory,
     MemoryInjectionBlockedError,
     SupersedeTargetChangedError,
@@ -88,10 +89,15 @@ from expert_work.protocol import (
     MemoryItem,
     MemoryRecallMode,
 )
+from expert_work.protocol.memory_item import MemoryOrigin, effective_origin
 from expert_work.runtime.audit.logger import AuditLogger
 from expert_work.runtime.cancellation import CancellationToken, RunCancelledError
 from expert_work.runtime.tokens import CharTokenEstimator, TokenEstimator
-from orchestrator.context.memory_render import recorded_date, select_memory_lines
+from orchestrator.context.memory_render import (
+    origin_label,
+    recorded_date,
+    select_memory_lines,
+)
 from orchestrator.graph_builder._config import (
     audit_logger_from_config,
     cancellation_token,
@@ -105,7 +111,7 @@ from orchestrator.graph_builder.retrieval_query import (
     log_retrieval_query,
     recent_history,
 )
-from orchestrator.llm import Embedder, LLMCaller
+from orchestrator.llm import Embedder, LLMCaller, embed_with_model
 from orchestrator.llm.truncation import is_truncated
 from orchestrator.state import AgentState
 from orchestrator.tools.knowledge import Reranker, rerank_documents
@@ -418,6 +424,9 @@ class ExtractedMemory:
     # P5b-2b ⑧ — LLM flag: this memory explicitly corrects prior info. Transient
     # (never persisted); threaded into reconcile to bias the UPDATE decision.
     is_correction: bool = False
+    # B-300 ② — set by the program from WHICH extraction pass produced it (never
+    # read from the reply): pass 1 → ``user_stated``, pass 2 → ``assistant_derived``.
+    origin: MemoryOrigin | None = None
 
 
 #: Stream RT-2 PR-2 (review HIGH) — ceiling for extraction-scored confidence.
@@ -1102,10 +1111,18 @@ _RECONCILE_SYSTEM = (
     "correcting earlier info — strongly prefer UPDATE (or DELETE) against "
     "the matching existing memory over ADD, so the old value is superseded "
     "rather than left to coexist.\n"
+    # B-300 §6.2 —— 双方都带 "source";用户后来自己说全了,旧的来自助手的版本应被取代。
+    "A candidate stated in user messages that matches an existing memory from the "
+    "assistant is an UPDATE, not a NOOP.\n"
     "Respond with ONLY a JSON object, no prose and no code fences:\n"
     '{"ops": [{"index": <candidate index>, "op": "ADD", '
     '"target_id": "<existing id, only for UPDATE/DELETE>"}]}'
 )
+
+
+def _assistant_overrides_user(candidate: MemoryItem, target: MemoryItem) -> bool:
+    """B-300 §6.2 —— 候选来自助手,目标的有效来源是用户消息里说的或用户更正的。"""
+    return candidate.origin == "assistant_derived" and effective_origin(target) in USER_SIDE_ORIGINS
 
 
 def _reconcile_cosine(a: Sequence[float], b: Sequence[float]) -> float:
@@ -1228,8 +1245,12 @@ async def _reconcile_and_apply(
                 "index": idx,
                 "kind": item.kind,
                 "content": item.content,
+                "source": origin_label(item),
                 "is_correction": is_corr,
-                "existing": [{"id": str(n.id), "content": n.content} for n in similar],
+                "existing": [
+                    {"id": str(n.id), "content": n.content, "source": origin_label(n)}
+                    for n in similar
+                ],
             }
             for idx, (item, similar, is_corr) in enumerate(pending)
         ]
@@ -1254,11 +1275,27 @@ async def _reconcile_and_apply(
 
     position = {item.id: idx for idx, item in enumerate(items)}
     blocked: list[_BlockedWrite] = []
-    for idx, (item, similar, _is_corr) in enumerate(pending):
+    for idx, (item, similar, is_corr) in enumerate(pending):
         op, target_raw = ops.get(idx, ("", None))
-        valid = {str(n.id): n.id for n in similar}
-        target = valid.get(target_raw) if target_raw is not None else None
-        if op == "NOOP":
+        valid = {str(n.id): n for n in similar}
+        target_item = valid.get(target_raw) if target_raw is not None else None
+        target = target_item.id if target_item is not None else None
+        if (
+            op in ("UPDATE", "DELETE")
+            and target_item is not None
+            and _assistant_overrides_user(item, target_item)
+        ):
+            # B-300 §6.2 唯一的拦截规则:来自助手的候选不得更新 / 删除用户说的、用户更正的。
+            # 被拦的删除什么都不做;被拦的更新:是用户的更正(短更新)→ 与旧的并存、按新增
+            # 存下;否则丢弃(多半只是把用户说过的话换个说法又提了一遍)。
+            if op == "UPDATE" and is_corr:
+                record_memory_reconcile(op="blocked_update_added")
+                direct.append(item)
+            else:
+                record_memory_reconcile(
+                    op="blocked_update_dropped" if op == "UPDATE" else "blocked_delete"
+                )
+        elif op == "NOOP":
             record_memory_reconcile(op="noop")
         elif op == "UPDATE" and target is not None:
             try:
@@ -1380,11 +1417,16 @@ async def _extract_pass(
     memories = parsed or []
     if pass_name == _CONVERSATION_EXTRACTION:
         # 来自助手:无论模型给多少,置信度压到 0.6 以内(B-300 ①)。
-        memories = [
-            replace(m, confidence=min(m.confidence, _MAX_ASSISTANT_DERIVED_CONFIDENCE))
+        return [
+            replace(
+                m,
+                confidence=min(m.confidence, _MAX_ASSISTANT_DERIVED_CONFIDENCE),
+                origin="assistant_derived",
+            )
             for m in memories
         ]
-    return memories
+    # B-300 ② —— 第一次提炼只看得到用户输入的文字:产出一律是「用户消息里说的」。
+    return [replace(m, origin="user_stated") for m in memories]
 
 
 def _pass_lines(pass_name: str, pass_input: _PassInput) -> list[str]:
@@ -1604,8 +1646,9 @@ async def flush_messages_with_outcome(
             extracted = kept
         if not extracted:
             return FlushOutcome(written=0, failed=extract_failed)
-        vectors = await token.run_cancellable(
-            embedder.embed([m.content for m in extracted], tenant_id=tenant_id)
+        # B-300 PR 2 —— 记下这一次实际用的向量模型(嵌入器报得出来时)。
+        vectors, embedding_model = await token.run_cancellable(
+            embed_with_model(embedder, [m.content for m in extracted], tenant_id=tenant_id)
         )
         items = [
             MemoryItem(
@@ -1626,6 +1669,9 @@ async def flush_messages_with_outcome(
                 # P5b-2b ⑦ — persist the predicted window so the consolidator
                 # due-scan can find this fact when it comes due.
                 expected_valid_days=mem.expected_valid_days,
+                # B-300 ② —— 来源由提炼次序决定;向量模型名。
+                origin=mem.origin,
+                embedding_model=embedding_model,
             )
             for mem, vector in zip(extracted, vectors, strict=True)
         ]

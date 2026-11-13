@@ -22,6 +22,7 @@ from orchestrator.llm.embedder import EmbeddingUsageSink as EmbeddingUsageSink
 from orchestrator.llm.embedder import FakeEmbedder as FakeEmbedder
 from orchestrator.llm.embedder import HTTPEmbeddingClient as HTTPEmbeddingClient
 from orchestrator.llm.embedder import OpenAICompatibleEmbedder as OpenAICompatibleEmbedder
+from orchestrator.llm.embedder import embed_with_model as embed_with_model
 from orchestrator.llm.embedder import embedding_usage_sink as embedding_usage_sink
 from orchestrator.llm.oauth_provider import (
     OAuthCapableProvider as OAuthCapableProvider,
@@ -194,6 +195,7 @@ __all__ = [
     "RerankClient",
     "RerankGuards",
     "effective_rpm",
+    "embed_with_model",
     "embedding_usage_sink",
     "make_azure_client",
     "make_deepseek_client",

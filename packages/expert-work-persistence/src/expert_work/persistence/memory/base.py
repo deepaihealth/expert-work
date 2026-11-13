@@ -20,6 +20,59 @@ from uuid import UUID
 
 from expert_work.common.threat_patterns import ThreatFinding, scan_for_threats
 from expert_work.protocol import MemoryItem
+from expert_work.protocol.memory_item import MemoryOrigin, effective_origin
+
+#: B-300 —— 汇总行的置信度上限:1.0 只留给用户更正(更正接口独占的哨兵值)。
+SUMMARY_MAX_CONFIDENCE = 0.99
+#: B-300 ② —— 来自助手的记忆置信度上限(与提炼第二次的封顶同一个数)。
+ASSISTANT_DERIVED_MAX_CONFIDENCE = 0.6
+#: 有效来源里算「用户一方」的两种(拦截规则、混合簇判断共用)。
+USER_SIDE_ORIGINS = frozenset({"user_stated", "user_corrected"})
+
+
+def is_mixed_origin(members: Sequence[MemoryItem]) -> bool:
+    """B-300 §6.2 —— 一组记忆里既有「来自助手」,又有用户消息里说的 / 用户更正的。
+
+    来源未记录的不算哪一边。整理时这样的簇不汇总。"""
+    origins = {effective_origin(m) for m in members}
+    return "assistant_derived" in origins and bool(origins & USER_SIDE_ORIGINS)
+
+
+@dataclass(frozen=True)
+class SummaryFields:
+    """B-300 D6 前半 + §6.2 —— 一条汇总行从成员继承的出处、分数与来源。"""
+
+    source_thread_id: str | None
+    source_run_id: str | None
+    importance: float
+    confidence: float
+    origin: MemoryOrigin | None
+
+
+def summary_fields(members: Sequence[MemoryItem]) -> SummaryFields:
+    """汇总行带的出处和分数(两个存储实现在写汇总的事务里、按重读到的成员算):
+
+    * 来源会话 / 来源 run 取成员里最新(``created_at`` 最大)的那一条的;
+    * 重要度取成员最大值;置信度取成员最小值,上限 0.99(1.0 只留给用户更正);
+    * 成员全是「来自助手」→ 来源记「来自助手」、置信度再压到 0.6 以内;否则来源为空
+      (汇总句是模型新写的文字,不给「用户消息里说的」)。
+    """
+
+    def _created(item: MemoryItem) -> float:
+        return item.created_at.timestamp() if item.created_at is not None else float("-inf")
+
+    newest = max(members, key=_created)
+    all_assistant = all(effective_origin(m) == "assistant_derived" for m in members)
+    confidence = min(min(m.confidence for m in members), SUMMARY_MAX_CONFIDENCE)
+    if all_assistant:
+        confidence = min(confidence, ASSISTANT_DERIVED_MAX_CONFIDENCE)
+    return SummaryFields(
+        source_thread_id=newest.source_thread_id,
+        source_run_id=newest.source_run_id,
+        importance=max(m.importance for m in members),
+        confidence=confidence,
+        origin="assistant_derived" if all_assistant else None,
+    )
 
 
 @dataclass(frozen=True)
@@ -225,8 +278,16 @@ class MemoryStore(abc.ABC):
         embedding: Sequence[float],
         kind: Literal["fact", "episodic"] | None = None,
         confidence: float | None = None,
+        embedding_model: str | None = None,
+        clear_origin: bool = False,
     ) -> MemoryItem | None:
         """Stream K.K6 — rewrite a live memory's content / kind.
+
+        B-300 PR 2 — ``embedding_model`` (the model that computed ``embedding``;
+        ``None`` = not known) always replaces the row's value, since the vector
+        is replaced. ``clear_origin`` sets the source column to NULL — an admin
+        edit makes the text nobody's statement; a user correction keeps it (its
+        effective source is the 1.0 confidence).
 
         The caller must re-embed before calling — the store does not
         own an embedder. Soft-deleted rows are not updatable; returns
@@ -433,6 +494,7 @@ class MemoryStore(abc.ABC):
         embedding: Sequence[float],
         source_ids: Sequence[UUID],
         source_hashes: Mapping[UUID, str],
+        embedding_model: str | None = None,
     ) -> MemoryItem:
         """Sprint #7 SUB-PASS 1 commit — write a new consolidated item
         with ``status='consolidated'`` + ``consolidated_from=source_ids``
@@ -451,7 +513,15 @@ class MemoryStore(abc.ABC):
         as it was read when the cluster was picked; a member corrected in place
         meanwhile (still current, new text) counts as changed too — the summary
         was decided on the old text. ``content`` goes through the strict write scan first;
-        blocked → :class:`MemoryInjectionBlockedError`, nothing written (D2)."""
+        blocked → :class:`MemoryInjectionBlockedError`, nothing written (D2).
+
+        B-300 PR 2 — the summary row takes its provenance, scores and source
+        from the re-read members (:func:`summary_fields`) and records
+        ``embedding_model``. Members that turned out mixed-source (assistant and
+        user side, :func:`is_mixed_origin`) raise
+        :class:`ConsolidationSourcesChangedError` — such clusters are never
+        summarized; the consolidator filters them when it picks clusters, this
+        re-check covers a member corrected meanwhile."""
 
     @abc.abstractmethod
     async def list_purge_candidates(

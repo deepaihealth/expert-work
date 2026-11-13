@@ -21,8 +21,10 @@ from expert_work.persistence.memory.base import (
     MemoryStore,
     MemoryWriteResult,
     SupersedeTargetChangedError,
+    is_mixed_origin,
     scan_memory_content,
     split_blocked,
+    summary_fields,
 )
 from expert_work.persistence.memory.hash import hash_content
 from expert_work.protocol import MemoryItem
@@ -322,6 +324,8 @@ class InMemoryMemoryStore(MemoryStore):
         embedding: Sequence[float],
         kind: Literal["fact", "episodic"] | None = None,
         confidence: float | None = None,
+        embedding_model: str | None = None,
+        clear_origin: bool = False,
     ) -> MemoryItem | None:
         for idx, row in enumerate(self._rows):
             if (
@@ -340,6 +344,10 @@ class InMemoryMemoryStore(MemoryStore):
                         # Stream Memory-Enhance (M-4) — user correction asserts
                         # the rewrite as truth (confidence 1.0).
                         "confidence": confidence if confidence is not None else row.confidence,
+                        # B-300 PR 2 — the vector is new, so is its model name;
+                        # an admin rewrite makes the source unrecorded.
+                        "embedding_model": embedding_model,
+                        "origin": None if clear_origin else row.origin,
                     }
                 )
                 self._rows[idx] = updated
@@ -567,6 +575,7 @@ class InMemoryMemoryStore(MemoryStore):
         embedding: Sequence[float],
         source_ids: Sequence[UUID],
         source_hashes: Mapping[UUID, str],
+        embedding_model: str | None = None,
     ) -> MemoryItem:
         now = datetime.now(UTC)
         new_id = uuid4()
@@ -593,6 +602,13 @@ class InMemoryMemoryStore(MemoryStore):
             if (row.content_hash or hash_content(row.content)) != source_hashes.get(sid):
                 msg = f"memory item {sid} changed since it was read; skipping cluster"
                 raise ConsolidationSourcesChangedError(msg)
+        members = [by_id[sid] for sid in source_ids]
+        # B-300 §6.2 — a mixed-source cluster is never summarized.
+        if is_mixed_origin(members):
+            msg = "cluster members mix assistant-derived and user-side sources; skipping cluster"
+            raise ConsolidationSourcesChangedError(msg)
+        # B-300 D6 前半 — provenance and scores from the members.
+        inherited = summary_fields(members)
         new_item = MemoryItem(
             id=new_id,
             tenant_id=tenant_id,
@@ -605,6 +621,12 @@ class InMemoryMemoryStore(MemoryStore):
             last_used_at=now,
             status="consolidated",
             consolidated_from=tuple(source_ids),
+            source_thread_id=inherited.source_thread_id,
+            source_run_id=inherited.source_run_id,
+            importance=inherited.importance,
+            confidence=inherited.confidence,
+            origin=inherited.origin,
+            embedding_model=embedding_model,
         )
         self._rows.append(new_item)
         # Atomically link sources back to the new consolidated parent.

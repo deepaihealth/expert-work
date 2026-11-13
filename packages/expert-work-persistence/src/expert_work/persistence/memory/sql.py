@@ -26,8 +26,10 @@ from expert_work.persistence.memory.base import (
     MemoryStore,
     MemoryWriteResult,
     SupersedeTargetChangedError,
+    is_mixed_origin,
     scan_memory_content,
     split_blocked,
+    summary_fields,
 )
 from expert_work.persistence.memory.hash import hash_content
 from expert_work.persistence.models import (
@@ -102,6 +104,9 @@ def _row_to_item(row: MemoryItemRow) -> MemoryItem:
         supersedes=row.supersedes,
         superseded_by=row.superseded_by,
         expected_valid_days=row.expected_valid_days,
+        # B-300 PR 2 — an unknown stored origin reads as None (model validator).
+        origin=row.origin,  # type: ignore[arg-type]
+        embedding_model=row.embedding_model,
     )
     # Capability Uplift Sprint #2 (Mini-ADR U-4) — drift detection.
     if row.content_hash and hash_content(row.content) != row.content_hash:
@@ -189,6 +194,9 @@ class SqlMemoryStore(MemoryStore):
                 "valid_at": item.valid_at if item.valid_at is not None else func.now(),
                 "supersedes": item.supersedes,
                 "expected_valid_days": item.expected_valid_days,
+                # B-300 PR 2 — source + the model that computed the vector.
+                "origin": item.origin,
+                "embedding_model": item.embedding_model,
             }
             for item in items
         ]
@@ -445,6 +453,8 @@ class SqlMemoryStore(MemoryStore):
         embedding: Sequence[float],
         kind: Literal["fact", "episodic"] | None = None,
         confidence: float | None = None,
+        embedding_model: str | None = None,
+        clear_origin: bool = False,
     ) -> MemoryItem | None:
         async with self._sf() as session:
             row = (
@@ -471,6 +481,11 @@ class SqlMemoryStore(MemoryStore):
             # content as truth, so the caller bumps confidence to 1.0.
             if confidence is not None:
                 row.confidence = confidence
+            # B-300 PR 2 — the vector is new, so is its model name; an admin
+            # rewrite makes the source unrecorded.
+            row.embedding_model = embedding_model
+            if clear_origin:
+                row.origin = None
             await session.commit()
             await session.refresh(row)
             return _row_to_item(row)
@@ -590,6 +605,8 @@ class SqlMemoryStore(MemoryStore):
                 valid_at=now,
                 supersedes=old_id,
                 expected_valid_days=new_item.expected_valid_days,
+                origin=new_item.origin,
+                embedding_model=new_item.embedding_model,
             )
             session.add(new_row)
             await session.commit()
@@ -837,6 +854,7 @@ class SqlMemoryStore(MemoryStore):
         embedding: Sequence[float],
         source_ids: Sequence[UUID],
         source_hashes: Mapping[UUID, str],
+        embedding_model: str | None = None,
     ) -> MemoryItem:
         now = datetime.now(UTC)
         new_id = uuid4()
@@ -858,29 +876,37 @@ class SqlMemoryStore(MemoryStore):
                 MemoryItemRow.user_id == user_id,
             ]
             locked = (
-                await session.execute(
-                    select(
-                        MemoryItemRow.id,
-                        MemoryItemRow.consolidated_into,
-                        MemoryItemRow.content_hash,
+                (
+                    await session.execute(
+                        select(MemoryItemRow)
+                        .where(*owned)
+                        .order_by(MemoryItemRow.id)
+                        .with_for_update()
                     )
-                    .where(*owned)
-                    .order_by(MemoryItemRow.id)
-                    .with_for_update()
                 )
-            ).all()
+                .scalars()
+                .all()
+            )
             # Idempotency guard — if any source has consolidated_into set
             # already, abort cleanly so the worker can skip on the next tick.
-            already = next((row for row in locked if row[1] is not None), None)
+            already = next((row for row in locked if row.consolidated_into is not None), None)
             if already is not None:
-                msg = f"memory item {already[0]} already consolidated_into {already[1]}; "
-                raise ConsolidationSourcesChangedError(msg + "skipping cluster")
+                msg = f"memory item {already.id} already consolidated_into "
+                msg += f"{already.consolidated_into}; skipping cluster"
+                raise ConsolidationSourcesChangedError(msg)
             # Review MEDIUM-1 — a member corrected in place since it was read: the
             # summary was decided on the old text.
-            changed = next((row for row in locked if source_hashes.get(row[0]) != row[2]), None)
+            changed = next(
+                (row for row in locked if source_hashes.get(row.id) != row.content_hash), None
+            )
             if changed is not None:
-                msg = f"memory item {changed[0]} changed since it was read; skipping cluster"
+                msg = f"memory item {changed.id} changed since it was read; skipping cluster"
                 raise ConsolidationSourcesChangedError(msg)
+            members = [_row_to_item(row) for row in locked]
+            # B-300 §6.2 — a mixed-source cluster is never summarized.
+            if is_mixed_origin(members):
+                msg = "cluster members mix assistant-derived and user-side sources; "
+                raise ConsolidationSourcesChangedError(msg + "skipping cluster")
             # The same "currently valid" predicate recall uses.
             current = (
                 await session.execute(
@@ -892,6 +918,8 @@ class SqlMemoryStore(MemoryStore):
             if current != len(set(source_ids)):
                 msg = "a cluster member is no longer current; skipping cluster"
                 raise ConsolidationSourcesChangedError(msg)
+            # B-300 D6 前半 — provenance and scores from the re-read members.
+            inherited = summary_fields(members)
             # Insert the consolidated parent.
             new_row = MemoryItemRow(
                 id=new_id,
@@ -906,6 +934,12 @@ class SqlMemoryStore(MemoryStore):
                 content_tsv=func.to_tsvector(_TS_CONFIG, tokenize_for_search(content)),
                 status="consolidated",
                 consolidated_from=[str(sid) for sid in source_ids],
+                source_thread_id=inherited.source_thread_id,
+                source_run_id=inherited.source_run_id,
+                importance=inherited.importance,
+                confidence=inherited.confidence,
+                origin=inherited.origin,
+                embedding_model=embedding_model,
             )
             session.add(new_row)
             # Atomically link sources back to the new parent.

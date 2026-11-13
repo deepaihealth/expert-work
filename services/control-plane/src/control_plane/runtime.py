@@ -1556,6 +1556,17 @@ class DynamicResolvingEmbedder:
         _, delegate = await self._resolve(tenant_id)
         return await delegate.embed(texts, tenant_id=tenant_id)
 
+    async def embed_reporting_model(
+        self, texts: Sequence[str], *, tenant_id: UUID
+    ) -> tuple[list[tuple[float, ...]], str]:
+        """B-300 PR 2 —— :meth:`embed` (the same unmarked request), plus the
+        ``provider/model`` this call resolved and used: long-term memory stores
+        it next to each vector."""
+        model_key, delegate = await self._resolve(tenant_id)
+        if not texts:
+            return [], model_key
+        return await delegate.embed(texts, tenant_id=tenant_id), model_key
+
     async def embed_query(self, query: str, *, tenant_id: UUID) -> tuple[float, ...]:
         """B-206 K-5 —— a knowledge-base search query, with the query-side
         marker the model catalog declares for the live model. Long-term memory

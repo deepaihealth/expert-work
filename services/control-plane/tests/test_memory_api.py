@@ -1067,3 +1067,75 @@ async def test_list_in_a_non_home_tenant_has_no_caller_user_id(
     assert resp.json()["data"]["cross_tenant"] is False
     assert resp.json()["data"]["items"]
     assert resp.json()["data"]["caller_user_id"] is None
+
+
+# ---------------------------------------------------------------------------
+# B-300 PR 2 — source column and embedding model name on the console paths
+# ---------------------------------------------------------------------------
+
+_EMBED_MODEL = "vendor-z/embed-9"
+
+
+class _ReportingEmbedder(_StubEmbedder):
+    """``DynamicResolvingEmbedder`` shape: names the model each call used."""
+
+    async def embed_reporting_model(
+        self, texts: Sequence[str], *, tenant_id: UUID
+    ) -> tuple[list[tuple[float, ...]], str]:
+        return await self.embed(texts, tenant_id=tenant_id), _EMBED_MODEL
+
+
+async def _mark_user_stated(store: InMemoryMemoryStore, mem_id: UUID) -> None:
+    store._rows = [
+        r.model_copy(update={"origin": "user_stated", "embedding_model": "old/model"})
+        if r.id == mem_id
+        else r
+        for r in store._rows
+    ]
+
+
+@pytest.mark.asyncio
+async def test_admin_patch_clears_the_source_and_records_the_model(
+    setup: tuple[AsyncClient, InMemoryMemoryStore, UUID, UUID, InMemoryAuditLogStore],
+) -> None:
+    client, store, user_id, mem_id, _ = setup
+    await _mark_user_stated(store, mem_id)
+    client._transport.app.state.embedder = _ReportingEmbedder()  # type: ignore[attr-defined]
+    resp = await client.patch(f"/v1/memory/{mem_id}", json={"content": "Rewritten by admin"})
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["data"]["origin"] is None
+    [row] = [r for r in await store.list_for_user(tenant_id=_TENANT, user_id=user_id)
+             if r.id == mem_id]  # fmt: skip
+    assert (row.origin, row.embedding_model) == (None, _EMBED_MODEL)
+
+
+@pytest.mark.asyncio
+async def test_user_correction_keeps_the_source_and_records_the_model(
+    setup: tuple[AsyncClient, InMemoryMemoryStore, UUID, UUID, InMemoryAuditLogStore],
+) -> None:
+    """The correction is shown as "corrected by the user" through confidence 1.0;
+    the source column is left as it was."""
+    client, store, user_id, mem_id, _ = setup
+    await _mark_user_stated(store, mem_id)
+    client._transport.app.state.embedder = _ReportingEmbedder()  # type: ignore[attr-defined]
+    resp = await client.post(
+        f"/v1/memory/{mem_id}/correct", json={"action": "rewrite", "content": "Now tea"}
+    )
+    assert resp.status_code == 200, resp.text
+    [row] = [r for r in await store.list_for_user(tenant_id=_TENANT, user_id=user_id)
+             if r.id == mem_id]  # fmt: skip
+    assert (row.origin, row.confidence, row.embedding_model) == ("user_stated", 1.0, _EMBED_MODEL)
+
+
+@pytest.mark.asyncio
+async def test_list_shows_the_source_but_not_the_embedding_model(
+    setup: tuple[AsyncClient, InMemoryMemoryStore, UUID, UUID, InMemoryAuditLogStore],
+) -> None:
+    client, store, _, mem_id, _ = setup
+    await _mark_user_stated(store, mem_id)
+    resp = await client.get("/v1/memory")
+    assert resp.status_code == 200, resp.text
+    [row] = [i for i in resp.json()["data"]["items"] if i["id"] == str(mem_id)]
+    assert row["origin"] == "user_stated"
+    assert "embedding_model" not in row
+    assert "old/model" not in resp.text

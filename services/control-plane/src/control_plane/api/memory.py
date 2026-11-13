@@ -58,6 +58,7 @@ from expert_work.persistence.tenant_user import TenantUserStore
 from expert_work.protocol import AuditAction, MemoryItem, Principal
 from expert_work.runtime.audit.logger import AuditLogger
 from orchestrator import AgentFactoryError
+from orchestrator.llm import embed_with_model
 
 logger = logging.getLogger("expert_work.control_plane.api.memory")
 
@@ -98,9 +99,11 @@ def _get_audit(request: Request) -> AuditLogger:
 
 
 def _serialise(item: MemoryItem) -> dict[str, Any]:
-    """Project a ``MemoryItem`` for the wire — drop the embedding vector."""
+    """Project a ``MemoryItem`` for the wire — drop the embedding vector and,
+    with it, the name of the model that computed it (B-300: internal only)."""
     data = item.model_dump(mode="json")
     data.pop("embedding", None)
+    data.pop("embedding_model", None)
     return data
 
 
@@ -395,7 +398,9 @@ def build_memory_router() -> APIRouter:
             # Catch the unconfigured failure and surface the same typed 503 as before.
             embedder = request.app.state.embedder
             try:
-                vectors = await embedder.embed([payload.content], tenant_id=target_tenant_id)
+                vectors, embedding_model = await embed_with_model(
+                    embedder, [payload.content], tenant_id=target_tenant_id
+                )
             except AgentFactoryError as exc:
                 raise HTTPException(
                     status_code=503,
@@ -416,6 +421,9 @@ def build_memory_router() -> APIRouter:
                 content=payload.content,
                 embedding=vectors[0],
                 kind=payload.kind,
+                embedding_model=embedding_model,
+                # B-300 §6.2 —— 管理员改写过的内容不是谁「说的」了:来源置空。
+                clear_origin=True,
             )
             # Still possible: forgotten between the lookup and the write.
             if updated is None:
@@ -533,7 +541,9 @@ def build_memory_router() -> APIRouter:
         )
         embedder = request.app.state.embedder
         try:
-            vectors = await embedder.embed([content], tenant_id=tenant_id)
+            vectors, embedding_model = await embed_with_model(
+                embedder, [content], tenant_id=tenant_id
+            )
         except AgentFactoryError as exc:
             raise HTTPException(
                 status_code=503,
@@ -559,6 +569,8 @@ def build_memory_router() -> APIRouter:
             content=content,
             embedding=vectors[0],
             confidence=1.0,
+            # B-300 —— 来源列不动:有效来源由置信度 1.0 表达(「用户更正」)。
+            embedding_model=embedding_model,
         )
         if updated is None:
             raise HTTPException(status_code=404, detail="memory not found")

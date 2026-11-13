@@ -37,7 +37,6 @@ from orchestrator import GraphRunner, ToolRegistry, build_react_graph
 from orchestrator.context.memory_render import (
     MEMORY_BLOCK_HEADING,
     MEMORY_LINE_LEGEND,
-    MEMORY_REMINDER,
     MEMORY_TRUNCATION_MARKER,
 )
 from orchestrator.graph_builder.builder import (
@@ -46,6 +45,17 @@ from orchestrator.graph_builder.builder import (
 )
 from orchestrator.graph_builder.memory import parse_extracted_memories
 from orchestrator.tools.registry import ToolSpec
+
+#: The reminder section starts here; its lines follow the block's source marks
+#: (pinned in ``test_memory_render.py``).
+_REMINDER_HEADING = "## Before relying on a memory\n"
+
+#: B-300 PR 2 —— every line now names its source. The contents below are
+#: shortened by the prefix growth, so each LINE keeps its old length and every
+#: token budget in this file is unchanged (ordinary rows have no source column
+#: → "source not recorded"; confidence 1.0 → "corrected by the user").
+_ORD = "- (fact · source not recorded) "
+_COR = "- (fact · corrected by the user) "
 
 
 def _memory(content: str, *, confidence: float = 0.5) -> MemoryItem:
@@ -69,10 +79,10 @@ def _strip_frame(text: str) -> str:
     reminder section; these tests look at the heading and the items only (the
     frame itself is pinned in ``test_memory_render.py``)."""
     head = MEMORY_BLOCK_HEADING + "\n" + MEMORY_LINE_LEGEND + "\n"
-    tail = "\n\n" + MEMORY_REMINDER
+    tail = "\n\n" + _REMINDER_HEADING
     assert text.startswith(head)
-    assert text.endswith(tail)
-    return MEMORY_BLOCK_HEADING + "\n" + text[len(head) : -len(tail)]
+    assert tail in text
+    return MEMORY_BLOCK_HEADING + "\n" + text[len(head) : text.index(tail)]
 
 
 def _body(out: list[BaseMessage]) -> str:
@@ -96,7 +106,7 @@ def test_default_path_five_ordinary_memories_unchanged() -> None:
     block — the budget only bites on oversized items."""
     contents = [f"user prefers option {i} for their workflow" for i in range(5)]
     expected = "## Relevant memories from past sessions\n" + "\n".join(
-        f"- (fact) {content}" for content in contents
+        f"{_ORD}{content}" for content in contents
     )
     out = _inject_memories(_base_messages(), [_memory(c) for c in contents], mode="per_session")
     assert _body(out) == expected
@@ -105,7 +115,7 @@ def test_default_path_five_ordinary_memories_unchanged() -> None:
 def test_default_path_per_turn_unchanged() -> None:
     contents = ["likes tea", "works remotely"]
     expected = "## Relevant memories from past sessions\n" + "\n".join(
-        f"- (fact) {content}" for content in contents
+        f"{_ORD}{content}" for content in contents
     )
     out = _inject_memories(_base_messages(), [_memory(c) for c in contents], mode="per_turn")
     assert _strip_frame(str(out[-1].content)) == expected
@@ -115,7 +125,7 @@ def test_default_path_spotlight_unchanged() -> None:
     """The budget selects on the RAW item lines; spotlighting (PI-1b)
     still wraps the selected block exactly as before."""
     contents = ["likes tea", "works remotely"]
-    items = "\n".join(f"- (fact) {content}" for content in contents)
+    items = "\n".join(f"{_ORD}{content}" for content in contents)
     expected = "## Relevant memories from past sessions\n" + spotlight_untrusted(
         items, nonce="abc123def456"
     )
@@ -136,24 +146,24 @@ def test_default_path_spotlight_unchanged() -> None:
 def test_budget_stops_greedy_and_truncates_boundary_item() -> None:
     """Items accumulate in rank order; the first item that does not fit
     is truncated to the remaining budget (visible marker) and later
-    items are dropped. Char heuristic: line = 9-char prefix + content,
+    items are dropped. Char heuristic: line = 31-char prefix + content,
     tokens = chars // 4."""
     mems = [
-        _memory("a" * 91),  # line 100 chars → 25 tokens
-        _memory("b" * 91),  # 25 tokens
-        _memory("c" * 91),  # 25 tokens → only 10 left → truncated
-        _memory("d" * 91),  # dropped
+        _memory("a" * 69),  # line 100 chars → 25 tokens
+        _memory("b" * 69),  # 25 tokens
+        _memory("c" * 69),  # 25 tokens → only 10 left → truncated
+        _memory("d" * 69),  # dropped
     ]
     out = _inject_memories(_base_messages(), mems, mode="per_session", token_budget=60)
     body = _body(out)
     lines = body.splitlines()
     # header + 3 selected lines (the 4th is dropped).
     assert len(lines) == 4
-    assert lines[1] == "- (fact) " + "a" * 91
-    assert lines[2] == "- (fact) " + "b" * 91
+    assert lines[1] == _ORD + "a" * 69
+    assert lines[2] == _ORD + "b" * 69
     assert lines[3].endswith(MEMORY_TRUNCATION_MARKER)
     # The truncated boundary item keeps a head slice of its content.
-    assert lines[3].startswith("- (fact) ccc")
+    assert lines[3].startswith(_ORD + "ccc")
     assert "dddd" not in body
 
 
@@ -166,7 +176,7 @@ def test_single_overlong_memory_is_truncated_not_dropped() -> None:
     assert MEMORY_TRUNCATION_MARKER in body
     # ~2000 tokens ≈ 8000 chars at the chars//4 heuristic (plus marker).
     assert len(body) < 9_000
-    assert body.startswith("## Relevant memories from past sessions\n- (fact) yyy")
+    assert body.startswith("## Relevant memories from past sessions\n" + _ORD + "yyy")
 
 
 def test_injected_estimator_drives_the_budget() -> None:
@@ -178,7 +188,7 @@ def test_injected_estimator_drives_the_budget() -> None:
         def count(self, text: str) -> int:
             return len(text)
 
-    mems = [_memory("z" * 191)]  # line 200 chars → 50 heuristic / 200 injected
+    mems = [_memory("z" * 169)]  # line 200 chars → 50 heuristic / 200 injected
     untouched = _inject_memories(_base_messages(), mems, mode="per_session", token_budget=100)
     truncated = _inject_memories(
         _base_messages(),
@@ -203,10 +213,10 @@ def test_correction_is_not_squeezed_out_by_earlier_ordinary_items() -> None:
     budget first. ``confidence=1.0`` here is the real M-4 shape — the
     correction endpoint is the sentinel's only writer."""
     mems = [
-        _memory("n" * 151),  # line 160 chars → 40 tokens
-        _memory("o" * 151),  # 40 tokens
-        _memory("p" * 151),  # 40 tokens — dropped (budget spent)
-        _memory("q" * 71, confidence=1.0),  # 20 tokens — guaranteed
+        _memory("n" * 129),  # line 160 chars → 40 tokens
+        _memory("o" * 129),  # 40 tokens
+        _memory("p" * 129),  # 40 tokens — dropped (budget spent)
+        _memory("q" * 47, confidence=1.0),  # 20 tokens — guaranteed
     ]
     out = _inject_memories(
         _base_messages(),
@@ -220,9 +230,9 @@ def test_correction_is_not_squeezed_out_by_earlier_ordinary_items() -> None:
     # Selected: n, o (general pass) + q (guarantee) — rendered in the
     # original rank order, so the default path stays byte-stable.
     assert len(lines) == 4
-    assert lines[1] == "- (fact) " + "n" * 151
-    assert lines[2] == "- (fact) " + "o" * 151
-    assert lines[3] == "- (fact) " + "q" * 71
+    assert lines[1] == _ORD + "n" * 129
+    assert lines[2] == _ORD + "o" * 129
+    assert lines[3] == _COR + "q" * 47
     assert "ppp" not in body
 
 
@@ -230,7 +240,7 @@ def test_correction_larger_than_reserve_competes_in_general_pass() -> None:
     """The guarantee slice is a floor, not a cap: a correction that
     overflows the reserve falls through to the general pass and can
     use the full remaining budget untruncated."""
-    mems = [_memory("r" * 3_191, confidence=1.0)]  # line 3200 chars → 800 tokens
+    mems = [_memory("r" * 3_167, confidence=1.0)]  # line 3200 chars → 800 tokens
     out = _inject_memories(
         _base_messages(),
         mems,
@@ -240,7 +250,7 @@ def test_correction_larger_than_reserve_competes_in_general_pass() -> None:
     )
     body = _body(out)
     assert MEMORY_TRUNCATION_MARKER not in body
-    assert "- (fact) " + "r" * 3_191 in body
+    assert _COR + "r" * 3_167 in body
 
 
 def test_oversized_correction_is_skipped_without_blocking_later_corrections() -> None:
@@ -250,10 +260,10 @@ def test_oversized_correction_is_skipped_without_blocking_later_corrections() ->
     Corrections [300, 400, 50] against a 500 reserve: 300 in, 400
     skipped (falls to the general pass), 50 in."""
     mems = [
-        _memory("n" * 2_591),  # 650 tokens — fills the general budget
-        _memory("a" * 1_191, confidence=1.0),  # correction, 300 tokens
-        _memory("b" * 1_591, confidence=1.0),  # correction, 400 tokens
-        _memory("c" * 191, confidence=1.0),  # correction, 50 tokens
+        _memory("n" * 2_569),  # 650 tokens — fills the general budget
+        _memory("a" * 1_167, confidence=1.0),  # correction, 300 tokens
+        _memory("b" * 1_567, confidence=1.0),  # correction, 400 tokens
+        _memory("c" * 167, confidence=1.0),  # correction, 50 tokens
     ]
     out = _inject_memories(
         _base_messages(),
@@ -268,9 +278,9 @@ def test_oversized_correction_is_skipped_without_blocking_later_corrections() ->
     # falls through); general: the 650 ordinary item exactly fills the rest,
     # so the skipped 400 correction is dropped. Rank order preserved.
     assert len(lines) == 4
-    assert lines[1] == "- (fact) " + "n" * 2_591
-    assert lines[2] == "- (fact) " + "a" * 1_191
-    assert lines[3] == "- (fact) " + "c" * 191
+    assert lines[1] == _ORD + "n" * 2_569
+    assert lines[2] == _COR + "a" * 1_167
+    assert lines[3] == _COR + "c" * 167
     assert "bbb" not in body
     assert MEMORY_TRUNCATION_MARKER not in body
 
@@ -284,7 +294,7 @@ def test_extraction_scored_confidence_cannot_eat_the_correction_reserve() -> Non
     caps at 0.99, so the sentinel stays M-4-exclusive."""
     extracted = parse_extracted_memories(
         '{"memories": [{"kind": "fact", "content": "'
-        + "e" * 71
+        + "e" * 49
         + '", "importance": 0.9, "confidence": 1.0}]}'
     )
     assert len(extracted) == 1
@@ -294,8 +304,8 @@ def test_extraction_scored_confidence_cannot_eat_the_correction_reserve() -> Non
         # The extracted item, exactly as the writeback would persist it
         # (kind / content / confidence carried over).
         _memory(extracted[0].content, confidence=clamped),  # 20 tokens
-        _memory("n" * 151),  # ordinary, 40 tokens
-        _memory("q" * 71, confidence=1.0),  # the REAL correction, ranked last
+        _memory("n" * 129),  # ordinary, 40 tokens
+        _memory("q" * 47, confidence=1.0),  # the REAL correction, ranked last
     ]
     out = _inject_memories(
         _base_messages(),
@@ -308,15 +318,15 @@ def test_extraction_scored_confidence_cannot_eat_the_correction_reserve() -> Non
     # The real correction wins the reserve despite being ranked last; had
     # the extracted item reached 1.0 it would have claimed the reserve
     # first (earlier rank) and the correction would have been dropped.
-    assert "- (fact) " + "q" * 71 in body
-    assert "- (fact) " + "e" * 71 in body
+    assert _COR + "q" * 47 in body
+    assert _ORD + "e" * 49 in body
 
 
 def test_zero_correction_budget_disables_the_guarantee() -> None:
     mems = [
-        _memory("s" * 91),  # 25 tokens
-        _memory("t" * 91),  # 25 tokens
-        _memory("u" * 71, confidence=1.0),  # correction, but no reserve
+        _memory("s" * 69),  # 25 tokens
+        _memory("t" * 69),  # 25 tokens
+        _memory("u" * 47, confidence=1.0),  # correction, but no reserve
     ]
     out = _inject_memories(
         _base_messages(),

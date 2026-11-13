@@ -25,9 +25,44 @@ from orchestrator.llm.embedder import (
     EmbeddingMarker,
     EmbeddingSide,
     catalog_batch_size,
+    embed_with_model,
     embedding_marker,
     marked_model_key,
 )
+
+# ---------------------------------------------------------------------------
+# B-300 PR 2 —— embed_with_model:能报出模型的嵌入器报,报不出的记空
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class _Reporting:
+    calls: list[str] = field(default_factory=list)
+
+    async def embed(self, texts: Sequence[str], *, tenant_id: Any) -> list[tuple[float, ...]]:
+        self.calls.append("embed")
+        return [(0.0,) for _ in texts]
+
+    async def embed_reporting_model(
+        self, texts: Sequence[str], *, tenant_id: Any
+    ) -> tuple[list[tuple[float, ...]], str]:
+        self.calls.append("reporting")
+        return [(1.0,) for _ in texts], "vendor/model-x"
+
+
+@pytest.mark.asyncio
+async def test_embed_with_model_uses_the_reporting_call_when_there_is_one() -> None:
+    reporting = _Reporting()
+    vectors, model = await embed_with_model(reporting, ["a", "b"], tenant_id=uuid4())
+    assert (vectors, model, reporting.calls) == ([(1.0,), (1.0,)], "vendor/model-x", ["reporting"])
+
+
+@pytest.mark.asyncio
+async def test_embed_with_model_falls_back_to_none_for_a_plain_embedder() -> None:
+    vectors, model = await embed_with_model(FakeEmbedder(dim=4), ["a"], tenant_id=uuid4())
+    assert len(vectors) == 1
+    assert model is None
+
 
 # ---------------------------------------------------------------------------
 # FakeEmbedder

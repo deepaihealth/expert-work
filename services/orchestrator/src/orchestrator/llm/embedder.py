@@ -101,6 +101,31 @@ class Embedder(Protocol):
 
 
 @runtime_checkable
+class ModelReportingEmbedder(Protocol):
+    """B-300 PR 2 — an :class:`Embedder` that can say which model a call used.
+
+    Long-term memory stores the model next to each vector (``provider/model``)
+    so a later model switch can tell old vectors from new ones. The model is
+    resolved per call, so the name is the one that produced these vectors."""
+
+    async def embed_reporting_model(
+        self, texts: Sequence[str], *, tenant_id: UUID
+    ) -> tuple[list[tuple[float, ...]], str]:
+        """Like :meth:`Embedder.embed`, plus the ``provider/model`` it used."""
+
+
+async def embed_with_model(
+    embedder: Embedder, texts: Sequence[str], *, tenant_id: UUID
+) -> tuple[list[tuple[float, ...]], str | None]:
+    """Embed ``texts`` and name the model when ``embedder`` can (B-300 PR 2);
+    an embedder that cannot (test doubles, wrappers) yields ``None``."""
+    if isinstance(embedder, ModelReportingEmbedder):
+        vectors, model = await embedder.embed_reporting_model(texts, tenant_id=tenant_id)
+        return vectors, model
+    return await embedder.embed(texts, tenant_id=tenant_id), None
+
+
+@runtime_checkable
 class EmbeddingClient(Protocol):
     """The embeddings HTTP surface — sized to the one endpoint we use so
     tests can fake it without mocking httpx."""
