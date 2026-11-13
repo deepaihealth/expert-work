@@ -29,6 +29,7 @@ from control_plane.api._external import (
 )
 from control_plane.api._run_event_stream import (
     EXTERNAL_HIDDEN_EVENTS,
+    EXTERNAL_STRIPPED_STATE_KEYS,
     build_event_producer,
     make_run_probe,
 )
@@ -136,6 +137,8 @@ async def build_events_response(
         # PR-A.3 Task 8 — 对外平面零新暴露:system_prompt 对第三方 API key
         # 的回放 / live 接合都不可见。
         hide_events=EXTERNAL_HIDDEN_EVENTS,
+        # 召回的长期记忆等内部数据:帧照发、值里删键(落库行不动,控制台照看全量)。
+        strip_state_keys=EXTERNAL_STRIPPED_STATE_KEYS,
         stream_format=stream_format,
     )
     headers = {

@@ -40,7 +40,10 @@ from control_plane.api._idempotency import (
     request_digest,
 )
 from control_plane.api._quota_admission import check_admission
-from control_plane.api._run_event_stream import EXTERNAL_HIDDEN_EVENTS
+from control_plane.api._run_event_stream import (
+    EXTERNAL_HIDDEN_EVENTS,
+    EXTERNAL_STRIPPED_STATE_KEYS,
+)
 from control_plane.api._run_progress import run_info_fields
 from control_plane.api._run_usage import make_usage_loader
 from control_plane.api._user_scope import get_user_repo
@@ -349,6 +352,7 @@ async def _supersede_and_run(
             request_digest=digest,
             envelope=True,
             hide_events=EXTERNAL_HIDDEN_EVENTS,
+            strip_state_keys=EXTERNAL_STRIPPED_STATE_KEYS,
             stream_format=stream_format,
             on_disconnect=DisconnectMode.CONTINUE,
             supersede=SupersedeRequest(target_run_id=target.run_id, replay=(op == "regenerate")),

@@ -47,7 +47,11 @@ from control_plane.api._idempotency import (
 )
 from control_plane.api._new_session_undo import NewSessionUndo, discard_new_session
 from control_plane.api._quota_admission import check_admission
-from control_plane.api._run_event_stream import EXTERNAL_HIDDEN_EVENTS, make_run_probe
+from control_plane.api._run_event_stream import (
+    EXTERNAL_HIDDEN_EVENTS,
+    EXTERNAL_STRIPPED_STATE_KEYS,
+    make_run_probe,
+)
 from control_plane.api._run_usage import make_usage_loader
 from control_plane.api._session_title import title_from_text
 from control_plane.api._user_scope import get_user_repo
@@ -1928,6 +1932,7 @@ def build_agents_router() -> APIRouter:
                 # PR-A.3 Task 8 — 对外平面零新暴露:system_prompt(服务端合成的
                 # 系统提示词全文)是控制台调试专用帧,第三方 API key 不可见。
                 hide_events=EXTERNAL_HIDDEN_EVENTS,
+                strip_state_keys=EXTERNAL_STRIPPED_STATE_KEYS,
                 stream_format=payload.stream_format,
                 # 断线在对外场景是意外而不是「我不要了」,取消会把一次网络
                 # 抖动放大成整轮工作作废;控制台那边关页面才是明确意图,所以
