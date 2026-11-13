@@ -20,6 +20,7 @@ from uuid import UUID, uuid4
 import httpx
 import pytest
 
+from expert_work.persistence import InMemoryMemoryStore
 from orchestrator.graph_builder.builder import _build_tool_context
 from orchestrator.tools import (
     BashTool,
@@ -87,13 +88,20 @@ def _plant(root: Path) -> NasWorkspaceStore:
     return NasWorkspaceStore(root=str(root))
 
 
-async def _read(store: NasWorkspaceStore, path: str, ctx: ToolContext) -> str | None:
-    """读到的正文;解析器或存储拒绝 → ``None``。"""
-    try:
-        result = await ReadFileTool(store=store).call({"path": path}, ctx=ctx)
-    except Exception:
-        return None
-    return result.content
+#: 拒绝的说法:``threads/`` 整个不许寻址 / agent 根下的旧投影不给委派子代。
+_THREADS_REFUSED = "'threads' is a reserved layout segment"
+_PROJECTION_REFUSED = "delegated runs cannot access /agent/MEMORY.md"
+
+
+async def _read(store: NasWorkspaceStore, path: str, ctx: ToolContext) -> str:
+    return (await ReadFileTool(store=store).call({"path": path}, ctx=ctx)).content
+
+
+async def _refusal(store: NasWorkspaceStore, path: str, ctx: ToolContext) -> str:
+    """``read_file`` 在解析器那一步拒绝时的说法(读到了任何东西都让断言红)。"""
+    with pytest.raises(ValueError) as caught:
+        await _read(store, path, ctx)
+    return str(caught.value)
 
 
 # ---------------------------------------------------------------------------
@@ -101,22 +109,47 @@ async def _read(store: NasWorkspaceStore, path: str, ctx: ToolContext) -> str | 
 # ---------------------------------------------------------------------------
 
 
+#: ① 不在这里:它对文件工具本来就对所有运行一律拒绝(主智能体也一样),由
+#: :func:`test_the_main_run_reads_what_it_reads_today` 两种身份一起钉,这里列出来证明不了新东西。
 @pytest.mark.parametrize(
-    ("layout", "path"),
+    ("layout", "path", "refusal"),
     [
-        ("conversation", _ONE),
-        ("conversation", _THREE),
-        ("agent_root", _ONE),
-        ("agent_root", _TWO),
-        ("agent_root", _THREE),
-        ("agent_root", _FOUR),
+        ("conversation", _THREE, _PROJECTION_REFUSED),
+        ("agent_root", _TWO, _THREADS_REFUSED),
+        ("agent_root", _THREE, _PROJECTION_REFUSED),
+        ("agent_root", _FOUR, _PROJECTION_REFUSED),
+        ("agent_root", "MEMORY.md", _PROJECTION_REFUSED),
     ],
 )
 async def test_a_delegated_run_cannot_read_the_projection(
-    tmp_path: Path, layout: str, path: str
+    tmp_path: Path, layout: str, path: str, refusal: str
 ) -> None:
     store = _plant(tmp_path)
-    assert await _read(store, path, _child(layout)) is None
+    assert refusal in await _refusal(store, path, _child(layout))
+
+
+@pytest.mark.parametrize("layout", ["conversation", "agent_root"])
+async def test_the_store_scope_of_a_delegated_run_has_no_thread_cell(
+    tmp_path: Path, layout: str
+) -> None:
+    """存储侧第二道:委派子代的作用域里 ``threads/`` 一格都不留、根下的旧投影也不在 ——
+    绕过解析器直接拿子代的作用域去读,同样读不到。"""
+    from orchestrator.tools.file_ops import _store_scope
+    from orchestrator.tools.sandbox import WorkspacePathEscapeError
+    from orchestrator.tools.sandbox_image_contract import AGENT_VIEW
+
+    store = _plant(tmp_path)
+    scope = _store_scope(AGENT_VIEW, _child(layout))
+    for rel in (f"threads/{_C1}/MEMORY.md", "MEMORY.md"):
+        with pytest.raises(WorkspacePathEscapeError):
+            await store.read_file(tenant_id=_TENANT, user_id=_USER, path=rel, scope=scope)
+    parent_scope = _store_scope(AGENT_VIEW, _parent(layout))
+    assert (
+        await store.read_file(
+            tenant_id=_TENANT, user_id=_USER, path="MEMORY.md", scope=parent_scope
+        )
+        == _ROOT_TEXT.encode()
+    )
 
 
 @pytest.mark.parametrize("layout", ["conversation", "agent_root"])
@@ -180,9 +213,9 @@ async def test_the_main_run_reads_what_it_reads_today(tmp_path: Path) -> None:
     assert await _read(store, _TWO, legacy) == _THREAD_TEXT
     assert await _read(store, _THREE, legacy) == _ROOT_TEXT
     assert await _read(store, _FOUR, legacy) == _ROOT_TEXT
-    # ① 对文件工具一律拒绝,主智能体也一样(不变)。
-    assert await _read(store, _ONE, conv) is None
-    assert await _read(store, _ONE, legacy) is None
+    # ① 对文件工具一律拒绝,主智能体与委派子代都一样(不变)。
+    for ctx in (conv, legacy, _child("conversation"), _child("agent_root")):
+        assert _THREADS_REFUSED in await _refusal(store, _ONE, ctx)
 
 
 # ---------------------------------------------------------------------------
@@ -209,6 +242,29 @@ async def test_the_main_runs_search_is_unchanged(tmp_path: Path) -> None:
     legacy = await search.call({"content": _ROOT_TEXT}, ctx=_parent("agent_root"))
     assert conv.meta["paths"] == ["/agent/MEMORY.md"]
     assert legacy.meta["paths"] == ["MEMORY.md"]
+
+
+@pytest.mark.parametrize("layout", ["conversation", "agent_root"])
+async def test_a_delegated_runs_search_cannot_tell_whether_the_projection_matches(
+    tmp_path: Path, layout: str
+) -> None:
+    """命中上限 N、N 个命中里含旧投影:结果(条数、是否截断)要与旧投影不含这个词时一模一样 ——
+    否则被注入的子代能一个字一个字地试出投影的内容。"""
+    store = _plant(tmp_path)
+    agent = _agent_root(tmp_path)
+    for name in ("a.md", "b.md"):
+        (agent / name).write_text("needle")
+    search = SearchFilesTool(store=store, max_results=2)
+    ctx = _child(layout)
+    (agent / "MEMORY.md").write_text("no match here")
+    without = await search.call({"content": "needle"}, ctx=ctx)
+    (agent / "MEMORY.md").write_text("needle")
+    with_match = await search.call({"content": "needle"}, ctx=ctx)
+
+    keys = ("paths", "n_results", "truncated", "too_deep")
+    assert [with_match.meta[k] for k in keys] == [without.meta[k] for k in keys]
+    assert with_match.content == without.content
+    assert "MEMORY.md" not in " ".join(with_match.meta["paths"])
 
 
 async def test_a_delegated_runs_search_finds_its_own_conversation_memory_file(
@@ -326,3 +382,138 @@ async def test_the_supervisor_backend_forwards_the_child_flag(flag: bool) -> Non
     )
     # 只在为真时发:老 supervisor 不认这个字段也不至于 422 掉主智能体的每一次 exec。
     assert sent[-1].get("child_run") is (True if flag else None)
+
+
+# ---------------------------------------------------------------------------
+# ask_image 手写的工作区 ref:与解析器同一个口径
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("layout", "rel", "allowed"),
+    [
+        ("conversation", f"threads/{_C1}/work/.tool_results/r/p.png", True),
+        ("conversation", f"threads/{_C1}/MEMORY.md", False),
+        ("conversation", f"threads/{_C1}/fig.png", False),
+        ("agent_root", f"threads/{_C1}/fig.png", False),
+    ],
+)
+def test_a_delegated_runs_image_ref_only_reaches_the_work_dir(
+    layout: str, rel: str, allowed: bool
+) -> None:
+    """委派子代在 ``threads/`` 底下只有对话视图的 ``threads/<对话>/work`` 可看(执行视图里放回的
+    也只有这一格);主智能体照旧认本对话那一整格。"""
+    from orchestrator.tools import ToolBlockedError
+    from orchestrator.tools.vision import _refuse_other_conversation
+
+    full = f"agents/{_KEY}/{rel}"
+    _refuse_other_conversation(full, _parent(layout))  # 主智能体:本对话那一格照旧
+    if allowed:
+        _refuse_other_conversation(full, _child(layout))
+    else:
+        with pytest.raises(ToolBlockedError):
+            _refuse_other_conversation(full, _child(layout))
+
+
+# ---------------------------------------------------------------------------
+# 子智能体不召回(设计 §13.2「子智能体不召回」,从 PR 1 挪到本条线)
+# ---------------------------------------------------------------------------
+
+
+class _CountingMemoryStore(InMemoryMemoryStore):
+    def __init__(self) -> None:
+        super().__init__()
+        self.retrievals = 0
+
+    async def retrieve(self, **kwargs: Any) -> Any:
+        self.retrievals += 1
+        return await super().retrieve(**kwargs)
+
+
+async def _recall(*, child: bool) -> tuple[dict[str, Any], int]:
+    """照工厂接线建出召回节点(manifest 自己开了 ``memory.long_term``),用父 / 子代的
+    configurable 各跑一次。子代的 configurable 就是 ``_child_config`` 产出的那一份。"""
+    from langchain_core.messages import HumanMessage
+
+    from expert_work.protocol import AgentSpec, MemoryItem
+    from orchestrator import MemoryEnv
+    from orchestrator.agent_factory import _build_memory_nodes
+    from orchestrator.llm import FakeEmbedder
+
+    store = _CountingMemoryStore()
+    embedder = FakeEmbedder(dim=16)
+    content = "the customer prefers morning calls"
+    [vector] = await embedder.embed([content], tenant_id=_TENANT)
+    await store.write(
+        [
+            MemoryItem(
+                id=uuid4(),
+                tenant_id=_TENANT,
+                user_id=_USER,
+                kind="fact",
+                content=content,
+                embedding=vector,
+            )
+        ]
+    )
+    spec = AgentSpec.model_validate(
+        {
+            "apiVersion": "expert_work.io/v1",
+            "kind": "Agent",
+            "metadata": {"name": "helper", "version": "1.0.0", "tenant": "t"},
+            "spec": {
+                "tenant_config": {},
+                "model": {"provider": "deepseek", "name": "x"},
+                "system_prompt": {"template": "hi"},
+                "memory": {"long_term": {}},
+                "sandbox": {
+                    "resources": {"cpu": "1.0", "memory": "1Gi"},
+                    "network": {"egress": "proxy", "allowlist": []},
+                    "filesystem": {"readonly_root": True, "writable": ["/workspace"]},
+                },
+            },
+        }
+    )
+    recall, _, _ = _build_memory_nodes(
+        spec,
+        memory_env=MemoryEnv(store=store, embedder=embedder),
+        llm_caller=None,  # type: ignore[arg-type]  # 读时校验 / 改写都没开,用不到
+    )
+    assert recall is not None
+    parent = _parent("conversation")
+    if child:
+        configurable = _child_config(parent, sub_thread_id=uuid4(), sub_run_id=uuid4())[
+            "configurable"
+        ]
+    else:
+        configurable = {
+            "tenant_id": str(_TENANT),
+            "user_id": str(_USER),
+            "thread_id": str(_C1),
+            "run_id": str(uuid4()),
+        }
+    # 经 LangGraph 跑这个节点(不是直接调函数):节点要拿到 ``config``,得由 LangGraph 按签名注入。
+    from langgraph.graph import END, START, StateGraph
+
+    from orchestrator.state import AgentState
+
+    graph = StateGraph(AgentState)
+    graph.add_node("memory_recall", recall)  # type: ignore[call-overload]
+    graph.add_edge(START, "memory_recall")
+    graph.add_edge("memory_recall", END)
+    state: Any = {"messages": [HumanMessage(content="when should we call the customer?")]}
+    final = await graph.compile().ainvoke(state, config={"configurable": configurable})
+    return final, store.retrievals
+
+
+async def test_a_delegated_run_does_not_recall_long_term_memory() -> None:
+    final, retrievals = await _recall(child=True)
+    assert retrievals == 0
+    assert not final.get("recalled_memories")
+
+
+async def test_the_same_agent_recalls_when_talked_to_directly() -> None:
+    final, retrievals = await _recall(child=False)
+    assert retrievals >= 1
+    recalled = final.get("recalled_memories") or []
+    assert [m.content for m in recalled] == ["the customer prefers morning calls"]

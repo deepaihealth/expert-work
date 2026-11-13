@@ -34,6 +34,9 @@ B-236 起又多两档(对话视图,``exec_view`` 脚本的 ``$2`` 非空时):
 对话视图的 ``/agent``                  ``agent_conv:<key>:<conv>``(B-262)→ 同上,
                                       另外 ``uploads`` / ``inputs`` / ``.tool_results``
                                       也不列出、不许寻址(脚本把它们盖住了)
+委派子代(B-300)的 agent 根            ``agent_child:<key>`` / ``agent_conv_child:<key>``
+                                      → 同上两档,但 ``threads/`` 一格不留,
+                                      根下的 ``MEMORY.md`` 也藏起来
 ===================================  ===========================================
 
 **``agent_key`` 不是 agent 名。** ``sanitize_agent_key()``
@@ -59,6 +62,7 @@ from orchestrator.tools.sandbox import SandboxSupervisorError, WorkspacePathEsca
 from orchestrator.tools.sandbox_image_contract import AGENT_VIEW, EXEC_VIEW
 from orchestrator.tools.workspace_paths import (
     CONVERSATION_WORK_DIR,
+    MEMORY_PROJECTION_FILE,
     PLATFORM_DIRS,
     THREADS_DIR,
     require_safe_key,
@@ -84,6 +88,13 @@ SCOPE_AGENT_SHARED_PREFIX = "agent_shared:"
 #: ``agent_shared`` 同一棵树、同样只留本对话那一格 ``threads/<conv>/``,另外藏起 agent 根的
 #: 平台目录(exec 视图里它们被盖住,那是老视图对话的件)。
 SCOPE_AGENT_CONVERSATION_PREFIX = "agent_conv:"
+#: B-300 —— 委派子代看到的 agent 根:``agent_child:<key>``(老视图的 ``/workspace`` 与 ``/agent``)、
+#: ``agent_conv_child:<key>``(对话视图的 ``/agent``)→ ``agents/<key>/``。``threads/`` 一格都不留
+#: (子代用的是主智能体那一格,主智能体的记忆投影在里面),agent 根下的旧投影 ``MEMORY.md``
+#: 也不列出、不许寻址 —— ``search_files`` 根本不走到它,不占命中名额;对话视图另藏平台目录,
+#: 同 ``agent_conv``。
+SCOPE_AGENT_CHILD_PREFIX = "agent_child:"
+SCOPE_AGENT_CONVERSATION_CHILD_PREFIX = "agent_conv_child:"
 
 #: 沙箱视图里 ``shared/`` 的样子 —— 由 :data:`EXEC_VIEW` 与目录名拼出来, 与
 #: ``workspace_paths.resolve_workspace_path`` 返回的那个字符串必须永远同形。
@@ -128,6 +139,10 @@ def scope_hidden_heads(scope: str) -> frozenset[str]:
         return frozenset({THREADS_DIR})
     if scope.startswith(SCOPE_AGENT_CONVERSATION_PREFIX):
         return frozenset({THREADS_DIR, *PLATFORM_DIRS})
+    if scope.startswith(SCOPE_AGENT_CHILD_PREFIX):
+        return frozenset({THREADS_DIR, MEMORY_PROJECTION_FILE})
+    if scope.startswith(SCOPE_AGENT_CONVERSATION_CHILD_PREFIX):
+        return frozenset({THREADS_DIR, *PLATFORM_DIRS, MEMORY_PROJECTION_FILE})
     return frozenset()
 
 
@@ -250,6 +265,8 @@ def scope_parts(scope: str) -> tuple[str, ...]:
         return (WORKSPACE_AGENTS_DIR, _safe_key(scope, scope[len(SCOPE_AGENT_PREFIX) :]))
     if _is_agent_view_scope(scope):
         return (WORKSPACE_AGENTS_DIR, _agent_shared_parts(scope)[0])
+    if scope.startswith((SCOPE_AGENT_CHILD_PREFIX, SCOPE_AGENT_CONVERSATION_CHILD_PREFIX)):
+        return (WORKSPACE_AGENTS_DIR, _safe_key(scope, scope.split(":", 1)[1]))
     if scope.startswith(SCOPE_CONVERSATION_PREFIX):
         key, conv = _conversation_parts(scope)
         return (WORKSPACE_AGENTS_DIR, key, THREADS_DIR, conv, CONVERSATION_WORK_DIR)
@@ -316,7 +333,12 @@ def _reject_reserved_head(prefix: tuple[str, ...], parts: tuple[str, ...], path:
 
 
 def store_scope(
-    ws: str, *, agent_key: str, conv_id: UUID | None = None, thread_id: UUID | None = None
+    ws: str,
+    *,
+    agent_key: str,
+    conv_id: UUID | None = None,
+    thread_id: UUID | None = None,
+    child_run: bool = False,
 ) -> str:
     """解析结果的 ``ws`` → 宿主侧作用域 —— 沙箱与宿主之间唯一的翻译点。
 
@@ -326,6 +348,8 @@ def store_scope(
     (``AGENT_VIEW``,以及老视图的 ``EXEC_VIEW``)都是 agent 根,``threads/`` 只留
     ``thread_id`` 那一格(``conv_id`` 优先)—— 与 exec 视图同一张挂载表;对话视图的
     ``AGENT_VIEW`` 另外藏起平台目录(B-262,``agent_conv``)。没绑 agent 时两者都是整个用户根。
+    ``child_run``(B-300,委派子代):agent 根那一档换成 ``agent_child`` / ``agent_conv_child``,
+    不带线程 id(``threads/`` 一格都不留),旧记忆投影也藏起来。
 
     刻意不接受别的写法:``ws`` 是本进程自己算出来的, 出现别的值意味着上游改了
     而这里没跟上 —— 那种时候静默回落到用户根就是一次静默的越权扩大。
@@ -339,5 +363,9 @@ def store_scope(
     if conv_id is not None:
         if ws == EXEC_VIEW:
             return conversation_scope(agent_key, conv_id)
+        if child_run:
+            return f"{SCOPE_AGENT_CONVERSATION_CHILD_PREFIX}{agent_key}"
         return agent_shared_scope(agent_key, conv_id, conversation=True)
+    if child_run:
+        return f"{SCOPE_AGENT_CHILD_PREFIX}{agent_key}"
     return agent_shared_scope(agent_key, thread_id)

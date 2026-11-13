@@ -595,6 +595,9 @@ def _walk_and_match(
                     # B-236 —— 作用域根下藏起来的首段(``agent_shared`` 的 ``threads/``)
                     # 连走都不走进去:别的对话的文件不该出现在任何一条结果里。
                     dirnames[:] = [d for d in dirnames if d not in hidden]
+                    # B-300 —— 首段也可以是根下的文件(委派子代的旧记忆投影 ``MEMORY.md``):
+                    # 不读、不占命中名额,结果与它不存在时一样。
+                    filenames = [f for f in filenames if f not in hidden]
                 if dirnames and _walk_depth(dirpath) >= MAX_WALK_DEPTH:
                     # review 9 —— 再往下不走:fwalk 每深一层多握一个目录 fd。结果标成 ``too_deep``
                     # (review 10 起与 ``truncated`` 分开;也不在这里停整个遍历,别的分支照搜)。

@@ -287,14 +287,15 @@ def hide_threads(view, keep, names):
 
 def hide_memory(view):
     # A delegated run: the agent-root MEMORY.md (when it is a plain file) is
-    # covered by /dev/null, sealed, so opening it fails.
+    # covered by /dev/null, sealed, so opening it fails. Anything else is left
+    # alone without a word: stderr is the tool output of every exec, and a link
+    # there resolves inside this view, where the projection is covered.
     try:
         target = os.open(MEMORY, os.O_PATH | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=view)
     except FileNotFoundError:
         return
     if not stat.S_ISREG(os.fstat(target).st_mode):
         os.close(target)
-        say(MEMORY + " is not a plain file in the agent root; not covered")
         return
     null = os.open("/dev/null", os.O_PATH | os.O_CLOEXEC)
     ro(attach(sc(OPEN_TREE, null, b"", CLONE), target), MEMORY, SEALED)

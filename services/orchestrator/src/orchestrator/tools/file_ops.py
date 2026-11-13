@@ -191,8 +191,14 @@ def _refuse_notes_write_from_a_child(target: ResolvedPath, ctx: ToolContext, *, 
 def _store_scope(ws: str, ctx: ToolContext) -> str:
     """解析结果的 ``ws`` → 宿主侧作用域,按本次调用的视图(B-236)。"""
     view = ctx.workspace_view
+    # B-300 —— 委派子代不带线程 id(``threads/`` 一格都不留);``own_thread`` 本身不改,exec 的
+    # 本对话本地状态目录还按它分。
     return store_scope(
-        ws, agent_key=view.agent_key, conv_id=view.conv_id, thread_id=view.own_thread
+        ws,
+        agent_key=view.agent_key,
+        conv_id=view.conv_id,
+        thread_id=None if view.child_run else view.own_thread,
+        child_run=view.child_run,
     )
 
 
@@ -1381,11 +1387,7 @@ class SearchFilesTool:
                 continue
             except SandboxSupervisorError as exc:
                 _raise_for_store_error(exc, tool="search_files")
-            hits.extend(
-                _addressable_hits(
-                    [replace(e, path=f"{prefix}{e.path}") for e in found.entries], ctx=ctx
-                )
-            )
+            hits.extend(replace(e, path=f"{prefix}{e.path}") for e in found.entries)
             truncated = truncated or found.truncated
             too_deep = too_deep or found.too_deep
         found = WorkspaceSearchResult(entries=tuple(hits), truncated=truncated, too_deep=too_deep)
@@ -1400,24 +1402,6 @@ class SearchFilesTool:
                 "too_deep": found.too_deep,
             },
         )
-
-
-def _addressable_hits(
-    hits: list[WorkspaceFileEntry], *, ctx: ToolContext
-) -> list[WorkspaceFileEntry]:
-    """B-300 —— 委派子代的搜索结果只留它寻址得到的:命中的写法再过一遍唯一的路径解析入口,
-    被拒的(agent 根下的旧记忆投影)不出现。``threads/`` 存储侧本来就不搜。主智能体原样。"""
-    if not ctx.child_run:
-        return hits
-    view = ctx.workspace_view
-    kept = []
-    for hit in hits:
-        try:
-            resolve_workspace_path(hit.path, view=view, tool="search_files")
-        except ValueError:
-            continue
-        kept.append(hit)
-    return kept
 
 
 def _optional_str(args: Mapping[str, Any], key: str, *, tool: str) -> str | None:

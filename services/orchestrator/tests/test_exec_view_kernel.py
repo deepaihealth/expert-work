@@ -470,9 +470,8 @@ def test_delegated_run_cannot_open_the_memory_projection(scenario: Scenario) -> 
         "0",
     ], legacy_child
     assert r["no_root_file"] == {"rc": 0, "out": "ran\n", "err": ""}
-    symlink = r["root_symlink"]
-    assert symlink["rc"] == 0, symlink["err"]
-    assert symlink["out"] == "refused\nrefused\n", symlink
+    # 根下的 MEMORY.md 不是普通文件时不盖,也不往每次 exec 的工具输出里写一行(review L5)。
+    assert r["root_symlink"] == {"rc": 0, "out": "refused\nrefused\n", "err": ""}
 
 
 def test_conversation_dirs_that_are_not_plain_dirs_fail_closed(scenario: Scenario) -> None:
