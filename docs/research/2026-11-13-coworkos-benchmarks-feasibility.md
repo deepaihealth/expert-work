@@ -6,7 +6,7 @@
 
 ## 1. 为什么有这份
 
-RUC-NLPIR 11 月发了 CoworkOS(arXiv 2611.03178,MIT,github.com/RUC-NLPIR/CoworkOS,调研时看的是 `baf03c3`,2026-11-03),用 GLM-5.3 在 12 个公开测评上把自己和 OpenHands、Codex、DeepSeek Harness 放在一起比。我们想知道:如果 Expert Work 也拿同样的测评、同样的模型跑一遍,能不能跑、要做多少事、大概花多少钱、跟他们的数能比到什么程度。
+RUC-NLPIR 11 月发了 CoworkOS(arXiv 2611.03178;代码 MIT,论文 CC BY-NC-SA 4.0;github.com/RUC-NLPIR/CoworkOS,调研时看的是 `baf03c3`,2026-11-03),用 GLM-5.3 在 12 个公开测评上把自己和 OpenHands、Codex、DeepSeek Harness 放在一起比。我们想知道:如果 Expert Work 也拿同样的测评、同样的模型跑一遍,能不能跑、要做多少事、大概花多少钱、跟他们的数能比到什么程度。
 
 用户 2026-11-13 的决定:
 
@@ -24,7 +24,7 @@ RUC-NLPIR 11 月发了 CoworkOS(arXiv 2611.03178,MIT,github.com/RUC-NLPIR/Cowork
 
 统一设置:GLM-5.3,High 思考档,上下文 256K,单次最多输出 64K(论文 §4.1.1、附录 A.1)【已核实】。
 
-**没有公开的**:评测代码、各测评的适配器、逐题结果;各测评用的版本、LLM 评审模型、用户模拟器模型大多没写;看分数形状是**每个测评只跑了一次**(τ³ 的分数都是 k/97,AutomationBench 都是 k/600)【推断】。
+**没有公开的**:评测代码、各测评的适配器、逐题结果;各测评用的版本、LLM 评审模型、用户模拟器模型大多没写;看分数形状,**τ³ 和 AutomationBench 看来只跑了一次**(τ³ 的分数都是 k/97,AutomationBench 都是 k/600),其它测评跑了几次看不出来【推断】。
 
 论文表 1 里与本文相关的 6 行(列:OpenHands / Codex / DeepSeek Harness / CoworkOS)【已核实】:
 
@@ -37,30 +37,30 @@ RUC-NLPIR 11 月发了 CoworkOS(arXiv 2611.03178,MIT,github.com/RUC-NLPIR/Cowork
 | OfficeQA Pro | 66.20 | 66.30 | 62.30 | 65.90 |
 | WorkspaceBench-Lite | 64.54 | 58.81 | 68.76 | 67.14 |
 
-本次只调研了这 6 个,因为它们离我们的场景最近。其余 6 个没展开:两个 ML 编程测评要 H200 GPU;WideSearch / BrowseComp 要他们的搜索后端;GDPVal 的 Elo 基准对手没写清;Harvey 的 120 题样本没公开。
+本次只调研了这 6 个,因为它们离我们的场景最近。其余 6 个没展开:两个 ML 编程测评要 H200 GPU;WideSearch 用 Serper 搜索 + Jina 读页面(都是商用服务),BrowseComp 没写搜索后端【已核实,论文附录 A.1】;GDPVal 的 Elo 基准对手没写清;Harvey 的 120 题样本没公开。
 
 ## 3. 六个测评逐个看
 
 **花费的共同假设**:只算被测智能体,按 GLM-5.3 价目 **输入 8 / 缓存命中 2 / 输出 28 元每百万 token**(`tools/eval/kb_agent_cost.py:34`、`tools/eval/clinconsensus.py:58`)【已核实】;缓存命中率按 50%–90% 算,输入折合约 2.6–5 元/百万【估计】。智谱在长任务上的真实缓存命中率没量过,这是最大变量。数据库里平台运行时用的价目表要跑前再核一次(迁移里没有种 glm-5.3 这行)【已核实】。下面都是**单轮**费用;按规矩对外数字至少跑两轮(§5)。
 
-**接入的共同点**:六个测评都没有「调一个 HTTP 智能体服务」的现成适配器【已核实】。我们都要写一段胶水:建 run → 等结束 → 取答案或产物 → 交给官方判分。各测评的「环境」(任务容器、模拟业务系统、用户模拟器)多半要放在我们平台外面,用 MCP 工具接给智能体(原因见 §4)【推断】。
+**接入的共同点**:六个测评都没找到能直接用的「调一个 HTTP 智能体服务」的适配器【推断】(SkillsBench 有一个 HTTP 桥但用不上,见 §3.1)。我们都要写一段胶水:建 run → 等结束 → 取答案或产物 → 交给官方判分。各测评的「环境」(任务容器、模拟业务系统、用户模拟器)多半要放在我们平台外面,用 MCP 工具接给智能体(原因见 §4)【推断】。
 
 ### 3.1 SkillsBench(工具使用)
 
 - **能否拿到**:github.com/benchflow-ai/skillsbench,Apache-2.0,任务全在仓库里,无门槛【已核实】。版本有 `skillsbench@1.0` / `@1.1`(87 题)和论文快照(86 题)【已核实】。**CoworkOS 说的「79 个文本任务」复原不出来**:按 `modality` 去掉图像/视频/音频剩 81,再去 3D 剩 78【已核实统计,结论为推断】。只能自己定口径并写明。
-- **接入与工作量**:官方 harness 把智能体装进任务容器里跑,判分也在同一容器里检查文件【已核实】。我们的沙箱挂不了任务镜像,走「工具代理」:写一个 Harbor `BaseAgent`(或 BenchFlow 桥),把智能体的 shell / 读写文件换成 MCP 工具,命令 exec 进外面的任务容器;每题自带的 Skills 要按题装到智能体上。粗估 **5–10 人日**【估计】。
+- **接入与工作量**:官方 harness 把智能体装进任务容器里跑,判分也在同一容器里检查文件【已核实】。仓库里有一个 AgentBeats 的 A2A HTTP 桥(`integrations/agentbeats/`、`acp_bridge.py`),但它只把提示转发给参赛方的 HTTP 端点、收回 base64 文件,**智能体看不到也操作不了任务容器**(输入文件和装好的库都在容器里)【已核实】,对多数题不够用,我们用不上【推断】。我们的沙箱挂不了任务镜像,走「工具代理」:写一个 Harbor `BaseAgent`(或 BenchFlow 桥),把智能体的 shell / 读写文件换成 MCP 工具,命令 exec 进外面的任务容器;每题自带的 Skills 要按题装到智能体上。粗估 **5–10 人日**【估计】。
 - **运行环境**:要一台 Docker 主机(每题 1–8 核、2–16 GB,无 GPU)【已核实】。几乎所有任务容器要联网,判分时还现场从 astral.sh / PyPI 拉包;部分镜像在 gcr.io 等境外仓库【已核实】。境内要准备 Docker Hub / PyPI / gcr.io 镜像或代理,或把任务主机放境外【推断】。判分基本不用 LLM,没有用户模拟器【已核实】。
 - **花费**:按每题 1–5M 输入、2–10 万输出的粗估,79 题单轮约 **¥250–2,200**【估计】;若像我们以前 Harness-Bench 那样每题约 27 万输入,只要约 ¥130【推断】。区间太宽,只能试跑定。另有 Docker 主机的机器钱。
 - **可比性风险**:题单对不上;带不带 Skills 没写(官方两种条件平均差约 16 分,64 分量级看像带 Skills)【推断】;版本没写;官方每题跑 3 次取平均,CoworkOS 疑似 1 次;我们换成工具代理后,工具集本身就和 OpenHands / Codex 不同,要写明;国内网络导致的装包失败要单独统计,别算成智能体失败。
-- **官方榜**:接受第三方 harness;GLM 只有 OpenHands + GLM 5.1(无 Skills 32.7 / 有 Skills 58.4),**没有 GLM-5.3**【已核实】。
+- **官方榜**:接受第三方 harness;GLM 只有 OpenHands + GLM 5.1(无 Skills 32.7 / 有 Skills 58.4),**官方榜没有 GLM-5.3**【已核实】。第三方 Vals.ai 也有 SkillsBench 榜,二手镜像显示 GLM-5.3(OpenHands,max 思考)47.51%,原页没核【未核实】。
 - **与我们场景的关系**:中。考察「按技能说明干活」,我们平台有技能体系;但多数题是编程 / 数据处理,离知识库 + 办公交付件远一些。
 
 ### 3.2 τ³-Bench Banking(工具使用)
 
 - **能否拿到**:github.com/sierra-research/tau2-bench,MIT,97 题 + 698 篇文档都在仓库里,能精确选到同一批题【已核实】。**版本是最大的坑**:v1.0.0 → v1.0.1 修了 banking 判分,分数最多上移约 9 分;v2.0.0(现 main)又换了用户模拟器提示词和判官,和 1.x 不可比;文本 banking 的官方榜要用 `v1.0.1` 跑【已核实】。CoworkOS 用哪版没写。
 - **接入与工作量**:原生接口是 Python 类,由 tau2 自己执行工具、按轨迹重放判分【已核实】。参考 Harbor 的 tau3-bench 适配器(MCP 边车形态,但基于 v1.0.0 且只用 BM25)写一个 MCP 服务:内含 tau2 环境 + 用户模拟器,对外暴露「给用户发消息 / 收回复」和全部 `alltools` 工具;跑完把记录转回 tau2 消息调官方判分。要关掉我们平台自带的联网搜索、知识库等工具。粗估 **4–7 人日**【估计】。
-- **运行环境**:纯 Python,不要 Docker / GPU【已核实】。**要境外模型服务**:用户模拟器(官方 1.x 榜统一用 `gpt-5.2`,换模型就算 custom 提交)、稠密检索 embedding(OpenAI `text-embedding-3-large` 或 OpenRouter `qwen3-embedding-8b`)【已核实】。出网的是评测脚本,不是沙箱。判官影响很小:97 题只有 1 题要 LLM 判官【已核实】。单题墙钟上限 1800 秒,我们平台的排队和沙箱冷启动也算在里面。
-- **花费**:Sierra 公开的 GLM-5.2 轨迹每题平均约 134 万输入、3 万输出,长尾单题到 1,200 万输入(会话记录,仓库外);按此 97 题单轮约 **¥200–900**,长尾单题 ¥30–100【估计】。另加用户模拟器(境外,按美元计)和一次性的 embedding 建索引。官方榜建议每题 ≥4 次。
+- **运行环境**:纯 Python,不要 Docker / GPU【已核实】。**要境外模型服务**:用户模拟器(官方 1.x 榜统一用 `gpt-5.2`,换模型就算 custom 提交)、稠密检索 embedding(OpenAI `text-embedding-3-large` 或 OpenRouter `qwen3-embedding-8b`)【已核实】。出网的是评测脚本,不是沙箱。判官影响很小:97 题只有 1 题要 LLM 判官【已核实】。CoworkOS 用 `--timeout 1800`(模拟时限 1800 秒,这是他们设的,不是 τ³ 的默认值)【已核实 CLI 参数 / 对应关系为推断】;照搬的话,我们平台的排队和沙箱冷启动也算在这 1800 秒里。
+- **花费**:Sierra 公开的 GLM-5.2 轨迹每题平均约 134 万输入、3 万输出,长尾单题到 1,200 万输入(会话记录,仓库外)。按这个均值,每题约 ¥4.3–7.5,97 题单轮约 **¥420–730**【估计】;按调研笔记每题 0.5–1.5M 输入的粗估,下沿可到约 ¥200【估计】。以前估得更高:按我们平台多步任务档估每题 ¥5–30,10-09 估过 10 题 ¥95–290(每题 ¥9.5–29)(会话记录,仓库外)。长尾单题 ¥30–100【估计】。另加用户模拟器(境外,按美元计)和一次性的 embedding 建索引。官方榜建议每题 ≥4 次。
 - **可比性风险**:版本、用户模拟器模型、embedding 三样 CoworkOS 都没写;97 题跑一次,一题约 1 分,抖动大;我们平台的系统提示词、平台段注入、子智能体、上下文压缩按官方定义都算 custom。
 - **官方榜**:taubench.com 接受第三方提交(分 standard / custom);banking 上 GLM-5.2 = 37.11,**没有 GLM-5.3**【已核实】。
 - **与我们场景的关系**:中高。「多轮对话 + 查知识文档 + 调业务工具」和我们的客服 / 知识库类智能体形态接近;但内容是英文银行业务。
@@ -79,7 +79,7 @@ RUC-NLPIR 11 月发了 CoworkOS(arXiv 2611.03178,MIT,github.com/RUC-NLPIR/Cowork
 
 - **能否拿到**:代码 github.com/databricks/officeqa(Apache-2.0),数据 CC-BY-SA 4.0【已核实】。HF `databricks/officeqa` 要申请(条件:不得用答案训练、不得刷分);**ModelScope 镜像 `evalscope/officeqa` 不用登录**,含 `officeqa_pro.csv`(就是这 133 题)和解析好的语料,共 5.43 GB【已核实】。题目被官方更新过,要钉版本。
 - **接入与工作量**:CoworkOS 说按「EvalScope/OfficeQA 原生规则」打分,对应 EvalScope 的 `officeqa_adapter.py`【已核实】。EvalScope 有外部智能体接口(`AgentRunner`:`setup` / `run`),内置 claude-code、codex、deepseek-harness 等;我们写一个 runner 调我们的 HTTP API、取回最终答案即可。**这是六个里最省事的**,粗估 **1–2 人日**【估计】——前提是语料能进工作区(见 §4)。
-- **运行环境**:不要 GPU,不要评审 LLM(规则打分),不要外网;数据从 ModelScope 下【已核实】。智能体要在约 697 个解析好的 txt(约 460 MB)里 grep / 读文件、必要时写代码算数【已核实】。灌进知识库也能做,但那是另一种测法,跟 grep 不可比【推断】。
+- **运行环境**:不要 GPU,不要评审 LLM(规则打分);数据从 ModelScope 下【已核实】。EvalScope 原生模式要 Docker【已核实】。EvalScope 默认不联网;Databricks 官方 harness 开了联网搜索【已核实】,CoworkOS 开没开不知道——「不要外网」只对 EvalScope 默认设置成立。智能体要在约 697 个解析好的 txt(约 460 MB)里 grep / 读文件、必要时写代码算数【已核实】。灌进知识库也能做,但那是另一种测法,跟 grep 不可比【推断】。
 - **花费**:按每题 0.2–1M 输入,133 题单轮约 **¥100–700**【估计】;若像我们短问答用例那样每题 ¥0.1–1,只要 ¥15–130。判分 0 元。
 - **可比性风险**:EvalScope 的设置比 Databricks 官方宽松得多——提示里直接告诉了答案在哪个文件,数值容差 1%(官方不提示、容差 0%)【已核实】。所以 CoworkOS 的 62–66 分**不能和官方榜约 61% 比**;要和 CoworkOS 比就原样用 EvalScope 的提示和容差。答案必须包在 `<FINAL_ANSWER>` 里,我们平台的提示词可能改答案格式。EvalScope 外部模式默认单题 600 秒超时,CoworkOS 用的没写。
 - **官方榜**:只有 Databricks 自己跑的三家厂商 harness,没有 GLM,没有第三方提交流程【已核实】。
@@ -92,7 +92,7 @@ RUC-NLPIR 11 月发了 CoworkOS(arXiv 2611.03178,MIT,github.com/RUC-NLPIR/Cowork
 - **运行环境**:官方每题 4 CPU / 8 GiB,超时 7200 秒(与 CoworkOS 一致)【已核实】。输入有 csv / txt / xlsx / pdf / db / docx / png,65 题合计约 71 MB;交付物主要是 xlsx / docx / pdf / csv【已核实】。**65 题里 57 题要智能体自己上网找材料**,官方任务容器网络是公开的【已核实】;访问境外站点是硬需求。**评审要境外服务**:官方默认 xAI `grok-4.3`,能换但官方明说换评审会改变分数【已核实】。判分时用 Docker 跑 LibreOffice 重算公式【已核实】。
 - **花费**:两种算法差一个数量级——按每题 0.3–2M token 粗估,单轮约 ¥100–750;按我们「1–2 小时长交付件」档(每题 ¥15–140,中位 ¥30–60)算是 ¥1,000–9,000【估计】。论文里其它模型全量一次按标价是 $32–210【已核实】。另加评审(grok-4.3 全量一次约 $20)【已核实】和联网搜索费用。
 - **可比性风险**:评审模型(用 grok-4.3 才对得上官方榜,CoworkOS 用谁没写);走 EvalScope 还是官方评审结果会不同(EvalScope 不重算 xlsx 公式,智能体写的公式会读成空)【已核实】;境内网络访问境外站点影响分数;数据公开,联网的智能体可能搜到答案【推断】;官方要求 65 题全部评审成功才算完整成绩。
-- **官方榜**:主页榜固定 OpenCode 作 harness、评审 Grok 4.3;**有 GLM-5.3 = 61.4**(第 8)【已核实】。没看到第三方提交流程,但同模型可以直接对照。
+- **官方榜**:主页榜固定 OpenCode 作 harness、评审 Grok 4.3;**有 GLM-5.3 = 61.4**(第 8)【已核实】。没看到第三方提交流程,但同模型可以直接对照(评审也用 grok-4.3 时)【推断】。
 - **与我们场景的关系**:**高**。真实白领任务,读 Office / PDF / 表格、交付 xlsx / docx / pdf,和我们的办公交付件场景最像;缺点是英文、美国职业场景、强依赖联网。
 
 ### 3.6 WorkspaceBench-Lite(生产力)
@@ -100,7 +100,7 @@ RUC-NLPIR 11 月发了 CoworkOS(arXiv 2611.03178,MIT,github.com/RUC-NLPIR/Cowork
 - **能否拿到**:代码 github.com/OpenDataBox/Workspace-Bench(MIT);题目 HF `Workspace-Bench/Workspace-Bench-Lite`(100 题,卡片没写许可),工作区 HF `Workspace-Bench/Workspace-Bench-Workspaces`(apache-2.0,英文归档 18.7 GB);都不用登录【已核实】。英文 Lite 100 题能对上。**还有中文版**(题目、工作区、rubric),是六个里唯一能测中文的【已核实】。官方 07-02 改过元数据、08-17 修过一个 rubric 泄露漏洞,要钉 revision【已核实】。
 - **接入与工作量**:CoworkOS 说「基于 AgentCompass」,但对应的是**还没合并的 PR #373**,只支持 claude_code / codex 两个 harness,PR 自己说还没和官方分数对齐过【已核实】。官方仓库的接入点简单:加一个 `evaluation/src/agents/expertwork.py`,一个 `run(prompt, work_dir, …)` 函数调我们的 HTTP API【已核实接口,做法为推断】。难点:每题的工作目录是整个人设工作区的完整拷贝(几个 GB),要预置进智能体能浏览的地方;评审要读智能体的执行轨迹,要把我们 run 的工具调用导出成他们的格式【推断】。粗估 **4–7 人日**【估计】。
 - **运行环境**:官方每题一个新容器,2 CPU / 8 GiB / 20 GiB 可写(与 CoworkOS 一致),官方默认超时 2000 秒、CoworkOS 用 2 小时【已核实】。不要 GPU。评审是一个 Claude Code 会话,**端点要兼容 Anthropic 协议**;论文用的评审模型是 Seed-2.0-Lite【已核实】。国产模型的 Anthropic 兼容接口能不能用没核实。下载约 19 GB 要走境外或镜像。
-- **花费**:论文各配置平均每题约 56 万 token、41 轮【已核实】;100 题单轮约 **¥130–650**【估计】。评审每题 0.1–0.5M token,用便宜模型很低【估计】。
+- **花费**:论文各配置平均每题约 56 万 token、41 轮【已核实】;100 题单轮约 **¥130–650**【估计】。这里用论文实测的每题 token,而没套 §3.5 用的「1–2 小时长交付件」档(每题 ¥15–140):那一档是按 150–300 次模型调用推算的,而论文实测平均只有约 41 轮。评审每题 0.1–0.5M token,用便宜模型很低【估计】。
 - **可比性风险**:CoworkOS 用的是未合并 PR 或内部改版,评审模型没写,主指标口径(micro / macro 通过率)要对齐,超时不同,轨迹导出不全会吃亏。**和 CoworkOS 可比程度最低**,更适合直接跑中文版测我们自己【推断】。
 - **官方榜**:45 个组合,有 GLM-5.1、没有 GLM-5.3;第三方提交入口还没开【已核实】。
 - **与我们场景的关系**:**高**。大工作区里的办公文件 + 文件依赖,接近「知识库 + 办公文档」,且有中文版。
@@ -109,20 +109,20 @@ RUC-NLPIR 11 月发了 CoworkOS(arXiv 2611.03178,MIT,github.com/RUC-NLPIR/Cowork
 
 | 测评 | 数据能否对齐 | 我们要写的(估计) | 境外依赖 | 单轮花费(估计) | 跟 CoworkOS 可比 | 公开榜有 GLM-5.3 | 场景相关 |
 |---|---|---|---|---|---|---|---|
-| SkillsBench | 79 题复原不出 | 5–10 人日 + Docker 主机 | 镜像仓库 / PyPI | ¥250–2,200(低可到 ¥130) | 低 | 否 | 中 |
-| τ³ Banking | 97 题能对上,版本不明 | 4–7 人日 | 用户模拟器 + embedding(OpenAI) | ¥200–900 + 模拟器 | 中低 | 否 | 中高 |
+| SkillsBench | 79 题复原不出 | 5–10 人日 + Docker 主机 | 镜像仓库 / PyPI | ¥250–2,200(低可到 ¥130) | 低 | 官方榜否(第三方 47.51 未核) | 中 |
+| τ³ Banking | 97 题能对上,版本不明 | 4–7 人日 | 用户模拟器 + embedding(OpenAI) | ¥420–730(按公开轨迹均值;粗估下沿 ¥200,旧估计更高)+ 模拟器 | 中低 | 否 | 中高 |
 | AutomationBench | 600 题 + PR #13 能对上 | 2–4 人日 | 无 | ¥640–5,300 | 中 | 否 | 中 |
 | OfficeQA Pro | 133 题能对上,钉版本 | 1–2 人日 + 语料进工作区 | 无 | ¥15–700 | 中(照搬 EvalScope 设置) | 否 | 中 |
-| JobBench | 65 题能对上,钉版本 | 2–4 人日 + 打通联网 | 评审 grok-4.3 + 境外网站 | ¥100–9,000 + 评审约 $20 | 中高 | **是,61.4** | 高 |
+| JobBench | 65 题能对上,钉版本 | 2–4 人日 + 打通联网 | 评审 grok-4.3 + 境外网站 | ¥100–9,000 + 评审约 $20 | 中高 | **官方榜有,61.4** | 高 |
 | WorkspaceBench-Lite | 100 题能对上,钉版本 | 4–7 人日 + 大工作区 + 轨迹导出 | HF 下载;Anthropic 兼容评审 | ¥130–650 | 低 | 否 | 高(有中文版) |
 
 ## 4. 我们这边的约束
 
-**以前怎么接外部测评**:SpreadsheetBench、Harness-Bench、ClinConsensus 都走对外 API `POST /v1/agents/{agent_code}/runs`(`services/control-plane/src/control_plane/api/agents.py:1704`),每题一个新 `user_id`(= 新沙箱 + 新工作区)【已核实】。只有 ClinConsensus 的脚本在仓库里(`tools/eval/clinconsensus.py`),其余适配脚本当时放在会话临时目录、已丢失。这次的教训:**适配器和逐题结果要进仓库或固定目录**。
+**以前怎么接外部测评**:对外 API 是 `POST /v1/agents/{agent_code}/runs`(`services/control-plane/src/control_plane/api/agents.py:1704`)。ClinConsensus 走它、每题一个新 `user_id`(= 新沙箱 + 新工作区),脚本在仓库里(`tools/eval/clinconsensus.py:259-262`)【已核实】。SpreadsheetBench、Harness-Bench 也是这么接的,但适配脚本当时放在会话临时目录、已丢失,这两条只有会话记录(仓库外);仓库里只有它们的报告(`docs/eval-reports/harness/`)。这次的教训:**适配器和逐题结果要进仓库或固定目录**。
 
 **沙箱约束**(决定了「环境放平台外、用 MCP 接进来」的路线)【已核实】:
 
-- **挂不了测评自带的 Docker 任务镜像**:每次领沙箱都用平台唯一的镜像(`services/sandbox-supervisor/src/sandbox_supervisor/supervisor.py:835-840`)。镜像是 python3.12 + LibreOffice + poppler + nodejs 等,没有 docker;根目录只读、非 root,`pip install` 默认装到 `--user`(`infra/sandbox-image/Dockerfile:284-299`),apt 装不了。
+- **挂不了测评自带的 Docker 任务镜像**:每次领沙箱都用平台唯一的镜像(`services/sandbox-supervisor/src/sandbox_supervisor/supervisor.py:835-840`)。镜像是 python3.12-slim + LibreOffice + poppler + nodejs 等,没有 docker(`infra/sandbox-image/Dockerfile:70`、`:215-230`);智能体的命令以 uid 10000 运行,不是 root(`Dockerfile:46-55`);根目录只读,`pip install` 默认装到 `--user`(`Dockerfile:284-299`),apt 装不了。
 - **单条命令最长 300 秒**(默认 60 秒,`services/orchestrator/src/orchestrator/tools/sandbox.py:52,59`),编译 / 大测试集要拆开或放后台。
 - **文件进**只能靠上传:`POST /v1/agents/{code}/uploads`(`services/control-plane/src/control_plane/api/external_uploads.py:233`),只收 pdf / docx / xlsx / pptx / txt / md / csv 加图片(`services/control-plane/src/control_plane/api/uploads.py:92-100`),单文件默认 25 MiB(`services/control-plane/src/control_plane/settings.py:348`)。对外 API **没有写工作区的接口**,`external_workspace.py` 只有列文件和下载两个 GET(`:123`、`:206`)。带目录树或其它类型(如 JobBench 的 `.db`)的输入,只能照 Harness-Bench 的老办法:打包 → base64 切成 txt 上传 → 让智能体解包。几百 MB 到几 GB 的语料 / 工作区(OfficeQA、WorkspaceBench)这样传不现实,要么做平台侧预置,要么用 MCP 文件工具从外面供【推断】。
 - **文件出**:产物下载 + 工作区单文件下载,客户端已有(`tools/eval/behavior_client.py:286-307`)。
@@ -155,7 +155,7 @@ RUC-NLPIR 11 月发了 CoworkOS(arXiv 2611.03178,MIT,github.com/RUC-NLPIR/Cowork
 
 ## 6. 届时要决定的事
 
-1. **跑哪几个**:按目的选——要和 CoworkOS / 同模型榜单对照(JobBench 最好,公开榜有 GLM-5.3 = 61.4;OfficeQA Pro 最省事);还是测自己的主场景(WorkspaceBench 中文版);还是两者都要。
+1. **跑哪几个**:按目的选——要和 CoworkOS / 同模型榜单对照(JobBench 最好,官方榜有 GLM-5.3 = 61.4,评审也用 grok-4.3 时才能直接对照【推断】;OfficeQA Pro 最省事);还是测自己的主场景(WorkspaceBench 中文版);还是两者都要。
 2. **和谁比、用什么口径**:跟 CoworkOS 表比(版本、评审、用户模拟器都要猜,只能写明假设),还是跟官方榜比(要按官方版本和评审)。平台原样上(带平台工具和提示词)还是只留测评自带工具。
 3. **境外服务器**:要不要临时租(香港 / 新加坡),放哪些东西(评测脚本、任务容器、MCP 服务),智能体本身要不要出境外网(JobBench 联网搜索)。
 4. **评审 / 模拟器账号**:xAI(grok-4.3)、OpenAI(用户模拟器 `gpt-5.2`、embedding)、Anthropic 兼容评审端点——开不开、用不用国产替代(替代就要先做交叉校准)。
