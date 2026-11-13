@@ -76,9 +76,8 @@ class StateDirError(RuntimeError):
 def check_state_dir(state_dir: Path) -> Path:
     """只有一个状态目录(``~/.cache/b300-eval``):总账、锁、每个报价的账本都在这里,换目录绕不开
     ¥400。别的目录只给测试用(要设 :data:`TEST_STATE_DIR_ENV`)。"""
-    if Path(state_dir).resolve() != Path(DEFAULT_STATE_DIR).resolve() and not os.environ.get(
-        TEST_STATE_DIR_ENV
-    ):
+    allowed = os.environ.get(TEST_STATE_DIR_ENV) == "1"  # 只认恰好是 "1"
+    if Path(state_dir).resolve() != Path(DEFAULT_STATE_DIR).resolve() and not allowed:
         raise StateDirError(
             f"spending always uses the default state dir {DEFAULT_STATE_DIR}; {state_dir} is only "
             f"accepted in tests ({TEST_STATE_DIR_ENV}=1)"

@@ -80,7 +80,18 @@ def _finish(out: Path, q: dict[str, Any], name: str) -> list[dict[str, Any]]:
     ]
     (out / name / "records.jsonl").write_text("".join(json.dumps(r) + "\n" for r in rows))
     (out / name / "verdicts.jsonl").write_text(json.dumps({"key": "v1", "verdict": False}) + "\n")
+    _meta(out, name)
     return rows
+
+
+def _meta(out: Path, name: str) -> None:
+    """旧目录的版本记录(第五轮起接着做要核对发布版本与脚本提交)。"""
+    meta = {
+        "release_tag": "rel-1",
+        "script_commit": phases.git_commit(),
+        "recorded_at": "2026-11-13T08:00:00+00:00",
+    }
+    (out / name / "meta.json").write_text(json.dumps(meta))
 
 
 def _progress(tmp_path: Path, old_out: Path) -> Path:
@@ -138,6 +149,7 @@ def test_resume_prepares_exactly_what_the_quote_counted(tmp_path: Path) -> None:
             for u in done
         )
     )
+    _meta(old_out, "c")
     progress_file = _progress(tmp_path, old_out)
     new_q = _quote(tmp_path, "--phases", "c", "--progress", str(progress_file))
     counted = new_q["remaining_units_by_phase"]
@@ -150,6 +162,8 @@ def test_resume_prepares_exactly_what_the_quote_counted(tmp_path: Path) -> None:
             new_out,
             "--resume-from",
             str(old_out),
+            "--release-tag",
+            "rel-1",
             "--phases",
             "c",
             "--progress",
@@ -186,6 +200,8 @@ def test_resume_refuses_when_the_old_out_moved_on_since_quoting(tmp_path: Path) 
         tmp_path / "new",
         "--resume-from",
         str(old_out),
+        "--release-tag",
+        "rel-1",
         "--phases",
         "c",
         "--progress",
@@ -208,6 +224,8 @@ def test_report_merges_carried_and_new_records(tmp_path: Path) -> None:
         new_out,
         "--resume-from",
         str(old_out),
+        "--release-tag",
+        "rel-1",
         "--phases",
         "c",
         "--progress",

@@ -286,7 +286,7 @@ def c5_region_in_candidates(
     seed_ids: Mapping[str, str], clusters: Sequence[Sequence[str]]
 ) -> dict[str, bool]:
     """C5 / T13:整理前这一片(X 与两条相近的)有没有被取成候选簇;已作废的 X 进没进候选。"""
-    region = {seed_ids.get(k) for k in ("x", "near1", "near2")} - {None}
+    region = {seed_ids.get(k) for k in ("x", "near1", "near2", "near3")} - {None}
     return {
         "region_clustered": any(len(region & set(c)) >= 2 for c in clusters),
         "x_in_candidates": any(seed_ids.get("x") in set(c) for c in clusters),

@@ -82,7 +82,12 @@ def judge_items(out: Path, phase: Phase) -> tuple[list[rep.JudgeItem], dict[str,
             summaries = [row["content"] for row in state_rows or [] if row.get("summary")]
             info["summaries"] = len(summaries)
             info["state_known"] = state_rows is not None
-            if r["user"] not in summaries_done and state_rows is not None:
+            # 没凑成簇的这一片:C5 ① 未测到,汇总行不送判官(省钱,也不进过线)
+            if (
+                r["user"] not in summaries_done
+                and state_rows is not None
+                and info.get("region_clustered")
+            ):
                 summaries_done.add(r["user"])
                 if summaries:
                     items.append(
@@ -154,9 +159,9 @@ def collect_outcomes(
                     (sid, bad) for sid, _d, bad, clustered in summary_rows if clustered
                 )
             else:
-                outcomes[("C5", "summary_violation", "consolidation")] += [
-                    (domain, bad) for _sid, domain, bad, _c in summary_rows
-                ]
+                measured = [(domain, bad) for _sid, domain, bad, _c in summary_rows]
+                if measured:  # 一次都没测到就不出这条线(「未测到」另列)
+                    outcomes[("C5", "summary_violation", "consolidation")] += measured
     return outcomes, {k: dict(v) for k, v in counts.items()}, baseline
 
 
@@ -176,14 +181,19 @@ def _c5_summaries(
         r = records[key]
         if r["user"] in seen or not info.get("state_known"):
             continue
+        if not info.get("region_clustered"):
+            # 整理前这一片没凑成候选簇(审查第五轮 M2):这一次 C5 ① 什么都没量到 —— 记「未测到」,
+            # 不算过线,也不算违规;基线上同样不进「证明会红」。
+            seen.add(r["user"])
+            counts["c5_not_measured"] += 1
+            continue
         if info.get("consolidated_before"):
             seen.add(r["user"])
             counts["c5_consolidated_before_our_step"] += 1
             continue
         seen.add(r["user"])
         counts["x_in_candidates"] += bool(info.get("x_in_candidates"))
-        clustered = bool(info.get("region_clustered"))
-        counts["c5_region_not_clustered"] += not clustered
+        clustered = True  # 没凑成簇的上面已经记成「未测到」
         bad = _bad(verdicts, f"{r['user']}|summary") if info.get("summaries") else False
         if bad is None:
             counts["judge_split_or_missing"] += 1
@@ -304,5 +314,11 @@ def report(out: Path, q: Mapping[str, Any] | None) -> dict[str, Any]:
     if (out / "compare-before").exists() or (out / "compare-after").exists():
         body["compare"] = compare_counts(out)
     # 从旧报价搬过来的记录(``prepare --resume-from``)与新跑的合在一起算;这里报搬了多少。
+    not_measured = sum(int((c or {}).get("c5_not_measured", 0)) for c in counts.values())
+    if not_measured:
+        body["disclosures"].append(
+            f"C5 ① 有 {not_measured} 次整理前这一片没凑成候选簇,记为「未测到」,"
+            "不算过线(审查第五轮 M2)。"
+        )
     body["carried"] = carried
     return body

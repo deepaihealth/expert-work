@@ -134,7 +134,8 @@ async def test_seed_writes_and_supersedes() -> None:
     deps, store, _ = _deps()
     scenario = _c5()
     (row,) = await _run(deps, {"op": "seed", "entries": [_seed_entry(scenario)]})
-    assert set(row["memory_ids"]) == {"x", "y", "near1", "near2"} and row["embedded"] == 4
+    assert set(row["memory_ids"]) == {"x", "y", "near1", "near2", "near3"}
+    assert row["embedded"] == 5
     user = UUID(row["user_id"])
     items = {
         str(m.id): m for m in await store.list_for_user(tenant_id=TENANT, user_id=user, limit=50)

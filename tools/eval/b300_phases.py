@@ -135,6 +135,7 @@ def build_units(phase: Phase, q: Mapping[str, Any]) -> list[dict[str, Any]]:
     试点报价(``q["pilot"]``)只取 :func:`pilot_scenarios`、一家、每个 1 次。"""
     units = []
     pilot = bool(q.get("pilot"))
+    models = {v["provider"]: {"main": v["main"], "memory": v["memory"]} for v in q["vendors"]}
     for s in pilot_scenarios(phase) if pilot else scenarios_for(phase):
         for repeat in range(1 if pilot else plan.REPEATS):
             vendors = [q["single_vendor"]] if pilot else vendors_for_class(phase, s.cls, q)
@@ -149,6 +150,9 @@ def build_units(phase: Phase, q: Mapping[str, Any]) -> list[dict[str, Any]]:
                         "vendor": vendor,
                         "repeat": repeat,
                         "attempt": 0,
+                        # 审查第五轮 M1:每个单元(及它的记录)带上型号与场景摘要,接着做时逐条核对
+                        "models": models[vendor],
+                        "scenario_digest": sc.scenario_digest([s]),
                         "user": user_name(
                             q["quote_id"],
                             phase.name,
@@ -458,6 +462,39 @@ def remaining_for(
         return shares, counts
 
     return compute
+
+
+def check_carry(old_out: Path, name: str, q: Mapping[str, Any], release_tag: str | None) -> None:
+    """接着做之前核对版本(审查第五轮 M1):旧目录这一段的发布版本、脚本提交要与这次一样;每条要搬的
+    记录的型号与场景摘要要与这份报价、现在的场景一样。对不上就整段拒,不悄悄混。"""
+    meta_file = old_out / name / "meta.json"
+    rows = finished_records(old_out, name)
+    if rows and not meta_file.exists():
+        raise EvalError(
+            f"{meta_file} missing: cannot tell which release the finished records ran on"
+        )
+    if meta_file.exists():
+        meta = json.loads(meta_file.read_text(encoding="utf-8"))
+        if meta.get("release_tag") != release_tag:
+            raise EvalError(
+                f"{name}: old records ran on release {meta.get('release_tag')!r}, this run is "
+                f"{release_tag!r}; results from different releases are not merged"
+            )
+        if meta.get("script_commit") != git_commit():
+            raise EvalError(
+                f"{name}: old records were made by script commit {meta.get('script_commit')}, "
+                f"this checkout is {git_commit()}; not merged"
+            )
+    models = {v["provider"]: {"main": v["main"], "memory": v["memory"]} for v in q["vendors"]}
+    scenarios = all_scenarios()
+    for r in rows:
+        if r.get("models") != models.get(r["vendor"]):
+            raise EvalError(
+                f"{r['key']}: ran on models {r.get('models')}, this quote uses "
+                f"{models.get(r['vendor'])}; not carried"
+            )
+        if r.get("scenario_digest") != sc.scenario_digest([scenarios[r["scenario_id"]]]):
+            raise EvalError(f"{r['key']}: the scenario changed since it ran; not carried")
 
 
 def carry_over(old_out: Path, new_out: Path, name: str, new_quote_id: str) -> int:

@@ -192,6 +192,9 @@ def parser() -> argparse.ArgumentParser:
                 default=None,
                 help="old out dir: carry finished records over, prepare only the rest",
             )
+            p.add_argument(
+                "--release-tag", default=None, help="with --resume-from: the release to run on"
+            )
         _quote_args(p, stop_required=name in {"run", "judge", "bundle", "ingest"})
         p.add_argument("--approved-quote", required=True)
         if name == "run":

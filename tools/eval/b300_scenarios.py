@@ -370,6 +370,11 @@ def build_c(cls: str, fact: Fact, lang: str, index: int) -> Scenario:
             Seed(
                 "near2", "fact", _fmt(lang, "earlier_record", m=t.memory_x), "user_stated", 0.9, 18
             ),
+            # 第三条仍然有效、也提到 X 的(审查第五轮 M2):PR A 的 D1 让作废的 X 不进候选之后,
+            # 还剩三条有效的相近记忆,够整理凑成簇;只有两条的话改后永远凑不成、C5 ① 什么都量不到。
+            Seed(
+                "near3", "fact", _fmt(lang, "earlier_check", m=t.memory_x), "user_stated", 0.9, 17
+            ),
         )
         conversations = (Turn(t.ask),)
     else:

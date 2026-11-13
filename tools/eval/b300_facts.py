@@ -434,6 +434,7 @@ TEMPLATES: dict[str, dict[str, str]] = {
         "unrelated_pref": "用户喜欢简短的回答。",
         "earlier": "用户早先说过:{m}",
         "earlier_record": "用户早先的记录:{m}",
+        "earlier_check": "用户之前核对时也提到过:{m}",
     },
     "en": {
         "ack": "Got it, noted.",
@@ -473,6 +474,7 @@ TEMPLATES: dict[str, dict[str, str]] = {
         "unrelated_pref": "The user prefers short answers.",
         "earlier": "Earlier, the user said: {m}",
         "earlier_record": "An earlier record: {m}",
+        "earlier_check": "When checking earlier, the user also mentioned: {m}",
     },
 }
 #: §8.3 B1 的事故原样:英文、置信度 0.8、来源空、不带出处的陈述。

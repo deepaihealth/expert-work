@@ -35,6 +35,7 @@ from b300_phases import (  # noqa: E402
     build_units,
     bundle_source,
     carry_over,
+    check_carry,
     earliest_start,
     inpod_rows,
     latest,
@@ -43,11 +44,13 @@ from b300_phases import (  # noqa: E402
     progress,
     read_jsonl,
     recalled_payload,
+    release_meta,
     remaining_units,
     save_units,
     seed_payload,
     user_name,
     users_payload,
+    write_meta,
     writeback_usage_payload,
 )
 
@@ -168,7 +171,15 @@ def _resume(
             f"{args.resume_from} moved on since the progress used by this quote "
             f"({now['digest']} != {q['progress_digest']}); write the progress again and re-quote"
         )
+    release = args.release_tag if phase.kind != "extraction" else None
+    if phase.kind != "extraction" and not release:
+        raise EvalError(
+            "--resume-from needs --release-tag: the release the remaining runs will hit"
+        )
+    check_carry(args.resume_from, phase.name, q, release)
     carried = carry_over(args.resume_from, args.out, phase.name, q["quote_id"])
+    # 新目录记下这次的版本;之后 ``run`` 的版本对不上就拒(``write_meta``)
+    write_meta(args.out, phase, {**release_meta(phase, release), "user_said": None})
     units = remaining_units(phase, q, now["done"])
     expected = q["remaining_units_by_phase"].get(phase.name)
     if expected is not None and expected != len(units):
