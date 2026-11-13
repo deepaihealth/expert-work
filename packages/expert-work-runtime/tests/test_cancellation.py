@@ -170,3 +170,25 @@ async def test_run_cancellable_propagates_inner_exception() -> None:
 def test_cancellation_token_key_is_stable() -> None:
     """The config key is part of the node ↔ worker contract."""
     assert CANCELLATION_TOKEN_KEY == "cancellation_token"
+
+
+@pytest.mark.asyncio
+async def test_run_cancellable_cancels_the_inner_call_when_the_caller_is_cancelled() -> None:
+    """B-300 review L3 —— 外层任务被取消(例如并发的另一件事先失败、TaskGroup 收摊)时,里面那次
+    调用也要跟着取消,不能留一个没人等的 LLM / 工具调用在后台跑完。"""
+    token = CancellationToken()
+    inner_cancelled = asyncio.Event()
+
+    async def slow() -> bool:
+        try:
+            return await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            inner_cancelled.set()
+            raise
+
+    outer = asyncio.ensure_future(token.run_cancellable(slow()))
+    await asyncio.sleep(0.01)
+    outer.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        _ = await outer
+    assert inner_cancelled.is_set()

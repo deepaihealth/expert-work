@@ -26,10 +26,11 @@ from expert_work.common.conversation_channel import SUPERSEDED_BY, is_hidden
 from expert_work.common.lifecycle import Lifecycle
 from expert_work.common.message_stamp import STAMP_RUN_ID, stamp_message
 from expert_work.common.supersede import mark_superseded
+from expert_work.common.user_input import is_draft_turn, mark_draft_turn
 from expert_work.persistence.audit_log import InMemoryAuditLogStore
 from expert_work.protocol import AgentSpec
 from expert_work.runtime.runs import InMemoryRunStore
-from orchestrator import LLM_CACHE_BYPASS_KEY, MEMORY_WRITEBACK_INLINE_KEY
+from orchestrator import LLM_CACHE_BYPASS_KEY, LONG_TERM_MEMORY_WRITE_OFF_KEY
 from tests.agent_fixtures import stub_agent_runtime
 from tests.auth_fixtures import TEST_AUDIENCE, TEST_ISSUER, build_test_jwt_verifier
 
@@ -313,23 +314,31 @@ async def test_stream_regenerate_bypasses_the_response_cache_and_edit_does_not(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("use_draft", [True, False])
-async def test_a_draft_trial_run_keeps_memory_writeback_inline(
+async def test_a_draft_trial_run_does_not_write_long_term_memory(
     monkeypatch: pytest.MonkeyPatch, spawn_ctx: _SpawnCtx, use_draft: bool
 ) -> None:
-    """B-168 —— 后台写回由 worker 按 (name, version) 取**线上**配置执行;草稿试跑的记忆
-    设置可能与线上不同,所以草稿 run 一律在本轮内写(run 带 ``MEMORY_WRITEBACK_INLINE_KEY``)。"""
+    """B-300 D7 —— 草稿试跑(``use_draft``)不写长期记忆:它写的会进与线上同一个记忆库,发布后的
+    同名智能体、这位用户的其它智能体都会召回。run 带 ``LONG_TERM_MEMORY_WRITE_OFF_KEY``;
+    已发布版本的 run 不带(照常写)。"""
     captured: dict[str, Any] = {}
 
     async def fake_run_agent(**kwargs: Any) -> None:
         captured["configurable"] = kwargs["config"]["configurable"]
+        captured["messages"] = kwargs["graph_input"]["messages"]
 
     monkeypatch.setattr(runs_mod, "run_agent", fake_run_agent)
     await spawn_ctx.spawn(mode="stream", supersede=None, use_draft=use_draft)
     await asyncio.sleep(0)
 
-    assert captured["configurable"].get(MEMORY_WRITEBACK_INLINE_KEY) is (
+    assert captured["configurable"].get(LONG_TERM_MEMORY_WRITE_OFF_KEY) is (
         True if use_draft else None
     )
+    # B-300 review M1 —— 草稿这一轮的用户消息上落一个服务端标记:之后任何一次写回(审批续跑、
+    # 孤儿接管、同一对话里后面的线上轮)重抽整段对话时都整轮跳过它。线上轮不带。
+    [typed] = [m for m in captured["messages"] if isinstance(m, HumanMessage) and not is_hidden(m)]
+    assert is_draft_turn(typed) is use_draft
+    # 本轮内写回的标记连同它的唯一设置方一起删了。
+    assert "memory_writeback_inline" not in captured["configurable"]
 
 
 @pytest.mark.asyncio
@@ -387,3 +396,14 @@ async def test_regenerate_carries_the_inputs_block_through_both_spawn_modes(
     assert [type(m).__name__ for m in back] == ["SystemMessage", "HumanMessage", "HumanMessage"]
     assert is_inputs_block(back[2]) and is_hidden(back[2])
     assert back[2].additional_kwargs == old_block.additional_kwargs
+
+
+def test_replay_drops_the_draft_turn_mark() -> None:
+    """B-300 review M1 —— 重新生成时草稿标记不随原件搬过去:这一轮是不是草稿由这次请求定
+    (``_start_run`` 按 ``use_draft`` 再盖)。"""
+    system = SystemMessage(content="sys", id="sys-old")
+    human = mark_draft_turn(HumanMessage(content="U", id="h-old"))
+    assert is_draft_turn(human)
+    out = replay_graph_input(_built(), [system, human], run_id=uuid4())
+    _sys_out, human_out = out["messages"]
+    assert not is_draft_turn(human_out)

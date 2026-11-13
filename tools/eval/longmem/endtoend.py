@@ -29,13 +29,14 @@ from __future__ import annotations
 import asyncio
 import inspect
 import logging
+import re
 from collections import defaultdict
 from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from typing import Any, Literal
 
-from langchain_core.messages import HumanMessage, SystemMessage
+from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage
 
 from expert_work.common.search.mmr import mmr_select
 from expert_work.persistence import InMemoryMemoryStore
@@ -127,20 +128,56 @@ def user_text_kwargs(
     return {}
 
 
-def _session_transcripts(docs: Sequence[MemoryDoc]) -> list[tuple[datetime | None, str]]:
-    """Group docs back into per-session transcripts, oldest first.
+class NothingIngestedError(RuntimeError):
+    """一整段语料一条记忆都没写进去 —— 入口没提炼、或模型全回空。
 
-    One human message per session keeps the extraction call count at
-    one per session and lets the date header sit next to its turns.
-    """
+    这时去打分只会得到一个看着正常的低分。"""
+
+
+#: LongMemEval 的两种角色(行首);LoCoMo 的说话人是人名,两人都是「用户」。
+_ROLE_LINE = re.compile(r"^(user|assistant): ", re.MULTILINE)
+
+
+def _session_docs(docs: Sequence[MemoryDoc]) -> list[tuple[datetime | None, list[MemoryDoc]]]:
+    """Group docs back into sessions, oldest first."""
     by_session: dict[str, list[MemoryDoc]] = defaultdict(list)
     for doc in docs:
         by_session[doc.session_id].append(doc)
-    sessions = [
-        (rows[0].timestamp, "\n".join(d.content for d in rows)) for rows in by_session.values()
-    ]
+    sessions = [(rows[0].timestamp, rows) for rows in by_session.values()]
     sessions.sort(key=lambda pair: (pair[0] is not None, pair[0] or datetime.min))
     return sessions
+
+
+def _session_messages(rows: Sequence[MemoryDoc], timestamp: datetime | None) -> list[BaseMessage]:
+    """B-300 PR 1 —— 一段会话拆成生产的消息形状:日期抬头一条用户消息,用户的每一轮一条
+    HumanMessage,助手的每一轮一条 AIMessage。
+
+    之前整段会话塞进一条用户消息,PR 1 之后第一次提炼(只看用户的话)会把助手的回答也当成用户说的;
+    不声明又一条都提炼不出来。LongMemEval 的 ``user:`` / ``assistant:`` 行首切开(session 粒度的
+    整段 doc 同样按行首切,续行归上一轮);LoCoMo 两个说话人都是人,带着名字整条当用户的话。
+    """
+    header = (
+        f"[Conversation session dated {timestamp:%Y-%m-%d %H:%M}]"
+        if timestamp is not None
+        else "[Conversation session]"
+    )
+    out: list[BaseMessage] = [HumanMessage(content=header)]
+    for doc in rows:
+        starts = list(_ROLE_LINE.finditer(doc.content))
+        if not starts:
+            out.append(HumanMessage(content=doc.content))
+            continue
+        for index, match in enumerate(starts):
+            end = starts[index + 1].start() if index + 1 < len(starts) else len(doc.content)
+            text = doc.content[match.end() : end].rstrip("\n")
+            if not text:
+                continue
+            out.append(
+                AIMessage(content=text)
+                if match.group(1) == "assistant"
+                else HumanMessage(content=text)
+            )
+    return out
 
 
 async def _ingest_corpus(
@@ -160,19 +197,18 @@ async def _ingest_corpus(
     under the shared semaphore. Note: with ``reconcile=True`` concurrent
     sessions reconcile against a moving store — same best-effort
     semantics as production runs landing memories while others write.
+
+    B-300 PR 1 —— 每段会话按角色拆开(:func:`_session_messages`),用户的那几条经显式参数声明为用户
+    文字。一整段语料一条都没写进去时抛 :class:`NothingIngestedError`,不悄悄去打分。
     """
     from orchestrator.graph_builder.memory import flush_messages_to_memory
 
-    async def _one(timestamp: datetime | None, transcript: str) -> int:
-        header = (
-            f"[Conversation session dated {timestamp:%Y-%m-%d %H:%M}]"
-            if timestamp is not None
-            else "[Conversation session]"
-        )
-        session = HumanMessage(content=f"{header}\n{transcript}")
+    async def _one(timestamp: datetime | None, rows: list[MemoryDoc]) -> int:
+        session = _session_messages(rows, timestamp)
+        typed = [m for m in session if isinstance(m, HumanMessage)]
         async with sem:
             return await flush_messages_to_memory(
-                [session],
+                session,
                 memory_store=store,
                 embedder=embedder,  # type: ignore[arg-type]
                 llm_caller=llm_caller,
@@ -182,13 +218,17 @@ async def _ingest_corpus(
                 token=token,
                 log_label="longmem.ingest",
                 reconcile=reconcile,
-                **user_text_kwargs(flush_messages_to_memory, [session], required=expect_user_text),
+                **user_text_kwargs(flush_messages_to_memory, typed, required=expect_user_text),
             )
 
-    counts = await asyncio.gather(
-        *[_one(ts, transcript) for ts, transcript in _session_transcripts(docs)]
-    )
-    return sum(counts)
+    counts = await asyncio.gather(*[_one(ts, rows) for ts, rows in _session_docs(docs)])
+    written = sum(counts)
+    if docs and written == 0:
+        raise NothingIngestedError(
+            f"{len(docs)} doc(s) in {len(counts)} session(s) produced no memory: the extraction "
+            "entry made no call or every reply was empty — refusing to score an empty store"
+        )
+    return written
 
 
 async def _answer(

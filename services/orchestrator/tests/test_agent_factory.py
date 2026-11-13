@@ -37,6 +37,7 @@ from orchestrator.agent_factory import (
     _build_provider,
     _chat_stream_deadline_s,
     _compression_model,
+    make_memory_recall_node,
     memory_model,
 )
 from orchestrator.context import ToolResultPruner
@@ -1257,6 +1258,36 @@ async def test_build_agent_wires_memory_nodes_to_the_memory_router(monkeypatch: 
     caller = captured["llm_caller"]
     assert [p.key for p in caller.inner.providers] == ["glm:glm-5.3-flash", "glm:glm-5.3"]
     assert caller.meter.default == ("glm", "glm-5.3-flash")
+
+
+@pytest.mark.asyncio
+async def test_recall_node_gets_the_injection_budget_and_estimator(monkeypatch: Any) -> None:
+    """B-300 D5 前半 —— 召回节点拿到与注入同一套预算参数和同一个 token 估算器,
+    才能只给真正进提示词的那几条加频次分。"""
+    captured: dict[str, Any] = {}
+    real = make_memory_recall_node
+
+    def _spy(**kwargs: Any) -> Any:
+        captured.update(kwargs)
+        return real(**kwargs)
+
+    sentinel_estimator = object()
+    monkeypatch.setattr("orchestrator.agent_factory.make_memory_recall_node", _spy)
+    monkeypatch.setattr("orchestrator.agent_factory.default_estimator", lambda: sentinel_estimator)
+    doc = deepcopy(_MINIMAL_SPEC)
+    doc["spec"]["memory"] = {
+        "long_term": {"injection_token_budget": 1234, "correction_token_budget": 56}
+    }
+    async with make_checkpointer("memory") as cp:
+        await _build(
+            AgentSpec.model_validate(doc),
+            secret_store=_secret_store(),
+            checkpointer=cp,
+            memory_env=_memory_env(),
+        )
+    assert captured["injection_token_budget"] == 1234
+    assert captured["correction_token_budget"] == 56
+    assert captured["estimator"] is sentinel_estimator
 
 
 @pytest.mark.asyncio

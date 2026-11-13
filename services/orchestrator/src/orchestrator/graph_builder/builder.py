@@ -133,6 +133,13 @@ from orchestrator.context import (
     WorkspaceProjector,
     safe_thread_projection_prefix,
 )
+from orchestrator.context.memory_render import (
+    MEMORY_BLOCK_HEADING,
+    MEMORY_LINE_LEGEND,
+    MEMORY_REMINDER,
+    memory_line,
+    select_memory_lines,
+)
 from orchestrator.context.system_prompt_view import keep_latest_system_prompt
 from orchestrator.graph_builder._approval import (
     ApprovalTarget,
@@ -2947,40 +2954,6 @@ def _inject_plan(messages: list[BaseMessage], plan: Plan) -> list[BaseMessage]:
     return _append_tail_human_message(messages, rendered)
 
 
-#: RT-2 PR-2 (RT-ADR-10) — visible marker appended when a memory item is cut
-#: at the injection budget boundary, so the model (and a transcript reader)
-#: can see the item is incomplete rather than mistaking the cut for the end.
-_MEMORY_TRUNCATION_MARKER = " [... truncated: memory injection token budget]"
-
-
-def _truncate_to_tokens(
-    text: str,
-    max_tokens: int,
-    count: Callable[[str], int],
-    marker: str = _MEMORY_TRUNCATION_MARKER,
-) -> str:
-    """RT-2 PR-2 — cut ``text`` down to roughly ``max_tokens`` per ``count``.
-
-    Proportional shrink with a bounded refinement loop: the estimator is
-    a heuristic (tiktoken or chars//4), so exact-token precision is not
-    the contract — the budget is approximate by design, and the marker's
-    own few tokens ride on top. B-236 —— ``marker`` lets the agent-notes block
-    name the file to read for the rest.
-    """
-    keep = len(text)
-    for _ in range(6):
-        tokens = count(text[:keep])
-        if tokens <= max_tokens:
-            break
-        # Proportional shrink; the min() guarantees progress even when
-        # the estimate barely moves between iterations.
-        keep = min(keep - 1, keep * max_tokens // max(tokens, 1))
-        if keep <= 0:
-            keep = 0
-            break
-    return text[:keep] + marker
-
-
 def _render_memory_lines(
     memories: Sequence[MemoryItem],
     *,
@@ -2988,73 +2961,26 @@ def _render_memory_lines(
     correction_token_budget: int,
     count: Callable[[str], int],
 ) -> list[str]:
-    """RT-2 PR-2 (RT-ADR-10) — pick the memory item lines that fit the
-    injection token budget.
-
-    Items are considered in their existing order (already rerank/MMR
-    ranked upstream) and rendered in that same order — the budget
-    changes SELECTION, never ordering, so the default path (top_k=5
-    ordinary memories, far under budget) renders byte-identical to the
-    pre-budget logic.
-
-    Two greedy passes (deer-flow guaranteed_categories shape):
-
-    1. correction pass — user-corrected items (``confidence >= 1.0``:
-       the M-4 correction API's EXCLUSIVE sentinel — the extraction
-       write path caps LLM-scored confidence at 0.99
-       (``memory._MAX_EXTRACTED_CONFIDENCE``) and ``MemoryItem.kind``
-       has no correction value) get first claim on up to
-       ``correction_token_budget`` tokens, so ordinary memories can
-       never squeeze a user's explicit correction out of the block.
-       Precise shape of the guarantee: within the reserve, corrections
-       are packed greedily in rank order; one that overflows the
-       REMAINING reserve is skipped — later, smaller corrections still
-       get their guarantee — and falls through to the general pass,
-       where with room left it can still land whole (the reserve is a
-       floor, not a cap);
-    2. general pass — every still-unselected item fills the rest of
-       ``token_budget``: an item that fits is taken whole, the first
-       item that does not fit is truncated to the remaining budget
-       (visible marker) and the pass stops — later items are dropped.
-
-    Truncated / dropped items are counted on
-    ``expert_work_memory_injection_truncated_total{outcome}``.
+    """RT-2 PR-2 (RT-ADR-10) — the memory item lines that fit the injection
+    token budget, in rank order. The selection itself is
+    :func:`~orchestrator.context.memory_render.select_memory_lines` (B-300 D5:
+    the recall node calls the same function once per run to bump only what is
+    injected); this wrapper counts truncated / dropped items on
+    ``expert_work_memory_injection_truncated_total{outcome}`` each step.
     """
-    lines = [f"- ({item.kind}) {item.content}" for item in memories]
-    costs = [count(line) for line in lines]
-    selected: dict[int, str] = {}
-
-    def _greedy(indices: Sequence[int], budget: int, *, truncate_boundary: bool) -> int:
-        spent = 0
-        for idx in indices:
-            room = budget - spent
-            if room <= 0:
-                break
-            if costs[idx] <= room:
-                selected[idx] = lines[idx]
-                spent += costs[idx]
-            elif truncate_boundary:
-                selected[idx] = _truncate_to_tokens(lines[idx], room, count)
-                _memory_injection_truncated_total.labels(outcome="truncated").inc()
-                spent = budget
-                break
-            # else: guarantee pass — the item overflows the remaining
-            # reserve; skip it (it falls through to the general pass) and
-            # keep going, so later, smaller corrections still get their
-            # guarantee (review MEDIUM-1).
-        return spent
-
-    corrections = [idx for idx, item in enumerate(memories) if item.confidence >= 1.0]
-    spent = _greedy(
-        corrections, min(correction_token_budget, token_budget), truncate_boundary=False
+    chosen = select_memory_lines(
+        memories,
+        token_budget=token_budget,
+        correction_token_budget=correction_token_budget,
+        count=count,
     )
-    rest = [idx for idx in range(len(memories)) if idx not in selected]
-    _greedy(rest, token_budget - spent, truncate_boundary=True)
-
-    dropped = len(memories) - len(selected)
+    truncated = sum(1 for idx, line in chosen if line != memory_line(memories[idx]))
+    if truncated:
+        _memory_injection_truncated_total.labels(outcome="truncated").inc(truncated)
+    dropped = len(memories) - len(chosen)
     if dropped:
         _memory_injection_truncated_total.labels(outcome="dropped").inc(dropped)
-    return [selected[idx] for idx in sorted(selected)]
+    return [line for _idx, line in chosen]
 
 
 def _inject_memories(
@@ -3109,7 +3035,8 @@ def _inject_memories(
     )
     if spotlight_nonce:
         items = spotlight_untrusted(items, nonce=spotlight_nonce)
-    body = "## Relevant memories from past sessions\n" + items
+    # B-300 ③ —— 标题、说明行、提醒节在围栏外(平台写的,可信);条目在围栏内。
+    body = f"{MEMORY_BLOCK_HEADING}\n{MEMORY_LINE_LEGEND}\n{items}\n\n{MEMORY_REMINDER}"
 
     if mode == "per_turn":
         return _append_tail_human_message(messages, body)

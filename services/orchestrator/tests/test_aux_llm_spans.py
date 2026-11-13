@@ -41,6 +41,7 @@ from opentelemetry.sdk.trace.export.in_memory_span_exporter import (
 )
 
 from expert_work.common.observability import LLM_SPAN_PURPOSES, init_tracing
+from expert_work.common.user_input import user_input_kwargs
 from expert_work.persistence import InMemoryMemoryStore
 from expert_work.protocol import MemoryItem, StructuredOutputSpec
 from expert_work.protocol.multimodal import ImageRef
@@ -200,8 +201,22 @@ async def test_memory_extract_emits_named_span(exporter: InMemorySpanExporter) -
     node = make_memory_writeback_node(
         memory_store=store, embedder=FakeEmbedder(dim=_DIM), llm_caller=llm
     )
+    # B-300 —— 第一次提炼只读带白名单标记的用户输入。
+    state = {
+        "messages": [
+            SystemMessage(content="help"),
+            HumanMessage(
+                content="done",
+                additional_kwargs=user_input_kwargs(
+                    text="done", images=0, files=0, external_blocks=0
+                ),
+            ),
+        ],
+        "step_count": 0,
+        "max_steps": 5,
+    }
     await node(  # type: ignore[arg-type]
-        _agent_state("done"),
+        state,
         {"configurable": {"tenant_id": str(tenant), "user_id": str(user)}},
     )
     assert "expert_work.memory.extract" in _names(exporter)

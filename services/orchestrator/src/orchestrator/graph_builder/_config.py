@@ -47,10 +47,15 @@ FAILOVER_SINK_KEY = "llm_failover_event_sink"
 #: control-plane 的两个 regenerate 入口(``spawn_run`` / ``RunQueueWorker``)。
 LLM_CACHE_BYPASS_KEY = "llm_cache_bypass"
 
-#: B-168 —— 这一轮的长期记忆写回在本轮内做,不交给后台。后台 worker 按 (name, version)
-#: 取**线上**配置执行;草稿试跑(``use_draft``)的记忆设置可能与线上不同,所以 run 入口
-#: 给草稿 run 设它。设置方:control-plane ``spawn_run``。
-MEMORY_WRITEBACK_INLINE_KEY = "memory_writeback_inline"
+#: B-300 D7 —— 这一轮不写长期记忆(写回节点与压缩前抢存都直接返回;召回照常)。草稿试跑
+#: (``use_draft``)写的记忆会进与线上同一个记忆库,发布后的同名智能体与这位用户的其它智能体
+#: 都会召回,所以 run 入口给草稿 run 设它。设置方:control-plane ``spawn_run``。
+#: 委派出去的子运行由 ``_child_config`` 写的 ``child_run`` 走同一个判断
+#: (:func:`long_term_memory_writes_off`)。
+LONG_TERM_MEMORY_WRITE_OFF_KEY = "long_term_memory_write_off"
+
+#: ``_child_run._child_config`` 给委派出去的子运行写的标记。
+CHILD_RUN_KEY = "child_run"
 
 #: An async callable that ships one token frame ``{step, channel, text}`` to the
 #: SSE bridge.
@@ -72,6 +77,14 @@ def configurable_uuid(config: RunnableConfig, key: str) -> UUID | None:
         except ValueError:
             return None
     return None
+
+
+def long_term_memory_writes_off(config: RunnableConfig) -> bool:
+    """这个 run 不写长期记忆:委派出去的子运行(B-300「子智能体不写」),或草稿试跑(D7)。
+
+    一个函数,两种来源;写回节点与压缩前抢存都只问它。"""
+    configurable = config.get("configurable") or {}
+    return bool(configurable.get(CHILD_RUN_KEY) or configurable.get(LONG_TERM_MEMORY_WRITE_OFF_KEY))
 
 
 def current_run_id(config: RunnableConfig) -> str | None:

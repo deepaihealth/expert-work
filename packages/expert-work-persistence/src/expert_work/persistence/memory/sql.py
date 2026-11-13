@@ -192,11 +192,18 @@ class SqlMemoryStore(MemoryStore):
             }
             for item in items
         ]
-        stmt = pg_insert(MemoryItemRow).values(payload).on_conflict_do_nothing()
+        stmt = (
+            pg_insert(MemoryItemRow)
+            .values(payload)
+            .on_conflict_do_nothing()
+            # B-300 D12 — RETURNING only yields the rows that were inserted, so
+            # a dedup no-op is not counted as written.
+            .returning(MemoryItemRow.id)
+        )
         async with self._sf() as session:
-            await session.execute(stmt)
+            landed = (await session.execute(stmt)).scalars().all()
             await session.commit()
-        return result
+        return MemoryWriteResult(blocked=result.blocked, written=len(landed))
 
     async def retrieve(
         self,

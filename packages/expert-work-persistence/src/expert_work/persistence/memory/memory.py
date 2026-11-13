@@ -123,6 +123,7 @@ class InMemoryMemoryStore(MemoryStore):
         # null valid_at). Computed once, outside the loop, so a multi-item
         # batch backfills to the same instant rather than drifting per row.
         now = datetime.now(UTC)
+        written = 0
         for item in items:
             # Stream K.K7 — fill content_hash if the caller didn't, and
             # skip the row when an identical live entry already exists
@@ -151,7 +152,8 @@ class InMemoryMemoryStore(MemoryStore):
                     }
                 )
             )
-        return MemoryWriteResult(blocked=tuple(blocked))
+            written += 1
+        return MemoryWriteResult(blocked=tuple(blocked), written=written)
 
     async def retrieve(
         self,
