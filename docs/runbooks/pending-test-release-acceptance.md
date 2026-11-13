@@ -2599,3 +2599,41 @@ PY
 - [x] **115.6 收尾**:删除 `acc-b301-orient` 知识库(连同三份文档)。 **11-12 测试 `69b15c916` 过**:知识库、文档、切块、解析缓存均 0 行,115.5 查询回到 0。
 
 **生产**:没有单独的验收步骤(生产知识库目前没有 PDF)。发布后读一次生产 control-plane pod 的 `/metrics`:有 `expert_work_knowledge_page_orientation_failures_total` 且为 0 之前不用管;以后出现 `{rotation="90"|"180"|"270"}` 的增长,按设计 §7.6 第 4 项做 D6 确认率(测试环境只读抽样,生产由用户跑同一脚本)。
+
+## §116 `region="auto"` 接缝自己重看一次(B-301 PR 3,没有开关)
+
+**背景**:设计 `docs/superpowers/specs/2026-11-11-b301-image-orientation-design.md` §4.2、§4.3、§10。`ask_image` 的 `region="auto"` 有横条报 `partial`(值被条的边切开)时,今天退回整张读并写「Re-ask with an explicit region …, or say the value is uncertain」,让主模型自己再问一次。现在工具自己把**报 `partial` 那几条的并集框**(只有一条报 `partial` 时沿切的方向两头各放宽半条 —— 否则裁出来的还是被切开的那几个像素)从横条用的**同一张画面**上、**按横条的分辨率**(宿主裁图上限 300 万像素而不是一般局部的 150 万;文档页按横条的 dpi)裁出来(PR 1 转过的图就从 `r<角度>/` 裁),用原问题加横条同样的 JSON 要求**快看一次**,然后:一致 → 仍给整张读,「small print may be unreliable」原样保留,「Re-ask …」换成 `The seam between bands was looked at again (region=[…]) and read "<值>", which also appears in the whole-image reading above; two looks agreeing does not make it certain, so say the value is uncertain.`(**读到的值总是写出来**);不一致 → `Two looks at this value disagree: the whole-image reading above / "<值>" … Neither is preferred; say the value is uncertain.`;重看什么都没读到 → `… and nothing was read there (…), so the two looks do not agree: say the value is uncertain.`。「一致」宁严勿松:读到的值里的数要与整张读回答**开头那几个数**逐个对上(比较符相同;两边都带单位时单位也相同),回答里紧接着的下一个数不能与它连成同一个值(`/` `:` `~` `-` `.` 或年月日时分),对上的那段后面也不能紧跟冒号(标签);带编号字母的整个值还要整体出现;只有文字的值要等于回答里按标点切开的某一整段、且后面不是冒号 —— `120/85` 对 `120/80`、`120` 对 `120/80`、`12` 对 `12:30`、`2026` 对 `2026-11-12`、`<5` 对 `5`、`68.1 lb` 对 `68.1 kg`、`6.1` 对「5.6 …(参考 3.9-6.1)」、`1` 对「Step 1: …」、`Zhang` 对「Name: Zhang San」、`HBsAg` 对「HBsAg: negative」都判不一致;`68.1 kg` 对「The reading is 68.1.」或「**68.1 kg**」一致(设计 §10 表下第 3 条)。重看失败 / 超时(30 秒,含排队等切块名额)/ run 剩的时间不到 60 秒(裁图之前、裁完各判一次)→ 工具结果与今天**逐字节相同**。横条之间冲突(没有 `partial`)、报 `partial` 的几条**不相邻**(例如 band 1 和 band 4:并集差不多是整张图,不是一条接缝)、整体类问题(计数 / 合计……)、整张读失败时不重看,输出与今天相同。重看之后记账出错与横条一样让这次工具调用失败。每次 `auto` 最多多 1 次调用。记两处:工具结果 meta 的 `seam_relook`(`outcome` ∈ `agree` / `disagree` / `no_reading` / `error` / `skipped_deadline`、`region`,看到回答时另有 `status` / `value` / `unit` / `raw`,失败时有 `error`;`vl_calls` 含这一次)与计数器 `expert_work_ask_image_seam_relook_total{outcome}`。**没有开关**:对所有看图模型生效,PR 1 的 `EXPERT_WORK_ASK_IMAGE_ORIENTATION` 也管不到它。
+
+**怎么进(只在测试环境)**:平台租户,调试台。临时智能体 `acc-b301-seam`:配置同 §114 的 `acc-b301-orient`(主模型不能看图,例如 glm-5.3;`vision` 块用测试环境在用的 `doubao-seed-2-1-pro-260628`;提示词「Use ask_image to look at images. Report exactly what it returns.」)。测试图本机用 Pillow 合成(零租户内容,不进仓库),在仓库根目录跑:
+
+```bash
+uv run python - <<'PY'
+from PIL import Image, ImageDraw, ImageFont
+# 3000x2000 = 600 万像素 >= 400 万(auto 门槛)-> ceil(6 / 1.5) = 4 条整宽横条(region_zoom.plan_bands),
+# 0-1000 尺度:band 1 = [0, 0, 1000, 275],band 2 = [0, 241, 1000, 517] -> 像素行 0..550 与 482..1034。
+# 大号数字的中心放在两条的重叠处(第 516 行),上下都伸出重叠区:两条都只看到半截。
+W, H = 3000, 2000
+big, small = ImageFont.load_default(size=300), ImageFont.load_default(size=28)
+def page(centre_y):
+    image = Image.new("RGB", (W, H), "white"); pen = ImageDraw.Draw(image)
+    for i in range(40):
+        pen.text((80, 40 + i * 48), f"Line {i + 1:02d}  reference row, no value here", fill=(90, 90, 90), font=small)
+    pen.text((1400, centre_y), "Weight", fill="black", font=small, anchor="lm")
+    pen.text((1700, centre_y), "47.3", fill="black", font=big, anchor="lm")
+    return image
+seam, plain = page(516), page(760)   # plain:数字整个落在 band 2 中间(482..1034 行),不碰接缝
+top, bottom = Image.eval(seam.crop((1650, 0, W, H)).convert("L"), lambda v: 255 - v).getbbox()[1::2]
+assert top < 482 < 550 < bottom, (top, bottom)   # 实测 416..631:band 1 的下边、band 2 的上边都切过它
+seam.save("seam.png"); plain.save("plain.png")
+seam.rotate(90, expand=True).save("seam-sideways.png")   # 逆时针转 90 度:要顺时针转 90 度才正(给 116.3)
+PY
+```
+
+看哪里:调试台轨迹里 `ask_image` 的结果与 meta;Langfuse 这一轮看图模型的 generation;control-plane pod 的 `/metrics`(发之前先读一次 `expert_work_ask_image_seam_relook_total` 做基数);需要时看 NAS 上这个 run 的 `.tool_results/<run>/crops/<图哈希>/`。每条都在**新会话**里做,问法统一为「用 ask_image 看图里 Weight 后面的数字是多少,region 用 'auto'」。**花费**:看图约 30 次(116.1 / 116.2 各 5~6 次、116.3 约 10 次,加一两次重试),doubao 每次约 1,500 输入 + 60 输出 token ≈ ¥0.011,约 ¥0.35;主模型几轮短对话。合计 **< ¥1**。
+
+- [ ] **116.1 接缝重看,多且只多 1 次调用**:上传 `seam.png`。判据:meta `auto="full_fallback"`、`auto_reason="partial"`;`bands` 里 band 1、band 2 的 `status="partial"`;`seam_relook.region` = 报 `partial` 那几条的并集(band 1、2 都报时是 `[0, 0, 1000, 517]`;只有一条报时是它沿上下各放宽半条,例如只有 band 2 时 `[0, 103, 1000, 655]`);`vl_calls=6`;Langfuse 里这次 `ask_image` 共 6 次看图调用(4 条横条 + 1 次整张 + 1 次接缝),接缝那次的图是 `crops/<哈希>/<region 四个数用 - 连>-b.jpg`(`-b` = 横条分辨率,与同一个框的显式 `region` 裁图分开),提问文字与横条的相同(原问题 + JSON 要求);NAS 上这张接缝裁图约 300 万像素(band 1、2 都报时 2950×1016;只有 band 2 报时 2855×1050),横条约 150 万(band 1 是 2860×524);`seam_relook_total` 在 `seam_relook.outcome` 那个标签上 +1。按 `outcome` 核措辞:`agree` → 结果里有 `small print may be unreliable` 和 `looked at again (region=[…]) and read "<值>", which also appears in the whole-image reading above`(`<值>` 与 meta `seam_relook.value`(连同 `unit`)一致),**没有** `Re-ask with an explicit region`,也没有 `look again with region=`;`disagree` → 有 `Two looks at this value disagree:` 和接缝读到的值,有 `Neither is preferred; say the value is uncertain.`;`no_reading` → 有 `nothing was read there`。三种都必须有 `say the value is uncertain`。**只看平台追加的那段**(整张读回答之后、以 `(region='auto':` 开头的括号,到 `Band readings:` 之前)里**不许**出现 reliable(除 unreliable 外)/ confirmed / same value —— 整张读的回答本身是看图模型的原话,不归平台管,出现这些词不算。**判据红的情形**:`auto_reason="partial"` 但 meta **没有** `seam_relook`(代码没生效);`vl_calls` 或 Langfuse 调用数不是 6;接缝那次裁的框与 `seam_relook.region` 不符,或接缝裁图不比横条大;`outcome="agree"` 而平台那段里没有写出读到的值、或还有 `Re-ask …`;平台那段里出现上面那几个禁用词。**不算红**:`auto_reason` 不是 `partial`(模型从某条横条读出了整个数、或没报 `partial`)—— 这是模型行为,把 meta 的 `bands` 原样记进 PR 评论,换新会话重试一次;还不触发就记「未触发」,代码路径由单元测试 `test_b301_seam_relook.py` 覆盖。`outcome` 是 `agree` / `disagree` / `no_reading` 哪一种都不算红(那是模型读得对不对),如实记下。
+- [ ] **116.2 没有横条报 `partial`:不多调用、输出不变**:上传 `plain.png`。判据:meta `auto="bands"`(band 2 读到 47.3)、**没有** `seam_relook`、`vl_calls=5`;Langfuse 5 次看图调用;`seam_relook_total` 各标签都不变;结果是 `47.3` 加 `(region='auto', read in bands: …)` 那一句(与改动前同一个格式)。**判据红的情形**:出现 `seam_relook` 或第 6 次调用。`auto` 不是 `bands`(例如横条冲突 / 也报了 `partial`)算模型行为:记下 `bands`,只核「没有 `partial` 就没有 `seam_relook`」这一条。
+- [ ] **116.3 转过的图:接缝从转正后的画面上裁(与 PR 1 一起)**:上传 `seam-sideways.png`。判据:meta `orientation.conclusion="rotated"`、`degrees=90`;`auto_pixels=6000000`,横条按转正后的 3000×2000 规划(`bands` 是 4 条整宽横条,框同 116.1);`seam_relook.region` 与 116.1 同规则;Langfuse 里接缝那次的图在 `crops/<哈希>/r90/` 下,NAS 上这张裁图里 `47.3` 是正的、整个在图里;`vl_calls=6`(问方向的 4 次记在 `orientation.extra_calls`,不在 `vl_calls` 里)。**判据红的情形**:接缝裁图不在 `r90/` 下,或裁出来的是横着的画面。`orientation` 结论不是 `rotated` 算模型判方向的事(§114),这一条记「未触发」;`auto_reason` 不是 `partial` 同 116.1 处理。
+- [ ] **116.4 收尾**:删 `acc-b301-seam` 及其会话;本机删掉三张合成图。
+
+**生产**:**没有开关** —— 合进 main 之后,任何一次从 main 打的生产发布都会带上它,对所有看图模型生效;PR 1 的运维紧急开关 `EXPERT_WORK_ASK_IMAGE_ORIENTATION` 管不到它,回退只能回滚镜像。**用户 11-12 已定 B-301 PR 1 与 PR 4 先不上生产**;本 PR 不跟着那个决定走:若下一次生产发布从 main 打包,PR 3 会一起上去,发布前要明确知情(要么接受,要么在发布分支上把它 revert 掉)。它在生产上只在 `region="auto"` 有相邻的横条报 `partial` 时多 1 次快看(豆包单图 token 有上限,每次约 ¥0.01;按像素计 token 的看图模型因为接缝裁图约 300 万像素,约是一条横条的 2 倍),措辞只比今天更保守;重看失败 / 超时 / 时间不够时输出与今天逐字节相同。上去之后读一次 `/metrics`,有 `expert_work_ask_image_seam_relook_total` 即说明已装上;看 `{outcome="error"}` 与 `{outcome="skipped_deadline"}` 的占比,前者长期偏高要查看图模型的超时。

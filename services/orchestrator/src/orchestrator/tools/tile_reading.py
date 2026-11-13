@@ -553,8 +553,13 @@ def _box_text(box: Box) -> str:
     return f"[{box[0]}, {box[1]}, {box[2]}, {box[3]}]"
 
 
-def aggregate_tiles(results: Sequence[TileResult]) -> AutoVerdict:
-    """各块的回答 → 单值 / 冲突 / 全无(spec §1)。失败的、读不懂的块各说一句,从不算作值。"""
+def aggregate_tiles(
+    results: Sequence[TileResult], *, seam_looked_at: Box | None = None
+) -> AutoVerdict:
+    """各块的回答 → 单值 / 冲突 / 全无(spec §1)。失败的、读不懂的块各说一句,从不算作值。
+
+    B-301 PR 3 —— ``seam_looked_at``:工具已经把接缝(这个框)再看过一次,「look again with
+    region=…」那半句换成「已重看过」;别的一字不改。"""
     found = [r for r in results if r.reply is not None and r.reply.status == "found"]
     partial = [r for r in results if r.reply is not None and r.reply.status == "partial"]
     not_found = [r for r in results if r.reply is not None and r.reply.status == "not_found"]
@@ -573,8 +578,12 @@ def aggregate_tiles(results: Sequence[TileResult]) -> AutoVerdict:
             names = ", ".join(r.tile.label for r in partial)
             content += (
                 f" {names} saw it cut off at their edge, so it probably sits on a seam "
-                f"between bands: look again with region={_box_text(union)}."
+                "between bands"
             )
+            if seam_looked_at is None:
+                content += f": look again with region={_box_text(union)}."
+            else:
+                content += f"; it was looked at again (region={_box_text(seam_looked_at)}), above."
     elif len(groups) == 1:
         outcome = "single"
         content = _single_text(groups[0], len(not_found), len(partial))

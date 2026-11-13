@@ -210,9 +210,13 @@ def is_rendered_figure_rel(rel: str) -> bool:
 #:
 #: B-301 —— 图片转正后再顺时针转过的局部(含整张的候选副本)放在 ``<src-sha>/r<角度>/`` 下
 #: (``r90`` / ``r180`` / ``r270``):同一个框转不同角度是不同的图,不许互相复用;0 度沿用原位置。
+#:
+#: B-301 PR 3 —— 按横条分辨率(约 300 万像素,而不是一般局部的约 150 万)裁的图片局部,文件名
+#: 在框后面多一个 ``-b``:同一个框两种分辨率是两张图,不许互相复用(文档页的局部靠 ``-d<dpi>``)。
 RENDERED_CROP_DIR = "crops"
 _BOX_PATTERN = "[0-9]{1,4}-[0-9]{1,4}-[0-9]{1,4}-[0-9]{1,4}"
 _ROTATED_CROP_DIR_PATTERN = "(?:r(?:90|180|270)/)?"
+_BAND_CROP_SUFFIX = "-b"
 _RENDERED_CROP_RE = re.compile(
     "^"
     + re.escape(WORKSPACE_OVERFLOW_DIR)
@@ -233,14 +237,19 @@ _RENDERED_CROP_RE = re.compile(
     + "-d[1-9][0-9]{0,3}|"
     + _ROTATED_CROP_DIR_PATTERN
     + _BOX_PATTERN
+    + "(?:"
+    + re.escape(_BAND_CROP_SUFFIX)
+    + ")?"
     + r")\.jpg\Z"
 )
 
 
-def region_crop_stem(box: tuple[int, int, int, int]) -> str:
+def region_crop_stem(box: tuple[int, int, int, int], *, band: bool = False) -> str:
     """框在裁图文件名里的写法 ``<x1>-<y1>-<x2>-<y2>`` —— 写的人(``tools.region_zoom``)与
-    读的人(``multimodal.parse_rendered_figure_ref``)都经这里。"""
-    return "-".join(str(v) for v in box)
+    读的人(``multimodal.parse_rendered_figure_ref``)都经这里。``band=True``:按横条分辨率裁的
+    图片局部,后面加 ``-b``(见 :data:`RENDERED_CROP_DIR`)。"""
+    stem = "-".join(str(v) for v in box)
+    return stem + _BAND_CROP_SUFFIX if band else stem
 
 
 def is_rendered_crop_rel(rel: str) -> bool:
