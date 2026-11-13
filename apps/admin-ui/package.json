@@ -67,7 +67,7 @@
       "@babel/core": ">=7.29.6 <8",
       "react-router": ">=7.18.2 <8",
       "uuid": ">=11.1.1 <12",
-      "brace-expansion": ">=2.1.7 <3",
+      "minimatch": ">=11.0.1 <12",
       "fast-uri": ">=3.1.9 <4",
       "postcss": ">=8.5.23 <9",
       "browserslist": ">=4.28.7 <5",
