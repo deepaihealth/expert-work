@@ -403,7 +403,7 @@ async def test_write_consolidated_waits_for_a_correction_in_flight(
             assert not task.done()
             await conn.commit()
         with pytest.raises(ConsolidationSourcesChangedError):
-            await task
+            _ = await task
         assert await _row_states(engine, u) == [("transient", None)] * 3
     finally:
         await engine.dispose()
@@ -458,7 +458,7 @@ async def test_supersede_waits_for_a_fold_in_flight(sql_store: SqlStoreFixture) 
             assert not task.done()
             await conn.commit()
         with pytest.raises(SupersedeTargetChangedError):
-            await task
+            _ = await task
         listed = await store.list_for_user(tenant_id=t, user_id=u)
         assert new.id not in {m.id for m in listed}
     finally:
@@ -501,7 +501,7 @@ async def _high_is_free_while_call_waits_on_low(
             finally:
                 await probe.rollback()
         await holder.rollback()
-    await task
+    _ = await task
 
 
 @pytest.mark.asyncio
