@@ -111,9 +111,11 @@ class _ViewRuntime(RecordingSandboxRuntime):
         egress: EgressContext | None = None,
         conv_id: UUID | None = None,
         workspace_thread_id: UUID | None = None,
+        child_run: bool = False,
     ) -> SandboxOutcome:
         self.exec_views.append(conv_id)
         self.exec_thread_ids.append(workspace_thread_id)
+        self.exec_child_runs.append(child_run)
         agent = _agent_root(self.root)
         work = _work(self.root, conv_id) if conv_id is not None else agent
         for d in (agent, work):
@@ -493,7 +495,8 @@ async def test_children_and_grandchildren_share_the_root_conversation(tmp_path: 
 def test_children_of_a_legacy_conversation_stay_legacy() -> None:
     parent = _ctx(_C1, layout="agent_root")
     child = _build_tool_context(_child_config(parent, sub_thread_id=uuid4(), sub_run_id=uuid4()))
-    assert child.workspace_view == _LEGACY
+    # B-300 —— 视图同一个,只多了委派子代标记(threads/ 那一格与旧记忆投影对它不开)。
+    assert child.workspace_view == replace(_LEGACY, child_run=True)
 
 
 # ---------------------------------------------------------------------------

@@ -402,7 +402,13 @@ async def build_tool_registry(
         figure_delivery=figure_delivery,
         workers_view_pages=vision_gap,
     )
-    _register_subagents(registry, subagents, tool_env, subagent_depth)
+    _register_subagents(
+        registry,
+        subagents,
+        tool_env,
+        subagent_depth,
+        parent_has_long_term_memory=_has_long_term_memory(parent_spec),
+    )
     _register_spawn_worker(
         registry, tool_env, parent_spec, dynamic_workers, subagent_depth, vision_gap=vision_gap
     )
@@ -582,11 +588,20 @@ def _register_ask_image(
     )
 
 
+def _has_long_term_memory(spec: AgentSpec | None) -> bool:
+    """B-300 —— 这个智能体开了长期记忆(manifest 有 ``memory.long_term``,与召回节点同一个判据)。"""
+    if spec is None or spec.spec.memory is None:
+        return False
+    return spec.spec.memory.long_term is not None
+
+
 def _register_subagents(
     registry: ToolRegistry,
     subagents: Sequence[SubAgentSpec],
     env: ToolEnv,
     subagent_depth: int,
+    *,
+    parent_has_long_term_memory: bool = False,
 ) -> None:
     """Register one :class:`SubAgentTool` per declared sub-agent — Stream J.4.
 
@@ -618,6 +633,7 @@ def _register_subagents(
                 builder=env.child_agent_builder,
                 child_depth=child_depth,
                 trajectory_recorder=env.trajectory_recorder,
+                parent_has_long_term_memory=parent_has_long_term_memory,
             )
         )
 

@@ -345,6 +345,7 @@ def _register_routes(app: FastAPI) -> None:
             agent_root=body.agent_root,
             conv_id=body.conv_id,
             thread_id=body.thread_id,
+            child_run=body.child_run,
         )
         return ExecResponse(
             stdout=result.stdout,

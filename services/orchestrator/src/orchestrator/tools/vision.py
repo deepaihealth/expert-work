@@ -141,6 +141,7 @@ from orchestrator.tools.tile_reading import (
     tile_question,
 )
 from orchestrator.tools.workspace_paths import (
+    CONVERSATION_WORK_DIR,
     PLATFORM_DIRS,
     agent_relative,
     conversation_work_prefix,
@@ -1717,8 +1718,14 @@ def _refuse_other_conversation(rel: str, ctx: ToolContext) -> None:
     review —— 分段与读侧同一个算法(``PurePosixPath``;``rel`` 已由解析器保证是规范写法)。"""
     parts = PurePosixPath(rel).parts
     if len(parts) >= 4 and parts[0] == "agents" and parts[2] == "threads":
-        own = ctx.workspace_view.own_thread
-        if own is None or parts[3] != str(own):
+        view = ctx.workspace_view
+        own = view.own_thread
+        # B-300 —— 委派子代在那一格里只有对话视图的 ``work/``(与解析器、执行视图同一个口径):
+        # 主智能体的记忆投影与 ``PLAN.md`` 等状态文件就在那一格的其余位置。
+        child_ok = not view.child_run or (
+            view.per_conversation and parts[4:5] == (CONVERSATION_WORK_DIR,)
+        )
+        if own is None or parts[3] != str(own) or not child_ok:
             msg = "ask_image image_ref points into another conversation's directory"
             raise ToolBlockedError(msg)
 

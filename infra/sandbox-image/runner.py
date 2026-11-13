@@ -26,6 +26,10 @@ directory; ``thread_id`` is the conversation's own thread (the one
 ``threads/<id>/`` left visible — every other conversation's directory is
 covered in both views).
 
+``child_run`` (B-300) is optional too: ``true`` marks a delegated run, which
+does not get that ``threads/<id>/`` back (only its ``work/`` in the
+conversation view) and finds the agent-root ``MEMORY.md`` covered.
+
 The submitted code runs in a *child* ``python -c`` process rather than in
 this interpreter. A child is killable on timeout and isolates a crashing
 or ``sys.exit``-ing snippet from the runner loop; gVisor (Stream F.3) is
@@ -67,12 +71,13 @@ MAX_OUTPUT_CHARS = 1_000_000
 #: ``exec_view`` 的模块文档),所以镜像必须在这个绝对路径上有 python。B-242 —— 沙箱本地状态
 #: (``/tmp``、``$HOME``、``/var/tmp``、``/run/lock``、``/opt/agents/<key>``)也换成本对话自己
 #: 的那一份,``/dev/shm`` 每次一块新的,``/opt/skills`` 只留自己 key 那一格且只读,其余挂载一律
-#: 只读;``$4`` / ``$5`` 是代码文件名与 sha256,这里走 ``-c``,恒为空串。
+#: 只读;``$4`` / ``$5`` 是代码文件名与 sha256,这里走 ``-c``,恒为空串;``$6``(B-300)是
+#: 委派子代标记(``1`` / 空串)。
 _EXEC_VIEW_SCRIPT = """\
 set -eu
 ew_path="${PATH-}"
 PATH=/usr/sbin:/usr/bin:/sbin:/bin
-root="$1"; conv="$2"; own="$3"; code="$4"; sum="$5"; shift 5
+root="$1"; conv="$2"; own="$3"; code="$4"; sum="$5"; child="$6"; shift 6
 drop() {
   case "$code" in
     ""|*/*|.*) ;;
@@ -91,6 +96,10 @@ for id in "$conv" "$own"; do
 done
 case "$code" in
   */*|.*) echo "ew-exec-view: bad script name" >&2; exit 98 ;;
+esac
+case "$child" in
+  ""|1) ;;
+  *) echo "ew-exec-view: bad child flag" >&2; drop; exit 98 ;;
 esac
 if [ -n "$conv" ]; then
   own="$conv"
@@ -114,6 +123,8 @@ REMOUNT_BIND = 0x20 | 0x1000  # MS_REMOUNT | MS_BIND
 SEALED = RDONLY | NOSUID | NODEV | NOEXEC
 DIR = os.O_PATH | os.O_NOFOLLOW | os.O_DIRECTORY | os.O_CLOEXEC
 PLATFORM_DIRS = ("uploads", "inputs", ".tool_results")
+# What is remembered about the user, as older releases projected it at the agent root.
+MEMORY = "MEMORY.md"
 # Sandbox-local dirs every exec could write: each is replaced by a copy kept per conversation
 # (<dir>/.ew-conv/<conv>), or a fresh tmpfs when there is no conversation.
 KEPT = ("/tmp", "/home/agent", "/var/tmp", "/run/lock")
@@ -213,15 +224,33 @@ def need(fd, name, label):
         die(label + " is not a plain directory under the agent root")
 
 
-def hide_threads(view, own_dir, own):
+def hide_threads(view, keep, names):
+    # An empty tmpfs over view/threads; keep is bound back at threads/<names...>
+    # (nothing is put back when names is empty).
     cover = tmpfs((b"size", b"1k"), (b"mode", b"0500"))
-    slot = None
-    if own:
-        os.mkdir(own, 0o777, dir_fd=cover)
-        slot = sub(cover, own, False)
+    slot = cover
+    for name in names:
+        os.mkdir(name, 0o777, dir_fd=slot)
+        slot = sub(slot, name, False)
     attach(cover, sub(view, "threads", False))
-    if slot is not None:
-        bind(own_dir, slot)
+    if names:
+        bind(keep, slot)
+
+
+def hide_memory(view):
+    # A delegated run: the agent-root MEMORY.md (when it is a plain file) is
+    # covered by /dev/null, sealed, so opening it fails. Anything else is left
+    # alone without a word: stderr is the tool output of every exec, and a link
+    # there resolves inside this view, where the projection is covered.
+    try:
+        target = os.open(MEMORY, os.O_PATH | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=view)
+    except FileNotFoundError:
+        return
+    if not stat.S_ISREG(os.fstat(target).st_mode):
+        os.close(target)
+        return
+    null = os.open("/dev/null", os.O_PATH | os.O_CLOEXEC)
+    ro(attach(sc(OPEN_TREE, null, b"", CLONE), target), MEMORY, SEALED)
 
 
 def hide_platform(view):
@@ -237,7 +266,7 @@ def hide_platform(view):
         ro(attach(tmpfs((b"size", b"1k"), (b"mode", b"0500")), target), "/agent/" + d, SEALED)
 
 
-def nas_view(root, conv, own):
+def nas_view(root, conv, own, child):
     nas = os.open("/mnt/workspace", os.O_PATH | os.O_DIRECTORY | os.O_CLOEXEC)
     agent = os.open("/agent", DIR)
     workspace = os.open("/workspace", DIR)
@@ -254,14 +283,24 @@ def nas_view(root, conv, own):
     threads = need(top, "threads", root + "/threads")
     own_dir = need(threads, own, root + "/threads/" + own) if own else None
     work = need(own_dir, "work", root + "/threads/" + own + "/work") if conv else None
+    if child:
+        # A delegated run works in the parent conversation, whose folder holds the
+        # projection of what is remembered about the user: only work/ goes back.
+        keep, names = (work, (own, "work")) if conv else (None, ())
+    else:
+        keep, names = own_dir, ((own,) if own else ())
     view = bind(top, agent)
     if conv:
         ws = bind(work, workspace)
         hide_platform(view)
     else:
         ws = bind(top, workspace)
-        hide_threads(ws, own_dir, own)
-    hide_threads(view, own_dir, own)
+        hide_threads(ws, keep, names)
+    hide_threads(view, keep, names)
+    if child:
+        hide_memory(view)
+        if not conv:
+            hide_memory(ws)
     try:
         shared = sub(nas, "shared", False)
     except FileNotFoundError:
@@ -439,19 +478,19 @@ def freeze():
             os.close(fd)
 
 
-def main(root, conv, own, name, digest):
+def main(root, conv, own, name, digest, child):
     tmp = local("/tmp")
     data = take(tmp, name, digest) if name else None
-    nas_view(root, conv, own)
+    nas_view(root, conv, own, child == "1")
     local_view(tmp, root.rsplit("/", 1)[-1] if root else "", own, name, data)
     freeze()
 
 
 try:
-    main(sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5])
+    main(sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5], sys.argv[6])
 except OSError as e:
     die("mount failed: " + str(e))
-' "$root" "$conv" "$own" "$code" "$sum" || { rc=$?; drop; exit "$rc"; }
+' "$root" "$conv" "$own" "$code" "$sum" "$child" || { rc=$?; drop; exit "$rc"; }
 cd /workspace
 PATH="$ew_path"
 HOME=/home/agent
@@ -473,6 +512,7 @@ def _exec_argv(
     agent_root: str | None,
     conv_id: str | None = None,
     thread_id: str | None = None,
+    child_run: bool = False,
 ) -> list[str]:
     """The child process argv: the B-60 namespace wrapper around ``python -c code``.
 
@@ -484,10 +524,12 @@ def _exec_argv(
     finds this list literal by ``ast`` and pins it against the orchestrator's copy.
 
     B-236 —— the conversation and thread ids only travel with an agent root (no
-    agent, no conversation view); the script re-validates them.
+    agent, no conversation view); the script re-validates them. B-300 —— so does the
+    delegated-run flag (``$6``: ``1`` or empty).
     """
     conv = conv_id if agent_root and conv_id else ""
     thread = thread_id if agent_root and thread_id else ""
+    child = "1" if agent_root and child_run else ""
     return [
         "/usr/bin/unshare",
         "-Urmi",
@@ -504,6 +546,8 @@ def _exec_argv(
         # B-242 —— 代码文件名与 sha256:本地走 -c,不落文件。
         "",
         "",
+        # B-300 —— 委派子代标记。
+        child,
         # -E -P, deliberately NOT -I: -I implies -s, which kicks the user
         # site out of sys.path and silently breaks `pip install --user`
         # (the image's PIP_USER=1 flow). -E keeps PYTHON* env-config
@@ -523,6 +567,7 @@ def run_once(
     agent_root: str | None = None,
     conv_id: str | None = None,
     thread_id: str | None = None,
+    child_run: bool = False,
 ) -> Response:
     """Run ``code`` in a child Python process; capture stdout / stderr / exit.
 
@@ -547,7 +592,7 @@ def run_once(
     """
     timeout_s = max(1, min(timeout_s, MAX_TIMEOUT_S))
     child_env = {**os.environ, **envs} if envs else None
-    argv = _exec_argv(code, agent_root, conv_id, thread_id)
+    argv = _exec_argv(code, agent_root, conv_id, thread_id, child_run)
     try:
         proc = subprocess.run(  # noqa: S603 - arbitrary code execution is the tool
             argv,
@@ -593,7 +638,9 @@ def handle_request(request: dict[str, object]) -> Response:
     conv_id = raw_conv if isinstance(raw_conv, str) and raw_conv else None
     raw_thread = request.get("thread_id")
     thread_id = raw_thread if isinstance(raw_thread, str) and raw_thread else None
-    return run_once(code, timeout_s, envs, agent_root, conv_id, thread_id)
+    # B-300 —— only a JSON ``true`` marks a delegated run.
+    child_run = request.get("child_run") is True
+    return run_once(code, timeout_s, envs, agent_root, conv_id, thread_id, child_run)
 
 
 def handle_line(line: str) -> Response:

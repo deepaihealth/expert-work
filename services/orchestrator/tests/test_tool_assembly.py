@@ -302,6 +302,51 @@ async def test_depth_cap_skips_missing_builder_check() -> None:
     assert len(registry) == 0
 
 
+def _parent_spec(*, long_term_memory: bool) -> Any:
+    from expert_work.protocol import AgentSpec
+
+    spec: dict[str, Any] = {
+        "tenant_config": {},
+        "model": {"provider": "deepseek", "name": "x"},
+        "system_prompt": {"template": "hi"},
+        "sandbox": {
+            "resources": {"cpu": "1.0", "memory": "1Gi"},
+            "network": {"egress": "proxy", "allowlist": []},
+            "filesystem": {"readonly_root": True, "writable": ["/workspace"]},
+        },
+    }
+    if long_term_memory:
+        spec["memory"] = {"long_term": {}}
+    return AgentSpec.model_validate(
+        {
+            "apiVersion": "expert_work.io/v1",
+            "kind": "Agent",
+            "metadata": {"name": "boss", "version": "1.0.0", "tenant": "t"},
+            "spec": spec,
+        }
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("long_term_memory", [True, False])
+async def test_delegation_task_text_mentions_memory_only_when_the_parent_has_it(
+    long_term_memory: bool,
+) -> None:
+    """B-300 T17 —— 平台提示词跟着能力走:主智能体开了长期记忆,委派工具的 ``task`` 说明才
+    多那一句;没开就没有。"""
+    registry = await build_tool_registry(
+        [],
+        tool_env=ToolEnv(child_agent_builder=_StubChildBuilder()),
+        subagents=_SUBAGENTS,
+        parent_spec=_parent_spec(long_term_memory=long_term_memory),
+    )
+    for name in ("researcher", "writer"):
+        tool = registry.get(name)
+        assert isinstance(tool, SubAgentTool)
+        task = tool.spec.parameters["properties"]["task"]["description"]
+        assert ("remembered about the user" in task) is long_term_memory, task
+
+
 @pytest.mark.asyncio
 async def test_no_subagents_with_empty_builder_is_fine() -> None:
     # No subagents declared → the missing-builder check never fires.

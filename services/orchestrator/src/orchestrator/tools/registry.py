@@ -458,7 +458,9 @@ class ToolContext:
         """本次调用的工作区视图 —— 文件工具解析路径与 exec 建命名空间用的同一个值。"""
         thread = (self.workspace_thread_id or self.thread_id) if self.agent_key else None
         conv = thread if self.workspace_layout == "conversation" else None
-        return WorkspaceView(agent_key=self.agent_key, conv_id=conv, thread_id=thread)
+        return WorkspaceView(
+            agent_key=self.agent_key, conv_id=conv, thread_id=thread, child_run=self.child_run
+        )
 
 
 #: Stream K.K8 — keys a tool is allowed to write back to ``AgentState``

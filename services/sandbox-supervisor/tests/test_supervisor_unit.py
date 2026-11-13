@@ -92,6 +92,8 @@ class FakeRunnerLink:
         #: B-236 —— 每次 exec 的 conv_id。
         self.exec_view_calls: list[UUID | None] = []
         self.exec_thread_calls: list[UUID | None] = []
+        #: B-300 —— 每次 exec 的委派子代标记。
+        self.exec_child_calls: list[bool] = []
 
     async def wait_ready(self, timeout_s: float) -> None:
         if not self._ready:
@@ -107,12 +109,14 @@ class FakeRunnerLink:
         agent_root: str | None = None,
         conv_id: UUID | None = None,
         thread_id: UUID | None = None,
+        child_run: bool = False,
     ) -> ExecResult:
         self.exec_calls.append((code, timeout_s))
         self.exec_envs_calls.append(envs)
         self.exec_agent_root_calls.append(agent_root)
         self.exec_view_calls.append(conv_id)
         self.exec_thread_calls.append(thread_id)
+        self.exec_child_calls.append(child_run)
         if self._exec_error is not None:
             raise self._exec_error
         return self._exec_result
@@ -1429,6 +1433,89 @@ async def test_exec_forwards_the_conversation_view_to_the_runner_link() -> None:
 
     assert link.exec_view_calls == [UUID(_CONV), None]
     assert link.exec_thread_calls == [UUID(_CONV), None]
+
+
+def test_exec_request_child_flag_defaults_off() -> None:
+    """B-300 —— 委派子代标记:不带 = 主智能体(老请求形状不变)。"""
+    assert ExecRequest(code="print(1)").child_run is False
+    assert ExecRequest(code="print(1)", agent_root=_ROOT, child_run=True).child_run is True
+
+
+@pytest.mark.asyncio
+async def test_exec_forwards_the_child_flag_to_the_runner_link() -> None:
+    link = FakeRunnerLink()
+    h = _harness(docker=RecordingDockerClient(link=link))
+    response = await h.supervisor.acquire(_acquire_request())
+
+    await h.supervisor.exec(
+        response.sandbox_id,
+        code="print(1)",
+        agent_root=_ROOT,
+        thread_id=UUID(_CONV),
+        child_run=True,
+    )
+    await h.supervisor.exec(response.sandbox_id, code="print(2)", agent_root=_ROOT)
+
+    assert link.exec_child_calls == [True, False]
+
+
+def test_exec_route_forwards_the_child_flag() -> None:
+    link = FakeRunnerLink()
+    h = _harness(docker=RecordingDockerClient(link=link))
+    app = create_app(SandboxSupervisorSettings(), supervisor=h.supervisor, enable_reaper=False)
+    with TestClient(app) as client:
+        acquired = client.post(
+            "/v1/sandboxes:acquire", json={"tenant_id": str(uuid4()), "thread_id": "t-1"}
+        )
+        sandbox_id = acquired.json()["sandbox_id"]
+        for body in (
+            {"code": "print(1)", "agent_root": _ROOT, "child_run": True},
+            {"code": "print(2)", "agent_root": _ROOT},
+        ):
+            resp = client.post(f"/v1/sandboxes/{sandbox_id}:exec", json=body)
+            assert resp.status_code == 200, resp.text
+
+    assert link.exec_child_calls == [True, False]
+
+
+class _FakeStdin:
+    def __init__(self) -> None:
+        self.lines: list[bytes] = []
+
+    def write(self, data: bytes) -> None:
+        self.lines.append(data)
+
+    async def drain(self) -> None:
+        return None
+
+
+class _FakeStdout:
+    async def readline(self) -> bytes:
+        return b'{"stdout": "", "stderr": "", "exit_code": 0, "timed_out": false}\n'
+
+
+class _FakeProcess:
+    def __init__(self) -> None:
+        self.stdin = _FakeStdin()
+        self.stdout = _FakeStdout()
+        self.returncode = None
+
+
+@pytest.mark.asyncio
+async def test_pipe_link_sends_the_child_flag_only_when_set() -> None:
+    """只在为真时带上这个键:请求形状对主智能体一个字不变。"""
+    import json
+
+    from sandbox_supervisor.runner_link import PipeRunnerLink
+
+    process = _FakeProcess()
+    link = PipeRunnerLink(process)  # type: ignore[arg-type]
+    await link.exec("print(1)", 5, agent_root=_ROOT, child_run=True)
+    await link.exec("print(2)", 5, agent_root=_ROOT)
+
+    sent = [json.loads(line) for line in process.stdin.lines]
+    assert sent[0]["child_run"] is True
+    assert "child_run" not in sent[1]
 
 
 @pytest.mark.asyncio

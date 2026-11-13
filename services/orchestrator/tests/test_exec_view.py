@@ -36,7 +36,9 @@ def _sh_and_helper() -> tuple[str, str]:
 
 
 _HELPER_OPEN = "/usr/local/bin/python3 -I -S -c '"
-_HELPER_CLOSE = '\n\' "$root" "$conv" "$own" "$code" "$sum" || { rc=$?; drop; exit "$rc"; }\n'
+_HELPER_CLOSE = (
+    '\n\' "$root" "$conv" "$own" "$code" "$sum" "$child" || { rc=$?; drop; exit "$rc"; }\n'
+)
 
 
 def test_script_fails_closed_and_names_both_roots() -> None:
@@ -87,6 +89,10 @@ def test_helper_opens_every_nas_path_without_following_symlinks() -> None:
         # 清理过期的对话副本时列目录;只读收尾时按挂载点拿 fd(不跟符号链接、只当 O_PATH)
         '".", os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC, dir_fd=store',
         "point, os.O_PATH | os.O_NOFOLLOW | os.O_CLOEXEC",
+        # B-300 —— 委派子代:agent 根下的旧记忆投影(不跟符号链接、只当 O_PATH,挂载前核对是
+        # 普通文件),以及盖它用的 /dev/null
+        "MEMORY, os.O_PATH | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=view",
+        '"/dev/null", os.O_PATH | os.O_CLOEXEC',
     }
     for args in opens:
         assert args in trusted or args.endswith(("DIR", "DIR, dir_fd=fd")), args
@@ -164,12 +170,13 @@ def test_argv_bound_passes_the_nas_root_as_first_positional() -> None:
         "",
         "",
         "",
+        "",
         *_PY,
     ]
 
 
 def test_argv_unbound_passes_an_empty_root() -> None:
-    assert exec_view_argv("", _PY) == [*EXEC_VIEW_ARGV_PREFIX, "", "", "", "", "", *_PY]
+    assert exec_view_argv("", _PY) == [*EXEC_VIEW_ARGV_PREFIX, "", "", "", "", "", "", *_PY]
 
 
 def test_build_exec_command_bound_and_unbound_verbatim() -> None:
@@ -181,11 +188,16 @@ def test_build_exec_command_bound_and_unbound_verbatim() -> None:
     )
     assert build_exec_command("plan-aaaaaaaa", "ew-exec-abc.py", _SUM) == (
         prefix + f" ew-exec-view /mnt/workspace/agents/plan-aaaaaaaa '' '' ew-exec-abc.py {_SUM}"
-        " python -E -P /tmp/.ew-exec/ew-exec-abc.py"
+        " '' python -E -P /tmp/.ew-exec/ew-exec-abc.py"
     )
     assert build_exec_command("", "ew-exec-abc.py", _SUM) == (
-        prefix + f" ew-exec-view '' '' '' ew-exec-abc.py {_SUM}"
+        prefix + f" ew-exec-view '' '' '' ew-exec-abc.py {_SUM} ''"
         " python -E -P /tmp/.ew-exec/ew-exec-abc.py"
+    )
+    # B-300 —— 委派子代:``$6`` 是 ``1``。
+    assert build_exec_command("plan-aaaaaaaa", "ew-exec-abc.py", _SUM, child_run=True) == (
+        prefix + f" ew-exec-view /mnt/workspace/agents/plan-aaaaaaaa '' '' ew-exec-abc.py {_SUM}"
+        " 1 python -E -P /tmp/.ew-exec/ew-exec-abc.py"
     )
     assert (EXEC_SCRIPT_DIR, EXEC_SCRIPT_VIEW_DIR) == ("/tmp", "/tmp/.ew-exec")  # noqa: S108
 
@@ -194,7 +206,7 @@ def test_script_path_is_quoted_not_interpolated() -> None:
     cmd = build_exec_command("", "a b;rm -rf x.py", _SUM)
     argv = shlex.split(cmd[len("umask 077 && ") :])
     assert argv[-1] == "/tmp/.ew-exec/a b;rm -rf x.py"  # noqa: S108
-    assert argv[-6:-4] == ["a b;rm -rf x.py", _SUM]
+    assert argv[-7:-4] == ["a b;rm -rf x.py", _SUM, ""]
 
 
 @pytest.mark.parametrize("bad", ["..", "a/b", "a b"])
@@ -219,6 +231,7 @@ def test_argv_conversation_view_carries_the_conversation() -> None:
         str(_CONV),
         "",
         "",
+        "",
         *_PY,
     ]
 
@@ -232,14 +245,16 @@ def test_argv_legacy_view_carries_only_the_own_thread() -> None:
         str(_CONV),
         "",
         "",
+        "",
         *_PY,
     ]
 
 
 def test_argv_unbound_never_carries_a_conversation() -> None:
     """没绑 agent 没有对话视图:对话 id、线程 id 都不发,脚本走未绑分支。"""
-    assert exec_view_argv("", _PY, conv_id=_CONV, thread_id=_CONV) == [
+    assert exec_view_argv("", _PY, conv_id=_CONV, thread_id=_CONV, child_run=True) == [
         *EXEC_VIEW_ARGV_PREFIX,
+        "",
         "",
         "",
         "",
@@ -265,7 +280,7 @@ def test_script_platform_dirs_are_the_resolver_platform_dirs() -> None:
 # 只读、竞态)由 ``test_exec_view_kernel.py`` 在真镜像真内核上验。
 
 _FAKE_PY = """#!/bin/sh
-shift 4  # -I -S -c <helper>(其后只有挂载阶段的五个参数)
+shift 4  # -I -S -c <helper>(其后只有挂载阶段的六个参数)
 printf '%s\\n' "$@" > "$EW_PY_LOG"
 exit "${EW_PY_RC:-0}"
 """
@@ -322,10 +337,17 @@ class _Rehearsal:
         )
 
     def run(
-        self, conv: str, cmd: str, *, own: str | None = None, code: str = "", digest: str = ""
+        self,
+        conv: str,
+        cmd: str,
+        *,
+        own: str | None = None,
+        code: str = "",
+        digest: str = "",
+        child: str = "",
     ) -> subprocess.CompletedProcess[str]:
         thread = conv if own is None else own
-        return self.run_raw(self.root, conv, thread, code, digest, "sh", "-c", cmd)
+        return self.run_raw(self.root, conv, thread, code, digest, child, "sh", "-c", cmd)
 
     def helper_args(self) -> list[str] | None:
         return self.py_log.read_text().splitlines() if self.py_log.exists() else None
@@ -343,8 +365,8 @@ def test_rehearsal_hands_the_mount_phase_to_the_helper_then_runs_the_payload(
     )
 
     assert proc.returncode == 0, proc.stderr
-    # 挂载阶段只拿到 $1..$5,载荷 argv 不交给它
-    assert r.helper_args() == [r.root, str(_CONV), str(_CONV), "ew-exec-abc.py", _SUM]
+    # 挂载阶段只拿到 $1..$6,载荷 argv 不交给它
+    assert r.helper_args() == [r.root, str(_CONV), str(_CONV), "ew-exec-abc.py", _SUM, ""]
     # 载荷:在 /workspace 里、PATH 还原成调用方的、由 unshare -Ur 起;B-242 —— HOME 等是镜像
     # 里的值(外层 shell 的 HOME=/ 不带进来),BASH_ENV / ENV 不留
     assert proc.stdout == (
@@ -357,9 +379,44 @@ def test_rehearsal_conversation_id_wins_over_the_thread_id(tmp_path: Path) -> No
     """对话视图里本对话那一格就是对话 id;老视图里才用 ``$3``。"""
     r = _Rehearsal(tmp_path)
     assert r.run(str(_CONV), "true", own="").returncode == 0
-    assert r.helper_args() == [r.root, str(_CONV), str(_CONV), "", ""]
+    assert r.helper_args() == [r.root, str(_CONV), str(_CONV), "", "", ""]
     assert r.run("", "true", own=_OTHER).returncode == 0
-    assert r.helper_args() == [r.root, "", _OTHER, "", ""]
+    assert r.helper_args() == [r.root, "", _OTHER, "", "", ""]
+
+
+def test_rehearsal_hands_the_child_flag_to_the_helper(tmp_path: Path) -> None:
+    """B-300 —— ``$6`` 是委派子代标记(``1`` / 空串),原样交给挂载阶段。"""
+    r = _Rehearsal(tmp_path)
+    assert r.run(str(_CONV), "true", child="1").returncode == 0
+    assert r.helper_args() == [r.root, str(_CONV), str(_CONV), "", "", "1"]
+
+
+@pytest.mark.parametrize("child", ["0", "true", "11", "x"])
+def test_rehearsal_bad_child_flag_fails_closed(tmp_path: Path, child: str) -> None:
+    r = _Rehearsal(tmp_path)
+    proc = r.run(str(_CONV), "echo ran", child=child)
+
+    assert proc.returncode == 98, proc.stderr
+    assert "ran" not in proc.stdout
+    assert r.helper_args() is None
+
+
+def test_helper_child_view_keeps_only_the_work_dir_and_covers_the_root_projection() -> None:
+    """B-300 —— 委派子代:``threads/`` 里不放回本对话那一格(对话视图只放回它的 ``work/``,
+    平台往子代 ``/workspace`` 落的件经 ``/agent/threads/<对话>/work`` 写),agent 根的旧投影
+    ``MEMORY.md`` 盖住:两种视图盖 ``/agent``,老视图另盖 ``/workspace``(同一个 agent 根的
+    另一次绑定);对话视图的 ``/workspace/MEMORY.md`` 是对话自己的文件,不盖。"""
+    _, helper = _sh_and_helper()
+    assert 'MEMORY = "MEMORY.md"\n' in helper
+    assert '        keep, names = (work, (own, "work")) if conv else (None, ())\n' in helper
+    assert "        hide_threads(ws, keep, names)\n" in helper
+    assert "    hide_threads(view, keep, names)\n" in helper
+    assert "        hide_memory(view)\n        if not conv:\n            hide_memory(ws)\n" in (
+        helper
+    )
+    assert "main(sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5], sys.argv[6])" in (
+        helper
+    )
 
 
 def test_rehearsal_mount_failure_never_runs_the_payload(tmp_path: Path) -> None:
@@ -399,7 +456,7 @@ def test_rehearsal_missing_agent_mount_point_exits_97_before_any_mount(tmp_path:
 )
 def test_rehearsal_bad_ids_fail_closed(tmp_path: Path, conv: str, own: str, code: str) -> None:
     r = _Rehearsal(tmp_path)
-    proc = r.run_raw(r.root, conv, own, code, _SUM, "sh", "-c", "echo ran")
+    proc = r.run_raw(r.root, conv, own, code, _SUM, "", "sh", "-c", "echo ran")
 
     assert proc.returncode == 98, proc.stderr
     assert "ran" not in proc.stdout
@@ -599,6 +656,6 @@ def test_rehearsal_early_exits_delete_the_outer_script(tmp_path: Path) -> None:
             r.agent.rmdir()
         if case == "helper-fails":
             r.extra_env = {"EW_PY_RC": "98"}
-        proc = r.run_raw(r.root, conv, conv, name, _SUM, "sh", "-c", "echo ran")
+        proc = r.run_raw(r.root, conv, conv, name, _SUM, "", "sh", "-c", "echo ran")
         assert proc.returncode in (97, 98), (case, proc.stderr)
         assert (outer / name).exists() is (case == "bad-name"), case

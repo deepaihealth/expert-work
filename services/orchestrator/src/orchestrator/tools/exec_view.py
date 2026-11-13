@@ -44,8 +44,8 @@ agent、所有对话的 exec 共用同一个容器 / microVM 的本地盘。uid 
 
 B-236 —— 按对话分目录。``$2`` 是对话 id(空 = 老视图,发布前已开的对话),``$3`` 是
 本对话的线程 id(老视图里用它把自己那一格 ``threads/<id>/`` 留出来;对话视图里与
-``$2`` 相同),``$4`` / ``$5`` 是代码文件名与 sha256(B-242,空 = 没有代码文件),再往后
-是 python argv。对话视图:
+``$2`` 相同),``$4`` / ``$5`` 是代码文件名与 sha256(B-242,空 = 没有代码文件),``$6``
+是委派子代标记(B-300,``1`` / 空串),再往后是 python argv。对话视图:
 
 * ``/agent`` = agent 根(该 agent 所有对话共用);``/workspace`` = 本对话自己的
   ``threads/<conv>/work``。
@@ -56,6 +56,13 @@ B-236 —— 按对话分目录。``$2`` 是对话 id(空 = 老视图,发布前�
   下的普通子目录,不再从 agent 根 bind 进来;``/agent`` 下的同名三个目录(老视图的对话还在
   用)各盖一块空 tmpfs(与 ``threads/`` 同一手法,另加只读:写进去报错而不是悄悄丢掉)。
   平台发给模型的相对路径一个字不变。
+* B-300 —— ``$6`` 为 ``1`` = 委派出去的子代。它干的是主智能体那个对话的活,而那一格
+  ``threads/<对话>/`` 里有主智能体的记忆投影 ``MEMORY.md``:子代时两种视图的 ``threads/``
+  都不放回那一格,对话视图只放回它底下的 ``work/``(就是子代自己的 ``/workspace``;平台经
+  ``/agent/threads/<对话>/work`` 往里写渲染页、超长结果)。agent 根下的旧投影 ``MEMORY.md``
+  是普通文件时用封死的 ``/dev/null`` 盖住(打开即失败):两种视图盖 ``/agent``,老视图另盖
+  ``/workspace``(同一个 agent 根的另一次绑定);对话视图的 ``/workspace/MEMORY.md`` 是对话
+  自己的文件,不盖。
 * agent 根下原有的基础目录(风格锚、模板……)不在这里挂:对话开场时控制面在宿主侧把它们
   复制进本对话的 ``work/``(:mod:`orchestrator.graph_builder.conversation_seed`),exec 看到的
   就是本对话自己的那份。
@@ -118,7 +125,7 @@ EXEC_VIEW_SCRIPT = """\
 set -eu
 ew_path="${PATH-}"
 PATH=/usr/sbin:/usr/bin:/sbin:/bin
-root="$1"; conv="$2"; own="$3"; code="$4"; sum="$5"; shift 5
+root="$1"; conv="$2"; own="$3"; code="$4"; sum="$5"; child="$6"; shift 6
 drop() {
   case "$code" in
     ""|*/*|.*) ;;
@@ -137,6 +144,10 @@ for id in "$conv" "$own"; do
 done
 case "$code" in
   */*|.*) echo "ew-exec-view: bad script name" >&2; exit 98 ;;
+esac
+case "$child" in
+  ""|1) ;;
+  *) echo "ew-exec-view: bad child flag" >&2; drop; exit 98 ;;
 esac
 if [ -n "$conv" ]; then
   own="$conv"
@@ -160,6 +171,8 @@ REMOUNT_BIND = 0x20 | 0x1000  # MS_REMOUNT | MS_BIND
 SEALED = RDONLY | NOSUID | NODEV | NOEXEC
 DIR = os.O_PATH | os.O_NOFOLLOW | os.O_DIRECTORY | os.O_CLOEXEC
 PLATFORM_DIRS = ("uploads", "inputs", ".tool_results")
+# What is remembered about the user, as older releases projected it at the agent root.
+MEMORY = "MEMORY.md"
 # Sandbox-local dirs every exec could write: each is replaced by a copy kept per conversation
 # (<dir>/.ew-conv/<conv>), or a fresh tmpfs when there is no conversation.
 KEPT = ("/tmp", "/home/agent", "/var/tmp", "/run/lock")
@@ -259,15 +272,33 @@ def need(fd, name, label):
         die(label + " is not a plain directory under the agent root")
 
 
-def hide_threads(view, own_dir, own):
+def hide_threads(view, keep, names):
+    # An empty tmpfs over view/threads; keep is bound back at threads/<names...>
+    # (nothing is put back when names is empty).
     cover = tmpfs((b"size", b"1k"), (b"mode", b"0500"))
-    slot = None
-    if own:
-        os.mkdir(own, 0o777, dir_fd=cover)
-        slot = sub(cover, own, False)
+    slot = cover
+    for name in names:
+        os.mkdir(name, 0o777, dir_fd=slot)
+        slot = sub(slot, name, False)
     attach(cover, sub(view, "threads", False))
-    if slot is not None:
-        bind(own_dir, slot)
+    if names:
+        bind(keep, slot)
+
+
+def hide_memory(view):
+    # A delegated run: the agent-root MEMORY.md (when it is a plain file) is
+    # covered by /dev/null, sealed, so opening it fails. Anything else is left
+    # alone without a word: stderr is the tool output of every exec, and a link
+    # there resolves inside this view, where the projection is covered.
+    try:
+        target = os.open(MEMORY, os.O_PATH | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=view)
+    except FileNotFoundError:
+        return
+    if not stat.S_ISREG(os.fstat(target).st_mode):
+        os.close(target)
+        return
+    null = os.open("/dev/null", os.O_PATH | os.O_CLOEXEC)
+    ro(attach(sc(OPEN_TREE, null, b"", CLONE), target), MEMORY, SEALED)
 
 
 def hide_platform(view):
@@ -283,7 +314,7 @@ def hide_platform(view):
         ro(attach(tmpfs((b"size", b"1k"), (b"mode", b"0500")), target), "/agent/" + d, SEALED)
 
 
-def nas_view(root, conv, own):
+def nas_view(root, conv, own, child):
     nas = os.open("/mnt/workspace", os.O_PATH | os.O_DIRECTORY | os.O_CLOEXEC)
     agent = os.open("/agent", DIR)
     workspace = os.open("/workspace", DIR)
@@ -300,14 +331,24 @@ def nas_view(root, conv, own):
     threads = need(top, "threads", root + "/threads")
     own_dir = need(threads, own, root + "/threads/" + own) if own else None
     work = need(own_dir, "work", root + "/threads/" + own + "/work") if conv else None
+    if child:
+        # A delegated run works in the parent conversation, whose folder holds the
+        # projection of what is remembered about the user: only work/ goes back.
+        keep, names = (work, (own, "work")) if conv else (None, ())
+    else:
+        keep, names = own_dir, ((own,) if own else ())
     view = bind(top, agent)
     if conv:
         ws = bind(work, workspace)
         hide_platform(view)
     else:
         ws = bind(top, workspace)
-        hide_threads(ws, own_dir, own)
-    hide_threads(view, own_dir, own)
+        hide_threads(ws, keep, names)
+    hide_threads(view, keep, names)
+    if child:
+        hide_memory(view)
+        if not conv:
+            hide_memory(ws)
     try:
         shared = sub(nas, "shared", False)
     except FileNotFoundError:
@@ -485,19 +526,19 @@ def freeze():
             os.close(fd)
 
 
-def main(root, conv, own, name, digest):
+def main(root, conv, own, name, digest, child):
     tmp = local("/tmp")
     data = take(tmp, name, digest) if name else None
-    nas_view(root, conv, own)
+    nas_view(root, conv, own, child == "1")
     local_view(tmp, root.rsplit("/", 1)[-1] if root else "", own, name, data)
     freeze()
 
 
 try:
-    main(sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5])
+    main(sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5], sys.argv[6])
 except OSError as e:
     die("mount failed: " + str(e))
-' "$root" "$conv" "$own" "$code" "$sum" || { rc=$?; drop; exit "$rc"; }
+' "$root" "$conv" "$own" "$code" "$sum" "$child" || { rc=$?; drop; exit "$rc"; }
 cd /workspace
 PATH="$ew_path"
 HOME=/home/agent
@@ -544,18 +585,29 @@ def exec_view_argv(
     thread_id: UUID | None = None,
     script_name: str = "",
     script_sha256: str = "",
+    child_run: bool = False,
 ) -> list[str]:
     """完整 argv:前缀 + ``$1``(绑了 agent 是 NAS 上的真实目录,未绑是空串)+ ``$2``
     (对话 id,老视图 / 未绑为空串)+ ``$3``(本对话的线程 id,没有为空串)+ ``$4`` / ``$5``
     (B-242:``EXEC_SCRIPT_DIR`` 下代码文件的名字与 sha256,本地后端走 ``-c`` 时为空串)
-    + python。
+    + ``$6``(B-300:委派子代为 ``1``,否则空串)+ python。
 
-    对话视图与线程 id 只在绑了 agent 时成立;未绑时一律不发。
+    对话视图、线程 id 与子代标记只在绑了 agent 时成立;未绑时一律不发。
     """
     root = agent_nas_root(agent_key) if agent_key else ""
     conv = str(conv_id) if root and conv_id is not None else ""
     thread = str(thread_id) if root and thread_id is not None else ""
-    return [*EXEC_VIEW_ARGV_PREFIX, root, conv, thread, script_name, script_sha256, *python_argv]
+    child = "1" if root and child_run else ""
+    return [
+        *EXEC_VIEW_ARGV_PREFIX,
+        root,
+        conv,
+        thread,
+        script_name,
+        script_sha256,
+        child,
+        *python_argv,
+    ]
 
 
 def build_exec_command(
@@ -565,6 +617,7 @@ def build_exec_command(
     *,
     conv_id: UUID | None = None,
     thread_id: UUID | None = None,
+    child_run: bool = False,
 ) -> str:
     """ACS 后端 ``commands.run``(``/bin/bash -l -c``)用的命令串。
 
@@ -580,5 +633,6 @@ def build_exec_command(
         thread_id=thread_id,
         script_name=script_name,
         script_sha256=script_sha256,
+        child_run=child_run,
     )
     return "umask 077 && " + shlex.join(argv)

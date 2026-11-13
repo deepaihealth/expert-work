@@ -52,6 +52,7 @@ if TYPE_CHECKING:
 import httpx
 from jsonschema import Draft202012Validator
 from jsonschema.exceptions import SchemaError
+from langchain_core.runnables import RunnableConfig
 from langgraph.checkpoint.base import BaseCheckpointSaver
 
 from expert_work.common.skill_activity import SkillActivityRecorder
@@ -153,6 +154,7 @@ from orchestrator.middleware_assembly import MiddlewareEnv, build_middleware_cha
 from orchestrator.multimodal import ImageResolver
 from orchestrator.output_judge import ActionJudge, OutputJudge
 from orchestrator.runner import GraphRunner
+from orchestrator.state import AgentState
 from orchestrator.tools import ToolEnv, build_tool_registry
 from orchestrator.tools.arg_bindings import manifest_bindings
 from orchestrator.tools.figure_reads import READING_RULE
@@ -3040,6 +3042,7 @@ def _build_memory_nodes(
         rewriter=llm_caller,
         abstain_threshold=long_term.abstain_threshold,
     )
+    recall = _skip_in_delegated_runs(recall)
     writeback = (
         make_memory_writeback_node(
             memory_store=env.store,
@@ -3069,6 +3072,20 @@ def _build_memory_nodes(
         else None
     )
     return recall, writeback, pre_compaction_flush
+
+
+def _skip_in_delegated_runs(recall: MemoryNode) -> MemoryNode:
+    """B-300 —— 委派出去的子代不召回长期记忆:``_child_config`` 写的 ``child_run`` 在,召回
+    节点什么都不做(与智能体笔记节点同一个判据)。同一个智能体被用户直接对话时照常召回。
+    主智能体那句「子代拿不到记忆」(委派工具 ``task`` 说明)由此成立。"""
+
+    # 注解要是真的 ``RunnableConfig``:LangGraph 按它决定给不给节点传 ``config``。
+    async def memory_recall(state: AgentState, config: RunnableConfig) -> dict[str, Any]:
+        if (config.get("configurable") or {}).get("child_run"):
+            return {}
+        return await recall(state, config)
+
+    return memory_recall
 
 
 def _step_model(spec: AgentSpec, when: str) -> ModelSpec:

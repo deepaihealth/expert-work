@@ -54,6 +54,7 @@ class RunnerLink(Protocol):
         agent_root: str | None = None,
         conv_id: UUID | None = None,
         thread_id: UUID | None = None,
+        child_run: bool = False,
     ) -> ExecResult:
         """Run ``code`` in the sandbox; return its captured outcome.
 
@@ -73,6 +74,9 @@ class RunnerLink(Protocol):
         ``conv_id`` (B-236) — the conversation view, sent to the runner as
         ``conv_id`` (string), plus ``thread_id`` (string, the conversation's own
         ``threads/<id>/``); omitted when ``None`` (the pre-feature request shape).
+
+        ``child_run`` (B-300) — a delegated run, sent as ``"child_run": true``;
+        omitted when false (the pre-feature request shape).
         """
 
     async def close(self) -> None:
@@ -116,6 +120,7 @@ class PipeRunnerLink:
         agent_root: str | None = None,
         conv_id: UUID | None = None,
         thread_id: UUID | None = None,
+        child_run: bool = False,
     ) -> ExecResult:
         async with self._lock:
             request: dict[str, object] = {"code": code, "timeout_s": timeout_s}
@@ -127,6 +132,8 @@ class PipeRunnerLink:
                 request["conv_id"] = str(conv_id)
             if thread_id is not None:
                 request["thread_id"] = str(thread_id)
+            if child_run:
+                request["child_run"] = True
             await self._write(request)
             # The supervisor's read deadline is the runner's own timeout
             # plus a grace window — a runner past it is itself hung.

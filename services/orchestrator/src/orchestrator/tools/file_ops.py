@@ -191,8 +191,14 @@ def _refuse_notes_write_from_a_child(target: ResolvedPath, ctx: ToolContext, *, 
 def _store_scope(ws: str, ctx: ToolContext) -> str:
     """解析结果的 ``ws`` → 宿主侧作用域,按本次调用的视图(B-236)。"""
     view = ctx.workspace_view
+    # B-300 —— 委派子代不带线程 id(``threads/`` 一格都不留);``own_thread`` 本身不改,exec 的
+    # 本对话本地状态目录还按它分。
     return store_scope(
-        ws, agent_key=view.agent_key, conv_id=view.conv_id, thread_id=view.own_thread
+        ws,
+        agent_key=view.agent_key,
+        conv_id=view.conv_id,
+        thread_id=None if view.child_run else view.own_thread,
+        child_run=view.child_run,
     )
 
 
