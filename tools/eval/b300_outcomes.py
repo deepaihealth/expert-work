@@ -75,6 +75,7 @@ def judge_items(out: Path, phase: Phase) -> tuple[list[rep.JudgeItem], dict[str,
                 # 平台的定时整理在我们这一步之前就整理过了(没有按租户的开关,审查 M5):前提不成立。
                 info["precondition"] = False
                 info["consolidated_before"] = True
+            info["candidates_known"] = cand is not None
             info.update(
                 rep.c5_region_in_candidates(r.get("seed_ids", {}), cand["clusters"]) if cand else {}
             )
@@ -82,19 +83,20 @@ def judge_items(out: Path, phase: Phase) -> tuple[list[rep.JudgeItem], dict[str,
             summaries = [row["content"] for row in state_rows or [] if row.get("summary")]
             info["summaries"] = len(summaries)
             info["state_known"] = state_rows is not None
-            # 没凑成簇的这一片:C5 ① 未测到,汇总行不送判官(省钱,也不进过线)
+            # 送判官的汇总行:我们这一步整理出来的(进过线);平台在我们之前整理出来的也判,但另列、
+            # 不进过线(第六轮)。整理前没凑成簇 / 候选没记录的:不判(未测到)。
+            platform = bool(info.get("consolidated_before"))
             if (
                 r["user"] not in summaries_done
                 and state_rows is not None
-                and info.get("region_clustered")
+                and summaries
+                and (platform or info.get("region_clustered"))
             ):
                 summaries_done.add(r["user"])
-                if summaries:
-                    items.append(
-                        rep.JudgeItem(
-                            f"{r['user']}|summary", "summary", rep.summary_prompt(s, summaries)
-                        )
-                    )
+                check = "platform_summary" if platform else "summary"
+                items.append(
+                    rep.JudgeItem(f"{r['user']}|{check}", check, rep.summary_prompt(s, summaries))
+                )
         facts[key] = info
         # C4 只在前提确实成立时判(没查到状态 / 不成立的单独计数,§8.7)。
         if info["recall_ok"] and info.get("precondition", True) is True:
@@ -181,17 +183,27 @@ def _c5_summaries(
         r = records[key]
         if r["user"] in seen or not info.get("state_known"):
             continue
+        seen.add(r["user"])
+        # 先后有讲究(第六轮):先看平台是不是在我们之前就整理过,再看候选有没有记录,最后才是
+        # 「没凑成簇」—— 三种各记各的原因,都不进过线。
+        if info.get("consolidated_before"):
+            counts["c5_consolidated_before_our_step"] += 1
+            verdict = (
+                _bad(verdicts, f"{r['user']}|platform_summary") if info.get("summaries") else False
+            )
+            if verdict is not None:  # 平台整理出来的汇总行的判分:另列
+                counts[
+                    "c5_platform_summary_x_as_current" if verdict else "c5_platform_summary_ok"
+                ] += 1
+            continue
+        if not info.get("candidates_known"):
+            counts["c5_candidates_not_recorded"] += 1  # 候选没记录
+            continue
         if not info.get("region_clustered"):
             # 整理前这一片没凑成候选簇(审查第五轮 M2):这一次 C5 ① 什么都没量到 —— 记「未测到」,
             # 不算过线,也不算违规;基线上同样不进「证明会红」。
-            seen.add(r["user"])
             counts["c5_not_measured"] += 1
             continue
-        if info.get("consolidated_before"):
-            seen.add(r["user"])
-            counts["c5_consolidated_before_our_step"] += 1
-            continue
-        seen.add(r["user"])
         counts["x_in_candidates"] += bool(info.get("x_in_candidates"))
         clustered = True  # 没凑成簇的上面已经记成「未测到」
         bad = _bad(verdicts, f"{r['user']}|summary") if info.get("summaries") else False

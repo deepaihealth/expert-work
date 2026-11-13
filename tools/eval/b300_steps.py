@@ -171,7 +171,9 @@ def _resume(
             f"{args.resume_from} moved on since the progress used by this quote "
             f"({now['digest']} != {q['progress_digest']}); write the progress again and re-quote"
         )
-    release = args.release_tag if phase.kind != "extraction" else None
+    release = args.release_tag
+    if phase.kind == "extraction" and release:
+        raise EvalError("extraction phases run locally and take no --release-tag")
     if phase.kind != "extraction" and not release:
         raise EvalError(
             "--resume-from needs --release-tag: the release the remaining runs will hit"
