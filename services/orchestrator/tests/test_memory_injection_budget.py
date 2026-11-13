@@ -38,9 +38,9 @@ from orchestrator.context.memory_render import (
     MEMORY_BLOCK_HEADING,
     MEMORY_LINE_LEGEND,
     MEMORY_REMINDER,
+    MEMORY_TRUNCATION_MARKER,
 )
 from orchestrator.graph_builder.builder import (
-    _MEMORY_TRUNCATION_MARKER,
     _inject_memories,
     _memory_injection_truncated_total,
 )
@@ -151,7 +151,7 @@ def test_budget_stops_greedy_and_truncates_boundary_item() -> None:
     assert len(lines) == 4
     assert lines[1] == "- (fact) " + "a" * 91
     assert lines[2] == "- (fact) " + "b" * 91
-    assert lines[3].endswith(_MEMORY_TRUNCATION_MARKER)
+    assert lines[3].endswith(MEMORY_TRUNCATION_MARKER)
     # The truncated boundary item keeps a head slice of its content.
     assert lines[3].startswith("- (fact) ccc")
     assert "dddd" not in body
@@ -163,7 +163,7 @@ def test_single_overlong_memory_is_truncated_not_dropped() -> None:
     cut to the budget with a visible marker."""
     out = _inject_memories(_base_messages(), [_memory("y" * 40_000)], mode="per_session")
     body = _body(out)
-    assert _MEMORY_TRUNCATION_MARKER in body
+    assert MEMORY_TRUNCATION_MARKER in body
     # ~2000 tokens ≈ 8000 chars at the chars//4 heuristic (plus marker).
     assert len(body) < 9_000
     assert body.startswith("## Relevant memories from past sessions\n- (fact) yyy")
@@ -187,8 +187,8 @@ def test_injected_estimator_drives_the_budget() -> None:
         token_budget=100,
         estimator=_OnePerChar(),
     )
-    assert _MEMORY_TRUNCATION_MARKER not in _body(untouched)
-    assert _MEMORY_TRUNCATION_MARKER in _body(truncated)
+    assert MEMORY_TRUNCATION_MARKER not in _body(untouched)
+    assert MEMORY_TRUNCATION_MARKER in _body(truncated)
 
 
 # ---------------------------------------------------------------------------
@@ -239,7 +239,7 @@ def test_correction_larger_than_reserve_competes_in_general_pass() -> None:
         correction_token_budget=500,
     )
     body = _body(out)
-    assert _MEMORY_TRUNCATION_MARKER not in body
+    assert MEMORY_TRUNCATION_MARKER not in body
     assert "- (fact) " + "r" * 3_191 in body
 
 
@@ -272,7 +272,7 @@ def test_oversized_correction_is_skipped_without_blocking_later_corrections() ->
     assert lines[2] == "- (fact) " + "a" * 1_191
     assert lines[3] == "- (fact) " + "c" * 191
     assert "bbb" not in body
-    assert _MEMORY_TRUNCATION_MARKER not in body
+    assert MEMORY_TRUNCATION_MARKER not in body
 
 
 def test_extraction_scored_confidence_cannot_eat_the_correction_reserve() -> None:
@@ -411,5 +411,5 @@ async def test_graph_threads_injection_budget_to_the_prompt() -> None:
     assert isinstance(block, HumanMessage)
     content = str(block.content)
     assert "Relevant memories" in content
-    assert _MEMORY_TRUNCATION_MARKER in content
+    assert MEMORY_TRUNCATION_MARKER in content
     assert len(_strip_frame(content)) < 1_000

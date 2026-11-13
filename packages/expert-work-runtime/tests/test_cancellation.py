@@ -179,9 +179,9 @@ async def test_run_cancellable_cancels_the_inner_call_when_the_caller_is_cancell
     token = CancellationToken()
     inner_cancelled = asyncio.Event()
 
-    async def slow() -> None:
+    async def slow() -> bool:
         try:
-            await asyncio.Event().wait()
+            return await asyncio.Event().wait()
         except asyncio.CancelledError:
             inner_cancelled.set()
             raise
@@ -190,5 +190,5 @@ async def test_run_cancellable_cancels_the_inner_call_when_the_caller_is_cancell
     await asyncio.sleep(0.01)
     outer.cancel()
     with pytest.raises(asyncio.CancelledError):
-        await outer
+        _ = await outer
     assert inner_cancelled.is_set()

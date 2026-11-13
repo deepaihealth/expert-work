@@ -35,8 +35,8 @@ from expert_work.common.observability import expert_work_counter
 from expert_work.common.spotlight import spotlight_untrusted
 from expert_work.common.threat_patterns import scan_for_threats
 from expert_work.runtime.tokens import CharTokenEstimator, TokenEstimator
+from orchestrator.context.memory_render import truncate_to_tokens
 from orchestrator.graph_builder._config import cancellation_token, configurable_uuid
-from orchestrator.graph_builder.builder import _truncate_to_tokens
 from orchestrator.graph_builder.memory import MemoryNode
 from orchestrator.state import AgentState
 from orchestrator.tools.nas_workspace_store import MISSING_DIR_ERRORS
@@ -137,7 +137,7 @@ def _body(text: str, *, nonce: str | None, budget: int, estimator: TokenEstimato
     content = text.strip()
     if estimator.count(content) > budget:
         agent_notes_total.labels(outcome="truncated").inc()
-        content = _truncate_to_tokens(content, budget, estimator.count, _TRUNCATION_MARKER)
+        content = truncate_to_tokens(content, budget, estimator.count, _TRUNCATION_MARKER)
     else:
         agent_notes_total.labels(outcome="injected").inc()
     if nonce:

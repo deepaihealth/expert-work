@@ -137,10 +137,8 @@ from orchestrator.context.memory_render import (
     MEMORY_BLOCK_HEADING,
     MEMORY_LINE_LEGEND,
     MEMORY_REMINDER,
-    MEMORY_TRUNCATION_MARKER,
     memory_line,
     select_memory_lines,
-    truncate_to_tokens,
 )
 from orchestrator.context.system_prompt_view import keep_latest_system_prompt
 from orchestrator.graph_builder._approval import (
@@ -2954,13 +2952,6 @@ def _inject_plan(messages: list[BaseMessage], plan: Plan) -> list[BaseMessage]:
     # Stream CM-0 (N1) — gauge the recitation size to watch for plan bloat.
     _cm_recitation_chars.set(len(rendered))
     return _append_tail_human_message(messages, rendered)
-
-
-#: RT-2 PR-2 (RT-ADR-10) — visible marker appended when a memory item is cut
-#: at the injection budget boundary (B-300: lives with the memory line renderer).
-_MEMORY_TRUNCATION_MARKER = MEMORY_TRUNCATION_MARKER
-#: B-236 agent notes reuse the same token cut (``agent_notes`` imports it from here).
-_truncate_to_tokens = truncate_to_tokens
 
 
 def _render_memory_lines(
