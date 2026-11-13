@@ -1390,7 +1390,7 @@ const zhCN: TranslationKeys = {
   memory_group: {
     tab_basic: "基本",
     tab_retrieval: "检索细节",
-    tab_budget: "预算与整理",
+    tab_budget: "预算",
     on_label: "长期记忆",
     on_brief: "跨对话记住用户信息",
     on_impact:
@@ -1443,7 +1443,6 @@ const zhCN: TranslationKeys = {
     abstain_threshold_impact:
       "检索后，若最相关记忆与问题的相似度低于此值，则不注入任何记忆，而非塞一个勉强的匹配——避免把关系不大的记忆拉进回答。\n0 = 从不跳过（默认）；约 0.2–0.3 = 跳过明显偏弱的匹配。\n示例：0",
     panel_injection: "注入预算",
-    panel_consolidation: "后台记忆整理",
     inj_budget_label: "记忆注入 token 预算",
     inj_budget_brief: "记忆最多能占多少 token",
     inj_budget_impact:
@@ -1454,12 +1453,6 @@ const zhCN: TranslationKeys = {
     corr_budget_impact:
       "用户明确纠正过的记忆（置信度 1.0 的纠正类记忆）优先可用的专属额度，确保普通记忆不会把它挤掉：纠正类记忆会优先分到最多这么多 token，剩下的预算才轮到普通记忆用。\n设成 0 = 不做这层保护。",
     corr_budget_default: "500",
-    consolidation_label: "后台记忆整理",
-    consolidation_brief: "后台定期整理记忆，不拖慢对话",
-    consolidation_impact:
-      "后台每隔一段时间（默认 4 小时一次）自动合并相似的临时记忆、清掉没用的噪音记忆——是后台任务，不会拖慢对话响应速度。\n关掉以后，这个智能体的长期记忆就不会再自动去重、沉淀、清理噪音了，临时记忆会越堆越多。\n整理工作由辅助模型执行，按「记忆整理」用途单独计费；判断哪些记忆算「相似」的具体标准是租户级别的配置，不在这份配置清单里。",
-    aux_model_note:
-      "做整理用的辅助模型默认走平台统一配置（claude-sonnet-4-6）。\n要单独给这个智能体换一个，请到 YAML 视图编辑 policies.memory_consolidation.aux_model。",
   },
   model_group: {
     panel_reflection: "反思自评",

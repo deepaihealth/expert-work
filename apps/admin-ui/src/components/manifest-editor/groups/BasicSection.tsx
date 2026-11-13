@@ -4,12 +4,12 @@
  * description) via ``ManifestEditor``'s stacked-sections fallback; this
  * curated pane adds ``RunProfileCard`` ABOVE that same ``FormView``, unchanged.
  *
- * ``RunProfileCard`` is a one-click preset over 18 fields scattered across
+ * ``RunProfileCard`` is a one-click preset over 17 fields scattered across
  * the memory/budget/context groups (``RUN_PROFILES``, form_model.ts): pick
  * "balanced" / "cost-saving" / "high-capability" and every managed field
  * jumps to that preset's value in one write (``applyRunProfile``). The
  * radio reflects the CURRENT manifest (``inferRunProfile``): checked when
- * all 18 fields exactly match a preset, otherwise none checked + a "Custom"
+ * all 17 fields exactly match a preset, otherwise none checked + a "Custom"
  * tag — any individual field can still be hand-tuned afterward in its own
  * group without the card fighting that edit (it just reads as "custom").
  *

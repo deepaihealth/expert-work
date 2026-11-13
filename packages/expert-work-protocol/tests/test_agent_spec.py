@@ -787,6 +787,42 @@ def test_context_compression_still_forbids_extra() -> None:
 
 
 # ---------------------------------------------------------------------------
+# policies.memory_consolidation — B-300 D9: accepted, deprecated, no effect
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("enabled", [True, False])
+def test_stored_memory_consolidation_block_still_loads_and_saves(enabled: bool) -> None:
+    """Every saved manifest carries ``policies.memory_consolidation.enabled``
+    (the backend serialises the default). The block must keep validating and
+    round-tripping even though nothing reads it — the policy forbids extra
+    keys, so dropping the fields would break stored configs."""
+    doc = _doc()
+    doc["spec"]["policies"] = {
+        "memory_consolidation": {
+            "enabled": enabled,
+            "aux_model": {"provider": "anthropic", "name": "claude-sonnet-4-5"},
+        }
+    }
+    spec = AgentSpec.model_validate(doc)
+    saved = spec.model_dump(mode="json", by_alias=True)
+    assert saved["spec"]["policies"]["memory_consolidation"]["enabled"] is enabled
+    reloaded = AgentSpec.model_validate(saved)
+    assert reloaded.spec.policies.memory_consolidation.enabled is enabled
+
+
+def test_memory_consolidation_fields_are_documented_as_no_op() -> None:
+    """The published agent schema (``/v1/agent-schema``) must not tell an
+    editor that these fields steer consolidation: it runs on the deployment
+    setting only."""
+    schema = AgentSpec.model_json_schema(by_alias=True)
+    props = schema["$defs"]["MemoryConsolidationPolicy"]["properties"]
+    for name in ("enabled", "aux_model"):
+        description = props[name].get("description", "").lower()
+        assert "deprecated" in description and "no effect" in description, name
+
+
+# ---------------------------------------------------------------------------
 # memory.long_term.reconcile_writes — CM-7
 # ---------------------------------------------------------------------------
 

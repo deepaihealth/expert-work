@@ -2,7 +2,7 @@
  * form_model_profiles.test.ts — config-page redesign v2 Task 6's run-profile
  * presets (``applyRunProfile``/``inferRunProfile``/``countProfileDiff``,
  * form_model.ts). Split from ``form_model.test.ts`` (already ~2500 lines)
- * since these tests exercise a single, self-contained feature over 18
+ * since these tests exercise a single, self-contained feature over 17
  * previously-independent fields.
  *
  * The linchpin invariant: applying "balanced" must leave every managed field
@@ -19,7 +19,6 @@ import {
   countProfileDiff,
   inferRunProfile,
   readAbstainThreshold,
-  readConsolidation,
   readContextGates,
   readDynamicWorkersOn,
   readMemoryBudgets,
@@ -36,14 +35,14 @@ import { BASE_MANIFEST_YAML } from "../defaults";
 
 // A truly blank manifest has NO ``memory.long_term`` block — memory is OFF
 // (presence semantics, ``readMemoryOn``), and presets never flip feature
-// switches, so the 7 memory-backed fields are skipped on it. The "all 18
+// switches, so the 7 memory-backed fields are skipped on it. The "all 17
 // fields" suites therefore run on ``BASE_ON`` (memory declared on, knobs
 // untouched); ``BASE`` exercises the memory-off gating suite below.
 const BASE: AgentManifest = { spec: {} };
 const BASE_ON: AgentManifest = { spec: { memory: { long_term: {} } } };
 
 describe("applyRunProfile", () => {
-  it("writes all 18 fields for the 'cost' preset", () => {
+  it("writes all 17 fields for the 'cost' preset", () => {
     const m = applyRunProfile(BASE_ON, "cost");
     expect(readTopK(m)).toBe(3);
     expect(readVerifyReads(m)).toBe(false);
@@ -52,7 +51,6 @@ describe("applyRunProfile", () => {
     expect(readAbstainThreshold(m)).toBe(0.2);
     expect(readMemoryBudgets(m).injectionTokenBudget).toBe(1000);
     expect(readMemoryBudgets(m).correctionTokenBudget).toBe(300);
-    expect(readConsolidation(m).consolidationEnabled).toBe(false);
     expect(readRunBudget(m).maxIterations).toBe(20);
     expect(readRunBudget(m).maxNoProgress).toBe(3);
     const gates = readContextGates(m);
@@ -66,7 +64,7 @@ describe("applyRunProfile", () => {
     expect(readDynamicWorkersOn(m)).toBe(false);
   });
 
-  it("writes all 18 fields for the 'capability' preset", () => {
+  it("writes all 17 fields for the 'capability' preset", () => {
     const m = applyRunProfile(BASE_ON, "capability");
     expect(readTopK(m)).toBe(8);
     expect(readVerifyReads(m)).toBe(true);
@@ -75,11 +73,6 @@ describe("applyRunProfile", () => {
     expect(readAbstainThreshold(m)).toBe(0);
     expect(readMemoryBudgets(m).injectionTokenBudget).toBe(4000);
     expect(readMemoryBudgets(m).correctionTokenBudget).toBe(800);
-    // consolidationEnabled's capability value (true) === its backend default
-    // (true), so ``applyRunProfile`` omits the key entirely (the
-    // "value===default → omit" convention) — the RAW reader legitimately
-    // returns undefined here; the effective (UI-facing) value is still true.
-    expect(readConsolidation(m).consolidationEnabled ?? true).toBe(true);
     expect(readRunBudget(m).maxIterations).toBe(60);
     expect(readRunBudget(m).maxNoProgress).toBe(6);
     const gates = readContextGates(m);
@@ -95,12 +88,12 @@ describe("applyRunProfile", () => {
 
   // "balanced" matches the backend default on every field but
   // maxNoProgress, so ``applyRunProfile`` omits every OTHER key — reading
-  // through the RAW helpers (readTopK/readMemoryBudgets/readConsolidation/
+  // through the RAW helpers (readTopK/readMemoryBudgets/
   // readRunBudget/readContextGates) legitimately returns undefined for
   // those; ``?? <backend default>`` recovers the effective value a UI
   // control would show (mirrors e.g. ``MemorySection``'s own
   // ``readTopK(formData) ?? 5``).
-  it("writes all 18 fields for the 'balanced' preset (effective values, from a blank manifest)", () => {
+  it("writes all 17 fields for the 'balanced' preset (effective values, from a blank manifest)", () => {
     const m = applyRunProfile(BASE_ON, "balanced");
     expect(readTopK(m) ?? 5).toBe(5);
     expect(readVerifyReads(m)).toBe(true);
@@ -109,7 +102,6 @@ describe("applyRunProfile", () => {
     expect(readAbstainThreshold(m)).toBe(0);
     expect(readMemoryBudgets(m).injectionTokenBudget ?? 2000).toBe(2000);
     expect(readMemoryBudgets(m).correctionTokenBudget ?? 500).toBe(500);
-    expect(readConsolidation(m).consolidationEnabled ?? true).toBe(true);
     expect(readRunBudget(m).maxIterations ?? 30).toBe(30);
     expect(readRunBudget(m).maxNoProgress).toBe(4);
     const gates = readContextGates(m);
@@ -183,6 +175,33 @@ describe("applyRunProfile", () => {
     const twice = applyRunProfile(once, "cost");
     expect(twice).toEqual(once);
   });
+
+  // B-300 D9 — the per-agent consolidation switch has no effect (nothing
+  // reads it), so no preset may write it ...
+  it("no preset writes policies.memory_consolidation", () => {
+    for (const profile of ["balanced", "cost", "capability"] as const) {
+      const spec = (applyRunProfile(BASE_ON, profile) as { spec: Record<string, unknown> })
+        .spec;
+      const policies = spec.policies as Record<string, unknown> | undefined;
+      expect(policies?.memory_consolidation).toBeUndefined();
+    }
+  });
+
+  // ... and a stored block (every saved manifest carries one) is left alone.
+  it("leaves a stored memory_consolidation block exactly as it was", () => {
+    const stored = {
+      enabled: false,
+      aux_model: { provider: "glm", name: "glm-4-flash" },
+    };
+    const base = {
+      spec: { memory: { long_term: {} }, policies: { memory_consolidation: stored } },
+    } as AgentManifest;
+    for (const profile of ["balanced", "cost", "capability"] as const) {
+      const spec = (applyRunProfile(base, profile) as { spec: Record<string, unknown> }).spec;
+      const policies = spec.policies as Record<string, unknown>;
+      expect(policies.memory_consolidation).toEqual(stored);
+    }
+  });
 });
 
 describe("inferRunProfile", () => {
@@ -219,12 +238,12 @@ describe("countProfileDiff", () => {
     expect(countProfileDiff(m, "cost")).toBe(0);
   });
 
-  it("is 16 for a memory-on blank manifest vs. 'cost' (every field differs except rewriteReads/recallMode, which cost shares with the backend default)", () => {
-    expect(countProfileDiff(BASE_ON, "cost")).toBe(16);
+  it("is 15 for a memory-on blank manifest vs. 'cost' (every field differs except rewriteReads/recallMode, which cost shares with the backend default)", () => {
+    expect(countProfileDiff(BASE_ON, "cost")).toBe(15);
   });
 
-  it("is 11 for a memory-OFF blank manifest vs. 'cost' (only the 11 non-memory applicable fields are compared)", () => {
-    expect(countProfileDiff(BASE, "cost")).toBe(11);
+  it("is 10 for a memory-OFF blank manifest vs. 'cost' (only the 10 non-memory applicable fields are compared)", () => {
+    expect(countProfileDiff(BASE, "cost")).toBe(10);
   });
 
   it("counts exactly 1 after a single field is hand-edited off a matched preset", () => {
@@ -256,7 +275,6 @@ interface EchoValues {
   abstainThreshold: number;
   injectionTokenBudget: number;
   correctionTokenBudget: number;
-  consolidationEnabled: boolean;
   maxIterations: number;
   maxNoProgress: number;
   prThresholdPct: number;
@@ -271,7 +289,14 @@ interface EchoValues {
 
 // Returns ``unknown`` (the readers' own input type) — the fixture mirrors
 // the wire shape, not the editor's ``AgentManifest`` view of it.
-function backendEcho(v: EchoValues, memoryOn: boolean): unknown {
+// ``consolidationEnabled`` is the deprecated, no-effect
+// ``policies.memory_consolidation.enabled`` every echo carries (B-300 D9);
+// older manifests saved with the "cost" preset hold ``false``.
+function backendEcho(
+  v: EchoValues,
+  memoryOn: boolean,
+  consolidationEnabled = true,
+): unknown {
   return {
     spec: {
       extends: null,
@@ -324,7 +349,7 @@ function backendEcho(v: EchoValues, memoryOn: boolean): unknown {
         },
         tool_output_budget: { enabled: true },
         memory_consolidation: {
-          enabled: v.consolidationEnabled,
+          enabled: consolidationEnabled,
           aux_model: null,
         },
         max_no_progress: v.maxNoProgress,
@@ -336,7 +361,7 @@ function backendEcho(v: EchoValues, memoryOn: boolean): unknown {
   };
 }
 
-// Each preset's values as the backend echoes them (all 18 explicit).
+// Each preset's values as the backend echoes them (all 17 explicit).
 const ECHO_VALUES: Record<"balanced" | "cost" | "capability", EchoValues> = {
   balanced: {
     topK: 5,
@@ -346,7 +371,6 @@ const ECHO_VALUES: Record<"balanced" | "cost" | "capability", EchoValues> = {
     abstainThreshold: 0,
     injectionTokenBudget: 2000,
     correctionTokenBudget: 500,
-    consolidationEnabled: true,
     maxIterations: 30,
     maxNoProgress: 4,
     prThresholdPct: 0.7,
@@ -366,7 +390,6 @@ const ECHO_VALUES: Record<"balanced" | "cost" | "capability", EchoValues> = {
     abstainThreshold: 0.2,
     injectionTokenBudget: 1000,
     correctionTokenBudget: 300,
-    consolidationEnabled: false,
     maxIterations: 20,
     maxNoProgress: 3,
     prThresholdPct: 0.6,
@@ -386,7 +409,6 @@ const ECHO_VALUES: Record<"balanced" | "cost" | "capability", EchoValues> = {
     abstainThreshold: 0,
     injectionTokenBudget: 4000,
     correctionTokenBudget: 800,
-    consolidationEnabled: true,
     maxIterations: 60,
     maxNoProgress: 6,
     prThresholdPct: 0.8,
@@ -412,6 +434,14 @@ describe("backend full-dump echo (#12)", () => {
       expect(inferRunProfile(backendEcho(ECHO_VALUES[profile], false))).toBe(
         profile,
       );
+    });
+
+    it(`recognizes '${profile}' whatever the stored memory_consolidation.enabled says (B-300 D9)`, () => {
+      for (const enabled of [true, false]) {
+        expect(
+          inferRunProfile(backendEcho(ECHO_VALUES[profile], true, enabled)),
+        ).toBe(profile);
+      }
     });
 
     it(`apply→save-payload round-trip on the '${profile}' echo stays '${profile}'`, () => {

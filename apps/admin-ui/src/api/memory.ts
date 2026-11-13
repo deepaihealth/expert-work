@@ -47,6 +47,10 @@ export interface MemoryList {
   items: MemoryItem[];
   total: number;
   cross_tenant: boolean;
+  /** The caller's own memory user id (B-300 D8) — the console identity only
+   *  carries the login subject. ``null`` where the caller can own no row
+   *  (cross-tenant view, or a tenant other than their home one). */
+  caller_user_id?: string | null;
 }
 
 export interface ListMemoriesParams {
@@ -76,26 +80,42 @@ export interface UpdateMemoryBody {
   kind?: MemoryKind;
 }
 
+/** Query params naming whose row a write targets; absent keys are omitted. */
+function writeTarget(userId?: string, tenantId?: string): Record<string, string> {
+  return {
+    ...(userId ? { user_id: userId } : {}),
+    ...(tenantId ? { tenant_id: tenantId } : {}),
+  };
+}
+
 /** ``userId`` is the tenant-admin governance target (M2 user detail —
  *  editing another user's memory via ``?user_id=``); omit for the
- *  caller's own memory. */
+ *  caller's own memory. ``tenantId`` is the row's tenant when a platform
+ *  admin writes from a non-home tenant scope (B-300 D8); it needs ``userId``. */
 export async function updateMemory(
   memoryId: string,
   body: UpdateMemoryBody,
   userId?: string,
+  tenantId?: string,
 ): Promise<MemoryItem> {
+  const params = writeTarget(userId, tenantId);
   return patchJson<MemoryItem>(
     `/v1/memory/${encodeURIComponent(memoryId)}`,
     body,
-    userId ? { params: { user_id: userId } } : undefined,
+    Object.keys(params).length > 0 ? { params } : undefined,
   );
 }
 
 /** DELETE returns 204 No Content — no body. ``userId`` is the tenant-admin
- *  governance target (forgetting another user's memory). */
-export async function deleteMemory(memoryId: string, userId?: string): Promise<void> {
+ *  governance target (forgetting another user's memory); ``tenantId`` as in
+ *  :func:`updateMemory`. */
+export async function deleteMemory(
+  memoryId: string,
+  userId?: string,
+  tenantId?: string,
+): Promise<void> {
   await apiClient.delete(`/v1/memory/${encodeURIComponent(memoryId)}`, {
-    params: { user_id: userId },
+    params: writeTarget(userId, tenantId),
   });
 }
 

@@ -191,10 +191,6 @@ export interface AgentManifest {
         recent_tool_results_kept?: number;
         [k: string]: unknown;
       };
-      // Capability Uplift Sprint #7 (Mini-ADR U-39) — per-agent
-      // MemoryConsolidator master switch (default_factory ⇒ absent block =
-      // enabled with the platform-default aux_model).
-      memory_consolidation?: { enabled?: boolean; [k: string]: unknown };
       // B3 — per-run total token budget across the whole delegation tree
       // (main agent + all workers), 0/absent = disabled.
       token_budget?: number;
@@ -302,7 +298,7 @@ export interface PromptVariableFields {
 }
 
 // ---- run profile presets (config-page redesign v2 Task 6) ----
-// Three curated one-click presets over 18 previously-scattered "how hard
+// Three curated one-click presets over 17 previously-scattered "how hard
 // does this agent think/remember" knobs (RunProfileCard, ``groups/
 // BasicSection.tsx``). ``RunProfile`` is a concrete preset name; the wider
 // ``RunProfileState`` adds "custom" — the UI state once any managed field
@@ -310,8 +306,10 @@ export interface PromptVariableFields {
 export type RunProfile = "balanced" | "cost" | "capability";
 export type RunProfileState = RunProfile | "custom";
 
-// The 18 managed fields, camelCased to match each field's existing read/patch
+// The 17 managed fields, camelCased to match each field's existing read/patch
 // helper (``readTopK``/``patchRunBudget``/etc. — see ``applyRunProfile``).
+// ``policies.memory_consolidation.enabled`` used to be an 18th; it has no
+// effect (B-300 D9), so presets neither write it nor match on it.
 interface RunProfileValues {
   topK: number;
   verifyReads: boolean;
@@ -320,7 +318,6 @@ interface RunProfileValues {
   abstainThreshold: number;
   injectionTokenBudget: number;
   correctionTokenBudget: number;
-  consolidationEnabled: boolean;
   maxIterations: number;
   maxNoProgress: number;
   prThresholdPct: number;
@@ -339,7 +336,7 @@ interface RunProfileValues {
 // ``groups/RunBudgetSection.tsx`` (max_iterations/max_no_progress),
 // ``groups/ContextGatesSection.tsx`` (pr_/wm_/cc_ thresholds+keeps),
 // ``groups/MemorySection.tsx`` (top_k/verify_reads/rewrite_reads/recall_mode/
-// abstain_threshold/injection+correction budgets/consolidation), and
+// abstain_threshold/injection+correction budgets), and
 // ``readDynamicWorkersOn`` below (dynamic_workers) — those files' own
 // comments point back here. NOTE ``maxNoProgress``'s backend default is 0,
 // which is NOT any preset's value (balanced/cost/capability write 4/3/6) — a
@@ -354,7 +351,6 @@ const PROFILE_BACKEND_DEFAULTS: RunProfileValues = {
   abstainThreshold: 0,
   injectionTokenBudget: 2000,
   correctionTokenBudget: 500,
-  consolidationEnabled: true,
   maxIterations: 30,
   maxNoProgress: 0,
   prThresholdPct: 0.7,
@@ -377,7 +373,6 @@ const RUN_PROFILES: Record<RunProfile, RunProfileValues> = {
     abstainThreshold: 0,
     injectionTokenBudget: 2000,
     correctionTokenBudget: 500,
-    consolidationEnabled: true,
     maxIterations: 30,
     maxNoProgress: 4,
     prThresholdPct: 0.7,
@@ -397,7 +392,6 @@ const RUN_PROFILES: Record<RunProfile, RunProfileValues> = {
     abstainThreshold: 0.2,
     injectionTokenBudget: 1000,
     correctionTokenBudget: 300,
-    consolidationEnabled: false,
     maxIterations: 20,
     maxNoProgress: 3,
     prThresholdPct: 0.6,
@@ -417,7 +411,6 @@ const RUN_PROFILES: Record<RunProfile, RunProfileValues> = {
     abstainThreshold: 0,
     injectionTokenBudget: 4000,
     correctionTokenBudget: 800,
-    consolidationEnabled: true,
     maxIterations: 60,
     maxNoProgress: 6,
     prThresholdPct: 0.8,
@@ -763,8 +756,8 @@ export function setPromptVariables(
 // ---- dynamic context — inject_current_date (DynamicContextSpec) ----
 // Whether the build writes today's date into the system prompt
 // (agent_factory reads ``dynamic_context.inject_current_date`` — a
-// day-granular, cache-stable injection). Like ``policies
-// .memory_consolidation`` / ``spec.cache``, ``spec.dynamic_context`` has a
+// day-granular, cache-stable injection). Like ``spec.cache``,
+// ``spec.dynamic_context`` has a
 // backend ``default_factory`` (an absent block ⇒ every field at its Pydantic
 // default, ``inject_current_date: True`` among them), so it follows the
 // standard optional-block ``mergeBlock`` idiom: ``true`` (the default) drops
@@ -1831,44 +1824,11 @@ export function patchMemoryBudgets(
   return patchSpec(m, updates);
 }
 
-// ---- memory consolidation (policies.memory_consolidation.enabled) ----
-// Capability Uplift Sprint #7 (Mini-ADR U-39) — per-agent MemoryConsolidator
-// master switch (MemoryConsolidationPolicy.enabled). Unlike ``long_term``,
-// ``policies.memory_consolidation`` has a backend ``default_factory`` (an
-// absent block ⇒ ``enabled: True`` + platform-default ``aux_model``), so it
-// follows the standard optional-block ``mergeBlock`` idiom — mirrors PR2's
-// ``patchContextGates`` policies sub-block handling: an emptied
-// ``memory_consolidation`` (and ``policies``, if that empties too) is
-// dropped rather than kept as ``{}``. The block's own unknown keys
-// (``aux_model``) survive untouched when patching ``enabled``.
-export interface ConsolidationFields {
-  consolidationEnabled?: boolean;
-}
-
-export const readConsolidation = (m: unknown): ConsolidationFields => ({
-  consolidationEnabled: specOf(m).policies?.memory_consolidation?.enabled,
-});
-
-export function patchConsolidation(
-  m: unknown,
-  patch: Partial<ConsolidationFields>,
-): AgentManifest {
-  const policies = specOf(m).policies ?? {};
-  const updates: Record<string, unknown> = { ...policies };
-
-  if ("consolidationEnabled" in patch) {
-    const merged = mergeBlock(
-      policies.memory_consolidation as Record<string, unknown> | undefined,
-      { enabled: patch.consolidationEnabled },
-    );
-    if (merged === undefined) delete updates.memory_consolidation;
-    else updates.memory_consolidation = merged;
-  }
-
-  return patchSpec(m, {
-    policies: Object.keys(updates).length > 0 ? updates : undefined,
-  });
-}
+// ---- memory consolidation: no form control (B-300 D9) ----
+// ``policies.memory_consolidation`` (``enabled`` / ``aux_model``) is
+// deprecated and has no effect — the consolidator runs on the deployment
+// setting only — so the form neither reads nor writes it. Stored values stay
+// in the manifest untouched (the protocol still accepts the block).
 
 // ---- reflection (spec.reflection — presence-semantic block) ----
 // Stream J.11 — whether the runtime reflect node runs. Unlike the optional
@@ -1996,10 +1956,10 @@ export function patchObservability(
 }
 
 // ---- run profile presets (config-page redesign v2 Task 6, cont'd) ----
-// ``applyRunProfile`` writes all 18 managed fields via their EXISTING
+// ``applyRunProfile`` writes all 17 managed fields via their EXISTING
 // read/patch pairs (never touching the manifest directly) — the field-level
 // "value === backend default → omit" convention already lives in
-// ``patchLongTerm``/``patchMemoryBudgets``/``patchConsolidation``/
+// ``patchLongTerm``/``patchMemoryBudgets``/
 // ``patchRunBudget``/``patchContextGates``/``setDynamicWorkersOn``; this
 // function only decides, per field, whether to pass the preset's value or
 // ``undefined`` (by comparing against ``PROFILE_BACKEND_DEFAULTS``).
@@ -2010,7 +1970,7 @@ export function patchObservability(
 // materializes the block on first touch — so while memory is off, the 7
 // long_term-backed fields are skipped entirely (not patched, not compared):
 // ``applyRunProfile`` leaves ``memory`` untouched, and ``inferRunProfile``/
-// ``countProfileDiff`` match on the remaining 11 applicable fields only.
+// ``countProfileDiff`` match on the remaining 10 applicable fields only.
 export function applyRunProfile(m: unknown, profile: RunProfile): AgentManifest {
   const target = RUN_PROFILES[profile];
   // undefined ⇒ "leave/return this field to the backend default" (deletes
@@ -2043,9 +2003,6 @@ export function applyRunProfile(m: unknown, profile: RunProfile): AgentManifest 
       correctionTokenBudget: orDefault("correctionTokenBudget"),
     });
   }
-  next = patchConsolidation(next, {
-    consolidationEnabled: orDefault("consolidationEnabled"),
-  });
   next = patchRunBudget(next, {
     maxIterations: orDefault("maxIterations"),
     maxNoProgress: orDefault("maxNoProgress"),
@@ -2066,12 +2023,11 @@ export function applyRunProfile(m: unknown, profile: RunProfile): AgentManifest 
   return next;
 }
 
-// Reads all 18 managed fields at their CURRENT effective value (stored value
+// Reads all 17 managed fields at their CURRENT effective value (stored value
 // if present, else the backend default) — the comparison basis for both
 // ``inferRunProfile`` and ``countProfileDiff``.
 function effectiveProfileValues(m: unknown): RunProfileValues {
   const budgets = readMemoryBudgets(m);
-  const consolidation = readConsolidation(m);
   const runBudget = readRunBudget(m);
   const gates = readContextGates(m);
   return {
@@ -2084,8 +2040,6 @@ function effectiveProfileValues(m: unknown): RunProfileValues {
       budgets.injectionTokenBudget ?? PROFILE_BACKEND_DEFAULTS.injectionTokenBudget,
     correctionTokenBudget:
       budgets.correctionTokenBudget ?? PROFILE_BACKEND_DEFAULTS.correctionTokenBudget,
-    consolidationEnabled:
-      consolidation.consolidationEnabled ?? PROFILE_BACKEND_DEFAULTS.consolidationEnabled,
     maxIterations: runBudget.maxIterations ?? PROFILE_BACKEND_DEFAULTS.maxIterations,
     maxNoProgress: runBudget.maxNoProgress ?? PROFILE_BACKEND_DEFAULTS.maxNoProgress,
     prThresholdPct: gates.prThresholdPct ?? PROFILE_BACKEND_DEFAULTS.prThresholdPct,
@@ -2122,7 +2076,7 @@ const applicableProfileKeys = (m: unknown): (keyof RunProfileValues)[] =>
     ? PROFILE_FIELD_KEYS
     : PROFILE_FIELD_KEYS.filter((k) => !MEMORY_PROFILE_KEYS.includes(k));
 
-/** Every applicable managed field (all 18, or the 11 non-memory ones while
+/** Every applicable managed field (all 17, or the 10 non-memory ones while
  * memory is off) matches one preset exactly → that preset; else "custom". */
 export function inferRunProfile(m: unknown): RunProfileState {
   const current = effectiveProfileValues(m);

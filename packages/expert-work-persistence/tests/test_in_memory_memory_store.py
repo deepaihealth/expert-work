@@ -1310,3 +1310,24 @@ async def test_hard_delete_expired_sweeps_across_tenants() -> None:
     remaining_ids = {row.id for row in store._rows}
     assert item_a.id not in remaining_ids
     assert item_b.id not in remaining_ids
+
+
+@pytest.mark.asyncio
+async def test_get_live_returns_the_row_only_for_its_own_tenant_and_user() -> None:
+    """B-300 D8 — the console's write endpoints look the row up BEFORE they
+    scan / re-embed, so a miss costs nothing. The lookup is scoped exactly
+    like ``update_content``: id + tenant + user, live rows only."""
+    store = InMemoryMemoryStore()
+    tenant, user, other_user, other_tenant = uuid4(), uuid4(), uuid4(), uuid4()
+    mine = _item(tenant=tenant, user=user, embedding=(1.0, 0.0), content="mine")
+    await store.write([mine])
+
+    got = await store.get_live(tenant_id=tenant, user_id=user, memory_id=mine.id)
+    assert got is not None and got.id == mine.id and got.content == "mine"
+
+    assert await store.get_live(tenant_id=tenant, user_id=other_user, memory_id=mine.id) is None
+    assert await store.get_live(tenant_id=other_tenant, user_id=user, memory_id=mine.id) is None
+    assert await store.get_live(tenant_id=tenant, user_id=user, memory_id=uuid4()) is None
+
+    assert await store.soft_delete(tenant_id=tenant, user_id=user, memory_id=mine.id)
+    assert await store.get_live(tenant_id=tenant, user_id=user, memory_id=mine.id) is None

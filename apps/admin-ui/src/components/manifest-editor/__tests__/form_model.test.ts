@@ -102,8 +102,6 @@ import {
   patchSandboxFs,
   readMemoryBudgets,
   patchMemoryBudgets,
-  readConsolidation,
-  patchConsolidation,
   readReflectionOn,
   setReflectionOn,
   readReflectionTuning,
@@ -2027,120 +2025,6 @@ describe("memory injection budgets (spec.memory.long_term token budgets)", () =>
       correction_token_budget: 800,
     });
     expect(readMemoryOn(withTopK)).toBe(true);
-  });
-});
-
-describe("memory consolidation (policies.memory_consolidation.enabled)", () => {
-  it("consolidationEnabled=false round-trips through YAML", () => {
-    const m: AgentManifest = { spec: {} };
-    const next = patchConsolidation(m, { consolidationEnabled: false });
-    const yaml = dumpYaml(next);
-    expect(yaml).toContain("memory_consolidation:");
-    expect(yaml).toContain("enabled: false");
-    const roundTripped = parse(yaml) as AgentManifest;
-    expect(readConsolidation(roundTripped).consolidationEnabled).toBe(false);
-  });
-
-  it("preserves unrelated policies keys (approval_required_tools) when patching", () => {
-    const base: AgentManifest = {
-      spec: { policies: { approval_required_tools: ["exec_python"] } },
-    };
-    const next = patchConsolidation(base, { consolidationEnabled: false });
-    expect(next.spec?.policies?.approval_required_tools).toEqual([
-      "exec_python",
-    ]);
-    expect(next.spec?.policies?.memory_consolidation).toEqual({
-      enabled: false,
-    });
-  });
-
-  it("explicit undefined deletes enabled, dropping memory_consolidation and policies when both empty", () => {
-    const base: AgentManifest = {
-      spec: { policies: { memory_consolidation: { enabled: false } } },
-    };
-    const cleared = patchConsolidation(base, {
-      consolidationEnabled: undefined,
-    });
-    expect(cleared.spec?.policies?.memory_consolidation).toBeUndefined();
-    expect(cleared.spec?.policies).toBeUndefined();
-  });
-
-  it("clearing enabled preserves aux_model sibling inside memory_consolidation", () => {
-    const base: AgentManifest = {
-      spec: {
-        policies: {
-          memory_consolidation: {
-            enabled: false,
-            aux_model: { provider: "glm", name: "glm-4-flash" },
-          },
-        },
-      },
-    };
-    const next = patchConsolidation(base, { consolidationEnabled: undefined });
-    expect(next.spec?.policies?.memory_consolidation).toEqual({
-      aux_model: { provider: "glm", name: "glm-4-flash" },
-    });
-  });
-
-  it("preserves aux_model unknown key when patching enabled", () => {
-    const base: AgentManifest = {
-      spec: {
-        policies: {
-          memory_consolidation: {
-            aux_model: { provider: "glm", name: "glm-4-flash" },
-          },
-        },
-      },
-    };
-    const next = patchConsolidation(base, { consolidationEnabled: true });
-    expect(next.spec?.policies?.memory_consolidation).toEqual({
-      aux_model: { provider: "glm", name: "glm-4-flash" },
-      enabled: true,
-    });
-  });
-
-  it("does not materialize policies when the patch is empty", () => {
-    const base: AgentManifest = { spec: {} };
-    const next = patchConsolidation(base, {});
-    expect(next.spec?.policies).toBeUndefined();
-  });
-
-  it("does not mutate the input manifest", () => {
-    const m: AgentManifest = {
-      spec: { policies: { memory_consolidation: { enabled: true } } },
-    };
-    const snapshot = JSON.stringify(m);
-    patchConsolidation(m, { consolidationEnabled: false });
-    expect(JSON.stringify(m)).toBe(snapshot);
-  });
-
-  it("readConsolidation returns undefined on an empty manifest", () => {
-    expect(readConsolidation({})).toEqual({ consolidationEnabled: undefined });
-  });
-
-  it("coexists with PR2's four policies sub-blocks without disturbing them", () => {
-    const base: AgentManifest = {
-      spec: {
-        policies: {
-          approval_required_tools: ["exec_python"],
-          max_no_progress: 3,
-          context_compression: { enabled: false },
-          working_memory: { enabled: true },
-          tool_result_prune: { enabled: true },
-          tool_output_budget: { enabled: false },
-        },
-      },
-    };
-    const next = patchConsolidation(base, { consolidationEnabled: false });
-    expect(next.spec?.policies?.memory_consolidation).toEqual({
-      enabled: false,
-    });
-    expect(next.spec?.policies?.approval_required_tools).toEqual([
-      "exec_python",
-    ]);
-    expect(next.spec?.policies?.max_no_progress).toBe(3);
-    expect(readContextGates(next).ccEnabled).toBe(false);
-    expect(readContextGates(next).wmEnabled).toBe(true);
   });
 });
 

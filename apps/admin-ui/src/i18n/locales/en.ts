@@ -1119,7 +1119,7 @@ export interface TranslationKeys {
     field_reset_hint: string;
   };
   // config-page redesign v2 Task 6 — RunProfileCard, the "basic" group's
-  // one-click preset over 18 fields scattered across memory/budget/context
+  // one-click preset over 17 fields scattered across memory/budget/context
   // (form_model.ts's RUN_PROFILES). ``{balanced,cost,capability}``/
   // ``{...}_desc`` are the three preset cards' label + one-line blurb;
   // ``custom`` is the "no preset matches" tag.
@@ -1342,14 +1342,11 @@ export interface TranslationKeys {
   // long-term-memory on/off switch (presence-semantic — see form_model.ts's
   // readMemoryOn/setMemoryOn); the other 8 fields (top_k/write_back on
   // "basic", the 6 read/write tuning knobs on "retrieval") each get the
-  // usual ``_label``/``_brief``/``_impact`` triple. The "budget" tab keeps
-  // its two pre-existing panels: ① injection budgets
-  // (spec.memory.long_term.injection_token_budget /
+  // usual ``_label``/``_brief``/``_impact`` triple. The "budget" tab holds
+  // the injection budgets (spec.memory.long_term.injection_token_budget /
   // correction_token_budget — only rendered while memory is on, since a
-  // budget is meaningless with no long_term block to inject from) and ②
-  // background consolidation (policies.memory_consolidation.enabled — a
-  // control-plane job, not on the run path, so it stays available even with
-  // memory off).
+  // budget is meaningless with no long_term block to inject from). The
+  // background-consolidation switch is gone (B-300 D9: it had no effect).
   memory_group: {
     tab_basic: string;
     tab_retrieval: string;
@@ -1396,7 +1393,6 @@ export interface TranslationKeys {
     abstain_threshold_brief: string;
     abstain_threshold_impact: string;
     panel_injection: string;
-    panel_consolidation: string;
     inj_budget_label: string;
     inj_budget_brief: string;
     inj_budget_impact: string;
@@ -1405,10 +1401,6 @@ export interface TranslationKeys {
     corr_budget_brief: string;
     corr_budget_impact: string;
     corr_budget_default: string;
-    consolidation_label: string;
-    consolidation_brief: string;
-    consolidation_impact: string;
-    aux_model_note: string;
   };
   // Task 3 (PR6) — "Model & Routing" group (ModelRoutingSection), embedded
   // after the existing "model" FormView section (provider/model picker,
@@ -5261,7 +5253,7 @@ const en: TranslationKeys = {
   memory_group: {
     tab_basic: "Basic",
     tab_retrieval: "Retrieval details",
-    tab_budget: "Budget & housekeeping",
+    tab_budget: "Budget",
     on_label: "Long-term memory",
     on_brief: "Remembers you across chats",
     on_impact:
@@ -5314,7 +5306,6 @@ const en: TranslationKeys = {
     abstain_threshold_impact:
       "After searching, if the best memory's similarity to the question is below this, inject nothing instead of a weak match — avoids dragging loosely-related memories into the answer.\n0 = never skip (default); ~0.2–0.3 = skip clearly weak matches.\nExample: 0",
     panel_injection: "Injection budget",
-    panel_consolidation: "Background memory consolidation",
     inj_budget_label: "Memory injection token budget",
     inj_budget_brief: "The most tokens memories may take up in the prompt",
     inj_budget_impact:
@@ -5325,12 +5316,6 @@ const en: TranslationKeys = {
     corr_budget_impact:
       "A dedicated token allowance that explicit user corrections (the kind the system treats as 100% certain) get first claim on, so ordinary memories can't crowd them out: correction memories get first claim on up to this many tokens, and ordinary memories only get what's left.\nSet it to 0 to skip this protection.",
     corr_budget_default: "500",
-    consolidation_label: "Background memory consolidation",
-    consolidation_brief: "Tidies memory in the background, without slowing chats",
-    consolidation_impact:
-      "Runs in the background on a schedule (every 4 hours by default), merging similar short-term memories and clearing out noisy ones — it's a background job, so it never slows down the conversation.\nTurn it off and this agent's long-term memory stops auto-deduplicating, distilling, and cleaning itself up — short-term memories just keep piling up.\nThe cleanup runs on the auxiliary model and is billed separately under 'memory consolidation'; what counts as 'similar enough to merge' is a tenant-level setting, not something this manifest controls.",
-    aux_model_note:
-      "The model that does the cleanup defaults to the platform-wide setting (claude-sonnet-4-6).\nTo pick a different one for just this agent, edit policies.memory_consolidation.aux_model in the YAML view.",
   },
   model_group: {
     panel_reflection: "Reflection self-assessment",

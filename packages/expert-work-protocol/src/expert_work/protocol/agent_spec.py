@@ -1049,31 +1049,38 @@ class ToolResultPrunePolicy(_B126OmitDefaultsMixin):
 
 
 class MemoryConsolidationPolicy(BaseModel):
-    """Stream Uplift Sprint #7 (Mini-ADR U-39) — per-agent
-    MemoryConsolidator knobs.
+    """Stream Uplift Sprint #7 (Mini-ADR U-39) — DEPRECATED, no effect.
 
-    The consolidator is a control-plane background worker, not an
-    agent-runtime call, but the auxiliary model choice is per-agent
-    because different agents may want different durability bars for
-    their long-term memory (a customer-support agent may want stricter
-    anti-mislearn than a personal-assistant agent).
+    Both fields are accepted and ignored. The memory consolidator is a
+    control-plane background worker that clusters per user, not per agent,
+    and it never reads an agent's manifest: it is not switched on or off per
+    agent, and the model it uses comes from the deployment settings only
+    (``EXPERT_WORK_MEMORY_CONSOLIDATOR_DEFAULT_AUX_PROVIDER`` /
+    ``_AUX_MODEL``, see control-plane settings).
 
-    ``aux_model`` NULL ↔ consolidator falls back to the platform
-    default configured via
-    ``EXPERT_WORK_MEMORY_CONSOLIDATOR_DEFAULT_AUX_MODEL`` (see
-    control-plane settings).
-
-    Independent of :class:`ContextCompressionPolicy.summariser_model`
-    because the two workloads have different cost / latency profiles:
-    context compression is hot-path per-turn (favours cheap+fast aux),
-    consolidation is cold-path every-4h (can afford a stronger model
-    for better anti-mislearn accuracy).
+    The class stays because every stored manifest carries
+    ``policies.memory_consolidation.enabled`` (the backend serialises the
+    default) and ``extra="forbid"`` would reject those manifests if the fields
+    were removed (B-300 D9). ``aux_model`` is still name-checked at publish
+    time (``control_plane/manifest_model_names.py``).
     """
 
     model_config = ConfigDict(extra="forbid")
 
-    enabled: bool = True
-    aux_model: ModelSpec | None = None
+    enabled: bool = Field(
+        default=True,
+        description=(
+            "Deprecated, no effect: memory consolidation is not switched per "
+            "agent; it follows the deployment settings only."
+        ),
+    )
+    aux_model: ModelSpec | None = Field(
+        default=None,
+        description=(
+            "Deprecated, no effect: the consolidation model comes from the "
+            "deployment setting only, not from the agent manifest."
+        ),
+    )
 
 
 class PolicySpec(BaseModel):
@@ -1100,9 +1107,8 @@ class PolicySpec(BaseModel):
     # Phase 3 — per-agent master switch for the whole tool-output-budget feature
     # (externalization + persist + prune). effective = platform AND agent.
     tool_output_budget: ToolOutputBudgetPolicy = Field(default_factory=ToolOutputBudgetPolicy)
-    # Capability Uplift Sprint #7 (Mini-ADR U-39) — per-agent
-    # MemoryConsolidator knobs. Defaults are equivalent to "use platform
-    # defaults" so existing manifests load unchanged.
+    # Capability Uplift Sprint #7 (Mini-ADR U-39) — deprecated, no effect
+    # (B-300 D9): kept only so stored manifests carrying it still load.
     memory_consolidation: MemoryConsolidationPolicy = Field(
         default_factory=MemoryConsolidationPolicy
     )

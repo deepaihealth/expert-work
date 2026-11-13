@@ -403,6 +403,23 @@ class SqlMemoryStore(MemoryStore):
             rows = (await session.execute(stmt)).scalars().all()
         return [_row_to_item(row) for row in rows]
 
+    async def get_live(
+        self,
+        *,
+        tenant_id: UUID,
+        user_id: UUID,
+        memory_id: UUID,
+    ) -> MemoryItem | None:
+        stmt = select(MemoryItemRow).where(
+            MemoryItemRow.id == memory_id,
+            MemoryItemRow.tenant_id == tenant_id,
+            MemoryItemRow.user_id == user_id,
+            MemoryItemRow.deleted_at.is_(None),
+        )
+        async with self._sf() as session:
+            row = (await session.execute(stmt)).scalar_one_or_none()
+        return None if row is None else _row_to_item(row)
+
     async def update_content(
         self,
         *,
