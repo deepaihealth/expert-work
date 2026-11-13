@@ -380,7 +380,7 @@ run 的每一个步骤完成时，服务端通过当前这条连接发出一次�
 
 默认情况下，`memory_writeback` 这一步只做登记，不等待保存完成：长期记忆在 `end` 之后由服务端在后台保存，通常几秒内完成。登记失败或平台未启用后台保存时，这一步直接完成保存，`end` 在保存之后才发出。这一步的值里没有保存结果，客户端照常忽略即可；它对新会话的影响见 [9.5 常见问题](./best-practices#新会话暂时读不到前一轮刚记下的内容)。
 
-`memory_recall` 这一步只表示「召回已经完成」。召回到的记忆只在服务端用来组织本轮回答，不通过事件流下发：这一步的值里只有 `_duration_ms`，例如 `{ "memory_recall": { "_duration_ms": 85 } }`，不含记忆的正文、条数或任何编号。实时的事件流、`GET /v1/agents/{agent_code}/runs/{run_id}/events` 的续传与回放、带同一 `Idempotency-Key` 的重试、审批后的续跑，拿到的都是这个形状。
+`memory_recall` 这一步只表示「召回这一步已经结束」。召回到的记忆只在服务端用来组织本轮回答，不通过事件流下发：这一步的值要么是 `null`（这一步没有产出，例如没有召回到内容或召回出错），要么只带 `_duration_ms`，例如 `{ "memory_recall": { "_duration_ms": 85 } }`；两种情况都不含记忆的正文、条数或任何编号。`POST /v1/agents/{agent_code}/runs` 的实时事件流、重新生成（`:regenerate`）与编辑（`:edit`）的事件流、`GET /v1/agents/{agent_code}/runs/{run_id}/events` 的续传与回放、带同一 `Idempotency-Key` 的重试、审批后的续跑，拿到的都是这个形状。
 
 三条处理规则：
 

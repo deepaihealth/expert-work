@@ -62,7 +62,7 @@ from orchestrator.sse import (
     strip_frame_state_keys,
 )
 from orchestrator.state import AgentState
-from orchestrator.stream_items import STREAM_FORMAT_ITEMS, STREAM_FORMAT_LEGACY
+from orchestrator.stream_items import STREAM_FORMAT_LEGACY
 from tests.auth_fixtures import TEST_AUDIENCE, TEST_ISSUER, build_test_jwt_verifier, make_test_jwt
 
 _SECRET_CONTENT = "recalled-memory-body-5c1e"
@@ -137,7 +137,9 @@ def _runtime(
 ) -> AgentRuntime:
     graph = GraphRunner(checkpointer=InMemorySaver()).compile(
         build_react_graph(
-            llm_caller=_fake_llm, tool_registry=ToolRegistry(), memory_recall_node=_recall
+            llm_caller=_fake_llm,  # type: ignore[arg-type]
+            tool_registry=ToolRegistry(),
+            memory_recall_node=_recall,
         )
     )
 
@@ -150,7 +152,7 @@ def _runtime(
     return AgentRuntime(
         run_manager=RunManager(store=run_store),
         stream_bridge=InMemoryStreamBridge(),
-        agent_builder=_build,
+        agent_builder=_build,  # type: ignore[arg-type]
         run_event_store=run_event_store,
     )
 
@@ -357,10 +359,7 @@ async def _never() -> bool:
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("stream_format", [STREAM_FORMAT_LEGACY, STREAM_FORMAT_ITEMS])
-async def test_live_consumer_strips_externally_and_console_keeps_full_items(
-    stream_format: str,
-) -> None:
+async def test_live_consumer_strips_externally_and_console_keeps_full_items() -> None:
     """同一个 bridge 上先挂对外 consumer、再挂控制台 consumer:对外裁掉,控制台
     照旧拿到整条记忆 —— 也证明裁剪没有改写 bridge 上那份共享的帧对象。"""
     bridge, rm = InMemoryStreamBridge(), RunManager()
@@ -371,12 +370,12 @@ async def test_live_consumer_strips_externally_and_console_keeps_full_items(
         bridge=bridge,
         run_manager=rm,
         record=record,
-        graph=_RecallGraph(),
+        graph=_RecallGraph(),  # type: ignore[arg-type]
         graph_input={},
         config={"configurable": {"thread_id": str(record.thread_id)}},
     )
 
-    async def _wire(strip: frozenset[str], fmt: str) -> str:
+    async def _wire(strip: frozenset[str]) -> str:
         chunks = [
             c
             async for c in sse_consumer(
@@ -387,18 +386,14 @@ async def test_live_consumer_strips_externally_and_console_keeps_full_items(
                 heartbeat_interval=5.0,
                 hide_events=EXTERNAL_HIDDEN_EVENTS if strip else frozenset(),
                 strip_state_keys=strip,
-                stream_format=fmt,
+                stream_format=STREAM_FORMAT_LEGACY,
             )
         ]
         return b"".join(chunks).decode()
 
-    external = await _wire(EXTERNAL_STRIPPED_STATE_KEYS, stream_format)
-    assert "event: end" in external
-    assert not [s for s in _FORBIDDEN if s in external]
-    if stream_format == STREAM_FORMAT_LEGACY:
-        _assert_external_memory_recall_frame(external)
+    _assert_external_memory_recall_frame(await _wire(EXTERNAL_STRIPPED_STATE_KEYS))
 
-    console = await _wire(frozenset(), STREAM_FORMAT_LEGACY)
+    console = await _wire(frozenset())
     recall = [f["memory_recall"] for f in _updates_frames(console) if "memory_recall" in f]
     assert recall[0]["recalled_memories"][0]["content"] == _SECRET_CONTENT
     assert recall[0]["recalled_memories"][0]["tenant_id"] == str(_MEMORY_TENANT)

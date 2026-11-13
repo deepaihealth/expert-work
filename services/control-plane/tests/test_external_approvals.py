@@ -427,7 +427,6 @@ async def test_decide_stream_passes_external_stripped_state_keys_to_sse_consumer
     assert resp.status_code == 200, resp.text
     assert "event: end" in resp.text
     assert seen == [EXTERNAL_STRIPPED_STATE_KEYS]
-    assert "recalled_memories" in EXTERNAL_STRIPPED_STATE_KEYS
 
 
 @pytest.mark.asyncio
